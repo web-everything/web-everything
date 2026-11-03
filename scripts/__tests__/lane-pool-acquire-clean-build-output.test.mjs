@@ -176,7 +176,7 @@ const { execFileSync } = require('node:child_process');
 const { appendFileSync } = require('node:fs');
 const args = process.argv.slice(2);
 if (args.includes(${JSON.stringify(probe)}) &&
-    args.includes(${JSON.stringify(probe === 'clean' ? '-fdX' : '_site/')})) {
+    args.includes(${JSON.stringify(probe === 'clean' ? '-ffdX' : '_site/')})) {
   appendFileSync(${JSON.stringify(attempts)}, 'attempt\\n');
   process.stderr.write('fatal: bad object cleanup probe\\n');
   process.exit(${exitCode});

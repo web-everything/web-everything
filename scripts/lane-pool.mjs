@@ -307,7 +307,7 @@ export function ignoredBuildOutputDirs(dir) {
     if (!(name === '_site' || /^_site-[A-Za-z0-9_.-]+$/.test(name)) || name.includes('..')) return false;
     if (denied.has(name)) return false;
     // Absent or symlinked outputs are never cleaned, so they need no git evidence (git rejects symlink pathspecs).
-    try { if (!lstatSync(join(dir, name)).isDirectory()) return false; } catch { return false; }
+    try { if (!lstatSync(join(dir, name)).isDirectory()) return false; } catch (e) { if (e?.code === 'ENOENT') return false; throw e; }
     // Unknown Git evidence aborts cleanup; only check-ignore's exit 1 means not ignored.
     const path = `${name}/`;
     if (git(['ls-files', '--', path], dir) !== '') return false;
@@ -324,10 +324,10 @@ export function ignoredBuildOutputDirs(dir) {
 export function cleanIgnoredBuildOutput(dir) {
   try {
     const dirs = ignoredBuildOutputDirs(dir).filter((name) => {
-      try { return lstatSync(join(dir, name)).isDirectory(); } catch { return false; }
+      try { return lstatSync(join(dir, name)).isDirectory(); } catch (e) { if (e?.code === 'ENOENT') return false; throw e; }
     });
     // Never invoke clean with an empty pathspec (which would target the whole repository).
-    if (dirs.length) git(['clean', '-fdX', '--quiet', '--', ...dirs.map((name) => `${name}/`)], dir);
+    if (dirs.length) git(['clean', '-ffdX', '--quiet', '--', ...dirs.map((name) => `${name}/`)], dir);
   } catch (e) {
     const message = msgOf(e).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ');
     throw Object.assign(new Error(`ignored build output cleanup failed: ${message}`, { cause: e }), {
@@ -1495,11 +1495,13 @@ function refreshLane(repo, n, { force = false } = {}) {
   const verdict = destructiveActionVerdict({ unpushed: before.unpushed, override: force });
   git(['reset', '--hard', `origin/${repo.branch}`, '--quiet'], dir);
   git(['clean', '-fd', '--quiet'], dir); // remove untracked, KEEP ignored (node_modules) — no -x
-  cleanIgnoredBuildOutput(dir);
+  let buildCleanError = null;
+  try { cleanIgnoredBuildOutput(dir); } catch (e) { buildCleanError = e; } // journal the destructive reset FIRST, then surface
   journalLaneEvent(dir, {
     action: 'refresh-reset', before, headAfter: laneHead(dir),
     reason: force ? `refresh --force (${verdict.reason})` : 'refresh — clean lane fast-forwarded', loud: verdict.loud || undefined,
   });
+  if (buildCleanError) throw buildCleanError;
   return { skipped: false, dirty: false, uncommitted: 0, ahead: 0 };
 }
 
@@ -2259,8 +2261,9 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
     if (reclaimAhead) logReclaimedAheadCommits(dir, repo.branch, chosen);
     git(['checkout', '-B', repo.branch, baseRef, '--quiet', '--force'], dir);
     git(['clean', '-fd', '--quiet'], dir);
-    cleanIgnoredBuildOutput(dir);
-      return { before, baseRef };
+    let buildCleanError = null;
+    try { cleanIgnoredBuildOutput(dir); } catch (e) { buildCleanError = e; } // journal first, rethrown after the acquire-reset journal line
+      return { before, baseRef, buildCleanError };
     };
     let reset;
     try {
@@ -2272,13 +2275,14 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
       repairUnhealthyClone();
       reset = resetToBase();
     }
-    const { before, baseRef } = reset;
+    const { before, baseRef, buildCleanError } = reset;
     // #4370 — the reset gets its own journal line NOW (a later deps/registry failure must not lose it).
     journalLaneEvent(dir, {
       action: 'acquire-reset', before, headAfter: laneHead(dir),
       reason: `acquire → ${baseRef}${flags.force ? ' (--force)' : ''}`, session: flags.session || process.env.LANE_SESSION || undefined,
       loud: before.unpushed ? true : undefined,
     });
+    if (buildCleanError) throw buildCleanError;
     unmapLanes(repo, [chosen]); // a reset lane no longer renders its old item (#2139)
     clearForeignVerifyMarker(dir);
   }
