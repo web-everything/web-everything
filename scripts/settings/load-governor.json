@@ -1,12 +1,11 @@
 {
-  "$comment": "R480 load governor. Operator, 2026-11-03 08:24 ET: 'better have to pause than be under load for a long time in term of velocity'. So targetLoadPerCore is a CEILING, not a soft goal: the moment the 1-min load per core is above it, heavy admission holds NEW heavy jobs from owners at or below holdFromClass (reason 'load-governor') with no grace window beyond hysteresis (they release only once load is under resumeBelowPerCore), and the governor writes a pause flag for those owners so they stop at their next safe point. Defaults lean toward pausing: only main-fix and delivery-unblock are exempt (they must never starve). A flag auto-expires after maxPauseMinutes so a paused worker cannot hold a lane forever. Priority order, highest first: main-fix > delivery-unblock > daemon-fix > build > report. classPatterns map an owner/purpose substring to a class (first class in priority order that matches wins; no match = build). Overrides: standard -> repo settings -> env WE_LOAD_GOVERNOR_TARGET, WE_LOAD_GOVERNOR_RESUME, WE_LOAD_GOVERNOR_ENABLED=0. Invalid values are ignored.",
+  "$comment": "R480 load governor. Operator, 2026-11-03 08:24 ET: 'better have to pause than be under load for a long time in term of velocity'. So targetLoadPerCore is a CEILING, not a soft goal: the moment the 1-min load per core is above it, heavy admission holds NEW heavy jobs from owners at or below holdFromClass (reason 'load-governor') with no grace window beyond hysteresis (they release only once load is under resumeBelowPerCore), and the governor writes a pause flag for those owners so they stop at their next safe point. Defaults lean toward pausing: only main-fix and delivery-unblock are exempt (they must never starve). A flag auto-expires after maxPauseMinutes so a paused worker cannot hold a lane forever. Priority order, highest first: main-fix > delivery-unblock > daemon-fix > build > report. classPatterns map an owner/purpose substring to a class (first class in priority order that matches wins; no match = build). Overrides: standard -> repo settings -> env WE_LOAD_GOVERNOR_TARGET, WE_LOAD_GOVERNOR_RESUME, WE_LOAD_GOVERNOR_ENABLED=0. Invalid values are ignored. main-fix and delivery-unblock can never be held or paused, whatever holdFromClass says. The load-over-target smell opens after 10 consecutive health ticks over target.",
   "loadGovernor": {
     "enabled": true,
     "targetLoadPerCore": 2,
     "resumeBelowPerCore": 1.6,
     "holdFromClass": "daemon-fix",
     "maxPauseMinutes": 90,
-    "overTargetSmellMinutes": 10,
     "priority": ["main-fix", "delivery-unblock", "daemon-fix", "build", "report"],
     "classPatterns": {
       "main-fix": ["main-fix", "red-main", "repair"],

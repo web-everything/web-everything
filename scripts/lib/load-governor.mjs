@@ -12,7 +12,7 @@ import { homedir } from 'node:os';
 export const GOVERNOR_REASON = 'load-governor';
 export const GOVERNOR_DEFAULTS = Object.freeze({
   enabled: true, targetLoadPerCore: 2, resumeBelowPerCore: 1.6, holdFromClass: 'daemon-fix',
-  maxPauseMinutes: 90, overTargetSmellMinutes: 10,
+  maxPauseMinutes: 90,
   priority: Object.freeze(['main-fix', 'delivery-unblock', 'daemon-fix', 'build', 'report']),
   classPatterns: Object.freeze({
     'main-fix': ['main-fix', 'red-main', 'repair'], 'delivery-unblock': ['unblock', 'drain', 'land', 'conflict'],
@@ -26,7 +26,7 @@ export function resolveGovernorSettings({ settings, env = {} } = {}) {
   const r = { ...GOVERNOR_DEFAULTS, classPatterns: { ...GOVERNOR_DEFAULTS.classPatterns }, priority: [...GOVERNOR_DEFAULTS.priority] };
   const s = settings?.loadGovernor ?? {};
   if (typeof s.enabled === 'boolean') r.enabled = s.enabled;
-  for (const k of ['targetLoadPerCore', 'resumeBelowPerCore', 'maxPauseMinutes', 'overTargetSmellMinutes']) if (pos(s[k])) r[k] = s[k];
+  for (const k of ['targetLoadPerCore', 'resumeBelowPerCore', 'maxPauseMinutes']) if (pos(s[k])) r[k] = s[k];
   if (Array.isArray(s.priority) && s.priority.length && s.priority.every((x) => typeof x === 'string')) r.priority = [...s.priority];
   if (typeof s.holdFromClass === 'string' && r.priority.includes(s.holdFromClass)) r.holdFromClass = s.holdFromClass;
   if (s.classPatterns && typeof s.classPatterns === 'object') {
@@ -35,7 +35,7 @@ export function resolveGovernorSettings({ settings, env = {} } = {}) {
   const t = Number(env.WE_LOAD_GOVERNOR_TARGET); if (pos(t)) r.targetLoadPerCore = t;
   const rs = Number(env.WE_LOAD_GOVERNOR_RESUME); if (pos(rs)) r.resumeBelowPerCore = rs;
   if (env.WE_LOAD_GOVERNOR_ENABLED === '0') r.enabled = false;
-  if (!(r.resumeBelowPerCore <= r.targetLoadPerCore)) r.resumeBelowPerCore = r.targetLoadPerCore; // hysteresis band can't invert
+  if (!(r.resumeBelowPerCore <= r.targetLoadPerCore)) r.resumeBelowPerCore = r.targetLoadPerCore * 0.8; // band can't invert or collapse (would flap)
   if (!r.priority.includes(r.holdFromClass)) r.holdFromClass = GOVERNOR_DEFAULTS.holdFromClass;
   return r;
 }
@@ -48,7 +48,8 @@ export function ownerClass(text, settings = GOVERNOR_DEFAULTS) {
 }
 export const classRank = (c, settings = GOVERNOR_DEFAULTS) => { const i = settings.priority.indexOf(c); return i < 0 ? settings.priority.length : i; };
 /** PURE: is this class below the exemption cutoff (so subject to holds and pauses)? */
-export const isHoldable = (c, settings = GOVERNOR_DEFAULTS) => classRank(c, settings) >= classRank(settings.holdFromClass, settings);
+export const ALWAYS_EXEMPT = Object.freeze(['main-fix', 'delivery-unblock']); // no setting may hold or pause these
+export const isHoldable = (c, settings = GOVERNOR_DEFAULTS) => !ALWAYS_EXEMPT.includes(c) && classRank(c, settings) >= classRank(settings.holdFromClass, settings);
 
 /**
  * PURE hysteresis step. `holding` is the previous state. Returns { holding, unreadable, reason }.
@@ -107,24 +108,25 @@ export function sweepExpired({ dir = defaultPauseDir(), maxPauseMinutes = GOVERN
  * (released) governor-owned flags. Operator flags (by != load-governor) are never cleared here. Returns events.
  */
 export function governorTick({ loadPerCore, owners = [], settings = GOVERNOR_DEFAULTS, stateFile, dir = defaultPauseDir(), now = new Date(), log = () => {} }) {
-  let prev = false; try { prev = JSON.parse(readFileSync(stateFile, 'utf8')).holding === true; } catch { /* first run */ }
+  let prev = false; let cooled = []; try { const j = JSON.parse(readFileSync(stateFile, 'utf8')); prev = j.holding === true; cooled = Array.isArray(j.cooled) ? j.cooled : []; } catch { /* first run */ }
   const st = governorState({ loadPerCore, holding: prev, settings });
   const events = [];
-  for (const o of sweepExpired({ dir, maxPauseMinutes: settings.maxPauseMinutes, now })) events.push({ event: 'expired', owner: o });
+  for (const o of sweepExpired({ dir, maxPauseMinutes: settings.maxPauseMinutes, now })) { events.push({ event: 'expired', owner: o }); if (st.holding && !cooled.includes(o)) cooled.push(o); } // TTL is a hard cap: no re-pause until load clears
+  if (!st.holding) cooled = [];
   if (st.unreadable) events.push({ event: 'load-unreadable', reason: st.reason });
   for (const { owner, text } of owners) {
     const cls = ownerClass(text ?? owner, settings);
     if (!isHoldable(cls, settings)) continue;
     const cur = readPause({ dir, owner, maxPauseMinutes: settings.maxPauseMinutes, now });
-    if (st.holding && !cur) { setPause({ dir, owner, reason: `${GOVERNOR_REASON}: ${st.reason}`, by: GOVERNOR_REASON, now }); events.push({ event: 'paused', owner, cls }); }
-    else if (!st.holding && !st.unreadable && cur?.by === GOVERNOR_REASON) { clearPause({ dir, owner }); events.push({ event: 'resumed', owner, cls }); }
+    if (st.holding && !cur && !cooled.includes(owner)) { setPause({ dir, owner, reason: `${GOVERNOR_REASON}: ${st.reason}`, by: GOVERNOR_REASON, now }); events.push({ event: 'paused', owner, cls }); }
+    else if (!st.holding && cur?.by === GOVERNOR_REASON) { clearPause({ dir, owner }); events.push({ event: 'resumed', owner, cls }); }
   }
-  if (!st.holding && !st.unreadable) { // owners gone from the list but still flagged by us: clear too
+  if (!st.holding) { // owners gone from the list but still flagged by us: clear too
     for (const { owner, flag } of listPauses({ dir, maxPauseMinutes: settings.maxPauseMinutes, now })) {
       if (flag.by === GOVERNOR_REASON) { clearPause({ dir, owner }); events.push({ event: 'resumed', owner }); }
     }
   }
-  if (stateFile && st.holding !== prev) { mkdirSync(join(stateFile, '..'), { recursive: true }); writeFileSync(stateFile, JSON.stringify({ holding: st.holding, at: now.toISOString() }) + '\n'); }
+  if (stateFile && (st.holding !== prev || cooled.length)) { mkdirSync(join(stateFile, '..'), { recursive: true }); writeFileSync(stateFile, JSON.stringify({ holding: st.holding, cooled, at: now.toISOString() }) + '\n'); }
   for (const e of events) log({ at: now.toISOString(), loadPerCore, ...e });
   return { ...st, events };
 }

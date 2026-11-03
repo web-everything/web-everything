@@ -66,12 +66,21 @@ describe('pause flags', () => {
     expect(readPause({ dir, owner: 'ops-hand', now })).not.toBeNull();
     expect(log.map((e) => e.event)).toEqual(['paused', 'resumed']);
   });
-  it('unreadable load never clears or sets flags', () => {
+  it('TTL is a hard cap: expired flag is not recreated while load stays high; main-fix never holdable', () => {
+    const dir = tmp(); const stateFile = join(tmp(), 'st.json'); const o = [{ owner: 'build-a' }];
+    governorTick({ loadPerCore: 3, owners: o, stateFile, dir, now });
+    const later = new Date(now.getTime() + 91 * 60_000);
+    governorTick({ loadPerCore: 3, owners: o, stateFile, dir, now: later });
+    expect(readPause({ dir, owner: 'build-a', now: later })).toBeNull();
+    expect(shouldHold({ text: 'main-fix', holding: true, settings: resolveGovernorSettings({ settings: { loadGovernor: { holdFromClass: 'main-fix' } } }) }).hold).toBe(false);
+    expect(resolveGovernorSettings({ settings: { loadGovernor: { targetLoadPerCore: 1 } } }).resumeBelowPerCore).toBe(0.8);
+  });
+  it('unreadable load fails open: clears governor flags, sets none', () => {
     const dir = tmp(); const stateFile = join(tmp(), 'st.json');
     governorTick({ loadPerCore: 3, owners: [{ owner: 'build-a' }], stateFile, dir, now });
     const r = governorTick({ loadPerCore: NaN, owners: [{ owner: 'build-a' }], stateFile, dir, now });
-    expect(r.events.map((e) => e.event)).toEqual(['load-unreadable']);
-    expect(readPause({ dir, owner: 'build-a', now })).not.toBeNull();
+    expect(r.events.map((e) => e.event)).toEqual(['load-unreadable', 'resumed']);
+    expect(readPause({ dir, owner: 'build-a', now })).toBeNull();
   });
 });
 describe('worker-pause CLI and smell', () => {
