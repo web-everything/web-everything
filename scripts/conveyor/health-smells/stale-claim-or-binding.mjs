@@ -13,7 +13,7 @@ export default {
   cadence: 'every-tick',
   probes: ['sessionWatchdog'],
   openAfter: 1,
-  closeAfter: 1,
+  closeAfter: 3, // one inconclusive pass (missing evidence) must not close an open alert
   severity: 'high',
   action: 'alert',
   recommendationHint: 'A claim is held by a silent holder on an unmoved head. Read the holder\'s transcript (inspect-agent-health) before releasing anything.',
