@@ -197,6 +197,7 @@ import { readGitIdentity, laneIdentityReport, ensureLaneHooksPath, resolveGitIde
 const parseScopeFlag = (v) => (typeof v === 'string' && v ? normScope(v.split(',')) : []);
 
 // ── tiny arg parsing ──────────────────────────────────────────────────────────────────────────────
+const isMain = Boolean(process.argv[1]) && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 const [, , cmd, ...rest] = process.argv;
 const flags = {};
 const positionals = [];
@@ -229,7 +230,7 @@ const isReadOnlyGit = (args) => READ_ONLY_GIT.has(args[0]) || (args[0] === 'remo
 // No inherited GIT_DIR / GIT_REFERENCE_BACKEND-style redirect either: a lane write must never land in another repository.
 // The process drops it too: lane-whois's status proof, lane-history's snapshot and lane-salvage's refs build their
 // git env from process.env (tested in lane-pool-git-diet.test.mjs).
-dropGitLocationEnv(process.env);
+if (isMain) dropGitLocationEnv(process.env);
 const LANE_GIT_ENV = scrubGitLocationEnv(process.env);
 const readOnlyGitEnv = (args) => ({ env: laneGitHardeningEnv(isReadOnlyGit(args) ? { ...LANE_GIT_ENV, GIT_OPTIONAL_LOCKS: '0' } : LANE_GIT_ENV) });
 // The transport keys those pins cannot reach (PR #5775 self-review): a lane-set `remote.origin.uploadpack` is multi-valued
@@ -298,6 +299,40 @@ const tryGit = (args, cwd, opts = {}) => {
   }
 };
 
+/** Read literal output names without executing lane-owned configuration. Unknown configs add nothing. */
+export function ignoredBuildOutputDirs(dir) {
+  const dirs = new Set();
+  const add = (name) => {
+    // Also exclude pathspec magic/globs and platform-specific separators: these must be literal children.
+    if (/^[A-Za-z0-9_-][A-Za-z0-9_.-]*$/.test(name) && !name.includes('..')) dirs.add(name);
+  };
+  try {
+    const config = readFileSync(join(dir, '.eleventy.js'), 'utf8');
+    const dirConfig = config.match(/\bdir\s*:\s*\{([^{}]*)\}/)?.[1];
+    const output = dirConfig?.match(/\boutput\s*:\s*(["'])([^"'\r\n]*)\1/);
+    if (output) add(output[2]);
+  } catch { /* Unreadable config: no Eleventy output is eligible. */ }
+  try {
+    const config = readFileSync(join(dir, 'playwright.config.ts'), 'utf8');
+    for (const match of config.matchAll(/--output=([^\s"'`]+)/g)) add(match[1]);
+  } catch { /* Unreadable config: no Playwright outputs are eligible. */ }
+  return [...dirs];
+}
+
+/** Best-effort removal of ignored build artifacts, scoped to real output directories in this lane. */
+export function cleanIgnoredBuildOutput(dir) {
+  try {
+    const dirs = ignoredBuildOutputDirs(dir).filter((name) => {
+      try { return lstatSync(join(dir, name)).isDirectory(); } catch { return false; }
+    });
+    // Never invoke clean with an empty pathspec (which would target the whole repository).
+    if (dirs.length) git(['clean', '-fdX', '--quiet', '--', ...dirs.map((name) => `${name}/`)], dir);
+  } catch (e) {
+    const message = String(e?.message || e).split('\n')[0].replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ');
+    log(`  ignored build output cleanup failed: ${message}`);
+  }
+}
+
 // Live-fire dispatch test, 2026-08-29: `git fetch origin --prune` crashed `provision`/`acquire` outright —
 // "error: cannot lock ref '<ref>': is at X but expected Y" — a transient race over the SHARED object store
 // every lane clones `--reference` (two lanes' fetches touching the same `refs/remotes/origin/*` at once).
@@ -331,8 +366,7 @@ function fetchOriginPruneWithRetry(dir, dietConfig) {
 const expandHome = (p) => (p && p.startsWith('~') ? join(homedir(), p.slice(1)) : p);
 
 // #3265 — the pool root is DERIVED from the checkout, not assumed from `$HOME`. Pure core + its
-// rationale live in `./lib/lane-pool-paths.mjs` (this file runs its CLI at import, so nothing here is
-// unit-testable by importing it).
+// rationale live in `./lib/lane-pool-paths.mjs`.
 // The checkout ROOT, not the cwd: `defaultPoolRoot` is pure and cannot tell `<checkout>/scripts` from
 // `<checkout>`, so handing it a subdirectory would put the pool INSIDE the repo (#1539 reviewer, round 2).
 // A lane needs no normalising — `workspaceFor` strips at `.lanes` from any depth — but this is the honest
@@ -347,7 +381,7 @@ const LOCAL_GIT_TIMEOUT_MS = Math.min(resolveChildTimeoutMs(), 15_000);
 // and runs `node "<WE_ROOT>/scripts/lane-pool.mjs" acquire …` with no `--repo`. The cwd fallback then found no origin
 // and every prepare failed with `could not determine an origin URL`. Outside any git work tree, the checkout this
 // script lives in is the honest answer (it IS `<WE_ROOT>`), for both the pool root and the repo to acquire from.
-const CWD_TOP_LEVEL = tryGit(['rev-parse', '--show-toplevel'], process.cwd(), { timeout: LOCAL_GIT_TIMEOUT_MS });
+const CWD_TOP_LEVEL = isMain ? tryGit(['rev-parse', '--show-toplevel'], process.cwd(), { timeout: LOCAL_GIT_TIMEOUT_MS }) : null;
 const SCRIPT_CHECKOUT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const CHECKOUT_ROOT = checkoutRootFor({ cwdTopLevel: CWD_TOP_LEVEL, scriptCheckout: SCRIPT_CHECKOUT, cwd: process.cwd() });
 // #3383 — `guardedPoolRoot` (not the bare `defaultPoolRoot`) so a vitest run that spawns this CLI for real with
@@ -356,7 +390,7 @@ const CHECKOUT_ROOT = checkoutRootFor({ cwdTopLevel: CWD_TOP_LEVEL, scriptChecko
 // down this file, so it's callable here.
 let POOL_ROOT;
 try {
-  POOL_ROOT = guardedPoolRoot(CHECKOUT_ROOT);
+  if (isMain) POOL_ROOT = guardedPoolRoot(CHECKOUT_ROOT);
 } catch (e) {
   // `fail` calls `process.exit(1)`, which does not itself unwind JS execution — the `throw` right after is a
   // belt-and-suspenders stop so nothing below this line ever runs against an undefined POOL_ROOT in the window
@@ -1458,6 +1492,7 @@ function refreshLane(repo, n, { force = false } = {}) {
   const verdict = destructiveActionVerdict({ unpushed: before.unpushed, override: force });
   git(['reset', '--hard', `origin/${repo.branch}`, '--quiet'], dir);
   git(['clean', '-fd', '--quiet'], dir); // remove untracked, KEEP ignored (node_modules) — no -x
+  cleanIgnoredBuildOutput(dir);
   journalLaneEvent(dir, {
     action: 'refresh-reset', before, headAfter: laneHead(dir),
     reason: force ? `refresh --force (${verdict.reason})` : 'refresh — clean lane fast-forwarded', loud: verdict.loud || undefined,
@@ -2221,6 +2256,7 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
     if (reclaimAhead) logReclaimedAheadCommits(dir, repo.branch, chosen);
     git(['checkout', '-B', repo.branch, baseRef, '--quiet', '--force'], dir);
     git(['clean', '-fd', '--quiet'], dir);
+    cleanIgnoredBuildOutput(dir);
       return { before, baseRef };
     };
     let reset;
@@ -4907,6 +4943,7 @@ const COMMANDS = {
   unmap: cmdUnmap,
 };
 
+if (isMain) {
 if (!cmd || cmd === 'help' || cmd === '--help' || !COMMANDS[cmd]) {
   if (cmd && cmd !== 'help' && cmd !== '--help') process.stderr.write(`unknown command: ${cmd}\n`);
   process.stderr.write(
@@ -4947,3 +4984,4 @@ if (unknownFlags.length) {
 }
 
 await COMMANDS[cmd](resolveRepo());
+}
