@@ -13,7 +13,7 @@ const HEAD_A = 'a'.repeat(40), HEAD_B = 'b'.repeat(40);
 export default {
   id: 'post-accept-advisory-shadow-replay',
   title: 'post-accept advisory replay deduplicates observations and preserves live review on telemetry failure',
-  card: 'x5vjl3o / #7618 / PR #6218',
+  card: '7618 / #7618 / PR #6218',
   fixedBy: { sha: 'HEAD', where: 'lane/x5vjl3o-post-accept-shadow',
     paths: [CLI, 'scripts/lib/review-loop-policy.mjs', 'scripts/operations/review-pr-io.mjs'] },
   fixPresent(root) {
