@@ -209,11 +209,14 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
   // A failed delete must never leave the old first-idle sample usable: remember the reset in memory too.
   const idleVoid = new Set();
   function resetIdle(entry) {
-    try { unlinkSync(idleFile(entry.file)); } catch (error) { if (error?.code !== 'ENOENT') idleVoid.add(entry.key); }
+    try { unlinkSync(idleFile(entry.file)); return; } catch (error) { if (error?.code === 'ENOENT') return; }
+    // Delete failed: neutralise the persisted sample by overwriting it (a recreated reaper then sees no valid stamp);
+    // if even that fails, this instance still refuses the stale sample until a fresh one is written.
+    try { writeFileSync(idleFile(entry.file), '{}', {mode: 0o600}); } catch { idleVoid.add(entry.key); }
   }
   function idleStamp(file, key, sampledAt) {
-    if (idleVoid.delete(key)) {
-      try { writeFileSync(idleFile(file), JSON.stringify({key, sampledAt}), {mode: 0o600}); } catch { /* retried next pass */ }
+    if (idleVoid.has(key)) {
+      try { writeFileSync(idleFile(file), JSON.stringify({key, sampledAt}), {mode: 0o600}); idleVoid.delete(key); } catch { /* still void: retried next pass */ }
       return sampledAt;
     }
     try { const saved = JSON.parse(readFileSync(idleFile(file), 'utf8')); if (saved.key === key && Number.isFinite(saved.sampledAt)) return saved.sampledAt; } catch { /* none yet */ }

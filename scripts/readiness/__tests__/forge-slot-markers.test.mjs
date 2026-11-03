@@ -238,7 +238,8 @@ describe('stale remote slot markers (perf10)', () => {
       await reaper.step(tel(0, S1, [going(RUN_A)]));
       chmodSync(root, 0o500); // unlink of the sidecar now fails with EACCES
       try { await reaper.step(async () => null); } finally { chmodSync(root, 0o700); }
-      expect(existsSync(join(root, 'slot-0.unconfirmed.idle'))).toBe(true);
+      const recreated = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
+      expect(await recreated.step(tel(0, S1 + 31_000, [going(RUN_A)]))).toEqual([]); // neutralised on disk, not just in memory
       expect(await reaper.step(tel(0, S1 + 31_000, [going(RUN_A)]))).toEqual([]);
       expect(names(root)).toEqual(['0']);
     });
