@@ -347,7 +347,7 @@ function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = []
   if (surfaceWidening) return done('suggest-split', [`finding-surface-widening:${newFiles.slice(0, 3).join(',')}`]);
   // R469 / D-R451: a NEW finding class in each of rounds 1 and 2 (nothing in the latest round was raised before, and the
   // count is not shrinking) is non-converging: route to redesign instead of granting round 3. Opt-in (settings-gated).
-  if (nonConverging?.enabled === true && same.length >= 2 && prev && annotated.length && repeated.length === 0
+  if (nonConverging?.enabled === true && same.length >= 2 && prev && annotated.length && repeated.length === 0 && !guardFindings.length
     && latestOpen.length >= prevOpen.length) {
     return done('non-converging', [`new-finding-class-each-round:${same.length}-rounds-${annotated.length}-new-findings`, 'route-to-redesign-D-R451']);
   }

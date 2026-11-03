@@ -360,4 +360,8 @@ describe('non-converging stop (R469: a new finding class each round)', () => {
     const r = judge([r1(), r2()], { nonConverging: { enabled: true }, llm: () => ({ verdict: 'grant', k: 1, reasons: ['x'] }) });
     expect(r.verdict).toBe('non-converging');
   });
+  it('never preempts the guard-code path: findings in guard files keep their usual verdict', () => {
+    const g = rt(H(9), [['scripts/lib/red-team-gate.mjs', 5, 'delta timeout unit mismatch in header'], ['src/e.mjs', 8, 'epsilon path join loses the drive'], ['src/f.mjs', 9, 'zeta token refresh races']]);
+    expect(judge([r1(), g], { nonConverging: { enabled: true } }).verdict).not.toBe('non-converging');
+  });
 });
