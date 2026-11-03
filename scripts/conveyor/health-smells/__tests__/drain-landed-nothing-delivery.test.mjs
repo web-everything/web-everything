@@ -96,4 +96,15 @@ describe('drain-landed-nothing delivery (real core + planner, default shadow mod
     const plan = planActions(out.transitions, { [smell.id]: smell }, { mode: 'shadow' }).filter((p) => p.kind === 'notify');
     expect(plan.length).toBe(1);
   });
+  it('alternating failed zero-count and queued passes still alert once 30 min have passed', () => {
+    const now = T0 + 120 * MIN;
+    const h = [];
+    for (let m = 100; m >= 2; m -= 8) h.push(m % 16 === 4 ? { at: now - m * MIN, considered: 0, merged: 0, exit: 1, failed: 1 } : { at: now - m * MIN, considered: 4, merged: 0 });
+    expect(smell.evaluate({ drainHistory: h }, { now })[0].breach).toBe(true);
+  });
+  it('an empty queue two hours ago then queued passes 1-2 min ago does not bypass the 30 min threshold', () => {
+    const now = T0 + 120 * MIN;
+    const h = [{ at: now - 120 * MIN, considered: 0, merged: 0, exit: 0, failed: 0 }, { at: now - 2 * MIN, considered: 4, merged: 0 }, { at: now - 1 * MIN, considered: 4, merged: 0 }];
+    expect(smell.evaluate({ drainHistory: h }, { now })).toEqual([]);
+  });
 });

@@ -11,27 +11,25 @@ import { HOUR } from '../health-watch-core.mjs';
 const MIN = 60 * 1000;
 
 /** PURE: the stall over the last `windowMs`, or null when the drain landed something / had nothing queued / is not covered. */
-/** The newest INFORMATIVE pass (a merge, queued work, or a clean empty queue — failed zero-count passes tell us nothing) was queued-and-unmerged more than `windowMs` ago and nothing since proves recovery. */
-function staleStall(history, now, windowMs) {
-  const informative = history.filter((p) => now - p.at >= 0 && ((Number(p.merged) || 0) > 0 || (Number(p.considered) || 0) > 0 || (p.exit === 0 && !(Number(p.failed) > 0))))
-    .sort((a, b) => b.at - a.at)[0];
-  if (informative && now - informative.at > windowMs && (Number(informative.considered) || 0) > 0 && (Number(informative.merged) || 0) === 0) {
-    return { passes: 0, considered: Number(informative.considered) || 0, reason: `no informative drain pass in ${Math.round((now - informative.at) / MIN)} min; the last one had ${Number(informative.considered)} queued and landed none` };
-  }
-  return null;
-}
+/** A pass that proves the drain recovered: it merged something, or it cleanly (exit 0, nothing failed) found nothing queued. */
+const isRecovery = (p) => (Number(p.merged) || 0) > 0 || ((Number(p.considered) || 0) === 0 && p.exit === 0 && !(Number(p.failed) > 0));
+/** A pass that had queued PRs and landed none. Failed zero-count passes are neither this nor recovery: they are ignored. */
+const isStalled = (p) => (Number(p.considered) || 0) > 0 && (Number(p.merged) || 0) === 0;
 
-export function landedNothing(rawHistory, { now, windowMs = 30 * MIN, minPasses = 2 } = {}) {
-  const history = (rawHistory || []).filter((p) => p.valid !== false); // a record with a missing/invalid count is UNKNOWN, never "landed something" or "nothing queued"
-  const inWin = history.filter((p) => now - p.at >= 0 && now - p.at <= windowMs).sort((a, b) => a.at - b.at);
-  if (inWin.length < minPasses) return staleStall(history, now, windowMs);
-  const everyIdle = inWin.every((p) => (Number(p.considered) || 0) > 0 && (Number(p.merged) || 0) === 0);
-  if (!everyIdle) return staleStall(history, now, windowMs);
-  const earlierCover = (history || []).some((p) => now - p.at >= windowMs * 0.9);
-  if (!earlierCover && inWin[0].at - (now - windowMs) > windowMs * 0.5) return staleStall(history, now, windowMs); // passes only cover the tail of the window
-  const last = inWin[inWin.length - 1];
+/**
+ * PURE: the stall, or null. The stall STARTS at the first queued-and-unmerged pass after the latest recovery (or
+ * the beginning of history) and holds while no recovery follows; it counts once it has lasted `windowMs`. Records with
+ * a missing/invalid count and failed zero-count passes are ignored (unknown, never recovery).
+ */
+export function landedNothing(rawHistory, { now, windowMs = 30 * MIN } = {}) {
+  const history = (rawHistory || []).filter((p) => p.valid !== false && now - p.at >= 0).sort((a, b) => a.at - b.at);
+  let start = null; let last = null; let passes = 0;
+  for (const p of history) {
+    if (isRecovery(p)) { start = null; last = null; passes = 0; } else if (isStalled(p)) { start ??= p.at; last = p; passes += 1; }
+  }
+  if (start == null || now - start < windowMs) return null;
   const bits = [...(last.skippedPrs || []), ...(last.deferredDetail || [])].map((x) => String(typeof x === 'string' ? x : JSON.stringify(x)).replace(/\s+/g, ' ').slice(0, 160));
-  return { passes: inWin.length, considered: Number(last.considered) || 0, reason: bits.length ? bits.slice(0, 2).join(' | ') : 'no hold reason in history; see daemon.log' };
+  return { passes, considered: Number(last.considered) || 0, reason: bits.length ? bits.slice(0, 2).join(' | ') : `queued PRs landed none for ${Math.round((now - start) / MIN)} min; no hold reason in history, see daemon.log` };
 }
 
 /** PURE: how many history passes fall in the window (fewer than `minPasses` is UNKNOWN, never clean). */
@@ -41,7 +39,7 @@ export function passesInWindow(rawHistory, { now, windowMs = 30 * MIN } = {}) {
 
 /** PURE: recovery evidence in the window — a valid pass that merged something, or a CLEAN (exit 0, nothing failed) pass that found nothing queued; a failed or partial pass with zero candidates proves nothing. Anything else is UNKNOWN. */
 export function recovered(rawHistory, { now, windowMs = 30 * MIN } = {}) {
-  return (rawHistory || []).some((p) => p.valid !== false && now - p.at >= 0 && now - p.at <= windowMs && ((Number(p.merged) || 0) > 0 || ((Number(p.considered) || 0) === 0 && p.exit === 0 && !(Number(p.failed) > 0))));
+  return (rawHistory || []).some((p) => p.valid !== false && now - p.at >= 0 && now - p.at <= windowMs && isRecovery(p));
 }
 
 export default {
