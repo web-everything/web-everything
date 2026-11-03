@@ -22,7 +22,7 @@
  *   bug this item removes).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readFileSync, cpSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, cpSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, sep } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -84,7 +84,9 @@ describe('lane acquire smoke after lane-hold reset refusal', () => {
   });
 
   describe('explicit-lane fallback from the published free-lane hints when the auto-pick scan times out', () => {
-    const hinted = (hints, runChild, hostBusy = () => true) => ({ ...context(runChild), laneHints: () => hints, hostBusy });
+    let tick;
+    beforeEach(() => { tick = 0; });
+    const hinted = (hints, runChild, hostBusy = () => true) => ({ ...context(runChild), laneHints: () => hints, hostBusy, clock: () => (tick += 120_000) });
     const timedOut = () => exit(1, { message: 'timed out after 120000ms (process group killed)' });
     it('a healthy auto-pick is used as before and the hints are never touched', async () => {
       const runChild = vi.fn().mockResolvedValueOnce(JSON.stringify({ lane: 3 })).mockResolvedValueOnce('');
@@ -107,27 +109,35 @@ describe('lane acquire smoke after lane-hold reset refusal', () => {
     });
     it('a failed cleanup after the timeout refuses the fallback (no leaked lease hidden)', async () => {
       const runChild = vi.fn().mockRejectedValueOnce(timedOut()).mockRejectedValueOnce(exit(1));
-      expect((await check.run(hinted([7], runChild))).ok).toBe(false);
+      expect((await check.run(hinted([7], runChild))).lane).toBeUndefined();
       expect(acquires(runChild)).toHaveLength(1);
     });
     it('a fast "no free lane" is NEVER rescued by a hint (no laundering)', async () => {
       const runChild = vi.fn().mockRejectedValue(exit(1, { stderr: '✗ no free lane in pool "web-everything" (3 all held/dirty)' }));
-      expect((await check.run(hinted([7], runChild))).ok).toBe(false);
+      expect((await check.run(hinted([7], runChild))).lane).toBeUndefined();
       expect(acquires(runChild).some(([, args]) => args.some((x) => x.startsWith('--lane=')))).toBe(false);
     });
     it('every hint failing re-throws the original timeout (still a failure, leases released)', async () => {
       const runChild = vi.fn().mockRejectedValue(timedOut());
       const row = await check.run(hinted([7], runChild));
-      expect(row.ok).toBe(false);
+      expect(row.lane).toBeUndefined();
       expect(row.detail).toMatch(/timed out after/);
       expect(runChild.mock.calls.some(([, args]) => args.includes('release') && args.includes('--all-pools'))).toBe(true);
     });
-    it('smokeLaneHints reads the list regardless of age, skips the caller\'s own lane, [] when missing', () => {
+    it('a FAST failure worded like a timeout is not rescued', async () => {
+      const runChild = vi.fn().mockRejectedValue(exit(1, { message: 'exited 1: x timed out after 120000ms (process group killed)' }));
+      expect((await check.run({ ...hinted([7], runChild), clock: () => 1000 })).ok).toBe(false);
+      expect(acquires(runChild).some(([, args]) => args.some((x) => x.startsWith('--lane=')))).toBe(false);
+    });
+    it('smokeLaneHints reads the list regardless of age, drops the caller\'s own lane (symlink-safe) and unresolvable rows', () => {
       const dir = mkdtempSync(join(tmpdir(), 'hints-'));
+      const mk = (n) => { const d = join(dir, `lane-${n}`); mkdirSync(d); return d; };
+      const own = mk(1); symlinkSync(own, join(dir, 'alias'));
       const file = join(dir, 'l.json');
-      writeFileSync(file, JSON.stringify({ v: 1, writtenAt: 1, repo: 'web-everything', poolDir: dir, lanes: [{ lane: 5 }, { lane: 2, path: '/x' }, { lane: 8 }, { lane: 9 }] }));
-      expect(smokeLaneHints({ root: '/x', env: { LANE_POOL_FREE_LIST_FILE: file } })).toEqual([5, 8, 9]);
-      expect(smokeLaneHints({ root: '/x', env: { LANE_POOL_FREE_LIST_FILE: join(dir, 'none.json') } })).toEqual([]);
+      writeFileSync(file, JSON.stringify({ v: 1, writtenAt: 1, repo: 'web-everything', poolDir: dir,
+        lanes: [{ lane: 5, path: mk(5) }, { lane: 1, path: join(dir, 'alias') }, { lane: 8, path: mk(8) }, { lane: 9 }, { lane: 10, path: join(dir, 'gone') }, { lane: 11, path: mk(11) }, { lane: 12, path: mk(12) }] }));
+      expect(smokeLaneHints({ root: own, env: { LANE_POOL_FREE_LIST_FILE: file } })).toEqual([5, 8, 11]);
+      expect(smokeLaneHints({ root: own, env: { LANE_POOL_FREE_LIST_FILE: join(dir, 'none.json') } })).toEqual([]);
     });
   });
 

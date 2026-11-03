@@ -74,9 +74,9 @@
  */
 
 import { randomUUID, createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { cpus, homedir, loadavg, tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { admit as admitResource, shadowAdmission } from './resource-admission.mjs';
 import { resolveCutoverMode } from './resource-gate.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
@@ -417,9 +417,12 @@ export function smokeLaneHints({ root, env = process.env, max = SMOKE_LANE_HINT_
   try {
     const poolDir = join(defaultPoolRoot(root, env), 'web-everything');
     const list = readFreeLaneList(resolveFreeLaneListPath({ repoName: 'web-everything', poolDir, env }));
-    // Never target the caller's own checkout (auto-pick's own selfLane exclusion).
-    const self = resolve(root);
-    const rows = (list?.lanes ?? []).filter((l) => !l?.path || resolve(l.path) !== self);
+    // Never target the caller's own checkout (auto-pick's own selfLane exclusion): canonical paths, and a row
+    // whose path is missing or unresolvable is dropped rather than trusted.
+    const self = realpathSync(root);
+    const rows = (list?.lanes ?? []).filter((l) => {
+      try { return l?.path && realpathSync(l.path) !== self; } catch { return false; }
+    });
     return freeLaneCandidates({ ...list, lanes: rows }).slice(0, max);
   } catch { return []; }
 }
@@ -466,8 +469,9 @@ async function checkLaneAcquireRelease(ctx) {
       }
       return undefined;
     };
-    const isTimeout = (e) => /timed out after \d+ms/.test(String(e?.message ?? e));
+    const isTimeout = (e) => /^timed out after \d+ms \(process group killed\)$/.test(String(e?.message ?? '').trim());
     const acquireWithHintFallback = async () => {
+      const tStart = (ctx.clock ?? Date.now)();
       try {
         return await acquire(hints.length ? Math.min(acquireCapMs, SMOKE_AUTOPICK_FIRST_MS) : acquireCapMs);
       } catch (e) {
@@ -475,7 +479,8 @@ async function checkLaneAcquireRelease(ctx) {
         // auto-pick; an idle-host timeout stays a failure. A failed cleanup also refuses the fallback, so a
         // possibly-leaked lease can never be hidden behind a later hinted success.
         const busy = typeof ctx.hostBusy === 'function' ? ctx.hostBusy() : hostLooksBusy(env);
-        if (!hints.length || !isTimeout(e) || !busy) throw e;
+        const firstCap = Math.min(acquireCapMs, SMOKE_AUTOPICK_FIRST_MS);
+        if (!hints.length || !isTimeout(e) || !busy || !((ctx.clock ?? Date.now)() - tStart >= firstCap * 0.9)) throw e;
         try { await releaseSession(); } catch { throw e; }
         const hinted = await acquireHinted();
         if (hinted === undefined) throw e;
