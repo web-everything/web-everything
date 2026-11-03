@@ -99,17 +99,59 @@ async function world(fn, { slug = 'fixture/prestage' } = {}) {
       expect(r.status, r.stderr + r.stdout).toBe(0);
       return { report:JSON.parse(r.stdout), stdout:r.stdout, calls:readFileSync(log,'utf8').trim().split('\n').filter(Boolean).map(JSON.parse), stderr:r.stderr };
     };
-    await fn({pr,run,coord,ledger,slug});
+    await fn({pr,run,coord,ledger,slug,dir});
   } finally { rmSync(dir,{recursive:true,force:true}); }
 }
 
 describe('real drain pre-stage path', () => {
+  it.each(['dependency-held', 'cascade', 'prestage'])('shadow adds zero gh calls compared with off (%s)', async path => {
+    const traces = [];
+    for (const shadowMode of ['off', 'shadow']) {
+      await world(({pr,run,dir,coord}) => {
+        if (path === 'dependency-held') {
+          pr.body += '\n<!-- lane-manifest:begin -->\n```json\n' + JSON.stringify({
+            item:'xabc123', repos:[{repo:'we',ref:pr.headRefName}], blockedBy:[], stackParents:['xpar123'],
+          }) + '\n```\n<!-- lane-manifest:end -->';
+        }
+        const calls = [];
+        if (path === 'prestage') {
+          const prepared = run(false, { shadowMode });
+          expect(prepared.stderr).toContain('eligible=true');
+          calls.push(...prepared.calls);
+        }
+        pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+        const next = run(path === 'prestage', { shadowMode });
+        calls.push(...next.calls);
+        if (path === 'dependency-held') {
+          expect(next.report.deferred, next.stderr).toEqual(expect.arrayContaining([
+            expect.objectContaining({num:42,waitOn:['xpar123']}),
+          ]));
+          expect(next.report.enqueueOutcomes ?? []).toEqual([]);
+          // Off's no-op still evaluates its arguments: equality alone could miss
+          // the same accidental readyInfoOf/label read in BOTH modes.
+          expect(calls.filter(a => a[0] === 'api' && a.some(x => x.includes('/issues/42/events')))).toEqual([]);
+          if (shadowMode === 'shadow') {
+            const rows = JSON.parse(readFileSync(join(coord, 'drain-async-shadow', 'state.json'), 'utf8')).records;
+            expect(rows).toEqual([expect.objectContaining({num:42,headSha:sha,actualEnqueueAt:null})]);
+          }
+        } else {
+          expect(next.report.enqueueOutcomes).toMatchObject([{num:42,outcome:'enqueued'}]);
+          if (path === 'prestage') expect(next.report.prestaged).toBe(true);
+        }
+        // Fixture roots differ; preserve every gh argument and its ordering.
+        traces.push(calls.filter(a => a[0] !== 'git').map(a => a.map(x => x.replaceAll(dir, '<fixture>'))));
+      });
+    }
+    expect(traces[1]).toEqual(traces[0]);
+  });
+
   it.each([false, true])('scoped drain preserves another PR pending timing (prestage: %s)', green => world(({pr,run,coord,slug}) => {
     const dir = join(coord, 'drain-async-shadow');
     const other = { repo: slug, num: 43, headSha: 'b'.repeat(40) };
-    const firstSeen = Date.now() - 1000;
-    createAsyncShadow({ mode: 'shadow', dir, now: () => firstSeen }).observePass({ candidates: [other] });
     if (green) expect(run(false, { shadowMode:'shadow' }).stderr).toContain('eligible=true');
+    const firstSeen = Date.now() - 1000;
+    const target = { repo: slug, num: 42, headSha: sha };
+    createAsyncShadow({ mode: 'shadow', dir, now: () => firstSeen }).observePass({ candidates: [target, other] });
     pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
     expect(run(green, { shadowMode:'shadow' }).report.enqueueOutcomes).toMatchObject([{num:42,outcome:'enqueued'}]);
     const pending = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')).records.find(row => row.num === 43);
@@ -117,6 +159,8 @@ describe('real drain pre-stage path', () => {
     expect(pending.retired).not.toBe(true);
     createAsyncShadow({ mode: 'shadow', dir }).recordActual(other);
     const rows = readFileSync(join(dir, 'shadow.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(rows).toHaveLength(2);
+    expect(rows.find(row => row.num === 42)).toMatchObject({ headSha: sha, actualEnqueueAt: expect.any(Number) });
     expect(rows.find(row => row.num === 43)).toMatchObject({ wouldEnqueueAt: firstSeen, actualEnqueueAt: expect.any(Number) });
   }));
   it('a drain run with json=true and WE_ASYNC_DRAIN=shadow writes rows with unchanged stdout', () => world(({pr,run,coord}) => {

@@ -28,6 +28,7 @@ export function summarize(lines) {
   };
 }
 
+/** WE_ASYNC_DRAIN defaults to off; set shadow explicitly to collect timing data. */
 export function createAsyncShadow({
   env = process.env,
   mode = env.WE_ASYNC_DRAIN || 'off',

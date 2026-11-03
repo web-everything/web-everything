@@ -106,7 +106,7 @@ describe('async drain shadow measurement', () => {
     expect(shadow.emitSummary().readyNotReached).toBe(1);
   });
 
-  it.each([undefined, 'live', 'typo'])('is off by default and for unknown modes (%s)', mode => {
+  it.each([undefined, 'off', 'live', 'typo'])('is off by default, for explicit off, and for unknown modes (%s)', mode => {
     const dir = join(temp(), 'disabled');
     const shadow = createAsyncShadow({ env: {}, mode, dir });
     shadow.observePass({ candidates: [candidate] });
