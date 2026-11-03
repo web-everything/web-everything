@@ -13,6 +13,48 @@ const key = c => `${c.repo}#${c.num}@${c.headSha}`;
 afterEach(() => { for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe('async drain shadow measurement', () => {
+  it.each([{ ...candidate, num: 8 }, { ...candidate, repo: 'other/repo' }])(
+    'preserves unrelated pending observations through scoped and empty passes (%j)', other => {
+      const dir = temp();
+      createAsyncShadow({ mode: 'shadow', dir, now: () => 100 })
+        .observePass({ candidates: [candidate, other] });
+      const scoped = createAsyncShadow({ mode: 'shadow', dir, now: () => 200 });
+      scoped.observePass({ candidates: [candidate], observedPrs: [candidate] });
+      scoped.observePass({ candidates: [], observedPrs: [candidate], countMissed: false });
+      scoped.observePass({ candidates: [], observedPrs: [] });
+      const rows = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')).records;
+      expect(rows.find(row => key(row) === key(other))).toMatchObject({
+        wouldEnqueueAt: 100, readyNotReached: 0, actualEnqueueAt: null,
+      });
+      expect(rows.find(row => key(row) === key(other)).retired).not.toBe(true);
+      expect(rows.find(row => key(row) === key(candidate)).retired).toBe(true);
+      const resumed = createAsyncShadow({ mode: 'shadow', dir, now: () => 300 });
+      resumed.observePass({ candidates: [other], observedPrs: [other] });
+      resumed.recordActual(other);
+      expect(lines(join(dir, 'shadow.jsonl'))).toEqual([
+        expect.objectContaining({ repo: other.repo, num: other.num, wouldEnqueueAt: 100, actualEnqueueAt: 300, deltaMs: 200 }),
+      ]);
+      expect(resumed.emitSummary().readyNotReached).toBe(2);
+    },
+  );
+
+  it('retires a superseded head within scope while expiring unrelated rows only at the retention bound', () => {
+    const dir = temp(); let clock = 100;
+    const shadow = createAsyncShadow({ mode: 'shadow', dir, now: () => clock, retentionMs: 50 });
+    const other = { ...candidate, num: 8 };
+    shadow.observePass({ candidates: [candidate, other] });
+    const next = { ...candidate, headSha: 'head-b' };
+    clock = 120;
+    shadow.observePass({ candidates: [next], observedPrs: [next] });
+    let rows = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')).records;
+    expect(rows.find(row => key(row) === key(candidate)).retired).toBe(true);
+    expect(rows.find(row => key(row) === key(other)).retired).not.toBe(true);
+    clock = 150;
+    shadow.observePass({ candidates: [], observedPrs: [] });
+    rows = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')).records;
+    expect(rows.find(row => key(row) === key(other))).toMatchObject({ retired: true, retiredAt: 150, readyNotReached: 0 });
+  });
+
   it('retires superseded and absent heads so two empty passes freeze head A after head B enqueues', () => {
     const dir = temp();
     const shadow = createAsyncShadow({ mode: 'shadow', dir, now: () => 100 });

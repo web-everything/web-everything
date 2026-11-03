@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 
 const keyOf = ({ repo, num, headSha }) => `${repo}#${num}@${headSha}`;
+const prKeyOf = ({ repo, num }) => `${repo}#${num}`;
 
 /** Completed timings only; pending rows still contribute missed passes and reasons. P90 is nearest-rank. */
 export function summarize(lines) {
@@ -102,10 +103,13 @@ export function createAsyncShadow({
     return summary;
   };
   return {
-    observePass({ candidates, enqueuedKeys = new Set(), countMissed = true }) {
+    observePass({ candidates, observedPrs = null, enqueuedKeys = new Set(), countMissed = true }) {
       pass++;
       const seenAt = now();
       const candidateKeys = new Set(candidates.map(keyOf));
+      // null means a complete inventory. Scoped callers name every PR they actually
+      // inspected (including ineligible ones); absence says nothing about other PRs.
+      const observedPrKeys = observedPrs == null ? null : new Set(observedPrs.map(prKeyOf));
       for (const [key, row] of records) {
         // Freeze superseded, closed/merged, absent and expired heads BEFORE counting this pass.
         if (row.retired) {
@@ -113,12 +117,13 @@ export function createAsyncShadow({
           continue;
         }
         if (row.actualEnqueueAt != null) continue;
-        if (!candidateKeys.has(key) || seenAt - row.wouldEnqueueAt >= retentionMs) {
+        const absentInScope = !candidateKeys.has(key) && (observedPrKeys == null || observedPrKeys.has(prKeyOf(row)));
+        if (absentInScope || seenAt - row.wouldEnqueueAt >= retentionMs) {
           row.retired = true;
           row.retiredAt = seenAt;
           continue;
         }
-        if (countMissed && !enqueuedKeys.has(key)) row.readyNotReached++;
+        if (countMissed && candidateKeys.has(key) && !enqueuedKeys.has(key)) row.readyNotReached++;
       }
       for (const candidate of candidates) {
         const key = keyOf(candidate);

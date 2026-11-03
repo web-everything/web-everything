@@ -12,6 +12,7 @@ import { fixDispatchResource } from '../conveyor/fix-claim-store.mjs';
 import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
 import { createPrestageCache, resolvePrestageSettings, enqueuePrestage } from '../lib/drain-prestage.mjs';
 import { buildLedgerEvent, EVENT_TYPES } from '../lib/verdict-ledger.mjs';
+import { createAsyncShadow } from '../lib/drain-async-shadow.mjs';
 
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs');
 const sha = 'a'.repeat(40);
@@ -103,6 +104,21 @@ async function world(fn, { slug = 'fixture/prestage' } = {}) {
 }
 
 describe('real drain pre-stage path', () => {
+  it.each([false, true])('scoped drain preserves another PR pending timing (prestage: %s)', green => world(({pr,run,coord,slug}) => {
+    const dir = join(coord, 'drain-async-shadow');
+    const other = { repo: slug, num: 43, headSha: 'b'.repeat(40) };
+    const firstSeen = Date.now() - 1000;
+    createAsyncShadow({ mode: 'shadow', dir, now: () => firstSeen }).observePass({ candidates: [other] });
+    if (green) expect(run(false, { shadowMode:'shadow' }).stderr).toContain('eligible=true');
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    expect(run(green, { shadowMode:'shadow' }).report.enqueueOutcomes).toMatchObject([{num:42,outcome:'enqueued'}]);
+    const pending = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')).records.find(row => row.num === 43);
+    expect(pending).toMatchObject({ wouldEnqueueAt: firstSeen, readyNotReached: 0, actualEnqueueAt: null });
+    expect(pending.retired).not.toBe(true);
+    createAsyncShadow({ mode: 'shadow', dir }).recordActual(other);
+    const rows = readFileSync(join(dir, 'shadow.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(rows.find(row => row.num === 43)).toMatchObject({ wouldEnqueueAt: firstSeen, actualEnqueueAt: expect.any(Number) });
+  }));
   it('a drain run with json=true and WE_ASYNC_DRAIN=shadow writes rows with unchanged stdout', () => world(({pr,run,coord}) => {
     pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
     const next = run(false, { shadowMode:'shadow' });

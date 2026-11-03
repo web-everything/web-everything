@@ -5430,7 +5430,7 @@ async function runCli() {
         prestageShadowCandidate = { repo: c.repo || localSlug, num: c.num, headSha: sha };
         // Eligibility was just checked live. No label reads are added for telemetry.
         try {
-          asyncShadow?.observePass({ candidates: [prestageShadowCandidate] });
+          asyncShadow?.observePass({ candidates: [prestageShadowCandidate], observedPrs: [prestageShadowCandidate] });
           shadowObserved = true;
         } catch { /* Timing only. */ }
         return announceAndRetargetBeforeLand(c, { preread: fetchPrComments(c.repo, c.num), defaultBranch: entry.baseRefName });
@@ -6769,10 +6769,13 @@ async function runCli() {
     try {
       // A dependency-held candidate may not have reached ready ordering. Never trigger a label read for telemetry.
       // A failed prestage attempt can fall through within this same sweep, not a later missed pass.
-      asyncShadow?.observePass({ countMissed: !shadowObserved, candidates: toMerge.map(c => ({
-        repo: c.repo || localSlug, num: c.num, headSha: c.headSha,
-        readyAtMs: readyInfoMemo.has(`${c.repo || localSlug}#${c.num}@${c.listedHeadSha || c.headSha || null}`) ? readyInfoOf(c).readyAtMs : null,
-      })) });
+      asyncShadow?.observePass({ countMissed: !shadowObserved,
+        // A filtered/targeted listing is not evidence that another PR disappeared.
+        observedPrs: verdicts.map(c => ({ repo: c.repo || localSlug, num: c.num })),
+        candidates: toMerge.map(c => ({
+          repo: c.repo || localSlug, num: c.num, headSha: c.headSha,
+          readyAtMs: readyInfoMemo.has(`${c.repo || localSlug}#${c.num}@${c.listedHeadSha || c.headSha || null}`) ? readyInfoOf(c).readyAtMs : null,
+        })) });
     } catch { /* Timing observations never affect enqueue decisions. */ }
   }
   const skipped = verdicts.filter((v) => v.decision === 'skip' && !v.requiredCheckReadError);
