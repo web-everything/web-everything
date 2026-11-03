@@ -2073,8 +2073,9 @@ function roundCapExhaustedNoteText(prNumber, attempts, cap, capKind) {
  *  `review:pending` that would hold an auto-landing PR for a review it does not need. */
 export const RESTORE_REVIEW_LABEL_GRACE_MS = 10 * 60_000;
 
-/** True only when every run has readable timing and every latest run has completed at least the grace ago. */
-export function greenSettledForRestoreGrace(rollup, now, graceMs = RESTORE_REVIEW_LABEL_GRACE_MS) {
+/** Every run needs readable timing; latest required checks must be successful statuses or completed runs.
+ * All latest reports, including optional checks, must have aged through the grace window. */
+export function greenSettledForRestoreGrace(rollup, now, graceMs = RESTORE_REVIEW_LABEL_GRACE_MS, requiredChecks = null) {
   if (!Array.isArray(rollup) || !rollup.length || !Number.isFinite(now) || now <= 0) return false;
   // Validate BEFORE collapse: an unreadable same-name row cannot be proven older than the winner.
   // A legacy status dates its report with startedAt, even when a later CheckRun supersedes its failure.
@@ -2084,10 +2085,21 @@ export function greenSettledForRestoreGrace(rollup, now, graceMs = RESTORE_REVIE
   // so same-name StatusContexts are ordered by time rather than response position.
   const checks = collapseRollupToLatestPerName(rollup.map(c => c?.__typename === 'StatusContext'
     ? { ...c, completedAt: c.startedAt } : c));
-  if (checks.some(c => c?.__typename === 'StatusContext'
+  const required = Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks : null;
+  if (checks.filter(c => required
+    ? required.includes(c?.name ?? c?.context)
+    : !CI_TRUTH_EXCLUDED_CHECKS.includes(c?.name ?? c?.context)).some(c => c?.__typename === 'StatusContext'
     ? String(c.state).toUpperCase() !== 'SUCCESS'
     : String(c?.status).toUpperCase() !== 'COMPLETED')) return false;
   return now - Math.max(...checks.map(completion)) >= graceMs;
+}
+
+/** A stacked PR may need its review label before CI ever starts. Do not mistake a rerun,
+ * a missing rollup, or malformed timing for that never-started state. */
+function checksNotYetRun(rollup) {
+  return Array.isArray(rollup) && rollup.every(c => c && c.__typename !== 'StatusContext'
+    && ['QUEUED', 'PENDING', 'WAITING', 'REQUESTED'].includes(String(c.status).toUpperCase())
+    && c.conclusion == null && c.completedAt == null && c.startedAt == null);
 }
 
 /** #3902 — env switch for the review-label healer: `stuck` (default) | `green` | `off`. */
@@ -2727,11 +2739,17 @@ export function planReconcile({
     }
 
     // ── PHASE, BORROWED. `classifyPr` for the labels, `reduceCheckState` for CI truth. Not re-derived.
+    // The shared reducers read `name`; legacy contexts use `context`. Apply the fallback exclusions
+    // using either spelling so an excluded legacy failure cannot force ci-red before restoration.
+    // Keep the original rollup for grace: even excluded reports must have readable, settled timing.
+    const ciRollup = Array.isArray(pr?.statusCheckRollup) && !(Array.isArray(requiredChecks) && requiredChecks.length)
+      ? pr.statusCheckRollup.filter(c => !CI_TRUTH_EXCLUDED_CHECKS.includes(c?.name ?? c?.context))
+      : pr?.statusCheckRollup;
     const phase = classifyPr({
       state: pr?.state, labels: pr?.labels, mergeStateStatus: pr?.mergeStateStatus,
-      statusCheckRollup: pr?.statusCheckRollup,
+      statusCheckRollup: ciRollup,
     }, requiredChecks);
-    const check = reduceCheckState(pr?.statusCheckRollup, requiredChecks);
+    const check = reduceCheckState(ciRollup, requiredChecks);
     const withPhase = { phase, check: check.state, labels: labelNames(pr?.labels) };
 
     // ── ALREADY-LANDED — its OWN branch, AHEAD OF EVERY OTHER CHECK IN THIS LOOP (`ci-red`, the advisory-fix
@@ -2836,7 +2854,8 @@ export function planReconcile({
           || (!laneHead && botAuthored && withPhase.check === 'green'))
         && !withPhase.labels.some((l) => l.startsWith('review:') || l === 'ready-to-merge')
         && pr?.rollupIncomplete !== true
-        && greenSettledForRestoreGrace(pr?.statusCheckRollup, now)) {
+        && (greenSettledForRestoreGrace(pr?.statusCheckRollup, now, undefined, requiredChecks)
+          || (stackedLanePr && withPhase.check !== 'red' && checksNotYetRun(pr?.statusCheckRollup)))) {
       dispatch.push({
         ...base, ...withPhase, kind: 'restore-review-label', label: 'review:pending',
         why: 'open PR, every required check is green, and it carries no review:* (or ready-to-merge) label — '
@@ -2858,7 +2877,7 @@ export function planReconcile({
         && !withPhase.labels.some((l) => l.startsWith('review:'))
         && isAiGeneratedPr(pr)
         && pr?.rollupIncomplete !== true
-        && greenSettledForRestoreGrace(pr?.statusCheckRollup, now)) {
+        && greenSettledForRestoreGrace(pr?.statusCheckRollup, now, undefined, requiredChecks)) {
       dispatch.push({
         ...base, ...withPhase, kind: 'restore-review-label', label: 'review:pending', variant: 'stuck',
         why: 'ready-to-merge lane PR with a red required check and no review:* label — the drain only scores '
@@ -2874,7 +2893,7 @@ export function planReconcile({
         && isAiGeneratedPr(pr) && !withPhase.labels.some(l => l.startsWith('review:'))
         && (withPhase.check === 'red' || withPhase.labels.some(l => ['status:ci-red', 'ci:failed'].includes(l)))
         && pr?.rollupIncomplete !== true
-        && greenSettledForRestoreGrace(pr?.statusCheckRollup, now)) {
+        && greenSettledForRestoreGrace(pr?.statusCheckRollup, now, undefined, requiredChecks)) {
       dispatch.push({ ...base, ...withPhase, kind: 'restore-review-label', label: 'review:pending',
         variant: 'stuck', rule: 'unlabeled-red',
         why: `agent PR reads ci-red but has no review:* label, so no daemon owns it (phase ${phase} answers nothing-owed); apply review:pending so the review path owns it; real red CI then routes to ci-heal` });

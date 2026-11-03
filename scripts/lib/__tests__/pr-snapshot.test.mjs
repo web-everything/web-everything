@@ -14,7 +14,7 @@ import {
   readSharedOpenPrs, nextLimit, isServable, projectPrs, SNAPSHOT_FIELDS, MIN_LIMIT, DIRTY_REFRESH_FLOOR_MS,
   readShaCache, writeShaCache, snapshotOpenCount,
 } from '../pr-snapshot.mjs';
-import { PrListUnreadableError, mapGraphqlPr } from '../pr-list-paged.mjs';
+import { PrListUnreadableError } from '../pr-list-paged.mjs';
 import { ghThrottleLogPath } from '../gh-throttle.mjs';
 import { prSnapshotEnabled, markPrSnapshotDirty, repoFromGhArgs, snapshotPath, PR_SNAPSHOT_VERSION } from '../pr-snapshot-store.mjs';
 
@@ -31,7 +31,7 @@ const PAGING = { pageSize: 20, pageRetries: 1, heavyMaxAgeSeconds: 600, source: 
 const pageCalls = calls => calls.filter(a => a[0] === 'api');
 const viewCalls = calls => calls.filter(a => a[0] === 'pr');
 
-function fakeExec(prs = PRS) {
+function fakeExec(prs = PRS, hasNextPage = false) {
   const calls = [];
   const exec = (file, argv) => {
     expect(file).toBe('gh');
@@ -45,7 +45,7 @@ function fakeExec(prs = PRS) {
       const nodes = prs.slice(start, end).map(({ comments, body, files, labels, statusCheckRollup, author, ...p }) => ({
         ...p, author: author && { login: author.login, __typename: author.is_bot ? 'Bot' : 'User' },
         labels: { nodes: labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: {
-          pageInfo: { hasNextPage: false },
+          pageInfo: { hasNextPage },
           nodes: statusCheckRollup.map(({ workflowName, ...c }) => c.__typename === 'CheckRun'
             ? { ...c, checkSuite: { workflowRun: { workflow: { name: workflowName } } } }
             : { ...c, createdAt: c.startedAt }),
@@ -90,14 +90,28 @@ describe('pure helpers', () => {
     expect(projectPrs([pr], ['number', 'statusCheckRollup'])).toEqual([pr]);
     expect(projectPrs([pr], ['number'])).toEqual([{ number: 1 }]);
   });
-  it('preserves mapper completeness through snapshot projection and JSON persistence', () => {
-    for (const hasNextPage of [true, undefined, false]) {
-      const mapped = mapGraphqlPr({ number: 1, commits: { nodes: [{ commit: { statusCheckRollup: {
-        contexts: { nodes: [], pageInfo: { hasNextPage } },
-      } } }] } });
-      const [projected] = projectPrs(JSON.parse(JSON.stringify([mapped])), ['number', 'statusCheckRollup']);
-      expect(projected.rollupIncomplete).toBe(hasNextPage === false ? undefined : true);
-    }
+  it.each([true, undefined, false])('preserves rollup completeness through hydration and cached reads: %s', hasNextPage => {
+    const { exec, calls } = fakeExec([PRS[0]], hasNextPage);
+    // Explicit undefined models an unreadable GraphQL pageInfo, rather than the helper default.
+    const pageExec = (file, argv) => {
+      const output = exec(file, argv);
+      if (argv[0] !== 'api' || hasNextPage !== undefined) return output;
+      const response = JSON.parse(output);
+      delete response.data.repository.pullRequests.nodes[0].commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.hasNextPage;
+      return JSON.stringify(response);
+    };
+    const fields = 'number,statusCheckRollup,comments,body,files';
+    const first = readSharedOpenPrs(opts({ fields, exec: pageExec }));
+    expect(first[0].rollupIncomplete).toBe(hasNextPage === false ? undefined : true);
+    expect(first[0].comments).toEqual(PRS[0].comments);
+    expect(first[0].body).toBe(PRS[0].body);
+    expect(first[0].files).toEqual(PRS[0].files);
+    expect(readSharedOpenPrs(opts({ fields, exec: pageExec }))).toEqual(first);
+    expect(pageCalls(calls)).toHaveLength(1);
+    expect(viewCalls(calls)).toHaveLength(1);
+    const persisted = JSON.parse(readFileSync(snapshotPath(dir, REPO), 'utf8'));
+    expect(persisted.prs[0].rollupIncomplete).toBe(hasNextPage === false ? undefined : true);
+    expect(persisted.paging.hydrated).toBe(1);
   });
   it('repoFromGhArgs reads --repo / -R / --repo=', () => {
     expect(repoFromGhArgs(['pr', 'edit', '1', '--repo', 'o/n'])).toBe('o/n');

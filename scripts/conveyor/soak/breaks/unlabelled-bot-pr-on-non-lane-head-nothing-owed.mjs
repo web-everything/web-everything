@@ -71,17 +71,15 @@ export default {
         violations.push(`Incomplete check evidence restored review: ${JSON.stringify(contexts)}`);
       }
     }
-    // A queued rerun must not turn a fresh completion into settled non-strict grace.
+    // A queued rerun must not turn a fresh completion into settled grace.
     for (const status of ['QUEUED', 'IN_PROGRESS']) {
       const rollup = [
         { ...done('test'), completedAt: '2026-11-02T15:59:00Z' },
         { __typename: 'CheckRun', name: 'test', status, conclusion: null, startedAt: '2026-11-02T15:59:30Z', completedAt: null },
       ];
       const now = Date.parse('2026-11-02T16:00:00Z');
-      for (const strict of [false, true]) {
-        if (greenSettledForRestoreGrace(rollup, now, undefined, { strict })) {
-          violations.push(`${status} rerun bypassed the grace window (strict=${strict})`);
-        }
+      if (greenSettledForRestoreGrace(rollup, now)) {
+        violations.push(`${status} rerun bypassed the grace window`);
       }
       const stacked = planReconcile({ prs: [{ ...pr, headRefName: 'lane/child', baseRefName: 'lane/parent', statusCheckRollup: rollup }],
         agents: [], now, requiredChecks: ['test'] });
