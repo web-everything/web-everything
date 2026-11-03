@@ -304,3 +304,13 @@ describe('audit round 3 hardening', () => {
     expect(filterReraises(l, [a], { pinStillHolds: () => true }).dropped).toEqual([]);
   });
 });
+
+describe('audit round 4 hardening', () => {
+  it('same claim at a different spot is not suppressed by a pin on the original spot', () => {
+    const a = finding({ line: 12, quote: 'if (!token) return next(); // login route' });
+    const b = finding({ line: 90, quote: 'if (!token) return next(); // admin route' });
+    const l = pinFinding(markFixed(record(emptyLedger(), [a]), findingKey(a), { head: H2 }), findingKey(a), PIN);
+    expect(filterReraises(l, [b], { pinStillHolds: () => true }).dropped).toEqual([]);
+    expect(filterReraises(l, [{ ...a, line: 14 }], { pinStillHolds: () => true }).dropped).toHaveLength(1);
+  });
+});

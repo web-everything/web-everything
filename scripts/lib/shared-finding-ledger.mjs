@@ -21,8 +21,15 @@ function exactMatch(entry, finding) {
   return Boolean(identity?.path && original?.path && identity.path === original.path && identity.normSummary === original.normSummary);
 }
 
+/** Suppression also needs the same spot: equal quote anchors and cited lines within 3 when both sides carry them. */
+function sameSpot(a, b) {
+  const ia = normalizeFindingIdentity(a), ib = normalizeFindingIdentity(b);
+  if (ia?.anchor && ib?.anchor && ia.anchor !== ib.anchor) return false;
+  return !(Number.isInteger(a.line) && Number.isInteger(b.line) && Math.abs(a.line - b.line) > 3);
+}
+
 function matches(entry, finding, { strict = false } = {}) {
-  if (exactMatch(entry, finding)) return true;
+  if (exactMatch(entry, finding)) return !strict || sameSpot(entry.finding, finding);
   if (strict) return false; // suppression needs the same path and the same claim: no anchor-only or fuzzy match
   const identity = normalizeFindingIdentity(finding);
   const original = normalizeFindingIdentity(entry.finding);
