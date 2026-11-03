@@ -41,7 +41,7 @@ describe('prototype-load ruled-WEAKENED exception (operator R396)', () => {
   it('NOT WEAKENED records are unchanged', () => {
     expect(readyEvidence([{ ref: REF, sha: SHA, tests: 'green', audit: 'NOT WEAKENED' }], input, [])).toMatchObject({ source: 'ready-record' });
   });
-  it('ships exactly the six ruled entries with pinned refs, full shas and rulings', () => {
+  it('ships exactly the seven ruled entries with pinned refs, full shas and rulings', () => {
     const shipped = JSON.parse(readFileSync(join(process.cwd(), 'scripts/settings/prototype-load.json'), 'utf8'));
     expect(shipped.ruledWeakened.map(({ ref, sha, ruling }) => [ref, sha, ruling])
       .sort(([a], [b]) => a.localeCompare(b))).toEqual([
@@ -50,6 +50,7 @@ describe('prototype-load ruled-WEAKENED exception (operator R396)', () => {
       ['lane/mq-removed-event-hold', '9730180d08259a7def9e8c4590ac9b7697515c65', 'R443'],
       ['lane/r452-restart-ceiling', 'be8f9f26291bad2acfd3cc45c458efed18d1c998', 'R452'],
       ['lane/rebuild-spawner-reader-thin', 'd2c55f72173c6da0c88612507fc86e144cf176a4', 'R384+R396'],
+      ['lane/review-early-start', 'bfa5d088cd1a630dd36f37c54bc3e8d250dccfc2', 'R464+R468+R474'],
       ['lane/verify-forge-route', '2b6ac7d67b5e4fc1b7137c6d7e59d202eb45a41b', 'R396'],
     ]);
     for (const e of shipped.ruledWeakened) { expect(e.sha).toMatch(/^[a-f0-9]{40}$/); expect(e.findings.length).toBeGreaterThan(0); }
