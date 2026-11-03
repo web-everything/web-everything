@@ -3980,6 +3980,48 @@ describe('restore-review-label — open green PR with no review label (PR #3830)
     const p = open({ headRefName: 'ci/x', author: { login: 'app/web-everything' }, statusCheckRollup: greenRollup.map(({ completedAt, ...c }) => c) });
     expect(planReconcile({ prs: [p], agents: [], durableCounts: {}, now: NOW }).dispatch.some((d) => d.kind === 'restore-review-label')).toBe(false);
   });
+  it('strict grace ignores a legacy failure superseded by a successful same-name CheckRun', () => {
+    const rollup = [
+      { __typename: 'StatusContext', context: 'gate', state: 'FAILURE' },
+      { __typename: 'CheckRun', name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: new Date(NOW - HOUR).toISOString() },
+    ];
+    const pr = open({ headRefName: 'ci/x', author: { login: 'app/web-everything' }, statusCheckRollup: rollup });
+    expect(greenSettledForRestoreGrace(rollup, NOW, undefined, { strict: true })).toBe(true);
+    expect(planReconcile({ prs: [pr], agents: [], now: NOW, requiredChecks: ['gate'] }).dispatch)
+      .toEqual([expect.objectContaining({ kind: 'restore-review-label', label: 'review:pending' })]);
+  });
+  it('strict grace waits for a mapped optional queued CheckRun to really complete and settle', () => {
+    const mappedRollup = (completedAt) => mapGraphqlPr({ commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: [
+      { __typename: 'CheckRun', name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: new Date(NOW - HOUR).toISOString() },
+      { __typename: 'CheckRun', name: 'optional', status: completedAt ? 'COMPLETED' : 'QUEUED', conclusion: completedAt ? 'SUCCESS' : null, completedAt },
+    ] } } } }] } }).statusCheckRollup;
+    for (const [completedAt, settled] of [[null, false], [new Date(NOW).toISOString(), false], [new Date(NOW - HOUR).toISOString(), true]]) {
+      const rollup = mappedRollup(completedAt);
+      const pr = open({ headRefName: 'ci/x', author: { login: 'app/web-everything' }, statusCheckRollup: rollup });
+      expect(greenSettledForRestoreGrace(rollup, NOW, undefined, { strict: true })).toBe(settled);
+      expect(planReconcile({ prs: [pr], agents: [], now: NOW, requiredChecks: ['gate'] }).dispatch
+        .some((d) => d.kind === 'restore-review-label')).toBe(settled);
+    }
+  });
+  it.each(['0001-01-01T00:00:00Z', '1969-12-31T23:59:59Z', '1970-01-01T00:00:00Z'])(
+    'strict grace treats completion at or before the epoch as unreadable: %s', completedAt => {
+      expect(greenSettledForRestoreGrace([
+        { name: 'gate', completedAt: new Date(NOW - HOUR).toISOString() },
+        { name: 'optional', completedAt },
+      ], NOW, undefined, { strict: true })).toBe(false);
+    });
+  it('a lane head waits through non-strict grace after a fresh successful StatusContext', () => {
+    const rollup = mapGraphqlPr({ commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: [
+      { __typename: 'CheckRun', name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: new Date(NOW - HOUR).toISOString() },
+      { __typename: 'StatusContext', context: 'external-ci', state: 'SUCCESS', createdAt: new Date(NOW).toISOString() },
+    ] } } } }] } }).statusCheckRollup;
+    const pr = open({ statusCheckRollup: rollup });
+    for (const [now, settled] of [[NOW + RESTORE_REVIEW_LABEL_GRACE_MS - 1, false], [NOW + RESTORE_REVIEW_LABEL_GRACE_MS, true]]) {
+      expect(greenSettledForRestoreGrace(rollup, now)).toBe(settled);
+      expect(planReconcile({ prs: [pr], agents: [], now, requiredChecks: ['gate'] }).dispatch
+        .some((d) => d.kind === 'restore-review-label')).toBe(settled);
+    }
+  });
   it.each([
     ['old success', 'SUCCESS', NOW - HOUR, true],
     ['at grace boundary', 'SUCCESS', NOW - RESTORE_REVIEW_LABEL_GRACE_MS, true],

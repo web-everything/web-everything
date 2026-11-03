@@ -35,6 +35,27 @@ export default {
         violations.push(`Successful optional StatusContext still prevents review restoration at ${now}`);
       }
     }
+    // PR #6296 send-back: grace must use the same winning rows as CI truth and reject mapper zero dates.
+    const cases = [
+      { name: 'legacy failure superseded by CheckRun', nodes: [
+        { __typename: 'StatusContext', context: 'test', state: 'FAILURE' }, done('test'),
+      ], owed: true },
+      { name: 'optional queued run', nodes: [done('test'),
+        { __typename: 'CheckRun', name: 'optional', status: 'QUEUED', conclusion: null, completedAt: null },
+      ], owed: false },
+      { name: 'optional run freshly completed', nodes: [done('test'),
+        { ...done('optional'), completedAt: '2026-11-02T16:00:00Z' },
+      ], owed: false },
+      { name: 'optional run completed and settled', nodes: [done('test'), done('optional')], owed: true },
+    ];
+    for (const { name, nodes, owed } of cases) {
+      const mappedCase = mapGraphqlPr({ commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes } } } }] } });
+      const result = planReconcile({ prs: [{ ...pr, statusCheckRollup: mappedCase.statusCheckRollup }], agents: [],
+        now: Date.parse('2026-11-02T16:00:00Z'), requiredChecks: ['test'] });
+      if (result.dispatch.some((d) => d.kind === 'restore-review-label') !== owed) {
+        violations.push(`${name}: expected restore-review-label=${owed}`);
+      }
+    }
     return { violations };
   },
   judge(report) { return report.violations; },

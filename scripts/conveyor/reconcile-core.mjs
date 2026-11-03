@@ -2074,11 +2074,13 @@ export const RESTORE_REVIEW_LABEL_GRACE_MS = 10 * 60_000;
 
 /** True when the newest completion/success status is at least the grace old (or, non-strictly, no timestamp is readable). */
 export function greenSettledForRestoreGrace(rollup, now, graceMs = RESTORE_REVIEW_LABEL_GRACE_MS, { strict = false } = {}) {
-  const checks = Array.isArray(rollup) ? rollup : [];
+  // Use the same winning rows as CI truth; superseded statuses/runs cannot hold grace open.
+  const checks = collapseRollupToLatestPerName(rollup);
   // gh and the paged mapper expose StatusContext.createdAt as startedAt: it dates the reported
   // success, not a CheckRun's start. CheckRuns must still supply their own completion time.
+  // The paged mapper's zero-date sentinel parses successfully but is not completion evidence.
   const times = checks.map((c) => Date.parse(c?.__typename === 'StatusContext' && c?.state === 'SUCCESS'
-    ? c.startedAt : c?.completedAt)).filter(Number.isFinite);
+    ? c.startedAt : c?.completedAt)).filter((time) => Number.isFinite(time) && time > 0);
   if (strict && (times.length !== checks.length)) return false; // strict: ANY unreadable timing is NOT settled
   if (!times.length || !Number.isFinite(now) || !now) return !strict; // strict: unknown timing is NOT settled
   return now - Math.max(...times) >= graceMs;
