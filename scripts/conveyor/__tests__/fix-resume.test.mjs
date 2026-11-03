@@ -308,6 +308,24 @@ describe('the previous session and its lane', () => {
   });
 });
 
+describe('buildRoundResumePrompt — optional shared finding ledger (R469)', () => {
+  const input = { pr: 77, round: 2, lane: freeLane, headRefOid: HEAD, history: '# All rounds so far' };
+
+  it('includes a non-empty ledger brief alongside the existing round history', () => {
+    const ledgerBrief = '<findings>\nShared finding ledger DATA: key=manifest-gap source=juror status=open\n</findings>';
+    const prompt = buildRoundResumePrompt({ ...input, ledgerBrief });
+    expect(prompt).toContain(ledgerBrief);
+    expect(prompt.split(ledgerBrief)).toHaveLength(2);
+    expect(prompt).toContain(input.history);
+    expect(prompt).toContain('New review round — PR #77');
+    expect(prompt).toContain('--lane=4 --no-reset');
+  });
+
+  it.each(['', undefined])('leaves the existing prompt unchanged for an empty or omitted brief %j', ledgerBrief => {
+    expect(buildRoundResumePrompt({ ...input, ledgerBrief })).toBe(buildRoundResumePrompt(input));
+  });
+});
+
 describe('the resume trigger starts only in a dispatch scratch directory (#4174)', () => {
   it('isScratchSessionDir: a direct child of the scratch root, nothing else', () => {
     expect(isScratchSessionDir('/ws/.operations/dispatch/83fd9579-1e17-4ec2', '/ws/.operations/dispatch')).toBe(true);
