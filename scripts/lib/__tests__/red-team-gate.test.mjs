@@ -44,6 +44,58 @@ describe('readRedTeamDisposition: unparsed findings fail closed', () => {
     expect(read(body)).toMatchObject({ unparsed: [], held: [], sendBack: [] });
   });
 
+  const headline = "### Post-accept red team — 2 possible break(s), 1 confirmed by Claude's re-check";
+  const unconfirmed = '1. [not confirmed] (edge-case, broken) — maybe';
+
+  it('holds the round-3 bracketless confirmed break beside a parsed unconfirmed finding', () => {
+    const skipped = '2. **confirmed** (edge-case, broken) — missed break';
+    const d = read(`${marker}\n${headline}\n${unconfirmed}\n${skipped}`);
+    expect(d.result.findings).toHaveLength(1);
+    expect(d.unparsed).toContain(skipped);
+    expect(d.held).toContainEqual(expect.objectContaining({ index: -1, synthetic: true }));
+  });
+
+  it.each([
+    [headline, unconfirmed],
+    [headline.replace('2 possible', '1 possible'), unconfirmed],
+    [headline.replace('1 confirmed', '0 confirmed'), unconfirmed],
+    [headline.replace('2 possible', '999999999999999999999999999999 possible'), unconfirmed],
+    [headline, ''],
+  ])('holds incomplete headline counts: %s / %s', (title, finding) => {
+    const d = read(`${marker}\n${title}\n${finding}\nNo findings.`);
+    expect(d.held).toContainEqual(expect.objectContaining({ index: -1, synthetic: true }));
+    expect(d.unparsed.join(' ')).toMatch(/headline/);
+    expect(d.held.at(-1).summary).toMatch(/repost/);
+    expect(redTeamResultId(d.result)).not.toBe(redTeamResultId(parseRedTeamComment(`${marker}\nNo findings.`)));
+  });
+
+  it.each(['', '### Post-accept red team — unreadable counts'])('holds findings without a readable headline even with explicit clear: %s', title => {
+    const body = `${marker}\n${title}\n${unconfirmed}\nNo findings.`;
+    expect(read(body).held).toContainEqual(expect.objectContaining({ index: -1, synthetic: true }));
+    const valid = `${marker}\n${headline.replace('2 possible', '1 possible').replace('1 confirmed', '0 confirmed')}\n${unconfirmed}`;
+    expect(redTeamResultId(parseRedTeamComment(body))).not.toBe(redTeamResultId(parseRedTeamComment(valid)));
+  });
+
+  it.each(['confirmed', 'unverifiable', 'not confirmed'])('holds list-prefixed bare %s with any decoration', verdict => {
+    for (const prefix of ['2. ', '2) ', '2: ', '2 - ', '- ', '* ', '+ ', '  - ']) {
+      for (const decoration of ['', '**', '__', '*_', '[**']) {
+        const skipped = `${prefix}${decoration}${verdict}${decoration} — skipped`;
+        const d = read(`${marker}\nNo findings.\n${skipped}`);
+        expect(d.unparsed).toContain(skipped.trim());
+        expect(d.held).toContainEqual(expect.objectContaining({ index: -1, synthetic: true }));
+      }
+    }
+  });
+
+  it('keeps the real producer’s mixed findings disposition and digest unchanged', () => {
+    const body = renderRedTeamComment({ pr: 4722, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+      findings: [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true },
+        { summary: 'maybe', category: 'edge-case', confirmedByRecheck: false }] });
+    const d = read(body);
+    expect(d).toMatchObject({ unparsed: [], held: [], sendBack: [expect.objectContaining({ index: 1 })] });
+    expect(redTeamResultId(d.result)).toBe(redTeamResultId({ findings: d.result.findings }));
+  });
+
   it.each(['', '\nUnrecognized verdict.', '\nNo findings. (maybe)',
     '\nRed team not required on this head: unknown policy'])('holds a newer result without an explicit clear line: %s', suffix => {
     const d = read(BODY_4722, [bot(`${marker}${suffix}`, '2026-10-10T02:05:00Z')]);

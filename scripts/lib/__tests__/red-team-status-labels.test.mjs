@@ -8,7 +8,7 @@ import { planRedTeamStatusLabels, syncRedTeamStatusLabels } from '../red-team-st
 import { resolveRedTeamProbes } from '../red-team-gate.mjs';
 const head = 'a'.repeat(40);
 const result = (findings = 'No findings.') => ({ author: { login: 'web-everything' }, body: `<!-- we:red-team-advisory pr=42 rev=${head} -->\n${findings}` });
-const broken = '1. [**confirmed**] (edge-case, broken) `scripts/x.mjs:1` — break';
+const broken = "### Post-accept red team — 1 possible break(s), 1 confirmed by Claude's re-check\n1. [**confirmed**] (edge-case, broken) `scripts/x.mjs:1` — break";
 const input = { repo: 'o/n', pr: 42, head, env: {}, labels: ['red-team:clear'] };
 describe('head-bound red-team operator labels', () => {
   it('shows scheduled/in-flight as pending and provisions through the label provider', () => {

@@ -52,6 +52,8 @@ const FINDING_RE = /^(\d+)\. \[(\*\*confirmed\*\*|not confirmed|unverifiable)\] 
 // Any verdict tag anywhere on a line is finding evidence, regardless of prefix or Markdown emphasis.
 // Skipped lines key the result digest and hold disposition until the comment is reposted parsed.
 const FINDING_SHAPED_RE = /\[\s*[*_]*\s*(?:confirmed|not confirmed|unverifiable)(?:\b|_)/i;
+const LIST_FINDING_SHAPED_RE = /^\s*(?:\d+\s*[.): -]|[-*+])\s*\[?\s*[*_]*\s*(?:confirmed|not confirmed|unverifiable)(?:\b|_)/i;
+const HEADLINE_RE = /^### Post-accept red team — (\d+) possible break\(s\), (\d+) confirmed by Claude's re-check$/;
 // Positive allow-list: clean advisory and sanctioned policy-skip producers. Unknown prose is not clear.
 const CLEAR_LINES = new Set([
   '### Post-accept red team — no break found',
@@ -77,11 +79,13 @@ export function parseRedTeamComment(body) {
   if (!m) return null;
   const findings = [];
   const shapedLines = [];
+  const headlines = [];
   let explicitClear = false;
   for (const line of text.split('\n')) {
     if (CLEAR_LINES.has(line.trim())) explicitClear = true;
+    if (line.trim().startsWith('### Post-accept red team')) headlines.push(line.trim());
     const f = FINDING_RE.exec(line);
-    if (!f && FINDING_SHAPED_RE.test(line)) shapedLines.push(line.trim());
+    if (!f && (FINDING_SHAPED_RE.test(line) || LIST_FINDING_SHAPED_RE.test(line))) shapedLines.push(line.trim());
     if (f) {
       const [path, ln] = f[5] ? (/^(.*?):(\d+)$/.exec(f[5])?.slice(1) ?? [f[5], null]) : [null, null];
       const impact = f[4].trim();
@@ -95,6 +99,17 @@ export function parseRedTeamComment(body) {
     }
     const s = SUB_RE.exec(line);
     if (s && findings.length) findings.at(-1)[s[1] === 'Scenario' ? 'scenario' : 'recheck'] = s[2].trim();
+  }
+  // Counts are producer evidence too: an omitted finding must not silently turn a result clear.
+  // Keep invalid headline evidence in the same digest/hold path as skipped finding lines.
+  if (headlines.length || findings.length) {
+    const headline = headlines[0];
+    const counts = headline === '### Post-accept red team — no break found'
+      ? [0, 0] : HEADLINE_RE.exec(headline ?? '')?.slice(1).map(Number);
+    if (headlines.length !== 1 || !counts || !counts.every(Number.isSafeInteger)
+      || counts[0] !== findings.length || counts[1] !== findings.filter(f => f.confirmed).length) {
+      shapedLines.push(`unparsed headline counts: ${headlines.join(' | ') || 'missing headline'}`);
+    }
   }
   const parsed = { pr: Number(m[1]), rev: m[2].toLowerCase(), findings };
   // Non-enumerable: digest/disposition evidence without changing the parsed shape callers compare or serialise.
