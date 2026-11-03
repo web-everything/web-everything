@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { probeMainCiRuns } from '../main-ci-red-io.mjs';
 import { mainRedState, classifyRun } from '../main-ci-red-core.mjs';
 
@@ -53,5 +54,34 @@ describe('main-red judges required checks only (R516)', () => {
       const p = probe([job(1, 'test', 'success'), job(3, 'test-selection-measure', 'timed_out')], { source });
       expect(mainRedState(p.runs, { tip: p.tip }).status).toBe('red');
     }
+  });
+  it('an ABSENT required summary job is red, not proof (failed shard, no `test` job)', () => {
+    const p = probe([job(2, 'smoke', 'success'), job(3, 'test-shard (3)', 'failure')]);
+    expect(mainRedState(p.runs, { tip: p.tip }).status).toBe('red');
+    expect(p.failing.jobs).toEqual(['test-shard (3)']);
+  });
+  it('a stale / fallback required list is never reread for the tip either', () => {
+    const calls = [];
+    const exec = (bin, argv) => {
+      calls.push(argv.join(' '));
+      if (argv[0] === 'run') return JSON.stringify([run]);
+      if (/\/jobs/.test(argv.join(' '))) return JSON.stringify({ total_count: 1, jobs: [job(3, 'test-shard (3)', 'failure')] });
+      if (argv.includes('--jq')) return SHA;
+      return JSON.stringify({ total_count: 1, check_runs: [{ id: 1, name: 'test', status: 'completed', conclusion: 'success' }] });
+    };
+    let reads = 0;
+    const readRequired = () => { reads += 1; return { checks: ['test'], source: 'stale-cache' }; };
+    const p = probeMainCiRuns({ exec, readRequired });
+    expect(reads).toBe(1);
+    expect(p.tip).toBeNull();
+    expect(mainRedState(p.runs, { tip: p.tip }).status).toBe('red');
+  });
+  it('the shadow full-suite step does not mask its exit code, so the recorder runs only after a real success', () => {
+    const yml = readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8');
+    const step = yml.slice(yml.indexOf('- name: Shadow full-suite run (json report)')).split('\n      - name:')[0];
+    expect(step).toContain('timeout-minutes: 18');
+    expect(step).not.toMatch(/\|\|\s*true/);
+    const record = yml.slice(yml.indexOf('- name: Record false-green signal')).split('\n      - name:')[0];
+    expect(record).toContain("steps.shadow_full.outcome == 'success'");
   });
 });
