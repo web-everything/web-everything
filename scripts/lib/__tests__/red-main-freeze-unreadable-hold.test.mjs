@@ -1,0 +1,49 @@
+// @vitest-environment node
+/** @file EMERGENCY-1 (R458): a timed-out freeze read retries once with a longer bound, and an unreadable freeze is its own hold, never "main is red [manual]". */
+import { describe, it, expect } from 'vitest';
+import { readSharedFreeze, DEFAULT_FREEZE_READ_TIMEOUT_MS, drainFreezeSignal, evaluateDrainFreeze, resolveDrainFreezeSettings } from '../red-main-freeze-shared.mjs';
+import { decideRedMainHold, redMainHoldReason } from '../red-main-hold.mjs';
+
+const BRANCH = 'ops/red-main-freeze';
+const timeoutErr = () => Object.assign(new Error('spawnSync git ETIMEDOUT'), { code: 'ETIMEDOUT' });
+
+describe('readSharedFreeze: one read with a longer, settable per-call bound', () => {
+  it('uses the read bound (default 80 s), makes ONE attempt, and does not retry a timeout', () => {
+    let bound = null; let fetches = 0;
+    const runFor = (ms) => { bound = ms; return (args) => { if (args[0] === 'fetch') { fetches += 1; throw timeoutErr(); } return ''; }; };
+    const r = readSharedFreeze({ board: '/b', branch: BRANCH, runFor, env: {} });
+    expect(bound).toBe(DEFAULT_FREEZE_READ_TIMEOUT_MS);
+    expect(DEFAULT_FREEZE_READ_TIMEOUT_MS).toBe(80_000);
+    expect(fetches).toBe(1);
+    expect(r.error).toMatch(/unreadable.*ETIMEDOUT/);
+  });
+  it('the bound is a setting (WE_RED_MAIN_FREEZE_READ_TIMEOUT_MS); junk falls back to the default', () => {
+    const seen = [];
+    const runFor = (ms) => { seen.push(ms); return (args) => (args[0] === 'ls-tree' ? 'red-main-freeze.json\n' : args[0] === 'show' ? JSON.stringify({ frozen: false }) : ''); };
+    expect(readSharedFreeze({ board: '/b', branch: BRANCH, runFor, env: { WE_RED_MAIN_FREEZE_READ_TIMEOUT_MS: '120000' } })).toMatchObject({ frozen: false });
+    readSharedFreeze({ board: '/b', branch: BRANCH, runFor, env: { WE_RED_MAIN_FREEZE_READ_TIMEOUT_MS: 'abc' } });
+    expect(seen).toEqual([120000, DEFAULT_FREEZE_READ_TIMEOUT_MS]);
+  });
+});
+
+describe('unreadable freeze is its own hold', () => {
+  const settings = resolveDrainFreezeSettings({ env: {}, tool: {} });
+  const state = evaluateDrainFreeze({ local: null, shared: { error: 'branch unreadable: ETIMEDOUT' }, settings });
+  const sig = drainFreezeSignal({ state, mainRedState: null, priority: null, now: Date.now() });
+  it('holds, with its own source and reason', () => {
+    expect(sig.red).toBe(true);
+    expect(sig.sources).toEqual(['freeze-unreadable']);
+    const d = decideRedMainHold({ num: 1, signal: sig });
+    expect(d.hold).toBe(true);
+    expect(d.reason).toMatch(/freeze-unreadable/);
+    expect(d.reason).not.toMatch(/main is red/);
+    expect(redMainHoldReason(sig)).toMatch(/NOT known red/);
+  });
+  it('still holds other repos (fail closed)', () => {
+    expect(decideRedMainHold({ num: 1, isLocal: false, signal: sig }).hold).toBe(true);
+  });
+  it('a real manual freeze keeps the manual source', () => {
+    const s = evaluateDrainFreeze({ local: { reason: 'x', at: 'y' }, shared: { error: 'e' }, settings });
+    expect(drainFreezeSignal({ state: s, mainRedState: null, priority: null, now: Date.now() }).sources).toContain('manual');
+  });
+});
