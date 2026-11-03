@@ -7,6 +7,7 @@
 import { loadavg, cpus, homedir } from 'node:os';
 import { join } from 'node:path';
 import { readSettings } from '../lib/settings-files.mjs';
+import { writeLineSync } from '../lib/write-all-sync.mjs';
 import { resolveGovernorSettings, setPause, clearPause, listPauses, governorTick, appendEvents, defaultPauseDir } from '../lib/load-governor.mjs';
 
 export function parseArgs(argv) {
@@ -14,7 +15,7 @@ export function parseArgs(argv) {
   for (const a of argv) { const m = /^--([^=]+)(?:=(.*))?$/.exec(a); if (m) o[m[1]] = m[2] ?? true; }
   return o;
 }
-export function main(argv, { out = (s) => process.stdout.write(`${s}\n`), settings, dir = defaultPauseDir(), now = new Date(), load = () => loadavg()[0] / cpus().length, home = homedir() } = {}) {
+export function main(argv, { out = (s) => writeLineSync(1, s),settings, dir = defaultPauseDir(), now = new Date(), load = () => loadavg()[0] / cpus().length, home = homedir() } = {}) {
   const a = parseArgs(argv);
   const s = settings ?? resolveGovernorSettings({ settings: readSettings(), env: process.env });
   if (a.list) { const l = listPauses({ dir, maxPauseMinutes: s.maxPauseMinutes, now }); out(l.length ? l.map((x) => `${x.owner}\t${x.flag.at}\t${x.flag.reason}`).join('\n') : 'no live pause flags'); return 0; }

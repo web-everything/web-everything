@@ -808,7 +808,7 @@ export function operatorControlCliPolicy(name, argv) {
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
 if (IS_CLI) {
   const [name, ...rest] = process.argv.slice(2);
-  if (name === 'worker-pause') { const { main: pause } = await import('./worker-pause.mjs'); process.exit(pause(rest)); } // R480: tiny flag CLI, not a run-record operation
+  if (name === 'worker-pause') { const { main: pause } = await import('./worker-pause.mjs'); const pauseCode = pause(rest); process.exit(pauseCode); } // R480: tiny flag CLI, not a run-record operation
   if (!name || name === '--help' || name === '-h') {
     writeAllSync(1, `${rootUsage()}\n`);
     process.exit(name ? 0 : 2);
