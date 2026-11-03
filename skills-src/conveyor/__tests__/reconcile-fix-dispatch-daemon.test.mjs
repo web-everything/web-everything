@@ -1930,6 +1930,8 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     expect(probe([lane('idle')])).not.toEqual(probe([lane('idle', '/w/.lanes/web-everything/lane-2')]));
     expect(probe([{ ...lane('busy'), laneHeadOid: 'a' }])).not.toEqual(probe([{ ...lane('busy'), laneHeadOid: 'b' }]));
     expect(probe([{ ...lane('busy'), pidAlive: true }])).not.toEqual(probe([{ ...lane('busy'), pidAlive: false }]));
+    expect(probe([{ ...lane('busy'), hung: true }])).not.toEqual(probe([{ ...lane('busy'), hung: false }]));
+    expect(probe([{ ...lane('busy'), hung: true, hungAgeMs: 1 }])).toEqual(probe([{ ...lane('busy'), hung: true, hungAgeMs: 99 }]));
     const chat = (status) => ({ sessionId: 's2', kind: 'interactive', cwd: '/w/main', status });
     expect(probe([chat('idle')])).toEqual(probe([chat('busy')]));
     expect(probe([{ ...chat('idle'), laneHeadOid: 'a' }])).not.toEqual(probe([{ ...chat('idle'), laneHeadOid: 'b' }]));

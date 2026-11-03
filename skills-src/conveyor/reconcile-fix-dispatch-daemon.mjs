@@ -760,11 +760,14 @@ export function readPlanClaims({ readAgents = () => enrichAgents(defaultReadAgen
   const out = new Set(listFixDispatchClaims(undefined, { liveOnly: true }).map((c) => `claim:${c.meta.repo}:${c.meta.pr}`));
   const agents = readAgents();
   if (!Array.isArray(agents)) throw new Error('plan agent probe unreadable');
-  // Identity, working directory (the lane binding) and, for lane-bound or non-interactive sessions, activity state and lane HEAD (what the planner binds sessions to PRs by):
-  // any of those changing means the planner's liveness reading would differ.
+  // The WHOLE enriched session record is the key (identity, cwd, lane HEAD, pid liveness, hung / idle / self-reported
+  // flags, wait state): any change means the planner's liveness reading would differ. Only a growing counter
+  // (`hungAgeMs`) and, for a plain chat session outside a lane clone, its busy/idle flip are left out.
   for (const a of agents) {
+    const { hungAgeMs: _age, ...record } = a ?? {};
     const laneBound = a?.kind !== 'interactive' || /[\\/]\.lanes[\\/]/.test(String(a?.cwd ?? ''));
-    out.add(`agent:${a?.sessionId ?? a?.pid ?? a?.name}:${a?.cwd ?? ''}:${a?.laneHeadOid ?? ''}:${a?.pidAlive ?? ''}${laneBound ? `:${a?.status ?? ''}` : ''}`);
+    if (!laneBound) delete record.status;
+    out.add(`agent:${a?.sessionId ?? a?.pid ?? a?.name}:${JSON.stringify(Object.entries(record).sort(([x], [y]) => (x < y ? -1 : 1)))}`);
   }
   return out;
 }
