@@ -142,7 +142,7 @@ describe.each(paths)('deleted origin head identity: %s', (_name, decide) => {
     ['partial identity', { headRepository: { name: 'web-everything' } }],
     ['non-string identity', { headRepository: { nameWithOwner: 7 } }],
     ['identity with a trailing newline', { headRepository: { nameWithOwner: `${REPO}\n` } }],
-    ['identity with invisible text', { headRepository: { nameWithOwner: `${REPO}​` } }],
+    ['identity with invisible text', { headRepository: { nameWithOwner: `${REPO}\u200b` } }],
   ])('keeps on %s', (_label, extra) => {
     expect(decide(proof([merged(extra)]))).toMatchObject(KEEP);
   });
