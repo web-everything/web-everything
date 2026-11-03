@@ -4,7 +4,7 @@ import {
   reviewScope, bindingRoundDecision, shadowRound, foldFindingStatuses, acceptanceIds,
   projectAvoidedRounds,
 } from '../review-round-rules.mjs';
-import { resolveReviewSettings } from '../review-settings.mjs';
+import { resolveReviewSettings, RACE_BLOCK_PATHS } from '../review-settings.mjs';
 
 const context = { repo: 'example/repo', pr: 42, symbol: 'check' };
 const finding = (overrides = {}) => ({
@@ -233,7 +233,7 @@ describe('resolveReviewSettings', () => {
   it('preserves the built-in defaults and allows file shadow mode', () => {
     expect(resolveReviewSettings({ fileConfig: null, env: {} }))
       .toEqual({ recheckCarriedReferrals: true, autoPolicyRespectsNotReal: true, scopedRereview: 'off', referralDefault: 'operator', roundBudget: 'off', takeoverReviewAttempts: 1,
-        rulingResolvesStandDown: 'on', standDownQueueSection: 'needs-you' });
+        rulingResolvesStandDown: 'on', standDownQueueSection: 'needs-you', releaseStage: 'prerelease', raceBlockPaths: RACE_BLOCK_PATHS });
     expect(resolveReviewSettings({ fileConfig: { scopedRereview: 'shadow' }, env: {} }).scopedRereview).toBe('shadow');
   });
   it('lets an explicit off environment override the file', () => {

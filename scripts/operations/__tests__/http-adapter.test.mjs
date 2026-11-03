@@ -110,8 +110,10 @@ import {
 describe('codex-audit runner output', () => {
   const cases = [
     { name: 'passing verdict', answer: 'NOT WEAKENED', code: 0, stdout: 'NOT WEAKENED\n', stderr: '' },
-    { name: 'weakened verdict with quoted multiline findings', answer: 'WEAKENED\nscripts/x.mjs:1 — "guard" weakened\nscripts/y.mjs:2 — second finding', code: 1,
-      stdout: 'WEAKENED\nscripts/x.mjs:1 — "guard" weakened\nscripts/y.mjs:2 — second finding\n', stderr: '' },
+    { name: 'weakened verdict with quoted multiline findings',
+      answer: ['WEAKENED', ...['f1', 'f2'].map(id => JSON.stringify({ id, class: 'B2', file: `scripts/${id}.mjs`, line: 1,
+        invariant: `"guard" ${id} weakened`, trigger: 'Input skips the guard', consequence: 'Guard fails open', relation: 'introduced' }))].join('\n'),
+      code: 1, stdoutPattern: /^WEAKENED\n\{[^\n]*"id":"f1"[^\n]*\}\n\{[^\n]*"id":"f2"[^\n]*\}\n$/, stderr: '' },
     { name: 'invalid answer', answer: 'incomplete', code: 3, stdout: '',
       stderr: 'UNPARSEABLE audit: incomplete or failed evidence; retry or request human review of the full diff.\n' },
     { name: 'record write failure', answer: 'NOT WEAKENED', recordError: true, code: 3, stdout: '',
@@ -151,10 +153,16 @@ describe('codex-audit runner output', () => {
       }
       const output = `${leakedOut}${rendered.lines.join('\n')}\n`;
       if (json) {
-        expect(JSON.parse(output).verdict).toEqual({ ok: testCase.code === 0, code: testCase.code,
-          stdout: testCase.stdout, stderr: testCase.stderr });
+        const verdict = JSON.parse(output).verdict;
+        if (testCase.stdoutPattern) {
+          expect(verdict).toMatchObject({ ok: false, code: testCase.code, stderr: testCase.stderr });
+          expect(verdict.stdout).toMatch(testCase.stdoutPattern);
+        } else {
+          expect(verdict).toEqual({ ok: testCase.code === 0, code: testCase.code, stdout: testCase.stdout, stderr: testCase.stderr });
+        }
       } else {
-        expect(output).toContain((testCase.stdout || testCase.stderr).trimEnd());
+        if (testCase.stdoutPattern) expect(output).toMatch(/WEAKENED\n\{[^\n]*"id":"f1"/);
+        else expect(output).toContain((testCase.stdout || testCase.stderr).trimEnd());
       }
       expect(leakedOut).toBe('');
       expect(leakedErr).toBe('');
