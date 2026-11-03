@@ -17,7 +17,7 @@ import { mkdirSync, readFileSync, realpathSync, readlinkSync, statSync } from 'n
 import { dirname, join, resolve, basename, sep } from 'node:path';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
-import { diffFeed, appendLines, checkedFeedPath, sidecarsOf, REPORT_KINDS, resolveSettings as feedSettings } from '../operations/needs-you-feed.mjs';
+import { diffFeed, replay, appendLines, checkedFeedPath, sidecarsOf, REPORT_KINDS, resolveSettings as feedSettings } from '../operations/needs-you-feed.mjs';
 import { notifyDesktopChecked } from './branch-sync.mjs';
 import { repeatDue, labelNames } from './pr-sweep-core.mjs';
 import { sortUnblockersFirst } from './pr-blocked-by.mjs';
@@ -178,8 +178,17 @@ function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, al
       // repo#pr@head:state. Legacy consumers alert once (A -> B -> A alerts A once); configured sweeps repeat with backoff and reset on movement.
       const shown = Object.fromEntries(Object.entries(saved.current ?? {}).filter(([k]) => prev.openKeys.includes(k)));
       // An incomplete pass may add new heads, but cannot replace an existing head's evidence.
-      const mineNow = items.filter(f => !other.some(k => k.startsWith(`${f.repo}#${f.pr}@${f.head}:`))
-        && !(incomplete && prev.openKeys.includes(feedKey(f)) && shown[feedKey(f)] !== updateIdentity(f, now)));
+      const eligible = f => !other.some(k => k.startsWith(`${f.repo}#${f.pr}@${f.head}:`));
+      const candidates = items.filter(eligible);
+      const mineNow = candidates.filter(f => !(incomplete && prev.openKeys.includes(feedKey(f))
+        && shown[feedKey(f)] !== updateIdentity(f, now)));
+      // Publication may retain a head without its current candidate. Retry/reminder scheduling
+      // still uses that head's published evidence and alert id, including when it was omitted.
+      const retained = incomplete ? replay({ path }).filter(f => f.kind === STALLED_KIND
+        && prev.openKeys.includes(feedKey(f)) && eligible(f)) : [];
+      const alertItems = incomplete
+        ? [...new Map([...candidates, ...retained].map(f => [feedKey(f), f])).values()]
+        : mineNow;
       const alerted = new Set((saved.published ?? []).filter((x) => prev.openKeys.includes(feedKeyOfId(x))));
       const changed = new Set(mineNow.filter((f) => prev.openKeys.includes(feedKey(f)) && shown[feedKey(f)] !== updateIdentity(f, now)).map(feedKey));
       const r = diffFeed(prev.openKeys.filter((k) => !changed.has(k)), mineNow, now, { incomplete, clearKinds: new Set([STALLED_KIND]) });
@@ -189,22 +198,22 @@ function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, al
       const repeats = Object.fromEntries(Object.entries(saved.repeats ?? {}).filter(([k]) => open.has(feedKeyOfId(k))));
       const fingerprint = f => JSON.stringify([updateIdentity(f, now), f.labels]);
       // Persisted one-shot ids carry no send time. Start a bounded clock on migration instead of flooding.
-      if (alertBackoffMinutes) for (const f of mineNow) {
+      if (alertBackoffMinutes) for (const f of alertItems) {
         if (changed.has(feedKey(f))) {
           for (const key of Object.keys(repeats)) if (feedKeyOfId(key) === feedKey(f)) delete repeats[key];
         }
         if (!changed.has(feedKey(f)) && alerted.has(id(f)) && !(saved.unnotified ?? []).includes(id(f)) && !repeats[id(f)]) repeats[id(f)] = { lastAlertAt: now, alertCount: 1, fingerprint: fingerprint(f) };
       }
-      const due = mineNow.filter(f => alertBackoffMinutes && repeats[id(f)] &&
+      const due = alertItems.filter(f => alertBackoffMinutes && repeats[id(f)] &&
         (repeats[id(f)].fingerprint !== fingerprint(f) || repeatDue(repeats[id(f)], now, alertBackoffMinutes)));
       // State transitions reset repeats, including a return to a previously seen state.
-      for (const f of mineNow) {
+      for (const f of alertItems) {
         if (changed.has(feedKey(f)) && (alertBackoffMinutes || updateIdentity(f, now) !== f.state
           || shown[feedKey(f)]?.startsWith('['))) due.push(f);
       }
       // Owed alerts from a failed send are retried until delivered or resolved, even across an incomplete pass.
       const pending = new Set((saved.unnotified ?? []).filter((x) => open.has(feedKeyOfId(x))));
-      const toAlert = mineNow.filter((f) => newly.includes(f) || pending.has(id(f)) || due.includes(f));
+      const toAlert = alertItems.filter((f) => newly.includes(f) || pending.has(id(f)) || due.includes(f));
       const unnotified = [...new Set([...pending, ...toAlert.map(id)])];
       // Our own record goes first, marking every alert owed until confirmed; what the feed shows is recorded only once
       // its line is written. A failed save can repeat a line or an alert, never drop one.

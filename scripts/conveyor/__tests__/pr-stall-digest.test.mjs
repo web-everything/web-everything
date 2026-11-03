@@ -843,3 +843,50 @@ it('empty-diff text in other identity fields does not count as an empty-diff sta
   expect(unacknowledged({ path: ctx.feedPath })).toEqual([]);
   expect(replay({ path: ctx.feedPath }).filter(e => e.kind === 'cleared')).toHaveLength(1);
 });
+
+
+it.each(['deadline crossing', 'changed state', 'omitted head'])('incomplete %s retries an owed retained alert without overwriting the feed', scenario => {
+  const ctx = setup();
+  const original = op(6254, 'stalled-head', { deadline: new Date(NOW + 1000).toISOString(), nextAction: 'await-review' });
+  const first = run(ctx, [original], { notify: () => ({ ok: false, error: 'first delivery failed' }) });
+  expect(first.errors.join(' ')).toContain('first delivery failed');
+  const before = unacknowledged({ path: ctx.feedPath });
+  const items = scenario === 'omitted head' ? [] : scenario === 'changed state'
+    ? [{ ...original, state: 'owner-stale', violation: 'owner-stale' }] : [original];
+  const retry = vi.fn(() => ({ ok: false, error: 'retry delivery failed' }));
+  const failed = run(ctx, items, { notify: retry, now: NOW + 1001, pass: { incomplete: true } });
+  expect(retry).toHaveBeenCalledTimes(1);
+  expect(failed.errors.join(' ')).toContain('retry delivery failed');
+  expect(failed.fresh.map(f => f.state)).toEqual([original.state]);
+  expect(failed.lines).toEqual([]);
+  expect(unacknowledged({ path: ctx.feedPath })).toEqual(before);
+  const alertId = `${REPO}#6254@${H}:${original.state}`;
+  expect(JSON.parse(readFileSync(join(ctx.stateDir, 'digest-state.json'), 'utf8')).unnotified).toEqual([alertId]);
+  const delivered = vi.fn(() => ({ ok: true }));
+  const result = run(ctx, items, { notify: delivered, now: NOW + 1002, pass: { incomplete: true } });
+  expect(delivered).toHaveBeenCalledTimes(1);
+  expect(result.errors).toEqual([]);
+  expect(result.notified).toBe(true);
+  expect(JSON.parse(readFileSync(join(ctx.stateDir, 'digest-state.json'), 'utf8')).unnotified).toEqual([]);
+  expect(replay({ path: ctx.feedPath })).toEqual(before);
+});
+
+it.each(['deadline crossing', 'changed state', 'omitted head'])('incomplete %s schedules retained backoff reminders without replacing their evidence', scenario => {
+  const ctx = setup(), { notify, out } = sent();
+  const original = op(6254, 'stalled-head', { deadline: new Date(NOW + 60000).toISOString(), nextAction: 'await-review' });
+  const options = { notify, alertBackoffMinutes: [30, 60] };
+  expect(run(ctx, [original], options).notified).toBe(true);
+  const before = unacknowledged({ path: ctx.feedPath });
+  const items = scenario === 'omitted head' ? [] : scenario === 'changed state'
+    ? [{ ...original, state: 'owner-stale', violation: 'owner-stale' }] : [original];
+  const due = run(ctx, items, { ...options, now: NOW + 31 * 60000, pass: { incomplete: true } });
+  expect(due.errors).toEqual([]);
+  expect(due.notified).toBe(true);
+  expect(due.fresh.map(f => f.state)).toEqual([original.state]);
+  expect(due.lines).toEqual([]);
+  expect(run(ctx, items, { ...options, now: NOW + 32 * 60000, pass: { incomplete: true } }).notified).toBe(false);
+  expect(run(ctx, items, { ...options, now: NOW + 91 * 60000, pass: { incomplete: true } }).notified).toBe(true);
+  expect(out).toHaveLength(3);
+  expect(unacknowledged({ path: ctx.feedPath })).toEqual(before);
+  expect(replay({ path: ctx.feedPath })).toEqual(before);
+});

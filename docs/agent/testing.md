@@ -3986,3 +3986,13 @@ merged detector/sweep finding whose original state survives. Other identity fiel
 such as the action do not establish an empty-diff finding. The named state,
 merged-violation and other-field tests in `pr-stall-digest.test.mjs` cover both the
 sweep preflight reader and persisted-feed publication.
+
+
+Incomplete-pass publication and notification scheduling are separate. Retained
+heads keep their published feed evidence, while owed retries and configured
+backoff reminders use that published item and its original alert identity.
+Replay supplies retained items even when a partial listing omits their heads;
+a changed candidate cannot replace their evidence or strand an older owed alert.
+The incomplete deadline-crossing, changed-state and omitted-head cases in
+`pr-stall-digest.test.mjs` cover failed-send retry/error reporting, successful
+confirmation, reminder backoff and unchanged persisted feed events.
