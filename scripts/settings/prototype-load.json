@@ -86,6 +86,15 @@
       ]
     },
     {
+      "ref": "lane/mq-same-head-merge-conflict",
+      "sha": "60944430a8e836e2df15a8baba0f8f2806d9d66d",
+      "ruling": "R466+R484",
+      "findings": [
+        "scripts/lib/drain-queue-safety.mjs:61 — One or two `merge_conflict` removals now bypass commit-binding validation and the same-head failure hold when the PR reports `CLEAN`. Previously, same-head or unbound conflicts required intervention; the three-removal cap permits retries previously blocked.",
+        "scripts/lib/__tests__/drain-queue-safety.test.mjs:784 — Tests now require conflict removals to release regardless of binding, while previous conflict hold and force-push protection cases substitute other reasons. The suite therefore accepts the bypass instead of detecting it."
+      ]
+    },
+    {
       "ref": "lane/r452-restart-ceiling",
       "sha": "be8f9f26291bad2acfd3cc45c458efed18d1c998",
       "ruling": "R452",
