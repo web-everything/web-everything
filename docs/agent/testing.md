@@ -3913,3 +3913,9 @@ and card selection, and keep readiness feeds undecided. Only reposting a fully p
 result removes the hold; gate actions and human clearance cannot release it.
 `red-team-gate.test.mjs` covers the closed path, clear advisories, release attempts and repost
 recovery; `record-red-team-ruling.test.mjs` and `needs-you-feed.test.mjs` cover the consumers.
+Verdict tags anywhere on a line require strict finding parsing, independent of numbering or
+Markdown emphasis. Empty results require an explicit allow-listed clear line (`No findings.`
+or the producer's `### Post-accept red team — no break found` heading, or either exact sanctioned
+`Red team not required on this head:` policy-skip line); marker-only or unknown
+results retain the synthetic hold and a distinct digest. Pin the clean path with
+`renderRedTeamComment` output, and migrate old marker-only clean fixtures explicitly.

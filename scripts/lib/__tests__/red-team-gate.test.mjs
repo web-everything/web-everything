@@ -37,6 +37,40 @@ describe('readRedTeamDisposition: unparsed findings fail closed', () => {
     expect(read(`${marker}\nNo findings.`)).toMatchObject({ unparsed: [], held: [], sendBack: [] });
   });
 
+  it('keeps the real producer’s clean result clear', () => {
+    const body = renderRedTeamComment({ pr: 4722, rev: HEAD, provider: 'codex', model: 'm',
+      findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' });
+    expect(body).toContain('### Post-accept red team — no break found');
+    expect(read(body)).toMatchObject({ unparsed: [], held: [], sendBack: [] });
+  });
+
+  it.each(['', '\nUnrecognized verdict.', '\nNo findings. (maybe)',
+    '\nRed team not required on this head: unknown policy'])('holds a newer result without an explicit clear line: %s', suffix => {
+    const d = read(BODY_4722, [bot(`${marker}${suffix}`, '2026-10-10T02:05:00Z')]);
+    expect(d.result.findings).toEqual([]);
+    expect(d.result.shapedLines).toEqual([]);
+    expect(d.unparsed).toHaveLength(1);
+    expect(d.held).toEqual([expect.objectContaining({ index: -1, synthetic: true })]);
+    expect(d.held[0].summary).toMatch(/explicit clear/);
+    expect(d.dispositions.get(-1)).toEqual({ state: 'held', by: null });
+    expect(d.rulings.get(-1)).toEqual([]);
+    expect(redTeamResultId(d.result)).not.toBe(redTeamResultId(parseRedTeamComment(`${marker}\nNo findings.`)));
+  });
+
+  it.each(['confirmed', 'not confirmed', 'unverifiable'])('holds every skipped [%s] tag regardless of prefix or decoration', tag => {
+    for (const prefix of ['1: ', '1 - ', '>> ', '', 'arbitrary prose ']) {
+      for (const decoration of ['', '**', '_', '*_']) {
+        const skipped = `${prefix}[${decoration}${tag}${decoration}] (edge-case, broken) — skipped break`;
+        // Even a clear line cannot override an unparsed tag.
+        expect(read(`${marker}\nNo findings.\n${skipped}`)).toMatchObject({
+          unparsed: [skipped], held: [expect.objectContaining({ synthetic: true })],
+        });
+        expect(redTeamResultId(parseRedTeamComment(`${BODY_4722}\n${skipped}`)))
+          .not.toBe(redTeamResultId(parseRedTeamComment(BODY_4722)));
+      }
+    }
+  });
+
   it.each([
     '1. [**CONFIRMED**] (edge-case, broken) `a.mjs:1` — wrong case',
     '1. [**confirmed**] edge-case broken — malformed',

@@ -49,10 +49,16 @@ export function redTeamMarker(pr, rev) {
 
 const MARKER_RE = /^<!-- we:red-team-advisory pr=(\d+) rev=([0-9a-f]{7,64}) -->/i;
 const FINDING_RE = /^(\d+)\. \[(\*\*confirmed\*\*|not confirmed|unverifiable)\] \(([^,()]+), ([^()]+?)\)(?: `([^`]+)`)? — (.*)$/;
-// Any line that LOOKS like a finding (leading whitespace, any case, loose punctuation).
+// Any verdict tag anywhere on a line is finding evidence, regardless of prefix or Markdown emphasis.
 // Skipped lines key the result digest and hold disposition until the comment is reposted parsed.
-// Include repeated/mixed Markdown emphasis; a closing underscore is a word character, so also allow it at the boundary.
-const FINDING_SHAPED_RE = /^\s*(?:\d+\s*[.)]|[-*+])\s*\[\s*[*_]*\s*(?:confirmed|not confirmed|unverifiable)(?:\b|_)/i;
+const FINDING_SHAPED_RE = /\[\s*[*_]*\s*(?:confirmed|not confirmed|unverifiable)(?:\b|_)/i;
+// Positive allow-list: clean advisory and sanctioned policy-skip producers. Unknown prose is not clear.
+const CLEAR_LINES = new Set([
+  '### Post-accept red team — no break found',
+  'No findings.',
+  'Red team not required on this head: card-only diff (policy redTeam.skipCardOnly)',
+  'Red team not required on this head: not owed (stored review)',
+]);
 const SUB_RE = /^ {3}- (Scenario|Re-check): (.*)$/;
 // Any reviewed-sha marker the shared parser reads (full or abbreviated, any case), and a case variant of the marker
 // name too: only used to SUPERSEDE a ruling, where reading more holds more.
@@ -71,9 +77,11 @@ export function parseRedTeamComment(body) {
   if (!m) return null;
   const findings = [];
   const shapedLines = [];
+  let explicitClear = false;
   for (const line of text.split('\n')) {
-    if (FINDING_SHAPED_RE.test(line) && !FINDING_RE.test(line)) shapedLines.push(line.trim());
+    if (CLEAR_LINES.has(line.trim())) explicitClear = true;
     const f = FINDING_RE.exec(line);
+    if (!f && FINDING_SHAPED_RE.test(line)) shapedLines.push(line.trim());
     if (f) {
       const [path, ln] = f[5] ? (/^(.*?):(\d+)$/.exec(f[5])?.slice(1) ?? [f[5], null]) : [null, null];
       const impact = f[4].trim();
@@ -91,6 +99,7 @@ export function parseRedTeamComment(body) {
   const parsed = { pr: Number(m[1]), rev: m[2].toLowerCase(), findings };
   // Non-enumerable: digest/disposition evidence without changing the parsed shape callers compare or serialise.
   Object.defineProperty(parsed, 'shapedLines', { value: shapedLines, enumerable: false });
+  Object.defineProperty(parsed, 'explicitClear', { value: explicitClear, enumerable: false });
   return parsed;
 }
 
@@ -107,6 +116,9 @@ export function redTeamResultId(parsed) {
   // one re-keys it and voids every record for the old id (fail closed). A result with none keeps its v1 id, so existing
   // records, operator rulings included, keep applying to results nobody has tampered with.
   const extra = Array.isArray(parsed.shapedLines) ? parsed.shapedLines : [];
+  if (!findings.length && !extra.length && !parsed.explicitClear) {
+    return createHash('sha256').update(JSON.stringify(['v3', findings, 'missing-explicit-clear'])).digest('hex').slice(0, 16);
+  }
   return createHash('sha256').update(JSON.stringify(extra.length ? ['v2', findings, extra] : ['v1', findings])).digest('hex').slice(0, 16);
 }
 
@@ -724,11 +736,13 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     if (effectiveAction === 'send-back') sendBack.push(f);
   }
   const unparsed = [...(result?.shapedLines ?? [])];
+  const missingClear = result && !result.findings.length && !unparsed.length && !result.explicitClear;
+  if (missingClear) unparsed.push('zero findings without an explicit clear line');
   if (unparsed.length) {
     // Not a parsed finding: no gate action, card or operator ceremony can release it.
     // Only a new, fully parsed result removes this hold. Never offer it for ruling/card filing.
     held.push({ index: -1, confirmed: true, synthetic: true,
-      summary: `unparsed finding-shaped line: ${unparsed[0]} — repost the red-team comment with parsed findings` });
+      summary: `${missingClear ? 'unparsed result' : 'unparsed finding-shaped line'}: ${unparsed[0]} — repost the red-team comment with parsed findings or an explicit clear line` });
     dispositions.set(-1, { state: 'held', by: null });
     findingRulings.set(-1, []);
   }

@@ -7,7 +7,7 @@ import { readDrainRedTeamEvidence, recordRedTeamStatus } from '../drain-red-team
 import { planRedTeamStatusLabels, syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 import { resolveRedTeamProbes } from '../red-team-gate.mjs';
 const head = 'a'.repeat(40);
-const result = (findings = '') => ({ author: { login: 'web-everything' }, body: `<!-- we:red-team-advisory pr=42 rev=${head} -->\n${findings}` });
+const result = (findings = 'No findings.') => ({ author: { login: 'web-everything' }, body: `<!-- we:red-team-advisory pr=42 rev=${head} -->\n${findings}` });
 const broken = '1. [**confirmed**] (edge-case, broken) `scripts/x.mjs:1` — break';
 const input = { repo: 'o/n', pr: 42, head, env: {}, labels: ['red-team:clear'] };
 describe('head-bound red-team operator labels', () => {
@@ -24,6 +24,10 @@ describe('head-bound red-team operator labels', () => {
   it('a clean recorded result is clear', () => {
     expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [result()] }))
       .toEqual({ add: 'red-team:clear', remove: ['red-team:pending'] });
+  });
+  it('a historical marker-only result is blocked', () => {
+    expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [result('')] }))
+      .toEqual({ add: 'red-team:blocked', remove: ['red-team:pending'] });
   });
   it.each(['sent-back', 'round-cap'])('a %s break is blocked', outcome => {
     const gate = { author: { login: 'web-everything' }, body: `<!-- we:red-team-gate pr=42 rev=${head} outcome=${outcome} -->` };
