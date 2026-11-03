@@ -24,7 +24,7 @@ function exactMatch(entry, finding) {
 /** Suppression also needs the same spot: equal quote anchors and cited lines identical when both sides carry them. */
 function sameSpot(a, b) {
   const ia = normalizeFindingIdentity(a), ib = normalizeFindingIdentity(b);
-  if (ia?.anchor && ib?.anchor && ia.anchor !== ib.anchor) return false;
+  if ((a.quote ?? '') !== (b.quote ?? '') || (ia?.anchor ?? '') !== (ib?.anchor ?? '')) return false;
   // Fail closed: a missing line on either side is not the same spot.
   const pos = (n) => Number.isInteger(n) && n > 0;
   return pos(a.line) && pos(b.line) && a.line === b.line
@@ -96,7 +96,7 @@ export function filterReraises(ledger, findings, { pinStillHolds } = {}) {
 /** Lists open, fixed-unpinned and test-pinned entries whose pin is not currently proven (a stale pin must not hide a finding). */
 export function renderOpenForBrief(ledger, { pinStillHolds } = {}) {
   const holds = (entry) => {
-    if (entry.status !== 'test-pinned' || entry.variants?.length || typeof pinStillHolds !== 'function') return false;
+    if (entry.status !== 'test-pinned' || entry.variants?.length || !entry.finding?.file || !(entry.finding.line > 0) || typeof pinStillHolds !== 'function') return false;
     try { return pinStillHolds(structuredClone(entry)) === true; } catch { return false; }
   };
   const entries = ledger.entries.filter(entry => !holds(entry));

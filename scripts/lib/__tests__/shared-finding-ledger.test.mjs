@@ -382,3 +382,15 @@ describe('audit round 10 hardening', () => {
     expect(filterReraises(l, [finding({ summary: 'ＡＵＴＨ_ADMIN bypasses authorization' })], { pinStillHolds: () => true }).dropped).toEqual([]);
   });
 });
+
+describe('audit round 11 hardening', () => {
+  const pin = (a) => pinFinding(markFixed(record(emptyLedger(), [a]), findingKey(a), { head: H2 }), findingKey(a), PIN);
+  it('a re-raise missing its quote is not suppressed', () => {
+    const quote = 'if (!token) return next(); // login route guard';
+    expect(filterReraises(pin(finding({ quote })), [finding({})], { pinStillHolds: () => true }).dropped).toEqual([]);
+  });
+  it('the brief keeps pathless and line-less pinned entries', () => {
+    expect(renderOpenForBrief(pin(finding({ file: undefined })), { pinStillHolds: () => true })).toContain(SUMMARY);
+    expect(renderOpenForBrief(pin(finding({ line: undefined })), { pinStillHolds: () => true })).toContain(SUMMARY);
+  });
+});
