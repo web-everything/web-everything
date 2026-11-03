@@ -64,7 +64,7 @@
       "sha": "2fe6208f8409668f0a74a637c5b53ac46f5031cf",
       "ruling": "R396",
       "findings": [
-        "scripts/operations/dispatch-lane.mjs:429 \u2014 Glob refusal applies only within multi-path entries; separate glob entries remain accepted despite the pre-existing overlap-check limitation. Probe: `we:src/a*b.mjs` and `we:src/ab*.mjs` both cover `we:src/abb.mjs`, but `scopesOverlap` returns false, allowing conflicting work through lease/rival exclusion."
+        "scripts/operations/dispatch-lane.mjs:429 — Glob refusal applies only within multi-path entries; separate glob entries remain accepted despite the pre-existing overlap-check limitation. Probe: `we:src/a*b.mjs` and `we:src/ab*.mjs` both cover `we:src/abb.mjs`, but `scopesOverlap` returns false, allowing conflicting work through lease/rival exclusion."
       ]
     },
     {
@@ -74,6 +74,15 @@
       "findings": [
         "The last-known-good fallback can proceed for up to the 2-min window after a freeze is newly published while reads keep timing out (PR #6289, accepted option A).",
         "merge-gate still enforces the freeze per merge."
+      ]
+    },
+    {
+      "ref": "lane/mq-removed-event-hold",
+      "sha": "9730180d08259a7def9e8c4590ac9b7697515c65",
+      "ruling": "R443",
+      "findings": [
+        "scripts/lib/drain-queue-safety.mjs:197 — Replaces the all-green requirement with an exception that discards FAILURE, CANCELLED, TIMED_OUT, ACTION_REQUIRED and STARTUP_FAILURE when a later same-name check succeeds in another run. Previously these outcomes blocked update-branch.",
+        "scripts/lib/drain-queue-safety.mjs:153 — Matching workflow_id, display name and timestamps does not prove job replacement across runs; independent same-name jobs can mask failures. The lookup validates only workflow_id, without binding the check to its claimed run/job or verifying equivalent execution context."
       ]
     }
   ]
