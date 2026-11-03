@@ -47,6 +47,7 @@ export const DEFAULT_HEALTH_CONFIG = Object.freeze({
   ...TMP_SWEEP_DEFAULTS,
   tmp: { reviewSeatTtlMin: 120, backlogIndexMaxMb: 2048 },
   health: { diskFreeMinGb: 30 },
+  diskCleanup: { enabled: true, keepSnapshots: 2, rebuildMaxAgeHours: 12, laneCap: 60, dailyCadenceHours: 24 }, // R498; see scripts/lib/disk-cleanup.mjs
   ...CLAUDE_JOBS_ARCHIVE_DEFAULTS,
   mode: 'shadow',
   tickBudgetMs: 60_000,
