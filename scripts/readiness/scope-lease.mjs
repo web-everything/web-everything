@@ -194,8 +194,8 @@ function patternsMayIntersect(a, b, star, compatible, budget) {
 }
 
 /** Conservative intersection of repo-relative scope paths. `*`/`?` stay within a segment;
- * standalone `**` consumes zero or more segments. Trailing-slash and extensionless directory entries
- * retain prefix semantics even when their parent segments or directory names contain wildcards.
+ * standalone `**` consumes zero or more segments. Directory entries and wildcard entries retain prefix
+ * semantics: an extension-shaped glob can name a dotted directory without a trailing slash.
  * Unsupported syntax, embedded globstars, >4096-character inputs or >20000 visited states return true:
  * unknown intersections must serialize, and authors can narrow scopes to recover concurrency. */
 export function globsMayIntersect(pathA, pathB) {
@@ -203,8 +203,9 @@ export function globsMayIntersect(pathA, pathB) {
   if (/[\[\]{}!\\]/.test(pathA + pathB)) return true;
   const segments = (path) => {
     const parts = path.replace(/\/$/, '').split('/');
-    // File-shaped globs stay at their authored depth; directory-shaped globs lease descendants too.
-    if (parts.at(-1) !== '**' && (path.endsWith('/') || !/\.[^./]+$/.test(parts.at(-1)))) parts.push('**');
+    // A glob can name a directory even with a file-shaped suffix (`*.v2`, `.git*`, `*/foo.mjs`).
+    // Keep its descendant form too; the matched ancestor must still satisfy every authored segment.
+    if (parts.at(-1) !== '**' && (path.endsWith('/') || /[*?]/.test(path) || !/\.[^./]+$/.test(parts.at(-1)))) parts.push('**');
     return parts;
   };
   const a = segments(pathA);

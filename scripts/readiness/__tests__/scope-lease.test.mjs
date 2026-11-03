@@ -6,9 +6,8 @@
  *   resolve-at-drain}, and the retry-once-then-escalate ladder keyed on a TOTAL attempt counter.
  */
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
-import { URL } from 'node:url';
+import source from '../scope-lease.mjs?raw';
 import {
   normScope, isSubtreeEntry, coversFile, globsMayIntersect, scopeEntriesOverlap, scopesOverlap,
   scopeLease, breachOf,
@@ -133,6 +132,13 @@ describe('glob intersection — conservative scope contention', () => {
     ['src/*/', 'src/ab/x/*.mjs'],
     ['src/a*/', 'src/a*/child.mjs'],
     ['src/*.v2/', 'src/ab.v2/x/*.mjs'],
+    ['src/*.v2', 'src/ab.v2/x/*.mjs'],
+    ['src/a?.v2', 'src/ab.v2/x/*.mjs'],
+    ['src/*.d', 'src/a.d/*.mjs'],
+    ['.git*', '.github/*.yml'],
+    ['packages/*/foo.v2', 'packages/x/foo.v2/*.mjs'],
+    ['packages/*/v1.2', 'packages/a/v1.2/deep/*.mjs'],
+    ['src/*.mjs', 'src/a.mjs/child/*.mjs'],
     ['*/lib/', 'src/lib/*.mjs'],
     ['packages/*/src/', 'packages/app/src/deep/*.mjs'],
     ['src/*/lib', 'src/a/lib/deep/*.mjs'],
@@ -154,23 +160,31 @@ describe('glob intersection — conservative scope contention', () => {
       expect(scopeEntriesOverlap(`we:${a}`, `other:${b}`), `${a} vs other:${b}`).toBe(false);
     }
   });
-  it('preserves the old ancestor relation for generated pairs with a common file witness', () => {
+  it('preserves every generated old ancestor relation unless an explicit disjointness proof exists', () => {
     const oldRoot = (entry) => entry.match(/^[^*?]*/)[0].replace(/\/$/, '');
     const oldRelated = (a, b) => a === b || a.startsWith(b + '/') || b.startsWith(a + '/') || !a || !b;
     let checked = 0;
     // Construct entries from concrete paths, rather than using the new matcher as the oracle.
-    for (const root of ['src', 'packages']) for (const name of ['a', 'ab', 'ab.v2']) {
+    for (const root of ['src', 'packages', 'packages/app']) for (const name of ['a', 'ab', 'ab.v2', 'foo.v2', 'a.d', 'v1.2', 'a.mjs', '.github']) {
       for (const depth of ['', '/lib', '/lib/deep']) {
         const file = `${root}/${name}${depth}/a.mjs`;
-        const parents = [`${root}/${name}/`, `${root}/*/`, `${root}/${name[0]}*/`, `${root}/a?/`, `${root}/*`];
+        const parents = [`${root}/${name}/`, `${root}/*/`, `${root}/${name[0]}*/`, `${root}/a?/`, `${root}/*`,
+          `${root}/${name[0]}*`, `${root}/*.v2`, `${root}/*.d`, `${root}/*.mjs`];
+        if (root === 'packages/app') parents.push(`packages/*/${name}`);
         const entries = [file, `${root}/${name}${depth}/*.mjs`, `${root}/*${depth}/*.mjs`];
         for (const parent of parents) for (const entry of entries) {
-          // a? needs two characters; the other parent patterns all match the constructed directory.
-          if (parent.includes('?') && name.length !== 2) continue;
           if (!oldRelated(oldRoot(parent), oldRoot(entry))) continue;
+          // For two globs, a concrete directory name can prove these parents disjoint. A wildcard
+          // directory can choose another name satisfying the parent's length or suffix constraint.
+          // Literal file entries retain the old ancestor fallback even when the glob cannot match.
+          const fixedName = !entry.startsWith(`${root}/*`);
+          const disjoint = entry.includes('*') && fixedName && (
+            (parent === `${root}/a?/` && (name.length !== 2 || !name.startsWith('a')))
+            || ['.v2', '.d', '.mjs'].some((suffix) => parent === `${root}/*${suffix}` && !name.endsWith(suffix))
+          );
           checked++;
-          expect(scopeEntriesOverlap(`we:${parent}`, `we:${entry}`), `${parent} vs ${entry}`).toBe(true);
-          expect(scopeEntriesOverlap(`we:${entry}`, `we:${parent}`), `${entry} vs ${parent}`).toBe(true);
+          expect(scopeEntriesOverlap(`we:${parent}`, `we:${entry}`), `${parent} vs ${entry}`).toBe(!disjoint);
+          expect(scopeEntriesOverlap(`we:${entry}`, `we:${parent}`), `${entry} vs ${parent}`).toBe(!disjoint);
         }
       }
     }
@@ -180,8 +194,11 @@ describe('glob intersection — conservative scope contention', () => {
     ['src/a*/', 'src/b*/deep/*.mjs'],
     ['src/a?', 'src/abc/deep/*.mjs'],
     ['src/*.v2/', 'src/ab.v3/deep/*.mjs'],
+    ['src/*.v2', 'src/ab.v3/deep/*.mjs'],
+    ['src/a?.v2', 'src/abc.v2/deep/*.mjs'],
+    ['packages/*/foo.v2', 'packages/x/bar.v2/*.mjs'],
+    ['.git*', '.hg/*.yml'],
     ['src/*/lib/', 'src/a/other/*.mjs'],
-    ['src/*.mjs', 'src/a.mjs/child/*.mjs'],
   ])('keeps provably disjoint glob entries separate: %s vs %s', (a, b) => {
     expect(scopeEntriesOverlap(`we:${a}`, `we:${b}`)).toBe(false);
     expect(scopeEntriesOverlap(`we:${b}`, `we:${a}`)).toBe(false);
@@ -193,6 +210,20 @@ describe('glob intersection — conservative scope contention', () => {
     expect(decision.outcome).toBe('wait');
     expect(decision.waitOn).toEqual(['directory-owner']);
   });
+  it.each(['we:src/*.v2', 'we:packages/*/foo.v2', 'we:.git*'])(
+    'launch policy waits on a bare dotted-directory lease %s', (directory) => {
+      const descendants = {
+        'we:src/*.v2': 'we:src/a.v2/x/*.mjs',
+        'we:packages/*/foo.v2': 'we:packages/x/foo.v2/*.mjs',
+        'we:.git*': 'we:.github/*.yml',
+      };
+      for (const [owner, candidate] of [[directory, descendants[directory]], [descendants[directory], directory]]) {
+        const decision = overlapAtLaunch([candidate], [{ id: 'directory-owner', scope: [owner] }]);
+        expect(decision.outcome).toBe('wait');
+        expect(decision.waitOn).toEqual(['directory-owner']);
+      }
+    },
+  );
   it('budget exhaustion conservatively contends for disjoint patterns', () => {
     // The final characters differ, so the exact languages cannot intersect. Their many star
     // placements exhaust the shared state budget before the matcher can establish that fact.
@@ -203,7 +234,6 @@ describe('glob intersection — conservative scope contention', () => {
   });
   it('the disjoint exhaustion regression rejects fail-open and raised-budget mutations', () => {
     // Execute mutants only in memory: never weaken the working source to prove the guard.
-    const source = readFileSync(new URL('../scope-lease.mjs', import.meta.url), 'utf8');
     const guard = 'if (--budget.remaining < 0) return true;';
     const bound = 'remaining: 20000';
     expect(source).toContain(guard);
