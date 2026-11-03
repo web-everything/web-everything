@@ -10,6 +10,7 @@
  *   It reads and acts on nothing. FAIL CLOSED: anything unknown, malformed or throwing is an `operator` item, and no
  *   automatic lane ever produces `not-real`, `clear-human`, `accept` or `supersede`.
  */
+import { planPendingRedTeam } from '../lib/red-team-pending-watchdog.mjs';
 import { validateVerdict, isGuardPath, proposeFix } from '../lib/round-judge.mjs';
 import { MAX_TOTAL_ROUND_EXTENSIONS } from './round-extension-mark.mjs';
 import { nextActions } from '../operations/pr-sweep-core.mjs';
@@ -39,7 +40,7 @@ export function demoteNeverAutomatic(item, operatorCommand) {
  */
 export const CLASSIFY_DEFAULTS = Object.freeze({
   staleHoldAutoResume: false, grantCeiling: MAX_TOTAL_ROUND_EXTENSIONS, maxFixListLines: 20, stateLanes: Object.freeze({}),
-  systemActions: Object.freeze({ 'await-ledger-outbox': true, 'resume-stale-hold': true, 'rerun-red-team-gate': true, 'ask-review-daemon': true, 'tooling-card': true }),
+  systemActions: Object.freeze({ 'await-ledger-outbox': true, 'resume-stale-hold': true, 'rerun-red-team-gate': true, 'ask-review-daemon': true, 'tooling-card': true, 'restart-red-team': true, 'publish-red-team-result': true }),
   policyActions: Object.freeze({ grant: true, card: true, block: true }),
 });
 /** Validators for each classifier setting leaf (shared with the sweep's cascade, so a bad value is refused there too). */
@@ -162,8 +163,8 @@ function classifyUnsafe(o = {}) {
   const rawSettings = o.settings; // read once: a getter must not validate one value and serve another
   const cfg = classifySettings(rawSettings === undefined ? {} : rawSettings);
   // Every other input is read ONCE into plain data (getters run once, here): what is validated is what is used.
-  const { row, head = '', verdict = null, files = [], card = null, grantsSoFar } = strictClone({ row: o.row, head: o.head, verdict: o.verdict ?? null,
-    files: o.files ?? [], card: o.card ?? null, grantsSoFar: o.grantsSoFar });
+  const { row, head = '', verdict = null, files = [], card = null, grantsSoFar, redTeam } = strictClone({ row: o.row, head: o.head, verdict: o.verdict ?? null,
+    files: o.files ?? [], card: o.card ?? null, grantsSoFar: o.grantsSoFar, redTeam: o.redTeam });
   if (!isRec(row) || typeof row.repo !== 'string' || !/^[\w-]+\/[\w-][\w.-]*$/.test(row.repo) || repoKeyForSlug(row.repo) === null
     || !Number.isSafeInteger(row.number) || row.number <= 0 || typeof row.waitingOn !== 'string' || !row.waitingOn) {
     throw new Error('unreadable row');
@@ -209,7 +210,15 @@ function classifyUnsafe(o = {}) {
   if (state === 'red-team-sent-back-cleared') return out('system', 'rerun-red-team-gate', 'a confirmed red-team break was sent back but no fixer owns it; the gate re-sends it');
   // System nudges never rule on anything, so a guard file does not stop them (it stops every POLICY action, below).
   if (REVIEW_WAITS.has(state)) {
-    return row.liveJob ? null : out('system', 'ask-review-daemon', `waiting on the ${row.actor === 'red-team' ? 'red team' : 'reviewer'} with no live job; ask the review daemon once for this head`,
+    if (row.liveJob) return null;
+    if (['red-team-pending', 'drain-skip:red-team-pending'].includes(state) && redTeam !== undefined) {
+      const plan = planPendingRedTeam(redTeam);
+      if (plan.kind === 'wait') return null;
+      if (plan.kind === 'exhausted') return operator('red-team-restart-exhausted', plan.reason);
+      if (plan.kind === 'publish-result') return out('system', 'publish-red-team-result', plan.reason, { headCap: 1 });
+      return out('system', 'restart-red-team', plan.reason, { headCap: 2, key: `${key}:restart-${redTeam.restarts + 1}` });
+    }
+    return out('system', 'ask-review-daemon', `waiting on the ${row.actor === 'red-team' ? 'red team' : 'reviewer'} with no live job; ask the review daemon once for this head`,
       { onceKey: `${row.repo}#${row.number}@${head.toLowerCase()}:ask-review-daemon` });
   }
   if (OPERATOR_STATES[state]) return operator(state, OPERATOR_STATES[state]);

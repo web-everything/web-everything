@@ -11,12 +11,14 @@
  */
 import { appendFileSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { homedir } from 'node:os';
+import { homedir, hostname } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { withFileLock } from '../lib/atomic-json-file.mjs';
 import { cascadePolicy, readPlatformPreferences, logCascadeSources } from '../lib/policy-cascade.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
+import { readRedTeamStatus as defaultReadRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
+import { pidAlive, pidNamespace, pidStartTime } from '../lib/pid-alive.mjs';
 import { readConfirmedBreaks } from '../lib/red-team-gate.mjs';
 import { detectRoundCap, judgeRound } from '../lib/round-judge.mjs';
 import { assessPrSweep } from '../operations/pr-sweep-core.mjs';
@@ -67,7 +69,8 @@ export function resolveStallSweepSettings({ env = process.env, read = readFileSy
   // The kill switch fails closed: a mode PRESENT in any layer but unusable (including `{}`, which the cascade's leaf
   // flattening would drop) turns the sweep OFF.
   const rawModes = [tool?.mode, platform?.mode].filter((m) => m !== undefined);
-  const out = cascadePolicy('prStallSweep', tool, { standard: STALL_SWEEP_DEFAULTS, envValues, valid, platform, env, log: () => {} });
+  // Suppress the intermediate log without consuming the shared logger's deduplication entry.
+  const out = cascadePolicy('prStallSweep', tool, { standard: STALL_SWEEP_DEFAULTS, envValues, valid, platform, env: { ...env, WE_POLICY_CASCADE_LOG: '0' }, log: () => {} });
   const value = { ...out.value }; const sources = { ...out.sources }; const bad = [...out.invalid];
   // A leaf check cannot see shape (`{maxActionsPerHour: {a: 5}}` has a valid leaf): every resolved scalar is checked
   // again, and a bad one falls back to the standard.
@@ -127,6 +130,9 @@ export function planStallActions(items, { history = [], now, limits }) {
   const done = history.filter((h) => h?.phase === 'would-do' || h?.phase === 'intent');
   let hour = done.filter((h) => Date.parse(h.ts) >= now - 3_600_000).length;
   const perHead = new Map();
+  const perAction = new Map();
+  const bucket = it => `${it.prHead}|${it.action}`;
+  for (const h of done) perAction.set(bucket(h), (perAction.get(bucket(h)) ?? 0) + 1);
   for (const h of done) perHead.set(h.prHead, (perHead.get(h.prHead) ?? 0) + 1);
   const seen = new Set(done.map((h) => `${h.key}|${h.action}`));
   const once = new Set(done.map((h) => h.onceKey).filter(Boolean));
@@ -135,9 +141,10 @@ export function planStallActions(items, { history = [], now, limits }) {
     if (it.lane === 'operator') continue;
     if (seen.has(`${it.key}|${it.action}`) || (it.onceKey && once.has(it.onceKey))) continue;
     const why = act.length >= limits.maxActionsPerSweep ? 'per-sweep cap' : hour >= limits.maxActionsPerHour ? 'per-hour cap'
-      : (perHead.get(it.prHead) ?? 0) >= limits.maxActionsPerPrHead ? 'per-PR-head cap' : null;
+      : (it.headCap === undefined ? (perHead.get(it.prHead) ?? 0) >= limits.maxActionsPerPrHead
+        : !Number.isSafeInteger(it.headCap) || it.headCap <= 0 || (perAction.get(bucket(it)) ?? 0) >= it.headCap) ? 'per-PR-head cap' : null;
     if (why) { held.push({ ...it, held: why }); continue; }
-    act.push(it); hour += 1; perHead.set(it.prHead, (perHead.get(it.prHead) ?? 0) + 1);
+    act.push(it); perAction.set(bucket(it), (perAction.get(bucket(it)) ?? 0) + 1); hour += 1; perHead.set(it.prHead, (perHead.get(it.prHead) ?? 0) + 1);
   }
   return { act, held };
 }
@@ -181,7 +188,7 @@ const ghFiles = (gh) => (repo, n) => {
  * `gh` is the ONLY GitHub seam (read verbs only: `pr list`, `pr view`, `api` GET); tests pin that.
  */
 export async function runStallSweep({ now = Date.now(), env = process.env, state = {}, settings, gh = (f, a, o) => execFileSync(f, a, o),
-  read, readFiles, judge = judgeRound, dir, log = console.error, force = false } = {}) {
+  read, readFiles, readRedTeamStatus = defaultReadRedTeamStatus, probe, judge = judgeRound, dir, log = console.error, force = false } = {}) {
   const s = settings ?? resolveStallSweepSettings({ env, log });
   const cfg = s.value;
   // Disabled/not-due passes still carry the metadata needed to release a disabled digest's feed suppression.
@@ -211,6 +218,7 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
     && Array.isArray(p.comments) && p.comments.every((c) => typeof c?.author?.login === 'string' && typeof c.body === 'string' && Number.isFinite(Date.parse(c.createdAt)));
   let readFailed = !Array.isArray(raw.prs) || !raw.prs.every(readable);
   const items = [];
+  const pending = [];
   for (const row of report.prs.filter((r) => r.stalled)) {
     const pr = prs.get(`${row.repo}#${row.number}`);
     const head = String(pr?.headRefOid ?? '');
@@ -224,10 +232,33 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
         verdict = cap?.trigger === trigger ? judge({ pr: row.number, repo: row.repo, head, trigger, comments: pr.comments, files: list, setting: breaks.value, maxGrants: judgeCfg.maxGrants }) : null;
       } catch (e) { base.errors.push(`judge ${row.repo}#${row.number}: ${msg(e)}`); verdict = null; readFailed = true; }
     }
-    const c = classifyStall({ row, head, verdict, files: list, card: null, settings: classifierSettings(cfg) });
+    const context = { row, head, verdict, files: list, card: null, settings: classifierSettings(cfg) };
+    const metadata = { repo: row.repo, pr: row.number, head, prHead: `${row.repo}#${row.number}@${head.toLowerCase()}`, state: row.waitingOn, title: String(row.title ?? '').slice(0, 120), verdict: verdict?.verdict ?? null };
+    if (['red-team-pending', 'drain-skip:red-team-pending'].includes(row.waitingOn)) {
+      let status; let ownerAlive = null;
+      try {
+        status = await readRedTeamStatus({ repo: row.repo, pr: row.number, head, env });
+        if (status && !status.unreadable && (status.repo !== row.repo || Number(status.pr) !== row.number || status.head !== head)) throw new Error('red-team status identity mismatch');
+        if (['queued', 'running'].includes(status?.status)) {
+          const local = probe ?? { host: hostname(), namespace: pidNamespace(), isAlive: pidAlive, readPidStart: pidStartTime };
+          if (status.host === local.host && status.pidNamespace === local.namespace && Number.isSafeInteger(status.pid) && status.pid > 0) {
+            const alive = await local.isAlive(status.pid);
+            if (alive === false) ownerAlive = false;
+            else if (alive === true) {
+              const start = status.pidStart ? await local.readPidStart(status.pid) : null;
+              // A missing birth time cannot prove PID reuse; retain the live-owner hold.
+              ownerAlive = !start || !status.pidStart || start === status.pidStart;
+            }
+          }
+        }
+      } catch (e) { status = { unreadable: true }; base.errors.push(`red-team ${row.repo}#${row.number}: ${msg(e)}`); }
+      pending.push({ context, metadata, status, ownerAlive });
+      continue;
+    }
+    const c = classifyStall(context);
     // An unreadable row or unreadable evidence anywhere makes the whole pass incomplete (it still reaches the operator).
     if (c?.reason?.startsWith('fail-closed: classifier error') || c?.action === 'unreadable-evidence' || verdict?.evidence?.failClosed) readFailed = true;
-    if (c) items.push({ ...c, repo: row.repo, pr: row.number, head, prHead: `${row.repo}#${row.number}@${head.toLowerCase()}`, state: row.waitingOn, title: String(row.title ?? '').slice(0, 120), verdict: verdict?.verdict ?? null });
+    if (c) items.push({ ...c, ...metadata });
   }
 
   // Read the budget, plan and durably record under ONE lock on the audit dir, so two overlapping passes can never both
@@ -237,6 +268,14 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
   function commit() {
   // Fail closed: an unreadable PR, file list or audit history means NO action this pass.
   const { records: history, complete: historyOk } = readAuditHistory(outDir);
+  for (const { context, metadata, status, ownerAlive } of pending) {
+    const restarts = history.filter(h => ['would-do', 'intent'].includes(h.phase) && h.prHead === metadata.prHead && h.action === 'restart-red-team');
+    const latest = restarts.length ? restarts.reduce((latest, h) => Math.max(latest, Date.parse(h.ts)), -Infinity) : null;
+    const c = classifyStall({ ...context, redTeam: { ageMinutes: context.row.ageMinutes, status, ownerAlive,
+      restarts: restarts.length, minutesSinceLastRestart: latest === null ? null : (now - latest) / 60_000 } });
+    if (c?.reason?.startsWith('fail-closed: classifier error')) readFailed = true;
+    if (c) items.push({ ...c, ...metadata });
+  }
   const incomplete = raw.unreadable.length > 0 || readFailed || !historyOk;
   const plan = incomplete ? { act: [], held: [] } : planStallActions(items, { history, now, limits: cfg });
   const ts = new Date(now).toISOString();

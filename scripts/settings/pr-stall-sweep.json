@@ -16,7 +16,7 @@
     "grantCeiling": 10,
     "maxFixListLines": 20,
     "stateLanes": { "system:fix-stood-down": "operator" },
-    "systemActions": { "await-ledger-outbox": true, "resume-stale-hold": true, "rerun-red-team-gate": true, "ask-review-daemon": true, "tooling-card": true },
+    "systemActions": { "await-ledger-outbox": true, "resume-stale-hold": true, "rerun-red-team-gate": true, "ask-review-daemon": true, "tooling-card": true, "restart-red-team": true, "publish-red-team-result": true },
     "policyActions": { "grant": true, "card": true, "block": true }
   }
 }

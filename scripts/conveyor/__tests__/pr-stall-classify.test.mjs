@@ -338,6 +338,8 @@ describe('every policy is a setting, and settings only make it stricter', () => 
       'rerun-red-team-gate': ['red-team-sent-back-cleared'],
       'ask-review-daemon': ['awaiting-review'],
       'tooling-card': ['fixing'],
+      'restart-red-team': ['red-team-pending', null, {}, { redTeam: { ageMinutes: 61, status: null, ownerAlive: null, restarts: 0, minutesSinceLastRestart: null } }],
+      'publish-red-team-result': ['red-team-pending', null, {}, { redTeam: { ageMinutes: 61, status: { status: 'finished', result: { status: 'ran' } }, ownerAlive: null, restarts: 0, minutesSinceLastRestart: null } }],
     },
     policyActions: {
       grant: ['ruling-needed:red-team-round-cap', 'grant'],
@@ -355,8 +357,8 @@ describe('every policy is a setting, and settings only make it stricter', () => 
   });
   it.each(Object.keys(actionCases).flatMap((group) => Object.keys(CLASSIFY_DEFAULTS[group]).map((action) => [group, action])))
   ('%s.%s off sends it to the operator', (group, action) => {
-    const [state, v, settings = {}] = actionCases[group][action];
-    const o = { settings, card, ...(v ? { verdict: verdict(v, TRIGGER[state]) } : {}) };
+    const [state, v, settings = {}, extra = {}] = actionCases[group][action];
+    const o = { settings, card, ...extra, ...(v ? { verdict: verdict(v, TRIGGER[state]) } : {}) };
     expect(at(state, o)).toMatchObject({ lane: group === 'systemActions' ? 'system' : 'policy', action });
     const r = at(state, { ...o, settings: { ...settings, [group]: { [action]: false } } });
     expect([r.lane, r.action]).toEqual(['operator', action]);
