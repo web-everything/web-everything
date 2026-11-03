@@ -131,24 +131,24 @@ export function createMqSameHeadRefreshOptions({ store, approvedHeadHold, enqueu
 // Skip diagnostics are process-local: refusing a refresh must never spend a shared claim.
 const mqSameHeadRefreshSkips = new Set();
 
-// Compare every supplied identity field, including presence. An absent origin is
-// not proof that same-name rows are retries. Conservatively retain unfamiliar shapes.
+// Display names alone do not establish a check origin. StatusContext rows and
+// incomplete/non-Actions URLs cannot prove that a failed check was superseded.
 function mqRefreshCheckIdentity(check) {
   const text = value => typeof value === 'string' && value.trim() ? value : null;
-  const canonical = value => {
-    if (typeof value === 'string') return text(value);
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-    const entries = Object.keys(value).sort().map(key => [key, value[key]]);
-    return entries.length ? JSON.stringify(entries) : null;
-  };
-  const name = text(check.name), context = text(check.context);
-  const workflowName = text(check.workflowName), workflow = canonical(check.workflow);
-  const app = canonical(check.app);
-  // A run URL cannot establish workflow identity. Only an explicit workflow URL can.
-  const detailsWorkflow = text(check.detailsUrl)?.match(/^(https:\/\/[^?#]+\/actions\/workflows\/[^/?#]+)(?:[/?#]|$)/)?.[1] ?? null;
-  if (!(name || context) || !(workflowName || workflow || (app && detailsWorkflow))) return null;
-  // Keep unknown/non-workflow URLs as additional evidence: never merge differing origins.
-  return JSON.stringify([name, context, workflowName, workflow, app, detailsWorkflow, text(check.detailsUrl)]);
+  const name = text(check.name), workflowName = text(check.workflowName);
+  if (check.__typename === 'StatusContext' || !name || !workflowName || !text(check.detailsUrl)) return null;
+  let url;
+  try { url = new URL(check.detailsUrl); } catch { return null; }
+  if (url.origin !== 'https://github.com' || url.username || url.password) return null;
+  const run = url.pathname.match(/^\/([^/]+)\/([^/]+)\/actions\/runs\/([1-9]\d*)(?:\/job\/([1-9]\d*))?\/?$/);
+  if (!run) return null;
+  const [, owner, repo, runId, jobId = null] = run;
+  return { name, workflowName, owner: owner.toLowerCase(), repo: repo.toLowerCase(), runId, jobId };
+}
+
+function mqRefreshSameWorkflow(first, second) {
+  return second !== null && first.owner === second.owner && first.repo === second.repo
+    && first.name === second.name && first.workflowName === second.workflowName;
 }
 
 function mqRefreshCheckLater(success, failure) {
@@ -157,7 +157,6 @@ function mqRefreshCheckLater(success, failure) {
   const laterStart = Date.parse(success.startedAt), earlierStart = Date.parse(failure.startedAt);
   if (!Number.isFinite(laterStart) || !Number.isFinite(earlierStart) || laterStart <= earlierStart) return false;
   for (const field of ['startedAt', 'completedAt']) {
-    if (success[field] == null && failure[field] == null) continue;
     const later = Date.parse(success[field]), earlier = Date.parse(failure[field]);
     // Missing, tied or contradictory ordering cannot prove supersession.
     if (!Number.isFinite(later) || !Number.isFinite(earlier) || later <= earlier) return false;
@@ -179,7 +178,7 @@ function mqRefreshChecksGreen(checks) {
     const identity = mqRefreshCheckIdentity(check);
     return identity !== null && checks.some(success => success.status === 'COMPLETED'
       && (success.conclusion ?? success.state) === 'SUCCESS'
-      && mqRefreshCheckIdentity(success) === identity && mqRefreshCheckLater(success, check));
+      && mqRefreshSameWorkflow(identity, mqRefreshCheckIdentity(success)) && mqRefreshCheckLater(success, check));
   });
 }
 

@@ -387,16 +387,68 @@ describe('merge-queue same-head failure admission', () => {
       ];
       f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
     }));
-    it.each(['context', 'app', 'workflow', 'detailsUrl'])('differing or missing %s identity never supersedes failure', field => fixture(f => {
-      for (const missing of [false, true]) {
-        const failure = { name: 'gate', workflowName: 'CI', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-11-02T10:00:00Z',
-          [field]: field === 'detailsUrl' ? 'https://github.com/fixture/drain/actions/workflows/ci.yml' : 'one' };
-        const success = { ...failure, conclusion: 'SUCCESS', startedAt: '2026-11-02T10:05:00Z',
-          [field]: field === 'detailsUrl' ? 'https://github.com/fixture/drain/actions/workflows/other.yml' : 'two' };
-        if (missing) delete success[field];
-        f.live.statusCheckRollup = [failure, success];
-        f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
-      }
+    const runCheck = (run, conclusion, minute, extra = {}) => ({
+      __typename: 'CheckRun', name: 'review-gate', workflowName: 'CI', status: 'COMPLETED', conclusion,
+      startedAt: `2026-11-02T10:${minute}:00Z`, completedAt: `2026-11-02T10:${minute}:30Z`,
+      detailsUrl: `https://github.com/fixture/drain/actions/runs/${run}/job/${run}01`, ...extra,
+    });
+    it('same workflow and name with valid distinct run URLs allows a later SUCCESS', () => fixture(f => {
+      f.live.statusCheckRollup = [runCheck(100, 'FAILURE', '00'), runCheck(101, 'SUCCESS', '05')];
+      f.run(); expect(f.requests()).toHaveLength(1); expect(existsSync(f.path)).toBe(true);
+    }));
+    it('workflow B failure stays blocking when workflow A succeeds with the same check name', () => fixture(f => {
+      f.live.statusCheckRollup = [
+        runCheck(100, 'FAILURE', '00', { workflowName: 'B' }),
+        runCheck(101, 'SUCCESS', '05', { workflowName: 'A' }),
+      ];
+      f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
+    }));
+    it.each(['failure', 'success'])('missing detailsUrl on %s stays blocking', missing => fixture(f => {
+      f.live.statusCheckRollup = [runCheck(100, 'FAILURE', '00'), runCheck(101, 'SUCCESS', '05')];
+      delete f.live.statusCheckRollup[missing === 'failure' ? 0 : 1].detailsUrl;
+      f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
+    }));
+    it.each([
+      'https://github.com/other/drain/actions/runs/101/job/10101',
+      'https://github.com/fixture/other/actions/runs/101/job/10101',
+      'https://example.com/fixture/drain/actions/runs/101/job/10101',
+      'https://github.com/fixture/drain/actions/runs/not-an-id/job/10101',
+      'https://github.com/fixture/drain/actions/runs/101/job/not-an-id',
+      'https://github.com/fixture/drain/actions/workflows/ci.yml',
+      '',
+    ])('unrelated or unparseable run URL stays blocking: %s', detailsUrl => fixture(f => {
+      f.live.statusCheckRollup = [runCheck(100, 'FAILURE', '00'), runCheck(101, 'SUCCESS', '05', { detailsUrl })];
+      f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
+    }));
+    it.each(['failure', 'success'])('missing workflowName on %s stays blocking despite valid run URLs', missing => fixture(f => {
+      f.live.statusCheckRollup = [runCheck(100, 'FAILURE', '00'), runCheck(101, 'SUCCESS', '05')];
+      delete f.live.statusCheckRollup[missing === 'failure' ? 0 : 1].workflowName;
+      f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
+    }));
+    it('run URLs without job IDs still identify runs', () => fixture(f => {
+      f.live.statusCheckRollup = [runCheck(100, 'FAILURE', '00'), runCheck(101, 'SUCCESS', '05')]
+        .map(row => ({ ...row, detailsUrl: row.detailsUrl.replace(/\/job\/\d+$/, '') }));
+      f.run(); expect(f.requests()).toHaveLength(1);
+    }));
+    it.each(['failure', 'success'])('missing check name on %s stays blocking', missing => fixture(f => {
+      f.live.statusCheckRollup = [runCheck(100, 'FAILURE', '00'), runCheck(101, 'SUCCESS', '05')];
+      delete f.live.statusCheckRollup[missing === 'failure' ? 0 : 1].name;
+      f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
+    }));
+    it('different check names in the same workflow cannot supersede', () => fixture(f => {
+      f.live.statusCheckRollup = [runCheck(100, 'FAILURE', '00'), runCheck(101, 'SUCCESS', '05', { name: 'other' })];
+      f.run(); expect(f.requests()).toHaveLength(0);
+    }));
+    it.each(['failure', 'success'])('missing completedAt on %s stays blocking', missing => fixture(f => {
+      f.live.statusCheckRollup = [runCheck(100, 'FAILURE', '00'), runCheck(101, 'SUCCESS', '05')];
+      delete f.live.statusCheckRollup[missing === 'failure' ? 0 : 1].completedAt;
+      f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
+    }));
+    it('tied completion times stay blocking despite valid later-starting run identity', () => fixture(f => {
+      f.live.statusCheckRollup = [runCheck(100, 'FAILURE', '00'), runCheck(101, 'SUCCESS', '05', {
+        completedAt: '2026-11-02T10:00:30Z',
+      })];
+      f.run(); expect(f.requests()).toHaveLength(0);
     }));
     // Trimmed from #6287's rollup: preserve the actual run timestamps and mixed outcomes.
     const rollup6287 = [
@@ -407,10 +459,11 @@ describe('merge-queue same-head failure admission', () => {
       { name: 'review-gate', status: 'COMPLETED', conclusion: 'SUCCESS', state: null, startedAt: '2026-11-02T22:52:04Z', completedAt: '2026-11-02T22:52:27Z' },
       { name: 'review-gate', status: 'COMPLETED', conclusion: 'SUCCESS', state: null, startedAt: '2026-11-02T23:26:39Z', completedAt: '2026-11-02T23:26:43Z' },
       { name: 'visual', status: 'COMPLETED', conclusion: 'SKIPPED', state: null, startedAt: '2026-11-02T22:52:03Z', completedAt: '2026-11-02T22:52:02Z' },
-    ];
-    it.each(['SUCCESS', 'FAILURE'])('#6287 rollup with explicit shared workflow identity judges latest review-gate %s', conclusion => fixture(f => {
-      // Synthetic identity enrichment only: the real rollup has no identity beyond name.
-      // Name alone cannot prove supersession; these rows may share it only with matching workflowName.
+    ].map((row, index) => ({ ...row, __typename: 'CheckRun', workflowName: 'CI',
+      // Preserve observed outcomes/times; representative IDs model the full rollup URL shape.
+      detailsUrl: `https://github.com/fixture/drain/actions/runs/${300 + index}/job/${400 + index}`,
+    }));
+    it.each(['SUCCESS', 'FAILURE'])('#6287-shaped rollup judges latest review-gate %s', conclusion => fixture(f => {
       f.live.statusCheckRollup = rollup6287.map(row => ({ ...row, workflowName: 'CI',
         ...(row.completedAt === '2026-11-02T23:26:43Z' ? { conclusion } : {}),
       }));
@@ -432,14 +485,14 @@ describe('merge-queue same-head failure admission', () => {
       ['failed', { status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-11-02T10:06:00Z' }],
     ])('newer %s attempt blocks an older success that finishes later', (_kind, newer) => fixture(f => {
       f.live.statusCheckRollup = [
-        { name: 'gate', workflowName: 'CI', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-11-02T10:00:00Z', completedAt: '2026-11-02T10:10:00Z' },
-        { name: 'gate', workflowName: 'CI', startedAt: '2026-11-02T10:05:00Z', ...newer },
+        { ...runCheck(100, 'SUCCESS', '00'), completedAt: '2026-11-02T10:10:00Z' },
+        { ...runCheck(101, 'FAILURE', '05'), ...newer },
       ];
       f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
     }));
     it.each(['success', 'failure'])('missing %s start time keeps overlapping failure blocking', missing => fixture(f => {
-      const success = { name: 'gate', workflowName: 'CI', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-11-02T10:00:00Z', completedAt: '2026-11-02T10:10:00Z' };
-      const failure = { name: 'gate', workflowName: 'CI', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-11-02T10:05:00Z', completedAt: '2026-11-02T10:06:00Z' };
+      const success = { ...runCheck(100, 'SUCCESS', '00'), completedAt: '2026-11-02T10:10:00Z' };
+      const failure = { ...runCheck(101, 'FAILURE', '05'), completedAt: '2026-11-02T10:06:00Z' };
       if (missing !== 'failure') delete success.startedAt;
       if (missing !== 'success') delete failure.startedAt;
       f.live.statusCheckRollup = [success, failure];
@@ -454,13 +507,13 @@ describe('merge-queue same-head failure admission', () => {
         // Completion order cannot distinguish an older overlapping success from a retry.
         f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
       }));
-    it('matching name/context/app/workflow URL proves a later completed SUCCESS supersedes failure', () => fixture(f => {
+    it('workflow URL without a run identity cannot supersede failure', () => fixture(f => {
       const identity = { name: 'gate', context: 'checks', app: { id: 123 }, detailsUrl: 'https://github.com/fixture/drain/actions/workflows/ci.yml' };
       f.live.statusCheckRollup = [
         { ...identity, status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-11-02T10:00:00Z' },
         { ...identity, status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-11-02T10:05:00Z' },
       ];
-      f.run(); expect(f.requests()).toHaveLength(1);
+      f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
     }));
     it.each(['other workflow', 'missing workflow', 'blank workflow'])(
       'a later success from another workflow cannot hide a same-name failure: %s', source => fixture(f => {
@@ -472,7 +525,7 @@ describe('merge-queue same-head failure admission', () => {
         f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
       }));
     it('missing workflow identity cannot prove that a success supersedes a failure', () => fixture(f => {
-      f.live.statusCheckRollup = rollup6287;
+      f.live.statusCheckRollup = rollup6287.map(({ workflowName, ...row }) => row);
       f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
     }));
     it.each([false, true])('unordered duplicates fail closed regardless of order: reversed=%s', reverse => fixture(f => {
@@ -487,12 +540,12 @@ describe('merge-queue same-head failure admission', () => {
       }];
       f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
     }));
-    it('context identity and startedAt order permit a later success', () => fixture(f => {
+    it('state-only StatusContext rows cannot supersede failures', () => fixture(f => {
       f.live.statusCheckRollup = [
-        { context: 'gate', workflowName: 'CI', status: 'COMPLETED', state: 'FAILURE', startedAt: '2026-11-02T23:06:39Z' },
+        { __typename: 'StatusContext', context: 'gate', workflowName: 'CI', status: 'COMPLETED', state: 'FAILURE', startedAt: '2026-11-02T23:06:39Z' },
         { name: '', context: 'gate', workflowName: 'CI', status: 'COMPLETED', state: 'SUCCESS', startedAt: '2026-11-02T23:26:39Z' },
       ];
-      f.run(); expect(f.requests()).toHaveLength(1);
+      f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
     }));
     it.each([[], null])('empty/missing rollup fails closed: %s', rollup => fixture(f => {
       f.live.statusCheckRollup = rollup; f.run(); expect(f.requests()).toHaveLength(0);
