@@ -200,6 +200,7 @@ import { reviewCiGate } from './lib/review-ci-gate.mjs';
 import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, handleRequiredWorkflowsRefusal, resolveRefreshOnStaleMergeGate, handleStaleMergeGate } from './lib/merge-queue-enqueue.mjs';
 import { recordEnqueueOutcome } from './lib/drain-poison-guard.mjs';
 import { createAsyncShadow } from './lib/drain-async-shadow.mjs';
+import { createEnqueueClaims } from './lib/drain-enqueue-claim.mjs';
 import { appendDaemonEvent } from './lib/daemon-events.mjs';
 import { createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, createQueueRequiredChecksOf } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
 // #3215 — the drain applies holds of its own (a fresh park, a #2409 stale-acceptance re-park); this is the
@@ -4564,6 +4565,20 @@ export function describeGhListError(e) {
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
 if (IS_CLI) runCli().catch((e) => { process.stderr.write(`merge-ai-prs ✗ ${String(e && e.stack || e)}\n`); process.exit(1); });
 
+/** Item 44 slice 2: the serial pass takes the shared per-(PR, head) claim around its enqueue; claim IO errors fail open. */
+function withSerialEnqueueClaim(claims, identity, run) {
+  let claim;
+  try { claim = claims?.claim({ ...identity, kind: 'serial' }); } catch { /* Serial enqueue stays fail-open. */ }
+  if (claim?.won === false) return { skipped: 'claimed-elsewhere' };
+  let result;
+  try { result = run(); } catch (error) {
+    try { if (claim?.won) claims.release({ ...identity, token: claim.token }); } catch { /* Preserve the enqueue error. */ }
+    throw error;
+  }
+  try { if (claim?.won) claims[result?.enqueued === true ? 'markDone' : 'release']({ ...identity, token: claim.token }); } catch { /* Bookkeeping never changes the result. */ }
+  return result;
+}
+
 async function runCli() {
   // #3866 (ratified) — opt-in only: a no-op unless WE_GITHUB_APP_* is configured, in which case every `gh`
   // call this drain run makes draws from the App installation's own rate-limit bucket instead of the
@@ -6674,7 +6689,9 @@ async function runCli() {
   };
   const toMerge = verdicts.filter((v) => v.decision === 'merge' && !v.prestagePendingCi); // @merge-gate-exempt the FINAL set actually merged; a held PR is `decision:'skip'` and MUST be excluded here — this is the hard AND that never lands a held PR
   let asyncShadow;
+  let enqueueClaims;
   if (!AS_JSON && !DRY_RUN) {
+    try { enqueueClaims = createEnqueueClaims(); } catch { /* Claims fail open for the serial pass. */ }
     try {
       asyncShadow = createAsyncShadow();
       // A dependency-held candidate may not have reached ready ordering. Never trigger a label read for telemetry.
@@ -7186,13 +7203,18 @@ async function runCli() {
             // xym8nt4 — re-check group ownership under the mutex: a group may have claimed this PR since the pre-pass hold.
             const groupHeld = cardGrouping.holdFor(c);
             if (groupHeld) return { skipped: 'card-group-hold', reason: groupHeld.reason };
-            if (mergeStrategy.enqueues(c.repo)) return enqueueWithSameHeadGuard(c, traceHeadSha, { comments: preread.read ? preread.comments : null }); // xtpxusq — never the merge API; throws on failure
+            if (mergeStrategy.enqueues(c.repo)) return withSerialEnqueueClaim(enqueueClaims, { repo: c.repo || localSlug, num: c.num, headSha: traceHeadSha }, () => { return enqueueWithSameHeadGuard(c, traceHeadSha, { comments: preread.read ? preread.comments : null }); }); // xtpxusq — never the merge API; throws on failure
             // x2e120n — the actual `gh pr merge` round-trip, timed on its own (a sub-component of the wider
             // "mergeCascade" step below, which also covers the pre-merge stamps/retarget for every candidate).
             __t.time('mergeCall', () => mergePr({ pr: c.num, repo: c.repo, method: 'merge', matchHeadCommit: traceHeadSha, caller: 'drain' }));
             return { merged: true };
           }, (mergeStrategy.enqueues(c.repo) || cardGrouping.mayHold()) ? { runUnlockedOnContention: false } : {}); // xtpxusq — the enqueue's state write must never run unserialized; xym8nt4 — nor may a direct merge's group re-check (a group claim holds this lock); a refused lock retries next pass
           if (landLock.ran === false) { recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'merge-lock-held', reason: `merge-write mutex held by ${landLock.heldBy || '?'}` }); if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} enqueue skipped: merge-write mutex held by ${landLock.heldBy || '?'} — retried next pass\n`); const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; }
+          if (landLock.result?.skipped === 'claimed-elsewhere') {
+            recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'enqueue-claimed', reason: 'claimed-elsewhere' });
+            const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip';
+            continue;
+          }
           if (landLock.result?.skipped === 'card-group-hold') {
             recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'card-group-hold', reason: landLock.result.reason });
             if (!AS_JSON) process.stderr.write(`  ⏸ ${repoTag(c.repo)}${c.num} not landed: ${landLock.result.reason} — claimed by a card group after the pass-start check (xym8nt4)\n`);
