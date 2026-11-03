@@ -904,21 +904,21 @@ describe('resolveDraft — a red-main fix PR always opens ready (card xu1nixv, i
 // ── R502 item 2: pre-approved / guard-config PRs open READY; a park label is retried, never silently dropped ──
 describe('decideReadyOnOpen — only flagged PRs skip the draft step (fail closed)', () => {
   const cfg = { guardConfigPaths: ['scripts/settings/prototype-load.json'] };
-  it('an Operator-pre-approved marker opens ready ONLY when the diff is confined to guard-config paths', () => {
-    expect(decideReadyOnOpen({ body: 'x\nOperator-pre-approved: R474\n', changedFiles: ['scripts/settings/prototype-load.json'], ...cfg })).toMatchObject({ ready: true, why: 'pre-approved' });
-    expect(decideReadyOnOpen({ body: 'x\nOperator-pre-approved: R474\n', changedFiles: ['a.mjs'], ...cfg }).ready).toBe(false);
+  const guard = ['scripts/settings/prototype-load.json'];
+  const marker = 'x\nOperator-pre-approved: R474\n';
+  it('marker AND a diff confined to guard-config paths opens ready', () => {
+    expect(decideReadyOnOpen({ body: marker, changedFiles: guard, ...cfg })).toMatchObject({ ready: true, why: 'pre-approved-guard-config' });
   });
-  it('a malformed or missing marker is only guard-config, never pre-approved', () => {
-    for (const body of ['Operator-pre-approved: yes', 'pre-approved R474', '', 'Operator-pre-approved: R4x']) expect(decideReadyOnOpen({ body, changedFiles: ['scripts/settings/prototype-load.json'], ...cfg }).why).toBe('guard-config');
-  });
-  it('a PR touching ONLY guard-config paths opens ready; any extra file keeps it a draft', () => {
-    expect(decideReadyOnOpen({ body: '', changedFiles: ['scripts/settings/prototype-load.json'], ...cfg })).toMatchObject({ ready: true, why: 'guard-config' });
-    expect(decideReadyOnOpen({ body: '', changedFiles: ['scripts/settings/prototype-load.json', 'x.mjs'], ...cfg }).ready).toBe(false);
+  it('a marker with any other file, or guard-config without a marker, stays a draft', () => {
+    expect(decideReadyOnOpen({ body: marker, changedFiles: [...guard, 'x.mjs'], ...cfg }).ready).toBe(false);
+    expect(decideReadyOnOpen({ body: marker, changedFiles: ['a.mjs'], ...cfg }).ready).toBe(false);
+    expect(decideReadyOnOpen({ body: '', changedFiles: guard, ...cfg }).ready).toBe(false);
+    for (const body of ['Operator-pre-approved: yes', 'pre-approved R474', 'Operator-pre-approved: R4x']) expect(decideReadyOnOpen({ body, changedFiles: guard, ...cfg }).ready).toBe(false);
   });
   it('no changed files, unreadable settings or no paths fail closed', () => {
-    expect(decideReadyOnOpen({ body: '', changedFiles: [], ...cfg }).ready).toBe(false);
-    expect(decideReadyOnOpen({ body: '', changedFiles: ['scripts/settings/prototype-load.json'] }).ready).toBe(false);
-    expect(decideReadyOnOpen({ body: '', changedFiles: ['scripts/settings/prototype-load.json'], guardConfigPaths: 'nope' }).ready).toBe(false);
+    expect(decideReadyOnOpen({ body: marker, changedFiles: [], ...cfg }).ready).toBe(false);
+    expect(decideReadyOnOpen({ body: marker, changedFiles: guard }).ready).toBe(false);
+    expect(decideReadyOnOpen({ body: marker, changedFiles: guard, guardConfigPaths: 'nope' }).ready).toBe(false);
   });
   it('resolveDraft honours readyOnOpen but never drafts outside park', () => {
     expect(resolveDraft({ mode: 'park', optOut: false, readyOnOpen: true })).toBe(false);

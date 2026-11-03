@@ -367,15 +367,16 @@ export function resolveDraft({ mode, optOut, ref = '', title = '', readyOnOpen =
   return mode === 'park' && !optOut;
 }
 
-/** R502 item 2 — does this PR skip the draft step? Fail closed, and NEVER on a caller-controlled claim alone: the net
- *  diff must be non-empty and confined to the configured `readyPaths` (scripts/settings/pr-land-ready.json), i.e.
- *  guard-config files. Inside that allowlist an `Operator-pre-approved: R<id>[+R<id>]` body line marks a pre-approved
- *  entry PR (reason `pre-approved`); without it the PR is `guard-config`. Anything else stays a draft. Review still
- *  happens (the review label is unchanged) and required CI still gates the merge: this removes only the draft step. */
+/** R502 item 2 — does this PR skip the draft step? Fail closed; BOTH conditions are required: an
+ *  `Operator-pre-approved: R<id>[+R<id>]` body line AND a non-empty net diff confined to the guard-config
+ *  `guardConfigPaths` (read from the BASE branch, scripts/settings/pr-land-ready.json). A marker alone (any diff)
+ *  or a guard-config diff alone (no marker) stays a draft. Review still happens (the review label is unchanged) and
+ *  required CI still gates the merge: this removes only the draft step for operator-ruled entry PRs. */
 export function decideReadyOnOpen({ body = '', changedFiles = [], guardConfigPaths = null } = {}) {
-  if (!Array.isArray(guardConfigPaths) || !guardConfigPaths.length || !Array.isArray(changedFiles) || !changedFiles.length
-    || !changedFiles.every((f) => guardConfigPaths.includes(f))) return { ready: false, why: 'not-flagged' };
-  return { ready: true, why: /^Operator-pre-approved:[ \t]*R\d+(?:\+R\d+)*[ \t]*$/m.test(String(body)) ? 'pre-approved' : 'guard-config' };
+  const marked = /^Operator-pre-approved:[ \t]*R\d+(?:\+R\d+)*[ \t]*$/m.test(String(body));
+  const confined = Array.isArray(guardConfigPaths) && guardConfigPaths.length > 0 && Array.isArray(changedFiles) && changedFiles.length > 0
+    && changedFiles.every((f) => guardConfigPaths.includes(f));
+  return marked && confined ? { ready: true, why: 'pre-approved-guard-config' } : { ready: false, why: marked ? 'marker-outside-guard-config' : 'not-flagged' };
 }
 
 /** R502 item 2 — apply a label with bounded retries (a single transient gh failure left #6339/#6343 with no review
