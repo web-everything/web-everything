@@ -426,7 +426,7 @@ describe('pending red-team watchdog in the shadow sweep', () => {
   const prHead = `${REPO}#11@${HEAD}`;
   const pendingPr = (patch = {}) => ({ ...PRS[0], labels: [{ name: 'red-team:pending' }], ...patch });
   const owner = { host: 'watchdog-host', pidNamespace: 'watchdog-ns', pid: 12345, pidStart: 'owner-start' };
-  const statusFor = (patch = {}) => ({ repo: REPO, pr: 11, head: HEAD, ...owner, status: 'running', ...patch });
+  const statusFor = (patch = {}) => ({ repo: REPO, pr: 11, head: HEAD, ...owner, startedAt: new Date(NOW - 120 * 60_000).toISOString(), status: 'running', ...patch });
   const restartRecord = (minutesAgo, patch = {}) => ({ ts: new Date(NOW - minutesAgo * 60_000).toISOString(),
     phase: 'would-do', lane: 'system', action: 'restart-red-team', prHead,
     key: `${prHead}:red-team-pending:restart-1`, ...patch });
@@ -465,12 +465,12 @@ describe('pending red-team watchdog in the shadow sweep', () => {
   });
   it('an owner on another host waits before the stale deadline and restarts after it', async () => {
     const ninetyMinutesAgo = new Date(NOW - 90 * 60_000).toISOString();
-    const status = statusFor({ host: 'another-host' });
+    const status = statusFor({ host: 'another-host', startedAt: ninetyMinutesAgo });
     const young = await sweep({ status, prs: [pendingPr({ updatedAt: ninetyMinutesAgo, createdAt: ninetyMinutesAgo })] });
     expect(young.out.items).toEqual([]);
     expect(young.out.act).toEqual([]);
     expect(young.probe.isAlive).not.toHaveBeenCalled();
-    const stale = await sweep({ status });
+    const stale = await sweep({ status, now: NOW + 30 * 60_000 });
     expect(stale.out.act).toMatchObject([{ action: 'restart-red-team' }]);
     expect(stale.probe.isAlive).not.toHaveBeenCalled();
   });
@@ -544,7 +544,9 @@ describe('pending red-team watchdog in the shadow sweep', () => {
       restartRecord(5, { action: 'ask-review-daemon', key: `${prHead}:daemon` }),
       restartRecord(5, { phase: 'would-skip', key: 'held' }), restartRecord(5, { phase: 'operator', key: 'operator' })]);
     const { out } = await sweep({ dir });
-    expect(out.act).toMatchObject([{ action: 'restart-red-team', key: `${prHead}:red-team-pending:restart-2` }]);
+    expect(out.items).toMatchObject([{ action: 'restart-red-team', key: `${prHead}:red-team-pending:restart-2` }]);
+    expect(out.act).toEqual([]);
+    expect(out.held).toMatchObject([{ held: 'per-PR-head cap' }]);
   });
   it.each(['restart-red-team', 'publish-red-team-result'])('disabling %s yields an operator item in the sweep', async action => {
     const { out } = await sweep({ settings: shadow({ systemActions: { ...STALL_SWEEP_DEFAULTS.systemActions, [action]: false } }),
@@ -586,7 +588,7 @@ describe('pending red-team watchdog in the shadow sweep', () => {
   });
   it('a PID in another namespace is unknown and waits before the stale deadline', async () => {
     const at = new Date(NOW - 90 * 60_000).toISOString();
-    const { out, probe } = await sweep({ status: statusFor({ pidNamespace: 'other-ns' }),
+    const { out, probe } = await sweep({ status: statusFor({ pidNamespace: 'other-ns', startedAt: at }),
       prs: [pendingPr({ updatedAt: at, createdAt: at })] });
     expect(probe.isAlive).not.toHaveBeenCalled();
     expect(out.items).toEqual([]);
@@ -607,9 +609,9 @@ describe('watchdog headCap buckets', () => {
   const prHead = `${REPO}#11@${HEAD}`;
   const restart = n => ({ lane: 'system', action: 'restart-red-team', prHead, headCap: 2, key: `${prHead}:restart-${n}` });
   const record = (item, phase = 'would-do') => ({ ...item, phase, ts: new Date(NOW - 90 * 60_000).toISOString() });
-  it('a prior daemon nudge does not consume the restart action bucket', () => {
+  it('a prior daemon nudge exhausts the shared budget and holds a restart', () => {
     const history = [record({ prHead, action: 'ask-review-daemon', key: 'daemon' })];
-    expect(planStallActions([restart(1)], { now: NOW, limits, history }).act).toEqual([restart(1)]);
+    expect(planStallActions([restart(1)], { now: NOW, limits, history })).toMatchObject({ act: [], held: [{ ...restart(1), held: 'per-PR-head cap' }] });
   });
   it.each(['would-do', 'intent'])('a second restart bypasses the shared one-action head cap after a prior %s', phase => {
     expect(planStallActions([restart(2)], { now: NOW, limits, history: [record(restart(1), phase)] }).act).toEqual([restart(2)]);

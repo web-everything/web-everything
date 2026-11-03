@@ -2,7 +2,7 @@
 import { describe, it, expect } from 'vitest';
 import { planPendingRedTeam } from '../red-team-pending-watchdog.mjs';
 
-const evidence = (patch = {}) => ({ ageMinutes: 61, status: null, ownerAlive: null,
+const evidence = (patch = {}) => ({ now: 0, ageMinutes: 61, status: null, ownerAlive: null,
   restarts: 0, minutesSinceLastRestart: null, ...patch });
 const plan = (patch = {}) => planPendingRedTeam(evidence(patch));
 const expectKind = (patch, kind) => {
@@ -30,10 +30,10 @@ describe('planPendingRedTeam', () => {
     expectKind({ ageMinutes: 1000, status: { status }, ownerAlive: true, restarts: 2 }, 'wait');
   });
   it.each(['queued', 'running'])('waits for an unknown %s owner before 120 minutes', status => {
-    expectKind({ ageMinutes: 119.99, status: { status }, ownerAlive: null }, 'wait');
+    expectKind({ ageMinutes: 1000, status: { status, startedAt: new Date(-119.99 * 60_000).toISOString() }, ownerAlive: null }, 'wait');
   });
   it.each(['queued', 'running'])('restarts an unknown %s owner at the stale deadline', status => {
-    expectKind({ ageMinutes: 120, status: { status }, ownerAlive: null }, 'restart');
+    expectKind({ ageMinutes: 1000, status: { status, startedAt: new Date(-120 * 60_000).toISOString() }, ownerAlive: null }, 'restart');
   });
   it.each(['queued', 'running'])('restarts a proven-dead %s owner before the stale deadline', status => {
     expectKind({ status: { status }, ownerAlive: false }, 'restart');

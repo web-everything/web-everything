@@ -563,7 +563,7 @@ describe('pending red-team watchdog evidence', () => {
       .toMatchObject({ lane: 'system', action: 'restart-red-team' });
   });
   it.each(states)('%s restarts an unknown owner exactly at the stale deadline', state => {
-    expect(at(state, { redTeam: pending({ ageMinutes: 120, status: { status: 'running' } }) }))
+    expect(at(state, { redTeam: pending({ now: 0, ageMinutes: 1000, status: { status: 'running', startedAt: new Date(-120 * 60_000).toISOString() } }) }))
       .toMatchObject({ lane: 'system', action: 'restart-red-team' });
   });
   it.each(states)('%s does not publish a finished status with only a legacy result string', state => {
