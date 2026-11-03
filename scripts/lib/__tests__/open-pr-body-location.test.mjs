@@ -11,11 +11,17 @@ const check = (bodyFile, extra = {}) => checkBodyFileLocation({ ...defaults, bod
 const privateTemp = { uid: 123, stat: () => ({ uid: 123, mode: 0o40700, isDirectory: () => true }) };
 
 describe('workerScratchDir', () => {
+  it('separates owners that collided under the truncated case-sensitive hash', () => {
+    const first = workerScratchDir('fix', 'abcdEFGhiJKlmnop');
+    const second = workerScratchDir('fix', 'AbcDeFgHIjKLmnop');
+    expect(first.toLowerCase()).not.toBe(second.toLowerCase());
+  });
+
   it('keeps case-distinct owners separate on case-insensitive filesystems', () => {
     const upper = workerScratchDir('fix', 'Alice1');
     const lower = workerScratchDir('fix', 'alice1');
     expect(upper.toLowerCase()).not.toBe(lower.toLowerCase());
-    expect(upper).toMatch(/_alice1-[0-9a-f]{6}$/);
+    expect(upper).toMatch(/_416c69636531$/);
     expect(isWorkerScratchDir(upper.slice('/tmp/'.length))).toBe(true);
     expect(isWorkerScratchDir(lower.slice('/tmp/'.length))).toBe(true);
   });
@@ -27,8 +33,24 @@ describe('workerScratchDir', () => {
     expect(new Set(paths).size).toBe(paths.length);
     for (const path of paths) {
       expect(isWorkerScratchDir(path.slice('/tmp/'.length))).toBe(true);
-      expect(check(`${path}/body.md`)).toEqual({ ok: true });
+      expect(check(`${path}/body.md`, privateTemp)).toEqual({ ok: true });
     }
+  });
+
+  it('round-trips owner bytes without case folding or hash truncation', () => {
+    const owners = ['abcdEFGhiJKlmnop', 'AbcDeFgHIjKLmnop', 'A', 'a-b-', 'Z9-Worker'];
+    for (const owner of owners) {
+      const encoded = workerScratchDir('fix', owner).split('_')[1];
+      expect(encoded).toMatch(/^[0-9a-f]+$/);
+      expect(Buffer.from(encoded, 'hex').toString('utf8')).toBe(owner);
+    }
+  });
+
+  it('bounds the encoded filename and gives a shorter-token fallback', () => {
+    expect(workerScratchDir('fix', 'a'.repeat(120)).split('/').pop()).toHaveLength(255);
+    expect(() => workerScratchDir('fix-', 'a'.repeat(120))).toThrow('use a shorter --purpose or --owner');
+    expect(() => workerScratchDir('fix', 'a'.repeat(121))).toThrow('use a shorter --purpose or --owner');
+    expect(() => workerScratchDir('a'.repeat(243), 'a')).toThrow('use a shorter --purpose or --owner');
   });
 
   it.each(['a_b', 'a/b', '../a', 'a\n', 'a\r', 'a\u2028', 'ａ', 'a\u200b', '`a`', '"a"', '--a'])('rejects token separators and invalid characters: %j', token => {
@@ -42,6 +64,38 @@ describe('workerScratchDir', () => {
 });
 
 describe('checkBodyFileLocation', () => {
+  it.each([
+    { uid: 456, mode: 0o40777, isDirectory: () => true },
+    { uid: 456, mode: 0o40700, isDirectory: () => true },
+    { uid: 123, mode: 0o40777, isDirectory: () => true },
+    undefined,
+  ])('requires private filesystem evidence for a scratch-named directory: %j', evidence => {
+    const stat = vi.fn(() => evidence);
+    expect(check('/tmp/we-scratch-team_shared/body.md', { uid: 123, stat }))
+      .toMatchObject({ ok: false, code: 'body-file-shared-path' });
+    expect(stat).toHaveBeenCalledWith('/tmp/we-scratch-team_shared');
+  });
+
+  it('does not let a nested scratch name bypass a shared parent', () => {
+    const stat = vi.fn(path => ({ uid: 123, mode: path === '/tmp/shared' ? 0o40777 : 0o40700, isDirectory: () => true }));
+    expect(check('/tmp/shared/we-scratch-team_shared/body.md', { uid: 123, stat }))
+      .toMatchObject({ code: 'body-file-shared-path' });
+    expect(stat).toHaveBeenCalledWith('/tmp/shared');
+  });
+
+  it.each(['/tmp/we-scratch-team_shared/body.md', '/tmp/we-scratch-team_shared/notes/body.md'])('admits verified scratch paths when the system temp root differs: %s', path => {
+    const stat = vi.fn(privateTemp.stat);
+    expect(check(path, { ...privateTemp, stat, tmp: '/system/temp' })).toEqual({ ok: true });
+    expect(stat).toHaveBeenCalledWith('/tmp/we-scratch-team_shared');
+    expect(check(path, { tmp: '/system/temp', stat: () => { throw new Error('EACCES'); } }))
+      .toMatchObject({ code: 'body-file-shared-path' });
+  });
+
+  it('requires a known UID even for scratch-named directories', () => {
+    expect(check('/tmp/we-scratch-team_shared/body.md', { ...privateTemp, uid: null }))
+      .toMatchObject({ code: 'body-file-shared-path' });
+  });
+
   it.each(['pr-bodies', 'shared-report', 'team-shared', 'we-scratch-pr-body'])('refuses shared directory %s despite its suffix', name => {
     expect(check(`/tmp/${name}/body.md`, {
       uid: 123, stat: () => ({ uid: 123, mode: 0o40755, isDirectory: () => true }),
@@ -55,7 +109,7 @@ describe('checkBodyFileLocation', () => {
     { uid: 123, mode: 0o100700, isDirectory: () => false },
     undefined,
   ])('refuses missing or non-private stat evidence', evidence => {
-    for (const name of ['task-abcdef', 'we-scratch-fix-abcdef']) {
+    for (const name of ['task-abcdef', 'we-scratch-fix-abcdef', 'we-scratch-team_shared']) {
       expect(check(`/tmp/${name}/body.md`, { uid: 123, stat: () => evidence }))
         .toMatchObject({ code: 'body-file-shared-path' });
     }
@@ -127,7 +181,7 @@ describe('checkBodyFileLocation', () => {
     expect(stat).toHaveBeenCalledWith(`/tmp/${path.split('/')[2]}`);
   });
 
-  it.each(['/other/task-0123456789/nested/body.md', '/other/we-scratch-build-123abc/body.md'])('refuses private-looking directories outside tmp: %s', path => {
+  it.each(['/other/task-0123456789/nested/body.md', '/other/we-scratch-build-123abc/body.md', '/other/we-scratch-team_shared/body.md'])('refuses private-looking directories outside tmp: %s', path => {
     const stat = vi.fn(privateTemp.stat);
     expect(check(path, { ...privateTemp, stat })).toMatchObject({ code: 'body-file-shared-path' });
     expect(stat).not.toHaveBeenCalled();

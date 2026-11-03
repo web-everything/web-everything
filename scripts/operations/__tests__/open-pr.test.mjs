@@ -11,7 +11,7 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { dirname, join, resolve } from 'node:path';
-import { mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { importGraph } from './import-graph.mjs';
@@ -753,6 +753,22 @@ describe('real body tracking adapter', () => {
   });
   const submit = (run, bodyFile) => run({ argv: ['--ref=lane/x', `--body-file=${bodyFile}`] });
 
+  it.each(['/tmp', tmpdir()])('checks real scratch directory permissions under %s before reading a body', temp => {
+    const scratch = mkdtempSync(join(temp, 'we-scratch-team_shared-'));
+    const readPrepBody = vi.fn(() => 'body');
+    const run = createPrLandRunner({
+      cwd: root, env: {}, readPrepBody, prepGate: () => ({ ok: true }),
+      prePrReview: () => ({ action: 'refuse', reason: 'next-gate', message: 'stop before publishing' }),
+    });
+    try {
+      chmodSync(scratch, 0o777);
+      expect(submit(run, join(scratch, 'body.md'))).toMatchObject({ outcome: 'refused', reason: 'body-file-shared-path' });
+      expect(readPrepBody).not.toHaveBeenCalled();
+      chmodSync(scratch, 0o700);
+      expect(submit(run, join(scratch, 'body.md'))).toMatchObject({ outcome: 'refused', reason: 'next-gate' });
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
+  });
+
   it.each([{}, { WE_CARD_BATCH_STATE_DIR: '/tmp/card-batch-state' }])('uses the resolved state-directory environment override: %j', env => {
     const run = createPrLandRunner({
       cwd: root, resolveEnv: () => env, readPrepBody: () => 'body', prepGate: () => ({ ok: true }),
@@ -763,6 +779,22 @@ describe('real body tracking adapter', () => {
     });
     expect(submit(run, '/tmp/card-batch-state-other/lease.body.md'))
       .toMatchObject({ outcome: 'refused', reason: 'body-file-shared-path' });
+  });
+
+  it('refuses a scratch-named alias to an untracked body in a shared directory', () => {
+    const scratch = mkdtempSync('/tmp/we-scratch-alias_private-');
+    const shared = mkdtempSync(join(tmpdir(), 'shared-body-'));
+    try {
+      chmodSync(shared, 0o777);
+      const body = join(shared, 'body.md');
+      writeFileSync(body, 'untracked body');
+      const alias = join(scratch, 'body.md');
+      symlinkSync(body, alias);
+      expect(submit(runner(), alias)).toMatchObject({ outcome: 'refused', reason: 'body-file-shared-path' });
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+      rmSync(shared, { recursive: true, force: true });
+    }
   });
 
   it('refuses an actually tracked file using the real Git index', () => {
@@ -860,7 +892,12 @@ describe('real body tracking adapter', () => {
     } finally { rmSync(scratch, { recursive: true, force: true }); }
   });
 
-  it.each(['/tmp/we-scratch-location-probe_abcdef123456/nonexistent/body.md', 'nonexistent-body-location-probe/notes/body.md'])('allows nonexistent body file %s through to the next gate', bodyFile => {
+  it('refuses a nonexistent scratch directory even when its name looks private', () => {
+    expect(submit(runner(), '/tmp/we-scratch-location-probe_abcdef123456/nonexistent/body.md'))
+      .toMatchObject({ outcome: 'refused', reason: 'body-file-shared-path' });
+  });
+
+  it.each(['nonexistent-body-location-probe/notes/body.md'])('allows nonexistent lane body file %s through to the next gate', bodyFile => {
     const run = createPrLandRunner({
       env: {}, readPrepBody: () => 'body', prepGate: () => ({ ok: true }),
       prePrReview: () => ({ action: 'refuse', reason: 'next-gate', message: 'stop before publishing' }),

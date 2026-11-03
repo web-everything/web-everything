@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { main, renderWorkerBrief } from '../worker-brief.mjs';
 import { resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { readRegistry, resolveFreeScopeSettings } from '../operations/free-scope-io.mjs';
@@ -16,10 +16,14 @@ const params = { purpose: 'fix-widget', files: ['scripts/x.mjs', 'plateau-app:sr
 const files = 'we:scripts/x.mjs,plateau-app:src/y.ts';
 const defaultProof = 'Prove the change on the live case with before/after evidence (command + output), not only unit tests.';
 const io = () => ({ stdout: { write: vi.fn() }, stderr: { write: vi.fn() }, writeFile: vi.fn(), newOwner: () => 'tok12345' });
+const privateTemp = { uid: 123, stat: () => ({ uid: 123, mode: 0o40700, isDirectory: () => true }) };
 
 describe('renderWorkerBrief', () => {
-  it('prints distinct lowercase scratch paths for case-distinct owners', () => {
-    const paths = ['Alice1', 'alice1'].map(owner => {
+  it.each([
+    ['Alice1', 'alice1'],
+    ['abcdEFGhiJKlmnop', 'AbcDeFgHIjKLmnop'],
+  ])('prints distinct lowercase scratch paths for case-distinct owners %s and %s', (first, second) => {
+    const paths = [first, second].map(owner => {
       const brief = renderWorkerBrief({ ...params, owner });
       return /--bodyFile=([^\s`]+)/.exec(brief)[1];
     });
@@ -32,7 +36,7 @@ describe('renderWorkerBrief', () => {
     const paths = pairs.slice(0, 3).map(([purpose, owner]) => {
       const brief = renderWorkerBrief({ ...params, purpose, owner });
       const bodyFile = /--bodyFile=([^\s`]+)/.exec(brief)[1];
-      expect(checkBodyFileLocation({ bodyFile, cwd: '/lanes/worker', home: '/home/operator', tmp: '/tmp', isTracked: () => false })).toEqual({ ok: true });
+      expect(checkBodyFileLocation({ bodyFile, cwd: '/lanes/worker', home: '/home/operator', tmp: '/tmp', isTracked: () => false, ...privateTemp })).toEqual({ ok: true });
       return bodyFile;
     });
     expect(new Set(paths).size).toBe(paths.length);
@@ -42,16 +46,15 @@ describe('renderWorkerBrief', () => {
   it.each(['Alice1', 'tok12345', 'A', 'a-b-', 'Z9-Worker', 'abc12345'])('admits the printed body path for accepted owner %s', owner => {
     const brief = renderWorkerBrief({ ...params, owner });
     const bodyFile = /--bodyFile=([^\s`]+)/.exec(brief)[1];
-    expect(checkBodyFileLocation({ bodyFile, cwd: '/lanes/worker', home: '/home/operator', tmp: '/tmp', isTracked: () => false })).toEqual({ ok: true });
+    expect(checkBodyFileLocation({ bodyFile, cwd: '/lanes/worker', home: '/home/operator', tmp: '/tmp', isTracked: () => false, ...privateTemp })).toEqual({ ok: true });
   });
 
   it('assigns different scratch dirs to workers with the same purpose and different owners', () => {
     const dirs = ['abc12345', 'def67890'].map(owner => {
       const brief = renderWorkerBrief({ ...params, owner });
-      const ownerHash = createHash('sha256').update(owner).digest('hex').slice(0, 6);
-      const dir = `/tmp/we-scratch-${params.purpose}_${owner.toLowerCase()}-${ownerHash}`;
+      const dir = `/tmp/we-scratch-${params.purpose}_${Buffer.from(owner).toString('hex')}`;
       expect(brief).toContain(`**Scratch dir.** \`${dir}\``);
-      expect(brief).toContain(`mkdir -p ${dir}`);
+      expect(brief).toContain(`mkdir -m 700 -p ${dir}`);
       expect(brief).toContain(`--bodyFile=${dir}/body.md`);
       expect(brief).toContain(`report file: \`${dir}/report.md\``);
       expect(brief).toContain('ALL PR body and notes/report files go ONLY there');
@@ -60,6 +63,20 @@ describe('renderWorkerBrief', () => {
       return dir;
     });
     expect(dirs[0]).not.toBe(dirs[1]);
+  });
+
+  it('creates an admissible private directory using the printed command with a permissive umask', () => {
+    const brief = renderWorkerBrief({ ...params, owner: randomUUID() });
+    const bodyFile = /--bodyFile=([^\s`]+)/.exec(brief)[1];
+    const command = /Run `(mkdir [^`]+)` first/.exec(brief)[1];
+    const scratch = path.dirname(bodyFile);
+    try {
+      const result = spawnSync('sh', ['-c', `umask 000; ${command}`], { encoding: 'utf8', timeout: 10000 });
+      expect(result.status).toBe(0);
+      expect(fs.statSync(scratch).mode & 0o777).toBe(0o700);
+      expect(checkBodyFileLocation({ bodyFile, cwd: '/lanes/worker', home: os.homedir(), tmp: os.tmpdir(),
+        isTracked: () => false })).toEqual({ ok: true });
+    } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
   });
 
   it('runs the printed plateau-app check outside WE and reports JSON for the explicit target', () => {
