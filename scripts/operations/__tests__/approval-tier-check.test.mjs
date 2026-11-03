@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, openSync, fstatSync, readSync, closeSync } from 'node:fs';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { decideTier, main, FLOOR } from '../approval-tier-check.mjs';
 
@@ -70,12 +70,15 @@ describe('thin approval-tier decision', () => {
     expect(run(facts({ c3: 'FAIL', explicitAsk: ask })).tier).toBe('elevated');
     for (const key of Object.keys(ask)) { const incomplete = { ...ask }; delete incomplete[key]; expect(run(facts({ c3: 'FAIL', explicitAsk: incomplete })).tier).toBe('human'); }
   });
-  it('explicit ask requirements follow configured tier knobs, retaining evidence', () => {
+  it.each(['requireQuote', 'requireTimestamp', 'requireRulingId'])('explicit ask %s is an immutable true floor; CLI fails closed', async key => {
     const s = structuredClone(settings);
-    s.explicitAsk.requireRulingId = false;
-    const explicitAsk = { quote: 'Implement this direction', timestamp: '2026-11-03T12:00:00Z' };
-    expect(run(facts({ c3: 'FAIL', explicitAsk }), s).tier).toBe('elevated');
-    expect(run(facts({ c3: 'FAIL', explicitAsk: null }), s).tier).toBe('human');
+    s.explicitAsk[key] = false;
+    expect(run(facts(), s)).toMatchObject({ tier: 'unknown', reasons: [`immutable floor: explicitAsk.${key}; operator review required`] });
+    const gatherFacts = vi.fn(async () => facts());
+    expect(await main(['--pr=1', '--repo=web-everything/web-everything'], {
+      settings: s, gatherFacts, stdout: () => {}, stderr: () => {},
+    })).toBe(2);
+    expect(gatherFacts).not.toHaveBeenCalled();
   });
   it('no R455 exception even for structured pre-existing findings', () => {
     expect(run(facts({ audit: { ...weakened, findings: ['pre-existing; carded #123'], findingsStructured: [{ class: 'pre-existing' }] } })).tier).toBe('human');
@@ -114,6 +117,18 @@ describe('thin approval-tier decision', () => {
     const s = structuredClone(settings);
     s.alwaysHuman.pathGlobs.push(...Array(1025).fill('extra/**'));
     expect(run(facts(), s).tier).toBe('unknown');
+  });
+  it('CLI reads only the canonical approval-tiers settings file, without platform overlays', async () => {
+    const settingsIO = { openSync: vi.fn(openSync), fstatSync, readSync, closeSync };
+    const stdout = vi.fn();
+    expect(await main(['--pr=1', '--repo=web-everything/web-everything'], {
+      settingsIO, gatherFacts: async () => facts(), stdout, stderr: () => {},
+    })).toBe(0);
+    expect(JSON.parse(stdout.mock.calls[0][0]).tier).toBe('standard');
+    expect(settingsIO.openSync).toHaveBeenCalledOnce();
+    expect(fileURLToPath(settingsIO.openSync.mock.calls[0][0])).toBe(
+      fileURLToPath(new NodeURL('../../settings/approval-tiers.json', import.meta.url)),
+    );
   });
   it.each([[65536, 0], [1048576, 2]])('CLI production settings reader bounds reads to 64KiB plus one sentinel byte (input=%s)', async (size, exitCode) => {
     // Valid JSON followed by whitespace: removing the size guard must not merely cause a parse error.

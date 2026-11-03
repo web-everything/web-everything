@@ -1,9 +1,11 @@
-/** D-R451 redesign: policy over upstream-validated facts, never a second evidence parser. */
+/** D-R451 redesign: policy over upstream-validated facts, never a second evidence parser.
+ * The validated scripts/settings/approval-tiers.json is the only settings source.
+ * Any future overlay layer must merge monotonically: killSwitch OR, lists union, thresholds max.
+ */
 import { existsSync, openSync, readSync, closeSync, fstatSync, constants } from 'node:fs';
 import { pathToFileURL, URL as NodeURL } from 'node:url';
 import micromatch from 'micromatch';
 import { readRedTeamDisposition } from '../lib/red-team-gate.mjs';
-import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
 
 export const FLOOR = Object.freeze({
   pathGlobs: Object.freeze([
@@ -44,7 +46,7 @@ export function validateSettings(s) {
   for (const [key, min] of [['repeatedRefusals', 3], ['alreadyFixedReports', 2], ['noProgressMs', 7200000]])
     requireFact(Number.isSafeInteger(e[key]) && e[key] >= min, `immutable emergency threshold: ${key}`);
   keysOnly(s.explicitAsk, ['requireQuote', 'requireTimestamp', 'requireRulingId']);
-  for (const key of ['requireQuote', 'requireTimestamp', 'requireRulingId']) requireFact(typeof s.explicitAsk[key] === 'boolean', `invalid explicit ask setting: ${key}`);
+  for (const key of ['requireQuote', 'requireTimestamp', 'requireRulingId']) requireFact(s.explicitAsk[key] === true, `immutable floor: explicitAsk.${key}`);
   return s;
 }
 
@@ -130,15 +132,9 @@ function readBounded(file, io) {
   } finally { io.closeSync(fd); }
 }
 function readSettings(stderr, io) {
-  const read = file => readBounded(file, io);
-  const tool = validateSettings(JSON.parse(read(new NodeURL('../settings/approval-tiers.json', import.meta.url))));
-  const platform = readPlatformPreferences({ readFile: read, warn: () => {} });
-  requireFact(!platform.errors.length, 'unreadable platform settings');
-  const preference = platform.prefs['approval-tiers'];
-  if (preference !== undefined) validateSettings(resolveCascade({ standard: tool, platform: preference }).value);
-  const resolved = resolveCascade({ standard: tool, platform: preference, tool, env: {} });
-  stderr(`${formatCascadeSourcesLine('approval-tiers', resolved)}\n`);
-  return validateSettings(resolved.value);
+  const settings = validateSettings(JSON.parse(readBounded(new NodeURL('../settings/approval-tiers.json', import.meta.url), io)));
+  stderr('approval-tiers settings source: scripts/settings/approval-tiers.json\n');
+  return settings;
 }
 
 export async function main(argv, { settings, settingsIO = { openSync, fstatSync, readSync, closeSync }, gatherFacts = gatherPrFacts, stdout = s => process.stdout.write(s), stderr = s => process.stderr.write(s) } = {}) {

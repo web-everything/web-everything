@@ -1,5 +1,5 @@
 {
-  "_doc": "R454-R459 / D-R451: settings may only add protection to the frozen in-code floor. R455 pre-existing exception is deferred until R473 structured per-finding classes; WEAKENED is never delegable. No environment overrides. Upstream facts must be complete, validated and head-bound; this policy does not parse prose.",
+  "_doc": "R454-R459 / D-R451: settings may only add protection to the frozen in-code floor. All explicitAsk requirements are immutable true. This file is the only settings source; no platform or environment overrides. R455 pre-existing exception is deferred until R473 structured per-finding classes; WEAKENED is never delegable. Upstream facts must be complete, validated and head-bound; this policy does not parse prose.",
   "version": 1,
   "killSwitch": false,
   "requireDifferentModelFamily": true,
