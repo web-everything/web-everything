@@ -9,6 +9,11 @@ const head = 'a'.repeat(40);
 const check = (name, conclusion = 'success', extra = {}) => ({ name, head_sha: head, status: 'completed', conclusion, ...extra });
 const fast = review.fastChecks.we;
 describe('pending-CI start policy', () => {
+  it.each(['off', 'shadow', 'on'])('a green test aggregate implies integration, but not standards, under startEarly=%s', startEarly => {
+    const policy = { ...review, startAfter: 'fast-checks', startEarly, fastChecks: ['test', 'integration', 'standards'] };
+    const result = reviewStartGate({ headSha: head, requiredChecks: ['test', 'integration'], checks: [check('test')], policy });
+    expect(result.affected).toEqual([{ name: 'standards', reason: 'missing' }]);
+  });
   it('off preserves the exact pre-early-start ci-green refusal for completed red CI', () => {
     expect(reviewStartGate({ headSha: head, requiredChecks: ['test'], checks: [check('test', 'failure')],
       policy: { ...review, startAfter: 'ci-green', startEarly: 'off' } })).toEqual({ allowed: false,

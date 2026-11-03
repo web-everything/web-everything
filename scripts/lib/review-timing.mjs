@@ -1,6 +1,7 @@
 /** Pure review/fixer timing decisions. Inputs always describe one pinned head. */
 import { reviewCiGate } from './review-ci-gate.mjs';
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
+import { withoutImpliedRequiredChecks } from './required-check-implication.mjs';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from './constellation-repos.mjs';
 
 // cancelOnCiRed: default off (operator 2026-10-16: keep the option, don't use it yet).
@@ -137,7 +138,8 @@ function registeredStartGate({ headSha, checks, requiredChecks }) {
   const strict = reviewCiGate({ headSha, checks, requiredChecks });
   if (!checkNames(requiredChecks) || typeof headSha !== 'string' || !headSha.trim()) return strict;
   const latest = new Map(collapseRollupToLatestPerName(checks).map(row => [row?.name ?? row?.context, row]));
-  const affected = [...new Set(requiredChecks)].flatMap(name => {
+  // Same implication rule as the strict gate: a green aggregate (test) proves a split-out job (integration).
+  const affected = [...new Set(withoutImpliedRequiredChecks(requiredChecks, [...latest.values()]))].flatMap(name => {
     const row = latest.get(name);
     let reason;
     if (!row) reason = 'missing';
