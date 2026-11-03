@@ -1719,3 +1719,10 @@ describe('direct (snapshot-disabled) list path: retried and truncation-safe', ()
     expect(prs.map(p => p.number)).toEqual([1]);
   }));
 });
+
+it('a paged fallback that returns fewer rows than GitHub reported is refused', async () => {
+  const { defaultReadPrs } = await import('../reconcile-pass.mjs');
+  const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
+  expect(() => defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readCommits: () => [], readShared: () => null,
+    listPaged: () => ({ rows: [], truncated: false, totalCount: 7, cache: {} }), readRest: () => ({ json: {} }) })).toThrow(/0 of 7/);
+});

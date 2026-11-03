@@ -415,6 +415,8 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
       pagedHeavyCache.set(repo, paged.cache);
       // A capped inventory is incomplete discovery: fail loudly rather than plan as if the omitted PRs did not exist.
       if (paged.truncated) throw Object.assign(new Error(`open-PR list for ${repo} truncated at ${PR_LIST_LIMIT} rows (${paged.totalCount} open) — refusing a partial inventory`), { code: 'pr-list-truncated' });
+      // The page reader trusts GitHub's own totalCount only loosely: fewer rows than it reported is a partial inventory.
+      if (Number.isInteger(paged.totalCount) && paged.rows.length < paged.totalCount) throw Object.assign(new Error(`open-PR pages for ${repo} returned ${paged.rows.length} of ${paged.totalCount} PRs — refusing a partial inventory`), { code: 'pr-list-truncated' });
       return paged.rows;
     }, { repo, op: 'reconcile-pr-list', ...retryOpts });
     if (!Array.isArray(listed)) return listed;
