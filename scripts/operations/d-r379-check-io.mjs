@@ -1,4 +1,7 @@
 /** Bounded, injectable Git/GitHub/filesystem readers for D-R379. No shell evaluation. */
+import { defaultListPrComments } from '../conveyor/pr-comments-list.mjs';
+import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { runGhSync } from '../lib/gh-throttle.mjs';
 import * as realFs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
@@ -18,12 +21,41 @@ const SHA = /^[a-f\d]{40}$/i;
 const MAX_BYTES = 8 * 1024 * 1024;
 const safeLog = text => stripVTControlCharacters(text).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
 
-async function realExec(bin, args, options) {
+function realExec(bin, args, options) {
   if (bin === 'gh') {
-    const { runGhSync } = await import('../lib/gh-throttle.mjs');
     return runGhSync(args, options);
   }
   return execFileSync(bin, args, options);
+}
+
+const RED_TEAM_LIMIT = 1024 * 1024;
+/** Shared trusted, current-head red-team evidence reader; unknown evidence requires operator review. */
+export function readRedTeam(pr, head, { cwd = process.cwd(), env = process.env, exec = realExec } = {}) {
+  const LIMIT = RED_TEAM_LIMIT;
+  const requireFact = (ok, reason) => { if (!ok) throw Error(reason); };
+  requireFact(Number.isSafeInteger(pr) && pr > 0 && /^[a-f\d]{40}$/i.test(head), 'invalid red-team scope');
+  let bytes = 0;
+  const comments = defaultListPrComments({ number: pr, repo: CONSTELLATION_REPOS.we.slug, maxPages: 10, gh: args => {
+    const output = exec('gh', args, { cwd, env, encoding: 'utf8', timeout: 60_000,
+      maxBuffer: LIMIT, stdio: ['ignore', 'pipe', 'pipe'] });
+    requireFact(typeof output === 'string' || Buffer.isBuffer(output), 'invalid comment output; operator review required');
+    bytes += Buffer.byteLength(output);
+    requireFact(bytes <= LIMIT, 'comment byte bound exceeded; operator review required');
+    return JSON.parse(String(output));
+  } });
+  let newest = null;
+  for (const comment of comments) {
+    requireFact(typeof comment.body === 'string', 'incomplete comment evidence; operator review required');
+    if (!isTrustedMarkerAuthor(comment)) continue;
+    const marker = /^<!-- we:red-team-advisory pr=(\d+) rev=([a-f\d]{40}) -->/i.exec(comment.body.trimStart());
+    if (!marker || Number(marker[1]) !== pr || marker[2] !== head) continue;
+    // Read the producer's recorded verdict, never infer clear from an empty parse.
+    const verdict = /^Advisory only:.* · recorded verdict `([^`]+)`\.$/m.exec(comment.body)?.[1];
+    const at = Date.parse(comment.createdAt);
+    requireFact(Number.isFinite(at), 'red-team timestamp unknown; operator review required');
+    if (!newest || at >= newest.at) newest = { at, head: marker[2], result: verdict === 'accept' ? 'clear' : (verdict ?? 'unknown') };
+  }
+  return newest ? { head: newest.head, result: newest.result } : null;
 }
 
 /** exec(bin, argv, options), fs, home, env, cwd and output streams are hermetically replaceable. */
@@ -82,6 +114,7 @@ export function createCheckDeps({ cwd = process.cwd(), home = homedir(), env = p
     if (typeof head !== 'string' || !SHA.test(head)) throw new Error('invalid commit');
   };
   return {
+    readRedTeam: (pr, head) => readRedTeam(pr, head, { cwd, env, exec }),
     async readPr(pr) {
       checkPrNumber(pr);
       return JSON.parse(await run('gh', ['pr', 'view', String(pr), '--repo', CONSTELLATION_REPOS.we.slug, '--json', 'title,body,headRefOid,baseRefName']));

@@ -404,6 +404,13 @@ export async function reviewed(pr, head, base, deps, { skipAudit = false } = {})
   if (blocked.length || missing.length) return result(2, name, 'FAIL', [
     ...blocked.map(l => `blocking label: ${l}`), ...missing.map(l => `missing label: ${l}`),
   ]);
+  if (typeof deps.readRedTeam !== 'function') return unknown(2, name, 'head-bound red-team reader unavailable; human review required');
+  let redTeam;
+  try { redTeam = await deps.readRedTeam(pr, head); }
+  catch { return unknown(2, name, 'head-bound red-team evidence unreadable; human review required'); }
+  if (redTeam?.head !== head || redTeam?.result !== 'clear') {
+    return result(2, name, 'FAIL', ['red-team not clear on current head; human review required']);
+  }
   if (!skipAudit) {
     try { audit = latestAudit(await deps.readAudits(), head, base); }
     catch { return unknown(2, name, 'audits unavailable or oversized'); }

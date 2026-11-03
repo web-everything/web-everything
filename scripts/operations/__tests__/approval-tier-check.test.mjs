@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { checkApprovalTier, classifyFindings as classify, createApprovalDeps, main } from '../approval-tier-check.mjs';
+import { createCheckDeps } from '../d-r379-check-io.mjs';
 import { buildVerdictRecord } from '../../lib/verdict-ledger.mjs';
 import { QUESTION_HASH } from '../codex-audit.mjs';
 
@@ -25,6 +26,11 @@ function deps({ paths = ['docs/examples/example.md'], humanRequired = false, set
     readJudgeModelFamily: async () => 'judge', stdout: vi.fn(), stderr: vi.fn(), ...extra,
   };
 }
+const exceptionPolicy = () => {
+  const settings = structuredClone(policy);
+  settings.tiers.standard.allowPreExistingCardedWeakened = true;
+  return settings;
+};
 const check = d => checkApprovalTier(6244, d, repo);
 const weakened = findings => ({ ...clear, verdict: 'WEAKENED', findings });
 const ask = { quote: 'Please implement this direction.', timestamp: clear.at, rulingId: 'R456' };
@@ -49,9 +55,9 @@ describe('approval tiers (synthetic, in-memory evidence)', () => {
   });
   it('R455 requires an existing card', async () => {
     const cardExists = vi.fn(async () => false);
-    expect((await check(deps({ audit: weakened([oldFinding]), cardExists }))).tier).toBe('human');
+    expect((await check(deps({ settings: exceptionPolicy(), audit: weakened([oldFinding]), cardExists }))).tier).toBe('human');
     expect(cardExists).toHaveBeenCalledWith('123');
-    expect((await check(deps({ audit: weakened([oldFinding]), cardExists: async () => { throw Error('unreadable cards'); } }))).tier).toBe('unknown');
+    expect((await check(deps({ settings: exceptionPolicy(), audit: weakened([oldFinding]), cardExists: async () => { throw Error('unreadable cards'); } }))).tier).toBe('unknown');
   });
   it.each([
     ['secrets-access', 'SECRET access', 'title'],
@@ -109,7 +115,7 @@ describe('approval tiers (synthetic, in-memory evidence)', () => {
     });
   it.each([
     [false, clear, 'standard'], [true, clear, 'elevated'],
-    [false, weakened([oldFinding]), 'standard'], [true, weakened([oldFinding]), 'elevated'],
+    [false, weakened([oldFinding]), 'human'], [true, weakened([oldFinding]), 'human'],
     [false, weakened(['docs/examples/example.md:3 weakens scope']), 'human'],
     [true, weakened(['docs/examples/example.md:3 weakens scope']), 'human'],
   ])('R454/R455 humanRequired=%s audit=%j => %s', async (humanRequired, audit, tier) => {
@@ -178,8 +184,8 @@ describe('approval tiers (synthetic, in-memory evidence)', () => {
       expect(classifyFindings([oldFinding, finding], ['docs/examples/example.md']).status).toBe('FAIL');
       expect((await check(deps({ audit: weakened([oldFinding, finding]) }))).tier).toBe('human');
     });
-  it('R455 uses every configured required phrase', async () => {
-    const settings = structuredClone(policy);
+  it('R455 uses every configured required phrase when explicitly enabled', async () => {
+    const settings = exceptionPolicy();
     settings.preExistingException = { requiredPhrases: ['pre-existing on main', 'unrelated to this change', 'independently confirmed'] };
     expect((await check(deps({ settings, audit: weakened([oldFinding]) }))).tier).toBe('human');
     expect((await check(deps({ settings, audit: weakened([`${oldFinding}; independently confirmed`]) }))).tier).toBe('standard');
@@ -209,9 +215,24 @@ describe('approval tiers (synthetic, in-memory evidence)', () => {
     expect(await check(deps({ audit: weakened(['docs/examples/example.md:2 assertion removed']),
       readEmergency: async () => emergency }))).toMatchObject({ tier: 'human', emergencyEligible: expected });
   });
-  it.each(['security', 'secret', 'credential'])('%s finding in diff prevents emergency', async word => {
+  it.each(['security', 'secret', 'credential', 'authentication', 'AUTHORIZATION', 'token', 'permission', 'access', 'injection', 'bypass', 'escalation', 'sanitization', 'csrf', 'xss', 'traversal', 'leak', 'password', 'key', 'crypto', 'guard', 'gate', 'verdict', 'label', 'approval'])('%s finding in diff prevents emergency', async word => {
     expect((await check(deps({ audit: weakened([`docs/examples/example.md:2 ${word} check removed`]),
       readEmergency: async () => ({ blocking: true, repeatedRefusals: 3 }) }))).emergencyEligible).toBe(false);
+  });
+  it.each([undefined, [], [''], Array(1001).fill('auth'), ['x'.repeat(4097)]])
+    ('invalid or oversized security word settings require operator repair (%#)', async securityFindingWords => {
+      const settings = structuredClone(policy);
+      settings.emergency1.securityFindingWords = securityFindingWords;
+      const r = await check(deps({ settings }));
+      expect(r).toMatchObject({ tier: 'unknown', approvableBy: 'operator', emergencyEligible: false });
+      expect(r.reasons.join(' ')).toContain('operator');
+    });
+  it('uses configured security words for emergency exclusion', async () => {
+    const settings = structuredClone(policy);
+    settings.emergency1.securityFindingWords = ['custom-risk'];
+    expect(await check(deps({ settings, audit: weakened(['docs/examples/example.md:2 CUSTOM-RISK check removed']),
+      readEmergency: async () => ({ blocking: true, repeatedRefusals: 3 }) })))
+      .toMatchObject({ tier: 'human', emergencyEligible: false });
   });
   it('clear audit never grants emergency eligibility', async () => {
     expect((await check(deps({ readEmergency: async () => ({ blocking: true, repeatedRefusals: 3 }) }))).emergencyEligible).toBe(false);
@@ -231,7 +252,7 @@ describe('approval tiers (synthetic, in-memory evidence)', () => {
     ['no audit', { audit: null }],
     ['unclassifiable finding', { audit: weakened(['unclear']) }],
     ['labels unreadable', { readLabels: async () => { throw Error(); } }],
-    ['emergency throws', { audit: weakened(['docs/examples/example.md:1 guard removed']), readEmergency: async () => { throw Error(); } }],
+    ['emergency throws', { audit: weakened(['docs/examples/example.md:1 assertion removed']), readEmergency: async () => { throw Error(); } }],
     ['oversized diff; operator reviews full diff', { paths: Array(10001).fill('x') }],
   ])('fail closed: %s', async (_name, overrides) => {
     const d = deps(overrides);
@@ -259,6 +280,23 @@ describe('approval tiers (synthetic, in-memory evidence)', () => {
     expect((await check(deps({ readAudits: async () => [clear,
       { ...clear, head: 'f'.repeat(40), verdict: 'WEAKENED', findings: ['bad'], at: '2026-11-03T00:00:00Z' }] }))).tier).toBe('standard');
   });
+  it.each([false, true])('default setting never passes WEAKENED (humanRequired=%s)', async humanRequired => {
+    expect(policy.tiers.standard.allowPreExistingCardedWeakened).toBe(false);
+    expect(await check(deps({ humanRequired, audit: weakened([oldFinding]) })))
+      .toMatchObject({ tier: 'human', approvableBy: 'operator' });
+  });
+  it.each(['NOT', 'never', 'no', "isn't", 'isn’t'])('enabled R455 rejects negation %s near required phrases', async negation => {
+    for (const phrase of policy.preExistingException.requiredPhrases) {
+      const finding = oldFinding.replace(phrase, `${negation} ${phrase}`);
+      expect(await check(deps({ settings: exceptionPolicy(), audit: weakened([finding]) })))
+        .toMatchObject({ tier: 'human', approvableBy: 'operator' });
+    }
+  });
+  it('security findings outside the diff also exclude emergency approval', async () => {
+    expect(await check(deps({ audit: weakened([`${oldFinding}; authentication check removed`]),
+      readEmergency: async () => ({ blocking: true, repeatedRefusals: 3 }) })))
+      .toMatchObject({ emergencyEligible: false });
+  });
   it('settings can disable the R455 exception', async () => {
     const settings = structuredClone(policy);
     settings.tiers.standard.allowPreExistingCardedWeakened = false;
@@ -268,7 +306,7 @@ describe('approval tiers (synthetic, in-memory evidence)', () => {
     const settings = structuredClone(policy);
     settings.emergency1.repeatedRefusalCount = 4;
     settings.emergency1.knownWontSelfResolveKinds = ['new-kind'];
-    const d = extra => deps({ settings, audit: weakened(['docs/examples/example.md:1 guard removed']),
+    const d = extra => deps({ settings, audit: weakened(['docs/examples/example.md:1 assertion removed']),
       readEmergency: async () => ({ blocking: true, ...extra }) });
     expect((await check(d({ repeatedRefusals: 3 }))).emergencyEligible).toBe(false);
     expect((await check(d({ knownKind: 'new-kind' }))).emergencyEligible).toBe(true);
@@ -294,7 +332,7 @@ describe('finding classification and default shape IO', () => {
   ])('classifies every finding: %j', (findings, status) => {
     expect(classifyFindings(findings, ['docs/examples/example.md']).status).toBe(status);
   });
-  it('reads the newest trusted current-head red-team verdict through bounded gh api argv', async () => {
+  it.each([createApprovalDeps, createCheckDeps])('reads the newest trusted current-head red-team verdict through bounded gh api argv (%#)', async createDeps => {
     const record = (rev, verdict, created_at, login = 'chalbert') => ({ user: { login }, created_at,
       body: `<!-- we:red-team-advisory pr=6244 rev=${rev} -->\n### Post-accept red team\nAdvisory only: this comment changes no label itself; Head \`${rev.slice(0, 12)}\` · recorded verdict \`${verdict}\`.` });
     const rows = [record(head, 'accept', '2026-11-01T00:00:00Z'),
@@ -302,7 +340,7 @@ describe('finding classification and default shape IO', () => {
       record(base, 'accept', '2026-11-03T00:00:00Z'),
       record(head, 'accept', '2026-11-04T00:00:00Z', 'untrusted')];
     const exec = vi.fn(() => JSON.stringify(rows));
-    const d = createApprovalDeps({ exec });
+    const d = createDeps({ exec });
     expect(await d.readRedTeam(6244, head)).toEqual({ head, result: 'changes' });
     rows.push(record(head, 'accept', '2026-11-05T00:00:00Z'));
     expect(await d.readRedTeam(6244, head)).toEqual({ head, result: 'clear' });

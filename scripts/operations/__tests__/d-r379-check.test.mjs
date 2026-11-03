@@ -23,6 +23,7 @@ const verdict = (pr, headSha, extra = {}) => buildVerdictRecord({
 });
 function deps(f = fixture(6223), overrides = {}) {
   return { readPr: async () => f, readLabels: async () => f.labels,
+    readRedTeam: async () => ({head: f.headRefOid, result: 'clear'}),
     fetchNetDiff: async () => ({paths: f.netDiffPaths, base}),
     readLabelEvents: async () => ['review:human','review:pending'].map(name =>
       ({event:'labeled',label:{name},created_at:'2026-11-02T09:00:00Z'})),
@@ -99,6 +100,17 @@ describe('PR target branch evidence', () => {
   });
 });
 describe('fail-closed evidence', () => {
+  it.each([
+    ['missing reader', undefined, 'UNKNOWN'],
+    ['unreadable evidence', async () => { throw Error('offline'); }, 'UNKNOWN'],
+    ['missing evidence', async () => null, 'FAIL'],
+    ['other head', async () => ({head: base, result: 'clear'}), 'FAIL'],
+    ['not clear', async () => ({head: fixture(6223).headRefOid, result: 'held'}), 'FAIL'],
+  ])('red-team clear label fails closed: %s', async (_name, readRedTeam, status) => {
+    const r = await checkPr(1, deps(undefined, {readRedTeam}));
+    expect(r.eligible).toBe(false);
+    expect(condition(r, 2).status).toBe(status);
+  });
   it('fetch failure is UNKNOWN and ineligible', async () => {
     const r = await checkPr(1, deps(undefined, { fetchNetDiff: async () => { throw Error(); } }));
     expect(r.eligible).toBe(false); expect(condition(r,3).status).toBe('UNKNOWN');

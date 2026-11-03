@@ -2,7 +2,7 @@
   "_doc": "Approval-tier settings (R454-R459). Every rule here is a setting; adjust on observed failures. Read by scripts/operations/approval-tier-check.mjs. Direction-setting; operator approves changes to this file.",
   "version": 1,
   "tiers": {
-    "standard": { "approvableBy": "orchestrator", "rule": "D-R379", "requireHumanRequiredFalse": true, "auditMustBe": "NOT WEAKENED", "allowPreExistingCardedWeakened": true },
+    "standard": { "approvableBy": "orchestrator", "rule": "D-R379", "requireHumanRequiredFalse": true, "auditMustBe": "NOT WEAKENED", "allowPreExistingCardedWeakened": false },
     "elevated": {
       "approvableBy": "elevated-judge", "rules": ["R456", "R459"],
       "killSwitch": false,
@@ -28,10 +28,11 @@
       "**/*pricing*", "**/*licens*", "**/monetization*/**"
     ]
   },
-  "preExistingException": { "requiredPhrases": ["pre-existing on main", "unrelated to this change"] },
+  "preExistingException": { "_doc": "Disabled by default via tiers.standard.allowPreExistingCardedWeakened. Requires structured audit findings before enabling; prose alone cannot prove independence.", "requiredPhrases": ["pre-existing on main", "unrelated to this change"] },
   "securityCriticalGlobs": ["scripts/**/*guard*", "scripts/**/*gate*", "scripts/**/*verdict*", "scripts/**/*approval*", "scripts/**/*label*", ".claude/hooks/**", "scripts/hooks/**", "scripts/review-set-label*"],
   "emergency1": {
     "_doc": "R458: ONE emergency definition. Blocking AND won't self-resolve (known now, or unknown after fallback).",
+    "securityFindingWords": ["security", "secret", "credential", "token", "auth", "authentication", "authorization", "permission", "access", "injection", "bypass", "escalat", "sanitiz", "csrf", "xss", "traversal", "leak", "password", "key", "crypto", "guard", "gate", "verdict", "label", "approval"],
     "fallbackNoProgressHours": 2,
     "repeatedRefusalCount": 3,
     "alreadyFixedReportCount": 2,

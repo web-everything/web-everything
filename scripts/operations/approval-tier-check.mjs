@@ -4,12 +4,10 @@ import * as fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { runGhSync } from '../lib/gh-throttle.mjs';
-import { defaultListPrComments } from '../conveyor/pr-comments-list.mjs';
-import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { pathToFileURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
 import { checkPr, reviewed, latestAudit, matchesGlob, validateSettings as validatePathSettings } from './d-r379-check.mjs';
-import { createCheckDeps } from './d-r379-check-io.mjs';
+import { createCheckDeps, readRedTeam } from './d-r379-check-io.mjs';
 import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
 
 const REPO = 'web-everything/web-everything';
@@ -31,7 +29,7 @@ export function validateSettings(s) {
     requireFact(typeof value === 'boolean', 'invalid approval setting boolean');
   }
   for (const list of [s.alwaysHuman?.pathGlobs, s.alwaysHuman?.categories, s.securityCriticalGlobs,
-    s.preExistingException?.requiredPhrases, elevated.rules, emergency?.knownWontSelfResolveKinds, emergency?.neverEmergencyApprovable]) {
+    s.preExistingException?.requiredPhrases, elevated.rules, emergency?.knownWontSelfResolveKinds, emergency?.neverEmergencyApprovable, emergency?.securityFindingWords]) {
     requireFact(Array.isArray(list) && list.length > 0 && list.length <= 1000
       && list.every(v => text(v) && v.length <= 4096), 'invalid or oversized approval setting list');
   }
@@ -94,6 +92,7 @@ export function classifyFindings(findings, netDiffPaths, requiredPhrases) {
     securityInDiff ||= inDiff && /security|secret|credential/i.test(line);
     if (!paths.length || parsed.includes(null) || /[\x00-\x1f\x7f-\x9f]/.test(line)) status = 'UNKNOWN';
     else if (status !== 'UNKNOWN' && (inDiff
+      || /\b(?:not|never|no|isn['’]t)\b/i.test(line)
       || !requiredPhrases.every(phrase => line.toLowerCase().includes(phrase.toLowerCase()))
       || !findingCards(line).length)) status = 'FAIL';
   }
@@ -132,31 +131,7 @@ export function createApprovalDeps(options = {}) {
       return io.readdirSync(join(cwd, 'backlog'), { withFileTypes: true })
         .some(entry => entry.isFile() && entry.name.startsWith(`${id}-`) && entry.name.endsWith('.md'));
     },
-    readRedTeam(pr, head) {
-      requireFact(Number.isSafeInteger(pr) && pr > 0 && /^[a-f\d]{40}$/i.test(head), 'invalid red-team scope');
-      let bytes = 0;
-      const comments = defaultListPrComments({ number: pr, repo: REPO, maxPages: 10, gh: args => {
-        const output = exec('gh', args, { cwd, env, encoding: 'utf8', timeout: 60_000,
-          maxBuffer: LIMIT, stdio: ['ignore', 'pipe', 'pipe'] });
-        requireFact(typeof output === 'string' || Buffer.isBuffer(output), 'invalid comment output; operator review required');
-        bytes += Buffer.byteLength(output);
-        requireFact(bytes <= LIMIT, 'comment byte bound exceeded; operator review required');
-        return JSON.parse(String(output));
-      } });
-      let newest = null;
-      for (const comment of comments) {
-        requireFact(typeof comment.body === 'string', 'incomplete comment evidence; operator review required');
-        if (!isTrustedMarkerAuthor(comment)) continue;
-        const marker = /^<!-- we:red-team-advisory pr=(\d+) rev=([a-f\d]{40}) -->/i.exec(comment.body.trimStart());
-        if (!marker || Number(marker[1]) !== pr || marker[2] !== head) continue;
-        // Read the producer's recorded verdict, never infer clear from an empty parse.
-        const verdict = /^Advisory only:.* · recorded verdict `([^`]+)`\.$/m.exec(comment.body)?.[1];
-        const at = Date.parse(comment.createdAt);
-        requireFact(Number.isFinite(at), 'red-team timestamp unknown; operator review required');
-        if (!newest || at >= newest.at) newest = { at, head: marker[2], result: verdict === 'accept' ? 'clear' : (verdict ?? 'unknown') };
-      }
-      return newest ? { head: newest.head, result: newest.result } : null;
-    },
+    readRedTeam: (pr, head) => readRedTeam(pr, head, { cwd, env, exec }),
     async readShape(files) {
       requireFact(files.every(path => !path.includes(',') && path === path.trim()), 'lossy shape paths; operator review required');
       const output = await exec(process.execPath, ['scripts/review-core-cli.mjs', 'shape', `--files=${files.join(',')}`, '--json'],
@@ -177,7 +152,7 @@ export async function checkApprovalTier(pr, deps, repo = REPO) {
     const settings = validateSettings(await deps.readApprovalSettings());
     // Cache promises, including failures: checkPr and reviewed must see identical evidence.
     const snapshot = { ...deps };
-    for (const key of ['readSettings', 'readPr', 'fetchNetDiff', 'readLabels', 'readReviewLedger', 'readAudits', 'readLabelEvents']) {
+    for (const key of ['readSettings', 'readPr', 'fetchNetDiff', 'readLabels', 'readReviewLedger', 'readAudits', 'readLabelEvents', 'readRedTeam']) {
       let promise;
       snapshot[key] = (...args) => promise ??= Promise.resolve().then(() => deps[key](...args));
     }
@@ -189,7 +164,7 @@ export async function checkApprovalTier(pr, deps, repo = REPO) {
       settings.alwaysHuman.categoryKeywords[category].some(word => categoryText.includes(word.toLowerCase())));
     if (categories.length) return result('human', settings.tiers.human.approvableBy,
       categories.map(category => `always-human category: ${category}`));
-    const redTeam = await deps.readRedTeam?.(pr, head);
+    const redTeam = await snapshot.readRedTeam(pr, head);
     requireFact(redTeam != null, 'head-bound red-team evidence absent');
     const redTeamClear = redTeam.head === head && redTeam.result === 'clear';
     const hits = globs => facts.netDiffPaths.filter(path => globs.some(glob => matchesGlob(path, glob)));
@@ -212,7 +187,7 @@ export async function checkApprovalTier(pr, deps, repo = REPO) {
     requireFact(['PASS', 'FAIL'].includes(classification?.status)
       && typeof classification.securityInDiff === 'boolean', 'audit findings unclassifiable');
     let cardsVerified = classification.status === 'PASS';
-    if (audit.verdict === 'WEAKENED' && cardsVerified) {
+    if (settings.tiers.standard.allowPreExistingCardedWeakened && audit.verdict === 'WEAKENED' && cardsVerified) {
       for (const line of audit.findings) {
         let exists = false;
         for (const id of findingCards(line)) {
@@ -231,8 +206,10 @@ export async function checkApprovalTier(pr, deps, repo = REPO) {
     if (!auditPassing) reasons.push('audit failing: WEAKENED findings are not all explicitly pre-existing on main, unrelated to this change, outside the net diff and carded');
     for (const c of conditions) if (c.status === 'FAIL') reasons.push(`condition ${c.id} failed: ${c.evidence.join('; ')}`);
     if (shape.humanRequired) reasons.push('shape humanRequired=true (R454)');
+    const securityFinding = audit.verdict === 'WEAKENED' && audit.findings.some(line =>
+      settings.emergency1.securityFindingWords.some(word => line.toLowerCase().includes(word.toLowerCase())));
     let emergencyEligible = false;
-    if (!alwaysHuman.length && redTeamClear && acceptance.status === 'PASS' && !classification.securityInDiff
+    if (!alwaysHuman.length && redTeamClear && acceptance.status === 'PASS' && !securityFinding && !classification.securityInDiff
       && ((audit.verdict === 'WEAKENED' && audit.findings.length > 0)
         || (!auditPassing && !shape.humanRequired && conditions.every(c => c.status === 'PASS')))) {
       const emergency = await deps.readEmergency(pr);
