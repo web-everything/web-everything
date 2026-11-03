@@ -68,6 +68,14 @@
       ]
     },
     {
+      "ref": "lane/forge-slot-reconciler-r475",
+      "sha": "d171c9f8f5e6a9656d4866f7ae04042c20ea6a97",
+      "ruling": "R475+R485",
+      "findings": [
+        "scripts/readiness/forge-slot-markers.mjs:272 — Previously, a listed run without a result retained its slot unconditionally; now two zero-active samples permit release without a settled result or per-run cleanup confirmation. This relaxes quarantine based on the producer’s aggregate directory listing (forge-exec-run.mjs:655)."
+      ]
+    },
+    {
       "ref": "lane/freeze-read-retry-lkg",
       "sha": "f8564fc77a42e3c5a326fc17e38c3873f66696b3",
       "ruling": "R432",
@@ -86,11 +94,28 @@
       ]
     },
     {
+      "ref": "lane/mq-same-head-merge-conflict",
+      "sha": "60944430a8e836e2df15a8baba0f8f2806d9d66d",
+      "ruling": "R466+R484",
+      "findings": [
+        "scripts/lib/drain-queue-safety.mjs:61 — One or two `merge_conflict` removals now bypass commit-binding validation and the same-head failure hold when the PR reports `CLEAN`. Previously, same-head or unbound conflicts required intervention; the three-removal cap permits retries previously blocked.",
+        "scripts/lib/__tests__/drain-queue-safety.test.mjs:784 — Tests now require conflict removals to release regardless of binding, while previous conflict hold and force-push protection cases substitute other reasons. The suite therefore accepts the bypass instead of detecting it."
+      ]
+    },
+    {
       "ref": "lane/r452-restart-ceiling",
       "sha": "be8f9f26291bad2acfd3cc45c458efed18d1c998",
       "ruling": "R452",
       "findings": [
         "The canonical Codex audit on head be8f9f2629 reports WEAKENED. The findings are exactly this ruled change: restarts are exempt from the shared per-head ceiling, and the tests that pinned \"restarts spend / are blocked by the shared budget\" were replaced by R452 tests (a second non-restart action on the same head is still refused, in current-pass, would-do and intent evidence). The sweep stays shadow-only."
+      ]
+    },
+    {
+      "ref": "lane/review-early-start",
+      "sha": "bfa5d088cd1a630dd36f37c54bc3e8d250dccfc2",
+      "ruling": "R464+R468+R474",
+      "findings": [
+        "scripts/settings/review.json:3 — Shipped timing changes from fast-check success to `push`, permitting review while both prerequisites are queued. Confirmed by a direct probe: pending checks now allow review, whereas the previous default refuses. `scripts/lib/review-timing.mjs:195` grants this permission even with `startEarly: \"shadow\"` or `\"off\"`; the added publication guard does not preserve the review-start gate."
       ]
     }
   ]
