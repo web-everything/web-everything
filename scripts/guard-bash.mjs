@@ -2046,6 +2046,10 @@ function fetchDestinationIsBranch(spec) {
   if (sp.startsWith('^')) return false;
   const colon = sp.indexOf(':');
   const dst = colon < 0 ? '' : sp.slice(colon + 1);
+  // A wildcard namespace can include refs/heads even when it does not spell that prefix literally.
+  // Compare the fixed prefix conservatively; disjoint namespaces (refs/custom/*, tags, remotes) stay safe.
+  const prefix = dst.split('*', 1)[0];
+  if (dst.includes('*') && ('refs/heads/'.startsWith(prefix) || prefix.startsWith('refs/heads/'))) return true;
   return !!dst && !/^refs\/(?!heads\/)/.test(dst);
 }
 
@@ -2075,7 +2079,7 @@ function fetchWritesLocalBranch(segment, fetchConfig) {
     if (options) {
       const flag = t.split('=')[0];
       // Git accepts unambiguous long-option abbreviations.
-      if ((flag.length >= 10 && '--update-head-ok'.startsWith(flag)) || t === '-u' || /^-[a-z]*u[a-z]*$/.test(t)) return true;
+      if ((flag.length >= 10 && '--update-head-ok'.startsWith(flag)) || t === '-u' || /^-[A-Za-z0-9]*u[A-Za-z0-9]*$/.test(t)) return true;
       if (flag.length >= 5 && '--stdin'.startsWith(flag)) return true; // refspec bytes are unavailable to this hook
       if (flag.length >= 6 && '--refmap'.startsWith(flag)) {
         const spec = t.includes('=') ? t.slice(t.indexOf('=') + 1) : toks[++i] || '';
@@ -2096,7 +2100,7 @@ function fetchWritesLocalBranch(segment, fetchConfig) {
   return false;
 }
 
-/** Config/remote have both read and write forms. Allow only an explicit read mode; conflicting or unknown
+/** Config/remote have both read and write forms. Allow explicit reads and legacy bare-key reads; conflicting or unknown
  *  flags fail closed so `config --get --add …` cannot disguise a mutation as a read. */
 function gitConfigOrRemoteWrites(segment, sub) {
   const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
@@ -2109,6 +2113,8 @@ function gitConfigOrRemoteWrites(segment, sub) {
     return true;
   }
   let read = false;
+  const positionals = [];
+  let options = true;
   const reads = new Set(['--get', '--get-all', '--get-regexp', '--get-urlmatch', '--list', '-l']);
   const flags = new Set(['--global', '--system', '--local', '--worktree', '--includes', '--no-includes',
     '--show-origin', '--show-scope', '--null', '-z', '--name-only', '--fixed-value',
@@ -2116,15 +2122,19 @@ function gitConfigOrRemoteWrites(segment, sub) {
   const values = new Set(['--file', '--fil', '-f', '--blob', '--type', '--default', '--value', '--url']);
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
+    if (options && a === '--') { options = false; continue; }
+    if (!options) { positionals.push(a); continue; }
     if (i === 0 && (a === 'get' || a === 'list')) { read = true; continue; }
     if (reads.has(a)) { read = true; continue; }
-    if (!a.startsWith('-')) continue;
+    if (!a.startsWith('-')) { positionals.push(a); continue; }
     if (a.startsWith('-f') && a.length > 2) continue;
     const flag = a.split('=')[0];
     if (values.has(flag)) { if (!a.includes('=')) i += 1; continue; }
     if (!flags.has(flag)) return true;
   }
-  return !read;
+  // A valid legacy key contains a section separator. Requiring it also keeps single-word modern
+  // mutation verbs such as `edit` from being mistaken for a legacy read.
+  return !read && !(positionals.length === 1 && positionals[0].includes('.'));
 }
 
 /** Read assignments from the same wrapper prefix that canonicalCommand peels, never ordinary arguments. */
@@ -2165,8 +2175,30 @@ export function readDaemonFetchConfig(segment, cwd, envDirs = [], configEnv = {}
   if (envDirs.length) return null;
   const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
   const globals = toks.slice(1, gitSubcommandIndex(toks));
+  // execFileSync does no shell expansion. Normalize target values with the same HOME rule as
+  // gitTargetDirs, preserving option order and leaving config payloads untouched.
+  for (let i = 0; i < globals.length; i++) {
+    const token = globals[i];
+    if (['-C', '--git-dir', '--work-tree'].includes(token)) {
+      const value = globals[++i];
+      if (value === '~' || value?.startsWith('~/')) {
+        globals[i] = absoluteGitTarget(cwd, value);
+        if (globals[i] === null) return null;
+      }
+    } else if (/^--(?:git-dir|work-tree)=/.test(token)) {
+      const equal = token.indexOf('=');
+      const value = token.slice(equal + 1);
+      if (value === '~' || value.startsWith('~/')) {
+        const target = absoluteGitTarget(cwd, value);
+        if (target === null) return null;
+        globals[i] = token.slice(0, equal + 1) + target;
+      }
+    } else if (GIT_VALUE_FLAGS.has(token)) i += 1;
+  }
   const env = { ...process.env, ...configEnv, GIT_OPTIONAL_LOCKS: '0' };
   for (const assignment of gitLeadingAssignments(segment)) env[assignment[1]] = assignment[2];
+  // An undefined tracked value is an unset tombstone: do not resurrect the inherited process value.
+  for (const key of Object.keys(env)) if (env[key] === undefined) delete env[key];
   for (const key of ['GIT_DIR', 'GIT_WORK_TREE']) {
     if (env[key] === '~' || env[key]?.startsWith('~/')) {
       env[key] = absoluteGitTarget(cwd, env[key]);
@@ -4946,16 +4978,23 @@ export function decide(command, ctx = {}) {
   // Visit nested shells at their invocation, with a copy of the environment at that point. Flattening
   // first applies future exports to earlier commands and lets assignments in child shells leak out.
   let nestedBudget = NESTED_NODE_CAP;
-  const checkScope = (list, whole, inherited, depth, persist = null) => {
+  const checkScope = (list, whole, inherited, depth, persist = null, inheritedReadonly = []) => {
     const gitConfigEnv = { ...inherited };
-    const setAssignment = (key, value) => {
+    const readonlyNames = new Set(inheritedReadonly);
+    // Clearing evidence must be unconditional. This scanner does not evaluate shell control flow;
+    // retain possible targets in conditional lists, loops and pipelines rather than assume unset ran.
+    const canUnset = !/[&|]|\b(?:if|then|else|elif|while|until|for|do|case)\b/.test(whole);
+    const setAssignment = (key, value, readonly = false) => {
+      if (value === undefined && !canUnset) return;
+      if (readonlyNames.has(key)) return; // failed assignment/unset leaves a readonly target active
       gitConfigEnv[key] = value;
-      if (persist) persist(key, value);
+      if (readonly) readonlyNames.add(key);
+      if (persist) persist(key, value, readonly);
     };
-    const checkNested = (text, env, persistChanges = null) => {
+    const checkNested = (text, env, persistChanges = null, childReadonly = readonlyNames) => {
       if (!String(text).trim() || depth >= NESTED_DEPTH_CAP || nestedBudget <= 0) return null;
       nestedBudget -= 1;
-      return checkScope(parseSegments(text).segments, text, env, depth + 1, persistChanges);
+      return checkScope(parseSegments(text).segments, text, env, depth + 1, persistChanges, childReadonly);
     };
     for (const seg of list) {
       const r = reason(seg, { ...ctx, gitConfigEnv });
@@ -4967,20 +5006,42 @@ export function decide(command, ctx = {}) {
       const substitutionCount = substitutionBodies(seg).length;
       for (const [index, text] of nestedCommandStrings(seg).entries()) {
         const substitution = index < substitutionCount;
+        const newProcess = !substitution && (SHELL_PROGRAMS.has(programWord(seg)) || runnerInvocation(canonicalCommand(seg))?.exec);
         // eval executes in this shell; explicit assignments in its script survive the invocation.
         const nestedReason = checkNested(text, substitution ? gitConfigEnv : localEnv,
-          !substitution && programWord(seg) === 'eval' ? setAssignment : null);
+          !substitution && programWord(seg) === 'eval' ? setAssignment : null, newProcess ? [] : readonlyNames);
         if (nestedReason) return nestedReason;
       }
       const words = shellTokens(seg).filter((t) => !t.op).map((t) => t.text);
       const canonicalWords = shellTokens(canonicalCommand(seg)).filter((t) => !t.op).map((t) => t.text);
+      if (!seg.trim().startsWith('(') && canonicalWords[0] === 'unset') {
+        let variables = true;
+        let options = true;
+        const names = [];
+        for (const word of canonicalWords.slice(1)) {
+          if (options && word === '--') { options = false; continue; }
+          if (options && word.startsWith('-')) {
+            if (!/^-[v]+$/.test(word)) variables = false; // -f/-n do not remove ordinary variables
+            continue;
+          }
+          names.push(word);
+        }
+        if (variables) for (const name of names) {
+          if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) setAssignment(name, undefined);
+        }
+      }
       const directive = !seg.trim().startsWith('(')
         && ['export', 'declare', 'typeset', 'readonly'].includes(canonicalWords[0]);
       if (directive || words.every((t) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(t))) {
+        const readonly = canonicalWords[0] === 'readonly'
+          || (['declare', 'typeset'].includes(canonicalWords[0]) && canonicalWords.some((t) => /^-[A-Za-z]*r[A-Za-z]*$/.test(t)));
         const assignments = directive ? [...gitLeadingAssignments(seg).map((m) => m[0]), ...canonicalWords] : words;
         for (const word of assignments) {
           const m = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(word);
-          if (m) setAssignment(m[1], m[2]);
+          if (m) setAssignment(m[1], m[2], readonly);
+          else if (readonly && word !== canonicalWords[0] && /^[A-Za-z_][A-Za-z0-9_]*$/.test(word)) {
+            setAssignment(word, gitConfigEnv[word], true);
+          }
         }
       }
     }
@@ -4988,7 +5049,7 @@ export function decide(command, ctx = {}) {
     // separators may not be reconstructible from an individual segment. Never use future assignments.
     const group = leadingGroupBody(whole);
     for (const text of [...substitutionBodies(whole), ...(group === null ? [] : [group])]) {
-      const r = checkNested(text, inherited);
+      const r = checkNested(text, inherited, null, inheritedReadonly);
       if (r) return r;
     }
     return null;

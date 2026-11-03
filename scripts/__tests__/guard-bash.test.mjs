@@ -3702,6 +3702,47 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     expect(decide('git symbolic-ref HEAD', { cwd: CLONE, daemonCloneRoots: roots })).toBeNull();
   });
 
+  it.each(['GIT_DIR', 'GIT_WORK_TREE', 'GIT_CONFIG'])(
+    'allows lane mutations after unsetting an exported Git target: %s', (key) => {
+      const target = key === 'GIT_DIR' ? `${CLONE}/.git` : key === 'GIT_CONFIG' ? `${CLONE}/config` : CLONE;
+      const mutation = key === 'GIT_CONFIG' ? 'git config user.name example' : 'git reset --hard';
+      const ctx = { cwd: LANE, daemonCloneRoots: roots };
+      for (const unset of [`unset ${key}`, `unset -v -- ${key}`, `eval 'unset ${key}'`]) {
+        expect(decide(`export ${key}=${target}; ${unset}; ${mutation}`, ctx), unset).toBeNull();
+      }
+      expect(decide(`export ${key}=${target}; bash -c 'unset ${key}'; ${mutation}`, ctx)).toMatch(/DAEMON CLONE/);
+      expect(decide(`export ${key}=${target}; unset -f ${key}; ${mutation}`, ctx)).toMatch(/DAEMON CLONE/);
+      for (const directive of ['readonly', 'declare -rx', 'typeset -r', "eval 'readonly"]) {
+        const declaration = directive.startsWith('eval') ? `${directive} ${key}=${target}'` : `${directive} ${key}=${target}`;
+        expect(decide(`${declaration}; unset ${key}; ${mutation}`, ctx), declaration).toMatch(/DAEMON CLONE/);
+      }
+      expect(decide(`export ${key}=${target}; readonly ${key}; unset ${key}; ${mutation}`, ctx)).toMatch(/DAEMON CLONE/);
+      expect(decide(`export ${key}=${target}; readonly ${key}; bash -c 'unset ${key}; ${mutation}'`, ctx)).toBeNull();
+      for (const skipped of [`false && unset ${key}`, `true || unset ${key}`, `unset ${key} | cat`, `false && eval 'unset ${key}'`, `if false; then true; unset ${key}; fi`]) {
+        expect(decide(`export ${key}=${target}; ${skipped}; ${mutation}`, ctx), skipped).toMatch(/DAEMON CLONE/);
+      }
+    },
+  );
+
+  it.each(['refs/*', 'refs/h*', 'refs/heads*', 'refs/hea*s/*'])(
+    'DENIES explicit and configured fetch glob destinations that can write branches: %s', (destination) => {
+      for (const command of [
+        `git fetch origin '+refs/heads/*:${destination}'`,
+        `git fetch --refmap='+refs/heads/*:${destination}' origin main`,
+        `git -c 'remote.origin.fetch=+refs/heads/*:${destination}' fetch origin`,
+      ]) expect(daemonCloneWriteReason(command, { cwd: CLONE, roots }), command).toMatch(/DAEMON CLONE/);
+      expect(daemonCloneWriteReason('git fetch origin', {
+        cwd: CLONE, roots, fetchConfig: [`+refs/heads/*:${destination}`],
+      })).toMatch(/DAEMON CLONE/);
+    },
+  );
+
+  it.each(['-Pu', '-4u', '-6u', '-uP', '-P4u'])(
+    'DENIES update-head-ok in mixed short fetch bundles: %s', (bundle) => {
+      expect(decide(`git fetch ${bundle} origin`, { cwd: CLONE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
+    },
+  );
+
   it.each([
     `GIT_DIR=${CLONE}/.git git log && git commit -m x`,
     `env GIT_WORK_TREE=${CLONE} git log; git reset --hard`,
@@ -3828,6 +3869,7 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     'config --get --add remote.origin.fetch +main:main',
     'config --rename-section remote.origin remote.other',
     'config --edit',
+    'config edit',
     'remote add upstream host:org/repo.git',
     'remote set-branches origin main',
     'remote set-url origin host:org/repo.git',
@@ -3842,6 +3884,9 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
   });
 
   it.each([
+    'config remote.origin.url', 'config --local user.name',
+    'config --type=path remote.origin.url', 'config --file /tmp/guard-config user.name',
+    'config -- user.name',
     'config --get remote.origin.fetch', 'config --get-all remote.origin.fetch',
     'config --get-regexp remote.*.fetch', 'config --list', 'config get remote.origin.fetch',
     'config list', 'config get --all remote.origin.fetch',
@@ -3881,7 +3926,7 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     expect(decide(`GIT_CONFIG=${CLONE}/config git log; git config remote.origin.fetch +main:main`, ctx)).toBeNull();
   });
 
-  it.each(['refs/remotes/origin/main', 'refs/tags/v1', 'refs/custom/main'])(
+  it.each(['refs/remotes/origin/main', 'refs/tags/v1', 'refs/custom/main', 'refs/remotes/origin/*', 'refs/tags/*', 'refs/custom/*'])(
     'ALLOWS persisted and explicit non-branch fetch destinations: %s', (destination) => {
       expect(daemonCloneWriteReason(`git fetch host:repo.git feature@v1:${destination}`, {
         cwd: CLONE, roots, fetchConfig: [`+main:${destination}`],
@@ -3924,6 +3969,14 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     expect(decide('git fetch origin', {
       cwd: CLONE, daemonCloneRoots: roots, daemonFetchConfigReader: () => { throw new Error('read failed'); },
     })).toMatch(/DAEMON CLONE/);
+  });
+
+  it('removes unset tombstones from the config-reader process environment', () => {
+    readDaemonFetchConfig('git fetch origin', CLONE, [], { GIT_DIR: undefined, GIT_WORK_TREE: undefined }, (_git, _args, options) => {
+      expect(options.env).not.toHaveProperty('GIT_DIR');
+      expect(options.env).not.toHaveProperty('GIT_WORK_TREE');
+      return '';
+    });
   });
 
   it('DENIES clean, GIT_DIR/GIT_WORK_TREE env, attached -C, and configured/refmap branch-writing fetch', () => {
@@ -3998,6 +4051,8 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
     ['branch', '[remote "origin"]\nfetch = +refs/heads/*:refs/heads/*\n'],
     ['tracking', '[remote "origin"]\nfetch = +refs/heads/*:refs/remotes/origin/*\n'],
     ['broken', '[remote "origin"\nfetch = +main:main\n'],
+    ['included', '[include]\npath = fetch-config\n'],
+    ['worktree', '[core]\nrepositoryformatversion = 1\n[extensions]\nworktreeConfig = true\n'],
   ]) {
     const repo = join(fakeClone, name);
     mkdirSync(join(repo, 'objects'), { recursive: true });
@@ -4006,6 +4061,28 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
     writeFileSync(join(repo, 'config'), config);
     configRepos[name] = repo;
   }
+  writeFileSync(join(configRepos.included, 'fetch-config'), '[remote "origin"]\nfetch = +refs/heads/*:refs/heads/*\n');
+  writeFileSync(join(configRepos.worktree, 'config.worktree'), '[remote "origin"]\nfetch = +refs/heads/*:refs/heads/*\n');
+
+  it.each(['included', 'worktree'])('DENIES fetch with %s branch mappings through the CLI', (name) => {
+    const command = `git -C ${configRepos[name]} fetch origin main`;
+    const out = runHook(command, lane);
+    expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+    // A failed reader also denies: prove the fixture is readable and contains the branch mapping.
+    expect(readDaemonFetchConfig(command, lane)).toEqual(['+refs/heads/*:refs/heads/*']);
+  });
+
+  it.each([
+    '-C ~/some-new-daemon-clone/tracking',
+    '--git-dir=~/some-new-daemon-clone/tracking',
+    '--git-dir ~/some-new-daemon-clone/tracking',
+    '-C ~/some-new-daemon-clone -C tracking',
+    '--git-dir=~/some-new-daemon-clone/tracking --work-tree=~/lane',
+    '--git-dir ~/some-new-daemon-clone/tracking --work-tree ~/lane',
+  ])('ALLOWS diagnostic fetch through home-spelled global targets: %s', (globals) => {
+    expect(runHook(`git ${globals} fetch origin main`, lane, root)).toBeNull();
+  });
 
   it.each(['branch', 'broken'])('DENIES fetch through the CLI with %s persisted config', (name) => {
     const out = runHook(`git -C ${configRepos[name]} fetch origin main`, lane);
