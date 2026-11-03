@@ -448,7 +448,7 @@ describe('ignoredRulings — an older-head block the current-head reviewer ruled
     it('a carried finding the head\'s verifier reproduced is re-confirmed and still escalates', () => {
       const base = record({ head: H3, runId: 'run-3' });
       const carried = recheck(H2, base);
-      const verified = { ...carried, verified: carried.referrals.map((f) => ({ key: f.key, outcome: 'reproduced', reason: 'reproduced on the live head' })) };
+      const verified = { ...carried, verified: carried.referrals.map((f) => ({ key: f.key, outcome: 'reproduced' })) };
       const comments = [...history, comment(r2([]), 10), comment(r2([block]), 12), comment(verified, 20)];
       expect(ignoredRulings({ headRefOid: H3, comments })?.matches).toHaveLength(1);
       expect(unverifiedOnHead({ headRefOid: H3, comments })).toEqual([]);
