@@ -151,7 +151,7 @@ describe('one split retry for incomplete inventory', () => {
         if (mode === 'exhausted') { clock = 10000; return { exitCode: 0, reportText: JSON.stringify({ testResults: [] }) }; }
         if (mode === 'killed') return { exitCode: 137 };
         if (mode === 'signal') return { exitCode: null, signal: 'SIGKILL' };
-        if (typeof mode === 'object') return { exitCode: 1, reportText: JSON.stringify(mode) };
+        if (typeof mode === 'object') return Object.hasOwn(mode, 'exitCode') ? mode : { exitCode: 1, reportText: JSON.stringify(mode) };
         if (mode === 'malformed') return { exitCode: 1, reportText: '{invalid JSON' };
         const reportText = mode === 'oversized' ? streamedInventory('x'.repeat(SHARD_REPORT_MAX_BYTES + 1))
           : JSON.stringify({ testResults: (['missing', 'remote-incomplete'].includes(mode) ? [] : options.files).map(name => ({ name,
@@ -193,8 +193,48 @@ describe('one split retry for incomplete inventory', () => {
   it.each([
     ['passing partial report', { success: true, testResults: [{ name: 'a', status: 'passed', assertionResults: [{ status: 'passed' }] }] }],
     ['unparseable report', 'malformed'],
-  ])('%s without observed failure may become GREEN after passing retries', async (_label, report) => {
+  ])('%s with exit 1 stays UNSETTLED after passing retries', async (_label, report) => {
     const f = await run([report, 'pass', 'pass']);
+    expect(f.code).toBe(75); expect(f.output).toContain('verify-shards: UNSETTLED');
+    expect(f.output).not.toContain('GREEN');
+    expect(f.calls).toHaveLength(3);
+  });
+  it('admission exit 75 with no report (command never ran) may become GREEN', async () => {
+    const f = await run([{ exitCode: 75, reportText: null }, 'pass', 'pass']);
+    expect(f.code).toBe(0); expect(f.output).toContain('verify-shards: GREEN');
+    expect(f.calls).toHaveLength(3);
+  });
+  it.each([null, '{invalid JSON', 'x'.repeat(SHARD_REPORT_MAX_BYTES + 1)].map((reportText, i) => [
+    ['missing', 'malformed', 'oversized'][i], reportText,
+  ]))('exit 1 with %s report cannot become GREEN', async (_label, reportText) => {
+    const f = await run([{ exitCode: 1, reportText }, 'pass', 'pass']);
+    expect(f.code).toBe(75); expect(f.output).toContain('verify-shards: UNSETTLED');
+    expect(f.output).not.toContain('GREEN'); expect(f.calls).toHaveLength(3);
+  });
+  it('exit 1 with missing report is FAIL when a retry fails', async () => {
+    const f = await run([{ exitCode: 1, reportText: null }, 'pass', 'fail']);
+    expect(f.code).toBe(1); expect(f.output).toContain('verify-shard 1/1: FAIL');
+  });
+  it.each(['fullName', 'title'])('retry skipping a previously executed %s stays UNSETTLED', async identity => {
+    const suite = (name, assertions) => ({ name, status: 'passed', assertionResults: assertions.map(
+      ([title, status = 'passed']) => ({ [identity]: title, status })) });
+    const initial = { exitCode: 0, reportText: JSON.stringify({ testResults: [suite('a', [['kept'], ['lost']])] }) };
+    const retry = { exitCode: 0, reportText: JSON.stringify({ testResults: [
+      suite('a', [['kept'], ['lost', 'pending']]), suite('b', [['lost']]),
+    ] }) };
+    const f = await run([initial, retry, 'pass']);
+    expect(f.code).toBe(75); expect(f.output).toContain('verify-shards: UNSETTLED');
+    expect(f.output).not.toContain('GREEN'); expect(f.calls).toHaveLength(3);
+  });
+  it('retry union retaining all previously executed assertions may become GREEN', async () => {
+    const suite = (name, titles) => ({ name, status: 'passed', assertionResults: titles.map(
+      fullName => ({ fullName, status: 'passed' })) });
+    const evidence = testResults => ({ exitCode: 0, reportText: JSON.stringify({ testResults }) });
+    const f = await run([
+      evidence([suite('a', ['first', 'second']), suite('c', ['third'])]),
+      evidence([suite('a', ['second', 'first']), suite('b', ['extra'])]),
+      evidence([suite('c', ['third']), suite('d', ['extra'])]),
+    ]);
     expect(f.code).toBe(0); expect(f.output).toContain('verify-shards: GREEN');
     expect(f.calls).toHaveLength(3);
   });
@@ -233,9 +273,10 @@ describe('one split retry for incomplete inventory', () => {
     expect(f.code).toBe(75); expect(f.calls.map(c => c.files)).toEqual([['a'], ['a']]);
     expect(new Set(f.calls.map(c => c.report)).size).toBe(2);
   });
-  it('confirms remote incomplete evidence locally before the one split retry', async () => {
+  it('confirms remote incomplete evidence locally but preserves its unexplained exit after the split retry', async () => {
     const f = await run(['remote-incomplete', 'missing', 'pass', 'pass']);
-    expect(f.code).toBe(0); expect(f.calls).toHaveLength(4);
+    expect(f.code).toBe(75); expect(f.output).toContain('verify-shards: UNSETTLED');
+    expect(f.output).not.toContain('GREEN'); expect(f.calls).toHaveLength(4);
     expect(f.calls.map(c => c.command)).toEqual(['node', 'npx', 'node', 'node']);
     expect(f.calls.map(c => c.files.length)).toEqual([4, 4, 2, 2]);
   });
