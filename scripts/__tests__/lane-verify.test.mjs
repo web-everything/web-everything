@@ -8,6 +8,7 @@
  *   (`scripts/verify-lane.mjs`) and pr-land's finish-guard calls `verifyGateDecision` here.
  */
 import { describe, it, expect, vi } from 'vitest';
+import { classifyRedCause } from '../lib/red-cause.mjs';
 import { existsSync, readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
@@ -17,6 +18,7 @@ import {
   DEFAULT_VERIFY_TTL_MINUTES,
   verifyStartBody,
   verifyFinishBody,
+  verificationInfrastructureFailure,
   isVerifyAbandoned,
   verifyGateDecision,
   normalizeVerifyRecord,
@@ -46,6 +48,45 @@ describe('marker lifecycle bodies (running → green/red)', () => {
     const done = verifyFinishBody(verifyStartBody({ sha: SHA, suites: 'gate', startedAt: 't' }), { finishedAt: 'u', exitCode: 2 });
     expect(done.status).toBe('red');
     expect(done.exitCode).toBe(2);
+  });
+});
+
+describe('unsettled shard classification', () => {
+  const detail = 'verification unsettled: a test shard stayed INVENTORY-INCOMPLETE after one split retry (capacity/wait); no test verdict, not red, not green. Retry or wait.';
+  it('classifies exit 75 as verify-unsettled infrastructure failure', () => {
+    expect(verificationInfrastructureFailure({ exitCode: 75 })).toEqual({ reason: 'verify-unsettled', detail });
+  });
+  it.each(['', 'verify-shards: UNSETTLED (1:UNSETTLED)'])('empty failure identities remain unsettled through finish and legacy marker reads: %s', summary => {
+    const failureDetails = { tests: [], summary, truncated: false };
+    expect(verificationInfrastructureFailure({ exitCode: 75, failureDetails }))
+      .toMatchObject({ reason: 'verify-unsettled' });
+    const done = verifyFinishBody({ sha: SHA }, { exitCode: 75, failureDetails });
+    expect(done.status).toBe('infrastructure-failure');
+    for (const record of [done, { sha: SHA, status: 'red', exitCode: 75, failureDetails }]) {
+      expect(verifyGateDecision({ record, headSha: SHA, requireVerified: true }))
+        .toMatchObject({ ok: false, status: 'infrastructure-failure', reason: 'verify-unsettled' });
+    }
+  });
+  it('redCause treats exit 75 as infrastructure rather than a test failure', () => {
+    const infrastructure = verificationInfrastructureFailure({ exitCode: 75 });
+    expect(classifyRedCause({ exitCode: 75, infrastructure,
+      phaseResults: [{ phase: 'vitest', result: { exitCode: 75 } }] }))
+      .toEqual({ redCause: 'infra', redCauseFiles: [] });
+  });
+  it('verifyFinishBody records a non-green, non-red status without failing-test names', () => {
+    const done = verifyFinishBody({ sha: SHA }, { exitCode: 75 });
+    expect(done).toMatchObject({ status: 'infrastructure-failure', exitCode: 75, infrastructure: { reason: 'verify-unsettled', detail } });
+    expect(done.failureDetails).toBeUndefined();
+    expect(verifyGateDecision({ record: done, headSha: SHA, requireVerified: true }).ok).toBe(false);
+  });
+  it('exit 75 with recorded failure details stays ordinary red through finish and gate reads', () => {
+    const failureDetails = { tests: [{ file: 'a', name: 'test' }], summary: 'test failed', truncated: false };
+    expect(verificationInfrastructureFailure({ exitCode: 75, failureDetails })).toBeNull();
+    const done = verifyFinishBody({ sha: SHA }, { exitCode: 75, failureDetails });
+    expect(done).toMatchObject({ status: 'red', exitCode: 75, failureDetails });
+    expect(done.infrastructure).toBeUndefined();
+    expect(verifyGateDecision({ record: done, headSha: SHA, requireVerified: true }))
+      .toMatchObject({ ok: false, status: 'red', reason: 'verify-red', failureDetails });
   });
 });
 
