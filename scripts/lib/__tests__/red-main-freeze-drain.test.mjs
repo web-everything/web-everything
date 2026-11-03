@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { evaluateDrainFreeze, prepareDrainFreeze, resolveDrainFreezeSettings, drainFreezeSignal } from '../red-main-freeze-shared.mjs';
+import { evaluateDrainFreeze, prepareDrainFreeze, resolveDrainFreezeSettings, drainFreezeSignal, readSharedFreeze } from '../red-main-freeze-shared.mjs';
 import { decideRedMainHold } from '../red-main-hold.mjs';
 
 const manual = { reason: 'operator\nstop', at: 'today\rnow' };
@@ -37,6 +37,66 @@ describe('A1 shared reader and cascade', () => {
   });
 });
 
+describe('timeout-like diagnostics cannot clear the drain hold', () => {
+  it.each(['ops/etimedout', 'ops/ETIMEDOUT', 'ops/prefix-etimedout-suffix'])(
+    'holds when the shared file disappears from %s after a clear read', async branch => {
+      let present = true;
+      const git = vi.fn(args => {
+        if (args[0] === 'ls-tree') return present ? 'red-main-freeze.json' : '';
+        if (args[0] === 'show') return JSON.stringify(clear);
+        return '';
+      });
+      const f = fixture({ local: null, env: {}, logSettings: false,
+        lkg: { now: () => 1_000_000, sleepSync: vi.fn() },
+        readShared: vi.fn(() => readSharedFreeze({ board: '/board', branch, run: git })) });
+      expect(decision(await prepareDrainFreeze(f)).hold).toBe(false);
+      present = false;
+      f.lkg.now = () => 1_001_000;
+      f.readShared.mockClear(); git.mockClear();
+      const state = await prepareDrainFreeze(f);
+      expect(state.shared.error).toBe(`red-main-freeze.json not on ${branch}`);
+      expect(state.shared.lastKnownGood).toBeUndefined();
+      expect(decision(state).hold).toBe(true);
+      expect(f.readShared).toHaveBeenCalledTimes(1);
+      expect(git.mock.calls.map(([args]) => args[0])).toEqual(['fetch', 'ls-tree']);
+      expect(f.lkg.sleepSync).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ['returned text', () => ({ error: 'branch unreadable: ops/ETIMEDOUT' })],
+    ['thrown message', () => { throw new Error('missing ops/etimedout'); }],
+    ['thrown stderr', () => { throw Object.assign(new Error('fetch failed'), { stderr: 'SSH connection timed out', code: 'ENOENT' }); }],
+    ['code substring', () => ({ error: 'missing', code: 'NOT_ETIMEDOUT' })],
+    ['code case', () => ({ error: 'missing', code: 'etimedout' })],
+    ['code phrase', () => ({ error: 'missing', code: 'timed out' })],
+    ['normalized text', () => ({ error: 'missing\r\nops/ETIMEDOUT\u2028`quote\"/../--' })],
+  ])('holds on %s without structured timeout evidence', async (_name, fail) => {
+    const f = fixture({ local: null, env: {}, logSettings: false,
+      lkg: { now: () => 1_000_000, sleepSync: vi.fn() } });
+    await prepareDrainFreeze(f);
+    f.readShared = vi.fn(fail);
+    const state = await prepareDrainFreeze(f);
+    expect(decision(state).hold).toBe(true);
+    expect(state.shared.lastKnownGood).toBeUndefined();
+    expect(f.readShared).toHaveBeenCalledTimes(1);
+    expect(f.lkg.sleepSync).not.toHaveBeenCalled();
+  });
+
+  it('stops timeout recovery when the next read reports a missing file', async () => {
+    const f = fixture({ local: null, env: {}, logSettings: false,
+      lkg: { now: () => 1_000_000, sleepSync: vi.fn() } });
+    await prepareDrainFreeze(f);
+    f.readShared = vi.fn().mockReturnValueOnce({ error: 'SSH warning', code: 'ETIMEDOUT' })
+      .mockReturnValue({ error: 'red-main-freeze.json not on ops/etimedout' });
+    const state = await prepareDrainFreeze(f);
+    expect(decision(state).hold).toBe(true);
+    expect(state.shared.lastKnownGood).toBeUndefined();
+    expect(f.readShared).toHaveBeenCalledTimes(2);
+    expect(f.lkg.sleepSync).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('untrusted last-known-good cache cannot clear the drain hold', () => {
   it.each(['writable file', 'symlink', 'writable directory', 'foreign owner'])(
     'rejects a newer forged clear from a %s after observing a shared freeze', async variant => {
@@ -55,7 +115,7 @@ describe('untrusted last-known-good cache cannot clear the drain hold', () => {
       const uid = process.getuid();
       const owner = variant === 'foreign owner' ? vi.spyOn(process, 'getuid').mockReturnValue(uid + 1) : null;
       try {
-        f.readShared.mockReturnValue({ error: 'spawnSync git ETIMEDOUT' });
+        f.readShared.mockReturnValue({ error: 'spawnSync git ETIMEDOUT', code: 'ETIMEDOUT' });
         f.lkg.now = () => 1_001_000;
         const state = await prepareDrainFreeze(f);
         expect(f.readShared).toHaveBeenCalledTimes(4);

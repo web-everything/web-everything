@@ -844,7 +844,7 @@ describe('A6 shared text sanitized on read and merge-gate output', () => {
 
 describe('prepareDrainFreeze: timed-out read retry + last-known-good', () => {
   const settings = resolveDrainFreezeSettings({ env: {}, tool: {} });
-  const T = { error: 'branch unreadable: spawnSync git ETIMEDOUT' };
+  const T = { error: 'branch unreadable: spawnSync git ETIMEDOUT', code: 'ETIMEDOUT' };
   const CLEAR = { source: 's', frozen: false, kind: 'manual', reason: null };
   const FROZEN = { source: 's', frozen: true, kind: 'manual', reason: 'red main' };
   const mk = () => ({ file: join(mkdtempSync(join(tmpdir(), 'lkg-')), 'lkg.json'), t: 1_000_000 });
@@ -969,7 +969,7 @@ describe('prepareDrainFreeze: timed-out read retry + last-known-good', () => {
         const opts = { env: {}, settings: resolveDrainFreezeSettings({ env: {}, tool: {} }), logSettings: false, stderr: () => {}, lkg: { file, key: 'foreign', now: () => 1000, sleepSync: () => {} } };
         await prepareDrainFreeze({ ...opts, readShared: () => ({ frozen: true }) });
         let reads = 0;
-        const state = await prepareDrainFreeze({ ...opts, lkg: { ...opts.lkg, now: () => 2000 }, readShared: () => { reads++; return { error: 'ETIMEDOUT' }; } });
+        const state = await prepareDrainFreeze({ ...opts, lkg: { ...opts.lkg, now: () => 2000 }, readShared: () => { reads++; return { error: 'ETIMEDOUT', code: 'ETIMEDOUT' }; } });
         const hold = decideRedMainHold({ num: 7, signal: drainFreezeSignal({ state, now: 1 }) }).hold;
         console.log(JSON.stringify({ reads, frozen: state.frozen, hold, lastKnownGood: !!state.shared.lastKnownGood }));
       `;
@@ -988,7 +988,7 @@ describe('prepareDrainFreeze: timed-out read retry + last-known-good', () => {
         const root = process.env.TMPDIR;
         writeFileSync(join(root, 'we-red-main-freeze-lkg.json'), JSON.stringify({ key: 'default', at: 1000, result: { frozen: false } }));
         const opts = { env: {}, settings: resolveDrainFreezeSettings({ env: {}, tool: {} }), logSettings: false, stderr: () => {}, lkg: { key: 'default', now: () => 1000, sleepSync: () => {} } };
-        const before = await prepareDrainFreeze({ ...opts, readShared: () => ({ error: 'ETIMEDOUT' }) });
+        const before = await prepareDrainFreeze({ ...opts, readShared: () => ({ error: 'ETIMEDOUT', code: 'ETIMEDOUT' }) });
         await prepareDrainFreeze({ ...opts, readShared: () => ({ frozen: false }) });
         const cacheDir = join(root, 'we-red-main-freeze-' + process.getuid());
         console.log(JSON.stringify({ held: before.frozen, dirMode: statSync(cacheDir).mode & 0o777, fileMode: statSync(join(cacheDir, 'lkg.json')).mode & 0o777, frozen: JSON.parse(readFileSync(join(cacheDir, 'lkg.json'), 'utf8')).result.frozen }));
@@ -1018,7 +1018,7 @@ describe('prepareDrainFreeze: timed-out read retry + last-known-good', () => {
     expect(s.frozen).toBe(false); expect(s.shared.lastKnownGood).toBe(true);
   });
   it.each(['returned code', 'thrown code', 'returned killed', 'thrown killed', 'stderr text', 'empty stderr code'])(
-    'timeout classification preserves %s even when the diagnostic is only an SSH warning', async variant => {
+    'timeout classification uses structured evidence for %s', async variant => {
       const m = mk(); await run(() => CLEAR, m);
       let calls = 0;
       const { s } = await run(() => {
@@ -1030,7 +1030,12 @@ describe('prepareDrainFreeze: timed-out read retry + last-known-good', () => {
         } });
         return { error: 'SSH warning', ...metadata };
       }, { ...m, t: m.t + 1000 });
-      expect(calls).toBe(3); expect(s.frozen).toBe(false); expect(s.shared.lastKnownGood).toBe(true);
+      if (variant === 'stderr text') {
+        expect(calls).toBe(1); expect(s.frozen).toBe(true); expect(s.shared.lastKnownGood).toBeUndefined();
+        expect(s.shared.error).toContain('SSH connection timed out');
+      } else {
+        expect(calls).toBe(3); expect(s.frozen).toBe(false); expect(s.shared.lastKnownGood).toBe(true);
+      }
     },
   );
   it('timeout + last-known-good frozen: holds', async () => {

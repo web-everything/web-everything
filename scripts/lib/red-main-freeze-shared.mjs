@@ -353,8 +353,9 @@ export function dequeueUnpublishedFreeze({ repo, branch, dryRun = false, exec = 
 }
 
 /** One pass of IO around the pure decision. Retry once, then reuse the new shared read. */
-const TIMEOUT_RE = /ETIMEDOUT|timed out/i;
-const isReadTimeout = r => r?.killed === true || TIMEOUT_RE.test(r?.code ?? '') || TIMEOUT_RE.test(r?.error ?? '');
+// Diagnostics can contain branch names or remote text; only process metadata
+// establishes a timeout for retries and the fail-open last-known-good fallback.
+const isReadTimeout = r => r?.killed === true || r?.code === 'ETIMEDOUT';
 const LKG_RETRIES = 2;
 const LKG_BACKOFF_MS = 1000;
 const LKG_DEFAULT_MINUTES = 2;
