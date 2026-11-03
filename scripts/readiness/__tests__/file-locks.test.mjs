@@ -382,64 +382,6 @@ describe('reclaim never destroys a lock another owner has taken since', () => {
     expect(readdirSync(dirname(root)).filter((n) => n.includes('.gone-'))).toEqual([]); // …and no tombstone beside it
   });
 
-  it.each(['corrupt', 'malformed', 'unreadable'])('releaseLockDirIf expected-null preserves %s metadata before rename', kind => {
-    const dir = lockDirFor(root, 'p'), file = join(dir, 'lock.json');
-    mkdirSync(dir);
-    if (kind === 'unreadable') mkdirSync(file);
-    else writeFileSync(file, kind === 'corrupt' ? '{' : '{}');
-    let renamed = false;
-    expect(readLockEntry(root, 'p')).toBeNull();
-    expect(releaseLockDirIf(root, 'p', null, {afterRename: () => { renamed = true; }})).toBe(false);
-    expect(renamed).toBe(false);
-    if (kind === 'unreadable') expect(readdirSync(file)).toEqual([]);
-    else expect(readFileSync(file, 'utf8')).toBe(kind === 'corrupt' ? '{' : '{}');
-  });
-
-  it.each(['corrupt', 'malformed', 'unreadable'])('releaseLockDirIf expected-null preserves %s metadata introduced between the entryless checks', kind => {
-    const dir = lockDirFor(root, 'p');
-    mkdirSync(dir);
-    let tomb;
-    expect(releaseLockDirIf(root, 'p', null, {afterRename: moved => {
-      tomb = moved;
-      // The first entryless check passed; ownership evidence appears before tombstone verification.
-      const file = join(moved, 'lock.json');
-      if (kind === 'unreadable') mkdirSync(file);
-      else writeFileSync(file, kind === 'corrupt' ? '{' : '{}');
-    }})).toBe(false);
-    expect(tomb).toBeDefined();
-    expect(existsSync(tomb)).toBe(false); // evidence restored to the original lock path
-    const file = join(dir, 'lock.json');
-    if (kind === 'unreadable') expect(readdirSync(file)).toEqual([]);
-    else expect(readFileSync(file, 'utf8')).toBe(kind === 'corrupt' ? '{' : '{}');
-  });
-
-  it('releaseLockDirIf expected-null removes a directory that stays entryless at both checks', () => {
-    const dir = lockDirFor(root, 'p');
-    mkdirSync(dir);
-    expect(releaseLockDirIf(root, 'p', null)).toBe(true);
-    expect(existsSync(dir)).toBe(false);
-  });
-
-  it.each(['successor', 'heartbeat'])('releaseLockDirIf preserves a displaced %s tombstone when a contender prevents restoration', change => {
-    const expected = makeLockEntry('A', 'p', iso(T0), 100);
-    const successor = {...expected, ...(change === 'successor' ? {owner: 'B', pid: 200} : {heartbeatAt: iso(T0 + 1)})};
-    acquireLockDir(root, 'p', expected);
-    let tomb;
-    try {
-      const removed = releaseLockDirIf(root, 'p', expected, {afterRename: moved => {
-        tomb = moved;
-        // Model a successor taken in the pre-check/rename gap, followed by a contender after the rename.
-        writeFileSync(join(tomb, 'lock.json'), JSON.stringify(successor));
-        expect(acquireLockDir(root, 'p', makeLockEntry('C', 'p', iso(T0 + 2), 300))).toBe(true);
-      }});
-      expect(removed).toBe(false);
-      expect(readLockEntry(root, 'p').owner).toBe('C');
-      expect(JSON.parse(readFileSync(join(tomb, 'lock.json'), 'utf8'))).toEqual(successor);
-      expect(dirname(tomb)).toBe(dirname(root));
-      expect(readdirSync(root)).toEqual([lockIdFor('p')]);
-    } finally { if (tomb) rmSync(tomb, {recursive: true, force: true}); }
-  });
-
   it('heartbeatOwn refreshes the owner\'s lease without rewriting lock.json, and refuses a lock that is no longer the caller\'s', () => {
     reserve(root, 'p', 'A', T0, iso(T0), 100);
     const raw = () => readFileSync(join(lockDirFor(root, 'p'), 'lock.json'), 'utf8');

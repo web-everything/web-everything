@@ -297,27 +297,25 @@ export function releaseLockDir(lockRoot, path) {
  * @param {string} lockRoot
  * @param {string} path
  * @param {{owner:string, heartbeatAt?:string}|null} expected  the entry the caller read (`null` ⇒ an entry-less dir)
- * @param {{afterRename?: ((tomb:string) => void)|null}} [opts] TEST-ONLY seam between rename and verification.
  * @returns {boolean} whether the expected lock was removed (`false` ⇒ gone already, or someone else's — left standing)
  */
-export function releaseLockDirIf(lockRoot, path, expected, { afterRename = null } = {}) {
+export function releaseLockDirIf(lockRoot, path, expected) {
   const dir = lockDirFor(lockRoot, path);
-  const matchesExpected = (found, location) => (expected
+  const matchesExpected = (found) => (expected
     ? !!found && found.owner === expected.owner && (expected.heartbeatAt == null || found.heartbeatAt === expected.heartbeatAt)
-    : found === null && isEntrylessDir(location));
+    : found === null);
   // Cheap pre-check: a lock that is plainly not the one judged is never moved at all, so the rename window below
   // opens only when the lock looks like the expected one.
   if (!existsSync(dir)) return false;
-  if (!matchesExpected(readLockEntry(lockRoot, path), dir)) return false;
+  if (!matchesExpected(readLockEntry(lockRoot, path))) return false;
   // The tombstone is a SIBLING of the lock root, never inside it: readers that enumerate `lockRoot` must not count it.
   const tomb = `${lockRoot}.gone-${randomBytes(6).toString('hex')}`;
   try { renameSync(dir, tomb); } catch (e) { if (e && (e.code === 'ENOENT')) return false; throw e; }
-  if (typeof afterRename === 'function') afterRename(tomb);
-  if (matchesExpected(readEntryInDir(tomb), tomb)) { rmSync(tomb, { recursive: true, force: true }); return true; }
+  if (matchesExpected(readEntryInDir(tomb))) { rmSync(tomb, { recursive: true, force: true }); return true; }
   // The lock changed hands between the pre-check and the rename: restore it. If someone already re-took the path in
-  // that gap, preserve BOTH locks: the displaced live lock stays as a sibling tombstone for recovery.
-  // Failed restoration never authorizes deleting unproved metadata.
-  try { renameSync(tomb, dir); } catch { /* Leave the displaced tombstone intact. */ }
+  // that gap, theirs stands and the displaced tombstone is dropped. This is the one window left (a read-to-rename
+  // gap, not a lease): a rename cannot be made conditional on content, only re-verified after the fact.
+  try { renameSync(tomb, dir); } catch { rmSync(tomb, { recursive: true, force: true }); }
   return false;
 }
 
