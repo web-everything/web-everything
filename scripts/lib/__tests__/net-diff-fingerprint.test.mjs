@@ -12,6 +12,7 @@ const S = {};
 beforeAll(() => {
   dir = mkdtempSync(join(tmpdir(), 'ndfp-'));
   git('init', '-q', '-b', 'main'); git('config', 'user.email', 't@t'); git('config', 'user.name', 't');
+  mkdirSync(join(dir, 'scripts/ci'), { recursive: true }); writeFileSync(join(dir, 'scripts/ci/test-timings.json'), '{"t":0}\n'); git('add', 'scripts/ci/test-timings.json');
   commit('a.mjs', 'one\ntwo\nthree\n', 'base');
   S.base = git('rev-parse', 'HEAD');
   git('checkout', '-q', '-b', 'pr');
@@ -26,7 +27,7 @@ beforeAll(() => {
   // mechanical path only: the root lane manifest is excluded
   git('checkout', '-q', '-b', 'fe', 'rebased'); S.fe = commit('b.txt', Buffer.from([0x61, 0xfe, 0x0a]), 'fe');
   git('checkout', '-q', '-b', 'ff', 'rebased'); S.ff = commit('b.txt', Buffer.from([0x61, 0xff, 0x0a]), 'ff');
-  git('checkout', '-q', '-b', 'timings', 'rebased'); mkdirSync(join(dir, 'scripts/ci'), { recursive: true }); S.timings = commit('scripts/ci/test-timings.json', '{"t":1}\n', 'timings');
+  git('checkout', '-q', '-b', 'timings', 'rebased'); S.timings = commit('scripts/ci/test-timings.json', '{"t":1}\n', 'timings');
   git('checkout', '-q', '-b', 'manifest', 'rebased'); S.manifest = commit('.lane-manifest.json', '{"a":1}\n', 'manifest');
 });
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
