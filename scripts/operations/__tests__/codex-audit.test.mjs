@@ -69,6 +69,21 @@ describe('canonical audit', () => {
     expect(f.deps.runCodex.mock.calls[0][0]).toContain(`git diff ${BASE}...${HEAD}`);
   });
 
+  it('prints exactly one JSON object with the full shas and canonical hash, recording after the audit', async () => {
+    const evidence = { id: 'guard', class: 'B3', file: 'scripts/gate.mjs', line: 12,
+      invariant: 'Unknown state refuses admission', trigger: 'Metadata unreadable',
+      consequence: 'Admission proceeds', relation: 'introduced' };
+    const f = fixture(`WEAKENED\n${JSON.stringify(evidence)}`);
+    expect(await main([...ARGS, '--json'], f.deps)).toBe(1);
+    const printed = JSON.parse(f.output.join(''));
+    expect(printed).toMatchObject({ verdict: 'WEAKENED', base: BASE, head: HEAD, questionHash: QUESTION_HASH });
+    expect(printed.findings).toEqual([expect.objectContaining(evidence)]);
+    expect(f.records).toHaveLength(1);
+    expect(f.records[0]).toMatchObject({ at: AT, base: BASE, head: HEAD, baseRef: 'origin/main', questionHash: QUESTION_HASH, verdict: 'WEAKENED' });
+    expect(f.deps.resolveSha.mock.calls).toEqual([['origin/main'], [HEAD]]);
+    expect(f.deps.appendRecord.mock.invocationCallOrder[0]).toBeGreaterThan(f.deps.runCodex.mock.invocationCallOrder[0]);
+  });
+
   it.each(['', '\n  \n', 'Looks good\nNOT WEAKENED', 'NOT WEAKENED extra', ' WEAKENED', 'WEAKENED ',
     '\x1b[32mNOT WEAKENED\x1b[0m', null])('fails closed on non-exact first verdict %j', async answer => {
     const f = fixture(answer);

@@ -63,7 +63,7 @@ function d2Verified(f, { readCard = readCardFromMain, now = Date.now } = {}, rel
     const body = readCard(f.card);
     if (typeof body !== 'string' || !body.trim()) return false;
     const dues = new Set();
-    for (const line of body.split(/\r?\n|\r| | /)) {
+    for (const line of body.split(/\r?\n|\r|\p{Zl}|\p{Zp}/u)) {
       if (!/must[\s_*-]*pay[\s_*-]*before/i.test(line)) continue;
       const m = /^mustPayBefore:[ \t]*(prod|\d{4}-\d{2}-\d{2})[ \t]*$/.exec(line);
       if (!m) return false;
