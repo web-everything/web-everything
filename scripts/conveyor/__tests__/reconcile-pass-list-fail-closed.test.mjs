@@ -304,3 +304,39 @@ describe('author lookup: a gh call TIMEOUT defers like a slot throttle; the defa
     expect(rest.mock.calls[0][1].execOpts.timeout).toBe(8_000);
   });
 });
+
+describe('fresh read (the fix daemon plans from a read taken AFTER its baseline probe): small pages, never the shared snapshot, never the heavy list', () => {
+  const run = async (extra) => {
+    const { defaultReadPrs } = await import('../reconcile-pass.mjs');
+    const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
+    const readShared = vi.fn(() => { throw new Error('the shared snapshot may predate the baseline probe'); });
+    const issued = [];
+    const exec = (...a) => { issued.push(a); return execFileSyncThrottled(...a); };
+    void exec;
+    return { readShared, call: (listPaged) => defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readCommits: () => [],
+      readShared, listPaged, readRest: () => ({ json: { user: { login: 'u', type: 'User' } } }),
+      retryOpts: { sleep: () => {}, persist: false, onEvent: () => {} }, ...extra }) };
+  };
+  it('fresh:true skips the shared snapshot and reads small pages (the planner always sees post-probe evidence)', async () => {
+    const { readShared, call } = await run({ fresh: true });
+    const listPaged = vi.fn(() => ({ rows: [{ number: 9601, labels: [], comments: [], statusCheckRollup: [] }], cache: {}, totalCount: 1 }));
+    expect(call(listPaged).map(p => p.number)).toEqual([9601]);
+    expect(readShared).not.toHaveBeenCalled();
+    expect(listPaged).toHaveBeenCalledTimes(1);
+  });
+  it('fresh:true fails closed like every other list read: a persistent 504 throws, a short inventory is refused', async () => {
+    const { call } = await run({ fresh: true });
+    const e504 = Object.assign(new Error('x'), { stderr: 'HTTP 504: 504 Gateway Timeout' });
+    expect(() => call(() => { throw e504; })).toThrow();
+    expect(() => call(() => ({ rows: [], cache: {}, totalCount: 7 }))).toThrow(/0 of 7|unique/);
+  });
+  it('the fix daemon planning read passes fresh:true and the REAL throttled exec (a wrapper exec forced the heavy list)', async () => {
+    const daemon = await import('../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs');
+    const read = vi.fn(() => []);
+    daemon.planFreshReadPrs(read)({ repo: 'web-everything/web-everything' });
+    const arg = read.mock.calls[0][0];
+    expect(arg.fresh).toBe(true);
+    expect(arg.exec).toBeUndefined();
+    expect(arg.attributionRepo).toBe('web-everything/web-everything');
+  });
+});

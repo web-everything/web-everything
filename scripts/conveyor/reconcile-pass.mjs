@@ -395,7 +395,10 @@ export function withRestAuthors(rows, { repo, readRest = ghRestGetJson, budget =
 }
 
 export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, readCommits = fetchPrCommits, attributionRepo = repo, readComments, factCache = null,
-  readShared = readSharedOpenPrs, listPaged = listOpenPrsPagedHydrated, readRest = ghRestGetJson, retryOpts = {} } = {}) {
+  readShared = readSharedOpenPrs, listPaged = listOpenPrsPagedHydrated, readRest = ghRestGetJson, retryOpts = {},
+  // `fresh`: skip the host-shared snapshot (valid ~75 s, may predate the caller's own baseline probe) but still read small
+  // pages — never the heavy 200-row `gh pr list`. The fix daemon plans from such a read.
+  fresh = false } = {}) {
   const enrichFresh = (rows, extra = {}) => enrichPrsWithCompleteComments(enrichPrsWithReviewEvidence(rows, { repo: attributionRepo, readCommits: (slug, number, opts) => readCommits(slug, number, { ...opts, ...(exec !== execFileSyncThrottled ? { exec: args => exec('gh', args) } : {}) }) }), { repo: attributionRepo ?? repo, ...(readComments ? { readComments } : {}), ...extra });
   const enrich = rows => {
     if (factCache?.mode !== 'shadow') return enrichFresh(rows);
@@ -453,10 +456,10 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
     return parsed;
   };
   if (exec === execFileSyncThrottled && repo) {
-    const usePaged = prSnapshotEnabled(process.env) || listPaged !== listOpenPrsPagedHydrated;
+    const usePaged = fresh || prSnapshotEnabled(process.env) || listPaged !== listOpenPrsPagedHydrated;
     let listed;
     try { listed = withListRetry(() => {
-      const shared = readShared({ repo, fields: SNAPSHOT_LIST_FIELDS, allowDeferred: true });
+      const shared = fresh ? null : readShared({ repo, fields: SNAPSHOT_LIST_FIELDS, allowDeferred: true });
       if (shared) {
         // A declared smoke sample (WE_PR_SNAPSHOT_SAMPLE or a rebuild-smoke child) is accepted; a sample flag in a live read is not.
         if (shared.sampled === true && !sampleContextDeclared(process.env)) throw Object.assign(new Error(`open-PR snapshot for ${repo} is a sample but no sample is declared — refusing a partial inventory`), { code: 'pr-list-truncated' });
