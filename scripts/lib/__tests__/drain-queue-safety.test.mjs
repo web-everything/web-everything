@@ -50,7 +50,7 @@ describe('merge-queue same-head failure admission', () => {
     __typename: 'HeadRefForcePushedEvent', createdAt, beforeCommit: { oid: prior }, afterCommit: { oid: after },
   });
   const timeline = (...nodes) => ({ nodes, hasPreviousPage: false });
-  const decide = evidence => decideMqSameHead({ pr, head, timeline: evidence });
+  const decide = (evidence, mergeState = 'CLEAN') => decideMqSameHead({ pr, head, timeline: evidence, mergeState });
   const released = { hold: false, line: null };
   const expectHold = (decision, detail) => {
     expect(decision.hold).toBe(true);
@@ -94,6 +94,7 @@ describe('merge-queue same-head failure admission', () => {
         }
         if (args.includes('mergeStateStatus,headRefOid,statusCheckRollup')) return JSON.stringify(f.live);
         if (args.some(arg => arg.includes('isInMergeQueue'))) return queueResponse(false, f.guardHead ?? head);
+        if (args.includes('mergeStateStatus,headRefOid')) return JSON.stringify({ mergeStateStatus: f.live.mergeStateStatus, headRefOid: head });
         return response(f.timeline ?? timeline(removed('failed_checks', f.guardHead ?? head)));
       });
       f.run = (selectedStore = store, identity = {}) => {
@@ -735,10 +736,17 @@ describe('merge-queue same-head failure admission', () => {
       });
       f.run(); expect(f.requests()).toHaveLength(0);
     }));
-    it('an unbound merge_conflict does not unconfirm a same-head failed_checks refresh', () => fixture(f => {
+    it('an unbound merge_conflict cannot confirm a same-head failure, so no refresh is spent', () => fixture(f => {
       f.timeline = timeline({ ...removed('merge_conflict'), beforeCommit: null }, removed());
       expectHold(f.run(), /— failed_checks$/);
-      expect(f.requests()).toHaveLength(1);
+      expect(f.requests()).toHaveLength(0);
+    }));
+    it('a merge_conflict removal on a PR that is not CLEAN holds, and an unreadable state fails closed', () => fixture(f => {
+      f.timeline = timeline({ ...removed('merge_conflict'), beforeCommit: null });
+      f.live.mergeStateStatus = 'UNSTABLE';
+      expectHold(f.run(), /merge_conflict removal and the PR is not CLEAN \(UNSTABLE\)/);
+      f.live.mergeStateStatus = 'CLEAN';
+      expect(f.run()).toEqual({ hold: false, line: null });
     }));
     it('repeated merge_conflict alone cannot confirm a failure or spend a refresh', () => fixture(f => {
       f.timeline = timeline(...Array.from({ length: 3 }, () => removed('merge_conflict')));
@@ -777,6 +785,9 @@ describe('merge-queue same-head failure admission', () => {
     for (const beforeCommit of [removed(reason).beforeCommit, null, { parents: { nodes: [] } }]) {
       expect(decide(timeline({ ...removed(reason), beforeCommit }))).toEqual(released);
     }
+  });
+  it.each([['UNSTABLE'], ['DIRTY'], [null]])('merge_conflict removal holds unless the live PR is CLEAN (%s)', state => {
+    expect(decide(timeline({ ...removed('merge_conflict'), beforeCommit: null }), state).hold).toBe(true);
   });
   it('#6288: merge_conflict with null commit binding releases a CLEAN candidate', () => {
     expect(decide(timeline({ ...removed('merge_conflict'), beforeCommit: null }))).toEqual(released);

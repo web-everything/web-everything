@@ -39,7 +39,7 @@ function mqSameHeadHold({ pr, head }, reason) {
 }
 
 /** Only the merge-group commit's second parent identifies the tested PR head. */
-export function decideMqSameHead({ pr, head, timeline } = {}) {
+export function decideMqSameHead({ pr, head, timeline, mergeState } = {}) {
   const hold = reason => mqSameHeadHold({ pr, head }, reason);
   const currentHead = mqOid(head);
   if (!currentHead) return hold('missing or invalid head');
@@ -56,8 +56,8 @@ export function decideMqSameHead({ pr, head, timeline } = {}) {
     if (event?.__typename !== 'RemovedFromMergeQueueEvent') return hold('unreadable merge-queue event');
     const reason = mqRemovalReason(event);
     if (reason === 'manual' || reason === 'merged') continue;
-    // Callers admit only CLEAN candidates: a base-dependent conflict is not head-failure evidence.
-    // Callers admit only CLEAN candidates: a base-dependent conflict is not head-failure evidence.
+    // A base-dependent conflict is not head-failure evidence, but only while the live PR is CLEAN (checked below).
+    // A base-dependent conflict is not head-failure evidence, but only while the live PR is CLEAN (checked below).
     if (reason === 'merge_conflict') {
       mergeConflictRemovals++;
       continue;
@@ -72,6 +72,8 @@ export function decideMqSameHead({ pr, head, timeline } = {}) {
   }
   if (mergeConflictRemovals >= MQ_MERGE_CONFLICT_RETRY_CAP)
     return hold(`repeated merge_conflict ejection (${mergeConflictRemovals} times); operator must inspect history and enqueue manually`);
+  if (mergeConflictRemovals > 0 && mergeState !== 'CLEAN')
+    return hold(`merge_conflict removal and the PR is not CLEAN (${String(mergeState ?? 'unknown')}); not re-enqueuing`);
   return { hold: false, line: null };
 }
 
@@ -262,6 +264,18 @@ function mqSameHeadRefresh({ repo, pr, head, exec, log, store, allow }) {
   }
 }
 
+const timelineHasConflict = timeline => Array.isArray(timeline?.nodes)
+  && timeline.nodes.some(event => event?.__typename === 'RemovedFromMergeQueueEvent' && mqRemovalReason(event) === 'merge_conflict');
+
+/** Live merge state on the same head, or null (unreadable or head moved) so the conflict exemption fails closed. */
+function readMqMergeState({ repo, pr, head, exec }) {
+  try {
+    const live = JSON.parse(exec('gh', ['pr', 'view', String(pr), '--repo', repo, '--json', 'mergeStateStatus,headRefOid'],
+      { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
+    return mqOid(live?.headRefOid) === head ? live.mergeStateStatus ?? null : null;
+  } catch { return null; }
+}
+
 export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, log = () => {}, allowAlreadyQueued = true, refresh } = {}) {
   // A human's live retry must reach the strategy's already-queued path and its follow-up/ledger writes.
   // This only skips historical admission for bookkeeping. Fresh mutations use allowAlreadyQueued:false
@@ -274,7 +288,8 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
   const decision = queue.error || !currentHead || mqOid(queue.head) !== currentHead
     ? mqSameHeadHold({ pr, head }, 'unreadable or mismatched live merge-queue state; inspect queue before retrying')
     : allowAlreadyQueued && queue.inQueue === true ? { hold: false, line: null }
-      : decideMqSameHead({ pr, head, timeline: (timeline = readMqTimeline({ repo, pr, exec })) });
+      : decideMqSameHead({ pr, head, timeline: (timeline = readMqTimeline({ repo, pr, exec })),
+        mergeState: timelineHasConflict(timeline) ? readMqMergeState({ repo, pr, head: currentHead, exec }) : undefined });
   if (decision.hold) {
     log(decision.line);
     // Unknown/incomplete history cannot authorize recovery. Require a failed removal bound to H.
@@ -282,7 +297,7 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
       && Array.isArray(timeline.nodes) && timeline.nodes.every(event =>
         event?.__typename === 'AddedToMergeQueueEvent' || event?.__typename === 'HeadRefForcePushedEvent'
         || (event?.__typename === 'RemovedFromMergeQueueEvent'
-          && (['manual', 'merged'].includes(mqRemovalReason(event)) || mqRemovalReason(event) === 'merge_conflict'
+          && (['manual', 'merged'].includes(mqRemovalReason(event))
             || (mqFailureReasons.has(mqRemovalReason(event))
               && mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid)))))
       && timeline.nodes.some(event =>
