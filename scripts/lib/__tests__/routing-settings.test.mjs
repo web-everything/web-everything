@@ -1,6 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolveRoutingSettings, effectiveBuilder, BUILD_KINDS } from '../routing-settings.mjs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { readDeclaredSettings } from '../settings-files.mjs';
 import { resolveDispatchRoute } from '../dispatch-routing-policy-io.mjs';
 import { resolveFixExecutorChain } from '../fix-executor-chain.mjs';
 
@@ -30,6 +34,18 @@ describe('routing settings', () => {
     const r = resolveDispatchRoute({ kind: 'build', deliveryAgent: 'codex' }, {});
     expect(r.outcome).toBe('refused');
     expect(r.refusal).toMatch(/codexReserveForAudit/);
+  });
+  it('deliveryAgent is trimmed and lower-cased before the refusal check', () => {
+    for (const agent of [' codex ', 'CODEX', 'Codex\n']) {
+      expect(resolveDispatchRoute({ kind: 'build', deliveryAgent: agent }, {}).outcome).toBe('refused');
+    }
+  });
+  it('fix-executor-chain reads routing.json through the error-surfacing reader (malformed means claude)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'route-'));
+    writeFileSync(join(dir, 'routing.json'), '{ not json');
+    const declared = readDeclaredSettings({ dir, legacyPath: null });
+    expect(declared.errors.length).toBe(1);
+    expect(effectiveBuilder({ env: {}, declared }).builder).toBe('claude');
   });
   it('audit kinds are never build kinds; build is', () => {
     expect(BUILD_KINDS).toContain('build');

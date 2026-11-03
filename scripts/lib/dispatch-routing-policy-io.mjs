@@ -72,7 +72,7 @@ export function resolveDispatchRoute(dispatch, options = {}) {
   }
   // routing.builder=claude: Codex is held for build kinds only; audit and review seats still use it.
   const claudeBuilds = BUILD_KINDS.includes(dispatch?.kind) && effectiveBuilder().builder === 'claude';
-  if (claudeBuilds && dispatch?.deliveryAgent === 'codex' && effectiveBuilder().settings.codexReserveForAudit) {
+  if (claudeBuilds && String(dispatch?.deliveryAgent ?? '').trim().toLowerCase() === 'codex' && effectiveBuilder().settings.codexReserveForAudit) {
     return { outcome: 'refused', refusal: 'deliveryAgent=codex refused: routing.builder=claude and codexReserveForAudit is true (Codex quota is reserved for audits); set codexReserveForAudit=false or routing.builder=codex to honour it', auditTrail: [] };
   }
   if (claudeBuilds && !availability.codex) {

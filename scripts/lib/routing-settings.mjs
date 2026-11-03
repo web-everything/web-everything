@@ -24,8 +24,8 @@ export function resolveRoutingSettings({ env = process.env, repo, declared } = {
 }
 
 /** The effective builder: 'claude' or 'codex'. `auto` reads the newest Codex quota reading; unknown keeps codex. */
-export function effectiveBuilder({ env = process.env, repo, quota = readCodexQuota } = {}) {
-  const s = resolveRoutingSettings({ env, ...(repo ? { repo } : {}) });
+export function effectiveBuilder({ env = process.env, repo, declared, quota = readCodexQuota } = {}) {
+  const s = resolveRoutingSettings({ env, ...(repo ? { repo } : {}), ...(declared ? { declared } : {}) });
   if (s.builder !== 'auto') return { builder: s.builder, source: s.source, settings: s };
   const q = quota(env);
   const used = Number.isFinite(q?.used_percent) ? q.used_percent : null;
