@@ -2250,12 +2250,12 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     const github=vi.fn(async call=>{peak=Math.max(peak,++active);await new Promise(resolve=>setImmediate(resolve));active--;return published(call);});
     await expect(build({cwd,exec:gitInventory(names.map(name=>Buffer.from(name)),Buffer.concat(names.map((name,i)=>indexRecord(name,data[i]))),
       {code:0,stdout:Buffer.concat(names.map((name,i)=>treeRecord(name,data[i])))}),publicRequest:github}))
-      .rejects.toMatchObject({code:'unshipped-test-file',detail:names[65]});
+      .rejects.toMatchObject({code:'unshipped-test-file',detail:expect.stringMatching(new RegExp(`^(?:${names.slice(65).join('|')})$`))}); // which over-cap leaf throws first depends on pool scheduling
     expect(github).toHaveBeenCalledTimes(64);
     expect(peak).toBeLessThanOrEqual(16);
     const oids=callsOf(github).map(call=>call.url);
     expect(new Set(oids).size).toBe(64);
-    expect(oids.some(endpoint=>endpoint.endsWith(blob(data[65])))).toBe(false);
+    expect([...new Set(data)].filter(item=>!oids.some(endpoint=>endpoint.endsWith(blob(item)))).length).toBe(2); // the two over-cap distinct blobs are never looked up
   });
 
   it('keeps identical tracked secrets.txt with a token excluded despite public evidence', async () => {
