@@ -2825,14 +2825,21 @@ function assertReleaseReservedScoped() {
   }
 }
 
-// Compare only refs present in this clone; an absent upstream branch is not an error.
+// Best-effort prune before comparing origin tracking refs; an absent upstream branch is not an error.
 // A successful salvage has separately verified its remote SHA, even when pushing by URL
 // did not create a local remote-tracking ref. Only that verified tip is also excluded.
 function releaseWorkRefuses(dir, label, salvage) {
   const safe = value => String(value).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ');
   const quote = value => /^[a-zA-Z0-9_./:-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
-  const commits = tryGit(['rev-list', 'HEAD', '--branches', '--not', '--remotes',
+  try {
+    git(['fetch', '--prune', 'origin'], dir, { timeout: 20_000 });
+  } catch (error) {
+    log(`  WARNING ${safe(label)}: origin prune fetch failed; using existing tracking refs: ${safe(msgOf(error))}`);
+  }
+  const commits = tryGit(['rev-list', 'HEAD', '--branches', '--not',
+    '--exclude=origin/HEAD', '--exclude=origin/ops/*', '--remotes=origin/*',
     ...(salvage?.status === 'pushed' ? [salvage.sha] : [])], dir);
+  // Only tracked changes are in scope by design; untracked files do not block release, and litter is reaped separately.
   const tracked = tryGit(['status', '--porcelain', '--untracked-files=no'], dir);
   if (commits === '' && tracked === '') return false;
   const details = [

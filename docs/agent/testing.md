@@ -3871,8 +3871,11 @@ clearing as a false-positive proof of detector completeness.
 
 ## Lane release preservation guard
 
-`lane-pool release` checks HEAD and every local branch against existing remote-tracking refs after
-known-litter cleanup and salvage. URL-based salvage may leave no tracking ref: only its verified
+`lane-pool release` checks HEAD and every local branch against origin remote-tracking refs (excluding
+`origin/HEAD`, `origin/ops/*`, and all non-origin remotes) after known-litter cleanup and salvage. A
+best-effort origin prune fetch runs first with a 20-second bound; failures are logged and tolerated.
+Untracked files deliberately do not block release: the guard covers tracked changes only.
+URL-based salvage may leave no tracking ref: only its verified
 remote SHA is an additional exclusion, and unrelated local branches still block release. Tests that
 intentionally release tracked edits or unpreserved commits must pass `--discard` explicitly; `--force`
 only overrides ownership. Unreadable or oversized Git evidence keeps the lease and names manual

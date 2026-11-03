@@ -16,7 +16,7 @@ function runPool(args, fault = '') {
     os.userInfo = () => ({ homedir: ${JSON.stringify(base)} });
     const original = cp.execFileSync;
     cp.execFileSync = (cmd, args, opts) => {
-      if (cmd === 'git' && opts?.cwd === ${JSON.stringify(laneDir)}) { ${fault} }
+      if (opts?.cwd === ${JSON.stringify(laneDir)}) { ${fault} }
       return original(cmd, args, opts);
     }; syncBuiltinESMExports();`;
   const result = spawnSync(process.execPath, [`--import=data:text/javascript,${encodeURIComponent(preload)}`,
@@ -102,6 +102,29 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     commitWork();
     git(['push', '--quiet', 'origin', 'HEAD:refs/heads/work/preserved'], laneDir);
     released(release());
+  });
+  it.each(['origin/ops/x', 'origin/HEAD', 'elsewhere/work'])('refuses a commit reachable only from a stale refs/remotes/%s ref', ref => {
+    const sha = commitWork();
+    git(['update-ref', `refs/remotes/${ref}`, sha], laneDir);
+    refused(release(), sha);
+  });
+  it('prunes a deleted origin branch before checking pushed evidence', () => {
+    const sha = commitWork();
+    git(['update-ref', 'refs/remotes/origin/work/deleted', sha], laneDir);
+    refused(release(), sha);
+    expect(git(['for-each-ref', '--format=%(refname)', 'refs/remotes/origin/work/deleted'], laneDir)).toBe('');
+  });
+  it('bounds the origin prune fetch and logs a tolerated timeout before refusing unpushed work', () => {
+    const sha = commitWork();
+    const result = release([], `if (args.includes('fetch')) {
+      if (!args.includes('--timeout-ms=20000') || !args.includes('--prune') || !args.includes('origin')) {
+        throw new Error('incorrect fetch bound or arguments');
+      }
+      throw new Error('forced fetch timeout');
+    }`);
+    refused(result, sha);
+    expect(result.stderr).toContain('origin prune fetch failed');
+    expect(result.stderr).toContain('forced fetch timeout');
   });
   it('--discard releases with a WARNING listing both commits and tracked changes', () => {
     const sha = commitWork();
