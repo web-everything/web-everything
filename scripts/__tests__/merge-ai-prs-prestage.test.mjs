@@ -115,6 +115,9 @@ describe('real drain pre-stage path', () => {
     expect(next.report).toMatchObject({prestaged:true,enqueueOutcomes:[{num:42,outcome:'enqueued'}]});
     const rows = readFileSync(join(coord, 'drain-async-shadow', 'shadow.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
     expect(rows).toEqual([expect.objectContaining({num:42,headSha:sha,actualEnqueueAt:expect.any(Number)})]);
+    expect(rows[0].actualEnqueueAt).toBeGreaterThanOrEqual(rows[0].wouldEnqueueAt);
+    expect(rows[0].deltaMs).toBe(rows[0].actualEnqueueAt - rows[0].wouldEnqueueAt);
+    expect(next.calls.filter(a => a.some(x => x.includes('enqueuePullRequest')))).toHaveLength(1);
   }));
   it.each([false, true])('drain wiring records enqueue refusal kind in shadow reasons (prestage: %s)', green => world(({pr,run,coord}) => {
     if (green) expect(run(false, { shadowMode:'shadow' }).stderr).toContain('eligible=true');

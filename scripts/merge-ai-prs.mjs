@@ -4820,12 +4820,16 @@ async function runCli() {
   const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, isMainFix,
     withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }), primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: process.env.WE_PRIMARY }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
-  function enqueueWithSameHeadGuard(c, sha, options) {
+  function enqueueWithSameHeadGuard(c, sha, options, shadow) {
     // Live manual retries pass the guard and retain the strategy's already-queued bookkeeping.
     const guard = mqSameHeadGuard({ repo: c.repo ?? localSlug, pr: c.num, head: sha,
       log: line => process.stderr.write(`${line}\n`) });
     if (guard.hold) return { enqueued: false, kind: 'mq-same-head-failed', reason: guard.line };
-    return mergeStrategy.enqueue(c, sha, options);
+    const result = mergeStrategy.enqueue(c, sha, options);
+    if (result?.enqueued === true) {
+      try { shadow?.recordActual({ repo: c.repo || localSlug, num: c.num, headSha: sha }); } catch { /* Timing only. */ }
+    }
+    return result;
   }
   // xym8nt4 — post-approval card grouping: sources of a combined card PR are held; groups form/reconcile after each pass.
   const cardGrouping = createCardGrouping({ localSlug, dryRun: DRY_RUN, isMainFix, requiredCheck: REQUIRED, prestage: (c, sha) => mergeStrategy.prestage(c, sha),
@@ -5353,11 +5357,8 @@ async function runCli() {
         } catch { /* Timing only. */ }
         return announceAndRetargetBeforeLand(c, { preread: fetchPrComments(c.repo, c.num), defaultBranch: entry.baseRefName });
       },
-      enqueue: (c, sha, entry) => enqueueWithSameHeadGuard(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }),
-      recordLanded: async (c, sha) => {
-        try { asyncShadow?.recordActual({ repo: c.repo || localSlug, num: c.num, headSha: sha }); } catch { /* Timing only. */ }
-        await recordLandedLedgerFacts(c, sha);
-      },
+      enqueue: (c, sha, entry) => enqueueWithSameHeadGuard(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }, asyncShadow),
+      recordLanded: recordLandedLedgerFacts,
       requiredCheck: REQUIRED,
     });
     if (!fast.fallback) {
