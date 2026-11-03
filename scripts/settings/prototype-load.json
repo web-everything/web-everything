@@ -134,6 +134,15 @@
       "findings": [
         "scripts/conveyor/reconcile-pass.mjs:456 — The snapshot-disabled fallback returns direct() without author validation, but PR_LIST_JSON_FIELDS omits author. This pre-existing bypass still accepts authorless rows despite the claimed fail-closed guarantee."
       ]
+    },
+    {
+      "ref": "lane/fresh-plan-read",
+      "sha": "83be0f19530ef10b5634c1ce9b8f69074e620e7a",
+      "ruling": "R521",
+      "findings": [
+        "scripts/conveyor/reconcile-pass.mjs:471 — Fresh planner reads now rely on a paged reader that requests only `labels(first:100)` without checking label completeness (`scripts/lib/pr-list-paged.mjs:75`). Omitted `review-status:draft-withdrawn` or `red-team:blocked/pending` labels bypass promotion guards (`scripts/conveyor/reconcile-core.mjs:2769–2776`). A synthetic probe confirmed an incomplete label connection is accepted as complete; the added tests do not cover this fail-open path.",
+        "note — pre-existing limit shared with the snapshot path: the `labels(first:100)` page query is the same one the shared PR snapshot and the drain listing already use; a PR with more than 100 labels is not a realistic state, and this branch does not change that query."
+      ]
     }
   ]
 }
