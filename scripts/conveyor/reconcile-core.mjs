@@ -2828,6 +2828,27 @@ export function planReconcile({
       });
       continue;
     }
+    // ── `restore-review-label`, ORPHANED-FIXING variant (R502 item 4; LIVE 2026-11-03, PR #6319). A fixer set
+    // `review-status:fixing`, then died or finished without pushing or re-arming: the PR carries that tag and NO
+    // `review:*` / `ready-to-merge` label, no live fixer holds the claim (a live session or `pr.fixClaim` refused
+    // above), and no verdict names the current head - so no daemon owned it and the old rules skipped it (phase is
+    // not `open`). Owed: the neutral `review:pending`. Not gated on CI (ownership, not readiness: review itself
+    // waits on CI via reviewChecksAllow) but past the same grace as the sibling variants. Unknown head fails closed.
+    if (reviewLabelHeal !== 'off' && !pr?.isDraft && (pr?.state ?? 'OPEN') === 'OPEN'
+        && String(pr?.headRefName ?? '').startsWith('lane/')
+        && withPhase.labels.includes('review-status:fixing')
+        && !withPhase.labels.some((l) => l.startsWith('review:') || l === 'ready-to-merge')
+        && !(pr?.fixClaim && pr.fixClaim.who)
+        && typeof pr?.headRefOid === 'string' && pr.headRefOid
+        && parseReviewedSha(pr?.comments) !== pr.headRefOid.toLowerCase()
+        && greenSettledForRestoreGrace(pr?.statusCheckRollup, now)) {
+      dispatch.push({
+        ...base, ...withPhase, kind: 'restore-review-label', label: 'review:pending', variant: 'orphaned-fixing',
+        why: 'review-status:fixing is the only tag left: no review:* label, no live fixer claim and no verdict for the '
+          + 'current head - nothing owns this PR; re-arm review:pending so the review path picks it up',
+      });
+      continue;
+    }
     // ── `restore-review-label`, STUCK variant (LIVE 2026-10-04, PR #3902). A `ready-to-merge` lane PR with NO
     // review:* label skipped review only because the drain's escalation pass would score it at land time — but
     // that pass scores MERGE CANDIDATES (every required check green). #3902 got `ready-to-merge` from the drain's

@@ -3983,6 +3983,33 @@ describe('restore-review-label — open green PR with no review label (PR #3830)
   });
 });
 
+// R502 item 4 (PR #6319, 2026-11-03): only `review-status:fixing` left on the PR, no review:pending, no live fixer claim
+// and no verdict for the head - both daemons saw nothing owed. Reconcile re-arms review:pending.
+describe('restore-review-label - orphaned review-status:fixing tag (R502 item 4)', () => {
+  const orphan = (over = {}) => pr1563({ isDraft: false, labels: lbl('review-status:fixing'), statusCheckRollup: greenRollup.map((c) => ({ ...c, completedAt: new Date(NOW - 30 * 60_000).toISOString() })), comments: [], headRefName: 'lane/x-orphan', headRefOid: 'a'.repeat(40), ...over });
+  const owed = (p) => planReconcile({ prs: [p], agents: [], durableCounts: {}, now: NOW }).dispatch.filter((d) => d.kind === 'restore-review-label' && d.variant === 'orphaned-fixing');
+  it('re-adds review:pending when CI is not green (green is already healed by the older rule), no live fixer holds the claim and no verdict exists for the head', () => {
+    expect(owed(orphan({ statusCheckRollup: pendingRollup }))).toEqual([expect.objectContaining({ prNumber: 1563, label: 'review:pending', variant: 'orphaned-fixing' })]);
+  });
+  it('a green orphan is already owed review:pending by the older green rule', () => {
+    expect(planReconcile({ prs: [orphan()], agents: [], durableCounts: {}, now: NOW }).dispatch).toEqual([expect.objectContaining({ kind: 'restore-review-label', label: 'review:pending' })]);
+  });
+  it('never while a fixer holds the claim', () => {
+    expect(owed(orphan({ statusCheckRollup: pendingRollup, fixClaim: { who: 'fix-1563', claimedAt: new Date(NOW - 5 * 60_000).toISOString() } }))).toEqual([]);
+  });
+  it('never when a verdict already names this head, or the head is unknown', () => {
+    const verdict = { body: `review\n<!-- reviewed-sha: ${'a'.repeat(40)} -->`, createdAt: '2026-10-04T18:51:50Z', author: AUTOMATION };
+    expect(owed(orphan({ statusCheckRollup: pendingRollup, comments: [verdict] }))).toEqual([]);
+    expect(owed(orphan({ statusCheckRollup: pendingRollup, headRefOid: undefined }))).toEqual([]);
+  });
+  it('never for a draft, non-lane, red-labelled or already review-labelled PR, or without the fixing tag', () => {
+    for (const p of [orphan({ isDraft: true }), orphan({ headRefName: 'feature/human' }), orphan({ labels: lbl('review-status:fixing', 'review:pending') }),
+      orphan({ labels: lbl('review-status:fixing', 'ready-to-merge') }), orphan({ labels: lbl('review-status:stood-down') })].map((p) => ({ ...p, statusCheckRollup: pendingRollup }))) {
+      expect(owed(p).filter((d) => d.variant === 'orphaned-fixing')).toEqual([]);
+    }
+  });
+});
+
 import { loadFlakeLegacyBody } from './load-flake-fixture.mjs';
 import { countUnresolvedStandDowns } from '../reconcile-core.mjs';
 it('legacy #3881 waits on host load, not a human', () => {
