@@ -31,6 +31,8 @@ import { enrichPrsWithTimeoutEvidence } from '../../conveyor/reconcile-pass.mjs'
 import { readTimeoutBudget, timeoutKey } from '../../conveyor/timeout-retry-state.mjs';
 import { planReconcile } from '../../conveyor/reconcile-core.mjs';
 import { allocateCardNumber } from '../../lib/card-number-allocator.mjs';
+// These tests describe codex-first routing; the shipped routing.builder=claude is covered in routing-settings.test.mjs.
+process.env.WE_ROUTING_BUILDER = 'codex';
 
 // Keep a regression to numeric allocation hermetic; follow-up filing must never call this mock.
 vi.mock('../../lib/card-number-allocator.mjs', () => ({
