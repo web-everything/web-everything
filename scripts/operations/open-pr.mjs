@@ -414,7 +414,7 @@ export function describeSubmit(result) {
   }
   if (result.outcome === 'opened' && result.labelStep === 'missing') {
     const label = result.reviewLabel || 'review:pending';
-    return { line: `submit: opened #${result.pr} but NO ${label} label was applied — no daemon will pick it up. Run: gh pr edit ${result.pr} --add-label ${label}`, failed: true };
+    return { line: `submit: opened #${result.pr} but NO ${label} label was applied — no daemon will pick it up. Run: gh pr edit ${result.pr} --repo ${result.repo || "<owner/repo>"} --add-label ${label}`, failed: true };
   }
   if (result.outcome === 'opened') {
     return { line: `submit: opened #${result.pr} ${result.url}`, failed: false };
