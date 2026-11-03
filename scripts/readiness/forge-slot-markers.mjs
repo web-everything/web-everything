@@ -90,7 +90,8 @@ function recentEvidence(telemetry, run) {
   if (!Array.isArray(ids) || ids.length !== telemetry.activeRuns || new Set(ids).size !== ids.length
     || ids.some(id => typeof id !== 'string' || !RUN.test(id))) return null;
   const active = run !== undefined && ids.includes(run);
-  return {complete: !active, active, byIds: true};
+  // no target run (run-less marker): only zero active runs proves completeness, as before
+  return {complete: run === undefined ? telemetry.activeRuns === 0 : !active, active, byIds: true};
 }
 
 /**
@@ -290,7 +291,11 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
             let verdict = 'run-less';
             if (entry.run) {
               verdict = runVerdict(telemetry, entry.run);
-              const confirm = verdict === 'idle' || (verdict === 'absent' && evidence.byIds);
+              // A per-run verdict taken while Forge is busy rests on ONE directory listing, which can miss a prepared->running
+              // rename: 'absent' and the supervisor failure codes 97/254 need the second own sample too.
+              const code = telemetry.recent.find(item => item?.runId === entry.run)?.code;
+              const confirm = verdict === 'idle' || (evidence.byIds && telemetry.activeRuns > 0
+                && (verdict === 'absent' || (verdict === 'finished' && (code === 97 || code === 254))));
               if (!confirm) resetIdle(entry);
               if (!['finished', 'absent', 'idle'].includes(verdict)) continue;
               // 'idle' rests on Forge's active-run count, taken from a directory listing without a per-run cleanup
