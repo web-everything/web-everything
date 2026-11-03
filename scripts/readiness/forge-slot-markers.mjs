@@ -6,7 +6,7 @@
 import {lstatSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync, renameSync, linkSync} from 'node:fs';
 import {randomBytes} from 'node:crypto';
 import {join} from 'node:path';
-import {readLockEntry, lockDirFor, releaseLockDirIf} from './file-locks.mjs';
+import {readLockEntry, lockDirFor, releaseLockDirIf, reserve, makeLockEntry} from './file-locks.mjs';
 import {probePidLiveness} from './pid-liveness.mjs';
 
 /** Reap expired local slot leases only on proof their owner is dead, including slots above the current cap. */
@@ -30,7 +30,25 @@ export function reapDeadSlotLocks({root, host, clock = Date.now, liveness = prob
       const heartbeatMs = Date.parse(entry.heartbeatAt);
       if (!Number.isFinite(heartbeatMs) || !(nowMs - heartbeatMs > ttlMs)) continue;
       if (liveness(entry.pid, selfPid) !== 'dead') continue;
-      if (!releaseLockDirIf(root, entry.path, entry)) continue;
+      const reaperOwner = `reaper-${selfPid}-${randomBytes(12).toString('hex')}`;
+      const nowIso = new Date(nowMs).toISOString();
+      const pidLivenessFn = held => {
+        const latest = JSON.parse(readFileSync(file, 'utf8'));
+        const heldHost = latest.host ?? held.meta?.host;
+        const stale = Number.isFinite(Date.parse(held.heartbeatAt)) && nowMs - Date.parse(held.heartbeatAt) > ttlMs;
+        const sameHolder = held.owner === entry.owner && held.pid === entry.pid
+          && latest.owner === held.owner && latest.pid === held.pid;
+        const dead = sameHolder && Number.isInteger(held.pid) && (heldHost == null || heldHost === host)
+          && stale && liveness(held.pid, selfPid) === 'dead';
+        // reserve also reclaims on TTL alone: abort rather than allowing that fallback for unproved holders.
+        if (!dead && (!sameHolder || stale || !Number.isFinite(Date.parse(held.heartbeatAt)))) {
+          throw new Error('slot holder changed or no longer provably dead');
+        }
+        return dead ? 'dead' : 'unknown';
+      };
+      if (!reserve(root, entry.path, reaperOwner, nowMs, nowIso, selfPid, pidLivenessFn, ttlMs / 60000, null, true).ok) continue;
+      const ourEntry = makeLockEntry(reaperOwner, entry.path, nowIso, selfPid);
+      if (!releaseLockDirIf(root, entry.path, ourEntry)) continue;
       reaped.push(entry.path);
       log(`heavy-admission: reaped ${entry.path} (lock ${JSON.stringify(file)}, owner ${JSON.stringify(entry.owner)}, pid ${entry.pid})\n`);
     } catch { /* Unreadable or incomplete evidence keeps the lock; retry on the next throttled pass. */ }

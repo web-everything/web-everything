@@ -388,6 +388,18 @@ describe('dead remote slot locks', () => {
     }})).toEqual([]);
     expect(JSON.parse(readFileSync(f.file, 'utf8')).owner).toBe('new-owner');
   });
+  it('keeps a lock retaken with a fresh live heartbeat between read and reap', () => {
+    const f = fixture();
+    const replacement = {...f.entry, owner: 'live-owner', pid: 333, heartbeatAt: iso(NOW)};
+    expect(f.reap({liveness: pid => {
+      if (pid === 111) {
+        writeFileSync(f.file, JSON.stringify(replacement));
+        return 'dead';
+      }
+      return 'alive';
+    }})).toEqual([]);
+    expect(JSON.parse(readFileSync(f.file, 'utf8'))).toEqual(replacement);
+  });
   it('returns an empty list when the root is absent', () => {
     const root = setup({});
     expect(reapDeadSlotLocks({root: join(root, 'absent'), host: 'forge'})).toEqual([]);
