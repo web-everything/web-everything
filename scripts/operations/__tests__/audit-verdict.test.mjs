@@ -60,7 +60,8 @@ describe('R473 pure classified verdict', () => {
 
   it('D2 retains a card due before prod, while D3 is advisory with a card', async () => {
     for (const stage of ['prerelease', 'prod']) {
-      const result = await compute([finding({ class: 'D2', relation: 'untouched', card: 'backlog/6400-debt.md' }), finding({ id: 'hardening', class: 'D3' })], options(stage, { readCard: () => 'status: open\n' }));
+      // A prod pay-by is due at prod, so the card on main states a dated, not-yet-due pay-by.
+      const result = await compute([finding({ class: 'D2', relation: 'untouched', card: 'backlog/6400-debt.md' }), finding({ id: 'hardening', class: 'D3' })], options(stage, { readCard: () => 'mustPayBefore: 2099-01-01\n' }));
       expect(result.verdict).toBe('NOT WEAKENED');
       expect(ids(result.cards).sort()).toEqual(['f1', 'hardening']);
       expect(result.cards).toContainEqual(expect.objectContaining({ id: 'f1', mustPayBefore: 'prod' }));
@@ -263,7 +264,8 @@ describe('R473 reviewer evidence replay (not new reproductions of the original b
     // Only D1 can become advisory after the one unsuccessful targeted recheck.
     const resolved = c.findings.map(f => c.recheckAs[f.id] ? { ...f, class: c.recheckAs[f.id], trigger: 'Targeted recheck supplied no breaking input' } : f);
     for (const stage of ['prerelease', 'prod']) {
-      const result = await compute(resolved, options(stage, { rulings: c.rulings, readCard: () => 'status: open\n' }));
+      // Case 8's debt card is dated and not yet due; an undated (prod) pay-by blocks at prod.
+      const result = await compute(resolved, options(stage, { rulings: c.rulings, readCard: () => 'mustPayBefore: 2099-01-01\n' }));
       expect(result.verdict).toBe(c[stage]);
       for (const f of resolved.filter(f => ['E1', 'E2', 'D2', 'D3', 'X1'].includes(f.class))) {
         if (stage === 'prod' && f.class.startsWith('E')) continue;
@@ -328,8 +330,8 @@ describe('R473 structured concurrency evidence', () => {
     const d2 = (extra = {}) => finding({ class: 'D2', relation: 'untouched', card: 'backlog/6400-debt.md', ...extra });
     const reader = (body = 'status: open\n') => vi.fn(() => body);
     const NOW = Date.parse('2026-11-03T12:00:00Z');
-    it.each(['prerelease', 'prod'])('ships with a card that exists on main at %s', async stage => {
-      const readCard = reader();
+    it.each([['prerelease', 'status: open\n'], ['prod', 'mustPayBefore: 2026-12-01\n']])('ships with a card that exists on main at %s', async (stage, body) => {
+      const readCard = reader(body);
       const r = await compute([d2()], options(stage, { readCard, now: NOW }));
       expect(r.verdict).toBe('NOT WEAKENED');
       expect(readCard).toHaveBeenCalledWith('backlog/6400-debt.md');
@@ -342,11 +344,26 @@ describe('R473 structured concurrency evidence', () => {
         expect((await compute([d2()], options('prerelease', { readCard, now: NOW }))).verdict).toBe('WEAKENED');
       }
     });
-    it('blocks once the mustPayBefore date has passed, ships before it', async () => {
-      expect((await compute([d2({ mustPayBefore: '2026-11-01' })], options('prerelease', { readCard: reader(), now: NOW }))).verdict).toBe('WEAKENED');
-      expect((await compute([d2()], options('prerelease', { readCard: reader('mustPayBefore: 2026-11-01\n'), now: NOW }))).verdict).toBe('WEAKENED');
-      expect((await compute([d2({ mustPayBefore: '2026-12-01' })], options('prerelease', { readCard: reader(), now: NOW }))).verdict).toBe('NOT WEAKENED');
-      expect((await compute([d2({ mustPayBefore: 'garbage' })], options('prerelease', { readCard: reader(), now: NOW }))).verdict).toBe('WEAKENED');
+    it('blocks once the card\'s mustPayBefore date has passed, ships before it', async () => {
+      const at = (body, stage = 'prerelease') => compute([d2()], options(stage, { readCard: reader(body), now: NOW }));
+      expect((await at('mustPayBefore: 2026-11-01\n')).verdict).toBe('WEAKENED');
+      expect((await at('mustPayBefore: 2026-12-01\n')).verdict).toBe('NOT WEAKENED');
+      expect((await at('mustPayBefore: garbage\n')).verdict).toBe('WEAKENED');
+      // Conflicting pay-by lines are contradictory evidence: fail closed.
+      expect((await at('mustPayBefore: 2026-12-01\nmustPayBefore: 2026-11-01\n')).verdict).toBe('WEAKENED');
+    });
+    it('ignores a model-supplied mustPayBefore: only the card on main sets the pay-by', async () => {
+      const at = (extra, body) => compute([d2(extra)], options('prerelease', { readCard: reader(body), now: NOW }));
+      expect((await at({ mustPayBefore: '2026-12-01' }, 'mustPayBefore: 2026-11-01\n')).verdict).toBe('WEAKENED');
+      expect((await at({ mustPayBefore: 'prod' }, 'mustPayBefore: 2026-11-01\n')).verdict).toBe('WEAKENED');
+      expect((await at({ mustPayBefore: '2026-11-01' }, 'mustPayBefore: 2026-12-01\n')).verdict).toBe('NOT WEAKENED');
+    });
+    it('a prod pay-by (explicit, or the default when the card states none) is due at prod', async () => {
+      const at = (body, stage) => compute([d2()], options(stage, { readCard: reader(body), now: NOW }));
+      expect((await at('mustPayBefore: prod\n', 'prod')).verdict).toBe('WEAKENED');
+      expect((await at('status: open\n', 'prod')).verdict).toBe('WEAKENED');
+      expect((await at('mustPayBefore: prod\n', 'prerelease')).verdict).toBe('NOT WEAKENED');
+      expect((await at('mustPayBefore: 2026-12-01\n', 'prod')).verdict).toBe('NOT WEAKENED');
     });
   });
 

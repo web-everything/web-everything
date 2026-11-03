@@ -6433,7 +6433,7 @@ public preview/release as `prod`. It does not replace the broader level/debt lif
 | E1 | Ordinary reversible defect in the diff, with no safety predicate involved | ship + expedite card, 72 hours | block |
 | E2 | Behaviour change in non-guard code without a test | ship + debt card | block |
 | D1 | Unsupported claim without a concrete input/interleaving | one targeted re-check; reclassify on evidence, otherwise explicit advisory resolution | same |
-| D2 | Pre-existing on main, untouched, not newly relied on and exposure not widened | ship + card that must exist on main | ship + card, payable before level move |
+| D2 | Pre-existing on main, untouched, not newly relied on and exposure not widened | ship + card that must exist on main | ship + card, payable before level move (a `prod` pay-by blocks) |
 | D3 | Hardening beyond the current contract | advisory + card | card; block if required by the prod contract |
 | X1 | Loosening explicitly ruled by authenticated operator; quoted ruling id and exact scope | ship + accepted-risk card | same |
 | X2 | Incomplete, unparseable or contradictory audit evidence | no clearance; per-finding adjudication | same |
@@ -6453,6 +6453,9 @@ newly blocking/unresolved result invalidate clearance and require a new audit or
 a previous block is never automatically cleared by a settings change.
 The model's opening verdict is informational. Every shipped finding retains a card record, including
 advisory and accepted risk; D2 carries `mustPayBefore: prod` and the requirement that its card exist on main.
+The D2 pay-by is read only from that card on main, never from the model's finding; a card without one owes
+`prod`. A `prod` pay-by is due at the prod stage, so it blocks there; an elapsed date, an unparseable value or
+conflicting pay-by lines block at either stage.
 A D2 with introduced/newly-relied-on exposure cannot defer as untouched debt. A prod contract requirement
 must be classified as the corresponding defect, rather than hidden as D3.
 
@@ -6481,6 +6484,9 @@ the exact original base/head. Never use 2-of-3 full-audit voting. A concrete inp
 D1 to B/E; explicit advisory D3 is possible after investigation. Failed reproduction cannot downgrade a B
 class. Unavailable, malformed, timeout, identity mismatch, still-D1 or contradictory results retain unresolved
 evidence for retry or human adjudication. Resolving one finding does not clear any separate block.
+The re-check result must keep the original's full fingerprint: id, file, line, hunk, invariant, trigger,
+consequence, class and relation. Only the D1 to D3 downgrade may restate the trigger, to record what the
+investigation found; any other change is an identity mismatch.
 
 **Settings and prod trigger.** `review.releaseStage` in `scripts/review-settings.json` defaults to
 `prerelease` when omitted, including historical files. Only exact `prerelease` / `prod` tokens are accepted;

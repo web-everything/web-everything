@@ -307,12 +307,28 @@ describe('R473 recheck fingerprint binding (D-R451)', () => {
     ['relation', { relation: 'untouched' }], ['class', { class: 'E2' }],
     ['id', { id: 'other' }], ['file', { file: 'scripts/else.mjs' }], ['invariant', { invariant: 'Something else' }],
     ['hunkHash', { hunkHash: 'f'.repeat(64) }],
+    // Location and consequence are part of the claim: a drifted recheck cannot relocate or rewrite it.
+    ['line', { line: 13 }], ['consequence', { consequence: 'Only a cosmetic difference' }],
   ])('a recheck that changes %s is void and the original stands', async (_name, change) => {
     const claim = finding({ class: 'D1', trigger: null });
     const f = fixture([claim], { recheck: vi.fn(async x => ({ ...x, class: 'D3', trigger: 'Swapped', ...change })) });
     expect(await main(ARGS, f.deps)).toBe(1);
     expect(f.result().verdict).toBe('WEAKENED');
     expect(f.result().recheck).toContainEqual(expect.objectContaining({ id: 'f1', class: 'D1' }));
+  });
+  it.each([
+    ['trigger', { trigger: 'A different input' }], ['line', { line: 13 }],
+    ['consequence', { consequence: 'Only a cosmetic difference' }],
+  ])('a same-class recheck that changes %s is void (only a D1 to D3 downgrade may restate the trigger)', async (_name, change) => {
+    const claim = finding({ disputed: true });
+    const f = fixture([claim], { recheck: vi.fn(async x => ({ ...x, disputed: false, ...change })) });
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.result().recheck).toContainEqual(expect.objectContaining({ id: 'f1', class: 'X2' }));
+    expect(f.result().cards).toEqual([]);
+  });
+  it('a same-class recheck with the identical fingerprint resolves the dispute', async () => {
+    const f = fixture([finding({ disputed: true })], { recheck: vi.fn(async x => ({ ...x, disputed: false })) });
+    expect(await main(ARGS, f.deps)).toBe(0);
   });
   it('a same-fingerprint D1 to D3 downgrade clears with a card', async () => {
     const f = fixture([finding({ class: 'D1', trigger: null })]);

@@ -7,8 +7,17 @@ export const FINDING_CLASSES = Object.freeze(['B1', 'B2', 'B3', 'B4', 'B5', 'B6'
 const scopeKeys = ['file', 'line', 'invariant', 'trigger', 'consequence', 'relation'];
 const text = value => typeof value === 'string' && value.trim().length > 0;
 export const findingIdentity = f => JSON.stringify([f?.file, f?.invariant]);
-/** Full re-check binding: a re-check may keep or downgrade the SAME fingerprint, never another finding. */
-export const findingFingerprint = f => JSON.stringify([f?.id, f?.file, f?.invariant, f?.class, f?.relation, f?.hunkHash ?? null]);
+/**
+ * Full re-check binding: a re-check may keep or downgrade the SAME fingerprint, never another finding.
+ * Binds the location (file, line, hunk), the claim (invariant, trigger, consequence) and its class/relation;
+ * only the D1 to D3 downgrade may restate the trigger (see `sameFindingRecheck`).
+ */
+export const findingFingerprint = f => JSON.stringify([f?.id, f?.file, f?.line, f?.invariant, f?.trigger ?? null,
+  f?.consequence, f?.class, f?.relation, f?.hunkHash ?? null]);
+/** True when `checked` keeps `original`'s fingerprint, or is its D1 to D3 downgrade differing only in the trigger. */
+export const sameFindingRecheck = (original, checked) => findingFingerprint(checked) === findingFingerprint(original)
+  || (original?.class === 'D1' && checked?.class === 'D3'
+    && findingFingerprint({ ...checked, class: 'D1', trigger: original.trigger }) === findingFingerprint(original));
 const validInterleaving = steps => Array.isArray(steps) && steps.length >= 2 && steps.length <= 32
   && steps.every(step => step && typeof step === 'object' && !Array.isArray(step)
     && ['actor', 'action'].every(k => text(step[k]) && step[k].length <= 1024))
@@ -38,14 +47,20 @@ export function readCardFromMain(path) {
   const r = spawnSync('git', ['show', `origin/main:${path}`], { cwd: REPO_ROOT, encoding: 'utf8', timeout: 30_000, maxBuffer: 1 << 20 });
   return r.error || r.status !== 0 ? null : r.stdout;
 }
-/** D2 debt ships only when its card exists on main and its pay-by date has not passed. Unreadable => false. */
-function d2Verified(f, { readCard = readCardFromMain, now = Date.now } = {}) {
+/**
+ * D2 debt ships only when its card exists on main and the card's pay-by has not passed. The pay-by is read
+ * only from that card, never from the model-supplied finding. A card without one owes `prod`, and a `prod`
+ * pay-by is due at the prod stage. Unreadable, conflicting or unparseable => false.
+ */
+function d2Verified(f, { readCard = readCardFromMain, now = Date.now } = {}, releaseStage) {
   try {
     if (typeof f.card !== 'string' || !CARD_PATH.test(f.card)) return false;
     const body = readCard(f.card);
     if (typeof body !== 'string' || !body.trim()) return false;
-    const due = f.mustPayBefore ?? /^mustPayBefore:\s*(\S+)\s*$/m.exec(body)?.[1];
-    if (due === undefined || due === 'prod') return true;
+    const dues = new Set([...body.matchAll(/^mustPayBefore:\s*(\S+)\s*$/gm)].map(m => m[1]));
+    if (dues.size > 1) return false;
+    const due = dues.size ? [...dues][0] : 'prod';
+    if (due === 'prod') return releaseStage !== 'prod';
     const when = Date.parse(due);
     return Number.isFinite(when) && when > (typeof now === 'function' ? now() : now);
   } catch { return false; }
@@ -96,7 +111,7 @@ export function computeVerdict(findings, options = {}) {
       }
     }
     if (f.class === 'D1' || f.class === 'X2') { result.recheck.push(f); continue; }
-    if (f.class === 'D2' && f.relation === 'untouched' && !d2Verified(f, options)) { result.blocks.push(f); continue; }
+    if (f.class === 'D2' && f.relation === 'untouched' && !d2Verified(f, options, releaseStage)) { result.blocks.push(f); continue; }
     if (f.class.startsWith('B') || (releaseStage === 'prod' && f.class.startsWith('E'))
       || (f.class === 'D2' && f.relation !== 'untouched')) { result.blocks.push(f); continue; }
     result.ships.push(f);
