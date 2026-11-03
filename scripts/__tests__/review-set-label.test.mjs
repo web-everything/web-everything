@@ -2499,9 +2499,9 @@ describe('the write arc and its #2964 ordering', () => {
         git('config', 'user.email', 'test@test');
         git('config', 'user.name', 'Test');
         git('config', 'commit.gpgsign', 'false');
-        const sourceRoot = execFileSync('git', ['rev-parse', '--show-toplevel'], {
-          cwd: dirname(fileURLToPath(import.meta.url)), encoding: 'utf8',
-        }).trim();
+        // Hermetic: resolve the source root from this file's path, not `git rev-parse`
+        // (a remote copy has no .git, which made this fixture fail with "not a git repository").
+        const sourceRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
         // Exercise the real hook and its complete dependency graph from the fixture's own cwd.
         // No POC registry is copied: the real prototype guard reads an empty registry and allows.
         const hookFiles = [
