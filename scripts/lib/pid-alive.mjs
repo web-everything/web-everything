@@ -52,13 +52,21 @@ export function pidIdentityStamp(pid, exec = execFileSync) {
   return { runnerStart: row.runnerStart ?? null, runnerArgv: row.runnerArgv ?? null };
 }
 
+export const PID_START_SLACK_MS = 120_000;
+
 /** Three-valued identity: only positive evidence of death may reclaim a runner's claim. */
-export function pidIdentity(pid, { expectStart = null, expectArgv = null, exec = execFileSync } = {}) {
+export function pidIdentity(pid, { expectStart = null, expectArgv = null, startedBy = null, exec = execFileSync } = {}) {
   const row = readPidIdentity(pid, exec);
   if ('alive' in row) return row;
   if (row.stat.startsWith('Z')) return { alive: false, reason: 'zombie' };
   // Working Claude sessions can retain their pre-warmed bg-spare argv. That command alone
   // cannot prove recycling: require a stored start/argv mismatch, zombie, or gone evidence.
+  // A holder can only start BEFORE (or just at) the moment it registered: a process that started later than
+  // `startedBy` (+ slack for clock/listing lag) is a different process that reused the pid.
+  if (Number.isFinite(startedBy)) {
+    const procMs = Date.parse(`${row.runnerStart} UTC`);
+    if (Number.isFinite(procMs) && procMs > startedBy + PID_START_SLACK_MS) return { alive: false, reason: 'started-after-holder' };
+  }
   if (expectStart && row.runnerStart !== String(expectStart).trim().replace(/\s+/g, ' ')) {
     return { alive: false, reason: 'start-mismatch' };
   }

@@ -451,7 +451,7 @@ export function refreshLiveFixDispatchClaims({
         continue;
       }
     }
-    const isIdle = nonTerminal.length > 0 && nonTerminal.every((a) => a.state === 'idle');
+    const isIdle = nonTerminal.length > 0 && nonTerminal.every((a) => a.state === 'idle' || a.status === 'idle');
     let idleHeadSha = null;
     if (!isAwaiting && idleRelease.enabled && isIdle) {
       try {
