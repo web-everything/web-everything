@@ -91,6 +91,10 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
       }
     } catch { /* Unreadable excusal evidence preserves the original failed checks. */ }
     const requiredChecks = trustedRequired && required.source !== 'timing-policy' ? required.checks : [];
+    // A discovery fault or untrusted/empty set cannot excuse healable red in push mode.
+    if (policy.startAfter === 'push' && ciRedOnHead({ headSha, checks,
+      requiredChecks: Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks : null }))
+      return withSource({ allowed: false, headSha, reason: 'ci-red', affected: [], checks, requiredChecks });
     // `requiredChecks` rides along so a publish-time void judges only healable reds, as review start does.
     let verifyGreen = false;
     if (policy.startBeforeCi) {

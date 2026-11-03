@@ -31,9 +31,40 @@ describe('pending-CI start policy', () => {
       affected: [{ name: 'test-shard (1)', reason: 'pending' }] });
   });
   it.each(['fast-checks', 'ci-green'])('allows queued and missing checks under %s', startAfter => {
-    for (const checks of [[check('registered')], [check('test-shard (1)', null, { status: 'queued' })]]) {
-      expect(reviewStartGate({ ...args, checks, policy: { ...review, startAfter, startEarly: 'on' } }))
+    const name = startAfter === 'ci-green' ? 'integration' : 'test-shard (1)';
+    for (const status of ['queued', 'in_progress']) {
+      const checks = [check(name, null, { status })];
+      expect(reviewStartGate({ ...args, requiredChecks: ['integration', 'second-required'], checks,
+        policy: { ...review, startAfter, startEarly: 'on' } }))
         .toMatchObject({ allowed: true, earlyStart: true, headSha: head });
+    }
+  });
+  it.each(['on', 'shadow'])('requires a pending prerequisite rather than an unrelated row for %s bypass', startEarly => {
+    for (const startAfter of ['fast-checks', 'ci-green']) {
+      for (const checks of [[check('unrelated')], [check('unrelated', null, { status: 'queued' })],
+        [check(startAfter === 'ci-green' ? 'integration' : 'standards')]]) {
+        const result = reviewStartGate({ ...args, requiredChecks: ['integration', 'second-required'], checks,
+          policy: { ...review, startAfter, startEarly } });
+        expect(result.allowed).toBe(false);
+        expect(result.wouldStartEarly).not.toBe(true);
+        expect(result.earlyStartNote).toBeUndefined();
+      }
+    }
+  });
+  it('push mode waits for registered head CI and refuses unknown-set healable red', () => {
+    const policy = { ...review, startAfter: 'push' };
+    expect(reviewStartGate({ headSha: head, checks: [], verifyGreen: true, policy: { ...policy, startBeforeCi: true } }))
+      .toMatchObject({ allowed: false, reason: 'no-ci-registered', affected: [] });
+    for (const checks of [[], undefined, null, [check('test', 'success', { head_sha: 'b'.repeat(40) })],
+      [{ name: 'test' }]]) {
+      expect(reviewStartGate({ headSha: head, checks, policy }))
+        .toMatchObject({ allowed: false, reason: 'no-ci-registered', affected: [] });
+    }
+    for (const requiredChecks of [undefined, null, []]) {
+      expect(reviewStartGate({ headSha: head, checks: [check('test', 'failure')], requiredChecks, policy }))
+        .toMatchObject({ allowed: false, reason: 'ci-red', affected: [] });
+      expect(reviewStartGate({ headSha: head, checks: [check('test', null, { status: 'queued' })], requiredChecks, policy }))
+        .toMatchObject({ allowed: true, reason: 'push', headSha: head });
     }
   });
   it.each(['on', 'shadow'])('refuses empty or absent registered CI evidence without an early-start note (%s)', startEarly => {
@@ -113,7 +144,8 @@ describe('parallel review start and void', () => {
     const checks = [...fast.map(n => check(n)), check('integration', null, { status: 'in_progress' })];
     expect(reviewStartGate({ headSha: head, repo: 'we', checks, requiredChecks: ['integration'] }).allowed).toBe(true);
     expect(reviewStartGate({ headSha: head, repo: 'we', checks, requiredChecks: ['integration'], policy: { ...review, startAfter: 'ci-green' } }).allowed).toBe(false);
-    expect(reviewStartGate({ headSha: head, checks: [], policy: { ...review, startAfter: 'push' } }).allowed).toBe(true);
+    expect(reviewStartGate({ headSha: head, checks: [], policy: { ...review, startAfter: 'push' } }))
+      .toMatchObject({ allowed: false, reason: 'no-ci-registered' });
   });
   it('requires each fast check on the head and refuses a red non-fast check', () => {
     for (const checks of [[], [check('standards')], fast.map(n => check(n, 'success', { head_sha: 'b'.repeat(40) })),

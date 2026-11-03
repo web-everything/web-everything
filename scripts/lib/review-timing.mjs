@@ -140,6 +140,7 @@ export function reviewStartGate({ headSha, checks, requiredChecks, repo, verifyG
     if (!gate.allowed && ciRedOnHead({ headSha, checks, requiredChecks })) return { ...gate, reason: 'ci-red' };
     if (gate.allowed || !['shadow', 'on'].includes(mode) || typeof headSha !== 'string' || !headSha.trim()
       || !gate.affected?.length || !gate.affected.every(row => ['pending', 'missing'].includes(row.reason))
+      || !gate.affected.some(row => row.reason === 'pending')
       || !readableEarlyChecks(checks, headSha) || ciRedOnHead({ headSha, checks, requiredChecks })) return gate;
     if (mode === 'on') return { allowed: true, reason: 'early-pending-ci', earlyStart: true, headSha, affected: gate.affected };
     return { ...gate, wouldStartEarly: true,
@@ -148,9 +149,19 @@ export function reviewStartGate({ headSha, checks, requiredChecks, repo, verifyG
   // Malformed evidence never becomes permission (and must not throw during red detection).
   if (Array.isArray(checks) && Array.from(checks).some(row => !row || typeof row !== 'object' || Array.isArray(row)))
     return { allowed: false, headSha, reason: 'malformed', affected: [] };
-  // Only required failures have a CI-heal owner. Optional failures, or any red under an unknown set, must not strand review.
+  // With a known required set, only its healable failures block review.
   if (Array.isArray(requiredChecks) && requiredChecks.length && ciRedOnHead({ headSha, checks, requiredChecks }))
     return { allowed: false, headSha, reason: 'ci-red', affected: policy.startAfter === 'ci-green' ? strict().affected : [] };
+  if (policy.startAfter === 'push') {
+    const refuse = reason => ({ allowed: false, headSha, reason, affected: [] });
+    if (typeof headSha !== 'string' || !headSha.trim()) return refuse('missing-head');
+    // Unknown requirements cannot excuse red CI; use the same heal rule as the verification-marker path.
+    if (ciRedOnHead({ headSha, checks, requiredChecks: checkNames(requiredChecks) ? requiredChecks : null }))
+      return refuse('ci-red');
+    if (!Array.isArray(checks) || !checks.some(row => readableEarlyChecks([row], headSha)))
+      return refuse('no-ci-registered');
+    return { allowed: true, headSha, reason: 'push', affected: [] };
+  }
   if (!policy.startBeforeCi && policy.startAfter === 'ci-green') return pendingStart(strict());
   if (policy.startBeforeCi && verifyGreen === true && typeof headSha === 'string' && headSha.trim()) {
     // An unknown required set must not let a red check ride past the marker: any healable red blocks, as in CI-green.
@@ -159,7 +170,6 @@ export function reviewStartGate({ headSha, checks, requiredChecks, repo, verifyG
     return { allowed: true, headSha, reason: 'verify-marker', affected: [] };
   }
   if (policy.startAfter === 'ci-green') return pendingStart(strict());
-  if (policy.startAfter === 'push') return { allowed: typeof headSha === 'string' && !!headSha.trim(), headSha, reason: typeof headSha === 'string' && headSha.trim() ? 'push' : 'missing-head', affected: [] };
   return pendingStart(reviewCiGate({ headSha, checks, requiredChecks: fastChecksFor(policy.fastChecks, repo) ?? requiredChecks }));
 }
 export function reviewMustVoid({ reviewedHead, currentHead, checks, requiredChecks = null, policy = REVIEW_TIMING_DEFAULTS } = {}) {

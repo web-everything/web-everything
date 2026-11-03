@@ -27,13 +27,35 @@ it.each(['fast-checks', 'push'])('uses required CI ownership under %s and report
       { context: 'optional-status', state: 'failure' }] };
   expect(readGate(args)).toMatchObject({ allowed: true, startAfter });
   expect(readGate({ ...args, readRequired: () => { throw Error('protection unavailable'); } }))
-    .toMatchObject({ allowed: true, startAfter, source: 'timing-policy' });
+    .toMatchObject({ allowed: startAfter !== 'push', ...(startAfter === 'push' ? { reason: 'ci-red' } : {}), startAfter, source: 'timing-policy' });
   expect(readGate({ ...args, readChecks: () => [...args.readChecks(), { name: 'test', status: 'completed', conclusion: 'failure' }] }))
     .toMatchObject({ allowed: false, reason: 'ci-red', startAfter });
   expect(readGate({ ...args, readHead: () => null })).toMatchObject({ allowed: false, startAfter });
   expect(readGate({ ...args, readChecks: () => { throw Error('offline'); } })).toMatchObject({ allowed: false, reason: 'unreadable-ci', startAfter });
   expect(readGate({ ...args, policy: { ...policy, startAfter: 'ci-green' }, readRequired: () => ({ source: 'fallback', checks: [] }) }))
     .toMatchObject({ allowed: false, reason: 'untrusted-required-set', startAfter: 'ci-green' });
+});
+it.each(['throws', 'fallback', 'empty', 'untrusted'])('push CI discovery %s never converts healable red into permission', mode => {
+  const readRequired = () => {
+    if (mode === 'throws') throw Error('unavailable');
+    return { source: ['fallback', 'untrusted'].includes(mode) ? 'fallback' : 'live', checks: mode === 'untrusted' ? ['unrelated'] : [] };
+  };
+  const io = { repo: 'other/product', pr: 7, policy: { startAfter: 'push', startEarly: 'shadow' },
+    readHead: () => headSha, readRequired,
+    readChecks: () => [{ name: 'test', head_sha: headSha, status: 'completed', conclusion: 'failure' }] };
+  expect(readGate(io)).toMatchObject({ allowed: false, headSha, reason: 'ci-red' });
+});
+it('push waits for any registered CI and the pending bypass ignores unrelated rows without logging', () => {
+  const io = { repo: 'other/product', pr: 7, readHead: () => headSha,
+    readRequired: () => ({ source: 'live', checks: ['test'] }), log: vi.fn() };
+  expect(readGate({ ...io, policy: { startAfter: 'push' }, readChecks: () => [] }))
+    .toMatchObject({ allowed: false, reason: 'no-ci-registered' });
+  for (const startEarly of ['on', 'shadow']) {
+    expect(readGate({ ...io, policy: { startAfter: 'ci-green', startEarly },
+      readChecks: () => [{ name: 'unrelated', head_sha: headSha, status: 'completed', conclusion: 'success' }] }))
+      .toMatchObject({ allowed: false });
+  }
+  expect(io.log).not.toHaveBeenCalled();
 });
 function fixture(over = {}) {
   return { policy: { startAfter: 'ci-green' }, repo: 'other/product', pr: 3432, readHead: vi.fn(() => headSha),
