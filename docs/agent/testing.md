@@ -679,6 +679,31 @@ The host queue needs write access to the admission pool's parent as well as the 
 An `EPERM` on that rename is an admission infrastructure failure, not a suite result.
 Keep the host queue; do not switch to a private pool or run tests directly.
 
+## releaseLockDirIf fail-closed
+
+`expected === null` permits removal only when directory listings prove the lock
+empty both before rename and inside the tombstone. Corrupt, malformed, unreadable,
+or newly appearing metadata survives; the test-only `afterRename(tomb)` seam
+exercises writes between these checks against real directories. Final removal uses
+non-recursive rmdir so a write after the listing also prevents deletion. The
+`beforeRmdir(tomb)` test-only seam injects that distinct late write; its named
+regression asserts false and byte-for-byte metadata preservation after restoration.
+
+A failed restore returns false and preserves the displaced directory as a sibling
+`<lockRoot>.gone-<lockId>-<nonce>`, outside the enumerated lock root. Acquisition
+checks matching tombstones before and after mkdir; reserve checks them before its
+own-owner refresh too. A readable, non-expired displaced lease blocks contenders,
+including PID-dead reclamation. Expiry uses the caller's clock and lease policy
+(defaults for direct acquisition); it permits acquisition without deleting evidence.
+Readable legacy `<lockRoot>.gone-<nonce>` entries are matched by their stored path.
+Unknown metadata in a matching per-lock tombstone blocks indefinitely: an operator
+must inspect and recover it before removing the tombstone. These guards coordinate
+updated callers; an external writer bypassing them cannot be prevented from writing,
+but its subsequent reserve is denied while the displaced lease remains live.
+
+`file-locks.test.mjs` covers metadata before/between checks, empty removal, blocked
+restoration, contender denial, the post-mkdir race, lease expiry and operator recovery.
+
 ## Prepare throughput
 
 Prepare batches use `prepare.batchSize` (6) and the just-in-time window uses

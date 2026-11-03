@@ -37,8 +37,8 @@
  * own the `mkdir`/`O_EXCL` boundary and are deliberately tiny so the testable logic stays pure.
  */
 
-import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, statSync, renameSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, statSync, renameSync, readdirSync, rmdirSync } from 'node:fs';
+import { join, dirname, basename, resolve } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 
 /** Default lease before a held lock is considered stale and reclaimable. Short enough that a crashed
@@ -195,6 +195,32 @@ export function lockDirFor(lockRoot, path) {
   return join(lockRoot, lockIdFor(path));
 }
 
+/** Displaced locks remain evidence, never garbage collected by acquisition. Scan both the new
+ * per-lock names and readable legacy tombstones (whose entry carries the original path). Unknown
+ * evidence for this lock blocks until operator recovery; readable entries unblock only after TTL.
+ * Check before AND after mkdir: a release may rename a successor after our first scan, freeing mkdir.
+ * reserve also checks before its own-owner fast path, so an old contender cannot refresh past this guard.
+ */
+function displacedLock(lockRoot, path, nowMs, leaseMinutes) {
+  const root = resolve(lockRoot);
+  const prefix = `${basename(root)}.gone-`;
+  const lockPrefix = `${prefix}${lockIdFor(path)}-`;
+  let names;
+  try { names = readdirSync(dirname(root)); }
+  catch (e) { return e?.code === 'ENOENT' ? null : { owner: null }; }
+  for (const name of names) {
+    if (!name.startsWith(prefix)) continue;
+    const specific = name.startsWith(lockPrefix);
+    if (!specific && !/^[0-9a-f]{12}$/.test(name.slice(prefix.length))) continue;
+    const entry = readEntryInDir(join(dirname(root), name));
+    if (!specific && entry?.path !== path) continue;
+    if (!entry || !Number.isFinite(Date.parse(entry.heartbeatAt))) return { owner: entry?.owner ?? null };
+    const minutes = typeof leaseMinutes === 'function' ? leaseMinutes(entry) : leaseMinutes;
+    if (!Number.isFinite(minutes) || !isLeaseExpired(entry, nowMs, minutes)) return entry;
+  }
+  return null;
+}
+
 /**
  * ATOMICALLY acquire the lock dir for `path` (Fork-1 primitive). `mkdir` (non-recursive) is atomic on
  * POSIX: it succeeds for exactly ONE racing caller and throws `EEXIST` for the rest — so the winner
@@ -210,12 +236,14 @@ export function lockDirFor(lockRoot, path) {
  * @param {string} lockRoot
  * @param {string} path
  * @param {object} entry  from {@link makeLockEntry}
- * @param {{afterMkdir?: (() => void)|null}} [opts]  TEST-ONLY seam (no-op by default; precedent:
+ * @param {{afterMkdir?: (() => void)|null, nowMs?: number, leaseMinutes?: number|Function}} [opts]
+ *   Clock/lease policy for displaced locks. `afterMkdir` is a TEST-ONLY seam (no-op by default; precedent:
  *   `atomic-json-file.mjs#withFileLock`'s `onBeforeStaleTakeover`): runs between the `mkdir` win and the entry
  *   write, so a test can stall the acquirer in exactly that gap.
  */
-export function acquireLockDir(lockRoot, path, entry, { afterMkdir = null } = {}) {
+export function acquireLockDir(lockRoot, path, entry, { afterMkdir = null, nowMs = Date.now(), leaseMinutes = DEFAULT_LEASE_MINUTES } = {}) {
   const dir = lockDirFor(lockRoot, path);
+  if (displacedLock(lockRoot, path, nowMs, leaseMinutes)) return false;
   try {
     mkdirSync(dir, { recursive: false });           // ← the atomic gate: EEXIST for losers
   } catch (e) {
@@ -226,6 +254,7 @@ export function acquireLockDir(lockRoot, path, entry, { afterMkdir = null } = {}
     } else { throw e; }
   }
   if (typeof afterMkdir === 'function') afterMkdir();
+  if (displacedLock(lockRoot, path, nowMs, leaseMinutes)) return false;
   try {
     writeFileSync(join(dir, 'lock.json'), JSON.stringify(entry, null, 2) + '\n', { encoding: 'utf8', flag: 'wx' });
   } catch (e) {
@@ -296,26 +325,38 @@ export function releaseLockDir(lockRoot, path) {
  * between the caller's read and the rename is put back instead of destroyed.
  * @param {string} lockRoot
  * @param {string} path
- * @param {{owner:string, heartbeatAt?:string}|null} expected  the entry the caller read (`null` ⇒ an entry-less dir)
+ * @param {{owner:string, heartbeatAt?:string}|null} expected  the entry the caller read (`null` ⇒ a truly empty dir)
+ * @param {{afterRename?: ((tomb:string) => void)|null, beforeRmdir?: ((tomb:string) => void)|null}} [opts]
+ *   TEST-ONLY seams after rename and between the final emptiness listing and rmdir.
  * @returns {boolean} whether the expected lock was removed (`false` ⇒ gone already, or someone else's — left standing)
  */
-export function releaseLockDirIf(lockRoot, path, expected) {
+export function releaseLockDirIf(lockRoot, path, expected, { afterRename = null, beforeRmdir = null } = {}) {
   const dir = lockDirFor(lockRoot, path);
   const matchesExpected = (found) => (expected
     ? !!found && found.owner === expected.owner && (expected.heartbeatAt == null || found.heartbeatAt === expected.heartbeatAt)
-    : found === null);
+    : false);
+  const matchesDir = (candidate) => {
+    if (expected !== null) return matchesExpected(readEntryInDir(candidate));
+    try { return readdirSync(candidate).length === 0; } catch { return false; }
+  };
   // Cheap pre-check: a lock that is plainly not the one judged is never moved at all, so the rename window below
   // opens only when the lock looks like the expected one.
   if (!existsSync(dir)) return false;
-  if (!matchesExpected(readLockEntry(lockRoot, path))) return false;
+  if (!matchesDir(dir)) return false;
   // The tombstone is a SIBLING of the lock root, never inside it: readers that enumerate `lockRoot` must not count it.
-  const tomb = `${lockRoot}.gone-${randomBytes(6).toString('hex')}`;
+  const tomb = `${resolve(lockRoot)}.gone-${lockIdFor(path)}-${randomBytes(6).toString('hex')}`;
   try { renameSync(dir, tomb); } catch (e) { if (e && (e.code === 'ENOENT')) return false; throw e; }
-  if (matchesExpected(readEntryInDir(tomb))) { rmSync(tomb, { recursive: true, force: true }); return true; }
-  // The lock changed hands between the pre-check and the rename: restore it. If someone already re-took the path in
-  // that gap, theirs stands and the displaced tombstone is dropped. This is the one window left (a read-to-rename
-  // gap, not a lease): a rename cannot be made conditional on content, only re-verified after the fact.
-  try { renameSync(tomb, dir); } catch { rmSync(tomb, { recursive: true, force: true }); }
+  if (typeof afterRename === 'function') afterRename(tomb);
+  if (matchesDir(tomb)) {
+    if (expected !== null) { rmSync(tomb, { recursive: true, force: true }); return true; }
+    // rmdir is the final atomic emptiness check: a late writer must not be recursively erased.
+    if (typeof beforeRmdir === 'function') beforeRmdir(tomb);
+    try { rmdirSync(tomb); return true; } catch { /* restore/preserve newly appearing evidence below */ }
+  }
+  // Never destroy a displaced successor if a contender blocks restoration. The sibling tombstone
+  // guards acquireLockDir/reserve until its lease expires (or an operator recovers unknown metadata).
+  // POSIX rename may replace an EMPTY contender directory; it cannot replace a populated lock dir.
+  try { renameSync(tomb, dir); } catch { /* preserve the tombstone on every restore failure */ }
   return false;
 }
 
@@ -347,7 +388,10 @@ function lockDirAgeMs(lockRoot, path) {
  */
 export function reserve(lockRoot, path, owner, nowMs, nowIso, pid = null, pidLiveness = 'unknown', leaseMinutes = DEFAULT_LEASE_MINUTES, meta = null, requireOwnProcess = false) {
   const entry = makeLockEntry(owner, path, nowIso, pid, meta);
-  if (acquireLockDir(lockRoot, path, entry)) return { ok: true, reason: 'free', heldBy: owner };
+  const displaced = displacedLock(lockRoot, path, nowMs, leaseMinutes);
+  if (displaced) return { ok: false, reason: 'held', heldBy: displaced.owner };
+  const acquireOptions = { nowMs, leaseMinutes };
+  if (acquireLockDir(lockRoot, path, entry, acquireOptions)) return { ok: true, reason: 'free', heldBy: owner };
   const current = readLockEntry(lockRoot, path);
   // xaipsbs — THE MKDIR/WRITE GAP. `acquireLockDir` wins with `mkdir` and only then writes `lock.json`, so a
   // loser can read the winner's dir in between and find no entry. Reading that as "free" made the loser
@@ -358,7 +402,7 @@ export function reserve(lockRoot, path, owner, nowMs, nowIso, pid = null, pidLiv
   if (!current) {
     const age = lockDirAgeMs(lockRoot, path);
     if (age === null) {                                   // the dir vanished meanwhile: just try again once
-      if (acquireLockDir(lockRoot, path, entry)) return { ok: true, reason: 'free', heldBy: owner };
+      if (acquireLockDir(lockRoot, path, entry, acquireOptions)) return { ok: true, reason: 'free', heldBy: owner };
       return { ok: false, reason: 'held', heldBy: null };
     }
     if (age < ENTRYLESS_LOCK_DIR_GRACE_MS) return { ok: false, reason: 'initializing', heldBy: null };
@@ -374,6 +418,6 @@ export function reserve(lockRoot, path, owner, nowMs, nowIso, pid = null, pidLiv
   // same stale entry must not delete the lock a faster reclaimer just took) then re-win atomically (EEXIST ⇒ we
   // lost the reclaim, report blocked so the caller re-probes rather than stomping the winner).
   releaseLockDirIf(lockRoot, path, current); // false ⇒ already gone (the acquire below wins) or re-taken (it loses)
-  if (acquireLockDir(lockRoot, path, entry)) return { ok: true, reason: d.reason, heldBy: owner };
+  if (acquireLockDir(lockRoot, path, entry, acquireOptions)) return { ok: true, reason: d.reason, heldBy: owner };
   return { ok: false, reason: 'held', heldBy: (readLockEntry(lockRoot, path) || {}).owner || null };
 }
