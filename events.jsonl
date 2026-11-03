@@ -51,3 +51,4 @@
 {"type":"quarantine-removed","at":1793669033295,"actor":"red-main-safety-net","test":"scripts/__tests__/verify-lane-revert-red.test.mjs","brokenSha":"a7ac5089f3921f840e37535a823082505a3703e7","why":"main-green"}
 {"type":"quarantine-added","at":1793710252020,"actor":"operator","test":"scripts/lib/__tests__/daemon-rebuild-fallback.test.mjs::smoke-harness-broken (x5wbsbc) rejects as smoke-harness-broken when the last-good control fails the same check","brokenSha":"4535653dfc1eaf8be4173b5607ed5f694488eb54","owner":"lane/main-fix-daemon-rebuild-fallback-timeout","reason":"smoke-harness-broken test hit 5000ms default timeout on loaded CI shard 7 (load flake)","addedAt":1793710252020,"expiresAt":1793796652020}
 {"type":"quarantine-fix-prs","at":1793710990572,"actor":"red-main-safety-net","fixPrs":[6329]}
+{"type":"quarantine-fix-prs","at":1793713165135,"actor":"red-main-safety-net","fixPrs":[6329,6334]}
