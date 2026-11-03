@@ -78,3 +78,24 @@ describe('R518 activeRunIds: dead run while Forge reports activeRuns > 0', () =>
     expect(existsSync(file)).toBe(true);
   });
 });
+
+describe('R518 audit round 1', () => {
+  it('a run-less marker is NOT released from activeRunIds alone while any run is active', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'slot-per-run-')); roots.push(root);
+    const file = join(root, 'slot-0.unconfirmed');
+    writeFileSync(file, markerContent({owner: 'o', pid: 111, nowMs: NOW - 600_000, host: 'forge'}));
+    utimesSync(file, (NOW - 600_000) / 1000, (NOW - 600_000) / 1000);
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: pid => (pid === 111 ? 'dead' : 'alive')});
+    const t = ms => tel(ms, {activeRunIds: [RUN_LIVE]}, []);
+    await reaper.step(t(S1)); await reaper.step(t(S2));
+    expect(existsSync(file)).toBe(true);
+  });
+  it.each([97, 254])('a supervisor failure code %s absent from activeRunIds needs two own samples', async code => {
+    const {file, reaper} = setup();
+    const fin = {runId: RUN_DEAD, startedAtET: iso(NOW - 600_000), code};
+    const t = ms => tel(ms, {activeRunIds: [RUN_LIVE]}, [live, fin]);
+    expect(await reaper.step(t(S1))).toEqual([]);
+    expect(existsSync(file)).toBe(true);
+    expect(await reaper.step(t(S2))).toEqual(['slot-0.unconfirmed']);
+  });
+});
