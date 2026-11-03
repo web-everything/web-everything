@@ -468,50 +468,6 @@ it('R437 a failed first delivery starts the 30-minute clock only when delivery s
   expect(run(ctx, [op(1)], { ...options, notify, now: NOW + 31 * 60000 }).notified).toBe(true);
 });
 
-it('R437 owner-signal read failure preserves a published invariant feed item while other reads succeed', async () => {
-  const { runPrSweep } = await import('../pr-sweep.mjs');
-  const ctx = setup(), { notify } = sent();
-  let previous = {}, failOwner = false;
-  let prs = [{ number: 6254, title: 'no labels', headRefOid: H, labels: [], changedFiles: 1, updatedAt: new Date(NOW).toISOString() }];
-  const readPrs = vi.fn(() => prs);
-  const detector = vi.fn(async () => ({ enabled: true, items: [], errors: [], nextSeen: {} }));
-  const passes = [];
-  const tick = async minutes => {
-    const report = await runPrSweep({ now: NOW + minutes * 60000, env: {}, config: {},
-      settings: { value: { repos: [REPO], idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90 }, sources: {} },
-      readPrs, readQueue: () => ({ ready: [], rulingNeeded: [] }), readPrevious: () => previous,
-      readSignals: () => { if (failOwner) throw new Error('injected owner read failure'); return {}; },
-      detector, notify, flush: () => {}, persist: () => {}, append: () => {},
-      stallSweep: async () => ({ mode: 'shadow', dir: ctx.stateDir, digest: true, items: [], incomplete: false }),
-      stallDigest: (pass, options) => {
-        passes.push(pass);
-        return publishStalledDigest(pass, { ...options, feedPath: ctx.feedPath });
-      } });
-    previous = report.nextState;
-    return report;
-  };
-  expect((await tick(0)).errors).toEqual([]);
-  const opened = unacknowledged({ path: ctx.feedPath });
-  expect(opened).toHaveLength(1);
-  expect(opened[0]).toMatchObject({ pr: 6254, state: 'no-labels', kind: 'stalled' });
-  failOwner = true;
-  const failed = await tick(1);
-  expect(failed.errors).toContain('owner signals: injected owner read failure');
-  expect(readPrs).toHaveBeenCalledTimes(2);
-  expect(detector).toHaveBeenCalledTimes(2);
-  expect(passes[1].items).toEqual([]);
-  expect(unacknowledged({ path: ctx.feedPath })).toEqual(opened);
-  expect(replay({ path: ctx.feedPath }).filter(event => event.kind === 'cleared')).toEqual([]);
-  expect(passes[1].incomplete).toBe(true);
-  failOwner = false;
-  expect((await tick(2)).errors).toEqual([]);
-  expect(unacknowledged({ path: ctx.feedPath })).toEqual(opened);
-  prs = [];
-  expect((await tick(3)).errors).toEqual([]);
-  expect(passes[3].incomplete).toBe(false);
-  expect(unacknowledged({ path: ctx.feedPath })).toEqual([]);
-});
-
 it('R437 legacy feed items keep their exact shape without invariant metadata', () => {
   const item = { lane: 'operator', repo: REPO, pr: 1, head: H, state: 'legacy', reason: 'readable reason',
     title: 'legacy title', command: 'inspect locally', evidence: ['proof'] };
@@ -567,13 +523,6 @@ it('R437 digest=false preserves detector completeness and clears stale detector 
   expect(result.cleared).toMatchObject([{ pr: 5759, kind: 'cleared', was: 'stalled' }]);
   expect(result.cleared).toHaveLength(1);
 });
-it('R437 enabled invariant producer marks owner-read failure incomplete and preserves the existing feed item', async () => {
-  const result = await ownerFailureWithObsoleteDetectorItem({ mode: 'shadow', digest: true });
-  expect(result.pass.incomplete).toBe(true);
-  expect(result.after).toEqual(result.before);
-  expect(result.cleared).toEqual([]);
-});
-
 it('persists merged invariant violation metadata alongside the original finding evidence and command', () => {
   const ctx = setup();
   const finding = op(12, 'stalled-head', { reason: 'specific failure', evidence: ['original evidence'], command: 'repair-command', owner: 'daemon:review-daemon', nextAction: 'await-review', deadline: '2026-10-21T17:00:00Z', violation: 'deadline-passed', blockedBy: [13] });
@@ -616,102 +565,67 @@ it('deadline identity crosses its bucket without timestamp churn and legacy stat
 });
 
 
-it.each([
-  ['missing diff count', { changedFiles: undefined }], ['null diff count', { changedFiles: null }],
-  ['fractional diff count', { changedFiles: 0.5 }], ['negative diff count', { changedFiles: -1 }],
-  ['string diff count', { changedFiles: '0' }], ['unsafe diff count', { changedFiles: Number.MAX_SAFE_INTEGER + 1 }],
-  ['missing labels', { labels: undefined }], ['null labels', { labels: null }],
-  ['malformed labels', { labels: [{}] }], ['empty label name', { labels: [''] }],
-  ['missing head', { headRefOid: undefined }], ['null head', { headRefOid: null }],
-  ['empty head', { headRefOid: '' }], ['blank head', { headRefOid: '   ' }],
-  ['missing update time', { updatedAt: undefined }], ['null update time', { updatedAt: null }],
-  ['invalid update time', { updatedAt: 'invalid' }],
-])('preserves persisted empty-diff feed on %s until same-head positive diff proof', async (_name, patch) => {
+it('an incomplete pass emits no new notification and leaves delivery owed for a complete pass', () => {
+  const ctx = setup();
+  const notify = vi.fn(() => ({ ok: true }));
+  const initial = run(ctx, [op(6254)], { notify, pass: { incomplete: true } });
+  expect(initial.errors).toEqual([]);
+  expect(initial.notified).toBe(false);
+  expect(notify).not.toHaveBeenCalled();
+  expect(run(ctx, [op(6254)], { notify, now: NOW + 60000 }).notified).toBe(true);
+  expect(notify).toHaveBeenCalledTimes(1);
+});
+
+it('R437 owner-signal read failure preserves a published invariant feed item while other reads succeed', async () => {
   const { runPrSweep } = await import('../pr-sweep.mjs');
   const ctx = setup(), { notify } = sent();
-  const base = { number: 6254, title: 'diff recovery', headRefOid: H, labels: ['review:accepted'],
-    changedFiles: 0, updatedAt: new Date(NOW).toISOString() };
-  let previous = {}, rows = [base];
+  let previous = {}, failOwner = false;
+  let prs = [{ number: 6254, title: 'no labels', headRefOid: H, labels: [], changedFiles: 1, updatedAt: new Date(NOW).toISOString() }];
+  const readPrs = vi.fn(() => prs);
+  const detector = vi.fn(async () => ({ enabled: true, items: [], errors: [], nextSeen: {} }));
   const passes = [];
   const tick = async minutes => {
     const report = await runPrSweep({ now: NOW + minutes * 60000, env: {}, config: {},
       settings: { value: { repos: [REPO], idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90 }, sources: {} },
-      readPrs: () => rows, readPrevious: () => previous, readQueue: () => ({ ready: [], rulingNeeded: [] }),
-      readSignals: () => ({}), detector: async () => ({ enabled: true, items: [], errors: [], nextSeen: {} }),
-      notify, flush: () => {}, persist: () => {}, append: () => {},
-      stallSweep: () => ({ mode: 'shadow', dir: ctx.stateDir, items: [], incomplete: false }),
-      stallDigest: (pass, options) => { passes.push(pass); return publishStalledDigest(pass, { ...options, feedPath: ctx.feedPath }); } });
+      readPrs, readQueue: () => ({ ready: [], rulingNeeded: [] }), readPrevious: () => previous,
+      readSignals: () => { if (failOwner) throw new Error('injected owner read failure'); return {}; },
+      detector, notify, flush: () => {}, persist: () => {}, append: () => {},
+      stallSweep: async () => ({ mode: 'shadow', dir: ctx.stateDir, digest: true, items: [], incomplete: false }),
+      stallDigest: (pass, options) => {
+        passes.push(pass);
+        return publishStalledDigest(pass, { ...options, feedPath: ctx.feedPath });
+      } });
     previous = report.nextState;
     return report;
   };
   expect((await tick(0)).errors).toEqual([]);
-  expect(passes[0].incomplete).toBe(false);
-  expect(unacknowledged({ path: ctx.feedPath })).toMatchObject([{ pr: 6254, head: H, state: 'empty-diff' }]);
-  rows = [{ ...base, changedFiles: 1, ...patch }];
-  await tick(1);
-  expect(passes[1].incomplete).toBe(true);
-  expect(replay({ path: ctx.feedPath }).filter(e => e.kind === 'cleared')).toEqual([]);
-  expect(unacknowledged({ path: ctx.feedPath }).some(e => e.pr === 6254 && e.head === H)).toBe(true);
-  if (Object.hasOwn(patch, 'changedFiles')) {
-    expect(passes[1].items).toEqual([]);
-    expect(unacknowledged({ path: ctx.feedPath })).toMatchObject([{ pr: 6254, head: H, state: 'empty-diff' }]);
-  }
-  rows = [{ ...base, changedFiles: 1 }];
-  expect((await tick(2)).errors).toEqual([]);
-  expect(passes[2]).toMatchObject({ incomplete: false, items: [] });
-  expect(unacknowledged({ path: ctx.feedPath })).toEqual([]);
-  expect(replay({ path: ctx.feedPath }).filter(e => e.kind === 'cleared')).toMatchObject([{ pr: 6254, head: H }]);
-  expect(replay({ path: ctx.feedPath }).filter(e => e.kind === 'cleared')).toHaveLength(1);
-});
-
-
-it.each([
-  ['mode=off / unknown diff', { mode: 'off', digest: true }, { changedFiles: null }],
-  ['digest=false / unknown diff', { mode: 'shadow', digest: false }, { changedFiles: null }],
-  ['mode=off / unknown labels', { mode: 'off', digest: true }, { labels: null }],
-  ['digest=false / unknown labels', { mode: 'shadow', digest: false }, { labels: null }],
-])('incomplete listings preserve persisted detector findings with invariant producer disabled: %s', async (_name, producer, patch) => {
-  const { runPrSweep } = await import('../pr-sweep.mjs');
-  const ctx = setup(), { notify } = sent();
-  const base = { number: 5759, title: 'detector evidence', headRefOid: H, labels: [],
-    changedFiles: 1, updatedAt: new Date(NOW).toISOString() };
-  const finding = op(base.number, Object.hasOwn(patch, 'changedFiles') ? 'empty-diff' : 'stalled-same-head', { action: 'stalled-detector' });
-  let previous = {}, rows = [base], detectorItems = [finding];
-  const passes = [];
-  const tick = async minutes => {
-    const report = await runPrSweep({ now: NOW + minutes * 60000, env: {}, config: {},
-      settings: { value: { repos: [REPO], idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90 }, sources: {} },
-      readPrs: () => rows, readPrevious: () => previous, readQueue: () => ({ ready: [], rulingNeeded: [] }),
-      readSignals: () => ({}), detector: async () => ({ enabled: true, items: detectorItems, errors: [], nextSeen: {} }),
-      notify, flush: () => {}, persist: () => {}, append: () => {},
-      stallSweep: () => ({ ...producer, dir: ctx.stateDir, items: [], incomplete: false }),
-      stallDigest: (pass, options) => {
-        passes.push({ pass, enabled: options.enabled });
-        return publishStalledDigest(pass, { ...options, feedPath: ctx.feedPath });
-      } });
-    previous = report.nextState;
-    expect(report.errors).toEqual([]);
-    return report;
-  };
-  // The invariant would publish no-labels if enabled; only the detector reaches the feed.
-  expect((await tick(0)).decisions[0].violation).toBe('no-labels');
-  expect(passes[0]).toMatchObject({ enabled: true, pass: { ...producer, incomplete: false, items: [finding] } });
   const opened = unacknowledged({ path: ctx.feedPath });
   expect(opened).toHaveLength(1);
-  expect(opened[0]).toMatchObject({ pr: base.number, head: H, state: finding.state });
-  detectorItems = [];
-  rows = [{ ...base, ...patch }];
-  await tick(1);
-  expect(passes[1]).toMatchObject({ enabled: true, pass: { ...producer, incomplete: true, items: [] } });
+  expect(opened[0]).toMatchObject({ pr: 6254, state: 'no-labels', kind: 'stalled' });
+  failOwner = true;
+  const failed = await tick(1);
+  expect(failed.errors).toContain('owner signals: injected owner read failure');
+  expect(readPrs).toHaveBeenCalledTimes(2);
+  expect(detector).toHaveBeenCalledTimes(2);
+  expect(passes[1].items).toEqual([]);
   expect(unacknowledged({ path: ctx.feedPath })).toEqual(opened);
-  expect(replay({ path: ctx.feedPath }).filter(e => e.kind === 'cleared')).toEqual([]);
-  rows = [base];
-  await tick(2);
-  expect(passes[2]).toMatchObject({ enabled: true, pass: { ...producer, incomplete: false, items: [] } });
+  expect(replay({ path: ctx.feedPath }).filter(event => event.kind === 'cleared')).toEqual([]);
+  expect(passes[1].incomplete).toBe(true);
+  failOwner = false;
+  expect((await tick(2)).errors).toEqual([]);
+  expect(unacknowledged({ path: ctx.feedPath })).toEqual(opened);
+  prs = [];
+  expect((await tick(3)).errors).toEqual([]);
+  expect(passes[3].incomplete).toBe(false);
   expect(unacknowledged({ path: ctx.feedPath })).toEqual([]);
-  expect(replay({ path: ctx.feedPath }).filter(e => e.kind === 'cleared')).toHaveLength(1);
 });
 
+it('R437 enabled invariant producer marks owner-read failure incomplete and preserves the existing feed item', async () => {
+  const result = await ownerFailureWithObsoleteDetectorItem({ mode: 'shadow', digest: true });
+  expect(result.pass.incomplete).toBe(true);
+  expect(result.after).toEqual(result.before);
+  expect(result.cleared).toEqual([]);
+});
 
 it('incomplete passes retain same-head findings and their saved identity while admitting new heads', () => {
   const ctx = setup(), { notify } = sent();
@@ -728,165 +642,4 @@ it('incomplete passes retain same-head findings and their saved identity while a
   expect(JSON.parse(readFileSync(join(ctx.stateDir, 'digest-state.json'), 'utf8')).current)
     .toMatchObject(saved.current);
   expect(result.fresh.map(e => e.pr)).toEqual([6255]);
-});
-
-it.each(['no prior item', 'other head', 'other repo'])('legacy missing diff count stays complete with %s', async scenario => {
-  const { runPrSweep } = await import('../pr-sweep.mjs');
-  const ctx = setup(), { notify } = sent();
-  if (scenario !== 'no prior item') run(ctx, [op(6254, 'empty-diff', {
-    head: scenario === 'other head' ? 'b'.repeat(40) : H,
-    repo: scenario === 'other repo' ? 'plateauapp/plateau-app' : REPO,
-  })], { notify });
-  let pass;
-  const report = await runPrSweep({ now: NOW, env: {}, config: {},
-    settings: { value: { repos: [REPO], idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90 }, sources: {} },
-    readPrs: () => [{ number: 6254, title: 'legacy', headRefOid: H, labels: ['review:accepted'], updatedAt: new Date(NOW).toISOString() }],
-    readPrevious: () => ({}), readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: () => ({}),
-    detector: async () => ({ enabled: true, items: [], errors: [], nextSeen: {} }),
-    notify, flush: () => {}, persist: () => {}, append: () => {},
-    stallSweep: () => ({ mode: 'off', dir: ctx.stateDir, items: [], incomplete: false }),
-    stallDigest: (input, options) => { pass = input; return publishStalledDigest(input, { ...options, feedPath: ctx.feedPath }); } });
-  expect(report.errors).toEqual([]);
-  expect(pass.incomplete).toBe(false);
-  expect(unacknowledged({ path: ctx.feedPath })).toEqual([]);
-});
-
-it('unknown diff and null labels cannot overwrite a persisted same-head empty-diff finding', async () => {
-  const { runPrSweep } = await import('../pr-sweep.mjs');
-  const ctx = setup(), { notify } = sent();
-  const seeded = run(ctx, [op(6254, 'empty-diff', { violation: 'empty-diff', nextAction: 'close into card' })], { notify });
-  expect(seeded.errors).toEqual([]);
-  const before = unacknowledged({ path: ctx.feedPath });
-  await runPrSweep({ now: NOW, env: {}, config: {},
-    settings: { value: { repos: [REPO], idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90 }, sources: {} },
-    readPrs: () => [{ number: 6254, title: 'unknown diff', headRefOid: H, labels: null, changedFiles: null, updatedAt: new Date(NOW).toISOString() }],
-    readPrevious: () => ({}), readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: () => ({}),
-    detector: async () => ({ enabled: true, items: [], errors: [], nextSeen: {} }),
-    notify, flush: () => {}, persist: () => {}, append: () => {},
-    stallSweep: () => ({ mode: 'shadow', dir: ctx.stateDir, items: [], incomplete: false }),
-    stallDigest: (pass, options) => publishStalledDigest(pass, { ...options, feedPath: ctx.feedPath }) });
-  expect(unacknowledged({ path: ctx.feedPath })).toEqual(before);
-  expect(replay({ path: ctx.feedPath })).toEqual(before);
-});
-
-
-it.each(['current', 'legacy'])('publisher rechecks %s persisted empty-diff proof under the feed lock', shape => {
-  const ctx = setup(), { notify } = sent();
-  run(ctx, [op(6254, 'empty-diff', { violation: 'empty-diff', nextAction: 'close into card' })], { notify });
-  const before = unacknowledged({ path: ctx.feedPath });
-  if (shape === 'legacy') {
-    const path = join(ctx.stateDir, 'digest-state.json');
-    const saved = JSON.parse(readFileSync(path, 'utf8'));
-    delete saved.current;
-    writeFileSync(path, JSON.stringify(saved));
-  }
-  const result = run(ctx, [], { notify, pass: { incomplete: false, unknownDiffs: [{ repo: REPO, pr: 6254, head: H }] } });
-  expect(result.errors).toEqual([]);
-  expect(result.lines).toEqual([]);
-  expect(unacknowledged({ path: ctx.feedPath })).toEqual(before);
-  expect(replay({ path: ctx.feedPath }).filter(e => e.kind === 'cleared')).toEqual([]);
-});
-
-it('unreadable persisted diff identity fails closed with an operator-visible error and preserves the feed', async () => {
-  const { runPrSweep } = await import('../pr-sweep.mjs');
-  const ctx = setup(), { notify } = sent();
-  run(ctx, [op(6254, 'empty-diff')], { notify });
-  const before = unacknowledged({ path: ctx.feedPath });
-  const path = join(ctx.stateDir, 'digest-state.json');
-  const saved = JSON.parse(readFileSync(path, 'utf8'));
-  saved.current[`${REPO}#6254@${H}:stalled`] = '[invalid identity';
-  writeFileSync(path, JSON.stringify(saved));
-  let pass;
-  const report = await runPrSweep({ now: NOW, env: {}, config: {},
-    settings: { value: { repos: [REPO], idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90 }, sources: {} },
-    readPrs: () => [{ number: 6254, title: 'unknown diff', headRefOid: H, labels: ['review:accepted'], changedFiles: null, updatedAt: new Date(NOW).toISOString() }],
-    readPrevious: () => ({}), readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: () => ({}),
-    detector: async () => ({ enabled: true, items: [], errors: [], nextSeen: {} }),
-    notify, flush: () => {}, persist: () => {}, append: () => {},
-    stallSweep: () => ({ mode: 'shadow', dir: ctx.stateDir, items: [], incomplete: false }),
-    stallDigest: (input, options) => { pass = input; return publishStalledDigest(input, { ...options, feedPath: ctx.feedPath }); } });
-  expect(report.errors.join(' ')).toContain('persisted diff evidence:');
-  expect(pass.incomplete).toBe(true);
-  expect(unacknowledged({ path: ctx.feedPath })).toEqual(before);
-  expect(replay({ path: ctx.feedPath }).filter(e => e.kind === 'cleared')).toEqual([]);
-});
-
-
-it.each([
-  ['state', 'empty-diff', 'owner-stale'],
-  ['merged violation', 'stalled-same-head', 'empty-diff'],
-])('unknown same-head diff evidence retains a persisted empty-diff %s', async (_slot, state, violation) => {
-  const { readDiffEvidenceIncomplete } = await import('../pr-stall-digest.mjs');
-  const ctx = setup(), { notify } = sent();
-  const finding = op(6254, state, { violation, nextAction: 'close into card' });
-  expect(run(ctx, [finding], { notify }).errors).toEqual([]);
-  const saved = JSON.parse(readFileSync(join(ctx.stateDir, 'digest-state.json'), 'utf8'));
-  expect(JSON.parse(saved.current[`${REPO}#6254@${H}:stalled`]).slice(0, 2)).toEqual([state, violation]);
-  const before = unacknowledged({ path: ctx.feedPath });
-  const unknownDiffs = [{ repo: REPO, pr: 6254, head: H }];
-  const result = run(ctx, [], { notify, now: NOW + 60000, pass: { incomplete: false, unknownDiffs } });
-  expect(result.errors).toEqual([]);
-  expect(result.lines).toEqual([]);
-  expect(unacknowledged({ path: ctx.feedPath })).toEqual(before);
-  expect(replay({ path: ctx.feedPath }).filter(e => e.kind === 'cleared')).toEqual([]);
-  expect(readDiffEvidenceIncomplete(ctx.stateDir, unknownDiffs)).toBe(true);
-});
-
-it('empty-diff text in other identity fields does not count as an empty-diff state or violation', async () => {
-  const { readDiffEvidenceIncomplete } = await import('../pr-stall-digest.mjs');
-  const ctx = setup(), { notify } = sent();
-  expect(run(ctx, [op(6254, 'stalled-same-head', { violation: 'owner-stale', nextAction: 'empty-diff' })], { notify }).errors).toEqual([]);
-  const unknownDiffs = [{ repo: REPO, pr: 6254, head: H }];
-  expect(readDiffEvidenceIncomplete(ctx.stateDir, unknownDiffs)).toBe(false);
-  const result = run(ctx, [], { notify, now: NOW + 60000, pass: { incomplete: false, unknownDiffs } });
-  expect(result.errors).toEqual([]);
-  expect(unacknowledged({ path: ctx.feedPath })).toEqual([]);
-  expect(replay({ path: ctx.feedPath }).filter(e => e.kind === 'cleared')).toHaveLength(1);
-});
-
-
-it.each(['deadline crossing', 'changed state', 'omitted head'])('incomplete %s retries an owed retained alert without overwriting the feed', scenario => {
-  const ctx = setup();
-  const original = op(6254, 'stalled-head', { deadline: new Date(NOW + 1000).toISOString(), nextAction: 'await-review' });
-  const first = run(ctx, [original], { notify: () => ({ ok: false, error: 'first delivery failed' }) });
-  expect(first.errors.join(' ')).toContain('first delivery failed');
-  const before = unacknowledged({ path: ctx.feedPath });
-  const items = scenario === 'omitted head' ? [] : scenario === 'changed state'
-    ? [{ ...original, state: 'owner-stale', violation: 'owner-stale' }] : [original];
-  const retry = vi.fn(() => ({ ok: false, error: 'retry delivery failed' }));
-  const failed = run(ctx, items, { notify: retry, now: NOW + 1001, pass: { incomplete: true } });
-  expect(retry).toHaveBeenCalledTimes(1);
-  expect(failed.errors.join(' ')).toContain('retry delivery failed');
-  expect(failed.fresh.map(f => f.state)).toEqual([original.state]);
-  expect(failed.lines).toEqual([]);
-  expect(unacknowledged({ path: ctx.feedPath })).toEqual(before);
-  const alertId = `${REPO}#6254@${H}:${original.state}`;
-  expect(JSON.parse(readFileSync(join(ctx.stateDir, 'digest-state.json'), 'utf8')).unnotified).toEqual([alertId]);
-  const delivered = vi.fn(() => ({ ok: true }));
-  const result = run(ctx, items, { notify: delivered, now: NOW + 1002, pass: { incomplete: true } });
-  expect(delivered).toHaveBeenCalledTimes(1);
-  expect(result.errors).toEqual([]);
-  expect(result.notified).toBe(true);
-  expect(JSON.parse(readFileSync(join(ctx.stateDir, 'digest-state.json'), 'utf8')).unnotified).toEqual([]);
-  expect(replay({ path: ctx.feedPath })).toEqual(before);
-});
-
-it.each(['deadline crossing', 'changed state', 'omitted head'])('incomplete %s schedules retained backoff reminders without replacing their evidence', scenario => {
-  const ctx = setup(), { notify, out } = sent();
-  const original = op(6254, 'stalled-head', { deadline: new Date(NOW + 60000).toISOString(), nextAction: 'await-review' });
-  const options = { notify, alertBackoffMinutes: [30, 60] };
-  expect(run(ctx, [original], options).notified).toBe(true);
-  const before = unacknowledged({ path: ctx.feedPath });
-  const items = scenario === 'omitted head' ? [] : scenario === 'changed state'
-    ? [{ ...original, state: 'owner-stale', violation: 'owner-stale' }] : [original];
-  const due = run(ctx, items, { ...options, now: NOW + 31 * 60000, pass: { incomplete: true } });
-  expect(due.errors).toEqual([]);
-  expect(due.notified).toBe(true);
-  expect(due.fresh.map(f => f.state)).toEqual([original.state]);
-  expect(due.lines).toEqual([]);
-  expect(run(ctx, items, { ...options, now: NOW + 32 * 60000, pass: { incomplete: true } }).notified).toBe(false);
-  expect(run(ctx, items, { ...options, now: NOW + 91 * 60000, pass: { incomplete: true } }).notified).toBe(true);
-  expect(out).toHaveLength(3);
-  expect(unacknowledged({ path: ctx.feedPath })).toEqual(before);
-  expect(replay({ path: ctx.feedPath })).toEqual(before);
 });

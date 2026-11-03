@@ -17,7 +17,7 @@ import { mkdirSync, readFileSync, realpathSync, readlinkSync, statSync } from 'n
 import { dirname, join, resolve, basename, sep } from 'node:path';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
-import { diffFeed, replay, appendLines, checkedFeedPath, sidecarsOf, REPORT_KINDS, resolveSettings as feedSettings } from '../operations/needs-you-feed.mjs';
+import { diffFeed, appendLines, checkedFeedPath, sidecarsOf, REPORT_KINDS, resolveSettings as feedSettings } from '../operations/needs-you-feed.mjs';
 import { notifyDesktopChecked } from './branch-sync.mjs';
 import { repeatDue, labelNames } from './pr-sweep-core.mjs';
 import { sortUnblockersFirst } from './pr-blocked-by.mjs';
@@ -105,24 +105,6 @@ const feedKey = (f) => `${f.repo}#${f.pr}@${f.head}:${STALLED_KIND}`;
 /** `repo#pr@head:state` -> the feed key of that head's `stalled` item (the state may itself contain `:`). */
 const feedKeyOfId = (x) => { const at = x.lastIndexOf('@'); return `${x.slice(0, at)}@${x.slice(at + 1).split(':')[0]}:${STALLED_KIND}`; };
 
-// Unknown diff counts matter only to a persisted empty-diff finding for this exact head.
-// Support both current identities and older sidecars carrying only published state ids.
-function diffEvidenceIncomplete(saved, unknownDiffs) {
-  return unknownDiffs.some(item => {
-    const key = feedKey(item), identity = saved.current?.[key];
-    if (identity !== undefined) {
-      if (typeof identity !== 'string') throw new Error('unreadable persisted stall identity');
-      return identity === 'empty-diff' || (identity.startsWith('[') && JSON.parse(identity).slice(0, 2).includes('empty-diff'));
-    }
-    return (saved.published ?? []).includes(`${item.repo}#${item.pr}@${item.head}:empty-diff`);
-  });
-}
-/** Sweep preflight; the publisher rechecks under the feed lock before changing persisted items. */
-export function readDiffEvidenceIncomplete(stateDir, unknownDiffs = []) {
-  if (!unknownDiffs.length) return false;
-  return diffEvidenceIncomplete(readJson(join(stateDir, 'digest-state.json'), {}), unknownDiffs);
-}
-
 // Keep legacy state strings (and their persisted repeat fingerprints) unchanged.
 // Deadline timestamps may move each tick; only crossing the deadline changes identity.
 function updateIdentity(f, now) {
@@ -172,48 +154,38 @@ function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, al
       // Already published for this PR head under another kind (operator-queue's item): not published twice.
       // Only operator-queue's report kinds count: an event-only key (review-no-verdict, disk-space) asks something else.
       const other = prev.openKeys.filter((k) => REPORT_KINDS.has(k.slice(k.lastIndexOf(':') + 1)));
-      const incomplete = !!pass.incomplete || diffEvidenceIncomplete(saved, pass.unknownDiffs ?? []);
       // The FEED shows each open head's current state and invariant/dependency identity. A change drops the
       // old key so the diff re-publishes the head with the current reason and command. The ALERT identity is
       // repo#pr@head:state. Legacy consumers alert once (A -> B -> A alerts A once); configured sweeps repeat with backoff and reset on movement.
       const shown = Object.fromEntries(Object.entries(saved.current ?? {}).filter(([k]) => prev.openKeys.includes(k)));
-      // An incomplete pass may add new heads, but cannot replace an existing head's evidence.
-      const eligible = f => !other.some(k => k.startsWith(`${f.repo}#${f.pr}@${f.head}:`));
-      const candidates = items.filter(eligible);
-      const mineNow = candidates.filter(f => !(incomplete && prev.openKeys.includes(feedKey(f))
-        && shown[feedKey(f)] !== updateIdentity(f, now)));
-      // Publication may retain a head without its current candidate. Retry/reminder scheduling
-      // still uses that head's published evidence and alert id, including when it was omitted.
-      const retained = incomplete ? replay({ path }).filter(f => f.kind === STALLED_KIND
-        && prev.openKeys.includes(feedKey(f)) && eligible(f)) : [];
-      const alertItems = incomplete
-        ? [...new Map([...candidates, ...retained].map(f => [feedKey(f), f])).values()]
-        : mineNow;
+      // Partial evidence may add a new head, but cannot replace a confirmed same-head item.
+      const mineNow = items.filter((f) => !other.some((k) => k.startsWith(`${f.repo}#${f.pr}@${f.head}:`))
+        && !(pass.incomplete && prev.openKeys.includes(feedKey(f)) && shown[feedKey(f)] !== updateIdentity(f, now)));
       const alerted = new Set((saved.published ?? []).filter((x) => prev.openKeys.includes(feedKeyOfId(x))));
       const changed = new Set(mineNow.filter((f) => prev.openKeys.includes(feedKey(f)) && shown[feedKey(f)] !== updateIdentity(f, now)).map(feedKey));
-      const r = diffFeed(prev.openKeys.filter((k) => !changed.has(k)), mineNow, now, { incomplete, clearKinds: new Set([STALLED_KIND]) });
+      const r = diffFeed(prev.openKeys.filter((k) => !changed.has(k)), mineNow, now, { incomplete: !!pass.incomplete, clearKinds: new Set([STALLED_KIND]) });
       const open = new Set(r.openKeys);
       const written = mineNow.filter((f) => r.lines.some((l) => l.startsWith(`NEEDS-YOU ${f.repo}#${f.pr} ${STALLED_KIND}:`)));
       const newly = written.filter((f) => !alerted.has(id(f)));
       const repeats = Object.fromEntries(Object.entries(saved.repeats ?? {}).filter(([k]) => open.has(feedKeyOfId(k))));
       const fingerprint = f => JSON.stringify([updateIdentity(f, now), f.labels]);
       // Persisted one-shot ids carry no send time. Start a bounded clock on migration instead of flooding.
-      if (alertBackoffMinutes) for (const f of alertItems) {
+      if (alertBackoffMinutes) for (const f of mineNow) {
         if (changed.has(feedKey(f))) {
           for (const key of Object.keys(repeats)) if (feedKeyOfId(key) === feedKey(f)) delete repeats[key];
         }
         if (!changed.has(feedKey(f)) && alerted.has(id(f)) && !(saved.unnotified ?? []).includes(id(f)) && !repeats[id(f)]) repeats[id(f)] = { lastAlertAt: now, alertCount: 1, fingerprint: fingerprint(f) };
       }
-      const due = alertItems.filter(f => alertBackoffMinutes && repeats[id(f)] &&
+      const due = mineNow.filter(f => alertBackoffMinutes && repeats[id(f)] &&
         (repeats[id(f)].fingerprint !== fingerprint(f) || repeatDue(repeats[id(f)], now, alertBackoffMinutes)));
       // State transitions reset repeats, including a return to a previously seen state.
-      for (const f of alertItems) {
+      for (const f of mineNow) {
         if (changed.has(feedKey(f)) && (alertBackoffMinutes || updateIdentity(f, now) !== f.state
           || shown[feedKey(f)]?.startsWith('['))) due.push(f);
       }
-      // Owed alerts from a failed send are retried until delivered or resolved, even across an incomplete pass.
+      // Failed sends remain owed until delivered or resolved; incomplete passes defer notification.
       const pending = new Set((saved.unnotified ?? []).filter((x) => open.has(feedKeyOfId(x))));
-      const toAlert = alertItems.filter((f) => newly.includes(f) || pending.has(id(f)) || due.includes(f));
+      const toAlert = mineNow.filter((f) => newly.includes(f) || pending.has(id(f)) || due.includes(f));
       const unnotified = [...new Set([...pending, ...toAlert.map(id)])];
       // Our own record goes first, marking every alert owed until confirmed; what the feed shows is recorded only once
       // its line is written. A failed save can repeat a line or an alert, never drop one.
@@ -232,7 +204,7 @@ function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, al
     fresh = items;
   }
   let notified = false;
-  if (fresh.length) {
+  if (fresh.length && !pass.incomplete) {
     const body = fresh.slice(0, 5).map((f) => `${f.repo.split('/').pop()}#${f.pr} ${f.state} ${(f.blockedBy ?? []).map(n => `blocked-by #${n}`).join(' ')} ${(f.unblocks ?? []).map(n => `unblocks #${n}`).join(' ')}`).join(' | ') + (fresh.length > 5 ? ` (+${fresh.length - 5} more)` : '');
     let out = null;
     try { out = notify({ title: `PR stall sweep: ${fresh.length} need you`, body }); } catch (e) { out = { ok: false, error: e?.message }; }

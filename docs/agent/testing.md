@@ -3837,11 +3837,6 @@ unchanged while removing the target, then proves the dependent retains its runni
 per-action map. The settings-to-evaluator contract cases in `pr-sweep.test.mjs` exercise
 both shapes from tool and environment settings, including effective deadlines and provenance.
 
-When the invariant digest producer is enabled, its owner-signal failures must mark the shared digest incomplete.
-`pr-stall-digest.test.mjs` exercises the real sweep and feed publisher across an owner-read
-failure, recovery, and a later confirmed PR removal: incomplete evidence preserves the open
-invariant item, while a complete listing may clear it.
-
 Dependency extraction uses Markdown block structure to exclude indented code and lazy
 blockquote continuations as well as fences; inline code retains the conservative exclusion
 for unterminated spans. The indented/quoted-example sweep regressions prove these examples
@@ -3851,19 +3846,7 @@ The four-case soak keeps a live blocker on its empty-diff fixture to pin that pr
 
 Legacy sweep/detector rows retain their original shape unless dependencies, empty-diff
 precedence, or configured alert backoff require enrichment. New invariant rows carry their
-own metadata; the feed serializer omits extensions absent from a legacy item. An explicit
-sweep-off or digest-false pass preserves detector-only behavior: agent listing failures do
-not make the independent detector incomplete, while enabled invariant producers still
-preserve published items when ownership cannot be read.
-
-The named `mode=off`, `digest=false`, and `enabled invariant producer` cases in
-`pr-stall-digest.test.mjs` seed a real detector feed item before an owner-read failure.
-With independent PR/detector reads succeeding, the disabled producers allow complete
-passes to clear the stale item; the enabled producer preserves it as incomplete evidence.
-The tests also require the detector digest to remain enabled, excluding disable-time
-clearing as a false-positive proof of detector completeness.
-
-R437 follow-up: `Unblocks: #N` (or `Unblocks #A, #B`) creates reverse dependencies
+own metadata; the feed serializer omits extensions absent from a legacy item. R437 follow-up: `Unblocks: #N` (or `Unblocks #A, #B`) creates reverse dependencies
 only from PR bodies, using the same Markdown exclusions and confirmed-open targets.
 Two matching fix-dispatch refusal entries produce `blocked-by-tooling`, with a tooling
 owner and repair action. Compare full reasons after removing quoted values, timestamps
@@ -3954,45 +3937,28 @@ existing `empty-diff` closure action. The named cases in `pr-sweep-audit.test.mj
 pin unknown evidence, valid nonzero counts, zero, and unaffected sibling decisions.
 
 
-## PR sweep incomplete listing evidence preserves feed findings
+## Simplified PR sweep diff handling
 
-Unknown diff evidence marks the shared stall digest incomplete only when the
-persisted digest contains an empty-diff finding for that repo/PR/head. Legacy
-listings without that finding retain their previous completeness behavior. A same-head
-empty-diff finding stays open across missing/invalid `changedFiles`; a subsequent
-known positive integer count permits clearing it on a complete pass. Unknown or
-malformed labels likewise mark the digest incomplete without dropping the PR.
-Missing/invalid update time and missing, empty or blank heads invalidate discovery
-and preserve existing feed findings through `prsReadOk`. This completeness rule
-also protects detector items when the invariant producer is disabled.
-`pr-stall-digest.test.mjs` exercises real publication and persisted feed replay
-through empty diff, incomplete evidence and same-head positive-count recovery,
-asserting no cleared event until the recovery pass.
+Unknown `changedFiles` keeps the PR evaluated and cannot establish `empty-diff`;
+only numeric integer zero does. Unknown counts do not alter digest completeness
+or trigger custom persisted-feed retention/clearing. The digest uses its baseline
+`diffFeed` incomplete-pass behavior. Incomplete passes send no new notification;
+unsent alerts remain owed for a subsequent complete pass. Repeat backoff and the
+violation-aware repeat identity continue to apply on complete passes.
 
 
-Incomplete stall passes retain the existing same-head feed identity and evidence;
-they may add findings on new heads, but cannot overwrite an existing item by
-removing its key before `diffFeed`. The publisher rechecks unknown-diff subjects
-against persisted empty-diff identities while holding the feed lock. Sweep preflight
-uses the same check; unreadable persisted identity evidence raises an operator-visible
-error and conservatively marks the pass incomplete. `pr-stall-digest.test.mjs`
-covers unknown diff plus null labels, other-repo/head isolation, legacy listings,
-and same-head replacement attempts alongside new-head publication.
+The enabled invariant producer independently requires readable owner signals.
+An owner-read failure marks its digest pass incomplete so an existing invariant
+finding cannot be cleared on missing evidence. A sweep-off or digest-disabled
+producer still permits the independent detector to complete. The restored
+owner-signal failure/recovery and enabled-producer regressions in
+`pr-stall-digest.test.mjs` cover persisted feed retention and no cleared event.
+This guard does not depend on unknown diff counts or custom retention logic.
 
 
-Persisted stall identities store state and violation separately. Empty-diff proof
-is still required when either of those two fields is `empty-diff`, including a
-merged detector/sweep finding whose original state survives. Other identity fields
-such as the action do not establish an empty-diff finding. The named state,
-merged-violation and other-field tests in `pr-stall-digest.test.mjs` cover both the
-sweep preflight reader and persisted-feed publication.
-
-
-Incomplete-pass publication and notification scheduling are separate. Retained
-heads keep their published feed evidence, while owed retries and configured
-backoff reminders use that published item and its original alert identity.
-Replay supplies retained items even when a partial listing omits their heads;
-a changed candidate cannot replace their evidence or strand an older owed alert.
-The incomplete deadline-crossing, changed-state and omitted-head cases in
-`pr-stall-digest.test.mjs` cover failed-send retry/error reporting, successful
-confirmation, reminder backoff and unchanged persisted feed events.
+Incomplete passes reject replacement candidates whose identity differs from an
+existing same-head finding before removing any feed key. New heads may still
+be published, while notifications remain deferred until a complete pass. The
+restored named same-head retention/new-head admission regression asserts unchanged
+persisted evidence and saved identity. This guard does not restore unknown-diff
+identity readers or replay-based retry scheduling.

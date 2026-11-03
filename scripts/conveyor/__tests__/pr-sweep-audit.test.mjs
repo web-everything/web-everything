@@ -280,3 +280,17 @@ it.each([0, 1, Number.MAX_SAFE_INTEGER])('only integer zero proves an empty diff
   expect(out.decisions[0].violation).toBe(changedFiles === 0 ? 'empty-diff' : null);
   expect(out.decisions[0].nextAction).toBe(changedFiles === 0 ? 'close into card' : 'await-review');
 });
+
+
+it.each([undefined, null, -1, 0.5, '0'])('unknown changedFiles=%s never claims empty-diff or marks the digest incomplete', async changedFiles => {
+  let pass;
+  const out = await run({ dryRun: false, readPrs: () => [{ ...pr, changedFiles }],
+    persist: () => {}, append: () => {}, flush: () => {}, notify: () => ({ ok: true }),
+    stallSweep: () => ({ mode: 'shadow', dir: 'unused', items: [], incomplete: false }),
+    stallDigest: input => { pass = input; return {}; } });
+  expect(out.decisions).toHaveLength(1);
+  expect(out.decisions[0].violation).not.toBe('empty-diff');
+  expect(out.decisions[0].nextAction).not.toBe('close into card');
+  expect(pass.incomplete).toBe(false);
+  expect(pass.items.some(item => item.violation === 'empty-diff')).toBe(false);
+});
