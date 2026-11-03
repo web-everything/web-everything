@@ -864,7 +864,9 @@ async function runCli() {
       process.stderr.write(`pr-land [${REPO}] · soak precheck: diff unavailable (${String(e.message || e).split('\n')[0]}); CI still enforces it\n`);
       return { ok: true, skipped: 'diff unavailable; CI still enforces it' };
     }
-    return soakPrecheckAtOpen({ title: createParams.title, body: CREATE_BODY, files });
+    let rulingsText = '';
+    try { rulingsText = readFileSync(process.env.WE_RULINGS_PATH || join(homedir(), 'workspace/.operations/handoff/rulings.md'), 'utf8'); } catch { /* fail closed: no ruling ids resolve */ }
+    return soakPrecheckAtOpen({ title: createParams.title, body: CREATE_BODY, files, actor: currentActorId(), rulingsText });
   }
 
   if (DRY_RUN) {

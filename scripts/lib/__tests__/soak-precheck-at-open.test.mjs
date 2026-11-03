@@ -14,13 +14,32 @@ describe('soak precheck at PR open', () => {
   it('refuses a daemon fix without replay evidence with actionable instructions', () => {
     const verdict = soakPrecheckAtOpen(fix);
     expect(verdict).toMatchObject({ ok: false, applicable: true });
-    for (const text of ['soak-waiver:', 'scripts/conveyor/soak/breaks/', '--body-file', SOAK_PRECHECK_ENV]) {
+    for (const text of ['scripts/conveyor/soak/breaks/', SOAK_PRECHECK_ENV]) {
       expect(verdict.message).toContain(text);
     }
     expect(HOME_REASONS['soak-declaration']).toBe('refused');
   });
-  it('passes with a waiver line', () => {
-    expect(soakPrecheckAtOpen({ ...fix, body: 'soak-waiver: covered by pure replay' }).ok).toBe(true);
+  it('refuses an agent-added waiver as soak-waiver-not-operator', () => {
+    const v = soakPrecheckAtOpen({ ...fix, body: 'soak-waiver: covered by pure replay', actor: 'worker-1', rulingsText: 'R1 | x' });
+    expect(v.ok).toBe(false);
+    expect(v.message.toLowerCase()).not.toContain('waiver:');
+    expect(v.reason).toContain('soak-waiver-not-operator');
+  });
+  it('refuses a waiver when the actor is unknown (fail closed)', () => {
+    expect(soakPrecheckAtOpen({ ...fix, body: 'soak-waiver: covered' }).ok).toBe(false);
+  });
+  it('refusal text to an agent names the break fix and no waiver hint', () => {
+    const m = soakPrecheckAtOpen({ ...fix, actor: 'worker-1' }).message;
+    expect(m).toContain('scripts/conveyor/soak/breaks/');
+    expect(m.toLowerCase()).not.toContain('waiver');
+  });
+  it('accepts a waiver authored by the operator actor', () => {
+    expect(soakPrecheckAtOpen({ ...fix, body: 'soak-waiver: covered', actor: 'chalbert' }).ok).toBe(true);
+  });
+  it('accepts a waiver citing an operator ruling id present in rulings.md', () => {
+    const base = { ...fix, actor: 'worker-1', rulingsText: 'R12 | 2026 | J | x\nR77 | y' };
+    expect(soakPrecheckAtOpen({ ...base, body: 'soak-waiver: per R77, pure fn' }).ok).toBe(true);
+    expect(soakPrecheckAtOpen({ ...base, body: 'soak-waiver: per R99, pure fn' }).ok).toBe(false);
   });
   it('passes with an added break file', () => {
     expect(soakPrecheckAtOpen({ ...fix, files: [...fix.files,
