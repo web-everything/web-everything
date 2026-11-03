@@ -73,6 +73,7 @@ function d2Verified(f, { readCard = readCardFromMain, now = Date.now } = {}, rel
     const due = dues.size ? [...dues][0] : 'prod';
     if (due === 'prod') return releaseStage !== 'prod';
     const when = Date.parse(`${due}T00:00:00Z`);
+    // utc-day-slice-ok: round-trips a UTC-midnight parse to reject impossible dates (2099-02-31); no wall-clock read.
     return Number.isFinite(when) && new Date(when).toISOString().slice(0, 10) === due
       && when > (typeof now === 'function' ? now() : now);
   } catch { return false; }
