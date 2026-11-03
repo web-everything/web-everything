@@ -3903,3 +3903,13 @@ Child report identities re-emitted as FAIL lines must strip C0/C1 controls and U
 line separators; the hostile-input table checks the resulting failure collector entries.
 When changing an existing test's expected verdict, disclose the behavior change in
 the PR description so reviewers can distinguish a policy change from a regression fix.
+## Lane release preservation guard
+
+`lane-pool release` checks HEAD and every local branch against origin remote-tracking refs (excluding
+`origin/HEAD`, `origin/ops/*`, and all non-origin remotes) after known-litter cleanup and salvage. A
+Untracked files deliberately do not block release: the guard covers tracked changes only.
+URL-based salvage may leave no tracking ref: only its verified
+remote SHA is an additional exclusion, and unrelated local branches still block release. Tests that
+intentionally release tracked edits or unpreserved commits must pass `--discard` explicitly; `--force`
+only overrides ownership. Unreadable or oversized Git evidence keeps the lease and names manual
+inspection or deliberate `--discard` as the operator fallback.

@@ -6,10 +6,10 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
-const cases = ['release --lane=1', 'release --all-pools', 'gc', 'gc insteadOf', 'gc pushInsteadOf',
+const cases = ['release --lane=1', 'release --all', 'release --all-pools', 'gc', 'gc insteadOf', 'gc pushInsteadOf',
   'gc credential.helper', 'gc core.gitProxy', 'gc core.askpass', 'gc http.proxy',
   'gc remote-alias-url', 'gc remote-alias-pushurl', 'gc remote-alias-normalized',
-  'release --lane=1 signing', 'release --all-pools signing', 'gc signing',
+  'release --lane=1 signing', 'release --all signing', 'release --all-pools signing', 'gc signing',
   'gc staged-card', 'gc staged-card-preserved-worktree'];
 
 export function replayRecoveryOrigin(root = ROOT, mode) {
@@ -76,9 +76,11 @@ export function replayRecoveryOrigin(root = ROOT, mode) {
       git(['remote', 'set-url', 'origin', callerOrigin], lane);
     }
     const release = mode.startsWith('release');
-    if (release) writeFileSync(join(lane, '.git', '.lane-lease'), JSON.stringify({
+    const leasePath = join(lane, '.git', '.lane-lease');
+    const leaseBytes = JSON.stringify({
       session: 'origin-proof', holder: 'origin-proof', purpose: 'soak', acquiredAt: new Date().toISOString(),
-    }));
+    });
+    if (release) writeFileSync(leasePath, leaseBytes);
     const bin = join(base, 'bin');
     mkdirSync(bin);
     for (const [name, body] of [['claude', 'echo "[]"'], ['lsof', 'exit 0'], ['gh', 'exit 1']]) {
@@ -96,7 +98,21 @@ export function replayRecoveryOrigin(root = ROOT, mode) {
         PATH: `${bin}:${process.env.PATH}` },
     });
     const violations = [];
-    if (result.status !== 0) violations.push(`${mode}: CLI failed (${result.status}): ${String(result.error || result.stderr).slice(0, 500)}`);
+    // Refused transport leaves this unique commit unpreserved: release must now
+    // fail closed and retain the lease, while gc still succeeds without reclaiming.
+    const refusedRelease = release && signing;
+    const expectedStatus = refusedRelease ? 1 : 0;
+    if (result.status !== expectedStatus) violations.push(`${mode}: expected CLI exit ${expectedStatus}, got ${result.status}: ${String(result.error || result.stderr).slice(0, 500)}`);
+    if (refusedRelease) {
+      if (!result.stderr.includes('UNPUSHED_WORK') || !result.stderr.includes(sha.slice(0, 12))) {
+        violations.push(`${mode}: did not identify unpreserved work in release refusal`);
+      }
+      if (!existsSync(leasePath) || readFileSync(leasePath, 'utf8') !== leaseBytes) {
+        violations.push(`${mode}: changed or removed lease despite unpreserved work`);
+      }
+    } else if (release && existsSync(leasePath)) {
+      violations.push(`${mode}: preserved work but did not release lease`);
+    }
     const saved = git(['ls-remote', '--heads', origin, 'refs/heads/salvage/*'], primary);
     const leaked = git(['ls-remote', '--heads', callerOrigin, 'refs/heads/salvage/*'], primary);
     if (leaked) violations.push(`${mode}: work sent to caller origin`);
