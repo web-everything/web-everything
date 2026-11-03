@@ -63,7 +63,7 @@ describe('observeRoundCap', () => {
     const file = join(dir, '2026-10.jsonl');
     const rows = readFileSync(file, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
     expect(rows).toHaveLength(1);
-    expect(rows[0].line).toBe('round-judge-shadow: #77 verdict=non-converging reasons=new-finding-class-each-round:2-rounds-1-new-findings');
+    expect(rows[0].line).toBe('round-judge-shadow: #77 verdict=non-converging reasons=new-finding-class-each-round:2-rounds-1-new-findings;route-to-redesign-D-R451');
     expect(rows[0].evidence).toMatchObject({ latestCount: 1, prevCount: 1, trend: 'changing' });
     expect(lines[0]).toMatch(/^round-judge-shadow: #77 verdict=non-converging .*source=env/);
     expect(observeRoundCap({ pr: 77, subject: subject(), env: env(), dir, now: Date.UTC(2026, 9, 21) })).toMatchObject({ skipped: 'already-logged' });
