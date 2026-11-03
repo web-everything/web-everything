@@ -322,7 +322,7 @@ describe('only an actively running session owns a PR', () => {
 
 // R437: the running shell, not just the pure evaluator, must cover fresh updatedAt.
 it('R437 evaluates every open PR, records state clocks and audits dependency order', async () => {
-  const rows = [{ ...pr, headRefOid: 'a'.repeat(40), number: 6193, body: '> blocked by #1', comments: [{ body: 'depends on #6244' }], updatedAt: new Date(now).toISOString() },
+  const rows = [{ ...pr, headRefOid: 'a'.repeat(40), number: 6193, body: '> blocked by #1', comments: [{ body: 'depends on #6244', author: { login: 'chalbert' } }], updatedAt: new Date(now).toISOString() },
     { ...pr, headRefOid: 'a'.repeat(40), number: 6244, labels: ['red-team:pending'], stateSince: now - 420 * 60000, updatedAt: new Date(now).toISOString() }];
   const lines = [];
   const out = await runPrSweep({ now, settings: { value: settings, sources: {} }, config: {},

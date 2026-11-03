@@ -9,7 +9,7 @@ it('ignores quotes, fenced code, inline code and self references', () => {
   expect(buildBlockedMap([{ number: 6, body, comments: [] }]).blockedBy.get(6)).toEqual([]);
 });
 it('reads body, comments and refusal reason, builds reverse links and keeps stable priority', () => {
-  const prs = [{ number: 6193, body: 'blocked by #6244', comments: [{ body: 'depends on #7' }], refusalReason: 'waiting on #8' }, { number: 6244 }];
+  const prs = [{ number: 6193, body: 'blocked by #6244', comments: [{ body: 'depends on #7', author: { login: 'chalbert' } }], refusalReason: 'waiting on #8' }, { number: 6244 }];
   // All three referenced targets are confirmed open; preserve coverage of each text source.
   const map = buildBlockedMap([...prs, { number: 7 }, { number: 8 }]);
   expect(map.blockedBy.get(6193)).toEqual([6244, 7, 8]);

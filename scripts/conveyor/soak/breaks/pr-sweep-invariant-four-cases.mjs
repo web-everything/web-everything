@@ -32,7 +32,7 @@ export default {
     if (!rows.find(p => p.number === 6193)?.nextAction?.includes('blocked-by #6244')) violations.push('blocked-by #6244 missing');
     if (rows.find(p => p.number === 6268)?.nextAction !== 'close into card') violations.push('empty diff not closed into card');
     // Additional replay: body-only reverse dependency and repeated fix-tool refusal.
-    const refusal = value => ({ name: 'fix-dispatch-daemon', kind: 'refusal', at: now,
+    const refusal = value => ({ name: 'fix-dispatch-daemon', kind: 'refusal', at: now, head: base.headRefOid,
       reason: `dispatch-lane: the value for {{SCOPE}} ("${value}") has characters the brief cannot carry safely. Refusing.` });
     const added = await runPrSweep({ now, dryRun: true, env: {}, config: {},
       settings: { value: { repos: [repo], idleMinutes: 45, stuckAlertMinutes: 90, toolingDeadlineMinutes: 240 }, sources: {} },

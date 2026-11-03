@@ -4,6 +4,8 @@
     "intervalMinutes": 30,
     "idleMinutes": 45,
     "toolingDeadlineMinutes": 240,
+    "blockedWaitMinutes": 480,
+    "toolingRefusalWindowMinutes": 360,
     "stuckAfterMinutes": 90,
     "stuckAlertMinutes": 90,
     "stalledAfterMinutes": 45,

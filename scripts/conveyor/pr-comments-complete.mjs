@@ -46,7 +46,7 @@ export function createOpenPrCommentReader({ exec = execRead, env = process.env, 
     return JSON.parse(exec('gh', args, { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, maxBuffer: 64 * 1024 * 1024 }));
   };
   return repo => {
-    const prs = gh(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '1000', '--json', 'number,title,labels,isDraft,updatedAt,headRefOid,changedFiles,additions,body,comments']);
+    const prs = gh(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '1000', '--json', 'number,title,labels,isDraft,updatedAt,headRefOid,changedFiles,additions,body,comments,author']);
     if (!Array.isArray(prs) || prs.length >= 1000 || prs.some(pr => !Array.isArray(pr?.comments) || pr.comments.some(c => typeof c?.body !== 'string'))) {
       throw Error('incomplete PR/comment listing; operator must inspect discovery before resolving alerts');
     }

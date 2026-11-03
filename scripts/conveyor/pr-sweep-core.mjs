@@ -83,11 +83,20 @@ export function repeatDue(record, now, backoff) {
     && now - record.lastAlertAt >= backoff[Math.min(Math.max(0, (record.alertCount ?? 1) - 1), backoff.length - 1)] * 60000;
 }
 /** Compare full reasons before shortening for display: different long failures stay distinct. */
-function repeatedToolingRefusal(daemons) {
+function repeatedToolingRefusal(daemons, pr, owner, now, settings) {
+  const headAt = ms(pr.headPushedAt ?? pr.pushedAt ?? pr.updatedAt);
+  const recent = daemons.filter(entry => {
+    const at = ms(entry.at), head = entry.head ?? entry.headRefOid;
+    return entry.kind === 'refusal' && ['fix-dispatch-daemon', 'reconcile-fix-dispatch-daemon'].includes(entry.name)
+      && typeof entry.reason === 'string' && Number.isFinite(at) && at <= now
+      && now - at <= (settings.toolingRefusalWindowMinutes ?? 360) * 60000
+      && (head != null ? head === pr.headRefOid : Number.isFinite(headAt) && at > headAt);
+  });
+  const latest = Math.max(...recent.map(entry => ms(entry.at)));
+  const progress = ms(owner.ownerLastSeenAt);
+  if (owner.state === 'active' && Number.isFinite(progress) && progress <= now && progress > latest) return null;
   const counts = new Map();
-  for (const entry of daemons) {
-    if (entry.kind !== 'refusal' || !['fix-dispatch-daemon', 'reconcile-fix-dispatch-daemon'].includes(entry.name)
-      || typeof entry.reason !== 'string') continue;
+  for (const entry of recent) {
     const reason = entry.reason
       .replace(/\b\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)?\b/g, '')
       .replace(/^.*?\brefused\b[^\n]*?\s[—–]\s/, '')
@@ -102,7 +111,7 @@ function repeatedToolingRefusal(daemons) {
 }
 /** PURE: one owner, action, deadline and violation for every open PR. */
 export function evaluateInvariant(pr, owner = {}, { now, since = now, settings = {}, blockedBy = [], daemons = [] } = {}) {
-  const toolingReason = !blockedBy.length && pr.changedFiles !== 0 ? repeatedToolingRefusal(daemons) : null;
+  const toolingReason = !blockedBy.length && pr.changedFiles !== 0 ? repeatedToolingRefusal(daemons, pr, owner, now, settings) : null;
   if (toolingReason) {
     const state = `blocked-by-tooling (${toolingReason})`;
     return { owner: 'tooling', state, violation: state, nextAction: `fix tooling: ${toolingReason}`,
@@ -120,12 +129,12 @@ export function evaluateInvariant(pr, owner = {}, { now, since = now, settings =
   const budget = !emptyDiff && blockedBy.length ? 'wait-on' : nextAction;
   const configured = settings.deadlineMinutes;
   // The settings cascade accepts a global scalar as well as per-action budgets.
-  const minutes = (Number.isFinite(configured) && configured > 0 ? configured : configured?.[budget]) ?? DEADLINE_MINUTES[budget] ?? 45;
+  const minutes = !emptyDiff && blockedBy.length ? (settings.blockedWaitMinutes ?? 480) : (Number.isFinite(configured) && configured > 0 ? configured : configured?.[budget]) ?? DEADLINE_MINUTES[budget] ?? 45;
   const deadline = new Date(stateSince(pr, since, now) + minutes * 60000).toISOString();
   const lastSignal = ms(owner.ownerLastSeenAt);
   const stale = owner.state === 'unknown' || owner.state === 'stuck'
     || (Number.isFinite(lastSignal) ? now - lastSignal > (settings.idleMinutes ?? 45) * 60000 : !['active', 'waiting-operator'].includes(owner.state) && now - stateSince(pr, since, now) > (settings.idleMinutes ?? 45) * 60000);
-  const violation = emptyDiff ? 'empty-diff' : blockedBy.length ? 'waiting-on-blocked'
+  const violation = emptyDiff ? 'empty-diff' : blockedBy.length ? (now > Date.parse(deadline) ? 'deadline-passed' : 'waiting-on-blocked')
     : unreadable ? 'owner-stale' : !labels.length ? 'no-labels'
     : now > Date.parse(deadline) ? 'deadline-passed' : stale ? 'owner-stale' : null;
   const implied = nextAction === 'fix' || nextAction === 'rebase' ? 'daemon:fix-dispatch-daemon' : nextAction.startsWith('await-') ? 'daemon:review-daemon' : 'operator';
@@ -138,11 +147,18 @@ export function planSweep({ idle, owners, prevState = {}, needsYou, now, setting
   const report = { idle: idle.map((p) => ({ ...p, ...owners[prKey(p)] })), needsYou: needsYou ?? null, needsYouAdded: [] };
   for (const p of idle) {
     const key = prKey(p); const owner = owners[key];
-    if (!ownerReadsOk || !prsReadOk || !['none', 'stuck', 'unknown'].includes(owner?.state)) continue;
+    if (!ownerReadsOk || !prsReadOk) continue;
     const old = prevState.episodes?.[key];
+    const blocked = p.changedFiles !== 0 && p.blockedBy?.length > 0;
+    const expired = blocked && now > p.blockedDeadline;
+    if (blocked && !expired) {
+      if (old) episodes[key] = { ...old };
+      continue;
+    }
+    if (!expired && !['none', 'stuck', 'unknown'].includes(owner?.state)) continue;
     const fingerprint = stateFingerprint(p);
     const same = settings.alertBackoffMinutes ? (old?.fingerprint === fingerprint || (!old?.fingerprint && old?.head === p.headRefOid && old?.updatedAt === p.updatedAt)) : old?.head === p.headRefOid && old?.updatedAt === p.updatedAt;
-    const episode = same ? { ...old } : { head: p.headRefOid, updatedAt: p.updatedAt, fingerprint, firstUnownedAt: now, alerted: false };
+    const episode = same || (blocked && old?.head === p.headRefOid) ? { ...old } : { head: p.headRefOid, updatedAt: p.updatedAt, fingerprint, firstUnownedAt: expired ? p.blockedSince : now, alerted: false };
     episode.fingerprint = fingerprint;
     if (episode.alerted && settings.alertBackoffMinutes && !Number.isFinite(episode.lastAlertAt)) {
       episode.lastAlertAt = now; episode.alertCount = episode.alertCount ?? 1;
@@ -150,9 +166,11 @@ export function planSweep({ idle, owners, prevState = {}, needsYou, now, setting
     // An unreadable owner keeps the episode clock running but waits twice as long,
     // so a brief unreadable tick never alerts and a permanent one still does.
     const alertAfter = settings.stuckAlertMinutes * (owner.state === 'unknown' ? 2 : 1);
-    if ((!episode.alerted && now - episode.firstUnownedAt > alertAfter * 60000) || repeatDue(episode, now, settings.alertBackoffMinutes)) {
-      alerts.push({ kind: 'pr-stuck', title: 'PR movement stalled', body: `${key} ${p.title}: ${owner.why}`, key }); episode.alerted = true; episode.lastAlertAt = now; episode.alertCount = (episode.alertCount ?? 0) + 1;
+    if ((expired && !episode.blockedExpiryAlerted) || (!episode.alerted && now - episode.firstUnownedAt > alertAfter * 60000) || repeatDue(episode, now, settings.alertBackoffMinutes)) {
+      alerts.push({ kind: 'pr-stuck', title: 'PR movement stalled', body: `${key} ${p.title}: ${blocked ? p.blockedBy.map(n => `blocked-by #${n}`).join(', ') + '; deadline-passed' : owner.why}`, key }); episode.alerted = true; episode.lastAlertAt = now; episode.alertCount = (episode.alertCount ?? 0) + 1;
     }
+    if (expired && episode.alerted) episode.blockedExpiryAlerted = true;
+    if (!blocked) delete episode.blockedExpiryAlerted;
     episodes[key] = episode;
     if (settings.dispatchDiagnosis && (owner.state === 'stuck' || episode.alerted)) diagnose.add(p.repo);
   }

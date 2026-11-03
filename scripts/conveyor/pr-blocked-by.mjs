@@ -1,5 +1,6 @@
 /** R437: report-only PR dependency edges. All text is untrusted Markdown; no IO. */
 import MarkdownIt from 'markdown-it';
+import { isTrustedSupersedeAuthor } from './supersede-rule.mjs';
 const markdown = new MarkdownIt();
 function dependencyText(text) {
   // Block tokens account for indentation, nesting and lazy blockquote continuation;
@@ -49,7 +50,14 @@ export function buildBlockedMap(prs) {
   const openNumbers = new Set(openPrs.map(pr => Number(pr.number ?? pr.pr)));
   for (const pr of openPrs) {
     const number = Number(pr.number ?? pr.pr);
-    const texts = [pr.body, ...(Array.isArray(pr.comments) ? pr.comments.map(c => typeof c === 'string' ? c : c.body) : []),
+    const author = pr.author?.login;
+    const comments = (Array.isArray(pr.comments) ? pr.comments : []).filter(c => {
+      const principal = { author: c?.author ?? c?.user };
+      const login = principal.author?.login;
+      return isTrustedSupersedeAuthor(principal) || (typeof author === 'string' && author.trim() !== ''
+        && typeof login === 'string' && login.toLowerCase() === author.toLowerCase());
+    });
+    const texts = [pr.body, ...comments.map(c => c.body),
       pr.refusalReason, pr.fixDaemonRefusalReason, ...(pr.daemons ?? []).filter(d => d.kind === 'refusal').map(d => d.reason)];
     const refs = [...new Set(texts.flatMap(parseBlockedBy))].filter(n => n !== number && openNumbers.has(n));
     blockedBy.set(number, refs);
@@ -62,7 +70,22 @@ export function buildBlockedMap(prs) {
       unblocks.set(number, [...new Set([...(unblocks.get(number) ?? []), target])]);
     }
   }
-  return { blockedBy, unblocks };
+  // Remove every edge participating in a cycle, using the original graph so
+  // removing one edge cannot accidentally preserve another edge in that cycle.
+  const reaches = (start, target) => {
+    const pending = [start], seen = new Set();
+    while (pending.length) {
+      const node = pending.pop();
+      if (node === target) return true;
+      if (seen.has(node)) continue;
+      seen.add(node); pending.push(...(blockedBy.get(node) ?? []));
+    }
+    return false;
+  };
+  const acyclic = new Map([...blockedBy].map(([number, refs]) => [number, refs.filter(n => !reaches(n, number))]));
+  unblocks.clear();
+  for (const [number, refs] of acyclic) for (const n of refs) unblocks.set(n, [...(unblocks.get(n) ?? []), number]);
+  return { blockedBy: acyclic, unblocks };
 }
 export function sortUnblockersFirst(rows) {
   return [...rows].sort((a, b) => Number(!!b.unblocks?.length) - Number(!!a.unblocks?.length));

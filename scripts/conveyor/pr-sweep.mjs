@@ -28,7 +28,7 @@ const SELF = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(SELF), '../..');
 const exec = promisify(execFile);
 const command = async (bin, args, env) => (await exec(bin, args, { env, encoding: 'utf8', timeout: 120000, maxBuffer: 16 * 1024 * 1024 })).stdout;
-const DEFAULTS = { toolingDeadlineMinutes: 240, alertBackoffMinutes: [30, 60, 120, 240], deadlineMinutes: DEADLINE_MINUTES, enabled: true, intervalMinutes: 30, idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90, sessionActiveWithinMinutes: 30, dispatchDiagnosis: false, repos: [CONSTELLATION_REPOS.we.slug, CONSTELLATION_REPOS['plateau-app'].slug] };
+const DEFAULTS = { blockedWaitMinutes: 480, toolingRefusalWindowMinutes: 360, toolingDeadlineMinutes: 240, alertBackoffMinutes: [30, 60, 120, 240], deadlineMinutes: DEADLINE_MINUTES, enabled: true, intervalMinutes: 30, idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90, sessionActiveWithinMinutes: 30, dispatchDiagnosis: false, repos: [CONSTELLATION_REPOS.we.slug, CONSTELLATION_REPOS['plateau-app'].slug] };
 export function resolvePrSweepSettings({ config = {}, env = process.env, read = readFileSync, log = console.error } = {}) {
   const errors = []; let tool = {};
   try { tool = JSON.parse(read(join(ROOT, 'scripts/settings/pr-sweep.json'), 'utf8')).prSweep; } catch (e) { errors.push(`settings: ${e.message}`); }
@@ -195,13 +195,16 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
       return value.alertBackoffMinutes ? { ...item, labels: decision.labels } : item;
     }
     return { ...item, labels: decision.labels, blockedBy: decision.blockedBy, unblocks: decision.unblocks,
-      owner: decision.owner, nextAction: decision.nextAction, deadline: decision.deadline,
-      ...(['empty-diff', 'waiting-on-blocked'].includes(decision.violation) ? { lane: 'operator', state: decision.violation, reason: decision.nextAction, action: decision.nextAction } : {}) };
+      ...(decision.violation ? { owner: decision.owner, nextAction: decision.nextAction, deadline: decision.deadline } : {}),
+      ...((['empty-diff', 'waiting-on-blocked'].includes(decision.violation) || (decision.blockedBy.length && decision.violation === 'deadline-passed')) ? { lane: 'operator', state: decision.violation, reason: decision.nextAction, action: decision.nextAction } : {}) };
   };
   // Keep the legacy idle report, while ownership and episodes cover every open PR.
-  const episodePrs = prs.filter(p => p.changedFiles === 0 || !dependencies.get(prKey(p)).blockedBy.length);
+  const episodePrs = prs.map(p => {
+    const key = prKey(p), decision = decisions.find(d => prKey(d) === key);
+    return { ...p, ...dependencies.get(key), blockedSince: clocks[key].since, blockedDeadline: Date.parse(decision.deadline) };
+  });
   const planned = planSweep({ idle: episodePrs, owners, prevState: previous ?? {}, needsYou: needsYou && sortUnblockersFirst(needsYou.map(p => ({ ...p, ...dependencies.get(prKey(p)) }))), now, settings: value, ownerReadsOk, prsReadOk });
-  planned.report.idle = sortUnblockersFirst(idle.map(p => ({ ...p, ...owners[prKey(p)], ...dependencies.get(prKey(p)), ...(p.changedFiles === 0 ? { state: 'empty-diff', why: 'close into card' } : dependencies.get(prKey(p))?.blockedBy.length ? { state: 'waiting-on-blocked', why: dependencies.get(prKey(p)).blockedBy.map(n => `blocked-by #${n}`).join(', ') } : {}) })));
+  planned.report.idle = sortUnblockersFirst(idle.map(p => ({ ...p, ...owners[prKey(p)], ...dependencies.get(prKey(p)), ...(p.changedFiles === 0 ? { state: 'empty-diff', why: 'close into card' } : dependencies.get(prKey(p))?.blockedBy.length ? { state: decisions.find(d => prKey(d) === prKey(p)).violation, why: dependencies.get(prKey(p)).blockedBy.map(n => `blocked-by #${n}`).join(', ') } : {}) })));
   planned.nextState.invariantClocks = clocks;
   const report = { decisions, at: new Date(now).toISOString(), settings: value, sources: resolved.sources, ...planned.report, alerts: planned.alerts, diagnose: planned.diagnose, nextState: planned.nextState, errors };
   const detect = async () => {
@@ -239,6 +242,8 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
         episode.alerted = old?.alerted ?? false;
         episode.lastAlertAt = old?.lastAlertAt;
         episode.alertCount = old?.alertCount ?? 0;
+        if (old?.blockedExpiryAlerted !== undefined) episode.blockedExpiryAlerted = old.blockedExpiryAlerted;
+        else delete episode.blockedExpiryAlerted;
       }
       if (!sent && alert.kind === 'needs-you') needsYouSendFailed = true;
     }
@@ -275,11 +280,16 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
         action: p.nextAction, reason: `${p.nextAction}; owner=${p.owner}; deadline=${p.deadline}`,
         command: `gh pr view ${p.number} --repo ${p.repo} --comments`,
         evidence: [`owner=${p.owner}`, `next=${p.nextAction}`, `deadline=${p.deadline}`] })) : [];
-      const published = [...invariantItems, ...(sweepDigestEnabled ? out.items ?? [] : []).map(annotate)
-        .filter(i => !invariantItems.some(p => p.repo === i.repo && p.pr === i.pr))];
+      const sweepItems = (sweepDigestEnabled ? out.items ?? [] : []).map(annotate);
+      const findings = [...sweepItems, ...detector.items.map(annotate).filter(d => !sweepItems.some(i =>
+        i.lane === 'operator' && i.repo === d.repo && i.pr === d.pr && String(i.head).toLowerCase() === String(d.head).toLowerCase()))];
+      const samePr = (a, b) => a.repo === b.repo && a.pr === b.pr;
+      const violations = invariantItems.filter(i => decisions.some(p => p.violation && p.repo === i.repo && p.number === i.pr));
+      const published = [...violations, ...findings.filter(i => !violations.some(p => samePr(p, i))),
+        ...invariantItems.filter(i => !violations.includes(i) && !findings.some(p => samePr(p, i)))];
       // A skipped (not-due) sweep has no items, so publishing would clear its open ones: wait for a pass that ran.
       if (out.dir && (out.items || out.mode === 'off' || out.digest === false)) {
-        const d = stallDigest({ ...out, items: sortUnblockersFirst([...published, ...detector.items.map(annotate).filter(d => !published.some(i => i.lane === 'operator' && i.repo === d.repo && i.pr === d.pr && String(i.head).toLowerCase() === d.head))]),
+        const d = stallDigest({ ...out, items: sortUnblockersFirst(published),
           incomplete: out.incomplete || !prsReadOk || (sweepDigestEnabled && !ownerReadsOk) || detectorErrors.length > 0 },
         { now, env, stateDir: out.dir, notify, alertBackoffMinutes: value.alertBackoffMinutes,
           enabled: sweepDigestEnabled || invariantItems.length > 0 || detector.items.length > 0 || detector.enabled });

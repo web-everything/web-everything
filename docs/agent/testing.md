@@ -3871,3 +3871,18 @@ and digits; truncate only the displayed reason to 80 characters. Explicit blocke
 empty-diff closure keep precedence. `prSweep.toolingDeadlineMinutes` defaults to 240
 through the existing policy cascade and provenance logger. The added soak replay retains
 the original four incident cases and exercises body-only reverse edges and tooling precedence.
+
+R437 audit hardening: dependency comments count only from the PR author or the shared
+supersede trusted-author gate; discovery must request PR `author` metadata. Body and
+fix-daemon refusal dependencies retain their sources. Drop every cycle-participating edge
+before deriving reverse links. Blocked waits preserve existing stall episodes and their
+alert history; after `prSweep.blockedWaitMinutes` (480 by default), report `deadline-passed`
+with the blocker annotation and alert even if an owner is active.
+Unblocks-only invariant rows annotate existing sweep/detector findings without replacing
+their reason or remediation; retain same-head operator deduplication.
+Tooling refusals must match the current head, or be unheaded and strictly newer than the
+head push time (falling back to `updatedAt`), and fall within
+`prSweep.toolingRefusalWindowMinutes` (360 by default). Newer active-owner progress cancels
+the tooling inference. Both bounds use the existing cascade and provenance logger.
+`scripts/conveyor/__tests__/pr-sweep-audit.test.mjs` pins these trust, expiry, cycle, merge,
+attribution and progress guarantees, including unknown timestamps and invalid settings.
