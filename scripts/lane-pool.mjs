@@ -2578,6 +2578,13 @@ async function cmdAcquire(repo) {
         // blip, the #2924 re-verify, a bad `--base`, an npm hiccup) — none of which are reasons to give up on
         // every OTHER candidate this pool might still offer.
         try {
+          // `--no-reset` skips every dirty/ahead check inside provisionClaimedLane, but a lane named by the (possibly
+          // event-refreshed) free list may have changed since it was published: auto-pick may only hand out a lane
+          // PROVEN clean and fully pushed right now. A failed probe (null) is not proof, so it is refused too.
+          if (flags['no-reset']) {
+            const snap = laneStateSnapshot(laneDir(repo, pick), `origin/${repo.branch}`);
+            if (snap.dirty !== 0 || snap.unpushed !== false) throw new Error(`lane-${pick} is not provably clean and pushed (dirty=${snap.dirty}, unpushed=${snap.unpushed}) — --no-reset will not hand it out`);
+          }
           provisionClaimedLane(repo, pick, false); // auto-pick never targets a reserved lane
           chosen = pick;
           break;

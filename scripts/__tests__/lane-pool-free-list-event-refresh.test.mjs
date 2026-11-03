@@ -108,6 +108,16 @@ describe('free-lane list is refreshed by lane-pool events', () => {
     expect(readFreeLaneList(listFile()).lanes.map((l) => l.lane)).not.toContain(lane);
   });
 
+  it('auto-pick --no-reset never hands out a dirty lane that a (stale) list names as free', () => {
+    const { lane } = acquireOneLane();
+    expect(runPool(['release', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json']).code).toBe(0);
+    writeFileSync(join(laneDir(lane), 'file.txt'), 'edited after publication\n'); // dirties a tracked file
+    writeFileSync(listFile(), JSON.stringify({ v: 1, writtenAt: Date.now(), repo: 'freepool', poolDir: null, lanes: [{ lane, at: Date.now() }] }));
+    const r = runPool(['acquire', ...poolArgs(), '--no-reset', '--session=other', '--json']);
+    expect(r.code).not.toBe(0);
+    expect(readFileSync(join(laneDir(lane), 'file.txt'), 'utf8')).toBe('edited after publication\n');
+  });
+
   it('an acquire drops the lane from the list and keeps it fresh', () => {
     expect(runPool(['provision', '--count=1', ...poolArgs()]).code).toBe(0);
     writeFileSync(listFile(), JSON.stringify({ v: 1, writtenAt: 1, repo: 'freepool', poolDir: null, lanes: [{ lane: 1 }] }));
