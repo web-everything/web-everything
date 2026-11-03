@@ -110,7 +110,7 @@ describe('lane-pool release reaps known-safe litter (#3568)', () => {
     writeFileSync(join(dir, 'file.txt'), 'unpushed edit\n'); // modifies the tracked seed file
     writeFileSync(join(dir, '.commit-msg.txt'), 'WE #1: test\n'); // litter, alongside real work
 
-    const release = runPool(['release', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json']);
+    const release = runPool(['release', '--discard', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json']);
     expect(release.code).toBe(0);
     expect(JSON.parse(release.out).released).toBe(1);
 
@@ -137,7 +137,7 @@ describe('lane-pool release reaps known-safe litter (#3568)', () => {
     git(['commit', '--quiet', '-m', 'track a file that happens to share the litter allowlist name'], dir);
     writeFileSync(join(dir, '.commit-msg.txt'), 'modified — this is real tracked work\n');
 
-    const release = runPool(['release', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json']);
+    const release = runPool(['release', '--discard', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json']);
     expect(release.code).toBe(0);
     expect(JSON.parse(release.out).released).toBe(1);
 
@@ -173,7 +173,7 @@ describe('lane-pool release reaps known-safe litter (#3568)', () => {
     const head = git(['rev-parse', 'HEAD'], dir);
     expect(git(['status', '--porcelain'], dir)).toBe(''); // ahead, not dirty
 
-    const release = runPool(['release', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json']);
+    const release = runPool(['release', '--discard', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json']);
     expect(release.code).toBe(0);
     expect(JSON.parse(release.out).released).toBe(1);
 
@@ -271,16 +271,17 @@ syncBuiltinESMExports();\n`);
     })]);
   });
 
-  it('a status-read failure with no known cards does not block release', () => {
+  it('a status-read failure with no known cards refuses release and keeps the lease', () => {
     const { lane } = acquireOneLane();
     const dir = laneDir(lane);
     const hook = gitHook(dir, `if (cmd === 'git' && opts?.cwd === lane && args.includes('status')) throw new Error('forced unreadable status');`);
     const release = runPool(['release', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json'], hook);
-    expect(release.code).toBe(0);
-    expect(JSON.parse(release.out).released).toBe(1);
+    expect(release.code).toBe(1);
+    expect(JSON.parse(release.out).released).toBe(0);
     expect(release.out + release.err).toContain('card salvage skipped');
-    expect(existsSync(join(dir, '.git', '.lane-lease'))).toBe(false);
+    expect(existsSync(join(dir, '.git', '.lane-lease'))).toBe(true);
     expect(existsSync(join(base, 'salvage'))).toBe(false);
+    expect(release.err).toContain('UNPUSHED_WORK');
   });
 
   it.each(['litter cleanup', 'salvage recheck'])('lease changed during %s prevents card retirement', stage => {
@@ -340,7 +341,7 @@ syncBuiltinESMExports();\n`);
     leaveCards(dir);
     writeFileSync(join(dir, 'file.txt'), 'real edit\n');
     const before = git(['status', '--porcelain', '--untracked-files=all'], dir);
-    const release = runPool(['release', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json']);
+    const release = runPool(['release', '--discard', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json']);
     expect(release.code).toBe(0);
     expect(git(['status', '--porcelain', '--untracked-files=all'], dir)).toBe(before);
     expect(existsSync(join(base, 'salvage'))).toBe(false);

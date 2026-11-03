@@ -35,7 +35,7 @@ export async function salvagePushLane({ lane, laneDir, io, now = () => new Date(
       if (pushed?.ok !== true) throw new Error('salvage push refused');
       if (await io.remoteSha(ref) !== ahead[0]) throw new Error('salvage remote SHA verification failed');
       await io.record(lane, `${ref} ${ahead[0]}\n`);
-      return { status: 'pushed', ref, unmatched };
+      return { status: 'pushed', ref, sha: ahead[0], unmatched };
     }
     throw new Error('100 salvage names occupied; inspect remote salvage branches and retry next minute');
   } catch (e) {
