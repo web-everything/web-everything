@@ -21,6 +21,10 @@ export default {
   async run({ sourceRoot = ROOT } = {}) {
     const violations = [];
     const check = (ok, why) => { if (!ok) violations.push(why); };
+    // This replay describes codex-first routing; the shipped routing.builder=claude holds Codex for builds
+    // (covered in routing-settings.test.mjs). Pin the builder for this run only, then restore it.
+    const priorBuilder = process.env.WE_ROUTING_BUILDER;
+    process.env.WE_ROUTING_BUILDER = 'codex';
     const load = path => import(pathToFileURL(join(sourceRoot, path)).href);
     try {
       const { resolveDispatchRoute } = await load('scripts/lib/dispatch-routing-policy-io.mjs');
@@ -70,6 +74,10 @@ export default {
         }
       }
     } catch (error) { violations.push(error.message); }
+    finally {
+      if (priorBuilder === undefined) delete process.env.WE_ROUTING_BUILDER;
+      else process.env.WE_ROUTING_BUILDER = priorBuilder;
+    }
     return { violations };
   },
   judge: report => report.violations,
