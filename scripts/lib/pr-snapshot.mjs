@@ -103,6 +103,10 @@ function candidateSmokeEnv(env, smokeChild) {
 /** True only when the caller DECLARED a smoke sample (WE_PR_SNAPSHOT_SAMPLE) — smoke/dry-run, never a normal read. */
 export function sampleDeclared(env = process.env) { return positiveInteger(env?.[WE_PR_SNAPSHOT_SAMPLE]) > 0; }
 
+/** The smoke/dry-run context where a sampled snapshot is legitimate: the sample env is set, or this is a rebuild-smoke
+ *  child (WE_SMOKE_LIVE_CLONE — the sample is then injected from settings, not present in process.env). */
+export function sampleContextDeclared(env = process.env) { return sampleDeclared(env) || Boolean(env?.WE_SMOKE_LIVE_CLONE); }
+
 /** A declared sample is NOT truncation: mark it `sampled` (non-enumerable) so readers accept it only while the sample
  *  env is set. Real truncation (`snap.truncated`) always fails closed; a shortfall with no declared sample too. */
 function smokeProjection(snap, fields, env) {

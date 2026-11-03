@@ -82,7 +82,7 @@ import { resolve } from 'node:path';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { codeqlFailureEvidence } from '../lib/codeql-gate.mjs';
 import { makeFixEvidenceReader, checkFixFacts } from '../lib/fix-facts.mjs';
-import { readSharedOpenPrs, sampleDeclared } from '../lib/pr-snapshot.mjs';
+import { readSharedOpenPrs, sampleContextDeclared } from '../lib/pr-snapshot.mjs';
 import { prSnapshotEnabled } from '../lib/pr-snapshot-store.mjs';
 import { listOpenPrsPagedHydrated, resolvePrListPaging, assertInventoryComplete, parseListOutput } from '../lib/pr-list-paged.mjs';
 import { ghRestGetJson } from '../lib/gh-rest-read.mjs';
@@ -328,7 +328,7 @@ const authorByPr = new Map();
  *  Shape matches `gh pr list --json author`. A failed/empty read FAILS CLOSED (the 5xx retry wrapper covers a transient one). */
 export function withRestAuthors(rows, { repo, readRest = ghRestGetJson } = {}) {
   if (!repo) return rows;
-  return rows.map(pr => {
+  const out = rows.map(pr => {
     if (pr?.author || !Number.isInteger(pr?.number)) return pr;
     const key = `${repo}#${pr.number}`;
     if (!authorByPr.has(key)) {
@@ -340,6 +340,8 @@ export function withRestAuthors(rows, { repo, readRest = ghRestGetJson } = {}) {
     }
     return { ...pr, author: authorByPr.get(key) };
   });
+  for (const flag of ['sampled', 'discoveryIncomplete']) if (rows[flag] === true) Object.defineProperty(out, flag, { value: true }); // .map drops non-enumerable flags
+  return out;
 }
 
 export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, readCommits = fetchPrCommits, attributionRepo = repo, readComments, factCache = null,
@@ -405,8 +407,8 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
     const listed = withListRetry(() => {
       const shared = readShared({ repo, fields: SNAPSHOT_LIST_FIELDS, allowDeferred: true });
       if (shared) {
-        // A declared smoke sample (WE_PR_SNAPSHOT_SAMPLE, smoke/dry-run) is accepted; a sample flag with no declared sample is not.
-        if (shared.sampled === true && !sampleDeclared(process.env)) throw Object.assign(new Error(`open-PR snapshot for ${repo} is a sample but no sample is declared — refusing a partial inventory`), { code: 'pr-list-truncated' });
+        // A declared smoke sample (WE_PR_SNAPSHOT_SAMPLE or a rebuild-smoke child) is accepted; a sample flag in a live read is not.
+        if (shared.sampled === true && !sampleContextDeclared(process.env)) throw Object.assign(new Error(`open-PR snapshot for ${repo} is a sample but no sample is declared — refusing a partial inventory`), { code: 'pr-list-truncated' });
         if (shared.discoveryIncomplete === true) throw Object.assign(new Error(`open-PR snapshot for ${repo} is truncated — refusing a partial inventory`), { code: 'pr-list-truncated' });
         return Array.isArray(shared) ? withRestAuthors(shared, { repo, readRest }) : shared; // author lookups sit INSIDE the retried read
       }
