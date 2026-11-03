@@ -36,9 +36,9 @@ export function passesInWindow(rawHistory, { now, windowMs = 30 * MIN } = {}) {
   return (rawHistory || []).filter((p) => p.valid !== false && now - p.at >= 0 && now - p.at <= windowMs).length;
 }
 
-/** PURE: recovery evidence in the window — a valid pass that merged something, or one that found nothing queued. Anything else is UNKNOWN. */
+/** PURE: recovery evidence in the window — a valid pass that merged something, or a CLEAN (exit 0, nothing failed) pass that found nothing queued; a failed or partial pass with zero candidates proves nothing. Anything else is UNKNOWN. */
 export function recovered(rawHistory, { now, windowMs = 30 * MIN } = {}) {
-  return (rawHistory || []).some((p) => p.valid !== false && now - p.at >= 0 && now - p.at <= windowMs && ((Number(p.merged) || 0) > 0 || (Number(p.considered) || 0) === 0));
+  return (rawHistory || []).some((p) => p.valid !== false && now - p.at >= 0 && now - p.at <= windowMs && ((Number(p.merged) || 0) > 0 || ((Number(p.considered) || 0) === 0 && p.exit === 0 && !(Number(p.failed) > 0))));
 }
 
 export default {

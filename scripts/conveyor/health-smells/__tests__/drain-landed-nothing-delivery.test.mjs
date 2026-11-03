@@ -80,4 +80,13 @@ describe('drain-landed-nothing delivery (real core + planner, default shadow mod
     const r = smell.evaluate({ drainHistory: [{ at: now - 5 * MIN, considered: 4, merged: 1 }, { at: now - 1 * MIN, considered: 3, merged: 0 }] }, { now });
     expect(r[0].breach).toBe(false);
   });
+  it('a failed pass with zero candidates is NOT recovery and does not close the stall', () => {
+    const s0 = open3();
+    const now = T0 + 40 * MIN;
+    const h = [{ at: now - 20 * MIN, considered: 4, merged: 0 }, { at: now - 5 * MIN, considered: 0, merged: 0, exit: 1, failed: 1 }, { at: now - 1 * MIN, considered: 0, merged: 0, exit: 1, failed: 0 }];
+    expect(smell.evaluate({ drainHistory: h }, { now })).toEqual([]);
+    const ok = smell.evaluate({ drainHistory: [{ at: now - 20 * MIN, considered: 4, merged: 0 }, { at: now - 1 * MIN, considered: 0, merged: 0, exit: 0, failed: 0 }] }, { now });
+    expect(ok[0].breach).toBe(false);
+    expect(s0).toBeTruthy();
+  });
 });

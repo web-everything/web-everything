@@ -15,7 +15,7 @@ describe('drain-landed-nothing', () => {
   });
   it('no breach when something merged, nothing was queued, or too few passes', () => {
     expect(landedNothing([pass(60), pass(20, { merged: 1 }), pass(3)], { now })).toBeNull();
-    expect(landedNothing([pass(60), pass(20, { considered: 0 }), pass(3, { considered: 0 })], { now })).toBeNull();
+    expect(landedNothing([pass(60), pass(20, { considered: 0, exit: 0 }), pass(3, { considered: 0, exit: 0 })], { now })).toBeNull();
     expect(landedNothing([pass(3)], { now })).toBeNull();
   });
   it('is a high-severity alert that repeats reminders (delivery proven in drain-landed-nothing-delivery.test.mjs)', () => {
