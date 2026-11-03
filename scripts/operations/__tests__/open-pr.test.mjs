@@ -9,9 +9,10 @@
  * verify marker, must not reach the network itself, and must not turn a home that could not run into a home
  * that refused. Several exist purely to stop a later "helpful" fallback from reopening the bypass.
  */
-import { describe, it, expect } from 'vitest';
-import { dirname, resolve } from 'node:path';
-import { readFileSync } from 'node:fs';
+import { describe, it, expect, vi } from 'vitest';
+import { dirname, join, resolve } from 'node:path';
+import { mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { importGraph } from './import-graph.mjs';
 import {
@@ -21,6 +22,11 @@ import {
 import { createPrLandRunner, createOpenPrSinks, PR_LAND_CLI, resolveGhCredentialEnv, deriveLaneRef } from '../open-pr-io.mjs';
 import { PARK_LABELS } from '../../pr-land.mjs';
 import { checkDuplicateBornAs } from '../../lib/duplicate-bornas-added.mjs';
+import { checkBodyFileLocation } from '../../lib/open-pr-body-location.mjs';
+import { writePrBody } from '../deliver-item-wrapper.mjs';
+import { landOne } from '../build-dispatch-hold-route-land.mjs';
+import { cardBatchStateDir } from '../card-batch-io.mjs';
+import { homedir } from 'node:os';
 
 const good = (over = {}) => ({
   ref: 'lane/open-pr-operation', base: 'main', title: 'a title', bodyFile: '/tmp/body.md',
@@ -670,6 +676,39 @@ describe('items 79/81 — truthful label-on-green outcome, credential env, --bra
 
 
 describe('PR body location admission', () => {
+  const location = (bodyFile, cwd = '/lanes/worker') => checkBodyFileLocation({ bodyFile, cwd, home: homedir(), tmp: tmpdir(), isTracked: () => false });
+
+  it('admits the actual deliver-item-wrapper body writer path', () => {
+    const writeFile = vi.fn();
+    const bodyFile = writePrBody({ item: '123', lane: '/lanes/worker', report: {} }, { writeFile });
+    expect(writeFile).toHaveBeenCalledWith(bodyFile, expect.any(String));
+    expect(location(bodyFile)).toEqual({ ok: true });
+  });
+
+  it('admits the actual hold-route open-pr body argument', () => {
+    let bodyFile;
+    const writeFile = vi.fn();
+    const result = landOne({ num: '123', route: 'out-of-scope', reason: 'requires preparation' }, {
+      acquireFn: () => ({ path: '/lanes/worker' }), releaseFn: () => {},
+      listCardNames: () => ['123-card.md'], readFile: () => '---\nscope: ["we:a.mjs"]\n---\n\n# Example\n', writeFile,
+      runFn: (_cmd, args) => {
+        if (!args.includes('open-pr')) return '';
+        bodyFile = args.find(arg => arg.startsWith('--bodyFile=')).slice('--bodyFile='.length);
+        return JSON.stringify({ findings: { submit: { effects: [{ type: 'open-pr.submit', status: 'applied', result: { outcome: 'opened', pr: 7 } }] } } });
+      },
+    });
+    expect(result).toMatchObject({ status: 'landed', pr: 7 });
+    expect(writeFile).toHaveBeenCalledWith(bodyFile, expect.any(String));
+    expect(location(bodyFile)).toEqual({ ok: true });
+  });
+
+  it('admits card-batch-seal bodies beside the default automation state', () => {
+    const caller = readFileSync(new URL('../card-batch-seal-io.mjs', import.meta.url), 'utf8');
+    expect(caller).toContain('bodyPath = `${statePath}.${lease.token}.body.md`');
+    const statePath = join(cardBatchStateDir({}), 'org-repo-prevention.json');
+    expect(location(`${statePath}.12345678-1234-1234-1234-123456789abc.body.md`)).toEqual({ ok: true });
+  });
+
   it.each(['body-file-shared-path', 'body-file-tracked'])('refuses %s before reading the body or spawning', code => {
     const calls = [];
     const run = createPrLandRunner({
@@ -705,6 +744,80 @@ describe('PR body location admission', () => {
 
 
 describe('real body tracking adapter', () => {
+  // Reuse the checkout's index read-only: these tests never stage files or write .git.
+  const root = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), '../../..'));
+  const trackedBody = 'scripts/operations/open-pr-io.mjs';
+  const runner = (cwd = root) => createPrLandRunner({
+    cwd, env: {}, readPrepBody: () => 'body', prepGate: () => ({ ok: true }),
+    prePrReview: () => ({ action: 'refuse', reason: 'next-gate', message: 'stop before publishing' }),
+  });
+  const submit = (run, bodyFile) => run({ argv: ['--ref=lane/x', `--body-file=${bodyFile}`] });
+
+  it('refuses an actually tracked file using the real Git index', () => {
+    expect(submit(runner(), join(root, trackedBody))).toMatchObject({ outcome: 'refused', reason: 'body-file-tracked' });
+  });
+
+  it('refuses an actually tracked file when cwd and the body use a symlinked checkout path', () => {
+    const scratch = mkdtempSync(join(tmpdir(), 'body-tracking-'));
+    try {
+      const alias = join(scratch, 'checkout');
+      symlinkSync(root, alias, 'dir');
+      expect(submit(runner(alias), join(alias, trackedBody))).toMatchObject({ outcome: 'refused', reason: 'body-file-tracked' });
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
+  });
+
+  it('refuses a parent-relative tracked body above a nested symlinked cwd', () => {
+    const scratch = mkdtempSync(join(tmpdir(), 'body-tracking-'));
+    try {
+      const alias = join(scratch, 'checkout');
+      symlinkSync(root, alias, 'dir');
+      expect(submit(runner(join(alias, 'scripts')), '../package.json'))
+        .toMatchObject({ outcome: 'refused', reason: 'body-file-tracked' });
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
+  });
+
+  it('allows an existing untracked file inside the repository through to the next gate', () => {
+    const scratch = mkdtempSync(join(root, '.fix-body-tracking-'));
+    try {
+      const bodyFile = join(scratch, 'body.md');
+      writeFileSync(bodyFile, 'body');
+      expect(submit(runner(), bodyFile)).toMatchObject({ reason: 'next-gate' });
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
+  });
+
+  it('allows an existing private body outside the worktree through to the next gate', () => {
+    const scratch = mkdtempSync(join(tmpdir(), 'we-scratch-tracking-'));
+    try {
+      const bodyFile = join(scratch, 'body.md');
+      writeFileSync(bodyFile, 'body');
+      expect(submit(runner(), bodyFile)).toMatchObject({ reason: 'next-gate' });
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
+  });
+
+  it('fails closed when real git ls-files exits with a corrupt-index error', () => {
+    const scratch = mkdtempSync(join(tmpdir(), 'body-tracking-'));
+    try {
+      const index = join(scratch, 'invalid-index');
+      writeFileSync(index, 'invalid index');
+      vi.stubEnv('GIT_INDEX_FILE', index);
+      const result = submit(runner(), join(root, trackedBody));
+      expect(result).toMatchObject({ outcome: 'refused', reason: 'body-file-shared-path' });
+      expect(result.detail).toContain('unable to verify Git tracking');
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed when real git cannot find a worktree', () => {
+    const scratch = mkdtempSync(join(tmpdir(), 'body-tracking-'));
+    try {
+      const result = submit(runner(scratch), join(scratch, 'body.md'));
+      expect(result).toMatchObject({ outcome: 'refused', reason: 'body-file-shared-path' });
+      expect(result.detail).toContain('unable to verify Git tracking');
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
+  });
+
   it.each(['/tmp/we-scratch-location-probe-abcdef123456/nonexistent/body.md', 'nonexistent-body-location-probe/notes/body.md'])('allows nonexistent body file %s through to the next gate', bodyFile => {
     const run = createPrLandRunner({
       env: {}, readPrepBody: () => 'body', prepGate: () => ({ ok: true }),

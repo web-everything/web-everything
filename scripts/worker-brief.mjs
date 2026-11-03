@@ -3,6 +3,7 @@ import { testsFirstWorkerRule } from './lib/tests-first-policy.mjs';
 import { resolveFreeScopeSettings } from './operations/free-scope-io.mjs';
 import { VERIFY_LANE_CLI } from './operations/verify-io.mjs';
 import { shellQuoteWord } from './readiness/heavy-admission.mjs';
+import { workerScratchDir } from './lib/open-pr-body-location.mjs';
 /**
  * @file worker-brief.mjs
  * @description Render the standard worker-brief block so dispatchers do not retype
@@ -44,10 +45,7 @@ const USAGE = `Usage: node scripts/worker-brief.mjs --purpose=<slug> --files=a,b
  * @returns {string} Markdown with a trailing newline.
  */
 export function renderWorkerBrief({ purpose, files, edgeClone, proof = DEFAULT_PROOF, repo = 'we', reportLines = 8, owner = randomUUID().slice(0, 8), policy = resolveBuildPolicy({ log: line => console.error(line) }), freeScope = resolveFreeScopeSettings({ log: line => console.error(line) }) } = {}) {
-  if (typeof owner !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9-]*$/.test(owner)) throw new Error('--owner must be an alphanumeric token.');
-  if (typeof purpose !== 'string' || !/^[a-z0-9][a-z0-9-]*$/.test(purpose)) {
-    throw new Error('--purpose must be a lowercase slug ([a-z0-9][a-z0-9-]*).');
-  }
+  const scratchDir = workerScratchDir(purpose, owner);
   const paths = typeof files === 'string' ? files.split(',') : files;
   if (!Array.isArray(paths) || !paths.length || paths.some(path => typeof path !== 'string' || !path.trim())) {
     throw new Error('--files requires a nonempty list of paths.');
@@ -66,7 +64,6 @@ export function renderWorkerBrief({ purpose, files, edgeClone, proof = DEFAULT_P
   if (!Number.isFinite(staleAfterMinutes) || !(heartbeatMinutes >= 1 / 60e3)) {
     throw new Error('Invalid staleAfterMinutes: the stale window must be at least 2 milliseconds for a heartbeat cadence of at least 1 millisecond; correct the free-scope setting and regenerate the brief.');
   }
-  const scratchDir = `/tmp/we-scratch-${purpose}-${owner}`;
   const laneRepo = repo === 'plateau-app' ? ' --repo=<plateau-app checkout>' : '';
   // Codex's full and related gates need WE's scripts/verify-lane.mjs; a plateau-app lane has only its own standards.
   const codexGate = repo === 'plateau-app' && policy.finalGate !== 'none' ? 'standards' : policy.finalGate;

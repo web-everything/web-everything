@@ -9,6 +9,7 @@ import { resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { readRegistry, resolveFreeScopeSettings } from '../operations/free-scope-io.mjs';
 import { main as freeScopeMain } from '../operations/free-scope-cli.mjs';
 import { heartbeatScope, partitionRegistry, registerScope } from '../operations/free-scope.mjs';
+import { checkBodyFileLocation } from '../lib/open-pr-body-location.mjs';
 
 const params = { purpose: 'fix-widget', files: ['scripts/x.mjs', 'plateau-app:src/y.ts'], owner: 'tok12345' };
 const files = 'we:scripts/x.mjs,plateau-app:src/y.ts';
@@ -16,6 +17,12 @@ const defaultProof = 'Prove the change on the live case with before/after eviden
 const io = () => ({ stdout: { write: vi.fn() }, stderr: { write: vi.fn() }, writeFile: vi.fn(), newOwner: () => 'tok12345' });
 
 describe('renderWorkerBrief', () => {
+  it.each(['Alice1', 'tok12345', 'A', 'a-b-', 'Z9-Worker', 'abc12345'])('admits the printed body path for accepted owner %s', owner => {
+    const brief = renderWorkerBrief({ ...params, owner });
+    const bodyFile = /--bodyFile=([^\s`]+)/.exec(brief)[1];
+    expect(checkBodyFileLocation({ bodyFile, cwd: '/lanes/worker', home: '/home/operator', tmp: '/tmp', isTracked: () => false })).toEqual({ ok: true });
+  });
+
   it('assigns different scratch dirs to workers with the same purpose and different owners', () => {
     const dirs = ['abc12345', 'def67890'].map(owner => {
       const brief = renderWorkerBrief({ ...params, owner });

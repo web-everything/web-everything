@@ -15,13 +15,13 @@
  */
 import { readMainCard, assertMachineTitle } from './machine-pr-title.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { dirname, isAbsolute, join, relative, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { classifySubmit } from './open-pr.mjs';
 import { checkBodyFileLocation } from '../lib/open-pr-body-location.mjs';
 import { checkDuplicateBornAs } from '../lib/duplicate-bornas-added.mjs';
-import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { buildGhShimSettingsEnv, defaultShimDir, shimGhPath, resolveOrgAwareShimDir, pathWithOrgAwareShim, isDaemonCaller } from '../lib/gh-app-shim.mjs';
 
@@ -152,14 +152,28 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
   bodyLocation = spawn !== spawnSync ? () => ({ ok: true }) : (opts) => checkBodyFileLocation({
     ...opts, home: homedir(), tmp: tmpdir(),
     isTracked: (path) => {
+      // Git reports a physical root. Resolve parent aliases, including paths above
+      // cwd; preserve the basename so a tracked symlink itself remains tracked.
+      let directory = dirname(path);
+      const tail = [basename(path)];
+      let trackingPath;
+      for (;;) {
+        try { trackingPath = join(realpathSync(directory), ...tail); break; }
+        catch (error) {
+          const parent = dirname(directory);
+          if (error.code !== 'ENOENT' || parent === directory) throw error;
+          tail.unshift(basename(directory));
+          directory = parent;
+        }
+      }
       // ls-files errors on external/nonexistent paths. Prove the repository boundary
       // first: a path outside its worktree cannot be tracked in this index.
       const root = execFileSync('git', ['rev-parse', '--show-toplevel'], {
         cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000, maxBuffer: 1024 * 1024,
       }).trim();
-      const rel = relative(root, path);
+      const rel = relative(root, trackingPath);
       if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return false;
-      const result = spawnSync('git', ['ls-files', '--error-unmatch', '--', path], {
+      const result = spawnSync('git', ['ls-files', '--error-unmatch', '--', trackingPath], {
         cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000, maxBuffer: 1024 * 1024,
       });
       if (result.error || ![0, 1].includes(result.status)) throw new Error('Git tracking check unavailable');
