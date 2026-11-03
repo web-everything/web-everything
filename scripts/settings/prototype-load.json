@@ -92,6 +92,14 @@
       "findings": [
         "The canonical Codex audit on head be8f9f2629 reports WEAKENED. The findings are exactly this ruled change: restarts are exempt from the shared per-head ceiling, and the tests that pinned \"restarts spend / are blocked by the shared budget\" were replaced by R452 tests (a second non-restart action on the same head is still refused, in current-pass, would-do and intent evidence). The sweep stays shadow-only."
       ]
+    },
+    {
+      "ref": "lane/review-early-start",
+      "sha": "bfa5d088cd1a630dd36f37c54bc3e8d250dccfc2",
+      "ruling": "R464+R468+R474",
+      "findings": [
+        "scripts/settings/review.json:3 — Shipped timing changes from fast-check success to `push`, permitting review while both prerequisites are queued. Confirmed by a direct probe: pending checks now allow review, whereas the previous default refuses. `scripts/lib/review-timing.mjs:195` grants this permission even with `startEarly: \"shadow\"` or `\"off\"`; the added publication guard does not preserve the review-start gate."
+      ]
     }
   ]
 }
