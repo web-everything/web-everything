@@ -144,9 +144,12 @@ export function serializeFreeLaneList(list) {
  * @param {{exclude?:Set<number>}} [o]
  * @returns {number[]}
  */
-export function freeLaneCandidates(list, { exclude = new Set() } = {}) {
+export function freeLaneCandidates(list, { exclude = new Set(), nowMs = null, maxAgeMs = null } = {}) {
   if (!list || !Array.isArray(list.lanes)) return [];
-  return list.lanes.map((l) => l.lane).filter((n) => !exclude.has(n));
+  // With a clock + limit, each ENTRY must itself be within the limit (an event-driven touch refreshes the list's
+  // writtenAt but never an old entry's own `at`).
+  const young = (l) => nowMs == null || maxAgeMs == null || !Number.isFinite(l.at) || (l.at <= nowMs + 1000 && nowMs - l.at < maxAgeMs);
+  return list.lanes.filter((l) => young(l)).map((l) => l.lane).filter((n) => !exclude.has(n));
 }
 
 // ── THIN FS SHELL ────────────────────────────────────────────────────────────────────────────────────────
