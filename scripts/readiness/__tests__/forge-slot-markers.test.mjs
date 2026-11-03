@@ -118,6 +118,91 @@ describe('stale remote slot markers (perf10)', () => {
     expect(await reaper.step(tel(1, undefined, [going(RUN_A)]))).toEqual([]);
     expect(names(root)).toEqual(['0']);
   });
+  describe('R475 unconfirmed-slot reconciler: a dead owner whose run Forge never started', () => {
+    it('reaps the slot when Forge reports ZERO active runs and lists the run with no result (prepared, never run)', async () => {
+      const root = setup({0: {pid: 111, run: RUN_A}});
+      const lines = [];
+      const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111]), log: m => lines.push(m)});
+      expect(await reaper.step(tel(0, undefined, [going(RUN_A)]))).toEqual([]); // first idle sample: not yet
+      expect(names(root)).toEqual(['0']);
+      expect(await reaper.step(tel(0, NOW + 120_000 + 31_000, [going(RUN_A)]))).toEqual(['slot-0.unconfirmed']);
+      expect(names(root)).toEqual([]);
+      expect(lines.join('')).toContain('slot-0');
+      expect(lines.join('')).toContain(RUN_A);
+      expect(lines.join('')).toMatch(/activeRuns=0/);
+    });
+    it('keeps the slot while Forge reports any active run (the listed run may still be executing)', async () => {
+      const root = setup({0: {pid: 111, run: RUN_A}});
+      const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
+      expect(await reaper.step(tel(1, undefined, [going(RUN_A)]))).toEqual([]);
+      expect(names(root)).toEqual(['0']);
+    });
+    it('keeps an idle-looking slot whose run started less than the sample margin before the sample', async () => {
+      const root = setup({0: {pid: 111, run: RUN_A}});
+      const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
+      expect(await reaper.step(tel(0, NOW + 120_000, [going(RUN_A, NOW + 120_000 - 30_000)]))).toEqual([]);
+      expect(names(root)).toEqual(['0']);
+    });
+    it('keeps the slot when a later sample shows an active run again (the first idle sample was a missed rename)', async () => {
+      const root = setup({0: {pid: 111, run: RUN_A}});
+      const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
+      await reaper.step(tel(0, undefined, [going(RUN_A)]));
+      expect(await reaper.step(tel(1, NOW + 160_000, [going(RUN_A)]))).toEqual([]);
+      expect(await reaper.step(tel(0, NOW + 200_000, [going(RUN_A)]))).toEqual([]); // idle clock restarted
+      expect(names(root)).toEqual(['0']);
+    });
+    it('keeps the slot when the probe fails or is unknown (fail closed)', async () => {
+      const root = setup({0: {pid: 111, run: RUN_A}});
+      const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
+      expect(await reaper.step(async () => { throw new Error('ssh down'); })).toEqual([]);
+      expect(await reaper.step(async () => null)).toEqual([]);
+      expect(await reaper.step(async () => ({sampledAtET: iso(NOW + 120_000), activeRuns: 0, recent: 'garbage'}))).toEqual([]);
+      expect(names(root)).toEqual(['0']);
+    });
+    it('keeps the slot while the owner is alive even with zero active runs', async () => {
+      const root = setup({0: {pid: 222, run: RUN_A}});
+      const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([])});
+      expect(await reaper.step(tel(0, undefined, [going(RUN_A)]))).toEqual([]);
+      expect(names(root)).toEqual(['0']);
+    });
+    it('reaps every such slot in one pass', async () => {
+      const root = setup({0: {pid: 111, run: RUN_A}, 1: {pid: 112, run: RUN_B}});
+      const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111, 112])});
+      await reaper.step(tel(0, undefined, [going(RUN_A), going(RUN_B)]));
+      expect((await reaper.step(tel(0, NOW + 160_000, [going(RUN_A), going(RUN_B)]))).sort()).toEqual(['slot-0.unconfirmed', 'slot-1.unconfirmed']);
+    });
+  });
+  describe('R475 coroner signal', () => {
+    it('signals once when >= 2 unconfirmed slots are older than the age bound, then throttles', async () => {
+      const root = setup({0: {pid: 222, run: RUN_A}, 1: {pid: 223, run: RUN_B}});
+      const events = [];
+      const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([]), signal: e => events.push(e)});
+      await reaper.step(tel(1));
+      await reaper.step(tel(1));
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({kind: 'stuck-slots', detail: {slots: ['slot-0.unconfirmed', 'slot-1.unconfirmed']}});
+    });
+    it('does not signal for one stuck slot or for young slots', async () => {
+      const one = setup({0: {pid: 222, run: RUN_A}});
+      const young = setup({0: {pid: 222, ageMs: 60_000}, 1: {pid: 223, ageMs: 60_000}});
+      const events = [];
+      for (const root of [one, young]) await createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([]), signal: e => events.push(e)}).step(tel(1));
+      expect(events).toEqual([]);
+    });
+    it('signals probe-unknown when a dead-owner slot is kept because the probe failed', async () => {
+      const root = setup({0: {pid: 111, run: RUN_A}});
+      const events = [];
+      const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111]), signal: e => events.push(e)});
+      await reaper.step(async () => { throw new Error('ssh down'); });
+      expect(events.map(e => e.kind)).toEqual(['probe-unknown']);
+      expect(names(root)).toEqual(['0']);
+    });
+    it('a throwing signal sink never breaks the pass', async () => {
+      const root = setup({0: {pid: 111, run: RUN_A}, 1: {pid: 112, run: RUN_B}});
+      const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111, 112]), signal: () => { throw new Error('x'); }});
+      expect(await reaper.step(async () => null)).toEqual([]);
+    });
+  });
   it.each([
     null, [], 'invalid', {}, {...done(RUN_B), runId: 'invalid'}, {...done(RUN_B), runId: 123},
     {...done(RUN_B), runId: RUN_B + '\n'}, {...done(RUN_B), code: '0'}, {...done(RUN_B), code: -1},
