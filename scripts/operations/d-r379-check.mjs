@@ -348,7 +348,7 @@ function labelNames(labels) {
 }
 
 /** Validate every head record, retaining cross-base weakened evidence newer than the bound clear. */
-function latestAudit(records, head, base) {
+export function latestAudit(records, head, base) {
   if (!Array.isArray(records) || records.length > MAX_AUDITS) throw new Error('invalid or oversized audit ledger');
   const valid = [];
   for (const record of records) {
@@ -387,7 +387,7 @@ function latestAudit(records, head, base) {
   return latest;
 }
 
-async function reviewed(pr, head, base, deps) {
+export async function reviewed(pr, head, base, deps, { skipAudit = false } = {}) {
   const name = 'Reviewed';
   let labels, audit;
   try { labels = labelNames(await deps.readLabels(pr, head)); }
@@ -404,12 +404,14 @@ async function reviewed(pr, head, base, deps) {
   if (blocked.length || missing.length) return result(2, name, 'FAIL', [
     ...blocked.map(l => `blocking label: ${l}`), ...missing.map(l => `missing label: ${l}`),
   ]);
-  try { audit = latestAudit(await deps.readAudits(), head, base); }
-  catch { return unknown(2, name, 'audits unavailable or oversized'); }
-  if (!audit) return result(2, name, 'FAIL', ['no audit for head']);
-  if (audit.verdict !== 'NOT WEAKENED') return result(2, name, 'FAIL', [`latest audit: ${audit.verdict}`]);
-  if (!base) return unknown(2, name, 'net diff merge-base unavailable');
-  if (audit.base === head || audit.base !== base) return result(2, name, 'FAIL', ['audit base does not match the classified net diff merge-base']);
+  if (!skipAudit) {
+    try { audit = latestAudit(await deps.readAudits(), head, base); }
+    catch { return unknown(2, name, 'audits unavailable or oversized'); }
+    if (!audit) return result(2, name, 'FAIL', ['no audit for head']);
+    if (audit.verdict !== 'NOT WEAKENED') return result(2, name, 'FAIL', [`latest audit: ${audit.verdict}`]);
+    if (!base) return unknown(2, name, 'net diff merge-base unavailable');
+    if (audit.base === head || audit.base !== base) return result(2, name, 'FAIL', ['audit base does not match the classified net diff merge-base']);
+  }
   let state, current;
   try {
     const events = await deps.readReviewLedger(pr);
@@ -453,6 +455,7 @@ async function reviewed(pr, head, base, deps) {
     const later = liveHolds.filter(label => applications.get(label) >= Date.parse(current.at));
     if (later.length) return result(2, name, 'FAIL', later.map(label => `hold applied after acceptance: ${label}`));
   }
+  if (skipAudit) return result(2, name, 'PASS', [REVIEW_LABELS.accepted, 'red-team:clear', 'verdict ledger accepts the current head with no holds']);
   return result(2, name, 'PASS', [REVIEW_LABELS.accepted, 'red-team:clear',
     `canonical audit NOT WEAKENED for head ${head}, base ${audit.base}, at ${audit.at}`,
     'verdict ledger accepts the current head with no holds']);

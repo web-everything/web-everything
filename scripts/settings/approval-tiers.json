@@ -1,0 +1,34 @@
+{
+  "_doc": "Approval-tier settings (R454-R459). Every rule here is a setting; adjust on observed failures. Read by scripts/operations/approval-tier-check.mjs. Direction-setting; operator approves changes to this file.",
+  "version": 1,
+  "tiers": {
+    "standard": { "approvableBy": "orchestrator", "rule": "D-R379", "requireHumanRequiredFalse": true, "auditMustBe": "NOT WEAKENED", "allowPreExistingCardedWeakened": true },
+    "elevated": {
+      "approvableBy": "elevated-judge", "rules": ["R456", "R459"],
+      "killSwitch": false,
+      "judge": { "requireDifferentModelFamilyFromAuthor": true },
+      "securityCriticalRequiresRedTeamClearOnHead": true,
+      "explicitlyAsked": { "requireVerbatimQuote": true, "requireTimestamp": true, "requireRulingId": true }
+    },
+    "human": { "approvableBy": "operator" }
+  },
+  "alwaysHuman": {
+    "_doc": "Never orchestrator- or elevated-approvable. Globs match net-diff paths.",
+    "categories": ["secrets-access", "forge-root-deploy", "irreversible-deletion", "pricing-licensing"],
+    "pathGlobs": [
+      "**/*secret*", "**/*credential*", "**/*token*", "**/*permission*", "**/*access-control*",
+      "scripts/forge-exec-run*", "scripts/forge-setup*", "**/forge-exec-run*", "**/forge-setup*",
+      "**/*delete*", "**/*purge*", "**/*migration*",
+      "**/*pricing*", "**/*licens*", "**/monetization*/**"
+    ]
+  },
+  "securityCriticalGlobs": ["scripts/**/*guard*", "scripts/**/*gate*", "scripts/**/*verdict*", "scripts/**/*approval*", "scripts/**/*label*", ".claude/hooks/**", "scripts/hooks/**", "scripts/review-set-label*"],
+  "emergency1": {
+    "_doc": "R458: ONE emergency definition. Blocking AND won't self-resolve (known now, or unknown after fallback).",
+    "fallbackNoProgressHours": 2,
+    "repeatedRefusalCount": 3,
+    "alreadyFixedReportCount": 2,
+    "knownWontSelfResolveKinds": ["approval-gate", "non-converging-verdict"],
+    "neverEmergencyApprovable": ["security-finding-in-diff", "secrets-access", "irreversible-action"]
+  }
+}
