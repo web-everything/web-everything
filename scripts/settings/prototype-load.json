@@ -84,6 +84,14 @@
         "scripts/lib/drain-queue-safety.mjs:197 — Replaces the all-green requirement with an exception that discards FAILURE, CANCELLED, TIMED_OUT, ACTION_REQUIRED and STARTUP_FAILURE when a later same-name check succeeds in another run. Previously these outcomes blocked update-branch.",
         "scripts/lib/drain-queue-safety.mjs:153 — Matching workflow_id, display name and timestamps does not prove job replacement across runs; independent same-name jobs can mask failures. The lookup validates only workflow_id, without binding the check to its claimed run/job or verifying equivalent execution context."
       ]
+    },
+    {
+      "ref": "lane/r452-restart-ceiling",
+      "sha": "be8f9f26291bad2acfd3cc45c458efed18d1c998",
+      "ruling": "R452",
+      "findings": [
+        "The canonical Codex audit on head be8f9f2629 reports WEAKENED. The findings are exactly this ruled change: restarts are exempt from the shared per-head ceiling, and the tests that pinned \"restarts spend / are blocked by the shared budget\" were replaced by R452 tests (a second non-restart action on the same head is still refused, in current-pass, would-do and intent evidence). The sweep stays shadow-only."
+      ]
     }
   ]
 }
