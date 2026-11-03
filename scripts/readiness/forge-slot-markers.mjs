@@ -168,6 +168,10 @@ function ownerGone(root, index, file, liveness, selfPid) {
   return liveness(ownerPid(root, index, file), selfPid) === 'dead';
 }
 
+// Process-wide: idle samples (marker path + identity) whose on-disk reset failed, so a recreated reaper in this process
+// still rejects them. A cross-process double I/O failure (delete and overwrite both failing) is accepted residual.
+const idleVoid = new Set();
+
 /**
  * Stateful reaper for one wait loop. `step()` is cheap and idempotent. It reads Forge telemetry (a lazy async getter)
  * only when a dead-owner marker exists, so a loop with no dead markers costs one readdir.
@@ -207,16 +211,15 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
   }
   const idleFile = file => file + '.idle';
   // A failed delete must never leave the old first-idle sample usable: remember the reset in memory too.
-  const idleVoid = new Set();
   function resetIdle(entry) {
     try { unlinkSync(idleFile(entry.file)); return; } catch (error) { if (error?.code === 'ENOENT') return; }
     // Delete failed: neutralise the persisted sample by overwriting it (a recreated reaper then sees no valid stamp);
     // if even that fails, this instance still refuses the stale sample until a fresh one is written.
-    try { writeFileSync(idleFile(entry.file), '{}', {mode: 0o600}); } catch { idleVoid.add(entry.key); }
+    try { writeFileSync(idleFile(entry.file), '{}', {mode: 0o600}); } catch { idleVoid.add(entry.file + '|' + entry.key); }
   }
   function idleStamp(file, key, sampledAt) {
-    if (idleVoid.has(key)) {
-      try { writeFileSync(idleFile(file), JSON.stringify({key, sampledAt}), {mode: 0o600}); idleVoid.delete(key); } catch { /* still void: retried next pass */ }
+    if (idleVoid.has(file + '|' + key)) {
+      try { writeFileSync(idleFile(file), JSON.stringify({key, sampledAt}), {mode: 0o600}); idleVoid.delete(file + '|' + key); } catch { /* still void: retried next pass */ }
       return sampledAt;
     }
     try { const saved = JSON.parse(readFileSync(idleFile(file), 'utf8')); if (saved.key === key && Number.isFinite(saved.sampledAt)) return saved.sampledAt; } catch { /* none yet */ }
