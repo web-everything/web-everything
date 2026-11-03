@@ -3259,7 +3259,39 @@ function homeCdTarget(cmd, { segments, pipedFrom }, home) {
 // target this resolver can't statically resolve (e.g. a command-substitution path) will be wrongly denied.
 // The fix is to invoke with a directly-resolvable `cd` (a literal absolute path, or `LANE=/abs; cd "$LANE"` —
 // the standard lane idiom every skill already teaches), not to reach for a removed override.
-export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve, home = process.env.HOME ?? null, onUnknownCwd = null) {
+/** Where the first `cd` may land when `resolveEffectiveCwd`'s readers leave it unresolved: a path, null for
+ *  unknown, or undefined when main's resolution already reads it. Covers a home target (`~`, `"$HOME"`) in a
+ *  chain the home resolver does not read — expanded with the starting HOME only when no earlier statement can
+ *  touch HOME — options (`-P`, `--`) before the target, a bare `cd` (HOME) and `cd -` (OLDPWD, unknown). */
+function unreadCdCandidate(segments, reportedCwd, resolvePath, home) {
+  const index = segments.findIndex((stmt) => /^cd(?:\s|$)/.test(stmt.trim()));
+  if (index < 0) return undefined;
+  const args = segments[index].trim().slice(2).trim().split(/\s+/).filter(Boolean);
+  let options = false;
+  while (args.length && /^-[LPe@]+$/.test(args[0])) { args.shift(); options = true; }
+  if (args[0] === '--') { args.shift(); options = true; }
+  const target = args[0] ?? '~';                              // a bare `cd` goes to HOME
+  if (target === '-') return null;                            // OLDPWD is not known here
+  // An unquoted `$HOME` word-splits on a HOME with whitespace, so `cd` would not land there.
+  const quotedHome = /^("?)\$(?:HOME|\{HOME\})(\/[^$`"'\\]*)?\1$/.exec(target);
+  const splits = quotedHome && !quotedHome[1] && /\s/.test(home ?? '');
+  const homeRest = /^~(?:\/|$)/.test(target) ? target.slice(1) : quotedHome && !splits ? quotedHome[2] || '' : null;
+  if (homeRest !== null || /^~/.test(target)) {
+    if (typeof home !== 'string' || !isAbsolute(home)) return undefined; // main's no-home behavior (#5957)
+    let tracked = homeRest === null ? null : home;            // `~user` / `~+` / `~-` are never resolved here
+    for (const before of segments.slice(0, index)) {
+      if (tracked === null) break;
+      tracked = valueAfter(before, 'HOME', tracked, tracked);
+    }
+    return tracked === home ? resolvePath(home + homeRest) : null;
+  }
+  if (!options) return undefined;
+  const plain = target.replace(/^(['"])(.*)\1$/, '$2');
+  if (/[`$(*?]/.test(plain)) return null;
+  return plain.startsWith('/') ? plain : resolvePath(reportedCwd || '.', plain);
+}
+
+export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve, home = process.env.HOME ?? null, onCdCandidate = null) {
   // r3 audit — a heredoc BODY is data. A `cd /elsewhere` line (or an apostrophe that desyncs the quote
   // scanner) inside a PR-body heredoc must not steer, or break, the cwd resolution; `decide` already strips
   // them before it parses, and this must agree with it. An unparseable command keeps the REPORTED cwd, which
@@ -3283,37 +3315,18 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
     val = val.replace(/^(['"])(.*)\1$/, '$2');                // strip matching surrounding quotes
     if (!/\s/.test(val)) vars[m[1]] = val;                    // single-token literal only
   }
+  // The returned cwd below keeps main's resolution. A caller that guards git targets also gets the place a
+  // first `cd` the resolution above does not read may land in (null = unknown), and can fail closed on it.
+  if (onCdCandidate) {
+    let candidate;
+    try { candidate = unreadCdCandidate(parsed.segments, reportedCwd, resolvePath, home); } catch { candidate = null; }
+    if (candidate !== undefined) onCdCandidate(candidate);
+  }
   // First `cd <target>` statement wins (that is where the command lands before the mutation runs).
-  for (const [index, stmt] of parsed.segments.entries()) {
-    const cd = stmt.trim().match(/^cd(?:\s+(.*))?$/);
+  for (const stmt of parsed.segments) {
+    const cd = stmt.trim().match(/^cd\s+(.+)$/);
     if (!cd) continue;
-    const args = (cd[1] || '').trim().split(/\s+/).filter(Boolean);
-    while (args.length && /^-[LPe@]+$/.test(args[0])) args.shift(); // options never name the directory
-    if (args[0] === '--') args.shift();
-    let target = args[0] ?? '~';                              // first arg only; a bare `cd` goes to HOME
-    if (target === '-') {                                     // OLDPWD is not known here
-      if (onUnknownCwd) onUnknownCwd();
-      return reportedCwd;
-    }
-    // A home target the resolver above did not expand (it reads only simple statement chains). With a
-    // usable starting HOME, expand it when no earlier statement can touch HOME; otherwise the directory is
-    // unknown, and the caller makes git targets fail closed instead of trusting a literal `~` join.
-    // An unquoted `$HOME` word-splits on a HOME with whitespace, so `cd` would not land there.
-    const quotedHome = /^("?)\$(?:HOME|\{HOME\})(\/[^$`"'\\]*)?\1$/.exec(target);
-    const splits = quotedHome && !quotedHome[1] && /\s/.test(home ?? '');
-    const homeRest = /^~(?:\/|$)/.test(target) ? target.slice(1) : quotedHome && !splits ? quotedHome[2] || '' : null;
-    if ((homeRest !== null || /^~/.test(target)) && typeof home === 'string' && isAbsolute(home)) {
-      let tracked = homeRest === null ? null : home;          // `~user` / `~+` / `~-` are never resolved here
-      for (const before of parsed.segments.slice(0, index)) {
-        if (tracked === null) break;
-        try { tracked = valueAfter(before, 'HOME', tracked, tracked); } catch { tracked = null; }
-      }
-      if (tracked !== home) {
-        if (onUnknownCwd) onUnknownCwd();
-        return reportedCwd;
-      }
-      return home + homeRest;
-    }
+    let target = cd[1].trim().split(/\s+/)[0];                // first arg only (ignore trailing redirs/opts)
     target = target.replace(/^(['"])(.*)\1$/, '$2');          // strip surrounding quotes
     const v = target.match(/^\$\{?([A-Za-z_]\w*)\}?$/);       // whole target is $VAR / ${VAR}
     if (v) target = vars[v[1]] ?? '';
@@ -5413,7 +5426,7 @@ if (IS_CLI) {
   let dispatchKind = null;
   let agentSession = false;
   let effectiveCwd = null;
-  let cwdUnknown = false; // a leading `cd` whose directory could not be followed (HOME rebound, `cd -`)
+  let cwdUnknown = false; // a first `cd` may land in a daemon clone, or cannot be followed (HOME rebound, `cd -`)
   let daemonRoots = [];
   let hookSessionId = null;
   let orchestratorSettings = {};
@@ -5451,7 +5464,8 @@ if (IS_CLI) {
     const rp = (p) => { try { return realpathSync(p); } catch { return p; } };
     // #2335 — the reported cwd resets to the primary between calls; honour a leading `cd <lane>` so a genuine
     // lane mutation isn't misread as a primary one (and the #2323 git call runs in the lane, not the primary).
-    const cwd = rp(resolveEffectiveCwd(cmd, ev.cwd || process.cwd(), undefined, undefined, () => { cwdUnknown = true; }));
+    let cdCandidate;
+    const cwd = rp(resolveEffectiveCwd(cmd, ev.cwd || process.cwd(), undefined, undefined, (candidate) => { cdCandidate = candidate; }));
     effectiveCwd = cwd;
     const weRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
     const workspace = dirname(weRoot);
@@ -5461,6 +5475,10 @@ if (IS_CLI) {
     // from the same `workspace` the primaries above use. A fault here fails open (empty list ⇒
     // `daemonCloneWriteReason` denies nothing) rather than wedging the agent.
     try { daemonRoots = daemonCloneRoots(workspace); } catch { daemonRoots = []; }
+    // A first `cd` main's resolution does not read may land in a daemon clone: its git targets fail closed.
+    try {
+      if (cdCandidate === null || (typeof cdCandidate === 'string' && isDaemonCloneRealpath(cdCandidate, daemonRoots))) cwdUnknown = true;
+    } catch { cwdUnknown = true; }
     // #2323 — only pay for the git call when it could possibly matter: a lane cwd about to run a
     // backlog-mutation command. Every other Bash call (the overwhelming majority) skips it entirely.
     if (!primaryCwd && isLaneCwd(cwd) && isBacklogMutation(cmd)) staleBehind = commitsBehindUpstream(cwd);
