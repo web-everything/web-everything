@@ -187,7 +187,7 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
         // `npx vitest` / `npm run` put node_modules/.bin on PATH for the shell; a bare node child does not.
         const childEnv = { ...env, WE_VERIFY_REMOTE_REPORT: remoteReport, PATH: `${join(cwd, 'node_modules', '.bin')}:${env.PATH ?? ''}` };
         delete childEnv[ADMISSION_HELD_ENV];
-        let lastResult = null, observedFailure = false, unexplainedExit = false;
+        let lastResult = null, observedFailure = false;
         async function attempt(local, attemptFiles = files, retry = '') {
           if (!remaining()) return 'NOT-RUN';
           const report = join(directory, `${index}.${retry}${local ? 'local' : 'initial'}.json`);
@@ -215,9 +215,9 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
           }
           catch { inventory = 'INVENTORY-INCOMPLETE'; }
           if (inventory === 'INVENTORY-INCOMPLETE') {
-            // Admission forwards child exits, including 75: any nonzero exit
-            // cannot be cleared by a later passing split.
-            unexplainedExit ||= result.exitCode !== 0;
+            // Exit 75 signals unsettled evidence; other nonzero child exits
+            // are failures even when inventory cannot explain them.
+            observedFailure ||= result.exitCode !== 0 && result.exitCode !== SHARD_UNSETTLED_EXIT;
             // Missing inventory may coexist with a real failure. Keep that
             // evidence across attempts so splitting cannot retry it away.
             try {
@@ -271,10 +271,11 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
               retried.push(verdict);
               if (infraExit || !['PASS', 'INVENTORY-INCOMPLETE'].includes(verdict)) break;
             }
-            status = observedFailure || retried.some(r => ['FAIL', 'TIMEOUT', 'NOT-RUN'].includes(r))
-              ? 'FAIL' : 'UNSETTLED';
+            status = retried.find(r => ['TIMEOUT', 'NOT-RUN', 'FAIL'].includes(r))
+              ?? (observedFailure ? 'FAIL' : 'UNSETTLED');
           }
-          if (unexplainedExit && status === 'PASS') status = 'UNSETTLED';
+          // A passing local confirmation cannot erase an incomplete attempt's failure evidence.
+          if (observedFailure && status === 'PASS') status = 'FAIL';
         } catch (error) { status = 'FAIL'; log(`verify-shard error: ${String(error.message).replace(/[\x00-\x1f\x7f]/g, '')}\n`); }
         // A killed/infrastructure shard must reach the caller as such (its guard refuses to run later phases on it).
         if (status !== 'PASS' && lastResult && lastResult.exitCode !== SHARD_UNSETTLED_EXIT && verificationInfrastructureFailure({ exitCode: lastResult.exitCode, signal: lastResult.signal })) infraExit ||= lastResult.signal ? 137 : lastResult.exitCode;

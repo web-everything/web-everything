@@ -135,11 +135,11 @@ describe('fail-closed wrapper', () => {
 });
 
 describe('one split retry for incomplete inventory', () => {
-  async function run(modes, files = ['a', 'b', 'c', 'd']) {
+  async function run(modes, files = ['a', 'b', 'c', 'd'], shards = 1) {
     let clock = 0;
     const calls = [], lines = [];
     const reports = new Map();
-    const code = await runShards({ argv: ['npx', 'vitest', 'run', ...files, '--pool', 'forks'], shards: 1, parallel: 1, budgetMs: 10000 }, {
+    const code = await runShards({ argv: ['npx', 'vitest', 'run', ...files, '--pool', 'forks'], shards, parallel: 1, budgetMs: 10000 }, {
       discover: () => null, env: {}, now: () => clock, log: s => lines.push(s), tmpdir: () => '/scratch',
       fs: { mkdtempSync: () => '/scratch/shards', rmSync: () => {}, readFileSync: p => { if (!reports.has(p)) throw Error('missing'); return reports.get(p); } },
       acquireLocal: async () => ({ ok: true }), releaseLocal: () => {},
@@ -148,6 +148,10 @@ describe('one split retry for incomplete inventory', () => {
         const mode = modes[calls.length - 1];
         if (mode === 'remote-incomplete') reports.set(options.remoteReport, JSON.stringify({ location: 'remote', exitCode: 1 }) + '\n');
         if (mode === 'timeout') return { exitCode: 124, timedOut: true };
+        if (mode === 'exit-failure') {
+          options.log(`${options.prefix}runner failed before writing inventory\n`);
+          return { exitCode: 2, reportText: null };
+        }
         if (mode === 'fail') options.log(`${options.prefix}retry assertion failed: expected true, received false\n`);
         if (mode === 'exhausted') { clock = 10000; return { exitCode: 0, reportText: JSON.stringify({ testResults: [] }) }; }
         if (mode === 'killed') return { exitCode: 137 };
@@ -198,9 +202,9 @@ describe('one split retry for incomplete inventory', () => {
   it.each([
     ['passing partial report', { success: true, testResults: [{ name: 'a', status: 'passed', assertionResults: [{ status: 'passed' }] }] }],
     ['unparseable report', 'malformed'],
-  ])('%s with exit 1 stays UNSETTLED after passing retries', async (_label, report) => {
+  ])('%s with exit 1 stays FAIL after passing retries', async (_label, report) => {
     const f = await run([report, 'pass', 'pass']);
-    expect(f.code).toBe(75); expect(f.output).toContain('verify-shards: UNSETTLED');
+    expect(f.code).toBe(1); expect(f.output).toContain('verify-shards: RED (1:FAIL;');
     expect(f.output).not.toContain('GREEN');
     expect(f.calls).toHaveLength(3);
   });
@@ -212,9 +216,9 @@ describe('one split retry for incomplete inventory', () => {
   });
   it.each([null, '{invalid JSON', 'x'.repeat(SHARD_REPORT_MAX_BYTES + 1)].map((reportText, i) => [
     ['missing', 'malformed', 'oversized'][i], reportText,
-  ]))('exit 1 with %s report cannot become GREEN', async (_label, reportText) => {
+  ]))('exit 1 with %s report stays FAIL after passing retries', async (_label, reportText) => {
     const f = await run([{ exitCode: 1, reportText }, 'pass', 'pass']);
-    expect(f.code).toBe(75); expect(f.output).toContain('verify-shards: UNSETTLED');
+    expect(f.code).toBe(1); expect(f.output).toContain('verify-shards: RED (1:FAIL;');
     expect(f.output).not.toContain('GREEN'); expect(f.calls).toHaveLength(3);
   });
   it('incomplete shard with a failing retry half is FAIL with exit 1 and preserves failure output', async () => {
@@ -261,10 +265,40 @@ describe('one split retry for incomplete inventory', () => {
     expect(f.output).toContain('verify-shards: UNSETTLED (');
     expect(f.output).not.toMatch(/RED|GREEN/); expect(f.calls).toHaveLength(3);
   });
-  it.each([['fail', 'missing', 1], ['missing', 'fail', 1], ['timeout', 'missing', 1], ['missing', 'timeout', 1]])('real %s / %s half takes precedence over incomplete inventory', async (left, right, code) => {
+  it.each([['fail', 'missing', 1], ['missing', 'fail', 1], ['timeout', 'missing', 124], ['missing', 'timeout', 124]])('real %s / %s half takes precedence over incomplete inventory', async (left, right, code) => {
     const f = await run(['missing', left, right]);
-    expect(f.code).toBe(code); expect(f.output).toContain('verify-shards: RED (1:FAIL;');
+    expect(f.code).toBe(code); expect(f.output).toContain(`verify-shards: RED (1:${code === 124 ? 'TIMEOUT' : 'FAIL'};`);
     expect(f.calls).toHaveLength(['fail', 'timeout'].includes(left) ? 2 : 3);
+  });
+  it.each(['missing', 'exit-failure'])('retry timeout preserves TIMEOUT and stops later shards after %s evidence', async initial => {
+    const f = await run([initial, 'timeout', 'pass'], ['a', 'b', 'c', 'd', 'e', 'f'], 2);
+    expect(f.code).toBe(124);
+    expect(f.output).toContain('verify-shards: RED (1:TIMEOUT, 2:NOT-RUN;');
+    expect(f.calls.map(c => c.files)).toEqual([['a', 'b', 'c'], ['a', 'b']]);
+  });
+  it('budget exhaustion after failure evidence preserves retry NOT-RUN', async () => {
+    const f = await run(['exit-failure', 'exhausted', 'pass']);
+    expect(f.code).toBe(124);
+    expect(f.output).toContain('verify-shards: RED (1:NOT-RUN;');
+    expect(f.calls).toHaveLength(2);
+  });
+  it.each([
+    ['initial', ['exit-failure', 'pass', 'pass']],
+    ['retry', ['missing', 'exit-failure', 'pass']],
+    ['initial with incomplete retry', ['exit-failure', 'missing', 'pass']],
+  ])('%s nonzero exit without inventory stays FAIL and preserves failure details', async (_label, modes) => {
+    const f = await run(modes);
+    expect(f.code).toBe(1);
+    expect(f.output).toContain('verify-shards: RED (1:FAIL;');
+    expect(f.output).toContain('[verify-shard 1/1] runner failed before writing inventory');
+    expect(f.output).not.toContain('GREEN');
+    expect(f.calls).toHaveLength(3);
+  });
+  it('retry exit 75 without inventory remains unsettled-eligible', async () => {
+    const f = await run(['missing', { exitCode: SHARD_UNSETTLED_EXIT, reportText: null }, 'pass']);
+    expect(f.code).toBe(SHARD_UNSETTLED_EXIT);
+    expect(f.output).toContain('verify-shards: UNSETTLED (1:UNSETTLED;');
+    expect(f.calls).toHaveLength(3);
   });
   it.each(['killed', 'signal'])('first split half %s halts before the second half and preserves infrastructure exit', async mode => {
     const f = await run(['missing', mode, 'pass']);
@@ -273,7 +307,7 @@ describe('one split retry for incomplete inventory', () => {
   });
   it('NOT-RUN after budget exhaustion launches neither split half', async () => {
     const f = await run(['exhausted', 'pass', 'pass']);
-    expect(f.code).toBe(1); expect(f.output).toContain('verify-shard 1/1: FAIL');
+    expect(f.code).toBe(124); expect(f.output).toContain('verify-shard 1/1: NOT-RUN');
     expect(f.calls).toHaveLength(1);
   });
   it('both incomplete halves remain unsettled without another split', async () => {
@@ -285,9 +319,18 @@ describe('one split retry for incomplete inventory', () => {
     expect(f.code).toBe(75); expect(f.calls.map(c => c.files)).toEqual([['a'], ['a']]);
     expect(new Set(f.calls.map(c => c.report)).size).toBe(2);
   });
-  it('confirms remote incomplete evidence locally but preserves its unexplained exit after the split retry', async () => {
+  it('remote incomplete nonzero exit cannot become GREEN after passing local confirmation', async () => {
+    const f = await run(['remote-incomplete', 'pass']);
+    expect(f.code).toBe(1);
+    expect(f.output).toContain('remote red; confirming locally');
+    expect(f.output).toContain('verify-shards: RED (1:FAIL;');
+    expect(f.output).not.toContain('GREEN');
+    expect(f.calls.map(c => c.command)).toEqual(['node', 'npx']);
+    expect(f.calls.map(c => c.files)).toEqual([['a', 'b', 'c', 'd'], ['a', 'b', 'c', 'd']]);
+  });
+  it('confirms remote incomplete evidence locally but preserves its failure exit after the split retry', async () => {
     const f = await run(['remote-incomplete', 'missing', 'pass', 'pass']);
-    expect(f.code).toBe(75); expect(f.output).toContain('verify-shards: UNSETTLED');
+    expect(f.code).toBe(1); expect(f.output).toContain('verify-shards: RED (1:FAIL;');
     expect(f.output).not.toContain('GREEN'); expect(f.calls).toHaveLength(4);
     expect(f.calls.map(c => c.command)).toEqual(['node', 'npx', 'node', 'node']);
     expect(f.calls.map(c => c.files.length)).toEqual([4, 4, 2, 2]);

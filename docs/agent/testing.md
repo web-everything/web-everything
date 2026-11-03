@@ -3872,12 +3872,17 @@ clearing as a false-positive proof of detector completeness.
 ## Shard split-retry evidence
 
 `verify-shard-run` retries incomplete inventory once in at most two halves to surface
-failures. The retry never yields PASS: any half FAIL, TIMEOUT, or NOT-RUN, or an
-observed failure in an incomplete report, makes the shard FAIL. Every other retry
+failures. The retry never yields PASS: the first TIMEOUT, NOT-RUN, or FAIL half
+keeps its status (TIMEOUT/NOT-RUN exit 124). Otherwise, observed failure evidence
+makes the shard FAIL (exit 1). Every other retry
 outcome is UNSETTLED (exit 75), including all halves passing. Retry output and
 failure details remain visible, and each shard contributes one final result.
 Admission forwards child exit codes, so exit 75 cannot prove the command never ran;
-unexplained nonzero exits cannot be cleared by passing retries. Infrastructure
+nonzero exits other than 75 are failure evidence even without inventory, and
+cannot be cleared by passing retries. Exit 0 or 75 with missing inventory remains
+unsettled-eligible in the absence of failure evidence. A passing local confirmation
+also cannot clear failure evidence retained from an incomplete remote attempt.
+Infrastructure
 exits retain their classification, and UNSETTLED retains `verify-unsettled`.
 First-attempt passes are unchanged. The scoped regressions live in
 `scripts/lib/__tests__/verify-shard-run.test.mjs`; run them through heavy admission.
