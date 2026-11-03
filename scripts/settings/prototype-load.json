@@ -126,6 +126,14 @@
         "scripts/merge-ai-prs.mjs:2686 — Pre-existing fail-open dependency handling remains: full sweeps clear absent `blockedBy` dependencies even when listing failures make `contextComplete=false`; an unreadable repo's open blocker can therefore be bypassed.",
         "scripts/merge-ai-prs.mjs:5616 — Pre-existing `--assume-complete-context` overrides the incomplete-context guard after listing failures, allowing an unobserved carrier to count as landed despite the new inventory checks."
       ]
+    },
+    {
+      "ref": "lane/author-lookup-defer",
+      "sha": "f62437a87d2831fdb56be1ec3d8387243b5e2f57",
+      "ruling": "R521",
+      "findings": [
+        "scripts/conveyor/reconcile-pass.mjs:456 — The snapshot-disabled fallback returns direct() without author validation, but PR_LIST_JSON_FIELDS omits author. This pre-existing bypass still accepts authorless rows despite the claimed fail-closed guarantee."
+      ]
     }
   ]
 }
