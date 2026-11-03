@@ -24,21 +24,22 @@ it('drops all cycle edges while retaining external dependencies and reverse link
   expect([...pair.blockedBy.values()]).toEqual([[], []]);
   expect([...pair.unblocks]).toEqual([]);
 });
-it('preserves an alerted stall episode during blocked wait and fires again after expiry', async () => {
+it('preserves the stall clock and normal repeat backoff while a blocker is annotated', async () => {
   const episode = { head: pr.headRefOid, updatedAt: pr.updatedAt, fingerprint: stateFingerprint(pr), firstUnownedAt: now - 200 * minute, alerted: true, lastAlertAt: now - 60 * minute, alertCount: 1 };
   const previous = { episodes: { [key]: episode }, invariantClocks: { [key]: { fingerprint: stateFingerprint(pr), since: now } } };
   const readPrs = () => [{ ...pr, body: 'blocked by #13' }, { ...pr, number: 13 }];
   const waiting = await run({ readPrs, readPrevious: () => previous });
-  expect(waiting.nextState.episodes[key]).toEqual(episode);
-  expect(waiting.alerts.filter(a => a.key === key)).toEqual([]);
+  expect(waiting.nextState.episodes[key]).toEqual({ ...episode, lastAlertAt: now, alertCount: 2 });
+  expect(waiting.alerts.filter(a => a.key === key)).toHaveLength(1);
   const expired = await run({ now: now + 481 * minute, readPrs, readPrevious: () => waiting.nextState });
-  expect(expired.decisions.find(p => p.number === 12)).toMatchObject({ violation: 'deadline-passed', blockedBy: [13], nextAction: 'blocked-by #13' });
+  expect(expired.decisions.find(p => p.number === 12)).toMatchObject({ violation: 'deadline-passed', blockedBy: [13], nextAction: 'await-review' });
   expect(expired.nextState.episodes[key].firstUnownedAt).toBe(episode.firstUnownedAt);
   expect(expired.alerts).toContainEqual(expect.objectContaining({ key, kind: 'pr-stuck' }));
 });
-it('blocked wait expiry creates an alert even with an active owner and no prior episode', async () => {
+it('a blocker annotation does not create a false stall for an active owner', async () => {
   const out = await run({ readPrs: () => [{ ...pr, body: 'blocked by #13', stateSince: now - 481 * minute }, { ...pr, number: 13 }], readSignals: () => ({ [key]: { daemons: [{ name: 'review', kind: 'progress', at: now }] } }) });
-  expect(out.alerts).toContainEqual(expect.objectContaining({ key, kind: 'pr-stuck' }));
+  expect(out.alerts.filter(a => a.key === key)).toEqual([]);
+  expect(out.nextState.episodes[key]).toBeUndefined();
 });
 it.each(['sweep', 'detector'])('unblocks-only annotations preserve the %s finding and remediation', async source => {
   const finding = { repo: pr.repo, pr: 12, head: pr.headRefOid, lane: 'operator', state: 'stalled-head', reason: 'existing operator finding', action: 'repair existing problem', nextAction: 'retain remediation', tags: ['existing'] };
@@ -75,15 +76,17 @@ it('newer active owner progress supersedes repeated tooling refusals', () => {
 it('new bounds resolve defaults, overrides, invalid fallback and provenance', () => {
   const logs = [];
   const defaults = resolvePrSweepSettings({ env: {}, log: line => logs.push(line) });
-  expect(defaults.value).toMatchObject({ blockedWaitMinutes: 480, toolingRefusalWindowMinutes: 360 });
-  for (const [name, envName] of [['blockedWaitMinutes', 'BLOCKED_WAIT_MINUTES'], ['toolingRefusalWindowMinutes', 'TOOLING_REFUSAL_WINDOW_MINUTES']]) {
+  expect(defaults.value).toMatchObject({ toolingRefusalWindowMinutes: 360 });
+  expect(defaults.value).not.toHaveProperty('blockedWaitMinutes');
+  for (const [name, envName] of [['toolingRefusalWindowMinutes', 'TOOLING_REFUSAL_WINDOW_MINUTES']]) {
     const resolved = resolvePrSweepSettings({ env: { [`WE_PR_SWEEP_${envName}`]: '10' }, log: () => {} });
     expect(resolved.value[name]).toBe(10); expect(resolved.sources[name]).toBe('env');
     const invalid = resolvePrSweepSettings({ env: { [`WE_PR_SWEEP_${envName}`]: '0' }, log: () => {} });
     expect(invalid.errors.join(' ')).toContain(name);
     expect(logs.join(' ')).toContain(name);
   }
-  expect(evaluateInvariant(pr, {}, { now, since: now - 11 * minute, blockedBy: [13], settings: { blockedWaitMinutes: 10 } }).violation).toBe('deadline-passed');
+  expect(evaluateInvariant(pr, {}, { now, since: now - 11 * minute, blockedBy: [13], settings: { blockedWaitMinutes: 10 } }))
+    .toEqual(evaluateInvariant(pr, {}, { now, since: now - 11 * minute }));
   expect(evaluateInvariant(pr, {}, { now, daemons: [refusal({ at: now - 11 * minute }), refusal({ at: now - 11 * minute })], settings: { toolingRefusalWindowMinutes: 10 } }).owner).not.toBe('tooling');
 });
 
@@ -94,9 +97,9 @@ it('requests PR authors so owner-authored dependency comments survive discovery'
   } });
   expect(buildBlockedMap(read(pr.repo)).blockedBy.get(12)).toEqual([13]);
 });
-it('retries an unsent blocked-expiry alert without waiting for the old alert backoff', async () => {
+it('retries an unsent scheduled alert with a blocker annotation using the unchanged backoff', async () => {
   const row = { ...pr, body: 'blocked by #13', stateSince: now - 481 * minute };
-  const episode = { head: pr.headRefOid, updatedAt: pr.updatedAt, fingerprint: stateFingerprint(pr), firstUnownedAt: now - 600 * minute, alerted: true, lastAlertAt: now - minute, alertCount: 4 };
+  const episode = { head: pr.headRefOid, updatedAt: pr.updatedAt, fingerprint: stateFingerprint(pr), firstUnownedAt: now - 600 * minute, alerted: true, lastAlertAt: now - 241 * minute, alertCount: 4, blockedExpiryAlerted: true };
   const failed = await run({ dryRun: false, readPrs: () => [row, { ...pr, number: 13 }], readPrevious: () => ({ episodes: { [key]: episode } }),
     notify: () => ({ ok: false, error: 'injected failure' }), flush: () => {}, persist: () => {}, append: () => {}, stallSweep: () => ({ mode: 'off' }) });
   expect(failed.alerts).toContainEqual(expect.objectContaining({ key }));

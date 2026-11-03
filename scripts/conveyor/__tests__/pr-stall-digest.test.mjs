@@ -573,3 +573,11 @@ it('R437 enabled invariant producer marks owner-read failure incomplete and pres
   expect(result.after).toEqual(result.before);
   expect(result.cleared).toEqual([]);
 });
+
+it('persists merged invariant violation metadata alongside the original finding evidence and command', () => {
+  const ctx = setup();
+  const finding = op(12, 'stalled-head', { reason: 'specific failure', evidence: ['original evidence'], command: 'repair-command', owner: 'daemon:review-daemon', nextAction: 'await-review', deadline: '2026-10-21T17:00:00Z', violation: 'deadline-passed', blockedBy: [13] });
+  expect(run(ctx, [finding], { notify: () => ({ ok: true }) }).errors).toEqual([]);
+  expect(replay({ path: ctx.feedPath })[0]).toMatchObject({ violation: 'deadline-passed', owner: finding.owner, nextAction: finding.nextAction, deadline: finding.deadline, command: 'repair-command', evidence: ['original evidence'], state: 'stalled-head', blockedBy: [13] });
+  expect(replay({ path: ctx.feedPath })[0].reason).toContain('specific failure');
+});

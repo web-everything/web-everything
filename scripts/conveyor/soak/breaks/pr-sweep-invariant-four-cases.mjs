@@ -25,11 +25,11 @@ export default {
       detector: async () => ({ enabled: false, items: [], errors: [], nextSeen: {} }),
       readPrs: () => prs, readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: () => ({}), readPrevious: () => ({}) });
     const rows = report.decisions ?? [], violations = [];
-    for (const [number, kind] of [[6254, 'no-labels'], [6193, 'waiting-on-blocked'], [6244, 'deadline-passed'], [6268, 'empty-diff']]) {
+    for (const [number, kind] of [[6254, 'no-labels'], [6193, null], [6244, 'deadline-passed'], [6268, 'empty-diff']]) {
       if (rows.find(p => p.number === number)?.violation !== kind) violations.push(`#${number} missing ${kind}`);
     }
     if (rows[0]?.number !== 6244 || !rows[0]?.unblocks?.includes(6193)) violations.push('blocker does not sort first / lacks unblocks #6193');
-    if (!rows.find(p => p.number === 6193)?.nextAction?.includes('blocked-by #6244')) violations.push('blocked-by #6244 missing');
+    if (!rows.find(p => p.number === 6193)?.blockedBy?.includes(6244) || rows.find(p => p.number === 6193)?.nextAction !== 'fix') violations.push('blocked-by #6244 missing');
     if (rows.find(p => p.number === 6268)?.nextAction !== 'close into card') violations.push('empty diff not closed into card');
     // Additional replay: body-only reverse dependency and repeated fix-tool refusal.
     const refusal = value => ({ name: 'fix-dispatch-daemon', kind: 'refusal', at: now, head: base.headRefOid,
@@ -43,7 +43,8 @@ export default {
       readQueue: () => ({ ready: [], rulingNeeded: [] }), readPrevious: () => ({}),
       readSignals: () => Object.fromEntries([6193, 6270].map(n => [`${repo}#${n}`, { daemons: [refusal('a1'), refusal('b2')] }])) });
     if (added.decisions[0]?.number !== 6244 || !added.decisions[0]?.unblocks.includes(6193)) violations.push('body Unblocks missing');
-    if (added.decisions.find(p => p.number === 6193)?.violation !== 'waiting-on-blocked') violations.push('explicit blocker must win over tooling');
+    if (!added.decisions.find(p => p.number === 6193)?.violation?.startsWith('blocked-by-tooling (')
+      || !added.decisions.find(p => p.number === 6193)?.blockedBy?.includes(6244)) violations.push('dependency annotation must preserve tooling finding');
     const tooling = added.decisions.find(p => p.number === 6270);
     if (tooling?.owner !== 'tooling' || !tooling?.violation?.startsWith('blocked-by-tooling (')
       || tooling?.state !== tooling?.violation || !tooling?.nextAction?.startsWith('fix tooling: ')

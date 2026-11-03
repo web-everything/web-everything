@@ -3831,7 +3831,7 @@ with injected readers in `pr-sweep-invariant-four-cases.soak.test.mjs`; run that
 
 PR dependency edges require the target in the same repository's current open-PR listing.
 The named blocker-removal regression in `pr-sweep.test.mjs` keeps the textual annotation
-unchanged while removing the target, then proves the dependent regains a stall episode and alert.
+unchanged while removing the target, then proves the dependent retains its running stall clock and normal alert schedule.
 
 `prSweep.deadlineMinutes` accepts either a positive scalar for every action budget or a
 per-action map. The settings-to-evaluator contract cases in `pr-sweep.test.mjs` exercise
@@ -3845,7 +3845,7 @@ invariant item, while a complete listing may clear it.
 Dependency extraction uses Markdown block structure to exclude indented code and lazy
 blockquote continuations as well as fences; inline code retains the conservative exclusion
 for unterminated spans. The indented/quoted-example sweep regressions prove these examples
-cannot suppress a stall episode. Empty diffs take precedence over dependency waits in the
+cannot suppress a stall episode. Empty diffs retain their normal closure in the
 action, deadline, violation, legacy report, and digest while preserving dependency metadata.
 The four-case soak keeps a live blocker on its empty-diff fixture to pin that precedence.
 
@@ -3867,22 +3867,31 @@ R437 follow-up: `Unblocks: #N` (or `Unblocks #A, #B`) creates reverse dependenci
 only from PR bodies, using the same Markdown exclusions and confirmed-open targets.
 Two matching fix-dispatch refusal entries produce `blocked-by-tooling`, with a tooling
 owner and repair action. Compare full reasons after removing quoted values, timestamps
-and digits; truncate only the displayed reason to 80 characters. Explicit blockers and
-empty-diff closure keep precedence. `prSweep.toolingDeadlineMinutes` defaults to 240
+and digits; truncate only the displayed reason to 80 characters. Dependency annotations
+never override tooling findings; empty-diff closure keeps precedence. `prSweep.toolingDeadlineMinutes` defaults to 240
 through the existing policy cascade and provenance logger. The added soak replay retains
-the original four incident cases and exercises body-only reverse edges and tooling precedence.
+the original four incident cases and exercises body-only reverse edges alongside tooling findings.
 
 R437 audit hardening: dependency comments count only from the PR author or the shared
 supersede trusted-author gate; discovery must request PR `author` metadata. Body and
-fix-daemon refusal dependencies retain their sources. Drop every cycle-participating edge
-before deriving reverse links. Blocked waits preserve existing stall episodes and their
-alert history; after `prSweep.blockedWaitMinutes` (480 by default), report `deadline-passed`
-with the blocker annotation and alert even if an owner is active.
-Unblocks-only invariant rows annotate existing sweep/detector findings without replacing
-their reason or remediation; retain same-head operator deduplication.
+fix-daemon refusal dependencies retain their sources only with current evidence. Unstructured
+refusal strings without head/time evidence cannot create edges. Drop every cycle-participating
+edge before deriving reverse links. Dependencies are annotation only: they never change an
+action, owner, deadline, stall episode, or alert schedule. The former blocked-wait window is
+removed, including its setting; persisted expiry flags are discarded without resetting clocks
+or alert history. Keep blocked-by/unblocks labels and sort unblockers first. Labels alone
+never manufacture an invariant stall finding for a PR with no violation.
+Invariant rows merge owner, nextAction, deadline and violation into existing same-PR/head
+sweep/detector findings, preserving reason, evidence, command, action and remediation. They
+stand alone only when no same-PR/head finding exists.
 Tooling refusals must match the current head, or be unheaded and strictly newer than the
 head push time (falling back to `updatedAt`), and fall within
 `prSweep.toolingRefusalWindowMinutes` (360 by default). Newer active-owner progress cancels
-the tooling inference. Both bounds use the existing cascade and provenance logger.
+the tooling inference and refusal-derived edges through the same helper. The recency bound
+uses the existing cascade and provenance logger.
 `scripts/conveyor/__tests__/pr-sweep-audit.test.mjs` pins these trust, expiry, cycle, merge,
 attribution and progress guarantees, including unknown timestamps and invalid settings.
+`pr-sweep-annotation-only.test.mjs` adds overdue-alert probes for both edge directions,
+normal invariant equality with/without edges, refusal freshness/progress rejection, and
+generic deadline violations that preserve sweep/detector evidence and remediation.
+The digest persistence probe also requires the merged violation tag to survive feed serialization.

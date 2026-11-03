@@ -1,5 +1,6 @@
 /** R437: report-only PR dependency edges. All text is untrusted Markdown; no IO. */
 import MarkdownIt from 'markdown-it';
+import { currentToolingRefusals, prKey } from './pr-sweep-core.mjs';
 import { isTrustedSupersedeAuthor } from './supersede-rule.mjs';
 const markdown = new MarkdownIt();
 function dependencyText(text) {
@@ -44,7 +45,7 @@ export function parseUnblocks(text) {
 /** Inputs are the current open-PR listing for ONE repository (state may be omitted).
  * Textual references alone never confirm a live blocker; closed, merged and absent targets do not block.
  */
-export function buildBlockedMap(prs) {
+export function buildBlockedMap(prs, { now, settings = {}, owners = {} } = {}) {
   const blockedBy = new Map(), unblocks = new Map();
   const openPrs = prs.filter(pr => pr.state === undefined || (typeof pr.state === 'string' && pr.state.toUpperCase() === 'OPEN'));
   const openNumbers = new Set(openPrs.map(pr => Number(pr.number ?? pr.pr)));
@@ -58,7 +59,7 @@ export function buildBlockedMap(prs) {
         && typeof login === 'string' && login.toLowerCase() === author.toLowerCase());
     });
     const texts = [pr.body, ...comments.map(c => c.body),
-      pr.refusalReason, pr.fixDaemonRefusalReason, ...(pr.daemons ?? []).filter(d => d.kind === 'refusal').map(d => d.reason)];
+      ...currentToolingRefusals(pr.daemons ?? [], pr, (pr.repo ? owners[prKey(pr)] : null) ?? {}, now, settings).map(d => d.reason)];
     const refs = [...new Set(texts.flatMap(parseBlockedBy))].filter(n => n !== number && openNumbers.has(n));
     blockedBy.set(number, refs);
     for (const n of refs) unblocks.set(n, [...new Set([...(unblocks.get(n) ?? []), number])]);

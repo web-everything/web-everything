@@ -98,6 +98,7 @@ export function feedItem(i) {
     ...(i.owner !== undefined ? { owner: i.owner } : {}),
     ...(i.nextAction !== undefined ? { nextAction: i.nextAction } : {}),
     ...(i.deadline !== undefined ? { deadline: i.deadline } : {}),
+    ...(i.violation !== undefined ? { violation: i.violation } : {}),
     evidence: ev.length ? ev : [`waiting state ${i.state}; next: ${i.action ?? 'a person decides'}`] };
 }
 const feedKey = (f) => `${f.repo}#${f.pr}@${f.head}:${STALLED_KIND}`;

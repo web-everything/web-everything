@@ -329,14 +329,14 @@ it('R437 evaluates every open PR, records state clocks and audits dependency ord
     readPrs: () => rows, readQueue: () => ({ ready: [], rulingNeeded: [] }), readPrevious: () => ({}), readSignals: ({ prs }) => Object.fromEntries(prs.map(p => [`${p.repo}#${p.number}`, { daemons: [] }])),
     append: line => lines.push(line), persist: () => {}, flush: () => {}, notify: () => ({ ok: true }),
     stallSweep: () => ({ mode: 'shadow', dir: 'unused', items: [] }), stallDigest: pass => {
-      expect(pass.items.map(p => p.pr)).toEqual([6244, 6193]);
-      expect(pass.items[1].reason).toContain('blocked-by #6244');
+      expect(pass.items.map(p => p.pr)).toEqual([6244]);
+      expect(pass.items[0]).toMatchObject({ violation: 'deadline-passed', unblocks: [6193] });
       return {};
     } });
   expect(out.errors).toEqual([]);
   expect(out.decisions.map(p => p.number)).toEqual([6244, 6193]);
   expect(out.decisions[0].violation).toBe('deadline-passed');
-  expect(out.decisions[1].violation).toBe('waiting-on-blocked');
+  expect(out.decisions[1]).toMatchObject({ violation: null, blockedBy: [6244], nextAction: 'fix' });
   expect(lines.join('')).toContain('unblocks #6193');
   expect(lines.join('')).toContain('blocked-by #6244');
   expect(lines.join('')).toMatch(/owner=.*next=.*deadline=/);
@@ -398,12 +398,12 @@ it('R437 migrates an old alerted episode to a repeat clock and retries a failed 
     notify: () => ({ ok: false, error: 'injected' }), persist: () => {}, append: () => {}, flush: () => {}, stallSweep: () => ({ mode: 'off' }) });
   expect(plan({ prevState: out.nextState, settings: configured, now: now + 31 * 60000 }).alerts).toHaveLength(1);
 });
-it('R437 uses idleMinutes for stale owner evidence and keeps blocked ownership out of stall claims', async () => {
+it('R437 uses idleMinutes for stale owner evidence even with a dependency annotation', async () => {
   const { evaluateInvariant } = await import('../pr-sweep-core.mjs');
   expect(evaluateInvariant(pr, {}, { now, since: now, settings }).violation).toBeNull();
   const owner = { state: 'active', owner: 'daemon:review', ownerLastSeenAt: now - 46 * 60000 };
   expect(evaluateInvariant(pr, owner, { now, since: now, settings }).violation).toBe('owner-stale');
-  expect(evaluateInvariant(pr, owner, { now, since: now, settings, blockedBy: [6244] })).toMatchObject({ violation: 'waiting-on-blocked', nextAction: 'blocked-by #6244' });
+  expect(evaluateInvariant(pr, owner, { now, since: now, settings, blockedBy: [6244] })).toMatchObject({ violation: 'owner-stale', nextAction: 'fix' });
 });
 
 it('R437 settings cascade names sources and rejects invalid backoff and deadlines', async () => {
@@ -418,7 +418,7 @@ it('R437 settings cascade names sources and rejects invalid backoff and deadline
   expect(invalid.errors.join(' ')).toMatch(/deadlineMinutes/);
 });
 
-it('R437 removing the blocker from the open-PR listing restores dependent stall monitoring and alerts', async () => {
+it('R437 removing a blocker annotation preserves the running stall clock and alert history', async () => {
   const dependent = { ...pr, number: 6193, headRefOid: 'a'.repeat(40), body: 'blocked by #6244' };
   const blocker = { ...pr, number: 6244, headRefOid: 'b'.repeat(40) };
   const key = `${pr.repo}#6193`;
@@ -433,14 +433,16 @@ it('R437 removing the blocker from the open-PR listing restores dependent stall 
     return report;
   };
   const blocked = await sweep(0, [dependent, blocker]);
-  expect(blocked.decisions.find(p => p.number === 6193)).toMatchObject({ blockedBy: [6244], violation: 'waiting-on-blocked' });
-  expect(blocked.nextState.episodes[key]).toBeUndefined();
+  expect(blocked.decisions.find(p => p.number === 6193)).toMatchObject({ blockedBy: [6244], violation: null, nextAction: 'fix' });
+  expect(blocked.nextState.episodes[key].firstUnownedAt).toBe(now);
   const released = await sweep(91, [dependent]);
   expect(released.decisions[0].blockedBy).toEqual([]);
   expect(released.decisions[0].violation).not.toBe('waiting-on-blocked');
-  expect(released.nextState.episodes[key].firstUnownedAt).toBe(now + 91 * 60000);
+  expect(released.nextState.episodes[key].firstUnownedAt).toBe(now);
+  expect(released.alerts).toContainEqual(expect.objectContaining({ kind: 'pr-stuck', key }));
   const stalled = await sweep(182, [dependent]);
-  expect(stalled.alerts).toContainEqual(expect.objectContaining({ kind: 'pr-stuck', key }));
+  expect(stalled.alerts.filter(a => a.key === key)).toEqual([]);
+  expect(stalled.nextState.episodes[key].firstUnownedAt).toBe(now);
 });
 
 it.each([
@@ -601,11 +603,11 @@ it('keeps empty-diff closure ahead of tooling with two matching fix refusals', a
   });
   expect(out.decisions[0].owner).not.toBe('tooling');
 });
-it('body Unblocks makes the explicit blocker win over repeated tooling refusals', async () => {
+it('body Unblocks labels do not hide repeated tooling refusals', async () => {
   const out = await toolingSweep([fixRefusal('failure'), fixRefusal('failure')], [pr, { ...pr, number: 6244, body: 'Unblocks: #12' }]);
   expect(out.decisions[0]).toMatchObject({ number: 6244, unblocks: [12] });
-  expect(out.decisions[1]).toMatchObject({ blockedBy: [6244], violation: 'waiting-on-blocked', nextAction: 'blocked-by #6244' });
-  expect(out.decisions[1].owner).not.toBe('tooling');
+  expect(out.decisions[1]).toMatchObject({ blockedBy: [6244], owner: 'tooling', violation: 'blocked-by-tooling (failure)', nextAction: 'fix tooling: failure' });
+  expect(out.decisions[1].owner).toBe('tooling');
 });
 it('tooling deadline resolves and logs cascade provenance and rejects invalid overrides', async () => {
   const { resolvePrSweepSettings } = await import('../pr-sweep.mjs');
