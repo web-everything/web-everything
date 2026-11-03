@@ -220,7 +220,8 @@ export function finishCodexAudit({ run, code, lines, json }) {
   const saved = [v.stdout, v.stderr].filter(Boolean).map(text => text.trimEnd());
   // A non-zero exit (e.g. `--resume=<completed run> --answer=accept` refusing, exit 2) must still show WHY:
   // append the refusal/diagnostic lines the saved verdict does not already carry.
-  const extra = outCode !== 0 ? (lines ?? []).filter(l => l !== '' && !saved.some(s => s.includes(l))) : [];
+  // Only when the CLI exit differs from the audit's own verdict code: a plain WEAKENED (same code) already says why.
+  const extra = code !== 0 && code !== v.code ? (lines ?? []).filter(l => l !== '' && !saved.some(s => s.includes(l))) : [];
   return { code: outCode, lines: [...saved, ...extra] };
 }
 
