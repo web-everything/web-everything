@@ -2,6 +2,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 export default {
   id: 'pr-sweep-invariant-four-cases', title: 'Every open PR has an invariant decision, including fresh and blocked PRs',
   card: 'R437 PR sweep invariant',
@@ -14,7 +15,7 @@ export default {
   async run() {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
     const { runPrSweep } = await import(pathToFileURL(join(root, 'scripts/conveyor/pr-sweep.mjs')).href);
-    const now = Date.parse('2026-11-02T23:00:00Z'), repo = 'web-everything/web-everything';
+    const now = Date.parse('2026-11-02T23:00:00Z'), repo = CONSTELLATION_REPOS.we.slug;
     const base = { repo, headRefOid: 'a'.repeat(40), updatedAt: new Date(now).toISOString(), changedFiles: 5, title: 'replay', labels: [] };
     const prs = [{ ...base, number: 6254 }, { ...base, number: 6193, body: 'blocked by #6244', labels: ['status:fixing'] },
       { ...base, number: 6244, labels: ['red-team:pending'], stateSince: now - 420 * 60000 },

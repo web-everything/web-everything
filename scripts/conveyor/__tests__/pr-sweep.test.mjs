@@ -4,6 +4,7 @@
 import { describe, it, expect } from 'vitest';
 import { classifyIdlePrs, resolveOwner, planSweep } from '../pr-sweep-core.mjs';
 import { collectOwnerSignals, runPrSweep } from '../pr-sweep.mjs';
+import * as completeComments from '../pr-comments-complete.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 const now = Date.parse('2026-10-14T16:00:00Z');
@@ -503,4 +504,43 @@ it('R437 empty diff with a live blocker keeps close-into-card precedence in swee
   expect(report.nextState.episodes[`${pr.repo}#6268`]).toBeDefined();
   expect(digests[0].items.find(p => p.pr === 6268)).toMatchObject({ blockedBy: [6244], state: 'empty-diff', action: 'close into card', nextAction: 'close into card' });
   expect(logs.join('')).toContain('next=close into card');
+});
+
+
+describe('R437 sanctioned dependency comment discovery', () => {
+  const comment = (i) => ({ id: `IC_${i}`, body: `note ${i}`, author: { login: 'operator' } });
+  it('uses one listing for short threads and completes long threads before dependency evaluation', () => {
+    const listed = Array.from({ length: 100 }, (_, i) => comment(i));
+    const last = { ...comment(100), body: 'blocked by #6244' };
+    const calls = [];
+    const read = completeComments.createOpenPrCommentReader({ exec: (_bin, args) => {
+      calls.push(args);
+      if (args[0] === 'pr') return JSON.stringify([{ ...pr, comments: listed }]);
+      if (args.includes('graphql')) return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: 101 } } } } });
+      if (args[1].endsWith('page=1')) return JSON.stringify(listed.map((c, i) => ({ ...c, id: i, node_id: c.id })));
+      return JSON.stringify([{ ...last, id: 100, node_id: last.id }]);
+    } });
+    expect(read(pr.repo)[0]).toMatchObject({ commentsComplete: true, comments: [...listed.map((c, i) => ({ ...c, node_id: c.id, createdAt: undefined })), { ...last, node_id: last.id, createdAt: undefined }] });
+    expect(calls).toHaveLength(4);
+    const shortCalls = [];
+    const short = completeComments.createOpenPrCommentReader({ exec: (_bin, args) => { shortCalls.push(args); return JSON.stringify([{ ...pr, comments: [last] }]); } });
+    expect(short(pr.repo)[0].comments).toEqual([last]);
+    expect(shortCalls).toHaveLength(1);
+  });
+  it('fails closed on missing comment evidence instead of treating it as an empty thread', () => {
+    const read = completeComments.createOpenPrCommentReader({ exec: () => JSON.stringify([pr]) });
+    expect(() => read(pr.repo)).toThrow(/comment/);
+  });
+  it('fails closed on oversized threads with an operator-visible escalation', () => {
+    const rows = Array.from({ length: 100 }, (_, i) => comment(i));
+    const read = completeComments.createOpenPrCommentReader({ maxPages: 1, exec: (_bin, args) => JSON.stringify(args[0] === 'pr' ? [{ ...pr, comments: rows }] : rows) });
+    expect(() => read(pr.repo)).toThrow(/page cap.*operator/i);
+  });
+  it('shares a bounded request budget across repository listings', () => {
+    let calls = 0;
+    const read = completeComments.createOpenPrCommentReader({ maxCalls: 1, exec: () => { calls++; return '[]'; } });
+    expect(read(pr.repo)).toEqual([]);
+    expect(() => read(pr.repo)).toThrow(/budget.*operator/i);
+    expect(calls).toBe(1);
+  });
 });

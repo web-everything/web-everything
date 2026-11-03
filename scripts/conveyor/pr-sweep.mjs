@@ -18,6 +18,7 @@ import { notifyDesktopChecked } from './branch-sync.mjs';
 import { flushDigest } from '../lib/quiet-hours-io.mjs';
 import { classifyIdlePrs, resolveOwner, planSweep, prKey, isRunningSession, evaluateInvariant, stateFingerprint, stateSince, DEADLINE_MINUTES } from './pr-sweep-core.mjs';
 import { buildBlockedMap, sortUnblockersFirst } from './pr-blocked-by.mjs';
+import { createOpenPrCommentReader } from './pr-comments-complete.mjs';
 import { sanitizeForFeed } from '../operations/needs-you-feed.mjs';
 import { runStallSweep } from './pr-stall-sweep.mjs';
 import { publishStalledDigest } from './pr-stall-digest.mjs';
@@ -153,8 +154,9 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
   if (settings) console.error(formatCascadeSourcesLine('prSweep', resolved));
   const previous = await safe('previous sweep', () => readPrevious ? readPrevious() : (existsSync(join(dir, 'pr-sweep.json')) ? JSON.parse(readFileSync(join(dir, 'pr-sweep.json'), 'utf8')).nextState : {}), {});
   const prs = []; let prsReadOk = true;
+  const readOpenPrs = readPrs ?? createOpenPrCommentReader({ env });
   for (const repo of value.repos) {
-    const rows = await safe(`prs ${repo}`, async () => readPrs ? readPrs(repo) : JSON.parse(await command('gh', ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '1000', '--json', 'number,title,labels,isDraft,updatedAt,headRefOid,changedFiles,additions,body,comments'], env)), null);
+    const rows = await safe(`prs ${repo}`, () => readOpenPrs(repo), null);
     if (!Array.isArray(rows) || rows.some((p) => !p || !Number.isInteger(Number(p.number)) || Number(p.number) <= 0 || !Number.isFinite(Date.parse(p.updatedAt)) || typeof p.headRefOid !== 'string')) {
       if (rows !== null) errors.push(`prs ${repo}: invalid PR listing`);
       prsReadOk = false; continue;
