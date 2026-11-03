@@ -3833,8 +3833,9 @@ PR dependency edges require the target in the same repository's current open-PR 
 The named blocker-removal regression in `pr-sweep.test.mjs` keeps the textual annotation
 unchanged while removing the target, then proves the dependent regains a stall episode and alert.
 The named cross-repository number-collision regression lists the same dependent number in
-two repositories, with its blocker open only in one. Both listing orders must preserve the
-other repository's stall episode and eventual alert. Its same-repository control uses
+two repositories, with its blocker open only in one and absent or merged in the other.
+Both listing orders must preserve the other repository's stall episode and eventual alert.
+Its same-repository control uses
 `Blocked by: #6244`; dependency phrases accept an optional colon, still excluding quoted
 examples and references split across lines.
 

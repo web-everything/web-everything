@@ -443,14 +443,19 @@ it('R437 removing the blocker from the open-PR listing restores dependent stall 
   expect(stalled.alerts).toContainEqual(expect.objectContaining({ kind: 'pr-stuck', key }));
 });
 
-it.each(['dependent repo first', 'blocker repo first'])
-  ('R437 cross-repository number collisions never suppress stall monitoring (%s)', async order => {
+it.each([
+  ['dependent repo first', 'absent'], ['blocker repo first', 'absent'],
+  ['dependent repo first', 'merged'], ['blocker repo first', 'merged'],
+])
+  ('R437 cross-repository number collisions never suppress stall monitoring (%s; target %s in dependent repo)', async (order, targetState) => {
     const otherRepo = 'plateauapp/plateau-app';
     const dependent = { ...pr, number: 6193, headRefOid: 'a'.repeat(40), body: 'Blocked by: #6244' };
     const otherDependent = { ...dependent, repo: otherRepo, headRefOid: 'b'.repeat(40) };
     const blocker = { ...pr, repo: otherRepo, number: 6244, headRefOid: 'c'.repeat(40) };
     const repos = order === 'dependent repo first' ? [pr.repo, otherRepo] : [otherRepo, pr.repo];
-    const rows = { [pr.repo]: [dependent], [otherRepo]: [otherDependent, blocker] };
+    // A merged local target cannot borrow the open status of the same number in another repo.
+    const localRows = targetState === 'merged' ? [dependent, { ...blocker, repo: pr.repo, state: 'MERGED' }] : [dependent];
+    const rows = { [pr.repo]: localRows, [otherRepo]: [otherDependent, blocker] };
     const key = `${pr.repo}#6193`, otherKey = `${otherRepo}#6193`;
     let previous = {};
     const tick = async minutes => {
@@ -462,6 +467,7 @@ it.each(['dependent repo first', 'blocker repo first'])
         detector: async () => ({ enabled: false, items: [], errors: [], nextSeen: {} }) });
       expect(reads).toEqual(repos);
       expect(report.errors).toEqual([]);
+      expect(report.decisions.filter(p => p.repo === pr.repo && p.number === 6244)).toEqual([]);
       const decision = report.decisions.find(p => p.repo === pr.repo && p.number === 6193);
       expect(decision.blockedBy).toEqual([]);
       expect(decision.violation).not.toBe('waiting-on-blocked');
