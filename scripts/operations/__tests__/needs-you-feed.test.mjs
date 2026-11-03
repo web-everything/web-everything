@@ -510,6 +510,21 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     const { kept } = await gateReadyItems(itemsFromReport(r), r, { gh: gate({ headRefOid: head, labels: [] }, gateComments({ pr: 9 })), log: () => {} });
     expect(kept[0]).toEqual({ ...itemsFromReport(r)[0], head });
   });
+  it('a confirmed break is classified before the human-review hold: red-team:blocked does not hide the alert', async () => {
+    const r = { needsYourMerge: [{ repo, number: 6239, title: 'm' }], ready: [] };
+    const { kept, held } = await gateReadyItems(itemsFromReport(r), r, { gh: gate({ headRefOid: head, labels: [{ name: 'red-team:blocked' }] },
+      gateComments({ pr: 6239, broken: true, impact: 'degraded' }).slice(0, 1)), log: () => {} });
+    expect(held).toEqual([]);
+    expect(kept[0]).toMatchObject({ pr: 6239, kind: 'confirmed-break-owed-send-back' });
+  });
+  it.each([['confirmed', () => gateComments({ pr: 6239, broken: true }).slice(0, 1)], ['undecided', () => []]])('a %s reclassified item drops the merge command and pick', async (_n, comments) => {
+    const r = { needsYourMerge: [{ repo, number: 6239, title: 'm', command: 'land-human-only', pick: 'merge it' }], ready: [] };
+    expect(itemsFromReport(r)[0].command ?? itemsFromReport(r)[0].pick).toBeTruthy();
+    const { kept } = await gateReadyItems(itemsFromReport(r), r, { gh: gate({ headRefOid: head, labels: [] }, comments()), log: () => {} });
+    expect(kept[0].kind).not.toBe('needs-you');
+    expect(kept[0]).not.toHaveProperty('command');
+    expect(kept[0]).not.toHaveProperty('pick');
+  });
   it('keeps red-team-undecided when the live PR cannot be read, and logs it', async () => {
     const logs = [];
     const { kept } = await gateReadyItems(items(), report, { gh: async () => { throw new Error('rate limited'); }, log: (l) => logs.push(l) });
