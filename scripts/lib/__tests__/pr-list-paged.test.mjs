@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   buildOpenPrPageQuery, mapGraphqlPr, parseOpenPrPage, isTransientGhFailure, heavyIsFresh,
-  listOpenPrsLightPaged, listOpenPrsPagedHydrated, hydrateHeavyFields, resolvePrListPaging, PrListUnreadableError,
+  listOpenPrsLightPaged, listOpenPrsPagedHydrated, assertInventoryComplete, listOpenPrsPagedHydratedComplete, hydrateHeavyFields, resolvePrListPaging, PrListUnreadableError,
   HEAVY_FIELDS, PAGED_LIGHT_FIELDS, PR_LIST_PAGING_DEFAULTS, PR_LIST_PAGE_SIZE_ENV,
 } from '../pr-list-paged.mjs';
 
@@ -309,5 +309,23 @@ describe('paged hydrated listing', () => {
     expect(error).toBeInstanceOf(PrListUnreadableError);
     expect(error).toMatchObject({ unreadable: true, stage: 'hydrate', number: 2 });
     expect(cache).toEqual(before);
+  });
+});
+
+describe('inventory completeness (fewer rows than GitHub reported is never a complete list)', () => {
+  const emptyPage = (totalCount) => () => JSON.stringify({ data: { repository: { pullRequests: { nodes: [], totalCount,
+    pageInfo: { hasNextPage: false, endCursor: null } } } } });
+  it('assertInventoryComplete names the shortfall and passes complete or truncated-declared lists', () => {
+    expect(() => assertInventoryComplete({ repo: 'owner/name', rows: [], totalCount: 7 })).toThrow(PrListUnreadableError);
+    expect(() => assertInventoryComplete({ repo: 'owner/name', rows: [], totalCount: 7 })).toThrow(/0 of 7/);
+    expect(() => assertInventoryComplete({ repo: 'owner/name', rows: [{}], totalCount: 1 })).not.toThrow();
+    expect(() => assertInventoryComplete({ repo: 'owner/name', rows: [], totalCount: 7, truncated: true })).not.toThrow();
+    expect(() => assertInventoryComplete({ repo: 'owner/name', rows: [], totalCount: undefined })).not.toThrow();
+  });
+  it('the drain-facing listing refuses a short inventory instead of returning it', () => {
+    const paging = { pageSize: 20, pageRetries: 0, heavyMaxAgeSeconds: 600 };
+    expect(() => listOpenPrsPagedHydratedComplete({ repo: 'owner/name', exec: emptyPage(7), paging, heavyFields: [] }))
+      .toThrow(/0 of 7/);
+    expect(listOpenPrsPagedHydratedComplete({ repo: 'owner/name', exec: emptyPage(0), paging, heavyFields: [] }).rows).toEqual([]);
   });
 });

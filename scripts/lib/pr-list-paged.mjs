@@ -222,3 +222,18 @@ export function listOpenPrsPagedHydrated({ repo, exec, paging, heavyFields, need
   return { rows, truncated: light.truncated, totalCount: light.totalCount, pages: light.pages,
     ms: light.ms, hydrated, reused, cache: nextCache };
 }
+
+/** PURE: fewer rows than GitHub's own `totalCount` (without a declared truncation) is a partial inventory. It must
+ *  fail closed with a named reason, never be reported as a complete list. */
+export function assertInventoryComplete({ repo, rows, totalCount, truncated = false }) {
+  if (truncated || !Number.isInteger(totalCount) || rows.length >= totalCount) return;
+  throw new PrListUnreadableError({ repo, stage: 'page', page: 'inventory',
+    cause: new Error(`pages carried ${rows.length} of ${totalCount} open PRs — refusing a partial inventory`) });
+}
+
+/** {@link listOpenPrsPagedHydrated} that refuses a short inventory (drain-facing). */
+export function listOpenPrsPagedHydratedComplete(o) {
+  const listed = listOpenPrsPagedHydrated(o);
+  assertInventoryComplete({ repo: o.repo, rows: listed.rows, totalCount: listed.totalCount, truncated: listed.truncated });
+  return listed;
+}

@@ -202,6 +202,13 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
     expect(whole.discoveryIncomplete).toBeUndefined();
   });
 
+  it('a short inventory (fewer rows than totalCount) is never published as a complete snapshot', () => {
+    const exec = () => JSON.stringify({ data: { repository: { pullRequests: { nodes: [], totalCount: 7,
+      pageInfo: { hasNextPage: false, endCursor: null } } } } });
+    expect(() => readSharedOpenPrs(opts({ fields: 'number', exec }))).toThrow(/0 of 7/);
+    expect(readSharedOpenPrs(opts({ fields: 'number', exec: fakeExec().exec }))).toHaveLength(PRS.length);
+  });
+
   it.each([false, true])('failed pages never publish or update a snapshot (previous=%s)', previous => {
     const many = Array.from({ length: 21 }, (_, i) => ({ ...PRS[0], number: i }));
     const fake = fakeExec(many);

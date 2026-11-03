@@ -39,7 +39,7 @@
 import { isUnderTest } from './under-test.mjs';
 import { isGhDeferred } from './gh-deferred.mjs';
 import { resolveSmokeDryRun } from './smoke-dry-run-settings.mjs';
-import { listOpenPrsLightPaged, hydrateHeavyFields, resolvePrListPaging } from './pr-list-paged.mjs';
+import { assertInventoryComplete, listOpenPrsLightPaged, hydrateHeavyFields, resolvePrListPaging } from './pr-list-paged.mjs';
 import { mkdirSync, readFileSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -179,6 +179,7 @@ export function fetchSnapshot({ repo, prevCount, prev = null, exec = execFileSyn
   const light = listOpenPrsLightPaged({ repo, exec, pageSize: paging.pageSize, pageRetries: paging.pageRetries,
     maxRows: MAX_LIMIT, execOpts: { throttle: { op: 'pr list (snapshot page)', deferrable } } });
   if (light.deferred) return light.deferred;
+  assertInventoryComplete({ repo, rows: light.rows, totalCount: light.totalCount, truncated: light.truncated });
   const cache = {};
   for (const p of prev?.prs ?? []) {
     if (prev.heavyMeta?.[p.number]) {
