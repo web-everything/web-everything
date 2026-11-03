@@ -305,7 +305,7 @@ export function proveRetirement({ root, entry, env = process.env, run = spawnSyn
 
 /**
  * A squash merge leaves the branch tip off main and (after deletion) unfetchable, so the ancestry proof cannot see it.
- * Prove it from GitHub instead: the ref is absent on origin, exactly ONE merged PR headed it in the origin repository, its head commit is
+ * Prove it from GitHub instead: the ref is absent on origin, exactly ONE PR headed it and is merged in the origin repository, its head commit is
  * the tip, and its merge commit is an ancestor of origin/main. Any missing, unreadable or ambiguous answer returns null.
  * @returns {{ref:string, action:'retire', reason:'pr-squash-merged', tip:string, pr:number, evidence:object}|null}
  */
@@ -314,14 +314,15 @@ export function proveSquashMerged({ root, entry, env = process.env, run = spawnS
   if (remoteTip({ root, ref: entry.ref, env, run }) !== null) return null; // still on origin (or unreadable): not this case
   const { gh, repo: slug } = retirementGitHub({ root, env, run });
   if (!/^[\w.-]+\/[\w.-]+$/.test(slug)) return null;
-  const list = gh(['pr', 'list', '--repo', slug, '--head', entry.ref, '--state', 'merged', '--json', 'number,state,headRefName,headRefOid,mergeCommit,headRepository,isCrossRepository', '--limit', '10']);
+  const list = gh(['pr', 'list', '--repo', slug, '--head', entry.ref, '--state', 'all', '--json', 'number,state,headRefName,headRefOid,mergeCommit,headRepository,isCrossRepository', '--limit', '10']);
   if (list.code !== 0) return null;
   let prs;
   try { prs = JSON.parse(list.stdout || 'null'); } catch { return null; }
-  if (!Array.isArray(prs)) return null;
-  const hits = prs.filter((p) => p?.headRefName === entry.ref && p?.state === 'MERGED');
-  if (hits.length !== 1) return null;
-  const [pr] = hits;
+  // Match the loader's proof: any other PR can belong to a later reuse, even when closed without merging.
+  // A full, possibly truncated page is ambiguous too; never filter it down to one historical merge.
+  if (!Array.isArray(prs) || prs.length !== 1) return null;
+  const [pr] = prs;
+  if (pr?.headRefName !== entry.ref || pr?.state !== 'MERGED') return null;
   if (pr.isCrossRepository !== false || typeof pr.headRepository?.nameWithOwner !== 'string'
     || pr.headRepository.nameWithOwner.toLowerCase() !== slug.toLowerCase()) return null;
   if (Number.isInteger(entry.pr) && entry.pr !== pr.number) return null;

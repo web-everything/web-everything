@@ -198,19 +198,20 @@ export function planRetirements({ rows, git, gh, repo, mainRef = 'origin/main' }
 
 /**
  * A registration whose branch could not be fetched (usually deleted after its PR merged). Retire it only when GitHub
- * names exactly ONE MERGED PR headed by the ref in the origin repository (matching a recorded PR number) and its merge commit is an
+ * names exactly ONE PR headed by the ref, which is MERGED in the origin repository (matching a recorded PR number), and its merge commit is an
  * ancestor of `mainRef`. The overlay CLI re-proves the same facts before it drops anything. Any unreadable,
  * ambiguous or missing answer keeps the row as `fetch-failed`.
  */
 export function planFetchFailed({ row, git, gh, repo, mainRef = 'origin/main' }) {
   const keep = { ref: row.ref, action: 'keep', reason: 'fetch-failed' };
   if (row.edgeResolution || !/^[\w.-]+\/[\w.-]+$/.test(String(repo || ''))) return keep;
-  const list = ghJson(gh, ['pr', 'list', '--repo', repo, '--head', row.ref, '--state', 'merged',
+  const list = ghJson(gh, ['pr', 'list', '--repo', repo, '--head', row.ref, '--state', 'all',
     '--json', 'number,state,headRefName,headRefOid,mergeCommit,headRepository,isCrossRepository', '--limit', '10']);
-  if (!list.ok || !Array.isArray(list.value)) return keep;
-  const hits = list.value.filter((pr) => pr?.headRefName === row.ref && pr?.state === 'MERGED');
-  if (hits.length !== 1) return keep;
-  const [pr] = hits;
+  // A closed/open PR can carry newer work under a reused name. Count every result before checking state;
+  // multiple results (including a full, possibly truncated page) cannot prove which registration merged.
+  if (!list.ok || !Array.isArray(list.value) || list.value.length !== 1) return keep;
+  const [pr] = list.value;
+  if (pr?.headRefName !== row.ref || pr?.state !== 'MERGED') return keep;
   if (pr.isCrossRepository !== false || typeof pr.headRepository?.nameWithOwner !== 'string'
     || pr.headRepository.nameWithOwner.toLowerCase() !== String(repo).toLowerCase()) return keep;
   if (Number.isInteger(row.pr) && row.pr !== pr.number) return keep;

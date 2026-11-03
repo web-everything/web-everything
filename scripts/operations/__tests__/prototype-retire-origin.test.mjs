@@ -46,6 +46,35 @@ const paths = [
   ['CLI re-proof', (p) => proveRetirement({ root: process.cwd(), entry: p.row, run: p.run })],
 ];
 
+describe.each(paths)('deleted reused branch: %s', (_name, decide) => {
+  it.each(['CLOSED', 'OPEN', 'MERGED'])('keeps an old merge alongside a newer %s PR', (state) => {
+    const prs = [merged(), merged({ number: 8, state, headRefOid: 'c'.repeat(40),
+      mergeCommit: state === 'MERGED' ? { oid: 'd'.repeat(40) } : null })];
+    for (const pr of [null, 7, 8]) {
+      const p = proof(prs, { ref: REF, pr });
+      const original = p.gh.getMockImplementation();
+      // Model GitHub's state filter: a merged-only lookup hides the reused branch's work.
+      p.gh.mockImplementation((args) => args[0] === 'pr' && args[1] === 'list'
+        ? { code: 0, stdout: JSON.stringify(args[args.indexOf('--state') + 1] === 'merged'
+          ? prs.filter((candidate) => candidate.state === 'MERGED') : prs) }
+        : original(args));
+      expect(decide(p)).toMatchObject({ action: 'keep', reason: 'fetch-failed' });
+    }
+  });
+
+  it('requests all states before accepting a unique merged PR', () => {
+    const p = proof([merged()]);
+    expect(decide(p)).toMatchObject({ action: 'retire', pr: 7 });
+    const args = p.gh.mock.calls.find(([args]) => args[0] === 'pr')[0];
+    expect(args[args.indexOf('--state') + 1]).toBe('all');
+  });
+
+  it('keeps a full result page with only one merged PR', () => {
+    const prs = [merged(), ...Array.from({ length: 9 }, (_, i) => merged({ number: i + 8, state: 'CLOSED', mergeCommit: null }))];
+    expect(decide(proof(prs))).toMatchObject({ action: 'keep', reason: 'fetch-failed' });
+  });
+});
+
 describe.each(paths)('deleted origin head identity: %s', (_name, decide) => {
   it.each([undefined, 7])('keeps an unrelated same-named fork even with recorded PR %s', (pr) => {
     const p = proof([merged({ isCrossRepository: true, headRepository: { nameWithOwner: 'contributor/web-everything' } })], { ref: REF, pr });
