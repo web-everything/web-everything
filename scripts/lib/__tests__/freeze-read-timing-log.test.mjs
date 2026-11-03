@@ -30,4 +30,11 @@ describe('freeze-read-timing-log', () => {
     expect(() => run(['fetch'], { cwd: '/nonexistent' })).toThrow(boom);
     expect(lines[0]).toContain('"err":"ETIMEDOUT"');
   });
+  it('adds no snapshot work near the deadline', () => {
+    const lines = [];
+    const run = instrumentGit(() => 'out', { log: (l) => lines.push(l), deadlineAt: Date.now() + 100 });
+    run(['fetch'], { cwd: '/nonexistent' });
+    expect(lines[0]).toContain('"postSkipped":"near-deadline"');
+    expect(lines[0]).not.toContain('"pre":{');
+  });
 });

@@ -68,12 +68,13 @@ function appendLog(line, file = TIMING_LOG) {
  * Wrap a git runner (args, opts) -> string. Only a `fetch` gets trace env (scoped to that one child via opts.env). Same
  * result/throw as `run`. Logs every fetch, plus any call that fails or exceeds `slowMs`.
  */
-export function instrumentGit(run, { label = 'freeze-read', slowMs = 5000, log = appendLog } = {}) {
+export function instrumentGit(run, { label = 'freeze-read', slowMs = 5000, log = appendLog, deadlineAt = null, marginMs = 3000 } = {}) {
+  const tight = () => deadlineAt != null && deadlineAt - Date.now() < marginMs; // near the read's deadline: add no extra work
   return (args, opts = {}) => {
     let tdir = null; let runOpts = opts; let pre = null;
     const t0 = Date.now(); const d0 = new Date(); const startClock = ((d0.getHours() * 60 + d0.getMinutes()) * 60 + d0.getSeconds()) * 1000 + d0.getMilliseconds();
     try {
-      pre = contentionSnapshot(opts.cwd);
+      if (!tight()) pre = contentionSnapshot(opts.cwd);
       if (args[0] === 'fetch') {
         tdir = mkdtempSync(join(tmpdir(), 'freeze-trace-'));
         runOpts = { ...opts, env: { ...(opts.env || process.env), GIT_TRACE2_EVENT: join(tdir, 't2'), GIT_TRACE_PACKET: join(tdir, 'pkt') } };
@@ -90,7 +91,7 @@ export function instrumentGit(run, { label = 'freeze-read', slowMs = 5000, log =
             const rd = (f) => { try { const fd = openSync(join(tdir, f), 'r'); try { const b = Buffer.alloc(TRACE_READ_CAP); return b.toString('utf8', 0, readSync(fd, b, 0, TRACE_READ_CAP, 0)); } finally { closeSync(fd); } } catch { return ''; } };
             rec.children = summarizeTrace2(rd('t2')); rec.packets = summarizePackets(rd('pkt'), startClock);
           }
-          try { rec.post = contentionSnapshot(opts.cwd); } catch { /* ignore */ }
+          try { if (!tight()) rec.post = contentionSnapshot(opts.cwd); else rec.postSkipped = 'near-deadline'; } catch { /* ignore */ }
           log(formatTimingLine(rec));
         }
       } catch { /* log-only: never affects the call */ }

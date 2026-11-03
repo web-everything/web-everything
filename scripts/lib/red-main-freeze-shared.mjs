@@ -227,7 +227,7 @@ export async function publishFreezeFromCli({ marker, clear = false, lifted, env 
  * Read the shared freeze for the merge-gate. Never throws; anything unreadable is `{source, error}` (fail closed).
  * @returns {{source:string, frozen?:boolean, reason?:string|null, at?:string|null, publishedAt?:string|null, mergeSha?:string|null, error?:string}}
  */
-export function readSharedFreeze({ board = REPO_ROOT, branch = resolveFreezeBranch(), run, runFor = (ms, deadlineAt) => (process.env.WE_FREEZE_READ_TIMING === '0' ? timedGit(ms, { deadlineAt }) : instrumentGit(timedGit(ms, { deadlineAt }))) } = {}) {
+export function readSharedFreeze({ board = REPO_ROOT, branch = resolveFreezeBranch(), run, runFor = (ms, deadlineAt) => (process.env.WE_FREEZE_READ_TIMING === '0' ? timedGit(ms, { deadlineAt }) : instrumentGit(timedGit(ms, { deadlineAt }), { deadlineAt })) } = {}) {
   const source = flatText(`${branch}:${SHARED_FREEZE_FILE}`);
   const isTimeout = (e) => e?.code === 'ETIMEDOUT' || /ETIMEDOUT|timed out/i.test(String(e?.message || ''));
   const attempt = (r) => readFromTransportBranch({ board, branch, paths: [SHARED_FREEZE_FILE], run: r })[SHARED_FREEZE_FILE];
