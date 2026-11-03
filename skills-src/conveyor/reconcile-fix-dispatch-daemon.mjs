@@ -69,7 +69,7 @@ import { createQueueBudget } from '../../scripts/readiness/heavy-queue-projectio
 import { execFileSyncThrottled } from '../../scripts/lib/gh-throttle.mjs';
 import { readStacksForPass } from '../../scripts/conveyor/pr-stack.mjs';
 import { applyNetScopeToReconcile } from '../../scripts/conveyor/net-scope.mjs';
-import { runReconcilePass, defaultReadPrs, enrichPrsWithCodeQL, PR_LIST_LIMIT } from '../../scripts/conveyor/reconcile-pass.mjs'; // #4191
+import { runReconcilePass, defaultReadPrs, defaultReadAgents, enrichPrsWithCodeQL, PR_LIST_LIMIT } from '../../scripts/conveyor/reconcile-pass.mjs'; // #4191
 import { createResourceFixThrottle } from '../../scripts/lib/resource-gate.mjs'; // x6nuodj: dynamic fixer cap + host gate via admit()
 import { createDispatchSinks } from '../../scripts/operations/dispatch-lane-io.mjs';
 import { repoProfile } from '../../scripts/lib/repo-profile.mjs';
@@ -752,9 +752,16 @@ export function readPlanFingerprints(repo, { exec = (...args) => execFileSyncThr
   return new Map(rows.map((pr) => [pr.number, prFingerprint(pr)]));
 }
 
-/** Default live claim probe: the set of PRs holding a live fix/ci-heal claim right now. */
-export function readPlanClaims() {
-  return new Set(listFixDispatchClaims(undefined, { liveOnly: true }).map((c) => `${c.meta.repo}:${c.meta.pr}`));
+/**
+ * Default live probe for claims and sessions: `claim:<repo>:<pr>` for every live fix/ci-heal claim, and
+ * `agent:<id>` for every live agent session (the planner's liveness gate reads these).
+ */
+export function readPlanClaims({ readAgents = () => defaultReadAgents() } = {}) {
+  const out = new Set(listFixDispatchClaims(undefined, { liveOnly: true }).map((c) => `claim:${c.meta.repo}:${c.meta.pr}`));
+  const agents = readAgents();
+  if (!Array.isArray(agents)) throw new Error('plan agent probe unreadable');
+  for (const a of agents) out.add(`agent:${a?.sessionId ?? a?.pid ?? a?.name}`);
+  return out;
 }
 
 /**
@@ -780,8 +787,12 @@ export function createReconcilePlanCache({ reconcile = (input) => runReconcilePa
     const stale = new Set(touched.get(repo) ?? []);
     for (const [pr, fp] of baseline.prs) if (live.prs.get(pr) !== fp) stale.add(pr);
     for (const [pr] of live.prs) if (!baseline.prs.has(pr)) stale.add(pr);
-    const claimPr = (key) => Number(String(key).split(':').pop());
-    for (const key of live.claims) if (!baseline.claims.has(key)) stale.add(claimPr(key));
+    for (const key of live.claims) {
+      if (baseline.claims.has(key)) continue;
+      // A session that appeared since the plan could bind to any PR: the liveness gate must be re-run, so every row is stale.
+      if (key.startsWith('agent:')) return 'all';
+      stale.add(Number(key.split(':').pop()));
+    }
     return stale;
   };
   const read = (repo) => {
@@ -790,9 +801,9 @@ export function createReconcilePlanCache({ reconcile = (input) => runReconcilePa
     try {
       const stale = staleSet(repo, entry.baseline);
       const plan = structuredClone(entry.plan);
-      const drop = (row) => !stale.has(row?.prNumber ?? row?.pr);
+      const drop = (row) => stale !== 'all' && !stale.has(row?.prNumber ?? row?.pr);
       for (const key of ['dispatch', 'notes', 'owedTriggers']) if (Array.isArray(plan[key])) plan[key] = plan[key].filter(drop);
-      const captured = structuredClone(entry.captured).filter((pr) => !stale.has(pr?.number));
+      const captured = structuredClone(entry.captured).filter((pr) => stale !== 'all' && !stale.has(pr?.number));
       return { plan, captured };
     } catch { entries.delete(repo); return null; }
   };

@@ -1870,7 +1870,7 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
 
   it('drops rows for a PR that gained a live fix claim after the plan was made', async () => {
     let reads = 0;
-    const plan = await readBack({ readPlanClaimSet: () => (reads++ < 1 ? new Set() : new Set(['repo-a:8'])) });
+    const plan = await readBack({ readPlanClaimSet: () => (reads++ < 1 ? new Set() : new Set(['claim:repo-a:8'])) });
     expect(plan.dispatch).toEqual([{ kind: 'ci-heal', prNumber: 7 }]);
   });
 
@@ -1913,5 +1913,13 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     expect(typeof args.exec).toBe('function');
     expect(args.exec).not.toBe(execFileSyncThrottled);
     expect(args.attributionRepo).toBe('web-everything/web-everything');
+  });
+
+  it('a session that appeared since the plan was made forces every dispatch row out (liveness gate must re-run)', async () => {
+    let reads = 0;
+    const plan = await readBack({ readPlanClaimSet: () => (reads++ < 1 ? new Set(['agent:s1']) : new Set(['agent:s1', 'agent:s2'])) });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.notes).toEqual([]);
+    expect(plan.refusals).toHaveLength(1);
   });
 });
