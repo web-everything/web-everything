@@ -529,7 +529,7 @@ export function orchestratorDelegateReason(command, ctx = {}) {
         && prefix.every((word, i) => word === words[i])))) return true;
     }
     // Keep data heredocs opaque, but scan stdin scripts with the same bounded traversal as shell -c.
-    const nested = [...substitutionBodies(raw), ...segments.flatMap(nestedCommandStrings)];
+    const nested = [...substitutionBodies(raw), ...segments.flatMap((seg) => nestedCommandStrings(seg))];
     for (const segment of segments) {
       const tokens = shellTokens(segment);
       const at = tokens.findIndex(token => token.op && /^(?:0)?<<<$/.test(token.text));
@@ -1473,7 +1473,7 @@ function trailingGroupTail(s) {
  * Deliberately NOT a shell: no expansion, no `$VAR` resolution — the #2367 accidental-collision threat
  * model. It only reads text that bash will re-parse as a command, which is the coverage r1–r4 lost.
  */
-export function nestedCommandStrings(segment) {
+export function nestedCommandStrings(segment, unknownPrefixNames = new Set()) {
   const s = String(segment || '');
   if (!s.trim()) return [];
   const out = substitutionBodies(s);
@@ -1496,7 +1496,11 @@ export function nestedCommandStrings(segment) {
   // or `MAIN_SESSION_BUILD_OK=1 bash -c "npm run build"` becomes a deny with no way out. Deliberately NOT
   // carried onto a `$( … )` body: bash expands a substitution BEFORE applying the prefix, so it does not
   // see it there (`FOO=1 echo "$(echo $FOO)"` prints empty) — and assuming it did would be a loosening.
-  const envPrefix = (s.replace(/^\s+/, '').match(/^(?:env\s+)?((?:[A-Za-z_]\w*=\S*\s+)*)/) || [, ''])[1];
+  const envPrefix = ((s.replace(/^\s+/, '').match(/^(?:env\s+)?((?:[A-Za-z_]\w*=\S*\s+)*)/) || [, ''])[1])
+    // The scope tracker can flag attributes that transform a command-local value. Do not stamp its raw
+    // text back onto every child command as proof that the transformed value is safe.
+    .replace(/([A-Za-z_]\w*)=\S*/g, (assignment, key) =>
+      unknownPrefixNames.has(key) ? `${key}=\${${key}}` : assignment);
   // The prefix reaches EVERY command in the re-executed string (`FOO=1 sh -c "a && b"` runs both a and b
   // with FOO set), so it is stamped onto each SEGMENT rather than onto the string as a whole.
   const reexec = (text) => {
@@ -2301,8 +2305,10 @@ export function daemonCloneWriteReason(segment, { cwd = null, roots = [], envDir
     // #xpt9fvd — fetch diagnosis stays allowed (it only updates remote-tracking refs), UNLESS it writes a local
     // branch (a refspec `src:<branch>` or --update-head-ok can move the checked-out branch under the working tree).
     if (sub === 'fetch') {
-      let config = fetchConfig;
-      if (daemonFetchConfigReader) {
+      // An uncertain environment cannot identify the repository whose persisted refspecs we need.
+      // Reading configuration under a raw, possibly transformed value could certify the wrong target.
+      let config = unknownTarget ? null : fetchConfig;
+      if (!unknownTarget && daemonFetchConfigReader) {
         try { config = daemonFetchConfigReader(s, cwd, envDirs, configEnv); } catch { config = null; }
       }
       if (!fetchWritesLocalBranch(s, config)) return null;
@@ -4989,12 +4995,15 @@ export function decide(command, ctx = {}) {
   // first applies future exports to earlier commands and lets assignments in child shells leak out.
   let nestedBudget = NESTED_NODE_CAP;
   const copyAlternates = (from) => new Map([...from].map(([key, values]) => [key, new Set(values)]));
-  const checkScope = (list, whole, inherited, depth, persist = null, inheritedReadonly = [], inheritedAlternates = new Map(), inheritedMaybeReadonly = []) => {
+  const checkScope = (list, whole, inherited, depth, persist = null, inheritedReadonly = [], inheritedAlternates = new Map(), inheritedMaybeReadonly = [], inheritedAttributes = []) => {
     const gitConfigEnv = { ...inherited };
     const readonlyNames = new Set(inheritedReadonly);
     // Names a possibly-skipped `readonly` may have locked: a later assignment or unset may fail, so it only
     // adds a possible value and never replaces the locked one.
     const maybeReadonly = new Set(inheritedMaybeReadonly);
+    // Unmodeled declaration attributes can refuse or transform later assignments (including command-local
+    // ones). Their textual values cannot prove a Git target safe. Keep this uncertainty in its shell scope.
+    const attributedNames = new Set(inheritedAttributes);
     // Other values a variable may hold because an assignment may not have run. Each is checked on its own:
     // every env-derived Git target is added separately, so one swapped key at a time covers every mix.
     const alternates = copyAlternates(inheritedAlternates);
@@ -5004,9 +5013,10 @@ export function decide(command, ctx = {}) {
     // (`2>&1`, `&>`) are not control flow.
     const controlText = whole.replace(/\d*[<>]&\d*-?|&>>?/g, ' ');
     const canUnset = !/[&|()]|\b(?:if|then|else|elif|while|until|for|do|case|select|function|enable)\b|(?:^|[\s;])[{}!#]/.test(controlText);
-    const setAssignment = (key, value, readonly = false, conditional = false) => {
+    const setAssignment = (key, value, readonly = false, conditional = false, attributes = false) => {
       if (readonlyNames.has(key)) return; // failed assignment/unset leaves a readonly target active
-      if (conditional || !canUnset || maybeReadonly.has(key)) {
+      if (attributes) attributedNames.add(key);
+      if (conditional || !canUnset || maybeReadonly.has(key) || attributedNames.has(key)) {
         // The assignment may be skipped or refused: it adds a possible value and never replaces the earlier
         // one. A readonly that may not have run only marks the name as possibly locked.
         if (gitConfigEnv[key] !== value) {
@@ -5017,7 +5027,7 @@ export function decide(command, ctx = {}) {
         }
         gitConfigEnv[key] = value;
         if (readonly) maybeReadonly.add(key);
-        if (persist) persist(key, value, readonly, true);
+        if (persist) persist(key, value, readonly, true, attributes);
         return;
       }
       gitConfigEnv[key] = value;
@@ -5026,20 +5036,24 @@ export function decide(command, ctx = {}) {
       if (persist) persist(key, value, readonly, false);
     };
     const checkNested = (text, env, persistChanges = null, childReadonly = readonlyNames, childAlternates = alternates,
-      childMaybeReadonly = maybeReadonly) => {
+      childMaybeReadonly = maybeReadonly, childAttributes = attributedNames) => {
       if (!String(text).trim() || depth >= NESTED_DEPTH_CAP || nestedBudget <= 0) return null;
       nestedBudget -= 1;
       return checkScope(parseSegments(text).segments, text, env, depth + 1, persistChanges, childReadonly, childAlternates,
-        childMaybeReadonly);
+        childMaybeReadonly, childAttributes);
     };
     for (const seg of list) {
-      const r = reason(seg, { ...ctx, gitConfigEnv });
+      const sub = gitSubcommand(seg);
+      const named = new Set(sub && (attributedNames.size || alternates.size)
+        ? seg.match(/[A-Za-z_][A-Za-z0-9_]*/g) || [] : []);
+      const attributeTargetUnknown = sub && [...attributedNames].some((key) =>
+        /^(?:GIT_|HOME$|XDG_CONFIG_HOME$)/.test(key) || named.has(key));
+      const r = reason(seg, { ...ctx, gitConfigEnv, gitTargetUnknown: ctx.gitTargetUnknown || attributeTargetUnknown });
       if (r) return r;
       // Only a git invocation reads the environment for a target. Check each relevant possible value on its
       // own; past ALTERNATE_CHECK_CAP the target is unknown and a state change fails closed.
-      if (alternates.size && gitSubcommand(seg)) {
+      if (alternates.size && sub) {
         const pairs = [];
-        const named = new Set(seg.match(/[A-Za-z_][A-Za-z0-9_]*/g) || []);
         for (const [key, values] of alternates) {
           if (!/^(?:GIT_|HOME$|XDG_CONFIG_HOME$)/.test(key) && !named.has(key)) continue;
           for (const value of values) pairs.push([key, value]);
@@ -5065,13 +5079,18 @@ export function decide(command, ctx = {}) {
       // Substitutions run before the command's local assignments take effect; explicit child shells
       // and runners receive those assignments even behind wrappers such as `command env`.
       const substitutionCount = substitutionBodies(seg).length;
-      for (const [index, text] of nestedCommandStrings(seg).entries()) {
+      for (const [index, text] of nestedCommandStrings(seg, attributedNames).entries()) {
         const substitution = index < substitutionCount;
         const newProcess = !substitution && (SHELL_PROGRAMS.has(programWord(seg)) || runnerInvocation(canonicalCommand(seg))?.exec);
+        const nestedEnv = substitution ? gitConfigEnv : { ...localEnv };
+        // Attributes themselves do not survive exec, but their possibly transformed values do. The child
+        // may replace this unresolved value with an ordinary scalar assignment in its own scope.
+        if (newProcess) for (const key of attributedNames) nestedEnv[key] = `\${${key}}`;
         // eval executes in this shell; explicit assignments in its script survive the invocation.
-        const nestedReason = checkNested(text, substitution ? gitConfigEnv : localEnv,
+        const nestedReason = checkNested(text, nestedEnv,
           !substitution && programWord(seg) === 'eval' ? setAssignment : null, newProcess ? [] : readonlyNames,
-          substitution ? alternates : localAlternates, newProcess ? [] : maybeReadonly);
+          substitution ? alternates : localAlternates, newProcess ? [] : maybeReadonly,
+          newProcess ? [] : attributedNames);
         if (nestedReason) return nestedReason;
       }
       const words = shellTokens(seg).filter((t) => !t.op).map((t) => t.text);
@@ -5096,7 +5115,12 @@ export function decide(command, ctx = {}) {
         : ['export', 'readonly'].includes(canonicalWords[0]) && optionWords.some((t) => /^-[A-Za-z]*f/.test(t));
       const versionDependent = ['export', 'readonly'].includes(canonicalWords[0])
         && optionWords.some((t) => /^-[A-Za-z]*p/.test(t));
-      const uncertain = redirected || badOption || versionDependent;
+      // Recognized does not mean a scalar assignment succeeds: -A/-g/-I/-l/-n/-u vary by Bash version,
+      // -i evaluates arithmetic, and +a cannot remove an array attribute. Only scalar export/readonly
+      // attributes have modeled assignment semantics. Printing directives still change no variable.
+      const unmodeledAttributes = !printsOnly && ['declare', 'typeset', 'readonly'].includes(canonicalWords[0])
+        && optionWords.some((t) => !/^[-+][rx]+$/.test(t));
+      const uncertain = redirected || badOption || versionDependent || unmodeledAttributes;
       if (!seg.trim().startsWith('(') && canonicalWords[0] === 'unset') {
         let variables = true;
         let options = true;
@@ -5122,9 +5146,9 @@ export function decide(command, ctx = {}) {
         const assignments = directive ? [...leadingWords, ...(printsOnly ? [] : canonicalWords)] : words;
         for (const word of assignments) {
           const m = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(word);
-          if (m) setAssignment(m[1], m[2], readonly, uncertain);
-          else if (readonly && word !== canonicalWords[0] && /^[A-Za-z_][A-Za-z0-9_]*$/.test(word)) {
-            setAssignment(word, gitConfigEnv[word], true, uncertain);
+          if (m) setAssignment(m[1], m[2], readonly, uncertain, unmodeledAttributes);
+          else if ((readonly || unmodeledAttributes) && word !== canonicalWords[0] && /^[A-Za-z_][A-Za-z0-9_]*$/.test(word)) {
+            setAssignment(word, gitConfigEnv[word], readonly, uncertain, unmodeledAttributes);
           }
         }
       }
@@ -5133,7 +5157,7 @@ export function decide(command, ctx = {}) {
     // separators may not be reconstructible from an individual segment. Never use future assignments.
     const group = leadingGroupBody(whole);
     for (const text of [...substitutionBodies(whole), ...(group === null ? [] : [group])]) {
-      const r = checkNested(text, inherited, null, inheritedReadonly, inheritedAlternates, inheritedMaybeReadonly);
+      const r = checkNested(text, inherited, null, inheritedReadonly, inheritedAlternates, inheritedMaybeReadonly, inheritedAttributes);
       if (r) return r;
     }
     return null;

@@ -3828,6 +3828,51 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     expect(decide(`export GIT_DIR=${CLONE}/.git; ${directive} GIT_DIR=/safe/.git; git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
   });
 
+  it.each(['GIT_DIR', 'GIT_WORK_TREE'].flatMap((key) => [
+    'declare -gx', 'typeset -ux', 'declare -lx', 'typeset -Ix',
+    'declare -nx', 'typeset -Ax', 'readonly -A', 'declare +a',
+  ].map((directive) => ({ key, directive }))))(
+    'DENIES recognized declaration options that can refuse a Git target reassignment: $key $directive', ({ key, directive }) => {
+      const ctx = { cwd: LANE, daemonCloneRoots: roots };
+      const value = key === 'GIT_DIR' ? `${CLONE}/.git` : CLONE;
+      // Some options are version dependent; +a cannot remove an existing array attribute.
+      const setup = directive === 'declare +a' ? `declare -a ${key}; ` : '';
+      for (const replacement of ['/safe', '"/sa"fe', "'/safe'"]) {
+        const command = `export ${key}=${value}; ${setup}${directive} ${key}=${replacement}`;
+        expect(decide(`${command}; git reset --hard`, ctx), command).toMatch(/DAEMON CLONE/);
+        expect(decide(`${command}; git log`, ctx), command).toBeNull();
+      }
+    },
+  );
+
+  it.each(['declare -a', 'typeset -i', 'declare -n', 'typeset -u', 'readonly -A'])(
+    'DENIES persistent unmodeled variable attributes across later assignments: %s', (directive) => {
+      const ctx = { cwd: LANE, daemonCloneRoots: roots };
+      for (const setup of [`${directive} GIT_DIR`, `eval '${directive} GIT_DIR'`]) {
+        const command = `export GIT_DIR=${CLONE}/.git; ${setup}; export GIT_DIR=/safe; git reset --hard`;
+        expect(decide(command, ctx), command).toMatch(/DAEMON CLONE/);
+      }
+      // Attributes may transform values or affect a command-local assignment as well.
+      expect(decide(`${directive} GIT_DIR=/safe; GIT_DIR=/safe git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
+      expect(decide(`${directive} GIT_DIR=/safe; bash -c 'git reset --hard'`, ctx)).toMatch(/DAEMON CLONE/);
+      expect(decide(`${directive} GIT_DIR=/safe; GIT_DIR=/safe bash -c 'git reset --hard'`, ctx)).toMatch(/DAEMON CLONE/);
+      expect(decide(`${directive} GIT_DIR=/safe; bash -c 'export GIT_DIR=/safe; git reset --hard'`, ctx)).toBeNull();
+      expect(decide(`${directive} GIT_DIR=/safe; git log`, ctx)).toBeNull();
+      // Unrelated attributes and child-scope declarations do not taint the parent's Git target.
+      expect(decide(`${directive} COUNT=1; git reset --hard`, ctx)).toBeNull();
+      expect(decide(`bash -c '${directive} GIT_DIR=/safe'; git reset --hard`, ctx)).toBeNull();
+    },
+  );
+
+  it('DENIES fetch with uncertain declaration attributes without reading config from the raw target', () => {
+    let reads = 0;
+    const ctx = { cwd: LANE, daemonCloneRoots: roots, daemonFetchConfigReader: () => { reads += 1; return []; } };
+    expect(decide('declare -u GIT_DIR=/safe; git fetch origin main', ctx)).toMatch(/DAEMON CLONE/);
+    expect(reads).toBe(0);
+    expect(decide(`git -C ${CLONE} fetch origin main`, ctx)).toBeNull();
+    expect(reads).toBe(1);
+  });
+
   it('ALLOWS lane mutations after many skipped unrelated assignments', () => {
     // Possible values are tracked per variable, so unrelated conditional assignments add no unknown target.
     const skipped = Array.from({ length: 12 }, (_, i) => `false && export V${i}=${i}`).join('; ');
@@ -4314,6 +4359,17 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
       expect(runHook(command, lane, root)?.hookSpecificOutput?.permissionDecision).toBe('deny');
     }
   });
+
+  it.each(['declare -gx', 'typeset -ux', 'readonly -A', 'declare +a'])(
+    'DENIES recognized declaration option failures through the CLI: %s', (directive) => {
+      const setup = directive === 'declare +a' ? 'declare -a GIT_DIR; ' : '';
+      const command = `export GIT_DIR=${fakeClone}/objects; ${setup}${directive} GIT_DIR=${lane}`;
+      const out = runHook(`${command}; git reset --hard`, lane, root);
+      expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+      expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+      expect(runHook(`${command}; git log`, lane, root)).toBeNull();
+    },
+  );
 
   it('DENIES mixed-case branch fetch destinations with readable safe config through the CLI', () => {
     const command = `git -C ${configRepos.tracking} fetch origin main:refs/Heads/main`;
