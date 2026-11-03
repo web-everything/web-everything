@@ -7,13 +7,17 @@ export const FINDING_CLASSES = Object.freeze(['B1', 'B2', 'B3', 'B4', 'B5', 'B6'
 const scopeKeys = ['file', 'line', 'invariant', 'trigger', 'consequence', 'relation'];
 const text = value => typeof value === 'string' && value.trim().length > 0;
 export const findingIdentity = f => JSON.stringify([f?.file, f?.invariant]);
+/** The only fields a re-check may change: it re-adjudicates the dispute and may supply structured race evidence. */
+const RECHECK_MUTABLE = new Set(['disputed', 'interleaving']);
 /**
  * Full re-check binding: a re-check may keep or downgrade the SAME fingerprint, never another finding.
- * Binds the location (file, line, hunk), the claim (invariant, trigger, consequence) and its class/relation;
- * only the D1 to D3 downgrade may restate the trigger (see `sameFindingRecheck`).
+ * Binds every field except `RECHECK_MUTABLE`: the location (file, line, hunk), the claim (invariant, trigger,
+ * consequence), class/relation, and any authority-bearing field (card, ruling), so a re-check can neither
+ * relocate nor rewrite a finding nor attach authority to it. Only the D1 to D3 downgrade may restate the
+ * trigger (see `sameFindingRecheck`).
  */
-export const findingFingerprint = f => JSON.stringify([f?.id, f?.file, f?.line, f?.invariant, f?.trigger ?? null,
-  f?.consequence, f?.class, f?.relation, f?.hunkHash ?? null]);
+export const findingFingerprint = f => JSON.stringify(Object.keys(f ?? {})
+  .filter(k => !RECHECK_MUTABLE.has(k) && f[k] !== undefined).sort().map(k => [k, f[k]]));
 /** True when `checked` keeps `original`'s fingerprint, or is its D1 to D3 downgrade differing only in the trigger. */
 export const sameFindingRecheck = (original, checked) => findingFingerprint(checked) === findingFingerprint(original)
   || (original?.class === 'D1' && checked?.class === 'D3'
@@ -50,19 +54,27 @@ export function readCardFromMain(path) {
 /**
  * D2 debt ships only when its card exists on main and the card's pay-by has not passed. The pay-by is read
  * only from that card, never from the model-supplied finding. A card without one owes `prod`, and a `prod`
- * pay-by is due at the prod stage. Unreadable, conflicting or unparseable => false.
+ * pay-by is due at the prod stage. Unreadable, conflicting or unparseable => false: any line that mentions a
+ * pay-by must be exactly `mustPayBefore: prod` or `mustPayBefore: YYYY-MM-DD` (a real calendar date).
  */
 function d2Verified(f, { readCard = readCardFromMain, now = Date.now } = {}, releaseStage) {
   try {
     if (typeof f.card !== 'string' || !CARD_PATH.test(f.card)) return false;
     const body = readCard(f.card);
     if (typeof body !== 'string' || !body.trim()) return false;
-    const dues = new Set([...body.matchAll(/^mustPayBefore:\s*(\S+)\s*$/gm)].map(m => m[1]));
+    const dues = new Set();
+    for (const line of body.split(/\r?\n|\r| | /)) {
+      if (!/must[\s_*-]*pay[\s_*-]*before/i.test(line)) continue;
+      const m = /^mustPayBefore:[ \t]*(prod|\d{4}-\d{2}-\d{2})[ \t]*$/.exec(line);
+      if (!m) return false;
+      dues.add(m[1]);
+    }
     if (dues.size > 1) return false;
     const due = dues.size ? [...dues][0] : 'prod';
     if (due === 'prod') return releaseStage !== 'prod';
-    const when = Date.parse(due);
-    return Number.isFinite(when) && when > (typeof now === 'function' ? now() : now);
+    const when = Date.parse(`${due}T00:00:00Z`);
+    return Number.isFinite(when) && new Date(when).toISOString().slice(0, 10) === due
+      && when > (typeof now === 'function' ? now() : now);
   } catch { return false; }
 }
 /** Repo-relative POSIX form of a reported path, or null when it cannot be established (callers fail closed). */

@@ -309,6 +309,9 @@ describe('R473 recheck fingerprint binding (D-R451)', () => {
     ['hunkHash', { hunkHash: 'f'.repeat(64) }],
     // Location and consequence are part of the claim: a drifted recheck cannot relocate or rewrite it.
     ['line', { line: 13 }], ['consequence', { consequence: 'Only a cosmetic difference' }],
+    // Authority-bearing or unlisted fields cannot be introduced by the recheck either.
+    ['card', { card: 'backlog/9999-any.md' }], ['ruling', { ruling: 'R1' }],
+    ['an unlisted field', { mustPayBefore: '2099-01-01' }],
   ])('a recheck that changes %s is void and the original stands', async (_name, change) => {
     const claim = finding({ class: 'D1', trigger: null });
     const f = fixture([claim], { recheck: vi.fn(async x => ({ ...x, class: 'D3', trigger: 'Swapped', ...change })) });
@@ -325,6 +328,14 @@ describe('R473 recheck fingerprint binding (D-R451)', () => {
     expect(await main(ARGS, f.deps)).toBe(1);
     expect(f.result().recheck).toContainEqual(expect.objectContaining({ id: 'f1', class: 'X2' }));
     expect(f.result().cards).toEqual([]);
+  });
+  it('a recheck cannot attach a debt card that turns a blocked D2 into a ship', async () => {
+    const claim = finding({ class: 'D2', relation: 'untouched', disputed: true });
+    const f = fixture([claim], { recheck: vi.fn(async x => ({ ...x, disputed: false, card: 'backlog/9999-any.md' })) });
+    f.deps.readCard = () => 'mustPayBefore: 2099-01-01\n';
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.result().blocks).toContainEqual(expect.objectContaining({ id: 'f1', class: 'D2' }));
+    expect(f.result().ships).toEqual([]);
   });
   it('a same-class recheck with the identical fingerprint resolves the dispute', async () => {
     const f = fixture([finding({ disputed: true })], { recheck: vi.fn(async x => ({ ...x, disputed: false })) });

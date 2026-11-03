@@ -6455,7 +6455,8 @@ The model's opening verdict is informational. Every shipped finding retains a ca
 advisory and accepted risk; D2 carries `mustPayBefore: prod` and the requirement that its card exist on main.
 The D2 pay-by is read only from that card on main, never from the model's finding; a card without one owes
 `prod`. A `prod` pay-by is due at the prod stage, so it blocks there; an elapsed date, an unparseable value or
-conflicting pay-by lines block at either stage.
+conflicting pay-by lines block at either stage. Every line that mentions a pay-by must read exactly
+`mustPayBefore: prod` or `mustPayBefore: YYYY-MM-DD` (a real calendar date); any other form blocks.
 A D2 with introduced/newly-relied-on exposure cannot defer as untouched debt. A prod contract requirement
 must be classified as the corresponding defect, rather than hidden as D3.
 
@@ -6484,9 +6485,10 @@ the exact original base/head. Never use 2-of-3 full-audit voting. A concrete inp
 D1 to B/E; explicit advisory D3 is possible after investigation. Failed reproduction cannot downgrade a B
 class. Unavailable, malformed, timeout, identity mismatch, still-D1 or contradictory results retain unresolved
 evidence for retry or human adjudication. Resolving one finding does not clear any separate block.
-The re-check result must keep the original's full fingerprint: id, file, line, hunk, invariant, trigger,
-consequence, class and relation. Only the D1 to D3 downgrade may restate the trigger, to record what the
-investigation found; any other change is an identity mismatch.
+The re-check result must keep the original's full fingerprint: every field, including id, file, line, hunk,
+invariant, trigger, consequence, class, relation and any card or ruling, except the dispute flag and the
+structured interleaving. Only the D1 to D3 downgrade may restate the trigger, to record what the
+investigation found; any other change, or a field the re-check adds, is an identity mismatch.
 
 **Settings and prod trigger.** `review.releaseStage` in `scripts/review-settings.json` defaults to
 `prerelease` when omitted, including historical files. Only exact `prerelease` / `prod` tokens are accepted;

@@ -351,6 +351,14 @@ describe('R473 structured concurrency evidence', () => {
       expect((await at('mustPayBefore: garbage\n')).verdict).toBe('WEAKENED');
       // Conflicting pay-by lines are contradictory evidence: fail closed.
       expect((await at('mustPayBefore: 2026-12-01\nmustPayBefore: 2026-11-01\n')).verdict).toBe('WEAKENED');
+      expect((await at('mustPayBefore: 2026-12-01\r\n')).verdict).toBe('NOT WEAKENED');
+    });
+    it.each([
+      'mustPayBefore: 2020-01-01 # overdue', 'mustPayBefore : 2020-01-01', '  mustPayBefore: 2020-01-01',
+      '**mustPayBefore:** 2020-01-01', 'mustPayBefore: 2020-01-01 00:00', 'MustPayBefore: 2020-01-01',
+      'must_pay_before: 2020-01-01', 'mustPayBefore: 99999', 'mustPayBefore: 2099-02-31', 'mustPayBefore:',
+    ])('a pay-by line it cannot parse strictly fails closed, never defaults to prod: %j', async line => {
+      expect((await compute([d2()], options('prerelease', { readCard: reader(`status: open\n${line}\n`), now: NOW }))).verdict).toBe('WEAKENED');
     });
     it('ignores a model-supplied mustPayBefore: only the card on main sets the pay-by', async () => {
       const at = (extra, body) => compute([d2(extra)], options('prerelease', { readCard: reader(body), now: NOW }));
