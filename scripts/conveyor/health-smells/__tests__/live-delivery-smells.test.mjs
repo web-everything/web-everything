@@ -44,6 +44,22 @@ describe('worker-count-vs-load', () => {
     expect(workers.evaluate(host(3), context())[0].breach).toBe(false);
     expect(workers.evaluate(host(4, 19.9), context())[0].breach).toBe(false);
   });
+  it('counts known unleased workers (workerWithoutLease) toward worker pressure', () => {
+    const h = host(0, 100);
+    h.lanePools.find(p => p.repo === 'we').workerWithoutLease = Array.from({ length: 15 }, (_, i) => i + 1);
+    expect(workers.evaluate(h, context())[0]).toMatchObject({ breach: true, measure: { liveWorkers: 15 } });
+  });
+  it('does not trust the file mtime when a reading has no valid own timestamp', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'worker-no-stamp-'));
+    try {
+      for (const repo of Object.keys(CONSTELLATION_REPOS)) {
+        const path = join(dir, `lane-pool-health-watch-${repo}.log`);
+        writeFileSync(path, `not-a-time ${JSON.stringify({ checked: true, health: { leased: 0 } })}\n`);
+        utimesSync(path, NOW / 1000, NOW / 1000);
+      }
+      expect(() => workers.evaluate({ ...host(0, 0), lanePools: probeLanePools(dir) }, context())).toThrow(/evidence/i);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it('breaches strictly above the cap even at zero load; sums leased workers across pools', () => {
     const config = { workerCountVsLoad: { workerCap: 4 } };
     expect(workers.evaluate(host(4, 0), context([], config))[0].breach).toBe(false);

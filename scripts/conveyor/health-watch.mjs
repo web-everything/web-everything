@@ -609,12 +609,10 @@ export function probeLanePools(logsDir) {
     try {
       const last = matches.at(-1);
       // Freshness is the matched reading's own time, never the file mtime alone: lines appended after it (errors)
-      // refresh the mtime without refreshing the reading. Own ISO timestamp prefix wins; else the mtime only when
-      // the reading is the file's last non-empty line; else unknown (null), which consumers treat as missing evidence.
+      // refresh the mtime without refreshing the reading. Only the reading's own ISO timestamp prefix counts; a missing or malformed one is unknown (null), which consumers treat as missing evidence.
       const lineStart = text.lastIndexOf('\n', last.index) + 1;
       const stamp = /^\[?(\d{4}-\d\d-\d\dT[\d:.]+Z?)/.exec(text.slice(lineStart, last.index));
-      const isLast = text.slice(last.index + last[0].length).replace(/^[^\n]*/, '').trim() === '';
-      const at = stamp && Number.isFinite(Date.parse(stamp[1])) ? Date.parse(stamp[1]) : (isLast ? st.mtimeMs : null);
+      const at = stamp && Number.isFinite(Date.parse(stamp[1])) ? Date.parse(stamp[1]) : null;
       const reading = { repo: key, health: JSON.parse(last[1]), at };
       if (last[2] && last[2] !== 'null') reading.workerWithoutLease = JSON.parse(last[2]);
       out.push(reading);

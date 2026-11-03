@@ -64,14 +64,16 @@ export default {
         || !Number.isFinite(p.at) || p.at < 0 || p.at > now || now - p.at > settings.maxEvidenceAgeMs)
       || !Number.isFinite(machineLoad?.load1) || machineLoad.load1 < 0
       || !count(machineLoad?.cpuCount)) throw new Error('Incomplete worker/load evidence (missing, invalid, or stale); inspect machineLoad and all configured lanePools logs and refresh readings before resuming dispatch.');
-    const liveWorkers = lanePools.reduce((sum, p) => sum + p.health.leased, 0);
+    // Known running workers include lanes with a live worker but no lease (`workerWithoutLease`).
+    const unleased = p => (Array.isArray(p.workerWithoutLease) ? new Set(p.workerWithoutLease.filter(Number.isSafeInteger)).size : 0);
+    const liveWorkers = lanePools.reduce((sum, p) => sum + p.health.leased + unleased(p), 0);
     const perCoreLoad = machineLoad.load1 / machineLoad.cpuCount;
     const breach = (perCoreLoad >= settings.loadPerCore && liveWorkers >= settings.minWorkersForLoad)
       || liveWorkers > settings.workerCap;
     return [{
       subject: 'machine', breach,
       measure: { liveWorkers, perCoreLoad, load1: machineLoad.load1, cpuCount: machineLoad.cpuCount, settings, sources },
-      summary: `${liveWorkers} leased lane workers (cap ${settings.workerCap}); load/core ${perCoreLoad.toFixed(2)} (threshold ${settings.loadPerCore} with at least ${settings.minWorkersForLoad} workers).`,
+      summary: `${liveWorkers} live lane workers, leased or unleased (cap ${settings.workerCap}); load/core ${perCoreLoad.toFixed(2)} (threshold ${settings.loadPerCore} with at least ${settings.minWorkersForLoad} workers).`,
       recommendation: 'Lower worker count through reduced concurrency / hold dispatch until pressure subsides; let current workers finish.',
     }];
   },
