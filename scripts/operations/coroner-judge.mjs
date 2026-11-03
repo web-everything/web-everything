@@ -23,9 +23,10 @@ export function rankFrictions(metrics, { topN = 5 } = {}) {
 const SHAPE = {
   type: 'object', additionalProperties: false, required: ['verdicts'], properties: {
     verdicts: { type: 'array', maxItems: 5, items: {
-      type: 'object', additionalProperties: false, required: ['key', 'verdict', 'coveredBy'], properties: {
+      type: 'object', additionalProperties: false, required: ['key', 'verdict', 'coveredBy', 'proposedFix'], properties: {
         key: { type: 'string' }, verdict: { type: 'string', enum: ['NEW', 'COVERED-BY'] },
         coveredBy: { type: ['string', 'null'] },
+        proposedFix: { type: 'string', description: 'For NEW, a non-empty concrete change to the daemon or tooling that handles the cause automatically. May be empty for COVERED-BY.' },
       },
     } },
   },
@@ -35,7 +36,7 @@ const SHAPE = {
 export async function judgeFrictions({ ranked, held = [], openPrs = [], recentCards = [], judge, log = console.error }) {
   try {
     const answer = await judge({
-      mandate: `${FENCED_DATA_RULE}\nUse only the supplied evidence; do not call tools. Compare each cause against held items, open PRs, then recent cards. Return NEW only for a concrete actionable cause with examples that no existing item would remove. Otherwise return COVERED-BY with its reference, or omit uncertain candidates. Return only the requested schema.`,
+      mandate: `${FENCED_DATA_RULE}\nUse only the supplied evidence; do not call tools. Compare each cause against held items, open PRs, then recent cards. Return NEW only for a concrete actionable cause with examples that no existing item would remove. For each NEW verdict, supply a non-empty proposedFix describing the concrete change to the daemon or tooling that handles the cause automatically. Otherwise return COVERED-BY with its reference (proposedFix may be empty), or omit uncertain candidates. Return only the requested schema.`,
       input: fenceUntrusted('material', JSON.stringify({ ranked, held, openPrs, recentCards })), shape: SHAPE,
     });
     const verdicts = answer?.value?.verdicts;
@@ -43,6 +44,7 @@ export async function judgeFrictions({ ranked, held = [], openPrs = [], recentCa
     const keys = new Set(ranked.map((r) => r.key)), seen = new Set();
     for (const row of verdicts) {
       if (!row || !keys.has(row.key) || seen.has(row.key) || !['NEW', 'COVERED-BY'].includes(row.verdict) ||
+        (row.verdict === 'NEW' && (typeof row.proposedFix !== 'string' || !row.proposedFix.trim())) ||
         (row.verdict === 'NEW' && row.coveredBy != null && row.coveredBy !== '') ||
         (row.verdict === 'COVERED-BY' && (typeof row.coveredBy !== 'string' || !row.coveredBy.trim()))) {
         throw new Error('invalid judge verdict entry');
@@ -67,7 +69,7 @@ export async function fileNewCards({ ranked, verdicts, state, fileItem, maxCards
     // The sink must deduplicate by key: recovery after a failed save returns the same receipt.
     // Recovered receipts count toward this run's cap exactly like newly appended cards.
     const item = await fileItem({ key: row.key, examples: row.examples, title: `Coroner: ${row.metric} / ${row.cause}`, kind: 'story', size: '3',
-      queue: 'false', digest: `Recurring delivery friction: ${row.cause}. Count: ${row.count}; minutes: ${row.minutes ?? 'unknown'}. Evidence: ${JSON.stringify(row.examples)}. Investigate the cause and implement an automatic prevention in the responsible tooling.` });
+      queue: 'false', proposedFix: matches[0].proposedFix, digest: `Recurring delivery friction: ${row.cause}. Count: ${row.count}; minutes: ${row.minutes ?? 'unknown'}. Evidence: ${JSON.stringify(row.examples)}.` });
     if (!item || !(item.id || item.rel)) throw new Error('file-item returned no card receipt');
     state.filed[row.key] = item.id ?? item.rel;
     await save(state);

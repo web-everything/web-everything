@@ -20,7 +20,7 @@ const metrics = () => ({ errorRates: {
   } },
 } });
 const answer = (verdicts) => ({ value: { verdicts } });
-const allNew = (ranked) => ranked.map(({ key }) => ({ key, verdict: 'NEW' }));
+const allNew = (ranked) => ranked.map(({ key }) => ({ key, verdict: 'NEW', proposedFix: 'Add bounded retries to the gate runner.' }));
 const context = () => ({
   held: [{ id: 'held-7', title: 'Retry lane acquisition' }],
   openPrs: [{ number: 42, title: 'Bound gate waits' }],
@@ -69,7 +69,7 @@ describe('rankFrictions', () => {
 describe('judgeFrictions', () => {
   it('passes ranked evidence and all coverage sources to a schema-constrained injected judge', async () => {
     const ranked = rankFrictions(metrics()); const coverage = context();
-    const verdicts = [{ key: ranked[0].key, verdict: 'NEW' },
+    const verdicts = [{ key: ranked[0].key, verdict: 'NEW', proposedFix: 'Add bounded retries to the gate runner.' },
       { key: ranked[1].key, verdict: 'COVERED-BY', coveredBy: 'PR #42' }];
     const judge = vi.fn(async () => answer(verdicts));
     expect(await judgeFrictions({ ranked, ...coverage, judge })).toEqual(verdicts);
@@ -79,6 +79,8 @@ describe('judgeFrictions', () => {
     expect(request.shape).toMatchObject({ type: 'object', required: expect.arrayContaining(['verdicts']) });
     expect(JSON.stringify(request.shape)).toContain('COVERED-BY');
     expect(JSON.stringify(request.shape)).toContain('NEW');
+    expect(request.shape.properties.verdicts.items.required).toContain('proposedFix');
+    expect(request.shape.properties.verdicts.items.properties.proposedFix).toMatchObject({ type: 'string' });
     for (const evidence of [ranked[0].key, 'PR #101', 'held-7', 'Bound gate waits', 'abc1234']) {
       expect(request.input).toContain(evidence);
     }
@@ -96,16 +98,35 @@ describe('judgeFrictions', () => {
     ['unknown verdict', (key) => ({ verdicts: [{ key, verdict: 'MAYBE' }] })],
     ['coverage without a reference', (key) => ({ verdicts: [{ key, verdict: 'COVERED-BY' }] })],
     ['NEW with coverage rejects the whole answer', (key) => ({ verdicts: [
-      { key, verdict: 'NEW', coveredBy: 'PR #42' }, { key: 'gateRuns:flaky', verdict: 'NEW' },
+      { key, verdict: 'NEW', proposedFix: 'Add bounded retries to the gate runner.', coveredBy: 'PR #42' }, { key: 'gateRuns:flaky', verdict: 'NEW', proposedFix: 'Add bounded retries to the gate runner.' },
     ] })],
-    ['unknown key', () => ({ verdicts: [{ key: 'invented', verdict: 'NEW' }] })],
-    ['conflicting duplicate key', (key) => ({ verdicts: [{ key, verdict: 'NEW' }, { key, verdict: 'COVERED-BY', coveredBy: 'held-7' }] })],
-    ['mixed valid and invalid entries', (key) => ({ verdicts: [{ key, verdict: 'NEW' }, { verdict: 'NEW' }] })],
+    ['unknown key', () => ({ verdicts: [{ key: 'invented', verdict: 'NEW', proposedFix: 'Add bounded retries to the gate runner.' }] })],
+    ['conflicting duplicate key', (key) => ({ verdicts: [{ key, verdict: 'NEW', proposedFix: 'Add bounded retries to the gate runner.' }, { key, verdict: 'COVERED-BY', coveredBy: 'held-7' }] })],
+    ['mixed valid and invalid entries', (key) => ({ verdicts: [{ key, verdict: 'NEW', proposedFix: 'Add bounded retries to the gate runner.' }, { verdict: 'NEW', proposedFix: 'Add bounded retries to the gate runner.' }] })],
   ])('fails closed with no verdicts and reports %s', async (_name, value) => {
     const ranked = rankFrictions(metrics()); const log = vi.fn();
     const verdicts = await judgeFrictions({ ranked, ...context(), judge: async () => ({ value: value(ranked[0].key) }), log });
     expect(verdicts).toEqual([]);
     expect(log).toHaveBeenCalled();
+  });
+
+  it.each([undefined, null, '', '  \n\t', 42])('rejects the whole answer and files nothing when a NEW proposedFix is %j', async (proposedFix) => {
+    const ranked = rankFrictions(metrics());
+    const verdicts = allNew(ranked.slice(0, 2));
+    if (proposedFix === undefined) delete verdicts[1].proposedFix;
+    else verdicts[1].proposedFix = proposedFix;
+    const fileItem = vi.fn(), log = vi.fn();
+    const result = await runCoronerJudge({ metrics: metrics(), judge: async () => answer(verdicts), fileItem, log });
+    expect(result.verdicts).toEqual([]);
+    expect(result.error).toContain('invalid judge verdict entry');
+    expect(fileItem).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalled();
+  });
+
+  it('accepts an empty proposedFix on a COVERED-BY verdict', async () => {
+    const ranked = rankFrictions(metrics());
+    const verdicts = [{ key: ranked[0].key, verdict: 'COVERED-BY', coveredBy: 'PR #42', proposedFix: '' }];
+    expect(await judgeFrictions({ ranked, judge: async () => answer(verdicts) })).toEqual(verdicts);
   });
 
   it('reports a judge exception without manufacturing NEW verdicts', async () => {
@@ -148,12 +169,13 @@ describe('fileNewCards', () => {
   it('files only explicit NEW candidates, never covered, omitted, unknown or uncertain candidates', async () => {
     const ranked = rankFrictions(metrics()); const fileItem = vi.fn(async () => ({ id: 'card-1' }));
     await fileNewCards({ ranked, state: {}, fileItem, verdicts: [
-      { key: ranked[0].key, verdict: 'NEW' },
+      { key: ranked[0].key, verdict: 'NEW', proposedFix: 'Add bounded retries to the gate runner.' },
       { key: ranked[1].key, verdict: 'COVERED-BY', coveredBy: 'PR #42' },
-      { key: ranked[2].key, verdict: 'MAYBE' }, { key: 'unknown', verdict: 'NEW' },
+      { key: ranked[2].key, verdict: 'MAYBE' }, { key: 'unknown', verdict: 'NEW', proposedFix: 'Add bounded retries to the gate runner.' },
     ] });
     expect(fileItem).toHaveBeenCalledOnce();
     expect(JSON.stringify(fileItem.mock.calls[0])).toContain('PR #101');
+    expect(fileItem.mock.calls[0][0].proposedFix).toBe('Add bounded retries to the gate runner.');
   });
 
   it.each([[undefined, 3], [1, 1]])('caps an all-NEW run with maxCards=%s at %s cards', async (maxCards, expected) => {

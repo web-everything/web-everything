@@ -1,7 +1,7 @@
 // @vitest-environment node
 // The job child runs under plain Node; happy-dom's AbortController is not one child_process accepts.
 import { it, expect, vi, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, existsSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, existsSync, symlinkSync, appendFileSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,6 +14,11 @@ import { parseFeedLine } from '../../operations/needs-you-feed.mjs';
 import { markLaunching } from '../../lib/daemon-jobs.mjs';
 import coronerSmell from '../health-smells/nightly-coroner-failed.mjs';
 import { emptyHealthState, runHealthTick } from '../health-watch-core.mjs';
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, readFileSync: vi.fn(actual.readFileSync) };
+});
+const proposedFix = 'Add bounded retries to the gate runner.';
 const roots = [];
 const temp = () => { const root = mkdtempSync(join(tmpdir(), 'nightly-coroner-')); roots.push(root); return root; };
 afterEach(() => { vi.restoreAllMocks(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -169,7 +174,7 @@ function judgedExtraction() {
   fixture.io.judge.mockImplementation(async () => {
     const { rankFrictions } = await import('../../operations/coroner-judge.mjs');
     return { value: { verdicts: rankFrictions(metrics).map(({ key }, n) => n === 1
-      ? { key, verdict: 'COVERED-BY', coveredBy: 'PR #42' } : { key, verdict: 'NEW' }) } };
+      ? { key, verdict: 'COVERED-BY', coveredBy: 'PR #42' } : { key, verdict: 'NEW', proposedFix }) } };
   });
   fixture.io.fileItem.mockImplementation(async () => ({ id: `card-${fixture.io.fileItem.mock.calls.length}` }));
   return { ...fixture, metrics };
@@ -196,7 +201,7 @@ it('appends numbered held cards in the handoff home by default and recovers exis
   await extractNightlyCoroner(input, io);
   const held = readFileSync(heldPath, 'utf8');
   expect(held).toMatch(/^8\. \(coroner-2026-10-16, held\) \*\*Coroner:/m);
-  expect(held).toContain('Fix idea:'); expect(held).toContain('Evidence:');
+  expect(held).toContain(`    Fix idea: ${proposedFix}\n`); expect(held).toContain('Evidence:');
   expect(held).toContain('PR #101'); expect(held).toContain('Size 3.');
   expect(held).toMatch(/^    Coroner key: gateRuns:cause-0$/m);
   expect(held.match(/Coroner key:/g)).toHaveLength(3);
@@ -211,6 +216,54 @@ it('appends numbered held cards in the handoff home by default and recovers exis
   expect(recovered.completed[input.night].filed).toBe(3);
   expect(io.run).toHaveBeenCalledOnce();
 });
+it('preserves a concurrent append between the held-list read and append without replacing the file', async () => {
+  const home = temp(), path = join(home, 'cards-to-file.md');
+  const original = '7. (earlier, held) **Existing item.**\n';
+  const concurrent = '8. (other-writer, held) **Concurrent item.**\n';
+  writeFileSync(path, original);
+  const inode = statSync(path).ino;
+  const actual = await vi.importActual('node:fs');
+  vi.mocked(readFileSync).mockImplementationOnce((...args) => {
+    expect(args[0]).toBe(path);
+    const snapshot = actual.readFileSync(...args);
+    appendFileSync(path, concurrent);
+    return snapshot;
+  });
+  vi.mocked(readFileSync).mockImplementationOnce((...args) => {
+    expect(args[0]).toBe(path);
+    expect(existsSync(`${path}.lock`)).toBe(true);
+    return actual.readFileSync(...args);
+  });
+  const receipt = appendHeldCoronerCard({ key: 'ci:flaky', title: 'Coroner: ci / flaky', size: '3',
+    digest: 'Evidence PR #42', proposedFix }, { home, night: '2026-10-16' });
+  const held = readFileSync(path, 'utf8');
+  expect(held.startsWith(original + concurrent)).toBe(true);
+  expect(held).toContain('    Coroner key: ci:flaky\n');
+  expect(held).toContain(`    Fix idea: ${proposedFix}\n`);
+  expect(statSync(path).ino).toBe(inode);
+  const numbers = [...held.matchAll(/^(\d+)\. /gm)].map((match) => Number(match[1]));
+  expect(numbers).toEqual([7, 8, 9]);
+  expect(new Set(numbers).size).toBe(numbers.length);
+  expect(receipt).toEqual({ id: 'cards-to-file.md#9' });
+  expect(held).toMatch(/^9\. \(coroner-2026-10-16, held\)[^\n]*\n(?:[^\n]*\n)*?    Coroner key: ci:flaky$/m);
+  expect(existsSync(`${path}.lock`)).toBe(false);
+});
+it('refuses filing while another writer holds the held-list lock and names manual recovery', () => {
+  const home = temp(), path = join(home, 'cards-to-file.md');
+  const held = '7. (earlier, held) **Existing item.**\n';
+  writeFileSync(path, held);
+  writeFileSync(`${path}.lock`, `${process.pid}\n`);
+  expect(() => appendHeldCoronerCard({ key: 'ci:flaky', title: 'Coroner: ci / flaky', size: '3',
+    digest: 'Evidence PR #42', proposedFix }, { home, night: '2026-10-16' }))
+    .toThrow('held list busy; retry later or run manual /coroner');
+  expect(readFileSync(path, 'utf8')).toBe(held);
+  expect(readFileSync(`${path}.lock`, 'utf8')).toBe(`${process.pid}\n`);
+  rmSync(`${path}.lock`);
+  expect(appendHeldCoronerCard({ key: 'ci:flaky', title: 'Coroner: ci / flaky', size: '3',
+    digest: 'Evidence PR #42', proposedFix }, { home, night: '2026-10-16' }))
+    .toEqual({ id: 'cards-to-file.md#8' });
+  expect(existsSync(`${path}.lock`)).toBe(false);
+});
 it('refuses a held key without a numbered receipt and leaves the held list untouched', () => {
   const home = temp(); const path = join(home, 'cards-to-file.md');
   const held = 'Coroner key: ci:flaky\n'; writeFileSync(path, held);
@@ -224,7 +277,7 @@ it.each(['', 'ci:flaky\nforged'])('refuses invalid held key %j without writing a
 });
 it('deduplicates held cards by an exact key line, including after evidence changes', () => {
   const home = temp();
-  const input = { key: 'ci:flaky', title: 'Coroner: ci / flaky', size: '3', digest: 'Evidence PR #42' };
+  const input = { key: 'ci:flaky', title: 'Coroner: ci / flaky', size: '3', proposedFix, digest: 'Evidence PR #42' };
   const first = appendHeldCoronerCard(input, { home, night: '2026-10-16' });
   const before = readFileSync(join(home, 'cards-to-file.md'), 'utf8');
   expect(appendHeldCoronerCard({ ...input, digest: 'Changed PR #99' }, { home, night: '2026-10-17' })).toEqual(first);

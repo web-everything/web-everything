@@ -20,6 +20,7 @@ import { runCoronerJudge, rankFrictions } from '../operations/coroner-judge.mjs'
 import { codexJudgeSpawn } from '../lib/codex-judge-spawn.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { fenceUntrusted } from '../lib/mandate-fence.mjs';
+import { withFileLock } from '../lib/atomic-json-file.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(SELF), '../..');
@@ -252,25 +253,41 @@ function readJudgeCoverage(sourceRoot, home) {
 export function appendHeldCoronerCard(input, { home = handoffHome(), night } = {}) {
   if (typeof input.key !== 'string' || !input.key || /[\r\n]/.test(input.key)) throw new Error('invalid coroner filing key');
   const path = join(home, 'cards-to-file.md');
-  let held = '';
-  try { held = readFileSync(path, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-  let number = 0, lastNumber = 0;
-  for (const line of held.split('\n')) {
-    const heading = line.match(/^(\d+)\.\s/);
-    if (heading) { number = Number(heading[1]); lastNumber = Math.max(lastNumber, number); }
-    if (line.trim() === `Coroner key: ${input.key}`) {
-      if (!number) throw new Error('coroner held receipt lacks item number; run manual /coroner');
-      return { id: `cards-to-file.md#${number}` };
+  const inspectHeld = () => {
+    let held = '';
+    try { held = readFileSync(path, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+    let number = 0, lastNumber = 0;
+    for (const line of held.split('\n')) {
+      const heading = line.match(/^(\d+)\.\s/);
+      if (heading) { number = Number(heading[1]); lastNumber = Math.max(lastNumber, number); }
+      if (line.trim() === `Coroner key: ${input.key}`) {
+        if (!number) throw new Error('coroner held receipt lacks item number; run manual /coroner');
+        return { receipt: { id: `cards-to-file.md#${number}` } };
+      }
     }
-  }
-  number = lastNumber + 1;
-  // Atomic publication keeps the final key line and its entire numbered item together on a crash.
-  atomicWrite(path, `${held}${held.endsWith('\n') || !held ? '' : '\n'}\n${number}. (coroner-${night}, held) **${input.title}.** ${input.digest}
-    Fix idea: Investigate the cause and implement automatic prevention in the responsible tooling.
+    return { number: lastNumber + 1 };
+  };
+  // Append-only receipts can be recovered without taking a writer lock.
+  const existing = inspectHeld().receipt;
+  if (existing) return existing;
+  mkdirSync(home, { recursive: true });
+  try {
+    return withFileLock(`${path}.lock`, () => {
+      // Re-read under the shared writer lock: the optimistic read may have missed an append.
+      const { receipt, number } = inspectHeld();
+      if (receipt) return receipt;
+      appendLines(path, [`\n${number}. (coroner-${night}, held) **${input.title}.** ${input.digest}
+    Fix idea: ${input.proposedFix}
     Evidence: ${JSON.stringify(input.examples ?? [])}. Scope: we:scripts/. Size ${input.size}.
-    Coroner key: ${input.key}
-`);
-  return { id: `cards-to-file.md#${number}` };
+    Coroner key: ${input.key}`]);
+      return { id: `cards-to-file.md#${number}` };
+    }, { timeoutMs: 0 });
+  } catch (e) {
+    if (String(e.message).startsWith('withFileLock: timed out')) {
+      throw new Error('coroner held list busy; retry later or run manual /coroner', { cause: e });
+    }
+    throw e;
+  }
 }
 /** `signal` aborts the acquire and extractor subprocesses (a stop); the lane release is never given it. */
 export async function extractNightlyCoroner({ night, until, dir, settings, nightly = NIGHTLY_DEFAULTS, sourceRoot = ROOT, laneSession = CORONER_LANE_SESSION }, {
