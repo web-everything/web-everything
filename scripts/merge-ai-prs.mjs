@@ -200,7 +200,7 @@ import { reviewCiGate } from './lib/review-ci-gate.mjs';
 import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, handleRequiredWorkflowsRefusal, resolveRefreshOnStaleMergeGate, handleStaleMergeGate } from './lib/merge-queue-enqueue.mjs';
 import { recordEnqueueOutcome } from './lib/drain-poison-guard.mjs';
 import { createAsyncShadow } from './lib/drain-async-shadow.mjs';
-import { createEnqueueClaims } from './lib/drain-enqueue-claim.mjs';
+import { createEnqueueClaims, withSerialEnqueueClaim } from './lib/drain-enqueue-claim.mjs';
 import { appendDaemonEvent } from './lib/daemon-events.mjs';
 import { createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, createQueueRequiredChecksOf } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
 // #3215 — the drain applies holds of its own (a fresh park, a #2409 stale-acceptance re-park); this is the
@@ -4564,20 +4564,6 @@ export function describeGhListError(e) {
 // ── CLI boundary ───────────────────────────────────────────────────────────────────────────────────────
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
 if (IS_CLI) runCli().catch((e) => { process.stderr.write(`merge-ai-prs ✗ ${String(e && e.stack || e)}\n`); process.exit(1); });
-
-/** Item 44 slice 2: the serial pass takes the shared per-(PR, head) claim around its enqueue; claim IO errors fail open. */
-function withSerialEnqueueClaim(claims, identity, run) {
-  let claim;
-  try { claim = claims?.claim({ ...identity, kind: 'serial' }); } catch { /* Serial enqueue stays fail-open. */ }
-  if (claim?.won === false) return { skipped: 'claimed-elsewhere' };
-  let result;
-  try { result = run(); } catch (error) {
-    try { if (claim?.won) claims.release({ ...identity, token: claim.token }); } catch { /* Preserve the enqueue error. */ }
-    throw error;
-  }
-  try { if (claim?.won) claims[result?.enqueued === true ? 'markDone' : 'release']({ ...identity, token: claim.token }); } catch { /* Bookkeeping never changes the result. */ }
-  return result;
-}
 
 async function runCli() {
   // #3866 (ratified) — opt-in only: a no-op unless WE_GITHUB_APP_* is configured, in which case every `gh`

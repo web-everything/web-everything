@@ -1,10 +1,10 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { createEnqueueClaims } from '../lib/drain-enqueue-claim.mjs';
+import { createEnqueueClaims, withSerialEnqueueClaim } from '../lib/drain-enqueue-claim.mjs';
 
 const roots = [];
 const temp = () => { const dir = mkdtempSync(join(process.env.TMPDIR, 'enqueue-claim-')); roots.push(dir); return dir; };
@@ -13,7 +13,7 @@ const key = c => `${c.repo}#${c.num}@${c.headSha}`;
 const filename = c => `${createHash('sha256').update(key(c)).digest('hex')}.json`;
 const claim = (claims, c = candidate, kind = 'serial') => claims.claim({ ...c, kind });
 const make = (dir = temp(), options = {}) => createEnqueueClaims({ dir, now: () => 100, pidAlive: () => true, ...options });
-afterEach(() => { for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => { vi.restoreAllMocks(); for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe('per-PR enqueue claims', () => {
   it('allows exactly one of concurrent same-head claimants to win', async () => {
@@ -155,9 +155,29 @@ describe('per-PR enqueue claims', () => {
     expect(readdirSync(dir)).toEqual([`${filename(candidate)}.lock`]);
   });
 
-  it('refuses corrupt records instead of granting a second claim', () => {
-    const dir = temp(); writeFileSync(join(dir, filename(candidate)), '{broken');
-    expect(() => claim(make(dir))).toThrow();
+  it.each(['{broken', 'null', '{}', '{"state":"claimed","pid":0}'])('reclaims corrupt or invalid records: %s', source => {
+    const dir = temp(); const path = join(dir, filename(candidate)); writeFileSync(path, source);
+    const result = claim(make(dir));
+    expect(result.won).toBe(true);
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toMatchObject({ state: 'claimed', token: result.token });
+  });
+
+  it('treats EPERM from the injected PID probe as alive and ESRCH as dead', () => {
+    const dir = temp(); claim(make(dir));
+    const probe = code => () => { throw Object.assign(new Error(code), { code }); };
+    expect(claim(make(dir, { pidAlive: probe('EPERM') }))).toMatchObject({ won: false, reason: 'held' });
+    expect(claim(make(dir, { pidAlive: probe('ESRCH') }))).toMatchObject({ won: true });
+  });
+
+  it('treats EPERM from the default process.kill probe as alive', () => {
+    const dir = temp(); claim(make(dir));
+    vi.spyOn(process, 'kill').mockImplementation(() => { throw Object.assign(new Error('denied'), { code: 'EPERM' }); });
+    expect(claim(make(dir, { pidAlive: undefined }))).toMatchObject({ won: false, reason: 'held' });
+  });
+
+  it('throws record IO errors distinctly from corrupt records and lock-busy', () => {
+    const dir = temp(); mkdirSync(join(dir, filename(candidate)));
+    expect(() => claim(make(dir))).toThrow(expect.objectContaining({ code: 'EISDIR' }));
   });
 
   it('property: serial enqueue lists are identical with claims enabled or disabled', () => {
@@ -180,5 +200,48 @@ describe('per-PR enqueue claims', () => {
       };
       expect(run(true)).toEqual(run(false));
     }
+  });
+});
+
+describe('serial enqueue claim diagnostics', () => {
+  const warning = op => `drain-enqueue-claim: ${op} failed for owner/repo#7@head-a: broken storage — proceeding fail-open\n`;
+
+  it('still enqueues and warns once with a daemon event when claim throws', () => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    const emit = vi.fn(); const run = vi.fn(() => ({ enqueued: true }));
+    const claims = { claim() { throw new Error('broken\nstorage'); } };
+    expect(withSerialEnqueueClaim(claims, candidate, run, { emit })).toEqual({ enqueued: true });
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(stderr.mock.calls).toEqual([[warning('claim')]]);
+    expect(emit).toHaveBeenCalledWith(expect.objectContaining({ repo: candidate.repo, pr: 7,
+      detail: { op: 'claim', headSha: 'head-a', message: 'broken storage' } }));
+  });
+
+  it.each([true, false])('preserves the enqueue result and warns on bookkeeping errors (enqueued: %s)', enqueued => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    const op = enqueued ? 'markDone' : 'release';
+    const claims = { claim: () => ({ won: true, token: 'owned' }),
+      [op]: vi.fn(() => { throw new Error('broken storage'); }) };
+    const result = { enqueued };
+    expect(withSerialEnqueueClaim(claims, candidate, () => result, { emit() { throw new Error('event failed'); } })).toBe(result);
+    expect(claims[op]).toHaveBeenCalledWith({ ...candidate, token: 'owned' });
+    expect(stderr.mock.calls).toEqual([[warning(op)]]);
+  });
+
+  it('preserves the original enqueue error when release also throws and warns', () => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    const error = new Error('enqueue failed');
+    const claims = { claim: () => ({ won: true, token: 'owned' }), release() { throw new Error('broken storage'); } };
+    expect(() => withSerialEnqueueClaim(claims, candidate, () => { throw error; }, { emit: () => Promise.reject(new Error('event failed')) })).toThrow(error);
+    expect(stderr.mock.calls).toEqual([[warning('release')]]);
+  });
+
+  it.each(['claim', 'release', 'markDone'])('warns when %s returns lock-busy without changing the serial outcome', op => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    const claims = { claim: () => ({ won: true, token: 'owned' }), [op]: () => ({ won: false, reason: 'lock-busy' }) };
+    const result = { enqueued: op === 'markDone' }; const run = vi.fn(() => result);
+    expect(withSerialEnqueueClaim(claims, candidate, run, { emit: vi.fn() })).toEqual(op === 'claim' ? { skipped: 'claimed-elsewhere' } : result);
+    expect(run).toHaveBeenCalledTimes(op === 'claim' ? 0 : 1);
+    expect(stderr.mock.calls).toEqual([[warning(op).replace('broken storage', 'lock-busy')]]);
   });
 });

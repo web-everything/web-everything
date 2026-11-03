@@ -4,10 +4,11 @@ import { mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, rmSync, st
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
+import { appendDaemonEvent } from './daemon-events.mjs';
 
 function ownerAlive(pid) {
   try { process.kill(pid, 0); return true; }
-  catch (error) { if (error.code === 'ESRCH') return false; throw error; }
+  catch (error) { return error.code !== 'ESRCH'; }
 }
 
 export function createEnqueueClaims({
@@ -20,12 +21,14 @@ export function createEnqueueClaims({
 } = {}) {
   const sleeper = new Int32Array(new SharedArrayBuffer(4));
   const read = path => {
-    let record;
-    try { record = JSON.parse(readFileSync(path, 'utf8')); }
+    let source;
+    try { source = readFileSync(path, 'utf8'); }
     catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+    let record;
+    try { record = JSON.parse(source); } catch { return null; }
     if (!record || !['claimed', 'done'].includes(record.state) || typeof record.token !== 'string'
         || typeof record.kind !== 'string' || !Number.isInteger(record.pid) || record.pid <= 0
-        || !Number.isFinite(record.claimedAt)) throw new Error('Invalid enqueue claim record');
+        || !Number.isFinite(record.claimedAt)) return null;
     return record;
   };
   const write = (path, record) => {
@@ -88,7 +91,11 @@ export function createEnqueueClaims({
         const at = now();
         if (record && at - record.claimedAt <= ttlMs) {
           if (record.state === 'done' && record.kind !== candidate.kind) return { won: false, reason: 'done-by-other', heldBy: record };
-          if (record.state === 'claimed' && pidAlive(record.pid)) return { won: false, reason: 'held', heldBy: record };
+          if (record.state === 'claimed') {
+            let alive;
+            try { alive = pidAlive(record.pid); } catch (error) { alive = error.code !== 'ESRCH'; }
+            if (alive) return { won: false, reason: 'held', heldBy: record };
+          }
         }
         const token = randomUUID();
         write(path, { key, state: 'claimed', kind: candidate.kind, pid, token, claimedAt: at });
@@ -108,4 +115,37 @@ export function createEnqueueClaims({
       });
     },
   };
+}
+
+/** Serial bookkeeping is best-effort; ownership refusals still skip the enqueue. */
+export function withSerialEnqueueClaim(claims, identity, run, { emit = appendDaemonEvent } = {}) {
+  const warn = (op, error) => {
+    const clean = value => String(value).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
+    const message = clean(error?.message ?? error);
+    const key = clean(`${identity.repo}#${identity.num}@${identity.headSha}`);
+    process.stderr.write(`drain-enqueue-claim: ${op} failed for ${key}: ${message} — proceeding fail-open\n`);
+    try {
+      Promise.resolve(emit({ kind: 'drain-enqueue-claim-error', repo: identity.repo, pr: identity.num,
+        daemon: 'drain', detail: { op, headSha: identity.headSha, message } })).catch(() => {});
+    } catch { /* Event storage never changes the serial outcome. */ }
+  };
+  const bookkeeping = (op, token) => {
+    try {
+      const result = claims[op]({ ...identity, token });
+      if (result?.reason === 'lock-busy') warn(op, 'lock-busy');
+    } catch (error) { warn(op, error); }
+  };
+  let claim;
+  try { claim = claims?.claim({ ...identity, kind: 'serial' }); } catch (error) { warn('claim', error); }
+  if (claim?.won === false) {
+    if (claim.reason === 'lock-busy') warn('claim', 'lock-busy');
+    return { skipped: 'claimed-elsewhere' };
+  }
+  let result;
+  try { result = run(); } catch (error) {
+    if (claim?.won) bookkeeping('release', claim.token);
+    throw error;
+  }
+  if (claim?.won) bookkeeping(result?.enqueued === true ? 'markDone' : 'release', claim.token);
+  return result;
 }
