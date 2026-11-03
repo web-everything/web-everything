@@ -468,8 +468,6 @@ const LEGACY_REMOTE_PRE_EXECUTION_REASONS = Object.freeze([
   'forge-unreachable',
   'copy-failed',
   'ignored-test-file',
-  'ignored-dependency',
-  'unresolvable-dynamic-import',
   'invalid-diff-coverage-base',
   'diff-coverage-base-unavailable',
   'coverage-report-not-portable',

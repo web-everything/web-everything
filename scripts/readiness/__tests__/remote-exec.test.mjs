@@ -604,7 +604,7 @@ describe('isAllowedCommand', () => {
 });
 
 describe('standards input parity', () => {
-  it('discovers the same base, tracked coverage report, tracked memory index and tracked skills locally and through the real manifest + filterEnv', async () => {
+  it('discovers the same base, ignored coverage report, tracked memory index and tracked skills locally and through the real manifest + filterEnv', async () => {
     for (const scenario of ['coverage base', 'coverage report', 'memory index', 'tracked skills']) {
       let observed;
       const f = fixture({receipt:(_nonce,value)=>JSON.stringify({...value,code:observed.exitCode})});
@@ -641,11 +641,10 @@ describe('standards input parity', () => {
       git('update-ref','refs/remotes/origin/main','HEAD');
       const loc = {start:{line:1,column:0},end:{line:1,column:40}};
       mkdirSync(join(work,'coverage'));
-      // Track this gate input: ignored non-test coverage bytes must never ship.
+      // Only the local input exists here; the real builder/stager must ship it.
       writeFileSync(join(work,'coverage/coverage-final.json'),JSON.stringify({[tier]:{
         branchMap:{0:{loc,locations:[loc,loc]}},b:{0:scenario === 'memory index' ? [1,1] : [0,0]},
       }}));
-      git('add','-f','coverage/coverage-final.json');
       const discover = (root, env) => {
         const coverage = scanDiffBranchCoverage(root,{base:env.DIFF_COVERAGE_BASE ?? 'HEAD'});
         const memory = spawnSync(process.execPath,[join(root,'scripts/check-memory.mjs'),'--json'],{
@@ -1077,11 +1076,8 @@ describe('runRemote', () => {
     expect(existsSync(await fs.mkdtemp.mock.results[0].value)).toBe(false);
   });
 
-  it('admits local execution for a selected unshippable Git-ignored test through the real legacy adapter', async () => {
+  it('admits local execution for a Git-ignored test through the real legacy adapter', async () => {
     const f = fixture();
-    f.argv = ['npm','run','test:unit','--','scripts/__tests__/ignored.test.mjs'];
-    mkdirSync(join(cwd, 'scripts/__tests__'), {recursive:true});
-    symlinkSync(join(cwd, 'a.test.mjs'), join(cwd, 'scripts/__tests__/ignored.test.mjs'));
     const exec = f.exec;
     f.exec = vi.fn(async call => call.file === 'git' && call.args.includes('-i')
       ? {code:0, stdout:Buffer.from('scripts/__tests__/ignored.test.mjs\0')}
@@ -1181,205 +1177,69 @@ describe('runRemote', () => {
     expect(readdirSync(destination, {recursive:true}).sort()).toEqual(['a.test.mjs', 'package-lock.json', 'src', 'src/kept.mjs']);
   });
 
-  it.each([
-    ['npm', '_site/assets/js/__tests__/stale.test.ts', 'a.test.mjs'],
-    ['npx', '_site-visual-fixtures/stale.test.mjs', 'a.test.mjs'],
-    ['npx', 'generated/a.test.mjs', 'A.TEST.MJS'],
-    ['npm', 'hidden.test.mjs', 'hidden.test.mjs'],
-    ['npm', 'scripts/hidden.test.mjs', undefined],
-  ])('ships ignored tests for %s selection in full/delta manifests and transport: %s', async (command, name, filter) => {
-    const f = fixture(), exec = f.exec;
-    mkdirSync(join(cwd, ...name.split('/').slice(0,-1)), {recursive:true});
-    writeFileSync(join(cwd, name), 'export const shipped = true');
-    f.exec = vi.fn(async call => call.file === 'git' && call.args.includes('-i')
-      ? {code:0, stdout:Buffer.from(name+'\0')} : exec(call));
-    f.argv = command === 'npm' ? ['npm','run','test:unit', ...(filter ? ['--', filter] : [])]
-      : ['npx','vitest','run', filter];
-    const manifest = await remoteManifestAPI.buildManifest({...f, selectedTests:filter ? [filter] : undefined});
-    expect(manifest.entries).toContainEqual(expect.objectContaining({path:Buffer.from(name), tracked:false,
-      sha256:createHash('sha256').update(readFileSync(join(cwd,name))).digest('hex')}));
-    const wire = forgeManifestAPI.manifestWire(manifest);
-    const delta = await remoteManifestAPI.buildDeltaManifest({...f, selectedTests:filter ? [filter] : undefined,
-      base:{sha:'a'.repeat(40),manifest:wire,manifestDigest:forgeManifestAPI.digestManifest(wire)}});
-    expect(delta.entries.map(entry => entry.path.toString())).toContain(name);
-    expect(await runRemote(f)).toMatchObject({mode:'remote',code:0});
-    const request = callsOf(f.exec).find(isRun);
-    expect(Buffer.from(JSON.parse(request.input).manifest.paths,'base64').toString().split('\0')).toContain(name);
-    const copy = callsOf(f.exec).find(call => call.file === 'rsync');
-    expect(copy.input.toString()).toContain('./'+name+'\0');
-  });
-
-  it('ships only ignored tests, excluding adjacent secrets and ignored coverage even from injected inventory', async () => {
-    const f = fixture(), exec = f.exec;
-    const names = ['.env.local', 'secrets.json', 'x.test.ts', 'coverage/coverage-final.json'];
-    mkdirSync(join(cwd,'coverage'));
-    for (const name of names) writeFileSync(join(cwd,name),'export const value = 1;');
-    f.exec = vi.fn(async call => call.file === 'git' && call.args.includes('-i')
-      ? {code:0,stdout:Buffer.from(names.join('\0')+'\0')} : exec(call));
-    f.listFiles.mockResolvedValue(['a.test.mjs','package-lock.json',...names]);
-    const manifest = await remoteManifestAPI.buildManifest(f);
-    expect(manifest.entries.map(entry=>entry.path.toString()).sort()).toEqual(['a.test.mjs','package-lock.json','x.test.ts']);
-  });
-
-  it.each([
-    ["import './helper';", 'helper.ts'],
-    ["export * from './helper';", 'helper/index.mjs'],
-    ["require('./helper');", 'helper.json'],
-    ["import('./helper');", 'helper.tsx'],
-    ...['.mts','.jsx','.mjs','.cjs'].map(ext=>["import './helper';",'helper'+ext]),
-    ["import './helper.js';", 'helper.js'],
-  ])('refuses an ignored non-test dependency before transport: %s', async (source, name) => {
-    const f = fixture(), exec = f.exec;
-    mkdirSync(join(cwd,'helper'),{recursive:true});
-    writeFileSync(join(cwd,'helper.js'),'export {};');
-    writeFileSync(join(cwd,name),'export {};');
-    writeFileSync(join(cwd,'a.test.mjs'),source);
-    f.listFiles.mockResolvedValue(['a.test.mjs','package-lock.json',...(name==='helper.js'?[]:['helper.js'])]);
-    f.exec = vi.fn(async call => call.file === 'git' && call.args.includes('-i')
-      ? {code:0,stdout:Buffer.from(name+'\0')} : exec(call));
-    expect(await runRemote(f)).toMatchObject({mode:'not-started',terminated:true,reason:'ignored-dependency',detail:name});
-    expect(callsOf(f.exec).some(call=>isPrepare(call)||call.file==='rsync'||isRun(call))).toBe(false);
-  });
-
-  it.each([
-    ['.js','.ts'], ['.js','.tsx'], ['.jsx','.tsx'], ['.mjs','.mts'], ['.cjs','.cts'],
-  ])('refuses ignored TypeScript extension substitution %s -> %s before transport', async (requested, actual) => {
-    const f = fixture(), exec = f.exec, name = 'helper'+actual;
-    writeFileSync(join(cwd,'a.test.mjs'),`import './helper${requested}';`);
-    writeFileSync(join(cwd,'helper'+requested),'export {};');
-    writeFileSync(join(cwd,name),'export {};');
-    f.listFiles.mockResolvedValue(['package-lock.json','a.test.mjs','helper'+requested]);
-    f.exec = vi.fn(async call=>call.file==='git' && call.args.includes('-i')
-      ? {code:0,stdout:Buffer.from(name+'\0')} : exec(call));
-    expect(await runRemote(f)).toMatchObject({mode:'not-started',terminated:true,reason:'ignored-dependency',detail:name});
-    expect(callsOf(f.exec).some(call=>isPrepare(call)||call.file==='rsync'||isRun(call))).toBe(false);
-  });
-
-  it.each(['vitest.config.ts','vite.config.mjs','vitest.workspace.ts'].flatMap(config=>[
-    [config, "export default {test:{setupFiles:['./setup.ts']}};", 'setupFiles'],
-    [config, "export default {test:{globalSetup:'./setup.ts'}};", 'globalSetup'],
-    [config, "import './setup.ts'; export default {};", 'configuration import'],
-  ]))('refuses ignored configuration execution dependencies before transport: %s / %s / %s', async (config, source) => {
-    const f = fixture(), exec = f.exec;
-    writeFileSync(join(cwd,config),source);
-    writeFileSync(join(cwd,'setup.ts'),'export default () => {};');
-    writeFileSync(join(cwd,'hidden.test.ts'),'export {};');
-    f.listFiles.mockResolvedValue(['package-lock.json','a.test.mjs',config]);
-    f.exec = vi.fn(async call=>call.file==='git' && call.args.includes('-i')
-      ? {code:0,stdout:Buffer.from('setup.ts\0hidden.test.ts\0')} : exec(call));
-    expect(await runRemote(f)).toMatchObject({mode:'not-started',terminated:true,
-      reason:'unresolvable-dynamic-import',detail:config});
-    expect(callsOf(f.exec).some(call=>isPrepare(call)||call.file==='rsync'||isRun(call))).toBe(false);
-  });
-
-  it.each(['#helper','fixture-package','fixture-package/helper'])
-  ('refuses package imports and self-references to an ignored helper before transport: %s', async specifier => {
-    const f = fixture(), exec = f.exec;
-    writeFileSync(join(cwd,'package.json'),JSON.stringify({name:'fixture-package',
-      imports:{'#helper':'./helper.mjs'},exports:{'.':'./helper.mjs','./helper':'./helper.mjs'}}));
-    writeFileSync(join(cwd,'hidden.test.mjs'),`import '${specifier}';`);
-    writeFileSync(join(cwd,'helper.mjs'),'export {};');
-    f.argv = ['npx','vitest','run','hidden.test.mjs'];
-    f.listFiles.mockResolvedValue(['package-lock.json','a.test.mjs','package.json']);
-    f.exec = vi.fn(async call=>call.file==='git' && call.args.includes('-i')
-      ? {code:0,stdout:Buffer.from('hidden.test.mjs\0helper.mjs\0')} : exec(call));
-    expect(await runRemote(f)).toMatchObject({mode:'not-started',terminated:true,
-      reason:'unresolvable-dynamic-import',detail:'hidden.test.mjs'});
-    expect(callsOf(f.exec).some(call=>isPrepare(call)||call.file==='rsync'||isRun(call))).toBe(false);
-  });
-
-  it.each(['fs','fs/promises','node:fs','node:test'])
-  ('allows builtin imports with omitted ignored non-test files: %s', async specifier => {
-    const f = fixture(), exec = f.exec;
-    writeFileSync(join(cwd,'a.test.mjs'),`import '${specifier}';`);
-    writeFileSync(join(cwd,'helper.mjs'),'export {};');
-    f.exec = vi.fn(async call=>call.file==='git' && call.args.includes('-i')
-      ? {code:0,stdout:Buffer.from('helper.mjs\0')} : exec(call));
-    expect(await runRemote(f)).toMatchObject({mode:'remote',code:0});
-  });
-
-  it('refuses unknown node-prefixed imports when ignored non-test dependencies may exist', async () => {
-    const f = fixture(), exec = f.exec;
-    writeFileSync(join(cwd,'a.test.mjs'),"import 'node:unknown-module';");
-    writeFileSync(join(cwd,'helper.mjs'),'export {};');
-    f.exec = vi.fn(async call=>call.file==='git' && call.args.includes('-i')
-      ? {code:0,stdout:Buffer.from('helper.mjs\0')} : exec(call));
-    expect(await runRemote(f)).toMatchObject({mode:'not-started',terminated:true,
-      reason:'unresolvable-dynamic-import',detail:'a.test.mjs'});
-    expect(callsOf(f.exec).some(call=>isPrepare(call)||call.file==='rsync'||isRun(call))).toBe(false);
-  });
-
-  it.each([
-    'import(target)', 'require(target)', 'module.require(target)',
-    'const load = require; load(target)', 'const load = module.require; load(target)',
-    "module['require'](target)", "module[key](target)",
-    'import(',
-    "createRequire(import.meta.url)('./helper')", "const load = createRequire(import.meta.url); load(target)",
-  ])('refuses an unresolvable dynamic import before transport: %s', async source => {
+  it('retains ignored-test fallback without discovery after finalizing the Forge coverage environment', async () => {
     const f = fixture();
-    writeFileSync(join(cwd,'a.test.mjs'),source);
-    expect(await runRemote(f)).toMatchObject({mode:'not-started',terminated:true,reason:'unresolvable-dynamic-import',detail:'a.test.mjs'});
-    expect(callsOf(f.exec).some(call=>isPrepare(call)||call.file==='rsync'||isRun(call))).toBe(false);
+    const gitIn=(...args)=>{
+      const result=spawnSync('git',['-c','user.name=t','-c','user.email=t@t',...args],{cwd,encoding:'utf8',timeout:10000});
+      expect(result.status,result.stderr).toBe(0);return result.stdout.trim();
+    };
+    gitIn('init','--quiet');
+    writeFileSync(join(cwd,'.gitignore'),'dist/\nheavy/\n');
+    mkdirSync(join(cwd,'dist'),{recursive:true});writeFileSync(join(cwd,'dist/hidden.test.mjs'),'must run');
+    gitIn('add','.');gitIn('commit','-q','-m','base');gitIn('branch','coverage-base');
+    const fake = f.exec;
+    f.exec = vi.fn(async call => call.file === 'git'
+      ? remoteManifestAPI.defaultExec({...call,env:{...call.env,PATH:process.env.PATH}}) : fake(call));
+    f.selectorExec = vi.fn(async () => ({stdout:JSON.stringify([join(cwd,'a.test.mjs')])}));
+    const result = await runRemote({...f,listFiles:undefined,argv:['npx','vitest','run','a.test.mjs'],env:{...f.env,DIFF_COVERAGE_BASE:'coverage-base'}});
+    expect(f.selectorExec).not.toHaveBeenCalled();
+    expect(result).toMatchObject({mode:'not-started',reason:'ignored-test-file',detail:'dist/hidden.test.mjs'});
   });
 
-  it('checks transitive static dependencies without shipping ignored helper bytes', async () => {
-    const f = fixture(), exec = f.exec;
-    writeFileSync(join(cwd,'a.test.mjs'),"import './bridge.js';");
-    writeFileSync(join(cwd,'bridge.js'),"module.require('./private-helper');");
-    writeFileSync(join(cwd,'private-helper.mts'),'export {};');
-    f.listFiles.mockResolvedValue(['package-lock.json','a.test.mjs','bridge.js']);
-    f.exec = vi.fn(async call=>call.file==='git' && call.args.includes('-i')
-      ? {code:0,stdout:Buffer.from('private-helper.mts\0')} : exec(call));
-    expect(await runRemote(f)).toMatchObject({reason:'ignored-dependency',detail:'private-helper.mts',mode:'not-started',terminated:true});
-    expect(callsOf(f.exec).some(call=>isPrepare(call)||call.file==='rsync'||isRun(call))).toBe(false);
-  });
-
-  it('falls back locally when the parsed source closure exceeds its byte bound', async () => {
+  it.each(['scripts/__tests__/.env.local/hidden.test.mjs','scripts/__tests__/.env.local/hidden.js','hidden.spec.ts','dist/hidden.test.mjs','build/hidden.test.mjs'])
+  ('falls back for a Git-ignored test instead of certifying remote success: %s', async name => {
+    writeFileSync(join(cwd,'vitest.config.mjs'), "export default {test:{include:['**/*.{test,spec}.{ts,mjs}', '**/__tests__/**/*.js'],exclude:[]}};");
+    spawnSync('git',['init','--quiet'],{cwd});
+    writeFileSync(join(cwd,'.gitignore'), name+'\n');
+    mkdirSync(join(cwd, ...name.split('/').slice(0,-1)),{recursive:true});
+    writeFileSync(join(cwd,name),'must run');
     const f = fixture();
-    writeFileSync(join(cwd,'a.test.mjs'),"import './one.js'; import './two.js';");
-    for (const name of ['one.js','two.js']) writeFileSync(join(cwd,name),'/*'+'x'.repeat(2200000)+'*/');
-    f.listFiles.mockResolvedValue(['package-lock.json','a.test.mjs','one.js','two.js']);
-    expect(await runRemote(f)).toMatchObject({reason:'unresolvable-dynamic-import',mode:'not-started',terminated:true});
-    expect(callsOf(f.exec).some(call=>isPrepare(call)||call.file==='rsync'||isRun(call))).toBe(false);
-  });
-
-  it('executes a selected test importing an ignored test on the real remote runner', async () => {
-    const name = '_site/hidden.test.mjs';
-    const f = realRemoteFixture(['package.json','package-lock.json']);
-    mkdirSync(join(cwd, '_site'));
-    writeFileSync(join(cwd, name), "export const value = 'IGNORED IMPORT AVAILABLE';");
-    writeFileSync(join(cwd, 'a.test.mjs'), "import {value} from './_site/hidden.test.mjs'; console.log(value);");
-    writeFileSync(join(cwd, 'package.json'), JSON.stringify({name:'fixture',version:'1.0.0',scripts:{'test:unit':'node'}}));
-    const exec = f.exec;
-    f.exec = vi.fn(async call => call.file === 'git' && call.args.includes('-i')
-      ? {code:0, stdout:Buffer.from(name+'\0')} : exec(call));
-    expect(await runRemote(f), JSON.stringify(f.runs)).toMatchObject({mode:'remote',code:0});
-    expect(f.runs.at(-1).stdout).toContain('IGNORED IMPORT AVAILABLE');
-  });
-
-  it.each(['symlink', 'excluded source', 'walk limit'])('refuses a selected ignored test with its existing %s reason', async kind => {
-    const f = fixture(), exec = f.exec;
-    const name = kind === 'excluded source' ? '.env.local/hidden.test.mjs' : '_site/hidden.test.mjs';
-    mkdirSync(join(cwd, name.split('/')[0]));
-    if (kind === 'symlink') symlinkSync(join(cwd,'a.test.mjs'), join(cwd,name));
-    else writeFileSync(join(cwd,name), 'export {}');
-    if (kind === 'walk limit') f.fs = {...filesystem, readdir:vi.fn(async () => Array(100001).fill(Buffer.from('entry')))};
-    f.exec = vi.fn(async call => call.file === 'git' && call.args.includes('-i')
-      ? {code:0, stdout:Buffer.from(name+'\0')} : exec(call));
-    f.argv = ['npx','vitest','run', name];
-    const reason = kind === 'symlink' ? 'unshipped-symlink' : kind === 'excluded source' ? 'excluded-source-file' : 'manifest-walk-limit';
-    expect(await runRemote(f)).toMatchObject({mode:'not-started',terminated:true,reason,
-      ...(kind === 'symlink' ? {detail:name} : {})});
+    const fake = f.exec;
+    f.exec = vi.fn(async call => call.file === 'git'
+      ? remoteManifestAPI.defaultExec({...call,env:{...call.env,PATH:process.env.PATH}}) : fake(call));
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'ignored-test-file',detail:name});
     expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
   });
-
-  it('keeps the specific refusal for an unshipped selected test', async () => {
+  it.each([
+    'scripts/build/__tests__/unit/lost.test.mjs',
+    'scripts/out/__tests__/unit/lost.test.mjs',
+    'scripts/coverage/__tests__/unit/lost.test.mjs',
+    'scripts/.next/__tests__/unit/lost.test.mjs',
+    'scripts/.vite/__tests__/unit/lost.test.mjs',
+    'scripts/.cache/__tests__/unit/lost.test.mjs',
+    'scripts/storybook-static/__tests__/unit/lost.test.mjs',
+    'scripts/_site/__tests__/unit/lost.test.mjs',
+    'scripts/dist/__tests__/unit/lost.test.mjs',
+    '_site/output.test.mjs',
+    'dist/output.test.mjs',
+    'scripts/quote\' space 雪/build/__tests__/unit/lost.test.mjs',
+  ])('falls back before transport for a whole-directory ignored test: %s', async name => {
+    writeFileSync(join(cwd,'vitest.config.mjs'), readFileSync(new URL('./fixtures/forge-selection-patterns.mjs',import.meta.url)));
     const f = fixture();
-    writeFileSync(join(cwd,'new.test.mjs'),'unshipped selected test');
-    await expect(remoteManifestAPI.buildManifest({...f,selectedTests:['new.test.mjs']}))
-      .rejects.toMatchObject({code:'unshipped-test-file',detail:'new.test.mjs'});
-    expect(await runRemote({...f,argv:['npx','vitest','run','new.test.mjs']}))
-      .toMatchObject({mode:'not-started',terminated:true,reason:'unshipped-test-file',detail:'new.test.mjs'});
+    f.argv = ['npm', 'run', 'test:unit'];
+    const exec = f.exec;
+    f.exec = vi.fn(async call => {
+      if (call.file === 'git' && call.args.includes('-i')) {
+        return {code:0, stdout:Buffer.from(name+'\0')};
+      }
+      // Model check-ignore evidence from a whole-directory rule (including info/exclude).
+      if (call.file === 'git' && gitArgs(call)[0] === 'check-ignore') {
+        return {code:0, stdout:call.input};
+      }
+      return exec(call);
+    });
+    await expect(remoteManifestAPI.buildManifest(f)).rejects.toMatchObject({code:'ignored-test-file'});
+    expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'ignored-test-file',detail:name});
     expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
   });
 
@@ -1407,7 +1267,7 @@ describe('runRemote', () => {
     expect(callsOf(f.exec).some(isPrepare)).toBe(false);
   });
 
-  it.each([[], ['--','--files=scripts/readiness/remote-exec.mjs']].flatMap(args => [[args,true],[args,false]]))('full-ships tracked absolute-path coverage and resolves local main behind HEAD to preserve remote guard parity: %j (dirty: %s)', async (args, dirty) => {
+  it.each([[], ['--','--files=scripts/readiness/remote-exec.mjs']].flatMap(args => [[args,true],[args,false]]))('full-ships absolute-path coverage and resolves local main behind HEAD to preserve remote guard parity: %j (dirty: %s)', async (args, dirty) => {
     const f = fixture({runCode:1}),original=f.exec;
     const git=(...args)=>{
       const result=spawnSync('git',args,{cwd,encoding:'utf8',timeout:10000});
@@ -1441,7 +1301,6 @@ describe('runRemote', () => {
     const report=JSON.stringify({[join(cwd,tier)]:entry});
     const portableReport=JSON.stringify({[tier]:entry});
     writeFileSync(join(cwd,'coverage/coverage-final.json'),report);
-    git('add','-f','coverage/coverage-final.json');
     // Equal source/report mtimes are fresh. This fractional value loses another
     // microsecond if the portable rewrite restores the already-staged timestamp.
     const stamp = 1700000000 + 123406 / 1e6;
@@ -1455,7 +1314,7 @@ describe('runRemote', () => {
     if (!dirty) expect(scanMaterializedGuards(cwd).coverage.status).toBe('no-scope');
     const artifacts=['reports/new.md','src/_data/researchTopics/new.json','src/_includes/research-descriptions/new.njk'];
     for(const name of artifacts){mkdirSync(join(cwd,name,'..'),{recursive:true});writeFileSync(join(cwd,name),'new artifact');}
-    f.listFiles.mockResolvedValue(['a.test.mjs','package-lock.json',tier,'coverage/coverage-final.json',...artifacts]);
+    f.listFiles.mockResolvedValue(['a.test.mjs','package-lock.json',tier,...artifacts]);
     let observed;
     f.exec=vi.fn(async call=>{
       if(call.file==='git')return remoteManifestAPI.defaultExec({...call,env:{...call.env,PATH:process.env.PATH}});
@@ -1479,7 +1338,7 @@ describe('runRemote', () => {
         const coverageIndex=entries.findIndex(path=>path.equals(Buffer.from('coverage/coverage-final.json')));
         expect(coverageIndex).toBeGreaterThanOrEqual(0);
         expect(request.manifest.hashes[coverageIndex]).toBe(createHash('sha256').update(portableReport).digest('hex'));
-        expect(request.manifest.tracked[coverageIndex]).toBe(true);
+        expect(request.manifest.tracked[coverageIndex]).toBe(false);
         expect(readFileSync(join(snapshot,'coverage/coverage-final.json'),'utf8')).toBe(portableReport);
         expect(readFileSync(join(cwd,'coverage/coverage-final.json'),'utf8')).toBe(report);
         expect(statSync(join(snapshot,'coverage/coverage-final.json')).mtimeMs).toBeCloseTo(statSync(join(cwd,'coverage/coverage-final.json')).mtimeMs,0);
@@ -1724,29 +1583,6 @@ describe('runRemoteCli', () => {
 });
 
 describe('explicit remote CLI decision', () => {
-  it('sends normalized main-gate argv and binds the receipt to that argv', async () => {
-    const f = fixture();
-    const original = ['npx','vitest','run','--testTimeout=15000','--hookTimeout=30000','./a.test.mjs'];
-    expect(await runRemoteCli({...f,argv:original,log:vi.fn()})).toBe(0);
-    const request = JSON.parse(callsOf(f.exec).find(isRun).input);
-    expect(request.argv).toEqual(['npx','vitest','run','--testTimeout=15000','--hookTimeout=30000','a.test.mjs']);
-    expect(request.argvDigest).toBe(digestArgv(request.argv));
-    expect(f.local).not.toHaveBeenCalled();
-    expect(original.at(-1)).toBe('./a.test.mjs');
-  });
-  it('refuses local-only retry argv in the explicit remote CLI before any execution', async () => {
-    const f = fixture({probeCode:255});
-    const original = ['npx','vitest','run','--maxWorkers=1','--minWorkers=1','--no-file-parallelism','./a.test.mjs'];
-    await expect(runRemoteCli({...f,argv:original,log:vi.fn()})).rejects.toThrow('command-not-allowed');
-    expect(f.local).not.toHaveBeenCalled();
-    expect(f.exec).not.toHaveBeenCalled();
-  });
-  it('refuses serial flags in direct transport without staging or dispatch', async () => {
-    const f = fixture();
-    expect(await runRemote({...f,argv:['npx','vitest','run','./a.test.mjs','--no-file-parallelism']}))
-      .toMatchObject({mode:'not-started',terminated:true,reason:'command-not-allowed'});
-    expect(f.exec).not.toHaveBeenCalled();
-  });
   it.each([
     ['unconfirmed', {mode:'unconfirmed', reason:'ambiguous-result'}, 124],
     ['malformed', {mode:'remote', code:'0'}, 124],
@@ -2394,7 +2230,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
 
   it('uses exactly the manifest bytes for rsync stdin, selected digest, and run request', async () => {
     const paths = ['identity.test.mjs', 'key-management.spec.ts', 'é.test.mjs', 'package-lock.json'].map(value => Buffer.from(value));
-    for (const path of paths.slice(0, 3)) writeFileSync(Buffer.concat([Buffer.from(cwd+'/'), path]), '/* must run */');
+    for (const path of paths.slice(0, 3)) writeFileSync(Buffer.concat([Buffer.from(cwd+'/'), path]), 'must run');
     const stage = Buffer.from(paths.map(path => `100644 ${'a'.repeat(40)} 0\t${path}\0`).join(''));
     const manifest = await build({cwd, exec:gitInventory(paths, stage)});
     const exec = acceptingTransport(paths, stage);
