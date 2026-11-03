@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { ghRestGetPaged } from '../lib/gh-rest-read.mjs';
+import { ghRestGetJson } from '../lib/gh-rest-read.mjs';
 import { decodeRecoveryAdmission } from '../lib/drain-red-team-evidence.mjs';
 import { recordRedTeamStatus, readRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
 import { normalizeRedTeamResult } from '../lib/review-red-team-on-skip.mjs';
@@ -2071,7 +2071,17 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
     },
     logTrial: (row) => logDelegationTrial(row, storePath ? { path: storePath } : {}),
     // R492 S1: conditional REST issue comments (shared ETag cache); REST `user.login` is read by isTrustedMarkerAuthor.
-    listComments: ({ pr, repo }) => ghRestGetPaged(`repos/${repo}/issues/${Number(pr)}/comments`, { maxItems: 5000, caller: 'review-extra-seats', env, execOpts: { env } }),
+    // This list gates a dedupe, so it must be COMPLETE: a non-array page or a runaway thread throws, never truncates.
+    listComments: ({ pr, repo }) => {
+      const out = [];
+      for (let page = 1; ; page += 1) {
+        if (page > 100) throw new Error(`comment list for ${repo}#${pr} exceeds 10000 comments`);
+        const { json } = ghRestGetJson(`repos/${repo}/issues/${Number(pr)}/comments?per_page=100&page=${page}`, { caller: 'review-extra-seats', env, execOpts: { env } });
+        if (!Array.isArray(json)) throw new Error(`comment list for ${repo}#${pr}: page ${page} was not a list`);
+        out.push(...json);
+        if (json.length < 100) return out;
+      }
+    },
     postComment: ({ pr, repo, body }) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body),
   };
 }

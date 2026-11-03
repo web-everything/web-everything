@@ -52,3 +52,17 @@ describe('review reads route through the shared ETag cache', () => {
     expect(f.calls()[1].join(' ')).toContain('If-None-Match');
   });
 });
+
+describe('red-team comment list is complete or throws', () => {
+  it('throws on a non-list page instead of returning a partial list', () => {
+    const f = fakeGh({ message: 'not a list' });
+    const io = createRedTeamIo({ env: process.env });
+    expect(() => withEnv(f, () => io.listComments({ pr: 3, repo: 'o/r' }))).toThrow(/not a list/);
+  });
+  it('follows full pages past 100 comments', () => {
+    const f = fakeGh(Array.from({ length: 100 }, (_, i) => ({ body: String(i), user: { login: 'b' } })));
+    const io = createRedTeamIo({ env: process.env });
+    // Every page returns 100 -> it must keep paging until the 100-page guard, then throw (never truncate).
+    expect(() => withEnv(f, () => io.listComments({ pr: 3, repo: 'o/r' }))).toThrow(/exceeds/);
+  });
+});
