@@ -13,7 +13,7 @@ import { dirname, join } from 'node:path';
 import {
   runDaemonLoop, buildCliDaemonEffects, realSleep, RECONCILE_FIX_DISPATCH_LEASE_KEY, DEFAULT_INTERVAL_MS,
   runReconcileFixDispatchAllRepos, FIX_DISPATCH_DAEMON_REPOS, hasStaleMainRefusal,
-  runReconcileCiHealDispatchAllRepos, runTickAllRepos as realRunTickAllRepos, readPlanFingerprints, readPlanClaims, formatRefusalLine,
+  runReconcileCiHealDispatchAllRepos, runTickAllRepos as realRunTickAllRepos, createReconcilePlanCache, readPlanFingerprints, readPlanClaims, formatRefusalLine,
   runHungCiRecoveryAllRepos, formatHungActionLine,
   runMainRedRebaseAllRepos, formatMainRedRebaseActionLine,
   runMissingRunRecoveryAllRepos, formatMissingRunActionLine,
@@ -1872,6 +1872,49 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     let reads = 0;
     const plan = await readBack({ readPlanClaimSet: () => (reads++ < 1 ? new Set() : new Set(['claim:repo-a:8'])) });
     expect(plan.dispatch).toEqual([{ kind: 'ci-heal', prNumber: 7 }]);
+  });
+
+  it.each([
+    ['a fix launches an unrelated session', [], [{ sessionId: 'fix-7', state: 'working' }]],
+    ['an auth-dead session is detected', [{ sessionId: 'heal-8', state: 'working' }], [{ sessionId: 'heal-8', state: 'working', authExpired: true }]],
+    ['a session disappears', [{ sessionId: 'heal-8', state: 'working' }], []],
+  ])('replans instead of starving CI-heal when %s, retaining the touched-PR exclusion', (_why, before, after) => {
+    let agents = before;
+    const reconcile = vi.fn(() => planOf({
+      dispatch: [{ kind: 'fix', prNumber: 7 }, { kind: 'ci-heal', prNumber: 8 }],
+      notes: [{ prNumber: 7 }, { prNumber: 8 }], owedTriggers: [{ pr: 7 }, { pr: 8 }],
+      refusals: [{ prNumber: 9, kind: 'live-process' }],
+    }));
+    const cache = createReconcilePlanCache({ reconcile, readFingerprints: base.readPlanFingerprint,
+      readClaims: () => readPlanClaims({ readAgents: () => agents }) });
+    cache.reconcile({ repo: 'repo-a' });
+    cache.markTouched({ dispatched: [{ repo: 'repo-a', pr: 7 }] });
+    agents = after;
+    const plan = cache.reconcile({ repo: 'repo-a' });
+    expect(reconcile).toHaveBeenCalledTimes(2);
+    expect(plan.dispatch).toEqual([{ kind: 'ci-heal', prNumber: 8 }]);
+    expect(plan.notes).toEqual([{ prNumber: 8 }]);
+    expect(plan.owedTriggers).toEqual([{ pr: 8 }]);
+    expect(plan.refusals).toEqual([{ prNumber: 9, kind: 'live-process' }]);
+    expect(cache.reconcile({ repo: 'repo-a' }).dispatch).toEqual(plan.dispatch);
+    expect(reconcile).toHaveBeenCalledTimes(2); // the fresh baseline is reusable
+  });
+
+  it('uses the new liveness verdict when a session appears, including through the notes fallback', () => {
+    let claimed = false;
+    const refusal = { prNumber: 8, kind: 'live-process' };
+    const reconcile = vi.fn(() => planOf(claimed ? { refusals: [refusal] }
+      : { dispatch: [{ kind: 'ci-heal', prNumber: 8 }], notes: [{ prNumber: 8 }] }));
+    const cache = createReconcilePlanCache({ reconcile, readFingerprints: base.readPlanFingerprint,
+      readClaims: () => new Set(claimed ? ['agent:heal-8:working'] : []) });
+    expect(cache.reconcile({ repo: 'repo-a' }).dispatch).toHaveLength(1);
+    claimed = true;
+    expect(cache.notes('repo-a')).toBeNull();
+    const plan = cache.reconcile({ repo: 'repo-a' });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toEqual([refusal]);
+    expect(cache.notes('repo-a').notes).toEqual([]);
+    expect(reconcile).toHaveBeenCalledTimes(2);
   });
 
   it('recomputes the plan in full when the live probe fails', async () => {

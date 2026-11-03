@@ -789,6 +789,8 @@ export function readPlanClaims({ readAgents = () => enrichAgents(defaultReadAgen
  *    just BEFORE the plan was computed. A PR whose head, draft state, labels or last activity (comments, stand-downs,
  *    pushes) changed, or that gained a live claim, loses its dispatch/notes/owed rows from the reused plan; refusal
  *    rows are kept (they only explain). Anything an earlier phase acted on is dropped the same way.
+ *  - A new, changed or removed session discards the cached plan and recomputes liveness. Merely dropping every
+ *    dispatch row would starve later phases whenever fix launches a session, including after auth recovery.
  *  - A failed probe, a plan older than `maxAgeMs`, or one that cannot be cloned is recomputed in full.
  *  - Each reader gets its own deep copy.
  * Each phase still runs its own live gates (fix claim, fresh per-sha check read, stale-main guard) on top.
@@ -799,17 +801,26 @@ export function createReconcilePlanCache({ reconcile = (input) => runReconcilePa
   const entries = new Map();
   const touched = new Map();
   const probe = (repo) => ({ prs: readFingerprints(repo), claims: readClaims() });
+  const filterRows = (plan, stale) => {
+    for (const key of ['dispatch', 'notes', 'owedTriggers']) if (Array.isArray(plan[key])) {
+      plan[key] = plan[key].filter(row => stale !== 'all' && !stale.has(row?.prNumber ?? row?.pr));
+    }
+    return plan;
+  };
   // PRs whose live state differs from what the plan saw (or that an earlier phase acted on).
   const staleSet = (repo, baseline) => {
     const live = probe(repo);
     const stale = new Set(touched.get(repo) ?? []);
+    // A session can bind by name or lane HEAD to any PR. Re-plan from live evidence rather than returning an
+    // empty plan: otherwise an unrelated fix session can suppress CI-heal on every pass, even after /login.
+    for (const key of new Set([...live.claims, ...baseline.claims])) {
+      if (key.startsWith('agent:') && live.claims.has(key) !== baseline.claims.has(key)) return 'recompute';
+    }
     if (live.prs.get(MAIN_STATE_KEY) !== baseline.prs.get(MAIN_STATE_KEY)) return 'all';
     for (const [pr, fp] of baseline.prs) if (live.prs.get(pr) !== fp) stale.add(pr);
     for (const [pr] of live.prs) if (!baseline.prs.has(pr)) stale.add(pr);
     for (const key of live.claims) {
       if (baseline.claims.has(key)) continue;
-      // A session that appeared since the plan could bind to any PR: the liveness gate must be re-run, so every row is stale.
-      if (key.startsWith('agent:')) return 'all';
       stale.add(Number(key.split(':').pop()));
     }
     return stale;
@@ -819,9 +830,8 @@ export function createReconcilePlanCache({ reconcile = (input) => runReconcilePa
     if (!entry || now() - entry.at > maxAgeMs) return null;
     try {
       const stale = staleSet(repo, entry.baseline);
-      const plan = structuredClone(entry.plan);
-      const drop = (row) => stale !== 'all' && !stale.has(row?.prNumber ?? row?.pr);
-      for (const key of ['dispatch', 'notes', 'owedTriggers']) if (Array.isArray(plan[key])) plan[key] = plan[key].filter(drop);
+      if (stale === 'recompute') { entries.delete(repo); return null; }
+      const plan = filterRows(structuredClone(entry.plan), stale);
       const captured = structuredClone(entry.captured).filter((pr) => stale !== 'all' && !stale.has(pr?.number));
       return { plan, captured };
     } catch { entries.delete(repo); return null; }
@@ -842,10 +852,10 @@ export function createReconcilePlanCache({ reconcile = (input) => runReconcilePa
       // attribution repo it would otherwise get by identity is passed explicitly. Later stages capture the hydrated
       // rows for notes.
       const { readPrs: _discovery, ...fresh } = input;
-      const plan = reconcile({ ...fresh,
+      const plan = filterRows(reconcile({ ...fresh,
         readPrs: tap((o = {}) => defaultReadPrs({ ...o, exec: (...args) => execFileSyncThrottled(...args), attributionRepo: o.attributionRepo ?? o.repo })),
         excuseMergeGateHolds: tap(input.excuseMergeGateHolds, excusePrMergeGateHolds),
-        enrichCodeQL: tap(input.enrichCodeQL, enrichPrsWithCodeQL) });
+        enrichCodeQL: tap(input.enrichCodeQL, enrichPrsWithCodeQL) }), touched.get(repo) ?? new Set());
       try { if (baseline) entries.set(repo, { at: now(), baseline, plan: structuredClone(plan), captured: structuredClone(captured) }); }
       catch { entries.delete(repo); }
       return plan;
