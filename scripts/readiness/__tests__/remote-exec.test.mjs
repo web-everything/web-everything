@@ -1875,8 +1875,9 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     const exec=vi.fn(async call=>bindingEvidence(call)??({code:0,stdout:call.args.includes('-i')?Buffer.from('coverage/coverage-final.json\0'):Buffer.alloc(0)}));
     await expect(build({cwd,exec})).rejects.toMatchObject({code:'unshipped-symlink'});
   });
-  function gitInventory(paths, stage = Buffer.alloc(0), tree = {code:0, stdout:Buffer.alloc(0)}) {
+  function gitInventory(paths, stage = Buffer.alloc(0), tree = {code:0, stdout:Buffer.alloc(0)}, github) {
     return vi.fn(async call => {
+      if (call.file === 'gh' && github) return github(call);
       expect(call.file).toBe('git');
       const binding=bindingEvidence(call);if(binding)return binding;
       expect(call.args).toContain('-z');
@@ -2056,6 +2057,12 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
   const indexRecord = (name, data) => Buffer.from(`100644 ${blob(data)} 0\t${name}\0`);
   const treeRecord = (name, data) => Buffer.from(`100644 blob ${blob(data)}\t${name}\0`);
 
+  const published = call => {
+    expect(call.args).toEqual(['api', '-i', '--hostname', 'github.com', expect.stringMatching(/^repos\/web-everything\/web-everything\/git\/blobs\/[a-f0-9]{40}$/)]);
+    expect(call.env.WE_GH_ETAG_CACHE).toBe('0');
+    expect(call.timeout).toBe(10000);
+    return {code:0, stdout:Buffer.from('HTTP/2.0 200 OK\r\n\r\n' + JSON.stringify({sha:call.args.at(-1).split('/').at(-1)}))};
+  };
   const publicTokenFixture = 'token=ghp_0123456789abcdefghijklmnopqrstuvwxyzABCD\n';
 
   it.each(['publish-secret-gate.test.mjs', '__tests__/secret-x.test.mjs', '__tests__/secret-fixture.mjs', 'secret-x.spec.mjs'])
@@ -2065,9 +2072,69 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     const paths = [Buffer.from(name)];
     expect(credentialContentFinding(paths[0], Buffer.from(publicTokenFixture))).toBeTruthy();
     const manifest = await build({cwd, exec:gitInventory(paths, indexRecord(name, publicTokenFixture),
-      {code:0, stdout:treeRecord(name, publicTokenFixture)})});
+      {code:0, stdout:Buffer.alloc(0)}, published)});
     expect(manifest.entries).toEqual([{path:paths[0], sha256:sha(publicTokenFixture), executable:false, tracked:true}]);
     expect(manifest.excluded).toEqual([]);
+  });
+
+  it.each(['404','error','timeout','garbage','bare','304','wrong oid'])('closes fixture lookup: %s', async kind => {
+    const name='secret.test.mjs';
+    writeFileSync(join(cwd,name),publicTokenFixture);
+    const github=vi.fn(call=>{
+      if(kind==='error'||kind==='timeout')throw Object.assign(new Error(kind),{code:kind==='timeout'?'ETIMEDOUT':'EIO'});
+      if(kind==='garbage')return {code:0,stdout:Buffer.from('HTTP/2.0 200 OK\r\n\r\n?')};
+      if(kind==='bare')return {code:0,stdout:Buffer.from(JSON.stringify({sha:blob(publicTokenFixture)}))};
+      if(kind==='wrong oid')return {code:0,stdout:Buffer.from('HTTP/2.0 200 OK\r\n\r\n'+JSON.stringify({sha:'a'.repeat(40)}))};
+      return {code:kind==='404'?1:0,stdout:Buffer.from(`HTTP/2.0 ${kind} Unknown\r\n\r\n{}`)};
+    });
+    // A rewritten local origin/main claims these exact private bytes are public.
+    await expect(build({cwd,exec:gitInventory([Buffer.from(name)],indexRecord(name,publicTokenFixture),
+      {code:0,stdout:treeRecord(name,publicTokenFixture)},github)})).rejects.toMatchObject({code:'unshipped-test-file',detail:name});
+    expect(github).toHaveBeenCalledTimes(1);
+  });
+
+  it('bounds a hung blob read', async () => {
+    const name='__tests__/secret-fixture.mjs';
+    mkdirSync(join(cwd,'__tests__'));writeFileSync(join(cwd,name),publicTokenFixture);
+    let started;
+    const ready=new Promise(resolve=>{started=resolve;});
+    const github=vi.fn(()=>{started();return new Promise(()=>{});});
+    vi.useFakeTimers({toFake:['setTimeout','clearTimeout']});
+    try {
+      const pending=build({cwd,exec:gitInventory([Buffer.from(name)],indexRecord(name,publicTokenFixture),undefined,github)});
+      const refused=expect(pending).rejects.toMatchObject({code:'unshipped-test-file',detail:name});
+      await ready;
+      await vi.advanceTimersByTimeAsync(10000);
+      await refused;
+    } finally {vi.useRealTimers();}
+  });
+
+  it('reads publication afresh per build', async () => {
+    const name='__tests__/secret-fixture.mjs';
+    mkdirSync(join(cwd,'__tests__'));writeFileSync(join(cwd,name),publicTokenFixture);
+    const github=vi.fn(published);
+    const exec=gitInventory([Buffer.from(name)],indexRecord(name,publicTokenFixture),undefined,github);
+    expect((await build({cwd,exec})).entries).toHaveLength(1);
+    github.mockResolvedValue({code:1,stdout:Buffer.from('HTTP/2.0 404 Unknown\r\n\r\n{}')});
+    await expect(build({cwd,exec})).rejects.toMatchObject({code:'unshipped-test-file',detail:name});
+    expect(github).toHaveBeenCalledTimes(2);
+  });
+
+  it('caps distinct blob reads', async () => {
+    mkdirSync(join(cwd,'__tests__'));
+    const names=Array.from({length:67},(_,i)=>`__tests__/secret-${String(i).padStart(2,'0')}.mjs`);
+    const data=names.map((_,i)=>publicTokenFixture+`// ${Math.max(0,i-1)}\n`);
+    names.forEach((name,i)=>writeFileSync(join(cwd,name),data[i]));
+    let active=0,peak=0;
+    const github=vi.fn(async call=>{peak=Math.max(peak,++active);await new Promise(resolve=>setImmediate(resolve));active--;return published(call);});
+    await expect(build({cwd,exec:gitInventory(names.map(name=>Buffer.from(name)),Buffer.concat(names.map((name,i)=>indexRecord(name,data[i]))),
+      {code:0,stdout:Buffer.concat(names.map((name,i)=>treeRecord(name,data[i])))},github)}))
+      .rejects.toMatchObject({code:'unshipped-test-file',detail:names[65]});
+    expect(github).toHaveBeenCalledTimes(64);
+    expect(peak).toBeLessThanOrEqual(16);
+    const oids=callsOf(github).map(call=>call.args.at(-1));
+    expect(new Set(oids).size).toBe(64);
+    expect(oids.some(endpoint=>endpoint.endsWith(blob(data[65])))).toBe(false);
   });
 
   it('keeps identical tracked secrets.txt with a token excluded despite public evidence', async () => {

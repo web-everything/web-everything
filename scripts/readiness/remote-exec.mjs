@@ -127,10 +127,10 @@ export function validateRunId(id) {
 
 // Captures have a hard byte limit; streamed command output is inherited verbatim.
 // @test-only-export-ok: the capture boundary suite exercises this process adapter directly.
-export function defaultExec({ file, args, cwd, input, inherit = false, onOutput, sshOptions, env }) {
+export function defaultExec({ file, args, cwd, input, inherit = false, onOutput, sshOptions, env, timeout }) {
   return new Promise((resolve, reject) => {
     const child = spawn(file, file === 'ssh' ? [...(sshOptions??connectionOptions()), ...args] : args, {
-      cwd, env, stdio: [input === undefined ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe'],
+      cwd, env, ...(timeout === undefined ? {} : {timeout, killSignal:'SIGKILL'}), stdio: [input === undefined ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe'],
     });
     const stdout = [];
     let bytes = 0;
@@ -483,6 +483,30 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     await publicLoad;
     return publicBlobs.get(key);
   }
+  // Publication proof is live and scoped to this build, never a local ref or
+  // shared ETag cache. The leaf pool bounds concurrent reads to 16; after 64
+  // distinct OIDs, retain exclusion (tests then require local execution).
+  const publishedBlobs=new Map();
+  function githubPublished(oid) {
+    if(publishedBlobs.has(oid))return publishedBlobs.get(oid);
+    if(publishedBlobs.size>=64)return false;
+    const lookup=(async()=>{
+      let timer;
+      try {
+        const result=await Promise.race([
+          exec({file:'gh',args:['api','-i','--hostname','github.com',`repos/web-everything/web-everything/git/blobs/${oid}`],
+            cwd,env:{...env,WE_GH_ETAG_CACHE:'0'},timeout:10000}),
+          new Promise(resolve=>{timer=setTimeout(()=>resolve(null),10000);}),
+        ]);
+        if(result?.code!==0||!Buffer.isBuffer(result.stdout)||result.stdout.length>LIMIT)return false;
+        // Unlike the general REST reader, bare bodies are unknown evidence.
+        const response=/^HTTP\/\S+ 200(?: [^\r\n]*)?\r?\n(?:[^\r\n]+\r?\n)*\r?\n([\s\S]*)$/.exec(result.stdout.toString('utf8'));
+        return !!response && JSON.parse(response[1])?.sha===oid;
+      } catch {return false;} finally {clearTimeout(timer);}
+    })();
+    publishedBlobs.set(oid,lookup);
+    return lookup;
+  }
   const excludedSource = () => Object.assign(new Error('Excluded source: use local fallback'), {code:'excluded-source-file'});
   files.sort(Buffer.compare);
   files = files.filter((path,i) => !i || !path.equals(files[i-1]));
@@ -508,14 +532,16 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   const leaves = await orderedPool(files, MANIFEST_CONCURRENCY, async path => {
     if (trackedLinks.has(path.toString('hex'))) return;
     const {parts,names,excluded:excludedByPolicy,credentialSource}=classifyManifestPath(path);
+    const testFixture=isTestFile(path)||parts.slice(0,-1).some(part=>part.equals(Buffer.from('__tests__')))
+      ||/\.(test|spec)\./.test(parts.at(-1).toString('latin1'));
     let publicOid;
     if (credentialSource && !names.includes('node_modules')) {
       const key = path.toString('base64');
       const indexedOid = indexBlobs.get(key);
-      publicOid = await publicBlob(key);
+      publicOid = testFixture ? indexedOid : await publicBlob(key);
       if (!indexedOid || indexedOid !== publicOid) {
-        // Not tracked-and-identical to origin/main: never ships. Source files
-        // refuse the manifest (local fallback); other types stay excluded as before.
+        // Fixtures require tracked bytes; other credential paths retain the
+        // origin/main check. Missing evidence keeps the existing local fallback.
         if (sourceExtension.test(names.at(-1))) throw excludedSource();
         publicOid = undefined;
       }
@@ -552,20 +578,22 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       return {entry:{path,sha256:previous.sha256,executable,tracked}};
     const hashDone=beginSub('hashing');
     const content = await readManifestFile(absolute,st,fs);
+    let workingOid;
     if (publicOid || trackedOnly) {
       publicOid ??= indexBlobs.get(path.toString('base64'));
       if (!publicOid) throw new Error('Sibling index unavailable');
       // Index equality alone must not authorize private, unstaged working bytes.
-      const oid = createHash(publicOid.length === 64 ? 'sha256' : 'sha1')
+      const oid = workingOid = createHash(publicOid.length === 64 ? 'sha256' : 'sha1')
         .update(`blob ${content.length}\0`).update(content).digest('hex');
       if (oid !== publicOid) throw excludedSource();
     }
     hashDone();
-    // R447: only test fixtures may deliberately spell credential patterns, and
-    // only after the public-blob identity check has verified their exact bytes.
-    const testFixture=isTestFile(path)||parts.slice(0,-1).some(part=>part.equals(Buffer.from('__tests__')))
-      ||/\.(test|spec)\./.test(parts.at(-1).toString('latin1'));
-    if(credentialSource&&publicOid&&testFixture)return {entry:manifestEntryFields(path,content,executable,tracked)};
+    // R447 fixtures may spell credential patterns only with GitHub's live
+    // publication proof for the actual working-tree blob just hashed above.
+    if(credentialSource&&publicOid&&testFixture) {
+      if(await githubPublished(workingOid))return {entry:manifestEntryFields(path,content,executable,tracked)};
+      return {excluded:path};
+    }
     if(credentialSource&&credentialContentFinding(path,content))return {excluded:path};
     return {entry:manifestEntry(path,content,!!(st.mode & 0o111),indexBlobs.has(path.toString('base64')))};
   });
