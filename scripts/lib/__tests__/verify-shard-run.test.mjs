@@ -216,6 +216,32 @@ describe('one split retry for incomplete inventory', () => {
     const f = await run([{ exitCode: 1, reportText: null }, 'pass', 'fail']);
     expect(f.code).toBe(1); expect(f.output).toContain('verify-shard 1/1: FAIL');
   });
+  it.each(['pending', 'skipped', 'todo', 'disabled', undefined])(
+    'retry half with one passed and one %s assertion stays UNSETTLED', async status => {
+      const retry = { exitCode: 0, reportText: JSON.stringify({ testResults: ['a', 'b'].map(name => ({
+        name, status: 'passed', assertionResults: [{ status: 'passed' }, { status }],
+      })) }) };
+      const f = await run(['missing', retry, 'pass']);
+      expect(f.code).toBe(SHARD_UNSETTLED_EXIT);
+      expect(f.output).toContain('verify-shards: UNSETTLED');
+      expect(f.output).not.toContain('GREEN'); expect(f.calls).toHaveLength(3);
+    });
+  it('retry checks pending assertions in every reported file, including unassigned files', async () => {
+    const retry = { exitCode: 0, reportText: JSON.stringify({ testResults: ['c', 'd', 'extra'].map(name => ({
+      name, status: 'passed', assertionResults: [{ status: 'passed' }, { status: name === 'extra' ? 'pending' : 'passed' }],
+    })) }) };
+    const f = await run(['missing', 'pass', retry]);
+    expect(f.code).toBe(SHARD_UNSETTLED_EXIT);
+    expect(f.output).toContain('verify-shards: UNSETTLED');
+    expect(f.output).not.toContain('GREEN'); expect(f.calls).toHaveLength(3);
+  });
+  it('first-attempt inventory still allows passed assertions alongside pending assertions', async () => {
+    const reportText = JSON.stringify({ testResults: [{ name: 'a', status: 'passed',
+      assertionResults: [{ status: 'passed' }, { status: 'pending' }] }] });
+    expect(inventoryVerdict(reportText, ['a'])).toBe('PASS');
+    const f = await run([{ exitCode: 0, reportText }], ['a']);
+    expect(f.code).toBe(0); expect(f.calls).toHaveLength(1);
+  });
   it.each(['fullName', 'title'])('retry skipping a previously executed %s stays UNSETTLED', async identity => {
     const suite = (name, assertions) => ({ name, status: 'passed', assertionResults: assertions.map(
       ([title, status = 'passed']) => ({ [identity]: title, status })) });
