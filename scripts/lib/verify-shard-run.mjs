@@ -46,18 +46,34 @@ export function splitVitestArgs(argv, count) {
   return { shards, flags };
 }
 
+function inventoryPath(name, cwd, receiptId) {
+  // Rebase only paths belonging to the completed remote run.
+  const remote = /^\/srv\/forge-exec\/(?:slot-[1-9]\d*\/)?(r-[a-f0-9]{32})\/work\/(.+)$/.exec(name);
+  if (remote && remote[2].split('/').some(part => part === '.' || part === '..')) throw Error('invalid remote inventory path');
+  return resolve(cwd, remote && remote[1] === receiptId ? remote[2] : name);
+}
+
+function collectExecutedAssertions(text, inventory, cwd, { receiptId }) {
+  try {
+    const report = JSON.parse(text);
+    if (!Array.isArray(report?.testResults)) return;
+    for (const suite of report.testResults) {
+      if (!Array.isArray(suite?.assertionResults)) continue;
+      const file = inventoryPath(suite.name, cwd, receiptId);
+      for (const assertion of suite.assertionResults) {
+        if (['passed', 'failed'].includes(assertion?.status)) {
+          inventory.add(JSON.stringify([file, assertion.fullName ?? assertion.title]));
+        }
+      }
+    }
+  } catch { /* Unreadable reports cannot establish additional executed assertions. */ }
+}
+
 export function inventoryVerdict(text, files, cwd = process.cwd(), { receiptId } = {}) {
   try {
     const report = JSON.parse(text);
     if (!Array.isArray(report.testResults)) return 'INVENTORY-INCOMPLETE';
-    const results = new Map(report.testResults.map(r => {
-      // Forge runs the same repo at a different absolute root. Only rebase names
-      // belonging to the completed run, never arbitrary matching path suffixes.
-      const remote = /^\/srv\/forge-exec\/(?:slot-[1-9]\d*\/)?(r-[a-f0-9]{32})\/work\/(.+)$/.exec(r.name);
-      if (remote && remote[2].split('/').some(part => part === '.' || part === '..')) throw Error('invalid remote inventory path');
-      const name = remote && remote[1] === receiptId ? remote[2] : r.name;
-      return [resolve(cwd, name), r];
-    }));
+    const results = new Map(report.testResults.map(r => [inventoryPath(r.name, cwd, receiptId), r]));
     const assigned = files.map(f => results.get(resolve(cwd, f)));
     // A suite reported but skipped/pending is not execution evidence.
     if (assigned.some(r => !r || !['passed', 'failed'].includes(r.status)
@@ -187,7 +203,8 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
         // `npx vitest` / `npm run` put node_modules/.bin on PATH for the shell; a bare node child does not.
         const childEnv = { ...env, WE_VERIFY_REMOTE_REPORT: remoteReport, PATH: `${join(cwd, 'node_modules', '.bin')}:${env.PATH ?? ''}` };
         delete childEnv[ADMISSION_HELD_ENV];
-        let lastResult = null, observedFailure = false;
+        let lastResult = null, observedFailure = false, unexplainedExit = false;
+        const initialAssertions = new Set(), retriedAssertions = new Set();
         async function attempt(local, attemptFiles = files, retry = '') {
           if (!remaining()) return 'NOT-RUN';
           const report = join(directory, `${index}.${retry}${local ? 'local' : 'initial'}.json`);
@@ -211,10 +228,14 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
           try {
             reportText = Object.hasOwn(result, 'reportText') ? result.reportText : fs.readFileSync(report, 'utf8');
             const location = local ? {} : phaseRunLocation(readRemoteReport(attemptRemoteReport, (path, encoding) => fs.readFileSync(path, encoding)));
+            collectExecutedAssertions(reportText, retry ? retriedAssertions : initialAssertions, cwd, location);
             inventory = inventoryVerdict(reportText, attemptFiles, cwd, location);
           }
           catch { inventory = 'INVENTORY-INCOMPLETE'; }
           if (inventory === 'INVENTORY-INCOMPLETE') {
+            // Exit 75 is admission refusal: no command ran. Other unsuccessful
+            // attempts cannot be cleared by a later passing split.
+            unexplainedExit ||= result.exitCode !== 0 && result.exitCode !== SHARD_UNSETTLED_EXIT;
             // Missing inventory may coexist with a real failure. Keep that
             // evidence across attempts so splitting cannot retry it away.
             try {
@@ -271,7 +292,12 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
             status = ['TIMEOUT', 'NOT-RUN', 'FAIL'].find(failure => retried.includes(failure))
               ?? (retried.every(r => r === 'PASS') ? 'PASS' : 'UNSETTLED');
             if (observedFailure && ['PASS', 'UNSETTLED'].includes(status)) status = 'FAIL';
+            else if (status === 'PASS' && [...initialAssertions].some(assertion => !retriedAssertions.has(assertion))) {
+              log(`verify-shard ${index + 1}/${shards.length}: retry inventory omitted previously executed assertions; rerun the affected selection\n`);
+              status = 'UNSETTLED';
+            }
           }
+          if (unexplainedExit && status === 'PASS') status = 'UNSETTLED';
         } catch (error) { status = 'FAIL'; log(`verify-shard error: ${String(error.message).replace(/[\x00-\x1f\x7f]/g, '')}\n`); }
         // A killed/infrastructure shard must reach the caller as such (its guard refuses to run later phases on it).
         if (status !== 'PASS' && lastResult && lastResult.exitCode !== SHARD_UNSETTLED_EXIT && verificationInfrastructureFailure({ exitCode: lastResult.exitCode, signal: lastResult.signal })) infraExit ||= lastResult.signal ? 137 : lastResult.exitCode;
