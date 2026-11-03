@@ -2832,15 +2832,20 @@ export function planReconcile({
     // `review-status:fixing`, then died or finished without pushing or re-arming: the PR carries that tag and NO
     // `review:*` / `ready-to-merge` label, no live fixer holds the claim (a live session or `pr.fixClaim` refused
     // above), and no verdict names the current head - so no daemon owned it and the old rules skipped it (phase is
-    // not `open`). Owed: the neutral `review:pending`. Not gated on CI (ownership, not readiness: review itself
-    // waits on CI via reviewChecksAllow) but past the same grace as the sibling variants. Unknown head fails closed.
-    if (reviewLabelHeal !== 'off' && !pr?.isDraft && (pr?.state ?? 'OPEN') === 'OPEN'
+    // not `open`). Owed: the neutral `review:pending`. Not gated on CI state (ownership, not readiness: review itself
+    // waits on CI via reviewChecksAllow) but only under policy `stuck`, past the same grace as the sibling variants and
+    // only with a readable check timestamp. Unknown head fails closed; any verdict judging the head (accept, changes,
+    // advisory) means a verdict exists.
+    if (reviewLabelHeal === 'stuck' && !pr?.isDraft && (pr?.state ?? 'OPEN') === 'OPEN'
         && String(pr?.headRefName ?? '').startsWith('lane/')
         && withPhase.labels.includes('review-status:fixing')
         && !withPhase.labels.some((l) => l.startsWith('review:') || l === 'ready-to-merge')
         && !(pr?.fixClaim && pr.fixClaim.who)
         && typeof pr?.headRefOid === 'string' && pr.headRefOid
         && parseReviewedSha(pr?.comments) !== pr.headRefOid.toLowerCase()
+        && !(Array.isArray(pr?.comments) && pr.comments.some((c) => isReviewVerdictComment(c) && verdictJudged(c, pr.headRefOid.toLowerCase())))
+        // Fail closed on the grace: with no readable check timestamp the PR's age is unknown, so it is not yet an orphan.
+        && (Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : []).some((c) => Number.isFinite(Date.parse(c?.completedAt)))
         && greenSettledForRestoreGrace(pr?.statusCheckRollup, now)) {
       dispatch.push({
         ...base, ...withPhase, kind: 'restore-review-label', label: 'review:pending', variant: 'orphaned-fixing',
