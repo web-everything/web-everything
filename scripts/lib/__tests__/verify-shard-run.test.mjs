@@ -199,9 +199,10 @@ describe('one split retry for incomplete inventory', () => {
     expect(f.output).not.toContain('GREEN');
     expect(f.calls).toHaveLength(3);
   });
-  it('admission exit 75 with no report (command never ran) may become GREEN', async () => {
+  it('exit 75 with no report stays UNSETTLED after passing retries', async () => {
     const f = await run([{ exitCode: 75, reportText: null }, 'pass', 'pass']);
-    expect(f.code).toBe(0); expect(f.output).toContain('verify-shards: GREEN');
+    expect(f.code).toBe(75); expect(f.output).toContain('verify-shards: UNSETTLED');
+    expect(f.output).not.toContain('GREEN');
     expect(f.calls).toHaveLength(3);
   });
   it.each([null, '{invalid JSON', 'x'.repeat(SHARD_REPORT_MAX_BYTES + 1)].map((reportText, i) => [
@@ -223,6 +224,18 @@ describe('one split retry for incomplete inventory', () => {
       suite('a', [['kept'], ['lost', 'pending']]), suite('b', [['lost']]),
     ] }) };
     const f = await run([initial, retry, 'pass']);
+    expect(f.code).toBe(75); expect(f.output).toContain('verify-shards: UNSETTLED');
+    expect(f.output).not.toContain('GREEN'); expect(f.calls).toHaveLength(3);
+  });
+  it.each(['fullName', 'title'])('retry executing fewer identically named %s assertions stays UNSETTLED', async identity => {
+    const suite = (name, count) => ({ name, status: 'passed', assertionResults: Array.from(
+      { length: count }, () => ({ [identity]: 'duplicate', status: 'passed' })) });
+    const evidence = testResults => ({ exitCode: 0, reportText: JSON.stringify({ testResults }) });
+    const f = await run([
+      evidence([suite('a', 2)]),
+      evidence([suite('a', 1), suite('b', 1)]),
+      'pass',
+    ]);
     expect(f.code).toBe(75); expect(f.output).toContain('verify-shards: UNSETTLED');
     expect(f.output).not.toContain('GREEN'); expect(f.calls).toHaveLength(3);
   });

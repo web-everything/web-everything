@@ -62,7 +62,8 @@ function collectExecutedAssertions(text, inventory, cwd, { receiptId }) {
       const file = inventoryPath(suite.name, cwd, receiptId);
       for (const assertion of suite.assertionResults) {
         if (['passed', 'failed'].includes(assertion?.status)) {
-          inventory.add(JSON.stringify([file, assertion.fullName ?? assertion.title]));
+          const key = JSON.stringify([file, assertion.fullName ?? assertion.title]);
+          inventory.set(key, (inventory.get(key) ?? 0) + 1);
         }
       }
     }
@@ -204,7 +205,7 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
         const childEnv = { ...env, WE_VERIFY_REMOTE_REPORT: remoteReport, PATH: `${join(cwd, 'node_modules', '.bin')}:${env.PATH ?? ''}` };
         delete childEnv[ADMISSION_HELD_ENV];
         let lastResult = null, observedFailure = false, unexplainedExit = false;
-        const initialAssertions = new Set(), retriedAssertions = new Set();
+        const initialAssertions = new Map(), retriedAssertions = new Map();
         async function attempt(local, attemptFiles = files, retry = '') {
           if (!remaining()) return 'NOT-RUN';
           const report = join(directory, `${index}.${retry}${local ? 'local' : 'initial'}.json`);
@@ -233,9 +234,9 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
           }
           catch { inventory = 'INVENTORY-INCOMPLETE'; }
           if (inventory === 'INVENTORY-INCOMPLETE') {
-            // Exit 75 is admission refusal: no command ran. Other unsuccessful
-            // attempts cannot be cleared by a later passing split.
-            unexplainedExit ||= result.exitCode !== 0 && result.exitCode !== SHARD_UNSETTLED_EXIT;
+            // Admission forwards child exits, including 75: any nonzero exit
+            // cannot be cleared by a later passing split.
+            unexplainedExit ||= result.exitCode !== 0;
             // Missing inventory may coexist with a real failure. Keep that
             // evidence across attempts so splitting cannot retry it away.
             try {
@@ -292,7 +293,7 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
             status = ['TIMEOUT', 'NOT-RUN', 'FAIL'].find(failure => retried.includes(failure))
               ?? (retried.every(r => r === 'PASS') ? 'PASS' : 'UNSETTLED');
             if (observedFailure && ['PASS', 'UNSETTLED'].includes(status)) status = 'FAIL';
-            else if (status === 'PASS' && [...initialAssertions].some(assertion => !retriedAssertions.has(assertion))) {
+            else if (status === 'PASS' && [...initialAssertions].some(([assertion, count]) => (retriedAssertions.get(assertion) ?? 0) < count)) {
               log(`verify-shard ${index + 1}/${shards.length}: retry inventory omitted previously executed assertions; rerun the affected selection\n`);
               status = 'UNSETTLED';
             }
