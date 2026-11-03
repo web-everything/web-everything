@@ -104,7 +104,8 @@ describe('free-lane list is refreshed by lane-pool events', () => {
     const dir = laneDir(lane);
     writeFileSync(join(dir, 'new.txt'), 'x\n'); git(['add', 'new.txt'], dir); git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'unpushed'], dir);
     writeFileSync(listFile(), JSON.stringify({ v: 1, writtenAt: 1, repo: 'freepool', poolDir: null, lanes: [] }));
-    runPool(['release', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json']);
+    expect(runPool(['release', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json']).code).toBe(0);
+    expect(isFreeLaneListFresh(readFreeLaneList(listFile()), Date.now(), 60_000)).toBe(true); // event publication ran
     expect(readFreeLaneList(listFile()).lanes.map((l) => l.lane)).not.toContain(lane);
   });
 
