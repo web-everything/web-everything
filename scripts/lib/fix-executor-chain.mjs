@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { readSettings } from './settings-files.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { ROUTED_CODEX_MAX_UNPRODUCTIVE } from './fix-slot-borrow.mjs';
+import { effectiveBuilder } from './routing-settings.mjs';
 
 const rung = (id, executor, policyRoute) => Object.freeze({ id, executor,
   ...(policyRoute ? { policyRoute: Object.freeze(policyRoute) } : {}) });
@@ -30,6 +31,8 @@ export function resolveFixExecutorChain({ env = process.env, platform = platform
   for (const [source, value] of [['platform', platform?.fixExecutor?.fallbackChain], ['repo', repo?.fixExecutor?.fallbackChain], ['env', rawEnv]]) {
     if (valid(value)) result = { value: [...value], source };
   }
+  // routing.builder=claude (or auto over the quota threshold) drops the codex rungs unless env named a chain.
+  if (result.source !== 'env' && effectiveBuilder({ env, repo }).builder === 'claude') result = { value: ['claude'], source: 'routing.builder' };
   const rawCritical = env?.WE_FIX_EXECUTOR_CRITICAL_CLAUDE_FROM_RUNG;
   const validCritical = value => Number.isSafeInteger(value) && value >= 1;
   const scalarCritical = value => validCritical(value) ? value : undefined;
