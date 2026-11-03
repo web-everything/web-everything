@@ -316,7 +316,7 @@ export function releaseLockDirIf(lockRoot, path, expected, { afterRename = null 
   if (matchesExpected(readEntryInDir(tomb), tomb)) { rmSync(tomb, { recursive: true, force: true }); return true; }
   // The lock changed hands between the pre-check and the rename: restore it. If someone already re-took the path in
   // that gap, preserve BOTH locks: the displaced live lock stays as a sibling tombstone for recovery.
-  // Enumeration of lockRoot still excludes it. Failed restoration never authorizes deleting unproved metadata.
+  // Failed restoration never authorizes deleting unproved metadata.
   try { renameSync(tomb, dir); } catch { /* Leave the displaced tombstone intact. */ }
   return false;
 }
@@ -350,11 +350,9 @@ function lockDirAgeMs(lockRoot, path) {
  *   is knowingly shared across genuinely different real processes (`heavy-admission.mjs`'s lane-path-keyed
  *   slots, #3383); every other consumer's `owner` already uniquely names one process (it embeds the pid),
  *   so this flag would be a no-op for them — left `false` there to keep the change strictly additive.
- * @param {{reclaimEntryless?:boolean}} [opts] Disable half-acquire recovery when the caller already observed a
- *   holder: missing metadata then means lost evidence, never a crashed mkdir/write gap.
  * @returns {{ ok: boolean, reason: string, heldBy: string|null }}
  */
-export function reserve(lockRoot, path, owner, nowMs, nowIso, pid = null, pidLiveness = 'unknown', leaseMinutes = DEFAULT_LEASE_MINUTES, meta = null, requireOwnProcess = false, { reclaimEntryless = true } = {}) {
+export function reserve(lockRoot, path, owner, nowMs, nowIso, pid = null, pidLiveness = 'unknown', leaseMinutes = DEFAULT_LEASE_MINUTES, meta = null, requireOwnProcess = false) {
   const entry = makeLockEntry(owner, path, nowIso, pid, meta);
   if (acquireLockDir(lockRoot, path, entry)) return { ok: true, reason: 'free', heldBy: owner };
   const current = readLockEntry(lockRoot, path);
@@ -370,7 +368,7 @@ export function reserve(lockRoot, path, owner, nowMs, nowIso, pid = null, pidLiv
       if (acquireLockDir(lockRoot, path, entry)) return { ok: true, reason: 'free', heldBy: owner };
       return { ok: false, reason: 'held', heldBy: null };
     }
-    if (!reclaimEntryless || !isEntrylessDir(lockDirFor(lockRoot, path))) return { ok: false, reason: 'held', heldBy: null };
+    if (!isEntrylessDir(lockDirFor(lockRoot, path))) return { ok: false, reason: 'held', heldBy: null };
     if (age < ENTRYLESS_LOCK_DIR_GRACE_MS) return { ok: false, reason: 'initializing', heldBy: null };
   }
   // `pidLiveness` may be a probe `(entry) => 'dead'|'alive'|'unknown'`, run against THIS read — so the verdict

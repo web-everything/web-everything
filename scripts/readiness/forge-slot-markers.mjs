@@ -3,13 +3,14 @@
 // forever, so a few dead clients walled off the whole cap while Forge sat idle ("remote-full" with load ~0.5).
 // A marker is reaped here only on liveness evidence: its owner process is provably dead AND Forge's own fresh
 // telemetry cannot account for it as a still-running remote run. Nothing is ever reaped on age alone.
-import {lstatSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync, renameSync, linkSync} from 'node:fs';
+import {lstatSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync, renameSync, linkSync, rmSync} from 'node:fs';
 import {randomBytes} from 'node:crypto';
 import {join} from 'node:path';
-import {readLockEntry, lockDirFor, releaseLockDirIf, reserve, makeLockEntry} from './file-locks.mjs';
+import {readLockEntry, lockDirFor} from './file-locks.mjs';
 import {probePidLiveness} from './pid-liveness.mjs';
 
-/** Reap expired local slot leases only on proof their owner is dead, including slots above the current cap. */
+/** Reap expired local slot leases only on proof their owner is dead, including slots above the current cap.
+ * Caller must hold the remote pool mutex for this entire synchronous operation. */
 export function reapDeadSlotLocks({root, host, clock = Date.now, liveness = probePidLiveness,
   selfPid = process.pid, ttlMs = 60 * 60_000, log = () => {}}) {
   const reaped = [], nowMs = clock();
@@ -30,27 +31,11 @@ export function reapDeadSlotLocks({root, host, clock = Date.now, liveness = prob
       const heartbeatMs = Date.parse(entry.heartbeatAt);
       if (!Number.isFinite(heartbeatMs) || !(nowMs - heartbeatMs > ttlMs)) continue;
       if (liveness(entry.pid, selfPid) !== 'dead') continue;
-      const reaperOwner = `reaper-${selfPid}-${randomBytes(12).toString('hex')}`;
-      const nowIso = new Date(nowMs).toISOString();
-      const pidLivenessFn = held => {
-        const latest = JSON.parse(readFileSync(file, 'utf8'));
-        const heldHost = latest.host ?? held.meta?.host;
-        const stale = Number.isFinite(Date.parse(held.heartbeatAt)) && nowMs - Date.parse(held.heartbeatAt) > ttlMs;
-        const sameHolder = held.owner === entry.owner && held.pid === entry.pid
-          && latest.owner === held.owner && latest.pid === held.pid;
-        const dead = sameHolder && Number.isInteger(held.pid) && (heldHost == null || heldHost === host)
-          && stale && liveness(held.pid, selfPid) === 'dead';
-        // reserve also reclaims on TTL alone: abort rather than allowing that fallback for unproved holders.
-        if (!dead && (!sameHolder || stale || !Number.isFinite(Date.parse(held.heartbeatAt)))) {
-          throw new Error('slot holder changed or no longer provably dead');
-        }
-        return dead ? 'dead' : 'unknown';
-      };
-      // We already observed a holder. Missing metadata now is lost evidence, never a half-acquire to recover.
-      if (!reserve(root, entry.path, reaperOwner, nowMs, nowIso, selfPid, pidLivenessFn, ttlMs / 60000, null, true,
-        {reclaimEntryless: false}).ok) continue;
-      const ourEntry = makeLockEntry(reaperOwner, entry.path, nowIso, selfPid);
-      if (!releaseLockDirIf(root, entry.path, ourEntry)) continue;
+      // Caller holds the pool mutex: no acquiring contender can replace the directory between this
+      // final readable comparison and removal. A changed heartbeat or owner keeps the slot.
+      const latest = readLockEntry(root, entry.path);
+      if (!latest || latest.owner !== entry.owner || latest.heartbeatAt !== entry.heartbeatAt) continue;
+      rmSync(lockDirFor(root, entry.path), {recursive: true});
       reaped.push(entry.path);
       log(`heavy-admission: reaped ${entry.path} (lock ${JSON.stringify(file)}, owner ${JSON.stringify(entry.owner)}, pid ${entry.pid})\n`);
     } catch { /* Unreadable or incomplete evidence keeps the lock; retry on the next throttled pass. */ }

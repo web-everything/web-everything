@@ -3868,3 +3868,28 @@ With independent PR/detector reads succeeding, the disabled producers allow comp
 passes to clear the stale item; the enabled producer preserves it as incomplete evidence.
 The tests also require the detector digest to remain enabled, excluding disable-time
 clearing as a false-positive proof of detector completeness.
+
+## Remote slot pool exclusion
+
+Remote slot acquire and dead slot-lock reap share `withPoolMutex(remoteRoot, fn)`;
+`reapDeadSlotLocks` requires that mutex for its entire synchronous call. Its final
+readable owner/heartbeat comparison permits direct directory removal inside exclusion.
+Do not reserve a temporary reaper slot for this path. Shared file-lock recovery must
+preserve a displaced tombstone when restoration fails; the named displaced-successor
+regression covers that independent guarantee. Expected-null removal requires an empty
+directory both before rename and inside the tombstone: a null parse alone is not
+proof of absent metadata. The expected-null regressions introduce corrupt, malformed,
+and unreadable metadata at each check and verify that it survives. `.pool-mutex` and `.pool-mutex.recovery`
+are outside every slot-name matcher.
+
+Dead-mutex recovery serializes its final identity/liveness read and unlink with a
+separate mkdir guard, `.pool-mutex.recovery`. Never automatically reap that guard:
+doing so would reintroduce the same delayed-unlink race. An abandoned guard returns
+bounded `mutex-busy` (skip acquire/reap this pass); an operator must verify that no
+recovery is running before removing the guard. The two-recoverer/successor interleaving
+and abandoned-guard tests in `pool-mutex.test.mjs` pin exclusion and that fallback.
+
+`pool-mutex.test.mjs` pins bounded fail-closed contention (skip this acquire/reap pass),
+dead-owner recovery, release fencing, and a successor acquired after an earlier judgment.
+Run it alongside file-locks, forge-slot-markers, and heavy-admission-remote-client tests
+through the host heavy-admission queue.

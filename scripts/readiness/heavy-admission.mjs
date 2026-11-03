@@ -161,6 +161,7 @@ import { cutoverDecision, loadResourceGateSettings } from '../lib/resource-gate.
 import { LEASE_FILENAME, isLeaseStale } from '../lib/lane-lease.mjs';
 import { reserve, releaseLockDir, readLockEntry, heartbeatOwn, lockDirFor } from './file-locks.mjs';
 import { probePidLiveness } from './pid-liveness.mjs';
+import { withPoolMutex } from './pool-mutex.mjs';
 import { defaultPoolRoot, guardedPoolRoot, workspaceFor } from '../lib/lane-pool-paths.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
@@ -832,11 +833,13 @@ export async function runWithRemoteDecision({
       // Throttled and cheap (one readdir) when no marker is stale, so it runs on every pass, not only once the pool is full.
       if(nowMs-reapedAt>=2000){
         reapedAt=nowMs;
-        try { reapDeadSlotLocks({root:remoteRoot,host,clock,ttlMs:ADMISSION_LEASE_MINUTES*60000,log}); } catch { /* best-effort cleanup */ }
+        try { withPoolMutex(remoteRoot, () => reapDeadSlotLocks({root:remoteRoot,host,clock,ttlMs:ADMISSION_LEASE_MINUTES*60000,log}), {clock}); } catch { /* best-effort cleanup */ }
         await markerReaper.step(async()=>{const state=await health();return state.ok?peekRemoteTelemetry({root:remoteRoot,host}):null;},nowMs).catch(()=>[]);
       }
       const blocked=blockedSlots(remoteRoot,cap),slots=Array.from({length:cap},(_,i)=>i).filter(i=>!blocked.has(i));
-      slot = tryAcquireSlot({...slotOptions,slots,nowMs,nowIso:new Date(nowMs).toISOString()});
+      const acquired = withPoolMutex(remoteRoot,
+        () => tryAcquireSlot({...slotOptions,slots,nowMs,nowIso:new Date(nowMs).toISOString()}), {clock});
+      slot = acquired.ok ? acquired.value : {ok:false};
       if(slot.ok)break;
       const waited = nowMs - waitAt;
       if (waited >= REMOTE_FULL_WAIT_MS) {
