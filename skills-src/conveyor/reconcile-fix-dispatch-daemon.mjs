@@ -804,11 +804,14 @@ export function createReconcilePlanCache({ reconcile = (input) => runReconcilePa
       try { baseline = probe(repo); } catch { baseline = null; }
       let captured = [];
       const tap = (fn, fallback) => (...args) => { captured = (fn ?? fallback)(...args); return captured; };
-      // Always plan from a fresh read taken AFTER the baseline probe: a caller-supplied `readPrs` (the pass's earlier
-      // discovery snapshot) could predate the baseline and let a newer probe certify older evidence. Dropping it also
-      // keeps the default reader's identity (attribution repo); the later stages capture the hydrated rows for notes.
+      // Always plan from a DIRECT read taken AFTER the baseline probe. A caller-supplied `readPrs` (the pass's earlier
+      // discovery snapshot) and the host-shared PR snapshot (valid ~75 s) can both predate the baseline, which would let
+      // a newer probe certify older evidence. A wrapper `exec` makes the default reader skip the shared snapshot; the
+      // attribution repo it would otherwise get by identity is passed explicitly. Later stages capture the hydrated
+      // rows for notes.
       const { readPrs: _discovery, ...fresh } = input;
       const plan = reconcile({ ...fresh,
+        readPrs: tap((o = {}) => defaultReadPrs({ ...o, exec: (...args) => execFileSyncThrottled(...args), attributionRepo: o.attributionRepo ?? o.repo })),
         excuseMergeGateHolds: tap(input.excuseMergeGateHolds, excusePrMergeGateHolds),
         enrichCodeQL: tap(input.enrichCodeQL, enrichPrsWithCodeQL) });
       try { if (baseline) entries.set(repo, { at: now(), baseline, plan: structuredClone(plan), captured: structuredClone(captured) }); }

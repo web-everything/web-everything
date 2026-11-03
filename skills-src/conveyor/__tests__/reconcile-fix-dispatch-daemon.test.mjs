@@ -28,6 +28,7 @@ import * as recovery from '../../../scripts/conveyor/ci-red-recovery-watch.mjs';
 import * as netScope from '../../../scripts/conveyor/net-scope.mjs';
 import * as prStack from '../../../scripts/conveyor/pr-stack.mjs';
 import * as reconcilePass from '../../../scripts/conveyor/reconcile-pass.mjs';
+import { execFileSyncThrottled } from '../../../scripts/lib/gh-throttle.mjs';
 import { resolveFixDispatchSettings } from '../../../scripts/conveyor/fix-takeover.mjs';
 
 describe('R242 fixDispatch.skipEmptySteps policy cascade', () => {
@@ -1900,6 +1901,13 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
       fixTick: vi.fn(opts => { opts.reconcile({ repo: opts.repo, readPrs: () => ['old snapshot'] }); return { dispatched: [], refusals: [] }; }),
     }) });
     expect(spy).toHaveBeenCalledTimes(1);
-    expect(spy.mock.calls[0][0].readPrs).toBeUndefined();
+    // The planner's read is a direct one: not the caller's snapshot, and not the host-shared snapshot either.
+    const read = vi.spyOn(reconcilePass, 'defaultReadPrs').mockImplementation(() => []);
+    spy.mock.calls[0][0].readPrs({ repo: 'web-everything/web-everything' });
+    expect(read).toHaveBeenCalledTimes(1);
+    const [args] = read.mock.calls[0];
+    expect(typeof args.exec).toBe('function');
+    expect(args.exec).not.toBe(execFileSyncThrottled);
+    expect(args.attributionRepo).toBe('web-everything/web-everything');
   });
 });
