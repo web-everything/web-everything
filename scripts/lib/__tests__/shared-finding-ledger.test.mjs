@@ -253,7 +253,12 @@ describe('filterReraises — strict-true proof boundary (fail closed)', () => {
       ['async function that throws', async () => { throw new Error('pin test runner unavailable'); }],
       ['rejected Promise', () => Promise.reject(new Error('pin test runner unavailable'))],
       ['thenable whose then rejects', () => ({ then: (_ok, fail) => { fail?.(new Error('x')); return Promise.reject(new Error('y')); } })],
-      ['thenable whose then getter throws', () => ({ get then() { throw new Error('hostile getter'); } })],
+      ['rejected Promise whose constructor getter throws', () => {
+        const rejected = Promise.reject(new Error('pin test runner unavailable'));
+        Object.defineProperty(rejected, 'constructor', { get() { throw new Error('hostile constructor'); } });
+        return rejected;
+      }],
+      ['thenable whose then getter throws',() => ({ get then() { throw new Error('hostile getter'); } })],
     ];
     for (const [name, pinStillHolds] of rejecting) {
       it(`filterReraises retains the finding and raises no unhandled rejection: ${name}`, async () => {
