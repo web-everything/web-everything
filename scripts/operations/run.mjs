@@ -215,9 +215,13 @@ export function createCodexAuditSink({ auditMain = codexAuditMain, makeDeps } = 
 
 export function finishCodexAudit({ run, code, lines, json }) {
   const v = run?.verdict;
-  const outCode = v?.code ?? code;
-  return { code: outCode, lines: json || !v ? lines
-    : [v.stdout, v.stderr].filter(Boolean).map(text => text.trimEnd()) };
+  const outCode = code !== 0 ? code : (v?.code ?? code);
+  if (json || !v) return { code: outCode, lines };
+  const saved = [v.stdout, v.stderr].filter(Boolean).map(text => text.trimEnd());
+  // A non-zero exit (e.g. `--resume=<completed run> --answer=accept` refusing, exit 2) must still show WHY:
+  // append the refusal/diagnostic lines the saved verdict does not already carry.
+  const extra = outCode !== 0 ? (lines ?? []).filter(l => l !== '' && !saved.some(s => s.includes(l))) : [];
+  return { code: outCode, lines: [...saved, ...extra] };
 }
 
 
