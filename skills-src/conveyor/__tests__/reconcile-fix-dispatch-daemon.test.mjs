@@ -1892,4 +1892,14 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     expect([...out.keys()]).toEqual([7]);
     expect(() => readPlanFingerprints('we', { exec: () => JSON.stringify([{ number: 7 }]) })).toThrow(/unreadable/);
   });
+
+  it('plans from a fresh read, never from a caller-supplied discovery snapshot that may predate the live probe', async () => {
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const spy = vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(() => planOf());
+    await runTickAllRepos({ ...base, repos: ['repo-a'], readPrs: () => [], ...phases([], {
+      fixTick: vi.fn(opts => { opts.reconcile({ repo: opts.repo, readPrs: () => ['old snapshot'] }); return { dispatched: [], refusals: [] }; }),
+    }) });
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy.mock.calls[0][0].readPrs).toBeUndefined();
+  });
 });
