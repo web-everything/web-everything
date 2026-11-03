@@ -10,7 +10,7 @@ tags: []
 
 # guard-bash: replace shell-state tracking with an allowlist that fails closed on unresolved git targets
 
-Residuals from PR 6262 (R451), same family as 7625. Replace we:scripts/guard-bash.mjs shell-state tracking (assignments, declare, conditionals, eval, wrappers, tilde) with an allowlist: any git invocation whose target dir or refspec cannot be resolved statically, while a daemon clone is registered, is denied unless provably a lane clone. Also cover persisted remote.*.fetch config and git config / git remote mutation (class G). 6262 ships only interim fail-closed handling for tilde/HOME, declare/local, SPEC refspec expansion and bundled short flags.
+Residuals from PR 6262 (R451), same family as 7625. Replace we:scripts/guard-bash.mjs shell-state tracking (assignments, declare, conditionals, eval, wrappers, tilde) with a narrower supported shell language: any git invocation whose target dir or refspec cannot be resolved statically, while a daemon clone is registered, is denied unless provably a lane clone. PR 6262 now implements an explicit daemon Git read classification, unknown-option refusal, compound export tracking, persisted remote.*.fetch config reads, config/remote mutation protection and the tilde/HOME, declare/local, SPEC and bundled-flag checks. Those are delivered safeguards, not residual bypass claims. This card retains the broader shell-language redesign; its acceptance design remains outstanding.
 
 ## Acceptance
 
