@@ -4989,12 +4989,15 @@ export function decide(command, ctx = {}) {
   // first applies future exports to earlier commands and lets assignments in child shells leak out.
   let nestedBudget = NESTED_NODE_CAP;
   const copyAlternates = (from) => new Map([...from].map(([key, values]) => [key, new Set(values)]));
-  const checkScope = (list, whole, inherited, depth, persist = null, inheritedReadonly = [], inheritedAlternates = new Map(), inheritedMaybeReadonly = []) => {
+  const checkScope = (list, whole, inherited, depth, persist = null, inheritedReadonly = [], inheritedAlternates = new Map(), inheritedMaybeReadonly = [], inheritedAttributes = []) => {
     const gitConfigEnv = { ...inherited };
     const readonlyNames = new Set(inheritedReadonly);
     // Names a possibly-skipped `readonly` may have locked: a later assignment or unset may fail, so it only
     // adds a possible value and never replaces the locked one.
     const maybeReadonly = new Set(inheritedMaybeReadonly);
+    // Integer, array, case-converting and inherited attributes can refuse or transform later assignments.
+    // A nameref can change another variable indirectly (null means any target may be affected).
+    const uncertainAttributes = new Set(inheritedAttributes);
     // Other values a variable may hold because an assignment may not have run. Each is checked on its own:
     // every env-derived Git target is added separately, so one swapped key at a time covers every mix.
     const alternates = copyAlternates(inheritedAlternates);
@@ -5004,9 +5007,13 @@ export function decide(command, ctx = {}) {
     // (`2>&1`, `&>`) are not control flow.
     const controlText = whole.replace(/\d*[<>]&\d*-?|&>>?/g, ' ');
     const canUnset = !/[&|()]|\b(?:if|then|else|elif|while|until|for|do|case|select|function|enable)\b|(?:^|[\s;])[{}!#]/.test(controlText);
-    const setAssignment = (key, value, readonly = false, conditional = false) => {
+    const setAssignment = (key, value, readonly = false, conditional = false, attribute = null) => {
       if (readonlyNames.has(key)) return; // failed assignment/unset leaves a readonly target active
-      if (conditional || !canUnset || maybeReadonly.has(key)) {
+      if (attribute) {
+        uncertainAttributes.add(key);
+        if (attribute === 'indirect') uncertainAttributes.add(null);
+      }
+      if (conditional || !canUnset || maybeReadonly.has(key) || uncertainAttributes.has(key)) {
         // The assignment may be skipped or refused: it adds a possible value and never replaces the earlier
         // one. A readonly that may not have run only marks the name as possibly locked.
         if (gitConfigEnv[key] !== value) {
@@ -5017,7 +5024,7 @@ export function decide(command, ctx = {}) {
         }
         gitConfigEnv[key] = value;
         if (readonly) maybeReadonly.add(key);
-        if (persist) persist(key, value, readonly, true);
+        if (persist) persist(key, value, readonly, true, attribute);
         return;
       }
       gitConfigEnv[key] = value;
@@ -5026,14 +5033,20 @@ export function decide(command, ctx = {}) {
       if (persist) persist(key, value, readonly, false);
     };
     const checkNested = (text, env, persistChanges = null, childReadonly = readonlyNames, childAlternates = alternates,
-      childMaybeReadonly = maybeReadonly) => {
+      childMaybeReadonly = maybeReadonly, childAttributes = uncertainAttributes) => {
       if (!String(text).trim() || depth >= NESTED_DEPTH_CAP || nestedBudget <= 0) return null;
       nestedBudget -= 1;
       return checkScope(parseSegments(text).segments, text, env, depth + 1, persistChanges, childReadonly, childAlternates,
-        childMaybeReadonly);
+        childMaybeReadonly, childAttributes);
     };
     for (const seg of list) {
-      const r = reason(seg, { ...ctx, gitConfigEnv });
+      let attributeTargetUnknown = false;
+      if (uncertainAttributes.size) {
+        const named = new Set(seg.match(/[A-Za-z_][A-Za-z0-9_]*/g) || []);
+        attributeTargetUnknown = [...uncertainAttributes].some((key) => key === null
+          || /^(?:GIT_|HOME$|XDG_CONFIG_HOME$)/.test(key) || named.has(key));
+      }
+      const r = reason(seg, { ...ctx, gitConfigEnv, gitTargetUnknown: ctx.gitTargetUnknown || attributeTargetUnknown });
       if (r) return r;
       // Only a git invocation reads the environment for a target. Check each relevant possible value on its
       // own; past ALTERNATE_CHECK_CAP the target is unknown and a state change fails closed.
@@ -5096,7 +5109,12 @@ export function decide(command, ctx = {}) {
         : ['export', 'readonly'].includes(canonicalWords[0]) && optionWords.some((t) => /^-[A-Za-z]*f/.test(t));
       const versionDependent = ['export', 'readonly'].includes(canonicalWords[0])
         && optionWords.some((t) => /^-[A-Za-z]*p/.test(t));
-      const uncertain = redirected || badOption || versionDependent;
+      // Recognized options are not all plain string assignments. Even a supported option can fail on
+      // this variable or Bash version; attributes also survive a declaration without an assignment.
+      const attribute = !printsOnly && ['declare', 'typeset', 'readonly'].includes(canonicalWords[0])
+        && optionWords.some((t) => /[aAilunI]/.test(t))
+        ? (optionWords.some((t) => /n/.test(t)) ? 'indirect' : 'value') : null;
+      const uncertain = redirected || badOption || versionDependent || !!attribute;
       if (!seg.trim().startsWith('(') && canonicalWords[0] === 'unset') {
         let variables = true;
         let options = true;
@@ -5117,14 +5135,19 @@ export function decide(command, ctx = {}) {
         && ['export', 'declare', 'typeset', 'readonly'].includes(canonicalWords[0]);
       if (directive || words.every((t) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(t))) {
         const readonly = canonicalWords[0] === 'readonly'
-          || (['declare', 'typeset'].includes(canonicalWords[0]) && canonicalWords.some((t) => /^-[A-Za-z]*r[A-Za-z]*$/.test(t)));
+          || (['declare', 'typeset'].includes(canonicalWords[0]) && optionWords.some((t) => /^-[A-Za-z]*r[A-Za-z]*$/.test(t)));
         const leadingWords = gitLeadingAssignments(seg).map((m) => m[0]);
         const assignments = directive ? [...leadingWords, ...(printsOnly ? [] : canonicalWords)] : words;
         for (const word of assignments) {
           const m = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(word);
-          if (m) setAssignment(m[1], m[2], readonly, uncertain);
-          else if (readonly && word !== canonicalWords[0] && /^[A-Za-z_][A-Za-z0-9_]*$/.test(word)) {
-            setAssignment(word, gitConfigEnv[word], true, uncertain);
+          if (m) setAssignment(m[1], m[2], readonly, uncertain, attribute);
+          else if (attribute && /^([A-Za-z_][A-Za-z0-9_]*)(?:\[|\+=)/.test(word)) {
+            // Indexed and append operands still apply attributes to the base variable. Their value is
+            // unresolved, so the target check uses the attribute marker rather than guessing shell evaluation.
+            const name = /^[A-Za-z_][A-Za-z0-9_]*/.exec(word)[0];
+            setAssignment(name, gitConfigEnv[name], readonly, true, attribute);
+          } else if ((readonly || attribute) && word !== canonicalWords[0] && /^[A-Za-z_][A-Za-z0-9_]*$/.test(word)) {
+            setAssignment(word, gitConfigEnv[word], readonly, uncertain, attribute);
           }
         }
       }
@@ -5133,7 +5156,8 @@ export function decide(command, ctx = {}) {
     // separators may not be reconstructible from an individual segment. Never use future assignments.
     const group = leadingGroupBody(whole);
     for (const text of [...substitutionBodies(whole), ...(group === null ? [] : [group])]) {
-      const r = checkNested(text, inherited, null, inheritedReadonly, inheritedAlternates, inheritedMaybeReadonly);
+      const r = checkNested(text, inherited, null, inheritedReadonly, inheritedAlternates, inheritedMaybeReadonly,
+        inheritedAttributes);
       if (r) return r;
     }
     return null;
