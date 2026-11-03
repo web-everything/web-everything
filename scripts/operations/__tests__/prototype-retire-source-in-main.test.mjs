@@ -79,6 +79,18 @@ describe('source-in-main retire evidence', () => {
     expect(d.action).toBe('keep');
   });
 
+  it('keeps a -m ref whose merge commit hides an edit that is not in main (unclean merge)', () => {
+    const { r, m0, source } = scenario();
+    r.ok('checkout', '-q', '-b', 'hide', m0);
+    r.commit('hidden.txt', 'secret\n');
+    const hiddenTree = r.ok('rev-parse', 'HEAD^{tree}');
+    r.ok('checkout', '-q', 'main');
+    const evil = r.ok('commit-tree', hiddenTree, '-p', m0, '-p', source, '-m', 'merge with extra edit');
+    r.ok('update-ref', 'refs/remotes/origin/lane/x-m2', evil);
+    landOn(r, source);
+    expect(run(notNoop(r.git)).action).toBe('keep');
+  });
+
   it('keeps when git cannot answer the ancestry question', () => {
     const { r, source } = scenario();
     landOn(r, source);

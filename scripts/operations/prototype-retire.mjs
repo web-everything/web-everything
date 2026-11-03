@@ -107,11 +107,11 @@ function ghJson(gh, args) {
  * The pinned source sha of a loader `-m<N>` merge ref, when it is proved fully in main; else null (keep).
  * The loader builds the ref as a commit with parents [main-at-load, source tip], so the source is the second parent.
  * Requires: a `-m<N>` name, a two-parent tip, the source an ancestor of main, no non-merge commit beyond main,
- * and the tip the only merge beyond main. Any unreadable git answer returns null.
+ * every merge clean (git recomputes its tree), and the tip the only merge beyond main. Any unreadable git answer returns null.
  */
 function sourceInMain({ git, ref, tip, carried, mainRef }) {
   if (!mergeRefBase(ref)) return null;
-  if (carried.unique.length !== 0) return null;
+  if (carried.unique.length !== 0 || carried.cleanMerges !== true) return null;
   if (carried.merges.some((merge) => merge !== tip)) return null;
   const parents = lines(git(['rev-list', '--parents', '-n', '1', tip]).stdout)[0]?.split(/\s+/).slice(1) || [];
   if (parents.length !== 2 || !parents.every((sha) => SHA.test(sha))) return null;
