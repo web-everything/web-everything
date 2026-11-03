@@ -8,17 +8,18 @@
  * only with card files (`we:scripts/lib/lane-card-salvage.mjs`).
  *
  * Scenario: the REAL filer against a scratch pool through the REAL `lane-pool.mjs` CLI. `file-item` writes the card
- * and then times out (the forced error path). Also releases a clean lane whose status read fails: unknown dirt
- * must not become a known card-save failure that strands its lease. A replaced lease during filing must keep
+ * and then times out (the forced error path). Also checks a clean lane whose status read fails: unknown dirt
+ * must keep its lease until an explicit discard. A replaced lease during filing must keep
  * the replacement holder's untracked cards, staged index and lease, including a same-session reacquisition.
  * An index lock after batch admission must retain the lease when retirement leaves a staged deletion.
  * A concurrent index-only card replacement at the deletion boundary must also retain its blob and lease.
- * GREEN = clean, card saved, unknown released, replacement holder untouched, incomplete unstaging held.
+ * GREEN = clean, card saved, unknown held until discard, replacement holder untouched, incomplete unstaging held.
  */
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import { execRead, readGit } from '../../../lib/proc-read.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..');
@@ -193,6 +194,8 @@ syncBuiltinESMExports();\n`);
       git(['rm', '--cached', '--quiet', '--ignore-unmatch', '--', CARD], stagedRace.path);
       cli(['release', `--lane=${stagedRace.lane}`, '--session=soak-index-race']);
       const unknown = JSON.parse(cli(['acquire', '--no-reset', '--session=soak-unknown', '--json']));
+      const unknownMarker = join(unknown.path, '.git', '.lane-lease');
+      const unknownLease = readFileSync(unknownMarker);
       const hook = join(base, 'unreadable-status.mjs');
       writeFileSync(hook, `import cp from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
@@ -202,10 +205,27 @@ cp.execFileSync = function(cmd, args, opts) {
   return original.call(this, cmd, args, opts);
 };
 syncBuiltinESMExports();\n`);
-      const release = JSON.parse(execRead('node', ['--import', hook, join(ROOT, 'scripts/lane-pool.mjs'),
-        'release', `--lane=${unknown.lane}`, '--session=soak-unknown', '--json', ...pool], { env, stdio: ['ignore', 'pipe', 'pipe'] }));
-      if (release.released !== 1 || existsSync(join(unknown.path, '.git', '.lane-lease'))) {
-        violations.push({ invariant: 'unknown-status-release', detail: 'a failed status read with no known cards stranded the lease' });
+      const unknownReleaseArgs = ['--import', hook, join(ROOT, 'scripts/lane-pool.mjs'),
+        'release', `--lane=${unknown.lane}`, '--session=soak-unknown', '--json', ...pool];
+      const release = spawnSync(process.execPath, unknownReleaseArgs, {
+        env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 30_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
+      });
+      if (release.error) throw release.error;
+      if (release.status !== 1 || JSON.parse(release.stdout).released !== 0
+        || !release.stderr.includes('UNPUSHED_WORK') || !release.stderr.includes('tracked status unreadable')
+        || !release.stderr.includes('--discard') || !existsSync(unknownMarker)
+        || !readFileSync(unknownMarker).equals(unknownLease)) {
+        violations.push({ invariant: 'unknown-status-keeps-lease', detail: 'unreadable tracked status must refuse release and preserve the exact lease' });
+      }
+      const discard = spawnSync(process.execPath, [...unknownReleaseArgs, '--discard'], {
+        env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 30_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
+      });
+      if (discard.error) throw discard.error;
+      if (discard.status !== 0 || JSON.parse(discard.stdout).released !== 1 || existsSync(unknownMarker)
+        || !/WARNING.*--discard.*tracked status unreadable/.test(discard.stderr)) {
+        violations.push({ invariant: 'unknown-status-explicit-discard', detail: 'explicit discard must release with a warning about unreadable tracked status' });
       }
       const raced = JSON.parse(cli(['acquire', '--no-reset', '--session=soak-old-owner', '--json']));
       writeFileSync(join(raced.path, CARD), 'replacement holder card\n');
