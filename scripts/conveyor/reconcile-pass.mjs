@@ -83,6 +83,10 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { codeqlFailureEvidence } from '../lib/codeql-gate.mjs';
 import { makeFixEvidenceReader, checkFixFacts } from '../lib/fix-facts.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
+import { prSnapshotEnabled } from '../lib/pr-snapshot-store.mjs';
+import { listOpenPrsPagedHydrated, resolvePrListPaging } from '../lib/pr-list-paged.mjs';
+import { ghRestGetJson } from '../lib/gh-rest-read.mjs';
+import { withListRetry } from '../lib/gh-list-retry.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { prFactKey, readThroughShadow } from './planner-fact-cache.mjs';
 import { enrichPrsWithCompleteComments } from './pr-comments-complete.mjs';
@@ -314,7 +318,31 @@ export function enrichPrsWithReviewEvidence(prs, { repo, readCommits = fetchPrCo
  * @param {{exec?:Function, repo?:string|null}} [o]
  * @returns {Array<object>}
  */
-export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, readCommits = fetchPrCommits, attributionRepo = repo, readComments, factCache = null } = {}) {
+/** `PR_LIST_JSON_FIELDS` minus `author`: `author` is not a snapshot field, so asking for it made EVERY production read
+ *  bypass the shared paged snapshot and run a heavy 200-row `gh pr list` (HTTP 504 all day, 2026-11-03). */
+export const SNAPSHOT_LIST_FIELDS = PR_LIST_JSON_FIELDS.split(',').filter(f => f !== 'author').join(',');
+const pagedHeavyCache = new Map();
+const authorByPr = new Map();
+
+/** An immutable per-PR fact (author), read through the ETag-cached REST reader and remembered in-process.
+ *  Shape matches `gh pr list --json author`. A failed read leaves the row without `author` (never fails the list). */
+export function withRestAuthors(rows, { repo, readRest = ghRestGetJson } = {}) {
+  if (!repo) return rows;
+  return rows.map(pr => {
+    if (pr?.author || !Number.isInteger(pr?.number)) return pr;
+    const key = `${repo}#${pr.number}`;
+    if (!authorByPr.has(key)) {
+      try {
+        const u = readRest(`repos/${repo}/pulls/${pr.number}`, { context: repo, op: 'pr author (reconcile)' })?.user;
+        if (u?.login) authorByPr.set(key, { login: u.login, is_bot: u.type === 'Bot' });
+      } catch { /* leave unset; bot detection degrades, the list does not */ }
+    }
+    return authorByPr.has(key) ? { ...pr, author: authorByPr.get(key) } : pr;
+  });
+}
+
+export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, readCommits = fetchPrCommits, attributionRepo = repo, readComments, factCache = null,
+  readShared = readSharedOpenPrs, listPaged = listOpenPrsPagedHydrated, readRest = ghRestGetJson, retryOpts = {} } = {}) {
   const enrichFresh = (rows, extra = {}) => enrichPrsWithCompleteComments(enrichPrsWithReviewEvidence(rows, { repo: attributionRepo, readCommits: (slug, number, opts) => readCommits(slug, number, { ...opts, ...(exec !== execFileSyncThrottled ? { exec: args => exec('gh', args) } : {}) }) }), { repo: attributionRepo ?? repo, ...(readComments ? { readComments } : {}), ...extra });
   const enrich = rows => {
     if (factCache?.mode !== 'shadow') return enrichFresh(rows);
@@ -354,18 +382,38 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
   };
   // #gh-graphql-budget — read the host-shared open-PR snapshot (one right-sized list per repo per TTL for the
   // whole fleet) instead of a private `gh pr list`; null = not applicable (tests, cwd repo) → the direct read below.
+  // Production path: ONE retried read (shared snapshot, else small pages) — a 502/503/504 is retried with backoff and a
+  // persistent failure THROWS (and raises a `gh-list-failed` event), it never reads as an empty list / "0 owed".
+  const direct = () => {
+    const argv = ['pr', 'list', '--state', 'open', '--limit', String(PR_LIST_LIMIT), '--json', PR_LIST_JSON_FIELDS];
+    if (repo) argv.push('--repo', repo);
+    // #x5n4zn3 — was bare (no timeout).
+    const out = exec('gh', argv, {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
+      timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+      throttle: { deferrable: true }, // this reader checks isGhDeferred below
+    });
+    if (isGhDeferred(out)) return JSON.parse(String(out));
+    const parsed = JSON.parse(String(out || '[]'));
+    return Array.isArray(parsed) ? parsed : [];
+  };
+  if (exec === execFileSyncThrottled && repo) {
+    const usePaged = prSnapshotEnabled(process.env) || listPaged !== listOpenPrsPagedHydrated;
+    let viaDirect = false; // the legacy direct list already asks for `author`
+    const listed = withListRetry(() => {
+      const shared = readShared({ repo, fields: SNAPSHOT_LIST_FIELDS, allowDeferred: true });
+      if (shared) return shared;
+      if (!usePaged) { viaDirect = true; return direct(); }
+      const paged = listPaged({ repo, exec, paging: resolvePrListPaging(), heavyFields: ['comments', 'body', 'files'],
+        cache: pagedHeavyCache.get(repo) || {}, maxRows: PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (reconcile page)' } } });
+      pagedHeavyCache.set(repo, paged.cache);
+      return paged.rows;
+    }, { repo, op: 'reconcile-pr-list', ...retryOpts });
+    return Array.isArray(listed) ? enrich(viaDirect ? listed : withRestAuthors(listed, { repo, readRest })) : listed;
+  }
   if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: PR_LIST_JSON_FIELDS, allowDeferred: true }); if (shared) return Array.isArray(shared) ? enrich(shared) : shared; }
-  const argv = ['pr', 'list', '--state', 'open', '--limit', String(PR_LIST_LIMIT), '--json', PR_LIST_JSON_FIELDS];
-  if (repo) argv.push('--repo', repo);
-  // #x5n4zn3 — was bare (no timeout).
-  const out = exec('gh', argv, {
-    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
-    timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
-    throttle: { deferrable: true }, // this reader checks isGhDeferred below
-  });
-  if (isGhDeferred(out)) return JSON.parse(String(out));
-  const parsed = JSON.parse(String(out || '[]'));
-  return Array.isArray(parsed) ? enrich(parsed) : [];
+  const rows = direct();
+  return Array.isArray(rows) ? enrich(rows) : rows;
 }
 
 /**

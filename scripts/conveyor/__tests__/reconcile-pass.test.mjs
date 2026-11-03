@@ -1640,3 +1640,29 @@ it('re-probes a bound PID on each pass, discarding an earlier live result even w
   expect(assessLiveness([{ agent: dead }])).toBeNull();
   expect(enrichAgents([row], { probe: () => null })[0]).not.toHaveProperty('pidAlive');
 });
+
+describe('defaultReadPrs production list path is cheap and loud (504 incident 2026-11-03)', () => {
+  it('drops author from the snapshot request and fills it per PR through the cached REST reader', async () => {
+    const { defaultReadPrs } = await import('../reconcile-pass.mjs');
+    const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
+    let asked;
+    const rest = vi.fn((path) => ({ user: { login: 'dependabot[bot]', type: 'Bot' }, path }));
+    const prs = defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readCommits: () => [],
+      readShared: ({ fields }) => { asked = fields; return [{ number: 7, labels: [], comments: [], statusCheckRollup: [] }]; },
+      readRest: rest });
+    expect(asked.split(',')).not.toContain('author');
+    expect(rest).toHaveBeenCalledWith('repos/o/r/pulls/7', expect.any(Object));
+    expect(prs[0].author).toMatchObject({ login: 'dependabot[bot]', is_bot: true });
+  });
+  it('falls back to small pages (never a 200-row heavy gh pr list) and surfaces a persistent 504', async () => {
+    const { defaultReadPrs } = await import('../reconcile-pass.mjs');
+    const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
+    const e504 = Object.assign(new Error('x'), { stderr: 'HTTP 504: 504 Gateway Timeout' });
+    const listPaged = vi.fn(() => { throw e504; });
+    let err;
+    try { defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readShared: () => null, listPaged,
+      retryOpts: { sleep: () => {}, persist: false, onEvent: () => {} }, readRest: () => ({}) }); } catch (e) { err = e; }
+    expect(String(err?.stderr)).toMatch(/504/);
+    expect(listPaged).toHaveBeenCalledTimes(3);
+  });
+});
