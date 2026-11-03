@@ -733,6 +733,9 @@ export function runMissingRunRecoveryAllRepos({ repos = FIX_DISPATCH_DAEMON_REPO
 /** How long (ms) a pass-local reconcile plan may be reused. Older than this, the next phase recomputes. */
 export const RECONCILE_PLAN_MAX_AGE_MS = 15 * 60 * 1000;
 
+/** Key (not a PR number) under which the probe records main's CI state. */
+const MAIN_STATE_KEY = 'main-ci-state';
+
 /** Stable per-PR fingerprint of everything a phase's decision reads live: head, draft, merge state, labels, check state, last activity. */
 function prFingerprint(pr) {
   const checks = (pr.statusCheckRollup ?? []).map((c) => [c?.name ?? c?.context ?? null, c?.workflowName ?? null, c?.status ?? c?.state ?? null,
@@ -749,7 +752,14 @@ export function readPlanFingerprints(repo, { exec = (...args) => execFileSyncThr
   // A wrapper `exec` (not the throttled function itself) makes defaultReadOpenPrs skip the shared snapshot.
   const rows = defaultReadOpenPrs({ exec, repo: CONSTELLATION_REPOS[repo]?.slug ?? repo, extraFields: ['isDraft', 'labels', 'updatedAt', 'mergeStateStatus'] });
   if (!Array.isArray(rows) || rows.some((pr) => !pr || typeof pr.updatedAt !== 'string')) throw new Error('plan fingerprint unreadable');
-  return new Map(rows.map((pr) => [pr.number, prFingerprint(pr)]));
+  const map = new Map(rows.map((pr) => [pr.number, prFingerprint(pr)]));
+  // Main's own CI state feeds the planner's main-red attribution (ci-heal authorization): any change drops every row.
+  const slug = CONSTELLATION_REPOS[repo]?.slug ?? repo;
+  const runs = JSON.parse(String(exec('gh', ['run', 'list', '--branch', 'main', '--limit', '20', '--repo', slug,
+    '--json', 'databaseId,status,conclusion,headSha,attempt,updatedAt'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60e3 }) || 'null'));
+  if (!Array.isArray(runs)) throw new Error('plan main-state unreadable');
+  map.set(MAIN_STATE_KEY, JSON.stringify(runs));
+  return map;
 }
 
 /**
@@ -793,6 +803,7 @@ export function createReconcilePlanCache({ reconcile = (input) => runReconcilePa
   const staleSet = (repo, baseline) => {
     const live = probe(repo);
     const stale = new Set(touched.get(repo) ?? []);
+    if (live.prs.get(MAIN_STATE_KEY) !== baseline.prs.get(MAIN_STATE_KEY)) return 'all';
     for (const [pr, fp] of baseline.prs) if (live.prs.get(pr) !== fp) stale.add(pr);
     for (const [pr] of live.prs) if (!baseline.prs.has(pr)) stale.add(pr);
     for (const key of live.claims) {

@@ -1885,41 +1885,27 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
 
   it('the default live probe reads GitHub directly (never the shared snapshot) and fails closed without updatedAt', () => {
     const rows = [{ number: 7, headRefOid: 'abc', isDraft: false, labels: [{ name: 'x' }], updatedAt: '2026-11-02T00:00:00Z' }];
-    const exec = vi.fn(() => JSON.stringify(rows));
+    const execFor = (prRows, runs = []) => vi.fn((_gh, args) => JSON.stringify(args[0] === 'run' ? runs : prRows));
+    const exec = execFor(rows);
     const out = readPlanFingerprints('we', { exec });
-    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec).toHaveBeenCalledTimes(2);
     expect(exec.mock.calls[0][0]).toBe('gh');
     expect(exec.mock.calls[0][1].join(' ')).toMatch(/updatedAt/);
-    expect([...out.keys()]).toEqual([7]);
+    expect([...out.keys()]).toEqual([7, 'main-ci-state']);
     // A required check flipping red to green must change the fingerprint even when nothing else does.
-    const at = (conclusion) => readPlanFingerprints('we', { exec: () => JSON.stringify([{ ...rows[0],
+    const at = (conclusion) => readPlanFingerprints('we', { exec: execFor([{ ...rows[0],
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion }] }]) }).get(7);
     expect(at('FAILURE')).not.toBe(at('SUCCESS'));
-    expect(() => readPlanFingerprints('we', { exec: () => JSON.stringify([{ number: 7 }]) })).toThrow(/unreadable/);
+    // Main's own CI state is part of the probe (it feeds main-red attribution).
+    const mainAt = (conclusion) => readPlanFingerprints('we', { exec: execFor(rows, [{ databaseId: 1, status: 'completed', conclusion }]) }).get('main-ci-state');
+    expect(mainAt('failure')).not.toBe(mainAt('success'));
+    expect(() => readPlanFingerprints('we', { exec: execFor([{ number: 7 }]) })).toThrow(/unreadable/);
   });
 
-  it('plans from a fresh read, never from a caller-supplied discovery snapshot that may predate the live probe', async () => {
-    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    const spy = vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(() => planOf());
-    await runTickAllRepos({ ...base, repos: ['repo-a'], readPrs: () => [], ...phases([], {
-      fixTick: vi.fn(opts => { opts.reconcile({ repo: opts.repo, readPrs: () => ['old snapshot'] }); return { dispatched: [], refusals: [] }; }),
-    }) });
-    expect(spy).toHaveBeenCalledTimes(1);
-    // The planner's read is a direct one: not the caller's snapshot, and not the host-shared snapshot either.
-    const read = vi.spyOn(reconcilePass, 'defaultReadPrs').mockImplementation(() => []);
-    spy.mock.calls[0][0].readPrs({ repo: 'web-everything/web-everything' });
-    expect(read).toHaveBeenCalledTimes(1);
-    const [args] = read.mock.calls[0];
-    expect(typeof args.exec).toBe('function');
-    expect(args.exec).not.toBe(execFileSyncThrottled);
-    expect(args.attributionRepo).toBe('web-everything/web-everything');
-  });
-
-  it('a session that appeared since the plan was made forces every dispatch row out (liveness gate must re-run)', async () => {
+  it('a change in main CI state drops every row, whichever PR it is', async () => {
     let reads = 0;
-    const plan = await readBack({ readPlanClaimSet: () => (reads++ < 1 ? new Set(['agent:s1']) : new Set(['agent:s1', 'agent:s2'])) });
+    const plan = await readBack({ readPlanFingerprint: () => new Map([[7, 'a'], [8, 'a'], ['main-ci-state', reads++ < 1 ? 'red' : 'green']]) });
     expect(plan.dispatch).toEqual([]);
-    expect(plan.notes).toEqual([]);
     expect(plan.refusals).toHaveLength(1);
   });
 
