@@ -8,8 +8,18 @@ import { randomUUID } from 'node:crypto';
 
 const defaults = { cwd: '/lanes/worker', home: '/home/operator', tmp: '/tmp', isTracked: () => false };
 const check = (bodyFile, extra = {}) => checkBodyFileLocation({ ...defaults, bodyFile, ...extra });
+const privateTemp = { uid: 123, stat: () => ({ uid: 123, mode: 0o40700, isDirectory: () => true }) };
 
 describe('workerScratchDir', () => {
+  it('keeps case-distinct owners separate on case-insensitive filesystems', () => {
+    const upper = workerScratchDir('fix', 'Alice1');
+    const lower = workerScratchDir('fix', 'alice1');
+    expect(upper.toLowerCase()).not.toBe(lower.toLowerCase());
+    expect(upper).toMatch(/_alice1-[0-9a-f]{6}$/);
+    expect(isWorkerScratchDir(upper.slice('/tmp/'.length))).toBe(true);
+    expect(isWorkerScratchDir(lower.slice('/tmp/'.length))).toBe(true);
+  });
+
   it('encodes purpose and owner boundaries uniquely, including repeated and trailing hyphens', () => {
     const purposes = ['fix', 'fix-widget', 'fix-', 'fix--widget'];
     const owners = ['abc12345', 'widget-abc12345', 'widget-', 'A', 'a-b-'];
@@ -32,6 +42,30 @@ describe('workerScratchDir', () => {
 });
 
 describe('checkBodyFileLocation', () => {
+  it.each(['pr-bodies', 'shared-report', 'team-shared', 'we-scratch-pr-body'])('refuses shared directory %s despite its suffix', name => {
+    expect(check(`/tmp/${name}/body.md`, {
+      uid: 123, stat: () => ({ uid: 123, mode: 0o40755, isDirectory: () => true }),
+    })).toMatchObject({ ok: false, code: 'body-file-shared-path' });
+  });
+
+  it.each([
+    { uid: 456, mode: 0o40700, isDirectory: () => true },
+    { uid: 123, mode: 0o40750, isDirectory: () => true },
+    { uid: 123, mode: 0o41700, isDirectory: () => true },
+    { uid: 123, mode: 0o100700, isDirectory: () => false },
+    undefined,
+  ])('refuses missing or non-private stat evidence', evidence => {
+    for (const name of ['task-abcdef', 'we-scratch-fix-abcdef']) {
+      expect(check(`/tmp/${name}/body.md`, { uid: 123, stat: () => evidence }))
+        .toMatchObject({ code: 'body-file-shared-path' });
+    }
+  });
+
+  it('fails closed when stat throws', () => {
+    expect(check('/tmp/task-abcdef/body.md', { stat: () => { throw new Error('EACCES'); } }))
+      .toMatchObject({ code: 'body-file-shared-path' });
+  });
+
   it.each(['/tmp/body.md', '/tmp/pr-body.md', '/lanes/worker-other/body.md', '/home/operator/.claude-other/body.md', '/home/operator/workspace/.operations-other/body.md', '/tmp/task-abc12/body.md', '/tmp/task-abcdef.md', '/tmp/shared-reports/body.md', '/workspace/web-everything/body.md'])('refuses shared path %s with the scratch-dir fallback', path => {
     expect(check(path)).toMatchObject({ ok: false, code: 'body-file-shared-path' });
     expect(check(path).message).toContain(path);
@@ -77,16 +111,40 @@ describe('checkBodyFileLocation', () => {
     expect(result.message).toContain('git rm --cached');
   });
 
-  it.each(['/tmp/we-scratch-fix-widget-abcdef12/body.md', '/tmp/we-scratch-fix-widget-fedcba98/notes/report.md', '/other/we-scratch-build-123abc/body.md'])('allows worker scratch directory %s', path => {
-    expect(check(path)).toEqual({ ok: true });
+  it.each(['/tmp/we-scratch-fix-widget-abcdef12/body.md', '/tmp/we-scratch-fix-widget-fedcba98/notes/report.md'])('allows legacy worker scratch directory only with private temp evidence: %s', path => {
+    expect(check(path, privateTemp)).toEqual({ ok: true });
+    expect(check(path, { stat: () => { throw new Error('ENOENT'); } })).toMatchObject({ code: 'body-file-shared-path' });
+    expect(isWorkerScratchDir(path.split('/')[2])).toBe(false);
   });
 
   it.each(['~/.claude/reports/body.md', '~/workspace/.operations/body.md', '/home/operator/.claude/body.md'])('allows daemon-owned directory %s and expands home', path => {
     expect(check(path)).toEqual({ ok: true });
   });
 
-  it.each(['/tmp/task-abcdef/body.md', '/other/task-0123456789/nested/body.md', '/tmp/task-G7kP2z/body.md', '/tmp/task-gggggg/body.md'])('allows private directory %s', path => {
-    expect(check(path)).toEqual({ ok: true });
+  it.each(['/tmp/task-abcdef/body.md', '/tmp/task-G7kP2z/notes/body.md', '/tmp/task-gggggg/body.md'])('allows a stat-proven private directory %s', path => {
+    const stat = vi.fn(privateTemp.stat);
+    expect(check(path, { ...privateTemp, stat })).toEqual({ ok: true });
+    expect(stat).toHaveBeenCalledWith(`/tmp/${path.split('/')[2]}`);
+  });
+
+  it.each(['/other/task-0123456789/nested/body.md', '/other/we-scratch-build-123abc/body.md'])('refuses private-looking directories outside tmp: %s', path => {
+    const stat = vi.fn(privateTemp.stat);
+    expect(check(path, { ...privateTemp, stat })).toMatchObject({ code: 'body-file-shared-path' });
+    expect(stat).not.toHaveBeenCalled();
+  });
+
+  it('does not accept a private nested directory below a shared temp child', () => {
+    const stat = vi.fn(path => ({ uid: 123, mode: path === '/tmp/shared' ? 0o40755 : 0o40700, isDirectory: () => true }));
+    expect(check('/tmp/shared/task-abcdef/body.md', { uid: 123, stat })).toMatchObject({ code: 'body-file-shared-path' });
+    expect(stat).toHaveBeenCalledTimes(1);
+    expect(stat).toHaveBeenCalledWith('/tmp/shared');
+  });
+
+  it('resolves extra private roots and still checks tracking first', () => {
+    const options = { extraPrivateRoots: ['/tmp/card-batch-state'] };
+    expect(check('/tmp/card-batch-state/body.md', options)).toEqual({ ok: true });
+    expect(check('/tmp/card-batch-state-other/body.md', options)).toMatchObject({ code: 'body-file-shared-path' });
+    expect(check('/tmp/card-batch-state/body.md', { ...options, isTracked: () => true })).toMatchObject({ code: 'body-file-tracked' });
   });
 
   it('accepts the codex-worker body path from a real mkdtempSync directory', () => {
@@ -94,7 +152,7 @@ describe('checkBodyFileLocation', () => {
     expect(caller).toContain("makeScratchDir = () => mkdtempSync(join(tmpdir(), 'codex-worker-'))");
     expect(caller).toContain("const bodyFile = join(scratchDir, 'pr-body.md')");
     const scratch = mkdtempSync(join(tmpdir(), 'codex-worker-'));
-    try { expect(check(join(scratch, 'pr-body.md'))).toEqual({ ok: true }); }
+    try { expect(check(join(scratch, 'pr-body.md'), { tmp: tmpdir() })).toEqual({ ok: true }); }
     finally { rmSync(scratch, { recursive: true, force: true }); }
   });
 

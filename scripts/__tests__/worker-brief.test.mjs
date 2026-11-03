@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { main, renderWorkerBrief } from '../worker-brief.mjs';
 import { resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { readRegistry, resolveFreeScopeSettings } from '../operations/free-scope-io.mjs';
@@ -17,6 +18,14 @@ const defaultProof = 'Prove the change on the live case with before/after eviden
 const io = () => ({ stdout: { write: vi.fn() }, stderr: { write: vi.fn() }, writeFile: vi.fn(), newOwner: () => 'tok12345' });
 
 describe('renderWorkerBrief', () => {
+  it('prints distinct lowercase scratch paths for case-distinct owners', () => {
+    const paths = ['Alice1', 'alice1'].map(owner => {
+      const brief = renderWorkerBrief({ ...params, owner });
+      return /--bodyFile=([^\s`]+)/.exec(brief)[1];
+    });
+    expect(paths[0].toLowerCase()).not.toBe(paths[1].toLowerCase());
+  });
+
   it('isolates distinct purpose/owner pairs whose hyphen concatenations collide', () => {
     const pairs = [['fix-widget', 'abc12345'], ['fix', 'widget-abc12345'], ['fix-', 'widget-abc12345'], ['fix', '-widget-abc12345']];
     // The first three are valid; a leading hyphen owner remains invalid.
@@ -39,7 +48,8 @@ describe('renderWorkerBrief', () => {
   it('assigns different scratch dirs to workers with the same purpose and different owners', () => {
     const dirs = ['abc12345', 'def67890'].map(owner => {
       const brief = renderWorkerBrief({ ...params, owner });
-      const dir = `/tmp/we-scratch-${params.purpose}_${owner}`;
+      const ownerHash = createHash('sha256').update(owner).digest('hex').slice(0, 6);
+      const dir = `/tmp/we-scratch-${params.purpose}_${owner.toLowerCase()}-${ownerHash}`;
       expect(brief).toContain(`**Scratch dir.** \`${dir}\``);
       expect(brief).toContain(`mkdir -p ${dir}`);
       expect(brief).toContain(`--bodyFile=${dir}/body.md`);

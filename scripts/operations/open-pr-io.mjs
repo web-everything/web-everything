@@ -15,7 +15,7 @@
  */
 import { readMainCard, assertMachineTitle } from './machine-pr-title.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { classifySubmit } from './open-pr.mjs';
@@ -204,7 +204,9 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
       let readable = true;
       const bodyFile = arg('body-file');
       if (bodyFile) {
-        const location = bodyLocation({ bodyFile, cwd });
+        const extraPrivateRoots = env.WE_CARD_BATCH_STATE_DIR
+          ? [resolve(cwd, env.WE_CARD_BATCH_STATE_DIR)] : [];
+        const location = bodyLocation({ bodyFile, cwd, extraPrivateRoots });
         if (!location.ok) return { outcome: 'refused', reason: location.code, detail: location.message };
         try { body = readPrepBody(bodyFilePath(bodyFile, cwd), 'utf8'); }
         catch (error) {

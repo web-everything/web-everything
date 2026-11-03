@@ -712,13 +712,13 @@ describe('PR body location admission', () => {
   it.each(['body-file-shared-path', 'body-file-tracked'])('refuses %s before reading the body or spawning', code => {
     const calls = [];
     const run = createPrLandRunner({
-      cwd: '/lane', bodyLocation: input => { calls.push(input); return { ok: false, code, message: 'use scratch' }; },
+      cwd: '/lane', env: {}, bodyLocation: input => { calls.push(input); return { ok: false, code, message: 'use scratch' }; },
       readPrepBody: () => { throw new Error('must not read'); },
       spawn: () => { calls.push('spawn'); return { status: 0, stdout: '{"pr":7}' }; },
       prePrReview: () => ({ action: 'pass' }), prepGate: () => ({ ok: true }),
     });
     expect(run({ argv: ['--ref=lane/x', '--body-file=/tmp/body.md'] })).toEqual({ outcome: 'refused', reason: code, detail: 'use scratch' });
-    expect(calls).toEqual([{ bodyFile: '/tmp/body.md', cwd: '/lane' }]);
+    expect(calls).toEqual([{ bodyFile: '/tmp/body.md', cwd: '/lane', extraPrivateRoots: [] }]);
   });
 
   it('passes an accepted body through location admission before reading and spawning', () => {
@@ -752,6 +752,18 @@ describe('real body tracking adapter', () => {
     prePrReview: () => ({ action: 'refuse', reason: 'next-gate', message: 'stop before publishing' }),
   });
   const submit = (run, bodyFile) => run({ argv: ['--ref=lane/x', `--body-file=${bodyFile}`] });
+
+  it.each([{}, { WE_CARD_BATCH_STATE_DIR: '/tmp/card-batch-state' }])('uses the resolved state-directory environment override: %j', env => {
+    const run = createPrLandRunner({
+      cwd: root, resolveEnv: () => env, readPrepBody: () => 'body', prepGate: () => ({ ok: true }),
+      prePrReview: () => ({ action: 'refuse', reason: 'next-gate', message: 'stop before publishing' }),
+    });
+    expect(submit(run, '/tmp/card-batch-state/lease.body.md')).toMatchObject({
+      outcome: 'refused', reason: env.WE_CARD_BATCH_STATE_DIR ? 'next-gate' : 'body-file-shared-path',
+    });
+    expect(submit(run, '/tmp/card-batch-state-other/lease.body.md'))
+      .toMatchObject({ outcome: 'refused', reason: 'body-file-shared-path' });
+  });
 
   it('refuses an actually tracked file using the real Git index', () => {
     expect(submit(runner(), join(root, trackedBody))).toMatchObject({ outcome: 'refused', reason: 'body-file-tracked' });
@@ -848,7 +860,7 @@ describe('real body tracking adapter', () => {
     } finally { rmSync(scratch, { recursive: true, force: true }); }
   });
 
-  it.each(['/tmp/we-scratch-location-probe-abcdef123456/nonexistent/body.md', 'nonexistent-body-location-probe/notes/body.md'])('allows nonexistent body file %s through to the next gate', bodyFile => {
+  it.each(['/tmp/we-scratch-location-probe_abcdef123456/nonexistent/body.md', 'nonexistent-body-location-probe/notes/body.md'])('allows nonexistent body file %s through to the next gate', bodyFile => {
     const run = createPrLandRunner({
       env: {}, readPrepBody: () => 'body', prepGate: () => ({ ok: true }),
       prePrReview: () => ({ action: 'refuse', reason: 'next-gate', message: 'stop before publishing' }),
