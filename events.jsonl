@@ -47,3 +47,4 @@
 {"type":"quarantine-fix-prs","at":1793649612265,"actor":"red-main-safety-net","fixPrs":[6268]}
 {"type":"quarantine-removed","at":1793649930665,"actor":"red-main-safety-net","test":"scripts/readiness/__tests__/forge-exec-run-reap.test.mjs","brokenSha":"527ca9f87f","why":"main-green"}
 {"type":"quarantine-fix-prs","at":1793649930665,"actor":"red-main-safety-net","fixPrs":[]}
+{"type":"quarantine-added","at":1793669049037,"actor":"operator","test":"scripts/__tests__/verify-lane-revert-red.test.mjs","brokenSha":"a7ac5089f3921f840e37535a823082505a3703e7","owner":"card:verify-lane-revert-red-1123","reason":"R157: scripts/__tests__/verify-lane-revert-red.test.mjs 'enforce turns the same result red; off runs nothing' fails locally on main 42e175fce5 and lanes (2 workers, 19:47/20:23 ET); reds every verify-lane","addedAt":1793669049037,"expiresAt":1793755449037}
