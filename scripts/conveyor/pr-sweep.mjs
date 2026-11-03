@@ -143,6 +143,13 @@ export async function collectOwnerSignals({ prs, dir, env, errors, errorSources 
     return [prKey(pr), { sessions, daemons, smell: episode?.smell, unreadSessions }];
   }));
 }
+const invariantItem = p => ({
+  repo: p.repo, pr: p.number, head: p.headRefOid, title: p.title, lane: 'operator', state: p.violation,
+  labels: p.labels, blockedBy: p.blockedBy, unblocks: p.unblocks, owner: p.owner, nextAction: p.nextAction, deadline: p.deadline,
+  violation: p.violation, action: p.nextAction, reason: `${p.nextAction}; owner=${p.owner}; deadline=${p.deadline}${p.blockedBy.map(n => `; blocked-by #${n}`).join('')}`,
+  command: `gh pr view ${p.number} --repo ${p.repo} --comments`,
+  evidence: [`owner=${p.owner}`, `next=${p.nextAction}`, `deadline=${p.deadline}`],
+});
 export async function runPrSweep({ now = Date.now(), dryRun = false, env = process.env, dir = healthDir(undefined, env), config,
   settings, sourceRoot = ROOT, readPrs, readQueue, readSignals = collectOwnerSignals, readPrevious,
   notify = notifyDesktopChecked, diagnose, persist, append, flush = flushDigest, stallSweep = runStallSweep, stallDigest = publishStalledDigest, detector = runDetector } = {}) {
@@ -152,7 +159,14 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
   const resolved = settings ?? resolvePrSweepSettings({ config, env }); errors.push(...(resolved.errors ?? []));
   const value = resolved.value;
   if (settings) console.error(formatCascadeSourcesLine('prSweep', resolved));
-  const previous = await safe('previous sweep', () => readPrevious ? readPrevious() : (existsSync(join(dir, 'pr-sweep.json')) ? JSON.parse(readFileSync(join(dir, 'pr-sweep.json'), 'utf8')).nextState : {}), {});
+  const previous = await safe('previous sweep', () => {
+    if (readPrevious) return readPrevious();
+    if (!existsSync(join(dir, 'pr-sweep.json'))) return {};
+    const saved = JSON.parse(readFileSync(join(dir, 'pr-sweep.json'), 'utf8'));
+    // Older reports already contain the confirmed rows, before emptyDiffItems existed.
+    return { ...saved.nextState, emptyDiffItems: saved.nextState?.emptyDiffItems
+      ?? (saved.decisions ?? []).filter(p => p.violation === 'empty-diff').map(invariantItem) };
+  }, {});
   const prs = []; let prsReadOk = true;
   const readOpenPrs = readPrs ?? createOpenPrCommentReader({ env });
   for (const repo of value.repos) {
@@ -236,6 +250,7 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
     return out;
   };
   const detectorErrors = [];
+  report.nextState.emptyDiffItems = previous?.emptyDiffItems ?? [];
   report.nextState.stallDetector = previous?.stallDetector ?? {}; // the first save must not drop saved clocks
   if (!dryRun) {
     await safe('quiet digest', () => flush({ send: (n) => notify(n, { quietGate: null }) }));
@@ -277,12 +292,16 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
       errors.push(...(out.errors ?? []).map((e) => `stall sweep: ${e}`));
       // Operator items go to the needs-you feed (kind `stalled`) and one quiet-hours-gated alert per pass.
       const sweepDigestEnabled = out.mode !== 'off' && out.digest !== false;
-      const invariantItems = sweepDigestEnabled && ownerReadsOk && prsReadOk ? decisions.filter(p => p.violation).map(p => annotate({
-        repo: p.repo, pr: p.number, head: p.headRefOid, title: p.title, lane: 'operator', state: p.violation,
-        labels: p.labels, blockedBy: p.blockedBy, unblocks: p.unblocks, owner: p.owner, nextAction: p.nextAction, deadline: p.deadline,
-        violation: p.violation, action: p.nextAction, reason: `${p.nextAction}; owner=${p.owner}; deadline=${p.deadline}${p.blockedBy.map(n => `; blocked-by #${n}`).join('')}`,
-        command: `gh pr view ${p.number} --repo ${p.repo} --comments`,
-        evidence: [`owner=${p.owner}`, `next=${p.nextAction}`, `deadline=${p.deadline}`] })) : [];
+      let invariantItems = sweepDigestEnabled && ownerReadsOk && prsReadOk ? decisions.filter(p => p.violation).map(p => annotate(invariantItem(p))) : [];
+      // Unknown diff evidence cannot resolve a confirmed empty diff on the same head.
+      // Keep the exact row (and alert identity), without inventing an empty diff for new PRs.
+      const keptEmpty = (sweepDigestEnabled ? previous?.emptyDiffItems ?? [] : []).filter(item => prs.some(p =>
+        p.repo === item.repo && p.number === item.pr && p.headRefOid.toLowerCase() === item.head.toLowerCase()
+        && p.diffEvidence === 'diff-unknown'));
+      invariantItems = [...invariantItems.filter(item => !keptEmpty.some(old =>
+        old.repo === item.repo && old.pr === item.pr)), ...keptEmpty];
+      report.nextState.emptyDiffItems = sweepDigestEnabled && ownerReadsOk && prsReadOk
+        ? invariantItems.filter(item => item.violation === 'empty-diff') : previous?.emptyDiffItems ?? [];
       const sweepItems = (sweepDigestEnabled ? out.items ?? [] : []).map(annotate);
       const findings = [...sweepItems, ...detector.items.map(annotate).filter(d => !sweepItems.some(i =>
         i.lane === 'operator' && i.repo === d.repo && i.pr === d.pr && String(i.head).toLowerCase() === String(d.head).toLowerCase()))];

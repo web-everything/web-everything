@@ -138,6 +138,7 @@ export function publishStalledDigest(pass, { now = Date.now(), env = process.env
 
 function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, alertBackoffMinutes, unlocked = false }) {
   let lines = []; let fresh = items; let lock = null;
+  const confirmed = new Set();
   const id = (f) => `${f.repo}#${f.pr}@${f.head}:${f.state}`;
   const mine = join(stateDir, 'digest-state.json');
   try {
@@ -161,6 +162,12 @@ function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, al
       // Partial evidence may add a new head, but cannot replace a confirmed same-head item.
       const mineNow = items.filter((f) => !other.some((k) => k.startsWith(`${f.repo}#${f.pr}@${f.head}:`))
         && !(pass.incomplete && prev.openKeys.includes(feedKey(f)) && shown[feedKey(f)] !== updateIdentity(f, now)));
+      // Feed rows can originate on incomplete passes. Only a complete observation confirms
+      // an identity; historical state without this proof waits for a complete pass too.
+      const confirmations = Object.fromEntries(Object.entries(saved.confirmed ?? {}).filter(([k]) => prev.openKeys.includes(k)));
+      if (!pass.incomplete) for (const f of mineNow) confirmations[feedKey(f)] = updateIdentity(f, now);
+      for (const f of mineNow) if (prev.openKeys.includes(feedKey(f)) && shown[feedKey(f)] === updateIdentity(f, now)
+        && confirmations[feedKey(f)] === updateIdentity(f, now)) confirmed.add(id(f));
       const alerted = new Set((saved.published ?? []).filter((x) => prev.openKeys.includes(feedKeyOfId(x))));
       const changed = new Set(mineNow.filter((f) => prev.openKeys.includes(feedKey(f)) && shown[feedKey(f)] !== updateIdentity(f, now)).map(feedKey));
       const r = diffFeed(prev.openKeys.filter((k) => !changed.has(k)), mineNow, now, { incomplete: !!pass.incomplete, clearKinds: new Set([STALLED_KIND]) });
@@ -183,19 +190,19 @@ function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, al
         if (changed.has(feedKey(f)) && (alertBackoffMinutes || updateIdentity(f, now) !== f.state
           || shown[feedKey(f)]?.startsWith('['))) due.push(f);
       }
-      // Failed sends remain owed until delivered or resolved; incomplete passes defer notification.
+      // Failed sends remain owed until delivered or resolved; incomplete passes notify only confirmed items.
       const pending = new Set((saved.unnotified ?? []).filter((x) => open.has(feedKeyOfId(x))));
       const toAlert = mineNow.filter((f) => newly.includes(f) || pending.has(id(f)) || due.includes(f));
       const unnotified = [...new Set([...pending, ...toAlert.map(id)])];
       // Our own record goes first, marking every alert owed until confirmed; what the feed shows is recorded only once
       // its line is written. A failed save can repeat a line or an alert, never drop one.
-      writeJsonAtomic(mine, { published: [...alerted], current: shown, unnotified, repeats });
+      writeJsonAtomic(mine, { published: [...alerted], current: shown, confirmed: confirmations, unnotified, repeats });
       appendLines(path, r.lines);
       writeJsonAtomic(sidecar, { ...prev, openKeys: r.openKeys });
       for (const f of newly) alerted.add(id(f));
       for (const f of written) shown[feedKey(f)] = updateIdentity(f, now);
       const keep = (k) => open.has(k);
-      writeJsonAtomic(mine, { published: [...alerted].filter((x) => keep(feedKeyOfId(x))), current: Object.fromEntries(Object.entries(shown).filter(([k]) => keep(k))), unnotified, repeats });
+      writeJsonAtomic(mine, { published: [...alerted].filter((x) => keep(feedKeyOfId(x))), current: Object.fromEntries(Object.entries(shown).filter(([k]) => keep(k))), confirmed: Object.fromEntries(Object.entries(confirmations).filter(([k]) => keep(k))), unnotified, repeats });
       return { lines: r.lines, fresh: toAlert };
     }));
   } catch (e) {
@@ -204,10 +211,11 @@ function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, al
     fresh = items;
   }
   let notified = false;
-  if (fresh.length && !pass.incomplete) {
-    const body = fresh.slice(0, 5).map((f) => `${f.repo.split('/').pop()}#${f.pr} ${f.state} ${(f.blockedBy ?? []).map(n => `blocked-by #${n}`).join(' ')} ${(f.unblocks ?? []).map(n => `unblocks #${n}`).join(' ')}`).join(' | ') + (fresh.length > 5 ? ` (+${fresh.length - 5} more)` : '');
+  const alerts = fresh.filter(f => !pass.incomplete || confirmed.has(id(f)));
+  if (alerts.length) {
+    const body = alerts.slice(0, 5).map((f) => `${f.repo.split('/').pop()}#${f.pr} ${f.state} ${(f.blockedBy ?? []).map(n => `blocked-by #${n}`).join(' ')} ${(f.unblocks ?? []).map(n => `unblocks #${n}`).join(' ')}`).join(' | ') + (alerts.length > 5 ? ` (+${alerts.length - 5} more)` : '');
     let out = null;
-    try { out = notify({ title: `PR stall sweep: ${fresh.length} need you`, body }); } catch (e) { out = { ok: false, error: e?.message }; }
+    try { out = notify({ title: `PR stall sweep: ${alerts.length} need you`, body }); } catch (e) { out = { ok: false, error: e?.message }; }
     notified = out?.ok === true;
     if (!notified) errors.push(`stalled alert: ${out?.error ?? 'not sent'}`);
     // Delivered: no longer owed (best effort; a failed save only repeats the alert next pass).
@@ -215,12 +223,12 @@ function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, al
     else if (lock) {
       try { withFileLock(lock, () => { const cur = readJson(mine, { published: [], unnotified: [] });
         const repeats = { ...cur.repeats };
-        if (alertBackoffMinutes) for (const f of fresh) {
+        if (alertBackoffMinutes) for (const f of alerts) {
           const fingerprint = JSON.stringify([updateIdentity(f, now), f.labels]);
           const prior = repeats[id(f)];
           repeats[id(f)] = { fingerprint, lastAlertAt: now, alertCount: (prior?.fingerprint === fingerprint ? prior.alertCount : 0) + 1 };
         }
-        writeJsonAtomic(mine, { ...cur, repeats, unnotified: (cur.unnotified ?? []).filter((x) => !fresh.some((f) => id(f) === x)) }); }); }
+        writeJsonAtomic(mine, { ...cur, repeats, unnotified: (cur.unnotified ?? []).filter((x) => !alerts.some((f) => id(f) === x)) }); }); }
       catch (e) { errors.push(`digest state: ${e.message}`); }
     }
   }

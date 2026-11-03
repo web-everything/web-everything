@@ -643,3 +643,99 @@ it('incomplete passes retain same-head findings and their saved identity while a
     .toMatchObject(saved.current);
   expect(result.fresh.map(e => e.pr)).toEqual([6255]);
 });
+
+
+it('R437 incomplete passes send confirmed due repeats and failed-send retries but suppress new detections', () => {
+  const ctx = setup(), notify = vi.fn(() => ({ ok: true }));
+  const options = { notify, alertBackoffMinutes: [30, 60, 120, 240] };
+  run(ctx, [op(1), op(2)], options);
+  run(ctx, [op(1), op(2)], { ...options, now: NOW + 30 * 60000, notify: () => ({ ok: false }) });
+  const result = run(ctx, [op(1), op(2), op(3)], { ...options, pass: { incomplete: true }, now: NOW + 31 * 60000 });
+  expect(result.notified).toBe(true);
+  expect(notify).toHaveBeenCalledTimes(2);
+  expect(notify.mock.calls[1][0].body).toContain('#1');
+  expect(notify.mock.calls[1][0].body).toContain('#2');
+  expect(notify.mock.calls[1][0].body).not.toContain('#3');
+  const due = run(ctx, [op(1), op(2), op(4)], { ...options, pass: { incomplete: true }, now: NOW + 91 * 60000 });
+  expect(due.notified).toBe(true);
+  expect(notify.mock.calls[2][0].body).not.toContain('#4');
+  expect(unacknowledged({ path: ctx.feedPath }).map(e => e.pr)).toEqual([1, 2, 3, 4]);
+  expect(JSON.parse(readFileSync(join(ctx.stateDir, 'digest-state.json'), 'utf8')).unnotified).toEqual([`${REPO}#3@${H}:ruling-needed:dispute`, `${REPO}#4@${H}:ruling-needed:dispute`]);
+  expect(run(ctx, [op(1), op(2)], { ...options, pass: { incomplete: true }, now: NOW + 92 * 60000 }).notified).toBe(false);
+});
+
+it('R437 unknown diff retains the persisted empty-diff finding and repeat alert until positive evidence, head change or closure', async () => {
+  const { runPrSweep } = await import('../pr-sweep.mjs');
+  const ctx = setup(), notify = vi.fn(() => ({ ok: true }));
+  let previous = {}, rows = [], minutes = 0, savedReport, legacy = false;
+  const tick = async () => {
+    const report = await runPrSweep({ now: NOW + minutes++ * 30 * 60000, env: {}, dir: ctx.stateDir,
+      settings: { value: { repos: [REPO], idleMinutes: 10000, stuckAfterMinutes: 10000, stuckAlertMinutes: 10000, deadlineMinutes: 10000, alertBackoffMinutes: [30,60,120,240] }, sources: {} },
+      readPrevious: legacy ? undefined : () => previous, readPrs: () => rows, readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: () => ({}),
+      detector: async () => ({ enabled: false, items: [], errors: [], nextSeen: {} }),
+      notify, flush: () => {}, persist: () => {}, append: () => {},
+      stallSweep: () => ({ mode: 'shadow', dir: ctx.stateDir, items: [], incomplete: false }),
+      stallDigest: (pass, options) => publishStalledDigest(pass, { ...options, feedPath: ctx.feedPath }),
+    });
+    expect(report.errors).toEqual([]);
+    previous = JSON.parse(JSON.stringify(report.nextState));
+    savedReport = report; legacy = false;
+    return unacknowledged({ path: ctx.feedPath });
+  };
+  const row = { number: 6254, title: 'empty', headRefOid: H, labels: ['review:pending'], changedFiles: 0, updatedAt: new Date(NOW).toISOString() };
+  rows = [row];
+  const original = await tick();
+  expect(original).toHaveLength(1);
+  expect(original[0].state).toBe('empty-diff');
+  // Resume a historical on-disk report with no new retention field.
+  writeFileSync(join(ctx.stateDir, 'pr-sweep.json'), JSON.stringify({ ...savedReport, nextState: { ...previous, emptyDiffItems: undefined } }));
+  legacy = true;
+  for (const value of [undefined, null, -1, 0.5, '0', false, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    rows = [{ ...row, changedFiles: value }, { ...row, number: 6255, changedFiles: value }];
+    expect(await tick()).toEqual(original);
+  }
+  expect(notify.mock.calls.filter(([n]) => n.title.startsWith('PR stall sweep:')).length).toBeGreaterThan(1);
+  rows = [{ ...row, changedFiles: 1 }];
+  expect(await tick()).toEqual([]);
+  rows = [row]; await tick();
+  rows = [{ ...row, headRefOid: 'b'.repeat(40), changedFiles: null }];
+  expect(await tick()).toEqual([]);
+  rows = [row]; await tick();
+  rows = [{ ...row, state: 'CLOSED', changedFiles: null }];
+  expect(await tick()).toEqual([]);
+});
+
+
+it('R437 consecutive incomplete passes never confirm a retained new detection', () => {
+  const ctx = setup(), notify = vi.fn(() => ({ ok: true }));
+  const item = op(6254), options = { notify, alertBackoffMinutes: [30,60,120,240] };
+  for (const minute of [0, 30, 90]) {
+    const result = run(ctx, [item], { ...options, now: NOW + minute * 60000, pass: { incomplete: true } });
+    expect(result.errors).toEqual([]);
+    expect(result.notified).toBe(false);
+    expect(notify).not.toHaveBeenCalled();
+    expect(unacknowledged({ path: ctx.feedPath })).toHaveLength(1);
+    expect(JSON.parse(readFileSync(join(ctx.stateDir, 'digest-state.json'), 'utf8')).unnotified)
+      .toEqual([`${REPO}#6254@${H}:ruling-needed:dispute`]);
+  }
+  expect(run(ctx, [item], { ...options, now: NOW + 91 * 60000 }).notified).toBe(true);
+  expect(notify).toHaveBeenCalledTimes(1);
+  expect(run(ctx, [item], { ...options, now: NOW + 121 * 60000, pass: { incomplete: true } }).notified).toBe(true);
+  expect(notify).toHaveBeenCalledTimes(2);
+});
+
+
+it('R437 legacy feed presence without persisted confirmation waits for a complete observation', () => {
+  const ctx = setup(), notify = vi.fn(() => ({ ok: true }));
+  const item = op(6254), options = { notify, alertBackoffMinutes: [30,60,120,240] };
+  run(ctx, [item], options);
+  const path = join(ctx.stateDir, 'digest-state.json');
+  const legacy = JSON.parse(readFileSync(path, 'utf8'));
+  delete legacy.confirmed;
+  writeFileSync(path, JSON.stringify(legacy));
+  expect(run(ctx, [item], { ...options, now: NOW + 30 * 60000, pass: { incomplete: true } }).notified).toBe(false);
+  expect(notify).toHaveBeenCalledTimes(1);
+  expect(run(ctx, [item], { ...options, now: NOW + 31 * 60000 }).notified).toBe(true);
+  expect(run(ctx, [item], { ...options, now: NOW + 91 * 60000, pass: { incomplete: true } }).notified).toBe(true);
+  expect(notify).toHaveBeenCalledTimes(3);
+});

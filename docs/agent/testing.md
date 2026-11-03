@@ -2375,6 +2375,13 @@ alert. Qualified daemon references (`repo#number`, `repo PR #number`, and GitHub
 clone's default repository; replay colliding PR numbers to catch cross-repository ownership attribution.
 
 Use the `pr-sweep*.test.mjs` files in `scripts/conveyor/__tests__/` through the heavy-admission queue.
+R437's digest separates feed retention from alert eligibility: incomplete passes never replace or clear
+confirmed rows, but still retry owed sends and due repeats for unchanged known identities. Digest state
+records confirmation separately from feed presence: incomplete passes may retain a new row but cannot
+confirm it, even across consecutive passes. Legacy state without confirmation waits for a complete pass. Unknown diff
+evidence retains same-head `emptyDiffItems` in sweep state; legacy reports recover them from their
+empty-diff decisions. Only positive integer diff evidence, a head change or closure resolves that finding.
+
 Inject every owner/queue/PR reader and every send/dispatch sink; the IO collector exposes separate
 agent, health-state, clone-root, log-listing and bounded-tail seams. Never let a missing test seam fall
 through to the host's live agents or daemon clones.
