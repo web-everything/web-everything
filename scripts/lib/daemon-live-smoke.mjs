@@ -255,6 +255,23 @@ export function resolveSmokeReadMemo(env = process.env) {
   } catch { return { enabled: true, source: 'standard' }; }
 }
 
+/** Smoke-only gh slot wait for the reconcile/dispatch dry-runs (their gh reads queue behind every other daemon's;
+ * live 2026-11-03: "no gh slot within 8s" failed both under Mac load). Layers: standard 45000 -> platform -> the
+ * `rebuildSmokeGhSlotWait` block of scripts/settings/rebuild-smoke.json -> env WE_SMOKE_GH_SLOT_WAIT_MS.
+ * Only the wait lengthens: a real gh error still fails the smoke, and an explicit WE_GH_THROTTLE_BACKGROUND_WAIT_MS wins.
+ * @returns {{backgroundWaitMs:number, source:string}} */
+export const SMOKE_GH_SLOT_WAIT_STANDARD_MS = 45_000;
+export function resolveSmokeGhSlotWait(env = process.env) {
+  try {
+    const raw = env?.WE_SMOKE_GH_SLOT_WAIT_MS;
+    const r = cascadePolicy('rebuildSmokeGhSlotWait', readDeclaredSettings().settings.rebuildSmokeGhSlotWait, {
+      env, standard: { backgroundWaitMs: SMOKE_GH_SLOT_WAIT_STANDARD_MS },
+      envValues: { backgroundWaitMs: raw != null && String(raw).trim() !== '' ? Number(raw) : undefined },
+      valid: { backgroundWaitMs: (x) => Number.isInteger(x) && x >= 0 && x <= 120_000 },
+    });
+    return { backgroundWaitMs: r.value?.backgroundWaitMs ?? SMOKE_GH_SLOT_WAIT_STANDARD_MS, source: r.sources?.backgroundWaitMs ?? 'standard' };
+  } catch { return { backgroundWaitMs: SMOKE_GH_SLOT_WAIT_STANDARD_MS, source: 'standard' }; }
+}
 
 const firstLine = (e) => String((e && e.message) || e).split('\n')[0];
 // #4044: a crashed node child's first stderr line is only the stack LOCATION (`node:internal/modules/cjs/
@@ -906,6 +923,7 @@ export async function runLiveSmoke({
   const admission = rebuildSmokeAdmission({ shadow, admit, env, shadowArgs });
   const budgets = resolveSmokeBudgets(env, { ...host, admission });
   const readMemo = resolveSmokeReadMemo(env);
+  const ghSlotWait = resolveSmokeGhSlotWait(env);
   const dryRun = resolveSmokeDryRun(env);
   try { // The I/O-bound rule's source, once per smoke, next to the shadow line (silent under test).
     if (isDecision(admission) && !process.env.VITEST) {
@@ -976,7 +994,9 @@ export async function runLiveSmoke({
       };
       try {
         const checkEnv = ['reconcile-dry-run', 'dispatch-dry-run'].includes(check.name)
-          ? { ...env, GH_CALLER: `rebuild-smoke:${check.name}`, ...(memoDir ? { [WE_GH_READ_MEMO_DIR]: memoDir } : {}),
+          ? { ...env, GH_CALLER: `rebuild-smoke:${check.name}`,
+            ...(env.WE_GH_THROTTLE_BACKGROUND_WAIT_MS ? {} : { WE_GH_THROTTLE_BACKGROUND_WAIT_MS: String(ghSlotWait.backgroundWaitMs) }),
+            ...(memoDir ? { [WE_GH_READ_MEMO_DIR]: memoDir } : {}),
             ...(dryRun.prSample ? { [WE_PR_SNAPSHOT_SAMPLE]: String(dryRun.prSample) } : {}),
             ...(dryRun.snapshotStaleOkMs ? { [WE_PR_SNAPSHOT_STALE_OK_MS]: String(dryRun.snapshotStaleOkMs) } : {}) } : env;
         result = await check.run({ ...ctx, env: checkEnv, runChild: trackedRunChild });

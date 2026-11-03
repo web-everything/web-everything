@@ -37,7 +37,7 @@ import {
   isEnvTimeoutRow, isEnvTimeoutFailureSet, widenSmokeBudgetsEnv,
   DISPATCH_DRY_RUN_SCRIPT, DISPATCH_DRY_RUN_CODE_ENTRIES, busyPoolSkip, hostLooksBusy,
   smokeLoadFactor, SMOKE_LOAD_SCALE_ENV, SMOKE_LOAD_SCALE_MAX_ENV, DEFAULT_SMOKE_LOAD_SCALE_MAX,
-  resolveIoBoundLoadScale, resolveSmokeGithubPerOwner, resolveSmokeReadMemo, resolveSmokeDryRun,
+  resolveIoBoundLoadScale, resolveSmokeGhSlotWait, resolveSmokeGithubPerOwner, resolveSmokeReadMemo, resolveSmokeDryRun,
 } from '../daemon-live-smoke.mjs';
 
 import { runBounded } from '../bounded-child.mjs';
@@ -934,6 +934,28 @@ describe('smoke read memo', () => {
     expect(resolveSmokeReadMemo({ WE_SMOKE_READ_MEMO: '0' })).toEqual({ enabled: false, source: 'env' });
     expect(resolveSmokeReadMemo({ WE_SMOKE_READ_MEMO: '1' })).toEqual({ enabled: true, source: 'env' });
     expect(resolveSmokeReadMemo({ WE_SMOKE_READ_MEMO: 'invalid' })).toEqual({ enabled: true, source: 'tool' });
+  });
+
+  it('smoke-only gh slot wait: declared tool value, env override, invalid ignored', () => {
+    expect(resolveSmokeGhSlotWait({})).toEqual({ backgroundWaitMs: 45_000, source: 'tool' });
+    expect(resolveSmokeGhSlotWait({ WE_SMOKE_GH_SLOT_WAIT_MS: '90000' })).toEqual({ backgroundWaitMs: 90_000, source: 'env' });
+    expect(resolveSmokeGhSlotWait({ WE_SMOKE_GH_SLOT_WAIT_MS: '999999' }).backgroundWaitMs).toBe(45_000);
+  });
+
+  it('lengthens the gh slot wait for the dry-run children only; an explicit throttle env wins', async () => {
+    const run = async (env) => {
+      const calls = [];
+      const inner = withNewCheckDefaults(async () => '');
+      await runLiveSmoke({ root: tmpdir(), env: { WE_SMOKE_READ_MEMO: '0', ...env }, runChild: async (cmd, args, opts) => { calls.push({ args, env: opts.env }); return inner(cmd, args, opts); } });
+      const dry = (c) => c.args[0] === 'scripts/conveyor/reconcile-pass.mjs' || (c.args[0] === '--input-type=module' && c.args[2] === DISPATCH_DRY_RUN_SCRIPT);
+      return { dry: calls.filter(dry), other: calls.filter((c) => !dry(c)) };
+    };
+    const a = await run({});
+    expect(a.dry.length).toBeGreaterThan(0);
+    for (const c of a.dry) expect(c.env.WE_GH_THROTTLE_BACKGROUND_WAIT_MS).toBe('45000');
+    for (const c of a.other) expect(c.env?.WE_GH_THROTTLE_BACKGROUND_WAIT_MS).toBeUndefined();
+    const b = await run({ WE_GH_THROTTLE_BACKGROUND_WAIT_MS: '5000' });
+    for (const c of b.dry) expect(c.env.WE_GH_THROTTLE_BACKGROUND_WAIT_MS).toBe('5000');
   });
 
   it.each(['1', '0'])('scopes the memo to dry-run children when enabled=%s and removes it', async (enabled) => {
