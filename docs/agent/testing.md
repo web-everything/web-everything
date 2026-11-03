@@ -3886,5 +3886,10 @@ complete remote failure followed by incomplete local confirmation and passing re
 Infrastructure
 exits retain their classification, and UNSETTLED retains `verify-unsettled` only
 when the caller supplies no failure details; exit 75 with failure details stays red.
+Ordinary remote phases still confirm a reported remote exit 75 locally because
+the nested admission wrapper can use it for deferral. The shard wrapper owns its
+own confirmation and retry, so its terminal UNSETTLED result is never confirmed
+again by verify-lane. Signals, watchdog timeouts, unknown run locations, and
+reported local failures still prohibit remote confirmation.
 First-attempt passes are unchanged. The scoped regressions live in
 `scripts/lib/__tests__/verify-shard-run.test.mjs`; run them through heavy admission.
