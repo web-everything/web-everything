@@ -29,6 +29,16 @@ import * as netScope from '../../../scripts/conveyor/net-scope.mjs';
 import * as prStack from '../../../scripts/conveyor/pr-stack.mjs';
 import * as reconcilePass from '../../../scripts/conveyor/reconcile-pass.mjs';
 import { execFileSyncThrottled } from '../../../scripts/lib/gh-throttle.mjs';
+import * as ghThrottle from '../../../scripts/lib/gh-throttle.mjs';
+import * as prSnapshot from '../../../scripts/lib/pr-snapshot.mjs';
+import * as ciHealDispatch from '../../../scripts/operations/ci-heal-pr-dispatch.mjs';
+import * as promoteDispatch from '../../../scripts/operations/promote-draft-pr-dispatch.mjs';
+import * as awaitVerifyLoop from '../../../scripts/conveyor/await-verify-loop.mjs';
+import * as stuckReclaim from '../../../scripts/conveyor/fixer-stuck-reclaim.mjs';
+import * as supersedeWatch from '../../../scripts/conveyor/supersede-watch.mjs';
+import * as fixFacts from '../../../scripts/lib/fix-facts.mjs';
+import * as heavyAdmission from '../../../scripts/readiness/heavy-admission.mjs';
+import * as resourceGate from '../../../scripts/lib/resource-gate.mjs';
 import { resolveFixDispatchSettings } from '../../../scripts/conveyor/fix-takeover.mjs';
 
 describe('R242 fixDispatch.skipEmptySteps policy cascade', () => {
@@ -1788,7 +1798,12 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
   afterEach(() => vi.restoreAllMocks());
   const planOf = (extra = {}) => ({ dispatch: [], notes: [], refusals: [], prs: 1, agents: 0, ...extra });
   const phases = (calls, extra = {}) => {
-    const use = name => (opts) => { calls.push(`${name}:${opts.repo}`); opts.reconcile({ repo: opts.repo }); return null; };
+    const use = name => (opts) => {
+      calls.push(`${name}:${opts.repo}`);
+      (opts.reconcile ?? reconcilePass.runReconcilePass)({ repo: opts.repo,
+        ...(name === 'fix' ? { allowStandDownAutoProceed: opts.allowStandDownAutoProceed } : {}) });
+      return null;
+    };
     return {
       fixTick: vi.fn(opts => { use('fix')(opts); return { dispatched: [], refusals: [] }; }),
       ciHealTick: vi.fn(async opts => { use('ci-heal')(opts); return { dispatched: [], refusals: [] }; }),
@@ -1809,6 +1824,244 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     await runTickAllRepos({ ...base, ...phases(calls) });
     expect(calls.filter(c => c.endsWith(':repo-a'))).toHaveLength(4);
     expect(spy).toHaveBeenCalledTimes(2);
+  });
+
+  it('never serves an auto-proceed plan to a phase using the read-only default, including notes', () => {
+    const reconcile = vi.fn(({ allowStandDownAutoProceed = false }) => planOf(allowStandDownAutoProceed
+      ? { dispatch: [{ kind: 'ci-heal', prNumber: 7 }], notes: [{ prNumber: 7 }] }
+      : { refusals: [{ kind: 'stand-down', prNumber: 7 }] }));
+    const cache = createReconcilePlanCache({ reconcile, readFingerprints: base.readPlanFingerprint,
+      readClaims: base.readPlanClaimSet });
+    expect(cache.reconcile({ repo: 'repo-a', allowStandDownAutoProceed: true }).dispatch).toHaveLength(1);
+    expect(cache.notes('repo-a')).toBeNull();
+    const held = cache.reconcile({ repo: 'repo-a' });
+    expect(held.dispatch).toEqual([]);
+    expect(held.refusals).toEqual([{ kind: 'stand-down', prNumber: 7 }]);
+    expect(cache.reconcile({ repo: 'repo-a', allowStandDownAutoProceed: false })).toEqual(held);
+    expect(cache.notes('repo-a').notes).toEqual([]);
+    expect(reconcile).toHaveBeenCalledTimes(2);
+  });
+
+  it('recomputes for the reverse flag transition and for other planner-affecting inputs', () => {
+    const reconcile = vi.fn(() => planOf());
+    const cache = createReconcilePlanCache({ reconcile, readFingerprints: base.readPlanFingerprint,
+      readClaims: base.readPlanClaimSet });
+    cache.reconcile({ repo: 'repo-a', allowStandDownAutoProceed: false });
+    cache.reconcile({ repo: 'repo-a', allowStandDownAutoProceed: true });
+    cache.reconcile({ repo: 'repo-a', defaultBranch: 'release' });
+    cache.reconcile({ repo: 'repo-a', defaultBranch: 'main' });
+    expect(reconcile).toHaveBeenCalledTimes(4);
+  });
+
+  it('custom planner hooks invalidate the previous notes view and never reuse an unkeyed override', () => {
+    const reconcile = vi.fn(() => planOf());
+    const cache = createReconcilePlanCache({ reconcile, readFingerprints: base.readPlanFingerprint,
+      readClaims: base.readPlanClaimSet });
+    cache.reconcile({ repo: 'repo-a' });
+    const options = { repo: 'repo-a', enrichCodeQL: rows => rows };
+    cache.reconcile(options);
+    expect(cache.notes('repo-a')).toBeNull();
+    cache.reconcile(options);
+    expect(reconcile).toHaveBeenCalledTimes(3);
+  });
+
+  it('normalizes auto-proceed permission exactly as the planner does and ignores discarded discovery readers', () => {
+    const reconcile = vi.fn(() => planOf());
+    const cache = createReconcilePlanCache({ reconcile, readFingerprints: base.readPlanFingerprint,
+      readClaims: base.readPlanClaimSet });
+    for (const allowStandDownAutoProceed of [undefined, false, null, 'true', 1]) {
+      cache.reconcile({ repo: 'repo-a', allowStandDownAutoProceed, readPrs: () => [] });
+    }
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    cache.reconcile({ repo: 'repo-a', allowStandDownAutoProceed: true });
+    expect(reconcile).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['inherited hook', 'non-enumerable hook', 'changing accessor'])('refuses reuse for %s input', shape => {
+    const reconcile = vi.fn(() => planOf());
+    const cache = createReconcilePlanCache({ reconcile, readFingerprints: base.readPlanFingerprint,
+      readClaims: base.readPlanClaimSet });
+    const hook = rows => rows;
+    let flip = false;
+    const input = shape === 'inherited hook' ? Object.assign(Object.create({ enrichCodeQL: hook }), { repo: 'repo-a' })
+      : shape === 'non-enumerable hook' ? Object.defineProperty({ repo: 'repo-a' }, 'enrichCodeQL', { value: hook })
+        : { repo: 'repo-a', get allowStandDownAutoProceed() { flip = !flip; return flip; } };
+    cache.reconcile(input);
+    expect(cache.notes('repo-a')).toBeNull();
+    cache.reconcile(input);
+    expect(reconcile).toHaveBeenCalledTimes(2);
+  });
+
+  it('planner bypasses poisoned discovery and shared snapshots, reading directly after the baseline', () => {
+    const order = [];
+    const discovery = vi.fn(() => [{ number: 99 }]);
+    const shared = vi.spyOn(prSnapshot, 'readSharedOpenPrs').mockImplementation(() => {
+      throw new Error('poisoned shared snapshot');
+    });
+    const exec = vi.spyOn(ghThrottle, 'execFileSyncThrottled').mockImplementation((command, argv) => {
+      order.push('direct');
+      expect(command).toBe('gh');
+      expect(argv.slice(0, 4)).toEqual(['pr', 'list', '--state', 'open']);
+      expect(argv).toContain('web-everything/web-everything');
+      return '[]';
+    });
+    const original = reconcilePass.defaultReadPrs;
+    const reader = vi.spyOn(reconcilePass, 'defaultReadPrs').mockImplementation(options => {
+      expect(options.exec).not.toBe(ghThrottle.execFileSyncThrottled);
+      expect(options.attributionRepo).toBe('web-everything/web-everything');
+      return original(options);
+    });
+    const cache = createReconcilePlanCache({
+      readFingerprints: () => { order.push('baseline'); return new Map(); }, readClaims: () => new Set(),
+      reconcile: options => {
+        expect(options.readPrs).not.toBe(discovery);
+        expect(options.readPrs({ repo: 'web-everything/web-everything' })).toEqual([]);
+        return planOf();
+      },
+    });
+    cache.reconcile({ repo: 'we', readPrs: discovery });
+    expect(order).toEqual(['baseline', 'direct']);
+    expect(reader).toHaveBeenCalledTimes(1);
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(discovery).not.toHaveBeenCalled();
+    expect(shared).not.toHaveBeenCalled();
+  });
+
+  it.each(['plan', 'captured rows'])('clone failure in %s recomputes in full on the next call', target => {
+    vi.spyOn(reconcilePass, 'enrichPrsWithCodeQL').mockImplementation(rows => rows);
+    const reconcile = vi.fn(options => {
+      if (target === 'captured rows') options.enrichCodeQL([{ number: 7, uncloneable() {} }]);
+      return planOf(target === 'plan' ? { uncloneable() {} } : {});
+    });
+    const cache = createReconcilePlanCache({ reconcile, readFingerprints: base.readPlanFingerprint,
+      readClaims: base.readPlanClaimSet });
+    expect(() => cache.reconcile({ repo: 'repo-a' })).not.toThrow();
+    expect(cache.notes('repo-a')).toBeNull();
+    cache.reconcile({ repo: 'repo-a' });
+    expect(reconcile).toHaveBeenCalledTimes(2);
+  });
+
+  it('a clone failure while reading an existing entry discards it and recomputes', () => {
+    const reconcile = vi.fn(() => planOf());
+    const cache = createReconcilePlanCache({ reconcile, readFingerprints: base.readPlanFingerprint,
+      readClaims: base.readPlanClaimSet });
+    cache.reconcile({ repo: 'repo-a' });
+    const original = globalThis.structuredClone;
+    vi.spyOn(globalThis, 'structuredClone').mockImplementationOnce(() => { throw new Error('clone failed'); })
+      .mockImplementation(value => original(value));
+    expect(cache.reconcile({ repo: 'repo-a' })).toEqual(planOf());
+    expect(reconcile).toHaveBeenCalledTimes(2);
+  });
+
+  it('nested plan and captured-row mutations cannot affect later readers', () => {
+    vi.spyOn(reconcilePass, 'enrichPrsWithCodeQL').mockImplementation(rows => rows);
+    const reconcile = vi.fn(options => {
+      options.enrichCodeQL([{ number: 7, comments: [{ body: 'original' }] }]);
+      return planOf({ dispatch: [{ prNumber: 7, details: { labels: ['original'] } }],
+        refusals: [{ prNumber: 8, details: { why: 'original' } }] });
+    });
+    const cache = createReconcilePlanCache({ reconcile, readFingerprints: base.readPlanFingerprint,
+      readClaims: base.readPlanClaimSet });
+    const input = { repo: 'repo-a' };
+    const first = cache.reconcile(input);
+    first.dispatch[0].details.labels[0] = 'mutated';
+    first.refusals[0].details.why = 'mutated';
+    const next = cache.reconcile(input);
+    expect(next.dispatch[0].details.labels).toEqual(['original']);
+    expect(next.refusals[0].details.why).toBe('original');
+    cache.notes('repo-a').prsByNumber.get(7).comments[0].body = 'mutated';
+    expect(cache.notes('repo-a').prsByNumber.get(7).comments[0].body).toBe('original');
+    expect(reconcile).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([false, true])('production defaults enable reuse, discard it between passes, and retain real phase live gates (auto-proceed=%s)', async allowStandDownAutoProceed => {
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.spyOn(fixFacts, 'warmFixFacts').mockResolvedValue(null);
+    vi.spyOn(awaitVerifyLoop, 'runTickAwaitVerify').mockResolvedValue({ rows: [] });
+    vi.spyOn(stuckReclaim, 'runFixerStuckReclaimPass').mockResolvedValue({ rows: [] });
+    vi.spyOn(supersedeWatch, 'runSupersedeWatch').mockReturnValue({ holds: [], applied: [] });
+    vi.spyOn(heavyAdmission, 'resolveLiveQueueBaseline').mockReturnValue({});
+    vi.spyOn(resourceGate, 'createResourceFixThrottle').mockReturnValue({ tryAdmit: () => ({ admit: true }) });
+    for (const key of ['sweepHungCiRecovery', 'sweepCiRedRecovery', 'sweepMissingRunRecovery']) {
+      vi.spyOn(recovery, key).mockReturnValue({ applied: [], refusals: [] });
+    }
+    let fixStale = false;
+    const fixGate = vi.fn(() => {
+      if (fixStale) throw new Error('fixture stale fix main');
+      return { fresh: true, behind: 0 };
+    });
+    const healGate = vi.fn(() => { throw new Error('fixture stale heal main'); });
+    const promoteGate = vi.fn(() => ({ fresh: true, behind: 0 }));
+    const freshChecks = vi.fn(() => ({ state: 'red', why: 'new failure after planning' }));
+    const ready = vi.fn();
+    const fix = fixDispatch.runReconcileFixDispatch;
+    vi.spyOn(fixDispatch, 'runReconcileFixDispatch').mockImplementation(options => fix({ ...options,
+      root: '/fixture', checkStaleness: fixGate, netScope: null, prStack: null, writeStacks: null,
+      resolveProfile: () => ({ capabilities: { fix: true, ciHeal: true }, canonicalPrefix: 'fui' }),
+      listFixClaims: () => [], listBuildClaims: () => [], loadItems: () => [],
+      priorityShadow: null, pickFreeLanes: () => [], queueAdmission: null,
+    }));
+    const heal = ciHealDispatch.runReconcileCiHealDispatch;
+    vi.spyOn(ciHealDispatch, 'runReconcileCiHealDispatch').mockImplementation(options => heal({ ...options,
+      root: '/fixture', checkStaleness: healGate,
+    }));
+    const promote = promoteDispatch.runReconcilePromoteDraftDispatch;
+    vi.spyOn(promoteDispatch, 'runReconcilePromoteDraftDispatch').mockImplementation(options => promote({ ...options,
+      root: '/fixture', checkStaleness: promoteGate, readHeadCheckState: freshChecks, provider: { ready },
+    }));
+    const planner = vi.fn(() => planOf({ dispatch: [{ kind: 'promote-draft', prNumber: 7, headRefOid: 'head' }] }));
+    // No tick handlers or reuseReconcilePlan are injected: exercise production activation and wiring.
+    const options = { repos: ['frontier-ui/frontierui'], fixSettings: { skipEmptySteps: false, standDownAutoProceed: allowStandDownAutoProceed },
+      authGateOverride: () => ({ paused: false }), notesDryRun: true, reconcilePass: planner,
+      readPlanFingerprint: base.readPlanFingerprint, readPlanClaimSet: base.readPlanClaimSet };
+    const first = await realRunTickAllRepos(options);
+    const firstPassPlans = allowStandDownAutoProceed ? 2 : 1;
+    expect(planner).toHaveBeenCalledTimes(firstPassPlans);
+    expect(planner.mock.calls[0][0].allowStandDownAutoProceed).toBe(allowStandDownAutoProceed);
+    if (allowStandDownAutoProceed) expect(planner.mock.calls[1][0].allowStandDownAutoProceed).toBeUndefined();
+    expect(first.dispatched).toEqual([]);
+    expect(first.ciHeal.refusals[0].why).toContain('fixture stale heal main');
+    expect(first.promoteDraft.refusals).toEqual([expect.objectContaining({ kind: 'stale-check-refused' })]);
+    fixStale = true;
+    const second = await realRunTickAllRepos(options);
+    expect(planner).toHaveBeenCalledTimes(firstPassPlans + 1);
+    expect(second.refusals).toContainEqual(expect.objectContaining({ why: 'fixture stale fix main' }));
+    expect(fixGate).toHaveBeenCalledTimes(2);
+    expect(healGate).toHaveBeenCalledTimes(2);
+    expect(promoteGate).toHaveBeenCalledTimes(2);
+    expect(freshChecks).toHaveBeenCalledTimes(2);
+    expect(ready).not.toHaveBeenCalled();
+  });
+
+  it('separate passes recompute independently', async () => {
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const reconcilePass = vi.fn(() => planOf());
+    const options = { ...base, repos: ['repo-a'], reconcilePass, ...phases([]) };
+    await runTickAllRepos(options);
+    expect(reconcilePass).toHaveBeenCalledTimes(1);
+    await runTickAllRepos(options);
+    expect(reconcilePass).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([[false, 128], [true, 228]])('baseline-versus-cache pass timing includes repeated probes and permission differences (auto-proceed=%s)', async (allowStandDownAutoProceed, expectedCached) => {
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const measure = async reuseReconcilePlan => {
+      let elapsed = 0;
+      const planner = () => { elapsed += 100; return planOf(); };
+      vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(planner);
+      return (await runTickAllRepos({ ...base, repos: ['repo-a'], ...phases([]), reuseReconcilePlan,
+        allowStandDownAutoProceed,
+        now: () => elapsed,
+        reconcilePass: planner,
+        readPlanFingerprint: () => { elapsed += 5; return new Map(); },
+        readPlanClaimSet: () => { elapsed += 2; return new Set(); },
+      })).passMs;
+    };
+    const baselineCost = await measure(false);
+    const cached = await measure(true);
+    expect(baselineCost).toBe(400);
+    expect(cached).toBe(expectedCached);
+    expect(cached).toBeLessThan(baselineCost);
   });
 
   it('hands each phase its own copy, so one phase mutating the plan cannot change another', async () => {

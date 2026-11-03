@@ -783,7 +783,7 @@ export function readPlanClaims({ readAgents = () => enrichAgents(defaultReadAgen
 }
 
 /**
- * One reconcile plan per repo per pass, reused by fix, ci-heal, promote-draft and notes. A READ CACHE only: it lives
+ * One reconcile plan per repo and compatible input per pass, reused by fix, ci-heal, promote-draft and notes. A READ CACHE only: it lives
  * inside one `runTickAllRepos` call and dies with it. It never authorizes an action, and it fails closed:
  *  - Every reuse re-probes the repo live (one light PR list plus the live claim set) and compares with the probe taken
  *    just BEFORE the plan was computed. A PR whose head, draft state, labels or last activity (comments, stand-downs,
@@ -792,6 +792,8 @@ export function readPlanClaims({ readAgents = () => enrichAgents(defaultReadAgen
  *  - A new, changed or removed session discards the cached plan and recomputes liveness. Merely dropping every
  *    dispatch row would starve later phases whenever fix launches a session, including after auth recovery.
  *  - A failed probe, a plan older than `maxAgeMs`, or one that cannot be cloned is recomputed in full.
+ *  - Auto-proceed permission must match. Other planner overrides force a full recompute; the discovery reader
+ *    is ignored because planning always reads directly. Notes uses the read-only default permission.
  *  - Each reader gets its own deep copy.
  * Each phase still runs its own live gates (fix claim, fresh per-sha check read, stale-main guard) on top.
  * @param {{reconcile?:Function, now?:Function, maxAgeMs?:number, readFingerprints?:Function, readClaims?:Function}} [o]
@@ -800,6 +802,15 @@ export function createReconcilePlanCache({ reconcile = (input) => runReconcilePa
   maxAgeMs = RECONCILE_PLAN_MAX_AGE_MS, readFingerprints = readPlanFingerprints, readClaims = readPlanClaims } = {}) {
   const entries = new Map();
   const touched = new Map();
+  // Production callers vary only this permission and the discarded discovery reader. Fail closed for every
+  // other override (including future planner inputs), rather than silently reusing a differently shaped plan.
+  const modeOf = (input) => {
+    if (![Object.prototype, null].includes(Object.getPrototypeOf(input))) return null;
+    const fields = Object.getOwnPropertyDescriptors(input);
+    if (Reflect.ownKeys(fields).some(key => !['repo', 'readPrs', 'allowStandDownAutoProceed'].includes(key)
+      || !Object.hasOwn(fields[key], 'value') || !fields[key].enumerable)) return null;
+    return fields.allowStandDownAutoProceed?.value === true;
+  };
   const probe = (repo) => ({ prs: readFingerprints(repo), claims: readClaims() });
   const filterRows = (plan, stale) => {
     for (const key of ['dispatch', 'notes', 'owedTriggers']) if (Array.isArray(plan[key])) {
@@ -825,9 +836,9 @@ export function createReconcilePlanCache({ reconcile = (input) => runReconcilePa
     }
     return stale;
   };
-  const read = (repo) => {
+  const read = (repo, mode = false) => {
     const entry = entries.get(repo);
-    if (!entry || now() - entry.at > maxAgeMs) return null;
+    if (!entry || mode === null || entry.mode !== mode || now() - entry.at > maxAgeMs) return null;
     try {
       const stale = staleSet(repo, entry.baseline);
       if (stale === 'recompute') { entries.delete(repo); return null; }
@@ -837,11 +848,14 @@ export function createReconcilePlanCache({ reconcile = (input) => runReconcilePa
     } catch { entries.delete(repo); return null; }
   };
   return {
-    /** Same shape as `runReconcilePass`. Computes once per repo, then serves live-validated copies. */
+    /** Same shape as `runReconcilePass`. Reuses only compatible inputs, serving live-validated copies. */
     reconcile(input = {}) {
       const repo = input.repo ?? null;
-      const hit = read(repo);
+      const mode = modeOf(input);
+      const hit = read(repo, mode);
       if (hit) return hit.plan;
+      // A custom or differently permitted plan must not leave an older entry available to notes.
+      entries.delete(repo);
       let baseline = null;
       try { baseline = probe(repo); } catch { baseline = null; }
       let captured = [];
@@ -856,7 +870,7 @@ export function createReconcilePlanCache({ reconcile = (input) => runReconcilePa
         readPrs: tap((o = {}) => defaultReadPrs({ ...o, exec: (...args) => execFileSyncThrottled(...args), attributionRepo: o.attributionRepo ?? o.repo })),
         excuseMergeGateHolds: tap(input.excuseMergeGateHolds, excusePrMergeGateHolds),
         enrichCodeQL: tap(input.enrichCodeQL, enrichPrsWithCodeQL) }), touched.get(repo) ?? new Set());
-      try { if (baseline) entries.set(repo, { at: now(), baseline, plan: structuredClone(plan), captured: structuredClone(captured) }); }
+      try { if (baseline && mode !== null) entries.set(repo, { at: now(), mode, baseline, plan: structuredClone(plan), captured: structuredClone(captured) }); }
       catch { entries.delete(repo); }
       return plan;
     },
@@ -945,7 +959,7 @@ export async function runTickAllRepos({
   // default here would spend one for every dispatched row those fakes produce. The real daemon
   // (`buildCliDaemonEffects`, below) opts in via {@link defaultTagDispatchStatus}.
   tagDispatchStatus = null,
-  // One reconcile plan per repo per pass, reused by fix/ci-heal/promote-draft/notes (see createReconcilePlanCache).
+  // Reuse compatible plans per repo per pass; auto-proceed and read-only callers need separate plans.
   // Default on for the real daemon; injected-tick fixtures keep their historical arguments unless they opt in.
   reuseReconcilePlan,
   // Injectable planner under the cache (tests count invocations).
