@@ -1967,8 +1967,11 @@ export function primaryTreeWriteReason(segment) {
 // person notices, #xpt9fvd; caught+reverted 3x on 2026-09-26).
 
 /** Shared normalization for git flags, inline assignments and exports from earlier segments.
- *  An unavailable HOME leaves a tilde target unknown (null), so mutations fail closed. */
+ *  An unavailable HOME or unresolved shell variable leaves the target unknown (null), so mutations fail closed. */
 function absoluteGitTarget(base, p) {
+  // Tokens have lost shell quoting here. Do not mistake a literal `$HOME`/`${VAR}` path for evidence
+  // about the shell-expanded target; unknown targets must retain daemon-clone protection.
+  if (p.includes('$')) return null;
   const home = process.env.HOME;
   if (p === '~' || p.startsWith('~/')) {
     if (!home || !isAbsolute(home)) return null;
@@ -2047,7 +2050,8 @@ function fetchDestinationIsBranch(spec) {
   const sp = spec.replace(/^\+/, '');
   if (sp.startsWith('^')) return false;
   const colon = sp.indexOf(':');
-  const dst = colon < 0 ? '' : sp.slice(colon + 1);
+  // Ref directories can alias on case-insensitive filesystems (including common macOS checkouts).
+  const dst = colon < 0 ? '' : sp.slice(colon + 1).toLowerCase();
   // A wildcard namespace can include refs/heads even when it does not spell that prefix literally.
   // Compare the fixed prefix conservatively; disjoint namespaces (refs/custom/*, tags, remotes) stay safe.
   const prefix = dst.split('*', 1)[0];
@@ -2183,6 +2187,7 @@ export function readDaemonFetchConfig(segment, cwd, envDirs = [], configEnv = {}
     const token = globals[i];
     if (['-C', '--git-dir', '--work-tree'].includes(token)) {
       const value = globals[++i];
+      if (value?.includes('$')) return null;
       if (value === '~' || value?.startsWith('~/')) {
         globals[i] = absoluteGitTarget(cwd, value);
         if (globals[i] === null) return null;
@@ -2190,6 +2195,7 @@ export function readDaemonFetchConfig(segment, cwd, envDirs = [], configEnv = {}
     } else if (/^--(?:git-dir|work-tree)=/.test(token)) {
       const equal = token.indexOf('=');
       const value = token.slice(equal + 1);
+      if (value.includes('$')) return null;
       if (value === '~' || value.startsWith('~/')) {
         const target = absoluteGitTarget(cwd, value);
         if (target === null) return null;
@@ -2202,6 +2208,7 @@ export function readDaemonFetchConfig(segment, cwd, envDirs = [], configEnv = {}
   // An undefined tracked value is an unset tombstone: do not resurrect the inherited process value.
   for (const key of Object.keys(env)) if (env[key] === undefined) delete env[key];
   for (const key of ['GIT_DIR', 'GIT_WORK_TREE']) {
+    if (env[key]?.includes('$')) return null;
     if (env[key] === '~' || env[key]?.startsWith('~/')) {
       env[key] = absoluteGitTarget(cwd, env[key]);
       if (env[key] === null) return null;
@@ -4996,7 +5003,7 @@ export function decide(command, ctx = {}) {
     // comments rather than assume a later assignment or unset ran. File-descriptor redirections
     // (`2>&1`, `&>`) are not control flow.
     const controlText = whole.replace(/\d*[<>]&\d*-?|&>>?/g, ' ');
-    const canUnset = !/[&|]|\b(?:if|then|else|elif|while|until|for|do|case|select|function|enable)\b|(?:^|[\s;])[{}!#]|\(\s*\)/.test(controlText);
+    const canUnset = !/[&|()]|\b(?:if|then|else|elif|while|until|for|do|case|select|function|enable)\b|(?:^|[\s;])[{}!#]/.test(controlText);
     const setAssignment = (key, value, readonly = false, conditional = false) => {
       if (readonlyNames.has(key)) return; // failed assignment/unset leaves a readonly target active
       if (conditional || !canUnset || maybeReadonly.has(key)) {
