@@ -196,3 +196,49 @@ describe('author lookup: a gh slot throttle DEFERS the read; it is never a hard 
     expect(rest).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('author lookups are bounded so a tick cannot wedge the daemon loop', () => {
+  it('defers once the per-read budget is spent, keeping the lookups already done', async () => {
+    const { withRestAuthors } = await import('../reconcile-pass.mjs');
+    const rest = vi.fn(() => ({ json: { user: { login: 'u', type: 'User' } } }));
+    const rows = Array.from({ length: 5 }, (_, i) => ({ number: 9200 + i }));
+    let err; try { withRestAuthors(rows, { repo: 'o/r', readRest: rest, budget: 3 }); } catch (e) { err = e; }
+    expect(err?.authorLookupDeferred).toBe(true);
+    expect(rest).toHaveBeenCalledTimes(3);
+    // the next tick continues where this one stopped (memoised), within budget
+    expect(withRestAuthors(rows, { repo: 'o/r', readRest: rest, budget: 3 })).toHaveLength(5);
+    expect(rest).toHaveBeenCalledTimes(5);
+  });
+  it('defers once the wall-clock deadline is spent, and passes a short per-call timeout', async () => {
+    const { withRestAuthors } = await import('../reconcile-pass.mjs');
+    let t = 0;
+    const rest = vi.fn(() => { t += 15_000; return { json: { user: { login: 'u', type: 'User' } } }; });
+    const rows = Array.from({ length: 6 }, (_, i) => ({ number: 9300 + i }));
+    let err; try { withRestAuthors(rows, { repo: 'o/r', readRest: rest, budget: 99, deadlineMs: 20_000, now: () => t }); } catch (e) { err = e; }
+    expect(err?.authorLookupDeferred).toBe(true);
+    expect(rest).toHaveBeenCalledTimes(2);
+    expect(rest.mock.calls[0][1].execOpts.timeout).toBeLessThanOrEqual(15_000);
+  });
+});
+
+describe('resolved authors persist across processes (a cold one-shot pass converges under the budget)', () => {
+  it('writes the memo next to the PR snapshot and a cold process reads it without a REST call', async () => {
+    const { mkdtempSync, readFileSync, existsSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = mkdtempSync(join(tmpdir(), 'pr-authors-'));
+    const prev = process.env.WE_PR_SNAPSHOT_DIR; process.env.WE_PR_SNAPSHOT_DIR = dir;
+    try {
+      vi.resetModules();
+      const a = await import('../reconcile-pass.mjs');
+      a.withRestAuthors([{ number: 9401 }], { repo: 'o/r', readRest: () => ({ json: { user: { login: 'persisted', type: 'User' } } }) });
+      expect(existsSync(join(dir, 'pr-authors.json'))).toBe(true);
+      expect(JSON.parse(readFileSync(join(dir, 'pr-authors.json'), 'utf8'))['o/r#9401'].login).toBe('persisted');
+      vi.resetModules(); // a fresh process: empty in-process memo
+      const b = await import('../reconcile-pass.mjs');
+      const rest = vi.fn(() => { throw new Error('must not be called'); });
+      expect(b.withRestAuthors([{ number: 9401 }], { repo: 'o/r', readRest: rest })[0].author.login).toBe('persisted');
+      expect(rest).not.toHaveBeenCalled();
+    } finally { if (prev === undefined) delete process.env.WE_PR_SNAPSHOT_DIR; else process.env.WE_PR_SNAPSHOT_DIR = prev; rmSync(dir, { recursive: true, force: true }); }
+  });
+});

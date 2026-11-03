@@ -78,12 +78,12 @@ import { repoKeyForSlug, CONSTELLATION_REPOS } from '../lib/constellation-repos.
 // `reconcile-core.mjs`-adjacent imports below) so it never collides with an overlay editing that region.
 import { getRequiredStatusChecks, withoutImpliedRequiredChecks } from '../lib/required-status-checks.mjs';
 import { execFileSync } from 'node:child_process';
-import { resolve } from 'node:path';
+import { resolve, join, dirname } from 'node:path';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { codeqlFailureEvidence } from '../lib/codeql-gate.mjs';
 import { makeFixEvidenceReader, checkFixFacts } from '../lib/fix-facts.mjs';
 import { readSharedOpenPrs, sampleContextDeclared } from '../lib/pr-snapshot.mjs';
-import { prSnapshotEnabled } from '../lib/pr-snapshot-store.mjs';
+import { prSnapshotEnabled, prSnapshotDir } from '../lib/pr-snapshot-store.mjs';
 import { listOpenPrsPagedHydrated, resolvePrListPaging, assertInventoryComplete, parseListOutput } from '../lib/pr-list-paged.mjs';
 import { ghRestGetJson } from '../lib/gh-rest-read.mjs';
 import { isGhThrottled } from '../lib/gh-deferred.mjs';
@@ -95,7 +95,7 @@ import { resolveLanePoolRepoPath } from './lane-pool-health-watch.mjs';
 import { REPO_ROOT, defaultListAgents } from '../operations/dispatch-lane-io.mjs';
 import { listAgentsWithReviewJobs } from '../operations/review-job-store.mjs';
 import { countRearmComments } from './rearm-review.mjs';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
 import { resolveStandDownHoldsAcrossHeads } from './stand-down.mjs';
 import { enrichPrsWithStandDownAutoProceed } from './stand-down-auto-proceed-io.mjs';
 import { resolveRoundCap, planReconcile, DISPATCH_KINDS, REFUSAL_KINDS, markSelfReportedDone, resolveInfraRetryCooloffMs, resolveInfraTransientCooloffMs, markHungSessions, markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, resolveOperatorRulingExtraRounds, resolveRoundExtensionAnchor } from './reconcile-core.mjs';
@@ -327,14 +327,45 @@ const authorByPr = new Map();
 
 /** An immutable per-PR fact (author), read through the ETag-cached REST reader and remembered in-process.
  *  Shape matches `gh pr list --json author`. A failed/empty read FAILS CLOSED (the 5xx retry wrapper covers a transient one). */
-export function withRestAuthors(rows, { repo, readRest = ghRestGetJson } = {}) {
+/** Bounds on ONE read's author lookups: the read runs synchronously inside the daemon's event loop, so it may never
+ *  wait on dozens of gh slots (live 2026-11-03 17:23 ET: a tick wedged for 18 minutes). Past either bound the read
+ *  is deferred (retry next tick); lookups already done stay memoised, so ticks converge. */
+export const AUTHOR_LOOKUP_BUDGET = 16;
+export const AUTHOR_LOOKUP_DEADLINE_MS = 12_000;
+export const AUTHOR_LOOKUP_TIMEOUT_MS = 8_000;
+
+// A PR's author never changes, so resolved authors are also persisted (host-shared, next to the PR snapshot): one-shot
+// pass processes (smokes, CLI passes) start cold every time and would otherwise never converge under the per-read budget.
+const authorFile = () => (prSnapshotEnabled(process.env) ? join(prSnapshotDir(process.env), 'pr-authors.json') : null);
+let authorsLoaded = false;
+function loadAuthors() {
+  if (authorsLoaded) return;
+  authorsLoaded = true;
+  const f = authorFile();
+  if (!f) return;
+  try { for (const [k, v] of Object.entries(JSON.parse(readFileSync(f, 'utf8')))) if (v?.login && !authorByPr.has(k)) authorByPr.set(k, v); } catch { /* none yet */ }
+}
+function saveAuthors() {
+  const f = authorFile();
+  if (!f) return;
+  try { mkdirSync(dirname(f), { recursive: true }); const tmp = `${f}.${process.pid}.tmp`; writeFileSync(tmp, JSON.stringify(Object.fromEntries(authorByPr))); renameSync(tmp, f); } catch { /* best-effort */ }
+}
+
+export function withRestAuthors(rows, { repo, readRest = ghRestGetJson, budget = AUTHOR_LOOKUP_BUDGET, deadlineMs = AUTHOR_LOOKUP_DEADLINE_MS, now = () => Date.now() } = {}) {
   if (!repo) return rows;
+  loadAuthors();
+  const startedAt = now();
+  let lookups = 0;
   const out = rows.map(pr => {
     if (pr?.author || !Number.isInteger(pr?.number)) return pr;
     const key = `${repo}#${pr.number}`;
     if (!authorByPr.has(key)) {
+      if (lookups >= budget || now() - startedAt >= deadlineMs) {
+        throw Object.assign(new Error(`author lookups for ${repo} over budget (${lookups} done) — deferring the read`), { authorLookupDeferred: true });
+      }
+      lookups++;
       let u;
-      try { u = readRest(`repos/${repo}/pulls/${pr.number}`, { context: repo, op: 'pr author (reconcile)' })?.json?.user; }
+      try { u = readRest(`repos/${repo}/pulls/${pr.number}`, { context: repo, op: 'pr author (reconcile)', execOpts: { timeout: AUTHOR_LOOKUP_TIMEOUT_MS } })?.json?.user; }
       catch (cause) {
         // A gh SLOT throttle (no slot within the wait, not a server failure) defers the WHOLE read: never accept the row
         // without its author, never hard-fail — the tick retries next time. A genuine 4xx / missing login still fails closed.
@@ -343,6 +374,7 @@ export function withRestAuthors(rows, { repo, readRest = ghRestGetJson } = {}) {
       }
       if (!u?.login) throw Object.assign(new Error(`author of ${key} missing from the REST response — refusing to accept the row without it`), { code: 'pr-author-unreadable' });
       authorByPr.set(key, { login: u.login, is_bot: u.type === 'Bot' });
+      saveAuthors();
     }
     return { ...pr, author: authorByPr.get(key) };
   });

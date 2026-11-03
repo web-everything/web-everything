@@ -18,7 +18,7 @@ describe('withListRetry', () => {
     const out = run(() => { if (++n < 3) throw e504(); return [{ number: 1 }]; }, o);
     expect(out).toEqual([{ number: 1 }]);
     expect(n).toBe(3);
-    expect(o.sleep.mock.calls.map(c => c[0])).toEqual([2000, 6000]);
+    expect(o.sleep.mock.calls.map(c => c[0])).toEqual([500, 1500]);
     expect(o.events).toEqual([]);
   });
   it('retries a wrapped (cause-chain) 502/503 too, but never a non-transient error', () => {
