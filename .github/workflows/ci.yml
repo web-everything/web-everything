@@ -763,9 +763,11 @@ jobs:
     # run in the 2026-09-25 sample ever executed it (every sampled run shows it `skipped`) — no real p95
     # exists yet. Sized conservatively off its own steps instead: it runs the FULL unsharded unit suite
     # once (unlike `test-shard`'s 1/9 coverage split) plus the full real-git integration suite, so budget well
-    # above a single shard's 15min. `continue-on-error: true` already keeps a genuine timeout here from
-    # ever reddening CI; this only stops a hang from tying up a runner for the 360-min default.
-    timeout-minutes: 30
+    # above a single shard's 15min. `continue-on-error: true` does NOT absorb a JOB-level timeout: run 41701873905
+    # (main @ 1b2aa007d, 2026-11-03) was marked `cancelled` — red — when the unit shadow run alone passed the old
+    # 30-min cap. So each shadow step carries its own `timeout-minutes` (a step timeout only fails that step, which
+    # `|| true` absorbs) and the job cap sits above their sum + setup; pinned by ci-measure-job-step-caps.test.mjs.
+    timeout-minutes: 60
     steps:
       # Same sibling layout as `test-shard` — the unit suite needs the FUI sibling for the `@frontierui/*` alias.
       # Shallow checkout plus blobless main history preserves the pinned-base merge base (#2681).
@@ -815,6 +817,7 @@ jobs:
       # The shadow FULL run — the whole unit suite with the json reporter, so the measure step has per-file
       # pass/fail. `|| true`: a red shadow run must still record (the false-green signal LIVES in a red full run).
       - name: Shadow full-suite run (json report)
+        timeout-minutes: 30
         working-directory: web-everything
         run: npx vitest run --reporter=json --outputFile=vitest-full.json || true
 
@@ -848,6 +851,7 @@ jobs:
 
       - name: Shadow integration-suite run (json report)
         if: always()
+        timeout-minutes: 12
         working-directory: web-everything
         run: npx vitest run --config vitest.integration.config.ts --reporter=json --outputFile=vitest-integration.json || true
 
