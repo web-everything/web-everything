@@ -3895,3 +3895,10 @@ attribution and progress guarantees, including unknown timestamps and invalid se
 normal invariant equality with/without edges, refusal freshness/progress rejection, and
 generic deadline violations that preserve sweep/detector evidence and remediation.
 The digest persistence probe also requires the merged violation tag to survive feed serialization.
+
+PR sweep comment-read failures are PR-local: retain the listed PR with
+`commentsComplete: false` and an operator diagnostic, ignore its comment-derived
+edges, and keep body edges and other PR alerts live. The audit suite covers capped,
+unreadable, missing and malformed threads across repositories. Digest updates and
+repeat fingerprints include invariant/action/dependency changes and pending/passed
+deadline buckets; metadata-free persisted rows retain legacy one-shot identities.

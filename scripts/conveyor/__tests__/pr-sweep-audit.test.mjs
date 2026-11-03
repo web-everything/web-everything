@@ -106,3 +106,35 @@ it('retries an unsent scheduled alert with a blocker annotation using the unchan
   expect(failed.nextState.episodes[key].lastAlertAt).toBe(episode.lastAlertAt);
   expect((await run({ readPrs: () => [row, { ...pr, number: 13 }], readPrevious: () => failed.nextState })).alerts).toContainEqual(expect.objectContaining({ key }));
 });
+
+// A broken thread must not turn a readable repository listing into a global outage.
+it.each(['oversized', 'unreadable', 'missing', 'malformed'])('isolates %s comment evidence to its PR and keeps other repositories alerting', async mode => {
+  const rows = Array.from({ length: 100 }, (_, i) => ({ id: `IC_${i}`, body: 'blocked by #13', author: pr.author }));
+  const otherRepo = 'frontierui/frontierui';
+  const read = createOpenPrCommentReader({ maxPages: 1, exec: (_bin, args) => {
+    if (args[0] === 'pr') return JSON.stringify(args.includes(otherRepo) ? [{ ...pr, number: 14, comments: [] }] : [
+      { ...pr, body: 'blocked by #15', comments: mode === 'missing' ? undefined : mode === 'malformed' ? [{ body: null }] : rows },
+      { ...pr, number: 13, comments: [] }, { ...pr, number: 15, comments: [] },
+    ]);
+    if (mode === 'unreadable') throw Error('injected thread failure');
+    return JSON.stringify(rows);
+  } });
+  const discovered = read(pr.repo);
+  expect(discovered.map(p => p.number)).toEqual([12, 13, 15]);
+  expect(discovered[0]).toMatchObject({ commentsComplete: false, comments: [], commentsError: expect.stringMatching(/operator.*full thread/i) });
+  expect(buildBlockedMap(discovered).blockedBy.get(12)).toEqual([15]);
+  const previous = { episodes: Object.fromEntries([[pr.repo, 13], [otherRepo, 14]].map(([repo, number]) => [`${repo}#${number}`, {
+    head: pr.headRefOid, updatedAt: pr.updatedAt, fingerprint: stateFingerprint(pr), firstUnownedAt: now - 300 * minute, alerted: false,
+  }])) };
+  const out = await run({ settings: { value: { ...settings, repos: [pr.repo, otherRepo] }, sources: {} }, readPrs: read, readPrevious: () => previous });
+  expect(out.decisions).toHaveLength(4);
+  expect(out.errors.join(' ')).toMatch(/PR #12.*comments incomplete.*operator/i);
+  for (const key of [`${pr.repo}#13`, `${otherRepo}#14`]) expect(out.alerts).toContainEqual(expect.objectContaining({ key, kind: 'pr-stuck' }));
+});
+
+it('never trusts partial comments explicitly marked incomplete, while retaining body dependencies', () => {
+  const map = buildBlockedMap([{ ...pr, commentsComplete: false, body: 'blocked by #15',
+    comments: [{ body: 'blocked by #13', author: pr.author }] }, { number: 13 }, { number: 15 }]);
+  expect(map.blockedBy.get(12)).toEqual([15]);
+  expect(map.unblocks.get(13)).toBeUndefined();
+});

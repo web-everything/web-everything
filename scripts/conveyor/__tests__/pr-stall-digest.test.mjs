@@ -581,3 +581,36 @@ it('persists merged invariant violation metadata alongside the original finding 
   expect(replay({ path: ctx.feedPath })[0]).toMatchObject({ violation: 'deadline-passed', owner: finding.owner, nextAction: finding.nextAction, deadline: finding.deadline, command: 'repair-command', evidence: ['original evidence'], state: 'stalled-head', blockedBy: [13] });
   expect(replay({ path: ctx.feedPath })[0].reason).toContain('specific failure');
 });
+
+it.each([
+  ['violation', { violation: 'deadline-passed' }],
+  ['nextAction', { nextAction: 'fix' }],
+  ['blockedBy', { blockedBy: [2] }],
+  ['unblocks', { unblocks: [3] }],
+  ['deadline bucket', { deadline: new Date(NOW - 1).toISOString() }],
+])('republishes and alerts on a changed %s on the same state before repeat backoff', (_name, change) => {
+  const ctx = setup(), { notify, out } = sent();
+  const options = { notify, alertBackoffMinutes: [30, 60] };
+  const initial = op(1, undefined, { violation: null, nextAction: 'await-review', blockedBy: [], unblocks: [], deadline: new Date(NOW + 60000).toISOString() });
+  expect(run(ctx, [initial], options).notified).toBe(true);
+  const updated = { ...initial, ...change };
+  const result = run(ctx, [updated], { ...options, now: NOW + 1 });
+  expect(result.errors).toEqual([]);
+  expect(result.lines).toHaveLength(1);
+  expect(result.notified).toBe(true);
+  expect(replay({ path: ctx.feedPath }).at(-1)).toMatchObject(change);
+  expect(run(ctx, [updated], { ...options, now: NOW + 2 }).notified).toBe(false);
+  expect(out).toHaveLength(2);
+});
+it('deadline identity crosses its bucket without timestamp churn and legacy state stays one-shot', () => {
+  const ctx = setup(), { notify } = sent();
+  const options = { notify, alertBackoffMinutes: [30, 60] };
+  const item = op(1, undefined, { deadline: new Date(NOW + 1000).toISOString() });
+  run(ctx, [item], options);
+  expect(run(ctx, [{ ...item, deadline: new Date(NOW + 2000).toISOString() }], { ...options, now: NOW + 1 }).lines).toEqual([]);
+  expect(run(ctx, [item], { ...options, now: NOW + 1001 }).notified).toBe(true);
+  const legacy = setup();
+  run(legacy, [op(1, 'A')], { notify });
+  run(legacy, [op(1, 'B')], { notify });
+  expect(run(legacy, [op(1, 'A')], { notify }).notified).toBe(false);
+});

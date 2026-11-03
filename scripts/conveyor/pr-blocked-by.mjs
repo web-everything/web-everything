@@ -52,7 +52,7 @@ export function buildBlockedMap(prs, { now, settings = {}, owners = {} } = {}) {
   for (const pr of openPrs) {
     const number = Number(pr.number ?? pr.pr);
     const author = pr.author?.login;
-    const comments = (Array.isArray(pr.comments) ? pr.comments : []).filter(c => {
+    const comments = (pr.commentsComplete !== false && Array.isArray(pr.comments) ? pr.comments : []).filter(c => {
       const principal = { author: c?.author ?? c?.user };
       const login = principal.author?.login;
       return isTrustedSupersedeAuthor(principal) || (typeof author === 'string' && author.trim() !== ''

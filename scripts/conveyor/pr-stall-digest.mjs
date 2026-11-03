@@ -105,6 +105,15 @@ const feedKey = (f) => `${f.repo}#${f.pr}@${f.head}:${STALLED_KIND}`;
 /** `repo#pr@head:state` -> the feed key of that head's `stalled` item (the state may itself contain `:`). */
 const feedKeyOfId = (x) => { const at = x.lastIndexOf('@'); return `${x.slice(0, at)}@${x.slice(at + 1).split(':')[0]}:${STALLED_KIND}`; };
 
+// Keep legacy state strings (and their persisted repeat fingerprints) unchanged.
+// Deadline timestamps may move each tick; only crossing the deadline changes identity.
+function updateIdentity(f, now) {
+  if (['violation', 'nextAction', 'blockedBy', 'unblocks', 'deadline'].every(k => f[k] === undefined)) return f.state;
+  const deadline = Date.parse(f.deadline);
+  const bucket = Number.isFinite(deadline) ? (now > deadline ? 'passed' : 'pending') : 'unknown';
+  return JSON.stringify([f.state, f.violation, f.nextAction, f.blockedBy, f.unblocks, bucket]);
+}
+
 /**
  * Publish one pass's operator items. Returns `{lines, fresh, notified, errors}`. Never throws.
  * @param {{items:object[], incomplete:boolean, settingsUnreadable?:boolean}} pass  the `runStallSweep` result
@@ -146,18 +155,18 @@ function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, al
       // Only operator-queue's report kinds count: an event-only key (review-no-verdict, disk-space) asks something else.
       const other = prev.openKeys.filter((k) => REPORT_KINDS.has(k.slice(k.lastIndexOf(':') + 1)));
       const mineNow = items.filter((f) => !other.some((k) => k.startsWith(`${f.repo}#${f.pr}@${f.head}:`)));
-      // The FEED shows each open head's CURRENT state: a state change on an open head (A -> B, or back to A) drops the
+      // The FEED shows each open head's current state and invariant/dependency identity. A change drops the
       // old key so the diff re-publishes the head with the current reason and command. The ALERT identity is
       // repo#pr@head:state. Legacy consumers alert once (A -> B -> A alerts A once); configured sweeps repeat with backoff and reset on movement.
       const shown = Object.fromEntries(Object.entries(saved.current ?? {}).filter(([k]) => prev.openKeys.includes(k)));
       const alerted = new Set((saved.published ?? []).filter((x) => prev.openKeys.includes(feedKeyOfId(x))));
-      const changed = new Set(mineNow.filter((f) => prev.openKeys.includes(feedKey(f)) && shown[feedKey(f)] !== f.state).map(feedKey));
+      const changed = new Set(mineNow.filter((f) => prev.openKeys.includes(feedKey(f)) && shown[feedKey(f)] !== updateIdentity(f, now)).map(feedKey));
       const r = diffFeed(prev.openKeys.filter((k) => !changed.has(k)), mineNow, now, { incomplete: !!pass.incomplete, clearKinds: new Set([STALLED_KIND]) });
       const open = new Set(r.openKeys);
       const written = mineNow.filter((f) => r.lines.some((l) => l.startsWith(`NEEDS-YOU ${f.repo}#${f.pr} ${STALLED_KIND}:`)));
       const newly = written.filter((f) => !alerted.has(id(f)));
       const repeats = Object.fromEntries(Object.entries(saved.repeats ?? {}).filter(([k]) => open.has(feedKeyOfId(k))));
-      const fingerprint = f => JSON.stringify([f.state, f.labels]);
+      const fingerprint = f => JSON.stringify([updateIdentity(f, now), f.labels]);
       // Persisted one-shot ids carry no send time. Start a bounded clock on migration instead of flooding.
       if (alertBackoffMinutes) for (const f of mineNow) {
         if (changed.has(feedKey(f))) {
@@ -168,8 +177,9 @@ function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, al
       const due = mineNow.filter(f => alertBackoffMinutes && repeats[id(f)] &&
         (repeats[id(f)].fingerprint !== fingerprint(f) || repeatDue(repeats[id(f)], now, alertBackoffMinutes)));
       // State transitions reset repeats, including a return to a previously seen state.
-      if (alertBackoffMinutes) for (const f of mineNow) {
-        if (changed.has(feedKey(f))) due.push(f);
+      for (const f of mineNow) {
+        if (changed.has(feedKey(f)) && (alertBackoffMinutes || updateIdentity(f, now) !== f.state
+          || shown[feedKey(f)]?.startsWith('['))) due.push(f);
       }
       // Owed alerts from a failed send are retried until delivered or resolved, even across an incomplete pass.
       const pending = new Set((saved.unnotified ?? []).filter((x) => open.has(feedKeyOfId(x))));
@@ -181,7 +191,7 @@ function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, al
       appendLines(path, r.lines);
       writeJsonAtomic(sidecar, { ...prev, openKeys: r.openKeys });
       for (const f of newly) alerted.add(id(f));
-      for (const f of written) shown[feedKey(f)] = f.state;
+      for (const f of written) shown[feedKey(f)] = updateIdentity(f, now);
       const keep = (k) => open.has(k);
       writeJsonAtomic(mine, { published: [...alerted].filter((x) => keep(feedKeyOfId(x))), current: Object.fromEntries(Object.entries(shown).filter(([k]) => keep(k))), unnotified, repeats });
       return { lines: r.lines, fresh: toAlert };
@@ -204,7 +214,7 @@ function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, al
       try { withFileLock(lock, () => { const cur = readJson(mine, { published: [], unnotified: [] });
         const repeats = { ...cur.repeats };
         if (alertBackoffMinutes) for (const f of fresh) {
-          const fingerprint = JSON.stringify([f.state, f.labels]);
+          const fingerprint = JSON.stringify([updateIdentity(f, now), f.labels]);
           const prior = repeats[id(f)];
           repeats[id(f)] = { fingerprint, lastAlertAt: now, alertCount: (prior?.fingerprint === fingerprint ? prior.alertCount : 0) + 1 };
         }

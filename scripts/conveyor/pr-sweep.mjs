@@ -161,6 +161,9 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
       if (rows !== null) errors.push(`prs ${repo}: invalid PR listing`);
       prsReadOk = false; continue;
     }
+    for (const p of rows) if (p.commentsComplete === false) {
+      errors.push(`prs ${repo}: PR #${p.number} comments incomplete: ${sanitizeForFeed(p.commentsError ?? 'operator must inspect full thread before using comment evidence', Infinity)}`);
+    }
     prs.push(...rows.filter(p => !p.state || p.state.toUpperCase() === 'OPEN').map((p) => ({ ...p, repo })));
   }
   const queue = await safe('operator queue', async () => readQueue ? readQueue() : JSON.parse(await command(process.execPath, [join(ROOT, 'scripts/operations/operator-queue.mjs'), '--json'], env)), null);

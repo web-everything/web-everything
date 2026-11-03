@@ -531,12 +531,12 @@ describe('R437 sanctioned dependency comment discovery', () => {
   });
   it('fails closed on missing comment evidence instead of treating it as an empty thread', () => {
     const read = completeComments.createOpenPrCommentReader({ exec: () => JSON.stringify([pr]) });
-    expect(() => read(pr.repo)).toThrow(/comment/);
+    expect(read(pr.repo)).toEqual([{ ...pr, comments: [], commentsComplete: false, commentsError: expect.stringMatching(/missing.*operator.*full thread/i) }]);
   });
   it('fails closed on oversized threads with an operator-visible escalation', () => {
     const rows = Array.from({ length: 100 }, (_, i) => comment(i));
     const read = completeComments.createOpenPrCommentReader({ maxPages: 1, exec: (_bin, args) => JSON.stringify(args[0] === 'pr' ? [{ ...pr, comments: rows }] : rows) });
-    expect(() => read(pr.repo)).toThrow(/page cap.*operator/i);
+    expect(read(pr.repo)).toEqual([{ ...pr, comments: [], commentsComplete: false, commentsError: expect.stringMatching(/page cap.*operator.*full thread/i) }]);
   });
   it('shares a bounded request budget across repository listings', () => {
     let calls = 0;

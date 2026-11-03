@@ -35,7 +35,8 @@ export function readCompletePrComments(number, { repo = null, exec = execRead, g
 
 /** One tick's open-PR discovery. Short threads stay in the list call; capped threads
  * use the complete reader. All repositories, pages and count proofs share a budget.
- * Exhaustion or unreadable evidence throws, allowing the caller to retain prior alerts.
+ * A failed listing throws; a failed thread retains its PR with explicit incomplete
+ * comment evidence and an operator diagnostic. Other enrichment callers still omit failed PRs.
  */
 export function createOpenPrCommentReader({ exec = execRead, env = process.env, maxCalls = 128, maxPages = 10 } = {}) {
   if (!Number.isSafeInteger(maxCalls) || maxCalls < 1 || !Number.isSafeInteger(maxPages) || maxPages < 1) throw Error('invalid comment discovery bounds');
@@ -47,13 +48,22 @@ export function createOpenPrCommentReader({ exec = execRead, env = process.env, 
   };
   return repo => {
     const prs = gh(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '1000', '--json', 'number,title,labels,isDraft,updatedAt,headRefOid,changedFiles,additions,body,comments,author']);
-    if (!Array.isArray(prs) || prs.length >= 1000 || prs.some(pr => !Array.isArray(pr?.comments) || pr.comments.some(c => typeof c?.body !== 'string'))) {
+    if (!Array.isArray(prs) || prs.length >= 1000) {
       throw Error('incomplete PR/comment listing; operator must inspect discovery before resolving alerts');
     }
-    return enrichPrsWithCompleteComments(prs, {
-      repo, annotate: pr => pr,
-      readComments: number => readCompletePrComments(number, { repo, gh, maxPages }),
-      onError: (pr, error) => { throw Error(`PR #${pr.number}: ${error.message}; operator must inspect full thread before resolving alerts`); },
+    return prs.map(pr => {
+      const incomplete = error => ({ ...pr, comments: [], commentsComplete: false,
+        commentsError: `${String(error?.message ?? error).split('\n')[0]}; operator must inspect full thread before using comment evidence` });
+      if (!Array.isArray(pr?.comments) || pr.comments.some(c => typeof c?.body !== 'string')) {
+        return incomplete('missing or malformed comment evidence');
+      }
+      let failure;
+      const [complete] = enrichPrsWithCompleteComments([pr], {
+        repo, annotate: pr => pr,
+        readComments: number => readCompletePrComments(number, { repo, gh, maxPages }),
+        onError: (_pr, error) => { failure = error; },
+      });
+      return complete ?? incomplete(failure);
     });
   };
 }
