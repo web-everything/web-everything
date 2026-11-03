@@ -519,3 +519,43 @@ describe('early PR-size guidance', () => {
     expect(brief.indexOf('pr-size --checkout=<lane>')).toBeLessThan(brief.indexOf('6. **One PR.**'));
   });
 });
+
+describe('brief red-team before code (R469)', () => {
+  const redTeam = { status: 'ok', classes: [{ attack: 'symlink bypass', test: 'rejects symlinked path' }] };
+  it('renderWorkerBrief appends the red-team findings under the task, before the standard rules', () => {
+    const brief = renderWorkerBrief({ ...params, redTeam });
+    expect(brief).toContain('symlink bypass');
+    expect(brief).toContain('rejects symlinked path');
+  });
+  it('adds nothing when no red-team result is given', () => {
+    expect(renderWorkerBrief(params)).not.toMatch(/red-team/i);
+  });
+  it('main runs the red-team for a guard touch-set with --prep-file and puts the classes in the brief', async () => {
+    const o = io();
+    const redTeamBrief = vi.fn(async () => redTeam);
+    const readText = vi.fn(() => 'prep and acceptance');
+    expect(await main(['--purpose=gate-fix', '--files=scripts/lib/red-team-gate.mjs', '--prep-file=/p.md'], { ...o, redTeamBrief, readText })).toBe(0);
+    expect(redTeamBrief).toHaveBeenCalledWith(expect.objectContaining({ prep: 'prep and acceptance' }));
+    expect(o.stdout.write.mock.calls[0][0]).toContain('symlink bypass');
+  });
+  it('main still prints the plain brief when the red-team result is failed (fail open)', async () => {
+    const o = io();
+    const redTeamBrief = vi.fn(async () => ({ status: 'failed', classes: [] }));
+    expect(await main(['--purpose=gate-fix', '--files=scripts/lib/red-team-gate.mjs', '--prep-file=/p.md'], { ...o, redTeamBrief, readText: () => 'x' })).toBe(0);
+    expect(o.stdout.write.mock.calls[0][0]).toContain('Standard worker rules');
+  });
+  it('preserves the plain brief when red-team execution rejects', async () => {
+    const o = io();
+    const redTeamBrief = vi.fn(async () => { throw new Error('rt boom'); });
+    expect(await main(['--purpose=gate-fix', '--files=scripts/lib/red-team-gate.mjs', '--prep-file=/p.md'], { ...o, redTeamBrief, readText: () => 'x' })).toBe(0);
+    expect(o.stdout.write.mock.calls[0][0]).toContain('Standard worker rules');
+    expect(o.stderr.write.mock.calls.join('')).toContain('rt boom');
+  });
+  it('preserves the plain brief when prep-file reading fails', async () => {
+    const o = io();
+    const redTeamBrief = vi.fn();
+    expect(await main(['--purpose=gate-fix', '--files=scripts/lib/red-team-gate.mjs', '--prep-file=/missing.md'], { ...o, redTeamBrief, readText: () => { throw new Error('ENOENT'); } })).toBe(0);
+    expect(o.stdout.write.mock.calls[0][0]).toContain('Standard worker rules');
+    expect(redTeamBrief).not.toHaveBeenCalled();
+  });
+});
