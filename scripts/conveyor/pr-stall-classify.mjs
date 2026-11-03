@@ -212,16 +212,17 @@ function classifyUnsafe(o = {}) {
   if (state === 'red-team-sent-back-cleared') return out('system', 'rerun-red-team-gate', 'a confirmed red-team break was sent back but no fixer owns it; the gate re-sends it');
   // System nudges never rule on anything, so a guard file does not stop them (it stops every POLICY action, below).
   if (REVIEW_WAITS.has(state)) {
-    if (row.liveJob) return null;
     if (['red-team-pending', 'drain-skip:red-team-pending'].includes(state) && redTeam !== undefined) {
       const plan = planPendingRedTeam(redTeam && typeof redTeam === 'object' && !Array.isArray(redTeam)
         ? { ...redTeam, maxRestarts: cfg.maxRedTeamRestartsPerHead } : redTeam);
       if (plan.kind === 'wait') return null;
       if (plan.kind === 'owner-unknown') return operator('red-team-owner-unknown', plan.reason);
       if (plan.kind === 'exhausted') return operator('red-team-restart-exhausted', plan.reason);
+      if (row.liveJob) return null;
       if (plan.kind === 'publish-result') return out('system', 'publish-red-team-result', plan.reason);
       return out('system', 'restart-red-team', plan.reason, { key: `${key}:restart-${redTeam.restarts + 1}` });
     }
+    if (row.liveJob) return null;
     return out('system', 'ask-review-daemon', `waiting on the ${row.actor === 'red-team' ? 'red team' : 'reviewer'} with no live job; ask the review daemon once for this head`,
       { onceKey: `${row.repo}#${row.number}@${head.toLowerCase()}:ask-review-daemon` });
   }

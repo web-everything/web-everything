@@ -40,6 +40,12 @@ describe('planPendingRedTeam', () => {
       status: { status: 'running', startedAt: new Date(-500 * 60_000).toISOString() } }, 'owner-unknown');
     expect(result.reason).toMatch(/run age.*500.*ownership could not be proven.*operator.*needs-you/);
   });
+  it.each([undefined, 'unreadable', new Date(1).toISOString()])('unknown owner with run timestamp %j escalates at pending deadline, never restarts', startedAt => {
+    const status = { status: 'running', startedAt };
+    expectKind({ status, ageMinutes: 119.99 }, 'wait');
+    const result = expectKind({ status, ageMinutes: 120 }, 'owner-unknown');
+    expect(result.reason).toMatch(/unreadable.*pending age.*120.*operator.*needs-you/);
+  });
   it.each(['failed', 'skipped'])('a terminal %s status permits restart', status => {
     expectKind({ status: { status } }, 'restart');
   });

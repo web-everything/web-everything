@@ -72,6 +72,17 @@ export function resolveStallSweepSettings({ env = process.env, read = readFileSy
   // A block that is present but not an object (`false`, `"off"`, `[]`) is unusable policy, not "no settings".
   const isBlock = (b) => !!b && typeof b === 'object' && !Array.isArray(b);
   if (!isBlock(tool) || !isBlock(platform)) { layerUnreadable = true; errors.push('a prStallSweep block is not an object'); }
+  // A present but invalid restart budget disables restarts at that layer, preserving its provenance.
+  const closeRestartBudget = (layer, name) => {
+    const k = 'maxRedTeamRestartsPerHead';
+    if (isBlock(layer) && Object.hasOwn(layer, k) && !valid[k](layer[k])) {
+      errors.push(`${name}.${k}=${JSON.stringify(layer[k])} (invalid; restarts disabled)`);
+      return { ...layer, [k]: 0 };
+    }
+    return layer;
+  };
+  tool = closeRestartBudget(tool, 'tool'); platform = closeRestartBudget(platform, 'platform');
+  Object.assign(envValues, closeRestartBudget(envValues, 'env'));
   tool = scalarsOnly(tool, 'tool'); platform = scalarsOnly(platform, 'platform');
   // The kill switch fails closed: a mode PRESENT in any layer but unusable (including `{}`, which the cascade's leaf
   // flattening would drop) turns the sweep OFF.
@@ -261,7 +272,7 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
           }
           if (status.repo !== row.repo || Number(status.pr) !== row.number || status.head !== head) throw new Error('red-team status identity mismatch');
           if (['queued', 'running'].includes(status.status)) {
-            // Missing timing is allowed (the watchdog waits), but malformed owner fields cannot be evidence.
+            // Missing timing uses the pending-age deadline; malformed owner fields cannot be evidence.
             const text = value => typeof value === 'string' && value.trim().length > 0;
             if (['host', 'pidNamespace', 'pidStart', 'startedAt', 'createdAt'].some(field => status[field] != null && !text(status[field]))
               || (status.pid != null && (!Number.isSafeInteger(status.pid) || status.pid <= 0))
@@ -311,6 +322,15 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
   }
   const incomplete = raw.unreadable.length > 0 || readFailed || !historyOk;
   const plan = incomplete ? { act: [], held: [] } : planStallActions(items, { history, now, limits: cfg });
+  for (const held of plan.held.filter(i => i.action === 'restart-red-team' && i.held === 'per-PR-head cap')) {
+    const entry = pending.find(p => p.metadata.prHead === held.prHead);
+    const restarts = [...history.filter(h => ['would-do', 'intent'].includes(h.phase)), ...plan.act]
+      .filter(h => h.prHead === held.prHead && h.action === 'restart-red-team').length;
+    items.push({ ...held, lane: 'operator', action: 'red-team-restart-exhausted',
+      key: `${held.prHead}:red-team-restart-exhausted`, held: undefined,
+      command: entry?.context.row.next?.command ?? null,
+      reason: `red-team restart held by the per-head ceiling (per-PR-head cap); ${restarts} restarts so far; pending age ${entry?.context.row.ageMinutes} minutes; operator must inspect the pending head (needs-you)` });
+  }
   const ts = new Date(now).toISOString();
   const logged = new Set(history.map((h) => `${h.phase}|${h.key}|${h.action}|${h.held ?? ''}`));
   const fresh = (r) => !logged.has(`${r.phase}|${r.key}|${r.action}|${r.held ?? ''}`);

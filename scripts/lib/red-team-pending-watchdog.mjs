@@ -19,7 +19,10 @@ export function planPendingRedTeam(input) {
       const started = [status.pidStart, status.startedAt, status.createdAt]
         .map(value => typeof value === 'string' && value.trim() ? Date.parse(value) : NaN)
         .find(Number.isFinite);
-      if (!Number.isFinite(now) || started === undefined || started > now) return wait('red-team run age is unreadable; operator must inspect the pending head');
+      if (!Number.isFinite(now) || started === undefined || started > now) {
+        if (ageMinutes < staleRunMinutes) return wait('red-team run age is unreadable before pending stale deadline');
+        return { kind: 'owner-unknown', reason: `red-team run age is unreadable; pending age is ${ageMinutes} minutes; ownership could not be proven; operator must inspect the pending head (needs-you)` };
+      }
       const runAgeMinutes = (now - started) / 60_000;
       if (runAgeMinutes < staleRunMinutes) return wait('red-team owner is unknown before stale deadline');
       return { kind: 'owner-unknown', reason: `red-team run age is ${runAgeMinutes} minutes; ownership could not be proven; operator must inspect the pending head (needs-you)` };

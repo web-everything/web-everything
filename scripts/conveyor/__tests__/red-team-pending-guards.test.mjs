@@ -218,12 +218,12 @@ describe('owner probes preserve unknown liveness', () => {
   it('a successful PID probe proves the process exists', () => {
     expect(pendingOwnerPidAlive(12345, () => {})).toBe(true);
   });
-  it.each(['isAlive', 'readPidStart'])('a throwing %s probe retains the active status and waits without a run timestamp', async method => {
+  it.each(['isAlive', 'readPidStart'])('a throwing %s probe escalates the active status without a run timestamp after the pending deadline', async method => {
     const { out } = await sweep({ ageMinutes: 1000, probePatch: {
       [method]: vi.fn(() => { throw new Error('unexpected probe failure'); }),
     } });
     expect(out.errors).toContainEqual(expect.stringMatching(/red-team owner.*unexpected probe failure/));
-    expect(out.items).toEqual([]);
+    expect(out.items).toMatchObject([{ lane: 'operator', action: 'red-team-owner-unknown' }]);
     expect(out.act).toEqual([]);
   });
   it('the default PID probe treats unexpected process.kill errors as unknown', async () => {
@@ -231,7 +231,7 @@ describe('owner probes preserve unknown liveness', () => {
     try {
       const { out } = await sweep({ ageMinutes: 1000, probePatch: { isAlive: pendingOwnerPidAlive } });
       expect(kill).toHaveBeenCalledWith(12345, 0);
-      expect(out.items).toEqual([]);
+      expect(out.items).toMatchObject([{ lane: 'operator', action: 'red-team-owner-unknown' }]);
       expect(out.act).toEqual([]);
     } finally { kill.mockRestore(); }
   });
@@ -267,11 +267,11 @@ describe('unknown active owners use run age', () => {
       pidStart: 'unreadable', startedAt: null, createdAt: new Date(NOW - 240 * 60_000).toISOString(),
     } })).kind).toBe('owner-unknown');
   });
-  it.each([{}, { pidStart: 'bad', startedAt: '', createdAt: false }, { pidStart: new Date(NOW + 1).toISOString() }])('unreadable or future run timing %j waits with operator fallback even when exhausted', timestamps => {
+  it.each([{}, { pidStart: 'bad', startedAt: '', createdAt: false }, { pidStart: new Date(NOW + 1).toISOString() }])('unreadable or future run timing %j escalates by pending age even when exhausted', timestamps => {
     const result = planPendingRedTeam(evidence({ now: NOW, ageMinutes: 1000, restarts: 3, minutesSinceLastRestart: 300,
       status: { status: 'running', ...timestamps },
     }));
-    expect(result).toMatchObject({ kind: 'wait', reason: expect.stringMatching(/operator.*inspect/) });
+    expect(result).toMatchObject({ kind: 'owner-unknown', reason: expect.stringMatching(/pending age.*1000.*operator.*inspect/) });
   });
   it('the sweep passes its clock and honors a fresh remote run on an old pending head', async () => {
     const readStatus = () => ({ repo: REPO, pr: 11, head: HEAD, status: 'running', host: 'remote',

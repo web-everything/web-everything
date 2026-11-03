@@ -539,6 +539,16 @@ describe('pending red-team watchdog evidence', () => {
       expect(at(state, { row: { liveJob: 'review-job' }, redTeam: pending({ status }) })).toBeNull();
     }
   });
+  it.each(states)('%s always emits watchdog escalations even with a live job', state => {
+    const attached = { row: { liveJob: 'review-job' } };
+    expect(at(state, { ...attached, redTeam: pending({ ageMinutes: 181, restarts: 2, minutesSinceLastRestart: 60 }) }))
+      .toMatchObject({ lane: 'operator', action: 'red-team-restart-exhausted' });
+    for (const startedAt of [undefined, 'unreadable', new Date(1).toISOString(), new Date(-120 * 60_000).toISOString()]) {
+      expect(at(state, { ...attached, redTeam: pending({ now: 0, ageMinutes: 120, status: { status: 'running', startedAt } }) }))
+        .toMatchObject({ lane: 'operator', action: 'red-team-owner-unknown' });
+    }
+    expect(at(state, { ...attached, redTeam: pending({ ageMinutes: 119, status: { status: 'running' } }) })).toBeNull();
+  });
   it.each(states)('%s publishes a finished head result while the pending label remains', state => {
     const item = at(state, { redTeam: pending({ restarts: 2, minutesSinceLastRestart: 0,
       status: { status: 'finished', result: { status: 'ran' } } }) });

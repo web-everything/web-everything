@@ -7,6 +7,7 @@ import { mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync, writeFileSync
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { resolveStallSweepSettings, runStallSweep, planStallActions, stallSweepDir, strictGh, strictDrainText, STALL_SWEEP_DEFAULTS } from '../pr-stall-sweep.mjs';
+import { resetCascadeLogForTest } from '../../lib/policy-cascade.mjs';
 import { createPrSweepReader } from '../../operations/pr-sweep-io.mjs';
 import { runPrSweep } from '../pr-sweep.mjs';
 import { runPrSweepJob } from '../pr-sweep-job.mjs';
@@ -60,11 +61,11 @@ const reader = (gh, unreadable = false) => {
 describe('settings', () => {
   const file = (block) => (path) => { if (String(path).endsWith('pr-stall-sweep.json')) return JSON.stringify({ prStallSweep: block }); const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; };
   const log = () => {};
-  it('repository shared ceiling resolves to three with tool provenance', () => {
+  it('repository shared ceiling resolves to one with tool provenance', () => {
     const log = vi.fn();
     const result = resolveStallSweepSettings({ env: { WE_POLICY_CASCADE_LOG: '1' }, log });
-    expect(result).toMatchObject({ value: { maxActionsPerPrHead: 3 }, sources: { maxActionsPerPrHead: 'tool' }, errors: [] });
-    expect(log.mock.calls.map(([line]) => line).join('\n')).toContain('maxActionsPerPrHead=3 (tool)');
+    expect(result).toMatchObject({ value: { maxActionsPerPrHead: 1 }, sources: { maxActionsPerPrHead: 'tool' }, errors: [] });
+    expect(log.mock.calls.map(([line]) => line).join('\n')).toContain('maxActionsPerPrHead=1 (tool)');
   });
   it.each([3, Number.MAX_SAFE_INTEGER])('shared ceiling validator accepts %s without changing its safe-integer bound', cap => {
     expect(resolveStallSweepSettings({ env: {}, read: file({ maxActionsPerPrHead: cap }), log }))
@@ -95,7 +96,7 @@ describe('settings', () => {
     expect(result.value.digest).toBe(true);
     expect(result.errors.join(' ')).toMatch(/digest/);
   });
-  it.each(Object.keys(STALL_SWEEP_DEFAULTS))('validates the %s setting and retains its standard value', key => {
+  it.each(Object.keys(STALL_SWEEP_DEFAULTS))('validates the %s setting and uses its closed fallback', key => {
     const standard = STALL_SWEEP_DEFAULTS[key];
     // The cascade flattens map leaves: the empty stateLanes standard is represented by an absent map.
     const effective = value => key === 'stateLanes' && value === undefined ? {} : value;
@@ -106,7 +107,7 @@ describe('settings', () => {
       ? Object.fromEntries((key === 'stateLanes' ? ['fixing'] : Object.keys(standard)).map(leaf => [leaf, 'invalid-setting-value']))
       : 'invalid-setting-value';
     const result = resolveStallSweepSettings({ env: {}, read: file({ [key]: invalid }), log });
-    expect(effective(result.value[key])).toEqual(standard);
+    expect(effective(result.value[key])).toEqual(key === 'maxRedTeamRestartsPerHead' ? 0 : standard);
     expect(result.errors.join(' ')).toContain(key);
   });
   it('is off by standard, and every leaf carries its source', () => {
@@ -471,6 +472,22 @@ describe('pending red-team watchdog in the shadow sweep', () => {
     expect(out.items).toMatchObject([{ lane: 'operator', action: 'red-team-restart-exhausted', command: expect.any(String) }]);
     expect(out.items[0].reason).toMatch(cap === 0 ? /disabled.*maxRedTeamRestartsPerHead=0.*operator/ : /exhausted.*operator/);
   });
+  it.each(['would-do', 'intent'])('shared cap yields one needs-you record per head after prior %s', async phase => {
+    for (const priorAction of ['ask-review-daemon', 'restart-red-team']) {
+      const dir = auditDir();
+      seed(dir, [restartRecord(120, { phase, action: priorAction })]);
+      const options = { dir, settings: shadow() };
+      const first = await sweep(options);
+      expect(first.out.act).toEqual([]);
+      expect(first.out.held).toMatchObject([{ action: 'restart-red-team', held: 'per-PR-head cap' }]);
+      const operator = first.out.records.filter(r => r.phase === 'operator');
+      expect(operator).toMatchObject([{ lane: 'operator', action: 'red-team-restart-exhausted',
+        reason: expect.stringMatching(new RegExp(`held by the per-head ceiling.*${priorAction === 'restart-red-team' ? 1 : 0} restarts so far.*pending age 180.*needs-you`)) }]);
+      const repeated = await sweep({ ...options, now: NOW + 60_000 });
+      expect(repeated.out.records.filter(r => r.phase === 'operator')).toEqual([]);
+      expect(lines(dir).filter(r => r.phase === 'operator')).toHaveLength(1);
+    }
+  });
   it.each(['would-do', 'intent'])('logs a shared-ceiling-held restart as would-skip after prior %s', async phase => {
     const dir = auditDir();
     seed(dir, [restartRecord(120, { phase, action: 'ask-review-daemon', key: `${prHead}:daemon` })]);
@@ -512,6 +529,17 @@ describe('pending red-team watchdog in the shadow sweep', () => {
     expect(stale.out.items).toMatchObject([{ lane: 'operator', action: 'red-team-owner-unknown',
       reason: expect.stringMatching(/run age.*120.*ownership could not be proven.*needs-you/) }]);
     expect(stale.probe.isAlive).not.toHaveBeenCalled();
+  });
+  it.each([undefined, 'unreadable', new Date(NOW + 1).toISOString()])('sweep escalates unknown-owner run timestamp %j at pending deadline without restarting', startedAt => {
+    const at = new Date(NOW - 120 * 60_000).toISOString();
+    return sweep({ status: statusFor({ host: 'remote', startedAt }),
+      prs: [pendingPr({ updatedAt: at, createdAt: at })] }).then(({ out }) => {
+      expect(out.incomplete).toBe(false);
+      expect(out.act).toEqual([]);
+      expect(out.records.filter(r => r.phase === 'operator')).toMatchObject([
+        { lane: 'operator', action: 'red-team-owner-unknown', reason: expect.stringMatching(/pending age.*120.*needs-you/) },
+      ]);
+    });
   });
   it('a finished real result with its label still pending is published instead of restarted', async () => {
     const { out, calls, log } = await sweep({ status: statusFor({ status: 'finished', result: { status: 'ran', findings: [] } }) });
@@ -721,6 +749,7 @@ describe('watchdog action settings defaults and provenance', () => {
 
 describe('restart budget settings cascade', () => {
   const resolve = (tool = {}, platform = {}, env = {}) => {
+    resetCascadeLogForTest();
     const log = vi.fn();
     const result = resolveStallSweepSettings({ env: { WE_POLICY_CASCADE_LOG: '1', ...env }, log,
       read: path => JSON.stringify({ prStallSweep: String(path).endsWith('pr-stall-sweep.json') ? tool : platform }) });
@@ -743,20 +772,23 @@ describe('restart budget settings cascade', () => {
       expect(result.logged).toContain(`maxRedTeamRestartsPerHead=${cap} (${source})`);
     }
   });
-  it.each([-1, 3, 0.5, 9007199254740992, null, false, '1', {}, []])('rejects bad layer cap %j and retains stricter underlying policy', invalid => {
-    const tool = resolve({ maxRedTeamRestartsPerHead: invalid }, { maxRedTeamRestartsPerHead: 0 });
+  it.each(['off', -1, 3, 0.5, 9007199254740992, null, false, '1', {}, []])('invalid layer cap %j disables restarts with layer provenance', invalid => {
+    const tool = resolve({ maxRedTeamRestartsPerHead: invalid }, { maxRedTeamRestartsPerHead: 2 });
     expect(tool.value.maxRedTeamRestartsPerHead).toBe(0);
-    expect(tool.sources.maxRedTeamRestartsPerHead).toBe('platform');
+    expect(tool.sources.maxRedTeamRestartsPerHead).toBe('tool');
+    expect(tool.logged).toContain('maxRedTeamRestartsPerHead=0 (tool)');
     expect(tool.errors.join(' ')).toContain('maxRedTeamRestartsPerHead');
     const platform = resolve({}, { maxRedTeamRestartsPerHead: invalid });
-    expect(platform.value.maxRedTeamRestartsPerHead).toBe(2);
-    expect(platform.sources.maxRedTeamRestartsPerHead).toBe('standard');
+    expect(platform.value.maxRedTeamRestartsPerHead).toBe(0);
+    expect(platform.sources.maxRedTeamRestartsPerHead).toBe('platform');
+    expect(platform.logged).toContain('maxRedTeamRestartsPerHead=0 (platform)');
     expect(platform.errors.join(' ')).toContain('maxRedTeamRestartsPerHead');
   });
-  it.each(['-1', '3', '0.5', 'NaN', 'Infinity', '', ' ', 'false', '9007199254740992'])('rejects bad env cap %j without loosening a zero tool policy', raw => {
-    const result = resolve({ maxRedTeamRestartsPerHead: 0 }, {}, { WE_PR_STALL_SWEEP_MAX_RED_TEAM_RESTARTS_PER_HEAD: raw });
+  it.each(['off', '-1', '3', '0.5', 'NaN', 'Infinity', '', ' ', 'false', '9007199254740992'])('invalid env cap %j disables restarts with env provenance', raw => {
+    const result = resolve({ maxRedTeamRestartsPerHead: 2 }, {}, { WE_PR_STALL_SWEEP_MAX_RED_TEAM_RESTARTS_PER_HEAD: raw });
     expect(result.value.maxRedTeamRestartsPerHead).toBe(0);
-    expect(result.sources.maxRedTeamRestartsPerHead).toBe('tool');
+    expect(result.sources.maxRedTeamRestartsPerHead).toBe('env');
+    expect(result.logged).toContain('maxRedTeamRestartsPerHead=0 (env)');
     expect(result.errors.join(' ')).toContain('maxRedTeamRestartsPerHead');
   });
 });
