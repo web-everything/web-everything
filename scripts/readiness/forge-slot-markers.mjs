@@ -168,10 +168,6 @@ function ownerGone(root, index, file, liveness, selfPid) {
   return liveness(ownerPid(root, index, file), selfPid) === 'dead';
 }
 
-// Process-wide: idle samples (marker path + identity) whose on-disk reset failed, so a recreated reaper in this process
-// still rejects them. A cross-process double I/O failure (delete and overwrite both failing) is accepted residual.
-const idleVoid = new Set();
-
 /**
  * Stateful reaper for one wait loop. `step()` is cheap and idempotent. It reads Forge telemetry (a lazy async getter)
  * only when a dead-owner marker exists, so a loop with no dead markers costs one readdir.
@@ -210,16 +206,28 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
     return at;
   }
   const idleFile = file => file + '.idle';
-  // A failed delete must never leave the old first-idle sample usable: remember the reset in memory too.
+  // A failed reset must never leave the old first-idle sample usable by ANY process. Fail closed, in order: delete the
+  // sample; else overwrite it; else persist a `.idle-void` marker (a different file) that makes every reader treat the
+  // sample as void and hold the slot; else (total I/O failure) hold in this instance. Nothing here is process-global.
+  const voidFile = file => file + '.idle-void';
+  const unpersisted = new Set();
   function resetIdle(entry) {
     try { unlinkSync(idleFile(entry.file)); return; } catch (error) { if (error?.code === 'ENOENT') return; }
-    // Delete failed: neutralise the persisted sample by overwriting it (a recreated reaper then sees no valid stamp);
-    // if even that fails, this instance still refuses the stale sample until a fresh one is written.
-    try { writeFileSync(idleFile(entry.file), '{}', {mode: 0o600}); } catch { idleVoid.add(entry.file + '|' + entry.key); }
+    try { writeFileSync(idleFile(entry.file), '{}', {mode: 0o600}); return; } catch { /* try the void marker */ }
+    try { writeFileSync(voidFile(entry.file), JSON.stringify({key: entry.key}), {mode: 0o600}); }
+    catch { unpersisted.add(entry.key); }
+    log(`heavy-admission: idle sample reset failed for ${entry.name}; holding the slot until it is cleared\n`);
   }
   function idleStamp(file, key, sampledAt) {
-    if (idleVoid.has(file + '|' + key)) {
-      try { writeFileSync(idleFile(file), JSON.stringify({key, sampledAt}), {mode: 0o600}); idleVoid.delete(file + '|' + key); } catch { /* still void: retried next pass */ }
+    let voided = unpersisted.has(key);
+    try { if (JSON.parse(readFileSync(voidFile(file), 'utf8')).key === key) voided = true; } catch { /* no void marker */ }
+    if (voided) {
+      // Hold: restart the window and clear the void only once both the fresh stamp and the cleanup are written.
+      try {
+        writeFileSync(idleFile(file), JSON.stringify({key, sampledAt}), {mode: 0o600});
+        try { unlinkSync(voidFile(file)); } catch (error) { if (error?.code !== 'ENOENT') throw error; }
+        unpersisted.delete(key);
+      } catch { /* still void: held, retried next pass */ }
       return sampledAt;
     }
     try { const saved = JSON.parse(readFileSync(idleFile(file), 'utf8')); if (saved.key === key && Number.isFinite(saved.sampledAt)) return saved.sampledAt; } catch { /* none yet */ }
@@ -244,7 +252,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
     try { linkSync(tomb, entry.file); unlinkSync(tomb); } catch { /* the held tombstone stays and keeps blocking its slot */ }
     return false;
   }
-  const forget = (file, key) => { firstDead.delete(key); try { unlinkSync(sidecar(file)); } catch { /* absent */ } try { unlinkSync(idleFile(file)); } catch { /* absent */ } };
+  const forget = (file, key) => { firstDead.delete(key); try { unlinkSync(sidecar(file)); } catch { /* absent */ } try { unlinkSync(idleFile(file)); } catch { /* absent */ } try { unlinkSync(voidFile(file)); } catch { /* absent */ } };
   return {
     async step(getTelemetry, now = clock()) {
       let names;

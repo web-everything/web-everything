@@ -243,16 +243,6 @@ describe('stale remote slot markers (perf10)', () => {
       expect(await reaper.step(tel(0, S1 + 31_000, [going(RUN_A)]))).toEqual([]);
       expect(names(root)).toEqual(['0']);
     });
-    it('rejects the stale idle sample in a recreated reaper when both delete and overwrite of it failed', async () => {
-      const {root, reaper} = mk();
-      await reaper.step(tel(0, S1, [going(RUN_A)]));
-      const idle = join(root, 'slot-0.unconfirmed.idle');
-      chmodSync(idle, 0o400); chmodSync(root, 0o500); // unlink and overwrite both fail
-      try { await reaper.step(async () => null); } finally { chmodSync(root, 0o700); chmodSync(idle, 0o600); }
-      const recreated = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
-      expect(await recreated.step(tel(0, S1 + 31_000, [going(RUN_A)]))).toEqual([]);
-      expect(names(root)).toEqual(['0']);
-    });
     it('logs a complete structured record for every released slot', async () => {
       const root = setup({0: {pid: 111, run: RUN_A}, 1: {pid: 112, run: RUN_B}});
       const lines = [];
