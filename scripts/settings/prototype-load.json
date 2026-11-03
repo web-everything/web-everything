@@ -28,6 +28,12 @@
       "note": "The plist's DRAIN_DAEMON_WE_CLONE is the DATA clone lane-1, which carries no overlays. Register overlays on the CODE clone code; see scripts/settings/operator-task.json edgeClones.drain and scripts/lib/daemon-clone-registry.mjs."
     }
   },
+  "daemonAliases": {
+    "reconcile-fix-dispatch": "fix",
+    "wev-fix-daemon": "fix",
+    "wev-review-daemon": "review",
+    "wev-health-watch": "health-watch"
+  },
   "launchAgentsDir": "~/Library/LaunchAgents",
   "workspaceRoot": "~/workspace",
   "adoption": {

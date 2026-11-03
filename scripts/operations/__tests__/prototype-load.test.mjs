@@ -12,7 +12,7 @@ import { createRequire } from 'node:module';
 import { runInNewContext } from 'node:vm';
 import { withBareOrigin } from './helpers/real-repo.mjs';
 import { createPrototypeLoader, defaultDeps } from '../prototype-load-io.mjs';
-import { changedPaths, comparePaths, nextMergeRef, prototypeLoadOperation, PROTOTYPE_LOAD_EFFECT } from '../prototype-load.mjs';
+import { resolveDaemonKey, changedPaths, comparePaths, nextMergeRef, prototypeLoadOperation, PROTOTYPE_LOAD_EFFECT } from '../prototype-load.mjs';
 import * as prototypeLoad from '../prototype-load.mjs';
 import { QUESTION_HASH, main as auditMain } from '../codex-audit.mjs';
 import { resolveOperation } from '../run.mjs';
@@ -1978,5 +1978,31 @@ describe('prototype-load', () => {
     expect(run.verdict).toMatchObject({ ok: false, adopted: true, stopReason: 'swap-remove-failed', detail: 'mutable-registration', removed: [], removedTips: {} });
     expect(mutations(f, 'remove')).toEqual([]);
     expect(f.registrations.has('lane/old')).toBe(true);
+  });
+});
+
+describe('prototype-load daemon key resolution (R502 item 1)', () => {
+  const daemons = { review: { label: 'com.we.review-daemon' }, fix: { label: 'com.we.fix-dispatch-daemon' }, verify: { label: 'com.we.verify-daemon' }, control: { label: 'com.we.control', clone: 'wev-control' }, drain: { label: 'com.plateau.drain-daemon', clone: '.lanes/we-drain-daemon/code' } };
+  const aliases = { 'reconcile-fix-dispatch': 'fix', 'wev-review-daemon': 'review' };
+  it.each([
+    ['review', 'review'], ['verify-daemon', 'verify'], ['com.we.verify-daemon', 'verify'], ['fix-dispatch-daemon', 'fix'],
+    ['reconcile-fix-dispatch', 'fix'], ['wev-review-daemon', 'review'], ['wev-control', 'control'],
+  ])('maps %s to %s', (name, key) => { expect(resolveDaemonKey(daemons, aliases, name)).toEqual({ key }); });
+  it('refuses unknown names and lists every valid key', () => {
+    const r = resolveDaemonKey(daemons, aliases, 'nope');
+    expect(r.key).toBeUndefined(); expect(r.reason).toBe('unknown'); expect(r.valid).toEqual(['review', 'fix', 'verify', 'control', 'drain']);
+  });
+  it('refuses an ambiguous alias instead of guessing', () => {
+    const r = resolveDaemonKey({ a: { label: 'com.we.x-daemon' }, b: { label: 'com.we.y', clone: 'x-daemon' } }, {}, 'x-daemon');
+    expect(r).toMatchObject({ reason: 'ambiguous', candidates: ['a', 'b'] });
+  });
+  it('an exact key always wins over an alias of another daemon', () => {
+    expect(resolveDaemonKey({ fix: { label: 'l1' }, review: { label: 'l2' } }, { fix: 'review' }, 'fix')).toEqual({ key: 'fix' });
+  });
+  it('run() loads onto the canonical daemon for an alias and lists keys on a real unknown', async () => {
+    const f = fixture({ settings: { daemonAliases: { 'wev-review-daemon': 'review' } } });
+    expect((await f.run({ daemon: 'wev-review-daemon' })).daemon).toBe('review');
+    const g = fixture(); const r = await g.run({ daemon: 'nope' });
+    expect(r.stopReason).toBe('unknown-daemon'); expect(r.validDaemons).toEqual(['control', 'review', 'drain']); expect(JSON.stringify(r)).toContain('control, review, drain');
   });
 });
