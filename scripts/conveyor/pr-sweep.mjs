@@ -21,7 +21,7 @@ import { buildBlockedMap, sortUnblockersFirst } from './pr-blocked-by.mjs';
 import { createOpenPrCommentReader } from './pr-comments-complete.mjs';
 import { sanitizeForFeed } from '../operations/needs-you-feed.mjs';
 import { runStallSweep } from './pr-stall-sweep.mjs';
-import { publishStalledDigest } from './pr-stall-digest.mjs';
+import { publishStalledDigest, readDiffEvidenceIncomplete } from './pr-stall-digest.mjs';
 import { runDetector } from './pr-stall-detector.mjs';
 import { expandRepeatedLines } from '../lib/log-timestamp.mjs';
 const SELF = fileURLToPath(import.meta.url);
@@ -176,9 +176,11 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
   // This is independent of producer enablement: the digest also carries detector items.
   const listingEvidenceIncomplete = prs.some(p => {
     const labels = labelNames(p);
-    return p.diffEvidence === 'diff-unknown' || !labels
+    return !labels
       || labels.some(label => typeof label !== 'string' || !label.trim());
   });
+  const unknownDiffs = prs.filter(p => p.diffEvidence === 'diff-unknown')
+    .map(p => ({ repo: p.repo, pr: p.number, head: p.headRefOid.toLowerCase() }));
   const queue = await safe('operator queue', async () => readQueue ? readQueue() : JSON.parse(await command(process.execPath, [join(ROOT, 'scripts/operations/operator-queue.mjs'), '--json'], env)), null);
   const queueOk = queue && !queue.incomplete && !(queue.errors?.length) && Array.isArray(queue.ready) && Array.isArray(queue.rulingNeeded)
     && [...queue.ready, ...queue.rulingNeeded].every((p) => p && repoKeyForSlug(p.repo) !== null && Number.isInteger(Number(p.number)) && Number(p.number) > 0);
@@ -303,8 +305,10 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
       }), ...invariantItems.filter(i => !findings.some(p => p.lane === 'operator' && samePrHead(p, i)))];
       // A skipped (not-due) sweep has no items, so publishing would clear its open ones: wait for a pass that ran.
       if (out.dir && (out.items || out.mode === 'off' || out.digest === false)) {
-        const d = stallDigest({ ...out, items: sortUnblockersFirst(published),
-          incomplete: out.incomplete || !prsReadOk || listingEvidenceIncomplete || (sweepDigestEnabled && !ownerReadsOk) || detectorErrors.length > 0 },
+        const diffEvidenceMissing = await safe('persisted diff evidence',
+          () => readDiffEvidenceIncomplete(out.dir, unknownDiffs), true);
+        const d = stallDigest({ ...out, unknownDiffs, items: sortUnblockersFirst(published),
+          incomplete: out.incomplete || !prsReadOk || listingEvidenceIncomplete || diffEvidenceMissing || (sweepDigestEnabled && !ownerReadsOk) || detectorErrors.length > 0 },
         { now, env, stateDir: out.dir, notify, alertBackoffMinutes: value.alertBackoffMinutes,
           enabled: sweepDigestEnabled || invariantItems.length > 0 || detector.items.length > 0 || detector.enabled });
         report.stallSweep.digest = { published: d.lines?.length ?? 0, alerted: d.fresh?.length ?? 0, notified: !!d.notified };

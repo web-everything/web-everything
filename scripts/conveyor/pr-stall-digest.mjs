@@ -105,6 +105,24 @@ const feedKey = (f) => `${f.repo}#${f.pr}@${f.head}:${STALLED_KIND}`;
 /** `repo#pr@head:state` -> the feed key of that head's `stalled` item (the state may itself contain `:`). */
 const feedKeyOfId = (x) => { const at = x.lastIndexOf('@'); return `${x.slice(0, at)}@${x.slice(at + 1).split(':')[0]}:${STALLED_KIND}`; };
 
+// Unknown diff counts matter only to a persisted empty-diff finding for this exact head.
+// Support both current identities and older sidecars carrying only published state ids.
+function diffEvidenceIncomplete(saved, unknownDiffs) {
+  return unknownDiffs.some(item => {
+    const key = feedKey(item), identity = saved.current?.[key];
+    if (identity !== undefined) {
+      if (typeof identity !== 'string') throw new Error('unreadable persisted stall identity');
+      return identity === 'empty-diff' || (identity.startsWith('[') && JSON.parse(identity)[0] === 'empty-diff');
+    }
+    return (saved.published ?? []).includes(`${item.repo}#${item.pr}@${item.head}:empty-diff`);
+  });
+}
+/** Sweep preflight; the publisher rechecks under the feed lock before changing persisted items. */
+export function readDiffEvidenceIncomplete(stateDir, unknownDiffs = []) {
+  if (!unknownDiffs.length) return false;
+  return diffEvidenceIncomplete(readJson(join(stateDir, 'digest-state.json'), {}), unknownDiffs);
+}
+
 // Keep legacy state strings (and their persisted repeat fingerprints) unchanged.
 // Deadline timestamps may move each tick; only crossing the deadline changes identity.
 function updateIdentity(f, now) {
@@ -154,14 +172,17 @@ function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, al
       // Already published for this PR head under another kind (operator-queue's item): not published twice.
       // Only operator-queue's report kinds count: an event-only key (review-no-verdict, disk-space) asks something else.
       const other = prev.openKeys.filter((k) => REPORT_KINDS.has(k.slice(k.lastIndexOf(':') + 1)));
-      const mineNow = items.filter((f) => !other.some((k) => k.startsWith(`${f.repo}#${f.pr}@${f.head}:`)));
+      const incomplete = !!pass.incomplete || diffEvidenceIncomplete(saved, pass.unknownDiffs ?? []);
       // The FEED shows each open head's current state and invariant/dependency identity. A change drops the
       // old key so the diff re-publishes the head with the current reason and command. The ALERT identity is
       // repo#pr@head:state. Legacy consumers alert once (A -> B -> A alerts A once); configured sweeps repeat with backoff and reset on movement.
       const shown = Object.fromEntries(Object.entries(saved.current ?? {}).filter(([k]) => prev.openKeys.includes(k)));
+      // An incomplete pass may add new heads, but cannot replace an existing head's evidence.
+      const mineNow = items.filter(f => !other.some(k => k.startsWith(`${f.repo}#${f.pr}@${f.head}:`))
+        && !(incomplete && prev.openKeys.includes(feedKey(f)) && shown[feedKey(f)] !== updateIdentity(f, now)));
       const alerted = new Set((saved.published ?? []).filter((x) => prev.openKeys.includes(feedKeyOfId(x))));
       const changed = new Set(mineNow.filter((f) => prev.openKeys.includes(feedKey(f)) && shown[feedKey(f)] !== updateIdentity(f, now)).map(feedKey));
-      const r = diffFeed(prev.openKeys.filter((k) => !changed.has(k)), mineNow, now, { incomplete: !!pass.incomplete, clearKinds: new Set([STALLED_KIND]) });
+      const r = diffFeed(prev.openKeys.filter((k) => !changed.has(k)), mineNow, now, { incomplete, clearKinds: new Set([STALLED_KIND]) });
       const open = new Set(r.openKeys);
       const written = mineNow.filter((f) => r.lines.some((l) => l.startsWith(`NEEDS-YOU ${f.repo}#${f.pr} ${STALLED_KIND}:`)));
       const newly = written.filter((f) => !alerted.has(id(f)));

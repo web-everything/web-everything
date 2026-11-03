@@ -675,7 +675,7 @@ it.each([
   const ctx = setup(), { notify } = sent();
   const base = { number: 5759, title: 'detector evidence', headRefOid: H, labels: [],
     changedFiles: 1, updatedAt: new Date(NOW).toISOString() };
-  const finding = op(base.number, 'stalled-same-head', { action: 'stalled-detector' });
+  const finding = op(base.number, Object.hasOwn(patch, 'changedFiles') ? 'empty-diff' : 'stalled-same-head', { action: 'stalled-detector' });
   let previous = {}, rows = [base], detectorItems = [finding];
   const passes = [];
   const tick = async minutes => {
@@ -710,4 +710,103 @@ it.each([
   expect(passes[2]).toMatchObject({ enabled: true, pass: { ...producer, incomplete: false, items: [] } });
   expect(unacknowledged({ path: ctx.feedPath })).toEqual([]);
   expect(replay({ path: ctx.feedPath }).filter(e => e.kind === 'cleared')).toHaveLength(1);
+});
+
+
+it('incomplete passes retain same-head findings and their saved identity while admitting new heads', () => {
+  const ctx = setup(), { notify } = sent();
+  const original = op(6254, 'empty-diff', { violation: 'empty-diff', nextAction: 'close into card' });
+  run(ctx, [original], { notify });
+  const before = unacknowledged({ path: ctx.feedPath });
+  const saved = JSON.parse(readFileSync(join(ctx.stateDir, 'digest-state.json'), 'utf8'));
+  const replacement = op(6254, 'owner-stale', { violation: 'owner-stale', nextAction: 'inspect unreadable labels' });
+  const result = run(ctx, [replacement, op(6255)], { notify, pass: { incomplete: true }, now: NOW + 60000 });
+  expect(result.errors).toEqual([]);
+  expect(unacknowledged({ path: ctx.feedPath }).find(e => e.pr === 6254)).toEqual(before[0]);
+  expect(unacknowledged({ path: ctx.feedPath }).some(e => e.pr === 6255)).toBe(true);
+  expect(replay({ path: ctx.feedPath }).filter(e => e.pr === 6254)).toEqual(before);
+  expect(JSON.parse(readFileSync(join(ctx.stateDir, 'digest-state.json'), 'utf8')).current)
+    .toMatchObject(saved.current);
+  expect(result.fresh.map(e => e.pr)).toEqual([6255]);
+});
+
+it.each(['no prior item', 'other head', 'other repo'])('legacy missing diff count stays complete with %s', async scenario => {
+  const { runPrSweep } = await import('../pr-sweep.mjs');
+  const ctx = setup(), { notify } = sent();
+  if (scenario !== 'no prior item') run(ctx, [op(6254, 'empty-diff', {
+    head: scenario === 'other head' ? 'b'.repeat(40) : H,
+    repo: scenario === 'other repo' ? 'plateauapp/plateau-app' : REPO,
+  })], { notify });
+  let pass;
+  const report = await runPrSweep({ now: NOW, env: {}, config: {},
+    settings: { value: { repos: [REPO], idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90 }, sources: {} },
+    readPrs: () => [{ number: 6254, title: 'legacy', headRefOid: H, labels: ['review:accepted'], updatedAt: new Date(NOW).toISOString() }],
+    readPrevious: () => ({}), readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: () => ({}),
+    detector: async () => ({ enabled: true, items: [], errors: [], nextSeen: {} }),
+    notify, flush: () => {}, persist: () => {}, append: () => {},
+    stallSweep: () => ({ mode: 'off', dir: ctx.stateDir, items: [], incomplete: false }),
+    stallDigest: (input, options) => { pass = input; return publishStalledDigest(input, { ...options, feedPath: ctx.feedPath }); } });
+  expect(report.errors).toEqual([]);
+  expect(pass.incomplete).toBe(false);
+  expect(unacknowledged({ path: ctx.feedPath })).toEqual([]);
+});
+
+it('unknown diff and null labels cannot overwrite a persisted same-head empty-diff finding', async () => {
+  const { runPrSweep } = await import('../pr-sweep.mjs');
+  const ctx = setup(), { notify } = sent();
+  const seeded = run(ctx, [op(6254, 'empty-diff', { violation: 'empty-diff', nextAction: 'close into card' })], { notify });
+  expect(seeded.errors).toEqual([]);
+  const before = unacknowledged({ path: ctx.feedPath });
+  await runPrSweep({ now: NOW, env: {}, config: {},
+    settings: { value: { repos: [REPO], idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90 }, sources: {} },
+    readPrs: () => [{ number: 6254, title: 'unknown diff', headRefOid: H, labels: null, changedFiles: null, updatedAt: new Date(NOW).toISOString() }],
+    readPrevious: () => ({}), readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: () => ({}),
+    detector: async () => ({ enabled: true, items: [], errors: [], nextSeen: {} }),
+    notify, flush: () => {}, persist: () => {}, append: () => {},
+    stallSweep: () => ({ mode: 'shadow', dir: ctx.stateDir, items: [], incomplete: false }),
+    stallDigest: (pass, options) => publishStalledDigest(pass, { ...options, feedPath: ctx.feedPath }) });
+  expect(unacknowledged({ path: ctx.feedPath })).toEqual(before);
+  expect(replay({ path: ctx.feedPath })).toEqual(before);
+});
+
+
+it.each(['current', 'legacy'])('publisher rechecks %s persisted empty-diff proof under the feed lock', shape => {
+  const ctx = setup(), { notify } = sent();
+  run(ctx, [op(6254, 'empty-diff', { violation: 'empty-diff', nextAction: 'close into card' })], { notify });
+  const before = unacknowledged({ path: ctx.feedPath });
+  if (shape === 'legacy') {
+    const path = join(ctx.stateDir, 'digest-state.json');
+    const saved = JSON.parse(readFileSync(path, 'utf8'));
+    delete saved.current;
+    writeFileSync(path, JSON.stringify(saved));
+  }
+  const result = run(ctx, [], { notify, pass: { incomplete: false, unknownDiffs: [{ repo: REPO, pr: 6254, head: H }] } });
+  expect(result.errors).toEqual([]);
+  expect(result.lines).toEqual([]);
+  expect(unacknowledged({ path: ctx.feedPath })).toEqual(before);
+  expect(replay({ path: ctx.feedPath }).filter(e => e.kind === 'cleared')).toEqual([]);
+});
+
+it('unreadable persisted diff identity fails closed with an operator-visible error and preserves the feed', async () => {
+  const { runPrSweep } = await import('../pr-sweep.mjs');
+  const ctx = setup(), { notify } = sent();
+  run(ctx, [op(6254, 'empty-diff')], { notify });
+  const before = unacknowledged({ path: ctx.feedPath });
+  const path = join(ctx.stateDir, 'digest-state.json');
+  const saved = JSON.parse(readFileSync(path, 'utf8'));
+  saved.current[`${REPO}#6254@${H}:stalled`] = '[invalid identity';
+  writeFileSync(path, JSON.stringify(saved));
+  let pass;
+  const report = await runPrSweep({ now: NOW, env: {}, config: {},
+    settings: { value: { repos: [REPO], idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90 }, sources: {} },
+    readPrs: () => [{ number: 6254, title: 'unknown diff', headRefOid: H, labels: ['review:accepted'], changedFiles: null, updatedAt: new Date(NOW).toISOString() }],
+    readPrevious: () => ({}), readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: () => ({}),
+    detector: async () => ({ enabled: true, items: [], errors: [], nextSeen: {} }),
+    notify, flush: () => {}, persist: () => {}, append: () => {},
+    stallSweep: () => ({ mode: 'shadow', dir: ctx.stateDir, items: [], incomplete: false }),
+    stallDigest: (input, options) => { pass = input; return publishStalledDigest(input, { ...options, feedPath: ctx.feedPath }); } });
+  expect(report.errors.join(' ')).toContain('persisted diff evidence:');
+  expect(pass.incomplete).toBe(true);
+  expect(unacknowledged({ path: ctx.feedPath })).toEqual(before);
+  expect(replay({ path: ctx.feedPath }).filter(e => e.kind === 'cleared')).toEqual([]);
 });

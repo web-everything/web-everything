@@ -3956,7 +3956,9 @@ pin unknown evidence, valid nonzero counts, zero, and unaffected sibling decisio
 
 ## PR sweep incomplete listing evidence preserves feed findings
 
-Unknown diff evidence also marks the shared stall digest incomplete. A same-head
+Unknown diff evidence marks the shared stall digest incomplete only when the
+persisted digest contains an empty-diff finding for that repo/PR/head. Legacy
+listings without that finding retain their previous completeness behavior. A same-head
 empty-diff finding stays open across missing/invalid `changedFiles`; a subsequent
 known positive integer count permits clearing it on a complete pass. Unknown or
 malformed labels likewise mark the digest incomplete without dropping the PR.
@@ -3966,3 +3968,13 @@ also protects detector items when the invariant producer is disabled.
 `pr-stall-digest.test.mjs` exercises real publication and persisted feed replay
 through empty diff, incomplete evidence and same-head positive-count recovery,
 asserting no cleared event until the recovery pass.
+
+
+Incomplete stall passes retain the existing same-head feed identity and evidence;
+they may add findings on new heads, but cannot overwrite an existing item by
+removing its key before `diffFeed`. The publisher rechecks unknown-diff subjects
+against persisted empty-diff identities while holding the feed lock. Sweep preflight
+uses the same check; unreadable persisted identity evidence raises an operator-visible
+error and conservatively marks the pass incomplete. `pr-stall-digest.test.mjs`
+covers unknown diff plus null labels, other-repo/head isolation, legacy listings,
+and same-head replacement attempts alongside new-head publication.
