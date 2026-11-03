@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-/** Durable, deterministic nightly extraction. No agent session or judgment is launched. */
-import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, realpathSync } from 'node:fs';
+/** Durable nightly extraction, followed by bounded coverage judgment and NEW-only filing. */
+import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, realpathSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
@@ -16,11 +16,16 @@ import { handoffHome } from '../operations/handoff-home.mjs';
 import { feedPath, appendLines, sanitizeForFeed } from '../operations/needs-you-feed.mjs';
 import { scrubText } from './health-watch-core.mjs';
 import { prSweepTickAllowed } from './pr-sweep-job.mjs';
+import { runCoronerJudge, rankFrictions } from '../operations/coroner-judge.mjs';
+import { codexJudgeSpawn } from '../lib/codex-judge-spawn.mjs';
+import { runGhSync } from '../lib/gh-throttle.mjs';
+import { fenceUntrusted } from '../lib/mandate-fence.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(SELF), '../..');
 const clocks = new Map();
-export const NIGHTLY_DEFAULTS = Object.freeze({ enabled: true, at: '22:17', laneWaitMs: 600000, attempts: 3, retryBackoffMin: 10, deadlineEt: '03:30', alertAfterProbeFailures: 3, runTimeoutMin: 30 });
+// Judge defaults: enabled, five ranked causes, at most three NEW cards per night; stable-key dedup across nights.
+export const NIGHTLY_DEFAULTS = Object.freeze({ enabled: true, at: '22:17', laneWaitMs: 600000, attempts: 3, retryBackoffMin: 10, deadlineEt: '03:30', alertAfterProbeFailures: 3, runTimeoutMin: 30, judge: Object.freeze({ enabled: true, maxCards: 3 }) });
 const positiveInt = (v) => Number.isSafeInteger(v) && v > 0;
 const validTime = (v) => typeof v === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(v);
 export function resolveNightlyCoronerSettings({ config = {}, env = process.env, read = readFileSync, log = console.error } = {}) {
@@ -36,8 +41,23 @@ export function resolveNightlyCoronerSettings({ config = {}, env = process.env, 
     standard: NIGHTLY_DEFAULTS, platform: platform.prefs.coroner?.nightly ?? {}, envValues,
     valid: { enabled: (v) => typeof v === 'boolean', at: validTime, laneWaitMs: positiveInt, attempts: positiveInt, retryBackoffMin: positiveInt, deadlineEt: validTime, alertAfterProbeFailures: positiveInt, runTimeoutMin: positiveInt }, env,
   });
+  const judgeEnv = {};
+  if (env.WE_CORONER_NIGHTLY_JUDGE_ENABLED !== undefined) {
+    const v = env.WE_CORONER_NIGHTLY_JUDGE_ENABLED;
+    judgeEnv.enabled = ['1', 'true'].includes(v) ? true : ['0', 'false'].includes(v) ? false : v;
+  }
+  if (env.WE_CORONER_NIGHTLY_JUDGE_MAX_CARDS !== undefined) judgeEnv.maxCards = Number(env.WE_CORONER_NIGHTLY_JUDGE_MAX_CARDS);
+  const judge = cascadePolicy('coroner.nightly.judge', { ...tool.judge, ...config.coroner?.nightly?.judge }, {
+    standard: NIGHTLY_DEFAULTS.judge, platform: platform.prefs.coroner?.nightly?.judge ?? {}, envValues: judgeEnv,
+    valid: { enabled: (v) => typeof v === 'boolean', maxCards: positiveInt }, env,
+  });
+  out.value.judge = judge.value;
+  for (const key of Object.keys(out.sources)) if (key === 'judge' || key.startsWith('judge.')) delete out.sources[key];
+  for (const [key, value] of Object.entries(judge.sources)) out.sources[`judge.${key}`] = value;
+  for (const key of Object.keys(out.leafValues)) if (key === 'judge' || key.startsWith('judge.')) delete out.leafValues[key];
+  for (const [key, value] of Object.entries(judge.leafValues)) out.leafValues[`judge.${key}`] = value;
   log(formatCascadeSourcesLine('coroner.nightly', out));
-  return { ...out, errors: [...errors, ...platform.errors, ...out.invalid] };
+  return { ...out, errors: [...errors, ...platform.errors, ...out.invalid, ...judge.invalid] };
 }
 export const nightlyCoronerTickAllowed = prSweepTickAllowed;
 
@@ -205,6 +225,29 @@ const sweepCoronerLeases = (root, sourceRoot, session, run = command) => run([jo
 
 /** The exact argv both extractor CLIs receive; each declares --since, --until and --json (contract-tested). */
 export const coronerExtractorArgs = (since, until) => ['--since', since, '--until', until, '--json'];
+
+/** Production evidence is read only when the default judge port is invoked. Injected judges own their IO.
+ * No partial coverage: missing files, saturated PR bound or oversized evidence defer to manual /coroner.
+ */
+function readJudgeCoverage(sourceRoot, home) {
+  const boundedRead = (path, cap) => {
+    if (statSync(path).size > cap) throw new Error('coroner coverage exceeds byte bound; run manual /coroner');
+    return readFileSync(path, 'utf8');
+  };
+  const held = boundedRead(join(home, 'cards-to-file.md'), 512 * 1024);
+  const openPrs = JSON.parse(runGhSync(['pr', 'list', '--state', 'open', '--limit', '201', '--json', 'number,title'],
+    { cwd: sourceRoot, encoding: 'utf8', timeout: 60000, maxBuffer: 1024 * 1024 }));
+  if (!Array.isArray(openPrs) || openPrs.length > 200 || openPrs.some((p) => !Number.isSafeInteger(p.number) || typeof p.title !== 'string')) {
+    throw new Error('coroner PR coverage incomplete or exceeds 200; run manual /coroner');
+  }
+  const backlog = join(sourceRoot, 'backlog');
+  const names = readdirSync(backlog).filter((name) => name.endsWith('.md'));
+  if (names.length > 20000) throw new Error('coroner backlog exceeds 20000 entries; run manual /coroner');
+  const recentCards = names.map((name) => ({ name, at: statSync(join(backlog, name)).mtimeMs }))
+    .sort((a, b) => b.at - a.at || a.name.localeCompare(b.name)).slice(0, 80)
+    .map(({ name }) => ({ id: name, content: boundedRead(join(backlog, name), 32 * 1024) }));
+  return { held, openPrs, recentCards };
+}
 /** `signal` aborts the acquire and extractor subprocesses (a stop); the lane release is never given it. */
 export async function extractNightlyCoroner({ night, until, dir, settings, nightly = NIGHTLY_DEFAULTS, sourceRoot = ROOT, laneSession = CORONER_LANE_SESSION }, {
   root = ROOT, home = handoffHome(), statusFeed = feedPath(), run = command, signal,
@@ -212,6 +255,20 @@ export async function extractNightlyCoroner({ night, until, dir, settings, night
   release = async (lane) => run([join(root, 'scripts/lane-pool.mjs'), 'release', `--lane=${lane.lane}`, `--session=${lane.holder}`, `--repo=${sourceRoot}`], sourceRoot,
     signal?.aborted ? { timeout: RELEASE_TIMEOUT_MS } : {}),
   sweep = async () => sweepCoronerLeases(root, sourceRoot, laneSession, run),
+  judge = async (request) => {
+    signal?.throwIfAborted();
+    const coverage = readJudgeCoverage(sourceRoot, home);
+    signal?.throwIfAborted();
+    // codexJudgeSpawn supplies the schema and read-only sandbox; the mandate prohibits tool use.
+    return codexJudgeSpawn({ ...request, input: `${request.input}\n${fenceUntrusted('material', JSON.stringify(coverage))}`,
+      timeoutMs: 5 * 60000 });
+  },
+  fileItem = async (input) => {
+    const output = JSON.parse(await run([join(root, 'scripts/operations/run.mjs'), 'file-item',
+      ...Object.entries(input).map(([key, value]) => `--${key}=${value}`), '--json'], sourceRoot, { signal, timeout: 60000 }));
+    if (output.stopped !== 'complete' || output.error) throw new Error('file-item did not complete');
+    return output.verdict;
+  },
 } = {}) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(night)) throw new Error('invalid coroner night');
   const cursorPath = join(dir, 'nightly-coroner-cursor.json');
@@ -256,7 +313,7 @@ export async function extractNightlyCoroner({ night, until, dir, settings, night
       const rate = (value) => value ? `${value.count}/${value.total} (${value.pct}%)` : 'unavailable';
       const fence = '```';
       const report = [`# Nightly coroner — ${night}`, '', `Window: ${since} → ${until}`, '',
-        'Deterministic extraction is ready. Operator judgment is pending; no agent session was launched.', '',
+        'Deterministic extraction is ready. Automated coverage judgment follows publication; manual analysis remains available.', '',
         `Settings: ${JSON.stringify(settings?.value ?? {})}; sources: ${JSON.stringify(settings?.sources ?? {})}`, '',
         '## Summary', '',
         `- Sessions observed: ${metrics.sessions?.count ?? 'unavailable'}`,
@@ -276,7 +333,52 @@ export async function extractNightlyCoroner({ night, until, dir, settings, night
   let feed = '';
   try { feed = readFileSync(statusFeed, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
   if (!feed.split('\n').some((line) => line.startsWith(`${marker} `))) {
-    appendLines(statusFeed, [`${marker} — operator judgment pending ${JSON.stringify({ at: window.until, kind: 'coroner-ready', report: reportName, reason: 'Coroner report ready for judgment' })}`]);
+    appendLines(statusFeed, [`${marker} — ${JSON.stringify({ at: window.until, kind: 'coroner-ready', report: reportName, reason: 'Coroner extraction ready; automated coverage judgment follows when enabled' })}`]);
+  }
+  signal?.throwIfAborted();
+  const judgePath = join(dir, 'nightly-coroner-judge.json');
+  if (nightly.judge?.enabled !== false) {
+    try {
+      const state = readOptionalJson(judgePath) ?? { filed: {}, completed: {} };
+      if (!state || typeof state !== 'object' || Array.isArray(state) ||
+        (state.filed != null && (typeof state.filed !== 'object' || Array.isArray(state.filed))) ||
+        (state.completed != null && (typeof state.completed !== 'object' || Array.isArray(state.completed)))) throw new Error('invalid coroner judge state');
+      state.completed ??= {};
+      state.nights ??= {};
+      if (typeof state.nights !== 'object' || Array.isArray(state.nights) ||
+        (state.nights[night] !== undefined && !Array.isArray(state.nights[night]))) throw new Error('invalid coroner nightly filing state');
+      if (!Object.hasOwn(state.completed, night)) {
+        let report = readFileSync(reportPath, 'utf8');
+        const extraction = report.match(/## Extraction[^\n]*\n\s*```json\n([\s\S]*?)\n```/);
+        if (!extraction) throw new Error('coroner report lacks extraction evidence');
+        const metrics = JSON.parse(extraction[1]);
+        const priorKeys = new Set(Object.keys(state.filed ?? {}));
+        const save = () => {
+          state.nights[night] = [...new Set([...(state.nights[night] ?? []),
+            ...Object.keys(state.filed ?? {}).filter((key) => !priorKeys.has(key))])];
+          atomicWrite(judgePath, `${JSON.stringify(state)}\n`);
+        };
+        const cap = nightly.judge?.maxCards ?? NIGHTLY_DEFAULTS.judge.maxCards;
+        if (!positiveInt(cap)) throw new Error('invalid coroner judge maxCards');
+        const result = rankFrictions(metrics).length ? await runCoronerJudge({ metrics, state, judge, fileItem, signal, save,
+          maxCards: Math.max(0, cap - (state.nights[night]?.length ?? 0)), log: () => {} })
+          : { ranked: [], verdicts: [], filed: [], error: null };
+        signal?.throwIfAborted();
+        if (result.error) throw new Error(result.error);
+        report = report.replace('Deterministic extraction is ready. Operator judgment is pending; no agent session was launched.',
+          'Deterministic extraction is ready. Automated coverage judgment completed; manual analysis remains available.');
+        atomicWrite(reportPath, `${report}\n## Automated coverage judgment\n\n${fenceUntrusted('material', JSON.stringify(result))}\n`);
+        state.completed[night] = { until: window.until, filed: state.nights[night]?.length ?? 0 };
+        save();
+      }
+    } catch (e) {
+      signal?.throwIfAborted();
+      const failureMarker = `NEEDS-YOU nightly-coroner ${reportName} judge-failed`;
+      if (!readFileSync(statusFeed, 'utf8').split('\n').some((line) => line.startsWith(`${failureMarker} `))) {
+        appendLines(statusFeed, [`${failureMarker} — ${JSON.stringify({ at: window.until, kind: 'coroner-judge-failed', report: reportName,
+          error: sanitizeForFeed(scrubText(String(e.message ?? e)), 1000), reason: 'Judgment or filing incomplete; retry or run manual /coroner' })}`]);
+      }
+    }
   }
   return { night, window, report: reportName };
 }
