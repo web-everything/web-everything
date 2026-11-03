@@ -77,6 +77,23 @@ describe('pruneSnapshots', () => {
   });
 });
 
+describe('unknown pins fail closed', () => {
+  it('skips snapshot pruning when a registration file is unreadable', () => {
+    for (const [i, k] of ['aaa', 'bbb', 'ccc', 'ddd'].entries()) snap('verify-daemon', 'code', k, i + 1);
+    writeFileSync(join(state, 'bad.json'), '{'.repeat(2_000_000));
+    const r = pruneSnapshots({ jobsDir: jobs, stateDir: state, keep: 2, processCommands: [], sizeOf, log() {} });
+    expect(r.removed).toEqual([]);
+    expect(existsSync(join(jobs, 'verify-daemon/.snapshots/code/ddd'))).toBe(true);
+  });
+  it('skips a daemon with a malformed job record and refuses a null process list', () => {
+    for (const [i, k] of ['aaa', 'bbb', 'ccc', 'ddd'].entries()) snap('verify-daemon', 'code', k, i + 1);
+    writeFileSync(join(jobs, 'verify-daemon', 'job-x.json'), 'not json');
+    expect(pruneSnapshots({ jobsDir: jobs, stateDir: state, keep: 2, processCommands: [], sizeOf, log() {} }).removed).toEqual([]);
+    rmSync(join(jobs, 'verify-daemon', 'job-x.json'));
+    expect(pruneSnapshots({ jobsDir: jobs, stateDir: state, keep: 2, processCommands: null, sizeOf, log() {} }).removed).toEqual([]);
+  });
+});
+
 describe('pruneRebuildDirs', () => {
   const mk = (name, status, hours, extra) => {
     record(name, 'job-a', status, extra);
@@ -141,6 +158,17 @@ describe('trimIdleLanes', () => {
     expect(removed).not.toContain(4);
     expect(removed).toEqual([3, 2]);
     expect(r.refused.find((x) => x.n === 4).reason).toContain(why);
+  });
+  it('REFUSES a lane that took a lease between the first look and the delete', () => {
+    let calls = 0;
+    const removed = [];
+    trimIdleLanes({ lanes, cap: 3, inspect: (l) => ({ ...idle, lease: l.n === 4 && ++calls > 1 }), sizeOf, removeLane: (l) => removed.push(l.n) });
+    expect(removed).not.toContain(4);
+  });
+  it('stops removing once enough space is free', () => {
+    const removed = [];
+    trimIdleLanes({ lanes, cap: 1, inspect: () => idle, sizeOf, removeLane: (l) => removed.push(l.n), enough: () => removed.length >= 1 });
+    expect(removed).toEqual([4]);
   });
   it('does nothing at or under the cap', () => {
     expect(run({}, 4).removed).toEqual([]);

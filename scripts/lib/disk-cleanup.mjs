@@ -30,20 +30,27 @@ const SNAP_KINDS = [['code', 'code'], ['node-modules', 'node-modules']];
 function safeList(dir) { try { return readdirSync(dir); } catch { return []; } }
 function readJson(file) { try { return JSON.parse(readFileSync(file, 'utf8')); } catch { return null; } }
 
-/** All non-snapshot job records in one daemon-jobs store dir. */
+/** All job records in one daemon-jobs store dir; `bad` counts record files we could not read (pins then unknown). */
 function jobRecords(dir) {
-  return safeList(dir).filter((n) => n.endsWith('.json')).map((n) => readJson(join(dir, n))).filter((r) => r && r.job);
+  const parsed = safeList(dir).filter((n) => n.endsWith('.json')).map((n) => readJson(join(dir, n)));
+  return { records: parsed.filter((r) => r && r.job), bad: parsed.filter((r) => !r || !r.job).length };
 }
 
-/** Text of every small top-level file in the daemon state dir: a live registration names its code sha there. */
+/**
+ * Text of every top-level `*.json` file in the daemon state dir (a live registration names its code sha there).
+ * Returns null when any of them is unreadable or oversized: the pins are then unknown and nothing may be pruned.
+ */
 function registrationText(stateDir) {
   let out = '';
   for (const name of safeList(stateDir)) {
+    if (!name.endsWith('.json')) continue;
     try {
       const p = join(stateDir, name);
       const st = statSync(p);
-      if (st.isFile() && st.size <= MAX_STATE_FILE_BYTES) out += `\n${readFileSync(p, 'utf8')}`;
-    } catch { /* unreadable: skip */ }
+      if (!st.isFile()) continue;
+      if (st.size > MAX_STATE_FILE_BYTES) return null;
+      out += `\n${readFileSync(p, 'utf8')}`;
+    } catch { return null; }
   }
   return out;
 }
@@ -51,11 +58,15 @@ function registrationText(stateDir) {
 /** Step (a). */
 export function pruneSnapshots({ jobsDir, stateDir, keep = DISK_CLEANUP_DEFAULTS.keepSnapshots, dryRun = false, processCommands = [], sizeOf, log = () => {} }) {
   const removed = [];
-  const blob = `${registrationText(stateDir)}\n${processCommands.join('\n')}`;
+  const registrations = registrationText(stateDir);
+  if (registrations === null || !Array.isArray(processCommands)) return { removed, skipped: 'pins unknown (registration state or process list unreadable)' };
+  const blob = `${registrations}\n${processCommands.join('\n')}`;
   for (const daemon of safeList(jobsDir)) {
     const dir = join(jobsDir, daemon);
     if (!existsSync(snapshotsRoot(dir))) continue;
-    const referenced = new Set(jobRecords(dir).filter((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status)).flatMap((r) => r.job.snapshotKeys || []));
+    const { records, bad } = jobRecords(dir);
+    if (bad) continue; // an unreadable job record may pin a snapshot: leave this daemon alone
+    const referenced = new Set(records.filter((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status)).flatMap((r) => r.job.snapshotKeys || []));
     for (const [sub] of SNAP_KINDS) {
       for (const key of safeList(join(snapshotsRoot(dir), sub))) {
         if (blob.includes(key)) referenced.add(`${sub === 'code' ? 'code' : 'node-modules'}:${key}`);
@@ -89,9 +100,11 @@ export function pruneRebuildDirs({ jobsDir, maxAgeHours = DISK_CLEANUP_DEFAULTS.
     const dir = join(jobsDir, name);
     let age;
     try { age = now - newestMtimeMs(dir); } catch { continue; }
-    const records = jobRecords(dir);
+    const { records, bad } = jobRecords(dir);
     let why = null;
-    if (age < maxAgeHours * 3_600_000) why = `newer than ${maxAgeHours}h`;
+    if (!Array.isArray(processCommands)) why = 'process list unknown';
+    else if (bad) why = 'unreadable job record';
+    else if (age < maxAgeHours * 3_600_000) why = `newer than ${maxAgeHours}h`;
     else if (records.some((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status))) why = 'has a non-terminal job';
     else if (records.some((r) => Number.isInteger(r.job.pid) && isPidAlive(r.job.pid))) why = 'a recorded job pid is alive';
     else if (processCommands.some((c) => c.includes(dir))) why = 'a running process uses it';
@@ -105,14 +118,19 @@ export function pruneRebuildDirs({ jobsDir, maxAgeHours = DISK_CLEANUP_DEFAULTS.
 }
 
 /** Step (c): remove idle lanes above `cap`, highest-numbered first, one at a time via `removeLane` (lane-pool's own path). */
-export function trimIdleLanes({ lanes, cap = DISK_CLEANUP_DEFAULTS.laneCap, dryRun = false, inspect, sizeOf, removeLane, log = () => {} }) {
+export function trimIdleLanes({ lanes, cap = DISK_CLEANUP_DEFAULTS.laneCap, dryRun = false, inspect, sizeOf, removeLane, enough = () => false, log = () => {} }) {
   const removed = []; const refused = [];
   let excess = lanes.length - cap;
   for (const lane of [...lanes].sort((a, b) => b.n - a.n)) {
-    if (excess <= 0) break;
+    if (excess <= 0 || (!dryRun && enough())) break;
     const s = inspect(lane);
     const blockers = ['lease', 'cwdInUse', 'unpushed', 'stash', 'dirty'].filter((k) => s[k]);
     if (blockers.length) { refused.push({ n: lane.n, path: lane.dir, reason: `not idle: ${blockers.join(', ')}` }); continue; }
+    if (!dryRun) { // re-check right before the delete: a lease may have been taken since the first look
+      const again = inspect(lane);
+      const nowBusy = ['lease', 'cwdInUse', 'unpushed', 'stash', 'dirty'].filter((k) => again[k]);
+      if (nowBusy.length) { refused.push({ n: lane.n, path: lane.dir, reason: `not idle on recheck: ${nowBusy.join(', ')}` }); continue; }
+    }
     const entry = { action: 'lane', n: lane.n, path: lane.dir, bytes: sizeOf(lane.dir), dryRun, reason: `idle lane above cap ${cap}` };
     removed.push(entry);
     log(entry);
@@ -133,12 +151,13 @@ export function runDiskCleanup({ freeGb, minGb, settings = DISK_CLEANUP_DEFAULTS
   if (!force && !(before < minGb)) return summary;
   summary.ran = true;
   const a = steps.has('a') ? pruneSnapshots({ jobsDir, stateDir, keep: settings.keepSnapshots, dryRun, processCommands, sizeOf, log }) : { removed: [] };
-  const b = steps.has('b') ? pruneRebuildDirs({ jobsDir, maxAgeHours: settings.rebuildMaxAgeHours, dryRun, now, processCommands, isPidAlive, sizeOf, log }) : { removed: [], refused: [] };
+  const b = steps.has('b') && (force || dryRun || freeGb() < minGb) ? pruneRebuildDirs({ jobsDir, maxAgeHours: settings.rebuildMaxAgeHours, dryRun, now, processCommands, isPidAlive, sizeOf, log }) : { removed: [], refused: [] };
   summary.removed.push(...a.removed, ...b.removed);
   summary.refused.push(...b.refused);
+  if (a.skipped) summary.refused.push({ path: jobsDir, reason: a.skipped });
   summary.afterGb = freeGb();
   if (steps.has('c') && summary.afterGb < minGb) {
-    const c = trimIdleLanes({ lanes, cap: settings.laneCap, dryRun, inspect: inspectLane, sizeOf, removeLane, log });
+    const c = trimIdleLanes({ lanes, cap: settings.laneCap, dryRun, inspect: inspectLane, sizeOf, removeLane, enough: () => freeGb() >= minGb, log });
     summary.removed.push(...c.removed);
     summary.refused.push(...c.refused);
     summary.afterGb = freeGb();

@@ -32,11 +32,12 @@ const num = (v, d) => (v !== undefined && v !== true && Number.isFinite(Number(v
 const sh = (cmd, args, opts = {}) => execFileSync(cmd, args, { encoding: 'utf8', timeout: 120_000, stdio: ['ignore', 'pipe', 'ignore'], ...opts });
 const sizeOf = (p) => { try { return Number(sh('du', ['-sk', p]).split('\t')[0]) * 1024; } catch { return 0; } };
 const isPidAlive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
-const processCommands = () => { try { return sh('ps', ['-axo', 'command=']).split('\n'); } catch { return []; } };
+// null = unknown: the library then refuses every delete that depends on it.
+const processCommands = () => { try { return sh('ps', ['-axo', 'command=']).split('\n'); } catch { return null; } };
 const freeGb = () => { const s = statfsSync(homedir()); return Number(s.bavail) * Number(s.bsize) / 1024 ** 3; };
 
 function liveCwds() {
-  try { return sh('lsof', ['-a', '-d', 'cwd', '-Fn']).split('\n').filter((l) => l.startsWith('n')).map((l) => l.slice(1)); } catch { return []; }
+  try { return sh('lsof', ['-a', '-d', 'cwd', '-Fn']).split('\n').filter((l) => l.startsWith('n')).map((l) => l.slice(1)); } catch { return null; }
 }
 function git(dir, args) { try { return sh('git', ['-C', dir, ...args]); } catch { return null; }
 }
@@ -45,13 +46,15 @@ function makeInspect() {
   const cwds = liveCwds();
   return (lane) => {
     const dir = lane.dir;
+    // Refresh remote-tracking refs first so a stale ref can never prove a commit is pushed; a failed fetch = not idle.
+    const fetched = git(dir, ['fetch', '--prune', '--quiet', 'origin']) !== null;
     const unpushedOut = git(dir, ['rev-list', '--count', 'HEAD', '--not', '--remotes']);
     const porcelain = git(dir, ['status', '--porcelain']);
     const stashOut = git(dir, ['stash', 'list']);
     return {
       lease: existsSync(join(dir, '.git', LEASE_FILENAME)),
-      cwdInUse: cwds.some((c) => c === dir || c.startsWith(`${dir}/`)),
-      unpushed: unpushedOut === null || Number(unpushedOut.trim()) > 0,
+      cwdInUse: cwds === null || cwds.some((c) => c === dir || c.startsWith(`${dir}/`)),
+      unpushed: !fetched || unpushedOut === null || Number(unpushedOut.trim()) > 0,
       stash: stashOut === null || stashOut.trim() !== '',
       dirty: porcelain === null || porcelain.trim() !== '',
     };
