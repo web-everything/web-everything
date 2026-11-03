@@ -498,3 +498,77 @@ describe('stand-down detection (live #5768 shape)', async () => {
     expect(classifyStall({ row, head }).lane).toBe('system');
   });
 });
+
+
+describe('pending red-team watchdog evidence', () => {
+  const pending = (patch = {}) => ({ ageMinutes: 61, status: null, ownerAlive: null,
+    restarts: 0, minutesSinceLastRestart: null, ...patch });
+  const states = ['red-team-pending', 'drain-skip:red-team-pending'];
+  it.each(states)('%s restarts an old head with no live run or result', state => {
+    expect(at(state, { redTeam: pending() })).toMatchObject({ lane: 'system', action: 'restart-red-team', headCap: 2,
+      key: `${REPO}#77@${HEAD.toLowerCase()}:${state}:restart-1` });
+  });
+  it.each(states)('%s retains the daemon fallback when evidence is omitted', state => {
+    expect(at(state)).toMatchObject({ lane: 'system', action: 'ask-review-daemon' });
+  });
+  it.each(states)('%s never acts while a live job is attached', state => {
+    for (const status of [null, { status: 'finished', result: { status: 'ran' } }]) {
+      expect(at(state, { row: { liveJob: 'review-job' }, redTeam: pending({ status }) })).toBeNull();
+    }
+  });
+  it.each(states)('%s publishes a finished head result while the pending label remains', state => {
+    const item = at(state, { redTeam: pending({ restarts: 2, minutesSinceLastRestart: 0,
+      status: { status: 'finished', result: { status: 'ran' } } }) });
+    expect(item).toMatchObject({ lane: 'system', action: 'publish-red-team-result' });
+    expect(item.action).not.toBe('restart-red-team');
+  });
+  it.each(states)('%s waits on young, alive, unknown-young, unreadable, or recently restarted evidence', state => {
+    for (const patch of [
+      { ageMinutes: 59 }, { ageMinutes: NaN }, { status: { unreadable: true } },
+      { ageMinutes: 300, status: { status: 'running' }, ownerAlive: true },
+      { ageMinutes: 119, status: { status: 'queued' }, ownerAlive: null },
+      { restarts: 1, minutesSinceLastRestart: 59 },
+    ]) expect(at(state, { redTeam: pending(patch) })).toBeNull();
+  });
+  it.each(states)('%s gives the spaced second restart a distinct key and its own two-action cap', state => {
+    expect(at(state, { redTeam: pending({ restarts: 1, minutesSinceLastRestart: 60 }) }))
+      .toMatchObject({ lane: 'system', action: 'restart-red-team', headCap: 2,
+        key: `${REPO}#77@${HEAD.toLowerCase()}:${state}:restart-2` });
+  });
+  it.each(states)('%s escalates the two-restart ceiling with restart and age evidence', state => {
+    const item = at(state, { redTeam: pending({ ageMinutes: 181, restarts: 2, minutesSinceLastRestart: 60 }) });
+    expect(item).toMatchObject({ lane: 'operator', action: 'red-team-restart-exhausted', command: expect.any(String) });
+    expect(item.reason).toMatch(/restart/i);
+    expect(item.reason).toMatch(/2/);
+    expect(item.reason).toMatch(/181/);
+  });
+  it.each(['restart-red-team', 'publish-red-team-result'])('%s defaults on and switching it off routes to the operator', action => {
+    expect(CLASSIFY_DEFAULTS.systemActions[action]).toBe(true);
+    const redTeam = pending(action === 'publish-red-team-result' ? { status: { status: 'finished', result: { status: 'ran' } } } : {});
+    const item = at('red-team-pending', { redTeam, settings: { systemActions: { [action]: false } } });
+    expect(item).toMatchObject({ lane: 'operator', action, command: expect.any(String) });
+    expect(item.reason).toContain(`systemActions.${action}`);
+  });
+  it('watchdog outcomes never classify as clear or accept actions', () => {
+    for (const state of states) for (const patch of [{}, { restarts: 2 },
+      { status: { status: 'finished', result: { status: 'ran' } } }, { status: { unreadable: true } }]) {
+      const item = at(state, { redTeam: pending(patch) });
+      if (item) expect(['restart-red-team', 'publish-red-team-result', 'red-team-restart-exhausted']).toContain(item.action);
+    }
+  });
+  it.each(states)('%s restarts a dead owner without waiting 120 minutes', state => {
+    expect(at(state, { redTeam: pending({ status: { status: 'running' }, ownerAlive: false }) }))
+      .toMatchObject({ lane: 'system', action: 'restart-red-team' });
+  });
+  it.each(states)('%s restarts an unknown owner exactly at the stale deadline', state => {
+    expect(at(state, { redTeam: pending({ ageMinutes: 120, status: { status: 'running' } }) }))
+      .toMatchObject({ lane: 'system', action: 'restart-red-team' });
+  });
+  it.each(states)('%s does not publish a finished status with only a legacy result string', state => {
+    expect(at(state, { redTeam: pending({ status: { status: 'finished', result: 'ran' } }) }))
+      .toMatchObject({ lane: 'system', action: 'restart-red-team' });
+  });
+  it.each(['awaiting-review', 'human-review-pending-advisory'])('%s keeps ordinary review routing even with red-team evidence', state => {
+    expect(at(state, { redTeam: pending() })).toMatchObject({ lane: 'system', action: 'ask-review-daemon' });
+  });
+});

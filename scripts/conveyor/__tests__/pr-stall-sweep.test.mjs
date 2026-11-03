@@ -420,3 +420,246 @@ describe('stand-down routing default', () => {
     expect(s.value.stateLanes).toMatchObject({ 'system:fix-stood-down': 'operator' });
   });
 });
+
+
+describe('pending red-team watchdog in the shadow sweep', () => {
+  const prHead = `${REPO}#11@${HEAD}`;
+  const pendingPr = (patch = {}) => ({ ...PRS[0], labels: [{ name: 'red-team:pending' }], ...patch });
+  const owner = { host: 'watchdog-host', pidNamespace: 'watchdog-ns', pid: 12345, pidStart: 'owner-start' };
+  const statusFor = (patch = {}) => ({ repo: REPO, pr: 11, head: HEAD, ...owner, status: 'running', ...patch });
+  const restartRecord = (minutesAgo, patch = {}) => ({ ts: new Date(NOW - minutesAgo * 60_000).toISOString(),
+    phase: 'would-do', lane: 'system', action: 'restart-red-team', prHead,
+    key: `${prHead}:red-team-pending:restart-1`, ...patch });
+  const seed = (dir, records) => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, '2026-10.jsonl'), records.map(r => JSON.stringify(r)).join('\n') + '\n');
+  };
+  const sweep = async ({ prs = [pendingPr()], status = null, alive = false, dir = auditDir(), ...options } = {}) => {
+    const { gh, calls } = fakeGh({ prs });
+    const log = vi.fn();
+    const readRedTeamStatus = vi.fn(() => status);
+    const probe = { host: owner.host, namespace: owner.pidNamespace, isAlive: vi.fn(() => alive),
+      readPidStart: vi.fn(() => owner.pidStart) };
+    const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh, read: reader(gh),
+      dir, log, readRedTeamStatus, probe, ...options,
+      // Advance the assessment clock together with the sweep clock on repeated passes.
+      read: options.read ?? (input => ({ ...reader(gh)(input), now: options.now ?? NOW })) });
+    return { out, dir, calls, log, readRedTeamStatus, probe };
+  };
+
+  it('pending over 60 minutes with no live run or result logs would restart-red-team in shadow', async () => {
+    const { out, dir, calls, log, readRedTeamStatus } = await sweep();
+    expect(out.act).toMatchObject([{ lane: 'system', action: 'restart-red-team', prHead, headCap: 2,
+      key: `${prHead}:red-team-pending:restart-1` }]);
+    expect(readRedTeamStatus).toHaveBeenCalledWith(expect.objectContaining({ repo: REPO, pr: 11, head: HEAD }));
+    expect(log.mock.calls.map(([line]) => line).join('\n'))
+      .toContain(`pr-stall-sweep (shadow) would restart-red-team ${prHead} [system]:`);
+    expect(lines(dir).filter(r => r.phase === 'would-do')).toMatchObject([{ action: 'restart-red-team', mode: 'shadow' }]);
+    expectReadOnly(calls);
+  });
+  it.each(['queued', 'running'])('a live %s owner is probed and never restarted even after 120 minutes', async status => {
+    const { out, probe } = await sweep({ status: statusFor({ status }), alive: true });
+    expect(probe.isAlive).toHaveBeenCalledWith(owner.pid);
+    expect(out.items).toEqual([]);
+    expect(out.act).toEqual([]);
+  });
+  it('an owner on another host waits before the stale deadline and restarts after it', async () => {
+    const ninetyMinutesAgo = new Date(NOW - 90 * 60_000).toISOString();
+    const status = statusFor({ host: 'another-host' });
+    const young = await sweep({ status, prs: [pendingPr({ updatedAt: ninetyMinutesAgo, createdAt: ninetyMinutesAgo })] });
+    expect(young.out.items).toEqual([]);
+    expect(young.out.act).toEqual([]);
+    expect(young.probe.isAlive).not.toHaveBeenCalled();
+    const stale = await sweep({ status });
+    expect(stale.out.act).toMatchObject([{ action: 'restart-red-team' }]);
+    expect(stale.probe.isAlive).not.toHaveBeenCalled();
+  });
+  it('a finished real result with its label still pending is published instead of restarted', async () => {
+    const { out, calls, log } = await sweep({ status: statusFor({ status: 'finished', result: { status: 'ran', findings: [] } }) });
+    expect(out.act).toMatchObject([{ lane: 'system', action: 'publish-red-team-result', prHead }]);
+    expect(log.mock.calls.map(([line]) => line).join('\n')).toContain(`would publish-red-team-result ${prHead}`);
+    expectReadOnly(calls);
+  });
+  it('finished without a ran result restarts rather than publishing', async () => {
+    const { out } = await sweep({ status: statusFor({ status: 'finished', result: { status: 'failed' } }) });
+    expect(out.act).toMatchObject([{ action: 'restart-red-team' }]);
+  });
+  it('a status read error fails closed with no action or daemon fallback', async () => {
+    const readRedTeamStatus = vi.fn(() => { throw new Error('status unreadable'); });
+    const { out, dir } = await sweep({ readRedTeamStatus });
+    expect(readRedTeamStatus).toHaveBeenCalledOnce();
+    expect(out.items).toEqual([]);
+    expect(out.act).toEqual([]);
+    expect(lines(dir).filter(r => r.phase === 'would-do')).toEqual([]);
+  });
+  it('an explicitly unreadable status also waits', async () => {
+    const { out } = await sweep({ status: { unreadable: true } });
+    expect(out.items).toEqual([]);
+    expect(out.act).toEqual([]);
+  });
+  it('a young pending head does nothing', async () => {
+    const young = new Date(NOW - 59 * 60_000).toISOString();
+    const { out } = await sweep({ prs: [pendingPr({ updatedAt: young, createdAt: young })] });
+    expect(out.items).toEqual([]);
+    expect(out.act).toEqual([]);
+  });
+  it('spaces restart attempts using the latest same-head would-do or intent audit record', async () => {
+    for (const phase of ['would-do', 'intent']) {
+      const dir = auditDir();
+      seed(dir, [restartRecord(90, { action: 'ask-review-daemon', key: `${prHead}:daemon` }), restartRecord(30, { phase })]);
+      const { out } = await sweep({ dir });
+      expect(out.items).toEqual([]);
+      expect(out.act).toEqual([]);
+    }
+  });
+  it('allows exactly two spaced restarts then emits an exhausted operator item on the same head', async () => {
+    const dir = auditDir();
+    const first = await sweep({ dir });
+    expect(first.out.act).toMatchObject([{ action: 'restart-red-team', key: `${prHead}:red-team-pending:restart-1` }]);
+    const tooSoon = await sweep({ dir, now: NOW + 59 * 60_000 });
+    expect(tooSoon.out.items).toEqual([]);
+    const second = await sweep({ dir, now: NOW + 60 * 60_000 });
+    expect(second.out.act).toMatchObject([{ action: 'restart-red-team', key: `${prHead}:red-team-pending:restart-2` }]);
+    const exhausted = await sweep({ dir, now: NOW + 120 * 60_000 });
+    expect(exhausted.out.act).toEqual([]);
+    expect(exhausted.out.items).toMatchObject([{ lane: 'operator', action: 'red-team-restart-exhausted' }]);
+    expect(exhausted.out.items[0].reason).toMatch(/2/);
+    expect(exhausted.out.items[0].reason).toMatch(/300/);
+    expect(lines(dir).filter(r => r.phase === 'would-do' && r.action === 'restart-red-team')).toHaveLength(2);
+    expect(lines(dir).filter(r => r.phase === 'operator')).toMatchObject([{ action: 'red-team-restart-exhausted' }]);
+  });
+  it.each(['would-do', 'intent'])('counts two prior %s restarts as exhausted and gives the operator age evidence', async phase => {
+    const dir = auditDir();
+    seed(dir, [restartRecord(150, { phase }), restartRecord(70, { phase, key: `${prHead}:red-team-pending:restart-2` })]);
+    const { out } = await sweep({ dir });
+    expect(out.act).toEqual([]);
+    expect(out.items).toMatchObject([{ lane: 'operator', action: 'red-team-restart-exhausted' }]);
+    expect(out.items[0].reason).toMatch(/2/);
+    expect(out.items[0].reason).toMatch(/180/);
+  });
+  it('ignores other heads, actions and non-spending audit phases when deriving restart count and spacing', async () => {
+    const dir = auditDir();
+    const otherHead = `${REPO}#11@${'b'.repeat(40)}`;
+    seed(dir, [restartRecord(90), restartRecord(5, { prHead: otherHead, key: `${otherHead}:restart-1` }),
+      restartRecord(5, { action: 'ask-review-daemon', key: `${prHead}:daemon` }),
+      restartRecord(5, { phase: 'would-skip', key: 'held' }), restartRecord(5, { phase: 'operator', key: 'operator' })]);
+    const { out } = await sweep({ dir });
+    expect(out.act).toMatchObject([{ action: 'restart-red-team', key: `${prHead}:red-team-pending:restart-2` }]);
+  });
+  it.each(['restart-red-team', 'publish-red-team-result'])('disabling %s yields an operator item in the sweep', async action => {
+    const { out } = await sweep({ settings: shadow({ systemActions: { ...STALL_SWEEP_DEFAULTS.systemActions, [action]: false } }),
+      status: action === 'publish-red-team-result' ? statusFor({ status: 'finished', result: { status: 'ran' } }) : null });
+    expect(out.act).toEqual([]);
+    expect(out.items).toMatchObject([{ lane: 'operator', action }]);
+  });
+  it('mode off reads no red-team evidence, probes no owners, and writes no audit', async () => {
+    const { out, dir, calls, readRedTeamStatus, probe } = await sweep({ settings: shadow({ mode: 'off' }) });
+    expect(out.skipped).toBe('off');
+    expect(readRedTeamStatus).not.toHaveBeenCalled();
+    expect(probe.isAlive).not.toHaveBeenCalled();
+    expect(calls).toEqual([]);
+    expect(lines(dir)).toEqual([]);
+  });
+  it('a restart storm holds extra PRs under both sweep and hour caps', async () => {
+    const prs = Array.from({ length: 8 }, (_, i) => pendingPr({ number: 11 + i }));
+    const dir = auditDir();
+    const first = await sweep({ prs, dir });
+    expect(first.out.act).toHaveLength(3);
+    expect(first.out.act.every(i => i.action === 'restart-red-team')).toBe(true);
+    expect(first.out.held).toHaveLength(5);
+    expect(first.out.held.every(i => i.held === 'per-sweep cap')).toBe(true);
+    const second = await sweep({ prs, dir, now: NOW + 15 * 60_000 });
+    expect(second.out.act).toHaveLength(3);
+    const third = await sweep({ prs, dir, now: NOW + 30 * 60_000 });
+    expect(third.out.act).toEqual([]);
+    expect(third.out.held).toHaveLength(2);
+    expect(third.out.held.every(i => i.held === 'per-hour cap')).toBe(true);
+    expect(lines(dir).filter(r => r.phase === 'would-do')).toHaveLength(6);
+  });
+  it('a proven-dead local owner restarts before the unknown-owner stale deadline', async () => {
+    const at = new Date(NOW - 90 * 60_000).toISOString();
+    const { out, probe } = await sweep({ status: statusFor(), alive: false,
+      prs: [pendingPr({ updatedAt: at, createdAt: at })] });
+    expect(probe.isAlive).toHaveBeenCalledWith(owner.pid);
+    expect(out.incomplete).toBe(false);
+    expect(out.act).toMatchObject([{ action: 'restart-red-team' }]);
+  });
+  it('a PID in another namespace is unknown and waits before the stale deadline', async () => {
+    const at = new Date(NOW - 90 * 60_000).toISOString();
+    const { out, probe } = await sweep({ status: statusFor({ pidNamespace: 'other-ns' }),
+      prs: [pendingPr({ updatedAt: at, createdAt: at })] });
+    expect(probe.isAlive).not.toHaveBeenCalled();
+    expect(out.items).toEqual([]);
+    expect(out.act).toEqual([]);
+  });
+  it('uses the newest restart timestamp even when audit lines are out of chronological order', async () => {
+    const dir = auditDir();
+    seed(dir, [restartRecord(30), restartRecord(90, { action: 'ask-review-daemon', key: `${prHead}:daemon` })]);
+    const { out } = await sweep({ dir });
+    expect(out.incomplete).toBe(false);
+    expect(out.items).toEqual([]);
+    expect(out.act).toEqual([]);
+  });
+});
+
+describe('watchdog headCap buckets', () => {
+  const limits = { maxActionsPerSweep: 10, maxActionsPerHour: 20, maxActionsPerPrHead: 1 };
+  const prHead = `${REPO}#11@${HEAD}`;
+  const restart = n => ({ lane: 'system', action: 'restart-red-team', prHead, headCap: 2, key: `${prHead}:restart-${n}` });
+  const record = (item, phase = 'would-do') => ({ ...item, phase, ts: new Date(NOW - 90 * 60_000).toISOString() });
+  it('a prior daemon nudge does not consume the restart action bucket', () => {
+    const history = [record({ prHead, action: 'ask-review-daemon', key: 'daemon' })];
+    expect(planStallActions([restart(1)], { now: NOW, limits, history }).act).toEqual([restart(1)]);
+  });
+  it.each(['would-do', 'intent'])('a second restart bypasses the shared one-action head cap after a prior %s', phase => {
+    expect(planStallActions([restart(2)], { now: NOW, limits, history: [record(restart(1), phase)] }).act).toEqual([restart(2)]);
+  });
+  it('caps its own action bucket at two including actions planned in this pass', () => {
+    const result = planStallActions([restart(1), restart(2), restart(3)], { now: NOW, limits });
+    expect(result.act).toEqual([restart(1), restart(2)]);
+    expect(result.held).toHaveLength(1);
+    expect(result.held[0].key).toBe(restart(3).key);
+  });
+  it('the two-restart head cap is lifetime, including old months', () => {
+    const history = [1, 2].map(n => ({ ...record(restart(n)), ts: '2026-01-01T00:00:00Z' }));
+    const result = planStallActions([restart(3)], { now: NOW, limits, history });
+    expect(result.act).toEqual([]);
+    expect(result.held).toHaveLength(1);
+  });
+  it('headCap items still spend the common per-sweep and per-hour budgets', () => {
+    const items = [restart(1), { ...restart(1), prHead: 'other-head', key: 'other-restart' }];
+    const perSweep = planStallActions(items, { now: NOW, limits: { ...limits, maxActionsPerSweep: 1 } });
+    expect(perSweep.act).toHaveLength(1);
+    expect(perSweep.held).toMatchObject([{ held: 'per-sweep cap' }]);
+    const history = [{ ...record({ prHead: 'third-head', key: 'prior', action: 'tooling-card' }), ts: new Date(NOW - 60_000).toISOString() }];
+    const perHour = planStallActions(items, { now: NOW, limits: { ...limits, maxActionsPerHour: 2 }, history });
+    expect(perHour.act).toHaveLength(1);
+    expect(perHour.held).toMatchObject([{ held: 'per-hour cap' }]);
+  });
+  it('different PR heads receive separate restart buckets', () => {
+    const other = { ...restart(1), prHead: `${REPO}#12@${HEAD}`, key: 'other' };
+    expect(planStallActions([other], { now: NOW, limits, history: [record(restart(1)), record(restart(2))] }).act).toEqual([other]);
+  });
+  it('separates two capped actions on the same head by action name', () => {
+    const publish = { ...restart(1), action: 'publish-red-team-result', key: `${prHead}:publish`, headCap: 1 };
+    expect(planStallActions([publish], { now: NOW, limits,
+      history: [record(restart(1)), record(restart(2))] }).act).toEqual([publish]);
+  });
+});
+
+describe('watchdog action settings defaults and provenance', () => {
+  it.each(['publish-red-team-result', 'restart-red-team'])('%s is enabled in both standard and persisted repo settings', action => {
+    expect(STALL_SWEEP_DEFAULTS.systemActions[action]).toBe(true);
+    const repo = JSON.parse(readFileSync(join(process.cwd(), 'scripts/settings/pr-stall-sweep.json'), 'utf8'));
+    expect(repo.prStallSweep.systemActions[action]).toBe(true);
+  });
+  it.each(['publish-red-team-result', 'restart-red-team'])('a tool-layer %s switch resolves with provenance', action => {
+    const log = vi.fn();
+    const read = path => String(path).endsWith('pr-stall-sweep.json')
+      ? JSON.stringify({ prStallSweep: { systemActions: { [action]: false } } }) : '{}';
+    const result = resolveStallSweepSettings({ env: { WE_POLICY_CASCADE_LOG: '1' }, read, log });
+    expect(result.value.systemActions[action]).toBe(false);
+    expect(result.sources[`systemActions.${action}`]).toBe('tool');
+    expect(log.mock.calls.map(([line]) => line).join('\n')).toContain(`systemActions.${action}=false (tool)`);
+  });
+});
