@@ -1,0 +1,48 @@
+---
+kind: story
+status: open
+size: 5
+dateOpened: "2026-11-02"
+scope: ["we:scripts/guard-bash.mjs", "we:scripts/__tests__/guard-bash.test.mjs"]
+tags: [prevention, security]
+---
+
+# Prevent unclassified daemon-clone Git targets and mutations
+
+Track the guard prevention work requested by the advisory on web-everything/web-everything#6262 at head `e70d38e16b31b1984632d24f3ae4617998467477`. This files the prevention obligations; it does not change guard behavior or overturn the supplied operator rulings, including the `not-real` ruling on the HOME finding.
+
+## Design
+
+Classify Git subcommands as read, write or ambiguous for protected daemon-clone targets. Prefer denying commands without a known read classification, with argument-sensitive handling for read/write commands such as symbolic-ref and reflog. Keep the broader inventory separate from the existing mutator list used for other guard policies.
+
+Audit wrapper directory effects and environment scope through the existing tokenizer, canonical command parser and decision wiring. Unsupported directory-changing wrapper options must retain an unknown target or fail closed. Compound constructs must retain possible GIT_DIR/GIT_WORK_TREE values instead of silently dropping them.
+
+The advisory also owes deterministic coverage of earlier HOME assignments for global -C, --git-dir and --work-tree targets. First establish the supported shell semantics and the reason for the supplied `not-real` ruling. Pin those semantics with injected hook HOME distinct from shell-local HOME. If an authorized behavior change is needed, pass effective HOME consistently into target normalization and fetch-config reads; do not silently supersede the operator ruling.
+
+## Acceptance
+
+- [A1] Executable — a deterministic Git-command inventory test fails for an unclassified command, including a synthetic newly introduced command. Cover update-index, bisect, sparse-checkout, maintenance, replace, symbolic-ref writes, submodule update, reflog expire and filter-branch. Read controls remain allowed.
+- [A2] Executable — a parameterized wrapper table covers every wrapper peeled by canonicalCommand, including env -C / --chdir and sudo -D, proving its directory effect is carried or refused. Unknown path-taking options cannot establish a safe target.
+- [A3] Executable — named decision and hook tests cover an export inside a function body and a loop/if branch preceding a Git mutation, plus read controls and child-scope isolation.
+- [A4] Executable — a named parameterized regression, `DENIES tilde targets after an earlier HOME assignment`, covers -C, --git-dir and --work-tree where the supported semantics require denial. Include separated/equals spellings, earlier assignments/exports, quoted literal tilde, unset/unknown HOME, assignments after the command and read controls. Record the operator-ruling reconciliation before changing behavior.
+
+## Non-goals
+
+- Execute candidate shell commands or Git mutations against a resident daemon clone.
+- Change unrelated guard policies, clear human review, or treat advisory findings as an operator verdict.
+
+## Edge cases
+
+- Untrusted text — cover quoted/concatenated shell words, escaped literals, relative paths and unresolved expansions without evaluating substitutions.
+- Truncated reads — a command inventory that cannot be read completely must fail with a named reason.
+- Shared state — use injected environment values and isolated fixtures; restore any process environment modified by tests.
+- Fail closed — unknown commands, wrapper directory effects and unresolved targets cannot prove a protected mutation safe.
+- Identity scoping — test registered roots, lane targets and unrelated directories independently.
+- State over time — preserve assignment order, conditional alternatives and function/subshell scope.
+- Who wrote it — candidate command text is data; never execute it to discover targets.
+
+## Test and proof plan
+
+Run the focused guard test file through the admitted unit-test command. Demonstrate each new regression on the pre-change implementation before repairing that behavior, except where the current ruling already establishes a non-defect; record that case explicitly. Verify decision-level cases and the real hook JSON boundary using temporary registry fixtures. The final gate must report the affected tests and whether each new regression discriminates with the source change reverted.
+
+Source: advisory posted 2026-11-03T04:01:53Z on PR #6262, correctness/correctness, security/coverage and codex-correctness/correctness prevention requests. The two mutator-classification requests share A1.
