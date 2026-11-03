@@ -243,9 +243,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
         try { ({mtimeMs, ino} = fs.statSync(file)); } catch { continue; }
         const marker = readMarker(file), index = Number(m[1]);
         if (marker.unreadable) continue;
-        // Stuck = kept past the age bound with NO proof of a live owner. Legacy, unbound, unknown-liveness and dead-owner
-        // markers all count; only a provably alive owner (a long healthy job) is excluded.
-        if (now - mtimeMs >= stuckAgeMs && (marker.legacy || liveness(ownerPid(root, index, file), selfPid) !== 'alive')) held.push({name, run: marker.run});
+        if (now - mtimeMs >= stuckAgeMs) held.push({name, run: marker.run});
         const key = `${name}:${ino}:${mtimeMs}`; // a replacement marker never inherits a predecessor's death stamp
         if (marker.legacy) {
           // Neither a missing/dead local lock holder nor this host's telemetry proves an unbound job stopped.
