@@ -60,4 +60,11 @@ describe('drain-landed-nothing delivery (real core + planner, default shadow mod
     expect(plan.length).toBe(1);
     expect(plan[0].suppressed).toBeNull();
   });
+  it('invalid-count records are unknown: they do not close an open stall', () => {
+    const s0 = open3();
+    const bad = [{ at: T0 + 30 * MIN, valid: false, considered: 0, merged: 0 }, { at: T0 + 35 * MIN, valid: false, considered: 0, merged: 0 }];
+    const now = T0 + 40 * MIN;
+    const st = stepEpisodes(s0, [{ smell, results: smell.evaluate({ drainHistory: bad }, { now }) }], now);
+    expect(Object.keys(st.state.episodes).length).toBe(1);
+  });
 });
