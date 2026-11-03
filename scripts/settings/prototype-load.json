@@ -32,7 +32,9 @@
     "reconcile-fix-dispatch": "fix",
     "wev-fix-daemon": "fix",
     "wev-review-daemon": "review",
-    "wev-health-watch": "health-watch"
+    "wev-health-watch": "health-watch",
+    "wev-control": "control",
+    "plateau-drain-daemon": "drain"
   },
   "launchAgentsDir": "~/Library/LaunchAgents",
   "workspaceRoot": "~/workspace",

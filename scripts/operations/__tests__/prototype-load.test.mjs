@@ -1983,7 +1983,7 @@ describe('prototype-load', () => {
 
 describe('prototype-load daemon key resolution (R502 item 1)', () => {
   const daemons = { review: { label: 'com.we.review-daemon' }, fix: { label: 'com.we.fix-dispatch-daemon' }, verify: { label: 'com.we.verify-daemon' }, control: { label: 'com.we.control', clone: 'wev-control' }, drain: { label: 'com.plateau.drain-daemon', clone: '.lanes/we-drain-daemon/code' } };
-  const aliases = { 'reconcile-fix-dispatch': 'fix', 'wev-review-daemon': 'review' };
+  const aliases = { 'reconcile-fix-dispatch': 'fix', 'wev-review-daemon': 'review', 'wev-control': 'control' };
   it.each([
     ['review', 'review'], ['verify-daemon', 'verify'], ['com.we.verify-daemon', 'verify'], ['fix-dispatch-daemon', 'fix'],
     ['reconcile-fix-dispatch', 'fix'], ['wev-review-daemon', 'review'], ['wev-control', 'control'],
@@ -1993,8 +1993,11 @@ describe('prototype-load daemon key resolution (R502 item 1)', () => {
     expect(r.key).toBeUndefined(); expect(r.reason).toBe('unknown'); expect(r.valid).toEqual(['review', 'fix', 'verify', 'control', 'drain']);
   });
   it('refuses an ambiguous alias instead of guessing', () => {
-    const r = resolveDaemonKey({ a: { label: 'com.we.x-daemon' }, b: { label: 'com.we.y', clone: 'x-daemon' } }, {}, 'x-daemon');
+    const r = resolveDaemonKey({ a: { label: 'com.we.x-daemon' }, b: { label: 'com.we.y' } }, { 'x-daemon': 'b' }, 'x-daemon');
     expect(r).toMatchObject({ reason: 'ambiguous', candidates: ['a', 'b'] });
+  });
+  it('never lets a generic clone dir basename self-select a daemon', () => {
+    expect(resolveDaemonKey(daemons, aliases, 'code')).toMatchObject({ reason: 'unknown' });
   });
   it('an exact key always wins over an alias of another daemon', () => {
     expect(resolveDaemonKey({ fix: { label: 'l1' }, review: { label: 'l2' } }, { fix: 'review' }, 'fix')).toEqual({ key: 'fix' });
