@@ -38,7 +38,7 @@ function guardPrReads(row, reads = new Set()) {
 describe('shared open-PR discovery', () => {
   it('pins the deduplicated union and proves every standalone field is included', () => {
     expect(PR_LIST_LIMIT).toBe(200);
-    expect(OPEN_PR_LIST_FIELDS).toBe('number,headRefName,title,body,labels,files,mergeable,mergeStateStatus,headRefOid,baseRefName,statusCheckRollup,comments,isDraft,createdAt');
+    expect(OPEN_PR_LIST_FIELDS).toBe('number,headRefName,title,body,labels,files,mergeable,mergeStateStatus,headRefOid,baseRefName,statusCheckRollup,comments,isDraft,createdAt,author');
     const union = OPEN_PR_LIST_FIELDS.split(',');
     expect(new Set(union).size).toBe(union.length);
     const standalone = new Set();
@@ -53,7 +53,7 @@ describe('shared open-PR discovery', () => {
   });
 
   it.each([null, 'owner/repo'])('uses runGhSync by default with the full query (repo %s)', (repo) => {
-    const prs = [{ number: 123, comments: [{ body: 'retained' }], files: [{ path: 'a.mjs' }] }];
+    const prs = [{ number: 123, author: { login: 'app/web-everything', is_bot: true }, comments: [{ body: 'retained' }], files: [{ path: 'a.mjs' }] }];
     runGhSync.mockReset().mockReturnValue(JSON.stringify(prs));
     expect(defaultFetchOpenPrs({ repo })).toEqual(prs);
     expect(runGhSync).toHaveBeenCalledTimes(1);

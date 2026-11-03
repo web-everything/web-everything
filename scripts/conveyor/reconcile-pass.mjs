@@ -293,7 +293,7 @@ import { classifyPr as classifyPrLifecycle } from './pr-watch.mjs';
 // straight off each row (`pr.isDraft`) to gate review dispatch off drafts and to plan the `promote-draft`
 // effect once a draft's required checks are green. Costs nothing extra beyond this one query, same as `files`
 // above.
-export const PR_LIST_JSON_FIELDS = 'number,title,headRefName,headRefOid,baseRefName,labels,statusCheckRollup,mergeStateStatus,comments,body,files,isDraft,createdAt';
+export const PR_LIST_JSON_FIELDS = 'number,title,headRefName,headRefOid,baseRefName,labels,statusCheckRollup,mergeStateStatus,comments,body,files,isDraft,createdAt,author';
 
 /** How many open PRs one pass reads. The board's own `OPEN_LIMIT` is 30; a reconciler that silently stopped at
  *  the default page would leave the overflow unowned, which is this item's defect wearing a smaller hat. */

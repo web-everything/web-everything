@@ -1770,6 +1770,15 @@ card loading through `readTick` and spawn argv: a pure router test cannot catch
 `readPrs` and `readAgents` to exercise its shared PR snapshot; that snapshot carries
 escalation reasons and touched paths into the session model selection.
 
+### Open PR author projections
+
+When a standalone reader adds a field, update both `open-pr-fetch.mjs`'s per-tick union and
+`pr-snapshot.mjs`'s host snapshot union, including the paged GraphQL query and mapper.
+Author projections must carry bot identity: GraphQL Bot logins can lack `app/` or `[bot]`,
+so map `__typename` to `is_bot`. Keep human and missing-author controls in
+`pr-list-paged.test.mjs`, and cover refreshing a persisted snapshot without the field
+and preserving author data on cache hits in `pr-snapshot.test.mjs`.
+
 ### Explicit Claude spawn models
 
 Operator rule (2026-09-29): every fresh daemon-launched Claude session must pass an explicit
@@ -3819,6 +3828,18 @@ keep the live host busy probe, but pin the idle probe's PID listing to the test 
 its real status file. Inject process churn, unreadable entries, and settled scans separately to
 verify the production scanner's fail-closed behavior without relying on host quiescence.
 
+## Review restoration requires complete check evidence
+
+Validate every run's timestamp before collapsing duplicate check names. An unreadable
+run cannot be proven superseded; a readable older failed status may still yield to a
+completed CheckRun. Both lane and bot-head restoration require completed latest runs
+with readable timestamps and the full ten-minute grace.
+
+Paged check fixtures must include `contexts.pageInfo.hasNextPage: false` when complete.
+True or unknown pagination carries `rollupIncomplete` through snapshot projection and
+JSON persistence; all restoration branches hold until a complete read is available.
+Keep regression coverage in `reconcile-core.test.mjs`, `pr-list-paged.test.mjs`, and
+`pr-snapshot.test.mjs`, plus the existing unlabelled-bot daemon soak scenario.
 ## PR sweep invariant replay (R437)
 
 `scripts/conveyor/__tests__/pr-sweep.test.mjs` covers the all-open-PR shell, state clocks

@@ -14,13 +14,14 @@ import {
   readSharedOpenPrs, nextLimit, isServable, projectPrs, SNAPSHOT_FIELDS, MIN_LIMIT, DIRTY_REFRESH_FLOOR_MS,
   readShaCache, writeShaCache, snapshotOpenCount,
 } from '../pr-snapshot.mjs';
-import { PrListUnreadableError } from '../pr-list-paged.mjs';
+import { PrListUnreadableError, mapGraphqlPr } from '../pr-list-paged.mjs';
 import { ghThrottleLogPath } from '../gh-throttle.mjs';
 import { prSnapshotEnabled, markPrSnapshotDirty, repoFromGhArgs, snapshotPath, PR_SNAPSHOT_VERSION } from '../pr-snapshot-store.mjs';
 
 const REPO = 'web-everything/web-everything';
 const PRS = Array.from({ length: 14 }, (_, i) => ({
   number: 100 + i, title: `t${i}`, body: `b${i}`, url: `u${i}`, isDraft: false, createdAt: 'c', updatedAt: 'u',
+  author: { login: 'human', is_bot: false },
   headRefName: `lane/x${i}`, headRefOid: `abc${i}`, baseRefName: 'main', isCrossRepository: false, reviewDecision: 'APPROVED', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
   labels: [{ name: 'ready-to-merge' }], files: [{ path: 'a.mjs' }], comments: [{ body: 'hi' }], statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED',
     startedAt: 's', completedAt: 'e', detailsUrl: 'url', workflowName: 'build' }],
@@ -41,8 +42,10 @@ function fakeExec(prs = PRS) {
       const size = Number(query.match(/first:(\d+)/)[1]);
       const start = Number(query.match(/after:"(\d+)"/)?.[1] ?? 0);
       const end = Math.min(start + size, prs.length);
-      const nodes = prs.slice(start, end).map(({ comments, body, files, labels, statusCheckRollup, ...p }) => ({
-        ...p, labels: { nodes: labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: {
+      const nodes = prs.slice(start, end).map(({ comments, body, files, labels, statusCheckRollup, author, ...p }) => ({
+        ...p, author: author && { login: author.login, __typename: author.is_bot ? 'Bot' : 'User' },
+        labels: { nodes: labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: {
+          pageInfo: { hasNextPage: false },
           nodes: statusCheckRollup.map(({ workflowName, ...c }) => c.__typename === 'CheckRun'
             ? { ...c, checkSuite: { workflowRun: { workflow: { name: workflowName } } } }
             : { ...c, createdAt: c.startedAt }),
@@ -82,6 +85,20 @@ describe('pure helpers', () => {
   it('projectPrs returns exactly the asked-for fields', () => {
     expect(projectPrs([{ number: 1, body: 'x', labels: [] }], ['number', 'labels'])).toEqual([{ number: 1, labels: [] }]);
   });
+  it('keeps incomplete-check evidence whenever a reader requests the rollup', () => {
+    const pr = { number: 1, statusCheckRollup: [], rollupIncomplete: true };
+    expect(projectPrs([pr], ['number', 'statusCheckRollup'])).toEqual([pr]);
+    expect(projectPrs([pr], ['number'])).toEqual([{ number: 1 }]);
+  });
+  it('preserves mapper completeness through snapshot projection and JSON persistence', () => {
+    for (const hasNextPage of [true, undefined, false]) {
+      const mapped = mapGraphqlPr({ number: 1, commits: { nodes: [{ commit: { statusCheckRollup: {
+        contexts: { nodes: [], pageInfo: { hasNextPage } },
+      } } }] } });
+      const [projected] = projectPrs(JSON.parse(JSON.stringify([mapped])), ['number', 'statusCheckRollup']);
+      expect(projected.rollupIncomplete).toBe(hasNextPage === false ? undefined : true);
+    }
+  });
   it('repoFromGhArgs reads --repo / -R / --repo=', () => {
     expect(repoFromGhArgs(['pr', 'edit', '1', '--repo', 'o/n'])).toBe('o/n');
     expect(repoFromGhArgs(['pr', 'edit', '1', '-R', 'o/n'])).toBe('o/n');
@@ -98,6 +115,22 @@ describe('pure helpers', () => {
 });
 
 describe('readSharedOpenPrs — one fetch serves the fleet', () => {
+  it('refreshes an old field union and preserves bot identity through fresh and cached reads', () => {
+    const author = { login: 'web-everything', is_bot: true };
+    const { exec, calls } = fakeExec([{ ...PRS[0], author }]);
+    writeFileSync(snapshotPath(dir, REPO), JSON.stringify({
+      v: PR_SNAPSHOT_VERSION, repo: REPO, fetchedAtMs: clock, fields: SNAPSHOT_FIELDS.filter(f => f !== 'author'),
+      prs: PRS, count: PRS.length,
+    }));
+    const fields = 'number,author';
+    const first = readSharedOpenPrs(opts({ fields, exec }));
+    expect(first).toEqual([{ number: PRS[0].number, author }]);
+    expect(readSharedOpenPrs(opts({ fields, exec }))).toEqual(first);
+    expect(pageCalls(calls)).toHaveLength(1);
+    expect(pageCalls(calls)[0][3]).toContain('author{login __typename}');
+    expect(viewCalls(calls)).toHaveLength(1);
+  });
+
   it('preserves capped comments unchanged through fresh and cached projections (#5955)', () => {
     const comments = Array.from({ length: 100 }, (_, i) => ({ body: `comment ${i}`, author: { login: 'someone' } }));
     const { exec, calls } = fakeExec([{ ...PRS[0], comments }]);
@@ -299,6 +332,7 @@ describe('the pass readers are wired to the snapshot (a seeded fresh snapshot is
     const got = m[fn]({ repo: REPO, ...extra });
     expect(got).toHaveLength(14);
     expect(got[0].number).toBe(100);
+    if (fn === 'defaultReadPrs') expect(got[0].author).toEqual(PRS[0].author);
   }, 60_000); // the first dynamic import of a heavy conveyor module can exceed the 5s default on a loaded host
 
   it('pr-limit#fetchOpenPrs', async () => {
