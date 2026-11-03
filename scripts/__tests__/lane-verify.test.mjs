@@ -56,6 +56,17 @@ describe('unsettled shard classification', () => {
   it('classifies exit 75 as verify-unsettled infrastructure failure', () => {
     expect(verificationInfrastructureFailure({ exitCode: 75 })).toEqual({ reason: 'verify-unsettled', detail });
   });
+  it.each(['', 'verify-shards: UNSETTLED (1:UNSETTLED)'])('empty failure identities remain unsettled through finish and legacy marker reads: %s', summary => {
+    const failureDetails = { tests: [], summary, truncated: false };
+    expect(verificationInfrastructureFailure({ exitCode: 75, failureDetails }))
+      .toMatchObject({ reason: 'verify-unsettled' });
+    const done = verifyFinishBody({ sha: SHA }, { exitCode: 75, failureDetails });
+    expect(done.status).toBe('infrastructure-failure');
+    for (const record of [done, { sha: SHA, status: 'red', exitCode: 75, failureDetails }]) {
+      expect(verifyGateDecision({ record, headSha: SHA, requireVerified: true }))
+        .toMatchObject({ ok: false, status: 'infrastructure-failure', reason: 'verify-unsettled' });
+    }
+  });
   it('redCause treats exit 75 as infrastructure rather than a test failure', () => {
     const infrastructure = verificationInfrastructureFailure({ exitCode: 75 });
     expect(classifyRedCause({ exitCode: 75, infrastructure,

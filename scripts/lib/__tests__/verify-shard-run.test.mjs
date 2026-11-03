@@ -129,8 +129,8 @@ describe('fail-closed wrapper', () => {
     expect(await f.run()).toBe(1); expect(f.calls.every(c => c.command === 'node')).toBe(true);
     expect(f.releases()).toBe(0);
   });
-  it.each(['pass', 'red'])('remote red is confirmed locally once and stays red: %s', async local => {
-    const f = fixture(['remote-red', local]); expect(await f.run()).toBe(1);
+  it.each(['pass', 'red'])('remote red is confirmed locally once: %s', async local => {
+    const f = fixture(['remote-red', local]); expect(await f.run()).toBe(local === 'pass' ? 0 : 1);
     expect(f.calls).toHaveLength(4); expect(f.calls[1].command).toBe('npx');
     expect(f.calls[1].env.WE_HEAVY_ADMISSION_HELD).toBe('1'); expect(f.releases()).toBe(1);
   });
@@ -148,6 +148,7 @@ describe('one split retry for incomplete inventory', () => {
       execute: async options => {
         calls.push(options);
         const mode = modes[calls.length - 1];
+        if (mode?.remote) reports.set(options.remoteReport, JSON.stringify({ location: 'remote', exitCode: mode.exitCode }) + '\n');
         if (['remote-incomplete', 'remote-fail'].includes(mode)) reports.set(options.remoteReport, JSON.stringify({ location: 'remote', exitCode: 1 }) + '\n');
         if (mode === 'timeout') return { exitCode: 124, timedOut: true };
         if (mode === 'exit-failure') {
@@ -190,6 +191,29 @@ describe('one split retry for incomplete inventory', () => {
     ['failed suite count alone', { numFailedTestSuites: 1, testResults: [] }],
     ['failed test count alone', { numFailedTests: 1, testResults: [] }],
   ];
+  it.each(['\n', '\r', '\u001b', '\u0085', '\u2028', '\u2029'].flatMap(control => ['fullName', 'title', 'suite'].map(identity => ({ control, identity }))))
+    ('failure identities cannot inject log lines or controls: $identity / $control', async ({ control, identity }) => {
+    const file = `real${control}name.test.mjs`;
+    const name = `x${control}FAIL forged.test.ts > y`;
+    const assertionResults = identity === 'suite' ? [{ status: 'passed' }] : [{ status: 'failed', [identity]: name }];
+    const f = await run([{ testResults: [{ name: file, status: 'failed', assertionResults }] }], [file]);
+    const collector = createFailureCollector();
+    collector.push(f.output);
+    expect(collector.finish().tests).toEqual([{ file: 'real name.test.mjs', name: identity === 'suite' ? null : 'x FAIL forged.test.ts > y' }]);
+    expect(f.output).not.toContain(control === '\n' ? '\nFAIL forged.test.ts' : control);
+    expect(f.code).toBe(1);
+  });
+  it.each([1, 2, 75].flatMap(exitCode => [false, true].flatMap(complete => [false, true].map(failed => ({ exitCode, complete, failed })))))
+    ('remote exit $exitCode, complete=$complete, failed=$failed survives incomplete confirmation and passing retries', async ({ exitCode, complete, failed }) => {
+      const reportText = JSON.stringify({ testResults: (complete ? ['a', 'b', 'c', 'd'] : ['a']).map(name => ({
+        name, status: failed ? 'failed' : 'passed', assertionResults: [{ status: failed ? 'failed' : 'passed' }],
+      })) });
+      const f = await run([{ remote: true, exitCode, reportText }, 'missing', 'pass', 'pass']);
+      expect(f.code).toBe(exitCode === 75 && !failed ? 75 : 1);
+      expect(f.output).not.toContain('GREEN');
+      // Exit 75 with actual failures is terminal; all other remote reds confirm once.
+      expect(f.calls).toHaveLength(exitCode === 75 && failed ? complete ? 1 : 3 : 4);
+    });
   it.each(observedFailures)('%s in complete inventory stays RED even with exit 0', async (_label, report) => {
     const reportText = JSON.stringify({ ...report, testResults: ['a', 'b', 'c', 'd'].map(name =>
       report.testResults.find(r => r.name === name)

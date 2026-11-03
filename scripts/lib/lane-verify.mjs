@@ -346,7 +346,7 @@ export function verifyStartBody({ sha, suites, startedAt, treeHash, runId }) {
  *  legacy callers that pass their own start body as `prev`. */
 /** Classify process termination without inventing an OOM/host-load diagnosis from a signal alone. */
 export function verificationInfrastructureFailure({ exitCode, signal, timedOutPhase, ceilingMs, failureDetails, killer = 'dispatcher' } = {}) {
-  if (exitCode === SHARD_UNSETTLED_EXIT && !failureDetails && !signal && !timedOutPhase) return {
+  if (exitCode === SHARD_UNSETTLED_EXIT && !failureDetails?.tests?.length && !signal && !timedOutPhase) return {
     reason: 'verify-unsettled',
     detail: 'verification unsettled: a test shard stayed INVENTORY-INCOMPLETE after one split retry (capacity/wait); no test verdict, not red, not green. Retry or wait.',
   };

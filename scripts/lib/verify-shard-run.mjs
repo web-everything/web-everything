@@ -220,6 +220,9 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
           // Retain real failures from every attempt, including complete remote
           // inventory followed by an incomplete local confirmation.
           observedFailure ||= inventory === 'FAIL';
+          // Preserve nonzero evidence even when the remote inventory is complete
+          // and passing: a later incomplete confirmation must not forget this exit.
+          observedFailure ||= result.exitCode !== 0 && result.exitCode !== SHARD_UNSETTLED_EXIT;
           try {
             const report = JSON.parse(reportText);
             const reportFailed = report?.success === false || report?.numRuntimeErrors > 0
@@ -235,22 +238,18 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
                 return failed.length ? failed.map(a => ({ file: r.name, name: a.fullName ?? a.title ?? null }))
                   : r?.status === 'failed' ? [{ file: r.name, name: null }] : [];
               }), summary: reportText, truncated: false });
-              const clean = text => String(text).replace(/[\x00-\x1f\x7f]/g, ' ');
+              const clean = text => String(text).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
               for (const test of details.tests) log(`FAIL ${clean(test.file)}${test.name ? ` > ${clean(test.name)}` : ''}\n`);
               log(`verify-shard ${index + 1}/${shards.length}: observed failure ${clean(details.summary)}\n`);
             }
           } catch { /* Unparseable reports contain no observed test failure. */ }
-          if (inventory === 'INVENTORY-INCOMPLETE') {
-            // Exit 75 signals unsettled evidence; other nonzero child exits
-            // are failures even when inventory cannot explain them.
-            observedFailure ||= result.exitCode !== 0 && result.exitCode !== SHARD_UNSETTLED_EXIT;
-            return inventory;
-          }
+          if (inventory === 'INVENTORY-INCOMPLETE') return inventory;
           return result.exitCode === 0 && !result.signal && inventory === 'PASS' ? 'PASS' : 'FAIL';
         }
         let status;
         try {
           status = await attempt(false);
+          const initiallyIncomplete = status === 'INVENTORY-INCOMPLETE';
           let ranOn = { location: 'unknown' };
           try {
             ranOn = phaseRunLocation(readRemoteReport(remoteReport, (path, encoding) => fs.readFileSync(path, encoding)), { remoteAttempt: true });
@@ -258,6 +257,7 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
           // Same predicate verify-lane uses: needs a REPORTED remote failure, and a signal, timeout or infrastructure exit
           // (e.g. 137) is never replaced by a local pass.
           if (['FAIL', 'INVENTORY-INCOMPLETE'].includes(status) && lastResult
+            && !(lastResult.exitCode === SHARD_UNSETTLED_EXIT && observedFailure)
             && shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode: lastResult.exitCode, signal: lastResult.signal,
               timedOut: lastResult.timedOut, ranOn })) {
             log(`verify-shard ${index + 1}/${shards.length}: remote red; confirming locally\n`);
@@ -291,8 +291,9 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
             status = retried.find(r => ['TIMEOUT', 'NOT-RUN', 'FAIL'].includes(r))
               ?? (observedFailure ? 'FAIL' : 'UNSETTLED');
           }
-          // A passing local confirmation cannot erase any attempt's failure evidence.
-          if (observedFailure && status === 'PASS') status = 'FAIL';
+          // Ordinary complete remote reds remain clearable by local confirmation.
+          // Incomplete shards retain their failure evidence even if confirmation passes.
+          if (initiallyIncomplete && observedFailure && status === 'PASS') status = 'FAIL';
         } catch (error) { status = 'FAIL'; log(`verify-shard error: ${String(error.message).replace(/[\x00-\x1f\x7f]/g, '')}\n`); }
         // A killed/infrastructure shard must reach the caller as such (its guard refuses to run later phases on it).
         if (status !== 'PASS' && lastResult && lastResult.exitCode !== SHARD_UNSETTLED_EXIT && verificationInfrastructureFailure({ exitCode: lastResult.exitCode, signal: lastResult.signal })) infraExit ||= lastResult.signal ? 137 : lastResult.exitCode;

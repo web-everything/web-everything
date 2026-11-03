@@ -1358,6 +1358,19 @@ describe('red diagnostics transport', () => {
     const result = spawnSync('node', [VERIFY_LANE, ...args, '--json'], { cwd: dir, encoding: 'utf8' });
     return { code: result.status, json: JSON.parse(result.stdout.trim().split('\n').at(-1)), stdout: result.stdout };
   }
+  it.each([['marker', []], ['run', ['run']]])('exit 75 without FAIL output is unsettled through the real collector: %s', (_label, mode) => {
+    for (const gate of ['exit 75', "printf 'verify-shards: UNSETTLED\\n'; exit 75"]) {
+      const result = invoke([...mode, `--gate=${gate}`]);
+      expect(result.code).toBe(3);
+      expect(result.json).toMatchObject({ status: 'infrastructure-failure', exitCode: 75,
+        infrastructure: { reason: 'verify-unsettled' } });
+      if (!mode.length) {
+        expect(JSON.parse(readFileSync(marker(), 'utf8'))).toMatchObject({ status: 'infrastructure-failure',
+          infrastructure: { reason: 'verify-unsettled' } });
+        expect(invoke(['check']).json).toMatchObject({ status: 'infrastructure-failure', reason: 'verify-unsettled' });
+      }
+    }
+  });
   it.each([['marker', []], ['run', ['run']]])('exit 75 with recorded failures stays red with details: %s', (_label, mode) => {
     const result = invoke([...mode, `--gate=printf ' FAIL  example.test.ts > outer > broken\\n'; exit 75`]);
     expect(result.code).toBe(2);
