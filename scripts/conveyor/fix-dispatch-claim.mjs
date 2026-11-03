@@ -451,7 +451,13 @@ export function refreshLiveFixDispatchClaims({
         continue;
       }
     }
-    const isIdle = nonTerminal.length > 0 && nonTerminal.every((a) => a.state === 'idle' || a.status === 'idle');
+    // Idle release only speaks for rows POSITIVELY bound to this claim (same sessionId, or — for a claim without
+    // one — started at/after the claim): an older same-named idle session must never release a newer dispatch.
+    const boundToClaim = (a) => (entry.meta.sessionId
+      ? a.sessionId === entry.meta.sessionId
+      : Number.isFinite(claimedMs) && startedAtMs(a.startedAt) >= claimedMs);
+    const isIdle = nonTerminal.length > 0
+      && nonTerminal.every((a) => (a.state === 'idle' || a.status === 'idle') && boundToClaim(a));
     let idleHeadSha = null;
     if (!isAwaiting && idleRelease.enabled && isIdle) {
       try {

@@ -1675,3 +1675,10 @@ it('enrichAgents default probe path: reused pid (process newer than session) is 
     { readLaneHead: () => null })[0];
   expect(out.pidAlive).toBe(false);
 });
+
+it('enrichAgents reads ISO-string and numeric-string startedAt for the reuse guard', async () => {
+  const { enrichAgents } = await import('../reconcile-pass.mjs');
+  for (const startedAt of ['2020-01-01T00:00:00Z', String(Date.parse('2020-01-01T00:00:00Z'))]) {
+    expect(enrichAgents([{ pid: process.pid, startedAt, state: 'working' }], { readLaneHead: () => null })[0].pidAlive).toBe(false);
+  }
+});

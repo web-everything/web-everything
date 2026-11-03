@@ -93,7 +93,7 @@ import { countRearmComments } from './rearm-review.mjs';
 import { readFileSync } from 'node:fs';
 import { resolveStandDownHoldsAcrossHeads } from './stand-down.mjs';
 import { enrichPrsWithStandDownAutoProceed } from './stand-down-auto-proceed-io.mjs';
-import { resolveRoundCap, planReconcile, DISPATCH_KINDS, REFUSAL_KINDS, markSelfReportedDone, resolveInfraRetryCooloffMs, resolveInfraTransientCooloffMs, markHungSessions, markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, resolveOperatorRulingExtraRounds, resolveRoundExtensionAnchor } from './reconcile-core.mjs';
+import { resolveRoundCap, planReconcile, DISPATCH_KINDS, REFUSAL_KINDS, markSelfReportedDone, resolveInfraRetryCooloffMs, resolveInfraTransientCooloffMs, markHungSessions, markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, startedAtMs, resolveOperatorRulingExtraRounds, resolveRoundExtensionAnchor } from './reconcile-core.mjs';
 import { tryReadCompletion } from '../operations/completion-store.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 // we:backlog/x5uqim1-*.md (#4075/#3383) — the two extra facts `reconcile-core.mjs#isPrCiFailureOwedRerun` needs
@@ -490,7 +490,7 @@ export function enrichAgents(agents, { readLaneHead = resolveLaneHead, probe = p
     const cwd = String(a?.cwd ?? '');
     if (cwd && !headCache.has(cwd)) headCache.set(cwd, readLaneHead(cwd));
     const alive = probe(Number.isInteger(a?.pid) ? a.pid : null, undefined, undefined,
-      { startedBy: typeof a?.startedAt === 'number' && a.startedAt > 0 ? a.startedAt : null });
+      { startedBy: (() => { const ms = startedAtMs(a?.startedAt); return Number.isFinite(ms) && ms > 0 ? ms : null; })() });
     const { pidAlive: previousPidAlive, ...fresh } = a;
     return {
       ...fresh,

@@ -684,7 +684,7 @@ describe('idle-claim auto-release (R201)', () => {
   const liveSweepOffsets = [0, 6.85, 15.8, 23.35, 32.8, 40.1, 49.1, 57.2, 71.15];
   const acquire = (pr = 5996) => acquireFixDispatchClaim({ repo: 'we', pr, kind: 'fix', headSha: 'sha1', owner: 'A', lockRoot: claimRoot, nowMs: T0, nowIso: iso(T0), leaseMinutes: 10 });
   const sweep = (at, { state = 'idle', head = 'sha1', events = [], extra = {} } = {}) => refreshLiveFixDispatchClaims({
-    lockRoot: claimRoot, listAgentsAll: () => [{ name: 'fix-5996', state }], hungInfoFor: () => null,
+    lockRoot: claimRoot, listAgentsAll: () => [{ name: 'fix-5996', startedAt: T0 + 1000, state }], hungInfoFor: () => null,
     awaitingVerifyFor: null, prHeadFor: () => head, recordEvent: (e) => events.push(e), nowIso: () => iso(at),
     idleRelease: resolveIdleClaimRelease({ env: {}, platform: null }), ...extra,
   });
@@ -771,7 +771,7 @@ describe('idle-claim auto-release (R201)', () => {
   it('releases a claim whose live listing row is state:working but status:idle (the real `claude agents` shape)', () => {
     acquire();
     const extra = { };
-    const rows = () => [{ name: 'fix-5996', state: 'working', status: 'idle' }];
+    const rows = () => [{ name: 'fix-5996', startedAt: T0 + 1000, state: 'working', status: 'idle', startedAt: T0 + 1000 }];
     const run = (at) => refreshLiveFixDispatchClaims({
       lockRoot: claimRoot, listAgentsAll: rows, hungInfoFor: () => null, awaitingVerifyFor: null,
       prHeadFor: () => 'sha1', recordEvent: () => {}, nowIso: () => iso(at),
@@ -785,7 +785,25 @@ describe('idle-claim auto-release (R201)', () => {
 
   it('keeps a claim whose row is state:working and status:busy', () => {
     acquire();
-    const rows = () => [{ name: 'fix-5996', state: 'working', status: 'busy' }];
+    const rows = () => [{ name: 'fix-5996', startedAt: T0 + 1000, state: 'working', status: 'busy' }];
+    let released = 0;
+    for (let t = T0 + 60_000; t <= T0 + 60_000 + 2 * IDLE_MS; t += 120_000) {
+      released += (refreshLiveFixDispatchClaims({
+        lockRoot: claimRoot, listAgentsAll: rows, hungInfoFor: () => null, awaitingVerifyFor: null,
+        prHeadFor: () => 'sha1', recordEvent: () => {}, nowIso: () => iso(t),
+        idleRelease: resolveIdleClaimRelease({ env: {}, platform: null }),
+      }).released ?? []).length;
+    }
+    expect(released).toBe(0);
+  });
+
+  it.each([
+    ['older same-named session (startedAt before the claim)', { startedAt: T0 - 3_600_000 }],
+    ['row with no binding evidence', {}],
+    ['ISO-string row older than the claim', { startedAt: new Date(T0 - 3_600_000).toISOString() }],
+  ])('never releases on an idle row not bound to this claim: %s', (_n, extraRow) => {
+    acquire();
+    const rows = () => [{ name: 'fix-5996', state: 'working', status: 'idle', ...extraRow }];
     let released = 0;
     for (let t = T0 + 60_000; t <= T0 + 60_000 + 2 * IDLE_MS; t += 120_000) {
       released += (refreshLiveFixDispatchClaims({
@@ -894,7 +912,7 @@ describe('idle-claim auto-release (R201)', () => {
     acquire(5996);
     acquire(5997);
     const recordEvent = vi.fn(() => { throw new Error('event storage unavailable'); });
-    const extra = { recordEvent, listAgentsAll: () => [5996, 5997].map((pr) => ({ name: `fix-${pr}`, state: 'idle' })) };
+    const extra = { recordEvent, listAgentsAll: () => [5996, 5997].map((pr) => ({ name: `fix-${pr}`, state: 'idle', startedAt: T0 + 1000 })) };
     expect(sweep(T0 + 60_000, { extra }).refreshed).toHaveLength(2);
     const result = sweepThrough(T0 + 60_000, T0 + 60_000 + IDLE_MS, { extra });
     expect(result.checked).toBe(2);
@@ -910,7 +928,7 @@ describe('idle-claim auto-release (R201)', () => {
     acquire(5996);
     acquire(5997);
     const recordEvent = vi.fn(() => Promise.reject(new Error('event storage unavailable')));
-    const extra = { recordEvent, listAgentsAll: () => [5996, 5997].map((pr) => ({ name: `fix-${pr}`, state: 'idle' })) };
+    const extra = { recordEvent, listAgentsAll: () => [5996, 5997].map((pr) => ({ name: `fix-${pr}`, state: 'idle', startedAt: T0 + 1000 })) };
     const unhandledRejection = vi.fn();
     process.on('unhandledRejection', unhandledRejection);
     try {
@@ -1064,10 +1082,10 @@ describe('idle-claim auto-release (R201)', () => {
   it.each([
     ['empty listing', []],
     ['no matching name', [{ name: 'fix-5997', state: 'idle' }]],
-    ['hung idle session', [{ name: 'fix-5996', state: 'idle', hung: true }]],
-    ['self-reported done session', [{ name: 'fix-5996', state: 'idle', selfReportedDone: true }]],
-    ['auth-expired session', [{ name: 'fix-5996', state: 'idle', authExpired: true }]],
-    ['historical terminal session', [{ name: 'fix-5996', state: 'done', startedAt: T0 - 1 }]],
+    ['hung idle session', [{ name: 'fix-5996', startedAt: T0 + 1000, state: 'idle', hung: true }]],
+    ['self-reported done session', [{ name: 'fix-5996', startedAt: T0 + 1000, state: 'idle', selfReportedDone: true }]],
+    ['auth-expired session', [{ name: 'fix-5996', startedAt: T0 + 1000, state: 'idle', authExpired: true }]],
+    ['historical terminal session', [{ name: 'fix-5996', startedAt: T0 + 1000, state: 'done', startedAt: T0 - 1 }]],
   ])('a sweep with %s breaks the idle window without extending the lease', (_name, rows) => {
     acquire();
     const key = { repo: 'we', pr: 5996, lockRoot: claimRoot };
@@ -1125,7 +1143,7 @@ describe('idle-claim auto-release (R201)', () => {
     const key = { repo: 'we', pr: 5996, lockRoot: claimRoot };
     let replacement;
     const result = sweep(T0 + 20 * 60_000, { extra: {
-      listAgentsAll: () => [{ name: 'fix-5996', state: 'idle' }],
+      listAgentsAll: () => [{ name: 'fix-5996', startedAt: T0 + 1000, state: 'idle' }],
       hungInfoFor: () => {
         const current = readFixDispatchClaim(key);
         const { owner = current.owner, ...metaChange } = change;
@@ -1189,7 +1207,7 @@ describe('idle-claim auto-release (R201)', () => {
     const prHeadFor = vi.fn(() => 'sha1');
     const events = [];
     const result = sweep(at, { events, extra: { prHeadFor,
-      listAgentsAll: () => states.map((state) => ({ name: 'fix-5996', state })),
+      listAgentsAll: () => states.map((state) => ({ name: 'fix-5996', startedAt: T0 + 1000, state })),
     } });
     if (shouldRelease) {
       expect(result.released).toHaveLength(1);

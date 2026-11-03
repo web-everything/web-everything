@@ -1789,6 +1789,7 @@
   "scripts/conveyor/soak/breaks/fix-dispatch-stalls-on-unrelated-clone-lag.soak.test.mjs": 1.85,
   "scripts/conveyor/soak/breaks/fix-scope-stale-claim-head.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/fixer-stuck-never-reclaimed.soak.test.mjs": 1.09,
+  "scripts/conveyor/soak/breaks/idle-status-fixer-claim-never-released.soak.test.mjs": 1.1,
   "scripts/conveyor/soak/breaks/infra-auto-rearm-budget-not-persisted.soak.test.mjs": 0.25,
   "scripts/conveyor/soak/breaks/label-mirror-delayed-input.soak.test.mjs": 0.7,
   "scripts/conveyor/soak/breaks/lease-reaper-prepare-pr-reaps-fresh-build.soak.test.mjs": 10.18,
