@@ -69,10 +69,32 @@ const toDateString = (v) =>
 // overlapping items apart by SCRIPT (the judgment/deterministic split of platform-decisions.md
 // #deterministic-core-thin-judgment). The loader only sanitizes it to a clean string[] (drop non-strings /
 // blanks) or `undefined` when absent/empty — the array-of-strings SHAPE is enforced by check:standards; the
-// OVERLAP semantics live in the dispatcher, never here.
-const normalizeScope = (v) => {
+// OVERLAP semantics live in the dispatcher, never here. Repo prefixes must nevertheless be canonical BEFORE
+// the planner compares scopes: aliases/case/unqualified paths would otherwise bypass lease/rival exclusion.
+const normalizeScope = (v, defaultPrefix = 'we:') => {
   if (!Array.isArray(v)) return undefined;
-  const list = v.map((s) => (s == null ? '' : String(s).trim())).filter(Boolean);
+  // R372 — an entry may name several paths (`we:a.mjs b.mjs`): split on whitespace/commas so every consumer sees one
+  // path per entry; an unprefixed piece inherits the nearest earlier `repo:` prefix of the same entry.
+  const list = [];
+  for (const entry of v) {
+    let repo = defaultPrefix; // bare paths are qualified only after the loader infers the item's locus
+    const text = entry == null ? '' : String(entry).trim();
+    const pieces = text.split(/[\s,]+/).filter(Boolean);
+    // Two or more globs inside one multi-path entry stay UNSPLIT, so dispatch-lane refuses it (fail closed): the lease
+    // matcher does not judge glob-vs-glob overlap, and flattening would hide that behind a clean-looking list. A file
+    // plus one test glob splits normally (#4701). Keep in step with dispatch-lane's refuseMultiPathGlobs.
+    if (pieces.filter((piece) => /[*?]/.test(piece)).length > 1) { list.push(text); continue; }
+    for (const piece of pieces) {
+      // Match dispatch-lane's prefix grammar, including underscores. Keep path case unchanged.
+      const own = /^[A-Za-z][\w-]*:/.exec(piece)?.[0] ?? '';
+      if (own) {
+        const prefix = own.slice(0, -1).toLowerCase();
+        const locus = Object.hasOwn(SCOPE_PREFIX_LOCUS, prefix) ? SCOPE_PREFIX_LOCUS[prefix] : null;
+        repo = `${locus ? SCOPE_LOCUS_PREFIX[locus] : prefix}:`;
+      }
+      list.push(repo + piece.slice(own.length));
+    }
+  }
   return list.length ? list : undefined;
 };
 
@@ -123,10 +145,13 @@ function inferLocusFromTags(tags) {
 const SCOPE_PREFIX_LOCUS = {
   we: 'webeverything', webeverything: 'webeverything',
   fui: 'frontierui', frontierui: 'frontierui',
-  plateau: 'plateau-app', 'plateau-app': 'plateau-app',
+  plateau: 'plateau-app', 'plateau-app': 'plateau-app', pa: 'plateau-app',
 };
+const SCOPE_LOCUS_PREFIX = { webeverything: 'we', frontierui: 'fui', 'plateau-app': 'plateau' };
 function inferLocusFromScope(scope) {
-  const list = normalizeScope(scope);
+  // This inference helper reports only an explicit scope signal. Its callers may supply authored input;
+  // do not invent a locus for a bare path. Scheduling's normalizeScope still qualifies every bare path.
+  const list = normalizeScope(scope, '');
   if (!list) return null;
   for (const entry of list) {
     const m = /^([a-z][a-z0-9-]*):/i.exec(entry);
@@ -414,8 +439,11 @@ function buildBacklog(fileNames) {
         dateReopened: toDateString(data.dateReopened),
         reportDate,
         // Optional predicted touch-set (#x53zzf9) — sanitized to a clean string[] or undefined. Overrides the
-        // raw `...data.scope` spread above so every consumer sees the normalized shape.
-        scope: normalizeScope(data.scope),
+        // raw `...data.scope` spread above. Preserve bare paths until locus inference below, so an
+        // invented we: prefix cannot suppress the authored tags' gate selection.
+        scope: normalizeScope(data.scope, ''),
+        // Authored spellings are display-only; scheduling consumes scope, qualified after locus inference.
+        scopeDisplay: Array.isArray(data.scope) ? [...data.scope] : undefined,
         details: src.details || data.details || undefined,
       };
       // Cache the authored body alongside the item; raises are merged after the cache read
@@ -653,6 +681,10 @@ function buildBacklog(fileNames) {
     item.locus = item.locusAuthored ? item.locus
       : isExerciseAppDescendant(item, byNum) ? 'exercise-app'
       : inferLocusFromScope(item.scope) || inferLocusFromTags(item.tags);
+    // Qualify remaining bare paths with the gate home only AFTER evaluating the original scope signals.
+    // Exercise-app has its gate in WE; explicit prefixes still win within each authored scope entry.
+    const scopePrefix = Object.hasOwn(SCOPE_LOCUS_PREFIX, item.locus) ? SCOPE_LOCUS_PREFIX[item.locus] : 'we';
+    item.scope = normalizeScope(item.scope, `${scopePrefix}:`);
 
     // CTA INVARIANT (#1275) — every OPEN item must render at least one pill: a call-to-action telling
     // whoever picks it up what to DO next (build / slice / split / ratify / unblock / graduate the
@@ -1027,6 +1059,8 @@ module.exports.HUMAN_GATE_KINDS = HUMAN_GATE_KINDS;
 // Named export of the pure `scope:` sanitizer (#x53zzf9) for direct regression testing — inert to the
 // Eleventy build, which only invokes the default function export.
 module.exports.normalizeScope = normalizeScope;
+// Expose the declared prefixes so parity tests cover newly added aliases automatically.
+module.exports.SCOPE_PREFIX_LOCUS = SCOPE_PREFIX_LOCUS;
 // Named export of the pure has-predicted-scope lens predicate (#2618) for direct regression testing — inert
 // to the Eleventy build, which only invokes the default function export.
 module.exports.deriveUnshapedNoScope = deriveUnshapedNoScope;

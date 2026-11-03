@@ -66,6 +66,7 @@ import { mintSessionSlug, PR_KINDS } from '../conveyor/session-slug.mjs';
 import { op } from './registry.mjs';
 // #3717 — the `taskType` derivation. PURE and import-free, which is why the DECLARATION may hold it.
 import { taskTypeFor } from '../lib/dispatch-task-type.mjs';
+import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 // #3224 — the raw invocation this operation declares over. Declared in ONE place and read by two
 // consumers: `op()` validates its shape here, and the skill-wiring scan reads the same map.
 import { DECLARED_HOMES } from './declared-homes.mjs';
@@ -408,6 +409,67 @@ export const BRIEF_VALUE_RE = /^[A-Za-z0-9_.,:/@#-]+$/;
  * never expands it, and `'` itself stays outside the allow-list so the quote cannot be closed early.
  */
 export const BRIEF_SCOPE_VALUE_RE = /^[A-Za-z0-9_.,:/@#*-]+$/;
+
+// Mirror repo-profile's scope aliases without importing its filesystem-backed profile resolver into this
+// pure declaration. The dispatch tests pin these values against repoProfile(...).canonicalPrefix.
+export const SCOPE_PREFIX_ALIASES = Object.freeze({ webeverything: 'we', frontierui: 'fui', 'plateau-app': 'plateau', pa: 'plateau' });
+function canonicalScopePrefix(value) {
+  const lower = String(value).toLowerCase();
+  const key = repoKeyForSlug(lower) ?? lower;
+  return Object.hasOwn(SCOPE_PREFIX_ALIASES, key) ? SCOPE_PREFIX_ALIASES[key] : key;
+}
+
+function refuseMultiPathGlobs(parts) {
+  // A file plus a test glob (`a.mjs __tests__/a*.test.mjs`) is the normal card shape (#4701) and is accepted, in one
+  // entry or as separate entries. Only ONE authored entry holding two or more globs is refused: the lease matcher
+  // cannot judge glob-vs-glob overlap, and flattening would hide that behind a clean-looking list.
+  // Cross-entry glob-vs-glob overlap is pre-existing (R412), carded; the lease matcher does not judge it.
+  if (parts.filter((piece) => /[*?]/.test(piece)).length > 1) {
+    throw new Error('dispatch-lane: unsafe scope entry — more than one glob in a multi-path scope entry is refused for {{SCOPE}}; use explicit paths, one glob per entry, or a directory scope.');
+  }
+}
+
+/**
+ * R372 — a card's `scope:` entry may name several paths in one string (`a.mjs b.mjs`): split every entry on
+ * whitespace or commas, so the lane-lease consumer still gets the comma-joined list it expects. Each piece is
+ * checked against {@link BRIEF_SCOPE_VALUE_RE}, then refused if it carries a `..` segment or is absolute (with or
+ * without a `repo:` prefix). FAIL CLOSED: one bad piece throws for the whole scope.
+ */
+export function normalizeBriefScope(raw, dispatchRepo = 'we') {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const entry of raw) {
+    // a piece with no `repo:` prefix inherits the nearest earlier prefix of the SAME entry, so `we:a.mjs b.mjs`
+    // is `we:a.mjs,we:b.mjs` and the lease overlap check sees both paths in the repo they belong to.
+    let inherited = '';
+    const parts = String(entry ?? '').split(/[\s,]+/).filter(Boolean);
+    refuseMultiPathGlobs(parts);
+    for (const raw0 of parts) {
+      const own = /^[A-Za-z][\w-]*:/.exec(raw0)?.[0] ?? '';
+      if (own) inherited = own;
+      const piece = own ? raw0 : inherited + raw0;
+      if (!BRIEF_SCOPE_VALUE_RE.test(piece)) {
+        throw new Error(
+          `dispatch-lane: the value for {{SCOPE}} (${JSON.stringify(piece)}) has characters the brief cannot carry `
+          + 'safely — it is pasted into a shell command the agent is told to run. Refusing.',
+        );
+      }
+      const prefix = /^[A-Za-z][\w-]*:/.exec(piece)?.[0] ?? '';
+      // Authored spelling stays on the card for display; scheduling and the brief receive a canonical prefix.
+      const segments = piece.slice(prefix.length).split('/');
+      if (segments.at(-1) === '') segments.pop(); // one trailing slash = "this directory"
+      // absolute, empty (`//`), `.` and `..` segments are refused: the lease matcher compares literal paths, so a
+      // non-canonical spelling would escape overlap exclusion.
+      if (!segments.length || segments.some((seg) => seg === '' || seg === '.' || seg === '..')) {
+        throw new Error(`dispatch-lane: unsafe scope entry ${JSON.stringify(piece)} — absolute, empty, \`.\` and \`..\` path segments are refused for {{SCOPE}}.`);
+      }
+      const repo = canonicalScopePrefix(prefix ? prefix.slice(0, -1) : dispatchRepo);
+      if (!/^[a-z][\w-]*$/.test(repo)) throw new Error(`dispatch-lane: unsafe scope repository ${JSON.stringify(repo)}`);
+      out.push(`${repo}:${piece.slice(prefix.length)}`);
+    }
+  }
+  return out;
+}
 
 /**
  * What `{{GATE_COMMAND}}`/`{{ATTRIBUTION}}` (#3960) may contain — WIDER than {@link BRIEF_VALUE_RE} on
@@ -1069,7 +1131,6 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes, groupMember
   }
   const item = raw.item && typeof raw.item === 'object' ? raw.item : null;
   const specPath = String(item?.specPath || '').trim();
-  const itemScope = Array.isArray(item?.scope) ? item.scope.map(String).filter(Boolean) : [];
   if (blocked('item-spec', !specPath, specPath)) {
     throw new Error(`dispatch-lane.read: no backlog file resolved for #${resolvedNum} — the brief needs the item's spec path`);
   }
@@ -1097,6 +1158,10 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes, groupMember
   // so that is the scope the lane ends up holding; this value is what the run record says was declared. The
   // card (#3165) sets one rule for both prepare kinds, so this is recorded rather than silently widened.
   const repairsExistingPr = launchKind === 'fix' || launchKind === 'ci-heal';
+  // Preparation/investigation lease the card itself and may be repairing its malformed scope.
+  // Validate item.scope only when it supplies the lane lease and the brief's SCOPE value.
+  const dispatchRepo = raw.repoTokens?.REPO ?? 'we';
+  const itemScope = launchKind === 'build' || repairsExistingPr ? normalizeBriefScope(item?.scope, dispatchRepo) : [];
   const scope = launchKind === 'build' || repairsExistingPr ? [...itemScope] : [`we:${specPath}`];
   if (launchKind === 'prepare-item' || launchKind === 'build') {
     for (const member of groupMembers) {
@@ -1107,10 +1172,13 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes, groupMember
       if (launchKind === 'prepare-item') scope.push(`we:${card.specPath}`);
       else {
         if (!Array.isArray(card.scope) || !card.scope.length) throw new Error(`dispatch-lane.read: group member #${member} has no scope`);
-        for (const path of card.scope) if (!scope.includes(path)) scope.push(path);
+        const memberScope = normalizeBriefScope(card.scope, dispatchRepo);
+        if (!memberScope.length) throw new Error(`dispatch-lane.read: group member #${member} has no scope`);
+        for (const path of memberScope) if (!scope.includes(path)) scope.push(path);
       }
     }
   }
+  // Each build/repair card was checked by normalizeBriefScope before flattening; the union has no entry boundaries.
   if (blocked('scope', (launchKind === 'build' || repairsExistingPr) && !itemScope.length, { launchKind, scope })) {
     // Unreachable through the core (`dispatch-plan` holds an unscoped item `unshaped-no-scope` and auto-prepares
     // it, so it never reaches `spawnBuilds`, `spawnFixes` or `spawnCiHeals`) — refused anyway, because an empty

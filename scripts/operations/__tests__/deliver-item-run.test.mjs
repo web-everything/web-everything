@@ -233,6 +233,7 @@ describe('#4649 real process preflight boundaries', () => {
     try {
       mkdirSync(f.env.WE_BACKLOG_DIR, { recursive: true });
       mkdirSync(join(f.dir, '.git'));
+      // The historical plateau-app: spelling must reach the mixed-locus gate unchanged.
       writeFileSync(join(f.env.WE_BACKLOG_DIR, '4620-mixed-locus.md'), `---\nkind: story\nsize: 5\nstatus: open\nscope: ${JSON.stringify(scope)}\n---\n# Mixed locus\n`);
       // The operation/reader/loader/store are real. External planner/GitHub/Git reads are supplied;
       // freshness observes a current checkout and writes its cache only in the temporary Git directory.
