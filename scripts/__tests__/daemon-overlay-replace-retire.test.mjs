@@ -291,14 +291,33 @@ describe('daemon-overlay.mjs retire of a squash-merged, deleted branch', () => {
   };
   const retire = (f, tip) => f.run(['retire', '--ref=lane/sq', `--expected-tip=${tip}`]);
 
-  it('retires when the merged PR headed this ref at the expected tip and its merge commit is on main', () => {
+  it('keeps a deleted branch even when the merged PR head matches expected-tip and its merge commit is on main', () => {
     const { f, tip, mergeOid } = setup();
     f.ghPrs([merged('lane/sq', tip, mergeOid)]);
     const r = retire(f, tip);
-    expect(r.status, r.stderr).toBe(0);
-    expect(JSON.parse(r.stdout)).toMatchObject({ retired: true, reason: 'pr-squash-merged' });
-    expect(f.list()).toEqual([]);
-    expect(f.events().at(-1)).toMatchObject({ kind: 'auto-retired', ref: 'lane/sq', tip });
+    expect(r.status, r.stderr).toBe(3);
+    expect(JSON.parse(r.stdout)).toMatchObject({ retired: false, refused: 'not-proved' });
+    expect(f.list()).toEqual(['lane/sq']);
+    expect(f.events().some((event) => event.kind === 'auto-retired')).toBe(false);
+  });
+
+  it('keeps a deleted reused branch registered after unmerged work with only an older merged PR', () => {
+    const f = fixture();
+    const oldTip = f.push('lane/sq', 'a.txt', 'first\n');
+    const mergeOid = f.squash('lane/sq', 'a.txt', 'first\n');
+    const currentTip = f.push('lane/sq', 'b.txt', 'unmerged reuse\n', oldTip);
+    expect(f.run(['add', '--ref=lane/sq', '--pr=7']).status).toBe(0);
+    const before = f.entry('lane/sq');
+    gitOk(f.author, ['push', '-q', 'origin', ':refs/heads/lane/sq']);
+    f.ghPrs([merged('lane/sq', oldTip, mergeOid)]);
+    // Neither a caller's historical tip nor the actual deleted tip authorizes the drop.
+    for (const tip of [oldTip, currentTip]) {
+      const r = retire(f, tip);
+      expect(r.status, r.stderr).toBe(3);
+      expect(JSON.parse(r.stdout)).toMatchObject({ retired: false, refused: 'not-proved' });
+      expect(f.entry('lane/sq')).toEqual(before);
+    }
+    expect(f.events().some((event) => event.kind === 'auto-retired')).toBe(false);
   });
 
   it('keeps an unmerged deleted origin registration when a same-named fork PR merged', () => {
@@ -334,11 +353,12 @@ describe('daemon-overlay.mjs retire of a squash-merged, deleted branch', () => {
     expect(f.list()).toEqual([]);
     expect(await settlePendingDrops({ root: f.clone, env: f.env, deps: { tip: () => tip } })).toEqual([{ ref: 'lane/sq', outcome: 'restored' }]);
     expect(f.list()).toEqual(['lane/sq']);
-    // and with the branch still deleted, the drop is confirmed
+    // Legacy intents are also unproved when the branch is still deleted: its last tip is unknown.
     await expect(retireRegistration({ root: f.clone, ref: 'lane/sq', expectedTip: tip, env: f.env, deps: {
       prove: () => ({ ref: 'lane/sq', action: 'retire', reason: 'pr-squash-merged', tip, pr: 7, evidence: { refGone: true, mergeCommit: mergeOid } }),
       tip: () => null, afterDrop: () => { throw new Error('killed'); } } })).rejects.toThrow('killed');
-    expect(await settlePendingDrops({ root: f.clone, env: f.env, deps: { tip: () => null } })).toEqual([{ ref: 'lane/sq', outcome: 'drop-confirmed' }]);
+    expect(await settlePendingDrops({ root: f.clone, env: f.env, deps: { tip: () => null } })).toEqual([{ ref: 'lane/sq', outcome: 'restored' }]);
+    expect(f.list()).toEqual(['lane/sq']);
   });
 
   it('refuses when the merge commit is not an ancestor of main', () => {

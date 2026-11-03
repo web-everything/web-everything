@@ -335,10 +335,10 @@ describe('planFetchFailed (registration whose branch could not be fetched)', () 
   const run = (r, gh, row = { ref: 'lane/gone' }) => planFetchFailed({ row, git: r.git, gh, repo: REPO });
   const withMain = () => { const r = repo(); r.setRemote('main', r.ok('rev-parse', 'HEAD')); return r; };
 
-  it('retires a MERGED PR whose merge commit is on origin/main', () => {
+  it('keeps a MERGED PR whose merge commit is on origin/main when the current branch tip is unknown', () => {
     const r = withMain();
     const sha = r.ok('rev-parse', 'HEAD');
-    expect(run(r, listGh([merged(sha)]))).toMatchObject({ ref: 'lane/gone', action: 'retire', reason: 'pr-squash-merged', tip: sha, pr: 7 });
+    expect(run(r, listGh([merged(sha)]))).toEqual({ ref: 'lane/gone', action: 'keep', reason: 'fetch-failed' });
   });
   it('keeps when the PR is not MERGED', () => {
     const r = withMain();

@@ -171,10 +171,10 @@ async function defaultCombinedTest({ clone, candidateSha, refs }, { exec, fs, en
 function defaultRetirePlanner({ rows, git, gh }) {
   const fetched = rows.filter((row) => git(['fetch', 'origin', `+refs/heads/${row.ref}:refs/remotes/origin/${row.ref}`]).code === 0);
   const unfetchedRows = rows.filter((row) => !fetched.includes(row));
-  const { repo, gh: originGh } = resolveOriginRepository({ git, gh });
-  // A merged PR whose branch is gone cannot be fetched: look its state up instead of keeping it forever (fails closed).
-  const unfetched = unfetchedRows.map((row) => planFetchFailed({ row, git, gh: originGh, repo }));
+  // Historical PRs cannot establish the last tip of a deleted/reused mutable branch.
+  const unfetched = unfetchedRows.map((row) => planFetchFailed({ row }));
   if (!fetched.length) return unfetched;
+  const { repo, gh: originGh } = resolveOriginRepository({ git, gh });
   return [...planRetirements({ rows: fetched, git, gh: originGh, repo }), ...unfetched];
 }
 

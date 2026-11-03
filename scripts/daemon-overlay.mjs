@@ -294,46 +294,17 @@ export function proveRetirement({ root, entry, env = process.env, run = spawnSyn
     const { gh, repo } = retirementGitHub({ root, env, run });
     return planRetirements({ rows: [entry], git, gh, repo })[0];
   });
-  if (result?.action === 'retire') return result;
-  // Only a branch that is GONE from origin can have been squash-merged and deleted; anything else stays as proved above.
-  if (!result || result.reason === 'fetch-failed') {
-    const squash = proveSquashMerged({ root, entry, env, run });
-    if (squash) return squash;
-  }
   return result?.action ? result : { ref: entry.ref, action: 'keep', reason: result?.reason || 'unprovable' };
 }
 
 /**
- * A squash merge leaves the branch tip off main and (after deletion) unfetchable, so the ancestry proof cannot see it.
- * Prove it from GitHub instead: the ref is absent on origin, exactly ONE PR headed it and is merged in the origin repository, its head commit is
- * the tip, and its merge commit is an ancestor of origin/main. Any missing, unreadable or ambiguous answer returns null.
- * @returns {{ref:string, action:'retire', reason:'pr-squash-merged', tip:string, pr:number, evidence:object}|null}
+ * Legacy proof entry point. A historical squash merge cannot prove the last tip of a deleted mutable branch.
+ * Registrations have no authoritative tip to compare with its PR head; callers must recover the branch's work
+ * and use the fetched-ref proof. Preserve the export while refusing every unprovable deleted-branch retirement.
+ * @returns {null}
  */
-export function proveSquashMerged({ root, entry, env = process.env, run = spawnSync }) {
-  if (entry.edgeResolution) return null;
-  if (remoteTip({ root, ref: entry.ref, env, run }) !== null) return null; // still on origin (or unreadable): not this case
-  const { gh, repo: slug } = retirementGitHub({ root, env, run });
-  if (!/^[\w.-]+\/[\w.-]+$/.test(slug)) return null;
-  const list = gh(['pr', 'list', '--repo', slug, '--head', entry.ref, '--state', 'all', '--json', 'number,state,headRefName,headRefOid,mergeCommit,headRepository,isCrossRepository', '--limit', '10']);
-  if (list.code !== 0) return null;
-  let prs;
-  try { prs = JSON.parse(list.stdout || 'null'); } catch { return null; }
-  // Match the loader's proof: any other PR can belong to a later reuse, even when closed without merging.
-  // A full, possibly truncated page is ambiguous too; never filter it down to one historical merge.
-  if (!Array.isArray(prs) || prs.length !== 1) return null;
-  const [pr] = prs;
-  if (pr?.headRefName !== entry.ref || pr?.state !== 'MERGED') return null;
-  if (pr.isCrossRepository !== false || typeof pr.headRepository?.nameWithOwner !== 'string'
-    || pr.headRepository.nameWithOwner.toLowerCase() !== slug.toLowerCase()) return null;
-  if (Number.isInteger(entry.pr) && entry.pr !== pr.number) return null;
-  const tip = String(pr.headRefOid ?? '');
-  const mergeOid = String(pr.mergeCommit?.oid ?? '');
-  if (!/^[0-9a-f]{40}$/.test(tip) || !/^[0-9a-f]{40}$/.test(mergeOid) || !Number.isInteger(pr.number)) return null;
-  const landed = withScratchFetch({ root, env, run, prefix: 'we-daemon-overlay-squash-', refspecs: ['+refs/heads/main:refs/remotes/origin/main'] },
-    (git) => git(['merge-base', '--is-ancestor', mergeOid, 'origin/main']).code === 0);
-  if (landed !== true) return null;
-  return { ref: entry.ref, action: 'retire', reason: 'pr-squash-merged', tip, pr: pr.number,
-    evidence: { refGone: true, prState: 'MERGED', mergeCommit: mergeOid, prVia: 'head-ref' } };
+export function proveSquashMerged() {
+  return null;
 }
 
 /** The single open origin PR headed by `ref`, or null (none, several, or incomplete evidence).
@@ -405,8 +376,9 @@ export async function settlePendingDrops({ root, env = process.env, by = null, d
     if (list.some((o) => o?.ref === record.ref)) { clearPending(root, env, record.ref); settled.push({ ref: record.ref, outcome: 'still-registered' }); continue; }
     const tipNow = tip(record.ref);
     const newNow = record.newRef ? tip(record.newRef) : undefined;
-    // A squash-merged retire was proved on a DELETED branch: only a still-deleted branch confirms it.
-    if ((record.refGone === true ? tipNow === null : tipNow === record.tip) && (!record.newRef || newNow === record.newTip)) {
+    // Legacy deleted-branch proofs used a historical PR head, not the registration's authoritative tip.
+    // Restore those interrupted drops even if the remote branch is still absent.
+    if (record.refGone !== true && tipNow === record.tip && (!record.newRef || newNow === record.newTip)) {
       clearPending(root, env, record.ref);
       appendOverlayEvent(root, { kind: record.kind === 'replace' ? 'replaced' : 'auto-retired', ref: record.ref, by, tip: record.tip, recovered: true }, { env });
       settled.push({ ref: record.ref, outcome: 'drop-confirmed' });

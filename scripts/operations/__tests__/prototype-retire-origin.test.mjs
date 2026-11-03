@@ -46,6 +46,25 @@ const paths = [
   ['CLI re-proof', (p) => proveRetirement({ root: process.cwd(), entry: p.row, run: p.run })],
 ];
 
+describe.each(paths)('deleted branch without authoritative tip: %s', (_name, decide) => {
+  it.each([undefined, 7])('keeps unmerged reuse with only historical PR 7 (recorded PR %s)', (pr) => {
+    // PR 7 merged at A; the branch was subsequently registered at C and deleted
+    // without another PR. Registrations persist the name/PR, not the current tip.
+    const p = proof([merged()], { ref: REF, pr });
+    expect(decide(p)).toMatchObject({ action: 'keep', reason: 'fetch-failed' });
+  });
+
+  it.each([TIP, 'c'.repeat(40)])('does not trust incidental SHA metadata %s', (sha) => {
+    const p = proof([merged()], { ref: REF, pr: 7, sha });
+    expect(decide(p)).toMatchObject({ action: 'keep', reason: 'fetch-failed' });
+  });
+});
+
+it('direct CLI squash proof cannot authorize a deleted reused registration', () => {
+  const p = proof([merged()], { ref: REF, pr: 7 });
+  expect(proveSquashMerged({ root: process.cwd(), entry: p.row, run: p.run })).toBeNull();
+});
+
 describe.each(paths)('deleted reused branch: %s', (_name, decide) => {
   it.each(['CLOSED', 'OPEN', 'MERGED'])('keeps an old merge alongside a newer %s PR', (state) => {
     const prs = [merged(), merged({ number: 8, state, headRefOid: 'c'.repeat(40),
@@ -62,11 +81,10 @@ describe.each(paths)('deleted reused branch: %s', (_name, decide) => {
     }
   });
 
-  it('requests all states before accepting a unique merged PR', () => {
+  it('keeps even a unique merged PR without consulting historical PR state', () => {
     const p = proof([merged()]);
-    expect(decide(p)).toMatchObject({ action: 'retire', pr: 7 });
-    const args = p.gh.mock.calls.find(([args]) => args[0] === 'pr')[0];
-    expect(args[args.indexOf('--state') + 1]).toBe('all');
+    expect(decide(p)).toMatchObject({ action: 'keep', reason: 'fetch-failed' });
+    expect(p.gh).not.toHaveBeenCalled();
   });
 
   it('keeps a full result page with only one merged PR', () => {
@@ -97,17 +115,15 @@ describe.each(paths)('deleted origin head identity: %s', (_name, decide) => {
     expect(decide(proof([merged(extra)]))).toMatchObject({ action: 'keep', reason: 'fetch-failed' });
   });
 
-  it.each([REPO, 'Web-Everything/Web-Everything'])('allows an origin head with identity %s', (nameWithOwner) => {
+  it.each([REPO, 'Web-Everything/Web-Everything'])('retains an origin head with identity %s without authoritative tip evidence', (nameWithOwner) => {
     expect(decide(proof([merged({ headRepository: { nameWithOwner } })])))
-      .toMatchObject({ action: 'retire', reason: 'pr-squash-merged', tip: TIP, pr: 7 });
+      .toMatchObject({ action: 'keep', reason: 'fetch-failed' });
   });
 
-  it('requests full head repository identity and the cross-repository flag', () => {
+  it('does not use repository identity as a substitute for the missing branch tip', () => {
     const p = proof([merged()]);
-    decide(p);
-    const args = p.gh.mock.calls.find(([args]) => args[0] === 'pr')[0];
-    expect(args[args.indexOf('--json') + 1].split(','))
-      .toEqual(expect.arrayContaining(['headRepository', 'isCrossRepository']));
+    expect(decide(p)).toMatchObject({ action: 'keep', reason: 'fetch-failed' });
+    expect(p.gh).not.toHaveBeenCalled();
   });
 });
 
@@ -163,9 +179,11 @@ describe.each(repositoryPaths)('repository binding: %s', (_name, decide, fetched
     const p = repositoryProof({ fetched });
     const result = decide(p);
     expect(result == null || result.action === 'keep').toBe(true);
-    expect(p.gh).toHaveBeenCalledWith(['repo', 'view', ORIGIN_URL, '--json', 'nameWithOwner,url']);
+    if (fetched) expect(p.gh).toHaveBeenCalledWith(['repo', 'view', ORIGIN_URL, '--json', 'nameWithOwner,url']);
+    else expect(p.gh).not.toHaveBeenCalled();
     const lists = p.gh.mock.calls.map(([args]) => args).filter((args) => args[0] === 'pr');
-    expect(lists.length).toBeGreaterThan(0);
+    if (fetched) expect(lists.length).toBeGreaterThan(0);
+    else expect(lists).toEqual([]);
     for (const args of lists) expect(args[args.indexOf('--repo') + 1]).toBe(`github.com/${ORIGIN_REPO}`);
   });
 
@@ -190,13 +208,16 @@ describe.each(repositoryPaths)('repository binding: %s', (_name, decide, fetched
     const result = decide(p);
     expect(result == null || result.action === 'keep').toBe(true);
     const lists = p.gh.mock.calls.map(([args]) => args).filter((args) => args[0] === 'pr');
-    expect(lists.length).toBeGreaterThan(0);
+    if (fetched) expect(lists.length).toBeGreaterThan(0);
+    else expect(lists).toEqual([]);
     for (const args of lists) expect(args[args.indexOf('--repo') + 1]).toBe(`${host}/${ORIGIN_REPO}`);
   });
 
-  if (!fetched) it('still retires a merged PR from origin when GH_REPO names upstream', () => {
+  if (!fetched) it('keeps a deleted branch even with a merged origin PR when GH_REPO names upstream', () => {
     const p = repositoryProof({ fetched, prs: [merged({ headRepository: { nameWithOwner: ORIGIN_REPO } })] });
-    expect(decide(p)).toMatchObject({ action: 'retire', reason: 'pr-squash-merged', pr: 7 });
+    const result = decide(p);
+    expect(result == null || result.action === 'keep').toBe(true);
+    expect(p.gh).not.toHaveBeenCalled();
   });
 });
 
