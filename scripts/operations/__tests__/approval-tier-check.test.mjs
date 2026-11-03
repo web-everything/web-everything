@@ -332,6 +332,46 @@ describe('approval tiers (synthetic, in-memory evidence)', () => {
 });
 
 describe('default approval IO', () => {
+  it.each([createApprovalDeps, createCheckDeps])('malformed [confirmed] advisory plus later operator block is not clear (%#)', async createDeps => {
+    const rows = [{ user: { login: 'chalbert' }, created_at: '2026-11-01T00:00:00Z',
+      body: `<!-- we:red-team-advisory pr=6244 rev=${head} -->\n### Post-accept red team\nAdvisory only: this pass never blocks or unblocks the merge. Head \`${head.slice(0, 12)}\` · recorded verdict \`accept\`.\n\n1. [confirmed] (edge-case, degraded) \`scripts/example.mjs:1\` — Degraded behavior.` }];
+    const readRedTeam = createDeps({ env: {}, exec: () => JSON.stringify(rows) }).readRedTeam;
+    const d = deps({ readRedTeam });
+    expect((await check(d)).tier).toBe('standard');
+    rows.push({ user: { login: 'chalbert' }, created_at: '2026-11-02T00:00:00Z',
+      body: `<!-- we:red-team-gate pr=6244 rev=${head} outcome=operator-block -->\n- 1 confirmed break(s) sent back to the fixer (#1).` });
+    expect((await readRedTeam(6244, head)).result).not.toBe('clear');
+    expect(await check(d)).toMatchObject({ tier: 'human', approvableBy: 'operator' });
+    const reviewed = await checkPr(6244, d, repo);
+    expect(reviewed.eligible).toBe(false);
+    expect(reviewed.conditions.find(c => c.id === 2).status).toBe('FAIL');
+  });
+  it.each(['RED-TEAM needs operator review', 'WE:RED-TEAM malformed marker', 'SEND-BACK #1', 'BLOCK #1',
+    `<!-- we:red-team-advisory pr=6244 rev=${base} -->`])('later unaccounted mention refuses clearance: %s', async body => {
+    const advisory = { user: { login: 'chalbert' }, created_at: clear.at,
+      body: `<!-- we:red-team-advisory pr=6244 rev=${head} -->\nAdvisory only: Head \`${head}\` · recorded verdict \`accept\`.` };
+    const later = { user: { login: 'untrusted' }, created_at: '2026-11-03T00:00:00Z', body };
+    const rows = [advisory, later];
+    const readRedTeam = createApprovalDeps({ env: {}, exec: () => JSON.stringify(rows) }).readRedTeam;
+    expect(readRedTeam(6244, head).result).toBe('unknown');
+    rows.reverse(); // Timestamp order must win over input order.
+    expect(readRedTeam(6244, head).result).toBe('unknown');
+    rows.reverse();
+    later.created_at = clear.at; // Equal timestamps must retain the later comment.
+    expect(readRedTeam(6244, head).result).toBe('unknown');
+    rows.push({ ...advisory, created_at: '2026-11-04T00:00:00Z' });
+    expect(readRedTeam(6244, head).result).toBe('clear');
+  });
+  it.each([{ body: null, created_at: clear.at }, { body: 'ordinary comment' },
+    { body: 'BLOCK', created_at: 'invalid' }, { body: 'ordinary comment', created_at: 123 }])('malformed comment requires operator review: %j', async malformed => {
+    const rows = [{ user: { login: 'chalbert' }, created_at: clear.at,
+      body: `<!-- we:red-team-advisory pr=6244 rev=${head} -->\nAdvisory only: Head \`${head}\` · recorded verdict \`accept\`.` }, malformed];
+    const readRedTeam = createApprovalDeps({ env: {}, exec: () => JSON.stringify(rows) }).readRedTeam;
+    const d = deps({ readRedTeam });
+    expect(() => readRedTeam(6244, head)).toThrow(/operator review required/);
+    expect(await check(d)).toMatchObject({ tier: 'unknown', approvableBy: 'operator' });
+    expect((await checkPr(6244, d, repo)).eligible).toBe(false);
+  });
   it.each(['sent-back', 'operator-block', 'round-cap'].flatMap(outcome =>
     ['approval-tier-check', 'D-R379 reviewed'].map(consumer => [outcome, consumer])))('advisory accept plus later %s is not clear in %s', async (outcome, consumer) => {
     const rows = [{ user: { login: 'chalbert' }, created_at: '2026-11-01T00:00:00Z',

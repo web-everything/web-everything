@@ -44,24 +44,31 @@ export function readRedTeam(pr, head, { cwd = process.cwd(), env = process.env, 
     requireFact(bytes <= LIMIT, 'comment byte bound exceeded; operator review required');
     return JSON.parse(String(output));
   } });
-  let newest = null;
-  for (const comment of comments) {
+  let newest = null, latestMention = null;
+  for (const [index, comment] of comments.entries()) {
     requireFact(typeof comment.body === 'string', 'incomplete comment evidence; operator review required');
+    const at = typeof comment.createdAt === 'string' ? Date.parse(comment.createdAt) : NaN;
+    requireFact(Number.isFinite(at), 'comment timestamp unknown; operator review required');
+    // Restrictive evidence need not be a well-formed marker or a trusted author.
+    // Include other-head mentions too: an unparsed comment cannot prove its scope.
+    if (/red-team|we:red-team|send-back|block/i.test(comment.body)
+      && (!latestMention || at >= latestMention.at)) latestMention = { at, index };
     if (!isTrustedMarkerAuthor(comment)) continue;
     const marker = /^<!-- we:red-team-advisory pr=(\d+) rev=([a-f\d]{40}) -->/i.exec(comment.body.trimStart());
     if (!marker || Number(marker[1]) !== pr || marker[2] !== head) continue;
     // Read the producer's recorded verdict, never infer clear from an empty parse.
     const verdict = /^Advisory only:.* · recorded verdict `([^`]+)`\.$/m.exec(comment.body)?.[1];
-    const at = Date.parse(comment.createdAt);
-    requireFact(Number.isFinite(at), 'red-team timestamp unknown; operator review required');
-    if (!newest || at >= newest.at) newest = { at, head: marker[2], result: verdict === 'accept' ? 'clear' : (verdict ?? 'unknown') };
+    if (!newest || at >= newest.at) newest = { at, index, head: marker[2], result: verdict === 'accept' ? 'clear' : (verdict ?? 'unknown') };
   }
   if (!newest) return null;
   const disposition = readRedTeamDisposition({ comments, pr, head, repo: CONSTELLATION_REPOS.we.slug, env });
-  // An advisory accept is necessary, but recorded send-backs and operator holds
-  // remain authoritative. Missing disposition evidence cannot grant clearance.
+  // Empty finding arrays are not an explicit resolution: the parser can drop
+  // malformed findings and their later rulings. Without aggregate clearance,
+  // require a fresh advisory after any later relevant comment (ties use order).
+  const laterMention = latestMention && (latestMention.at > newest.at
+    || (latestMention.at === newest.at && latestMention.index > newest.index));
   const result = disposition.sendBack.length || disposition.held.length ? 'blocked'
-    : !disposition.result ? 'unknown' : newest.result;
+    : !disposition.result || (newest.result === 'clear' && laterMention) ? 'unknown' : newest.result;
   return { head: newest.head, result };
 }
 
