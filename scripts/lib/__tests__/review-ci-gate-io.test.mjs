@@ -5,6 +5,19 @@ import { join } from 'node:path';
 import { getRequiredStatusChecks } from '../required-status-checks.mjs';
 import { readReviewCiGate as readGate, readReviewHead, readReviewChecks, formatReviewCiSkip } from '../review-ci-gate-io.mjs';
 const readReviewCiGate = o => readGate({ policy: { startAfter: 'ci-green' }, ...o });
+it('logs the shadow opportunity through injected IO and pins early permission to the reread head', () => {
+  const sha = 'a'.repeat(40), log = vi.fn();
+  const io = { repo: 'other/product', pr: 12, readHead: () => sha,
+    readRequired: () => ({ source: 'live', checks: ['test'] }),
+    readChecks: () => [{ name: 'test', head_sha: sha, status: 'in_progress', conclusion: null }],
+    policy: { startAfter: 'ci-green', startEarly: 'shadow' }, log };
+  expect(readGate(io)).toMatchObject({ allowed: false, wouldStartEarly: true, headSha: sha });
+  expect(log).toHaveBeenCalledWith(`review-early-start: would start early on ${sha} (pending: test=pending)`);
+  expect(readGate({ ...io, policy: { ...io.policy, startEarly: 'on' } })).toMatchObject({ allowed: true, earlyStart: true, headSha: sha });
+  expect(readGate({ ...io, policy: { ...io.policy, startEarly: 'on' },
+    readHead: vi.fn().mockReturnValueOnce(sha).mockReturnValueOnce('b'.repeat(40)) }))
+    .toMatchObject({ allowed: false, reason: 'head-changed' });
+});
 const headSha = 'a'.repeat(40);
 it.each(['fast-checks', 'push'])('uses required CI ownership under %s and reports policy on read failures', startAfter => {
   const policy = { startAfter, fastChecks: ['standards'] };

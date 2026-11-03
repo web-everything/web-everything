@@ -6,7 +6,7 @@ import { CONSTELLATION_REPOS, repoKeyForSlug } from './constellation-repos.mjs';
 // cancelOnCiRed: default off (operator 2026-10-16: keep the option, don't use it yet).
 // fastChecks is keyed by repo: only WE's CI publishes these names. A repo without an entry waits on its required checks.
 export const REVIEW_TIMING_DEFAULTS = Object.freeze({
-  startBeforeCi: false, startAfter: 'fast-checks', fastChecks: Object.freeze({ we: Object.freeze(['standards', 'test-shard (1)']) }), cancelOnCiRed: false,
+  startBeforeCi: false, startAfter: 'fast-checks', startEarly: 'shadow', fastChecks: Object.freeze({ we: Object.freeze(['standards', 'test-shard (1)']) }), cancelOnCiRed: false,
   deltaMaxLines: 50, deltaMaxFiles: 3, skipDrainMechanical: true,
   earlyStartShadow: false, earlyStartCare: Object.freeze(['none', 'low']),
   earlyStartMaxLines: 400, earlyStartMaxFiles: 12, earlyStartKinds: Object.freeze(['code']),
@@ -111,20 +111,54 @@ export function earlyStartShadow({ headSha, checks, requiredChecks, verifyGreen,
   } catch { return result('unreadable-checks'); }
   return result('eligible', true);
 }
+/** Validate raw evidence before permitting a pending-only bypass; collapse must not hide malformed rows. */
+function readableEarlyChecks(checks, headSha) {
+  if (!Array.isArray(checks)) return false;
+  return Array.from(checks).every(row => {
+    if (!row || typeof row !== 'object' || Array.isArray(row)
+      || typeof (row.name ?? row.context) !== 'string' || !(row.name ?? row.context).trim()
+      || (row.head_sha != null && row.head_sha !== headSha)) return false;
+    const kind = row.__typename ?? row.type;
+    if (kind != null && !['CheckRun', 'StatusContext'].includes(kind)) return false;
+    const lower = v => typeof v === 'string' ? v.toLowerCase() : '';
+    if (row.state != null) return kind !== 'CheckRun' && row.status == null && row.conclusion == null
+      && ['pending', 'expected', 'success', 'failure', 'error'].includes(lower(row.state));
+    if (kind === 'StatusContext') return false;
+    if (lower(row.status) === 'completed') return ['success', 'failure', 'error', 'neutral', 'skipped', 'cancelled',
+      'timed_out', 'action_required', 'startup_failure', 'stale'].includes(lower(row.conclusion));
+    return ['queued', 'in_progress', 'pending', 'waiting', 'requested'].includes(lower(row.status)) && row.conclusion == null;
+  });
+}
+
+/** Start permission only. Merge/ready decisions must continue using their strict CI gates. */
 export function reviewStartGate({ headSha, checks, requiredChecks, repo, verifyGreen, policy = REVIEW_TIMING_DEFAULTS } = {}) {
-  if (!policy.startBeforeCi && policy.startAfter === 'ci-green') return reviewCiGate({ headSha, checks, requiredChecks });
+  const strict = () => reviewCiGate({ headSha, checks, requiredChecks });
+  const pendingStart = gate => {
+    const mode = policy.startEarly ?? REVIEW_TIMING_DEFAULTS.startEarly;
+    if (!gate.allowed && ciRedOnHead({ headSha, checks, requiredChecks })) return { ...gate, reason: 'ci-red' };
+    if (gate.allowed || !['shadow', 'on'].includes(mode) || typeof headSha !== 'string' || !headSha.trim()
+      || !gate.affected?.length || !gate.affected.every(row => ['pending', 'missing'].includes(row.reason))
+      || !readableEarlyChecks(checks, headSha) || ciRedOnHead({ headSha, checks, requiredChecks })) return gate;
+    if (mode === 'on') return { allowed: true, reason: 'early-pending-ci', earlyStart: true, headSha, affected: gate.affected };
+    return { ...gate, wouldStartEarly: true,
+      earlyStartNote: `review-early-start: would start early on ${headSha} (pending: ${gate.affected.map(row => `${row.name}=${row.reason}`).join(', ')})` };
+  };
+  // Malformed evidence never becomes permission (and must not throw during red detection).
+  if (Array.isArray(checks) && Array.from(checks).some(row => !row || typeof row !== 'object' || Array.isArray(row)))
+    return { allowed: false, headSha, reason: 'malformed', affected: [] };
   // Only required failures have a CI-heal owner. Optional failures, or any red under an unknown set, must not strand review.
   if (Array.isArray(requiredChecks) && requiredChecks.length && ciRedOnHead({ headSha, checks, requiredChecks }))
-    return { allowed: false, headSha, reason: 'ci-red', affected: [] };
+    return { allowed: false, headSha, reason: 'ci-red', affected: policy.startAfter === 'ci-green' ? strict().affected : [] };
+  if (!policy.startBeforeCi && policy.startAfter === 'ci-green') return pendingStart(strict());
   if (policy.startBeforeCi && verifyGreen === true && typeof headSha === 'string' && headSha.trim()) {
     // An unknown required set must not let a red check ride past the marker: any healable red blocks, as in CI-green.
     if (ciRedOnHead({ headSha, checks, requiredChecks: Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks : null }))
       return { allowed: false, headSha, reason: 'ci-red', affected: [] };
     return { allowed: true, headSha, reason: 'verify-marker', affected: [] };
   }
-  if (policy.startAfter === 'ci-green') return reviewCiGate({ headSha, checks, requiredChecks });
+  if (policy.startAfter === 'ci-green') return pendingStart(strict());
   if (policy.startAfter === 'push') return { allowed: typeof headSha === 'string' && !!headSha.trim(), headSha, reason: typeof headSha === 'string' && headSha.trim() ? 'push' : 'missing-head', affected: [] };
-  return reviewCiGate({ headSha, checks, requiredChecks: fastChecksFor(policy.fastChecks, repo) ?? requiredChecks });
+  return pendingStart(reviewCiGate({ headSha, checks, requiredChecks: fastChecksFor(policy.fastChecks, repo) ?? requiredChecks }));
 }
 export function reviewMustVoid({ reviewedHead, currentHead, checks, requiredChecks = null, policy = REVIEW_TIMING_DEFAULTS } = {}) {
   return !reviewedHead || reviewedHead !== currentHead || (policy.cancelOnCiRed && ciRedOnHead({ headSha: currentHead, checks, requiredChecks }));

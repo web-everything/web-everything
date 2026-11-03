@@ -4,9 +4,74 @@ import { REVIEW_TIMING_DEFAULTS as review, FIX_TIMING_DEFAULTS as fix,
 import * as reviewTiming from '../review-timing.mjs';
 import { CI_TRUTH_EXCLUDED_CHECKS } from '../../operations/pr-status.mjs';
 import { resolveTimingPolicy } from '../review-timing-settings.mjs';
+import { resetCascadeLogForTest } from '../policy-cascade.mjs';
 const head = 'a'.repeat(40);
 const check = (name, conclusion = 'success', extra = {}) => ({ name, head_sha: head, status: 'completed', conclusion, ...extra });
 const fast = review.fastChecks.we;
+describe('pending-CI start policy', () => {
+  const args = { headSha: head, repo: 'we', requiredChecks: ['integration'],
+    checks: [check('standards'), check('test-shard (1)', null, { status: 'in_progress' })] };
+  it('starts early only in on mode; shadow reports the opportunity and off is unchanged', () => {
+    const run = startEarly => reviewStartGate({ ...args, policy: { ...review, startEarly } });
+    expect(run('on')).toMatchObject({ allowed: true, reason: 'early-pending-ci', earlyStart: true, headSha: head,
+      affected: [{ name: 'test-shard (1)', reason: 'pending' }] });
+    expect(run('shadow')).toMatchObject({ allowed: false, wouldStartEarly: true,
+      earlyStartNote: `review-early-start: would start early on ${head} (pending: test-shard (1)=pending)` });
+    expect(run('off')).toEqual({ allowed: false, headSha: head, reason: 'required-checks-not-successful',
+      affected: [{ name: 'test-shard (1)', reason: 'pending' }] });
+  });
+  it.each(['fast-checks', 'ci-green'])('allows queued and missing checks under %s', startAfter => {
+    for (const checks of [[], [check('test-shard (1)', null, { status: 'queued' })]]) {
+      expect(reviewStartGate({ ...args, checks, policy: { ...review, startAfter, startEarly: 'on' } }))
+        .toMatchObject({ allowed: true, earlyStart: true, headSha: head });
+    }
+  });
+  it.each(['off', 'shadow', 'on'])('never permits healable red CI in %s mode', startEarly => {
+    for (const startAfter of ['fast-checks', 'ci-green']) {
+      expect(reviewStartGate({ ...args, checks: [...args.checks, check('integration', 'failure')],
+        policy: { ...review, startAfter, startEarly } })).toMatchObject({ allowed: false, reason: 'ci-red' });
+    }
+  });
+  it('fails closed on missing heads, wrong heads, malformed rows, red fast checks and unknown requirements', () => {
+    const policy = { ...review, startEarly: 'on' };
+    for (const override of [
+      { headSha: null }, { checks: null }, { checks: [null] },
+      { checks: [check('standards', 'success', { head_sha: 'b'.repeat(40) })] },
+      { checks: [check('standards', null, { status: 'queued', head_sha: '' })] },
+      { checks: [check('standards', 'failure', { status: 'in_progress' })] },
+      { checks: [check('standards', 'failure')] },
+      { checks: [check('unrelated', null, { status: 'unknown' })] },
+      { checks: [{ name: 'standards', status: 'queued', state: 'success' }] },
+      { policy: { ...policy, startAfter: 'ci-green' }, requiredChecks: [] },
+    ]) {
+      const result = reviewStartGate({ ...args, policy, ...override });
+      expect(result.allowed).toBe(false);
+      expect(result.wouldStartEarly).not.toBe(true);
+      expect(result.earlyStart).not.toBe(true);
+    }
+  });
+  it('resolves startEarly across every layer, rejects invalid values, and logs provenance', () => {
+    const base = { env: {}, read: () => '{}', review: {}, fix: {}, platformReview: {}, platformFix: {} };
+    expect(resolveTimingPolicy(base).review.startEarly).toBe('shadow');
+    expect(resolveTimingPolicy({ ...base, platformReview: { startEarly: 'on' } }).sources.review.startEarly).toBe('platform');
+    expect(resolveTimingPolicy({ ...base, platformReview: { startEarly: 'on' }, review: { startEarly: 'off' } }).review.startEarly).toBe('off');
+    const logs = [];
+    const result = resolveTimingPolicy({ ...base, review: { startEarly: 'off' },
+      env: { WE_REVIEW_START_EARLY: 'on', WE_POLICY_CASCADE_LOG: '1' }, log: line => logs.push(line) });
+    expect(result.review.startEarly).toBe('on');
+    expect(result.sources.review.startEarly).toBe('env');
+    expect(logs.join('\n')).toContain('startEarly="on" (env)');
+    expect(resolveTimingPolicy({ ...base, review: { startEarly: 'on' }, env: { WE_REVIEW_START_EARLY: 'invalid' } }).review.startEarly).toBe('on');
+    expect(resolveTimingPolicy({ ...base, review: { startEarly: true } }).review.startEarly).toBe('shadow');
+  });
+  it('reads the tool timing block while preserving legacy timing leaves', () => {
+    const result = resolveTimingPolicy({ env: {}, platformReview: {}, platformFix: {},
+      read: path => path.endsWith('/settings/review.json') ? '{"timing":{"startEarly":"off"}}'
+        : path.endsWith('/review-settings.json') ? '{"startAfter":"ci-green"}' : '{}' });
+    expect(result.review).toMatchObject({ startAfter: 'ci-green', startEarly: 'off' });
+    expect(result.sources.review.startEarly).toBe('tool');
+  });
+});
 describe('parallel review start and void', () => {
   it('starts after only fast checks, with full CI still pending', () => {
     const checks = [...fast.map(n => check(n)), check('integration', null, { status: 'in_progress' })];
@@ -145,6 +210,7 @@ it('resolves every timing leaf through the cascade, logging sources and rejectin
   expect(result.sources.review).toMatchObject({ startAfter: 'standard', deltaMaxLines: 'env', deltaMaxFiles: 'tool', cancelOnCiRed: 'platform' });
 });
 it('logs each timing setting with its effective source, including enabled defaults', () => {
+  resetCascadeLogForTest();
   const logs = [];
   resolveTimingPolicy({ env: { WE_POLICY_CASCADE_LOG: '1' }, read: () => '{}', review: {}, fix: {}, platformReview: {}, platformFix: {}, log: line => logs.push(line) });
   expect(logs.join('\n')).toContain('startAfter="fast-checks" (standard)');

@@ -39,6 +39,7 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
   readHeadAndLabels = readReviewHeadAndLabels,
   readMergeGateVerdict = defaultReadMergeGateVerdict, readFreeze = readSharedFreeze, mergeGateSetting,
   readVerifyGreen = hasGreenLedger, coordinationRoot,
+  log = line => console.error(line),
   readChecks = readReviewChecks, readRequired = getRequiredStatusChecks, policy = resolveTimingPolicy().review } = {}) {
   let headSha = null;
   let labels;
@@ -96,7 +97,13 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
       try { verifyGreen = readVerifyGreen({ dir: greenLedgerDir({ coordinationRoot: coordinationRoot ?? resolveCoordinationRoot() }), sha: headSha }) === true; }
       catch { /* Unreadable verification waits on CI. */ }
     }
-    return withSource({ ...reviewStartGate({ headSha, repo, requiredChecks, checks, policy, verifyGreen }), checks, requiredChecks });
+    const gate = reviewStartGate({ headSha, repo, requiredChecks, checks, policy, verifyGreen });
+    if (gate.earlyStartNote) {
+      // console is wrapped by the project's daemon logger; injected loggers keep fixtures hermetic.
+      try { log(gate.earlyStartNote.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').slice(0, 2000)); }
+      catch { /* Diagnostics cannot change permission. */ }
+    }
+    return withSource({ ...gate, checks, requiredChecks });
   } catch (error) {
     return { allowed: false, headSha, startAfter: policy.startAfter, reason: 'unreadable-ci', error: String(error?.message ?? error) };
   }
