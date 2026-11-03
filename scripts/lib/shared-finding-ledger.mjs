@@ -22,7 +22,15 @@ function exactMatch(entry, finding) {
 }
 
 /** Suppression also needs the same spot: equal quote anchors and cited lines identical when both sides carry them. */
+const evidence = (f) => JSON.stringify(Object.entries(f ?? {}).filter(([k, v]) => k !== 'category' && v !== undefined).sort(([x], [y]) => (x < y ? -1 : 1)));
+
 function sameSpot(a, b) {
+  // Fail closed: every field except the reviewer's category lens must match, so no evidence difference is ever hidden.
+  if (evidence(a) !== evidence(b)) return false;
+  return sameSpotLine(a, b);
+}
+
+function sameSpotLine(a, b) {
   const ia = normalizeFindingIdentity(a), ib = normalizeFindingIdentity(b);
   if ((a.quote ?? '') !== (b.quote ?? '') || (ia?.anchor ?? '') !== (ib?.anchor ?? '')) return false;
   // Fail closed: a missing line on either side is not the same spot.

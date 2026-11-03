@@ -424,3 +424,12 @@ describe('audit round 14 hardening', () => {
     expect(brief).toContain('curl /admin');
   });
 });
+
+describe('audit round 15 hardening', () => {
+  it('a re-raise with any differing evidence field (prevention) is not suppressed', () => {
+    const a = finding({ preventionCaptured: true });
+    const l = pinFinding(markFixed(record(emptyLedger(), [a]), findingKey(a), { head: H2 }), findingKey(a), PIN);
+    expect(filterReraises(l, [finding({ preventionCaptured: false })], { pinStillHolds: () => true }).dropped).toEqual([]);
+    expect(filterReraises(l, [finding({ preventionCaptured: true, category: 'security' })], { pinStillHolds: () => true }).dropped).toHaveLength(1);
+  });
+});
