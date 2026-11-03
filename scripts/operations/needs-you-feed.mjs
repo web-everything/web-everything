@@ -236,7 +236,9 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
   // "your review" and "needs your merge" rows both ask the operator to approve: both pass the same live red-team gate.
   const ready = new Set([...(report.ready ?? []), ...(report.needsYourMerge ?? [])].map((r) => `${r.repo}#${r.number ?? r.pr}`));
   const deadline = Date.now() + deadlineMs;
-  const undecided = item => ({ ...item, kind: 'red-team-undecided',
+  // A reclassified item no longer carries the approve/merge instruction it came with.
+  const stripAction = ({ command, pick, ...rest }) => rest;
+  const undecided = item => ({ ...stripAction(item), kind: 'red-team-undecided',
     reason: 'the red team has no result recorded on the live head' });
   const out = new Array(items.length); const held = [];
   const judge = async (index) => {
@@ -252,7 +254,6 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
       checked = { ...item, head: view.headRefOid };
       const reasons = humanReviewHold({ ...view, labels: view.labels ?? [] }, now,
         { fixClaimLive: fixClaimLive(item.repo, item.pr) });
-      if (reasons.length) { held.push({ item, reasons }); return; }
       const state = liveResultGateState(view.comments, item.pr, view.headRefOid, item.repo);
       // The shared disposition (red-team-gate) decides what still holds on the live head; no private marker parser.
       const disposition = state.result === null ? null
@@ -263,8 +264,10 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
       const settled = f => !open.has(f.index) && (disposition?.rulings.get(f.index) ?? []).some(r => r.source === 'operator' && r.kind !== 'block');
       const owed = state.sendBackOutcome === GATE_OUTCOMES.SENT_BACK || state.sendBackOutcome === GATE_OUTCOMES.ROUND_CAP
         || (state.result?.findings ?? []).some(f => f.confirmed && !settled(f));
+      // A confirmed break is classified before the hold: a hold (blocked, sent back) must not hide the alert.
+      if (reasons.length && !owed) { held.push({ item, reasons }); return; }
       if (owed) {
-        out[index] = verified({ ...checked, kind: 'confirmed-break-owed-send-back',
+        out[index] = verified({ ...stripAction(checked), kind: 'confirmed-break-owed-send-back',
           reason: 'a confirmed red-team break is owed a send-back on the live head' });
       } else if (state.result !== null && !state.result.findings.some(f => f.recheckOutcome === 'unverifiable') && headlineAgrees(view.comments, item.pr, view.headRefOid)) out[index] = verified(checked);
       else out[index] = undecided(checked);

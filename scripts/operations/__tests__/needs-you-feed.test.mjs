@@ -343,6 +343,7 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
   const report = { ready: [{ repo, number: 5768, title: 't' }], needsYourMerge: [{ repo, number: 9, title: 'm' }] };
   const gate = (view, comments) => async (_f, args) => (args[0] === 'api' ? JSON.stringify([comments]) : JSON.stringify(view));
   const items = () => itemsFromReport(report);
+  const bare = ({ command, pick, ...rest }) => rest; // reclassified items drop the approve/merge instruction
   const gateComments = ({ pr = 5768, rev = head, outcome = GATE_OUTCOMES.NOTHING_TO_SEND, broken = false, impact = 'broken' } = {}) => {
     const body = renderRedTeamComment({ pr, rev, provider: 'codex', model: 'm', recheckStatus: 'ok',
       foldedVerdict: broken ? 'changes' : 'accepted', findings: broken ? [{ summary: 'confirmed break',
@@ -372,7 +373,7 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     });
     expect(held).toEqual([]);
     expect(kept).toHaveLength(1);
-    expect(kept[0]).toEqual({ ...original[0], head, kind: 'confirmed-break-owed-send-back', reason: expect.any(String) });
+    expect(kept[0]).toEqual({ ...bare(original[0]), head, kind: 'confirmed-break-owed-send-back', reason: expect.any(String) });
     expect(kept[0].reason).toMatch(/confirmed red-team break.*owed.*send-back/i);
     expect(kept[0].reason).not.toContain('all gates pass');
   });
@@ -387,7 +388,7 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     });
     expect(held).toEqual([]);
     expect(kept).toHaveLength(2);
-    expect(expectUndecided(kept)).toEqual({ ...items()[0], head, kind: 'red-team-undecided', reason: expect.any(String) });
+    expect(expectUndecided(kept)).toEqual({ ...bare(items()[0]), head, kind: 'red-team-undecided', reason: expect.any(String) });
     expect(kept.find(i => i.pr === 9)).toMatchObject({ kind: 'red-team-undecided' });
   });
 
@@ -529,7 +530,7 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     const logs = [];
     const { kept } = await gateReadyItems(items(), report, { gh: async () => { throw new Error('rate limited'); }, log: (l) => logs.push(l) });
     expect(kept.map((i) => i.pr).sort((a, b) => a - b)).toEqual([9, 5768]);
-    expect(expectUndecided(kept)).toEqual({ ...items()[0], kind: 'red-team-undecided', reason: expect.any(String) });
+    expect(expectUndecided(kept)).toEqual({ ...bare(items()[0]), kind: 'red-team-undecided', reason: expect.any(String) });
     expect(logs.join()).toMatch(/live gate unreadable, keeping: rate limited/);
   });
   it('runOnce applies the gate by default and logs what it held back', async () => {
@@ -573,7 +574,7 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     const { kept, held } = await gateReadyItems(items(), report, { gh, log: (l) => logs.push(l), deadlineMs: -1 });
     expect(held).toEqual([]);
     expect(kept.map((i) => i.pr).sort((a, b) => a - b)).toEqual([9, 5768]);
-    expect(expectUndecided(kept)).toEqual({ ...items()[0], kind: 'red-team-undecided', reason: expect.any(String) });
+    expect(expectUndecided(kept)).toEqual({ ...bare(items()[0]), kind: 'red-team-undecided', reason: expect.any(String) });
     expect(gh).not.toHaveBeenCalled();
     expect(logs.join()).toMatch(/gate deadline/);
   });
