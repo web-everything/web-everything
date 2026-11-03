@@ -995,7 +995,7 @@ export async function runLiveSmoke({
       try {
         const checkEnv = ['reconcile-dry-run', 'dispatch-dry-run'].includes(check.name)
           ? { ...env, GH_CALLER: `rebuild-smoke:${check.name}`,
-            ...(env.WE_GH_THROTTLE_BACKGROUND_WAIT_MS ? {} : { WE_GH_THROTTLE_BACKGROUND_WAIT_MS: String(ghSlotWait.backgroundWaitMs) }),
+            ...(env.WE_GH_THROTTLE_BACKGROUND_WAIT_MS || !(typeof hostBusy === 'function' ? hostBusy() : hostLooksBusy(env)) ? {} : { WE_GH_THROTTLE_BACKGROUND_WAIT_MS: String(ghSlotWait.backgroundWaitMs) }),
             ...(memoDir ? { [WE_GH_READ_MEMO_DIR]: memoDir } : {}),
             ...(dryRun.prSample ? { [WE_PR_SNAPSHOT_SAMPLE]: String(dryRun.prSample) } : {}),
             ...(dryRun.snapshotStaleOkMs ? { [WE_PR_SNAPSHOT_STALE_OK_MS]: String(dryRun.snapshotStaleOkMs) } : {}) } : env;

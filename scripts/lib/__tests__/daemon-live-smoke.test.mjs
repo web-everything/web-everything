@@ -942,11 +942,11 @@ describe('smoke read memo', () => {
     expect(resolveSmokeGhSlotWait({ WE_SMOKE_GH_SLOT_WAIT_MS: '999999' }).backgroundWaitMs).toBe(45_000);
   });
 
-  it('lengthens the gh slot wait for the dry-run children only; an explicit throttle env wins', async () => {
-    const run = async (env) => {
+  it('lengthens the gh slot wait for the dry-run children only, only on a busy host; an explicit throttle env wins', async () => {
+    const run = async (env, hostBusy = () => true) => {
       const calls = [];
       const inner = withNewCheckDefaults(async () => '');
-      await runLiveSmoke({ root: tmpdir(), env: { WE_SMOKE_READ_MEMO: '0', ...env }, runChild: async (cmd, args, opts) => { calls.push({ args, env: opts.env }); return inner(cmd, args, opts); } });
+      await runLiveSmoke({ root: tmpdir(), hostBusy, env: { WE_SMOKE_READ_MEMO: '0', ...env }, runChild: async (cmd, args, opts) => { calls.push({ args, env: opts.env }); return inner(cmd, args, opts); } });
       const dry = (c) => c.args[0] === 'scripts/conveyor/reconcile-pass.mjs' || (c.args[0] === '--input-type=module' && c.args[2] === DISPATCH_DRY_RUN_SCRIPT);
       return { dry: calls.filter(dry), other: calls.filter((c) => !dry(c)) };
     };
@@ -954,6 +954,8 @@ describe('smoke read memo', () => {
     expect(a.dry.length).toBeGreaterThan(0);
     for (const c of a.dry) expect(c.env.WE_GH_THROTTLE_BACKGROUND_WAIT_MS).toBe('45000');
     for (const c of a.other) expect(c.env?.WE_GH_THROTTLE_BACKGROUND_WAIT_MS).toBeUndefined();
+    const idle = await run({}, () => false); // an idle host keeps the standard 8s wait
+    for (const c of idle.dry) expect(c.env.WE_GH_THROTTLE_BACKGROUND_WAIT_MS).toBeUndefined();
     const b = await run({ WE_GH_THROTTLE_BACKGROUND_WAIT_MS: '5000' });
     for (const c of b.dry) expect(c.env.WE_GH_THROTTLE_BACKGROUND_WAIT_MS).toBe('5000');
   });
