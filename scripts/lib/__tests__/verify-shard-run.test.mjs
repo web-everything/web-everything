@@ -11,6 +11,8 @@ import { allowedCommand } from '../../readiness/forge-exec-run.mjs';
 import { runRemote } from '../../readiness/remote-exec.mjs';
 import { keepAliveScript } from '../test-keepalive.mjs';
 import { pidIdentity } from '../pid-alive.mjs';
+import { createFailureCollector } from '../verify-failures.mjs';
+import { verifyFinishBody } from '../lane-verify.mjs';
 import { splitVitestArgs, runShards, executeShard, inventoryVerdict, parseShardCli, streamedInventory, SHARD_REPORT_MAX_BYTES, SHARD_UNSETTLED_EXIT } from '../verify-shard-run.mjs';
 
 describe('shard split', () => {
@@ -313,6 +315,24 @@ describe('one split retry for incomplete inventory', () => {
     const f = await run(['missing', mode, 'pass']);
     expect(f.code).toBe(137); expect(f.output).toContain('verify-shards: RED');
     expect(f.calls.map(c => c.files)).toEqual([['a', 'b', 'c', 'd'], ['a', 'b']]);
+  });
+  it.each(['killed', 'signal'])('failed assertion with missing inventory then %s retry stays red with failure details', async mode => {
+    const initial = { exitCode: 1, reportText: JSON.stringify({ testResults: [{ name: 'a.test.mjs', status: 'failed',
+      assertionResults: [{ status: 'failed', fullName: 'retained assertion', failureMessages: ['expected true, received false'] }] }] }) };
+    const f = await run([initial, mode, 'pass'], ['a.test.mjs', 'b.test.mjs']);
+    expect(f.code).toBe(1);
+    expect(f.output).toContain('INVENTORY-INCOMPLETE; retrying once');
+    expect(f.output).toContain('retry infrastructure failure; retaining observed test failure');
+    expect(f.output).toContain('verify-shards: RED (1:FAIL;');
+    expect(f.output).toContain('expected true, received false');
+    expect(f.calls.map(c => c.files)).toEqual([['a.test.mjs', 'b.test.mjs'], ['a.test.mjs']]);
+    const collector = createFailureCollector();
+    collector.push(f.output);
+    const failureDetails = collector.finish();
+    expect(failureDetails.tests).toEqual([{ file: 'a.test.mjs', name: 'retained assertion' }]);
+    const record = verifyFinishBody({ sha: 'a'.repeat(40) }, { exitCode: f.code, failureDetails });
+    expect(record).toMatchObject({ status: 'red', failureDetails });
+    expect(record.infrastructure).toBeUndefined();
   });
   it('NOT-RUN after budget exhaustion launches neither split half', async () => {
     const f = await run(['exhausted', 'pass', 'pass']);

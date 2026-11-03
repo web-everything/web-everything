@@ -1037,7 +1037,7 @@ const retryAudit = isolatedRetryAudit(retriedFailures, isolatedRetry);
 const diagnostic = { ...(exitCode === 0 ? {} : { failureDetails }), ...retryAudit };
 const retryDetail = describeIsolatedRetry(retryAudit);
 // Item 99 — why the gate was red (also when a flaky failure outside the diff went green alone), with the files.
-const infrastructure = verificationInfrastructureFailure({ exitCode, signal, ...(phaseTimeout ? { timedOutPhase: phaseTimeout.phase, ceilingMs: phaseTimeout.ceilingMs, killer: 'verify-lane' } : {}) })
+const infrastructure = verificationInfrastructureFailure({ exitCode, signal, failureDetails, ...(phaseTimeout ? { timedOutPhase: phaseTimeout.phase, ceilingMs: phaseTimeout.ceilingMs, killer: 'verify-lane' } : {}) })
   ?? (remoteUnconfirmed ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null);
 // The gate's own diff plus whatever was edited while it queued or ran (the same set the isolated retry judges against).
 const diffFiles = Array.isArray(resolvedGate?.decision?.changedFiles) ? [...new Set([...resolvedGate.decision.changedFiles, ...editedDuringRun])] : resolvedGate?.decision?.changedFiles;

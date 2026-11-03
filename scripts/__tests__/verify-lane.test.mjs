@@ -1358,6 +1358,18 @@ describe('red diagnostics transport', () => {
     const result = spawnSync('node', [VERIFY_LANE, ...args, '--json'], { cwd: dir, encoding: 'utf8' });
     return { code: result.status, json: JSON.parse(result.stdout.trim().split('\n').at(-1)), stdout: result.stdout };
   }
+  it.each([['marker', []], ['run', ['run']]])('exit 75 with recorded failures stays red with details: %s', (_label, mode) => {
+    const result = invoke([...mode, `--gate=printf ' FAIL  example.test.ts > outer > broken\\n'; exit 75`]);
+    expect(result.code).toBe(2);
+    expect(result.json).toMatchObject({ status: 'red', exitCode: 75,
+      failureDetails: { tests: [{ file: 'example.test.ts', name: 'outer > broken' }] } });
+    expect(result.json.infrastructure).toBeUndefined();
+    if (!mode.length) {
+      const record = JSON.parse(readFileSync(marker(), 'utf8'));
+      expect(record).toMatchObject({ status: 'red', exitCode: 75, failureDetails: result.json.failureDetails });
+      expect(record.infrastructure).toBeUndefined();
+    }
+  });
   it('streams the evidence and round trips marker, check and wait; green clears', () => {
     const ran = invoke([`--gate=${gate}`]);
     expect(ran.code).toBe(2);

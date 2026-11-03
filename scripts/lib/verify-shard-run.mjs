@@ -6,6 +6,7 @@ import { join, resolve, dirname } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { readRemoteReport, shouldConfirmRemoteRed, phaseRunLocation } from './verify-remote-routing.mjs';
 import { verificationInfrastructureFailure } from './lane-verify.mjs';
+import { boundFailureDetails } from './verify-failures.mjs';
 import { SHARD_UNSETTLED_EXIT } from './verify-exit-codes.mjs';
 export { SHARD_UNSETTLED_EXIT } from './verify-exit-codes.mjs';
 import { startTreeWatchdog } from './tree-watchdog.mjs';
@@ -175,7 +176,7 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
     const { shards, flags } = splitVitestArgs(argv, Math.max(1, Math.min(count, planned.length - excluded.length)));
     const deadline = now() + budgetMs, results = new Array(shards.length);
     directory = fs.mkdtempSync(join(tmpdir(), 'verify-shards-'));
-    let next = 0, infraExit = 0, stopLaunching = false;
+    let next = 0, infraExit = 0, stopLaunching = false, failureBeforeInfra = false;
     // The slot helpers identify holders by process. Serialize confirmation in
     // this process so one confirmation cannot release another's slot.
     let localTail = Promise.resolve();
@@ -205,6 +206,8 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
           if (result.timedOut || result.exitCode === 124) return 'TIMEOUT';
           if (verificationInfrastructureFailure(result) && result.exitCode !== SHARD_UNSETTLED_EXIT) {
             infraExit ||= result.signal ? 137 : result.exitCode;
+            failureBeforeInfra ||= observedFailure;
+            if (observedFailure) log(`verify-shard ${index + 1}/${shards.length}: retry infrastructure failure; retaining observed test failure\n`);
             return 'FAIL';
           }
           let inventory, reportText;
@@ -219,10 +222,23 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
           observedFailure ||= inventory === 'FAIL';
           try {
             const report = JSON.parse(reportText);
-            observedFailure ||= report?.success === false || report?.numRuntimeErrors > 0
+            const reportFailed = report?.success === false || report?.numRuntimeErrors > 0
               || report?.numFailedTestSuites > 0 || report?.numFailedTests > 0
               || (Array.isArray(report?.testResults) && report.testResults.some(r => r?.status === 'failed'
                 || (Array.isArray(r?.assertionResults) && r.assertionResults.some(a => a?.status === 'failed'))));
+            observedFailure ||= reportFailed;
+            if (reportFailed) {
+              // Re-emit bounded identities outside the JSON/prefixed child output so
+              // verify-lane's failure collector retains them even if a retry dies.
+              const details = boundFailureDetails({ tests: (report?.testResults ?? []).flatMap(r => {
+                const failed = (r?.assertionResults ?? []).filter(a => a?.status === 'failed');
+                return failed.length ? failed.map(a => ({ file: r.name, name: a.fullName ?? a.title ?? null }))
+                  : r?.status === 'failed' ? [{ file: r.name, name: null }] : [];
+              }), summary: reportText, truncated: false });
+              const clean = text => String(text).replace(/[\x00-\x1f\x7f]/g, ' ');
+              for (const test of details.tests) log(`FAIL ${clean(test.file)}${test.name ? ` > ${clean(test.name)}` : ''}\n`);
+              log(`verify-shard ${index + 1}/${shards.length}: observed failure ${clean(details.summary)}\n`);
+            }
           } catch { /* Unparseable reports contain no observed test failure. */ }
           if (inventory === 'INVENTORY-INCOMPLETE') {
             // Exit 75 signals unsettled evidence; other nonzero child exits
@@ -296,6 +312,9 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
       return SHARD_UNSETTLED_EXIT;
     }
     log(`verify-shards: RED (${results.map((r, i) => `${i + 1}:${r}`).join(', ')}; inspect shard output and rerun the affected selection)\n`);
+    // A later infrastructure exit cannot replace an already observed test verdict
+    // and cause verify-lane to discard its recorded failure details.
+    if (failureBeforeInfra) return 1;
     if (infraExit > 0 && infraExit < 256 && infraExit !== 124) return infraExit;
     return results.some(r => ['TIMEOUT', 'NOT-RUN'].includes(r)) ? 124 : 1;
   } catch (error) {
