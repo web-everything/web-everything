@@ -7,7 +7,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import {
-  normScope, isSubtreeEntry, coversFile, scopeEntriesOverlap, scopesOverlap,
+  normScope, isSubtreeEntry, coversFile, globsMayIntersect, scopeEntriesOverlap, scopesOverlap,
   scopeLease, breachOf,
   overlapAtLaunch, OVERLAP_POLICIES,
   breachOutcome, BREACH_POLICIES, RETRY_BOUND, BREACH_ESCALATION_LADDER, ESCALATION_ROUTES,
@@ -101,6 +101,61 @@ describe('scopeEntriesOverlap / scopesOverlap — module-pattern overlap (mirror
     expect(scopesOverlap(['we:a', 'we:b'], ['we:c', 'we:b/x.ts'])).toBe(true);
     expect(scopesOverlap(['we:a', 'we:b'], ['we:c', 'we:d'])).toBe(false);
     expect(scopesOverlap([], ['we:a'])).toBe(false);
+  });
+});
+
+describe('glob intersection — conservative scope contention', () => {
+  it('single stars cannot cross path segments', () => {
+    expect(globsMayIntersect('src/*.mjs', 'src/x/*.mjs')).toBe(false);
+  });
+  it('question marks consume exactly one character', () => {
+    expect(globsMayIntersect('src/a?b.mjs', 'src/ac*.mjs')).toBe(true);
+    expect(globsMayIntersect('src/a?b.mjs', 'src/ab.mjs')).toBe(false);
+    expect(globsMayIntersect('src/a?b.mjs', 'src/a/x/b.mjs')).toBe(false);
+  });
+  it('globstars match zero or many segments on either side', () => {
+    expect(globsMayIntersect('src/**/a*b.mjs', 'src/ab*.mjs')).toBe(true);
+    expect(globsMayIntersect('src/ab*.mjs', 'src/**/a*b.mjs')).toBe(true);
+    expect(globsMayIntersect('src/**/a*b.mjs', 'src/x/y/ab*.mjs')).toBe(true);
+    expect(globsMayIntersect('src/**/a.mjs', 'other/**/a.mjs')).toBe(false);
+  });
+  it('bare and trailing-slash directory entries cover descendants of globbed parents', () => {
+    expect(globsMayIntersect('src/ab', 'src/a*/child.mjs')).toBe(true);
+    expect(globsMayIntersect('src/ab.v2/', 'src/a*/child.mjs')).toBe(true);
+    expect(globsMayIntersect('src/ab.mjs', 'src/a*/child.mjs')).toBe(false);
+  });
+  it('long-star patterns finish within a bounded budget', () => {
+    const start = performance.now();
+    expect(scopeEntriesOverlap(`we:src/a${'*a'.repeat(200)}*b.mjs`, `we:src/ab${'*a'.repeat(200)}*.mjs`)).toBe(true);
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
+  it('oversized patterns conservatively contend instead of exhausting the matcher', () => {
+    expect(globsMayIntersect(`src/a${'*a'.repeat(3000)}.mjs`, 'other/b*.mjs')).toBe(true);
+  });
+  it('unrecognised embedded globstars conservatively contend', () => {
+    expect(globsMayIntersect('src/a**b.mjs', 'other/x.mjs')).toBe(true);
+  });
+  it('finds a common filename even when neither glob matches the other glob text', () => {
+    expect(scopeEntriesOverlap('we:src/a*b.mjs', 'we:src/ab*.mjs')).toBe(true);
+    expect(scopeEntriesOverlap('we:src/ab*.mjs', 'we:src/a*b.mjs')).toBe(true);
+  });
+  it('globstar covers nested files and zero intervening segments', () => {
+    expect(scopeEntriesOverlap('we:src/**', 'we:src/x/y.mjs')).toBe(true);
+    expect(scopeEntriesOverlap('we:src/**/a*b.mjs', 'we:src/ab*.mjs')).toBe(true);
+  });
+  it('two single-star globs under different depths are disjoint end to end', () => {
+    expect(scopeEntriesOverlap('we:src/*.mjs', 'we:src/x/*.mjs')).toBe(false);
+  });
+  it('keeps literal file equality and inequality unchanged', () => {
+    expect(scopeEntriesOverlap('we:src/a.mjs', 'we:src/a.mjs')).toBe(true);
+    expect(scopeEntriesOverlap('we:src/a.mjs', 'we:src/b.mjs')).toBe(false);
+  });
+  it('keeps repository boundaries even for intersecting or unsupported globs', () => {
+    expect(scopeEntriesOverlap('we:src/a*b.mjs', 'fui:src/ab*.mjs')).toBe(false);
+    expect(scopeEntriesOverlap('we:src/[ab].mjs', 'fui:src/a.mjs')).toBe(false);
+  });
+  it.each(['[ab]', '{a,b}', '!a'])('fails closed for unsupported syntax %s', (syntax) => {
+    expect(scopeEntriesOverlap(`we:src/${syntax}.mjs`, 'we:other/z.mjs')).toBe(true);
   });
 });
 
