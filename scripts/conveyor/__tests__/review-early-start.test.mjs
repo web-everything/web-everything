@@ -50,7 +50,8 @@ describe('early review never grants landing permission', () => {
     const policy = { ...REVIEW_TIMING_DEFAULTS, startAfter: 'ci-green', startEarly };
     for (const checks of [[row('in_progress')], [row('completed', 'failure')]]) {
       const start = reviewStartGate({ headSha, checks, requiredChecks: ['test'], policy });
-      if (checks[0].conclusion === 'failure') expect(start).toMatchObject({ allowed: false, reason: 'ci-red' });
+      if (checks[0].conclusion === 'failure') expect(start).toMatchObject({ allowed: false,
+        reason: startEarly === 'off' ? 'required-checks-not-successful' : 'ci-red' });
       else if (startEarly === 'on') expect(start).toMatchObject({ allowed: true, earlyStart: true });
       // Model a stored accepted verdict on precisely this head, including an accidentally present ready label.
       const accepted = { ...pr(checks), reviewedSha: headSha, earlyStart: true };

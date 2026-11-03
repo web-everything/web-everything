@@ -9,6 +9,16 @@ const head = 'a'.repeat(40);
 const check = (name, conclusion = 'success', extra = {}) => ({ name, head_sha: head, status: 'completed', conclusion, ...extra });
 const fast = review.fastChecks.we;
 describe('pending-CI start policy', () => {
+  it('off preserves the exact pre-early-start ci-green refusal for completed red CI', () => {
+    expect(reviewStartGate({ headSha: head, requiredChecks: ['test'], checks: [check('test', 'failure')],
+      policy: { ...review, startAfter: 'ci-green', startEarly: 'off' } })).toEqual({ allowed: false,
+      headSha: head, reason: 'required-checks-not-successful', affected: [{ name: 'test', reason: 'failure' }] });
+  });
+  it('off preserves strict fast-check failure diagnostics when the required set is unknown', () => {
+    expect(reviewStartGate({ headSha: head, checks: [check('test', 'failure')],
+      policy: { ...review, startAfter: 'fast-checks', fastChecks: ['test'], startEarly: 'off' } })).toEqual({
+      allowed: false, headSha: head, reason: 'required-checks-not-successful', affected: [{ name: 'test', reason: 'failure' }] });
+  });
   it.each(['push', 'fast-checks', 'ci-green'])('requires every prerequisite registered on this head under %s', startAfter => {
     const names = ['standards', 'test'];
     for (const startEarly of ['on', 'shadow']) {
@@ -125,7 +135,8 @@ describe('pending-CI start policy', () => {
   it.each(['off', 'shadow', 'on'])('never permits healable red CI in %s mode', startEarly => {
     for (const startAfter of ['fast-checks', 'ci-green']) {
       expect(reviewStartGate({ ...args, checks: [...args.checks, check('integration', 'failure')],
-        policy: { ...review, startAfter, startEarly } })).toMatchObject({ allowed: false, reason: 'ci-red' });
+        policy: { ...review, startAfter, startEarly } })).toMatchObject({ allowed: false,
+        reason: startEarly === 'off' && startAfter === 'ci-green' ? 'required-checks-not-successful' : 'ci-red' });
     }
   });
   it('fails closed on missing heads, wrong heads, malformed rows, red fast checks and unknown requirements', () => {

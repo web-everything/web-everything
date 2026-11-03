@@ -161,12 +161,14 @@ function registeredStartGate({ headSha, checks, requiredChecks }) {
 /** Start permission only. Merge/ready decisions must continue using their strict CI gates. */
 export function reviewStartGate({ headSha, checks, requiredChecks, repo, verifyGreen, policy = REVIEW_TIMING_DEFAULTS } = {}) {
   const strict = () => reviewCiGate({ headSha, checks, requiredChecks });
+  // Rollback preserves the original strict CI-green result, including its reason and affected rows.
+  if (policy.startEarly === 'off' && !policy.startBeforeCi && policy.startAfter === 'ci-green') return strict();
   const prerequisites = policy.startAfter === 'ci-green' ? requiredChecks : fastChecksFor(policy.fastChecks, repo) ?? requiredChecks;
   const registered = () => registeredStartGate({ headSha, checks, requiredChecks: prerequisites });
   const pendingStart = gate => {
     const mode = policy.startEarly ?? REVIEW_TIMING_DEFAULTS.startEarly;
-    if (!gate.allowed && ciRedOnHead({ headSha, checks, requiredChecks })) return { ...gate, reason: 'ci-red' };
     if (!['shadow', 'on'].includes(mode)) return gate;
+    if (!gate.allowed && ciRedOnHead({ headSha, checks, requiredChecks })) return { ...gate, reason: 'ci-red' };
     // Retain other strict refusals; registration also applies when an aggregate implied a missing prerequisite.
     if (gate.allowed || !gate.affected?.length || gate.affected.every(row => ['pending', 'missing'].includes(row.reason))) gate = registered();
     if (gate.allowed || !['shadow', 'on'].includes(mode) || typeof headSha !== 'string' || !headSha.trim()
