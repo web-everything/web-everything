@@ -11,7 +11,7 @@ const raw = readFileSync(new URL('../../../.github/workflows/ci.yml', import.met
 const { jobs } = yaml.load(raw);
 const fetchMain = 'git fetch --no-tags --filter=blob:none --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main';
 // Historical full-history WE checkouts; `test` is intentionally gone from this roster.
-const historyJobs = ['changes', 'standards', 'integration', 'daemon-soak-scope', 'test-selection-measure'];
+const historyJobs = ['changes', 'standards', 'integration', 'daemon-soak-scope'];
 
 describe('ci.yml shallow checkouts with blobless main history', () => {
   it('only unit test-shard and soak-shard use full history for live-git tests and quarantine ancestry', () => {
@@ -81,4 +81,37 @@ describe('ci.yml shallow checkouts with blobless main history', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   }, 20_000);
+});
+
+describe('test-selection-measure lives in its own workflow (R523)', () => {
+  const own = yaml.load(readFileSync(new URL('../../../.github/workflows/test-selection-measure.yml', import.meta.url), 'utf8'));
+  const job = own.jobs['test-selection-measure'];
+
+  it('is gone from ci.yml and no ci.yml job needs it', () => {
+    expect(jobs['test-selection-measure']).toBeUndefined();
+    for (const j of Object.values(jobs)) expect([j.needs ?? []].flat()).not.toContain('test-selection-measure');
+  });
+
+  it('has its own concurrency group, never cancels, and stays non-gating and gated by the repo var', () => {
+    expect(own.concurrency.group).toMatch(/^test-selection-measure-/);
+    expect(own.concurrency['cancel-in-progress']).toBe(false);
+    expect(Object.keys(own.on).sort()).toEqual(['push', 'workflow_dispatch']);
+    expect(job['continue-on-error']).toBe(true);
+    expect(job['timeout-minutes']).toBe(30);
+    expect(job.if).toContain("vars.WE_MEASURE_TEST_SELECTION == '1'");
+  });
+
+  it('bounds the shadow suite steps below the job timeout so they fail soft', () => {
+    for (const n of ['Shadow full-suite run (json report)', 'Shadow integration-suite run (json report)']) {
+      const s = job.steps.find((x) => x.name === n);
+      expect(s['timeout-minutes']).toBeLessThan(30);
+      expect(s['continue-on-error']).toBe(true);
+    }
+  });
+
+  it('keeps the shallow checkout plus blobless main fetch', () => {
+    const i = job.steps.findIndex((s) => s.uses?.startsWith('actions/checkout@') && !s.with?.repository);
+    expect(job.steps[i].with['fetch-depth']).toBe(50);
+    expect(job.steps[i + 1].name).toBe('Fetch main history (blobless)');
+  });
 });

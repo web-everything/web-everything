@@ -1,0 +1,123 @@
+name: Test-selection measure
+
+# Diff-driven test-selection MEASURE lane (#2681), moved out of ci.yml (R523): this non-gating job ran to its
+# 30-minute cap while holding ci.yml's `ci-${{ github.ref }}` concurrency group, which does not cancel on main
+# (#5000), so it delayed every main CI verdict. Its own workflow + own group means it never holds main CI and
+# never cancels another workflow. Evidence-gathering only: nothing requires this check.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: test-selection-measure-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test-selection-measure:
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.WE_MEASURE_TEST_SELECTION == '1' }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    # xd1sfms (#4075/#3383) — this lane is OFF by default today (see the `if:` above), so no successful
+    # run in the 2026-09-25 sample ever executed it (every sampled run shows it `skipped`) — no real p95
+    # exists yet. Sized conservatively off its own steps instead: it runs the FULL unsharded unit suite
+    # once (unlike `test-shard`'s 1/9 coverage split) plus the full real-git integration suite, so budget well
+    # above a single shard's 15min. `continue-on-error: true` already keeps a genuine timeout here from
+    # ever reddening CI; this only stops a hang from tying up a runner for the 360-min default.
+    timeout-minutes: 30
+    steps:
+      # Same sibling layout as `test-shard` — the unit suite needs the FUI sibling for the `@frontierui/*` alias.
+      # Shallow checkout plus blobless main history preserves the pinned-base merge base (#2681).
+      - name: Checkout WE
+        uses: actions/checkout@v4
+        with:
+          path: web-everything
+          fetch-depth: 50
+      - name: Fetch main history (blobless)
+        working-directory: web-everything
+        run: git fetch --no-tags --filter=blob:none --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main
+      - name: Mint FUI read token (GitHub App)
+        id: fui-app-token
+        if: vars.WE_APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.WE_APP_ID }}
+          private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}
+          owner: frontier-ui
+          repositories: frontierui
+          permission-contents: read
+      - name: Checkout FUI (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: frontier-ui/frontierui
+          token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
+          path: frontierui
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            web-everything/package-lock.json
+            frontierui/package-lock.json
+
+      - name: Install + build FUI tools
+        working-directory: frontierui
+        run: |
+          npm ci
+          npm run build:tools
+
+      - name: Install
+        working-directory: web-everything
+        run: npm ci
+
+      # The shadow FULL run — the whole unit suite with the json reporter, so the measure step has per-file
+      # pass/fail. `|| true`: a red shadow run must still record (the false-green signal LIVES in a red full run).
+      - name: Shadow full-suite run (json report)
+        timeout-minutes: 15
+        continue-on-error: true
+        working-directory: web-everything
+        run: npx vitest run --reporter=json --outputFile=vitest-full.json || true
+
+      # Record the false-green sample: decide off the diff, compare against the shadow full run's failures, append.
+      - name: Record false-green signal (#2681)
+        working-directory: web-everything
+        run: node scripts/readiness/test-selection.mjs --measure --vitest-json=vitest-full.json
+        env:
+          # Evaluate the decision AS IF the shrink were on, so the measure reflects what shrink WOULD do —
+          # without any real gate depending on it (this job gates nothing).
+          WE_DIFF_TEST_SELECTION: "1"
+          WE_FALSE_GREEN_LOG: false-green-log.json
+
+      - name: Upload false-green sample
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: false-green-signal
+          path: web-everything/false-green-log.json
+          if-no-files-found: warn
+
+      # Free byproduct of the shadow run above: per-test durations are already in vitest-full.json, this
+      # job just never looked at them. Printed straight into the CI log (no artifact download needed) as an
+      # early-warning signal for individual slow tests and files creeping up before they dominate a shard —
+      # this job runs the SAME real-git/subprocess integration config as `npm run test:integration:vitest`
+      # too, so both tiers are covered. Report-only: never fails the job.
+      - name: Report slowest tests (unit)
+        if: always()
+        working-directory: web-everything
+        run: node scripts/dev/report-slow-tests.mjs vitest-full.json --top=40 || true
+
+      - name: Shadow integration-suite run (json report)
+        if: always()
+        timeout-minutes: 8
+        continue-on-error: true
+        working-directory: web-everything
+        run: npx vitest run --config vitest.integration.config.ts --reporter=json --outputFile=vitest-integration.json || true
+
+      - name: Report slowest tests (integration)
+        if: always()
+        working-directory: web-everything
+        run: node scripts/dev/report-slow-tests.mjs vitest-integration.json --top=40 || true
