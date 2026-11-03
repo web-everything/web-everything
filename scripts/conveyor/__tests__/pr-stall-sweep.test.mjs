@@ -62,11 +62,11 @@ const reader = (gh, unreadable = false) => {
 describe('settings', () => {
   const file = (block) => (path) => { if (String(path).endsWith('pr-stall-sweep.json')) return JSON.stringify({ prStallSweep: block }); const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; };
   const log = () => {};
-  it('repository shared ceiling resolves to one with tool provenance', () => {
+  it('repository shared ceiling resolves to two (R452) with tool provenance', () => {
     const log = vi.fn();
     const result = resolveStallSweepSettings({ env: { WE_POLICY_CASCADE_LOG: '1' }, log });
-    expect(result).toMatchObject({ value: { maxActionsPerPrHead: 1 }, sources: { maxActionsPerPrHead: 'tool' }, errors: [] });
-    expect(log.mock.calls.map(([line]) => line).join('\n')).toContain('maxActionsPerPrHead=1 (tool)');
+    expect(result).toMatchObject({ value: { maxActionsPerPrHead: 2 }, sources: { maxActionsPerPrHead: 'tool' }, errors: [] });
+    expect(log.mock.calls.map(([line]) => line).join('\n')).toContain('maxActionsPerPrHead=2 (tool)');
   });
   it.each([3, Number.MAX_SAFE_INTEGER])('shared ceiling validator accepts %s without changing its safe-integer bound', cap => {
     expect(resolveStallSweepSettings({ env: {}, read: file({ maxActionsPerPrHead: cap }), log }))

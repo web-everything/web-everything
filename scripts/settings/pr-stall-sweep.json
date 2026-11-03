@@ -10,7 +10,7 @@
     "intervalMinutes": 15,
     "maxActionsPerSweep": 3,
     "maxActionsPerHour": 6,
-    "maxActionsPerPrHead": 1,
+    "maxActionsPerPrHead": 2,
     "maxRedTeamRestartsPerHead": 2,
     "digest": true,
     "staleHoldAutoResume": false,
