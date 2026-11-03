@@ -16,7 +16,7 @@ export default {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
     const { planReconcile } = await import(pathToFileURL(join(root, 'scripts/conveyor/reconcile-core.mjs')).href);
     const pr = { number: 3830, state: 'OPEN', headRefName: 'lane/xw4yqe9-prevention-card', headRefOid: '5dbb97875768544344368071250e485f1b43ebb2',
-      isDraft: false, labels: [], comments: [], mergeStateStatus: 'CLEAN',
+      isDraft: false, labels: [], comments: [], mergeStateStatus: 'CLEAN', rollupIncomplete: false,
       statusCheckRollup: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'].map(done) };
     const plan = planReconcile({ prs: [pr], agents: [], durableCounts: {}, now: Date.parse('2026-10-04T11:50:00Z'),
       requiredChecks: ['test', 'smoke', 'daemon-soak'] });

@@ -16,7 +16,7 @@ export default {
     const { planReconcile, greenSettledForRestoreGrace } = await import(pathToFileURL(join(root, 'scripts/conveyor/reconcile-core.mjs')).href);
     const { mapGraphqlPr } = await import(pathToFileURL(join(root, 'scripts/lib/pr-list-paged.mjs')).href);
     const pr = { number: 6254, state: 'OPEN', headRefName: 'ci/refresh-test-timings', headRefOid: 'f81bcb488ef9fdb3a38ea92fac80830b17753b69',
-      author: { login: 'app/web-everything', is_bot: true }, isDraft: false, labels: [], comments: [], mergeStateStatus: 'CLEAN',
+      author: { login: 'app/web-everything', is_bot: true }, isDraft: false, labels: [], comments: [], mergeStateStatus: 'CLEAN', rollupIncomplete: false,
       statusCheckRollup: ['test', 'smoke', 'daemon-soak'].map(done) };
     const plan = planReconcile({ prs: [pr], agents: [], durableCounts: {}, now: Date.parse('2026-11-02T16:00:00Z'),
       requiredChecks: ['test', 'smoke', 'daemon-soak'] });

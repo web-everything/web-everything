@@ -3953,7 +3953,17 @@ describe('xe8y12n orthogonal missing-review diagnostic', () => {
 // LIVE INCIDENT 2026-10-03/04, PR #3830: an open, green lane PR with NO review:* label sat in limbo forever.
 describe('restore-review-label — open green PR with no review label (PR #3830)', () => {
   it('is on the frozen DISPATCH_KINDS list', () => { expect(DISPATCH_KINDS).toContain('restore-review-label'); });
-  const open = (over = {}) => pr1563({ isDraft: false, labels: [], statusCheckRollup: greenRollup, comments: [], headRefName: 'lane/xw4yqe9-prevention-card', ...over });
+  const open = (over = {}) => pr1563({ isDraft: false, labels: [], rollupIncomplete: false, statusCheckRollup: greenRollup, comments: [], headRefName: 'lane/xw4yqe9-prevention-card', ...over });
+  it.each([
+    ['bot', { headRefName: 'ci/timings', author: { login: 'app/web-everything' } }],
+    ['lane', { headRefName: 'lane/restore' }],
+  ])('%s green settled rollup restores only with explicit completeness', (_kind, identity) => {
+    for (const [rollupIncomplete, restored] of [[undefined, false], [true, false], [false, true]]) {
+      const pr = open({ ...identity, rollupIncomplete });
+      expect(planReconcile({ prs: [pr], now: NOW }).dispatch.some(d => d.kind === 'restore-review-label'),
+        `rollupIncomplete=${rollupIncomplete}`).toBe(restored);
+    }
+  });
   it.each(['FAILURE', 'PENDING'])('required legacy %s blocks, optional legacy failure restores', state => {
     const gate = { __typename: 'CheckRun', name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: new Date(NOW - HOUR).toISOString() };
     const legacy = { __typename: 'StatusContext', context: 'legacy', state, startedAt: new Date(NOW - HOUR).toISOString() };
@@ -3974,7 +3984,7 @@ describe('restore-review-label — open green PR with no review label (PR #3830)
   });
   it.each([[[]], [[{ name: 'gate', status: 'QUEUED', conclusion: null, completedAt: null }]]])(
     'stacked never-run checks restore review: %j', statusCheckRollup => {
-      const pr = open({ baseRefName: 'lane/parent', statusCheckRollup });
+      const pr = open({ baseRefName: 'lane/parent', statusCheckRollup, rollupIncomplete: false });
       expect(planReconcile({ prs: [pr], now: NOW, requiredChecks: ['gate'] }).dispatch)
         .toContainEqual(expect.objectContaining({ kind: 'restore-review-label' }));
       for (const completedAt of ['unreadable', '0001-01-01T00:00:00Z']) {
@@ -4070,8 +4080,10 @@ describe('restore-review-label — open green PR with no review label (PR #3830)
     expect(planReconcile(options).dispatch).toContainEqual(expect.objectContaining({
       kind: 'restore-review-label', label: 'review:pending', ...expected,
     }));
-    expect(planReconcile({ ...options, prs: [{ ...pr, rollupIncomplete: true }] }).dispatch
-      .some(d => d.kind === 'restore-review-label')).toBe(false);
+    for (const rollupIncomplete of [undefined, true]) {
+      expect(planReconcile({ ...options, prs: [{ ...pr, rollupIncomplete }] }).dispatch
+        .some(d => d.kind === 'restore-review-label')).toBe(false);
+    }
   });
   it('unknown timing or completion never satisfies lane grace', () => {
     const completedAt = new Date(NOW - HOUR).toISOString();

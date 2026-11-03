@@ -365,7 +365,11 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
   });
   if (isGhDeferred(out)) return JSON.parse(String(out));
   const parsed = JSON.parse(String(out || '[]'));
-  return Array.isArray(parsed) ? enrich(parsed) : [];
+  // The direct gh fallback has no pageInfo; a full 100-context page remains unknown.
+  const prs = Array.isArray(parsed) ? parsed.map(pr => pr.rollupIncomplete === undefined
+    && Array.isArray(pr.statusCheckRollup) && pr.statusCheckRollup.length < 100
+    ? { ...pr, rollupIncomplete: false } : pr) : [];
+  return enrich(prs);
 }
 
 /**
@@ -1438,7 +1442,7 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch })
     // A refused or never-started read leaves a rollup that may miss a live run (past the page limit, or unread):
     // flag it so a mechanical re-run, which GitHub rejects against a live run, holds instead of guessing.
     ready.push({ ...pr, statusCheckRollup: (refused || neverStarted) && known ? known : result.error ? [] : result.rows,
-      ...((refused || neverStarted) ? { rollupIncomplete: true } : {}) });
+      rollupIncomplete: Boolean(refused || neverStarted) });
   }
   return { prs: ready, refusals, notes, owedTriggers };
 }

@@ -21,7 +21,7 @@ import { prSnapshotEnabled, markPrSnapshotDirty, repoFromGhArgs, snapshotPath, P
 const REPO = 'web-everything/web-everything';
 const PRS = Array.from({ length: 14 }, (_, i) => ({
   number: 100 + i, title: `t${i}`, body: `b${i}`, url: `u${i}`, isDraft: false, createdAt: 'c', updatedAt: 'u',
-  author: { login: 'human', is_bot: false },
+  author: { login: 'human', is_bot: false }, rollupIncomplete: false,
   headRefName: `lane/x${i}`, headRefOid: `abc${i}`, baseRefName: 'main', isCrossRepository: false, reviewDecision: 'APPROVED', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
   labels: [{ name: 'ready-to-merge' }], files: [{ path: 'a.mjs' }], comments: [{ body: 'hi' }], statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED',
     startedAt: 's', completedAt: 'e', detailsUrl: 'url', workflowName: 'build' }],
@@ -85,10 +85,15 @@ describe('pure helpers', () => {
   it('projectPrs returns exactly the asked-for fields', () => {
     expect(projectPrs([{ number: 1, body: 'x', labels: [] }], ['number', 'labels'])).toEqual([{ number: 1, labels: [] }]);
   });
-  it('keeps incomplete-check evidence whenever a reader requests the rollup', () => {
-    const pr = { number: 1, statusCheckRollup: [], rollupIncomplete: true };
+  it.each([true, false])('keeps rollup completeness evidence whenever a reader requests the rollup: %s', rollupIncomplete => {
+    const pr = { number: 1, statusCheckRollup: [], rollupIncomplete };
     expect(projectPrs([pr], ['number', 'statusCheckRollup'])).toEqual([pr]);
     expect(projectPrs([pr], ['number'])).toEqual([{ number: 1 }]);
+  });
+  it('does not certify old snapshot rows with no completeness evidence', () => {
+    const pr = { number: 1, statusCheckRollup: [] };
+    expect(projectPrs([pr], ['number', 'statusCheckRollup'])).toEqual([pr]);
+    expect(projectPrs([pr], ['statusCheckRollup'])[0].rollupIncomplete).toBeUndefined();
   });
   it.each([true, undefined, false])('preserves rollup completeness through hydration and cached reads: %s', hasNextPage => {
     const { exec, calls } = fakeExec([PRS[0]], hasNextPage);
@@ -102,7 +107,7 @@ describe('pure helpers', () => {
     };
     const fields = 'number,statusCheckRollup,comments,body,files';
     const first = readSharedOpenPrs(opts({ fields, exec: pageExec }));
-    expect(first[0].rollupIncomplete).toBe(hasNextPage === false ? undefined : true);
+    expect(first[0].rollupIncomplete).toBe(hasNextPage !== false);
     expect(first[0].comments).toEqual(PRS[0].comments);
     expect(first[0].body).toBe(PRS[0].body);
     expect(first[0].files).toEqual(PRS[0].files);
@@ -110,7 +115,7 @@ describe('pure helpers', () => {
     expect(pageCalls(calls)).toHaveLength(1);
     expect(viewCalls(calls)).toHaveLength(1);
     const persisted = JSON.parse(readFileSync(snapshotPath(dir, REPO), 'utf8'));
-    expect(persisted.prs[0].rollupIncomplete).toBe(hasNextPage === false ? undefined : true);
+    expect(persisted.prs[0].rollupIncomplete).toBe(hasNextPage !== false);
     expect(persisted.paging.hydrated).toBe(1);
   });
   it('repoFromGhArgs reads --repo / -R / --repo=', () => {
@@ -171,7 +176,8 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
     for (const fields of fieldSets) {
       const got = readSharedOpenPrs(opts({ fields, exec }));
       expect(got).toHaveLength(14);
-      expect(Object.keys(got[0]).sort()).toEqual(fields.split(',').sort());
+      expect(Object.keys(got[0]).sort()).toEqual([...fields.split(','),
+        ...(fields.split(',').includes('statusCheckRollup') ? ['rollupIncomplete'] : [])].sort());
       expect(got).toEqual(projectPrs(PRS, fields.split(',')));
       clock += 5_000;
     }

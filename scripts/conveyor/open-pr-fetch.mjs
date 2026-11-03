@@ -23,7 +23,11 @@ export function defaultFetchOpenPrs({ repo = null, exec = runGhSync, readComment
   if (repo) argv.push('--repo', repo);
   const out = exec(argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 });
   const parsed = JSON.parse(String(out || '[]'));
-  return Array.isArray(parsed) ? enrichPrsWithCompleteComments(parsed, { repo, ...(readComments ? { readComments } : {}) }) : [];
+  // gh caps contexts at 100 without pageInfo; only an uncapped array proves completeness.
+  const prs = Array.isArray(parsed) ? parsed.map(pr => pr.rollupIncomplete === undefined
+    && Array.isArray(pr.statusCheckRollup) && pr.statusCheckRollup.length < 100
+    ? { ...pr, rollupIncomplete: false } : pr) : [];
+  return Array.isArray(parsed) ? enrichPrsWithCompleteComments(prs, { repo, ...(readComments ? { readComments } : {}) }) : [];
 }
 
 /** A missing, malformed, or non-array snapshot is an empty safe list, never another network read. */

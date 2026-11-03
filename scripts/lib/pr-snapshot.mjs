@@ -157,7 +157,7 @@ export function projectPrs(prs, fields) {
   return prs.map((p) => {
     const o = {};
     for (const f of fields) if (p && Object.prototype.hasOwnProperty.call(p, f)) o[f] = p[f];
-    if (fields.includes('statusCheckRollup') && p?.rollupIncomplete === true) o.rollupIncomplete = true;
+    if (fields.includes('statusCheckRollup') && typeof p?.rollupIncomplete === 'boolean') o.rollupIncomplete = p.rollupIncomplete;
     return o;
   });
 }

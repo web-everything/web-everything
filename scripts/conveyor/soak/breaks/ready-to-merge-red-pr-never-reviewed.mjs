@@ -16,7 +16,7 @@ export default {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
     const { planReconcile } = await import(pathToFileURL(join(root, 'scripts/conveyor/reconcile-core.mjs')).href);
     const pr = { number: 3902, state: 'OPEN', isDraft: false, headRefName: 'lane/pool-scan-skip-non-dir-entries',
-      headRefOid: '8d0ccb4b51356f760172fb0e79ccc6000a0812a1', mergeStateStatus: 'BLOCKED', comments: [],
+      headRefOid: '8d0ccb4b51356f760172fb0e79ccc6000a0812a1', mergeStateStatus: 'BLOCKED', rollupIncomplete: false, comments: [],
       labels: [{ name: 'ready-to-merge' }], commits: [aiCommit],
       statusCheckRollup: [run('test', 'SUCCESS'), run('smoke', 'SUCCESS'), run('daemon-soak', 'SUCCESS'), run('soak-replay-gate', 'FAILURE')] };
     const plan = planReconcile({ prs: [pr], agents: [], durableCounts: {}, now: Date.parse('2026-10-04T17:30:00Z'),

@@ -2853,7 +2853,7 @@ export function planReconcile({
         && ((laneHead && (withPhase.check === 'green' || (stackedLanePr && withPhase.check !== 'red')))
           || (!laneHead && botAuthored && withPhase.check === 'green'))
         && !withPhase.labels.some((l) => l.startsWith('review:') || l === 'ready-to-merge')
-        && pr?.rollupIncomplete !== true
+        && pr?.rollupIncomplete === false
         && (greenSettledForRestoreGrace(pr?.statusCheckRollup, now, undefined, requiredChecks)
           || (stackedLanePr && withPhase.check !== 'red' && checksNotYetRun(pr?.statusCheckRollup)))) {
       dispatch.push({
@@ -2876,7 +2876,7 @@ export function planReconcile({
         && withPhase.labels.includes('ready-to-merge')
         && !withPhase.labels.some((l) => l.startsWith('review:'))
         && isAiGeneratedPr(pr)
-        && pr?.rollupIncomplete !== true
+        && pr?.rollupIncomplete === false
         && greenSettledForRestoreGrace(pr?.statusCheckRollup, now, undefined, requiredChecks)) {
       dispatch.push({
         ...base, ...withPhase, kind: 'restore-review-label', label: 'review:pending', variant: 'stuck',
@@ -2892,7 +2892,7 @@ export function planReconcile({
         && ['open', 'queued'].includes(phase) && String(pr?.headRefName ?? '').startsWith('lane/')
         && isAiGeneratedPr(pr) && !withPhase.labels.some(l => l.startsWith('review:'))
         && (withPhase.check === 'red' || withPhase.labels.some(l => ['status:ci-red', 'ci:failed'].includes(l)))
-        && pr?.rollupIncomplete !== true
+        && pr?.rollupIncomplete === false
         && greenSettledForRestoreGrace(pr?.statusCheckRollup, now, undefined, requiredChecks)) {
       dispatch.push({ ...base, ...withPhase, kind: 'restore-review-label', label: 'review:pending',
         variant: 'stuck', rule: 'unlabeled-red',

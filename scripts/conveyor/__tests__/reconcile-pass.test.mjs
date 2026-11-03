@@ -124,6 +124,14 @@ prFileContract({
 });
 
 
+it.each([0, 99, 100, 101])('direct reconcile discovery certifies only uncapped rollups: %s', async count => {
+  const { defaultReadPrs } = await import('../reconcile-pass.mjs');
+  const pr = { number: 1, labels: [{ name: 'review:pending' }], comments: [],
+    statusCheckRollup: Array.from({ length: count }, () => ({ name: 'test' })) };
+  const [result] = defaultReadPrs({ exec: () => JSON.stringify([pr]) });
+  expect(result.rollupIncomplete).toBe(count < 100 ? false : undefined);
+});
+
 // we:backlog/x81m8xx-*.md (#4189) — a caller passing the internal repo KEY (`--repo=we`, exactly as
 // `constellation-repos.mjs` names it) must not reach `gh` as the bare key: `gh pr list --repo we` fails
 // (`gh` only understands `owner/name`). Both readers must see the NORMALISED slug.

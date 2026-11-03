@@ -62,6 +62,19 @@ describe('shared open-PR discovery', () => {
       expect.objectContaining({ encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }));
   });
 
+  it.each([0, 1, 99, 100, 101])('certifies gh rollups only below the 100-context cap: %s', count => {
+    const pr = { number: 1, comments: [], statusCheckRollup: Array.from({ length: count }, () => ({ name: 'test' })) };
+    const [result] = defaultFetchOpenPrs({ exec: () => JSON.stringify([pr]) });
+    expect(result.rollupIncomplete).toBe(count < 100 ? false : undefined);
+    expect(result.statusCheckRollup).toEqual(pr.statusCheckRollup);
+  });
+  it.each([{}, { statusCheckRollup: null }, { statusCheckRollup: {} },
+    { statusCheckRollup: [], rollupIncomplete: true }])('does not certify unknown or explicitly incomplete gh evidence: %j', evidence => {
+    const pr = { number: 1, comments: [], ...evidence };
+    const [result] = defaultFetchOpenPrs({ exec: () => JSON.stringify([pr]) });
+    expect(result.rollupIncomplete).toBe(evidence.rollupIncomplete);
+  });
+
   it.each(['', undefined, '{}', 'null'])('tolerates falsy or non-array output: %s', (out) => {
     expect(defaultFetchOpenPrs({ exec: () => out })).toEqual([]);
   });

@@ -92,7 +92,7 @@ export function mapGraphqlPr(n) {
     // GraphQL Bot logins need not carry gh's app/ prefix; preserve bot identity explicitly.
     author: n.author ? { login: n.author.login, is_bot: n.author.__typename === 'Bot' } : null,
     // Never certify the first 100 contexts as the full set; unknown pageInfo is also incomplete.
-    ...(contexts?.pageInfo?.hasNextPage !== false || !Array.isArray(contexts?.nodes) ? { rollupIncomplete: true } : {}) };
+    rollupIncomplete: contexts?.pageInfo?.hasNextPage !== false || !Array.isArray(contexts?.nodes) };
 }
 
 /** PURE: reject GraphQL errors even when accompanied by partial data. */

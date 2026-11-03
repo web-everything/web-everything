@@ -3924,3 +3924,10 @@ Child report identities re-emitted as FAIL lines must strip C0/C1 controls and U
 line separators; the hostile-input table checks the resulting failure collector entries.
 When changing an existing test's expected verdict, disclose the behavior change in
 the PR description so reviewers can distinguish a policy change from a regression fix.
+
+## Review-label restoration requires explicit rollup completeness
+
+The restore-review-label planner gates accept only `rollupIncomplete: false`; old snapshots with no flag
+remain ineligible. Complete GraphQL context pages set false from `hasNextPage: false`, direct gh listings
+only certify arrays below the 100-context cap, and snapshot projections preserve both boolean values.
+Complete-rollup fixtures (including stacked never-run cases) must carry false explicitly.
