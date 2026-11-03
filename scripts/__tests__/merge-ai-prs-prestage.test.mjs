@@ -400,13 +400,13 @@ describe('real drain pre-stage path', () => {
     expect(next.calls.some(a => a[0] === 'pr' && a[1] === 'list' && !a.includes('--base') || a.some(x => x.includes('pullRequests(')))).toBe(false);
     expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(true);
   }));
-  it('a green-event enqueue runs the cascade pre-landing steps: stacked retarget and review-coverage notice', () => world(({pr,run}) => {
-    expect(run().stderr).toContain('eligible=true');
+  it.each(['off', 'shadow'])('a green-event enqueue runs the cascade pre-landing steps: stacked retarget and review-coverage notice (async drain: %s)', shadowMode => world(({pr,run}) => {
+    expect(run(false, { shadowMode }).stderr).toContain('eligible=true');
     // The pre-landing read is fresh: the reviewed-sha record is gone by green time, so coverage is announced.
     pr.comments = [];
     pr.stacked = [{ number: 43, baseRefName: pr.headRefName }];
     pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
-    const next = run(true);
+    const next = run(true, { shadowMode });
     expect(next.report, next.stderr).toMatchObject({prestaged:true,enqueueOutcomes:[{num:42,outcome:'enqueued'}]});
     const at = pred => next.calls.findIndex(pred);
     const enqueued = at(a => a.some(x => x.includes('enqueuePullRequest')));
