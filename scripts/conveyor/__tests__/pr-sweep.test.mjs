@@ -599,20 +599,28 @@ describe('R502 wait state replaces the implied daemon owner', () => {
   it('resolveWaitState: live claim beats refusal beats parked; nothing known stays null', async () => {
     const { resolveWaitState } = await import('../pr-sweep-core.mjs');
     const refusal = { kind: 'refusal', at: new Date(now - 10 * 60000).toISOString(), reason: 'review-referrals-pending', name: 'fix-dispatch-daemon' };
-    expect(resolveWaitState(open, { fixClaim: { who: 'fix-12' }, daemons: [refusal] })).toMatchObject({ kind: 'live-claim' });
-    expect(resolveWaitState(open, { daemons: [refusal] })).toMatchObject({ kind: 'refused', detail: expect.stringContaining('review-referrals-pending') });
-    expect(resolveWaitState({ ...open, labels: ['review:human'] }, {})).toMatchObject({ kind: 'parked' });
+    const ctx = { now };
+    expect(resolveWaitState(open, { fixClaim: { who: 'fix-12' }, daemons: [refusal] }, ctx)).toMatchObject({ kind: 'live-claim' });
+    expect(resolveWaitState(open, { daemons: [refusal] }, ctx)).toMatchObject({ kind: 'refused', detail: expect.stringContaining('review-referrals-pending') });
+    expect(resolveWaitState({ ...open, labels: ['review:human'] }, {}, ctx)).toMatchObject({ kind: 'parked' });
+    // freshness: a months-old refusal, or no clock, is not a wait state
+    expect(resolveWaitState(open, { daemons: [{ ...refusal, at: new Date(now - 90 * 86400000).toISOString() }] }, ctx)).toBeNull();
+    expect(resolveWaitState(open, { daemons: [refusal] })).toBeNull();
     expect(resolveWaitState({ ...open, isDraft: true }, {})).toMatchObject({ kind: 'parked' });
     expect(resolveWaitState(open, {})).toBeNull();
   });
   it('a refusal older than the newest daemon progress is not the current wait state', async () => {
     const { resolveWaitState } = await import('../pr-sweep-core.mjs');
     const daemons = [{ kind: 'refusal', at: new Date(now - 30 * 60000).toISOString(), reason: 'nothing-owed', name: 'x' }, { kind: 'progress', at: new Date(now - 5 * 60000).toISOString(), name: 'x' }];
-    expect(resolveWaitState(open, { daemons })).toBeNull();
+    expect(resolveWaitState(open, { daemons }, { now })).toBeNull();
   });
   it('a stale owner with a known wait state reports it, not owner-stale and not the implied daemon', async () => {
     const r = await evalFor(open, { kind: 'refused', detail: 'review-referrals-pending' });
     expect(r).toMatchObject({ violation: 'waiting-refused', owner: 'wait:refused', waitState: { kind: 'refused' } });
+  });
+  it('an unreadable owner (state unknown) keeps owner-stale even with a wait state', async () => {
+    const r = await evalFor(open, { kind: 'refused', detail: 'x' }, { state: 'unknown', owner: null });
+    expect(r.violation).toBe('owner-stale');
   });
   it('without a wait state the old owner-stale report is unchanged; deadline-passed still wins', async () => {
     expect((await evalFor(open, null)).violation).toBe('owner-stale');
@@ -632,6 +640,8 @@ it('R502: collectOwnerSignals attaches the live fixer claim as evidence and tole
   const base = { prs: [pr], dir: tmpdir(), env: {}, errors: [], readAgents: () => [], cloneRoots: () => [], listLogs: () => [], readHealth: () => ({}) };
   const withClaim = await collectOwnerSignals({ ...base, readClaim: () => ({ meta: { who: 'fix-12', claimedAt: 'x' } }) });
   expect(withClaim[`${pr.repo}#12`].fixClaim).toEqual({ who: 'fix-12', claimedAt: 'x' });
-  const broken = await collectOwnerSignals({ ...base, readClaim: () => { throw new Error('EACCES'); } });
+  const errors = [];
+  const broken = await collectOwnerSignals({ ...base, errors, readClaim: () => { throw new Error('EACCES'); } });
   expect(broken[`${pr.repo}#12`].fixClaim).toBeUndefined();
+  expect(errors.join(' ')).toContain('EACCES'); // incomplete evidence is reported, so ownerReadsOk goes false
 });

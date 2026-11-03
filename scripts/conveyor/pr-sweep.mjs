@@ -144,7 +144,7 @@ export async function collectOwnerSignals({ prs, dir, env, errors, errorSources 
     const episode = Object.values(health.episodes ?? {}).find((e) => ['open', 'flapping'].includes(e.status)
       && ['fixer-stuck', 'fix-claim-held-no-progress', 'ruling-needed-waiting'].includes(e.smell) && mentions(`${e.subject} ${JSON.stringify(e.measure)}`, pr));
     let claim = null;
-    try { claim = readClaim(pr); } catch { claim = null; }
+    try { claim = readClaim(pr); } catch (e) { claim = null; recordError('claims', `claim ${prKey(pr)}: ${e.message}`); }
     const fixClaim = claim?.meta?.who ? { who: claim.meta.who, claimedAt: claim.meta.claimedAt ?? null } : null;
     return [prKey(pr), { sessions, daemons, smell: episode?.smell, unreadSessions, ...(fixClaim ? { fixClaim } : {}) }];
   }));
@@ -190,7 +190,7 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
     const key = prKey(p), fingerprint = stateFingerprint(p), old = previous?.invariantClocks?.[key];
     const since = stateSince(p, old?.fingerprint === fingerprint ? old.since : now, now);
     clocks[key] = { fingerprint, since };
-    return { ...p, ...dependencies.get(key), ...evaluateInvariant(p, owners[key], { now, since, settings: value, waitState: resolveWaitState(p, (signals ?? {})[key]), ...dependencies.get(key) }) };
+    return { ...p, ...dependencies.get(key), ...evaluateInvariant(p, owners[key], { now, since, settings: value, waitState: resolveWaitState(p, (signals ?? {})[key], { now, maxAgeMinutes: value.waitStateMaxAgeMinutes }), ...dependencies.get(key) }) };
   }));
   const annotate = item => {
     const decision = decisions.find(p => p.repo === item.repo && p.number === item.pr);

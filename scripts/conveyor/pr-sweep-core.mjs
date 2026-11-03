@@ -72,11 +72,12 @@ export function resolveOwner(pr, signals = {}) {
 /** R502 item 5 - the REAL reason a PR is waiting, so the sweep stops reporting the implied daemon as a stale owner.
  *  Precedence: a live fixer claim, then the daemon's latest refusal (when no later progress and, if it names a head,
  *  the current head), then a parked PR (draft or `review:human`). Null when nothing is known: the old report stands. PURE. */
-export function resolveWaitState(pr, { fixClaim = null, daemons = [] } = {}) {
+export function resolveWaitState(pr, { fixClaim = null, daemons = [] } = {}, { now = null, maxAgeMinutes = 360 } = {}) {
   if (fixClaim?.who) return { kind: 'live-claim', detail: String(fixClaim.who) };
+  // A refusal is current evidence only when fresh: without a clock, or older than maxAgeMinutes, it is not a wait state.
   const dated = (Array.isArray(daemons) ? daemons : []).filter((d) => Number.isFinite(ms(d?.at)));
   const progressAt = Math.max(-Infinity, ...dated.filter((d) => d.kind === 'progress').map((d) => ms(d.at)));
-  const refusal = dated.filter((d) => d.kind === 'refusal' && ms(d.at) > progressAt && (d.head == null || d.head === pr.headRefOid))
+  const refusal = dated.filter((d) => d.kind === 'refusal' && Number.isFinite(now) && now - ms(d.at) <= maxAgeMinutes * 60000 && ms(d.at) > progressAt && (d.head == null || d.head === pr.headRefOid))
     .sort((a, b) => ms(b.at) - ms(a.at))[0];
   if (refusal) return { kind: 'refused', detail: String(refusal.reason ?? '').slice(0, 160), by: refusal.name ?? null, at: new Date(ms(refusal.at)).toISOString() };
   const labels = labelNames(pr) ?? [];
@@ -117,10 +118,10 @@ export function evaluateInvariant(pr, owner = {}, { now, since = now, settings =
     || (Number.isFinite(lastSignal) ? now - lastSignal > (settings.idleMinutes ?? 45) * 60000 : !['active', 'waiting-operator'].includes(owner.state) && now - stateSince(pr, since, now) > (settings.idleMinutes ?? 45) * 60000);
   const violation = emptyDiff ? 'empty-diff' : blockedBy.length ? 'waiting-on-blocked'
     : unreadable ? 'owner-stale' : !labels.length ? 'no-labels'
-    : now > Date.parse(deadline) ? 'deadline-passed' : stale ? (waitState?.kind ? `waiting-${waitState.kind}` : 'owner-stale') : null;
+    : now > Date.parse(deadline) ? 'deadline-passed' : stale ? (waitState?.kind && owner.state !== 'unknown' ? `waiting-${waitState.kind}` : 'owner-stale') : null;
   const implied = nextAction === 'fix' || nextAction === 'rebase' ? 'daemon:fix-dispatch-daemon' : nextAction.startsWith('await-') ? 'daemon:review-daemon' : 'operator';
   // A stale owner with a known wait state reports THAT, never the stale or implied daemon (R502 item 5).
-  const reported = stale && waitState?.kind ? `wait:${waitState.kind}` : owner.owner ?? implied;
+  const reported = stale && waitState?.kind && owner.state !== 'unknown' ? `wait:${waitState.kind}` : owner.owner ?? implied;
   return { owner: reported, nextAction, deadline, violation, ...(waitState?.kind ? { waitState } : {}) };
 }
 export function planSweep({ idle, owners, prevState = {}, needsYou, now, settings, ownerReadsOk = true, prsReadOk = true }) {
