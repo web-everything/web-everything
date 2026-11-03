@@ -6,6 +6,7 @@ import { join, dirname } from 'node:path';
 import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, gateReadyItems, REPORT_KINDS, GATE_KINDS, assertProducerCheckout, monitorCommand, main, sidecarsOf } from '../needs-you-feed.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 import { GATE_OUTCOMES, parseRedTeamComment, redTeamGateMarker, redTeamResultId } from '../../lib/red-team-gate.mjs';
+import { buildReviewedShaMarker, buildClearedHumanMarker } from '../../lib/review-escalation.mjs';
 import { isReadOnlyOperation } from '../registry.mjs';
 import { operatorSessionBootstrapOperation } from '../operator-session-bootstrap.mjs';
 import { bootstrapPlan } from '../operator-session-bootstrap-io.mjs';
@@ -344,11 +345,11 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
   const gate = (view, comments) => async (_f, args) => (args[0] === 'api' ? JSON.stringify([comments]) : JSON.stringify(view));
   const items = () => itemsFromReport(report);
   const bare = ({ command, pick, ...rest }) => rest; // reclassified items drop the approve/merge instruction
-  const gateComments = ({ pr = 5768, rev = head, outcome = GATE_OUTCOMES.NOTHING_TO_SEND, broken = false, impact = 'broken' } = {}) => {
+  const gateComments = ({ pr = 5768, rev = head, outcome = GATE_OUTCOMES.NOTHING_TO_SEND, broken = false, impact = 'broken', count = 1 } = {}) => {
     const body = renderRedTeamComment({ pr, rev, provider: 'codex', model: 'm', recheckStatus: 'ok',
-      foldedVerdict: broken ? 'changes' : 'accepted', findings: broken ? [{ summary: 'confirmed break',
-        category: 'edge-case', impactIfUnfixed: impact, file: 'scripts/x.mjs', line: 3,
-        confirmedByRecheck: true, recheckReason: 'real' }] : [] });
+      foldedVerdict: broken ? 'changes' : 'accepted', findings: broken ? Array.from({ length: count }, (_, index) => ({ summary: 'confirmed break',
+        category: 'edge-case', impactIfUnfixed: impact, file: 'scripts/x.mjs', line: 3 + index,
+        confirmedByRecheck: true, recheckReason: 'real' })) : [] });
     return [
       { user: { login: 'web-everything' }, body, created_at: '2026-10-10T02:04:41Z' },
       { user: { login: 'web-everything' }, created_at: '2026-10-10T02:05:00Z',
@@ -376,6 +377,54 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     expect(kept[0]).toEqual({ ...bare(original[0]), head, kind: 'confirmed-break-owed-send-back', reason: expect.any(String) });
     expect(kept[0].reason).toMatch(/confirmed red-team break.*owed.*send-back/i);
     expect(kept[0].reason).not.toContain('all gates pass');
+  });
+  const rulingCases = [GATE_OUTCOMES.SENT_BACK, GATE_OUTCOMES.ROUND_CAP].flatMap(outcome =>
+    ['ready', 'needsYourMerge'].flatMap(section => ['card', 'not-real', 'clear-human', 'block'].map(ruling => [outcome, section, ruling])));
+  it.each(rulingCases)('operator ruling after %s restores %s approval for %s only when the finding is settled', async (outcome, section, ruling) => {
+    // Sent-back releases require the shared reader's explicit any-state opt-in; cap releases use its default.
+    vi.stubEnv('WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE', String(outcome === GATE_OUTCOMES.SENT_BACK));
+    const r = { ready: [], [section]: [{ repo, number: 5768, title: 't', command: 'human merge', pick: 'pick 5768' }] };
+    const [res, record] = gateComments({ outcome, broken: true });
+    const id = redTeamResultId(parseRedTeamComment(res.body));
+    const lines = {
+      card: '- 1 finding(s) carded by the operator to `we:backlog/follow-up.md` (#1).',
+      'not-real': '- 1 finding(s) left advisory (#1).',
+      block: '- 1 confirmed break(s) sent back to the fixer (#1).',
+    };
+    const clearance = { user: { login: 'chalbert', type: 'User' }, created_at: '2026-10-10T02:07:00Z',
+      body: ['✅ review — `review:human` cleared via the sanctioned path', '',
+        'Cleared by chalbert via `review-set-label.mjs --to=clear-human` (gate-self).', '',
+        buildReviewedShaMarker(head), buildClearedHumanMarker('chalbert')].join('\n') };
+    const decision = { user: { login: 'chalbert', type: 'User' }, created_at: '2026-10-10T02:06:00Z',
+      body: `${redTeamGateMarker(5768, head, `operator-${ruling}`, id)}\n${lines[ruling]}` };
+    const comments = [res, record, ...(ruling === 'clear-human' ? [clearance] : [decision])];
+    // A block continues to win even over a later clear-human ceremony.
+    if (ruling === 'block') comments.push(clearance);
+    const original = itemsFromReport(r)[0];
+    const { kept, held } = await gateReadyItems([original], r, {
+      gh: gate({ headRefOid: head, labels: [] }, comments), log: () => {}, fixClaimLive: () => false,
+    });
+    expect(held).toEqual([]);
+    if (ruling === 'block' || (ruling === 'clear-human' && outcome === GATE_OUTCOMES.SENT_BACK)) {
+      expect(kept[0]).toMatchObject({ kind: 'confirmed-break-owed-send-back' });
+      expect(kept[0]).not.toHaveProperty('command');
+      expect(kept[0]).not.toHaveProperty('pick');
+    } else {
+      expect(kept).toEqual([{ ...original, head }]);
+      expect(kept[0].command ?? kept[0].pick).toBeTruthy();
+    }
+  });
+  it.each([[[1]], [[1, 2]]])('operator card covering %j releases approval only after every confirmed finding is settled', async indices => {
+    vi.stubEnv('WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE', 'false');
+    const r = { ready: [{ repo, number: 5768, title: 'two breaks' }] };
+    const [res, record] = gateComments({ outcome: GATE_OUTCOMES.ROUND_CAP, broken: true, count: 2 });
+    const decision = { user: { login: 'chalbert', type: 'User' }, created_at: '2026-10-10T02:06:00Z',
+      body: `${redTeamGateMarker(5768, head, 'operator-card', redTeamResultId(parseRedTeamComment(res.body)))}\n` +
+        `- ${indices.length} finding(s) carded by the operator to \`we:backlog/follow-up.md\` (${indices.map(i => `#${i}`).join(', ')}).` };
+    const { kept } = await gateReadyItems(itemsFromReport(r), r, {
+      gh: gate({ headRefOid: head, labels: [] }, [res, record, decision]), log: () => {}, fixClaimLive: () => false,
+    });
+    expect(kept[0].kind).toBe(indices.length === 2 ? 'needs-you' : 'confirmed-break-owed-send-back');
   });
   it.each([
     ['no record', () => []],
@@ -420,6 +469,30 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     expect(result.openKeys).toContain(key);
     expect(result.lines.join('\n')).not.toContain('NEEDS-YOU-CLEARED');
   });
+  it.each(['ready', 'needsYourMerge'].flatMap(section => ['live pass', 'newer-head confirmed verdict'].map(verdict => [section, verdict])))(
+    'runOnce retires a persisted confirmed-break alert for %s on a %s', async (section, verdict) => {
+      const path = join(temp(), 'needs-you-events.jsonl');
+      const newer = verdict === 'newer-head confirmed verdict', live = newer ? 'b'.repeat(40) : head;
+      const key = `${repo}#5768@${head}:confirmed-break-owed-send-back`;
+      const unrelated = `${repo}#99@${head}:confirmed-break-owed-send-back`;
+      writeFileSync(sidecarsOf(path).state, JSON.stringify({ openKeys: [key, unrelated] }));
+      const settings = { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: path }, allowPrimary: { value: true } };
+      const r = { ready: [], [section]: [{ repo, number: 5768, head, title: 't', command: 'human merge' }] };
+      const result = await runOnce({ exec: async () => JSON.stringify(r),
+        gh: gate({ headRefOid: live, labels: [] }, gateComments({ rev: live, broken: newer })),
+        settings, env: {}, now: at, log: () => {}, checkoutRoot: join(temp(), 'workspace/.lanes/we/lane-1') });
+      const nextKey = `${repo}#5768@${live}:${newer ? 'confirmed-break-owed-send-back' : 'needs-you'}`;
+      expect(result.openKeys).toEqual(expect.arrayContaining([nextKey, unrelated]));
+      expect(result.openKeys).not.toContain(key);
+      expect(JSON.parse(readFileSync(sidecarsOf(path).state, 'utf8')).openKeys).toEqual(result.openKeys);
+      expect(result.lines.filter(line => line.startsWith('NEEDS-YOU-CLEARED ')).map(parseFeedLine)).toEqual([
+        expect.objectContaining({ repo, pr: 5768, head, kind: 'cleared', was: 'confirmed-break-owed-send-back' }),
+      ]);
+      const published = result.lines.filter(line => line.startsWith('NEEDS-YOU ')).map(parseFeedLine);
+      expect(published).toEqual([expect.objectContaining({ pr: 5768, head: live,
+        kind: newer ? 'confirmed-break-owed-send-back' : 'needs-you' })]);
+      if (!newer) expect(published[0].command ?? published[0].pick).toBeTruthy();
+    });
   it('a malformed confirmed finding inside a carried-verdict wrapper is not a clean pass', async () => {
     const [res] = gateComments({ broken: true }), bad = res.body.replace(/\n1\. .*/, '\n1. [**confirmed**] (edge-case, broken) `` — ');
     const from = 'c'.repeat(40), carried = `<!-- review-verdict-carried from=${from} to=${head} patch-id=${'d'.repeat(40)} -->\nReview verdict carried across an identical contribution.\n${bad}`;
@@ -454,9 +527,13 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] }, [res, card]), log: () => {} });
     expect(kept.find(i => i.pr === 5768).kind).toBe('confirmed-break-owed-send-back');
   });
-  it('a trusted result marker the shared parser cannot read is never a clean pass', async () => {
+  it.each([
+    ['missing closing space', body => body.replace(/ -->/, '-->')],
+    ['missing closer', body => body.replace(/ -->/, '')],
+    ['unknown scope', body => body.replace(/ pr=\d+ rev=[^ ]+ -->/, ' -->')],
+  ])('a trusted live result marker the shared parser cannot read (%s) is never a clean pass', async (_shape, mutate) => {
     const [res] = gateComments({ broken: true }), clean = gateComments().slice(0, 1);
-    const bad = { ...res, created_at: '2026-10-10T03:00:00Z', body: res.body.replace(/ -->/, '-->') };
+    const bad = { ...res, created_at: '2026-10-10T03:00:00Z', body: mutate(res.body) };
     const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] }, [...clean, bad]), log: () => {} });
     expect(kept.find(i => i.pr === 5768).kind).not.toBe('needs-you');
   });
@@ -471,6 +548,18 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
       [...old, ...gateComments({ outcome: GATE_OUTCOMES.NOTHING_TO_SEND })]), log: () => {} });
     expect(kept.find(i => i.pr === 5768)).toEqual({ ...items()[0], head });
   });
+  it.each([
+    ['missing closing space', body => body.replace(' -->', '-->')],
+    ['missing closer', body => body.replace(' -->', '')],
+    ['unreadable finding', body => body.replace(/\n1\. .*/, '\n1. [**confirmed**] (edge-case, broken) `` — ')],
+  ].flatMap(([shape, mutate]) => ['stale head', 'another PR'].map(scope => [shape, scope, mutate])))(
+    'a malformed historical result (%s, %s) cannot veto a clean live-head result', async (_shape, scope, mutate) => {
+      const [old] = gateComments({ rev: scope === 'stale head' ? '2'.repeat(40) : head,
+        pr: scope === 'another PR' ? 99 : 5768, broken: true });
+      const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] },
+        [{ ...old, body: mutate(old.body) }, ...gateComments()]), log: () => {} });
+      expect(kept.find(i => i.pr === 5768)).toEqual({ ...items()[0], head });
+    });
   it('REPORT_KINDS is unchanged for other producers: gate kinds only clear through alsoClear', () => {
     expect(REPORT_KINDS.has('red-team-undecided')).toBe(false);
     expect(REPORT_KINDS.has('confirmed-break-owed-send-back')).toBe(false);

@@ -9,7 +9,7 @@ import { dirname, join, resolve, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { handoffHome } from './handoff-home.mjs';
 import { humanReviewHold } from './pr-sweep-core.mjs';
-import { GATE_OUTCOMES, liveResultGateState, parseRedTeamComment, RED_TEAM_COMMENT_MARKER, readRedTeamDisposition } from '../lib/red-team-gate.mjs';
+import { liveResultGateState, parseRedTeamComment, RED_TEAM_COMMENT_MARKER, readRedTeamDisposition } from '../lib/red-team-gate.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
@@ -109,8 +109,12 @@ function headlineAgrees(comments, pr, head) {
     return lines.every((line, at) => {
       if (!line.trimStart().toLowerCase().startsWith(RED_TEAM_COMMENT_MARKER)) return true; // same leniency as the shared parser
       const body = lines.slice(at).join('\n').trimStart(), parsed = parseRedTeamComment(body);
-      // A trusted result marker the shared parser cannot read is unknown content: never a clean pass.
-      if (!parsed) return false;
+      if (!parsed) {
+        // Repair only the delimiter to ask the shared parser which PR/head this marker names.
+        // Malformed live or unscopable evidence still vetoes approval; unrelated history does not.
+        const scope = parseRedTeamComment(`${line.split('-->', 1)[0].trimEnd()} -->`);
+        return scope !== null && (scope.pr !== Number(pr) || scope.rev !== live);
+      }
       return parsed.pr !== Number(pr) || parsed.rev !== live || resultAgrees(body, parsed);
     });
   });
@@ -262,8 +266,7 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
       // is written before the card job succeeds, so it is no proof (nor is a policy that leaves degraded to a card).
       const open = new Set([...(disposition?.sendBack ?? []), ...(disposition?.held ?? [])].map(f => f.index));
       const settled = f => !open.has(f.index) && (disposition?.rulings.get(f.index) ?? []).some(r => r.source === 'operator' && r.kind !== 'block');
-      const owed = state.sendBackOutcome === GATE_OUTCOMES.SENT_BACK || state.sendBackOutcome === GATE_OUTCOMES.ROUND_CAP
-        || (state.result?.findings ?? []).some(f => f.confirmed && !settled(f));
+      const owed = (state.result?.findings ?? []).some(f => f.confirmed && !settled(f));
       // A confirmed break is classified before the hold: a hold (blocked, sent back) must not hide the alert.
       if (reasons.length && !owed) { held.push({ item, reasons }); return; }
       if (owed) {
