@@ -130,3 +130,34 @@ describe('replay proof with real git', () => {
     expect(proveReplayEquivalent({ exec: () => { throw new Error('missing'); }, fromSha: 'a'.repeat(40), toSha: 'b'.repeat(40) })).toMatchObject({ ok: false, reason: expect.stringContaining('not readable locally') });
   });
 });
+
+// R503 part 4 — the drain-mechanical set also covers the regenerated CI timing file, so a merge of main that only
+// moves it keeps an operator approval; any other change still invalidates.
+import { MECHANICAL_DIFF_PATHS } from '../transient-paths.mjs';
+import { normalizeDiffFingerprint, normalizeContributionFingerprint } from '../review-escalation.mjs';
+import { decideHumanClearanceCarry } from '../human-clearance-carry.mjs';
+
+describe('mechanical net-diff paths (R503)', () => {
+  const code = 'diff --git a/src/a.mjs b/src/a.mjs\n--- a/src/a.mjs\n+++ b/src/a.mjs\n@@ -1,1 +1,1 @@\n-a\n+b\n';
+  const timings = (n) => `diff --git a/scripts/ci/test-timings.json b/scripts/ci/test-timings.json\n--- a/scripts/ci/test-timings.json\n+++ b/scripts/ci/test-timings.json\n@@ -1,1 +1,1 @@\n-{"t":1}\n+{"t":${n}}\n`;
+  it('names the root manifest and the CI timing file only', () => {
+    expect([...MECHANICAL_DIFF_PATHS].sort()).toEqual(['.lane-manifest.json', 'scripts/ci/test-timings.json']);
+  });
+  it.each([['strict', normalizeDiffFingerprint], ['contribution', normalizeContributionFingerprint]])('%s fingerprint ignores a timings-only change', (_, fp) => {
+    expect(fp(code + timings(2))).toBe(fp(code + timings(3)));
+    expect(fp(code + timings(2))).toBe(fp(code));
+  });
+  it.each([['strict', normalizeDiffFingerprint], ['contribution', normalizeContributionFingerprint]])('%s fingerprint still moves for a one-character code change and a nested timings file', (_, fp) => {
+    expect(fp(code + timings(2))).not.toBe(fp(code.replace('+b', '+c') + timings(2)));
+    const nested = timings(2).replaceAll('scripts/ci/test-timings.json', 'x/scripts/ci/test-timings.json');
+    expect(fp(code + nested)).not.toBe(fp(code));
+  });
+  it('an operator clearance carries across a merge of main that only moved the timing file', () => {
+    const cleared = liveCarryFingerprints(code + timings(2));
+    const base = { enabled: true, headSha: 'b'.repeat(40), mechanical: { ok: true, kind: 'merge', reason: '1 merge(s) of origin/main' } };
+    const clearance = { sha: 'a'.repeat(40), diff: cleared.diff, contribution: cleared.contribution, actor: 'operator' };
+    expect(decideHumanClearanceCarry({ ...base, clearance, headDiff: code + timings(9) })).toMatchObject({ carry: true });
+    expect(decideHumanClearanceCarry({ ...base, clearance, headDiff: code.replace('+b', '+c') + timings(9) })).toMatchObject({ carry: false });
+    expect(decideHumanClearanceCarry({ ...base, clearance, headDiff: null })).toMatchObject({ carry: false });
+  });
+});
