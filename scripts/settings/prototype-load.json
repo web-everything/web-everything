@@ -66,6 +66,15 @@
       "findings": [
         "scripts/operations/dispatch-lane.mjs:429 \u2014 Glob refusal applies only within multi-path entries; separate glob entries remain accepted despite the pre-existing overlap-check limitation. Probe: `we:src/a*b.mjs` and `we:src/ab*.mjs` both cover `we:src/abb.mjs`, but `scopesOverlap` returns false, allowing conflicting work through lease/rival exclusion."
       ]
+    },
+    {
+      "ref": "lane/freeze-read-retry-lkg",
+      "sha": "f8564fc77a42e3c5a326fc17e38c3873f66696b3",
+      "ruling": "R432",
+      "findings": [
+        "The last-known-good fallback can proceed for up to the 2-min window after a freeze is newly published while reads keep timing out (PR #6289, accepted option A).",
+        "merge-gate still enforces the freeze per merge."
+      ]
     }
   ]
 }
