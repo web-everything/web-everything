@@ -3,7 +3,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const done = (name) => ({ __typename: 'CheckRun', name, status: 'COMPLETED', conclusion: 'SUCCESS' });
+// The checks completed thirty minutes before the replay, beyond the restoration grace.
+const done = (name) => ({ __typename: 'CheckRun', name, status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-04T11:20:00Z' });
 
 export default {
   id: 'green-lane-pr-without-review-label-in-limbo',

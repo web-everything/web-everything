@@ -4021,15 +4021,22 @@ describe('restore-review-label — open green PR with no review label (PR #3830)
         expect(planReconcile({ prs: [pr], now: NOW }).dispatch.some(d => d.kind === 'restore-review-label')).toBe(false);
       }
     });
-  it('all review-restoration branches require a complete rollup', () => {
+  it.each([
+    ['green', [], greenRollup, { phase: 'open' }],
+    ['stuck', lbl('ready-to-merge'), redRollup, { phase: 'ci-red', variant: 'stuck' }],
+    ['unlabeled-red', lbl('ready-to-merge', 'status:ci-red'), greenRollup,
+      { phase: 'queued', variant: 'stuck', rule: 'unlabeled-red' }],
+  ])('%s review restoration requires a complete rollup', (_branch, labels, statusCheckRollup, expected) => {
     const commits = [{ messageBody: 'Co-Authored-By: Claude <noreply@anthropic.com>' }];
-    for (const labels of [[], lbl('ready-to-merge')]) {
-      const pr = open({ commits, labels, statusCheckRollup: redRollup });
-      const options = { prs: [pr], now: NOW, unlabeledRedAgentPr: 'review-label' };
-      expect(planReconcile(options).dispatch.some(d => d.kind === 'restore-review-label')).toBe(true);
-      expect(planReconcile({ ...options, prs: [{ ...pr, rollupIncomplete: true }] }).dispatch
-        .some(d => d.kind === 'restore-review-label')).toBe(false);
-    }
+    // A failed required check without ready-to-merge routes to ci-heal. The unlabeled-red
+    // rule instead covers a queued PR whose green checks coexist with status:ci-red.
+    const pr = open({ commits, labels, statusCheckRollup });
+    const options = { prs: [pr], now: NOW, unlabeledRedAgentPr: 'review-label' };
+    expect(planReconcile(options).dispatch).toContainEqual(expect.objectContaining({
+      kind: 'restore-review-label', label: 'review:pending', ...expected,
+    }));
+    expect(planReconcile({ ...options, prs: [{ ...pr, rollupIncomplete: true }] }).dispatch
+      .some(d => d.kind === 'restore-review-label')).toBe(false);
   });
   it('unknown timing or completion never satisfies lane grace', () => {
     const completedAt = new Date(NOW - HOUR).toISOString();
