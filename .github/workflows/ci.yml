@@ -813,7 +813,8 @@ jobs:
         run: npm ci
 
       # The shadow FULL run — the whole unit suite with the json reporter, so the measure step has per-file
-      # pass/fail. `|| true`: a red shadow run must still record (the false-green signal LIVES in a red full run).
+      # pass/fail. No `|| true` (it would mask a crash). A red full run exits nonzero but still writes the report; a timeout or
+      # crash writes none, so the recorder below keys on the outcome plus the report file.
       # R516: bounded below the job's 30 min and soft-failing, so a slow shadow run ends THIS step (the job is already
       # continue-on-error) instead of the whole job being cancelled and reading as a non-success run on main.
       - name: Shadow full-suite run (json report)
@@ -821,13 +822,13 @@ jobs:
         timeout-minutes: 18
         continue-on-error: true
         working-directory: web-everything
-        run: npx vitest run --reporter=json --outputFile=vitest-full.json || true
+        run: npx vitest run --reporter=json --outputFile=vitest-full.json
 
       # Record the false-green sample: decide off the diff, compare against the shadow full run's failures, append.
       # Only a COMPLETE shadow run may be recorded: a timed-out or killed run leaves no valid report, and the recorder
       # would otherwise log it as zero failures (a false "no false-green").
       - name: Record false-green signal (#2681)
-        if: steps.shadow_full.outcome == 'success'
+        if: steps.shadow_full.outcome == 'success' || (steps.shadow_full.outcome == 'failure' && hashFiles('web-everything/vitest-full.json') != '')
         working-directory: web-everything
         run: node scripts/readiness/test-selection.mjs --measure --vitest-json=vitest-full.json
         env:

@@ -72,13 +72,17 @@ export function readRunJobs(runId, { exec = execFileSyncThrottled, repoSlug = DE
  * required set every failed job gates (fail closed). When narrowing hides a failed job, positive proof is demanded: every
  * required job in the run must have SUCCEEDED, so a failed shard under a cancelled `test` summary stays gating. PURE.
  */
+const SUMMARY_PROOF_JOBS = Object.freeze(['test', 'daemon-soak']);
 export function onlyGatingFailures(jobs, requiredChecks) {
   if (!jobs) return jobs;
   const gating = Array.isArray(requiredChecks) && requiredChecks.length ? new Set(requiredChecks) : null;
   if (!gating) return { ...jobs, gatingFailed: jobs.failed };
   const gatingFailed = jobs.failed.filter((j) => gating.has(j.name));
   const hidden = jobs.failed.length > gatingFailed.length;
-  const unproven = hidden && (jobs.names ?? []).some((n) => gating.has(n) && !(jobs.passed ?? []).includes(n));
+  // The proof jobs are the required summary jobs this workflow produces (`test`, `daemon-soak`): each must be PRESENT and
+  // have SUCCEEDED. An absent or non-success one is red (other required checks live in other workflows).
+  const proof = SUMMARY_PROOF_JOBS.filter((n) => gating.has(n));
+  const unproven = hidden && (!proof.length || proof.some((n) => !(jobs.passed ?? []).includes(n)));
   return { ...jobs, gatingFailed: unproven ? jobs.failed : gatingFailed };
 }
 
@@ -88,6 +92,15 @@ export function readFailingTests(jobId, { exec = execFileSyncThrottled, repoSlug
   return (Array.isArray(rows) ? rows : [])
     .filter((a) => a?.annotation_level === 'failure' && a.path && a.path !== '.github')
     .map((a) => String(a.title || a.path).slice(0, 300));
+}
+
+/** The required list, only when it is a LIVE or fresh-cache read (a fallback / stale-cache / declared list may omit a newly required check); else null. */
+export function trustedRequiredChecks(readRequired, repoSlug) {
+  try {
+    const got = readRequired({ repo: repoSlug });
+    const trusted = got?.source === undefined || ['live', 'cache'].includes(got.source);
+    return trusted && Array.isArray(got?.checks) && got.checks.length ? got.checks : null;
+  } catch { return null; }
 }
 
 /** Read the current main commit and its checks best-effort; any unreadable fact leaves the runs-only rule in charge. */
@@ -108,7 +121,8 @@ export function readMainTip({ exec = execFileSyncThrottled, repoSlug = DEFAULT_R
         checkRuns: page.check_runs.map(({ id, name, status, conclusion }) => ({ id, name, status, conclusion })),
       };
     };
-    const checks = requiredChecks ?? readRequired({ repo: repoSlug }).checks;
+    // A required list that is not live/fresh-cache is never trusted for the tip either; an explicit null means "none".
+    const checks = requiredChecks !== undefined ? requiredChecks : trustedRequiredChecks(readRequired, repoSlug);
     if (!Array.isArray(checks) || !checks.length) return null;
     const newest = [...runs].filter((r) => r.headSha === sha).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
     const tip = { sha, runStatus: newest?.status ?? null, ...checksOf(sha), requiredChecks: checks };
@@ -139,12 +153,7 @@ export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAU
   // test-selection-measure) is not a code failure of main. Real failures surface in the required `test` / `daemon-soak`
   // summary jobs. An unreadable or empty required set filters nothing (fail closed: every failed job stays gating).
   let requiredChecks = null;
-  // Only a LIVE or fresh-cache read is trusted policy; a fallback / stale-cache / declared list may omit a newly required check.
-  try {
-    const got = readRequired({ repo: repoSlug });
-    const trusted = got?.source === undefined || ['live', 'cache'].includes(got.source);
-    requiredChecks = trusted && Array.isArray(got?.checks) && got.checks.length ? got.checks : null;
-  } catch { requiredChecks = null; }
+  requiredChecks = trustedRequiredChecks(readRequired, repoSlug);
   // One job read per run, however many passes below look at it. `null` = unreadable (stays red: never promoted on a blind read).
   const jobsRead = new Map();
   const jobsOf = (r) => {
@@ -188,7 +197,7 @@ export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAU
     if (!candidate || jobsRead.has(candidate.databaseId)) break; // already inspected: genuine, or unreadable
     if (!markInfraOnly(candidate, jobsOf(candidate))) break;
   }
-  const tip = readMainTip({ exec, repoSlug, settings, runs: sorted, readRequired, ...(requiredChecks ? { requiredChecks } : {}) });
+  const tip = readMainTip({ exec, repoSlug, settings, runs: sorted, readRequired, requiredChecks });
   if (settings.mainCiRedFlakeRerun && failingRun) {
     // Rerun evidence is best-effort: unreadable logs/diffs never poison the primary runs probe.
     failing.failures = null;

@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { probeMainCiRuns } from '../main-ci-red-io.mjs';
 import { mainRedState, classifyRun } from '../main-ci-red-core.mjs';
 
@@ -11,7 +12,9 @@ const run = { databaseId: 41701873905, headSha: SHA, status: 'completed', conclu
   createdAt: '2026-11-03T19:17:00Z', updatedAt: '2026-11-03T20:00:00Z', attempt: 1 };
 const job = (id, name, conclusion) => ({ id, name, conclusion, status: 'completed' });
 
-function probe(jobs, { required = REQUIRED, runs = [run], source } = {}) {
+function probe(jobsIn, { required = REQUIRED, runs = [run], source } = {}) {
+  // A realistic run carries both required summary jobs; a case that wants one absent or failing names it itself.
+  const jobs = [...jobsIn, ...(jobsIn.some((j) => j.name === 'daemon-soak') ? [] : [job(9, 'daemon-soak', 'success')])];
   const exec = (bin, argv) => {
     const url = argv.join(' ');
     if (argv[0] === 'run' && argv[1] === 'list') return JSON.stringify(runs);
@@ -73,15 +76,16 @@ describe('main-red judges required checks only (R516)', () => {
     const readRequired = () => { reads += 1; return { checks: ['test'], source: 'stale-cache' }; };
     const p = probeMainCiRuns({ exec, readRequired });
     expect(reads).toBe(1);
-    expect(p.tip).toBeNull();
+    expect(p.tip ?? null).toBeNull();
     expect(mainRedState(p.runs, { tip: p.tip }).status).toBe('red');
   });
   it('the shadow full-suite step does not mask its exit code, so the recorder runs only after a real success', () => {
-    const yml = readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8');
+    const yml = readFileSync(resolve(process.cwd(), '.github/workflows/ci.yml'), 'utf8');
     const step = yml.slice(yml.indexOf('- name: Shadow full-suite run (json report)')).split('\n      - name:')[0];
     expect(step).toContain('timeout-minutes: 18');
     expect(step).not.toMatch(/\|\|\s*true/);
     const record = yml.slice(yml.indexOf('- name: Record false-green signal')).split('\n      - name:')[0];
     expect(record).toContain("steps.shadow_full.outcome == 'success'");
+    expect(record).toContain("hashFiles('web-everything/vitest-full.json')"); // a red run still records; a crash or timeout leaves no report
   });
 });
