@@ -15,6 +15,11 @@ describe('isBriefRedTeamTouchSet', () => {
     expect(isBriefRedTeamTouchSet(['we:scripts/lib/daemon-load-overlay.mjs'])).toBe(true);
     expect(isBriefRedTeamTouchSet(['we:scripts/lib/github-token-store.mjs'])).toBe(true);
   });
+  it('covers daemon names anywhere in the path and ignores design-token files', () => {
+    expect(isBriefRedTeamTouchSet(['we:scripts/conveyor/resource-sampler-daemon.mjs'])).toBe(true);
+    expect(isBriefRedTeamTouchSet(['we:scripts/lib/daemon-rebuild/prepare.mjs'])).toBe(true);
+    expect(isBriefRedTeamTouchSet(['we:scripts/lib/token-css.mjs'])).toBe(false);
+  });
   it('is false for an ordinary touch-set, so ordinary dispatch is not slowed', () => {
     expect(isBriefRedTeamTouchSet(PLAIN)).toBe(false);
     expect(isBriefRedTeamTouchSet([])).toBe(false);

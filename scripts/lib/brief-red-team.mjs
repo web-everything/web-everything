@@ -17,7 +17,7 @@ export function isBriefRedTeamTouchSet(files = []) {
   return Array.isArray(files) && files.some(file => {
     const path = String(file ?? '').replace(/^[^/:]+:/, '');
     const name = path.split('/').pop();
-    return isGuardPath(path) || /^daemon|credential|secret|token|security/i.test(name);
+    return isGuardPath(path) || /(?:^|\/)daemon[\w.-]*\//i.test(path) || /(?:^|[-_.])daemon(?:[-_.]|$)|credential|secret|(?:^|[-_.])(?:auth-?)?tokens?(?:-(?:store|file|cache|vault|refresh|exchange)|[-_.]?$)|security/i.test(name.replace(/\.[a-z]+$/, ''));
   });
 }
 
