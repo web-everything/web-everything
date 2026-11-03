@@ -242,3 +242,20 @@ describe('resolved authors persist across processes (a cold one-shot pass conver
     } finally { if (prev === undefined) delete process.env.WE_PR_SNAPSHOT_DIR; else process.env.WE_PR_SNAPSHOT_DIR = prev; rmSync(dir, { recursive: true, force: true }); }
   });
 });
+
+it('an unwritable author memo is reported (once), not swallowed', async () => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'pr-authors-ro-'));
+  writeFileSync(join(dir, 'blocker'), 'x'); // a FILE where the snapshot dir should be → mkdir fails
+  const prev = process.env.WE_PR_SNAPSHOT_DIR; process.env.WE_PR_SNAPSHOT_DIR = join(dir, 'blocker');
+  const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    vi.resetModules();
+    const m = await import('../reconcile-pass.mjs');
+    m.withRestAuthors([{ number: 9501 }, { number: 9502 }], { repo: 'o/r', readRest: () => ({ json: { user: { login: 'u', type: 'User' } } }) });
+    const warns = err.mock.calls.map(c => String(c[0])).filter(t => /author memo not persisted/.test(t));
+    expect(warns).toHaveLength(1);
+  } finally { err.mockRestore(); if (prev === undefined) delete process.env.WE_PR_SNAPSHOT_DIR; else process.env.WE_PR_SNAPSHOT_DIR = prev; rmSync(dir, { recursive: true, force: true }); }
+});

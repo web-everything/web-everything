@@ -338,6 +338,7 @@ export const AUTHOR_LOOKUP_TIMEOUT_MS = 8_000;
 // pass processes (smokes, CLI passes) start cold every time and would otherwise never converge under the per-read budget.
 const authorFile = () => (prSnapshotEnabled(process.env) ? join(prSnapshotDir(process.env), 'pr-authors.json') : null);
 let authorsLoaded = false;
+let authorSaveWarned = false;
 function loadAuthors() {
   if (authorsLoaded) return;
   authorsLoaded = true;
@@ -348,7 +349,11 @@ function loadAuthors() {
 function saveAuthors() {
   const f = authorFile();
   if (!f) return;
-  try { mkdirSync(dirname(f), { recursive: true }); const tmp = `${f}.${process.pid}.tmp`; writeFileSync(tmp, JSON.stringify(Object.fromEntries(authorByPr))); renameSync(tmp, f); } catch { /* best-effort */ }
+  try { mkdirSync(dirname(f), { recursive: true }); const tmp = `${f}.${process.pid}.tmp`; writeFileSync(tmp, JSON.stringify(Object.fromEntries(authorByPr))); renameSync(tmp, f); }
+  catch (e) {
+    // Not fatal for this read, but one-shot passes depend on this file to converge under the lookup budget: say so (once).
+    if (!authorSaveWarned) { authorSaveWarned = true; console.error(`reconcile-pass: author memo not persisted (${String(e?.message ?? e).split('\n')[0]}) — cold passes may defer until it is writable`); }
+  }
 }
 
 export function withRestAuthors(rows, { repo, readRest = ghRestGetJson, budget = AUTHOR_LOOKUP_BUDGET, deadlineMs = AUTHOR_LOOKUP_DEADLINE_MS, now = () => Date.now() } = {}) {
@@ -451,7 +456,7 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
         if (shared.discoveryIncomplete === true) throw Object.assign(new Error(`open-PR snapshot for ${repo} is truncated — refusing a partial inventory`), { code: 'pr-list-truncated' });
         return Array.isArray(shared) ? withRestAuthors(shared, { repo, readRest }) : shared; // author lookups sit INSIDE the retried read
       }
-      if (!usePaged) return direct(); // the legacy direct list already asks for `author`
+      if (!usePaged) return direct(); // snapshot explicitly disabled (opt-out / hermetic tests): the legacy direct read, no author fill
       const paged = listPaged({ repo, exec, paging: resolvePrListPaging(), heavyFields: ['comments', 'body', 'files'],
         cache: pagedHeavyCache.get(repo) || {}, maxRows: PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (reconcile page)' } } });
       pagedHeavyCache.set(repo, paged.cache);
