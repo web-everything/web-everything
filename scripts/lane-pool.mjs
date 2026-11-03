@@ -327,7 +327,7 @@ export function cleanIgnoredBuildOutput(dir) {
       try { return lstatSync(join(dir, name)).isDirectory(); } catch (e) { if (e?.code === 'ENOENT') return false; throw e; }
     });
     // Never invoke clean with an empty pathspec (which would target the whole repository).
-    if (dirs.length) git(['clean', '-ffdX', '--quiet', '--', ...dirs.map((name) => `${name}/`)], dir);
+    if (dirs.length) git(['clean', '-fdX', '--quiet', '--', ...dirs.map((name) => `${name}/`)], dir);
   } catch (e) {
     const message = msgOf(e).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ');
     throw Object.assign(new Error(`ignored build output cleanup failed: ${message}`, { cause: e }), {
