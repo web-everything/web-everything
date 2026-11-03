@@ -42,9 +42,12 @@ export const ACTORS = Object.freeze(['fixer', 'reviewer', 'red-team', 'drain', '
 
 const REFERRAL_HOLD_MARKER = 'review-referral-hold';
 const HOLD_LEAD = /^\s*review paused:/i;
-const NEEDS_DECISION_RE = /conveyor\s+—\s+needs your decision/i;
 // Leading-line markers only (an optional emoji first): a later comment QUOTING one is not renewed work.
 const LEAD = String.raw`^\s*(?:[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]\u{FE0F}?\s+)?`; // an emoji, never `>` (a quote)
+const NEEDS_DECISION_RE = new RegExp(`${LEAD}conveyor[ \t]+—[ \t]+needs your decision[ \t]*(?:\\r?\\n|$)`, 'iu');
+// Historical fallback notes used the escalation headline while explicitly continuing automated CI healing.
+// Exclude only that informational headline; unknown escalation kinds still require operator attention.
+const AUTOMATED_FALLBACK_RE = /^\s*needs your decision:[ \t]*timeout-retry-fallback-heal[ \t]*(?:\r?\n|$)/i;
 const FIX_BEGIN_RE = new RegExp(`${LEAD}conveyor fix-begin\\s+—\\s+fix claim held`, 'iu');
 const FIX_END_RE = new RegExp(`${LEAD}conveyor fix-end\\s+—\\s+fix claim released`, 'iu');
 const REARM_RE = new RegExp(`${LEAD}conveyor fix\\s+—\\s+re-armed for re-review`, 'iu');
@@ -129,7 +132,11 @@ export function holdEvidence(pr, hold, { cardReadable = (ref) => referralCardRea
 export function needsDecisionOpen(comments, { headCommittedAt = null } = {}) {
   const list = sorted(comments);
   let note = null;
-  for (const e of list) if (trusted(e) && NEEDS_DECISION_RE.test(bodyOf(e.c))) note = e;
+  for (const e of list) {
+    const body = bodyOf(e.c);
+    if (trusted(e) && NEEDS_DECISION_RE.test(body)
+      && !AUTOMATED_FALLBACK_RE.test(body.replace(NEEDS_DECISION_RE, ''))) note = e;
+  }
   if (!note || note.at === null) return null;
   const pushed = t(headCommittedAt);
   if (pushed !== null && pushed > note.at) return null;

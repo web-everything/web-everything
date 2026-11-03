@@ -138,3 +138,67 @@ it('never trusts partial comments explicitly marked incomplete, while retaining 
   expect(map.blockedBy.get(12)).toEqual([15]);
   expect(map.unblocks.get(13)).toBeUndefined();
 });
+
+
+it.each(['system', 'policy', 'operator'])('publishes no-labels invariant despite a same-head %s finding', async lane => {
+  const finding = { repo: pr.repo, pr: pr.number, head: pr.headRefOid.toUpperCase(), lane,
+    state: 'existing', action: 'existing remediation', reason: 'existing evidence' };
+  let published;
+  const out = await run({ dryRun: false, readPrs: () => [{ ...pr, labels: [] }],
+    persist: () => {}, append: () => {}, flush: () => {}, notify: () => ({ ok: true }),
+    stallSweep: () => ({ mode: 'shadow', dir: 'unused', items: [finding] }),
+    stallDigest: pass => { published = pass.items; return {}; } });
+  expect(out.errors).toEqual([]);
+  expect(published.filter(p => p.lane === 'operator')).toEqual([
+    expect.objectContaining({ repo: pr.repo, pr: pr.number, violation: 'no-labels' }),
+  ]);
+  if (lane === 'operator') expect(published).toEqual([expect.objectContaining({ ...finding, violation: 'no-labels' })]);
+  else expect(published.find(p => p.lane === lane)).toMatchObject(finding);
+});
+
+it('exhausted global comment budget retains all PRs and later repository movement alerts', async () => {
+  const otherRepo = 'plateauapp/plateau-app';
+  const comments = Array.from({ length: 100 }, (_, i) => ({ id: `IC_${i}`, body: 'blocked by #99', author: pr.author }));
+  let listingCalls = 0, commentCalls = 0;
+  const read = createOpenPrCommentReader({ exec: (_bin, args) => {
+    if (args[0] === 'pr') {
+      listingCalls++;
+      return JSON.stringify(args.includes(otherRepo) ? [{ ...pr, number: 99, comments: [] }] : [
+        ...Array.from({ length: 13 }, (_, i) => ({ ...pr, number: i + 1, comments })),
+        { ...pr, number: 99, comments: [] },
+      ]);
+    }
+    commentCalls++;
+    return JSON.stringify(comments);
+  } });
+  const previous = { episodes: Object.fromEntries([pr.repo, otherRepo].map(repo => [`${repo}#99`, {
+    head: pr.headRefOid, updatedAt: pr.updatedAt, fingerprint: stateFingerprint(pr), firstUnownedAt: now - 300 * minute, alerted: false,
+  }])) };
+  const out = await run({ settings: { value: { ...settings, repos: [pr.repo, otherRepo] }, sources: {} },
+    readPrs: read, readPrevious: () => previous });
+  expect(listingCalls).toBe(2);
+  expect(commentCalls).toBe(128);
+  expect(out.decisions).toHaveLength(15);
+  expect(out.errors.join(' ')).toMatch(/PR #13.*budget.*operator.*full thread/i);
+  expect(out.decisions.filter(p => p.number !== 99).every(p => p.blockedBy.length === 0)).toBe(true);
+  for (const repo of [pr.repo, otherRepo]) expect(out.alerts).toContainEqual(expect.objectContaining({ key: `${repo}#99`, kind: 'pr-stuck' }));
+});
+
+
+it.each([{}, { owner: 'session:fix-12', state: 'active' }, { owner: 'operator', state: 'waiting-operator' }])
+('unlabelled PR restoration belongs to the fix daemon until the label deadline: %j', owner => {
+  const row = { ...pr, labels: [] };
+  const deadline = now + 45 * minute;
+  for (const tick of [now, deadline]) expect(evaluateInvariant(row, owner, { now: tick, since: now }))
+    .toMatchObject({ owner: 'daemon:fix-daemon', nextAction: 'restore-review-label', violation: 'no-labels', deadline: new Date(deadline).toISOString() });
+  expect(evaluateInvariant(row, owner, { now: deadline + 1, since: now }))
+    .toMatchObject({ owner: 'operator', nextAction: 'restore-review-label', violation: 'no-labels' });
+});
+it('review-label restoration preserves configured label budgets and escalates overdue persisted state', async () => {
+  const row = { ...pr, labels: [] };
+  const previous = { invariantClocks: { [key]: { fingerprint: stateFingerprint(row), since: now - 46 * minute } } };
+  const out = await run({ readPrs: () => [row], readPrevious: () => previous });
+  expect(out.decisions[0]).toMatchObject({ owner: 'operator', nextAction: 'restore-review-label', violation: 'no-labels' });
+  expect(evaluateInvariant(row, {}, { now, since: now, settings: { deadlineMinutes: { label: 75 } } }))
+    .toMatchObject({ owner: 'daemon:fix-daemon', nextAction: 'restore-review-label', deadline: new Date(now + 75 * minute).toISOString() });
+});

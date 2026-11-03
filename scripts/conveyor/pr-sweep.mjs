@@ -282,12 +282,12 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
         i.lane === 'operator' && i.repo === d.repo && i.pr === d.pr && String(i.head).toLowerCase() === String(d.head).toLowerCase()))];
       const samePrHead = (a, b) => a.repo === b.repo && a.pr === b.pr && typeof a.head === 'string'
         && typeof b.head === 'string' && a.head.toLowerCase() === b.head.toLowerCase();
-      // Invariants enrich findings; they never replace detector/sweep evidence or remediation.
+      // Only published operator findings can absorb an invariant; other lanes are filtered out by the digest.
       const published = [...findings.map(item => {
-        const invariant = invariantItems.find(p => samePrHead(p, item));
+        const invariant = item.lane === 'operator' && invariantItems.find(p => samePrHead(p, item));
         return invariant?.violation ? { ...item, owner: invariant.owner, nextAction: invariant.nextAction,
           deadline: invariant.deadline, violation: invariant.violation } : item;
-      }), ...invariantItems.filter(i => !findings.some(p => samePrHead(p, i)))];
+      }), ...invariantItems.filter(i => !findings.some(p => p.lane === 'operator' && samePrHead(p, i)))];
       // A skipped (not-due) sweep has no items, so publishing would clear its open ones: wait for a pass that ran.
       if (out.dir && (out.items || out.mode === 'off' || out.digest === false)) {
         const d = stallDigest({ ...out, items: sortUnblockersFirst(published),

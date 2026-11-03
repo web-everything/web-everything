@@ -34,16 +34,19 @@ export function readCompletePrComments(number, { repo = null, exec = execRead, g
 }
 
 /** One tick's open-PR discovery. Short threads stay in the list call; capped threads
- * use the complete reader. All repositories, pages and count proofs share a budget.
+ * use the complete reader. Listings and comments each have a tick-wide maxCalls budget;
+ * comment pages/count proofs share the latter, with maxPages also bounding each thread.
  * A failed listing throws; a failed thread retains its PR with explicit incomplete
  * comment evidence and an operator diagnostic. Other enrichment callers still omit failed PRs.
  */
 export function createOpenPrCommentReader({ exec = execRead, env = process.env, maxCalls = 128, maxPages = 10 } = {}) {
   if (!Number.isSafeInteger(maxCalls) || maxCalls < 1 || !Number.isSafeInteger(maxPages) || maxPages < 1) throw Error('invalid comment discovery bounds');
-  let calls = 0;
+  let listingCalls = 0, commentCalls = 0;
   const gh = args => {
-    if (calls >= maxCalls) throw Error('comment discovery request budget exceeded; operator must inspect full threads before resolving alerts');
-    calls++;
+    const listing = args[0] === 'pr' && args[1] === 'list';
+    if ((listing ? listingCalls : commentCalls) >= maxCalls) throw Error('comment discovery request budget exceeded; operator must inspect full threads before resolving alerts');
+    if (listing) listingCalls++;
+    else commentCalls++;
     return JSON.parse(exec('gh', args, { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, maxBuffer: 64 * 1024 * 1024 }));
   };
   return repo => {

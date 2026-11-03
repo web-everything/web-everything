@@ -124,13 +124,14 @@ export function evaluateInvariant(pr, owner = {}, { now, since = now, settings =
   }
   const labels = labelNames(pr);
   const unreadable = !labels || labels.some(l => typeof l !== 'string');
-  let nextAction = unreadable ? 'inspect unreadable labels' : !labels.length ? 'label'
+  let nextAction = unreadable ? 'inspect unreadable labels' : !labels.length ? 'restore-review-label'
     : labels.includes('red-team:pending') ? 'await-red-team'
     : labels.some(l => /^(review:changes|status:fixing)$/.test(l)) ? 'fix'
     : labels.some(l => /rebase|conflict/.test(l)) ? 'rebase' : 'await-review';
   const emptyDiff = pr.changedFiles === 0;
   if (emptyDiff) nextAction = 'close into card';
-  const budget = nextAction;
+  // Preserve existing per-label budgets and persisted state clocks for restoration.
+  const budget = nextAction === 'restore-review-label' ? 'label' : nextAction;
   const configured = settings.deadlineMinutes;
   // The settings cascade accepts a global scalar as well as per-action budgets.
   const minutes = (Number.isFinite(configured) && configured > 0 ? configured : configured?.[budget]) ?? DEADLINE_MINUTES[budget] ?? 45;
@@ -141,7 +142,10 @@ export function evaluateInvariant(pr, owner = {}, { now, since = now, settings =
   const violation = emptyDiff ? 'empty-diff' : unreadable ? 'owner-stale' : !labels.length ? 'no-labels'
     : now > Date.parse(deadline) ? 'deadline-passed' : stale ? 'owner-stale' : null;
   const implied = nextAction === 'fix' || nextAction === 'rebase' ? 'daemon:fix-dispatch-daemon' : nextAction.startsWith('await-') ? 'daemon:review-daemon' : 'operator';
-  return { owner: owner.owner ?? implied, nextAction, deadline, violation };
+  const assigned = nextAction === 'restore-review-label'
+    ? now > Date.parse(deadline) ? 'operator' : 'daemon:fix-daemon'
+    : owner.owner ?? implied;
+  return { owner: assigned, nextAction, deadline, violation };
 }
 export function planSweep({ idle, owners, prevState = {}, needsYou, now, settings, ownerReadsOk = true, prsReadOk = true }) {
   const alerts = []; const diagnose = new Set();

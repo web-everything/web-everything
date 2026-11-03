@@ -3883,7 +3883,8 @@ or alert history. Keep blocked-by/unblocks labels and sort unblockers first. Lab
 never manufacture an invariant stall finding for a PR with no violation.
 Invariant rows merge owner, nextAction, deadline and violation into existing same-PR/head
 sweep/detector findings, preserving reason, evidence, command, action and remediation. They
-stand alone only when no same-PR/head finding exists.
+stand alone unless a same-PR/head operator-lane finding will be published; system and
+policy lanes cannot absorb an operator invariant.
 Tooling refusals must match the current head, or be unheaded and strictly newer than the
 head push time (falling back to `updatedAt`), and fall within
 `prSweep.toolingRefusalWindowMinutes` (360 by default). Newer active-owner progress cancels
@@ -3902,3 +3903,27 @@ edges, and keep body edges and other PR alerts live. The audit suite covers capp
 unreadable, missing and malformed threads across repositories. Digest updates and
 repeat fingerprints include invariant/action/dependency changes and pending/passed
 deadline buckets; metadata-free persisted rows retain legacy one-shot identities.
+
+
+## PR sweep comment budgets and advisory replay
+
+Repository listings and comment pagination have separate tick-wide `maxCalls` budgets
+(default 128 each). Pagination and count proofs share the comment budget; each thread
+also retains its `maxPages` cap. Exhausting comment evidence retains the listed PR with
+an operator-visible full-thread inspection diagnostic and never invalidates repository
+discovery. `pr-sweep-audit.test.mjs` exercises 13 long threads and a later repository,
+requiring movement alerts in both repositories after the comment budget is exhausted.
+The duplicate-number cases in `pr-sweep.test.mjs` cover both dependency directions
+with #5 and #6 in two repos; removing the filter before `buildBlockedMap` must fail them.
+
+`operations/__tests__/pr-sweep.test.mjs` keeps trimmed live prefixes from #6293 and
+#6288. Their historical `timeout-retry-fallback-heal` headline says “needs your decision”
+but announces continued automated healing. It is not an operator escalation; advisory,
+card-queued and enqueue-clearance comments cannot create one either. Real unanswered
+operator notes remain visible; a later informational fallback cannot replace them.
+Only a leading escalation headline counts, never a quotation or inline mention.
+
+Unlabelled PRs belong to `daemon:fix-daemon` with action `restore-review-label` through
+the existing label deadline, then to `operator` strictly after it. Keep the `label`
+budget key and persisted state clock when deriving that action. The audit tests cover
+the exact deadline boundary, previous owner evidence, custom budgets and resumed clocks.

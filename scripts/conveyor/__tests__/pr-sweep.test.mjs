@@ -624,3 +624,24 @@ it('tooling deadline resolves and logs cascade provenance and rejects invalid ov
   const invalid = resolvePrSweepSettings({ env: { WE_PR_SWEEP_TOOLING_DEADLINE_MINUTES: '0' }, log: () => {} });
   expect(invalid.errors.join(' ')).toContain('toolingDeadlineMinutes');
 });
+
+
+it.each(['Unblocks: #6', 'blocked by #5'])('keeps duplicate PR numbers scoped to each repository: %s', async declaration => {
+  const otherRepo = 'plateauapp/plateau-app';
+  const rows = [
+    { ...pr, number: 5, body: declaration.startsWith('Unblocks') ? declaration : '' },
+    { ...pr, number: 6, body: declaration.startsWith('blocked') ? declaration : '' },
+    { ...pr, repo: otherRepo, number: 5, body: '' },
+    { ...pr, repo: otherRepo, number: 6, body: '' },
+  ];
+  const out = await runPrSweep({ now, dryRun: true, config: {},
+    settings: { value: { ...settings, repos: [pr.repo, otherRepo] }, sources: {} },
+    readPrs: repo => rows.filter(p => p.repo === repo), readPrevious: () => ({}),
+    readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: () => ({}),
+    detector: async () => ({ enabled: false, items: [], errors: [], nextSeen: {} }) });
+  expect(out.errors).toEqual([]);
+  expect(out.decisions).toHaveLength(4);
+  for (const row of rows) expect(out.decisions.find(p => p.repo === row.repo && p.number === row.number))
+    .toMatchObject({ blockedBy: row.repo === pr.repo && row.number === 6 ? [5] : [],
+      unblocks: row.repo === pr.repo && row.number === 5 ? [6] : [] });
+});

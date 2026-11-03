@@ -581,3 +581,38 @@ describe('humanReviewHold: the gate behind "your review" (#5768)', () => {
     expect(humanReviewHold({ ...base, comments: [claim, c('plateau-worker[bot]', '2026-10-21T14:32:00Z', '🔓 conveyor fix-end — fix claim released')] }, at)).toEqual([]);
   });
 });
+
+
+// Trimmed live comment prefixes fetched read-only on 2026-11-02; each body is at most 200 characters.
+const advisoryThreads = [
+  [6293, [
+    ['plateau-worker[bot]', '🔔 conveyor — needs your decision\n\nneeds your decision: timeout-retry-fallback-heal\n\nPR #6293: timeout retry ineligible (timeout-evidence:incomplete-failure-inventory); falling back to ordinary ci-hea'],
+    ['plateau-reviewer[bot]', "<!-- we:red-team-advisory pr=6293 rev=073bd50f27849551cbb37ce952340ffaec10b91c -->\n### Post-accept red team — 1 possible break(s), 1 confirmed by Claude's re-check\n\nAdvisory only: this comment changes"],
+    ['plateau-reviewer[bot]', '<!-- we:red-team-gate pr=6293 rev=073bd50f27849551cbb37ce952340ffaec10b91c outcome=card-queued result=1cc003e2cf2d7fa3 -->\n**Red-team gate** (setting `redTeam.confirmedBreaks`, card x1b8hlo) on head `'],
+    ['plateau-merger[bot]', '<!-- we-drain-enqueue-clearance head=073bd50f27849551cbb37ce952340ffaec10b91c -->\n**Drain enqueue clearance** — the drain judged head `073bd50f2784` ready (every drain gate passed: couple whole, block'],
+  ]],
+  [6288, [
+    ['plateau-worker[bot]', '🔔 conveyor — needs your decision\n\nneeds your decision: timeout-retry-fallback-heal\n\nPR #6288: timeout retry ineligible (timeout-evidence:incomplete-failure-inventory); falling back to ordinary ci-hea'],
+    ['plateau-reviewer[bot]', "<!-- we:red-team-advisory pr=6288 rev=df26ef777ee34b1d60169bcdc9664a7c33b4ea0f -->\n### Post-accept red team — 2 possible break(s), 2 confirmed by Claude's re-check\n\nAdvisory only: this comment changes"],
+    ['plateau-reviewer[bot]', '<!-- we:red-team-gate pr=6288 rev=df26ef777ee34b1d60169bcdc9664a7c33b4ea0f outcome=card-queued result=e016d7dcd1035a19 -->\n**Red-team gate** (setting `redTeam.confirmedBreaks`, card x1b8hlo) on head `'],
+  ]],
+];
+it.each(advisoryThreads)('live #%s automation fallback and advisory thread does not ask the operator', (number, prefixes) => {
+  const comments = prefixes.map(([login, body], i) => c(login, new Date(NOW - (10 - i) * 60000).toISOString(), body));
+  for (const comment of comments) {
+    expect(comment.body.length).toBeLessThanOrEqual(200);
+    expect(needsDecisionOpen([comment])).toBeNull();
+  }
+  expect(needsDecisionOpen(comments)).toBeNull();
+  expect(row(sweep([mkPr({ number, labels: L('review:accepted'), comments })]), number).waitingOn).not.toBe('needs-decision:note');
+});
+it.each(['> 🔔 conveyor — needs your decision', 'Advisory example: 🔔 conveyor — needs your decision'])
+('quoted or mentioned escalation heading is not an operator request: %s', body => {
+  expect(needsDecisionOpen([c('plateau-worker[bot]', new Date(NOW - 60000).toISOString(), body)])).toBeNull();
+});
+it('an informational fallback cannot supersede or hide a real unanswered operator escalation', () => {
+  const real = c('plateau-worker[bot]', new Date(NOW - 120000).toISOString(),
+    '🔔 conveyor — needs your decision\n\nneeds your decision: timeout-retry-needs-human\n\nNo further rerun or heal is safe; please decide.');
+  const fallback = c('plateau-worker[bot]', new Date(NOW - 60000).toISOString(), advisoryThreads[0][1][0][1]);
+  expect(needsDecisionOpen([real, fallback])).toMatchObject({ at: NOW - 120000, dispute: false });
+});
