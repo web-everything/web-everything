@@ -165,3 +165,34 @@ describe('a declared smoke sample is not truncation (follow-up regression, 2026-
     await expect(read({ discoveryIncomplete: true }, '12')).rejects.toThrow(/truncated/);
   });
 });
+
+describe('author lookup: a gh slot throttle DEFERS the read; it is never a hard failure and never accepts a row without its author', () => {
+  const throttled = () => Object.assign(new Error('gh-throttle: throttled — no gh slot within 8.122s (class=background); retry next tick\n'),
+    { status: 1, stdout: '', stderr: 'gh-throttle: throttled — no gh slot within 8.122s (class=background); retry next tick\n', ghThrottled: { class: 'background', waitedMs: 8122 } });
+  const read = async (number, readRest) => {
+    const { defaultReadPrs } = await import('../reconcile-pass.mjs');
+    const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
+    return defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readCommits: () => [], readRest,
+      readShared: () => [{ number, labels: [], comments: [], statusCheckRollup: [] }],
+      retryOpts: { sleep: () => {}, persist: false, onEvent: () => {} } });
+  };
+  it('a throttled author lookup returns the deferred marker (retry next tick), not rows and not a throw', async () => {
+    const { isGhDeferred } = await import('../../lib/gh-deferred.mjs');
+    const out = await read(9101, () => { throw throttled(); });
+    expect(Array.isArray(out)).toBe(false);
+    expect(isGhDeferred(out)).toBe(true);
+    expect(out.deferred).toBe(true);
+  });
+  it('a genuine 4xx still fails closed', async () => {
+    await expect(read(9102, () => { throw Object.assign(new Error('x'), { stderr: 'HTTP 404: Not Found', httpStatus: 404 }); })).rejects.toThrow(/author/);
+  });
+  it('a missing login still fails closed', async () => {
+    await expect(read(9103, () => ({ json: {} }))).rejects.toThrow(/author/);
+  });
+  it('a resolved author is remembered: the second read of the same PR makes no REST call', async () => {
+    const rest = vi.fn(() => ({ json: { user: { login: 'u', type: 'User' } } }));
+    expect((await read(9104, rest)).map(p => p.author.login)).toEqual(['u']);
+    expect((await read(9104, rest)).map(p => p.author.login)).toEqual(['u']);
+    expect(rest).toHaveBeenCalledTimes(1);
+  });
+});

@@ -86,6 +86,7 @@ import { readSharedOpenPrs, sampleContextDeclared } from '../lib/pr-snapshot.mjs
 import { prSnapshotEnabled } from '../lib/pr-snapshot-store.mjs';
 import { listOpenPrsPagedHydrated, resolvePrListPaging, assertInventoryComplete, parseListOutput } from '../lib/pr-list-paged.mjs';
 import { ghRestGetJson } from '../lib/gh-rest-read.mjs';
+import { isGhThrottled } from '../lib/gh-deferred.mjs';
 import { withListRetry } from '../lib/gh-list-retry.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { prFactKey, readThroughShadow } from './planner-fact-cache.mjs';
@@ -334,7 +335,12 @@ export function withRestAuthors(rows, { repo, readRest = ghRestGetJson } = {}) {
     if (!authorByPr.has(key)) {
       let u;
       try { u = readRest(`repos/${repo}/pulls/${pr.number}`, { context: repo, op: 'pr author (reconcile)' })?.json?.user; }
-      catch (cause) { throw Object.assign(new Error(`author of ${key} unreadable — refusing to accept the row without it`, { cause }), { code: 'pr-author-unreadable', stderr: cause?.stderr }); }
+      catch (cause) {
+        // A gh SLOT throttle (no slot within the wait, not a server failure) defers the WHOLE read: never accept the row
+        // without its author, never hard-fail — the tick retries next time. A genuine 4xx / missing login still fails closed.
+        if (isGhThrottled(cause)) throw Object.assign(new Error(`author lookup of ${key} throttled — deferring the read`, { cause }), { authorLookupDeferred: true });
+        throw Object.assign(new Error(`author of ${key} unreadable — refusing to accept the row without it`, { cause }), { code: 'pr-author-unreadable', stderr: cause?.stderr });
+      }
       if (!u?.login) throw Object.assign(new Error(`author of ${key} missing from the REST response — refusing to accept the row without it`), { code: 'pr-author-unreadable' });
       authorByPr.set(key, { login: u.login, is_bot: u.type === 'Bot' });
     }
@@ -404,7 +410,8 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
   };
   if (exec === execFileSyncThrottled && repo) {
     const usePaged = prSnapshotEnabled(process.env) || listPaged !== listOpenPrsPagedHydrated;
-    const listed = withListRetry(() => {
+    let listed;
+    try { listed = withListRetry(() => {
       const shared = readShared({ repo, fields: SNAPSHOT_LIST_FIELDS, allowDeferred: true });
       if (shared) {
         // A declared smoke sample (WE_PR_SNAPSHOT_SAMPLE or a rebuild-smoke child) is accepted; a sample flag in a live read is not.
@@ -421,7 +428,10 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
       // The page reader trusts GitHub's own totalCount only loosely: fewer rows than it reported is a partial inventory.
       assertInventoryComplete({ repo, rows: paged.rows, totalCount: paged.totalCount, truncated: paged.truncated });
       return withRestAuthors(paged.rows, { repo, readRest });
-    }, { repo, op: 'reconcile-pr-list', ...retryOpts });
+    }, { repo, op: 'reconcile-pr-list', ...retryOpts }); } catch (e) {
+      if (e?.authorLookupDeferred) return { outcome: 'deferred-low-budget', deferred: true, priority: 'background', reason: 'author-lookup-throttled', message: String(e.message) };
+      throw e;
+    }
     if (!Array.isArray(listed)) return listed;
     return enrich(listed);
   }
