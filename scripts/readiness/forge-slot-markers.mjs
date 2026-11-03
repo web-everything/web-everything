@@ -243,6 +243,9 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
         try { ({mtimeMs, ino} = fs.statSync(file)); } catch { continue; }
         const marker = readMarker(file), index = Number(m[1]);
         if (marker.unreadable) continue;
+        // Stuck = kept past the age bound with NO proof of a live owner. Legacy, unbound, unknown-liveness and dead-owner
+        // markers all count; only a provably alive owner (a long healthy job) is excluded.
+        if (now - mtimeMs >= stuckAgeMs && (marker.legacy || liveness(ownerPid(root, index, file), selfPid) !== 'alive')) held.push({name, run: marker.run});
         const key = `${name}:${ino}:${mtimeMs}`; // a replacement marker never inherits a predecessor's death stamp
         if (marker.legacy) {
           // Neither a missing/dead local lock holder nor this host's telemetry proves an unbound job stopped.
@@ -252,8 +255,6 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
         if (marker.host !== host || host === undefined) continue;
         if (!ownerGone(root, index, file, liveness, selfPid)) { forget(file, key); continue; }
         stampFor(file, key);
-        // Stuck means a DEAD owner whose slot is still kept; a live owner's long job is healthy, not stuck.
-        if (now - mtimeMs >= stuckAgeMs) held.push({name, run: marker.run});
         dead.push({name, key, file, mtimeMs, ino, index, run: marker.run, at: marker.at, owner: marker.owner});
       }
       if (dead.length) {
