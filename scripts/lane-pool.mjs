@@ -299,40 +299,12 @@ const tryGit = (args, cwd, opts = {}) => {
   }
 };
 
-/** Read literal output names without executing lane-owned configuration. Unknown configs add nothing. */
+/** List eligible top-level build directories using the fixed naming convention (_site, _site-*). */
 export function ignoredBuildOutputDirs(dir) {
-  const dirs = new Set();
   const denied = new Set(['node_modules', '.git', '.claude', 'src', 'scripts', 'docs']);
-  const add = (name) => {
-    // Also exclude pathspec magic/globs and platform-specific separators: these must be literal children.
-    // Parsing config source cannot be made fully sound (string literals, block comments), so a hard backstop:
-    // only the repo's generated-site naming convention (`_site`, `_site-*`) can ever be cleaned.
-    if (/^_site(?:-[A-Za-z0-9_.-]+)?$/.test(name) && !name.includes('..')) dirs.add(name);
-  };
-  try {
-    // Consume quoted strings (including escaped characters) before recognizing comments.
-    // Mask comments with whitespace so removing one cannot join separate tokens.
-    const config = readFileSync(join(dir, '.eleventy.js'), 'utf8')
-      .replace(/("(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|`(?:\\[\s\S]|[^`\\])*`)|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g,
-        (match, quoted) => quoted ?? match.replace(/[^\r\n]/g, ' '));
-    // Only standalone opening/closing lines delimit a supported dir block.
-    for (const block of config.matchAll(/^[\t ]*dir[\t ]*:[\t ]*\{[\t ]*\r?\n([^{}]*?)^[\t ]*\}[\t ]*,?[\t ]*\r?$/gm)) {
-      for (const line of block[1].split(/\r?\n/)) {
-        const output = line.match(/^\s*output\s*:\s*(["'])([A-Za-z0-9_-][A-Za-z0-9_.-]*)\1\s*,?\s*$/);
-        if (output) add(output[2]);
-      }
-    }
-  } catch { /* Unreadable config: no Eleventy output is eligible. */ }
-  try {
-    const config = readFileSync(join(dir, 'playwright.config.ts'), 'utf8');
-    for (const line of config.split(/\r?\n/)) {
-      // Validate the whole command property before extracting any output tokens.
-      // Flag values may include template interpolations such as ${VISUAL_FIXTURE_PORT}.
-      if (line.includes('//') || !/^\s*command\s*:\s*`npx @11ty\/eleventy\b(?:\s+--[A-Za-z-]+(?:=[^\s`;&|#]+)?)*`\s*,?\s*$/.test(line)) continue;
-      for (const match of line.matchAll(/\s--output=([A-Za-z0-9_-][A-Za-z0-9_.-]*)(?=\s|`)/g)) add(match[1]);
-    }
-  } catch { /* Unreadable config: no Playwright outputs are eligible. */ }
-  return [...dirs].filter((name) => {
+  return readdirSync(dir).filter((name) => {
+    // Only literal children in the fixed naming convention (_site, _site-*) are eligible.
+    if (!(name === '_site' || /^_site-[A-Za-z0-9_.-]+$/.test(name)) || name.includes('..')) return false;
     if (denied.has(name)) return false;
     // Absent or symlinked outputs are never cleaned, so they need no git evidence (git rejects symlink pathspecs).
     try { if (!lstatSync(join(dir, name)).isDirectory()) return false; } catch { return false; }
@@ -348,7 +320,7 @@ export function ignoredBuildOutputDirs(dir) {
   });
 }
 
-/** Remove eligible ignored build directories; failure must prevent handing out a dirty lane. */
+/** Remove eligible ignored build directories (_site, _site-*); failure must prevent handing out a dirty lane. */
 export function cleanIgnoredBuildOutput(dir) {
   try {
     const dirs = ignoredBuildOutputDirs(dir).filter((name) => {
