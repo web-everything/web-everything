@@ -1073,6 +1073,21 @@ describe('guard-bash — direct-push-to-main block (#2203)', () => {
     blocked('git push origin');
     blocked('git push --force-with-lease');
   });
+  it('ALLOWS a lane/* push whose expansion is only a redirect target or a non-destination option value (#6262)', () => {
+    allowed('git push origin HEAD:refs/heads/lane/x --push-option="$OPT"');
+    allowed('git push origin HEAD:refs/heads/lane/x 2>"$LOG"');
+    allowed('git push origin HEAD:refs/heads/lane/x --force-with-lease="lane/x:$SHA"');
+  });
+  it('still blocks a push whose remote, refspec or helper program is an unresolved expansion (#6262)', () => {
+    const unresolved = (c) => expect(decide(c), c).toMatch(/unresolved git push arguments/);
+    unresolved('git push origin "$B"');
+    unresolved('git push origin HEAD:refs/heads/lane/x$B');
+    unresolved('git push origin `echo main`');
+    unresolved('git push "$R" HEAD:refs/heads/lane/x');
+    unresolved('git push --repo="$R" origin HEAD:refs/heads/lane/x');
+    unresolved('git push origin HEAD:refs/heads/lane/x --receive-pack="$X"');
+    unresolved('git push origin HEAD:refs/heads/lane/x --unknown="$X"');
+  });
   it('ALLOWS a lane/* push (the sanctioned path — PR-gated)', () => {
     allowed('git push origin HEAD:refs/heads/lane/foo-2210');
     allowed('git push origin abc123:refs/heads/lane/batch-x-1');
@@ -3594,6 +3609,26 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
   const LANE = '/ws/.lanes/web-everything/lane-53';
   const roots = [CLONE];
 
+  // #6262 — over-denies this PR introduced (red before the narrowing), with the attack shapes pinned alongside.
+  it('allows wrapper commands whose option leaves the child and cwd as written (no unmodelled directory effect)', () => {
+    for (const command of ['command -v git', 'command -V git', 'env -i git status', 'env -u FOO git log --oneline',
+      'time -p git status', 'nice -n 5 git diff --stat', 'env -i FOO=1 git rev-parse HEAD']) {
+      expect(daemonCloneWriteReason(command, { cwd: LANE, roots }), command).toBeNull();
+    }
+  });
+  it('still fails closed on wrapper options that can carry a daemon-clone git write or directory change', () => {
+    for (const command of [`env -i git -C ${CLONE} commit -m x`, `env -C ${CLONE} git commit -m x`, 'env -i git commit -m x',
+      'env -u FOO git push', 'command -p git commit -m x', 'time -p git reset --hard',
+      'nice -n 5 git checkout main', 'nice -n 5 bash -c "git commit -m x"', 'env -i git status $X', `env -i git -C ${CLONE} status`,
+      'time -f %e git commit -m x']) {
+      expect(daemonCloneWriteReason(command, { cwd: LANE, roots }), command).toMatch(/DAEMON CLONE/);
+    }
+  });
+  it('A1 truncated inventory: a git invocation cut off before its option value or subcommand fails closed with a named reason', () => {
+    for (const command of ['git -C', 'git --git-dir', 'git --work-tree', 'git -c', 'env -i git -C', 'env -u FOO git -c']) {
+      expect(daemonCloneWriteReason(command, { cwd: LANE, roots }), command).toMatch(/DAEMON CLONE \("unresolved (?:git|wrapper) target/);
+    }
+  });
   it('A1 inventory denies unclassified daemon commands and permits known reads', () => {
     const ctx = { cwd: LANE, daemonCloneRoots: roots };
     for (const command of ['synthetic-new-command', 'update-index --refresh', 'bisect start',

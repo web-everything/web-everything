@@ -2354,6 +2354,10 @@ function daemonWrapperUncertain(segment) {
   const words = shellTokens(String(segment).trim().replace(/^[({]\s*/, '')).filter((t) => !t.op).map((t) => t.text);
   // This check concerns Git and shell wrappers that may invoke it, not unrelated `env -i echo` commands.
   if (!words.some((word) => ['git', 'sh', 'bash', 'zsh', 'eval'].includes(word.replace(/^.*\//, '')))) return false;
+  // canonicalCommand does not peel wrappers that carry options, so a child reached AFTER a modelled option is only
+  // proven safe when it is a plain Git read (subcommand directly after `git`, literal args) or `command -v/-V`.
+  let optionSeen = false;
+  let probeOnly = false;
   for (let i = 0; i < words.length;) {
     const word = words[i++];
     if (/^[A-Za-z_]\w*=/.test(word)) continue;
@@ -2362,11 +2366,30 @@ function daemonWrapperUncertain(segment) {
       return true; // canonicalCommand does not peel path-qualified wrappers; do not lose their Git child
     }
     if (word === 'env') {
-      if (words[i]?.startsWith('-')) return true; // -C/--chdir, split strings and unknown options
+      // Only options that neither change directory nor split a string are modelled: -i/-0 and -u NAME.
+      // -C/--chdir, -S/--split-string and unknown options stay uncertain.
+      while (words[i]?.startsWith('-')) {
+        const option = words[i++];
+        optionSeen = true;
+        if (['-i', '-0', '--ignore-environment', '--null'].includes(option)) continue;
+        if (option === '-u') { if (!words[i++]) return true; continue; }
+        if (/^--unset=.+/.test(option)) continue;
+        return true;
+      }
       continue;
     }
     if (['time', 'command', 'builtin', 'nice'].includes(word)) {
-      if (words[i]?.startsWith('-')) return true;
+      // Value-free (`time -p`, `command -p/-v/-V`) and `nice -n N` options leave the child command and its cwd
+      // exactly as written; anything else is unmodelled and fails closed.
+      while (words[i]?.startsWith('-')) {
+        const option = words[i++];
+        optionSeen = true;
+        if (word === 'time' && option === '-p') continue;
+        if (word === 'command' && option === '-p') continue;
+        if (word === 'command' && ['-v', '-V'].includes(option)) { probeOnly = true; continue; } // never runs its operand
+        if (word === 'nice' && option === '-n' && /^-?\d+$/.test(words[i] ?? '')) { i += 1; continue; }
+        return true;
+      }
       continue;
     }
     if (word === 'sudo') {
@@ -2391,7 +2414,39 @@ function daemonWrapperUncertain(segment) {
       }
       continue;
     }
-    return false;
+    if (!optionSeen || probeOnly) return false;
+    if (base === 'git') return !(DAEMON_GIT_READS.has(words[i] ?? '') && words.slice(i).every((w) => !/[$`]/.test(w)));
+    return ['sh', 'bash', 'zsh', 'eval'].includes(base);
+  }
+  return false;
+}
+
+// Push options whose VALUE steers where the push goes (remote, helper program): an expansion there is as unresolved as
+// one in a positional remote/refspec. Other option values (`--push-option`, `--force-with-lease=`, `-o`) do not pick a ref.
+const PUSH_TARGET_OPTIONS = new Set(['--repo', '--receive-pack', '--exec', '--mirror', '--all', '--tags', '--delete', '--prune']);
+
+/** Does a `git push` carry a `$`/backtick expansion where it can choose the destination? Pure. A redirect target
+ *  (`2>"$LOG"`) or an unrelated option value (`--push-option="$X"`) is not a destination; an unknown option stays
+ *  fail-closed, as does a command substitution that spans tokens. */
+function pushHasUnresolvedTarget(command) {
+  if (!/[$`]/.test(command)) return false;
+  const toks = shellTokens(command);
+  if (toks.some((t) => t.op && /[`]|\$\(/.test(t.text ?? ''))) return true;
+  const words = [];
+  for (let k = 0; k < toks.length; k += 1) {
+    if (toks[k].op) { if (/^\d*[<>]/.test(toks[k].text ?? '') && !/[`$]/.test(toks[k].text)) k += 1; continue; } // redirect target
+    words.push(toks[k].text);
+  }
+  const at = words.indexOf('push');
+  if (at < 0) return true;
+  const args = words.slice(at + 1);
+  for (let i = 0; i < args.length; i += 1) {
+    const a = args[i];
+    if (!/[$`]/.test(a)) continue;
+    if (!a.startsWith('-')) return true; // positional remote/refspec
+    const name = a.replace(/=.*$/s, '');
+    if (PUSH_TARGET_OPTIONS.has(name)) return true;
+    if (!['--push-option', '-o', '--force-with-lease', '--signed', '--recurse-submodules'].includes(name)) return true;
   }
   return false;
 }
@@ -4532,7 +4587,7 @@ export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLi
   // skips CI entirely. Only an explicit `lane/*` destination is allowed. Sanctioned override: prefix
   // `MAIN_PUSH_OK=1` (e.g. pr-land --fallback-git, or an emergency the user directs).
   const resolvedPush = canonicalGitOp(s);
-  if (/^git\s+push\b/.test(resolvedPush) && /[$`]/.test(resolvedPush)
+  if (/^git\s+push\b/.test(resolvedPush) && pushHasUnresolvedTarget(resolvedPush)
       && !/\bMAIN_PUSH_OK=1\b/.test(s))
     return 'unresolved git push arguments may target a protected ref. Use explicit literal remote/refspec arguments and push to a lane/* ref.';
   if (atCommand(/^git\s+push\b/) && !/\bMAIN_PUSH_OK=1\b/.test(s)) {
