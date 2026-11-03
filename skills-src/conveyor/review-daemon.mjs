@@ -169,8 +169,27 @@ const WE_SLUG = CONSTELLATION_REPOS.we.slug;
 
 /** Identical shape to we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs's own `runDaemonLoop` — see
  *  that file's header for why it is duplicated here rather than imported (not yet landed on `main`). */
+/**
+ * R492 (B): the resident set of this long-lived process. A live heap snapshot showed the JS heap flat at ~400 MB
+ * while RSS climbed past 3 GB: the growth is native allocator retention (large transient gh/Buffer outputs freed but
+ * not returned to the OS), which no JS-level bound can release. So the loop recycles the process BETWEEN ticks once
+ * RSS passes a ceiling; launchd KeepAlive restarts it (the same exit the self-sync restart uses). `WE_REVIEW_DAEMON_MAX_RSS_MB`
+ * sets the ceiling (default 3072); 0 turns recycling off.
+ */
+export const DEFAULT_MAX_RSS_MB = 3072;
+export function resolveMaxRssMb(env = process.env) {
+  const raw = env.WE_REVIEW_DAEMON_MAX_RSS_MB;
+  if (raw === undefined || raw === '') return DEFAULT_MAX_RSS_MB;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_MAX_RSS_MB;
+}
+export function shouldRecycleForRss(rssBytes, env = process.env) {
+  const limit = resolveMaxRssMb(env);
+  return limit > 0 && Number(rssBytes) > limit * 1024 * 1024;
+}
+
 export async function runDaemonLoop({
-  tickOnce, sleep, heartbeat = () => true, onTick = () => {}, onTickError = () => {},
+  tickOnce, sleep, heartbeat = () => true, onTick = () => {}, onTickError = () => {}, shouldRecycle = () => false,
   intervalMs = DEFAULT_INTERVAL_MS, maxTicks = Infinity,
 }) {
   if (typeof tickOnce !== 'function') throw new TypeError('runDaemonLoop requires a tickOnce effect');
@@ -184,6 +203,7 @@ export async function runDaemonLoop({
     }
     const alive = await heartbeat();
     if (!alive) return { ticks: tick + 1, stoppedReason: 'lease-lost' };
+    if (shouldRecycle()) return { ticks: tick + 1, stoppedReason: 'rss-recycle' };
     if (tick + 1 >= maxTicks) return { ticks: tick + 1, stoppedReason: 'max-ticks' };
     await sleep(intervalMs);
     tick += 1;
@@ -1734,6 +1754,7 @@ export function buildCliDaemonEffects({
     },
     sleep: realSleep,
     heartbeat: () => heartbeatRunnerLease(RUNNER_LOCK_ROOT, owner, { key: REVIEW_DAEMON_LEASE_KEY }),
+    shouldRecycle: () => shouldRecycleForRss(process.memoryUsage().rss),
     onTick: (result) => {
       // A `withSelfSync`-skipped tick (`skippedTick`: `repos: []`) used to print as "tick () — 0 owed", which read
       // like discovery had watched NO repo. Say what actually happened.
@@ -1846,6 +1867,7 @@ async function main() {
   if (!stopping) {
     console.error(`review-daemon: loop stopped (${stoppedReason}) — releasing the lease and exiting.`);
     releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key: REVIEW_DAEMON_LEASE_KEY });
+    if (stoppedReason === 'rss-recycle') process.exit(0); // launchd KeepAlive restarts onto a fresh heap
   }
 }
 
