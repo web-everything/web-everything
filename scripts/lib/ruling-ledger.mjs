@@ -74,9 +74,10 @@ function currentRecords(snaps, head) {
 }
 
 /** Carries are evidence to re-check, never proof that a run re-confirmed the finding on this head. */
-const unverifiedFromRecords = (records) => records.flatMap(({ record }) => record.referrals.flatMap((f) => {
+const reproducedOnHead = (record, key) => (record.verified ?? []).some((v) => v?.key === key && v.outcome === 'reproduced');
+const unverifiedFromRecords = (records, merelyPending = () => true) => records.flatMap(({ record }) => record.referrals.flatMap((f) => {
   const recheck = referralRecheck(record, f.key);
-  return recheck ? [{ finding: findingView(f), runId: record.runId, priorHead: recheck.fromHead ?? null }] : [];
+  return recheck && !reproducedOnHead(record, f.key) && merelyPending(record, f.key) ? [{ finding: findingView(f), runId: record.runId, priorHead: recheck.fromHead ?? null }] : [];
 }));
 
 /** Current-head re-check carries, including append-only `record.rechecks`, independent of prior rulings. */
@@ -294,7 +295,14 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
     return seen ? seen.index : null;
   };
   const matches = [];
-  const unverified = unverifiedFromRecords(cur);
+  // A carry is unverified only while the finding is merely pending on this head: a ruling here (a reviewer's, or an
+  // auto-policy block) means a run looked at it again, and a `reproduced` verification re-confirms it outright.
+  const merelyPending = (record, key) => {
+    const hereState = gateState(record);
+    return !activeRulings(record, key).length && !!hereState && hereState.pending.includes(key) && !hereState.blocked.includes(key)
+      && !operatorRulings.some((o) => o.head === head && o.runId === record.runId && o.key === key);
+  };
+  const unverified = unverifiedFromRecords(cur, merelyPending);
   const restacks = new Map();
   let worst = 0;
   for (const { record } of cur) {
@@ -304,7 +312,7 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
     for (const f of record.referrals) {
       // A carried re-check has no confirming run on this head, whatever its source head ruled.
       // Keep it visible as unverified; the pending-findings gate still holds acceptance.
-      if (referralRecheck(record, f.key)) continue;
+      if (referralRecheck(record, f.key) && !reproducedOnHead(record, f.key) && merelyPending(record, f.key)) continue;
       const g = findingView(f);
       if (matches.some((m) => m.finding.key === g.key)) continue;
       if (rulingsHere(f.key).some((r) => r.result === 'block')) continue;

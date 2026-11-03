@@ -436,9 +436,22 @@ describe('ignoredRulings — an older-head block the current-head reviewer ruled
       const carried = recheck(kind === 'original block' ? H1 : H2, fresh);
       const thread = (rec) => ({ headRefOid: head, comments: [...history, ...source, comment(rec, 20),
         ...(kind === 'auto-policy' ? [autoBlock(rec, 22)] : [])] });
-      expect(ignoredRulings(thread(carried))).toBeNull();
-      expect(unverifiedOnHead(thread(carried))).toHaveLength(1);
+      if (kind === 'auto-policy') {
+        // an auto-policy block on the carried finding means the gate acted on it on this head: the ladder keeps counting
+        expect(ignoredRulings(thread(carried))?.matches).toHaveLength(1);
+      } else {
+        expect(ignoredRulings(thread(carried))).toBeNull();
+        expect(unverifiedOnHead(thread(carried))).toHaveLength(1);
+      }
       expect(ignoredRulings(thread(fresh))?.matches).toHaveLength(1);
+    });
+    it('a carried finding the head\'s verifier reproduced is re-confirmed and still escalates', () => {
+      const base = record({ head: H3, runId: 'run-3' });
+      const carried = recheck(H2, base);
+      const verified = { ...carried, verified: carried.referrals.map((f) => ({ key: f.key, outcome: 'reproduced', reason: 'reproduced on the live head' })) };
+      const comments = [...history, comment(r2([]), 10), comment(r2([block]), 12), comment(verified, 20)];
+      expect(ignoredRulings({ headRefOid: H3, comments })?.matches).toHaveLength(1);
+      expect(unverifiedOnHead({ headRefOid: H3, comments })).toEqual([]);
     });
     it('replay #5762 @5eba5a13: no false dispute; the re-checked finding is pending', () => {
       const fx = fixture('pr-5762-5eba5a13-recheck-after-not-real.json');
