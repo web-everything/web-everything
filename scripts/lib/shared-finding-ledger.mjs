@@ -26,7 +26,9 @@ function sameSpot(a, b) {
   const ia = normalizeFindingIdentity(a), ib = normalizeFindingIdentity(b);
   if (ia?.anchor && ib?.anchor && ia.anchor !== ib.anchor) return false;
   // Fail closed: a missing line on either side is not the same spot.
-  return Number.isInteger(a.line) && Number.isInteger(b.line) && Math.abs(a.line - b.line) === 0;
+  const pos = (n) => Number.isInteger(n) && n > 0;
+  return pos(a.line) && pos(b.line) && a.line === b.line
+    && a.verdict === b.verdict && a.impactIfUnfixed === b.impactIfUnfixed;
 }
 
 const rawClaim = (f) => String(f?.summary ?? '').normalize('NFKC').replace(/\s+/g, ' ').trim();

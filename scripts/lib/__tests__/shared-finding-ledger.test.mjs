@@ -362,3 +362,15 @@ describe('audit round 8 hardening', () => {
     expect(filterReraises(l, [a, b], { pinStillHolds: () => true }).dropped).toEqual([]);
   });
 });
+
+describe('audit round 9 hardening', () => {
+  const pin = (a) => pinFinding(markFixed(record(emptyLedger(), [a]), findingKey(a), { head: H2 }), findingKey(a), PIN);
+  it('a worse verdict or impact is not suppressed by a milder pin', () => {
+    const l = pin(finding({ verdict: 'PLAUSIBLE', impactIfUnfixed: 'degraded' }));
+    expect(filterReraises(l, [finding({ verdict: 'CONFIRMED', impactIfUnfixed: 'broken' })], { pinStillHolds: () => true }).dropped).toEqual([]);
+  });
+  it('non-positive lines are never suppressed', () => {
+    const l = pin(finding({ line: -1 }));
+    expect(filterReraises(l, [finding({ line: -1 })], { pinStillHolds: () => true }).dropped).toEqual([]);
+  });
+});
