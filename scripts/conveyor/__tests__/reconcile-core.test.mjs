@@ -4014,6 +4014,11 @@ describe('restore-review-label - orphaned review-status:fixing tag (R502 item 4)
     expect(owed(orphan(), { reviewLabelHeal: 'green' })).toEqual([]);
     expect(owed(orphan(), { reviewLabelHeal: 'off' })).toEqual([]);
   });
+  it('fails closed on unknowns: claim read failed, comments unreadable, no clock', () => {
+    expect(owed(orphan({ fixClaimUnknown: true }))).toEqual([]);
+    expect(owed(orphan({ comments: undefined }))).toEqual([]);
+    expect(planReconcile({ prs: [orphan()], agents: [], durableCounts: {}, now: 0 }).dispatch.some((d) => d.variant === 'orphaned-fixing')).toBe(false);
+  });
   it('never for a draft, non-lane, review-labelled, ready-to-merge or untagged PR', () => {
     for (const p of [orphan({ isDraft: true }), orphan({ headRefName: 'feature/human' }), orphan({ labels: lbl('review-status:fixing', 'review:pending') }),
       orphan({ labels: lbl('review-status:fixing', 'ready-to-merge') }), orphan({ labels: lbl('review-status:stood-down') })]) {

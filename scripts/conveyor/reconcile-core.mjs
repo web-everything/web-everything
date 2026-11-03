@@ -2840,7 +2840,8 @@ export function planReconcile({
         && String(pr?.headRefName ?? '').startsWith('lane/')
         && withPhase.labels.includes('review-status:fixing')
         && !withPhase.labels.some((l) => l.startsWith('review:') || l === 'ready-to-merge')
-        && !(pr?.fixClaim && pr.fixClaim.who)
+        && !(pr?.fixClaim && pr.fixClaim.who) && !pr?.fixClaimUnknown
+        && Array.isArray(pr?.comments) && Number.isFinite(now) && now > 0
         && typeof pr?.headRefOid === 'string' && pr.headRefOid
         && parseReviewedSha(pr?.comments) !== pr.headRefOid.toLowerCase()
         && !(Array.isArray(pr?.comments) && pr.comments.some((c) => isReviewVerdictComment(c) && verdictJudged(c, pr.headRefOid.toLowerCase())))
