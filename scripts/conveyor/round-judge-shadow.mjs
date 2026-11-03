@@ -37,8 +37,8 @@ export function resolveRoundJudgeMode({ env = process.env, path = ROUND_JUDGE_SE
   try { file = JSON.parse(readFileSync(path, 'utf8')); } catch { file = {}; }
   let plat = platform;
   if (plat === undefined) { try { plat = platformPreference('rounds', { env }); } catch { plat = undefined; } }
-  const resolved = resolveCascade({ standard: { judge: { mode: 'off', maxGrants: ROUND_JUDGE_MAX_GRANTS_STANDARD, nonConverging: false } }, platform: plat, tool: file?.rounds ?? file,
-    valid: { judge: (v) => (typeof v === 'boolean' ? true : typeof v === 'number' ? Number.isInteger(v) && v >= 1 && v <= 100 : normMode(v?.mode ?? v) !== null) } });
+  const resolved = resolveCascade({ standard: { judge: { mode: 'off', maxGrants: ROUND_JUDGE_MAX_GRANTS_STANDARD }, nonConverging: { enabled: false } }, platform: plat, tool: file?.rounds ?? file,
+    valid: { nonConverging: (v) => typeof v === 'boolean', judge: (v) => (typeof v === 'number' ? Number.isInteger(v) && v >= 1 && v <= 100 : normMode(v?.mode ?? v) !== null) } });
   logCascadeSources('rounds', resolved, { env, ...(log ? { log } : {}) });
   let mode = normMode(resolved.leafValues?.['judge.mode']) ?? 'off';
   let source = resolved.sources?.['judge.mode'] ?? 'standard';
@@ -47,7 +47,7 @@ export function resolveRoundJudgeMode({ env = process.env, path = ROUND_JUDGE_SE
   if (fromEnv) { mode = fromEnv; source = 'env'; }
   const mg = resolved.leafValues?.['judge.maxGrants'];
   const maxGrants = Number.isInteger(mg) && mg >= 1 ? mg : ROUND_JUDGE_MAX_GRANTS_STANDARD;
-  const nonConverging = resolved.leafValues?.['judge.nonConverging'] === true;
+  const nonConverging = resolved.leafValues?.['nonConverging.enabled'] === true;
   return { mode, source, maxGrants, nonConverging, line: `${formatCascadeSourcesLine('rounds', resolved)}${source === 'env' ? ` · env ${ROUND_JUDGE_MODE_ENV}=${mode}` : ''}` };
 }
 

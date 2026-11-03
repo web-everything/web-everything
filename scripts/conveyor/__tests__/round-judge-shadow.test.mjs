@@ -129,10 +129,12 @@ describe('observeRoundCap', () => {
 
 describe('nonConverging setting', () => {
   it('is off in the standard, on when the settings file turns it on, and ignores junk', () => {
+    const maxJunk = tmp(); const mp = join(maxJunk, 'm.json'); writeFileSync(mp, JSON.stringify({ rounds: { judge: { mode: 'shadow', maxGrants: true } } }));
+    expect(resolveRoundJudgeMode({ env: {}, path: mp, platform: null }).maxGrants).toBe(20);
     expect(resolveRoundJudgeMode({ env: {}, path: '/nonexistent', platform: null }).nonConverging).toBe(false);
-    const d = tmp(); const p = join(d, 's.json'); writeFileSync(p, JSON.stringify({ rounds: { judge: { mode: 'shadow', nonConverging: true } } }));
+    const d = tmp(); const p = join(d, 's.json'); writeFileSync(p, JSON.stringify({ rounds: { judge: { mode: 'shadow' }, nonConverging: { enabled: true } } }));
     expect(resolveRoundJudgeMode({ env: {}, path: p, platform: null }).nonConverging).toBe(true);
-    writeFileSync(p, JSON.stringify({ rounds: { judge: { mode: 'shadow', nonConverging: 'yes' } } }));
+    writeFileSync(p, JSON.stringify({ rounds: { judge: { mode: 'shadow' }, nonConverging: { enabled: 'yes' } } }));
     expect(resolveRoundJudgeMode({ env: {}, path: p, platform: null }).nonConverging).toBe(false);
   });
 });
