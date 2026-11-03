@@ -102,6 +102,13 @@ describe('source-in-main retire evidence', () => {
     expect(run(git).action).toBe('keep');
   });
 
+  it('keeps when the merge-tree compare against main errors out (exit 128)', () => {
+    const { r, source } = scenario();
+    landOn(r, source);
+    const git = (args) => (args[0] === 'merge-tree' && args.includes('origin/main') ? { code: 128, stdout: '' } : r.git(args));
+    expect(run(git).action).toBe('keep');
+  });
+
   it('keeps when git cannot answer the ancestry question', () => {
     const { r, source } = scenario();
     landOn(r, source);

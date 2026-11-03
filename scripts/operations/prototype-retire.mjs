@@ -94,7 +94,7 @@ export function carriedBeyondMain({ git, ref, mainRef = 'origin/main' }) {
   const cleanMerges = uncleanMerges.length === 0;
   const onto = git(['merge-tree', '--write-tree', '--no-messages', mainRef, tip]);
   const contentInMain = onto.code === 0 && lines(onto.stdout)[0] === mainTree;
-  return { ok: true, tip, unique, merges, uncleanMerges, cleanMerges, contentInMain };
+  return { ok: true, tip, unique, merges, uncleanMerges, cleanMerges, contentInMain, ontoCode: onto.code };
 }
 
 function ghJson(gh, args) {
@@ -112,6 +112,8 @@ function ghJson(gh, args) {
 function sourceInMain({ git, ref, tip, carried, mainRef }) {
   if (!mergeRefBase(ref)) return null;
   if (carried.unique.length !== 0 || carried.cleanMerges !== true) return null;
+  // The main compare must have ANSWERED (0 = merged, 1 = conflict); an error (e.g. 128) is unreadable evidence.
+  if (![0, 1].includes(carried.ontoCode)) return null;
   if (carried.merges.some((merge) => merge !== tip)) return null;
   const parentsRes = git(['rev-list', '--parents', '-n', '1', tip]);
   if (parentsRes.code !== 0) return null;
