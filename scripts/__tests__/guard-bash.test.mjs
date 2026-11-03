@@ -4,7 +4,7 @@
  *   sanctioned `MAIN_PUSH_OK=1` escape passes through. The stdin/JSON I/O is the boundary; `decide` is pure.
  */
 import { describe, it, expect, afterAll } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, readFileSync, symlinkSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import {
@@ -3730,6 +3730,70 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     expect(daemonCloneWriteReason(`git -C ${CLONE} fetch origin`, { cwd: LANE, roots })).toBeNull();
   });
 
+  it('A1 daemon command inventory denies synthetic unclassified commands and preserves reads', () => {
+    for (const args of ['synthetic-new-git-command', 'update-index --refresh', 'bisect start',
+      'sparse-checkout set src', 'maintenance run', 'replace HEAD HEAD~1', 'symbolic-ref HEAD refs/heads/x',
+      'submodule update', 'reflog expire --all', 'filter-branch --all']) {
+      expect(decide(`git -C ${CLONE} ${args}`, { cwd: LANE, daemonCloneRoots: roots }), args).toMatch(/DAEMON CLONE/);
+      expect(daemonCloneWriteReason(`git ${args}`, { cwd: LANE, roots }), args).toBeNull();
+    }
+    for (const args of ['status', 'log', 'diff', 'show', 'rev-parse HEAD', 'ls-files', 'describe', 'symbolic-ref HEAD']) {
+      expect(decide(`git -C ${CLONE} ${args}`, { cwd: LANE, daemonCloneRoots: roots }), args).toBeNull();
+    }
+  });
+
+  it.each(['env', 'time', 'command', 'builtin', 'nice', 'sudo', 'xargs', 'npx', 'bunx',
+    `env -C ${CLONE}`, `env --chdir=${CLONE}`, `env --chdir ${CLONE}`, `sudo -D ${CLONE}`,
+    `sudo -D${CLONE}`, `command env --chdir=${CLONE}`, `env --future-path ${CLONE}`])(
+    'A2 daemon wrapper matrix carries or refuses directory effects: %s', (wrapper) => {
+      expect(decide(`${wrapper} git -C ${CLONE} reset --hard`, { cwd: LANE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
+      if (!wrapper.includes(' ')) {
+        expect(decide(`${wrapper} git -C ${CLONE} status`, { cwd: LANE, daemonCloneRoots: roots })).toBeNull();
+      } else {
+        expect(decide(`${wrapper} git reset --hard`, { cwd: LANE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
+      }
+    },
+  );
+
+  it('A3 daemon compound exports retain possible targets and isolate child scope', () => {
+    for (const prefix of [`f() { export GIT_DIR=${CLONE}/.git; }; f`,
+      `f ( ) { export GIT_DIR=${CLONE}/.git; }; f`,
+      `for x in 1; do export GIT_DIR=${CLONE}/.git; done`, `if true; then export GIT_DIR=${CLONE}/.git; fi`]) {
+      expect(decide(`${prefix}; git reset --hard`, { cwd: LANE, daemonCloneRoots: roots }), prefix).toMatch(/DAEMON CLONE/);
+      expect(decide(`${prefix}; git status`, { cwd: LANE, daemonCloneRoots: roots }), prefix).toBeNull();
+    }
+    expect(decide(`bash -c 'export GIT_DIR=${CLONE}/.git'; git reset --hard`, {
+      cwd: LANE, daemonCloneRoots: roots,
+    })).toBeNull();
+  });
+
+  it.each(['--super-prefix status', '--unknown-option log', '--super-prefix=prefix'])(
+    'DENIES unclassifiable global Git options: %s', (option) => {
+      for (const command of [`git -C ${CLONE} ${option} reset --hard`,
+        `git ${option} -C ${CLONE} reset --hard`]) {
+        expect(decide(command, { cwd: LANE, daemonCloneRoots: roots }), command).toMatch(/DAEMON CLONE/);
+      }
+    },
+  );
+
+  it('DENIES unresolved arguments in mixed read/write subcommands', () => {
+    for (const args of ['config $ARGS.key', 'remote $ARGS', 'symbolic-ref $ARGS']) {
+      expect(decide(`git -C ${CLONE} ${args}`, { cwd: LANE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
+    }
+  });
+
+  it.each(['$SPEC', '${SPEC}', '$(printf x)', '`printf x`', 'HEAD:refs/$DEST/x'])(
+    'DENIES unresolved fetch refspecs across positional, refmap and config readers: %s', (spec) => {
+      for (const args of [`fetch . "${spec}"`, `fetch --refmap="${spec}" . HEAD`,
+        `-c remote.origin.fetch="${spec}" fetch origin`]) {
+        expect(decide(`SPEC=HEAD:refs/heads/x; git -C ${CLONE} ${args}`, {
+          cwd: LANE, daemonCloneRoots: roots,
+        })).toMatch(/DAEMON CLONE/);
+      }
+      expect(daemonCloneWriteReason('git fetch origin', { cwd: CLONE, roots, fetchConfig: [spec] })).toMatch(/DAEMON CLONE/);
+    },
+  );
+
   it('ALLOWS read-only commands targeting the clone — `git -C <clone> log`, `cat`, `git status`', () => {
     expect(daemonCloneWriteReason(`git -C ${CLONE} log`, { cwd: LANE, roots })).toBeNull();
     expect(daemonCloneWriteReason('cat notes.md', { cwd: CLONE, roots })).toBeNull();
@@ -4312,6 +4376,8 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     `git config --fil=${CLONE}/config remote.origin.fetch +main:main`,
     `git config -f ${CLONE}/config remote.origin.fetch +main:main`,
     `git config -f${CLONE}/config remote.origin.fetch +main:main`,
+    `git config -zf${CLONE}/config remote.origin.fetch +main:main`,
+    `git config -zf ${CLONE}/config remote.origin.fetch +main:main`,
     `GIT_CONFIG=${CLONE}/config git config remote.origin.fetch +main:main`,
     `command env GIT_CONFIG=${CLONE}/config git config remote.origin.fetch +main:main`,
     `GIT_CONFIG_GLOBAL=${CLONE}/config git config --global remote.origin.fetch +main:main`,
@@ -4350,11 +4416,47 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     const result = readDaemonFetchConfig('GIT_CONFIG=/decoy VALUE=+main:main git -C /ws -C repo --config-env=remote.origin.fetch=VALUE fetch origin', LANE, [], {},
       (...args) => { calls.push(args); return `remote.origin.fetch\n${spec}\0`; });
     expect(result).toEqual([spec]);
-    expect(calls[0][0]).toBe('git');
-    expect(calls[0][1]).toEqual(['-C', '/ws', '-C', 'repo', '--config-env=remote.origin.fetch=VALUE',
+    expect(calls[0][0]).toBe('/usr/bin/git');
+    expect(calls[0][1]).toEqual(['-C', '/ws', '-C', 'repo', '-c', 'remote.origin.fetch=+main:main',
       '--no-pager', 'config', '--null', '--get-regexp', '^remote\\..*\\.fetch$']);
-    expect(calls[0][2]).toMatchObject({ cwd: LANE, timeout: 2000, maxBuffer: 128 * 1024, env: { VALUE: '+main:main' } });
+    expect(calls[0][2]).toMatchObject({ cwd: LANE, timeout: 2000, maxBuffer: 128 * 1024 });
+    expect(calls[0][2].env).not.toHaveProperty('VALUE');
     expect(calls[0][2].env).not.toHaveProperty('GIT_CONFIG');
+  });
+
+  it('isolates the fetch config child from command-supplied executable and loader environment', () => {
+    let called = false;
+    const command = 'PATH=/attacker LD_PRELOAD=/evil LD_LIBRARY_PATH=/evil DYLD_INSERT_LIBRARIES=/evil GIT_EXEC_PATH=/evil EXTRA=value git fetch origin';
+    expect(readDaemonFetchConfig(command, CLONE, [], {}, (git, _args, options) => {
+      called = true;
+      expect(git).toBe('/usr/bin/git');
+      for (const key of ['PATH', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES', 'GIT_EXEC_PATH', 'EXTRA']) {
+        expect(options.env).not.toHaveProperty(key);
+      }
+      return '';
+    })).toEqual([]);
+    expect(called).toBe(true);
+  });
+
+  it('treats executable environment names in config-env as values and refuses unresolved values', () => {
+    for (const option of ['--config-env=remote.origin.fetch=LD_PRELOAD', '--config-env remote.origin.fetch=LD_PRELOAD']) {
+      let called = false;
+      expect(readDaemonFetchConfig(`LD_PRELOAD=+main:main git ${option} fetch origin`, CLONE, [], {}, (_git, args, { env }) => {
+        called = true;
+        expect(args.slice(0, 2)).toEqual(['-c', 'remote.origin.fetch=+main:main']);
+        expect(env).not.toHaveProperty('LD_PRELOAD');
+        return '';
+      })).toEqual([]);
+      expect(called).toBe(true);
+    }
+    for (const command of ['git --exec-path=/evil fetch origin',
+      'VALUE=$SPEC git --config-env=remote.origin.fetch=VALUE fetch origin',
+      'git -c include.path=$CONFIG fetch origin', 'GIT_CONFIG_GLOBAL=$CONFIG git fetch origin',
+      'git --super-prefix prefix fetch origin']) {
+      let called = false;
+      expect(readDaemonFetchConfig(command, CLONE, [], {}, () => { called = true; return ''; })).toBeNull();
+      expect(called).toBe(false);
+    }
   });
 
   it.each([
@@ -4483,6 +4585,32 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
   };
 
   // Bare repository fixtures avoid modifying the checkout's .git or running any git mutation.
+  it('hook compares symlinked Git and config targets in the registry realpath namespace', () => {
+    const alias = join(root, 'clone-alias');
+    symlinkSync(fakeClone, alias);
+    for (const command of [`git -C ${alias} synthetic-new-command`,
+      `git --git-dir=${alias}/missing-git-dir reset --hard`,
+      `git config -zf${alias}/missing-config user.name example`]) {
+      expect(runHook(command, lane)?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    }
+    expect(runHook(`git -C ${alias} status`, lane)).toBeNull();
+  });
+
+  it('hook refuses unreadable target resolution and preserves ordinary lane targets', () => {
+    expect(runHook(`git -C ${root}/${'x'.repeat(8192)} reset --hard`, lane)
+      ?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    expect(runHook(`git -C ${lane} synthetic-new-command`, lane)).toBeNull();
+  });
+
+  it('A3 hook compound exports retain possible targets and isolate child scope', () => {
+    for (const prefix of [`f() { export GIT_DIR=${fakeClone}/.git; }; f`,
+      `for x in 1; do export GIT_DIR=${fakeClone}/.git; done`, `if true; then export GIT_DIR=${fakeClone}/.git; fi`]) {
+      expect(runHook(`${prefix}; git reset --hard`, lane)?.hookSpecificOutput?.permissionDecision).toBe('deny');
+      expect(runHook(`${prefix}; git status`, lane)).toBeNull();
+    }
+    expect(runHook(`bash -c 'export GIT_DIR=${fakeClone}/.git'; git reset --hard`, lane)).toBeNull();
+  });
+
   const configRepos = {};
   for (const [name, config] of [
     ['branch', '[remote "origin"]\nfetch = +refs/heads/*:refs/heads/*\n'],
