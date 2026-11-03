@@ -50,7 +50,7 @@ export const PUBLISH_ATTEMPTS = 4;
 /** Per-git-call ceiling: a hung fetch/push FAILS (writer: reported + exit 1; reader: `{error}`, fail closed). */
 export const GIT_TIMEOUT_MS = 20_000;
 /** A timed-out freeze READ is retried once with this many times the bound (so a fully hung read fails closed within 3x the bound). */
-const READ_TOTAL_MS = 60_000; // hard cap on one whole freeze read (both attempts, all git calls)
+const READ_TOTAL_MS = 60_000; // shared deadline for one whole freeze read (both attempts, all git calls). Each call gets at most the time left, enforced through timedGit's SIGTERM timeout; like every timedGit call it assumes git honours SIGTERM (a child that ignores it is a pre-existing limit, not widened here)
 const READ_RETRY_FACTOR = 2; // worst case one read is GIT_TIMEOUT_MS x (1 + factor) = 60 s, then it fails closed
 /** Captured git output cap: the freeze doc is a few hundred bytes; anything near this is not our file (fail). */
 const GIT_MAX_BUFFER = 4 * 1024 * 1024;
@@ -233,7 +233,7 @@ export function readSharedFreeze({ board = REPO_ROOT, branch = resolveFreezeBran
   let text;
   try {
     // A loaded host (EMERGENCY-1: load ~25) can push a plain fetch past the per-call bound: retry ONCE with a longer bound before failing closed.
-    // ONE shared deadline for both attempts: every git call is capped at the time left, so the whole read is bounded by READ_TOTAL_MS.
+    // ONE shared deadline for both attempts: every git call is capped at the time left, so the whole read is bounded by READ_TOTAL_MS (given git honours SIGTERM).
     const deadlineAt = Date.now() + READ_TOTAL_MS;
     try { text = attempt(run ?? runFor(GIT_TIMEOUT_MS, deadlineAt)); }
     catch (e) { if (!isTimeout(e)) throw e; text = attempt(run ?? runFor(GIT_TIMEOUT_MS * READ_RETRY_FACTOR, deadlineAt)); }
