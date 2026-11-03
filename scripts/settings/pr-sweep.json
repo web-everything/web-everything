@@ -7,6 +7,7 @@
     "toolingRefusalWindowMinutes": 360,
     "stuckAfterMinutes": 90,
     "stuckAlertMinutes": 90,
+    "readFailAlertAfterPasses": 3,
     "stalledAfterMinutes": 45,
     "sessionActiveWithinMinutes": 30,
     "dispatchDiagnosis": false,

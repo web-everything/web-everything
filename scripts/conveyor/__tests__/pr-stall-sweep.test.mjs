@@ -379,10 +379,10 @@ describe('wiring', () => {
     expect(report.nextState.stallSweep).toEqual({ lastRunAt: NOW, was: 1 });
     expect(report.stallSweep).toMatchObject({ mode: 'shadow', wouldDo: 0 });
   });
-  it('the card-335 report is saved BEFORE the stall sweep runs', async () => {
+  it('stall reads finish before saving decisions so failed reads can freeze PR state', async () => {
     const order = [];
     await runPrSweep({ ...base, persist: () => order.push('persist'), stallSweep: async () => { order.push('stall'); return { state: {} }; } });
-    expect(order).toEqual(['persist', 'stall', 'persist']);
+    expect(order).toEqual(['stall', 'persist', 'persist']);
   });
   it('a pass with items publishes the operator digest; a skipped pass does not', async () => {
     const stallDigest = vi.fn(() => ({ lines: ['x'], fresh: [1], notified: true, errors: [] }));

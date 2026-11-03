@@ -27,7 +27,7 @@ function setup() {
 const op = (pr, state = 'ruling-needed:dispute', o = {}) => ({ lane: 'operator', repo: REPO, pr, head: H, state, action: state, reason: 'the fixer and the reviewer disagree',
   evidence: ['needs-your-decision note', 'e2', 'e3', 'e4'], command: `node scripts/operations/run.mjs record-referral-ruling --pr=${pr} --actor=<your login> --channel=<where you ruled>`, title: 't', ...o });
 const sent = () => { const out = []; const notify = (n) => { out.push(n); return { ok: true }; }; return { out, notify }; };
-const run = (ctx, items, o = {}) => publishStalledDigest({ items, incomplete: false, ...o.pass }, { now: NOW, env: {}, ...ctx, ...o });
+const run = (ctx, items, o = {}) => publishStalledDigest({ items, ...o.pass }, { now: NOW, env: {}, ...ctx, ...o });
 
 describe('the stalled feed kind', () => {
   it('disabling clears published unacknowledged stalls and preserves other feed kinds', async () => {
@@ -201,10 +201,10 @@ describe('the stalled feed kind', () => {
     run(ctx, [op(1)], { notify });
     expect(out).toHaveLength(1);
   });
-  it('clears itself once the condition is gone, but never on an incomplete pass', () => {
+  it('clears itself once the condition is gone, but never for a PR with failed reads', () => {
     const ctx = setup(); const { notify } = sent();
     run(ctx, [op(1)], { notify });
-    run(ctx, [], { notify, pass: { incomplete: true } });
+    run(ctx, [], { notify, pass: { readsOk: { [`${REPO}#1`]: false } } });
     expect(unacknowledged({ path: ctx.feedPath })).toHaveLength(1);
     run(ctx, [], { notify });
     expect(replay({ path: ctx.feedPath }).at(-1)).toMatchObject({ kind: 'cleared', was: 'stalled', pr: 1 });
@@ -242,7 +242,7 @@ describe('never suppressed', () => {
         parentPort.postMessage({ phase: 'ready' });
         if (Atomics.wait(signals, d.index, 0, 10000) === 'timed-out') throw new Error('start barrier timed out');
         let notifications = 0;
-        const result = publishStalledDigest({ items: [d.item], incomplete: false }, {
+        const result = publishStalledDigest({ items: [d.item] }, {
           ...d.ctx, env: {}, now: d.now, notify: () => {
             notifications++;
             if (d.index === 0) {
@@ -297,10 +297,10 @@ describe('never suppressed', () => {
     const r = run(ctx, [op(1)], { notify });
     expect(out).toHaveLength(1); expect(r.errors.join(' ')).toMatch(/digest lock/);
   }, 30_000);
-  it('a failed alert survives an incomplete pass and is sent when the item returns', () => {
+  it('a failed alert survives failed PR reads and is sent when the item returns', () => {
     const ctx = setup(); const out = [];
     run(ctx, [op(1)], { notify: () => ({ ok: false, error: 'osascript' }) });
-    run(ctx, [], { notify: (n) => { out.push(n); return { ok: true }; }, pass: { incomplete: true } });
+    run(ctx, [], { notify: (n) => { out.push(n); return { ok: true }; }, pass: { readsOk: { [`${REPO}#1`]: false } } });
     run(ctx, [op(1)], { notify: (n) => { out.push(n); return { ok: true }; } });
     expect(out).toHaveLength(1);
   });
@@ -509,19 +509,17 @@ async function ownerFailureWithObsoleteDetectorItem(producer) {
     cleared: replay({ path: ctx.feedPath }).filter(event => event.kind === 'cleared') };
 }
 
-it('R437 mode=off preserves detector completeness and clears stale detector items despite owner-read failure', async () => {
+it('R437 mode=off freezes detector items on owner-read failure', async () => {
   const result = await ownerFailureWithObsoleteDetectorItem({ mode: 'off', digest: true });
-  expect(result.pass.incomplete).toBe(false);
-  expect(result.after).toEqual([]);
-  expect(result.cleared).toMatchObject([{ pr: 5759, kind: 'cleared', was: 'stalled' }]);
-  expect(result.cleared).toHaveLength(1);
+  expect(result.pass.readsOk[`${REPO}#5759`]).toBe(false);
+  expect(result.after).toEqual(result.before);
+  expect(result.cleared).toEqual([]);
 });
-it('R437 digest=false preserves detector completeness and clears stale detector items despite owner-read failure', async () => {
+it('R437 digest=false freezes detector items on owner-read failure', async () => {
   const result = await ownerFailureWithObsoleteDetectorItem({ mode: 'shadow', digest: false });
-  expect(result.pass.incomplete).toBe(false);
-  expect(result.after).toEqual([]);
-  expect(result.cleared).toMatchObject([{ pr: 5759, kind: 'cleared', was: 'stalled' }]);
-  expect(result.cleared).toHaveLength(1);
+  expect(result.pass.readsOk[`${REPO}#5759`]).toBe(false);
+  expect(result.after).toEqual(result.before);
+  expect(result.cleared).toEqual([]);
 });
 it('persists merged invariant violation metadata alongside the original finding evidence and command', () => {
   const ctx = setup();
@@ -565,15 +563,22 @@ it('deadline identity crosses its bucket without timestamp churn and legacy stat
 });
 
 
-it('an incomplete pass emits no new notification and leaves delivery owed for a complete pass', () => {
-  const ctx = setup();
-  const notify = vi.fn(() => ({ ok: true }));
-  const initial = run(ctx, [op(6254)], { notify, pass: { incomplete: true } });
-  expect(initial.errors).toEqual([]);
-  expect(initial.notified).toBe(false);
-  expect(notify).not.toHaveBeenCalled();
-  expect(run(ctx, [op(6254)], { notify, now: NOW + 60000 }).notified).toBe(true);
-  expect(notify).toHaveBeenCalledTimes(1);
+it('failed PR reads retain all digest state while healthy PRs publish and retry owed alerts', () => {
+  const ctx = setup(), notify = vi.fn(() => ({ ok: true }));
+  run(ctx, [op(1)], { notify: () => ({ ok: false }) });
+  const path = join(ctx.stateDir, 'digest-state.json');
+  const old = JSON.parse(readFileSync(path, 'utf8'));
+  const result = run(ctx, [op(1, 'changed'), op(2)], { notify, pass: { readsOk: { [`${REPO}#1`]: false } } });
+  expect(result.fresh.map(x => x.pr)).toEqual([2]);
+  expect(result.notified).toBe(true);
+  const saved = JSON.parse(readFileSync(path, 'utf8'));
+  for (const field of ['published', 'current', 'confirmed', 'unnotified', 'repeats']) {
+    const onlyA = value => Array.isArray(value) ? value.filter(k => k.startsWith(`${REPO}#1@`))
+      : Object.fromEntries(Object.entries(value ?? {}).filter(([k]) => k.startsWith(`${REPO}#1@`)));
+    expect(onlyA(saved[field])).toEqual(onlyA(old[field]));
+  }
+  expect(unacknowledged({ path: ctx.feedPath }).find(x => x.pr === 1).state).toBe('ruling-needed:dispute');
+  expect(run(ctx, [op(1), op(2)], { notify }).fresh.map(x => x.pr)).toEqual([1]);
 });
 
 it('R437 owner-signal read failure preserves a published invariant feed item while other reads succeed', async () => {
@@ -610,59 +615,24 @@ it('R437 owner-signal read failure preserves a published invariant feed item whi
   expect(passes[1].items).toEqual([]);
   expect(unacknowledged({ path: ctx.feedPath })).toEqual(opened);
   expect(replay({ path: ctx.feedPath }).filter(event => event.kind === 'cleared')).toEqual([]);
-  expect(passes[1].incomplete).toBe(true);
+  expect(passes[1].readsOk[`${REPO}#6254`]).toBe(false);
   failOwner = false;
   expect((await tick(2)).errors).toEqual([]);
   expect(unacknowledged({ path: ctx.feedPath })).toEqual(opened);
   prs = [];
   expect((await tick(3)).errors).toEqual([]);
-  expect(passes[3].incomplete).toBe(false);
+  expect(passes[3].readsOk[`${REPO}#6254`]).not.toBe(false);
   expect(unacknowledged({ path: ctx.feedPath })).toEqual([]);
 });
 
-it('R437 enabled invariant producer marks owner-read failure incomplete and preserves the existing feed item', async () => {
+it('R437 enabled invariant producer marks the PR unreadable on owner-read failure and preserves the existing feed item', async () => {
   const result = await ownerFailureWithObsoleteDetectorItem({ mode: 'shadow', digest: true });
-  expect(result.pass.incomplete).toBe(true);
+  expect(result.pass.readsOk[`${REPO}#5759`]).toBe(false);
   expect(result.after).toEqual(result.before);
   expect(result.cleared).toEqual([]);
 });
 
-it('incomplete passes retain same-head findings and their saved identity while admitting new heads', () => {
-  const ctx = setup(), { notify } = sent();
-  const original = op(6254, 'empty-diff', { violation: 'empty-diff', nextAction: 'close into card' });
-  run(ctx, [original], { notify });
-  const before = unacknowledged({ path: ctx.feedPath });
-  const saved = JSON.parse(readFileSync(join(ctx.stateDir, 'digest-state.json'), 'utf8'));
-  const replacement = op(6254, 'owner-stale', { violation: 'owner-stale', nextAction: 'inspect unreadable labels' });
-  const result = run(ctx, [replacement, op(6255)], { notify, pass: { incomplete: true }, now: NOW + 60000 });
-  expect(result.errors).toEqual([]);
-  expect(unacknowledged({ path: ctx.feedPath }).find(e => e.pr === 6254)).toEqual(before[0]);
-  expect(unacknowledged({ path: ctx.feedPath }).some(e => e.pr === 6255)).toBe(true);
-  expect(replay({ path: ctx.feedPath }).filter(e => e.pr === 6254)).toEqual(before);
-  expect(JSON.parse(readFileSync(join(ctx.stateDir, 'digest-state.json'), 'utf8')).current)
-    .toMatchObject(saved.current);
-  expect(result.fresh.map(e => e.pr)).toEqual([6255]);
-});
 
-
-it('R437 incomplete passes send confirmed due repeats and failed-send retries but suppress new detections', () => {
-  const ctx = setup(), notify = vi.fn(() => ({ ok: true }));
-  const options = { notify, alertBackoffMinutes: [30, 60, 120, 240] };
-  run(ctx, [op(1), op(2)], options);
-  run(ctx, [op(1), op(2)], { ...options, now: NOW + 30 * 60000, notify: () => ({ ok: false }) });
-  const result = run(ctx, [op(1), op(2), op(3)], { ...options, pass: { incomplete: true }, now: NOW + 31 * 60000 });
-  expect(result.notified).toBe(true);
-  expect(notify).toHaveBeenCalledTimes(2);
-  expect(notify.mock.calls[1][0].body).toContain('#1');
-  expect(notify.mock.calls[1][0].body).toContain('#2');
-  expect(notify.mock.calls[1][0].body).not.toContain('#3');
-  const due = run(ctx, [op(1), op(2), op(4)], { ...options, pass: { incomplete: true }, now: NOW + 91 * 60000 });
-  expect(due.notified).toBe(true);
-  expect(notify.mock.calls[2][0].body).not.toContain('#4');
-  expect(unacknowledged({ path: ctx.feedPath }).map(e => e.pr)).toEqual([1, 2, 3, 4]);
-  expect(JSON.parse(readFileSync(join(ctx.stateDir, 'digest-state.json'), 'utf8')).unnotified).toEqual([`${REPO}#3@${H}:ruling-needed:dispute`, `${REPO}#4@${H}:ruling-needed:dispute`]);
-  expect(run(ctx, [op(1), op(2)], { ...options, pass: { incomplete: true }, now: NOW + 92 * 60000 }).notified).toBe(false);
-});
 
 it('R437 unknown diff retains the persisted empty-diff finding and repeat alert until positive evidence, head change or closure', async () => {
   const { runPrSweep } = await import('../pr-sweep.mjs');
@@ -706,36 +676,15 @@ it('R437 unknown diff retains the persisted empty-diff finding and repeat alert 
 });
 
 
-it('R437 consecutive incomplete passes never confirm a retained new detection', () => {
-  const ctx = setup(), notify = vi.fn(() => ({ ok: true }));
-  const item = op(6254), options = { notify, alertBackoffMinutes: [30,60,120,240] };
-  for (const minute of [0, 30, 90]) {
-    const result = run(ctx, [item], { ...options, now: NOW + minute * 60000, pass: { incomplete: true } });
-    expect(result.errors).toEqual([]);
-    expect(result.notified).toBe(false);
-    expect(notify).not.toHaveBeenCalled();
-    expect(unacknowledged({ path: ctx.feedPath })).toHaveLength(1);
-    expect(JSON.parse(readFileSync(join(ctx.stateDir, 'digest-state.json'), 'utf8')).unnotified)
-      .toEqual([`${REPO}#6254@${H}:ruling-needed:dispute`]);
-  }
-  expect(run(ctx, [item], { ...options, now: NOW + 91 * 60000 }).notified).toBe(true);
-  expect(notify).toHaveBeenCalledTimes(1);
-  expect(run(ctx, [item], { ...options, now: NOW + 121 * 60000, pass: { incomplete: true } }).notified).toBe(true);
-  expect(notify).toHaveBeenCalledTimes(2);
-});
 
 
-it('R437 legacy feed presence without persisted confirmation waits for a complete observation', () => {
-  const ctx = setup(), notify = vi.fn(() => ({ ok: true }));
-  const item = op(6254), options = { notify, alertBackoffMinutes: [30,60,120,240] };
-  run(ctx, [item], options);
-  const path = join(ctx.stateDir, 'digest-state.json');
-  const legacy = JSON.parse(readFileSync(path, 'utf8'));
-  delete legacy.confirmed;
-  writeFileSync(path, JSON.stringify(legacy));
-  expect(run(ctx, [item], { ...options, now: NOW + 30 * 60000, pass: { incomplete: true } }).notified).toBe(false);
-  expect(notify).toHaveBeenCalledTimes(1);
-  expect(run(ctx, [item], { ...options, now: NOW + 31 * 60000 }).notified).toBe(true);
-  expect(run(ctx, [item], { ...options, now: NOW + 91 * 60000, pass: { incomplete: true } }).notified).toBe(true);
-  expect(notify).toHaveBeenCalledTimes(3);
+
+it('disabling the producer preserves failed PR open keys and owed alerts', () => {
+  const ctx = setup();
+  run(ctx, [op(1), op(2)], { notify: () => ({ ok: false }) });
+  const path = join(ctx.stateDir, 'digest-state.json'), old = readFileSync(path, 'utf8');
+  const result = run(ctx, [], { enabled: false, pass: { readsOk: { [`${REPO}#1`]: false } } });
+  expect(result.errors).toEqual([]);
+  expect(unacknowledged({ path: ctx.feedPath }).map(x => x.pr)).toEqual([1]);
+  expect(readFileSync(path, 'utf8')).toBe(old);
 });

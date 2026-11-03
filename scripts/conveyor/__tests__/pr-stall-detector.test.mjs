@@ -524,22 +524,22 @@ describe('runPrSweep detector integration', () => {
     const report = await runPrSweep(options);
     expect(report.nextState.stallDetector).toEqual({ [key()]: saved[key()] });
     expect(options.persist.mock.results.at(-1).value.nextState.stallDetector).toEqual({ [key()]: saved[key()] });
-    expect(options.stallDigest.mock.calls[0][0].incomplete).toBe(true);
+    expect(options.stallDigest.mock.calls[0][0].readsOk[PR_KEY]).toBe(false);
     const recovery = sweepOptions({ readPrevious: () => report.nextState });
     expect((await runPrSweep(recovery)).stallDetector.stalled).toBe(1);
   });
 
-  it.each(['reject', 'invalid'])('preserves previous detector state and marks the digest incomplete on a %s PR read', async failure => {
+  it.each(['reject', 'invalid'])('preserves previous detector state and marks the PR unreadable on a %s PR read', async failure => {
     const saved = { [key()]: NOW - 90 * MINUTE };
     const options = sweepOptions({ readPrevious: () => ({ stallDetector: saved }),
       readPrs: () => { if (failure === 'reject') throw new Error('PR read failed'); return null; } });
     const report = await runPrSweep(options);
     expect(report.nextState.stallDetector).toEqual(saved);
     for (const result of options.persist.mock.results) expect(result.value.nextState.stallDetector).toEqual(saved);
-    expect(options.stallDigest.mock.calls[0][0].incomplete).toBe(true);
+    expect(options.stallDigest.mock.calls[0][0].readsOk[PR_KEY]).toBe(false);
   });
 
-  it.each(['reject', 'partial'])('preserves clocks and marks the digest incomplete on a %s signal read', async failure => {
+  it.each(['reject', 'partial'])('preserves clocks and marks the PR unreadable on a %s signal read', async failure => {
     const saved = { [key()]: NOW - 90 * MINUTE };
     const options = sweepOptions({ readSignals: async ({ errors }) => {
       if (failure === 'reject') throw new Error('logs unreadable');
@@ -548,22 +548,22 @@ describe('runPrSweep detector integration', () => {
     const report = await runPrSweep(options);
     expect(report.nextState.stallDetector).toEqual(saved);
     expect(options.persist.mock.results.at(-1).value.nextState.stallDetector).toEqual(saved);
-    expect(options.stallDigest.mock.calls[0][0].incomplete).toBe(true);
+    expect(options.stallDigest.mock.calls[0][0].readsOk[PR_KEY]).toBe(false);
     expect(options.stallDigest.mock.calls[0][0].items).toEqual([]);
   });
 
-  it('a failing agent listing alone does not suppress detection or mark the digest incomplete', async () => {
+  it('a failing agent listing freezes PR publication even when detector evidence is readable', async () => {
     const options = sweepOptions({ readSignals: args => collectOwnerSignals({ ...args,
       readAgents: () => { throw new Error('agents offline'); }, readHealth: () => ({}),
       cloneRoots: () => ['fixture-clone'], listLogs: () => [], readTail: () => '' }) });
     const report = await runPrSweep(options);
     expect(report.stallDetector.stalled).toBe(1);
     expect(report.errors.join(' ')).toContain('agents offline');
-    expect(options.stallDigest.mock.calls[0][0]).toMatchObject({ incomplete: false,
-      items: [expect.objectContaining({ action: 'stalled-detector' })] });
+    expect(options.stallDigest.mock.calls[0][0]).toMatchObject({ readsOk: { [PR_KEY]: false }, items: [] });
+    expect(report.nextState.stallDetector).toEqual({ [key()]: NOW - 90 * MINUTE });
   });
 
-  it.each(['health', 'roots', 'logs', 'tail'])('a failed %s signal read still preserves clocks and marks the digest incomplete', async source => {
+  it.each(['health', 'roots', 'logs', 'tail'])('a failed %s signal read still preserves clocks and marks the PR unreadable', async source => {
     const fail = () => { throw new Error('unreadable'); };
     const options = sweepOptions({ readSignals: args => collectOwnerSignals({ ...args,
       readAgents: () => [], readHealth: source === 'health' ? fail : () => ({}),
@@ -571,7 +571,7 @@ describe('runPrSweep detector integration', () => {
       listLogs: source === 'logs' ? fail : () => ['review-daemon.log'], readTail: source === 'tail' ? fail : () => '' }) });
     const report = await runPrSweep(options);
     expect(report.nextState.stallDetector).toEqual({ [key()]: NOW - 90 * MINUTE });
-    expect(options.stallDigest.mock.calls[0][0]).toMatchObject({ incomplete: true, items: [] });
+    expect(options.stallDigest.mock.calls[0][0]).toMatchObject({ readsOk: { [PR_KEY]: false }, items: [] });
   });
 
   it('disabled detector and off sweep call the digest with enabled=false to clear open stalls', async () => {
@@ -581,13 +581,14 @@ describe('runPrSweep detector integration', () => {
     expect(options.stallDigest.mock.calls[0][1].enabled).toBe(false);
   });
 
-  it.each(['not due', 'throws'])('a %s stall sweep does not publish and still persists the detector clock', async outcome => {
+  it.each(['not due', 'throws'])('a %s stall sweep does not publish; failed reads cannot start a detector clock', async outcome => {
     const options = sweepOptions({ readPrevious: () => ({}), readSignals: async () => ({ [PR_KEY]: { daemons: [] } }),
       stallSweep: async () => { if (outcome === 'throws') throw new Error('sweep failed'); return { skipped: 'not due' }; } });
     const report = await runPrSweep(options);
     expect(options.stallDigest).not.toHaveBeenCalled();
-    expect(report.nextState.stallDetector).toEqual({ [key()]: NOW });
-    expect(options.persist.mock.results.at(-1).value.nextState.stallDetector).toEqual({ [key()]: NOW });
+    const expected = outcome === 'throws' ? {} : { [key()]: NOW };
+    expect(report.nextState.stallDetector).toEqual(expected);
+    expect(options.persist.mock.results.at(-1).value.nextState.stallDetector).toEqual(expected);
   });
 
   it('preserves only the errored PR clock when daemon data is malformed', async () => {
@@ -597,7 +598,7 @@ describe('runPrSweep detector integration', () => {
     } }), readSignals: async () => ({ [PR_KEY]: { daemons: [{ at: null, kind: 'refusal', reason: REASON }] } }) });
     const report = await runPrSweep(options);
     expect(report.nextState.stallDetector).toEqual({ [key()]: NOW - 90 * MINUTE });
-    expect(options.stallDigest.mock.calls[0][0].incomplete).toBe(true);
+    expect(options.stallDigest.mock.calls[0][0].readsOk[PR_KEY]).toBe(false);
   });
 
   it('publishes one stalled event across repeated passes for the same PR and head', async () => {

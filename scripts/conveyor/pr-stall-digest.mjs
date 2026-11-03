@@ -7,8 +7,7 @@
  *
  *   Dedupe: one item per `repo#pr@head:state` (a new state on the same head is re-published), and nothing the feed
  *   already published for that PR head under another kind (operator-queue's items) is published again. Self-clearing:
- *   on a complete pass a `stalled` item no longer reported gets a `NEEDS-YOU-CLEARED` line; an incomplete pass clears
- *   nothing. Disabling the producer clears its published items and releases queue suppression under the feed lock.
+ *   a readable PR no longer reported gets a `NEEDS-YOU-CLEARED` line; failed PR reads preserve all saved state. Disabling the producer clears its published items and releases queue suppression under the feed lock.
  *   NEVER SUPPRESSED ON A FAILED READ: when the feed state cannot be read, the alert still goes out, undeduped.
  *   An alert that fails to send is retried next pass. Each item: reason, 1-3 evidence lines, one paste-ready command.
  *   Setting `prStallSweep.digest` (standard true) turns it off; the quiet hours are the shared `quietHours` settings.
@@ -56,7 +55,7 @@ function checkedDigestFeedPath(feedPath, env, stateDir) {
 }
 
 /** Clear a disabled producer's events before relinquishing suppression, under both publishers' shared feed lock. */
-function releaseStalledSuppression({ feedPath, env, stateDir, errors, now }) {
+function releaseStalledSuppression({ feedPath, env, stateDir, errors, now, pass }) {
   let lines = [];
   try {
     const path = checkedDigestFeedPath(feedPath, env, stateDir);
@@ -65,7 +64,9 @@ function releaseStalledSuppression({ feedPath, env, stateDir, errors, now }) {
     withFileLock(`${sidecar}.lock`, () => {
       const prev = readJson(sidecar, { openKeys: [] });
       if (!Array.isArray(prev?.openKeys)) throw new Error('feed state has no openKeys');
-      const cleared = diffFeed(prev.openKeys, [], now, { clearKinds: new Set([STALLED_KIND]) });
+      const frozen = prev.openKeys.filter(key => !readable(pass, key));
+      const cleared = diffFeed(prev.openKeys.filter(key => readable(pass, key)), [], now, { clearKinds: new Set([STALLED_KIND]) });
+      cleared.openKeys.push(...frozen);
       // Append first: if publication fails, keep the keys so the next disabled pass retries the clear.
       appendLines(path, cleared.lines);
       lines = cleared.lines;
@@ -116,7 +117,7 @@ function updateIdentity(f, now) {
 
 /**
  * Publish one pass's operator items. Returns `{lines, fresh, notified, errors}`. Never throws.
- * @param {{items:object[], incomplete:boolean, settingsUnreadable?:boolean}} pass  the `runStallSweep` result
+ * @param {{items:object[], readsOk?:object, unreadableRepos?:string[], settingsUnreadable?:boolean}} pass  the `runStallSweep` result
  * @param {{now?:number, env?:object, feedPath?:string, stateDir:string, notify?:Function, enabled?:boolean}} o
  */
 export function publishStalledDigest(pass, { now = Date.now(), env = process.env, feedPath, stateDir, notify = notifyDesktopChecked, enabled = true, alertBackoffMinutes } = {}) {
@@ -124,9 +125,9 @@ export function publishStalledDigest(pass, { now = Date.now(), env = process.env
   if (isUnderTest(env) && !feedPath) return { lines: [], fresh: [], notified: false, errors, skipped: 'under-test' }; // never the real feed
   // Unknown policy is not an explicit disable: preserve open items, suppression and alert obligations until recovery.
   if (pass?.settingsUnreadable) return { lines: [], fresh: [], notified: false, errors, skipped: 'settings unreadable' };
-  if (!enabled) return releaseStalledSuppression({ feedPath, env, stateDir, errors, now });
+  if (!enabled) return releaseStalledSuppression({ feedPath, env, stateDir, errors, now, pass });
   if (!Array.isArray(pass?.items)) return { lines: [], fresh: [], notified: false, errors, skipped: 'no pass' };
-  const items = sortUnblockersFirst(pass.items.filter((i) => i.lane === 'operator').map(feedItem));
+  const items = sortUnblockersFirst(pass.items.filter((i) => i.lane === 'operator' && readable(pass, `${i.repo}#${i.pr}`)).map(feedItem));
   // A feed configured as digest.lock may already contain events. Reject it before lock recovery can reclaim it.
   try { checkedDigestFeedPath(feedPath, env, stateDir); }
   catch { return deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, alertBackoffMinutes, unlocked: true }); }
@@ -136,9 +137,11 @@ export function publishStalledDigest(pass, { now = Date.now(), env = process.env
   catch (e) { errors.push(`digest lock: ${String(e?.message ?? e).split('\n')[0]}`); return deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, alertBackoffMinutes, unlocked: true }); }
 }
 
+const readable = (pass, key) => pass.readsOk?.[key.split('@')[0]] !== false
+  && !(pass.unreadableRepos ?? []).includes(key.split('#')[0]);
+
 function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, alertBackoffMinutes, unlocked = false }) {
   let lines = []; let fresh = items; let lock = null;
-  const confirmed = new Set();
   const id = (f) => `${f.repo}#${f.pr}@${f.head}:${f.state}`;
   const mine = join(stateDir, 'digest-state.json');
   try {
@@ -159,18 +162,14 @@ function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, al
       // old key so the diff re-publishes the head with the current reason and command. The ALERT identity is
       // repo#pr@head:state. Legacy consumers alert once (A -> B -> A alerts A once); configured sweeps repeat with backoff and reset on movement.
       const shown = Object.fromEntries(Object.entries(saved.current ?? {}).filter(([k]) => prev.openKeys.includes(k)));
-      // Partial evidence may add a new head, but cannot replace a confirmed same-head item.
-      const mineNow = items.filter((f) => !other.some((k) => k.startsWith(`${f.repo}#${f.pr}@${f.head}:`))
-        && !(pass.incomplete && prev.openKeys.includes(feedKey(f)) && shown[feedKey(f)] !== updateIdentity(f, now)));
-      // Feed rows can originate on incomplete passes. Only a complete observation confirms
-      // an identity; historical state without this proof waits for a complete pass too.
-      const confirmations = Object.fromEntries(Object.entries(saved.confirmed ?? {}).filter(([k]) => prev.openKeys.includes(k)));
-      if (!pass.incomplete) for (const f of mineNow) confirmations[feedKey(f)] = updateIdentity(f, now);
-      for (const f of mineNow) if (prev.openKeys.includes(feedKey(f)) && shown[feedKey(f)] === updateIdentity(f, now)
-        && confirmations[feedKey(f)] === updateIdentity(f, now)) confirmed.add(id(f));
+      const mineNow = items.filter((f) => !other.some((k) => k.startsWith(`${f.repo}#${f.pr}@${f.head}:`)));
+      // Retain historical confirmations verbatim for failed PRs; readable PRs need no pass-level proof.
+      const confirmations = { ...saved.confirmed };
       const alerted = new Set((saved.published ?? []).filter((x) => prev.openKeys.includes(feedKeyOfId(x))));
       const changed = new Set(mineNow.filter((f) => prev.openKeys.includes(feedKey(f)) && shown[feedKey(f)] !== updateIdentity(f, now)).map(feedKey));
-      const r = diffFeed(prev.openKeys.filter((k) => !changed.has(k)), mineNow, now, { incomplete: !!pass.incomplete, clearKinds: new Set([STALLED_KIND]) });
+      const frozen = prev.openKeys.filter(k => !readable(pass, k));
+      const r = diffFeed(prev.openKeys.filter(k => readable(pass, k) && !changed.has(k)), mineNow, now, { clearKinds: new Set([STALLED_KIND]) });
+      r.openKeys.push(...frozen);
       const open = new Set(r.openKeys);
       const written = mineNow.filter((f) => r.lines.some((l) => l.startsWith(`NEEDS-YOU ${f.repo}#${f.pr} ${STALLED_KIND}:`)));
       const newly = written.filter((f) => !alerted.has(id(f)));
@@ -190,7 +189,7 @@ function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, al
         if (changed.has(feedKey(f)) && (alertBackoffMinutes || updateIdentity(f, now) !== f.state
           || shown[feedKey(f)]?.startsWith('['))) due.push(f);
       }
-      // Failed sends remain owed until delivered or resolved; incomplete passes notify only confirmed items.
+      // Failed sends remain owed until delivered or resolved; failed PR reads never consume them.
       const pending = new Set((saved.unnotified ?? []).filter((x) => open.has(feedKeyOfId(x))));
       const toAlert = mineNow.filter((f) => newly.includes(f) || pending.has(id(f)) || due.includes(f));
       const unnotified = [...new Set([...pending, ...toAlert.map(id)])];
@@ -211,7 +210,7 @@ function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, al
     fresh = items;
   }
   let notified = false;
-  const alerts = fresh.filter(f => !pass.incomplete || confirmed.has(id(f)));
+  const alerts = fresh;
   if (alerts.length) {
     const body = alerts.slice(0, 5).map((f) => `${f.repo.split('/').pop()}#${f.pr} ${f.state} ${(f.blockedBy ?? []).map(n => `blocked-by #${n}`).join(' ')} ${(f.unblocks ?? []).map(n => `unblocks #${n}`).join(' ')}`).join(' | ') + (alerts.length > 5 ? ` (+${alerts.length - 5} more)` : '');
     let out = null;

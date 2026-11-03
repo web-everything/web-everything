@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * @file scripts/conveyor/pr-sweep.mjs
- * @description Card 335 — bounded IO shell for the health-watch PR movement job. CLI: run [--dry-run] [--json].
+ * @description Card 335 — bounded IO shell with per-PR read completeness and bounded read-failure alerts. CLI: run [--dry-run] [--json].
  */
 import { existsSync, readFileSync, mkdirSync, renameSync, writeFileSync, appendFileSync, readdirSync, openSync, closeSync, fstatSync, readSync, realpathSync } from 'node:fs';
 import { dirname, join, resolve, basename } from 'node:path';
@@ -16,7 +16,7 @@ import { healthDir } from './health-watch-section.mjs';
 import { handoffHome } from '../operations/handoff-home.mjs';
 import { notifyDesktopChecked } from './branch-sync.mjs';
 import { flushDigest } from '../lib/quiet-hours-io.mjs';
-import { classifyIdlePrs, resolveOwner, planSweep, prKey, isRunningSession, evaluateInvariant, stateFingerprint, stateSince, DEADLINE_MINUTES } from './pr-sweep-core.mjs';
+import { classifyIdlePrs, resolveOwner, planSweep, prKey, isRunningSession, evaluateInvariant, stateFingerprint, stateSince, ownerSignalsReadable, repeatDue, DEADLINE_MINUTES } from './pr-sweep-core.mjs';
 import { buildBlockedMap, sortUnblockersFirst } from './pr-blocked-by.mjs';
 import { createOpenPrCommentReader } from './pr-comments-complete.mjs';
 import { sanitizeForFeed } from '../operations/needs-you-feed.mjs';
@@ -28,7 +28,7 @@ const SELF = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(SELF), '../..');
 const exec = promisify(execFile);
 const command = async (bin, args, env) => (await exec(bin, args, { env, encoding: 'utf8', timeout: 120000, maxBuffer: 16 * 1024 * 1024 })).stdout;
-const DEFAULTS = { toolingRefusalWindowMinutes: 360, toolingDeadlineMinutes: 240, alertBackoffMinutes: [30, 60, 120, 240], deadlineMinutes: DEADLINE_MINUTES, enabled: true, intervalMinutes: 30, idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90, sessionActiveWithinMinutes: 30, dispatchDiagnosis: false, repos: [CONSTELLATION_REPOS.we.slug, CONSTELLATION_REPOS['plateau-app'].slug] };
+const DEFAULTS = { readFailAlertAfterPasses: 3, toolingRefusalWindowMinutes: 360, toolingDeadlineMinutes: 240, alertBackoffMinutes: [30, 60, 120, 240], deadlineMinutes: DEADLINE_MINUTES, enabled: true, intervalMinutes: 30, idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90, sessionActiveWithinMinutes: 30, dispatchDiagnosis: false, repos: [CONSTELLATION_REPOS.we.slug, CONSTELLATION_REPOS['plateau-app'].slug] };
 export function resolvePrSweepSettings({ config = {}, env = process.env, read = readFileSync, log = console.error } = {}) {
   const errors = []; let tool = {};
   try { tool = JSON.parse(read(join(ROOT, 'scripts/settings/pr-sweep.json'), 'utf8')).prSweep; } catch (e) { errors.push(`settings: ${e.message}`); }
@@ -42,6 +42,7 @@ export function resolvePrSweepSettings({ config = {}, env = process.env, read = 
   const valid = Object.fromEntries(Object.keys(DEFAULTS).map((k) => [k, (v) => typeof DEFAULTS[k] === 'boolean' ? typeof v === 'boolean'
     : k === 'alertBackoffMinutes' ? Array.isArray(v) && v.length === 4 && v.every((n, i) => n === [30,60,120,240][i])
     : k === 'deadlineMinutes' ? (Number.isFinite(v) && v > 0) || (v && typeof v === 'object' && !Array.isArray(v) && Object.entries(v).every(([name, n]) => Object.hasOwn(DEADLINE_MINUTES, name) && Number.isFinite(n) && n > 0))
+    : k === 'readFailAlertAfterPasses' ? Number.isSafeInteger(v) && v > 0
     : k === 'repos' ? Array.isArray(v) && v.length > 0 && v.every((r) => repoKeyForSlug(r) !== null) : Number.isFinite(v) && v > 0]));
   const platform = readPlatformPreferences({ env, readFile: read }); errors.push(...platform.errors);
   const out = cascadePolicy('prSweep', { ...tool, ...config.prSweep }, { standard: DEFAULTS, envValues, valid, platform: platform.prefs.prSweep ?? {}, env });
@@ -167,16 +168,43 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
     return { ...saved.nextState, emptyDiffItems: saved.nextState?.emptyDiffItems
       ?? (saved.decisions ?? []).filter(p => p.violation === 'empty-diff').map(invariantItem) };
   }, {});
-  const prs = []; let prsReadOk = true;
+  const prs = [], unreadableRepos = new Set(), readsOk = {};
+  const knownKeys = new Set([
+    ...Object.keys(previous?.episodes ?? {}), ...Object.keys(previous?.invariantClocks ?? {}),
+    ...Object.keys(previous?.stallDetector ?? {}).map(k => k.split('@')[0]),
+    ...(previous?.emptyDiffItems ?? []).map(i => `${i.repo}#${i.pr}`),
+    ...(previous?.needsYou ?? []), ...Object.keys(previous?.readFailures ?? {}), ...Object.keys(previous?.readFailureAlerts ?? {}),
+  ]);
+  const failed = key => { readsOk[key] = false; knownKeys.add(key); };
+  const failAll = () => { for (const repo of value.repos) unreadableRepos.add(repo); };
+  const readable = key => readsOk[key] !== false && !unreadableRepos.has(key.split('#')[0]);
+  // Readers may report explicit PR keys; unattributable failures affect every dependent PR.
+  const readFailures = (out = {}) => {
+    for (const key of out.failedPrKeys ?? []) failed(key);
+    for (const [key, ok] of Object.entries(out.readsOk ?? {})) if (ok === false) failed(key);
+    for (const error of out.errors ?? []) {
+      const keys = [...knownKeys].filter(key => String(error).includes(`${key}:`) || String(error).includes(`${key} `) || String(error) === key);
+      if (keys.length) keys.forEach(failed);
+      else {
+        const repo = value.repos.find(repo => String(error).startsWith(`${repo}:`));
+        if (repo) unreadableRepos.add(repo);
+        else if (!(out.failedPrKeys?.length)) failAll();
+      }
+    }
+  };
   const readOpenPrs = readPrs ?? createOpenPrCommentReader({ env });
   for (const repo of value.repos) {
     const rows = await safe(`prs ${repo}`, () => readOpenPrs(repo), null);
     if (!Array.isArray(rows) || rows.some((p) => !p || !Number.isInteger(Number(p.number)) || Number(p.number) <= 0 || !Number.isFinite(Date.parse(p.updatedAt)) || typeof p.headRefOid !== 'string')) {
       if (rows !== null) errors.push(`prs ${repo}: invalid PR listing`);
-      prsReadOk = false; continue;
+      unreadableRepos.add(repo); continue;
     }
-    for (const p of rows) if (p.commentsComplete === false) {
-      errors.push(`prs ${repo}: PR #${p.number} comments incomplete: ${sanitizeForFeed(p.commentsError ?? 'operator must inspect full thread before using comment evidence', Infinity)}`);
+    for (const p of rows) {
+      knownKeys.add(prKey({ ...p, repo }));
+      if (p.commentsComplete === false) {
+        failed(prKey({ ...p, repo }));
+        errors.push(`prs ${repo}: PR #${p.number} comments incomplete: ${sanitizeForFeed(p.commentsError ?? 'operator must inspect full thread before using comment evidence', Infinity)}`);
+      }
     }
     // Missing diff evidence is PR-local: keep discovery and all other invariants live.
     prs.push(...rows.filter(p => !p.state || p.state.toUpperCase() === 'OPEN').map((p) => ({ ...p, repo,
@@ -191,19 +219,64 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
     && [...queue.ready, ...queue.rulingNeeded].every((p) => p && repoKeyForSlug(p.repo) !== null && Number.isInteger(Number(p.number)) && Number(p.number) > 0);
   if (queue && !queueOk) errors.push(`operator queue incomplete: ${JSON.stringify(queue.errors ?? [])}`);
   const needsYou = queueOk ? [...queue.ready, ...queue.rulingNeeded].map((p) => ({ ...p, repo: CONSTELLATION_REPOS[repoKeyForSlug(p.repo)]?.slug ?? p.repo })) : null;
+  for (const p of needsYou ?? []) knownKeys.add(prKey(p));
   const idle = classifyIdlePrs({ prs, now, idleMinutes: value.idleMinutes });
   const before = errors.length;
   const signals = await safe('owner signals', () => readSignals({ prs, now, dir, env, errors, sourceRoot }), {});
-  const ownerReadsOk = errors.length === before && queueOk;
+  if (!queueOk) failAll();
+  readFailures({ errors: errors.slice(before) });
+  for (const p of prs) if (!ownerSignalsReadable(p, signals?.[prKey(p)])) failed(prKey(p));
   const owners = Object.fromEntries(prs.map((p) => [prKey(p), resolveOwner(p, { ...value, now, ...(signals ?? {})[prKey(p)], operator: needsYou?.some((n) => prKey(n) === prKey(p)) })]));
-  const clocks = prsReadOk ? {} : { ...previous?.invariantClocks };
+  for (const p of prs) if (owners[prKey(p)]?.state === 'unknown') failed(prKey(p));
+  const detectorErrors = [];
+  const detectorOut = await safe('stall detector', () => detector({ prs, seen: previous?.stallDetector ?? {}, now, env,
+    readSignals: async ({ prs }) => {
+      const readErrors = [], errorSources = [];
+      const result = await readSignals({ prs, now, dir, env, errors: readErrors, errorSources, sourceRoot });
+      const agentsOnly = new Set(errorSources.filter(e => e.source === 'agents').map(e => e.index));
+      detectorErrors.push(...readErrors.filter((_, index) => !agentsOnly.has(index)));
+      errors.push(...readErrors.filter((_, index) => agentsOnly.has(index)).map(e => `owner signals: ${e}`));
+      readFailures({ errors: readErrors });
+      if (readErrors.some((_, index) => !agentsOnly.has(index))) throw new Error('owner signals incomplete');
+      return result;
+    } }), null);
+  if (!detectorOut) failAll();
+  const detected = detectorOut ?? { enabled: true, items: [], nextSeen: {}, errors: [] };
+  readFailures(detected);
+  detectorErrors.push(...(detected.errors ?? []));
+  errors.push(...detectorErrors.map(e => `stall detector: ${e}`));
+  // Finish all PR reads before planning or sending: a later failure cannot consume an earlier alert.
+  let stallOut;
+  if (!dryRun) {
+    stallOut = await safe('stall sweep', () => stallSweep({ now, env, state: previous?.stallSweep ?? {} }), null);
+    if (!stallOut) failAll();
+    if (stallOut) {
+      readFailures(stallOut);
+      errors.push(...(stallOut.errors ?? []).map(e => `stall sweep: ${e}`));
+      // Production sweep read gaps are recorded in its pass audit, scoped when possible.
+      const audit = stallOut.records?.find(r => r.phase === 'pass');
+      for (const gap of audit?.unreadable ?? []) {
+        if (typeof gap === 'string') readFailures({ errors: [gap] });
+        else if (gap.repo && (gap.number ?? gap.pr)) failed(`${gap.repo}#${gap.number ?? gap.pr}`);
+        else failAll();
+      }
+      // The audit bounds its sample to five gaps; a full sample cannot prove the other PRs readable.
+      if (audit?.unreadable?.length >= 5 || (audit?.readFailed && !audit.unreadable?.length
+        && !(stallOut.errors?.length) && !(stallOut.items ?? []).some(i => i.action === 'unreadable-evidence'
+          || i.reason?.startsWith('fail-closed: classifier error')))) failAll();
+      for (const item of stallOut.items ?? []) if (item.action === 'unreadable-evidence'
+        || item.reason?.startsWith('fail-closed: classifier error')) failed(`${item.repo}#${item.pr}`);
+    }
+  }
+  for (const key of knownKeys) readsOk[key] = readable(key);
+  const clocks = Object.fromEntries(Object.entries(previous?.invariantClocks ?? {}).filter(([key]) => !readable(key)));
   const dependencies = new Map();
   for (const repo of value.repos) {
     const map = buildBlockedMap(prs.filter(p => p.repo === repo).map(p => ({ ...p, daemons: signals?.[prKey(p)]?.daemons ?? [] })), { now, settings: value, owners });
     for (const p of prs.filter(p => p.repo === repo)) dependencies.set(prKey(p), {
       blockedBy: map.blockedBy.get(p.number) ?? [], unblocks: map.unblocks.get(p.number) ?? [] });
   }
-  const decisions = sortUnblockersFirst(prs.map(p => {
+  const decisions = sortUnblockersFirst(prs.filter(p => readable(prKey(p))).map(p => {
     const key = prKey(p), fingerprint = stateFingerprint(p), old = previous?.invariantClocks?.[key];
     const since = stateSince(p, old?.fingerprint === fingerprint ? old.since : now, now);
     clocks[key] = { fingerprint, since };
@@ -222,36 +295,31 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
   };
   // Keep the legacy idle report, while ownership and episodes cover every open PR.
   const episodePrs = sortUnblockersFirst(prs.map(p => ({ ...p, ...dependencies.get(prKey(p)) })));
-  const planned = planSweep({ idle: episodePrs, owners, prevState: previous ?? {}, needsYou: needsYou && sortUnblockersFirst(needsYou.map(p => ({ ...p, ...dependencies.get(prKey(p)) }))), now, settings: value, ownerReadsOk, prsReadOk });
+  const planned = planSweep({ idle: episodePrs, owners, prevState: previous ?? {}, needsYou: needsYou && sortUnblockersFirst(needsYou.map(p => ({ ...p, ...dependencies.get(prKey(p)) }))), now, settings: value, readsOk });
   planned.report.idle = sortUnblockersFirst(idle.map(p => ({ ...p, ...owners[prKey(p)], ...dependencies.get(prKey(p)), ...(p.changedFiles === 0 ? { state: 'empty-diff', why: 'close into card' } : {}) })));
   planned.nextState.invariantClocks = clocks;
   const report = { decisions, at: new Date(now).toISOString(), settings: value, sources: resolved.sources, ...planned.report, alerts: planned.alerts, diagnose: planned.diagnose, nextState: planned.nextState, errors };
-  const detect = async () => {
-    const out = await detector({ prs, seen: previous?.stallDetector ?? {}, now, env,
-      readSignals: async ({ prs }) => {
-        const readErrors = [], errorSources = [];
-        const signals = await readSignals({ prs, now, dir, env, errors: readErrors, errorSources, sourceRoot });
-        // Agent activity is used by the owner sweep, but the detector only needs
-        // log/refusal evidence. Unknown-source errors still fail closed.
-        const agentsOnly = new Set(errorSources.filter(e => e.source === 'agents').map(e => e.index));
-        detectorErrors.push(...readErrors.filter((_, index) => !agentsOnly.has(index)));
-        errors.push(...readErrors.filter((_, index) => agentsOnly.has(index)).map(e => `owner signals: ${e}`));
-        if (readErrors.some((_, index) => !agentsOnly.has(index))) throw new Error('owner signals incomplete');
-        return signals;
-      } });
-    out.items = sortUnblockersFirst(out.items.map(annotate));
-    detectorErrors.push(...out.errors);
-    errors.push(...detectorErrors.map(e => `stall detector: ${e}`));
-    report.stallDetector = { enabled: out.enabled, stalled: out.items.length, ...(dryRun ? { items: out.items } : {}) };
-    // A PR the detector could not read keeps its saved clock, so recovery does not restart its age.
-    const keptOld = Object.fromEntries(Object.entries(previous?.stallDetector ?? {}).filter(([k]) =>
-      (out.failedPrKeys ?? []).some(key => k.startsWith(`${key}@`))));
-    report.nextState.stallDetector = prsReadOk ? { ...keptOld, ...out.nextSeen } : previous?.stallDetector ?? {};
-    return out;
+  report.readsOk = readsOk;
+  report.stallDetector = { enabled: detected.enabled, stalled: detected.items.length, ...(dryRun ? { items: detected.items.filter(i => readable(`${i.repo}#${i.pr}`)).map(annotate) } : {}) };
+  report.nextState.stallDetector = {
+    ...Object.fromEntries(Object.entries(previous?.stallDetector ?? {}).filter(([key]) => !readable(key.split('@')[0]))),
+    ...Object.fromEntries(Object.entries(detected.nextSeen ?? {}).filter(([key]) => readable(key.split('@')[0]))),
   };
-  const detectorErrors = [];
+  report.nextState.readFailures = {};
+  report.nextState.readFailureAlerts = {};
+  for (const key of knownKeys) {
+    if (readable(key)) continue;
+    const count = (previous?.readFailures?.[key] ?? 0) + 1;
+    report.nextState.readFailures[key] = count;
+    const old = previous?.readFailureAlerts?.[key];
+    if (old) report.nextState.readFailureAlerts[key] = old;
+    if (count >= (value.readFailAlertAfterPasses ?? 3) && (!old?.alerted || repeatDue(old, now, value.alertBackoffMinutes))) {
+      report.alerts.push({ kind: 'reads-failing', violation: 'reads-failing', key, title: 'PR reads failing',
+        body: `${key}: evidence unreadable for ${count} consecutive passes; inspect reader errors and restore PR evidence` });
+      report.nextState.readFailureAlerts[key] = { alerted: true, lastAlertAt: now, alertCount: (old?.alertCount ?? 0) + 1 };
+    }
+  }
   report.nextState.emptyDiffItems = previous?.emptyDiffItems ?? [];
-  report.nextState.stallDetector = previous?.stallDetector ?? {}; // the first save must not drop saved clocks
   if (!dryRun) {
     await safe('quiet digest', () => flush({ send: (n) => notify(n, { quietGate: null }) }));
     let needsYouSendFailed = false;
@@ -263,6 +331,7 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
         episode.lastAlertAt = old?.lastAlertAt;
         episode.alertCount = old?.alertCount ?? 0;
       }
+      if (!sent && alert.kind === 'reads-failing') report.nextState.readFailureAlerts[alert.key] = previous?.readFailureAlerts?.[alert.key] ?? { alerted: false };
       if (!sent && alert.kind === 'needs-you') needsYouSendFailed = true;
     }
     if (needsYouSendFailed) report.nextState.needsYou = previous.needsYou;
@@ -280,30 +349,25 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
       if (persist) return persist(report); mkdirSync(dir, { recursive: true }); const dest = join(dir, 'pr-sweep.json'); const tmp = `${dest}.${process.pid}.tmp`; writeFileSync(tmp, `${JSON.stringify(report, null, 2)}\n`); renameSync(tmp, dest);
     });
     await write();
-    // The automatic stall sweep (shadow until slice 5) runs AFTER this sweep's own state is saved, so a slow or failing
-    // stall pass can never cost the card-335 sweep its state. It keeps its own `prStallSweep.intervalMinutes`.
-    const stalled = await safe('stall sweep', async () => {
-      const out = await safe('stall sweep', () => stallSweep({ now, env, state: previous?.stallSweep ?? {} }),
-        { mode: 'off', incomplete: true });
-      const detector = await detect();
+    // Reads completed before planning; publish only readable PRs and preserve failed PR obligations.
+    const stalled = await safe('stall sweep publication', async () => {
+      const out = stallOut ?? { mode: 'off' };
       report.nextState.stallSweep = out.state ?? report.nextState.stallSweep;
-      report.stallSweep = { mode: out.mode, skipped: out.skipped ?? null, wouldDo: out.act?.length ?? 0, incomplete: out.incomplete ?? null,
-        lanes: Object.fromEntries(['system', 'policy', 'operator'].map((l) => [l, (out.items ?? []).filter((i) => i.lane === l).length])) };
-      errors.push(...(out.errors ?? []).map((e) => `stall sweep: ${e}`));
+      report.stallSweep = { mode: out.mode, skipped: out.skipped ?? null, wouldDo: out.act?.length ?? 0,
+        lanes: Object.fromEntries(['system', 'policy', 'operator'].map(l => [l, (out.items ?? []).filter(i => i.lane === l).length])) };
       // Operator items go to the needs-you feed (kind `stalled`) and one quiet-hours-gated alert per pass.
       const sweepDigestEnabled = out.mode !== 'off' && out.digest !== false;
-      let invariantItems = sweepDigestEnabled && ownerReadsOk && prsReadOk ? decisions.filter(p => p.violation).map(p => annotate(invariantItem(p))) : [];
+      let invariantItems = sweepDigestEnabled ? decisions.filter(p => p.violation).map(p => annotate(invariantItem(p))) : [];
       // Unknown diff evidence cannot resolve a confirmed empty diff on the same head.
       // Keep the exact row (and alert identity), without inventing an empty diff for new PRs.
-      const keptEmpty = (sweepDigestEnabled ? previous?.emptyDiffItems ?? [] : []).filter(item => prs.some(p =>
+      const keptEmpty = (previous?.emptyDiffItems ?? []).filter(item => !readable(`${item.repo}#${item.pr}`) || prs.some(p =>
         p.repo === item.repo && p.number === item.pr && p.headRefOid.toLowerCase() === item.head.toLowerCase()
         && p.diffEvidence === 'diff-unknown'));
       invariantItems = [...invariantItems.filter(item => !keptEmpty.some(old =>
         old.repo === item.repo && old.pr === item.pr)), ...keptEmpty];
-      report.nextState.emptyDiffItems = sweepDigestEnabled && ownerReadsOk && prsReadOk
-        ? invariantItems.filter(item => item.violation === 'empty-diff') : previous?.emptyDiffItems ?? [];
+      report.nextState.emptyDiffItems = sweepDigestEnabled ? invariantItems.filter(item => item.violation === 'empty-diff') : previous?.emptyDiffItems ?? [];
       const sweepItems = (sweepDigestEnabled ? out.items ?? [] : []).map(annotate);
-      const findings = [...sweepItems, ...detector.items.map(annotate).filter(d => !sweepItems.some(i =>
+      const findings = [...sweepItems, ...detected.items.map(annotate).filter(d => !sweepItems.some(i =>
         i.lane === 'operator' && i.repo === d.repo && i.pr === d.pr && String(i.head).toLowerCase() === String(d.head).toLowerCase()))];
       const samePrHead = (a, b) => a.repo === b.repo && a.pr === b.pr && typeof a.head === 'string'
         && typeof b.head === 'string' && a.head.toLowerCase() === b.head.toLowerCase();
@@ -315,10 +379,11 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
       }), ...invariantItems.filter(i => !findings.some(p => p.lane === 'operator' && samePrHead(p, i)))];
       // A skipped (not-due) sweep has no items, so publishing would clear its open ones: wait for a pass that ran.
       if (out.dir && (out.items || out.mode === 'off' || out.digest === false)) {
-        const d = stallDigest({ ...out, items: sortUnblockersFirst(published),
-          incomplete: out.incomplete || !prsReadOk || (sweepDigestEnabled && !ownerReadsOk) || detectorErrors.length > 0 },
+        const { incomplete: _legacyCompleteness, ...digestPass } = out;
+        const d = stallDigest({ ...digestPass, items: sortUnblockersFirst(published.filter(i => readable(`${i.repo}#${i.pr}`))),
+          readsOk, unreadableRepos: [...unreadableRepos] },
         { now, env, stateDir: out.dir, notify, alertBackoffMinutes: value.alertBackoffMinutes,
-          enabled: sweepDigestEnabled || invariantItems.length > 0 || detector.items.length > 0 || detector.enabled });
+          enabled: sweepDigestEnabled || invariantItems.length > 0 || detected.items.length > 0 || detected.enabled });
         report.stallSweep.digest = { published: d.lines?.length ?? 0, alerted: d.fresh?.length ?? 0, notified: !!d.notified };
         errors.push(...(d.errors ?? []).map((e) => `stall digest: ${e}`));
       }
@@ -326,7 +391,6 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
     }, false);
     if (stalled || errors.some((e) => e.startsWith('stall sweep'))) await write();
   }
-  else await detect();
   return report;
 }
 // Match the detached job's entry check, including snapshots reached through /var symlinks.

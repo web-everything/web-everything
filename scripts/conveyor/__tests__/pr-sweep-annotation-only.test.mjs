@@ -9,7 +9,7 @@ const settings = { repos: [pr.repo], idleMinutes: 45, stuckAfterMinutes: 90, stu
 const run = extra => runPrSweep({ now, dryRun: true, env: {}, settings: { value: settings, sources: {} }, readPrs: () => [pr], readPrevious: () => ({}), readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: () => ({}), detector: async () => ({ enabled: false, items: [], errors: [], nextSeen: {} }), ...extra });
 
 it.each(['Unblocks', 'blocked-by'])('overdue PR alerts exactly once on its normal schedule with an %s edge', async source => {
-  const rows = source === 'Unblocks' ? [pr, { ...blocker, body: 'Unblocks: #12' }] : [{ ...pr, body: 'blocked by #13' }, blocker];
+  const rows = source === 'Unblocks' ? [pr, { ...blocker, body: 'Unblocks: #12' }] : [{ ...pr, body: 'Blocked-by: #13' }, blocker];
   let previous = { episodes: { [key]: { head: pr.headRefOid, updatedAt: pr.updatedAt, fingerprint: stateFingerprint(pr), firstUnownedAt: now - 91 * minute, alerted: false } } };
   const alerts = [];
   for (const minutes of [0, 1, 60]) {
@@ -56,7 +56,7 @@ it('unstructured refusal strings without head/time evidence cannot create edges'
 it.each([['sweep', false], ['detector', false], ['sweep', true], ['detector', true]])('deadline-passed merges into the %s finding with edge=%s without losing evidence or remediation', async (source, edge) => {
   const finding = { repo: pr.repo, pr: 12, head: pr.headRefOid, lane: 'operator', state: 'existing-state', reason: 'specific reason', evidence: ['specific evidence'], command: 'repair-command', action: 'repair action', remediation: { command: 'specific remediation' }, tags: ['existing'] };
   let items;
-  const out = await run({ dryRun: false, readPrs: () => [{ ...pr, stateSince: now - 121 * minute, ...(edge ? { body: 'blocked by #13' } : {}) }, ...(edge ? [blocker] : [])],
+  const out = await run({ dryRun: false, readPrs: () => [{ ...pr, stateSince: now - 121 * minute, ...(edge ? { body: 'Blocked-by: #13' } : {}) }, ...(edge ? [blocker] : [])],
     persist: () => {}, append: () => {}, flush: () => {}, notify: () => ({ ok: true }),
     stallSweep: async () => ({ mode: 'shadow', dir: 'unused', items: source === 'sweep' ? [finding] : [] }),
     detector: async () => ({ enabled: true, items: source === 'detector' ? [finding] : [], errors: [], nextSeen: {} }),

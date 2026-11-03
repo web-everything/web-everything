@@ -1,47 +1,49 @@
-/** R437: report-only PR dependency edges. All text is untrusted Markdown; no IO. */
+/** R437: report-only PR dependency edges. Only explicit body trailers and current tooling refusals declare edges; no IO. */
 import MarkdownIt from 'markdown-it';
 import { currentToolingRefusals, prKey } from './pr-sweep-core.mjs';
-import { isTrustedSupersedeAuthor } from './supersede-rule.mjs';
 const markdown = new MarkdownIt();
-function dependencyText(text) {
-  // Block tokens account for indentation, nesting and lazy blockquote continuation;
-  // a line-prefix filter cannot tell quoted example text from an active dependency.
-  const paragraphs = [];
-  let quoteDepth = 0;
-  for (const token of markdown.parse(String(text ?? ''), {})) {
-    if (token.type === 'blockquote_open') quoteDepth++;
-    else if (token.type === 'blockquote_close') quoteDepth--;
-    else if (token.type === 'inline' && quoteDepth === 0) paragraphs.push(token.content);
-  }
-  const plain = paragraphs.join('\n');
-  // Equal-length backtick runs delimit spans across lines. An unterminated span
-  // stays excluded: uncertain quoted text must never manufacture a dependency.
+/** Mask backtick spans without joining source lines or manufacturing trailer text.
+ * Equal-length runs close a span; an unmatched opener masks the rest of its paragraph.
+ */
+function maskInlineCode(text) {
+  const mask = value => value.replace(/[^\n]/g, '\u0000');
   let clean = '', cursor = 0, delimiter = null;
-  for (const run of plain.matchAll(/`+/g)) {
+  for (const run of text.matchAll(/`+/g)) {
     if (delimiter === null) {
-      clean += plain.slice(cursor, run.index) + '\u0000';
-      delimiter = run[0].length;
-    } else if (run[0].length === delimiter) {
-      delimiter = null;
+      // Outside code, a backslash escapes only the first backtick in a run.
+      const escapes = text.slice(0, run.index).match(/\\+$/)?.[0].length ?? 0;
+      const escaped = escapes % 2;
+      const length = run[0].length - escaped;
+      if (!length) continue;
+      clean += text.slice(cursor, run.index + escaped) + mask(run[0].slice(escaped));
+      delimiter = length;
+    } else {
+      clean += mask(text.slice(cursor, run.index + run[0].length));
+      if (run[0].length === delimiter) delimiter = null;
     }
     cursor = run.index + run[0].length;
   }
-  if (delimiter === null) clean += plain.slice(cursor);
-  return clean;
+  return clean + (delimiter === null ? text.slice(cursor) : mask(text.slice(cursor)));
 }
-export function parseBlockedBy(text) {
-  return [...new Set([...dependencyText(text).matchAll(/\b(?:blocked[ \t]+by|depends[ \t]+on|waits[ \t]+on|waiting[ \t]+on)[ \t]+#([1-9]\d*)\b/gi)]
-    .map(m => Number(m[1])).filter(Number.isSafeInteger))];
-}
-/** Explicit reverse declarations belong to the PR body, never comments or daemon logs. */
-export function parseUnblocks(text) {
-  const refs = [];
-  for (const line of dependencyText(text).split('\n')) {
-    const list = line.match(/^[ \t]*unblocks(?:[ \t]*:[ \t]*|[ \t]+)(#[1-9]\d*(?:[ \t,]+#[1-9]\d*)*)\b/i)?.[1];
-    if (list) refs.push(...[...list.matchAll(/#([1-9]\d*)/g)].map(m => Number(m[1])).filter(Number.isSafeInteger));
+/** Read literal trailer lines in unquoted Markdown paragraphs; code never declares edges. */
+function trailers(text, key) {
+  const body = String(text ?? '').replace(/\r\n?/g, '\n');
+  const lines = body.split('\n'), refs = [];
+  let quoteDepth = 0;
+  for (const token of markdown.parse(body, {})) {
+    if (token.type === 'blockquote_open') quoteDepth++;
+    else if (token.type === 'blockquote_close') quoteDepth--;
+    else if (token.type === 'inline' && quoteDepth === 0 && token.map) {
+      for (const line of maskInlineCode(lines.slice(...token.map).join('\n')).split('\n')) {
+        const list = line.match(new RegExp(`^ {0,3}${key}:[ \t]*(#[1-9]\\d*(?:[ \t,]+#[1-9]\\d*)*)[ \t]*$`, 'i'))?.[1];
+        if (list) refs.push(...[...list.matchAll(/#([1-9]\d*)/g)].map(m => Number(m[1])).filter(Number.isSafeInteger));
+      }
+    }
   }
   return [...new Set(refs)];
 }
+export function parseBlockedBy(text) { return trailers(text, 'blocked-by'); }
+export function parseUnblocks(text) { return trailers(text, 'unblocks'); }
 /** Inputs are the current open-PR listing for ONE repository (state may be omitted).
  * Textual references alone never confirm a live blocker; closed, merged and absent targets do not block.
  */
@@ -51,16 +53,10 @@ export function buildBlockedMap(prs, { now, settings = {}, owners = {} } = {}) {
   const openNumbers = new Set(openPrs.map(pr => Number(pr.number ?? pr.pr)));
   for (const pr of openPrs) {
     const number = Number(pr.number ?? pr.pr);
-    const author = pr.author?.login;
-    const comments = (pr.commentsComplete !== false && Array.isArray(pr.comments) ? pr.comments : []).filter(c => {
-      const principal = { author: c?.author ?? c?.user };
-      const login = principal.author?.login;
-      return isTrustedSupersedeAuthor(principal) || (typeof author === 'string' && author.trim() !== ''
-        && typeof login === 'string' && login.toLowerCase() === author.toLowerCase());
-    });
-    const texts = [pr.body, ...comments.map(c => c.body),
-      ...currentToolingRefusals(pr.daemons ?? [], pr, (pr.repo ? owners[prKey(pr)] : null) ?? {}, now, settings).map(d => d.reason)];
-    const refs = [...new Set(texts.flatMap(parseBlockedBy))].filter(n => n !== number && openNumbers.has(n));
+    // Preserve the existing refusal-state mapping only; comments and arbitrary logs are never declarations.
+    const tooling = currentToolingRefusals(pr.daemons ?? [], pr, (pr.repo ? owners[prKey(pr)] : null) ?? {}, now, settings)
+      .flatMap(d => [...d.reason.matchAll(/\b(?:blocked[ \t]+by|depends[ \t]+on|waits[ \t]+on|waiting[ \t]+on)[ \t]+#([1-9]\d*)\b/gi)].map(m => Number(m[1])));
+    const refs = [...new Set([...parseBlockedBy(pr.body), ...tooling])].filter(n => n !== number && openNumbers.has(n));
     blockedBy.set(number, refs);
     for (const n of refs) unblocks.set(n, [...new Set([...(unblocks.get(n) ?? []), number])]);
   }

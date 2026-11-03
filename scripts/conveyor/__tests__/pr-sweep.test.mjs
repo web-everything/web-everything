@@ -281,10 +281,10 @@ describe('only an actively running session owns a PR', () => {
     const unscoped = await sweepWith(gapped({ reason: 'completion store row unreadable' }), first.nextState);
     expect(unscoped.errors.join(' ')).toContain('agent listing incomplete'); expect(unscoped.alerts).toEqual([]);
     expect(unscoped.nextState.episodes).toEqual(first.nextState.episodes);
-    // A record that stays unreadable still alerts once the doubled wait passes.
+    // A failed read never consumes the saved episode, regardless of ownership age.
     const blind = await sweepWith(gapped({ reason: 'wrapped record fix-12 unreadable', session: 'fix-12' }), first.nextState, now + 181 * 60000);
-    expect(blind.idle[0].state).toBe('unknown'); expect(blind.alerts).toHaveLength(1);
-    expect(blind.alerts[0].body).toContain('Bound session could not be read');
+    expect(blind.idle[0].state).toBe('unknown'); expect(blind.alerts).toEqual([]);
+    expect(blind.nextState.episodes).toEqual(first.nextState.episodes);
   });
   it('a busy live job with no readable transcript is unknown, never a false stall or a forever owner', async () => {
     const first = plan();
@@ -295,9 +295,10 @@ describe('only an actively running session owns a PR', () => {
     const thrown = await sweepWith([job], first.nextState, now + 100 * 60000, () => { throw new Error('tail read failed'); });
     expect(thrown.idle[0].state).toBe('unknown'); expect(thrown.alerts).toEqual([]);
     expect((await sweepWith([{ ...job, pidAlive: false }], first.nextState)).alerts).toHaveLength(1);
-    // Unknown is bounded: a job started 4 h ago with no readable activity no longer holds the PR.
+    // A failed transcript read remains closed even beyond the ownership budget.
     const wedged = await sweepWith([{ ...job, startedAt: now - 140 * 60000 }], first.nextState);
-    expect(wedged.idle[0].state).toBe('none'); expect(wedged.alerts).toHaveLength(1);
+    expect(wedged.idle[0].state).toBe('none'); expect(wedged.alerts).toEqual([]);
+    expect(wedged.nextState.episodes).toEqual(first.nextState.episodes);
     // An unnamed busy row binds to every web-everything PR but must not make them unreadable.
     const unnamed = await sweepWith([{ ...job, name: 'Assistant' }], first.nextState);
     expect(unnamed.idle[0].state).toBe('none'); expect(unnamed.alerts).toHaveLength(1);
@@ -322,7 +323,7 @@ describe('only an actively running session owns a PR', () => {
 
 // R437: the running shell, not just the pure evaluator, must cover fresh updatedAt.
 it('R437 evaluates every open PR, records state clocks and audits dependency order', async () => {
-  const rows = [{ ...pr, headRefOid: 'a'.repeat(40), number: 6193, body: '> blocked by #1', comments: [{ body: 'depends on #6244', author: { login: 'chalbert' } }], updatedAt: new Date(now).toISOString() },
+  const rows = [{ ...pr, headRefOid: 'a'.repeat(40), number: 6193, body: 'Blocked-by: #6244', comments: [{ body: 'depends on #9999', author: { login: 'chalbert' } }], updatedAt: new Date(now).toISOString() },
     { ...pr, headRefOid: 'a'.repeat(40), number: 6244, labels: ['red-team:pending'], stateSince: now - 420 * 60000, updatedAt: new Date(now).toISOString() }];
   const lines = [];
   const out = await runPrSweep({ now, settings: { value: settings, sources: {} }, config: {},
@@ -373,7 +374,8 @@ it('R437 fresh updates retain the state clock, while a head or label-set change 
     const tick = now + minutes * 60000;
     const out = await runPrSweep({ now: tick, dryRun: true, config: {}, settings: { value: settings, sources: {} },
       readPrevious: () => previous, readPrs: () => [{ ...pr, labels: ['red-team:pending'], updatedAt: new Date(tick).toISOString(), ...overrides }],
-      readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: () => ({}) });
+      detector: () => ({ enabled: false, items: [], errors: [], nextSeen: {} }),
+      readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: () => ({ [`${pr.repo}#12`]: { daemons: [] } }) });
     previous = out.nextState;
     return out.decisions[0];
   };
@@ -419,7 +421,7 @@ it('R437 settings cascade names sources and rejects invalid backoff and deadline
 });
 
 it('R437 removing a blocker annotation preserves the running stall clock and alert history', async () => {
-  const dependent = { ...pr, number: 6193, headRefOid: 'a'.repeat(40), body: 'blocked by #6244' };
+  const dependent = { ...pr, number: 6193, headRefOid: 'a'.repeat(40), body: 'Blocked-by: #6244' };
   const blocker = { ...pr, number: 6244, headRefOid: 'b'.repeat(40) };
   const key = `${pr.repo}#6193`;
   let previous = {};
@@ -451,7 +453,7 @@ it.each([
 ])
   ('R437 cross-repository number collisions never suppress stall monitoring (%s; target %s in dependent repo)', async (order, targetState) => {
     const otherRepo = 'plateauapp/plateau-app';
-    const dependent = { ...pr, number: 6193, headRefOid: 'a'.repeat(40), body: 'Blocked by: #6244' };
+    const dependent = { ...pr, number: 6193, headRefOid: 'a'.repeat(40), body: 'Blocked-by: #6244' };
     const otherDependent = { ...dependent, repo: otherRepo, headRefOid: 'b'.repeat(40) };
     const blocker = { ...pr, repo: otherRepo, number: 6244, headRefOid: 'c'.repeat(40) };
     const repos = order === 'dependent repo first' ? [pr.repo, otherRepo] : [otherRepo, pr.repo];
@@ -477,8 +479,9 @@ it.each([
       expect(report.nextState.episodes[key].firstUnownedAt).toBe(now);
       // The identical annotation is a real dependency only in the blocker repository.
       expect(report.decisions.find(p => p.repo === otherRepo && p.number === 6193))
-        .toMatchObject({ blockedBy: [6244], violation: 'waiting-on-blocked' });
-      expect(report.nextState.episodes[otherKey]).toBeUndefined();
+        .toMatchObject({ blockedBy: [6244], nextAction: 'fix' });
+      expect(report.decisions.find(p => p.repo === otherRepo && p.number === 6193).violation).not.toBe('waiting-on-blocked');
+      expect(report.nextState.episodes[otherKey].firstUnownedAt).toBe(now);
       previous = report.nextState;
       return report;
     };
@@ -532,7 +535,7 @@ it('R437 empty diff takes precedence over blockedBy in the invariant action, vio
     .toMatchObject({ nextAction: 'close into card', violation: 'empty-diff', deadline: new Date(now + 45 * 60000).toISOString() });
 });
 it('R437 empty diff with a live blocker keeps close-into-card precedence in sweep output and digest', async () => {
-  const empty = { ...pr, number: 6268, headRefOid: 'a'.repeat(40), changedFiles: 0, body: 'blocked by #6244' };
+  const empty = { ...pr, number: 6268, headRefOid: 'a'.repeat(40), changedFiles: 0, body: 'Blocked-by: #6244' };
   const blocker = { ...pr, number: 6244, headRefOid: 'b'.repeat(40), changedFiles: 5 };
   const digests = [], logs = [];
   const report = await runPrSweep({ now, env: {}, config: {}, settings: { value: settings, sources: {} },
@@ -554,7 +557,7 @@ describe('R437 sanctioned dependency comment discovery', () => {
   const comment = (i) => ({ id: `IC_${i}`, body: `note ${i}`, author: { login: 'operator' } });
   it('uses one listing for short threads and completes long threads before dependency evaluation', () => {
     const listed = Array.from({ length: 100 }, (_, i) => comment(i));
-    const last = { ...comment(100), body: 'blocked by #6244' };
+    const last = { ...comment(100), body: 'Blocked-by: #6244' };
     const calls = [];
     const read = completeComments.createOpenPrCommentReader({ exec: (_bin, args) => {
       calls.push(args);
@@ -667,11 +670,11 @@ it('tooling deadline resolves and logs cascade provenance and rejects invalid ov
 });
 
 
-it.each(['Unblocks: #6', 'blocked by #5'])('keeps duplicate PR numbers scoped to each repository: %s', async declaration => {
+it.each(['Unblocks: #6', 'Blocked-by: #5'])('keeps duplicate PR numbers scoped to each repository: %s', async declaration => {
   const otherRepo = 'plateauapp/plateau-app';
   const rows = [
     { ...pr, number: 5, body: declaration.startsWith('Unblocks') ? declaration : '' },
-    { ...pr, number: 6, body: declaration.startsWith('blocked') ? declaration : '' },
+    { ...pr, number: 6, body: declaration.startsWith('Blocked-by') ? declaration : '' },
     { ...pr, repo: otherRepo, number: 5, body: '' },
     { ...pr, repo: otherRepo, number: 6, body: '' },
   ];
@@ -685,4 +688,56 @@ it.each(['Unblocks: #6', 'blocked by #5'])('keeps duplicate PR numbers scoped to
   for (const row of rows) expect(out.decisions.find(p => p.repo === row.repo && p.number === row.number))
     .toMatchObject({ blockedBy: row.repo === pr.repo && row.number === 6 ? [5] : [],
       unblocks: row.repo === pr.repo && row.number === 5 ? [6] : [] });
+});
+
+
+it.each(['comments', 'owner', 'detector', 'listing'])('per-PR %s read failure freezes A while B alerts and retries failed sends', async source => {
+  const a = `${pr.repo}#12`, bRepo = 'plateauapp/plateau-app', b = `${bRepo}#13`;
+  const old = { episodes: { [a]: { head: 'abc', updatedAt: pr.updatedAt, firstUnownedAt: now - 10000000, alerted: false },
+    [b]: { head: 'abc', updatedAt: pr.updatedAt, firstUnownedAt: now - 10000000, alerted: false } },
+    invariantClocks: { [a]: { fingerprint: 'saved', since: 123 } }, stallDetector: { [`${a}@abc`]: { since: 456 } } };
+  let previous = old;
+  const tick = async ok => {
+    const result = await runPrSweep({ now, settings: { value: { ...settings, repos: [pr.repo, bRepo] }, sources: {} },
+      readPrevious: () => previous,
+      readPrs: repo => { if (source === 'listing' && repo === pr.repo) throw new Error('listing failed');
+        return [{ ...pr, number: repo === pr.repo ? 12 : 13, commentsComplete: !(source === 'comments' && repo === pr.repo) }]; },
+      readQueue: () => ({ ready: [], rulingNeeded: [] }),
+      readSignals: () => source === 'owner' ? { [a]: { readsOk: false } } : {},
+      detector: () => ({ enabled: true, items: [], errors: source === 'detector' ? ['failed A'] : [], failedPrKeys: source === 'detector' ? [a] : [], nextSeen: {} }),
+      stallSweep: () => ({ mode: 'off' }), notify: () => ({ ok }), flush: () => {}, persist: () => {}, append: () => {} });
+    expect(result.nextState.episodes[a]).toEqual(old.episodes[a]);
+    expect(result.nextState.invariantClocks[a]).toEqual(old.invariantClocks[a]);
+    expect(result.nextState.stallDetector[`${a}@abc`]).toEqual(old.stallDetector[`${a}@abc`]);
+    expect(result.alerts.filter(x => x.kind === 'pr-stuck').map(x => x.key)).toEqual([b]);
+    previous = result.nextState;
+    return result;
+  };
+  await tick(false);
+  expect((await tick(true)).nextState.episodes[b].alerted).toBe(true);
+});
+it('three consecutive failed reads emit one reads-failing alert, retry delivery, and reset on recovery', async () => {
+  let previous = {}, fails = true, sendsOk = true; const sent = [];
+  const tick = async () => {
+    const report = await runPrSweep({ now, settings: { value: settings, sources: {} }, readPrevious: () => previous,
+      readPrs: () => [{ ...pr, commentsComplete: !fails }], readSignals: () => ({}), readQueue: () => ({ ready: [], rulingNeeded: [] }),
+      detector: () => ({ enabled: false, items: [], errors: [], nextSeen: {} }), stallSweep: () => ({ mode: 'off' }),
+      notify: n => { sent.push(n); return { ok: sendsOk }; }, flush: () => {}, persist: () => {}, append: () => {} });
+    previous = report.nextState; return report;
+  };
+  await tick(); await tick(); expect(sent).toEqual([]);
+  sendsOk = false; await tick(); sendsOk = true; await tick(); await tick();
+  expect(sent.map(n => n.kind)).toEqual(['reads-failing', 'reads-failing']);
+  expect(previous.readFailures[`${pr.repo}#12`]).toBe(5);
+  fails = false; await tick(); expect(previous.readFailures[`${pr.repo}#12`] ?? 0).toBe(0);
+});
+
+
+it('an unattributable owner read failure freezes PRs present only in the operator queue', async () => {
+  const out = await runPrSweep({ now, dryRun: true, settings: { value: settings, sources: {} },
+    readPrevious: () => ({ needsYou: [] }), readPrs: () => [], readQueue: () => ({ ready: [pr], rulingNeeded: [] }),
+    readSignals: () => { throw new Error('owner store unavailable'); },
+    detector: () => ({ enabled: false, items: [], errors: [], nextSeen: {} }) });
+  expect(out.alerts).toEqual([]);
+  expect(out.nextState.needsYou).toEqual([]);
 });

@@ -1,6 +1,6 @@
 /**
  * @file scripts/conveyor/pr-sweep-core.mjs
- * @description Card 335 — pure PR movement ownership and episode planning; no IO or implicit clock.
+ * @description Card 335 — pure PR movement ownership and per-PR read-gated episode planning; no IO or implicit clock.
  */
 import { findFixerSession } from './health-smells/pr-no-owner.mjs';
 import { parseSessionSlug } from './session-slug.mjs';
@@ -42,6 +42,12 @@ function namesPr(name, pr) {
   const slug = parseSessionSlug(name);
   if (slug) return !slug.itemKind && slug.repo === repoKeyForSlug(pr.repo) && Number(slug.id) === Number(pr.number);
   return repoKeyForSlug(pr.repo) === 'we' && Boolean(findFixerSession([{ name }], pr.number));
+}
+/** A bound session read failure freezes its PR even after the ownership budget expires. */
+export function ownerSignalsReadable(pr, signals = {}) {
+  return signals.readsOk !== false
+    && !(signals.unreadSessions ?? []).some(name => namesPr(name, pr))
+    && !(signals.sessions ?? []).some(a => namesPr(a.name, pr) && a.activityUnknown === true);
 }
 export function resolveOwner(pr, signals = {}) {
   const { now, stuckAfterMinutes = 90, sessionActiveWithinMinutes = 30, operator, smell, daemons = [], sessions = [], unreadSessions = [] } = signals;
@@ -148,14 +154,14 @@ export function evaluateInvariant(pr, owner = {}, { now, since = now, settings =
     : owner.owner ?? implied;
   return { owner: assigned, nextAction, deadline, violation };
 }
-export function planSweep({ idle, owners, prevState = {}, needsYou, now, settings, ownerReadsOk = true, prsReadOk = true }) {
+export function planSweep({ idle, owners, prevState = {}, needsYou, now, settings, readsOk = {} }) {
   const alerts = []; const diagnose = new Set();
   if (Array.isArray(needsYou)) needsYou = [...new Map(needsYou.map((p) => [prKey(p), p])).values()];
-  const episodes = ownerReadsOk && prsReadOk ? {} : { ...prevState.episodes };
+  const episodes = Object.fromEntries(Object.entries(prevState.episodes ?? {}).filter(([key]) => readsOk[key] === false));
   const report = { idle: idle.map((p) => ({ ...p, ...owners[prKey(p)] })), needsYou: needsYou ?? null, needsYouAdded: [] };
   for (const p of idle) {
     const key = prKey(p); const owner = owners[key];
-    if (!ownerReadsOk || !prsReadOk) continue;
+    if (readsOk[key] === false) continue;
     const old = prevState.episodes?.[key];
     if (!['none', 'stuck', 'unknown'].includes(owner?.state)) continue;
     const fingerprint = stateFingerprint(p);
@@ -165,8 +171,7 @@ export function planSweep({ idle, owners, prevState = {}, needsYou, now, setting
     if (episode.alerted && settings.alertBackoffMinutes && !Number.isFinite(episode.lastAlertAt)) {
       episode.lastAlertAt = now; episode.alertCount = episode.alertCount ?? 1;
     }
-    // An unreadable owner keeps the episode clock running but waits twice as long,
-    // so a brief unreadable tick never alerts and a permanent one still does.
+    // Unknown ownership without a failed read uses a doubled ownership budget.
     const alertAfter = settings.stuckAlertMinutes * (owner.state === 'unknown' ? 2 : 1);
     if ((!episode.alerted && now - episode.firstUnownedAt > alertAfter * 60000) || repeatDue(episode, now, settings.alertBackoffMinutes)) {
       alerts.push({ kind: 'pr-stuck', title: 'PR movement stalled', body: `${key} ${p.title}: ${owner.why}${[...(p.blockedBy ?? []).map(n => `blocked-by #${n}`), ...(p.unblocks ?? []).map(n => `unblocks #${n}`)].map(label => '; ' + label).join('')}`, key }); episode.alerted = true; episode.lastAlertAt = now; episode.alertCount = (episode.alertCount ?? 0) + 1;
@@ -177,7 +182,8 @@ export function planSweep({ idle, owners, prevState = {}, needsYou, now, setting
   }
   const nextState = { episodes, ...(prevState.needsYou !== undefined ? { needsYou: prevState.needsYou } : {}) };
   if (needsYou !== null && needsYou !== undefined) {
-    const keys = [...new Set(needsYou.map(prKey))];
+    needsYou = needsYou.filter(p => readsOk[prKey(p)] !== false);
+    const keys = [...new Set([...needsYou.map(prKey), ...(prevState.needsYou ?? []).filter(key => readsOk[key] === false)])];
     if (Array.isArray(prevState.needsYou)) report.needsYouAdded = needsYou.filter((p) => !prevState.needsYou.includes(prKey(p)));
     nextState.needsYou = keys;
     if (report.needsYouAdded.length) alerts.push({ kind: 'needs-you', title: 'PR queue NEEDS YOU', body: report.needsYouAdded.map((p) => `${prKey(p)} ${p.title ?? ''}`).join(' | ') });
