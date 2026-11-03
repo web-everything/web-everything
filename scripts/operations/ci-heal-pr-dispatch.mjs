@@ -438,6 +438,13 @@ export async function runReconcileCiHealDispatch({
   const owedFlush = flushOwed(repoKey);
   const timeoutFollowups = await flushTimeouts({ root, repo: CONSTELLATION_REPOS[repoKey].slug });
   const reconciled = reconcile({ repo, ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
+  // A DEFERRED read planned nothing: owed is UNKNOWN, not zero. Skip the tick — no timeout reruns, no dispatch, no
+  // unsupported-row rewrite (that would RELEASE rows the unread PRs still owe) — and say so.
+  if (reconciled?.deferred === true) {
+    const readDeferred = String(reconciled.message ?? reconciled.reason ?? 'deferred').split('\n')[0];
+    console.error(`ci-heal-pr-dispatch: open-PR read deferred — owed unknown, skipping this tick: ${readDeferred}`);
+    return { dispatched: [], refusals: [], readDeferred, timeoutFollowups, reconcileRefusals: 0, reconcileRefusalDetails: [], owedFlush };
+  }
   const timeoutResults = [];
   for (const entry of (reconciled.dispatch ?? []).filter((row) => row.kind === 'ci-timeout-rerun')) {
     try {
