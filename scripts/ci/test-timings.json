@@ -1231,6 +1231,7 @@
   "scripts/conveyor/soak/breaks/red-team-deadline-merges-without-result.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/red-team-round-cap-never-rulable.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/ruling-answers-unrelated-or-stale-stand-down.soak.test.mjs": 1.4,
-  "scripts/conveyor/soak/breaks/stale-referral-hold-never-resumes.soak.test.mjs": 1.4
+  "scripts/conveyor/soak/breaks/stale-referral-hold-never-resumes.soak.test.mjs": 1.4,
+  "scripts/conveyor/soak/breaks/unlabelled-bot-pr-on-non-lane-head-nothing-owed.soak.test.mjs": 6.3
  }
 }
