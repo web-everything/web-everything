@@ -1,7 +1,7 @@
 /** Same normalized reason on the last N attempts per PR, within the shared one-hour
  * evidence window. Uses daemon memory only, not duplicate operation-record evidence.
- * Health-dir config.json: sameRefusalStreak.streakLength (positive safe integer, default 3).
- * Large thresholds require that many observed attempts; they never relax the check.
+ * Health-dir config.json: sameRefusalStreak.streakLength (integer 2–10, default 3).
+ * Invalid/out-of-range overrides fall back to 3, reported with source 'default'.
  * Explicitly notifies on medium openings; persistent streaks escalate to high
  * and notify again after 30 minutes. No retries or dispatch mutations.
  */
@@ -13,16 +13,17 @@ export default {
   probes: ['daemonLogs'], openAfter: 1, closeAfter: 2,
   severity: 'medium', action: 'alert', notifyOnOpen: true, escalateAfterMs: 30 * MINUTE,
   evaluate(_probes, { now, daemons, config } = {}) {
-    if (!daemons || typeof daemons !== 'object' || !Number.isFinite(now)) {
+    if (!daemons || typeof daemons !== 'object' || Array.isArray(daemons)
+      || !Object.keys(daemons).length || !Number.isFinite(now)) {
       throw new Error('Incomplete daemon attempt evidence; inspect daemonLogs probe errors and run why-not-dispatching on the affected PR.');
     }
     const override = config?.sameRefusalStreak?.streakLength;
-    const overridden = Number.isSafeInteger(override) && override > 0;
+    const overridden = Number.isSafeInteger(override) && override >= 2 && override <= 10;
     const streakLength = overridden ? override : 3;
     const groups = new Map();
     for (const daemon of Object.values(daemons)) {
-      // Old memory with no attempts is valid: the fold has not observed any yet.
-      const attempts = daemon?.prAttempts ?? [];
+      // Only an explicit empty array proves that no attempts were observed.
+      const attempts = daemon?.prAttempts;
       if (!Array.isArray(attempts)) throw new Error('Invalid daemon attempt evidence; inspect daemonLogs.');
       for (const row of attempts) {
         if (!row || typeof row.pr !== 'string' || !row.pr || !Number.isFinite(row.at)

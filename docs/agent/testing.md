@@ -249,7 +249,13 @@ for an already-high episode. Shadow suppression and tracked silences still apply
 Health-dir config overrides are `workerCountVsLoad.{loadPerCore,minWorkersForLoad,workerCap}`
 and `sameRefusalStreak.streakLength`; effective thresholds and their sources appear in episode measures.
 Worker cap inherits the existing `workerCapacity.ceiling` setting/environment override, falling back
-to 12 when absent. Malformed evidence throws so the core preserves episodes and records probe errors.
+to 12 when absent or outside [1,200]. Load/core accepts [0.5,20], minimum workers accepts integers
+in [1,200], and refusal streak length accepts integers in [2,10]; invalid overrides use the default
+threshold and provenance. Worker pressure sums leased lanes from the existing local, per-tick
+`lanePools` probe, independent of gh cadence and `--no-gh`. Exercise that producer with a log fixture,
+not a second agent listing. Missing/empty lane-pool evidence and missing/null attempt arrays throw
+so the core preserves episodes and records probe errors; only explicit empty attempt arrays mean
+no attempts. Cover persisted daemon memory without `prAttempts` and oversized settings explicitly.
 
 ## Health tick watchdog deadlines
 
