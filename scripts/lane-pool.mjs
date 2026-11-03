@@ -85,6 +85,7 @@ import { homedir, hostname, tmpdir } from 'node:os';
 import { join, basename, resolve, dirname, sep } from 'node:path';
 import { resolveReal } from './guard-lane.mjs';
 import { readGit, execRead } from './lib/proc-read.mjs';
+import { createBuildOutputCleaner } from './lib/lane-build-output.mjs';
 import { boundedGitCommand, BOUNDED_GIT_GRACE_MS } from './lib/git-bounded.mjs';
 import { ensureLaneAlternates, findPrimaryForPool, poolNameFromLanePath } from './lib/lane-alternates.mjs';
 // #4415 — live incident 2026-09-29: `deadLeasePlan`'s own `gh pr list --state all` (below) was a bare,
@@ -197,7 +198,6 @@ import { readGitIdentity, laneIdentityReport, ensureLaneHooksPath, resolveGitIde
 const parseScopeFlag = (v) => (typeof v === 'string' && v ? normScope(v.split(',')) : []);
 
 // ── tiny arg parsing ──────────────────────────────────────────────────────────────────────────────
-const isMain = Boolean(process.argv[1]) && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 const [, , cmd, ...rest] = process.argv;
 const flags = {};
 const positionals = [];
@@ -230,7 +230,7 @@ const isReadOnlyGit = (args) => READ_ONLY_GIT.has(args[0]) || (args[0] === 'remo
 // No inherited GIT_DIR / GIT_REFERENCE_BACKEND-style redirect either: a lane write must never land in another repository.
 // The process drops it too: lane-whois's status proof, lane-history's snapshot and lane-salvage's refs build their
 // git env from process.env (tested in lane-pool-git-diet.test.mjs).
-if (isMain) dropGitLocationEnv(process.env);
+dropGitLocationEnv(process.env);
 const LANE_GIT_ENV = scrubGitLocationEnv(process.env);
 const readOnlyGitEnv = (args) => ({ env: laneGitHardeningEnv(isReadOnlyGit(args) ? { ...LANE_GIT_ENV, GIT_OPTIONAL_LOCKS: '0' } : LANE_GIT_ENV) });
 // The transport keys those pins cannot reach (PR #5775 self-review): a lane-set `remote.origin.uploadpack` is multi-valued
@@ -299,42 +299,7 @@ const tryGit = (args, cwd, opts = {}) => {
   }
 };
 
-/** List eligible top-level build directories using the fixed naming convention (_site, _site-*). */
-export function ignoredBuildOutputDirs(dir) {
-  const denied = new Set(['node_modules', '.git', '.claude', 'src', 'scripts', 'docs']);
-  return readdirSync(dir).filter((name) => {
-    // Only literal children in the fixed naming convention (_site, _site-*) are eligible.
-    if (!(name === '_site' || /^_site-[A-Za-z0-9_.-]+$/.test(name)) || name.includes('..')) return false;
-    if (denied.has(name)) return false;
-    // Absent or symlinked outputs are never cleaned, so they need no git evidence (git rejects symlink pathspecs).
-    try { if (!lstatSync(join(dir, name)).isDirectory()) return false; } catch (e) { if (e?.code === 'ENOENT') return false; throw e; }
-    // Unknown Git evidence aborts cleanup; only check-ignore's exit 1 means not ignored.
-    const path = `${name}/`;
-    if (git(['ls-files', '--', path], dir) !== '') return false;
-    try {
-      return git(['check-ignore', '-q', '--', path], dir) === '';
-    } catch (error) {
-      if (error.code === 'exit' && error.status === 1) return false;
-      throw error;
-    }
-  });
-}
-
-/** Remove eligible ignored build directories (_site, _site-*); failure must prevent handing out a dirty lane. */
-export function cleanIgnoredBuildOutput(dir) {
-  try {
-    const dirs = ignoredBuildOutputDirs(dir).filter((name) => {
-      try { return lstatSync(join(dir, name)).isDirectory(); } catch (e) { if (e?.code === 'ENOENT') return false; throw e; }
-    });
-    // Never invoke clean with an empty pathspec (which would target the whole repository).
-    if (dirs.length) git(['clean', '-fdX', '--quiet', '--', ...dirs.map((name) => `${name}/`)], dir);
-  } catch (e) {
-    const message = msgOf(e).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ');
-    throw Object.assign(new Error(`ignored build output cleanup failed: ${message}`, { cause: e }), {
-      ignoredBuildOutputCleanupFailure: true,
-    });
-  }
-}
+const { cleanIgnoredBuildOutput } = createBuildOutputCleaner(git);
 
 // Live-fire dispatch test, 2026-08-29: `git fetch origin --prune` crashed `provision`/`acquire` outright —
 // "error: cannot lock ref '<ref>': is at X but expected Y" — a transient race over the SHARED object store
@@ -384,7 +349,7 @@ const LOCAL_GIT_TIMEOUT_MS = Math.min(resolveChildTimeoutMs(), 15_000);
 // and runs `node "<WE_ROOT>/scripts/lane-pool.mjs" acquire …` with no `--repo`. The cwd fallback then found no origin
 // and every prepare failed with `could not determine an origin URL`. Outside any git work tree, the checkout this
 // script lives in is the honest answer (it IS `<WE_ROOT>`), for both the pool root and the repo to acquire from.
-const CWD_TOP_LEVEL = isMain ? tryGit(['rev-parse', '--show-toplevel'], process.cwd(), { timeout: LOCAL_GIT_TIMEOUT_MS }) : null;
+const CWD_TOP_LEVEL = tryGit(['rev-parse', '--show-toplevel'], process.cwd(), { timeout: LOCAL_GIT_TIMEOUT_MS });
 const SCRIPT_CHECKOUT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const CHECKOUT_ROOT = checkoutRootFor({ cwdTopLevel: CWD_TOP_LEVEL, scriptCheckout: SCRIPT_CHECKOUT, cwd: process.cwd() });
 // #3383 — `guardedPoolRoot` (not the bare `defaultPoolRoot`) so a vitest run that spawns this CLI for real with
@@ -393,7 +358,7 @@ const CHECKOUT_ROOT = checkoutRootFor({ cwdTopLevel: CWD_TOP_LEVEL, scriptChecko
 // down this file, so it's callable here.
 let POOL_ROOT;
 try {
-  if (isMain) POOL_ROOT = guardedPoolRoot(CHECKOUT_ROOT);
+  POOL_ROOT = guardedPoolRoot(CHECKOUT_ROOT);
 } catch (e) {
   // `fail` calls `process.exit(1)`, which does not itself unwind JS execution — the `throw` right after is a
   // belt-and-suspenders stop so nothing below this line ever runs against an undefined POOL_ROOT in the window
@@ -1495,13 +1460,11 @@ function refreshLane(repo, n, { force = false } = {}) {
   const verdict = destructiveActionVerdict({ unpushed: before.unpushed, override: force });
   git(['reset', '--hard', `origin/${repo.branch}`, '--quiet'], dir);
   git(['clean', '-fd', '--quiet'], dir); // remove untracked, KEEP ignored (node_modules) — no -x
-  let buildCleanError = null;
-  try { cleanIgnoredBuildOutput(dir); } catch (e) { buildCleanError = e; } // journal the destructive reset FIRST, then surface
   journalLaneEvent(dir, {
     action: 'refresh-reset', before, headAfter: laneHead(dir),
     reason: force ? `refresh --force (${verdict.reason})` : 'refresh — clean lane fast-forwarded', loud: verdict.loud || undefined,
   });
-  if (buildCleanError) throw buildCleanError;
+  cleanIgnoredBuildOutput(dir);
   return { skipped: false, dirty: false, uncommitted: 0, ahead: 0 };
 }
 
@@ -2261,28 +2224,26 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
     if (reclaimAhead) logReclaimedAheadCommits(dir, repo.branch, chosen);
     git(['checkout', '-B', repo.branch, baseRef, '--quiet', '--force'], dir);
     git(['clean', '-fd', '--quiet'], dir);
-    let buildCleanError = null;
-    try { cleanIgnoredBuildOutput(dir); } catch (e) { buildCleanError = e; } // journal first, rethrown after the acquire-reset journal line
-      return { before, baseRef, buildCleanError };
+      return { before, baseRef };
     };
     let reset;
     try {
       reset = resetToBase();
     } catch (e) {
-      // Artifact removal failures must reach claim rollback, even if Git's error resembles corruption.
-      if (e.ignoredBuildOutputCleanupFailure || !looksLikeCorruption(msgOf(e))) throw e;
+      if (!looksLikeCorruption(msgOf(e))) throw e;
       healSharedStoreFor(repo, e);
       repairUnhealthyClone();
       reset = resetToBase();
     }
-    const { before, baseRef, buildCleanError } = reset;
+    const { before, baseRef } = reset;
     // #4370 — the reset gets its own journal line NOW (a later deps/registry failure must not lose it).
     journalLaneEvent(dir, {
       action: 'acquire-reset', before, headAfter: laneHead(dir),
       reason: `acquire → ${baseRef}${flags.force ? ' (--force)' : ''}`, session: flags.session || process.env.LANE_SESSION || undefined,
       loud: before.unpushed ? true : undefined,
     });
-    if (buildCleanError) throw buildCleanError;
+    // Cleanup failures reach claim rollback after journalling, outside the corruption retry.
+    cleanIgnoredBuildOutput(dir);
     unmapLanes(repo, [chosen]); // a reset lane no longer renders its old item (#2139)
     clearForeignVerifyMarker(dir);
   }
@@ -4932,6 +4893,8 @@ async function cmdGc(repo) {
 }
 
 // ── dispatch ──────────────────────────────────────────────────────────────────────────────────────
+// Forwarding entry modules and symlinked scripts also dispatch this CLI on import.
+// Importable cleanup helpers live in lib/lane-build-output.mjs instead.
 const COMMANDS = {
   // Scheduler entrypoint: safe to invoke every tick; interval + host mutex suppress duplicate passes.
   gc: cmdGc,
@@ -4951,7 +4914,6 @@ const COMMANDS = {
   unmap: cmdUnmap,
 };
 
-if (isMain) {
 if (!cmd || cmd === 'help' || cmd === '--help' || !COMMANDS[cmd]) {
   if (cmd && cmd !== 'help' && cmd !== '--help') process.stderr.write(`unknown command: ${cmd}\n`);
   process.stderr.write(
@@ -4992,4 +4954,3 @@ if (unknownFlags.length) {
 }
 
 await COMMANDS[cmd](resolveRepo());
-}

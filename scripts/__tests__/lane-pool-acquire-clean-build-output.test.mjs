@@ -5,7 +5,14 @@ import { spawnSync, execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, chmodSync } from 'node:fs';
 import { resolve, join, dirname, delimiter } from 'node:path';
 import { tmpdir } from 'node:os';
-import { ignoredBuildOutputDirs, cleanIgnoredBuildOutput } from '../lane-pool.mjs';
+import { pathToFileURL } from 'node:url';
+import { createBuildOutputCleaner } from '../lib/lane-build-output.mjs';
+import { readGit } from '../lib/proc-read.mjs';
+import { laneGitHardeningEnv, scrubGitLocationEnv } from '../lib/lane-git-hardening.mjs';
+import { readLaneJournal } from '../lib/lane-history.mjs';
+
+const { ignoredBuildOutputDirs, cleanIgnoredBuildOutput } = createBuildOutputCleaner((args, cwd) =>
+  readGit(args, { cwd, timeout: 20_000, env: laneGitHardeningEnv(scrubGitLocationEnv(process.env)) }).trim());
 
 const eleventyConfig = (name) => `module.exports = {\n  dir: {\n    output: "${name}",\n  },\n};\n`;
 const playwrightCommand = (name) => '  command: `npx @11ty/eleventy --output=' + name + '`,\n';
@@ -44,13 +51,14 @@ afterEach(() => {
   sharedFixture.restore();
 });
 
-function runPool(command, ...args) {
-  return spawnSync('node', [SCRIPT, command, `--origin=${originDir}`, `--reference=${referenceDir}`,
+function runPoolAt(script, command, ...args) {
+  return spawnSync('node', [script, command, `--origin=${originDir}`, `--reference=${referenceDir}`,
     '--name=buildoutputtest', '--branch=main', '--no-install', ...args], {
     encoding: 'utf8', timeout: 60_000,
     env: withGhStub({ ...process.env, LANE_POOL_ROOT: poolRoot }),
   });
 }
+const runPool = (command, ...args) => runPoolAt(SCRIPT, command, ...args);
 function provision() {
   const result = runPool('provision', '--count=1');
   expect(result.status, result.stderr).toBe(0);
@@ -95,7 +103,7 @@ describe('ignored build output cleanup', () => {
   });
 
   for (const command of ['acquire', 'refresh']) {
-    it(`removes stale ignored test files on ${command}, only in that lane`, () => {
+    it.each(['direct', 'symlink', 'forwarding module'])(`removes stale ignored test files on ${command} via %s, only in that lane`, (entry) => {
       const lane = provision();
       const stale = ['_site/assets/js/__tests__/x.test.ts', '_site-visual-fixtures/y.test.ts'];
       for (const file of stale) {
@@ -103,7 +111,13 @@ describe('ignored build output cleanup', () => {
         put(referenceDir, file);
       }
       put(lane, 'node_modules/keep.js');
-      const result = runPool(command, '--lane=1');
+      let script = SCRIPT;
+      if (entry !== 'direct') {
+        script = join(base, 'lane-pool.mjs');
+        if (entry === 'symlink') symlinkSync(SCRIPT, script);
+        else writeFileSync(script, `import ${JSON.stringify(pathToFileURL(SCRIPT).href)};\n`);
+      }
+      const result = runPoolAt(script, command, '--lane=1');
       expect(result.status, result.stderr).toBe(0);
       for (const file of stale) {
         expect(existsSync(join(lane, file))).toBe(false);
@@ -168,6 +182,9 @@ describe('ignored build output cleanup', () => {
       `surfaces %s exit %i as cleanup failure on ${command} without a corruption retry`, (probe, exitCode) => {
       const lane = provision();
       put(lane, '_site/stale.test.ts');
+      const resetEvents = () => readLaneJournal(join(poolRoot, 'buildoutputtest'), { lane: 1 })
+        .filter((event) => event.action === `${command}-reset`);
+      const priorResets = resetEvents().length;
       const bin = join(base, 'bin');
       const attempts = join(base, 'cleanup-attempts');
       // Fail only this cleanup operation; every other Git operation uses the real binary.
@@ -191,6 +208,8 @@ try {
       const result = runPool(command, '--lane=1');
       expect(result.status).not.toBe(0);
       expect(result.stderr).toContain('ignored build output cleanup failed');
+      expect(resetEvents()).toHaveLength(priorResets + 1);
+      expect(resetEvents().at(-1)).toMatchObject({ headAfter: git(['rev-parse', 'HEAD'], lane) });
       expect(readFileSync(attempts, 'utf8')).toBe('attempt\n');
       expect(existsSync(join(lane, '_site/stale.test.ts'))).toBe(true);
       expect(existsSync(join(poolRoot, 'buildoutputtest', '.quarantine'))).toBe(false);
