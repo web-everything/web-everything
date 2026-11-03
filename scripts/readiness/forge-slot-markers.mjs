@@ -287,11 +287,11 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
               // receipt. So the run must also have existed for the whole death-sample margin before that sample (both
               // stamps are Forge's clock): a run that old has its state on disk and would be counted if it were active.
               if (verdict === 'idle') {
+                const started = Date.parse(telemetry.recent.find(item => item?.runId === entry.run)?.startedAtET);
+                if (!Number.isFinite(started) || sampledAt - started < DEATH_SAMPLE_MARGIN_MS) continue;
                 // The count can miss a concurrent prepared->running rename in ONE listing. Require a second, later sample,
                 // taken by THIS reaper, that still reports zero active runs before releasing.
                 const first = idleStamp(entry.file, entry.key, sampledAt);
-                const started = Date.parse(telemetry.recent.find(item => item?.runId === entry.run)?.startedAtET);
-                if (!Number.isFinite(started) || sampledAt - started < DEATH_SAMPLE_MARGIN_MS) continue;
                 if (sampledAt - first < idleConfirmMs) continue;
               }
             } else if (!evidence.complete || maybeOwnsInflight(telemetry, entry.at ?? entry.mtimeMs, diedBy)) continue;

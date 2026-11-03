@@ -187,13 +187,19 @@ describe('stale remote slot markers (perf10)', () => {
       expect(await reaper.step(tel(0, S1 + 30_000, [going(RUN_A)]))).toEqual(['slot-0.unconfirmed']);
     });
     it('retains a young run across two idle samples (run-age guard alone) and releases at the margin', async () => {
-      const young = mk();
-      await young.reaper.step(tel(0, S1, [going(RUN_A, S1 - 10_000)]));
-      expect(await young.reaper.step(tel(0, S1 + 30_000, [going(RUN_A, S1 + 30_000 - 89_999)]))).toEqual([]);
-      expect(names(young.root)).toEqual(['0']);
-      const old = mk();
-      await old.reaper.step(tel(0, S1, [going(RUN_A, S1 - 10_000)]));
-      expect(await old.reaper.step(tel(0, S1 + 30_000, [going(RUN_A, S1 + 30_000 - 90_000)]))).toEqual(['slot-0.unconfirmed']);
+      // the first sample is old enough to start confirmation; the second lists the run as younger than the margin
+      for (const [startedAgo, expected] of [[89_999, []], [90_000, ['slot-0.unconfirmed']]]) {
+        const {root, reaper} = mk();
+        await reaper.step(tel(0, S1, [going(RUN_A, S1 - 90_000)]));
+        expect(await reaper.step(tel(0, S1 + 30_000, [going(RUN_A, S1 + 30_000 - startedAgo)]))).toEqual(expected);
+        expect(names(root)).toEqual(expected.length ? [] : ['0']);
+      }
+    });
+    it('does not start confirmation from a sample whose run is younger than the margin', async () => {
+      const {root, reaper} = mk();
+      await reaper.step(tel(0, S1, [going(RUN_A, S1 - 10_000)]));
+      expect(await reaper.step(tel(0, S1 + 30_000, [going(RUN_A, S1 + 30_000 - 90_000)]))).toEqual([]);
+      expect(names(root)).toEqual(['0']);
     });
     it('ignores a sample taken before the death-sample margin and releases only on two samples after it', async () => {
       const {root, reaper} = mk();
