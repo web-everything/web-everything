@@ -94,8 +94,8 @@ describe('test-selection-measure lives in its own workflow (R523)', () => {
 
   it('has its own concurrency group, never cancels, and stays non-gating and gated by the repo var', () => {
     expect(own.concurrency.group).toMatch(/^test-selection-measure-/);
-    expect(own.concurrency['cancel-in-progress']).toBe(false);
-    expect(Object.keys(own.on).sort()).toEqual(['push', 'workflow_dispatch']);
+    expect(own.concurrency.group).not.toMatch(/^ci-/);
+    expect(Object.keys(own.on).sort()).toEqual(['merge_group', 'pull_request', 'push', 'workflow_dispatch']);
     expect(job['continue-on-error']).toBe(true);
     expect(job['timeout-minutes']).toBe(30);
     expect(job.if).toContain("vars.WE_MEASURE_TEST_SELECTION == '1'");
@@ -113,5 +113,13 @@ describe('test-selection-measure lives in its own workflow (R523)', () => {
     const i = job.steps.findIndex((s) => s.uses?.startsWith('actions/checkout@') && !s.with?.repository);
     expect(job.steps[i].with['fetch-depth']).toBe(50);
     expect(job.steps[i + 1].name).toBe('Fetch main history (blobless)');
+    expect(job.steps[i + 1].run).toBe(fetchMain);
+    expect(job.steps[i + 1]['working-directory']).toBe('web-everything');
+    expect(job.steps[i + 1].if).toBeUndefined();
+  });
+
+  it('records the false-green sample only when the shadow report exists', () => {
+    const rec = job.steps.find((s) => s.name === 'Record false-green signal (#2681)');
+    expect(rec.if).toContain("hashFiles('web-everything/vitest-full.json')");
   });
 });

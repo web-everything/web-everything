@@ -7,11 +7,14 @@ name: Test-selection measure
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main, 'lane/**']
+  merge_group:
   workflow_dispatch:
 
 concurrency:
   group: test-selection-measure-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
@@ -84,6 +87,8 @@ jobs:
 
       # Record the false-green sample: decide off the diff, compare against the shadow full run's failures, append.
       - name: Record false-green signal (#2681)
+        # A timed-out shadow run leaves no report; recording then would log a false "no escape" sample.
+        if: ${{ hashFiles('web-everything/vitest-full.json') != '' }}
         working-directory: web-everything
         run: node scripts/readiness/test-selection.mjs --measure --vitest-json=vitest-full.json
         env:
