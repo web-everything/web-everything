@@ -23,7 +23,7 @@ The advisory also owes deterministic coverage of earlier HOME assignments for gl
 
 The advisory's `codex-correctness` panel reports `prevention-outstanding`. Its HOME prevention request is filed here as A4; filing it does not assert that the disputed behavior is a confirmed defect. This card stays open until its executable acceptance criteria are delivered.
 
-Prevention receipt for the advisory posted **2026-11-03T04:01:53Z**, `codex-correctness/correctness` at `scripts/guard-bash.mjs:1975`: “Add a deterministic parameterized regression test covering earlier HOME assignments for -C, --git-dir, and --work-tree, and pass the tracked effective HOME into normalization.” A4 below owns that request, including the required reconciliation with the current `not-real` ruling. Filing this receipt does not claim that the tests or runtime change have shipped.
+Prevention receipt for the advisory posted **2026-11-03T04:01:53Z**, `codex-correctness/correctness` at `we:scripts/guard-bash.mjs:1975`: “Add a deterministic parameterized regression test covering earlier HOME assignments for -C, --git-dir, and --work-tree, and pass the tracked effective HOME into normalization.” A4 below owns that request, including the required reconciliation with the current `not-real` ruling. Filing this receipt does not claim that the tests or runtime change have shipped.
 
 | Advisory finding | Filed prevention |
 | --- | --- |
