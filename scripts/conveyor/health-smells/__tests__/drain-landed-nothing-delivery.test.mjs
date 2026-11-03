@@ -32,4 +32,24 @@ describe('drain-landed-nothing delivery (real core + planner, default shadow mod
     expect(at.length).toBeGreaterThanOrEqual(3);
     for (let i = 2; i < at.length; i++) expect(at[i] - at[i - 1]).toBeGreaterThan(at[i - 1] - at[i - 2] - 1e-9);
   });
+
+  const open3 = () => { let s = empty; for (let i = 0; i < 3; i++) s = tick(s, T0 + i * MIN).state; return s; };
+  it('a missing history probe does not close the open episode', () => {
+    const s0 = open3();
+    const stepped = stepEpisodes(s0, [{ smell, results: smell.evaluate({ drainHistory: null }, { now: T0 + 40 * MIN }) }], T0 + 40 * MIN);
+    expect(Object.keys(stepped.state.episodes).length).toBe(1);
+    expect(stepped.state.episodes[Object.keys(stepped.state.episodes)[0]].status).not.toBe('closed');
+  });
+  it('a drain that stops completing passes keeps the episode open and still reminds', () => {
+    let s = open3(); let reminded = 0;
+    const old = [{ at: T0 - 20 * MIN, considered: 4, merged: 0 }]; // unchanged history, no new passes
+    for (const m of [31, 62, 63, 64, 65, 66, 130]) {
+      const now = T0 + m * MIN;
+      const results = smell.evaluate({ drainHistory: old }, { now });
+      const st = stepEpisodes(s, [{ smell, results }], now); s = st.state;
+      reminded += planActions(st.transitions, { [smell.id]: smell }, { mode: 'shadow' }).filter((p) => p.kind === 'notify').length;
+    }
+    expect(Object.keys(s.episodes).length).toBe(1);
+    expect(reminded).toBeGreaterThanOrEqual(1);
+  });
 });

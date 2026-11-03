@@ -23,11 +23,17 @@ export function landedNothing(history, { now, windowMs = 30 * MIN, minPasses = 2
   return { passes: inWin.length, considered: Number(last.considered) || 0, reason: bits.length ? bits.slice(0, 2).join(' | ') : 'no hold reason in history; see daemon.log' };
 }
 
+/** PURE: how many history passes fall in the window (fewer than `minPasses` is UNKNOWN, never clean). */
+export function passesInWindow(history, { now, windowMs = 30 * MIN } = {}) {
+  return (history || []).filter((p) => now - p.at >= 0 && now - p.at <= windowMs).length;
+}
+
 export default {
   id: 'drain-landed-nothing',
   scope: 'host',
   cadence: 'every-tick',
   probes: ['drainHistory'],
+  missingSubjectsUnknown: true, // a missing/unreadable history is unknown, never proof the drain recovered
   openAfter: 1,
   closeAfter: 1,
   severity: 'high',
@@ -39,6 +45,8 @@ export default {
   evaluate({ drainHistory }, { now }) {
     if (!Array.isArray(drainHistory)) return [];
     const r = landedNothing(drainHistory, { now, windowMs: this.windowMs });
+    // Too few passes to judge (the drain stopped completing passes): UNKNOWN, so an open episode stays open and keeps reminding.
+    if (!r && passesInWindow(drainHistory, { now, windowMs: this.windowMs }) < 2) return [];
     return [{
       subject: 'drain',
       breach: !!r,
