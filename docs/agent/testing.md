@@ -3927,3 +3927,17 @@ Unlabelled PRs belong to `daemon:fix-daemon` with action `restore-review-label` 
 the existing label deadline, then to `operator` strictly after it. Keep the `label`
 budget key and persisted state clock when deriving that action. The audit tests cover
 the exact deadline boundary, previous owner evidence, custom budgets and resumed clocks.
+
+
+## PR sweep owner clock skew
+
+Owner progress timestamps may be at most five minutes ahead of the sweep clock.
+`resolveOwner` ignores daemon progress beyond that tolerance before selecting the
+newest signal, so a future row cannot hide valid past progress. `sessionActivity`
+uses the same bound for activity and start timestamps while retaining valid past
+evidence and bounded unknown activity. The invariant independently treats an
+out-of-bounds last-seen timestamp as `owner-stale`, even if supplied as active.
+`pr-sweep-audit.test.mjs` covers the tolerance boundary, stale/past fallback,
+future session starts, and tomorrow-dated signals across replayed ticks. Invalid
+future evidence cannot suppress the normal invariant deadline or movement alert;
+operators receive the existing overdue-alert path rather than a future ownership lease.

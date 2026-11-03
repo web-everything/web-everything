@@ -25,11 +25,12 @@ export function isRunningSession(a) {
 /**
  * 'yes' when running, alive and active within the window (a recent start counts);
  * 'unknown' when running and alive but its activity could not be read; else 'no'.
- * Future timestamps are not evidence. Unknown lasts only `unknownForMinutes` after the start.
+ * Timestamps beyond the five-minute clock-skew tolerance are not evidence. Unknown lasts only `unknownForMinutes` after the start.
  */
+const OWNER_CLOCK_SKEW_MS = 5 * 60000;
 export function sessionActivity(a, now, activeWithinMinutes = 30, unknownForMinutes = 90) {
   if (!isRunningSession(a)) return 'no';
-  const valid = (v) => { const t = ms(v); return Number.isFinite(t) && t <= now + 60000 ? t : NaN; };
+  const valid = (v) => { const t = ms(v); return Number.isFinite(t) && t <= now + OWNER_CLOCK_SKEW_MS ? t : NaN; };
   const seen = Math.max(...[a.lastActivityAt, a.startedAt].map(valid).filter(Number.isFinite));
   if (Number.isFinite(seen) && now - seen <= activeWithinMinutes * 60000) return 'yes';
   const started = valid(a.startedAt);
@@ -58,7 +59,7 @@ export function resolveOwner(pr, signals = {}) {
   const session = findFixerSession(live, pr.number) ?? live.find((a) => ['review', 'inspect'].includes(parseSessionSlug(a.name)?.kind));
   // Refusals and diagnostics never acquired ownership. Keep them out of the
   // progress clock, including legacy refusal signals carrying only `reason`.
-  const daemon = [...daemons].filter((d) => d.kind !== 'refusal' && d.kind !== 'diagnostic' && d.reason === undefined && Number.isFinite(ms(d.at)))
+  const daemon = [...daemons].filter((d) => d.kind !== 'refusal' && d.kind !== 'diagnostic' && d.reason === undefined && Number.isFinite(ms(d.at)) && ms(d.at) <= now + OWNER_CLOCK_SKEW_MS)
     .sort((a, b) => ms(b.at) - ms(a.at))[0];
   const owner = session ? `session:${session.name}` : daemon ? `daemon:${daemon.name}` : null;
   // A healthy live session is current evidence even when its creation timestamp is old.
@@ -137,7 +138,7 @@ export function evaluateInvariant(pr, owner = {}, { now, since = now, settings =
   const minutes = (Number.isFinite(configured) && configured > 0 ? configured : configured?.[budget]) ?? DEADLINE_MINUTES[budget] ?? 45;
   const deadline = new Date(stateSince(pr, since, now) + minutes * 60000).toISOString();
   const lastSignal = ms(owner.ownerLastSeenAt);
-  const stale = owner.state === 'unknown' || owner.state === 'stuck'
+  const stale = owner.state === 'unknown' || owner.state === 'stuck' || lastSignal > now + OWNER_CLOCK_SKEW_MS
     || (Number.isFinite(lastSignal) ? now - lastSignal > (settings.idleMinutes ?? 45) * 60000 : !['active', 'waiting-operator'].includes(owner.state) && now - stateSince(pr, since, now) > (settings.idleMinutes ?? 45) * 60000);
   const violation = emptyDiff ? 'empty-diff' : unreadable ? 'owner-stale' : !labels.length ? 'no-labels'
     : now > Date.parse(deadline) ? 'deadline-passed' : stale ? 'owner-stale' : null;

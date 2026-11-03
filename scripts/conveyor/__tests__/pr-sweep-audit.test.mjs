@@ -1,7 +1,7 @@
 import { it, expect } from 'vitest';
 import { AUTOMATION_LOGINS } from '../../lib/marker-authorship.mjs';
 import { buildBlockedMap } from '../pr-blocked-by.mjs';
-import { evaluateInvariant, stateFingerprint } from '../pr-sweep-core.mjs';
+import { evaluateInvariant, stateFingerprint, resolveOwner, sessionActivity } from '../pr-sweep-core.mjs';
 import { createOpenPrCommentReader } from '../pr-comments-complete.mjs';
 import { runPrSweep, resolvePrSweepSettings } from '../pr-sweep.mjs';
 const now = Date.parse('2026-11-02T16:00:00Z'), minute = 60000;
@@ -201,4 +201,55 @@ it('review-label restoration preserves configured label budgets and escalates ov
   expect(out.decisions[0]).toMatchObject({ owner: 'operator', nextAction: 'restore-review-label', violation: 'no-labels' });
   expect(evaluateInvariant(row, {}, { now, since: now, settings: { deadlineMinutes: { label: 75 } } }))
     .toMatchObject({ owner: 'daemon:fix-daemon', nextAction: 'restore-review-label', deadline: new Date(now + 75 * minute).toISOString() });
+});
+
+
+it.each([5 * minute + 1, 24 * 60 * minute])('ignores daemon progress beyond five-minute skew: %s ms', offset => {
+  const future = { name: 'review', kind: 'progress', at: now + offset };
+  expect(resolveOwner(pr, { now, daemons: [future] })).toMatchObject({ state: 'none', owner: null, ownerLastSeenAt: null });
+  const past = { name: 'fix-dispatch-daemon', kind: 'progress', at: now - 100 * minute };
+  expect(resolveOwner(pr, { now, daemons: [past, future] }))
+    .toMatchObject({ state: 'stuck', owner: 'daemon:fix-dispatch-daemon', ownerLastSeenAt: new Date(past.at).toISOString() });
+  expect(evaluateInvariant(pr, { state: 'active', owner: 'daemon:review', ownerLastSeenAt: new Date(future.at).toISOString() }, { now, since: now }))
+    .toMatchObject({ violation: 'owner-stale' });
+});
+it.each([-minute, 0, 5 * minute])('retains ordinary progress and tolerated clock skew: %s ms', offset => {
+  const at = now + offset;
+  const owner = resolveOwner(pr, { now, daemons: [{ name: 'review', at }] });
+  expect(owner).toMatchObject({ state: 'active', owner: 'daemon:review' });
+  expect(evaluateInvariant(pr, owner, { now, since: now }).violation).toBeNull();
+  expect(sessionActivity({ state: 'working', pidAlive: true, lastActivityAt: at }, now)).toBe('yes');
+});
+it('future session activity/start cannot grant ownership but valid past evidence still can', () => {
+  const session = { name: 'fix-12', state: 'working', pidAlive: true, lastActivityAt: now + 24 * 60 * minute, startedAt: now + 24 * 60 * minute };
+  expect(sessionActivity(session, now)).toBe('no');
+  expect(sessionActivity({ ...session, activityUnknown: true }, now)).toBe('no');
+  expect(resolveOwner(pr, { now, sessions: [session] })).toMatchObject({ state: 'none', owner: null });
+  expect(sessionActivity({ ...session, startedAt: now - minute }, now)).toBe('yes');
+  expect(sessionActivity({ ...session, lastActivityAt: now - minute }, now)).toBe('yes');
+  expect(sessionActivity({ ...session, startedAt: now - 60 * minute, activityUnknown: true }, now)).toBe('unknown');
+});
+it.each(['daemon', 'session'])('tomorrow-dated %s evidence cannot suppress invariant or movement alerts', async kind => {
+  let previous = {};
+  const future = now + 24 * 60 * minute;
+  const signals = kind === 'daemon' ? { daemons: [{ name: 'review', at: future }] }
+    : { sessions: [{ name: 'fix-12', state: 'working', pidAlive: true, startedAt: future, lastActivityAt: future }] };
+  const tick = async minutes => {
+    const out = await run({ now: now + minutes * minute, readPrevious: () => previous, readSignals: () => ({ [key]: signals }) });
+    previous = out.nextState;
+    expect(out.errors).toEqual([]);
+    expect(out.idle[0]).toMatchObject({ state: 'none', owner: null });
+    return out;
+  };
+  await tick(0);
+  expect((await tick(46)).decisions[0].violation).toBe('owner-stale');
+  const overdue = await tick(91);
+  expect(overdue.decisions[0].violation).toBe('deadline-passed');
+  expect(overdue.alerts).toContainEqual(expect.objectContaining({ key, kind: 'pr-stuck' }));
+});
+
+
+it.each(['active', 'waiting-operator'])('invariant rejects a future last-seen timestamp even for a supplied %s owner', state => {
+  expect(evaluateInvariant(pr, { state, owner: 'daemon:review', ownerLastSeenAt: now + 24 * 60 * minute }, { now, since: now }))
+    .toMatchObject({ violation: 'owner-stale' });
 });
