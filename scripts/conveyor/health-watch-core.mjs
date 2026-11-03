@@ -570,6 +570,7 @@ export function stepEpisodes(state, evaluations, now, { config = DEFAULT_HEALTH_
             key, smell: smell.id, subject: r.subject, status: 'pending', severity: smell.severity ?? 'medium',
             action: smell.action ?? 'alert', breachStreak: 0, cleanStreak: 0, firstBreachAt: now,
             openedAt: null, lastBreachAt: null, id: null, tracked: null, remindedAt: null, samples: 0,
+            ...(smell.repeatReminders === true ? { repeatReminders: true, reminderAfterMs: Number.isFinite(smell.reminderAfterMs) ? smell.reminderAfterMs : undefined } : {}),
           };
         }
         // A clean observation breaks the duration clock even when close hysteresis keeps the episode.
@@ -632,10 +633,16 @@ export function stepEpisodes(state, evaluations, now, { config = DEFAULT_HEALTH_
       emit('silence-expired', key);
     }
   }
-  // High-severity reminder: once, `reminderAfterMs` after opening, if still untracked.
+  // High-severity reminder: once, `reminderAfterMs` after opening, if still untracked. A smell that sets
+  // `repeatReminders` keeps reminding while the episode stays open, the gap doubling each time (cap 24h).
   for (const [key, ep] of Object.entries(next.episodes)) {
-    if (ep.status === 'pending' || ep.tracked || ep.severity !== 'high' || ep.remindedAt) continue;
-    if (ep.openedAt != null && now - ep.openedAt >= cfg.reminderAfterMs) { ep.remindedAt = now; emit('reminder', key); }
+    if (ep.status === 'pending' || ep.tracked || ep.severity !== 'high') continue;
+    const repeat = ep.repeatReminders === true;
+    if (ep.remindedAt && !repeat) continue;
+    const base = Number.isFinite(ep.reminderAfterMs) ? ep.reminderAfterMs : cfg.reminderAfterMs;
+    const gap = repeat ? Math.min(base * 2 ** (ep.reminderCount ?? 0), 24 * HOUR) : base;
+    const since = repeat ? (ep.remindedAt ?? ep.openedAt) : ep.openedAt;
+    if (since != null && now - since >= gap) { ep.remindedAt = now; if (repeat) ep.reminderCount = (ep.reminderCount ?? 0) + 1; emit('reminder', key); }
   }
   next.history = next.history.slice(-cfg.historyKeep);
   return { state: next, transitions };

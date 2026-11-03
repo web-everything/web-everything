@@ -3,7 +3,7 @@
  * own `history.jsonl` passes (via the `drainHistory` probe): a stall is every pass in the window considering PRs
  * and merging none, with the window actually covered by passes (a quiet drain with nothing queued is not a stall).
  * 2026-11-03: a freeze-branch read timeout held every PR for hours as "main is red [manual]" and nothing alerted.
- * Repeats come from the health-watch core: `reminderAfterMs` re-alerts and `escalateAfterMs` escalates, so the
+ * Repeats come from the health-watch core: `repeatReminders` re-notifies with a doubling gap from `reminderAfterMs`, so the
  * alert backs off instead of going quiet. The hold reason from the latest pass rides in the summary.
  */
 import { HOUR } from '../health-watch-core.mjs';
@@ -33,8 +33,8 @@ export default {
   severity: 'high',
   action: 'alert',
   windowMs: 30 * MIN,
+  repeatReminders: true, // the core re-notifies while the stall persists, the gap doubling from reminderAfterMs (cap 24h)
   reminderAfterMs: HOUR,
-  escalateAfterMs: 4 * HOUR,
   recommendationHint: 'The drain has had queued PRs for 30+ minutes and landed none — read the hold reason (freeze-unreadable vs a real red main) in the drain log.',
   evaluate({ drainHistory }, { now }) {
     if (!Array.isArray(drainHistory)) return [];

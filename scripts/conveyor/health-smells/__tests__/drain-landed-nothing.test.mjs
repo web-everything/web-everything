@@ -18,9 +18,7 @@ describe('drain-landed-nothing', () => {
     expect(landedNothing([pass(60), pass(20, { considered: 0 }), pass(3, { considered: 0 })], { now })).toBeNull();
     expect(landedNothing([pass(3)], { now })).toBeNull();
   });
-  it('is a high-severity alert that reminds and escalates (backoff)', () => {
-    expect(smell).toMatchObject({ severity: 'high', action: 'alert' });
-    expect(smell.reminderAfterMs).toBeGreaterThan(0);
-    expect(smell.escalateAfterMs).toBeGreaterThan(smell.reminderAfterMs);
+  it('is a high-severity alert that repeats reminders (delivery proven in drain-landed-nothing-delivery.test.mjs)', () => {
+    expect(smell).toMatchObject({ severity: 'high', action: 'alert', repeatReminders: true });
   });
 });

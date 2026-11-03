@@ -1,0 +1,35 @@
+import { describe, it, expect } from 'vitest';
+import smell from '../drain-landed-nothing.mjs';
+import { stepEpisodes, planActions, DEFAULT_HEALTH_CONFIG } from '../../health-watch-core.mjs';
+import { NOTIFY_EVEN_IN_SHADOW } from '../../health-smells-notify-list.mjs';
+
+const MIN = 60000;
+const T0 = Date.parse('2026-11-03T12:00:00Z');
+const stalled = (now) => [1, 2, 3].map((i) => ({ at: now - i * 12 * MIN, considered: 4, merged: 0, skippedPrs: [], deferredDetail: [] }));
+const tick = (state, now) => {
+  const results = smell.evaluate({ drainHistory: stalled(now) }, { now });
+  const stepped = stepEpisodes(state, [{ smell, results }], now);
+  const plan = planActions(stepped.transitions, { [smell.id]: smell }, { mode: 'shadow' });
+  return { state: stepped.state, plan: plan.filter((p) => p.kind === 'notify') };
+};
+const empty = { episodes: {}, opens: {}, history: [], silences: [] };
+
+describe('drain-landed-nothing delivery (real core + planner, default shadow mode)', () => {
+  it('is on the notify-even-in-shadow list', () => {
+    expect(NOTIFY_EVEN_IN_SHADOW.has('drain-landed-nothing')).toBe(true);
+  });
+  it('notifies unsuppressed when the episode opens, in shadow mode', () => {
+    let s = empty; let notified = [];
+    for (let i = 0; i < 3; i++) { const r = tick(s, T0 + i * MIN); s = r.state; notified = notified.concat(r.plan); }
+    expect(notified.length).toBe(1);
+    expect(notified[0].suppressed).toBeNull();
+  });
+  it('keeps reminding with backoff while the stall persists', () => {
+    let s = empty; const at = [];
+    for (let i = 0; i < 3; i++) s = tick(s, T0 + i * MIN).state;
+    const hours = [1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 20];
+    for (const h of hours) { const now = T0 + h * 60 * MIN; const r = tick(s, now); s = r.state; if (r.plan.length) { expect(r.plan[0].suppressed).toBeNull(); at.push(h); } }
+    expect(at.length).toBeGreaterThanOrEqual(3);
+    for (let i = 2; i < at.length; i++) expect(at[i] - at[i - 1]).toBeGreaterThan(at[i - 1] - at[i - 2] - 1e-9);
+  });
+});
