@@ -293,8 +293,9 @@ describe('probeDrainHistory', () => {
     writeFileSync(path, toJsonl(history(9)));
     const out = probeDrainHistory({ path, nowMs: NOW });
     expect(out.length).toBeGreaterThan(0);
-    expect(Math.min(...out.map((p) => p.at))).toBeGreaterThanOrEqual(NOW - 7 * HOUR);
-    expect(Object.keys(out[0]).sort()).toEqual(['at', 'considered', 'deferred', 'exit', 'failed', 'merged', 'ms']);
+    // trimmed to the window, plus at most ONE older pass (the last pass, which `drain-landed-nothing` needs after a stoppage)
+    expect(out.filter((p) => p.at < NOW - 7 * HOUR).length).toBeLessThanOrEqual(1);
+    expect(Object.keys(out[out.length - 1]).sort()).toEqual(['at', 'considered', 'deferred', 'deferredDetail', 'exit', 'failed', 'merged', 'ms', 'skippedPrs', 'valid']);
   });
 
   it('no file → null (no drain on this host), not an empty history', () => {
