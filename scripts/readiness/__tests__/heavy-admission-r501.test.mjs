@@ -1,7 +1,7 @@
 // @vitest-environment node
 /** R501: needs-git local routing and the remote-success record that forgeShare reads. */
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { readdirSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { main, decideRemote, runWithRemoteDecision, resolveAdmissionPolicy } from '../heavy-admission.mjs';
 
@@ -61,10 +61,7 @@ describe('R501 remote success record', () => {
       WE_VERIFY_REMOTE_REPORT: join(root, 'report.jsonl') })) vi.stubEnv(k, v);
     const remoteExec = vi.fn(async () => ({ mode: 'remote', code: 0, receiptId: 'rcpt-1' }));
     await expect(main(['run', `--repo=${root}`, '--', 'npm', 'run', 'test:unit', '--', 'plain.test.mjs'], { remoteExec, readTelemetry: healthy })).rejects.toBe(exited);
-    const found = [];
-    const walk = d => { for (const e of readdirSync(d, { withFileTypes: true })) { const p = join(d, e.name); if (e.isDirectory()) walk(p); else if (e.name === 'remote-runs.jsonl') found.push(p); } };
-    walk(root);
-    expect(found).toHaveLength(1);
-    expect(JSON.parse(readFileSync(found[0], 'utf8').trim())).toMatchObject({ receiptId: 'rcpt-1', kind: expect.any(String) });
+    const file = join(pool, '.admission', 'heavy', 'remote-runs.jsonl');
+    expect(JSON.parse(readFileSync(file, 'utf8').trim())).toMatchObject({ receiptId: 'rcpt-1', kind: expect.any(String) });
   });
 });
