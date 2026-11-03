@@ -573,7 +573,8 @@ describe('verify-lane remote phase spawn', () => {
     ...[false, true].map(phaseAdmission => ['remote', 0, 'remote', false,
       "npx vitest run 'one.test.mjs'",
       ['run', 'test:unit', '--', 'one.test.mjs'], phaseAdmission]),
-    ['remote', 0, 'local', false, 'npm run check:standards', undefined, undefined, 75],
+    // Admission deferral has no failing-test output; exit 75 with failures is pinned below.
+    ['remote', 0, 'local', false, 'npm run check:standards', undefined, undefined, 75, 0, undefined, '', false],
     ['remote', 0, 'local', false, 'npm run test:unit', undefined, undefined, 1],
     ['local', 1, 'local', true, 'npm run test:unit', undefined, undefined, 0, 1],
     ...[false, true].flatMap(phaseAdmission => [0, 1].map(localExit => ['remote', localExit, 'local', false,
@@ -582,7 +583,7 @@ describe('verify-lane remote phase spawn', () => {
     ['remote', 1, 'local', false, "npx vitest run 'one.test.mjs'", ['run', 'test:unit', '--', 'one.test.mjs'], true, 1, 1, 0],
     ...[false, true].map(phaseAdmission => ['remote', 1, 'local', false, "npx vitest run 'one.test.mjs'", ['run', 'test:unit', '--', 'one.test.mjs'], phaseAdmission, 1, 1, 1]),
   ];
-  function verifyRemotePhase(mode, code, location, held, gateCommand, expectedArgs, phaseAdmission, remoteExit = 0, localExit = 0, retryExit, localBehavior = '') {
+  function verifyRemotePhase(mode, code, location, held, gateCommand, expectedArgs, phaseAdmission, remoteExit = 0, localExit = 0, retryExit, localBehavior = '', remoteFailure = true) {
     const root = mkdtempSync(join(tmpdir(), 'verify-routing-'));
     try {
       execFileSync('git', ['init', '-q'], { cwd: root });
@@ -592,7 +593,8 @@ describe('verify-lane remote phase spawn', () => {
       const routing = pathToFileURL(resolve(repo, 'scripts/lib/verify-remote-routing.mjs')).href;
       const gate = pathToFileURL(resolve(repo, 'scripts/lib/verify-lane-gate.mjs')).href;
       const laterPhases = phaseAdmission !== undefined;
-      const confirmed = mode === 'remote' && remoteExit !== 0 && remoteExit !== 124;
+      const confirmed = mode === 'remote' && remoteExit !== 0 && remoteExit !== 124
+        && !(remoteExit === 75 && remoteFailure);
       // A red that survives the isolated retry is compared with origin/main; that unheld spawn needs its own slot.
       // Standards stays green there, since only a Vitest-only red is compared with the base.
       const baseCompared = retryExit !== undefined && retryExit !== 0;
@@ -646,7 +648,7 @@ if(mode==='local-fallback') {
 }
 if(['remote','local-fallback'].includes(mode) && !held)fs.appendFileSync(process.env.WE_VERIFY_REMOTE_REPORT,JSON.stringify({location:mode,receiptId:'run-123456',exitCode})+'\\n');
 if(mode==='unreadable')fs.writeFileSync(process.env.WE_VERIFY_REMOTE_REPORT,'{');
-if(exitCode) {
+if(exitCode && (held || mode !== 'remote' || process.env.ROUTING_REMOTE_FAILURE === '1')) {
   const local=held || mode==='local-fallback';
   const file=local ? (process.env.ROUTING_RETRY_EXIT ? 'local.test.mjs' : 'one.test.mjs') : 'remote.test.mjs';
   fs.writeSync(2,' FAIL  '+file+' > '+(local?'local':'remote')+' failure\\nAssertionError: fixture failure\\n');
@@ -684,6 +686,7 @@ process.exit(again?0:1);`);
         cwd: root, encoding: 'utf8', timeout: 30000,
         env: { ...process.env, PATH: bin + ':' + process.env.PATH, ROUTING_MODE: mode, ROUTING_EVENTS: events,
           ROUTING_REMOTE_EXIT: String(remoteExit), ROUTING_LOCAL_EXIT: String(localExit),
+          ROUTING_REMOTE_FAILURE: remoteFailure ? '1' : '0',
           ROUTING_LOCAL_DELAY: confirmed && !laterPhases ? '1' : '0',
           ROUTING_RETRY_EXIT: retryExit === undefined ? '' : String(retryExit), WE_VERIFY_ISOLATED_RETRY: 'untouched',
           ROUTING_STANDARDS_EXIT: baseCompared || (mode === 'local-fallback' && retryExit !== undefined) ? '0' : '',
@@ -780,8 +783,14 @@ process.exit(again?0:1);`);
         expect(marker.exitCode).toBe(124);
       }
       if (code !== 0 && !infrastructureReason) {
-        expect(marker.failureDetails.summary).toContain('local failure');
-        expect(marker.failureDetails.summary).not.toContain('remote failure');
+        const retainedRemoteFailure = mode === 'remote' && !confirmed;
+        expect(marker.failureDetails.summary).toContain(retainedRemoteFailure ? 'remote failure' : 'local failure');
+        expect(marker.failureDetails.summary).not.toContain(retainedRemoteFailure ? 'local failure' : 'remote failure');
+        if (retainedRemoteFailure) {
+          expect(marker.exitCode).toBe(75);
+          expect(marker.failureDetails.tests).toEqual([{ file: 'remote.test.mjs', name: 'remote failure' }]);
+          expect(marker).not.toHaveProperty('infrastructure');
+        }
       }
       if (baseCompared) {
         const baseSpawn = observed.findLastIndex(e => e.event === 'spawn');
@@ -795,6 +804,12 @@ process.exit(again?0:1);`);
     } finally { rmSync(root, { recursive:true,force:true }); }
   }
   it.each(cases)('%s phase (exit %i, %s, held=%s): %s preserves admission and terminal evidence (argv=%j, phaseAdmission=%s, remoteExit=%s, localExit=%s, retryExit=%s)', verifyRemotePhase);
+  it.each(['npm run test:unit', 'npm run check:standards'])('remote exit 75 with recorded failures stays red without local confirmation: %s', command => {
+    verifyRemotePhase('remote', 75, 'remote', false, command, undefined, undefined, 75);
+  });
+  it('remote test admission deferral without failures can be confirmed locally', () => {
+    verifyRemotePhase('remote', 0, 'local', false, 'npm run test:unit', undefined, undefined, 75, 0, undefined, '', false);
+  });
   it('local confirmation holds admission and clears inherited Forge dispatch after a remote red', () => {
     verifyRemotePhase('remote', 0, 'local', false, 'npm run test:unit', undefined, undefined, 1);
   });
