@@ -3,6 +3,7 @@ kind: task
 status: open
 dateOpened: "2026-11-02"
 scope: ["we:docs/agent/reviewer-expectations.md"]
+scopeRationale: "A2 cites we:scripts/__tests__/guard-bash.test.mjs only as evidence for removed PR-body claims; this card does not change that file."
 tags: [prevention, review]
 ---
 
