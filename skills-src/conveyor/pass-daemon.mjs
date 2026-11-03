@@ -67,6 +67,7 @@ import { withSelfSync, resolvePocSyncBranch, DAEMON_SELF_SYNC_BRANCH_ENV } from 
 import { StringDecoder } from 'node:string_decoder';
 import { notifyDesktopChecked } from '../../scripts/conveyor/branch-sync.mjs';
 import { installDaemonLog, stripLogTimestamp } from './daemon-log.mjs';
+import { setProcessTitle } from '../../scripts/lib/process-title.mjs';
 
 const CLOSE_GRACE_MS = 5000;
 /** The most output a relayed child stream may buffer without a newline before it is flushed as a line of its own. */
@@ -576,6 +577,7 @@ export function spawnPassOnce(entry, ports = {}) {
 }
 
 async function main(argv) {
+  setProcessTitle('pass-daemon', (argv || []).find((a) => typeof a === 'string' && !a.startsWith('-')));
   installDaemonLog(); // item 68a: ISO-stamp every log line (WE_DAEMON_LOG_TIMESTAMPS=0 turns it off)
   const flags = {};
   for (const a of argv) {

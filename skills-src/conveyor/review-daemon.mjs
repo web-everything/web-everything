@@ -138,6 +138,7 @@ import { warmReviewFacts, readReviewCiGateFactsFirst, withFactsLabels } from '..
 import { createGhProvider } from '../../scripts/lib/review-label-provider.mjs';
 import { runPrepReviewTick, resolvePrepReviewMode } from '../../scripts/conveyor/prep-review.mjs';
 import { makePrepReviewDeps } from '../../scripts/conveyor/prep-review-io.mjs';
+import { setProcessTitle } from '../../scripts/lib/process-title.mjs';
 
 /** This daemon's own lease key — distinct from the Dispatcher's default sentinel, #3870's Fix-dispatch key,
  *  and any future daemon's own key (#3877). */
@@ -1801,6 +1802,7 @@ export function buildCliDaemonEffects({
 }
 
 async function main() {
+  setProcessTitle('review-daemon');
   installDaemonLog(); // item 68a: ISO-stamp every log line (WE_DAEMON_LOG_TIMESTAMPS=0 turns it off)
   const intervalMs = resolveReviewIntervalMs();
   const owner = makeOwner('review-daemon');

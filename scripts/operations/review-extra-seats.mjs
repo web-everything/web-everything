@@ -87,6 +87,7 @@ import { parseDelegationMarker } from '../lib/delegation-marker.mjs';
 import { logDelegationTrial } from '../conveyor/log-delegation-trial.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { RED_TEAM_UNVERIFIABLE_TAG, readRedTeamProbes, RED_TEAM_COMMENT_MARKER, RED_TEAM_CONFIRMED_TAG, RED_TEAM_UNCONFIRMED_TAG, redTeamMarker, redTeamForHead } from '../lib/red-team-gate.mjs';
+import { setProcessTitle } from '../lib/process-title.mjs';
 
 const THIS_FILE = fileURLToPath(import.meta.url);
 const REPO_ROOT = resolve(dirname(THIS_FILE), '..', '..');
@@ -2189,4 +2190,4 @@ export function runExtraSeatsCli(argv = process.argv.slice(2), { redTeamIo } = {
 }
 
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(THIS_FILE);
-if (IS_CLI) runExtraSeatsCli();
+if (IS_CLI) { setProcessTitle('review-extra-seats'); runExtraSeatsCli(); }

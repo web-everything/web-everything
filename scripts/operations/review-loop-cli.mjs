@@ -96,6 +96,7 @@ import { READ_SINK_ENV, withReadSink } from '../lib/review-speculative-red-team.
 // never committed, never pushed). `fileItemForPreventionViaLandingJob` (below) routes through the SAME shared
 // detached-landing-job seam #4317's caller already uses, extracted to this leaf for exactly this reuse.
 import { spawnPreventionLandingJob } from '../lib/prevention-landing-job.mjs';
+import { setProcessTitle } from '../lib/process-title.mjs';
 
 /** The operation this driver always runs. Not a flag: this file has exactly one job. */
 export const REVIEW_LOOP_OP = 'review-pr';
@@ -1094,6 +1095,7 @@ export async function runReviewLoopOnce({
 
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
 if (IS_CLI) {
+  setProcessTitle('review-loop');
   const argv = process.argv.slice(2);
   // `argv` is known before the declaration `resolveOperation` binds sinks to — see `hasJsonFlag`'s doc
   // (`we:scripts/operations/cli-adapter.mjs`). A `--json` invocation must not have this file's own notice
