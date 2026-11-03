@@ -230,6 +230,8 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
               || (Array.isArray(report?.testResults) && report.testResults.some(r => r?.status === 'failed'
                 || (Array.isArray(r?.assertionResults) && r.assertionResults.some(a => a?.status === 'failed'))));
             observedFailure ||= reportFailed;
+            // A complete inventory cannot pass this attempt's failure evidence.
+            if (reportFailed && inventory === 'PASS') inventory = 'FAIL';
             if (reportFailed) {
               // Re-emit bounded identities outside the JSON/prefixed child output so
               // verify-lane's failure collector retains them even if a retry dies.
