@@ -12,7 +12,7 @@ const MIN = 60 * 1000;
 
 /** PURE: the stall over the last `windowMs`, or null when the drain landed something / had nothing queued / is not covered. */
 /** A pass that proves the drain recovered: it merged something, or it cleanly (exit 0, nothing failed) found nothing queued. */
-const isRecovery = (p) => (Number(p.merged) || 0) > 0 || ((Number(p.considered) || 0) === 0 && p.exit === 0 && !(Number(p.failed) > 0));
+const isRecovery = (p) => (Number(p.merged) || 0) > 0 || ((Number(p.considered) || 0) === 0 && p.exit === 0 && !(Number(p.failed) > 0) && !(Number(p.failedRepos) > 0));
 /** A pass that had queued PRs and landed none. Failed zero-count passes are neither this nor recovery: they are ignored. */
 const isStalled = (p) => (Number(p.considered) || 0) > 0 && (Number(p.merged) || 0) === 0;
 
@@ -37,7 +37,7 @@ export function passesInWindow(rawHistory, { now, windowMs = 30 * MIN } = {}) {
   return (rawHistory || []).filter((p) => p.valid !== false && now - p.at >= 0 && now - p.at <= windowMs).length;
 }
 
-/** PURE: recovery evidence in the window — a valid pass that merged something, or a CLEAN (exit 0, nothing failed) pass that found nothing queued; a failed or partial pass with zero candidates proves nothing. Anything else is UNKNOWN. */
+/** PURE: recovery evidence in the window — a valid pass that merged something, or a CLEAN (exit 0, nothing failed, no repo listing failed) pass that found nothing queued; a failed or partial pass with zero candidates proves nothing. Anything else is UNKNOWN. */
 export function recovered(rawHistory, { now, windowMs = 30 * MIN } = {}) {
   return (rawHistory || []).some((p) => p.valid !== false && now - p.at >= 0 && now - p.at <= windowMs && isRecovery(p));
 }

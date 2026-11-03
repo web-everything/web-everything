@@ -87,7 +87,9 @@ describe('drain-landed-nothing delivery (real core + planner, default shadow mod
     expect(smell.evaluate({ drainHistory: h }, { now })).toEqual([]);
     const ok = smell.evaluate({ drainHistory: [{ at: now - 20 * MIN, considered: 4, merged: 0 }, { at: now - 1 * MIN, considered: 0, merged: 0, exit: 0, failed: 0 }] }, { now });
     expect(ok[0].breach).toBe(false);
-    expect(s0).toBeTruthy();
+    const st = stepEpisodes(s0, [{ smell, results: smell.evaluate({ drainHistory: h }, { now }) }], now);
+    expect(Object.keys(st.state.episodes).length).toBe(1);
+    expect(st.transitions.some((t) => t.type === 'closed')).toBe(false);
   });
   it('failed zero-candidate passes after queued work open an alert from scratch', () => {
     const now = T0 + 60 * MIN;
@@ -106,5 +108,10 @@ describe('drain-landed-nothing delivery (real core + planner, default shadow mod
     const now = T0 + 120 * MIN;
     const h = [{ at: now - 120 * MIN, considered: 0, merged: 0, exit: 0, failed: 0 }, { at: now - 2 * MIN, considered: 4, merged: 0 }, { at: now - 1 * MIN, considered: 4, merged: 0 }];
     expect(smell.evaluate({ drainHistory: h }, { now })).toEqual([]);
+  });
+  it('a clean-looking pass with failed repo listings is not recovery', () => {
+    const now = T0 + 60 * MIN;
+    const h = [{ at: now - 45 * MIN, considered: 4, merged: 0 }, { at: now - 1 * MIN, considered: 0, merged: 0, exit: 0, failed: 0, failedRepos: 1 }];
+    expect(smell.evaluate({ drainHistory: h }, { now })[0].breach).toBe(true);
   });
 });
