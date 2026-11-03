@@ -788,7 +788,7 @@ export async function runWithRemoteDecision({
     : env ? resolveCeilingMs(env) : DEFAULT_ADMISSION_CEILING_MS,
   loadPerCore = () => loadavg()[0] / cpus().length,
   remoteExec, remoteClientOverride = null, onDecision,
-  log = (line) => process.stderr.write(line),
+  log = (line) => process.stderr.write(line), appendEvent = appendClientOverrideEvent,
   // Under test the real host's load must not change routing; tests inject this seam.
   hostOverloaded = () => !isUnderTest(env ?? {}) && hostOverloadedForRemote(env),
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -830,7 +830,7 @@ export async function runWithRemoteDecision({
   const stuck = policy.settings.remote;
   const markerReaper = createMarkerReaper({root:remoteRoot,host,clock,log,
     stuckMinSlots:stuck.stuckMinSlots,stuckAgeMs:stuck.stuckAgeMs,signalEveryMs:stuck.stuckSignalEveryMs,
-    signal:({kind,detail})=>{void appendClientOverrideEvent({kind:'forge-slots-stuck',daemon:'heavy-admission',detail:{reason:kind,host,...detail}});}});
+    signal:({kind,detail})=>{void appendEvent({kind:'forge-slots-stuck',daemon:'heavy-admission',detail:{reason:kind,host,...detail}});}});
   let overloadWaitLogged = false;
   try {
     for (;;) {

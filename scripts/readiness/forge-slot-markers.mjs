@@ -243,7 +243,6 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
         try { ({mtimeMs, ino} = fs.statSync(file)); } catch { continue; }
         const marker = readMarker(file), index = Number(m[1]);
         if (marker.unreadable) continue;
-        if (now - mtimeMs >= stuckAgeMs) held.push({name, run: marker.run});
         const key = `${name}:${ino}:${mtimeMs}`; // a replacement marker never inherits a predecessor's death stamp
         if (marker.legacy) {
           // Neither a missing/dead local lock holder nor this host's telemetry proves an unbound job stopped.
@@ -253,13 +252,19 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
         if (marker.host !== host || host === undefined) continue;
         if (!ownerGone(root, index, file, liveness, selfPid)) { forget(file, key); continue; }
         stampFor(file, key);
+        // Stuck means a DEAD owner whose slot is still kept; a live owner's long job is healthy, not stuck.
+        if (now - mtimeMs >= stuckAgeMs) held.push({name, run: marker.run});
         dead.push({name, key, file, mtimeMs, ino, index, run: marker.run, at: marker.at, owner: marker.owner});
       }
       if (dead.length) {
         let telemetry = null;
         try { telemetry = await getTelemetry(); } catch { /* probe failed: unknown, fail closed */ }
         const sampledAt = Date.parse(telemetry?.sampledAtET), evidence = recentEvidence(telemetry);
-        if (!Number.isFinite(sampledAt) || !evidence) raise('probe-unknown', {slots: dead.map(d => d.name)}, now);
+        if (!Number.isFinite(sampledAt) || !evidence) {
+          // An unknown or failed probe interrupts any idle confirmation: the next idle sample starts a fresh window.
+          for (const entry of dead) { try { unlinkSync(idleFile(entry.file)); } catch { /* absent */ } }
+          raise('probe-unknown', {slots: dead.map(d => d.name)}, now);
+        }
         if (Number.isFinite(sampledAt) && evidence) {
           dead.sort((a, b) => a.mtimeMs - b.mtimeMs);
           for (const entry of dead) {

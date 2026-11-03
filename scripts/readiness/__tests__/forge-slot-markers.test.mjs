@@ -1,6 +1,6 @@
 // @vitest-environment node
 import {describe, it, expect, afterEach} from 'vitest';
-import {readdirSync, readFileSync, mkdirSync, renameSync, mkdtempSync, writeFileSync, existsSync, rmSync, utimesSync} from 'node:fs';
+import {readdirSync, readFileSync, mkdirSync, renameSync, mkdtempSync, writeFileSync, existsSync, rmSync, utimesSync, statSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {lockDirFor} from '../file-locks.mjs';
@@ -172,15 +172,111 @@ describe('stale remote slot markers (perf10)', () => {
       expect((await reaper.step(tel(0, NOW + 160_000, [going(RUN_A), going(RUN_B)]))).sort()).toEqual(['slot-0.unconfirmed', 'slot-1.unconfirmed']);
     });
   });
+  describe('R475 release predicates (boundary, one guard at a time)', () => {
+    const S1 = NOW + 120_000;
+    const mk = () => { const root = setup({0: {pid: 111, run: RUN_A}}); return {root, reaper: createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])})}; };
+    const seedIdle = (root, sampledAt) => {
+      const file = join(root, 'slot-0.unconfirmed'), st = statSync(file);
+      writeFileSync(file + '.idle', JSON.stringify({key: `slot-0.unconfirmed:${st.ino}:${st.mtimeMs}`, sampledAt}));
+    };
+    it('retains an idle slot before the confirmation interval expires and releases at it', async () => {
+      const {root, reaper} = mk();
+      expect(await reaper.step(tel(0, S1, [going(RUN_A)]))).toEqual([]);
+      expect(await reaper.step(tel(0, S1 + 29_999, [going(RUN_A)]))).toEqual([]);
+      expect(names(root)).toEqual(['0']);
+      expect(await reaper.step(tel(0, S1 + 30_000, [going(RUN_A)]))).toEqual(['slot-0.unconfirmed']);
+    });
+    it('retains a young run across two idle samples (run-age guard alone) and releases at the margin', async () => {
+      const young = mk();
+      seedIdle(young.root, S1 - 60_000);
+      expect(await young.reaper.step(tel(0, S1, [going(RUN_A, S1 - 89_999)]))).toEqual([]);
+      expect(names(young.root)).toEqual(['0']);
+      const old = mk();
+      seedIdle(old.root, S1 - 60_000);
+      expect(await old.reaper.step(tel(0, S1, [going(RUN_A, S1 - 90_000)]))).toEqual(['slot-0.unconfirmed']);
+    });
+    it('retains the slot until the death-sample margin has passed, releasing at it', async () => {
+      const {root, reaper} = mk();
+      seedIdle(root, NOW - 60_000);
+      const recent = [going(RUN_A, NOW - 700_000)];
+      // first-seen-dead stamp is taken at clock() = NOW; a sample 1 ms short of the margin cannot speak for it
+      expect(await reaper.step(tel(0, NOW + 89_999, recent))).toEqual([]);
+      expect(await reaper.step(tel(0, NOW + 90_000, recent))).toEqual(['slot-0.unconfirmed']);
+    });
+    it('resumes idle confirmation after recreating the reaper', async () => {
+      const {root, reaper} = mk();
+      expect(await reaper.step(tel(0, S1, [going(RUN_A)]))).toEqual([]);
+      const second = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
+      expect(await second.step(tel(0, S1 + 29_999, [going(RUN_A)]))).toEqual([]);
+      expect(await second.step(tel(0, S1 + 30_000, [going(RUN_A)]))).toEqual(['slot-0.unconfirmed']);
+    });
+    it('rejects a predecessor marker idle timestamp after recreating the reaper', async () => {
+      const {root, reaper} = mk();
+      await reaper.step(tel(0, S1, [going(RUN_A)]));
+      const file = join(root, 'slot-0.unconfirmed');
+      rmSync(file); rmSync(file + '.dead', {force: true});
+      writeFileSync(file, markerContent({owner: 'o2', pid: 111, nowMs: NOW - 500_000, host: 'forge', run: RUN_A}));
+      const t = (NOW - 500_000) / 1000; utimesSync(file, t, t);
+      const second = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
+      expect(await second.step(tel(0, S1 + 31_000, [going(RUN_A)]))).toEqual([]); // successor starts its own window
+      expect(names(root)).toEqual(['0']);
+    });
+    it.each([
+      ['a failed probe', async () => { throw new Error('ssh down'); }],
+      ['a null probe', async () => null],
+      ['malformed telemetry', async () => ({sampledAtET: iso(S1 + 10_000), activeRuns: 0, recent: 'garbage'})],
+    ])('restarts idle confirmation after %s between idle samples', async (_label, bad) => {
+      const {root, reaper} = mk();
+      expect(await reaper.step(tel(0, S1, [going(RUN_A)]))).toEqual([]);
+      expect(await reaper.step(bad)).toEqual([]);
+      expect(await reaper.step(tel(0, S1 + 31_000, [going(RUN_A)]))).toEqual([]); // new window began here
+      expect(names(root)).toEqual(['0']);
+      expect(await reaper.step(tel(0, S1 + 61_000, [going(RUN_A)]))).toEqual(['slot-0.unconfirmed']);
+    });
+    it('logs a complete structured record for every released slot', async () => {
+      const root = setup({0: {pid: 111, run: RUN_A}, 1: {pid: 112, run: RUN_B}});
+      const lines = [];
+      const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111, 112]), log: m => lines.push(m)});
+      const recent = [going(RUN_A), going(RUN_B)];
+      await reaper.step(tel(0, S1, recent));
+      await reaper.step(tel(0, S1 + 31_000, recent));
+      const records = lines.map(l => /released unconfirmed remote slot (\{.*\}) activeRuns=/.exec(l)).filter(Boolean).map(m => JSON.parse(m[1]));
+      expect(records.sort((a, b) => a.slot - b.slot)).toEqual([
+        {slot: 0, runId: RUN_A, verdict: 'idle', activeRuns: 0, sampledAtET: iso(S1 + 31_000)},
+        {slot: 1, runId: RUN_B, verdict: 'idle', activeRuns: 0, sampledAtET: iso(S1 + 31_000)},
+      ]);
+    });
+  });
   describe('R475 coroner signal', () => {
-    it('signals once when >= 2 unconfirmed slots are older than the age bound, then throttles', async () => {
+    it('signals once when >= 2 dead-owner unconfirmed slots are kept past the age bound, then throttles', async () => {
+      const root = setup({0: {pid: 222, run: RUN_A}, 1: {pid: 223, run: RUN_B}});
+      const events = [];
+      const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([222, 223]), signal: e => events.push(e)});
+      const recent = [going(RUN_A), going(RUN_B)];
+      await reaper.step(tel(2, undefined, recent));
+      await reaper.step(tel(2, undefined, recent));
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({kind: 'stuck-slots', detail: {slots: ['slot-0.unconfirmed', 'slot-1.unconfirmed']}});
+    });
+    it('does not raise stuck-slots for old markers whose owners are alive (a long healthy job)', async () => {
       const root = setup({0: {pid: 222, run: RUN_A}, 1: {pid: 223, run: RUN_B}});
       const events = [];
       const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([]), signal: e => events.push(e)});
-      await reaper.step(tel(1));
-      await reaper.step(tel(1));
+      await reaper.step(tel(2, undefined, [going(RUN_A), going(RUN_B)]));
+      expect(events).toEqual([]);
+    });
+    it('throttles each signal kind until its configured interval expires', async () => {
+      const root = setup({0: {pid: 222, run: RUN_A}, 1: {pid: 223, run: RUN_B}});
+      const events = [];
+      const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([222, 223]), signalEveryMs: 5_000, signal: e => events.push(e)});
+      const recent = [going(RUN_A), going(RUN_B)];
+      await reaper.step(tel(2, undefined, recent), NOW);
+      await reaper.step(tel(2, undefined, recent), NOW + 4_999);
       expect(events).toHaveLength(1);
-      expect(events[0]).toMatchObject({kind: 'stuck-slots', detail: {slots: ['slot-0.unconfirmed', 'slot-1.unconfirmed']}});
+      await reaper.step(tel(2, undefined, recent), NOW + 5_000);
+      expect(events).toHaveLength(2);
+      await reaper.step(async () => null, NOW + 5_001); // another kind is throttled independently
+      expect(events.map(e => e.kind)).toEqual(['stuck-slots', 'stuck-slots', 'probe-unknown']);
     });
     it('does not signal for one stuck slot or for young slots', async () => {
       const one = setup({0: {pid: 222, run: RUN_A}});
