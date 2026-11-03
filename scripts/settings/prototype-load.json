@@ -68,6 +68,14 @@
       ]
     },
     {
+      "ref": "lane/forge-slot-reconciler-r475",
+      "sha": "d171c9f8f5e6a9656d4866f7ae04042c20ea6a97",
+      "ruling": "R475+R485",
+      "findings": [
+        "scripts/readiness/forge-slot-markers.mjs:272 — Previously, a listed run without a result retained its slot unconditionally; now two zero-active samples permit release without a settled result or per-run cleanup confirmation. This relaxes quarantine based on the producer’s aggregate directory listing (forge-exec-run.mjs:655)."
+      ]
+    },
+    {
       "ref": "lane/freeze-read-retry-lkg",
       "sha": "f8564fc77a42e3c5a326fc17e38c3873f66696b3",
       "ruling": "R432",
