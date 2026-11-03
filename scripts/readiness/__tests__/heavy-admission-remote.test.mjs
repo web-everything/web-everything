@@ -2,7 +2,7 @@
 /** Contract tests for the pending remote admission exports; all execution and load IO is injected. */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { execSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, readFileSync, utimesSync, statSync } from 'node:fs';
+import { readdirSync, mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, readFileSync, utimesSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { main, decideRemote, runWithRemoteDecision, adaptLegacyRemoteResult, resolveAdmissionPolicy, heldSlots, shellQuoteWord, DEFAULT_ADMISSION_CEILING_MS, DEFAULT_FAST_RUN_TIMEOUT_MS } from '../heavy-admission.mjs';
@@ -187,7 +187,9 @@ describe('remote admission policy', () => {
       expect(remoteExec).toHaveBeenCalledWith(expect.objectContaining({ argv:expected, cwd: root, signal: expect.any(AbortSignal) }));
       expect(exit).toHaveBeenCalledWith(23);
       expect(JSON.parse(readFileSync(join(root, 'verify-report.jsonl'), 'utf8'))).toEqual({ location: 'remote', receiptId: 'run-123456', exitCode: 23 });
-      expect(existsSync(join(pool, '.admission','heavy'))).toBe(false);
+      // R501: the only thing a remote success may leave in the heavy root is the forgeShare record
+      expect(existsSync(join(pool, '.admission','heavy','slot-0'))).toBe(false);
+      expect(readdirSync(join(pool, '.admission','heavy'))).toEqual(['remote-runs.jsonl']);
       expect(heldSlots({lockRoot:join(pool,'.admission','remote'),cap:8})).toHaveLength(0);
     } finally { exit.mockRestore(); stderr.mockRestore(); vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); }
   });
