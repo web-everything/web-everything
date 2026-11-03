@@ -7,9 +7,9 @@ import refusals from '../same-refusal-streak.mjs';
 import { SMELLS } from '../index.mjs';
 import { NOTIFY_EVEN_IN_SHADOW } from '../../health-smells-notify-list.mjs';
 import { validateSmellShape } from '../../health-smells-shape.mjs';
-import { emptyHealthState, stepEpisodes, planActions, runHealthTick, MINUTE } from '../../health-watch-core.mjs';
+import { foldDaemonMemory, emptyHealthState, stepEpisodes, planActions, runHealthTick, MINUTE } from '../../health-watch-core.mjs';
 import { foldPrAttempts } from '../../health-pr-attempts.mjs';
-import { probeLanePools } from '../../health-watch.mjs';
+import { probeLanePools, probeDaemonLogs } from '../../health-watch.mjs';
 import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 import { DAEMON_MANIFEST } from '../../../../skills-src/conveyor/daemon-manifest.mjs';
 
@@ -22,6 +22,9 @@ const rows = (reasons, pr = 'owner/repo#42') => reasons.map((reason, i) => ({
   pr, reason, action: 'fix-dispatch', at: NOW - (reasons.length - i) * 1000,
 }));
 const context = (attempts = [], config = {}) => ({ now: NOW, config, daemons: { fix: { prAttempts: attempts } } });
+const daemonSample = { name: 'fix', text: '', mtimeMs: NOW, sizeBytes: 0, bootstrap: false };
+const daemonEvidence = { daemonLogs: [daemonSample] };
+const fullMem = attempts => ({ ...foldDaemonMemory(undefined, daemonSample, NOW), prAttempts: attempts });
 const same = rows(['no-lane: 1 busy', 'no-lane: 2 busy', 'no-lane: 3 busy']);
 
 describe('live delivery smell descriptors', () => {
@@ -105,7 +108,7 @@ describe('worker-count-vs-load', () => {
     try {
       for (const key of Object.keys(CONSTELLATION_REPOS)) {
         const path = join(dir, `lane-pool-health-watch-${key}.log`);
-        writeFileSync(path, JSON.stringify({ checked: true, health: { leased: key === 'we' ? 4 : 0 } }));
+        writeFileSync(path, `${new Date(NOW).toISOString()} ${JSON.stringify({ checked: true, health: { leased: key === 'we' ? 4 : 0 } })}\n`);
         utimesSync(path, NOW / 1000, NOW / 1000);
       }
       const first = runHealthTick(emptyHealthState(), { ...host(), lanePools: probeLanePools(dir) }, [workers], NOW);
@@ -116,6 +119,33 @@ describe('worker-count-vs-load', () => {
       for (const broken of [null, 'unparseable health log']) {
         if (broken !== null) writeFileSync(path, broken);
         const next = runHealthTick(state, { ...host(0, 0), lanePools: probeLanePools(dir) }, [workers], NOW + MINUTE);
+        expect(next.evaluations[0].error).toMatch(/evidence/i);
+        expect(Object.values(next.state.episodes)[0].cleanStreak).toBe(0);
+        expect(next.transitions.map(t => t.type)).not.toContain('closed');
+        state = next.state;
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each(['stale', 'unstamped', 'invalid'])('does not refresh a %s health reading when later log output updates the mtime', kind => {
+    const dir = mkdtempSync(join(tmpdir(), 'worker-reading-time-'));
+    try {
+      const staleAt = NOW - 3 * DAEMON_MANIFEST['health-watch'].intervalMs - 1;
+      for (const repo of Object.keys(CONSTELLATION_REPOS)) {
+        const stamp = repo !== 'we' ? new Date(NOW).toISOString()
+          : kind === 'stale' ? new Date(staleAt).toISOString() : kind === 'invalid' ? 'invalid-time' : '';
+        const health = JSON.stringify({ checked: true, health: { leased: 0 }, workerWithoutLease: [45] });
+        writeFileSync(join(dir, `lane-pool-health-watch-${repo}.log`),
+          `${new Date(NOW).toISOString()} ${health}\n${stamp ? stamp + ' ' : ''}${health}\n${new Date(NOW).toISOString()} scan failed\n`);
+        utimesSync(join(dir, `lane-pool-health-watch-${repo}.log`), NOW / 1000, NOW / 1000);
+      }
+      const lanePools = probeLanePools(dir);
+      const reading = lanePools.find(p => p.repo === 'we');
+      expect(reading).toMatchObject({ health: { leased: 0 }, workerWithoutLease: [45] });
+      if (kind === 'stale') expect(reading.at).toBe(staleAt);
+      else expect(Number.isFinite(reading.at)).toBe(false);
+      let state = runHealthTick(emptyHealthState(), host(), [workers], NOW).state;
+      for (const now of [NOW, NOW + 1]) {
+        const next = runHealthTick(state, { ...host(0, 0), lanePools }, [workers], now);
         expect(next.evaluations[0].error).toMatch(/evidence/i);
         expect(Object.values(next.state.episodes)[0].cleanStreak).toBe(0);
         expect(next.transitions.map(t => t.type)).not.toContain('closed');
@@ -158,8 +188,8 @@ describe('worker-count-vs-load', () => {
     try {
       for (const repo of Object.keys(CONSTELLATION_REPOS)) {
         const path = join(dir, `lane-pool-health-watch-${repo}.log`);
-        writeFileSync(path, JSON.stringify({ checked: true, health: { leased: 0 } }));
         const at = repo === 'we' ? NOW - 3 * DAEMON_MANIFEST['health-watch'].intervalMs - 1000 : NOW;
+        writeFileSync(path, `${new Date(at).toISOString()} ${JSON.stringify({ checked: true, health: { leased: 0 } })}\n`);
         utimesSync(path, at / 1000, at / 1000);
       }
       expect(() => workers.evaluate({ ...host(0, 0), lanePools: probeLanePools(dir) }, context())).toThrow(/evidence/i);
@@ -194,7 +224,7 @@ describe('worker-count-vs-load', () => {
       const sample = leased => {
         for (const repo of Object.keys(CONSTELLATION_REPOS)) {
           const path = join(dir, `lane-pool-health-watch-${repo}.log`);
-          writeFileSync(path, JSON.stringify({ checked: true, health: { leased: repo === 'we' ? leased : 0 } }));
+          writeFileSync(path, `${new Date(NOW).toISOString()} ${JSON.stringify({ checked: true, health: { leased: repo === 'we' ? leased : 0 } })}\n`);
           utimesSync(path, NOW / 1000, NOW / 1000);
         }
         return { machineLoad: host().machineLoad, lanePools: probeLanePools(dir) };
@@ -210,38 +240,38 @@ describe('worker-count-vs-load', () => {
 
 describe('same-refusal-streak', () => {
   it('uses shared normalization and per-PR ordering, rather than counting any failures', () => {
-    expect(refusals.evaluate({}, context([...same].reverse()))[0]).toMatchObject({ subject: 'owner/repo#42', breach: true });
-    expect(refusals.evaluate({}, context(rows(['a', 'b', 'a', 'b', 'a'])))[0].breach).toBe(false);
-    expect(refusals.evaluate({}, context(same.slice(0, 2)))[0].breach).toBe(false);
-    expect(refusals.evaluate({}, context([...same.slice(0, 2), ...rows(['x'], 'owner/other#42')])).every(r => !r.breach)).toBe(true);
+    expect(refusals.evaluate(daemonEvidence, context([...same].reverse()))[0]).toMatchObject({ subject: 'owner/repo#42', breach: true });
+    expect(refusals.evaluate(daemonEvidence, context(rows(['a', 'b', 'a', 'b', 'a'])))[0].breach).toBe(false);
+    expect(refusals.evaluate(daemonEvidence, context(same.slice(0, 2)))[0].breach).toBe(false);
+    expect(refusals.evaluate(daemonEvidence, context([...same.slice(0, 2), ...rows(['x'], 'owner/other#42')])).every(r => !r.breach)).toBe(true);
   });
   it('only compares the last N attempts and supports a threshold override', () => {
-    expect(refusals.evaluate({}, context(rows(['different', 'a', 'a', 'a'])))[0].breach).toBe(true);
-    expect(refusals.evaluate({}, context(rows(['a', 'a', 'a', 'different'])))[0].breach).toBe(false);
-    expect(refusals.evaluate({}, context(same.slice(0, 2), { sameRefusalStreak: { streakLength: 2 } }))[0].breach).toBe(true);
-    expect(refusals.evaluate({}, context(same, { sameRefusalStreak: { streakLength: 1000000 } }))[0].breach).toBe(true);
-    expect(refusals.evaluate({}, context(same, { sameRefusalStreak: { streakLength: 0 } }))[0].breach).toBe(true);
+    expect(refusals.evaluate(daemonEvidence, context(rows(['different', 'a', 'a', 'a'])))[0].breach).toBe(true);
+    expect(refusals.evaluate(daemonEvidence, context(rows(['a', 'a', 'a', 'different'])))[0].breach).toBe(false);
+    expect(refusals.evaluate(daemonEvidence, context(same.slice(0, 2), { sameRefusalStreak: { streakLength: 2 } }))[0].breach).toBe(true);
+    expect(refusals.evaluate(daemonEvidence, context(same, { sameRefusalStreak: { streakLength: 1000000 } }))[0].breach).toBe(true);
+    expect(refusals.evaluate(daemonEvidence, context(same, { sameRefusalStreak: { streakLength: 0 } }))[0].breach).toBe(true);
   });
   it('reuses daemon parsing, excludes expected waits, and ignores expired/future attempts', () => {
     const text = [1, 2, 3].map(n => `fix-daemon: refused no-lane owner/repo PR #42 — ${n} busy`).join('\n');
     const attempts = foldPrAttempts([], { text, mtimeMs: NOW }, NOW, MINUTE);
-    const r = refusals.evaluate({}, context(attempts))[0];
+    const r = refusals.evaluate(daemonEvidence, context(attempts))[0];
     expect(r.breach).toBe(true);
     expect(r.recommendation).toMatch(/why-not-dispatching.*owner\/repo#42/);
-    expect(refusals.evaluate({}, context(same.map(r => ({ ...r, reason: 'human-gated: review:human' }))))).toEqual([]);
-    expect(refusals.evaluate({}, context(same.map(r => ({ ...r, at: NOW - 61 * MINUTE }))))).toEqual([]);
-    expect(refusals.evaluate({}, context(same.map(r => ({ ...r, at: NOW + 1 }))))).toEqual([]);
+    expect(refusals.evaluate(daemonEvidence, context(same.map(r => ({ ...r, reason: 'human-gated: review:human' }))))).toEqual([]);
+    expect(refusals.evaluate(daemonEvidence, context(same.map(r => ({ ...r, at: NOW - 61 * MINUTE }))))).toEqual([]);
+    expect(refusals.evaluate(daemonEvidence, context(same.map(r => ({ ...r, at: NOW + 1 }))))).toEqual([]);
   });
   it('fails closed on missing or malformed attempt evidence, including an unknown latest reason', () => {
-    expect(() => refusals.evaluate({}, { now: NOW })).toThrow(/evidence/i);
-    expect(() => refusals.evaluate({}, context([...same, { pr: 'owner/repo#42', at: NOW }]))).toThrow(/evidence/i);
-    expect(refusals.evaluate({}, context())).toEqual([]);
+    expect(() => refusals.evaluate(daemonEvidence, { now: NOW })).toThrow(/evidence/i);
+    expect(() => refusals.evaluate(daemonEvidence, context([...same, { pr: 'owner/repo#42', at: NOW }]))).toThrow(/evidence/i);
+    expect(refusals.evaluate(daemonEvidence, context())).toEqual([]);
   });
   it.each([null, {}, { fix: null }, { fix: {} }, { fix: { prAttempts: null } }])(
     'records a probe error and preserves an open episode for missing attempts: %j', daemons => {
-      expect(() => refusals.evaluate({}, { now: NOW, daemons })).toThrow(/evidence/i);
-      const state = { ...emptyHealthState(), daemons: { fix: { prAttempts: same } } };
-      const first = runHealthTick(state, { daemonLogs: [] }, [refusals], NOW);
+      expect(() => refusals.evaluate(daemonEvidence, { now: NOW, daemons })).toThrow(/evidence/i);
+      const state = { ...emptyHealthState(), daemons: { fix: fullMem(same) } };
+      const first = runHealthTick(state, daemonEvidence, [refusals], NOW);
       expect(first.transitions.map(t => t.type)).toContain('opened');
       const next = runHealthTick({ ...first.state, daemons }, { daemonLogs: [] }, [refusals], NOW + MINUTE);
       expect(next.evaluations[0].error).toMatch(/evidence/i);
@@ -253,19 +283,59 @@ describe('same-refusal-streak', () => {
       expect(Object.values(again.state.episodes)[0].cleanStreak).toBe(0);
       expect(again.transitions.map(t => t.type)).not.toContain('closed');
     });
+  it.each(['missing', 'null', 'other-daemon'])('preserves an open refusal alert when logs are %s despite remembered clean attempts', kind => {
+    const first = runHealthTick({ ...emptyHealthState(), daemons: { fix: fullMem(same) } },
+      daemonEvidence, [refusals], NOW);
+    expect(first.transitions.map(t => t.type)).toContain('opened');
+    // Persisted empty or expired arrays cannot prove a clean tick without this daemon's log.
+    for (const attempts of [[], same]) {
+      let state = JSON.parse(JSON.stringify({ ...first.state, daemons: { fix: fullMem(attempts) } }));
+      for (const now of [NOW + 61 * MINUTE, NOW + 62 * MINUTE]) {
+        const daemonLogs = kind === 'null' ? null : kind === 'other-daemon'
+          ? [{ ...daemonSample, name: 'other' }] : [];
+        const next = runHealthTick(state, { daemonLogs }, [refusals], now);
+        expect(next.evaluations[0].error).toMatch(/evidence/i);
+        expect(next.evaluations[0].results).toBeNull();
+        expect(Object.values(next.state.episodes)[0].cleanStreak).toBe(0);
+        expect(next.transitions.map(t => t.type)).not.toContain('closed');
+        state = next.state;
+      }
+    }
+  });
+  it('treats a missing log in the real probe as unknown, then closes after two observed clean ticks', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'refusal-missing-log-'));
+    try {
+      const first = runHealthTick({ ...emptyHealthState(), daemons: { fix: fullMem(same) } },
+        daemonEvidence, [refusals], NOW);
+      let state = first.state;
+      for (const now of [NOW + 61 * MINUTE, NOW + 62 * MINUTE]) {
+        const next = runHealthTick(state, { daemonLogs: probeDaemonLogs(dir).samples }, [refusals], now);
+        expect(next.evaluations[0].error).toMatch(/evidence/i);
+        expect(next.transitions.map(t => t.type)).not.toContain('closed');
+        state = next.state;
+      }
+      writeFileSync(join(dir, 'fix.log'), '');
+      for (const now of [NOW + 63 * MINUTE, NOW + 64 * MINUTE]) {
+        const next = runHealthTick(state, { daemonLogs: probeDaemonLogs(dir).samples }, [refusals], now);
+        expect(next.evaluations[0].error).toBeUndefined();
+        expect(next.transitions.filter(t => t.type === 'closed')).toHaveLength(now === NOW + 64 * MINUTE ? 1 : 0);
+        state = next.state;
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it.each([1, 11, 1e9, 2.5, Infinity, '3', null])('falls back to streak 3 for invalid override %j', streakLength => {
-    expect(refusals.evaluate({}, context(same, { sameRefusalStreak: { streakLength } }))[0])
+    expect(refusals.evaluate(daemonEvidence, context(same, { sameRefusalStreak: { streakLength } }))[0])
       .toMatchObject({ breach: true, measure: { streakLength: 3, source: 'default' } });
   });
   it('accepts the upper streak boundary of ten', () => {
-    expect(refusals.evaluate({}, context(rows(Array(10).fill('no-lane')), { sameRefusalStreak: { streakLength: 10 } }))[0])
+    expect(refusals.evaluate(daemonEvidence, context(rows(Array(10).fill('no-lane')), { sameRefusalStreak: { streakLength: 10 } }))[0])
       .toMatchObject({ breach: true, measure: { streakLength: 10, source: 'health config' } });
   });
 });
 
 describe('real core delivery in shadow mode', () => {
   function step(smell, state, at) {
-    const results = smell === workers ? smell.evaluate(host(), context()) : smell.evaluate({}, context(same));
+    const results = smell === workers ? smell.evaluate(host(), context()) : smell.evaluate(daemonEvidence, context(same));
     const next = stepEpisodes(state, [{ smell, results }], at);
     return { ...next, plan: planActions(next.transitions, { [smell.id]: smell }, { mode: 'shadow' }) };
   }

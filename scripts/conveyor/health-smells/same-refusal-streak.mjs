@@ -12,7 +12,7 @@ export default {
   id: 'same-refusal-streak', scope: 'repo', cadence: 'every-tick',
   probes: ['daemonLogs'], openAfter: 1, closeAfter: 2,
   severity: 'medium', action: 'alert', notifyOnOpen: true, escalateAfterMs: 30 * MINUTE,
-  evaluate(_probes, { now, daemons, config } = {}) {
+  evaluate({ daemonLogs } = {}, { now, daemons, config } = {}) {
     if (!daemons || typeof daemons !== 'object' || Array.isArray(daemons)
       || !Object.keys(daemons).length || !Number.isFinite(now)) {
       throw new Error('Incomplete daemon attempt evidence; inspect daemonLogs probe errors and run why-not-dispatching on the affected PR.');
@@ -21,10 +21,15 @@ export default {
     const overridden = Number.isSafeInteger(override) && override >= 2 && override <= 10;
     const streakLength = overridden ? override : 3;
     const groups = new Map();
-    for (const daemon of Object.values(daemons)) {
+    const sampled = new Set(Array.isArray(daemonLogs) ? daemonLogs.map(s => s?.name) : []);
+    for (const [name, daemon] of Object.entries(daemons)) {
       // Only an explicit empty array proves that no attempts were observed.
       const attempts = daemon?.prAttempts;
       if (!Array.isArray(attempts)) throw new Error('Invalid daemon attempt evidence; inspect daemonLogs.');
+      // Remembered attempts only count as evidence while that daemon's log was actually sampled this tick.
+      if (!sampled.has(name)) {
+        throw new Error(`Daemon log ${name} was not sampled this tick (incomplete evidence); inspect daemonLogs and run why-not-dispatching on the affected PR.`);
+      }
       for (const row of attempts) {
         if (!row || typeof row.pr !== 'string' || !row.pr || !Number.isFinite(row.at)
           || typeof row.reason !== 'string' || !normalizeReason(row.reason)) {
