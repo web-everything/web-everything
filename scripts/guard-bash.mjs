@@ -2364,7 +2364,7 @@ function daemonWrapperUncertain(segment) {
     const word = words[i++];
     if (/^[A-Za-z_]\w*=/.test(word)) {
       // code-running Git env (GIT_EXTERNAL_DIFF, GIT_*_COMMAND, GIT_PAGER, config injection) makes even a "read" subcommand run code (`--ext-diff`).
-      if (/^GIT_(?:EXTERNAL_DIFF|\w*_COMMAND|PAGER|EDITOR|SEQUENCE_EDITOR|ASKPASS|SSH|CONFIG_COUNT|CONFIG_PARAMETERS|CONFIG_(?:KEY|VALUE)_\d+)=/.test(word)) gitEnvSeen = true;
+      if (/^GIT_(?:EXTERNAL_DIFF|\w*_COMMAND|PAGER|EDITOR|SEQUENCE_EDITOR|ASKPASS|SSH|CONFIG_\w+)=/.test(word)) gitEnvSeen = true;
       continue;
     }
     const base = word.replace(/^\\+/, '').replace(/^.*\//, '');

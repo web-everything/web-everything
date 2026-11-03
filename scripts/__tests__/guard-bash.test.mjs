@@ -3627,7 +3627,7 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
   it('still fails closed on wrapper options that can carry a daemon-clone git write or directory change', () => {
     for (const command of [`env -i git -C ${CLONE} commit -m x`, `env -C ${CLONE} git commit -m x`, 'env -i git commit -m x',
       'env -u FOO git push', 'command -p git commit -m x', 'time -p git reset --hard',
-      'nice -n 5 git checkout main', 'nice -n 5 bash -c "git commit -m x"', 'env -i git status $X', 'env -i git diff --no-index a b --output=out', `env -i GIT_EXTERNAL_DIFF="sh -c 'touch proof'" git diff --ext-diff`, 'env -i GIT_SSH_COMMAND=x git log', 'env GIT_PAGER=x git show', 'env -i git diff --ext-diff', `env -i git -C ${CLONE} status`,
+      'nice -n 5 git checkout main', 'nice -n 5 bash -c "git commit -m x"', 'env -i git status $X', 'env -i git diff --no-index a b --output=out', `env -i GIT_EXTERNAL_DIFF="sh -c 'touch proof'" git diff --ext-diff`, 'env -i GIT_SSH_COMMAND=x git log', 'env -i GIT_CONFIG_GLOBAL=/x/cfg git status --porcelain', 'env GIT_CONFIG_SYSTEM=/x git log', 'env GIT_PAGER=x git show', 'env -i git diff --ext-diff', `env -i git -C ${CLONE} status`,
       'time -f %e git commit -m x']) {
       expect(daemonCloneWriteReason(command, { cwd: LANE, roots }), command).toMatch(/DAEMON CLONE/);
     }
