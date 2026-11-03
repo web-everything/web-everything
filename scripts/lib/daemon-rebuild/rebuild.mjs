@@ -34,7 +34,7 @@ import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
 // new reasons to be classified. `error` covers versionedRebuild's error: <detail>.
 export const FAILURE_REASONS = new Set([
   'candidate-worktree-failed', 'deps-job-queue-failed', 'dispatch-smoke-failed',
-  'established-overlay-conflict', 'existing-overlays-unresolved', 'fetch-failed',
+  'established-overlay-conflict', 'existing-overlays-unresolved', 'fetch-failed', 'force-adopt-refused',
   'git-common-dir-failed', 'git-dir-unreadable', 'head-unresolved', 'launch-failed',
   'main-unresolved', 'merge-tree-failed', 'no-origin-url', 'not-built',
   'overlay-state-corrupt', 'pinned-overlay-conflict', 'pinned-overlay-unavailable',

@@ -10,7 +10,7 @@ import { isRepoFile, pickSmokeDiagnostics, sourceFilesIn } from '../daemon-boot-
 import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidate } from './state.mjs';
 import { releaseBuildLease } from './lease.mjs';
-import { readForceAdopt, clearForceAdopt, recordForcedAdoption } from '../daemon-force-adopt.mjs';
+import { readForceAdopt, clearForceAdopt, recordForcedAdoption, abortForcedAdoption } from '../daemon-force-adopt.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { finalizeRebuild, staleAlertDetail, dropSuspectOverlays } from './adopt.mjs';
 import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
@@ -667,13 +667,18 @@ export async function smokeAndAdopt({
     const forceSmoke = { verdict: a.smokeResult.verdict, failed: failedA.map((r) => r.name) };
     alert('force-adopt-over-failed-smoke', { ruling: forceReq.ruling, quote: forceReq.quote, ...forceSmoke, target: plan.finalSha });
     const lastGoodState = readRebuildState(root, stEnv).adopted;
+    const emit = (e) => appendDaemonEvent(e, { env: { WE_DAEMON_EVENTS: env?.WE_DAEMON_EVENTS } });
+    // Log + durable watch FIRST: a build that fails its smoke is never adopted without a record and a rollback watch.
+    const opened = await recordForcedAdoption({
+      root, env: stEnv, request: forceReq, sha: plan.finalSha, lastGood: lastGoodState ?? { head: prevHead }, smoke: forceSmoke, emit,
+    });
+    if (!opened.ok) {
+      alert('force-adopt-refused', { reason: opened.reason });
+      await hold('force-adopt-refused', failedA);
+      return { moved: false, reason: 'force-adopt-refused', detail: opened.reason, plan, alerts: [...prepAlerts, ...alertsList] };
+    }
     const forced = await finalize(plan, undefined, undefined, a.smokeResult);
-    if (forced.moved === true || forced.readyRecorded === true) {
-      await recordForcedAdoption({
-        root, env: stEnv, request: forceReq, sha: plan.finalSha, lastGood: lastGoodState ?? { head: prevHead },
-        smoke: forceSmoke, emit: (e) => appendDaemonEvent(e, { env: { WE_DAEMON_EVENTS: env?.WE_DAEMON_EVENTS } }),
-      });
-    } else clearForceAdopt(root, stEnv);
+    if (forced.moved !== true && forced.readyRecorded !== true) await abortForcedAdoption({ root, env: stEnv, request: forceReq, sha: plan.finalSha, emit });
     return forced;
   }
   if (a.reused) {

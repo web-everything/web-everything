@@ -329,8 +329,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       if (input.forceAdopt) {
         // R508: queue ONE operator-ruled adoption of the latest registered build. The rebuild smoke still runs and its
         // result is recorded next to the force; refused without a real ruling id + verbatim quote.
-        const req = requestForceAdopt({ root: out.clone, env, daemon: input.daemon, ruling: input.ruling, quote: input.quote });
-        out.forceAdopt = req.ok ? { requested: true, ruling: req.record.ruling } : { requested: false, refused: req.reason };
+        const req = requestForceAdopt({ root: out.clone, env, daemon: input.daemon, ruling: input.ruling, quote: input.quote, dryRun: input.dryRun });
+        out.forceAdopt = req.ok ? { requested: !input.dryRun, dryRun: !!input.dryRun, ruling: req.record.ruling } : { requested: false, refused: req.reason };
         out.ok = req.ok;
         return req.ok ? out : stop('force-adopt-refused', { forceAdopt: out.forceAdopt });
       }

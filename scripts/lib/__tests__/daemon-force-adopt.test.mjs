@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  validateForceAdopt, requestForceAdopt, readForceAdopt, recordForcedAdoption, readForceWatch,
+  validateForceAdopt, requestForceAdopt, readForceAdopt, recordForcedAdoption, abortForcedAdoption, readForceWatch,
   evaluateForceWatch, runForceWatchTick,
 } from '../daemon-force-adopt.mjs';
 
@@ -49,7 +49,39 @@ describe('requestForceAdopt', () => {
   it('writes a one-shot request with a ruling + quote', () => {
     const r = requestForceAdopt({ root, env, daemon: 'review', ruling: 'R508', quote: QUOTE, rulingsText: RULINGS, now: () => 1000 });
     expect(r.ok).toBe(true);
-    expect(readForceAdopt(root, env)).toMatchObject({ daemon: 'review', ruling: 'R508', quote: QUOTE });
+    expect(readForceAdopt(root, env, () => 2000)).toMatchObject({ daemon: 'review', ruling: 'R508', quote: QUOTE });
+  });
+});
+
+describe('request safety', () => {
+  it('a dry run validates but never arms an adoption', () => {
+    const r = requestForceAdopt({ root, env, daemon: 'review', ruling: 'R508', quote: QUOTE, rulingsText: RULINGS, dryRun: true });
+    expect(r.ok).toBe(true);
+    expect(readForceAdopt(root, env)).toBeNull();
+  });
+  it('an expired request never fires', () => {
+    requestForceAdopt({ root, env, daemon: 'review', ruling: 'R508', quote: QUOTE, rulingsText: RULINGS, now: () => 1000 });
+    expect(readForceAdopt(root, env, () => 1000 + 60_000)).not.toBeNull();
+    expect(readForceAdopt(root, env, () => 1000 + 3 * 3600_000)).toBeNull();
+  });
+});
+
+describe('recordForcedAdoption sinks', () => {
+  const args = () => ({ root, env, request: { daemon: 'review', ruling: 'R508', quote: QUOTE }, sha: 'b'.repeat(40), lastGood: { head: 'a'.repeat(40) }, smoke: { verdict: 'code', failed: [] }, now: () => 1 });
+  it('refuses (opens no watch) when the daemon-events sink failed', async () => {
+    const r = await recordForcedAdoption({ ...args(), emit: async () => false });
+    expect(r).toMatchObject({ ok: false, reason: 'audit-sink-failed' });
+    expect(readForceWatch(root, env)).toBeNull();
+  });
+  it('refuses when the handoff file cannot be written', async () => {
+    writeFileSync(join(dir, 'blocker'), 'x');
+    const r = await recordForcedAdoption({ ...args(), env: { ...env, WE_FORCE_ADOPT_HANDOFF: join(dir, 'blocker', 'x') }, emit: async () => true });
+    expect(r.ok).toBe(false);
+  });
+  it('abort drops the watch and consumes the request', async () => {
+    await recordForcedAdoption({ ...args(), emit: async () => true });
+    await abortForcedAdoption({ root, env, request: { daemon: 'review', ruling: 'R508' }, sha: 'b'.repeat(40), emit: async () => {} });
+    expect(readForceWatch(root, env)).toBeNull();
   });
 });
 

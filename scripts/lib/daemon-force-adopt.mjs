@@ -18,6 +18,7 @@ import { cloneKeyOf } from './daemon-last-good.mjs';
 export const FORCE_ADOPT_WATCH_TICKS = 5;
 export const FORCE_ADOPT_MAX_RESTARTS = 3;
 const MIN_QUOTE = 12;
+export const FORCE_ADOPT_TTL_MS = 2 * 60 * 60 * 1000;
 const norm = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
 
 const handoffDir = (env) => join(env?.HOME || homedir(), 'workspace/.operations/handoff');
@@ -54,30 +55,47 @@ const readJson = (p) => { try { return JSON.parse(readFileSync(p, 'utf8')); } ca
 const writeJson = (p, v) => { mkdirSync(dirname(p), { recursive: true }); const t = `${p}.${process.pid}.tmp`; writeFileSync(t, JSON.stringify(v)); renameSync(t, p); };
 
 /** Validate and persist a one-shot request; the next rebuild smoke consumes it. */
-export function requestForceAdopt({ root, env = process.env, daemon, ruling, quote, rulingsText, now = Date.now } = {}) {
+export function requestForceAdopt({ root, env = process.env, daemon, ruling, quote, rulingsText, now = Date.now, dryRun = false } = {}) {
   const text = rulingsText ?? (() => { try { return readFileSync(rulingsPath(env), 'utf8'); } catch { return ''; } })();
   const v = validateForceAdopt({ daemon, ruling, quote, rulingsText: text });
   if (!v.ok) return v;
-  const record = { daemon, ruling, quote: norm(quote), requestedAt: new Date(now()).toISOString() };
-  writeJson(requestPath(root, env), record);
+  const ttl = Number(env?.WE_FORCE_ADOPT_TTL_MS) > 0 ? Number(env.WE_FORCE_ADOPT_TTL_MS) : FORCE_ADOPT_TTL_MS;
+  const record = { daemon, ruling, quote: norm(quote), requestedAt: new Date(now()).toISOString(), expiresAt: new Date(now() + ttl).toISOString() };
+  if (!dryRun) writeJson(requestPath(root, env), record); // a dry run validates only, never arms an adoption
   return { ok: true, record };
 }
-export const readForceAdopt = (root, env = process.env) => readJson(requestPath(root, env));
+/** The pending request, or null when absent or expired (a stale operator request never fires later). */
+export function readForceAdopt(root, env = process.env, now = Date.now) {
+  const r = readJson(requestPath(root, env));
+  return r && Date.parse(r.expiresAt) > now() ? r : null;
+}
 export const clearForceAdopt = (root, env = process.env) => rmSync(requestPath(root, env), { force: true });
 export const readForceWatch = (root, env = process.env) => readJson(watchPath(root, env));
 const clearWatch = (root, env) => rmSync(watchPath(root, env), { force: true });
 
-const appendLine = (p, line) => { try { mkdirSync(dirname(p), { recursive: true }); appendFileSync(p, line); } catch { /* audit is best-effort, the event is the primary record */ } };
+/** true only when the line really landed: a forced adoption refuses to proceed unless every audit sink wrote. */
+const appendLine = (p, line) => { try { mkdirSync(dirname(p), { recursive: true }); appendFileSync(p, line); return true; } catch { return false; } };
 
-/** Log a forced adoption loudly, write the coroner-review record, and open the health watch. */
+/** BEFORE the adoption: log it loudly (all three sinks must land), write the coroner-review record and open the durable
+ *  health watch. Returns { ok:false } (nothing opened) when any sink fails, so the caller then does NOT adopt. */
 export async function recordForcedAdoption({ root, env = process.env, request, sha, lastGood, smoke, emit, now = Date.now }) {
   const at = new Date(now()).toISOString();
   const detail = { ruling: request.ruling, quote: request.quote, sha, lastGood: lastGood?.head ?? null, smoke: smoke ?? null, watchTicks: FORCE_ADOPT_WATCH_TICKS };
-  await emit?.({ kind: 'force-adopt', daemon: request.daemon, detail });
-  appendLine(handoffFile(env), `- FORCE-ADOPT ${at} ${request.daemon} ${request.ruling}: adopted ${sha} though smoke ${smoke?.verdict ?? 'unknown'} `
+  const evented = (await emit?.({ kind: 'force-adopt', daemon: request.daemon, detail })) !== false;
+  const handed = appendLine(handoffFile(env), `- FORCE-ADOPT ${at} ${request.daemon} ${request.ruling}: adopting ${sha} though smoke ${smoke?.verdict ?? 'unknown'} `
     + `(failed: ${(smoke?.failed || []).join(',') || 'none'}); operator quote: "${request.quote}"; auto-rollback watch ${FORCE_ADOPT_WATCH_TICKS} ticks\n`);
-  appendLine(coronerFile(env), `${JSON.stringify({ kind: 'force-adopt-review', at, daemon: request.daemon, ruling: request.ruling, quote: request.quote, sha, lastGood: lastGood?.head ?? null, smoke: smoke ?? null })}\n`);
-  writeJson(watchPath(root, env), { daemon: request.daemon, ruling: request.ruling, sha, lastGood, ticksLeft: FORCE_ADOPT_WATCH_TICKS, bad: 0, startedAt: at });
+  const coroned = appendLine(coronerFile(env), `${JSON.stringify({ kind: 'force-adopt-review', at, daemon: request.daemon, ruling: request.ruling, quote: request.quote, sha, lastGood: lastGood?.head ?? null, smoke: smoke ?? null })}\n`);
+  if (!(evented && handed && coroned)) return { ok: false, reason: 'audit-sink-failed' };
+  try { writeJson(watchPath(root, env), { daemon: request.daemon, ruling: request.ruling, sha, lastGood, ticksLeft: FORCE_ADOPT_WATCH_TICKS, bad: 0, startedAt: at }); } catch { return { ok: false, reason: 'watch-write-failed' }; }
+  clearForceAdopt(root, env);
+  return { ok: true };
+}
+
+/** The adoption did not happen (lock refused, reset failed): drop the watch that was opened for it, and say so. */
+export async function abortForcedAdoption({ root, env = process.env, request, sha, emit, now = Date.now }) {
+  clearWatch(root, env);
+  appendLine(handoffFile(env), `- FORCE-ADOPT ${new Date(now()).toISOString()} ${request.daemon} ${request.ruling}: NOT adopted ${sha} (adoption did not complete); request consumed\n`);
+  await emit?.({ kind: 'force-adopt-aborted', daemon: request.daemon, detail: { ruling: request.ruling, sha } });
   clearForceAdopt(root, env);
 }
 

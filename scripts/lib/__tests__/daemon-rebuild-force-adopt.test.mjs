@@ -141,6 +141,19 @@ describe('R508 force-adopt through rebuildClone', () => {
     expect(headOf(cloneDir)).toBe(before);
   });
 
+  it('does not adopt when an audit sink cannot be written (events path unwritable)', async () => {
+    const { base, originDir, cloneDir, env: env0 } = makeFixture();
+    writeFileSync(join(base, 'blocker'), 'x');
+    const env = { ...forceEnv(env0, base), WE_DAEMON_EVENTS: join(base, 'blocker', 'events.jsonl'), WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' };
+    const lastGood = headOf(cloneDir);
+    advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n'));
+    requestForceAdopt({ root: cloneDir, env, daemon: 'review', ruling: 'R508', quote: QUOTE, rulingsText: RULINGS });
+    const r = await rebuildClone({ root: cloneDir, env, runSmoke: failing(), prState: async () => null, lockOpts: LOCK_OPTS });
+    expect(r.moved).not.toBe(true);
+    expect(headOf(cloneDir)).toBe(lastGood);
+    expect(readForceWatch(cloneDir, env)).toBeNull();
+  });
+
   it('a request without a ruling is refused and changes nothing', () => {
     const { cloneDir, env } = makeFixture();
     expect(requestForceAdopt({ root: cloneDir, env, daemon: 'review', quote: QUOTE, rulingsText: RULINGS }).ok).toBe(false);
