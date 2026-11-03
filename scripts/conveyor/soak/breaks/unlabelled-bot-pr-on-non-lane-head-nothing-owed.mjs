@@ -13,7 +13,7 @@ export default {
   fixPresent() { return true; },
   async run() {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
-    const { planReconcile } = await import(pathToFileURL(join(root, 'scripts/conveyor/reconcile-core.mjs')).href);
+    const { planReconcile, greenSettledForRestoreGrace } = await import(pathToFileURL(join(root, 'scripts/conveyor/reconcile-core.mjs')).href);
     const { mapGraphqlPr } = await import(pathToFileURL(join(root, 'scripts/lib/pr-list-paged.mjs')).href);
     const pr = { number: 6254, state: 'OPEN', headRefName: 'ci/refresh-test-timings', headRefOid: 'f81bcb488ef9fdb3a38ea92fac80830b17753b69',
       author: { login: 'app/web-everything', is_bot: true }, isDraft: false, labels: [], comments: [], mergeStateStatus: 'CLEAN',
@@ -54,6 +54,24 @@ export default {
         now: Date.parse('2026-11-02T16:00:00Z'), requiredChecks: ['test'] });
       if (result.dispatch.some((d) => d.kind === 'restore-review-label') !== owed) {
         violations.push(`${name}: expected restore-review-label=${owed}`);
+      }
+    }
+    // A queued rerun must not turn a fresh completion into settled non-strict grace.
+    for (const status of ['QUEUED', 'IN_PROGRESS']) {
+      const rollup = [
+        { ...done('test'), completedAt: '2026-11-02T15:59:00Z' },
+        { __typename: 'CheckRun', name: 'test', status, conclusion: null, startedAt: '2026-11-02T15:59:30Z', completedAt: null },
+      ];
+      const now = Date.parse('2026-11-02T16:00:00Z');
+      for (const strict of [false, true]) {
+        if (greenSettledForRestoreGrace(rollup, now, undefined, { strict })) {
+          violations.push(`${status} rerun bypassed the grace window (strict=${strict})`);
+        }
+      }
+      const stacked = planReconcile({ prs: [{ ...pr, headRefName: 'lane/child', baseRefName: 'lane/parent', statusCheckRollup: rollup }],
+        agents: [], now, requiredChecks: ['test'] });
+      if (stacked.dispatch.some(d => d.kind === 'restore-review-label')) {
+        violations.push(`${status} rerun prematurely restored the stacked lane PR's review label`);
       }
     }
     return { violations };

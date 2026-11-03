@@ -3990,6 +3990,33 @@ describe('restore-review-label — open green PR with no review label (PR #3830)
     expect(planReconcile({ prs: [pr], agents: [], now: NOW, requiredChecks: ['gate'] }).dispatch)
       .toEqual([expect.objectContaining({ kind: 'restore-review-label', label: 'review:pending' })]);
   });
+  it.each(['QUEUED', 'IN_PROGRESS', 'queued', 'in_progress'])(
+    'a completion one minute ago plus a latest %s rerun never satisfies grace', status => {
+      const completed = { __typename: 'CheckRun', name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS',
+        startedAt: new Date(NOW - 120_000).toISOString(), completedAt: new Date(NOW - 60_000).toISOString() };
+      const rerun = { __typename: 'CheckRun', name: 'gate', status, conclusion: null,
+        startedAt: new Date(NOW - 30_000).toISOString(), completedAt: null };
+      for (const strict of [false, true]) {
+        expect(greenSettledForRestoreGrace([completed], NOW, undefined, { strict })).toBe(false);
+        for (const nodes of [[completed, rerun], [rerun, completed]]) {
+          const mapped = mapGraphqlPr({ commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes } } } }] } });
+          for (const rollup of [nodes, mapped.statusCheckRollup]) {
+            expect(greenSettledForRestoreGrace(rollup, NOW, undefined, { strict })).toBe(false);
+            // Even after the previous run's grace expires, the rerun is still incomplete.
+            expect(greenSettledForRestoreGrace(rollup, NOW + HOUR, undefined, { strict })).toBe(false);
+          }
+        }
+        // Once the rerun completes, its completion starts a new full window.
+        const finished = { ...rerun, status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: new Date(NOW).toISOString() };
+        for (const [now, settled] of [[NOW + RESTORE_REVIEW_LABEL_GRACE_MS - 1, false], [NOW + RESTORE_REVIEW_LABEL_GRACE_MS, true]]) {
+          expect(greenSettledForRestoreGrace([completed, finished], now, undefined, { strict })).toBe(settled);
+        }
+      }
+      // Stacked lane PRs can reach label restoration while checks are pending.
+      const pr = open({ baseRefName: 'lane/parent', statusCheckRollup: [completed, rerun] });
+      expect(planReconcile({ prs: [pr], agents: [], now: NOW, requiredChecks: ['gate'] }).dispatch
+        .some(d => d.kind === 'restore-review-label')).toBe(false);
+    });
   it('strict grace waits for a mapped optional queued CheckRun to really complete and settle', () => {
     const mappedRollup = (completedAt) => mapGraphqlPr({ commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: [
       { __typename: 'CheckRun', name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: new Date(NOW - HOUR).toISOString() },

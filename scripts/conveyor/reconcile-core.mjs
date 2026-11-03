@@ -2076,6 +2076,9 @@ export const RESTORE_REVIEW_LABEL_GRACE_MS = 10 * 60_000;
 export function greenSettledForRestoreGrace(rollup, now, graceMs = RESTORE_REVIEW_LABEL_GRACE_MS, { strict = false } = {}) {
   // Use the same winning rows as CI truth; superseded statuses/runs cannot hold grace open.
   const checks = collapseRollupToLatestPerName(rollup);
+  // An active latest run is not settled, even when non-strict grace permits missing timestamps.
+  // Otherwise a queued rerun erases the previous completion and bypasses the producer's wait.
+  if (checks.some(c => c?.status && String(c.status).toUpperCase() !== 'COMPLETED')) return false;
   // gh and the paged mapper expose StatusContext.createdAt as startedAt: it dates the reported
   // success, not a CheckRun's start. CheckRuns must still supply their own completion time.
   // The paged mapper's zero-date sentinel parses successfully but is not completion evidence.
