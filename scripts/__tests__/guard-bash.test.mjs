@@ -3601,10 +3601,33 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     })).toMatch(/DAEMON CLONE/);
   });
 
-  it('DENIES incomplete nested traversal with a visible fallback; preserves behavior without clone roots', () => {
+  it.each([{}, { daemonCloneRoots: [] }, { daemonCloneRoots: ['/ws/wev-review-daemon'] }])(
+    'DENIES a main push after 32 substitution-bearing shells regardless of clone roots: %j', (ctx) => {
+      const prefix = Array(32).fill("bash -c 'echo $(true)'").join('; ');
+      expect(decide('echo $(git push origin main)', ctx)).toMatch(/direct push to `main`/);
+      expect(decide(`${prefix}; echo $(git push origin main)`, ctx)).toMatch(/traversal budget exhausted|direct push to `main`/);
+    },
+  );
+
+  it('DENIES incomplete nested traversal with a visible fallback regardless of clone roots', () => {
     const command = Array(96).fill("bash -c 'echo $(true)'").join('; ');
-    expect(decide(command, { cwd: LANE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE.*traversal.*(?:budget|limit)/s);
-    expect(decide(command, { cwd: LANE, daemonCloneRoots: [] })).toBeNull();
+    for (const ctx of [{}, { daemonCloneRoots: [] }, { cwd: LANE, daemonCloneRoots: roots }]) {
+      expect(decide(command, ctx)).toMatch(/nested-command traversal budget exhausted; split the command/);
+    }
+  });
+
+  it('DENIES excessive nesting with a visible shallower-command fallback regardless of clone roots', () => {
+    const command = 'echo $('.repeat(6) + 'true' + ')'.repeat(6);
+    for (const ctx of [{}, { daemonCloneRoots: [] }, { daemonCloneRoots: roots }]) {
+      expect(decide(command, ctx)).toMatch(/nested-command traversal depth limit exhausted; split the command into smaller, shallower invocations/);
+    }
+  });
+
+  it('ALLOWS 40 plain echo statements regardless of clone roots', () => {
+    const command = Array(40).fill('echo hi').join('; ');
+    for (const ctx of [{}, { daemonCloneRoots: [] }, { daemonCloneRoots: roots }]) {
+      expect(decide(command, ctx)).toBeNull();
+    }
   });
 
   it.each(['$SPEC', '"$SPEC"', '${SPEC}', '`printf main:refs/heads/x`'])(

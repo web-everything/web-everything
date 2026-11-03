@@ -5209,13 +5209,13 @@ export function decide(command, ctx = {}) {
       childMaybeReadonly = maybeReadonly, childAttributes = uncertainAttributes) => {
       if (!String(text).trim()) return null;
       if (depth >= NESTED_DEPTH_CAP || nestedBudget <= 0) {
-        // Uninspected executable text can select any clone through shell state. Keep the
-        // historical behavior only when there are no daemon-clone targets to protect.
-        return ctx.daemonCloneRoots?.length
-          ? `DAEMON CLONE protection: nested-command traversal ${nestedBudget <= 0 ? 'budget' : 'depth limit'} exhausted; `
-            + 'split the command into smaller, shallower invocations so every target can be checked. '
-            + daemonCloneWriteMessage('unresolved target in uninspected nested command')
-          : null;
+        // Uninspected executable text may violate ANY guard rule, even without clone targets.
+        // Repeated text can run under different shell state, so it still needs inspection.
+        const protection = ctx.daemonCloneRoots?.length ? 'DAEMON CLONE protection' : 'Shell command protection';
+        return `${protection}: nested-command traversal ${nestedBudget <= 0 ? 'budget' : 'depth limit'} exhausted; `
+          + 'split the command into smaller, shallower invocations so every target can be checked. '
+          + (ctx.daemonCloneRoots?.length
+            ? daemonCloneWriteMessage('unresolved target in uninspected nested command') : 'Uninspected executable text cannot be allowed.');
       }
       nestedBudget -= 1;
       return checkScope(parseSegments(text).segments, text, env, depth + 1, persistChanges, childReadonly, childAlternates,
