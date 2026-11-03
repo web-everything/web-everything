@@ -1473,7 +1473,7 @@ function trailingGroupTail(s) {
  * Deliberately NOT a shell: no expansion, no `$VAR` resolution — the #2367 accidental-collision threat
  * model. It only reads text that bash will re-parse as a command, which is the coverage r1–r4 lost.
  */
-export function nestedCommandStrings(segment) {
+export function nestedCommandStrings(segment, { omitAssignments = new Set() } = {}) {
   const s = String(segment || '');
   if (!s.trim()) return [];
   const out = substitutionBodies(s);
@@ -1496,7 +1496,9 @@ export function nestedCommandStrings(segment) {
   // or `MAIN_SESSION_BUILD_OK=1 bash -c "npm run build"` becomes a deny with no way out. Deliberately NOT
   // carried onto a `$( … )` body: bash expands a substitution BEFORE applying the prefix, so it does not
   // see it there (`FOO=1 echo "$(echo $FOO)"` prints empty) — and assuming it did would be a loosening.
-  const envPrefix = (s.replace(/^\s+/, '').match(/^(?:env\s+)?((?:[A-Za-z_]\w*=\S*\s+)*)/) || [, ''])[1];
+  const envPrefix = (s.replace(/^\s+/, '').match(/^(?:env\s+)?((?:[A-Za-z_]\w*=\S*\s+)*)/) || [, ''])[1]
+    .replace(/[A-Za-z_]\w*=\S*\s+/g, (assignment) =>
+      omitAssignments.has(assignment.slice(0, assignment.indexOf('='))) ? '' : assignment);
   // The prefix reaches EVERY command in the re-executed string (`FOO=1 sh -c "a && b"` runs both a and b
   // with FOO set), so it is stamped onto each SEGMENT rather than onto the string as a whole.
   const reexec = (text) => {
@@ -4988,12 +4990,15 @@ export function decide(command, ctx = {}) {
   // Visit nested shells at their invocation, with a copy of the environment at that point. Flattening
   // first applies future exports to earlier commands and lets assignments in child shells leak out.
   let nestedBudget = NESTED_NODE_CAP;
+  const unknownNamerefTarget = Symbol('unknown nameref target');
+  const unresolvedNamerefs = Symbol('unresolved nameref names');
   const copyAlternates = (from) => new Map([...from].map(([key, values]) => [key, new Set(values)]));
   const checkScope = (list, whole, inherited, depth, persist = null, inheritedReadonly = [], inheritedAlternates = new Map(), inheritedMaybeReadonly = []) => {
     const gitConfigEnv = { ...inherited };
+    if (gitConfigEnv[unresolvedNamerefs]) gitConfigEnv[unresolvedNamerefs] = new Set(gitConfigEnv[unresolvedNamerefs]);
     const readonlyNames = new Set(inheritedReadonly);
-    // Names a possibly-skipped `readonly` may have locked: a later assignment or unset may fail, so it only
-    // adds a possible value and never replaces the locked one.
+    // Names a possibly-skipped `readonly` or an unmodeled declaration attribute may have constrained:
+    // a later assignment or unset may fail or transform its value, so it cannot erase earlier possibilities.
     const maybeReadonly = new Set(inheritedMaybeReadonly);
     // Other values a variable may hold because an assignment may not have run. Each is checked on its own:
     // every env-derived Git target is added separately, so one swapped key at a time covers every mix.
@@ -5004,8 +5009,21 @@ export function decide(command, ctx = {}) {
     // (`2>&1`, `&>`) are not control flow.
     const controlText = whole.replace(/\d*[<>]&\d*-?|&>>?/g, ' ');
     const canUnset = !/[&|()]|\b(?:if|then|else|elif|while|until|for|do|case|select|function|enable)\b|(?:^|[\s;])[{}!#]/.test(controlText);
-    const setAssignment = (key, value, readonly = false, conditional = false) => {
+    const setAssignment = (key, value, readonly = false, conditional = false, synthetic = false) => {
+      if (key === unresolvedNamerefs) {
+        (gitConfigEnv[key] ||= new Set()).add(value);
+        if (persist) persist(key, value);
+        return;
+      }
+      if (key === unknownNamerefTarget) {
+        gitConfigEnv[key] = true;
+        if (persist) persist(key, true);
+        return;
+      }
       if (readonlyNames.has(key)) return; // failed assignment/unset leaves a readonly target active
+      if (gitConfigEnv[unresolvedNamerefs]?.has(key) && !synthetic) {
+        setAssignment(unknownNamerefTarget, true); // this write may already have changed an arbitrary Git environment variable
+      }
       if (conditional || !canUnset || maybeReadonly.has(key)) {
         // The assignment may be skipped or refused: it adds a possible value and never replaces the earlier
         // one. A readonly that may not have run only marks the name as possibly locked.
@@ -5017,13 +5035,13 @@ export function decide(command, ctx = {}) {
         }
         gitConfigEnv[key] = value;
         if (readonly) maybeReadonly.add(key);
-        if (persist) persist(key, value, readonly, true);
+        if (persist) persist(key, value, readonly, true, synthetic);
         return;
       }
       gitConfigEnv[key] = value;
       alternates.delete(key);
       if (readonly) readonlyNames.add(key);
-      if (persist) persist(key, value, readonly, false);
+      if (persist) persist(key, value, readonly, false, synthetic);
     };
     const checkNested = (text, env, persistChanges = null, childReadonly = readonlyNames, childAlternates = alternates,
       childMaybeReadonly = maybeReadonly) => {
@@ -5033,7 +5051,22 @@ export function decide(command, ctx = {}) {
         childMaybeReadonly);
     };
     for (const seg of list) {
-      const r = reason(seg, { ...ctx, gitConfigEnv });
+      const leading = gitLeadingAssignments(seg);
+      const constrainedLocal = new Set();
+      // A shell-prefix assignment to a readonly or otherwise constrained variable may fail too.
+      // Assignments passed to external `env` do not modify shell variables and are excluded here.
+      for (const word of shellTokens(seg)) {
+        if (!word.op && !word.quoted && word.text === 'time') continue; // the shell keyword preserves assignment semantics
+        const assignment = !word.op && /^([A-Za-z_][A-Za-z0-9_]*)=/.exec(word.text);
+        if (!assignment) break;
+        if (readonlyNames.has(assignment[1]) || maybeReadonly.has(assignment[1])) constrainedLocal.add(assignment[1]);
+      }
+      const referenced = new Set(canonicalCommand(seg).match(/[A-Za-z_][A-Za-z0-9_]*/g) || []);
+      const uncertainLocalReference = [...constrainedLocal].some((key) => gitConfigEnv[unresolvedNamerefs]?.has(key));
+      const constrainedTarget = uncertainLocalReference
+        || [...constrainedLocal].some((key) => /^(?:GIT_|HOME$|XDG_CONFIG_HOME$)/.test(key) || referenced.has(key));
+      const r = reason(seg, { ...ctx, gitConfigEnv,
+        gitTargetUnknown: ctx.gitTargetUnknown || gitConfigEnv[unknownNamerefTarget] || constrainedTarget });
       if (r) return r;
       // Only a git invocation reads the environment for a target. Check each relevant possible value on its
       // own; past ALTERNATE_CHECK_CAP the target is unknown and a state change fails closed.
@@ -5055,21 +5088,24 @@ export function decide(command, ctx = {}) {
         }
       }
       const localEnv = { ...gitConfigEnv };
-      const leading = gitLeadingAssignments(seg);
+      if (uncertainLocalReference) localEnv[unknownNamerefTarget] = true;
       let localAlternates = alternates;
       if (leading.some((assignment) => alternates.has(assignment[1]))) localAlternates = copyAlternates(alternates);
       for (const assignment of leading) {
-        localEnv[assignment[1]] = assignment[2];
-        if (localAlternates !== alternates) localAlternates.delete(assignment[1]); // a command-local assignment always applies
+        localEnv[assignment[1]] = constrainedLocal.has(assignment[1]) ? '$unresolved_declaration_attribute' : assignment[2];
+        if (localAlternates !== alternates && !constrainedLocal.has(assignment[1])) localAlternates.delete(assignment[1]);
       }
       // Substitutions run before the command's local assignments take effect; explicit child shells
       // and runners receive those assignments even behind wrappers such as `command env`.
       const substitutionCount = substitutionBodies(seg).length;
-      for (const [index, text] of nestedCommandStrings(seg).entries()) {
+      // Failed prefix assignments cannot be stamped onto the child script again as successful ones.
+      for (const [index, text] of nestedCommandStrings(seg, { omitAssignments: constrainedLocal }).entries()) {
         const substitution = index < substitutionCount;
         const newProcess = !substitution && (SHELL_PROGRAMS.has(programWord(seg)) || runnerInvocation(canonicalCommand(seg))?.exec);
+        const childEnv = { ...(substitution ? gitConfigEnv : localEnv) };
+        if (newProcess) delete childEnv[unresolvedNamerefs]; // aliases do not survive exec; earlier uncertain writes do
         // eval executes in this shell; explicit assignments in its script survive the invocation.
-        const nestedReason = checkNested(text, substitution ? gitConfigEnv : localEnv,
+        const nestedReason = checkNested(text, childEnv,
           !substitution && programWord(seg) === 'eval' ? setAssignment : null, newProcess ? [] : readonlyNames,
           substitution ? alternates : localAlternates, newProcess ? [] : maybeReadonly);
         if (nestedReason) return nestedReason;
@@ -5096,6 +5132,13 @@ export function decide(command, ctx = {}) {
         : ['export', 'readonly'].includes(canonicalWords[0]) && optionWords.some((t) => /^-[A-Za-z]*f/.test(t));
       const versionDependent = ['export', 'readonly'].includes(canonicalWords[0])
         && optionWords.some((t) => /^-[A-Za-z]*p/.test(t));
+      // Recognizing an option does not prove its assignment succeeds or preserves the literal value.
+      // Arrays, integers, namerefs, case conversion and inherited attributes can reject, redirect or
+      // transform it, including later plain assignments. Only -r/-x scalar attributes are modeled;
+      // even a scope-only option such as -g can reject an assignment on an older Bash version.
+      const unknownAttributes = ['declare', 'typeset'].includes(canonicalWords[0])
+        ? optionWords.some((t) => !/^-[rx]+$/.test(t))
+        : canonicalWords[0] === 'readonly' && optionWords.some((t) => /[aA]/.test(t));
       const uncertain = redirected || badOption || versionDependent;
       if (!seg.trim().startsWith('(') && canonicalWords[0] === 'unset') {
         let variables = true;
@@ -5117,16 +5160,36 @@ export function decide(command, ctx = {}) {
         && ['export', 'declare', 'typeset', 'readonly'].includes(canonicalWords[0]);
       if (directive || words.every((t) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(t))) {
         const readonly = canonicalWords[0] === 'readonly'
-          || (['declare', 'typeset'].includes(canonicalWords[0]) && canonicalWords.some((t) => /^-[A-Za-z]*r[A-Za-z]*$/.test(t)));
+          || (['declare', 'typeset'].includes(canonicalWords[0]) && optionWords.some((t) => /^-[A-Za-z]*r[A-Za-z]*$/.test(t)));
         const leadingWords = gitLeadingAssignments(seg).map((m) => m[0]);
         const assignments = directive ? [...leadingWords, ...(printsOnly ? [] : canonicalWords)] : words;
+        const attributeWords = new Set(directive && !printsOnly && unknownAttributes ? canonicalWords.slice(1) : []);
+        const namerefDeclaration = ['declare', 'typeset'].includes(canonicalWords[0])
+          && optionWords.some((t) => /^-[A-Za-z]*n/.test(t));
+        const unresolvedReferences = [];
         for (const word of assignments) {
           const m = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(word);
-          if (m) setAssignment(m[1], m[2], readonly, uncertain);
+          const name = m?.[1] || (word !== canonicalWords[0] && /^[A-Za-z_][A-Za-z0-9_]*$/.test(word) ? word : null);
+          if (attributeWords.has(word) && name) {
+            if (namerefDeclaration) {
+              // A nameref changes its destination, not its own name. Taint a literal destination now;
+              // a dynamic/unset destination makes a subsequent write through this name uncertain.
+              const destination = m ? m[2] : gitConfigEnv[name];
+              const literal = /^([A-Za-z_][A-Za-z0-9_]*)(?:\[\d+\])?$/.exec(destination || '');
+              if (literal) setAssignment(literal[1], '$unresolved_nameref_destination', true, true, true);
+              else if (!destination || /[$`\[]/.test(destination)) unresolvedReferences.push(name);
+            }
+            // Reuse the possibly-constrained-name tracking so eval propagation and later assignments
+            // retain this unknown value. A new shell starts with scalar environment values instead.
+            setAssignment(name, '$unresolved_declaration_attribute', true, true, true);
+          }
+          if (m) setAssignment(m[1], m[2], readonly, uncertain, namerefDeclaration && attributeWords.has(word));
           else if (readonly && word !== canonicalWords[0] && /^[A-Za-z_][A-Za-z0-9_]*$/.test(word)) {
             setAssignment(word, gitConfigEnv[word], true, uncertain);
           }
         }
+        // Binding the alias itself does not write its destination. Register after processing the declaration.
+        for (const name of unresolvedReferences) setAssignment(unresolvedNamerefs, name);
       }
     }
     // Preserve the whole-command recovery used by withNestedCommands: a substitution/group containing
