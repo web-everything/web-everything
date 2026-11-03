@@ -345,8 +345,8 @@ export function verifyStartBody({ sha, suites, startedAt, treeHash, runId }) {
  *  explicitly and wins. `prev` supplies only `startedAt`/`suites` (audit fields); `base.sha` is a fallback for
  *  legacy callers that pass their own start body as `prev`. */
 /** Classify process termination without inventing an OOM/host-load diagnosis from a signal alone. */
-export function verificationInfrastructureFailure({ exitCode, signal, timedOutPhase, ceilingMs, killer = 'dispatcher' } = {}) {
-  if (exitCode === SHARD_UNSETTLED_EXIT && !signal && !timedOutPhase) return {
+export function verificationInfrastructureFailure({ exitCode, signal, timedOutPhase, ceilingMs, failureDetails, killer = 'dispatcher' } = {}) {
+  if (exitCode === SHARD_UNSETTLED_EXIT && !failureDetails && !signal && !timedOutPhase) return {
     reason: 'verify-unsettled',
     detail: 'verification unsettled: a test shard stayed INVENTORY-INCOMPLETE after one split retry (capacity/wait); no test verdict, not red, not green. Retry or wait.',
   };
@@ -366,7 +366,7 @@ export function verificationInfrastructureFailure({ exitCode, signal, timedOutPh
 
 export function verifyFinishBody(prev, { finishedAt, exitCode, sha, treeHash, suites, signal, infrastructure, failureDetails, retriedTimeouts, retriedFailures, isolatedRetry } = {}) {
   const base = prev && typeof prev === 'object' ? prev : {};
-  const failure = infrastructure || verificationInfrastructureFailure({ exitCode, signal });
+  const failure = infrastructure || verificationInfrastructureFailure({ exitCode, signal, failureDetails });
   const green = exitCode != null && Number(exitCode) === 0 && !failure;
   return {
     sha: sha ?? base.sha ?? null,
@@ -634,7 +634,7 @@ export function verifyGateDecision({ record, headSha, nowMs = Date.now(), ttlMs 
       detail: `verification for ${String(headSha).slice(0, 8)} is UNFINISHED (${abandoned ? 'abandoned — a backgrounded run that never completed' : 'still in-flight'}; started ${rec.startedAt || '?'}). A half-run verification must not look complete — re-run \`node scripts/verify-lane.mjs\` to completion (foreground, blocking) before landing.`,
     };
   }
-  const infrastructure = rec?.infrastructure || verificationInfrastructureFailure({ exitCode: rec?.exitCode, signal: rec?.signal });
+  const infrastructure = rec?.infrastructure || verificationInfrastructureFailure({ exitCode: rec?.exitCode, signal: rec?.signal, failureDetails: rec?.failureDetails });
   if (matches && (rec.status === 'infrastructure-failure' || (rec.status === 'red' && infrastructure))) {
     const reason = infrastructure?.reason || 'verify-infrastructure';
     const detail = infrastructure?.detail || 'verification infrastructure failed; no test verdict. Inspect the runner log before retrying.';

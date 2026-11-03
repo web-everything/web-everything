@@ -63,10 +63,19 @@ describe('unsettled shard classification', () => {
       .toEqual({ redCause: 'infra', redCauseFiles: [] });
   });
   it('verifyFinishBody records a non-green, non-red status without failing-test names', () => {
-    const done = verifyFinishBody({ sha: SHA }, { exitCode: 75, failureDetails: { tests: [{ file: 'a', name: 'test' }] } });
+    const done = verifyFinishBody({ sha: SHA }, { exitCode: 75 });
     expect(done).toMatchObject({ status: 'infrastructure-failure', exitCode: 75, infrastructure: { reason: 'verify-unsettled', detail } });
     expect(done.failureDetails).toBeUndefined();
     expect(verifyGateDecision({ record: done, headSha: SHA, requireVerified: true }).ok).toBe(false);
+  });
+  it('exit 75 with recorded failure details stays ordinary red through finish and gate reads', () => {
+    const failureDetails = { tests: [{ file: 'a', name: 'test' }], summary: 'test failed', truncated: false };
+    expect(verificationInfrastructureFailure({ exitCode: 75, failureDetails })).toBeNull();
+    const done = verifyFinishBody({ sha: SHA }, { exitCode: 75, failureDetails });
+    expect(done).toMatchObject({ status: 'red', exitCode: 75, failureDetails });
+    expect(done.infrastructure).toBeUndefined();
+    expect(verifyGateDecision({ record: done, headSha: SHA, requireVerified: true }))
+      .toMatchObject({ ok: false, status: 'red', reason: 'verify-red', failureDetails });
   });
 });
 

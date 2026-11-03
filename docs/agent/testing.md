@@ -3881,8 +3881,10 @@ Admission forwards child exit codes, so exit 75 cannot prove the command never r
 nonzero exits other than 75 are failure evidence even without inventory, and
 cannot be cleared by passing retries. Exit 0 or 75 with missing inventory remains
 unsettled-eligible in the absence of failure evidence. A passing local confirmation
-also cannot clear failure evidence retained from an incomplete remote attempt.
+also cannot clear failure evidence retained from any remote attempt, including a
+complete remote failure followed by incomplete local confirmation and passing retries.
 Infrastructure
-exits retain their classification, and UNSETTLED retains `verify-unsettled`.
+exits retain their classification, and UNSETTLED retains `verify-unsettled` only
+when the caller supplies no failure details; exit 75 with failure details stays red.
 First-attempt passes are unchanged. The scoped regressions live in
 `scripts/lib/__tests__/verify-shard-run.test.mjs`; run them through heavy admission.

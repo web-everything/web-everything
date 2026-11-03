@@ -127,8 +127,8 @@ describe('fail-closed wrapper', () => {
     expect(await f.run()).toBe(1); expect(f.calls.every(c => c.command === 'node')).toBe(true);
     expect(f.releases()).toBe(0);
   });
-  it.each(['pass', 'red'])('remote red is confirmed locally once: %s', async local => {
-    const f = fixture(['remote-red', local]); expect(await f.run()).toBe(local === 'pass' ? 0 : 1);
+  it.each(['pass', 'red'])('remote red is confirmed locally once and stays red: %s', async local => {
+    const f = fixture(['remote-red', local]); expect(await f.run()).toBe(1);
     expect(f.calls).toHaveLength(4); expect(f.calls[1].command).toBe('npx');
     expect(f.calls[1].env.WE_HEAVY_ADMISSION_HELD).toBe('1'); expect(f.releases()).toBe(1);
   });
@@ -146,7 +146,7 @@ describe('one split retry for incomplete inventory', () => {
       execute: async options => {
         calls.push(options);
         const mode = modes[calls.length - 1];
-        if (mode === 'remote-incomplete') reports.set(options.remoteReport, JSON.stringify({ location: 'remote', exitCode: 1 }) + '\n');
+        if (['remote-incomplete', 'remote-fail'].includes(mode)) reports.set(options.remoteReport, JSON.stringify({ location: 'remote', exitCode: 1 }) + '\n');
         if (mode === 'timeout') return { exitCode: 124, timedOut: true };
         if (mode === 'exit-failure') {
           options.log(`${options.prefix}runner failed before writing inventory\n`);
@@ -160,8 +160,8 @@ describe('one split retry for incomplete inventory', () => {
         if (mode === 'malformed') return { exitCode: 1, reportText: '{invalid JSON' };
         const reportText = mode === 'oversized' ? streamedInventory('x'.repeat(SHARD_REPORT_MAX_BYTES + 1))
           : JSON.stringify({ testResults: (['missing', 'remote-incomplete'].includes(mode) ? [] : options.files).map(name => ({ name,
-            status: mode === 'fail' ? 'failed' : 'passed', assertionResults: [{ status: mode === 'fail' ? 'failed' : 'passed' }] })) });
-        return { exitCode: ['fail', 'remote-incomplete'].includes(mode) ? 1 : 0, reportText };
+            status: ['fail', 'remote-fail'].includes(mode) ? 'failed' : 'passed', assertionResults: [{ status: mode === 'fail' ? 'failed' : 'passed' }] })) });
+        return { exitCode: ['fail', 'remote-incomplete', 'remote-fail'].includes(mode) ? 1 : 0, reportText };
       },
     });
     return { code, calls, output: lines.join('') };
@@ -188,6 +188,15 @@ describe('one split retry for incomplete inventory', () => {
     ['failed suite count alone', { numFailedTestSuites: 1, testResults: [] }],
     ['failed test count alone', { numFailedTests: 1, testResults: [] }],
   ];
+  it.each(observedFailures)('%s in complete inventory stays RED even with exit 0', async (_label, report) => {
+    const reportText = JSON.stringify({ ...report, testResults: ['a', 'b', 'c', 'd'].map(name =>
+      report.testResults.find(r => r.name === name)
+        ?? { name, status: 'passed', assertionResults: [{ status: 'passed' }] }) });
+    const f = await run([{ exitCode: 0, reportText }]);
+    expect(f.code).toBe(1);
+    expect(f.output).toContain('verify-shards: RED (1:FAIL;');
+    expect(f.calls).toHaveLength(1);
+  });
   it.each(observedFailures)('%s with missing files stays RED after passing retries', async (_label, report) => {
     const f = await run([report, 'pass', 'pass']);
     expect(f.code).toBe(1); expect(f.output).toContain('verify-shards: RED');
@@ -332,6 +341,16 @@ describe('one split retry for incomplete inventory', () => {
     const f = await run(['remote-incomplete', 'missing', 'pass', 'pass']);
     expect(f.code).toBe(1); expect(f.output).toContain('verify-shards: RED (1:FAIL;');
     expect(f.output).not.toContain('GREEN'); expect(f.calls).toHaveLength(4);
+    expect(f.calls.map(c => c.command)).toEqual(['node', 'npx', 'node', 'node']);
+    expect(f.calls.map(c => c.files.length)).toEqual([4, 4, 2, 2]);
+  });
+  it('complete remote failure then incomplete local confirmation and passing split retries stays FAIL with exit 1', async () => {
+    const f = await run(['remote-fail', 'missing', 'pass', 'pass']);
+    expect(f.code).toBe(1);
+    expect(f.output).toContain('remote red; confirming locally');
+    expect(f.output).toContain('verify-shards: RED (1:FAIL;');
+    expect(f.output).not.toContain('UNSETTLED');
+    expect(f.output).not.toContain('GREEN');
     expect(f.calls.map(c => c.command)).toEqual(['node', 'npx', 'node', 'node']);
     expect(f.calls.map(c => c.files.length)).toEqual([4, 4, 2, 2]);
   });

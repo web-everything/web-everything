@@ -214,19 +214,20 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
             inventory = inventoryVerdict(reportText, attemptFiles, cwd, location);
           }
           catch { inventory = 'INVENTORY-INCOMPLETE'; }
+          // Retain real failures from every attempt, including complete remote
+          // inventory followed by an incomplete local confirmation.
+          observedFailure ||= inventory === 'FAIL';
+          try {
+            const report = JSON.parse(reportText);
+            observedFailure ||= report?.success === false || report?.numRuntimeErrors > 0
+              || report?.numFailedTestSuites > 0 || report?.numFailedTests > 0
+              || (Array.isArray(report?.testResults) && report.testResults.some(r => r?.status === 'failed'
+                || (Array.isArray(r?.assertionResults) && r.assertionResults.some(a => a?.status === 'failed'))));
+          } catch { /* Unparseable reports contain no observed test failure. */ }
           if (inventory === 'INVENTORY-INCOMPLETE') {
             // Exit 75 signals unsettled evidence; other nonzero child exits
             // are failures even when inventory cannot explain them.
             observedFailure ||= result.exitCode !== 0 && result.exitCode !== SHARD_UNSETTLED_EXIT;
-            // Missing inventory may coexist with a real failure. Keep that
-            // evidence across attempts so splitting cannot retry it away.
-            try {
-              const report = JSON.parse(reportText);
-              observedFailure ||= report?.success === false || report?.numRuntimeErrors > 0
-                || report?.numFailedTestSuites > 0 || report?.numFailedTests > 0
-                || (Array.isArray(report?.testResults) && report.testResults.some(r => r?.status === 'failed'
-                  || (Array.isArray(r?.assertionResults) && r.assertionResults.some(a => a?.status === 'failed'))));
-            } catch { /* Unparseable reports contain no observed test failure. */ }
             return inventory;
           }
           return result.exitCode === 0 && !result.signal && inventory === 'PASS' ? 'PASS' : 'FAIL';
@@ -274,7 +275,7 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
             status = retried.find(r => ['TIMEOUT', 'NOT-RUN', 'FAIL'].includes(r))
               ?? (observedFailure ? 'FAIL' : 'UNSETTLED');
           }
-          // A passing local confirmation cannot erase an incomplete attempt's failure evidence.
+          // A passing local confirmation cannot erase any attempt's failure evidence.
           if (observedFailure && status === 'PASS') status = 'FAIL';
         } catch (error) { status = 'FAIL'; log(`verify-shard error: ${String(error.message).replace(/[\x00-\x1f\x7f]/g, '')}\n`); }
         // A killed/infrastructure shard must reach the caller as such (its guard refuses to run later phases on it).
