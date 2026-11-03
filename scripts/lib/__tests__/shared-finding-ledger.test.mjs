@@ -352,3 +352,13 @@ describe('audit round 7 hardening', () => {
     expect(filterReraises(l, [b], { pinStillHolds: () => true }).dropped).toEqual([]);
   });
 });
+
+describe('audit round 8 hardening', () => {
+  it('an entry with unresolved variants never suppresses', () => {
+    const a = finding({ summary: 'ALLOW_ADMIN flag bypasses authorization' });
+    const b = finding({ summary: 'allow_admin flag bypasses authorization' });
+    let l = recordFindings(record(emptyLedger(), [a]), { source: 'audit', head: H2, findings: [b] });
+    l = pinFinding(markFixed(l, l.entries[0].key, { head: H2 }), l.entries[0].key, PIN);
+    expect(filterReraises(l, [a, b], { pinStillHolds: () => true }).dropped).toEqual([]);
+  });
+});

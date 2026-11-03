@@ -83,7 +83,7 @@ export function filterReraises(ledger, findings, { pinStillHolds } = {}) {
   for (const finding of findings) {
     const entry = ledger.entries.find(candidate => matches(candidate, finding, { strict: true }));
     let proven = false;
-    if (entry?.status === 'test-pinned' && entry.pinningTest && typeof pinStillHolds === 'function') {
+    if (entry?.status === 'test-pinned' && !entry.variants?.length && entry.pinningTest && typeof pinStillHolds === 'function') {
       try { proven = pinStillHolds(structuredClone(entry)) === true; } catch { /* Retain on unknown evidence. */ }
     }
     (proven ? dropped : kept).push(finding);
