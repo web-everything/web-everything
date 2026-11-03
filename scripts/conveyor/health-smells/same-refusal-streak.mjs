@@ -1,0 +1,50 @@
+/** Same normalized reason on the last N attempts per PR, within the shared one-hour
+ * evidence window. Uses daemon memory only, not duplicate operation-record evidence.
+ * Health-dir config.json: sameRefusalStreak.streakLength (positive safe integer, default 3).
+ * Large thresholds require that many observed attempts; they never relax the check.
+ * Explicitly notifies on medium openings; persistent streaks escalate to high
+ * and notify again after 30 minutes. No retries or dispatch mutations.
+ */
+import { MINUTE, normalizeReason } from '../health-watch-core.mjs';
+import { ATTEMPT_WINDOW_MS, isExpectedPrWait } from '../health-pr-attempts.mjs';
+
+export default {
+  id: 'same-refusal-streak', scope: 'repo', cadence: 'every-tick',
+  probes: ['daemonLogs'], openAfter: 1, closeAfter: 2,
+  severity: 'medium', action: 'alert', notifyOnOpen: true, escalateAfterMs: 30 * MINUTE,
+  evaluate(_probes, { now, daemons, config } = {}) {
+    if (!daemons || typeof daemons !== 'object' || !Number.isFinite(now)) {
+      throw new Error('Incomplete daemon attempt evidence; inspect daemonLogs probe errors and run why-not-dispatching on the affected PR.');
+    }
+    const override = config?.sameRefusalStreak?.streakLength;
+    const overridden = Number.isSafeInteger(override) && override > 0;
+    const streakLength = overridden ? override : 3;
+    const groups = new Map();
+    for (const daemon of Object.values(daemons)) {
+      // Old memory with no attempts is valid: the fold has not observed any yet.
+      const attempts = daemon?.prAttempts ?? [];
+      if (!Array.isArray(attempts)) throw new Error('Invalid daemon attempt evidence; inspect daemonLogs.');
+      for (const row of attempts) {
+        if (!row || typeof row.pr !== 'string' || !row.pr || !Number.isFinite(row.at)
+          || typeof row.reason !== 'string' || !normalizeReason(row.reason)) {
+          throw new Error('Incomplete PR attempt evidence; inspect daemonLogs and run why-not-dispatching on the affected PR.');
+        }
+        if (row.at <= now - ATTEMPT_WINDOW_MS || row.at > now || isExpectedPrWait(row)) continue;
+        if (!groups.has(row.pr)) groups.set(row.pr, []);
+        groups.get(row.pr).push(row);
+      }
+    }
+    return [...groups].map(([pr, attempts]) => {
+      attempts.sort((a, b) => a.at - b.at);
+      const tail = attempts.slice(-streakLength);
+      const reason = normalizeReason(tail.at(-1).reason);
+      const breach = tail.length === streakLength && tail.every(row => normalizeReason(row.reason) === reason);
+      return {
+        subject: pr, breach,
+        measure: { streakLength, source: overridden ? 'health config' : 'default', attempts: attempts.length, reason },
+        summary: `${pr}: last ${tail.length}/${streakLength} attempts ${breach ? 'share' : 'checked for'} the same normalized reason: ${reason}`,
+        recommendation: `Run why-not-dispatching on ${pr} and resolve the reported blocker before retrying.`,
+      };
+    });
+  },
+};

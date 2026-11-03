@@ -4,7 +4,8 @@
  * `evaluate(probes, ctx)` returning `[{subject, breach, measure, summary, recommendation}]`:
  *   id, scope (host|repo), cadence (every-tick|gh), probes (the named IO reads the shell must supply — a smell
  *   whose probe did not run this tick is skipped, so its episodes do not move), openAfter/closeAfter
- *   (hysteresis), severity, action (alert|investigate|file), optional `diagnose` (a read-only command the shell
+ *   (hysteresis), severity, action (alert|investigate|file), optional `notifyOnOpen: true` (notify even for a
+ *   medium opening, still respecting shadow suppression and tracked silences), optional `diagnose` (a read-only command the shell
  *   runs with a hard timeout when an episode opens).
  *
  * DISCOVERED FROM DISK (#3729-style conflict prevention) — every module file in this directory is picked up

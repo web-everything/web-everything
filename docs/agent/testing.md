@@ -238,6 +238,19 @@ settings file to warn/3000000 with tool provenance, checks unreadable settings/p
 guards executable-looking custom input with an execution sentinel and a static evaluation check.
 An unreadable policy source must retain a readable higher-priority mode; unknown mode fails closed.
 
+## Health worker pressure and refusal delivery
+
+`health-smells/__tests__/live-delivery-smells.test.mjs` drives the actual descriptors through
+`stepEpisodes` and `planActions` in shadow mode. Keep the core policy explicit: high worker-pressure
+episodes notify on open and remind after the default four hours; medium refusal streaks explicitly
+opt into opening notification with `notifyOnOpen: true`, then notify after their 30-minute escalation.
+Other medium openings stay quiet. `escalateAfterMs` does not replace the global `reminderAfterMs`
+for an already-high episode. Shadow suppression and tracked silences still apply to opening opt-ins.
+Health-dir config overrides are `workerCountVsLoad.{loadPerCore,minWorkersForLoad,workerCap}`
+and `sameRefusalStreak.streakLength`; effective thresholds and their sources appear in episode measures.
+Worker cap inherits the existing `workerCapacity.ceiling` setting/environment override, falling back
+to 12 when absent. Malformed evidence throws so the core preserves episodes and records probe errors.
+
 ## Health tick watchdog deadlines
 
 `scripts/conveyor/__tests__/health-watch.test.mjs` keeps the real child-process kill probe and uses an

@@ -674,7 +674,7 @@ export function planActions(transitions, smellsById, {
     const shadowSuppressed = mode === 'shadow' && !notifySet.has(smell.id);
     if (t.type === 'opened' || t.type === 'flapping') {
       if (smell.diagnose) plan.push({ kind: 'diagnose', key: t.key, diagnose: smell.diagnose });
-      if (ep.severity === 'high' && !ep.tracked) plan.push({ kind: 'notify', key: t.key, suppressed: shadowSuppressed ? 'shadow mode' : null });
+      if ((ep.severity === 'high' || smell.notifyOnOpen === true) && !ep.tracked) plan.push({ kind: 'notify', key: t.key, suppressed: shadowSuppressed ? 'shadow mode' : null });
       if (smell.action === 'investigate') {
         const off = mode === 'shadow' ? 'shadow mode (agent investigation dispatch is off — config `investigateDispatch`)' : 'agent investigation dispatch is off (config `investigateDispatch`)';
         plan.push({ kind: 'investigate', key: t.key, suppressed: investigateDispatch === true ? null : off });
