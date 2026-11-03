@@ -35,16 +35,18 @@ export function demoteNeverAutomatic(item, operatorCommand) {
  *   - `stateLanes`: per waiting state, `auto` (the mapping below) or `operator` (always ask a person).
  *   - `systemActions` / `policyActions`: turn each automatic action on or off; off sends the item to the operator.
  *   - `grantCeiling`: most rounds granted in total, 1..MAX_TOTAL_ROUND_EXTENSIONS (lowers the shared ceiling, never raises).
+ *   - `maxRedTeamRestartsPerHead`: separate restart budget, 0..2; zero routes orphaned heads to the operator.
  *   - `maxFixListLines`: the longest fix list a policy block may carry (1..20: it can only lower the standard).
  *   - `staleHoldAutoResume`: a stale hold is the system's (true) or the operator's (false).
  */
 export const CLASSIFY_DEFAULTS = Object.freeze({
-  staleHoldAutoResume: false, grantCeiling: MAX_TOTAL_ROUND_EXTENSIONS, maxFixListLines: 20, stateLanes: Object.freeze({}),
+  maxRedTeamRestartsPerHead: 2, staleHoldAutoResume: false, grantCeiling: MAX_TOTAL_ROUND_EXTENSIONS, maxFixListLines: 20, stateLanes: Object.freeze({}),
   systemActions: Object.freeze({ 'await-ledger-outbox': true, 'resume-stale-hold': true, 'rerun-red-team-gate': true, 'ask-review-daemon': true, 'tooling-card': true, 'restart-red-team': true, 'publish-red-team-result': true }),
   policyActions: Object.freeze({ grant: true, card: true, block: true }),
 });
 /** Validators for each classifier setting leaf (shared with the sweep's cascade, so a bad value is refused there too). */
 export const CLASSIFY_VALID = Object.freeze({
+  maxRedTeamRestartsPerHead: (v) => Number.isSafeInteger(v) && v >= 0 && v <= 2,
   staleHoldAutoResume: (v) => typeof v === 'boolean',
   grantCeiling: (v) => Number.isSafeInteger(v) && v >= 1 && v <= MAX_TOTAL_ROUND_EXTENSIONS,
   maxFixListLines: (v) => Number.isSafeInteger(v) && v >= 1 && v <= 20,
@@ -212,12 +214,13 @@ function classifyUnsafe(o = {}) {
   if (REVIEW_WAITS.has(state)) {
     if (row.liveJob) return null;
     if (['red-team-pending', 'drain-skip:red-team-pending'].includes(state) && redTeam !== undefined) {
-      const plan = planPendingRedTeam(redTeam);
+      const plan = planPendingRedTeam(redTeam && typeof redTeam === 'object' && !Array.isArray(redTeam)
+        ? { ...redTeam, maxRestarts: cfg.maxRedTeamRestartsPerHead } : redTeam);
       if (plan.kind === 'wait') return null;
       if (plan.kind === 'owner-unknown') return operator('red-team-owner-unknown', plan.reason);
       if (plan.kind === 'exhausted') return operator('red-team-restart-exhausted', plan.reason);
-      if (plan.kind === 'publish-result') return out('system', 'publish-red-team-result', plan.reason, { headCap: 1 });
-      return out('system', 'restart-red-team', plan.reason, { headCap: 2, key: `${key}:restart-${redTeam.restarts + 1}` });
+      if (plan.kind === 'publish-result') return out('system', 'publish-red-team-result', plan.reason);
+      return out('system', 'restart-red-team', plan.reason, { key: `${key}:restart-${redTeam.restarts + 1}` });
     }
     return out('system', 'ask-review-daemon', `waiting on the ${row.actor === 'red-team' ? 'red team' : 'reviewer'} with no live job; ask the review daemon once for this head`,
       { onceKey: `${row.repo}#${row.number}@${head.toLowerCase()}:ask-review-daemon` });

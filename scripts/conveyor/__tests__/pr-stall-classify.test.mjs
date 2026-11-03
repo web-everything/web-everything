@@ -507,8 +507,29 @@ describe('pending red-team watchdog evidence', () => {
     restarts: 0, minutesSinceLastRestart: null, ...patch });
   const states = ['red-team-pending', 'drain-skip:red-team-pending'];
   it.each(states)('%s restarts an old head with no live run or result', state => {
-    expect(at(state, { redTeam: pending() })).toMatchObject({ lane: 'system', action: 'restart-red-team', headCap: 2,
+    expect(at(state, { redTeam: pending() })).toMatchObject({ lane: 'system', action: 'restart-red-team',
       key: `${REPO}#77@${HEAD.toLowerCase()}:${state}:restart-1` });
+  });
+  it.each([0, 1, 2])('configured cap %s controls restart exhaustion, overriding evidence policy', cap => {
+    for (const state of states) for (const restarts of [0, 1, 2]) {
+      const item = at(state, { settings: { maxRedTeamRestartsPerHead: cap },
+        redTeam: pending({ restarts, minutesSinceLastRestart: 60, maxRestarts: 100 }) });
+      expect(item).not.toHaveProperty('headCap');
+      expect(item).toMatchObject(restarts < cap
+        ? { lane: 'system', action: 'restart-red-team', key: expect.stringMatching(new RegExp(`restart-${restarts + 1}$`)) }
+        : { lane: 'operator', action: 'red-team-restart-exhausted', command: expect.any(String), reason: expect.stringContaining('operator') });
+    }
+  });
+  it('zero restart cap still permits publication with no item-level cap', () => {
+    const item = at('red-team-pending', { settings: { maxRedTeamRestartsPerHead: 0 },
+      redTeam: pending({ status: { status: 'finished', result: { status: 'ran' } } }) });
+    expect(item).toMatchObject({ lane: 'system', action: 'publish-red-team-result' });
+    expect(item).not.toHaveProperty('headCap');
+  });
+  it.each([-1, 3, 0.5, NaN, Infinity, '1', null, {}, []])('invalid classifier restart policy %j fails closed to the operator', cap => {
+    expect(at('red-team-pending', { settings: { maxRedTeamRestartsPerHead: cap }, redTeam: pending() }))
+      .toMatchObject({ lane: 'operator', action: 'unclassified', command: null,
+        reason: expect.stringMatching(/fail-closed: classifier error.*maxRedTeamRestartsPerHead/) });
   });
   it.each(states)('%s retains the daemon fallback when evidence is omitted', state => {
     expect(at(state)).toMatchObject({ lane: 'system', action: 'ask-review-daemon' });
@@ -532,9 +553,9 @@ describe('pending red-team watchdog evidence', () => {
       { restarts: 1, minutesSinceLastRestart: 59 },
     ]) expect(at(state, { redTeam: pending(patch) })).toBeNull();
   });
-  it.each(states)('%s gives the spaced second restart a distinct key and its own two-action cap', state => {
+  it.each(states)('%s gives the spaced second restart a distinct key under the configured restart budget', state => {
     expect(at(state, { redTeam: pending({ restarts: 1, minutesSinceLastRestart: 60 }) }))
-      .toMatchObject({ lane: 'system', action: 'restart-red-team', headCap: 2,
+      .toMatchObject({ lane: 'system', action: 'restart-red-team',
         key: `${REPO}#77@${HEAD.toLowerCase()}:${state}:restart-2` });
   });
   it.each(states)('%s escalates the two-restart ceiling with restart and age evidence', state => {

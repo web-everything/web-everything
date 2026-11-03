@@ -34,7 +34,7 @@ export const STALL_SWEEP_DIR_ENV = 'WE_PR_STALL_SWEEP_DIR';
 /** The standard values; the classifier's policies are leaves of the same block, checked by its validators. */
 export const STALL_SWEEP_DEFAULTS = Object.freeze({ mode: 'off', intervalMinutes: 15, maxActionsPerSweep: 3, maxActionsPerHour: 6,
   maxActionsPerPrHead: 1, digest: true, ...CLASSIFY_DEFAULTS });
-const SCALARS = ['mode', 'digest', 'intervalMinutes', 'maxActionsPerSweep', 'maxActionsPerHour', 'maxActionsPerPrHead', 'staleHoldAutoResume', 'grantCeiling', 'maxFixListLines'];
+const SCALARS = ['mode', 'digest', 'intervalMinutes', 'maxActionsPerSweep', 'maxActionsPerHour', 'maxActionsPerPrHead', 'maxRedTeamRestartsPerHead', 'staleHoldAutoResume', 'grantCeiling', 'maxFixListLines'];
 const SETTINGS_FILE = join(ROOT, 'scripts/settings/pr-stall-sweep.json');
 const envName = (k) => `WE_PR_STALL_SWEEP_${k.replace(/[A-Z]/g, (c) => `_${c}`).toUpperCase()}`;
 const msg = (e) => String(e?.message ?? e).split('\n')[0].slice(0, 200);
@@ -57,7 +57,7 @@ export function resolveStallSweepSettings({ env = process.env, read = readFileSy
     const raw = env[envName(k)];
     if (raw === undefined) continue;
     envValues[k] = typeof d === 'boolean' ? (['1', 'true'].includes(raw) ? true : ['0', 'false'].includes(raw) ? false : raw)
-      : typeof d === 'number' ? Number(raw) : String(raw).trim().toLowerCase();
+      : typeof d === 'number' ? (k === 'maxRedTeamRestartsPerHead' && String(raw).trim() === '' ? raw : Number(raw)) : String(raw).trim().toLowerCase();
   }
   const valid = { ...CLASSIFY_VALID, mode: (v) => STALL_SWEEP_MODES.includes(v), digest: (v) => typeof v === 'boolean',
     ...Object.fromEntries(['intervalMinutes', 'maxActionsPerSweep', 'maxActionsPerHour', 'maxActionsPerPrHead'].map((k) => [k, (v) => Number.isSafeInteger(v) && v > 0])) };
@@ -140,20 +140,25 @@ export function planStallActions(items, { history = [], now, limits }) {
   const perAction = new Map();
   const bucket = it => `${it.prHead}|${it.action}`;
   for (const h of done) perAction.set(bucket(h), (perAction.get(bucket(h)) ?? 0) + 1);
-  // Every action spends the shared head budget, including capped and legacy records.
-  for (const h of done) perHead.set(h.prHead, (perHead.get(h.prHead) ?? 0) + 1);
+  // Restarts have a distinct, separately configured per-head budget. All other actions, including
+  // idempotent result publication, spend the ordinary head budget. Historical records use action kind too.
+  for (const h of done.filter(h => h.action !== 'restart-red-team')) perHead.set(h.prHead, (perHead.get(h.prHead) ?? 0) + 1);
   const seen = new Set(done.map((h) => `${h.key}|${h.action}`));
   const once = new Set(done.map((h) => h.onceKey).filter(Boolean));
   const act = []; const held = [];
   for (const it of items) {
     if (it.lane === 'operator') continue;
     if (seen.has(`${it.key}|${it.action}`) || (it.onceKey && once.has(it.onceKey))) continue;
+    const restart = it.action === 'restart-red-team';
+    const restartCap = limits.maxRedTeamRestartsPerHead;
+    const headFull = restart
+      ? (!CLASSIFY_VALID.maxRedTeamRestartsPerHead(restartCap) || (perAction.get(bucket(it)) ?? 0) >= restartCap)
+      : (perHead.get(it.prHead) ?? 0) >= limits.maxActionsPerPrHead;
     const why = act.length >= limits.maxActionsPerSweep ? 'per-sweep cap' : hour >= limits.maxActionsPerHour ? 'per-hour cap'
-      : ((perHead.get(it.prHead) ?? 0) >= limits.maxActionsPerPrHead + (it.headCap ?? 0)
-        || (it.headCap !== undefined && (!Number.isSafeInteger(it.headCap) || it.headCap <= 0 || (perAction.get(bucket(it)) ?? 0) >= it.headCap))) ? 'per-PR-head cap' : null;
+      : headFull ? (restart ? 'red-team restart per-head cap; operator must inspect the pending head' : 'per-PR-head cap') : null;
     if (why) { held.push({ ...it, held: why }); continue; }
     act.push(it); perAction.set(bucket(it), (perAction.get(bucket(it)) ?? 0) + 1); hour += 1;
-    perHead.set(it.prHead, (perHead.get(it.prHead) ?? 0) + 1);
+    if (!restart) perHead.set(it.prHead, (perHead.get(it.prHead) ?? 0) + 1);
   }
   return { act, held };
 }

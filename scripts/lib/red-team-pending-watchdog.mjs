@@ -25,6 +25,7 @@ export function planPendingRedTeam(input) {
       return { kind: 'owner-unknown', reason: `red-team run age is ${runAgeMinutes} minutes; ownership could not be proven; operator must inspect the pending head (needs-you)` };
     }
   }
+  if (maxRestarts === 0) return { kind: 'exhausted', reason: 'red-team restarts disabled by maxRedTeamRestartsPerHead=0; operator must inspect the pending head' };
   if (restarts >= maxRestarts) return { kind: 'exhausted', reason: `${restarts} red-team restarts exhausted at age ${ageMinutes} minutes; operator must inspect the pending head` };
   if (restarts > 0 && minutesSinceLastRestart < thresholdMinutes) return wait('last red-team restart is too recent');
   return { kind: 'restart', reason: `pending red-team head is ${ageMinutes} minutes old without a live owner or finished result; restart ${restarts + 1}` };

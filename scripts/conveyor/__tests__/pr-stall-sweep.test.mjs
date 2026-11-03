@@ -447,9 +447,18 @@ describe('pending red-team watchdog in the shadow sweep', () => {
     return { out, dir, calls, log, readRedTeamStatus, probe };
   };
 
+  it.each([0, 1, 2])('sweep uses configured restart cap %s and escalates at the ceiling', async cap => {
+    const dir = auditDir();
+    if (cap) seed(dir, Array.from({ length: cap }, (_, n) => restartRecord(120 + n * 60,
+      { key: `${prHead}:red-team-pending:restart-${n + 1}` })));
+    const { out } = await sweep({ dir, settings: shadow({ maxRedTeamRestartsPerHead: cap }) });
+    expect(out.act).toEqual([]);
+    expect(out.items).toMatchObject([{ lane: 'operator', action: 'red-team-restart-exhausted', command: expect.any(String) }]);
+    expect(out.items[0].reason).toMatch(cap === 0 ? /disabled.*maxRedTeamRestartsPerHead=0.*operator/ : /exhausted.*operator/);
+  });
   it('pending over 60 minutes with no live run or result logs would restart-red-team in shadow', async () => {
     const { out, dir, calls, log, readRedTeamStatus } = await sweep();
-    expect(out.act).toMatchObject([{ lane: 'system', action: 'restart-red-team', prHead, headCap: 2,
+    expect(out.act).toMatchObject([{ lane: 'system', action: 'restart-red-team', prHead,
       key: `${prHead}:red-team-pending:restart-1` }]);
     expect(readRedTeamStatus).toHaveBeenCalledWith(expect.objectContaining({ repo: REPO, pr: 11, head: HEAD }));
     expect(log.mock.calls.map(([line]) => line).join('\n'))
@@ -606,11 +615,19 @@ describe('pending red-team watchdog in the shadow sweep', () => {
   });
 });
 
-describe('watchdog headCap buckets', () => {
-  const limits = { maxActionsPerSweep: 10, maxActionsPerHour: 20, maxActionsPerPrHead: 1 };
+describe('watchdog restart budgets', () => {
+  const limits = { maxActionsPerSweep: 10, maxActionsPerHour: 20, maxActionsPerPrHead: 1, maxRedTeamRestartsPerHead: 2 };
   const prHead = `${REPO}#11@${HEAD}`;
-  const restart = n => ({ lane: 'system', action: 'restart-red-team', prHead, headCap: 2, key: `${prHead}:restart-${n}` });
+  const restart = n => ({ lane: 'system', action: 'restart-red-team', prHead, key: `${prHead}:restart-${n}` });
   const record = (item, phase = 'would-do') => ({ ...item, phase, ts: new Date(NOW - 90 * 60_000).toISOString() });
+  it.each([0, 1, 2])('configured cap %s admits exactly that many restarts per head', cap => {
+    const result = planStallActions([restart(1), restart(2), restart(3)], {
+      now: NOW, limits: { ...limits, maxRedTeamRestartsPerHead: cap },
+    });
+    expect(result.act).toEqual([restart(1), restart(2)].slice(0, cap));
+    expect(result.held).toEqual([restart(1), restart(2), restart(3)].slice(cap)
+      .map(it => ({ ...it, held: expect.stringMatching(/restart per-head cap.*operator/) })));
+  });
   it('a prior daemon nudge still permits the bounded restart allowance', () => {
     const history = [record({ prHead, action: 'ask-review-daemon', key: 'daemon' })];
     expect(planStallActions([restart(1)], { now: NOW, limits, history })).toEqual({ act: [restart(1)], held: [] });
@@ -630,7 +647,7 @@ describe('watchdog headCap buckets', () => {
     expect(result.act).toEqual([]);
     expect(result.held).toHaveLength(1);
   });
-  it('headCap items still spend the common per-sweep and per-hour budgets', () => {
+  it('restart items still spend the common per-sweep and per-hour budgets', () => {
     const items = [restart(1), { ...restart(1), prHead: 'other-head', key: 'other-restart' }];
     const perSweep = planStallActions(items, { now: NOW, limits: { ...limits, maxActionsPerSweep: 1 } });
     expect(perSweep.act).toHaveLength(1);
@@ -644,10 +661,14 @@ describe('watchdog headCap buckets', () => {
     const other = { ...restart(1), prHead: `${REPO}#12@${HEAD}`, key: 'other' };
     expect(planStallActions([other], { now: NOW, limits, history: [record(restart(1)), record(restart(2))] }).act).toEqual([other]);
   });
-  it('different capped actions still share the total head ceiling', () => {
-    const publish = { ...restart(1), action: 'publish-red-team-result', key: `${prHead}:publish`, headCap: 1 };
+  it('publication uses only the ordinary ceiling and remains idempotent', () => {
+    const publish = { ...restart(1), action: 'publish-red-team-result', key: `${prHead}:publish` };
     expect(planStallActions([publish], { now: NOW, limits,
-      history: [record(restart(1)), record(restart(2))] })).toEqual({ act: [], held: [{ ...publish, held: 'per-PR-head cap' }] });
+      history: [record(restart(1)), record(restart(2))] })).toEqual({ act: [publish], held: [] });
+    expect(planStallActions([publish], { now: NOW, limits, history: [record(publish)] })).toEqual({ act: [], held: [] });
+    expect(planStallActions([publish], { now: NOW, limits,
+      history: [record({ prHead, action: 'ask-review-daemon', key: 'nudge' }), record(restart(1))] }))
+      .toEqual({ act: [], held: [{ ...publish, held: 'per-PR-head cap' }] });
   });
 });
 
@@ -665,5 +686,48 @@ describe('watchdog action settings defaults and provenance', () => {
     expect(result.value.systemActions[action]).toBe(false);
     expect(result.sources[`systemActions.${action}`]).toBe('tool');
     expect(log.mock.calls.map(([line]) => line).join('\n')).toContain(`systemActions.${action}=false (tool)`);
+  });
+});
+
+
+describe('restart budget settings cascade', () => {
+  const resolve = (tool = {}, platform = {}, env = {}) => {
+    const log = vi.fn();
+    const result = resolveStallSweepSettings({ env: { WE_POLICY_CASCADE_LOG: '1', ...env }, log,
+      read: path => JSON.stringify({ prStallSweep: String(path).endsWith('pr-stall-sweep.json') ? tool : platform }) });
+    return { ...result, logged: log.mock.calls.map(([line]) => line).join('\n') };
+  };
+  it('defaults to two in the standard, resolved settings and persisted repository settings', () => {
+    expect(STALL_SWEEP_DEFAULTS.maxRedTeamRestartsPerHead).toBe(2);
+    expect(JSON.parse(readFileSync(join(process.cwd(), 'scripts/settings/pr-stall-sweep.json'), 'utf8'))
+      .prStallSweep.maxRedTeamRestartsPerHead).toBe(2);
+    expect(resolve()).toMatchObject({ value: { maxRedTeamRestartsPerHead: 2 }, sources: { maxRedTeamRestartsPerHead: 'standard' },
+      logged: expect.stringContaining('maxRedTeamRestartsPerHead=2 (standard)') });
+  });
+  it.each([0, 1, 2])('valid cap %s resolves and logs provenance at every override layer', cap => {
+    const setting = { maxRedTeamRestartsPerHead: cap };
+    for (const [result, source] of [[resolve({}, setting), 'platform'], [resolve(setting), 'tool'],
+      [resolve({ maxRedTeamRestartsPerHead: 2 }, { maxRedTeamRestartsPerHead: 1 },
+        { WE_PR_STALL_SWEEP_MAX_RED_TEAM_RESTARTS_PER_HEAD: String(cap) }), 'env']]) {
+      expect(result.value.maxRedTeamRestartsPerHead).toBe(cap);
+      expect(result.sources.maxRedTeamRestartsPerHead).toBe(source);
+      expect(result.logged).toContain(`maxRedTeamRestartsPerHead=${cap} (${source})`);
+    }
+  });
+  it.each([-1, 3, 0.5, 9007199254740992, null, false, '1', {}, []])('rejects bad layer cap %j and retains stricter underlying policy', invalid => {
+    const tool = resolve({ maxRedTeamRestartsPerHead: invalid }, { maxRedTeamRestartsPerHead: 0 });
+    expect(tool.value.maxRedTeamRestartsPerHead).toBe(0);
+    expect(tool.sources.maxRedTeamRestartsPerHead).toBe('platform');
+    expect(tool.errors.join(' ')).toContain('maxRedTeamRestartsPerHead');
+    const platform = resolve({}, { maxRedTeamRestartsPerHead: invalid });
+    expect(platform.value.maxRedTeamRestartsPerHead).toBe(2);
+    expect(platform.sources.maxRedTeamRestartsPerHead).toBe('standard');
+    expect(platform.errors.join(' ')).toContain('maxRedTeamRestartsPerHead');
+  });
+  it.each(['-1', '3', '0.5', 'NaN', 'Infinity', '', ' ', 'false', '9007199254740992'])('rejects bad env cap %j without loosening a zero tool policy', raw => {
+    const result = resolve({ maxRedTeamRestartsPerHead: 0 }, {}, { WE_PR_STALL_SWEEP_MAX_RED_TEAM_RESTARTS_PER_HEAD: raw });
+    expect(result.value.maxRedTeamRestartsPerHead).toBe(0);
+    expect(result.sources.maxRedTeamRestartsPerHead).toBe('tool');
+    expect(result.errors.join(' ')).toContain('maxRedTeamRestartsPerHead');
   });
 });

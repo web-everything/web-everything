@@ -66,7 +66,7 @@ describe('shadow sweep owner identity and result guards', () => {
     const { out, probe } = await sweep({ start: 'replacement-process' });
     expect(probe.isAlive).toHaveBeenCalledWith(12345);
     expect(probe.readPidStart).toHaveBeenCalledWith(12345);
-    expect(out.act).toMatchObject([{ action: 'restart-red-team', headCap: 2 }]);
+    expect(out.act).toMatchObject([{ action: 'restart-red-team' }]);
     expect(out.records.filter(r => r.phase === 'would-do')).toMatchObject([{ action: 'restart-red-team', mode: 'shadow' }]);
   });
   it('a matching live PID birth time suppresses restarts beyond the stale deadline', async () => {
@@ -108,61 +108,49 @@ describe('shadow sweep owner identity and result guards', () => {
 });
 
 
-describe('headCap and shared head budgets', () => {
-  const limits = { maxActionsPerSweep: 20, maxActionsPerHour: 20, maxActionsPerPrHead: 2 };
+describe('separate restart and ordinary head budgets', () => {
+  const limits = { maxActionsPerSweep: 20, maxActionsPerHour: 20, maxActionsPerPrHead: 2, maxRedTeamRestartsPerHead: 2 };
   const prHead = `${REPO}#11@${HEAD}`;
-  const item = (action, headCap) => ({ lane: 'system', prHead, key: `${prHead}:${action}`, action,
-    ...(headCap === undefined ? {} : { headCap }) });
+  const item = (action, key = action) => ({ lane: 'system', prHead, key: `${prHead}:${key}`, action });
   const record = (it, phase = 'would-do') => ({ ...it, phase, ts: new Date(NOW - 60_000).toISOString() });
-  const capped = item('restart-red-team', 2);
-  const ordinary = [item('ask-review-daemon'), item('rerun-check')];
-  it.each(['would-do', 'intent'])('two different ordinary %s actions hold ordinary items but permit the capped allowance', phase => {
-    const result = planStallActions([item('third-action'), capped], {
-      now: NOW, limits, history: ordinary.map(it => record(it, phase)),
+  const restarts = [1, 2].map(n => item('restart-red-team', `restart-${n}`));
+  const ordinary = [item('ask-review-daemon'), item('tooling-card')];
+  it.each(['would-do', 'intent', 'current pass'])('ordinary actions at the shared ceiling never block restarts with %s evidence', source => {
+    const extra = item('publish-red-team-result');
+    const result = planStallActions(source === 'current pass' ? [...ordinary, extra, ...restarts] : [extra, ...restarts], {
+      now: NOW, limits, history: source === 'current pass' ? [] : ordinary.map(it => record(it, source)),
     });
-    expect(result.act).toEqual([capped]);
-    expect(result.held).toEqual([{ ...item('third-action'), held: 'per-PR-head cap' }]);
+    expect(result.act).toEqual(source === 'current pass' ? [...ordinary, ...restarts] : restarts);
+    expect(result.held).toEqual([{ ...extra, held: 'per-PR-head cap' }]);
   });
-  it('ordinary actions planned this pass permit the bounded headCap allowance', () => {
-    const result = planStallActions([...ordinary, capped], { now: NOW, limits });
-    expect(result.act).toEqual([...ordinary, capped]);
-    expect(result.held).toEqual([]);
-  });
-  it.each(['history', 'current pass'])('headCap actions in %s spend the shared budget', source => {
-    const result = planStallActions(source === 'history' ? ordinary : [capped, ...ordinary], {
-      now: NOW, limits, history: source === 'history' ? [record(capped)] : [],
+  it.each(['would-do', 'intent', 'current pass'])('restarts never spend the ordinary budget with %s evidence', source => {
+    const extra = item('publish-red-team-result');
+    const result = planStallActions(source === 'current pass' ? [...restarts, ...ordinary, extra] : [...ordinary, extra], {
+      now: NOW, limits, history: source === 'current pass' ? [] : restarts.map(it => record(it, source)),
     });
-    expect(result.act).toEqual(source === 'history' ? [ordinary[0]] : [capped, ordinary[0]]);
-    expect(result.held).toEqual([{ ...ordinary[1], held: 'per-PR-head cap' }]);
+    expect(result.act).toEqual(source === 'current pass' ? [...restarts, ...ordinary] : ordinary);
+    expect(result.held).toEqual([{ ...extra, held: 'per-PR-head cap' }]);
   });
-  it.each(['would-do', 'intent', 'current pass'])('mixed capped buckets stop at shared maximum plus headCap with %s evidence', source => {
-    const prior = [...ordinary, item('other-capped', 10), { ...capped, key: 'previous' }];
-    const next = { ...capped, key: 'next' };
+  it.each(['would-do', 'intent', 'current pass'])('restart ceiling is independent of ordinary count with %s evidence', source => {
+    const next = item('restart-red-team', 'restart-3');
+    const prior = [...ordinary, ...restarts];
     const result = planStallActions(source === 'current pass' ? [...prior, next] : [next], {
       now: NOW, limits, history: source === 'current pass' ? [] : prior.map(it => record(it, source)),
     });
     expect(result.act).toEqual(source === 'current pass' ? prior : []);
-    expect(result.held).toEqual([{ ...next, held: 'per-PR-head cap' }]);
+    expect(result.held).toEqual([{ ...next, held: expect.stringMatching(/restart per-head cap.*operator/) }]);
   });
-  it('headCap actions still stop at their own bucket below the shared ceiling', () => {
-    const result = planStallActions([{ ...capped, key: 'next' }], {
-      now: NOW, limits, history: [record(capped), record({ ...capped, key: 'previous' })],
-    });
+  it.each([undefined, -1, 3, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])('invalid restart limit %s holds for operator inspection', cap => {
+    const result = planStallActions([restarts[0]], { now: NOW, limits: { ...limits, maxRedTeamRestartsPerHead: cap } });
     expect(result.act).toEqual([]);
-    expect(result.held).toMatchObject([{ held: 'per-PR-head cap' }]);
+    expect(result.held).toEqual([{ ...restarts[0], held: expect.stringMatching(/restart per-head cap.*operator/) }]);
   });
-  it('legacy records missing headCap conservatively spend the shared budget', () => {
-    const { headCap, ...legacy } = capped;
-    const result = planStallActions([ordinary[0]], {
-      now: NOW, limits: { ...limits, maxActionsPerPrHead: 1 }, history: [record(legacy)],
-    });
-    expect(result.act).toEqual([]);
-    expect(result.held).toMatchObject([{ held: 'per-PR-head cap' }]);
-  });
-  it.each([0, -1, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])('invalid headCap %s holds for operator budget inspection', headCap => {
-    const result = planStallActions([{ ...capped, headCap }], { now: NOW, limits });
-    expect(result.act).toEqual([]);
-    expect(result.held).toMatchObject([{ held: 'per-PR-head cap' }]);
+  it.each([false, true])('persisted restart records with legacy headCap=%s use action kind for both budgets', legacy => {
+    const history = restarts.map(it => record({ ...it, ...(legacy ? { headCap: 2 } : {}) }));
+    const next = item('restart-red-team', 'restart-3');
+    const result = planStallActions([...ordinary, next], { now: NOW, limits, history });
+    expect(result.act).toEqual(ordinary);
+    expect(result.held).toEqual([{ ...next, held: expect.stringMatching(/restart per-head cap.*operator/) }]);
   });
 });
 

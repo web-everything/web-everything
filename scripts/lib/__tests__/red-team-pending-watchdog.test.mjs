@@ -63,6 +63,11 @@ describe('planPendingRedTeam', () => {
   it.each([2, 3, 100])('exhausts after %s restarts rather than retrying forever', restarts => {
     expectKind({ restarts, minutesSinceLastRestart: 180 }, 'exhausted');
   });
+  it.each([0, 1, 2])('admits exactly %s spaced restarts before operator escalation', maxRestarts => {
+    const kinds = [0, 1, 2].map(restarts => expectKind({ maxRestarts, restarts, minutesSinceLastRestart: 60 },
+      restarts < maxRestarts ? 'restart' : 'exhausted').kind);
+    expect(kinds.filter(kind => kind === 'restart')).toHaveLength(maxRestarts);
+  });
   it('honors explicit threshold, restart ceiling and stale-run deadline overrides', () => {
     expectKind({ thresholdMinutes: 90, ageMinutes: 89 }, 'wait');
     expectKind({ thresholdMinutes: 90, ageMinutes: 100, restarts: 1, minutesSinceLastRestart: 89 }, 'wait');
@@ -100,6 +105,7 @@ describe('planPendingRedTeam', () => {
     expectKind({ minutesSinceLastRestart: null }, 'restart');
   });
   it('a configured zero-restart budget immediately escalates an old orphan', () => {
-    expectKind({ maxRestarts: 0 }, 'exhausted');
+    expect(expectKind({ maxRestarts: 0 }, 'exhausted').reason).toMatch(/disabled.*maxRedTeamRestartsPerHead=0.*operator/);
+    expectKind({ maxRestarts: 0, status: { status: 'finished', result: { status: 'ran' } } }, 'publish-result');
   });
 });
