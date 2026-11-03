@@ -5096,7 +5096,12 @@ export function decide(command, ctx = {}) {
         : ['export', 'readonly'].includes(canonicalWords[0]) && optionWords.some((t) => /^-[A-Za-z]*f/.test(t));
       const versionDependent = ['export', 'readonly'].includes(canonicalWords[0])
         && optionWords.some((t) => /^-[A-Za-z]*p/.test(t));
-      const uncertain = redirected || badOption || versionDependent;
+      // Recognizing a declaration flag does not prove the assignment succeeded. Attribute conversion
+      // (arrays, integers, namerefs, case conversion), scope flags and version-specific flags can reject
+      // it or store a different value. Only ordinary export/readonly attributes prove replacement here.
+      const attributeDeclaration = ['declare', 'typeset', 'readonly'].includes(canonicalWords[0])
+        && optionWords.some((t) => !/^[-+][rx]+$/.test(t));
+      const uncertain = redirected || badOption || versionDependent || attributeDeclaration;
       if (!seg.trim().startsWith('(') && canonicalWords[0] === 'unset') {
         let variables = true;
         let options = true;
@@ -5117,7 +5122,7 @@ export function decide(command, ctx = {}) {
         && ['export', 'declare', 'typeset', 'readonly'].includes(canonicalWords[0]);
       if (directive || words.every((t) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(t))) {
         const readonly = canonicalWords[0] === 'readonly'
-          || (['declare', 'typeset'].includes(canonicalWords[0]) && canonicalWords.some((t) => /^-[A-Za-z]*r[A-Za-z]*$/.test(t)));
+          || (['declare', 'typeset'].includes(canonicalWords[0]) && optionWords.some((t) => /^-[A-Za-z]*r[A-Za-z]*$/.test(t)));
         const leadingWords = gitLeadingAssignments(seg).map((m) => m[0]);
         const assignments = directive ? [...leadingWords, ...(printsOnly ? [] : canonicalWords)] : words;
         for (const word of assignments) {

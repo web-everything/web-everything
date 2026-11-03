@@ -3828,6 +3828,31 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     expect(decide(`export GIT_DIR=${CLONE}/.git; ${directive} GIT_DIR=/safe/.git; git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
   });
 
+  it.each(['declare', 'typeset'])('does not invent a readonly lock from a trailing dash operand: %s', (builtin) => {
+    const ctx = { cwd: LANE, daemonCloneRoots: roots };
+    for (const separator of ['', '-- ']) {
+      expect(decide(`${builtin} -x ${separator}GIT_DIR=/safe -r; export GIT_DIR=${CLONE}/.git; git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
+    }
+  });
+
+  it.each(['GIT_DIR', 'GIT_WORK_TREE', 'GIT_CONFIG', 'TARGET'].flatMap((key) =>
+    ['declare', 'typeset', 'readonly'].flatMap((builtin) =>
+      (builtin === 'readonly' ? ['-a', '-A', '-aA'] : ['-n', '-i', '-l', '-u', '-a', '-A', '-g', '-I', '-t', '-xn', '+n'])
+        .map((option) => ({ key, builtin, option })))))(
+    'DENIES after an attribute declaration that may reject replacement of $key: $builtin $option', ({ key, builtin, option }) => {
+      const target = key === 'GIT_DIR' ? `${CLONE}/.git` : key === 'GIT_CONFIG' ? `${CLONE}/config` : CLONE;
+      const mutation = key === 'GIT_CONFIG' ? 'git config user.name example'
+        : key === 'TARGET' ? 'git --config-env=core.worktree=TARGET reset --hard' : 'git reset --hard';
+      const ctx = { cwd: LANE, daemonCloneRoots: roots };
+      const declaration = `${builtin} ${option} ${key}=/safe`;
+      // Recognition of an option does not prove the builtin accepted its assignment.
+      for (const middle of [declaration, `eval '${declaration}'`]) {
+        expect(decide(`export ${key}=${target}; ${middle}; ${mutation}`, ctx), middle).toMatch(/DAEMON CLONE/);
+      }
+      expect(decide(`export ${key}=${target}; ${declaration}; git log`, ctx)).toBeNull();
+    },
+  );
+
   it('ALLOWS lane mutations after many skipped unrelated assignments', () => {
     // Possible values are tracked per variable, so unrelated conditional assignments add no unknown target.
     const skipped = Array.from({ length: 12 }, (_, i) => `false && export V${i}=${i}`).join('; ');
@@ -4307,6 +4332,20 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
       }
     },
   );
+
+  it.each(['GIT_DIR', 'GIT_WORK_TREE'].flatMap((key) =>
+    ['declare -n', 'typeset -xn', 'declare -g', 'readonly -A'].map((directive) => ({ key, directive }))
+  ))('DENIES rejected declaration replacements through the CLI: $key $directive', ({ key, directive }) => {
+    const value = key === 'GIT_DIR' ? `${fakeClone}/.git` : fakeClone;
+    const prefix = `export ${key}=${value}; ${directive} ${key}=/safe;`;
+    expect(runHook(`${prefix} git reset --hard`, lane)?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    expect(runHook(`${prefix} git log`, lane)).toBeNull();
+  });
+
+  it('DENIES a protected assignment after a trailing -r operand through the CLI', () => {
+    const command = `declare -x GIT_DIR=/safe -r; export GIT_DIR=${fakeClone}/.git; git reset --hard`;
+    expect(runHook(command, lane)?.hookSpecificOutput?.permissionDecision).toBe('deny');
+  });
 
   it('DENIES non-persisting subshell environment mutations through the CLI', () => {
     for (const mutation of [`export GIT_DIR=${lane}/.git`, 'unset GIT_DIR']) {

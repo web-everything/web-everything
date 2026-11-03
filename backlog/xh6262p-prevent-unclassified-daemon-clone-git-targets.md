@@ -23,7 +23,7 @@ The advisory also owes deterministic coverage of earlier HOME assignments for gl
 
 The advisory's `codex-correctness` panel reports `prevention-outstanding`. Its HOME prevention request is filed here as A4; filing it does not assert that the disputed behavior is a confirmed defect. This card stays open until its executable acceptance criteria are delivered.
 
-Prevention receipt for the advisory posted **2026-11-03T04:01:53Z**, `codex-correctness/correctness` at `scripts/guard-bash.mjs:1975`: “Add a deterministic parameterized regression test covering earlier HOME assignments for -C, --git-dir, and --work-tree, and pass the tracked effective HOME into normalization.” A4 below owns that request, including the required reconciliation with the current `not-real` ruling. Filing this receipt does not claim that the tests or runtime change have shipped.
+Prevention receipt for the advisory posted **2026-11-03T04:01:53Z**, `codex-correctness/correctness` at `we:scripts/guard-bash.mjs:1975`: “Add a deterministic parameterized regression test covering earlier HOME assignments for -C, --git-dir, and --work-tree, and pass the tracked effective HOME into normalization.” A4 below owns that request, including the required reconciliation with the current `not-real` ruling. Filing this receipt does not claim that the tests or runtime change have shipped.
 
 | Advisory finding | Filed prevention |
 | --- | --- |
@@ -53,6 +53,12 @@ If the reconciled semantics require tracked HOME, carry the same effective value
 
 - Execute candidate shell commands or Git mutations against a resident daemon clone.
 - Change unrelated guard policies, clear human review, or treat advisory findings as an operator verdict.
+
+## Operator send-back regression coverage
+
+The still-blocking round-6 declaration-options send-back has a separate regression matrix in `we:scripts/__tests__/guard-bash.test.mjs`: recognized `declare`, `typeset` and `readonly` options cannot erase an earlier protected target merely because the option spelling is recognized. Cover nameref, integer, case, array, scope, inherited-attribute and trace options, bundles and plus options; include eval, read controls and the hook JSON boundary. Only ordinary export/readonly attributes establish unconditional replacement. A trailing `-r` after a name or `--` is an operand and cannot invent a readonly lock that hides a later protected assignment.
+
+This is conservative preservation of possible earlier values, not full interpretation of shell variable attributes or completion of A1–A4. The advisory prevention obligations above remain open, and the supplied HOME `not-real` ruling remains in force.
 
 ## Edge cases
 
