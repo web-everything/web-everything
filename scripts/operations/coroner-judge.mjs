@@ -6,6 +6,35 @@
  */
 import { FENCED_DATA_RULE, fenceUntrusted } from '../lib/mandate-fence.mjs';
 
+// Display text is untrusted even after schema validation. Only code emits structural lines.
+const TRUNCATED = '[truncated; see coroner report]';
+function heldText(value, limit) {
+  let text = String(value ?? '').replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ').replace(/\s+/gu, ' ').trim();
+  if (/^(?:\d+\.|Coroner key:|Fix idea:|Evidence:|Scope:|[#*+>_`~\-=])/i.test(text)) text = `\\${text}`;
+  return text.length > limit ? `${text.slice(0, limit - TRUNCATED.length)}${TRUNCATED}` : text;
+}
+
+/** Pure held-list rendering: display fields are bounded; numbering and the ranked-key receipt are code-owned.
+ * Truncated fields point the operator to the full extraction report rather than hiding the bound.
+ */
+export function renderHeldEntry({ title, count, minutes, examples, proposedFix, key }, { number, night }) {
+  if (typeof key !== 'string' || !key || key !== key.trim() || key.length > 512 || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(key)) {
+    throw new Error('invalid coroner filing key; run manual /coroner');
+  }
+  if (!Number.isSafeInteger(number) || number < 1 || !/^\d{4}-\d{2}-\d{2}$/.test(night)) {
+    throw new Error('invalid coroner held numbering or night; run manual /coroner');
+  }
+  const refs = Array.isArray(examples) ? examples.slice(0, 10).map((example) => heldText(example?.ref, 300)) : [];
+  if (examples?.length > 10) refs.push(TRUNCATED);
+  const evidence = heldText(refs.join('; '), 3200);
+  const measuredCount = Number.isFinite(count) && count >= 0 ? count : 'unknown';
+  const measuredMinutes = Number.isFinite(minutes) && minutes >= 0 ? minutes : 'unknown';
+  return `\n${number}. (coroner-${night}, held) **${heldText(title, 300)}.** Count: ${measuredCount}; minutes: ${measuredMinutes}.
+    Fix idea: ${heldText(proposedFix, 1600)}
+    Evidence: ${evidence}. Scope: we:scripts/. Size 3.
+    Coroner key: ${key}`;
+}
+
 export function rankFrictions(metrics, { topN = 5 } = {}) {
   const rows = [];
   for (const [metric, value] of Object.entries(metrics?.errorRates ?? {})) {
@@ -36,7 +65,7 @@ const SHAPE = {
 export async function judgeFrictions({ ranked, held = [], openPrs = [], recentCards = [], judge, log = console.error }) {
   try {
     const answer = await judge({
-      mandate: `${FENCED_DATA_RULE}\nUse only the supplied evidence; do not call tools. Compare each cause against held items, open PRs, then recent cards. Return NEW only for a concrete actionable cause with examples that no existing item would remove. For each NEW verdict, supply a non-empty proposedFix describing the concrete change to the daemon or tooling that handles the cause automatically. Otherwise return COVERED-BY with its reference (proposedFix may be empty), or omit uncertain candidates. Return only the requested schema.`,
+      mandate: `${FENCED_DATA_RULE}\nUse only the supplied evidence. This judge runs with the tool-free provider (--tools ""); no tools are available. Compare each cause against held items, open PRs, then recent cards. Return NEW only for a concrete actionable cause with examples that no existing item would remove. For each NEW verdict, supply a non-empty proposedFix describing the concrete change to the daemon or tooling that handles the cause automatically. Otherwise return COVERED-BY with its reference (proposedFix may be empty), or omit uncertain candidates. Return only the requested schema.`,
       input: fenceUntrusted('material', JSON.stringify({ ranked, held, openPrs, recentCards })), shape: SHAPE,
     });
     const verdicts = answer?.value?.verdicts;
@@ -68,7 +97,7 @@ export async function fileNewCards({ ranked, verdicts, state, fileItem, maxCards
     signal?.throwIfAborted();
     // The sink must deduplicate by key: recovery after a failed save returns the same receipt.
     // Recovered receipts count toward this run's cap exactly like newly appended cards.
-    const item = await fileItem({ key: row.key, examples: row.examples, title: `Coroner: ${row.metric} / ${row.cause}`, kind: 'story', size: '3',
+    const item = await fileItem({ key: row.key, count: row.count, minutes: row.minutes, examples: row.examples, title: `Coroner: ${row.metric} / ${row.cause}`, kind: 'story', size: '3',
       queue: 'false', proposedFix: matches[0].proposedFix, digest: `Recurring delivery friction: ${row.cause}. Count: ${row.count}; minutes: ${row.minutes ?? 'unknown'}. Evidence: ${JSON.stringify(row.examples)}.` });
     if (!item || !(item.id || item.rel)) throw new Error('file-item returned no card receipt');
     state.filed[row.key] = item.id ?? item.rel;

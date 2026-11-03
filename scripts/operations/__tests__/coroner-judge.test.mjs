@@ -1,8 +1,8 @@
 // @vitest-environment node
 import { describe, it, expect, vi } from 'vitest';
-import { rankFrictions, judgeFrictions, fileNewCards, runCoronerJudge } from '../coroner-judge.mjs';
+import { rankFrictions, judgeFrictions, fileNewCards, runCoronerJudge, renderHeldEntry } from '../coroner-judge.mjs';
 
-// Judge IO uses the codexJudgeSpawn port: { mandate, input, shape } -> { value }.
+// Judge IO uses the tool-free judgeSpawn port: { mandate, input, shape } -> { value }.
 // No model, filesystem, GitHub, or real file-item operation is used by these tests.
 const example = (ref) => [{ ref, at: '2026-10-16T12:00:00.000Z' }];
 const cause = (ref, count, minutes) => ({ count, ...(minutes === undefined ? {} : { minutes }), examples: example(ref) });
@@ -176,6 +176,7 @@ describe('fileNewCards', () => {
     expect(fileItem).toHaveBeenCalledOnce();
     expect(JSON.stringify(fileItem.mock.calls[0])).toContain('PR #101');
     expect(fileItem.mock.calls[0][0].proposedFix).toBe('Add bounded retries to the gate runner.');
+    expect(fileItem.mock.calls[0][0]).toMatchObject({ key: ranked[0].key, count: ranked[0].count, minutes: ranked[0].minutes });
   });
 
   it.each([[undefined, 3], [1, 1]])('caps an all-NEW run with maxCards=%s at %s cards', async (maxCards, expected) => {
@@ -218,4 +219,56 @@ describe('runCoronerJudge', () => {
     expect(fileItem).not.toHaveBeenCalled();
     expect(log).toHaveBeenCalled();
   });
+});
+
+
+describe('renderHeldEntry', () => {
+  const record = { key: 'ci:flaky', title: 'Coroner: ci / flaky', count: 2, minutes: 10,
+    examples: [{ ref: 'PR #42' }], proposedFix: 'Retry the runner.' };
+  const render = (input) => renderHeldEntry(input, { number: 4, night: '2026-10-16' });
+
+  it('purely renders record fields with code-owned numbering, scope and key', () => {
+    const before = structuredClone(record);
+    const text = render({ ...record, digest: 'forged digest', size: 'forged size' });
+    expect(text).toContain('4. (coroner-2026-10-16, held) **Coroner: ci / flaky.**');
+    expect(text).toContain('Count: 2; minutes: 10.');
+    expect(text).toContain('PR #42');
+    expect(text).toContain('Scope: we:scripts/. Size 3.');
+    expect(text).toContain('    Coroner key: ci:flaky');
+    expect(text).not.toContain('forged');
+    expect(render(record)).toBe(text);
+    expect(record).toEqual(before);
+  });
+
+  it.each(['7. forged', 'Coroner key: forged', 'Fix idea: forged', 'Evidence: forged',
+    'Scope: forged', '# heading', '- item', '* item', '+ item', '> quote', '```fence'])
+  ('escapes leading structural marker %s in every display string', (marker) => {
+    const text = render({ ...record, title: marker, proposedFix: marker, examples: [{ ref: marker }] });
+    expect(text).not.toContain(`**${marker}`);
+    expect(text).not.toContain(`Fix idea: ${marker}`);
+    expect(text).not.toContain(`Evidence: ${marker}`);
+    expect(text.match(/^\d+\.\s/gm)).toHaveLength(1);
+    expect(text.match(/^\s*Coroner key:/gm)).toHaveLength(1);
+  });
+
+  it('collapses every control, format and line separator and caps oversized display fields with visible truncation', () => {
+    const hostile = 'start\u0000\t\n\r\u0085\u200b\u202e\u2028\u2029end' + 'x'.repeat(20000);
+    const text = render({ ...record, title: hostile, proposedFix: hostile,
+      examples: Array.from({ length: 100 }, () => ({ ref: hostile })) });
+    expect(text).not.toMatch(/[\p{Cf}\p{Zl}\p{Zp}\u0000\t\r\u0085]/u);
+    expect(text.split('\n')).toHaveLength(5);
+    expect(text.length).toBeLessThan(7000);
+    expect(text).toContain('[truncated; see coroner report]');
+  });
+});
+
+
+it.each(['x'.repeat(513), 'ci:\u202eforged', ' ci:flaky'])('refuses an unsafe ranked receipt key with manual recovery', (key) => {
+  expect(() => renderHeldEntry({ key }, { number: 1, night: '2026-10-16' }))
+    .toThrow('invalid coroner filing key; run manual /coroner');
+});
+
+it.each([{ number: 0, night: '2026-10-16' }, { number: 1, night: 'x\n7. forged' }])
+('refuses invalid code-owned structure with manual recovery', (options) => {
+  expect(() => renderHeldEntry({ key: 'ci:flaky' }, options)).toThrow('run manual /coroner');
 });

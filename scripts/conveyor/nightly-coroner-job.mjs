@@ -16,8 +16,7 @@ import { handoffHome } from '../operations/handoff-home.mjs';
 import { feedPath, appendLines, sanitizeForFeed } from '../operations/needs-you-feed.mjs';
 import { scrubText } from './health-watch-core.mjs';
 import { prSweepTickAllowed } from './pr-sweep-job.mjs';
-import { runCoronerJudge, rankFrictions } from '../operations/coroner-judge.mjs';
-import { codexJudgeSpawn } from '../lib/codex-judge-spawn.mjs';
+import { runCoronerJudge, rankFrictions, renderHeldEntry } from '../operations/coroner-judge.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { fenceUntrusted } from '../lib/mandate-fence.mjs';
 import { withFileLock } from '../lib/atomic-json-file.mjs';
@@ -251,7 +250,7 @@ function readJudgeCoverage(sourceRoot, home) {
 }
 /** Held-list sink shared by fresh filings and crash recovery. The key line is the durable receipt. */
 export function appendHeldCoronerCard(input, { home = handoffHome(), night } = {}) {
-  if (typeof input.key !== 'string' || !input.key || /[\r\n]/.test(input.key)) throw new Error('invalid coroner filing key');
+  if (typeof input.key !== 'string' || !input.key || input.key !== input.key.trim() || input.key.length > 512 || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(input.key)) throw new Error('invalid coroner filing key; run manual /coroner');
   const path = join(home, 'cards-to-file.md');
   const inspectHeld = () => {
     let held = '';
@@ -276,10 +275,7 @@ export function appendHeldCoronerCard(input, { home = handoffHome(), night } = {
       // Re-read under the shared writer lock: the optimistic read may have missed an append.
       const { receipt, number } = inspectHeld();
       if (receipt) return receipt;
-      appendLines(path, [`\n${number}. (coroner-${night}, held) **${input.title}.** ${input.digest}
-    Fix idea: ${input.proposedFix}
-    Evidence: ${JSON.stringify(input.examples ?? [])}. Scope: we:scripts/. Size ${input.size}.
-    Coroner key: ${input.key}`]);
+      appendLines(path, [renderHeldEntry(input, { number, night })]);
       return { id: `cards-to-file.md#${number}` };
     }, { timeoutMs: 0 });
   } catch (e) {
@@ -289,6 +285,18 @@ export function appendHeldCoronerCard(input, { home = handoffHome(), night } = {
     throw e;
   }
 }
+/** Refuse tool-bearing requests and provider failures; never substitute a read-only shell provider. */
+export async function spawnToolFreeCoronerJudge(request, { load = () => import('../lib/judge-spawn.mjs') } = {}) {
+  if ('allowedTools' in request) throw new Error('coroner refuses allowedTools: tool-free judgeSpawn is required; run manual /coroner');
+  try {
+    const { judgeSpawn } = await load();
+    if (typeof judgeSpawn !== 'function') throw new Error('judgeSpawn export unavailable');
+    const outcome = await judgeSpawn(request); // No allowedTools: judgeSpawn enforces --tools "".
+    return { value: outcome.value };
+  } catch (cause) {
+    throw new Error('coroner tool-free judgeSpawn unavailable or failed; retry later or run manual /coroner', { cause });
+  }
+}
 /** `signal` aborts the acquire and extractor subprocesses (a stop); the lane release is never given it. */
 export async function extractNightlyCoroner({ night, until, dir, settings, nightly = NIGHTLY_DEFAULTS, sourceRoot = ROOT, laneSession = CORONER_LANE_SESSION }, {
   root = ROOT, home = handoffHome(), statusFeed = feedPath(), run = command, signal,
@@ -296,13 +304,14 @@ export async function extractNightlyCoroner({ night, until, dir, settings, night
   release = async (lane) => run([join(root, 'scripts/lane-pool.mjs'), 'release', `--lane=${lane.lane}`, `--session=${lane.holder}`, `--repo=${sourceRoot}`], sourceRoot,
     signal?.aborted ? { timeout: RELEASE_TIMEOUT_MS } : {}),
   sweep = async () => sweepCoronerLeases(root, sourceRoot, laneSession, run),
+  loadJudgeSpawn = () => import('../lib/judge-spawn.mjs'),
   judge = async (request) => {
     signal?.throwIfAborted();
     const coverage = readJudgeCoverage(sourceRoot, home);
     signal?.throwIfAborted();
-    // codexJudgeSpawn supplies the schema and read-only sandbox; the mandate prohibits tool use.
-    return codexJudgeSpawn({ ...request, input: `${request.input}\n${fenceUntrusted('material', JSON.stringify(coverage))}`,
-      timeoutMs: 5 * 60000 });
+    // judgeSpawn enforces the schema and --tools ""; an unavailable provider fails judgment closed.
+    return spawnToolFreeCoronerJudge({ ...request, input: `${request.input}\n${fenceUntrusted('material', JSON.stringify(coverage))}`,
+      timeoutMs: 5 * 60000 }, { load: loadJudgeSpawn });
   },
   fileItem = async (input) => appendHeldCoronerCard(input, { home, night }),
 } = {}) {
