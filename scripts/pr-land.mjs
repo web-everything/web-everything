@@ -131,7 +131,6 @@ import { writeAllSync } from './lib/write-all-sync.mjs';
 import { admittedArgv } from './readiness/heavy-admission.mjs'; // xaipsbs — the heal's check:standards waits for a heavy-command slot
 import { verifyGateDecision, readVerifyMarker, resolveVerifyOptions } from './lib/lane-verify.mjs'; // #2833 — the lane-verification finish-guard: refuse to land a HEAD whose synchronous suite run never finished (or, under --require-verified, was never recorded green). readVerifyMarker/resolveVerifyOptions are the SHARED marker reader + option resolver (findings 2/5) both this gate and verify-lane use, so the two can never drift (readVerifyMarker owns the VERIFY_FILENAME path — no bare JSON.parse of the marker here).
 import { MAIN_CI_RED_DEFAULTS } from './conveyor/main-ci-red-core.mjs'; // card xu1nixv — a red-main fix PR never opens as a draft
-import { readSettings } from './lib/settings-files.mjs'; // R502 item 2 — guard-config paths that open ready
 
 import { laneRelevantChangeSinceForRecord } from './lib/verify-lane-gate.mjs'; // #4296 — keys the finish-guard's marker match to what LANE-RELEVANT files changed since the marker's recorded sha, not the exact commit (a no-op merge of BASE that conflicts only outside the lane's own touch-set must not force a fresh full re-verify).
 
@@ -875,7 +874,8 @@ async function runCli() {
   // are excluded (their poll loop has no `'DRAFT'` branch and would spin to timeout).
   let readyOnOpen = false;
   try {
-    const guardConfigPaths = readSettings().prLandReady?.guardConfigPaths;
+    // The allowlist is read from the BASE branch, never the PR's own tree: a branch cannot authorise itself.
+    const guardConfigPaths = JSON.parse(gitC(['show', `${REMOTE}/${BASE}:scripts/settings/pr-land-ready.json`])).prLandReady?.guardConfigPaths;
     let changedFiles = [];
     try { changedFiles = String(gitC(['diff', '--name-only', `${REMOTE}/${BASE}...${refSha}`])).split('\n').filter(Boolean); } catch { /* fail closed: stays a draft */ }
     readyOnOpen = decideReadyOnOpen({ body: CREATE_BODY, changedFiles, guardConfigPaths }).ready;
