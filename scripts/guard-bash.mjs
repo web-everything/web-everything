@@ -2405,6 +2405,9 @@ const GIT_TARGET_ENV_KEYS = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_
   'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'XDG_CONFIG_HOME'];
 // How many distinct names one statement's unmodelled-rebinding check reads before it treats ANY name as rebound.
 const REBIND_NAME_CAP = 512;
+const REBINDING_BUILTINS = new Set(['read', 'mapfile', 'readarray', 'printf', 'let', 'for', 'select', 'coproc', 'export',
+  'readonly', 'declare', 'typeset', 'local', 'getopts', 'unset', 'wait']);
+const REBINDING_TEXT = new RegExp(`\\b(?:${[...REBINDING_BUILTINS].join('|')})\\b|\\(\\(|\\[|\\$\\{|\\}[<>]|[A-Za-z0-9_]=`);
 
 // Separate from GIT_STATE_SUBCOMMANDS: new commands and aliases default to denied at protected targets.
 const DAEMON_GIT_READS = new Set(['status', 'log', 'diff', 'show', 'rev-parse', 'rev-list', 'ls-files',
@@ -2478,7 +2481,8 @@ function daemonGitRead(segment, sub) {
   // `grep -O`/`--open-files-in-pager` runs a program; any short bundle holding `O` is read as that option.
   if (sub === 'grep') return !args.some((a) => /^-[^-]*O/.test(a) || spellsLongOption(a, ['--open-files-in-pager']));
   // `ls-remote -u`/`--upload-pack` runs a program.
-  if (sub === 'ls-remote') return !args.some((a) => /^-[^-]*u/.test(a) || spellsLongOption(a, ['--upload-pack'], 3));
+  // (`--exec` is its alias; `--ex` is ambiguous with `--exit-code` and refused too.)
+  if (sub === 'ls-remote') return !args.some((a) => /^-[^-]*u/.test(a) || spellsLongOption(a, ['--upload-pack', '--exec'], 3));
   if (sub === 'config' || sub === 'remote') return !gitConfigOrRemoteWrites(segment, sub);
   if (sub === 'symbolic-ref') {
     return args.filter((a) => !['-q', '--quiet', '--short', '--no-recurse'].includes(a)).length === 1
@@ -3088,8 +3092,8 @@ function expansionWords(text) {
 }
 
 /** git push options whose value is the NEXT word when not attached with `=` (long forms may be abbreviated). */
-// (`--signed` / `--force-with-lease` / `--recurse-submodules` take an ATTACHED optional value only.)
-const GIT_PUSH_VALUE_OPTIONS = ['--repo', '--receive-pack', '--exec', '--push-option'];
+// (`--signed` / `--force-with-lease` take an ATTACHED optional value only; `--recurse-submodules` requires one.)
+const GIT_PUSH_VALUE_OPTIONS = ['--repo', '--receive-pack', '--exec', '--push-option', '--recurse-submodules'];
 
 /** Can no shell expansion in this canonical `git push …` change WHERE it pushes? Pure. True when there is no
  *  expansion, or every expansion sits in the SOURCE of a positional refspec (never the repository operand)
@@ -3283,6 +3287,7 @@ function rebindingOf(name) {
       operand: new RegExp(`(?<![\\w{$./-])${name}(?!\\w)`),
       valued: new RegExp(`^${name}${index}\\+?=`),
       descriptor: new RegExp(`(?<![\\w$])\\{${name}\\}[<>]`),
+      defaulting: new RegExp(`\\$\\{${name}${index}:?=`, 'g'),
     });
   }
   return rebindPatterns.get(name);
@@ -3347,7 +3352,8 @@ function rebindsUnreadably(s, name, p) {
   if (chain && SPECIAL_BUILTIN.test(command)) return true;
   if (command === 'eval' || command === 'source' || command === '.') return true;
   const operands = words.slice(j + 1).map(unquoted);
-  const named = (w) => w === name || w.startsWith('$');                    // `$X` may name anything
+  // `$X` may name anything; `NAME[0]` assigns NAME's first element, which is NAME itself.
+  const named = (w) => w.replace(/\[.*$/s, '') === name || w.startsWith('$');
   if (command === 'coproc') return named(operands[0] ?? '');
   if (command === 'for' || command === 'select') return named(operands[0] ?? '');
   if (command === 'printf') {
@@ -3366,6 +3372,8 @@ function rebindsUnreadably(s, name, p) {
 function rebindsInArithmetic(s, p) {
   const masked = maskQuotedKeepingExpansions(s);
   if (p.descriptor.test(masked)) return true;
+  // `${NAME:=v}` / `${NAME=v}` assign NAME when it is unset (or empty) — outside a child shell it persists.
+  if (/\$\{/.test(masked) && arithmeticOutsideChild(masked, p.defaulting)) return true;
   // `$[…]`, an array subscript (`x[D=6]=1`, `${x[D=7]}`) and a `${D:off:len}` offset are arithmetic too.
   return /\(\(|\[|\$\{/.test(masked) && arithmeticOutsideChild(masked, p.arithmetic);
 }
@@ -5675,16 +5683,23 @@ export function decide(command, ctx = {}) {
           return modelled && !dynamicName ? rebindsInArithmetic(seg.trim(), p) : rebindsUnreadably(seg.trim(), key, p);
         } catch { return true; }
       };
-      // Every name the statement spells (a `--config-env=<key>=NAME` target may be any variable), bounded.
-      // `source`/`.`, or a rebinding through an expanded name (`read $V`) — a name that appears nowhere in the
-      // text still reads as rebound — may change ANY variable: every target is unknown from here on.
+      // `source`/`.` and `eval` of expanded text run script text this hook cannot read. Like the tracker before
+      // this catch-all, they are NOT modelled (`source .venv/bin/activate; git commit` stays allowed); the
+      // allowlist redesign in card xiymj12 owns that residual.
+      const unreadScript = ['source', '.'].includes(programWord(seg)) || (programWord(seg) === 'eval' && !modelled);
+      // Quoted message text is data: it neither triggers the check nor counts toward the name cap. Expansions
+      // inside double quotes are kept (`"${GIT_DIR:=x}"` assigns), and a quoted whole word still names a variable.
+      const masked = maskQuotedKeepingExpansions(seg);
+      const quotedWords = shellWords(seg).map(unquoted).filter((w) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(w));
       // A statement with no rebinding builtin, arithmetic, subscript, descriptor or assignment rebinds nothing.
-      const mayRebind = /\b(?:read|mapfile|readarray|printf|let|for|select|coproc|export|readonly|declare|typeset|local|getopts|unset|wait|eval|source)\b|\(\(|\[|\$\{|\}[<>]|[A-Za-z0-9_]=|^\s*\./.test(unquoted(seg)); // `r\ead` runs `read`
-      const spelled = mayRebind ? [...new Set(seg.match(/[A-Za-z_][A-Za-z0-9_]*/g) || [])] : [];
-      // Past the cap the names are not read one by one: ANY may be rebound (fail closed, the visible
-      // "unresolved git target" deny), never silently unchecked.
-      const anyName = ['source', '.'].includes(programWord(seg)) || spelled.length > REBIND_NAME_CAP
-        || (mayRebind && rebinds('__guard_bash_unspelled_name__'));
+      // `quotedWords` also catches an escaped or quoted builtin word (`r\ead`, `"read"`).
+      const mayRebind = !unreadScript && (REBINDING_TEXT.test(masked) || quotedWords.some((w) => REBINDING_BUILTINS.has(w)));
+      // Every name the statement spells (a `--config-env=<key>=NAME` target may be any variable), bounded.
+      const spelled = mayRebind ? [...new Set([...(masked.match(/[A-Za-z_][A-Za-z0-9_]*/g) || []), ...quotedWords])] : [];
+      // A rebinding through an expanded name (`read $V`) — a name that appears nowhere in the text still reads
+      // as rebound — may change ANY variable. Past the cap the names are not read one by one: also ANY (fail
+      // closed, the visible "unresolved git target" deny), never silently unchecked.
+      const anyName = mayRebind && (spelled.length > REBIND_NAME_CAP || rebinds('__guard_bash_unspelled_name__'));
       for (const key of new Set([...GIT_TARGET_ENV_KEYS, ...(anyName ? [] : spelled)])) {
         if (anyName || (mayRebind && rebinds(key))) setAssignment(key, `\${${key}}`, false, true);
       }

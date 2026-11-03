@@ -3805,6 +3805,8 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
       ['an expanded word that may be an option', 'git push "$OPT" origin HEAD:lane/x'],
       ['an expanded option value', 'git push --repo=$R HEAD:lane/x'],
       ['an expanded separated option value', 'git push -o "$X" origin HEAD:lane/x'],
+      // `--recurse-submodules` takes the next word, so the quoted refspec here is the repository operand.
+      ['a refspec shifted into the repository operand', 'git push --recurse-submodules check "$C:lane/x"'],
       ['a literal lane ref beside an unknown one', 'git push origin HEAD:lane/x "$SPEC"'],
       ['a backtick destination', 'git push origin "HEAD:`printf main`"'],
       ['an ANSI-C quoted word', "git push origin $'HEAD:main'"],
@@ -3859,7 +3861,8 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     'git branch -v newname', 'git branch --set-upstream-to=origin/main', 'git branch -u origin/main',
     'git tag v1', 'git tag -d v1', 'git tag -a v1 -m x', 'git tag -f v1', 'git grep -O touch x',
     'git grep --open-files-in-pager=touch x', 'git grep -nO x', 'git ls-remote --upload-pack=touch origin',
-    'git ls-remote -u touch origin', 'git ls-remote --upl=touch origin', 'git --version reset', 'git --help -w log',
+    'git ls-remote -u touch origin', 'git ls-remote --upl=touch origin', 'git ls-remote --exec=touch origin',
+    'git ls-remote --exec touch origin', 'git ls-remote --exe=touch origin', 'git --version reset', 'git --help -w log',
     'git --exec-path=/x reset --hard'])(
     'DENIES the write or command-running form %s inside a protected clone', (command) => {
       expect(decide(command, { cwd: CLONE, daemonCloneRoots: roots }), command).toMatch(/DAEMON CLONE/);
@@ -3891,8 +3894,10 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
       ['getopts', (k) => `getopts a ${k}`],
       ['a {NAME}> descriptor', (k) => `exec {${k}}>/dev/null`],
       ['an eval of a read', (k) => `eval 'read ${k} <<< ${CLONE}/.git'`],
-      ['an eval of expanded text', () => 'eval "$SETUP"'],
-      ['a sourced file', () => 'source ./env.sh'],
+      ['a := default expansion', (k) => `: \${${k}:=${CLONE}/.git}`],
+      ['a = default expansion', (k) => `: "\${${k}=${CLONE}/.git}"`],
+      ['printf -v into element 0', (k) => `printf -v ${k}[0] %s ${CLONE}/.git`],
+      ['a quoted builtin word', (k) => `"read" ${k} <<< ${CLONE}/.git`],
     ];
     const KEYS = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_CONFIG', 'GIT_CONFIG_GLOBAL', 'XDG_CONFIG_HOME'];
     it.each(WRITERS.flatMap(([name, writer]) => KEYS.map((key) => ({ name, writer, key }))))(
@@ -3911,6 +3916,19 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
       ['an expanded printf -v name', `printf -v "$N" %s ${CLONE}; git --config-env=core.worktree=T reset --hard`],
     ])('%s is unknown after an unmodelled write', (_name, command) => {
       expect(decide(command, { cwd: LANE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
+    });
+    // Sourced files and eval of expanded text run script text the hook cannot read; they are not modelled
+    // (the allowlist redesign in card xiymj12 owns that residual), so common setup lines stay allowed.
+    it.each(['source .venv/bin/activate; git commit -m x', '. ~/.nvm/nvm.sh && git add path && git commit -m x',
+      'eval "$(ssh-agent -s)"; git push origin HEAD:lane/x'])('does not model unread script text: %s', (command) => {
+      expect(decide(command, { cwd: LANE, daemonCloneRoots: roots, gitConfigEnv: { HOME: '/hook-home' } })).toBeNull();
+    });
+    it('quoted message text neither triggers the check nor counts toward the name cap', () => {
+      const words = Array.from({ length: 600 }, (_, i) => `w${i}`).join(' ');
+      for (const command of [`gh pr comment 6262 --body "Fixed for ${words}"; git push origin HEAD:lane/x`,
+        `git commit -m "read ${words}" && git push origin HEAD:lane/x`]) {
+        expect(decide(command, { cwd: LANE, daemonCloneRoots: roots })).toBeNull();
+      }
     });
     it('an unrelated read leaves the Git targets resolved (no over-deny)', () => {
       expect(decide('for f in a b; do git add $f; done', { cwd: LANE, daemonCloneRoots: roots })).toBeNull();
