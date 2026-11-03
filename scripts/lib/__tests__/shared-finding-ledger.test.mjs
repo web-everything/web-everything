@@ -413,3 +413,14 @@ describe('audit round 13 hardening', () => {
     expect(filterReraises(l, [{ ...a }], { pinStillHolds: () => true }).dropped).toHaveLength(1);
   });
 });
+
+describe('audit round 14 hardening', () => {
+  it('the brief shows the distinguishing evidence of a reopened variant', () => {
+    const a = finding({ failure_scenario: 'GET /login returns 200' });
+    let l = pinFinding(markFixed(record(emptyLedger(), [a]), findingKey(a), { head: H2 }), findingKey(a), PIN);
+    l = recordFindings(l, { source: 'red-team', head: H2, findings: [finding({ failure_scenario: 'GET /admin returns 200', reproCommand: 'curl /admin' })] });
+    const brief = renderOpenForBrief(l);
+    expect(brief).toContain('GET /admin returns 200');
+    expect(brief).toContain('curl /admin');
+  });
+});
