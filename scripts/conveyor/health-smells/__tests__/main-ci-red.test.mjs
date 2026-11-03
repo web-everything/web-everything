@@ -135,7 +135,7 @@ describe('IO probe reads main CI by workflow, not across all workflows (card xfr
       if (argv[1].includes('/runs/2/jobs')) return JSON.stringify({ total_count: 1, jobs: [{ id: 5, name: 'test', conclusion: 'cancelled' }] });
       throw new Error(`unexpected ${argv.join(' ')}`);
     };
-    const out = probeMainCiRuns({ exec, repoSlug: 'o/r' });
+    const out = probeMainCiRuns({ exec, repoSlug: 'o/r', readRequired: () => ({ checks: [] }) });
     expect(calls[0]).toContain('run list --repo o/r --workflow ci.yml --branch main');
     expect(out.runs.find((r) => r.databaseId === 2).infraOnly).toBe(true);
     expect(mainRedState(out.runs).status).toBe('green');
@@ -300,7 +300,7 @@ describe('a truncated read window (live 2026-10-08: 60 runs did not reach the la
       if (argv[0] === 'run') { const n = Number(argv[argv.indexOf('--limit') + 1]); limits.push(n); return JSON.stringify(page(n === 3 ? 3 : 5)); }
       return JSON.stringify({ total_count: 1, jobs: [{ id: 1, name: 'test', conclusion: 'failure' }] });
     };
-    const out = probeMainCiRuns({ exec, settings: mainCiRedSettings({ mainCiRedRunLimit: 3, mainCiRedRunLimitMax: 5 }) });
+    const out = probeMainCiRuns({ exec, readRequired: () => ({ checks: [] }), settings: mainCiRedSettings({ mainCiRedRunLimit: 3, mainCiRedRunLimitMax: 5 }) });
     expect(limits).toEqual([3, 5]);
     expect(mainRedState(out.runs).lastGreen).not.toBeNull();
   });
@@ -454,7 +454,7 @@ describe('F2 — the REAL first red run is checked for "infra only", however dee
     return JSON.stringify([]);
   };
   it('an infra-only oldest red run is skipped: the first red commit is the oldest GENUINE failure', () => {
-    const out = probeMainCiRuns({ exec: execFor([1]), repoSlug: 'o/r' });
+    const out = probeMainCiRuns({ exec: execFor([1]), repoSlug: 'o/r', readRequired: () => ({ checks: [] }) });
     const st = mainRedState(out.runs);
     expect(st.status).toBe('red');
     expect(st.firstRed.runId).toBe(2);
@@ -462,7 +462,7 @@ describe('F2 — the REAL first red run is checked for "infra only", however dee
   });
   it('a run of several infra-only runs at the front of the window is skipped too, within a bounded number of job reads', () => {
     const calls = [];
-    const out = probeMainCiRuns({ exec: execFor([1, 2, 3], calls), repoSlug: 'o/r' });
+    const out = probeMainCiRuns({ exec: execFor([1, 2, 3], calls), repoSlug: 'o/r', readRequired: () => ({ checks: [] }) });
     expect(mainRedState(out.runs).firstRed.runId).toBe(4);
     expect(calls.length).toBeLessThanOrEqual(12); // bounded: 4 newest + at most a few front-of-window reads
   });
@@ -471,17 +471,17 @@ describe('F2 — the REAL first red run is checked for "infra only", however dee
       if (argv[0] === 'run') return JSON.stringify([green, { ...runRow(1), conclusion: 'startup_failure' }]);
       return JSON.stringify({ total_count: 0, jobs: [] });
     };
-    const st = mainRedState(probeMainCiRuns({ exec, repoSlug: 'o/r' }).runs);
+    const st = mainRedState(probeMainCiRuns({ exec, repoSlug: 'o/r', readRequired: () => ({ checks: [] }) }).runs);
     expect(st.status).toBe('red');
     expect(st.firstRed.runId).toBe(1);
   });
   it('a genuinely failing oldest run is kept (no change to the 2026-10-08 shape)', () => {
-    const out = probeMainCiRuns({ exec: execFor([]), repoSlug: 'o/r' });
+    const out = probeMainCiRuns({ exec: execFor([]), repoSlug: 'o/r', readRequired: () => ({ checks: [] }) });
     expect(mainRedState(out.runs).firstRed.runId).toBe(1);
   });
   it('an unreadable job list on the candidate never promotes a later run: it stays the candidate (unknown never acts as green)', () => {
     const exec = (cmd, argv) => { if (argv[0] === 'run') return JSON.stringify([green, runRow(1), runRow(2)]); throw new Error('jobs unreadable'); };
-    expect(mainRedState(probeMainCiRuns({ exec, repoSlug: 'o/r' }).runs).firstRed.runId).toBe(1);
+    expect(mainRedState(probeMainCiRuns({ exec, repoSlug: 'o/r', readRequired: () => ({ checks: [] }) }).runs).firstRed.runId).toBe(1);
   });
 });
 
