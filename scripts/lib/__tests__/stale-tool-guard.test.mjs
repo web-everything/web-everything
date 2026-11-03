@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync,
+  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -174,6 +174,90 @@ const nodeCalls = (h) => h.exec.mock.calls.filter(([cmd]) => cmd === process.exe
 const removals = (h) => h.exec.mock.calls.filter(([, args]) => args.includes('worktree') && args.includes('remove'));
 
 describe('review regressions', () => {
+  it.each(['file', 'directory', 'chain'])('checks the real tool checkout when invoked through an external %s symlink', kind => {
+    const outside = scratch();
+    const fixture = mkdtempSync(join(ROOT, '.fix-tool-'));
+    garbage.push(fixture);
+    put(fixture, 'tool.mjs', "import { guardToolEntry } from '../scripts/lib/stale-tool-guard-entry.mjs';\nawait guardToolEntry();\nconsole.log('guard passed');\n");
+    let alias = join(outside, 'tool.mjs');
+    if (kind === 'directory') {
+      symlinkSync(fixture, join(outside, 'alias-directory'));
+      alias = join(outside, 'alias-directory/tool.mjs');
+    } else {
+      symlinkSync(join(fixture, 'tool.mjs'), join(outside, 'target.mjs'));
+      symlinkSync(kind === 'chain' ? './target.mjs' : join(fixture, 'tool.mjs'), alias);
+    }
+    const trace = join(outside, 'git-calls.jsonl');
+    put(outside, 'bin/git', `#!${process.execPath}
+const { appendFileSync } = require('node:fs');
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(trace)}, JSON.stringify({ args, cwd: process.cwd() }) + '\\n');
+if (args.includes('rev-parse') || args.includes('merge-base')) console.log('${UPSTREAM_COMMIT}');
+else if (args.includes('rev-list')) console.log('0');
+else if (!args.includes('fetch') && !args.includes('diff')) process.exit(99);
+`);
+    chmodSync(join(outside, 'bin/git'), 0o755);
+    const env = { ...process.env, PATH: `${join(outside, 'bin')}:${process.env.PATH}`,
+      WE_TOOL_STALE_MODE: 'refuse', WE_TOOL_STALE_THRESHOLD: '5' };
+    delete env.NODE_OPTIONS;
+    delete env.VITEST;
+    const result = spawnSync(process.execPath, [alias], { cwd: outside, env,
+      encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain('guard passed');
+    const calls = readFileSync(trace, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(calls.map(call => call.args[2])).toEqual(['fetch', 'rev-parse', 'rev-list', 'merge-base', 'diff']);
+    for (const call of calls) {
+      expect(call.cwd).toBe(realpathSync(ROOT));
+      expect(call.args.slice(0, 2)).toEqual(['-C', realpathSync(ROOT)]);
+    }
+  });
+
+  it.each(['ref changed', 'lock exists'])('retries a transient fetch %s before checking freshness', async kind => {
+    const { guardToolCheckout } = await load();
+    const h = harness({ behind: '0\n', changed: '' });
+    const runner = h.exec.getMockImplementation();
+    let fetches = 0;
+    h.exec.mockImplementation((command, args, options) => {
+      if (args.includes('fetch') && ++fetches === 1) return { status: 1, stdout: '', stderr: kind === 'ref changed'
+        ? "error: cannot lock ref 'refs/remotes/origin/main': is at abc but expected def"
+        : "Unable to create 'refs/remotes/origin/main.lock': File exists" };
+      return runner(command, args, options);
+    });
+    await expect(guardToolCheckout({ ...h, env: { WE_GIT_LOCK_RETRY_BASE_MS: '0' } })).resolves.toBeUndefined();
+    expect(fetches).toBe(2);
+    expect(h.exec.mock.calls.some(([, args]) => args.includes('diff'))).toBe(true);
+  });
+
+  it('normalizes an explicitly supplied checkout symlink with the entry', async () => {
+    const { guardToolCheckout } = await load();
+    const h = harness({ behind: '0\n', changed: '' });
+    const alias = join(scratch(), 'checkout');
+    symlinkSync(h.root, alias);
+    await expect(guardToolCheckout({ ...h, root: alias, entry: join(alias, 'scripts/tool.mjs') }))
+      .resolves.toBeUndefined();
+    expect(h.exec.mock.calls[0][1].slice(0, 2)).toEqual(['-C', realpathSync(h.root)]);
+  });
+
+  it('refuses a dangling entry symlink before collecting Git evidence', async () => {
+    const { guardToolCheckout } = await load();
+    const h = harness();
+    const alias = join(scratch(), 'missing-tool.mjs');
+    symlinkSync(join(h.root, 'missing.mjs'), alias);
+    await expect(guardToolCheckout({ ...h, entry: alias })).rejects.toThrow('ENOENT');
+    expect(h.exec).not.toHaveBeenCalled();
+  });
+
+  it('fails closed after the bounded fetch lock retries are exhausted', async () => {
+    const { guardToolCheckout } = await load();
+    const h = harness();
+    h.exec.mockReturnValue({ status: 1, stdout: '', stderr: "cannot lock ref 'refs/remotes/origin/main': is at abc but expected def" });
+    await expect(guardToolCheckout({ ...h, env: { WE_GIT_LOCK_RETRY_ATTEMPTS: '2', WE_GIT_LOCK_RETRY_BASE_MS: '0' } }))
+      .rejects.toThrow('git-ref-lock-transient');
+    expect(h.exec).toHaveBeenCalledTimes(2);
+    expect(nodeCalls(h)).toHaveLength(0);
+  });
+
   it.each([
     'git@github.com:web-everything/web-everything.git',
     'ssh://git@github.com:2222/web-everything/web-everything.git',
@@ -422,6 +506,7 @@ describe('guardToolCheckout', () => {
     const h = harness({ fail });
     await expect(async () => guardToolCheckout({ ...h, settings: { mode: 'reexec' } })).rejects.toThrow(`Git ${fail}`);
     expect(nodeCalls(h)).toHaveLength(0);
+    if (fail === 'fetch') expect(h.exec).toHaveBeenCalledTimes(1);
   });
 
   it.each(['fetch', 'rev-parse', 'rev-list', 'merge-base', 'diff'])('fails closed when %s throws', async (fail) => {
@@ -792,7 +877,8 @@ describe('guard bounds and settings', () => {
   it.each(['timeout', 'output overflow'])('refuses a fetch %s with an operator recovery path', async (reason) => {
     const { guardToolCheckout } = await load();
     const h = harness();
-    h.exec.mockReturnValue({ status: null, error: new Error(reason) });
+    h.exec.mockReturnValue({ status: null, error: new Error(reason), stdout: '',
+      stderr: "cannot lock ref 'refs/remotes/origin/main': is at abc but expected def" });
     await expect(guardToolCheckout({ ...h, settings: { mode: 'reexec' } }))
       .rejects.toThrow('Update the tool checkout from origin/main and retry');
     expect(h.exec).toHaveBeenCalledTimes(1);

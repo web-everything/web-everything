@@ -241,6 +241,16 @@ tool through the preload URL's `tool` parameter and their rebuild state director
 `<state>/<clone>.candidate-<token>/scripts/lane-pool.mjs`, including fallback and last-good
 smokes; unrelated candidate children keep native loading. Production has no test-marker exemption.
 
+Production freshness guards must resolve the real entry and checkout paths before collecting Git
+evidence, including external file, directory and chained symlinks. Keep the native-bootstrap
+regressions in `scripts/lib/__tests__/stale-tool-guard.test.mjs`; they capture every Git cwd
+without replacing the production guard. Guard fetches use `retryTransientGit` with complete
+nonzero-exit stderr for ref-lock classification. Exhausted contention, nontransient failures,
+timeouts and output overflow must still refuse; never expose raw Git stderr in the refusal.
+When reconciling `lane-pool.mjs` with main, retain its current pool behavior and await the
+freshness entry before loading dependencies. Its entry-wiring tests pin that ordering and
+the original-checkout fallback used by re-execution.
+
 Post-run transcript diagnostics resolve their policy independently of the optional inspector dependency.
 Keep the named checker-import failure regression in `scripts/__tests__/codex-direct-task.test.mjs`:
 a completed run must still return its report, preserve the shipped warn default, and enforce fail in

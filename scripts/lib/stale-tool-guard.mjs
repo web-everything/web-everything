@@ -1,5 +1,5 @@
 /** Fail closed before a tool runs from a checkout whose static dependencies are stale. */
-import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -7,6 +7,7 @@ import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } fro
 import { readDeclaredSettings } from './settings-files.mjs';
 import { laneGitHardeningEnv, laneGitCheckoutEnv, scrubGitRepoEnv } from './lane-git-hardening.mjs';
 import { checkoutRootFor, guardedPoolRoot } from './lane-pool-paths.mjs';
+import { retryTransientGit } from './git-fetch-retry.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const nonnegative = value => Number.isSafeInteger(value) && value >= 0;
@@ -116,8 +117,8 @@ function checkoutRoot(entry) {
 export async function guardToolCheckout({ entry, root, exec = spawnSync, env = process.env, settings, log = console.error } = {}) {
   try {
     if (typeof entry !== 'string' || !entry) throw new Error('Missing tool entry');
-    entry = resolve(entry);
-    root = resolve(root ?? checkoutRoot(entry));
+    entry = realpathSync(resolve(entry));
+    root = realpathSync(root ?? checkoutRoot(entry));
     const name = within(root, entry);
     const policy = resolveStaleToolSettings({ env, settings, log });
     // No inherited Git repository, executable, config or transport context may redirect this guard.
@@ -127,11 +128,16 @@ export async function guardToolCheckout({ entry, root, exec = spawnSync, env = p
       const result = exec('git', ['-C', cwd, ...args], { cwd, env: commandEnv,
         encoding: 'utf8', timeout: GIT_TIMEOUT_MS, killSignal: 'SIGKILL', maxBuffer: MAX_BUFFER, shell: false });
       if (result?.error || result?.status !== 0 || typeof result.stdout !== 'string') {
-        throw new Error(`Git ${args[0]} failed or exceeded its ${GIT_TIMEOUT_MS}ms / ${MAX_BUFFER}-byte bound`);
+        const error = new Error(`Git ${args[0]} failed or exceeded its ${GIT_TIMEOUT_MS}ms / ${MAX_BUFFER}-byte bound`);
+        // Only complete nonzero exits supply retry evidence. Timeout, overflow and
+        // malformed results remain immediate refusals; stderr is never logged.
+        if (!result?.error && Number.isInteger(result?.status) && result.status !== 0
+          && typeof result.stdout === 'string') error.stderr = result.stderr;
+        throw error;
       }
       return result.stdout;
     };
-    git(['fetch', '--upload-pack=git-upload-pack', '--no-tags', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
+    retryTransientGit(() => git(['fetch', '--upload-pack=git-upload-pack', '--no-tags', 'origin', '+refs/heads/main:refs/remotes/origin/main']), { env });
     // Resolve the exact fetched ref once: local branches/tags can shadow origin/main,
     // and a concurrent fetch must not change the target between checking and reexec.
     const upstream = git(['rev-parse', '--verify', 'refs/remotes/origin/main^{commit}']).trim();
