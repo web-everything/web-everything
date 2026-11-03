@@ -932,7 +932,7 @@ export function probeSessionWatchdog({
 export function probeDrainHistory({ path = defaultDrainHistoryPath(), nowMs = Date.now(), windowMs = 7 * HOUR, read = readJsonlTail } = {}) {
   if (!existsSync(path)) return null;
   const { entries } = read(path, { maxBytes: 4 * 1024 * 1024 });
-  const num0 = (v) => (v == null ? 0 : Number(v));
+  const num0 = (v) => (v == null ? 0 : (typeof v === 'number' && Number.isFinite(v) ? v : NaN)); // only a real number (or absent) counts; false / '' / junk is NaN, so never clean
   const all = entries
     .map((e) => ({ clean: e?.exit === 0 && num0(e?.failed) === 0 && (Array.isArray(e?.failedRepos) ? e.failedRepos.length === 0 : num0(e?.failedRepos) === 0), valid: Number.isFinite(e?.considered) && Number.isFinite(e?.merged), at: Date.parse(e?.at || ''), ms: e?.ms, exit: e?.exit, considered: e?.considered ?? 0, merged: e?.merged ?? 0, deferred: e?.deferred ?? 0, failed: e?.failed ?? 0, failedRepos: Array.isArray(e?.failedRepos) ? e.failedRepos.length : (Number(e?.failedRepos) || 0), skippedPrs: Array.isArray(e?.skippedPrs) ? e.skippedPrs.slice(0, 5) : [], deferredDetail: Array.isArray(e?.deferredDetail) ? e.deferredDetail.slice(0, 5) : [] }))
     .filter((e) => Number.isFinite(e.at) && e.at <= nowMs);

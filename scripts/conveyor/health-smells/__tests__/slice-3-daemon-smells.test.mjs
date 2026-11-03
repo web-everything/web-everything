@@ -298,6 +298,14 @@ describe('probeDrainHistory', () => {
     expect(Object.keys(out[out.length - 1]).sort()).toEqual(['at', 'clean', 'considered', 'deferred', 'deferredDetail', 'exit', 'failed', 'failedRepos', 'merged', 'ms', 'skippedPrs', 'valid']);
   });
 
+  it('marks a pass clean only when exit and the failure counters are real zeros', () => {
+    const path = join(dir, 'clean.jsonl');
+    const rows = [{ exit: 0, failed: 0, failedRepos: [] }, { exit: 0, failed: false }, { exit: 0, failed: 0, failedRepos: '' }, { exit: 0, failed: 0, failedRepos: ['x'] }, { exit: 1, failed: 0 }]
+      .map((r, i) => ({ at: new Date(NOW - (10 - i) * 60000).toISOString(), considered: 0, merged: 0, ...r }));
+    writeFileSync(path, toJsonl(rows));
+    expect(probeDrainHistory({ path, nowMs: NOW }).map((p) => p.clean)).toEqual([true, false, false, false, false]);
+  });
+
   it('no file → null (no drain on this host), not an empty history', () => {
     expect(probeDrainHistory({ path: join(dir, 'missing.jsonl'), nowMs: NOW })).toBeNull();
   });
