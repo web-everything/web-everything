@@ -60,6 +60,21 @@ const reader = (gh, unreadable = false) => {
 describe('settings', () => {
   const file = (block) => (path) => { if (String(path).endsWith('pr-stall-sweep.json')) return JSON.stringify({ prStallSweep: block }); const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; };
   const log = () => {};
+  it('repository shared ceiling resolves to three with tool provenance', () => {
+    const log = vi.fn();
+    const result = resolveStallSweepSettings({ env: { WE_POLICY_CASCADE_LOG: '1' }, log });
+    expect(result).toMatchObject({ value: { maxActionsPerPrHead: 3 }, sources: { maxActionsPerPrHead: 'tool' }, errors: [] });
+    expect(log.mock.calls.map(([line]) => line).join('\n')).toContain('maxActionsPerPrHead=3 (tool)');
+  });
+  it.each([3, Number.MAX_SAFE_INTEGER])('shared ceiling validator accepts %s without changing its safe-integer bound', cap => {
+    expect(resolveStallSweepSettings({ env: {}, read: file({ maxActionsPerPrHead: cap }), log }))
+      .toMatchObject({ value: { maxActionsPerPrHead: cap }, sources: { maxActionsPerPrHead: 'tool' }, errors: [] });
+  });
+  it('shared ceiling validator rejects values above the safe-integer bound', () => {
+    const result = resolveStallSweepSettings({ env: {}, read: file({ maxActionsPerPrHead: Number.MAX_SAFE_INTEGER + 1 }), log });
+    expect(result.value.maxActionsPerPrHead).toBe(1);
+    expect(result.errors.join(' ')).toContain('maxActionsPerPrHead');
+  });
   it('digest defaults to true in both the standard and the repository settings', () => {
     expect(STALL_SWEEP_DEFAULTS.digest).toBe(true);
     expect(resolveStallSweepSettings({ env: {}, read: file({}), log })).toMatchObject({ value: { digest: true }, sources: { digest: 'standard' } });
@@ -440,7 +455,7 @@ describe('pending red-team watchdog in the shadow sweep', () => {
     const readRedTeamStatus = vi.fn(() => status);
     const probe = { host: owner.host, namespace: owner.pidNamespace, isAlive: vi.fn(() => alive),
       readPidStart: vi.fn(() => owner.pidStart) };
-    const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh, read: reader(gh),
+    const out = await runStallSweep({ now: NOW, env: {}, settings: shadow({ maxActionsPerPrHead: 3 }), gh, read: reader(gh),
       dir, log, readRedTeamStatus, probe, ...options,
       // Advance the assessment clock together with the sweep clock on repeated passes.
       read: options.read ?? (input => ({ ...reader(gh)(input), now: options.now ?? NOW })) });
@@ -455,6 +470,19 @@ describe('pending red-team watchdog in the shadow sweep', () => {
     expect(out.act).toEqual([]);
     expect(out.items).toMatchObject([{ lane: 'operator', action: 'red-team-restart-exhausted', command: expect.any(String) }]);
     expect(out.items[0].reason).toMatch(cap === 0 ? /disabled.*maxRedTeamRestartsPerHead=0.*operator/ : /exhausted.*operator/);
+  });
+  it.each(['would-do', 'intent'])('logs a shared-ceiling-held restart as would-skip after prior %s', async phase => {
+    const dir = auditDir();
+    seed(dir, [restartRecord(120, { phase, action: 'ask-review-daemon', key: `${prHead}:daemon` })]);
+    const { out, calls } = await sweep({ dir, settings: shadow({ maxActionsPerPrHead: 1 }) });
+    expect(out.incomplete).toBe(false);
+    expect(out.act).toEqual([]);
+    expect(out.held).toMatchObject([{ action: 'restart-red-team', held: 'per-PR-head cap' }]);
+    expect(lines(dir).filter(r => r.phase === 'would-skip')).toMatchObject([
+      { action: 'restart-red-team', held: 'per-PR-head cap' },
+    ]);
+    expect(lines(dir).filter(r => r.phase === 'would-do' && r.action === 'restart-red-team')).toEqual([]);
+    expectReadOnly(calls);
   });
   it('pending over 60 minutes with no live run or result logs would restart-red-team in shadow', async () => {
     const { out, dir, calls, log, readRedTeamStatus } = await sweep();
@@ -616,7 +644,7 @@ describe('pending red-team watchdog in the shadow sweep', () => {
 });
 
 describe('watchdog restart budgets', () => {
-  const limits = { maxActionsPerSweep: 10, maxActionsPerHour: 20, maxActionsPerPrHead: 1, maxRedTeamRestartsPerHead: 2 };
+  const limits = { maxActionsPerSweep: 10, maxActionsPerHour: 20, maxActionsPerPrHead: 3, maxRedTeamRestartsPerHead: 2 };
   const prHead = `${REPO}#11@${HEAD}`;
   const restart = n => ({ lane: 'system', action: 'restart-red-team', prHead, key: `${prHead}:restart-${n}` });
   const record = (item, phase = 'would-do') => ({ ...item, phase, ts: new Date(NOW - 90 * 60_000).toISOString() });
@@ -632,8 +660,9 @@ describe('watchdog restart budgets', () => {
     const history = [record({ prHead, action: 'ask-review-daemon', key: 'daemon' })];
     expect(planStallActions([restart(1)], { now: NOW, limits, history })).toEqual({ act: [restart(1)], held: [] });
   });
-  it.each(['would-do', 'intent'])('a second restart bypasses the shared one-action head cap after a prior %s', phase => {
-    expect(planStallActions([restart(2)], { now: NOW, limits, history: [record(restart(1), phase)] }).act).toEqual([restart(2)]);
+  it.each(['would-do', 'intent'])('a second restart is held by the shared one-action head cap after a prior %s', phase => {
+    expect(planStallActions([restart(2)], { now: NOW, limits: { ...limits, maxActionsPerPrHead: 1 },
+      history: [record(restart(1), phase)] })).toEqual({ act: [], held: [{ ...restart(2), held: 'per-PR-head cap' }] });
   });
   it('caps its own action bucket at two including actions planned in this pass', () => {
     const result = planStallActions([restart(1), restart(2), restart(3)], { now: NOW, limits });
@@ -667,7 +696,7 @@ describe('watchdog restart budgets', () => {
       history: [record(restart(1)), record(restart(2))] })).toEqual({ act: [publish], held: [] });
     expect(planStallActions([publish], { now: NOW, limits, history: [record(publish)] })).toEqual({ act: [], held: [] });
     expect(planStallActions([publish], { now: NOW, limits,
-      history: [record({ prHead, action: 'ask-review-daemon', key: 'nudge' }), record(restart(1))] }))
+      history: [record({ prHead, action: 'ask-review-daemon', key: 'nudge' }), record(restart(1)), record(restart(2))] }))
       .toEqual({ act: [], held: [{ ...publish, held: 'per-PR-head cap' }] });
   });
 });

@@ -140,9 +140,8 @@ export function planStallActions(items, { history = [], now, limits }) {
   const perAction = new Map();
   const bucket = it => `${it.prHead}|${it.action}`;
   for (const h of done) perAction.set(bucket(h), (perAction.get(bucket(h)) ?? 0) + 1);
-  // Restarts have a distinct, separately configured per-head budget. All other actions, including
-  // idempotent result publication, spend the ordinary head budget. Historical records use action kind too.
-  for (const h of done.filter(h => h.action !== 'restart-red-team')) perHead.set(h.prHead, (perHead.get(h.prHead) ?? 0) + 1);
+  // Every action spends the shared head budget; restarts also have their own stricter ceiling.
+  for (const h of done) perHead.set(h.prHead, (perHead.get(h.prHead) ?? 0) + 1);
   const seen = new Set(done.map((h) => `${h.key}|${h.action}`));
   const once = new Set(done.map((h) => h.onceKey).filter(Boolean));
   const act = []; const held = [];
@@ -151,14 +150,15 @@ export function planStallActions(items, { history = [], now, limits }) {
     if (seen.has(`${it.key}|${it.action}`) || (it.onceKey && once.has(it.onceKey))) continue;
     const restart = it.action === 'restart-red-team';
     const restartCap = limits.maxRedTeamRestartsPerHead;
-    const headFull = restart
-      ? (!CLASSIFY_VALID.maxRedTeamRestartsPerHead(restartCap) || (perAction.get(bucket(it)) ?? 0) >= restartCap)
-      : (perHead.get(it.prHead) ?? 0) >= limits.maxActionsPerPrHead;
+    const restartFull = restart
+      && (!CLASSIFY_VALID.maxRedTeamRestartsPerHead(restartCap) || (perAction.get(bucket(it)) ?? 0) >= restartCap);
+    const headFull = (perHead.get(it.prHead) ?? 0) >= limits.maxActionsPerPrHead;
     const why = act.length >= limits.maxActionsPerSweep ? 'per-sweep cap' : hour >= limits.maxActionsPerHour ? 'per-hour cap'
-      : headFull ? (restart ? 'red-team restart per-head cap; operator must inspect the pending head' : 'per-PR-head cap') : null;
+      : restartFull ? 'red-team restart per-head cap; operator must inspect the pending head'
+        : headFull ? 'per-PR-head cap' : null;
     if (why) { held.push({ ...it, held: why }); continue; }
     act.push(it); perAction.set(bucket(it), (perAction.get(bucket(it)) ?? 0) + 1); hour += 1;
-    if (!restart) perHead.set(it.prHead, (perHead.get(it.prHead) ?? 0) + 1);
+    perHead.set(it.prHead, (perHead.get(it.prHead) ?? 0) + 1);
   }
   return { act, held };
 }
