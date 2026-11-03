@@ -1640,3 +1640,38 @@ it('re-probes a bound PID on each pass, discarding an earlier live result even w
   expect(assessLiveness([{ agent: dead }])).toBeNull();
   expect(enrichAgents([row], { probe: () => null })[0]).not.toHaveProperty('pidAlive');
 });
+
+
+describe('pid reuse: a process that started after the session registered is not that session', () => {
+  const ps = (lstart) => () => `S ${lstart} claude bg-spare x\n`;
+  const SESSION_MS = Date.parse('2026-11-03T14:00:00Z');
+  it('reused pid (process started 1h after the session) reads dead', async () => {
+    const { pidIdentity } = await import('../../lib/pid-alive.mjs');
+    expect(pidIdentity(1, { startedBy: SESSION_MS, exec: ps('Tue Nov  3 15:00:00 2026') })).toMatchObject({ alive: false, reason: 'started-after-holder' });
+  });
+  it('live holder (pre-warmed bg-spare started before the session) reads alive', async () => {
+    const { pidIdentity } = await import('../../lib/pid-alive.mjs');
+    expect(pidIdentity(1, { startedBy: SESSION_MS, exec: ps('Tue Nov  3 13:00:00 2026') }).alive).toBe(true);
+  });
+  it('unreadable ps stays unknown (fail closed: keep)', async () => {
+    const { pidIdentity } = await import('../../lib/pid-alive.mjs');
+    expect(pidIdentity(1, { startedBy: SESSION_MS, exec: () => { throw Object.assign(new Error('x'), { stderr: 'boom' }); } }).alive).toBeNull();
+  });
+  it('dead holder reads dead; enrichAgents passes the session start through to the probe', async () => {
+    const { enrichAgents, probePid } = await import('../reconcile-pass.mjs');
+    const seen = [];
+    // Mirrors the production call shape: probe(pid, kill, identity, opts) — opts is the FOURTH argument.
+    const probe = (pid, _kill, _identity, opts) => { seen.push(opts); return probePid(pid, () => { throw Object.assign(Error('x'), { code: 'ESRCH' }); }, undefined, opts); };
+    const out = enrichAgents([{ pid: 66752, startedAt: SESSION_MS, state: 'working' }], { probe })[0];
+    expect(out.pidAlive).toBe(false);
+    expect(seen[0]).toEqual({ startedBy: SESSION_MS });
+  });
+});
+
+it('enrichAgents default probe path: reused pid (process newer than session) is marked pidAlive:false', async () => {
+  const { enrichAgents } = await import('../reconcile-pass.mjs');
+  // pid of THIS test process; claim a session that registered long before this process started.
+  const out = enrichAgents([{ pid: process.pid, startedAt: Date.parse('2020-01-01T00:00:00Z'), state: 'working' }],
+    { readLaneHead: () => null })[0];
+  expect(out.pidAlive).toBe(false);
+});

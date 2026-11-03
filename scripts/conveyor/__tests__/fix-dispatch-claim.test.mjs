@@ -664,7 +664,7 @@ it.each([false, true])('default claim refresh keeps a live wrapped fixing claim 
       ...(awaiting ? { awaitingVerify: { sha: 'a'.repeat(40), pr: 3964, ref: 'lane/fix', requestedAt: iso(T0) } } : {}),
     });
     writeCompletion(record, completions);
-    const result = refreshLiveFixDispatchClaims({ lockRoot: claimRoot, nowMs: T0 + 1000, nowIso: () => iso(T0 + 1000), hungInfoFor: () => null, awaitingVerifyFor: () => null });
+    const result = refreshLiveFixDispatchClaims({ lockRoot: claimRoot, nowMs: T0 + 1000, nowIso: () => iso(T0 + 1000), hungInfoFor: () => null, awaitingVerifyFor: () => null, prHeadFor: () => null });
     expect(list).toHaveBeenCalledWith({ all: true });
     expect(result.refreshed).toHaveLength(1);
     expect(result.released ?? []).toEqual([]);
@@ -766,6 +766,35 @@ describe('idle-claim auto-release (R201)', () => {
     expect(policy).toEqual({ enabled: true, idleMinutes: 12,
       sources: { enabled: 'standard', idleMinutes: 'platform' },
       invalid: ['platform.enabled="yes"', 'env.idleMinutes=0'] });
+  });
+
+  it('releases a claim whose live listing row is state:working but status:idle (the real `claude agents` shape)', () => {
+    acquire();
+    const extra = { };
+    const rows = () => [{ name: 'fix-5996', state: 'working', status: 'idle' }];
+    const run = (at) => refreshLiveFixDispatchClaims({
+      lockRoot: claimRoot, listAgentsAll: rows, hungInfoFor: () => null, awaitingVerifyFor: null,
+      prHeadFor: () => 'sha1', recordEvent: () => {}, nowIso: () => iso(at),
+      idleRelease: resolveIdleClaimRelease({ env: {}, platform: null }), ...extra,
+    });
+    const released = [];
+    for (let t = T0 + 60_000; t <= T0 + 60_000 + IDLE_MS; t += 120_000) released.push(...(run(t).released ?? []));
+    expect(released).toHaveLength(1);
+    expect(released[0].reason).toMatch(/idle-head-unmoved/);
+  });
+
+  it('keeps a claim whose row is state:working and status:busy', () => {
+    acquire();
+    const rows = () => [{ name: 'fix-5996', state: 'working', status: 'busy' }];
+    let released = 0;
+    for (let t = T0 + 60_000; t <= T0 + 60_000 + 2 * IDLE_MS; t += 120_000) {
+      released += (refreshLiveFixDispatchClaims({
+        lockRoot: claimRoot, listAgentsAll: rows, hungInfoFor: () => null, awaitingVerifyFor: null,
+        prHeadFor: () => 'sha1', recordEvent: () => {}, nowIso: () => iso(t),
+        idleRelease: resolveIdleClaimRelease({ env: {}, platform: null }),
+      }).released ?? []).length;
+    }
+    expect(released).toBe(0);
   });
 
   it.each(['abc', '0'])('malformed WE_IDLE_CLAIM_RELEASE_MINUTES=%s falls back to the 30 min standard', (value) => {
