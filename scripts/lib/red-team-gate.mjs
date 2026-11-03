@@ -61,6 +61,8 @@ const CLEAR_LINES = new Set([
   'Red team not required on this head: card-only diff (policy redTeam.skipCardOnly)',
   'Red team not required on this head: not owed (stored review)',
 ]);
+// Fixed producer lines (mirrors rebase-verdict-carry's producer-format check); anything else is held as unparsed.
+const KNOWN_ADVISORY_LINE_RE = /^(?:$|The red team tried to break this change and reported nothing\.|A confirmed break is recorded as a miss for the accepting review and for the builder's model\.|Advisory only: this comment changes no label itself; the red-team gate \(setting `redTeam\.confirmedBreaks`\) sends a confirmed broken break back to the fixer\. Head `[0-9a-f]{12}` · red team [^\n]+ · recorded verdict `[^`\n]+`\.)$/;
 const SUB_RE = /^ {3}- (Scenario|Re-check): (.*)$/;
 // Any reviewed-sha marker the shared parser reads (full or abbreviated, any case), and a case variant of the marker
 // name too: only used to SUPERSEDE a ruling, where reading more holds more.
@@ -98,7 +100,11 @@ export function parseRedTeamComment(body) {
       continue;
     }
     const s = SUB_RE.exec(line);
-    if (s && findings.length) findings.at(-1)[s[1] === 'Scenario' ? 'scenario' : 'recheck'] = s[2].trim();
+    if (s && findings.length) { findings.at(-1)[s[1] === 'Scenario' ? 'scenario' : 'recheck'] = s[2].trim(); continue; }
+    // Positive allow-list (the producer's own line forms): any other non-blank line, in any shape
+    // (blockquote, other numbering, prose carrying a verdict), is unparsed evidence and holds the result.
+    if (!KNOWN_ADVISORY_LINE_RE.test(line.trim()) && !CLEAR_LINES.has(line.trim()) && !headlines.includes(line.trim())
+      && !(MARKER_RE.test(line.trim()) && !line.trim().replace(MARKER_RE, '').trim())) shapedLines.push(line.trim());
   }
   // Counts are producer evidence too: an omitted finding must not silently turn a result clear.
   // Keep invalid headline evidence in the same digest/hold path as skipped finding lines.
