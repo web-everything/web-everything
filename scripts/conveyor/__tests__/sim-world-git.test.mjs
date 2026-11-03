@@ -26,6 +26,7 @@ describe('simulator git and budget regressions', () => {
         expect(preloads.some(option => option.includes('fake-clock-preload.mjs'))).toBe(true);
         const freshness = new URL(preloads.find(option => option.includes('lane-pool-freshness-loader.mjs')).slice('--import='.length));
         expect(freshness.searchParams.get('tool')).toBe(pathToFileURL(join(w.simCloneRoot, 'scripts/lane-pool.mjs')).href);
+        expect(freshness.searchParams.get('candidates')).toBe(pathToFileURL(join(w.root, 'daemon-self-sync-state')).href);
         const policyModule = pathToFileURL(join(w.simCloneRoot, 'scripts/lib/build-policy.mjs')).href;
         const operationsModule = pathToFileURL(join(w.simCloneRoot, 'scripts/operations/run.mjs')).href;
         const brief = execFileSync(process.execPath, ['--input-type=module', '-e', `

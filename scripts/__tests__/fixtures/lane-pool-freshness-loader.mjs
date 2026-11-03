@@ -4,16 +4,42 @@
  */
 import { register } from 'node:module';
 import { isMainThread } from 'node:worker_threads';
-import { dirname, resolve } from 'node:path';
+import { realpathSync } from 'node:fs';
+import { dirname, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-// A simulator explicitly names its private copy in this test-only preload URL.
+function fileUrl(path) {
+  // Node resolves entry symlinks before passing the module URL to load(). Match
+  // that identity for both argv and the explicitly selected simulator tool.
+  // An unrelated child's argv (e.g. -e) need not name an existing file.
+  try { return pathToFileURL(realpathSync(path)).href; }
+  catch { return pathToFileURL(resolve(path)).href; }
+}
+
+// A simulator explicitly names its private copy and candidate directory here.
 // Do not register for other children: async hooks move ESM reads off-thread,
 // hiding them from the runtime tracer and changing stdout pipe behavior.
-const tool = new URL(import.meta.url).searchParams.get('tool')
-  ?? pathToFileURL(resolve(dirname(fileURLToPath(import.meta.url)), '../../lane-pool.mjs')).href;
-if (isMainThread && process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === tool) {
-  register(import.meta.url);
+const params = new URL(import.meta.url).searchParams;
+const selected = params.get('tool');
+const tool = fileUrl(selected ? fileURLToPath(selected)
+  : resolve(dirname(fileURLToPath(import.meta.url)), '../../lane-pool.mjs'));
+if (isMainThread && process.argv[1]) {
+  const entry = fileUrl(process.argv[1]);
+  const candidates = params.get('candidates');
+  let hook = entry === tool ? import.meta.url : null;
+  if (entry !== tool && candidates) {
+    const root = fileURLToPath(fileUrl(fileURLToPath(candidates)));
+    const parts = relative(root, fileURLToPath(entry)).split(sep);
+    if (parts.length === 3 && parts[0].includes('.candidate-')
+      && parts[1] === 'scripts' && parts[2] === 'lane-pool.mjs') {
+      // Each rebuild candidate is disposable. Select only its pool CLI, then
+      // pass that exact URL to the hook thread; never register for its daemons.
+      const selectedHook = new URL(import.meta.url);
+      selectedHook.searchParams.set('tool', entry);
+      hook = selectedHook.href;
+    }
+  }
+  if (hook) register(hook);
 }
 
 export async function load(url, context, nextLoad) {

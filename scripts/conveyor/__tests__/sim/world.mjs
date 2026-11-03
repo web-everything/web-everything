@@ -268,9 +268,11 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
   // (h) sim clock
   const clock = createSimClock({ file: join(root, 'clock.json'), startOffsetMs: clockStartOffsetMs });
   // Keep the guard injection outside the copied production tree. Scope it to
-  // this world's lane-pool entry; other children retain native Node loading.
+  // this world's lane-pool entry and disposable rebuild candidates; other
+  // children retain native Node loading.
   const freshnessLoader = pathToFileURL(join(INVOKING_ROOT, 'scripts/__tests__/fixtures/lane-pool-freshness-loader.mjs'));
   freshnessLoader.searchParams.set('tool', pathToFileURL(join(simClone, 'scripts/lane-pool.mjs')).href);
+  freshnessLoader.searchParams.set('candidates', pathToFileURL(join(root, 'daemon-self-sync-state')).href);
 
   // (i) one merged env
   const ghBinDir = rawGh.env.PATH.split(':')[0];

@@ -215,8 +215,14 @@ describe('probation build checkout isolation', () => {
       git(['init', '--bare', '--initial-branch=main', origin]);
       git(['remote', 'add', 'origin', origin]);
       git(['push', 'origin', 'main']);
-      // Delegate the fixture entry point to the actual pool CLI and all its lease/refusal logic.
-      put(join(f.repo, 'scripts/lane-pool.mjs'), `import ${JSON.stringify(pathToFileURL(join(WE_ROOT, 'scripts/lane-pool.mjs')).href)};`);
+      // Launch the real CLI as an entry, so the test-only freshness preload can
+      // select it without installing loader hooks in unrelated import wrappers.
+      put(join(f.repo, 'scripts/lane-pool.mjs'), `
+        import { execFileSync } from 'node:child_process';
+        execFileSync(process.execPath, [${JSON.stringify(join(WE_ROOT, 'scripts/lane-pool.mjs'))}, ...process.argv.slice(2)], {
+          stdio: 'inherit', timeout: 30_000, killSignal: 'SIGKILL',
+        });
+      `);
       rmSync(join(f.root, '.lanes'), { recursive: true, force: true });
       execFileSync(process.execPath, [join(WE_ROOT, 'scripts/lane-pool.mjs'), 'provision',
         `--repo=${f.repo}`, '--count=1', '--no-install'], {

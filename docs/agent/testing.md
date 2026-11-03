@@ -233,8 +233,13 @@ Remove the fixture during teardown.
 Native lane-pool fixtures inject the freshness check through the test-only
 `scripts/__tests__/fixtures/lane-pool-freshness-loader.mjs` preload. Register its hook only
 when the child entry is the selected tool: hooks in unrelated children hide ESM reads from
-the runtime tracer. Simulator worlds must explicitly select their private tool through the
-preload URL's `tool` parameter while retaining the clock preload; production has no test-marker exemption.
+the runtime tracer. Match entry symlinks by their real paths, as Node's module loader does.
+Fixture wrappers must spawn the actual CLI entry with its arguments and inherited environment
+instead of importing it under another entry path. Simulator worlds explicitly select their private
+tool through the preload URL's `tool` parameter and their rebuild state directory through
+`candidates`, while retaining the clock preload. The latter selects only pool entries under
+`<state>/<clone>.candidate-<token>/scripts/lane-pool.mjs`, including fallback and last-good
+smokes; unrelated candidate children keep native loading. Production has no test-marker exemption.
 
 Post-run transcript diagnostics resolve their policy independently of the optional inspector dependency.
 Keep the named checker-import failure regression in `scripts/__tests__/codex-direct-task.test.mjs`:

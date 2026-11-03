@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -52,6 +52,47 @@ describe('lane-pool fixture freshness injection', () => {
     expect(child.stdout).toBe('native loading\n');
   });
 
+  it('recognizes a symlink to the canonical tool before registering hooks', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'freshness-loader-'));
+    dirs.push(dir);
+    const alias = join(dir, 'tool alias.mjs');
+    symlinkSync(resolve(process.cwd(), 'scripts/lane-pool.mjs'), alias);
+    // Observe registration without running the real pool CLI or making Git writes.
+    const child = run(['--input-type=module', '-e', `
+      import Module, { syncBuiltinESMExports } from 'node:module';
+      Module.register = () => console.log('registered');
+      syncBuiltinESMExports();
+      process.argv[1] = ${JSON.stringify(alias)};
+      await import(${JSON.stringify(loaderUrl().href)});
+    `]);
+    expect(child.error).toBeUndefined();
+    expect(child.stderr).toBe('');
+    expect(child.status).toBe(0);
+    expect(child.stdout).toBe('registered\n');
+  });
+
+  it.each([false, true])('injects a selected tool reached through a symlink (selected alias=%s)', selectedAlias => {
+    const dir = mkdtempSync(join(tmpdir(), 'freshness-loader-'));
+    dirs.push(dir);
+    const tool = join(dir, 'tool entry é.mjs');
+    const alias = join(dir, 'tool alias.mjs');
+    writeFileSync(tool, `
+      async function guardToolEntry({ check = async () => { throw new Error('fixture guard ran'); } } = {}) {
+        await check();
+      }
+      await guardToolEntry();
+      console.log('injected');
+    `);
+    symlinkSync(tool, alias);
+    const selected = loaderUrl();
+    selected.searchParams.set('tool', pathToFileURL(selectedAlias ? alias : tool).href);
+    const child = run(['--import', selected.href, alias]);
+    expect(child.error).toBeUndefined();
+    expect(child.stderr).toBe('');
+    expect(child.status).toBe(0);
+    expect(child.stdout).toBe('injected\n');
+  });
+
   it('injects an explicitly selected simulator copy, preserving its output and refusing other copies', () => {
     const dir = mkdtempSync(join(tmpdir(), 'freshness-loader-'));
     dirs.push(dir);
@@ -86,6 +127,62 @@ describe('lane-pool fixture freshness injection', () => {
     expect(unrelated.status).toBe(1);
     expect(unrelated.stderr).toContain('fixture guard ran');
     expect(unrelated.stdout).toBe('');
+  });
+
+  it('injects disposable rebuild candidate entries only with an explicit candidate directory', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'freshness-loader-'));
+    dirs.push(dir);
+    const state = join(dir, 'state');
+    const selected = loaderUrl();
+    selected.searchParams.set('candidates', pathToFileURL(state).href);
+    // Rebuild fallback and last-good probes reuse the path with new contents.
+    for (const label of ['candidate', 'plain main', 'last good']) {
+      const tool = join(state, 'control.candidate-token/scripts/lane-pool.mjs');
+      mkdirSync(dirname(tool), { recursive: true });
+      writeFileSync(tool, `
+        async function guardToolEntry({ check = async () => { throw new Error('fixture guard ran'); } } = {}) {
+          await check();
+        }
+        await guardToolEntry();
+        console.log(${JSON.stringify(label)});
+      `);
+      const refused = run(['--import', loaderUrl().href, tool]);
+      expect(refused.error).toBeUndefined();
+      expect(refused.status).toBe(1);
+      expect(refused.stderr).toContain('fixture guard ran');
+      expect(refused.stdout).toBe('');
+      const admitted = run(['--import', selected.href, tool]);
+      expect(admitted.error).toBeUndefined();
+      expect(admitted.stderr).toBe('');
+      expect(admitted.status).toBe(0);
+      expect(admitted.stdout).toBe(`${label}\n`);
+    }
+  });
+
+  it.each([
+    'state/control.candidate-token/scripts/worker.mjs',
+    'state/control/scripts/lane-pool.mjs',
+    'state-sibling/control.candidate-token/scripts/lane-pool.mjs',
+  ])('keeps native loading outside candidate pool entries: %s', path => {
+    const dir = mkdtempSync(join(tmpdir(), 'freshness-loader-'));
+    dirs.push(dir);
+    const tool = join(dir, path);
+    mkdirSync(dirname(tool), { recursive: true });
+    writeFileSync(tool, '');
+    const selected = loaderUrl();
+    selected.searchParams.set('candidates', pathToFileURL(join(dir, 'state')).href);
+    const child = run(['--input-type=module', '-e', `
+      import Module, { syncBuiltinESMExports } from 'node:module';
+      Module.register = () => { throw new Error('unexpected loader thread'); };
+      syncBuiltinESMExports();
+      process.argv[1] = ${JSON.stringify(tool)};
+      await import(${JSON.stringify(selected.href)});
+      console.log('native loading');
+    `]);
+    expect(child.error).toBeUndefined();
+    expect(child.stderr).toBe('');
+    expect(child.status).toBe(0);
+    expect(child.stdout).toBe('native loading\n');
   });
 
   it.each(['no injection site', 'await guardToolEntry(); await guardToolEntry();'])(
