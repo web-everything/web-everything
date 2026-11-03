@@ -6,5 +6,24 @@
   "rulingResolvesStandDown": "on",
   "standDownQueueSection": "needs-you",
   "recheckCarriedReferrals": true,
-  "autoPolicyRespectsNotReal": true
+  "autoPolicyRespectsNotReal": true,
+  "releaseStage": "prerelease",
+  "raceBlockPaths": [
+    "scripts/**/file-locks*",
+    "scripts/*file-locks*",
+    "scripts/**/lease*",
+    "scripts/*lease*",
+    "scripts/**/slot*",
+    "scripts/*slot*",
+    "scripts/**/lock-reaper*",
+    "scripts/*lock-reaper*",
+    "scripts/**/lane-pool*",
+    "scripts/*lane-pool*",
+    "scripts/**/merge*",
+    "scripts/*merge*",
+    "scripts/**/drain*",
+    "scripts/*drain*",
+    "scripts/**/mq*",
+    "scripts/*mq*"
+  ]
 }

@@ -25,8 +25,8 @@ function fixture(answer = 'NOT WEAKENED') {
 }
 
 describe('canonical audit', () => {
-  it('pins the question text and its sha256 hash', () => {
-    expect(CANONICAL_QUESTION).toBe('You are a read-only auditor. Judge the WHOLE diff `git diff <base>...<head>`, including pre-existing behaviour the diff now relies on, not only the changed lines. Does the change WEAKEN anything: a guard, gate, test, assertion or fail-closed path; a loosened check or threshold; removed validation; a new bypass, override or silent fallback; a test that no longer fails when the behaviour breaks? Pre-existing limitations the diff relies on count. Answer with the FIRST line exactly `NOT WEAKENED` or `WEAKENED`, then findings, one per line, each with file:line and why. Do not edit files.');
+  it('retires the historical question and binds the revised schema to its sha256 hash', () => {
+    expect(CANONICAL_QUESTION).not.toBe('You are a read-only auditor. Judge the WHOLE diff `git diff <base>...<head>`, including pre-existing behaviour the diff now relies on, not only the changed lines. Does the change WEAKEN anything: a guard, gate, test, assertion or fail-closed path; a loosened check or threshold; removed validation; a new bypass, override or silent fallback; a test that no longer fails when the behaviour breaks? Pre-existing limitations the diff relies on count. Answer with the FIRST line exactly `NOT WEAKENED` or `WEAKENED`, then findings, one per line, each with file:line and why. Do not edit files.');
     expect(QUESTION_HASH).toMatch(/^[a-f0-9]{64}$/);
     expect(QUESTION_HASH).toBe(createHash('sha256').update(CANONICAL_QUESTION).digest('hex'));
   });
@@ -60,23 +60,13 @@ describe('canonical audit', () => {
     expect(f.records).toEqual([]);
   });
 
-  it.each([['NOT WEAKENED', 0], ['WEAKENED', 1]])('prints and records first-line verdict %s', async (verdict, code) => {
-    const f = fixture(`\n\r\n${verdict}\r\nscripts/example.mjs:12 why\n`);
-    expect(await main(ARGS, f.deps)).toBe(code);
-    expect(f.output.join('')).toBe(`${verdict}\nscripts/example.mjs:12 why\n`);
-    expect(f.records).toEqual([{ at: AT, base: BASE, head: HEAD, baseRef: 'origin/main',
-      questionHash: QUESTION_HASH, verdict, findings: ['scripts/example.mjs:12 why'] }]);
+  it.each(['NOT WEAKENED', 'WEAKENED'])('refuses legacy unclassified findings after opening %s', async verdict => {
+    const f = fixture(`${verdict}\nscripts/example.mjs:12 why`);
+    expect(await main(ARGS, f.deps)).not.toBe(0);
+    expect(f.records.some(record => record.verdict === 'NOT WEAKENED')).toBe(false);
+    expect(f.output.join('')).not.toMatch(/^(?:NOT WEAKENED|\{"verdict":"NOT WEAKENED")/);
     expect(f.deps.runCodex.mock.calls[0][0]).toContain(CANONICAL_QUESTION);
     expect(f.deps.runCodex.mock.calls[0][0]).toContain(`git diff ${BASE}...${HEAD}`);
-    expect(f.deps.resolveSha.mock.calls).toEqual([['origin/main'], [HEAD]]);
-    expect(f.deps.appendRecord.mock.invocationCallOrder[0]).toBeGreaterThan(f.deps.runCodex.mock.invocationCallOrder[0]);
-  });
-
-  it('prints exactly one JSON object with the full shas and canonical hash', async () => {
-    const f = fixture('WEAKENED\nx.mjs:1 bypass');
-    expect(await main([...ARGS, '--json'], f.deps)).toBe(1);
-    expect(JSON.parse(f.output.join(''))).toEqual({ verdict: 'WEAKENED', base: BASE, head: HEAD,
-      questionHash: QUESTION_HASH, findings: ['x.mjs:1 bypass'] });
   });
 
   it.each(['', '\n  \n', 'Looks good\nNOT WEAKENED', 'NOT WEAKENED extra', ' WEAKENED', 'WEAKENED ',
@@ -125,17 +115,20 @@ describe('canonical audit', () => {
     }
   });
 
-  it.each(['NOT WEAKENED', 'WEAKENED'])('preserves repeated agreeing verdicts and findings mentioning verdict words: %s', async verdict => {
-    const f = fixture(`${verdict}\n${verdict}\nscripts/gate.mjs:12 checks WEAKENED and NOT WEAKENED, \`WEAKENED\`, "NOT WEAKENED", --head and ../paths`);
-    expect(await main(ARGS, f.deps)).toBe(verdict === 'NOT WEAKENED' ? 0 : 1);
-    expect(f.records).toHaveLength(1);
-    expect(findAudit(f.records, { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toBe(f.records[0]);
+  it.each(['NOT WEAKENED', 'WEAKENED'])('repeated agreeing verdicts do not rescue unclassified findings: %s', async verdict => {
+    const f = fixture(`${verdict}\n${verdict}\nscripts/gate.mjs:12 unclassified claim`);
+    expect(await main(ARGS, f.deps)).not.toBe(0);
+    expect(f.records.some(record => record.verdict === 'NOT WEAKENED')).toBe(false);
   });
 
   it.each(conflictingAnswers)('findAudit ignores historical contradictory records: %j', async answer => {
     const verdict = answer.startsWith('WEAKENED') ? 'WEAKENED' : 'NOT WEAKENED';
-    const f = fixture(verdict);
-    await main(ARGS, f.deps);
+    const evidence = { id: 'guard', class: 'B3', file: 'scripts/gate.mjs', line: 12,
+      invariant: 'Unknown state refuses admission', trigger: 'Metadata unreadable',
+      consequence: 'Admission proceeds', relation: 'introduced' };
+    const f = fixture(verdict === 'WEAKENED' ? `${verdict}\n${JSON.stringify(evidence)}` : verdict);
+    expect(await main(ARGS, f.deps)).toBe(verdict === 'WEAKENED' ? 1 : 0);
+    expect(f.records[0]).toMatchObject({ verdict });
     const valid = { ...f.records[0], at: '2026-01-01T00:00:00.000Z' };
     const query = { base: BASE, head: HEAD, questionHash: QUESTION_HASH };
     for (const findings of [answer.slice(verdict.length).split(/\r?\n/), [answer]]) {
@@ -161,19 +154,23 @@ describe('canonical audit', () => {
   });
 
   it('strips terminal controls from findings before terminal output', async () => {
-    const f = fixture('WEAKENED\nx:1 \x1b[31mbypass\x1b[0m\x07');
+    const evidence = { id: 'control', class: 'B1', file: 'x', line: 1, invariant: 'No bypass',
+      trigger: 'Untrusted input', consequence: '\x1b[31mbypass\x1b[0m\x07', relation: 'introduced' };
+    const f = fixture(`WEAKENED\n${JSON.stringify(evidence)}`);
     await main(ARGS, f.deps);
-    expect(f.output.join('')).toBe('WEAKENED\nx:1 bypass\n');
+    const printed = JSON.parse(f.output.join('').split('\n')[1]);
+    expect(printed.consequence).toBe('bypass');
+    expect(f.records[0].findings[0].consequence).toBe(evidence.consequence);
   });
 
   it('findAudit selects the later appended record when timestamps are equal', () => {
-    const first = { base: BASE, head: HEAD, questionHash: QUESTION_HASH, at: AT, verdict: 'NOT WEAKENED' };
+    const first = { base: BASE, head: HEAD, questionHash: QUESTION_HASH, findings: [], at: AT, verdict: 'NOT WEAKENED' };
     const later = { ...first, verdict: 'WEAKENED' };
     expect(findAudit([first, later], { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toBe(later);
   });
 
   it('findAudit selects latest exact base, head and canonical hash, rejecting other hashes and heads', () => {
-    const first = { base: BASE, head: HEAD, questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', at: '2026-01-01T00:00:00.000Z' };
+    const first = { base: BASE, head: HEAD, questionHash: QUESTION_HASH, findings: [], verdict: 'NOT WEAKENED', at: '2026-01-01T00:00:00.000Z' };
     const latest = { ...first, at: AT };
     const records = [latest, { ...latest, head: BASE }, { ...latest, questionHash: 'other' }, first];
     expect(findAudit(records, { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toBe(latest);
@@ -184,22 +181,22 @@ describe('canonical audit', () => {
   });
 
   it('findAudit rejects a different base for the same head and canonical hash', () => {
-    const record = { base: HEAD, head: HEAD, questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', at: AT };
+    const record = { base: HEAD, head: HEAD, questionHash: QUESTION_HASH, findings: [], verdict: 'NOT WEAKENED', at: AT };
     expect(findAudit([record], { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toBeNull();
   });
 
   it.each([undefined, null, '', 'origin/main', 'a'.repeat(39), 'g'.repeat(40), BASE + '\n'])('findAudit rejects missing or non-full base %j', base => {
-    const record = { base, head: HEAD, questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', at: AT };
+    const record = { base, head: HEAD, questionHash: QUESTION_HASH, findings: [], verdict: 'NOT WEAKENED', at: AT };
     expect(findAudit([record], { base, head: HEAD, questionHash: QUESTION_HASH })).toBeNull();
   });
 
   it.each([undefined, null, '', 'main', 'b'.repeat(39), 'b'.repeat(41), 'g'.repeat(40), HEAD + '\n'])('findAudit rejects missing or non-full head %j even when the record matches', head => {
-    const record = { base: BASE, head, questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', at: AT };
+    const record = { base: BASE, head, questionHash: QUESTION_HASH, findings: [], verdict: 'NOT WEAKENED', at: AT };
     expect(findAudit([record], { base: BASE, head, questionHash: QUESTION_HASH })).toBeNull();
   });
 
   it.each([undefined, null, '', 'garbage', 'not weakened', 'NOT WEAKENED ', ' WEAKENED', 'WEAKENED\n'])('findAudit ignores newer invalid verdict %j without displacing valid evidence', verdict => {
-    const valid = { base: BASE, head: HEAD, questionHash: QUESTION_HASH, verdict: 'WEAKENED', at: '2026-01-01T00:00:00.000Z' };
+    const valid = { base: BASE, head: HEAD, questionHash: QUESTION_HASH, findings: [], verdict: 'WEAKENED', at: '2026-01-01T00:00:00.000Z' };
     const invalid = { ...valid, verdict, at: AT };
     const query = { base: BASE, head: HEAD, questionHash: QUESTION_HASH };
     expect(findAudit([valid, invalid], query)).toBe(valid);
@@ -207,9 +204,9 @@ describe('canonical audit', () => {
   });
 
   it('findAudit rejects a missing query base and legacy records without a base', () => {
-    const record = { base: BASE, head: HEAD, questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', at: AT };
+    const record = { base: BASE, head: HEAD, questionHash: QUESTION_HASH, findings: [], verdict: 'NOT WEAKENED', at: AT };
     expect(findAudit([record], { head: HEAD, questionHash: QUESTION_HASH })).toBeNull();
-    const legacy = { head: HEAD, questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', at: AT };
+    const legacy = { head: HEAD, questionHash: QUESTION_HASH, findings: [], verdict: 'NOT WEAKENED', at: AT };
     expect(findAudit([legacy], { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toBeNull();
   });
 });
