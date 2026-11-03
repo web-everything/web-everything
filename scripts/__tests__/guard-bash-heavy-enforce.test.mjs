@@ -43,6 +43,37 @@ const bypassRuns = [
   'node --no-warnings node_modules/.bin/vitest run a.test.mjs',
 ];
 
+const ordinarySessionRuns = [
+  'vitest', 'vitest run', 'vitest related scripts/a.mjs --run', 'vitest watch',
+  'vitest a.test.mjs', 'npx vitest run a.test.mjs b.test.mjs',
+  'npx --yes vitest run a.test.mjs', 'pnpm exec vitest run a.test.mjs',
+  'node_modules/.bin/vitest run a.test.mjs', './node_modules/.bin/vitest run a.test.mjs',
+  'bunx vitest run a.test.mjs', 'FOO=1 npx vitest run a.test.mjs',
+  'vitest --changed', 'WE_FULL_SUITE_OK=1 vitest run',
+  'npm test', 'npm t', 'npm tst', 'npm run test',
+  ...['npm', 'pnpm', 'yarn', 'bun'].flatMap((runner) =>
+    ['test', 't', 'tst', 'run test'].flatMap((script) =>
+      [`${runner} ${script}`, `${runner} ${script} -- a.test.mjs`])),
+  'node scripts/check-standards.mjs', 'node ../check-standards.mjs --local',
+  'node /tmp/lane/scripts/check-standards.mjs --local --files=a.mjs',
+  'WE_FULL_SUITE_OK=1 npm test -- a.test.mjs',
+  // alternate spellings of the same runs (advisory finding on #3932): runner flags before the subcommand,
+  // a pinned vitest version, exec wrappers, vitest's own entry script, separate-valued node options
+  'pnpm vitest run a.test.mjs', 'yarn vitest run a.test.mjs', 'bun vitest run a.test.mjs',
+  'npm -s test', 'npm --silent test -- a.test.mjs', 'npm --prefix . test', 'npm -w x test -- a.test.mjs',
+  'npx vitest@latest run a.test.mjs', 'npx -y vitest@2 run a.test.mjs',
+  'timeout 300 npx vitest run a.test.mjs', 'timeout -s KILL 300 npx vitest run a.test.mjs',
+  'nice -n 5 npx vitest run a.test.mjs', 'nice -5 npx vitest run a.test.mjs',
+  'node node_modules/vitest/vitest.mjs run a.test.mjs',
+  // other direct entry points of the same vitest install (advisory finding on #3932, round 2)
+  'node ./node_modules/vitest/dist/cli.js run a.test.mjs', 'node node_modules/vitest/dist/cli.js a.test.mjs',
+  'node node_modules/.bin/vitest run a.test.mjs', 'node ../node_modules/.bin/vitest run a.test.mjs',
+  'node --title standards scripts/check-standards.mjs --local',
+  'node --max-old-space-size 4096 scripts/check-standards.mjs',
+  'node --env-file .env scripts/check-standards.mjs',
+  'node --require ./setup.js scripts/check-standards.mjs',
+];
+
 describe('heavy-enforce — every direct test run requires admission', () => {
   it.each(execVitestRuns)('denies bare whole-suite `%s` both raw and admitted', (cmd) => {
     for (const prefix of ['', queue]) {
@@ -99,36 +130,26 @@ describe('heavy-enforce — every direct test run requires admission', () => {
     'npm run x -- vitest run a.test.mjs',
   ])('allows non-run `%s`', (cmd) => expect(decide(cmd, {})).toBeNull());
 
-  it.each([
-    'vitest', 'vitest run', 'vitest related scripts/a.mjs --run', 'vitest watch',
-    'vitest a.test.mjs', 'npx vitest run a.test.mjs b.test.mjs',
-    'npx --yes vitest run a.test.mjs', 'pnpm exec vitest run a.test.mjs',
-    'node_modules/.bin/vitest run a.test.mjs', './node_modules/.bin/vitest run a.test.mjs',
-    'bunx vitest run a.test.mjs', 'FOO=1 npx vitest run a.test.mjs',
-    'vitest --changed', 'WE_FULL_SUITE_OK=1 vitest run',
-    'npm test', 'npm t', 'npm tst', 'npm run test',
-    ...['npm', 'pnpm', 'yarn', 'bun'].flatMap((runner) =>
-      ['test', 't', 'tst', 'run test'].flatMap((script) =>
-        [`${runner} ${script}`, `${runner} ${script} -- a.test.mjs`])),
-    'node scripts/check-standards.mjs', 'node ../check-standards.mjs --local',
-    'node /tmp/lane/scripts/check-standards.mjs --local --files=a.mjs',
-    'WE_FULL_SUITE_OK=1 npm test -- a.test.mjs',
-    // alternate spellings of the same runs (advisory finding on #3932): runner flags before the subcommand,
-    // a pinned vitest version, exec wrappers, vitest's own entry script, separate-valued node options
-    'pnpm vitest run a.test.mjs', 'yarn vitest run a.test.mjs', 'bun vitest run a.test.mjs',
-    'npm -s test', 'npm --silent test -- a.test.mjs', 'npm --prefix . test', 'npm -w x test -- a.test.mjs',
-    'npx vitest@latest run a.test.mjs', 'npx -y vitest@2 run a.test.mjs',
-    'timeout 300 npx vitest run a.test.mjs', 'timeout -s KILL 300 npx vitest run a.test.mjs',
-    'nice -n 5 npx vitest run a.test.mjs', 'nice -5 npx vitest run a.test.mjs',
-    'node node_modules/vitest/vitest.mjs run a.test.mjs',
-    // other direct entry points of the same vitest install (advisory finding on #3932, round 2)
-    'node ./node_modules/vitest/dist/cli.js run a.test.mjs', 'node node_modules/vitest/dist/cli.js a.test.mjs',
-    'node node_modules/.bin/vitest run a.test.mjs', 'node ../node_modules/.bin/vitest run a.test.mjs',
-    'node --title standards scripts/check-standards.mjs --local',
-    'node --max-old-space-size 4096 scripts/check-standards.mjs',
-    'node --env-file .env scripts/check-standards.mjs',
-    'node --require ./setup.js scripts/check-standards.mjs',
-  ])('denies %s in an ordinary session', (cmd) => {
+  // Reuse every direct Vitest spelling from the deny table, including Node-option bypasses.
+  const vitestHeads = [...new Set([...ordinarySessionRuns, ...bypassRuns, ...execVitestRuns]
+    .flatMap((cmd) => {
+      const entry = /(?:^|\s)(?:vitest(?:@[^\s]+)?|(?:\.\.?\/)?node_modules\/(?:\.bin\/vitest|vitest\/(?:vitest\.mjs|dist\/cli\.js)))(?=\s|$)/.exec(cmd);
+      if (!entry) return [];
+      return [cmd.slice(0, entry.index + entry[0].length).replace(/^WE_FULL_SUITE_OK=1\s+/, '')];
+    })), 'node --no-warnings node_modules/vitest/vitest.mjs'];
+
+  it.each(vitestHeads)('requires the full-suite escape for bare `%s run`, raw and admitted', (head) => {
+    for (const prefix of ['', queue]) {
+      const cmd = prefix + head + ' run';
+      expect(decide(cmd, {}), cmd).toContain('bare FULL-SUITE');
+      expect(decide(cmd, {}), cmd).toContain('WE_FULL_SUITE_OK');
+      expect(fullSuiteEscapeUsed('WE_FULL_SUITE_OK=1 ' + cmd), cmd).toBe(true);
+    }
+    expect(decide(queue + head + ' run a.test.mjs', {})).toBeNull();
+    expect(decide('WE_FULL_SUITE_OK=1 ' + queue + head + ' run', {})).toBeNull();
+  });
+
+  it.each(ordinarySessionRuns)('denies %s in an ordinary session', (cmd) => {
     expect(decide(cmd, {})).not.toBeNull();
   });
 
