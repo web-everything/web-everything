@@ -1,8 +1,10 @@
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { URL as NodeURL } from 'node:url';
-import { describe, expect, it } from 'vitest';
-import { BUILT_IN_REVIEW_SETTINGS, defaultReviewSettingsPath, resolveReviewSettings,
+import { describe, expect, it, vi } from 'vitest';
+import { BUILT_IN_REVIEW_SETTINGS, defaultReviewSettingsPath, loadReviewSettingsFile, resolveReviewSettings,
   resolveAuditSettings, resolveReviewSettingSource, validateReviewSettings } from '../review-settings.mjs';
 
 describe('R473 release settings', () => {
@@ -91,4 +93,25 @@ describe('R473 release settings', () => {
     expect(defaults).toEqual(expect.arrayContaining([expect.any(String)]));
     expect(validateReviewSettings({ raceBlockPaths }).raceBlockPaths).toEqual(defaults);
   });
+
+  describe('D-R451 env and root fail-closed', () => {
+    const paths = (fileConfig, env, log) => resolveAuditSettings({ fileConfig, platform: {}, env, log }).value.raceBlockPaths;
+    it.each(['[]', 'not json', '{"a":1}', '[""]', '[1]'])('env race paths %j is ignored with a warning and keeps custom protection', raw => {
+      const log = vi.fn();
+      const out = paths({ raceBlockPaths: ['custom/*'] }, { WE_REVIEW_RACE_BLOCK_PATHS: raw }, log);
+      expect(out).toContain('custom/*');
+      expect(log).toHaveBeenCalledWith(expect.stringMatching(/ignored/));
+    });
+    it('valid env race paths add protection and never remove configured paths', () => {
+      expect(paths({ raceBlockPaths: ['custom/*'] }, { WE_REVIEW_RACE_BLOCK_PATHS: '["extra/*"]' })).toEqual(expect.arrayContaining(['custom/*', 'extra/*']));
+    });
+    it.each([['null', 'null'], ['array', '[]'], ['scalar', '7'], ['string', '"x"']])('a readable settings file with a %s root resolves to prod', (_n, body) => {
+      const dir = mkdtempSync(join(tmpdir(), 'rs-'));
+      const file = join(dir, 'review-settings.json');
+      writeFileSync(file, body);
+      expect(loadReviewSettingsFile(file).releaseStage).toBe('prod');
+      rmSync(dir, { recursive: true, force: true });
+    });
+  });
+
 });

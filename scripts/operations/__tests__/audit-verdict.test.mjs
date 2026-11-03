@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { URL as NodeURL, fileURLToPath } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { BUILT_IN_REVIEW_SETTINGS } from '../../lib/review-settings.mjs';
 
 // R473 stage 1 deliberately supplies tests only. Stage 2 supplies the implementation;
@@ -60,7 +60,7 @@ describe('R473 pure classified verdict', () => {
 
   it('D2 retains a card due before prod, while D3 is advisory with a card', async () => {
     for (const stage of ['prerelease', 'prod']) {
-      const result = await compute([finding({ class: 'D2', relation: 'untouched' }), finding({ id: 'hardening', class: 'D3' })], options(stage));
+      const result = await compute([finding({ class: 'D2', relation: 'untouched', card: 'backlog/6400-debt.md' }), finding({ id: 'hardening', class: 'D3' })], options(stage, { readCard: () => 'status: open\n' }));
       expect(result.verdict).toBe('NOT WEAKENED');
       expect(ids(result.cards).sort()).toEqual(['f1', 'hardening']);
       expect(result.cards).toContainEqual(expect.objectContaining({ id: 'f1', mustPayBefore: 'prod' }));
@@ -263,7 +263,7 @@ describe('R473 reviewer evidence replay (not new reproductions of the original b
     // Only D1 can become advisory after the one unsuccessful targeted recheck.
     const resolved = c.findings.map(f => c.recheckAs[f.id] ? { ...f, class: c.recheckAs[f.id], trigger: 'Targeted recheck supplied no breaking input' } : f);
     for (const stage of ['prerelease', 'prod']) {
-      const result = await compute(resolved, options(stage, { rulings: c.rulings }));
+      const result = await compute(resolved, options(stage, { rulings: c.rulings, readCard: () => 'status: open\n' }));
       expect(result.verdict).toBe(c[stage]);
       for (const f of resolved.filter(f => ['E1', 'E2', 'D2', 'D3', 'X1'].includes(f.class))) {
         if (stage === 'prod' && f.class.startsWith('E')) continue;
@@ -323,4 +323,31 @@ describe('R473 structured concurrency evidence', () => {
     expect(result.blocks).toHaveLength(1);
     expect(result.ships).toEqual([]);
   });
+
+  describe('D2 debt verification (D-R451)', () => {
+    const d2 = (extra = {}) => finding({ class: 'D2', relation: 'untouched', card: 'backlog/6400-debt.md', ...extra });
+    const reader = (body = 'status: open\n') => vi.fn(() => body);
+    const NOW = Date.parse('2026-11-03T12:00:00Z');
+    it.each(['prerelease', 'prod'])('ships with a card that exists on main at %s', async stage => {
+      const readCard = reader();
+      const r = await compute([d2()], options(stage, { readCard, now: NOW }));
+      expect(r.verdict).toBe('NOT WEAKENED');
+      expect(readCard).toHaveBeenCalledWith('backlog/6400-debt.md');
+    });
+    it.each([['missing card field', { card: undefined }], ['card path outside backlog/', { card: '../x.md' }]])('blocks on %s', async (_n, extra) => {
+      expect((await compute([d2(extra)], options('prerelease', { readCard: reader(), now: NOW }))).blocks).toHaveLength(1);
+    });
+    it('blocks when the card is not on main, the reader throws, or it returns blank', async () => {
+      for (const readCard of [() => null, () => { throw new Error('no git'); }, () => '  ']) {
+        expect((await compute([d2()], options('prerelease', { readCard, now: NOW }))).verdict).toBe('WEAKENED');
+      }
+    });
+    it('blocks once the mustPayBefore date has passed, ships before it', async () => {
+      expect((await compute([d2({ mustPayBefore: '2026-11-01' })], options('prerelease', { readCard: reader(), now: NOW }))).verdict).toBe('WEAKENED');
+      expect((await compute([d2()], options('prerelease', { readCard: reader('mustPayBefore: 2026-11-01\n'), now: NOW }))).verdict).toBe('WEAKENED');
+      expect((await compute([d2({ mustPayBefore: '2026-12-01' })], options('prerelease', { readCard: reader(), now: NOW }))).verdict).toBe('NOT WEAKENED');
+      expect((await compute([d2({ mustPayBefore: 'garbage' })], options('prerelease', { readCard: reader(), now: NOW }))).verdict).toBe('WEAKENED');
+    });
+  });
+
 });

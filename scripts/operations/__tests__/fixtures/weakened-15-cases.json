@@ -216,7 +216,8 @@
         "invariant": "6244 pre-existing glob overlap",
         "trigger": "Cross-entry overlap missed on main; diff neither relies on nor widens it",
         "consequence": "Existing matcher limitation",
-        "relation": "untouched"
+        "relation": "untouched",
+        "card": "backlog/6244-glob-overlap.md"
       }
     ],
     "rulings": [],

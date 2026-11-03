@@ -112,14 +112,14 @@ describe('R473 classified audit prompt and records', () => {
 });
 
 describe('R473 per-finding recheck, never 2-of-3 voting', () => {
-  it.each(['D3', 'E1', 'E2', 'X2'])('one recheck returning disputed %s stays unresolved', async cls => {
+  it.each(['D3', 'E1', 'E2', 'X2'])('one recheck returning disputed %s stays unresolved (fingerprint-void keeps the original D1)', async cls => {
     const f = fixture([finding({ class: 'D1', trigger: null })], {
       recheck: vi.fn(async f => ({ ...f, class: cls, disputed: true, trigger: 'Evidence remains disputed' })),
     });
     expect(await main(ARGS, f.deps)).toBe(1);
     expect(f.deps.recheck).toHaveBeenCalledTimes(1);
     expect(f.deps.runCodex).toHaveBeenCalledTimes(1);
-    expect(f.result().recheck).toContainEqual(expect.objectContaining({ id: 'f1', class: 'X2' }));
+    expect(f.result().recheck).toContainEqual(expect.objectContaining({ id: 'f1', class: cls === 'D3' ? 'X2' : 'D1' }));
     expect(f.result().ships).toEqual([]);
     expect(f.result().cards).toEqual([]);
     expect(f.records.some(r => r.verdict === 'NOT WEAKENED')).toBe(false);
@@ -131,7 +131,7 @@ describe('R473 per-finding recheck, never 2-of-3 voting', () => {
     });
     expect(await main(ARGS, f.deps)).toBe(1);
     expect(f.deps.recheck).toHaveBeenCalledTimes(1);
-    expect(f.result().recheck).toContainEqual(expect.objectContaining({ class: 'X2' }));
+    expect(f.result().recheck).toContainEqual(expect.objectContaining({ class: 'D1' }));
     expect(f.records.some(r => r.verdict === 'NOT WEAKENED')).toBe(false);
   });
 
@@ -164,12 +164,13 @@ describe('R473 per-finding recheck, never 2-of-3 voting', () => {
     expect(f.deps.runCodex).toHaveBeenCalledTimes(1);
   });
 
-  it.each(['B4', 'E1'])('a concrete D1 recheck reclassifies to %s instead of voting', async cls => {
+  it.each(['B4', 'E1'])('a D1 recheck that upgrades to %s changes the fingerprint, is void, and the original D1 stands', async cls => {
     const claim = finding({ class: 'D1', trigger: null });
     const f = fixture([claim], { stage: 'prod', recheck: vi.fn(async f => ({ ...f, class: cls, trigger: 'A pauses; B replaces state; A writes stale state' })) });
     expect(await main(ARGS, f.deps)).toBe(1);
     expect(f.deps.recheck).toHaveBeenCalledTimes(1);
-    expect(f.result().blocks).toContainEqual(expect.objectContaining({ id: 'f1', class: cls }));
+    expect(f.result().recheck).toContainEqual(expect.objectContaining({ id: 'f1', class: 'D1' }));
+    expect(f.result().verdict).toBe('WEAKENED');
   });
 
   it.each(['unavailable', 'malformed', 'still-D1', 'different-finding', 'timeout'])('one %s recheck retains unresolved evidence and never clears', async mode => {
@@ -209,12 +210,13 @@ describe('R473 failed exemptions and mandatory race protection', () => {
     expect(f.records.some(r => r.verdict === 'NOT WEAKENED')).toBe(false);
   });
 
-  it('unauthenticated X1 can be independently reclassified as a blocking security defect', async () => {
+  it('unauthenticated X1 stays unresolved X2; a recheck that changes its class is void', async () => {
     const claim = finding({ class: 'X1', ruling: 'R-invented', consequence: 'Security bypass exposes secrets' });
     const f = fixture([claim], { recheck: vi.fn(async f => ({ ...f, class: 'B1' })) });
     expect(await main(ARGS, f.deps)).toBe(1);
     expect(f.deps.recheck).toHaveBeenCalledTimes(1);
-    expect(f.result().blocks).toContainEqual(expect.objectContaining({ id: 'f1', class: 'B1' }));
+    expect(f.result().recheck).toContainEqual(expect.objectContaining({ id: 'f1', class: 'X2' }));
+    expect(f.result().verdict).toBe('WEAKENED');
     expect(f.result().cards).toEqual([]);
   });
 
@@ -299,4 +301,29 @@ describe('R473 protected-path paraphrase adjudication', () => {
     expect(f.errors.join('')).toMatch(/human review/);
     expect(f.records).toEqual([]);
   });
+
+describe('R473 recheck fingerprint binding (D-R451)', () => {
+  it.each([
+    ['relation', { relation: 'untouched' }], ['class', { class: 'E2' }],
+    ['id', { id: 'other' }], ['file', { file: 'scripts/else.mjs' }], ['invariant', { invariant: 'Something else' }],
+    ['hunkHash', { hunkHash: 'f'.repeat(64) }],
+  ])('a recheck that changes %s is void and the original stands', async (_name, change) => {
+    const claim = finding({ class: 'D1', trigger: null });
+    const f = fixture([claim], { recheck: vi.fn(async x => ({ ...x, class: 'D3', trigger: 'Swapped', ...change })) });
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.result().verdict).toBe('WEAKENED');
+    expect(f.result().recheck).toContainEqual(expect.objectContaining({ id: 'f1', class: 'D1' }));
+  });
+  it('a same-fingerprint D1 to D3 downgrade clears with a card', async () => {
+    const f = fixture([finding({ class: 'D1', trigger: null })]);
+    expect(await main(ARGS, f.deps)).toBe(0);
+  });
+  it('uses deps.hunkHash when supplied and binds to it', async () => {
+    const f = fixture([finding({ class: 'D1', trigger: null })], { recheck: vi.fn(async x => ({ ...x, class: 'D3', hunkHash: 'a'.repeat(64) })) });
+    f.deps.hunkHash = vi.fn(async () => 'b'.repeat(64));
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.deps.hunkHash).toHaveBeenCalled();
+  });
+});
+
 });

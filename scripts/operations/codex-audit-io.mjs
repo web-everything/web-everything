@@ -1,4 +1,5 @@
 /** @file Real Git/Codex and JSONL persistence adapters for the standalone audit. */
+import { createHash } from 'node:crypto';
 import * as realFs from 'node:fs';
 import { spawnSync as realSpawnSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
@@ -40,6 +41,7 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
       const checked = parseAuditAnswer(answer);
       return checked.length === 1 ? checked[0] : null;
     },
+    hunkHash: (finding, { base, head }) => createHash('sha256').update(run('git', ['diff', `${base}...${head}`, '--', finding.file], 30_000)).digest('hex'),
     resolveSha: ref => run('git', ['rev-parse', '--verify', `${ref}^{commit}`], 30_000).trim(),
     runCodex(prompt) {
       const scratch = fs.mkdtempSync(join(scratchRoot, 'codex-audit-'));

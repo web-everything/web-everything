@@ -101,12 +101,14 @@ export function validateReviewSettings(raw) {
 }
 
 export function loadReviewSettingsFile(path = defaultReviewSettingsPath()) {
-  try { return validateReviewSettings(JSON.parse(readFileSync(path, 'utf8'))); }
+  try { return validateReviewSettings(plainRoot(JSON.parse(readFileSync(path, 'utf8')))); }
   catch { return validateReviewSettings({ releaseStage: 'prod' }); }
 }
 
 // Failed reads are explicit conservative policy; an omitted key in a readable file keeps the product default.
-const rawReviewSettings = () => { try { return JSON.parse(readFileSync(defaultReviewSettingsPath(), 'utf8')); } catch { return { releaseStage: 'prod' }; } };
+// A readable file whose root is not a plain object counts as unreadable (fail closed to prod).
+const plainRoot = v => { if (v && typeof v === 'object' && !Array.isArray(v)) return v; throw new Error('settings root is not an object'); };
+const rawReviewSettings = () => { try { return plainRoot(JSON.parse(readFileSync(defaultReviewSettingsPath(), 'utf8'))); } catch { return { releaseStage: 'prod' }; } };
 const REFERRAL_SAFETY_KEYS = ['recheckCarriedReferrals', 'autoPolicyRespectsNotReal'];
 /** New referral safeguards use the shared standard → platform → tool → env cascade, with provenance. */
 export function resolveReferralSafetySettings({ fileConfig = rawReviewSettings(), platform, env = process.env, log } = {}) {
@@ -150,19 +152,30 @@ export function resolveReviewSettingSource(key, { fileRaw, platform, env = proce
 export function resolveAuditSettings({ fileConfig = rawReviewSettings(), platform, env = process.env, log } = {}) {
   const keys = ['releaseStage', 'raceBlockPaths'];
   const pick = layer => Object.fromEntries(keys.filter(k => Object.hasOwn(layer ?? {}, k)).map(k => [k, PARSERS[k](layer[k])]));
-  const envValues = Object.fromEntries(keys.filter(k => Object.hasOwn(env ?? {}, REVIEW_SETTINGS_ENV[k]))
+  // Env can only tighten: raceBlockPaths from env ADD protection; empty/invalid is ignored with a warning.
+  let envPaths = null;
+  if (Object.hasOwn(env ?? {}, REVIEW_SETTINGS_ENV.raceBlockPaths)) {
+    try { const v = JSON.parse(env[REVIEW_SETTINGS_ENV.raceBlockPaths]); if (validPaths(v) && v.length) envPaths = v; } catch { /* warned below */ }
+    if (!envPaths) (log ?? console.warn)(`${REVIEW_SETTINGS_ENV.raceBlockPaths} is empty or invalid; ignored (env never removes race protection)`);
+  }
+  const envValues = Object.fromEntries(keys.filter(k => k !== 'raceBlockPaths' && Object.hasOwn(env ?? {}, REVIEW_SETTINGS_ENV[k]))
     .map(k => [k, PARSERS[k](env[REVIEW_SETTINGS_ENV[k]], { fromEnv: true })]));
   const run = (envLayer, envVals) => cascadePolicy('review', pick(fileConfig), {
     standard: { releaseStage: 'prerelease', raceBlockPaths: RACE_BLOCK_PATHS },
     platform: pick(platform === undefined ? platformPreference('review', { env }) : platform), env: envLayer, envValues: envVals, log,
     valid: { releaseStage: v => RELEASE_STAGES.includes(v), raceBlockPaths: validPaths },
   });
-  const resolved = run(env, envValues);
+  const noRaceEnv = Object.fromEntries(Object.entries(env ?? {}).filter(([k]) => k !== REVIEW_SETTINGS_ENV.raceBlockPaths));
+  let resolved = run(noRaceEnv, envValues);
   // An env override may only tighten: it can never relax a configured prod.
   if (envValues.releaseStage === 'prerelease') {
     const { releaseStage: _drop, ...rest } = envValues;
     const base = run({}, rest);
-    if (base.value?.releaseStage === 'prod') return base;
+    if (base.value?.releaseStage === 'prod') resolved = base;
+  }
+  if (envPaths) {
+    resolved = { ...resolved, value: { ...resolved.value, raceBlockPaths: Object.freeze([...new Set([...resolved.value.raceBlockPaths, ...envPaths])]) },
+      sources: { ...resolved.sources, raceBlockPaths: 'env' } };
   }
   return resolved;
 }

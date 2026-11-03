@@ -1,11 +1,14 @@
 /** Pure audit projection of platform-decisions#review-stringency-classified-outcomes. */
 import { BUILT_IN_REVIEW_SETTINGS, RELEASE_STAGES } from '../lib/review-settings.mjs';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 
 export const FINDING_CLASSES = Object.freeze(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'E1', 'E2', 'D1', 'D2', 'D3', 'X1', 'X2']);
 const scopeKeys = ['file', 'line', 'invariant', 'trigger', 'consequence', 'relation'];
 const text = value => typeof value === 'string' && value.trim().length > 0;
 export const findingIdentity = f => JSON.stringify([f?.file, f?.invariant]);
+/** Full re-check binding: a re-check may keep or downgrade the SAME fingerprint, never another finding. */
+export const findingFingerprint = f => JSON.stringify([f?.id, f?.file, f?.invariant, f?.class, f?.relation, f?.hunkHash ?? null]);
 const validInterleaving = steps => Array.isArray(steps) && steps.length >= 2 && steps.length <= 32
   && steps.every(step => step && typeof step === 'object' && !Array.isArray(step)
     && ['actor', 'action'].every(k => text(step[k]) && step[k].length <= 1024))
@@ -28,6 +31,25 @@ function matchesPath(file, pattern) {
 }
 
 const REPO_ROOT = fileURLToPath(new NodeURL('../../', import.meta.url));
+const CARD_PATH = /^backlog\/[A-Za-z0-9._-]+\.md$/;
+/** Default card reader: the card must exist on origin/main. Any failure is unavailable (null). */
+export function readCardFromMain(path) {
+  if (typeof path !== 'string' || !CARD_PATH.test(path)) return null;
+  const r = spawnSync('git', ['show', `origin/main:${path}`], { cwd: REPO_ROOT, encoding: 'utf8', timeout: 30_000, maxBuffer: 1 << 20 });
+  return r.error || r.status !== 0 ? null : r.stdout;
+}
+/** D2 debt ships only when its card exists on main and its pay-by date has not passed. Unreadable => false. */
+function d2Verified(f, { readCard = readCardFromMain, now = Date.now } = {}) {
+  try {
+    if (typeof f.card !== 'string' || !CARD_PATH.test(f.card)) return false;
+    const body = readCard(f.card);
+    if (typeof body !== 'string' || !body.trim()) return false;
+    const due = f.mustPayBefore ?? /^mustPayBefore:\s*(\S+)\s*$/m.exec(body)?.[1];
+    if (due === undefined || due === 'prod') return true;
+    const when = Date.parse(due);
+    return Number.isFinite(when) && when > (typeof now === 'function' ? now() : now);
+  } catch { return false; }
+}
 /** Repo-relative POSIX form of a reported path, or null when it cannot be established (callers fail closed). */
 function pathCandidates(file) {
   if (typeof file !== 'string' || /[\u0000-\u001f]/.test(file) || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(file)) return null;
@@ -74,6 +96,7 @@ export function computeVerdict(findings, options = {}) {
       }
     }
     if (f.class === 'D1' || f.class === 'X2') { result.recheck.push(f); continue; }
+    if (f.class === 'D2' && f.relation === 'untouched' && !d2Verified(f, options)) { result.blocks.push(f); continue; }
     if (f.class.startsWith('B') || (releaseStage === 'prod' && f.class.startsWith('E'))
       || (f.class === 'D2' && f.relation !== 'untouched')) { result.blocks.push(f); continue; }
     result.ships.push(f);
