@@ -349,6 +349,12 @@ export function classifySubmit({ status, signal, stdout = '', stderr = '', error
         pr: parsed.pr, url: parsed.url ?? null,
       };
     }
+    // R502 item 2: a parked PR whose review label did not apply is opened but UNLABELLED (#6339/#6343 stalled
+    // "no labels"). Say so instead of reporting a clean open.
+    if (parsed.reason === 'parked' && parsed.pr && parsed.reviewLabelApplied === false) {
+      return { outcome: 'opened', reason: 'parked', labelStep: 'missing', reviewLabel: parsed.reviewLabel ?? 'review:pending',
+        detail: parsed.detail ?? tail, pr: parsed.pr, url: parsed.url ?? null };
+    }
     const known = HOME_REASONS[parsed.reason];
     const outcome = known === 'opened' ? 'opened' : (known ?? 'unrun');
     return {
@@ -405,6 +411,10 @@ export function extractSubmitResult(payload) {
 export function describeSubmit(result) {
   if (result.outcome === 'opened' && result.labelStep === 'deferred') {
     return { line: `submit: opened #${result.pr}${result.url ? ` ${result.url}` : ''} — ${result.detail}`, failed: false };
+  }
+  if (result.outcome === 'opened' && result.labelStep === 'missing') {
+    const label = result.reviewLabel || 'review:pending';
+    return { line: `submit: opened #${result.pr} but NO ${label} label was applied — no daemon will pick it up. Run: gh pr edit ${result.pr} --add-label ${label}`, failed: true };
   }
   if (result.outcome === 'opened') {
     return { line: `submit: opened #${result.pr} ${result.url}`, failed: false };

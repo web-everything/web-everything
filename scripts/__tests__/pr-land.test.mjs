@@ -7,7 +7,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { pushFailedDetail, mergeMethodFlag, buildCreateArgs, prCreateBodyGuard, buildMergeArgs, buildRenumberHealArgs, buildRegenArgs, buildAddLabelArgs, classifyChecks, planPrLand, pollVerdict, isPostLandTreeDirty, postLandSkips, postLandReport, scopeHealChangedPaths, resolveProducerReviewLabel, resolveRosterReconcile, resolveParkLabel, withAuthorStamp, composePrBody, PARK_LABELS, decideHoldReadyStrip, resolveDraft, isMainFixPr, unlabelledHandOffLabel } from '../pr-land.mjs';
+import { pushFailedDetail, mergeMethodFlag, buildCreateArgs, prCreateBodyGuard, buildMergeArgs, buildRenumberHealArgs, buildRegenArgs, buildAddLabelArgs, classifyChecks, planPrLand, pollVerdict, isPostLandTreeDirty, postLandSkips, postLandReport, scopeHealChangedPaths, resolveProducerReviewLabel, resolveRosterReconcile, resolveParkLabel, withAuthorStamp, composePrBody, PARK_LABELS, decideHoldReadyStrip, resolveDraft, isMainFixPr, decideReadyOnOpen, applyLabelWithRetry, unlabelledHandOffLabel } from '../pr-land.mjs';
 import { REVIEW_LABELS, REVIEW_LABEL_META, READY_TO_MERGE_LABEL, scoreEscalation } from '../lib/review-escalation.mjs';
 import { buildAuthorActorMarker, parseAuthorActorId } from '../lib/review-independence.mjs';
 import { PANEL_LENSES } from '../lib/review-core.mjs';
@@ -478,7 +478,7 @@ describe('pr-land.mjs source wiring — draft-first PRs applied at the park crea
   const src = readFileSync(resolve(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
   it('the create params carry `draft` computed via resolveDraft, threaded from PLAN.mode and the --no-draft flag', () => {
     expect(src).toMatch(/const DRAFT_OPT_OUT = !!flags\['no-draft'\];/);
-    expect(src).toMatch(/const DRAFT = resolveDraft\(\{ mode: PLAN\.mode, optOut: DRAFT_OPT_OUT, ref: REF, title: sourceTitle \?\? '' \}\);/);
+    expect(src).toMatch(/const DRAFT = resolveDraft\(\{ mode: PLAN\.mode, optOut: DRAFT_OPT_OUT, ref: REF, title: sourceTitle \?\? '', readyOnOpen \}\);/);
     expect(src).toMatch(/const createParams = \{ base: BASE, head: REF, body: CREATE_BODY, draft: DRAFT,/);
     expect(src).toMatch(/get title\(\) \{ return publicationTitle\(/);
     expect(src).toMatch(/if \(DRY_RUN\) \{\s+const createArgs = buildCreateArgs\(createParams\);/);
@@ -898,5 +898,39 @@ describe('resolveDraft — a red-main fix PR always opens ready (card xu1nixv, i
   it('any other parked PR stays draft-first (the card PR "a red main gets an owner" included)', () => {
     expect(resolveDraft({ mode: 'park', optOut: false, ref: 'lane/main-red-owner-card', title: 'backlog: file xu1nixv — a red main gets an owner' })).toBe(true);
     expect(isMainFixPr({ ref: 'lane/foo', title: 'fix(drain): main tip refresh' })).toBe(false);
+  });
+});
+
+// ── R502 item 2: pre-approved / guard-config PRs open READY; a park label is retried, never silently dropped ──
+describe('decideReadyOnOpen — only flagged PRs skip the draft step (fail closed)', () => {
+  const cfg = { guardConfigPaths: ['scripts/settings/prototype-load.json'] };
+  it('an Operator-pre-approved body marker with a ruling id opens ready', () => {
+    expect(decideReadyOnOpen({ body: 'x\nOperator-pre-approved: R474\n', changedFiles: ['a.mjs'], ...cfg })).toMatchObject({ ready: true, why: 'pre-approved' });
+  });
+  it('a malformed or missing marker does not', () => {
+    for (const body of ['Operator-pre-approved: yes', 'pre-approved R474', '', 'Operator-pre-approved: R4x']) expect(decideReadyOnOpen({ body, changedFiles: ['a.mjs'], ...cfg }).ready).toBe(false);
+  });
+  it('a PR touching ONLY guard-config paths opens ready; any extra file keeps it a draft', () => {
+    expect(decideReadyOnOpen({ body: '', changedFiles: ['scripts/settings/prototype-load.json'], ...cfg })).toMatchObject({ ready: true, why: 'guard-config' });
+    expect(decideReadyOnOpen({ body: '', changedFiles: ['scripts/settings/prototype-load.json', 'x.mjs'], ...cfg }).ready).toBe(false);
+  });
+  it('no changed files, unreadable settings or no paths fail closed', () => {
+    expect(decideReadyOnOpen({ body: '', changedFiles: [], ...cfg }).ready).toBe(false);
+    expect(decideReadyOnOpen({ body: '', changedFiles: ['scripts/settings/prototype-load.json'] }).ready).toBe(false);
+    expect(decideReadyOnOpen({ body: '', changedFiles: ['scripts/settings/prototype-load.json'], guardConfigPaths: 'nope' }).ready).toBe(false);
+  });
+  it('resolveDraft honours readyOnOpen but never drafts outside park', () => {
+    expect(resolveDraft({ mode: 'park', optOut: false, readyOnOpen: true })).toBe(false);
+    expect(resolveDraft({ mode: 'park', optOut: false, readyOnOpen: false })).toBe(true);
+  });
+});
+describe('applyLabelWithRetry — a park label is retried before it is reported missing', () => {
+  it('succeeds on a later attempt', () => {
+    let n = 0; const r = applyLabelWithRetry(() => { if (++n < 3) throw new Error('boom'); }, { attempts: 3 });
+    expect(r).toMatchObject({ applied: true, attempts: 3 });
+  });
+  it('reports the last error when every attempt fails', () => {
+    const r = applyLabelWithRetry(() => { throw new Error('rate limited'); }, { attempts: 2 });
+    expect(r).toMatchObject({ applied: false, attempts: 2, error: 'rate limited' });
   });
 });
