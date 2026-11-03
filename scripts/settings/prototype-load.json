@@ -18,6 +18,11 @@
     "lease-reaper": {
       "label": "com.we.lease-reaper"
     },
+    "pass-readers": {
+      "label": "com.we.conveyor-pass-daemon.ci-red-recovery-watch-we",
+      "clone": "wev-pass-readers",
+      "note": "The clone that runs the reader pass daemons, including ci-red-recovery-watch-we. The label is that pass daemon launchd job; with an explicit clone prototype-load uses the clone, and self-sync adopts the new code."
+    },
     "control": {
       "label": "com.we.control",
       "clone": "wev-control"
