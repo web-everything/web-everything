@@ -34,7 +34,6 @@ describe('freeze-read-timing-log', () => {
     const lines = [];
     const run = instrumentGit(() => 'out', { log: (l) => lines.push(l), deadlineAt: Date.now() + 100 });
     run(['fetch'], { cwd: '/nonexistent' });
-    expect(lines[0]).toContain('"postSkipped":"near-deadline"');
-    expect(lines[0]).not.toContain('"pre":{');
+    expect(lines).toHaveLength(0);
   });
 });

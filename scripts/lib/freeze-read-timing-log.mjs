@@ -75,7 +75,7 @@ export function instrumentGit(run, { label = 'freeze-read', slowMs = 5000, log =
     const t0 = Date.now(); const d0 = new Date(); const startClock = ((d0.getHours() * 60 + d0.getMinutes()) * 60 + d0.getSeconds()) * 1000 + d0.getMilliseconds();
     try {
       if (!tight()) pre = contentionSnapshot(opts.cwd);
-      if (args[0] === 'fetch') {
+      if (args[0] === 'fetch' && !tight()) {
         tdir = mkdtempSync(join(tmpdir(), 'freeze-trace-'));
         runOpts = { ...opts, env: { ...(opts.env || process.env), GIT_TRACE2_EVENT: join(tdir, 't2'), GIT_TRACE_PACKET: join(tdir, 'pkt') } };
       }
@@ -85,13 +85,13 @@ export function instrumentGit(run, { label = 'freeze-read', slowMs = 5000, log =
     finally {
       try {
         const ms = Date.now() - t0;
-        if (args[0] === 'fetch' || err || ms > slowMs) {
+        if (!tight() && (args[0] === 'fetch' || err || ms > slowMs)) {
           const rec = { label, cmd: String(args[0]), ms, ok: !err, err: err ? String(err.code || err.signal || err.message).slice(0, 60) : null, pre };
           if (tdir) {
             const rd = (f) => { try { const fd = openSync(join(tdir, f), 'r'); try { const b = Buffer.alloc(TRACE_READ_CAP); return b.toString('utf8', 0, readSync(fd, b, 0, TRACE_READ_CAP, 0)); } finally { closeSync(fd); } } catch { return ''; } };
             rec.children = summarizeTrace2(rd('t2')); rec.packets = summarizePackets(rd('pkt'), startClock);
           }
-          try { if (!tight()) rec.post = contentionSnapshot(opts.cwd); else rec.postSkipped = 'near-deadline'; } catch { /* ignore */ }
+          try { rec.post = contentionSnapshot(opts.cwd); } catch { /* ignore */ }
           log(formatTimingLine(rec));
         }
       } catch { /* log-only: never affects the call */ }
