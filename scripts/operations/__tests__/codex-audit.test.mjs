@@ -1,3 +1,4 @@
+import { FENCED_DATA_RULE } from '../../lib/mandate-fence.mjs';
 /** @file Hermetic standalone audit contract and real-adapter boundary tests. */
 import { createHash } from 'node:crypto';
 import * as realFs from 'node:fs';
@@ -23,6 +24,65 @@ function fixture(answer = 'NOT WEAKENED') {
   };
   return { deps, records, output, errors };
 }
+
+describe('audit shared ledger context (R469)', () => {
+  const ledgerBrief = FENCED_DATA_RULE + '\n\n<findings>\nShared finding ledger DATA: key=guard-gap source=juror status=test-pinned\n'
+    + 'scripts/gate.mjs:12 guard removed\n</findings>';
+
+  it('appends a non-empty deps.ledgerBrief after the unchanged canonical question and range', async () => {
+    const baseline = fixture();
+    await main(ARGS, baseline.deps);
+    const f = fixture();
+    f.deps.ledgerBrief = ledgerBrief;
+    expect(await main(ARGS, f.deps)).toBe(0);
+    const prompt = f.deps.runCodex.mock.calls[0][0];
+    const originalPrompt = baseline.deps.runCodex.mock.calls[0][0];
+    expect(prompt.startsWith(originalPrompt)).toBe(true);
+    expect(prompt).toContain(ledgerBrief);
+    expect(prompt.trimEnd().endsWith(ledgerBrief)).toBe(true);
+    expect(prompt.indexOf(ledgerBrief)).toBeGreaterThan(prompt.indexOf(CANONICAL_QUESTION));
+    expect(prompt.indexOf(ledgerBrief)).toBeGreaterThan(prompt.indexOf(`git diff ${BASE}...${HEAD}`));
+    expect(f.records[0].questionHash).toBe(QUESTION_HASH);
+    expect(QUESTION_HASH).toBe(createHash('sha256').update(CANONICAL_QUESTION).digest('hex'));
+  });
+
+  it.each(['', undefined, null, false, 123, { text: 'not a brief string' }])
+  ('preserves the original prompt when ledgerBrief is empty or not a string: %j', async ledgerBrief => {
+    const baseline = fixture();
+    await main(ARGS, baseline.deps);
+    const f = fixture();
+    f.deps.ledgerBrief = ledgerBrief;
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.deps.runCodex.mock.calls[0][0]).toBe(baseline.deps.runCodex.mock.calls[0][0]);
+  });
+
+  it.each([false, true])('never drops audit findings or changes WEAKENED with ledger context (json=%s)', async json => {
+    const findings = ['scripts/gate.mjs:12 guard removed', 'scripts/other.mjs:8 new bypass'];
+    const f = fixture(`WEAKENED\n${findings.join('\n')}`);
+    f.deps.ledgerBrief = ledgerBrief;
+    expect(await main(json ? [...ARGS, '--json'] : ARGS, f.deps)).toBe(1);
+    expect(f.deps.runCodex.mock.calls[0][0]).toContain(ledgerBrief);
+    expect(f.records).toEqual([{ at: AT, base: BASE, head: HEAD, baseRef: 'origin/main',
+      questionHash: QUESTION_HASH, verdict: 'WEAKENED', findings }]);
+    if (json) {
+      expect(JSON.parse(f.output.join(''))).toEqual({ base: BASE, head: HEAD,
+        questionHash: QUESTION_HASH, verdict: 'WEAKENED', findings });
+    } else {
+      expect(f.output.join('')).toBe(`WEAKENED\n${findings.join('\n')}\n`);
+    }
+  });
+
+  it.each(['Looks good\nNOT WEAKENED', ' WEAKENED', 'WEAKENED ', 'NOT WEAKENED\nWEAKENED'])
+  ('retains fail-closed verdict parsing with ledger context: %j', async answer => {
+    const f = fixture(answer);
+    f.deps.ledgerBrief = ledgerBrief;
+    expect(await main(ARGS, f.deps)).toBe(3);
+    expect(f.deps.runCodex.mock.calls[0][0]).toContain(ledgerBrief);
+    expect(f.errors.join('')).toMatch(/UNPARSEABLE/);
+    expect(f.output).toEqual([]);
+    expect(f.records).toEqual([]);
+  });
+});
 
 describe('canonical audit', () => {
   it('pins the question text and its sha256 hash', () => {
