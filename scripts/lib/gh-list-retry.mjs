@@ -16,6 +16,14 @@ import { GH_TRANSIENT_SERVER_PATTERNS } from './gh-throttle.mjs';
 export const GH_LIST_BACKOFF_MS = Object.freeze([2000, 6000]);
 export const GH_LIST_FAIL_THRESHOLD = 3;
 
+/** Backoff schedule, overridable by WE_GH_LIST_BACKOFF_MS (comma-separated ms) so sims and soaks need not sleep for real. */
+export function listBackoffFromEnv(env = process.env) {
+  const raw = env?.WE_GH_LIST_BACKOFF_MS;
+  if (typeof raw !== 'string' || !raw.trim()) return GH_LIST_BACKOFF_MS;
+  const parsed = raw.split(',').map((x) => Number(x.trim()));
+  return parsed.every((n) => Number.isFinite(n) && n >= 0) ? Object.freeze(parsed) : GH_LIST_BACKOFF_MS;
+}
+
 const textOf = (e) => {
   const parts = [];
   for (let c = e, i = 0; c && i < 4; c = c.cause, i++) parts.push(c.message, c.stderr && String(c.stderr));
@@ -44,8 +52,10 @@ function appendEvent(ev, env) {
  * @param {{repo?:string, op?:string, attempts?:number, backoffMs?:number[], sleep?:Function, streaks?:Map,
  *   persist?:boolean, threshold?:number, onEvent?:Function, env?:object, daemon?:string}} [o]
  */
-export function withListRetry(fn, { repo = '', op = 'pr-list', attempts = GH_LIST_BACKOFF_MS.length + 1, backoffMs = GH_LIST_BACKOFF_MS,
-  sleep = syncSleep, streaks, persist = true, threshold = GH_LIST_FAIL_THRESHOLD, onEvent, env = process.env, daemon } = {}) {
+export function withListRetry(fn, { repo = '', op = 'pr-list', attempts, backoffMs, sleep = syncSleep, streaks, persist = true,
+  threshold = GH_LIST_FAIL_THRESHOLD, onEvent, env = process.env, daemon } = {}) {
+  backoffMs ??= listBackoffFromEnv(env);
+  attempts ??= backoffMs.length + 1;
   const key = `${repo}:${op}`;
   const map = streaks ?? (persist ? loadStreaks(env) : new Map());
   const save = () => { if (!streaks && persist) saveStreaks(env, map); };

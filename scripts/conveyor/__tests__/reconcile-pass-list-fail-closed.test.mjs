@@ -11,10 +11,12 @@ vi.mock('node:child_process', async (importOriginal) => ({
 }));
 vi.mock('../../lib/gh-throttle.mjs', async (importOriginal) => {
   const { execFileSync } = await import('node:child_process');
+  // execFileSync is the vi.fn() above, so this gh is a fake: no real process is ever spawned.
+  const fakeGh = (args, opts) => execFileSync('gh', args, opts);
   return {
     ...await importOriginal(),
     execFileSyncThrottled: vi.fn((file, args, opts) => execFileSync(file, args, opts)),
-    runGhSync: vi.fn((args, opts) => execFileSync('gh', args, opts)),
+    runGhSync: vi.fn(fakeGh),
   };
 });
 vi.mock('../../lib/write-all-sync.mjs', () => ({ writeAllSync: vi.fn(), writeLineSync: vi.fn() }));
