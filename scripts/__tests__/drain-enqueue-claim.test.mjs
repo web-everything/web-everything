@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
+import * as claimModule from '../lib/drain-enqueue-claim.mjs';
 import { createEnqueueClaims, withSerialEnqueueClaim } from '../lib/drain-enqueue-claim.mjs';
 
 const roots = [];
@@ -23,25 +24,30 @@ describe('per-PR enqueue claims', () => {
     for (const result of results.filter(r => !r.won)) expect(result).toMatchObject({ reason: 'held', heldBy: { pid: 1, kind: 'serial' } });
   });
 
-  it('holds live owners beyond ttlMs through the default 60-minute hard cap, then reclaims', () => {
+  it('holds live owners beyond ttlMs and past the default 60-minute hard cap', () => {
     const dir = temp();
     claim(make(dir));
     expect(claim(make(dir, { now: () => 600_101 }))).toMatchObject({ won: false, reason: 'held' });
     expect(claim(make(dir, { now: () => 3_600_100 }))).toMatchObject({ won: false, reason: 'held' });
-    expect(claim(make(dir, { now: () => 3_600_101 }))).toMatchObject({ won: true });
+    expect(claim(make(dir, { now: () => 3_600_101 }))).toMatchObject({ won: false, reason: 'held' });
   });
 
-  it('reclaims a live owner past an injected hard cap', () => {
+  it('keeps a live owner held past an injected hard cap', () => {
     const dir = temp();
     claim(make(dir));
     expect(claim(make(dir, { now: () => 1100, ttlMs: 10, hardTtlMs: 1000 }))).toMatchObject({ won: false, reason: 'held' });
-    expect(claim(make(dir, { now: () => 1101, ttlMs: 10, hardTtlMs: 1000 }))).toMatchObject({ won: true });
+    expect(claim(make(dir, { now: () => 1101, ttlMs: 10, hardTtlMs: 1000 }))).toMatchObject({ won: false, reason: 'held' });
   });
 
   it('reclaims a dead owner immediately before either TTL expires', () => {
     const dir = temp();
     claim(make(dir));
     expect(claim(make(dir, { pidAlive: () => false }))).toMatchObject({ won: true });
+  });
+
+  it('replaces an owner past the hard cap only after its PID is dead', () => {
+    const dir = temp(); claim(make(dir));
+    expect(claim(make(dir, { now: () => 1101, hardTtlMs: 1000, pidAlive: () => false })).won).toBe(true);
   });
 
   it('keys repository, PR number and new head independently', () => {
@@ -75,6 +81,27 @@ describe('per-PR enqueue claims', () => {
     claims.release({ ...candidate, token: JSON.parse(readFileSync(join(dir, filename(candidate)), 'utf8')).token });
     const second = claim(claims); claims.markDone({ ...candidate, token: second.token });
     expect(claim(claims).won).toBe(true);
+  });
+
+  it('protects a long enqueue from other kinds for a full TTL after doneAt', () => {
+    let clock = 100; const ttlMs = 10_000;
+    const claims = make(undefined, { now: () => clock, ttlMs });
+    const first = claim(claims);
+    clock = 100 + ttlMs + 1000;
+    claims.markDone({ ...candidate, token: first.token });
+    clock = 100 + ttlMs + 2000;
+    expect(claim(claims, candidate, 'fast')).toMatchObject({ won: false, reason: 'done-by-other' });
+    clock = 100 + 2 * ttlMs + 1000;
+    expect(claim(claims, candidate, 'fast').reason).toBe('done-by-other');
+    clock++;
+    expect(claim(claims, candidate, 'fast').won).toBe(true);
+  });
+
+  it('falls back to claimedAt for persisted done records missing doneAt', () => {
+    const dir = temp();
+    writeFileSync(join(dir, filename(candidate)), JSON.stringify({ state: 'done', kind: 'serial', pid: 1, token: 'old', claimedAt: 100 }));
+    expect(claim(make(dir, { now: () => 1100, ttlMs: 1000 }), candidate, 'fast').reason).toBe('done-by-other');
+    expect(claim(make(dir, { now: () => 1101, ttlMs: 1000 }), candidate, 'fast').won).toBe(true);
   });
 
   it('uses shared coordination state across instances without leaving temporary files', () => {
@@ -297,5 +324,43 @@ describe('serial enqueue claim diagnostics', () => {
     expect(withSerialEnqueueClaim(claims, candidate, run, { emit: vi.fn() })).toEqual(op === 'claim' ? { skipped: 'claimed-elsewhere' } : result);
     expect(run).toHaveBeenCalledTimes(op === 'claim' ? 0 : 1);
     expect(stderr.mock.calls).toEqual([[warning(op).replace('broken storage', 'lock-busy')]]);
+  });
+});
+
+describe('explicit claim fault policy', () => {
+  const faults = [
+    ['undefined store', () => undefined],
+    ['throwing store', () => ({ claim() { throw new Error('broken storage'); } })],
+    ['missing claim method', () => ({})],
+    ['undefined result', () => ({ claim: () => undefined })],
+    ['incomplete result', () => ({ claim: () => ({}) })],
+    ['reported fault', () => ({ claim: () => ({ won: false, reason: 'claim-fault' }) })],
+    ['lock fault', () => ({ claim: () => ({ won: false, reason: 'lock-busy' }) })],
+  ];
+  it.each(faults)('async fails closed on %s and warns visibly', (_name, store) => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    expect(claimModule.claimOrFault(store(), { ...candidate, kind: 'fast' }, { mode: 'async', emit: vi.fn() }))
+      .toEqual({ won: false, reason: 'claim-fault' });
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining('fail-closed'));
+  });
+  it.each(faults)('serial fails open on %s and warns visibly', (name, store) => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    const result = claimModule.claimOrFault(store(), candidate, { mode: 'serial', emit: vi.fn() });
+    expect(result).toEqual(name === 'lock fault' ? { won: false, reason: 'lock-busy' } : { won: true });
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining('fail-open'));
+  });
+  it.each(['serial', 'async'])('%s preserves ownership wins and explicit refusals', mode => {
+    for (const result of [{ won: true, token: 'owned' }, ...['held', 'done-by-other', 'unreadable-record'].map(reason => ({ won: false, reason }))]) {
+      const claims = { claim: vi.fn(() => result) };
+      expect(claimModule.claimOrFault(claims, candidate, { mode })).toBe(result);
+      expect(claims.claim).toHaveBeenCalledWith(candidate);
+    }
+  });
+  it('serial wrapper enqueues and warns when the store is undefined', () => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    const run = vi.fn(() => ({ enqueued: true }));
+    expect(withSerialEnqueueClaim(undefined, candidate, run, { emit: vi.fn() })).toEqual({ enqueued: true });
+    expect(run).toHaveBeenCalledOnce();
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining('fail-open'));
   });
 });

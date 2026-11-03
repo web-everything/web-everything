@@ -1,8 +1,10 @@
 /**
+ * serial: fail-open = status quo on main; async: fails closed; R425 (async path stays off/shadow until switched on)
  * Shared, per-head enqueue ownership. Serial bookkeeping deliberately fails open on
  * storage faults: withLandWriteLock already serializes the enqueue, so claim-store
  * failures warn without changing serial behavior. Explicit ownership refusals skip.
- * Live claims use hardTtlMs (60 minutes); done records use ttlMs across kinds.
+ * Live owners remain held regardless of age (including the legacy hardTtlMs cap).
+ * Done records use ttlMs from doneAt across kinds, or claimedAt for legacy records.
  * Unreadable records remain held through ttlMs based on their file mtime.
  */
 import { createHash, randomUUID } from 'node:crypto';
@@ -23,7 +25,6 @@ export function createEnqueueClaims({
   now = Date.now,
   pidAlive = ownerAlive,
   ttlMs = 10 * 60_000,
-  hardTtlMs = 60 * 60_000,
   pid = process.pid,
 } = {}) {
   const sleeper = new Int32Array(new SharedArrayBuffer(4));
@@ -102,8 +103,8 @@ export function createEnqueueClaims({
         const at = now();
         if (record) {
           if (record.unreadable && at - record.mtimeMs <= ttlMs) return { won: false, reason: 'unreadable-record' };
-          if (record.state === 'done' && at - record.claimedAt <= ttlMs && record.kind !== candidate.kind) return { won: false, reason: 'done-by-other', heldBy: record };
-          if (record.state === 'claimed' && at - record.claimedAt <= hardTtlMs) {
+          if (record.state === 'done' && at - (record.doneAt ?? record.claimedAt) <= ttlMs && record.kind !== candidate.kind) return { won: false, reason: 'done-by-other', heldBy: record };
+          if (record.state === 'claimed') {
             let alive;
             try { alive = pidAlive(record.pid); } catch (error) { alive = error.code !== 'ESRCH'; }
             if (alive) return { won: false, reason: 'held', heldBy: record };
@@ -129,35 +130,53 @@ export function createEnqueueClaims({
   };
 }
 
+function warnClaimFault(identity, op, error, mode, emit) {
+  const clean = value => String(value).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
+  const message = clean(error?.message ?? error);
+  const key = clean(`${identity.repo}#${identity.num}@${identity.headSha}`);
+  process.stderr.write(`drain-enqueue-claim: ${op} failed for ${key}: ${message} — ${mode === 'serial' ? 'proceeding fail-open' : 'held fail-closed; retry claim storage before async enqueue'}\n`);
+  try {
+    Promise.resolve(emit({ kind: 'drain-enqueue-claim-error', repo: identity.repo, pr: identity.num,
+      daemon: 'drain', detail: { op, headSha: identity.headSha, message } })).catch(() => {});
+  } catch { /* Event storage never changes the admission outcome. */ }
+}
+
+/** Synchronous claim admission; async names the consumer path, not a Promise store. */
+export function claimOrFault(claims, identity, { mode = 'async', emit = appendDaemonEvent } = {}) {
+  if (!['serial', 'async'].includes(mode)) throw new TypeError(`Unknown claim mode: ${mode}`);
+  let result;
+  try {
+    if (!claims) throw new Error('claim store unavailable');
+    result = claims.claim(identity);
+    if (result?.won === true && typeof result.token === 'string' && result.token) return result;
+    if (result?.won === false && ['held', 'done-by-other', 'unreadable-record'].includes(result.reason)) return result;
+    throw new Error(result?.reason ?? 'invalid claim result');
+  } catch (error) {
+    warnClaimFault(identity, 'claim', error, mode, emit);
+    // Serial historically skips a busy lock, but proceeds when storage itself faults.
+    if (mode === 'serial') return result?.reason === 'lock-busy' ? result : { won: true };
+    return { won: false, reason: 'claim-fault' };
+  }
+}
+
 /** Serial bookkeeping is best-effort; ownership refusals still skip the enqueue. */
 export function withSerialEnqueueClaim(claims, identity, run, { emit = appendDaemonEvent } = {}) {
-  const warn = (op, error) => {
-    const clean = value => String(value).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
-    const message = clean(error?.message ?? error);
-    const key = clean(`${identity.repo}#${identity.num}@${identity.headSha}`);
-    process.stderr.write(`drain-enqueue-claim: ${op} failed for ${key}: ${message} — proceeding fail-open\n`);
-    try {
-      Promise.resolve(emit({ kind: 'drain-enqueue-claim-error', repo: identity.repo, pr: identity.num,
-        daemon: 'drain', detail: { op, headSha: identity.headSha, message } })).catch(() => {});
-    } catch { /* Event storage never changes the serial outcome. */ }
-  };
+  const warn = (op, error) => warnClaimFault(identity, op, error, 'serial', emit);
   const bookkeeping = (op, token) => {
     try {
       const result = claims[op]({ ...identity, token });
       if (result?.reason === 'lock-busy') warn(op, 'lock-busy');
     } catch (error) { warn(op, error); }
   };
-  let claim;
-  try { claim = claims?.claim({ ...identity, kind: 'serial' }); } catch (error) { warn('claim', error); }
+  const claim = claimOrFault(claims, { ...identity, kind: 'serial' }, { mode: 'serial', emit });
   if (claim?.won === false) {
-    if (claim.reason === 'lock-busy') warn('claim', 'lock-busy');
     return { skipped: 'claimed-elsewhere' };
   }
   let result;
   try { result = run(); } catch (error) {
-    if (claim?.won) bookkeeping('release', claim.token);
+    if (claim?.won && claim.token) bookkeeping('release', claim.token);
     throw error;
   }
-  if (claim?.won) bookkeeping(result?.enqueued === true ? 'markDone' : 'release', claim.token);
+  if (claim?.won && claim.token) bookkeeping(result?.enqueued === true ? 'markDone' : 'release', claim.token);
   return result;
 }
