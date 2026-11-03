@@ -462,7 +462,7 @@ export function resolveLaneHead(cwd, exec = execFileSync) {
  * @param {Function} [identity]
  * @returns {boolean|null}
  */
-export function probePid(pid, kill = (p, s) => process.kill(p, s), identity = pidIdentity) {
+export function probePid(pid, kill = (p, s) => process.kill(p, s), identity = pidIdentity, { startedBy = null } = {}) {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   try {
     kill(pid, 0);
@@ -470,7 +470,7 @@ export function probePid(pid, kill = (p, s) => process.kill(p, s), identity = pi
     if (e && e.code === 'ESRCH') return false;
     if (e?.code !== 'EPERM') return null;
   }
-  try { return identity(pid).alive; } catch { return null; }
+  try { return (Number.isFinite(startedBy) ? identity(pid, { startedBy }) : identity(pid)).alive; } catch { return null; }
 }
 
 /**
@@ -489,7 +489,8 @@ export function enrichAgents(agents, { readLaneHead = resolveLaneHead, probe = p
   return (Array.isArray(agents) ? agents : []).map((a) => {
     const cwd = String(a?.cwd ?? '');
     if (cwd && !headCache.has(cwd)) headCache.set(cwd, readLaneHead(cwd));
-    const alive = probe(Number.isInteger(a?.pid) ? a.pid : null);
+    const alive = probe(Number.isInteger(a?.pid) ? a.pid : null, undefined, undefined,
+      { startedBy: typeof a?.startedAt === 'number' && a.startedAt > 0 ? a.startedAt : null });
     const { pidAlive: previousPidAlive, ...fresh } = a;
     return {
       ...fresh,
