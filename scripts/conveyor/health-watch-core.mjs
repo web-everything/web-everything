@@ -48,6 +48,9 @@ export const DEFAULT_HEALTH_CONFIG = Object.freeze({
   tmp: { reviewSeatTtlMin: 120, backlogIndexMaxMb: 2048 },
   health: { diskFreeMinGb: 30 },
   ...CLAUDE_JOBS_ARCHIVE_DEFAULTS,
+  bottleneckReportEnabled: true, // shadow: report files only
+  bottleneckReportEveryMs: HOUR,
+  bottleneckReportBudgetMs: 60_000,
   mode: 'shadow',
   tickBudgetMs: 60_000,
   flapMax: 3,

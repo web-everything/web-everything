@@ -45,6 +45,8 @@
  *   node scripts/conveyor/health-watch.mjs silence --smell=ID [--subject=S] --card=NNN [--hours=72]
  *   node scripts/conveyor/health-watch.mjs unsilence --smell=ID [--subject=S]
  */
+import { runBottleneckReport } from './bottleneck-report.mjs';
+import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { runArchiveRetentionTick } from './archive-retention-tick.mjs';
 export { archiveRetentionTickAllowed } from './archive-retention-tick.mjs';
 import { sweepReviewTmp, probeDiskSpace } from './review-tmp-health.mjs';
@@ -1124,7 +1126,8 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   const dir = healthDir(flags['state-root']);
   const statePath = join(dir, 'state.json');
   const prev = { ...emptyHealthState(), ...readJson(statePath, {}) };
-  const config = { ...DEFAULT_HEALTH_CONFIG, ...readJson(join(dir, 'config.json'), {}) };
+  const toolConfig = readJson(join(dir, 'config.json'), {});
+  const config = { ...DEFAULT_HEALTH_CONFIG, ...toolConfig };
   const logsDir = flags['logs-dir'] || defaultLogsDir();
   const probeErrors = {};
   const probes = {};
@@ -1158,6 +1161,22 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   const claudeJobsArchive = archiveAllowed && archiveDue
     ? await attempt('claudeJobsArchive', () => archiveClaudeJobs(archiveOptions(config, flags, now)))
     : null;
+
+  const bottleneckSettings = cascadePolicy('bottleneckReport', {
+    enabled: toolConfig.bottleneckReportEnabled, everyMs: toolConfig.bottleneckReportEveryMs, budgetMs: toolConfig.bottleneckReportBudgetMs,
+  }, { standard: { enabled: true, everyMs: HOUR, budgetMs: 60_000 },
+    envValues: {
+      enabled: process.env.WE_BOTTLENECK_REPORT_ENABLED == null ? undefined : process.env.WE_BOTTLENECK_REPORT_ENABLED !== '0',
+      everyMs: process.env.WE_BOTTLENECK_REPORT_EVERY_MS == null ? undefined : Number(process.env.WE_BOTTLENECK_REPORT_EVERY_MS),
+      budgetMs: process.env.WE_BOTTLENECK_REPORT_BUDGET_MS == null ? undefined : Number(process.env.WE_BOTTLENECK_REPORT_BUDGET_MS),
+    }, valid: { enabled: v => typeof v === 'boolean', everyMs: v => Number.isFinite(v) && v >= HOUR,
+      budgetMs: v => Number.isFinite(v) && v >= 0 && v <= 60_000 } });
+  const bottleneckAllowed = deps.runBottleneckReport || (!flags['state-root'] && !flags['dry-run']);
+  const bottleneckReport = bottleneckAllowed && bottleneckSettings.value.enabled
+    && (prev.bottleneckReport?.truncated === true || cadenceDue(prev.bottleneckReport?.at, now, bottleneckSettings.value.everyMs))
+    ? await attempt('bottleneckReport', () => (deps.runBottleneckReport ?? runBottleneckReport)({
+      dir, now, budgetMs: bottleneckSettings.value.budgetMs, everyMs: bottleneckSettings.value.everyMs,
+    })) : null;
 
   // Card 335 — queue movement reads beside the archive cadence; never block a health tick.
   const prSweepSettings = resolvePrSweepSettings({ config });
@@ -1410,6 +1429,11 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   const state = scrubDeep(result.state);
   if (claudeJobsArchive) state.claudeJobsArchive = { at: now, ...(claudeJobsArchive.complete ? { completedAt: now } : {}), ...claudeJobsArchive };
   else if (prev.claudeJobsArchive) state.claudeJobsArchive = prev.claudeJobsArchive;
+  if (bottleneckReport && !bottleneckReport.skipped && Number.isFinite(bottleneckReport.completedAt)) state.bottleneckReport = {
+    at: now, completedAt: bottleneckReport.completedAt, summary: bottleneckReport.summary,
+    ...(bottleneckReport.truncated ? {truncated:true} : {}),
+  };
+  else if (prev.bottleneckReport) state.bottleneckReport = prev.bottleneckReport;
   if (prSweepJob) state.prSweep = prSweepJob.state;
   else if (prev.prSweep) state.prSweep = prev.prSweep;
   if (!flags['state-root'] && !flags['dry-run']) {
@@ -1618,6 +1642,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // The whole summary goes through the scrub too (the last choke point before stdout).
   return scrubDeep({
     now: new Date(now).toISOString(), durationMs, mode: config.mode, stateDir: dir, ghSampled: !!probes.prs, ghJob,
+    bottleneckReport: bottleneckReport ?? null,
     claudeJobsArchive: claudeJobsArchive ?? null, tmpSweep: tmpSweep ?? null, ghSpend: ghSpend ?? null, probeErrors, transitions: result.transitions.map((t) => ({ type: t.type, key: t.key })),
     plan: result.plan.map(({ diagnose, ...rest }) => rest), diagnoses, notifications, investigations, reports: written,
     section: renderHealthSection(state, { now, reportDir }),
@@ -1682,6 +1707,7 @@ async function main(argv) {
       else {
         console.log(`health-watch: tick ${summary.now} in ${summary.durationMs}ms (${summary.mode}); transitions: ${summary.transitions.map((t) => `${t.type} ${t.key}`).join(', ') || 'none'}`);
         if (summary.claudeJobsArchive) console.log(formatClaudeJobsArchiveLine(summary.claudeJobsArchive));
+        if (summary.bottleneckReport) console.log(summary.bottleneckReport.summary);
         if (summary.tmpSweep) console.log(formatTmpSweepLine(summary.tmpSweep));
         console.log(summary.section.join('\n'));
       }
