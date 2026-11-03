@@ -12,6 +12,7 @@
     "maxActionsPerHour": 6,
     "maxActionsPerPrHead": 2,
     "maxRedTeamRestartsPerHead": 2,
+    "maxRedTeamRestartsPerHead": 2,
     "digest": true,
     "staleHoldAutoResume": false,
     "grantCeiling": 10,

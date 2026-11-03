@@ -86,7 +86,7 @@ describe('settings', () => {
   it('R452: repository settings allow two actions per head (two red-team restarts, then needs-you)', () => {
     const repo = JSON.parse(readFileSync(join(process.cwd(), 'scripts/settings/pr-stall-sweep.json'), 'utf8'));
     expect(repo.prStallSweep.maxActionsPerPrHead).toBe(2);
-    expect(repo.prStallSweep.maxRedTeamRestartsPerHead ?? 2).toBe(2);
+    expect(repo.prStallSweep.maxRedTeamRestartsPerHead).toBe(2);
   });
   it.each([['false', false], ['0', false], ['true', true], ['1', true]])('parses WE_PR_STALL_SWEEP_DIGEST=%s as %s', (raw, value) => {
     expect(resolveStallSweepSettings({ env: { WE_PR_STALL_SWEEP_DIGEST: raw }, read: file({ digest: !value }), log }))
