@@ -1352,6 +1352,8 @@ const SHELL_C_FLAG = /^-[A-Za-z]*c$/;
 // separately-filed follow-up; this expansion must not add a second one).
 const NESTED_DEPTH_CAP = 4;
 const NESTED_NODE_CAP = 64;
+// Possible earlier values of Git-relevant variables checked per git segment; beyond it the target is unknown.
+const ALTERNATE_CHECK_CAP = 16;
 
 /** Index of the `)` that closes the group / command substitution opened at `s[open]` (a `(`), or -1.
  *  Quote-aware and nesting-aware. Pure. */
@@ -2276,7 +2278,7 @@ function daemonCloneWriteMessage(dir) {
  * cwd naming one explicitly (`cp x /…/wev-review-daemon/y` run from a lane) are caught. Falls back to the
  * ambient-cwd test alone when no operand is found at all (e.g. a bare `rm` with nothing to resolve).
  */
-export function daemonCloneWriteReason(segment, { cwd = null, roots = [], envDirs = [], configEnv = {}, fetchConfig = [], daemonFetchConfigReader = null } = {}) {
+export function daemonCloneWriteReason(segment, { cwd = null, roots = [], envDirs = [], configEnv = {}, fetchConfig = [], daemonFetchConfigReader = null, unknownTarget = false } = {}) {
   if (!roots.length) return null;
   const s = String(segment || '');
   const sub = gitSubcommand(s);
@@ -2285,6 +2287,7 @@ export function daemonCloneWriteReason(segment, { cwd = null, roots = [], envDir
     if (!GIT_STATE_SUBCOMMANDS.has(sub) && !configWrite) return null;
     // Named environment follows shell scope/order; envDirs remains a conservative explicit caller input.
     const targets = gitTargetDirs(s, cwd, configEnv).concat(envDirs.map((p) => absoluteGitTarget(cwd, p)));
+    if (unknownTarget) targets.push(null); // too many possible environment values to check one by one
     if (configWrite && sub === 'config') targets.push(...gitConfigFileTargets(s, targets[0], configEnv));
     const hit = targets.find((d) => d === null || isDaemonCloneRealpath(d, roots));
     if (hit === undefined) return null;
@@ -4057,7 +4060,7 @@ function globMatch(tokens, s) {
   return t === tokens.length;
 }
 
-export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLiveLease = false, markedLeaseSlug = null, contestedHolderSlug = null, dispatchKind = null, cwd = null, daemonCloneRoots = [], gitEnvDirs = [], gitConfigEnv = {}, daemonFetchConfigReader = null, fixClaimedBranches = [], pushTargets = [], fixPushes = [] } = {}) {
+export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLiveLease = false, markedLeaseSlug = null, contestedHolderSlug = null, dispatchKind = null, cwd = null, daemonCloneRoots = [], gitEnvDirs = [], gitConfigEnv = {}, gitTargetUnknown = false, daemonFetchConfigReader = null, fixClaimedBranches = [], pushTargets = [], fixPushes = [] } = {}) {
   const s = segment.trim();
   if (!s) return null;
 
@@ -4069,7 +4072,7 @@ export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLi
   // #xpt9fvd — a write targeting a DAEMON CLONE. Checked early and unconditionally (independent of
   // `primaryCwd`/lease context — a daemon clone is neither a primary checkout nor an ordinary leased lane):
   // see `daemonCloneWriteReason`'s own doc for the two shapes it catches and the one it deliberately does not.
-  const daemonWrite = daemonCloneWriteReason(s, { cwd, roots: daemonCloneRoots, envDirs: gitEnvDirs, configEnv: gitConfigEnv, daemonFetchConfigReader });
+  const daemonWrite = daemonCloneWriteReason(s, { cwd, roots: daemonCloneRoots, envDirs: gitEnvDirs, configEnv: gitConfigEnv, daemonFetchConfigReader, unknownTarget: gitTargetUnknown });
   if (daemonWrite) return daemonWrite;
 
   // xpnhz4o — a bare full-suite run. Before the raw-heavy arm so a bare `vitest run` gets THIS message (which
@@ -4979,21 +4982,26 @@ export function decide(command, ctx = {}) {
   // first applies future exports to earlier commands and lets assignments in child shells leak out.
   let nestedBudget = NESTED_NODE_CAP;
   const copyAlternates = (from) => new Map([...from].map(([key, values]) => [key, new Set(values)]));
-  const checkScope = (list, whole, inherited, depth, persist = null, inheritedReadonly = [], inheritedAlternates = new Map()) => {
+  const checkScope = (list, whole, inherited, depth, persist = null, inheritedReadonly = [], inheritedAlternates = new Map(), inheritedMaybeReadonly = []) => {
     const gitConfigEnv = { ...inherited };
     const readonlyNames = new Set(inheritedReadonly);
+    // Names a possibly-skipped `readonly` may have locked: a later assignment or unset may fail, so it only
+    // adds a possible value and never replaces the locked one.
+    const maybeReadonly = new Set(inheritedMaybeReadonly);
     // Other values a variable may hold because an assignment may not have run. Each is checked on its own:
     // every env-derived Git target is added separately, so one swapped key at a time covers every mix.
     const alternates = copyAlternates(inheritedAlternates);
     // Clearing evidence must be unconditional. This scanner does not evaluate shell control flow;
-    // retain possible targets in conditional lists, loops and pipelines rather than assume unset ran.
-    const canUnset = !/[&|]|\b(?:if|then|else|elif|while|until|for|do|case)\b/.test(whole);
+    // retain possible targets in conditional lists, loops, pipelines, groups, function bodies and after
+    // comments rather than assume a later assignment or unset ran. File-descriptor redirections
+    // (`2>&1`, `&>`) are not control flow.
+    const controlText = whole.replace(/\d*[<>]&\d*-?|&>>?/g, ' ');
+    const canUnset = !/[&|]|\b(?:if|then|else|elif|while|until|for|do|case|select|function)\b|(?:^|[\s;])[{}!#]|\(\s*\)/.test(controlText);
     const setAssignment = (key, value, readonly = false, conditional = false) => {
-      if (value === undefined && !canUnset) return;
       if (readonlyNames.has(key)) return; // failed assignment/unset leaves a readonly target active
-      if (conditional || !canUnset) {
-        // The assignment may be skipped: it adds a possible value and never replaces the earlier one, and a
-        // readonly that may not have run never blocks a later assignment.
+      if (conditional || !canUnset || maybeReadonly.has(key)) {
+        // The assignment may be skipped or refused: it adds a possible value and never replaces the earlier
+        // one. A readonly that may not have run only marks the name as possibly locked.
         if (gitConfigEnv[key] !== value) {
           const values = alternates.get(key) || new Set();
           values.add(gitConfigEnv[key]);
@@ -5001,7 +5009,8 @@ export function decide(command, ctx = {}) {
           alternates.set(key, values);
         }
         gitConfigEnv[key] = value;
-        if (persist) persist(key, value, false, true);
+        if (readonly) maybeReadonly.add(key);
+        if (persist) persist(key, value, readonly, true);
         return;
       }
       gitConfigEnv[key] = value;
@@ -5009,25 +5018,42 @@ export function decide(command, ctx = {}) {
       if (readonly) readonlyNames.add(key);
       if (persist) persist(key, value, readonly, false);
     };
-    const checkNested = (text, env, persistChanges = null, childReadonly = readonlyNames, childAlternates = alternates) => {
+    const checkNested = (text, env, persistChanges = null, childReadonly = readonlyNames, childAlternates = alternates,
+      childMaybeReadonly = maybeReadonly) => {
       if (!String(text).trim() || depth >= NESTED_DEPTH_CAP || nestedBudget <= 0) return null;
       nestedBudget -= 1;
-      return checkScope(parseSegments(text).segments, text, env, depth + 1, persistChanges, childReadonly, childAlternates);
+      return checkScope(parseSegments(text).segments, text, env, depth + 1, persistChanges, childReadonly, childAlternates,
+        childMaybeReadonly);
     };
     for (const seg of list) {
       const r = reason(seg, { ...ctx, gitConfigEnv });
       if (r) return r;
-      for (const [key, values] of alternates) {
-        for (const value of values) {
-          const alt = reason(seg, { ...ctx, gitConfigEnv: { ...gitConfigEnv, [key]: value } });
-          if (alt) return alt;
+      // Only a git invocation reads the environment for a target. Check each relevant possible value on its
+      // own; past ALTERNATE_CHECK_CAP the target is unknown and a state change fails closed.
+      if (alternates.size && gitSubcommand(seg)) {
+        const pairs = [];
+        const named = new Set(seg.match(/[A-Za-z_][A-Za-z0-9_]*/g) || []);
+        for (const [key, values] of alternates) {
+          if (!/^(?:GIT_|HOME$|XDG_CONFIG_HOME$)/.test(key) && !named.has(key)) continue;
+          for (const value of values) pairs.push([key, value]);
+        }
+        if (pairs.length > ALTERNATE_CHECK_CAP) {
+          const unknown = reason(seg, { ...ctx, gitConfigEnv, gitTargetUnknown: true });
+          if (unknown) return unknown;
+        } else {
+          for (const [key, value] of pairs) {
+            const alt = reason(seg, { ...ctx, gitConfigEnv: { ...gitConfigEnv, [key]: value } });
+            if (alt) return alt;
+          }
         }
       }
       const localEnv = { ...gitConfigEnv };
-      const localAlternates = copyAlternates(alternates);
-      for (const assignment of gitLeadingAssignments(seg)) {
+      const leading = gitLeadingAssignments(seg);
+      let localAlternates = alternates;
+      if (leading.some((assignment) => alternates.has(assignment[1]))) localAlternates = copyAlternates(alternates);
+      for (const assignment of leading) {
         localEnv[assignment[1]] = assignment[2];
-        localAlternates.delete(assignment[1]); // a command-local assignment always applies to that command
+        if (localAlternates !== alternates) localAlternates.delete(assignment[1]); // a command-local assignment always applies
       }
       // Substitutions run before the command's local assignments take effect; explicit child shells
       // and runners receive those assignments even behind wrappers such as `command env`.
@@ -5038,7 +5064,7 @@ export function decide(command, ctx = {}) {
         // eval executes in this shell; explicit assignments in its script survive the invocation.
         const nestedReason = checkNested(text, substitution ? gitConfigEnv : localEnv,
           !substitution && programWord(seg) === 'eval' ? setAssignment : null, newProcess ? [] : readonlyNames,
-          substitution ? alternates : localAlternates);
+          substitution ? alternates : localAlternates, newProcess ? [] : maybeReadonly);
         if (nestedReason) return nestedReason;
       }
       const words = shellTokens(seg).filter((t) => !t.op).map((t) => t.text);
@@ -5078,7 +5104,7 @@ export function decide(command, ctx = {}) {
     // separators may not be reconstructible from an individual segment. Never use future assignments.
     const group = leadingGroupBody(whole);
     for (const text of [...substitutionBodies(whole), ...(group === null ? [] : [group])]) {
-      const r = checkNested(text, inherited, null, inheritedReadonly, inheritedAlternates);
+      const r = checkNested(text, inherited, null, inheritedReadonly, inheritedAlternates, inheritedMaybeReadonly);
       if (r) return r;
     }
     return null;

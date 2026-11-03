@@ -3769,6 +3769,39 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     expect(decide(`${skipped}; export GIT_DIR=${CLONE}/.git; git reset --hard`, { cwd: LANE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
   });
 
+  it('DENIES when a function body, comment or quote-split eval keyword hides a skipped Git target change', () => {
+    const ctx = { cwd: LANE, daemonCloneRoots: roots };
+    for (const command of [
+      // A function body is defined, not run.
+      `export GIT_DIR=${CLONE}/.git\nf() {\nexport GIT_DIR=${LANE}/.git\n}\ngit reset --hard`,
+      `export GIT_DIR=${CLONE}/.git; function f { export GIT_DIR=${LANE}/.git; }; git reset --hard`,
+      // A comment runs nothing after it on its line.
+      `export GIT_DIR=${CLONE}/.git; # ; export GIT_DIR=${LANE}/.git\ngit reset --hard`,
+      // Quote-split keywords hide the condition from the calling scope; the eval script still sees it.
+      `eval "i""f true\nth""en\nreadonly GIT_DIR=${CLONE}/.git\nf""i"\nexport GIT_DIR=${LANE}/.git\ngit reset --hard`,
+      `eval "i""f true\nth""en\nreadonly GIT_DIR=${CLONE}/.git\nf""i"\nunset GIT_DIR\ngit reset --hard`,
+    ]) expect(decide(command, ctx), command).toMatch(/DAEMON CLONE/);
+  });
+
+  it('ALLOWS an unconditional reassignment after a file-descriptor redirection', () => {
+    // `2>&1` is a redirection, not a background or conditional list.
+    expect(decide(`export GIT_DIR=${CLONE}/.git; git log 2>&1; export GIT_DIR=${LANE}/.git; git reset --hard`,
+      { cwd: LANE, daemonCloneRoots: roots })).toBeNull();
+  });
+
+  it('bounds possible-value checks: fails closed past the cap and stays fast on long commands', () => {
+    const ctx = { cwd: LANE, daemonCloneRoots: roots };
+    // More possible GIT_DIR values than the per-segment cap: the target is unknown, so a write fails closed.
+    const many = Array.from({ length: 20 }, (_, i) => `false && export GIT_DIR=${LANE}/w${i}/.git`).join('; ');
+    expect(decide(`${many}; git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
+    expect(decide(`${many}; git status`, ctx)).toBeNull();
+    // Unrelated possible values are never re-checked, so a long command stays cheap.
+    const long = Array.from({ length: 300 }, (_, i) => `false && export V${i}=${i}; git status`).join('; ');
+    const started = Date.now();
+    expect(decide(`${long}; git reset --hard`, ctx)).toBeNull();
+    expect(Date.now() - started).toBeLessThan(10000);
+  });
+
   it.each(['refs/*', 'refs/h*', 'refs/heads*', 'refs/hea*s/*'])(
     'DENIES explicit and configured fetch glob destinations that can write branches: %s', (destination) => {
       for (const command of [
