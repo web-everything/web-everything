@@ -206,7 +206,16 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
     return at;
   }
   const idleFile = file => file + '.idle';
+  // A failed delete must never leave the old first-idle sample usable: remember the reset in memory too.
+  const idleVoid = new Set();
+  function resetIdle(entry) {
+    try { unlinkSync(idleFile(entry.file)); } catch (error) { if (error?.code !== 'ENOENT') idleVoid.add(entry.key); }
+  }
   function idleStamp(file, key, sampledAt) {
+    if (idleVoid.delete(key)) {
+      try { writeFileSync(idleFile(file), JSON.stringify({key, sampledAt}), {mode: 0o600}); } catch { /* retried next pass */ }
+      return sampledAt;
+    }
     try { const saved = JSON.parse(readFileSync(idleFile(file), 'utf8')); if (saved.key === key && Number.isFinite(saved.sampledAt)) return saved.sampledAt; } catch { /* none yet */ }
     try { writeFileSync(idleFile(file), JSON.stringify({key, sampledAt}), {mode: 0o600}); } catch { /* retried next pass */ }
     return sampledAt;
@@ -261,7 +270,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
         const sampledAt = Date.parse(telemetry?.sampledAtET), evidence = recentEvidence(telemetry);
         if (!Number.isFinite(sampledAt) || !evidence) {
           // An unknown or failed probe interrupts any idle confirmation: the next idle sample starts a fresh window.
-          for (const entry of dead) { try { unlinkSync(idleFile(entry.file)); } catch { /* absent */ } }
+          for (const entry of dead) resetIdle(entry);
           raise('probe-unknown', {slots: dead.map(d => d.name)}, now);
         }
         if (Number.isFinite(sampledAt) && evidence) {
@@ -272,7 +281,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
             let verdict = 'run-less';
             if (entry.run) {
               verdict = runVerdict(telemetry, entry.run);
-              if (verdict !== 'idle') { try { unlinkSync(idleFile(entry.file)); } catch { /* absent */ } }
+              if (verdict !== 'idle') resetIdle(entry);
               if (!['finished', 'absent', 'idle'].includes(verdict)) continue;
               // 'idle' rests on Forge's active-run count, taken from a directory listing without a per-run cleanup
               // receipt. So the run must also have existed for the whole death-sample margin before that sample (both
