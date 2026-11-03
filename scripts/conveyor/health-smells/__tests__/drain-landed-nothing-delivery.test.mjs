@@ -67,4 +67,17 @@ describe('drain-landed-nothing delivery (real core + planner, default shadow mod
     const st = stepEpisodes(s0, [{ smell, results: smell.evaluate({ drainHistory: bad }, { now }) }], now);
     expect(Object.keys(st.state.episodes).length).toBe(1);
   });
+  it('two uncovered queued passes do not close an open stall (no evidence of recovery)', () => {
+    const s0 = open3();
+    const now = T0 + 40 * MIN;
+    const h = [{ at: now - 2 * MIN, considered: 4, merged: 0 }, { at: now - 1 * MIN, considered: 4, merged: 0 }];
+    const st = stepEpisodes(s0, [{ smell, results: smell.evaluate({ drainHistory: h }, { now }) }], now);
+    expect(Object.keys(st.state.episodes).length).toBe(1);
+    expect(smell.evaluate({ drainHistory: h }, { now })).toEqual([]);
+  });
+  it('a merge or an empty queue IS recovery and closes the stall', () => {
+    const now = T0 + 40 * MIN;
+    const r = smell.evaluate({ drainHistory: [{ at: now - 5 * MIN, considered: 4, merged: 1 }, { at: now - 1 * MIN, considered: 3, merged: 0 }] }, { now });
+    expect(r[0].breach).toBe(false);
+  });
 });

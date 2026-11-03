@@ -634,13 +634,13 @@ export function stepEpisodes(state, evaluations, now, { config = DEFAULT_HEALTH_
     }
   }
   // High-severity reminder: once, `reminderAfterMs` after opening, if still untracked. A smell that sets
-  // `repeatReminders` keeps reminding while the episode stays open, the gap doubling each time (cap 24h).
+  // `repeatReminders` keeps reminding while the episode stays open, the gap doubling each time (cap 4h).
   for (const [key, ep] of Object.entries(next.episodes)) {
     if (ep.status === 'pending' || ep.tracked || ep.severity !== 'high') continue;
     const repeat = ep.repeatReminders === true;
     if (ep.remindedAt && !repeat) continue;
     const base = Number.isFinite(ep.reminderAfterMs) ? ep.reminderAfterMs : cfg.reminderAfterMs;
-    const gap = repeat ? Math.min(base * 2 ** (ep.reminderCount ?? 0), 24 * HOUR) : base;
+    const gap = repeat ? Math.min(base * 2 ** (ep.reminderCount ?? 0), 4 * HOUR) : base; // capped at 4h: the core has no delivery ack, so a lost send delays the next try by at most 4h
     const since = repeat ? (ep.remindedAt ?? ep.openedAt) : ep.openedAt;
     if (since != null && now - since >= gap) { ep.remindedAt = now; if (repeat) ep.reminderCount = (ep.reminderCount ?? 0) + 1; emit('reminder', key); }
   }

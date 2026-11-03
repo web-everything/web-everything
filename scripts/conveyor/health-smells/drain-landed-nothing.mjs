@@ -36,6 +36,11 @@ export function passesInWindow(rawHistory, { now, windowMs = 30 * MIN } = {}) {
   return (rawHistory || []).filter((p) => p.valid !== false && now - p.at >= 0 && now - p.at <= windowMs).length;
 }
 
+/** PURE: recovery evidence in the window — a valid pass that merged something, or one that found nothing queued. Anything else is UNKNOWN. */
+export function recovered(rawHistory, { now, windowMs = 30 * MIN } = {}) {
+  return (rawHistory || []).some((p) => p.valid !== false && now - p.at >= 0 && now - p.at <= windowMs && ((Number(p.merged) || 0) > 0 || (Number(p.considered) || 0) === 0));
+}
+
 export default {
   id: 'drain-landed-nothing',
   scope: 'host',
@@ -47,14 +52,15 @@ export default {
   severity: 'high',
   action: 'alert',
   windowMs: 30 * MIN,
-  repeatReminders: true, // the core re-notifies while the stall persists, the gap doubling from reminderAfterMs (cap 24h)
+  repeatReminders: true, // the core re-notifies while the stall persists, the gap doubling from reminderAfterMs (cap 4h)
   reminderAfterMs: HOUR,
   recommendationHint: 'The drain has had queued PRs for 30+ minutes and landed none — read the hold reason (freeze-unreadable vs a real red main) in the drain log.',
   evaluate({ drainHistory }, { now }) {
     if (!Array.isArray(drainHistory)) return [];
     const r = landedNothing(drainHistory, { now, windowMs: this.windowMs });
     // Too few passes to judge (the drain stopped completing passes): UNKNOWN, so an open episode stays open and keeps reminding.
-    if (!r && passesInWindow(drainHistory, { now, windowMs: this.windowMs }) < 2) return [];
+    // Clean only on evidence of recovery (a merge, or nothing queued); a window we cannot judge stays unknown.
+    if (!r && !recovered(drainHistory, { now, windowMs: this.windowMs })) return [];
     return [{
       subject: 'drain',
       breach: !!r,
