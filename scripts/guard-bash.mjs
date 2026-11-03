@@ -3257,8 +3257,6 @@ export function rawHeavyCommandReason(segment, { primaryCwd = false } = {}) {
 const VITEST_WORD = /^vitest(?:@\S*)?$/;
 /** vitest's own entry scripts when run through `node` (`vitest/vitest.mjs`, `vitest/dist/cli.js`, `.bin/vitest`). */
 const VITEST_NODE_ENTRY = /(?:^|\/)node_modules\/(?:vitest\/(?:vitest\.mjs|dist\/cli\.js)|\.bin\/vitest)$/;
-const TSC_WORD = /^tsc(?:@\S*)?$/;
-const TSC_NODE_ENTRY = /(?:^|\/)node_modules\/(?:typescript\/(?:bin\/tsc|lib\/tsc\.js)|\.bin\/tsc)$/;
 /** vitest's watch mode spelled as a flag (`-w` is its short form); `--watch=false`/`=0` is NOT watch. */
 const VITEST_WATCH_FLAG = /^(?:--watch|-w)(?:=(?:true|1|yes|on))?$/i;
 /** npm options that choose WHICH package's `test` script runs; a replacement that drops them tests another package. */
@@ -3348,10 +3346,6 @@ function ungatedHeavyHead(head, depth = 0) {
     if (w.slice(1).some((arg) => /^(?:--version|-v|--help|-h)$/.test(arg))) return null;
     return { kind: 'vitest', watch: w[1] === 'watch' || w[1] === 'dev' || w.slice(1).some((arg) => VITEST_WATCH_FLAG.test(arg)) };
   }
-  if (TSC_WORD.test(w[0] || '')) {
-    if (w.slice(1).some((arg) => /^(?:--version|-v|--help|-h)$/.test(arg))) return null;
-    return { kind: 'typecheck' };
-  }
   if (w[0] === 'node') {
     // Only the script position is executable. --check/-c and eval arguments are not scripts.
     let i = 1;
@@ -3366,7 +3360,7 @@ function ungatedHeavyHead(head, depth = 0) {
       // a separate option value (`--title standards`, `--env-file .env`, `--max-old-space-size 4096`) is not the script
       // Known extensionless executable paths are scripts too, not option values.
       else if (!flag.includes('=') && w[i] && !w[i].startsWith('-') && !NODE_SCRIPT_WORD.test(w[i])
-        && !TSC_NODE_ENTRY.test(w[i]) && !VITEST_NODE_ENTRY.test(w[i])) i += 1;
+        && !VITEST_NODE_ENTRY.test(w[i])) i += 1;
     }
     if (testRun) return { kind: 'node-test' };
     if (w[i] === '--') i += 1;
@@ -3376,16 +3370,13 @@ function ungatedHeavyHead(head, depth = 0) {
     if (VITEST_NODE_ENTRY.test(w[i] || '')) {
       return ungatedHeavyHead('vitest' + head.slice(words[i].end), depth + 1);
     }
-    if (TSC_NODE_ENTRY.test(w[i] || '')) {
-      return ungatedHeavyHead('tsc' + head.slice(words[i].end), depth + 1);
-    }
     return null; // Includes heavy-admission: its child is an argument, not the executable.
   }
   const inv = runnerInvocation(head);
   if (inv?.exec) return ungatedHeavyHead(canonicalCommand(inv.exec), depth + 1);
   // pnpm/yarn/bun resolve bare tool names to their bins (npm does not).
   if (w[0] !== 'npm' && inv?.names?.length === 1
-    && (VITEST_WORD.test(inv.names[0]) || TSC_WORD.test(inv.names[0]))) {
+    && VITEST_WORD.test(inv.names[0])) {
     return ungatedHeavyHead(inv.names[0] + head.slice(words[w.indexOf(inv.names[0], 1)].end), depth + 1);
   }
   let at = -1;

@@ -17,18 +17,7 @@ const bypassRuns = [
   'node --test-reporter=spec --test a.mjs',
   'npm x vitest run a.test.mjs',
   'npm x -- vitest run a',
-  'npx tsc --noEmit',
-  'tsc -p .',
-  'npm exec tsc',
-  'node node_modules/typescript/bin/tsc',
-  'node --no-warnings node_modules/typescript/bin/tsc --noEmit',
-  'node --no-warnings node_modules/.bin/tsc --noEmit',
   'node --no-warnings node_modules/.bin/vitest run a.test.mjs',
-  'pnpm tsc --noEmit',
-  'yarn tsc',
-  'bun tsc',
-  'pnpm exec tsc',
-  'bunx tsc',
 ];
 
 describe('heavy-enforce — every direct test run requires admission', () => {
@@ -52,12 +41,9 @@ describe('heavy-enforce — every direct test run requires admission', () => {
   });
 
   it.each([
-    'node --check scripts/__tests__/a.test.mjs', 'node --version', 'tsc --version',
+    'node --check scripts/__tests__/a.test.mjs', 'node --version',
     'node --check --test a.mjs', 'node --version --test',
     'node a.mjs --test', 'node --title --test a.mjs',
-    'node node_modules/typescript/bin/tsc --version', 'npm exec tsc -- --version',
-    'node --no-warnings node_modules/typescript/bin/tsc --version',
-    ...['pnpm', 'yarn', 'bun', 'pnpm exec', 'bunx'].map(runner => `${runner} tsc --version`),
     'npm run x -- vitest run a.test.mjs',
   ])('allows non-run `%s`', (cmd) => expect(decide(cmd, {})).toBeNull());
 
