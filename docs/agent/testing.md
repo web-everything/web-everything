@@ -3941,3 +3941,14 @@ out-of-bounds last-seen timestamp as `owner-stale`, even if supplied as active.
 future session starts, and tomorrow-dated signals across replayed ticks. Invalid
 future evidence cannot suppress the normal invariant deadline or movement alert;
 operators receive the existing overdue-alert path rather than a future ownership lease.
+
+
+## PR sweep diff evidence
+
+A listing's `changedFiles` must be a non-negative safe integer. Missing, null,
+fractional, negative, string, non-finite and unsafe counts keep the PR in discovery
+and invariant evaluation, with `diffEvidence: diff-unknown` and an operator
+inspection note on the serialized decision. They never prove an empty diff or
+invalidate the whole repository listing. Only numeric integer zero permits the
+existing `empty-diff` closure action. The named cases in `pr-sweep-audit.test.mjs`
+pin unknown evidence, valid nonzero counts, zero, and unaffected sibling decisions.

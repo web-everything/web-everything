@@ -253,3 +253,30 @@ it.each(['active', 'waiting-operator'])('invariant rejects a future last-seen ti
   expect(evaluateInvariant(pr, { state, owner: 'daemon:review', ownerLastSeenAt: now + 24 * 60 * minute }, { now, since: now }))
     .toMatchObject({ violation: 'owner-stale' });
 });
+
+
+it.each([
+  ['missing', undefined], ['null', null], ['fraction', 0.5], ['negative', -1],
+  ['string zero', '0'], ['boolean', false], ['NaN', NaN], ['infinite', Infinity],
+  ['unsafe integer', Number.MAX_SAFE_INTEGER + 1],
+])('retains PR with %s changedFiles and exposes unknown diff evidence', async (_name, changedFiles) => {
+  const row = { ...pr, changedFiles };
+  if (_name === 'missing') delete row.changedFiles;
+  const out = await run({ readPrs: () => [row, { ...pr, number: 13 }] });
+  expect(out.decisions).toHaveLength(2);
+  expect(out.decisions.find(p => p.number === 12)).toMatchObject({
+    diffEvidence: 'diff-unknown', diffEvidenceNote: expect.stringMatching(/changedFiles.*operator.*inspect.*diff/i),
+  });
+  expect(out.decisions.find(p => p.number === 12).violation).not.toBe('empty-diff');
+  expect(out.decisions.find(p => p.number === 12).nextAction).not.toBe('close into card');
+  expect(out.decisions.find(p => p.number === 13)).not.toHaveProperty('diffEvidence');
+  expect(out.nextState.invariantClocks[key]).toBeDefined();
+});
+it.each([0, 1, Number.MAX_SAFE_INTEGER])('only integer zero proves an empty diff: changedFiles=%s', async changedFiles => {
+  const out = await run({ readPrs: () => [{ ...pr, changedFiles }] });
+  expect(out.errors).toEqual([]);
+  expect(out.decisions).toHaveLength(1);
+  expect(out.decisions[0]).not.toHaveProperty('diffEvidence');
+  expect(out.decisions[0].violation).toBe(changedFiles === 0 ? 'empty-diff' : null);
+  expect(out.decisions[0].nextAction).toBe(changedFiles === 0 ? 'close into card' : 'await-review');
+});

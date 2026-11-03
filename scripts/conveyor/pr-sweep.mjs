@@ -164,7 +164,13 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
     for (const p of rows) if (p.commentsComplete === false) {
       errors.push(`prs ${repo}: PR #${p.number} comments incomplete: ${sanitizeForFeed(p.commentsError ?? 'operator must inspect full thread before using comment evidence', Infinity)}`);
     }
-    prs.push(...rows.filter(p => !p.state || p.state.toUpperCase() === 'OPEN').map((p) => ({ ...p, repo })));
+    // Missing diff evidence is PR-local: keep discovery and all other invariants live.
+    prs.push(...rows.filter(p => !p.state || p.state.toUpperCase() === 'OPEN').map((p) => ({ ...p, repo,
+      ...(!Number.isSafeInteger(p.changedFiles) || p.changedFiles < 0 ? {
+        diffEvidence: 'diff-unknown',
+        diffEvidenceNote: 'changedFiles missing or invalid; operator must inspect the PR diff before treating it as empty',
+      } : {}),
+    })));
   }
   const queue = await safe('operator queue', async () => readQueue ? readQueue() : JSON.parse(await command(process.execPath, [join(ROOT, 'scripts/operations/operator-queue.mjs'), '--json'], env)), null);
   const queueOk = queue && !queue.incomplete && !(queue.errors?.length) && Array.isArray(queue.ready) && Array.isArray(queue.rulingNeeded)
