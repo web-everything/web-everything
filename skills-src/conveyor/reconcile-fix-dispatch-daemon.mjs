@@ -66,6 +66,8 @@ import { runReconcileCiHealDispatch, dispatchCiHeal } from '../../scripts/operat
 import { runReconcilePromoteDraftDispatch } from '../../scripts/operations/promote-draft-pr-dispatch.mjs'; // draft-first PRs, operator-approved 2026-09-27 — see runPromoteDraftDispatchAllRepos below
 import { resolveLiveQueueBaseline } from '../../scripts/readiness/heavy-admission.mjs'; // card xkyw1x4
 import { createQueueBudget } from '../../scripts/readiness/heavy-queue-projection.mjs'; // card xkyw1x4
+import { readStacksForPass } from '../../scripts/conveyor/pr-stack.mjs';
+import { applyNetScopeToReconcile } from '../../scripts/conveyor/net-scope.mjs';
 import { runReconcilePass, defaultReadPrs, enrichPrsWithCodeQL, PR_LIST_LIMIT } from '../../scripts/conveyor/reconcile-pass.mjs'; // #4191
 import { createResourceFixThrottle } from '../../scripts/lib/resource-gate.mjs'; // x6nuodj: dynamic fixer cap + host gate via admit()
 import { createDispatchSinks } from '../../scripts/operations/dispatch-lane-io.mjs';
@@ -727,6 +729,77 @@ export function runMissingRunRecoveryAllRepos({ repos = FIX_DISPATCH_DAEMON_REPO
   return { repos: perRepo, dispatched, refusals };
 }
 
+/** How long (ms) a pass-local reconcile plan may be reused. Older than this, the next phase recomputes. */
+export const RECONCILE_PLAN_MAX_AGE_MS = 15 * 60 * 1000;
+
+/**
+ * One reconcile plan per repo per pass, reused by fix, ci-heal, promote-draft and notes. A READ CACHE only: it lives
+ * inside one `runTickAllRepos` call and dies with it. It never authorizes an action; every phase still re-checks its
+ * own preconditions live (claims, fresh per-sha check read, stale-main guard). It fails closed: a plan older than
+ * `maxAgeMs`, or one that cannot be cloned, is recomputed; every row about a PR an earlier phase already acted on
+ * this pass is dropped from later readers; each reader gets its own deep copy.
+ * @param {{reconcile?:Function, now?:Function, maxAgeMs?:number}} [o]
+ */
+export function createReconcilePlanCache({ reconcile = (input) => runReconcilePass(input), now = Date.now, maxAgeMs = RECONCILE_PLAN_MAX_AGE_MS } = {}) {
+  const entries = new Map();
+  const touched = new Map();
+  const fresh = (repo) => {
+    const entry = entries.get(repo);
+    return entry && now() - entry.at <= maxAgeMs ? entry : null;
+  };
+  const withoutTouched = (repo, plan) => {
+    const prs = touched.get(repo);
+    if (!prs?.size) return plan;
+    const keep = (row) => !prs.has(row?.prNumber ?? row?.pr);
+    for (const key of ['dispatch', 'notes', 'refusals', 'owedTriggers']) if (Array.isArray(plan[key])) plan[key] = plan[key].filter(keep);
+    return plan;
+  };
+  const read = (repo) => {
+    const entry = fresh(repo);
+    if (!entry) return null;
+    try { return { plan: withoutTouched(repo, structuredClone(entry.plan)), captured: structuredClone(entry.captured) }; }
+    catch { entries.delete(repo); return null; }
+  };
+  return {
+    /** Same shape as `runReconcilePass`. Computes once per repo, then serves copies. */
+    reconcile(input = {}) {
+      const repo = input.repo ?? null;
+      const hit = read(repo);
+      if (hit) return hit.plan;
+      let captured = [];
+      const tap = (fn, fallback) => (...args) => { captured = (fn ?? fallback)(...args); return captured; };
+      // The default reader is recognised by identity (attribution repo), so it is left untapped; the later stages
+      // still capture the hydrated rows notes needs.
+      const plan = reconcile({ ...input,
+        ...(input.readPrs ? { readPrs: tap(input.readPrs) } : {}),
+        excuseMergeGateHolds: tap(input.excuseMergeGateHolds, excusePrMergeGateHolds),
+        enrichCodeQL: tap(input.enrichCodeQL, enrichPrsWithCodeQL) });
+      try { entries.set(repo, { at: now(), plan: structuredClone(plan), captured: structuredClone(captured) }); }
+      catch { entries.delete(repo); }
+      return plan;
+    },
+    /** The notes view of the cached plan, or null when there is none to reuse. */
+    notes(repo) {
+      const hit = read(repo);
+      if (!hit) return null;
+      return { notes: Array.isArray(hit.plan.notes) ? hit.plan.notes : [],
+        prsByNumber: new Map((Array.isArray(hit.captured) ? hit.captured : []).map((pr) => [pr.number, pr])) };
+    },
+    /** Record PRs a phase acted on this pass; later phases will not reuse plan rows for them. */
+    markTouched(results) {
+      for (const d of results?.dispatched ?? results?.dispatch ?? []) {
+        const pr = d?.pr ?? d?.prNumber;
+        if (pr == null) continue;
+        const repo = d.repo ?? null;
+        for (const key of repo == null ? [...entries.keys()] : [repo]) {
+          if (!touched.has(key)) touched.set(key, new Set());
+          touched.get(key).add(pr);
+        }
+      }
+    },
+  };
+}
+
 /**
  * we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs#runTickAllRepos — #xngv3vn (epic #3383/#4075): the
  * daemon's WHOLE per-tick unit of work, composing BOTH halves this daemon now owns — the pre-existing `fix`
@@ -790,12 +863,19 @@ export async function runTickAllRepos({
   // default here would spend one for every dispatched row those fakes produce. The real daemon
   // (`buildCliDaemonEffects`, below) opts in via {@link defaultTagDispatchStatus}.
   tagDispatchStatus = null,
+  // One reconcile plan per repo per pass, reused by fix/ci-heal/promote-draft/notes (see createReconcilePlanCache).
+  // Default on for the real daemon; injected-tick fixtures keep their historical arguments unless they opt in.
+  reuseReconcilePlan,
+  // Injectable planner under the cache (tests count invocations).
+  reconcilePass = (input) => runReconcilePass(input),
   // Injectable clock for the per-phase timing (live 2026-10-09: an untimed 15.7-min pass delayed PR #4624's fix).
   now = Date.now,
 } = {}) {
   const passStart = now();
   const anyTickInjected = [fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick,
     promoteDraftTick, notesTick, awaitVerifyTick, stuckFixerTick, supersedeTick, rulingStandDownTick].some(Boolean);
+  const planCache = (reuseReconcilePlan ?? !anyTickInjected)
+    ? createReconcilePlanCache({ reconcile: reconcilePass, now }) : null;
   const phaseMs = {};
   const timed = (name, fn) => { const t = now(); try { return fn(); } finally { phaseMs[name] = now() - t; } };
   const timedAsync = async (name, fn) => { const t = now(); try { return await fn(); } finally { phaseMs[name] = now() - t; } };
@@ -869,7 +949,7 @@ export async function runTickAllRepos({
     let entries = [];
     return runReconcileCiHealDispatch({ ...options,
       reconcile: (input) => {
-        const plan = runReconcilePass(input);
+        const plan = planCache ? planCache.reconcile(input) : runReconcilePass(input);
         entries = plan.dispatch ?? [];
         return plan;
       },
@@ -928,50 +1008,66 @@ export async function runTickAllRepos({
     if (skippedSteps.includes(step)) { phaseMs[step] = 0; return emptyResult(); }
     return timed(step, fn);
   };
+  // Pass-local plan reuse for the two phases routed through sharedTick (ci-heal and notes are wired below).
+  // Fix keeps its net-scope and stack IO, which it only enables for the identity-equal planner.
+  const reuseOptions = (step, tick) => {
+    if (!planCache || (step !== 'fix' && step !== 'promote-draft')) return {};
+    return { reconcile: planCache.reconcile, ...(step === 'fix' && tick === runReconcileFixDispatch
+      ? { netScope: applyNetScopeToReconcile, prStack: readStacksForPass } : {}) };
+  };
   const sharedTick = (step, tick) => options => {
     const snapshot = snapshots.get(options.repo);
-    if (!snapshot) return tick(options);
+    if (!snapshot) return tick({ ...options, ...reuseOptions(step, tick) });
     const sharedRead = () => structuredClone(snapshot.rows);
     // Re-run each owner's reconciliation reads; only PR discovery is shared.
     const reconcile = input => runReconcilePass({ ...input, readPrs: sharedRead });
     if (step === 'fix' && tick === runReconcileFixDispatch) {
       // Preserve reconcile's identity: fix uses it to enable net-scope and stack IO.
-      return tick({ ...options, readPrs: sharedRead });
+      return tick({ ...options, readPrs: sharedRead, ...reuseOptions(step, tick) });
     }
     const readOpenPrs = input => {
       const fields = input?.extraFields ?? [];
       return snapshot.rows.every(pr => fields.every(field => Object.hasOwn(pr, field)))
         ? sharedRead() : defaultReadOpenPrs(input);
     };
-    return tick({ ...options, readPrs: sharedRead, readOpenPrs, reconcile });
+    return tick({ ...options, readPrs: sharedRead, readOpenPrs, reconcile, ...reuseOptions(step, tick) });
   };
   const fix = stepTimed('fix', () => (authGate.paused ? pausedDispatchResult()
     : runReconcileFixDispatchAllRepos({ repos: stepRepos.get('fix'), allowStandDownAutoProceed,
       tick: sharedTick('fix', fixTick ?? runReconcileFixDispatch),
       ...(fixTick ? {} : { queueAdmission, dispatchThrottle, borrowGate, fixExecutorRoute }) })));
+  planCache?.markTouched(fix);
   // R242 audit round 3: CI-heal must retain its historical flushOwed/flushTimeouts
   // ordering, and notes must write from fresh evidence, even on an empty snapshot.
   // Neither step participates in snapshot sharing or empty-work skipping.
   const ciHeal = await timedAsync('ci-heal', async () => (authGate.paused ? pausedDispatchResult()
-    : await runReconcileCiHealDispatchAllRepos({ repos, ...(ciHealTick ? { tick: ciHealTick } : { tick: routedCiHealTick, queueAdmission, dispatchThrottle }) })));
+    : await runReconcileCiHealDispatchAllRepos({ repos, ...(ciHealTick ? { tick: ciHealTick } : { tick: routedCiHealTick, queueAdmission, dispatchThrottle }),
+      ...(planCache ? { reconcile: planCache.reconcile } : {}) })));
+  planCache?.markTouched(ciHeal);
   if (dispatchThrottle) lastFixQueueLength = fixQueueLengthOf(fix, ciHeal);
   const hungCi = stepTimed('hung-ci', () => runHungCiRecoveryAllRepos({ repos: stepRepos.get('hung-ci'), tick: sharedTick('hung-ci', hungCiTick ?? sweepHungCiRecovery) }));
+  planCache?.markTouched(hungCi);
   // x5uqim1 follow-up (#4075/#3383) — the FOURTH half this daemon now owns: see
   // {@link runMainRedRebaseAllRepos}'s own docblock for why this daemon, specifically, is where it lives (same
   // reason `hungCi` already does — the pass's own `daemon-manifest.mjs` entry has no launchd job installed).
   const mainRedRebase = stepTimed('main-red-rebase', () => runMainRedRebaseAllRepos({ repos: stepRepos.get('main-red-rebase'), tick: sharedTick('main-red-rebase', mainRedRebaseTick ?? sweepCiRedRecovery) }));
+  planCache?.markTouched(mainRedRebase);
   // xi4od2p (#4075/#3383) — the SIXTH half this daemon now owns: see {@link runMissingRunRecoveryAllRepos}'s
   // own docblock for why this daemon, specifically, is where it lives (same reason `hungCi`/`mainRedRebase`
   // already do — the pass's own `daemon-manifest.mjs` entry has no launchd job installed).
   const missingRun = stepTimed('missing-run', () => runMissingRunRecoveryAllRepos({ repos: stepRepos.get('missing-run'), tick: sharedTick('missing-run', missingRunTick ?? sweepMissingRunRecovery) }));
+  planCache?.markTouched(missingRun);
   // draft-first PRs (operator-approved 2026-09-27) — the SEVENTH half this daemon now owns: see
   // {@link runPromoteDraftDispatchAllRepos}'s own docblock for why this daemon, specifically, is where it
   // lives (same reason `hungCi`/`mainRedRebase`/`missingRun` already do). UNPAUSED by `authGate` — see that
   // function's own docblock for why (no Claude session is ever spawned by this half).
   const promoteDraft = stepTimed('promote-draft', () => runPromoteDraftDispatchAllRepos({ repos: stepRepos.get('promote-draft'), tick: sharedTick('promote-draft', promoteDraftTick ?? runReconcilePromoteDraftDispatch) }));
-  // #4191: surface notes using fresh evidence after the dispatch/promote steps.
+  planCache?.markTouched(promoteDraft);
+  // #4191: surface notes after the dispatch/promote steps. With plan reuse, notes read the pass's cached plan minus
+  // every PR an earlier phase acted on (fail closed); a missing or too-old plan falls back to a fresh read.
   const notes = timed('notes', () => runReconcileNotesAllRepos({
-    repos, ...(notesTick ? { tick: notesTick } : {}), ...(notesDryRun == null ? {} : { dryRun: notesDryRun }),
+    repos, ...(planCache ? { reconcile: planCache.reconcile } : {}),
+    ...(notesTick ? { tick: notesTick } : planCache ? { tick: (o) => planCache.notes(o.repo) ?? defaultReadNotesForRepo(o) } : {}), ...(notesDryRun == null ? {} : { dryRun: notesDryRun }),
   }));
   // #3383 follow-up — tag EVERY freshly-dispatched fix/ci-heal session's PR right away, `fix`+`ci-heal`
   // ONLY: `hungCi`/`mainRedRebase`/`missingRun` are mechanical git/gh actions with no live Claude session bound
