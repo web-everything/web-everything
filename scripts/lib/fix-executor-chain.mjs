@@ -31,8 +31,12 @@ export function resolveFixExecutorChain({ env = process.env, platform = platform
   for (const [source, value] of [['platform', platform?.fixExecutor?.fallbackChain], ['repo', repo?.fixExecutor?.fallbackChain], ['env', rawEnv]]) {
     if (valid(value)) result = { value: [...value], source };
   }
-  // routing.builder=claude (or auto over the quota threshold) drops the codex rungs unless env named a chain.
-  if (result.source !== 'env' && effectiveBuilder({ env, repo }).builder === 'claude') result = { value: ['claude'], source: 'routing.builder' };
+  // routing.builder=claude (or auto over the quota threshold) drops the codex rungs from every layer, env included.
+  // To use Codex again set routing.builder=codex (or WE_ROUTING_BUILDER=codex); a chain alone cannot override it.
+  if (effectiveBuilder({ env, repo }).builder === 'claude') {
+    const kept = result.value.filter(id => FIX_EXECUTOR_RUNGS[id].executor !== 'codex');
+    result = { value: kept, source: `${result.source}+routing.builder` };
+  }
   const rawCritical = env?.WE_FIX_EXECUTOR_CRITICAL_CLAUDE_FROM_RUNG;
   const validCritical = value => Number.isSafeInteger(value) && value >= 1;
   const scalarCritical = value => validCritical(value) ? value : undefined;

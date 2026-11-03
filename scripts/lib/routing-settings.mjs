@@ -4,18 +4,19 @@ import { readCodexQuota } from './codex-usage-ledger.mjs';
 
 export const BUILDERS = Object.freeze(['claude', 'codex', 'auto']);
 /** Dispatch kinds whose code-writing may move off Codex. Review, red-team and audit seats are never in this list. */
-export const BUILD_KINDS = Object.freeze(['prepare', 'prepare-item', 'takeover', 'design', 'fix', 'ci-heal']);
+export const BUILD_KINDS = Object.freeze(['prepare', 'prepare-item', 'prepare-complex', 'prepare-card', 'takeover', 'design', 'fix', 'ci-heal', 'build', 'worker', 'doc-fix', 'prevention-card']);
 const DEFAULTS = Object.freeze({ builder: 'codex', auditProvider: 'codex', codexReserveForAudit: true, autoClaudeAbovePercent: 70 });
 
 export function resolveRoutingSettings({ env = process.env, repo = readSettings() } = {}) {
   const file = repo?.routing ?? {};
   const out = { ...DEFAULTS, source: 'default' };
-  if (BUILDERS.includes(file.builder)) { out.builder = file.builder; out.source = 'repo'; }
+  // An invalid value fails closed to claude (keeps Codex reserved) rather than silently restoring codex.
+  if (file.builder !== undefined) { out.builder = BUILDERS.includes(file.builder) ? file.builder : 'claude'; out.source = 'repo'; }
   if (typeof file.auditProvider === 'string' && file.auditProvider) out.auditProvider = file.auditProvider;
   if (typeof file.codexReserveForAudit === 'boolean') out.codexReserveForAudit = file.codexReserveForAudit;
   if (Number.isFinite(file.autoClaudeAbovePercent) && file.autoClaudeAbovePercent >= 0 && file.autoClaudeAbovePercent <= 100) out.autoClaudeAbovePercent = file.autoClaudeAbovePercent;
   const raw = typeof env?.WE_ROUTING_BUILDER === 'string' ? env.WE_ROUTING_BUILDER.trim() : '';
-  if (BUILDERS.includes(raw)) { out.builder = raw; out.source = 'env'; }
+  if (raw) { out.builder = BUILDERS.includes(raw) ? raw : 'claude'; out.source = 'env'; }
   return out;
 }
 

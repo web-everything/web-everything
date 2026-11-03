@@ -11,7 +11,8 @@ describe('routing settings', () => {
   it('env beats the repo file; invalid values are ignored', () => {
     const repo = { routing: { builder: 'claude' } };
     expect(resolveRoutingSettings({ env: { WE_ROUTING_BUILDER: 'codex' }, repo }).builder).toBe('codex');
-    expect(resolveRoutingSettings({ env: { WE_ROUTING_BUILDER: 'nope' }, repo }).builder).toBe('claude');
+    expect(resolveRoutingSettings({ env: { WE_ROUTING_BUILDER: 'nope' }, repo: {} }).builder).toBe('claude');
+    expect(resolveRoutingSettings({ env: {}, repo: { routing: { builder: 'cluade' } } }).builder).toBe('claude');
   });
   it('auto goes to claude at the threshold; an unknown reading keeps codex', () => {
     const repo = { routing: { builder: 'auto', autoClaudeAbovePercent: 70 } };
@@ -19,14 +20,15 @@ describe('routing settings', () => {
     expect(effectiveBuilder({ env: {}, repo, quota: () => ({ used_percent: 40 }) }).builder).toBe('codex');
     expect(effectiveBuilder({ env: {}, repo, quota: () => null }).builder).toBe('codex');
   });
-  it('audit kinds are never build kinds', () => {
+  it('audit kinds are never build kinds; build is', () => {
+    expect(BUILD_KINDS).toContain('build');
     expect(BUILD_KINDS).not.toContain('review');
     expect(BUILD_KINDS).toEqual(expect.arrayContaining(['prepare', 'takeover', 'design', 'ci-heal']));
   });
-  it('builder claude collapses the repair chain; an explicit env chain still wins', () => {
+  it('builder claude collapses the repair chain; an env chain cannot bring codex back, only builder=codex can', () => {
     const repo = { routing: { builder: 'claude' }, fixExecutor: { fallbackChain: ['codex', 'codex-alt', 'claude'] } };
     expect(resolveFixExecutorChain({ env: {}, platform: {}, repo }).value).toEqual(['claude']);
-    expect(resolveFixExecutorChain({ env: { WE_FIX_EXECUTOR_FALLBACK_CHAIN: 'codex,claude' }, platform: {}, repo }).value).toEqual(['codex', 'claude']);
+    expect(resolveFixExecutorChain({ env: { WE_FIX_EXECUTOR_FALLBACK_CHAIN: 'codex,claude' }, platform: {}, repo }).value).toEqual(['claude']);
     expect(resolveFixExecutorChain({ env: {}, platform: {}, repo: { ...repo, routing: { builder: 'codex' } } }).value).toEqual(['codex', 'codex-alt', 'claude']);
   });
 });
