@@ -3672,21 +3672,56 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
   it.each(['~', '$HOME', '${HOME}', '$TARGET', '${TARGET}'].flatMap((home) =>
     ['-C ', '--git-dir=', '--git-dir ', '--work-tree=', '--work-tree '].map((option) => ({ home, option }))))(
     'DENIES equivalent or unresolved global targets: $option ($home)', ({ home, option }) => {
-      const oldHome = process.env.HOME;
-      process.env.HOME = '/ws';
-      try {
-        const target = `${home}/wev-review-daemon${option.startsWith('--git-dir') ? '/.git' : ''}`;
-        const ctx = { cwd: LANE, daemonCloneRoots: roots };
-        for (const path of [target, `"${target}"`]) {
-          expect(decide(`git ${option}${path} reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
-          expect(decide(`git ${option}${path} log`, ctx)).toBeNull();
-        }
-      } finally {
-        if (oldHome === undefined) delete process.env.HOME;
-        else process.env.HOME = oldHome;
+      // The tracked shell HOME is injected; the hook process's own HOME is never read.
+      const target = `${home}/wev-review-daemon${option.startsWith('--git-dir') ? '/.git' : ''}`;
+      const ctx = { cwd: LANE, daemonCloneRoots: roots, gitConfigEnv: { HOME: '/ws' } };
+      for (const path of [target, `"${target}"`]) {
+        expect(decide(`git ${option}${path} reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
+        expect(decide(`git ${option}${path} log`, ctx)).toBeNull();
       }
     },
   );
+
+  // Card xh6262p A4. Ruling reconciliation: the HOME finding at guard-bash.mjs:1975 was ruled `not-real`, then
+  // `block` by policy on head 89f25a08b; this pins the blocked behavior. Shell-local HOME (/ws) differs from the
+  // injected hook HOME (/hook-home), and neither is the test process's own HOME.
+  describe('DENIES tilde targets after an earlier HOME assignment', () => {
+    const HOOK_HOME = '/hook-home';
+    const ctx = (home = HOOK_HOME) => ({ cwd: LANE, daemonCloneRoots: roots, gitConfigEnv: { HOME: home } });
+    const tilde = (option) => `~/wev-review-daemon${option.startsWith('--git-dir') ? '/.git' : ''}`;
+    const ASSIGNMENTS = ['HOME=/ws; ', 'export HOME=/ws; ', 'HOME=/ws && ', 'HOME="/ws"; ', "HOME=/w's'; ",
+      'declare -x HOME=/ws; ', 'true && HOME=/ws; '];
+    it.each(['-C ', '--git-dir ', '--git-dir=', '--work-tree ', '--work-tree='].flatMap((option) =>
+      ASSIGNMENTS.map((assignment) => ({ option, assignment }))))(
+      '$assignment git $option<tilde> mutation is denied, read allowed', ({ option, assignment }) => {
+        expect(decide(`${assignment}git ${option}${tilde(option)} reset --hard`, ctx())).toMatch(/DAEMON CLONE/);
+        expect(decide(`${assignment}git ${option}${tilde(option)} log`, ctx())).toBeNull();
+      });
+
+    it.each([
+      ['an assignment after the command', 'git -C ~/wev-review-daemon reset --hard; HOME=/ws', HOOK_HOME, false],
+      ['a command-local HOME prefix leaves command words on the shell HOME', 'HOME=/ws git -C ~/wev-review-daemon reset --hard', HOOK_HOME, false],
+      ['a command-local HOME prefix cannot move command words away', 'HOME=/elsewhere git -C ~/wev-review-daemon reset --hard', '/ws', true],
+      ['an earlier HOME moves the target away from the hook HOME', 'HOME=/elsewhere; git -C ~/wev-review-daemon reset --hard', '/ws', false],
+      ['a possibly skipped HOME keeps the earlier value', 'false && HOME=/elsewhere; git -C ~/wev-review-daemon reset --hard', '/ws', true],
+      ['a child shell uses its own HOME', "bash -c 'HOME=/ws; git -C ~/wev-review-daemon reset --hard'", HOOK_HOME, true],
+      ['an earlier prefix HOME applies to a later prefix value', 'HOME=/ws GIT_DIR=~/wev-review-daemon/.git git reset --hard', HOOK_HOME, true],
+      ['an assignment value expands when it runs', 'export GIT_DIR=~/wev-review-daemon/.git; HOME=/elsewhere; git reset --hard', '/ws', true],
+      ['a later HOME does not retarget an earlier value', 'export GIT_WORK_TREE=~/wev-review-daemon; HOME=/ws; git clean -fd', HOOK_HOME, false],
+      ['a possibly skipped HOME keeps both values for a later assignment', 'false && HOME=/elsewhere; export GIT_DIR=~/wev-review-daemon/.git; git reset --hard', '/ws', true],
+      ['unset HOME is unknown', 'unset HOME; git -C ~/wev-review-daemon reset --hard', HOOK_HOME, true],
+      ['an unresolved HOME is unknown', 'HOME=$(mktemp -d); git -C ~/wev-review-daemon reset --hard', HOOK_HOME, true],
+      ['a relative HOME is unknown', 'HOME=ws; git -C ~/wev-review-daemon reset --hard', HOOK_HOME, true],
+      ['an unresolved HOME is unknown for a later assignment', 'HOME=$(x); export GIT_DIR=~/wev-review-daemon/.git; git reset --hard', HOOK_HOME, true],
+      ['a user tilde is unknown', 'git -C ~nobody/wev-review-daemon reset --hard', HOOK_HOME, true],
+      ['a quoted literal tilde stays conservative', 'HOME=/ws; git -C "~/wev-review-daemon" reset --hard', HOOK_HOME, true],
+    ])('%s', (_name, command, home, denied) => {
+      const out = decide(command, ctx(home));
+      if (denied) expect(out).toMatch(/DAEMON CLONE/);
+      else expect(out).toBeNull();
+      expect(decide(command.replace(/reset --hard|clean -fd/, 'log'), ctx(home))).toBeNull();
+    });
+  });
 
   it.each(['--git-dir', '--work-tree'].flatMap((option) =>
     ['separate', 'equals'].flatMap((spelling) =>
@@ -4494,6 +4529,43 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
 
     it('keeps reads allowed when a tilde target cannot be resolved', () => {
       expect(runHook('export GIT_WORK_TREE=~; git log', lane, '')).toBeNull();
+    });
+
+    // Card xh6262p A4 at the hook JSON boundary: the hook process HOME is a different directory.
+    describe('DENIES tilde targets after an earlier HOME assignment', () => {
+      const hookHome = join(root, 'hook-home');
+      it.each(['-C ', '--git-dir ', '--git-dir=', '--work-tree ', '--work-tree='].flatMap((option) =>
+        ['', 'export '].map((prefix) => ({ option, prefix }))))('$prefix HOME then git $option', ({ option, prefix }) => {
+        const target = `~/workspace/wev-review-daemon${option.startsWith('--git-dir') ? '/.git' : ''}`;
+        const out = runHook(`${prefix}HOME=${root}; git ${option}${target} reset --hard`, lane, hookHome);
+        expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+        expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+        expect(runHook(`${prefix}HOME=${root}; git ${option}${target} log`, lane, hookHome)).toBeNull();
+      });
+
+      // [command, hook HOME, denied]. Bash: an env operand and a declaration argument see the HOME from
+      // before the statement; the export row is also denied because the left-to-right reading is kept.
+      it.each([
+        [`HOME=${root}; cd ~/workspace/wev-review-daemon && git reset --hard`, hookHome, true],
+        [`HOME=${root} GIT_DIR=~/workspace/wev-review-daemon/.git git reset --hard`, hookHome, true],
+        [`env HOME=${hookHome} GIT_DIR=~/workspace/wev-review-daemon/.git git reset --hard`, root, true],
+        [`export HOME=${hookHome} GIT_DIR=~/workspace/wev-review-daemon/.git; git reset --hard`, root, true],
+        [`export HOME=${root} GIT_DIR=~/workspace/wev-review-daemon/.git; git reset --hard`, hookHome, true],
+        [`env HOME=${root} GIT_DIR=~/workspace/wev-review-daemon/.git git log`, hookHome, false],
+        [`git -C ~/workspace/wev-review-daemon reset --hard; HOME=${root}`, hookHome, false],
+      ])('applies Bash HOME timing at the hook: %s', (command, home, denied) => {
+        const out = runHook(command, lane, home);
+        if (denied) expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+        else expect(out).toBeNull();
+      });
+
+      it('reads fetch config through the same tracked HOME', () => {
+        const fetch = (name) => `git -C ~/some-new-daemon-clone/${name} fetch origin main`;
+        expect(readDaemonFetchConfig(fetch('branch'), lane, [], { HOME: root })).toEqual(['+refs/heads/*:refs/heads/*']);
+        expect(readDaemonFetchConfig(fetch('tracking'), lane, [], { HOME: root })).toEqual(['+refs/heads/*:refs/remotes/origin/*']);
+        expect(runHook(`HOME=${root}; ${fetch('branch')}`, lane, hookHome)?.hookSpecificOutput?.permissionDecision).toBe('deny');
+        expect(runHook(`HOME=${root}; ${fetch('tracking')}`, lane, hookHome)).toBeNull();
+      });
     });
   });
   // These preserve main's single-directory behavior; the proposed shell strings are never executed.

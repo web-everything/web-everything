@@ -1966,18 +1966,57 @@ export function primaryTreeWriteReason(segment) {
 // why a hand-edit here is worse than a primary edit (it silently BLOCKS the daemon's own next rebuild until a
 // person notices, #xpt9fvd; caught+reverted 3x on 2026-09-26).
 
-/** Shared normalization for git flags, inline assignments and exports from earlier segments.
- *  An unavailable HOME or unresolved shell variable leaves the target unknown (null), so mutations fail closed. */
-function absoluteGitTarget(base, p) {
+/** Expand a leading `~` / `~/` with `home`, the shell's HOME where the word is expanded. Null when the
+ *  expansion needs state this hook cannot know: an unset, empty, relative or unresolved HOME, or a
+ *  `~user` / `~+` / `~-` prefix. Words without a leading tilde are returned unchanged. */
+function expandHomeTilde(p, home) {
+  if (typeof p !== 'string' || !p.startsWith('~')) return p;
+  if (p !== '~' && !p.startsWith('~/')) return null;
+  if (typeof home !== 'string' || !isAbsolute(home) || /[$`]/.test(home)) return null;
+  return home + p.slice(1);
+}
+
+/** Bash expands a tilde in an assignment value when the assignment runs, with the HOME in effect then.
+ *  Store that expansion; one that needs an unknown HOME keeps a `$` marker, so every target reader
+ *  treats the value as unresolved instead of letting a later HOME retarget it. */
+function assignedValue(raw, home) {
+  if (typeof raw !== 'string' || !raw.startsWith('~')) return raw;
+  return expandHomeTilde(raw, home) ?? `\${HOME}${raw.slice(1)}`;
+}
+
+/** Shared normalization for git flags, inline assignments and exports from earlier segments. `home` is the
+ *  tracked shell HOME (earlier assignments and exports included), never the hook process's own. An
+ *  unavailable HOME or unresolved shell variable leaves the target unknown (null), so mutations fail closed. */
+function absoluteGitTarget(base, p, home) {
   // Tokens have lost shell quoting here. Do not mistake a literal `$HOME`/`${VAR}` path for evidence
   // about the shell-expanded target; unknown targets must retain daemon-clone protection.
-  if (p.includes('$')) return null;
-  const home = process.env.HOME;
-  if (p === '~' || p.startsWith('~/')) {
-    if (!home || !isAbsolute(home)) return null;
-    p = home + p.slice(1);
+  if (/[$`]/.test(p)) return null;
+  const expanded = expandHomeTilde(p, home);
+  if (expanded === null) return null;
+  return resolve(base || '.', expanded);
+}
+
+/** Apply `segment`'s wrapper-prefix assignments to `env` as Bash expands their tildes. The leading run of
+ *  bare assignments is expanded left to right (`HOME=/a GIT_DIR=~/x` gives `/a/x`); operands of env-like
+ *  wrappers see the HOME from before the command (`env HOME=/a GIT_DIR=~/x` keeps the shell HOME). Returns
+ *  every environment that could result: Bash's reading first, then the left-to-right reading when it
+ *  differs, so callers check both and an unexpected shell cannot turn the difference into a bypass. */
+function leadingAssignmentEnvs(env, segment) {
+  const raw = String(segment || '').trim().replace(/^[({]\s*/, '');
+  const words = shellTokens(raw).filter((t) => !t.op).map((t) => t.text);
+  const count = wrapperPrefixLength(words);
+  const bash = { ...env };
+  const sequential = { ...env };
+  const keys = [];
+  let bare = true;
+  for (let i = 0; i < count; i++) {
+    const m = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(words[i]);
+    if (!m) { bare = false; continue; }
+    bash[m[1]] = assignedValue(m[2], bare ? bash.HOME : env.HOME);
+    sequential[m[1]] = assignedValue(m[2], sequential.HOME);
+    keys.push(m[1]);
   }
-  return resolve(base || '.', p);
+  return keys.some((key) => bash[key] !== sequential[key]) ? [bash, sequential] : [bash];
 }
 
 /** Every directory a git invocation TARGETS, from its GLOBAL options only (those before the subcommand): the
@@ -1985,26 +2024,27 @@ function absoluteGitTarget(base, p) {
  *  an absolute one resets), plus `--git-dir` / `--work-tree` (both `=` and separate-arg spellings, resolved
  *  against that effective dir). Pure — string-only, no fs. Returns `[]` when `segment` is not git. A
  *  subcommand's own `-C` (`git commit -C HEAD`) is NOT a global option and is never read here. Reads the
- *  SAME wrapper-peeled, basename-resolved `canonicalCommand` view `gitSubcommand` does. A leading `~` is
- *  expanded from HOME (the shell would have, before git saw it). */
+ *  SAME wrapper-peeled, basename-resolved `canonicalCommand` view `gitSubcommand` does. A leading `~` in a
+ *  command word is expanded from the tracked shell HOME in `configEnv` (the shell would have, before git saw
+ *  it); a command-local `HOME=` prefix does not change it. Inline assignment values follow
+ *  `leadingAssignmentEnvs`, and every possible reading contributes its targets. */
 function gitTargetDirs(segment, cwd, configEnv = {}) {
   const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
   if (!toks.length || toks[0] !== 'git') return [];
+  const home = configEnv.HOME;
   let dir = cwd || '.';
-  const env = { ...configEnv };
-  for (const assignment of gitLeadingAssignments(segment)) env[assignment[1]] = assignment[2];
-  let gitDir = env.GIT_DIR ?? null;
-  let workTree = env.GIT_WORK_TREE ?? null;
+  let gitDir = null;
+  let workTree = null;
   const configuredTrees = [];
   for (let i = 1; i < toks.length; i++) {
     const t = toks[i];
     if (t === '-C' && i + 1 < toks.length) {
-      dir = absoluteGitTarget(dir, toks[++i]);
+      dir = absoluteGitTarget(dir, toks[++i], home);
       if (dir === null) return [null];
       continue;
     }
     if (t.length > 2 && t.startsWith('-C')) { // not valid git, fail closed
-      dir = absoluteGitTarget(dir, t.slice(2));
+      dir = absoluteGitTarget(dir, t.slice(2), home);
       if (dir === null) return [null];
       continue;
     }
@@ -2020,7 +2060,7 @@ function gitTargetDirs(segment, cwd, configEnv = {}) {
     else if (t.startsWith('--config-env=')) { config = t.slice('--config-env='.length); fromEnv = true; }
     if (config !== null) {
       const match = /^core\.worktree=(.*)$/is.exec(config);
-      if (match) configuredTrees.push(fromEnv ? env[match[1]] ?? null : match[1]);
+      if (match) configuredTrees.push({ fromEnv, value: match[1] });
       continue;
     }
     if (GIT_VALUE_FLAGS.has(t)) { i += 1; continue; }
@@ -2028,13 +2068,18 @@ function gitTargetDirs(segment, cwd, configEnv = {}) {
     break; // the subcommand — everything after it is the subcommand's own options
   }
   const out = [dir];
-  if (gitDir !== null) out.push(absoluteGitTarget(dir, gitDir));
-  if (workTree !== null) out.push(absoluteGitTarget(dir, workTree));
-  for (const tree of configuredTrees) {
-    // Git resolves relative core.worktree against its git dir (possibly discovered through a gitfile).
-    // Without filesystem evidence that base is unknown; do not guess the cwd and allow a clone write.
-    out.push(tree === null || (!isAbsolute(tree) && !tree.startsWith('~/') && tree !== '~')
-      ? null : absoluteGitTarget(dir, tree));
+  for (const env of leadingAssignmentEnvs(configEnv, segment)) {
+    const envGitDir = gitDir ?? env.GIT_DIR ?? null;
+    const envWorkTree = workTree ?? env.GIT_WORK_TREE ?? null;
+    if (envGitDir !== null) out.push(absoluteGitTarget(dir, envGitDir, home));
+    if (envWorkTree !== null) out.push(absoluteGitTarget(dir, envWorkTree, home));
+    for (const configured of configuredTrees) {
+      const tree = configured.fromEnv ? env[configured.value] ?? null : configured.value;
+      // Git resolves relative core.worktree against its git dir (possibly discovered through a gitfile).
+      // Without filesystem evidence that base is unknown; do not guess the cwd and allow a clone write.
+      out.push(tree === null || (!isAbsolute(tree) && !tree.startsWith('~/') && tree !== '~')
+        ? null : absoluteGitTarget(dir, tree, home));
+    }
   }
   return out;
 }
@@ -2156,17 +2201,18 @@ function gitConfigFileTargets(segment, dir, configEnv) {
   const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
   const args = toks.slice(gitSubcommandIndex(toks) + 1);
   const targets = [];
+  const home = configEnv.HOME;
   for (let i = 0; i < args.length; i++) {
     const t = args[i];
-    if (t === '--file' || t === '--fil' || t === '-f') targets.push(absoluteGitTarget(dir, args[++i] || ''));
-    else if (/^--file?=/.test(t)) targets.push(absoluteGitTarget(dir, t.slice(t.indexOf('=') + 1)));
-    else if (t.startsWith('-f') && t.length > 2) targets.push(absoluteGitTarget(dir, t.slice(2)));
+    if (t === '--file' || t === '--fil' || t === '-f') targets.push(absoluteGitTarget(dir, args[++i] || '', home));
+    else if (/^--file?=/.test(t)) targets.push(absoluteGitTarget(dir, t.slice(t.indexOf('=') + 1), home));
+    else if (t.startsWith('-f') && t.length > 2) targets.push(absoluteGitTarget(dir, t.slice(2), home));
   }
-  const env = { ...configEnv };
-  for (const assignment of gitLeadingAssignments(segment)) env[assignment[1]] = assignment[2];
   const scopes = [['GIT_CONFIG', null], ['GIT_CONFIG_GLOBAL', '--global'], ['GIT_CONFIG_SYSTEM', '--system']];
-  for (const [key, flag] of scopes) {
-    if (env[key] && (!flag || args.some((a) => a.length >= 3 && flag.startsWith(a)))) targets.push(absoluteGitTarget(dir, env[key]));
+  for (const env of leadingAssignmentEnvs(configEnv, segment)) {
+    for (const [key, flag] of scopes) {
+      if (env[key] && (!flag || args.some((a) => a.length >= 3 && flag.startsWith(a)))) targets.push(absoluteGitTarget(dir, env[key], home));
+    }
   }
   return targets;
 }
@@ -2181,36 +2227,43 @@ export function readDaemonFetchConfig(segment, cwd, envDirs = [], configEnv = {}
   if (envDirs.length) return null;
   const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
   const globals = toks.slice(1, gitSubcommandIndex(toks));
-  // execFileSync does no shell expansion. Normalize target values with the same HOME rule as
+  // execFileSync does no shell expansion. Normalize target values with the same tracked shell HOME as
   // gitTargetDirs, preserving option order and leaving config payloads untouched.
+  const home = configEnv.HOME;
   for (let i = 0; i < globals.length; i++) {
     const token = globals[i];
     if (['-C', '--git-dir', '--work-tree'].includes(token)) {
       const value = globals[++i];
-      if (value?.includes('$')) return null;
-      if (value === '~' || value?.startsWith('~/')) {
-        globals[i] = absoluteGitTarget(cwd, value);
+      if (value === undefined) continue;
+      if (/[$`]/.test(value)) return null;
+      if (value.startsWith('~')) {
+        globals[i] = absoluteGitTarget(cwd, value, home);
         if (globals[i] === null) return null;
       }
     } else if (/^--(?:git-dir|work-tree)=/.test(token)) {
       const equal = token.indexOf('=');
       const value = token.slice(equal + 1);
-      if (value.includes('$')) return null;
-      if (value === '~' || value.startsWith('~/')) {
-        const target = absoluteGitTarget(cwd, value);
+      if (/[$`]/.test(value)) return null;
+      if (value.startsWith('~')) {
+        const target = absoluteGitTarget(cwd, value, home);
         if (target === null) return null;
         globals[i] = token.slice(0, equal + 1) + target;
       }
     } else if (GIT_VALUE_FLAGS.has(token)) i += 1;
   }
-  const env = { ...process.env, ...configEnv, GIT_OPTIONAL_LOCKS: '0' };
-  for (const assignment of gitLeadingAssignments(segment)) env[assignment[1]] = assignment[2];
+  // Inline assignments with more than one possible reading leave the repository unknown.
+  const readings = leadingAssignmentEnvs(configEnv, segment);
+  if (readings.length !== 1) return null;
+  const env = { ...process.env, ...readings[0], GIT_OPTIONAL_LOCKS: '0' };
   // An undefined tracked value is an unset tombstone: do not resurrect the inherited process value.
   for (const key of Object.keys(env)) if (env[key] === undefined) delete env[key];
+  // Git reads global fetch config under HOME; an unresolved value cannot be read faithfully.
+  if (/[$`]/.test(env.HOME ?? '')) return null;
   for (const key of ['GIT_DIR', 'GIT_WORK_TREE']) {
-    if (env[key]?.includes('$')) return null;
-    if (env[key] === '~' || env[key]?.startsWith('~/')) {
-      env[key] = absoluteGitTarget(cwd, env[key]);
+    if (env[key] === undefined) continue;
+    if (/[$`]/.test(env[key])) return null;
+    if (env[key].startsWith('~')) {
+      env[key] = absoluteGitTarget(cwd, env[key], home);
       if (env[key] === null) return null;
     }
   }
@@ -2293,7 +2346,7 @@ export function daemonCloneWriteReason(segment, { cwd = null, roots = [], envDir
     const configWrite = (sub === 'config' || sub === 'remote') && gitConfigOrRemoteWrites(s, sub);
     if (!GIT_STATE_SUBCOMMANDS.has(sub) && !configWrite) return null;
     // Named environment follows shell scope/order; envDirs remains a conservative explicit caller input.
-    const targets = gitTargetDirs(s, cwd, configEnv).concat(envDirs.map((p) => absoluteGitTarget(cwd, p)));
+    const targets = gitTargetDirs(s, cwd, configEnv).concat(envDirs.map((p) => absoluteGitTarget(cwd, p, configEnv.HOME)));
     if (unknownTarget) targets.push(null); // too many possible environment values to check one by one
     if (configWrite && sub === 'config') targets.push(...gitConfigFileTargets(s, targets[0], configEnv));
     const hit = targets.find((d) => d === null || isDaemonCloneRealpath(d, roots));
@@ -5032,6 +5085,17 @@ export function decide(command, ctx = {}) {
       if (readonly) readonlyNames.add(key);
       if (persist) persist(key, value, readonly, false);
     };
+    // Bash expands a tilde in an assignment value when the assignment runs. The first HOME is the one in
+    // effect; every other possible HOME (a possibly skipped assignment) adds its expansion as a possible value.
+    const assignValue = (key, raw, homes, readonly, conditional, attribute) => {
+      const [value, ...others] = [...new Set(homes.map((home) => assignedValue(raw, home)))];
+      if (!others.length) {
+        setAssignment(key, value, readonly, conditional, attribute);
+        return;
+      }
+      for (const other of others) setAssignment(key, other, readonly, true, attribute);
+      setAssignment(key, value, readonly, true, attribute);
+    };
     const checkNested = (text, env, persistChanges = null, childReadonly = readonlyNames, childAlternates = alternates,
       childMaybeReadonly = maybeReadonly, childAttributes = uncertainAttributes) => {
       if (!String(text).trim() || depth >= NESTED_DEPTH_CAP || nestedBudget <= 0) return null;
@@ -5067,13 +5131,26 @@ export function decide(command, ctx = {}) {
           }
         }
       }
-      const localEnv = { ...gitConfigEnv };
       const leading = gitLeadingAssignments(seg);
+      // Inline values expand their tildes as leadingAssignmentEnvs describes, under every HOME this shell may
+      // hold; each other reading becomes a possible value of the variable it changes.
+      const homeOptions = [gitConfigEnv, ...[...(alternates.get('HOME') || [])].map((home) => ({ ...gitConfigEnv, HOME: home }))];
+      const readings = leading.length ? homeOptions.flatMap((env) => leadingAssignmentEnvs(env, seg)) : [{ ...gitConfigEnv }];
+      const localEnv = readings[0];
       let localAlternates = alternates;
-      if (leading.some((assignment) => alternates.has(assignment[1]))) localAlternates = copyAlternates(alternates);
-      for (const assignment of leading) {
-        localEnv[assignment[1]] = assignment[2];
-        if (localAlternates !== alternates) localAlternates.delete(assignment[1]); // a command-local assignment always applies
+      if (leading.length && (readings.length > 1 || leading.some((assignment) => alternates.has(assignment[1])))) {
+        localAlternates = copyAlternates(alternates);
+      }
+      if (localAlternates !== alternates) {
+        for (const assignment of leading) localAlternates.delete(assignment[1]); // a command-local assignment always applies
+        for (const other of readings.slice(1)) {
+          for (const [, key] of leading) {
+            if (other[key] === localEnv[key]) continue;
+            const values = localAlternates.get(key) || new Set();
+            values.add(other[key]);
+            localAlternates.set(key, values);
+          }
+        }
       }
       // Substitutions run before the command's local assignments take effect; explicit child shells
       // and runners receive those assignments even behind wrappers such as `command env`.
@@ -5138,9 +5215,19 @@ export function decide(command, ctx = {}) {
           || (['declare', 'typeset'].includes(canonicalWords[0]) && optionWords.some((t) => /^-[A-Za-z]*r[A-Za-z]*$/.test(t)));
         const leadingWords = gitLeadingAssignments(seg).map((m) => m[0]);
         const assignments = directive ? [...leadingWords, ...(printsOnly ? [] : canonicalWords)] : words;
+        // A bare assignment statement expands each value after the earlier ones ran. Declaration arguments are
+        // expanded before the builtin runs, so they see the statement's starting HOME; after a HOME operand
+        // the left-to-right reading is also kept as a possible value.
+        const homesNow = () => [gitConfigEnv.HOME, ...(alternates.get('HOME') || [])];
+        const statementHomes = homesNow();
+        let homeAssigned = false;
         for (const word of assignments) {
           const m = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(word);
-          if (m) setAssignment(m[1], m[2], readonly, uncertain, attribute);
+          if (m) {
+            const homes = !directive ? homesNow() : homeAssigned ? [...statementHomes, ...homesNow()] : statementHomes;
+            assignValue(m[1], m[2], homes, readonly, uncertain, attribute);
+            if (m[1] === 'HOME') homeAssigned = true;
+          }
           else if (attribute && /^([A-Za-z_][A-Za-z0-9_]*)(?:\[|\+=)/.test(word)) {
             // Indexed and append operands still apply attributes to the base variable. Their value is
             // unresolved, so the target check uses the attribute marker rather than guessing shell evaluation.

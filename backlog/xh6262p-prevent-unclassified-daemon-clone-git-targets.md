@@ -9,7 +9,7 @@ tags: [prevention, security]
 
 # Prevent unclassified daemon-clone Git targets and mutations
 
-Track the guard prevention work requested by the advisory on web-everything/web-everything#6262 at head `e70d38e16b31b1984632d24f3ae4617998467477`. This files the prevention obligations; it does not change guard behavior or overturn the supplied operator rulings, including the `not-real` ruling on the HOME finding.
+Track the guard prevention work requested by the advisory on web-everything/web-everything#6262 at head `e70d38e16b31b1984632d24f3ae4617998467477`. This files the prevention obligations. A1–A3 remain open and do not change guard behavior. A4 is delivered on the same PR: the HOME finding at `we:scripts/guard-bash.mjs:1975` was first ruled `not-real`, then ruled `block` by policy on head `89f25a08be610a54e92e6f6bfa751e8d7102d5c2`, and the fix follows the later `block` ruling.
 
 ## Design
 
@@ -23,7 +23,7 @@ The advisory also owes deterministic coverage of earlier HOME assignments for gl
 
 The advisory's `codex-correctness` panel reports `prevention-outstanding`. Its HOME prevention request is filed here as A4; filing it does not assert that the disputed behavior is a confirmed defect. This card stays open until its executable acceptance criteria are delivered.
 
-Prevention receipt for the advisory posted **2026-11-03T04:01:53Z**, `codex-correctness/correctness` at `we:scripts/guard-bash.mjs:1975`: “Add a deterministic parameterized regression test covering earlier HOME assignments for -C, --git-dir, and --work-tree, and pass the tracked effective HOME into normalization.” A4 below owns that request, including the required reconciliation with the current `not-real` ruling. Filing this receipt does not claim that the tests or runtime change have shipped.
+Prevention receipt for the advisory posted **2026-11-03T04:01:53Z**, `codex-correctness/correctness` at `we:scripts/guard-bash.mjs:1975`: “Add a deterministic parameterized regression test covering earlier HOME assignments for -C, --git-dir, and --work-tree, and pass the tracked effective HOME into normalization.” A4 below owns that request. Reconciliation: the later policy `block` ruling supersedes the `not-real` ruling, so the runtime change and the named tests ship on PR #6262 (see A4 status).
 
 | Advisory finding | Filed prevention |
 | --- | --- |
@@ -40,6 +40,7 @@ Prevention receipt for the advisory posted **2026-11-03T04:01:53Z**, `codex-corr
 - [A2] Executable — a parameterized wrapper table covers every wrapper peeled by canonicalCommand, including env -C / --chdir and sudo -D, proving its directory effect is carried or refused. Unknown path-taking options cannot establish a safe target.
 - [A3] Executable — named decision and hook tests cover an export inside a function body and a loop/if branch preceding a Git mutation, plus read controls and child-scope isolation.
 - [A4] Executable — a named parameterized regression, `DENIES tilde targets after an earlier HOME assignment`, covers -C, --git-dir and --work-tree where the supported semantics require denial. Include separated/equals spellings, earlier assignments/exports, quoted literal tilde, unset/unknown HOME, assignments after the command and read controls. Record the operator-ruling reconciliation before changing behavior.
+  - Status: delivered on PR #6262. Decision and hook tests named `DENIES tilde targets after an earlier HOME assignment` pin the matrix. Command words use the tracked shell HOME; assignment values expand when they run (bare prefixes left to right, env operands and declaration arguments with the statement's starting HOME, the left-to-right reading also kept); possibly skipped HOME values stay checked; unknown HOME fails closed. The fetch-config reader uses the same tracked HOME.
 
 ### A4 deterministic fixture and wiring
 
@@ -47,7 +48,7 @@ Use distinct injected hook HOME, shell-local HOME, lane and protected-clone root
 
 Distinguish unquoted `~/...` expansion from a quoted literal tilde and from `$HOME` / `${HOME}` expansion. An assignment after the Git invocation cannot affect its target. Unset, relative or unresolved effective HOME must exercise the unknown-target path where expansion requires HOME. Give each case an explicit shell-semantics expectation rather than applying the advisory's denial expectation to literal paths. Fixtures must not depend on the developer's HOME or alter it without restoration.
 
-If the reconciled semantics require tracked HOME, carry the same effective value through global target options, GIT_DIR/GIT_WORK_TREE normalization and persisted fetch-config reads. Add a fetch-reader assertion so target protection and the configuration subprocess cannot resolve the same tilde spelling differently. Preserve possible earlier HOME values after conditional or refused assignments. Record the current `not-real` ruling alongside the test expectations; do not describe this prevention filing as a completed runtime fix.
+If the reconciled semantics require tracked HOME, carry the same effective value through global target options, GIT_DIR/GIT_WORK_TREE normalization and persisted fetch-config reads. Add a fetch-reader assertion so target protection and the configuration subprocess cannot resolve the same tilde spelling differently. Preserve possible earlier HOME values after conditional or refused assignments. The test block records the ruling history (`not-real`, then policy `block`) alongside its expectations.
 
 ## Non-goals
 
