@@ -111,9 +111,13 @@ export function parseTelemetry(text) {
   if ((!Buffer.isBuffer(text) && typeof text !== 'string') || Buffer.byteLength(text)>65536
     || (Buffer.isBuffer(text) && !Buffer.from(text.toString('utf8')).equals(text))) throw new Error('Invalid telemetry size or encoding');
   const v=JSON.parse(text.toString());
-  if (!exactKeys(v,'activeRuns,cores,loadPerCore,memFreePct,recent,sampledAtET') || !validET(v.sampledAtET)
+  // R518: activeRunIds is optional (an older Forge omits it); when present it must be exactly the active runs.
+  const withIds=exactKeys(v,'activeRunIds,activeRuns,cores,loadPerCore,memFreePct,recent,sampledAtET');
+  if (!(withIds||exactKeys(v,'activeRuns,cores,loadPerCore,memFreePct,recent,sampledAtET')) || !validET(v.sampledAtET)
     || !Number.isSafeInteger(v.cores) || v.cores<1 || !Number.isFinite(v.loadPerCore) || v.loadPerCore<0
     || !Number.isFinite(v.memFreePct) || v.memFreePct<0 || v.memFreePct>100 || !duration(v.activeRuns)
+    || (withIds&&(!Array.isArray(v.activeRunIds)||v.activeRunIds.length!==v.activeRuns
+      ||v.activeRunIds.some(id=>!runName(id))||new Set(v.activeRunIds).size!==v.activeRunIds.length))
     || !Array.isArray(v.recent) || v.recent.length>50 || v.recent.some(r=>!(exactKeys(r,'code,runId,stageMs,startedAtET')
       || (exactKeys(r,'code,prewarmed,runId,stageMs,startedAtET') && typeof r.prewarmed==='boolean'))
       || !runName(r.runId) || !validET(r.startedAtET) || !exactKeys(r.stageMs,'install,run')
@@ -650,9 +654,10 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       recent.push(JSON.parse(await readPinned(join(receipts,name))));
     recent.sort((a,b)=>Date.parse(b.startedAtET)-Date.parse(a.startedAtET)||a.runId.localeCompare(b.runId));
     const cores=cpus().length;
+    const activeRunIds=[...new Set(names.filter(n=>/^r-[a-f0-9]{32}\.(prepared|running)$/.test(n)).map(n=>n.slice(0,-n.split('.').pop().length-1)))].sort();
     const value={sampledAtET:easternTimestamp(clock()),cores,loadPerCore:loadavg()[0]/cores,
       memFreePct:freemem()/totalmem()*100,
-      activeRuns:names.filter(n=>/^r-[a-f0-9]{32}\.(prepared|running)$/.test(n)).length,recent:recent.slice(0,50)};
+      activeRuns:activeRunIds.length,activeRunIds,recent:recent.slice(0,50)};
     parseTelemetry(JSON.stringify(value));
     await atomicJSON(join(receipts,'telemetry.json'),value);
     return value;
