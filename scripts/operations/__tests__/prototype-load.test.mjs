@@ -242,7 +242,7 @@ function fixture(options = {}) {
   }
   // Retirement has its own real-git suite (prototype-retire.test.mjs); here it is injected like combinedTest.
   const retirePlanner = vi.fn((input) => options.retirePlan ? options.retirePlan(input) : []);
-  const load = createPrototypeLoader({ exec, fs, env, retirePlanner, ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone({ ...settings, ...options.settings }), now: () => clock,
+  const load = createPrototypeLoader({ exec, fs, env, retirePlanner, ...(options.fingerprint ? { fingerprint: options.fingerprint } : {}), ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone({ ...settings, ...options.settings }), now: () => clock,
     cloneKey: (root) => { cloneRoots.push(root); return 'test-clone-key'; },
     sleep: async (ms) => { sleeps.push(ms); clock += ms; await options.onSleep?.(); } });
   return { calls, records, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, retirePlanner, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
@@ -1978,5 +1978,39 @@ describe('prototype-load', () => {
     expect(run.verdict).toMatchObject({ ok: false, adopted: true, stopReason: 'swap-remove-failed', detail: 'mutable-registration', removed: [], removedTips: {} });
     expect(mutations(f, 'remove')).toEqual([]);
     expect(f.registrations.has('lane/old')).toBe(true);
+  });
+});
+
+// R503 part 2 — a canonical audit for a rebased/merged head carries to the live head when the net-diff fingerprint is unchanged.
+describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
+  const FP = 'e'.repeat(64), OTHER_FP = '1'.repeat(64), OLD = 'd'.repeat(40);
+  const old = (o = {}) => auditRecord({ head: OLD, fingerprint: FP, ...o });
+  it('carries an audit of an older head whose fingerprint equals the live one', () => {
+    const record = old();
+    expect(prototypeLoad.canonicalAuditEvidence([record], SHA, () => true, FP)).toEqual({ ok: true, record });
+  });
+  it('a real code change (different fingerprint) does not carry', () => {
+    expect(prototypeLoad.canonicalAuditEvidence([old()], SHA, () => true, OTHER_FP)).toEqual({ ok: false, reason: 'no-record' });
+  });
+  it.each([['unreadable live fingerprint', null], ['malformed live fingerprint', 'zz']])('%s never carries', (_, live) => {
+    expect(prototypeLoad.canonicalAuditEvidence([old()], SHA, () => true, live)).toEqual({ ok: false, reason: 'no-record' });
+  });
+  it('a record without a stored fingerprint never carries', () => {
+    expect(prototypeLoad.canonicalAuditEvidence([old({ fingerprint: undefined })], SHA, () => true, FP)).toEqual({ ok: false, reason: 'no-record' });
+  });
+  it('a WEAKENED audit on the carried head blocks', () => {
+    expect(prototypeLoad.canonicalAuditEvidence([old({ verdict: 'WEAKENED' })], SHA, () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
+  });
+  it('the base must still be covered by main', () => {
+    expect(prototypeLoad.canonicalAuditEvidence([old()], SHA, () => false, FP)).toEqual({ ok: false, reason: 'no-record' });
+  });
+  it('the loader carries on a matching fingerprint and refuses on a differing or unreadable one', async () => {
+    const audits = auditLines([old()]);
+    const ok = await auditedFixture('refuse', { audits, fingerprint: () => FP }).run();
+    expect(ok).toMatchObject({ ok: true, canonicalAudit: { ok: true } });
+    for (const fingerprint of [() => OTHER_FP, () => null, () => { throw new Error('boom'); }]) {
+      const out = await auditedFixture('refuse', { audits, fingerprint }).run();
+      expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { ok: false, reason: 'no-record' } });
+    }
   });
 });
