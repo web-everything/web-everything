@@ -14,7 +14,7 @@ export default {
   probes: ['sessionWatchdog'],
   openAfter: 1,
   closeAfter: 1,
-  severity: 'medium',
+  severity: 'high',
   action: 'alert',
   recommendationHint: 'A claim is held by a silent holder on an unmoved head. Read the holder\'s transcript (inspect-agent-health) before releasing anything.',
   evaluate({ sessionWatchdog } = {}) {

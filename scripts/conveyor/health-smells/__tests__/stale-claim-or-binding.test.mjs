@@ -3,6 +3,7 @@ import { describe, it, expect } from 'vitest';
 import smell from '../stale-claim-or-binding.mjs';
 import { validateSmellShape } from '../../health-smells-shape.mjs';
 import { NOTIFY_EVEN_IN_SHADOW } from '../../health-smells-notify-list.mjs';
+import { emptyHealthState, stepEpisodes, planActions } from '../../health-watch-core.mjs';
 
 const finding = { type: 'stale-claim', repo: 'we', pr: 6300, session: { name: 'fix-6300' }, claimAgeMinutes: 120, holderIdleMinutes: 40, holderClass: 'stalled', headSha: 'abc123456789', thresholdMinutes: 90, idleThresholdMinutes: 20 };
 describe('stale-claim-or-binding', () => {
@@ -20,5 +21,10 @@ describe('stale-claim-or-binding', () => {
   it('fails closed when the watchdog probe is missing', () => {
     expect(smell.evaluate({ sessionWatchdog: null })).toEqual([]);
     expect(smell.evaluate({})).toEqual([]);
+  });
+  it('actually sends an opening notification in shadow mode (severity high, on the list)', () => {
+    const r = stepEpisodes(emptyHealthState(), [{ smell, results: smell.evaluate({ sessionWatchdog: { findings: [finding] } }) }], 0);
+    const notify = planActions(r.transitions, { [smell.id]: smell }, { mode: 'shadow' }).find((p) => p.kind === 'notify');
+    expect(notify).toBeTruthy(); expect(notify.suppressed).toBeNull();
   });
 });
