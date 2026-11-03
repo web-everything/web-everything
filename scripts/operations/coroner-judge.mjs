@@ -35,11 +35,26 @@ export function renderHeldEntry({ title, count, minutes, examples, proposedFix, 
     Coroner key: ${key}`;
 }
 
+const record = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+export function validateCoronerCoverage(coverage) {
+  if (!record(coverage) || !(typeof coverage.held === 'string' || Array.isArray(coverage.held)) ||
+    !Array.isArray(coverage.openPrs) || !Array.isArray(coverage.recentCards)) {
+    throw new Error('coroner coverage incomplete or malformed; retry or run manual /coroner');
+  }
+}
+
+const NON_CAUSE_KEYS = new Set(['notes', 'byKind', 'falseFindings', 'window', 'daemonErrors', 'mergeConflicts']);
 export function rankFrictions(metrics, { topN = 5 } = {}) {
+  const invalid = () => { throw new Error('coroner metrics incomplete or malformed; retry or run manual /coroner'); };
+  if (!record(metrics) || !record(metrics.errorRates)) invalid();
   const rows = [];
-  for (const [metric, value] of Object.entries(metrics?.errorRates ?? {})) {
-    for (const [cause, evidence] of Object.entries(value?.causes ?? {})) {
-      if (!evidence || !Number.isFinite(evidence.count) || evidence.count <= 0) continue;
+  for (const [metric, value] of Object.entries(metrics.errorRates)) {
+    if (NON_CAUSE_KEYS.has(metric) && !(record(value) && 'causes' in value)) continue; // extractor members that carry no cause table
+    if (!record(value) || !record(value.causes)) invalid();
+    for (const [cause, evidence] of Object.entries(value.causes)) {
+      if (!record(evidence) || !Number.isFinite(evidence.count) || evidence.count < 0 || !Array.isArray(evidence.examples)) invalid();
+      if (evidence.count === 0) continue;
       rows.push({ key: `${metric}:${cause}`, metric, cause, count: evidence.count,
         minutes: Number.isFinite(evidence.minutes) && evidence.minutes >= 0 ? evidence.minutes : null,
         examples: structuredClone(evidence.examples ?? []) });
@@ -62,8 +77,9 @@ const SHAPE = {
 };
 
 /** The whole answer is rejected on any invalid entry; omission is never inferred as NEW. */
-export async function judgeFrictions({ ranked, held = [], openPrs = [], recentCards = [], judge, log = console.error }) {
+export async function judgeFrictions({ ranked, held, openPrs, recentCards, judge, log = console.error }) {
   try {
+    validateCoronerCoverage({ held, openPrs, recentCards });
     const answer = await judge({
       mandate: `${FENCED_DATA_RULE}\nUse only the supplied evidence. This judge runs with the tool-free provider (--tools ""); no tools are available. Compare each cause against held items, open PRs, then recent cards. Return NEW only for a concrete actionable cause with examples that no existing item would remove. For each NEW verdict, supply a non-empty proposedFix describing the concrete change to the daemon or tooling that handles the cause automatically. Otherwise return COVERED-BY with its reference (proposedFix may be empty), or omit uncertain candidates. Return only the requested schema.`,
       input: fenceUntrusted('material', JSON.stringify({ ranked, held, openPrs, recentCards })), shape: SHAPE,
@@ -99,6 +115,7 @@ export async function fileNewCards({ ranked, verdicts, state, fileItem, maxCards
     // Recovered receipts count toward this run's cap exactly like newly appended cards.
     const item = await fileItem({ key: row.key, count: row.count, minutes: row.minutes, examples: row.examples, title: `Coroner: ${row.metric} / ${row.cause}`, kind: 'story', size: '3',
       queue: 'false', proposedFix: matches[0].proposedFix, digest: `Recurring delivery friction: ${row.cause}. Count: ${row.count}; minutes: ${row.minutes ?? 'unknown'}. Evidence: ${JSON.stringify(row.examples)}.` });
+    if (item?.limitReached === true) break; // The sink enforces the durable per-night bound under its append lock.
     if (!item || !(item.id || item.rel)) throw new Error('file-item returned no card receipt');
     state.filed[row.key] = item.id ?? item.rel;
     await save(state);

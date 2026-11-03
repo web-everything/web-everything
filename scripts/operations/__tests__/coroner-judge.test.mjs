@@ -60,9 +60,16 @@ describe('rankFrictions', () => {
       .toBe(first.find((r) => r.examples[0].ref === 'old').key);
   });
 
-  it('returns no candidates when error-rate evidence is absent', () => {
-    expect(rankFrictions({})).toEqual([]);
+  it.each([undefined, null, {}, [], { errorRates: null }, { errorRates: [] },
+    { errorRates: 'broken' }, { errorRates: { ci: null } }, { errorRates: { ci: {} } },
+    { errorRates: { ci: { causes: [] } } }, { errorRates: { ci: { causes: { broken: null } } } },
+    { errorRates: { ci: { causes: { broken: { count: '1', examples: [] } } } } }])('rejects missing or malformed metrics: %j', (input) => {
+    expect(() => rankFrictions(input)).toThrow(/coroner.*metrics/);
+  });
+
+  it('accepts present errorRates with legitimately zero causes', () => {
     expect(rankFrictions({ errorRates: {} })).toEqual([]);
+    expect(rankFrictions({ errorRates: { ci: { causes: {} } } })).toEqual([]);
   });
 });
 
@@ -116,7 +123,7 @@ describe('judgeFrictions', () => {
     if (proposedFix === undefined) delete verdicts[1].proposedFix;
     else verdicts[1].proposedFix = proposedFix;
     const fileItem = vi.fn(), log = vi.fn();
-    const result = await runCoronerJudge({ metrics: metrics(), judge: async () => answer(verdicts), fileItem, log });
+    const result = await runCoronerJudge({ metrics: metrics(), ...context(), judge: async () => answer(verdicts), fileItem, log });
     expect(result.verdicts).toEqual([]);
     expect(result.error).toContain('invalid judge verdict entry');
     expect(fileItem).not.toHaveBeenCalled();
@@ -126,7 +133,7 @@ describe('judgeFrictions', () => {
   it('accepts an empty proposedFix on a COVERED-BY verdict', async () => {
     const ranked = rankFrictions(metrics());
     const verdicts = [{ key: ranked[0].key, verdict: 'COVERED-BY', coveredBy: 'PR #42', proposedFix: '' }];
-    expect(await judgeFrictions({ ranked, judge: async () => answer(verdicts) })).toEqual(verdicts);
+    expect(await judgeFrictions({ ranked, ...context(), judge: async () => answer(verdicts) })).toEqual(verdicts);
   });
 
   it('reports a judge exception without manufacturing NEW verdicts', async () => {
@@ -200,6 +207,22 @@ describe('fileNewCards', () => {
 });
 
 describe('runCoronerJudge', () => {
+  it.each(['held', 'openPrs', 'recentCards'].flatMap((piece) => [undefined, null, 42].map((value) => [piece, value])))
+  ('fails closed when required coverage %s is %j', async (piece, value) => {
+    const coverage = { ...context(), [piece]: value };
+    const fileItem = vi.fn(), judge = vi.fn(), log = vi.fn();
+    const result = await runCoronerJudge({ metrics: metrics(), ...coverage, fileItem, judge, log });
+    expect(result.error).toMatch(/coverage/);
+    expect(judge).not.toHaveBeenCalled(); expect(fileItem).not.toHaveBeenCalled();
+  });
+
+  it('stops without saving or filing further when the held sink reports the nightly cap', async () => {
+    const fileItem = vi.fn(async () => ({ limitReached: true })), save = vi.fn();
+    expect(await fileNewCards({ ranked: rankFrictions(metrics()), verdicts: allNew(rankFrictions(metrics())),
+      state: {}, fileItem, save })).toEqual([]);
+    expect(fileItem).toHaveBeenCalledOnce(); expect(save).not.toHaveBeenCalled();
+  });
+
   it('composes ranking, judgment and bounded filing and replays without filing twice', async () => {
     const state = {}; const fileItem = vi.fn(async () => ({ id: `card-${fileItem.mock.calls.length}` }));
     const judge = vi.fn(async () => answer(allNew(rankFrictions(metrics()))));

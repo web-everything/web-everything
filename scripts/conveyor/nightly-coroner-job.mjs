@@ -16,7 +16,7 @@ import { handoffHome } from '../operations/handoff-home.mjs';
 import { feedPath, appendLines, sanitizeForFeed } from '../operations/needs-you-feed.mjs';
 import { scrubText } from './health-watch-core.mjs';
 import { prSweepTickAllowed } from './pr-sweep-job.mjs';
-import { runCoronerJudge, rankFrictions, renderHeldEntry } from '../operations/coroner-judge.mjs';
+import { runCoronerJudge, rankFrictions, renderHeldEntry, validateCoronerCoverage } from '../operations/coroner-judge.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { fenceUntrusted } from '../lib/mandate-fence.mjs';
 import { withFileLock } from '../lib/atomic-json-file.mjs';
@@ -250,32 +250,37 @@ function readJudgeCoverage(sourceRoot, home) {
   return { held, openPrs, recentCards };
 }
 /** Held-list sink shared by fresh filings and crash recovery. The key line is the durable receipt. */
-export function appendHeldCoronerCard(input, { home = handoffHome(), night } = {}) {
+export function appendHeldCoronerCard(input, { home = handoffHome(), night, maxCards = NIGHTLY_DEFAULTS.judge.maxCards } = {}) {
+  if (!positiveInt(maxCards) || !/^\d{4}-\d{2}-\d{2}$/.test(night)) throw new Error('invalid coroner nightly cap or night; run manual /coroner');
   if (typeof input.key !== 'string' || !input.key || input.key !== input.key.trim() || input.key.length > 512 || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(input.key)) throw new Error('invalid coroner filing key; run manual /coroner');
   const path = join(home, 'cards-to-file.md');
   const inspectHeld = () => {
     let held = '';
     try { held = readFileSync(path, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-    let number = 0, lastNumber = 0;
+    let number = 0, lastNumber = 0, nightlyCount = 0, receipt;
     for (const line of held.split('\n')) {
       const heading = line.match(/^(\d+)\.\s/);
-      if (heading) { number = Number(heading[1]); lastNumber = Math.max(lastNumber, number); }
+      if (heading) {
+        number = Number(heading[1]); lastNumber = Math.max(lastNumber, number);
+        if (line.startsWith(`${heading[1]}. (coroner-${night}, held) `)) nightlyCount++;
+      }
       if (line.trim() === `Coroner key: ${input.key}`) {
         if (!number) throw new Error('coroner held receipt lacks item number; run manual /coroner');
-        return { receipt: { id: `cards-to-file.md#${number}` } };
+        receipt ??= { id: `cards-to-file.md#${number}` };
       }
     }
-    return { number: lastNumber + 1 };
+    return { receipt, number: lastNumber + 1, nightlyCount };
   };
-  // Append-only receipts can be recovered without taking a writer lock.
+  // Existing append-only receipts need no write; only the locked read authorizes a new append.
   const existing = inspectHeld().receipt;
   if (existing) return existing;
   mkdirSync(home, { recursive: true });
   try {
     return withFileLock(`${path}.lock`, () => {
-      // Re-read under the shared writer lock: the optimistic read may have missed an append.
-      const { receipt, number } = inspectHeld();
+      // The appended list is the ledger, including writes whose state save failed.
+      const { receipt, number, nightlyCount } = inspectHeld();
       if (receipt) return receipt;
+      if (nightlyCount >= maxCards) return { limitReached: true };
       appendLines(path, [renderHeldEntry(input, { number, night })]);
       return { id: `cards-to-file.md#${number}` };
     }, { timeoutMs: 0 });
@@ -306,16 +311,9 @@ export async function extractNightlyCoroner({ night, until, dir, settings, night
     signal?.aborted ? { timeout: RELEASE_TIMEOUT_MS } : {}),
   sweep = async () => sweepCoronerLeases(root, sourceRoot, laneSession, run),
   loadJudgeSpawn = () => import('../lib/judge-spawn.mjs'),
-  judge = async (request) => {
-    signal?.throwIfAborted();
-    const coverage = readCoverage(sourceRoot, home);
-    signal?.throwIfAborted();
-    // judgeSpawn enforces the schema and --tools ""; an unavailable provider fails judgment closed.
-    return spawnToolFreeCoronerJudge({ ...request, input: `${request.input}\n${fenceUntrusted('material', JSON.stringify(coverage))}`,
-      timeoutMs: 5 * 60000 }, { load: loadJudgeSpawn });
-  },
+  judge, // Injected judges own their coverage IO.
   readCoverage = readJudgeCoverage,
-  fileItem = async (input) => appendHeldCoronerCard(input, { home, night }),
+  fileItem = async (input) => appendHeldCoronerCard(input, { home, night, maxCards: nightly.judge?.maxCards ?? NIGHTLY_DEFAULTS.judge.maxCards }),
 } = {}) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(night)) throw new Error('invalid coroner night');
   const cursorPath = join(dir, 'nightly-coroner-cursor.json');
@@ -363,11 +361,11 @@ export async function extractNightlyCoroner({ night, until, dir, settings, night
         'Deterministic extraction is ready. Automated coverage judgment follows publication; manual analysis remains available.', '',
         `Settings: ${JSON.stringify(settings?.value ?? {})}; sources: ${JSON.stringify(settings?.sources ?? {})}`, '',
         '## Summary', '',
-        `- Sessions observed: ${metrics.sessions?.count ?? 'unavailable'}`,
-        `- Gate failures: ${rate(metrics.errorRates?.gateRuns)}`,
-        `- CI failures: ${rate(metrics.errorRates?.ci)}`,
-        `- Code change-request rounds: ${metrics.changeRequests?.byKind?.code?.rounds ?? 'unavailable'}`,
-        `- Source warnings: ${metrics.sources?.warnings?.length ?? 0}`, '',
+        `- Sessions observed: ${metrics?.sessions?.count ?? 'unavailable'}`,
+        `- Gate failures: ${rate(metrics?.errorRates?.gateRuns)}`,
+        `- CI failures: ${rate(metrics?.errorRates?.ci)}`,
+        `- Code change-request rounds: ${metrics?.changeRequests?.byKind?.code?.rounds ?? 'unavailable'}`,
+        `- Source warnings: ${metrics?.sources?.warnings?.length ?? 0}`, '',
         '## Extraction (includes change-request rounds when available)', '', '```json', JSON.stringify(metrics, null, 2), '```', '',
         '## False findings', '', falseFindings === null ? 'Extractor not present.' : `${fence}json\n${JSON.stringify(falseFindings, null, 2)}\n${fence}`, '',
         `<!-- nightly-coroner ${JSON.stringify(window)} -->`, ''].join('\n');
@@ -399,6 +397,11 @@ export async function extractNightlyCoroner({ night, until, dir, settings, night
         const extraction = report.match(/## Extraction[^\n]*\n\s*```json\n([\s\S]*?)\n```/);
         if (!extraction) throw new Error('coroner report lacks extraction evidence');
         const metrics = JSON.parse(extraction[1]);
+        const coverage = judge ? { held: [], openPrs: [], recentCards: [] } : readCoverage(sourceRoot, home);
+        validateCoronerCoverage(coverage);
+        signal?.throwIfAborted();
+        // judgeSpawn enforces the schema and --tools ""; no provider fallback is permitted.
+        const judgePort = judge ?? ((request) => spawnToolFreeCoronerJudge({ ...request, timeoutMs: 5 * 60000 }, { load: loadJudgeSpawn }));
         const priorKeys = new Set(Object.keys(state.filed ?? {}));
         const save = () => {
           state.nights[night] = [...new Set([...(state.nights[night] ?? []),
@@ -407,8 +410,8 @@ export async function extractNightlyCoroner({ night, until, dir, settings, night
         };
         const cap = nightly.judge?.maxCards ?? NIGHTLY_DEFAULTS.judge.maxCards;
         if (!positiveInt(cap)) throw new Error('invalid coroner judge maxCards');
-        const result = rankFrictions(metrics).length ? await runCoronerJudge({ metrics, state, judge, fileItem, signal, save,
-          maxCards: Math.max(0, cap - (state.nights[night]?.length ?? 0)), log: () => {} })
+        const result = rankFrictions(metrics).length ? await runCoronerJudge({ metrics, state, judge: judgePort, fileItem, signal, save,
+          ...coverage, maxCards: cap, log: () => {} })
           : { ranked: [], verdicts: [], filed: [], error: null };
         signal?.throwIfAborted();
         if (result.error) throw new Error(result.error);
