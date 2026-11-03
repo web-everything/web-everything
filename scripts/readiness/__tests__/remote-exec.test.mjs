@@ -1076,8 +1076,9 @@ describe('runRemote', () => {
     expect(existsSync(await fs.mkdtemp.mock.results[0].value)).toBe(false);
   });
 
-  it('admits local execution for a Git-ignored test through the real legacy adapter', async () => {
+  it('admits local execution for a selected Git-ignored test through the real legacy adapter', async () => {
     const f = fixture();
+    f.argv = ['npm','run','test:unit','--','scripts/__tests__/ignored.test.mjs'];
     const exec = f.exec;
     f.exec = vi.fn(async call => call.file === 'git' && call.args.includes('-i')
       ? {code:0, stdout:Buffer.from('scripts/__tests__/ignored.test.mjs\0')}
@@ -1177,6 +1178,169 @@ describe('runRemote', () => {
     expect(readdirSync(destination, {recursive:true}).sort()).toEqual(['a.test.mjs', 'package-lock.json', 'src', 'src/kept.mjs']);
   });
 
+  it.each([
+    ['npm','a.test.mjs'], ['npx','a.test.mjs'], ['npx','rated/a.test.mjs'], ['npx','A.TEST.MJS'],
+  ])('refuses an ignored duplicate-suffix match for a Vitest positional filter (%s %s)', async (command, filter) => {
+    const f = fixture(), name = 'generated/a.test.mjs';
+    mkdirSync(join(cwd,'generated'));
+    writeFileSync(join(cwd,name),'ignored duplicate must run locally');
+    const exec = f.exec;
+    f.exec = vi.fn(async call => call.file === 'git' && call.args.includes('-i')
+      ? {code:0,stdout:Buffer.from(name+'\0')} : exec(call));
+    f.argv = command === 'npm' ? ['npm','run','test:unit','--',filter] : ['npx','vitest','run',filter];
+    expect(await runRemote(f)).toMatchObject({mode:'not-started',terminated:true,reason:'ignored-test-file',detail:name});
+    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+
+  it('checks imports of every inventory test matching a positional filter', async () => {
+    const f = fixture(), name = 'hidden.test.mjs';
+    mkdirSync(join(cwd,'generated'));
+    writeFileSync(join(cwd,'generated/a.test.mjs'), "import '../hidden.test.mjs'");
+    writeFileSync(join(cwd,name),'ignored imported test');
+    f.listFiles = async () => ['package-lock.json','a.test.mjs','generated/a.test.mjs'];
+    const exec = f.exec;
+    f.exec = vi.fn(async call => call.file === 'git' && call.args.includes('-i')
+      ? {code:0,stdout:Buffer.from(name+'\0')} : exec(call));
+    expect(await runRemote(f)).toMatchObject({mode:'not-started',terminated:true,reason:'ignored-test-file',detail:name});
+    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+
+  describe.each(['vitest.config.ts', 'vite.config.mjs', 'vitest.soak.config.ts'])('configuration-loaded ignored dependencies (%s)', config => {
+    it.each(['setupFiles', 'globalSetup'])('falls back before remote preparation for a configuration-loaded ignored %s', async hook => {
+      const f = fixture(), name = 'hidden.test.mjs';
+      writeFileSync(join(cwd, name), 'export default () => {}');
+      writeFileSync(join(cwd, config), `export default { test: { ${hook}: ['./${name}'] } };`);
+      f.listFiles.mockResolvedValue(['package-lock.json', 'a.test.mjs', config]);
+      const exec = f.exec;
+      f.exec = vi.fn(async call => call.file === 'git' && call.args.includes('-i')
+        ? {code:0, stdout:Buffer.from(name+'\0')} : exec(call));
+      f.argv = ['npx','vitest','run','a.test.mjs',
+        ...(config === 'vitest.soak.config.ts' ? ['--config', config] : [])];
+      expect(await runRemote(f)).toMatchObject({mode:'not-started', terminated:true,
+        reason:'unresolved-test-dependency', detail:config});
+      expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+    });
+  });
+
+  it('keeps configuration-loaded ignored dependency discovery local when the root directory is unreadable', async () => {
+    const f = fixture(), exec = f.exec;
+    f.exec = vi.fn(async call => call.file === 'git' && call.args.includes('-i')
+      ? {code:0, stdout:Buffer.from('hidden.test.mjs\0')} : exec(call));
+    const fs = {...filesystem, readdir:async () => { throw Object.assign(Error('unreadable'), {code:'EACCES'}); }};
+    expect(await runRemote({...f, fs})).toMatchObject({mode:'not-started', terminated:true,
+      reason:'unresolved-test-dependency', detail:'.'});
+    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+
+  it.each([false, true])('refuses an ignored test reached through package imports (via helper=%s)', async helper => {
+    const f = fixture(), name = 'hidden.test.mjs';
+    writeFileSync(join(cwd, 'package.json'), JSON.stringify({type:'module', imports:{'#hidden':'./hidden.test.mjs'}}));
+    writeFileSync(join(cwd, name), 'export const loaded = true');
+    const dependency = helper ? 'helper.mjs' : 'a.test.mjs';
+    writeFileSync(join(cwd, 'a.test.mjs'), helper ? "import './helper.mjs'" : "await import('#hidden').catch(() => {})");
+    if (helper) writeFileSync(join(cwd, dependency), "await import('#hidden').catch(() => {})");
+    f.listFiles.mockResolvedValue(['package.json', 'package-lock.json', 'a.test.mjs', ...(helper ? [dependency] : [])]);
+    const exec = f.exec;
+    f.exec = vi.fn(async call => call.file === 'git' && call.args.includes('-i')
+      ? {code:0, stdout:Buffer.from(name+'\0')} : exec(call));
+    f.argv = ['npx','vitest','run','a.test.mjs'];
+    expect(await runRemote(f)).toMatchObject({mode:'not-started', terminated:true,
+      reason:'unresolved-test-dependency', detail:dependency});
+    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+
+  it.each(['npm', 'npx'])('skips stale ignored tests for an explicit %s selection through remote transport', async command => {
+    const f = fixture();
+    const name = '_site/assets/js/__tests__/backlog-graph-render.test.ts';
+    mkdirSync(join(cwd, '_site/assets/js/__tests__'), {recursive:true});
+    writeFileSync(join(cwd, name), 'stale generated test');
+    const exec = f.exec;
+    f.exec = vi.fn(async call => call.file === 'git' && call.args.includes('-i')
+      ? {code:0, stdout:Buffer.from(name+'\0')} : exec(call));
+    f.argv = command === 'npm' ? [...argv] : ['npx','vitest','run','--testTimeout=15000','a.test.mjs'];
+    const manifest = await remoteManifestAPI.buildManifest({...f, selectedTests:['a.test.mjs']});
+    expect(manifest.entries.map(e => e.path.toString())).not.toContain(name);
+    const wire = forgeManifestAPI.manifestWire(manifest);
+    const delta = await remoteManifestAPI.buildDeltaManifest({...f,selectedTests:['a.test.mjs'],
+      base:{sha:'a'.repeat(40),manifest:wire,manifestDigest:forgeManifestAPI.digestManifest(wire)}});
+    expect(delta.entries.map(e => e.path.toString())).not.toContain(name);
+    expect(await runRemote(f)).toMatchObject({mode:'remote',code:0});
+  });
+
+  describe.each([false,true])('unresolved dependency admission (via helper=%s)', helper => {
+    it.each([
+      ['unparseable dependency', 'import('],
+      ['glob discovery', "import.meta.glob('./*.test.mjs')"],
+      ['computed import', "const name='hidden'; await import('./' + name + '.test.mjs')"],
+      ['template import', "const name='hidden'; await import(`./${name}.test.mjs`)"],
+      ['computed require', "const name='hidden'; require('./' + name + '.test.mjs')"],
+      ['module require', "const name='hidden'; module.require('./' + name + '.test.mjs')"],
+      ['aliased require', "const load=require; load('./hidden.test.mjs')"],
+      ['created require', "import {createRequire} from 'node:module'; const load=createRequire(import.meta.url); load('./hidden.test.mjs')"],
+      ['unresolved package import', "await import('#missing').catch(() => {})"],
+      ['package self-reference', "import 'fixture-package/hidden'"],
+    ])('refuses %s before remote preparation when ignored tests exist', async (_label, source) => {
+      const f = fixture(), name = 'hidden.test.mjs', dependency = helper ? 'helper.mjs' : 'a.test.mjs';
+      writeFileSync(join(cwd,name),'ignored runtime dependency');
+      writeFileSync(join(cwd,'a.test.mjs'),helper ? "import './helper.mjs'" : source);
+      if(helper) writeFileSync(join(cwd,'helper.mjs'),source);
+      const exec = f.exec;
+      f.exec = vi.fn(async call => call.file === 'git' && call.args.includes('-i')
+        ? {code:0,stdout:Buffer.from(name+'\0')} : exec(call));
+      await expect(remoteManifestAPI.buildManifest({...f,selectedTests:['a.test.mjs']}))
+        .rejects.toMatchObject({code:'unresolved-test-dependency',detail:dependency});
+      expect(await runRemote(f)).toMatchObject({mode:'not-started',terminated:true,
+        reason:'unresolved-test-dependency',detail:dependency});
+      expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+    });
+  });
+
+  it.each(["await import('./helper.mjs')", "require('./helper.mjs')", "await import('node:fs')", "require('fs')"])
+  ('keeps literal dependency loading eligible and ignores import-like comments and strings: %s', async source => {
+    const f = fixture(), name = 'hidden.test.mjs';
+    writeFileSync(join(cwd,name),'unselected ignored test');
+    writeFileSync(join(cwd,'helper.mjs'),'export const value=1');
+    writeFileSync(join(cwd,'a.test.mjs'), `const example="import(variable)"; // require(variable)\n${source}`);
+    f.listFiles = async () => ['package-lock.json','a.test.mjs','helper.mjs'];
+    const exec = f.exec;
+    f.exec = vi.fn(async call => call.file === 'git' && call.args.includes('-i')
+      ? {code:0,stdout:Buffer.from(name+'\0')} : exec(call));
+    expect(await runRemote(f)).toMatchObject({mode:'remote',code:0});
+  });
+
+  it.each([true, false])('refuses an ignored test imported by the selection (via helper=%s)', async helper => {
+    const f = fixture(), name = 'hidden.test.mjs';
+    writeFileSync(join(cwd,name),'ignored test');
+    writeFileSync(join(cwd,'a.test.mjs'), helper ? "import './helper.mjs'" : "import './hidden.test.mjs'");
+    if(helper) writeFileSync(join(cwd,'helper.mjs'), "export * from './hidden.test.mjs'");
+    const exec = f.exec;
+    f.exec = vi.fn(async call => call.file === 'git' && call.args.includes('-i')
+      ? {code:0,stdout:Buffer.from(name+'\0')} : exec(call));
+    await expect(remoteManifestAPI.buildManifest({...f,selectedTests:['a.test.mjs']}))
+      .rejects.toMatchObject({code:'ignored-test-file',detail:name});
+  });
+
+  it.each(['oversized','missing'])('keeps local admission for %s selected dependency evidence', async state => {
+    const f = fixture(), name = 'stale.test.mjs';
+    writeFileSync(join(cwd,name),'stale ignored artifact');
+    writeFileSync(join(cwd,'a.test.mjs'), state === 'oversized' ? 'x'.repeat(4*1024*1024+1) : "import './missing-helper.mjs'");
+    const exec = f.exec;
+    f.exec = vi.fn(async call => call.file === 'git' && call.args.includes('-i')
+      ? {code:0,stdout:Buffer.from(name+'\0')} : exec(call));
+    await expect(remoteManifestAPI.buildManifest({...f,selectedTests:['a.test.mjs']})).rejects.toMatchObject({
+      code:state === 'oversized' ? 'manifest-walk-limit' : 'manifest-worktree-mismatch',
+    });
+    expect(await runRemote(f)).toMatchObject({mode:'not-started',terminated:true});
+    expect(callsOf(f.exec).some(call => isPrepare(call) || isRun(call))).toBe(false);
+  });
+
+  it('keeps the specific refusal for an unshipped selected test', async () => {
+    const f = fixture();
+    writeFileSync(join(cwd,'new.test.mjs'),'unshipped selected test');
+    await expect(remoteManifestAPI.buildManifest({...f,selectedTests:['new.test.mjs']}))
+      .rejects.toMatchObject({code:'unshipped-test-file',detail:'new.test.mjs'});
+  });
+
   it('retains ignored-test fallback without discovery after finalizing the Forge coverage environment', async () => {
     const f = fixture();
     const gitIn=(...args)=>{
@@ -1191,7 +1355,7 @@ describe('runRemote', () => {
     f.exec = vi.fn(async call => call.file === 'git'
       ? remoteManifestAPI.defaultExec({...call,env:{...call.env,PATH:process.env.PATH}}) : fake(call));
     f.selectorExec = vi.fn(async () => ({stdout:JSON.stringify([join(cwd,'a.test.mjs')])}));
-    const result = await runRemote({...f,listFiles:undefined,argv:['npx','vitest','run','a.test.mjs'],env:{...f.env,DIFF_COVERAGE_BASE:'coverage-base'}});
+    const result = await runRemote({...f,listFiles:undefined,argv:['npm','run','test:coverage'],env:{...f.env,DIFF_COVERAGE_BASE:'coverage-base'}});
     expect(f.selectorExec).not.toHaveBeenCalled();
     expect(result).toMatchObject({mode:'not-started',reason:'ignored-test-file',detail:'dist/hidden.test.mjs'});
   });
@@ -1207,6 +1371,7 @@ describe('runRemote', () => {
     const fake = f.exec;
     f.exec = vi.fn(async call => call.file === 'git'
       ? remoteManifestAPI.defaultExec({...call,env:{...call.env,PATH:process.env.PATH}}) : fake(call));
+    f.argv = ['npm','run','test:unit','--',name];
     expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'ignored-test-file',detail:name});
     expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
   });
@@ -1583,6 +1748,30 @@ describe('runRemoteCli', () => {
 });
 
 describe('explicit remote CLI decision', () => {
+  it('sends normalized retry argv and binds the receipt to that argv', async () => {
+    const f = fixture();
+    const original = ['npx','vitest','run','--maxWorkers=1','--minWorkers=1','--no-file-parallelism',
+      '--testTimeout=15000','--hookTimeout=30000','./a.test.mjs'];
+    expect(await runRemoteCli({...f,argv:original,log:vi.fn()})).toBe(0);
+    const request = JSON.parse(callsOf(f.exec).find(isRun).input);
+    expect(request.argv).toEqual(['npx','vitest','run','--testTimeout=15000','--hookTimeout=30000','a.test.mjs']);
+    expect(request.argvDigest).toBe(digestArgv(request.argv));
+    expect(f.local).not.toHaveBeenCalled();
+    expect(original.at(-1)).toBe('./a.test.mjs');
+  });
+  it('keeps original retry argv for local fallback after remote normalization', async () => {
+    const f = fixture({probeCode:255});
+    const original = ['npx','vitest','run','--maxWorkers=1','--minWorkers=1','--no-file-parallelism','./a.test.mjs'];
+    expect(await runRemoteCli({...f,argv:original,log:vi.fn()})).toBe(7);
+    expect(f.local).toHaveBeenCalledWith(original);
+    expect(callsOf(f.exec).some(isRun)).toBe(false);
+  });
+  it('normalizes direct transport argv even without the CLI entry point', async () => {
+    const f = fixture();
+    expect(await runRemote({...f,argv:['npx','vitest','run','./a.test.mjs','--no-file-parallelism']}))
+      .toMatchObject({mode:'remote',code:0});
+    expect(JSON.parse(callsOf(f.exec).find(isRun).input).argv).toEqual(['npx','vitest','run','a.test.mjs']);
+  });
   it.each([
     ['unconfirmed', {mode:'unconfirmed', reason:'ambiguous-result'}, 124],
     ['malformed', {mode:'remote', code:'0'}, 124],

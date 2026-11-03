@@ -927,7 +927,7 @@ export function runnerInvocation(head) {
       i += 1;
       continue;
     }
-    if (w === 'exec' || w === 'dlx') { sawExec = true; i += 1; continue; }
+    if (w === 'exec' || w === 'dlx' || (runner === 'npm' && w === 'x' && !sawRun && !sawExec)) { sawExec = true; i += 1; continue; }
     if (w === 'workspace' || w === 'workspaces') { i += 2; continue; }  // `yarn workspace <name> <rest…>`
     if (w === 'run' || w === 'run-script') { sawRun = true; i += 1; continue; }
     break;                                                    // the subcommand / script-name position
@@ -3257,6 +3257,8 @@ export function rawHeavyCommandReason(segment, { primaryCwd = false } = {}) {
 const VITEST_WORD = /^vitest(?:@\S*)?$/;
 /** vitest's own entry scripts when run through `node` (`vitest/vitest.mjs`, `vitest/dist/cli.js`, `.bin/vitest`). */
 const VITEST_NODE_ENTRY = /(?:^|\/)node_modules\/(?:vitest\/(?:vitest\.mjs|dist\/cli\.js)|\.bin\/vitest)$/;
+const TSC_WORD = /^tsc(?:@\S*)?$/;
+const TSC_NODE_ENTRY = /(?:^|\/)node_modules\/(?:typescript\/(?:bin\/tsc|lib\/tsc\.js)|\.bin\/tsc)$/;
 /** vitest's watch mode spelled as a flag (`-w` is its short form); `--watch=false`/`=0` is NOT watch. */
 const VITEST_WATCH_FLAG = /^(?:--watch|-w)(?:=(?:true|1|yes|on))?$/i;
 /** npm options that choose WHICH package's `test` script runs; a replacement that drops them tests another package. */
@@ -3346,23 +3348,34 @@ function ungatedHeavyHead(head, depth = 0) {
     if (w.slice(1).some((arg) => /^(?:--version|-v|--help|-h)$/.test(arg))) return null;
     return { kind: 'vitest', watch: w[1] === 'watch' || w[1] === 'dev' || w.slice(1).some((arg) => VITEST_WATCH_FLAG.test(arg)) };
   }
+  if (TSC_WORD.test(w[0] || '')) {
+    if (w.slice(1).some((arg) => /^(?:--version|-v|--help|-h)$/.test(arg))) return null;
+    return { kind: 'typecheck' };
+  }
   if (w[0] === 'node') {
     // Only the script position is executable. --check/-c and eval arguments are not scripts.
     let i = 1;
+    let testRun = false;
     while (w[i]?.startsWith('-') && w[i] !== '--') {
-      if (/^(?:--check|-c|--eval|-e|--print|-p)(?:=|$)/.test(w[i])) return null;
+      if (/^(?:--check|-c|--eval|-e|--print|-p|--version|-v|--help|-h)(?:=|$)/.test(w[i])) return null;
       const flag = w[i];
       i += 1;
-      if (NODE_SCRIPT_VALUE_FLAGS.has(flag)) i += 1;
+      // --test is a boolean runtime option, not a value-taking flag or a script argument.
+      if (flag === '--test') { testRun = true; continue; }
+      if (NODE_SCRIPT_VALUE_FLAGS.has(flag) || flag === '--title') i += 1;
       // a separate option value (`--title standards`, `--env-file .env`, `--max-old-space-size 4096`) is not the script
       else if (!flag.includes('=') && w[i] && !w[i].startsWith('-') && !NODE_SCRIPT_WORD.test(w[i])) i += 1;
     }
+    if (testRun) return { kind: 'node-test' };
     if (w[i] === '--') i += 1;
     if (/(?:^|\/)check-standards\.mjs$/.test(w[i] || '')) {
       return { kind: 'standards', tail: head.slice(words[i].end).trim() };
     }
     if (VITEST_NODE_ENTRY.test(w[i] || '')) {
       return ungatedHeavyHead('vitest' + head.slice(words[i].end), depth + 1);
+    }
+    if (TSC_NODE_ENTRY.test(w[i] || '')) {
+      return ungatedHeavyHead('tsc' + head.slice(words[i].end), depth + 1);
     }
     return null; // Includes heavy-admission: its child is an argument, not the executable.
   }

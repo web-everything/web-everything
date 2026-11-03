@@ -414,6 +414,38 @@ describe('runWithRemoteDecision', () => {
     expect(f.log.mock.calls[1][0]).toContain('refusing local rerun');
   });
 
+  it.each(['not-started','cancelled'])('records exactly one structured fallback for %s', async mode => {
+    const f = fixture({result:{mode,terminated:true,reason:'ignored-test-file',detail:'hidden.test.mjs'}});
+    const now = Date.now();
+    expect(await runWithRemoteDecision({...f,clock:()=>now})).toEqual({handled:false});
+    const lines = readFileSync(join(f.lockRoot,'remote-fallbacks.jsonl'),'utf8').trim().split('\n');
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0])).toEqual({ts:new Date(now).toISOString(),reason:'ignored-test-file',
+      detail:'hidden.test.mjs',lane:'fixture-checkout',kind:'files'});
+  });
+
+  it('records health refusals without dispatching remotely', async () => {
+    const f = fixture();
+    expect(await runWithRemoteDecision({...f,readTelemetry:async()=>null})).toEqual({handled:false});
+    expect(f.remoteExec).not.toHaveBeenCalled();
+    const rows = readFileSync(join(f.lockRoot,'remote-fallbacks.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({reason:expect.any(String),detail:null,lane:'fixture-checkout',kind:'files'});
+  });
+
+  it('bounds fallback log growth and tolerates an unwritable log', async () => {
+    const f = fixture({result:{mode:'not-started',terminated:true,reason:'copy-failed',detail:'x'.repeat(20000)}});
+    mkdirSync(f.lockRoot,{recursive:true});
+    const file = join(f.lockRoot,'remote-fallbacks.jsonl');
+    writeFileSync(file,'x'.repeat(2*1024*1024));
+    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(statSync(file).size).toBeLessThanOrEqual(1024*1024);
+    const last = JSON.parse(readFileSync(file,'utf8').trim().split('\n').at(-1));
+    expect(last.detail.length).toBeLessThanOrEqual(4096);
+    rmSync(file); mkdirSync(file);
+    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+  });
+
   it.each(['not-started', 'cancelled'])('%s with terminated=true falls back to local admission', async (mode) => {
     const reason = 'remote termination confirmed';
     const f = fixture({ result: { mode, terminated: true, reason } });

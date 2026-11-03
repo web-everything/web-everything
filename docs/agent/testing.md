@@ -2183,6 +2183,18 @@ limits, idle-hook order and real local packing that preserves recent unreachable
 oversized stamp skips GC (`stamp-unreadable` in the `clone-maintenance` event); inspect
 and repair `clone-maintenance-<cloneLockKey>.json` under the daemon state directory.
 
+Remote Vitest argv compatibility belongs in the client: `normalizeRemoteArgv` removes
+the local `./` file prefix and worker controls before Forge validation and dispatch.
+Keep the server allowlist strict and local fallback argv unchanged. The producer-backed
+regressions live in `scripts/readiness/__tests__/remote-argv-allowlist.test.mjs`.
+Explicit selections may omit ignored tests only when their execution dependencies
+are certified. Vitest/Vite configuration can load files outside selected-test imports
+through `setupFiles` and `globalSetup`; until that graph is certified, configuration
+presence plus ignored tests keeps local admission (`unresolved-test-dependency`).
+Package imports (`#name`), package self-references and other non-relative specifiers
+also keep local admission while ignored tests exist: relative traversal cannot
+certify their resolved graph. Only Node built-ins may bypass that traversal.
+
 The `heavy-enforce` guard requires admission even for one-file Vitest runs, `related`,
 and direct `check-standards.mjs` execution. Use `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <file>`
 or the admitted `npm run test:unit -- <file>` / `npm run check:standards` scripts.

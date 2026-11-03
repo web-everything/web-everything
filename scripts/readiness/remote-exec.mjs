@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import '../lib/tools-root-guard.mjs';
 import { spawn } from 'node:child_process';
+import { isBuiltin } from 'node:module';
 import * as filesystem from 'node:fs/promises';
 import { constants, mkdirSync, lstatSync, realpathSync } from 'node:fs';
-import { join, resolve, relative, isAbsolute, win32 } from 'node:path';
+import { join, resolve, relative, dirname, isAbsolute, win32 } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
 import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -72,6 +73,26 @@ const newRunId = () => `${new Date().toISOString().replace(/[^0-9tz]/gi, '').toL
 export function isAllowedCommand(argv) {
   // Only task arguments may follow the script name; npm options can skip or replace execution.
   return allowedCommand(argv);
+}
+
+/** Adapt local Vitest spellings to Forge's fixed command contract and worker policy. */
+export function normalizeRemoteArgv(argv) {
+  if (!Array.isArray(argv) || !argv.every(arg => typeof arg === 'string')
+    || argv[0] !== 'npx' || argv[1] !== 'vitest' || !['run', 'related'].includes(argv[2])) return argv;
+  const normalized = argv.slice(0, 3);
+  for (let i = 3; i < argv.length; i++) {
+    const arg = argv[i];
+    // These two-token options take values, not positional file filters.
+    if (arg === '-t' || arg === '--config') {
+      normalized.push(arg);
+      if (++i < argv.length) normalized.push(argv[i]);
+    } else if (arg === '--no-file-parallelism' || /^--(?:maxWorkers|minWorkers)=/.test(arg)) {
+      // Forge owns concurrency for the admitted remote slot.
+    } else {
+      normalized.push(arg.startsWith('./') ? arg.slice(2) : arg);
+    }
+  }
+  return normalized;
 }
 
 export function filterEnv(env = {}) {
@@ -286,8 +307,113 @@ async function verifyTrackedLink(cwd, {linkPath,linkOid:oid,targetPath}, fs) {
 const manifestRefusal=(code,path)=>Object.assign(new Error(`${code}: use local fallback`),{
   code,detail:(Buffer.isBuffer(path)?path.toString('utf8'):String(path)).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g,'?')||'.',
 });
+// Test-shaped arguments are still Vitest substring filters, never exact paths.
+// Other filter forms retain the conservative whole-inventory refusal.
+function selectedTestArgs(argv) {
+  if (argv[2] === 'check:standards' || argv[2] === 'related') return;
+  const args = argv.slice(argv[0] === 'npm' ? 4 : 3), files = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '-t' || args[i] === '--config') { i++; continue; }
+    if (args[i].startsWith('-')) continue;
+    if (!isTestFile(Buffer.from(args[i]))) return;
+    files.push(args[i]);
+  }
+  return files.length ? files : undefined;
+}
+
+// Vitest's positional matcher is case-insensitive and checks both the raw
+// filter and its relative spelling. Conservatively include every inventory match.
+function matchesTestFilters(path, filters, cwd) {
+  const name = path.toString().toLocaleLowerCase();
+  return filters.some(filter => name.includes(filter.toLocaleLowerCase())
+    || name.includes(relative(cwd, resolve(cwd, filter)).toLocaleLowerCase()));
+}
+
+// A literal-only dependency list cannot certify runtime-resolved loaders.
+// Refuse unknown loader expressions while ignored tests would be omitted.
+function assertLiteralDependencyLoading(ts, source, path) {
+  const tree = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true);
+  const unresolved = () => { throw manifestRefusal('unresolved-test-dependency', path); };
+  if (tree.parseDiagnostics.length) unresolved();
+  function visit(node) {
+    if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword
+      && !ts.isStringLiteral(node.arguments[0])) unresolved();
+    if (ts.isIdentifier(node) && node.text === 'require') {
+      const call = node.parent;
+      if (!ts.isCallExpression(call) || call.expression !== node || call.arguments.length !== 1
+        || !ts.isStringLiteral(call.arguments[0])) unresolved();
+    }
+    // Factory-created/aliased loaders and glob discovery require runtime evidence.
+    if (ts.isIdentifier(node) && node.text === 'createRequire') unresolved();
+    if (ts.isElementAccessExpression(node) && ts.isStringLiteral(node.argumentExpression)
+      && ['require','createRequire'].includes(node.argumentExpression.text)) unresolved();
+    if (ts.isPropertyAccessExpression(node) && ts.isMetaProperty(node.expression)
+      && node.expression.keywordToken === ts.SyntaxKind.ImportKeyword
+      && ['glob','globEager'].includes(node.name.text)) unresolved();
+    ts.forEachChild(node, visit);
+  }
+  visit(tree);
+}
+
+// Follow literal local imports through helpers as well as direct test imports.
+// Unknown/unreadable or oversized dependency evidence keeps local admission.
+async function selectedDependencyPaths({cwd, fs, selectedTests, ignoredTests}) {
+  const paths = new Set(selectedTests.map(path => relative(cwd, resolve(cwd, path))));
+  if (!ignoredTests.length) return paths;
+  // Configuration can load tests through setupFiles/globalSetup (including
+  // computed values and imported helpers), independently of selected imports.
+  // Until that execution graph is certified, keep local admission rather than
+  // dropping ignored files it might need. Inspect disk, not just Git's inventory:
+  // configuration itself can be ignored or omitted by an injected file listing.
+  let rootNames;
+  try { rootNames = await fs.readdir(cwd); }
+  catch { throw manifestRefusal('unresolved-test-dependency', '.'); }
+  const config = rootNames.sort().find(name =>
+    /^(?:(?:vitest|vite)(?:\.[^.]+)*\.config|vitest\.workspace)\.[cm]?[jt]s$/.test(name));
+  if (config) throw manifestRefusal('unresolved-test-dependency', config);
+  const ts = await import('typescript');
+  const ignored = new Set(ignoredTests.map(path => path.toString()));
+  let bytes = 0;
+  for (const path of paths) {
+    if (ignored.has(path)) throw manifestRefusal('ignored-test-file', path);
+    if (paths.size > 10000) throw manifestRefusal('manifest-walk-limit', path);
+    // Do not follow symlinks while discovering imports.
+    const parts = pathParts(Buffer.from(path));
+    let component = Buffer.from(cwd);
+    for (const part of parts) {
+      component = bytePath(component, part);
+      const st = await fs.lstat(component);
+      if (st.isSymbolicLink()) throw manifestRefusal('unshipped-symlink', path);
+    }
+    const stat = await fs.lstat(bytePath(cwd, Buffer.from(path)));
+    if (!stat.isFile() || (bytes += stat.size) > LIMIT) throw manifestRefusal('manifest-walk-limit', path);
+    const source = await fs.readFile(bytePath(cwd, Buffer.from(path)), 'utf8');
+    assertLiteralDependencyLoading(ts, source, path);
+    for (const {fileName} of ts.preProcessFile(source, true, true).importedFiles) {
+      if (isBuiltin(fileName)) continue;
+      // Package imports, self-references and aliases can resolve to ignored
+      // local tests too. Their graph is not certified by relative traversal.
+      if (!fileName.startsWith('.')) throw manifestRefusal('unresolved-test-dependency', path);
+      const target = relative(cwd, resolve(cwd, dirname(path), fileName));
+      if (target === '..' || target.startsWith('../')) throw manifestRefusal('manifest-worktree-mismatch', target);
+      const stem = target.replace(/\.[cm]?jsx?$/, '');
+      const candidates = [target, ...['.ts','.tsx','.mts','.cts','.js','.jsx','.mjs','.cjs'].map(ext => stem+ext),
+        ...['.ts','.tsx','.js','.mjs'].map(ext => target+'/index'+ext)];
+      let found;
+      for (const candidate of candidates) {
+        try { if ((await fs.lstat(bytePath(cwd, Buffer.from(candidate)))).isFile()) {found=candidate; break;} }
+        catch (error) { if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error; }
+      }
+      if (!found) throw manifestRefusal('manifest-worktree-mismatch', target);
+      if (ignored.has(found)) throw manifestRefusal('ignored-test-file', found);
+      if (/\.[cm]?[jt]sx?$/.test(found)) paths.add(found);
+    }
+  }
+  return paths;
+}
+
 // Walk independently of Git's inventory. Never follow a directory link.
-async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,ignoredPaths,exec,head,rootInfo,scoped}) {
+async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,ignoredPaths,selectedPaths,exec,head,rootInfo,scoped}) {
   const shipped=new Map(entries.map(entry=>[entry.path.toString('hex'),entry]));
   const walked=new Map();
   let count=0,bytes=0;
@@ -311,8 +437,8 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
       }
       if(st.isDirectory())await walk(absolute,path);
       else if(st.isFile()) {
-        // (a) Discovery excludes entry points, not imports. Every test-shaped
-        // leaf must ship, even when Git ignores it or Vitest does not list it.
+        // Unselected ignored tests are stale artifacts, not transport inputs.
+        if(isTestFile(path)&&ignoredPaths.has(key)&&selectedPaths&&!selectedPaths.has(path.toString()))continue;
         if(isTestFile(path)&&!shipped.has(key))throw manifestRefusal('unshipped-test-file',path);
         // Ignored leaves may become tests or excluded paths through directory
         // aliases. Follow projections transitively, sharing the walk's limits.
@@ -375,21 +501,16 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
   }
 }
 
-export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, env=process.env, beginSub=noTiming} = {}) {
+export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, selectedTests, env=process.env, beginSub=noTiming} = {}) {
   exec=await bindGit({cwd,env,exec});
   if(head!==undefined&&!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(head))throw new Error('Invalid Git HEAD');
-  // Neither Git ignores nor Vitest discovery prove that a file is unused:
-  // selected tests can import excluded tests, directly or through helpers.
-  // Until dependency inclusion is established, retain local fallback.
   const ignored = await timed(beginSub,'ignored-file-listing',()=>ignoredInventory(cwd,exec));
   if (ignored.code !== 0 || !Buffer.isBuffer(ignored.stdout)) throw new Error('Ignored byte inventory unavailable');
   const ignoredPaths = splitPaths(ignored.stdout);
-  for (const path of ignoredPaths) {
-    if (pathParts(path).slice(0,-1).some(part => part.equals(Buffer.from('node_modules')) || part.equals(Buffer.from('.git')))) continue;
-    if (isTestFile(path)) {
-      const refusal=manifestRefusal('ignored-test-file',path);
-      throw Object.assign(refusal,{message:`Ignored test ${refusal.detail}: use local fallback`});
-    }
+  const ignoredTests = ignoredPaths.filter(path => isTestFile(path)
+    && !pathParts(path).slice(0,-1).some(part => part.equals(Buffer.from('node_modules')) || part.equals(Buffer.from('.git'))));
+  for (const path of ignoredTests) {
+    if (!selectedTests?.length || matchesTestFilters(path, selectedTests, cwd)) throw manifestRefusal('ignored-test-file',path);
   }
   const walkDone=beginSub('inventory-walk');
   let files;
@@ -401,6 +522,14 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     const result = await exec({file:'git',args:['ls-files','-co','--exclude-standard','-z'],cwd});
     if (result.code !== 0 || !Buffer.isBuffer(result.stdout)) throw new Error('Byte inventory unavailable');
     files = splitPaths(result.stdout);
+  }
+  const matchingTests = selectedTests?.length
+    ? files.filter(path => isTestFile(path) && matchesTestFilters(path, selectedTests, cwd)).map(path => path.toString()) : [];
+  const selectedPaths = selectedTests?.length
+    ? await selectedDependencyPaths({cwd,fs,selectedTests:[...selectedTests,...matchingTests],ignoredTests}) : null;
+  if (selectedPaths) {
+    const skipped = new Set(ignoredTests.map(path => path.toString('hex')));
+    files = files.filter(path => !skipped.has(path.toString('hex')));
   }
   // Only this ignored coverage input is transportable; it uses the same leaf
   // safety checks and digests below as ordinary inventory entries.
@@ -624,7 +753,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     }
   }
   try {await timed(beginSub,'cross-check',()=>crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,
-    ignoredPaths:new Set(ignoredPaths.map(path=>path.toString('hex'))),exec,head,rootInfo,scoped:trackedOnly&&!!listFiles}));}
+    ignoredPaths:new Set(ignoredPaths.map(path=>path.toString('hex'))),selectedPaths,exec,head,rootInfo,scoped:trackedOnly&&!!listFiles}));}
   catch(error) {throw error.code?.startsWith('manifest-')||['unshipped-test-file','unshipped-symlink'].includes(error.code)
     ? error : manifestRefusal('manifest-worktree-mismatch',error.detail??(error.path?relative(cwd,Buffer.isBuffer(error.path)?error.path.toString('utf8'):error.path):'.'));}
   const manifest = {entries,excluded,...(siblings ? {siblings} : {})};
@@ -662,7 +791,7 @@ export async function rankBases({cwd=process.cwd(),exec=defaultExec,env=process.
 export async function selectBase(options={}) {return (await rankBases(options))[0]??null;}
 const manifestFailure=error=>String(error?.message??error??'Base evidence unavailable').replace(/[\x00-\x1f\x7f-\x9f]/g,' ').slice(0,200)||'Base evidence unavailable';
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
-export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=filesystem,base,head,env=process.env,beginSub=noTiming}={}) {
+export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=filesystem,base,head,selectedTests,env=process.env,beginSub=noTiming}={}) {
   exec=await bindGit({cwd,env,exec});
   if(!base || digestManifest(base.manifest)!==base.manifestDigest)throw new Error('Base manifest digest mismatch');
   const snapshot=decodeManifest(base.manifest);
@@ -761,7 +890,7 @@ export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=
     } finally {await reader?.close();}
     manifestMode='git-delta';
   } catch {manifestReason ??='base or git evidence unavailable';reuse=undefined;}
-  const manifest=await buildManifest({cwd,exec,fs,head,reuse,env,beginSub});
+  const manifest=await buildManifest({cwd,exec,fs,head,reuse,selectedTests,env,beginSub});
   // Transfer decisions still compare the complete manifest, including fresh modes.
   const final=new Set(manifest.entries.map(e=>e.path.toString('hex')));
   const deltaPaths=manifest.entries.filter(entry=>{
@@ -894,7 +1023,7 @@ async function stageSnapshot({fs,stageDirectory,source:sourceRoot,destination:de
 
 // Shared by the run and presync: one base selection and one delta manifest
 // builder, so both apply identical exclusion and walk checks.
-async function discoverDelta({cwd,exec,fs,env,host,discovery,fetchBaseManifest,head,beginSub=noTiming}) {
+async function discoverDelta({cwd,exec,fs,env,host,discovery,fetchBaseManifest,head,selectedTests,beginSub=noTiming}) {
   const gitDir=exec[gitBinding]?.dir;
   if(discovery.code!==0)throw new Error('No base capabilities');
   const caps=JSON.parse(protocolText(discovery.stdout,8192));
@@ -922,7 +1051,7 @@ async function discoverDelta({cwd,exec,fs,env,host,discovery,fetchBaseManifest,h
     if(selected)break;
   }
   if(!selected)throw lastError;
-  return buildDeltaManifest({cwd,exec,fs,base:selected,head,env,beginSub});
+  return buildDeltaManifest({cwd,exec,fs,base:selected,head,selectedTests,env,beginSub});
 }
 
 // Presync (card 7515): ship a lane's delta leaves to a per-lane Forge cache
@@ -1054,7 +1183,9 @@ export async function runRemote(options={}) {
 
 async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, onRun, log = text=>process.stderr.write(text) } = {}) {
   const fallback = (reason, detail) => ({ mode: 'not-started', terminated: true, reason, detail });
+  argv = normalizeRemoteArgv(argv);
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed');
+  const selectedTests = selectedTestArgs(argv);
   let executionEnv;
   try { executionEnv = filterEnv(env); } catch (error) { return fallback(error.code); }
   const needsGit=argv[2]==='check:standards'||Object.hasOwn(executionEnv,'DIFF_COVERAGE_BASE');
@@ -1115,14 +1246,14 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       // subcommand; their full-ship path retains its existing admission order.
       try {
         if(disableDelta)throw new Error('Full ship selected');
-        delta=await discoverDelta({cwd,exec,fs,env,host,discovery:unwrap(initial[2]),fetchBaseManifest:sha=>ssh('base-manifest',{sha}),head:logicalHead,beginSub});
+        delta=await discoverDelta({cwd,exec,fs,env,host,discovery:unwrap(initial[2]),fetchBaseManifest:sha=>ssh('base-manifest',{sha}),head:logicalHead,selectedTests,beginSub});
         // Warm-leaf assembly recreates mtimes; coverage freshness needs full ship.
         if (delta.entries.some(entry => entry.path.equals(Buffer.from('coverage/coverage-final.json')))) throw new Error('Coverage inputs require full ship');
         manifest=delta;
         if(delta.manifestMode==='full-scan'){manifestReason=manifestFailure(delta.manifestReason);delta=undefined;}
       } catch(error) {manifestReason=manifestFailure(error);delta=undefined;}
 
-      manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead,env,beginSub});
+      manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead,selectedTests,env,beginSub});
       log(`manifest: ${delta ? `git-delta (${delta.changedCount} changed of ${delta.baseCount})` : `full-scan (${manifestReason})`}\n`);
       manifestDone({...(!delta?{manifestReason}:{}),substages:[...substages.values].map(([stage,ms])=>({stage,ms:Math.round(ms)}))});
       // Scanners may skip nonexistent paths. Require the entire requested scope
@@ -1238,7 +1369,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
       if (['coverage-report-not-portable','diff-coverage-base-unavailable'].includes(error.code)) return fallback(error.code);
       if (error.code === 'excluded-source-file') return {mode:'not-started', terminated:true, reason:error.code};
-      return fallback(['ignored-test-file','unshipped-test-file','unshipped-symlink','manifest-worktree-mismatch','manifest-walk-limit','unbound-worktree'].includes(error.code) ? error.code : 'copy-failed',error.detail);
+      return fallback(['ignored-test-file','unshipped-test-file','unshipped-symlink','manifest-worktree-mismatch','manifest-walk-limit','unresolved-test-dependency','unbound-worktree'].includes(error.code) ? error.code : 'copy-failed',error.detail);
     }
     try {
       const runAt=clock(),runDone=begin('forge-run');
@@ -1308,7 +1439,8 @@ export function verifyReceipt(text, expected, code) {
 
 /** Explicit remote CLI request; the shared decision contract owns safe local admission. */
 export async function main(options = {}) {
-  if (!isAllowedCommand(options.argv)) throw new Error('command-not-allowed: use npm run <allowed-task> -- <task-args>');
+  const remoteArgv = normalizeRemoteArgv(options.argv);
+  if (!isAllowedCommand(remoteArgv)) throw new Error('command-not-allowed: use npm run <allowed-task> -- <task-args>');
   // Import at invocation time: heavy-admission's default executor imports us.
   const { runWithRemoteDecision, loadAdmissionPolicy, adaptLegacyRemoteResult } = await import('./heavy-admission.mjs');
   const loaded = loadAdmissionPolicy({env:options.env,checkoutRoot:options.cwd});
@@ -1321,7 +1453,7 @@ export async function main(options = {}) {
     argv:options.argv, cwd:options.cwd, env:options.env, policy,
     timeoutMs:options.timeoutMs, log:options.log,
     host:options.host, readTelemetry:options.readTelemetry, lockRoot:options.lockRoot, clock:options.clock,
-    remoteExec:async decisionOptions=>{const value=await remoteExecutor(decisionOptions);capturedTimings=value?.timings;return value;},
+    remoteExec:async decisionOptions=>{const value=await remoteExecutor({...decisionOptions,argv:remoteArgv});capturedTimings=value?.timings;return value;},
   });
   if(capturedTimings?.length)(options.stderr??(text=>process.stderr.write(text)))(['forge stages (Eastern) | ms | transfer',...capturedTimings.map(t=>`${t.stage} ${t.startedAtET} | ${t.ms}${t.shipMode ? ` | ${t.shipMode} ${t.fileCount} files ${t.bytesSent} bytes${t.presyncClaimed?` presynced ${t.presyncClaimed.count} files ${t.presyncClaimed.bytes} bytes`:''}`:''}${t.substages?.length ? `\n${t.substages.map(s=>`  ${s.stage} | ${s.ms}`).join('\n')}`:''}`)].join('\n')+'\n');
   if (result.handled) return result.exitCode;

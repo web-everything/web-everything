@@ -10,8 +10,46 @@ import { resolve } from 'node:path';
 import { decide } from '../guard-bash.mjs';
 
 const queue = 'node scripts/readiness/heavy-admission.mjs run -- ';
+const bypassRuns = [
+  'node --test scripts/__tests__/a.test.mjs',
+  'node --test',
+  'node --test-reporter=spec --test a.mjs',
+  'npm x vitest run a.test.mjs',
+  'npm x -- vitest run a',
+  'npx tsc --noEmit',
+  'tsc -p .',
+  'npm exec tsc',
+  'node node_modules/typescript/bin/tsc',
+];
 
 describe('heavy-enforce — every direct test run requires admission', () => {
+  it.each(bypassRuns)('denies bypass `%s` with its exact admitted form', (cmd) => {
+    const result = decide(cmd, {});
+    expect(result).toContain('heavy-enforce');
+    expect(result).toContain('`' + queue + cmd + '`');
+  });
+
+  it.each(bypassRuns)('allows admitted bypass `%s`', (cmd) => {
+    expect(decide(queue + cmd, {})).toBeNull();
+  });
+
+  it.each(bypassRuns.flatMap((cmd) => [
+    `echo "${cmd}"`,
+    `grep -F '${cmd}' file`,
+    `git commit -m "document ${cmd}"`,
+    `node -e 'const command = "${cmd}"'`,
+  ]))('allows bypass text as data in `%s`', (cmd) => {
+    expect(decide(cmd, {})).toBeNull();
+  });
+
+  it.each([
+    'node --check scripts/__tests__/a.test.mjs', 'node --version', 'tsc --version',
+    'node --check --test a.mjs', 'node --version --test',
+    'node a.mjs --test', 'node --title --test a.mjs',
+    'node node_modules/typescript/bin/tsc --version', 'npm exec tsc -- --version',
+    'npm run x -- vitest run a.test.mjs',
+  ])('allows non-run `%s`', (cmd) => expect(decide(cmd, {})).toBeNull());
+
   it.each([
     'vitest', 'vitest run', 'vitest related scripts/a.mjs --run', 'vitest watch',
     'vitest a.test.mjs', 'npx vitest run a.test.mjs b.test.mjs',
