@@ -1674,3 +1674,11 @@ it('a truncated paged fallback is refused loudly, never planned as a complete in
   expect(() => defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readCommits: () => [], readShared: () => null,
     listPaged: () => ({ rows, truncated: true, totalCount: 900, cache: {} }), readRest: () => ({ json: {} }) })).toThrow(/truncated/);
 });
+
+it('a truncated shared snapshot is refused loudly too', async () => {
+  const { defaultReadPrs } = await import('../reconcile-pass.mjs');
+  const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
+  const rows = [{ number: 1 }];
+  Object.defineProperty(rows, 'discoveryIncomplete', { value: true });
+  expect(() => defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readShared: () => rows })).toThrow(/truncated/);
+});

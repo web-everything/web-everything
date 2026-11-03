@@ -402,7 +402,10 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
     let viaDirect = false; // the legacy direct list already asks for `author`
     const listed = withListRetry(() => {
       const shared = readShared({ repo, fields: SNAPSHOT_LIST_FIELDS, allowDeferred: true });
-      if (shared) return shared;
+      if (shared) {
+        if (shared.discoveryIncomplete === true) throw Object.assign(new Error(`open-PR snapshot for ${repo} is truncated — refusing a partial inventory`), { code: 'pr-list-truncated' });
+        return shared;
+      }
       if (!usePaged) { viaDirect = true; return direct(); }
       const paged = listPaged({ repo, exec, paging: resolvePrListPaging(), heavyFields: ['comments', 'body', 'files'],
         cache: pagedHeavyCache.get(repo) || {}, maxRows: PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (reconcile page)' } } });

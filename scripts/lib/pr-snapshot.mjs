@@ -99,7 +99,14 @@ function candidateSmokeEnv(env, smokeChild) {
   return effective;
 }
 
+/** A capped snapshot must not read as a complete inventory: carry the flag (non-enumerable) on the projected rows. */
 function smokeProjection(snap, fields, env) {
+  const rows = smokeProjectionRows(snap, fields, env);
+  if (snap?.truncated === true && Array.isArray(rows)) Object.defineProperty(rows, 'discoveryIncomplete', { value: true });
+  return rows;
+}
+
+function smokeProjectionRows(snap, fields, env) {
   const sample = positiveInteger(env[WE_PR_SNAPSHOT_SAMPLE]);
   if (!sample) return projectPrs(snap.prs, fields);
   if (!sampleLogged) {
