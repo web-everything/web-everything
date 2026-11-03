@@ -45,9 +45,18 @@ export const TAKEOVER_REVIEW_ATTEMPTS_MAX = 5;
  * `review.standDownQueueSection` — `needs-you` (built-in) surfaces unresolved needs-judgment questions
  * under NEEDS YOU. `stood-down` keeps the legacy section. Env: WE_REVIEW_STAND_DOWN_QUEUE_SECTION.
  */
-export const BUILT_IN_REVIEW_SETTINGS = Object.freeze({ referralDefault: 'operator', recheckCarriedReferrals: true, autoPolicyRespectsNotReal: true, scopedRereview: 'off', roundBudget: ROUND_BUDGET_OFF,
+/** Audit projection of review-stringency-classified-outcomes. */
+export const RELEASE_STAGES = Object.freeze(['prerelease', 'prod']);
+export const RACE_BLOCK_PATHS = Object.freeze(['scripts/**/file-locks*', 'scripts/*file-locks*',
+  'scripts/**/lease*', 'scripts/*lease*', 'scripts/**/slot*', 'scripts/*slot*',
+  'scripts/**/lock-reaper*', 'scripts/*lock-reaper*', 'scripts/**/lane-pool*', 'scripts/*lane-pool*',
+  'scripts/**/merge*', 'scripts/*merge*', 'scripts/**/drain*', 'scripts/*drain*', 'scripts/**/mq*', 'scripts/*mq*']);
+const parseStage = v => RELEASE_STAGES.includes(v) ? v : 'prod';
+const validPaths = v => Array.isArray(v) && v.length <= 256 && v.every(p => typeof p === 'string' && p.trim().length > 0 && p.length <= 512);
+const parsePaths = v => validPaths(v) ? Object.freeze([...v]) : RACE_BLOCK_PATHS;
+export const BUILT_IN_REVIEW_SETTINGS = Object.freeze({ releaseStage: 'prerelease', raceBlockPaths: RACE_BLOCK_PATHS, referralDefault: 'operator', recheckCarriedReferrals: true, autoPolicyRespectsNotReal: true, scopedRereview: 'off', roundBudget: ROUND_BUDGET_OFF,
   takeoverReviewAttempts: 1, rulingResolvesStandDown: 'on', standDownQueueSection: 'needs-you' });
-export const REVIEW_SETTINGS_ENV = Object.freeze({ referralDefault: 'WE_REVIEW_REFERRAL_DEFAULT', recheckCarriedReferrals: 'WE_REVIEW_RECHECK_CARRIED_REFERRALS',
+export const REVIEW_SETTINGS_ENV = Object.freeze({ releaseStage: 'WE_REVIEW_RELEASE_STAGE', raceBlockPaths: 'WE_REVIEW_RACE_BLOCK_PATHS', referralDefault: 'WE_REVIEW_REFERRAL_DEFAULT', recheckCarriedReferrals: 'WE_REVIEW_RECHECK_CARRIED_REFERRALS',
   autoPolicyRespectsNotReal: 'WE_REVIEW_AUTO_POLICY_RESPECTS_NOT_REAL', scopedRereview: 'WE_REVIEW_SCOPED_REREVIEW',
   roundBudget: 'WE_REVIEW_ROUND_BUDGET', takeoverReviewAttempts: 'WE_REVIEW_TAKEOVER_REVIEW_ATTEMPTS',
   rulingResolvesStandDown: 'WE_REVIEW_RULING_RESOLVES_STAND_DOWN', standDownQueueSection: 'WE_REVIEW_STAND_DOWN_QUEUE_SECTION' });
@@ -58,6 +67,11 @@ const parseBoolean = (v, { fromEnv = false } = {}) => fromEnv
   ? (v === 'true' ? true : v === 'false' ? false : undefined)
   : (typeof v === 'boolean' ? v : undefined);
 const PARSERS = Object.freeze({
+  releaseStage: parseStage,
+  raceBlockPaths: (v, { fromEnv = false } = {}) => {
+    if (!fromEnv) return parsePaths(v);
+    try { return parsePaths(JSON.parse(v)); } catch { return RACE_BLOCK_PATHS; }
+  },
   recheckCarriedReferrals: parseBoolean, autoPolicyRespectsNotReal: parseBoolean,
   ...Object.fromEntries(Object.entries(ALLOWED).map(([key, allowed]) => [key, (v) => (allowed.includes(v) ? v : undefined)])),
   roundBudget: (v, { fromEnv = false } = {}) => {
@@ -78,6 +92,7 @@ export function validateReviewSettings(raw) {
   const config = { ...BUILT_IN_REVIEW_SETTINGS };
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
     for (const [key, parse] of Object.entries(PARSERS)) {
+      if (!Object.hasOwn(raw, key)) continue;
       const value = parse(raw[key]);
       if (value !== undefined) config[key] = value;
     }
@@ -104,17 +119,19 @@ export function resolveReferralSafetySettings({ fileConfig = rawReviewSettings()
 }
 
 /** Env wins over the file; an invalid override keeps the lower layer. */
-export function resolveReviewSettings({ fileConfig = rawReviewSettings(), platform, env = process.env } = {}) {
+export function resolveReviewSettings({ fileConfig = rawReviewSettings(), platform, env = process.env, log } = {}) {
   const values = { ...validateReviewSettings(fileConfig) };
   for (const [key, parse] of Object.entries(PARSERS)) {
+    if (!Object.hasOwn(env ?? {}, REVIEW_SETTINGS_ENV[key])) continue;
     const override = parse(env?.[REVIEW_SETTINGS_ENV[key]], { fromEnv: true });
     if (override !== undefined) values[key] = override;
   }
-  return { ...values, ...resolveReferralSafetySettings({ fileConfig, platform, env }).value };
+  return { ...values, ...resolveReferralSafetySettings({ fileConfig, platform, env }).value, ...resolveAuditSettings({ fileConfig, platform, env, log }).value };
 }
 
 /** Source of the winning valid layer, using raw file data so defaults never masquerade as file values. */
 export function resolveReviewSettingSource(key, { fileRaw, platform, env = process.env } = {}) {
+  if (['releaseStage', 'raceBlockPaths'].includes(key)) return resolveAuditSettings({ fileConfig: fileRaw, platform, env }).sources[key];
   if (REFERRAL_SAFETY_KEYS.includes(key)) return resolveReferralSafetySettings({ fileConfig: fileRaw, platform, env }).sources[key];
   const parse = PARSERS[key];
   if (!parse) throw new Error(`unknown review setting: ${key}`);
@@ -124,4 +141,19 @@ export function resolveReviewSettingSource(key, { fileRaw, platform, env = proce
     catch { fileRaw = null; }
   }
   return parse(fileRaw?.[key]) !== undefined ? 'file' : 'built-in';
+}
+
+/** The trusted running checkout supplies settings; never load them from the candidate diff.
+ * Explicit invalid stages select prod; malformed paths retain built-in protection.
+ */
+export function resolveAuditSettings({ fileConfig = rawReviewSettings(), platform, env = process.env, log } = {}) {
+  const keys = ['releaseStage', 'raceBlockPaths'];
+  const pick = layer => Object.fromEntries(keys.filter(k => Object.hasOwn(layer ?? {}, k)).map(k => [k, PARSERS[k](layer[k])]));
+  const envValues = Object.fromEntries(keys.filter(k => Object.hasOwn(env ?? {}, REVIEW_SETTINGS_ENV[k]))
+    .map(k => [k, PARSERS[k](env[REVIEW_SETTINGS_ENV[k]], { fromEnv: true })]));
+  return cascadePolicy('review', pick(fileConfig), {
+    standard: { releaseStage: 'prerelease', raceBlockPaths: RACE_BLOCK_PATHS },
+    platform: pick(platform === undefined ? platformPreference('review', { env }) : platform), env, envValues, log,
+    valid: { releaseStage: v => RELEASE_STAGES.includes(v), raceBlockPaths: validPaths },
+  });
 }

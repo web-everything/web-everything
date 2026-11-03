@@ -5,6 +5,10 @@ import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 
+import { resolveReviewSettings } from '../lib/review-settings.mjs';
+import { FENCED_DATA_RULE, fenceUntrusted } from '../lib/mandate-fence.mjs';
+import { CANONICAL_QUESTION, parseAuditAnswer } from './codex-audit.mjs';
+
 const DEFAULT_RECORD_PATH = '~/workspace/.operations/coordination/audits.jsonl';
 const SETTINGS = new URL('../settings/prototype-load.json', import.meta.url);
 
@@ -29,7 +33,13 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
     if (result.error || result.status !== 0) throw new Error('audit subprocess failed or exceeded its bound');
     return result.stdout;
   };
-  return {
+  const deps = {
+    settings: () => resolveReviewSettings(),
+    async recheck(finding, { base, head }) {
+      const answer = await deps.runCodex(`${CANONICAL_QUESTION}\nRe-check only the fenced finding against git diff ${base}...${head}. Supply a concrete input/interleaving; if unsupported D1 is advisory after investigation, classify D3 and state the investigation result in trigger. Preserve its id, file and invariant.\n${FENCED_DATA_RULE}\n${fenceUntrusted('findings', JSON.stringify(finding))}`);
+      const checked = parseAuditAnswer(answer);
+      return checked.length === 1 ? checked[0] : null;
+    },
     resolveSha: ref => run('git', ['rev-parse', '--verify', `${ref}^{commit}`], 30_000).trim(),
     runCodex(prompt) {
       const scratch = fs.mkdtempSync(join(scratchRoot, 'codex-audit-'));
@@ -69,4 +79,5 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
     stdout: text => process.stdout.write(text),
     stderr: text => process.stderr.write(text),
   };
+  return deps;
 }
