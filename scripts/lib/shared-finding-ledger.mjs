@@ -118,7 +118,7 @@ export function renderOpenForBrief(ledger, { pinStillHolds } = {}) {
   if (!entries.length) return '';
   const body = entries.map(entry => `key=${entry.key} sources=${entry.sources.join(',')} status=${entry.status}\n`
     + [entry.finding, ...(entry.variants ?? [])].map(f => `${f.file ?? ''}:${f.line ?? ''} ${f.summary}`
-      + ['verdict', 'impactIfUnfixed', 'quote', 'failure_scenario', 'reproCommand'].filter(k => f[k]).map(k => `\n  ${k}: ${f[k]}`).join('')).join('\n')).join('\n\n');
+      + Object.keys(f).filter(k => !['file', 'line', 'summary', 'category'].includes(k) && f[k] !== undefined && f[k] !== '').sort().map(k => `\n  ${k}: ${typeof f[k] === 'string' ? f[k] : JSON.stringify(f[k])}`).join('')).join('\n')).join('\n\n');
   return `${FENCED_DATA_RULE}\n\n${fenceUntrusted('findings', `Shared finding ledger DATA:\n${body}`)}`;
 }
 

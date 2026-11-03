@@ -433,3 +433,11 @@ describe('audit round 15 hardening', () => {
     expect(filterReraises(l, [finding({ preventionCaptured: true, category: 'security' })], { pinStillHolds: () => true }).dropped).toHaveLength(1);
   });
 });
+
+describe('audit round 16 hardening', () => {
+  it('the brief renders every evidence field incl. prevention', () => {
+    const a = finding({ preventionCaptured: true, rootCause: 'missing guard', prevention: 'add test' });
+    const brief = renderOpenForBrief(record(emptyLedger(), [a]));
+    for (const t of ['preventionCaptured: true', 'rootCause: missing guard', 'prevention: add test']) expect(brief).toContain(t);
+  });
+});
