@@ -40,7 +40,7 @@ function fixture() {
   const state = mktemp('we-overlay-rr-state-');
   // gh stub: no PR heads any ref; every other GitHub question fails (fails closed in the planner).
   const bin = mktemp('we-overlay-rr-gh-');
-  writeFileSync(join(bin, 'gh'), '#!/bin/sh\nif [ "$1 $2" = "pr list" ]; then echo "[]"; exit 0; fi\nif [ "$1 $2" = "repo view" ]; then echo web-everything/web-everything; exit 0; fi\nexit 1\n', { mode: 0o755 });
+  writeFileSync(join(bin, 'gh'), '#!/bin/sh\nif [ "$1 $2" = "pr list" ]; then echo "[]"; exit 0; fi\nif [ "$1 $2" = "repo view" ]; then echo \'{"nameWithOwner":"web-everything/web-everything","url":"https://github.com/web-everything/web-everything"}\'; exit 0; fi\nexit 1\n', { mode: 0o755 });
   const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, WE_DAEMON_OVERLAY_DIR: state, WE_DAEMON_OVERLAY_STACK_BASES: '{}', WE_OVERLAY_NO_PR: 'warn' };
   /** Commit `file` on `ref` (starting from `from`) and push it; returns the new tip. */
   const push = (ref, file, content, from = 'origin/main') => {
@@ -68,7 +68,7 @@ function fixture() {
     return JSON.parse(readFileSync(join(state, name), 'utf8')).overlays.find((o) => o.ref === ref);
   };
   /** Replace the gh stub: `prs` is what every `pr list` answers; `repo view` still names the repo. */
-  const ghPrs = (prs) => writeFileSync(join(bin, 'gh'), `#!/bin/sh\nif [ "$1 $2" = "pr list" ]; then echo '${JSON.stringify(prs)}'; exit 0; fi\nif [ "$1 $2" = "repo view" ]; then echo web-everything/web-everything; exit 0; fi\nexit 1\n`, { mode: 0o755 });
+  const ghPrs = (prs) => writeFileSync(join(bin, 'gh'), `#!/bin/sh\nif [ "$1 $2" = "pr list" ]; then echo '${JSON.stringify(prs)}'; exit 0; fi\nif [ "$1 $2" = "repo view" ]; then echo '{"nameWithOwner":"web-everything/web-everything","url":"https://github.com/web-everything/web-everything"}'; exit 0; fi\nexit 1\n`, { mode: 0o755 });
   /** Squash-merge: main gets the same content in a NEW commit, then the branch is deleted. Returns the main commit. */
   const squash = (ref, file, content) => {
     gitOk(author, ['fetch', '-q', 'origin']);
@@ -442,12 +442,12 @@ describe('inferPrNumber origin identity and incomplete evidence', () => {
   const originUrl = 'git@github.com:web-everything/web-everything.git';
   const sameRepo = { number: 9, headRefName: 'lane/known',
     headRepository: { nameWithOwner: 'web-everything/web-everything' }, isCrossRepository: false };
-  function infer(prs, { repo = 'web-everything/web-everything', originStatus = 0, listStatus = 0, repoStatus = 0, raw } = {}) {
+  function infer(prs, { repo = 'web-everything/web-everything', host = 'github.com', originStatus = 0, listStatus = 0, repoStatus = 0, raw } = {}) {
     const calls = [];
     const value = inferPrNumber({ root: '/unused', ref: 'lane/known', env: {}, run: (cmd, args) => {
       calls.push([cmd, ...args]);
       if (cmd === 'git') return { status: originStatus, stdout: originUrl };
-      if (args[0] === 'repo') return { status: repoStatus, stdout: repo };
+      if (args[0] === 'repo') return { status: repoStatus, stdout: JSON.stringify({ nameWithOwner: repo, url: `https://${host}/${repo}` }) };
       return { status: listStatus, stdout: raw ?? JSON.stringify(prs) };
     } });
     return { value, calls };
@@ -457,8 +457,15 @@ describe('inferPrNumber origin identity and incomplete evidence', () => {
     const { value, calls } = infer([sameRepo]);
     expect(value).toBe(9);
     expect(calls[0]).toEqual(['git', 'remote', 'get-url', 'origin']);
-    expect(calls[1]).toEqual(['gh', 'repo', 'view', originUrl, '--json', 'nameWithOwner', '--jq', '.nameWithOwner']);
+    expect(calls[1]).toEqual(['gh', 'repo', 'view', originUrl, '--json', 'nameWithOwner,url']);
+    expect(calls[2][calls[2].indexOf('--repo') + 1]).toBe('github.com/web-everything/web-everything');
     expect(calls[2][calls[2].indexOf('--json') + 1].split(',')).toEqual(expect.arrayContaining(['headRepository', 'isCrossRepository']));
+  });
+
+  it('keeps the resolved origin host in inferred PR reads', () => {
+    const { value, calls } = infer([sameRepo], { host: 'enterprise.example' });
+    expect(value).toBe(9);
+    expect(calls[2][calls[2].indexOf('--repo') + 1]).toBe('enterprise.example/web-everything/web-everything');
   });
 
   it.each([

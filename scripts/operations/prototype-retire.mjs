@@ -23,6 +23,31 @@ import { parseSupersedes, isTrustedSupersedeAuthor, isBodyEditedAfterMergeByUntr
 const SHA = /^[a-f0-9]{40}$/;
 const lines = (text) => String(text || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 
+/** Bind evidence to origin's repository AND host, regardless of GH_REPO, GH_HOST or gh's defaults. */
+export function resolveOriginRepository({ git, gh }) {
+  const unknown = { repo: '', gh: () => ({ code: 1, stdout: '' }) };
+  try {
+    const origin = git(['remote', 'get-url', 'origin']);
+    const url = String(origin.stdout || '').trim();
+    if (origin.code !== 0 || !url || url.startsWith('-') || /[\r\n\0]/.test(url)) return unknown;
+    const result = ghJson(gh, ['repo', 'view', url, '--json', 'nameWithOwner,url']);
+    const repo = result.value?.nameWithOwner;
+    if (!result.ok || typeof repo !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(repo)) return unknown;
+    const page = new URL(result.value.url);
+    if (page.protocol !== 'https:' || page.username || page.password || page.search || page.hash
+      || page.pathname.toLowerCase() !== `/${repo}`.toLowerCase()) return unknown;
+    const boundGh = (args) => {
+      if (args[0] === 'api') return gh([...args, '--hostname', page.host]);
+      const index = args.indexOf('--repo');
+      if (index < 0) return { code: 1, stdout: '' };
+      const bound = [...args];
+      bound[index + 1] = `${page.host}/${repo}`;
+      return gh(bound);
+    };
+    return { repo, gh: boundGh };
+  } catch { return unknown; }
+}
+
 /** Use the same visible declaration target list as the conveyor; code and trailing prose confer no authority. */
 export function declaresSupersedes(body, pr) {
   if (!Number.isInteger(pr)) return false;

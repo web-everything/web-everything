@@ -19,7 +19,7 @@ import { cloneKey } from '../lib/daemon-overlays.mjs';
 import { clearPendingAdoption, recordPendingAdoption, OVERLAY_ADOPTION_MAX_PENDING, OVERLAY_ADOPTION_TTL_MS } from '../lib/overlay-adoption.mjs';
 import { isGraphSourceFile, isVitestTestFile } from '../lib/related-test-selection.mjs';
 import { safeRef, safeRegistrationRef, validSha, jsonLines, readyEvidence, canonicalAuditEvidence, changedPaths, comparePaths, nextMergeRef, refusal } from './prototype-load.mjs';
-import { planRetirements, planFetchFailed } from './prototype-retire.mjs';
+import { planRetirements, planFetchFailed, resolveOriginRepository } from './prototype-retire.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
 // Per-test, hook and teardown bounds mitigate a shell-backed runner outliving its wrapper.
@@ -171,12 +171,11 @@ async function defaultCombinedTest({ clone, candidateSha, refs }, { exec, fs, en
 function defaultRetirePlanner({ rows, git, gh }) {
   const fetched = rows.filter((row) => git(['fetch', 'origin', `+refs/heads/${row.ref}:refs/remotes/origin/${row.ref}`]).code === 0);
   const unfetchedRows = rows.filter((row) => !fetched.includes(row));
-  const repoName = gh(['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner']);
-  const repo = repoName.code === 0 ? repoName.stdout.trim() : '';
+  const { repo, gh: originGh } = resolveOriginRepository({ git, gh });
   // A merged PR whose branch is gone cannot be fetched: look its state up instead of keeping it forever (fails closed).
-  const unfetched = unfetchedRows.map((row) => planFetchFailed({ row, git, gh, repo }));
+  const unfetched = unfetchedRows.map((row) => planFetchFailed({ row, git, gh: originGh, repo }));
   if (!fetched.length) return unfetched;
-  return [...planRetirements({ rows: fetched, git, gh, repo }), ...unfetched];
+  return [...planRetirements({ rows: fetched, git, gh: originGh, repo }), ...unfetched];
 }
 
 /** The sole real IO binding; constructing an injected loader performs no ambient reads. */
