@@ -1700,6 +1700,14 @@ describe('direct (snapshot-disabled) list path: retried and truncation-safe', ()
       retryOpts: { sleep: () => {}, persist: false, onEvent: () => {} } })).toThrow(/cap — refusing/);
     expect(n).toBe(2);
   }));
+  it('valid JSON that is not an array is a failure, never an empty inventory', () => withDisabled(async () => {
+    const { defaultReadPrs } = await import('../reconcile-pass.mjs');
+    const { execFileSync } = await import('node:child_process');
+    const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
+    execFileSync.mockReset().mockReturnValue(JSON.stringify({ message: 'oops' }));
+    expect(() => defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readCommits: () => [], readShared: () => null,
+      retryOpts: { sleep: () => {}, persist: false, onEvent: () => {} } })).toThrow(/not a list/);
+  }));
   it('returns a normal listing after a retried 504', () => withDisabled(async () => {
     const { defaultReadPrs } = await import('../reconcile-pass.mjs');
     const { execFileSync } = await import('node:child_process');

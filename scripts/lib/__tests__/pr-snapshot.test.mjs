@@ -192,6 +192,16 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
     expect(readSharedOpenPrs(opts({ fields: 'reviewDecision', exec }))).toEqual(PRS.map(p => ({ reviewDecision: p.reviewDecision })));
   });
 
+  it('a WE_PR_SNAPSHOT_SAMPLE subset is flagged discoveryIncomplete so reconcile cannot plan it as complete', () => {
+    const { exec } = fakeExec();
+    const rows = readSharedOpenPrs(opts({ fields: 'number', exec, env: { VITEST: '1', WE_PR_SNAPSHOT_SAMPLE: '1' } }));
+    expect(rows.length).toBe(1);
+    expect(PRS.length).toBeGreaterThan(1);
+    expect(rows.discoveryIncomplete).toBe(true);
+    const whole = readSharedOpenPrs(opts({ fields: 'number', exec }));
+    expect(whole.discoveryIncomplete).toBeUndefined();
+  });
+
   it.each([false, true])('failed pages never publish or update a snapshot (previous=%s)', previous => {
     const many = Array.from({ length: 21 }, (_, i) => ({ ...PRS[0], number: i }));
     const fake = fakeExec(many);

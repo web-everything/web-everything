@@ -397,7 +397,8 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
     const parsed = JSON.parse(String(out || '[]'));
     // A full page means the inventory may be capped: refuse it rather than plan as if the overflow did not exist.
     if (Array.isArray(parsed) && parsed.length >= PR_LIST_LIMIT) throw Object.assign(new Error(`open-PR list${repo ? ` for ${repo}` : ''} hit the ${PR_LIST_LIMIT} cap — refusing a possibly partial inventory`), { code: 'pr-list-truncated' });
-    return Array.isArray(parsed) ? parsed : [];
+    if (!Array.isArray(parsed)) throw Object.assign(new Error(`open-PR list${repo ? ` for ${repo}` : ''} was not a list — refusing to read it as an empty inventory`), { code: 'pr-list-malformed' });
+    return parsed;
   };
   if (exec === execFileSyncThrottled && repo) {
     const usePaged = prSnapshotEnabled(process.env) || listPaged !== listOpenPrsPagedHydrated;
