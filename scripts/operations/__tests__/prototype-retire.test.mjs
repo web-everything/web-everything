@@ -330,7 +330,8 @@ describe('planFetchFailed (registration whose branch could not be fetched)', () 
     if (fail || args[0] !== 'pr' || args[1] !== 'list') return { code: 1, stdout: '' };
     return { code: 0, stdout: JSON.stringify(prs) };
   };
-  const merged = (head, extra = {}) => ({ number: 7, state: 'MERGED', headRefName: 'lane/gone', headRefOid: head, mergeCommit: { oid: head }, ...extra });
+  const merged = (head, extra = {}) => ({ number: 7, state: 'MERGED', headRefName: 'lane/gone', headRefOid: head,
+    headRepository: { nameWithOwner: REPO }, isCrossRepository: false, mergeCommit: { oid: head }, ...extra });
   const run = (r, gh, row = { ref: 'lane/gone' }) => planFetchFailed({ row, git: r.git, gh, repo: REPO });
   const withMain = () => { const r = repo(); r.setRemote('main', r.ok('rev-parse', 'HEAD')); return r; };
 

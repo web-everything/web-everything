@@ -296,7 +296,7 @@ export function proveRetirement({ root, entry, env = process.env, run = spawnSyn
 
 /**
  * A squash merge leaves the branch tip off main and (after deletion) unfetchable, so the ancestry proof cannot see it.
- * Prove it from GitHub instead: the ref is absent on origin, exactly ONE merged PR headed it, that PR's head commit is
+ * Prove it from GitHub instead: the ref is absent on origin, exactly ONE merged PR headed it in the origin repository, its head commit is
  * the tip, and its merge commit is an ancestor of origin/main. Any missing, unreadable or ambiguous answer returns null.
  * @returns {{ref:string, action:'retire', reason:'pr-squash-merged', tip:string, pr:number, evidence:object}|null}
  */
@@ -307,7 +307,7 @@ export function proveSquashMerged({ root, entry, env = process.env, run = spawnS
   const repo = gh(['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner']);
   const slug = repo.code === 0 ? repo.stdout.trim() : '';
   if (!/^[\w.-]+\/[\w.-]+$/.test(slug)) return null;
-  const list = gh(['pr', 'list', '--repo', slug, '--head', entry.ref, '--state', 'merged', '--json', 'number,state,headRefName,headRefOid,mergeCommit', '--limit', '10']);
+  const list = gh(['pr', 'list', '--repo', slug, '--head', entry.ref, '--state', 'merged', '--json', 'number,state,headRefName,headRefOid,mergeCommit,headRepository,isCrossRepository', '--limit', '10']);
   if (list.code !== 0) return null;
   let prs;
   try { prs = JSON.parse(list.stdout || 'null'); } catch { return null; }
@@ -315,6 +315,8 @@ export function proveSquashMerged({ root, entry, env = process.env, run = spawnS
   const hits = prs.filter((p) => p?.headRefName === entry.ref && p?.state === 'MERGED');
   if (hits.length !== 1) return null;
   const [pr] = hits;
+  if (pr.isCrossRepository !== false || typeof pr.headRepository?.nameWithOwner !== 'string'
+    || pr.headRepository.nameWithOwner.toLowerCase() !== slug.toLowerCase()) return null;
   if (Number.isInteger(entry.pr) && entry.pr !== pr.number) return null;
   const tip = String(pr.headRefOid ?? '');
   const mergeOid = String(pr.mergeCommit?.oid ?? '');

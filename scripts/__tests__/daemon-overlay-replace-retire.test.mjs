@@ -280,7 +280,8 @@ describe('daemon-overlay.mjs retire', () => {
 });
 
 describe('daemon-overlay.mjs retire of a squash-merged, deleted branch', () => {
-  const merged = (ref, tip, mergeOid, n = 7) => ({ number: n, state: 'MERGED', headRefName: ref, headRefOid: tip, mergeCommit: { oid: mergeOid } });
+  const merged = (ref, tip, mergeOid, n = 7) => ({ number: n, state: 'MERGED', headRefName: ref, headRefOid: tip,
+    headRepository: { nameWithOwner: 'web-everything/web-everything' }, isCrossRepository: false, mergeCommit: { oid: mergeOid } });
   const setup = () => {
     const f = fixture();
     const tip = f.push('lane/sq', 'a.txt', 'squashed\n');
@@ -298,6 +299,21 @@ describe('daemon-overlay.mjs retire of a squash-merged, deleted branch', () => {
     expect(JSON.parse(r.stdout)).toMatchObject({ retired: true, reason: 'pr-squash-merged' });
     expect(f.list()).toEqual([]);
     expect(f.events().at(-1)).toMatchObject({ kind: 'auto-retired', ref: 'lane/sq', tip });
+  });
+
+  it('keeps an unmerged deleted origin registration when a same-named fork PR merged', () => {
+    const f = fixture();
+    const tip = f.push('lane/sq', 'unique.txt', 'unmerged origin work\n');
+    expect(f.run(['add', '--ref=lane/sq']).status).toBe(0);
+    const mergeOid = gitOk(f.author, ['rev-parse', 'origin/main']);
+    gitOk(f.author, ['push', '-q', 'origin', ':refs/heads/lane/sq']);
+    f.ghPrs([{ ...merged('lane/sq', tip, mergeOid), isCrossRepository: true,
+      headRepository: { nameWithOwner: 'contributor/web-everything' } }]);
+    const r = retire(f, tip);
+    expect(r.status, r.stderr).toBe(3);
+    expect(JSON.parse(r.stdout)).toMatchObject({ retired: false, refused: 'not-proved' });
+    expect(f.list()).toEqual(['lane/sq']);
+    expect(f.events().some((event) => event.kind === 'auto-retired')).toBe(false);
   });
 
   it('restores the registration when the branch is recreated at the proved tip before the drop', async () => {

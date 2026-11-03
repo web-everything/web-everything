@@ -173,7 +173,7 @@ export function planRetirements({ rows, git, gh, repo, mainRef = 'origin/main' }
 
 /**
  * A registration whose branch could not be fetched (usually deleted after its PR merged). Retire it only when GitHub
- * names exactly ONE MERGED PR headed by the ref (matching a recorded PR number) and that PR's merge commit is an
+ * names exactly ONE MERGED PR headed by the ref in the origin repository (matching a recorded PR number) and its merge commit is an
  * ancestor of `mainRef`. The overlay CLI re-proves the same facts before it drops anything. Any unreadable,
  * ambiguous or missing answer keeps the row as `fetch-failed`.
  */
@@ -181,11 +181,13 @@ export function planFetchFailed({ row, git, gh, repo, mainRef = 'origin/main' })
   const keep = { ref: row.ref, action: 'keep', reason: 'fetch-failed' };
   if (row.edgeResolution || !/^[\w.-]+\/[\w.-]+$/.test(String(repo || ''))) return keep;
   const list = ghJson(gh, ['pr', 'list', '--repo', repo, '--head', row.ref, '--state', 'merged',
-    '--json', 'number,state,headRefName,headRefOid,mergeCommit', '--limit', '10']);
+    '--json', 'number,state,headRefName,headRefOid,mergeCommit,headRepository,isCrossRepository', '--limit', '10']);
   if (!list.ok || !Array.isArray(list.value)) return keep;
   const hits = list.value.filter((pr) => pr?.headRefName === row.ref && pr?.state === 'MERGED');
   if (hits.length !== 1) return keep;
   const [pr] = hits;
+  if (pr.isCrossRepository !== false || typeof pr.headRepository?.nameWithOwner !== 'string'
+    || pr.headRepository.nameWithOwner.toLowerCase() !== String(repo).toLowerCase()) return keep;
   if (Number.isInteger(row.pr) && row.pr !== pr.number) return keep;
   const tip = String(pr.headRefOid ?? '');
   const mergeOid = String(pr.mergeCommit?.oid ?? '');
