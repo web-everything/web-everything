@@ -54,11 +54,18 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
     headSha = head({ repo, pr });
     if (typeof headSha !== 'string' || !headSha.trim()) return { ...reviewCiGate({ headSha }), startAfter: policy.startAfter };
     let checks;
-    const fast = policy.startAfter === 'fast-checks' ? fastChecksFor(policy.fastChecks, repo) : null;
+    const fast = ['fast-checks', 'push'].includes(policy.startAfter) ? fastChecksFor(policy.fastChecks, repo) : null;
     // A repo whose CI does not publish fast checks waits on its own required set, exactly as ci-green does.
     const needsRequired = reviewUsesRequiredChecks(policy, repo);
     let required = { source: 'timing-policy', checks: fast ?? [] };
-    if (needsRequired) required = readRequired({ repo, ttlMs: 0 });
+    if (needsRequired) {
+      try { required = readRequired({ repo, ttlMs: 0 }); }
+      catch (error) {
+        if (policy.startAfter !== 'push') throw error;
+        // Keep reading head-bound checks so a discovery failure cannot hide red CI.
+        required = { source: 'fallback', checks: [] };
+      }
+    }
     else {
       checks = readChecks({ repo, headSha });
       // Early review needs branch-protection discovery only to identify an owner for red CI.
@@ -75,7 +82,7 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
     });
     // Repo-declared requirements are code-reviewed policy, not the last-resort fallback.
     const trustedRequired = ['live', 'cache', 'declared', 'timing-policy'].includes(required?.source) || trustedStale;
-    if (needsRequired && !trustedRequired) {
+    if (needsRequired && !trustedRequired && policy.startAfter !== 'push') {
       return withSource({ allowed: false, headSha, reason: 'untrusted-required-set' });
     }
     checks ??= readChecks({ repo, headSha });

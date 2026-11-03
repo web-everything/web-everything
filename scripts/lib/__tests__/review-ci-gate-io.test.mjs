@@ -5,6 +5,20 @@ import { join } from 'node:path';
 import { getRequiredStatusChecks } from '../required-status-checks.mjs';
 import { readReviewCiGate as readGate, readReviewHead, readReviewChecks, formatReviewCiSkip } from '../review-ci-gate-io.mjs';
 const readReviewCiGate = o => readGate({ policy: { startAfter: 'ci-green' }, ...o });
+it('push requires both fast prerequisites, and discovers required checks for repos with no fast set', () => {
+  const sha = 'a'.repeat(40);
+  const row = name => ({ name, head_sha: sha, status: 'queued', conclusion: null });
+  const io = { repo: 'other/product', pr: 1, readHead: () => sha,
+    readRequired: vi.fn(() => ({ source: 'live', checks: ['test', 'standards'] })) };
+  const policy = { startAfter: 'push', fastChecks: ['standards', 'test'] };
+  expect(readGate({ ...io, policy, readChecks: () => [row('unrelated')] }))
+    .toMatchObject({ allowed: false, reason: 'ci-not-registered', affected: [
+      { name: 'standards', reason: 'missing' }, { name: 'test', reason: 'missing' }] });
+  expect(readGate({ ...io, policy, readChecks: () => [row('standards'), row('test')] })).toMatchObject({ allowed: true });
+  expect(readGate({ ...io, policy: { startAfter: 'push' }, readChecks: () => [row('test')] }))
+    .toMatchObject({ allowed: false, reason: 'ci-not-registered', affected: [{ name: 'standards', reason: 'missing' }] });
+  expect(io.readRequired).toHaveBeenCalledWith({ repo: io.repo, ttlMs: 0 });
+});
 it('logs the shadow opportunity through injected IO and pins early permission to the reread head', () => {
   const sha = 'a'.repeat(40), log = vi.fn();
   const io = { repo: 'other/product', pr: 12, readHead: () => sha,
@@ -49,7 +63,7 @@ it('push waits for any registered CI and the pending bypass ignores unrelated ro
   const io = { repo: 'other/product', pr: 7, readHead: () => headSha,
     readRequired: () => ({ source: 'live', checks: ['test'] }), log: vi.fn() };
   expect(readGate({ ...io, policy: { startAfter: 'push' }, readChecks: () => [] }))
-    .toMatchObject({ allowed: false, reason: 'no-ci-registered' });
+    .toMatchObject({ allowed: false, reason: 'ci-not-registered' });
   for (const startEarly of ['on', 'shadow']) {
     expect(readGate({ ...io, policy: { startAfter: 'ci-green', startEarly },
       readChecks: () => [{ name: 'unrelated', head_sha: headSha, status: 'completed', conclusion: 'success' }] }))
