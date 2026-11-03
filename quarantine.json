@@ -1,14 +1,5 @@
 {
   "version": 1,
-  "entries": [
-    {
-      "test": "scripts/__tests__/verify-lane-revert-red.test.mjs",
-      "brokenSha": "a7ac5089f3921f840e37535a823082505a3703e7",
-      "owner": "card:verify-lane-revert-red-1123",
-      "reason": "R157: scripts/__tests__/verify-lane-revert-red.test.mjs 'enforce turns the same result red; off runs nothing' fails locally on main 42e175fce5 and lanes (2 workers, 19:47/20:23 ET); reds every verify-lane",
-      "addedAt": 1793669049037,
-      "expiresAt": 1793755449037
-    }
-  ],
+  "entries": [],
   "mode": "quarantine"
 }
