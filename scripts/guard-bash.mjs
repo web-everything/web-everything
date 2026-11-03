@@ -5074,10 +5074,13 @@ export function decide(command, ctx = {}) {
       const redirected = shellTokens(seg).some((t) => t.op && /[<>]/.test(t.text));
       const knownOptions = { export: /^-[fnp]+$/, readonly: /^-[aAfp]+$/, declare: /^[-+][aAfFgilnrtuxIp]+$/,
         typeset: /^[-+][aAfFgilnrtuxIp]+$/ }[canonicalWords[0]];
-      const optionEnd = canonicalWords.indexOf('--');
-      const badOption = !!knownOptions && canonicalWords.slice(1, optionEnd < 0 ? undefined : optionEnd)
-        .some((t) => /^[-+]./.test(t) && !knownOptions.test(t));
-      const optionWords = canonicalWords.slice(1, optionEnd < 0 ? undefined : optionEnd).filter((t) => /^[-+]./.test(t));
+      // Bash reads options only up to `--` or the first non-option word; a later dash word is a name.
+      const optionWords = [];
+      for (const word of canonicalWords.slice(1)) {
+        if (word === '--' || !/^[-+]./.test(word)) break;
+        optionWords.push(word);
+      }
+      const badOption = !!knownOptions && optionWords.some((t) => !knownOptions.test(t));
       // `declare`/`typeset` with -p, -f or -F print or list and assign nothing; `export -f` and `readonly -f`
       // name functions, never variables. Bash versions differ on `export -p X=v` / `readonly -p X=v`, so
       // those only add a possible value.

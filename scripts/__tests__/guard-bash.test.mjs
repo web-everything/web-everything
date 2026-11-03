@@ -3778,6 +3778,15 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     },
   );
 
+  it.each(['declare -x GIT_DIR=TARGET -p', 'export GIT_DIR=TARGET -f', 'typeset -x GIT_DIR=TARGET -F', 'export GIT_DIR=TARGET -Q'])(
+    'records an assignment followed by a dash word, which bash reads as a name, not an option: %s', (directive) => {
+      const ctx = { cwd: LANE, daemonCloneRoots: roots };
+      const command = directive.replace('TARGET', `${CLONE}/.git`);
+      expect(decide(`${command}; git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
+      expect(decide(`export GIT_DIR=${LANE}/.git; ${command}; git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
+    },
+  );
+
   it.each(['export -p', 'readonly -p'])('treats version-dependent %s assignments as possible values', (directive) => {
     const ctx = { cwd: LANE, daemonCloneRoots: roots };
     // Bash 3.2 assigns here, so a protected value is recorded; and the earlier value is never erased.
