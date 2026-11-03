@@ -164,7 +164,7 @@ export function isScratchSessionDir(cwd, scratchRoot, realpath = (p) => p) {
  * The prompt a resumed fixer gets: what is new, where its lane is, the brief steps to redo, then every round so far
  * (the last one is this round's findings). Quoted PR text is marked as DATA by the history section itself.
  */
-export function buildRoundResumePrompt({ pr, itemNum = null, round, cap = null, lane, headRefOid, history = '' }) {
+export function buildRoundResumePrompt({ pr, itemNum = null, round, cap = null, lane, headRefOid, history = '', ledgerBrief = '' }) {
   const item = itemNum ? `item #${itemNum}` : 'no backlog item';
   const sha = String(headRefOid ?? '').slice(0, 9);
   // Your own lease counts as holding the lane only while it is live: an expired one may be reclaimed by the pool at
@@ -195,6 +195,7 @@ export function buildRoundResumePrompt({ pr, itemNum = null, round, cap = null, 
     'then steps 2 to 9 (step 1 is the lane above). Answer every finding below, especially any marked as raised again.',
     '',
     history || '(no round history could be read for this PR — read the newest review comments on the PR first)',
+    ...(typeof ledgerBrief === 'string' && ledgerBrief.trim() ? ['', ledgerBrief] : []),
   ].join('\n');
 }
 

@@ -233,3 +233,24 @@ describe('sharedLedgerEnabled — opt in only', () => {
     expect(sharedLedgerEnabled({})).toBe(false);
   });
 });
+
+describe('filterReraises — strict-true proof boundary (fail closed)', () => {
+  const cases = [
+    ['absent callback', undefined],
+    ['false', () => false],
+    ['undefined', () => undefined],
+    ['truthy non-boolean', () => 'yes'],
+    ['Promise result', () => Promise.resolve(true)],
+  ];
+  for (const [name, pinStillHolds] of cases) {
+    it(`keeps a test-pinned re-raise when proof is ${name}`, () => {
+      const out = filterReraises(pinned(), [finding()], { pinStillHolds });
+      expect(out).toEqual({ kept: [finding()], dropped: [] });
+    });
+  }
+  it('literal true suppresses only the matching test-pinned finding, not a merely fixed one', () => {
+    const fixedOnly = markFixed(record(), findingKey(finding()), { head: H2 });
+    expect(filterReraises(fixedOnly, [finding()], { pinStillHolds: () => true }).dropped).toEqual([]);
+    expect(filterReraises(pinned(), [finding()], { pinStillHolds: () => true }).dropped).toEqual([finding()]);
+  });
+});
