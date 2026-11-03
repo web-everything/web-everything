@@ -37,7 +37,7 @@
  * own the `mkdir`/`O_EXCL` boundary and are deliberately tiny so the testable logic stays pure.
  */
 
-import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, statSync, renameSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, statSync, renameSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 
@@ -63,8 +63,8 @@ export function lockIdFor(path) {
 
 /**
  * Tolerant parse of a lock-entry's JSON text → `{ owner, path, pid, heartbeatAt }` or `null`. NEVER
- * throws: a half-written / corrupt entry parses to `null` so the caller treats the lock as absent
- * rather than wedging (a corrupt lock must not be un-reclaimable). `pid` is normalized to a number or
+ * throws: a half-written / corrupt entry parses to `null`; an existing dir with unreadable metadata
+ * must be kept rather than reclaimed on missing evidence. `pid` is normalized to a number or
  * `null` (the PID fast-path is optional metadata, not load-bearing).
  * @param {string} text
  */
@@ -297,31 +297,38 @@ export function releaseLockDir(lockRoot, path) {
  * @param {string} lockRoot
  * @param {string} path
  * @param {{owner:string, heartbeatAt?:string}|null} expected  the entry the caller read (`null` ⇒ an entry-less dir)
+ * @param {{afterRename?: ((tomb:string) => void)|null}} [opts] TEST-ONLY seam between rename and verification.
  * @returns {boolean} whether the expected lock was removed (`false` ⇒ gone already, or someone else's — left standing)
  */
-export function releaseLockDirIf(lockRoot, path, expected) {
+export function releaseLockDirIf(lockRoot, path, expected, { afterRename = null } = {}) {
   const dir = lockDirFor(lockRoot, path);
-  const matchesExpected = (found) => (expected
+  const matchesExpected = (found, location) => (expected
     ? !!found && found.owner === expected.owner && (expected.heartbeatAt == null || found.heartbeatAt === expected.heartbeatAt)
-    : found === null);
+    : found === null && isEntrylessDir(location));
   // Cheap pre-check: a lock that is plainly not the one judged is never moved at all, so the rename window below
   // opens only when the lock looks like the expected one.
   if (!existsSync(dir)) return false;
-  if (!matchesExpected(readLockEntry(lockRoot, path))) return false;
+  if (!matchesExpected(readLockEntry(lockRoot, path), dir)) return false;
   // The tombstone is a SIBLING of the lock root, never inside it: readers that enumerate `lockRoot` must not count it.
   const tomb = `${lockRoot}.gone-${randomBytes(6).toString('hex')}`;
   try { renameSync(dir, tomb); } catch (e) { if (e && (e.code === 'ENOENT')) return false; throw e; }
-  if (matchesExpected(readEntryInDir(tomb))) { rmSync(tomb, { recursive: true, force: true }); return true; }
+  if (typeof afterRename === 'function') afterRename(tomb);
+  if (matchesExpected(readEntryInDir(tomb), tomb)) { rmSync(tomb, { recursive: true, force: true }); return true; }
   // The lock changed hands between the pre-check and the rename: restore it. If someone already re-took the path in
-  // that gap, theirs stands and the displaced tombstone is dropped. This is the one window left (a read-to-rename
-  // gap, not a lease): a rename cannot be made conditional on content, only re-verified after the fact.
-  try { renameSync(tomb, dir); } catch { rmSync(tomb, { recursive: true, force: true }); }
+  // that gap, preserve BOTH locks: the displaced live lock stays as a sibling tombstone for recovery.
+  // Enumeration of lockRoot still excludes it. Failed restoration never authorizes deleting unproved metadata.
+  try { renameSync(tomb, dir); } catch { /* Leave the displaced tombstone intact. */ }
   return false;
 }
 
 /** How long a lock dir may exist without its `lock.json` before it counts as a crashed half-acquire (xaipsbs).
  *  The gap between `mkdir` and the entry write is microseconds; 10s is generous and still recovers a crash. */
 export const ENTRYLESS_LOCK_DIR_GRACE_MS = 10_000;
+
+/** Only an empty directory is evidence of the mkdir/write half-acquire; corrupt metadata is never that case. */
+function isEntrylessDir(dir) {
+  try { return readdirSync(dir).length === 0; } catch { return false; }
+}
 
 /** Wall-clock age of a lock dir, or null when it does not exist. */
 function lockDirAgeMs(lockRoot, path) {
@@ -343,9 +350,11 @@ function lockDirAgeMs(lockRoot, path) {
  *   is knowingly shared across genuinely different real processes (`heavy-admission.mjs`'s lane-path-keyed
  *   slots, #3383); every other consumer's `owner` already uniquely names one process (it embeds the pid),
  *   so this flag would be a no-op for them — left `false` there to keep the change strictly additive.
+ * @param {{reclaimEntryless?:boolean}} [opts] Disable half-acquire recovery when the caller already observed a
+ *   holder: missing metadata then means lost evidence, never a crashed mkdir/write gap.
  * @returns {{ ok: boolean, reason: string, heldBy: string|null }}
  */
-export function reserve(lockRoot, path, owner, nowMs, nowIso, pid = null, pidLiveness = 'unknown', leaseMinutes = DEFAULT_LEASE_MINUTES, meta = null, requireOwnProcess = false) {
+export function reserve(lockRoot, path, owner, nowMs, nowIso, pid = null, pidLiveness = 'unknown', leaseMinutes = DEFAULT_LEASE_MINUTES, meta = null, requireOwnProcess = false, { reclaimEntryless = true } = {}) {
   const entry = makeLockEntry(owner, path, nowIso, pid, meta);
   if (acquireLockDir(lockRoot, path, entry)) return { ok: true, reason: 'free', heldBy: owner };
   const current = readLockEntry(lockRoot, path);
@@ -353,7 +362,7 @@ export function reserve(lockRoot, path, owner, nowMs, nowIso, pid = null, pidLiv
   // loser can read the winner's dir in between and find no entry. Reading that as "free" made the loser
   // DELETE the winner's dir and take it too: two holders of one lock (seen live, two heavy-admission runs
   // started together with cap 1, both ran). A dir with no entry is a winner still writing, unless it is old
-  // enough to be a crash between the two calls; only then is it reclaimable. Wall clock, not `nowMs`: the
+  // enough to be a crash between the two calls AND still empty; only then is it reclaimable. Wall clock, not `nowMs`: the
   // dir's mtime is wall clock too.
   if (!current) {
     const age = lockDirAgeMs(lockRoot, path);
@@ -361,6 +370,7 @@ export function reserve(lockRoot, path, owner, nowMs, nowIso, pid = null, pidLiv
       if (acquireLockDir(lockRoot, path, entry)) return { ok: true, reason: 'free', heldBy: owner };
       return { ok: false, reason: 'held', heldBy: null };
     }
+    if (!reclaimEntryless || !isEntrylessDir(lockDirFor(lockRoot, path))) return { ok: false, reason: 'held', heldBy: null };
     if (age < ENTRYLESS_LOCK_DIR_GRACE_MS) return { ok: false, reason: 'initializing', heldBy: null };
   }
   // `pidLiveness` may be a probe `(entry) => 'dead'|'alive'|'unknown'`, run against THIS read — so the verdict

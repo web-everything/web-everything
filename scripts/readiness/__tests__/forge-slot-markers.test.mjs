@@ -380,6 +380,24 @@ describe('dead remote slot locks', () => {
     expect(f.reap()).toEqual([]);
     expect(existsSync(f.file)).toBe(true);
   });
+  it.each(['missing', 'corrupt', 'unreadable'])('keeps metadata that becomes %s after the first liveness probe', kind => {
+    const f = fixture();
+    let probes = 0;
+    expect(f.reap({liveness: () => {
+      probes++;
+      rmSync(f.file);
+      if (kind === 'corrupt') writeFileSync(f.file, '{');
+      if (kind === 'unreadable') mkdirSync(f.file);
+      const old = (Date.now() - 60_000) / 1000;
+      utimesSync(f.dir, old, old);
+      return 'dead';
+    }})).toEqual([]);
+    expect(probes).toBe(1);
+    expect(existsSync(f.dir)).toBe(true);
+    if (kind === 'missing') expect(existsSync(f.file)).toBe(false);
+    if (kind === 'corrupt') expect(readFileSync(f.file, 'utf8')).toBe('{');
+    if (kind === 'unreadable') expect(readdirSync(f.file)).toEqual([]);
+  });
   it('keeps a lock retaken during the liveness probe', () => {
     const f = fixture();
     expect(f.reap({liveness: () => {

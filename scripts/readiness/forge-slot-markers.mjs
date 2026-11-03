@@ -46,7 +46,9 @@ export function reapDeadSlotLocks({root, host, clock = Date.now, liveness = prob
         }
         return dead ? 'dead' : 'unknown';
       };
-      if (!reserve(root, entry.path, reaperOwner, nowMs, nowIso, selfPid, pidLivenessFn, ttlMs / 60000, null, true).ok) continue;
+      // We already observed a holder. Missing metadata now is lost evidence, never a half-acquire to recover.
+      if (!reserve(root, entry.path, reaperOwner, nowMs, nowIso, selfPid, pidLivenessFn, ttlMs / 60000, null, true,
+        {reclaimEntryless: false}).ok) continue;
       const ourEntry = makeLockEntry(reaperOwner, entry.path, nowIso, selfPid);
       if (!releaseLockDirIf(root, entry.path, ourEntry)) continue;
       reaped.push(entry.path);
