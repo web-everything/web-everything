@@ -273,13 +273,47 @@ describe('per-PR enqueue claims', () => {
   });
 });
 
+describe('shared enqueue claim wiring', () => {
+  const source = readFileSync(join(process.cwd(), 'scripts/merge-ai-prs.mjs'), 'utf8');
+  const start = source.indexOf('  function enqueueWithSameHeadGuard(');
+  const end = source.indexOf('\n  }', start) + '\n  }'.length;
+  const helper = source.slice(start, end);
+
+  it('keeps the only strategy enqueue inside the shared helper', () => {
+    expect(helper.match(/mergeStrategy\.enqueue\(/g)).toHaveLength(1);
+    expect(source.slice(0, start) + source.slice(end)).not.toMatch(/mergeStrategy\.enqueue\(/);
+  });
+
+  it('takes the identity claim after the same-head guard', () => {
+    expect(helper).toMatch(/withSerialEnqueueClaim\(enqueueClaims,\s*\{ repo: c\.repo \?\? localSlug, num: c\.num, headSha: sha \}/);
+    expect(helper.indexOf('mqSameHeadGuard(')).toBeLessThan(helper.indexOf('withSerialEnqueueClaim('));
+    expect(helper.indexOf('withSerialEnqueueClaim(')).toBeLessThan(helper.indexOf('mergeStrategy.enqueue('));
+  });
+
+  it('creates the claim store beside the helper without a JSON or dry-run gate', () => {
+    const initStart = source.indexOf('  let enqueueClaims;');
+    const init = source.slice(initStart, start);
+    expect(initStart).toBeGreaterThan(-1);
+    expect(init).toContain('try { enqueueClaims = createEnqueueClaims(); }');
+    expect(init).not.toMatch(/AS_JSON|DRY_RUN/);
+    expect(source.match(/createEnqueueClaims\(\)/g)).toHaveLength(1);
+  });
+
+  it('both enqueue sites call the shared helper directly', () => {
+    expect(source).toMatch(/enqueue:\s*\(c, sha, entry\) => enqueueWithSameHeadGuard\(c, sha,/);
+    expect(source).toMatch(/if \(mergeStrategy\.enqueues\(c\.repo\)\) return enqueueWithSameHeadGuard\(c, traceHeadSha,/);
+  });
+
+
+});
+
 describe('serial enqueue claim diagnostics', () => {
   const warning = op => `drain-enqueue-claim: ${op} failed for owner/repo#7@head-a: broken storage — proceeding fail-open\n`;
 
   it('warns on initialization failure at the serial call site and leaves claims disabled', () => {
     const source = readFileSync(join(process.cwd(), 'scripts/merge-ai-prs.mjs'), 'utf8');
     const start = source.indexOf('try { enqueueClaims = createEnqueueClaims(); }');
-    const end = source.indexOf('    try {\n      asyncShadow', start);
+    const end = source.indexOf('\n  function enqueueWithSameHeadGuard(', start);
     expect(start).toBeGreaterThan(-1); expect(end).toBeGreaterThan(start);
     const stderr = { write: vi.fn() };
     const initialize = new Function('createEnqueueClaims', 'process', `let enqueueClaims; ${source.slice(start, end)}; return enqueueClaims;`);

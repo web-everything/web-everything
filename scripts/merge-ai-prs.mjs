@@ -4821,12 +4821,17 @@ async function runCli() {
   const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, isMainFix,
     withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }), primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: process.env.WE_PRIMARY }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
+  let enqueueClaims;
+  try { enqueueClaims = createEnqueueClaims(); } catch (error) {
+    const message = String(error?.message ?? error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
+    process.stderr.write(`drain-enqueue-claim: initialization failed: ${message} — proceeding fail-open\n`);
+  }
   function enqueueWithSameHeadGuard(c, sha, options) {
     // Live manual retries pass the guard and retain the strategy's already-queued bookkeeping.
     const guard = mqSameHeadGuard({ repo: c.repo ?? localSlug, pr: c.num, head: sha,
       log: line => process.stderr.write(`${line}\n`) });
     if (guard.hold) return { enqueued: false, kind: 'mq-same-head-failed', reason: guard.line };
-    return mergeStrategy.enqueue(c, sha, options);
+    return withSerialEnqueueClaim(enqueueClaims, { repo: c.repo ?? localSlug, num: c.num, headSha: sha }, () => mergeStrategy.enqueue(c, sha, options));
   }
   // xym8nt4 — post-approval card grouping: sources of a combined card PR are held; groups form/reconcile after each pass.
   const cardGrouping = createCardGrouping({ localSlug, dryRun: DRY_RUN, isMainFix, requiredCheck: REQUIRED, prestage: (c, sha) => mergeStrategy.prestage(c, sha),
@@ -6675,12 +6680,7 @@ async function runCli() {
   };
   const toMerge = verdicts.filter((v) => v.decision === 'merge' && !v.prestagePendingCi); // @merge-gate-exempt the FINAL set actually merged; a held PR is `decision:'skip'` and MUST be excluded here — this is the hard AND that never lands a held PR
   let asyncShadow;
-  let enqueueClaims;
   if (!AS_JSON && !DRY_RUN) {
-    try { enqueueClaims = createEnqueueClaims(); } catch (error) {
-      const message = String(error?.message ?? error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
-      process.stderr.write(`drain-enqueue-claim: initialization failed: ${message} — proceeding fail-open\n`);
-    }
     try {
       asyncShadow = createAsyncShadow();
       // A dependency-held candidate may not have reached ready ordering. Never trigger a label read for telemetry.
@@ -7192,7 +7192,7 @@ async function runCli() {
             // xym8nt4 — re-check group ownership under the mutex: a group may have claimed this PR since the pre-pass hold.
             const groupHeld = cardGrouping.holdFor(c);
             if (groupHeld) return { skipped: 'card-group-hold', reason: groupHeld.reason };
-            if (mergeStrategy.enqueues(c.repo)) return withSerialEnqueueClaim(enqueueClaims, { repo: c.repo || localSlug, num: c.num, headSha: traceHeadSha }, () => { return enqueueWithSameHeadGuard(c, traceHeadSha, { comments: preread.read ? preread.comments : null }); }); // xtpxusq — never the merge API; throws on failure
+            if (mergeStrategy.enqueues(c.repo)) return enqueueWithSameHeadGuard(c, traceHeadSha, { comments: preread.read ? preread.comments : null }); // xtpxusq — never the merge API; throws on failure
             // x2e120n — the actual `gh pr merge` round-trip, timed on its own (a sub-component of the wider
             // "mergeCascade" step below, which also covers the pre-merge stamps/retarget for every candidate).
             __t.time('mergeCall', () => mergePr({ pr: c.num, repo: c.repo, method: 'merge', matchHeadCommit: traceHeadSha, caller: 'drain' }));
