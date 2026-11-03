@@ -34,7 +34,8 @@
  *
  *   IMPURE (git, fs) — every side effect is injectable.
  */
-import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync, writeFileSync, renameSync, mkdirSync, unlinkSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { RED_MAIN_HOLD_SETTINGS_FILE, redMainSignal } from './red-main-hold.mjs';
@@ -360,6 +361,46 @@ const LKG_DEFAULT_MINUTES = 2;
 const LKG_MAX_MINUTES = 2; // upper bound: a setting can never turn the cache into a long freeze bypass
 const lkgMemory = new Map(); // per drain process; the disk copy below survives a restart
 
+/** Cache paths are local authority: never trust another user's temp file, or repair its permissions/ownership. */
+function trustedLkgDirectory(file, create = false) {
+  const uid = process.getuid?.();
+  if (!Number.isInteger(uid) || constants.O_NOFOLLOW === undefined) throw new Error('cache ownership cannot be verified');
+  const dir = dirname(file);
+  if (create) mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const stat = lstatSync(dir);
+  if (!stat.isDirectory() || stat.uid !== uid || (stat.mode & 0o022) !== 0) throw new Error('untrusted cache directory');
+  return uid;
+}
+
+function readLkgDisk(file) {
+  let fd;
+  try {
+    const uid = trustedLkgDirectory(file);
+    // Validate the opened inode, not a path checked before open. NONBLOCK also prevents a planted FIFO hanging the drain.
+    fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.uid !== uid || (stat.mode & 0o022) !== 0 || stat.nlink !== 1 || stat.size > 64 * 1024) return null;
+    // A cache is only a small freeze doc; bound even a file that grows after fstat.
+    const buf = Buffer.alloc(64 * 1024 + 1);
+    const size = readSync(fd, buf, 0, buf.length, 0);
+    if (size !== stat.size || size === buf.length) return null;
+    return JSON.parse(buf.subarray(0, size).toString('utf8'));
+  } catch { return null; } // Untrusted or unavailable disk evidence never clears a freeze.
+  finally { if (fd !== undefined) closeSync(fd); }
+}
+
+function writeLkgDisk(file, rec) {
+  let tmp;
+  try {
+    trustedLkgDirectory(file, true);
+    const candidate = `${file}.${process.pid}.${randomUUID()}.tmp`;
+    writeFileSync(candidate, JSON.stringify(rec), { mode: 0o600, flag: 'wx' });
+    tmp = candidate; // Only unlink files created by this invocation.
+    renameSync(tmp, file);
+  } catch { /* Persistence is best-effort; a verified live read remains in memory. */ }
+  finally { if (tmp) { try { unlinkSync(tmp); } catch { /* renamed or unavailable */ } } }
+}
+
 /**
  * Drain-side shared-freeze read: a git TIMEOUT is retried (at most {@link LKG_RETRIES}, backoff) and, if it persists, a FRESH
  * last-known-good "not frozen" read (younger than WE_DRAIN_RED_MAIN_FREEZE_LKG_MINUTES, default 2, capped at 2; 0 = off) stands in.
@@ -368,7 +409,7 @@ const lkgMemory = new Map(); // per drain process; the disk copy below survives 
 function readSharedWithFallback({ readShared, env, stderr, lkg = {} }) {
   const now = lkg.now ?? Date.now;
   const sleepSync = lkg.sleepSync ?? (ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms));
-  const file = lkg.file ?? env.WE_RED_MAIN_FREEZE_LKG_FILE ?? resolve(tmpdir(), 'we-red-main-freeze-lkg.json');
+  const file = lkg.file ?? env.WE_RED_MAIN_FREEZE_LKG_FILE ?? resolve(tmpdir(), `we-red-main-freeze-${process.getuid?.() ?? 'unknown'}`, 'lkg.json');
   const minutesRaw = lkg.minutes ?? Number(env.WE_DRAIN_RED_MAIN_FREEZE_LKG_MINUTES ?? LKG_DEFAULT_MINUTES);
   const minutes = Number.isFinite(minutesRaw) && minutesRaw >= 0 ? Math.min(minutesRaw, LKG_MAX_MINUTES) : LKG_DEFAULT_MINUTES;
   const key = lkg.key ?? '';
@@ -381,12 +422,12 @@ function readSharedWithFallback({ readShared, env, stderr, lkg = {} }) {
   if (typeof r?.frozen === 'boolean' && !r.error) {
     const rec = { key, at: now(), result: r };
     lkgMemory.set(file, rec);
-    try { mkdirSync(dirname(file), { recursive: true }); const tmp = `${file}.${process.pid}.tmp`; writeFileSync(tmp, JSON.stringify(rec)); renameSync(tmp, file); } catch { /* cache is best-effort */ }
+    writeLkgDisk(file, rec);
     return r;
   }
   if (!r?.error || !isReadTimeout(r) || minutes === 0) return r;
   // The newest record wins (memory vs disk); equal timestamps prefer a freeze from either process.
-  let disk = null; try { disk = JSON.parse(readFileSync(file, 'utf8')); } catch { /* none */ }
+  const disk = readLkgDisk(file);
   const cands = [lkgMemory.get(file), disk].filter(x => x && x.key === key && Number.isFinite(x.at));
   const rec = cands.sort((a, b) => b.at - a.at || Number(b.result?.frozen === true) - Number(a.result?.frozen === true))[0] ?? null;
   const age = rec ? now() - rec.at : Infinity;

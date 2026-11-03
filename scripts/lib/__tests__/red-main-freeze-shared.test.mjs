@@ -6,7 +6,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -866,6 +866,88 @@ describe('prepareDrainFreeze: timed-out read retry + last-known-good', () => {
     const m = mk(); await run(() => CLEAR, m);
     const { s, log } = await run(() => T, { ...m, t: m.t + 60_000 });
     expect(s.frozen).toBe(false); expect(log).toMatch(/freeze read timed out — using last-known-good from 60s/);
+  });
+  it('accepts a trusted on-disk clear after restart (no memory record)', async () => {
+    const m = mk();
+    writeFileSync(m.file, JSON.stringify({ key: 'restart', at: m.t, result: CLEAR }), { mode: 0o600 });
+    const { s } = await run(() => T, { ...m, t: m.t + 1000 }, { key: 'restart' });
+    expect(s.frozen).toBe(false); expect(s.shared.lastKnownGood).toBe(true);
+  });
+  it.each(['writable file', 'symlink', 'hardlink', 'writable directory', 'symlink directory'])(
+    'ignores an unsafe %s even with no in-memory record', async variant => {
+      const m = mk(); const record = JSON.stringify({ key: 'unsafe', at: m.t, result: CLEAR });
+      writeFileSync(m.file, record, { mode: 0o600 });
+      if (variant === 'writable file') chmodSync(m.file, 0o620);
+      if (variant === 'writable directory') chmodSync(dirname(m.file), 0o770);
+      if (variant === 'symlink' || variant === 'hardlink') {
+        const target = `${m.file}.target`; writeFileSync(target, record, { mode: 0o600 }); rmSync(m.file);
+        if (variant === 'symlink') symlinkSync(target, m.file); else linkSync(target, m.file);
+      }
+      if (variant === 'symlink directory') {
+        const link = `${dirname(m.file)}-link`; symlinkSync(dirname(m.file), link); m.file = join(link, 'lkg.json');
+      }
+      const { s, log } = await run(() => T, { ...m, t: m.t + 1000 }, { key: 'unsafe' });
+      expect(s.frozen).toBe(true); expect(log).not.toContain('using last-known-good');
+    },
+  );
+  it('writes private records and never follows a pre-created temporary symlink', async () => {
+    const m = mk(); const target = `${m.file}.target`;
+    writeFileSync(target, 'untouched'); symlinkSync(target, `${m.file}.${process.pid}.tmp`);
+    await run(() => CLEAR, m);
+    expect(readFileSync(target, 'utf8')).toBe('untouched');
+    expect(statSync(m.file).mode & 0o077).toBe(0);
+  });
+  it('rejects an oversized disk cache without a memory record', async () => {
+    const m = mk();
+    writeFileSync(m.file, JSON.stringify({ key: 'large', at: m.t, result: CLEAR, padding: 'x'.repeat(64 * 1024) }), { mode: 0o600 });
+    const { s } = await run(() => T, m, { key: 'large' });
+    expect(s.frozen).toBe(true); expect(s.shared.lastKnownGood).toBeUndefined();
+  });
+  it('rejects a foreign-owned disk inode after a sticky-directory write failure, preserving the hold', () => {
+    const m = mk();
+    try {
+      const script = `
+        import fs from 'node:fs';
+        import { syncBuiltinESMExports } from 'node:module';
+        import { prepareDrainFreeze, resolveDrainFreezeSettings, drainFreezeSignal } from ${JSON.stringify(resolve(HERE, '../red-main-freeze-shared.mjs'))};
+        import { decideRedMainHold } from ${JSON.stringify(resolve(HERE, '../red-main-hold.mjs'))};
+        const file = process.env.FREEZE_CACHE_TEST_FILE;
+        fs.writeFileSync(file, JSON.stringify({ key: 'foreign', at: 1500, result: { frozen: false } }), { mode: 0o600 });
+        const stat = fs.fstatSync;
+        fs.fstatSync = fd => Object.assign(stat(fd), { uid: process.getuid() + 1 });
+        fs.renameSync = () => { throw Object.assign(new Error('sticky directory refuses replacement'), { code: 'EPERM' }); };
+        syncBuiltinESMExports();
+        const opts = { env: {}, settings: resolveDrainFreezeSettings({ env: {}, tool: {} }), logSettings: false, stderr: () => {}, lkg: { file, key: 'foreign', now: () => 1000, sleepSync: () => {} } };
+        await prepareDrainFreeze({ ...opts, readShared: () => ({ frozen: true }) });
+        let reads = 0;
+        const state = await prepareDrainFreeze({ ...opts, lkg: { ...opts.lkg, now: () => 2000 }, readShared: () => { reads++; return { error: 'ETIMEDOUT' }; } });
+        const hold = decideRedMainHold({ num: 7, signal: drainFreezeSignal({ state, now: 1 }) }).hold;
+        console.log(JSON.stringify({ reads, frozen: state.frozen, hold, lastKnownGood: !!state.shared.lastKnownGood }));
+      `;
+      const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], { env: { ...process.env, FREEZE_CACHE_TEST_FILE: m.file }, encoding: 'utf8', timeout: 10_000 });
+      expect(child.status, child.stderr).toBe(0);
+      expect(JSON.parse(child.stdout)).toEqual({ reads: 3, frozen: true, hold: true, lastKnownGood: false });
+    } finally { rmSync(dirname(m.file), { recursive: true, force: true }); }
+  });
+  it('uses a private per-user default directory and never reads the legacy shared-temp record', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lkg-default-'));
+    try {
+      const script = `
+        import { prepareDrainFreeze, resolveDrainFreezeSettings } from ${JSON.stringify(resolve(HERE, '../red-main-freeze-shared.mjs'))};
+        import { readFileSync, statSync, writeFileSync } from 'node:fs';
+        import { join } from 'node:path';
+        const root = process.env.TMPDIR;
+        writeFileSync(join(root, 'we-red-main-freeze-lkg.json'), JSON.stringify({ key: 'default', at: 1000, result: { frozen: false } }));
+        const opts = { env: {}, settings: resolveDrainFreezeSettings({ env: {}, tool: {} }), logSettings: false, stderr: () => {}, lkg: { key: 'default', now: () => 1000, sleepSync: () => {} } };
+        const before = await prepareDrainFreeze({ ...opts, readShared: () => ({ error: 'ETIMEDOUT' }) });
+        await prepareDrainFreeze({ ...opts, readShared: () => ({ frozen: false }) });
+        const cacheDir = join(root, 'we-red-main-freeze-' + process.getuid());
+        console.log(JSON.stringify({ held: before.frozen, dirMode: statSync(cacheDir).mode & 0o777, fileMode: statSync(join(cacheDir, 'lkg.json')).mode & 0o777, frozen: JSON.parse(readFileSync(join(cacheDir, 'lkg.json'), 'utf8')).result.frozen }));
+      `;
+      const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], { env: { ...process.env, TMPDIR: dir }, encoding: 'utf8', timeout: 10_000 });
+      expect(child.status, child.stderr).toBe(0);
+      expect(JSON.parse(child.stdout)).toEqual({ held: true, dirMode: 0o700, fileMode: 0o600, frozen: false });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('a child timing out after writing stderr retains ETIMEDOUT, retries and uses a fresh clear cache', async () => {
     const m = mk(); await run(() => CLEAR, m);

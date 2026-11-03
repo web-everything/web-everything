@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { evaluateDrainFreeze, prepareDrainFreeze, resolveDrainFreezeSettings, drainFreezeSignal } from '../red-main-freeze-shared.mjs';
@@ -35,6 +35,35 @@ describe('A1 shared reader and cascade', () => {
     expect(resolve({ env: { [envKey]: override }, tool: { [key]: builtIn } })).toEqual({ value: override, source: 'env' });
     expect(resolve({ env: { [envKey]: 'invalid' }, platform: { [key]: override } }).source).toBe('platform');
   });
+});
+
+describe('untrusted last-known-good cache cannot clear the drain hold', () => {
+  it.each(['writable file', 'symlink', 'writable directory', 'foreign owner'])(
+    'rejects a newer forged clear from a %s after observing a shared freeze', async variant => {
+      const f = fixture({ local: null, env: {}, logSettings: false, lkg: { now: () => 1_000_000, sleepSync: () => {} }, readShared: vi.fn(() => ({ frozen: true })) });
+      await prepareDrainFreeze(f);
+      const record = JSON.parse(readFileSync(f.lkg.file, 'utf8'));
+      record.at += 500; record.result = clear;
+      writeFileSync(f.lkg.file, JSON.stringify(record));
+      if (variant === 'writable file') chmodSync(f.lkg.file, 0o666);
+      if (variant === 'writable directory') chmodSync(join(f.lkg.file, '..'), 0o777);
+      if (variant === 'symlink') {
+        const target = `${f.lkg.file}.forged`;
+        writeFileSync(target, JSON.stringify(record));
+        rmSync(f.lkg.file); symlinkSync(target, f.lkg.file);
+      }
+      const uid = process.getuid();
+      const owner = variant === 'foreign owner' ? vi.spyOn(process, 'getuid').mockReturnValue(uid + 1) : null;
+      try {
+        f.readShared.mockReturnValue({ error: 'spawnSync git ETIMEDOUT' });
+        f.lkg.now = () => 1_001_000;
+        const state = await prepareDrainFreeze(f);
+        expect(f.readShared).toHaveBeenCalledTimes(4);
+        expect(state.shared.lastKnownGood).toBeUndefined();
+        expect(decision(state).hold).toBe(true);
+      } finally { owner?.mockRestore(); }
+    },
+  );
 });
 
 const fixtureDirs = [];
