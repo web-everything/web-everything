@@ -9,6 +9,8 @@ import { dirname, join, resolve, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { handoffHome } from './handoff-home.mjs';
 import { humanReviewHold } from './pr-sweep-core.mjs';
+import { liveResultGateState, parseRedTeamComment, RED_TEAM_COMMENT_MARKER, readRedTeamDisposition } from '../lib/red-team-gate.mjs';
+import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { isLaneLocus, workspaceRootOf } from '../guard-lane.mjs';
@@ -65,10 +67,12 @@ const sectionReasons = {
   rulingNeeded: 'review parked with confirmed findings — your block/card/not-real ruling',
   stoodDown: 'fix agent asked a question — your judgment; no label changed',
 };
-// Only these kinds can be represented (and therefore resolved by absence) in itemsFromReport.
+// Only these kinds can be represented (and therefore resolved by absence) by the report and its live gates.
 // Event-only escalations such as review-no-verdict and disk-space remain until acknowledged;
 // a successful queue read supplies no evidence that their independently owned condition resolved.
 export const REPORT_KINDS = new Set(['needs-you', 'ruling-needed', 'at-round-limit', 'escalated', 'stood-down']);
+// Gate verdicts are new evidence about a head, never a repeat of the stall question: they are not suppressed by it.
+export const GATE_KINDS = new Set(['confirmed-break-owed-send-back', 'red-team-undecided']);
 const shellArg = value => /^[\w/.:=-]+$/.test(String(value)) ? String(value) : `'${String(value).replace(/'/g, "'\\''")}'`;
 export function itemsFromReport(report) {
   const items = [];
@@ -90,6 +94,43 @@ export function itemsFromReport(report) {
   items.incomplete = !!report.incomplete;
   return items;
 }
+// For the approval alert every confirmed break (degraded as well as broken) counts, whatever the send-back policy;
+// a break the gate already released (recorded card/advisory/ruling) no longer holds.
+const ALERT_BREAK_POLICY = Object.freeze({ broken: 'send-back', degraded: 'send-back', unconfirmed: 'advisory' });
+// The parser silently drops a finding line it cannot read; the comment's own headline counts them. Any result
+// comment for the live head whose headline disagrees with what parsed is not a clean pass (fail closed).
+function headlineAgrees(comments, pr, head) {
+  const live = String(head ?? '').toLowerCase();
+  return (Array.isArray(comments) ? comments : []).every(c => {
+    if (!isTrustedMarkerAuthor(c)) return true; // untrusted text is data, never a veto
+    const whole = typeof c === 'string' ? c : c?.body;
+    const lines = typeof whole === 'string' ? whole.replace(/\r\n/g, '\n').split('\n') : [];
+    // Every embedded result counts, carried wrappers included (liveResultGateState reads those too).
+    return lines.every((line, at) => {
+      if (!line.trimStart().toLowerCase().startsWith(RED_TEAM_COMMENT_MARKER)) return true; // same leniency as the shared parser
+      const body = lines.slice(at).join('\n').trimStart(), parsed = parseRedTeamComment(body);
+      if (!parsed) {
+        // Repair only the delimiter to ask the shared parser which PR/head this marker names.
+        // Malformed live or unscopable evidence still vetoes approval; unrelated history does not.
+        const scope = parseRedTeamComment(`${line.split('-->', 1)[0].trimEnd()} -->`);
+        return scope !== null && (scope.pr !== Number(pr) || scope.rev !== live);
+      }
+      return parsed.pr !== Number(pr) || parsed.rev !== live || resultAgrees(body, parsed);
+    });
+  });
+}
+function resultAgrees(body, parsed) {
+  {
+    const clean = /^### Post-accept red team — no break found$/m.test(body);
+    const counted = /^### Post-accept red team — (\d+) possible break\(s\), (\d+) confirmed/m.exec(body);
+    if (clean) return parsed.findings.length === 0;
+    return !!counted && Number(counted[1]) === parsed.findings.length
+      && Number(counted[2]) === parsed.findings.filter(f => f.confirmed).length;
+  }
+}
+// Items whose verdict came from a live read of the PR (the only evidence that may retire a confirmed-break alert).
+const LIVE_VERIFIED = new WeakSet();
+const verified = item => { LIVE_VERIFIED.add(item); return item; };
 const keyOf = i => `${i.repo}#${i.pr}@${i.head}:${i.kind}`;
 /** Queue text is display data: bound it and remove terminal controls, line separators and bidi/invisible formatting. */
 export function sanitizeForFeed(text, max) {
@@ -110,9 +151,9 @@ function fromKey(key) {
   if (!m) throw new Error(`needs-you-feed: invalid state key ${key}`);
   return { repo: m[1], pr: Number(m[2]), head: m[3], was: m[4] };
 }
-export function diffFeed(prevOpenKeys, items, now, { incomplete = items.incomplete, clearKinds = null } = {}) {
+export function diffFeed(prevOpenKeys, items, now, { incomplete = items.incomplete, clearKinds = null, alsoClear = null, retainKeys = [] } = {}) {
   const at = new Date(now).toISOString(), prev = new Set(prevOpenKeys), current = new Map(items.map(sanitizeItem).map(i => [keyOf(i), i]));
-  const retained = new Set([...prev].filter(key => incomplete || (clearKinds && !clearKinds.has(fromKey(key).was))));
+  const retained = new Set([...prev].filter(key => incomplete || retainKeys.includes(key) || (clearKinds && !clearKinds.has(fromKey(key).was) && !alsoClear?.has(fromKey(key).was))));
   const lines = [];
   for (const [key, item] of current) if (!prev.has(key)) {
     const event = { at, ...item };
@@ -191,27 +232,49 @@ async function readLivePr(item, { gh, cwd }, fields = 'labels,headRefOid') {
 /**
  * Drop "your review" items whose LIVE PR no longer qualifies (red team not clear on the live head, sent back, a fix
  * claim open): operator-queue's report can lag the labels by a tick, and a notification cannot be taken back. A PR
- * that cannot be read is KEPT (an alert is never suppressed on missing evidence); the failure is logged. Only items
+ * that cannot be read is kept as red-team-undecided; the failure is logged. Only items
  * that came from the queue's `ready` section are judged. Returns `{kept, held}`.
  */
 export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(), log = console.error, deadlineMs = 120000, concurrency = 4,
   fixClaimLive = (repo, pr) => { try { return readLiveFixClaim({ repo, pr }) !== null; } catch { return null; } } } = {}) {
-  const ready = new Set((report.ready ?? []).map((r) => `${r.repo}#${r.number ?? r.pr}`));
+  // "your review" and "needs your merge" rows both ask the operator to approve: both pass the same live red-team gate.
+  const ready = new Set([...(report.ready ?? []), ...(report.needsYourMerge ?? [])].map((r) => `${r.repo}#${r.number ?? r.pr}`));
   const deadline = Date.now() + deadlineMs;
+  // A reclassified item no longer carries the approve/merge instruction it came with.
+  const stripAction = ({ command, pick, ...rest }) => rest;
+  const undecided = item => ({ ...stripAction(item), kind: 'red-team-undecided',
+    reason: 'the red team has no result recorded on the live head' });
   const out = new Array(items.length); const held = [];
   const judge = async (index) => {
     const item = items[index];
     if (item.kind !== 'needs-you' || !ready.has(`${item.repo}#${item.pr}`)) { out[index] = item; return; }
-    // Bounded work: past the pass deadline an item is KEPT unjudged, never dropped on missing evidence.
-    if (Date.now() >= deadline) { log(`needs-you-feed ${item.repo}#${item.pr} gate deadline reached, keeping`); out[index] = item; return; }
+    // Missing or late evidence keeps an alert without claiming that all gates passed.
+    if (Date.now() >= deadline) { log(`needs-you-feed ${item.repo}#${item.pr} gate deadline reached, keeping`); out[index] = undecided(item); return; }
+    let checked = item;
     try {
       const view = await readLivePr(item, { gh, cwd });
+      if (!Array.isArray(view.labels)) throw new Error('the live PR read has no labels');
+      // Publish the head actually checked, not a stale report head or a later lookup.
+      checked = { ...item, head: view.headRefOid };
       const reasons = humanReviewHold({ ...view, labels: view.labels ?? [] }, now,
         { fixClaimLive: fixClaimLive(item.repo, item.pr) });
-      if (reasons.length) { held.push({ item, reasons }); return; }
-      // Publish the head that was actually checked, not a stale one from the report or a later lookup.
-      out[index] = { ...item, head: view.headRefOid };
-    } catch (error) { log(`needs-you-feed ${item.repo}#${item.pr} live gate unreadable, keeping: ${error.message}`); out[index] = item; }
+      const state = liveResultGateState(view.comments, item.pr, view.headRefOid, item.repo);
+      // The shared disposition (red-team-gate) decides what still holds on the live head; no private marker parser.
+      const disposition = state.result === null ? null
+        : readRedTeamDisposition({ comments: view.comments, pr: item.pr, head: view.headRefOid, repo: item.repo, setting: ALERT_BREAK_POLICY });
+      // Only an operator's own card / not-real / clear ruling settles a confirmed break: the gate's automatic card record
+      // is written before the card job succeeds, so it is no proof (nor is a policy that leaves degraded to a card).
+      const open = new Set([...(disposition?.sendBack ?? []), ...(disposition?.held ?? [])].map(f => f.index));
+      const settled = f => !open.has(f.index) && (disposition?.rulings.get(f.index) ?? []).some(r => r.source === 'operator' && r.kind !== 'block');
+      const owed = (state.result?.findings ?? []).some(f => f.confirmed && !settled(f));
+      // A confirmed break is classified before the hold: a hold (blocked, sent back) must not hide the alert.
+      if (reasons.length && !owed) { held.push({ item, reasons }); return; }
+      if (owed) {
+        out[index] = verified({ ...stripAction(checked), kind: 'confirmed-break-owed-send-back',
+          reason: 'a confirmed red-team break is owed a send-back on the live head' });
+      } else if (state.result !== null && !state.result.findings.some(f => f.recheckOutcome === 'unverifiable') && headlineAgrees(view.comments, item.pr, view.headRefOid)) out[index] = verified(checked);
+      else out[index] = undecided(checked);
+    } catch (error) { log(`needs-you-feed ${item.repo}#${item.pr} live gate unreadable, keeping: ${error.message}`); out[index] = undecided(checked); }
   };
   let next = 0;
   await Promise.all(Array.from({ length: Math.max(1, concurrency) }, async () => { while (next < items.length) await judge(next++); }));
@@ -268,6 +331,7 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
   const report = JSON.parse(String(stdout));
   if (!report || typeof report !== 'object' || !Array.isArray(report.ready)) throw new Error('needs-you-feed: invalid operator-queue report');
   if (failedRead) report.incomplete = true;
+  // liveGate:false is a hermetic test seam only: no CLI argument or setting reaches it.
   const gated = !liveGate ? { kept: itemsFromReport(report), held: [] } : await gateReadyItems(itemsFromReport(report), report, { gh, cwd: checkoutRoot, now: new Date(now).getTime(), log });
   for (const { item, reasons } of gated.held) log(`needs-you-feed ${item.repo}#${item.pr} held back from your review: ${reasons.join('; ')}`);
   const items = !liveGate ? gated.kept : (await gateRulingItems(gated.kept, { gh, cwd: checkoutRoot, log })).kept;
@@ -295,9 +359,13 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
     // The PR stall sweep's open `stalled` item already asks about this PR head: a NEW queue item for it is not
     // published twice (one already open stays, so it is never cleared by this filter).
     const stalled = honorStalled ? prev.openKeys.filter(k => k.endsWith(':stalled')).map(k => k.slice(0, -':stalled'.length)) : [];
-    const asked = i => !!i.head && stalled.includes(`${i.repo}#${i.pr}@${i.head}`); // only a resolved, matching head
+    const asked = i => !GATE_KINDS.has(i.kind) && !!i.head && stalled.includes(`${i.repo}#${i.pr}@${i.head}`); // only a resolved, matching head
     const fresh = items.filter(i => !asked(i) || prev.openKeys.includes(keyOf(i)));
-    const result = diffFeed(prev.openKeys, fresh, now, { clearKinds: REPORT_KINDS, incomplete: items.incomplete });
+    // An open confirmed-break alert clears only on positive evidence for that PR (a later live pass or a newer-head
+    // verdict). Absence from the queue, unreadable evidence or an undecided verdict never clear it.
+    const proven = new Set(fresh.filter(i => LIVE_VERIFIED.has(i) && (i.kind === 'needs-you' || i.kind === 'confirmed-break-owed-send-back')).map(i => `${i.repo}#${i.pr}`));
+    const retainKeys = prev.openKeys.filter(k => k.endsWith(':confirmed-break-owed-send-back') && !proven.has(k.slice(0, k.lastIndexOf('@'))));
+    const result = diffFeed(prev.openKeys, fresh, now, { clearKinds: REPORT_KINDS, alsoClear: GATE_KINDS, incomplete: items.incomplete, retainKeys });
     appendLines(path, result.lines);
     writeJsonAtomic(statePath, { openKeys: result.openKeys, lastRunAt: new Date(now).toISOString() });
     return result;

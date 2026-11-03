@@ -148,6 +148,7 @@ jobs:
             web-everything/package-lock.json
             frontierui/package-lock.json
 
+      # Base-branch Actions caches are readable by fork PRs. Keep private FUI code on the runner.
       - name: Install + build FUI tools
         working-directory: frontierui
         run: |
@@ -240,6 +241,7 @@ jobs:
 
       # FUI first (ratified #1946/#2016 ordering): install its deps (the `@frontierui/*` alias resolves to
       # sibling source that imports them) + build the pinned component-render CLI the gate/build call.
+      # Fork PRs can restore base-branch caches, so private FUI tools must be built on each run.
       - name: Install + build FUI tools
         if: ${{ needs.changes.outputs.light != 'true' }}
         working-directory: frontierui
@@ -252,6 +254,7 @@ jobs:
         working-directory: web-everything
         run: npm ci
 
+      # Vite can transform private sibling imports; its cache must also stay on the runner.
       # Card 11: files are assigned to a shard by MEASURED time (scripts/ci/shard-assign.mjs +
       # scripts/ci/test-timings.json), not vitest's blind `--shard=i/N`. Every file is in exactly one shard.
       # Card 12: `--group=covered` is the tests that can reach a coverage-counted file (scripts/ci/coverage-reach.mjs);
@@ -463,6 +466,7 @@ jobs:
             web-everything/package-lock.json
             frontierui/package-lock.json
 
+      # Fork PRs can restore base-branch caches, so private FUI tools must be built on each run.
       - name: Install + build FUI tools
         if: ${{ steps.gate.outputs.run == 'true' }}
         working-directory: frontierui
@@ -475,6 +479,7 @@ jobs:
         working-directory: web-everything
         run: npm ci
 
+      # Vite can transform private sibling imports; its cache must also stay on the runner.
       - name: Real-git integration suite (lane-pool, operations transport)
         if: ${{ steps.gate.outputs.run == 'true' }}
         working-directory: web-everything
@@ -686,6 +691,7 @@ jobs:
 
       # FUI first (ratified #1946/#2016 ordering): the `@frontierui/*` alias resolves to sibling source and
       # `build:docs` calls the pinned component-render CLI produced by build:tools.
+      # Fork PRs can restore base-branch caches, so private FUI tools must be built on each run.
       - name: Install + build FUI tools
         if: ${{ needs.changes.outputs.light != 'true' }}
         working-directory: frontierui

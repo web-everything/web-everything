@@ -2,7 +2,10 @@
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
-import { mqSameHeadGuard } from './lib/drain-queue-safety.mjs';
+import { createMqLiveReader, mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath, readDrainQueueSafety, redTeamEnqueueHold } from './lib/drain-queue-safety.mjs';
+import { readDrainRedTeamEvidence } from './lib/drain-red-team-evidence.mjs';
+import { readStandingRuling, readOperatorIssues, headIsCardOnly, headBelongsToPr, readUneditedCommentIds, standingRulingScope } from './conveyor/standing-ruling-io.mjs';
+import { resolveApprovalLicensesEnqueue, proveHumanOnlyLicense } from './lib/human-only-enqueue-license.mjs';
 import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, refreshHeldHead, retainApprovedHumanQueueHead } from './lib/approved-human-surface-hold.mjs';
 /**
  * merge-ai-prs.mjs — sweep OPEN pull requests and merge the AI-generated ones that are safe to land.
@@ -236,7 +239,7 @@ import { prepareDrainFreeze, drainFreezeSignal, flatText } from './lib/red-main-
 import { resolveRedMainHoldSetting, resolveRedMainMode, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs';
 import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward, laterReviewHold } from './lib/accept-carry-forward.mjs'; // card xu7kxtt (#5472) — an identical net diff keeps the accept
 import { decideQuarantineHold, resolveFixFiles, listedPrFiles } from './lib/red-main-quarantine.mjs'; // mode `quarantine` (OFF by default until its red-team review)
-import { readPinnedChangedFiles } from './lib/merge-queue-enqueue.mjs';
+import { readPinnedChangedFiles, workflowEditHold } from './lib/merge-queue-enqueue.mjs';
 import { decideDrainWorkflowEditHold, resolveDrainWorkflowEditHuman } from './lib/drain-workflow-edit-hold.mjs';
 import { readQuarantine } from './lib/red-main-quarantine-io.mjs'; // the "contain" third of the red-main safety net: while main is red only the main-fix PR(s) land
 export { remoteManifestApiArgs };
@@ -250,6 +253,8 @@ export { remoteManifestApiArgs };
 function recordEnqueue(outcomes, repo, outcome) {
   return recordEnqueueOutcome({ outcomes, repo, outcome, emit: appendDaemonEvent });
 }
+
+const mqSameHeadRefreshStore = createMqSameHeadRefreshStore({ path: mqSameHeadRefreshStatePath() });
 
 const REVIEW_BASELINE_STATE_PATH = resolve(process.cwd(), '.claude/skills/drain/review-baseline-state.json');
 
@@ -4820,12 +4825,60 @@ async function runCli() {
   const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, isMainFix,
     withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }), primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: process.env.WE_PRIMARY }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
-  function enqueueWithSameHeadGuard(c, sha, options, shadow) {
+  function enqueueWithSameHeadGuard(c, sha, options, approvedHeadHold, shadow) {
     // Live manual retries pass the guard and retain the strategy's already-queued bookkeeping.
-    const guard = mqSameHeadGuard({ repo: c.repo ?? localSlug, pr: c.num, head: sha,
+    const refresh = DRY_RUN ? undefined : createMqSameHeadRefreshOptions({ store: mqSameHeadRefreshStore,
+      approvedHeadHold, repo: c.repo ?? localSlug, pr: c.num, head: sha,
+      // Refresh mutates the branch before enqueue runs. Reuse its authorization gates here,
+      // with fresh evidence at H, before the refresh's label read or once-per-head claim.
+      enqueueAllowed: () => {
+        const repo = c.repo ?? localSlug;
+        const exec = createMqLiveReader();
+        const gh = args => exec('gh', args, { encoding: 'utf8', timeout: 60_000,
+          maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { personalRoute: false } });
+        const log = line => process.stderr.write(`  ${line}\n`);
+        try {
+          const comments = readCompletePrComments(c.num, { repo, exec });
+          if (!Array.isArray(comments)) throw Error('complete comments unreadable');
+          const safety = readDrainQueueSafety({ log });
+          if (safety.value.waitForRedTeamBeforeEnqueue) {
+            const evidence = readDrainRedTeamEvidence({ repo, pr: c.num, head: sha });
+            const standingRuling = standingRulingScope({ repo, pr: { number: c.num, headRefOid: sha, comments } }, {
+              readRuling: slug => readStandingRuling(slug, { readIssues: target => readOperatorIssues(target, { gh }) }),
+              cardOnly: target => headIsCardOnly(target, { belongs: identity => headBelongsToPr(identity, { gh }) }),
+              unedited: target => readUneditedCommentIds(target, { gh }),
+            });
+            if (redTeamEnqueueHold({ ...evidence, repo, pr: c.num, head: sha, comments, standingRuling })) return false;
+          }
+          // Use the live base, as enqueuePr does: a retarget can expose a workflow edit.
+          const live = JSON.parse(exec('gh', ['pr', 'view', String(c.num), '--repo', repo,
+            '--json', 'headRefOid,baseRefName'], { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
+            stdio: ['ignore', 'pipe', 'pipe'] }));
+          if (live?.headRefOid !== sha || typeof live.baseRefName !== 'string' || !live.baseRefName) return false;
+          const read = readPinnedChangedFiles({ headSha: sha, base: live.baseRefName, cwd: process.cwd(), exec });
+          if (read.error) return false;
+          const workflow = resolveDrainWorkflowEditHuman();
+          log(`policy · drainWorkflowEditHuman=${workflow.value} (${workflow.source})`);
+          if (decideDrainWorkflowEditHold({ files: read.files, filesComplete: true, headSha: sha,
+            humanClearedSha: parseLatestHumanClearedSha(comments), setting: workflow.value }).hold) return false;
+          const surface = workflowEditHold({ files: read.files, expectedCount: read.files?.length });
+          if (!surface.hold) return true;
+          if (!surface.humanOnly) return false;
+          const setting = resolveApprovalLicensesEnqueue();
+          log(`human-only approvalLicensesEnqueue=${setting.value} (${setting.source})`);
+          if (!setting.value) return false;
+          const license = proveHumanOnlyLicense({ repo, pr: c.num, headSha: sha, cwd: process.cwd(), exec });
+          return license?.licensed === true && ['exact', 'numbering', 'mechanical'].includes(license.tier);
+        } catch { return false; }
+      } });
+    const guard = mqSameHeadGuard({ refresh, repo: c.repo ?? localSlug, pr: c.num, head: sha,
       log: line => process.stderr.write(`${line}\n`) });
     if (guard.hold) return { enqueued: false, kind: 'mq-same-head-failed', reason: guard.line };
-    const result = mergeStrategy.enqueue(c, sha, options);
+    const result = mergeStrategy.enqueue(c, sha, { ...options,
+      // The early queued bypass authorizes bookkeeping only. If membership disappears during the
+      // strategy's other checks, require fresh timeline admission immediately before any mutation.
+      sameHeadAdmission: () => mqSameHeadGuard({ repo: c.repo ?? localSlug, pr: c.num, head: sha,
+        allowAlreadyQueued: false, refresh, log: line => process.stderr.write(`${line}\n`) }) });
     if (result?.enqueued === true) {
       try { shadow?.recordActual({ repo: c.repo || localSlug, num: c.num, headSha: sha }); } catch { /* Timing only. */ }
     }
@@ -5319,6 +5372,31 @@ async function runCli() {
       if (summary) process.stderr.write(`async-drain-shadow: summary n=${summary.n} median=${summary.medianDeltaMs == null ? 'null' : summary.medianDeltaMs / 1000}s p90=${summary.p90DeltaMs == null ? 'null' : summary.p90DeltaMs / 1000}s readyNotReached=${summary.readyNotReached}\n`);
     } catch { /* Best-effort timing only. */ }
   };
+  const approvedHeadSetting = resolveSkipRebaseApprovedHumanSurface();
+  if (!AS_JSON) process.stderr.write(`  merge-queue: skipRebaseApprovedHumanSurface=${approvedHeadSetting.value} (${approvedHeadSetting.source})\n`);
+  const approvedHeadHold = (v, headSha = v.listedHeadSha || v.headSha, { strict = false } = {}) => {
+    // Only the queue can retest an unchanged head against main. Direct merges (including sibling repos)
+    // still need the drain's rebase/refresh path, regardless of the head's human approval.
+    if (!mergeStrategy.queueOwnsFreshness(v.repo)) return false;
+    try {
+      if (strict && (!['on', 'off'].includes(approvedHeadSetting?.value)
+          || !['env', 'settings'].includes(approvedHeadSetting?.source)))
+        throw new Error('approval settings unreadable or unresolvable; operator must inspect approval configuration');
+      const cwd = isLocalRepo(v.repo) ? process.cwd() : siblingCloneDir(v.repo);
+      if (approvedHeadSetting.value === 'on' && !cwd) throw new Error('no PR clone for approved-head proof');
+      // Refresh authorization must observe approval added since the memo was populated.
+      const decision = readApprovedHumanSurfaceHold({ setting: approvedHeadSetting.value, pr: v.num, repo: v.repo || localSlug,
+        expectedHead: headSha, exec: (file, args, opts) => file === 'gh'
+          ? (strict ? createMqLiveReader((_file, argv, options) => readGh(argv, options))('gh', args, opts) : readGh(args, opts))
+          : execFileSync(file, args, { ...opts, cwd }) });
+      if (decision.hold && !AS_JSON) process.stderr.write(`  ⏸ PR ${repoTag(v.repo)}${v.num}: ${decision.reason}\n`);
+      return decision.hold;
+    } catch (e) {
+      process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: approved-head proof unreadable (${String(e?.message ?? e).replace(/[\r\n]+/g, ' ')}); ${strict ? 'not requesting same-head refresh' : 'using legacy rebase/refresh path'}\n`);
+      if (strict) return true;
+      return false;
+    }
+  };
   const prestageSetting = resolvePrestageSettings({ log: line => process.stderr.write(`${line}\n`) });
   // Prepared admission is still a candidate selection: honor the same resolved repo set and
   // operator label/base filters as listOne before consuming (or invalidating) a cached preparation.
@@ -5357,7 +5435,7 @@ async function runCli() {
         } catch { /* Timing only. */ }
         return announceAndRetargetBeforeLand(c, { preread: fetchPrComments(c.repo, c.num), defaultBranch: entry.baseRefName });
       },
-      enqueue: (c, sha, entry) => enqueueWithSameHeadGuard(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }, asyncShadow),
+      enqueue: (c, sha, entry) => enqueueWithSameHeadGuard(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }, approvedHeadHold, asyncShadow),
       recordLanded: recordLandedLedgerFacts,
       requiredCheck: REQUIRED,
     });
@@ -5741,24 +5819,6 @@ async function runCli() {
     }
   }
 
-  const approvedHeadSetting = resolveSkipRebaseApprovedHumanSurface();
-  if (!AS_JSON) process.stderr.write(`  merge-queue: skipRebaseApprovedHumanSurface=${approvedHeadSetting.value} (${approvedHeadSetting.source})\n`);
-  const approvedHeadHold = (v, headSha = v.listedHeadSha || v.headSha) => {
-    // Only the queue can retest an unchanged head against main. Direct merges (including sibling repos)
-    // still need the drain's rebase/refresh path, regardless of the head's human approval.
-    if (!mergeStrategy.queueOwnsFreshness(v.repo)) return false;
-    try {
-      const cwd = isLocalRepo(v.repo) ? process.cwd() : siblingCloneDir(v.repo);
-      if (approvedHeadSetting.value === 'on' && !cwd) throw new Error('no PR clone for approved-head proof');
-      const decision = readApprovedHumanSurfaceHold({ setting: approvedHeadSetting.value, pr: v.num, repo: v.repo || localSlug,
-        expectedHead: headSha, exec: (file, args, opts) => file === 'gh' ? readGh(args, opts) : execFileSync(file, args, { ...opts, cwd }) });
-      if (decision.hold && !AS_JSON) process.stderr.write(`  ⏸ PR ${repoTag(v.repo)}${v.num}: ${decision.reason}\n`);
-      return decision.hold;
-    } catch (e) {
-      process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: approved-head proof unreadable (${String(e?.message ?? e).replace(/[\r\n]+/g, ' ')}); using legacy rebase/refresh path\n`);
-      return false;
-    }
-  };
   // Keep this wrapper in the sweep's scope so every fresh read uses its approval-proof helper and setting.
   const revalidateFresh = (repo, num, opts) => revalidateWithUnknownRetry({
     ...unknownRecovery, repo: repo || localSlug, num,
@@ -7217,7 +7277,7 @@ async function runCli() {
             // xym8nt4 — re-check group ownership under the mutex: a group may have claimed this PR since the pre-pass hold.
             const groupHeld = cardGrouping.holdFor(c);
             if (groupHeld) return { skipped: 'card-group-hold', reason: groupHeld.reason };
-            if (mergeStrategy.enqueues(c.repo)) return enqueueWithSameHeadGuard(c, traceHeadSha, { comments: preread.read ? preread.comments : null }); // xtpxusq — never the merge API; throws on failure
+            if (mergeStrategy.enqueues(c.repo)) return enqueueWithSameHeadGuard(c, traceHeadSha, { comments: preread.read ? preread.comments : null }, approvedHeadHold); // xtpxusq — never the merge API; throws on failure
             // x2e120n — the actual `gh pr merge` round-trip, timed on its own (a sub-component of the wider
             // "mergeCascade" step below, which also covers the pre-merge stamps/retarget for every candidate).
             __t.time('mergeCall', () => mergePr({ pr: c.num, repo: c.repo, method: 'merge', matchHeadCommit: traceHeadSha, caller: 'drain' }));
