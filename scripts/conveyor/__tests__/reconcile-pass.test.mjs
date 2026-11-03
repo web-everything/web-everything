@@ -1646,7 +1646,7 @@ describe('defaultReadPrs production list path is cheap and loud (504 incident 20
     const { defaultReadPrs } = await import('../reconcile-pass.mjs');
     const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
     let asked;
-    const rest = vi.fn((path) => ({ user: { login: 'dependabot[bot]', type: 'Bot' }, path }));
+    const rest = vi.fn(() => ({ status: 200, json: { user: { login: 'dependabot[bot]', type: 'Bot' } } }));
     const prs = defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readCommits: () => [],
       readShared: ({ fields }) => { asked = fields; return [{ number: 7, labels: [], comments: [], statusCheckRollup: [] }]; },
       readRest: rest });
@@ -1665,4 +1665,13 @@ describe('defaultReadPrs production list path is cheap and loud (504 incident 20
     expect(String(err?.stderr)).toMatch(/504/);
     expect(listPaged).toHaveBeenCalledTimes(3);
   });
+});
+
+it('a truncated paged fallback marks discovery incomplete instead of reading as complete', async () => {
+  const { defaultReadPrs } = await import('../reconcile-pass.mjs');
+  const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
+  const rows = [{ number: 1, labels: [], comments: [], statusCheckRollup: [], author: { login: 'x' } }];
+  const prs = defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readCommits: () => [], readShared: () => null,
+    listPaged: () => ({ rows, truncated: true, cache: {} }), readRest: () => ({ json: {} }) });
+  expect(prs.discoveryIncomplete).toBe(true);
 });

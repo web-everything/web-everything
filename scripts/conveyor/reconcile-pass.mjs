@@ -333,7 +333,7 @@ export function withRestAuthors(rows, { repo, readRest = ghRestGetJson } = {}) {
     const key = `${repo}#${pr.number}`;
     if (!authorByPr.has(key)) {
       try {
-        const u = readRest(`repos/${repo}/pulls/${pr.number}`, { context: repo, op: 'pr author (reconcile)' })?.user;
+        const u = readRest(`repos/${repo}/pulls/${pr.number}`, { context: repo, op: 'pr author (reconcile)' })?.json?.user;
         if (u?.login) authorByPr.set(key, { login: u.login, is_bot: u.type === 'Bot' });
       } catch { /* leave unset; bot detection degrades, the list does not */ }
     }
@@ -407,9 +407,15 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
       const paged = listPaged({ repo, exec, paging: resolvePrListPaging(), heavyFields: ['comments', 'body', 'files'],
         cache: pagedHeavyCache.get(repo) || {}, maxRows: PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (reconcile page)' } } });
       pagedHeavyCache.set(repo, paged.cache);
+      // A capped inventory is incomplete discovery — mark it so the planner does not treat the omitted PRs as absent.
+      if (paged.truncated) Object.defineProperty(paged.rows, 'discoveryIncomplete', { value: true });
       return paged.rows;
     }, { repo, op: 'reconcile-pr-list', ...retryOpts });
-    return Array.isArray(listed) ? enrich(viaDirect ? listed : withRestAuthors(listed, { repo, readRest })) : listed;
+    if (!Array.isArray(listed)) return listed;
+    const withAuthors = viaDirect ? listed : withRestAuthors(listed, { repo, readRest });
+    const enriched = enrich(withAuthors);
+    if (listed.discoveryIncomplete === true && enriched.discoveryIncomplete !== true) Object.defineProperty(enriched, 'discoveryIncomplete', { value: true });
+    return enriched;
   }
   if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: PR_LIST_JSON_FIELDS, allowDeferred: true }); if (shared) return Array.isArray(shared) ? enrich(shared) : shared; }
   const rows = direct();
