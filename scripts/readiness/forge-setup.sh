@@ -17,7 +17,12 @@
 #   ops ALL=(root) NOPASSWD: /usr/local/libexec/forge-exec-run.mjs *
 # - root-owned forge-warm-base systemd service/timer (service runs as ops,
 #   timer every 30s) and /etc/cron.daily/forge-exec-prune root:root 0755;
-# - installs python3 and rsync if missing. Never prunes active slot locks.
+# - R497 egress: slot users forge-exec-1..N get no outbound network except loopback and
+#   TCP 443 to registry.npmjs.org (cold npm ci runs as the slot user). Rules come from
+#   /usr/local/libexec/forge-egress.sh (nft table inet forge_exec_egress), refreshed every
+#   5 min by forge-exec-egress.timer. Rollback: nft delete table inet forge_exec_egress &&
+#   systemctl disable --now forge-exec-egress.timer forge-exec-egress.service;
+# - installs python3, rsync and nftables if missing. Never prunes active slot locks.
 set -euo pipefail
 
 FORGE_EXEC_SLOTS=${FORGE_EXEC_SLOTS:-8}
@@ -286,6 +291,42 @@ WantedBy=timers.target
 TIMER
 systemctl daemon-reload
 systemctl enable --now forge-warm-base.timer
+# R497: no egress for slot users. Root-owned script, installed via temp + atomic rename.
+if ! command -v nft >/dev/null 2>&1; then
+  apt-get install -y nftables
+fi
+egress_pending=$(mktemp /usr/local/libexec/.forge-egress.XXXXXX)
+install -o root -g root -m 0755 "$(dirname -- "$0")/forge-egress.sh" "$egress_pending"
+mv -f -- "$egress_pending" /usr/local/libexec/forge-egress.sh
+cat > /etc/systemd/system/forge-exec-egress.service <<EGRESS
+[Unit]
+Description=Drop outbound network for Forge slot users (registry allowlist only)
+# Before sshd so no run can start on a rebooted Forge before the table exists. At boot the registry usually
+# does not resolve yet: the table installs CLOSED (no registry) and the timer opens the allowlist after 1 min.
+Before=ssh.service sshd.service
+DefaultDependencies=no
+After=systemd-user-sessions.service local-fs.target
+[Service]
+Type=oneshot
+Environment=FORGE_EXEC_SLOTS=$FORGE_EXEC_SLOTS
+ExecStart=/usr/local/libexec/forge-egress.sh apply
+[Install]
+WantedBy=multi-user.target
+EGRESS
+cat > /etc/systemd/system/forge-exec-egress.timer <<'EGRESST'
+[Unit]
+Description=Refresh the Forge slot egress registry allowlist
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Unit=forge-exec-egress.service
+[Install]
+WantedBy=timers.target
+EGRESST
+systemctl daemon-reload
+systemctl enable forge-exec-egress.service
+systemctl start forge-exec-egress.service
+systemctl enable --now forge-exec-egress.timer
 cat > /etc/cron.daily/forge-exec-prune <<'PRUNE'
 #!/bin/bash
 set -euo pipefail
