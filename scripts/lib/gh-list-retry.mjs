@@ -13,7 +13,8 @@ import { dirname, join } from 'node:path';
 import { daemonEventsPath } from './daemon-events.mjs';
 import { GH_TRANSIENT_SERVER_PATTERNS } from './gh-throttle.mjs';
 
-export const GH_LIST_BACKOFF_MS = Object.freeze([2000, 6000]);
+// The sleep is SYNCHRONOUS inside the daemon's event loop: keep the total to a couple of seconds per read.
+export const GH_LIST_BACKOFF_MS = Object.freeze([500, 1500]);
 export const GH_LIST_FAIL_THRESHOLD = 3;
 
 const textOf = (e) => {
