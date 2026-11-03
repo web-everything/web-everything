@@ -68,14 +68,6 @@
       ]
     },
     {
-      "ref": "lane/forge-slot-reconciler-r475",
-      "sha": "d171c9f8f5e6a9656d4866f7ae04042c20ea6a97",
-      "ruling": "R475+R485",
-      "findings": [
-        "scripts/readiness/forge-slot-markers.mjs:272 — Previously, a listed run without a result retained its slot unconditionally; now two zero-active samples permit release without a settled result or per-run cleanup confirmation. This relaxes quarantine based on the producer’s aggregate directory listing (forge-exec-run.mjs:655)."
-      ]
-    },
-    {
       "ref": "lane/freeze-read-retry-lkg",
       "sha": "f8564fc77a42e3c5a326fc17e38c3873f66696b3",
       "ruling": "R432",
@@ -91,15 +83,6 @@
       "findings": [
         "scripts/lib/drain-queue-safety.mjs:197 — Replaces the all-green requirement with an exception that discards FAILURE, CANCELLED, TIMED_OUT, ACTION_REQUIRED and STARTUP_FAILURE when a later same-name check succeeds in another run. Previously these outcomes blocked update-branch.",
         "scripts/lib/drain-queue-safety.mjs:153 — Matching workflow_id, display name and timestamps does not prove job replacement across runs; independent same-name jobs can mask failures. The lookup validates only workflow_id, without binding the check to its claimed run/job or verifying equivalent execution context."
-      ]
-    },
-    {
-      "ref": "lane/mq-same-head-merge-conflict",
-      "sha": "60944430a8e836e2df15a8baba0f8f2806d9d66d",
-      "ruling": "R466+R484",
-      "findings": [
-        "scripts/lib/drain-queue-safety.mjs:61 — One or two `merge_conflict` removals now bypass commit-binding validation and the same-head failure hold when the PR reports `CLEAN`. Previously, same-head or unbound conflicts required intervention; the three-removal cap permits retries previously blocked.",
-        "scripts/lib/__tests__/drain-queue-safety.test.mjs:784 — Tests now require conflict removals to release regardless of binding, while previous conflict hold and force-push protection cases substitute other reasons. The suite therefore accepts the bypass instead of detecting it."
       ]
     },
     {
