@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { checkBodyFileLocation } from '../open-pr-body-location.mjs';
+import { checkBodyFileLocation, isWorkerScratchDir, workerScratchDir } from '../open-pr-body-location.mjs';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -8,6 +8,28 @@ import { randomUUID } from 'node:crypto';
 
 const defaults = { cwd: '/lanes/worker', home: '/home/operator', tmp: '/tmp', isTracked: () => false };
 const check = (bodyFile, extra = {}) => checkBodyFileLocation({ ...defaults, bodyFile, ...extra });
+
+describe('workerScratchDir', () => {
+  it('encodes purpose and owner boundaries uniquely, including repeated and trailing hyphens', () => {
+    const purposes = ['fix', 'fix-widget', 'fix-', 'fix--widget'];
+    const owners = ['abc12345', 'widget-abc12345', 'widget-', 'A', 'a-b-'];
+    const paths = purposes.flatMap(purpose => owners.map(owner => workerScratchDir(purpose, owner)));
+    expect(new Set(paths).size).toBe(paths.length);
+    for (const path of paths) {
+      expect(isWorkerScratchDir(path.slice('/tmp/'.length))).toBe(true);
+      expect(check(`${path}/body.md`)).toEqual({ ok: true });
+    }
+  });
+
+  it.each(['a_b', 'a/b', '../a', 'a\n', 'a\r', 'a\u2028', 'ａ', 'a\u200b', '`a`', '"a"', '--a'])('rejects token separators and invalid characters: %j', token => {
+    expect(() => workerScratchDir(token, 'owner')).toThrow();
+    expect(() => workerScratchDir('fix', token)).toThrow();
+  });
+
+  it.each(['we-scratch-fix_', 'we-scratch-_owner', 'we-scratch-fix_owner_extra', 'we-scratch-fix_owner\n'])('does not recognize malformed scratch encoding %j', segment => {
+    expect(isWorkerScratchDir(segment)).toBe(false);
+  });
+});
 
 describe('checkBodyFileLocation', () => {
   it.each(['/tmp/body.md', '/tmp/pr-body.md', '/lanes/worker-other/body.md', '/home/operator/.claude-other/body.md', '/home/operator/workspace/.operations-other/body.md', '/tmp/task-abc12/body.md', '/tmp/task-abcdef.md', '/tmp/shared-reports/body.md', '/workspace/web-everything/body.md'])('refuses shared path %s with the scratch-dir fallback', path => {
@@ -27,11 +49,25 @@ describe('checkBodyFileLocation', () => {
     expect(check(path)).toEqual({ ok: true });
   });
 
-  it('resolves relative paths before checking tracking and lane containment', () => {
+  it('preserves relative traversal for tracking and resolves it for lexical lane containment', () => {
     const isTracked = vi.fn(() => false);
     expect(check('notes/../body.md', { isTracked })).toEqual({ ok: true });
-    expect(isTracked).toHaveBeenCalledWith('/lanes/worker/body.md');
+    expect(isTracked).toHaveBeenCalledWith('/lanes/worker/notes/../body.md');
     expect(check('../../tmp/body.md')).toMatchObject({ code: 'body-file-shared-path' });
+  });
+
+  it('uses the physical target for directory exemptions after checking the original traversal', () => {
+    const isTracked = vi.fn(() => false);
+    const resolvePath = path => path === '/lanes/worker/body.md' ? '/tmp/body.md' : path;
+    expect(check('body.md', { isTracked, resolvePath })).toMatchObject({ code: 'body-file-shared-path' });
+    expect(isTracked).toHaveBeenCalledWith('/lanes/worker/body.md');
+  });
+
+  it('fails closed with a scratch fallback when physical resolution is unavailable', () => {
+    const result = check('body.md', { resolvePath: () => { throw new Error('EACCES'); } });
+    expect(result).toMatchObject({ code: 'body-file-shared-path' });
+    expect(result.message).toContain('unable to resolve body location');
+    expect(result.message).toContain("brief's per-worker scratch dir");
   });
 
   it.each(['/lanes/worker/body.md', '/tmp/we-scratch-fix-widget-abcdef12/body.md', '/home/operator/.claude/body.md', '/tmp/task-abcdef/body.md'])('refuses tracked files before any directory exemption: %s', path => {

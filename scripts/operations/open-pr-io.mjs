@@ -113,6 +113,22 @@ function bodyFilePath(path, cwd) {
   return isAbsolute(expanded) ? expanded : `${cwd}${sep}${expanded}`;
 }
 
+/** Resolve filesystem traversal before normalizing. Missing tails are allowed for
+ * callers that prepare their body later; other resolution failures stay closed. */
+function physicalBodyPath(path) {
+  let directory = path;
+  const tail = [];
+  for (;;) {
+    try { return join(realpathSync.native(directory), ...tail); }
+    catch (error) {
+      const parent = dirname(directory);
+      if (error.code !== 'ENOENT' || parent === directory) throw error;
+      tail.unshift(basename(directory));
+      directory = parent;
+    }
+  }
+}
+
 /** The decisions a gate may return; anything else (null, `{}`, a typo'd action) is a check error, never a pass. */
 const GATE_ACTIONS = Object.freeze(['pass', 'advise', 'refuse']);
 
@@ -150,34 +166,27 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
   git: gitOpt,
   // Real git/gh only when the real spawn is in use: a caller that injected `spawn` is a rehearsal/test and must stay hermetic.
   bodyLocation = spawn !== spawnSync ? () => ({ ok: true }) : (opts) => checkBodyFileLocation({
-    ...opts, home: homedir(), tmp: tmpdir(),
+    ...opts, home: homedir(), tmp: tmpdir(), resolvePath: physicalBodyPath,
     isTracked: (path) => {
-      // Git reports a physical root. Resolve parent aliases, including paths above
-      // cwd; preserve the basename so a tracked symlink itself remains tracked.
-      let directory = dirname(path);
-      const tail = [basename(path)];
-      let trackingPath;
-      for (;;) {
-        try { trackingPath = join(realpathSync(directory), ...tail); break; }
-        catch (error) {
-          const parent = dirname(directory);
-          if (error.code !== 'ENOENT' || parent === directory) throw error;
-          tail.unshift(basename(directory));
-          directory = parent;
-        }
-      }
+      // Check both the directory entry (a tracked symlink remains tracked) and
+      // the actual file read by the publisher (an untracked symlink may target it).
+      const entryPath = join(physicalBodyPath(dirname(path)), basename(path));
+      const targetPath = physicalBodyPath(path);
       // ls-files errors on external/nonexistent paths. Prove the repository boundary
       // first: a path outside its worktree cannot be tracked in this index.
       const root = execFileSync('git', ['rev-parse', '--show-toplevel'], {
         cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000, maxBuffer: 1024 * 1024,
       }).trim();
-      const rel = relative(root, trackingPath);
-      if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return false;
-      const result = spawnSync('git', ['ls-files', '--error-unmatch', '--', trackingPath], {
-        cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000, maxBuffer: 1024 * 1024,
-      });
-      if (result.error || ![0, 1].includes(result.status)) throw new Error('Git tracking check unavailable');
-      return result.status === 0;
+      for (const trackingPath of new Set([entryPath, targetPath])) {
+        const rel = relative(root, trackingPath);
+        if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) continue;
+        const result = spawnSync('git', ['--literal-pathspecs', 'ls-files', '--error-unmatch', '--', trackingPath], {
+          cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000, maxBuffer: 1024 * 1024,
+        });
+        if (result.error || ![0, 1].includes(result.status)) throw new Error('Git tracking check unavailable');
+        if (result.status === 0) return true;
+      }
+      return false;
     },
   }),
   dupBornAs = spawn !== spawnSync ? () => [] : ({ env: execEnv, ...opts }) => checkDuplicateBornAs({ ...opts, exec: (cmd, args) => execFileSync(cmd, args, { cwd, env: execEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 }) }),

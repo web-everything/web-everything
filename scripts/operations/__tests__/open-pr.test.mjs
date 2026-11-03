@@ -757,6 +757,36 @@ describe('real body tracking adapter', () => {
     expect(submit(runner(), join(root, trackedBody))).toMatchObject({ outcome: 'refused', reason: 'body-file-tracked' });
   });
 
+  it.each(['relative', 'absolute'])('refuses tracked symlink/.. traversal with a %s body path', form => {
+    const bodyFile = '.claude/skills/../package.json';
+    const input = form === 'absolute' ? `${root}/${bodyFile}` : bodyFile;
+    expect(readFileSync(`${root}/${bodyFile}`, 'utf8')).toBe(readFileSync(join(root, 'package.json'), 'utf8'));
+    expect(submit(runner(), input)).toMatchObject({ outcome: 'refused', reason: 'body-file-tracked' });
+  });
+
+  it('refuses an untracked file symlink that the publisher reads as a tracked file', () => {
+    const scratch = mkdtempSync(join(tmpdir(), 'body-tracking-'));
+    try {
+      const alias = join(scratch, 'body.md');
+      symlinkSync(join(root, 'package.json'), alias);
+      expect(readFileSync(alias, 'utf8')).toBe(readFileSync(join(root, 'package.json'), 'utf8'));
+      expect(submit(runner(), alias)).toMatchObject({ outcome: 'refused', reason: 'body-file-tracked' });
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
+  });
+
+  it('still refuses a tracked symlink itself', () => {
+    expect(submit(runner(), '.claude/skills')).toMatchObject({ outcome: 'refused', reason: 'body-file-tracked' });
+  });
+
+  it('fails closed when body symlink resolution loops', () => {
+    const scratch = mkdtempSync(join(tmpdir(), 'body-tracking-'));
+    try {
+      const alias = join(scratch, 'body.md');
+      symlinkSync(alias, alias);
+      expect(submit(runner(), alias)).toMatchObject({ outcome: 'refused', reason: 'body-file-shared-path' });
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
+  });
+
   it('refuses an actually tracked file when cwd and the body use a symlinked checkout path', () => {
     const scratch = mkdtempSync(join(tmpdir(), 'body-tracking-'));
     try {

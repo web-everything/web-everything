@@ -17,6 +17,19 @@ const defaultProof = 'Prove the change on the live case with before/after eviden
 const io = () => ({ stdout: { write: vi.fn() }, stderr: { write: vi.fn() }, writeFile: vi.fn(), newOwner: () => 'tok12345' });
 
 describe('renderWorkerBrief', () => {
+  it('isolates distinct purpose/owner pairs whose hyphen concatenations collide', () => {
+    const pairs = [['fix-widget', 'abc12345'], ['fix', 'widget-abc12345'], ['fix-', 'widget-abc12345'], ['fix', '-widget-abc12345']];
+    // The first three are valid; a leading hyphen owner remains invalid.
+    const paths = pairs.slice(0, 3).map(([purpose, owner]) => {
+      const brief = renderWorkerBrief({ ...params, purpose, owner });
+      const bodyFile = /--bodyFile=([^\s`]+)/.exec(brief)[1];
+      expect(checkBodyFileLocation({ bodyFile, cwd: '/lanes/worker', home: '/home/operator', tmp: '/tmp', isTracked: () => false })).toEqual({ ok: true });
+      return bodyFile;
+    });
+    expect(new Set(paths).size).toBe(paths.length);
+    expect(() => renderWorkerBrief({ ...params, purpose: pairs[3][0], owner: pairs[3][1] })).toThrow();
+  });
+
   it.each(['Alice1', 'tok12345', 'A', 'a-b-', 'Z9-Worker', 'abc12345'])('admits the printed body path for accepted owner %s', owner => {
     const brief = renderWorkerBrief({ ...params, owner });
     const bodyFile = /--bodyFile=([^\s`]+)/.exec(brief)[1];
@@ -26,7 +39,7 @@ describe('renderWorkerBrief', () => {
   it('assigns different scratch dirs to workers with the same purpose and different owners', () => {
     const dirs = ['abc12345', 'def67890'].map(owner => {
       const brief = renderWorkerBrief({ ...params, owner });
-      const dir = `/tmp/we-scratch-${params.purpose}-${owner}`;
+      const dir = `/tmp/we-scratch-${params.purpose}_${owner}`;
       expect(brief).toContain(`**Scratch dir.** \`${dir}\``);
       expect(brief).toContain(`mkdir -p ${dir}`);
       expect(brief).toContain(`--bodyFile=${dir}/body.md`);
