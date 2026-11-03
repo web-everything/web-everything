@@ -5,6 +5,7 @@ import { validateRoutingPolicy, applyRoutingOverrides, DEFAULT_ROUTING_POLICY, r
 import { readPlatformPreferences } from './policy-cascade.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
 import { decideDispatchRoute } from './dispatch-contracts.mjs';
+import { BUILD_KINDS, effectiveBuilder } from './routing-settings.mjs';
 import { providerQuotaHold } from './provider-quota-hold.mjs';
 import { resolveRoutingOverrideRoute } from './dispatch-routing-override-route.mjs';
 function initialPolicy() {
@@ -68,6 +69,14 @@ export function resolveDispatchRoute(dispatch, options = {}) {
   for (const provider of ['antigravity', 'codex']) {
     const hold = providerQuotaHold(records, provider, options.now ?? Date.now());
     if (hold) availability[provider] = hold;
+  }
+  // routing.builder=claude: Codex is held for build kinds only; audit and review seats still use it.
+  const claudeBuilds = BUILD_KINDS.includes(dispatch?.kind) && effectiveBuilder().builder === 'claude';
+  if (claudeBuilds && String(dispatch?.deliveryAgent ?? '').trim().toLowerCase() === 'codex' && effectiveBuilder().settings.codexReserveForAudit) {
+    return { outcome: 'refused', refusal: 'deliveryAgent=codex refused: routing.builder=claude and codexReserveForAudit is true (Codex quota is reserved for audits); set codexReserveForAudit=false or routing.builder=codex to honour it', auditTrail: [] };
+  }
+  if (claudeBuilds && !availability.codex) {
+    availability.codex = 'routing.builder=claude: Codex is reserved for audit';
   }
   return decideDispatchRoute(dispatch, { ...options, availability, routingPolicy: options.routingPolicy ?? readRoutingPolicy() });
 }
