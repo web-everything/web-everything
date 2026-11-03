@@ -6417,6 +6417,89 @@ invariants that already win) and the deterministic-core rule.
     rate-limit/origin checks are n/a for a scheduled job without an endpoint; single-emission retry guards
     still apply. These bounds and n/a reasons are acceptance obligations, not delivered infrastructure.
 
+**R473 standalone-audit projection (addition to this rule).** The audit uses the following closed
+classes. This is a projection of the rule above, with internal delivery represented as `prerelease` and
+public preview/release as `prod`. It does not replace the broader level/debt lifecycle contract.
+
+| Class | Finding | Prerelease | Prod |
+|---|---|---|---|
+| B1 | Security/access bypass, secret/token exposure, authority from agent-settable input | block | block |
+| B2 | Guard fails open | block | block |
+| B3 | Unknown, unreadable or stale state treated as safe or success | block | block |
+| B4 | Ownership, fencing, ordering or merge authorization violation with a reachable interleaving | block | block |
+| B5 | Irreversible action or data loss | block | block |
+| B6 | Required safety alert/escalation silenced, or unresolved finding cleared without evidence | block | block |
+| B7 | Test/check removed or loosened without equal coverage; safety behaviour changed without a test that fails when it breaks | block | block |
+| E1 | Ordinary reversible defect in the diff, with no safety predicate involved | ship + expedite card, 72 hours | block |
+| E2 | Behaviour change in non-guard code without a test | ship + debt card | block |
+| D1 | Unsupported claim without a concrete input/interleaving | one targeted re-check; reclassify on evidence, otherwise explicit advisory resolution | same |
+| D2 | Pre-existing on main, untouched, not newly relied on and exposure not widened | ship + card that must exist on main | ship + card, payable before level move |
+| D3 | Hardening beyond the current contract | advisory + card | card; block if required by the prod contract |
+| X1 | Loosening explicitly ruled by authenticated operator; quoted ruling id and exact scope | ship + accepted-risk card | same |
+| X2 | Incomplete, unparseable or contradictory audit evidence | no clearance; per-finding adjudication | same |
+
+**Rules of use.** Apply an authenticated operator ruling first, bound exactly to file, line, invariant,
+trigger, consequence and relation. An X1 with no authenticated exact match remains unresolved as X2
+until independently classified; a failed exemption does not establish an ordinary reversible defect.
+Otherwise choose the strongest matching row, never first-match.
+Each finding supplies a stable id, exact class token, file:line, violated invariant, concrete trigger or
+step-by-step interleaving, consequence and relation to the diff (`introduced`, `newly relied on`, or
+`untouched`). Missing/malformed evidence fails closed; a D1 may explicitly have a null/empty trigger.
+Unknown class tokens do not alias valid ones. The script computes the verdict from individual findings:
+any block or unresolved recheck means `WEAKENED`; only a complete audit without either is `NOT WEAKENED`.
+Cached clearance is recomputed from complete classified findings under the current trusted settings
+(release stage, additional race paths and authenticated rulings) on every read. Missing findings or a
+newly blocking/unresolved result invalidate clearance and require a new audit or human adjudication;
+a previous block is never automatically cleared by a settings change.
+The model's opening verdict is informational. Every shipped finding retains a card record, including
+advisory and accepted risk; D2 carries `mustPayBefore: prod` and the requirement that its card exist on main.
+A D2 with introduced/newly-relied-on exposure cannot defer as untouched debt. A prod contract requirement
+must be classified as the corresponding defect, rather than hidden as D3.
+
+**Concurrency carve-out.** In file-locks, lease/slot/lock reapers, lane-pool and merge/drain/mq paths,
+a race claim with a stated reachable interleaving is B4 regardless of a weaker model tag; no runnable
+reproduction is required. Before path matching, normalize separators, duplicate slashes and dot segments
+to a repo-relative POSIX path. Absolute paths under the running repo use that root; other absolute
+paths may match a protected repo-relative suffix. Escaping relative paths and unresolvable paths
+retain race protection; insufficient evidence requires the targeted recheck or human adjudication.
+Interleavings use a structured `interleaving` array of 2–32 ordered
+`{ actor, action }` steps involving at least two distinct actors; each field is nonblank and at most
+1024 characters. Classification never infers concurrency from English keywords or punctuation.
+On protected paths, a weaker claim without that evidence stays unresolved as X2 (D1 remains D1).
+A protected path alone does not promote an ordinary output defect to B4; ambiguous claims require the
+single targeted recheck, then human adjudication or an authenticated exact-scope ruling if still unresolved.
+Malformed or oversized interleaving evidence refuses clearance, with that same human fallback.
+
+**Fail-open definition.** A protected action proceeds, authority is granted, or success is reported while
+a required safety predicate is false or not established. Name both the predicate and action. Probe missing,
+unreadable, malformed, stale and conflicting evidence: refuse/defer and report no success. A degraded mode
+requires trusted policy (authenticated operator ruling or a confirmed settings layer); agent-settable flags
+and environment variables establish no authority.
+
+**One re-check per disputed finding.** Deduplicate by file + invariant and bind the targeted re-check to
+the exact original base/head. Never use 2-of-3 full-audit voting. A concrete input/interleaving may reclassify
+D1 to B/E; explicit advisory D3 is possible after investigation. Failed reproduction cannot downgrade a B
+class. Unavailable, malformed, timeout, identity mismatch, still-D1 or contradictory results retain unresolved
+evidence for retry or human adjudication. Resolving one finding does not clear any separate block.
+
+**Settings and prod trigger.** `review.releaseStage` in `scripts/review-settings.json` defaults to
+`prerelease` when omitted, including historical files. Only exact `prerelease` / `prod` tokens are accepted;
+an explicitly malformed value selects `prod`. `review.raceBlockPaths` is a list of literal globs (`*` for a
+segment, `**` across directories) or directory prefixes ending `/`, with built-in protection for the paths
+above. Configured paths extend the built-in list; empty or custom-only lists cannot remove that protection.
+Malformed lists retain built-in protection; maximum 256 entries of 512 characters each. Oversized or
+invalid audit evidence (maximum 1 MiB per answer) refuses clearance and requests human review of the full diff.
+Both keys use the shared standard → platform → tool → environment cascade with effective source diagnostics
+(`resolveAuditSettings` / `resolveReviewSettingSource`). Environment keys are `WE_REVIEW_RELEASE_STAGE` and
+`WE_REVIEW_RACE_BLOCK_PATHS` (JSON array); these are inputs to trusted operator-run tooling, never evidence of
+operator identity. The release-stage environment override may only tighten the configured stage:
+`prod` may replace `prerelease`, but env `prerelease` cannot replace configured `prod` (including
+fail-closed `prod`). An ignored loosening retains the configured source in diagnostics.
+Candidate settings cannot authorize their own audit. The trusted running checkout supplies
+the resolved snapshot. The **prod trigger is the first outside user** of any constellation surface: first
+public npm package publish or first external user/customer on plateau-app. The operator records that level
+move; B rows never relax, and outstanding due debt gates the move.
+
 **Proof requirement and ownership.** Decision `#6239` resolves the design only. Implementation and live proof
 belong to epic `#6236`: production-path before/after on a live PR and a fresh-window recount of auto-block
 overrides and reviewer not-real rulings, with dated windows, denominators and settings revisions. The epic may
