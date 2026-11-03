@@ -3259,7 +3259,7 @@ function homeCdTarget(cmd, { segments, pipedFrom }, home) {
 // target this resolver can't statically resolve (e.g. a command-substitution path) will be wrongly denied.
 // The fix is to invoke with a directly-resolvable `cd` (a literal absolute path, or `LANE=/abs; cd "$LANE"` —
 // the standard lane idiom every skill already teaches), not to reach for a removed override.
-export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve, home = process.env.HOME ?? null, onUnresolvedHome = null) {
+export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve, home = process.env.HOME ?? null, onUnknownCwd = null) {
   // r3 audit — a heredoc BODY is data. A `cd /elsewhere` line (or an apostrophe that desyncs the quote
   // scanner) inside a PR-body heredoc must not steer, or break, the cwd resolution; `decide` already strips
   // them before it parses, and this must agree with it. An unparseable command keeps the REPORTED cwd, which
@@ -3284,14 +3284,36 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
     if (!/\s/.test(val)) vars[m[1]] = val;                    // single-token literal only
   }
   // First `cd <target>` statement wins (that is where the command lands before the mutation runs).
-  for (const stmt of parsed.segments) {
-    const cd = stmt.trim().match(/^cd\s+(.+)$/);
+  for (const [index, stmt] of parsed.segments.entries()) {
+    const cd = stmt.trim().match(/^cd(?:\s+(.*))?$/);
     if (!cd) continue;
-    let target = cd[1].trim().split(/\s+/)[0];                // first arg only (ignore trailing redirs/opts)
-    // An unquoted home target the resolver above could not expand although the starting HOME is usable
-    // (so the command rebinds HOME unreadably): the directory is unknown. Tell the caller, so git targets
-    // fail closed instead of trusting the literal `~` join below.
-    if (target.startsWith('~') && onUnresolvedHome && typeof home === 'string' && isAbsolute(home)) onUnresolvedHome();
+    const args = (cd[1] || '').trim().split(/\s+/).filter(Boolean);
+    while (args.length && /^-[LPe@]+$/.test(args[0])) args.shift(); // options never name the directory
+    if (args[0] === '--') args.shift();
+    let target = args[0] ?? '~';                              // first arg only; a bare `cd` goes to HOME
+    if (target === '-') {                                     // OLDPWD is not known here
+      if (onUnknownCwd) onUnknownCwd();
+      return reportedCwd;
+    }
+    // A home target the resolver above did not expand (it reads only simple statement chains). With a
+    // usable starting HOME, expand it when no earlier statement can touch HOME; otherwise the directory is
+    // unknown, and the caller makes git targets fail closed instead of trusting a literal `~` join.
+    // An unquoted `$HOME` word-splits on a HOME with whitespace, so `cd` would not land there.
+    const quotedHome = /^("?)\$(?:HOME|\{HOME\})(\/[^$`"'\\]*)?\1$/.exec(target);
+    const splits = quotedHome && !quotedHome[1] && /\s/.test(home ?? '');
+    const homeRest = /^~(?:\/|$)/.test(target) ? target.slice(1) : quotedHome && !splits ? quotedHome[2] || '' : null;
+    if ((homeRest !== null || /^~/.test(target)) && typeof home === 'string' && isAbsolute(home)) {
+      let tracked = homeRest === null ? null : home;          // `~user` / `~+` / `~-` are never resolved here
+      for (const before of parsed.segments.slice(0, index)) {
+        if (tracked === null) break;
+        try { tracked = valueAfter(before, 'HOME', tracked, tracked); } catch { tracked = null; }
+      }
+      if (tracked !== home) {
+        if (onUnknownCwd) onUnknownCwd();
+        return reportedCwd;
+      }
+      return home + homeRest;
+    }
     target = target.replace(/^(['"])(.*)\1$/, '$2');          // strip surrounding quotes
     const v = target.match(/^\$\{?([A-Za-z_]\w*)\}?$/);       // whole target is $VAR / ${VAR}
     if (v) target = vars[v[1]] ?? '';
@@ -5391,7 +5413,7 @@ if (IS_CLI) {
   let dispatchKind = null;
   let agentSession = false;
   let effectiveCwd = null;
-  let cwdHomeUnknown = false; // a leading `cd ~…` whose HOME could not be followed
+  let cwdUnknown = false; // a leading `cd` whose directory could not be followed (HOME rebound, `cd -`)
   let daemonRoots = [];
   let hookSessionId = null;
   let orchestratorSettings = {};
@@ -5429,7 +5451,7 @@ if (IS_CLI) {
     const rp = (p) => { try { return realpathSync(p); } catch { return p; } };
     // #2335 — the reported cwd resets to the primary between calls; honour a leading `cd <lane>` so a genuine
     // lane mutation isn't misread as a primary one (and the #2323 git call runs in the lane, not the primary).
-    const cwd = rp(resolveEffectiveCwd(cmd, ev.cwd || process.cwd(), undefined, undefined, () => { cwdHomeUnknown = true; }));
+    const cwd = rp(resolveEffectiveCwd(cmd, ev.cwd || process.cwd(), undefined, undefined, () => { cwdUnknown = true; }));
     effectiveCwd = cwd;
     const weRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
     const workspace = dirname(weRoot);
@@ -5455,7 +5477,7 @@ if (IS_CLI) {
   }
   // --config-env can name any inherited variable, not just one of Git's own GIT_* variables.
   const gitConfigEnv = { ...process.env };
-  const guardCtx = { ...orchestratorSettings, primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, daemonCloneRoots: daemonRoots, gitConfigEnv, gitTargetUnknown: cwdHomeUnknown, daemonFetchConfigReader: readDaemonFetchConfig, fixPushes };
+  const guardCtx = { ...orchestratorSettings, primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, daemonCloneRoots: daemonRoots, gitConfigEnv, gitTargetUnknown: cwdUnknown, daemonFetchConfigReader: readDaemonFetchConfig, fixPushes };
   const r = decide(cmd, guardCtx);
   if (r) {
     // #3311 — the deny is ALL-OR-NOTHING, so name the state-producing steps it takes down with it. Computed

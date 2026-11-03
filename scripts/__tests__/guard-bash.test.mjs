@@ -4585,6 +4585,15 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
         [`HOME=${root}; HOME=/tmp export X=1; cd ~/workspace/wev-review-daemon && git reset --hard`, hookHome, true],
         [`read HOME <<< ${root}; cd ~/workspace/wev-review-daemon && git status`, hookHome, false],
         [`cd ~ && git status`, hookHome, false],
+        // Chains the simple cd resolver does not read still expand `~` when nothing touched HOME.
+        ['git status && cd ~/lane && git commit -m x', root, false],
+        ['git status && cd ~/workspace/wev-review-daemon && git reset --hard', root, true],
+        ['git status && cd "$HOME/workspace/wev-review-daemon" && git reset --hard', root, true],
+        // cd options never name the directory; a bare cd goes to HOME.
+        ['cd -P ~/workspace/wev-review-daemon && git reset --hard', root, true],
+        [`cd -- ${homeClone} && git reset --hard`, root, true],
+        [`HOME=${homeClone}; cd; git reset --hard`, hookHome, true],
+        [`HOME=${homeClone}; cd; git status`, hookHome, false],
       ])('applies Bash HOME timing at the hook: %s', (command, home, denied) => {
         const out = runHook(command, lane, home);
         if (denied) expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
