@@ -573,7 +573,7 @@ export function createDrainMergeStrategy({
         },
         ...(preparedAdmission ? { preparedSurface: prepared.preparedSurface } : {}) });
       if (!r.ok) {
-        if (r.reason === 'mq-same-head-failed') return { enqueued: false, kind: r.reason, reason: r.error };
+        if (r.reason === 'mq-same-head-failed') return { enqueued: false, kind: 'mq-same-head-failed', reason: r.error };
         if (r.humanOnly) {
           void appendDaemonEvent({ kind: 'needs-you', repo: slugOf(c.repo), pr: c.num, daemon: 'drain',
             detail: `Operator must re-approve the current head or queue it: ${r.licenseReason || r.error}` }, { env }).catch(() => {});
