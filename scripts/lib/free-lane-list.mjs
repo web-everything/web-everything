@@ -214,3 +214,24 @@ export function writeFreeLaneListAtomic(path, list, { tmpPathFor = defaultTmpPat
 }
 
 const defaultTmpPathFor = (path) => `${path}.${process.pid}.${Date.now()}.${randomBytes(8).toString('hex')}.tmp`;
+
+/**
+ * Event-driven refresh: apply ONE lane's change (a release makes it free, an acquire/trim makes it not) to the
+ * published list and stamp it fresh NOW, without waiting for the periodic health-watch pass (its cadence was
+ * 8-44 min apart on 2026-11-03, so the list sat past its freshness limit and `acquire` fell into the full
+ * per-lane scan). Entries not touched here are carried over unverified, which is safe: `acquire` re-claims and
+ * re-verifies every candidate it takes from the list. Best-effort and never throws, so a lane-pool command can
+ * never fail because of it.
+ * @param {{path:string, repoName:string, poolDir:string, lane:number, free:boolean, now?:number, laneDir?:string, head?:(string|null), branch?:(string|null)}} o
+ * @returns {boolean} whether the list was rewritten
+ */
+export function touchFreeLaneList({ path, repoName, poolDir, lane, free, now = Date.now(), laneDir = null, head = null, branch = null }) {
+  try {
+    if (!Number.isInteger(lane) || lane < 0) return false;
+    const prior = readFreeLaneList(path);
+    const kept = (prior?.lanes ?? []).filter((l) => l.lane !== lane);
+    if (free) kept.push({ lane, path: laneDir ?? join(poolDir, `lane-${lane}`), head, branch });
+    writeFreeLaneListAtomic(path, buildFreeLaneList({ repoName, poolDir, writtenAt: now, lanes: kept }));
+    return true;
+  } catch { return false; }
+}
