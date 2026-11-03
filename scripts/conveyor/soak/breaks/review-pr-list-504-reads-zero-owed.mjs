@@ -63,7 +63,7 @@ export async function replayPrList504(root) {
 export default {
   id: 'review-pr-list-504-reads-zero-owed',
   title: 'a GitHub 504 on the open-PR list is retried, surfaced and evented — never read as "0 owed"',
-  card: 'live incident 2026-11-03, review/fix/drain gh pr list 504',
+  card: 'live incident 2026-11-03, review/fix/drain open-PR list 504',
   fixedBy: {
     sha: '393b3f4237',
     where: 'lane/cheap-pr-list-retry',
