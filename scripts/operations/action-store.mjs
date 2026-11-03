@@ -80,7 +80,7 @@ export function createActionStore({ root = resolveCoordinationRoot(), fs = nativ
       });
     });
   };
-  const claim = ({ resource, kind, owner, evidence = null, attempt, reconcile: reconcilePort }) => {
+  const claim = ({ resource, kind, owner, evidence = null, attempt, reconcile: reconcilePort, canClaim }) => {
     if (attempt !== undefined) throw new TypeError('Attempt numbers are allocated by the action store');
     const identity = parseResource(resource);
     const allocate = () => {
@@ -100,6 +100,8 @@ export function createActionStore({ root = resolveCoordinationRoot(), fs = nativ
         }
         return { ok: false, held: true, reason: isExpired(latest, now()) ? 'held:indeterminate' : 'held', record: latest };
       }
+      // Recheck terminal admission on every allocation retry, including exclusive-create races.
+      if (latest && canClaim && canClaim(latest) !== true) return { ok: false, held: true, reason: 'held', record: latest };
       const at = milliseconds(now());
       const record = { version: 1, ...identity, attempt: (latest?.attempt ?? 0) + 1, kind, state: 'intent', outcome: null,
         owner, ownerToken: randomUUID(), createdAt: at, updatedAt: at, heartbeatAt: at, leaseMs,

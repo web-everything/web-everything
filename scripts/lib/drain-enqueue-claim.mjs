@@ -4,129 +4,62 @@
  * storage faults: withLandWriteLock already serializes the enqueue, so claim-store
  * failures warn without changing serial behavior. Explicit ownership refusals skip.
  * Live owners remain held regardless of age (including the legacy hardTtlMs cap).
- * Done records use ttlMs from doneAt across kinds, or claimedAt for legacy records.
- * Unreadable records remain held through ttlMs based on their file mtime.
+ * Enqueued terminals use ttlMs from doneAt across kinds; same-kind retries proceed.
+ * Unreadable or inconsistent coordination records are storage faults, never reclaimed by age.
  */
-import { createHash, randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { performance } from 'node:perf_hooks';
+import { hostname } from 'node:os';
+import { createActionStore, CoordinationUnavailableError } from '../operations/action-store.mjs';
+import { actionResource } from '../operations/action-record.mjs';
+import { pidAlive as ownerAlive } from '../operations/coordination-lock.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
 
-function ownerAlive(pid) {
-  try { process.kill(pid, 0); return true; }
-  catch (error) { return error.code !== 'ESRCH'; }
-}
-
 export function createEnqueueClaims({
   env = process.env,
-  dir = join(resolveCoordinationRoot({ env }), 'drain-enqueue-claim'),
+  root = resolveCoordinationRoot({ env }),
+  dir, // Retain the old explicit test/storage override as an action-store root.
   now = Date.now,
   pidAlive = ownerAlive,
+  isPidAlive = pidAlive,
   ttlMs = 10 * 60_000,
   pid = process.pid,
+  host = hostname(),
 } = {}) {
-  const sleeper = new Int32Array(new SharedArrayBuffer(4));
-  const unreadable = path => {
-    try { return { unreadable: true, mtimeMs: statSync(path).mtimeMs }; }
-    catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  const store = createActionStore({ root: dir ?? root, now, isPidAlive });
+  // Item IDs permit a lossless hex encoding of the head-qualified enqueue key.
+  const resourceFor = c => actionResource(c.repo, { type: 'item',
+    id: `enqueue-${Buffer.from(`${c.num}@${c.headSha}`).toString('hex')}` });
+  const alive = record => {
+    const owner = record.evidence;
+    if (owner.host !== host) return undefined;
+    try { return isPidAlive(owner.pid); }
+    catch (error) { return error.code === 'ESRCH' ? false : undefined; }
   };
-  const read = path => {
-    let source;
-    try { source = readFileSync(path, 'utf8'); }
-    catch (error) { if (error.code === 'ENOENT') return null; return unreadable(path); }
-    let record;
-    try { record = JSON.parse(source); } catch { return unreadable(path); }
-    if (!record || !['claimed', 'done'].includes(record.state) || typeof record.token !== 'string'
-        || typeof record.kind !== 'string' || !Number.isInteger(record.pid) || record.pid <= 0
-        || !Number.isFinite(record.claimedAt)) return unreadable(path);
-    return record;
-  };
-  const write = (path, record) => {
-    const temporary = `${path}.${randomUUID()}.tmp`;
-    try { writeFileSync(temporary, JSON.stringify(record), { flag: 'wx' }); renameSync(temporary, path); }
-    finally { rmSync(temporary, { force: true }); }
-  };
-  const locked = (candidate, operation) => {
-    const key = `${candidate.repo}#${candidate.num}@${candidate.headSha}`;
-    const path = join(dir, `${createHash('sha256').update(key).digest('hex')}.json`);
-    const lock = `${path}.lock`;
-    mkdirSync(dir, { recursive: true });
-    const deadline = performance.now() + 2000;
-    const owner = `${randomUUID()}.owner`;
-    const staged = `${lock}.${owner}.tmp`;
-    mkdirSync(staged);
-    let owned = false;
-    try {
-      // Publish a nonempty directory atomically: even a delayed rmdir cannot remove a successor.
-      writeFileSync(join(staged, owner), '', { flag: 'wx' });
-      for (;;) {
-        try {
-          // Snapshot the unique marker BEFORE the age check. Unlink only that observed generation.
-          const entries = readdirSync(lock);
-          if (Date.now() - statSync(lock).mtimeMs > 5000) {
-            if (entries.length === 0) rmdirSync(lock); // Legacy empty lock.
-            else if (entries.length === 1 && entries[0].endsWith('.owner')) {
-              unlinkSync(join(lock, entries[0]));
-              rmdirSync(lock);
-            }
-          }
-        } catch (error) {
-          if (error.code === 'ENOENT') {
-            try {
-              const at = new Date(); utimesSync(staged, at, at);
-              renameSync(staged, lock);
-              owned = true;
-              break;
-            } catch (publishError) {
-              if (!['EEXIST', 'ENOTEMPTY'].includes(publishError.code)) throw publishError;
-            }
-          } else if (!['EEXIST', 'ENOTEMPTY'].includes(error.code)) throw error;
-        }
-        if (performance.now() >= deadline) return { won: false, reason: 'lock-busy' };
-        Atomics.wait(sleeper, 0, 0, 10);
-      }
-      return operation(path, key);
-    } finally {
-      rmSync(staged, { recursive: true, force: true });
-      if (owned) {
-        try { unlinkSync(join(lock, owner)); rmdirSync(lock); }
-        catch (error) { if (!['ENOENT', 'EEXIST', 'ENOTEMPTY'].includes(error.code)) throw error; }
-      }
-    }
+  const finish = (candidate, outcome) => {
+    const resource = resourceFor(candidate);
+    const record = store.attempts(resource).at(-1);
+    if (!record || record.ownerToken !== candidate.token || record.state === 'terminal') return;
+    const result = store.transition(resource, record.attempt, {
+      token: candidate.token, rev: record.rev, from: 'intent', to: 'terminal',
+      patch: { outcome },
+    });
+    if (!result.ok) throw new CoordinationUnavailableError(resource, result.reason);
   };
   return {
     claim(candidate) {
-      return locked(candidate, (path, key) => {
-        const record = read(path);
-        const at = now();
-        if (record) {
-          if (record.unreadable && at - record.mtimeMs <= ttlMs) return { won: false, reason: 'unreadable-record' };
-          if (record.state === 'done' && at - (record.doneAt ?? record.claimedAt) <= ttlMs && record.kind !== candidate.kind) return { won: false, reason: 'done-by-other', heldBy: record };
-          if (record.state === 'claimed') {
-            let alive;
-            try { alive = pidAlive(record.pid); } catch (error) { alive = error.code !== 'ESRCH'; }
-            if (alive) return { won: false, reason: 'held', heldBy: record };
-          }
-        }
-        const token = randomUUID();
-        write(path, { key, state: 'claimed', kind: candidate.kind, pid, token, claimedAt: at });
-        return { won: true, token };
+      const result = store.claim({
+        resource: resourceFor(candidate), kind: 'enqueue', owner: `${host}:${pid}`,
+        evidence: { pid, host, kind: candidate.kind, key: `${candidate.repo}#${candidate.num}@${candidate.headSha}` },
+        canClaim: previous => previous.outcome !== 'enqueued' || previous.evidence.kind === candidate.kind
+          || now() - previous.evidence.doneAt > ttlMs,
+        reconcile: record => store.reconcile(record, { ownerAlive: alive }),
       });
+      if (result.ok) return { won: true, token: result.record.ownerToken };
+      return { won: false, reason: result.record?.state === 'terminal' ? 'done-by-other' : 'held',
+        heldBy: result.record?.evidence };
     },
-    release(candidate) {
-      return locked(candidate, path => {
-        const record = read(path);
-        if (record && record.token === candidate.token) unlinkSync(path);
-      });
-    },
-    markDone(candidate) {
-      return locked(candidate, path => {
-        const record = read(path);
-        if (record && record.token === candidate.token) write(path, { ...record, state: 'done', doneAt: now() });
-      });
-    },
+    release: candidate => finish(candidate, 'released'),
+    markDone: candidate => finish(candidate, 'enqueued'),
   };
 }
 

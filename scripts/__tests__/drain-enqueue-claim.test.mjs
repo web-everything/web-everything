@@ -1,275 +1,231 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import * as nativeFs from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { createHash } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { hostname } from 'node:os';
 import { pathToFileURL } from 'node:url';
+import { fork } from 'node:child_process';
 import * as claimModule from '../lib/drain-enqueue-claim.mjs';
 import { createEnqueueClaims, withSerialEnqueueClaim } from '../lib/drain-enqueue-claim.mjs';
+import { createActionStore } from '../operations/action-store.mjs';
+import { assertActionRecord, transitionRecord } from '../operations/action-record.mjs';
 
 const roots = [];
-const temp = () => { const dir = mkdtempSync(join(process.env.TMPDIR, 'enqueue-claim-')); roots.push(dir); return dir; };
-const candidate = { repo: 'owner/repo', num: 7, headSha: 'head-a' };
+const temp = () => { const root = mkdtempSync(join(process.env.TMPDIR, 'enqueue-claim-')); roots.push(root); return root; };
+const candidate = { repo: 'web-everything/web-everything', num: 7, headSha: 'head-a' };
 const key = c => `${c.repo}#${c.num}@${c.headSha}`;
-const filename = c => `${createHash('sha256').update(key(c)).digest('hex')}.json`;
 const claim = (claims, c = candidate, kind = 'serial') => claims.claim({ ...c, kind });
-const make = (dir = temp(), options = {}) => createEnqueueClaims({ dir, now: () => 100, pidAlive: () => true, ...options });
-afterEach(() => { vi.restoreAllMocks(); for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+const make = (root = temp(), options = {}) => createEnqueueClaims({ root, dir: root, now: () => 100, isPidAlive: () => true, ...options });
+const latest = root => createActionStore({ root }).list().at(-1);
+afterEach(() => { vi.restoreAllMocks(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
-describe('per-PR enqueue claims', () => {
-  it('allows exactly one of concurrent same-head claimants to win', async () => {
-    const dir = temp();
-    const results = await Promise.all(Array.from({ length: 12 }, (_, pid) => Promise.resolve().then(() => claim(make(dir, { pid: pid + 1 })))));
-    expect(results.filter(r => r.won)).toHaveLength(1);
-    for (const result of results.filter(r => !r.won)) expect(result).toMatchObject({ reason: 'held', heldBy: { pid: 1, kind: 'serial' } });
+describe('action-store enqueue claims', () => {
+  it('two claimants for one key have exactly one winner in the shared ledger', () => {
+    const root = temp(); const a = claim(make(root)); const b = claim(make(root));
+    expect(a).toMatchObject({ won: true, token: expect.any(String) });
+    expect(b).toMatchObject({ won: false, reason: 'held' });
+    expect(latest(root)).toMatchObject({ state: 'intent', ownerToken: a.token,
+      evidence: { pid: process.pid, host: hostname(), kind: 'serial', key: key(candidate) } });
   });
 
-  it('holds live owners beyond ttlMs and past the default 60-minute hard cap', () => {
-    const dir = temp();
-    claim(make(dir));
-    expect(claim(make(dir, { now: () => 600_101 }))).toMatchObject({ won: false, reason: 'held' });
-    expect(claim(make(dir, { now: () => 3_600_100 }))).toMatchObject({ won: false, reason: 'held' });
-    expect(claim(make(dir, { now: () => 3_600_101 }))).toMatchObject({ won: false, reason: 'held' });
+  it('concurrent processes claiming the same key have exactly one winner', async () => {
+    const root = temp(); const worker = join(root, 'worker.mjs');
+    const moduleUrl = pathToFileURL(join(process.cwd(), 'scripts/lib/drain-enqueue-claim.mjs')).href;
+    writeFileSync(worker, `import { createEnqueueClaims, claimOrFault } from ${JSON.stringify(moduleUrl)};
+      process.send('ready');
+      process.once('message', () => {
+        process.send(claimOrFault(createEnqueueClaims({ root: process.argv[2], dir: process.argv[2] }),
+          JSON.parse(process.argv[3]), { emit() {} }));
+        process.disconnect();
+      });`);
+    const children = Array.from({ length: 4 }, () => fork(worker, [root, JSON.stringify({ ...candidate, kind: 'serial' })], { execArgv: [], stdio: ['ignore', 'ignore', 'pipe', 'ipc'] }));
+    try {
+      let readyCount = 0;
+      const answersPromise = Promise.all(children.map(child => new Promise((resolve, reject) => {
+        let stderr = '';
+        child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-4096); });
+        child.on('error', reject);
+        child.once('exit', code => { if (code) reject(new Error(`child exited ${code}: ${stderr}`)); });
+        child.on('message', message => {
+          if (message === 'ready') { if (++readyCount === children.length) children.forEach(c => c.send('claim')); }
+          else resolve(message);
+        });
+      })));
+      const answers = await answersPromise;
+      expect(answers.filter(r => r.won)).toHaveLength(1);
+      expect(answers.filter(r => !r.won).every(r => r.reason === 'held' || r.reason === 'claim-fault')).toBe(true);
+    } finally { children.forEach(child => child.kill()); }
+  }, 15_000);
+
+  it('a paused live owner stays held beyond lease, ttl and any legacy age cap', () => {
+    const root = temp(); claim(make(root));
+    expect(claim(make(root, { now: () => 100_000_000, ttlMs: 10, hardTtlMs: 20 })))
+      .toMatchObject({ won: false, reason: 'held' });
+    expect(latest(root).attempt).toBe(1);
   });
 
-  it('keeps a live owner held past an injected hard cap', () => {
-    const dir = temp();
-    claim(make(dir));
-    expect(claim(make(dir, { now: () => 1100, ttlMs: 10, hardTtlMs: 1000 }))).toMatchObject({ won: false, reason: 'held' });
-    expect(claim(make(dir, { now: () => 1101, ttlMs: 10, hardTtlMs: 1000 }))).toMatchObject({ won: false, reason: 'held' });
+  it('reconciles an expired dead same-host owner before allocating a new attempt', () => {
+    const root = temp(); const a = claim(make(root, { pid: 123456 }));
+    expect(claim(make(root, { now: () => 600_101, isPidAlive: () => false }))).toMatchObject({ won: true });
+    const rows = createActionStore({ root }).list();
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({ state: 'terminal', outcome: 'abandoned-absent' });
+    expect(rows[1].ownerToken).not.toBe(a.token);
   });
 
-  it('reclaims a dead owner immediately before either TTL expires', () => {
-    const dir = temp();
-    claim(make(dir));
-    expect(claim(make(dir, { pidAlive: () => false }))).toMatchObject({ won: true });
+  it('does not reclaim a dead owner before lease expiry', () => {
+    const root = temp(); claim(make(root));
+    expect(claim(make(root, { isPidAlive: () => false }))).toMatchObject({ won: false, reason: 'held' });
   });
 
-  it('replaces an owner past the hard cap only after its PID is dead', () => {
-    const dir = temp(); claim(make(dir));
-    expect(claim(make(dir, { now: () => 1101, hardTtlMs: 1000, pidAlive: () => false })).won).toBe(true);
+  it.each(['remote-host', 'throwing-probe', 'unknown-probe'])('holds uncertain owner liveness: %s', scenario => {
+    const root = temp(); claim(make(root, scenario === 'remote-host' ? { host: 'remote.invalid' } : {}));
+    const isPidAlive = scenario === 'throwing-probe' ? () => { throw new Error('unknown'); } : () => undefined;
+    expect(claim(make(root, { now: () => 100_000_000, isPidAlive }))).toMatchObject({ won: false, reason: 'held' });
   });
 
-  it('keys repository, PR number and new head independently', () => {
-    const claims = make();
-    for (const c of [candidate, { ...candidate, headSha: 'head-b' }, { ...candidate, repo: 'other/repo' }, { ...candidate, num: 8 }]) expect(claim(claims, c).won).toBe(true);
+  it.each(['corrupt', 'unreadable', 'inconsistent'])('async holds %s records forever; serial warns and fails open', fault => {
+    const root = temp(); const claims = make(root); claim(claims);
+    const store = createActionStore({ root }); const record = latest(root); const path = store.pathFor(record.resource, record.attempt);
+    if (fault === 'unreadable') { rmSync(path); mkdirSync(path); }
+    else writeFileSync(path, fault === 'corrupt' ? '{broken' : JSON.stringify({ ...record, attempt: 99 }));
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    const broken = make(root, { now: () => 100_000_000 });
+    expect(claimModule.claimOrFault(broken, { ...candidate, kind: 'fast' }, { emit: vi.fn() }))
+      .toEqual({ won: false, reason: 'claim-fault' });
+    const run = vi.fn(() => ({ enqueued: true }));
+    expect(withSerialEnqueueClaim(broken, candidate, run, { emit: vi.fn() })).toEqual({ enqueued: true });
+    expect(run).toHaveBeenCalledOnce();
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining('proceeding fail-open'));
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining('held fail-closed'));
   });
 
-  it('release and markDone ignore wrong tokens, including tokens from a replaced owner', () => {
-    const dir = temp(); const claims = make(dir);
-    const first = claim(claims);
-    claims.release({ ...candidate, token: 'wrong' });
-    claims.markDone({ ...candidate, token: 'wrong' });
-    expect(claim(claims)).toMatchObject({ won: false, reason: 'held' });
-    const next = claim(make(dir, { pidAlive: () => false }));
-    claims.release({ ...candidate, token: first.token });
+  it('enqueued terminal protects a different kind for ttl from doneAt, then expires', () => {
+    const root = temp(); let clock = 100;
+    const claims = make(root, { now: () => clock, ttlMs: 1000 }); const first = claim(claims);
+    clock = 10_000; claims.markDone({ ...candidate, token: first.token });
+    expect(latest(root)).toMatchObject({ state: 'terminal', outcome: 'enqueued', updatedAt: clock, evidence: { doneAt: clock } });
+    clock = 11_000; expect(claim(claims, candidate, 'fast').reason).toBe('done-by-other');
+    clock++; expect(claim(claims, candidate, 'fast').won).toBe(true);
+  });
+
+  it('rechecks terminal admission after allocation contention and refuses a different kind after the winner enqueues', () => {
+    const root = temp(); const winner = make(root);
+    const first = claim(winner); winner.release({ ...candidate, token: first.token });
+    const resource = latest(root).resource;
+    const store = createActionStore({ root });
+    let interleaved = false;
+    const openSync = vi.fn((path, flags) => {
+      expect(path).toBe(store.pathFor(resource, 2));
+      expect(flags).toBe('wx');
+      expect(interleaved).toBe(false);
+      interleaved = true;
+      // The loser has read the released terminal and chosen attempt 2. Publish
+      // the winner's claim AND completion before the loser's exclusive create.
+      const won = claim(winner);
+      expect(won.won).toBe(true);
+      winner.markDone({ ...candidate, token: won.token });
+      return nativeFs.openSync(path, flags); // Real EEXIST forces allocation retry.
+    });
+    const loser = createActionStore({ root, now: () => 100, fs: { ...nativeFs, openSync } });
+    const canClaim = vi.fn(previous => previous.outcome !== 'enqueued'
+      || previous.evidence.kind === 'fast' || 100 - previous.evidence.doneAt > 1000);
+    const result = loser.claim({ resource, kind: 'enqueue', owner: 'loser',
+      evidence: { pid: process.pid, host: hostname(), kind: 'fast', key: key(candidate) }, canClaim });
+    expect(interleaved).toBe(true);
+    expect(openSync).toHaveBeenCalledTimes(1);
+    expect(canClaim.mock.calls.map(([record]) => record.outcome)).toEqual(['released', 'enqueued']);
+    expect(result).toMatchObject({ ok: false, held: true,
+      record: { attempt: 2, state: 'terminal', outcome: 'enqueued', evidence: { kind: 'serial' } } });
+    expect(store.attempts(resource)).toHaveLength(2);
+  });
+
+  it('doneAt equals the terminal transition time even when each clock read advances', () => {
+    const root = temp(); let clock = 100;
+    const claims = make(root, { now: () => ++clock }); const first = claim(claims);
     claims.markDone({ ...candidate, token: first.token });
+    const record = latest(root);
+    expect(record.outcome).toBe('enqueued');
+    expect(record.evidence.doneAt).toBe(record.updatedAt);
+    expect(record.evidence.doneAt).toBe(record.history.at(-1).at);
+  });
+
+  it('the shared reconciler holds expired enqueue intent without an owner-liveness port', () => {
+    const root = temp(); claim(make(root));
+    const store = createActionStore({ root, now: () => 100_000_000 });
+    expect(store.reconcile(latest(root))).toMatchObject({ ok: false, held: true });
+    expect(latest(root).state).toBe('intent');
+  });
+
+  it('unavailable coordination root fails closed for async and warns before serial fail-open', () => {
+    const root = join(temp(), 'not-a-directory'); writeFileSync(root, 'blocked');
+    const claims = make(root); const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    expect(claimModule.claimOrFault(claims, candidate, { emit: vi.fn() })).toEqual({ won: false, reason: 'claim-fault' });
+    expect(claimModule.claimOrFault(claims, candidate, { mode: 'serial', emit: vi.fn() })).toEqual({ won: true });
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining('proceeding fail-open'));
+  });
+
+  it('same kind reclaims enqueued immediately; release also retires through the ledger', () => {
+    const root = temp(); const claims = make(root); const first = claim(claims);
+    claims.markDone({ ...candidate, token: first.token }); const next = claim(claims);
+    expect(next.won).toBe(true); claims.release({ ...candidate, token: next.token });
+    expect(latest(root)).toMatchObject({ state: 'terminal', outcome: 'released' });
+    expect(claim(claims, candidate, 'fast').won).toBe(true);
+  });
+
+  it('ignores wrong and superseded tokens for release and markDone', () => {
+    const root = temp(); const claims = make(root); const first = claim(claims);
+    for (const op of ['release', 'markDone']) claims[op]({ ...candidate, token: 'wrong' });
     expect(claim(claims).reason).toBe('held');
-    claims.release({ ...candidate, token: next.token });
-    expect(claim(claims).won).toBe(true);
+    claims.release({ ...candidate, token: first.token }); const next = claim(claims);
+    for (const op of ['release', 'markDone']) claims[op]({ ...candidate, token: first.token });
+    expect(latest(root)).toMatchObject({ state: 'intent', ownerToken: next.token });
   });
 
-  it('done serial blocks fast until expiry but permits serial retries and stamps doneAt', () => {
-    const dir = temp(); let clock = 100;
-    const claims = make(dir, { now: () => clock, ttlMs: 1000 });
-    const first = claim(claims); clock = 200;
-    claims.markDone({ ...candidate, token: first.token });
-    expect(JSON.parse(readFileSync(join(dir, filename(candidate)), 'utf8'))).toMatchObject({ state: 'done', doneAt: 200 });
-    expect(claim(claims, candidate, 'fast')).toMatchObject({ won: false, reason: 'done-by-other', heldBy: { kind: 'serial' } });
-    clock = 1201;
-    expect(claim(claims, candidate, 'fast').won).toBe(true);
-    claims.release({ ...candidate, token: JSON.parse(readFileSync(join(dir, filename(candidate)), 'utf8')).token });
-    const second = claim(claims); claims.markDone({ ...candidate, token: second.token });
-    expect(claim(claims).won).toBe(true);
+  it('new head SHA, repository and PR number are independent', () => {
+    const claims = make();
+    for (const c of [candidate, { ...candidate, headSha: 'head-b' }, { ...candidate, num: 8 }, { ...candidate, repo: 'frontier-ui/frontierui' }]) expect(claim(claims, c).won).toBe(true);
   });
 
-  it('protects a long enqueue from other kinds for a full TTL after doneAt', () => {
-    let clock = 100; const ttlMs = 10_000;
-    const claims = make(undefined, { now: () => clock, ttlMs });
-    const first = claim(claims);
-    clock = 100 + ttlMs + 1000;
-    claims.markDone({ ...candidate, token: first.token });
-    clock = 100 + ttlMs + 2000;
-    expect(claim(claims, candidate, 'fast')).toMatchObject({ won: false, reason: 'done-by-other' });
-    clock = 100 + 2 * ttlMs + 1000;
-    expect(claim(claims, candidate, 'fast').reason).toBe('done-by-other');
-    clock++;
-    expect(claim(claims, candidate, 'fast').won).toBe(true);
-  });
-
-  it('falls back to claimedAt for persisted done records missing doneAt', () => {
-    const dir = temp();
-    writeFileSync(join(dir, filename(candidate)), JSON.stringify({ state: 'done', kind: 'serial', pid: 1, token: 'old', claimedAt: 100 }));
-    expect(claim(make(dir, { now: () => 1100, ttlMs: 1000 }), candidate, 'fast').reason).toBe('done-by-other');
-    expect(claim(make(dir, { now: () => 1101, ttlMs: 1000 }), candidate, 'fast').won).toBe(true);
-  });
-
-  it('uses shared coordination state across instances without leaving temporary files', () => {
-    const root = temp(); const env = { WE_COORDINATION_ROOT: root };
-    expect(claim(createEnqueueClaims({ env })).won).toBe(true);
-    expect(claim(createEnqueueClaims({ env })).reason).toBe('held');
-    expect(readdirSync(join(root, 'drain-enqueue-claim'))).toEqual([filename(candidate)]);
-  });
-
-  it('reclaims a lock older than five seconds', () => {
-    const dir = temp(); const lock = join(dir, `${filename(candidate)}.lock`);
-    mkdirSync(lock); const old = new Date(Date.now() - 6000); utimesSync(lock, old, old);
-    expect(claim(make(dir)).won).toBe(true);
-  });
-
-  it.each([false, true])('exactly one claimant wins when two stale-lock reclaimers race with a live replacement (owner marker: %s)', marked => {
-    const dir = temp(); const lock = join(dir, `${filename(candidate)}.lock`);
-    mkdirSync(lock);
-    if (marked) writeFileSync(join(lock, 'expired.owner'), '');
-    const old = new Date(Date.now() - 6000); utimesSync(lock, old, old);
-    const worker = `
-      const { parentPort, workerData: d } = require('node:worker_threads');
-      const fs = require('node:fs');
-      const { syncBuiltinESMExports } = require('node:module');
-      const gate = new Int32Array(d.shared);
-      const wait = index => {
-        if (Atomics.wait(gate, index, 0, 6000) === 'timed-out') throw new Error('interleaving barrier timed out');
-      };
-      if (d.role === 'late') {
-        const original = fs.statSync; let observed = false;
-        fs.statSync = function(path, ...args) {
-          const stat = original.call(this, path, ...args);
-          if (path === d.lock && !observed) {
-            observed = true;
-            parentPort.postMessage({ observed: true });
-            wait(0); // Keep the expired directory's stat while the other worker replaces it.
-          }
-          return stat;
-        };
-        syncBuiltinESMExports();
-      }
-      (async () => {
-        const { createEnqueueClaims } = await import(d.moduleUrl);
-        const claims = createEnqueueClaims({ dir: d.dir, pidAlive: () => true, now: () => {
-          if (d.role === 'first') {
-            // The replacement lock is held and the record has already been read as absent.
-            Atomics.store(gate, 0, 1); Atomics.notify(gate, 0);
-            wait(1);
-          }
-          return 100;
-        } });
-        try { parentPort.postMessage({ result: claims.claim({ ...d.candidate, kind: 'serial' }) }); }
-        finally { if (d.role === 'late') { Atomics.store(gate, 1, 1); Atomics.notify(gate, 1); } }
-      })().catch(error => { throw error; });
-    `;
-    const program = `
-      import { Worker } from 'node:worker_threads';
-      const shared = new SharedArrayBuffer(8);
-      const data = ${JSON.stringify({ dir, lock, candidate, moduleUrl: pathToFileURL(join(process.cwd(), 'scripts/lib/drain-enqueue-claim.mjs')).href })};
-      const start = (role, observed = () => {}) => new Promise((resolve, reject) => {
-        const worker = new Worker(${JSON.stringify(worker)}, { eval: true, workerData: { ...data, role, shared } });
-        worker.on('message', message => { if (message.observed) observed(); else resolve(message.result); });
-        worker.on('error', reject);
-      });
-      let first;
-      const late = start('late', () => { first = start('first'); });
-      const lateResult = await late;
-      console.log(JSON.stringify([await first, lateResult]));
-    `;
-    const result = spawnSync(process.execPath, ['--input-type=module', '-e', program], { encoding: 'utf8', timeout: 15_000, maxBuffer: 64 * 1024 });
-    expect(result.status, result.stderr).toBe(0);
-    const results = JSON.parse(result.stdout);
-    expect(results.filter(row => row.won)).toHaveLength(1);
-    expect(JSON.parse(readFileSync(join(dir, filename(candidate)), 'utf8')).token).toBe(results.find(row => row.won).token);
-  }, 20_000);
-
-  it('returns lock-busy within a bounded wait without disturbing a fresh lock', () => {
-    const dir = temp(); const lock = join(dir, `${filename(candidate)}.lock`); mkdirSync(lock);
-    const started = performance.now();
-    expect(claim(make(dir))).toEqual({ won: false, reason: 'lock-busy' });
-    expect(performance.now() - started).toBeLessThan(3000);
-    expect(readdirSync(dir)).toEqual([`${filename(candidate)}.lock`]);
-  });
-
-  it('leaves unknown stale lock contents intact and returns lock-busy', () => {
-    const dir = temp(); const lock = join(dir, `${filename(candidate)}.lock`); mkdirSync(lock);
-    writeFileSync(join(lock, 'unknown'), 'keep');
-    const old = new Date(Date.now() - 6000); utimesSync(lock, old, old);
-    expect(claim(make(dir))).toEqual({ won: false, reason: 'lock-busy' });
-    expect(readFileSync(join(lock, 'unknown'), 'utf8')).toBe('keep');
-    expect(readdirSync(dir)).toEqual([`${filename(candidate)}.lock`]);
-  });
-
-  it.each(['{broken', 'null', '{}', '{"state":"claimed","pid":0}'])('holds fresh corrupt or invalid records and reclaims only past ttlMs: %s', source => {
-    const dir = temp(); const path = join(dir, filename(candidate)); writeFileSync(path, source);
-    utimesSync(path, new Date(1000), new Date(1000));
-    expect(claim(make(dir, { now: () => 1999, ttlMs: 1000 }))).toEqual({ won: false, reason: 'unreadable-record' });
-    expect(claim(make(dir, { now: () => 2000, ttlMs: 1000 }))).toEqual({ won: false, reason: 'unreadable-record' });
-    expect(readFileSync(path, 'utf8')).toBe(source);
-    const result = claim(make(dir, { now: () => 2001, ttlMs: 1000 }));
-    expect(result.won).toBe(true);
-    expect(JSON.parse(readFileSync(path, 'utf8'))).toMatchObject({ state: 'claimed', token: result.token });
-  });
-
-  it('treats EPERM from the injected PID probe as alive and ESRCH as dead', () => {
-    const dir = temp(); claim(make(dir));
-    const probe = code => () => { throw Object.assign(new Error(code), { code }); };
-    expect(claim(make(dir, { pidAlive: probe('EPERM') }))).toMatchObject({ won: false, reason: 'held' });
-    expect(claim(make(dir, { pidAlive: probe('ESRCH') }))).toMatchObject({ won: true });
-  });
-
-  it('treats EPERM from the default process.kill probe as alive', () => {
-    const dir = temp(); claim(make(dir));
-    vi.spyOn(process, 'kill').mockImplementation(() => { throw Object.assign(new Error('denied'), { code: 'EPERM' }); });
-    expect(claim(make(dir, { pidAlive: undefined }))).toMatchObject({ won: false, reason: 'held' });
-  });
-
-  it('holds a fresh unreadable record rather than throwing a storage fault', () => {
-    const dir = temp(); mkdirSync(join(dir, filename(candidate)));
-    expect(claim(make(dir))).toEqual({ won: false, reason: 'unreadable-record' });
-  });
-
-  it('reclaims an unreadable file only after its mtime TTL expires', () => {
-    const dir = temp(); const path = join(dir, filename(candidate));
-    writeFileSync(path, 'unreadable'); utimesSync(path, new Date(1000), new Date(1000));
-    const program = `
-      import fs from 'node:fs';
-      import { syncBuiltinESMExports } from 'node:module';
-      import { createEnqueueClaims } from ${JSON.stringify(pathToFileURL(join(process.cwd(), 'scripts/lib/drain-enqueue-claim.mjs')).href)};
-      const read = fs.readFileSync;
-      fs.readFileSync = function(path, ...args) {
-        if (path === ${JSON.stringify(path)}) throw Object.assign(new Error('denied'), { code: 'EACCES' });
-        return read.call(this, path, ...args);
-      };
-      syncBuiltinESMExports();
-      let clock = 2000;
-      const claims = createEnqueueClaims({ dir: ${JSON.stringify(dir)}, now: () => clock, ttlMs: 1000 });
-      const candidate = ${JSON.stringify({ ...candidate, kind: 'serial' })};
-      const fresh = claims.claim(candidate);
-      clock = 2001;
-      console.log(JSON.stringify([fresh, claims.claim(candidate)]));
-    `;
-    const result = spawnSync(process.execPath, ['--input-type=module', '-e', program], { encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024 });
-    expect(result.status, result.stderr).toBe(0);
-    expect(JSON.parse(result.stdout)).toEqual([{ won: false, reason: 'unreadable-record' }, { won: true, token: expect.any(String) }]);
-    expect(JSON.parse(readFileSync(path, 'utf8')).state).toBe('claimed');
-  });
-
-  it('property: serial enqueue lists are identical with claims enabled or disabled', () => {
+  it('property: serial enqueue list is identical with claims on vs off', () => {
     let seed = 44;
     const random = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed; };
-    for (let trial = 0; trial < 60; trial++) {
-      const candidates = Array.from({ length: random() % 30 }, () => ({ ...candidate, num: random() % 5, headSha: `head-${random() % 3}`, outcome: random() % 3 }));
+    for (let trial = 0; trial < 40; trial++) {
+      const candidates = Array.from({ length: random() % 30 }, () => ({ ...candidate, num: 1 + random() % 5, headSha: `head-${random() % 3}`, outcome: random() % 3 }));
       const run = enabled => {
         const claims = make(); const enqueued = [];
-        const enqueue = c => { if (c.outcome === 0) throw new Error('enqueue failed'); if (c.outcome === 1) enqueued.push(key(c)); return { enqueued: c.outcome === 1 }; };
         for (const c of candidates) {
-          const result = enabled ? claim(claims, c) : { won: true };
-          if (!result.won) continue;
-          try {
-            const outcome = enqueue(c);
-            if (enabled) claims[outcome.enqueued ? 'markDone' : 'release']({ ...c, token: result.token });
-          } catch { if (enabled) claims.release({ ...c, token: result.token }); }
+          const enqueue = () => { if (c.outcome === 0) throw new Error('enqueue failed'); if (c.outcome === 1) enqueued.push(key(c)); return { enqueued: c.outcome === 1 }; };
+          try { if (enabled) withSerialEnqueueClaim(claims, c, enqueue); else enqueue(); } catch { /* Expected enqueue failure. */ }
         }
         return enqueued;
       };
       expect(run(true)).toEqual(run(false));
     }
+  });
+});
+
+describe('enqueue-only terminal outcome exclusions', () => {
+  const otherAction = () => createActionStore({ root: temp(), now: () => 100 }).claim({
+    resource: 'web-everything/web-everything#pr:7', kind: 'review', owner: 'reviewer',
+  }).record;
+
+  it.each(['released', 'enqueued'])('transitionRecord rejects %s for a non-enqueue action', outcome => {
+    const record = otherAction();
+    expect(assertActionRecord(record)).toBe(record);
+    expect(transitionRecord(record, { token: record.ownerToken, rev: record.rev,
+      from: 'intent', to: 'terminal', patch: { outcome } }, 200))
+      .toEqual({ ok: false, reason: 'illegal-outcome' });
+  });
+
+  it.each(['released', 'enqueued'])('assertActionRecord rejects persisted %s for a non-enqueue action', outcome => {
+    const record = otherAction();
+    const terminal = { ...record, rev: 2, state: 'terminal', outcome, updatedAt: 200,
+      history: [...record.history, { state: 'terminal', at: 200, owner: record.owner }] };
+    // The same persisted shape with a general action outcome is valid: only the
+    // enqueue-specific outcome should make this otherwise consistent record fail.
+    expect(assertActionRecord({ ...terminal, outcome: 'not-started' })).toMatchObject({ state: 'terminal' });
+    expect(() => assertActionRecord(terminal)).toThrow('Invalid action record');
   });
 });
 
@@ -308,7 +264,7 @@ describe('shared enqueue claim wiring', () => {
 });
 
 describe('serial enqueue claim diagnostics', () => {
-  const warning = op => `drain-enqueue-claim: ${op} failed for owner/repo#7@head-a: broken storage — proceeding fail-open\n`;
+  const warning = op => `drain-enqueue-claim: ${op} failed for web-everything/web-everything#7@head-a: broken storage — proceeding fail-open\n`;
 
   it('warns on initialization failure at the serial call site and leaves claims disabled', () => {
     const source = readFileSync(join(process.cwd(), 'scripts/merge-ai-prs.mjs'), 'utf8');

@@ -65,10 +65,13 @@ export function transitionRecord(record, { token, from, to, patch = {}, rev = re
   if (record.state !== from) return { ok: false, reason: 'wrong-state' };
   const legal = { intent: ['dispatching', 'terminal'], dispatching: ['observed', 'terminal'], observed: ['terminal'], terminal: [] };
   if (!legal[from]?.includes(to)) return { ok: false, reason: 'illegal-transition' };
-  if (to === 'terminal' && !(isOperatorResolution(patch.evidence) && ['settled', 'abandoned-absent'].includes(patch.outcome)) && !({ intent: ['abandoned-absent', 'not-started'], dispatching: ['abandoned-absent', 'not-started'], observed: ['settled'] }[from]?.includes(patch.outcome))) return { ok: false, reason: 'illegal-outcome' };
+  if (to === 'terminal' && !(record.kind === 'enqueue' && from === 'intent' && ['released', 'enqueued'].includes(patch.outcome)) && !(isOperatorResolution(patch.evidence) && ['settled', 'abandoned-absent'].includes(patch.outcome)) && !({ intent: ['abandoned-absent', 'not-started'], dispatching: ['abandoned-absent', 'not-started'], observed: ['settled'] }[from]?.includes(patch.outcome))) return { ok: false, reason: 'illegal-outcome' };
   if (to === 'observed' && (typeof patch.handle !== 'string' || !patch.handle.trim())) return { ok: false, reason: 'missing-handle' };
   const at = milliseconds(now);
-  return { ok: true, record: { ...record, ...patch, state: to, rev: record.rev + 1, updatedAt: at,
+  // Enqueue TTL begins at the terminal transition's clock sample, never at claim creation.
+  const completion = record.kind === 'enqueue' && to === 'terminal' && patch.outcome === 'enqueued'
+    ? { evidence: { ...record.evidence, ...patch.evidence, doneAt: at } } : {};
+  return { ok: true, record: { ...record, ...patch, ...completion, state: to, rev: record.rev + 1, updatedAt: at,
     history: [...record.history, { state: to, at, owner: patch.owner ?? record.owner }] } };
 }
 export function assertActionRecord(record) {
@@ -88,12 +91,23 @@ export function assertActionRecord(record) {
     || (record.state === 'intent' && record.dispatchingSince !== null)
     || (record.state === 'dispatching' && !Number.isFinite(record.dispatchingSince))
     || (record.state === 'observed' && (typeof record.handle !== 'string' || !record.handle.trim()))
-    || (record.state === 'terminal' && !['settled', 'not-started', 'abandoned-absent'].includes(record.outcome))) throw new TypeError('Invalid action record');
+    || (record.kind === 'enqueue' && (!Number.isInteger(record.evidence?.pid) || record.evidence.pid < 1
+      || typeof record.evidence.host !== 'string' || !record.evidence.host || typeof record.evidence.kind !== 'string' || !record.evidence.kind
+      || typeof record.evidence.key !== 'string' || !record.evidence.key
+      || (record.outcome === 'enqueued' && (!Number.isFinite(record.evidence.doneAt) || record.evidence.doneAt !== record.updatedAt))))
+    || (record.state === 'terminal' && !['settled', 'not-started', 'abandoned-absent',
+      ...(record.kind === 'enqueue' ? ['released', 'enqueued'] : [])].includes(record.outcome))) throw new TypeError('Invalid action record');
   return record;
 }
-/** Ports answer arrays of matching agents and { found:boolean, handle? }; unusable evidence holds. */
-export function reconcile(record, { listAgents, findEffect, now, absenceGraceMs = ABSENCE_GRACE_MS }) {
+/** Ports answer matching agents/effects; enqueue intents require positive owner death. Unknown evidence holds. */
+export function reconcile(record, { listAgents, findEffect, ownerAlive, now, absenceGraceMs = ABSENCE_GRACE_MS }) {
   if (!isExpired(record, now)) return { outcome: 'indeterminate' };
+  if (record.kind === 'enqueue') {
+    if (record.state !== 'intent') return { outcome: 'indeterminate' };
+    try { return withResult(ownerAlive?.(record), (alive) => alive === false
+      ? { outcome: 'effect-absent', evidence: { ownerDead: true } } : { outcome: 'indeterminate' },
+    () => ({ outcome: 'indeterminate' })); } catch { return { outcome: 'indeterminate' }; }
+  }
   if (record.state === 'intent' && record.dispatchingSince === null) return { outcome: 'effect-absent', evidence: { neverDispatching: true } };
   try {
     return withResult(listAgents(record), (agents) => withResult(findEffect(record), (effect) => {

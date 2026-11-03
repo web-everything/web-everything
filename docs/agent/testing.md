@@ -3765,3 +3765,16 @@ polling sleep, then adoption and cleanup; immediate adoption alone does not exer
 For new operation refusal branches, use table-driven cases for every bad-input detail and invalid numeric
 shape, and assert the operator-facing fallback text. Pair state producers with a consumer integration test;
 test failed persistence warnings explicitly so callers cannot promise an event that was never tracked.
+
+## Head-qualified drain enqueue claims (R425)
+
+`drain-enqueue-claim.mjs` uses the shared action-store attempt ledger. The resource is
+`<canonical-repo>#item:enqueue-<hex(num@headSha)>`; evidence retains the readable
+`repo#num@headSha` key and owner PID, host and consumer kind. Enqueue intents can
+reconcile only after lease expiry and a same-host probe positively proves owner death;
+missing or failed probes hold. Terminal `released` / `enqueued` outcomes are scoped to
+the enqueue action kind. The transition stamps `evidence.doneAt` using its own clock
+sample, and allocation rechecks the terminal admission predicate after contention.
+Use tmp coordination roots in `scripts/__tests__/drain-enqueue-claim.test.mjs`; exercise
+corrupt/unreadable histories through `claimOrFault` to verify async refusal and the
+visible serial fail-open warning. Run this file through heavy admission.
