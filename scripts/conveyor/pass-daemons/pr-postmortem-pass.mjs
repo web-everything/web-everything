@@ -14,7 +14,6 @@ import { planFileItem } from '../../operations/file-item.mjs';
 import { createFileItemReader, createFileItemSinks, REPO_ROOT } from '../../operations/file-item-io.mjs';
 import { SCAFFOLD_EFFECT } from '../../operations/scaffold.mjs';
 import { fileIntoBatch } from '../../operations/card-batch-file.mjs';
-import { setProcessTitle } from '../../lib/process-title.mjs';
 import { buildPostmortem, shouldPostmortem, publishPostmortem, collectPrTimeline, resolvePostmortemSettings,
   coronerStateDir, readOptionalJson, atomicJson, ghJson, validateSubject, withCoronerLock, repoFilenameKey } from '../../operations/coroner-pr-postmortem.mjs';
 
@@ -203,7 +202,6 @@ export async function runPostmortemCli(values, { runPass = runPostmortemPass, lo
   } while (values.watch && !signal?.aborted);
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  setProcessTitle('postmortem');
   const { values } = parseArgs({ options: { repo:{type:'string'}, out:{type:'string'}, watch:{type:'boolean'}, 'dry-run':{type:'boolean'} } });
   const abort = new AbortController();
   process.once('SIGTERM',() => abort.abort()); process.once('SIGINT',() => abort.abort());

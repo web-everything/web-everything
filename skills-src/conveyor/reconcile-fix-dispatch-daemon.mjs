@@ -108,7 +108,6 @@ import { withSelfSync } from '../../scripts/lib/daemon-self-sync.mjs';
 import { withPrEvents } from '../../scripts/lib/pr-events.mjs';
 import { isStaleMainRefusalMessage } from '../../scripts/lib/main-staleness.mjs';
 import { installDaemonLog } from './daemon-log.mjs';
-import { setProcessTitle } from '../../scripts/lib/process-title.mjs';
 import { logDaemonHeap } from '../../scripts/lib/daemon-heap-log.mjs'; // R368 per-pass heap line (`WE_DAEMON_HEAP_LOG=0` = off)
 import { warmFixFacts, takeFixReadStats, formatFixReadStats } from '../../scripts/lib/fix-facts.mjs'; // perf C1d (`WE_FIX_FACTS=0` = off)
 
@@ -1541,7 +1540,6 @@ export function withFixDispatchClaimRefresh(effects, { log = console, refresh = 
 }
 
 async function main() {
-  setProcessTitle('fix-dispatch');
   installDaemonLog(); // item 68a: ISO-stamp every log line (WE_DAEMON_LOG_TIMESTAMPS=0 turns it off)
   const owner = makeOwner('reconcile-fix-dispatch-daemon');
   const acquired = acquireRunnerLease(RUNNER_LOCK_ROOT, owner, { key: RECONCILE_FIX_DISPATCH_LEASE_KEY });

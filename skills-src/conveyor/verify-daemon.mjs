@@ -72,7 +72,6 @@ import { runVerifyDispatch, recordKilledVerification, killOrphanGroup, killAdopt
 import { loadVerifySettingsFile, resolveVerifySettings } from '../../scripts/lib/verify-settings.mjs';
 import { installDaemonLog } from './daemon-log.mjs';
 import { createVerifyGateJobs, resolveGateAsJob } from '../../scripts/conveyor/verify-gate-job.mjs';
-import { setProcessTitle } from '../../scripts/lib/process-title.mjs';
 
 /** This daemon's own lease key — distinct from the Dispatcher's default sentinel and from the Fix-dispatch
  *  and Review daemons' own keys (#3870, #3876), so none of them ever contend on the same lock dir (#3877).
@@ -588,7 +587,6 @@ export async function runDaemon({ effects, codeChanged, cleanup }) {
 }
 
 async function main() {
-  setProcessTitle('verify-daemon');
   installDaemonLog(); // item 68a: ISO-stamp every log line (WE_DAEMON_LOG_TIMESTAMPS=0 turns it off)
   const owner = makeOwner('verify-daemon');
   const acquired = acquireRunnerLease(RUNNER_LOCK_ROOT, owner, { key: VERIFY_DAEMON_LEASE_KEY });

@@ -1,5 +1,8 @@
 // Process titles: a tiny shared helper so Activity Monitor / `ps` show which role each node process plays.
 // Title only (process.title); NEVER touches argv. Never throws. macOS truncates long titles, so cap at ~32 chars.
+// CAUTION before wiring a caller: process.title REPLACES the command text `ps` shows (verified on macOS), and several
+// matchers read that text (liveReviewRoundBudget, runner-activity scriptToken, heavy-queue, verify-dispatch isDispatchedRun).
+// Wire an entry point only after its matcher uses lease/pid identity instead of command text.
 export const PROCESS_TITLE_MAX = 32;
 
 export function formatProcessTitle(role, detail) {

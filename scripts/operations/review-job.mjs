@@ -136,7 +136,6 @@ import { decideStackDispatch, fingerprintOf, mainNetDiffText, readBottomLanded, 
 import { UNATTENDED_REVIEW_ACTOR } from './review-loop-cli.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
-import { setProcessTitle } from '../lib/process-title.mjs';
 
 const THIS_FILE = fileURLToPath(import.meta.url);
 
@@ -1549,4 +1548,4 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
 }
 
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(THIS_FILE);
-if (IS_CLI) { setProcessTitle('review-job'); runReviewJobCli(); }
+if (IS_CLI) runReviewJobCli();

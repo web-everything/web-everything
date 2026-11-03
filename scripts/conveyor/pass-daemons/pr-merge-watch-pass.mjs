@@ -15,7 +15,6 @@ import { appendDaemonEvent } from '../../lib/daemon-events.mjs';
 import { readSettings } from '../../lib/settings-files.mjs';
 import { resolveCascade, readPlatformPreferences, formatCascadeSourcesLine } from '../../lib/policy-cascade.mjs';
 import { handoffHome } from '../../operations/handoff-home.mjs';
-import { setProcessTitle } from '../../lib/process-title.mjs';
 
 const object = v => v !== null && typeof v === 'object' && !Array.isArray(v);
 const sha = v => typeof v === 'string' && /^[a-f0-9]{40}$/i.test(v);
@@ -210,7 +209,6 @@ export async function runMergeWatchCli(values, { runPass = runMergeWatch, sleep:
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  setProcessTitle('merge-watch');
   const { values } = parseArgs({ options: { repo: { type: 'string', multiple: true },
     out: { type: 'string' }, watch: { type: 'boolean' } } });
   if (!values.repo?.length) throw Error('expected --repo=owner/name');
