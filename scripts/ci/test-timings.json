@@ -807,7 +807,6 @@
   "scripts/lib/__tests__/daemon-rebuild-auto-rebase.test.mjs": 142.16,
   "scripts/lib/__tests__/daemon-rebuild-candidate-env.test.mjs": 0.89,
   "scripts/lib/__tests__/daemon-rebuild-events.test.mjs": 0.82,
-  "scripts/lib/__tests__/daemon-rebuild-fallback.test.mjs": 20.19,
   "scripts/lib/__tests__/daemon-rebuild-graduated.test.mjs": 0.04,
   "scripts/lib/__tests__/daemon-rebuild-hold-live-pinned.test.mjs": 3.21,
   "scripts/lib/__tests__/daemon-rebuild-job-main.test.mjs": 0.03,
