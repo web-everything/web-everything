@@ -467,8 +467,10 @@ function handleOpenPrPage(store, rest) {
   const prs = filterPrs(repoState, { state: 'open' }).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.number - a.number);
   const nodes = prs.slice(offset, offset + pageSize).map(pr => {
     const view = buildPrGraphqlView(repoState, pr, { originPath: repoState.originPath, callerActor: ACTOR, fields: PAGED_LIGHT_FIELDS });
-    const { labels, statusCheckRollup, ...light } = pickFields(view, PAGED_LIGHT_FIELDS.join(','));
-    return { ...light, labels: { nodes: labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: statusCheckRollup } } } }] } };
+    const { labels, statusCheckRollup, author, ...light } = pickFields(view, PAGED_LIGHT_FIELDS.join(','));
+    const bot = author?.is_bot === true || /^app\//.test(author?.login ?? '') || /\[bot\]$/.test(author?.login ?? '');
+    return { ...light, author: author ? { login: author.login, __typename: bot ? 'Bot' : 'User' } : null,
+      labels: { nodes: labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: statusCheckRollup } } } }] } };
   });
   return jsonResult({ data: { repository: { pullRequests: { nodes, totalCount: prs.length,
     pageInfo: { hasNextPage: offset + nodes.length < prs.length, endCursor: nodes.length ? `fake-pr-page:${offset + nodes.length}` : null } } } } });

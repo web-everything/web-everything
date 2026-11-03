@@ -15,7 +15,7 @@ const repo = 'owner/name';
 const node = (number, extra = {}) => ({ number, title: `PR ${number}`, url: `https://example.com/${number}`,
   isDraft: false, createdAt: '2026-10-12T00:00:00Z', updatedAt: '2026-10-13T00:00:00Z',
   headRefName: `branch-${number}`, headRefOid: `head-${number}`, baseRefName: 'main',
-  isCrossRepository: false, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', reviewDecision: null, ...extra });
+  isCrossRepository: false, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', reviewDecision: null, author: null, ...extra });
 const page = (nodes, hasNextPage = false, endCursor = null, totalCount = 45) => JSON.stringify({
   data: { repository: { pullRequests: { nodes, pageInfo: { hasNextPage, endCursor }, totalCount } } },
 });
@@ -33,6 +33,7 @@ describe('query and gh row shape', () => {
     const q = buildOpenPrPageQuery({ repo, pageSize: 20 });
     expect(q).toContain('repository(owner:"owner",name:"name")');
     expect(q).toContain('states:OPEN,first:20,orderBy:');
+    expect(q).toContain('author{login __typename}');
     expect(q).not.toContain('after:');
     expect([...q].filter(c => c === '{')).toHaveLength([...q].filter(c => c === '}').length);
     const after = 'cursor"\\\n';
@@ -40,6 +41,15 @@ describe('query and gh row shape', () => {
     for (const bad of ['owner', 'owner/name/other', 'owner/"name', '', null]) {
       expect(() => buildOpenPrPageQuery({ repo: bad, pageSize: 20 })).toThrow(TypeError);
     }
+  });
+  it.each([
+    [{ login: 'web-everything', __typename: 'Bot' }, { login: 'web-everything', is_bot: true }],
+    [{ login: 'human', __typename: 'User' }, { login: 'human', is_bot: false }],
+    [{ login: 'team', __typename: 'Organization' }, { login: 'team', is_bot: false }],
+    [null, null],
+    [undefined, null],
+  ])('preserves author identity and maps Bot type without relying on a login suffix: %j', (author, expected) => {
+    expect(mapGraphqlPr(node(1, { author })).author).toEqual(expected);
   });
   it('maps both check kinds exactly, including nulls and empty connections', () => {
     const check = { __typename: 'CheckRun', name: 'test', status: 'IN_PROGRESS', completedAt: null,

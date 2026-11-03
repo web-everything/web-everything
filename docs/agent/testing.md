@@ -1770,6 +1770,15 @@ card loading through `readTick` and spawn argv: a pure router test cannot catch
 `readPrs` and `readAgents` to exercise its shared PR snapshot; that snapshot carries
 escalation reasons and touched paths into the session model selection.
 
+### Open PR author projections
+
+When a standalone reader adds a field, update both `open-pr-fetch.mjs`'s per-tick union and
+`pr-snapshot.mjs`'s host snapshot union, including the paged GraphQL query and mapper.
+Author projections must carry bot identity: GraphQL Bot logins can lack `app/` or `[bot]`,
+so map `__typename` to `is_bot`. Keep human and missing-author controls in
+`pr-list-paged.test.mjs`, and cover refreshing a persisted snapshot without the field
+and preserving author data on cache hits in `pr-snapshot.test.mjs`.
+
 ### Explicit Claude spawn models
 
 Operator rule (2026-09-29): every fresh daemon-launched Claude session must pass an explicit

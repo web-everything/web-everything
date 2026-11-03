@@ -55,7 +55,7 @@ import {
 export const SNAPSHOT_FIELDS = Object.freeze([
   'number', 'title', 'body', 'url', 'isDraft', 'createdAt', 'updatedAt',
   'headRefName', 'headRefOid', 'baseRefName', 'isCrossRepository', 'mergeable', 'mergeStateStatus', 'reviewDecision',
-  'labels', 'files', 'comments', 'statusCheckRollup',
+  'labels', 'files', 'comments', 'statusCheckRollup', 'author',
 ]);
 
 /** Smoke-only controls; unset keeps the normal snapshot read unchanged. */

@@ -14,7 +14,7 @@ import { enrichPrsWithCompleteComments } from './pr-comments-complete.mjs';
 // `isDraft` (draft-first PRs, operator-approved 2026-09-27) — see `reconcile-pass.mjs#PR_LIST_JSON_FIELDS`'s
 // own comment; this is the SAME field, on the field list the real daemon actually reads (this fetch feeds the
 // `--prs-file=` every mechanical pass in `skills-src/conveyor/runner.mjs` shares for one tick).
-export const OPEN_PR_LIST_FIELDS = 'number,headRefName,title,body,labels,files,mergeable,mergeStateStatus,headRefOid,baseRefName,statusCheckRollup,comments,isDraft,createdAt';
+export const OPEN_PR_LIST_FIELDS = 'number,headRefName,title,body,labels,files,mergeable,mergeStateStatus,headRefOid,baseRefName,statusCheckRollup,comments,isDraft,createdAt,author';
 export const PR_LIST_LIMIT = 200;
 
 /** Throws on a failed fetch so the runner can fall back to each pass's standalone discovery. */
