@@ -1087,6 +1087,7 @@ describe('guard-bash — direct-push-to-main block (#2203)', () => {
     unresolved('git push --repo="$R" origin HEAD:refs/heads/lane/x');
     unresolved('git push origin HEAD:refs/heads/lane/x --receive-pack="$X"');
     unresolved('git push origin HEAD:refs/heads/lane/x --unknown="$X"');
+    unresolved('git push origin HEAD:refs/heads/lane/x --push-option=$X'); // unquoted: word-splits into a refspec
   });
   it('ALLOWS a lane/* push (the sanctioned path — PR-gated)', () => {
     allowed('git push origin HEAD:refs/heads/lane/foo-2210');
@@ -3619,7 +3620,7 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
   it('still fails closed on wrapper options that can carry a daemon-clone git write or directory change', () => {
     for (const command of [`env -i git -C ${CLONE} commit -m x`, `env -C ${CLONE} git commit -m x`, 'env -i git commit -m x',
       'env -u FOO git push', 'command -p git commit -m x', 'time -p git reset --hard',
-      'nice -n 5 git checkout main', 'nice -n 5 bash -c "git commit -m x"', 'env -i git status $X', `env -i git -C ${CLONE} status`,
+      'nice -n 5 git checkout main', 'nice -n 5 bash -c "git commit -m x"', 'env -i git status $X', 'env -i git diff --no-index a b --output=out', `env -i git -C ${CLONE} status`,
       'time -f %e git commit -m x']) {
       expect(daemonCloneWriteReason(command, { cwd: LANE, roots }), command).toMatch(/DAEMON CLONE/);
     }

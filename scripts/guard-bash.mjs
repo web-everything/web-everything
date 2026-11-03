@@ -2415,7 +2415,7 @@ function daemonWrapperUncertain(segment) {
       continue;
     }
     if (!optionSeen || probeOnly) return false;
-    if (base === 'git') return !(DAEMON_GIT_READS.has(words[i] ?? '') && words.slice(i).every((w) => !/[$`]/.test(w)));
+    if (base === 'git') return !(DAEMON_GIT_READS.has(words[i] ?? '') && words.slice(i).every((w) => !/[$`]/.test(w) && !/^--out/.test(w)));
     return ['sh', 'bash', 'zsh', 'eval'].includes(base);
   }
   return false;
@@ -2435,7 +2435,9 @@ function pushHasUnresolvedTarget(command) {
   const words = [];
   for (let k = 0; k < toks.length; k += 1) {
     if (toks[k].op) { if (/^\d*[<>]/.test(toks[k].text ?? '') && !/[`$]/.test(toks[k].text)) k += 1; continue; } // redirect target
-    words.push(toks[k].text);
+    // An UNQUOTED expansion word-splits into extra arguments (`--push-option=$X` with X="a HEAD:refs/heads/main"),
+    // so only a quoted one is a single, non-destination value.
+    words.push(/[$`]/.test(toks[k].text) && !toks[k].quoted ? `${toks[k].text}` + '\u0000split' : toks[k].text);
   }
   const at = words.indexOf('push');
   if (at < 0) return true;
@@ -2445,6 +2447,7 @@ function pushHasUnresolvedTarget(command) {
     if (!/[$`]/.test(a)) continue;
     if (!a.startsWith('-')) return true; // positional remote/refspec
     const name = a.replace(/=.*$/s, '');
+    if (a.endsWith('\u0000split')) return true; // unquoted: may split into a refspec
     if (PUSH_TARGET_OPTIONS.has(name)) return true;
     if (!['--push-option', '-o', '--force-with-lease', '--signed', '--recurse-submodules'].includes(name)) return true;
   }
