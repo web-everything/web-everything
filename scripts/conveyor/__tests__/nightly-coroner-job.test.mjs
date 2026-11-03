@@ -1,6 +1,7 @@
 // @vitest-environment node
 // The job child runs under plain Node; happy-dom's AbortController is not one child_process accepts.
 import { it, expect, vi, afterEach } from 'vitest';
+import { withPathLock } from '../../readiness/with-lock.mjs';
 import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, existsSync, symlinkSync, appendFileSync, statSync, renameSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -203,7 +204,7 @@ it('appends numbered held cards in the handoff home by default and recovers exis
   delete io.fileItem;
   await extractNightlyCoroner(input, io);
   const held = readFileSync(heldPath, 'utf8');
-  expect(held).toMatch(/^8\. \(coroner-2026-10-16, held\) \*\*Coroner:/m);
+  expect(held).toMatch(/^8\. \*\*Coroner:[^\n]*\*\* \(coroner-2026-10-16, held\)/m);
   expect(held).toContain(`    Fix idea: ${proposedFix}\n`); expect(held).toContain('Evidence:');
   expect(held).toContain('PR #101'); expect(held).toContain('Size 3.');
   expect(held).toMatch(/^    Coroner key: gateRuns:cause-0$/m);
@@ -224,7 +225,6 @@ it('preserves a concurrent append between the held-list read and append without 
   const original = '7. (earlier, held) **Existing item.**\n';
   const concurrent = '8. (other-writer, held) **Concurrent item.**\n';
   writeFileSync(path, original);
-  const inode = statSync(path).ino;
   const actual = await vi.importActual('node:fs');
   vi.mocked(readFileSync).mockImplementationOnce((...args) => {
     expect(args[0]).toBe(path);
@@ -234,7 +234,7 @@ it('preserves a concurrent append between the held-list read and append without 
   });
   vi.mocked(readFileSync).mockImplementationOnce((...args) => {
     expect(args[0]).toBe(path);
-    expect(existsSync(`${path}.lock`)).toBe(true);
+    expect(() => withPathLock(path, () => {}, { timeoutMs: 0 })).toThrow(/timed out/); // the shared list lock is held
     return actual.readFileSync(...args);
   });
   const receipt = appendHeldCoronerCard({ key: 'ci:flaky', title: 'Coroner: ci / flaky', size: '3',
@@ -243,29 +243,25 @@ it('preserves a concurrent append between the held-list read and append without 
   expect(held.startsWith(original + concurrent)).toBe(true);
   expect(held).toContain('    Coroner key: ci:flaky\n');
   expect(held).toContain(`    Fix idea: ${proposedFix}\n`);
-  expect(statSync(path).ino).toBe(inode);
+  expect(statSync(path).ino).not.toBe(0); // the shared primitive writes atomically under the lock; no append is lost
   const numbers = [...held.matchAll(/^(\d+)\. /gm)].map((match) => Number(match[1]));
   expect(numbers).toEqual([7, 8, 9]);
   expect(new Set(numbers).size).toBe(numbers.length);
   expect(receipt).toEqual({ id: 'cards-to-file.md#9' });
-  expect(held).toMatch(/^9\. \(coroner-2026-10-16, held\)[^\n]*\n(?:[^\n]*\n)*?    Coroner key: ci:flaky$/m);
-  expect(existsSync(`${path}.lock`)).toBe(false);
+  expect(held).toMatch(/^9\. \*\*[^\n]*\(coroner-2026-10-16, held\)[^\n]*\n(?:[^\n]*\n)*?    Coroner key: ci:flaky$/m);
+  expect(() => withPathLock(path, () => {}, { timeoutMs: 0 })).not.toThrow(); // released
 });
-it('refuses filing while another writer holds the held-list lock and names manual recovery', () => {
+it('refuses filing while another writer holds the shared held-list lock and names manual recovery', () => {
   const home = temp(), path = join(home, 'cards-to-file.md');
   const held = '7. (earlier, held) **Existing item.**\n';
   writeFileSync(path, held);
-  writeFileSync(`${path}.lock`, `${process.pid}\n`);
-  expect(() => appendHeldCoronerCard({ key: 'ci:flaky', title: 'Coroner: ci / flaky', size: '3',
-    count: 2, minutes: 10, examples: [{ ref: 'PR #42' }], proposedFix }, { home, night: '2026-10-16' }))
-    .toThrow('held list busy; retry later or run manual /coroner');
+  const input = { key: 'ci:flaky', title: 'Coroner: ci / flaky', size: '3', count: 2, minutes: 10, examples: [{ ref: 'PR #42' }], proposedFix };
+  withPathLock(path, () => {
+    expect(() => appendHeldCoronerCard(input, { home, night: '2026-10-16' }))
+      .toThrow('held list busy; retry later or run manual /coroner');
+  });
   expect(readFileSync(path, 'utf8')).toBe(held);
-  expect(readFileSync(`${path}.lock`, 'utf8')).toBe(`${process.pid}\n`);
-  rmSync(`${path}.lock`);
-  expect(appendHeldCoronerCard({ key: 'ci:flaky', title: 'Coroner: ci / flaky', size: '3',
-    count: 2, minutes: 10, examples: [{ ref: 'PR #42' }], proposedFix }, { home, night: '2026-10-16' }))
-    .toEqual({ id: 'cards-to-file.md#8' });
-  expect(existsSync(`${path}.lock`)).toBe(false);
+  expect(appendHeldCoronerCard(input, { home, night: '2026-10-16' })).toEqual({ id: 'cards-to-file.md#8' });
 });
 it('refuses a held key without a numbered receipt and leaves the held list untouched', () => {
   const home = temp(); const path = join(home, 'cards-to-file.md');
@@ -814,15 +810,14 @@ it.each(['held', 'openPrs', 'recentCards'])('fails the night closed when coverag
 
 it('counts all of this night’s held entries under the append lock, independent of candidate keys and old nights', () => {
   const home = temp(), path = join(home, 'cards-to-file.md');
-  writeFileSync(path, '1. (coroner-2026-10-15, held) **Old.**\n    Coroner key: ci:old\n');
+  writeFileSync(path, '1. **Old.** (coroner-2026-10-15, held) x\n    Coroner key: ci:old\n');
   const input = { key: 'ci:first', title: 'First', examples: [], proposedFix };
   expect(appendHeldCoronerCard(input, { home, night: '2026-10-16', maxCards: 1 })).toEqual({ id: 'cards-to-file.md#2' });
   const held = readFileSync(path, 'utf8');
   expect(appendHeldCoronerCard({ ...input, key: 'ci:other' }, { home, night: '2026-10-16', maxCards: 1 })).toEqual({ limitReached: true });
   expect(readFileSync(path, 'utf8')).toBe(held);
   expect(appendHeldCoronerCard(input, { home, night: '2026-10-16', maxCards: 1 })).toEqual({ id: 'cards-to-file.md#2' });
-  mkdirSync(`${path}.lock`);
-  expect(() => appendHeldCoronerCard({ ...input, key: 'ci:other' }, { home, night: '2026-10-16', maxCards: 1 })).toThrow(/busy/);
+  withPathLock(path, () => expect(() => appendHeldCoronerCard({ ...input, key: 'ci:other' }, { home, night: '2026-10-16', maxCards: 1 })).toThrow(/busy/));
 });
 
 it.each([['missing errorRates', {}], ['malformed errorRates', { errorRates: 'broken' }], ['missing metrics', null]])

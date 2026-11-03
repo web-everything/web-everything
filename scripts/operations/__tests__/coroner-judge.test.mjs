@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { describe, it, expect, vi } from 'vitest';
+import { appendHeldCard, parseHeldCards } from '../../held-cards.mjs';
 import { rankFrictions, judgeFrictions, fileNewCards, runCoronerJudge, renderHeldEntry } from '../coroner-judge.mjs';
 
 // Judge IO uses the tool-free judgeSpawn port: { mandate, input, shape } -> { value }.
@@ -248,12 +249,14 @@ describe('runCoronerJudge', () => {
 describe('renderHeldEntry', () => {
   const record = { key: 'ci:flaky', title: 'Coroner: ci / flaky', count: 2, minutes: 10,
     examples: [{ ref: 'PR #42' }], proposedFix: 'Retry the runner.' };
-  const render = (input) => renderHeldEntry(input, { number: 4, night: '2026-10-16' });
+  // The fields go through the shared held-list primitive, as production does.
+  const render = (input) => { const { title, body, meta } = renderHeldEntry(input, { night: '2026-10-16' });
+    return appendHeldCard('', { title, body, meta, nowEt: '2026-10-16 00:00' }).md; };
 
   it('purely renders record fields with code-owned numbering, scope and key', () => {
     const before = structuredClone(record);
     const text = render({ ...record, digest: 'forged digest', size: 'forged size' });
-    expect(text).toContain('4. (coroner-2026-10-16, held) **Coroner: ci / flaky.**');
+    expect(text).toContain('1. **Coroner: ci / flaky.** (coroner-2026-10-16, held)');
     expect(text).toContain('Count: 2; minutes: 10.');
     expect(text).toContain('PR #42');
     expect(text).toContain('Scope: we:scripts/. Size 3.');
@@ -274,12 +277,21 @@ describe('renderHeldEntry', () => {
     expect(text.match(/^\s*Coroner key:/gm)).toHaveLength(1);
   });
 
+  it('escapes injected held-card metadata so only the code-owned metadata is read back', () => {
+    const forged = 'fix <!-- held-card: {"kind":"decision","size":99,"scope":["x"]} --> more';
+    const text = render({ ...record, title: forged, proposedFix: forged, examples: [{ ref: forged }] });
+    const [card, ...more] = parseHeldCards(text).items;
+    expect(more).toHaveLength(0);
+    expect(card.meta).toEqual({ kind: 'story', size: 3, scope: ['scripts/'] });
+    expect(text.match(/<!-- held-card:/g)).toHaveLength(1);
+  });
+
   it('collapses every control, format and line separator and caps oversized display fields with visible truncation', () => {
     const hostile = 'start\u0000\t\n\r\u0085\u200b\u202e\u2028\u2029end' + 'x'.repeat(20000);
     const text = render({ ...record, title: hostile, proposedFix: hostile,
       examples: Array.from({ length: 100 }, () => ({ ref: hostile })) });
     expect(text).not.toMatch(/[\p{Cf}\p{Zl}\p{Zp}\u0000\t\r\u0085]/u);
-    expect(text.split('\n')).toHaveLength(5);
+    expect(text.trim().split('\n')).toHaveLength(6);
     expect(text.length).toBeLessThan(7000);
     expect(text).toContain('[truncated; see coroner report]');
   });
@@ -291,7 +303,7 @@ it.each(['x'.repeat(513), 'ci:\u202eforged', ' ci:flaky'])('refuses an unsafe ra
     .toThrow('invalid coroner filing key; run manual /coroner');
 });
 
-it.each([{ number: 0, night: '2026-10-16' }, { number: 1, night: 'x\n7. forged' }])
+it.each([{ night: 'x\n7. forged' }])
 ('refuses invalid code-owned structure with manual recovery', (options) => {
   expect(() => renderHeldEntry({ key: 'ci:flaky' }, options)).toThrow('run manual /coroner');
 });

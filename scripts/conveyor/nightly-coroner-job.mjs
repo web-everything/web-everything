@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 /** Durable nightly extraction, followed by bounded coverage judgment and NEW-only filing. */
+import { withPathLock } from '../readiness/with-lock.mjs';
+import { appendHeldCard } from '../held-cards.mjs';
+import { atomicWriteText } from '../held-cards-io.mjs';
 import { ghRepoSlug, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
 import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, realpathSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -20,7 +23,6 @@ import { prSweepTickAllowed } from './pr-sweep-job.mjs';
 import { runCoronerJudge, rankFrictions, renderHeldEntry, validateCoronerCoverage } from '../operations/coroner-judge.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { fenceUntrusted } from '../lib/mandate-fence.mjs';
-import { withFileLock } from '../lib/atomic-json-file.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(SELF), '../..');
@@ -250,43 +252,47 @@ function readJudgeCoverage(sourceRoot, home) {
     .map(({ name }) => ({ id: name, content: boundedRead(join(backlog, name), 32 * 1024) }));
   return { held, openPrs, recentCards };
 }
+const etTimeNy = (date) => { const p = Object.fromEntries(new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(date).map(({ type, value }) => [type, value])); return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`; };
 /** Held-list sink shared by fresh filings and crash recovery. The key line is the durable receipt. */
 export function appendHeldCoronerCard(input, { home = handoffHome(), night, maxCards = NIGHTLY_DEFAULTS.judge.maxCards } = {}) {
   if (!positiveInt(maxCards) || !/^\d{4}-\d{2}-\d{2}$/.test(night)) throw new Error('invalid coroner nightly cap or night; run manual /coroner');
   if (typeof input.key !== 'string' || !input.key || input.key !== input.key.trim() || input.key.length > 512 || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(input.key)) throw new Error('invalid coroner filing key; run manual /coroner');
   const path = join(home, 'cards-to-file.md');
-  const inspectHeld = () => {
-    let held = '';
-    try { held = readFileSync(path, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-    let number = 0, lastNumber = 0, nightlyCount = 0, receipt;
+  const readHeld = () => { try { return readFileSync(path, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') throw e; return ''; } };
+  const inspectHeld = (held) => {
+    let number = 0, nightlyCount = 0, receipt;
     for (const line of held.split('\n')) {
       const heading = line.match(/^(\d+)\.\s/);
       if (heading) {
-        number = Number(heading[1]); lastNumber = Math.max(lastNumber, number);
-        if (line.startsWith(`${heading[1]}. (coroner-${night}, held) `)) nightlyCount++;
+        number = Number(heading[1]);
+        if (line.includes(` (coroner-${night}, held) `) && /^\d+\. \*\*/.test(line)) nightlyCount++;
       }
       if (line.trim() === `Coroner key: ${input.key}`) {
         if (!number) throw new Error('coroner held receipt lacks item number; run manual /coroner');
         receipt ??= { id: `cards-to-file.md#${number}` };
       }
     }
-    return { receipt, number: lastNumber + 1, nightlyCount };
+    return { receipt, nightlyCount };
   };
   // Existing append-only receipts need no write; only the locked read authorizes a new append.
-  const existing = inspectHeld().receipt;
+  const existing = inspectHeld(readHeld()).receipt;
   if (existing) return existing;
   mkdirSync(home, { recursive: true });
   try {
-    return withFileLock(`${path}.lock`, () => {
+    // The shared held-list lock and card primitive (numbering, escaping, metadata round-trip) as `held-cards add`.
+    return withPathLock(path, ({ touch }) => {
       // The appended list is the ledger, including writes whose state save failed.
-      const { receipt, number, nightlyCount } = inspectHeld();
+      const held = readHeld(), { receipt, nightlyCount } = inspectHeld(held);
       if (receipt) return receipt;
       if (nightlyCount >= maxCards) return { limitReached: true };
-      appendLines(path, [renderHeldEntry(input, { number, night })]);
-      return { id: `cards-to-file.md#${number}` };
+      const { title, body, meta } = renderHeldEntry(input, { night });
+      const result = appendHeldCard(held, { title, body, meta, nowEt: etTimeNy(new Date()) });
+      touch(); // still the holder? Then commit.
+      atomicWriteText(path, result.md);
+      return { id: `cards-to-file.md#${result.num}` };
     }, { timeoutMs: 0 });
   } catch (e) {
-    if (String(e.message).startsWith('withFileLock: timed out')) {
+    if (e.code === 'ELOCKTIMEOUT') {
       throw new Error('coroner held list busy; retry later or run manual /coroner', { cause: e });
     }
     throw e;

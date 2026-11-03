@@ -9,30 +9,29 @@ import { FENCED_DATA_RULE, fenceUntrusted } from '../lib/mandate-fence.mjs';
 // Display text is untrusted even after schema validation. Only code emits structural lines.
 const TRUNCATED = '[truncated; see coroner report]';
 function heldText(value, limit) {
-  let text = String(value ?? '').replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ').replace(/\s+/gu, ' ').trim();
+  let text = String(value ?? '').replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ').replace(/\s+/gu, ' ').trim()
+    .replaceAll('<!--', '<\\!--').replaceAll('-->', '--\\>').replaceAll('**', '\\*\\*'); // no held-card metadata, no bold span
   if (/^(?:\d+\.|Coroner key:|Fix idea:|Evidence:|Scope:|[#*+>_`~\-=])/i.test(text)) text = `\\${text}`;
   return text.length > limit ? `${text.slice(0, limit - TRUNCATED.length)}${TRUNCATED}` : text;
 }
 
-/** Pure held-list rendering: display fields are bounded; numbering and the ranked-key receipt are code-owned.
+/** Pure field rendering for the shared held-list primitive (`appendHeldCard`, which owns numbering, the list lock and
+ * the metadata round-trip). Display fields are bounded and escaped; the ranked-key receipt line is code-owned.
  * Truncated fields point the operator to the full extraction report rather than hiding the bound.
  */
-export function renderHeldEntry({ title, count, minutes, examples, proposedFix, key }, { number, night }) {
+export function renderHeldEntry({ title, count, minutes, examples, proposedFix, key }, { night }) {
   if (typeof key !== 'string' || !key || key !== key.trim() || key.length > 512 || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(key)) {
     throw new Error('invalid coroner filing key; run manual /coroner');
   }
-  if (!Number.isSafeInteger(number) || number < 1 || !/^\d{4}-\d{2}-\d{2}$/.test(night)) {
-    throw new Error('invalid coroner held numbering or night; run manual /coroner');
-  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(night)) throw new Error('invalid coroner held night; run manual /coroner');
   const refs = Array.isArray(examples) ? examples.slice(0, 10).map((example) => heldText(example?.ref, 300)) : [];
   if (examples?.length > 10) refs.push(TRUNCATED);
   const evidence = heldText(refs.join('; '), 3200);
   const measuredCount = Number.isFinite(count) && count >= 0 ? count : 'unknown';
   const measuredMinutes = Number.isFinite(minutes) && minutes >= 0 ? minutes : 'unknown';
-  return `\n${number}. (coroner-${night}, held) **${heldText(title, 300)}.** Count: ${measuredCount}; minutes: ${measuredMinutes}.
-    Fix idea: ${heldText(proposedFix, 1600)}
-    Evidence: ${evidence}. Scope: we:scripts/. Size 3.
-    Coroner key: ${key}`;
+  return { title: heldText(title, 300),
+    body: `(coroner-${night}, held) Count: ${measuredCount}; minutes: ${measuredMinutes}.\nFix idea: ${heldText(proposedFix, 1600)}\nEvidence: ${evidence}. Scope: we:scripts/. Size 3.\nCoroner key: ${key}`,
+    meta: { kind: 'story', size: 3, scope: ['scripts/'] } };
 }
 
 const record = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
