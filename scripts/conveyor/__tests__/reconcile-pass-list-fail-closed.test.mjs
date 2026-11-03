@@ -131,3 +131,37 @@ it('an author lookup failure fails the whole read; a row is never accepted witho
     readRest: () => ({ json: {} }),
     retryOpts: { sleep: () => {}, persist: false, onEvent: () => {} } })).toThrow(/author/);
 });
+
+describe('a declared smoke sample is not truncation (follow-up regression, 2026-11-03 16:23 ET)', () => {
+  const rowsWith = (flags) => { const r = [{ number: 1, labels: [], comments: [], statusCheckRollup: [], author: { login: 'x' } }]; for (const [k, v] of Object.entries(flags)) Object.defineProperty(r, k, { value: v }); return r; };
+  const read = async (flags, env, smokeClone) => {
+    const prev = process.env.WE_PR_SNAPSHOT_SAMPLE, prevClone = process.env.WE_SMOKE_LIVE_CLONE;
+    if (smokeClone) process.env.WE_SMOKE_LIVE_CLONE = smokeClone; else delete process.env.WE_SMOKE_LIVE_CLONE;
+    if (env === undefined) delete process.env.WE_PR_SNAPSHOT_SAMPLE; else process.env.WE_PR_SNAPSHOT_SAMPLE = env;
+    try {
+      const { defaultReadPrs } = await import('../reconcile-pass.mjs');
+      const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
+      return defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readCommits: () => [], readShared: () => rowsWith(flags) });
+    } finally {
+      if (prev === undefined) delete process.env.WE_PR_SNAPSHOT_SAMPLE; else process.env.WE_PR_SNAPSHOT_SAMPLE = prev;
+      if (prevClone === undefined) delete process.env.WE_SMOKE_LIVE_CLONE; else process.env.WE_SMOKE_LIVE_CLONE = prevClone;
+    }
+  };
+  it('accepts sampled rows in a rebuild-smoke child (sample injected from settings, not process.env)', async () => {
+    expect((await read({ sampled: true }, undefined, '/clone')).map(p => p.number)).toEqual([1]);
+  });
+  it('keeps the sampled flag through the author fill', async () => {
+    const { withRestAuthors } = await import('../reconcile-pass.mjs');
+    const r = [{ number: 5 }]; Object.defineProperty(r, 'sampled', { value: true });
+    expect(withRestAuthors(r, { repo: 'o/r', readRest: () => ({ json: { user: { login: 'u', type: 'User' } } }) }).sampled).toBe(true);
+  });
+  it('accepts rows marked sampled when the sample env is declared', async () => {
+    expect((await read({ sampled: true }, '12')).map(p => p.number)).toEqual([1]);
+  });
+  it('refuses a sampled flag when no sample env is set', async () => {
+    await expect(read({ sampled: true }, undefined)).rejects.toThrow(/sample/);
+  });
+  it('refuses a truncated snapshot even when a sample is declared', async () => {
+    await expect(read({ discoveryIncomplete: true }, '12')).rejects.toThrow(/truncated/);
+  });
+});
