@@ -1,5 +1,4 @@
 /** PR #6254 (2026-11-02, D-R338): an open, green, non-draft BOT PR on a non-lane head with no review:* label was `nothing-owed` 13x. */
-import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -10,7 +9,8 @@ export default {
   title: 'PR #6254: an unlabelled open green bot PR on a non-lane head (ci/refresh-test-timings) is refused nothing-owed forever and never reviewed',
   card: 'D-R338 reconcile treats no labels as already reviewed',
   fixedBy: { sha: '2665d4226207d8f4c81a970c06cafa60f1cc08da,49e6b4224b463a6a6d6a0092369d0d42a6295e1a,99634539ae2deccbd1f6bfa73759bb038708ee80,28b0aa9fb78fbfe4e723229a1d21974f8e38e678', where: 'lane/reconcile-unlabelled-nonlane-pr', paths: ['scripts/conveyor/reconcile-core.mjs'] },
-  fixPresent(root) { const src = readFileSync(join(root, 'scripts/conveyor/reconcile-core.mjs'), 'utf8'); return src.includes('botAuthored') && src.includes('strict: !laneHead') && src.includes('times.length !== checks.length'); },
+  // Always present: the fix ships in the same PR as this break, so a reproduced violation must FAIL the gate (never an expected-fail escape).
+  fixPresent() { return true; },
   async run() {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
     const { planReconcile } = await import(pathToFileURL(join(root, 'scripts/conveyor/reconcile-core.mjs')).href);
