@@ -18,7 +18,7 @@ export function emptyLedger() {
 function exactMatch(entry, finding) {
   const identity = normalizeFindingIdentity(finding);
   const original = normalizeFindingIdentity(entry.finding);
-  return Boolean(identity && original && identity.path === original.path && identity.normSummary === original.normSummary);
+  return Boolean(identity?.path && original?.path && identity.path === original.path && identity.normSummary === original.normSummary);
 }
 
 function matches(entry, finding, { strict = false } = {}) {
@@ -84,7 +84,7 @@ export function filterReraises(ledger, findings, { pinStillHolds } = {}) {
 /** Lists open, fixed-unpinned and test-pinned entries whose pin is not currently proven (a stale pin must not hide a finding). */
 export function renderOpenForBrief(ledger, { pinStillHolds } = {}) {
   const holds = (entry) => {
-    if (entry.status !== 'test-pinned' || typeof pinStillHolds !== 'function') return false;
+    if (entry.status !== 'test-pinned' || entry.variants?.length || typeof pinStillHolds !== 'function') return false;
     try { return pinStillHolds(structuredClone(entry)) === true; } catch { return false; }
   };
   const entries = ledger.entries.filter(entry => !holds(entry));
@@ -103,7 +103,8 @@ export function sharedLedgerEnabled(settings, env = process.env) {
 export function fenceLedgerBrief(text) {
   if (typeof text !== 'string' || !text.trim()) return '';
   const rest = text.startsWith(FENCED_DATA_RULE) ? text.slice(FENCED_DATA_RULE.length).trim() : '';
-  const ours = rest.startsWith('<findings>') && rest.endsWith('</findings>')
-    && rest.split('<findings>').length === 2 && rest.split('</findings>').length === 2;
+  const inner = rest.startsWith('<findings>\n') && rest.endsWith('\n</findings>') ? rest.slice(11, -12) : null;
+  // Already ours only if re-fencing the inner body is a no-op (every closing-tag spelling was already neutralized).
+  const ours = inner !== null && fenceUntrusted('findings', inner) === rest;
   return ours ? text : `${FENCED_DATA_RULE}\n\n${fenceUntrusted('findings', text)}`;
 }
