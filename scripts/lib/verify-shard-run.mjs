@@ -6,6 +6,8 @@ import { join, resolve, dirname } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { readRemoteReport, shouldConfirmRemoteRed, phaseRunLocation } from './verify-remote-routing.mjs';
 import { verificationInfrastructureFailure } from './lane-verify.mjs';
+import { SHARD_UNSETTLED_EXIT } from './verify-exit-codes.mjs';
+export { SHARD_UNSETTLED_EXIT } from './verify-exit-codes.mjs';
 import { startTreeWatchdog } from './tree-watchdog.mjs';
 import { acquireSlotBlocking, releaseOwnedSlot, admissionLockRoot, resolveCap, ADMISSION_HELD_ENV } from '../readiness/heavy-admission.mjs';
 
@@ -164,7 +166,7 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
     const found = planned.length ? discover({ files: planned, cwd }) : null;
     let excluded = found ? planned.filter(f => !found.has(canonical(resolve(cwd, f)))) : [];
     // Discovery that rejects EVERY selected file is more likely a path/config mismatch than a fully excluded selection:
-    // keep them all so any file that really cannot run shows up as INVENTORY-INCOMPLETE (red) instead of a vacuous green.
+    // keep them all so any file that really cannot run shows up as incomplete inventory instead of a vacuous green.
     if (excluded.length === planned.length) excluded = [];
     if (excluded.length) {
       log(`verify-shards: NOTE ${excluded.length} selected file(s) are excluded by the vitest config (never runnable here or in CI), not run: ${excluded.join(' ')}\n`);
@@ -186,23 +188,29 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
         const childEnv = { ...env, WE_VERIFY_REMOTE_REPORT: remoteReport, PATH: `${join(cwd, 'node_modules', '.bin')}:${env.PATH ?? ''}` };
         delete childEnv[ADMISSION_HELD_ENV];
         let lastResult = null;
-        async function attempt(local) {
+        async function attempt(local, attemptFiles = files, retry = '') {
           if (!remaining()) return 'NOT-RUN';
-          const report = join(directory, `${index}.${local ? 'local' : 'initial'}.json`);
+          const report = join(directory, `${index}.${retry}${local ? 'local' : 'initial'}.json`);
           // Preserve the npx command class through admission. JSON travels on
           // stdout through the existing SSH stream; no remote file is left behind
           // for finish() to delete before the inventory can be retrieved.
-          const args = shardRunArgv(files, flags);
+          const args = shardRunArgv(attemptFiles, flags);
+          const attemptRemoteReport = retry ? join(directory, `${index}.${retry}remote.jsonl`) : remoteReport;
+          const attemptEnv = { ...childEnv, WE_VERIFY_REMOTE_REPORT: attemptRemoteReport };
           const result = await execute({ command: local ? 'npx' : 'node',
             args: local ? args.slice(1) : [HEAVY_ADMISSION_SCRIPT, 'run', '--', ...args],
-            files, report, remoteReport, cwd, env: local ? { ...childEnv, [ADMISSION_HELD_ENV]: '1' } : childEnv,
+            files: attemptFiles, report, remoteReport: attemptRemoteReport, cwd, env: local ? { ...attemptEnv, [ADMISSION_HELD_ENV]: '1' } : attemptEnv,
             timeoutMs: remaining(), prefix: `[verify-shard ${index + 1}/${shards.length}] `, log });
           lastResult = result;
           if (result.timedOut || result.exitCode === 124) return 'TIMEOUT';
+          if (verificationInfrastructureFailure(result) && result.exitCode !== SHARD_UNSETTLED_EXIT) {
+            infraExit ||= result.signal ? 137 : result.exitCode;
+            return 'FAIL';
+          }
           let inventory;
           try {
-            const location = local ? {} : phaseRunLocation(readRemoteReport(remoteReport, (path, encoding) => fs.readFileSync(path, encoding)));
-            inventory = inventoryVerdict(Object.hasOwn(result, 'reportText') ? result.reportText : fs.readFileSync(report, 'utf8'), files, cwd, location);
+            const location = local ? {} : phaseRunLocation(readRemoteReport(attemptRemoteReport, (path, encoding) => fs.readFileSync(path, encoding)));
+            inventory = inventoryVerdict(Object.hasOwn(result, 'reportText') ? result.reportText : fs.readFileSync(report, 'utf8'), attemptFiles, cwd, location);
           }
           catch { inventory = 'INVENTORY-INCOMPLETE'; }
           if (inventory === 'INVENTORY-INCOMPLETE') return inventory;
@@ -237,9 +245,19 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
               } finally { unlock(); }
             }
           }
+          if (status === 'INVENTORY-INCOMPLETE') {
+            log(`verify-shard ${index + 1}/${shards.length}: INVENTORY-INCOMPLETE; retrying once in ${Math.min(2, files.length)} part(s)\n`);
+            const middle = Math.ceil(files.length / 2);
+            const halves = files.length === 1 ? [files] : [files.slice(0, middle), files.slice(middle)];
+            const retried = [];
+            // One split level only. Each half must prove its own complete inventory.
+            for (const [half, selected] of halves.entries()) retried.push(await attempt(false, selected, `retry-${half + 1}.`));
+            status = ['TIMEOUT', 'NOT-RUN', 'FAIL'].find(failure => retried.includes(failure))
+              ?? (retried.every(r => r === 'PASS') ? 'PASS' : 'UNSETTLED');
+          }
         } catch (error) { status = 'FAIL'; log(`verify-shard error: ${String(error.message).replace(/[\x00-\x1f\x7f]/g, '')}\n`); }
         // A killed/infrastructure shard must reach the caller as such (its guard refuses to run later phases on it).
-        if (status !== 'PASS' && lastResult && verificationInfrastructureFailure({ exitCode: lastResult.exitCode, signal: lastResult.signal })) infraExit ||= lastResult.signal ? 137 : lastResult.exitCode;
+        if (status !== 'PASS' && lastResult && lastResult.exitCode !== SHARD_UNSETTLED_EXIT && verificationInfrastructureFailure({ exitCode: lastResult.exitCode, signal: lastResult.signal })) infraExit ||= lastResult.signal ? 137 : lastResult.exitCode;
         if (status === 'TIMEOUT' || infraExit) stopLaunching = true;
         results[index] = status;
         log(`verify-shard ${index + 1}/${shards.length}: ${status} (${files.length} files, ${now() - started} ms)\n`);
@@ -250,6 +268,10 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
     if (results.every(r => r === 'PASS')) {
       log(`verify-shards: GREEN (all ${shards.length} shards, ${shards.flat().length} files executed and passed)\n`);
       return 0;
+    }
+    if (!infraExit && !results.some(r => ['FAIL', 'TIMEOUT', 'NOT-RUN'].includes(r)) && results.includes('UNSETTLED')) {
+      log(`verify-shards: UNSETTLED (${results.map((r, i) => `${i + 1}:${r}`).join(', ')}; incomplete inventory after one split retry; retry or wait)\n`);
+      return SHARD_UNSETTLED_EXIT;
     }
     log(`verify-shards: RED (${results.map((r, i) => `${i + 1}:${r}`).join(', ')}; inspect shard output and rerun the affected selection)\n`);
     if (infraExit > 0 && infraExit < 256 && infraExit !== 124) return infraExit;

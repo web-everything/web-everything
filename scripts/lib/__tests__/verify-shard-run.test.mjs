@@ -11,7 +11,7 @@ import { allowedCommand } from '../../readiness/forge-exec-run.mjs';
 import { runRemote } from '../../readiness/remote-exec.mjs';
 import { keepAliveScript } from '../test-keepalive.mjs';
 import { pidIdentity } from '../pid-alive.mjs';
-import { splitVitestArgs, runShards, executeShard, inventoryVerdict, parseShardCli, streamedInventory, SHARD_REPORT_MAX_BYTES } from '../verify-shard-run.mjs';
+import { splitVitestArgs, runShards, executeShard, inventoryVerdict, parseShardCli, streamedInventory, SHARD_REPORT_MAX_BYTES, SHARD_UNSETTLED_EXIT } from '../verify-shard-run.mjs';
 
 describe('shard split', () => {
   it('balances deterministically, covers files once, and preserves flags including values', () => {
@@ -102,10 +102,15 @@ describe('fail-closed wrapper', () => {
     expect(f.lines.filter(l => l.startsWith('verify-shard '))).toHaveLength(3);
     expect(f.calls[0].args.some(a => a.endsWith('scripts/readiness/heavy-admission.mjs'))).toBe(true);
   });
-  it.each(['red', 'missing', 'unreadable'])('%s cannot turn green', async mode => {
-    const f = fixture([mode]); expect(await f.run()).toBe(1);
+  it.each(['red', 'missing', 'unreadable'])('%s cannot turn green without complete retry evidence', async mode => {
+    const f = fixture(mode === 'red' ? [mode] : [mode, mode]);
+    expect(await f.run()).toBe(mode === 'red' ? 1 : 75);
     expect(f.lines.join('')).not.toContain('GREEN');
-    if (mode !== 'red') expect(f.lines.join('')).toContain('INVENTORY-INCOMPLETE');
+    if (mode !== 'red') {
+      expect(f.lines.join('')).toContain('UNSETTLED');
+      expect(f.lines.join('')).not.toContain('RED');
+      expect(f.calls).toHaveLength(4);
+    }
   });
   it('timeout exhausts budget and records unstarted shards NOT-RUN', async () => {
     const f = fixture(['timeout']); expect(await f.run()).toBe(124);
@@ -126,6 +131,63 @@ describe('fail-closed wrapper', () => {
     const f = fixture(['remote-red', local]); expect(await f.run()).toBe(local === 'pass' ? 0 : 1);
     expect(f.calls).toHaveLength(4); expect(f.calls[1].command).toBe('npx');
     expect(f.calls[1].env.WE_HEAVY_ADMISSION_HELD).toBe('1'); expect(f.releases()).toBe(1);
+  });
+});
+
+describe('one split retry for incomplete inventory', () => {
+  async function run(modes, files = ['a', 'b', 'c', 'd']) {
+    const calls = [], lines = [];
+    const reports = new Map();
+    const code = await runShards({ argv: ['npx', 'vitest', 'run', ...files, '--pool', 'forks'], shards: 1, parallel: 1, budgetMs: 10000 }, {
+      discover: () => null, env: {}, log: s => lines.push(s), tmpdir: () => '/scratch',
+      fs: { mkdtempSync: () => '/scratch/shards', rmSync: () => {}, readFileSync: p => { if (!reports.has(p)) throw Error('missing'); return reports.get(p); } },
+      acquireLocal: async () => ({ ok: true }), releaseLocal: () => {},
+      execute: async options => {
+        calls.push(options);
+        const mode = modes[calls.length - 1];
+        if (mode === 'remote-incomplete') reports.set(options.remoteReport, JSON.stringify({ location: 'remote', exitCode: 1 }) + '\n');
+        if (mode === 'timeout') return { exitCode: 124, timedOut: true };
+        const reportText = mode === 'oversized' ? streamedInventory('x'.repeat(SHARD_REPORT_MAX_BYTES + 1))
+          : JSON.stringify({ testResults: (['missing', 'remote-incomplete'].includes(mode) ? [] : options.files).map(name => ({ name,
+            status: mode === 'fail' ? 'failed' : 'passed', assertionResults: [{ status: mode === 'fail' ? 'failed' : 'passed' }] })) });
+        return { exitCode: ['fail', 'remote-incomplete'].includes(mode) ? 1 : 0, reportText };
+      },
+    });
+    return { code, calls, output: lines.join('') };
+  }
+  it('incomplete shard retries in halves with independent argv and report paths, both PASS -> GREEN', async () => {
+    const f = await run(['missing', 'pass', 'pass']);
+    expect(f.code).toBe(0); expect(f.output).toContain('verify-shards: GREEN');
+    expect(f.calls.map(c => c.files)).toEqual([['a', 'b', 'c', 'd'], ['a', 'b'], ['c', 'd']]);
+    expect(new Set(f.calls.map(c => c.report)).size).toBe(3);
+    expect(new Set(f.calls.map(c => c.remoteReport)).size).toBe(3);
+    for (const c of f.calls) expect(c.args.slice(3)).toEqual(['npx', 'vitest', 'run', ...c.files, '--pool', 'forks', '--reporter=json']);
+  });
+  it.each(['missing', 'oversized'])('%s half stays UNSETTLED, never PASS; split depth and execute count are bounded', async mode => {
+    const f = await run(['missing', mode, 'pass']);
+    expect(SHARD_UNSETTLED_EXIT).toBe(75); expect(f.code).toBe(75);
+    expect(f.output).toContain('verify-shards: UNSETTLED (');
+    expect(f.output).not.toMatch(/RED|GREEN/); expect(f.calls).toHaveLength(3);
+  });
+  it.each([['fail', 'missing', 1], ['missing', 'fail', 1], ['timeout', 'missing', 124], ['missing', 'timeout', 124]])('real %s / %s half takes precedence over incomplete inventory', async (left, right, code) => {
+    const f = await run(['missing', left, right]);
+    expect(f.code).toBe(code); expect(f.output).toContain('verify-shards: RED');
+    expect(f.calls).toHaveLength(3);
+  });
+  it('both incomplete halves remain unsettled without another split', async () => {
+    const f = await run(['missing', 'missing', 'missing']);
+    expect(f.code).toBe(75); expect(f.calls).toHaveLength(3);
+  });
+  it('single-file incomplete shard retries once whole then is unsettled', async () => {
+    const f = await run(['missing', 'missing'], ['a']);
+    expect(f.code).toBe(75); expect(f.calls.map(c => c.files)).toEqual([['a'], ['a']]);
+    expect(new Set(f.calls.map(c => c.report)).size).toBe(2);
+  });
+  it('confirms remote incomplete evidence locally before the one split retry', async () => {
+    const f = await run(['remote-incomplete', 'missing', 'pass', 'pass']);
+    expect(f.code).toBe(0); expect(f.calls).toHaveLength(4);
+    expect(f.calls.map(c => c.command)).toEqual(['node', 'npx', 'node', 'node']);
+    expect(f.calls.map(c => c.files.length)).toEqual([4, 4, 2, 2]);
   });
 });
 
