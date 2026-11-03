@@ -21,14 +21,19 @@ export function jsonLines(text) {
  *  ref, full 40-hex sha and ruling match the record exactly. Anything else stays refused; a `--audit` argument can
  *  never claim it. Never a blanket bypass. */
 const RULING = /^R\d+(?:\+R\d+)*$/;
-export function readyEvidence(records, input, ruledWeakened = []) {
+export function readyEvidence(records, input, ruledWeakened = [], liveFp = null) {
   if (input.testsRun?.trim() && /^NOT WEAKENED$/i.test(input.audit || '')) return { source: 'arguments', testsRun: input.testsRun };
-  const record = records.find((r) => r?.ref === input.branch && r.sha === input.sha && r.tests === 'green' && /^NOT WEAKENED$/i.test(r.audit || ''));
+  // R503: a record speaks for the live sha when it names it exactly, or its stored net-diff fingerprint equals the live one.
+  // A rebase or merge of main that leaves the code alone therefore keeps the evidence; any code change does not.
+  const covers = (r) => r?.ref === input.branch && (r.sha === input.sha || carriesAcross(r.fingerprint, liveFp));
+  const record = records.find((r) => covers(r) && r.tests === 'green' && /^NOT WEAKENED$/i.test(r.audit || ''));
   if (record) return { source: 'ready-record', record };
-  const ruled = records.find((r) => r?.ref === input.branch && r.sha === input.sha && r.tests === 'green' && r.audit === 'WEAKENED'
+  // The allowlist entry binds to the record by its exact sha, or (carry) by holding the live fingerprint itself.
+  const binds = (e, r) => e.sha === r.sha && r.sha === input.sha || carriesAcross(e.fingerprint, liveFp) && carriesAcross(r.fingerprint, liveFp);
+  const ruled = records.find((r) => covers(r) && r.tests === 'green' && r.audit === 'WEAKENED'
     && validSha(r.sha) && RULING.test(r.auditRuling || '')
     && Array.isArray(r.auditDisclosed) && r.auditDisclosed.length > 0 && r.auditDisclosed.every((f) => typeof f === 'string' && f.trim())
-    && Array.isArray(ruledWeakened) && ruledWeakened.some((e) => e && e.ref === r.ref && e.sha === r.sha && e.ruling === r.auditRuling
+    && Array.isArray(ruledWeakened) && ruledWeakened.some((e) => e && e.ref === r.ref && binds(e, r) && e.ruling === r.auditRuling
       && Array.isArray(e.findings) && e.findings.length > 0 && e.findings.every((f) => typeof f === 'string' && f.trim())
       && e.findings.length === r.auditDisclosed.length && e.findings.every((f, i) => f === r.auditDisclosed[i])));
   return ruled ? { source: 'ready-record', record: ruled, ruledWeakened: { ruling: ruled.auditRuling, findings: ruled.auditDisclosed } } : null;
