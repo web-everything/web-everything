@@ -9,6 +9,22 @@ import { analyzePr } from './pr-time-core.mjs';
 const HOUR = 3600000;
 const ms = t => typeof t === 'number' ? t : Date.parse(t);
 const unknown = key => /^(unknown:|other:|fix:agent-unattributed)/.test(key);
+const RETRY_MS=5*60_000, MAX_EARLY_RETRIES=3;
+const deferredFailure=e=>!!e?.ghThrottled || e?.code==='BOTTLENECK_DEADLINE' || /budget exhausted|no gh slot/i.test(String(e?.message || e));
+/** Same production-reader fence as prSweepTickAllowed, including future fixture flags. */
+export function bottleneckReportAllowed(flags={}) {
+ return !Object.entries(flags).some(([key,value])=>value && (key.endsWith('-fixture') ||
+  ['no-gh','dry-run','state-root','logs-dir','lock-root','claude-jobs-root','tmp-sweep-root','lane-pool-root','self-sync-dir','builder-log-dir'].includes(key)));
+}
+/** Precision warnings are not work. Only explicit deferred work earns spaced, capped early retries. */
+export function bottleneckCadence(state,now,everyMs=HOUR,{force=false}={}) {
+ const last=ms(state?.at), cycle=state?.cycleAt==null?last:ms(state.cycleAt);
+ if(force || !Number.isFinite(last) || last<=0 || last>now || !Number.isFinite(cycle) || cycle<=0 || cycle>now || now-cycle>=everyMs)
+  return {due:true,cycleAt:now,earlyRetries:0};
+ const retries=state?.earlyRetries==null?0:Number.isInteger(state.earlyRetries) && state.earlyRetries>=0?state.earlyRetries:MAX_EARLY_RETRIES;
+ const due=state?.deferredWork===true && now-last>=RETRY_MS && retries<MAX_EARLY_RETRIES;
+ return {due,cycleAt:cycle,earlyRetries:due?retries+1:retries};
+}
 
 export function buildReport({slicesByPr, now = Date.now(), windowHours = 24, previous} = {}) {
  if (!(windowHours > 0) || !Number.isFinite(windowHours)) throw new Error('windowHours must be positive');
@@ -109,7 +125,7 @@ function defaultReaders({now, deadline, cache, gaps, runGh = runGhSync, searchLo
       if(data.items.length<100){gaps.push({source:'PR listing',why:`${query}: search ended early; remaining PRs deferred`});break;}
       if(page===10)gaps.push({source:'PR listing',why:`${query}: 1000-result bound; partition the discovery query to cover remaining PRs`});
      }
-    } catch(e){gaps.push({source:'PR listing',why:String(e.message)});if(/budget/.test(e.message))break;}
+    } catch(e){gaps.push({source:'PR listing',why:String(e.message)});if(deferredFailure(e))cache.deferredWork=true;if(/budget/.test(e.message))break;}
    }
    return [...found.values()];
   },
@@ -135,7 +151,7 @@ function defaultReaders({now, deadline, cache, gaps, runGh = runGhSync, searchLo
 }
 
 /** Analysis and publication have separate deadlines: exhausted analysis still publishes partial evidence. */
-export async function runBottleneckReport({dir, now = Date.now(), deps = {}, budgetMs = 60000, everyMs = HOUR, writeGraceMs = 3000, prs} = {}) {
+export async function runBottleneckReport({dir, now = Date.now(), deps = {}, budgetMs = 60000, everyMs = HOUR, writeGraceMs = 3000, prs, force=false} = {}) {
  const io=deps.fs || fs, clock=deps.clock || Date.now, at=ms(now);
  budgetMs=Number.isFinite(budgetMs)?Math.max(0,Math.min(60000,budgetMs)):60000;
  writeGraceMs=Number.isFinite(writeGraceMs)?Math.max(1,Math.min(5000,writeGraceMs)):3000;
@@ -153,8 +169,9 @@ export async function runBottleneckReport({dir, now = Date.now(), deps = {}, bud
  };
  const bounded=limiter(deadline);
  const validSlices=slices=>Array.isArray(slices) && slices.every(s=>s && typeof s.causeKey==='string' && Number.isFinite(ms(s.start)) && Number.isFinite(ms(s.end)) && ms(s.end)>=ms(s.start));
- const entries=Object.create(null);let cacheLoaded=false, previous, listed=[], truncated=false;
- const record=(source,e)=>{truncated=true;gaps.push({source,why:String(e?.message || e)});};
+ const entries=Object.create(null);let cacheLoaded=false, previous, listed=[], truncated=false, deferredWork=false;
+ let cadence={cycleAt:at,earlyRetries:0};
+ const record=(source,e,retry=deferredFailure(e))=>{truncated=true;deferredWork ||= retry;gaps.push({source,why:String(e?.message || e)});};
  const load=async(file)=>{
   try{return JSON.parse(await bounded(()=>io.readFile(join(dir,file),'utf8')));}
   catch(e){if(e.code==='BOTTLENECK_DEADLINE')throw e;if(e.code!=='ENOENT')record(file,e);return null;}
@@ -170,9 +187,10 @@ export async function runBottleneckReport({dir, now = Date.now(), deps = {}, bud
    if(at-entry.cachedAt<=72*HOUR)entries[key]=entry;
   }
   cacheLoaded=true;
-  const stamp=await load('bottleneck-report.json'), last=ms(stamp?.at);
+  const stamp=await load('bottleneck-report.json');
   // Explicit proof lists bypass cadence, but ordinary ticks keep the hourly gate.
-  if(prs===undefined && stamp?.truncated!==true && Number.isFinite(last) && last<=at && at-last<everyMs)return {skipped:true,at:stamp.at,summary:'Bottleneck report: hourly cadence'};
+  cadence=bottleneckCadence(stamp,at,everyMs,{force:force || prs!==undefined});
+  if(!cadence.due)return {skipped:true,at:stamp.at,summary:'Bottleneck report: cadence hold'};
   let history='';
   try {history=await bounded(()=>deps.fs ? io.readFile(join(dir,'bottleneck-history.jsonl'),'utf8') : readTail(join(dir,'bottleneck-history.jsonl'),4*1024*1024,()=>record('history','bounded history tail')));}
   catch(e){if(e.code==='BOTTLENECK_DEADLINE')throw e;if(e.code!=='ENOENT')record('history',e);}
@@ -202,7 +220,7 @@ export async function runBottleneckReport({dir, now = Date.now(), deps = {}, bud
    // Short-term reuse lets partial passes resume without repeatedly analysing the same newest PRs.
    // A cached final lifecycle can reopen; only current closed-state evidence permits immutable reuse.
    if(current && (current.final ? pr.state==='closed' : (pr.state!=='closed' && updatedAt && current.updatedAt===updatedAt && at>=current.cachedAt && at-current.cachedAt<everyMs)))continue;
-   if(clock()>=deadline || attempts>=cache.maxPrs || cache.calls>=cache.maxCalls){record('analysis budget','remaining PRs deferred to a later run');break;}
+   if(clock()>=deadline || attempts>=cache.maxPrs || cache.calls>=cache.maxCalls){record('analysis budget','remaining PRs deferred to a later run',true);break;}
    attempts++;
    try {
     const ciGapStart=cache.gaps.length, ioGapStart=gaps.length;
@@ -226,6 +244,8 @@ export async function runBottleneckReport({dir, now = Date.now(), deps = {}, bud
  gaps.push(...cache.gaps,...selected.flatMap(e=>Array.isArray(e.gaps)?e.gaps:[]));
  const uniqueGaps=[...new Map(gaps.map(g=>[JSON.stringify(g),g])).values()];
  report.truncated=truncated || uniqueGaps.length>0;report.gapsFlagged.push(...uniqueGaps);report.prsListed=listed.length;
+ report.deferredWork=deferredWork || cache.deferredWork===true;
+ report.cycleAt=cadence.cycleAt;report.earlyRetries=cadence.earlyRetries;
  const line=summary(report), publish=limiter(clock()+writeGraceMs);
  try {
   await publish(()=>io.mkdir(dir,{recursive:true}));
@@ -233,6 +253,6 @@ export async function runBottleneckReport({dir, now = Date.now(), deps = {}, bud
   await publish(()=>io.writeFile(join(dir,'bottleneck-report.md'),renderMarkdown(report)));
   await publish(()=>io.appendFile(join(dir,'bottleneck-history.jsonl'),JSON.stringify(report)+'\n'));
   await publish(()=>io.writeFile(join(dir,'bottleneck-report.json'),JSON.stringify(report,null,2)+'\n'));
-  return {at,completedAt:clock(),summary:line,truncated:report.truncated,...(truncated?{error:gaps.map(g=>g.why).join('; ')}:{})};
+  return {at,completedAt:clock(),summary:line,truncated:report.truncated,deferredWork:report.deferredWork,cycleAt:report.cycleAt,earlyRetries:report.earlyRetries,...(truncated?{error:gaps.map(g=>g.why).join('; ')}:{})};
  } catch(e) {return {at,error:String(e?.message || e),summary:'Bottleneck report: incomplete (report IO failed)',truncated:true};}
 }

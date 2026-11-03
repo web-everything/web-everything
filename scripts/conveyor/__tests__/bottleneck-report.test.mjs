@@ -353,7 +353,7 @@ describe('report runner', () => {
   expect(JSON.parse(files.get('state/bottleneck-report.json')).prsConsidered).toBe(1);
   expect(Object.values(JSON.parse(files.get('state/bottleneck-slices.json')).entries)[0]).toMatchObject({number:2,updatedAt:'2026-11-02T21:00:00Z'});
   calls.length=0;deps.analyzePr=async pr=>{calls.push(pr);return [slice(pr,'ci:queued',1)];};
-  await runBottleneckReport({dir:'state',now:now+1000,deps});
+  await runBottleneckReport({dir:'state',now:now+5*60000,deps});
   expect(calls).toEqual([1]);
   expect(JSON.parse(files.get('state/bottleneck-report.json')).prsConsidered).toBe(2);
  });
@@ -387,7 +387,7 @@ describe('report runner', () => {
   // Force a resumable pass within the freshness interval, keeping the metadata version identical.
   const report=JSON.parse(files.get('state/bottleneck-report.json'));
   files.set('state/bottleneck-report.json',JSON.stringify({...report,truncated:true}));
-  await runBottleneckReport({dir:'state',now:now+1000,deps});
+  await runBottleneckReport({dir:'state',now:now+1000,deps,force:true});
   expect(deps.analyzePr).toHaveBeenCalledTimes(2);
   expect(JSON.parse(files.get('state/bottleneck-report.json')).causes.find(c=>c.key==='unknown:idle').hoursLost)
    .toBeCloseTo(1+1000/hour);
@@ -519,10 +519,31 @@ describe('report runner', () => {
   deps.analyzePr=async(pr,{cache})=>{cache.gaps.push({source:'PR 1 CI',why:'completed workflow timing used'});return [slice(pr,'ci:queued',1)];};
   await runBottleneckReport({dir:'state',now,deps});
   deps.analyzePr=vi.fn(()=>{throw Error('must reuse final slices');});
-  await runBottleneckReport({dir:'state',now:now+1000,deps});
+  await runBottleneckReport({dir:'state',now:now+hour,deps});
   expect(deps.analyzePr).not.toHaveBeenCalled();
   expect(JSON.parse(files.get('state/bottleneck-report.json'))).toMatchObject({truncated:true,
    gapsFlagged:expect.arrayContaining([{source:'PR 1 CI',why:'completed workflow timing used'}])});
+ });
+ it('a final-cache run with only precision warnings respects the hourly cadence',async()=>{
+  const {deps,files}=setup();deps.listPrs=vi.fn(async()=>[{number:1,repo:'a/b',state:'closed'}]);
+  deps.analyzePr=vi.fn(async(pr,{cache})=>{cache.gaps.push({source:'CI',why:'completed workflow timing used; individual job/idle detail unavailable'});return [slice(pr,'ci:queued',1)];});
+  await runBottleneckReport({dir:'state',now,deps});
+  expect(JSON.parse(files.get('state/bottleneck-report.json'))).toMatchObject({truncated:true,deferredWork:false});
+  expect((await runBottleneckReport({dir:'state',now:now+5*60000,deps})).skipped).toBe(true);
+  expect(deps.listPrs).toHaveBeenCalledTimes(1);expect(deps.analyzePr).toHaveBeenCalledTimes(1);
+ });
+ it('deferred PR work retries early with five-minute spacing and at most three consecutive early retries',async()=>{
+  const {deps,files}=setup();deps.analyzePr=vi.fn(async()=>{throw Object.assign(Error('no gh slot'),{ghThrottled:{class:'background'}});});
+  await runBottleneckReport({dir:'state',now,deps});
+  expect(JSON.parse(files.get('state/bottleneck-report.json'))).toMatchObject({deferredWork:true,earlyRetries:0,cycleAt:now});
+  expect((await runBottleneckReport({dir:'state',now:now+60000,deps})).skipped).toBe(true);
+  for(const minutes of [5,10,15])await runBottleneckReport({dir:'state',now:now+minutes*60000,deps});
+  expect(deps.analyzePr).toHaveBeenCalledTimes(4);
+  expect((await runBottleneckReport({dir:'state',now:now+20*60000,deps})).skipped).toBe(true);
+  expect(deps.analyzePr).toHaveBeenCalledTimes(4);
+  await runBottleneckReport({dir:'state',now:now+hour,deps});
+  expect(deps.analyzePr).toHaveBeenCalledTimes(5);
+  expect(JSON.parse(files.get('state/bottleneck-report.json'))).toMatchObject({earlyRetries:0,cycleAt:now+hour});
  });
  it('rebuilds final slices from the prior attribution version instead of retaining backdated hours',async()=>{
   const {deps,files}=setup();deps.listPrs=async()=>[{number:1,repo:'a/b',state:'closed'}];
@@ -536,6 +557,10 @@ describe('report runner', () => {
 
 // Host IO is fenced for tick integration and the production bounded-history reader.
 const host = vi.hoisted(()=>({active:false,files:new Map(),history:null}));
+const reportProbe=vi.hoisted(()=>({active:false,run:vi.fn()}));
+vi.mock('../bottleneck-report.mjs',async original=>{
+ const real=await original();return {...real,runBottleneckReport:(...args)=>reportProbe.active?reportProbe.run(...args):real.runBottleneckReport(...args)};
+});
 vi.mock('node:fs',async original=>{
  const real=await original();const missing=()=>{throw Object.assign(Error('fixture absent'),{code:'ENOENT'});};
  const fake={readFileSync:p=>host.files.has(String(p))?host.files.get(String(p)):missing(),
@@ -555,7 +580,7 @@ vi.mock('node:fs',async original=>{
  const memoryPromises={readFile:async p=>fake.readFileSync(p),mkdir:async()=>{},writeFile:async(p,v)=>fake.writeFileSync(p,v),
   appendFile:async(p,v)=>host.files.set(String(p),(host.files.get(String(p))||'')+v)};
  const promises={...real.promises,...Object.fromEntries(Object.entries(memoryPromises).map(([k,f])=>
-  [k,(...args)=>host.active && host.history?f(...args):real.promises[k](...args)]))};
+  [k,(...args)=>host.active?f(...args):real.promises[k](...args)]))};
  return {...real,...wrapped,promises,default:{...real.default,...wrapped,promises}};
 });
 vi.mock('node:child_process',async original=>{
@@ -568,6 +593,11 @@ vi.mock('../nightly-coroner-job.mjs',async original=>({...await original(),night
 vi.mock('../health-watch-job.mjs',async original=>({...await original(),resolveHealthJobSwitches:()=>({ghProbes:false})}));
 vi.mock('../../lib/quiet-hours-io.mjs',async original=>({...await original(),flushDigest:vi.fn()}));
 vi.mock('../../lib/ledger-readiness-daily.mjs',async original=>({...await original(),runDailyReadinessCheck:vi.fn()}));
+vi.mock('../../operations/card-batch-seal-io.mjs',()=>({sealDueBatches:vi.fn()}));
+vi.mock('../needs-you-feed-job.mjs',()=>({superviseNeedsYouFeed:vi.fn()}));
+vi.mock('../archive-retention-tick.mjs',async original=>({...await original(),runArchiveRetentionTick:vi.fn(async()=>({results:[]}))}));
+vi.mock('../main-ci-red-io.mjs',()=>({probeAndOwnMainCi:vi.fn(async()=>({runs:[]}))}));
+vi.mock('../health-watch-main-red.mjs',()=>({runMainRedAlert:vi.fn()}));
 import { tick } from '../health-watch.mjs';
 describe('shadow tick wiring',()=>{
  async function run(enabled,runner,extra={},previous) {
@@ -585,11 +615,28 @@ describe('shadow tick wiring',()=>{
   expect((await run(true)).bottleneckReport).toBeNull();
   expect((await run(true,undefined,{'dry-run':true})).bottleneckReport).toBeNull();
  });
+ it.each(['no-gh','dry-run','state-root','logs-dir','lock-root','ps-fixture','machine-load-fixture','future-fixture',
+  'claude-jobs-root','tmp-sweep-root','lane-pool-root','self-sync-dir','builder-log-dir'])('production bottleneck readers are fenced by --%s even with force-gh',async flag=>{
+  reportProbe.active=true;reportProbe.run.mockReset().mockResolvedValue({completedAt:now,summary:'unexpected production read'});
+  try {
+   const value=['no-gh','dry-run'].includes(flag)?true:'fixture';
+   const out=await run(true,undefined,{'state-root':undefined,'no-gh':false,'force-gh':true,[flag]:value});
+   expect(out.bottleneckReport).toBeNull();expect(reportProbe.run).not.toHaveBeenCalled();
+  } finally{reportProbe.active=false;}
+ });
+ it('force-gh bypasses cadence but no-gh still wins over force-gh',async()=>{
+  const previous={at:now,completedAt:now,summary:'complete'},runner=vi.fn(async()=>({completedAt:now+1000,summary:'forced'}));
+  await run(true,runner,{'no-gh':false,'force-gh':true,now:new Date(now+1000).toISOString()},previous);
+  expect(runner).toHaveBeenCalledTimes(1);expect(runner.mock.calls[0][0].force).toBe(true);
+  runner.mockClear();
+  await run(true,runner,{'no-gh':true,'force-gh':true,now:new Date(now+1000).toISOString()},previous);
+  expect(runner).not.toHaveBeenCalled();
+ });
  it('enabled injected runner persists state and summary, and observes hourly state stamp',async()=>{
   const runner=vi.fn(async()=>({completedAt:now,summary:'Top sinks (24h): ci:queued 1 h/d'}));
   const out=await run(true,runner);
   expect(out.bottleneckReport.summary).toContain('Top sinks');
-  expect(JSON.parse(host.files.get('/fixture-health/state.json')).bottleneckReport).toEqual({at:now,completedAt:now,summary:out.bottleneckReport.summary});
+  expect(JSON.parse(host.files.get('/fixture-health/state.json')).bottleneckReport).toEqual({at:now,completedAt:now,summary:out.bottleneckReport.summary,deferredWork:false,cycleAt:now,earlyRetries:0});
   host.active=true;
   try {await tick({'state-root':'fixture','no-gh':true,'no-diagnose':true,'no-notify':true,'no-investigate':true,'no-file':true,now:new Date(now+1000).toISOString()},
    {smells:[],collectInventory:()=>({}),runBottleneckReport:runner});}
@@ -613,11 +660,16 @@ describe('shadow tick wiring',()=>{
   const out=await run(true,async()=>{throw Error('report unavailable');});
   expect(out.probeErrors.bottleneckReport).toBe('report unavailable');
  });
- it('a published partial report retries on the next tick instead of waiting an hour',async()=>{
-  const previous={at:now,completedAt:now,summary:'partial',truncated:true};
-  const runner=vi.fn(async()=>({completedAt:now+1000,summary:'complete'}));
-  await run(true,runner,{now:new Date(now+1000).toISOString()},previous);
+ it('deferred partial reports retry after five minutes, while precision-only and legacy truncation stay hourly',async()=>{
+  const previous={at:now,completedAt:now,summary:'partial',truncated:true,deferredWork:true,cycleAt:now,earlyRetries:0};
+  const runner=vi.fn(async()=>({completedAt:now+5*60000,summary:'complete'}));
+  await run(true,runner,{now:new Date(now+1000).toISOString()},previous);expect(runner).not.toHaveBeenCalled();
+  await run(true,runner,{now:new Date(now+5*60000).toISOString()},previous);
   expect(runner).toHaveBeenCalledTimes(1);
-  expect(JSON.parse(host.files.get('/fixture-health/state.json')).bottleneckReport.at).toBe(now+1000);
+  expect(JSON.parse(host.files.get('/fixture-health/state.json')).bottleneckReport).toMatchObject({at:now+5*60000,cycleAt:now,earlyRetries:1});
+  runner.mockClear();
+  for(const deferredWork of [false,undefined])await run(true,runner,{now:new Date(now+5*60000).toISOString()},{...previous,deferredWork});
+  await run(true,runner,{now:new Date(now+20*60000).toISOString()},{...previous,at:now+15*60000,earlyRetries:3});
+  expect(runner).not.toHaveBeenCalled();
  });
 });

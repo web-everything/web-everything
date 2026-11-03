@@ -45,7 +45,7 @@
  *   node scripts/conveyor/health-watch.mjs silence --smell=ID [--subject=S] --card=NNN [--hours=72]
  *   node scripts/conveyor/health-watch.mjs unsilence --smell=ID [--subject=S]
  */
-import { runBottleneckReport } from './bottleneck-report.mjs';
+import { runBottleneckReport, bottleneckReportAllowed, bottleneckCadence } from './bottleneck-report.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { runArchiveRetentionTick } from './archive-retention-tick.mjs';
 export { archiveRetentionTickAllowed } from './archive-retention-tick.mjs';
@@ -1171,11 +1171,13 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
       budgetMs: process.env.WE_BOTTLENECK_REPORT_BUDGET_MS == null ? undefined : Number(process.env.WE_BOTTLENECK_REPORT_BUDGET_MS),
     }, valid: { enabled: v => typeof v === 'boolean', everyMs: v => Number.isFinite(v) && v >= HOUR,
       budgetMs: v => Number.isFinite(v) && v >= 0 && v <= 60_000 } });
-  const bottleneckAllowed = deps.runBottleneckReport || (!flags['state-root'] && !flags['dry-run']);
+  const bottleneckAllowed = deps.runBottleneckReport || bottleneckReportAllowed(flags);
+  const bottleneckForce=!!flags['force-gh'] && !flags['no-gh'];
+  const bottleneckCadencePlan=bottleneckCadence(prev.bottleneckReport,now,bottleneckSettings.value.everyMs,{force:bottleneckForce});
   const bottleneckReport = bottleneckAllowed && bottleneckSettings.value.enabled
-    && (prev.bottleneckReport?.truncated === true || cadenceDue(prev.bottleneckReport?.at, now, bottleneckSettings.value.everyMs))
+    && bottleneckCadencePlan.due
     ? await attempt('bottleneckReport', () => (deps.runBottleneckReport ?? runBottleneckReport)({
-      dir, now, budgetMs: bottleneckSettings.value.budgetMs, everyMs: bottleneckSettings.value.everyMs,
+      dir, now, budgetMs: bottleneckSettings.value.budgetMs, everyMs: bottleneckSettings.value.everyMs,force:bottleneckForce,
     })) : null;
 
   // Card 335 — queue movement reads beside the archive cadence; never block a health tick.
@@ -1431,6 +1433,9 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   else if (prev.claudeJobsArchive) state.claudeJobsArchive = prev.claudeJobsArchive;
   if (bottleneckReport && !bottleneckReport.skipped && Number.isFinite(bottleneckReport.completedAt)) state.bottleneckReport = {
     at: now, completedAt: bottleneckReport.completedAt, summary: bottleneckReport.summary,
+    deferredWork:bottleneckReport.deferredWork===true,
+    cycleAt:Number.isFinite(bottleneckReport.cycleAt)?bottleneckReport.cycleAt:bottleneckCadencePlan.cycleAt,
+    earlyRetries:Number.isInteger(bottleneckReport.earlyRetries)?bottleneckReport.earlyRetries:bottleneckCadencePlan.earlyRetries,
     ...(bottleneckReport.truncated ? {truncated:true} : {}),
   };
   else if (prev.bottleneckReport) state.bottleneckReport = prev.bottleneckReport;
