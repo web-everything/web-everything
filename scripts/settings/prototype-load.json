@@ -117,6 +117,15 @@
       "findings": [
         "scripts/settings/review.json:3 — Shipped timing changes from fast-check success to `push`, permitting review while both prerequisites are queued. Confirmed by a direct probe: pending checks now allow review, whereas the previous default refuses. `scripts/lib/review-timing.mjs:195` grants this permission even with `startEarly: \"shadow\"` or `\"off\"`; the added publication guard does not preserve the review-start gate."
       ]
+    },
+    {
+      "ref": "lane/cheap-pr-list-retry",
+      "sha": "393b3f42378fc25dd729b4d17c930dd7fb89a56c",
+      "ruling": "R517",
+      "findings": [
+        "scripts/merge-ai-prs.mjs:2686 — Pre-existing fail-open dependency handling remains: full sweeps clear absent `blockedBy` dependencies even when listing failures make `contextComplete=false`; an unreadable repo's open blocker can therefore be bypassed.",
+        "scripts/merge-ai-prs.mjs:5616 — Pre-existing `--assume-complete-context` overrides the incomplete-context guard after listing failures, allowing an unobserved carrier to count as landed despite the new inventory checks."
+      ]
     }
   ]
 }
