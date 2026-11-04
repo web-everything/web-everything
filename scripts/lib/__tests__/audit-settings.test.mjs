@@ -117,6 +117,19 @@ describe('audit settings (R528)', () => {
     const hashes = resolve(full({ priorQuestionHashes: ['abcdef12'], PriorQuestionHashes: [] }));
     expect(hashes.value.priorQuestionHashes).toEqual([]);
   });
+  it.each(['releaseStage ', 'releaseStage​', 'ｒeleaseStage', 'releaſeStage', ' release\tStage'])(
+    'a whitespace, invisible or compatibility-form variant %j of a setting key fails it closed (PR #6381)', k => {
+      const r = resolveAuditSettings({ fileRead: file({ [k]: 'prerelease' }), platform: null, env: {}, log: () => {} });
+      expect(r.value.releaseStage).toBe('prod');
+      expect(r.sources.releaseStage).toBe('strictest');
+    });
+  it('section-level whitespace variants fail the setting closed (PR #6381)', () => {
+    for (const audit of [{ verdict: { 'mode ': 'computed' } }, { 'verdict ': { mode: 'computed' } }]) {
+      const r = resolveAuditSettings({ fileRead: file(audit), platform: null, env: {}, log: () => {} });
+      expect(r.value.verdictMode).toBe('shadow');
+      expect(r.sources.verdictMode).toBe('strictest');
+    }
+  });
   it('empty-object path lists and hashes warn instead of vanishing silently', () => {
     const r = resolve(full({ raceBlockPaths: {}, guardFloorPaths: {}, priorQuestionHashes: {} }));
     expect(r.value.raceBlockPaths).toEqual(GUARD_FLOOR);

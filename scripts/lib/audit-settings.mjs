@@ -65,14 +65,16 @@ function rawMalformed(layer, key, valid) {
   return Object.hasOwn(layer[a], b) && !valid(layer[a][b]);
 }
 /**
- * A key that differs from a setting only by letter case (`ReleaseStage`, `recheck.Max`, `Verdict.mode`) is an explicit
+ * A key that differs from a setting only by letter case, compatibility form, whitespace or an invisible character
+ * (`ReleaseStage`, `recheck.Max`, `"releaseStage "`, a zero-width space, fullwidth or long-s letters) is an explicit
  * choice the cascade cannot see: it would read as omitted and earn the default. It fails that setting closed instead.
  * Other misspellings (`verdicts`) cannot be mapped to a setting; they are only named by `unknownKeys`.
  */
+const foldKey = s => s.normalize('NFKC').replace(/[\s\p{Default_Ignorable_Code_Point}]/gu, '').toLowerCase();
 function caseShadowed(layer, key) {
   if (!isObj(layer)) return false;
   const [a, b] = pathOf(key);
-  const fold = s => s.toLowerCase();
+  const fold = foldKey;
   for (const [ka, x] of Object.entries(layer)) {
     if (fold(ka) !== fold(a)) continue;
     if (b === undefined) { if (ka !== a) return true; continue; }
