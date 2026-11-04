@@ -8,7 +8,7 @@ import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { classifyManifestPath, credentialTextFinding } from './forge-exec-manifest.mjs';
+import { classifyManifestPath, credentialTextFinding, credentialContentFinding } from './forge-exec-manifest.mjs';
 
 export const REMOTE_TRANSPORTS = Object.freeze(['rsync', 'git-bundle']);
 export const DEFAULT_REMOTE_TRANSPORT = 'rsync';
@@ -142,7 +142,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
     let excluded;
     try { excluded = classifyManifestPath(path).excluded; } catch { excluded = true; }
     if (excluded) return { path: label, finding: 'excluded-path' };
-    if (!blobs.has(newSha)) blobs.set(newSha, label);
+    if (!blobs.has(newSha)) blobs.set(newSha, { label, path });
     if (blobs.size > maxBlobs) throw bundleError('bundle-credential-scan-too-large');
   }
   const shas = [...blobs.keys()];
@@ -170,7 +170,13 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
       const content = out.subarray(newline + 1, newline + 1 + Number(size));
       offset = newline + 1 + Number(size) + 1;
       const finding = credentialTextFinding(content.toString('latin1')) ?? credentialTextFinding(content.toString('utf8'));
-      if (finding) return { path: blobs.get(sha), finding };
+      // R559: the SAME content scanner the rsync path uses for credential-named files, applied to every added blob
+      // (binary or unreadable text fails closed as unsupported-text-encoding), plus the raw token patterns.
+      const { label, path } = blobs.get(sha);
+      let policy = null;
+      try { policy = credentialContentFinding(path, content); } catch { policy = 'content-scan-error'; }
+      const hit = policy ?? finding;
+      if (hit) return { path: label, finding: hit };
     }
     batch = []; batchBytes = 0;
     return null;

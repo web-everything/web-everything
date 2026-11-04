@@ -274,3 +274,16 @@ describe('R593 audit round 3 fixes (R559)', () => {
     expect(existsSync(join(work, '.git'))).toBe(false);
   });
 });
+
+describe('R593 content scanner parity with the rsync path (R559)', () => {
+  it('flags a secret assignment in a historical blob that only the rsync content scanner knows', async () => {
+    await commit(lane, { 'config.ini': 'password=actual-private-value\n' }, 'cfg');
+    const head = await commit(lane, { 'config.ini': 'ok=1\n' }, 'scrub');
+    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ path: 'config.ini', finding: expect.stringContaining('password') });
+  });
+  it('fails closed on a binary historical blob', async () => {
+    await fs.writeFile(join(lane, 'blob.bin'), Buffer.from([0xff, 0xfe, 0x00, 0x80]));
+    git(lane, 'add', '--', 'blob.bin'); git(lane, ...ident, 'commit', '-q', '-m', 'bin');
+    expect(await scanBundleRange({ cwd: lane, head: git(lane, 'rev-parse', 'HEAD'), prerequisite: runnerMain, exec })).toMatchObject({ path: 'blob.bin', finding: 'unsupported-text-encoding' });
+  });
+});
