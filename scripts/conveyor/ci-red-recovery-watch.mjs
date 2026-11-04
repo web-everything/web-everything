@@ -354,18 +354,35 @@ export function sweepCiRedRecovery({
   const applied = [];
   if (apply) {
     let started = 0;
+    // A deferred refresh did no write, but its verification still cost network time (review round 3 of #6340: slow
+    // deferrals ran past the 300 s pass deadline because only started refreshes counted). So refresh time is
+    // metered whether or not it started: `spentMs` bounds it against the budget, `attempts` bounds the call count
+    // loosely (a fast deferral must not eat the per-tick cap, or a few permanent deferrals would starve the rest).
+    let spentMs = 0;
+    let attempts = 0;
+    const maxAttemptsPerTick = Math.max(1, maxApplyPerTick) * 4;
     for (const d of plan.dispatch) {
       // Progress floor: the first refresh of a tick always starts. Discovery (per-PR comment reads) can by itself
       // outlast the budget; without the floor every tick would defer everything and the queue would never drain.
-      if (started >= maxApplyPerTick || (started >= 1 && now() - tickStartedAt >= applyBudgetMs)) {
+      if (started >= maxApplyPerTick || attempts >= maxAttemptsPerTick || spentMs >= applyBudgetMs
+        || (started >= 1 && now() - tickStartedAt >= applyBudgetMs)) {
         applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, ok: false, action: 'deferred', deferred: true, budgetExhausted: true,
           error: 'tick apply budget spent — left for the next tick (no rebase comment posted, the per-sha cap is untouched)' });
         continue;
       }
       const held = checkClaim({ repo, branch: d.headRefName });
       // Passing prNumber makes refreshOntoMain verify the PR is same-repo before it rebases and force-pushes.
-      const result = held ? { ok: false, error: held.message }
-        : refresh(d.headRefName, { base: `origin/${defaultBranch}`, root: repoRoot, prNumber: d.prNumber, repo, readIsCrossRepository });
+      let result;
+      if (held) result = { ok: false, error: held.message };
+      else {
+        const refreshStartedAt = now();
+        attempts += 1;
+        try {
+          result = refresh(d.headRefName, { base: `origin/${defaultBranch}`, root: repoRoot, prNumber: d.prNumber, repo, readIsCrossRepository });
+        } finally {
+          spentMs += Math.max(0, now() - refreshStartedAt);
+        }
+      }
       // 2026-10-10 live: #4784 claim-held refusals burned the cap. A failed push re-reads the claim store (the push
       // race); the failure text is never trusted to say a claim is held (PR #4825 round 4).
       if (held || result.deferred || (!result.ok && checkClaim({ repo, branch: d.headRefName }))) {

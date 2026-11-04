@@ -312,6 +312,34 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
     expect(result.applied.map((a) => [a.prNumber, a.action])).toEqual([[2635, 'deferred'], [2636, 'rebased']]);
   });
 
+  // Review round 3 of #6340: deferrals skipped `started`, so slow deferred verifications never tripped the time
+  // budget and ran past the pass deadline. Refresh time counts whether or not the refresh started.
+  it('slow deferred refreshes still spend the tick time budget', () => {
+    const prs = [1, 2, 3, 4, 5].map((n) => ({ ...PR_2635, number: 2700 + n, headRefName: `lane/s${n}` }));
+    let t = 0;
+    const refresh = vi.fn(() => { t += 100; return { deferred: true, ok: false, error: 'verification failed' }; });
+    const postComment = vi.fn();
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment, apply: true, now: () => t, applyBudgetMs: 250, maxApplyPerTick: 8,
+    });
+    expect(refresh).toHaveBeenCalledTimes(3);
+    expect(postComment).not.toHaveBeenCalled();
+    expect(result.applied).toHaveLength(5);
+    expect(result.applied.slice(3)).toEqual([expect.objectContaining({ deferred: true, budgetExhausted: true }), expect.objectContaining({ deferred: true, budgetExhausted: true })]);
+  });
+
+  it('fast deferrals are bounded by a loose attempt cap, not the per-tick start cap', () => {
+    const prs = Array.from({ length: 12 }, (_, i) => ({ ...PR_2635, number: 2800 + i, headRefName: `lane/q${i}` }));
+    const refresh = vi.fn(() => ({ deferred: true, ok: false, error: 'not same-repo' }));
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment: vi.fn(), apply: true, now: () => 0, applyBudgetMs: 1000, maxApplyPerTick: 2,
+    });
+    expect(refresh).toHaveBeenCalledTimes(8);
+    expect(result.applied).toHaveLength(12);
+  });
+
   it('a failed refresh whose claim is found held afterwards is a free deferral too', () => {
     const prs = [2635, 2636].map((number) => ({ ...PR_2635, number, headRefName: `lane/k${number}` }));
     let t = 0;
