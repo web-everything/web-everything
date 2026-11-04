@@ -18,14 +18,17 @@ import { dirname, join } from 'node:path';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
+import { parseReviewedSha } from './review-escalation.mjs';
 
 const SHA = /^[0-9a-f]{40}$/;
 export const HEAD_INDEX_STANDARD = Object.freeze({ keepPerPr: 20, logMaxLines: 2000 });
+export const MAP_VERSION = 1;
+export const LOCK_STALE_MS = 30_000, LOCK_WAIT_MS = 15_000;
 const posInt = v => Number.isSafeInteger(v) && v > 0;
 
 /** Sibling of the shared runs dir: <operations>/review-head-index. */
 export function defaultHeadIndexDir(env = process.env) { return join(dirname(resolveCoordinationRoot({ env })), 'review-head-index'); }
-export function headIndexPaths(dir) { return { log: join(dir, 'log.jsonl'), map: join(dir, 'map.json'), tmp: join(dir, 'map.json.tmp') }; }
+export function headIndexPaths(dir) { return { log: join(dir, 'log.jsonl'), map: join(dir, 'map.json'), lock: join(dir, 'lock'), tmp: join(dir, 'map.json.tmp') }; }
 
 /** Standard -> platform -> tool via the policy cascade; no env override. */
 export function resolveHeadIndexSettings({ file = readSettings(), platform, env = process.env, log } = {}) {
@@ -92,7 +95,7 @@ export function readHeadIndex({ dir = defaultHeadIndexDir(), fs = nodeFs } = {})
       if (!existsSafe(fs, mapPath)) return { ok: true, map: {} };
       return { ok: false, reason: 'index-unreadable' }; // a map with no log is not a state we write
     }
-    if (stored && stored.map && typeof stored.map === 'object' && stored.logBytes === logSize && validMap(stored.map)) return { ok: true, map: stored.map };
+    if (stored && stored.map && typeof stored.map === 'object' && stored.version === MAP_VERSION && stored.logBytes === logSize && validMap(stored.map)) return { ok: true, map: stored.map };
     return { ok: true, map: parseLog(fs.readFileSync(log, 'utf8')).map, rebuilt: true };
   } catch { return { ok: false, reason: 'index-unreadable' }; }
 }
@@ -105,6 +108,46 @@ const durable = (fs, path, flag, text) => {
 };
 const atomicWrite = (fs, path, tmp, text) => { durable(fs, tmp, 'w', text); fs.renameSync(tmp, path); };
 
+const sleepMs = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const pidAlive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; } };
+
+/** Exclusive lock file (O_EXCL) holding {pid, token, at}. A lock is stale when older than staleMs or its owner pid is dead. */
+export function withHeadIndexLock(dir, fn, { fs = nodeFs, staleMs = LOCK_STALE_MS, waitMs = LOCK_WAIT_MS, now = Date.now, pid = process.pid } = {}) {
+  const { lock } = headIndexPaths(dir);
+  const token = `${pid}-${now()}-${Math.random().toString(36).slice(2)}`;
+  const deadline = now() + waitMs;
+  for (;;) {
+    try {
+      const fd = fs.openSync(lock, 'wx');
+      try { fs.writeSync(fd, JSON.stringify({ pid, token, at: now() })); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      break;
+    } catch (e) {
+      if (e?.code !== 'EEXIST') throw e;
+      let held = null, text = null;
+      try { text = fs.readFileSync(lock, 'utf8'); held = JSON.parse(text); } catch { /* unreadable holder: judged by age below */ }
+      let age = Infinity;
+      try { age = now() - fs.statSync(lock).mtimeMs; } catch { continue; } // vanished: retry
+      const dead = held && Number.isInteger(held.pid) && !pidAlive(held.pid);
+      if (dead || age > staleMs) {
+        // Move the stale lock aside atomically; only one contender wins the rename. Never delete a lock that changed.
+        const aside = `${lock}.stale.${token}`;
+        try {
+          fs.renameSync(lock, aside);
+          let moved = null; try { moved = fs.readFileSync(aside, 'utf8'); } catch { /* gone */ }
+          if (moved !== text && text !== null) { try { fs.linkSync(aside, lock); } catch { /* a newer holder exists; leave it */ } }
+          try { fs.unlinkSync(aside); } catch { /* best effort */ }
+        } catch { /* another contender moved it */ }
+        continue;
+      }
+      if (now() >= deadline) throw Error('review-head-index: lock busy (holder pid ' + (held?.pid ?? '?') + ')');
+      sleepMs(10 + Math.floor(Math.random() * 20));
+    }
+  }
+  try { return fn(); } finally {
+    try { if (JSON.parse(fs.readFileSync(lock, 'utf8')).token === token) fs.unlinkSync(lock); } catch { /* not ours or gone */ }
+  }
+}
+
 /**
  * Record a durable review verdict. Call only after the verdict itself is durable (its run record exists).
  * Throws on a malformed record or an unreadable existing index (never overwrites what it cannot read).
@@ -115,37 +158,51 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
   if (!validRecord(rec)) throw Error(`review-head-index: invalid record (repo/pr/head/verdict/at): head=${String(head).slice(0, 12)} verdict=${String(verdict)}`);
   if (!posInt(keepPerPr) || !posInt(logMaxLines)) throw Error('review-head-index: invalid keepPerPr/logMaxLines');
   fs.mkdirSync(dir, { recursive: true });
-  const { log, map: mapPath, tmp } = headIndexPaths(dir);
-  const current = readHeadIndex({ dir, fs });
-  if (!current.ok) throw Error('review-head-index: existing index unreadable; refusing to write');
-  durable(fs, log, 'a', `${JSON.stringify(rec)}\n`);            // 1. durable log line (fsynced)
-  const map = applyRecord(current.map, rec, keepPerPr);       // 2. compacted map, temp then rename
-  let lines = fs.readFileSync(log, 'utf8').split('\n').filter(l => l.trim()).length;
-  if (lines > logMaxLines) { // 3. bound growth: rewrite the log from the compacted map, atomically, then the map
-    const compact = Object.entries(map).flatMap(([k, v]) => {
-      const [r, p] = [k.slice(0, k.lastIndexOf('#')), Number(k.slice(k.lastIndexOf('#') + 1))];
-      const row = (hash, h) => ({ repo: r, pr: p, head: h.head, netPatchHash: hash.startsWith(NOKEY) ? null : hash, verdict: h.verdict, at: h.at });
-      const older = Object.entries(v.history).sort((a, b) => Date.parse(a[1].at) - Date.parse(b[1].at)).map(([hash, h]) => row(hash, h));
-      // The PR's current record goes LAST so a rebuild restores lastReviewedHead and its verdict exactly.
-      return [...older, { repo: r, pr: p, head: v.lastReviewedHead, netPatchHash: v.netPatchHash, verdict: v.verdict, at: v.at }];
-    });
-    const text = compact.map(c => `${JSON.stringify(c)}\n`).join('');
-    atomicWrite(fs, log, `${log}.tmp`, text);
-    lines = compact.length;
-  }
-  atomicWrite(fs, mapPath, tmp, JSON.stringify({ logBytes: size(fs, log), map }));
-  return { ok: true, lines };
+  return withHeadIndexLock(dir, () => {  // read, append, compact and publish are ONE transaction
+    const { log, map: mapPath, tmp } = headIndexPaths(dir);
+    const current = readHeadIndex({ dir, fs });
+    if (!current.ok) throw Error('review-head-index: existing index unreadable; refusing to write');
+    durable(fs, log, 'a', `${JSON.stringify(rec)}\n`);            // 1. durable log line (fsynced)
+    const map = applyRecord(current.map, rec, keepPerPr);       // 2. compacted map, temp then rename
+    let lines = fs.readFileSync(log, 'utf8').split('\n').filter(l => l.trim()).length;
+    if (lines > logMaxLines) { // 3. bound growth: rewrite the log from the compacted map, atomically, then the map
+      const compact = Object.entries(map).flatMap(([k, v]) => {
+        const [r, p] = [k.slice(0, k.lastIndexOf('#')), Number(k.slice(k.lastIndexOf('#') + 1))];
+        const row = (hash, h) => ({ repo: r, pr: p, head: h.head, netPatchHash: hash.startsWith(NOKEY) ? null : hash, verdict: h.verdict, at: h.at });
+        const older = Object.entries(v.history).sort((a, b) => Date.parse(a[1].at) - Date.parse(b[1].at)).map(([hash, h]) => row(hash, h));
+        // The PR's current record goes LAST so a rebuild restores lastReviewedHead and its verdict exactly.
+        return [...older, { repo: r, pr: p, head: v.lastReviewedHead, netPatchHash: v.netPatchHash, verdict: v.verdict, at: v.at }];
+      });
+      const text = compact.map(c => `${JSON.stringify(c)}\n`).join('');
+      atomicWrite(fs, log, `${log}.tmp`, text);
+      lines = compact.length;
+    }
+    atomicWrite(fs, mapPath, tmp, JSON.stringify({ version: MAP_VERSION, logBytes: size(fs, log), map }));
+    return { ok: true, lines };
+  }, { fs });
 }
 
 /**
- * Is a review owed for this PR head? Pure. `index` is the result of readHeadIndex.
+ * Is a review owed for this PR head? Pure. `seed` (from seedFromReviewComments) stands in for a missing record. `index` is the result of readHeadIndex.
  * owed:null + held:true means unknown (fail closed): hold the PR, do not treat it as nothing-owed.
  */
-export function headReviewOwed({ index, repo, pr, head, netPatchHash = null } = {}) {
+export function seedFromReviewComments(comments) {
+  const head = parseReviewedSha(comments);
+  return head && SHA.test(head) ? { lastReviewedHead: head, verdict: 'marker', source: 'reviewed-sha-marker' } : null;
+}
+
+export function headReviewOwed({ index, repo, pr, head, netPatchHash = null, seed = null } = {}) {
   if (!index || index.ok !== true || !index.map) return { owed: null, held: true, reason: 'index-unreadable' };
   if (!SHA.test(head ?? '')) return { owed: null, held: true, reason: 'head-unreadable' };
   const r = index.map[prKey(repo, pr)];
-  if (!r) return { owed: true, reason: 'no-record' };
+  if (!r) {
+    // Pre-index PR: seed from the latest trusted reviewed-sha marker. No marker (or no seed given) is owed, never nothing-owed.
+    if (seed && SHA.test(seed.lastReviewedHead ?? '')) {
+      return seed.lastReviewedHead === head ? { owed: false, reason: 'same-head', seeded: true, verdict: seed.verdict }
+        : { owed: true, reason: 'new-head', seeded: true, lastReviewedHead: seed.lastReviewedHead };
+    }
+    return { owed: true, reason: 'no-record' };
+  }
   if (r.lastReviewedHead === head) return { owed: false, reason: 'same-head', verdict: r.verdict };
   const prior = netPatchHash ? r.history?.[netPatchHash] : null;
   if (prior) return { owed: false, carried: true, reason: 'same-net-patch', verdict: prior.verdict, fromHead: prior.head };

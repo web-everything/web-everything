@@ -3,8 +3,10 @@ import * as nodeFs from 'node:fs';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
-import { recordReview, readHeadIndex, headReviewOwed, netPatchKey, resolveHeadIndexSettings, headIndexPaths } from '../review-head-index.mjs';
+import { fork } from 'node:child_process';
+import { withHeadIndexLock, seedFromReviewComments, recordReview, readHeadIndex, headReviewOwed, netPatchKey, resolveHeadIndexSettings, headIndexPaths } from '../review-head-index.mjs';
 
 const H = n => String(n).repeat(40).slice(0, 40);
 let dir;
@@ -55,13 +57,13 @@ describe('durability and growth', () => {
   });
   it('atomic write order: log append fsynced before the map temp write, temp fsynced before rename', () => {
     const ops = [];
-    const kind = p => (String(p).endsWith('.tmp') ? 'tmp' : 'log');
+    const kind = p => (String(p).endsWith('.tmp') ? 'tmp' : String(p).endsWith('lock') ? 'lock' : 'log');
     const fs = { ...nodeFs,
       openSync: (p, f) => { ops.push(`open:${f}:${kind(p)}`); return nodeFs.openSync(p, f); },
       fsyncSync: fd => { ops.push('fsync'); return nodeFs.fsyncSync(fd); },
       renameSync: (a, b) => { ops.push('rename'); return nodeFs.renameSync(a, b); } };
     rec({ fs });
-    expect(ops).toEqual(['open:a:log', 'fsync', 'open:w:tmp', 'fsync', 'rename']);
+    expect(ops).toEqual(['open:wx:lock', 'fsync', 'open:a:log', 'fsync', 'open:w:tmp', 'fsync', 'rename']);
     expect(existsSync(headIndexPaths(dir).map)).toBe(true);
   });
   it('a cached map with an invalid entry is rebuilt from the log, never trusted', () => {
@@ -141,5 +143,64 @@ describe('resolveHeadIndexSettings', () => {
     expect(resolveHeadIndexSettings({ file: {}, platform: {}, env: {} }).value.keepPerPr).toBe(20);
     expect(resolveHeadIndexSettings({ file: { reviewHeadIndex: { keepPerPr: 5 } }, platform: {}, env: {} }).value.keepPerPr).toBe(5);
     expect(resolveHeadIndexSettings({ file: { reviewHeadIndex: { keepPerPr: -1 } }, platform: {}, env: {} }).value.keepPerPr).toBe(20);
+  });
+});
+
+describe('lock, version and pre-index seeding', () => {
+  it('concurrent writers (separate processes) lose no record and leave a map equal to the log', async () => {
+    const mod = pathToFileURL(join(process.cwd(), 'scripts/lib/review-head-index.mjs')).href;
+    const script = join(dir, 'w.mjs');
+    writeFileSync(script, `import { recordReview } from ${JSON.stringify(mod)};
+const [d, i] = process.argv.slice(2);
+for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: String(Number(i) + 1).repeat(40).slice(0, 40), netPatchHash: 'p' + i + '-' + n, verdict: n % 2 ? 'reject' : 'accept', at: new Date(Date.UTC(2026, 10, 4, 10, Number(i), n)).toISOString(), keepPerPr: 100 });
+`);
+    const run = i => new Promise((res, rej) => { const c = fork(script, [dir, String(i)]); c.on('exit', code => (code === 0 ? res() : rej(Error(`writer ${i} exit ${code}`)))); });
+    await Promise.all([0, 1, 2, 3].map(run));
+    const fromMap = readHeadIndex({ dir });
+    const lines = readFileSync(headIndexPaths(dir).log, 'utf8').trim().split('\n');
+    expect(lines).toHaveLength(24);
+    expect(Object.keys(fromMap.map['o/r#7'].history)).toHaveLength(24);
+    writeFileSync(headIndexPaths(dir).map, '{{');
+    expect(readHeadIndex({ dir }).map).toEqual(fromMap.map);
+  }, 60000);
+  it('a stale lock (dead owner or old) is taken over; a live fresh lock blocks until timeout', () => {
+    const { lock } = headIndexPaths(dir);
+    nodeFs.mkdirSync(dir, { recursive: true });
+    writeFileSync(lock, JSON.stringify({ pid: 999999, token: 't', at: 0 }));
+    expect(withHeadIndexLock(dir, () => 'ok')).toBe('ok');
+    expect(existsSync(lock)).toBe(false);
+    writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 't', at: Date.now() }));
+    expect(() => withHeadIndexLock(dir, () => 'no', { waitMs: 60 })).toThrow(/lock busy/);
+    expect(existsSync(lock)).toBe(true);
+    writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 't', at: 0 }));
+    expect(withHeadIndexLock(dir, () => 'old', { staleMs: -1 })).toBe('old');
+  });
+  it('releases the lock when the transaction throws', () => {
+    const fs = { ...nodeFs, renameSync: () => { throw Error('crash'); } };
+    expect(() => rec({ fs })).toThrow();
+    expect(existsSync(headIndexPaths(dir).lock)).toBe(false);
+  });
+  it('a map older than the log (or an unversioned map) is rejected and rebuilt', () => {
+    rec(); const { map: mp } = headIndexPaths(dir);
+    const stored = JSON.parse(readFileSync(mp, 'utf8'));
+    const stale = JSON.stringify({ ...stored, map: {} });
+    rec({ head: H(2), netPatchHash: 'p2', verdict: 'reject', at: '2026-11-04T10:05:00Z' });
+    writeFileSync(mp, stale); // a stale map left by a lost race, with an old log size
+    expect(headReviewOwed({ index: readHeadIndex({ dir }), repo: 'o/r', pr: 7, head: H(2) })).toMatchObject({ owed: false, verdict: 'reject' });
+    writeFileSync(mp, JSON.stringify({ logBytes: nodeFs.statSync(headIndexPaths(dir).log).size, map: {} }));
+    expect(readHeadIndex({ dir }).rebuilt).toBe(true);
+  });
+  it('pre-index PR: seeds from the latest reviewed-sha marker; no marker or unreadable is never nothing-owed', () => {
+    const idx = readHeadIndex({ dir });
+    const comments = [{ viewerDidAuthor: true, body: `verdict\n<!-- reviewed-sha: ${H(3)} -->` }];
+    const seed = seedFromReviewComments(comments);
+    const base = { index: idx, repo: 'o/r', pr: 5 };
+    expect(seed).not.toBeNull();
+    expect(headReviewOwed({ ...base, head: H(3), seed })).toMatchObject({ owed: false, seeded: true });
+    expect(headReviewOwed({ ...base, head: H(4), seed })).toMatchObject({ owed: true, reason: 'new-head', seeded: true });
+    expect(seedFromReviewComments([{ author: { login: 'rando' }, body: comments[0].body }])).toBeNull();
+    expect(seedFromReviewComments([])).toBeNull();
+    expect(headReviewOwed({ ...base, head: H(3), seed: null }).owed).toBe(true);
+    expect(headReviewOwed({ index: { ok: false }, repo: 'o/r', pr: 5, head: H(3), seed })).toMatchObject({ owed: null, held: true });
   });
 });
