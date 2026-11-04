@@ -36,7 +36,10 @@ export function resolveGovernorSettings({ settings, env = {} } = {}) {
   const rs = Number(env.WE_LOAD_GOVERNOR_RESUME); if (pos(rs)) r.resumeBelowPerCore = rs;
   if (env.WE_LOAD_GOVERNOR_ENABLED === '0') r.enabled = false;
   if (!(r.resumeBelowPerCore <= r.targetLoadPerCore)) r.resumeBelowPerCore = r.targetLoadPerCore * 0.8; // band can't invert or collapse (would flap)
-  if (!r.priority.includes(r.holdFromClass)) r.holdFromClass = GOVERNOR_DEFAULTS.holdFromClass;
+  // A priority/cutoff pair that leaves NO class holdable would report "holding" while pausing nothing: ignore that override pair.
+  if (!r.priority.includes(r.holdFromClass) || !r.priority.some((c) => isHoldable(c, r))) {
+    r.priority = [...GOVERNOR_DEFAULTS.priority]; r.holdFromClass = GOVERNOR_DEFAULTS.holdFromClass;
+  }
   return r;
 }
 

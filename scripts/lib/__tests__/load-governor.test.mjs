@@ -16,6 +16,25 @@ describe('settings', () => {
     expect(resolveGovernorSettings({ env: { WE_LOAD_GOVERNOR_TARGET: 'x' } }).targetLoadPerCore).toBe(2);
   });
 });
+describe('settings: a priority override can never leave nothing holdable', () => {
+  const holdsSomething = (s) => ['feature-build', 'metrics-report', 'daemon-fix-x'].some((text) => shouldHold({ text, holding: true, settings: s }).hold);
+  it.each([
+    ['omits the default cutoff', { priority: ['main-fix', 'delivery-unblock', 'build', 'report'] }],
+    ['only exempt classes', { priority: ['main-fix', 'delivery-unblock'] }],
+    ['cutoff names a class missing from the override', { priority: ['main-fix', 'build'], holdFromClass: 'daemon-fix' }],
+    ['cutoff is the last exempt class only', { priority: ['build', 'main-fix'], holdFromClass: 'main-fix' }],
+  ])('falls back to a working cutoff when the override %s', (_n, loadGovernor) => {
+    const s = resolveGovernorSettings({ settings: { loadGovernor } });
+    expect(s.priority.includes(s.holdFromClass)).toBe(true);
+    expect(holdsSomething(s)).toBe(true);
+    expect(governorState({ loadPerCore: 3, settings: s }).holding).toBe(true);
+  });
+  it('keeps a complete, valid override', () => {
+    const s = resolveGovernorSettings({ settings: { loadGovernor: { priority: ['main-fix', 'delivery-unblock', 'build', 'report'], holdFromClass: 'report' } } });
+    expect(s.priority).toEqual(['main-fix', 'delivery-unblock', 'build', 'report']); expect(s.holdFromClass).toBe('report');
+    expect(shouldHold({ text: 'metrics-report', holding: true, settings: s }).hold).toBe(true);
+  });
+});
 describe('hysteresis', () => {
   it('holds above target, keeps holding until below resume, then opens', () => {
     expect(governorState({ loadPerCore: 2.1 }).holding).toBe(true);
