@@ -33,16 +33,25 @@ function quotedEnd(t, i) {
 }
 // Index just past the template literal starting at t[i] (a backtick); `${ … }` holes are parsed so a backtick
 // or quote inside one cannot desynchronise the scan.
+// The literal text between holes is pushed on `lits` as disjoint pieces (nested literals are pushed by the hole
+// scan), so the pieces together never exceed the input size however deeply templates nest.
 function templateEnd(t, i, depth, lits) {
   const n = t.length;
   let j = i + 1;
+  let piece = j;
   while (j < n) {
     const c = t[j];
     if (c === '\\') { j += 2; continue; }
-    if (c === '`') return j + 1;
-    if (c === '$' && t[j + 1] === '{' && depth < MAX_TEMPLATE_DEPTH) { j = scan(t, j + 2, depth + 1, true, lits).end; continue; }
+    if (c === '`') { if (lits) lits.push(t.slice(piece, j)); return j + 1; }
+    if (c === '$' && t[j + 1] === '{' && depth < MAX_TEMPLATE_DEPTH) {
+      if (lits) lits.push(t.slice(piece, j));
+      j = scan(t, j + 2, depth + 1, true, lits).end;
+      piece = j;
+      continue;
+    }
     j++;
   }
+  if (lits) lits.push(t.slice(piece, Math.min(j, n)));
   return n;
 }
 // Does a `{` after this token open an object literal / expression (so its `}` is an operand and a following `/`
@@ -98,7 +107,7 @@ function scan(t, start, depth, inHole, lits) {
     if (c === "'" || c === '"' || c === '`') {
       const end = c === '`' ? templateEnd(t, i, depth, lits) : quotedEnd(t, i);
       emit(t.slice(i, end), c);
-      if (lits) lits.push(t.slice(i + 1, end > i + 1 && t[end - 1] === c ? end - 1 : end));
+      if (lits && c !== '`') lits.push(t.slice(i + 1, end > i + 1 && t[end - 1] === c ? end - 1 : end));
       i = end;
       continue;
     }
@@ -141,7 +150,12 @@ function scan(t, start, depth, inHole, lits) {
           let e = i;
           while (e < n && e - i <= MAX_WORD && isIdent(t[e])) e++;
           const w = e - i <= MAX_WORD ? t.slice(i, e) : '';
-          if (w === 'function' || w === 'class' || w === 'async') {
+          let p = e;
+          while (p < n && /\s/.test(t[p])) p++;
+          const nx = t[p] ?? '';
+          // a keyword used as a property name (`{class: 1}`, `{function: x}`) is followed by `:` / `,` / `}`, not a body
+          const keyword = w === 'function' ? nx === '(' || nx === '*' || isIdent(nx) : w === 'class' ? nx === '{' || isIdent(nx) : w === 'async';
+          if (keyword) {
             let ex = exprStart(last, prev, word());
             if (w === 'function' && isIdent(last) && word() === 'async') ex = asyncExpr; // `async function`: the async decides
             if (w === 'async') asyncExpr = ex;
@@ -177,7 +191,12 @@ function scan(t, start, depth, inHole, lits) {
     if (c === '!') postfixBang = nonNull;
     if (c === '{') braces.push(opensExpr);
     if (c === '}') exprClose = braces.pop() ?? false;
-    if (c === ')') { const k = stack.pop() ?? 0; ctrlParen = k === 1; fnBodyExpr = k === 2; }
+    if (c === ')') {
+      const k = stack.pop() ?? 0;
+      ctrlParen = k === 1;
+      fnBodyExpr = k === 2;
+      if (stack.length < pendDepth) pendKind = ''; // the group holding a pending keyword closed without a body
+    }
     i++;
   }
   return { out, end: n };
@@ -201,9 +220,14 @@ export function stripComments(t) {
 const CHILD = /\b(?:node:)?child_process\b/;
 // the class ends with the literal U+2028 and U+2029 characters (line terminators, written raw so a regex literal stays valid)
 const COMMAND_SEPARATOR = new RegExp('[;&|(`' + String.raw`\n\r  ]`);
-const WS =/\s*/y;
-const ENV_ASSIGN = /[A-Za-z_]\w*=\S*\s+/y;
-const GIT_AT = /(?:[^\n]*\/)?git(?=\s|$)/y;
+const WS = /\s*/y;
+const ENV_ASSIGN = /[A-Za-z_]\w*=(?:"[^"\n]*"|'[^'\n]*'|\S*)\s+/y;
+const TOKEN = /\S+/y;
+const GIT_AT = /(?:[^\n]*\/)?git(?:\.exe)?(?=\s|$)/y;
+// Words that run the next word as a command (shell keywords, groups, wrappers); skipped before looking for `git`.
+const COMMAND_PREFIX = new Set(['then', 'else', 'elif', 'do', 'if', 'while', 'until', '!', '{', 'sudo', 'time', 'exec', 'env', 'command', 'nice', 'nohup', 'xargs', 'builtin']);
+// `\n`, `\r` written as escapes in a quoted string are line breaks once the string is evaluated.
+const decodeBreaks = (s) => s.replace(/\\([nr])/g, '\n');
 // Each step is a sticky match from a moving index, so a long run of spaces or `A=b` prefixes stays linear.
 function commandIsGit(segment) {
   let pos = 0;
@@ -212,13 +236,16 @@ function commandIsGit(segment) {
     WS.test(segment);
     pos = WS.lastIndex;
     ENV_ASSIGN.lastIndex = pos;
-    if (!ENV_ASSIGN.test(segment)) break;
-    pos = ENV_ASSIGN.lastIndex;
+    if (ENV_ASSIGN.test(segment)) { pos = ENV_ASSIGN.lastIndex; continue; }
+    TOKEN.lastIndex = pos;
+    const m = TOKEN.exec(segment);
+    if (m && COMMAND_PREFIX.has(m[0])) { pos = TOKEN.lastIndex; continue; }
+    break;
   }
   GIT_AT.lastIndex = pos;
   return GIT_AT.test(segment);
 }
-const literalNamesGit = (s) => s.split(COMMAND_SEPARATOR).some(commandIsGit);
+const literalNamesGit = (s) => decodeBreaks(s).split(COMMAND_SEPARATOR).some(commandIsGit);
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 export function sourceNeedsGit(text, { helpers = [] } = {}) {

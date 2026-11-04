@@ -108,6 +108,17 @@ describe('sourceNeedsGit', () => {
     expect(sourceNeedsGit(E + 'export default class {}' + rx + tail)).toBe(true);
     expect(sourceNeedsGit(E + 'if (x) {} else function g(){}' + rx + tail)).toBe(true);
     expect(sourceNeedsGit(E + 'const o = {function: 1, b: {}} / 2;' + tail)).toBe(true);
+    // a keyword used as a property name opens no body: it must not turn the next block into an expression
+    const blk = "\nif (ok) { run() }\n/'/.test(s) && execSync('git status');";
+    expect(sourceNeedsGit(E + "const o = {a: 1, class: 'b'}" + blk)).toBe(true);
+    expect(sourceNeedsGit(E + "const o = {a: 1, function: 'b'}" + blk)).toBe(true);
+    expect(sourceNeedsGit(E + "const o = {function: x}; foo(o) {}" + blk)).toBe(true);
+    expect(sourceNeedsGit(E + 'const o = {class: 1, m() {}}' + blk)).toBe(true);
+  });
+  it('nested templates keep literal pieces disjoint (bounded memory and time)', () => {
+    const t0 = Date.now();
+    expect(sourceNeedsGit("import 'node:child_process'; " + '`${ '.repeat(333000))).toBe(false);
+    expect(Date.now() - t0).toBeLessThan(2500);
   });
   it('shell command position: leading whitespace, newlines, separators, env prefixes, paths', () => {
     const E = "import { execSync } from 'node:child_process'; ";
@@ -116,9 +127,15 @@ describe('sourceNeedsGit', () => {
       '`\n git status`', '`echo hi\ngit status`', '`echo hi\r\n  git status`', "'cd x && git status'", "'cd x; git status'",
       "'a | git hash-object --stdin'", "'echo $(git rev-parse HEAD)'", '"echo `git rev-parse HEAD`"',
       "'GIT_DIR=x git status'", "'A=1 B=2 /usr/bin/git status'", "'(git status)'", '`cd ${dir}\n\tgit log`',
+      // newline / tab written as an escape in an ordinary string
+      "'\\ngit status'", "'set -e\\ngit init'", "'a\\r\\n  git status'", "'echo hi\\n git log'",
+      // wrappers, shell keywords and groups before git; quoted env values; an .exe suffix
+      "'sudo git status'", "'time git status'", "'exec git status'", "'env FOO=1 git status'", "'ls | xargs git add'", "'! git diff --quiet'",
+      "'if true; then git status; fi'", "'if a; then b; else git status; fi'", "'{ git status; }'", "'FOO=\"a b\" git status'", "'git.exe'", "'git.exe status'",
+      '`git ${args}`', '`${dir}/git status`', '`cd ${dir} && git log`',
     ]) expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(true);
     // still not git: other binaries, prose mentions, env-only strings, comments
-    for (const lit of ["'gitleaks scan'", "'run git later'", "'digit status'", "'  gitx status'", "'GIT_DIR=x'", "'echo git status'", "'a-git status'"]) {
+    for (const lit of ["'gitleaks scan'", "'run git later'", "'digit status'", "'  gitx status'", "'GIT_DIR=x'", "'sudo ls'", "'\\\\nls'", "'if true; then ls; fi'","'echo git status'", "'a-git status'"]) {
       expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(false);
     }
     expect(sourceNeedsGit(E + "// execSync(' git status')\nexecSync('node x')")).toBe(false);
