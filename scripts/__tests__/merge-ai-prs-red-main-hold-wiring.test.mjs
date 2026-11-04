@@ -139,6 +139,8 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
       ...(freeze === 'sibling' ? {} : { WE_RED_MAIN_FREEZE_LEGACY: legacyMarker }), WE_MERGE_QUEUE_SETTINGS_FILE: mqSettings,
       // VITEST is cleared below, so pin the merge-delivery tool layer to a file with no `mergeDelivery` (drain-direct), not the live one.
       WE_MERGE_DELIVERY_SETTINGS_FILE: mqSettings,
+      // VITEST is cleared below, so the drain-reads default would flip to REST (R546) and bypass the git fakes: pin it to git.
+      WE_DRAIN_READS_SOURCE: 'git',
       WE_RED_MAIN_FREEZE_SHARED: 'off' }; // VITEST is cleared below, so the unfreeze CLI must not push the live shared ops branch (xyd06qo)
     if (freeze === 'sibling') delete env.WE_RED_MAIN_FREEZE_LEGACY;
     if (lateGroup) env.RMH_LATE_GROUP = `${join(coord, 'drain-card-groups.json')}#${lateGroup}`;
