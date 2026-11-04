@@ -1557,6 +1557,9 @@ describe('scan-capped run scan — per-caller direction', () => {
     for (const ev of [{ ...capped, seatRecorded: true }, { ...capped, recorded: true }, { ...capped, completedRecorded: true }, { ok: false, reason: 'scan-capped' }])
       expect(decide(accepted({ readEvidence: () => ev })).action).toBe('skip');
   });
+  it('capped witness alone never forces a review when the evidence read rejects', () => {
+    expect(decide(accepted({ readWitness: () => capped, readEvidence: () => ({ ok: false, reason: 'review-unfinished' }) })).action).toBe('skip');
+  });
   it('other unknowns still hold', () => {
     expect(decide(accepted({ readEvidence: () => ({ ok: false, reason: 'review-unfinished' }) })).action).toBe('skip');
   });

@@ -224,7 +224,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (last != null && now - last < setting.retryCooldownMin * 60_000) return skip('retry cooldown active');
       return { ...row, ...decision };
     };
-    let capped = false;
+    let capped = false, witnessCapped = false;
     try {
       if (!setting.enabled) return skip('reviewRedTeamOnSkip.enabled=false');
       if (!isRealHead(head) || (refusal.headSha != null && refusal.headSha !== head)) return skip('live head missing or changed');
@@ -235,8 +235,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (readWitness) {
         const w = readWitness({ repo, pr, head });
         if (w?.ok === false && w.reason !== 'scan-capped') return skip(w.reason);
-        if (w?.ok === false) capped = true; // the witness cannot be judged; the evidence read below carries seat facts
-        if (!capped && (['queued', 'running'].includes(w.rawWriter.parsed?.status) || w.rawWriter.parsed?.staleAbandoned)) {
+        if (w?.ok === false) witnessCapped = true; // unjudgeable: the evidence read below decides (and carries seat facts)
+        if (!witnessCapped && (['queued', 'running'].includes(w.rawWriter.parsed?.status) || w.rawWriter.parsed?.staleAbandoned)) {
           const recovery = planRedTeamRecovery(w, recoveryOptions);
           return recovery.mode === 'skip' ? skip(recovery.why)
             : dispatchDecision({ action: 'dispatch', mode: recovery.mode, staleRecovery: true, why: 'dead owner recovery' });
