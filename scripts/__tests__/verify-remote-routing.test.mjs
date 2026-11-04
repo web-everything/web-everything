@@ -2,7 +2,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { appendVerifyRemoteReport, heartbeatOwnedSlot } from '../readiness/heavy-admission.mjs';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
-import { localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, readRemoteReport, remoteInfrastructureFailure, phaseRunLocation, overallRunLocation, decidePhaseRemote, splitExplicitGate, runGateSegments, SHARD_RUN_SCRIPT } from '../lib/verify-remote-routing.mjs';
+import { localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, readRemoteReport, remoteInfrastructureFailure, phaseRunLocation, overallRunLocation, decidePhaseRemote, splitExplicitGate, runGateSegments, remainingBudgetMs, budgetExhaustedResult, SHARD_RUN_SCRIPT } from '../lib/verify-remote-routing.mjs';
 import { shellQuote } from '../lib/verify-lane-gate.mjs';
 import { runInNewContext } from 'node:vm';
 import { fstatSync, readSync } from 'node:fs';
@@ -1017,5 +1017,56 @@ describe('explicit and compound gates split into per-segment phases (PR-4)', () 
     const source = readFileSync(resolve(repo, 'scripts/verify-lane.mjs'), 'utf8');
     expect(source).toMatch(/runGateSegments\(explicitSegments, [^\n]*budgetMs: PHASE_TIMEOUT_MS/);
     expect(source).toMatch(/timeoutMs: timeoutMs \?\? PHASE_TIMEOUT_MS/);
+  });
+
+  // Every path of a split gate that spends time draws from ONE deadline. Walked here against a tiny budget.
+  describe('one shared deadline: every time-spending path of a split gate', () => {
+    const tiny = 100;
+    const clockRun = (costs, now) => vi.fn(async () => { now.t += costs.shift(); return { exitCode: 0, signal: null }; });
+    it.each([
+      ['segment 1 starts with the whole budget', async () => {
+        const now = { t: 0 }; const run = clockRun([10, 10], now);
+        await runGateSegments(['a', 'b'], run, { budgetMs: tiny, now: () => now.t });
+        expect(run.mock.calls[0][1].timeoutMs).toBe(100);
+      }],
+      ['segment 2 starts with only what segment 1 left', async () => {
+        const now = { t: 0 }; const run = clockRun([60, 10], now);
+        await runGateSegments(['a', 'b'], run, { budgetMs: tiny, now: () => now.t });
+        expect(run.mock.calls[1][1].timeoutMs).toBe(40);
+      }],
+      ['an exhausted budget before a segment skips it and times out', async () => {
+        const now = { t: 0 }; const run = clockRun([100, 10], now);
+        const result = await runGateSegments(['a', 'b'], run, { budgetMs: tiny, now: () => now.t });
+        expect(run).toHaveBeenCalledTimes(1);
+        expect(result).toMatchObject({ timedOut: true, budgetExhausted: true });
+      }],
+      ['the final return is checked: an over-budget last segment cannot be green', async () => {
+        const now = { t: 0 }; const run = clockRun([150], now);
+        const result = await runGateSegments(['a'], run, { budgetMs: tiny, now: () => now.t });
+        expect(result).toMatchObject({ timedOut: true, budgetExhausted: true });
+        expect(result.exitCode).not.toBe(0);
+      }],
+      ['the segment receives the absolute deadline so a local confirmation draws from the same budget', async () => {
+        const now = { t: 1000 }; const run = clockRun([5], now);
+        await runGateSegments(['a'], run, { budgetMs: tiny, now: () => now.t });
+        expect(run.mock.calls[0][1].deadlineAt).toBe(1100);
+      }],
+      ['a local confirmation or base rerun with no budget left is skipped, otherwise capped by it', () => {
+        expect(remainingBudgetMs(1100, () => 1000)).toBe(100);
+        expect(remainingBudgetMs(1100, () => 1100)).toBe(0);
+        expect(remainingBudgetMs(1100, () => 1200)).toBe(0);
+        expect(remainingBudgetMs(null, () => 1200)).toBeUndefined();
+        expect(budgetExhaustedResult({ ranOn: { location: 'remote' } })).toMatchObject({ timedOut: true, budgetExhausted: true, exitCode: 124, ranOn: { location: 'remote' } });
+      }],
+      ['verify-lane wires confirmation and base rerun to the deadline; isolated retry, scans, guards and standards exist only for non-split gates', () => {
+        const source = readFileSync(resolve(repo, 'scripts/verify-lane.mjs'), 'utf8');
+        expect(source).toMatch(/const explicitSegments = retryableGate \? null/);
+        expect(source).toMatch(/remainingBudgetMs\(deadlineAt/);
+        expect(source).toMatch(/remainingBudgetMs\(gateDeadlineAt/);
+        expect(source).toMatch(/timeoutMs: Math\.min\(/);
+        for (const retryOnly of ['isolatedRetryMode !== \'off\'', 'resolvedGate.scanCommands', 'alwaysRun.command', 'resolvedGate.standardsCommand'])
+          expect(source.split('\n').filter(l => l.includes(retryOnly) && /retryableGate/.test(l) || !l.includes(retryOnly)).length).toBeGreaterThan(0);
+      }],
+    ])('%s', async (_name, walk) => { await walk(); });
   });
 });
