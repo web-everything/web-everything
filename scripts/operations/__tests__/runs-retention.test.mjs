@@ -141,6 +141,14 @@ describe('runsRetention', () => {
     expect(r.archived).toBe(0); expect(listRunIds(runs)).toEqual(['run-big']);
   });
 
+  it('refuses an archive dir inside the runs dir', () => {
+    put('run-old', 30);
+    mkdirSync(join(runs, 'x'));
+    const r = base({ settings: { ...settings, archiveDir: join(runs, 'x', 'WE-archive', 'runs') } });
+    expect(r.status).toBe('skipped'); expect(r.errors.join()).toMatch(/overlap/);
+    expect(listRunIds(runs)).toEqual(['run-old']);
+  });
+
   it('settings: defaults to 14 days / 30 GiB; env overrides; invalid throws', () => {
     expect(resolveRetentionSettings({ env: {}, tool: {} }).keepDays).toBe(14);
     expect(resolveRetentionSettings({ env: { WE_RUNS_RETENTION_KEEP_DAYS: '30' }, tool: {} }).keepDays).toBe(30);

@@ -7,7 +7,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, lstatSync, linkSync, realpathSync, rmdirSync, unlinkSync, rmSync, statSync, statfsSync, writeFileSync, mkdtempSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join, dirname, basename } from 'node:path';
+import { join, dirname, basename, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { isRunRecordTerminal, listRunIds, resolveRunsDir, runPath } from './run-store.mjs';
@@ -157,6 +157,10 @@ export function runsRetention(o = {}) {
   if (dryRun || !out.eligible) { if (!dryRun) out.status = 'nothing-to-do'; return out; }
 
   // The archive target must already be mounted: never create the cloud-storage root locally.
+  const srcReal = realpathSync(dir), dstProbe = resolve(settings.archiveDir);
+  if (dstProbe === srcReal || dstProbe.startsWith(srcReal + '/') || srcReal.startsWith(dstProbe + '/')) {
+    out.status = 'skipped'; out.errors.push('source and archive overlap; originals retained'); return out;
+  }
   const mountRoot = dirname(dirname(settings.archiveDir));
   const realDir = p => { try { const l = lstatSync(p); return l.isDirectory() && !l.isSymbolicLink() ? l : null; } catch { return null; } };
   const mount0 = realDir(mountRoot);
@@ -214,6 +218,9 @@ export function runsRetention(o = {}) {
           try { renameSync(path, parked); held.push({ f, path, parked }); }
           catch (e) { if (e.code !== 'ENOENT') out.errors.push(`${f.id}: quarantine failed (${e.code ?? e.message}); original retained`); }
         }
+        // WHY THIS IS WRITER EXCLUSION: the quarantine name carries a fresh random UUID that no other process can know,
+        // so the only way to reach the parked inode is a descriptor (or hard link) that existed BEFORE the rename -
+        // exactly what lsof enumerates (fail-closed). A writer using the canonical path now creates a different inode.
         // Phase 2: refuse any quarantined inode some process still holds open (writer exclusion), then verify + delete.
         const realDirPath = realpathSync(dir);
         const open = openPaths(realDirPath);
