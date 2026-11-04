@@ -588,8 +588,8 @@ describe('R559 tree completeness must be known: truncated === false, strictly', 
   it('the root tree and the path walk apply the same rule', () => {
     const root = routes({ ...hwWorld([]), 'git/trees/rt0': ok({ tree: [{ path: 'backlog', type: 'tree', sha: 'bk' }] }) });
     expect(readBacklogNames('main', { source: src(root) })).toMatchObject({ ok: false, reason: 'tree-completeness-unknown' });
-    const walk = routes(fileWorld('a/b.md', b64('x\n')));
-    expect(readFileAtRef('t', 'a/b.md', 'main', { source: src(walk) })).toMatchObject({ ok: true });
+    const regular = routes(fileWorld('a/b.md', b64('x\n')));
+    expect(readFileAtRef('t', 'a/b.md', 'main', { source: src(regular) })).toMatchObject({ ok: true });
     const unknown = routes({ ...fileWorld('a/b.md', b64('x\n')), 'git/trees/rt0': ok({ tree: [{ path: 'a', type: 'tree', sha: 'rt1' }] }) });
     expect(readFileAtRef('t', 'a/b.md', 'main', { source: src(unknown) })).toMatchObject({ ok: false, reason: 'tree-completeness-unknown' });
   });
