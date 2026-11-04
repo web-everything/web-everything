@@ -71,11 +71,15 @@ export function resolveDispatchRoute(dispatch, options = {}) {
     if (hold) availability[provider] = hold;
   }
   // routing.builder=claude: Codex is held for build kinds only; audit and review seats still use it.
-  const claudeBuilds = BUILD_KINDS.includes(dispatch?.kind) && effectiveBuilder().builder === 'claude';
-  if (claudeBuilds && String(dispatch?.deliveryAgent ?? '').trim().toLowerCase() === 'codex' && effectiveBuilder().settings.codexReserveForAudit) {
+  // Resolve the builder once, so an `auto` quota reading cannot change between the refusal and the hold.
+  const builder = BUILD_KINDS.includes(dispatch?.kind) ? effectiveBuilder() : null;
+  const claudeBuilds = builder?.builder === 'claude';
+  const explicitCodex = String(dispatch?.deliveryAgent ?? '').trim().toLowerCase() === 'codex';
+  if (claudeBuilds && explicitCodex && builder.settings.codexReserveForAudit) {
     return { outcome: 'refused', refusal: 'deliveryAgent=codex refused: routing.builder=claude and codexReserveForAudit is true (Codex quota is reserved for audits); set codexReserveForAudit=false or routing.builder=codex to honour it', auditTrail: [] };
   }
-  if (claudeBuilds && !availability.codex) {
+  // With the reserve off, an explicit deliveryAgent=codex is honoured (the refusal above promises this); every other build stays held.
+  if (claudeBuilds && !explicitCodex && !availability.codex) {
     availability.codex = 'routing.builder=claude: Codex is reserved for audit';
   }
   return decideDispatchRoute(dispatch, { ...options, availability, routingPolicy: options.routingPolicy ?? readRoutingPolicy() });
