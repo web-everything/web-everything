@@ -64,12 +64,14 @@ export function isAcceptedQuestionHash(hash, { priorQuestionHashes = [], now = D
  * prior question hash qualify only while inside their window; a prior WEAKENED is returned (and so blocks). */
 export function findAudit(records, { head, base, questionHash, priorQuestionHashes = resolvePriorQuestionHashes(), now = Date.now() }) {
   if (!SHA.test(base ?? '') || !SHA.test(head ?? '') || questionHash !== QUESTION_HASH) return null;
-    let latest = null, prior = null, sawCurrent = false;
+  let latest = null, prior = null, sawCurrent = false;
   for (const record of records) {
-    if (record?.head !== head || record.base !== base || !isAcceptedQuestionHash(record.questionHash, { priorQuestionHashes, now, at: record.at }) || !Number.isFinite(Date.parse(record.at))
-      || (record.verdict !== 'NOT WEAKENED' && record.verdict !== 'WEAKENED')) continue;
+    if (record?.head !== head || record.base !== base) continue;
     const isCurrent = record.questionHash === QUESTION_HASH;
+    // Any matching current-question record, usable or not (bad timestamp, unknown verdict), blocks the prior fallback.
     if (isCurrent) sawCurrent = true;
+    if (!isAcceptedQuestionHash(record.questionHash, { priorQuestionHashes, now, at: record.at }) || !Number.isFinite(Date.parse(record.at))
+      || (record.verdict !== 'NOT WEAKENED' && record.verdict !== 'WEAKENED')) continue;
     if (Array.isArray(record.findings) && hasConflictingVerdict(record.verdict, record.findings)) continue;
     if (isCurrent && (!latest || Date.parse(record.at) >= Date.parse(latest.at))) latest = record;
     if (!isCurrent && (!prior || Date.parse(record.at) >= Date.parse(prior.at))) prior = record;

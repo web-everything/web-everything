@@ -3,9 +3,10 @@ import { createHash } from 'node:crypto';
 import * as realFs from 'node:fs';
 import { spawnSync as realSpawnSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { describe, it, expect, vi } from 'vitest';
-import { CANONICAL_QUESTION, QUESTION_HASH, main, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes } from '../codex-audit.mjs';
+import { CANONICAL_QUESTION, QUESTION_HASH, main, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes, MAX_PRIOR_WINDOW_MS } from '../codex-audit.mjs';
 import { createAuditDeps } from '../codex-audit-io.mjs';
 
 const BASE = 'a'.repeat(40);
@@ -424,6 +425,46 @@ describe('prior question hashes (AU1 PR-B)', () => {
     expect(resolvePriorQuestionHashes()).toEqual([]);
     expect(resolvePriorQuestionHashes({ readFile: () => '{"audit":{"priorQuestionHashes":[{"hash":"zz","acceptUntil":"2026-12-01"}]}}' })).toEqual([]);
     expect(resolvePriorQuestionHashes({ readFile: () => { throw new Error('unreadable'); } })).toEqual([]);
+  });
+  const settingsWith = list => () => JSON.stringify({ audit: { priorQuestionHashes: list } });
+  it('resolves a valid nonempty prior-question-hash setting', () => {
+    const list = [{ hash: PRIOR, acceptUntil: '2026-12-01T00:00:00.000Z' }, { hash: 'd'.repeat(64), acceptUntil: '2026-12-02T00:00:00.000Z' }];
+    expect(resolvePriorQuestionHashes({ readFile: settingsWith(list), env: {} })).toEqual(list);
+    // one invalid entry voids the whole list (strictest reading)
+    expect(resolvePriorQuestionHashes({ readFile: settingsWith([...list, { hash: 'zz', acceptUntil: '2026-12-01' }]), env: {} })).toEqual([]);
+  });
+  it('excludes platform prior-question hashes', () => {
+    const dir = realFs.mkdtempSync(join(tmpdir(), 'codex-audit-platform-'));
+    try {
+      const file = join(dir, 'platform.json');
+      const platform = { hash: 'e'.repeat(64), acceptUntil: '2026-12-05T00:00:00.000Z' };
+      realFs.writeFileSync(file, JSON.stringify({ audit: { priorQuestionHashes: [platform] } }));
+      const env = { WE_PLATFORM_PREFERENCES_FILE: file };
+      // platform value alone is ignored; a tool value is kept without the platform entry merged in
+      expect(resolvePriorQuestionHashes({ env, readFile: settingsWith([]) })).toEqual([]);
+      const tool = { hash: PRIOR, acceptUntil: '2026-12-01T00:00:00.000Z' };
+      expect(resolvePriorQuestionHashes({ env, readFile: settingsWith([tool]) })).toEqual([tool]);
+    } finally { realFs.rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('window boundaries: acceptUntil and the 30-day lower bound are inclusive, one ms past is rejected', () => {
+    const until = '2026-11-10T00:00:00.000Z', U = Date.parse(until), list = window(until);
+    const ok = (now, at) => isAcceptedQuestionHash(PRIOR, { priorQuestionHashes: list, now, at });
+    expect(MAX_PRIOR_WINDOW_MS).toBe(30 * 24 * 3600 * 1000);
+    expect(ok(U, undefined)).toBe(true);
+    expect(ok(U + 1, undefined)).toBe(false);
+    expect(ok(U, until)).toBe(true);
+    expect(ok(U, new Date(U + 1).toISOString())).toBe(false);
+    expect(ok(U, new Date(U - MAX_PRIOR_WINDOW_MS).toISOString())).toBe(true);
+    expect(ok(U, new Date(U - MAX_PRIOR_WINDOW_MS - 1).toISOString())).toBe(false);
+  });
+  it.each([
+    ['an invalid timestamp', { at: 'not-a-date' }],
+    ['an unrecognized verdict', { verdict: 'MAYBE' }],
+    ['a missing verdict', { verdict: undefined }],
+  ])('a current-question record with %s blocks the prior fallback', (_name, over) => {
+    const bad = rec('NOT WEAKENED', { questionHash: QUESTION_HASH, ...over });
+    expect(find([rec('NOT WEAKENED'), bad], open)).toBeNull();
+    expect(find([bad, rec('NOT WEAKENED')], open)).toBeNull();
   });
   it('replay over a frozen copy of audits.jsonl is identical with priorQuestionHashes empty', () => {
     const dir = join(dirname(fileURLToPath(import.meta.url)), 'fixtures');
