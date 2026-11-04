@@ -48,6 +48,15 @@ export default {
       process.env.WE_LANE_SALVAGE_DIR = env.WE_LANE_SALVAGE_DIR;
       const pool = [`--origin=${origin}`, `--reference=${ref}`, '--name=r310pool', '--branch=trunk', '--no-install'];
       const cli = (args) => execRead('node', [join(ROOT, 'scripts/lane-pool.mjs'), ...args, ...pool], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+      // A kept lane exits 1 (the release-refusal contract), so execRead would throw: read status, stdout and stderr.
+      const keptRelease = (args) => {
+        const run = spawnSync(process.execPath, args, { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: 30_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024 });
+        if (run.error) throw run.error;
+        return { status: run.status, json: JSON.parse(run.stdout), stderr: run.stderr };
+      };
+      const keptForCards = (run) => run.status === 1 && run.json.released === 0
+        && run.json.kept?.some((k) => k.reason === 'card-salvage-failed');
       cli(['provision', '--count=1']);
       const { landPreventionCard } = await import(join(ROOT, 'scripts/operations/land-prevention-card.mjs'));
       let laneDir = null;
@@ -184,9 +193,9 @@ cp.execFileSync = function(cmd, args, opts) {
   return original.call(this, cmd, args, opts);
 };
 syncBuiltinESMExports();\n`);
-      const stagedRelease = JSON.parse(execRead('node', ['--import', indexHook, join(ROOT, 'scripts/lane-pool.mjs'),
-        'release', `--lane=${stagedRace.lane}`, '--session=soak-index-race', '--json', ...pool], { env, stdio: ['ignore', 'pipe', 'pipe'] }));
-      if (stagedRelease.released !== 0 || git(['ls-files', '--stage', '--', CARD], stagedRace.path).split(/\s+/)[1] !== blob
+      const stagedRelease = keptRelease(['--import', indexHook, join(ROOT, 'scripts/lane-pool.mjs'),
+        'release', `--lane=${stagedRace.lane}`, '--session=soak-index-race', '--json', ...pool]);
+      if (!keptForCards(stagedRelease) || git(['ls-files', '--stage', '--', CARD], stagedRace.path).split(/\s+/)[1] !== blob
         || !existsSync(stagedLeasePath) || !readFileSync(stagedLeasePath).equals(stagedLease)) {
         violations.push({ invariant: 'concurrent-staging-keeps-blob-and-lease', detail: 'index-only version B must remain staged when only version A was salvaged' });
       }
@@ -243,9 +252,9 @@ cp.execFileSync = function(cmd, args, opts) {
   return out;
 };
 syncBuiltinESMExports();\n`);
-      const raceRelease = JSON.parse(execRead('node', ['--import', hook, join(ROOT, 'scripts/lane-pool.mjs'),
-        'release', `--lane=${raced.lane}`, '--session=soak-old-owner', '--json', ...pool], { env, stdio: ['ignore', 'pipe', 'pipe'] }));
-      if (raceRelease.released !== 0 || readFileSync(leasePath, 'utf8') !== JSON.stringify(replacement)
+      const raceRelease = keptRelease(['--import', hook, join(ROOT, 'scripts/lane-pool.mjs'),
+        'release', `--lane=${raced.lane}`, '--session=soak-old-owner', '--json', ...pool]);
+      if (!keptForCards(raceRelease) || readFileSync(leasePath, 'utf8') !== JSON.stringify(replacement)
         || !existsSync(join(raced.path, CARD)) || readFileSync(join(raced.path, CARD), 'utf8') !== 'replacement holder card\n') {
         violations.push({ invariant: 'ownership-during-salvage', detail: 'a lease swap during the status recheck must preserve the replacement lease and card' });
       }

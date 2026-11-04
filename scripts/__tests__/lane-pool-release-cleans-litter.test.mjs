@@ -234,8 +234,10 @@ syncBuiltinESMExports();\n`);
     for (const locked of [true, false]) {
       if (!locked) rmSync(lock);
       const release = runPool(['release', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json']);
-      expect(release.code).toBe(0);
+      // A kept lane exits 1 and is named in `kept`, so a caller reading only the exit code or the JSON sees it.
+      expect(release.code).toBe(1);
       expect(JSON.parse(release.out).released).toBe(0);
+      expect(JSON.parse(release.out).kept).toEqual([expect.objectContaining({ lane, reason: 'card-salvage-failed' })]);
       expect(release.out + release.err).toContain('staged card deletion needs recovery');
       expect(readFileSync(leasePath)).toEqual(leaseBytes);
       expect(readFileSync(join(dir, '.git', 'index'))).toEqual(indexBytes);
@@ -302,8 +304,10 @@ syncBuiltinESMExports();\n`);
       return out;
     }`);
     const release = runPool(['release', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json'], hook);
-    expect(release.code).toBe(0);
+    // The salvage recheck failure keeps the lane (exit 1, named in `kept`); the litter-cleanup stage only declines.
+    expect(release.code).toBe(stage === 'salvage recheck' ? 1 : 0);
     expect(JSON.parse(release.out).released).toBe(0);
+    if (stage === 'salvage recheck') expect(JSON.parse(release.out).kept).toEqual([expect.objectContaining({ lane, reason: 'card-salvage-failed' })]);
     expect(release.out + release.err).toMatch(/lease changed/);
     expect(readFileSync(leasePath, 'utf8')).toBe(replacementBytes);
     expect(readFileSync(join(dir, 'backlog/xfmkody-prevention-guard.md'), 'utf8')).toBe('card\n');
