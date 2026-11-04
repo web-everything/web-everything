@@ -32,8 +32,10 @@ function parseArgs(argv) {
   return flags;
 }
 
-/** A prior hash is honoured for at most this long from now, whatever acceptUntil says. */
+/** A prior-hash record counts only if made within this long before the entry's acceptUntil (and not after it). When
+ * `at` is not given, only the acceptUntil window is checked. */
 export const MAX_PRIOR_WINDOW_MS = 30 * 24 * 3600 * 1000;
+const recordInWindow = (e, at) => at === undefined || (Date.parse(at) <= Date.parse(e.acceptUntil) && Date.parse(e.acceptUntil) - Date.parse(at) <= MAX_PRIOR_WINDOW_MS);
 const HASH_64 = /^[a-f0-9]{64}(?![\s\S])/;
 const SETTINGS_FILE = new URL('../settings/codex-audit.json', import.meta.url);
 const validHashList = v => Array.isArray(v) && v.every(e => e && typeof e === 'object' && HASH_64.test(e.hash ?? '') && Number.isFinite(Date.parse(e.acceptUntil)));
@@ -52,20 +54,19 @@ export function resolvePriorQuestionHashes({ env = process.env, readFile = readF
 }
 
 /** True for the current question hash, or a prior hash still inside its acceptUntil window. Unknown/expired: false. */
-export function isAcceptedQuestionHash(hash, { priorQuestionHashes = [], now = Date.now() } = {}) {
+export function isAcceptedQuestionHash(hash, { priorQuestionHashes = [], now = Date.now(), at } = {}) {
   if (hash === QUESTION_HASH) return true;
   if (typeof hash !== 'string' || !HASH_64.test(hash) || !Array.isArray(priorQuestionHashes) || !Number.isFinite(now)) return false;
-  return priorQuestionHashes.some(e => e?.hash === hash && Number.isFinite(Date.parse(e.acceptUntil)) && now <= Date.parse(e.acceptUntil) && Date.parse(e.acceptUntil) - now <= MAX_PRIOR_WINDOW_MS);
+  return priorQuestionHashes.some(e => e?.hash === hash && Number.isFinite(Date.parse(e.acceptUntil)) && now <= Date.parse(e.acceptUntil) && recordInWindow(e, at));
 }
 
 /** Latest timestamp wins, with later appended records breaking ties; foreign hashes never qualify. Records under a
  * prior question hash qualify only while inside their window; a prior WEAKENED is returned (and so blocks). */
 export function findAudit(records, { head, base, questionHash, priorQuestionHashes = resolvePriorQuestionHashes(), now = Date.now() }) {
   if (!SHA.test(base ?? '') || !SHA.test(head ?? '') || questionHash !== QUESTION_HASH) return null;
-  const accept = { priorQuestionHashes, now };
-  let latest = null, prior = null;
+    let latest = null, prior = null;
   for (const record of records) {
-    if (record?.head !== head || record.base !== base || !isAcceptedQuestionHash(record.questionHash, accept) || !Number.isFinite(Date.parse(record.at))
+    if (record?.head !== head || record.base !== base || !isAcceptedQuestionHash(record.questionHash, { priorQuestionHashes, now, at: record.at }) || !Number.isFinite(Date.parse(record.at))
       || (record.verdict !== 'NOT WEAKENED' && record.verdict !== 'WEAKENED')) continue;
     if (Array.isArray(record.findings) && hasConflictingVerdict(record.verdict, record.findings)) continue;
     const isCurrent = record.questionHash === QUESTION_HASH;

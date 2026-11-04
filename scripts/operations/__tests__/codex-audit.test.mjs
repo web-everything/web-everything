@@ -409,8 +409,9 @@ describe('prior question hashes (AU1 PR-B)', () => {
     expect(find([cur, prior], open)).toBe(cur);
     expect(find([prior, cur], open)).toBe(cur);
   });
-  it('windows longer than 30 days out are not honoured', () => {
-    expect(isAcceptedQuestionHash(PRIOR, { priorQuestionHashes: window('2027-06-01T00:00:00.000Z'), now: NOW })).toBe(false);
+  it('prior records older than 30 days before acceptUntil, or dated after it, are ignored', () => {
+    expect(find([rec('NOT WEAKENED', { at: '2020-01-01T00:00:00.000Z' })], open)).toBeNull();
+    expect(find([rec('NOT WEAKENED', { at: '2026-11-11T00:00:00.000Z' })], open)).toBeNull();
   });
   it('contradictory prior records are still rejected', () => {
     expect(find([rec('NOT WEAKENED', { findings: ['WEAKENED'] })], open)).toBeNull();
