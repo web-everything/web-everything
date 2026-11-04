@@ -149,6 +149,59 @@ it('logs the effective scan setting and its source through the shared cascade', 
   expect(lines.join('\n')).toContain('scan.maxParses=17 (tool)');
 });
 
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+// Resource guarantee: 300 payloads of ~1 MiB each (~300 MiB in all) scanned in a child whose
+// old-space heap is 64 MiB. Each payload fits; keeping them all cannot. The `retain` control
+// proves the bound is tight enough to catch a scan that keeps what it read.
+describe('finder releases nonmatching payloads between reads', () => {
+  const lib = name => JSON.stringify(pathToFileURL(join(process.cwd(), 'scripts/lib', name)).href);
+  const scan = (mode, dir) => spawnSync(process.execPath, ['--max-old-space-size=64', '--input-type=module', '-e', `
+    const { createNewestRunFinder } = await import(${lib('stream-filter-runs.mjs')});
+    const { readDrainRedTeamEvidence } = await import(${lib('drain-red-team-evidence.mjs')});
+    const ids = Array.from({ length: 300 }, (_, i) => 'review-pr-' + i);
+    const stat = id => ({ mtimeMs: Number(String(id).match(/(\\d+)(\\.json)?$/)[1]) });
+    const blob = () => new Array(1 << 17).fill(1); // ~1 MiB of heap per payload
+    const kept = [];
+    let result;
+    if ($mode === 'drain') {
+      // Same-repo runs for another PR: the review lookup must keep none of them.
+      const r = readDrainRedTeamEvidence({ repo: 'o/r', pr: 1, head: 'b'.repeat(40), env: { WE_SHARED_RUNS_DIR: ${JSON.stringify(dir)} },
+        runsDir: ${JSON.stringify(dir)}, list: () => ids, stat,
+        read: () => ({ op: 'review-pr', input: { repo: 'o/r', pr: 2 }, blob: blob() }),
+        readScorecards: () => [], scanSettings: { file: {}, platform: {}, env: {} }, warn: () => {} });
+      result = r.ok === false ? r.reason : 'evidence';
+    } else {
+      const find = createNewestRunFinder({ ids, stat, read: blob, maxParses: 300, warn: () => {} });
+      result = String(find(run => { if ($mode === 'retain') kept.push(run); return false; }));
+    }
+    process.stdout.write(result);
+  `.replaceAll('$mode', JSON.stringify(mode))], { encoding: 'utf8', timeout: 120_000 });
+  it('scans payloads whose total exceeds the heap when each one fits', () => {
+    const child = scan('finder');
+    expect(child.stderr).not.toMatch(/out of memory|Error/);
+    expect(child.status).toBe(0);
+    expect(child.stdout).toBe('null');
+  });
+  it('the review-run lookup keeps no payload of another PR', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'finder-heap-'));
+    try {
+      const child = scan('drain', dir);
+      expect(child.stderr).not.toMatch(/out of memory|Error/);
+      expect(child.status).toBe(0);
+      expect(child.stdout).toBe('evidence');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('control: the same heap runs out when the caller keeps every payload', () => {
+    const child = scan('retain');
+    expect(child.status).not.toBe(0);
+    expect(child.stderr).toMatch(/heap out of memory/i);
+  });
+});
+
 describe('createNewestRunFinder id-asc tie order', () => {
   it('breaks equal-mtime ties by code-unit order like the pre-bound sorted listing, not locale order', async () => {
     const { createNewestRunFinder } = await import('../stream-filter-runs.mjs');
