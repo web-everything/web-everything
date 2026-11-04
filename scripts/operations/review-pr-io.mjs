@@ -931,6 +931,8 @@ export function createReviewPrSinks({
   sameGapJudge,
   publishGate = readReviewCiGate,
   readPublishHead = readReviewHead,
+  sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
+  now = Date.now,
   readChangedLines,
   mirrorReferral = (record) => appendJuryEvent(`${record.repo}#${record.pr}`, { type: 'mandatory-referrals', round: 0, record }, { root }),
   cardReadable = (ref) => referralCardReadable(ref, root),
@@ -985,6 +987,25 @@ export function createReviewPrSinks({
         throw notApplied('review void: head moved or current head could not be read');
     };
     await assertHead();
+    if ((policy.startEarly === 'on' || policy.startAfter === 'push') && payload.to === 'accepted') {
+      const deadline = now() + policy.startEarlyPublishWaitMs;
+      const strictPolicy = { ...policy, startEarly: 'off', startAfter: 'ci-green', startBeforeCi: false };
+      for (;;) {
+        let ci;
+        try { ci = await publishGate({ ...args, policy: strictPolicy }); }
+        catch { /* Missing/unreadable CI evidence waits; it never authorizes acceptance. */ }
+        await assertHead();
+        if (ci?.reason === 'head-changed' || (ci?.headSha && ci.headSha !== payload.reviewedHead))
+          throw notApplied('review void: head moved or CI became red');
+        if (ci?.allowed === true && ci.headSha === payload.reviewedHead) return;
+        if (ci?.reason === 'ci-red') throw notApplied('review held: CI red on reviewed head; CI-heal path');
+        const remaining = deadline - now();
+        if (remaining <= 0) throw notApplied('review held: CI still pending on reviewed head');
+        // Clamp to Node's timer range even when an operator configures a very large poll interval.
+        await sleep(Math.min(policy.startEarlyPollMs, remaining, 2147483647));
+        await assertHead();
+      }
+    }
     if (!policy.cancelOnCiRed) return;
     let ci;
     try { ci = await publishGate({ ...args, policy, expectedHead: payload.reviewedHead }); }
