@@ -18,6 +18,10 @@
     "lease-reaper": {
       "label": "com.we.lease-reaper"
     },
+    "pass-readers": {
+      "label": "com.we.conveyor-pass-daemon.ci-red-recovery-watch-we",
+      "note": "The label is the ci-red-recovery-watch-we pass daemon launchd job. No explicit clone: prototype-load resolves the clone from that installed plist WorkingDirectory, so overlays register on the clone the watcher actually runs from (the shipped template installs wev-review-daemon; the live install runs wev-pass-readers), and self-sync adopts the new code."
+    },
     "control": {
       "label": "com.we.control",
       "clone": "wev-control"
