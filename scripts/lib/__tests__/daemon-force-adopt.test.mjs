@@ -115,6 +115,10 @@ describe('recordForcedAdoption sinks', () => {
     await recordForcedAdoption({ ...args(), emit: async () => true });
     await abortForcedAdoption({ root, env, request: { daemon: 'review', ruling: 'R508' }, sha: 'b'.repeat(40), emit: async () => {} });
     expect(readForceWatch(root, env)).toBeNull();
+    // The earlier "adopting" handoff line and coroner review record are both retracted, not left standing.
+    expect(readFileSync(env.WE_FORCE_ADOPT_HANDOFF, 'utf8')).toMatch(/adopting[\s\S]*NOT adopted/);
+    const kinds = readFileSync(env.WE_FORCE_ADOPT_CORONER, 'utf8').trim().split('\n').map((l) => JSON.parse(l).kind);
+    expect(kinds).toEqual(['force-adopt-review', 'force-adopt-aborted']);
   });
 });
 

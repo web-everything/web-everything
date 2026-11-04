@@ -106,7 +106,10 @@ export async function recordForcedAdoption({ root, env = process.env, request, s
 /** The adoption did not happen (lock refused, reset failed): drop the watch that was opened for it, and say so. */
 export async function abortForcedAdoption({ root, env = process.env, request, sha, emit, now = Date.now }) {
   clearWatch(root, env);
-  appendLine(handoffFile(env), `- FORCE-ADOPT ${new Date(now()).toISOString()} ${request.daemon} ${request.ruling}: NOT adopted ${sha} (adoption did not complete); request consumed\n`);
+  const at = new Date(now()).toISOString();
+  appendLine(handoffFile(env), `- FORCE-ADOPT ${at} ${request.daemon} ${request.ruling}: NOT adopted ${sha} (adoption did not complete); request consumed\n`);
+  // The coroner already holds a `force-adopt-review` record for this sha: say it did not happen.
+  appendLine(coronerFile(env), `${JSON.stringify({ kind: 'force-adopt-aborted', at, daemon: request.daemon, ruling: request.ruling, sha, reason: 'adoption-did-not-complete' })}\n`);
   await emit?.({ kind: 'force-adopt-aborted', daemon: request.daemon, detail: { ruling: request.ruling, sha } });
   clearForceAdopt(root, env);
 }
