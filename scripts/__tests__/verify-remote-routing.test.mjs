@@ -1129,7 +1129,7 @@ describe('explicit and compound gates split into per-segment phases (PR-4)', () 
       expect(source).toMatch(/gateChildren\.set\(/);
       expect(source).toMatch(/killProcessTree\(pid, 'SIGKILL'/);
       expect(source).toMatch(/signal\?\.aborted\) return budgetExhaustedResult/);
-      expect(source).toMatch(/withDeadline\(\(\) => measureBaseFailures/);
+      expect(source).toMatch(/withDeadline\(signal => measureBaseFailures/);
     });
   });
 });

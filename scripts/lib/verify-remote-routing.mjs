@@ -152,21 +152,47 @@ export const remainingBudgetMs = (deadlineAt, now = Date.now) =>
 export const budgetExhaustedResult = last => ({ exitCode: 124, signal: 'SIGKILL', timedOut: true, budgetExhausted: true, remoteAttempt: false,
   ranOn: last?.ranOn ?? { location: 'local' }, failureDetails: last?.failureDetails, output: null });
 
+// THE structural bound: run `task(signal)` under ONE outer watchdog. At the absolute `deadlineAt` the signal aborts,
+// `onExpire` runs (verify-lane kills every child group in flight there) and the call returns `{ expired: true }` even if
+// the task is stuck in an admission wait or ignores the signal. A task that settles in time is returned untouched.
+// Late work the abandoned task still attempts must check `signal.aborted` and stand down.
+export async function withDeadline(task, { deadlineAt, now = Date.now, onExpire } = {}) {
+  const ms = remainingBudgetMs(deadlineAt, now);
+  if (ms === undefined) return { expired: false, value: await task(new AbortController().signal) };
+  const controller = new AbortController();
+  const expire = () => { controller.abort(); try { onExpire?.(); } catch { /* the verdict is the timeout either way */ } };
+  if (ms === 0) { expire(); return { expired: true }; }
+  let timer;
+  const EXPIRED = Symbol('expired');
+  const expiry = new Promise(resolve => { timer = setTimeout(() => { expire(); resolve(EXPIRED); }, ms); });
+  const running = Promise.resolve().then(() => task(controller.signal));
+  running.catch(() => {}); // an abandoned task's later failure must not surface
+  try {
+    const out = await Promise.race([running, expiry]);
+    return out === EXPIRED ? { expired: true } : { expired: false, value: out };
+  } finally { clearTimeout(timer); }
+}
+
 // Strict `&&`: run each segment in turn; the first nonzero exit or signal stops the rest and is the result.
-// The segments share ONE deadline (`budgetMs`, the single-phase ceiling a whole gate had before the split). Each gets the
-// time remaining (`timeoutMs`) and the absolute `deadlineAt`; a spent budget before a segment, or after the last one,
-// is a timeout, never a pass.
-export async function runGateSegments(segments, run, { budgetMs, now = Date.now, onDeadline } = {}) {
+// The whole run is bounded by ONE outer watchdog (`withDeadline`, `budgetMs` = the single-phase ceiling a whole gate had
+// before the split), so correctness never depends on the arithmetic below: that only hands each segment the time
+// remaining (`timeoutMs`), the absolute `deadlineAt` and the abort `signal` as an optimisation. A spent budget before a
+// segment, after the last one, or an expiry mid-flight is a timeout, never a pass.
+export async function runGateSegments(segments, run, { budgetMs, now = Date.now, onExpire, onDeadline } = {}) {
   const deadlineAt = Number.isFinite(budgetMs) ? now() + budgetMs : undefined;
   if (deadlineAt !== undefined) onDeadline?.(deadlineAt);
   let last = null;
-  for (const segment of segments) {
-    const remaining = remainingBudgetMs(deadlineAt, now);
-    if (remaining === 0) return budgetExhaustedResult(last);
-    last = await run(segment, remaining === undefined ? {} : { timeoutMs: remaining, deadlineAt });
-    if (last.exitCode !== 0 || last.signal) return last;
-  }
-  return remainingBudgetMs(deadlineAt, now) === 0 && last ? budgetExhaustedResult(last) : last;
+  const outcome = await withDeadline(async signal => {
+    for (const segment of segments) {
+      const remaining = remainingBudgetMs(deadlineAt, now);
+      if (remaining === 0 || signal.aborted) return budgetExhaustedResult(last);
+      last = await run(segment, remaining === undefined ? { signal } : { timeoutMs: remaining, deadlineAt, signal });
+      if (signal.aborted) return budgetExhaustedResult(last);
+      if (last.exitCode !== 0 || last.signal) return last;
+    }
+    return remainingBudgetMs(deadlineAt, now) === 0 && last ? budgetExhaustedResult(last) : last;
+  }, { deadlineAt, now, onExpire });
+  return outcome.expired ? budgetExhaustedResult(last) : outcome.value;
 }
 
 export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
