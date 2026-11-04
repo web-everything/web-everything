@@ -1031,7 +1031,7 @@ export const DELIVERY_VENDOR_PROVIDERS = Object.freeze({ 'claude-restricted': 'c
 /** The launch kinds whose dispatch honours the marker (`build`, `fix`, `ci-heal` — the three provider modules that
  *  read it). A marker on an item the tick launches as a `prepare`/`investigate` is not read: it is not an override
  *  of anything there, so it is neither recorded nor refused. */
-const MARKER_KINDS = Object.freeze(['build', 'fix', 'ci-heal']);
+export const MARKER_KINDS = Object.freeze(['build', 'fix', 'ci-heal']);
 
 /**
  * WHICH VENDOR ACTUALLY EXECUTES A DISPATCH, given what the criteria `routed` and what #3840's `deliveryAgent:`

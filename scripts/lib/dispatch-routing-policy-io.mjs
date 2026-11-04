@@ -4,7 +4,7 @@ import { ROUTING_POLICY_PATH, trustedSnapshot } from './dispatch-routing-policy-
 import { validateRoutingPolicy, applyRoutingOverrides, DEFAULT_ROUTING_POLICY, resolveOperationRoute as resolvePureRoute, resolvePolicyModel as resolvePureModel, operationEffort } from './dispatch-routing-policy.mjs';
 import { readPlatformPreferences } from './policy-cascade.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
-import { decideDispatchRoute } from './dispatch-contracts.mjs';
+import { decideDispatchRoute, MARKER_KINDS } from './dispatch-contracts.mjs';
 import { BUILD_KINDS, effectiveBuilder } from './routing-settings.mjs';
 import { providerQuotaHold } from './provider-quota-hold.mjs';
 import { resolveRoutingOverrideRoute } from './dispatch-routing-override-route.mjs';
@@ -74,7 +74,8 @@ export function resolveDispatchRoute(dispatch, options = {}) {
   // Resolve the builder once, so an `auto` quota reading cannot change between the refusal and the hold.
   const builder = BUILD_KINDS.includes(dispatch?.kind) ? effectiveBuilder() : null;
   const claudeBuilds = builder?.builder === 'claude';
-  const explicitCodex = String(dispatch?.deliveryAgent ?? '').trim().toLowerCase() === 'codex';
+  // Only the marker kinds read deliveryAgent (dispatch-contracts ignores it elsewhere), so only they count as explicit.
+  const explicitCodex = MARKER_KINDS.includes(dispatch?.kind) && String(dispatch?.deliveryAgent ?? '').trim().toLowerCase() === 'codex';
   if (claudeBuilds && explicitCodex && builder.settings.codexReserveForAudit) {
     return { outcome: 'refused', refusal: 'deliveryAgent=codex refused: routing.builder=claude and codexReserveForAudit is true (Codex quota is reserved for audits); set codexReserveForAudit=false or routing.builder=codex to honour it', auditTrail: [] };
   }

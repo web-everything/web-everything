@@ -46,6 +46,11 @@ function availabilityFor(dispatch) {
   return state.seen.length ? state.seen.at(-1).availability : null;
 }
 const NON_BUILD_KINDS = ['review', 'red-team', 'audit', 'codex-audit', 'advise', 'judge'];
+// The kinds routing.json's $comment promises are held, pinned literally so dropping one from BUILD_KINDS goes red.
+const DOCUMENTED_BUILD_KINDS = ['build', 'fix', 'ci-heal', 'prepare', 'takeover', 'design'];
+const HELD_KINDS = [...new Set([...DOCUMENTED_BUILD_KINDS, ...BUILD_KINDS])];
+// Build kinds whose dispatch ignores a deliveryAgent marker (only build, fix and ci-heal read it).
+const NON_MARKER_BUILD_KINDS = BUILD_KINDS.filter(k => !['build', 'fix', 'ci-heal'].includes(k));
 
 describe('routing settings', () => {
   it('ships claude and defaults to codex without a repo value', () => {
@@ -113,7 +118,7 @@ describe('routing settings', () => {
   });
   it('claude builder holds codex for every build kind and for no other kind', () => {
     settingsDir({ 'routing.json': { routing: { builder: 'claude' } } });
-    for (const kind of BUILD_KINDS) expect(availabilityFor({ kind, ...SCOPED })?.codex, kind).toMatch(/routing\.builder=claude/);
+    for (const kind of HELD_KINDS) expect(availabilityFor({ kind, ...SCOPED })?.codex, kind).toMatch(/routing\.builder=claude/);
     for (const kind of NON_BUILD_KINDS) {
       expect(BUILD_KINDS).not.toContain(kind);
       expect(availabilityFor({ kind, ...SCOPED })?.codex, kind).toBeUndefined();
@@ -121,7 +126,7 @@ describe('routing settings', () => {
   });
   it('codex builder holds codex for no kind', () => {
     settingsDir({ 'routing.json': { routing: { builder: 'codex' } } });
-    for (const kind of [...BUILD_KINDS, ...NON_BUILD_KINDS]) expect(availabilityFor({ kind, ...SCOPED })?.codex, kind).toBeUndefined();
+    for (const kind of [...HELD_KINDS, ...NON_BUILD_KINDS]) expect(availabilityFor({ kind, ...SCOPED })?.codex, kind).toBeUndefined();
   });
   it('auto builder at dispatch holds codex over the quota threshold or on an unreadable reading, not below it', () => {
     settingsDir({ 'routing.json': { routing: { builder: 'auto', autoClaudeAbovePercent: 70 } } });
@@ -140,6 +145,17 @@ describe('routing settings', () => {
     expect(r.outcome).not.toBe('refused');
     expect(availabilityFor(explicit)?.codex).toBeUndefined();
     expect(availabilityFor({ kind: 'build', ...SCOPED })?.codex).toMatch(/routing\.builder=claude/);
+    for (const kind of ['fix', 'ci-heal']) expect(availabilityFor({ ...explicit, kind })?.codex, kind).toBeUndefined();
+  });
+  it('a deliveryAgent=codex marker on a build kind that ignores markers neither lifts the hold nor is refused', () => {
+    expect(NON_MARKER_BUILD_KINDS.length).toBeGreaterThan(0);
+    for (const codexReserveForAudit of [false, true]) {
+      settingsDir({ 'routing.json': { routing: { builder: 'claude', codexReserveForAudit } } });
+      for (const kind of NON_MARKER_BUILD_KINDS) {
+        const dispatch = { kind, ...SCOPED, deliveryAgent: 'codex', deliveryAgentReason: 'x' };
+        expect(availabilityFor(dispatch)?.codex, `${kind} reserve=${codexReserveForAudit}`).toMatch(/routing\.builder=claude/);
+      }
+    }
   });
   it('the explicit deliveryAgent=codex refusal fires from a routing.json reserve, not only the shipped file', () => {
     settingsDir({ 'routing.json': { routing: { builder: 'claude', codexReserveForAudit: true } } });
@@ -151,7 +167,7 @@ describe('routing settings', () => {
   it('audit kinds are never build kinds; build is', () => {
     expect(BUILD_KINDS).toContain('build');
     expect(BUILD_KINDS).not.toContain('review');
-    expect(BUILD_KINDS).toEqual(expect.arrayContaining(['prepare', 'takeover', 'design', 'ci-heal']));
+    expect(BUILD_KINDS).toEqual(expect.arrayContaining(DOCUMENTED_BUILD_KINDS));
   });
   it('builder claude collapses the repair chain; an env chain cannot bring codex back, only builder=codex can', () => {
     const repo = { routing: { builder: 'claude' }, fixExecutor: { fallbackChain: ['codex', 'codex-alt', 'claude'] } };
