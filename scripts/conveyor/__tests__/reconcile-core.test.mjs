@@ -36,7 +36,27 @@ import {
   markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, CI_HEAL_ROUND_CAP,
   CONFLICT_FIX_ROUND_CAP, ADVISORY_FIX_ROUND_CAP, CONFLICT_FIX_ABSOLUTE_CEILING, foldReviewRefusalInto,
   ACCEPT_LABEL_GRACE_MS, acceptLabelDropped, CARD_BATCH_EXTRACT_WIRED, BLOCKED_CANCELLED_RERUN_CAP,
+  splitFailingChecks, reviewHoldGatesOnlyRed,
 } from '../reconcile-core.mjs';
+
+// PR #6326 self-review: a red LEGACY commit status ({context, state}) is a failing check, as ciRedOnHead reads it.
+describe('failing legacy commit statuses', () => {
+  it.each(['FAILURE', 'ERROR', 'failure'])('a required %s status lands in splitFailingChecks().required', state => {
+    expect(splitFailingChecks([{ context: 'integration', state }], ['integration']))
+      .toEqual({ required: ['integration'], nonRequired: [] });
+  });
+  it.each(['PENDING', 'EXPECTED', 'SUCCESS'])('a %s status is not failing', state => {
+    expect(splitFailingChecks([{ context: 'integration', state }], ['integration'])).toEqual({ required: [], nonRequired: [] });
+  });
+  it('a status:null row is not normalized (as the strict review gate)', () => {
+    expect(splitFailingChecks([{ context: 'integration', state: 'FAILURE', status: null }], ['integration']).required).toEqual([]);
+  });
+  it('a red required status beside a red review-gate is not a review-hold-only red', () => {
+    const rollup = [{ name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' }, { context: 'integration', state: 'FAILURE' }];
+    expect(reviewHoldGatesOnlyRed(rollup, ['review-gate', 'integration'])).toBe(false);
+    expect(reviewHoldGatesOnlyRed(rollup.slice(0, 1), ['review-gate', 'integration'])).toBe(true);
+  });
+});
 import {
   STAND_DOWN_MARKER, WATCHER_STAND_DOWN_ACTOR, SUPERSEDE_STAND_DOWN_MARKER, buildStandDownComment,
 } from '../stand-down.mjs';

@@ -625,9 +625,13 @@ const commentBody = (c) => (typeof c === 'string' ? c : c?.body);
  * @param {Array<{name?:string, context?:string, status?:string, conclusion?:string}>} [rollup]
  * @returns {string[]}
  */
+// A legacy commit status (`{context, state}`, NO `status` key — as review-ci-gate.mjs#statusAsCheckRow) whose state
+// is FAILURE/ERROR is a completed red too (PR #6326 self-review); pending/expected/success never count.
+const isRedLegacyStatus = (c) => c && typeof c === 'object' && c.status === undefined && c.conclusion == null
+  && ['FAILURE', 'ERROR'].includes(String(c.state ?? '').toUpperCase());
 const failingCheckNames = (rollup) => (Array.isArray(rollup) ? rollup : [])
-  .filter((c) => String(c?.status ?? '').toUpperCase() === 'COMPLETED'
-    && !['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(String(c?.conclusion ?? '').toUpperCase()))
+  .filter((c) => isRedLegacyStatus(c) || (String(c?.status ?? '').toUpperCase() === 'COMPLETED'
+    && !['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(String(c?.conclusion ?? '').toUpperCase())))
   .map((c) => c?.name || c?.context || 'unnamed check');
 
 /**
