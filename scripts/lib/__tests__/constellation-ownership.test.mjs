@@ -1,6 +1,7 @@
 // @repo-scanning-test scope=full — ownership coverage and CLI totals require the complete tracked inventory.
 import { describe, expect, it } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
+import { promisify } from 'node:util';
 import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -84,16 +85,16 @@ describe('constellation ownership', () => {
     console.log('Tracked ownership baseline:\n' + JSON.stringify(result, null, 2));
   });
 
-  it('runs classify --json against git ls-files and includes totals and reclassifications', () => {
-    const result = JSON.parse(execFileSync(process.execPath,
-      ['scripts/lib/constellation-ownership.mjs', 'classify', '--json'],
-      { cwd: root, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }));
+  // The ONE full-repo CLI child. Async and with no `timeout:` option, so a slow host surfaces as vitest's own
+  // "Test timed out" (the load-flake route) instead of a child-local ETIMEDOUT assertion-shaped failure.
+  it('runs classify --json against git ls-files and includes totals and reclassifications', async () => {
+    const run = args => promisify(execFile)(process.execPath, ['scripts/lib/constellation-ownership.mjs', ...args],
+      { cwd: root, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+    const result = JSON.parse((await run(['classify', '--json'])).stdout);
     expect(result.files.map(file => file.path)).toEqual(tracked);
-    expect(result.totals).toEqual(totals(result.files));
+    expect(result.totals).toEqual(baselineTotals);
     expect(result.reclassified.length).toBeGreaterThan(0);
-    expect(() => execFileSync(process.execPath,
-      ['scripts/lib/constellation-ownership.mjs', 'invalid'],
-      { cwd: root, stdio: 'pipe' })).toThrow();
+    await expect(run(['invalid'])).rejects.toThrow();
   });
 
   it.each(['existing', 'missing'])('counts stored symlink text without following an %s target', targetState => {
