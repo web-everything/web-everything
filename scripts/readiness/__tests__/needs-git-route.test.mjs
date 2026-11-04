@@ -39,6 +39,12 @@ describe('sourceNeedsGit', () => {
     expect(sourceNeedsGit(G + 'let r = f(i) / 2;' + spawn + ' // see /x')).toBe(true);
     expect(sourceNeedsGit(G + "const a=`${ '`' }`; const u='http://x';" + spawn)).toBe(true);
     expect(sourceNeedsGit(G + "const a=`x${ `y${ '}' }` }z`; const u='http://x';" + spawn)).toBe(true);
+    // a quote/backtick/brace inside a regex literal in a `${ }` hole does not end the hole early
+    expect(sourceNeedsGit(G + "function f() {\n  const a = `${ s.replace(/\"/g, '\\\\\"') }`;\n}\nconst b = `**/*.js`;" + spawn)).toBe(true);
+    expect(sourceNeedsGit(G + "it('a', () => { const c = `${s.replace(/`/g, '')}`; const g = `**/*.js`;" + spawn + ' });')).toBe(true);
+    expect(sourceNeedsGit(G + "function f() { const a = `${ s.replace(/'/g, '') }`; const b = `http://x`;" + spawn + ' }')).toBe(true);
+    expect(sourceNeedsGit(G + "function f() { const a = `${ s.replace(/}/g, '') }`; const b = `http://x`;" + spawn + ' }')).toBe(true);
+    expect(sourceNeedsGit(G + 'const a = `${ x / 2 } ${ y / 3 }`; const b = `http://x`;' + spawn)).toBe(true);
     // a comment ends at CR, U+2028 and U+2029 as well as LF
     for (const nl of ['\r', ' ', ' ']) expect(sourceNeedsGit(G + '// c' + nl + spawn)).toBe(true);
     // ... but text inside one comment stays a comment
@@ -46,7 +52,7 @@ describe('sourceNeedsGit', () => {
   });
   it('stays linear on adversarial 300k inputs (no quadratic rescans)', () => {
     const o = { helpers: ['a.mjs'] };
-    const inputs = ['(/['.repeat(100000), 'import' + ' '.repeat(300000) + 'x', 'a'.repeat(300000), "('".repeat(150000), '${'.repeat(100000), '`${'.repeat(100000)];
+    const inputs = ['(/['.repeat(100000), 'import' + ' '.repeat(300000) + 'x', 'a'.repeat(300000), "('".repeat(150000), '${'.repeat(100000), '`${'.repeat(100000), '`${' + '(/['.repeat(100000), '`${' + '(/'.repeat(150000)];
     const t0 = Date.now();
     for (const s of inputs) expect(sourceNeedsGit(s, o)).toBe(false);
     expect(Date.now() - t0).toBeLessThan(2500);

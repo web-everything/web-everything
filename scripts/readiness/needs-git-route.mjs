@@ -39,18 +39,49 @@ function templateEnd(t, i, depth) {
   }
   return n;
 }
+// End index (exclusive) of a regex literal starting at t[i] === '/', or -1 when there is no closing `/` on the line.
+function regexEnd(t, i) {
+  const n = t.length;
+  let j = i + 1;
+  let cls = false;
+  while (j < n && !isNewline(t[j])) {
+    const e = t[j];
+    if (e === '\\') { j += 2; continue; }
+    if (e === '[') cls = true; else if (e === ']') cls = false; else if (e === '/' && !cls) break;
+    j++;
+  }
+  if (t[j] !== '/') return -Math.min(j, n) - 2; // not closed: the scan stopped at -(result + 2)
+  j++;
+  while (j < n && isIdent(t[j])) j++;
+  return j;
+}
 function holeEnd(t, i, depth) {
   const n = t.length;
   let j = i;
   let braces = 0;
+  let last = ''; // last significant character, to tell a regex literal from a division
+  let wordStart = 0;
+  let noCloseUntil = -1;
   while (j < n) {
     const c = t[j];
+    if (c === '`') { j = templateEnd(t, j, depth); last = c; continue; }
+    if (c === "'" || c === '"') { j = quotedEnd(t, j); last = c; continue; }
+    if (c === '/' && t[j + 1] === '/') { while (j < n && !isNewline(t[j])) j++; continue; }
+    if (c === '/' && t[j + 1] === '*') { const e = t.indexOf('*/', j + 2); j = e < 0 ? n : e + 2; continue; }
+    if (c === '/') {
+      const w = isIdent(last) && j - wordStart <= MAX_WORD ? t.slice(wordStart, j).trimEnd() : '';
+      const regexOk = j >= noCloseUntil && (last === '' || (isIdent(last) ? REGEX_AFTER_WORD.has(w) : !')]\'"`'.includes(last)));
+      const e = regexOk ? regexEnd(t, j) : 0;
+      if (e > 0) { j = e; last = '0'; wordStart = j; continue; }
+      if (e < 0) noCloseUntil = -e - 2; // no closing `/` before here: later `/` on this line are divisions (no rescans)
+      last = c; j++; continue;
+    }
     if (c === '{') braces++;
     else if (c === '}') { if (braces === 0) return j + 1; braces--; }
-    else if (c === '`') { j = templateEnd(t, j, depth); continue; }
-    else if (c === "'" || c === '"') { j = quotedEnd(t, j); continue; }
-    else if (c === '/' && t[j + 1] === '/') { while (j < n && !isNewline(t[j])) j++; continue; }
-    else if (c === '/' && t[j + 1] === '*') { const e = t.indexOf('*/', j + 2); j = e < 0 ? n : e + 2; continue; }
+    if (!/\s/.test(c)) {
+      if (isIdent(c) && !isIdent(last)) wordStart = j;
+      last = c;
+    }
     j++;
   }
   return n;
