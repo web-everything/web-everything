@@ -2,7 +2,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { appendVerifyRemoteReport, heartbeatOwnedSlot } from '../readiness/heavy-admission.mjs';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
-import { localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, readRemoteReport, remoteInfrastructureFailure, phaseRunLocation, overallRunLocation, decidePhaseRemote, splitExplicitGate, runGateSegments, remainingBudgetMs, budgetExhaustedResult, withDeadline, SHARD_RUN_SCRIPT } from '../lib/verify-remote-routing.mjs';
+import { localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, readRemoteReport, remoteInfrastructureFailure, phaseRunLocation, overallRunLocation, decidePhaseRemote, splitExplicitGate, runGateSegments, remainingBudgetMs, budgetExhaustedResult, SHARD_RUN_SCRIPT } from '../lib/verify-remote-routing.mjs';
 import { shellQuote } from '../lib/verify-lane-gate.mjs';
 import { runInNewContext } from 'node:vm';
 import { fstatSync, readSync } from 'node:fs';
@@ -945,9 +945,12 @@ describe('explicit and compound gates split into per-segment phases (PR-4)', () 
       .toBe(`VERIFY_SCAN_FILES='["scripts/a.mjs"]' npm run test:unit -- scripts/b.test.mjs`);
   });
 
-  it('accepts check:standards and this checkout\'s own wrapper, and never splits inside single quotes', () => {
-    expect(splitExplicitGate(`${ours} --shards=2 -- npx vitest run a.test.mjs && npm run check:standards`)).toEqual([
-      `${ours} --shards=2 -- npx vitest run a.test.mjs`, 'npm run check:standards']);
+  it('splits ONLY the shard-wrapper + vitest/scan shape: this checkout\'s own wrapper is kept, check:standards stays local with the reason logged', () => {
+    expect(splitExplicitGate(`${ours} --shards=2 -- npx vitest run a.test.mjs && ${scan}`)).toEqual([
+      `${ours} --shards=2 -- npx vitest run a.test.mjs`, scan]);
+    const narrowLog = vi.fn();
+    expect(splitExplicitGate(`${ours} --shards=2 -- npx vitest run a.test.mjs && npm run check:standards`, { log: narrowLog })).toBeNull();
+    expect(narrowLog.mock.calls[0][0]).toContain('unknown-segment');
     const quoted = `${foreign} --shards=2 -- npx vitest run a.test.mjs && VERIFY_SCAN_FILES='["a && b.mjs"]' npx vitest run c.test.mjs`;
     // The `&&` inside the quoted list is not a boundary: the one segment is rejected whole by Forge's env allowlist.
     const log = vi.fn();
@@ -987,149 +990,80 @@ describe('explicit and compound gates split into per-segment phases (PR-4)', () 
     expect(killed).toHaveBeenCalledTimes(1);
   });
 
+  it('the final return is checked and keeps the remote-attempt classification, so an over-budget remote gate stays termination-unconfirmed', async () => {
+    let clock = 0;
+    const run = vi.fn(async () => { clock += 150; return { exitCode: 0, signal: null, remoteAttempt: true, ranOn: { location: 'remote' } }; });
+    const result = await runGateSegments(['a'], run, { budgetMs: 100, now: () => clock });
+    expect(result).toMatchObject({ exitCode: 124, timedOut: true, budgetExhausted: true, remoteAttempt: true, ranOn: { location: 'remote' } });
+    expect(remoteInfrastructureFailure({ exitCode: result.exitCode, remoteAttempt: result.remoteAttempt, ranOn: result.ranOn }))
+      .toMatchObject({ reason: 'remote-termination-unconfirmed' });
+  });
+
+  it('a spent budget before a segment skips it; each segment is handed the absolute deadline', async () => {
+    let clock = 1000;
+    const run = vi.fn(async () => { clock += 100; return { exitCode: 0, signal: null }; });
+    const result = await runGateSegments(['a', 'b'], run, { budgetMs: 100, now: () => clock });
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0][1]).toEqual({ deadlineAt: 1100 });
+    expect(result).toMatchObject({ timedOut: true, budgetExhausted: true });
+  });
+
+  describe('a split gate runs under the existing worker watchdog, with no local confirmation and no base rerun', () => {
+    const source = readFileSync(resolve(repo, 'scripts/verify-lane.mjs'), 'utf8');
+    const start = source.indexOf('async function timedRunGate(');
+    const end = source.indexOf('// runVitestOnBase', start);
+    const build = (overrides = {}) => {
+      const runGate = vi.fn(async () => ({ exitCode: 1, remoteAttempt: true, ranOn: { location: 'remote', failureLocation: 'remote' }, failureDetails: { tests: [] } }));
+      const acquireAdmission = vi.fn(async () => ({ ok: false, remote: true }));
+      const context = {
+        phaseAdmission: false, firstPhaseAdmission: null, admission: { remote: true }, currentAdmission: null,
+        phaseAdmissionPlan, shouldConfirmRemoteRed, remoteInfrastructureFailure, remainingBudgetMs, budgetExhaustedResult,
+        mergeRunLocation: (a, b) => a === b ? a : 'mixed', runGate, acquireAdmission, recordOutcome: vi.fn(), buildPhaseOutcome: value => value,
+        ranOnPhases: {}, phaseMs: {}, remoteUnconfirmed: false, phaseTimeout: null, vitestAdmittedLocally: false, resolvedGate: null,
+        slotHeartbeat: null, setInterval: vi.fn(), clearInterval: vi.fn(), heartbeatOwnedSlot: vi.fn(), releaseOwnedSlot: vi.fn(),
+        ADMISSION_LOCK_ROOT: '', ADMISSION_CAP: 1, REPO: repo, SLOT_HEARTBEAT_MS: 1000, PHASE_TIMEOUT_MS: 10000, MARKER_NONCE_SUFFIX: '',
+        performance, MARKER_NONCE: '', process: { stderr: { write: vi.fn() } }, ...overrides,
+      };
+      return { runGate, acquireAdmission, context, timedRunGate: runInNewContext(`${source.slice(start, end)}; timedRunGate`, context) };
+    };
+    const segment = `${foreign} --shards=2 -- npx vitest run a.test.mjs`.replace(foreign, ours);
+
+    it('a red remote segment is the verdict as-is: no second local run, no second admission', async () => {
+      const { runGate, acquireAdmission, timedRunGate } = build();
+      const result = await timedRunGate(null, segment, undefined, { deadlineAt: Date.now() + 60000, noConfirm: true });
+      expect(runGate).toHaveBeenCalledTimes(1);
+      expect(acquireAdmission).toHaveBeenCalledTimes(1);
+      expect(result).toMatchObject({ exitCode: 1, remoteAttempt: true });
+    });
+
+    it('the watchdog gets the time remaining AFTER admission, so an admission wait cannot extend the ceiling', async () => {
+      const deadlineAt = Date.now() + 5000;
+      const { runGate, timedRunGate } = build();
+      await timedRunGate(null, segment, undefined, { deadlineAt, noConfirm: true });
+      const { timeoutMs } = runGate.mock.calls[0][2];
+      expect(timeoutMs).toBeGreaterThan(0);
+      expect(timeoutMs).toBeLessThanOrEqual(5000);
+    });
+
+    it('a budget spent during admission never spawns the segment and times out', async () => {
+      const { runGate, timedRunGate } = build();
+      const result = await timedRunGate(null, segment, undefined, { deadlineAt: Date.now() - 1, noConfirm: true });
+      expect(runGate).not.toHaveBeenCalled();
+      expect(result).toMatchObject({ timedOut: true, budgetExhausted: true });
+    });
+
+    it('verify-lane builds no new timer: the base rerun is skipped for split gates and no outer deadline helper exists', () => {
+      expect(source).toMatch(/!explicitSegments && baseCandidate/);
+      expect(source).toMatch(/noConfirm: true/);
+      expect(source).not.toMatch(/withDeadline|killGateChildren|gateChildren/);
+    });
+  });
+
   it('verify-lane admits each segment on its own and leaves the marker suites value alone', () => {
     const source = readFileSync(resolve(repo, 'scripts/verify-lane.mjs'), 'utf8');
     expect(source).toMatch(/splitExplicitGate\(/);
     expect(source).toMatch(/runGateSegments\(\s*explicitSegments/);
     expect(source).toContain('suites: GATE');
     expect(source).not.toMatch(/suites: explicitSegments/);
-  });
-
-  it('shares ONE gate deadline: each segment gets the time remaining, so segments cannot each use the full ceiling', async () => {
-    let clock = 0;
-    const run = vi.fn(async (_segment, { timeoutMs }) => { clock += 70; return { exitCode: 0, signal: null, seenTimeout: timeoutMs }; });
-    const result = await runGateSegments(['a', 'b', 'c'], run, { budgetMs: 100, now: () => clock });
-    expect(run.mock.calls.map(c => [c[0], c[1].timeoutMs])).toEqual([['a', 100], ['b', 30]]);
-    expect(run).toHaveBeenCalledTimes(2);
-    expect(result).toMatchObject({ timedOut: true, budgetExhausted: true, signal: 'SIGKILL' });
-    expect(result.exitCode).not.toBe(0);
-  });
-
-  it('a gate that finishes inside the budget passes every segment and never reports a timeout', async () => {
-    let clock = 0;
-    const run = vi.fn(async () => { clock += 10; return { exitCode: 0, signal: null }; });
-    const result = await runGateSegments(['a', 'b', 'c'], run, { budgetMs: 100, now: () => clock });
-    expect(run).toHaveBeenCalledTimes(3);
-    expect(result.budgetExhausted).toBeUndefined();
-  });
-
-  it('verify-lane hands the remaining budget to the phase watchdog', () => {
-    const source = readFileSync(resolve(repo, 'scripts/verify-lane.mjs'), 'utf8');
-    expect(source).toMatch(/runGateSegments\(explicitSegments, [^\n]*budgetMs: PHASE_TIMEOUT_MS/);
-    expect(source).toMatch(/timeoutMs: timeoutMs \?\? PHASE_TIMEOUT_MS/);
-  });
-
-  // Every path of a split gate that spends time draws from ONE deadline. Walked here against a tiny budget.
-  describe('one shared deadline: every time-spending path of a split gate', () => {
-    const tiny = 100;
-    const clockRun = (costs, now) => vi.fn(async () => { now.t += costs.shift(); return { exitCode: 0, signal: null }; });
-    it.each([
-      ['segment 1 starts with the whole budget', async () => {
-        const now = { t: 0 }; const run = clockRun([10, 10], now);
-        await runGateSegments(['a', 'b'], run, { budgetMs: tiny, now: () => now.t });
-        expect(run.mock.calls[0][1].timeoutMs).toBe(100);
-      }],
-      ['segment 2 starts with only what segment 1 left', async () => {
-        const now = { t: 0 }; const run = clockRun([60, 10], now);
-        await runGateSegments(['a', 'b'], run, { budgetMs: tiny, now: () => now.t });
-        expect(run.mock.calls[1][1].timeoutMs).toBe(40);
-      }],
-      ['an exhausted budget before a segment skips it and times out', async () => {
-        const now = { t: 0 }; const run = clockRun([100, 10], now);
-        const result = await runGateSegments(['a', 'b'], run, { budgetMs: tiny, now: () => now.t });
-        expect(run).toHaveBeenCalledTimes(1);
-        expect(result).toMatchObject({ timedOut: true, budgetExhausted: true });
-      }],
-      ['the final return is checked: an over-budget last segment cannot be green', async () => {
-        const now = { t: 0 }; const run = clockRun([150], now);
-        const result = await runGateSegments(['a'], run, { budgetMs: tiny, now: () => now.t });
-        expect(result).toMatchObject({ timedOut: true, budgetExhausted: true });
-        expect(result.exitCode).not.toBe(0);
-      }],
-      ['the segment receives the absolute deadline so a local confirmation draws from the same budget', async () => {
-        const now = { t: 1000 }; const run = clockRun([5], now);
-        await runGateSegments(['a'], run, { budgetMs: tiny, now: () => now.t });
-        expect(run.mock.calls[0][1].deadlineAt).toBe(1100);
-      }],
-      ['a local confirmation or base rerun with no budget left is skipped, otherwise capped by it', () => {
-        expect(remainingBudgetMs(1100, () => 1000)).toBe(100);
-        expect(remainingBudgetMs(1100, () => 1100)).toBe(0);
-        expect(remainingBudgetMs(1100, () => 1200)).toBe(0);
-        expect(remainingBudgetMs(null, () => 1200)).toBeUndefined();
-        expect(budgetExhaustedResult({ ranOn: { location: 'remote' } })).toMatchObject({ timedOut: true, budgetExhausted: true, exitCode: 124, ranOn: { location: 'remote' } });
-      }],
-      ['verify-lane wires confirmation and base rerun to the deadline; isolated retry, scans, guards and standards exist only for non-split gates', () => {
-        const source = readFileSync(resolve(repo, 'scripts/verify-lane.mjs'), 'utf8');
-        expect(source).toMatch(/const explicitSegments = retryableGate \? null/);
-        expect(source).toMatch(/remainingBudgetMs\(deadlineAt/);
-        expect(source).toMatch(/remainingBudgetMs\(gateDeadlineAt/);
-        expect(source).toMatch(/timeoutMs: Math\.min\(/);
-      }],
-    ])('%s', async (_name, walk) => { await walk(); });
-  });
-
-  // Structural guarantee: ONE outer watchdog around the whole split-gate execution (the old single-command gate's
-  // semantics). Correctness does not depend on the per-segment remaining-time arithmetic above.
-  describe('one outer watchdog bounds the whole split gate', () => {
-    const budget = 60;
-    const grace = 250;
-    const timed = async fn => { const t0 = Date.now(); const out = await fn(); return { out, ms: Date.now() - t0 }; };
-
-    it('an admission wait that eats the budget is cut at the deadline, and the late arrival is told to stand down', async () => {
-      let signal;
-      const expire = vi.fn();
-      const { out, ms } = await timed(() => runGateSegments(['a', 'b'], (_segment, budgetInfo) => {
-        signal = budgetInfo.signal;
-        return new Promise(resolve => setTimeout(() => resolve({ exitCode: 0, signal: null }), 2000)); // stuck in acquireAdmission
-      }, { budgetMs: budget, onExpire: expire }));
-      expect(out).toMatchObject({ timedOut: true, budgetExhausted: true });
-      expect(out.exitCode).not.toBe(0);
-      expect(signal.aborted).toBe(true);
-      expect(expire).toHaveBeenCalledTimes(1);
-      expect(ms).toBeLessThan(budget + grace);
-    });
-
-    it('a local confirmation in flight at the deadline is killed (the segment ignores the budget it was handed)', async () => {
-      const kill = vi.fn();
-      const { out, ms } = await timed(() => runGateSegments(['a'], async () => {
-        await new Promise(resolve => setTimeout(resolve, 20));
-        return new Promise(() => {}); // the confirmation run: never settles by itself
-      }, { budgetMs: budget, onExpire: kill }));
-      expect(out).toMatchObject({ timedOut: true, budgetExhausted: true });
-      expect(kill).toHaveBeenCalledTimes(1);
-      expect(ms).toBeLessThan(budget + grace);
-    });
-
-    it('a base rerun in flight at the deadline is killed and yields no result', async () => {
-      const kill = vi.fn();
-      const { out, ms } = await timed(() => withDeadline(() => new Promise(() => {}), { deadlineAt: Date.now() + budget, onExpire: kill }));
-      expect(out).toEqual({ expired: true });
-      expect(kill).toHaveBeenCalledTimes(1);
-      expect(ms).toBeLessThan(budget + grace);
-    });
-
-    it('a task that finishes in time is returned untouched and the timer is cleared', async () => {
-      const kill = vi.fn();
-      const out = await withDeadline(async () => 42, { deadlineAt: Date.now() + 5000, onExpire: kill });
-      expect(out).toEqual({ expired: false, value: 42 });
-      await new Promise(resolve => setTimeout(resolve, 20));
-      expect(kill).not.toHaveBeenCalled();
-      expect(await withDeadline(async () => 7, { deadlineAt: undefined })).toEqual({ expired: false, value: 7 });
-    });
-
-    it('an already-spent deadline never starts the task', async () => {
-      const task = vi.fn(async () => 1);
-      expect(await withDeadline(task, { deadlineAt: Date.now() - 1 })).toEqual({ expired: true });
-      expect(task).not.toHaveBeenCalled();
-    });
-
-    it('verify-lane kills every tracked child group on expiry, refuses late work, and bounds the base rerun the same way', () => {
-      const source = readFileSync(resolve(repo, 'scripts/verify-lane.mjs'), 'utf8');
-      expect(source).toMatch(/onExpire: killGateChildren/);
-      expect(source).toMatch(/gateChildren\.set\(/);
-      expect(source).toMatch(/killProcessTree\(pid, 'SIGKILL'/);
-      expect(source).toMatch(/signal\?\.aborted\) return budgetExhaustedResult/);
-      expect(source).toMatch(/withDeadline\(signal => measureBaseFailures/);
-    });
   });
 });
