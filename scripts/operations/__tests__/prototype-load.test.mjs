@@ -2174,6 +2174,24 @@ describe('carried evidence precedence (R503 red team)', () => {
     expect(await auditedFixture('warn', { ready: auditLines([own]), audits, auditBaseInMain: TREE }).run()).toMatchObject({ ok: true, canonicalAudit: { reason: 'weakened' } });
     expect(await auditedFixture('warn', { ready: auditLines([ready()]), audits: '', fingerprint: () => FP }).run()).toMatchObject({ ok: true, canonicalAudit: { reason: 'no-record' } });
   });
+  it('round 3 self-review: a live-head WEAKENED audit that findAudit drops as malformed still blocks the carried pass', () => {
+    const pass = audit({ at: at(1) });
+    for (const weak of [
+      auditRecord({ verdict: 'WEAKENED', at: at(2), findings: ['guard removed', 'NOT WEAKENED'] }),
+      auditRecord({ verdict: 'WEAKENED', at: 'nope' }),
+      auditRecord({ verdict: 'WEAKENED', at: at(2), head: SHA.toUpperCase() }),
+    ]) expect(prototypeLoad.canonicalAuditEvidence([pass, weak], SHA, () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
+    // A foreign-question record is still not a verdict: it neither blocks nor enables.
+    expect(prototypeLoad.canonicalAuditEvidence([pass, auditRecord({ verdict: 'WEAKENED', at: at(2), questionHash: 'foreign' })], SHA, () => true, FP)).toEqual({ ok: true, record: pass });
+  });
+  it('round 3 self-review: a newer WEAKENED ready record of another head without a fingerprint blocks the carry (rebase twice)', () => {
+    const between = ready({ sha: C, fingerprint: undefined, audit: 'WEAKENED' });
+    expect(prototypeLoad.readyEvidence([ready(), between], input, [], FP)).toBeNull();
+    // Proven different code (another fingerprint), an older one, or a green one does not block.
+    expect(prototypeLoad.readyEvidence([ready(), { ...between, fingerprint: '1'.repeat(64) }], input, [], FP)).toEqual({ source: 'ready-record', record: ready() });
+    expect(prototypeLoad.readyEvidence([between, ready()], input, [], FP)).toEqual({ source: 'ready-record', record: ready() });
+    expect(prototypeLoad.readyEvidence([ready(), { ...between, audit: 'NOT WEAKENED' }], input, [], FP)).toEqual({ source: 'ready-record', record: ready() });
+  });
 });
 
 describe('prototype-load daemon key resolution (R502 item 1)', () => {

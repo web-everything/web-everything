@@ -56,7 +56,12 @@ export function readyEvidence(records, input, ruledWeakened = [], liveFp = null)
   if (ownAt >= 0) return judge(list[ownAt]);
   // No live-sha record: the newest carried head whose latest record itself holds the live fingerprint decides.
   const pick = carried.filter((i) => carries(list[i])).pop();
-  return pick === undefined ? null : judge(list[pick]);
+  if (pick === undefined) return null;
+  // Round 3: a NEWER latest record of another head with no readable fingerprint may be the same code (a second rebase),
+  // so when it would not load it blocks the carry. Only a readable, different fingerprint proves it is other code.
+  const hasFp = (fp) => carriesAcross(fp, fp);
+  if ([...latest].some(([sha, i]) => sha !== live && i > pick && !hasFp(list[i].fingerprint) && !judge(list[i]))) return null;
+  return judge(list[pick]);
 }
 /** Canonical audit for this head. Each non-empty base (base!==head) is judged by findAudit (latest wins within a
  * base, file order breaks ties, contradictory findings rejected). Fail closed: ANY base whose latest verdict is
@@ -94,6 +99,9 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   const covered = (base) => { if (!coverMemo.has(base)) coverMemo.set(base, !!covers(base)); return coverMemo.get(base); };
   // An own WEAKENED stops here, before covers() can touch git (refuse mode promises to stop before git).
   if (own.some((d) => d.record.verdict === 'WEAKENED')) return { ok: false, reason: 'weakened' };
+  // Round 3: a live-head WEAKENED that findAudit cannot use (contradictory findings, unparsable time) must not vanish
+  // and leave the live head looking unaudited, which would let a carried pass decide. Only a foreign question is ignored.
+  if (!own.length && list.some((r) => r?.head === sha && r.base !== sha && r.verdict === 'WEAKENED' && r.questionHash === QUESTION_HASH)) return { ok: false, reason: 'weakened' };
   const carriedWeak = carried.filter((d) => d.record.verdict === 'WEAKENED');
   if (carriedWeak.length) {
     const ownAt = Math.max(-Infinity, ...own.filter((d) => covered(d.base)).map((d) => Date.parse(d.record.at)));
