@@ -21,7 +21,6 @@ const DEFAULTS = Object.freeze({
   minFreeGiB: 30,
   batchMaxGiB: 4,
   batchMaxCompressedGiB: 2,
-  archivePrEvidence: false,
 });
 
 /** standard defaults < scripts/settings/runs-retention.json < env. Invalid values throw (never guess). */
@@ -32,12 +31,12 @@ export function resolveRetentionSettings({ env = process.env, tool } = {}) {
   }
   const e = { keepDays: env.WE_RUNS_RETENTION_KEEP_DAYS, archiveDir: env.WE_RUNS_RETENTION_ARCHIVE_DIR,
     minFreeGiB: env.WE_RUNS_RETENTION_MIN_FREE_GIB, batchMaxGiB: env.WE_RUNS_RETENTION_BATCH_MAX_GIB };
+  if (e.keepDays === undefined && env.WE_ARCHIVE_RUNS_KEEP_DAYS !== undefined) e.keepDays = env.WE_ARCHIVE_RUNS_KEEP_DAYS; // honor the established archive-retention override
   const v = { ...DEFAULTS, ...(tool ?? {}) };
   for (const [k, x] of Object.entries(e)) if (x !== undefined && x !== '') v[k] = k === 'archiveDir' ? x : Number(x);
   for (const k of ['keepDays', 'minFreeGiB', 'batchMaxGiB', 'batchMaxCompressedGiB']) {
     if (!Number.isFinite(v[k]) || v[k] < 0) throw new Error(`runs-retention: invalid setting ${k}=${v[k]}`);
   }
-  if (typeof v.archivePrEvidence !== 'boolean') throw new Error('runs-retention: invalid setting archivePrEvidence (boolean required)');
   if (typeof v.archiveDir !== 'string' || !v.archiveDir.trim()) throw new Error('runs-retention: invalid setting archiveDir');
   v.archiveDir = v.archiveDir.replace(/^~(?=\/|$)/, homedir());
   return v;
@@ -107,7 +106,7 @@ export function runsRetention(o = {}) {
   const verifyContents = o.verifyContents ?? defaultVerify;
   const out = { status: dryRun ? 'dry-run' : 'archived', dryRun, scanned: 0, eligible: 0, eligibleBytes: 0,
     kept: { young: 0, nonTerminal: 0, resumable: 0, unreadable: 0 }, archived: 0, deleted: 0, bytesFreed: 0, archives: [], errors: [], months: {} };
-  const cutoff = now - settings.keepDays * DAY;
+  const cutoff = Math.min(now - settings.keepDays * DAY, now - 600000); // never younger than 10 minutes
   // Crash recovery: a record parked under .retiring-* by an interrupted pass goes back to its canonical name.
   if (!dryRun) for (const name of existsSync(dir) ? readdirSync(dir) : []) {
     const m = /^\.retiring-(.+)\.[0-9a-f-]{36}$/.exec(name);
@@ -134,8 +133,8 @@ export function runsRetention(o = {}) {
     // unknown op or no injection = retained). An interrupted run between steps is what --resume continues.
     if (!record || !isRunRecordTerminal(record) || !isComplete(record)) { out.kept.nonTerminal++; continue; }
     if (reviewRunMayResume(record)) { out.kept.resumable++; continue; }
-    // PR evidence outlives the cursor (same rule as pruneTerminalRuns): retained unless the setting opts in.
-    if (!settings.archivePrEvidence && record.effects.some(e => e?.result?.pr)) { out.kept.resumable++; continue; }
+    // PR evidence outlives the cursor (same rule as pruneTerminalRuns): always retained (no opt-in).
+    if (record.effects.some(e => e?.result?.pr)) { out.kept.resumable++; continue; }
     if (!byMonth.has(month)) byMonth.set(month, []);
     byMonth.get(month).push({ id, name: `${id}.json`, size: st.size, mtimeMs: st.mtimeMs, ino: st.ino, hash: createHash('sha256').update(bytes).digest('hex') });
     out.eligible++; out.eligibleBytes += st.size;
@@ -170,6 +169,7 @@ export function runsRetention(o = {}) {
       let partial;
       try {
         mkdirSync(monthDir, { recursive: true });
+        if (!realDir(settings.archiveDir) || !realDir(monthDir)) throw new Error('archive directory is not a real directory (symlink?); originals retained');
         partial = join(monthDir, `.${randomUUID()}.${codec.ext}.partial`);
         const names = batch.map(f => f.name);
         tarCreate(partial, dir, names, codec);

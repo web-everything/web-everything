@@ -6,8 +6,7 @@
       "archiveDir": "~/Library/CloudStorage/GoogleDrive-nic.g.gilbert@gmail.com/My Drive/WE-archive/runs",
       "minFreeGiB": 30,
       "batchMaxGiB": 4,
-      "batchMaxCompressedGiB": 2,
-      "archivePrEvidence": false
+      "batchMaxCompressedGiB": 2
     }
   }
 }
