@@ -9,6 +9,8 @@ import { readdirSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { workspaceFor } from './lane-pool-paths.mjs';
+import { memoryFreePct } from './memory-available.mjs';
+import { loadHostOverloadSettings } from './host-overload-settings.mjs';
 import { admissionStatus, admissionLockRoot, resolveCap } from '../readiness/heavy-admission.mjs';
 
 const round = n => Math.round(n * 10) / 10;
@@ -124,9 +126,9 @@ export function createSampler({ exec = execFileSync, cpus = os.cpus, loadavg = o
       if (value === null) throw Error('unrecognized memory pressure'); return value;
     });
     const memFreePct = probe('memFreePct', () => {
-      const free = freemem(); const total = totalmem();
-      if (!Number.isFinite(free) || !Number.isFinite(total) || total <= 0) throw Error('invalid memory totals');
-      return round(free / total * 100);
+      let metric = 'free'; // an unreadable or invalid policy takes the stricter reading, never the looser one
+      try { metric = loadHostOverloadSettings({ log: () => {} }).settings.host.capacity.memoryMetric; } catch { /* strict */ }
+      return memoryFreePct({ metric, exec: run, freemem, totalmem });
     });
     const swapPct = probe('swapUsedPct', () => {
       const value = swapUsedPct(run('sysctl', ['-n', 'vm.swapusage']));
