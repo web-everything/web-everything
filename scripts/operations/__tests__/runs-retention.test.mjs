@@ -133,6 +133,7 @@ describe('runsRetention', () => {
   it('settings: defaults to 14 days / 30 GiB; env overrides; invalid throws', () => {
     expect(resolveRetentionSettings({ env: {}, tool: {} }).keepDays).toBe(14);
     expect(resolveRetentionSettings({ env: { WE_RUNS_RETENTION_KEEP_DAYS: '3' }, tool: {} }).keepDays).toBe(3);
+    expect(() => resolveRetentionSettings({ env: {}, tool: { archivePrEvidence: 'false' } })).toThrow(/boolean/);
     expect(() => resolveRetentionSettings({ env: { WE_RUNS_RETENTION_MIN_FREE_GIB: '-1' }, tool: {} })).toThrow(/invalid/);
   });
 });

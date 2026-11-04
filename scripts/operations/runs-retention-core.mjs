@@ -37,6 +37,7 @@ export function resolveRetentionSettings({ env = process.env, tool } = {}) {
   for (const k of ['keepDays', 'minFreeGiB', 'batchMaxGiB', 'batchMaxCompressedGiB']) {
     if (!Number.isFinite(v[k]) || v[k] < 0) throw new Error(`runs-retention: invalid setting ${k}=${v[k]}`);
   }
+  if (typeof v.archivePrEvidence !== 'boolean') throw new Error('runs-retention: invalid setting archivePrEvidence (boolean required)');
   if (typeof v.archiveDir !== 'string' || !v.archiveDir.trim()) throw new Error('runs-retention: invalid setting archiveDir');
   v.archiveDir = v.archiveDir.replace(/^~(?=\/|$)/, homedir());
   return v;
@@ -196,7 +197,8 @@ export function runsRetention(o = {}) {
             // Move the record AWAY first (atomic): a writer replacing it now creates an independent new file, and
             // the exact inode we hash is the one we delete. A changed record is put back, never destroyed.
             renameSync(path, held);
-            if (hashOf(held) === f.hash && lstatSync(held).isFile()) { unlinkSync(held); out.deleted++; out.bytesFreed += f.size; }
+            const hs = lstatSync(held);
+            if (hs.isFile() && hs.mtimeMs === f.mtimeMs && hs.ino === f.ino && hs.size === f.size && hashOf(held) === f.hash) { unlinkSync(held); out.deleted++; out.bytesFreed += f.size; }
             else {
               out.kept.young++;
               try { linkSync(held, path); unlinkSync(held); } catch { out.errors.push(`${f.id}: changed after archive; kept at ${held}`); }

@@ -16,7 +16,7 @@ export function createRunsRetentionSinks(deps = {}) {
   return {
     [RUNS_RETENTION_EFFECT]: async (payload) => {
       const counts = deps.isComplete ? null : await stepCounts();
-      const isComplete = deps.isComplete ?? (r => counts.has(r.op) && r.cursor >= counts.get(r.op) && !r.pending);
+      const isComplete = deps.isComplete ?? (r => counts.has(r.op) && r.cursor === counts.get(r.op) && !r.pending);
       return runsRetention({ dryRun: payload.dryRun, month: payload.month || undefined, ...deps, isComplete });
     },
   };
