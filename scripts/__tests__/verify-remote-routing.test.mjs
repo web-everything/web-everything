@@ -2,7 +2,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { appendVerifyRemoteReport, heartbeatOwnedSlot } from '../readiness/heavy-admission.mjs';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
-import { localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, readRemoteReport, remoteInfrastructureFailure, phaseRunLocation, overallRunLocation, decidePhaseRemote, splitExplicitGate, runGateSegments, remainingBudgetMs, budgetExhaustedResult, SHARD_RUN_SCRIPT } from '../lib/verify-remote-routing.mjs';
+import { localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, readRemoteReport, remoteInfrastructureFailure, phaseRunLocation, overallRunLocation, decidePhaseRemote, splitExplicitGate, runGateSegments, remainingBudgetMs, budgetExhaustedResult, withDeadline, SHARD_RUN_SCRIPT } from '../lib/verify-remote-routing.mjs';
 import { shellQuote } from '../lib/verify-lane-gate.mjs';
 import { runInNewContext } from 'node:vm';
 import { fstatSync, readSync } from 'node:fs';
@@ -1066,5 +1066,70 @@ describe('explicit and compound gates split into per-segment phases (PR-4)', () 
         expect(source).toMatch(/timeoutMs: Math\.min\(/);
       }],
     ])('%s', async (_name, walk) => { await walk(); });
+  });
+
+  // Structural guarantee: ONE outer watchdog around the whole split-gate execution (the old single-command gate's
+  // semantics). Correctness does not depend on the per-segment remaining-time arithmetic above.
+  describe('one outer watchdog bounds the whole split gate', () => {
+    const budget = 60;
+    const grace = 250;
+    const timed = async fn => { const t0 = Date.now(); const out = await fn(); return { out, ms: Date.now() - t0 }; };
+
+    it('an admission wait that eats the budget is cut at the deadline, and the late arrival is told to stand down', async () => {
+      let signal;
+      const expire = vi.fn();
+      const { out, ms } = await timed(() => runGateSegments(['a', 'b'], (_segment, budgetInfo) => {
+        signal = budgetInfo.signal;
+        return new Promise(resolve => setTimeout(() => resolve({ exitCode: 0, signal: null }), 2000)); // stuck in acquireAdmission
+      }, { budgetMs: budget, onExpire: expire }));
+      expect(out).toMatchObject({ timedOut: true, budgetExhausted: true });
+      expect(out.exitCode).not.toBe(0);
+      expect(signal.aborted).toBe(true);
+      expect(expire).toHaveBeenCalledTimes(1);
+      expect(ms).toBeLessThan(budget + grace);
+    });
+
+    it('a local confirmation in flight at the deadline is killed (the segment ignores the budget it was handed)', async () => {
+      const kill = vi.fn();
+      const { out, ms } = await timed(() => runGateSegments(['a'], async () => {
+        await new Promise(resolve => setTimeout(resolve, 20));
+        return new Promise(() => {}); // the confirmation run: never settles by itself
+      }, { budgetMs: budget, onExpire: kill }));
+      expect(out).toMatchObject({ timedOut: true, budgetExhausted: true });
+      expect(kill).toHaveBeenCalledTimes(1);
+      expect(ms).toBeLessThan(budget + grace);
+    });
+
+    it('a base rerun in flight at the deadline is killed and yields no result', async () => {
+      const kill = vi.fn();
+      const { out, ms } = await timed(() => withDeadline(() => new Promise(() => {}), { deadlineAt: Date.now() + budget, onExpire: kill }));
+      expect(out).toEqual({ expired: true });
+      expect(kill).toHaveBeenCalledTimes(1);
+      expect(ms).toBeLessThan(budget + grace);
+    });
+
+    it('a task that finishes in time is returned untouched and the timer is cleared', async () => {
+      const kill = vi.fn();
+      const out = await withDeadline(async () => 42, { deadlineAt: Date.now() + 5000, onExpire: kill });
+      expect(out).toEqual({ expired: false, value: 42 });
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(kill).not.toHaveBeenCalled();
+      expect(await withDeadline(async () => 7, { deadlineAt: undefined })).toEqual({ expired: false, value: 7 });
+    });
+
+    it('an already-spent deadline never starts the task', async () => {
+      const task = vi.fn(async () => 1);
+      expect(await withDeadline(task, { deadlineAt: Date.now() - 1 })).toEqual({ expired: true });
+      expect(task).not.toHaveBeenCalled();
+    });
+
+    it('verify-lane kills every tracked child group on expiry, refuses late work, and bounds the base rerun the same way', () => {
+      const source = readFileSync(resolve(repo, 'scripts/verify-lane.mjs'), 'utf8');
+      expect(source).toMatch(/onExpire: killGateChildren/);
+      expect(source).toMatch(/gateChildren\.set\(/);
+      expect(source).toMatch(/killProcessTree\(pid, 'SIGKILL'/);
+      expect(source).toMatch(/signal\?\.aborted\) return budgetExhaustedResult/);
+      expect(source).toMatch(/withDeadline\(\(\) => measureBaseFailures/);
+    });
   });
 });
