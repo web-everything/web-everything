@@ -612,6 +612,57 @@ describe('bounded review evidence scans', () => {
     expect(result.ok).not.toBe(false);
     expect(result).toMatchObject({ status: { status: 'finished' } });
   });
+  // Recovery's exact-head query takes the drain's carried-status relaxation, so its carry fallback is reachable
+  // past the cap, and the fallback reuses the same scan (one parse budget).
+  it('recovery resolves a carried head beyond the cap using one shared parse budget', () => {
+    const f = fixture(), from = 'c'.repeat(40);
+    recordRedTeamStatus({ ...f, loopPayload: { ...payload(f.head), carriedFrom: from }, status: 'finished', result: 'skipped' }, f);
+    const panel = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(from), ...startedAt(4999 * 10_000 - 1000) };
+    let reads = 0;
+    const result = readRecoveryWitness({ ...f, ...big, read: id => { reads++; return id === 'review-pr-4999' ? panel : null; } });
+    expect(result.ok).not.toBe(false);
+    expect(result.newest).toBeNull();
+    expect(result.carryEvidence).toMatchObject({ status: { status: 'finished', head: f.head } });
+    expect(result.carryEvidence.ok).not.toBe(false);
+    expect(reads).toBe(MAX_RUN_RECORDS_PARSED);
+  });
+  it.each([['stamped before the omitted records', 1], ['stamped inside the mtime slack', 4699 * 10_000 + RUN_MTIME_SLACK_MS - 1]])(
+    'recovery holds a carried head whose status was %s', (_what, ms) => {
+      const f = fixture(), from = 'c'.repeat(40);
+      recordRedTeamStatus({ ...f, loopPayload: { ...payload(f.head), carriedFrom: from }, status: 'finished', result: 'skipped' }, f);
+      const at = new Date(ms);
+      utimesSync(statusFile(f), at, at);
+      const panel = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(from), ...startedAt(4999 * 10_000 - 1000) };
+      const result = readRecoveryWitness({ ...f, ...big, read: id => id === 'review-pr-4999' ? panel : null });
+      expect(result).toEqual({ ok: false, reason: 'scan-capped' });
+    });
+  it('recovery holds a carried head when the newest same-PR run did not review the carried-from head', () => {
+    const f = fixture(), from = 'c'.repeat(40);
+    recordRedTeamStatus({ ...f, loopPayload: { ...payload(f.head), carriedFrom: from }, status: 'finished', result: 'skipped' }, f);
+    const later = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload('d'.repeat(40)), ...startedAt(4999 * 10_000 - 1000) };
+    expect(readRecoveryWitness({ ...f, ...big, read: id => id === 'review-pr-4999' ? later : null }))
+      .toEqual({ ok: false, reason: 'scan-capped' });
+  });
+  it('recovery holds an uncarried status head whose exact-head review the window omitted', () => {
+    const f = fixture();
+    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'ran' }, f);
+    const other = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload('d'.repeat(40)), ...startedAt(4999 * 10_000 - 1000) };
+    expect(readRecoveryWitness({ ...f, ...big, read: id => id === 'review-pr-4999' ? other : null }))
+      .toEqual({ ok: false, reason: 'scan-capped' });
+  });
+  it('historical card-only fallback shares the total parse budget', () => {
+    const f = fixture(), oldHead = 'c'.repeat(40);
+    const loopPayload = { verdict: { verdict: 'changes' }, findings: { read: {
+      netBasis: { rev: oldHead }, netChangedFiles: ['backlog/123-card.md'], diffText: '+card' } } };
+    recordRedTeamStatus({ ...f, loopPayload, status: 'finished', result: 'skipped' }, f);
+    const old = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...loopPayload, ...startedAt(199 * 10_000 - 1000) };
+    let reads = 0;
+    // No live-head run, so the exact-head scan reads every record; the old head's evidence must reuse it.
+    const result = readDrainRedTeamEvidence({ ...f, ...big, list: () => Array.from({ length: 200 }, (_, i) => `review-pr-${i}`),
+      read: id => { reads++; return id === 'review-pr-199' ? old : null; } });
+    expect(result).toMatchObject({ loopPayload, status: { status: 'finished', head: oldHead, skipCardOnly: true } });
+    expect(reads).toBe(200);
+  });
   it.each([['drain', readDrainRedTeamEvidence], ['recovery', readRecoveryWitness]])('%s holds an unreviewed head: absence of an exact-head run cannot be proven past the cap', (_name, reader) => {
     const f = fixture();
     const older = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload('d'.repeat(40)), ...startedAt(4999 * 10_000 - 1000) };
@@ -713,6 +764,20 @@ it('capped evidence replaces a stale clear label with pending instead of preserv
   const f = fixture();
   expect(planRedTeamStatusLabels({ ...f, labels: ['red-team:clear'], comments: [],
     evidence: { ok: false, reason: 'scan-capped' } })).toEqual({ add: 'red-team:pending', remove: ['red-team:clear'] });
+});
+// Unknown evidence never shows clear, and never adds pending beside a hold label that is already shown.
+it.each([
+  [['red-team:clear'], { add: 'red-team:pending', remove: ['red-team:clear'] }],
+  [['red-team:blocked'], { add: null, remove: [] }],
+  [['red-team:pending'], { add: null, remove: [] }],
+  [[], { add: 'red-team:pending', remove: [] }],
+  [['red-team:blocked', 'red-team:clear'], { add: null, remove: ['red-team:clear'] }],
+  [['red-team:pending', 'red-team:clear'], { add: null, remove: ['red-team:clear'] }],
+  [[{ name: 'red-team:blocked' }], { add: null, remove: [] }],
+])('unknown evidence on labels %j plans %j', (labels, plan) => {
+  for (const reason of ['scan-capped', 'review-unfinished', 'run-start-missing']) {
+    expect(planRedTeamStatusLabels({ ...fixture(), labels, comments: [], evidence: { ok: false, reason } })).toEqual(plan);
+  }
 });
 it('an older unfinished review does not replace a logically newer finished panel', () => {
   const f = fixture();

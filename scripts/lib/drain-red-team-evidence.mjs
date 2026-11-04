@@ -159,14 +159,21 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
 export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir = env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(env),
   list = listRunIds, read = readRun, stat = statSync, scanSettings = { env }, warn, now = Date.now(),
   readScorecards = () => readStore({ path: resolveScorecardStorePath(env), strict: true }).records } = {}) {
-  const key = { repo, pr, head }, path = statusPath(key, env), bytes = optionalBytes(path);
+  const key = { repo, pr, head }, path = statusPath(key, env);
+  // Stat before reading: a rewrite between the two can only make this mtime older than the bytes (stricter).
+  let statusAt = NaN;
+  try { statusAt = statSync(path).mtimeMs; } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  const bytes = optionalBytes(path);
   const parsed = bytes === null ? null : JSON.parse(bytes);
   if (bytes !== null && (!parsed || parsed.repo !== repo || Number(parsed.pr) !== Number(pr) || parsed.head !== head)) throw Error('recovery writer identity mismatch');
   const records = readScorecards();
   const seats = records.filter(r => r.dispatchKind === 'review-seat' && r.seat === 'red-team'
     && r.repo === repo && Number(r.pr) === Number(pr) && r.rev === head);
   const lookup = reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak: 'id-desc', scanSettings, warn, now });
-  const latest = lookup();
+  // A carried head's capped exact-head query takes the drain status path's relaxation (see reviewRunLookup), so
+  // the carry fallback below can answer past the cap exactly when the drain can. Uncapped scans are unaffected.
+  const carriedFrom = parsed?.loopPayload?.carriedFrom;
+  const latest = typeof carriedFrom === 'string' ? lookup(true, undefined, { writtenAfter: statusAt, newestHead: carriedFrom }) : lookup();
   if (latest.ok === false) return latest;
   const newest = latest.run ? { id: latest.id, run: latest.run, at: latest.at } : null;
   const marker = optionalBytes(`${path}.stale-redispatch-1`);

@@ -3929,9 +3929,12 @@ more than 2 s (`RUN_MTIME_SLACK_MS`) before the exact-head match started: none o
 newer run. A match whose start cannot rule out the omitted records still holds as `scan-capped`.
 With no exact-head match in a capped window, a carried head still resolves through the any-head
 query once the newest same-PR run started after every omitted record was written, and a head with a
-status file also needs every omitted record written no later than that status. An unreviewed head
-holds: past the cap, the absence of an exact-head run cannot be proven.
-Recovery's carry fallback reuses the same scan, so one recovery read stays inside one parse budget.
+status file also needs every omitted record written at least the 2 s slack before that status and the
+newest run to be the carried-from review. An unreviewed head holds: past the cap, the absence of an
+exact-head run cannot be proven.
+Recovery's exact-head query takes the same carried-status relaxation, so its carry fallback resolves
+past the cap exactly when the drain does. That fallback, and the drain's historical card-only fallback,
+reuse the same scan, so one read stays inside one parse budget.
 Equal starts retain the drain's ascending / recovery's descending ID tie order. A start-less
 same-PR run last written before the selected run started is older and ignored; any other start-less
 run among two or more returns `run-start-missing` and holds. A single run needs no ordering and
