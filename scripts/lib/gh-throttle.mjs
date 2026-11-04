@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { memoReviewGh } from './review-tick-memo.mjs';
 /**
  * @file scripts/lib/gh-throttle.mjs
  * @description A TRANSPARENT local queue/throttle for `gh` CLI calls (we:backlog/3621's "Amendment (2026-09-08,
@@ -1812,6 +1813,10 @@ function logFinishedCiHit(args, cls, throttle, env) {
  * card 300 (live 2026-10-14: dispatch-dry-run 676s, reconcile-dry-run 215s on wev-health-watch).
  */
 export function runGhSync(args, opts = {}) {
+  return memoReviewGh(args, opts, () => runGhSyncWithCaches(args, opts));
+}
+
+function runGhSyncWithCaches(args, opts = {}) {
   const { throttle = {}, ...execOpts } = opts;
   if (isGhLocalOnly(args)) return runGhSyncUnmemoized(args, opts);
   const childEnv = execOpts.env || process.env;

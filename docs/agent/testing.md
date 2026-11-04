@@ -3910,3 +3910,14 @@ The `smoke-github-outage` break pins `WE_GH_LIST_BACKOFF_MS=5,5` and
 `WE_GH_JSON_RETRY_BACKOFF_MS=5` before the daemon forks. This preserves exhausted,
 fail-closed reads across reconcile and dispatch smoke passes within the unchanged
 90-second tick bound; shortening only the outer list backoff does not suffice.
+
+### Review tick read reuse (R362)
+
+`review.tick.memoize` and `review.tick.stepTimings` resolve standard → platform →
+`scripts/settings/review-tick.json` through the shared source logger. The daemon creates one
+async-local context per pass; callers outside it keep live reads. Test tick expiry, head changes,
+mutation invalidation, main-run reuse and shared main-fetch failures with
+`scripts/lib/__tests__/review-tick-memo.test.mjs`. Explicit head probes remain live.
+The timing summary uses milliseconds; `per-PR-loop` includes reconciliation enrichment,
+and its ledger/free-scope/label-provider substeps can overlap that total. A failed main
+fetch refuses net reads until the next tick; restore connectivity and let the next tick retry.

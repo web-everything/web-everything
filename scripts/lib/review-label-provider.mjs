@@ -1,3 +1,4 @@
+import { timeReviewStep } from './review-tick-memo.mjs';
 /**
  * @file scripts/lib/review-label-provider.mjs
  * @description THE PROVIDER PORT for the review-label arc (#x8xf5rl) — the four operations
@@ -198,11 +199,12 @@ export function assertCompletePrComments(comments, response) {
  * @param {{exec?: Function, writeFile?: Function, removeFile?: Function, tmpDir?: string}} [o]
  */
 export function createGhProvider({
-  exec = (args, opts) => runGhSync(args, { encoding: 'utf8', ...opts }),
+  exec: execute = (args, opts) => runGhSync(args, { encoding: 'utf8', ...opts }),
   writeFile = writeFileSync,
   removeFile = unlinkSync,
   tmpDir = tmpdir(),
 } = {}) {
+  const exec = (...args) => timeReviewStep('label-provider', () => execute(...args));
   return {
     name: 'gh',
 

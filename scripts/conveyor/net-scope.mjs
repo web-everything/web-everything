@@ -139,7 +139,7 @@ export function readNetSets(rows, { dir, git = noBaseFetchGit(), base = 'main', 
   }
   if (todo.length) {
     let fresh;
-    try { fresh = readNetFileSets({ dir, rows: todo, git, remote, base }); } catch { fresh = new Map(); }
+    try { fresh = readNetFileSets({ dir, rows: todo, git, remote, base, fetchBase: false }); } catch { fresh = new Map(); }
     for (const row of todo) {
       const net = fresh.get(row.number) ?? { ok: false, reason: 'not read' };
       out.set(row.number, net);

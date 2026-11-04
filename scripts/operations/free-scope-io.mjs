@@ -1,3 +1,4 @@
+import { fetchReviewMainOnce, reviewTickMemoEnabled, timeReviewStep } from '../lib/review-tick-memo.mjs';
 /**
  * @file scripts/operations/free-scope-io.mjs
  * @description IMPURE snapshot and registry boundary for free-scope. GitHub, YAML, clock and filesystem
@@ -91,9 +92,15 @@ export function defaultGitDirFor(repo, { root = repoRoot, env = process.env } = 
  * Each PR's NET file set from git (xl5oele): the head commit against its merge-base with current `<remote>/<base>`.
  * One fetch brings `<base>` up to date plus every PR head not already present (by `refs/pull/<n>/head`, no ref or
  * FETCH_HEAD written). A failed fetch is not fatal: heads already present are still diffed, and a stale base only
- * widens a set (never narrows it). Returns Map(number → { ok, files, added } | { ok: false, reason }).
+ * widens a set (never narrows it). Memoized review ticks instead require one successful base fetch and
+ * refuse every net read for that checkout after a base-fetch failure. `fetchBase: false` is reserved for
+ * callers whose git adapter intentionally delegates base freshness to daemon self-sync. Returns Map(number → { ok, files, added } | { ok: false, reason }).
  */
-export function readNetFileSets({ dir, rows, git, remote = 'origin', base = 'main' }) {
+export function readNetFileSets(options) {
+  return timeReviewStep('free-scope', () => readNetFileSetsLive(options));
+}
+
+function readNetFileSetsLive({ dir, rows, git, remote = 'origin', base = 'main', fetchBase = true }) {
   const out = new Map();
   const fail = (row, reason) => out.set(row.number, { ok: false, reason });
   if (!dir) { for (const row of rows) fail(row, 'no local checkout of this repo'); return out; }
@@ -102,10 +109,20 @@ export function readNetFileSets({ dir, rows, git, remote = 'origin', base = 'mai
   if (!valid.length) return out;
   const present = (sha) => { try { git(dir, ['cat-file', '-e', `${sha}^{commit}`]); return true; } catch { return false; } };
   const missing = valid.filter((row) => !present(row.headRefOid));
-  try {
-    git(dir, ['fetch', '--quiet', '--no-write-fetch-head', '--end-of-options', remote,
-      `+refs/heads/${base}:refs/remotes/${remote}/${base}`, ...missing.map((row) => `refs/pull/${row.number}/head`)]);
-  } catch { /* offline or a head gone: diff whatever is present; the rest falls back below */ }
+  const fetchArgs = ['fetch', '--quiet', '--no-write-fetch-head', '--end-of-options', remote];
+  const baseRef = `+refs/heads/${base}:refs/remotes/${remote}/${base}`;
+  if (fetchBase && reviewTickMemoEnabled()) {
+    try { fetchReviewMainOnce(JSON.stringify([dir, remote, base]), () => git(dir, [...fetchArgs, baseRef])); }
+    catch { for (const row of valid) fail(row, 'fetch failed'); return out; }
+    // A head first encountered later in the tick still needs its own object fetch.
+    if (missing.length) {
+      try { git(dir, [...fetchArgs, ...missing.map(row => `refs/pull/${row.number}/head`)]); }
+      catch { for (const row of valid) fail(row, 'fetch failed'); return out; }
+    }
+  } else {
+    try { git(dir, [...fetchArgs, baseRef, ...missing.map(row => `refs/pull/${row.number}/head`)]); }
+    catch { /* Preserve the legacy offline fallback outside memoized review ticks. */ }
+  }
   for (const row of valid) {
     try {
       const mergeBase = String(git(dir, ['merge-base', '--end-of-options', `${remote}/${base}`, row.headRefOid])).split('\n')[0].trim();

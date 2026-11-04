@@ -1,0 +1,8 @@
+{
+  "review": {
+    "tick": {
+      "memoize": "on",
+      "stepTimings": "on"
+    }
+  }
+}
