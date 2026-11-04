@@ -266,8 +266,7 @@ describe('author lookup: a gh call TIMEOUT defers like a slot throttle; the defa
   const timedOut = () => Object.assign(new Error('spawnSync gh ETIMEDOUT'), { code: 'ETIMEDOUT', signal: 'SIGKILL', status: null, stderr: '' });
   it('an 8 s call timeout (ETIMEDOUT / SIGKILL) defers the whole read, never a hard pr-author-unreadable', async () => {
     const { withRestAuthors } = await import('../reconcile-pass.mjs');
-    for (const err of [timedOut(), Object.assign(new Error('killed'), { signal: 'SIGKILL', status: null }),
-      Object.assign(new Error('x'), { stderr: 'context deadline exceeded (Client.Timeout exceeded)' })]) {
+    for (const err of [timedOut(), Object.assign(new Error('x'), { stderr: 'context deadline exceeded (Client.Timeout exceeded)' })]) {
       let thrown;
       try { withRestAuthors([{ number: 9700 + Math.floor(Math.random() * 1e4) }], { repo: 'o/r', readRest: () => { throw err; } }); } catch (e) { thrown = e; }
       expect(thrown?.authorLookupDeferred).toBe(true);
@@ -281,6 +280,12 @@ describe('author lookup: a gh call TIMEOUT defers like a slot throttle; the defa
       readShared: () => [{ number: 9801, labels: [], comments: [], statusCheckRollup: [] }], readRest: () => { throw timedOut(); },
       retryOpts: { sleep: () => {}, persist: false, onEvent: () => {} } });
     expect(out.deferred).toBe(true);
+  });
+  it('a bare SIGKILL / killed process (OOM, operator kill) is NOT a timeout: it fails closed', async () => {
+    const { withRestAuthors } = await import('../reconcile-pass.mjs');
+    for (const err of [Object.assign(new Error('killed'), { signal: 'SIGKILL', status: null }), Object.assign(new Error('x'), { killed: true })]) {
+      expect(() => withRestAuthors([{ number: 9803 + Math.floor(Math.random() * 1e4) }], { repo: 'o/r', readRest: () => { throw err; } })).toThrow(/author/);
+    }
   });
   it('a genuine non-timeout failure (HTTP 404) still fails closed', async () => {
     const { withRestAuthors } = await import('../reconcile-pass.mjs');

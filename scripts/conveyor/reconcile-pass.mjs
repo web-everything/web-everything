@@ -330,11 +330,11 @@ const authorByPr = new Map();
 /** Bounds on ONE read's author lookups: the read runs synchronously inside the daemon's event loop, so it may never
  *  wait on dozens of gh slots (live 2026-11-03 17:23 ET: a tick wedged for 18 minutes). Past either bound the read
  *  is deferred (retry next tick); lookups already done stay memoised, so ticks converge. */
-/** The per-call timeout (AUTHOR_LOOKUP_TIMEOUT_MS) kills `gh` (execFileSync: code ETIMEDOUT / signal SIGKILL, no exit status).
+/** The per-call timeout (AUTHOR_LOOKUP_TIMEOUT_MS) kills `gh` (execFileSync: code ETIMEDOUT).
  *  That says nothing about the PR: it defers the read exactly like a slot throttle, it is no hard failure. */
 export function isGhCallTimeout(e) {
   if (!e) return false;
-  if (e.code === 'ETIMEDOUT' || e.signal === 'SIGKILL' || e.killed === true) return true;
+  if (e.code === 'ETIMEDOUT') return true; // execFileSync's own timeout marker; a bare SIGKILL (OOM, operator) is NOT a timeout
   return /\b(ETIMEDOUT|timed out|Client\.Timeout|context deadline exceeded)\b/i.test(`${e.message ?? ''}\n${e.stderr ?? ''}`);
 }
 export const AUTHOR_LOOKUP_BUDGET = 16;
