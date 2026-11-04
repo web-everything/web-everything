@@ -122,6 +122,8 @@ export function runsRetention(o = {}) {
     kept: { young: 0, nonTerminal: 0, resumable: 0, unreadable: 0 }, archived: 0, deleted: 0, bytesFreed: 0, archives: [], errors: [], months: {} };
   const cutoff = Math.min(now - settings.keepDays * DAY, now - 600000); // never younger than 10 minutes
   const ids = listRunIds(dir);
+  const maxFiles = o.maxFiles ?? 1_000_000;
+  if (ids.length > maxFiles) { out.status = 'skipped'; out.scanned = ids.length; out.errors.push(`scan bound exceeded (${ids.length} > ${maxFiles}); raise maxFiles after inspection`); return out; }
   out.scanned = ids.length;
   const byMonth = new Map();
   for (const id of ids) {

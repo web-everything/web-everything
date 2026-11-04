@@ -158,6 +158,12 @@ describe('runsRetention', () => {
     expect(r.errors).toEqual([]); expect(listRunIds(runs)).toEqual(['run-x']);
   });
 
+  it('fails closed past the scan bound', () => {
+    put('run-old', 30);
+    const r = base({ maxFiles: 0 });
+    expect(r.status).toBe('skipped'); expect(listRunIds(runs)).toEqual(['run-old']);
+  });
+
   it('settings: defaults to 14 days / 30 GiB; env overrides; invalid throws', () => {
     expect(resolveRetentionSettings({ env: {}, tool: {} }).keepDays).toBe(14);
     expect(resolveRetentionSettings({ env: { WE_RUNS_RETENTION_KEEP_DAYS: '30' }, tool: {} }).keepDays).toBe(30);
