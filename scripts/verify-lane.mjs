@@ -84,7 +84,7 @@ import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRe
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
-import { SHARD_RUN_SCRIPT, localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
+import { SHARD_RUN_SCRIPT, recordVerifyLocal, localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
 import { startTreeWatchdog } from './lib/tree-watchdog.mjs';
 import { shellQuote, isShardWrapperCommand } from './lib/verify-lane-gate.mjs';
 import { randomBytes } from 'node:crypto';
@@ -628,13 +628,23 @@ const phaseAdmission = verifyPhaseAdmissionEnabled(process.env) && retryableGate
 const admissionPhases = {};
 async function acquireAdmission(phase, command, { forceLocal = false } = {}) {
   let decision = { remote: false, reason: localPhaseReason(command) };
+  // Every phase verify-lane keeps local says why on stderr and leaves a `verify-local:<reason>` fallback row,
+  // so the forge share sees it. A forced local confirmation follows a remote attempt that already counted.
+  const noteLocal = reason => {
+    process.stderr.write(`verify-lane: local admission (${reason})\n`);
+    recordVerifyLocal({ lockRoot: ADMISSION_LOCK_ROOT, reason: `verify-local:${reason}`, command, cwd: REPO, env: process.env });
+  };
+  let preflightRefusal = null;
   if (!forceLocal && !phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: true } }).takeLocalSlot) {
     decision = await decidePhaseRemote({ cwd: REPO, env: process.env, argv: command.split(/\s+/) });
     process.stderr.write(`verify-lane: ${decision.remote ? 'remote' : 'local'} admission (${decision.reason})\n`);
-  } else if (decision.reason !== 'raw-command') {
-    process.stderr.write(`verify-lane: local admission (${decision.reason})\n`);
+    if (!decision.remote) preflightRefusal = decision.reason;
   }
   const plan = phaseAdmissionPlan({ command, cwd: REPO, decision });
+  if (preflightRefusal !== null) {
+    // The nested shard wrapper owns its own admission and rows; only a phase run on this process's slot is recorded here.
+    if (plan.takeLocalSlot) recordVerifyLocal({ lockRoot: ADMISSION_LOCK_ROOT, reason: `verify-local:${preflightRefusal}`, command, cwd: REPO, env: process.env });
+  } else if (!decision.remote && !forceLocal) noteLocal(decision.reason);
   if (!plan.takeLocalSlot) return { ok: false, waitedMs: 0, remote: true, ...plan };
   const routing = phaseAdmission ? phaseAdmissionKind({
     phase, decision: resolvedGate.decision, standardsScoped: resolvedGate.decision.standards?.scoped, env: process.env,

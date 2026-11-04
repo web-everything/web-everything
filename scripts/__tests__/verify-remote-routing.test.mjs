@@ -67,6 +67,7 @@ describe('timeout preservation', () => {
       ranOnPhases: {}, phaseMs: {}, remoteUnconfirmed: false, phaseTimeout: null, vitestAdmittedLocally: false,
       resolvedGate: { decision: { changedFiles: ['scripts/changed.test.mjs'] } },
       slotHeartbeat: null, setInterval: vi.fn(() => ({ unref() {} })), clearInterval: vi.fn(),
+      recordVerifyLocal: vi.fn(),
       heartbeatOwnedSlot: vi.fn(), releaseOwnedSlot: vi.fn(),
       ADMISSION_LOCK_ROOT: '', ADMISSION_CAP: 1, REPO: repo, SLOT_HEARTBEAT_MS: 1000,
       PHASE_TIMEOUT_MS: 60000, MARKER_NONCE_SUFFIX: '', performance,

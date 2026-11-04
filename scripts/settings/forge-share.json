@@ -1,7 +1,7 @@
 {
-  "$comment": "R497 forge share. target (0.9): the share of countable heavy runs that must run on Forge. windowMinutes (60): the trailing window the share is measured over. alertAfterMinutes (60): the share must also have been below target that long ago before forge-share-below-target alerts. expectedLocalReasons: named fallback reasons expected to run locally; they are counted separately and excluded from the share (needs-git is listed ahead of that reason existing).",
+  "$comment": "R497 forge share. target (0.9): the share of countable heavy runs that must run on Forge. windowMinutes (60): the trailing window the share is measured over. alertAfterMinutes (60): the share must also have been below target that long ago before forge-share-below-target alerts. expectedLocalReasons: named fallback reasons expected to run locally; they are counted separately and excluded from the share (needs-git is listed ahead of that reason existing). verify-local:* rows are written by verify-lane for phases it keeps local itself; the two by-design ones (an unrecognised raw command, vitest related) are expected, every preflight refusal stays a counted miss.",
   "target": 0.9,
   "windowMinutes": 60,
   "alertAfterMinutes": 60,
-  "expectedLocalReasons": ["command-not-allowed", "needs-git"]
+  "expectedLocalReasons": ["command-not-allowed", "needs-git", "verify-local:raw-command", "verify-local:vitest-related-local-only"]
 }

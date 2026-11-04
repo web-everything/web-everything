@@ -1,8 +1,8 @@
-import { existsSync, openSync, fstatSync, readSync, closeSync, constants } from 'node:fs';
+import { existsSync, mkdirSync, appendFileSync, openSync, fstatSync, readSync, closeSync, constants } from 'node:fs';
 import { cpus, loadavg } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { dirname, join, resolve } from 'node:path';
-import { admissionLockRoot, admissionBypassReason, poolRootOf, loadAdmissionPolicy, decideRemote, resolveRemoteClient } from '../readiness/heavy-admission.mjs';
+import { basename, dirname, join, resolve } from 'node:path';
+import { admissionLockRoot, admissionBypassReason, poolRootOf, loadAdmissionPolicy, decideRemote, resolveRemoteClient, classifyCommandKind } from '../readiness/heavy-admission.mjs';
 import { defaultPoolRoot } from './lane-pool-paths.mjs';
 import { allowedCommand, allowedEnv } from '../readiness/forge-exec-run.mjs';
 import { verificationInfrastructureFailure } from './lane-verify.mjs';
@@ -92,6 +92,19 @@ export const SHARD_RUN_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'v
 export function localPhaseReason(command) {
   return command.split(' && ').some(segment => /^npx vitest related(?=\s|$)/.test(segment.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '')))
     ? 'vitest-related-local-only' : 'raw-command';
+}
+
+// A phase verify-lane keeps local on its own slot never reaches the nested wrapper, so nothing else records it.
+// One row per decision in remote-fallbacks.jsonl (same shape as heavy-admission's), reason `verify-local:<why>`.
+// Best-effort and bounded: observability must never block the gate.
+export function recordVerifyLocal({ lockRoot, reason, command, cwd, env = process.env, now = Date.now }) {
+  try {
+    const bounded = value => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, '?').slice(0, 4096);
+    const row = { ts: new Date(now()).toISOString(), reason: bounded(reason), detail: null, lane: basename(cwd),
+      kind: classifyCommandKind(String(command), env) };
+    mkdirSync(lockRoot, { recursive: true });
+    appendFileSync(join(lockRoot, 'remote-fallbacks.jsonl'), JSON.stringify(row) + '\n', 'utf8');
+  } catch { /* best-effort */ }
 }
 
 export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
