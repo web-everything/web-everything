@@ -1833,6 +1833,7 @@
   "scripts/conveyor/soak/breaks/merged-prepare-guard-measures-from-merge.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/needs-you-feed-disable.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/nightly-coroner-deadline-stop.soak.test.mjs": 1.4,
+  "scripts/conveyor/soak/breaks/nightly-coroner-never-judges.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/nightly-coroner-retained-failure.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/nightly-coroner-symlinked-lane.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/non-human-referral-hold-never-resumes.soak.test.mjs": 1.48,
