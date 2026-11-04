@@ -29,17 +29,24 @@ vi.mock('../../lib/required-status-checks.mjs', async (importOriginal) => {
 });
 
 describe('defaultReadPrs production list path is cheap and loud (504 incident 2026-11-03)', () => {
-  it('drops author from the snapshot request and fills it per PR through the cached REST reader', async () => {
-    const { defaultReadPrs } = await import('../reconcile-pass.mjs');
+  // PR #6296 (#6254): `author` is now a snapshot field, so the snapshot request asks for it and serves it; only a
+  // row the snapshot gave no author (an older snapshot) is filled per PR through the cached REST reader.
+  it('asks the snapshot for author, serves it, and REST-fills only a row that lacks one', async () => {
+    const { defaultReadPrs, PR_LIST_JSON_FIELDS } = await import('../reconcile-pass.mjs');
     const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
     let asked;
     const rest = vi.fn(() => ({ status: 200, json: { user: { login: 'dependabot[bot]', type: 'Bot' } } }));
     const prs = defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readCommits: () => [],
-      readShared: ({ fields }) => { asked = fields; return [{ number: 7, labels: [], comments: [], statusCheckRollup: [] }]; },
+      readShared: ({ fields }) => { asked = fields; return [
+        { number: 7, labels: [], comments: [], statusCheckRollup: [] },
+        { number: 8, labels: [], comments: [], statusCheckRollup: [], author: { login: 'app/web-everything', is_bot: true } },
+      ]; },
       readRest: rest });
-    expect(asked.split(',')).not.toContain('author');
+    expect(asked.split(',')).toEqual(PR_LIST_JSON_FIELDS.split(','));
+    expect(rest).toHaveBeenCalledTimes(1);
     expect(rest).toHaveBeenCalledWith('repos/o/r/pulls/7', expect.any(Object));
     expect(prs[0].author).toMatchObject({ login: 'dependabot[bot]', is_bot: true });
+    expect(prs[1].author).toEqual({ login: 'app/web-everything', is_bot: true });
   });
   it('falls back to small pages (never a 200-row heavy gh pr list) and surfaces a persistent 504', async () => {
     const { defaultReadPrs } = await import('../reconcile-pass.mjs');
