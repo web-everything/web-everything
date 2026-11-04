@@ -123,4 +123,8 @@ export const DECLARED_HOMES = Object.freeze({
   // own dirty-tree defaults. A skill telling a session to run the generator by hand for a routine refresh is
   // telling it to skip the hash gate and the hand-off record this operation exists to add.
   'docket-refresh': Object.freeze(['we:scripts/gen-decision-docket.mjs']),
+
+  // `runs-retention` (R549) — verified archive-then-delete of terminal run records; the older archive-only tool it
+  // supersedes for deletion is `scripts/archive-retention.mjs` (never deletes without a writer-exclusion provider).
+  'runs-retention': Object.freeze(['we:scripts/archive-retention.mjs']),
 });

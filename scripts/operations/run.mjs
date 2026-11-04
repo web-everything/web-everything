@@ -161,6 +161,8 @@ import { landHumanOnlyOperation, LAND_HUMAN_ONLY_OP, finishLandOutcome } from '.
 import { createLandHumanOnlyReader, createLandHumanOnlySinks } from './land-human-only-io.mjs';
 import { createClearStuckSessionReader, createClearStuckSessionSinks } from './clear-stuck-session-io.mjs';
 import { docketRefreshOperation, DOCKET_REFRESH_OP, finishDocketOutcome } from './docket-refresh.mjs';
+import { runsRetentionOperation, RUNS_RETENTION_OP, finishRunsRetention } from './runs-retention.mjs';
+import { createRunsRetentionSinks } from './runs-retention-io.mjs';
 import { createDocketRefreshReader, createDocketRefreshSinks } from './docket-refresh-io.mjs';
 import { prSweepOperation, PR_SWEEP_OP } from './pr-sweep.mjs';
 import { assessPrSweep, finishPrSweep } from './pr-sweep-core.mjs';
@@ -634,6 +636,12 @@ export const OPERATIONS = Object.freeze({
   // the parseOk:false count + item numbers, so a session sees at a glance whether hand-fill is owed. The publish
   // itself is a session's `Artifact` call (`we:skills-src/decision-docket/SKILL.md`), never this operation. Last
   // stdout line is `publish: owed` or `publish: none`.
+  // R549 — archive (verified read-back) then delete terminal run records older than runs.retention.keepDays; dry run unless --apply.
+  [RUNS_RETENTION_OP]: () => ({
+    declaration: runsRetentionOperation(),
+    sinks: createRunsRetentionSinks(),
+    finish: finishRunsRetention,
+  }),
   [DOCKET_REFRESH_OP]: () => ({
     declaration: docketRefreshOperation({ readFacts: createDocketRefreshReader() }),
     sinks: createDocketRefreshSinks(),

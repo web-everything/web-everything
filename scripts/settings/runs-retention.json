@@ -1,0 +1,12 @@
+{
+  "$comment": "R549 runs retention. Terminal run records older than keepDays are archived (tar+zstd/gzip, verified read-back) to archiveDir/<YYYY-MM>/, then deleted. Overrides: WE_RUNS_RETENTION_KEEP_DAYS, _ARCHIVE_DIR, _MIN_FREE_GIB, _BATCH_MAX_GIB (uncompressed per batch; compressed must stay <= batchMaxCompressedGiB). Never writes to Forge.",
+  "runs": {
+    "retention": {
+      "keepDays": 14,
+      "archiveDir": "~/Library/CloudStorage/GoogleDrive-nic.g.gilbert@gmail.com/My Drive/WE-archive/runs",
+      "minFreeGiB": 30,
+      "batchMaxGiB": 4,
+      "batchMaxCompressedGiB": 2
+    }
+  }
+}

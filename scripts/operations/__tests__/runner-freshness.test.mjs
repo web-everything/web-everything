@@ -124,6 +124,7 @@ describe('runner freshness policy', () => {
         "route-pr-outcome",
         "routing-override",
         "runner-activity",
+        "runs-retention",
         "scaffold",
         "sessions",
         "stage-pr-view",
