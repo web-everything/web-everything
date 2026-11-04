@@ -1,4 +1,3 @@
-import { timeReviewStep, addReviewStep } from '../lib/review-tick-memo.mjs';
 import { greenLedgerDir, hasGreenLedger } from '../lib/lane-verify.mjs';
 import { unread } from './dispatch-eligibility.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
@@ -1534,7 +1533,7 @@ export function enrichPrsWithLedgerHolds(prs, { repo, now = Date.now(), env = pr
   // (a daemon that inherits a stray VITEST must not fail open).
   if ((isUnderTest(env) || isUnderTest()) && step === ledgerHoldStep && !ledgerDeciding(env)) return prs;
   try {
-    const { prs: out, summary } = timeReviewStep('ledger-read', () => step(prs, { repo, now, env }));
+    const { prs: out, summary } = step(prs, { repo, now, env });
     const line = renderLedgerShadowSummary(summary);
     if (line) log(line);
     return out;
@@ -1642,7 +1641,6 @@ export function runReconcilePass({
   // from the PR's own defect. Costs nothing beyond what `readPrs` already fetched when nothing is `ci:failed`.
   // #4501 — `requiredChecks` now threaded through so this enrichment judges the SAME live-required set
   // `planReconcile` uses below, instead of silently falling back to `DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS`.
-  const perPrStarted = Date.now();
   const hydrated = hydrateChecks(rawPrs, {
     repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug, requiredChecks, readChecks, defaultBranch,
   });
@@ -1677,7 +1675,6 @@ export function runReconcilePass({
   const prsBeforeRulings = repoKey === 'we' && mechanicalSetting.mechanicalRoundsCountTowardCap === false
     ? enrichMechanicalRound(prsBeforeMechanical, { defaultBranch }) : prsBeforeMechanical;
   const rulingPrs = enrichPrsWithReviewChurn(enrichStandingRulingGrants(prsBeforeRulings, { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug });
-  addReviewStep('per-PR-loop', Date.now() - perPrStarted);
   const agents = enrich(readAgents({}));
   const mainSha = resolveMainSha(defaultBranch);
   const owedCiRerunSetting = loadOwedCiRerunSettings({ env });

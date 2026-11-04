@@ -132,8 +132,7 @@ describe('review tick plan sharing', () => {
     });
     await effects.tickOnce();
     expect(reconcile).toHaveBeenCalledTimes(reuse === '1' ? 3 : 6);
-    expect(lines.filter(line => line.includes('pass timings:'))).toEqual([expect.stringMatching(/setup=\d+ms list=\d+ms ledger-read=\d+ms per-PR-loop=\d+ms human-surface=\d+ms free-scope=\d+ms label-provider=\d+ms total=\d+ms/)]);
-    expect(lines.filter((l) => l.includes('pass phases'))).toEqual([expect.stringMatching(/total \d+\.\d+s — reap .*facts .*review .*web-everything .*frontierui .*plateau-app .*convert .*prep .*reusePlan=.*source env.*repoConcurrency=3 \(source env\)/)]);
+    expect(lines.filter((l) => l.includes('pass timings'))).toEqual([expect.stringMatching(/total \d+\.\d+s — reap .*facts .*review .*web-everything .*frontierui .*plateau-app .*convert .*prep .*reusePlan=.*source env.*repoConcurrency=3 \(source env\)/)]);
     await effects.tickOnce();
     expect(maps[0]).toBeInstanceOf(Map);
     expect(maps[1]).not.toBe(maps[0]);
@@ -151,8 +150,8 @@ describe('review tick plan sharing', () => {
       runConvertAdvisories: (opts = {}) => { now += 300; },
       runPrepReview: () => { now += 400; }, convertAdvisoryEnabled: true,
     }).tickOnce();
-    expect(lines.filter((line) => line.includes('pass phases'))).toEqual(enabled === '1' ? [
-      'review-daemon: pass phases total 1.0s — reap 0.1s, facts 0.0s, review 0.2s (web-everything 0.2s), convert 0.3s, prep 0.4s · reusePlan=true (source env) repoConcurrency=3 (source env)',
+    expect(lines.filter((line) => line.includes('pass timings'))).toEqual(enabled === '1' ? [
+      'review-daemon: pass timings total 1.0s — reap 0.1s, facts 0.0s, review 0.2s (web-everything 0.2s), convert 0.3s, prep 0.4s · reusePlan=true (source env) repoConcurrency=3 (source env)',
     ] : []);
   });
   it('resolves valid env leaves over platform preferences; rejects invalid values and tolerates broken env access', () => {

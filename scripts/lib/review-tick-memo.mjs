@@ -19,7 +19,7 @@ export function resolveReviewTickSettings({ env = process.env, read = readSettin
 export function withReviewTick(fn, { settings = resolveReviewTickSettings().value.tick,
   log = line => console.error(line), now = Date.now } = {}) {
   const timer = createStepTimer(now), started = now();
-  const context = { active: true, settings, timer, reads: new Map(), mainRuns: new Map(), heads: new Map(), fetches: new Map() };
+  const context = { active: true, settings, timer, mainRuns: new Map(), fetches: new Map() };
   const finish = () => {
     context.active = false;
     if (settings.stepTimings === 'on') log(`review-daemon · pass timings: ${formatTimingsSummary(
@@ -66,55 +66,20 @@ const flag = (args, name) => {
   return i < 0 ? undefined : args[i + 1];
 };
 
-/** Only these expensive reads are reused. Live head-only probes still detect pushes mid-pass.
- * Full argv and checkout scope stay in the key, so field sets, repos and auth routes cannot alias.
- * Writes invalidate all GitHub evidence, including counts, before executing (even a failed write may land).
+/** Only `gh run list --branch main` is reused (once per repo per tick). `gh pr view` and the comments
+ * totalCount are deliberately NOT cached (R549): fresh re-reads and completeness checks must see live data.
  */
 export function memoReviewGh(args, opts, read) {
   const tick = ticks.getStore();
   if (!reviewTickMemoEnabled()) return read();
-  const [command, operation] = args;
-  const graphqlCount = command === 'api' && operation === 'graphql'
-    && args.some(a => a.includes('comments{totalCount}'));
-  const mutation = (command === 'pr' && ['edit', 'comment', 'review', 'merge', 'close', 'reopen', 'ready', 'create'].includes(operation))
-    || (command === 'api' && !graphqlCount && (operation === 'graphql' || args.includes('--input')
-      || ['POST', 'PUT', 'PATCH', 'DELETE'].includes(flag(args, '--method') ?? flag(args, '-X'))));
-  if (mutation) { tick.reads.clear(); return read(); }
+  if (!(args[0] === 'run' && args[1] === 'list' && flag(args, '--branch') === 'main')) return read();
   const repo = flag(args, '--repo') ?? flag(args, '-R') ?? opts.env?.GH_REPO ?? process.env.GH_REPO ?? '';
-  const scope = JSON.stringify([repo, opts.cwd ?? process.cwd(), opts.env ?? null, opts.encoding ?? null]);
-  let identity = null, liveHead = false;
-  if (command === 'pr' && operation === 'view' && /^\d+$/.test(args[2] ?? '')) {
-    identity = `${scope}:${args[2]}`;
-    const fields = flag(args, '--json');
-    liveHead = !!fields?.split(',').includes('headRefOid')
-      && fields.split(',').every(field => ['headRefOid', 'labels'].includes(field));
-    if (!fields) return read();
-  } else if (graphqlCount) {
-    const field = name => args.find(a => a.startsWith(`${name}=`))?.slice(name.length + 1);
-    const slug = `${field('owner')}/${field('name')}`;
-    const countScope = JSON.stringify([slug, opts.cwd ?? process.cwd(), opts.env ?? null, opts.encoding ?? null]);
-    identity = `${countScope}:${field('n')}`;
-    // Without a pinned head a count is not reusable evidence.
-    if (!tick.heads.has(identity)) return read();
-  } else if (!(command === 'run' && operation === 'list' && flag(args, '--branch') === 'main')) return read();
-  const keyFor = () => JSON.stringify([scope, args, identity ? tick.heads.get(identity) ?? null : null]);
-  const cache = identity ? tick.reads : tick.mainRuns;
-  const key = keyFor();
-  if (!liveHead && cache.has(key)) {
-    const hit = cache.get(key);
+  const key = JSON.stringify([repo, args, opts.cwd ?? process.cwd(), opts.env ?? null, opts.encoding ?? null]);
+  if (tick.mainRuns.has(key)) {
+    const hit = tick.mainRuns.get(key);
     if ('error' in hit) throw hit.error;
     return hit.value;
   }
-  let value;
-  try { value = read(); }
-  catch (error) { if (!liveHead) cache.set(key, { error }); throw error; }
-  if (identity && command === 'pr') {
-    try {
-      const head = JSON.parse(String(value))?.headRefOid;
-      if (typeof head === 'string' && head) tick.heads.set(identity, head);
-      else if (!tick.heads.has(identity)) return value;
-    } catch { return value; }
-  }
-  if (!liveHead) cache.set(keyFor(), { value });
-  return value;
+  try { const value = read(); tick.mainRuns.set(key, { value }); return value; }
+  catch (error) { tick.mainRuns.set(key, { error }); throw error; }
 }

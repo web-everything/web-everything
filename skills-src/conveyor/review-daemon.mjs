@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { withReviewTick, timeReviewStep, addReviewStep } from '../../scripts/lib/review-tick-memo.mjs';
 /**
  * @file skills-src/conveyor/review-daemon.mjs
  * @description #3876 (epic #3383) — the standalone Review daemon: reconcile-pass.mjs (discovery) +
@@ -346,7 +345,7 @@ export function resolveReviewTickSharing(env = process.env) {
  */
 export function sweepReviewHolds(opts) {
   let repark;
-  try { repark = timeReviewStep('human-surface', () => sweepHumanSurfaceRepark(opts)) ?? []; } catch (e) {
+  try { repark = sweepHumanSurfaceRepark(opts) ?? []; } catch (e) {
     repark = [{ num: 0, repark: 'sweep-failed', error: String((e && e.message) || e).split('\n')[0] }];
   }
   return [...repark, ...(sweepReviewHoldLabels(opts) ?? [])];
@@ -445,7 +444,7 @@ export function runReviewTick({
   let rawPrsError = null;
   let rawPrsFailed = false;
   if (sharedReads) {
-    try { rawPrs = timeReviewStep('list', () => readPrs({ repo })); } catch (e) { rawPrsError = e; rawPrsFailed = true; }
+    try { rawPrs = readPrs({ repo }); } catch (e) { rawPrsError = e; rawPrsFailed = true; }
   }
   let holdReconcileResults = [];
   let holdReconcileError = null;
@@ -480,7 +479,7 @@ export function runReviewTick({
   try {
     if (sharedReads) {
       if (rawPrsFailed) throw rawPrsError;
-      rawAgents = timeReviewStep('list', () => readAgents({}));
+      rawAgents = readAgents({});
       plan = reconcile({ repo, defaultBranch, readPrs: () => rawPrs, readAgents: () => rawAgents });
     } else {
       plan = reconcile({ repo, defaultBranch });
@@ -1648,7 +1647,7 @@ export function buildCliDaemonEffects({
   let passCount = 0;
   return {
     intervalMs,
-    tickOnce: () => withReviewTick(async () => {
+    tickOnce: async () => {
       const started = Date.now();
       factCache?.resetStats();
       const sharing = resolveReviewTickSharing();
@@ -1684,7 +1683,6 @@ export function buildCliDaemonEffects({
       const warm = await warmReviewFacts(REVIEW_DAEMON_REPOS); // once a tick: refresh the facts mirror from the Worker (not GitHub)
       log.error(`review-daemon: pr-facts ${warm.skipped ? `off (${warm.skipped})` : (warm.warmed ?? []).map((w) => `${w.repo.split('/')[1]}=${w.ok ? 'store' : `github (${w.reason})`}`).join(' ')}`);
       phaseMs.facts = Date.now() - phaseStarted;
-      addReviewStep('setup', phaseMs.reap + phaseMs.facts);
       phaseStarted = Date.now();
       const result = await runReview({ plans, onPlan });
       phaseMs.review = Date.now() - phaseStarted;
@@ -1728,12 +1726,12 @@ export function buildCliDaemonEffects({
       if (sharing.phaseTimings) {
         const seconds = (ms) => `${(ms / 1000).toFixed(1)}s`;
         const repos = Object.entries(result?.perRepoMs ?? {}).map(([repo, ms]) => `${repo.split('/').at(-1)} ${seconds(ms)}`).join(', ');
-        log.error(`review-daemon: pass phases total ${seconds(Date.now() - started)} — reap ${seconds(phaseMs.reap)}, facts ${seconds(phaseMs.facts)}, review ${seconds(phaseMs.review)} (${repos}), convert ${seconds(phaseMs.convert)}, prep ${seconds(phaseMs.prep)} · reusePlan=${sharing.reusePlan} (source ${sharing.source.reusePlan}) repoConcurrency=${sharing.repoConcurrency} (source ${sharing.source.repoConcurrency})${cacheTiming}`);
+        log.error(`review-daemon: pass timings total ${seconds(Date.now() - started)} — reap ${seconds(phaseMs.reap)}, facts ${seconds(phaseMs.facts)}, review ${seconds(phaseMs.review)} (${repos}), convert ${seconds(phaseMs.convert)}, prep ${seconds(phaseMs.prep)} · reusePlan=${sharing.reusePlan} (source ${sharing.source.reusePlan}) repoConcurrency=${sharing.repoConcurrency} (source ${sharing.source.repoConcurrency})${cacheTiming}`);
       }
       passCount += 1;
       logDaemonHeap({ daemon: 'review-daemon', pass: passCount, passMs: Date.now() - started, log });
       return { ...result, sessionReap, convertAdvisory, prepReview };
-    }, { log: line => log.error(line) }),
+    },
     sleep: realSleep,
     heartbeat: () => heartbeatRunnerLease(RUNNER_LOCK_ROOT, owner, { key: REVIEW_DAEMON_LEASE_KEY }),
     onTick: (result) => {

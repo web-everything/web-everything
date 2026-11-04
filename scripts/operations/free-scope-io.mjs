@@ -1,4 +1,4 @@
-import { fetchReviewMainOnce, reviewTickMemoEnabled, timeReviewStep } from '../lib/review-tick-memo.mjs';
+import { fetchReviewMainOnce, reviewTickMemoEnabled } from '../lib/review-tick-memo.mjs';
 /**
  * @file scripts/operations/free-scope-io.mjs
  * @description IMPURE snapshot and registry boundary for free-scope. GitHub, YAML, clock and filesystem
@@ -96,11 +96,7 @@ export function defaultGitDirFor(repo, { root = repoRoot, env = process.env } = 
  * refuse every net read for that checkout after a base-fetch failure. `fetchBase: false` is reserved for
  * callers whose git adapter intentionally delegates base freshness to daemon self-sync. Returns Map(number → { ok, files, added } | { ok: false, reason }).
  */
-export function readNetFileSets(options) {
-  return timeReviewStep('free-scope', () => readNetFileSetsLive(options));
-}
-
-function readNetFileSetsLive({ dir, rows, git, remote = 'origin', base = 'main', fetchBase = true }) {
+export function readNetFileSets({ dir, rows, git, remote = 'origin', base = 'main', fetchBase = true }) {
   const out = new Map();
   const fail = (row, reason) => out.set(row.number, { ok: false, reason });
   if (!dir) { for (const row of rows) fail(row, 'no local checkout of this repo'); return out; }
