@@ -8,7 +8,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ghRestGetJson } from '../gh-rest-read.mjs';
-import { DRAIN_READ_TRANSIENT, DrainReadError, drainRestJson, isTransientReadFailure, readOriginSlug, resolveDrainReadsSource } from '../drain-api-reads.mjs';
+import { DRAIN_READ_TRANSIENT, DrainReadError, drainRestJson, isTransientReadFailure, readAddedFiles, readOriginSlug, resolveDrainReadsSource } from '../drain-api-reads.mjs';
 import { readSharedFreeze, SHARED_FREEZE_FILE } from '../red-main-freeze-shared.mjs';
 import { readNumberingEvidence } from '../card-number-allocator.mjs';
 import { checkBornAsCollision, guardEnqueue } from '../drain-poison-guard.mjs';
@@ -240,5 +240,20 @@ describe('R549 round: pinned repo, strict base64, 20 s freeze bound', () => {
     expect(seen).toEqual([20000]);
     drainRestJson('t', 'repos/{owner}/{repo}/x', { rest: (p, o) => { seen.push(o.execOpts.timeout); return ok({}); }, slug: 'o/r' });
     expect(seen[1]).toBeUndefined();
+  });
+});
+
+describe('added-file read: renamed entries match git-diff addition semantics', () => {
+  const read = (files) => readAddedFiles('main', SHA, { rest: routes({ 'compare/': ok({ files }) }), slug: 'o/r' });
+  it('renamed INTO backlog/ counts as an addition (new path)', () => {
+    expect(read([{ filename: 'backlog/xabc123-new.md', previous_filename: 'drafts/x.md', status: 'renamed' }])).toEqual(['backlog/xabc123-new.md']);
+  });
+  it('renamed OUT of backlog/ is listed only under its new, non-backlog path', () => {
+    const names = read([{ filename: 'archive/x.md', previous_filename: 'backlog/xabc123-new.md', status: 'renamed' }]);
+    expect(names).toEqual(['archive/x.md']);
+    expect(names.some((n) => n.startsWith('backlog/'))).toBe(false);
+  });
+  it('modified is not an addition', () => {
+    expect(read([{ filename: 'backlog/xabc123-new.md', status: 'modified' }, { filename: 'backlog/xdef456.md', status: 'added' }])).toEqual(['backlog/xdef456.md']);
   });
 });

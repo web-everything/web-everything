@@ -136,5 +136,6 @@ export function readAddedFiles(base, headSha, o = {}) {
     // Unknown evidence is never skipped: an entry without a name or a known status could hide an added card.
     if (typeof f?.filename !== 'string' || !KNOWN.has(f.status)) throw new DrainReadError(read, 'api-malformed', 'file entry without a name or a known status');
   }
-  return j.files.filter((f) => f.status === 'added').map((f) => f.filename);
+  // A GitHub `renamed` entry is an addition at its NEW path (the old no-rename git diff counted it so); callers filter by prefix.
+  return j.files.filter((f) => f.status === 'added' || f.status === 'renamed').map((f) => f.filename);
 }
