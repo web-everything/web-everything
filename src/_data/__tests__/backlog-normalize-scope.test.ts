@@ -158,6 +158,76 @@ describe('backlog loader normalizeScope — multi-path entries (R372)', () => {
     expect(normalizeScope(['we:a.mjs b.mjs,fui:c.mjs d.mjs,we:e.mjs f.mjs', 'g.mjs h.mjs']))
       .toEqual(['we:a.mjs', 'we:b.mjs', 'fui:c.mjs', 'fui:d.mjs', 'we:e.mjs', 'we:f.mjs', 'we:g.mjs', 'we:h.mjs']);
   });
+  // send-back (R547/R10/R559) — the loader must split every entry dispatch-lane accepts, or the planner sees one
+  // whitespace-joined string and lease/rival exclusion is bypassed (fail-open; base refused such cards).
+  it('send-back (a) — a disjoint multi-glob entry (the #4557 shape) is split and held by the planner on lease and on rival', () => {
+    const e1 = 'we:scripts/operations/__tests__/explore-io*.test.mjs';
+    const e2 = 'we:scripts/operations/__tests__/dispatch-lane-io*.test.mjs';
+    for (const separator of [' ', ',', '\n']) {
+      const scope = normalizeScope([`${e1}${separator}${e2}`]);
+      expect(scope, JSON.stringify(separator)).toEqual([e1, e2]);
+      for (const touched of ['we:scripts/operations/__tests__/explore-io.test.mjs', 'we:scripts/operations/__tests__/dispatch-lane-io-wiring.test.mjs']) {
+        const leased = dispatchPlan({ queue: [{ num: 1, scope }], leases: [{ lane: 2, scope: [touched] }], freeLanes: [3] });
+        expect(leased.launch, touched).toEqual([]);
+        expect(leased.held[0].reason, touched).toBe('overlaps lane-2');
+        // the same card as the lower-ranked RIVAL of a higher-ranked item that just launched on `touched`
+        const rivals = dispatchPlan({ queue: [{ num: 1, scope: [touched] }, { num: 2, scope }], leases: [], freeLanes: [3, 4] });
+        expect(rivals.launch, touched).toEqual([{ num: 1, lane: 3 }]);
+        expect(rivals.held[0].reason, touched).toBe('overlaps lane-3');
+      }
+    }
+  });
+
+  it('send-back (b) — a mixed-prefix entry is split with each piece canonical, and the fui lease is seen', () => {
+    expect(normalizeScope(['we:src/a*.mjs fui:src/b*.mjs'])).toEqual(['we:src/a*.mjs', 'fui:src/b*.mjs']);
+    expect(normalizeScope(['WE:src/a*.mjs FrontierUI:src/b*.mjs'])).toEqual(['we:src/a*.mjs', 'fui:src/b*.mjs']);
+    expect(normalizeScope(['webeverything:src/a*.mjs,pa:src/b*.mjs'])).toEqual(['we:src/a*.mjs', 'plateau:src/b*.mjs']);
+    const scope = normalizeScope(['we:src/a*.mjs fui:src/b*.mjs']);
+    const fui = dispatchPlan({ queue: [{ num: 1, scope }], leases: [{ lane: 2, scope: ['fui:src/b.mjs'] }], freeLanes: [3] });
+    expect(fui.launch).toEqual([]);
+    expect(fui.held[0].reason).toBe('overlaps lane-2');
+    const we = dispatchPlan({ queue: [{ num: 1, scope }], leases: [{ lane: 2, scope: ['we:src/a.mjs'] }], freeLanes: [3] });
+    expect(we.held[0].reason).toBe('overlaps lane-2');
+    // the same path under the OTHER repo is not a conflict
+    const other = dispatchPlan({ queue: [{ num: 1, scope }], leases: [{ lane: 2, scope: ['plateau:src/b.mjs'] }], freeLanes: [3] });
+    expect(other.launch).toEqual([{ num: 1, lane: 3 }]);
+  });
+
+  // Parity: for every multi-glob entry shape, the loader leaves it unsplit EXACTLY when dispatch-lane refuses it.
+  it.each([
+    // [entry, dispatch accepts?]
+    ['we:scripts/a*.mjs we:scripts/b*.mjs', true],
+    ['we:scripts/operations/__tests__/explore-io*.test.mjs we:scripts/operations/__tests__/dispatch-lane-io*.test.mjs', true],
+    ['we:scripts/__tests__/merge-ai-prs*.test.mjs, we:scripts/__tests__/lane-drain*.test.mjs, we:scripts/__tests__/drain-followup-job-entry.test.mjs', true],
+    ['we:scripts/x.mjs we:scripts/__tests__/x*.test.mjs', true],
+    ['we:src/a*.mjs fui:src/a*.mjs', true],
+    ['we:src/a*.mjs FUI:src/a*.mjs', true],
+    ['src/a*.mjs fui:src/a*.mjs', true],
+    ['we:src/a*.mjs fui:src/b*.mjs src/c*.mjs', true],
+    ['we:src/a*.mjs PA:src/a*.mjs', true],
+    ['we:scripts/a*.mjs we:scripts/ab*.mjs', false],
+    ['we:scripts/a*.mjs we:scripts/a*.mjs', false],
+    ['we:scripts/__tests__/x*.test.mjs WE:scripts/__tests__/x*.test.mjs', false],
+    ['scripts/a*.mjs we:scripts/a*.mjs', false],
+    ['we:scripts/*/a.mjs we:scripts/x/*.mjs', false],
+    ['we:src/a*.mjs fui:src/b*.mjs we:src/ab*.mjs', false],
+    ['frontierui:src/a*.mjs FUI:src/ab*.mjs', false],
+  ])('send-back (c) — loader and dispatch agree on %j (dispatch accepts: %s)', (entry, accepted) => {
+    for (const text of [entry, entry.replace(/, ?/g, ' ')]) {
+      const loaded = normalizeScope([text])!;
+      if (accepted) {
+        const dispatched = normalizeBriefScope([text]);
+        expect(loaded.every((piece) => !/[\s,]/.test(piece)), text).toBe(true); // split into separate entries
+        expect(loaded, text).toEqual(dispatched); // and canonical exactly as dispatch canonicalizes them
+        expect(normalizeBriefScope(loaded), text).toEqual(dispatched); // dispatch re-reads loader output unchanged
+      } else {
+        expect(() => normalizeBriefScope([text]), text).toThrow(/unsafe scope.*glob/);
+        expect(loaded, text).toHaveLength(1); // left unsplit, so dispatch refuses it too (fail closed)
+        expect(() => normalizeBriefScope(loaded), text).toThrow(/unsafe scope.*glob/);
+      }
+    }
+  });
+
   it('splits on whitespace and commas; unprefixed pieces inherit the entry repo prefix', () => {
     expect(normalizeScope(['we:a.mjs b.mjs', 'fui:c.mjs,d.mjs'])).toEqual(['we:a.mjs', 'we:b.mjs', 'fui:c.mjs', 'fui:d.mjs']);
   });

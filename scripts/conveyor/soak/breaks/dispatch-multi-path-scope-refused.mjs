@@ -81,6 +81,21 @@ export default {
         if (!shaped.dispatching || JSON.stringify(shaped.scope) !== JSON.stringify(disjoint)) violations.push(`${kind} did not carry disjoint globs in one entry`);
       } catch (e) { violations.push(`${kind} refused disjoint globs in one entry: ${String(e.message).slice(0, 120)}`); }
     }
+    // send-back (R547): what dispatch accepts, the loader must split — else the planner sees one joined string and
+    // lease/rival exclusion is bypassed. A disjoint-glob entry (backlog #4557) must be held on a lease and a rival.
+    {
+      const disjoint = ['we:scripts/operations/__tests__/explore-io*.test.mjs', 'we:scripts/operations/__tests__/dispatch-lane-io*.test.mjs'];
+      const split = normalizeScope([disjoint.join(' ')]);
+      if (JSON.stringify(split) !== JSON.stringify(disjoint)) violations.push('the loader left a disjoint-glob entry unsplit');
+      else {
+        const touched = ['we:scripts/operations/__tests__/explore-io.test.mjs'];
+        const leased = dispatchPlan({ queue: [{ num: 1, scope: split }], leases: [{ lane: 2, scope: touched }], freeLanes: [3] });
+        if (leased.launch.length || leased.held[0]?.reason !== 'overlaps lane-2') violations.push('a disjoint-glob entry bypassed planner lease exclusion');
+        const rivals = dispatchPlan({ queue: [{ num: 1, scope: touched }, { num: 2, scope: split }], leases: [], freeLanes: [3, 4] });
+        if (rivals.launch.length !== 1 || rivals.held[0]?.reason !== 'overlaps lane-3') violations.push('a disjoint-glob entry bypassed planner rival exclusion');
+      }
+      if (normalizeScope(['we:src/a*b.mjs we:src/ab*.mjs'])?.length !== 1) violations.push('the loader split a glob entry whose globs may meet');
+    }
     for (const scope of [
       ['we:src/a*b.mjs', 'we:src/ab*.mjs'],
       ['we:src/a.mjs', 'we:src/ab*.mjs'],

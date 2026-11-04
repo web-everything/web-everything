@@ -67,6 +67,9 @@ import { op } from './registry.mjs';
 // #3717 — the `taskType` derivation. PURE and import-free, which is why the DECLARATION may hold it.
 import { taskTypeFor } from '../lib/dispatch-task-type.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
+// ONE glob-overlap rule shared with the backlog loader (`src/_data/backlog.js` normalizeScope): a drifted copy let
+// the loader leave dispatch-accepted entries unsplit, which hid them from planner lease/rival exclusion.
+import scopeGlobOverlap from '../lib/scope-glob-overlap.cjs';
 // #3224 — the raw invocation this operation declares over. Declared in ONE place and read by two
 // consumers: `op()` validates its shape here, and the skill-wiring scan reads the same map.
 import { DECLARED_HOMES } from './declared-homes.mjs';
@@ -426,25 +429,10 @@ function refuseMultiPathGlobs(parts, dispatchRepo = 'we') {
   // (`explore-io*` and `dispatch-lane-io*`). Only globs inside ONE authored entry that COULD overlap are refused:
   // the lease matcher cannot judge glob-vs-glob overlap, and flattening would hide that behind a clean list.
   // Cross-entry glob-vs-glob overlap is pre-existing (R412), carded; the lease matcher does not judge it.
-  let inherited = '';
-  const globs = [];
-  for (const piece of parts) {
-    const own = /^[A-Za-z][\w-]*:/.exec(piece)?.[0] ?? '';
-    if (own) inherited = own;
-    if (!/[*?]/.test(piece)) continue;
-    const path = own ? piece.slice(own.length) : piece;
-    const repo = canonicalScopePrefix(inherited ? inherited.slice(0, -1) : dispatchRepo);
-    globs.push({ repo, fixed: path.slice(0, path.search(/[*?]/)) });
-  }
-  // Two globs are provably disjoint only when they sit in different repos or their fixed leading text diverges;
-  // otherwise one fixed prefix starts the other and they may match the same file.
-  const mayMeet = (a, b) => a.repo === b.repo && (a.fixed.startsWith(b.fixed) || b.fixed.startsWith(a.fixed));
-  for (let i = 0; i < globs.length; i += 1) {
-    for (let j = i + 1; j < globs.length; j += 1) {
-      if (mayMeet(globs[i], globs[j])) {
-        throw new Error('dispatch-lane: unsafe scope entry — two globs in one multi-path scope entry could overlap for {{SCOPE}}; use explicit paths, globs with disjoint leading paths, or a directory scope.');
-      }
-    }
+  // The rule itself lives in scripts/lib/scope-glob-overlap.cjs, shared with the backlog loader, which splits an
+  // entry into separate canonical entries exactly when this check passes.
+  if (scopeGlobOverlap.entryGlobsMayMeet(parts, (prefix) => canonicalScopePrefix(prefix || dispatchRepo))) {
+    throw new Error('dispatch-lane: unsafe scope entry — two globs in one multi-path scope entry could overlap for {{SCOPE}}; use explicit paths, globs with disjoint leading paths, or a directory scope.');
   }
 }
 

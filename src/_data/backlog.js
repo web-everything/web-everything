@@ -31,6 +31,7 @@ const LOADER_VERSION = createHash('sha1')
   .update(JSON.parse(readFileSync(require.resolve('gray-matter/package.json'), 'utf8')).version)
   .digest('hex');
 const { normalizeRelatedReport } = require('../../scripts/lib/related-report.cjs');
+const { entryGlobsMayMeet } = require('../../scripts/lib/scope-glob-overlap.cjs');
 const MarkdownIt = require('markdown-it');
 
 const md = new MarkdownIt({ html: true, linkify: true, typographer: true });
@@ -80,10 +81,17 @@ const normalizeScope = (v, defaultPrefix = 'we:') => {
     let repo = defaultPrefix; // bare paths are qualified only after the loader infers the item's locus
     const text = entry == null ? '' : String(entry).trim();
     const pieces = text.split(/[\s,]+/).filter(Boolean);
-    // Two or more globs inside one multi-path entry stay UNSPLIT, so dispatch-lane refuses it (fail closed): the lease
-    // matcher does not judge glob-vs-glob overlap, and flattening would hide that behind a clean-looking list. A file
-    // plus one test glob splits normally (#4701). Keep in step with dispatch-lane's refuseMultiPathGlobs.
-    if (pieces.filter((piece) => /[*?]/.test(piece)).length > 1) { list.push(text); continue; }
+    // An entry whose globs MAY MEET stays UNSPLIT: dispatch-lane refuses exactly those entries (fail closed), since the
+    // lease matcher cannot judge glob-vs-glob overlap and splitting would hide that behind a clean-looking list.
+    // Every other entry (a file plus a test glob, #4701; globs with disjoint leading paths, #4557) is split below into
+    // separate canonical entries, so planner lease/rival exclusion sees each piece. The rule is ONE shared helper,
+    // the one dispatch-lane's refuseMultiPathGlobs calls, so the two can never drift.
+    const repoOf = (prefix) => {
+      if (!prefix) return defaultPrefix.replace(/:$/, '');
+      const key = prefix.toLowerCase();
+      return Object.hasOwn(SCOPE_PREFIX_LOCUS, key) ? SCOPE_LOCUS_PREFIX[SCOPE_PREFIX_LOCUS[key]] : key;
+    };
+    if (entryGlobsMayMeet(pieces, repoOf)) { list.push(text); continue; }
     for (const piece of pieces) {
       // Match dispatch-lane's prefix grammar, including underscores. Keep path case unchanged.
       const own = /^[A-Za-z][\w-]*:/.exec(piece)?.[0] ?? '';
