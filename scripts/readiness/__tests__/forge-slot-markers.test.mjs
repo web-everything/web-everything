@@ -254,11 +254,48 @@ describe('stale remote slot markers (perf10)', () => {
     it('signals once when >= 2 unconfirmed slots are older than the age bound, then throttles', async () => {
       const root = setup({0: {pid: 222, run: RUN_A}, 1: {pid: 223, run: RUN_B}});
       const events = [];
-      const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([]), signal: e => events.push(e)});
+      const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([222, 223]), signal: e => events.push(e)});
       await reaper.step(tel(1));
       await reaper.step(tel(1));
       expect(events).toHaveLength(1);
       expect(events[0]).toMatchObject({kind: 'stuck-slots', detail: {slots: ['slot-0.unconfirmed', 'slot-1.unconfirmed']}});
+    });
+    it('never signals stuck-slots for old markers whose owners are alive (a long remote job is healthy)', async () => {
+      const root = setup({0: {pid: 222, run: RUN_A}, 1: {pid: 223, run: RUN_B}, 2: {pid: 224, run: RUN_C}});
+      const events = [];
+      const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([]), signal: e => events.push(e)});
+      await reaper.step(tel(3, undefined, [going(RUN_A), going(RUN_B), going(RUN_C)]));
+      expect(events).toEqual([]);
+      // one owner dies: still below the minimum of two dead-owner slots
+      const mixed = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([222]), signal: e => events.push(e)});
+      await mixed.step(tel(3, undefined, [going(RUN_A), going(RUN_B), going(RUN_C)]));
+      expect(events).toEqual([]);
+      const two = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([222, 224]), signal: e => events.push(e)});
+      await two.step(tel(3, undefined, [going(RUN_A), going(RUN_B), going(RUN_C)]));
+      expect(events).toHaveLength(1);
+      expect(events[0].detail.slots).toEqual(['slot-0.unconfirmed', 'slot-2.unconfirmed']);
+    });
+    it('throttles a signal kind across reaper instances sharing one remote root', async () => {
+      const root = setup({0: {pid: 222, run: RUN_A}, 1: {pid: 223, run: RUN_B}});
+      const events = [];
+      const make = () => createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([222, 223]), signalEveryMs: 5_000, signal: e => events.push(e)});
+      const recent = [going(RUN_A), going(RUN_B)];
+      await make().step(tel(2, undefined, recent), NOW);
+      await make().step(tel(2, undefined, recent), NOW + 4_999); // a fresh reaper (another wait loop) stays quiet
+      expect(events).toHaveLength(1);
+      await make().step(tel(2, undefined, recent), NOW + 5_000);
+      expect(events).toHaveLength(2);
+    });
+    it('a future-dated or unreadable throttle stamp never suppresses the signal for good', async () => {
+      const root = setup({0: {pid: 222, run: RUN_A}, 1: {pid: 223, run: RUN_B}});
+      const events = [];
+      const recent = [going(RUN_A), going(RUN_B)];
+      const stamp = join(root, '.signal-stuck-slots');
+      for (const content of [JSON.stringify({at: NOW + 86_400_000}), 'not json', '{}']) {
+        writeFileSync(stamp, content);
+        await createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([222, 223]), signal: e => events.push(e)}).step(tel(2, undefined, recent), NOW);
+      }
+      expect(events).toHaveLength(3);
     });
     it('also signals stuck-slots when the old unconfirmed slots have dead owners', async () => {
       const root = setup({0: {pid: 222, run: RUN_A}, 1: {pid: 223, run: RUN_B}});
@@ -284,7 +321,7 @@ describe('stale remote slot markers (perf10)', () => {
       const one = setup({0: {pid: 222, run: RUN_A}});
       const young = setup({0: {pid: 222, ageMs: 60_000}, 1: {pid: 223, ageMs: 60_000}});
       const events = [];
-      for (const root of [one, young]) await createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([]), signal: e => events.push(e)}).step(tel(1));
+      for (const root of [one, young]) await createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([222, 223]), signal: e => events.push(e)}).step(tel(1));
       expect(events).toEqual([]);
     });
     it('signals probe-unknown when a dead-owner slot is kept because the probe failed', async () => {

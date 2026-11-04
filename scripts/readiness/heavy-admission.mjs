@@ -242,7 +242,7 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
   priority: Object.freeze({ mode: 'enforce', repairPatterns: DEFAULT_REPAIR_PATTERNS }),
   remote: Object.freeze({ enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null,
     maxConcurrent: 8, backoffMs: 120000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15,
-    // R475: raise a health event (coroner trigger) when >= stuckMinSlots unconfirmed slots are older than stuckAgeMs,
+    // R475: raise a health event (coroner trigger) when >= stuckMinSlots dead-owner unconfirmed slots are older than stuckAgeMs,
     // or when a slot is kept because the Forge probe was unknown; at most one event per kind per stuckSignalEveryMs.
     stuckMinSlots: 2, stuckAgeMs: 600000, stuckSignalEveryMs: 600000 }),
 });

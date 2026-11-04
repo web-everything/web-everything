@@ -186,10 +186,21 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
   graceMs = MARKER_GRACE_MS, log = () => {}, fs = {readdirSync, statSync, unlinkSync},
   signal = () => {}, idleConfirmMs = 30_000, stuckMinSlots = 2, stuckAgeMs = 600_000, signalEveryMs = 600_000}) {
   const signalledAt = new Map();
+  // The last-signalled time is shared through a stamp under the remote root, so every wait loop (one reaper each) on this
+  // host throttles together. A missing, unreadable or future-dated stamp is ignored: it can only cause an extra advisory
+  // event, never suppress one for good. The in-memory time still throttles this instance when writes fail.
+  const signalStamp = kind => join(root, `.signal-${kind}`);
+  const stampedAt = kind => {
+    let at = signalledAt.get(kind);
+    try { const saved = JSON.parse(readFileSync(signalStamp(kind), 'utf8')).at; if (Number.isFinite(saved) && (at === undefined || saved > at)) at = saved; } catch { /* none yet */ }
+    return at;
+  };
   // R475: tell the health loop (and so the coroner) about a stuck pool; throttled per kind, never throws.
   const raise = (kind, detail, now) => {
-    if (signalledAt.has(kind) && now - signalledAt.get(kind) < signalEveryMs) return;
+    const last = stampedAt(kind);
+    if (last !== undefined && last <= now && now - last < signalEveryMs) return;
     signalledAt.set(kind, now);
+    try { writeFileSync(signalStamp(kind), JSON.stringify({at: now}), {mode: 0o600}); } catch { /* advisory */ }
     try { signal({kind, detail}); } catch { /* advisory */ }
   };
   const firstDead = new Map();
@@ -252,7 +263,9 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
         try { ({mtimeMs, ino} = fs.statSync(file)); } catch { continue; }
         const marker = readMarker(file), index = Number(m[1]);
         if (marker.unreadable) continue;
-        if (now - mtimeMs >= stuckAgeMs) held.push({name, run: marker.run});
+        const gone = ownerGone(root, index, file, liveness, selfPid);
+        // Only an old marker whose owner is provably gone is "stuck": a live owner is a long-running job, not a leak.
+        if (gone && now - mtimeMs >= stuckAgeMs) held.push({name, run: marker.run});
         const key = `${name}:${ino}:${mtimeMs}`; // a replacement marker never inherits a predecessor's death stamp
         if (marker.legacy) {
           // Neither a missing/dead local lock holder nor this host's telemetry proves an unbound job stopped.
@@ -260,7 +273,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
         }
         // Telemetry only speaks for its own Forge host: a marker not provably bound to this host is retained.
         if (marker.host !== host || host === undefined) continue;
-        if (!ownerGone(root, index, file, liveness, selfPid)) { forget(file, key); continue; }
+        if (!gone) { forget(file, key); continue; }
         stampFor(file, key);
         dead.push({name, key, file, mtimeMs, ino, index, run: marker.run, at: marker.at, owner: marker.owner});
       }
