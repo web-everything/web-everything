@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { REFERRAL_CARRY_REASON, AUTO_POLICY_ACTOR, buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
 import {
-  rulingNeeded, ignoredRulings, claimSimilarity, sameFinding, hasSentBack, renderRulingNotAddressed,
+  rulingNeeded, ignoredRulings, unverifiedOnHead, rulingDisputeText, claimSimilarity, sameFinding, hasSentBack, renderRulingNotAddressed,
   fixerRulingBrief, RULING_NOT_ADDRESSED_MARKER,
 } from '../ruling-ledger.mjs';
 
@@ -77,6 +77,46 @@ describe('ignoredRulings', () => {
     expect(ig.escalate).toBe(false);
     expect(ig.matches[0].ruling).toMatch(/pointer files must be listed/);
     expect(ig.matches[0].priorHead).toBe(H1);
+  });
+  describe('re-check carries are unverified on the live head (#6296, #6262)', () => {
+    const carry = (rec, shape) => {
+      const recheck = { status: 'needs re-check on live head', fromHead: H1, head: H2 };
+      return shape === 'referral' ? { ...rec, referrals: rec.referrals.map((f) => ({ ...f, recheck })) }
+        : { ...rec, rechecks: [{ key: rec.referrals[0].key, ...recheck }] };
+    };
+    it.each(['referral', 'record.rechecks'])('%s carry does not prove a regression and still holds acceptance', (shape) => {
+      const current = carry(record({ head: H2, runId: 'run-2' }), shape);
+      const pr = { headRefOid: H2, comments: [...history, comment(current, 20)] };
+      expect(ignoredRulings(pr, { humanAt: 1 })).toBeNull();
+      expect(unverifiedOnHead(pr)).toEqual([{ finding: expect.objectContaining({ key: current.referrals[0].key, file: 'policy/pointer.md' }),
+        runId: 'run-2', priorHead: H1 }]);
+      expect(rulingNeeded(pr, { humanAt: 1 })?.findings).toEqual([expect.objectContaining({ reason: 'pending' })]);
+    });
+    it('without a carry, the same re-list is a real regression', () => {
+      const pr = { headRefOid: H2, comments: [...history, comment(record({ head: H2, runId: 'run-2' }), 20)] };
+      expect(ignoredRulings(pr)?.matches).toHaveLength(1);
+      expect(unverifiedOnHead(pr)).toEqual([]);
+    });
+    it('only the re-confirmed finding escalates; the dispute names the unverified carry', () => {
+      const old = record({ head: H1, runId: 'focus-old', file: 'widget/focus.md', rulings: [block] });
+      const current = record({ head: H2, runId: 'focus-new', file: 'widget/focus.md' });
+      const carried = carry(record({ head: H2, runId: 'run-2' }), 'referral');
+      const pr = { headRefOid: H2, comments: [...history, comment(old, 5), comment(current, 20), comment(carried, 21)] };
+      const ig = ignoredRulings(pr, { humanAt: 1 });
+      expect(ig.matches).toHaveLength(1);
+      expect(ig.matches[0].finding.file).toBe('widget/focus.md');
+      expect(ig.escalate).toBe(true);
+      expect(ig.unverified).toEqual(unverifiedOnHead(pr));
+      expect(ig.unverified).toHaveLength(1);
+      expect(rulingDisputeText(6296, ig)).toContain(' Unverified on head (not re-confirmed by a run on this head): policy/pointer.md:12.');
+    });
+    it('unverified reporting needs a valid head and trusted attempted current-head records', () => {
+      const current = carry(record({ head: H2, runId: 'run-2' }), 'referral');
+      expect(unverifiedOnHead({ headRefOid: '', comments: [comment(current, 20)] })).toEqual([]);
+      expect(unverifiedOnHead({ headRefOid: H3, comments: [comment(current, 20)] })).toEqual([]);
+      expect(unverifiedOnHead({ headRefOid: H2, comments: [comment(current, 20, 'stranger')] })).toEqual([]);
+      expect(unverifiedOnHead({ headRefOid: H2, comments: [comment({ ...current, attempted: false }, 20)] })).toEqual([]);
+    });
   });
   it('matches a reworded claim on the same file, and a drifted line', () => {
     const reworded = 'the policy pointer files are still missing from the standards manifest, so the gate cannot see them';
@@ -385,20 +425,33 @@ describe('ignoredRulings — an older-head block the current-head reviewer ruled
       expect(ignoredRulings({ headRefOid: H3, comments }, { humanAt: 1 })).toBeNull();
       expect(rulingNeeded({ headRefOid: H3, comments })?.findings).toEqual([expect.objectContaining({ reason: 'pending', file: 'policy/pointer.md' })]);
     });
-    it('still came back when the source head ruled it block, left it open, or re-blocked it (controls)', () => {
-      const h3 = comment(recheck(H2, record({ head: H3, runId: 'run-3' })), 20);
-      expect(ignoredRulings({ headRefOid: H3, comments: [...history, comment(r2([]), 10), comment(r2([block]), 12), h3] })?.matches).toHaveLength(1);
-      expect(ignoredRulings({ headRefOid: H3, comments: [...history, comment(r2([]), 10), h3] })?.matches).toHaveLength(1);
-      // carried from the block's own head: the block is the latest ruling in its lineage
-      expect(ignoredRulings({ headRefOid: H2, comments: [...history, comment(recheck(H1, record({ head: H2, runId: 'run-2' })), 20)] })?.matches).toHaveLength(1);
-      // a not-real on H2 that came BEFORE a later block (on H2's own run, superseded) does not clear it
+    it.each(['block', 'open', 'original block', 'reblock', 'auto-policy'])('%s source/control: carried is unverified; a fresh re-raise still escalates', (kind) => {
       const reblock = { ...block, supersedes: ['r0'] };
-      expect(ignoredRulings({ headRefOid: H3, comments: [...history, comment(r2([fixed]), 10), comment(r2([fixed, reblock]), 12), h3] })?.matches).toHaveLength(1);
+      const source = kind === 'block' ? [comment(r2([]), 10), comment(r2([block]), 12)]
+        : kind === 'open' ? [comment(r2([]), 10)]
+        : kind === 'reblock' ? [comment(r2([fixed]), 10), comment(r2([fixed, reblock]), 12)]
+        : kind === 'auto-policy' ? [comment(r2([]), 10), comment(r2([fixed]), 12)] : [];
+      const head = kind === 'original block' ? H2 : H3;
+      const fresh = record({ head, runId: head === H2 ? 'run-2' : 'run-3' });
+      const carried = recheck(kind === 'original block' ? H1 : H2, fresh);
+      const thread = (rec) => ({ headRefOid: head, comments: [...history, ...source, comment(rec, 20),
+        ...(kind === 'auto-policy' ? [autoBlock(rec, 22)] : [])] });
+      if (kind === 'auto-policy') {
+        // an auto-policy block on the carried finding means the gate acted on it on this head: the ladder keeps counting
+        expect(ignoredRulings(thread(carried))?.matches).toHaveLength(1);
+      } else {
+        expect(ignoredRulings(thread(carried))).toBeNull();
+        expect(unverifiedOnHead(thread(carried))).toHaveLength(1);
+      }
+      expect(ignoredRulings(thread(fresh))?.matches).toHaveLength(1);
     });
-    it('an auto-policy block on the current head re-check keeps the ladder (Codex audit control)', () => {
-      const r3 = recheck(H2, record({ head: H3, runId: 'run-3' }));
-      const ig = ignoredRulings({ headRefOid: H3, comments: [...history, comment(r2([]), 10), comment(r2([fixed]), 12), comment(r3, 20), autoBlock(r3, 22)] });
-      expect(ig?.matches).toHaveLength(1);
+    it('a carried finding the head\'s verifier reproduced is re-confirmed and still escalates', () => {
+      const base = record({ head: H3, runId: 'run-3' });
+      const carried = recheck(H2, base);
+      const verified = { ...carried, verified: carried.referrals.map((f) => ({ key: f.key, outcome: 'reproduced' })) };
+      const comments = [...history, comment(r2([]), 10), comment(r2([block]), 12), comment(verified, 20)];
+      expect(ignoredRulings({ headRefOid: H3, comments })?.matches).toHaveLength(1);
+      expect(unverifiedOnHead({ headRefOid: H3, comments })).toEqual([]);
     });
     it('replay #5762 @5eba5a13: no false dispute; the re-checked finding is pending', () => {
       const fx = fixture('pr-5762-5eba5a13-recheck-after-not-real.json');
