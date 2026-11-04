@@ -172,8 +172,10 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 't', at: Date.now() }));
     expect(() => withHeadIndexLock(dir, () => 'no', { waitMs: 60 })).toThrow(/lock busy/);
     expect(existsSync(lock)).toBe(true);
+    // a LIVE owner is never displaced, however old the lock is
     writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 't', at: 0 }));
-    expect(withHeadIndexLock(dir, () => 'old', { staleMs: -1 })).toBe('old');
+    nodeFs.utimesSync(lock, new Date(0), new Date(0));
+    expect(() => withHeadIndexLock(dir, () => 'old', { waitMs: 60, staleMs: 1 })).toThrow(/lock busy/);
   });
   it('releases the lock when the transaction throws', () => {
     const fs = { ...nodeFs, renameSync: () => { throw Error('crash'); } };
@@ -187,18 +189,45 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     rec({ head: H(2), netPatchHash: 'p2', verdict: 'reject', at: '2026-11-04T10:05:00Z' });
     writeFileSync(mp, stale); // a stale map left by a lost race, with an old log size
     expect(headReviewOwed({ index: readHeadIndex({ dir }), repo: 'o/r', pr: 7, head: H(2) })).toMatchObject({ owed: false, verdict: 'reject' });
-    writeFileSync(mp, JSON.stringify({ logBytes: nodeFs.statSync(headIndexPaths(dir).log).size, map: {} }));
+    writeFileSync(mp, JSON.stringify({ version: 2, logHash: 'bad', map: {} }));
     expect(readHeadIndex({ dir }).rebuilt).toBe(true);
   });
-  it('pre-index PR: seeds from the latest reviewed-sha marker; no marker or unreadable is never nothing-owed', () => {
+  it('a same-size corrupted log is never served from the cache; an unreadable log fails closed', () => {
+    rec({ verdict: 'accept' });
+    const { log } = headIndexPaths(dir);
+    const before = nodeFs.statSync(log).size;
+    writeFileSync(log, readFileSync(log, 'utf8').replace('"accept"', '"xxxxxx"'.slice(0, 8)));
+    expect(nodeFs.statSync(log).size).toBe(before);
+    expect(readHeadIndex({ dir }).ok).toBe(true); // rebuilt from the log text, not the stale cache
+    expect(readHeadIndex({ dir }).map['o/r#7'].verdict).toBe('xxxxxx');
+    rmSync(log); nodeFs.mkdirSync(log); // unreadable: stat works, read throws
+    expect(headReviewOwed({ index: readHeadIndex({ dir }), repo: 'o/r', pr: 7, head: H(1) })).toMatchObject({ owed: null, held: true });
+  });
+  it('fencing: a writer that lost its lock refuses to publish', () => {
+    const { lock } = headIndexPaths(dir);
+    expect(() => withHeadIndexLock(dir, fence => { writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'other', at: Date.now() })); fence(); })).toThrow(/lock lost/);
+    rmSync(lock, { force: true });
+    const fs = { ...nodeFs, openSync: (p, f) => { if (f === 'a') writeFileSync(headIndexPaths(dir).lock, JSON.stringify({ pid: process.pid, token: 'thief', at: 1 })); return nodeFs.openSync(p, f); } };
+    // the swap happens as the append opens; the next fence (before the map publish) must refuse
+    expect(() => rec({ fs })).toThrow(/lock lost/);
+    expect(existsSync(headIndexPaths(dir).map)).toBe(false);
+  });
+  it('pre-index PR: seeds only from an accept-shaped verdict with a whole-line marker; anything else is owed', () => {
+    const mk = body => [{ viewerDidAuthor: true, body }];
+    const good = `✅ review — accepted\n\nRecorded by bot.\n<!-- reviewed-sha: ${H(3)} -->\n`;
     const idx = readHeadIndex({ dir });
-    const comments = [{ viewerDidAuthor: true, body: `verdict\n<!-- reviewed-sha: ${H(3)} -->` }];
-    const seed = seedFromReviewComments(comments);
     const base = { index: idx, repo: 'o/r', pr: 5 };
+    const seed = seedFromReviewComments(mk(good));
     expect(seed).not.toBeNull();
     expect(headReviewOwed({ ...base, head: H(3), seed })).toMatchObject({ owed: false, seeded: true });
     expect(headReviewOwed({ ...base, head: H(4), seed })).toMatchObject({ owed: true, reason: 'new-head', seeded: true });
-    expect(seedFromReviewComments([{ author: { login: 'rando' }, body: comments[0].body }])).toBeNull();
+    expect(seedFromReviewComments([{ author: { login: 'rando' }, body: good }])).toBeNull();
+    expect(seedFromReviewComments(mk(`🔁 review — changes requested\n\nRecorded by bot.\nexample: <!-- reviewed-sha: ${H(3)} -->`))).toBeNull();
+    expect(seedFromReviewComments([...mk(good), ...mk(`🔁 review — changes requested\n\nRecorded by bot.\n`)])).toBeNull();
+    expect(seedFromReviewComments(mk(`✅ review — accepted\n\n> <!-- reviewed-sha: ${H(3)} -->\n`))).toBeNull();
+    expect(seedFromReviewComments(mk(`✅ review — accepted\n\n\`\`\`\n<!-- reviewed-sha: ${H(3)} -->\n\`\`\`\n`))).toBeNull();
+    expect(seedFromReviewComments(mk(`✅ review — accepted\n\nsee <!-- reviewed-sha: ${H(3)} --> here\n`))).toBeNull();
+    expect(seedFromReviewComments(mk(`✅ review — accepted\n\n<!-- reviewed-sha: abc1234 -->\n`))).toBeNull();
     expect(seedFromReviewComments([])).toBeNull();
     expect(headReviewOwed({ ...base, head: H(3), seed: null }).owed).toBe(true);
     expect(headReviewOwed({ index: { ok: false }, repo: 'o/r', pr: 5, head: H(3), seed })).toMatchObject({ owed: null, held: true });

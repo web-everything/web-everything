@@ -18,11 +18,12 @@ import { dirname, join } from 'node:path';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
-import { parseReviewedSha } from './review-escalation.mjs';
+import { REVIEWED_SHA_MARKER } from './review-escalation.mjs';
+import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 
 const SHA = /^[0-9a-f]{40}$/;
 export const HEAD_INDEX_STANDARD = Object.freeze({ keepPerPr: 20, logMaxLines: 2000 });
-export const MAP_VERSION = 1;
+export const MAP_VERSION = 2;
 export const LOCK_STALE_MS = 30_000, LOCK_WAIT_MS = 15_000;
 const posInt = v => Number.isSafeInteger(v) && v > 0;
 
@@ -82,21 +83,25 @@ const parseLog = text => {
   }
   return { map, lines: lines.length };
 };
+const hashText = text => createHash('sha256').update(text).digest('hex');
 const size = (fs, p) => { try { return fs.statSync(p).size; } catch (e) { if (e?.code === 'ENOENT') return null; throw e; } };
 
-/** Read the index. O(1) when the map matches the log size; rebuilds from the log otherwise. Never throws. */
+/** Read the index. Uses the cached map only when its log content hash matches; rebuilds from the log otherwise. Never throws. */
 export function readHeadIndex({ dir = defaultHeadIndexDir(), fs = nodeFs } = {}) {
   try {
     const { log, map: mapPath } = headIndexPaths(dir);
     const logSize = size(fs, log);
     let stored = null;
-    try { stored = JSON.parse(fs.readFileSync(mapPath, 'utf8')); } catch (e) { if (e?.code !== 'ENOENT') stored = null; }
+    try { stored = JSON.parse(fs.readFileSync(mapPath, 'utf8')); } catch { stored = null; }
     if (logSize === null) {
       if (!existsSafe(fs, mapPath)) return { ok: true, map: {} };
       return { ok: false, reason: 'index-unreadable' }; // a map with no log is not a state we write
     }
-    if (stored && stored.map && typeof stored.map === 'object' && stored.version === MAP_VERSION && stored.logBytes === logSize && validMap(stored.map)) return { ok: true, map: stored.map };
-    return { ok: true, map: parseLog(fs.readFileSync(log, 'utf8')).map, rebuilt: true };
+    // An unreadable log throws here and fails closed. The cache is trusted only when the log's content hash matches.
+    const text = fs.readFileSync(log, 'utf8');
+    const logHash = hashText(text);
+    if (stored && stored.map && typeof stored.map === 'object' && stored.version === MAP_VERSION && stored.logHash === logHash && validMap(stored.map)) return { ok: true, map: stored.map };
+    return { ok: true, map: parseLog(text).map, rebuilt: true };
   } catch { return { ok: false, reason: 'index-unreadable' }; }
 }
 const existsSafe = (fs, p) => { try { fs.statSync(p); return true; } catch { return false; } };
@@ -111,11 +116,16 @@ const atomicWrite = (fs, path, tmp, text) => { durable(fs, tmp, 'w', text); fs.r
 const sleepMs = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const pidAlive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; } };
 
-/** Exclusive lock file (O_EXCL) holding {pid, token, at}. A lock is stale when older than staleMs or its owner pid is dead. */
+/**
+ * Exclusive lock file (O_EXCL) holding {pid, token, at}. A lock is taken over ONLY when its owner pid is dead (or, for a
+ * holder file that never got written, after staleMs). A live owner is never displaced, however old the lock. `fn` gets a
+ * `fence()` that throws unless the lock file still carries OUR token; call it before every publish.
+ */
 export function withHeadIndexLock(dir, fn, { fs = nodeFs, staleMs = LOCK_STALE_MS, waitMs = LOCK_WAIT_MS, now = Date.now, pid = process.pid } = {}) {
   const { lock } = headIndexPaths(dir);
   const token = `${pid}-${now()}-${Math.random().toString(36).slice(2)}`;
   const deadline = now() + waitMs;
+  const holder = () => { try { return JSON.parse(fs.readFileSync(lock, 'utf8')); } catch { return null; } };
   for (;;) {
     try {
       const fd = fs.openSync(lock, 'wx');
@@ -123,18 +133,17 @@ export function withHeadIndexLock(dir, fn, { fs = nodeFs, staleMs = LOCK_STALE_M
       break;
     } catch (e) {
       if (e?.code !== 'EEXIST') throw e;
-      let held = null, text = null;
-      try { text = fs.readFileSync(lock, 'utf8'); held = JSON.parse(text); } catch { /* unreadable holder: judged by age below */ }
+      const held = holder();
       let age = Infinity;
       try { age = now() - fs.statSync(lock).mtimeMs; } catch { continue; } // vanished: retry
-      const dead = held && Number.isInteger(held.pid) && !pidAlive(held.pid);
-      if (dead || age > staleMs) {
-        // Move the stale lock aside atomically; only one contender wins the rename. Never delete a lock that changed.
+      const dead = held ? Number.isInteger(held.pid) && !pidAlive(held.pid) : age > staleMs; // no readable owner: only after the grace
+      if (dead) {
+        // Move the stale lock aside atomically; only one contender wins the rename. A lock that changed is put back.
         const aside = `${lock}.stale.${token}`;
         try {
           fs.renameSync(lock, aside);
-          let moved = null; try { moved = fs.readFileSync(aside, 'utf8'); } catch { /* gone */ }
-          if (moved !== text && text !== null) { try { fs.linkSync(aside, lock); } catch { /* a newer holder exists; leave it */ } }
+          let moved = null; try { moved = JSON.parse(fs.readFileSync(aside, 'utf8')); } catch { /* unreadable */ }
+          if (moved && held && moved.token !== held.token) { try { fs.linkSync(aside, lock); } catch { /* a newer holder exists */ } }
           try { fs.unlinkSync(aside); } catch { /* best effort */ }
         } catch { /* another contender moved it */ }
         continue;
@@ -143,8 +152,9 @@ export function withHeadIndexLock(dir, fn, { fs = nodeFs, staleMs = LOCK_STALE_M
       sleepMs(10 + Math.floor(Math.random() * 20));
     }
   }
-  try { return fn(); } finally {
-    try { if (JSON.parse(fs.readFileSync(lock, 'utf8')).token === token) fs.unlinkSync(lock); } catch { /* not ours or gone */ }
+  const fence = () => { if (holder()?.token !== token) throw Error('review-head-index: lock lost (fencing token mismatch); refusing to publish'); };
+  try { return fn(fence); } finally {
+    try { if (holder()?.token === token) fs.unlinkSync(lock); } catch { /* not ours or gone */ }
   }
 }
 
@@ -158,10 +168,11 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
   if (!validRecord(rec)) throw Error(`review-head-index: invalid record (repo/pr/head/verdict/at): head=${String(head).slice(0, 12)} verdict=${String(verdict)}`);
   if (!posInt(keepPerPr) || !posInt(logMaxLines)) throw Error('review-head-index: invalid keepPerPr/logMaxLines');
   fs.mkdirSync(dir, { recursive: true });
-  return withHeadIndexLock(dir, () => {  // read, append, compact and publish are ONE transaction
+  return withHeadIndexLock(dir, fence => {  // read, append, compact and publish are ONE transaction
     const { log, map: mapPath, tmp } = headIndexPaths(dir);
     const current = readHeadIndex({ dir, fs });
     if (!current.ok) throw Error('review-head-index: existing index unreadable; refusing to write');
+    fence();
     durable(fs, log, 'a', `${JSON.stringify(rec)}\n`);            // 1. durable log line (fsynced)
     const map = applyRecord(current.map, rec, keepPerPr);       // 2. compacted map, temp then rename
     let lines = fs.readFileSync(log, 'utf8').split('\n').filter(l => l.trim()).length;
@@ -174,10 +185,12 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
         return [...older, { repo: r, pr: p, head: v.lastReviewedHead, netPatchHash: v.netPatchHash, verdict: v.verdict, at: v.at }];
       });
       const text = compact.map(c => `${JSON.stringify(c)}\n`).join('');
+      fence();
       atomicWrite(fs, log, `${log}.tmp`, text);
       lines = compact.length;
     }
-    atomicWrite(fs, mapPath, tmp, JSON.stringify({ version: MAP_VERSION, logBytes: size(fs, log), map }));
+    fence();
+    atomicWrite(fs, mapPath, tmp, JSON.stringify({ version: MAP_VERSION, logHash: hashText(fs.readFileSync(log, 'utf8')), map }));
     return { ok: true, lines };
   }, { fs });
 }
@@ -186,9 +199,30 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
  * Is a review owed for this PR head? Pure. `seed` (from seedFromReviewComments) stands in for a missing record. `index` is the result of readHeadIndex.
  * owed:null + held:true means unknown (fail closed): hold the PR, do not treat it as nothing-owed.
  */
+const ACCEPT_HEAD = /^✅ review — accepted\r?\n/, CHANGES_HEAD = /^(?:🔁 )?(?:human )?review — changes requested\r?\n/;
+const MARKER_LINE = new RegExp(`^<!-- ${REVIEWED_SHA_MARKER}: ([0-9a-f]{40}) -->$`);
+/**
+ * Seed for a pre-index PR: the latest trusted VERDICT comment, and only if it is accept-shaped (heading at byte 0) with a
+ * whole-line full-sha marker among its first lines, outside quotes and code fences. A later changes-requested verdict,
+ * an untrusted author, a quoted/fenced/short/prose marker, or no verdict at all gives null, which means owed.
+ */
 export function seedFromReviewComments(comments) {
-  const head = parseReviewedSha(comments);
-  return head && SHA.test(head) ? { lastReviewedHead: head, verdict: 'marker', source: 'reviewed-sha-marker' } : null;
+  let latest = null;
+  for (const c of Array.isArray(comments) ? comments : []) {
+    if (!isTrustedMarkerAuthor(c)) continue;
+    const body = typeof c?.body === 'string' ? c.body : '';
+    if (ACCEPT_HEAD.test(body)) latest = { kind: 'accept', body };
+    else if (CHANGES_HEAD.test(body)) latest = { kind: 'changes', body };
+  }
+  if (latest?.kind !== 'accept') return null;
+  let fenced = false, found = null;
+  for (const line of latest.body.split(/\r?\n/).slice(0, 12)) {
+    if (/^\s*(```|~~~)/.test(line)) { fenced = !fenced; continue; }
+    if (fenced || /^\s*>/.test(line)) continue;
+    const m = MARKER_LINE.exec(line);
+    if (m) found = m[1];
+  }
+  return found ? { lastReviewedHead: found, verdict: 'marker', source: 'reviewed-sha-marker' } : null;
 }
 
 export function headReviewOwed({ index, repo, pr, head, netPatchHash = null, seed = null } = {}) {
