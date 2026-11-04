@@ -108,17 +108,21 @@ const validET = value => typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\
   && Number.isFinite(Date.parse(value)) && easternTimestamp(Date.parse(value)) === value;
 const duration = n => Number.isSafeInteger(n) && n >= 0;
 // R518: a prepared->running rename can make ONE directory listing miss a live run entirely (neither name seen). The
-// active-run list is only published when two consecutive listings agree; otherwise it is omitted (readers then fall
-// back to the zero-active-runs rule, i.e. fail closed).
+// active-run list is only published when two consecutive listings agree. Otherwise `stable` is false and `count` is the
+// size of the UNION of every listing taken, at least 1 (the churn itself proves a run exists), so a reader that falls
+// back to the zero-active-runs rule never sees a false zero.
 export async function stableActiveRunIds(list,tries=5) {
   const ids=names=>[...new Set(names.filter(n=>/^r-[a-f0-9]{32}\.(prepared|running)$/.test(n)).map(n=>n.slice(0,-n.split('.').pop().length-1)))].sort();
+  const union=new Set();
   let previous=ids(await list());
+  previous.forEach(id=>union.add(id));
   for(let i=1;i<tries;i++){
     const next=ids(await list());
-    if(next.length===previous.length&&next.every((id,j)=>id===previous[j]))return next;
+    next.forEach(id=>union.add(id));
+    if(next.length===previous.length&&next.every((id,j)=>id===previous[j]))return {stable:true,ids:next,count:next.length};
     previous=next;
   }
-  return undefined;
+  return {stable:false,ids:undefined,count:Math.max(1,union.size)};
 }
 export function parseTelemetry(text) {
   if ((!Buffer.isBuffer(text) && typeof text !== 'string') || Buffer.byteLength(text)>65536
@@ -667,11 +671,10 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       recent.push(JSON.parse(await readPinned(join(receipts,name))));
     recent.sort((a,b)=>Date.parse(b.startedAtET)-Date.parse(a.startedAtET)||a.runId.localeCompare(b.runId));
     const cores=cpus().length;
-    const stableIds=await stableActiveRunIds(()=>readdir(receipts));
-    const activeRunIds=stableIds??[...new Set(names.filter(n=>/^r-[a-f0-9]{32}\.(prepared|running)$/.test(n)).map(n=>n.slice(0,-n.split('.').pop().length-1)))].sort();
+    const active=await stableActiveRunIds(()=>readdir(receipts));
     const value={sampledAtET:easternTimestamp(clock()),cores,loadPerCore:loadavg()[0]/cores,
       memFreePct:freemem()/totalmem()*100,
-      activeRuns:activeRunIds.length,...(stableIds?{activeRunIds}:{}),recent:recent.slice(0,50)};
+      activeRuns:active.count,...(active.stable?{activeRunIds:active.ids}:{}),recent:recent.slice(0,50)};
     parseTelemetry(JSON.stringify(value));
     await atomicJSON(join(receipts,'telemetry.json'),value);
     return value;

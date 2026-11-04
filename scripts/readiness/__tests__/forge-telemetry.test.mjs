@@ -25,13 +25,19 @@ describe('R518 telemetry activeRunIds', () => {
 describe('R518 stable active-run listing (audit: one listing can miss a prepared->running rename)', () => {
   const listing = (...rounds) => { let i = 0; return async () => rounds[Math.min(i++, rounds.length - 1)]; };
   it('returns the ids when two consecutive listings agree', async () => {
-    expect(await stableActiveRunIds(listing([A + '.running'], [A + '.running']))).toEqual([A]);
+    expect(await stableActiveRunIds(listing([A + '.running'], [A + '.running']))).toEqual({stable: true, ids: [A], count: 1});
   });
   it('a listing that missed the renamed run is not trusted: it retries until two agree', async () => {
-    expect(await stableActiveRunIds(listing([], [A + '.running'], [A + '.running']))).toEqual([A]);
+    expect(await stableActiveRunIds(listing([], [A + '.running'], [A + '.running']))).toEqual({stable: true, ids: [A], count: 1});
   });
-  it('never stabilising omits the list (readers fall back to the zero-active rule)', async () => {
+  it('never stabilising omits the list and never reports a false zero (union count, at least 1)', async () => {
     let n = 0;
-    expect(await stableActiveRunIds(async () => (n++ % 2 ? [A + '.running'] : []), 4)).toBeUndefined();
+    expect(await stableActiveRunIds(async () => (n++ % 2 ? [A + '.running'] : []), 4)).toEqual({stable: false, ids: undefined, count: 1});
+  });
+  it('a run seen in every listing still counts when another run keeps the listing unstable', async () => {
+    let n = 0;
+    const r = await stableActiveRunIds(async () => [A + '.running', ...(n++ % 2 ? [B + '.running'] : [])], 4);
+    expect(r.stable).toBe(false);
+    expect(r.count).toBe(2);
   });
 });
