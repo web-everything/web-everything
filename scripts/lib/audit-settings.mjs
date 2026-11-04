@@ -1,0 +1,111 @@
+/**
+ * Audit rubric settings (R528, AU1 PR-A). Pure resolution of named decisions through the shared policy cascade.
+ * Trusted source only: the file is read from the RUNNING checkout (derived from this module's location), never
+ * from a candidate diff or the cwd. Env may only TIGHTEN; any unreadable or invalid value resolves to the
+ * strictest option. Inert: nothing in the runtime imports this yet (PR-C wires it).
+ */
+import { readFileSync } from 'node:fs';
+import { fileURLToPath, URL as NodeURL } from 'node:url';
+import { cascadePolicy } from './policy-cascade.mjs';
+
+export const AUDIT_SETTINGS_PATH = fileURLToPath(new NodeURL('../settings/codex-audit.json', import.meta.url));
+/** Built-in race-protected paths; settings and env can only ADD to these. */
+export const GUARD_FLOOR = Object.freeze(['scripts/**/file-locks*', 'scripts/*file-locks*', 'scripts/**/lease*', 'scripts/*lease*',
+  'scripts/**/slot*', 'scripts/*slot*', 'scripts/**/lock-reaper*', 'scripts/*lock-reaper*', 'scripts/**/lane-pool*', 'scripts/*lane-pool*',
+  'scripts/**/merge*', 'scripts/*merge*', 'scripts/**/drain*', 'scripts/*drain*', 'scripts/**/mq*', 'scripts/*mq*']);
+
+// Ordered strictest first; env may only move toward the front.
+const RANKS = Object.freeze({
+  verdictMode: ['shadow', 'model', 'computed'],
+  preExistingMode: ['block', 'prove', 'allow'],
+  releaseStage: ['prod', 'prerelease'],
+});
+export const AUDIT_SETTINGS_ENV = Object.freeze({
+  verdictMode: 'WE_AUDIT_VERDICT_MODE', preExistingMode: 'WE_AUDIT_PREEXISTING_MODE', releaseStage: 'WE_AUDIT_RELEASE_STAGE',
+  raceBlockPaths: 'WE_AUDIT_RACE_BLOCK_PATHS', guardFloorPaths: 'WE_AUDIT_GUARD_FLOOR_PATHS',
+  recheckMax: 'WE_AUDIT_RECHECK_MAX', baseRecheckMax: 'WE_AUDIT_BASE_RECHECK_MAX',
+  requireOnMain: 'WE_AUDIT_CARDS_REQUIRE_ON_MAIN', requirePayBy: 'WE_AUDIT_CARDS_REQUIRE_PAY_BY',
+});
+const MAX_RECHECK = 3;
+const STRICTEST = Object.freeze({ verdictMode: 'shadow', preExistingMode: 'block', releaseStage: 'prod', recheckMax: 0, baseRecheckMax: 0,
+  requireOnMain: true, requirePayBy: true });
+const DEFAULTS = Object.freeze({ verdictMode: 'model', preExistingMode: 'block', releaseStage: 'prerelease', recheckMax: 1, baseRecheckMax: 3,
+  requireOnMain: true, requirePayBy: true });
+
+const isObj = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+const validPaths = v => Array.isArray(v) && v.length <= 256 && v.every(p => typeof p === 'string' && p.trim().length > 0 && p.length <= 512);
+const validHashes = v => Array.isArray(v) && v.length <= 64 && v.every(h => typeof h === 'string' && /^[0-9a-f]{8,128}$/.test(h));
+const validCount = v => Number.isInteger(v) && v >= 0 && v <= MAX_RECHECK;
+const enumOf = key => v => RANKS[key].includes(v);
+const VALID = Object.freeze({ verdictMode: enumOf('verdictMode'), preExistingMode: enumOf('preExistingMode'), releaseStage: enumOf('releaseStage'),
+  recheckMax: validCount, baseRecheckMax: validCount, requireOnMain: v => typeof v === 'boolean', requirePayBy: v => typeof v === 'boolean' });
+
+function readFile(path, read) {
+  try { const v = JSON.parse(read(path, 'utf8')); return isObj(v) && isObj(v.audit) ? { tool: v.audit } : { tool: null, unreadable: true }; }
+  catch { return { tool: null, unreadable: true }; }
+}
+const get = (tool, key) => {
+  const [a, b] = { verdictMode: ['verdict', 'mode'], preExistingMode: ['preExisting', 'mode'], baseRecheckMax: ['preExisting', 'baseRecheckMax'],
+    recheckMax: ['recheck', 'max'], requireOnMain: ['cards', 'requireOnMain'], requirePayBy: ['cards', 'requirePayBy'] }[key] ?? [key];
+  return b === undefined ? tool?.[a] : tool?.[a]?.[b];
+};
+const parseEnv = (key, raw) => {
+  if (typeof raw !== 'string') return undefined;
+  if (['recheckMax', 'baseRecheckMax'].includes(key)) return /^\d+$/.test(raw) ? Number(raw) : undefined;
+  if (['requireOnMain', 'requirePayBy'].includes(key)) return raw === 'true' ? true : raw === 'false' ? false : undefined;
+  return raw;
+};
+/** Is `candidate` at least as strict as `current`? */
+function tighter(key, candidate, current) {
+  if (RANKS[key]) return RANKS[key].indexOf(candidate) <= RANKS[key].indexOf(current);
+  if (key === 'recheckMax' || key === 'baseRecheckMax') return candidate <= current;
+  return candidate === true || current === false;
+}
+
+/**
+ * Resolve the audit settings. `fileRead`/`path`/`platform` are test seams; production passes none.
+ * @returns {{value: object, sources: Record<string,string>, warnings: string[]}}
+ */
+export function resolveAuditSettings({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync, platform, env = process.env, log } = {}) {
+  const warnings = [];
+  const warn = m => { warnings.push(m); try { (log ?? (() => {}))(m); } catch { /* never throws */ } };
+  const { tool, unreadable } = readFile(path, fileRead);
+  let cascade;
+  try { cascade = cascadePolicy('audit', tool, { standard: undefined, platform, env, log }); } catch { cascade = null; }
+  const layered = cascade?.layered ?? {};
+  const value = {}; const sources = {};
+  for (const key of Object.keys(DEFAULTS)) {
+    let v = get(layered, key); let src = 'file';
+    if (v === undefined && !unreadable && cascade) { v = DEFAULTS[key]; src = 'built-in'; }
+    if (unreadable || !cascade || !VALID[key](v)) {
+      if (!(v === undefined && !unreadable)) { warn(`audit setting ${key} unreadable or invalid; using strictest ${JSON.stringify(STRICTEST[key])}`); }
+      v = STRICTEST[key]; src = 'strictest';
+    }
+    // allow is never trusted: it resolves to block.
+    if (key === 'preExistingMode' && v === 'allow') { warn('audit.preExisting.mode=allow resolves to block (the model label is never trusted)'); v = 'block'; }
+    const envRaw = env?.[AUDIT_SETTINGS_ENV[key]];
+    if (envRaw !== undefined) {
+      const e = parseEnv(key, envRaw);
+      if (e !== undefined && VALID[key](e) && !(key === 'preExistingMode' && e === 'allow') && tighter(key, e, v)) { v = e; src = 'env'; }
+      else warn(`env ${AUDIT_SETTINGS_ENV[key]}=${JSON.stringify(envRaw)} ignored (env may only tighten)`);
+    }
+    value[key] = v; sources[key] = src;
+  }
+  // Path lists only ever ADD to the built-in floor; a bad list contributes nothing (the floor remains).
+  for (const [key, layerVal] of [['raceBlockPaths', get(layered, 'raceBlockPaths')], ['guardFloorPaths', get(layered, 'guardFloorPaths')]]) {
+    let list = layerVal === undefined ? [] : layerVal;
+    if (!validPaths(list)) { warn(`audit setting ${key} invalid; built-in floor only`); list = []; }
+    let envList = [];
+    const raw = env?.[AUDIT_SETTINGS_ENV[key]];
+    if (raw !== undefined) {
+      try { const p = JSON.parse(raw); if (validPaths(p)) envList = p; else warn(`env ${AUDIT_SETTINGS_ENV[key]} invalid; ignored`); } catch { warn(`env ${AUDIT_SETTINGS_ENV[key]} invalid; ignored`); }
+    }
+    value[key] = Object.freeze([...new Set([...GUARD_FLOOR, ...list, ...envList])]);
+    sources[key] = envList.length ? 'env' : list.length ? 'file' : 'built-in';
+  }
+  // Prior question hashes only widen what is ACCEPTED, so no env route exists; a bad list is empty.
+  const hashes = get(layered, 'priorQuestionHashes');
+  value.priorQuestionHashes = Object.freeze(hashes === undefined ? [] : validHashes(hashes) ? [...hashes] : (warn('audit setting priorQuestionHashes invalid; none accepted'), []));
+  sources.priorQuestionHashes = hashes === undefined ? 'built-in' : 'file';
+  return { value: Object.freeze(value), sources, warnings };
+}
