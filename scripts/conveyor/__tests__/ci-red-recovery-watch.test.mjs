@@ -275,21 +275,36 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
     expect(result.applied[2]).toMatchObject({ deferred: true, ok: false, budgetExhausted: true });
   });
 
-  it('defers all refreshes without comments when discovery exhausts the tick apply budget', () => {
+  // Review of #6340: with a slow discovery phase (per-PR comment reads) the budget was already spent before the
+  // loop began, so every tick deferred everything and the queue never drained. The first refresh always starts.
+  it('still starts exactly one refresh when discovery alone exhausted the tick apply budget (no starvation)', () => {
+    const prs = [2635, 2636, 2637].map((number) => ({ ...PR_2635, number, headRefName: `lane/d${number}` }));
     let t = 0;
     const refresh = vi.fn(() => ({ ok: true, action: 'rebased' }));
     const postComment = vi.fn();
     const result = sweepCiRedRecovery({
-      readOpenPrs: () => { t += 200; return [PR_2635]; },
+      readOpenPrs: () => { t += 200; return prs; },
       readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
       refresh, postComment, apply: true, now: () => t, applyBudgetMs: 150, maxApplyPerTick: 10,
     });
-    expect(result.dispatch.map((d) => d.prNumber)).toEqual([2635]);
-    expect(refresh).not.toHaveBeenCalled();
-    expect(postComment).not.toHaveBeenCalled();
-    expect(result.applied).toEqual([expect.objectContaining({
-      prNumber: 2635, action: 'deferred', deferred: true, ok: false, budgetExhausted: true,
-    })]);
+    expect(result.dispatch.map((d) => d.prNumber)).toEqual([2635, 2636, 2637]);
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(postComment).toHaveBeenCalledTimes(1);
+    expect(result.applied.map((a) => [a.prNumber, a.action])).toEqual([[2635, 'rebased'], [2636, 'deferred'], [2637, 'deferred']]);
+    expect(result.applied[1]).toMatchObject({ deferred: true, ok: false, budgetExhausted: true });
+  });
+
+  it('a claim-held PR first in line does not use up the progress floor', () => {
+    const prs = [2635, 2636].map((number) => ({ ...PR_2635, number, headRefName: `lane/f${number}` }));
+    let t = 0;
+    const refresh = vi.fn(() => ({ ok: true, action: 'rebased' }));
+    const checkClaim = vi.fn(({ branch }) => (branch === 'lane/f2635' ? { message: 'held' } : null));
+    sweepCiRedRecovery({
+      readOpenPrs: () => { t += 200; return prs; }, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment: vi.fn(), apply: true, now: () => t, applyBudgetMs: 150, maxApplyPerTick: 10, checkClaim,
+    });
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(refresh).toHaveBeenCalledWith('lane/f2636', expect.anything());
   });
 
   it('never refreshes more than maxApplyPerTick PRs in one tick (post-green storm bound)', () => {

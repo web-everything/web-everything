@@ -30,6 +30,15 @@ export default {
     if (refreshed > 2) violations.push({ detail: `${refreshed} refreshes started past a 150 ms budget` });
     const deferred = result.applied.filter((a) => a.deferred).map((a) => a.prNumber);
     if (comments.some((n) => deferred.includes(n))) violations.push({ detail: 'a deferred PR got a rebase comment (burns its cap)' });
+    // Review of #6340: slow discovery (per-PR comment reads) spent the whole budget before the loop began, so every
+    // tick deferred everything forever. At least one refresh must still start.
+    let t2 = 0;
+    const starved = sweepCiRedRecovery({
+      readOpenPrs: () => { t2 += 200; return prs; }, readMainRuns: () => mainRuns, readAheadBy: () => 5, readComments: () => [],
+      refresh: () => ({ ok: true, action: 'rebased' }), postComment: () => {}, checkClaim: () => null, readPriority: () => null,
+      apply: true, now: () => t2, applyBudgetMs: 150, maxApplyPerTick: 8,
+    });
+    if (!starved.applied.some((a) => a.ok)) violations.push({ detail: 'discovery outlasted the budget and the tick refreshed nothing (starvation)' });
     return { violations };
   },
   judge(report) { return report.violations.map((v) => v.detail); },

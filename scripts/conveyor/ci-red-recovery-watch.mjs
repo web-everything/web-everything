@@ -355,7 +355,9 @@ export function sweepCiRedRecovery({
   if (apply) {
     let started = 0;
     for (const d of plan.dispatch) {
-      if (started >= maxApplyPerTick || now() - tickStartedAt >= applyBudgetMs) {
+      // Progress floor: the first refresh of a tick always starts. Discovery (per-PR comment reads) can by itself
+      // outlast the budget; without the floor every tick would defer everything and the queue would never drain.
+      if (started >= maxApplyPerTick || (started >= 1 && now() - tickStartedAt >= applyBudgetMs)) {
         applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, ok: false, action: 'deferred', deferred: true, budgetExhausted: true,
           error: 'tick apply budget spent — left for the next tick (no rebase comment posted, the per-sha cap is untouched)' });
         continue;
