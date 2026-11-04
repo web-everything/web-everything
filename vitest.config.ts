@@ -30,7 +30,7 @@ export default defineConfig({
     // explicit root, so without it they would write real attempts to `~/workspace/.operations/coordination`.
     // prepare-124 S3: the shadow tracer setup file goes FIRST so it snapshots env before vitest.setup.ts strips `WE_*`.
     // Same off switches as the reporter, plus WE_TEST_CACHE_TRACE=0 (it records only; it never skips a test).
-    setupFiles: [...(testTraceEnabled(process.env) ? ['./scripts/test-cache/trace-setup.mjs'] : []), './vitest.setup.ts'],
+    setupFiles: [...(testTraceEnabled(process.env) ? ['./scripts/test-cache/trace-setup.mjs'] : []), ...(process.env.WE_CACHEABILITY_GUARD === '1' ? ['./scripts/ci/test-cacheability-guard.setup.mjs'] : []), './vitest.setup.ts'],
     // prepare-124 S2: SHADOW-ONLY test-result cache. The reporter never skips or changes a test; it records "would
     // skip" next to the real outcome in ~/.cache/we-vitest-results. Absent under CI / GITHUB_ACTIONS / WE_TEST_CACHE=0
     // (no reporter is even constructed). A CLI `--reporter=...` replaces this list, so such runs are not logged.
