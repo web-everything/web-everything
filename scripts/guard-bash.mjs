@@ -172,7 +172,7 @@ import { DECLARED_HOMES } from './operations/declared-homes.mjs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { readdirSync } from 'node:fs';
-import { resolve, dirname, join } from 'node:path';
+import { resolve, dirname, join, isAbsolute } from 'node:path';
 import { LEASE_FILENAME, isLeaseStale, isForeignLease, laneMarkedSlug, assertedLaneSlug, requiredAssertionSlug } from './lib/lane-lease.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 import { usageReportSecretDir, USAGE_REPORT_KEYCHAIN_SERVICE } from './lib/usage-report-secret-paths.mjs';
@@ -1352,6 +1352,8 @@ const SHELL_C_FLAG = /^-[A-Za-z]*c$/;
 // separately-filed follow-up; this expansion must not add a second one).
 const NESTED_DEPTH_CAP = 4;
 const NESTED_NODE_CAP = 64;
+// Possible earlier values of Git-relevant variables checked per git segment; beyond it the target is unknown.
+const ALTERNATE_CHECK_CAP = 16;
 
 /** Index of the `)` that closes the group / command substitution opened at `s[open]` (a `(`), or -1.
  *  Quote-aware and nesting-aware. Pure. */
@@ -1964,22 +1966,748 @@ export function primaryTreeWriteReason(segment) {
 // why a hand-edit here is worse than a primary edit (it silently BLOCKS the daemon's own next rebuild until a
 // person notices, #xpt9fvd; caught+reverted 3x on 2026-09-26).
 
-/** git's `-C <path>` global-flag value, resolved against `cwd` — the effective directory a git invocation
- *  targets when it is NOT simply `cwd` itself (`git -C wev-review-daemon log` reads/writes that clone from
- *  wherever the shell actually sits). Pure — string-only, no fs. Returns `null` when `segment` is not a git
- *  invocation or carries no `-C`, so the caller falls back to `cwd`. Reads the SAME wrapper-peeled,
- *  basename-resolved `canonicalCommand` view `gitSubcommand` does, so a path-qualified/wrapped git
- *  (`/usr/bin/git -C … log`, `env git -C … log`) still resolves.
- *  KNOWN RESIDUAL: git allows REPEATED `-C` (each one relative to the previous); only the first is honoured
- *  here. Every daemon-clone-diagnosis shape this guard has ever seen (`git -C <clone> log`) is a single `-C`,
- *  so this is a documented simplification, not a hole any live shape has hit. */
-function gitDashCTarget(segment, cwd) {
-  const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op);
-  if (!toks.length || toks[0].text !== 'git') return null;
-  for (let i = 1; i < toks.length - 1; i++) {
-    if (toks[i].text === '-C') return resolve(cwd || '.', toks[i + 1].text);
+/** Expand a leading `~` / `~/` with `home`, the shell's HOME where the word is expanded. Null when the
+ *  expansion needs state this hook cannot know: an unset, empty, relative or unresolved HOME, or a
+ *  `~user` / `~+` / `~-` prefix. Words without a leading tilde are returned unchanged. */
+function expandHomeTilde(p, home) {
+  if (typeof p !== 'string' || !p.startsWith('~')) return p;
+  if (p !== '~' && !p.startsWith('~/')) return null;
+  if (typeof home !== 'string' || !isAbsolute(home) || /[$`]/.test(home)) return null;
+  return home + p.slice(1);
+}
+
+/** A word bash brace-expands into several words (`{a,b}`, `{1..3}`). One linear pass (a regex with two
+ *  stars around the separator backtracks quadratically on a long unclosed `{,,,,`). Exposes `.test`. */
+const BRACE_EXPANSION = {
+  test(word) {
+    const s = String(word);
+    let open = -1;
+    let separated = false;
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i];
+      if (ch === '{') { open = i; separated = false; } else if (open < 0) continue;
+      else if (ch === '}') { if (separated) return true; open = -1; }
+      else if (ch === ',' || (ch === '.' && s[i + 1] === '.')) separated = true;
+      else if (/\s/.test(ch)) open = -1;
+    }
+    return false;
+  },
+};
+
+/** The HOME value that leaves every tilde expansion unresolved (`expandHomeTilde` returns null for it). */
+const UNRESOLVED_HOME = '${HOME}';
+
+/** The HOME a tilde in `segment`'s own words expands with. When the command assigns HOME in its own prefix,
+ *  the tilde never trusts a tracked value: it is unresolved, so a mutation through it fails closed. Every
+ *  tilde-reading target site (git flags, config files, the fetch config reader, envDirs) uses this. */
+function tildeHome(segment, configEnv = {}) {
+  return gitLeadingAssignments(segment).some((m) => m[1] === 'HOME') ? UNRESOLVED_HOME : configEnv.HOME;
+}
+
+/** Bash expands a tilde in an assignment value when the assignment runs, with the HOME in effect then.
+ *  Store that expansion; one that needs an unknown HOME keeps a `$` marker, so every target reader
+ *  treats the value as unresolved instead of letting a later HOME retarget it. */
+function assignedValue(raw, home) {
+  if (typeof raw !== 'string' || !raw.startsWith('~')) return raw;
+  return expandHomeTilde(raw, home) ?? `\${HOME}${raw.slice(1)}`;
+}
+
+/** Shared normalization for git flags, inline assignments and exports from earlier segments. `home` is the
+ *  tracked shell HOME (earlier assignments and exports included), never the hook process's own. An
+ *  unavailable HOME or unresolved shell variable leaves the target unknown (null), so mutations fail closed. */
+function absoluteGitTarget(base, p, home) {
+  // Tokens have lost shell quoting here. Do not mistake a literal `$HOME`/`${VAR}` path for evidence
+  // about the shell-expanded target; unknown targets must retain daemon-clone protection.
+  // Globs/brace expansion can select a protected directory; no filesystem or shell-state guess is safe.
+  if (/[$`*?\[{}]/.test(p)) return null;
+  const expanded = expandHomeTilde(p, home);
+  if (expanded === null || /[$`*?\[{}]/.test(expanded)) return null;
+  return resolve(base || '.', expanded);
+}
+
+/** Apply `segment`'s wrapper-prefix assignments to `env` as Bash expands their tildes. The leading run of
+ *  bare assignments is expanded left to right (`HOME=/a GIT_DIR=~/x` gives `/a/x`); operands of env-like
+ *  wrappers see the HOME from before the command (`env HOME=/a GIT_DIR=~/x` keeps the shell HOME). Returns
+ *  every environment that could result: Bash's reading first, then the left-to-right reading when it
+ *  differs, so callers check both and an unexpected shell cannot turn the difference into a bypass. */
+function leadingAssignmentEnvs(env, segment) {
+  const raw = String(segment || '').trim().replace(/^[({]\s*/, '');
+  const words = shellTokens(raw).filter((t) => !t.op).map((t) => t.text);
+  const count = wrapperPrefixLength(words);
+  const bash = { ...env };
+  const sequential = { ...env };
+  const keys = [];
+  let bare = true;
+  // Once this command assigns HOME, a later tilde never trusts a tracked HOME: it stays unresolved.
+  let homeAssigned = false;
+  for (let i = 0; i < count; i++) {
+    const m = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(words[i]);
+    if (!m) { bare = false; continue; }
+    bash[m[1]] = assignedValue(m[2], homeAssigned ? UNRESOLVED_HOME : bare ? bash.HOME : env.HOME);
+    sequential[m[1]] = assignedValue(m[2], homeAssigned ? UNRESOLVED_HOME : sequential.HOME);
+    if (m[1] === 'HOME') homeAssigned = true;
+    keys.push(m[1]);
+  }
+  return keys.some((key) => bash[key] !== sequential[key]) ? [bash, sequential] : [bash];
+}
+
+/** Every directory a git invocation TARGETS, from its GLOBAL options only (those before the subcommand): the
+ *  effective dir first, then EVERY intermediate `-C <path>` target applied in order (each relative to the
+ *  previous, an absolute one resets), plus `--git-dir` / `--work-tree` (both `=` and separate-arg spellings, resolved
+ *  against that effective dir). Pure — string-only, no fs. Returns `[]` when `segment` is not git. A
+ *  subcommand's own `-C` (`git commit -C HEAD`) is NOT a global option and is never read here. Reads the
+ *  SAME wrapper-peeled, basename-resolved `canonicalCommand` view `gitSubcommand` does. A leading `~` in a
+ *  command word is expanded from the tracked shell HOME in `configEnv` (the shell would have, before git saw
+ *  it); a command-local `HOME=` prefix does not change it. Inline assignment values follow
+ *  `leadingAssignmentEnvs`, and every possible reading contributes its targets. */
+function gitTargetDirs(segment, cwd, configEnv = {}) {
+  const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
+  if (!toks.length || toks[0] !== 'git') return [];
+  // Unknown option arity can hide a later target. Never interpret its value as the subcommand.
+  const subIndex = gitSubcommandIndex(toks);
+  if (subIndex < 0) return [null];
+  // Brace expansion (`{-C,<dir>}`) turns one word into several global options: the targets are unknown.
+  if (toks.slice(1, subIndex + 1).some((t) => BRACE_EXPANSION.test(t))) return [null];
+  const home = tildeHome(segment, configEnv);
+  let dir = cwd || '.';
+  let gitDir = null;
+  let workTree = null;
+  const changeDirs = [];
+  const configuredTrees = [];
+  for (let i = 1; i < toks.length; i++) {
+    const t = toks[i];
+    if (t === '-C' && i + 1 < toks.length) {
+      dir = absoluteGitTarget(dir, toks[++i], home);
+      if (dir === null) return [null];
+      changeDirs.push(dir);
+      continue;
+    }
+    if (t.length > 2 && t.startsWith('-C')) { // not valid git, fail closed
+      dir = absoluteGitTarget(dir, t.slice(2), home);
+      if (dir === null) return [null];
+      changeDirs.push(dir);
+      continue;
+    }
+    if (t === '--git-dir' && i + 1 < toks.length) { gitDir = toks[++i]; continue; }
+    if (t === '--work-tree' && i + 1 < toks.length) { workTree = toks[++i]; continue; }
+    if (t.startsWith('--git-dir=')) { gitDir = t.slice('--git-dir='.length); continue; }
+    if (t.startsWith('--work-tree=')) { workTree = t.slice('--work-tree='.length); continue; }
+    let config = null;
+    let fromEnv = false;
+    if (t === '-c') config = toks[++i] || '';
+    else if (t.startsWith('-c')) config = t.slice(2);
+    else if (t === '--config-env') { config = toks[++i] || ''; fromEnv = true; }
+    else if (t.startsWith('--config-env=')) { config = t.slice('--config-env='.length); fromEnv = true; }
+    if (config !== null) {
+      const match = /^core\.worktree=(.*)$/is.exec(config);
+      if (match) configuredTrees.push({ fromEnv, value: match[1] });
+      continue;
+    }
+    if (GIT_VALUE_FLAGS.has(t)) { i += 1; continue; }
+    if (t.startsWith('-')) continue;
+    break; // the subcommand — everything after it is the subcommand's own options
+  }
+  // A later -C must not erase evidence that an earlier target entered a protected clone.
+  // Keep the effective directory first for the config-file target reader.
+  const out = [dir, ...changeDirs];
+  for (const env of leadingAssignmentEnvs(configEnv, segment)) {
+    const envGitDir = gitDir ?? env.GIT_DIR ?? null;
+    const envWorkTree = workTree ?? env.GIT_WORK_TREE ?? null;
+    if (envGitDir !== null) out.push(absoluteGitTarget(dir, envGitDir, home));
+    if (envWorkTree !== null) out.push(absoluteGitTarget(dir, envWorkTree, home));
+    for (const configured of configuredTrees) {
+      const tree = configured.fromEnv ? env[configured.value] ?? null : configured.value;
+      // Git resolves relative core.worktree against its git dir (possibly discovered through a gitfile).
+      // Without filesystem evidence that base is unknown; do not guess the cwd and allow a clone write.
+      out.push(tree === null || (!isAbsolute(tree) && !tree.startsWith('~/') && tree !== '~')
+        ? null : absoluteGitTarget(dir, tree, home));
+    }
+  }
+  return out;
+}
+
+/** git fetch options that SWALLOW the next token, so their value is never read as the remote or a refspec. */
+const GIT_FETCH_VALUE_FLAGS = new Set([
+  '--depth', '--deepen', '--jobs', '-j', '--upload-pack', '--server-option', '-o', '--shallow-since',
+  '--shallow-exclude', '--negotiation-tip', '--filter', '--receive-pack', '--submodule-prefix',
+]);
+
+/** Does a refspec name a local branch destination? Shared by persisted and command-line config. */
+function fetchDestinationIsBranch(spec) {
+  if (/[$`]/.test(spec)) return true; // unresolved shell refspec: it may write a protected branch
+  const sp = spec.replace(/^\+/, '');
+  if (sp.startsWith('^')) return false;
+  const colon = sp.indexOf(':');
+  // Ref directories can alias on case-insensitive filesystems (including common macOS checkouts).
+  const dst = colon < 0 ? '' : sp.slice(colon + 1).toLowerCase();
+  // A wildcard namespace can include refs/heads even when it does not spell that prefix literally.
+  // Compare the fixed prefix conservatively; disjoint namespaces (refs/custom/*, tags, remotes) stay safe.
+  const prefix = dst.split('*', 1)[0];
+  if (dst.includes('*') && ('refs/heads/'.startsWith(prefix) || prefix.startsWith('refs/heads/'))) return true;
+  return !!dst && !/^refs\/(?!heads\/)/.test(dst);
+}
+
+/** Does this `git fetch` segment WRITE a local branch (so, possibly, the clone's checked-out one)? True for
+ *  `--update-head-ok` / `-u` (the flag exists only to let fetch overwrite the checked-out branch) and for any
+ *  refspec whose destination is a local branch: under `refs/heads/`, or unqualified (git resolves a bare
+ *  destination to a branch). Destinations under `refs/remotes/`, `refs/tags/` and other `refs/` namespaces,
+ *  and refspecs with no destination (`fetch origin main`), are fine. Only the repository operand is skipped:
+ *  a later `feature@v1:main` is a refspec, even though it also resembles an SCP repository URL. */
+function fetchWritesLocalBranch(segment, fetchConfig) {
+  if (!Array.isArray(fetchConfig) || fetchConfig.some((spec) => typeof spec !== 'string' || fetchDestinationIsBranch(spec))) return true;
+  const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
+  const subIndex = gitSubcommandIndex(toks);
+  // Brace expansion splits one word into several options or refspecs (`{origin,main:main}`), like `$X`.
+  // Read the segment text: the tokenizer may not keep a brace word as one plain word.
+  if (BRACE_EXPANSION.test(segment) || toks.some((t) => BRACE_EXPANSION.test(t))) return true;
+  let i = 1;
+  while (i < subIndex) {
+    // An unresolved expansion in a global option (attached `-c$X` or separate) can inject a refspec.
+    if (/[$`]/.test(toks[i]) || (GIT_VALUE_FLAGS.has(toks[i]) && /[$`]/.test(toks[i + 1] || ''))) return true;
+    // `git -c remote.<n>.fetch=<refspec> fetch <n>` injects a configured refspec
+    const kv = toks[i] === '-c' ? toks[i + 1] || '' : toks[i].startsWith('-c') ? toks[i].slice(2) : '';
+    const cfg = /^remote\.[^=]*\.fetch=(.*)$/is.exec(kv);
+    if (cfg && fetchDestinationIsBranch(cfg[1])) return true;
+    i += GIT_VALUE_FLAGS.has(toks[i]) ? 2 : 1;
+  }
+  let repositorySeen = false;
+  let options = true;
+  for (i = subIndex + 1; i < toks.length; i++) {
+    const t = toks[i];
+    if (options && t === '--') { options = false; continue; }
+    if (options) {
+      // An option word holding an unresolved expansion, its value attached (`--opt=$X`, `-o$X`) or not
+      // (`--$X`), gets the same check as a separate value: its expanded bytes are unknown here.
+      if (t.startsWith('-') && /[$`]/.test(t)) return true;
+      const flag = t.split('=')[0];
+      // Git accepts unambiguous long-option abbreviations.
+      if ((flag.length >= 10 && '--update-head-ok'.startsWith(flag)) || t === '-u' || /^-[A-Za-z0-9]*u[A-Za-z0-9]*$/.test(t)) return true;
+      if (flag.length >= 5 && '--stdin'.startsWith(flag)) return true; // refspec bytes are unavailable to this hook
+      if (flag.length >= 6 && '--refmap'.startsWith(flag)) {
+        const spec = t.includes('=') ? t.slice(t.indexOf('=') + 1) : toks[++i] || '';
+        if (fetchDestinationIsBranch(spec)) return true;
+        continue;
+      }
+      if (flag.length >= 6 && '--repo'.startsWith(flag)) {
+        if (!t.includes('=')) i += 1;
+        repositorySeen = true;
+        continue;
+      }
+      if (GIT_FETCH_VALUE_FLAGS.has(t)) {
+        if (/[$`]/.test(toks[++i] || '')) return true;
+        continue;
+      }
+      if (/^-[^-].+/.test(t)) {
+        // Parse the bundle individually. Value-taking/unknown letters leave its reading uncertain.
+        if ([...t.slice(1)].some((flag) => !'aPfkpqvnt46'.includes(flag))) return true;
+        continue;
+      }
+      if (t.startsWith('-')) continue;
+    }
+    if (/[$`]/.test(t)) return true; // even an unknown repository word can expand into extra refspecs
+    if (!repositorySeen) { repositorySeen = true; continue; }
+    if (fetchDestinationIsBranch(t)) return true;
+  }
+  return false;
+}
+
+/** Config/remote have both read and write forms. Allow explicit reads and legacy bare-key reads; conflicting or unknown
+ *  flags fail closed so `config --get --add …` cannot disguise a mutation as a read. */
+function gitConfigOrRemoteWrites(segment, sub) {
+  const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
+  const args = toks.slice(gitSubcommandIndex(toks) + 1);
+  if (sub === 'remote') {
+    if (!args.length || args.every((a) => a === '-v' || a === '--verbose')) return false;
+    const rest = args.filter((a) => a !== '-v' && a !== '--verbose');
+    if (rest[0] === 'get-url') return rest.slice(1).some((a) => a.startsWith('-') && !['--push', '--all', '--'].includes(a));
+    if (rest[0] === 'show') return rest.slice(1).some((a) => a.startsWith('-') && !['-n', '--'].includes(a));
+    return true;
+  }
+  let read = false;
+  const positionals = [];
+  let options = true;
+  const reads = new Set(['--get', '--get-all', '--get-regexp', '--get-urlmatch', '--list', '-l']);
+  const flags = new Set(['--global', '--system', '--local', '--worktree', '--includes', '--no-includes',
+    '--show-origin', '--show-scope', '--null', '-z', '--name-only', '--fixed-value',
+    '--bool', '--int', '--bool-or-int', '--path', '--expiry-date', '--all', '--regexp', '--show-names']);
+  const values = new Set(['--file', '--fil', '-f', '--blob', '--type', '--default', '--value', '--url']);
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (options && a === '--') { options = false; continue; }
+    if (!options) { positionals.push(a); continue; }
+    if (i === 0 && (a === 'get' || a === 'list')) { read = true; continue; }
+    if (reads.has(a)) { read = true; continue; }
+    if (!a.startsWith('-')) { positionals.push(a); continue; }
+    if (a.startsWith('-f') && a.length > 2) continue;
+    const flag = a.split('=')[0];
+    if (values.has(flag)) { if (!a.includes('=')) i += 1; continue; }
+    if (!flags.has(flag)) return true;
+  }
+  // A valid legacy key contains a section separator. Requiring it also keeps single-word modern
+  // mutation verbs such as `edit` from being mistaken for a legacy read.
+  return !read && !(positionals.length === 1 && positionals[0].includes('.'));
+}
+
+/** Read assignments from the same wrapper prefix that canonicalCommand peels, never ordinary arguments. */
+function gitLeadingAssignments(segment) {
+  const raw = String(segment || '').trim().replace(/^[({]\s*/, '');
+  const words = shellTokens(raw).filter((t) => !t.op).map((t) => t.text);
+  return words.slice(0, wrapperPrefixLength(words))
+    .map((word) => /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(word)).filter(Boolean);
+}
+
+/** `git config --file` / `-f` and its GIT_CONFIG equivalent select a write target independently of cwd. */
+function gitConfigFileTargets(segment, dir, configEnv) {
+  const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
+  const args = toks.slice(gitSubcommandIndex(toks) + 1);
+  const targets = [];
+  const home = tildeHome(segment, configEnv);
+  for (let i = 0; i < args.length; i++) {
+    const t = args[i];
+    if (t === '--file' || t === '--fil' || t === '-f') targets.push(absoluteGitTarget(dir, args[++i] || '', home));
+    else if (/^--file?=/.test(t)) targets.push(absoluteGitTarget(dir, t.slice(t.indexOf('=') + 1), home));
+    else if (/^-[^-]/.test(t)) {
+      // Read short bundles letter by letter. Retain the attached-value reading as well as
+      // the separate operand when the suffix could itself be flags: uncertainty never clears a target.
+      for (let j = 1; j < t.length; j++) {
+        if (t[j] !== 'f') continue;
+        const suffix = t.slice(j + 1);
+        if (suffix) targets.push(absoluteGitTarget(dir, suffix, home));
+        if (!suffix || /^[zl]+$/.test(suffix)) targets.push(absoluteGitTarget(dir, args[++i] || '', home));
+        break;
+      }
+    }
+  }
+  const scopes = [['GIT_CONFIG', null], ['GIT_CONFIG_GLOBAL', '--global'], ['GIT_CONFIG_SYSTEM', '--system']];
+  const globalScope = args.some((a) => a.length >= 3 && '--global'.startsWith(a));
+  for (const env of leadingAssignmentEnvs(configEnv, segment)) {
+    for (const [key, flag] of scopes) {
+      if (env[key] && (!flag || args.some((a) => a.length >= 3 && flag.startsWith(a)))) targets.push(absoluteGitTarget(dir, env[key], home));
+    }
+    if (globalScope && !env.GIT_CONFIG_GLOBAL) {
+      // Without GIT_CONFIG_GLOBAL, git writes its global file under the HOME (or XDG_CONFIG_HOME) the git
+      // process sees, a command-local prefix included. An unknown value leaves the target unknown.
+      const files = [[env.HOME, '.gitconfig'], env.XDG_CONFIG_HOME ? [env.XDG_CONFIG_HOME, 'git/config'] : [env.HOME, '.config/git/config']];
+      for (const [base, file] of files) {
+        targets.push(typeof base !== 'string' || !base || /[$`]/.test(base) ? null : resolve(dir || '.', base, file));
+      }
+    }
+  }
+  return targets;
+}
+
+/** Impure CLI adapter: Git itself reads effective fetch configuration, including includes, worktree config,
+ *  command-line -c/--config-env and inherited environment. Never fetches or writes. Fail closed on errors,
+ *  oversized output or timeout; the normal lane/overlay remedy remains available in the denial message.
+ *  The pure predicates receive the resulting refspec array (or null), not filesystem access. */
+export function readDaemonFetchConfig(segment, cwd, envDirs = [], configEnv = {}, run = execFileSync) {
+  // Earlier-segment env targets have lost their variable names in decide's conservative envDirs view.
+  // Do not read the lane's config and mistake it for proof about that other repository.
+  if (envDirs.length) return null;
+  const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
+  const subIndex = gitSubcommandIndex(toks);
+  if (subIndex < 0 || toks[subIndex] !== 'fetch') return null;
+  const globals = toks.slice(1, subIndex);
+  // execFileSync does no shell expansion. Normalize target values with the same tracked shell HOME as
+  // gitTargetDirs, preserving option order and leaving config payloads untouched.
+  const home = tildeHome(segment, configEnv);
+  for (let i = 0; i < globals.length; i++) {
+    const token = globals[i];
+    if (['-C', '--git-dir', '--work-tree'].includes(token)) {
+      const value = globals[++i];
+      if (value === undefined) continue;
+      if (/[$`]/.test(value)) return null;
+      if (value.startsWith('~')) {
+        globals[i] = absoluteGitTarget(cwd, value, home);
+        if (globals[i] === null) return null;
+      }
+    } else if (/^--(?:git-dir|work-tree)=/.test(token)) {
+      const equal = token.indexOf('=');
+      const value = token.slice(equal + 1);
+      if (/[$`]/.test(value)) return null;
+      if (value.startsWith('~')) {
+        const target = absoluteGitTarget(cwd, value, home);
+        if (target === null) return null;
+        globals[i] = token.slice(0, equal + 1) + target;
+      }
+    } else if (GIT_VALUE_FLAGS.has(token)) i += 1;
+  }
+  // Inline assignments with more than one possible reading leave the repository unknown.
+  const readings = leadingAssignmentEnvs(configEnv, segment);
+  if (readings.length !== 1) return null;
+  const effective = { ...process.env, ...readings[0] };
+  // Resolve --config-env to inert argv data. Never forward arbitrary named variables (PATH,
+  // loader variables, GIT_EXEC_PATH, etc.) just because the candidate uses them as config values.
+  for (let i = 0; i < globals.length; i++) {
+    const token = globals[i];
+    if (token === '--config-env' || token.startsWith('--config-env=')) {
+      const pair = token === '--config-env' ? globals[i + 1] : token.slice('--config-env='.length);
+      const equal = pair?.indexOf('=') ?? -1;
+      if (equal < 1) return null;
+      const value = effective[pair.slice(equal + 1)];
+      if (typeof value !== 'string' || /[$`]/.test(value)) return null;
+      globals.splice(i, token === '--config-env' ? 2 : 1, '-c', `${pair.slice(0, equal)}=${value}`);
+      i += 1;
+    } else if (GIT_VALUE_FLAGS.has(token)) i += 1;
+  }
+  const env = { GIT_OPTIONAL_LOCKS: '0' };
+  const configKeys = /^(?:HOME|XDG_CONFIG_HOME|GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_CEILING_DIRECTORIES|GIT_DISCOVERY_ACROSS_FILESYSTEM|GIT_CONFIG_GLOBAL|GIT_CONFIG_SYSTEM|GIT_CONFIG_NOSYSTEM|GIT_CONFIG_PARAMETERS|GIT_CONFIG_COUNT|GIT_CONFIG_KEY_\d+|GIT_CONFIG_VALUE_\d+)$/;
+  for (const [key, value] of Object.entries(effective)) {
+    if (configKeys.test(key) && value !== undefined) {
+      if (/[$`]/.test(value)) return null;
+      env[key] = value;
+    }
+  }
+  // An undefined tracked value is an unset tombstone: do not resurrect the inherited process value.
+  for (const key of Object.keys(env)) if (env[key] === undefined) delete env[key];
+  // Git reads global fetch config under HOME; an unresolved value cannot be read faithfully.
+  if (/[$`]/.test(env.HOME ?? '')) return null;
+  for (const key of ['GIT_DIR', 'GIT_WORK_TREE']) {
+    if (env[key] === undefined) continue;
+    if (/[$`]/.test(env[key])) return null;
+    if (env[key].startsWith('~')) {
+      env[key] = absoluteGitTarget(cwd, env[key], home);
+      if (env[key] === null) return null;
+    }
+  }
+  // GIT_CONFIG selects a file for `git config` ONLY; `git fetch` ignores it. Leaving it in this read would
+  // let a safe decoy hide the repository's actual branch-writing fetch config.
+  delete env.GIT_CONFIG;
+  try {
+    const output = run('/usr/bin/git', [...globals, '--no-pager', 'config', '--null', '--get-regexp', '^remote\\..*\\.fetch$'], {
+      cwd: cwd || '.', env, encoding: 'utf8', timeout: 2000, maxBuffer: 128 * 1024,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    if (!output) return [];
+    if (!output.endsWith('\0')) return null;
+    return output.slice(0, -1).split('\0').map((entry) => {
+      const newline = entry.indexOf('\n');
+      if (newline < 0) throw new Error('incomplete git config entry');
+      return entry.slice(newline + 1);
+    });
+  } catch (err) {
+    return err?.status === 1 && !err.signal && !err.stdout ? [] : null;
+  }
+}
+
+/** Environment names that make even a "read" git command run code or write a file: an external diff, any
+ *  `*_COMMAND` hook, a pager (`PAGER`/`GIT_PAGER`, and less's own `LESSOPEN`/`LESSCLOSE` preprocessors), editors,
+ *  askpass/ssh programs, an exec path, `GIT_TRACE*` (a path value appends to that file) and config injection.
+ *  ONE list, iterated whole by its test, so a new name is added here rather than in a second regex. */
+export const GIT_CODE_ENV = Object.freeze([
+  /^GIT_EXTERNAL_DIFF$/, /^GIT_\w*_COMMAND$/, /^(?:GIT_)?PAGER$/, /^LESS(?:OPEN|CLOSE)$/,
+  /^GIT_(?:SEQUENCE_)?EDITOR$/, /^(?:GIT|SSH)_ASKPASS$/, /^GIT_SSH$/, /^GIT_EXEC_PATH$/, /^GIT_TRACE\w*$/,
+  /^GIT_CONFIG(?:_\w+)?$/,
+]);
+
+/** Is `word` (`NAME=value`) an assignment of a GIT_CODE_ENV name to a value that can run code or write a file?
+ *  Only plain literal values that do neither are exempt: a pager of `cat`/`less`/`more`/empty, and a GIT_TRACE*
+ *  of off/on/an fd number (a path writes a file). Anything with an expansion is never exempt. */
+export function gitCodeEnvAssignment(word) {
+  const m = /^([A-Za-z_]\w*)=(.*)$/s.exec(String(word));
+  if (!m || !GIT_CODE_ENV.some((re) => re.test(m[1]))) return false;
+  const value = m[2];
+  if (/[$`]/.test(value)) return true;
+  // A pager that is a bare `cat`, or `less`/`more` with plain flags, runs nothing else.
+  if (/^(?:GIT_)?PAGER$/.test(m[1])) return !/^(?:|cat|(?:less|more)(?:\s+-[A-Za-z0-9]+)*)$/.test(value);
+  if (/^GIT_TRACE\w*$/.test(m[1])) return !/^(?:|0|1|[2-9]|true|false)$/i.test(value);
+  // Switching the system config off, or pointing a config file at /dev/null, adds no config.
+  if (m[1] === 'GIT_CONFIG_NOSYSTEM') return false;
+  if (/^GIT_CONFIG(?:_GLOBAL|_SYSTEM)?$/.test(m[1]) && value === '/dev/null') return false;
+  return true;
+}
+
+/** Wrapper programs that run a SEPARATE child command: their own options and operands come first, then the child.
+ *  Some options change the child's directory (`env -C/--chdir`, `sudo -D/--chdir`) or hide it in one string
+ *  (`env -S`, `flock -c`, `npx -c`). */
+const DAEMON_CHILD_WRAPPERS = new Set(['env', 'time', 'command', 'builtin', 'nice', 'sudo', 'doas', 'xargs', 'npx',
+  'bunx', 'timeout', 'nohup', 'exec', 'setsid', 'stdbuf', 'ionice', 'chrt', 'taskset', 'caffeinate', 'unbuffer',
+  'flock', 'watch', 'nsenter', 'unshare', 'chpst', 'arch']);
+// Short option letters that take a value (attached or as the next word), per wrapper (GNU and BSD/macOS spellings).
+const WRAPPER_SHORT_VALUE = {
+  env: 'uCSPLa', sudo: 'acugUDpCrtTRh', doas: 'uC', nice: 'n', ionice: 'cnp', timeout: 'sk', stdbuf: 'ioe',
+  xargs: 'IdELnPsaJRS', exec: 'a', caffeinate: 'tw', flock: 'wEc', npx: 'pc', bunx: 'pc', watch: 'nq',
+  time: 'fo', chrt: 'TPD',
+};
+// Short option letters known to take NO value. A letter in neither table is unmodelled: the peel is then uncertain
+// and the any-word writer scan below is the backstop (an unmodelled option's value may be read as the child).
+const WRAPPER_SHORT_FLAG = {
+  env: 'i0v', sudo: 'AbBEHiKklnPSsVv', doas: 'Lns', nice: '', ionice: 't', timeout: 'v', stdbuf: '',
+  xargs: '0ortpx', exec: 'cl', caffeinate: 'dimsu', flock: 'sxunoF', npx: 'y', bunx: 'y', watch: 'bcegptx',
+  time: 'pav', chrt: 'abdefimorRv', command: 'p', builtin: '', setsid: 'cfw', nohup: '', taskset: 'acp', unbuffer: 'p',
+};
+// Long options that take the NEXT word as their value when written without `=`.
+const WRAPPER_LONG_VALUE = new Set(['--unset', '--user', '--group', '--host', '--prompt', '--close-from', '--role',
+  '--type', '--command-timeout', '--other-user', '--signal', '--kill-after', '--delimiter', '--eof', '--max-lines',
+  '--max-args', '--max-procs', '--max-chars', '--arg-file', '--replace', '--input', '--output', '--error',
+  '--adjustment', '--class', '--classdata', '--pid', '--package', '--call', '--command', '--interval', '--timeout',
+  '--argv0', '--login-class', '--chroot', '--format', '--append']);
+// Long options known to take no value.
+const WRAPPER_LONG_FLAG = new Set(['--ignore-environment', '--null', '--debug', '--preserve-status', '--foreground',
+  '--verbose', '--login', '--shell', '--non-interactive', '--preserve-env', '--yes', '--no-install', '--portability',
+  '--no-run-if-empty', '--open-tty', '--exit', '--shared', '--exclusive', '--nonblock', '--no-fork', '--fork',
+  '--background', '--set-home', '--stdin', '--reset-timestamp', '--remove-timestamp', '--quiet', '--differences',
+  '--beep', '--errexit', '--chgexit', '--no-title', '--precise', '--color', '--all-tasks', '--reset-on-fork']);
+// Positional operands the wrapper itself consumes before the child (`timeout 5`, `flock <file>`, `chrt <prio>`).
+const WRAPPER_POSITIONALS = { timeout: 1, flock: 1, chrt: 1, taskset: 1 };
+const WRAPPER_SPLIT_CAP = 8;
+// Bounds on re-judging a peeled child: each `!`-separated level recurses once per carried directory.
+const WRAPPER_PEEL_DEPTH_CAP = 3;
+const WRAPPER_BASES_CAP = 6;
+
+/** The old any-word backstop: the first file-writing program word (rm, cp, …, tee, an in-place sed/perl) anywhere in
+ *  `words`, its operands resolved against every base. Used only when the peel met an option it does not model, so a
+ *  value it may have taken for the child cannot hide the real writer. */
+function wrappedWriterScan(words, bases, roots) {
+  for (let i = 0; i < words.length; i++) {
+    const base = words[i].replace(/^\\+/, '').replace(/^.*\//, '');
+    if (!FS_MUTATING_PROGRAMS.has(base) && !['tee', 'sed', 'perl'].includes(base)) continue;
+    const operands = fileOperands(words.slice(i + 1).map((text) => ({ text, quoted: false, op: false })));
+    if (!operands.length) return bases.find((b) => isDaemonCloneRealpath(resolve(b), roots)) ?? null;
+    for (const operand of operands) {
+      for (const b of bases) {
+        const abs = resolve(b, operand);
+        if (isDaemonCloneRealpath(abs, roots)) return abs;
+      }
+    }
+    return null;
   }
   return null;
+}
+
+/** Shell-quote one word so it re-parses to the same text. An expansion stays visible (double quotes), so every
+ *  downstream `$`/backtick check still fails closed on it. */
+function requoteWord(word) {
+  const quote = (text) => (/^[A-Za-z0-9_@%+=:,./-]+$/.test(text) ? text : `"${text.replace(/["\\]/g, '\\$&')}"`);
+  const assignment = /^([A-Za-z_]\w*)=(.*)$/s.exec(word);
+  return assignment ? `${assignment[1]}=${assignment[2] === '' ? '""' : quote(assignment[2])}` : quote(word);
+}
+
+/** Peel the wrappers in front of a segment's real command, carrying their effect: the child command text (with any
+ *  `NAME=value` the segment or an `env`/`time` wrapper sets in front of it) and every directory it may run in
+ *  (cwd, then each `-C`/`--chdir`/`-D` value in order, bundled `-iC dir` and unique `--ch=dir` prefixes included).
+ *  The scan stops at the first word that is not the wrapper's own option or operand, so a child's arguments are never
+ *  read as the child. Returns null when there is no wrapper, 'unresolved' when a directory or split string cannot be
+ *  read statically. */
+function peelDaemonWrapper(segment, cwd) {
+  let words = shellTokens(String(segment).trim().replace(/^[({]\s*/, '')).filter((t) => !t.op).map((t) => t.text);
+  const assigns = [];
+  let peeled = false;
+  const takeAssignments = () => { while (/^[A-Za-z_]\w*=/.test(words[0] ?? '')) assigns.push(words.shift()); };
+  takeAssignments();
+  while (words[0] === '!') { words.shift(); peeled = true; takeAssignments(); }
+  const bases = [cwd || '.'];
+  let current = cwd || '.';
+  let splits = 0;
+  let uncertain = false;
+  let probeOnly = false;
+  for (;;) {
+    const wrapper = (words[0] ?? '').replace(/^\\+/, '').replace(/^.*\//, '');
+    if (!DAEMON_CHILD_WRAPPERS.has(wrapper)) break;
+    peeled = true;
+    words.shift();
+    const shortValue = WRAPPER_SHORT_VALUE[wrapper] || '';
+    const shortFlag = WRAPPER_SHORT_FLAG[wrapper];
+    // Inside ONE wrapper every directory value resolves against that wrapper's starting directory (the last one
+    // wins at run time; every one is kept here). Only nested wrappers chain.
+    const start = current;
+    const setDir = (dir) => {
+      if (!dir || /[$`]/.test(dir) || dir.startsWith('~')) return false;
+      current = resolve(start, dir);
+      bases.push(current);
+      return true;
+    };
+    const split = (text) => {
+      if (++splits > WRAPPER_SPLIT_CAP) return false;
+      words.unshift(...shellTokens(text).filter((t) => !t.op).map((t) => t.text));
+      return true;
+    };
+    let pendingSplit = null;
+    let optionsEnded = false;
+    // The wrapper's own options; false when a directory value cannot be read statically.
+    const readOptions = () => {
+      while (!optionsEnded && words.length && words[0].startsWith('-') && words[0] !== '-') {
+        const option = words.shift();
+        if (option === '--') { optionsEnded = true; break; }
+        if (option.startsWith('--')) {
+          const eq = option.indexOf('=');
+          const name = eq < 0 ? option : option.slice(0, eq);
+          const attached = eq < 0 ? null : option.slice(eq + 1);
+          const isPrefix = (full) => name.length >= 3 && full.startsWith(name); // getopt_long accepts unique prefixes
+          if ((wrapper === 'env' || wrapper === 'sudo') && isPrefix('--chdir')) {
+            if (!setDir(attached ?? words.shift())) return false;
+          } else if (wrapper === 'env' && isPrefix('--split-string')) {
+            pendingSplit = attached ?? words.shift() ?? '';
+          } else if (WRAPPER_LONG_VALUE.has(name)) {
+            if (attached === null) words.shift();
+          } else if (!WRAPPER_LONG_FLAG.has(name)) uncertain = true;
+          continue;
+        }
+        const letters = option.slice(1);
+        if (wrapper === 'command' && /[vV]/.test(letters)) probeOnly = true; // `command -v` never runs its operand
+        for (let k = 0; k < letters.length; k++) {
+          if (!shortValue.includes(letters[k])) {
+            if (shortFlag === undefined || !shortFlag.includes(letters[k])) uncertain = true;
+            continue;
+          }
+          const value = letters.slice(k + 1) || words.shift();
+          if ((wrapper === 'env' && letters[k] === 'C') || (wrapper === 'sudo' && letters[k] === 'D')) {
+            if (!setDir(value)) return false;
+          } else if ((wrapper === 'env' && letters[k] === 'S') || (['flock', 'npx', 'bunx'].includes(wrapper) && letters[k] === 'c')) {
+            pendingSplit = value ?? '';
+          }
+          break;
+        }
+      }
+      return true;
+    };
+    if (!readOptions()) return 'unresolved';
+    if (wrapper === 'env' || wrapper === 'time') takeAssignments();
+    if (WRAPPER_POSITIONALS[wrapper]) words.splice(0, WRAPPER_POSITIONALS[wrapper]);
+    // flock takes options after its lock file too (`flock <file> -c "<cmd>"`).
+    if (wrapper === 'flock' && !readOptions()) return 'unresolved';
+    // A split string IS the child (env -S runs it with the remaining words appended).
+    if (pendingSplit !== null && !split(pendingSplit)) return 'unresolved';
+    if (wrapper === 'env' || wrapper === 'time') takeAssignments();
+  }
+  if (!peeled || !words.length || probeOnly) return null;
+  const unique = [...new Set(bases)];
+  if (unique.length > WRAPPER_BASES_CAP) return 'unresolved';
+  return { child: [...assigns, ...words].map(requoteWord).join(' '), bases: unique, uncertainWords: uncertain ? words : null };
+}
+
+/** Wrappers with unmodelled options cannot prove either their command or its cwd. Keep this
+ * daemon-only: other policies retain their existing canonical-command interpretation. */
+function daemonWrapperUncertain(segment) {
+  const words = shellTokens(String(segment).trim().replace(/^[({]\s*/, '')).filter((t) => !t.op).map((t) => t.text);
+  // This check concerns Git and shell wrappers that may invoke it, not unrelated `env -i echo` commands.
+  if (!words.some((word) => ['git', 'sh', 'bash', 'zsh', 'eval'].includes(word.replace(/^.*\//, '')))) return false;
+  // canonicalCommand does not peel wrappers that carry options, so a child reached AFTER a modelled option is only
+  // proven safe when it is a plain Git read (subcommand directly after `git`, literal args) or `command -v/-V`.
+  let optionSeen = false;
+  let probeOnly = false;
+  let gitEnvSeen = false;
+  let wrapperSeen = false;
+  for (let i = 0; i < words.length;) {
+    const word = words[i++];
+    if (/^[A-Za-z_]\w*=/.test(word)) {
+      // code-running Git env (GIT_EXTERNAL_DIFF, GIT_*_COMMAND, GIT_PAGER, config injection) makes even a "read" subcommand run code (`--ext-diff`).
+      if (gitCodeEnvAssignment(word)) gitEnvSeen = true;
+      continue;
+    }
+    const base = word.replace(/^\\+/, '').replace(/^.*\//, '');
+    if (base !== word && ['env', 'time', 'command', 'builtin', 'nice', 'sudo', 'xargs', 'npx', 'bunx'].includes(base)) {
+      return true; // canonicalCommand does not peel path-qualified wrappers; do not lose their Git child
+    }
+    if (word === 'env') {
+      wrapperSeen = true;
+      // Only options that neither change directory nor split a string are modelled: -i/-0 and -u NAME.
+      // -C/--chdir, -S/--split-string and unknown options stay uncertain.
+      while (words[i]?.startsWith('-')) {
+        const option = words[i++];
+        optionSeen = true;
+        if (['-i', '-0', '--ignore-environment', '--null'].includes(option)) continue;
+        if (option === '-u') { if (!words[i++]) return true; continue; }
+        if (/^--unset=.+/.test(option)) continue;
+        return true;
+      }
+      continue;
+    }
+    if (['time', 'command', 'builtin', 'nice'].includes(word)) {
+      if (word === 'time') wrapperSeen = true; // the `time` keyword takes `NAME=value` prefixes like env does
+      // Value-free (`time -p`, `command -p/-v/-V`) and `nice -n N` options leave the child command and its cwd
+      // exactly as written; anything else is unmodelled and fails closed.
+      while (words[i]?.startsWith('-')) {
+        const option = words[i++];
+        optionSeen = true;
+        if (word === 'time' && option === '-p') continue;
+        if (word === 'command' && option === '-p') continue;
+        if (word === 'command' && ['-v', '-V'].includes(option)) { probeOnly = true; continue; } // never runs its operand
+        if (word === 'nice' && option === '-n' && /^-?\d+$/.test(words[i] ?? '')) { i += 1; continue; }
+        return true;
+      }
+      continue;
+    }
+    if (word === 'sudo') {
+      while (words[i]?.startsWith('-')) {
+        const option = words[i++];
+        if (['-u', '-g', '-U'].includes(option)) { if (!words[i++]) return true; }
+        else if (option !== '-n') return true; // includes -D/--chdir, attached values and unknown options
+      }
+      continue;
+    }
+    if (word === 'xargs') {
+      while (words[i]?.startsWith('-')) {
+        if (!/^(?:-n\d+|-[0rt]+)$/.test(words[i++])) return true;
+      }
+      continue;
+    }
+    if (word === 'npx' || word === 'bunx') {
+      while (words[i]?.startsWith('-')) {
+        const option = words[i++];
+        if (['-p', '--package', '-c'].includes(option)) { if (!words[i++]) return true; }
+        else if (!['-y', '--yes', '--no-install'].includes(option)) return true;
+      }
+      continue;
+    }
+    if (gitEnvSeen && wrapperSeen && base === 'git') return true;
+    if (!optionSeen || probeOnly) return false;
+    if (base === 'git') return gitEnvSeen || !(DAEMON_GIT_READS.has(words[i] ?? '') && !words.slice(i).includes('--ext-diff') && words.slice(i).every((w) => !/[$`]/.test(w) && !/^--out/.test(w)));
+    return ['sh', 'bash', 'zsh', 'eval'].includes(base);
+  }
+  return false;
+}
+
+// The one exact, whole-token spelling in which a `$VAR` cannot pick the push destination: a push-option value that is
+// ONE double-quoted simple variable (no word splitting, nothing glued to it). A redirect target is NOT allowed: bash
+// opens/truncates it before git runs, so `>"$X"` can write a daemon clone. Matched on the RAW text and removed; ANY other `$`/backtick left over (unquoted, partly quoted,
+// ANSI-C `$'..'`, command substitution, positional remote/refspec, --repo/--receive-pack/--exec) stays denied.
+const PUSH_SAFE_EXPANSION = /(?:^|\s)(?:--push-option=|--push-option\s+|-o\s+)"\$(?:\{[A-Za-z_]\w*\}|[A-Za-z_]\w*)"(?=\s|$)/g;
+
+/** Does a `git push` carry a `$`/backtick expansion where it can choose the destination? Pure, structural:
+ *  strip the one exact harmless spelling above, then any remaining `$`/backtick fails closed. */
+function pushHasUnresolvedTarget(command) {
+  if (!/[$`]/.test(command)) return false;
+  const rest = String(command).replace(PUSH_SAFE_EXPANSION, ' ');
+  // The allowance must not sit beside a redirect: bash opens/truncates the target before git runs.
+  if (rest !== command && /[<>]/.test(command)) return true;
+  return /[$`]/.test(rest);
+}
+
+// Separate from GIT_STATE_SUBCOMMANDS: new commands and aliases default to denied at protected targets.
+export const DAEMON_GIT_READS = new Set(['status', 'log', 'diff', 'show', 'rev-parse', 'rev-list', 'ls-files',
+  'ls-tree', 'cat-file', 'describe', 'merge-base', 'for-each-ref', 'show-ref', 'name-rev',
+  'diff-tree', 'diff-index', 'diff-files', 'count-objects', 'check-ref-format']);
+
+// Config keys a read may be given with `-c` without running anything: target and display settings only.
+const DAEMON_READ_SAFE_CONFIG = /^(?:core\.(?:worktree|quotepath|abbrev|bare)|color\.[\w.-]+|log\.\w+|status\.\w+|advice\.\w+|safe\.directory|user\.\w+|i18n\.\w+|diff\.(?:renames|noprefix|mnemonicprefix|algorithm|context|relative|statgraphwidth))$/i;
+
+function daemonGitRead(segment, sub) {
+  const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
+  const index = gitSubcommandIndex(toks);
+  if (index < 0) return false;
+  // A global `-c key=value` / `--config-env key=ENV` can set a pager, fsmonitor, external diff or other program, and
+  // `--exec-path=<dir>` swaps git's own helpers: a read behind one is judged by its target instead. Only keys known
+  // to run nothing are exempt; an unknown key is never guessed safe.
+  const globals = toks.slice(1, index);
+  for (let i = 0; i < globals.length; i++) {
+    const t = globals[i];
+    if (/^--exec-path/.test(t)) return false;
+    let setting = null;
+    if (t === '-c' || t === '--config-env') setting = globals[++i] ?? '';
+    else if (/^-c./.test(t)) setting = t.slice(2);
+    else if (t.startsWith('--config-env=')) setting = t.slice('--config-env='.length);
+    if (setting !== null && (/[$`]/.test(setting) || !DAEMON_READ_SAFE_CONFIG.test(setting.split('=')[0]))) return false;
+  }
+  const args = toks.slice(index + 1);
+  if (args.some((a) => /[$`]/.test(a) || /^--out/.test(a))) return false;
+  if (DAEMON_GIT_READS.has(sub)) return true;
+  if (sub === 'config' || sub === 'remote') return !gitConfigOrRemoteWrites(segment, sub);
+  if (sub === 'symbolic-ref') {
+    return args.filter((a) => !['-q', '--quiet', '--short', '--no-recurse'].includes(a)).length === 1
+      && args.every((a) => !a.startsWith('-') || ['-q', '--quiet', '--short', '--no-recurse'].includes(a));
+  }
+  return sub === 'reflog' && (!args.length || args[0] === 'show');
 }
 
 /** The deny message for a write inside daemon clone `dir`. A plain function (not a template literal alone) so
@@ -2006,7 +2734,7 @@ function daemonCloneWriteMessage(dir) {
  * the CLI wrapper exactly like `primaryCwd`/`foreignLiveLease` above — this function does no fs I/O itself.
  *
  * TWO SHAPES, both real 2026-09-26 incidents:
- *   1. a git STATE-MUTATING subcommand (`GIT_STATE_SUBCOMMANDS`, minus `fetch`) whose EFFECTIVE directory —
+ *   1. a git command without a known read classification whose EFFECTIVE directory —
  *      its own `-C <path>` if it has one, else `cwd` — resolves inside a daemon clone: `git reset`/
  *      `checkout`/`commit`/… run either with cwd already inside the clone, or from anywhere via
  *      `git -C <clone-path> reset --hard`.
@@ -2014,14 +2742,17 @@ function daemonCloneWriteMessage(dir) {
  *      from the primary-tree arm above) or an FS-mutating program (`FS_MUTATING_PROGRAMS`: `cp`/`mv`/`rm`/…)
  *      — run with `cwd` already inside a daemon clone.
  *
- * `git fetch` IS ALLOWED — explicitly excluded from the deny set, checked before the daemon-directory test so
- * it is allowed EVEN WHEN targeting a daemon clone by `-C`/cwd. It only updates remote-tracking refs, never
- * the working tree or the index, so it cannot dirty a clone or race its rebuild — exactly the read-only
- * "diagnose from outside" shape the card asks to keep open. Every OTHER `GIT_STATE_SUBCOMMANDS` entry
- * (including `pull`, which fetches AND merges into the working tree) is denied. A pure READ op (`log`/
- * `status`/`diff`/`show`/`rev-parse`/…) is never in scope at all: `gitSubcommand` still returns it, but this
- * function only denies subcommands present in `GIT_STATE_SUBCOMMANDS`, so `git -C <clone> log` and `cat`
- * never match either arm below and pass through unmentioned.
+ * A diagnostic `git fetch` stays allowed when its explicit AND effective configured refspecs write no local
+ * branches. The CLI injects a bounded, read-only config reader; pure callers can inject `fetchConfig` directly
+ * (default: an empty configuration). Missing, unreadable or incomplete CLI config evidence denies the fetch.
+ * Every other command without a known read classification (including future subcommands and aliases)
+ * is denied. The effective target is every
+ * directory `gitTargetDirs` finds (ALL `-C` in order, `--git-dir`, `--work-tree`); `fetch` into a daemon clone is
+ * denied when `fetchWritesLocalBranch` (an explicit/configured local-branch destination, `--update-head-ok`,
+ * unavailable stdin refspecs or unavailable config evidence). Config/remote mutations are denied while their
+ * known read forms remain allowed. Read operations are explicitly classified by daemonGitRead,
+ * independently of the mutator list used by other guard policies. Unknown global-option arity or
+ * wrapper directory semantics cannot establish a safe command or target and therefore fail closed.
  *
  * A non-git write resolves EVERY operand it can find (the redirect/tee/sed-i/perl-pi targets `fileWriteTargets`
  * already extracts, or an FS-mutating program's plain file operands) against `cwd` and denies if ANY lands in
@@ -2029,15 +2760,86 @@ function daemonCloneWriteMessage(dir) {
  * cwd naming one explicitly (`cp x /…/wev-review-daemon/y` run from a lane) are caught. Falls back to the
  * ambient-cwd test alone when no operand is found at all (e.g. a bare `rm` with nothing to resolve).
  */
-export function daemonCloneWriteReason(segment, { cwd = null, roots = [] } = {}) {
+export function daemonCloneWriteReason(segment, options = {}) {
+  const { cwd = null, roots = [], envDirs = [], configEnv = {}, fetchConfig = [], daemonFetchConfigReader = null, unknownTarget = false } = options;
   if (!roots.length) return null;
   const s = String(segment || '');
-  const sub = gitSubcommand(s);
-  if (sub) {
-    if (sub === 'fetch') return null; // #xpt9fvd — diagnosis stays allowed; fetch never touches the working tree
-    if (!GIT_STATE_SUBCOMMANDS.has(sub)) return null; // a read op (log/status/diff/show/…) — never denied
-    const effectiveDir = gitDashCTarget(s, cwd) || cwd;
-    return isDaemonCloneRealpath(effectiveDir, roots) ? daemonCloneWriteMessage(effectiveDir) : null;
+  if (daemonWrapperUncertain(s)) return daemonCloneWriteMessage('unresolved wrapper target');
+  // A wrapped child (`env -C <clone> rm x`, `timeout 5 env GIT_PAGER=… git log`, `! sed -i … <clone>/x`) is judged
+  // as the command it is, once in every directory the wrappers may run it in. The text is shorter each level.
+  const peeled = peelDaemonWrapper(s, cwd);
+  if (peeled === 'unresolved') return daemonCloneWriteMessage('unresolved wrapper target');
+  if (peeled) {
+    const depth = options.peelDepth ?? 0;
+    if (depth >= WRAPPER_PEEL_DEPTH_CAP) return daemonCloneWriteMessage('unresolved wrapper target: too deeply nested');
+    if (peeled.uncertainWords) {
+      const scanned = wrappedWriterScan(peeled.uncertainWords, peeled.bases, roots);
+      if (scanned) return daemonCloneWriteMessage(scanned);
+    }
+    for (const base of peeled.bases) {
+      const child = daemonCloneWriteReason(peeled.child, { ...options, cwd: base, peelDepth: depth + 1 });
+      if (child) return child;
+    }
+  }
+  // Strict: behind an unknown global flag no subcommand is trusted (no read, no fetch exception).
+  const sub = gitSubcommandStrict(s);
+  if (programWord(s) === 'git') {
+    const configWrite = (sub === 'config' || sub === 'remote') && gitConfigOrRemoteWrites(s, sub);
+    // A bare leading code-running env (`PAGER='sh -c …' git log`, `GIT_TRACE=<clone>/t git status`) makes a read
+    // run code or write a file, so it is judged by its target like any other git command.
+    const leadingWords = shellTokens(s.trim().replace(/^[({]\s*/, '')).filter((t) => !t.op).map((t) => t.text);
+    let codeEnv = false;
+    const tracePaths = [];
+    const leadingAssigned = [];
+    for (const word of leadingWords) {
+      if (!/^[A-Za-z_]\w*=/.test(word)) break;
+      leadingAssigned.push(word);
+    }
+    // Names the command's own earlier statements set (`export GIT_TRACE=…; git status`): the tracked scope values
+    // that differ from the hook's inherited environment. The inherited environment itself is not the command's doing.
+    // The GIT_CONFIG* family is excluded here: the scope tracker already models it as a target/config input (it
+    // stores placeholder values for unmodelled writers), and a read after it is a pinned, deliberate allow.
+    const scopeAssigned = Object.entries(configEnv || {})
+      .filter(([key, value]) => typeof value === 'string' && value !== process.env[key] && !/^GIT_CONFIG/.test(key))
+      .map(([key, value]) => `${key}=${value}`);
+    for (const word of [...scopeAssigned, ...leadingAssigned]) {
+      // An editor never runs for a read; it only matters to a write, which is judged by its target anyway.
+      if (!gitCodeEnvAssignment(word) || /^GIT_(?:SEQUENCE_)?EDITOR=/.test(word)) continue;
+      codeEnv = true;
+      // A GIT_TRACE* path is a file git appends to, wherever the repository is: check the file itself.
+      const trace = /^GIT_TRACE\w*=(.+)$/s.exec(word);
+      if (trace) tracePaths.push(trace[1]);
+    }
+    for (const p of tracePaths) {
+      if (/[$`]/.test(p) || p.startsWith('~')) return daemonCloneWriteMessage('unresolved GIT_TRACE file');
+      const abs = resolve(cwd || '.', p);
+      if (isDaemonCloneRealpath(abs, roots)) return daemonCloneWriteMessage(abs);
+    }
+    if (!codeEnv && daemonGitRead(s, sub)) return null;
+    // Named environment follows shell scope/order; envDirs remains a conservative explicit caller input.
+    // Git resolves an environment GIT_DIR / GIT_WORK_TREE against its effective directory (after every -C),
+    // the same base and tilde normalization gitTargetDirs uses; the reported cwd is kept as well.
+    const targets = gitTargetDirs(s, cwd, configEnv);
+    const base = targets.length ? targets[0] : cwd;
+    const home = tildeHome(s, configEnv);
+    for (const p of envDirs) {
+      targets.push(base === null ? null : absoluteGitTarget(base, p, home));
+      targets.push(absoluteGitTarget(cwd, p, home));
+    }
+    if (unknownTarget) targets.push(null); // too many possible environment values to check one by one
+    if (configWrite && sub === 'config') targets.push(...gitConfigFileTargets(s, targets[0], configEnv));
+    const hit = targets.find((d) => d === null || isDaemonCloneRealpath(d, roots));
+    if (hit === undefined) return null;
+    // #xpt9fvd — fetch diagnosis stays allowed (it only updates remote-tracking refs), UNLESS it writes a local
+    // branch (a refspec `src:<branch>` or --update-head-ok can move the checked-out branch under the working tree).
+    if (sub === 'fetch') {
+      let config = fetchConfig;
+      if (daemonFetchConfigReader) {
+        try { config = daemonFetchConfigReader(s, cwd, envDirs, configEnv); } catch { config = null; }
+      }
+      if (!fetchWritesLocalBranch(s, config)) return null;
+    }
+    return daemonCloneWriteMessage(hit ?? 'unresolved git target: unavailable environment or relative configured worktree');
   }
   const prog = programWord(s);
   const isWrite = isFileWriteRedirect(s);
@@ -2555,7 +3357,7 @@ export function isDestructiveLaneGitOp(cmd) {
   if (/^git\s+restore\b[^\n]*\s\.(?:\s|$)/.test(c)) return true;                 // restore [--worktree/--staged/--] .
   if (/^git\s+switch\b[^\n]*\s(?:-f|--force|--discard-changes)(?=\s|$)/.test(c)) return true; // switch -f <branch>
   if (/^git\s+push\b/.test(c) &&
-      (/(?:^|\s)(?:-f|--force|--force-with-lease)(?=\s|$)/.test(c) || /(?:^|\s)\+\S/.test(c))) return true; // force-push (flag or +refspec)
+      (/(?:^|\s)(?:-[a-zA-Z]*f[a-zA-Z]*|--force|--force-with-lease)(?=\s|$)/.test(c) || /(?:^|\s)\+\S/.test(c))) return true; // force-push (flag or +refspec)
   return false;
 }
 
@@ -2656,6 +3458,8 @@ function rebindingOf(name) {
       operand: new RegExp(`(?<![\\w{$./-])${name}(?!\\w)`),
       valued: new RegExp(`^${name}${index}\\+?=`),
       descriptor: new RegExp(`(?<![\\w$])\\{${name}\\}[<>]`),
+      // `${NAME:=word}` / `${NAME=word}` assigns NAME as a side effect of expanding it.
+      defaultAssign: new RegExp(`\\$\\{${name}${index}:?=`),
     });
   }
   return rebindPatterns.get(name);
@@ -2697,6 +3501,7 @@ const unquoted = (word) => word.replace(/[\\'"]/g, '');
 // Does this statement rebind `name` in the current shell in a way `valueAfter` cannot read?
 function rebindsUnreadably(s, name, p) {
   if (rebindsInArithmetic(s, p)) return true;
+  if (p.defaultAssign.test(s)) return true;
   const words = shellWords(s);
   let chain = false;                                                        // `name` assigned in the prefix chain
   let j = 0;
@@ -2720,7 +3525,8 @@ function rebindsUnreadably(s, name, p) {
   if (chain && SPECIAL_BUILTIN.test(command)) return true;
   if (command === 'eval' || command === 'source' || command === '.') return true;
   const operands = words.slice(j + 1).map(unquoted);
-  const named = (w) => w === name || w.startsWith('$');                    // `$X` may name anything
+  // `$X` may name anything; `NAME[i]` writes an element of NAME (and `NAME[0]` is NAME itself).
+  const named = (w) => w === name || w.startsWith('$') || (w.startsWith(`${name}[`));
   if (command === 'coproc') return named(operands[0] ?? '');
   if (command === 'for' || command === 'select') return named(operands[0] ?? '');
   if (command === 'printf') {
@@ -2837,6 +3643,70 @@ function valueAfter(stmt, name, value, home) {
   return rebindsUnreadably(s, name, p) ? null : value;
 }
 
+// A statement as decide's env tracker reads it: a function header or compound keyword prefix stripped.
+function scopeStatement(stmt) {
+  return String(stmt).trim()
+    .replace(/^(?:function\s+[A-Za-z_]\w*\s*(?:\(\s*\))?|[A-Za-z_]\w*\s*\(\s*\))\s*\{\s*/, '')
+    .replace(/^(?:(?:then|do|else|elif|if|while|until)\s+)+/, '');
+}
+
+// Text that can rebind a name it does not spell: an expansion, or text run by eval / source / `.`.
+const INDIRECT_WRITER = /[$`]|(?:^|[\s;&|({])(?:eval|source|\.)(?:\s|$)/;
+const DECLARATION_BUILTIN = new Set(['declare', 'typeset', 'local', 'readonly']);
+const UNCHANGED = Symbol('unchanged');
+
+// Does `stmt` write `name` in a way the env tracker does not model? A plain or exported `NAME=value` is
+// modelled; so is `unset` (it only removes a value, leaving git on its cwd, which is always a target). Every
+// other writer — and any declaration builtin naming it, whatever its options — is unmodelled. Fails closed.
+function writesUnmodelled(stmt, name) {
+  let value;
+  try { value = valueAfter(stmt, name, UNCHANGED, null); } catch { return true; }
+  // null: unreadable, including `NAME+=` (appending to an unknown value).
+  if (value === null) return shellTokens(canonicalCommand(stmt)).find((t) => !t.op)?.text !== 'unset';
+  const words = shellTokens(canonicalCommand(stmt)).filter((t) => !t.op).map((t) => t.text);
+  if (!DECLARATION_BUILTIN.has(words[0])) return false;
+  const p = rebindingOf(name);
+  return words.slice(1).some((w) => p.operand.test(w) || w.startsWith('$'));
+}
+
+// Every protected Git environment name `stmt` writes unmodelled (GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR,
+// and the GIT_CONFIG* family, including any GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n> it spells).
+const GIT_CONFIG_NAME_CAP = 16;
+const PROTECTED_GIT_NAMES = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_CONFIG', 'GIT_CONFIG_GLOBAL',
+  'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS'];
+function unmodelledGitWrites(stmt, depth = 0) {
+  if (!/GIT_/.test(stmt) && !INDIRECT_WRITER.test(stmt)) return [];
+  const bodies = literalEvalStatements(stmt, depth);
+  if (bodies) return [...new Set(bodies.flatMap((body) => unmodelledGitWrites(body, depth + 1)))];
+  const spelled = new Set(stmt.match(/\bGIT_CONFIG_\w{1,64}/g) || []);
+  // Bound the per-name work: past the cap the statement is not read name by name and fails closed.
+  if (spelled.size > GIT_CONFIG_NAME_CAP) return ['GIT_CONFIG_COUNT'];
+  const names = new Set([...PROTECTED_GIT_NAMES, ...spelled]);
+  return [...names].filter((name) => writesUnmodelled(stmt, name));
+}
+
+// Can `stmt` write HOME at all — modelled or not, a command-local prefix included?
+function statementWritesHome(stmt, depth = 0) {
+  if (!/HOME/.test(stmt) && !INDIRECT_WRITER.test(stmt)) return false;
+  if (gitLeadingAssignments(stmt).some((m) => m[1] === 'HOME')) return true;
+  const bodies = literalEvalStatements(stmt, depth);
+  if (bodies) return bodies.some((body) => statementWritesHome(body, depth + 1));
+  try { return valueAfter(stmt, 'HOME', UNCHANGED, null) !== UNCHANGED; } catch { return true; }
+}
+
+// The statements of a fully literal `eval` script (no expansion, no prefix assignment, no redirection),
+// read the same way as the calling scope; null when the eval text is not known here (it then counts as
+// an unmodelled writer of every name). Depth-bounded like the nested-command traversal.
+function literalEvalStatements(stmt, depth) {
+  if (depth >= 4 || programWord(stmt) !== 'eval' || /[$`]/.test(stmt)) return null;
+  if (shellTokens(stmt).some((t) => t.op) || gitLeadingAssignments(stmt).length) return null;
+  const words = shellTokens(canonicalCommand(stmt)).filter((t) => !t.op).map((t) => t.text);
+  // eval's own options (`--`, an unknown flag) change which words form the script: not read here.
+  if (words[0] !== 'eval' || /^-/.test(words[1] || '')) return null;
+  const parsed = parseSegments(words.slice(1).join(' '));
+  return parsed.unterminated ? null : parsed.segments.map(scopeStatement);
+}
+
 // HOME after one statement runs: unchanged, the newly assigned absolute path, or null (unknown).
 function homeAfter(stmt, home) {
   const value = valueAfter(stmt, 'HOME', home, home);
@@ -2927,7 +3797,69 @@ function homeCdTarget(cmd, { segments, pipedFrom }, home) {
 // target this resolver can't statically resolve (e.g. a command-substitution path) will be wrongly denied.
 // The fix is to invoke with a directly-resolvable `cd` (a literal absolute path, or `LANE=/abs; cd "$LANE"` —
 // the standard lane idiom every skill already teaches), not to reach for a removed override.
-export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve, home = process.env.HOME ?? null) {
+/** Where the first `cd` may land when `resolveEffectiveCwd`'s readers leave it unresolved: a path, null for
+ *  unknown, or undefined when main's resolution already reads it. Covers a home target (`~`, `"$HOME"`) in a
+ *  chain the home resolver does not read — expanded with the starting HOME only when no earlier statement can
+ *  touch HOME — options (`-P`, `--`) before the target, a bare `cd` (HOME) and `cd -` (OLDPWD, unknown). */
+function unreadCdCandidate(segments, reportedCwd, resolvePath, home) {
+  const index = segments.findIndex((stmt) => /^cd(?:\s|$)/.test(stmt.trim()));
+  if (index < 0) return undefined;
+  const args = segments[index].trim().slice(2).trim().split(/\s+/).filter(Boolean);
+  let options = false;
+  while (args.length && /^-[LPe@]+$/.test(args[0])) { args.shift(); options = true; }
+  if (args[0] === '--') { args.shift(); options = true; }
+  const target = args[0] ?? '~';                              // a bare `cd` goes to HOME
+  if (target === '-') return null;                            // OLDPWD is not known here
+  // An unquoted `$HOME` word-splits on a HOME with whitespace, so `cd` would not land there.
+  const quotedHome = /^("?)\$(?:HOME|\{HOME\})(\/[^$`"'\\]*)?\1$/.exec(target);
+  const splits = quotedHome && !quotedHome[1] && /\s/.test(home ?? '');
+  const homeRest = /^~(?:\/|$)/.test(target) ? target.slice(1) : quotedHome && !splits ? quotedHome[2] || '' : null;
+  if (homeRest !== null || /^~/.test(target)) {
+    if (typeof home !== 'string' || !isAbsolute(home)) return undefined; // main's no-home behavior (#5957)
+    // HOME written earlier in the command: never fall back to the hook's HOME.
+    if (segments.slice(0, index).some(statementWritesHome)) return null;
+    let tracked = homeRest === null ? null : home;            // `~user` / `~+` / `~-` are never resolved here
+    for (const before of segments.slice(0, index)) {
+      if (tracked === null) break;
+      tracked = valueAfter(before, 'HOME', tracked, tracked);
+    }
+    return tracked === home ? resolvePath(home + homeRest) : null;
+  }
+  if (!options) return undefined;
+  const plain = target.replace(/^(['"])(.*)\1$/, '$2');
+  if (/[`$(*?]/.test(plain)) return null;
+  return plain.startsWith('/') ? plain : resolvePath(reportedCwd || '.', plain);
+}
+
+/** Every value `name` may hold at a `cd "$name"`: each literal value any statement assigns (a conditional
+ *  one may be skipped, so a value is only ever added, never replaced), and null when a statement writes it
+ *  in a form not read here (a substitution, `read`, `printf -v`, `for`, an append, eval). */
+function cdVariableValues(segments, name, home) {
+  if (name.length > 64) return [null];                       // a pathological name never reaches a RegExp
+  const values = new Set();
+  // A tilde value expands with the starting HOME only while nothing in the command writes HOME.
+  const tildeBase = typeof home === 'string' && isAbsolute(home) && !segments.some(statementWritesHome) ? home : null;
+  for (const stmt of segments) {
+    const m = stmt.trim().match(/^(?:export\s+)?([A-Za-z_]\w*)=(.*)$/s);
+    if (m && m[1] === name) {
+      const raw = m[2].trim();
+      const quoted = /^(['"])(.*)\1$/s.exec(raw);
+      // A quoted value is literal text (a quoted `~` stays `~`); an unquoted one must be a plain path.
+      let val = quoted ? quoted[2] : raw;
+      if (!quoted && /^~(?:\/|$)/.test(val)) val = tildeBase === null ? '' : tildeBase + val.slice(1);
+      values.add(!val || (quoted ? /[`$]/ : /[`$(\s*?\[{~'"\\]/).test(val) ? null : val);
+      continue;
+    }
+    if (!stmt.includes(name) && !INDIRECT_WRITER.test(stmt)) continue;
+    let value;
+    try { value = valueAfter(stmt, name, UNCHANGED, null); } catch { value = null; }
+    if (value === UNCHANGED) continue;
+    values.add(typeof value === 'string' && value && !/[`$(\s*?\[{]/.test(value) ? value : null);
+  }
+  return [...values];
+}
+
+export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve, home = process.env.HOME ?? null, onCdCandidate = null) {
   // r3 audit — a heredoc BODY is data. A `cd /elsewhere` line (or an apostrophe that desyncs the quote
   // scanner) inside a PR-body heredoc must not steer, or break, the cwd resolution; `decide` already strips
   // them before it parses, and this must agree with it. An unparseable command keeps the REPORTED cwd, which
@@ -2940,7 +3872,15 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
   let homed = null;
   try { homed = homeCdTarget(cmd, parsed, home); } catch { homed = null; } // never fail the hook open
 
-  if (homed) return homed.startsWith('/') ? homed : resolvePath(reportedCwd || '.', homed);
+  if (homed) {
+    // A home target after an earlier HOME write: the returned cwd keeps main's resolution, but a caller
+    // guarding git targets is told the landing place is unknown (deny rather than trust a tracked HOME).
+    if (onCdCandidate) {
+      const index = parsed.segments.findIndex((stmt) => /^cd(?:\s|$)/.test(stmt.trim()));
+      if (parsed.segments.slice(0, Math.max(index, 0)).some(statementWritesHome)) onCdCandidate(null);
+    }
+    return homed.startsWith('/') ? homed : resolvePath(reportedCwd || '.', homed);
+  }
   // Collect simple literal `VAR=value` / `export VAR=value` assignments (no command-subst/globs) in order.
   const vars = Object.create(null);
   for (const stmt of parsed.segments) {
@@ -2951,6 +3891,13 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
     val = val.replace(/^(['"])(.*)\1$/, '$2');                // strip matching surrounding quotes
     if (!/\s/.test(val)) vars[m[1]] = val;                    // single-token literal only
   }
+  // The returned cwd below keeps main's resolution. A caller that guards git targets also gets the place a
+  // first `cd` the resolution above does not read may land in (null = unknown), and can fail closed on it.
+  if (onCdCandidate) {
+    let candidate;
+    try { candidate = unreadCdCandidate(parsed.segments, reportedCwd, resolvePath, home); } catch { candidate = null; }
+    if (candidate !== undefined) onCdCandidate(candidate);
+  }
   // First `cd <target>` statement wins (that is where the command lands before the mutation runs).
   for (const stmt of parsed.segments) {
     const cd = stmt.trim().match(/^cd\s+(.+)$/);
@@ -2958,7 +3905,27 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
     let target = cd[1].trim().split(/\s+/)[0];                // first arg only (ignore trailing redirs/opts)
     target = target.replace(/^(['"])(.*)\1$/, '$2');          // strip surrounding quotes
     const v = target.match(/^\$\{?([A-Za-z_]\w*)\}?$/);       // whole target is $VAR / ${VAR}
-    if (v) target = vars[v[1]] ?? '';
+    if (v) {
+      target = vars[v[1]] ?? '';
+      // The last literal value wins above, even when a later assignment was conditional and may be
+      // skipped. A caller guarding git targets also gets every other value the variable may hold.
+      if (onCdCandidate) {
+        for (const value of cdVariableValues(parsed.segments, v[1], home)) {
+          onCdCandidate(value === null ? null : value.startsWith('/') ? value : resolvePath(reportedCwd || '.', value));
+        }
+      }
+    } else if (onCdCandidate) {
+      // `cd "$L/"`, `cd $L/sub`, `cd "$L"/.`: main gives up on these and keeps the reported cwd. A variable
+      // this command assigns still says where the cd may land: report each value joined with the suffix.
+      const prefixed = target.replace(/["']/g, '').match(/^\$\{?([A-Za-z_]\w*)\}?(\/.*)$/);
+      if (prefixed) {
+        for (const value of cdVariableValues(parsed.segments, prefixed[1], home)) {
+          if (value === null || /[`$(*?\[{]/.test(prefixed[2])) { onCdCandidate(null); continue; }
+          const joined = value + prefixed[2];
+          onCdCandidate(joined.startsWith('/') ? resolvePath(joined) : resolvePath(reportedCwd || '.', joined));
+        }
+      }
+    }
     if (!target || /[`$(*?]/.test(target)) return reportedCwd; // still unexpanded / globby → fail safe
     return target.startsWith('/') ? target : resolvePath(reportedCwd || '.', target);
   }
@@ -3821,7 +4788,7 @@ function globMatch(tokens, s) {
   return t === tokens.length;
 }
 
-export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLiveLease = false, markedLeaseSlug = null, contestedHolderSlug = null, dispatchKind = null, cwd = null, daemonCloneRoots = [], fixClaimedBranches = [], pushTargets = [], fixPushes = [] } = {}) {
+export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLiveLease = false, markedLeaseSlug = null, contestedHolderSlug = null, dispatchKind = null, cwd = null, daemonCloneRoots = [], gitEnvDirs = [], gitConfigEnv = {}, gitTargetUnknown = false, daemonFetchConfigReader = null, fixClaimedBranches = [], pushTargets = [], fixPushes = [] } = {}) {
   const s = segment.trim();
   if (!s) return null;
 
@@ -3833,7 +4800,7 @@ export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLi
   // #xpt9fvd — a write targeting a DAEMON CLONE. Checked early and unconditionally (independent of
   // `primaryCwd`/lease context — a daemon clone is neither a primary checkout nor an ordinary leased lane):
   // see `daemonCloneWriteReason`'s own doc for the two shapes it catches and the one it deliberately does not.
-  const daemonWrite = daemonCloneWriteReason(s, { cwd, roots: daemonCloneRoots });
+  const daemonWrite = daemonCloneWriteReason(s, { cwd, roots: daemonCloneRoots, envDirs: gitEnvDirs, configEnv: gitConfigEnv, daemonFetchConfigReader, unknownTarget: gitTargetUnknown });
   if (daemonWrite) return daemonWrite;
 
   // xpnhz4o — a bare full-suite run. Before the raw-heavy arm so a bare `vitest run` gets THIS message (which
@@ -4040,6 +5007,10 @@ export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLi
   // `lane/*` ref → PR → CI gate; a direct `git push … main` (or a bare `git push` from a checkout on main)
   // skips CI entirely. Only an explicit `lane/*` destination is allowed. Sanctioned override: prefix
   // `MAIN_PUSH_OK=1` (e.g. pr-land --fallback-git, or an emergency the user directs).
+  const resolvedPush = canonicalGitOp(s);
+  if (/^git\s+push\b/.test(resolvedPush) && pushHasUnresolvedTarget(resolvedPush)
+      && !/\bMAIN_PUSH_OK=1\b/.test(s))
+    return 'unresolved git push arguments may target a protected ref. Use explicit literal remote/refspec arguments and push to a lane/* ref.';
   if (atCommand(/^git\s+push\b/) && !/\bMAIN_PUSH_OK=1\b/.test(s)) {
     const pushHead = heads.find((h) => /^git\s+push\b/.test(h));
     const rest = pushHead.replace(/^git\s+push\b/, '');
@@ -4479,17 +5450,23 @@ const GIT_STATE_SUBCOMMANDS = new Set([
   'add', 'commit', 'tag', 'stash', 'apply', 'am', 'cherry-pick', 'revert', 'merge', 'rebase', 'push',
   'mv', 'rm', 'reset', 'restore', 'checkout', 'switch', 'branch', 'worktree', 'clone', 'init',
   'update-ref', 'notes', 'fetch', 'pull',
+  'clean', 'read-tree', 'checkout-index', 'gc', 'prune', 'repack',
 ]);
 
 /** Programs whose whole job is to change the filesystem. Same shape and same reasoning as the git set: a
  *  short explicit list, not a "not on the read list" rule. */
-const FS_MUTATING_PROGRAMS = new Set([
+export const FS_MUTATING_PROGRAMS = new Set([
   'cp', 'mv', 'rm', 'rmdir', 'mkdir', 'touch', 'ln', 'install', 'rsync', 'chmod', 'chown', 'truncate', 'patch',
 ]);
 
 /** git's own global flags that SWALLOW the next token, so the subcommand walk below does not mistake their
  *  VALUE for the subcommand (`git -C /some/path add -A` → `add`, never `/some/path`). */
-const GIT_VALUE_FLAGS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--config-env']);
+// `--attr-source <tree>` takes a separate value too (git 2.40+); without it `HEAD` would read as the subcommand.
+const GIT_VALUE_FLAGS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--config-env',
+  '--attr-source']);
+const GIT_GLOBAL_FLAGS = new Set(['-p', '--paginate', '-P', '--no-pager', '--bare', '--no-replace-objects',
+  '--literal-pathspecs', '--glob-pathspecs', '--noglob-pathspecs', '--icase-pathspecs',
+  '--no-optional-locks', '--no-lazy-fetch', '--no-advice']);
 
 /** The git SUBCOMMAND of `segment`, or '' when it is not git. Pure. Reads the wrapper-peeled, basename-
  *  resolved `canonicalCommand` view, so `/usr/bin/git`, `env git` and `"git"` all resolve — the same
@@ -4497,12 +5474,38 @@ const GIT_VALUE_FLAGS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--name
 function gitSubcommand(segment) {
   if (programWord(segment) !== 'git') return '';
   const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
+  // Skip unknown global flags and still find the subcommand (`git --attr-source=HEAD add -A` → `add`), so
+  // every deny arm keyed on the subcommand (git-add enumeration, the collateral notice) keeps firing. An
+  // unknown flag can only HIDE a subcommand here, never invent a safe one.
   for (let i = 1; i < toks.length; i++) {
     if (GIT_VALUE_FLAGS.has(toks[i])) { i += 1; continue; }
     if (toks[i].startsWith('-')) continue;
     return toks[i];
   }
   return '';
+}
+
+/** The subcommand only when the global options before it are all known (`gitSubcommandIndex`), else ''.
+ *  The daemon-clone path uses this: an unknown flag's arity may hide a target, so it never guesses one. */
+function gitSubcommandStrict(segment) {
+  if (programWord(segment) !== 'git') return '';
+  const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
+  return toks[gitSubcommandIndex(toks)] || '';
+}
+
+function gitSubcommandIndex(toks) {
+  for (let i = 1; i < toks.length; i++) {
+    if (GIT_VALUE_FLAGS.has(toks[i])) {
+      if (i + 1 >= toks.length) return -1;
+      i += 1;
+      continue;
+    }
+    if (GIT_GLOBAL_FLAGS.has(toks[i]) || /^-(?:c|C).+/.test(toks[i])
+      || /^--(?:git-dir|work-tree|namespace|exec-path|config-env|attr-source)=/.test(toks[i])) continue;
+    if (toks[i].startsWith('-')) return -1; // unknown arity: no subsequent token is a proven subcommand
+    return i;
+  }
+  return toks.length;
 }
 
 /** What STATE would this segment have produced, in a few words — or null if it produces none. Pure.
@@ -4734,11 +5737,272 @@ export function decide(command, ctx = {}) {
   // quote-CORRECT (r1–r4) lost the coverage the quote-BLIND split had by accident, because a nested
   // command stopped being torn open at its separators. Recursing into those positions restores it
   // structurally — and covers the `bash -c "npm run build"` shape base never caught at all.
-  for (const seg of withNestedCommands(segments, command)) {
-    const r = reason(seg, ctx);
-    if (r) return r;
-  }
-  return null;
+  // Visit nested shells at their invocation, with a copy of the environment at that point. Flattening
+  // first applies future exports to earlier commands and lets assignments in child shells leak out.
+  let nestedBudget = NESTED_NODE_CAP;
+  const copyAlternates = (from) => new Map([...from].map(([key, values]) => [key, new Set(values)]));
+  const checkScope = (list, whole, inherited, depth, persist = null, inheritedReadonly = [], inheritedAlternates = new Map(), inheritedMaybeReadonly = [], inheritedAttributes = []) => {
+    const gitConfigEnv = { ...inherited };
+    const readonlyNames = new Set(inheritedReadonly);
+    // Names a possibly-skipped `readonly` may have locked: a later assignment or unset may fail, so it only
+    // adds a possible value and never replaces the locked one.
+    const maybeReadonly = new Set(inheritedMaybeReadonly);
+    // Integer, array, case-converting and inherited attributes can refuse or transform later assignments.
+    // A nameref can change another variable indirectly (null means any target may be affected).
+    const uncertainAttributes = new Set(inheritedAttributes);
+    // Other values a variable may hold because an assignment may not have run. Each is checked on its own:
+    // every env-derived Git target is added separately, so one swapped key at a time covers every mix.
+    const alternates = copyAlternates(inheritedAlternates);
+    const visitedNested = new Set();
+    // Clearing evidence must be unconditional. This scanner does not evaluate shell control flow;
+    // retain possible targets in conditional lists, loops, pipelines, groups, function bodies and after
+    // comments rather than assume a later assignment or unset ran. File-descriptor redirections
+    // (`2>&1`, `&>`) are not control flow.
+    const controlText = whole.replace(/\d*[<>]&\d*-?|&>>?/g, ' ');
+    const canUnset = !/[&|()]|\b(?:if|then|else|elif|while|until|for|do|case|select|function|enable)\b|(?:^|[\s;])[{}!#]/.test(controlText);
+    const setAssignment = (key, value, readonly = false, conditional = false, attribute = null) => {
+      if (readonlyNames.has(key)) return; // failed assignment/unset leaves a readonly target active
+      if (attribute) {
+        uncertainAttributes.add(key);
+        if (attribute === 'indirect') uncertainAttributes.add(null);
+      }
+      if (conditional || !canUnset || maybeReadonly.has(key) || uncertainAttributes.has(key)) {
+        // The assignment may be skipped or refused: it adds a possible value and never replaces the earlier
+        // one. A readonly that may not have run only marks the name as possibly locked.
+        if (gitConfigEnv[key] !== value) {
+          const values = alternates.get(key) || new Set();
+          values.add(gitConfigEnv[key]);
+          values.delete(value);
+          alternates.set(key, values);
+          if (values.size > ALTERNATE_CHECK_CAP) {
+            // Too many possible values to track: the value is unknown, so every target reader fails closed.
+            // Collapsing also bounds the per-segment work that grows with each possible HOME.
+            alternates.delete(key);
+            value = `\${${key}}`;
+          }
+        }
+        gitConfigEnv[key] = value;
+        if (readonly) maybeReadonly.add(key);
+        if (persist) persist(key, value, readonly, true, attribute);
+        return;
+      }
+      gitConfigEnv[key] = value;
+      alternates.delete(key);
+      if (readonly) readonlyNames.add(key);
+      if (persist) persist(key, value, readonly, false);
+    };
+    // Bash expands a tilde in an assignment value when the assignment runs. The first HOME is the one in
+    // effect; every other possible HOME (a possibly skipped assignment) adds its expansion as a possible value.
+    const assignValue = (key, raw, homes, readonly, conditional, attribute) => {
+      const [value, ...others] = [...new Set(homes.map((home) => assignedValue(raw, home)))];
+      if (!others.length) {
+        setAssignment(key, value, readonly, conditional, attribute);
+        return;
+      }
+      for (const other of others) setAssignment(key, other, readonly, true, attribute);
+      setAssignment(key, value, readonly, true, attribute);
+    };
+    const checkNested = (text, env, persistChanges = null, childReadonly = readonlyNames, childAlternates = alternates,
+      childMaybeReadonly = maybeReadonly, childAttributes = uncertainAttributes) => {
+      if (!String(text).trim()) return null;
+      if (depth >= NESTED_DEPTH_CAP || nestedBudget <= 0) {
+        // Uninspected executable text may violate ANY guard rule, even without clone targets.
+        // Repeated text can run under different shell state, so it still needs inspection.
+        const protection = ctx.daemonCloneRoots?.length ? 'DAEMON CLONE protection' : 'Shell command protection';
+        return `${protection}: nested-command traversal ${nestedBudget <= 0 ? 'budget' : 'depth limit'} exhausted; `
+          + 'split the command into smaller, shallower invocations so every target can be checked. '
+          + (ctx.daemonCloneRoots?.length
+            ? daemonCloneWriteMessage('unresolved target in uninspected nested command') : 'Uninspected executable text cannot be allowed.');
+      }
+      nestedBudget -= 1;
+      return checkScope(parseSegments(text).segments, text, env, depth + 1, persistChanges, childReadonly, childAlternates,
+        childMaybeReadonly, childAttributes);
+    };
+    // Writers the tracker below does not model (`read`, `printf -v`, `for NAME in`, `+=`, `let`, `getopts`,
+    // `mapfile`, a declaration builtin, eval/source) may set a protected Git name or HOME to anything. The
+    // whole scope is scanned first, so a loop back-edge or a function body defined earlier cannot run a git
+    // mutation before the writer is seen. A tainted Git name makes every git target in this scope unknown
+    // (mutations fail closed); a written HOME leaves every tilde unresolved instead of trusting a tracked value.
+    let homeWritten = gitConfigEnv.HOME === UNRESOLVED_HOME;
+    const tainted = [];
+    for (const originalSeg of list) {
+      const seg = scopeStatement(originalSeg);
+      if (!homeWritten && statementWritesHome(seg)) homeWritten = true;
+      for (const name of unmodelledGitWrites(seg)) if (!uncertainAttributes.has(name)) { uncertainAttributes.add(name); tainted.push(name); }
+    }
+    const forceHome = () => {
+      if (!homeWritten) return;
+      gitConfigEnv.HOME = UNRESOLVED_HOME;
+      alternates.delete('HOME');
+    };
+    forceHome();
+    for (const originalSeg of list) {
+      // Compound headers are syntax, not executable program names. Inspect the body at its position
+      // in this scope; canUnset=false retains both the prior value and every possibly executed export.
+      // Explicit child shells still recurse with a copy through checkNested below.
+      const seg = scopeStatement(originalSeg);
+      const homeBefore = gitConfigEnv.HOME;
+      let attributeTargetUnknown = false;
+      if (uncertainAttributes.size) {
+        const named = new Set(seg.match(/[A-Za-z_][A-Za-z0-9_]*/g) || []);
+        attributeTargetUnknown = [...uncertainAttributes].some((key) => key === null
+          || /^(?:GIT_|HOME$|XDG_CONFIG_HOME$)/.test(key) || named.has(key));
+      }
+      const r = reason(seg, { ...ctx, gitConfigEnv, gitTargetUnknown: ctx.gitTargetUnknown || attributeTargetUnknown });
+      if (r) return r;
+      // Only a git invocation reads the environment for a target. Check each relevant possible value on its
+      // own; past ALTERNATE_CHECK_CAP the target is unknown and a state change fails closed.
+      if (alternates.size && gitSubcommand(seg)) {
+        const pairs = [];
+        const named = new Set(seg.match(/[A-Za-z_][A-Za-z0-9_]*/g) || []);
+        for (const [key, values] of alternates) {
+          if (!/^(?:GIT_|HOME$|XDG_CONFIG_HOME$)/.test(key) && !named.has(key)) continue;
+          for (const value of values) pairs.push([key, value]);
+        }
+        if (pairs.length > ALTERNATE_CHECK_CAP) {
+          const unknown = reason(seg, { ...ctx, gitConfigEnv, gitTargetUnknown: true });
+          if (unknown) return unknown;
+        } else {
+          for (const [key, value] of pairs) {
+            const alt = reason(seg, { ...ctx, gitConfigEnv: { ...gitConfigEnv, [key]: value } });
+            if (alt) return alt;
+          }
+        }
+      }
+      const leading = gitLeadingAssignments(seg);
+      // Inline values expand their tildes as leadingAssignmentEnvs describes, under every HOME this shell may
+      // hold; each other reading becomes a possible value of the variable it changes.
+      const homeOptions = [gitConfigEnv, ...[...(alternates.get('HOME') || [])].map((home) => ({ ...gitConfigEnv, HOME: home }))];
+      const readings = leading.length ? homeOptions.flatMap((env) => leadingAssignmentEnvs(env, seg)) : [{ ...gitConfigEnv }];
+      const localEnv = readings[0];
+      let localAlternates = alternates;
+      if (leading.length && (readings.length > 1 || leading.some((assignment) => alternates.has(assignment[1])))) {
+        localAlternates = copyAlternates(alternates);
+      }
+      if (localAlternates !== alternates) {
+        for (const assignment of leading) localAlternates.delete(assignment[1]); // a command-local assignment always applies
+        for (const other of readings.slice(1)) {
+          for (const [, key] of leading) {
+            if (other[key] === localEnv[key]) continue;
+            const values = localAlternates.get(key) || new Set();
+            values.add(other[key]);
+            localAlternates.set(key, values);
+          }
+        }
+      }
+      // Substitutions run before the command's local assignments take effect; explicit child shells
+      // and runners receive those assignments even behind wrappers such as `command env`.
+      const substitutionCount = substitutionBodies(seg).length;
+      for (const [index, text] of nestedCommandStrings(seg).entries()) {
+        visitedNested.add(text);
+        const substitution = index < substitutionCount;
+        const newProcess = !substitution && (SHELL_PROGRAMS.has(programWord(seg)) || runnerInvocation(canonicalCommand(seg))?.exec);
+        // eval executes in this shell; explicit assignments in its script survive the invocation.
+        const nestedReason = checkNested(text, substitution ? gitConfigEnv : localEnv,
+          !substitution && programWord(seg) === 'eval' ? setAssignment : null, newProcess ? [] : readonlyNames,
+          substitution ? alternates : localAlternates, newProcess ? [] : maybeReadonly);
+        if (nestedReason) return nestedReason;
+      }
+      const words = shellTokens(seg).filter((t) => !t.op).map((t) => t.text);
+      const canonicalWords = shellTokens(canonicalCommand(seg)).filter((t) => !t.op).map((t) => t.text);
+      // A failed redirection skips the builtin, and an unknown option makes it refuse: either way its
+      // assignment or unset may not run, so it only adds a possible value.
+      const redirected = shellTokens(seg).some((t) => t.op && /[<>]/.test(t.text));
+      const knownOptions = { export: /^-[fnp]+$/, readonly: /^-[aAfp]+$/, declare: /^[-+][aAfFgilnrtuxIp]+$/,
+        typeset: /^[-+][aAfFgilnrtuxIp]+$/ }[canonicalWords[0]];
+      // Bash reads options only up to `--` or the first non-option word; a later dash word is a name.
+      const optionWords = [];
+      for (const word of canonicalWords.slice(1)) {
+        if (word === '--' || !/^[-+]./.test(word)) break;
+        optionWords.push(word);
+      }
+      const badOption = !!knownOptions && optionWords.some((t) => !knownOptions.test(t));
+      // `declare`/`typeset` with -p, -f or -F print or list and assign nothing; `export -f` and `readonly -f`
+      // name functions, never variables. Bash versions differ on `export -p X=v` / `readonly -p X=v`, so
+      // those only add a possible value.
+      const printsOnly = ['declare', 'typeset'].includes(canonicalWords[0])
+        ? optionWords.some((t) => /[pfF]/.test(t))
+        : ['export', 'readonly'].includes(canonicalWords[0]) && optionWords.some((t) => /^-[A-Za-z]*f/.test(t));
+      const versionDependent = ['export', 'readonly'].includes(canonicalWords[0])
+        && optionWords.some((t) => /^-[A-Za-z]*p/.test(t));
+      // Recognized options are not all plain string assignments. Even a supported option can fail on
+      // this variable or Bash version; attributes also survive a declaration without an assignment.
+      // local may fail or expose a value from an unmodelled function scope; never trust its reassignment.
+      const attribute = canonicalWords[0] === 'local' ? 'value' : !printsOnly && ['declare', 'typeset', 'readonly'].includes(canonicalWords[0])
+        && optionWords.some((t) => /[aAilunI]/.test(t))
+        ? (optionWords.some((t) => /n/.test(t)) ? 'indirect' : 'value') : null;
+      const uncertain = redirected || badOption || versionDependent || !!attribute;
+      if (!seg.trim().startsWith('(') && canonicalWords[0] === 'unset') {
+        let variables = true;
+        let options = true;
+        const names = [];
+        for (const word of canonicalWords.slice(1)) {
+          if (options && word === '--') { options = false; continue; }
+          if (options && word.startsWith('-')) {
+            if (!/^-[v]+$/.test(word)) variables = false; // -f/-n do not remove ordinary variables
+            continue;
+          }
+          names.push(word);
+        }
+        if (variables) for (const name of names) {
+          if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) setAssignment(name, undefined, false, uncertain);
+        }
+      }
+      const directive = !seg.trim().startsWith('(')
+        && ['export', 'declare', 'typeset', 'readonly', 'local'].includes(canonicalWords[0]);
+      if (directive || words.every((t) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(t))) {
+        const readonly = canonicalWords[0] === 'readonly'
+          || (['declare', 'typeset'].includes(canonicalWords[0]) && optionWords.some((t) => /^-[A-Za-z]*r[A-Za-z]*$/.test(t)));
+        const leadingWords = gitLeadingAssignments(seg).map((m) => m[0]);
+        const assignments = directive ? [...leadingWords, ...(printsOnly ? [] : canonicalWords)] : words;
+        // A bare assignment statement expands each value after the earlier ones ran. Declaration arguments are
+        // expanded before the builtin runs, so they see the statement's starting HOME; after a HOME operand
+        // the left-to-right reading is also kept as a possible value.
+        const homesNow = () => (homeWritten ? [UNRESOLVED_HOME] : [gitConfigEnv.HOME, ...(alternates.get('HOME') || [])]);
+        const statementHomes = homesNow();
+        let homeAssigned = false;
+        // A prefix assignment on a declaration builtin is temporary in Bash but kept in POSIX mode: it only
+        // adds a possible value and never replaces the earlier one.
+        const prefixCount = directive ? leadingWords.length : 0;
+        for (const [index, word] of assignments.entries()) {
+          const m = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(word);
+          if (m) {
+            const homes = !directive ? homesNow() : homeAssigned ? [...statementHomes, ...homesNow()] : statementHomes;
+            assignValue(m[1], m[2], homes, readonly && index >= prefixCount, uncertain || index < prefixCount, attribute);
+            if (m[1] === 'HOME') homeAssigned = true;
+          }
+          else if (attribute && /^([A-Za-z_][A-Za-z0-9_]*)(?:\[|\+=)/.test(word)) {
+            // Indexed and append operands still apply attributes to the base variable. Their value is
+            // unresolved, so the target check uses the attribute marker rather than guessing shell evaluation.
+            const name = /^[A-Za-z_][A-Za-z0-9_]*/.exec(word)[0];
+            setAssignment(name, gitConfigEnv[name], readonly, true, attribute);
+          } else if ((readonly || attribute) && word !== canonicalWords[0] && /^[A-Za-z_][A-Za-z0-9_]*$/.test(word)) {
+            setAssignment(word, gitConfigEnv[word], readonly, uncertain, attribute);
+          }
+        }
+      }
+      // HOME writers this tracker does not model (`HOME+=`, `read HOME`, `printf -v HOME`, a prefix a special
+      // builtin may keep) must not leave a stale HOME. The cd resolver's statement reader says what HOME can
+      // be after this statement; when it cannot tell, or disagrees, HOME becomes unknown and tilde targets fail closed.
+      let readerHome;
+      try {
+        readerHome = valueAfter(seg, 'HOME', homeBefore, typeof homeBefore === 'string' ? homeBefore : null);
+      } catch { readerHome = null; }
+      if (readerHome === null || readerHome !== gitConfigEnv.HOME) setAssignment('HOME', '${HOME}', false, true);
+      forceHome();
+    }
+    // Preserve the whole-command recovery used by withNestedCommands: a substitution/group containing
+    // separators may not be reconstructible from an individual segment. Never use future assignments.
+    const group = leadingGroupBody(whole);
+    for (const text of [...substitutionBodies(whole), ...(group === null ? [] : [group])]) {
+      if (visitedNested.has(text)) continue;
+      const r = checkNested(text, homeWritten ? { ...inherited, HOME: UNRESOLVED_HOME } : inherited, null, inheritedReadonly,
+        inheritedAlternates, inheritedMaybeReadonly, [...inheritedAttributes, ...tainted]);
+      if (r) return r;
+    }
+    return null;
+  };
+  return checkScope(segments, command, ctx.gitConfigEnv, 0);
 }
 
 // #2323 — how many commits is `cwd`'s HEAD behind its upstream (`@{u}`)? Impure (a git call), so it lives in
@@ -4849,6 +6113,7 @@ if (IS_CLI) {
   let dispatchKind = null;
   let agentSession = false;
   let effectiveCwd = null;
+  let cwdUnknown = false; // a first `cd` may land in a daemon clone, or cannot be followed (HOME rebound, `cd -`)
   let daemonRoots = [];
   let hookSessionId = null;
   let orchestratorSettings = {};
@@ -4886,7 +6151,10 @@ if (IS_CLI) {
     const rp = (p) => { try { return realpathSync(p); } catch { return p; } };
     // #2335 — the reported cwd resets to the primary between calls; honour a leading `cd <lane>` so a genuine
     // lane mutation isn't misread as a primary one (and the #2323 git call runs in the lane, not the primary).
-    const cwd = rp(resolveEffectiveCwd(cmd, ev.cwd || process.cwd()));
+    // Every place the first `cd` may land (null = unknown). Collected, never overwritten: one safe candidate
+    // must not hide an earlier protected or unknown one.
+    const cdCandidates = [];
+    const cwd = rp(resolveEffectiveCwd(cmd, ev.cwd || process.cwd(), undefined, undefined, (candidate) => { cdCandidates.push(candidate); }));
     effectiveCwd = cwd;
     const weRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
     const workspace = dirname(weRoot);
@@ -4896,6 +6164,10 @@ if (IS_CLI) {
     // from the same `workspace` the primaries above use. A fault here fails open (empty list ⇒
     // `daemonCloneWriteReason` denies nothing) rather than wedging the agent.
     try { daemonRoots = daemonCloneRoots(workspace); } catch { daemonRoots = []; }
+    // A first `cd` main's resolution does not read may land in a daemon clone: its git targets fail closed.
+    try {
+      if (cdCandidates.some((c) => c === null || (typeof c === 'string' && isDaemonCloneRealpath(c, daemonRoots)))) cwdUnknown = true;
+    } catch { cwdUnknown = true; }
     // #2323 — only pay for the git call when it could possibly matter: a lane cwd about to run a
     // backlog-mutation command. Every other Bash call (the overwhelming majority) skips it entirely.
     if (!primaryCwd && isLaneCwd(cwd) && isBacklogMutation(cmd)) staleBehind = commitsBehindUpstream(cwd);
@@ -4910,7 +6182,9 @@ if (IS_CLI) {
   if (/\bgit\b/.test(cmd) && /\bpush\b/.test(cmd)) {
     ({ fixPushes } = await computeFixClaimCtx(cmd, { caller: { sessionId: hookSessionId, who: process.env.WE_FIX_WHO || null, token: process.env.WE_FIX_TOKEN || null }, cwd: effectiveCwd || process.cwd() }));
   }
-  const guardCtx = { ...orchestratorSettings, primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, daemonCloneRoots: daemonRoots, fixPushes };
+  // --config-env can name any inherited variable, not just one of Git's own GIT_* variables.
+  const gitConfigEnv = { ...process.env };
+  const guardCtx = { ...orchestratorSettings, primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, daemonCloneRoots: daemonRoots, gitConfigEnv, gitTargetUnknown: cwdUnknown, daemonFetchConfigReader: readDaemonFetchConfig, fixPushes };
   const r = decide(cmd, guardCtx);
   if (r) {
     // #3311 — the deny is ALL-OR-NOTHING, so name the state-producing steps it takes down with it. Computed
