@@ -87,6 +87,13 @@ function wrappedChain(command) {
 
 // Only THIS checkout-independent wrapper (beside this module) owns its own admission; any other path is an ordinary command.
 export const SHARD_RUN_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'verify-shard-run.mjs');
+// Why a phase the wrapper cannot take stays local. `vitest related` is local by design today: Forge's allowlist
+// accepts it, but the nested heavy-admission wrapper maps only `vitest run`, so it never reaches the remote path.
+export function localPhaseReason(command) {
+  return command.split(' && ').some(segment => /^npx vitest related(?=\s|$)/.test(segment.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '')))
+    ? 'vitest-related-local-only' : 'raw-command';
+}
+
 export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
   if (!/[;&|<>`$()\r\n]/.test(command.replace(/'(?:[^']|'\\'')*'/g, "''")) && command.startsWith(`node ${shellQuote(SHARD_RUN_SCRIPT)} `)) {
     return { command, takeLocalSlot: false, setHeld: false, shardWrapper: true };
