@@ -175,7 +175,13 @@ export function runsRetention(o = {}) {
     catch (e) {
       // A crashed pass leaves its lock behind: reclaim it only when its recorded owner pid is gone.
       if (e.code !== 'EEXIST' || ownerAlive()) throw e;
-      unlinkSync(join(lockDir, 'owner')); rmdirSync(lockDir); mkdirSync(lockDir);
+      // Atomic takeover: only ONE contender can rename the stale lock away; it re-checks the owner of what it got.
+      const grave = `${lockDir}.stale.${randomUUID()}`;
+      renameSync(lockDir, grave);
+      let pid; try { pid = Number(readFileSync(join(grave, 'owner'), 'utf8')); process.kill(pid, 0); renameSync(grave, lockDir); throw e; }
+      catch (e2) { if (e2 === e || e2.code === 'EPERM') throw e; }
+      rmSync(grave, { recursive: true, force: true });
+      mkdirSync(lockDir);
     }
     writeFileSync(join(lockDir, 'owner'), String(process.pid));
   } catch (e) { out.status = 'skipped'; out.errors.push(`archive busy or unwritable (${e.code}); originals retained`); return out; }
