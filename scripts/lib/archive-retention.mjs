@@ -159,7 +159,8 @@ export async function archiveRetention(o = {}) {
       try { await link(parked, canonical); await unlink(parked); return true; }
       catch (e) {
         out.errors.push(`ALERT: restore of ${basename(parked)} failed (${e.code ?? e.message}); operator must inspect`);
-        await (o.emit ?? (ev => appendDaemonEvent(ev, { env })))({ kind: 'archive-retention-alert', daemon: 'archive-retention', detail: { parked, canonical, error: e.message } }).catch(() => {});
+        // The emitter may be sync or async and may throw: an alert failure must never abort the scan.
+        try { await (o.emit ?? (ev => appendDaemonEvent(ev, { env })))({ kind: 'archive-retention-alert', daemon: 'archive-retention', detail: { parked, canonical, error: e.message } }); } catch { /* alert is best-effort */ }
         return false;
       }
     }
@@ -253,7 +254,7 @@ export async function archiveRetention(o = {}) {
         await writeArchiveManifest(archiveManifest, source, drive, next, maxFiles);
         archived = next;
         out.bundles.push(final); out.filesArchived += names.length;
-        let uncoordinated = 0;
+        let uncoordinated = 0; const retry = [];
         for (const f of group.files) {
           let removed = false, entered = false;
           const remove = async (writerExcluded) => {
@@ -282,7 +283,15 @@ export async function archiveRetention(o = {}) {
               await remove(false);
             }
           } catch (e) { if (e.code !== 'ENOENT') throw e; }
-          if (!removed) out.filesRetained++;
+          if (!removed) { out.filesRetained++; if (kind === 'runs' && o.withSourceWriterExclusion) retry.push(relative(source, f.path)); }
+        }
+        // A runs record that has a removal path (a provider) but was skipped (live writer, restored quarantine) must not
+        // stay excluded forever by the manifest: forget it so the next run re-verifies and retries removal.
+        // (Cost: one extra Drive bundle per retry; the sources are never deleted without a fresh verified copy.)
+        if (retry.length) {
+          const forget = new Map(archived); for (const key of retry) forget.delete(key);
+          await writeArchiveManifest(archiveManifest, source, drive, forget, maxFiles);
+          archived = forget;
         }
         if (uncoordinated) out.errors.push(`Source removal skipped for ${uncoordinated} files: writer exclusion unavailable; originals retained. Operator must arrange exclusion of all source writers, including open descriptors, before reclamation.`);
         for (const dir of [...new Set(group.dirs)].sort((a, b) => b.length - a.length)) {
