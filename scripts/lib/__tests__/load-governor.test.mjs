@@ -105,6 +105,18 @@ describe('settings: a priority override without a cutoff resolves one inside tha
     expect(shouldHold({ text: 'feature-build', holding: true, settings: s }).hold).toBe(true);
     expect(shouldHold({ text: 'red-main repair', holding: true, settings: s }).hold).toBe(false);
   });
+  it('a missing cutoff never makes the top class holdable', () => {
+    const s = resolveGovernorSettings({ settings: { loadGovernor: { priority: ['urgent', 'normal', 'low'], classPatterns: { urgent: ['urgent'] } } } });
+    expect(s.priority).toEqual(['urgent', 'normal', 'low']);
+    expect(shouldHold({ text: 'urgent-job', holding: true, settings: s }).hold).toBe(false);
+    expect(shouldHold({ text: 'whatever', holding: true, settings: s }).hold).toBe(true);
+  });
+  it('an array or empty-pattern classPatterns override cannot create junk classes or erase patterns', () => {
+    const a = resolveGovernorSettings({ settings: { loadGovernor: { classPatterns: [['x']] } } });
+    expect(Object.keys(a.classPatterns)).toEqual(Object.keys(D.classPatterns));
+    const b = resolveGovernorSettings({ settings: { loadGovernor: { classPatterns: { 'main-fix': [] } } } });
+    expect(b.classPatterns['main-fix']).toEqual(D.classPatterns['main-fix']);
+  });
   it('keeps the default cutoff when the override still contains it', () => {
     const s = resolveGovernorSettings({ settings: { loadGovernor: { priority: ['build', 'daemon-fix', 'report'] } } });
     expect(s.holdFromClass).toBe('daemon-fix'); expect(s.priority.includes(s.holdFromClass)).toBe(true);
@@ -184,6 +196,22 @@ describe('worker-pause CLI and smell', () => {
     expect(main(['--resume', flag], { dir, out: o, now })).not.toBe(0);
     expect(out.at(-1)).toMatch(/error/);
     expect(listPauses({ dir, now }).map((x) => x.owner).sort()).toEqual(['a', 'b']);
+  });
+  it.each([['--owner='], ['--owner=.'], ['--owner=..'], ['--owner=  '], ['--owner']])('setting a pause with %s is an argument error, not a crash', (flag) => {
+    const dir = tmp(); const out = [];
+    expect(main([flag], { dir, out: (s) => out.push(s) })).toBe(2);
+    expect(out.at(-1)).toMatch(/error/); expect(listPauses({ dir })).toEqual([]);
+  });
+  it.each([['--resume='], ['--resume=0'], ['--resume=false'], ['--list=x'], ['--tick=1'], ['--tick', '--owners'], ['--owner=a', '--reason']])('flag %s misuse is an argument error', (...argv) => {
+    const dir = tmp(); const now = new Date('2026-11-03T13:00:00Z'); setPause({ dir, owner: 'a', reason: 'x', now });
+    expect(main(argv, { dir, out: () => {}, now, load: () => 3, home: tmp() })).toBe(2);
+    expect(listPauses({ dir, now }).map((x) => x.owner)).toEqual(['a']);
+  });
+  it('a tick skips owners whose flag name would be the pause dir itself instead of crashing', () => {
+    const dir = tmp(); const now = new Date('2026-11-03T13:00:00Z');
+    const r = governorTick({ loadPerCore: 3, owners: [{ owner: '.' }, { owner: '..' }, { owner: '' }, { owner: 'build-ok' }], stateFile: join(tmp(), 's.json'), dir, now });
+    expect(r.events.filter((e) => e.event === 'paused').map((e) => e.owner)).toEqual(['build-ok']);
+    expect(r.events.filter((e) => e.event === 'skipped-invalid-owner').length).toBe(3);
   });
   it('bare --resume still clears every flag', () => {
     const dir = tmp(); const now = new Date('2026-11-03T13:00:00Z');

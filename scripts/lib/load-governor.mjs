@@ -31,16 +31,18 @@ export function resolveGovernorSettings({ settings, env = {} } = {}) {
   if (Array.isArray(s.priority) && s.priority.length && s.priority.every((x) => typeof x === 'string')) r.priority = [...s.priority];
   const explicitCutoff = typeof s.holdFromClass === 'string' && r.priority.includes(s.holdFromClass);
   if (explicitCutoff) r.holdFromClass = s.holdFromClass;
-  if (s.classPatterns && typeof s.classPatterns === 'object') {
+  if (s.classPatterns && typeof s.classPatterns === 'object' && !Array.isArray(s.classPatterns)) {
     for (const [c, p] of Object.entries(s.classPatterns)) {
       if (c === '__proto__') continue; // assigning it would swap the prototype instead of adding a class
-      if (Array.isArray(p) && p.every((x) => typeof x === 'string' && x.trim())) r.classPatterns[c] = p; // a blank pattern matches every owner
+      if (Array.isArray(p) && p.length && p.every((x) => typeof x === 'string' && x.trim())) r.classPatterns[c] = p; // a blank pattern matches every owner
     }
   }
   // No usable cutoff given: resolve one that exists in the resulting priority list (the default if it is there and reachable,
   // else the first reachable non-exempt class) instead of discarding the whole priority override.
   if (!explicitCutoff) {
-    const cand = [GOVERNOR_DEFAULTS.holdFromClass, ...r.priority].find((c) => r.priority.includes(c) && !ALWAYS_EXEMPT.includes(c) && isReachable(c, r));
+    // never the highest-priority class by accident: default cutoff, else the fallback class, else the LOWEST reachable class
+    const ok = (c) => r.priority.includes(c) && !ALWAYS_EXEMPT.includes(c) && isReachable(c, r);
+    const cand = [GOVERNOR_DEFAULTS.holdFromClass, fallbackClass(r), ...[...r.priority].reverse()].find(ok);
     if (cand) r.holdFromClass = cand;
   }
   const t = Number(env.WE_LOAD_GOVERNOR_TARGET); if (pos(t)) r.targetLoadPerCore = t;
@@ -100,6 +102,8 @@ export function releaseOrder(waiters, settings = GOVERNOR_DEFAULTS) {
 // ── pause flags: <dir>/<owner> = {reason, at, resumeWhen, by} ──────────────────────────────────────────────────────
 export const defaultPauseDir = (home = homedir()) => join(home, '.claude', 'conveyor', 'pause');
 const safe = (o) => String(o).replace(/[^A-Za-z0-9._-]/g, '_');
+/** An owner name usable as a flag file: a non-blank string whose on-disk name is not the pause dir (`.`) or its parent (`..`). */
+export const validOwner = (o) => typeof o === 'string' && o.trim() !== '' && !['.', '..'].includes(safe(o));
 
 export function setPause({ dir = defaultPauseDir(), owner, reason, resumeWhen = 'load below resumeBelowPerCore', by = 'operator', now = new Date() }) {
   mkdirSync(dir, { recursive: true });
@@ -137,6 +141,7 @@ export function governorTick({ loadPerCore, owners = [], settings = GOVERNOR_DEF
   if (!st.holding) cooled = [];
   if (st.unreadable) events.push({ event: 'load-unreadable', reason: st.reason });
   for (const { owner, text } of owners) {
+    if (!validOwner(owner)) { events.push({ event: 'skipped-invalid-owner', owner: String(owner) }); continue; } // `.`/`..`/blank would hit the pause dir itself
     const cls = ownerClass(text ?? owner, settings);
     const cur = readPause({ dir, owner, maxPauseMinutes: settings.maxPauseMinutes, now });
     if (!isHoldable(cls, settings)) { // reclassified as exempt (e.g. feature-build -> red-main-repair): drop OUR pause, never an operator's

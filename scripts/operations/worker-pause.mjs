@@ -8,7 +8,7 @@ import { loadavg, cpus, homedir } from 'node:os';
 import { join } from 'node:path';
 import { readSettings } from '../lib/settings-files.mjs';
 import { writeLineSync } from '../lib/write-all-sync.mjs';
-import { resolveGovernorSettings, setPause, clearPause, listPauses, governorTick, appendEvents, defaultPauseDir } from '../lib/load-governor.mjs';
+import { resolveGovernorSettings, setPause, clearPause, listPauses, governorTick, validOwner, appendEvents, defaultPauseDir } from '../lib/load-governor.mjs';
 
 export function parseArgs(argv) {
   const o = {};
@@ -17,6 +17,10 @@ export function parseArgs(argv) {
 }
 export function main(argv, { out = (s) => writeLineSync(1, s),settings, dir = defaultPauseDir(), now = new Date(), load = () => loadavg()[0] / cpus().length, home = homedir() } = {}) {
   const a = parseArgs(argv);
+  // boolean flags take no value (`--resume=` / `--resume=0` would otherwise take a different path than bare `--resume`); value flags need one
+  const bad = ['list', 'tick', 'resume'].filter((k) => k in a && a[k] !== true).map((k) => `--${k} takes no value`)
+    .concat(['owners', 'reason', 'resume-when'].filter((k) => k in a && typeof a[k] !== 'string').map((k) => `--${k} needs a value`));
+  if (bad.length) { out(`error: ${bad.join('; ')}`); return 2; }
   const s = settings ?? resolveGovernorSettings({ settings: readSettings(), env: process.env });
   if (a.list) { const l = listPauses({ dir, maxPauseMinutes: s.maxPauseMinutes, now }); out(l.length ? l.map((x) => `${x.owner}\t${x.flag.at}\t${x.flag.reason}`).join('\n') : 'no live pause flags'); return 0; }
   if (a.tick) {
@@ -28,11 +32,12 @@ export function main(argv, { out = (s) => writeLineSync(1, s),settings, dir = de
     return 0;
   }
   if (a.resume) {
-    if ('owner' in a && !(typeof a.owner === 'string' && a.owner.trim())) { out('error: --owner needs a non-empty value (use --resume alone to clear every flag)'); return 2; }
+    if ('owner' in a && !validOwner(a.owner)) { out('error: --owner needs a valid owner name (use --resume alone to clear every flag)'); return 2; }
     if (typeof a.owner === 'string') { out(clearPause({ dir, owner: a.owner }) ? `resumed ${a.owner}` : `no flag for ${a.owner}`); return 0; }
     const l = listPauses({ dir, maxPauseMinutes: s.maxPauseMinutes, now }); l.forEach((x) => clearPause({ dir, owner: x.owner })); out(`resumed ${l.length} owner(s)`); return 0;
   }
-  if (typeof a.owner === 'string') {
+  if ('owner' in a) {
+    if (!validOwner(a.owner)) { out('error: --owner needs a valid owner name'); return 2; }
     const f = setPause({ dir, owner: a.owner, reason: typeof a.reason === 'string' ? a.reason : 'operator pause', ...(typeof a['resume-when'] === 'string' ? { resumeWhen: a['resume-when'] } : {}), by: 'operator', now });
     out(`paused ${a.owner} since ${f.at} (auto-expires after ${s.maxPauseMinutes} min)`); return 0;
   }
