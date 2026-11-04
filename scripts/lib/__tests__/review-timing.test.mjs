@@ -3,6 +3,7 @@ import { REVIEW_TIMING_DEFAULTS as review, FIX_TIMING_DEFAULTS as fix,
   fixPushGate, reviewStartGate, reviewMustVoid, rereviewMode, joinedFixDecision, fixReadiness, fastChecksFor, NON_HEALABLE_CHECKS, ciRedOnHead } from '../review-timing.mjs';
 import * as reviewTiming from '../review-timing.mjs';
 import { CI_TRUTH_EXCLUDED_CHECKS } from '../../operations/pr-status.mjs';
+import { reviewCiGate } from '../review-ci-gate.mjs';
 import { resolveTimingPolicy } from '../review-timing-settings.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
 const head = 'a'.repeat(40);
@@ -13,6 +14,21 @@ describe('pending-CI start policy', () => {
     const policy = { ...review, startAfter: 'fast-checks', startEarly, fastChecks: ['test', 'integration', 'standards'] };
     const result = reviewStartGate({ headSha: head, requiredChecks: ['test', 'integration'], checks: [check('test')], policy });
     expect(result.affected).toEqual([{ name: 'standards', reason: 'missing' }]);
+  });
+  // Red team on f4ed5360 (#6326): a green LEGACY commit status (`{context, state}`) must imply integration in the
+  // registration gate exactly as the strict gate (which normalizes statuses first) already does.
+  describe.each(['ci-green', 'fast-checks', 'push'])('a green legacy status test implies integration under startAfter=%s', startAfter => {
+    const policy = startEarly => ({ ...review, startAfter, startEarly, fastChecks: ['test', 'integration'] });
+    const requiredChecks = ['test', 'integration'];
+    it.each([['shadow', 'success'], ['on', 'success'], ['shadow', 'SUCCESS'], ['on', 'SUCCESS']])('startEarly=%s state=%s', (startEarly, state) => {
+      const checks = [{ context: 'test', state }];
+      expect(reviewCiGate({ headSha: head, checks, requiredChecks })).toMatchObject({ allowed: true });  // the strict gate already accepts
+      expect(reviewStartGate({ headSha: head, requiredChecks, checks, policy: policy(startEarly) })).toMatchObject({ allowed: true });
+    });
+    it.each(['pending', 'failure', 'error'])('a %s legacy status implies nothing', state => {
+      const result = reviewStartGate({ headSha: head, requiredChecks, checks: [{ context: 'test', state }], policy: policy('shadow') });
+      expect(result.allowed).toBe(false);
+    });
   });
   it('off preserves the exact pre-early-start ci-green refusal for completed red CI', () => {
     expect(reviewStartGate({ headSha: head, requiredChecks: ['test'], checks: [check('test', 'failure')],
