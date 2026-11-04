@@ -549,6 +549,46 @@ describe('bounded review evidence scans', () => {
     const result = reader({ ...f, ...big, read: id => ({ 'review-pr-4999': unfinished, 'review-pr-4998': accepted })[id] ?? null });
     expect(result).toMatchObject({ ok: false, reason: 'review-unfinished' });
   });
+  const statusFile = f => join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
+  it('drain resolves a carried head among 5000 records when the carried-from review is the newest run', () => {
+    const f = fixture(), from = 'c'.repeat(40);
+    recordRedTeamStatus({ ...f, loopPayload: { ...payload(f.head), carriedFrom: from }, status: 'finished', result: 'skipped' }, f);
+    const panel = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(from), ...startedAt(4999 * 10_000 - 1000) };
+    let reads = 0;
+    const result = readDrainRedTeamEvidence({ ...f, ...big, read: id => { reads++; return id === 'review-pr-4999' ? panel : null; } });
+    expect(result.ok).not.toBe(false);
+    expect(result).toMatchObject({ status: { status: 'finished' } });
+    expect(reads).toBe(MAX_RUN_RECORDS_PARSED);
+  });
+  it('drain still reports a later panel that invalidates a carry among 5000 records', () => {
+    const f = fixture(), from = 'c'.repeat(40);
+    recordRedTeamStatus({ ...f, loopPayload: { ...payload(f.head), carriedFrom: from }, status: 'finished', result: 'skipped' }, f);
+    const later = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload('d'.repeat(40)), ...startedAt(4999 * 10_000 - 1000) };
+    const result = readDrainRedTeamEvidence({ ...f, ...big, read: id => id === 'review-pr-4999' ? later : null });
+    expect(result).toMatchObject({ carryConflict: true, loopPayload: later });
+  });
+  it('drain holds a carried head when the newest same-PR run cannot be settled inside the window', () => {
+    const f = fixture(), from = 'c'.repeat(40);
+    recordRedTeamStatus({ ...f, loopPayload: { ...payload(f.head), carriedFrom: from }, status: 'finished', result: 'skipped' }, f);
+    const panel = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(from), ...startedAt(1000) };
+    const result = readDrainRedTeamEvidence({ ...f, ...big, read: id => id === 'review-pr-4999' ? panel : null });
+    expect(result).toMatchObject({ ok: false, reason: 'scan-capped' });
+  });
+  it('drain holds a status written before records the window omitted', () => {
+    const f = fixture(), from = 'c'.repeat(40);
+    recordRedTeamStatus({ ...f, loopPayload: { ...payload(f.head), carriedFrom: from }, status: 'finished', result: 'skipped' }, f);
+    // The omitted records were written after the status, so a newer exact-head accept could hide among them.
+    utimesSync(statusFile(f), 1, 1);
+    const panel = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(from), ...startedAt(4999 * 10_000 - 1000) };
+    const result = readDrainRedTeamEvidence({ ...f, ...big, read: id => id === 'review-pr-4999' ? panel : null });
+    expect(result).toMatchObject({ ok: false, reason: 'scan-capped' });
+  });
+  it.each([['drain', readDrainRedTeamEvidence], ['recovery', readRecoveryWitness]])('%s holds an unreviewed head: absence of an exact-head run cannot be proven past the cap', (_name, reader) => {
+    const f = fixture();
+    const older = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload('d'.repeat(40)), ...startedAt(4999 * 10_000 - 1000) };
+    const result = reader({ ...f, ...big, read: id => id === 'review-pr-4999' ? older : null });
+    expect(result).toMatchObject({ ok: false, reason: 'scan-capped' });
+  });
   it.each([['drain', readDrainRedTeamEvidence], ['recovery', readRecoveryWitness]])('%s explicitly holds beyond the parse cap, including fallback scans', (_name, reader) => {
     const f = fixture();
     let reads = 0;
@@ -728,6 +768,12 @@ describe('abandoned and start-less review runs have a defined outcome', () => {
       const { args } = setup(f, a => ({ ...a, verdict: null, ...waiting, ...started(15_000) }), 20_000);
       expect(reader({ ...args, now: 20_000 + 30 * 24 * HOUR })).toEqual({ ok: false, reason: 'review-unfinished' });
     }
+  });
+  it.each(both)('%s never treats a rewound resume the review loop may still finish as abandoned', (_name, reader) => {
+    const f = fixture();
+    // rewindRunToStep clears verdict and pending but keeps the read start; the loop marks it resumeOf.
+    const { args } = setup(f, a => ({ ...a, verdict: null, resumeOf: { attempts: 1 }, ...started(15_000) }), 20_000);
+    expect(reader({ ...args, now: 20_000 + 30 * 24 * HOUR })).toEqual({ ok: false, reason: 'review-unfinished' });
   });
   it.each(both)('%s keeps an older stale verdict-less run from blocking a newer finished accept', (_name, reader) => {
     const f = fixture();

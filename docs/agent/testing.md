@@ -3927,6 +3927,10 @@ A record is written after its read step starts, so its mtime is an upper bound o
 The scan therefore stops early, well below the cap, once every unread record was last written
 more than 2 s (`RUN_MTIME_SLACK_MS`) before the exact-head match started: none of them can be a
 newer run. A match whose start cannot rule out the omitted records still holds as `scan-capped`.
+With no exact-head match in a capped window, a carried head still resolves through the any-head
+query once the newest same-PR run started after every omitted record was written, and a head with a
+status file also needs every omitted record written no later than that status. An unreviewed head
+holds: past the cap, the absence of an exact-head run cannot be proven.
 Recovery's carry fallback reuses the same scan, so one recovery read stays inside one parse budget.
 Equal starts retain the drain's ascending / recovery's descending ID tie order. A start-less
 same-PR run last written before the selected run started is older and ignored; any other start-less
@@ -3935,7 +3939,8 @@ remains usable without a timestamp. A newer unfinished attempt holds as `review-
 A verdict-less run that run-store calls terminal (nothing pending or in flight) and that has not been
 written for an hour (`ABANDONED_REVIEW_AFTER_MS`) is abandoned: it is neither evidence nor unfinished,
 so a crashed re-review cannot hold a PR forever. A run waiting on a pending step or effect is never
-abandoned. Unreadable records still throw, never skip.
+abandoned, and neither is a rewound resume (`resumeOf`), which the review loop may still finish.
+Unreadable records still throw, never skip.
 
 The scoped regressions are `drain-red-team-evidence`, `stream-filter-runs`, and the settings layout
 test `settings-files`; use heavy admission.

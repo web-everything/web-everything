@@ -66,15 +66,21 @@ const unfinishedReview = run => !run.verdict || run.pending != null
 export const RUN_MTIME_SLACK_MS = 2000;
 // A verdict-less record that run-store calls terminal (nothing pending or in flight) and that has not
 // been written for this long is an abandoned attempt (a crash or kill): it is neither evidence nor an
-// unfinished review. A run waiting on a pending step or effect is never abandoned, however old.
+// unfinished review. A run waiting on a pending step or effect is never abandoned, however old, and
+// neither is a rewound resume (`resumeOf`): the review loop resumes that run, which may still reject.
 export const ABANDONED_REVIEW_AFTER_MS = 60 * 60 * 1000;
-const abandonedReview = (hit, now) => !hit.run.verdict && isRunRecordTerminal(hit.run) && now - hit.at >= ABANDONED_REVIEW_AFTER_MS;
+const abandonedReview = (hit, now) => !hit.run.verdict && hit.run.resumeOf == null && isRunRecordTerminal(hit.run)
+  && now - hit.at >= ABANDONED_REVIEW_AFTER_MS;
 const TIE_ORDERS = ['id-asc', 'id-desc'];
 
 // Retain only the selected head/PR payloads and the newest unfinished attempt. Finished
 // evidence is usable only once the scan rules out a newer unfinished run. The scan stops as
 // soon as every unread record was last written before the exact-head match started (so none
 // of them can have started after it); otherwise it reads up to the shared parse cap.
+// With no exact-head match, a capped scan still answers when the window provably holds the answer:
+// the any-head query once the newest same-PR run started after every unread record was written,
+// and the exact-head query for "nothing written after `writtenAfter`" once, in addition, every
+// unread record was written at or before that time. Anything else holds as `scan-capped`.
 // One scan serves both tie orders, so a caller's fallback shares this scan's parse budget.
 function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak = 'id-asc', scanSettings, warn, now = Date.now() }) {
   if (!TIE_ORDERS.includes(tieBreak)) throw new TypeError('unknown run tieBreak');
@@ -90,7 +96,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
   const runScan = () => {
     const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, unfinished: null }]));
     const startless = []; // ids and mtimes only, never payloads
-    let count = 0;
+    let count = 0, newestSettled = false, boundary = -Infinity;
     const find = createNewestRunFinder({ ids: list(runsDir).filter(id => id.startsWith('review-pr-')), tieBreak,
       stat: id => stat(join(runsDir, `${id}.json`)), read: id => read(id, runsDir), scanSettings, warn });
     const end = find((run, id, at, nextAt) => {
@@ -107,12 +113,14 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
         }
       }
       // Equal starts share one start time, so either tie order gives the same bound.
-      const exact = slots[tieBreak].exact;
+      const { exact, newest } = slots[tieBreak];
+      boundary = nextAt;
+      if (newest !== null && reviewStartedAt(newest) > nextAt + RUN_MTIME_SLACK_MS) newestSettled = true;
       return exact !== null && reviewStartedAt(exact) > nextAt + RUN_MTIME_SLACK_MS;
     });
-    scan = { slots, startless, count, end };
+    scan = { slots, startless, count, end, newestSettled, boundary };
   };
-  const failureFor = order => {
+  const failureFor = (order, exactHead, writtenAfter) => {
     const { newest, exact, unfinished } = scan.slots[order];
     const selected = exact ?? newest;
     const selectedStart = selected ? reviewStartedAt(selected) : NaN;
@@ -124,14 +132,19 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     if (unfinished && (!selected || unfinished.id === selected.id || reviewStartedAt(unfinished) >= selectedStart)) {
       return { ok: false, reason: 'review-unfinished' };
     }
-    return scan.end?.ok === false ? scan.end : null;
+    if (scan.end?.ok !== false) return null;
+    // Capped: usable only when no unread record can change this query's answer (see above).
+    if (exact === null && scan.newestSettled
+      && (!exactHead || (Number.isFinite(writtenAfter) && scan.boundary <= writtenAfter))) return null;
+    return scan.end;
   };
-  return (exactHead = true, order = tieBreak) => {
+  return (exactHead = true, order = tieBreak, { writtenAfter } = {}) => {
     if (!TIE_ORDERS.includes(order)) throw new TypeError('unknown run tieBreak');
     if (!scan) runScan();
-    if (!failures.has(order)) failures.set(order, failureFor(order));
+    const key = `${order}|${exactHead}|${writtenAfter}`;
+    if (!failures.has(key)) failures.set(key, failureFor(order, exactHead, writtenAfter));
     const slot = scan.slots[order];
-    return failures.get(order) ?? (exactHead ? slot.exact : slot.newest) ?? { run: null, at: 0 };
+    return failures.get(key) ?? (exactHead ? slot.exact : slot.newest) ?? { run: null, at: 0 };
   };
 }
 
@@ -155,7 +168,7 @@ export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir
     // Preserve the existing policy-only carry surface; it never supplies a stale recovery payload.
     // The fallback reuses this scan (one parse budget) but reads it in the drain's ascending tie order.
     ...(newest ? {} : { carryEvidence: readDrainRedTeamEvidence({ ...key, env, runsDir, list, read, stat, scanSettings, warn, now,
-      lookup: (exactHead = true) => lookup(exactHead, 'id-asc'), readScorecards: () => records }) }),
+      lookup: (exactHead = true, _order, options) => lookup(exactHead, 'id-asc', options), readScorecards: () => records }) }),
     evidenceSha256: digest(JSON.stringify([seats, newest])),
     markers: { redispatch: marker === null ? null : JSON.parse(marker), retry: retryMarkerSpent(path) } };
 }
@@ -312,12 +325,14 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     status = JSON.parse(readFileSync(statusPath({ repo, pr, head }, env), 'utf8'));
     statusAt = statSync(statusPath({ repo, pr, head }, env)).mtimeMs;
   } catch (e) { if (e.code !== 'ENOENT') throw e; }
-  const scan = latestRun();
-  if (scan.ok === false) return scan;
+  // Every path below checks its own scan query first, so unknown evidence always holds; a carried
+  // head needs only the any-head query, and a head with a status only runs written after it.
   const carry = readRedTeamCarry({ repo, pr, head, env });
   const carriedFrom = carry?.loopPayload.carriedFrom ?? status?.loopPayload?.carriedFrom;
   if (carriedFrom) {
-    const latest = latestRun(false).run;
+    const latestHit = latestRun(false);
+    if (latestHit.ok === false) return latestHit;
+    const latest = latestHit.run;
     const laterPanel = latest && latest.findings?.read?.netBasis?.rev !== carriedFrom;
     const ownStatus = status === undefined || (status?.repo === repo && Number(status.pr) === Number(pr) && status.head === head
       && (status.loopPayload?.carriedFrom === carriedFrom || (status.head === carriedFrom && status.skipCardOnly === true))
@@ -336,10 +351,11 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     }
   }
   if (status?.repo === repo && Number(status.pr) === Number(pr) && status.head === head) {
+    const latest = latestRun(true, undefined, { writtenAfter: statusAt });
+    if (latest.ok === false) return latest;
     // A finished status from an earlier review of this same head never supersedes a newer accepting run (a re-review
     // of an unchanged head labels its accept before its job writes `queued`).
     if (!['queued', 'running'].includes(status.status)) {
-      const latest = latestRun();
       if (latest.at > statusAt && owes(latest.run)) {
         // A finished result that was never published still reaches the recovery path: a re-review of the same head must not
         // strand it behind a pass that may never come (#5759, #5762).
@@ -367,7 +383,9 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     return { status, loopPayload, ...seatEvidence, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
       ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error', 'failed'].includes(resultStatus), recorded: recorded || resultStatus === 'ran' };
   }
-  const loopPayload = latestRun().run;
+  const exactHit = latestRun();
+  if (exactHit.ok === false) return exactHit;
+  const loopPayload = exactHit.run;
   if (!loopPayload && !recorded) {
     const olderHit = latestRun(false);
     const older = olderHit.run;
