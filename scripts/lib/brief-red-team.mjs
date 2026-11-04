@@ -1,4 +1,5 @@
 /** Bounded, advisory red-team of a sensitive worker brief before implementation. */
+import { readFileSync, statSync } from 'node:fs';
 import { isGuardPath } from './round-judge.mjs';
 import { readSettings } from './settings-files.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
@@ -19,6 +20,30 @@ export function isBriefRedTeamTouchSet(files = []) {
     const name = path.split('/').pop();
     return isGuardPath(path) || /(?:^|\/)daemon[\w.-]*\//i.test(path) || /(?:^|[-_.])daemon(?:[-_.]|$)|credential|secret|(?:^|[-_.])(?:auth-?)?tokens?(?:-(?:store|file|cache|vault|refresh|exchange)|[-_.]?$)|security/i.test(name.replace(/\.[a-z]+$/, ''));
   });
+}
+
+const MAX_PREP_BYTES = 1024 * 1024;
+
+/**
+ * Read prep text from a regular file only. A FIFO, tty, socket or directory (e.g. an open
+ * `/dev/stdin` pipe) can block a synchronous read until EOF, so it is refused before opening.
+ */
+export function readPrepFile(file, { maxBytes = MAX_PREP_BYTES } = {}) {
+  const info = statSync(file);
+  if (!info.isFile()) throw new Error('--prep-file must be a regular file (pipes, ttys and directories are refused)');
+  if (info.size > maxBytes) throw new Error(`--prep-file exceeds ${maxBytes} bytes`);
+  return readFileSync(file, 'utf8');
+}
+
+/** Await a read that may be async, failing after timeoutMs so a stalled source cannot stall the brief. */
+export async function boundedRead(read, timeoutMs) {
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(read),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('prep read timed out')), timeoutMs); }),
+    ]);
+  } finally { clearTimeout(timer); }
 }
 
 export function readBriefRedTeamPolicy({ env = process.env, read = readSettings } = {}) {

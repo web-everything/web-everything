@@ -559,3 +559,46 @@ describe('brief red-team before code (R469)', () => {
     expect(redTeamBrief).not.toHaveBeenCalled();
   });
 });
+
+describe('brief red-team prep reading is gated and bounded (blocking-read hang)', () => {
+  const GUARD_ARGS = ['--purpose=gate-fix', '--files=scripts/lib/red-team-gate.mjs', '--prep-file=/p.md'];
+  const enabled = { enabled: true, timeoutMs: 20, maxClasses: 6 };
+  it('does not read the prep source when red-teaming is disabled', async () => {
+    const o = io();
+    const readText = vi.fn(() => 'x');
+    const redTeamBrief = vi.fn();
+    expect(await main(GUARD_ARGS, { ...o, redTeamBrief, readText, readPolicy: () => ({ ...enabled, enabled: false }) })).toBe(0);
+    expect(readText).not.toHaveBeenCalled();
+    expect(o.stdout.write.mock.calls[0][0]).toContain('Standard worker rules');
+  });
+  it('does not read the prep source outside the red-team touch-set', async () => {
+    const o = io();
+    const readText = vi.fn(() => 'x');
+    expect(await main(['--purpose=probe', '--files=scripts/lib/format-date.mjs', '--prep-file=/dev/stdin'],
+      { ...o, redTeamBrief: vi.fn(), readText, readPolicy: () => enabled })).toBe(0);
+    expect(readText).not.toHaveBeenCalled();
+  });
+  it('prints the plain brief when an async prep read never settles (bounded by the timeout)', async () => {
+    const o = io();
+    const redTeamBrief = vi.fn();
+    const code = await main(GUARD_ARGS, { ...o, redTeamBrief, readText: () => new Promise(() => {}), readPolicy: () => enabled });
+    expect(code).toBe(0);
+    expect(redTeamBrief).not.toHaveBeenCalled();
+    expect(o.stdout.write.mock.calls[0][0]).toContain('Standard worker rules');
+    expect(o.stderr.write.mock.calls.join('')).toMatch(/timed out/);
+  });
+  it('real CLI: an open, never-closed stdin as --prep-file does not hang (disabled and non-FIFO-safe)', () => {
+    const cli = path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'worker-brief.mjs');
+    for (const env of [{ WE_BRIEF_RED_TEAM_ENABLED: 'false' }, { WE_BRIEF_RED_TEAM_ENABLED: 'true', WE_BRIEF_RED_TEAM_TIMEOUT_MS: '50' }]) {
+      const fifo = path.join(os.tmpdir(), `we-prep-fifo-${randomUUID()}`);
+      spawnSync('mkfifo', [fifo]);
+      try {
+        const r = spawnSync(process.execPath, [cli, '--purpose=gate-fix', '--files=scripts/lib/red-team-gate.mjs', `--prep-file=${fifo}`],
+          { env: { ...process.env, ...env }, timeout: 8000, encoding: 'utf8' });
+        expect(r.error).toBeUndefined();
+        expect(r.status).toBe(0);
+        expect(r.stdout).toContain('Standard worker rules');
+      } finally { fs.rmSync(fifo, { force: true }); }
+    }
+  });
+});

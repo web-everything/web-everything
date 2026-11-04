@@ -2,7 +2,11 @@
  * Brief red-team before code (R469 part 3): only guard/daemon/credential touch-sets, bounded, fail-open, settings-gated.
  */
 import { describe, expect, it, vi } from 'vitest';
-import { isBriefRedTeamTouchSet, readBriefRedTeamPolicy, redTeamBrief, renderRedTeamSection } from '../brief-red-team.mjs';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { isBriefRedTeamTouchSet, readPrepFile, readBriefRedTeamPolicy, redTeamBrief, renderRedTeamSection } from '../brief-red-team.mjs';
 
 const GUARD = ['we:scripts/lib/red-team-gate.mjs'];
 const PLAIN = ['we:scripts/lib/format-date.mjs'];
@@ -90,5 +94,34 @@ describe('renderRedTeamSection', () => {
     expect(text).toMatch(/must have a test/i);
     expect(renderRedTeamSection({ status: 'skipped', classes: [] })).toBe('');
     expect(renderRedTeamSection({ status: 'failed', classes: [] })).toBe('');
+  });
+});
+
+describe('readPrepFile (bounded, regular files only)', () => {
+  const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'we-prep-'));
+  it('reads a regular file', () => {
+    const dir = tmp();
+    const file = path.join(dir, 'p.md');
+    fs.writeFileSync(file, 'prep text');
+    try { expect(readPrepFile(file)).toBe('prep text'); } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('rejects a FIFO without opening it (would block until EOF)', () => {
+    const dir = tmp();
+    const fifo = path.join(dir, 'f');
+    spawnSync('mkfifo', [fifo]);
+    try { expect(() => readPrepFile(fifo)).toThrow(/regular file/); } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('rejects a directory and a missing path', () => {
+    const dir = tmp();
+    try {
+      expect(() => readPrepFile(dir)).toThrow(/regular file/);
+      expect(() => readPrepFile(path.join(dir, 'nope'))).toThrow();
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('rejects an oversized file', () => {
+    const dir = tmp();
+    const file = path.join(dir, 'big.md');
+    fs.writeFileSync(file, 'x'.repeat(2048));
+    try { expect(() => readPrepFile(file, { maxBytes: 1024 })).toThrow(/exceeds 1024 bytes/); } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
 });

@@ -3,8 +3,8 @@ import { testsFirstWorkerRule } from './lib/tests-first-policy.mjs';
 import { resolveFreeScopeSettings } from './operations/free-scope-io.mjs';
 import { VERIFY_LANE_CLI } from './operations/verify-io.mjs';
 import { shellQuoteWord } from './readiness/heavy-admission.mjs';
-import { redTeamBrief as defaultRedTeamBrief, readBriefRedTeamPolicy, renderRedTeamSection } from './lib/brief-red-team.mjs';
-import { readFileSync } from 'node:fs';
+import { redTeamBrief as defaultRedTeamBrief, readBriefRedTeamPolicy, renderRedTeamSection,
+  isBriefRedTeamTouchSet, readPrepFile, boundedRead } from './lib/brief-red-team.mjs';
 const PURPOSE_TOKEN = /^[a-z0-9][a-z0-9-]*(?![\s\S])/;
 const OWNER_TOKEN = /^[A-Za-z0-9][A-Za-z0-9-]*(?![\s\S])/;
 
@@ -222,7 +222,7 @@ export function renderReportStep() {
 /** Run the CLI with injectable writable streams and an async or sync file writer. */
 export async function main(argv, { stdout = process.stdout, stderr = process.stderr, writeFile = defaultWriteFile,
   newOwner = () => randomUUID().slice(0, 8), redTeamBrief = defaultRedTeamBrief,
-  readText = path => readFileSync(path, 'utf8') } = {}) {
+  readText = readPrepFile, readPolicy = readBriefRedTeamPolicy } = {}) {
   const flags = new Set(['purpose', 'files', 'edge-clone', 'proof', 'repo', 'report-lines', 'out', 'owner', 'prep-file']);
   const options = {};
   let brief;
@@ -248,12 +248,14 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
   }
   if (options['prep-file']) {
     try {
-      const prep = await readText(options['prep-file']);
-      const redTeam = await redTeamBrief({
-        files: options.files.split(',').map(path => path.trim()), prep,
-        policy: readBriefRedTeamPolicy(), log: line => stderr.write(line + '\n'),
-      });
-      brief = renderWorkerBrief({ ...renderParams, redTeam });
+      const files = options.files.split(',').map(path => path.trim());
+      const policy = readPolicy();
+      // Never touch the prep source unless the red-team will actually use it.
+      if (policy.enabled && isBriefRedTeamTouchSet(files)) {
+        const prep = await boundedRead(() => readText(options['prep-file']), policy.timeoutMs);
+        const redTeam = await redTeamBrief({ files, prep, policy, log: line => stderr.write(line + '\n') });
+        brief = renderWorkerBrief({ ...renderParams, redTeam });
+      }
     } catch (error) {
       stderr.write(`brief red-team failed (fail-open): ${String(error?.message ?? error).replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')}\n`);
     }
