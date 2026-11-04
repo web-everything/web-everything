@@ -17,7 +17,7 @@ permissions:
 jobs:
   whole-suite:
     runs-on: [self-hosted, hetzner, we]
-    timeout-minutes: 40
+    timeout-minutes: 75
     steps:
       # Sibling layout under $GITHUB_WORKSPACE so WE's `../frontierui` resolves — both the vitest/vite
       # `@frontierui/*` alias (dev/test-time; `we:vitest.config.ts` → `../frontierui/plugs`) AND the pinned
@@ -71,9 +71,18 @@ jobs:
         working-directory: web-everything
         run: npm ci
 
-      - name: Whole unit suite, single runner, 24 threads, no coverage
+      - name: Whole unit suite, single runner, 16 threads, isolated TMPDIR/HOME, no coverage
         working-directory: web-everything
+        env:
+          WE_VITEST_MAX_WORKERS: '16'
         run: |
+          export TMPDIR="$RUNNER_TEMP/tmp-whole" HOME="$RUNNER_TEMP/home-whole"
+          mkdir -p "$TMPDIR" "$HOME"
+          git config --global user.email ci@example.invalid; git config --global user.name ci
           uptime
-          npx vitest run --pool=threads --poolOptions.threads.maxThreads=24 --reporter=default $(node scripts/ci/quarantine-skip.mjs)
-          uptime
+          ( while :; do cut -d' ' -f1 /proc/loadavg; sleep 15; done > "$RUNNER_TEMP/load.txt" ) &
+          SAMPLER=$!
+          trap 'kill $SAMPLER 2>/dev/null; echo "peak 1-min load: $(sort -n "$RUNNER_TEMP/load.txt" | tail -1)"; uptime' EXIT
+          start=$(date +%s)
+          npx vitest run --pool=threads --reporter=default $(node scripts/ci/quarantine-skip.mjs)
+          echo "wall seconds: $(( $(date +%s) - start ))"
