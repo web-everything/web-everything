@@ -20,6 +20,7 @@ import {
   resolveFreeLaneListPath,
   readFreeLaneList,
   writeFreeLaneListAtomic,
+  isProvablyCleanAndPushed,
 } from '../free-lane-list.mjs';
 
 const T0 = Date.parse('2026-09-25T16:00:00.000Z');
@@ -178,5 +179,24 @@ describe('freeLaneCandidates per-entry age', () => {
     const list = { v: 1, writtenAt: 1_000_000, repo: 'r', poolDir: null, lanes: [{ lane: 1, at: 1_000_000 - 700_000 }, { lane: 2, at: 1_000_000 - 1000 }] };
     expect(freeLaneCandidates(list, { nowMs: 1_000_000, maxAgeMs: 600_000 })).toEqual([2]);
     expect(freeLaneCandidates(list)).toEqual([1, 2]);
+  });
+});
+
+describe('isProvablyCleanAndPushed (the shared no-reset / release-publication bar)', () => {
+  const ok = { workDirty: 0, unpushedCommits: 0, ahead: 0 };
+  it.each([
+    ['clean + pushed', ok, {}, true],
+    ['litter-only dirt is already folded into workDirty=0', { ...ok, dirty: 2 }, {}, true],
+    ['real dirt', { ...ok, workDirty: 1 }, {}, false],
+    ['an unpushed commit', { ...ok, unpushedCommits: 1 }, {}, false],
+    ['failed dirt probe (null)', { ...ok, workDirty: null }, {}, false],
+    ['failed unpushed probe (null)', { ...ok, unpushedCommits: null }, {}, false],
+    ['missing fields', {}, {}, false],
+    ['no snapshot', null, {}, false],
+    ['ahead of origin is fine without requireInSync', { ...ok, ahead: 2 }, {}, true],
+    ['ahead of origin fails requireInSync', { ...ok, ahead: 2 }, { requireInSync: true }, false],
+    ['unknown ahead fails requireInSync', { ...ok, ahead: null }, { requireInSync: true }, false],
+  ])('%s', (_name, snap, opts, expected) => {
+    expect(isProvablyCleanAndPushed(snap, opts)).toBe(expected);
   });
 });

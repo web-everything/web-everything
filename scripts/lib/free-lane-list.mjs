@@ -152,6 +152,22 @@ export function freeLaneCandidates(list, { exclude = new Set(), nowMs = null, ma
   return list.lanes.filter((l) => young(l)).map((l) => l.lane).filter((n) => !exclude.has(n));
 }
 
+/**
+ * The ONE bar for "a lane may be handed out / published as free without a reset": no real work in the tree and
+ * nothing unpushed. Uses the litter-adjusted `workDirty` (untracked known-safe scratch files the scan and
+ * release treat as clean do not count) and the commit count `unpushedCommits` — NOT the snapshot's own
+ * `unpushed`/`dirty`, which fold RAW dirt in and would refuse a litter-only lane. Fails closed: a missing
+ * snapshot or any null (failed probe) field is not proof.
+ * @param {{workDirty?:(number|null), unpushedCommits?:(number|null), ahead?:(number|null)}|null|undefined} snap
+ * @param {{requireInSync?:boolean}} [o] also require `ahead === 0` (release publishes only a lane level with origin)
+ * @returns {boolean}
+ */
+export function isProvablyCleanAndPushed(snap, { requireInSync = false } = {}) {
+  if (!snap || typeof snap !== 'object') return false;
+  if (snap.workDirty !== 0 || snap.unpushedCommits !== 0) return false;
+  return !requireInSync || snap.ahead === 0;
+}
+
 // ── THIN FS SHELL ────────────────────────────────────────────────────────────────────────────────────────
 
 /**

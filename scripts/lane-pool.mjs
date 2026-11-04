@@ -125,7 +125,7 @@ import { retryTransientGit } from './lib/git-fetch-retry.mjs';
 import { healLaneRefs, diagnoseLane, quarantineLane, looksLikeCorruption, looksLikeCommitGraphError, healSharedCommitGraph } from './lib/lane-repair.mjs';
 // #4122 — the free-lane list `acquire`'s auto-pick reads as a fast pre-filter before paying for its own scan
 // (see that module's own header for the full incident/design writeup).
-import { readFreeLaneList, isFreeLaneListFresh, freeLaneCandidates, resolveFreeLaneListPath, touchFreeLaneList, DEFAULT_FREE_LANE_LIST_MAX_AGE_MS, FREE_LANE_LIST_MAX_AGE_ENV } from './lib/free-lane-list.mjs';
+import { readFreeLaneList, isFreeLaneListFresh, freeLaneCandidates, resolveFreeLaneListPath, touchFreeLaneList, isProvablyCleanAndPushed, DEFAULT_FREE_LANE_LIST_MAX_AGE_MS, FREE_LANE_LIST_MAX_AGE_ENV } from './lib/free-lane-list.mjs';
 // #2560 — lane-pool may freely import readiness (confirmed no circular import): the advisory scope-lease check
 // at acquire. normScope normalizes the declared `--scope`; candidateLaunch is the pure overlap-at-launch query.
 import { normScope } from './readiness/scope-lease.mjs';
@@ -2583,7 +2583,7 @@ async function cmdAcquire(repo) {
           // PROVEN clean and fully pushed right now. A failed probe (null) is not proof, so it is refused too.
           if (flags['no-reset']) {
             const snap = laneStateSnapshot(laneDir(repo, pick), `origin/${repo.branch}`);
-            if (snap.dirty !== 0 || snap.unpushed !== false) throw new Error(`lane-${pick} is not provably clean and pushed (dirty=${snap.dirty}, unpushed=${snap.unpushed}) — --no-reset will not hand it out`);
+            if (!isProvablyCleanAndPushed(snap)) throw new Error(`lane-${pick} is not provably clean and pushed (workDirty=${snap.workDirty}, unpushedCommits=${snap.unpushedCommits}) — --no-reset will not hand it out`);
           }
           provisionClaimedLane(repo, pick, false); // auto-pick never targets a reserved lane
           chosen = pick;
@@ -3143,7 +3143,7 @@ async function cmdRelease(repo) {
     unmapLanes({ ...repo, referencePath: repo.registryReferencePath || repo.referencePath }, [n]);
     // Only a lane PROVEN clean and fully pushed right now is published as free (the same bar auto-pick's scan applies).
     const afterRelease = isReservedLease(lease) ? null : laneStateSnapshot(dir, `origin/${repo.branch}`);
-    touchFreeList(repo, n, afterRelease?.unpushed === false && afterRelease?.ahead === 0 && afterRelease?.dirty === 0);
+    touchFreeList(repo, n, isProvablyCleanAndPushed(afterRelease, { requireInSync: true }));
     log(`  released lane-${n} (was ${describeLease(lease)})`);
     released++;
   }
