@@ -93,7 +93,7 @@ const normalizeScope = (v, defaultPrefix = 'we:') => {
       const key = prefix.toLowerCase();
       return Object.hasOwn(SCOPE_PREFIX_LOCUS, key) ? SCOPE_LOCUS_PREFIX[SCOPE_PREFIX_LOCUS[key]] : key;
     };
-    if (entryGlobsMayMeet(pieces, repoOf)) { list.push(text); continue; }
+    const qualified = [];
     for (const piece of pieces) {
       // Match dispatch-lane's prefix grammar, including underscores. Keep path case unchanged.
       const own = /^[A-Za-z][\w-]*:/.exec(piece)?.[0] ?? '';
@@ -102,8 +102,13 @@ const normalizeScope = (v, defaultPrefix = 'we:') => {
         const locus = Object.hasOwn(SCOPE_PREFIX_LOCUS, prefix) ? SCOPE_PREFIX_LOCUS[prefix] : null;
         repo = `${locus ? SCOPE_LOCUS_PREFIX[locus] : prefix}:`;
       }
-      list.push(repo + piece.slice(own.length));
+      qualified.push(repo + piece.slice(own.length));
     }
+    // An entry that is kept whole is kept CANONICALLY QUALIFIED, never as authored text: dispatch-lane judges bare
+    // pieces under its own default repo (always `we`), the loader under the item's locus. Emitting every piece with
+    // its resolved prefix makes dispatch judge the same repos the loader did, so a whole entry is always refused.
+    if (entryGlobsMayMeet(pieces, repoOf)) { list.push(qualified.join(' ')); continue; }
+    list.push(...qualified);
   }
   return list.length ? list : undefined;
 };

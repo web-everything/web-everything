@@ -231,24 +231,31 @@ describe('backlog loader normalizeScope — multi-path entries (R372)', () => {
   // The real loader runs normalizeScope TWICE: first with no default repo (locus not yet inferred), then with the
   // item's locus prefix. A bare piece's repo is unknown in pass one, so pass one must not split an entry whose
   // pass-two verdict could be "may meet" — it would lose the entry boundary dispatch needs to refuse it.
+  // Production dispatch ALWAYS judges a bare piece under `we` (dispatch-lane-io: briefTokensForRepo('we')), whatever
+  // the item's locus — so the loader's output must be refused/accepted by dispatch-under-`we` exactly as the loader
+  // judged it under the locus. A whole entry is therefore emitted canonically qualified (never as authored text).
   it.each([
-    // [entry, locus prefix of pass two, dispatchRepo, dispatch accepts?]
-    ['src/a*.mjs we:src/ab*.mjs', 'we:', 'we', false],
-    ['src/a*.mjs fui:src/a*.mjs', 'fui:', 'fui', false],
-    ['src/a*.mjs fui:src/a*.mjs', 'we:', 'we', true],
-    ['src/a*.mjs fui:src/b*.mjs', 'fui:', 'fui', true],
-    ['src/a*.mjs plateau:src/ab*.mjs', 'plateau:', 'plateau', false],
-    ['src/a*.mjs we:src/b*.mjs', 'we:', 'we', true],
-  ])('send-back — the loader two-pass pipeline agrees with dispatch on %j (locus %s)', (entry, locus, dispatchRepo, accepted) => {
+    // [entry, locus prefix of pass two, whole entry kept? (dispatch refuses it)]
+    ['src/a*.mjs we:src/ab*.mjs', 'we:', true],
+    ['src/a*.mjs fui:src/a*.mjs', 'fui:', true], // bare piece is fui under this locus: it MEETS fui:src/a*
+    ['src/a*.mjs fui:src/a*.mjs', 'we:', false],
+    ['src/a*.mjs fui:src/b*.mjs', 'fui:', false],
+    ['src/a*.mjs plateau:src/ab*.mjs', 'plateau:', true],
+    ['plateau:src/a*.mjs src/a*.mjs', 'fui:', true], // reverse order, bare piece inherits plateau:
+    ['src/a*.mjs we:src/b*.mjs', 'we:', false],
+  ])('send-back — the loader two-pass pipeline agrees with production dispatch on %j (locus %s)', (entry, locus, whole) => {
     const loaded = normalizeScope(normalizeScope([entry], '') as string[], locus)!;
-    if (accepted) {
+    if (!whole) {
       expect(loaded.every((piece) => !/[\s,]/.test(piece)), entry).toBe(true);
-      expect(normalizeBriefScope(loaded, dispatchRepo), entry).toEqual(loaded);
-      expect(normalizeBriefScope([entry], dispatchRepo), entry).toEqual(loaded);
+      expect(normalizeBriefScope(loaded, 'we'), entry).toEqual(loaded);
     } else {
-      expect(loaded, entry).toHaveLength(1); // still one whole entry
-      expect(() => normalizeBriefScope(loaded, dispatchRepo), entry).toThrow(/unsafe scope.*glob/);
-      expect(() => normalizeBriefScope([entry], dispatchRepo), entry).toThrow(/unsafe scope.*glob/);
+      expect(loaded, entry).toHaveLength(1); // still one whole entry …
+      expect(loaded[0].split(' ').every((piece) => /^[a-z]+:/.test(piece)), entry).toBe(true); // … canonically qualified
+      expect(() => normalizeBriefScope(loaded, 'we'), entry).toThrow(/unsafe scope.*glob/);
+    }
+    if (locus === 'we:') { // the authored entry itself reaches the same verdict when locus and dispatch repo coincide
+      if (whole) expect(() => normalizeBriefScope([entry], 'we'), entry).toThrow(/unsafe scope.*glob/);
+      else expect(normalizeBriefScope([entry], 'we'), entry).toEqual(loaded);
     }
   });
 
