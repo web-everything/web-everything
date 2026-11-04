@@ -20,8 +20,7 @@
     },
     "pass-readers": {
       "label": "com.we.conveyor-pass-daemon.ci-red-recovery-watch-we",
-      "clone": "wev-pass-readers",
-      "note": "The clone that runs the reader pass daemons, including ci-red-recovery-watch-we. The label is that pass daemon launchd job; with an explicit clone prototype-load uses the clone, and self-sync adopts the new code."
+      "note": "The label is the ci-red-recovery-watch-we pass daemon launchd job. No explicit clone: prototype-load resolves the clone from that installed plist WorkingDirectory, so overlays register on the clone the watcher actually runs from (the shipped template installs wev-review-daemon; the live install runs wev-pass-readers), and self-sync adopts the new code."
     },
     "control": {
       "label": "com.we.control",
