@@ -77,11 +77,11 @@ export function swapUsedPct(text) {
   if (!Number.isFinite(total) || !Number.isFinite(used)) return null;
   return total > 0 ? round(used / total * 100) : 0;
 }
-export function buildSnapshot({ sampledAtMs, intervalMs, cpuIdlePct, cores, loadAvg, memPressureLevel, memFreePct, memAvailableMb, memFloorMb, memFloorSource, swapUsedPct: swapPct, disk, fseventsdCpuPct, heavySlots, agentSessions, laneCount, errors = [] }) {
+export function buildSnapshot({ sampledAtMs, intervalMs, cpuIdlePct, cores, loadAvg, memPressureLevel, memFreePct, memAvailableMb, memFloorMb, memFloorSource, memMetric, swapUsedPct: swapPct, disk, fseventsdCpuPct, heavySlots, agentSessions, laneCount, errors = [] }) {
   return { schema: 'resource-snapshot/1', sampledAt: new Date(sampledAtMs).toISOString(),
     freshUntil: new Date(sampledAtMs + 3 * intervalMs).toISOString(), intervalMs,
     cpu: { idlePct: finite(cpuIdlePct), cores: finite(cores), loadAvg: [0, 1, 2].map(i => finite(loadAvg?.[i])) },
-    memory: { pressureLevel: finite(memPressureLevel), freePct: finite(memFreePct), availableMb: finite(memAvailableMb), floorMb: finite(memFloorMb), floorSource: memFloorSource ?? null, swapUsedPct: finite(swapPct) },
+    memory: { pressureLevel: finite(memPressureLevel), freePct: finite(memFreePct), metric: memMetric ?? null, availableMb: finite(memAvailableMb), floorMb: finite(memFloorMb), floorSource: memFloorSource ?? null, swapUsedPct: finite(swapPct) },
     disk: { busyPct: finite(disk?.busyPct), ioDepth: finite(disk?.ioDepth), readMBps: finite(disk?.readMBps), writeMBps: finite(disk?.writeMBps) },
     // macOS exposes no public fsevents backlog counter.
     fsevents: { fseventsdCpuPct: finite(fseventsdCpuPct), backlog: null },
@@ -125,23 +125,24 @@ export function createSampler({ exec = execFileSync, cpus = os.cpus, loadavg = o
       const value = memoryPressureLevel(run('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level']));
       if (value === null) throw Error('unrecognized memory pressure'); return value;
     });
-    // One policy read per sample. An unreadable or invalid policy takes the stricter metric and NO floor (null), which
-    // makes the admission gate refuse: a default could sit below a stricter configured floor, so it is never substituted.
-    let memPolicy = { metric: 'free', floorMb: null, floorSource: 'unreadable policy' };
+    // One policy read per sample. An unreadable or invalid policy publishes NO memory reading at all (R559): no
+    // percent, no available MB, no floor, no metric. The admission gate then refuses (floor) and the cap cannot raise.
+    let memPolicy = null;
     try {
       const { settings, sources } = loadHostOverloadSettings({ log: () => {} });
       memPolicy = { metric: settings.host.capacity.memoryMetric, floorMb: settings.host.capacity.memAvailableFloorMb,
         floorSource: sources['host.capacity.memAvailableFloorMb'] ?? 'standard' };
-    } catch { /* strict defaults above */ }
-    const memFreePct = probe('memFreePct', () => memoryFreePct({ metric: memPolicy.metric, exec: run, freemem, totalmem }));
-    const memAvailableMb = probe('memAvailableMb', () => memoryAvailableMb({ metric: memPolicy.metric, exec: run, freemem }));
+    } catch { memPolicy = null; }
+    const needPolicy = () => { if (!memPolicy) throw Error('memory policy unreadable'); return memPolicy; };
+    const memFreePct = probe('memFreePct', () => memoryFreePct({ metric: needPolicy().metric, exec: run, freemem, totalmem }));
+    const memAvailableMb = probe('memAvailableMb', () => memoryAvailableMb({ metric: needPolicy().metric, exec: run, freemem }));
     const swapPct = probe('swapUsedPct', () => {
       const value = swapUsedPct(run('sysctl', ['-n', 'vm.swapusage']));
       if (value === null) throw Error('unrecognized swap usage'); return value;
     });
     const procs = probe('ps', () => parsePsCpu(run('ps', ['-A', '-o', 'pid=,pcpu=,comm='])));
     const snapshot = buildSnapshot({ sampledAtMs, intervalMs, cpuIdlePct, cores: nextCpus?.length,
-      loadAvg: probe('loadavg', loadavg), memPressureLevel, memFreePct, memAvailableMb, memFloorMb: memPolicy.floorMb, memFloorSource: memPolicy.floorSource,
+      loadAvg: probe('loadavg', loadavg), memPressureLevel, memFreePct, memAvailableMb, memFloorMb: memPolicy?.floorMb, memFloorSource: memPolicy?.floorSource, memMetric: memPolicy?.metric,
       swapUsedPct: swapPct, disk,
       fseventsdCpuPct: procs === null ? null : fseventsCpuPct(procs),
       agentSessions: procs === null ? null : countAgentSessions(procs),

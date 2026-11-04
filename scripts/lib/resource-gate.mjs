@@ -285,7 +285,7 @@ export function createResourceFixThrottle({
   sendBackReservedSlots,
   listClaims = () => [], env = process.env, alive = isPidAlive, queueLength = null, settings, root, nowMs = () => Date.now(),
   readSnap = () => readSnapshot(root ? { root } : {}), readHeavyWait = () => readLiveHeavyWaitMinutes({ env }), gate, log = (line) => process.stderr.write(line),
-  resolveFloor = () => { const r = loadHostOverloadSettings({ env, log: () => {} }); return { floorMb: r.settings.host.capacity.memAvailableFloorMb, source: r.sources['host.capacity.memAvailableFloorMb'] ?? 'standard' }; },
+  resolveFloor = () => { const r = loadHostOverloadSettings({ env, log: () => {} }); return { metric: r.settings.host.capacity.memoryMetric, floorMb: r.settings.host.capacity.memAvailableFloorMb, source: r.sources['host.capacity.memAvailableFloorMb'] ?? 'standard' }; },
   sample, loadavg, cpuCount, // forwarded to the legacy gate (the logged comparison)
 } = {}) {
   sendBackReservedSlots ??= resolveHandoffSettings('fix', { env }).value.sendBackReservedSlots;
@@ -302,7 +302,12 @@ export function createResourceFixThrottle({
     lastSnap = snap; lastFloor = floor;
     const m = snap?.memory ?? {};
     const fresh = !!snap && Number.isFinite(Date.parse(snap.freshUntil)) && nowMs() <= Date.parse(snap.freshUntil);
-    const d = decideMemoryFloor({ availableMb: m.availableMb, floorMb: floor.floorMb, pressureLevel: m.pressureLevel, snapshotFresh: fresh });
+    // R559: the reading must have been taken under the SAME metric this process's policy names; a missing or different
+    // stamp is a mismatch and refuses (a stricter "free" dispatcher never trusts a larger "available" reading).
+    const metricOk = typeof floor.metric === 'string' && m.metric === floor.metric;
+    const d = !metricOk && fresh && floor.floorMb != null
+      ? { admit: false, reason: `memory metric mismatch (snapshot ${m.metric ?? 'unstamped'}, policy ${floor.metric ?? 'unknown'})` }
+      : decideMemoryFloor({ availableMb: m.availableMb, floorMb: floor.floorMb, pressureLevel: m.pressureLevel, snapshotFresh: fresh });
     if (d.admit) return { admit: true };
     return { admit: false, refusal: { admit: false, kind: 'host-load', signal: 'mem-floor', why: `memory floor: ${d.reason} (floor ${floor.floorMb ?? '?'} MB from ${floor.source}); ${kind} deferred, no claim taken` } };
   };

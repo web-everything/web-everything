@@ -10,9 +10,9 @@ import { admitLaunch, resolveCostAdmissionSettings } from '../cost-admission.mjs
 import { lightResourceDecision } from '../cost-admission-facts.mjs';
 
 const NOW = Date.parse('2026-10-10T15:00:00Z');
-const snap = ({ idle = 40, pressure = 1, ageMs = 5000, freshForMs = 20000, freePct, swapUsedPct, availableMb = 8192, floorMb = 2048 } = {}) => ({
+const snap = ({ idle = 40, pressure = 1, ageMs = 5000, freshForMs = 20000, freePct, swapUsedPct, availableMb = 8192, floorMb = 2048, metric = 'available' } = {}) => ({
   sampledAt: new Date(NOW - ageMs).toISOString(), freshUntil: new Date(NOW - ageMs + freshForMs).toISOString(),
-  cpu: { idlePct: idle, loadAvg: [60] }, memory: { pressureLevel: pressure, availableMb, floorMb, floorSource: 'standard', ...(freePct !== undefined ? { freePct } : {}), ...(swapUsedPct !== undefined ? { swapUsedPct } : {}) },
+  cpu: { idlePct: idle, loadAvg: [60] }, memory: { pressureLevel: pressure, metric, availableMb, floorMb, floorSource: 'standard', ...(freePct !== undefined ? { freePct } : {}), ...(swapUsedPct !== undefined ? { swapUsedPct } : {}) },
   disk: { busyPct: 100 }, heavySlots: { held: 1, cap: 4 },
 });
 let root;
@@ -288,7 +288,7 @@ describe('dynamic fixer cap', () => {
   describe('R559 fresh read and own-policy floor', () => {
     const mk2 = (readSnap, resolveFloor, lines = []) => createResourceFixThrottle({ sendBackReservedSlots: 0, listClaims: () => [], queueLength: 0, readSnap, nowMs: () => NOW,
       resolveFloor, settings: { cutover: 'enforce', fixCap: { ...fixCap, floor: 4, ceiling: 4 } }, gate: () => ({ admit: true }), log: (l) => lines.push(l) });
-    const std = () => ({ floorMb: 2048, source: 'standard' });
+    const std = () => ({ floorMb: 2048, source: 'standard', metric: 'available' });
     it('re-reads memory on every admission: a drop mid-pass refuses the next fixer', () => {
       let cur = snap({ availableMb: 8192 });
       const t = mk2(() => cur, std);
@@ -305,33 +305,39 @@ describe('dynamic fixer cap', () => {
     });
     it('takes the floor from the dispatching process policy, never the snapshot floor', () => {
       // snapshot carries a lax 2048 MB floor; this process demands 16384 MB; 8192 MB available must refuse
-      const d = mk2(() => snap({ availableMb: 8192, floorMb: 2048 }), () => ({ floorMb: 16384, source: 'env WE_HOST_CAPACITY_MEM_AVAILABLE_FLOOR_MB' })).tryAdmit('fix');
+      const d = mk2(() => snap({ availableMb: 8192, floorMb: 2048 }), () => ({ floorMb: 16384, metric: 'available', source: 'env WE_HOST_CAPACITY_MEM_AVAILABLE_FLOOR_MB' })).tryAdmit('fix');
       expect(d).toMatchObject({ admit: false, signal: 'mem-floor' });
       expect(d.why).toMatch(/8192 MB < floor 16384 MB/); expect(d.why).toContain('env WE_HOST_CAPACITY_MEM_AVAILABLE_FLOOR_MB');
       // and a snapshot floor of 99999 cannot block a host this process says is fine
       expect(mk2(() => snap({ availableMb: 8192, floorMb: 99999 }), std).tryAdmit('fix').admit).toBe(true);
     });
+    it('R559 metric stamp: a snapshot taken under a different or missing metric refuses', () => {
+      const strictFree = () => ({ floorMb: 2048, source: 'tool', metric: 'free' });
+      expect(mk2(() => snap({ metric: 'available' }), strictFree).tryAdmit('fix').why).toMatch(/metric mismatch \(snapshot available, policy free\)/);
+      expect(mk2(() => snap({ metric: 'free' }), strictFree).tryAdmit('fix').admit).toBe(true);
+      expect(mk2(() => snap({ metric: null }), std).tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
+    });
     it('an unreadable own policy refuses', () => {
       expect(mk2(() => snap(), () => { throw Error('bad policy'); }).tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
     });
     it('logs the effective floor and its source from the own policy', () => {
-      const lines = []; mk2(() => snap(), () => ({ floorMb: 4096, source: 'tool' }), lines).tryAdmit('fix');
+      const lines = []; mk2(() => snap(), () => ({ floorMb: 4096, metric: 'available', source: 'tool' }), lines).tryAdmit('fix');
       expect(lines[0]).toMatch(/mem floor 4096 MB \(tool\) available 8192 MB pressure 1 → admit/);
     });
   });
   describe('R559 throwing host gate', () => {
     it('refuses (does not admit) and logs the reason when the gate throws', () => {
-      const lines = [];
+      const lines = []; let boom = true;
       const t = createResourceFixThrottle({ sendBackReservedSlots: 0, listClaims: () => [], queueLength: 0, readSnap: () => snap(), nowMs: () => NOW,
-        settings: { cutover: 'enforce', fixCap: { ...fixCap, floor: 4, ceiling: 4 } }, log: (l) => lines.push(l), gate: () => { throw Error('probe exploded'); } });
+        settings: { cutover: 'enforce', fixCap: { ...fixCap, floor: 4, ceiling: 4 } }, log: (l) => lines.push(l), gate: () => { if (boom) throw Error('probe exploded'); return { admit: true }; } });
       const d = t.tryAdmit('fix');
       expect(d).toMatchObject({ admit: false, kind: 'host-load', signal: 'gate-error' });
       expect(d.why).toContain('probe exploded');
       expect(lines.join('')).toMatch(/host gate threw \(probe exploded\)/);
-      // refusal counted no slot: a healthy gate then admits all four
-      const ok = createResourceFixThrottle({ sendBackReservedSlots: 0, listClaims: () => [], queueLength: 0, readSnap: () => snap(), nowMs: () => NOW,
-        settings: { cutover: 'enforce', fixCap: { ...fixCap, floor: 4, ceiling: 4 } }, log: () => {}, gate: () => ({ admit: true }) });
-      expect([1, 2, 3, 4].every(() => ok.tryAdmit('fix').admit)).toBe(true);
+      // the SAME throttle: the refusal consumed no slot, so all four slots remain, then the cap refuses the fifth
+      boom = false;
+      expect([1, 2, 3, 4].map(() => t.tryAdmit('fix').admit)).toEqual([true, true, true, true]);
+      expect(t.tryAdmit('fix')).toMatchObject({ admit: false, kind: 'fix-cap' });
     });
   });
   describe('R558 available-metric thresholds', () => {

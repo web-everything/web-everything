@@ -107,14 +107,23 @@ describe('R553 hard memory floor (fail closed)', () => {
       expect(m).toMatchObject({ floorMb: 3000, floorSource: 'env', pressureLevel: 2 });
     } finally { spy.mockRestore(); }
   });
-  it('an unreadable policy leaves NO floor in the snapshot (never a default that could loosen a stricter configured floor)', () => {
+  it('an unreadable policy publishes NO memory reading (no percent, available MB, floor or metric), so admission refuses', () => {
     const spy = vi.spyOn(hostOverloadSettings, 'loadHostOverloadSettings').mockImplementation(() => { throw Error('invalid policy'); });
     try {
       const s = createSampler({ checkoutRoot: process.cwd(), exec: (c) => (c === 'sysctl' ? '1' : ''), now: () => 0, cpus: () => [],
         freemem: () => 9000 * 1024 * 1024, totalmem: () => TOTAL, readHeavySlots: () => ({ held: 0, cap: 1 }), countLanes: () => 0 });
       const m = s.sample().memory;
-      expect(m.floorMb).toBeNull();
-      expect(decideMemoryFloor({ availableMb: m.availableMb, floorMb: m.floorMb, pressureLevel: m.pressureLevel }).admit).toBe(false);
+      expect(m).toMatchObject({ freePct: null, availableMb: null, floorMb: null, metric: null });
+      expect(decideMemoryFloor({ availableMb: m.availableMb, floorMb: 2048, pressureLevel: m.pressureLevel }).admit).toBe(false);
+    } finally { spy.mockRestore(); }
+  });
+  it('a readable policy stamps the metric it measured under', () => {
+    const policy = resolveHostOverloadSettings({ platform: {}, tool: {}, env: { WE_HOST_CAPACITY_MEMORY_METRIC: 'free' }, log: () => {} });
+    const spy = vi.spyOn(hostOverloadSettings, 'loadHostOverloadSettings').mockReturnValue(policy);
+    try {
+      const s = createSampler({ checkoutRoot: process.cwd(), exec: (c) => (c === 'sysctl' ? '1' : ''), now: () => 0, cpus: () => [],
+        freemem: () => 9000 * 1024 * 1024, totalmem: () => TOTAL, readHeavySlots: () => ({ held: 0, cap: 1 }), countLanes: () => 0 });
+      expect(s.sample().memory.metric).toBe('free');
     } finally { spy.mockRestore(); }
   });
 });
