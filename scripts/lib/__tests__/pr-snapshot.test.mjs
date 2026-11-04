@@ -385,9 +385,11 @@ describe('the pass readers are wired to the snapshot (a seeded fresh snapshot is
   }, 60_000); // the first dynamic import of a heavy conveyor module can exceed the 5s default on a loaded host
 
   it('reconcile serves the snapshot author without a REST lookup; a row lacking one is still REST-filled', async () => {
-    const { defaultReadPrs, SNAPSHOT_LIST_FIELDS } = await import('../../conveyor/reconcile-pass.mjs');
+    const { defaultReadPrs, SNAPSHOT_LIST_FIELDS, PR_LIST_JSON_FIELDS } = await import('../../conveyor/reconcile-pass.mjs');
     expect(SNAPSHOT_LIST_FIELDS.split(',')).toContain('author');
-    expect(SNAPSHOT_LIST_FIELDS.split(',').every(f => SNAPSHOT_FIELDS.includes(f))).toBe(true);
+    // The snapshot serves every field reconcile lists: none is silently dropped, none makes the snapshot unservable.
+    expect(SNAPSHOT_LIST_FIELDS).toBe(PR_LIST_JSON_FIELDS);
+    expect(PR_LIST_JSON_FIELDS.split(',').filter(f => !SNAPSHOT_FIELDS.includes(f))).toEqual([]);
     const rest = [];
     const readRest = path => { rest.push(path); return { json: { user: { login: 'filled', type: 'Bot' } } }; };
     const served = defaultReadPrs({ repo: REPO, readCommits: () => [], readRest });
