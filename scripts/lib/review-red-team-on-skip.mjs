@@ -249,6 +249,9 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (capped) {
         const acc = Array.isArray(rawPr.labels) && rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:accepted');
         if (!acc) return skip('scan-capped');
+        // A stored status for this head (running, queued, retry-spent, finished) is direct evidence the
+        // capped scan cannot see past: keep its existing handling instead of forcing a review.
+        if (readStatus({ repo, pr, head }) != null) return skip('scan-capped; red-team status recorded for this head');
         const acceptanceC = latestAcceptRecord(rawPr.comments, Array.isArray(rawPr.reviews) ? rawPr.reviews : null);
         const reviewsC = Array.isArray(rawPr.reviews) ? rawPr.reviews : null;
         const refusalC = publishableClearGuard({ labels: rawPr.labels, acceptance: acceptanceC, comments: rawPr.comments, reviews: reviewsC });

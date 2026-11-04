@@ -1549,6 +1549,10 @@ describe('scan-capped run scan — per-caller direction', () => {
   it('a capped scan on an unaccepted PR is still held (no review forced)', () => {
     expect(decide({ readEvidence: () => capped })).toMatchObject({ action: 'skip', why: 'scan-capped' });
   });
+  it('capped scan with a stored status for the head still holds (running / retry-spent)', () => {
+    for (const status of [{ status: 'running', head }, { status: 'finished', head, retries: 3 }])
+      expect(decide(accepted({ readEvidence: () => capped, readWitness: () => capped, readStatus: () => status })).action).toBe('skip');
+  });
   it('other unknowns still hold', () => {
     expect(decide(accepted({ readEvidence: () => ({ ok: false, reason: 'review-unfinished' }) })).action).toBe('skip');
   });
