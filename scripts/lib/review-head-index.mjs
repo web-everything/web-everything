@@ -49,6 +49,7 @@ export function netPatchKey({ exec, cwd, sha, mainRef = 'origin/main' } = {}) {
   } catch (error) { return { ok: false, reason: `net-patch-unreadable: ${String(error?.message ?? error).slice(0, 120)}` }; }
 }
 
+const NOKEY = 'head:';
 const prKey = (repo, pr) => `${repo}#${Number(pr)}`;
 const validRecord = r => r && typeof r.repo === 'string' && r.repo && Number.isSafeInteger(Number(r.pr)) && SHA.test(r.head ?? '')
   && typeof r.verdict === 'string' && r.verdict && Number.isFinite(Date.parse(r.at));
@@ -58,12 +59,16 @@ export function applyRecord(map, rec, keepPerPr) {
   const key = prKey(rec.repo, rec.pr);
   const prev = map[key] ?? { history: {} };
   const history = { ...prev.history };
-  if (rec.netPatchHash) history[rec.netPatchHash] = { head: rec.head, verdict: rec.verdict, at: rec.at };
+  // A review without a net-patch key is kept under a head-scoped key so compaction never drops it; it can never be carried.
+  history[rec.netPatchHash ?? `${NOKEY}${rec.head}`] = { head: rec.head, verdict: rec.verdict, at: rec.at };
   const kept = Object.entries(history).sort((a, b) => Date.parse(b[1].at) - Date.parse(a[1].at) || (a[0] < b[0] ? -1 : 1)).slice(0, keepPerPr);
   map[key] = { lastReviewedHead: rec.head, netPatchHash: rec.netPatchHash ?? null, verdict: rec.verdict, at: rec.at, history: Object.fromEntries(kept) };
   return map;
 }
 
+const validEntry = e => e && SHA.test(e.lastReviewedHead ?? '') && typeof e.verdict === 'string' && e.verdict && Number.isFinite(Date.parse(e.at))
+  && e.history && typeof e.history === 'object' && Object.values(e.history).every(h => h && SHA.test(h.head ?? '') && typeof h.verdict === 'string' && h.verdict && Number.isFinite(Date.parse(h.at)));
+const validMap = m => m && typeof m === 'object' && Object.values(m).every(validEntry);
 const parseLog = text => {
   const lines = text.split('\n').filter(l => l.trim());
   const map = {};
@@ -87,13 +92,18 @@ export function readHeadIndex({ dir = defaultHeadIndexDir(), fs = nodeFs } = {})
       if (!existsSafe(fs, mapPath)) return { ok: true, map: {} };
       return { ok: false, reason: 'index-unreadable' }; // a map with no log is not a state we write
     }
-    if (stored && stored.map && typeof stored.map === 'object' && stored.logBytes === logSize) return { ok: true, map: stored.map };
+    if (stored && stored.map && typeof stored.map === 'object' && stored.logBytes === logSize && validMap(stored.map)) return { ok: true, map: stored.map };
     return { ok: true, map: parseLog(fs.readFileSync(log, 'utf8')).map, rebuilt: true };
   } catch { return { ok: false, reason: 'index-unreadable' }; }
 }
 const existsSafe = (fs, p) => { try { fs.statSync(p); return true; } catch { return false; } };
 
-const atomicWrite = (fs, path, tmp, text) => { fs.writeFileSync(tmp, text); fs.renameSync(tmp, path); };
+// Durable: write, fsync, close. The rename happens only after the temp file is flushed.
+const durable = (fs, path, flag, text) => {
+  const fd = fs.openSync(path, flag);
+  try { fs.writeSync(fd, text); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+};
+const atomicWrite = (fs, path, tmp, text) => { durable(fs, tmp, 'w', text); fs.renameSync(tmp, path); };
 
 /**
  * Record a durable review verdict. Call only after the verdict itself is durable (its run record exists).
@@ -108,14 +118,16 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
   const { log, map: mapPath, tmp } = headIndexPaths(dir);
   const current = readHeadIndex({ dir, fs });
   if (!current.ok) throw Error('review-head-index: existing index unreadable; refusing to write');
-  fs.appendFileSync(log, `${JSON.stringify(rec)}\n`);          // 1. durable log line
+  durable(fs, log, 'a', `${JSON.stringify(rec)}\n`);            // 1. durable log line (fsynced)
   const map = applyRecord(current.map, rec, keepPerPr);       // 2. compacted map, temp then rename
   let lines = fs.readFileSync(log, 'utf8').split('\n').filter(l => l.trim()).length;
   if (lines > logMaxLines) { // 3. bound growth: rewrite the log from the compacted map, atomically, then the map
     const compact = Object.entries(map).flatMap(([k, v]) => {
       const [r, p] = [k.slice(0, k.lastIndexOf('#')), Number(k.slice(k.lastIndexOf('#') + 1))];
-      return Object.entries(v.history).sort((a, b) => Date.parse(a[1].at) - Date.parse(b[1].at))
-        .map(([hash, h]) => ({ repo: r, pr: p, head: h.head, netPatchHash: hash, verdict: h.verdict, at: h.at }));
+      const row = (hash, h) => ({ repo: r, pr: p, head: h.head, netPatchHash: hash.startsWith(NOKEY) ? null : hash, verdict: h.verdict, at: h.at });
+      const older = Object.entries(v.history).sort((a, b) => Date.parse(a[1].at) - Date.parse(b[1].at)).map(([hash, h]) => row(hash, h));
+      // The PR's current record goes LAST so a rebuild restores lastReviewedHead and its verdict exactly.
+      return [...older, { repo: r, pr: p, head: v.lastReviewedHead, netPatchHash: v.netPatchHash, verdict: v.verdict, at: v.at }];
     });
     const text = compact.map(c => `${JSON.stringify(c)}\n`).join('');
     atomicWrite(fs, log, `${log}.tmp`, text);
