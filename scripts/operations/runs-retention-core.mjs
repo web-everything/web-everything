@@ -10,7 +10,8 @@ import { homedir, tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { isRunRecordTerminal, listRunIds, resolveRunsDir, runPath, tryReadRun } from './run-store.mjs';
+import { isRunRecordTerminal, listRunIds, resolveRunsDir, runPath } from './run-store.mjs';
+import { parseRunRecord } from './run-record.mjs';
 
 const DAY = 86400000;
 const GIB = 1024 ** 3;
@@ -41,6 +42,11 @@ export function resolveRetentionSettings({ env = process.env, tool } = {}) {
   return v;
 }
 
+/**
+ * NOTE ON WRITERS: run records are only ever written by writeRun -> writeJsonAtomic (temp + same-fs rename), never
+ * modified in place, so the inode quarantined below can not change underneath the hash; a concurrent writer creates
+ * a NEW file at the canonical name, which this pass never touches.
+ */
 /** Conservative superset of review runs a `--resume` could need (parked / unfinished advise). */
 export function reviewRunMayResume(record) {
   if (record.op !== 'review-pr') return false;
@@ -96,10 +102,16 @@ export function runsRetention(o = {}) {
   const codec = o.codec ?? defaultCodec();
   const tarCreate = o.tarCreate ?? defaultTarCreate, tarList = o.tarList ?? defaultTarList;
   const freeGiB = o.freeGiB ?? defaultFreeGiB;
+  const isComplete = o.isComplete ?? (() => false);
   const verifyContents = o.verifyContents ?? defaultVerify;
   const out = { status: dryRun ? 'dry-run' : 'archived', dryRun, scanned: 0, eligible: 0, eligibleBytes: 0,
     kept: { young: 0, nonTerminal: 0, resumable: 0, unreadable: 0 }, archived: 0, deleted: 0, bytesFreed: 0, archives: [], errors: [], months: {} };
   const cutoff = now - settings.keepDays * DAY;
+  // Crash recovery: a record parked under .retiring-* by an interrupted pass goes back to its canonical name.
+  if (!dryRun) for (const name of existsSync(dir) ? readdirSync(dir) : []) {
+    const m = /^\.retiring-(.+)\.[0-9a-f-]{36}$/.exec(name);
+    if (m) { try { linkSync(join(dir, name), runPath(m[1], dir)); unlinkSync(join(dir, name)); } catch { /* canonical exists: leave the parked copy for an operator */ } }
+  }
   const ids = listRunIds(dir);
   out.scanned = ids.length;
   const byMonth = new Map();
@@ -109,15 +121,22 @@ export function runsRetention(o = {}) {
     if (!st.isFile() || st.mtimeMs >= cutoff) { out.kept.young++; continue; }
     const month = monthOf(st.mtimeMs);
     if (o.month && month !== o.month) continue;
-    let record;
-    try { record = tryReadRun(id, dir); } catch { out.kept.unreadable++; continue; }
-    // cursor 0 = never advanced: a resume would restart it, so it is not treated as finished history.
-    if (!record || !isRunRecordTerminal(record) || !(record.cursor > 0)) { out.kept.nonTerminal++; continue; }
+    // ONE read: eligibility and the content hash come from the same bytes.
+    let record, bytes;
+    try {
+      bytes = readFileSync(runPath(id, dir));
+      const parsed = parseRunRecord(bytes.toString('utf8'));
+      if (!parsed.ok) throw new Error(parsed.reason);
+      record = parsed.record;
+    } catch { out.kept.unreadable++; continue; }
+    // Finished = no pending effect AND the cursor reached the declaration's last step (`isComplete`, injected;
+    // unknown op or no injection = retained). An interrupted run between steps is what --resume continues.
+    if (!record || !isRunRecordTerminal(record) || !isComplete(record)) { out.kept.nonTerminal++; continue; }
     if (reviewRunMayResume(record)) { out.kept.resumable++; continue; }
     // PR evidence outlives the cursor (same rule as pruneTerminalRuns): retained unless the setting opts in.
     if (!settings.archivePrEvidence && record.effects.some(e => e?.result?.pr)) { out.kept.resumable++; continue; }
     if (!byMonth.has(month)) byMonth.set(month, []);
-    byMonth.get(month).push({ id, name: `${id}.json`, size: st.size, mtimeMs: st.mtimeMs, ino: st.ino, hash: hashOf(runPath(id, dir)) });
+    byMonth.get(month).push({ id, name: `${id}.json`, size: st.size, mtimeMs: st.mtimeMs, ino: st.ino, hash: createHash('sha256').update(bytes).digest('hex') });
     out.eligible++; out.eligibleBytes += st.size;
     out.months[month] = (out.months[month] ?? 0) + 1;
   }

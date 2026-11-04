@@ -1,5 +1,5 @@
 /** @file runs-retention.test.mjs — R549 archive-then-delete retention on a fixture runs dir. */
-import { writeFileSync, symlinkSync, mkdtempSync, mkdirSync, rmSync, utimesSync, existsSync, readdirSync } from 'node:fs';
+import { renameSync, writeFileSync, symlinkSync, mkdtempSync, mkdirSync, rmSync, utimesSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it, expect } from 'vitest';
@@ -15,7 +15,7 @@ const put = (id, ageDays, patch = {}) => {
   const t = (NOW - ageDays * DAY) / 1000;
   utimesSync(join(runs, `${id}.json`), t, t);
 };
-const base = (extra = {}) => runsRetention({ runsDir: runs, now: NOW, settings, dryRun: false, freeGiB: () => 500, ...extra });
+const base = (extra = {}) => runsRetention({ runsDir: runs, now: NOW, settings, dryRun: false, freeGiB: () => 500, isComplete: () => true, ...extra });
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'we-runs-ret-'));
@@ -40,7 +40,7 @@ describe('runsRetention', () => {
 
   it('dry-run (the default) reports counts and bytes and changes nothing', () => {
     put('run-old', 30);
-    const r = runsRetention({ runsDir: runs, now: NOW, settings });
+    const r = runsRetention({ runsDir: runs, now: NOW, settings, isComplete: () => true });
     expect(r.dryRun).toBe(true); expect(r.eligible).toBe(1); expect(r.eligibleBytes).toBeGreaterThan(0);
     expect(listRunIds(runs)).toEqual(['run-old']);
     expect(existsSync(drive)).toBe(false);
@@ -106,7 +106,7 @@ describe('runsRetention', () => {
     put('run-zero', 30, { cursor: 0 });
     put('run-real', 30);
     symlinkSync(join(runs, 'run-real.json'), join(runs, 'run-link.json'));
-    const r = base();
+    const r = base({ isComplete: rec => rec.cursor > 0 });
     expect(listRunIds(runs).sort()).toEqual(['run-link', 'run-zero']);
     expect(r.deleted).toBe(1);
   });
@@ -115,6 +115,19 @@ describe('runsRetention', () => {
     put('run-old', 30);
     const r = base({ verifyContents: () => { throw new Error('archive content mismatch'); } });
     expect(r.deleted).toBe(0); expect(listRunIds(runs)).toEqual(['run-old']);
+  });
+
+  it('keeps a record whose cursor has not reached the declared last step', () => {
+    put('run-mid', 30);
+    const r = base({ isComplete: () => false });
+    expect(r.deleted).toBe(0); expect(listRunIds(runs)).toEqual(['run-mid']);
+  });
+
+  it('restores a record parked by an interrupted pass', () => {
+    put('run-x', 1);
+    renameSync(join(runs, 'run-x.json'), join(runs, '.retiring-run-x.123e4567-e89b-12d3-a456-426614174000'));
+    base();
+    expect(listRunIds(runs)).toEqual(['run-x']);
   });
 
   it('settings: defaults to 14 days / 30 GiB; env overrides; invalid throws', () => {
