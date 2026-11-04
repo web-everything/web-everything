@@ -370,3 +370,18 @@ describe('audit IO with injected filesystem and subprocesses', () => {
     expect(f.fs.appendFileSync).not.toHaveBeenCalled();
   });
 });
+
+describe('audit record fingerprint (R503)', () => {
+  it('stores the head net-diff fingerprint when readable and omits it when not', async () => {
+    const fp = 'c'.repeat(64);
+    const f = fixture(); f.deps.fingerprint = vi.fn(async () => fp);
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.deps.fingerprint).toHaveBeenCalledWith(BASE, HEAD);
+    expect(f.records[0]).toMatchObject({ head: HEAD, fingerprint: fp });
+    for (const bad of [async () => null, async () => { throw new Error('git'); }]) {
+      const g = fixture(); g.deps.fingerprint = bad;
+      expect(await main(ARGS, g.deps)).toBe(0);
+      expect(g.records[0]).not.toHaveProperty('fingerprint');
+    }
+  });
+});

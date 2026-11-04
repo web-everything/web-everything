@@ -27,6 +27,7 @@ import { pathToFileURL } from 'node:url';
 const SPECIFIC = new Set([
   'transient-504-not-retried', 'persistent-504-read-as-list', 'persistent-504-no-event',
   'persistent-504-not-bounded', 'heavy-list-issued', 'declared-sample-read-as-truncated',
+  'author-throttle-hard-failed',
 ]);
 
 const e504 = () => Object.assign(new Error('gh failed'), { stderr: 'HTTP 504: 504 Gateway Timeout (https://api.github.com/graphql)' });
@@ -66,7 +67,15 @@ export async function replayPrList504(root) {
     Object.defineProperty(sampled, 'sampled', { value: true });
     sampleAccepted = read.defaultReadPrs({ ...base, readShared: () => sampled, retryOpts: retryOpts({ streaks: new Map() }) }).length === 1;
   } catch { sampleAccepted = false; } finally { if (prev === undefined) delete process.env.WE_PR_SNAPSHOT_SAMPLE; else process.env.WE_PR_SNAPSHOT_SAMPLE = prev; }
-  return { transientOk, persistentReturned, persistentCalls, events, sampleAccepted };
+  // Follow-up (2026-11-03 17:19 ET): a gh SLOT throttle during the author lookup defers the read, it is no hard failure.
+  let authorThrottleDeferred = false;
+  try {
+    const throttled = Object.assign(new Error('gh-throttle: throttled — no gh slot within 8s (class=background)'), { ghThrottled: { class: 'background' } });
+    const out = read.defaultReadPrs({ ...base, readShared: () => [{ number: 987654, labels: [], comments: [], statusCheckRollup: [] }],
+      readRest: () => { throw throttled; }, retryOpts: retryOpts({ streaks: new Map() }) });
+    authorThrottleDeferred = !Array.isArray(out) && out?.deferred === true;
+  } catch { authorThrottleDeferred = false; }
+  return { transientOk, persistentReturned, persistentCalls, events, sampleAccepted, authorThrottleDeferred };
 }
 
 export default {
@@ -89,6 +98,7 @@ export default {
     if (r.persistentCalls !== 9) violations.push({ invariant: 'persistent-504-not-bounded', detail: `3 reads x 3 attempts expected 9 list calls, saw ${r.persistentCalls}` });
     if (!r.events.some((e) => e.kind === 'gh-list-failed')) violations.push({ invariant: 'persistent-504-no-event', detail: 'three failed reads in a row raised no gh-list-failed event' });
     if (!r.sampleAccepted) violations.push({ invariant: 'declared-sample-read-as-truncated', detail: 'a declared WE_PR_SNAPSHOT_SAMPLE sample was refused as a partial inventory' });
+    if (!r.authorThrottleDeferred) violations.push({ invariant: 'author-throttle-hard-failed', detail: 'a gh slot throttle during the author lookup did not defer the read' });
     return { violations };
   },
   judge(report) {
