@@ -12,7 +12,8 @@ export const PROTOTYPE_LOAD_EFFECT = 'prototype-load.apply';
 export const safeRegistrationRef = (ref) => typeof ref === 'string' && /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(ref)
   && !/\.\.|\/\/|\/\.|@\{|\.$|\/$|\.lock(?:\/|$)/.test(ref);
 export const safeRef = (ref) => safeRegistrationRef(ref) && ref.startsWith('lane/');
-export const validSha = (sha) => /^[a-f0-9]{40}$/i.test(sha || '');
+// Strings only (main #6353's alias rule): RegExp.test coerces, so an array ['<sha>'] would otherwise pass and alias a real sha.
+export const validSha = (sha) => typeof sha === 'string' && /^[a-f0-9]{40}$/i.test(sha);
 const lowerSha = (sha) => (typeof sha === 'string' ? sha.toLowerCase() : sha);
 export function jsonLines(text) {
   return String(text).split(/\r?\n/).flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } });

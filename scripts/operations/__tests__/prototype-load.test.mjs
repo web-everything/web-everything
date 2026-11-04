@@ -2080,6 +2080,18 @@ describe('readyEvidence fingerprint carry (R503)', () => {
   it.each([['changed code', OTHER_FP], ['unreadable live fp', null], ['malformed live fp', 'zz']])('%s does not carry a ready record', (_, live) => {
     expect(prototypeLoad.readyEvidence([green()], input, [], live)).toBeNull();
   });
+  it('a non-string sha never passes validSha, so an array sha is never a carried or live record', () => {
+    expect(prototypeLoad.validSha([OLD])).toBe(false);
+    expect(prototypeLoad.validSha(OLD)).toBe(true);
+    expect(prototypeLoad.readyEvidence([green({ sha: [OLD] })], input, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([green({ sha: [SHA] })], input, [], FP)).toBeNull();
+  });
+  it('warn mode treats an array-sha ready record as carried, never as the live head\'s own', async () => {
+    // readyEvidence already refuses it; this pins the IO gate's own fail-closed compare if a record ever gets through.
+    const ready = auditLines([green({ sha: [SHA] })]);
+    const out = await auditedFixture('warn', { ready, audits: auditLines([auditRecord({ verdict: 'WEAKENED' })]), auditBaseInMain: TREE, fingerprint: () => FP }).run();
+    expect(out.ok).toBe(false);
+  });
   it('a record without a stored fingerprint, or for another ref, never carries', () => {
     expect(prototypeLoad.readyEvidence([green({ fingerprint: undefined })], input, [], FP)).toBeNull();
     expect(prototypeLoad.readyEvidence([green({ ref: 'lane/other' })], input, [], FP)).toBeNull();
@@ -2247,6 +2259,7 @@ describe('canonicalAuditEvidence live fingerprint wiring (R503)', () => {
     ['only records whose head is the live head', auditLines([auditRecord({ fingerprint: FP })]), true],
     ['an older-head record with an empty fingerprint', auditLines([old({ fingerprint: '' })])],
     ['an older-head record without a head', auditLines([old({ head: undefined })])],
+    ['only live-head records stored in upper case', auditLines([auditRecord({ fingerprint: FP, head: SHA.toUpperCase() })]), true],
   ])('never computes the live fingerprint for %s', async (_, audits, proceeds = false) => {
     const fingerprint = vi.fn(() => FP);
     const f = auditedFixture('refuse', { audits, auditBaseInMain: TREE, fingerprint });
