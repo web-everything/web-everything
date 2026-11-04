@@ -3993,6 +3993,17 @@ describe('restore-review-label — open green PR with no review label (PR #3830)
           .some(d => d.kind === 'restore-review-label')).toBe(false);
       }
     });
+  it('a stacked PR read through the GraphQL snapshot/paged mapper with no checks yet (null rollup) restores review', () => {
+    // GitHub's own answer for a commit no check has reported on: statusCheckRollup null.
+    const { statusCheckRollup, rollupIncomplete } = mapGraphqlPr({ commits: { nodes: [{ commit: { statusCheckRollup: null } }] } });
+    const pr = open({ baseRefName: 'lane/parent', statusCheckRollup, rollupIncomplete });
+    expect(planReconcile({ prs: [pr], now: NOW, requiredChecks: ['gate'] }).dispatch)
+      .toContainEqual(expect.objectContaining({ kind: 'restore-review-label' }));
+    // An unread commit (no commit node) is still unknown evidence: no restore.
+    const unread = mapGraphqlPr({ commits: { nodes: [] } });
+    expect(planReconcile({ prs: [open({ baseRefName: 'lane/parent', ...unread })], now: NOW, requiredChecks: ['gate'] }).dispatch
+      .some(d => d.kind === 'restore-review-label')).toBe(false);
+  });
   it.each([
     ['app prefix alone', { login: 'app/foo', is_bot: false }, true],
     ['bot suffix alone', { login: 'foo[bot]', is_bot: false }, true],

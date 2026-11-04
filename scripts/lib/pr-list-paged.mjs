@@ -83,7 +83,11 @@ const mapCtx = c => c.__typename === 'CheckRun'
 
 /** PURE: gh's flattened check shape, plus incomplete-read evidence that must accompany the rollup. */
 export function mapGraphqlPr(n) {
-  const contexts = n.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts;
+  const commit = n.commits?.nodes?.[0]?.commit;
+  const contexts = commit?.statusCheckRollup?.contexts;
+  // GitHub answers `statusCheckRollup: null` for a commit no check has reported on: a complete, empty set
+  // (a stacked lane PR before CI starts). A missing commit or rollup field is unread evidence, never empty.
+  const noChecksYet = commit != null && typeof commit === 'object' && commit.statusCheckRollup === null;
   return { number: n.number, title: n.title, url: n.url, isDraft: n.isDraft, createdAt: n.createdAt, updatedAt: n.updatedAt,
     headRefName: n.headRefName, headRefOid: n.headRefOid, baseRefName: n.baseRefName, isCrossRepository: n.isCrossRepository,
     mergeable: n.mergeable, mergeStateStatus: n.mergeStateStatus, reviewDecision: n.reviewDecision ?? '',
@@ -92,7 +96,7 @@ export function mapGraphqlPr(n) {
     // GraphQL Bot logins need not carry gh's app/ prefix; preserve bot identity explicitly.
     author: n.author ? { login: n.author.login, is_bot: n.author.__typename === 'Bot' } : null,
     // Never certify the first 100 contexts as the full set; unknown pageInfo is also incomplete.
-    rollupIncomplete: contexts?.pageInfo?.hasNextPage !== false || !Array.isArray(contexts?.nodes) };
+    rollupIncomplete: !noChecksYet && (contexts?.pageInfo?.hasNextPage !== false || !Array.isArray(contexts?.nodes)) };
 }
 
 /** PURE: reject GraphQL errors even when accompanied by partial data. */

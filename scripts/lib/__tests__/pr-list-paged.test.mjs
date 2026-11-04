@@ -98,6 +98,19 @@ describe('query and gh row shape', () => {
       expect(complete.rollupIncomplete).toBe(false);
       expect(complete.statusCheckRollup).toHaveLength(100);
     });
+  // GitHub answers `statusCheckRollup: null` for a commit no check has reported on yet: that is a complete,
+  // empty set. A missing commit or an absent rollup field is unread evidence and stays incomplete.
+  it.each([
+    ['null rollup (no checks yet)', { nodes: [{ commit: { statusCheckRollup: null } }] }, false],
+    ['commit without the rollup field', { nodes: [{ commit: {} }] }, true],
+    ['no commit node', { nodes: [] }, true],
+    ['no commits connection', undefined, true],
+    ['rollup without contexts', { nodes: [{ commit: { statusCheckRollup: {} } }] }, true],
+  ])('rollup completeness for %s', (_name, commits, incomplete) => {
+    const mapped = mapGraphqlPr(node(1, commits === undefined ? {} : { commits }));
+    expect(mapped.rollupIncomplete).toBe(incomplete);
+    expect(mapped.statusCheckRollup).toEqual([]);
+  });
 });
 
 describe('light paging', () => {
