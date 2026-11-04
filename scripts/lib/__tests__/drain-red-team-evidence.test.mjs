@@ -8,7 +8,7 @@ import { historicalCardOnlySkipCandidate, readDrainRedTeamEvidence, recordRedTea
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { redTeamOwedFor } from '../review-red-team-policy.mjs';
 import { pidStartTime } from '../pid-alive.mjs';
-import { resumeRedTeamCarry } from '../red-team-carry-machine.mjs';
+import { readRedTeamCarry, resumeRedTeamCarry } from '../red-team-carry-machine.mjs';
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -611,6 +611,80 @@ describe('bounded review evidence scans', () => {
     const result = readDrainRedTeamEvidence({ ...f, ...big, read: id => id === 'review-pr-4999' ? panel : null });
     expect(result.ok).not.toBe(false);
     expect(result).toMatchObject({ status: { status: 'finished' } });
+  });
+  // An unfinished card-only carry journal for this head, written before its compatibility status (a crash).
+  const carryJournal = (f, from) => {
+    const loopPayload = { verdict: null, carriedFrom: from, findings: { read: {
+      netBasis: { rev: f.head }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'] } } };
+    expect(() => resumeRedTeamCarry({ ...f, loopPayload }, { env: f.env, eligible: () => true,
+      intentRecorded: () => false, recordIntent: () => { throw Error('crash'); } })).toThrow('crash');
+  };
+  it('recovery resolves a carry journal past the cap from the existing scan, like the drain', () => {
+    const f = fixture(), from = 'c'.repeat(40);
+    carryJournal(f, from);
+    // The newest same-PR run is the carried-from panel and started after every omitted record was written.
+    const panel = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(from), ...startedAt(4999 * 10_000 - 1000) };
+    let reads = 0;
+    const args = { ...f, ...big, read: id => { reads++; return id === 'review-pr-4999' ? panel : null; } };
+    expect(readDrainRedTeamEvidence(args)).toMatchObject({ carry: { step: 'intent' }, skipCardOnly: true });
+    reads = 0;
+    const witness = readRecoveryWitness(args);
+    expect(witness.ok).not.toBe(false);
+    expect(witness.newest).toBeNull();
+    expect(witness.carryEvidence).toMatchObject({ carry: { step: 'intent' }, skipCardOnly: true });
+    // The fallback reuses the capped scan: one parse budget for the witness and its carry evidence.
+    expect(reads).toBe(MAX_RUN_RECORDS_PARSED);
+    // The scheduler reads the resolvable carry instead of skipping the PR on a capped witness.
+    let evidenceReads = 0;
+    const rows = planRedTeamOnSkip({ repo: f.repo, refusals: [{ kind: 'already-reviewed-head', prNumber: f.pr }],
+      rawPrs: [{ number: f.pr, headRefOid: f.head, comments: [], labels: ['review:accepted'] }],
+      readWitness: key => readRecoveryWitness({ ...args, ...key }),
+      readEvidence: key => { evidenceReads++; return readDrainRedTeamEvidence({ ...args, ...key }); },
+      readStatus: () => null, readCarry: key => readRedTeamCarry({ ...key, env: f.env }),
+      setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(), now: 0 });
+    expect(rows[0].why).not.toBe('scan-capped');
+    expect(evidenceReads).toBe(1);
+  });
+  it('recovery still holds a capped carry whose carried-from panel cannot be settled inside the window', () => {
+    const f = fixture(), from = 'c'.repeat(40);
+    carryJournal(f, from);
+    const panel = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(from), ...startedAt(1000) };
+    const result = readRecoveryWitness({ ...f, ...big, read: id => id === 'review-pr-4999' ? panel : null });
+    expect(result).toMatchObject({ ok: false, reason: 'scan-capped' });
+  });
+  it('recovery still holds a capped exact-head match even when a carry journal exists', () => {
+    const f = fixture(), from = 'c'.repeat(40);
+    carryJournal(f, from);
+    const own = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head), ...startedAt(1000) };
+    const result = readRecoveryWitness({ ...f, ...big, read: id => id === 'review-pr-4999' ? own : null });
+    expect(result).toMatchObject({ ok: false, reason: 'scan-capped' });
+  });
+  // The status-file twin of the journal case: recovery's capped exact-head read defers to the drain's
+  // status query, which resolves only once every omitted record predates the status by the slack.
+  it.each([[RUN_MTIME_SLACK_MS - 1, false], [RUN_MTIME_SLACK_MS, true]])('recovery on a carried status stamped %i ms after the first omitted record resolves: %s', (offset, resolves) => {
+    const f = fixture(), from = 'c'.repeat(40);
+    recordRedTeamStatus({ ...f, loopPayload: { ...payload(f.head), carriedFrom: from }, status: 'finished', result: 'skipped' }, f);
+    const at = new Date(4699 * 10_000 + offset);
+    utimesSync(statusFile(f), at, at);
+    const panel = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(from), ...startedAt(4999 * 10_000 - 1000) };
+    const witness = readRecoveryWitness({ ...f, ...big, read: id => id === 'review-pr-4999' ? panel : null });
+    if (!resolves) {
+      expect(witness).toMatchObject({ ok: false, reason: 'scan-capped' });
+      return;
+    }
+    expect(witness.ok).not.toBe(false);
+    expect(witness.newest).toBeNull();
+    expect(witness.carryEvidence).toMatchObject({ status: { status: 'finished' } });
+    expect(witness.carryEvidence.ok).not.toBe(false);
+  });
+  it('recovery reports a later panel that invalidates a capped carry as carry evidence, never as a newest run', () => {
+    const f = fixture(), from = 'c'.repeat(40);
+    carryJournal(f, from);
+    const later = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload('d'.repeat(40)), ...startedAt(4999 * 10_000 - 1000) };
+    const witness = readRecoveryWitness({ ...f, ...big, read: id => id === 'review-pr-4999' ? later : null });
+    expect(witness.newest).toBeNull();
+    expect(witness.carryEvidence).toMatchObject({ carryConflict: true, loopPayload: later });
+    expect(planRedTeamRecovery(witness)).toMatchObject({ mode: 'skip' });
   });
   it.each([['drain', readDrainRedTeamEvidence], ['recovery', readRecoveryWitness]])('%s holds an unreviewed head: absence of an exact-head run cannot be proven past the cap', (_name, reader) => {
     const f = fixture();

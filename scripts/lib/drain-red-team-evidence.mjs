@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { hostname } from 'node:os';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { isRunRecordTerminal, listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operations/run-store.mjs';
-import { createNewestRunFinder } from './stream-filter-runs.mjs';
+import { createNewestRunFinder, RUN_SCAN_CAPPED } from './stream-filter-runs.mjs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { redTeamEnabled, redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
@@ -166,15 +166,25 @@ export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir
   const seats = records.filter(r => r.dispatchKind === 'review-seat' && r.seat === 'red-team'
     && r.repo === repo && Number(r.pr) === Number(pr) && r.rev === head);
   const lookup = reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak: 'id-desc', scanSettings, warn, now });
+  // Preserve the existing policy-only carry surface; it never supplies a stale recovery payload.
+  // The fallback reuses this scan (one parse budget) but reads it in the drain's ascending tie order.
+  const readCarryEvidence = () => readDrainRedTeamEvidence({ ...key, env, runsDir, list, read, stat, scanSettings, warn, now,
+    lookup: (exactHead = true, _order, options) => lookup(exactHead, 'id-asc', options), readScorecards: () => records });
   const latest = lookup();
-  if (latest.ok === false) return latest;
+  let carryEvidence;
+  if (latest.ok === false) {
+    // A capped exact-head query cannot prove there is no exact-head run, but the drain's carry
+    // paths answer from the same scan through their own, provable queries. Read that fallback
+    // first, so recovery never holds a head the drain can settle. Its newest run stays null, which
+    // recovery never treats as an owed pass. Unfinished or unordered runs still hold at once.
+    if (latest.reason !== RUN_SCAN_CAPPED.reason) return latest;
+    carryEvidence = readCarryEvidence();
+    if (carryEvidence?.ok === false) return latest;
+  }
   const newest = latest.run ? { id: latest.id, run: latest.run, at: latest.at } : null;
   const marker = optionalBytes(`${path}.stale-redispatch-1`);
   return { ...key, rawWriter: { bytes, parsed, sha256: digest(bytes) }, seats, newest: newest?.run ?? null,
-    // Preserve the existing policy-only carry surface; it never supplies a stale recovery payload.
-    // The fallback reuses this scan (one parse budget) but reads it in the drain's ascending tie order.
-    ...(newest ? {} : { carryEvidence: readDrainRedTeamEvidence({ ...key, env, runsDir, list, read, stat, scanSettings, warn, now,
-      lookup: (exactHead = true, _order, options) => lookup(exactHead, 'id-asc', options), readScorecards: () => records }) }),
+    ...(newest ? {} : { carryEvidence: carryEvidence ?? readCarryEvidence() }),
     evidenceSha256: digest(JSON.stringify([seats, newest])),
     markers: { redispatch: marker === null ? null : JSON.parse(marker), retry: retryMarkerSpent(path) } };
 }
