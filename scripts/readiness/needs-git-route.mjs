@@ -226,8 +226,9 @@ const TOKEN = /\S+/y;
 const GIT_AT = /(?:[^\n]*\/)?git(?:\.exe)?(?=\s|$)/y;
 // Words that run the next word as a command (shell keywords, groups, wrappers); skipped before looking for `git`.
 const COMMAND_PREFIX = new Set(['then', 'else', 'elif', 'do', 'if', 'while', 'until', '!', '{', 'sudo', 'time', 'exec', 'env', 'command', 'nice', 'nohup', 'xargs', 'builtin']);
-// `\n`, `\r` written as escapes in a quoted string are line breaks once the string is evaluated.
-const decodeBreaks = (s) => s.replace(/\\([nr])/g, '\n');
+// `\n`, `\r` and `\t` written as escapes in a quoted string are whitespace once the string is evaluated; a break
+// splits the command, so all three become one.
+const decodeBreaks = (s) => s.replace(/\\[nrt]/g, '\n');
 // Each step is a sticky match from a moving index, so a long run of spaces or `A=b` prefixes stays linear.
 function commandIsGit(segment) {
   let pos = 0;
