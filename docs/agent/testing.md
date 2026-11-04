@@ -3927,6 +3927,9 @@ remote SHA is an additional exclusion, and unrelated local branches still block 
 intentionally release tracked edits or unpreserved commits must pass `--discard` explicitly; `--force`
 only overrides ownership. Unreadable or oversized Git evidence keeps the lease and names manual
 inspection or deliberate `--discard` as the operator fallback.
+A refusal exits 1, names each kept lane in `--json` (`kept: [{ pool?, lane, reason: 'unpushed-work', details }]`)
+and journals a loud `release-refused` line. Callers that ignore the exit code (the drain's release-on-land,
+a launch-failure un-reserve, the reaper) therefore never leave a silent ghost lease. Tests pin the exit code, the `kept` list and the journal line.
 Canonical-origin isolation fixtures must assert refusal and an unchanged lease when the owning pool's
 origin is unresolved. Reclaim fixtures with rejected salvage must first assert that reaper release
 refuses, then explicitly discard the lease to exercise reclaim on unpreserved work. The card-filer soak

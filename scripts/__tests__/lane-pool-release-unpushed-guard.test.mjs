@@ -4,6 +4,7 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, w
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
+import { readLaneJournal } from '../lib/lane-history.mjs';
 
 const script = resolve(process.cwd(), 'scripts/lane-pool.mjs');
 const git = (args, cwd) => execFileSync('git', args, {
@@ -100,6 +101,28 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     expect(result.stderr).toContain(sha.slice(0, 12));
     expect(readFileSync(marker, 'utf8')).toBe(lease);
     expect(existsSync(join(poolRoot, 'releaseguard', 'lane-2', '.git', '.lane-lease'))).toBe(false);
+  });
+  // Callers that parse the JSON (the drain's release-on-land reads it from a non-zero exit's stdout) must see WHICH
+  // lane was kept and why, and the refusal must leave a loud journal line, so a kept lease is never a silent ghost.
+  it('reports the kept lane in --json and journals the refusal loud', () => {
+    const sha = commitWork();
+    const result = release();
+    refused(result, sha);
+    expect(result.data.kept).toEqual([expect.objectContaining({
+      ...(selector === '--all-pools' ? { pool: 'releaseguard' } : {}), lane: 1, reason: 'unpushed-work',
+      details: expect.stringContaining(sha.slice(0, 12)),
+    })]);
+    const journal = readLaneJournal(join(poolRoot, 'releaseguard')).filter(e => e.lane === 1 && e.action === 'release-refused');
+    expect(journal).toEqual([expect.objectContaining({ loud: true, unpushed: true, reason: expect.stringContaining('UNPUSHED_WORK') })]);
+    release();
+    expect(readLaneJournal(join(poolRoot, 'releaseguard')).filter(e => e.lane === 1 && e.action === 'release-refused')).toHaveLength(1);
+  });
+  it('reports a clean release with an empty kept list', () => {
+    commitWork();
+    git(['push', '--quiet', 'origin', 'HEAD:refs/heads/work/preserved'], laneDir);
+    const result = release();
+    released(result);
+    expect(result.data.kept).toEqual([]);
   });
   it('releases a pushed commit without requiring a particular upstream ref', () => {
     commitWork();

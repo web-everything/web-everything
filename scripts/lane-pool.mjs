@@ -2940,8 +2940,13 @@ function releaseWorkRefuses(dir, label, salvage, proof) {
   log(`  ${safe(label)}: UNPUSHED_WORK — ${details}; lane and lease kept. Preserve work (commit tracked changes first):\n` +
     `    git -C ${quote(safe(dir))} push origin HEAD:refs/heads/${quote(safe(branch))}\n` +
     '    Push other unpushed local branches too, then retry release; pass --discard to deliberately release without preserving this work.');
+  // A caller that swallows the exit code (the drain's release-on-land, a launch-failure un-reserve, the reaper) still
+  // leaves this loud journal line, and `--json` names the kept lane, so a kept lease is never a silent ghost.
+  journalLaneEvent(dir, {
+    action: 'release-refused', reason: `UNPUSHED_WORK — ${details}`.slice(0, 1000), loud: true, unpushed: true,
+  }, { unlessRepeat: true });
   process.exitCode = 1;
-  return true;
+  return { reason: 'unpushed-work', details: details.slice(0, 1000) };
 }
 
 // #2667 — cross-pool release-by-session. `release --all-pools --session=<slug>` sweeps EVERY pool under
@@ -3007,6 +3012,7 @@ async function cmdReleaseAllPools(repo) {
   // `execFileSync`, so it inherits whatever directory that process happens to be running from).
   const pools = existingPools();
   const perPool = [];
+  const kept = []; // lanes the unpushed-work guard kept: the drain's release-on-land reads this from the JSON
   let released = 0;
   for (const name of pools) {
     const poolDir = join(POOL_ROOT, name);
@@ -3042,7 +3048,8 @@ async function cmdReleaseAllPools(repo) {
         if (salvage.status === 'failed') log(`  WARNING ${name}/lane-${n}: SALVAGE PUSH FAILED: ${salvage.reason}; checking remaining work before release`);
         else if (salvage.status === 'pushed') log(`  ${name}/lane-${n}: salvaged to ${salvage.ref}`);
       }
-      if (releaseWorkRefuses(dir, `${name}/lane-${n}`, salvage, proof)) continue;
+      const refusedWork = releaseWorkRefuses(dir, `${name}/lane-${n}`, salvage, proof);
+      if (refusedWork) { kept.push({ pool: name, lane: n, ...refusedWork }); continue; }
       if (!takeMarkerIf(dir, moved => sameLease(moved, lease), n)) {
         log(`  ${name}/lane-${n}: lease changed during salvage; kept`);
         continue;
@@ -3064,8 +3071,8 @@ async function cmdReleaseAllPools(repo) {
       unmapLanes({ referencePath: repo.registryReferencePath || repo.referencePath, name }, lanes);
     }
   }
-  if (released === 0) log(`  no leases held by ${selectorLabel} in any pool (${pools.length} pool(s) scanned)`);
-  if (flags.json) process.stdout.write(JSON.stringify({ session: session || null, item: wantItem, released, pools: perPool }, null, 2) + '\n');
+  if (released === 0 && kept.length === 0) log(`  no leases held by ${selectorLabel} in any pool (${pools.length} pool(s) scanned)`);
+  if (flags.json) process.stdout.write(JSON.stringify({ session: session || null, item: wantItem, released, pools: perPool, kept }, null, 2) + '\n');
 }
 
 function deliveredLeaseForLane(dir, lease) {
@@ -3113,6 +3120,7 @@ async function cmdRelease(repo) {
   else if (flags.lane !== undefined) { targets = [Number(flags.lane)]; targeted = true; }
   else return fail('release needs --lane=N or --all');
   let released = 0;
+  const kept = []; // lanes the unpushed-work guard kept (named in --json so a caller can surface them)
   for (const n of targets) {
     const dir = laneDir(repo, n);
     const lease = readLease(dir);
@@ -3230,7 +3238,8 @@ async function cmdRelease(repo) {
         else if (salvage.status === 'pushed') log(`  lane-${n}: salvaged to ${salvage.ref}`);
       }
     }
-    if (releaseWorkRefuses(dir, `lane-${n}`, salvage, { io: laneIo, key: repo.originUrl ? `${repo.name}\0${repo.originUrl}` : null })) continue;
+    const refusedWork = releaseWorkRefuses(dir, `lane-${n}`, salvage, { io: laneIo, key: repo.originUrl ? `${repo.name}\0${repo.originUrl}` : null });
+    if (refusedWork) { kept.push({ lane: n, ...refusedWork }); continue; }
     releaseTestBarrier();
     if (!takeMarkerIf(dir, (moved) => sameLease(moved, lease), n)) {
       log(`  lane-${n}: lease changed since it was read (a new acquire/release raced this one) — not releasing; re-run if lane-${n} still looks wrong`);
@@ -3266,7 +3275,7 @@ async function cmdRelease(repo) {
     log(`  released lane-${n} (was ${describeLease(lease)})`);
     released++;
   }
-  if (flags.json) process.stdout.write(JSON.stringify({ released, targets }, null, 2) + '\n');
+  if (flags.json) process.stdout.write(JSON.stringify({ released, targets, kept }, null, 2) + '\n');
 }
 
 function printStatus(repo) {
