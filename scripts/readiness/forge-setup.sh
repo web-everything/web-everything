@@ -305,7 +305,10 @@ Description=Drop outbound network for Forge slot users (registry allowlist only)
 # does not resolve yet: the table installs CLOSED (no registry) and the timer opens the allowlist after 1 min.
 Before=ssh.socket ssh.service sshd.service
 DefaultDependencies=no
-After=systemd-user-sessions.service local-fs.target
+# No After=systemd-user-sessions.service: that unit runs after basic.target, and ssh.socket is Before=sockets.target
+# (before basic.target), so Before=ssh.socket plus that After= would close an ordering cycle and systemd would drop a job.
+# The apply only needs local files (slot users are in /etc/passwd) and the kernel, so local-fs.target is enough.
+After=local-fs.target
 [Service]
 Type=oneshot
 Environment=FORGE_EXEC_SLOTS=$FORGE_EXEC_SLOTS
