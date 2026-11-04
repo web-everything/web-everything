@@ -29,6 +29,30 @@ describe('settings: a priority override can never leave nothing holdable', () =>
     expect(holdsSomething(s)).toBe(true);
     expect(governorState({ loadPerCore: 3, settings: s }).holding).toBe(true);
   });
+  it.each([
+    ['holdable class no owner can classify as', { priority: ['main-fix', 'delivery-unblock', 'build', 'foo'], holdFromClass: 'foo' }],
+    ['empty-string pattern on an exempt class', { classPatterns: { 'main-fix': [''] } }],
+    ['blank pattern everywhere it matters', { classPatterns: { 'main-fix': ['  '], 'daemon-fix': [''] } }],
+  ])('never leaves the governor a no-op: %s', (_n, loadGovernor) => {
+    const s = resolveGovernorSettings({ settings: { loadGovernor } });
+    expect(holdsSomething(s)).toBe(true);
+  });
+  it('exempt classes stay exempt even when the priority omits them', () => {
+    const s = resolveGovernorSettings({ settings: { loadGovernor: { priority: ['daemon-fix', 'build'] } } });
+    for (const text of ['red-main repair', 'unblock land']) expect(shouldHold({ text, holding: true, settings: s }).hold).toBe(false);
+    expect(shouldHold({ text: 'feature-build', holding: true, settings: s }).hold).toBe(true);
+  });
+  it('resume == target collapses the band, so it is pulled below target; tiny maxPauseMinutes is ignored', () => {
+    const s = resolveGovernorSettings({ settings: { loadGovernor: { targetLoadPerCore: 2, resumeBelowPerCore: 2, maxPauseMinutes: 0.0001 } } });
+    expect(s.resumeBelowPerCore).toBeLessThan(s.targetLoadPerCore);
+    expect(s.maxPauseMinutes).toBe(D.maxPauseMinutes);
+  });
+  it('governorTick under a bad override still pauses a real holdable owner', () => {
+    const dir = tmp(); const stateFile = join(tmp(), 'st.json');
+    const settings = resolveGovernorSettings({ settings: { loadGovernor: { priority: ['main-fix', 'delivery-unblock', 'build', 'report'] } } });
+    const r = governorTick({ loadPerCore: 3, owners: [{ owner: 'feature-build-1' }, { owner: 'red-main-fix' }], settings, stateFile, dir, now: new Date('2026-11-03T13:00:00Z') });
+    expect(r.events.filter((e) => e.event === 'paused').map((e) => e.owner)).toEqual(['feature-build-1']);
+  });
   it('keeps a complete, valid override', () => {
     const s = resolveGovernorSettings({ settings: { loadGovernor: { priority: ['main-fix', 'delivery-unblock', 'build', 'report'], holdFromClass: 'report' } } });
     expect(s.priority).toEqual(['main-fix', 'delivery-unblock', 'build', 'report']); expect(s.holdFromClass).toBe('report');

@@ -26,19 +26,22 @@ export function resolveGovernorSettings({ settings, env = {} } = {}) {
   const r = { ...GOVERNOR_DEFAULTS, classPatterns: { ...GOVERNOR_DEFAULTS.classPatterns }, priority: [...GOVERNOR_DEFAULTS.priority] };
   const s = settings?.loadGovernor ?? {};
   if (typeof s.enabled === 'boolean') r.enabled = s.enabled;
-  for (const k of ['targetLoadPerCore', 'resumeBelowPerCore', 'maxPauseMinutes']) if (pos(s[k])) r[k] = s[k];
+  for (const k of ['targetLoadPerCore', 'resumeBelowPerCore']) if (pos(s[k])) r[k] = s[k];
+  if (Number.isFinite(s.maxPauseMinutes) && s.maxPauseMinutes >= 1) r.maxPauseMinutes = s.maxPauseMinutes; // a sub-minute TTL would make every pause a no-op
   if (Array.isArray(s.priority) && s.priority.length && s.priority.every((x) => typeof x === 'string')) r.priority = [...s.priority];
   if (typeof s.holdFromClass === 'string' && r.priority.includes(s.holdFromClass)) r.holdFromClass = s.holdFromClass;
   if (s.classPatterns && typeof s.classPatterns === 'object') {
-    for (const [c, p] of Object.entries(s.classPatterns)) if (Array.isArray(p) && p.every((x) => typeof x === 'string')) r.classPatterns[c] = p;
+    for (const [c, p] of Object.entries(s.classPatterns)) if (Array.isArray(p) && p.every((x) => typeof x === 'string' && x.trim())) r.classPatterns[c] = p; // a blank pattern matches every owner
   }
   const t = Number(env.WE_LOAD_GOVERNOR_TARGET); if (pos(t)) r.targetLoadPerCore = t;
   const rs = Number(env.WE_LOAD_GOVERNOR_RESUME); if (pos(rs)) r.resumeBelowPerCore = rs;
   if (env.WE_LOAD_GOVERNOR_ENABLED === '0') r.enabled = false;
-  if (!(r.resumeBelowPerCore <= r.targetLoadPerCore)) r.resumeBelowPerCore = r.targetLoadPerCore * 0.8; // band can't invert or collapse (would flap)
-  // A priority/cutoff pair that leaves NO class holdable would report "holding" while pausing nothing: ignore that override pair.
-  if (!r.priority.includes(r.holdFromClass) || !r.priority.some((c) => isHoldable(c, r))) {
+  if (!(r.resumeBelowPerCore < r.targetLoadPerCore)) r.resumeBelowPerCore = r.targetLoadPerCore * 0.8; // band can't invert or collapse (would flap)
+  // Individually valid priority/cutoff/patterns that jointly leave NO class both holdable and reachable would report "holding"
+  // while pausing nothing: ignore that whole override set and use the defaults.
+  if (!r.priority.includes(r.holdFromClass) || !r.priority.some((c) => isHoldable(c, r) && isReachable(c, r))) {
     r.priority = [...GOVERNOR_DEFAULTS.priority]; r.holdFromClass = GOVERNOR_DEFAULTS.holdFromClass;
+    r.classPatterns = { ...GOVERNOR_DEFAULTS.classPatterns };
   }
   return r;
 }
@@ -46,9 +49,13 @@ export function resolveGovernorSettings({ settings, env = {} } = {}) {
 /** PURE: the owner's class from its owner/purpose/session text; first class in priority order that matches, else build. */
 export function ownerClass(text, settings = GOVERNOR_DEFAULTS) {
   const t = String(text ?? '').toLowerCase();
-  for (const c of settings.priority) if ((settings.classPatterns[c] ?? []).some((p) => t.includes(p.toLowerCase()))) return c;
-  return settings.priority.includes('build') ? 'build' : settings.priority[settings.priority.length - 1];
+  // exempt classes are scanned first even when a priority override omits them, so no setting can make them holdable
+  for (const c of new Set([...ALWAYS_EXEMPT, ...settings.priority])) if ((settings.classPatterns[c] ?? []).some((p) => t.includes(p.toLowerCase()))) return c;
+  return fallbackClass(settings);
 }
+const fallbackClass = (settings) => (settings.priority.includes('build') ? 'build' : settings.priority[settings.priority.length - 1]);
+/** Can some owner text classify as `c`? Only with a pattern, or as the fallback class. */
+const isReachable = (c, settings) => (settings.classPatterns[c] ?? []).length > 0 || fallbackClass(settings) === c;
 export const classRank = (c, settings = GOVERNOR_DEFAULTS) => { const i = settings.priority.indexOf(c); return i < 0 ? settings.priority.length : i; };
 /** PURE: is this class below the exemption cutoff (so subject to holds and pauses)? */
 export const ALWAYS_EXEMPT = Object.freeze(['main-fix', 'delivery-unblock']); // no setting may hold or pause these
