@@ -74,8 +74,14 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   //  - a carried head's latest WEAKENED blocks unless the live head has a NEWER verdict of its own (a fresh re-audit).
   // Shas compare case-insensitively (validSha accepts either case), so the live head always finds its own verdicts.
   sha = lowerSha(sha);
-  const list = (Array.isArray(records) ? records : [])
-    .map((r) => (r && typeof r === 'object' ? { ...r, head: lowerSha(r.head), base: lowerSha(r.base) } : r));
+  // Copy a record only when lower-casing changes it, so the returned evidence keeps the caller's record identity.
+  const original = new Map();
+  const list = (Array.isArray(records) ? records : []).map((r) => {
+    if (!r || typeof r !== 'object' || (lowerSha(r.head) === r.head && lowerSha(r.base) === r.base)) return r;
+    const copy = { ...r, head: lowerSha(r.head), base: lowerSha(r.base) };
+    original.set(copy, r);
+    return copy;
+  });
   const decisions = (head) => [...new Set(list.filter((r) => r?.head === head && r.base !== head).map((r) => r.base))]
     .map((base) => ({ base, record: findAudit(list, { head, base, questionHash: QUESTION_HASH }) })).filter((d) => d.record);
   const own = decisions(sha);
@@ -86,16 +92,20 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   // Ask covers() once per base: a flaky second answer must never let the pass loop disagree with this check.
   const coverMemo = new Map();
   const covered = (base) => { if (!coverMemo.has(base)) coverMemo.set(base, !!covers(base)); return coverMemo.get(base); };
-  const ownAt = Math.max(-Infinity, ...own.filter((d) => covered(d.base)).map((d) => Date.parse(d.record.at)));
-  if (own.some((d) => d.record.verdict === 'WEAKENED')
-    || carried.some((d) => d.record.verdict === 'WEAKENED' && !(Date.parse(d.record.at) < ownAt))) return { ok: false, reason: 'weakened' };
+  // An own WEAKENED stops here, before covers() can touch git (refuse mode promises to stop before git).
+  if (own.some((d) => d.record.verdict === 'WEAKENED')) return { ok: false, reason: 'weakened' };
+  const carriedWeak = carried.filter((d) => d.record.verdict === 'WEAKENED');
+  if (carriedWeak.length) {
+    const ownAt = Math.max(-Infinity, ...own.filter((d) => covered(d.base)).map((d) => Date.parse(d.record.at)));
+    if (carriedWeak.some((d) => !(Date.parse(d.record.at) < ownAt))) return { ok: false, reason: 'weakened' };
+  }
   // A pass counts only when covers(base) proves its base is in main; a carried pass must itself hold the fingerprint.
   const passes = own.length ? own : carried.filter((d) => carriesAcross(d.record.fingerprint, liveFp));
   let pass = null;
   for (const { base, record } of passes) {
     if (covered(base) && (!pass || Date.parse(record.at) >= Date.parse(pass.at))) pass = record;
   }
-  return pass ? { ok: true, record: pass } : { ok: false, reason: 'no-record' };
+  return pass ? { ok: true, record: original.get(pass) ?? pass } : { ok: false, reason: 'no-record' };
 }
 /** Include BOTH sides of renames/copies; NUL output preserves whitespace and quoted paths. */
 /** Resolve a worker-supplied daemon name to its settings key (R502 item 1: workers guessed wrong 3 times).
