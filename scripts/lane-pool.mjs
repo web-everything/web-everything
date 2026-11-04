@@ -191,7 +191,8 @@ import { VERIFY_FILENAME, keepMarkerAfterReset, readVerifyMarker } from './lib/l
 import { checkLaneHold, laneHoldJournalFields, clearLaneAwaitRecords } from './lib/lane-hold-io.mjs';
 import { resolveLaneHoldSettings } from './lib/lane-lease.mjs';
 import { applyLaneDietConfig, laneDietConfigState } from './lib/lane-git-diet.mjs';
-import { dropGitLocationEnv, laneGitHardeningEnv, scrubGitLocationEnv, scrubGitRepoEnv, scrubRiskyLaneConfig } from './lib/lane-git-hardening.mjs';
+import { dropGitLocationEnv, laneGitHardeningEnv, scrubGitLocationEnv, scrubGitRepoEnv, scrubRiskyLaneConfig, LANE_CONFIG_LIST_ARGS } from './lib/lane-git-hardening.mjs';
+import { laneMaskingConfig, laneRedirectConfig, wellFormedConfigList, withHonestReportingPins } from './lib/health-watch-lane-scan.mjs';
 import { readGitIdentity, laneIdentityReport, ensureLaneHooksPath, resolveGitIdentityPlaceholders, GIT_IDENTITY_FIX_HINT } from './lib/git-identity.mjs';
 
 // #2560 — `--scope=a,b,c` → a normalized, repo-qualified array (empty when the flag is absent/blank).
@@ -2831,8 +2832,10 @@ function assertReleaseReservedScoped() {
 // by the lane git env). Returns the change lines ('' when clean), or null when any evidence is unreadable.
 // Every release evidence read ignores lane-written history rewrites: a `refs/replace/*` ref or `.git/info/grafts`
 // could otherwise make a listed origin sha appear to contain an unpushed commit, or swap HEAD's tree under status.
-const releaseEvidenceGit = (args, dir, opts = {}) => tryGit(args, dir, {
-  ...opts, env: { ...readOnlyGitEnv(args).env, GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/nonexistent' },
+// The honest-reporting pins (scripts/lib/health-watch-lane-scan.mjs) also beat a host-level fileMode/ignoreStat that
+// would hide lane edits.
+const releaseEvidenceGit = (args, dir, opts = {}, extraEnv = {}) => tryGit(args, dir, {
+  ...opts, env: withHonestReportingPins({ ...readOnlyGitEnv(args).env, GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/nonexistent', ...extraEnv }),
 });
 // Stat-trust config (core.checkStat / core.trustctime / core.ignoreStat) is pinned to git's defaults by the shared lane
 // git env (scripts/lib/lane-git-hardening.mjs), for this read and every earlier refreshing status in the release flow.
@@ -2840,10 +2843,17 @@ const releaseEvidenceGit = (args, dir, opts = {}) => tryGit(args, dir, {
 // tracked in we:backlog/xuuhfpf-release-guard-detect-tracked-edits-hidden-by-a-hand-forged-i.md).
 const HIDDEN_ENTRY_HASH_LIMIT = 1000;
 function releaseTrackedChanges(dir) {
+  // Lane-owned config that makes status under-report (core.fileMode=false, autocrlf, sparse, …) or points it at another
+  // worktree (core.worktree) is refused outright: no clean read on top of it can be trusted.
+  // Only the lane's own scopes are inspected; NOSYSTEM drops the system file Apple Git labels scope `unknown`, which
+  // the well-formed check (like the health-watch probe it shares) would otherwise refuse on every lane.
+  const config = releaseEvidenceGit([...LANE_CONFIG_LIST_ARGS], dir, {}, { GIT_CONFIG_NOSYSTEM: '1' });
+  if (config === null || !wellFormedConfigList(config)) return null;
+  const masking = [...laneMaskingConfig(config), ...laneRedirectConfig(config).filter(key => /^core\.worktree$/i.test(key))];
   const status = releaseEvidenceGit(['status', '--porcelain', '--untracked-files=no', '--ignore-submodules=none'], dir);
   const listing = status === null ? null : releaseEvidenceGit(['ls-files', '-z', '-s', '-v'], dir);
   if (listing === null) return null;
-  const hidden = [];
+  const hidden = masking.map(key => `lane config ${key} can hide tracked changes; unset it`);
   const compare = [];
   for (const entry of listing.split('\0')) {
     if (!entry) continue;
@@ -2889,7 +2899,8 @@ function releaseUnprovenCommits(dir, salvage, proof) {
   const stashRef = releaseEvidenceGit(['for-each-ref', '--format=%(objectname)', 'refs/stash'], dir);
   const stashes = stashRef ? releaseEvidenceGit(['reflog', 'show', '--format=%H', 'refs/stash', '--'], dir) : stashRef;
   if (stashes === null) return { commits: null };
-  const tips = stashes ? stashes.split('\n').filter(Boolean) : [];
+  // The ref itself too: a stash ref with an expired, deleted or never-written reflog lists no entries.
+  const tips = [...(stashRef ? stashRef.split('\n') : []), ...(stashes ? stashes.split('\n') : [])].filter(Boolean);
   const input = [...tips, ...[...heads, ...(salvage?.status === 'pushed' ? [salvage.sha] : [])].map(sha => `^${sha}`)]
     .map(line => `${line}\n`).join('');
   const unproven = () => releaseEvidenceGit(['rev-list', '--ignore-missing', '--stdin', 'HEAD', '--branches'], dir,

@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
@@ -136,9 +136,10 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     git(['branch', 'work/hidden', sha], laneDir);
     refused(release(), sha);
   });
-  it('refuses tracked work parked in a stash', () => {
+  it.each(['with its reflog', 'with an expired reflog'])('refuses tracked work parked in a stash %s', shape => {
     writeFileSync(join(laneDir, 'seed.txt'), 'stashed edit\n');
     git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'stash', '--quiet'], laneDir);
+    if (shape === 'with an expired reflog') git(['reflog', 'expire', '--expire=now', 'refs/stash'], laneDir);
     expect(git(['status', '--porcelain', '--untracked-files=no'], laneDir)).toBe('');
     refused(release(), git(['rev-parse', 'refs/stash'], laneDir));
   });
@@ -210,6 +211,24 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     const result = release();
     refused(result);
     expect(result.stderr).toContain('seed.txt');
+  });
+  // Lane config that changes what status reports is refused outright, whatever the worktree holds.
+  it.each(['core.fileMode', 'core.worktree'])('refuses a tracked change hidden by lane %s config', key => {
+    if (key === 'core.fileMode') {
+      chmodSync(join(laneDir, 'seed.txt'), 0o755);
+      git(['config', 'core.fileMode', 'false'], laneDir);
+    } else {
+      const decoy = join(base, 'decoy');
+      git(['clone', '--quiet', origin, decoy]);
+      writeFileSync(join(laneDir, 'seed.txt'), 'edit behind a redirect\n');
+      git(['config', 'core.worktree', decoy], laneDir);
+    }
+    expect(execFileSync('git', ['status', '--porcelain', '--untracked-files=no'], {
+      cwd: laneDir, encoding: 'utf8', env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+    }).trim()).toBe('');
+    const result = release();
+    refused(result);
+    expect(result.stderr).toContain(`lane config ${key.toLowerCase()}`);
   });
   it('refuses a submodule change hidden by diff.ignoreSubmodules', () => {
     const sub = join(laneDir, 'sub');
