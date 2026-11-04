@@ -12,6 +12,7 @@ import { createRequire } from 'node:module';
 import { runInNewContext } from 'node:vm';
 import { withBareOrigin } from './helpers/real-repo.mjs';
 import { createPrototypeLoader, defaultDeps } from '../prototype-load-io.mjs';
+import { netDiffFingerprint } from '../../lib/net-diff-fingerprint.mjs';
 import { resolveDaemonKey, changedPaths, comparePaths, nextMergeRef, prototypeLoadOperation, PROTOTYPE_LOAD_EFFECT } from '../prototype-load.mjs';
 import * as prototypeLoad from '../prototype-load.mjs';
 import { QUESTION_HASH, main as auditMain } from '../codex-audit.mjs';
@@ -149,6 +150,7 @@ function fixture(options = {}) {
     if (args[0] === 'fetch') {
       const ref = args[2]?.replace(/^\+refs\/heads\//, '').split(':')[0];
       if (options.staleFetchFails === ref) return fail(1);
+      if (options.liveFetchFails && args.length > 3 && args[2] === 'main') return fail(1); // only the `origin main <branch>` fetch, not the bare `origin main`
       if (ref === BASE.branch && tipReads > 0 && options.advanceEstablishedBeforeSwap) establishedAdvanced = true;
       if (establishedTips.has(ref)) {
         const count = (establishedFetches.get(ref) || 0) + 1;
@@ -2001,6 +2003,45 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
   it('a WEAKENED audit on the carried head blocks', () => {
     expect(prototypeLoad.canonicalAuditEvidence([old({ verdict: 'WEAKENED' })], SHA, () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
   });
+  // The carry veto must judge a carried head's WEAKENED verdicts exactly as findAudit does (round 3): a record findAudit
+  // rejects, or supersedes, or never consults must not block a carry; a record it accepts still must (fail closed).
+  describe('carry veto follows findAudit', () => {
+    const OTHER_BASE = 'f'.repeat(40);
+    const carried = (...extra) => prototypeLoad.canonicalAuditEvidence([old(), ...extra], SHA, () => true, FP);
+    it.each([
+      ['a contradictory-findings WEAKENED record', { verdict: 'WEAKENED', findings: ['NOT WEAKENED'] }],
+      ['a contradictory-findings WEAKENED record (zero-width and line-break shapes)', { verdict: 'WEAKENED', findings: ['note\n\u200BNOT WEAKENED'] }],
+      ['a WEAKENED record with an unparseable timestamp', { verdict: 'WEAKENED', at: 'not-a-date' }],
+      ['a WEAKENED record with a malformed base', { verdict: 'WEAKENED', base: 'zz' }],
+      ['a WEAKENED empty-diff record (base equals head)', { verdict: 'WEAKENED', base: OLD }],
+    ])('%s on the carried head does not block the carry', (_, overrides) => {
+      expect(carried(old({ fingerprint: undefined, base: OTHER_BASE, at: '2026-10-22T12:00:00Z', ...overrides })).ok).toBe(true);
+    });
+    it('a WEAKENED verdict superseded by a later NOT WEAKENED on the same base does not block (latest wins)', () => {
+      const weak = old({ fingerprint: undefined, base: OTHER_BASE, verdict: 'WEAKENED', at: '2026-10-21T12:00:00Z' });
+      const fixed = old({ fingerprint: undefined, base: OTHER_BASE, at: '2026-10-22T12:00:00Z' });
+      expect(carried(weak, fixed).ok).toBe(true);
+    });
+    it('a valid WEAKENED verdict that is the latest for its base still blocks, even next to a contradictory pass', () => {
+      const weak = old({ fingerprint: undefined, base: OTHER_BASE, verdict: 'WEAKENED', at: '2026-10-22T12:00:00Z' });
+      const earlierPass = old({ fingerprint: undefined, base: OTHER_BASE, at: '2026-10-21T12:00:00Z' });
+      const contradictoryLaterPass = old({ fingerprint: undefined, base: OTHER_BASE, at: '2026-10-23T12:00:00Z', findings: ['WEAKENED'] });
+      expect(carried(earlierPass, weak)).toEqual({ ok: false, reason: 'weakened' });
+      // a later pass findAudit rejects does not supersede the valid WEAKENED verdict
+      expect(carried(earlierPass, weak, contradictoryLaterPass)).toEqual({ ok: false, reason: 'weakened' });
+    });
+  });
+  describe('non-string head/base never alias a string one (trust boundary)', () => {
+    const B = 'f'.repeat(40);
+    it('an array-wrapped base cannot displace the veto of the real string base it stringifies to', () => {
+      const weak = old({ fingerprint: undefined, base: B, verdict: 'WEAKENED', at: '2026-10-22T12:00:00Z' });
+      const alias = old({ fingerprint: undefined, base: [B], at: '2026-10-23T12:00:00Z' });
+      expect(prototypeLoad.canonicalAuditEvidence([old(), weak, alias], SHA, () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
+    });
+    it('a carried array-based record is never a pass', () => {
+      expect(prototypeLoad.canonicalAuditEvidence([old({ base: [TREE] })], SHA, () => true, FP)).toEqual({ ok: false, reason: 'no-record' });
+    });
+  });
   it('a carried record never lends its head other records without the fingerprint', () => {
     const other = old({ fingerprint: undefined, base: 'f'.repeat(40), at: '2026-10-21T12:00:00Z' });
     const weak = old({ fingerprint: undefined, base: '9'.repeat(40), verdict: 'WEAKENED', at: '2026-10-22T12:00:00Z' });
@@ -2191,6 +2232,102 @@ describe('carried evidence precedence (R503 red team)', () => {
     expect(prototypeLoad.readyEvidence([ready(), { ...between, fingerprint: '1'.repeat(64) }], input, [], FP)).toEqual({ source: 'ready-record', record: ready() });
     expect(prototypeLoad.readyEvidence([between, ready()], input, [], FP)).toEqual({ source: 'ready-record', record: ready() });
     expect(prototypeLoad.readyEvidence([ready(), { ...between, audit: 'NOT WEAKENED' }], input, [], FP)).toEqual({ source: 'ready-record', record: ready() });
+  });
+});
+
+// R503 — when the loader computes the live fingerprint, and the production helper wiring (from main, PR #6353).
+// Same carry fixture as 'canonicalAuditEvidence fingerprint carry (R503)' above.
+describe('canonicalAuditEvidence live fingerprint wiring (R503)', () => {
+  const FP = 'e'.repeat(64), OLD = 'd'.repeat(40);
+  const old = (o = {}) => auditRecord({ head: OLD, fingerprint: FP, ...o });
+  // The live fingerprint costs a fetch plus a git diff, so it is computed only when an older head's stored fingerprint could carry.
+  it.each([
+    ['no audit records at all', ''],
+    ['records without a stored fingerprint', auditLines([old({ fingerprint: undefined })])],
+    ['only records whose head is the live head', auditLines([auditRecord({ fingerprint: FP })]), true],
+    ['an older-head record with an empty fingerprint', auditLines([old({ fingerprint: '' })])],
+    ['an older-head record without a head', auditLines([old({ head: undefined })])],
+  ])('never computes the live fingerprint for %s', async (_, audits, proceeds = false) => {
+    const fingerprint = vi.fn(() => FP);
+    const f = auditedFixture('refuse', { audits, auditBaseInMain: TREE, fingerprint });
+    const out = await f.run();
+    expect(fingerprint).not.toHaveBeenCalled();
+    // a loader that went on past the audit stage legitimately fetches `origin main <branch>` later (admission), so only a stop proves the guard
+    if (proceeds) expect(out.canonicalAudit).toMatchObject({ ok: true });
+    else {
+      expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
+      expect(f.calls.filter((c) => c.args[0] === 'fetch' && c.args.length > 3)).toEqual([]);
+    }
+  });
+  it('computes the live fingerprint exactly once, for origin/main and the live sha, when a candidate exists', async () => {
+    let f, fetchesBefore;
+    const fingerprint = vi.fn(() => { fetchesBefore = f.calls.filter((c) => c.args[0] === 'fetch' && c.args.length > 3).map((c) => c.args); return FP; });
+    f = auditedFixture('refuse', { audits: auditLines([old(), old({ base: 'f'.repeat(40) })]), auditBaseInMain: TREE, fingerprint });
+    await f.run();
+    expect(fingerprint).toHaveBeenCalledTimes(1);
+    expect(fingerprint).toHaveBeenCalledWith('origin/main', SHA);
+    // the live branch was fetched BEFORE it was fingerprinted
+    expect(fetchesBefore).toEqual([['fetch', 'origin', 'main', BASE.branch]]);
+  });
+  it('a failed fetch of the live branch means no carry and the fingerprint is never computed', async () => {
+    const fingerprint = vi.fn(() => FP);
+    // the injected fingerprint matches and main covers the base, so only the failed live fetch can withhold the carry
+    const control = await auditedFixture('refuse', { audits: auditLines([old()]), auditBaseInMain: TREE, fingerprint: () => FP }).run();
+    expect(control).toMatchObject({ ok: true, canonicalAudit: { ok: true } });
+    const out = await auditedFixture('refuse', { audits: auditLines([old()]), auditBaseInMain: TREE, fingerprint, liveFetchFails: true }).run();
+    expect(fingerprint).not.toHaveBeenCalled();
+    expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { ok: false, reason: 'no-record' } });
+  });
+  // The production wiring: no injected `fingerprint`, so netDiffFingerprint runs over the loader's own exec.
+  describe('default (non-injected) fingerprint wiring', () => {
+    const FORK = '9'.repeat(40);
+    // Canned git for the helper's own calls (the ones carrying --end-of-options); everything else keeps the fixture's handlers.
+    const cannedGit = (text) => {
+      const seen = [];
+      const exec = (cmd, args) => {
+        seen.push(args.slice(2));
+        const verb = args[2];
+        if (verb === 'rev-parse') return Buffer.from(`${args.at(-1).startsWith('origin/main') ? TREE : SHA}\n`);
+        if (verb === 'merge-base') return Buffer.from(`${FORK}\n`);
+        if (verb === 'diff') return Buffer.from(text);
+        throw new Error(`unexpected git ${args.slice(2)}`);
+      };
+      return { seen, exec, combinedIO: { handles: (cmd, args) => cmd === 'git' && args[0] === '-C' && args.includes('--end-of-options'), exec, fs: {} } };
+    };
+    const DIFF = 'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n';
+    const liveOf = (text) => netDiffFingerprint('/repo', 'origin/main', SHA, { exec: cannedGit(text).exec });
+    it('carries when the real helper, run over the loader exec, matches the stored fingerprint', async () => {
+      const fp = liveOf(DIFF);
+      expect(fp).toMatch(/^[0-9a-f]{64}$/);
+      const { combinedIO, seen } = cannedGit(DIFF);
+      const f = auditedFixture('refuse', { audits: auditLines([old({ fingerprint: fp })]), auditBaseInMain: TREE, combinedIO });
+      const out = await f.run();
+      expect(out.canonicalAudit).toEqual({ mode: 'refuse', ok: true, record: old({ fingerprint: fp }) });
+      // the helper saw origin/main as the base, the live sha as the head, and diffed the merge-base against the live sha
+      expect(seen.map((a) => a[0])).toEqual(['rev-parse', 'rev-parse', 'merge-base', 'diff']);
+      expect(seen[0].at(-1)).toBe(`${SHA}^{commit}`);
+      expect(seen[1].at(-1)).toBe('origin/main^{commit}');
+      expect(seen[3].slice(-2)).toEqual([FORK, SHA]);
+      // and the live branch was fetched before the helper first touched git
+      const firstFetch = f.calls.findIndex((c) => c.args[0] === 'fetch' && c.args.length > 3 && c.args[3] === BASE.branch);
+      const firstHelper = f.calls.findIndex((c) => c.cmd === 'git' && c.args.includes('--end-of-options'));
+      expect(firstFetch).toBeGreaterThanOrEqual(0);
+      expect(firstHelper).toBeGreaterThan(firstFetch);
+    });
+    it('does not carry when the live diff differs from the stored fingerprint', async () => {
+      const stored = liveOf(DIFF);
+      const { combinedIO, seen } = cannedGit(`${DIFF}+more\n`);
+      const out = await auditedFixture('refuse', { audits: auditLines([old({ fingerprint: stored })]), auditBaseInMain: TREE, combinedIO }).run();
+      expect(seen.map((a) => a[0])).toContain('diff'); // the real helper ran; it is the differing diff that withholds the carry
+      expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { ok: false, reason: 'no-record' } });
+    });
+    it('does not carry when the helper cannot read git (empty diff)', async () => {
+      const stored = liveOf(DIFF);
+      const { combinedIO, seen } = cannedGit('');
+      const out = await auditedFixture('refuse', { audits: auditLines([old({ fingerprint: stored })]), auditBaseInMain: TREE, combinedIO }).run();
+      expect(seen.map((a) => a[0])).toContain('diff');
+      expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
+    });
   });
 });
 

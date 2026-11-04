@@ -268,7 +268,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
     let liveFpMemo;
     const liveFingerprint = (evidence) => {
       if (liveFpMemo !== undefined) return liveFpMemo;
-      if (!evidence.some((r) => r?.fingerprint && r.sha !== input.sha && r.head !== input.sha)) return null;
+      // The record must name another head (audit) or sha (ready record): a headless record can never carry (main #6353).
+      if (!evidence.some((r) => r?.fingerprint && (r.head || r.sha) && r.sha !== input.sha && r.head !== input.sha)) return null;
       try {
         requireGit('fetch', 'origin', 'main', input.branch);
         liveFpMemo = (fingerprint || ((b, h) => netDiffFingerprint(repo, b, h, { exec })))('origin/main', input.sha) || null;

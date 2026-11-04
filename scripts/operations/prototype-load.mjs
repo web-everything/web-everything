@@ -90,7 +90,9 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   const decisions = (head) => [...new Set(list.filter((r) => r?.head === head && r.base !== head).map((r) => r.base))]
     .map((base) => ({ base, record: findAudit(list, { head, base, questionHash: QUESTION_HASH }) })).filter((d) => d.record);
   const own = decisions(sha);
-  const carriedHeads = new Set(list.filter((r) => r?.head && r.head !== sha && validSha(r.head) && carriesAcross(r.fingerprint, liveFp)).map((r) => r.head));
+  // Only string heads carry (main #6353): a non-string head that stringifies to a sha never aliases a real one, and
+  // findAudit refuses non-string head/base, so a non-string base never decides either.
+  const carriedHeads = new Set(list.filter((r) => typeof r?.head === 'string' && r.head !== sha && validSha(r.head) && carriesAcross(r.fingerprint, liveFp)).map((r) => r.head));
   const carried = [...carriedHeads].flatMap(decisions);
   // Only an own verdict that could itself pass (its base is in main) is a re-audit that supersedes a carried WEAKENED:
   // a newer audit of a narrow, uncovered base never hides it behind an older covered pass.
