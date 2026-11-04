@@ -10,13 +10,16 @@ const git = (args, cwd) => execFileSync('git', args, {
   cwd, encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024,
 }).trim();
 let fixtureRoot, fixture, origin, reference, base, poolRoot, laneDir, marker, lease;
-function runPool(args, fault = '') {
+function runPool(args, fault = '', remoteFault = '') {
+  // `remoteFault` runs for the canonical-origin listing (the only ls-remote here: recovery is off), which executes
+  // in the primary checkout rather than the lane.
   const preload = `import os from 'node:os'; import cp from 'node:child_process';
     import { syncBuiltinESMExports } from 'node:module';
     os.userInfo = () => ({ homedir: ${JSON.stringify(base)} });
     const original = cp.execFileSync;
     cp.execFileSync = (cmd, args, opts) => {
       if (opts?.cwd === ${JSON.stringify(laneDir)}) { ${fault} }
+      if (opts?.cwd !== ${JSON.stringify(laneDir)} && args.includes('ls-remote')) { ${remoteFault} }
       return original(cmd, args, opts);
     }; syncBuiltinESMExports();`;
   const result = spawnSync(process.execPath, [`--import=data:text/javascript,${encodeURIComponent(preload)}`,
@@ -78,7 +81,7 @@ afterEach(() => {
 });
 
 describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector => {
-  const release = (extra = [], fault = '') => runPool(['release', selector, ...extra], fault);
+  const release = (extra = [], fault = '', remoteFault = '') => runPool(['release', selector, ...extra], fault, remoteFault);
   it('refuses an unpushed commit and keeps the exact lease, even with --force', () => {
     const sha = commitWork();
     refused(release(['--force']), sha);
@@ -108,6 +111,36 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     git(['update-ref', '--no-deref', `refs/remotes/${ref}`, sha], laneDir);
     refused(release(), sha);
   });
+  // Local remote-tracking refs are lane-writable and can be stale, so none of them counts as proof:
+  // only what the canonical origin lists right now does.
+  it.each(['stale origin/main', 'forged origin/fake', 'symbolic origin/alias'])('refuses a commit hidden behind a %s tracking ref', shape => {
+    const sha = commitWork();
+    if (shape === 'stale origin/main') git(['update-ref', 'refs/remotes/origin/main', sha], laneDir);
+    if (shape === 'forged origin/fake') git(['update-ref', 'refs/remotes/origin/fake', sha], laneDir);
+    if (shape === 'symbolic origin/alias') {
+      git(['symbolic-ref', 'refs/remotes/origin/alias', `refs/heads/${git(['symbolic-ref', '--short', 'HEAD'], laneDir)}`], laneDir);
+    }
+    refused(release(), sha);
+  });
+  it('releases a lane whose HEAD is behind an origin tip it has not fetched yet', () => {
+    const other = join(base, 'other');
+    git(['clone', '--quiet', origin, other]);
+    writeFileSync(join(other, 'later.txt'), 'later\n');
+    git(['add', 'later.txt'], other);
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '-m', 'later'], other);
+    git(['push', '--quiet', 'origin', 'HEAD:main'], other);
+    released(release());
+  });
+  it.each(['unreadable', 'malformed', 'oversized'])('fails closed on a %s canonical origin listing', failure => {
+    const remoteFault = failure === 'malformed' ? "return 'not-a-sha\\trefs/heads/main\\n';"
+      : `const error = new Error('forced listing failure'); error.code = ${JSON.stringify(failure === 'oversized' ? 'ENOBUFS' : 'EIO')}; throw error;`;
+    const result = release([], '', remoteFault);
+    refused(result);
+    expect(result.stderr).toContain('canonical origin');
+    const override = release(['--discard'], '', remoteFault);
+    released(override);
+    expect(override.stderr).toMatch(/WARNING.*--discard.*canonical origin/);
+  });
   it('--discard releases with a WARNING listing both commits and tracked changes', () => {
     const sha = commitWork();
     writeFileSync(join(laneDir, 'seed.txt'), 'unfinished edit\n');
@@ -127,6 +160,32 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     expect(existsSync(join(laneDir, '.commit-msg.txt'))).toBe(false);
     expect(readFileSync(join(laneDir, 'seed.txt'), 'utf8')).toBe('unfinished edit\n');
   });
+  // `git status` trusts index flags and submodule-ignore config, so a plain porcelain read can report clean
+  // over a real tracked edit. Each shape below must still refuse.
+  it.each(['assume-unchanged edit', 'assume-unchanged deletion', 'skip-worktree edit', 'skip-worktree deletion'])('refuses a tracked %s hidden by index flags', shape => {
+    git(['update-index', shape.startsWith('assume') ? '--assume-unchanged' : '--skip-worktree', 'seed.txt'], laneDir);
+    if (shape.endsWith('deletion')) rmSync(join(laneDir, 'seed.txt'));
+    else writeFileSync(join(laneDir, 'seed.txt'), 'hidden edit\n');
+    expect(git(['status', '--porcelain', '--untracked-files=no'], laneDir)).toBe('');
+    const result = release();
+    refused(result);
+    expect(result.stderr).toContain('seed.txt');
+  });
+  it('refuses a submodule change hidden by diff.ignoreSubmodules', () => {
+    const sub = join(laneDir, 'sub');
+    git(['init', '--quiet', sub]);
+    const commitSub = message => git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '--allow-empty', '-m', message], sub);
+    commitSub('one');
+    git(['add', 'sub'], laneDir);
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '-m', 'add gitlink'], laneDir);
+    git(['push', '--quiet', 'origin', 'HEAD:refs/heads/work/gitlink'], laneDir);
+    commitSub('two');
+    git(['config', 'diff.ignoreSubmodules', 'all'], laneDir);
+    expect(git(['status', '--porcelain', '--untracked-files=no'], laneDir)).toBe('');
+    const result = release();
+    refused(result);
+    expect(result.stderr).toContain('sub');
+  });
   it('refuses work reachable only from another local branch', () => {
     const sha = commitWork();
     git(['branch', 'work/other', sha], laneDir);
@@ -140,9 +199,14 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     refused(result, sha);
     expect(result.stderr).toContain(`git -C ${laneDir} push origin HEAD:refs/heads/lane/lane-1-preserve`);
   });
-  it('compares only existing remote refs when no remote-tracking refs remain', () => {
+  it('proves against the canonical origin even when the lane has no remote-tracking refs', () => {
     git(['remote', 'remove', 'origin'], laneDir);
-    refused(release(), git(['rev-parse', 'HEAD'], laneDir));
+    released(release());
+  });
+  it('refuses an unpushed commit when the lane has no remote-tracking refs', () => {
+    const sha = commitWork();
+    git(['remote', 'remove', 'origin'], laneDir);
+    refused(release(), sha);
   });
   it('does not block on untracked files outside the litter allowlist', () => {
     writeFileSync(join(laneDir, 'notes.txt'), 'notes\n');

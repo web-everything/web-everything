@@ -2825,21 +2825,76 @@ function assertReleaseReservedScoped() {
   }
 }
 
-// Compares against existing origin/* tracking refs only (no fetch: release must not use lane-controlled transport config).
-// An absent upstream branch is not an error.
-// A successful salvage has separately verified its remote SHA, even when pushing by URL
-// did not create a local remote-tracking ref. Only that verified tip is also excluded.
-function releaseWorkRefuses(dir, label, salvage) {
+// Only tracked changes are in scope by design; untracked files do not block release, and litter is reaped separately.
+// `git status` trusts index flags, so assume-unchanged / skip-worktree entries are compared by content here, and
+// `--ignore-submodules=none` overrides a lane's diff.ignoreSubmodules / submodule.*.ignore (fsmonitor is pinned off
+// by the lane git env). Returns the change lines ('' when clean), or null when any evidence is unreadable.
+const HIDDEN_ENTRY_HASH_LIMIT = 1000;
+function releaseTrackedChanges(dir) {
+  const status = tryGit(['status', '--porcelain', '--untracked-files=no', '--ignore-submodules=none'], dir);
+  const listing = status === null ? null : tryGit(['ls-files', '-z', '-s', '-v'], dir);
+  if (listing === null) return null;
+  const hidden = [];
+  const compare = [];
+  for (const entry of listing.split('\0')) {
+    if (!entry) continue;
+    const match = /^(\S) (\d{6}) ([a-f0-9]{40}|[a-f0-9]{64}) \d\t([\s\S]+)$/.exec(entry);
+    if (!match) return null;
+    const [, tag, mode, sha, path] = match;
+    // Lowercase tag = assume-unchanged; S/s = skip-worktree. Every other entry is already covered by status.
+    if (!/^(?:[a-z]|S)$/.test(tag)) continue;
+    let stat;
+    try { stat = lstatSync(join(dir, path)); } catch { hidden.push(`${path} (hidden by index flags: missing from worktree)`); continue; }
+    // Links and gitlinks are not content-compared here: a flagged one is reported rather than trusted.
+    if (!['100644', '100755'].includes(mode) || !stat.isFile()) { hidden.push(`${path} (hidden by index flags)`); continue; }
+    compare.push({ path, sha });
+  }
+  if (compare.length > HIDDEN_ENTRY_HASH_LIMIT) return null;
+  if (compare.length) {
+    const hashes = tryGit(['hash-object', '--no-filters', '--', ...compare.map(({ path }) => path)], dir);
+    const lines = hashes === null ? [] : hashes.split('\n');
+    if (lines.length !== compare.length) return null;
+    compare.forEach(({ path, sha }, i) => { if (lines[i] !== sha) hidden.push(`${path} (hidden by index flags: modified)`); });
+  }
+  return [status, ...hidden.map(line => `?! ${line}`)].filter(Boolean).join('\n');
+}
+
+// Commits count as preserved only when the canonical origin lists them RIGHT NOW (ls-remote of the pool's resolved
+// origin, run in the primary checkout), or when a salvage push verified its remote SHA. No local refs/remotes/* ref is
+// proof: a lane can make one stale, forged or a symbolic alias of its own branch. A listed tip the lane has not
+// fetched is skipped (`--ignore-missing`); if that leaves commits unproven, one hardened fetch of the origin heads runs
+// and the check repeats. A failed listing or fetch never releases: it keeps the stricter result.
+const releaseRemoteHeads = new Map();
+function releaseUnprovenCommits(dir, salvage, proof) {
+  // On a refusal without remote proof, name the commits local tracking refs do not cover. This is an operator hint
+  // for the message only; it never authorizes a release.
+  const refused = why => ({ commits: null, why, hint: tryGit(['rev-list', '--max-count=20', 'HEAD', '--branches', '--not',
+    '--exclude=origin/HEAD', '--exclude=origin/ops/*', '--remotes=origin/*'], dir) });
+  let heads = proof?.key ? releaseRemoteHeads.get(proof.key) : undefined;
+  if (!heads) {
+    if (!proof?.io) return refused(proof?.why || 'canonical origin unresolved');
+    try { heads = proof.io.remoteHeads(); } catch (e) { return refused(msgOf(e)); }
+    if (proof.key) releaseRemoteHeads.set(proof.key, heads);
+  }
+  const input = [...heads, ...(salvage?.status === 'pushed' ? [salvage.sha] : [])].map(sha => `^${sha}\n`).join('');
+  const unproven = () => tryGit(['rev-list', '--ignore-missing', '--stdin', 'HEAD', '--branches'], dir, { stdio: ['pipe', 'pipe', 'pipe'], input });
+  let commits = unproven();
+  if (commits !== '') {
+    try { proof.io.fetchHeads(dir); commits = unproven(); } catch { /* keep the unfetched, stricter result */ }
+  }
+  return { commits };
+}
+
+function releaseWorkRefuses(dir, label, salvage, proof) {
   const safe = value => String(value).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ');
   const quote = value => /^[a-zA-Z0-9_./:-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
-  const commits = tryGit(['rev-list', 'HEAD', '--branches', '--not',
-    '--exclude=origin/HEAD', '--exclude=origin/ops/*', '--remotes=origin/*',
-    ...(salvage?.status === 'pushed' ? [salvage.sha] : [])], dir);
-  // Only tracked changes are in scope by design; untracked files do not block release, and litter is reaped separately.
-  const tracked = tryGit(['status', '--porcelain', '--untracked-files=no'], dir);
+  const { commits, why, hint } = releaseUnprovenCommits(dir, salvage, proof);
+  const tracked = releaseTrackedChanges(dir);
   if (commits === '' && tracked === '') return false;
   const details = [
-    commits === null ? 'commit evidence unreadable or exceeds the Git output limit; inspect local history manually'
+    why ? `commits cannot be proven on the canonical origin (${safe(why).slice(0, 300)})${hint
+      ? `; local commits not on any origin tracking ref: ${hint.split('\n').map(sha => sha.slice(0, 12)).join(', ')}` : ''}; inspect local history manually`
+      : commits === null ? 'commit evidence unreadable or exceeds the Git output limit; inspect local history manually'
       : commits ? `unpushed commits: ${commits.split('\n').map(sha => sha.slice(0, 12)).join(', ')}` : '',
     tracked === null ? 'tracked status unreadable or exceeds the Git output limit; inspect the index and worktree manually'
       : tracked ? `tracked changes: ${safe(tracked)}` : '',
@@ -2935,13 +2990,18 @@ async function cmdReleaseAllPools(repo) {
         log(`  ${name}/lane-${n}: ${describeLease(lease)} — reserved; skipped (un-reserve is single-lane --release-reserved)`);
         continue;
       }
-      let salvage, salvageIo;
-      if (recoveryEnabled()) {
-        // Other pools must resolve their own primary's origin; never reuse this pool's URL or a lane remote.
+      let salvage, salvageIo, laneIo, proofWhy;
+      // Other pools must resolve their own primary's origin; never reuse this pool's URL or a lane remote. The
+      // release proof needs that origin even when recovery (salvage) is off.
+      try {
         salvageRepo ??= name === repo.name ? repo
           : resolveRepo({ reference: primarySiblingPath(repo, name), pool: name });
-        salvageIo = realSalvageIo({ repo: salvageRepo, preflightLaneDir: dir });
+        laneIo = realSalvageIo({ repo: salvageRepo, preflightLaneDir: dir });
+      } catch (e) {
+        proofWhy = `origin of pool ${name} unresolved: ${msgOf(e)}`;
       }
+      if (recoveryEnabled()) salvageIo = laneIo;
+      const proof = { io: salvageRepo?.originUrl ? laneIo : null, key: salvageRepo?.originUrl ? `${name}\0${salvageRepo.originUrl}` : null, why: proofWhy };
       scrubClaimedLaneConfig(dir, 'before release work check');
       cleanLaneLitter(dir);
       if (salvageIo) {
@@ -2949,7 +3009,7 @@ async function cmdReleaseAllPools(repo) {
         if (salvage.status === 'failed') log(`  WARNING ${name}/lane-${n}: SALVAGE PUSH FAILED: ${salvage.reason}; checking remaining work before release`);
         else if (salvage.status === 'pushed') log(`  ${name}/lane-${n}: salvaged to ${salvage.ref}`);
       }
-      if (releaseWorkRefuses(dir, `${name}/lane-${n}`, salvage)) continue;
+      if (releaseWorkRefuses(dir, `${name}/lane-${n}`, salvage, proof)) continue;
       if (!takeMarkerIf(dir, moved => sameLease(moved, lease), n)) {
         log(`  ${name}/lane-${n}: lease changed during salvage; kept`);
         continue;
@@ -3090,7 +3150,9 @@ async function cmdRelease(repo) {
     // litter, the other 2 clean-but-ahead — the whole pool read 0 of 48 acquirable at once). Any
     // non-allowlisted dirty state (real uncommitted work) is left completely untouched by this call.
     // The snapshot and litter `status` / `clean` would run a lane-set clean filter, which no env pin reaches (PR #5775).
-    const salvageIo = recoveryEnabled() && repo.originUrl ? realSalvageIo({ repo, preflightLaneDir: dir }) : null;
+    // The release proof (releaseWorkRefuses) reads the canonical origin even when recovery (salvage) is off.
+    const laneIo = repo.originUrl ? realSalvageIo({ repo, preflightLaneDir: dir }) : null;
+    const salvageIo = recoveryEnabled() ? laneIo : null;
     scrubClaimedLaneConfig(dir, 'before release snapshot');
     const beforeLitter = laneStateSnapshot(dir, `origin/${repo.branch}`);
     // xbdixjc — a release by anyone but the holder (the reaper's `--force`, a delivered-lease release) may not
@@ -3135,7 +3197,7 @@ async function cmdRelease(repo) {
         else if (salvage.status === 'pushed') log(`  lane-${n}: salvaged to ${salvage.ref}`);
       }
     }
-    if (releaseWorkRefuses(dir, `lane-${n}`, salvage)) continue;
+    if (releaseWorkRefuses(dir, `lane-${n}`, salvage, { io: laneIo, key: repo.originUrl ? `${repo.name}\0${repo.originUrl}` : null })) continue;
     releaseTestBarrier();
     if (!takeMarkerIf(dir, (moved) => sameLease(moved, lease), n)) {
       log(`  lane-${n}: lease changed since it was read (a new acquire/release raced this one) — not releasing; re-run if lane-${n} still looks wrong`);

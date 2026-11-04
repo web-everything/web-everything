@@ -134,15 +134,32 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
     }
     return git(dir, transportArgs, 120_000, true);
   };
+  // Fetch every non-ops origin head into refs/remotes/origin/*. Explicit refspecs make pruning independent of lane config.
+  const fetchHeads = dir => transportGit(dir, 'fetch', '--recurse-submodules=no', '--prune', '--no-tags', origin, '+refs/heads/*:refs/remotes/origin/*',
+    // ops/* carries the verdict ledger (huge history, never lane work): the lane's diet config excludes it, and this explicit
+    // refspec would otherwise pull ~117k objects on every release (lane-68, 2026-11-01).
+    '^refs/heads/ops/*');
   return {
+    fetchHeads,
+    /** The canonical origin's branch tips right now (ops/* excluded), read in the primary checkout, never the lane.
+     *  Throws on anything but complete `<sha>\trefs/heads/<name>` lines, so a caller can fail closed. */
+    remoteHeads: () => {
+      const args = transport('ls-remote', origin, 'refs/heads/*');
+      checkTransportConfig(repo.referencePath);
+      const output = git(repo.referencePath, args, 120_000, true);
+      const shas = [];
+      for (const line of output ? output.split('\n') : []) {
+        const match = /^([a-f0-9]{40}|[a-f0-9]{64})\trefs\/heads\/(.+)$/.exec(line);
+        if (!match) throw new Error('unreadable canonical origin head listing');
+        if (!match[2].startsWith('ops/')) shas.push(match[1]);
+      }
+      return shas;
+    },
     aheadShas: dir => git(dir, ['rev-list', `origin/${repo.branch}..HEAD`]).split('\n').filter(Boolean),
     unmatchedShas: (dir, ahead) => {
       // All branch tips are needed for exact-SHA reachability, but only the integration branch
-      // participates in patch equivalence. Explicit refspecs also make pruning independent of lane config.
-      transportGit(dir, 'fetch', '--recurse-submodules=no', '--prune', '--no-tags', origin, '+refs/heads/*:refs/remotes/origin/*',
-        // ops/* carries the verdict ledger (huge history, never lane work): the lane's diet config excludes it, and this explicit
-        // refspec would otherwise pull ~117k objects on every release (lane-68, 2026-11-01).
-        '^refs/heads/ops/*');
+      // participates in patch equivalence.
+      fetchHeads(dir);
       const matched = new Set();
       for (const line of git(dir, ['cherry', `origin/${repo.branch}`, 'HEAD']).split('\n')) {
         if (line.startsWith('- ')) matched.add(line.slice(2).trim());

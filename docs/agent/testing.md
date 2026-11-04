@@ -3913,8 +3913,14 @@ fail-closed reads across reconcile and dispatch smoke passes within the unchange
 
 ## Lane release preservation guard
 
-`lane-pool release` checks HEAD and every local branch against origin remote-tracking refs (excluding
-`origin/HEAD`, `origin/ops/*`, and all non-origin remotes) after known-litter cleanup and salvage.
+`lane-pool release` checks HEAD and every local branch against the branch tips the pool's canonical
+origin lists right now (`ls-remote` run in the primary checkout, `ops/*` excluded) after known-litter
+cleanup and salvage. No local `refs/remotes/*` ref is proof: stale, forged and symbolic-alias tracking
+refs all still refuse. A listed tip the lane has not fetched triggers one hardened fetch before refusing.
+An unresolved origin or an unreadable listing refuses; every named pool in a fixture therefore needs
+its primary checkout (a sibling of the reference) so release can resolve that origin.
+Tracked changes are read with `--ignore-submodules=none`, and assume-unchanged / skip-worktree entries
+are compared by content, so index flags and submodule-ignore config cannot hide an edit.
 Untracked files deliberately do not block release: the guard covers tracked changes only.
 URL-based salvage may leave no tracking ref: only its verified
 remote SHA is an additional exclusion, and unrelated local branches still block release. Tests that
