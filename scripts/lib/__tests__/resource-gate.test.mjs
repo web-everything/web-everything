@@ -202,11 +202,18 @@ describe('dynamic fixer cap', () => {
   ])('holds at the floor (no raise, no lower): %s', (_, o) => {
     expect(cap(o)).toMatchObject({ cap: 8, raised: false, lowered: false });
   });
-  it('an unknown memory / swap / heavy-wait reading never blocks a raise on its own, and is named in the reason', () => {
-    const d = cap({ snapshot: snap({ idle: 45 }), heavyWaitMinutes: null });
-    expect(d).toMatchObject({ cap: 10, raised: true });
-    expect(d.reason).toMatch(/mem free \?%/);
-    expect(d.reason).toMatch(/heavy wait \?m/);
+  it.each([
+    ['mem free', { snapshot: snap({ idle: 45, swapUsedPct: 20 }) }],
+    ['swap', { snapshot: snap({ idle: 45, freePct: 50 }) }],
+    ['heavy wait', { heavyWaitMinutes: null }],
+    ['cpu idle', { snapshot: { ...snap({ freePct: 50, swapUsedPct: 20 }), cpu: { loadAvg: [60] } } }],
+  ])('R559: an unknown %s reading BLOCKS a raise, names itself, and still holds the floor', (name, o) => {
+    const d = cap(o);
+    expect(d).toMatchObject({ cap: 8, raised: false });
+    expect(d.reason).toContain(`${name}`); expect(d.reason).toMatch(/never raise on an unknown reading|unknown/);
+  });
+  it('R559: an unknown reading still allows a LOWER on what is known (swap exhausted, memory unknown)', () => {
+    expect(cap({ snapshot: snap({ idle: 45, swapUsedPct: 96 }) })).toMatchObject({ lowered: true, raised: false });
   });
   it('never above the ceiling', () => {
     expect(cap({ liveAtPassStart: 11 })).toMatchObject({ cap: 12, raised: true });
@@ -226,7 +233,7 @@ describe('dynamic fixer cap', () => {
   it('the throttle admits a fixer above the old static cap when raised, then refuses at the computed cap', () => {
     const claims = Array.from({ length: 8 }, (_, i) => ({ meta: { kind: 'fix', repo: 'we', pr: i + 1 } }));
     const lines = [];
-    const t = createResourceFixThrottle({ sendBackReservedSlots: 0, listClaims: () => claims, alive: () => true, queueLength: () => 7, readSnap: () => snap({ idle: 45 }), readHeavyWait: () => 5,
+    const t = createResourceFixThrottle({ sendBackReservedSlots: 0, listClaims: () => claims, alive: () => true, queueLength: () => 7, readSnap: () => snap({ idle: 45, freePct: 50, swapUsedPct: 20 }), readHeavyWait: () => 5,
       nowMs: () => NOW, settings: { cutover: 'enforce', fixCap }, gate: () => ({ admit: true, note: 'admit() admitted' }),
       env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '8' }, log: (l) => lines.push(l) });
     expect(t.tryAdmit('fix')).toMatchObject({ admit: true, aboveStaticCap: true });
@@ -236,13 +243,13 @@ describe('dynamic fixer cap', () => {
     expect(third.why).toContain('cap 10 (dynamic fixer cap: floor 8, ceiling 12');
     expect(lines[0]).toMatch(/^resource-gate fix-cap: old: static cap 8 \| new: cap 10 .* → using 10 \(enforce\)/);
     // the log line names the new inputs and where each threshold came from
-    expect(lines[0]).toMatch(/inputs: mem free \?% · swap \?% · heavy wait 5m · cpu idle 45% · fix queue 7/);
+    expect(lines[0]).toMatch(/inputs: mem free 50% · swap 20% · heavy wait 5m · cpu idle 45% · fix queue 7/);
     expect(lines[0]).toMatch(/thresholds: .*raiseMaxSwapUsedPct=60 \(standard\)/);
   });
   it('shadow: the static cap decides; the computed cap is only logged', () => {
     const claims = Array.from({ length: 8 }, (_, i) => ({ meta: { kind: 'fix', repo: 'we', pr: i + 1 } }));
     const lines = [];
-    const t = createResourceFixThrottle({ sendBackReservedSlots: 0, listClaims: () => claims, alive: () => true, queueLength: 7, readSnap: () => snap({ idle: 45 }), readHeavyWait: () => 5,
+    const t = createResourceFixThrottle({ sendBackReservedSlots: 0, listClaims: () => claims, alive: () => true, queueLength: 7, readSnap: () => snap({ idle: 45, freePct: 50, swapUsedPct: 20 }), readHeavyWait: () => 5,
       nowMs: () => NOW, settings: { cutover: 'shadow', fixCap }, gate: () => ({ admit: true }), env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '8' }, log: (l) => lines.push(l) });
     expect(t.tryAdmit('fix')).toMatchObject({ admit: false, kind: 'fix-cap' });
     expect(lines[0]).toContain('new: cap 10');
@@ -276,6 +283,21 @@ describe('dynamic fixer cap', () => {
       ['no available reading', () => snap({ availableMb: null })], ['no floor', () => snap({ floorMb: null })],
       ['no pressure', () => snap({ pressure: null })]])('fails closed on %s', (_n, readSnap) => {
       expect(mk(readSnap).tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
+    });
+  });
+  describe('R559 throwing host gate', () => {
+    it('refuses (does not admit) and logs the reason when the gate throws', () => {
+      const lines = [];
+      const t = createResourceFixThrottle({ sendBackReservedSlots: 0, listClaims: () => [], queueLength: 0, readSnap: () => snap(), nowMs: () => NOW,
+        settings: { cutover: 'enforce', fixCap: { ...fixCap, floor: 4, ceiling: 4 } }, log: (l) => lines.push(l), gate: () => { throw Error('probe exploded'); } });
+      const d = t.tryAdmit('fix');
+      expect(d).toMatchObject({ admit: false, kind: 'host-load', signal: 'gate-error' });
+      expect(d.why).toContain('probe exploded');
+      expect(lines.join('')).toMatch(/host gate threw \(probe exploded\)/);
+      // refusal counted no slot: a healthy gate then admits all four
+      const ok = createResourceFixThrottle({ sendBackReservedSlots: 0, listClaims: () => [], queueLength: 0, readSnap: () => snap(), nowMs: () => NOW,
+        settings: { cutover: 'enforce', fixCap: { ...fixCap, floor: 4, ceiling: 4 } }, log: () => {}, gate: () => ({ admit: true }) });
+      expect([1, 2, 3, 4].every(() => ok.tryAdmit('fix').admit)).toBe(true);
     });
   });
   describe('R558 available-metric thresholds', () => {

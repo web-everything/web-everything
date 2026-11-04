@@ -218,7 +218,7 @@ export function gateLaunch({ kind = 'fix', gate, env = process.env, settings, le
  * LOWERED below the floor (to floor - lowerBy, never under lowerMinimum) when free memory, swap or the projected
  * heavy-queue wait is past its lower threshold. RAISED above the floor only when the snapshot is fresh, `fix` is
  * admitted, CPU idle is at least the backstop, free memory / swap / heavy wait are inside their raise thresholds
- * and queueLength > raiseQueueOver. An unknown memory, swap or wait reading never blocks on its own (named as `?`).
+ * and queueLength > raiseQueueOver. An unknown cpu, memory, swap or wait reading never permits a RAISE (R559) but never blocks a hold or a lower.
  * @param {{fixCap:object, liveAtPassStart:number, queueLength:number|null, heavyWaitMinutes?:number|null, snapshot:object|null, nowMs:number, policy?:object}} o
  */
 export function decideFixCap({ fixCap, liveAtPassStart = 0, queueLength = null, heavyWaitMinutes = null, snapshot = null, nowMs = Date.now(), policy } = {}) {
@@ -249,6 +249,9 @@ export function decideFixCap({ fixCap, liveAtPassStart = 0, queueLength = null, 
   }
   if (d.unknown) return { ...base, reason: `floor: ${d.reason} (never raise on an unknown snapshot)` };
   if (d.verdict !== 'admit') return { ...base, reason: `floor: fix not admitted (${d.reason})` };
+  // R559: an unknown reading never permits a raise (holding or lowering stay available on what is known).
+  const unknownRaise = [['cpu idle', cpu], ['mem free', mem], ['swap', swap], ['heavy wait', wait]].filter(([, v]) => v === null).map(([n]) => n);
+  if (unknownRaise.length) return { ...base, reason: `floor: ${unknownRaise.join(', ')} unknown (never raise on an unknown reading)` };
   if (cpu !== null && cpu < f.holdCpuIdleBelowPct) return { ...base, reason: `floor: cpu idle ${cpu}% < ${f.holdCpuIdleBelowPct}% backstop` };
   if (mem !== null && mem < f.raiseMinMemFreePct) return { ...base, reason: `floor: mem free ${mem}% < ${f.raiseMinMemFreePct}% raise threshold` };
   if (swap !== null && swap > f.raiseMaxSwapUsedPct) return { ...base, reason: `floor: swap ${swap}% > ${f.raiseMaxSwapUsedPct}% raise threshold` };
@@ -332,7 +335,11 @@ export function createResourceFixThrottle({
         return { admit: false, kind: 'fix-cap', why: `${live} live fix/ci-heal session(s) >= cap ${c.effective} (dynamic fixer cap: floor ${c.floor}, ceiling ${c.ceiling}; ${c.reason}); ${kind} deferred, no claim taken` };
       }
       let g = { admit: true };
-      try { g = gateFor(kind); } catch { g = { admit: true }; }
+      try { g = gateFor(kind); } catch (e) {
+        const why = `host gate threw (${String(e?.message ?? e).slice(0, 120)}); ${kind} refused, no claim taken`;
+        try { log(`resource-gate fix-throttle: ${why}\n`); } catch { /* best effort */ }
+        return { admit: false, kind: 'host-load', signal: 'gate-error', why };
+      }
       if (!g.admit) return g;
       live += 1;
       const above = live > legacyCap ? ` — fixer ${live} is above the old static cap ${legacyCap} (${c.reason})` : '';
