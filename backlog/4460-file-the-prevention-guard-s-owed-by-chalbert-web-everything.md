@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/operations/deliver-item-wrapper.mjs", "we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs", "we:scripts/operations/open-pr.mjs", "we:scripts/operations/open-pr-io.mjs", "we:scripts/operations/__tests__/open-pr-io.test.mjs", "we:scripts/operations/__tests__/open-pr.test.mjs", "we:skills-src/conveyor/build-dispatch-daemon.mjs", "we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs", "we:scripts/conveyor/infra-blocked.mjs", "we:scripts/conveyor/__tests__/infra-blocked.test.mjs", "we:scripts/lib/conveyor-sync-timeout-guard.mjs", "we:scripts/lib/__tests__/conveyor-sync-timeout-guard.test.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/check-standards.test.mjs", "we:skills-src/pr/SKILL.md", "we:skills-src/pr/__tests__/pr-diff-checklist.test.mjs"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-01"
-preparedAgainstSha: "0e155fe84a59630def9f9e7d85a21faf22a6dca7"
+preparedDate: "2026-11-03"
+preparedAgainstSha: "e7799190f421e91742eacf1b1e2f1de397e7aa34"
 tags: []
 ---
 
@@ -79,3 +79,5 @@ Use task TMPDIR for scratch work. If admission is busy, wait once using the queu
 - Broader daemon discovery, interprocedural timeout analysis, asynchronous build lifetime management, global undefined-symbol linting, and automated semantic validation of PR descriptions remain outside this item. The targeted guard must state that coverage boundary.
 - The current zero-exit resume branch at `we:scripts/conveyor/infra-blocked.mjs:765` accepts a parsed result without requiring a PR number, and its temporary-body path has no production unlink in this function. These are separate observations, not changes to the nonzero-failure regression mandate; record them separately during implementation if still outstanding. Tests here clean their own temporary bodies.
 - Do not reopen the delivered retry timeout fix or silently change retry/backoff policy. No follow-up is a prerequisite for this MVP, and no dependency edit is proposed.
+
+revalidated: The supplied diff only updates backlog template checks; it does not change the preparation’s premises, design, scope, or test/proof plan.
