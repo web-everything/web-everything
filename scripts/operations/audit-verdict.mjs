@@ -53,7 +53,7 @@ function d2Verified(f, releaseStage, { readCard = readCardFromMain, now = Date.n
     const body = readCard(f.card);
     if (typeof body !== 'string' || !body.trim()) return false;
     // Any pay-by-looking line (indent, case, spacing, trailing text) must parse strictly, or it fails closed.
-    const lines = body.split(/\r\n|[\n\r  ]/).filter(l => /^\s*must[\s_-]*pay[\s_-]*before\s*:/i.test(l.normalize('NFKC')));
+    const lines = body.split(/\r\n|[\n\r\p{Zl}\p{Zp}]/u).filter(l => /^\s*must[\s_-]*pay[\s_-]*before\s*:/i.test(l.normalize('NFKC')));
     if (lines.length > 1) return false;
     const due = lines.length ? /^mustPayBefore: *(\S+) *$/.exec(lines[0])?.[1] : undefined;
     if (lines.length && due === undefined) return false;
