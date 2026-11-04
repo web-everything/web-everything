@@ -5,6 +5,7 @@
  *   Setting `drain.reads.source`: "api" (default) | "git" (the old local-git reads). An API failure NEVER falls
  *   back to git: it throws/returns a DrainReadError that is transient (retry next pass) and names its reason.
  */
+import { execFileSync } from 'node:child_process';
 import { ghRestGetJson } from './gh-rest-read.mjs';
 import { readSettings } from './settings-files.mjs';
 import { platformPreference, resolveCascade } from './policy-cascade.mjs';
@@ -38,10 +39,38 @@ export function resolveDrainReadsSource({ env = process.env, file, platform } = 
   return { value: c.value, source: ({ standard: 'default', tool: 'settings' })[c.sources['']] ?? c.sources[''] };
 }
 
-/** One REST JSON read; every failure becomes a named transient DrainReadError. Returns the parsed body. */
-export function drainRestJson(read, path, { rest = ghRestGetJson, cwd, env = process.env } = {}) {
+const SLUG_TTL_MS = 60_000;
+const slugCache = new Map();
+/** `owner/repo` of the checkout's `origin` remote. A parse failure fails closed; GH_REPO must agree or be unset. */
+export function readOriginSlug(cwd, { env = process.env, git = (c) => execFileSync('git', ['-C', c, 'remote', 'get-url', 'origin'], { encoding: 'utf8', timeout: 20_000, stdio: ['ignore', 'pipe', 'pipe'] }), now = Date.now } = {}) {
+  const dir = cwd || process.cwd();
+  const hit = slugCache.get(dir);
+  let slug = hit && now() - hit.at < SLUG_TTL_MS ? hit.slug : null;
+  if (!slug) {
+    let url;
+    try { url = String(git(dir)).trim(); } catch (e) { throw new DrainReadError('repo-pin', 'origin-unreadable', String(e?.message ?? e).split('\n')[0]); }
+    const m = /^(?:https:\/\/(?:[^@/]+@)?github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/.exec(url);
+    if (!m || m[1] === '.' || m[1] === '..' || m[2] === '.' || m[2] === '..') throw new DrainReadError('repo-pin', 'origin-unparseable', 'origin is not a github.com owner/repo URL');
+    slug = `${m[1]}/${m[2]}`;
+    slugCache.set(dir, { slug, at: now() });
+  }
+  const pinned = String(env.GH_REPO ?? '').trim().replace(/^(?:https?:\/\/)?github\.com\//, '');
+  if (pinned && pinned.toLowerCase() !== slug.toLowerCase()) throw new DrainReadError('repo-pin', 'repo-mismatch', `GH_REPO ${pinned} is not origin ${slug}`);
+  return slug;
+}
+
+/** One REST JSON read, pinned to the origin repository; every failure becomes a named transient DrainReadError. */
+export function drainRestJson(read, path, { rest = ghRestGetJson, cwd, env = process.env, slug, timeoutMs } = {}) {
   let res;
-  try { res = rest(path, { env, context: cwd ?? '', execOpts: cwd ? { cwd } : {} }); } catch (e) {
+  try {
+    const repo = slug ?? readOriginSlug(cwd, { env });
+    const { GH_REPO: _ignored, ...cleanEnv } = env;
+    res = rest(String(path).replace('{owner}/{repo}', repo), {
+      env: cleanEnv, context: `${repo}@${cwd ?? ''}`,
+      execOpts: { ...(cwd ? { cwd } : {}), env: cleanEnv, ...(timeoutMs ? { timeout: timeoutMs } : {}) },
+    });
+  } catch (e) {
+    if (e instanceof DrainReadError) throw e;
     const status = e?.httpStatus;
     throw new DrainReadError(read, status ? `api-http-${status}` : 'api-error', String(e?.message ?? e).split('\n')[0]);
   }
@@ -53,7 +82,13 @@ const b64 = (read, doc) => {
   if (!doc || typeof doc !== 'object' || doc.type !== 'file' || doc.encoding !== 'base64' || typeof doc.content !== 'string') {
     throw new DrainReadError(read, 'api-malformed', 'not a base64 file response');
   }
-  return Buffer.from(doc.content, 'base64').toString('utf8');
+  // Strict: GitHub wraps lines with \n; nothing else but the base64 alphabet and padding is allowed, and the
+  // decode must re-encode to the same text, so corrupt or truncated content can never read as evidence.
+  const flat = doc.content.replace(/\n/g, '');
+  if (flat.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(flat)) throw new DrainReadError(read, 'api-malformed', 'invalid base64 content');
+  const bytes = Buffer.from(flat, 'base64');
+  if (bytes.toString('base64') !== flat) throw new DrainReadError(read, 'api-malformed', 'base64 content does not round-trip');
+  return bytes.toString('utf8');
 };
 
 /** File text at a ref, or null when the path is absent (404). Malformed/oversized responses fail closed. */

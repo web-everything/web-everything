@@ -224,13 +224,13 @@ export async function publishFreezeFromCli({ marker, clear = false, lifted, env 
  * Read the shared freeze for the merge-gate. Never throws; anything unreadable is `{source, error}` (fail closed).
  * @returns {{source:string, frozen?:boolean, reason?:string|null, at?:string|null, publishedAt?:string|null, mergeSha?:string|null, error?:string}}
  */
-export function readSharedFreeze({ board = REPO_ROOT, branch = resolveFreezeBranch(), run, readsSource, rest } = {}) {
+export function readSharedFreeze({ board = REPO_ROOT, branch = resolveFreezeBranch(), run, readsSource, rest, slug } = {}) {
   const source = flatText(`${branch}:${SHARED_FREEZE_FILE}`);
   let text;
   // R546: GitHub REST + ETag by default (setting drain.reads.source); an injected git `run` means the git path.
   // An API failure is a named transient error, never a git fallback.
   if (run === undefined && (readsSource ?? resolveDrainReadsSource().value) === 'api') {
-    try { text = readFileAtRef('freeze-read', SHARED_FREEZE_FILE, branch, { rest, cwd: board }); }
+    try { text = readFileAtRef('freeze-read', SHARED_FREEZE_FILE, branch, { rest, cwd: board, slug, timeoutMs: GIT_TIMEOUT_MS }); } // keeps the freeze read's 20 s bound
     catch (e) { return { source, error: flatText(`branch unreadable: ${e.message}`), transient: e instanceof DrainReadError }; }
     if (text == null) return { source, error: flatText(`${SHARED_FREEZE_FILE} not on ${branch}`) };
   } else {

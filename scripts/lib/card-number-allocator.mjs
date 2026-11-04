@@ -65,7 +65,7 @@ function readRemoteRefs(git, remote = 'origin') {
  * Leave tracking refs alone by default: a caller may already have merged their trees.
  * Deferred numbering explicitly refreshes tracking before its separate bornAs reads.
  */
-export function readNumberingEvidence(git, remote = 'origin', { refreshTracking = false, source, rest, cwd } = {}) {
+export function readNumberingEvidence(git, remote = 'origin', { refreshTracking = false, source, rest, cwd, slug } = {}) {
   let main;
   if ((source ?? resolveDrainReadsSource().value) === 'api') {
     // R546: the high-water mark is a GitHub REST read (ETag; a 304 spends no git process). An API failure throws a
@@ -75,9 +75,9 @@ export function readNumberingEvidence(git, remote = 'origin', { refreshTracking 
       // The REST repository is the one this checkout (the git callback's target) belongs to - never the ambient cwd.
       cwd ??= String(git(['rev-parse', '--show-toplevel'])).trim();
       if (!cwd) throw new DrainReadError('high-water-mark', 'api-error', 'checkout root unreadable');
-      main = numericIds(readBacklogNames('main', { rest, cwd }));
+      main = numericIds(readBacklogNames('main', { rest, cwd, slug }));
       if (refreshTracking) {
-        const tip = readBranchSha('main', { rest, cwd });
+        const tip = readBranchSha('main', { rest, cwd, slug });
         const local = () => { try { return String(git(['rev-parse', '--verify', '--quiet', `refs/remotes/${remote}/main`])).trim(); } catch { return ''; } };
         if (local() !== tip) {
           try { git(['fetch', '--no-tags', '--no-write-fetch-head', '--refmap=', remote, `+refs/heads/main:refs/remotes/${remote}/main`]); } catch { /* judged by the re-check below */ }

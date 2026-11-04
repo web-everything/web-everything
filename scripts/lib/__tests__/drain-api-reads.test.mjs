@@ -8,7 +8,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ghRestGetJson } from '../gh-rest-read.mjs';
-import { DRAIN_READ_TRANSIENT, DrainReadError, isTransientReadFailure, resolveDrainReadsSource } from '../drain-api-reads.mjs';
+import { DRAIN_READ_TRANSIENT, DrainReadError, drainRestJson, isTransientReadFailure, readOriginSlug, resolveDrainReadsSource } from '../drain-api-reads.mjs';
 import { readSharedFreeze, SHARED_FREEZE_FILE } from '../red-main-freeze-shared.mjs';
 import { readNumberingEvidence } from '../card-number-allocator.mjs';
 import { checkBornAsCollision, guardEnqueue } from '../drain-poison-guard.mjs';
@@ -41,7 +41,7 @@ describe('drain.reads.source setting', () => {
 });
 
 describe('freeze read over REST', () => {
-  const read = (rest) => readSharedFreeze({ board: '/x', branch: 'ops/red-main-freeze', readsSource: 'api', rest });
+  const read = (rest) => readSharedFreeze({ board: '/x', branch: 'ops/red-main-freeze', readsSource: 'api', rest, slug: 'o/r' });
   it('success: parses the doc without a git process', () => {
     const rest = routes({ [SHARED_FREEZE_FILE]: ok(b64(FREEZE)) });
     expect(read(rest)).toMatchObject({ frozen: true, kind: 'manual' });
@@ -87,11 +87,11 @@ describe('origin/main high-water mark over REST', () => {
   it('uses the git callback checkout as the REST repository context', () => {
     const seenCwd = [];
     const rest = (path, o) => { seenCwd.push(o.context); return base()(path, o); };
-    readNumberingEvidence((a) => (a[0] === 'rev-parse' ? '/the/checkout\n' : ''), 'origin', { source: 'api', rest });
+    readNumberingEvidence((a) => (a[0] === 'rev-parse' ? '/the/checkout\n' : ''), 'origin', { source: 'api', rest, slug: 'o/r' });
     expect(seenCwd.length).toBeGreaterThan(0);
-    expect(new Set(seenCwd)).toEqual(new Set(['/the/checkout']));
+    expect(new Set(seenCwd)).toEqual(new Set(['o/r@/the/checkout']));
   });
-  const run = (rest, git = noGit()) => readNumberingEvidence(git, 'origin', { source: 'api', rest, cwd: '/c' });
+  const run = (rest, git = noGit()) => readNumberingEvidence(git, 'origin', { source: 'api', rest, cwd: '/c', slug: 'o/r' });
   const refsGit = (calls) => (args) => { calls.push(args); if (args[0] === 'ls-remote') return ''; throw new Error('only ls-remote allowed'); };
   it('success: max card number from the REST tree, no fetch/ls-tree', () => {
     const calls = [];
@@ -119,16 +119,16 @@ describe('origin/main high-water mark over REST', () => {
     const rest = base({ 'git/ref/heads/main': ok({ object: { sha: SHA } }) });
     const git = (local, calls) => (args) => { calls.push(args[0]); if (args[0] === 'rev-parse') return `${local}\n`; if (args[0] === 'ls-remote') return ''; throw new Error('fetch ETIMEDOUT'); };
     const stale = [];
-    expect(() => readNumberingEvidence(git(OTHER, stale), 'origin', { source: 'api', rest, refreshTracking: true })).toThrow(/tracking-ref-stale/);
+    expect(() => readNumberingEvidence(git(OTHER, stale), 'origin', { source: 'api', rest, slug: 'o/r', refreshTracking: true })).toThrow(/tracking-ref-stale/);
     const fresh = [];
-    readNumberingEvidence(git(SHA, fresh), 'origin', { source: 'api', rest, refreshTracking: true });
+    readNumberingEvidence(git(SHA, fresh), 'origin', { source: 'api', rest, slug: 'o/r', refreshTracking: true });
     expect(fresh).not.toContain('fetch');
   });
 });
 
 describe('bornAs read over REST', () => {
   const CARD = '---\nbornAs: xabc123\n---\nbody\n';
-  const args = (rest, git) => ({ exec: (cmd, a) => git(a), headSha: SHA, cwd: undefined, readsSource: 'api', rest });
+  const args = (rest, git) => ({ exec: (cmd, a) => git(a), headSha: SHA, cwd: undefined, readsSource: 'api', rest, slug: 'o/r' });
   const rest0 = (over = {}) => routes({
     'compare/': ok({ files: [{ filename: 'backlog/xabc123-new.md', status: 'added' }, { filename: 'src/x.ts', status: 'added' }] }),
     'contents/backlog/xabc123-new.md': ok(b64(CARD)),
@@ -158,7 +158,7 @@ describe('bornAs read over REST', () => {
   it('5xx: unreadable with a named transient reason; enqueue gives a retry note, not a by-hand text', () => {
     const r = checkBornAsCollision(args(rest0({ 'compare/': http(500) }), git()));
     expect(r.error).toContain('api-http-500');
-    const out = guardEnqueue({ c: { num: 9 }, headSha: SHA, repo: 'o/r', exec: (c, a) => git()(a), base: 'main', readsSource: 'api', rest: rest0({ 'compare/': http(500) }) });
+    const out = guardEnqueue({ c: { num: 9 }, headSha: SHA, repo: 'o/r', exec: (c, a) => git()(a), base: 'main', readsSource: 'api', slug: 'o/r', rest: rest0({ 'compare/': http(500) }) });
     expect(out).toMatchObject({ enqueued: false, deferred: true, kind: 'bornas-unreadable' });
     expect(out.reason).toContain('Retry note');
     expect(out.reason).not.toContain('Inspect main');
@@ -183,5 +183,62 @@ describe('transient numbering failures say retry, real refusals still say by han
     expect(t).toContain('retry note');
     expect(t).not.toContain('by hand');
     expect(detailFor('merge-queue: branch numbering refused: bad card')).toContain('number it by hand');
+  });
+});
+
+describe('R549 round: pinned repo, strict base64, 20 s freeze bound', () => {
+  const GIT = (url) => () => url;
+  it('derives owner/repo from origin (https, ssh, .git) and fails closed otherwise', () => {
+    const slug = (url, env = {}) => readOriginSlug(`/c-${Math.random()}`, { env, git: GIT(url) });
+    expect(slug('https://github.com/web-everything/web-everything.git\n')).toBe('web-everything/web-everything');
+    expect(slug('git@github.com:a/b')).toBe('a/b');
+    expect(slug('https://x-access-token:t@github.com/a/b.git')).toBe('a/b');
+    expect(() => slug('https://gitlab.com/a/b')).toThrow(/origin-unparseable/);
+    expect(() => slug('not a url')).toThrow(/origin-unparseable/);
+    expect(() => readOriginSlug(`/c-${Math.random()}`, { git: () => { throw new Error('no origin'); } })).toThrow(/origin-unreadable/);
+  });
+  it('GH_REPO naming another repo is a mismatch (fail closed); the same repo is fine', () => {
+    const d = `/c-${Math.random()}`;
+    expect(() => readOriginSlug(d, { env: { GH_REPO: 'evil/other' }, git: GIT('git@github.com:a/b.git') })).toThrow(/repo-mismatch/);
+    expect(readOriginSlug(`/c-${Math.random()}`, { env: { GH_REPO: 'A/B' }, git: GIT('git@github.com:a/b.git') })).toBe('a/b');
+  });
+  it('every REST call carries the explicit repo, never a placeholder, and GH_REPO never reaches gh', () => {
+    let seen;
+    const rest = (path, o) => { seen = { path, o }; return ok({ x: 1 }); };
+    drainRestJson('t', 'repos/{owner}/{repo}/git/ref/heads/main', { rest, slug: 'a/b', env: { GH_REPO: 'evil/other', HOME: '/h' } });
+    expect(seen.path).toBe('repos/a/b/git/ref/heads/main');
+    expect(seen.o.env.GH_REPO).toBeUndefined();
+    expect(seen.o.execOpts.env.GH_REPO).toBeUndefined();
+  });
+  it('a pin failure surfaces as a named transient read failure through the callers', () => {
+    const r = readSharedFreeze({ board: '/nowhere-' + Math.random(), branch: 'ops/red-main-freeze', readsSource: 'api', rest: routes({}), env: undefined });
+    expect(r.frozen).toBeUndefined();
+    expect(r.error).toMatch(/origin-unreadable|origin-unparseable|repo-mismatch/);
+  });
+  it('strict base64: bad alphabet, bad length and non-canonical content fail closed', () => {
+    const bad = (content) => readSharedFreeze({ board: '/x', branch: 'ops/b', readsSource: 'api', slug: 'o/r', rest: routes({ [SHARED_FREEZE_FILE]: ok({ type: 'file', encoding: 'base64', content }) }) }).error;
+    expect(bad('!!!!')).toContain('invalid base64');
+    expect(bad('abc')).toContain('invalid base64');
+    expect(bad('QR==')).toContain('does not round-trip');
+    const good = Buffer.from(FREEZE).toString('base64').replace(/(.{20})/g, '$1\n');
+    expect(readSharedFreeze({ board: '/x', branch: 'ops/b', readsSource: 'api', slug: 'o/r', rest: routes({ [SHARED_FREEZE_FILE]: ok({ type: 'file', encoding: 'base64', content: good }) }) })).toMatchObject({ frozen: true });
+  });
+  it('corrupt added-card content is held, not admitted', () => {
+    const rest = routes({
+      'compare/': ok({ files: [{ filename: 'backlog/xabc123-new.md', status: 'added' }] }),
+      'contents/backlog/xabc123-new.md': ok({ type: 'file', encoding: 'base64', content: '!!!!' }),
+      'git/ref/heads/main': ok({ object: { sha: OTHER } }),
+    });
+    const r = checkBornAsCollision({ exec: () => `${OTHER}\n`, headSha: SHA, readsSource: 'api', rest, slug: 'o/r' });
+    expect(r.ok).toBeUndefined();
+    expect(r.error).toContain('invalid base64');
+  });
+  it('the freeze read keeps its 20 s bound; other reads keep the reader default', () => {
+    const seen = [];
+    const rest = (path, o) => { seen.push(o.execOpts.timeout); return ok(b64(FREEZE)); };
+    readSharedFreeze({ board: '/x', branch: 'ops/b', readsSource: 'api', slug: 'o/r', rest });
+    expect(seen).toEqual([20000]);
+    drainRestJson('t', 'repos/{owner}/{repo}/x', { rest: (p, o) => { seen.push(o.execOpts.timeout); return ok({}); }, slug: 'o/r' });
+    expect(seen[1]).toBeUndefined();
   });
 });

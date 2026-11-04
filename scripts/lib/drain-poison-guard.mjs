@@ -53,7 +53,7 @@ export function healableClone(cwd, primary) {
   } catch { return false; }
 }
 
-export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primary = null, heal = healLaneRefs, log = () => {}, readsSource, rest }) {
+export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primary = null, heal = healLaneRefs, log = () => {}, readsSource, rest, slug }) {
   const api = (readsSource ?? resolveDrainReadsSource().value) === 'api';
   const git = args => exec('git', args, { cwd, encoding: 'utf8', timeout: 60_000, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
   let healed = null;
@@ -82,7 +82,7 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
     if (api) {
       // R546: the added cards and their text come from GitHub REST (ETag; no fetch of the PR head). Main is judged
       // from the local origin/<base> ref, which must equal GitHub's tip: a stale ref fails closed (transient).
-      const o = { rest, cwd };
+      const o = { rest, cwd, slug };
       names = readAddedFiles(base, headSha, o).filter(path => TOP_LEVEL_CARD.test(path));
       headText = (path) => {
         const text = readFileAtRef('bornas-card', path, headSha, o);
@@ -161,8 +161,8 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
   } catch (e) { return done({ error: String(e?.message ?? e) }); }
 }
 
-export function guardEnqueue({ c, headSha, repo, exec, emit = () => {}, comment = () => {}, seen = new Set(), base, cwd, primary, heal, log, readsSource, rest }) {
-  const result = checkBornAsCollision({ exec, headSha, base, cwd, primary, heal, log, readsSource, rest });
+export function guardEnqueue({ c, headSha, repo, exec, emit = () => {}, comment = () => {}, seen = new Set(), base, cwd, primary, heal, log, readsSource, rest, slug }) {
+  const result = checkBornAsCollision({ exec, headSha, base, cwd, primary, heal, log, readsSource, rest, slug });
   if (result.ok) return null;
   const { hash, path, mainCard } = result.collision ?? {};
   const kind = result.collision ? 'bornas-collision' : 'bornas-unreadable';
