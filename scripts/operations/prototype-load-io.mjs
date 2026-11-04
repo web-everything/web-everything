@@ -268,7 +268,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
     let liveFpMemo;
     const liveFingerprint = (evidence) => {
       if (liveFpMemo !== undefined) return liveFpMemo;
-      if (!evidence.some((r) => r?.fingerprint && r.sha !== input.sha && r.head !== input.sha)) return null;
+      // An audit record names its head (no head = no carry); a ready record or allowlist entry names its sha.
+      if (!evidence.some((r) => r?.fingerprint && (r.head ? r.head !== input.sha : r.sha && r.sha !== input.sha))) return null;
       try {
         requireGit('fetch', 'origin', 'main', input.branch);
         liveFpMemo = (fingerprint || ((b, h) => netDiffFingerprint(repo, b, h, { exec })))('origin/main', input.sha) || null;
