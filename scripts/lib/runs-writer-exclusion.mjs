@@ -12,20 +12,18 @@ import { isRunRecordTerminal } from '../operations/run-store.mjs';
 export const pidAlive = (pid) => {
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
 };
-const TMP = /^(.+)\.(\d+)\.[0-9a-f-]{36}\.tmp$/;
+const TMP = /^(.+)\.(\d+)\.[^.]+\.[^.]+\.tmp$/;
+// writeJsonAtomic: `<name>.<pid>.<Date.now()>.<random>.tmp` (plus the run-store `<dest>.<pid>.<uuid>.tmp` form).
 
 /** @returns {(path:string, critical:()=>Promise<void>)=>Promise<void>} */
-export function createRunsWriterExclusion({ isPidAlive = pidAlive, list = readdir, read = readFile, snapshotTtlMs = 5000, now = Date.now } = {}) {
-  const snaps = new Map();
+export function createRunsWriterExclusion({ isPidAlive = pidAlive, list = readdir, read = readFile, } = {}) {
+  // Fresh listing on EVERY call (no cache): a writer that started a moment ago must be seen.
   async function livePids(dir) {
-    const hit = snaps.get(dir);
-    if (hit && now() - hit.at < snapshotTtlMs) return hit.map;
     const map = new Map();
     for (const name of await list(dir)) {
       const m = TMP.exec(name);
       if (m) { const pids = map.get(m[1]) ?? []; pids.push(Number(m[2])); map.set(m[1], pids); }
     }
-    snaps.set(dir, { at: now(), map });
     return map;
   }
   return async (path, critical) => {
@@ -49,6 +47,8 @@ export function runRecordEligible(text) {
   let record;
   try { record = JSON.parse(text); } catch { return false; }
   if (!isRunRecordTerminal(record)) return false;
+  // Fail closed on unknown shapes: every effect must carry a status known to be final.
+  if (!record.effects.every(e => e && typeof e === 'object' && ['declared', 'applied', 'failed'].includes(e.status))) return false;
   if (record.op === 'review-pr') {
     if (record.resumeOf && !record.stepTimings?.some(t => t?.step === 'advise' && t.finishedAt)) return false;
     for (const v of [record.verdict, record.findings?.referralVerdict, record.resumeOf?.verdict]) {

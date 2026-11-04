@@ -353,7 +353,7 @@ it('a live writer pid skips the record; a dead pid is eligible; unreadable state
   const { createRunsWriterExclusion } = await import('../runs-writer-exclusion.mjs');
   const a = join(runs, 'a.json'), b = join(runs, 'b.json'), c = join(runs, 'c.json');
   for (const p of [a, b, c]) { await writeFile(p, rec); await utimes(p, old, old); }
-  const u = '00000000-0000-0000-0000-000000000000';
+  const u = '1700000000000.abc123';
   await writeFile(join(runs, `a.json.111.${u}.tmp`), '{}');
   await writeFile(join(runs, `b.json.222.${u}.tmp`), '{}');
   await writeFile(join(runs, 'c.json.lock'), 'garbage');
@@ -361,6 +361,24 @@ it('a live writer pid skips the record; a dead pid is eligible; unreadable state
   const out = await realRun({ withSourceWriterExclusion: provider });
   expect(await Promise.all([a, b, c].map(exists))).toEqual([true, false, true]);
   expect(out.errors.join()).toMatch(/writer exclusion unavailable/);
+});
+it('a writer that appears after a first check is seen (no cached listing)', async () => {
+  const { createRunsWriterExclusion } = await import('../runs-writer-exclusion.mjs');
+  const provider = createRunsWriterExclusion({ isPidAlive: () => true });
+  let n = 0; await provider(join(runs, 'a.json'), async () => { n++; });
+  await writeFile(join(runs, 'a.json.5.1700000000000.zz.tmp'), '{}');
+  await provider(join(runs, 'a.json'), async () => { n++; });
+  expect(n).toBe(1);
+});
+it('records with unknown effect statuses are not eligible', async () => {
+  const { runRecordEligible } = await import('../runs-writer-exclusion.mjs');
+  expect(runRecordEligible(JSON.stringify({ effects: [{ status: 'weird' }] }))).toBe(false);
+  expect(runRecordEligible(JSON.stringify({ effects: [{ status: 'applied' }] }))).toBe(true);
+});
+it('a record replaced just before removal is restored, not deleted', async () => {
+  const p = await file(join(runs, 'r.json'));
+  const out = await run({ afterSourceStat: async path => { await writeFile(path + '.n', 'newer-bytes'); await rename(path + '.n', path); } });
+  expect(await exists(p)).toBe(true); expect(await readFile(p, 'utf8')).toBe('newer-bytes'); expect(out.filesRetained).toBeGreaterThan(0);
 });
 it('an unreadable runs directory snapshot fails closed', async () => {
   const { createRunsWriterExclusion } = await import('../runs-writer-exclusion.mjs');

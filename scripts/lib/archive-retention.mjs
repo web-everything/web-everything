@@ -227,7 +227,13 @@ export async function archiveRetention(o = {}) {
             // Test seam exercises precisely the former final-stat → unlink interval.
             await o.afterSourceStat?.(f.path);
             if (!writerExcluded) return;
-            await unlink(f.path);
+            // Quarantine by atomic rename, re-verify the bytes' identity, only then unlink: a writer that replaced
+            // the record between the stat and here is detected and its new file is restored, never deleted.
+            const parked = join(dirname(f.path), `.retiring-${randomUUID()}`);
+            await rename(f.path, parked);
+            const q = await lstat(parked);
+            if (!(q.isFile() && q.dev === f.stat.dev && q.ino === f.stat.ino && q.size === f.stat.size && q.mtimeMs === f.stat.mtimeMs)) { await link(parked, f.path).then(() => unlink(parked), () => {}); return; }
+            await unlink(parked);
             removed = true;
             out.bytesFreed += f.stat.size;
           };
