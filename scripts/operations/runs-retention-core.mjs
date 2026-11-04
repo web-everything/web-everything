@@ -11,6 +11,7 @@ import { join, dirname, basename } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { isRunRecordTerminal, listRunIds, resolveRunsDir, runPath } from './run-store.mjs';
+import { archiveSettings } from '../lib/archive-retention.mjs';
 import { parseRunRecord } from './run-record.mjs';
 
 const DAY = 86400000;
@@ -31,13 +32,18 @@ export function resolveRetentionSettings({ env = process.env, tool } = {}) {
   }
   const e = { keepDays: env.WE_RUNS_RETENTION_KEEP_DAYS, archiveDir: env.WE_RUNS_RETENTION_ARCHIVE_DIR,
     minFreeGiB: env.WE_RUNS_RETENTION_MIN_FREE_GIB, batchMaxGiB: env.WE_RUNS_RETENTION_BATCH_MAX_GIB };
-  if (e.keepDays === undefined && env.WE_ARCHIVE_RUNS_KEEP_DAYS !== undefined) e.keepDays = env.WE_ARCHIVE_RUNS_KEEP_DAYS; // honor the established archive-retention override
   const v = { ...DEFAULTS, ...(tool ?? {}) };
   for (const [k, x] of Object.entries(e)) if (x !== undefined && x !== '') v[k] = k === 'archiveDir' ? x : Number(x);
   for (const k of ['keepDays', 'minFreeGiB', 'batchMaxGiB', 'batchMaxCompressedGiB']) {
     if (!Number.isFinite(v[k]) || v[k] < 0) throw new Error(`runs-retention: invalid setting ${k}=${v[k]}`);
   }
   if (typeof v.archiveDir !== 'string' || !v.archiveDir.trim()) throw new Error('runs-retention: invalid setting archiveDir');
+  // The established archive policy (platform prefs, archive-retention.json, WE_ARCHIVE_RUNS_KEEP_DAYS) can only LENGTHEN
+  // the window, and an invalid policy blocks retention exactly as it blocks the archiver.
+  {
+    const legacy = archiveSettings({ env, log: () => {} }).value.runs.keepDays;
+    if (Number.isFinite(legacy) && legacy > v.keepDays) v.keepDays = legacy;
+  }
   v.archiveDir = v.archiveDir.replace(/^~(?=\/|$)/, homedir());
   return v;
 }
@@ -91,8 +97,8 @@ function defaultVerify(file, batch, codec) {
 /** Paths under `dir` any process holds open (lsof). Fails CLOSED: if lsof can not answer, every path counts as open. */
 function defaultOpenPaths(dir) {
   const r = spawnSync('lsof', ['-Fn', '+D', dir], { maxBuffer: 256 * 1024 * 1024 });
-  // lsof exits 1 for "nothing open" ONLY with empty stderr; any other signal means incomplete visibility -> everything counts as open.
-  if (r.error || (r.status !== 0 && r.status !== 1) || (r.status === 1 && String(r.stderr).trim())) return { has: () => true };
+  // lsof exits 1 for "nothing open" ONLY with empty stderr; any other signal means any stderr = incomplete visibility -> everything counts as open.
+  if (r.error || (r.status !== 0 && r.status !== 1) || String(r.stderr).trim()) return { has: () => true };
   return new Set(String(r.stdout).split('\n').filter(l => l.startsWith('n')).map(l => l.slice(1)));
 }
 const defaultFreeGiB = dir => { const s = statfsSync(dir); return (s.bavail * s.bsize) / GIB; };

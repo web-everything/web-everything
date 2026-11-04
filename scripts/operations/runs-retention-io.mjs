@@ -19,7 +19,13 @@ export function createRunsRetentionSinks(deps = {}) {
   return {
     [RUNS_RETENTION_EFFECT]: async (payload) => {
       const counts = deps.isComplete ? null : await stepCounts();
-      const isComplete = deps.isComplete ?? (r => counts.has(r.op) && r.cursor === counts.get(r.op) && !r.pending);
+      const { OPERATIONS } = deps.isComplete ? {} : await import('./run.mjs');
+      // review-pr declarations vary with the saved roster: build THAT run's own declaration (as --resume does).
+      const stepsFor = r => {
+        if (r.op === 'review-pr') { try { return OPERATIONS['review-pr']({ resumeId: r.id }).declaration.steps.length; } catch { return null; } }
+        return counts.has(r.op) ? counts.get(r.op) : null;
+      };
+      const isComplete = deps.isComplete ?? (r => { const n = stepsFor(r); return n !== null && r.cursor === n && !r.pending; });
       return runsRetention({ dryRun: payload.dryRun, month: payload.month || undefined, ...deps, isComplete });
     },
   };
