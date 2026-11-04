@@ -96,7 +96,7 @@ describe('runsRetention', () => {
 
   it('a concurrent lock refuses to run (never two archivers)', () => {
     put('run-old', 30);
-    mkdirSync(join(drive, '..'), { recursive: true }); mkdirSync(join(drive, '..', '.runs-retention.lock'));
+    mkdirSync(join(drive, '..'), { recursive: true }); mkdirSync(join(drive, '..', '.runs-retention.lock')); writeFileSync(join(drive, '..', '.runs-retention.lock', 'owner'), String(process.pid));
     const r = base();
     expect(r.status).toBe('skipped'); expect(listRunIds(runs)).toEqual(['run-old']);
   });
@@ -147,6 +147,15 @@ describe('runsRetention', () => {
     const r = base({ settings: { ...settings, archiveDir: join(runs, 'x', 'WE-archive', 'runs') } });
     expect(r.status).toBe('skipped'); expect(r.errors.join()).toMatch(/overlap/);
     expect(listRunIds(runs)).toEqual(['run-old']);
+  });
+
+  it('reclaims a stale lock left by a crashed pass and recovers its parked record', () => {
+    put('run-x', 1);
+    renameSync(join(runs, 'run-x.json'), join(runs, '.retiring-run-x.123e4567-e89b-12d3-a456-426614174000'));
+    mkdirSync(join(drive, '..'), { recursive: true }); mkdirSync(join(drive, '..', '.runs-retention.lock'));
+    writeFileSync(join(drive, '..', '.runs-retention.lock', 'owner'), '999999999');
+    const r = base();
+    expect(r.errors).toEqual([]); expect(listRunIds(runs)).toEqual(['run-x']);
   });
 
   it('settings: defaults to 14 days / 30 GiB; env overrides; invalid throws', () => {

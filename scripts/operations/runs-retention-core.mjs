@@ -166,9 +166,18 @@ export function runsRetention(o = {}) {
   const mountSame = () => { const m = realDir(mountRoot); return m && m.dev === mount0.dev && m.ino === mount0.ino; };
   // One invocation at a time: an atomic mkdir lock beside the archives (never overwrite a verified archive).
   const lockDir = join(dirname(settings.archiveDir), '.runs-retention.lock');
-  try { mkdirSync(dirname(settings.archiveDir), { recursive: true }); mkdirSync(lockDir); }
-  catch (e) { out.status = 'skipped'; out.errors.push(`archive busy or unwritable (${e.code}); originals retained`); return out; }
-  try { return archiveAll(); } finally { rmdirSync(lockDir); }
+  const ownerAlive = () => { try { process.kill(Number(readFileSync(join(lockDir, 'owner'), 'utf8')), 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+  try {
+    mkdirSync(dirname(settings.archiveDir), { recursive: true });
+    try { mkdirSync(lockDir); }
+    catch (e) {
+      // A crashed pass leaves its lock behind: reclaim it only when its recorded owner pid is gone.
+      if (e.code !== 'EEXIST' || ownerAlive()) throw e;
+      unlinkSync(join(lockDir, 'owner')); rmdirSync(lockDir); mkdirSync(lockDir);
+    }
+    writeFileSync(join(lockDir, 'owner'), String(process.pid));
+  } catch (e) { out.status = 'skipped'; out.errors.push(`archive busy or unwritable (${e.code}); originals retained`); return out; }
+  try { return archiveAll(); } finally { try { unlinkSync(join(lockDir, 'owner')); } catch { /* gone */ } rmdirSync(lockDir); }
   function archiveAll() {
   // Crash recovery (under the archive lock, so a live pass's quarantine is never exposed): a record parked under .retiring-* by an interrupted pass goes back to its canonical name.
   for (const name of existsSync(dir) ? readdirSync(dir) : []) {
