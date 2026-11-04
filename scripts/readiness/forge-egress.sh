@@ -41,19 +41,24 @@ resolve_registry() { # $1 = 4|6 — one fresh lookup, as root
 STATE_DIR=${FORGE_EGRESS_STATE_DIR:-/run/forge-egress}
 KEEP=${FORGE_EGRESS_KEEP_SNAPSHOTS:-3}
 [[ "$KEEP" =~ ^[1-9][0-9]*$ ]] || KEEP=3
-# Only address characters ever reach the nft ruleset (history is read back from disk, so it is not trusted text).
-addr_only() { { tr ' ' '\n' | grep -E '^[0-9A-Fa-f:.]+$' | sort -u; } || true; }
+# Only well-formed addresses of the right family ever reach the nft ruleset (history is read back from disk, so it is not
+# trusted text; a hex-only word like `dead` must not be left for nft to resolve as a hostname). $1 = 4|6.
+addr_only() {
+  local re='^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+  [[ "$1" == 6 ]] && re='^[0-9A-Fa-f]*:[0-9A-Fa-f:.]*$'
+  { tr ' ' '\n' | grep -E "$re" | sort -u; } || true
+}
 snapshot() { # fix ONE lookup per apply: the table that is installed is the table that gets recorded
-  CUR4=$(resolve_registry 4 | addr_only); CUR6=$(resolve_registry 6 | addr_only); SNAPSHOT_TAKEN=1
+  CUR4=$(resolve_registry 4 | addr_only 4); CUR6=$(resolve_registry 6 | addr_only 6); SNAPSHOT_TAKEN=1
 }
 registry_ips() { # $1 = 4|6 — current lookup plus the retained snapshots
   local cur="CUR$1" hist=''
-  [[ -r "$STATE_DIR/registry$1" ]] && hist=$(addr_only < "$STATE_DIR/registry$1")
-  printf '%s\n%s\n' "${!cur}" "$hist" | addr_only
+  [[ -r "$STATE_DIR/registry$1" ]] && hist=$(addr_only "$1" < "$STATE_DIR/registry$1")
+  printf '%s\n%s\n' "${!cur}" "$hist" | addr_only "$1"
 }
 record_snapshot() { # $1 = 4|6 — append the current non-empty lookup, keep the last KEEP lines (atomic rename)
   local cur="CUR$1" line tmp
-  line=$(printf '%s\n' "${!cur}" | addr_only | tr '\n' ' ')
+  line=$(printf '%s\n' "${!cur}" | addr_only "$1" | tr '\n' ' ')
   [[ -n "${line// /}" ]] || return 0
   mkdir -p -m 0700 "$STATE_DIR" || return 1
   tmp=$(mktemp "$STATE_DIR/.registry$1.XXXXXX") || return 1
@@ -79,8 +84,6 @@ render() {
   echo "  set registry6 { type ipv6_addr;$([[ ${#v6[@]} -gt 0 ]] && echo " elements = { $(join_commas "${v6[@]}") };") }"
   echo "  chain slot_egress {"
   echo '    oifname "lo" accept'
-  # A flow already open to an address the refresh just dropped keeps working (conntrack outlives the table swap).
-  echo '    ct state established,related accept'
   echo '    ip daddr @registry4 tcp dport 443 accept'
   echo '    ip6 daddr @registry6 tcp dport 443 accept'
   echo '    reject with icmpx type admin-prohibited'
@@ -97,8 +100,8 @@ case "${1:-}" in
   apply)
     snapshot   # one lookup: the installed table and the recorded history come from the same snapshot
     rules=$(render)
-    # Always install the freshly rendered table. A DNS blip yields an EMPTY allowlist (closed), never a stale or
-    # unvalidated live table: availability of cold installs yields to the no-egress guarantee (they fall back to local).
+    # Always install the freshly rendered table. A DNS blip yields an EMPTY allowlist (closed) unless a recent
+    # snapshot (grace window, see above) still holds addresses; never the stale LIVE table itself: availability of cold installs yields to the no-egress guarantee (they fall back to local).
     nft -f - <<<"$rules"
     # Remember what resolved only after the table loaded. A state-write failure only narrows the next allowlist (closed side).
     record_snapshot 4 && record_snapshot 6 || echo 'forge-egress: could not record the registry snapshot (grace window not extended)' >&2 ;;

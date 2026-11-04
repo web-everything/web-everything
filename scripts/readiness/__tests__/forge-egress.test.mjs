@@ -20,16 +20,16 @@ const sandbox=(fn)=>{
 };
 const fake=(dir,name,body)=>writeFileSync(join(dir,name),`#!/bin/bash\n${body}\n`,{mode:0o755});
 const NFT_CAPTURE='{ echo "ARGS:$*"; cat; } > "$NFT_CAPTURE"';
-const apply=(dir,env={})=>spawnSync('bash',[script,'apply'],{encoding:'utf8',env:{PATH:dir+':'+process.env.PATH,NFT_CAPTURE:join(dir,'captured'),...env}});
+const apply=(dir,env={})=>spawnSync('bash',[script,'apply'],{encoding:'utf8',env:{PATH:dir+':'+process.env.PATH,FORGE_EGRESS_STATE_DIR:join(dir,'default-state'),NFT_CAPTURE:join(dir,'captured'),...env}});
 const captured=(dir)=>readFileSync(join(dir,'captured'),'utf8');
 const elements=(text,set)=>{const m=text.match(new RegExp(`set ${set} \\{[^}]*?elements = \\{ ([^}]*) \\}`));return m?m[1].split(', ').sort():[];};
 
 describe('forge-egress rule set',()=>{
-  it('matches exactly the slot uids and rejects everything but loopback, open flows and registry:443',()=>{
+  it('matches exactly the slot uids and rejects everything but loopback and registry:443',()=>{
     const r=render(base);expect(r.status).toBe(0);
     expect(r.stdout).toContain('meta skuid { 990, 991, 992 } jump slot_egress');
     const chain=r.stdout.split('chain slot_egress {')[1].split('}')[0].trim().split('\n').map(l=>l.trim());
-    expect(chain).toEqual(['oifname "lo" accept','ct state established,related accept','ip daddr @registry4 tcp dport 443 accept','ip6 daddr @registry6 tcp dport 443 accept','reject with icmpx type admin-prohibited']);
+    expect(chain).toEqual(['oifname "lo" accept','ip daddr @registry4 tcp dport 443 accept','ip6 daddr @registry6 tcp dport 443 accept','reject with icmpx type admin-prohibited']);
     expect(r.stdout).toContain('elements = { 104.16.1.35, 104.16.2.35 }');
     expect(r.stdout).toContain('elements = { 2606:4700::6810:2323 }');
   });
@@ -62,7 +62,7 @@ describe('forge-egress slot user lookup',()=>{
   });
   it('apply never calls nft when the slot uid lookup fails',()=>sandbox(dir=>{
     fake(dir,'nft','touch "$NFT_CAPTURE"');
-    const r=apply(dir,{...NO_STATE,NFT_CAPTURE:join(dir,'called'),FORGE_EXEC_SLOTS:'2',FORGE_EGRESS_USER_PREFIX:'no-such-slot-user-',FORGE_EGRESS_REGISTRY_V4:'1.1.1.1'});
+    const r=apply(dir,{NFT_CAPTURE:join(dir,'called'),FORGE_EXEC_SLOTS:'2',FORGE_EGRESS_USER_PREFIX:'no-such-slot-user-',FORGE_EGRESS_REGISTRY_V4:'1.1.1.1'});
     expect(r.status).not.toBe(0);
     expect(existsSync(join(dir,'called'))).toBe(false);
   }));
@@ -76,7 +76,7 @@ describe('forge-egress slot user lookup',()=>{
   it('aborts and never calls nft when slot 2 lookup fails after slot 1 succeeded',()=>sandbox(dir=>{
     fake(dir,'id','[ "$2" = forge-exec-1 ] && { echo 2001; exit 0; }; exit 1');
     fake(dir,'nft','touch "$NFT_CAPTURE"');
-    const r=apply(dir,{...NO_STATE,NFT_CAPTURE:join(dir,'called'),FORGE_EXEC_SLOTS:'3',FORGE_EGRESS_REGISTRY_V4:'1.1.1.1',FORGE_EGRESS_REGISTRY_V6:''});
+    const r=apply(dir,{NFT_CAPTURE:join(dir,'called'),FORGE_EXEC_SLOTS:'3',FORGE_EGRESS_REGISTRY_V4:'1.1.1.1',FORGE_EGRESS_REGISTRY_V6:''});
     expect(r.status).not.toBe(0);
     expect(r.stdout).not.toContain('meta skuid');
     expect(existsSync(join(dir,'called'))).toBe(false);
@@ -92,7 +92,7 @@ describe('forge-egress registry lookup (default resolver path)',()=>{
     fake(dir,'getent','echo "getent $*" >> "$LOOKUP_LOG"; exit 2');
     fake(dir,'timeout','echo "timeout $*" >> "$LOOKUP_LOG"; shift; exec "$@"');
     fake(dir,'nft',NFT_CAPTURE);
-    const r=apply(dir,{...NO_STATE,...slot,LOOKUP_LOG:join(dir,'lookups')});
+    const r=apply(dir,{...slot,LOOKUP_LOG:join(dir,'lookups')});
     expect(r.status).toBe(0);
     const log=readFileSync(join(dir,'lookups'),'utf8');
     expect(log).toContain('timeout 5 getent ahostsv4 registry.npmjs.org');
@@ -107,21 +107,21 @@ describe('forge-egress registry lookup (default resolver path)',()=>{
     fake(dir,'getent','echo 104.16.1.35 STREAM registry.npmjs.org');
     fake(dir,'timeout','exit 124');
     fake(dir,'nft',NFT_CAPTURE);
-    expect(apply(dir,{...NO_STATE,...slot}).status).toBe(0);
+    expect(apply(dir,{...slot}).status).toBe(0);
     expect(captured(dir)).not.toContain('elements');
   }));
   it('installs the resolved, de-duplicated registry addresses from the default lookup',()=>sandbox(dir=>{
     fake(dir,'getent','case "$1" in ahostsv4) printf "104.16.1.35 STREAM registry.npmjs.org\\n104.16.1.35 DGRAM\\n104.16.2.35 STREAM\\n";; *) printf "2606:4700::6810:2323 STREAM registry.npmjs.org\\n";; esac');
     fake(dir,'timeout','shift; exec "$@"');
     fake(dir,'nft',NFT_CAPTURE);
-    expect(apply(dir,{...NO_STATE,...slot}).status).toBe(0);
+    expect(apply(dir,{...slot}).status).toBe(0);
     const got=captured(dir);
     expect(elements(got,'registry4')).toEqual(['104.16.1.35','104.16.2.35']);
     expect(elements(got,'registry6')).toEqual(['2606:4700::6810:2323']);
   }));
-  it('apply loads the freshly rendered table even when DNS fails (closed allowlist, never a stale live table)',()=>sandbox(dir=>{
+  it('apply loads a freshly rendered table even when DNS fails (empty allowlist when no snapshot is retained)',()=>sandbox(dir=>{
     fake(dir,'nft',NFT_CAPTURE);
-    const r=apply(dir,{...NO_STATE,...slot,FORGE_EGRESS_REGISTRY_V4:'',FORGE_EGRESS_REGISTRY_V6:''});
+    const r=apply(dir,{...slot,FORGE_EGRESS_REGISTRY_V4:'',FORGE_EGRESS_REGISTRY_V6:''});
     expect(r.status).toBe(0);
     const got=captured(dir);
     expect(got).toContain('delete table inet forge_exec_egress');
@@ -169,6 +169,17 @@ describe('forge-egress registry grace window (rotating CDN pool)',()=>{
     expect(got).not.toContain('pwned');
     expect(elements(got,'registry4')).toEqual(['1.1.1.1','5.5.5.5','6.6.6.6']);
   }));
+  it('malformed history tokens (not addresses of the family) never reach the ruleset',()=>sandbox(dir=>{
+    fake(dir,'nft',NFT_CAPTURE);
+    const state=join(dir,'state');mkdirSync(state);
+    writeFileSync(join(state,'registry4'),'dead . : 2606:4700::1 300.1 1.2.3.4\n');
+    writeFileSync(join(state,'registry6'),'add 1.2.3.4 2606:4700::1\n');
+    const r=apply(dir,{FORGE_EGRESS_UIDS:'990',FORGE_EGRESS_STATE_DIR:state,FORGE_EGRESS_REGISTRY_V4:'',FORGE_EGRESS_REGISTRY_V6:''});
+    expect(r.status).toBe(0);
+    const got=captured(dir);
+    expect(elements(got,'registry4')).toEqual(['1.2.3.4']);
+    expect(elements(got,'registry6')).toEqual(['2606:4700::1']);
+  }));
   it('an invalid retention setting falls back to 3 snapshots',()=>sandbox(dir=>{
     fake(dir,'nft',NFT_CAPTURE);
     const state=join(dir,'state');
@@ -192,7 +203,8 @@ describe('forge-setup egress service',()=>{
       .toBeLessThan(at('mv -f -- "$egress_pending" /usr/local/libexec/forge-egress.sh'));
     // The unit carries the slot count (a dropped line would fall back to the default of 8 and abort on a missing user).
     expect(at('Environment=FORGE_EXEC_SLOTS=$FORGE_EXEC_SLOTS')).toBeLessThan(at('ExecStart=/usr/local/libexec/forge-egress.sh apply'));
-    expect(setup).toContain('OnUnitActiveSec=5min');
+    expect(setup).toContain('forge-exec-egress.service <<EGRESS\n'); // unquoted heredoc: $FORGE_EXEC_SLOTS is expanded at install time
+    expect(setup.split("<<'EGRESST'")[1].split('\nEGRESST\n')[0]).toContain('OnUnitActiveSec=5min');
     // Loaded before the timer starts, synchronously.
     const reload=setup.indexOf('systemctl daemon-reload',at('forge-exec-egress.timer <<'));
     expect(reload).toBeGreaterThan(-1);
