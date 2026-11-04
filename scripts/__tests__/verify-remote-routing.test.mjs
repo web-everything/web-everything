@@ -5,6 +5,7 @@ import { keepAliveScript } from '../lib/test-keepalive.mjs';
 import { localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, readRemoteReport, remoteInfrastructureFailure, phaseRunLocation, overallRunLocation, decidePhaseRemote, recordVerifyLocal, SHARD_RUN_SCRIPT } from '../lib/verify-remote-routing.mjs';
 import { runInNewContext } from 'node:vm';
 import { fstatSync, readSync } from 'node:fs';
+import { computeForgeShare } from '../lib/forge-share.mjs';
 import { shellQuote } from '../lib/verify-lane-gate.mjs';
 
 vi.mock('node:fs', async importOriginal => {
@@ -993,5 +994,16 @@ describe('verify-local decisions are logged as forge-share fallbacks (PR-1)', ()
   it('forge-share keeps every verify-local reason a counted miss (honest denominator)', () => {
     const settings = JSON.parse(readFileSync(resolve(repo, 'scripts/settings/forge-share.json'), 'utf8'));
     expect(settings.expectedLocalReasons.some(r => r.startsWith('verify-local:'))).toBe(false);
+  });
+
+  it('KNOWN LIMITATION: the share counts local runs from slot-release rows, so a verify-local row alone (unslotted timeout path) stays out of the denominator', () => {
+    // Pinned so a fix (count verify-local rows directly; backlog card filed with this PR) must change it deliberately.
+    const now = Date.parse('2026-11-04T18:00:00Z');
+    const r = computeForgeShare({ now, windowMs: 3600000, target: 0.9, expectedLocalReasons: [],
+      remoteRuns: [{ ts: '2026-11-04T17:30:00Z', ms: 1000 }], localRuns: [],
+      fallbacks: [{ ts: '2026-11-04T17:40:00Z', reason: 'verify-local:raw-command', lane: 'lane-7', kind: 'selected' }],
+      coverage: { remoteRuns: true, localRuns: true, fallbacks: true } });
+    expect(r.share).toBe(1);
+    expect(r.byReason['verify-local:raw-command']).toBe(1);
   });
 });
