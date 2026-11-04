@@ -3,7 +3,7 @@ bornAs: xisvj20
 kind: story
 size: 2
 status: open
-scope: ["we:health-watch-core.test.mjs", "we:daemon-rebuild-skip-unrelated.test.mjs"]
+scope: ["we:scripts/conveyor/__tests__/health-watch-core.test.mjs", "we:scripts/lib/__tests__/daemon-rebuild-skip-unrelated.test.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

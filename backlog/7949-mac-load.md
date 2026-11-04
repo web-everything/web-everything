@@ -3,7 +3,7 @@ bornAs: xvx26ux
 kind: story
 size: 2
 status: open
-scope: ["we:lane-pool.mjs"]
+scope: ["we:scripts/lane-pool.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

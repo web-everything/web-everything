@@ -3,7 +3,7 @@ bornAs: xgfhjl3
 kind: story
 size: 2
 status: open
-scope: ["we:adopt.mjs"]
+scope: ["we:scripts/lib/daemon-rebuild/adopt.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

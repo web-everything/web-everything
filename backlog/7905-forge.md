@@ -3,7 +3,7 @@ bornAs: xrliesw
 kind: story
 size: 2
 status: open
-scope: ["we:remote-exec.mjs", "we:scripts/readiness/remote-exec.mjs"]
+scope: ["we:scripts/readiness/remote-exec.mjs", "we:scripts/readiness/remote-exec.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

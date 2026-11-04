@@ -3,7 +3,7 @@ bornAs: xwasq40
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/operations/coroner-extract.mjs", "we:scripts/open-pr.mjs"]
+scope: ["we:scripts/operations/coroner-extract.mjs", "we:scripts/operations/open-pr.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

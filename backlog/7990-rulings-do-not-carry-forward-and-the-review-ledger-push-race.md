@@ -3,7 +3,7 @@ bornAs: xzm1r3t
 kind: story
 size: 2
 status: open
-scope: ["we:daemon-overlays.mjs", "we:prepare.mjs", "we:edge-fetch.mjs"]
+scope: ["we:scripts/lib/daemon-overlays.mjs", "we:scripts/lib/daemon-rebuild/prepare.mjs", "we:scripts/lib/daemon-rebuild/edge-fetch.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

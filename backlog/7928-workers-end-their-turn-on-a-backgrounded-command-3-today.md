@@ -3,7 +3,7 @@ bornAs: xu50hhf
 kind: story
 size: 2
 status: open
-scope: ["we:CLAUDE.md", "we:worker-brief.mjs"]
+scope: ["we:CLAUDE.md", "we:scripts/worker-brief.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

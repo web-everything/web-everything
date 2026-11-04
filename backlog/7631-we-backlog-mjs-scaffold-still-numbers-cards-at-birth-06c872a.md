@@ -3,7 +3,7 @@ bornAs: x0m3wc3
 kind: story
 size: 2
 status: open
-scope: ["we:backlog.mjs"]
+scope: ["we:scripts/backlog.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

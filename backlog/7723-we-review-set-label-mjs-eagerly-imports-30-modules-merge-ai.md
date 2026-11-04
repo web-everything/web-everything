@@ -3,7 +3,7 @@ bornAs: x934rqr
 kind: story
 size: 2
 status: open
-scope: ["we:review-set-label.mjs"]
+scope: ["we:scripts/review-set-label.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

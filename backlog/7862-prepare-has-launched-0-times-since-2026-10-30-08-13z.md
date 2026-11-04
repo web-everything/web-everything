@@ -3,7 +3,7 @@ bornAs: xnhgwb1
 kind: story
 size: 2
 status: open
-scope: ["we:wev-control/skills-src/conveyor/build-dispatch-daemon.mjs", "we:scripts/settings/prepare.json"]
+scope: ["we:skills-src/conveyor/build-dispatch-daemon.mjs", "we:scripts/settings/prepare.json"]
 dateOpened: "2026-11-02"
 tags: []
 ---

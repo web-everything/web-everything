@@ -3,7 +3,7 @@ bornAs: x2ilu0t
 kind: story
 size: 2
 status: open
-scope: ["we:red-team-gate-apply.mjs"]
+scope: ["we:scripts/operations/red-team-gate-apply.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

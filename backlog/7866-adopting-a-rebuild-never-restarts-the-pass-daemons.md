@@ -3,7 +3,7 @@ bornAs: xnsrxty
 kind: story
 size: 2
 status: open
-scope: ["we:pass-daemon.mjs"]
+scope: ["we:skills-src/conveyor/pass-daemon.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

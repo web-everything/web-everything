@@ -3,7 +3,7 @@ bornAs: xb90l5k
 kind: story
 size: 2
 status: open
-scope: ["we:hetzner-jobs.yml"]
+scope: ["we:.github/workflows/hetzner-jobs.yml"]
 dateOpened: "2026-11-02"
 tags: []
 ---

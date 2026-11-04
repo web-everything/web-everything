@@ -3,7 +3,7 @@ bornAs: x4dslss
 kind: story
 size: 2
 status: open
-scope: ["we:verify-lane.mjs", "we:fix-handoff.test.mjs"]
+scope: ["we:scripts/verify-lane.mjs", "we:scripts/lib/__tests__/fix-handoff.test.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

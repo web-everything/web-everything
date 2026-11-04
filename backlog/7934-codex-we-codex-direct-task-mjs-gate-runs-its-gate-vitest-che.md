@@ -3,7 +3,7 @@ bornAs: xuwgluw
 kind: story
 size: 2
 status: open
-scope: ["we:codex-direct-task.mjs", "we:scripts/readiness/heavy-admission.mjs"]
+scope: ["we:scripts/codex-direct-task.mjs", "we:scripts/readiness/heavy-admission.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

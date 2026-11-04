@@ -3,7 +3,7 @@ bornAs: xr26ywt
 kind: story
 size: 2
 status: open
-scope: ["we:land-prevention-card.mjs"]
+scope: ["we:scripts/operations/land-prevention-card.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

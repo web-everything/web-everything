@@ -3,7 +3,7 @@ bornAs: xo0o3wt
 kind: story
 size: 2
 status: open
-scope: ["we:codex-direct-task.mjs", "we:CLAUDE.md"]
+scope: ["we:scripts/codex-direct-task.mjs", "we:CLAUDE.md"]
 dateOpened: "2026-11-02"
 tags: []
 ---

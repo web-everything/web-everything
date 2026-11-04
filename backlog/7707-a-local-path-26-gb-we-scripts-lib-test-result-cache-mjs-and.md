@@ -3,7 +3,7 @@ bornAs: x7p4gm8
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/lib/test-result-cache.mjs", "we:standards-cache.mjs"]
+scope: ["we:scripts/lib/test-result-cache.mjs", "we:scripts/lib/standards-cache.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

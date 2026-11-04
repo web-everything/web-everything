@@ -3,7 +3,7 @@ bornAs: x5fqu97
 kind: story
 size: 2
 status: open
-scope: ["we:verify-lane.test.mjs"]
+scope: ["we:scripts/__tests__/verify-lane.test.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

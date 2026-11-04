@@ -3,7 +3,7 @@ bornAs: xnc0vi8
 kind: story
 size: 2
 status: open
-scope: ["we:health-smells-notify-list.mjs"]
+scope: ["we:scripts/conveyor/health-smells-notify-list.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

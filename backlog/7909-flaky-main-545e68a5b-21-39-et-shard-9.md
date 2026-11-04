@@ -3,7 +3,7 @@ bornAs: xsfda4r
 kind: story
 size: 2
 status: open
-scope: ["we:delivery-policy.test.mjs"]
+scope: ["we:scripts/lib/__tests__/delivery-policy.test.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

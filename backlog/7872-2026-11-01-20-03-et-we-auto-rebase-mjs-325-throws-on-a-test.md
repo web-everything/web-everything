@@ -3,7 +3,7 @@ bornAs: xo9405b
 kind: story
 size: 2
 status: open
-scope: ["we:auto-rebase.mjs"]
+scope: ["we:scripts/lib/daemon-rebuild/auto-rebase.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

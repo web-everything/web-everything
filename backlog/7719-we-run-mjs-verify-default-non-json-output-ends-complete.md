@@ -3,7 +3,7 @@ bornAs: x8s4x1l
 kind: story
 size: 2
 status: open
-scope: ["we:run.mjs"]
+scope: ["we:scripts/conveyor/soak/run.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

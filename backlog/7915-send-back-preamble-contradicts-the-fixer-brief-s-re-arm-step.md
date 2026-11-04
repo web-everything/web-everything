@@ -3,7 +3,7 @@ bornAs: xsz63q0
 kind: story
 size: 2
 status: open
-scope: ["we:rearm-review.mjs"]
+scope: ["we:scripts/conveyor/rearm-review.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

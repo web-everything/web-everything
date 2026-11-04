@@ -3,7 +3,7 @@ bornAs: xtpha88
 kind: story
 size: 2
 status: open
-scope: ["we:detached-op.mjs", "we:pid-alive.mjs", "we:bounded-child.mjs"]
+scope: ["we:detached-op.mjs", "we:scripts/lib/pid-alive.mjs", "we:scripts/lib/bounded-child.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

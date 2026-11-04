@@ -3,7 +3,7 @@ bornAs: xq2o449
 kind: story
 size: 2
 status: open
-scope: ["we:lane-pool-recover.mjs"]
+scope: ["we:scripts/lib/lane-pool-recover.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

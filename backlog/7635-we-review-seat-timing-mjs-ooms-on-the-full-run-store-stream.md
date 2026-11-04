@@ -3,7 +3,7 @@ bornAs: x1a7cdl
 kind: story
 size: 2
 status: open
-scope: ["we:review-seat-timing.mjs"]
+scope: ["we:scripts/operations/review-seat-timing.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

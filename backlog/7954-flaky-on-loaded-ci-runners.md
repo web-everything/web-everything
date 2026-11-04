@@ -3,7 +3,7 @@ bornAs: xwiwszx
 kind: story
 size: 2
 status: open
-scope: ["we:daemon-rebuild-hold-live-pinned.test.mjs", "we:worker-wrapper.test.mjs"]
+scope: ["we:scripts/lib/__tests__/daemon-rebuild-hold-live-pinned.test.mjs", "we:scripts/operations/__tests__/worker-wrapper.test.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

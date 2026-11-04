@@ -3,7 +3,7 @@ bornAs: xj2vlfj
 kind: story
 size: 2
 status: open
-scope: ["we:worker-brief.mjs", "we:scripts/readiness/heavy-admission.mjs"]
+scope: ["we:scripts/worker-brief.mjs", "we:scripts/readiness/heavy-admission.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

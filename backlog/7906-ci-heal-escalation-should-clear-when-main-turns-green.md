@@ -3,7 +3,7 @@ bornAs: xrommtm
 kind: story
 size: 2
 status: open
-scope: ["we:ci.yml"]
+scope: ["we:.github/workflows/ci.yml"]
 dateOpened: "2026-11-02"
 tags: []
 ---

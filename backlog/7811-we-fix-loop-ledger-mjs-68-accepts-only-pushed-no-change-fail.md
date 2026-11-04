@@ -3,7 +3,7 @@ bornAs: xidwk4k
 kind: story
 size: 2
 status: open
-scope: ["we:fix-loop-ledger.mjs"]
+scope: ["we:scripts/conveyor/fix-loop-ledger.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

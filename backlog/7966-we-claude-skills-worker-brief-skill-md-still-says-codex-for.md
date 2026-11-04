@@ -3,7 +3,7 @@ bornAs: xxgd7l4
 kind: story
 size: 2
 status: open
-scope: ["we:.claude/skills/worker-brief/SKILL.md", "we:worker-brief.mjs"]
+scope: ["we:skills-src/worker-brief/SKILL.md", "we:scripts/worker-brief.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

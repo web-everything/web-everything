@@ -3,7 +3,7 @@ bornAs: x5gcts1
 kind: story
 size: 2
 status: open
-scope: ["we:run.mjs", "we:verify-lane.mjs"]
+scope: ["we:scripts/conveyor/soak/run.mjs", "we:scripts/verify-lane.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

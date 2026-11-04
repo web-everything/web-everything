@@ -3,7 +3,7 @@ bornAs: xyk0ga9
 kind: story
 size: 2
 status: open
-scope: ["we:MEMORY.md", "we:AGENTS.md", "we:CLAUDE.md"]
+scope: ["we:agent-memory-src/MEMORY.md", "we:AGENTS.md", "we:CLAUDE.md"]
 dateOpened: "2026-11-02"
 tags: []
 ---

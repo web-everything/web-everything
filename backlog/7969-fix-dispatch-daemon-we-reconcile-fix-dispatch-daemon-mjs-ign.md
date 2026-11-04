@@ -3,7 +3,7 @@ bornAs: xxyw5tt
 kind: story
 size: 2
 status: open
-scope: ["we:reconcile-fix-dispatch-daemon.mjs"]
+scope: ["we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

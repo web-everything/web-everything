@@ -3,7 +3,7 @@ bornAs: x06gkd5
 kind: story
 size: 2
 status: open
-scope: ["we:land-prevention-card.mjs", "we:lane-card-salvage.test.mjs"]
+scope: ["we:scripts/operations/land-prevention-card.mjs", "we:scripts/lib/__tests__/lane-card-salvage.test.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

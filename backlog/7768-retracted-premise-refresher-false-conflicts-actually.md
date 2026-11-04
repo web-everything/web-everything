@@ -3,7 +3,7 @@ bornAs: xedrd1v
 kind: story
 size: 2
 status: open
-scope: ["we:daemon-overlay.test.mjs"]
+scope: ["we:bun-trial/scripts/__tests__/daemon-overlay.test.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

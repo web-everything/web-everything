@@ -3,7 +3,7 @@ bornAs: xyl1lu3
 kind: story
 size: 2
 status: open
-scope: ["we:daemon-overlays.mjs", "we:docs/agent/testing.md", "we:import-closure.mjs"]
+scope: ["we:scripts/lib/daemon-overlays.mjs", "we:docs/agent/testing.md", "we:scripts/lib/import-closure.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

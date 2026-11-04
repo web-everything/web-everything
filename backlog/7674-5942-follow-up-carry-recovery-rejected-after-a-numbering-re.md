@@ -3,7 +3,7 @@ bornAs: x4nivt9
 kind: story
 size: 2
 status: open
-scope: ["we:red-team-carry-io.mjs"]
+scope: ["we:scripts/lib/red-team-carry-io.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

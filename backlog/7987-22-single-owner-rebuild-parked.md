@@ -3,7 +3,7 @@ bornAs: xzhboou
 kind: story
 size: 2
 status: open
-scope: ["we:daemon-clone-lock.mjs"]
+scope: ["we:scripts/lib/daemon-clone-lock.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

@@ -3,7 +3,7 @@ bornAs: xwm8jga
 kind: story
 size: 2
 status: open
-scope: ["we:review-extra-seats.mjs"]
+scope: ["we:scripts/operations/review-extra-seats.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

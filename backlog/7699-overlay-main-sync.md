@@ -3,7 +3,7 @@ bornAs: x6uesjw
 kind: story
 size: 2
 status: open
-scope: ["we:testing.md"]
+scope: ["we:docs/agent/testing.md"]
 dateOpened: "2026-11-02"
 tags: []
 ---

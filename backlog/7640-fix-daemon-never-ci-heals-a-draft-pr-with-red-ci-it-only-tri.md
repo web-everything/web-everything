@@ -3,7 +3,7 @@ bornAs: x1lxqta
 kind: story
 size: 2
 status: open
-scope: ["we:forge-verify-marker.test.mjs"]
+scope: ["we:scripts/readiness/__tests__/forge-verify-marker.test.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

@@ -3,7 +3,7 @@ bornAs: x84pxlp
 kind: story
 size: 2
 status: open
-scope: ["we:enqueue-on-event.mjs"]
+scope: ["we:scripts/lib/enqueue-on-event.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

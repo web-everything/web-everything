@@ -3,7 +3,7 @@ bornAs: xyj73f7
 kind: story
 size: 2
 status: open
-scope: ["we:reconcile-core.mjs"]
+scope: ["we:scripts/conveyor/reconcile-core.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

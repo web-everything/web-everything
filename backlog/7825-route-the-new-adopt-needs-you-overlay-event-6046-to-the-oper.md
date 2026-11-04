@@ -3,7 +3,7 @@ bornAs: xjx28ih
 kind: story
 size: 2
 status: open
-scope: ["we:adopt.mjs/prepare.mjs"]
+scope: ["we:scripts/lib/daemon-rebuild/prepare.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

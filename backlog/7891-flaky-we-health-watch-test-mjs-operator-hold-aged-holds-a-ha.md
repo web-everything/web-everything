@@ -3,7 +3,7 @@ bornAs: xq251x8
 kind: story
 size: 2
 status: open
-scope: ["we:health-watch.test.mjs"]
+scope: ["we:bun-trial/scripts/conveyor/__tests__/health-watch.test.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

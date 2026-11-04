@@ -3,7 +3,7 @@ bornAs: x3q893i
 kind: story
 size: 2
 status: open
-scope: ["we:forge-exec-run.test.mjs", "we:scripts/lib/repo-scan-tests.mjs"]
+scope: ["we:scripts/readiness/__tests__/forge-exec-run.test.mjs", "we:scripts/lib/repo-scan-tests.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

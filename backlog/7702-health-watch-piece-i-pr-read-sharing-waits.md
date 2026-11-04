@@ -3,7 +3,7 @@ bornAs: x78233q
 kind: story
 size: 2
 status: open
-scope: ["we:review-pr.mjs", "we:fix-context-pack.mjs", "we:fix-round-history.mjs"]
+scope: ["we:scripts/operations/review-pr.mjs", "we:scripts/conveyor/fix-context-pack.mjs", "we:scripts/conveyor/fix-round-history.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

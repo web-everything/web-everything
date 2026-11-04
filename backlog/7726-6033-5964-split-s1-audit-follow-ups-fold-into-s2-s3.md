@@ -3,7 +3,7 @@ bornAs: x9bna1d
 kind: story
 size: 2
 status: open
-scope: ["we:smoke.mjs", "we:plan.mjs"]
+scope: ["we:scripts/lib/daemon-rebuild/smoke.mjs", "we:scripts/lib/daemon-rebuild/plan.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

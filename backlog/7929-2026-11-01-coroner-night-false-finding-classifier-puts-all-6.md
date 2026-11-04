@@ -3,7 +3,7 @@ bornAs: xujdl3d
 kind: story
 size: 2
 status: open
-scope: ["we:coroner-false-findings.mjs", "we:scripts/operations/coroner-false-findings.mjs"]
+scope: ["we:scripts/operations/coroner-false-findings.mjs", "we:scripts/operations/coroner-false-findings.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---

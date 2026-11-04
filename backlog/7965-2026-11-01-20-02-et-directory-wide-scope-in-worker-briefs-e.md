@@ -3,7 +3,7 @@ bornAs: xxeyywq
 kind: story
 size: 2
 status: open
-scope: ["we:worker-brief.mjs"]
+scope: ["we:scripts/worker-brief.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---
