@@ -98,7 +98,10 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, unfinished: null }]));
     const startless = []; // ids and mtimes only, never payloads
     let count = 0, newestSettled = false, boundary = -Infinity;
-    const find = createNewestRunFinder({ ids: list(runsDir).filter(id => id.startsWith('review-pr-')), tieBreak,
+    // The read window is fixed in one order (equal mtimes by ascending id) for every caller: the tie
+    // order only ranks matches in the slots. Otherwise equal mtimes straddling the cap would put
+    // different records in the drain's and recovery's windows, and the two could disagree.
+    const find = createNewestRunFinder({ ids: list(runsDir).filter(id => id.startsWith('review-pr-')), tieBreak: 'id-asc',
       stat: id => stat(join(runsDir, `${id}.json`)), read: id => read(id, runsDir), scanSettings, warn });
     const end = find((run, id, at, nextAt) => {
       if (run?.op === 'review-pr' && run.input?.repo === repo && Number(run.input?.pr) === Number(pr)) {
@@ -167,7 +170,8 @@ export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir
     && r.repo === repo && Number(r.pr) === Number(pr) && r.rev === head);
   const lookup = reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak: 'id-desc', scanSettings, warn, now });
   // Preserve the existing policy-only carry surface; it never supplies a stale recovery payload.
-  // The fallback reuses this scan (one parse budget) but reads it in the drain's ascending tie order.
+  // The fallback reuses this scan (one parse budget and the same read window) but ranks equal
+  // starts in the drain's ascending id order.
   const readCarryEvidence = () => readDrainRedTeamEvidence({ ...key, env, runsDir, list, read, stat, scanSettings, warn, now,
     lookup: (exactHead = true, _order, options) => lookup(exactHead, 'id-asc', options), readScorecards: () => records });
   const latest = lookup();

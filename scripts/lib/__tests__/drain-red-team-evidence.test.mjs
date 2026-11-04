@@ -642,8 +642,31 @@ describe('bounded review evidence scans', () => {
       readEvidence: key => { evidenceReads++; return readDrainRedTeamEvidence({ ...args, ...key }); },
       readStatus: () => null, readCarry: key => readRedTeamCarry({ ...key, env: f.env }),
       setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(), now: 0 });
-    expect(rows[0].why).not.toBe('scan-capped');
+    // The same decision as the uncapped read of this carry.
+    expect(rows[0]).toMatchObject({ action: 'dispatch', mode: 'fresh' });
     expect(evidenceReads).toBe(1);
+  });
+  // Equal mtimes straddle the cap: positions 300 and 301 share one mtime. Both readers must read the
+  // same window whichever record holds the older exact-head run, so they never disagree.
+  it.each(['review-pr-a', 'review-pr-z'])('drain and recovery read the same window when equal mtimes straddle the cap (exact-head run on %s)', exactOn => {
+    const f = fixture(), from = 'c'.repeat(40);
+    carryJournal(f, from);
+    const mtimes = { 'review-pr-panel': 100_000_000, 'review-pr-a': 50_000_000, 'review-pr-z': 50_000_000 };
+    for (let i = 0; i < 298; i++) mtimes[`review-pr-f${String(i).padStart(4, '0')}`] = 60_000_000 + i;
+    for (let i = 0; i < 1000; i++) mtimes[`review-pr-o${String(i).padStart(4, '0')}`] = 1000 + i;
+    const runs = { 'review-pr-panel': { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(from), ...startedAt(99_990_000) },
+      [exactOn]: { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head), ...startedAt(49_000_000) } };
+    const args = { ...f, list: () => Object.keys(mtimes),
+      stat: path => ({ mtimeMs: mtimes[path.match(/(review-pr-[^/]+)\.json$/)[1]] }), read: id => runs[id] ?? null };
+    const drain = readDrainRedTeamEvidence(args), witness = readRecoveryWitness(args);
+    // The id-ascending window reads review-pr-a and omits review-pr-z.
+    if (exactOn === 'review-pr-a') {
+      expect(drain).toMatchObject({ ok: false, reason: 'scan-capped' });
+      expect(witness).toMatchObject({ ok: false, reason: 'scan-capped' });
+    } else {
+      expect(drain).toMatchObject({ carry: { step: 'intent' } });
+      expect(witness.carryEvidence).toMatchObject({ carry: { step: 'intent' } });
+    }
   });
   it('recovery still holds a capped carry whose carried-from panel cannot be settled inside the window', () => {
     const f = fixture(), from = 'c'.repeat(40);

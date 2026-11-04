@@ -3914,8 +3914,8 @@ fail-closed reads across reconcile and dispatch smoke passes within the unchange
 
 ## Bounded review run scans
 
-Review evidence scans stat candidates before parsing, order by mtime descending (id ascending for drain ties, id descending for recovery ties),
-and parse at most `runs.scan.maxParses` (standard default 300) per read, including historical/recovery fallbacks.
+Review evidence scans stat candidates before parsing, read them by mtime descending (equal mtimes by
+ascending id, for drain and recovery alike, so both read the same window), and parse at most `runs.scan.maxParses` (standard default 300) per read, including historical/recovery fallbacks.
 The setting resolves through the shared standard/platform/tool cascade; `scripts/settings/runs-scan.json`
 leaves the tool value unset so platform preferences apply. No environment override is added.
 The shared finder continues from its cursor; it never retains a folder of payloads. Exhausting the
