@@ -64,7 +64,7 @@ import { VERIFY_DAEMON_LEASE_KEY } from '../skills-src/conveyor/verify-daemon.mj
 import { readLockEntry } from './readiness/file-locks.mjs';
 import { spawn } from 'node:child_process';
 import { createFailureCollector, mergeFailureDetails } from './lib/verify-failures.mjs';
-import { isolatedRetryArgv, isolatedRetryFailures, describeIsolatedRetry, isolatedRetryAudit, FLAKY_OUTSIDE_DIFF, STILL_RED_IN_ISOLATION, MAX_TIMEOUT_LOG_BYTES } from './lib/gate-timeout-retry.mjs';
+import { retryKilledFailures, isolatedRetryArgv, isolatedRetryFailures, describeIsolatedRetry, isolatedRetryAudit, MAX_TIMEOUT_LOG_BYTES } from './lib/gate-timeout-retry.mjs';
 import * as nodeFs from 'node:fs';
 import { writeFileSync, renameSync, existsSync, readFileSync, readdirSync, unlinkSync, lstatSync, mkdtempSync, rmSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -544,6 +544,7 @@ if (cacheHit) {
   const cachedRetry = {
     ...(preStart.retriedFailures?.length ? { retriedFailures: preStart.retriedFailures } : {}),
     ...(preStart.isolatedRetry ? { isolatedRetry: preStart.isolatedRetry } : {}),
+    ...(preStart.infraKilledRetries ? { infraKilledRetries: preStart.infraKilledRetries } : {}),
     ...(preStart.retriedTimeouts?.length ? { retriedTimeouts: preStart.retriedTimeouts } : {}),
     ...markerRedCause(preStart),
   };
@@ -890,6 +891,9 @@ let gateMs;
 // Only an infrastructure failure (a signal / killed runner) stops early: a dead runner must not run more phases.
 const runAllPhases = verifySetting('runAllPhases', process.env) === true;
 const isolatedRetryMode = verifySetting('isolatedRetry', process.env);
+const infraKilledRetry = verifySetting('infraKilledRetry', process.env);
+let infraKilledRetries = 0;
+process.stderr.write(`verify-lane: fix.gate.infraKilledRetry=${infraKilledRetry} (${verifySettingSource('infraKilledRetry', process.env)})\n`);
 const phaseResults = [];
 // The guard run writes vitest's JSON report here: the inventory of files that ACTUALLY executed, which is the only
 // proof every declared guard ran (vitest treats file arguments as filters, so a config-excluded guard is dropped
@@ -917,13 +921,38 @@ try {
       changedFiles: changedNow ? [...resolvedGate.decision.changedFiles, ...changedNow.changedFiles] : null, cwd: REPO });
     if (retriedFailures.length) {
       process.stderr.write(`Re-running ${retriedFailures.length} failing file(s) outside the diff once, alone: ${retriedFailures.map(f => `${f.file} (${f.kind})`).join(', ')}\n`);
-      // Exact file filters, one worker, no related traversal, no passWithNoTests, and no second attempt.
+      // Exact file filters, one worker, no related traversal, no passWithNoTests.
       // The isolated run keeps the gate's OWN scaled timeouts: without them vitest falls back to its 5 s default and a
       // load-slow file that passed the main run's 15 s budget times out again alone (ci-heal-4017: still-red at load 25).
       const timeoutFlags = scaledTimeoutFlags(resolvedGate.decision?.testTimeoutFactor ?? 1).split(' ').filter(Boolean);
       const retryArgv = isolatedRetryArgv(retriedFailures.map(f => f.file), timeoutFlags);
-      result = await timedRunGate('vitestMs', retryArgv[0], retryArgv.slice(1));
-      isolatedRetry = result.exitCode === 0 && !result.signal ? FLAKY_OUTSIDE_DIFF : STILL_RED_IN_ISOLATION;
+      try { result = await timedRunGate('vitestMs', retryArgv[0], retryArgv.slice(1)); }
+      catch (error) {
+        if (!error.signal && error.code !== 'ETIMEDOUT') throw error;
+        result = { exitCode: null, signal: error.signal, code: error.code };
+      }
+      const retryFiles = retriedFailures.map(f => f.file);
+      const currentRetryDiff = () => {
+        const current = localChangedSet({ runGit: git });
+        if (!current) return null;
+        editedDuringRun = [...new Set([...editedDuringRun, ...current.changedFiles])];
+        return [...resolvedGate.decision.changedFiles, ...editedDuringRun];
+      };
+      ({ result, retriedFailures, isolatedRetry, infraKilledRetries } = await retryKilledFailures({
+        result, retriedFailures, maxRetries: infraKilledRetry,
+        classify: r => isolatedRetryFailures({ ...r.output, failureDetails: r.failureDetails,
+          changedFiles: currentRetryDiff(), cwd: REPO, mode: isolatedRetryMode }),
+        canRetry: () => {
+          const diff = currentRetryDiff();
+          return diff !== null && retryFiles.every(file => !diff.includes(file));
+        },
+        run: () => {
+          process.stderr.write('Re-running killed-child failures outside the diff through heavy admission.\n');
+          return timedRunGate('vitestMs', retryArgv[0], retryArgv.slice(1));
+        },
+      }));
+      // A later isolated verdict supersedes the earlier attempt's watchdog timeout as well as its exit code.
+      if (infraKilledRetries && !result.timedOut) phaseTimeout = null;
     }
   }
   phaseResults.push({ phase: 'vitest', result });
@@ -1033,7 +1062,7 @@ const builtPhases = buildVerifyPhases({ admission: { mode: phaseAdmission ? 'pha
   alwaysRun: alwaysRun.declared.length ? alwaysRun : null });
 const phases = admissionFallback ? { ...builtPhases, admissionFallback } : builtPhases;
 
-const retryAudit = isolatedRetryAudit(retriedFailures, isolatedRetry);
+const retryAudit = { ...isolatedRetryAudit(retriedFailures, isolatedRetry), ...(infraKilledRetries ? { infraKilledRetries } : {}) };
 const diagnostic = { ...(exitCode === 0 ? {} : { failureDetails }), ...retryAudit };
 const retryDetail = describeIsolatedRetry(retryAudit);
 // Item 99 — why the gate was red (also when a flaky failure outside the diff went green alone), with the files.

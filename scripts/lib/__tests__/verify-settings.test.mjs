@@ -10,7 +10,7 @@ import { verifyRelatedMode, verifyTestTimeoutFactor, verifyStandardsPolicy, veri
 
 const allSources = source => Object.fromEntries(Object.keys(BUILT_IN_VERIFY_SETTINGS).map(key => [key, source]));
 const custom = { shardMinTests: 24, shardSize: 12, shardParallel: 3, relatedMode: 'import-only', testTimeoutFactor: 4, standards: 'ci-only', phaseAdmission: false, fastTargets: 2,
-  matchRequestVariants: false, supersede: 'never', restartInFlight: 'kill', runAllPhases: false, isolatedRetry: 'off', relatedMaxTests: 12, relatedDepth: 3, alwaysRunTests: ['a/b.test.mjs'], skipLocalForCardOnly: false,
+  matchRequestVariants: false, supersede: 'never', restartInFlight: 'kill', runAllPhases: false, isolatedRetry: 'off', infraKilledRetry: 1, relatedMaxTests: 12, relatedDepth: 3, alwaysRunTests: ['a/b.test.mjs'], skipLocalForCardOnly: false,
   revertRed: 'enforce', revertRedSince: '2026-01-01', revertRedMaxFiles: 10, selection: 'pr', phaseTimeoutMs: 600_000, slotHeartbeatMs: 120_000 };
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -30,7 +30,7 @@ describe('verify settings', () => {
     for (const f of shippedAlwaysRun) expect(existsSync(resolve(dirname(fileURLToPath(import.meta.url)), '../../..', f)), f).toBe(true);
     expect(defaultVerifySettingsPath()).toBe(resolve(dirname(fileURLToPath(import.meta.url)), '../../verify-settings.json'));
     expect(resolveVerifySettings({ fileConfig: loadVerifySettingsFile(defaultVerifySettingsPath()), env: {} }))
-      .toEqual({ values: { ...BUILT_IN_VERIFY_SETTINGS, relatedMode: 'import-only', standards: 'auto', relatedMaxTests: 40, relatedDepth: 2, alwaysRunTests: shippedAlwaysRun, skipLocalForCardOnly: true, revertRed: 'warn', revertRedSince: '2026-10-08', revertRedMaxFiles: 40, selection: 'since-last-green' }, sources: { ...allSources('file'), shardMinTests: 'default', shardSize: 'default', shardParallel: 'default' } });
+      .toEqual({ values: { ...BUILT_IN_VERIFY_SETTINGS, relatedMode: 'import-only', standards: 'auto', relatedMaxTests: 40, relatedDepth: 2, alwaysRunTests: shippedAlwaysRun, skipLocalForCardOnly: true, revertRed: 'warn', revertRedSince: '2026-10-08', revertRedMaxFiles: 40, selection: 'since-last-green' }, sources: { ...allSources('file'), shardMinTests: 'default', shardSize: 'default', shardParallel: 'default', infraKilledRetry: 'default' } });
     expect(verifyRelatedMode({})).toBe('import-only');
   });
 
@@ -55,10 +55,10 @@ describe('verify settings', () => {
     const env = { WE_VERIFY_SHARD_MIN_TESTS: '24', WE_VERIFY_SHARD_SIZE: '12', WE_VERIFY_SHARD_PARALLEL: '3', WE_VERIFY_RELATED: 'all', WE_VERIFY_TEST_TIMEOUT_FACTOR: '2.5', WE_VERIFY_STANDARDS: 'auto',
       WE_VERIFY_PHASE_ADMISSION: '1', WE_VERIFY_FAST_TARGETS: '0', WE_VERIFY_MATCH_REQUEST_VARIANTS: '1',
       WE_VERIFY_SUPERSEDE: 'any', WE_VERIFY_RESTART_IN_FLIGHT: 'adopt', WE_VERIFY_RUN_ALL_PHASES: '1',
-      WE_VERIFY_ISOLATED_RETRY: 'timeouts', WE_VERIFY_RELATED_MAX_TESTS: '5', WE_VERIFY_RELATED_DEPTH: '1', WE_VERIFY_ALWAYS_RUN_TESTS: 'x/y.test.mjs, z.test.mjs', WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: '1',
+      WE_VERIFY_ISOLATED_RETRY: 'timeouts', WE_VERIFY_INFRA_KILLED_RETRY: '2', WE_VERIFY_RELATED_MAX_TESTS: '5', WE_VERIFY_RELATED_DEPTH: '1', WE_VERIFY_ALWAYS_RUN_TESTS: 'x/y.test.mjs, z.test.mjs', WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: '1',
       WE_VERIFY_REVERT_RED: 'warn', WE_VERIFY_REVERT_RED_SINCE: '2026-10-08', WE_VERIFY_REVERT_RED_MAX_FILES: '7', WE_VERIFY_SELECTION: 'since-last-green', WE_VERIFY_PHASE_TIMEOUT_MS: '90000', WE_VERIFY_SLOT_HEARTBEAT_MS: '60000' };
     const values = { shardMinTests: 24, shardSize: 12, shardParallel: 3, relatedMode: 'all', testTimeoutFactor: 2.5, standards: 'auto', phaseAdmission: true, fastTargets: 0,
-      matchRequestVariants: true, supersede: 'any', restartInFlight: 'adopt', runAllPhases: true, isolatedRetry: 'timeouts', relatedMaxTests: 5, relatedDepth: 1, alwaysRunTests: ['x/y.test.mjs', 'z.test.mjs'], skipLocalForCardOnly: true,
+      matchRequestVariants: true, supersede: 'any', restartInFlight: 'adopt', runAllPhases: true, isolatedRetry: 'timeouts', infraKilledRetry: 2, relatedMaxTests: 5, relatedDepth: 1, alwaysRunTests: ['x/y.test.mjs', 'z.test.mjs'], skipLocalForCardOnly: true,
       revertRed: 'warn', revertRedSince: '2026-10-08', revertRedMaxFiles: 7, selection: 'since-last-green', phaseTimeoutMs: 90_000, slotHeartbeatMs: 60_000 };
     expect(resolveVerifySettings({ fileConfig: custom, env })).toEqual({ values, sources: allSources('env') });
     expect(resolveVerifySettings({ fileConfig: custom, env: { WE_VERIFY_RELATED: 'all' } }))
@@ -243,3 +243,13 @@ describe('revert-red settings (#5466)', () => {
     }
   });
  });
+
+it('infraKilledRetry defaults to one; validates integer bounds and env provenance', () => {
+  expect(resolveVerifySettings({ env: {} }).values.infraKilledRetry).toBe(1);
+  for (const value of [0, 1, 2, 3]) {
+    expect(validateVerifySettings({ infraKilledRetry: value }).infraKilledRetry).toBe(value);
+    expect(resolveVerifySettings({ fileConfig: { infraKilledRetry: 0 }, env: { WE_VERIFY_INFRA_KILLED_RETRY: String(value) } })).toMatchObject({ values: { infraKilledRetry: value }, sources: { infraKilledRetry: 'env' } });
+  }
+  for (const value of [-1, 4, 1.5, null, '2']) expect(validateVerifySettings({ infraKilledRetry: value }).infraKilledRetry).toBe(1);
+  for (const value of ['4', '-1', '1.5', '', 'NaN']) expect(resolveVerifySettings({ fileConfig: { infraKilledRetry: 2 }, env: { WE_VERIFY_INFRA_KILLED_RETRY: value } })).toMatchObject({ values: { infraKilledRetry: 2 }, sources: { infraKilledRetry: 'file' } });
+});

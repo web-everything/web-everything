@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync, lstatSync, existsSync, utimesSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { isolatedRetryFailures, retryKilledFailures } from '../../lib/gate-timeout-retry.mjs';
 import { computeWorkingTreeHash } from '../../lib/verify-lane-gate.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs, laneFilterDrivers, LANE_CONFIG_LIST_ARGS, LANE_GIT_CONFIG_PINS } from '../../lib/lane-git-hardening.mjs';
 import {
@@ -1158,4 +1159,53 @@ describe('verify-only infra retries', () => {
     expect(h.calls.resume).toHaveLength(0);
     expect([...h.store.values()][0].pendingResume).toBeUndefined();
   });
+});
+
+it('killed untouched files route to load-flake; mixed assertions and unrelated failures stay red', () => {
+  const killed = marker('red', { isolatedRetry: 'still-red', retriedFailures: [{ file: 'a', kind: 'killed' }], failureDetails: { tests: [{ file: 'a' }] } });
+  expect(isLoadFlakeRed(killed)).toBe(true);
+  expect(classify({ marker: killed })).toMatchObject({ action: 'resume', resume: 'load-flake' });
+  expect(isLoadFlakeRed({ ...killed, retriedFailures: [...killed.retriedFailures, { file: 'b', kind: 'assertion' }] })).toBe(false);
+  expect(isLoadFlakeRed({ ...killed, failureDetails: { tests: [{ file: 'b' }] } })).toBe(false);
+});
+
+it('application status assertions remain assertions and authorize neither extra retries nor load-flake routing', async () => {
+  const file = 'untouched.test.mjs';
+  const failureDetails = { tests: [{ file, name: 'application status' }], truncated: false };
+  const output = {
+    stderr: ` FAIL  ${file} > application status\nAssertionError: status: expected null to be 0\n`,
+    stdout: ' Test Files  1 failed\n Tests  1 failed\n Duration  1s\n',
+  };
+  const result = { exitCode: 1, output, failureDetails };
+  const inventory = r => isolatedRetryFailures({ ...r.output, failureDetails: r.failureDetails, changedFiles: ['source.mjs'], cwd: '/repo' });
+  let attempts = 0;
+  const retry = await retryKilledFailures({ result, retriedFailures: inventory(result), maxRetries: 3,
+    classify: inventory, run: async () => { attempts++; return result; } });
+  expect(retry.retriedFailures).toEqual([{ file, kind: 'assertion' }]);
+  expect(attempts).toBe(0);
+  expect(retry.infraKilledRetries).toBe(0);
+  const red = marker('red', { failureDetails, retriedFailures: retry.retriedFailures, isolatedRetry: retry.isolatedRetry });
+  expect(isLoadFlakeRed(red)).toBe(false);
+  expect(classify({ marker: red })).toMatchObject({ action: 'resume', resume: 'red' });
+});
+
+it('assertions mentioning killed remain assertions and route red', async () => {
+  for (const message of ['AssertionError: expected worker to be killed', 'AssertionError: expected child process to be killed', 'AssertionError: child was killed']) {
+    const file = 'untouched.test.mjs';
+    const failureDetails = { tests: [{ file, name: 'worker lifecycle' }], truncated: false };
+    const result = { exitCode: 1, failureDetails, output: {
+      stderr: ` FAIL  ${file} > worker lifecycle\n${message}\n`,
+      stdout: ' Test Files  1 failed\n Tests  1 failed\n Duration  1s\n',
+    } };
+    const inventory = r => isolatedRetryFailures({ ...r.output, failureDetails: r.failureDetails, changedFiles: ['source.mjs'], cwd: '/repo' });
+    let attempts = 0;
+    const retry = await retryKilledFailures({ result, retriedFailures: inventory(result), maxRetries: 3,
+      classify: inventory, run: async () => { attempts++; return result; } });
+    expect(retry.retriedFailures, message).toEqual([{ file, kind: 'assertion' }]);
+    expect(attempts, message).toBe(0);
+    expect(retry.infraKilledRetries, message).toBe(0);
+    const red = marker('red', { failureDetails, retriedFailures: retry.retriedFailures, isolatedRetry: retry.isolatedRetry });
+    expect(isLoadFlakeRed(red), message).toBe(false);
+    expect(classify({ marker: red }), message).toMatchObject({ action: 'resume', resume: 'red' });
+  }
 });

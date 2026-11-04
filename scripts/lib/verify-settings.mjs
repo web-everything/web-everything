@@ -19,6 +19,8 @@ export const BUILT_IN_VERIFY_SETTINGS = Object.freeze({
   // 'untouched' (any failure kind, at most 3 files), 'timeouts' (only timeout failures), 'off'.
   // A pass alone is recorded on the marker as `isolatedRetry: 'flaky-outside-diff'`; CI still runs the full suite.
   isolatedRetry: 'untouched',
+  // fix.gate.infraKilledRetry — extra admitted retries for killed children in untouched files.
+  infraKilledRetry: 1,
   // #5128 — over this many related tests (any import depth), run only tests within `relatedDepth` import hops (never
   // fewer than the direct importers) and mark the run `selection-truncated`. 0 = off (plain `vitest related`).
   relatedMaxTests: 0,
@@ -80,6 +82,7 @@ const rules = {
   supersede: value => ['newer', 'never', 'any'].includes(value),
   restartInFlight: value => ['adopt', 'kill'].includes(value),
   runAllPhases: value => typeof value === 'boolean',
+  infraKilledRetry: value => Number.isSafeInteger(value) && value >= 0 && value <= 3,
   isolatedRetry: value => ['untouched', 'timeouts', 'off'].includes(value),
   relatedMaxTests: value => Number.isSafeInteger(value) && value >= 0,
   relatedDepth: value => Number.isSafeInteger(value) && value >= 1,
@@ -101,7 +104,7 @@ const envKeys = {
   standards: 'WE_VERIFY_STANDARDS', phaseAdmission: 'WE_VERIFY_PHASE_ADMISSION', fastTargets: 'WE_VERIFY_FAST_TARGETS',
   matchRequestVariants: 'WE_VERIFY_MATCH_REQUEST_VARIANTS', supersede: 'WE_VERIFY_SUPERSEDE',
   restartInFlight: 'WE_VERIFY_RESTART_IN_FLIGHT',
-  runAllPhases: 'WE_VERIFY_RUN_ALL_PHASES', isolatedRetry: 'WE_VERIFY_ISOLATED_RETRY',
+  runAllPhases: 'WE_VERIFY_RUN_ALL_PHASES', isolatedRetry: 'WE_VERIFY_ISOLATED_RETRY', infraKilledRetry: 'WE_VERIFY_INFRA_KILLED_RETRY',
   relatedMaxTests: 'WE_VERIFY_RELATED_MAX_TESTS', relatedDepth: 'WE_VERIFY_RELATED_DEPTH',
   alwaysRunTests: 'WE_VERIFY_ALWAYS_RUN_TESTS', skipLocalForCardOnly: 'WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY',
   revertRed: 'WE_VERIFY_REVERT_RED', revertRedSince: 'WE_VERIFY_REVERT_RED_SINCE', revertRedMaxFiles: 'WE_VERIFY_REVERT_RED_MAX_FILES',
@@ -146,7 +149,7 @@ export function resolveVerifySettings({ fileConfig, env = {} } = {}) {
     sources[key] = fileKeys.get(validated).has(key) ? 'file' : 'default';
     let value = env?.[envKeys[key]];
     if (booleanKeys.has(key)) value = value === '0' ? false : value === '1' ? true : undefined;
-    else if (['shardMinTests', 'shardSize', 'shardParallel', 'testTimeoutFactor', 'fastTargets', 'relatedMaxTests', 'relatedDepth', 'revertRedMaxFiles', 'phaseTimeoutMs', 'slotHeartbeatMs'].includes(key)) {
+    else if (['infraKilledRetry', 'shardMinTests', 'shardSize', 'shardParallel', 'testTimeoutFactor', 'fastTargets', 'relatedMaxTests', 'relatedDepth', 'revertRedMaxFiles', 'phaseTimeoutMs', 'slotHeartbeatMs'].includes(key)) {
       value = value != null && String(value).trim() !== '' ? Number(value) : undefined;
     }
     else if (key === 'alwaysRunTests') {

@@ -505,6 +505,8 @@ Re-run the SAME test from step 2 before you request verify — it must now be gr
 re-run that SAME probe and confirm it now shows the fixed behavior. Keep the trimmed after-output next to the
 before-output from step 2; step 6 posts both as the evidence.
 
+A killed-child failure in an untouched file is infrastructure, never gate-red.
+
 **Load-flake exception.** When verify is red ONLY on timeouts that pass alone under high host load, save and push
 the fix to `lane/<head>-fix-<N>-alt`, then use the load-flake exit instead of the terminal gate-red exit below. It
 releases the fix claim like every other exit. Pass the PR's FULL 40-character head sha as GitHub has it (`git ls-remote origin refs/heads/<head ref> | cut -f1` — under push-before-gate that is your own early-pushed sha, and a local `origin/<ref>` is stale).

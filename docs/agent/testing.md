@@ -3910,3 +3910,16 @@ The `smoke-github-outage` break pins `WE_GH_LIST_BACKOFF_MS=5,5` and
 `WE_GH_JSON_RETRY_BACKOFF_MS=5` before the daemon forks. This preserves exhausted,
 fail-closed reads across reconcile and dispatch smoke passes within the unchanged
 90-second tick bound; shortening only the outer list backoff does not suffice.
+
+### Killed-child failures during isolated gate retries
+
+`fix.gate.infraKilledRetry` (`infraKilledRetry` in `scripts/verify-settings.json`,
+`WE_VERIFY_INFRA_KILLED_RETRY` in the environment) defaults to 1 and accepts integers
+0–3; 0 disables extra attempts. It uses the verify settings policy cascade
+(standard → platform → tool → environment); verify-lane logs the effective value
+and source. After the first isolated retry, only explicit killed-child infrastructure
+in untouched files authorizes another attempt through the same heavy admission path.
+Every attempt reclassifies its evidence: an ordinary assertion or incomplete inventory
+stays red and stops retries. Exhausted killed failures route to load-flake recovery,
+so the reverify worker can retry them; they must not cause terminal gate-red stand-down.
+The marker records extra attempts as `infraKilledRetries`. Edited files never qualify.

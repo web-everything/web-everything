@@ -73,11 +73,11 @@ export function isHarnessRecord(record) {
 
 /**
  * A red the gate itself classified as load-only: every failing file was re-run alone, every retried file failed
- * only on Vitest timeouts, and no failing test sits outside the retried set. Pure.
+ * only on Vitest timeouts or explicit killed-child infrastructure, and no failing test sits outside the retried set. Pure.
  */
 export function isLoadFlakeRed(marker) {
   const retried = Array.isArray(marker?.retriedFailures) ? marker.retriedFailures : [];
-  if (!retried.length || !retried.every((f) => f?.kind === 'timeout' && typeof f.file === 'string')) return false;
+  if (!retried.length || !retried.every((f) => ['timeout', 'killed'].includes(f?.kind) && typeof f.file === 'string')) return false;
   const files = new Set(retried.map((f) => f.file));
   const tests = Array.isArray(marker?.failureDetails?.tests) ? marker.failureDetails.tests : [];
   return tests.every((t) => files.has(t?.file));

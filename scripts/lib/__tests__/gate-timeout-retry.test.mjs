@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { timeoutRetryFiles, isolatedRetryFailures, describeIsolatedRetry, isolatedRetryAudit, FLAKY_OUTSIDE_DIFF,
-  MAX_TIMEOUT_LOG_BYTES } from '../gate-timeout-retry.mjs';
+  MAX_TIMEOUT_LOG_BYTES, retryKilledFailures } from '../gate-timeout-retry.mjs';
 import { createFailureCollector } from '../verify-failures.mjs';
 
 function evidence(messages = ['Error: Test timed out in 5000ms.'], files = ['a.test.mjs']) {
@@ -82,4 +82,74 @@ describe('isolated retry of failures in untouched files (75c)', () => {
     expect(isolatedRetryAudit([], FLAKY_OUTSIDE_DIFF)).toEqual({});
     expect(describeIsolatedRetry({ retriedTimeouts: ['x.test.mjs'] })).toContain('timeout-only failures');
   });
+});
+
+describe('killed-child infrastructure failures', () => {
+  it.each([
+    'AssertionError: child status: expected null to be 0',
+    'AssertionError: child status null',
+    'Error: child "signal": "SIGKILL"',
+    "Error: signal: 'SIGTERM'",
+    'Error: spawnSync node ETIMEDOUT',
+    'Error: ETIMEDOUT',
+    "Error: ENOENT: no such file, open '/private/var/folders/ab/cd/T/task-1/a'",
+    "Error: ENOTDIR: not a directory, chdir '/tmp/task-1'",
+    'Error: child was killed',
+    'Error: child process was killed',
+  ])('classifies explicit infra signature: %s', message => {
+    expect(isolatedRetryFailures(evidence([message]))).toEqual([{ file: 'a.test.mjs', kind: 'killed' }]);
+    expect(isolatedRetryFailures({ ...evidence([message]), changedFiles: ['a.test.mjs'] })).toEqual([]);
+  });
+  it.each(['Error: killed', 'AssertionError: child was killed', 'AssertionError: expected worker to be killed', 'AssertionError: expected child process to be killed', 'Error: expected worker to be killed', 'AssertionError: status: expected null to be 0', 'AssertionError: expected null to be 0', 'Error: ENOENT /repo/missing', 'Error: signal handler failed', 'AssertionError: wrong value'])('keeps ordinary failures as assertions: %s', message => {
+    expect(isolatedRetryFailures(evidence([message]))[0].kind).toBe('assertion');
+  });
+  it('requires every error message in every failure of a file to match', () => {
+    expect(isolatedRetryFailures(evidence(['Error: child was killed\nCaused by: wrong value']))[0].kind).toBe('assertion');
+    expect(isolatedRetryFailures(evidence(['Error: child was killed', 'AssertionError: wrong value'], ['a.test.mjs', 'a.test.mjs']))[0].kind).toBe('assertion');
+  });
+  const killed = () => ({ exitCode: 1, output: evidence(['Error: child was killed']), failureDetails: evidence(['Error: child was killed']).failureDetails });
+  const files = [{ file: 'a.test.mjs', kind: 'killed' }];
+  const classify = r => isolatedRetryFailures({ ...r.output, failureDetails: r.failureDetails, changedFiles: ['source.mjs'], cwd: '/repo' });
+  it('bounds killed retries and records attempts; a pass becomes flaky', async () => {
+    let calls = 0;
+    const r = await retryKilledFailures({ result: killed(), retriedFailures: files, maxRetries: 3, classify, run: async () => (++calls === 2 ? { exitCode: 0 } : killed()) });
+    expect(calls).toBe(2);
+    expect(r).toMatchObject({ infraKilledRetries: 2, isolatedRetry: 'flaky-outside-diff' });
+  });
+  it('stops at the budget and routes an exhausted killed failure as killed', async () => {
+    let calls = 0;
+    const r = await retryKilledFailures({ result: killed(), retriedFailures: files, maxRetries: 1, classify, run: async () => { calls++; return killed(); } });
+    expect(calls).toBe(1);
+    expect(r).toMatchObject({ infraKilledRetries: 1, isolatedRetry: 'still-red', retriedFailures: files });
+  });
+  it('stops on normal assertions, incomplete evidence, and a newly edited file', async () => {
+    for (const final of [{ ...killed(), output: evidence(['AssertionError: wrong value']), failureDetails: evidence(['AssertionError: wrong value']).failureDetails }, { exitCode: 1 }]) {
+      let calls = 0;
+      const r = await retryKilledFailures({ result: killed(), retriedFailures: files, maxRetries: 3, classify, run: async () => { calls++; return final; } });
+      expect(calls).toBe(1);
+      expect(r.retriedFailures[0].kind).toBe('assertion');
+      expect(r.isolatedRetry).toBe('still-red');
+    }
+    let calls = 0;
+    await retryKilledFailures({ result: killed(), retriedFailures: files, maxRetries: 3, classify: () => [], run: async () => { calls++; } });
+    expect(calls).toBe(0);
+  });
+  it.each([{ exitCode: null, signal: 'SIGKILL' }, { exitCode: null, code: 'ETIMEDOUT' }])('retries a signalled or timed out runner: %j', async result => {
+    const r = await retryKilledFailures({ result, retriedFailures: files, maxRetries: 1, classify, run: async () => ({ exitCode: 0 }) });
+    expect(r.infraKilledRetries).toBe(1);
+    expect(r.isolatedRetry).toBe('flaky-outside-diff');
+  });
+  it('zero disables extra retries', async () => {
+    const r = await retryKilledFailures({ result: killed(), retriedFailures: files, maxRetries: 0, classify, run: async () => { throw Error('must not run'); } });
+    expect(r.infraKilledRetries).toBe(0);
+  });
+});
+
+it('an oversized retry budget fails closed to no extra attempts', async () => {
+  const r = await retryKilledFailures({ result: { exitCode: 1, signal: 'SIGKILL' }, retriedFailures: [{ file: 'a.test.mjs', kind: 'killed' }], maxRetries: 4, classify: () => [], run: async () => { throw Error('must not run'); } });
+  expect(r).toMatchObject({ infraKilledRetries: 0, isolatedRetry: 'still-red' });
+});
+it('an edited file blocks even a killed runner from being retried', async () => {
+  const r = await retryKilledFailures({ result: { exitCode: 1, signal: 'SIGKILL' }, retriedFailures: [{ file: 'a.test.mjs', kind: 'killed' }], maxRetries: 3, classify: () => [], canRetry: () => false, run: async () => { throw Error('must not run'); } });
+  expect(r.infraKilledRetries).toBe(0);
 });
