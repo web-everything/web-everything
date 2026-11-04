@@ -21,6 +21,12 @@ export function main(argv, { out = (s) => writeLineSync(1, s),settings, dir = de
   const bad = ['list', 'tick', 'resume'].filter((k) => k in a && a[k] !== true).map((k) => `--${k} takes no value`)
     .concat(['owners', 'reason', 'resume-when'].filter((k) => k in a && typeof a[k] !== 'string').map((k) => `--${k} needs a value`));
   if (bad.length) { out(`error: ${bad.join('; ')}`); return 2; }
+  // Unknown flags, typos (`--ower=a`), positionals (`--resume a`) and flags the chosen mode ignores (`--resume --owners=a`) must not
+  // fall through to a broader action (bare --resume clears EVERY flag): refuse them all.
+  const mode = a.list ? 'list' : a.tick ? 'tick' : a.resume ? 'resume' : 'pause';
+  const allowed = { list: ['list'], tick: ['tick', 'owners'], resume: ['resume', 'owner'], pause: ['owner', 'reason', 'resume-when'] }[mode];
+  const stray = argv.filter((t) => { const m = /^--([^=]+)(?:=(.*))?$/.exec(t); return !m || !allowed.includes(m[1]); });
+  if (stray.length) { out(`error: unexpected argument(s) for ${mode}: ${stray.map((t) => JSON.stringify(t)).join(', ')}`); return 2; }
   const s = settings ?? resolveGovernorSettings({ settings: readSettings(), env: process.env });
   if (a.list) { const l = listPauses({ dir, maxPauseMinutes: s.maxPauseMinutes, now }); out(l.length ? l.map((x) => `${x.owner}\t${x.flag.at}\t${x.flag.reason}`).join('\n') : 'no live pause flags'); return 0; }
   if (a.tick) {

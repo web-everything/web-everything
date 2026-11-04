@@ -68,8 +68,9 @@ export function ownerClass(text, settings = GOVERNOR_DEFAULTS) {
 /** Own-property lookup only: a class named `constructor`/`toString` must not read inherited Object members. */
 const patternsOf = (settings, c) => (Object.hasOwn(settings.classPatterns ?? {}, c) && Array.isArray(settings.classPatterns[c]) ? settings.classPatterns[c] : []);
 const fallbackClass = (settings) => (settings.priority.includes('build') ? 'build' : settings.priority[settings.priority.length - 1]);
-/** Can some owner text classify as `c`? Only with a pattern, or as the fallback class. */
-const isReachable = (c, settings) => patternsOf(settings, c).length > 0 || fallbackClass(settings) === c;
+/** Can some owner text classify as `c`? As the fallback class, or via a pattern no earlier class's pattern shadows
+ *  (a text containing p also contains whatever shorter pattern of an earlier class p contains, so probing p itself is exact). */
+const isReachable = (c, settings) => fallbackClass(settings) === c || patternsOf(settings, c).some((p) => ownerClass(p, settings) === c);
 export const classRank = (c, settings = GOVERNOR_DEFAULTS) => { const i = settings.priority.indexOf(c); return i < 0 ? settings.priority.length : i; };
 /** PURE: is this class below the exemption cutoff (so subject to holds and pauses)? */
 export const ALWAYS_EXEMPT = Object.freeze(['main-fix', 'delivery-unblock']); // no setting may hold or pause these
@@ -140,9 +141,13 @@ export function governorTick({ loadPerCore, owners = [], settings = GOVERNOR_DEF
   for (const o of sweepExpired({ dir, maxPauseMinutes: settings.maxPauseMinutes, now })) { events.push({ event: 'expired', owner: o }); if (st.holding && !cooled.includes(o)) cooled.push(o); } // TTL is a hard cap: no re-pause until load clears
   if (!st.holding) cooled = [];
   if (st.unreadable) events.push({ event: 'load-unreadable', reason: st.reason });
+  // Flags are keyed by the sanitized name, so `w/1` and `w_1` share one file. If any owner on a key is exempt, the key is never
+  // paused (an exempt worker must not be held through a sibling's name) and the holdable sibling is reported, not paused.
+  const exemptKeys = new Set(owners.filter((o) => validOwner(o.owner) && !isHoldable(ownerClass(o.text ?? o.owner, settings), settings)).map((o) => safe(o.owner)));
   for (const { owner, text } of owners) {
     if (!validOwner(owner)) { events.push({ event: 'skipped-invalid-owner', owner: String(owner) }); continue; } // `.`/`..`/blank would hit the pause dir itself
     const cls = ownerClass(text ?? owner, settings);
+    if (isHoldable(cls, settings) && exemptKeys.has(safe(owner))) { events.push({ event: 'skipped-colliding-owner', owner, cls }); continue; }
     const cur = readPause({ dir, owner, maxPauseMinutes: settings.maxPauseMinutes, now });
     if (!isHoldable(cls, settings)) { // reclassified as exempt (e.g. feature-build -> red-main-repair): drop OUR pause, never an operator's
       if (cur?.by === GOVERNOR_REASON) { clearPause({ dir, owner }); events.push({ event: 'resumed', owner, cls }); }

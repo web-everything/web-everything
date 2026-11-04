@@ -85,6 +85,18 @@ describe('hold and release', () => {
     expect(ownerClass('anything')).toBe('build');
   });
 });
+describe('settings: a class whose every pattern is shadowed by an earlier class is unreachable', () => {
+  it('falls back to defaults instead of reporting holding while holding nothing', () => {
+    const s = resolveGovernorSettings({ settings: { loadGovernor: { priority: ['main-fix', 'build', 'z'], holdFromClass: 'z', classPatterns: { z: ['repair'] } } } });
+    expect(s.priority).toEqual([...D.priority]); expect(s.holdFromClass).toBe(D.holdFromClass);
+    expect(shouldHold({ text: 'feature-x', holding: true, settings: s }).hold).toBe(true);
+  });
+  it('a class with one shadowed and one live pattern stays reachable', () => {
+    const s = resolveGovernorSettings({ settings: { loadGovernor: { priority: ['main-fix', 'build', 'z'], holdFromClass: 'z', classPatterns: { z: ['repair', 'zzz'] } } } });
+    expect(s.priority).toEqual(['main-fix', 'build', 'z']);
+    expect(shouldHold({ text: 'zzz-job', holding: true, settings: s })).toMatchObject({ hold: true, cls: 'z' });
+  });
+});
 describe('settings: class names that collide with Object members', () => {
   it.each(['constructor', 'toString', 'hasOwnProperty', '__proto__'])('priority naming %s never throws in ownerClass/shouldHold', (name) => {
     const s = resolveGovernorSettings({ settings: { loadGovernor: { priority: ['daemon-fix', name] } } });
@@ -134,6 +146,18 @@ describe('pause flags', () => {
     expect(readPause({ dir, owner: 'w1', now })).toBeNull();
     expect(readPause({ dir, owner: 'w2', now })).toMatchObject({ by: 'operator' });
     expect(r.events.filter((e) => e.event === 'resumed').map((e) => e.owner)).toEqual(['w1']);
+  });
+  it.each([['w/1', 'w_1'], ['w_1', 'w/1']])('owners %s and %s share one flag file: the exempt one wins and the holdable one is reported, not paused', (first, second) => {
+    const dir = tmp(); const stateFile = join(tmp(), 'st.json');
+    const texts = { 'w/1': 'feature-build', w_1: 'red-main repair' };
+    const r = governorTick({ loadPerCore: 3, owners: [first, second].map((owner) => ({ owner, text: texts[owner] })), stateFile, dir, now });
+    expect(listPauses({ dir, now })).toEqual([]);
+    expect(r.events.map((e) => `${e.event}:${e.owner}`)).toEqual(['skipped-colliding-owner:w/1']);
+  });
+  it('a holdable owner alone is still paused when its sanitized name is unique', () => {
+    const dir = tmp(); const stateFile = join(tmp(), 'st.json');
+    governorTick({ loadPerCore: 3, owners: [{ owner: 'w/1', text: 'feature-build' }, { owner: 'w2', text: 'red-main repair' }], stateFile, dir, now });
+    expect(readPause({ dir, owner: 'w/1', now })).not.toBeNull();
   });
   it('set, read, expire by TTL', () => {
     const dir = tmp();
@@ -212,6 +236,13 @@ describe('worker-pause CLI and smell', () => {
     const r = governorTick({ loadPerCore: 3, owners: [{ owner: '.' }, { owner: '..' }, { owner: '' }, { owner: 'build-ok' }], stateFile: join(tmp(), 's.json'), dir, now });
     expect(r.events.filter((e) => e.event === 'paused').map((e) => e.owner)).toEqual(['build-ok']);
     expect(r.events.filter((e) => e.event === 'skipped-invalid-owner').length).toBe(3);
+  });
+  it.each([['--resume', '--owners=a'], ['--resume', '--ower=a'], ['--resume', '--Owner=a'], ['--resume', '-owner=a'], ['--resume', 'a'], ['--resume', '--owner', 'a'], ['--resume', '--reason=x'], ['--list', '--resume'], ['--owner=a', 'extra']])('%s: a stray or ignored argument never falls through to a broader action', (...argv) => {
+    const dir = tmp(); const now = new Date('2026-11-03T13:00:00Z'); const out = [];
+    setPause({ dir, owner: 'a', reason: 'x', by: 'operator', now }); setPause({ dir, owner: 'b', reason: 'y', by: 'operator', now });
+    expect(main(argv, { dir, out: (s) => out.push(s), now, load: () => 3, home: tmp() })).toBe(2);
+    expect(out.at(-1)).toMatch(/error/);
+    expect(listPauses({ dir, now }).map((x) => x.owner).sort()).toEqual(['a', 'b']);
   });
   it('bare --resume still clears every flag', () => {
     const dir = tmp(); const now = new Date('2026-11-03T13:00:00Z');
