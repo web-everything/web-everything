@@ -94,11 +94,12 @@ function scan(t, start, depth, inHole, lits) {
   const braces = []; // per open `{`: does it open an expression (object literal / function or class expression body)?
   let exprClose = false; // the last token was the `}` of such a brace: an operand, so a following `/` divides
   let postfixBang = false; // the last token was a TypeScript non-null `x!`: an operand, so a following `/` divides
+  let numDot = false; // the last token was the `.` ending a numeric literal (`1.`): an operand, so a following `/` divides
   let asyncExpr = false; // the last `async` keyword began in expression position
   let pendKind = ''; // 'function' | 'class' keyword seen, its body `{` not yet opened
   let pendExpr = false; // ... and it began in expression position
   let pendDepth = 0; // ... at this paren depth
-  const emit = (s, sig) => { out += s; prev = last; last = sig; ctrlParen = false; exprClose = false; postfixBang = false; fnBodyExpr = false; };
+  const emit = (s, sig) => { out += s; prev = last; last = sig; ctrlParen = false; exprClose = false; postfixBang = false; fnBodyExpr = false; numDot = false; };
   while (i < n) {
     const c = t[i];
     const d = t[i + 1];
@@ -120,6 +121,7 @@ function scan(t, start, depth, inHole, lits) {
       else if (last === ']' || last === '"' || last === "'" || last === '`') regexOk = false;
       else if ((last === '+' || last === '-') && prev === last) regexOk = false; // postfix ++ / --
       else if (last === '!') regexOk = !postfixBang;
+      else if (last === '.') regexOk = !numDot; // `1. / 2` divides; a spread `.../re/` or stray dot starts a regex
       else if (last === '}') regexOk = !exprClose; // end of a block starts a statement; end of an object literal is an operand
       else regexOk = true; // operator, `(`, `,`, `=`, `{`, `;`
       if (regexOk) {
@@ -187,8 +189,10 @@ function scan(t, start, depth, inHole, lits) {
     if (c === '}' && inHole && braces.length === 0) return { out, end: i + 1 };
     if (c === ';') pendKind = '';
     const nonNull = c === '!' && ((isIdent(last) && !REGEX_AFTER_WORD.has(word())) || (last === ')' && !ctrlParen) || last === ']');
+    const endsNumber = c === '.' && isIdent(last) && !wordDot && wordEnd === i && t[wordStart] >= '0' && t[wordStart] <= '9';
     emit(c, c);
     if (c === '!') postfixBang = nonNull;
+    if (c === '.') numDot = endsNumber;
     if (c === '{') braces.push(opensExpr);
     if (c === '}') exprClose = braces.pop() ?? false;
     if (c === ')') {
@@ -246,7 +250,12 @@ function commandIsGit(segment) {
   GIT_AT.lastIndex = pos;
   return GIT_AT.test(segment);
 }
-const literalNamesGit = (s) => decodeBreaks(s).split(COMMAND_SEPARATOR).some(commandIsGit);
+// The shell removes quotes and backslashes from a command word (`"git"`, `'git'`, `g"i"t`, `\"git\"`), so a segment
+// that has any is also judged with them dropped. (Dropping them can only add matches, never hide one.)
+const SHELL_QUOTING = /["'\\]/;
+const dequote = (s) => s.replace(/["'\\]/g, '');
+const segmentRunsGit = (seg) => commandIsGit(seg) || (SHELL_QUOTING.test(seg) && commandIsGit(dequote(seg)));
+const literalNamesGit = (s) => decodeBreaks(s).split(COMMAND_SEPARATOR).some(segmentRunsGit);
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 export function sourceNeedsGit(text, { helpers = [] } = {}) {

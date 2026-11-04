@@ -140,6 +140,27 @@ describe('sourceNeedsGit', () => {
     }
     expect(sourceNeedsGit(E + "// execSync(' git status')\nexecSync('node x')")).toBe(false);
   });
+  it('a quoted or escaped shell executable still names git', () => {
+    const E = "import { execSync } from 'node:child_process'; ";
+    for (const lit of [
+      "'\"git\" rev-parse --show-toplevel'", `"'git' status"`, "'\"/usr/bin/git\" status'", "'\"/my dir/git\" status'", "'g\"i\"t status'", "'g\\\\it status'",
+      "'\\\\\"git\\\\\" status'", "'cd x && \"git\" status'", "'\"sudo\" \"git\" status'", "'\"FOO=1\" git status'", "'\"git\"'", '`"git" ${args}`',
+    ]) expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(true);
+    // quoted arguments and other binaries are still not git
+    for (const lit of ["'\"gitleaks\" scan'", "'echo \"git status\"'", "'\"node\" git.mjs'", "'\"a-git\" status'"]) {
+      expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(false);
+    }
+  });
+  it('a trailing-dot number is an operand: the next `/` divides', () => {
+    const E = "import { execSync } from 'node:child_process'; ";
+    const tail = " execSync('git rev-parse --show-toplevel'); const path = '/tmp';";
+    for (const num of ['1.', '10.', '0.', '1e3.', '0x1F.']) expect(sourceNeedsGit(E + `const ratio = ${num} / 2;` + tail), num).toBe(true);
+    expect(sourceNeedsGit(E + 'const r = f(1. / 2, 3.) / 4;' + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'const r = 1.5.toFixed(1) / 2;' + tail)).toBe(true);
+    // a spread or member dot is not a number: a regex literal after it is still a regex
+    expect(sourceNeedsGit(E + "const a = [...[/'/]]; const u = 'http://x';" + tail)).toBe(true);
+    expect(sourceNeedsGit(E + "const r = /'/.test(s); const u = 'http://x';" + tail)).toBe(true);
+  });
   it('U+2028 / U+2029 are legal inside string literals and do not end them', () => {
     const E = "import { execSync } from 'node:child_process'; ";
     for (const sep of [' ', ' ']) {
