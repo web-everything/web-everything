@@ -2010,7 +2010,7 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
     const carried = (...extra) => prototypeLoad.canonicalAuditEvidence([old(), ...extra], SHA, () => true, FP);
     it.each([
       ['a contradictory-findings WEAKENED record', { verdict: 'WEAKENED', findings: ['NOT WEAKENED'] }],
-      ['a contradictory-findings WEAKENED record (zero-width and line-break shapes)', { verdict: 'WEAKENED', findings: ['note\n​NOT WEAKENED'] }],
+      ['a contradictory-findings WEAKENED record (zero-width and line-break shapes)', { verdict: 'WEAKENED', findings: ['note\n\u200BNOT WEAKENED'] }],
       ['a WEAKENED record with an unparseable timestamp', { verdict: 'WEAKENED', at: 'not-a-date' }],
       ['a WEAKENED record with a malformed base', { verdict: 'WEAKENED', base: 'zz' }],
       ['a WEAKENED empty-diff record (base equals head)', { verdict: 'WEAKENED', base: OLD }],
