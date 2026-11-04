@@ -29,6 +29,34 @@ describe('sourceNeedsGit', () => {
     // a real comment after a regex is still a comment
     expect(sourceNeedsGit(cp + "const re = /a\\//; // execFileSync('git', [])")).toBe(false);
   });
+  it('does not lose the scan position after a regex/division/template misjudgment', () => {
+    const G = "import {execSync} from 'node:child_process';\n";
+    const spawn = " execSync('git status');";
+    expect(sourceNeedsGit(G + "if (x) /'/.test(y); const u='http://x';" + spawn)).toBe(true);
+    expect(sourceNeedsGit(G + "while (m=next()) /x'/.exec(m); const u='http://x';" + spawn)).toBe(true);
+    expect(sourceNeedsGit(G + "function f(){}\n/'/.test(a); const u='http://x';" + spawn)).toBe(true);
+    expect(sourceNeedsGit(G + 'let r = i++ / 2;' + spawn + ' // see /x')).toBe(true);
+    expect(sourceNeedsGit(G + 'let r = f(i) / 2;' + spawn + ' // see /x')).toBe(true);
+    expect(sourceNeedsGit(G + "const a=`${ '`' }`; const u='http://x';" + spawn)).toBe(true);
+    expect(sourceNeedsGit(G + "const a=`x${ `y${ '}' }` }z`; const u='http://x';" + spawn)).toBe(true);
+    // a comment ends at CR, U+2028 and U+2029 as well as LF
+    for (const nl of ['\r', ' ', ' ']) expect(sourceNeedsGit(G + '// c' + nl + spawn)).toBe(true);
+    // ... but text inside one comment stays a comment
+    expect(sourceNeedsGit(G + "// execSync('git status')")).toBe(false);
+  });
+  it('stays linear on adversarial 300k inputs (no quadratic rescans)', () => {
+    const o = { helpers: ['a.mjs'] };
+    const inputs = ['(/['.repeat(100000), 'import' + ' '.repeat(300000) + 'x', 'a'.repeat(300000), "('".repeat(150000), '${'.repeat(100000), '`${'.repeat(100000)];
+    const t0 = Date.now();
+    for (const s of inputs) expect(sourceNeedsGit(s, o)).toBe(false);
+    expect(Date.now() - t0).toBeLessThan(2500);
+    // oversize input is not judged (same as an unreadable file): stays remote
+    expect(sourceNeedsGit("import 'node:child_process'; run('git', [])" + ' '.repeat(1024 * 1024))).toBe(false);
+  });
+  it('ignores non-string and empty helper entries', () => {
+    expect(sourceNeedsGit("import '../x.mjs'", { helpers: [null, '', undefined, 7] })).toBe(false);
+    expect(sourceNeedsGit("import '../x.mjs'", { helpers: 'x.mjs' })).toBe(false);
+  });
   it('honours declared helpers imported dynamically, by side-effect, or via require', () => {
     const o = { helpers: ['git-helper.mjs'] };
     expect(sourceNeedsGit("const { tracked } = await import('../git-helper.mjs'); tracked();", o)).toBe(true);
@@ -37,6 +65,10 @@ describe('sourceNeedsGit', () => {
     expect(sourceNeedsGit('import "../git-helper.mjs"', o)).toBe(true);
     expect(sourceNeedsGit("const h = require('../git-helper.mjs')", o)).toBe(true);
     expect(sourceNeedsGit("export * from '../git-helper.mjs'", o)).toBe(true);
+    expect(sourceNeedsGit("import\n  '../git-helper.mjs'", o)).toBe(true);
+    expect(sourceNeedsGit("await import(\n  '../git-helper.mjs?raw')", o)).toBe(true);
+    expect(sourceNeedsGit("require.resolve('../git-helper.mjs')", o)).toBe(true);
+    expect(sourceNeedsGit("await vi.importActual('../git-helper.mjs')", o)).toBe(true);
     expect(sourceNeedsGit("// import '../git-helper.mjs'\n// await import('../git-helper.mjs')", o)).toBe(false);
     expect(sourceNeedsGit("const s = 'git-helper.mjs'; other('../git-helper.mjs')", o)).toBe(false);
   });
