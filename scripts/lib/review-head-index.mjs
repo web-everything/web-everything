@@ -138,14 +138,19 @@ export function withHeadIndexLock(dir, fn, { fs = nodeFs, staleMs = LOCK_STALE_M
       try { age = now() - fs.statSync(lock).mtimeMs; } catch { continue; } // vanished: retry
       const dead = held ? Number.isInteger(held.pid) && !pidAlive(held.pid) : age > staleMs; // no readable owner: only after the grace
       if (dead) {
-        // Move the stale lock aside atomically; only one contender wins the rename. A lock that changed is put back.
+        // Move the stale lock aside atomically; only one contender wins the rename. What we moved is compared with what we
+        // judged dead BEFORE anything is decided: a lock that changed (its owner re-created it between our read and the
+        // rename) is a live owner's, so it is linked back. If a newer lock already exists, that newer holder wins and its
+        // lock is left alone. Only `aside` is ever unlinked here, never `lock`.
         const aside = `${lock}.stale.${token}`;
-        try {
-          fs.renameSync(lock, aside);
+        let renamed = false;
+        try { fs.renameSync(lock, aside); renamed = true; } catch { /* another contender moved it */ }
+        if (renamed) {
           let moved = null; try { moved = JSON.parse(fs.readFileSync(aside, 'utf8')); } catch { /* unreadable */ }
-          if (moved && held && moved.token !== held.token) { try { fs.linkSync(aside, lock); } catch { /* a newer holder exists */ } }
+          const changed = held ? moved?.token !== held.token : moved !== null; // unreadable then is only "same" when we saw nothing readable either
+          if (changed) { try { fs.linkSync(aside, lock); } catch { /* EEXIST: a newer holder exists and wins; never unlink `lock` */ } }
           try { fs.unlinkSync(aside); } catch { /* best effort */ }
-        } catch { /* another contender moved it */ }
+        }
         continue;
       }
       if (now() >= deadline) throw Error('review-head-index: lock busy (holder pid ' + (held?.pid ?? '?') + ')');
@@ -200,6 +205,9 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
  * owed:null + held:true means unknown (fail closed): hold the PR, do not treat it as nothing-owed.
  */
 const ACCEPT_HEAD = /^✅ review — accepted\r?\n/, CHANGES_HEAD = /^(?:🔁 )?(?:human )?review — changes requested\r?\n/;
+// Any other trusted daemon/operator control comment (re-arm, stand-down, escalation, hold, pause, load-flake, supersede, or an
+// unknown future hold): a symbol/emoji-led first line naming one of those. A later one withdraws an earlier accept.
+const CONTROL_HEAD = /^(?:[^\p{L}\p{N}\s]️?\s*)+[^\r\n]*?(?:conveyor|re-?armed?|stood down|stand[- ]?down|escalat|\bhold\b|\bheld\b|\bpaus|supersed)/iu;
 const MARKER_LINE = new RegExp(`^<!-- ${REVIEWED_SHA_MARKER}: ([0-9a-f]{40}) -->$`);
 /**
  * Seed for a pre-index PR: the latest trusted VERDICT comment, and only if it is accept-shaped (heading at byte 0) with a
@@ -213,12 +221,20 @@ export function seedFromReviewComments(comments) {
     const body = typeof c?.body === 'string' ? c.body : '';
     if (ACCEPT_HEAD.test(body)) latest = { kind: 'accept', body };
     else if (CHANGES_HEAD.test(body)) latest = { kind: 'changes', body };
+    else if (CONTROL_HEAD.test(body)) latest = { kind: 'control', body }; // re-arm / stand-down / escalation / hold: not an accept
   }
   if (latest?.kind !== 'accept') return null;
-  let fenced = false, found = null;
+  let open = null, found = null; // open = { ch, len } of the fence we are inside
   for (const line of latest.body.split(/\r?\n/).slice(0, 12)) {
-    if (/^\s*(```|~~~)/.test(line)) { fenced = !fenced; continue; }
-    if (fenced || /^\s*>/.test(line)) continue;
+    const f = /^\s*(`{3,}|~{3,})(.*)$/.exec(line);
+    if (open) {
+      // Close only on the same fence char, at least as long as the opener, with nothing after it but whitespace.
+      if (f && f[1][0] === open.ch && f[1].length >= open.len && f[2].trim() === '') open = null;
+      continue;
+    }
+    // A backtick fence's info string cannot contain a backtick (that is inline code, not a fence).
+    if (f && !(f[1][0] === '`' && f[2].includes('`'))) { open = { ch: f[1][0], len: f[1].length }; continue; }
+    if (/^\s*>/.test(line)) continue;
     const m = MARKER_LINE.exec(line);
     if (m) found = m[1];
   }

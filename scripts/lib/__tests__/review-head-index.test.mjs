@@ -177,6 +177,34 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     nodeFs.utimesSync(lock, new Date(0), new Date(0));
     expect(() => withHeadIndexLock(dir, () => 'old', { waitMs: 60, staleMs: 1 })).toThrow(/lock busy/);
   });
+  it('takeover: an owner that re-creates the lock between the dead-check and the rename keeps it (restored, fence passes)', () => {
+    const { lock } = headIndexPaths(dir);
+    nodeFs.mkdirSync(dir, { recursive: true });
+    writeFileSync(lock, JSON.stringify({ pid: 999999, token: 'dead', at: 0 }));
+    let swapped = false;
+    const fs = { ...nodeFs, renameSync: (a, b) => {
+      if (!swapped && a === lock) { swapped = true; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'live', at: Date.now() })); }
+      return nodeFs.renameSync(a, b);
+    } };
+    expect(() => withHeadIndexLock(dir, () => 'no', { fs, waitMs: 60 })).toThrow(/lock busy/);
+    expect(JSON.parse(readFileSync(lock, 'utf8')).token).toBe('live'); // the live owner's fence would still pass
+    expect(nodeFs.readdirSync(dir).filter(f => f.includes('.stale.'))).toEqual([]);
+  });
+  it('takeover: when a newer lock exists at restore time the newer holder wins and its lock is never unlinked', () => {
+    const { lock } = headIndexPaths(dir);
+    nodeFs.mkdirSync(dir, { recursive: true });
+    writeFileSync(lock, JSON.stringify({ pid: 999999, token: 'dead', at: 0 }));
+    let swapped = false, newer = false;
+    const fs = { ...nodeFs,
+      renameSync: (a, b) => {
+        if (!swapped && a === lock) { swapped = true; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'live', at: Date.now() })); }
+        return nodeFs.renameSync(a, b);
+      },
+      linkSync: (a, b) => { if (!newer) { newer = true; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'newest', at: Date.now() })); } return nodeFs.linkSync(a, b); } };
+    expect(() => withHeadIndexLock(dir, () => 'no', { fs, waitMs: 60 })).toThrow(/lock busy/);
+    expect(JSON.parse(readFileSync(lock, 'utf8')).token).toBe('newest');
+    expect(nodeFs.readdirSync(dir).filter(f => f.includes('.stale.'))).toEqual([]);
+  });
   it('releases the lock when the transaction throws', () => {
     const fs = { ...nodeFs, renameSync: () => { throw Error('crash'); } };
     expect(() => rec({ fs })).toThrow();
@@ -229,6 +257,24 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     expect(seedFromReviewComments(mk(`✅ review — accepted\n\nsee <!-- reviewed-sha: ${H(3)} --> here\n`))).toBeNull();
     expect(seedFromReviewComments(mk(`✅ review — accepted\n\n<!-- reviewed-sha: abc1234 -->\n`))).toBeNull();
     expect(seedFromReviewComments([])).toBeNull();
+    // a later control comment from a trusted author withdraws an earlier accept
+    for (const control of [
+      '🔧 conveyor fix — re-armed for re-review\n\nThe bounce was repaired.',
+      '🛑 conveyor fix — stood down, human judgment needed\n\nreason: needs-judgment',
+      '⏸ conveyor fix — paused for a concurrent author, re-arms on the next head\n',
+      '⏳ conveyor fix — fix ready, verify red only on host-load timeouts; re-verifies when the host is quiet\n',
+      '🚧 review on hold pending operator\n\nsome unknown future hold',
+    ]) expect(seedFromReviewComments([...mk(good), ...mk(control)])).toBeNull();
+    // ...but a control comment BEFORE the accept does not
+    expect(seedFromReviewComments([...mk('🛑 conveyor fix — stood down, human judgment needed\n'), ...mk(good)])).not.toBeNull();
+    // ...and an untrusted control comment does not
+    expect(seedFromReviewComments([...mk(good), { author: { login: 'rando' }, body: '🛑 conveyor fix — stood down\n' }])).not.toBeNull();
+    // fences: a ``` line inside a ~~~ block, and inside a 4-backtick block, does not close it
+    expect(seedFromReviewComments(mk(`✅ review — accepted\n\n~~~\n\`\`\`\n<!-- reviewed-sha: ${H(3)} -->\n~~~\n`))).toBeNull();
+    expect(seedFromReviewComments(mk(`✅ review — accepted\n\n\`\`\`\`\n\`\`\`\n<!-- reviewed-sha: ${H(3)} -->\n\`\`\`\`\n`))).toBeNull();
+    // a closer with an info string does not close; a proper longer closer does, so a marker after it is accepted
+    expect(seedFromReviewComments(mk(`✅ review — accepted\n\n\`\`\`\n\`\`\`js\n<!-- reviewed-sha: ${H(3)} -->\n\`\`\`\n`))).toBeNull();
+    expect(seedFromReviewComments(mk(`✅ review — accepted\n\n\`\`\`\ncode\n\`\`\`\`\n<!-- reviewed-sha: ${H(3)} -->\n`))).not.toBeNull();
     expect(headReviewOwed({ ...base, head: H(3), seed: null }).owed).toBe(true);
     expect(headReviewOwed({ index: { ok: false }, repo: 'o/r', pr: 5, head: H(3), seed })).toMatchObject({ owed: null, held: true });
   });
