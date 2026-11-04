@@ -47,9 +47,11 @@ export function resolveDrainReadsSource({ env = process.env, file, platform } = 
 const SLUG_TTL_MS = 60_000;
 const slugCache = new Map();
 /** `owner/repo` of the checkout's `origin` remote. A parse failure fails closed; GH_REPO must agree or be unset. */
-export function readOriginSlug(cwd, { env = process.env, git = (c) => execFileSync('git', ['-C', c, 'remote', 'get-url', 'origin'], { encoding: 'utf8', timeout: 20_000, stdio: ['ignore', 'pipe', 'pipe'] }), now = Date.now } = {}) {
+export function readOriginSlug(cwd, { env = process.env, remote = 'origin', git = (c) => execFileSync('git', ['-C', c, 'remote', 'get-url', remote], { encoding: 'utf8', timeout: 20_000, stdio: ['ignore', 'pipe', 'pipe'] }), now = Date.now } = {}) {
+  if (!/^[\w.-]+$/.test(String(remote))) throw new DrainReadError('repo-pin', 'origin-unreadable', 'invalid remote name');
   const dir = cwd || process.cwd();
-  const hit = slugCache.get(dir);
+  const key = `${dir}\0${remote}`;
+  const hit = slugCache.get(key);
   let slug = hit && now() - hit.at < SLUG_TTL_MS ? hit.slug : null;
   if (!slug) {
     let url;
@@ -57,7 +59,7 @@ export function readOriginSlug(cwd, { env = process.env, git = (c) => execFileSy
     const m = /^(?:https:\/\/(?:[^@/]+@)?github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/.exec(url);
     if (!m || m[1] === '.' || m[1] === '..' || m[2] === '.' || m[2] === '..') throw new DrainReadError('repo-pin', 'origin-unparseable', 'origin is not a github.com owner/repo URL');
     slug = `${m[1]}/${m[2]}`;
-    slugCache.set(dir, { slug, at: now() });
+    slugCache.set(key, { slug, at: now() });
   }
   const pinned = String(env.GH_REPO ?? '').trim().replace(/^(?:https?:\/\/)?github\.com\//, '');
   if (pinned && pinned.toLowerCase() !== slug.toLowerCase()) throw new DrainReadError('repo-pin', 'repo-mismatch', `GH_REPO ${pinned} is not origin ${slug}`);
@@ -75,9 +77,9 @@ const unreadable = (reason, now, detail = '') => ({ ok: false, reason, ...(detai
  * The REST transport, pinned to api.github.com (GH_HOST forced, GH_REPO/enterprise token dropped) and to the checkout's
  * origin owner/repo (`repo` optionally names the configured one and must agree). `read('json', path)` takes a
  * `repos/{owner}/{repo}/...` path and returns the typed result; it never throws. Each call has a deadline.
- * @param {{rest?:Function, cwd?:string, env?:object, slug?:string, repo?:string, git?:Function, timeoutMs?:number, deadlineAt?:number, now?:()=>number}} [o]
+ * @param {{rest?:Function, cwd?:string, env?:object, slug?:string, repo?:string, remote?:string, git?:Function, timeoutMs?:number, deadlineAt?:number, now?:()=>number}} [o]
  */
-export function createRestSource({ rest = ghRestGetJson, cwd, env = process.env, slug, repo, git, timeoutMs = DEFAULT_CALL_TIMEOUT_MS, deadlineAt, now = Date.now } = {}) {
+export function createRestSource({ rest = ghRestGetJson, cwd, env = process.env, slug, repo, remote = 'origin', git, timeoutMs = DEFAULT_CALL_TIMEOUT_MS, deadlineAt, now = Date.now } = {}) {
   return {
     read(kind, key) {
       if (kind !== 'json') return unreadable('unsupported-kind', now, kind);
@@ -85,7 +87,7 @@ export function createRestSource({ rest = ghRestGetJson, cwd, env = process.env,
       if (Number.isFinite(deadlineAt) && now() >= deadlineAt) return unreadable('deadline', now, 'overall deadline passed before the call');
       let pinned = slug;
       try {
-        pinned ??= readOriginSlug(cwd, { env, ...(git ? { git } : {}) });
+        pinned ??= readOriginSlug(cwd, { env, remote, ...(git ? { git } : {}) });
         if (repo && String(repo).toLowerCase() !== pinned.toLowerCase()) return unreadable('repo-mismatch', now, `configured ${repo} is not origin ${pinned}`);
       } catch (e) { return unreadable(e?.reason ?? 'repo-pin', now, e?.message); }
       const { GH_REPO: _r, GH_ENTERPRISE_TOKEN: _t, GITHUB_ENTERPRISE_TOKEN: _g, ...base } = env;
