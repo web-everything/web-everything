@@ -71,9 +71,12 @@ export async function main(argv, deps) {
     if (hasConflictingVerdict(verdict, lines)) throw new Error('conflicting verdict lines');
     const findings = lines.filter(line => line.trim()).map(clean);
     const result = { verdict, base, head, questionHash: QUESTION_HASH, findings };
+    // R503: store the head's net-diff fingerprint so the audit carries across a rebase/merge-of-main; unreadable = omitted.
+    let fingerprint = null;
+    try { fingerprint = (await deps.fingerprint?.(base, head)) || null; } catch { fingerprint = null; }
     try {
       await deps.appendRecord({ at: deps.now(), base, head, baseRef: flags.base,
-        questionHash: QUESTION_HASH, verdict, findings });
+        questionHash: QUESTION_HASH, verdict, findings, ...(fingerprint ? { fingerprint } : {}) });
     } catch {
       deps.stderr('Audit record write failed; repair the record path and retry.\n');
       return 3;

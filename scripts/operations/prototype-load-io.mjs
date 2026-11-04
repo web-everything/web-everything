@@ -19,6 +19,7 @@ import { cloneKey } from '../lib/daemon-overlays.mjs';
 import { clearPendingAdoption, recordPendingAdoption, OVERLAY_ADOPTION_MAX_PENDING, OVERLAY_ADOPTION_TTL_MS } from '../lib/overlay-adoption.mjs';
 import { isGraphSourceFile, isVitestTestFile } from '../lib/related-test-selection.mjs';
 import { safeRef, safeRegistrationRef, validSha, jsonLines, readyEvidence, canonicalAuditEvidence, changedPaths, comparePaths, nextMergeRef, refusal, resolveDaemonKey } from './prototype-load.mjs';
+import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
 import { planRetirements, planFetchFailed, resolveOriginRepository } from './prototype-retire.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -187,7 +188,7 @@ export function defaultDeps() {
     retirePlanner: defaultRetirePlanner };
 }
 export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, combinedTest, cloneKey: keyForClone = cloneKey,
-  retirePlanner = defaultRetirePlanner }) {
+  retirePlanner = defaultRetirePlanner, fingerprint = null }) {
   const expand = (p) => p.startsWith('~/') ? join(env.HOME, p.slice(2)) : p;
   const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return ''; throw e; } };
   const tool = settings || JSON.parse(read(join(repo, 'scripts/settings/prototype-load.json')));
@@ -262,6 +263,18 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
     return { files: [], conflicting: [], ...data.check, exit: result.code, wouldRegister: data.wouldRegister };
   };
   return async function load(input) {
+    // R503: the live head's net-diff fingerprint, computed once and only when some evidence for another sha stores one.
+    // Any git failure is no carry (null), never a throw.
+    let liveFpMemo;
+    const liveFingerprint = (evidence) => {
+      if (liveFpMemo !== undefined) return liveFpMemo;
+      if (!evidence.some((r) => r?.fingerprint && r.sha !== input.sha && r.head !== input.sha)) return null;
+      try {
+        requireGit('fetch', 'origin', 'main', input.branch);
+        liveFpMemo = (fingerprint || ((b, h) => netDiffFingerprint(repo, b, h, { exec })))('origin/main', input.sha) || null;
+      } catch { liveFpMemo = null; }
+      return liveFpMemo;
+    };
     const out = { ok: false, daemon: input.daemon, clone: null, cloneSource: null, registered: false, adopted: false,
       stopReason: null, branch: input.branch, sha: input.sha, effectiveRef: input.branch, effectiveSha: input.sha,
       dryRun: !!input.dryRun, stale: [], staleTolerated: [], removed: [], removedTips: {}, why: input.why || '',
@@ -350,7 +363,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         || !Number.isFinite(config.adoption.pollMs) || config.adoption.pollMs <= 0) return stop('bad-input', { detail: 'bad-adoption-settings', fallback: 'Fix adoption.timeoutMs and adoption.pollMs in scripts/settings/prototype-load.json.' });
       if (input.waitAdoptionMs !== undefined && input.waitAdoptionMs !== '' && (!Number.isFinite(Number(input.waitAdoptionMs)) || Number(input.waitAdoptionMs) < 0)) return stop('bad-input', { detail: 'bad-wait-adoption-ms', fallback: 'Pass --wait-adoption-ms as a number of milliseconds (0 returns right after registration; the cap is 160000).' });
       stage = 'no-ready';
-      out.gate = readyEvidence(jsonLines(read(expand(config.readyRecordPath))), input, config.ruledWeakened);
+      const readyRecords = jsonLines(read(expand(config.readyRecordPath)));
+      out.gate = readyEvidence(readyRecords, input, config.ruledWeakened, liveFingerprint([...readyRecords, ...(Array.isArray(config.ruledWeakened) ? config.ruledWeakened : [])]));
       if (out.gate?.ruledWeakened) console.warn(`WARNING: RULED-WEAKENED EXCEPTION ${out.gate.ruledWeakened.ruling}: loading ${input.branch}@${input.sha} despite audit WEAKENED. Disclosed findings: ${out.gate.ruledWeakened.findings.join(' | ')}`);
       if (!out.gate) return stop('no-ready', { detail: 'no-fix-ready-record', fallback: `No fix-ready record in ${config.readyRecordPath} matches ref=${input.branch} sha=${input.sha}. A record needs the fields {"ref":"${input.branch}","sha":"${input.sha}","tests":"green","audit":"NOT WEAKENED"}; write it after the scoped tests pass and the Codex audit says NOT WEAKENED, or pass --tests-run and --audit="NOT WEAKENED".` });
       stage = 'no-canonical-audit';
@@ -362,7 +376,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         if (!fetchedMain) { requireGit('fetch', 'origin', 'main'); fetchedMain = true; }
         return ancestor(base, 'origin/main');
       } catch { return false; } };
-      out.canonicalAudit = { mode, ...canonicalAuditEvidence(auditRecords, input.sha, covers) };
+      const liveFp = liveFingerprint(auditRecords);
+      out.canonicalAudit = { mode, ...canonicalAuditEvidence(auditRecords, input.sha, covers, liveFp) };
       if (!out.canonicalAudit.ok) {
         const fallback = `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load.`;
         if (mode === 'refuse') return stop('no-canonical-audit', { fallback });
