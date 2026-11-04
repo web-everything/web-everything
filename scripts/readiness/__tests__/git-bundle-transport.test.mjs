@@ -287,3 +287,10 @@ describe('R593 content scanner parity with the rsync path (R559)', () => {
     expect(await scanBundleRange({ cwd: lane, head: git(lane, 'rev-parse', 'HEAD'), prerequisite: runnerMain, exec })).toMatchObject({ path: 'blob.bin', finding: 'unsupported-text-encoding' });
   });
 });
+
+describe('R593 commit-message scanner parity (R559)', () => {
+  it('flags a secret assignment in a commit message', async () => {
+    await commit(lane, { 'ok.txt': 'ok\n' }, 'notes\npassword=actual-private-value');
+    expect(await scanBundleRange({ cwd: lane, head: git(lane, 'rev-parse', 'HEAD'), prerequisite: runnerMain, exec })).toMatchObject({ path: 'commit-message' });
+  });
+});

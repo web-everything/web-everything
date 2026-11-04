@@ -126,7 +126,9 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
   const messages = await git(['log', '-z', '--root', '--format=%an%n%ae%n%cn%n%ce%n%B', range]);
   if (messages.code !== 0) throw bundleError('bundle-credential-scan-failed');
   for (const message of splitNul(bytes(messages.stdout))) {
-    const finding = credentialTextFinding(message.toString('latin1')) ?? credentialTextFinding(message.toString('utf8'));
+    // Same scanner as blobs (secret assignments included); a message is plain text.
+    let finding = credentialTextFinding(message.toString('latin1')) ?? credentialTextFinding(message.toString('utf8'));
+    try { finding ??= credentialContentFinding(Buffer.from('commit-message.txt'), message); } catch { finding ??= 'content-scan-error'; }
     if (finding) return { path: 'commit-message', finding };
   }
   const tokens = splitNul(bytes(log.stdout));
