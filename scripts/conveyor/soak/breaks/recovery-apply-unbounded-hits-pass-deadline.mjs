@@ -14,7 +14,7 @@ export default {
   title: 'post-green recovery apply loop has no time budget or batch cap, so the pass deadline kills it mid-batch',
   card: 'backlog 4119 follow-up (2026-11-03 main red-to-green)',
   fixedBy: { sha: 'pending', where: 'lane/recovery-apply-budget', paths: ['scripts/conveyor/ci-red-recovery-watch.mjs'] },
-  fixPresent(root) { return readFileSync(join(root, 'scripts/conveyor/ci-red-recovery-watch.mjs'), 'utf8').includes('budgetExhausted'); },
+  fixPresent(root) { return readFileSync(join(root, 'scripts/conveyor/ci-red-recovery-watch.mjs'), 'utf8').includes('PROGRESS_FLOOR_PROBES'); },
   run() {
     const violations = [];
     const prs = [1, 2, 3, 4].map((n) => ({ number: 7000 + n, headRefName: `lane/soak${n}`, headRefOid: String(n).repeat(40), statusCheckRollup: [failing] }));
@@ -48,6 +48,18 @@ export default {
       apply: true, now: () => t3, applyBudgetMs: 150, maxApplyPerTick: 8,
     });
     if (!freeDefer.applied.some((a) => a.ok)) violations.push({ detail: 'a free deferral spent the progress floor and starved the later PRs' });
+    // Review round 3 of #6340: slow deferred refreshes (no write, but 35 s of network reads each) bypassed the time
+    // budget and the batch cap, so a run of them outlasted the 300 s pass deadline.
+    const many = Array.from({ length: 12 }, (_, i) => ({ number: 7100 + i, headRefName: `lane/slow${i}`, headRefOid: String(i % 9 + 1).repeat(40), statusCheckRollup: [failing] }));
+    let t4 = 0;
+    let calls = 0;
+    sweepCiRedRecovery({
+      readOpenPrs: () => many, readMainRuns: () => mainRuns, readAheadBy: () => 5, readComments: () => [],
+      refresh: () => { calls += 1; t4 += 35_000; return { deferred: true, ok: false, error: 'verification failed' }; },
+      postComment: () => {}, checkClaim: () => null, readPriority: () => null,
+      apply: true, now: () => t4, applyBudgetMs: 170_000, maxApplyPerTick: 8,
+    });
+    if (t4 >= 300_000 || calls > 5) violations.push({ detail: `${calls} slow deferred refreshes ran for ${t4 / 1000} s, past the 170 s budget` });
     return { violations };
   },
   judge(report) { return report.violations.map((v) => v.detail); },

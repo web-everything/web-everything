@@ -338,6 +338,47 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
     expect(refresh).toHaveBeenCalledWith('lane/f2636', expect.anything());
   });
 
+  // Review round 3 of #6340: deferred refreshes did no write but their network reads cost time, and they bypassed
+  // both the time budget and the batch cap, so a run of slow deferrals outlasted the 300 s pass deadline.
+  it('slow deferred refreshes stop at the time budget (the pass deadline is never reached)', () => {
+    const prs = Array.from({ length: 12 }, (_, i) => ({ ...PR_2635, number: 3000 + i, headRefName: `lane/s${i}` }));
+    let t = 0;
+    const refresh = vi.fn(() => { t += 35_000; return { deferred: true, ok: false, error: 'verification failed' }; });
+    const postComment = vi.fn();
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment, apply: true, now: () => t, applyBudgetMs: 170_000, maxApplyPerTick: 8,
+    });
+    expect(refresh).toHaveBeenCalledTimes(5); // 5 × 35 s = 175 s ≥ 170 s: no 6th call
+    expect(t).toBeLessThan(200_000);
+    expect(postComment).not.toHaveBeenCalled();
+    expect(result.applied).toHaveLength(12);
+    expect(result.applied.every((a) => a.deferred)).toBe(true);
+    expect(result.applied.slice(5).every((a) => a.budgetExhausted)).toBe(true);
+  });
+
+  it('instant deferred refreshes are still capped per tick (maxApplyPerTick × 2 refresh calls)', () => {
+    const prs = Array.from({ length: 30 }, (_, i) => ({ ...PR_2635, number: 3100 + i, headRefName: `lane/q${i}` }));
+    const refresh = vi.fn(() => ({ deferred: true, ok: false, error: 'not same-repo' }));
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment: vi.fn(), apply: true, now: () => 0, applyBudgetMs: 170_000, maxApplyPerTick: 8,
+    });
+    expect(refresh).toHaveBeenCalledTimes(16);
+    expect(result.applied).toHaveLength(30);
+  });
+
+  it('past the budget with discovery alone, only a bounded number of deferral probes run before a real refresh', () => {
+    const prs = Array.from({ length: 6 }, (_, i) => ({ ...PR_2635, number: 3200 + i, headRefName: `lane/p${i}` }));
+    let t = 0;
+    const refresh = vi.fn((branch) => (branch === 'lane/p5' ? { ok: true, action: 'rebased' } : { deferred: true, ok: false, error: 'x' }));
+    sweepCiRedRecovery({
+      readOpenPrs: () => { t += 200; return prs; }, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment: vi.fn(), apply: true, now: () => t, applyBudgetMs: 150, maxApplyPerTick: 8,
+    });
+    expect(refresh).toHaveBeenCalledTimes(3); // the floor is 3 probes, so the 4th+ PRs wait for the next tick
+  });
+
   it('never refreshes more than maxApplyPerTick PRs in one tick (post-green storm bound)', () => {
     const prs = [2635, 2636, 2637].map((number) => ({ ...PR_2635, number, headRefName: `lane/c${number}` }));
     const refresh = vi.fn(() => ({ ok: true, action: 'rebased' }));

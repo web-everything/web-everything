@@ -353,17 +353,23 @@ export function sweepCiRedRecovery({
 
   const applied = [];
   if (apply) {
-    let started = 0;
+    let started = 0; // refreshes that did work (they post a marker and spend the per-sha cap)
+    let probes = 0; // every refresh() call, deferred or not: a deferral does no write but its network reads cost time
+    const maxProbes = maxApplyPerTick * PROBES_PER_APPLY_SLOT;
     for (const d of plan.dispatch) {
-      // Progress floor: the first refresh of a tick always starts. Discovery (per-PR comment reads) can by itself
-      // outlast the budget; without the floor every tick would defer everything and the queue would never drain.
-      if (started >= maxApplyPerTick || (started >= 1 && now() - tickStartedAt >= applyBudgetMs)) {
+      // Progress floor: while nothing has started yet, a few refresh calls are allowed past the budget. Discovery
+      // (per-PR comment reads) can by itself outlast the budget; without the floor every tick would defer everything
+      // and the queue would never drain. The floor is a bounded number of PROBES, not one start, so a free deferral
+      // cannot spend it (round 2 of #6340) yet a run of slow deferrals cannot outlast it either (round 3).
+      const floorOpen = started === 0 && probes < PROGRESS_FLOOR_PROBES;
+      if (started >= maxApplyPerTick || probes >= maxProbes || (now() - tickStartedAt >= applyBudgetMs && !floorOpen)) {
         applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, ok: false, action: 'deferred', deferred: true, budgetExhausted: true,
           error: 'tick apply budget spent — left for the next tick (no rebase comment posted, the per-sha cap is untouched)' });
         continue;
       }
       const held = checkClaim({ repo, branch: d.headRefName });
       // Passing prNumber makes refreshOntoMain verify the PR is same-repo before it rebases and force-pushes.
+      if (!held) probes += 1;
       const result = held ? { ok: false, error: held.message }
         : refresh(d.headRefName, { base: `origin/${defaultBranch}`, root: repoRoot, prNumber: d.prNumber, repo, readIsCrossRepository });
       // 2026-10-10 live: #4784 claim-held refusals burned the cap. A failed push re-reads the claim store (the push
@@ -1665,6 +1671,11 @@ function parseFlags(argv) {
   }
   return flags;
 }
+
+/** Refresh calls allowed past the time budget while none has started yet (the starvation floor, bounded). */
+const PROGRESS_FLOOR_PROBES = 3;
+/** Total refresh calls (deferred included) per tick = maxApplyPerTick × this; bounds slow deferral runs. */
+const PROBES_PER_APPLY_SLOT = 2;
 
 /** we:scripts/conveyor/ci-red-recovery-watch.mjs#resolveApplyBudgetMs — how long (from the tick's start) the apply
  *  loop may keep STARTING refreshes. The pass deadline is 300 s and three more passes follow, so default 170 s. */
