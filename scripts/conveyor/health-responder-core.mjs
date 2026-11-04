@@ -40,6 +40,7 @@ export const OBSERVATION_ONLY = Object.freeze({
   "fix-claim-held-no-progress": "A slow fix claim is not proof of a stuck holder; report only, never release the claim or push to the branch.",
   "fixer-stuck": "Never kill the fixer or release its claim from the responder; the session watchdog and reaper own the stuck-session path.",
   "fixer-verify-never-settles": "Never reset/re-request a marker or kill a waiter; fix the verify-daemon pass that is not dispatching.",
+  "forge-share-below-target": "Fallback to local runs is fixed via the named fallback reasons through normal delivery; the responder never reroutes runs, raises the Forge target or edits heavy admission.",
   "gh-call-failures": "Inhibit responder GitHub actions, honor existing throttle; do not amplify failed writes.",
   "gh-graphql-budget": "Inhibit GitHub actions until the existing budget read permits them; no new poll/retry loop.",
   "build-session-idle": "Silence does not prove death; detection only. The owning watchdog/reaper alone acts on the worker, never the responder.",
