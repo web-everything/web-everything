@@ -707,7 +707,7 @@ let baseCandidate = null;
 let baseFailures = null;
 // The final exit code alone cannot say whether a 124 came from an unconfirmed remote attempt; the phases recorded it.
 const infrastructureNow = (exitCode, signal, failureDetails) => verificationInfrastructureFailure({ exitCode, signal, failureDetails }) ?? (remoteUnconfirmed ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null);
-async function runGate(command, args, { forgeDispatch = false } = {}) {
+async function runGate(command, args, { forgeDispatch = false, timeoutMs } = {}) {
   const reportDir = mkdtempSync(join(tmpdir(), 'verify-remote-report-'));
   const reportFile = join(reportDir, 'report.jsonl');
   const childEnv = { ...process.env, WE_VERIFY_REMOTE_REPORT: reportFile };
@@ -769,7 +769,7 @@ async function runGate(command, args, { forgeDispatch = false } = {}) {
       else Promise.resolve(stopped).then(() => resolveGate(result));
     };
     const watchdog = Number.isInteger(child.pid) ? startTreeWatchdog({
-      pid: child.pid, timeoutMs: PHASE_TIMEOUT_MS,
+      pid: child.pid, timeoutMs: timeoutMs ?? PHASE_TIMEOUT_MS,
       kill: { orphansOfOwnGroup: true, marker: phaseMarker, outputFds: [child.stdout?._handle?.fd, child.stderr?._handle?.fd].filter((fd) => Number.isInteger(fd) && fd > 2) },
       ...(currentAdmission.ok ? { heartbeat: { module: HEAVY_ADMISSION_MODULE, exportName: 'heartbeatOwnedSlot', args: { lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO }, everyMs: SLOT_HEARTBEAT_MS } } : {}),
       onFire: () => {
@@ -806,7 +806,7 @@ function recordOutcome(key, outcome) {
   outcomes[key] = outcome;
 }
 // `outcomeKey` separates the always-run guard's outcome from the scanners' (it shares the `scan` admission kind).
-async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
+async function timedRunGate(phase, command, args, { outcomeKey, timeoutMs } = {}) {
   const kind = phase?.replace(/Ms$/, '');
   let acquired = null;
   if (firstPhaseAdmission) acquired = firstPhaseAdmission;
@@ -834,7 +834,7 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
   try {
     // Admission may span the whole gate; a command rewrite belongs only to this phase.
     const plan = phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: currentAdmission.remote === true } });
-    let result = await runGate(args ? command : plan.command, args, { forgeDispatch: !plan.takeLocalSlot });
+    let result = await runGate(args ? command : plan.command, args, { forgeDispatch: !plan.takeLocalSlot, ...(timeoutMs ? { timeoutMs } : {}) });
     if (shouldConfirmRemoteRed({ plan, ...result })) {
       process.stderr.write(`verify-lane: remote phase red (exit ${result.exitCode}) - confirming locally\n`);
       process.stderr.write(`\n⏳ gate queueing for admission (phase: ${kind})${MARKER_NONCE_SUFFIX}\n`);
@@ -844,7 +844,7 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
       startHeartbeat();
       // Run the original command. One confirmation only;
       // its verdict and failure inventory replace the remote result before isolated retry.
-      result = { ...await runGate(command, args), ranOn: { location: 'local', remoteRedConfirmedLocally: true } };
+      result = { ...await runGate(command, args, ...(timeoutMs ? [{ timeoutMs }] : [])), ranOn: { location: 'local', remoteRedConfirmedLocally: true } };
     }
     // A nested local fallback owns its admission; its local verdict has the same retry safeguards.
     if (kind === 'vitest') vitestAdmittedLocally = currentAdmission.ok
@@ -912,7 +912,7 @@ const alwaysRun = retryableGate
   : { command: null, declared: [], files: [], skipped: [] };
 const continueAfter = (r) => r.exitCode === 0 || (runAllPhases && !r.signal && !verificationInfrastructureFailure(r));
 try {
-  let result = explicitSegments ? await runGateSegments(explicitSegments, segment => timedRunGate(null, segment)) : await timedRunGate(retryableGate ? 'vitestMs' : null,
+  let result = explicitSegments ? await runGateSegments(explicitSegments, (segment, { timeoutMs } = {}) => timedRunGate(null, segment, undefined, { timeoutMs }), { budgetMs: PHASE_TIMEOUT_MS }) : await timedRunGate(retryableGate ? 'vitestMs' : null,
     // Item 59 (b) — a recognized default gate with a non-`vitest related` test half (`npm test`, a skipped-vitest echo)
     // runs the plan resolved under THIS (the daemon's) standards policy, not the requester's stamped command.
     // `GATE` stays the marker's `suites`, so the cache key still matches.
@@ -936,6 +936,7 @@ try {
       isolatedRetry = result.exitCode === 0 && !result.signal ? FLAKY_OUTSIDE_DIFF : STILL_RED_IN_ISOLATION;
     }
   }
+  if (result?.budgetExhausted && !phaseTimeout) phaseTimeout = { phase: 'gate', ceilingMs: PHASE_TIMEOUT_MS };
   phaseResults.push({ phase: 'vitest', result });
   // #3887 — the repo-scanning tests `vitest related` cannot select, scoped to the changed files (each command carries
   // its own VERIFY_SCAN_FILES). Before check:standards, so a scanner failure is reported with the tests.

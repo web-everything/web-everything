@@ -146,10 +146,18 @@ function rewriteShardWrapperSegment(segment) {
 }
 
 // Strict `&&`: run each segment in turn; the first nonzero exit or signal stops the rest and is the result.
-export async function runGateSegments(segments, run) {
+// The segments share ONE deadline (`budgetMs`, the single-phase ceiling a whole gate had before the split): each gets
+// the time remaining as `timeoutMs`, and once it is spent the rest is not run and the result is a timeout.
+export async function runGateSegments(segments, run, { budgetMs, now = Date.now } = {}) {
+  const startedAt = now();
   let last = null;
   for (const segment of segments) {
-    last = await run(segment);
+    const remaining = Number.isFinite(budgetMs) ? Math.floor(budgetMs - (now() - startedAt)) : undefined;
+    if (remaining !== undefined && remaining <= 0) {
+      return { exitCode: 124, signal: 'SIGKILL', timedOut: true, budgetExhausted: true, remoteAttempt: false,
+        ranOn: last?.ranOn ?? { location: 'local' }, failureDetails: last?.failureDetails, output: null };
+    }
+    last = await run(segment, remaining === undefined ? {} : { timeoutMs: remaining });
     if (last.exitCode !== 0 || last.signal) return last;
   }
   return last;
