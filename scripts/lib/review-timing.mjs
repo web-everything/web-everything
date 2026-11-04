@@ -140,8 +140,9 @@ function registeredStartGate({ headSha, checks, requiredChecks }) {
   const latest = new Map(collapseRollupToLatestPerName(checks).map(row => [row?.name ?? row?.context, row]));
   // Same implication rule as the strict gate: a green aggregate (test) proves a split-out job (integration). The
   // strict gate reads a legacy commit status (`{context, state}`) as a check row first, so a green STATUS aggregate
-  // implies too; the per-row judgment below reads the raw row, which already handles `state`.
-  const asCheckRow = row => row && typeof row === 'object' && row.status == null && row.conclusion == null
+  // implies too; the per-row judgment below reads the raw row, which already handles `state`. Only a row with NO
+  // `status` key is a status (as review-ci-gate.mjs#statusAsCheckRow): `status: null` stays raw and implies nothing.
+  const asCheckRow = row => row && typeof row === 'object' && row.status === undefined && row.conclusion == null
     && typeof row.state === 'string' && row.state.toLowerCase() === 'success'
     ? { ...row, status: 'completed', conclusion: 'success' } : row;
   const affected = [...new Set(withoutImpliedRequiredChecks(requiredChecks, [...latest.values()].map(asCheckRow)))].flatMap(name => {

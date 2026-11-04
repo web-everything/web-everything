@@ -29,6 +29,11 @@ describe('pending-CI start policy', () => {
       const result = reviewStartGate({ headSha: head, requiredChecks, checks: [{ context: 'test', state }], policy: policy('shadow') });
       expect(result.allowed).toBe(false);
     });
+    it.each(['shadow', 'on'])('a status row carrying status:null is not normalized, as in the strict gate (startEarly=%s)', startEarly => {
+      const checks = [{ context: 'test', state: 'success', status: null }];
+      expect(reviewCiGate({ headSha: head, checks, requiredChecks }).allowed).toBe(false);
+      expect(reviewStartGate({ headSha: head, requiredChecks, checks, policy: policy(startEarly) }).allowed).toBe(false);
+    });
   });
   it('off preserves the exact pre-early-start ci-green refusal for completed red CI', () => {
     expect(reviewStartGate({ headSha: head, requiredChecks: ['test'], checks: [check('test', 'failure')],
