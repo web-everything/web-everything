@@ -127,11 +127,16 @@ export function main(args, io = {}) {
   }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  try { main(process.argv.slice(2)); }
+/** CLI wrapper: returns the exit code; error text is JSON-quoted so filenames/control text stay inert. */
+export function runCli(args, io = {}) {
+  const { err = text => process.stderr.write(text), ...rest } = io;
+  try { main(args, rest); return 0; }
   catch (error) {
-    // JSON quoting keeps any filename/control text inert in terminal diagnostics.
-    process.stderr.write(JSON.stringify(error.message) + '\n');
-    process.exitCode = 1;
+    err(JSON.stringify(error.message) + '\n');
+    return 1;
   }
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  process.exitCode = runCli(process.argv.slice(2));
 }

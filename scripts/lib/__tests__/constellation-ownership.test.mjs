@@ -6,7 +6,7 @@ import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'n
 import { dirname, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { classify, existingTrackedPaths, main, totals } from '../constellation-ownership.mjs';
+import { classify, existingTrackedPaths, runCli, totals } from '../constellation-ownership.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const map = JSON.parse(readFileSync(resolve(root, 'config/constellation-ownership.json'), 'utf8'));
@@ -94,7 +94,10 @@ describe('constellation ownership', () => {
     expect(result.files.map(file => file.path)).toEqual(tracked);
     expect(result.totals).toEqual(baselineTotals);
     expect(result.reclassified.length).toBeGreaterThan(0);
-    await expect(run(['invalid'])).rejects.toThrow();
+    // Cheap usage-error child: the real shim's exit status and JSON-quoted stderr.
+    await expect(run(['invalid'])).rejects.toMatchObject({
+      code: 1, stderr: '"Usage: node scripts/lib/constellation-ownership.mjs classify [--json]"\n',
+    });
   });
 
   it.each(['existing', 'missing'])('counts stored symlink text without following an %s target', targetState => {
@@ -114,21 +117,27 @@ describe('constellation ownership', () => {
 
   it.each(['ENOENT', 'ENOTDIR', 'EACCES'])('handles working-tree inventory errors in the CLI (%s)', code => {
     // In-process on a small fixture list; lstat is injected so no child or preload is needed.
+    // Deleted path is one the map reclassifies, so dropping it must also drop it from `reclassified`.
     const listed = ['AGENTS.md', 'backlog/x.md', 'scripts/gen-inventory.mjs'];
-    const deleted = 'backlog/x.md';
+    const deleted = 'scripts/gen-inventory.mjs';
+    expect(classify(listed, map).reclassified.some(file => file.path === deleted)).toBe(true);
     const lstat = path => {
       if (path === deleted) throw Object.assign(new Error('simulated unstaged deletion'), { code });
     };
     let out = '';
-    const run = () => main(['classify', '--json'], {
-      root, listTracked: () => listed, lstat, read: () => Buffer.from('a\n'), out: text => { out += text; },
+    let err = '';
+    const run = () => runCli(['classify', '--json'], {
+      root, listTracked: () => listed, lstat, read: () => Buffer.from('a\n'),
+      out: text => { out += text; }, err: text => { err += text; },
     });
     if (code === 'EACCES') {
-      expect(run).toThrow('simulated unstaged deletion');
+      expect(run()).toBe(1);
+      expect(err).toBe('"simulated unstaged deletion"\n');
       expect(out).toBe('');
       return;
     }
-    run();
+    expect(run()).toBe(0);
+    expect(err).toBe('');
     const result = JSON.parse(out);
     const remaining = listed.filter(path => path !== deleted);
     expect(result.files.map(file => file.path)).toEqual(remaining);
