@@ -1,0 +1,79 @@
+# Trusted merge-group and main-push suites run on persistent Hetzner runners.
+# Runner labels: [self-hosted, hetzner, we]; the runner hook wipes the workspace.
+# Required checks stay in their hosted workflows: ci.yml (test, smoke, daemon-soak),
+# soak-replay-gate.yml and merge-gate.yml.
+# Called jobs appear as hetzner / test-shard (N) and hetzner / integration;
+# those are not required contexts.
+name: Forge whole-suite proto (R568 trial branch only, not required)
+
+on:
+  push:
+    branches: [lane/forge-ci-proto-whole]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  whole-suite:
+    runs-on: [self-hosted, hetzner, we]
+    timeout-minutes: 40
+    steps:
+      # Sibling layout under $GITHUB_WORKSPACE so WE's `../frontierui` resolves — both the vitest/vite
+      # `@frontierui/*` alias (dev/test-time; `we:vitest.config.ts` → `../frontierui/plugs`) AND the pinned
+      # component-render CLI the gate/build call. #2165 (single-repo CI has neither the sibling nor a
+      # published `@frontierui/*` package), mirroring the #1137 deploy.yml workaround:
+      #   $GITHUB_WORKSPACE/web-everything  (this repo)
+      #   $GITHUB_WORKSPACE/frontierui      (the sibling)
+      - name: Checkout WE
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: web-everything
+          persist-credentials: false
+          # Fetch branch history during authenticated checkout; later steps have no stored token.
+          fetch-depth: 0 # tests that shell check-standards need origin/main history for the backlog scope guards
+      - name: Mint FUI read token (GitHub App)
+        id: fui-app-token
+        if: ${{ (vars.WE_APP_ID != '') }}
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.WE_APP_ID }}
+          private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}
+          owner: frontier-ui
+          repositories: frontierui
+          permission-contents: read
+      - name: Checkout FUI (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: frontier-ui/frontierui
+          token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
+          path: frontierui
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            web-everything/package-lock.json
+            frontierui/package-lock.json
+
+      # FUI first (ratified #1946/#2016 ordering): install its deps (the `@frontierui/*` alias resolves to
+      # sibling source that imports them) + build the pinned component-render CLI the gate/build call.
+      - name: Install + build FUI tools
+        working-directory: frontierui
+        run: |
+          npm ci
+          npm run build:tools
+
+      - name: Install
+        working-directory: web-everything
+        run: npm ci
+
+      - name: Whole unit suite, single runner, 24 threads, no coverage
+        working-directory: web-everything
+        run: |
+          uptime
+          npx vitest run --pool=threads --poolOptions.threads.maxThreads=24 --reporter=default $(node scripts/ci/quarantine-skip.mjs)
+          uptime
