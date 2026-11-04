@@ -37,7 +37,7 @@ const USAGE = `Usage: node scripts/worker-brief.mjs --purpose=<slug> --files=a,b
   --files=a,b             Required allowed files; bare paths receive we:
   --edge-clone=<path>     Include daemon overlay and adoption instructions
   --proof=<text>          Override the live before/after proof requirement
-  --prep-file=<path>      Red-team prep/acceptance text before the worker rules (fail open)
+  --prep-file=<path>      Red-team prep/acceptance file (regular file, max 128 KiB; pipes refused; fail open)
   --repo=we|plateau-app   Lane repository (default: we)
   --owner=<token>         Scope-registry owner token (default: fresh per brief, so two workers with one slug stay apart)
   --report-lines=N        Positive report line limit (default: 8)

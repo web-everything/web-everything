@@ -1,5 +1,5 @@
 /** Bounded, advisory red-team of a sensitive worker brief before implementation. */
-import { readFileSync, statSync } from 'node:fs';
+import { openSync, fstatSync, readSync, closeSync, constants } from 'node:fs';
 import { isGuardPath } from './round-judge.mjs';
 import { readSettings } from './settings-files.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
@@ -22,20 +22,32 @@ export function isBriefRedTeamTouchSet(files = []) {
   });
 }
 
-const MAX_PREP_BYTES = 1024 * 1024;
+const MAX_PREP_BYTES = 128 * 1024;
+const FS = { openSync, fstatSync, readSync, closeSync };
 
 /**
- * Read prep text from a regular file only. A FIFO, tty, socket or directory (e.g. an open
- * `/dev/stdin` pipe) can block a synchronous read until EOF, so it is refused before opening.
+ * Read prep text from a regular file only (pipes, ttys and directories such as an open `/dev/stdin`
+ * are refused). Opens with O_NONBLOCK so a FIFO swapped in after any check cannot block the open,
+ * checks the opened descriptor (no stat-then-reopen race) and reads at most maxBytes+1 bytes, so a
+ * file whose reported size lies or grows cannot exceed the cap.
  */
-export function readPrepFile(file, { maxBytes = MAX_PREP_BYTES } = {}) {
-  const info = statSync(file);
-  if (!info.isFile()) throw new Error('--prep-file must be a regular file (pipes, ttys and directories are refused)');
-  if (info.size > maxBytes) throw new Error(`--prep-file exceeds ${maxBytes} bytes`);
-  return readFileSync(file, 'utf8');
+export function readPrepFile(file, { maxBytes = MAX_PREP_BYTES, fs = FS } = {}) {
+  const fd = fs.openSync(file, constants.O_RDONLY | constants.O_NONBLOCK);
+  try {
+    if (!fs.fstatSync(fd).isFile()) throw new Error('--prep-file must be a regular file (pipes, ttys and directories are refused)');
+    const buffer = Buffer.alloc(maxBytes + 1);
+    let length = 0;
+    while (length < buffer.length) {
+      const read = fs.readSync(fd, buffer, length, buffer.length - length, null);
+      if (read === 0) break;
+      length += read;
+    }
+    if (length > maxBytes) throw new Error(`--prep-file exceeds ${maxBytes} bytes`);
+    return buffer.toString('utf8', 0, length);
+  } finally { fs.closeSync(fd); }
 }
 
-/** Await a read that may be async, failing after timeoutMs so a stalled source cannot stall the brief. */
+/** Await a possibly-async reader, failing after timeoutMs (bounds injected async readers only; readPrepFile is synchronous and bounded by its own checks). */
 export async function boundedRead(read, timeoutMs) {
   let timer;
   try {

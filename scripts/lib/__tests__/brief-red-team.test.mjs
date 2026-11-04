@@ -118,6 +118,23 @@ describe('readPrepFile (bounded, regular files only)', () => {
       expect(() => readPrepFile(path.join(dir, 'nope'))).toThrow();
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
+  it('caps bytes actually read when fstat reports size 0 (procfs-style or growing file)', () => {
+    const reads = [];
+    const fsOps = {
+      openSync: () => 7, closeSync: vi.fn(),
+      fstatSync: () => ({ isFile: () => true, size: 0 }),
+      readSync: (fd, buf, off, len) => { reads.push(len); buf.fill(0x61, off, off + len); return len; },
+    };
+    expect(() => readPrepFile('/x', { maxBytes: 64, fs: fsOps })).toThrow(/exceeds 64 bytes/);
+    expect(reads.reduce((a, b) => a + b, 0)).toBe(65);
+    expect(fsOps.closeSync).toHaveBeenCalledWith(7);
+  });
+  it('checks the opened descriptor, not the path, so a path swapped to a FIFO after open is not read', () => {
+    const fsOps = { openSync: () => 9, closeSync: vi.fn(), readSync: vi.fn(), fstatSync: () => ({ isFile: () => false }) };
+    expect(() => readPrepFile('/x', { fs: fsOps })).toThrow(/regular file/);
+    expect(fsOps.readSync).not.toHaveBeenCalled();
+    expect(fsOps.closeSync).toHaveBeenCalledWith(9);
+  });
   it('rejects an oversized file', () => {
     const dir = tmp();
     const file = path.join(dir, 'big.md');
