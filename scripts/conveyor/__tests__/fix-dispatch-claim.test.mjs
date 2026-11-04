@@ -815,6 +815,31 @@ describe('idle-claim auto-release (R201)', () => {
     expect(released).toBe(0);
   });
 
+  // The explicit sessionId binding guarantee: a claim that carries a sessionId is bound by that id ALONE; the
+  // start-time fallback applies only to claims without one.
+  it.each([
+    ['row with the SAME sessionId releases even though it started before the claim (id wins over start time)',
+      { sessionId: 'S1', startedAt: T0 - 3_600_000 }, 1],
+    ['row with a DIFFERENT sessionId never releases even though it started after the claim',
+      { sessionId: 'S2', startedAt: T0 + 1000 }, 0],
+    ['row with no sessionId never releases a sessionId-bound claim, however recent its start',
+      { startedAt: T0 + 1000 }, 0],
+  ])('sessionId-bound claim: %s', (_n, extraRow, expectedReleases) => {
+    expect(acquireFixDispatchClaim({ repo: 'we', pr: 5996, kind: 'fix', headSha: 'sha1', owner: 'A', sessionId: 'S1',
+      lockRoot: claimRoot, nowMs: T0, nowIso: iso(T0), leaseMinutes: 10 }).ok).toBe(true);
+    expect(readFixDispatchClaim({ repo: 'we', pr: 5996, kind: 'fix', lockRoot: claimRoot }).meta.sessionId).toBe('S1');
+    const rows = () => [{ name: 'fix-5996', state: 'working', status: 'idle', ...extraRow }];
+    let released = 0;
+    for (let t = T0 + 60_000; t <= T0 + 60_000 + 2 * IDLE_MS; t += 120_000) {
+      released += (refreshLiveFixDispatchClaims({
+        lockRoot: claimRoot, listAgentsAll: rows, hungInfoFor: () => null, awaitingVerifyFor: null, activityMsFor: () => 0,
+        prHeadFor: () => 'sha1', recordEvent: () => {}, nowIso: () => iso(t),
+        idleRelease: resolveIdleClaimRelease({ env: {}, platform: null }),
+      }).released ?? []).length;
+    }
+    expect(released).toBe(expectedReleases);
+  });
+
   it.each([
     ['transcript touched inside the idle window', () => T0 + 60_000 + 25 * 60_000],
     ['transcript silent 60 min (long tool call, inside the 90 min grace)', () => T0],
