@@ -6,7 +6,7 @@
 import { describe, it, expect } from 'vitest';
 import { mkdtempSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { execFileSyncThrottled } from '../gh-throttle.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -631,6 +631,7 @@ describe('R559 safety reads never reuse a cache: the gh env is an allowlist', ()
     writeFileSync(gh, `#!/bin/sh\nn=$(cat '${counter}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${counter}'\nprintf 'HTTP/2.0 200 OK\\r\\n\\r\\n{"object":{"sha":"%040d"}}' $n\n`);
     chmodSync(gh, 0o755);
     const saved = { memo: process.env.WE_GH_READ_MEMO_DIR, root: process.env.WE_GH_THROTTLE_LOCK_ROOT };
+    mkdirSync(join(dir, 'memo')); // the memo never creates its own directory
     process.env.WE_GH_READ_MEMO_DIR = join(dir, 'memo');
     process.env.WE_GH_THROTTLE_LOCK_ROOT = join(dir, 'locks');
     try {

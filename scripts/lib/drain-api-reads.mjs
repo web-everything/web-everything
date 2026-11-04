@@ -10,6 +10,7 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { ghRestGetJson } from './gh-rest-read.mjs';
+import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { readSettings } from './settings-files.mjs';
 import { platformPreference, resolveCascade } from './policy-cascade.mjs';
 
@@ -79,7 +80,21 @@ const unreadable = (reason, now, detail = '') => ({ ok: false, reason, ...(detai
  * `repos/{owner}/{repo}/...` path and returns the typed result; it never throws. Each call has a deadline.
  * @param {{rest?:Function, cwd?:string, env?:object, slug?:string, repo?:string, remote?:string, git?:Function, timeoutMs?:number, deadlineAt?:number, now?:()=>number}} [o]
  */
-export function createRestSource({ rest = ghRestGetJson, cwd, env = process.env, slug, repo, remote = 'origin', git, timeoutMs = DEFAULT_CALL_TIMEOUT_MS, deadlineAt, now = Date.now } = {}) {
+// The gh environment of a safety read is built from an ALLOWLIST: token, host, and throttle settings only. Cache, memo, replay
+// and binary-override variables (WE_GH_READ_MEMO_DIR, WE_GH_ETAG_*, WE_FINISHED_CI_CACHE_DIR, WE_GH_THROTTLE_GH_BIN, ...) are
+// never inherited: a memoized answer has no expiry, so an old unfrozen tip could outlive a published freeze.
+const ENV_ALLOW = new Set(['PATH', 'HOME', 'XDG_CONFIG_HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'GH_CONFIG_DIR', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_CALLER',
+  'WE_GH_AUTH_TOKEN_HASH', 'WE_GH_AUTH_INSTALLATION', 'WE_GH_AUTH_SOURCE']);
+export function pinnedGhEnv(env = process.env) {
+  const out = {};
+  for (const [k, v] of Object.entries(env ?? {})) {
+    if (v === undefined) continue;
+    if (ENV_ALLOW.has(k) || (/^WE_GH_THROTTLE_/.test(k) && k !== 'WE_GH_THROTTLE_GH_BIN')) out[k] = v;
+  }
+  return { ...out, GH_HOST: 'github.com' };
+}
+
+export function createRestSource({ rest, exec = execFileSyncThrottled, cwd, env = process.env, slug, repo, remote = 'origin', git, timeoutMs = DEFAULT_CALL_TIMEOUT_MS, deadlineAt, now = Date.now } = {}) {
   return {
     read(kind, key) {
       if (kind !== 'json') return unreadable('unsupported-kind', now, kind);
@@ -90,11 +105,13 @@ export function createRestSource({ rest = ghRestGetJson, cwd, env = process.env,
         pinned ??= readOriginSlug(cwd, { env, remote, ...(git ? { git } : {}) });
         if (repo && String(repo).toLowerCase() !== pinned.toLowerCase()) return unreadable('repo-mismatch', now, `configured ${repo} is not origin ${pinned}`);
       } catch (e) { return unreadable(e?.reason ?? 'repo-pin', now, e?.message); }
-      const { GH_REPO: _r, GH_ENTERPRISE_TOKEN: _t, GITHUB_ENTERPRISE_TOKEN: _g, ...base } = env;
-      const cleanEnv = { ...base, GH_HOST: 'github.com' };
+      const cleanEnv = pinnedGhEnv(env);
+      // gh-throttle's read memo is keyed off throttle.env (default process.env), not the child env: hand it the allowlisted env too.
+      const pinnedExec = (file, args, opts = {}) => exec(file, args, { ...opts, throttle: { ...opts.throttle, env: cleanEnv } });
       let res;
       try {
-        res = rest(key.replace('{owner}/{repo}', pinned), {
+        res = (rest ?? ghRestGetJson)(key.replace('{owner}/{repo}', pinned), {
+          ...(rest ? {} : { exec: pinnedExec }),
           env: cleanEnv, context: `${pinned}@${cwd ?? ''}`,
           execOpts: { ...(cwd ? { cwd } : {}), env: cleanEnv, timeout: timeoutMs },
         });
