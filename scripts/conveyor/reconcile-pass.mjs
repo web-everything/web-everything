@@ -1471,9 +1471,12 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch })
         const absent = withoutImpliedRequiredChecks(requiredChecks ?? [], rows).filter(name => !rows.some(row => row.name === name));
         const observed = collapseRollupToLatestPerName(rows).some(row => (!requiredChecks?.length || requiredChecks.includes(row.name))
           && (row.status.toLowerCase() !== 'completed' || FAILING_CONCLUSIONS.includes(row.conclusion?.toLowerCase())));
+        // `startedAt`: a feed that never projected `started_at` must not read as "never started" — an unread
+        // field is kept as an unparseable marker so `checksNotYetRun` (a queued rerun guard) fails closed.
         cache.set(key, { rows: rows.map(row => ({ ...row, status: row.status.toUpperCase(),
           detailsUrl: row.detailsUrl ?? row.details_url ?? row.html_url ?? null,
-          conclusion: row.conclusion?.toUpperCase() ?? null, completedAt: row.completed_at ?? null })),
+          conclusion: row.conclusion?.toUpperCase() ?? null, completedAt: row.completed_at ?? null,
+          startedAt: Object.hasOwn(row, 'started_at') ? (row.started_at ?? null) : 'unread' })),
         ...(absent.length && !observed ? { incomplete: `missing required checks: ${absent.join(', ')}` } : {}) });
       } catch (error) { cache.set(key, { error: String(error?.message ?? error) }); }
     }

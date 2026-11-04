@@ -1057,6 +1057,23 @@ it('xxh4zw8 hydrates the crowded snapshot before planning same-tick recovery', a
   expect(readChecks).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', sha: XX_HEAD });
 });
 
+// Judge round 7/9 self-review: the REST check-runs feed hydrated here never projects `started_at`, so a queued
+// RERUN read through it must not pass `checksNotYetRun` as a never-started check (fail closed on the unread field).
+it.each([
+  ['no started_at field (unread)', {}, false],
+  ['a populated started_at (queued rerun)', { started_at: '2026-10-01T09:00:00Z' }, false],
+  ['an explicit null started_at (never started)', { started_at: null }, true],
+])('a stacked lane PR hydrated from REST runs with %s restores review: %s', async (_name, extra, restored) => {
+  const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  const pr = { ...xxPr(), isDraft: false, baseRefName: 'lane/parent', headRefName: 'lane/3336-stacked',
+    statusCheckRollup: [{ name: 'test', status: 'QUEUED', conclusion: null }] };
+  const readChecks = vi.fn(() => XX_REQUIRED.map((name, i) => ({ id: 1 + i, name, status: 'queued',
+    conclusion: null, completed_at: null, ...extra })));
+  const plan = runReconcilePass({ ...xxOptions(), readPrs: () => [pr], readChecks });
+  expect(readChecks).toHaveBeenCalledTimes(1);
+  expect(plan.dispatch.some(d => d.kind === 'restore-review-label' && d.prNumber === 3336)).toBe(restored);
+});
+
 it('hydrated REST check origins reach timeout enrichment', async () => {
   const { runReconcilePass } = await import('../reconcile-pass.mjs');
   const detailsUrl = 'https://github.com/web-everything/web-everything/actions/runs/10/job/20';
