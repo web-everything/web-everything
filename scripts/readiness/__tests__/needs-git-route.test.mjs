@@ -53,6 +53,19 @@ describe('sourceNeedsGit', () => {
     expect(sourceNeedsGit(E + "const f = () => {}\n/'/.test(a); const u = 'http://x';" + tail)).toBe(true);
     expect(sourceNeedsGit(E + "class A { m() {} }\n/'/.test(a); const u = 'http://x';" + tail)).toBe(true);
     expect(sourceNeedsGit(E + "else {}\n/'/.test(a); const u = 'http://x';" + tail)).toBe(true);
+    // TypeScript non-null `x!`, keyword-named properties and keyword-named methods are operands, not keywords
+    const one = " execFileSync('git', ['status']); expect(half / 2).toBe(1);";
+    expect(sourceNeedsGit(E + 'const half = total! / 2;' + one)).toBe(true);
+    expect(sourceNeedsGit(E + 'const half = f(a)! / 2;' + one)).toBe(true);
+    expect(sourceNeedsGit(E + 'const half = a[0]! / 2;' + one)).toBe(true);
+    expect(sourceNeedsGit(E + 'const half = stats.in / 2;' + one)).toBe(true);
+    expect(sourceNeedsGit(E + 'const half = a?.of / 2;' + one)).toBe(true);
+    expect(sourceNeedsGit(E + 'const half = d.with({day: 1}) / 2;' + one)).toBe(true);
+    expect(sourceNeedsGit(E + 'const half = x.for(1) / 2;' + one)).toBe(true);
+    // ... while a real regex after `!` / `return` / a real control head still reads as a regex
+    expect(sourceNeedsGit(E + "const ok = !/'/.test(s); const u = 'http://x';" + tail)).toBe(true);
+    expect(sourceNeedsGit(E + "function f(s) { return !/'/.test(s); } const u = 'http://x';" + tail)).toBe(true);
+    expect(sourceNeedsGit(E + "if (a) /'/.test(s); const u = 'http://x';" + tail)).toBe(true);
     // a quote/backtick/brace inside a regex literal in a `${ }` hole does not end the hole early
     expect(sourceNeedsGit(G + "function f() {\n  const a = `${ s.replace(/\"/g, '\\\\\"') }`;\n}\nconst b = `**/*.js`;" + spawn)).toBe(true);
     expect(sourceNeedsGit(G + "it('a', () => { const c = `${s.replace(/`/g, '')}`; const g = `**/*.js`;" + spawn + ' });')).toBe(true);

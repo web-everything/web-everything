@@ -73,6 +73,7 @@ function holeEnd(t, i, depth) {
   let last = '('; // last significant character, to tell a regex literal from a division; a hole starts an expression
   let prev = '';
   let wordStart = 0;
+  let wordDot = false; // the current word is a property name (`x.in`), never a keyword
   let noCloseUntil = -1;
   while (j < n) {
     const c = t[j];
@@ -81,7 +82,7 @@ function holeEnd(t, i, depth) {
     if (c === '/' && t[j + 1] === '/') { while (j < n && !isNewline(t[j])) j++; continue; }
     if (c === '/' && t[j + 1] === '*') { const e = t.indexOf('*/', j + 2); j = e < 0 ? n : e + 2; continue; }
     if (c === '/') {
-      const w = isIdent(last) && j - wordStart <= MAX_WORD ? t.slice(wordStart, j).trimEnd() : '';
+      const w = isIdent(last) && !wordDot && j - wordStart <= MAX_WORD ? t.slice(wordStart, j).trimEnd() : '';
       const regexOk = j >= noCloseUntil && (last === '' || (isIdent(last) ? REGEX_AFTER_WORD.has(w)
         : last === '}' ? !exprClose : !')]\'"`'.includes(last)));
       const e = regexOk ? regexEnd(t, j) : 0;
@@ -90,10 +91,10 @@ function holeEnd(t, i, depth) {
       prev = last; last = c; exprClose = false; j++; continue;
     }
     let closesExpr = false;
-    if (c === '{') braces.push(braceOpensExpr(last, prev, isIdent(last) && j - wordStart <= MAX_WORD ? t.slice(wordStart, j).trimEnd() : ''));
+    if (c === '{') braces.push(braceOpensExpr(last, prev, isIdent(last) && !wordDot && j - wordStart <= MAX_WORD ? t.slice(wordStart, j).trimEnd() : ''));
     else if (c === '}') { if (braces.length === 0) return j + 1; closesExpr = braces.pop(); }
     if (!/\s/.test(c)) {
-      if (isIdent(c) && !isIdent(last)) wordStart = j;
+      if (isIdent(c) && !isIdent(last)) { wordStart = j; wordDot = last === '.'; }
       prev = last;
       last = c;
       exprClose = closesExpr;
@@ -114,10 +115,12 @@ export function stripComments(t) {
   const stack = []; // per open `(`: was it the head of if/while/for/with (a `)` there is followed by a statement)
   let ctrlParen = false; // the last token was the `)` closing such a head
   let noCloseUntil = -1; // a regex scan already found no closing `/` before this index: don't rescan the line
-  const word = () => (isIdent(last) && wordEnd - wordStart <= MAX_WORD ? t.slice(wordStart, wordEnd) : '');
+  let wordDot = false; // the current word is a property name (`x.in`, `x.with(...)`), never a keyword
+  const word = () => (isIdent(last) && !wordDot && wordEnd - wordStart <= MAX_WORD ? t.slice(wordStart, wordEnd) : '');
   const braces = []; // per open `{`: does it open an expression (object literal)? see braceOpensExpr
   let exprClose = false; // the last token was the `}` of such a brace: an operand, so a following `/` divides
-  const emit = (s, sig) => { out += s; prev = last; last = sig; ctrlParen = false; exprClose = false; };
+  let postfixBang = false; // the last token was a TypeScript non-null `x!`: an operand, so a following `/` divides
+  const emit = (s, sig) => { out += s; prev = last; last = sig; ctrlParen = false; exprClose = false; postfixBang = false; };
   while (i < n) {
     const c = t[i];
     const d = t[i + 1];
@@ -137,6 +140,7 @@ export function stripComments(t) {
       else if (last === ')') regexOk = ctrlParen;
       else if (last === ']' || last === '"' || last === "'" || last === '`') regexOk = false;
       else if ((last === '+' || last === '-') && prev === last) regexOk = false; // postfix ++ / --
+      else if (last === '!') regexOk = !postfixBang;
       else if (last === '}') regexOk = !exprClose; // end of a block starts a statement; end of an object literal is an operand
       else regexOk = true; // operator, `(`, `,`, `=`, `{`, `;`
       if (regexOk) {
@@ -161,7 +165,7 @@ export function stripComments(t) {
     }
     if (/\s/.test(c)) { out += c; i++; continue; }
     if (isIdent(c)) {
-      if (!(isIdent(last) && wordEnd === i)) wordStart = i;
+      if (!(isIdent(last) && wordEnd === i)) { wordStart = i; wordDot = last === '.'; }
       wordEnd = i + 1;
       emit(c, c);
       i++;
@@ -169,7 +173,9 @@ export function stripComments(t) {
     }
     if (c === '(') stack.push(PAREN_KEYWORD.has(word()));
     const opensExpr = c === '{' ? braceOpensExpr(last, prev, word()) : false;
+    const nonNull = c === '!' && ((isIdent(last) && !REGEX_AFTER_WORD.has(word())) || (last === ')' && !ctrlParen) || last === ']');
     emit(c, c);
+    if (c === '!') postfixBang = nonNull;
     if (c === '{') braces.push(opensExpr);
     if (c === '}') exprClose = braces.pop() ?? false;
     if (c === ')') ctrlParen = stack.pop() ?? false;
