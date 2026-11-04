@@ -139,7 +139,8 @@ describe('origin/main high-water mark over REST', () => {
     expect(calls).toEqual([]);
   });
   it('malformed or truncated tree fails closed', () => {
-    expect(() => run(base({ 'git/trees/bk': ok({ nope: 1 }) }))).toThrow(/api-malformed/);
+    expect(() => run(base({ 'git/trees/bk': ok({ nope: 1 }) }))).toThrow(/tree-completeness-unknown/);
+    expect(() => run(base({ 'git/trees/bk': ok({ truncated: false, nope: 1 }) }))).toThrow(/api-malformed/);
     expect(() => run(base({ 'git/trees/bk': ok(tree(['1-a.md'], { truncated: true })) }))).toThrow(/api-truncated/);
     expect(() => run(base({ 'git/trees/rt0': ok({ truncated: false, tree: [] }) }))).toThrow(/api-malformed/);
   });

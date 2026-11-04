@@ -170,6 +170,8 @@ function readTreeEntries(read, treeSha, o) {
   const r = pull(read, `repos/{owner}/{repo}/git/trees/${encodeURIComponent(treeSha)}`, o);
   if (!r.ok) return r;
   if (r.value?.truncated === true) return bad(r, 'api-truncated', 'tree truncated');
+  // Completeness must be KNOWN: GitHub always sends a boolean, so anything but a literal false is unreadable.
+  if (r.value?.truncated !== false) return bad(r, 'tree-completeness-unknown', `truncated flag is ${JSON.stringify(r.value?.truncated)}`);
   if (!Array.isArray(r.value?.tree)) return bad(r, 'api-malformed', 'tree is not a list');
   for (const t of r.value.tree) if (typeof t?.path !== 'string') return bad(r, 'api-malformed', 'tree entry without a path');
   return good(r, r.value.tree);
