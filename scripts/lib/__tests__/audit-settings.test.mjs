@@ -25,6 +25,45 @@ describe('audit settings (R528)', () => {
     const r = resolve(full({ verdict: { mode: 'bogus' }, releaseStage: 'dev', recheck: { max: 9 }, preExisting: { mode: 'x', baseRecheckMax: -1 }, cards: { requireOnMain: 'no', requirePayBy: 0 } }));
     expect(r.value).toMatchObject(STRICT);
   });
+  it('an explicit empty object at a setting fails closed with a warning, never reads as omitted (PR #6381 red team)', () => {
+    const r = resolveAuditSettings({ fileRead: () => JSON.stringify({ audit: { releaseStage: {} } }), platform: null, env: {}, log: () => {} });
+    expect(r.value.releaseStage).toBe('prod');
+    expect(r.sources.releaseStage).toBe('strictest');
+    expect(r.warnings.join()).toMatch(/releaseStage/);
+    const all = resolve(full({ verdict: { mode: {} }, releaseStage: {}, recheck: { max: {} }, preExisting: { mode: {}, baseRecheckMax: {} }, cards: { requireOnMain: {}, requirePayBy: {} } }));
+    expect(all.value).toMatchObject(STRICT);
+    expect(all.warnings.length).toBeGreaterThanOrEqual(7);
+  });
+  it('a non-object where a section belongs fails closed for every setting under it', () => {
+    for (const bad of ['shadow', null, [], 3, true, '']) {
+      const r = resolve(full({ verdict: bad, preExisting: bad, recheck: bad, cards: bad }));
+      expect(r.value).toMatchObject({ ...STRICT, releaseStage: 'prerelease' });
+      expect(r.warnings.length).toBeGreaterThanOrEqual(6);
+    }
+  });
+  it('an empty section is an omitted section (defaults), not a malformed one', () => {
+    const r = resolve({ verdict: {}, preExisting: {}, recheck: {}, cards: {} });
+    expect(r.value).toMatchObject({ verdictMode: 'model', preExistingMode: 'block', recheckMax: 1, baseRecheckMax: 3, releaseStage: 'prerelease' });
+    expect(r.warnings).toEqual([]);
+  });
+  it('a malformed tool entry is not hidden by a valid platform value beneath it', () => {
+    const r = resolveAuditSettings({ fileRead: file({ releaseStage: {}, verdict: 'x' }), platform: { releaseStage: 'prerelease', verdict: { mode: 'computed' } }, env: {}, log: () => {} });
+    expect(r.value).toMatchObject({ releaseStage: 'prod', verdictMode: 'shadow' });
+  });
+  it('a non-object platform layer fails closed instead of reading as omitted', () => {
+    for (const plat of ['prerelease', ['x'], 7, false]) {
+      const r = resolveAuditSettings({ fileRead: file({}), platform: plat, env: {}, log: () => {} });
+      expect(r.value).toMatchObject(STRICT);
+      expect(r.warnings.length).toBeGreaterThanOrEqual(7);
+    }
+  });
+  it('empty-object path lists and hashes warn instead of vanishing silently', () => {
+    const r = resolve(full({ raceBlockPaths: {}, guardFloorPaths: {}, priorQuestionHashes: {} }));
+    expect(r.value.raceBlockPaths).toEqual(GUARD_FLOOR);
+    expect(r.value.guardFloorPaths).toEqual(GUARD_FLOOR);
+    expect(r.value.priorQuestionHashes).toEqual([]);
+    expect(r.warnings.join()).toMatch(/raceBlockPaths.*guardFloorPaths.*priorQuestionHashes/s);
+  });
   it('allow resolves to block with a warning', () => {
     const r = resolve(full({ preExisting: { mode: 'allow', baseRecheckMax: 3 } }));
     expect(r.value.preExistingMode).toBe('block');

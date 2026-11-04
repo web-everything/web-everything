@@ -44,11 +44,26 @@ function readFile(path, read) {
   try { const v = JSON.parse(read(path, 'utf8')); return isObj(v) && isObj(v.audit) ? { tool: v.audit } : { tool: null, unreadable: true }; }
   catch { return { tool: null, unreadable: true }; }
 }
+const pathOf = key => ({ verdictMode: ['verdict', 'mode'], preExistingMode: ['preExisting', 'mode'], baseRecheckMax: ['preExisting', 'baseRecheckMax'],
+  recheckMax: ['recheck', 'max'], requireOnMain: ['cards', 'requireOnMain'], requirePayBy: ['cards', 'requirePayBy'] }[key] ?? [key]);
 const get = (tool, key) => {
-  const [a, b] = { verdictMode: ['verdict', 'mode'], preExistingMode: ['preExisting', 'mode'], baseRecheckMax: ['preExisting', 'baseRecheckMax'],
-    recheckMax: ['recheck', 'max'], requireOnMain: ['cards', 'requireOnMain'], requirePayBy: ['cards', 'requirePayBy'] }[key] ?? [key];
+  const [a, b] = pathOf(key);
   return b === undefined ? tool?.[a] : tool?.[a]?.[b];
 };
+/**
+ * Malformed explicit entries the cascade's leaf flattening hides (PR #6381): an empty object at a setting has no
+ * leaves, so `releaseStage: {}` vanishes and reads as omitted; a non-object where a section belongs
+ * (`verdict: "shadow"`) makes `verdict.mode` read as omitted. Checked on each RAW layer so such an entry fails
+ * closed instead of earning the default. An empty section (`verdict: {}`) sets nothing and stays omitted.
+ */
+function rawMalformed(layer, key, valid) {
+  if (!isObj(layer)) return false;
+  const [a, b] = pathOf(key);
+  if (!Object.hasOwn(layer, a)) return false;
+  if (b === undefined) return !valid(layer[a]);
+  if (!isObj(layer[a])) return true;
+  return Object.hasOwn(layer[a], b) && !valid(layer[a][b]);
+}
 const parseEnv = (key, raw) => {
   if (typeof raw !== 'string') return undefined;
   if (['recheckMax', 'baseRecheckMax'].includes(key)) return /^\d+$/.test(raw) ? Number(raw) : undefined;
@@ -73,12 +88,18 @@ export function resolveAuditSettings({ path = AUDIT_SETTINGS_PATH, fileRead = re
   let cascade;
   try { cascade = cascadePolicy('audit', tool, { standard: undefined, platform, env, log }); } catch { cascade = null; }
   const layered = cascade?.layered ?? {};
+  // A platform preference that is present but not an object flattens to one root leaf and reads as all-omitted.
+  const plat = cascade?.platform;
+  const platBad = plat !== undefined && plat !== null && !isObj(plat);
+  if (platBad) warn('audit platform preference is not an object; every setting resolves to its strictest option');
+  const malformed = (key, valid) => platBad || [plat, tool].some(layer => rawMalformed(layer, key, valid));
   const value = {}; const sources = {};
   for (const key of Object.keys(DEFAULTS)) {
     let v = get(layered, key); let src = 'file';
-    if (v === undefined && !unreadable && cascade) { v = DEFAULTS[key]; src = 'built-in'; }
-    if (unreadable || !cascade || !VALID[key](v)) {
-      if (!(v === undefined && !unreadable)) { warn(`audit setting ${key} unreadable or invalid; using strictest ${JSON.stringify(STRICTEST[key])}`); }
+    const bad = malformed(key, VALID[key]);
+    if (v === undefined && !unreadable && cascade && !bad) { v = DEFAULTS[key]; src = 'built-in'; }
+    if (unreadable || !cascade || bad || !VALID[key](v)) {
+      if (unreadable || bad || v !== undefined) { warn(`audit setting ${key} unreadable or invalid; using strictest ${JSON.stringify(STRICTEST[key])}`); }
       v = STRICTEST[key]; src = 'strictest';
     }
     // allow is never trusted: it resolves to block.
@@ -94,7 +115,9 @@ export function resolveAuditSettings({ path = AUDIT_SETTINGS_PATH, fileRead = re
   // Path lists only ever ADD to the built-in floor; a bad list contributes nothing (the floor remains).
   for (const [key, layerVal] of [['raceBlockPaths', get(layered, 'raceBlockPaths')], ['guardFloorPaths', get(layered, 'guardFloorPaths')]]) {
     let list = layerVal === undefined ? [] : layerVal;
+    // A malformed raw entry warns; the valid layered list (if any) still adds, since more protected paths is stricter.
     if (!validPaths(list)) { warn(`audit setting ${key} invalid; built-in floor only`); list = []; }
+    else if (malformed(key, validPaths)) warn(`audit setting ${key} has a malformed entry; it adds nothing`);
     let envList = [];
     const raw = env?.[AUDIT_SETTINGS_ENV[key]];
     if (raw !== undefined) {
@@ -105,7 +128,8 @@ export function resolveAuditSettings({ path = AUDIT_SETTINGS_PATH, fileRead = re
   }
   // Prior question hashes only widen what is ACCEPTED, so no env route exists; a bad list is empty.
   const hashes = get(layered, 'priorQuestionHashes');
-  value.priorQuestionHashes = Object.freeze(hashes === undefined ? [] : validHashes(hashes) ? [...hashes] : (warn('audit setting priorQuestionHashes invalid; none accepted'), []));
-  sources.priorQuestionHashes = hashes === undefined ? 'built-in' : 'file';
+  const hashesBad = malformed('priorQuestionHashes', validHashes);
+  value.priorQuestionHashes = Object.freeze(hashes === undefined && !hashesBad ? [] : !hashesBad && validHashes(hashes) ? [...hashes] : (warn('audit setting priorQuestionHashes invalid; none accepted'), []));
+  sources.priorQuestionHashes = hashes === undefined && !hashesBad ? 'built-in' : 'file';
   return { value: Object.freeze(value), sources, warnings };
 }
