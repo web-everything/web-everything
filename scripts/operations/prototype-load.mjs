@@ -25,18 +25,35 @@ export function readyEvidence(records, input, ruledWeakened = [], liveFp = null)
   if (input.testsRun?.trim() && /^NOT WEAKENED$/i.test(input.audit || '')) return { source: 'arguments', testsRun: input.testsRun };
   // R503: a record speaks for the live sha when it names it exactly, or its stored net-diff fingerprint equals the live one.
   // A rebase or merge of main that leaves the code alone therefore keeps the evidence; any code change does not.
-  const covers = (r) => r?.ref === input.branch && (r.sha === input.sha || validSha(r.sha) && carriesAcross(r.fingerprint, liveFp));
-  const record = records.find((r) => covers(r) && r.tests === 'green' && /^NOT WEAKENED$/i.test(r.audit || ''));
-  if (record) return { source: 'ready-record', record };
+  const list = Array.isArray(records) ? records : [];
+  const carries = (r) => validSha(r.sha) && carriesAcross(r.fingerprint, liveFp);
   // The allowlist entry binds to the record by its exact sha, or (carry) by holding the live fingerprint itself.
   const binds = (e, r) => e.sha === r.sha && r.sha === input.sha || validSha(e.sha) && validSha(r.sha) && carriesAcross(e.fingerprint, liveFp) && carriesAcross(r.fingerprint, liveFp);
-  const ruled = records.find((r) => covers(r) && r.tests === 'green' && r.audit === 'WEAKENED'
-    && validSha(r.sha) && RULING.test(r.auditRuling || '')
-    && Array.isArray(r.auditDisclosed) && r.auditDisclosed.length > 0 && r.auditDisclosed.every((f) => typeof f === 'string' && f.trim())
-    && Array.isArray(ruledWeakened) && ruledWeakened.some((e) => e && e.ref === r.ref && binds(e, r) && e.ruling === r.auditRuling
-      && Array.isArray(e.findings) && e.findings.length > 0 && e.findings.every((f) => typeof f === 'string' && f.trim())
-      && e.findings.length === r.auditDisclosed.length && e.findings.every((f, i) => f === r.auditDisclosed[i])));
-  return ruled ? { source: 'ready-record', record: ruled, ruledWeakened: { ruling: ruled.auditRuling, findings: ruled.auditDisclosed } } : null;
+  const judge = (r) => {
+    if (r.tests === 'green' && /^NOT WEAKENED$/i.test(r.audit || '')) return { source: 'ready-record', record: r };
+    const ruled = r.tests === 'green' && r.audit === 'WEAKENED'
+      && validSha(r.sha) && RULING.test(r.auditRuling || '')
+      && Array.isArray(r.auditDisclosed) && r.auditDisclosed.length > 0 && r.auditDisclosed.every((f) => typeof f === 'string' && f.trim())
+      && Array.isArray(ruledWeakened) && ruledWeakened.some((e) => e && e.ref === r.ref && binds(e, r) && e.ruling === r.auditRuling
+        && Array.isArray(e.findings) && e.findings.length > 0 && e.findings.every((f) => typeof f === 'string' && f.trim())
+        && e.findings.length === r.auditDisclosed.length && e.findings.every((f, i) => f === r.auditDisclosed[i]));
+    return ruled ? { source: 'ready-record', record: r, ruledWeakened: { ruling: r.auditRuling, findings: r.auditDisclosed } } : null;
+  };
+  // Precedence (R503 red team rounds 1–2). The records file is append-only, so file order is time order:
+  //  - per sha, only its LATEST record counts (a superseded WEAKENED or red record never blocks forever);
+  //  - the live sha's own latest record decides whenever one exists, and a carried record can never outrank it;
+  //  - a carried head whose latest record would not load (WEAKENED unruled, not green, unbound) blocks unless the
+  //    live sha has a NEWER record of its own — newer negative evidence about the same code is never bypassed.
+  const latest = new Map();
+  list.forEach((r, i) => { if (r?.ref === input.branch && (r.sha === input.sha || validSha(r.sha))) latest.set(r.sha, i); });
+  const ownAt = latest.has(input.sha) ? latest.get(input.sha) : -1;
+  const carried = [...latest].filter(([sha]) => sha !== input.sha && list.some((r) => r?.ref === input.branch && r.sha === sha && carries(r)))
+    .map(([, i]) => i).sort((a, b) => a - b);
+  if (carried.some((i) => i > ownAt && !judge(list[i]))) return null;
+  if (ownAt >= 0) return judge(list[ownAt]);
+  // No live-sha record: the newest carried head whose latest record itself holds the live fingerprint decides.
+  const pick = carried.filter((i) => carries(list[i])).pop();
+  return pick === undefined ? null : judge(list[pick]);
 }
 /** Canonical audit for this head. Each non-empty base (base!==head) is judged by findAudit (latest wins within a
  * base, file order breaks ties, contradictory findings rejected). Fail closed: ANY base whose latest verdict is
@@ -47,19 +64,25 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   // No stored or live fingerprint, or any difference, means no carry (a real code change always re-audits).
   // Eligibility is per RECORD: each carried record must itself hold the matching fingerprint, so one carried record
   // can never lend its head's other (unfingerprinted or foreign) records.
-  const eligible = records.filter((r) => r?.head === sha || (r?.head && validSha(r.head) && carriesAcross(r.fingerprint, liveFp)));
-  const heads = new Set(eligible.map((r) => r.head));
-  // Fail closed the other way too: a valid WEAKENED verdict anywhere on a carried head blocks, fingerprint or not.
-  for (const r of records) if (r?.head && r.head !== sha && heads.has(r.head) && r.verdict === 'WEAKENED'
-    && r.questionHash === QUESTION_HASH && Number.isFinite(Date.parse(r.at))) return { ok: false, reason: 'weakened' };
+  // Precedence (R503 red team rounds 1–2):
+  //  - per head and base, only the LATEST valid verdict counts (findAudit), over ALL that head's records — fingerprint
+  //    or not — so a superseded WEAKENED never blocks forever, and an unsuperseded one is never hidden;
+  //  - the live head's own verdicts decide whenever it has any, and a carried pass can never outrank them;
+  //  - a carried head's latest WEAKENED blocks unless the live head has a NEWER verdict of its own (a fresh re-audit).
+  const list = Array.isArray(records) ? records : [];
+  const decisions = (head) => [...new Set(list.filter((r) => r?.head === head && r.base !== head).map((r) => r.base))]
+    .map((base) => ({ base, record: findAudit(list, { head, base, questionHash: QUESTION_HASH }) })).filter((d) => d.record);
+  const own = decisions(sha);
+  const carriedHeads = new Set(list.filter((r) => r?.head && r.head !== sha && validSha(r.head) && carriesAcross(r.fingerprint, liveFp)).map((r) => r.head));
+  const carried = [...carriedHeads].flatMap(decisions);
+  const ownAt = Math.max(-Infinity, ...own.map((d) => Date.parse(d.record.at)));
+  if (own.some((d) => d.record.verdict === 'WEAKENED')
+    || carried.some((d) => d.record.verdict === 'WEAKENED' && !(Date.parse(d.record.at) < ownAt))) return { ok: false, reason: 'weakened' };
+  // A pass counts only when covers(base) proves its base is in main; a carried pass must itself hold the fingerprint.
+  const passes = own.length ? own : carried.filter((d) => carriesAcross(d.record.fingerprint, liveFp));
   let pass = null;
-  for (const head of heads) {
-    const bases = new Set(eligible.filter((r) => r.head === head && r.base !== head).map((r) => r.base));
-    for (const base of bases) {
-      const record = findAudit(eligible, { head, base, questionHash: QUESTION_HASH });
-      if (record?.verdict === 'WEAKENED') return { ok: false, reason: 'weakened' };
-      if (record && covers(base) && (!pass || Date.parse(record.at) >= Date.parse(pass.at))) pass = record;
-    }
+  for (const { base, record } of passes) {
+    if (covers(base) && (!pass || Date.parse(record.at) >= Date.parse(pass.at))) pass = record;
   }
   return pass ? { ok: true, record: pass } : { ok: false, reason: 'no-record' };
 }

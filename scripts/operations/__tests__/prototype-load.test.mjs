@@ -2077,6 +2077,70 @@ describe('readyEvidence fingerprint carry (R503)', () => {
   });
 });
 
+// R503 red team rounds 1–2 — evidence precedence: the latest verdict per head (and base) wins, the live head's own
+// evidence outranks carried evidence, and newer carried negative evidence blocks until the live head re-records.
+describe('carried evidence precedence (R503 red team)', () => {
+  const FP = 'e'.repeat(64), A = 'd'.repeat(40), C = '7'.repeat(40);
+  const at = (h) => `2026-10-2${h}T12:00:00Z`;
+  const audit = (o = {}) => auditRecord({ head: A, fingerprint: FP, ...o });
+  it('round 1: a superseded WEAKENED audit of a carried head does not block its newer passing audit', () => {
+    const pass = audit({ at: at(2) });
+    expect(prototypeLoad.canonicalAuditEvidence([audit({ verdict: 'WEAKENED', at: at(1) }), pass], SHA, () => true, FP)).toEqual({ ok: true, record: pass });
+  });
+  it('round 1: a fresh live-head audit newer than an unsuperseded carried WEAKENED unblocks', () => {
+    const fresh = auditRecord({ at: at(3) });
+    expect(prototypeLoad.canonicalAuditEvidence([audit({ verdict: 'WEAKENED', at: at(1) }), fresh], SHA, () => true, FP)).toEqual({ ok: true, record: fresh });
+    // and the superseded scenario plus a fresh live-head audit also loads
+    expect(prototypeLoad.canonicalAuditEvidence([audit({ verdict: 'WEAKENED', at: at(1) }), audit({ at: at(2) }), fresh], SHA, () => true, FP)).toEqual({ ok: true, record: fresh });
+  });
+  it('a carried WEAKENED newer than the live head\'s own verdict still blocks', () => {
+    expect(prototypeLoad.canonicalAuditEvidence([auditRecord({ at: at(1) }), audit({ verdict: 'WEAKENED', at: at(3) })], SHA, () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
+  });
+  it('a live-head WEAKENED blocks an older or newer carried pass', () => {
+    for (const [own, carried] of [[at(1), at(3)], [at(3), at(1)]]) {
+      expect(prototypeLoad.canonicalAuditEvidence([audit({ at: carried }), auditRecord({ verdict: 'WEAKENED', at: own })], SHA, () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
+    }
+  });
+  it('the live head\'s own verdict outranks a carried pass: an uncovered own base does not fall back to the carry', () => {
+    const own = auditRecord({ base: C, at: at(1) });
+    expect(prototypeLoad.canonicalAuditEvidence([audit({ at: at(2) }), own], SHA, (base) => base !== C, FP)).toEqual({ ok: false, reason: 'no-record' });
+  });
+
+  const input = { branch: BASE.branch, sha: SHA };
+  const ready = (o = {}) => ({ ref: BASE.branch, sha: A, fingerprint: FP, tests: 'green', audit: 'NOT WEAKENED', ...o });
+  const liveWeak = ready({ sha: SHA, fingerprint: undefined, audit: 'WEAKENED' });
+  it('round 2: a live-head WEAKENED record blocks an older carried green record in either order', () => {
+    expect(prototypeLoad.readyEvidence([ready(), liveWeak], input, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([liveWeak, ready()], input, [], FP)).toBeNull();
+  });
+  it('a live-head non-green record also blocks the carried green record', () => {
+    expect(prototypeLoad.readyEvidence([ready(), ready({ sha: SHA, fingerprint: undefined, tests: 'red' })], input, [], FP)).toBeNull();
+  });
+  it('the latest live-head record wins over an earlier one for the same sha', () => {
+    const green = ready({ sha: SHA, fingerprint: undefined });
+    expect(prototypeLoad.readyEvidence([green, liveWeak], input, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([liveWeak, green], input, [], FP)).toEqual({ source: 'ready-record', record: green });
+  });
+  it('a carried WEAKENED newer than the live head\'s own record blocks; a newer own record unblocks', () => {
+    const own = ready({ sha: SHA, fingerprint: undefined });
+    const carriedWeak = ready({ sha: C, audit: 'WEAKENED' });
+    expect(prototypeLoad.readyEvidence([own, carriedWeak], input, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([carriedWeak, own], input, [], FP)).toEqual({ source: 'ready-record', record: own });
+  });
+  it('a superseded carried WEAKENED does not block that head\'s newer green record', () => {
+    const green = ready();
+    expect(prototypeLoad.readyEvidence([ready({ audit: 'WEAKENED' }), green], input, [], FP)).toEqual({ source: 'ready-record', record: green });
+  });
+  it('an unsuperseded carried WEAKENED on another head blocks a carried green record', () => {
+    expect(prototypeLoad.readyEvidence([ready(), ready({ sha: C, audit: 'WEAKENED' })], input, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([ready({ sha: C, audit: 'WEAKENED' }), ready()], input, [], FP)).toBeNull();
+  });
+  it('the loader refuses a carried green record when the live head is recorded WEAKENED', async () => {
+    const out = await auditedFixture('warn', { ready: auditLines([ready(), liveWeak]), fingerprint: () => FP }).run();
+    expect(out).toMatchObject({ ok: false, stopReason: 'no-ready' });
+  });
+});
+
 describe('prototype-load daemon key resolution (R502 item 1)', () => {
   const daemons = { review: { label: 'com.we.review-daemon' }, fix: { label: 'com.we.fix-dispatch-daemon' }, verify: { label: 'com.we.verify-daemon' }, control: { label: 'com.we.control', clone: 'wev-control' }, drain: { label: 'com.plateau.drain-daemon', clone: '.lanes/we-drain-daemon/code' } };
   const aliases = { 'reconcile-fix-dispatch': 'fix', 'wev-review-daemon': 'review', 'wev-control': 'control' };
