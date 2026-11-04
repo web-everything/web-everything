@@ -18,6 +18,10 @@
     "lease-reaper": {
       "label": "com.we.lease-reaper"
     },
+    "pass-readers": {
+      "label": "com.we.conveyor-pass-daemon.ci-red-recovery-watch-we",
+      "note": "The label is the ci-red-recovery-watch-we pass daemon launchd job. No explicit clone: prototype-load resolves the clone from that installed plist WorkingDirectory, so overlays register on the clone the watcher actually runs from (the shipped template installs wev-review-daemon; the live install runs wev-pass-readers), and self-sync adopts the new code."
+    },
     "control": {
       "label": "com.we.control",
       "clone": "wev-control"
@@ -27,6 +31,14 @@
       "clone": ".lanes/we-drain-daemon/code",
       "note": "The plist's DRAIN_DAEMON_WE_CLONE is the DATA clone lane-1, which carries no overlays. Register overlays on the CODE clone code; see scripts/settings/operator-task.json edgeClones.drain and scripts/lib/daemon-clone-registry.mjs."
     }
+  },
+  "daemonAliases": {
+    "reconcile-fix-dispatch": "fix",
+    "wev-fix-daemon": "fix",
+    "wev-review-daemon": "review",
+    "wev-health-watch": "health-watch",
+    "wev-control": "control",
+    "plateau-drain-daemon": "drain"
   },
   "launchAgentsDir": "~/Library/LaunchAgents",
   "workspaceRoot": "~/workspace",
@@ -68,6 +80,14 @@
       ]
     },
     {
+      "ref": "lane/forge-slot-reconciler-r475",
+      "sha": "0cbd4303bc0a961fdafda162bec407af8b8709dc",
+      "ruling": "R475+R485",
+      "findings": [
+        "scripts/readiness/forge-slot-markers.mjs:283 — Adds `idle` to the release allowlist, allowing deletion of markers for listed runs with `code:null` that previously remained blocked. Two zero-count samples replace per-run completion evidence. The underlying count comes from a non-atomic directory listing (scripts/readiness/forge-exec-run.mjs:647), so this loosens the fail-closed guard without proving that run’s cleanup."
+      ]
+    },
+    {
       "ref": "lane/freeze-read-retry-lkg",
       "sha": "f8564fc77a42e3c5a326fc17e38c3873f66696b3",
       "ruling": "R432",
@@ -86,6 +106,15 @@
       ]
     },
     {
+      "ref": "lane/mq-same-head-merge-conflict",
+      "sha": "94eb862d0f5595cb6d322c09d5945bbdcf92bfa9",
+      "ruling": "R466+R484",
+      "findings": [
+        "scripts/lib/drain-queue-safety.mjs:59 — One or two `merge_conflict` removals now bypass commit-binding validation and the same-head failure hold whenever the live PR is CLEAN. CLEAN does not prove the failed merge-group conditions changed; previously these cases required operator inspection.",
+        "scripts/__tests__/merge-ai-prs-prestage.test.mjs:188 — Replacing `merge_conflict` with `ci_failure` removes integration coverage that prevented a force-push from bypassing an unbound conflict failure. The test now passes despite that protection being removed."
+      ]
+    },
+    {
       "ref": "lane/r452-restart-ceiling",
       "sha": "be8f9f26291bad2acfd3cc45c458efed18d1c998",
       "ruling": "R452",
@@ -99,6 +128,40 @@
       "ruling": "R464+R468+R474",
       "findings": [
         "scripts/settings/review.json:3 — Shipped timing changes from fast-check success to `push`, permitting review while both prerequisites are queued. Confirmed by a direct probe: pending checks now allow review, whereas the previous default refuses. `scripts/lib/review-timing.mjs:195` grants this permission even with `startEarly: \"shadow\"` or `\"off\"`; the added publication guard does not preserve the review-start gate."
+      ]
+    },
+    {
+      "ref": "lane/cheap-pr-list-retry",
+      "sha": "393b3f42378fc25dd729b4d17c930dd7fb89a56c",
+      "ruling": "R517",
+      "findings": [
+        "scripts/merge-ai-prs.mjs:2686 — Pre-existing fail-open dependency handling remains: full sweeps clear absent `blockedBy` dependencies even when listing failures make `contextComplete=false`; an unreadable repo's open blocker can therefore be bypassed.",
+        "scripts/merge-ai-prs.mjs:5616 — Pre-existing `--assume-complete-context` overrides the incomplete-context guard after listing failures, allowing an unobserved carrier to count as landed despite the new inventory checks."
+      ]
+    },
+    {
+      "ref": "lane/author-lookup-defer",
+      "sha": "f62437a87d2831fdb56be1ec3d8387243b5e2f57",
+      "ruling": "R521",
+      "findings": [
+        "scripts/conveyor/reconcile-pass.mjs:456 — The snapshot-disabled fallback returns direct() without author validation, but PR_LIST_JSON_FIELDS omits author. This pre-existing bypass still accepts authorless rows despite the claimed fail-closed guarantee."
+      ]
+    },
+    {
+      "ref": "lane/fresh-plan-read",
+      "sha": "83be0f19530ef10b5634c1ce9b8f69074e620e7a",
+      "ruling": "R521",
+      "findings": [
+        "scripts/conveyor/reconcile-pass.mjs:471 — Fresh planner reads now rely on a paged reader that requests only `labels(first:100)` without checking label completeness (`scripts/lib/pr-list-paged.mjs:75`). Omitted `review-status:draft-withdrawn` or `red-team:blocked/pending` labels bypass promotion guards (`scripts/conveyor/reconcile-core.mjs:2769–2776`). A synthetic probe confirmed an incomplete label connection is accepted as complete; the added tests do not cover this fail-open path.",
+        "note — pre-existing limit shared with the snapshot path: the `labels(first:100)` page query is the same one the shared PR snapshot and the drain listing already use; a PR with more than 100 labels is not a realistic state, and this branch does not change that query."
+      ]
+    },
+    {
+      "ref": "lane/runs-scan-bound-aff4",
+      "sha": "aff4a567812cd837234ceeadd0cd7d8a0f658fdb",
+      "ruling": "R545",
+      "findings": [
+        "scripts/lib/drain-red-team-evidence.mjs:76 — Retains the pre-existing reliance on mtime to select finished reviews; start times only protect unfinished reviews. An older acceptance updated after a newer rejection wins. A read-only probe confirmed recovery schedules a fresh pass using that stale acceptance, ignoring the newer rejection."
       ]
     }
   ]
