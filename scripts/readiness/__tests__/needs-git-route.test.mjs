@@ -144,10 +144,32 @@ describe('sourceNeedsGit', () => {
     const E = "import { execSync } from 'node:child_process'; ";
     for (const lit of [
       "'\"git\" rev-parse --show-toplevel'", `"'git' status"`, "'\"/usr/bin/git\" status'", "'\"/my dir/git\" status'", "'g\"i\"t status'", "'g\\\\it status'",
-      "'\\\\\"git\\\\\" status'", "'cd x && \"git\" status'", "'\"sudo\" \"git\" status'", "'\"FOO=1\" git status'", "'\"git\"'", '`"git" ${args}`',
+      "'\\\"git\\\" status'", "'cd x && \"git\" status'", "'\"sudo\" \"git\" status'", "'\"FOO=1\" git status'", "'\"git\"'", '`"git" ${args}`',
     ]) expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(true);
     // quoted arguments and other binaries are still not git
     for (const lit of ["'\"gitleaks\" scan'", "'echo \"git status\"'", "'\"node\" git.mjs'", "'\"a-git\" status'"]) {
+      expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(false);
+    }
+  });
+  it('JS string escapes are decoded before the command is read', () => {
+    const E = "import { execSync } from 'node:child_process'; ";
+    for (const lit of [
+      "'\\x67it status'", "'\\u0067it status'", "'\\u{67}it status'", "'echo hi\\x0agit status'", "'echo hi\\u000agit status'",
+      "'\\ngit\\x20status'", "'\\tgit status'", '`\\x67it ${args}`', "'echo hi\\0\\x0agit'",
+    ]) expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(true);
+    // `\\` is one backslash (then `n`), not a line break; a tab between words is not a command break
+    for (const lit of ["'echo \\\\ngit status'", "'echo\\tgit status'", "'\\x65cho git status'", "'\\u{110000}git status'"]) {
+      expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(false);
+    }
+  });
+  it('options after a wrapper, $-quoting, $(…) env values and shell hex escapes', () => {
+    const E = "import { execSync } from 'node:child_process'; ";
+    for (const lit of [
+      "'env -i git status'", "'env -u X git status'", "'command -- git status'", "'sudo -n git status'", "'sudo -u root git status'",
+      "'time -p git status'", "'nice -n 5 git status'", "'env -i FOO=1 git status'", "'sudo -E env -i git'", "'xargs -0 git add'", "'env -i /usr/bin/git status'",
+      "\"$'git' status\"", "'$\"git\" status'", "\"$'g\\\\x69t' status\"", "\"$'\\\\147it' status\"", "'FOO=$(echo a) git status'", "'(cd x) git status'",
+    ]) expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(true);
+    for (const lit of ["'env -i ls'", "'nice -n 5 node git.mjs'", "'echo -n git status'", "'-i git status'", "'sudo ls -a'"]) {
       expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(false);
     }
   });
@@ -179,7 +201,8 @@ describe('sourceNeedsGit', () => {
     const o = { helpers: ['a.mjs'] };
     const inputs = ['(/['.repeat(100000), 'import' + ' '.repeat(300000) + 'x', 'a'.repeat(300000), "('".repeat(150000), '${'.repeat(100000), '`${'.repeat(100000), '`${' + '(/['.repeat(100000), '`${' + '(/'.repeat(150000),
       ...["'" + 'A=b '.repeat(70000) + "'", "'" + ' '.repeat(300000) + "'", "'" + ';'.repeat(300000) + "'", "'" + ' /'.repeat(150000) + "'",
-        '`' + '\n '.repeat(150000) + '`', 'function(){}'.repeat(25000), 'class{}'.repeat(40000), '=function(){'.repeat(25000)].map(x => "import 'node:child_process'; " + x)];
+        "'" + 'sudo -a '.repeat(37000) + "'", "'" + 'env -u x '.repeat(33000) + "'", "'" + '\\x'.repeat(140000) + "'", "'" + '"\\'.repeat(140000) + "'", "'" + '$"'.repeat(140000) + "'", "'" + ') '.repeat(140000) + "'",
+        '`' + '\n '.repeat(150000) + '`','function(){}'.repeat(25000), 'class{}'.repeat(40000), '=function(){'.repeat(25000)].map(x => "import 'node:child_process'; " + x)];
     const t0 = Date.now();
     for (const s of inputs) expect(sourceNeedsGit(s, o)).toBe(false);
     expect(Date.now() - t0).toBeLessThan(2500);

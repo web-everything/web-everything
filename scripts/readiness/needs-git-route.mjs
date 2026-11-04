@@ -230,32 +230,67 @@ const TOKEN = /\S+/y;
 const GIT_AT = /(?:[^\n]*\/)?git(?:\.exe)?(?=\s|$)/y;
 // Words that run the next word as a command (shell keywords, groups, wrappers); skipped before looking for `git`.
 const COMMAND_PREFIX = new Set(['then', 'else', 'elif', 'do', 'if', 'while', 'until', '!', '{', 'sudo', 'time', 'exec', 'env', 'command', 'nice', 'nohup', 'xargs', 'builtin']);
-// `\n`, `\r` and `\t` written as escapes in a quoted string are whitespace once the string is evaluated; a break
-// splits the command, so all three become one.
-const decodeBreaks = (s) => s.replace(/\\[nrt]/g, '\n');
-// Each step is a sticky match from a moving index, so a long run of spaces or `A=b` prefixes stays linear.
+// The text a JS string literal evaluates to: `\n` `\t` `\xHH` `\uHHHH` `\u{…}` and the other escapes are decoded in one
+// pass (so `\\n` stays a backslash and an `n`); a `\` + line break is a continuation and vanishes.
+const JS_ESCAPE = /\\(?:x([0-9a-fA-F]{2})|u\{([0-9a-fA-F]{1,6})\}|u([0-9a-fA-F]{4})|(\r\n|[\s\S]))/g;
+const SIMPLE_ESCAPE = { n: '\n', r: '\r', t: '\t', b: '\b', v: '\v', f: '\f', 0: '\0' };
+function decodeEscapes(s) {
+  return s.replace(JS_ESCAPE, (all, x, ub, u4, ch) => {
+    if (x ?? u4) return String.fromCharCode(parseInt(x ?? u4, 16));
+    if (ub) { const cp = parseInt(ub, 16); return cp <= 0x10ffff ? String.fromCodePoint(cp) : all; }
+    if (ch === '\r\n' || ch === '\n' || ch === '\r' || ch === ' ' || ch === ' ') return '';
+    return SIMPLE_ESCAPE[ch] ?? ch;
+  });
+}
+const GIT_TOKEN = /^(?:\S*\/)?git(?:\.exe)?$/;
+// Walks the command word of one segment. A work list over (position, behind-a-wrapper) states, each visited once, keeps it
+// linear however many `A=b` prefixes, wrappers or flags there are. Behind a wrapper (`sudo`, `env`, `nice`, `command`, a
+// shell keyword …) an option (`-i`, `--`) is skipped, and so is the value that may follow it (`env -u X git`, `nice -n 5 git`).
 function commandIsGit(segment) {
-  let pos = 0;
-  for (;;) {
-    WS.lastIndex = pos;
+  const seen = new Set();
+  const todo = [[0, false]];
+  while (todo.length) {
+    const [from, wrapped] = todo.pop();
+    WS.lastIndex = from;
     WS.test(segment);
-    pos = WS.lastIndex;
+    const pos = WS.lastIndex;
+    const key = pos * 2 + (wrapped ? 1 : 0);
+    if (seen.has(key)) continue;
+    seen.add(key);
     ENV_ASSIGN.lastIndex = pos;
-    if (ENV_ASSIGN.test(segment)) { pos = ENV_ASSIGN.lastIndex; continue; }
+    if (ENV_ASSIGN.test(segment)) { todo.push([ENV_ASSIGN.lastIndex, wrapped]); continue; }
     TOKEN.lastIndex = pos;
     const m = TOKEN.exec(segment);
-    if (m && COMMAND_PREFIX.has(m[0])) { pos = TOKEN.lastIndex; continue; }
-    break;
+    if (!m) continue;
+    const tok = m[0];
+    const end = pos + tok.length;
+    if (COMMAND_PREFIX.has(tok)) { todo.push([end, true]); continue; }
+    if (wrapped && tok[0] === '-') {
+      todo.push([end, true]);
+      WS.lastIndex = end;
+      WS.test(segment);
+      TOKEN.lastIndex = WS.lastIndex;
+      const v = TOKEN.exec(segment);
+      if (v) todo.push([WS.lastIndex + v[0].length, true]);
+      continue;
+    }
+    if (wrapped) { if (GIT_TOKEN.test(tok)) return true; continue; }
+    GIT_AT.lastIndex = pos;
+    if (GIT_AT.test(segment)) return true;
   }
-  GIT_AT.lastIndex = pos;
-  return GIT_AT.test(segment);
+  return false;
 }
-// The shell removes quotes and backslashes from a command word (`"git"`, `'git'`, `g"i"t`, `\"git\"`), so a segment
-// that has any is also judged with them dropped. (Dropping them can only add matches, never hide one.)
+// The shell removes quotes and backslashes from a command word (`"git"`, `'git'`, `g"i"t`, `\git`), reads `$'…'` / `$"…"`
+// like a plain quote and decodes `\xHH` / `\NNN` inside `$'…'`, so a segment that has any is also judged with all that
+// applied. (Dropping them can only add matches, never hide one.)
 const SHELL_QUOTING = /["'\\]/;
-const dequote = (s) => s.replace(/["'\\]/g, '');
+const dequote = (s) => s
+  .replace(/\\x([0-9a-fA-F]{2})|\\([0-7]{3})/g, (_, h, o) => String.fromCharCode(h ? parseInt(h, 16) : parseInt(o, 8)))
+  .replace(/\$(?=["'])/g, '')
+  .replace(/["'\\]/g, '');
 const segmentRunsGit = (seg) => commandIsGit(seg) || (SHELL_QUOTING.test(seg) && commandIsGit(dequote(seg)));
-const literalNamesGit = (s) => decodeBreaks(s).split(COMMAND_SEPARATOR).some(segmentRunsGit);
+// `)` also ends a command (`FOO=$(echo a) git status`, `(cd x) git`): over-matching it only routes locally.
+const literalNamesGit = (s) => decodeEscapes(s).split(COMMAND_SEPARATOR).flatMap(p => p.split(')')).some(segmentRunsGit);
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 export function sourceNeedsGit(text, { helpers = [] } = {}) {
