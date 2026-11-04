@@ -55,10 +55,10 @@ const retired = (over = {}) => ({
 const READY_AT = '2026-11-04T21:52:24.136Z';
 
 describe('overlayGraduated — an auto-retired overlay counts as graduated (live 2026-11-04)', () => {
-  it('accepts an auto-retired pr-merged event whose evidence says the content is in main and the tree agrees', () => {
+  it.each(['pr-merged', 'in-main'])('accepts an auto-retired %s event whose evidence says the content is in main and the tree agrees', (reason) => {
     const f = fixture();
     expect(overlayGraduated({
-      ref: REF, sha: f.sha, build: f.build, registered: () => false, events: [retired({ tip: f.sha })], git: f.git, readyAt: READY_AT,
+      ref: REF, sha: f.sha, build: f.build, registered: () => false, events: [retired({ tip: f.sha, reason })], git: f.git, readyAt: READY_AT,
     })).toBe(true);
   });
 
@@ -69,13 +69,26 @@ describe('overlayGraduated — an auto-retired overlay counts as graduated (live
     })).toBe(false);
   });
 
-  it('refuses when the evidence does not say contentInMain and cleanMerges', () => {
+  it('refuses an auto-retired event with an unsupported reason despite matching tip and affirmative evidence', () => {
     const f = fixture();
-    const noContent = retired({ tip: f.sha, evidence: { cleanMerges: true, contentInMain: false } });
-    const dirty = retired({ tip: f.sha, evidence: { cleanMerges: false, contentInMain: true } });
-    for (const ev of [noContent, dirty, retired({ tip: f.sha, evidence: undefined })]) {
-      expect(overlayGraduated({ ref: REF, sha: f.sha, build: f.build, registered: () => false, events: [ev], git: f.git, readyAt: READY_AT })).toBe(false);
-    }
+    expect(overlayGraduated({
+      ref: REF, sha: f.sha, build: f.build, registered: () => false,
+      events: [retired({ tip: f.sha, reason: 'pr-closed' })], git: f.git, readyAt: READY_AT,
+    })).toBe(false);
+  });
+
+  it.each([
+    ['missing contentInMain', { cleanMerges: true }],
+    ['false contentInMain', { cleanMerges: true, contentInMain: false }],
+    ['missing cleanMerges', { contentInMain: true }],
+    ['false cleanMerges', { cleanMerges: false, contentInMain: true }],
+    ['missing evidence', undefined],
+  ])('refuses an auto-retired event with %s', (_name, evidence) => {
+    const f = fixture();
+    expect(overlayGraduated({
+      ref: REF, sha: f.sha, build: f.build, registered: () => false,
+      events: [retired({ tip: f.sha, evidence })], git: f.git, readyAt: READY_AT,
+    })).toBe(false);
   });
 
   it('refuses a retirement recorded after the candidate passed, a still-registered overlay, an unreadable log and a build lacking the content', () => {
