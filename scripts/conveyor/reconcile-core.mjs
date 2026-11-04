@@ -546,7 +546,8 @@ export function staleRequiredBaseRepair({ pr, requiredChecks, defaultBranch }) {
     ['queued', 'in_progress', 'pending', 'waiting', 'requested'].includes(String(row?.status ?? row?.state).toLowerCase())
     || String(row?.state).toLowerCase() === 'expected')) return null;
   const gate = reviewStartGate({ headSha: pr.headRefOid, requiredChecks, checks: pr.statusCheckRollup, verifyGreen: pr.verifyGreen, policy: pr.reviewTiming });
-  if (gate.allowed || gate.reason !== 'required-checks-not-successful' || !gate.affected.length
+  // 'ci-not-registered' is the early-start gate's name for the same all-missing shape (startEarly shadow/on).
+  if (gate.allowed || !['required-checks-not-successful', 'ci-not-registered'].includes(gate.reason) || !gate.affected.length
       || gate.affected.some(row => row.reason !== 'missing')) return null;
   return { missing: gate.affected.map(row => row.name) };
 }

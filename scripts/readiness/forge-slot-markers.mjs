@@ -62,7 +62,11 @@ export function runVerdict(telemetry, run) {
   // cleanup through this telemetry schema; it has no per-run cleanup field. A normal exit using either code
   // is deliberately treated conservatively too.
   if ((entry.code === 97 || entry.code === 254) && !evidence.complete) return 'unknown';
-  return Number.isInteger(entry.code) ? 'finished' : 'inflight';
+  if (Number.isInteger(entry.code)) return 'finished';
+  // R475: a run listed without a result is only 'inflight' while Forge reports some active run. With ZERO active runs
+  // (Forge's own count, sampled after the owner died) nothing is executing: the run was prepared and never started,
+  // and its dead owner can never send the `run` request. That is positive proof the slot is idle.
+  return evidence.complete ? 'idle' : 'inflight';
 }
 
 // Forge caps `recent` at the newest 50 receipts (forge-exec-run.mjs#parseTelemetry). An older run can still be
@@ -179,7 +183,26 @@ function ownerGone(root, index, file, liveness, selfPid) {
  * until an operator confirms remote cleanup and removes it. Local owner death alone cannot settle remote work.
  */
 export function createMarkerReaper({root, host, clock = Date.now, liveness = probePidLiveness, selfPid = process.pid,
-  graceMs = MARKER_GRACE_MS, log = () => {}, fs = {readdirSync, statSync, unlinkSync}}) {
+  graceMs = MARKER_GRACE_MS, log = () => {}, fs = {readdirSync, statSync, unlinkSync},
+  signal = () => {}, idleConfirmMs = 30_000, stuckMinSlots = 2, stuckAgeMs = 600_000, signalEveryMs = 600_000}) {
+  const signalledAt = new Map();
+  // The last-signalled time is shared through a stamp under the remote root, so every wait loop (one reaper each) on this
+  // host throttles together. A missing, unreadable or future-dated stamp is ignored: it can only cause an extra advisory
+  // event, never suppress one for good. The in-memory time still throttles this instance when writes fail.
+  const signalStamp = kind => join(root, `.signal-${kind}`);
+  const stampedAt = kind => {
+    let at = signalledAt.get(kind);
+    try { const saved = JSON.parse(readFileSync(signalStamp(kind), 'utf8')).at; if (Number.isFinite(saved) && (at === undefined || saved > at)) at = saved; } catch { /* none yet */ }
+    return at;
+  };
+  // R475: tell the health loop (and so the coroner) about a stuck pool; throttled per kind, never throws.
+  const raise = (kind, detail, now) => {
+    const last = stampedAt(kind);
+    if (last !== undefined && last <= now && now - last < signalEveryMs) return;
+    signalledAt.set(kind, now);
+    try { writeFileSync(signalStamp(kind), JSON.stringify({at: now}), {mode: 0o600}); } catch { /* advisory */ }
+    try { signal({kind, detail}); } catch { /* advisory */ }
+  };
   const firstDead = new Map();
   const sidecar = file => file + '.dead';
   function stampFor(file, key) {
@@ -192,6 +215,21 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
     }
     firstDead.set(key, at);
     return at;
+  }
+  const idleFile = file => file + '.idle';
+  // The release decision rests ONLY on this reaper's own live samples (kept in memory). The `.idle` sidecar is written
+  // best-effort for the alarm and age reporting and is never read back as evidence, so a stale or unreadable stamp from
+  // any process, or failing writes, can never cause a release.
+  const firstIdle = new Map();
+  function resetIdle(entry) {
+    firstIdle.delete(entry.key);
+    try { unlinkSync(idleFile(entry.file)); } catch { /* advisory only */ }
+  }
+  function idleStamp(file, key, sampledAt) {
+    if (firstIdle.has(key)) return firstIdle.get(key);
+    firstIdle.set(key, sampledAt);
+    try { writeFileSync(idleFile(file), JSON.stringify({key, sampledAt}), {mode: 0o600}); } catch { /* advisory only */ }
+    return sampledAt;
   }
   function claimAndRemove(entry) {
     const held = entry.index;
@@ -211,12 +249,12 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
     try { linkSync(tomb, entry.file); unlinkSync(tomb); } catch { /* the held tombstone stays and keeps blocking its slot */ }
     return false;
   }
-  const forget = (file, key) => { firstDead.delete(key); try { unlinkSync(sidecar(file)); } catch { /* absent */ } };
+  const forget = (file, key) => { firstDead.delete(key); firstIdle.delete(key); try { unlinkSync(sidecar(file)); } catch { /* absent */ } try { unlinkSync(idleFile(file)); } catch { /* absent */ } };
   return {
     async step(getTelemetry, now = clock()) {
       let names;
       try { names = fs.readdirSync(root); } catch { return []; }
-      const dead = [], reaped = [];
+      const dead = [], reaped = [], held = [];
       for (const name of names) {
         const m = NAME.exec(name);
         if (!m) continue;
@@ -225,6 +263,9 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
         try { ({mtimeMs, ino} = fs.statSync(file)); } catch { continue; }
         const marker = readMarker(file), index = Number(m[1]);
         if (marker.unreadable) continue;
+        const gone = ownerGone(root, index, file, liveness, selfPid);
+        // Only an old marker whose owner is provably gone is "stuck": a live owner is a long-running job, not a leak.
+        if (gone && now - mtimeMs >= stuckAgeMs) held.push({name, run: marker.run});
         const key = `${name}:${ino}:${mtimeMs}`; // a replacement marker never inherits a predecessor's death stamp
         if (marker.legacy) {
           // Neither a missing/dead local lock holder nor this host's telemetry proves an unbound job stopped.
@@ -232,20 +273,40 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
         }
         // Telemetry only speaks for its own Forge host: a marker not provably bound to this host is retained.
         if (marker.host !== host || host === undefined) continue;
-        if (!ownerGone(root, index, file, liveness, selfPid)) { forget(file, key); continue; }
+        if (!gone) { forget(file, key); continue; }
         stampFor(file, key);
         dead.push({name, key, file, mtimeMs, ino, index, run: marker.run, at: marker.at, owner: marker.owner});
       }
       if (dead.length) {
-        const telemetry = await getTelemetry();
+        let telemetry = null;
+        try { telemetry = await getTelemetry(); } catch { /* probe failed: unknown, fail closed */ }
         const sampledAt = Date.parse(telemetry?.sampledAtET), evidence = recentEvidence(telemetry);
+        if (!Number.isFinite(sampledAt) || !evidence) {
+          // An unknown or failed probe interrupts any idle confirmation: the next idle sample starts a fresh window.
+          for (const entry of dead) resetIdle(entry);
+          raise('probe-unknown', {slots: dead.map(d => d.name)}, now);
+        }
         if (Number.isFinite(sampledAt) && evidence) {
           dead.sort((a, b) => a.mtimeMs - b.mtimeMs);
           for (const entry of dead) {
             const diedBy = firstDead.get(entry.key);
-            if (now - entry.mtimeMs < graceMs || sampledAt < diedBy + DEATH_SAMPLE_MARGIN_MS) continue;
+            if (now - entry.mtimeMs < graceMs || sampledAt < diedBy + DEATH_SAMPLE_MARGIN_MS) { resetIdle(entry); continue; }
+            let verdict = 'run-less';
             if (entry.run) {
-              if (!['finished', 'absent'].includes(runVerdict(telemetry, entry.run))) continue;
+              verdict = runVerdict(telemetry, entry.run);
+              if (verdict !== 'idle') resetIdle(entry);
+              if (!['finished', 'absent', 'idle'].includes(verdict)) continue;
+              // 'idle' rests on Forge's active-run count, taken from a directory listing without a per-run cleanup
+              // receipt. So the run must also have existed for the whole death-sample margin before that sample (both
+              // stamps are Forge's clock): a run that old has its state on disk and would be counted if it were active.
+              if (verdict === 'idle') {
+                const started = Date.parse(telemetry.recent.find(item => item?.runId === entry.run)?.startedAtET);
+                if (!Number.isFinite(started) || sampledAt - started < DEATH_SAMPLE_MARGIN_MS) { resetIdle(entry); continue; } // not fully qualifying: restart the window
+                // The count can miss a concurrent prepared->running rename in ONE listing. Require a second, later sample,
+                // taken by THIS reaper, that still reports zero active runs before releasing.
+                const first = idleStamp(entry.file, entry.key, sampledAt);
+                if (sampledAt - first < idleConfirmMs) continue;
+              }
             } else if (!evidence.complete || maybeOwnsInflight(telemetry, entry.at ?? entry.mtimeMs, diedBy)) continue;
             // Claim whatever is at the marker name with one atomic rename, THEN prove it is the file we judged. A replacement
             // swapped in meanwhile is put straight back (or kept as a held tombstone that still blocks its slot), so no
@@ -253,9 +314,12 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
             if (!claimAndRemove(entry)) continue;
             forget(entry.file, entry.key);
             reaped.push(entry.name);
+            log(`heavy-admission: released unconfirmed remote slot ${JSON.stringify({slot: entry.index, runId: entry.run ?? null, verdict, activeRuns: telemetry.activeRuns, sampledAtET: telemetry.sampledAtET})} activeRuns=${telemetry.activeRuns}\n`);
           }
         }
       }
+      const stuck = held.filter(h => !reaped.includes(h.name));
+      if (stuck.length >= stuckMinSlots) raise('stuck-slots', {slots: stuck.map(h => h.name), minAgeMs: stuckAgeMs}, now);
       if (reaped.length) log(`heavy-admission: reaped stale remote slot marker(s) ${reaped.join(', ')} (owner dead; its Forge run is finished or absent)\n`);
       return reaped;
     },
