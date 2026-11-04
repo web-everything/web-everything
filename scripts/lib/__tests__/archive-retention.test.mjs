@@ -344,8 +344,8 @@ it('age threshold: records younger than keepDays stay', async () => {
 });
 it('unreadable, non-terminal and PR-evidence records are never eligible', async () => {
   const bad = await file(join(runs, 'bad.json')); // 'record' is not JSON
-  const pending = join(runs, 'p.json'); await writeFile(pending, JSON.stringify({ effects: [{ status: 'pending' }] })); await utimes(pending, old, old);
-  const pr = join(runs, 'pr.json'); await writeFile(pr, JSON.stringify({ effects: [{ status: 'applied', result: { pr: 1 } }] })); await utimes(pr, old, old);
+  const pending = join(runs, 'p.json'); await writeFile(pending, JSON.stringify({ ...JSON.parse(rec), effects: [{ status: 'pending' }] })); await utimes(pending, old, old);
+  const pr = join(runs, 'pr.json'); await writeFile(pr, JSON.stringify({ ...JSON.parse(rec), effects: [{ status: 'applied', result: { pr: 1 } }] })); await utimes(pr, old, old);
   const ok = join(runs, 'ok.json'); await writeFile(ok, rec); await utimes(ok, old, old);
   await realRun({ isComplete: () => true });
   expect(await Promise.all([bad, pending, pr, ok].map(exists))).toEqual([true, true, true, false]);
@@ -440,4 +440,16 @@ it('the live registry completion check treats cursor 1 of a multi-step op as unf
   const { loadRunCompletion } = await import('../runs-writer-exclusion.mjs');
   const done = await loadRunCompletion();
   expect(done({ op: 'no-such-op', cursor: 1, pending: null })).toBe(false);
+});
+
+it('a Drive copy whose content differs from the judged bytes keeps the original', async () => {
+  const p = join(runs, 'c.json'); await writeFile(p, rec); await utimes(p, old, old);
+  const out = await realRun({ isComplete: () => true, afterBundle: async () => { await writeFile(join(runs, 'c.json'), rec); } });
+  expect(out.errors).toEqual([]); // sanity: unchanged content passes
+  const q = join(runs, 'd.json'); await writeFile(q, rec); await utimes(q, old, old);
+  const out2 = await realRun({ isComplete: () => true, now: now + 2 * 86400000, afterBundle: async f => {
+    const { execFileSync } = await import('node:child_process'); const t = join(root, 'swap'); await mkdir(t, { recursive: true });
+    await writeFile(join(t, 'd.json'), 'tampered'); execFileSync('tar', ['-czf', f, '-C', t, './d.json']);
+  } });
+  expect(out2.errors.join()).toMatch(/mismatch|verification/); expect(await exists(q)).toBe(true);
 });

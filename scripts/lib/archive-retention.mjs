@@ -230,6 +230,17 @@ export async function archiveRetention(o = {}) {
         await unlink(temp).catch(e => { if (e.code !== 'ENOENT') throw e; });
         await o.afterBundle?.(final);
         const listing = o.listBundle ? await o.listBundle(final) : (await tar(['-tzf', final])).stdout.trimEnd().split('\n');
+        // Content check (runs): extract the Drive copy and compare each member's sha256 with the bytes judged eligible.
+        if (group.files.every(f => f.hash)) {
+          const check = await mkdtemp(join(tmpdir(), 'archive-retention-verify-'));
+          try {
+            await tar(['-xzf', final, '-C', check]);
+            for (const f of group.files) {
+              const got = createHash('sha256').update(await readFile(join(check, relative(source, f.path)))).digest('hex');
+              if (got !== f.hash) throw Error('archive content mismatch; originals retained');
+            }
+          } finally { await rm(check, { recursive: true, force: true }); }
+        }
         const verified = await lstat(final);
         if (!verified.isFile() || verified.size <= 0 || verified.size !== written.size || listing.length !== names.length || listing.some((n, i) => n !== names[i])) throw Error('archive verification failed; originals retained');
         const driveNow = await directory(drive);
