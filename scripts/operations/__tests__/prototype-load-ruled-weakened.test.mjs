@@ -41,13 +41,14 @@ describe('prototype-load ruled-WEAKENED exception (operator R396)', () => {
   it('NOT WEAKENED records are unchanged', () => {
     expect(readyEvidence([{ ref: REF, sha: SHA, tests: 'green', audit: 'NOT WEAKENED' }], input, [])).toMatchObject({ source: 'ready-record' });
   });
-  it('ships exactly the thirteen ruled entries with pinned refs, full shas and rulings', () => {
+  it('ships exactly the fourteen ruled entries with pinned refs, full shas and rulings', () => {
     const shipped = JSON.parse(readFileSync(join(process.cwd(), 'scripts/settings/prototype-load.json'), 'utf8'));
     expect(shipped.ruledWeakened.map(({ ref, sha, ruling }) => [ref, sha, ruling])
       .sort(([a], [b]) => a.localeCompare(b))).toEqual([
       ['lane/author-lookup-defer', 'f62437a87d2831fdb56be1ec3d8387243b5e2f57', 'R521'],
       ['lane/cheap-pr-list-retry', '393b3f42378fc25dd729b4d17c930dd7fb89a56c', 'R517'],
       ['lane/dispatch-scope-multi', '2fe6208f8409668f0a74a637c5b53ac46f5031cf', 'R396'],
+      ['lane/drain-rest-reader-r557', 'cc8ac117222de6f7146f7a059f55df0fe00aa587', 'R563'],
       ['lane/forge-slot-reconciler-r475', '0cbd4303bc0a961fdafda162bec407af8b8709dc', 'R475+R485'],
       ['lane/freeze-read-retry-lkg', 'f8564fc77a42e3c5a326fc17e38c3873f66696b3', 'R432'],
       ['lane/fresh-plan-read', '83be0f19530ef10b5634c1ce9b8f69074e620e7a', 'R521'],
