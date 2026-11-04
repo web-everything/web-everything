@@ -884,7 +884,8 @@ export async function runWithRemoteDecision({
   // confirmed termination; otherwise the marker stays for the reaper. Installed only while a marker is outstanding.
   const cancelController = new AbortController();
   let signalled = null; let onSignal;
-  const signalPromise = new Promise((resolve) => { onSignal = (name) => { if (signalled) return; signalled = name; resolve({ clientSignal: name }); cancelController.abort(); controller.abort(); }; });
+  let escalate; const escalatePromise = new Promise((resolve) => { escalate = () => resolve(null); });
+  const signalPromise = new Promise((resolve) => { onSignal = (name) => { if (signalled) { escalate(); return; } signalled = name; resolve({ clientSignal: name }); cancelController.abort(); controller.abort(); }; });
   let signalHandlers = [];
   // A kill that lands while a result is being recorded is honoured: exit with the signal code, keeping `terminated` as is.
   const killedExit = () => signalled ? { handled: true, exitCode: 128 + CLIENT_SIGNAL_NUMBERS[signalled], signal: signalled } : null;
@@ -920,6 +921,7 @@ export async function runWithRemoteDecision({
       const termination = await Promise.race([
         remote.catch(() => null),
         new Promise((resolve) => { cancelTimer = setTimeout(() => resolve(null), resolveSignalCancelWaitMs(env)); }),
+        escalatePromise, // a repeated signal during the cancel wait stops waiting at once (marker stays for the reaper)
       ]);
       clearTimeout(cancelTimer);
       terminated = (termination?.mode === 'remote' && Number.isInteger(termination.code) && termination.code >= 0 && termination.code <= 254)

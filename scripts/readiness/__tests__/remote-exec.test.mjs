@@ -770,7 +770,9 @@ describe('standards input parity', () => {
 
   const ackReceipt = (_nonce, value) => JSON.stringify({v:1,nonce:value.nonce,run:value.run,cancelAck:true});
   it.each([['a cancel-acknowledged finish (run killed before a receipt)', ackReceipt, 'cancelled'], ['a legacy runner null finish that never acknowledged cancel', 'null', 'unconfirmed'], ['a finish that failed to parse', 'untrusted', 'unconfirmed'],
-    ['a cancel ack for another run', (_n, value) => JSON.stringify({v:1,nonce:value.nonce,run:'other',cancelAck:true}), 'unconfirmed']])(
+    ['a cancel ack for another run', (_n, value) => JSON.stringify({v:1,nonce:value.nonce,run:'other',cancelAck:true}), 'unconfirmed'],
+    ['a cancel ack with another nonce', (_n, value) => JSON.stringify({v:1,nonce:'f'.repeat(32),run:value.run,cancelAck:true}), 'unconfirmed'],
+    ['a cancel ack with another version', (_n, value) => JSON.stringify({v:2,nonce:value.nonce,run:value.run,cancelAck:true}), 'unconfirmed']])(
     'x40a9dk: an aborted client reports %s as %s', async (_name, receipt, mode) => {
     const controller = new AbortController(), abort = () => controller.abort();
     const f = fixture({receipt}), original = f.exec;
