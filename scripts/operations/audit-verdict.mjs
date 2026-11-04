@@ -52,7 +52,11 @@ function d2Verified(f, releaseStage, { readCard = readCardFromMain, now = Date.n
     if (typeof f.card !== 'string' || !CARD_PATH.test(f.card)) return false;
     const body = readCard(f.card);
     if (typeof body !== 'string' || !body.trim()) return false;
-    const due = /^mustPayBefore:\s*(\S+)\s*$/m.exec(body)?.[1];
+    // Any pay-by-looking line (indent, case, spacing, trailing text) must parse strictly, or it fails closed.
+    const lines = body.split(/\r\n|[\n\r  ]/).filter(l => /^\s*must[\s_-]*pay[\s_-]*before\s*:/i.test(l.normalize('NFKC')));
+    if (lines.length > 1) return false;
+    const due = lines.length ? /^mustPayBefore: *(\S+) *$/.exec(lines[0])?.[1] : undefined;
+    if (lines.length && due === undefined) return false;
     if (due === undefined) return true;
     if (due === 'prod') return releaseStage !== 'prod';
     const when = Date.parse(due);

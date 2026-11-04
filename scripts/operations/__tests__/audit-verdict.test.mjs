@@ -354,6 +354,16 @@ describe('R473 structured concurrency evidence', () => {
       // A model-supplied overdue date does not override a card with no pay-by either way.
       expect((await compute([d2({ mustPayBefore: '2026-11-01' })], options('prerelease', { readCard: reader(), now: NOW }))).verdict).toBe('NOT WEAKENED');
     });
+    it.each([
+      ['a trailing comment', 'mustPayBefore: 2026-12-01 # later'], ['an indent', '  mustPayBefore: 2026-12-01'],
+      ['a space before the colon', 'mustPayBefore : 2026-12-01'], ['different case', 'MustPayBefore: 2026-12-01'],
+      ['a bare-CR line ending and trailing text','status: open\rmustPayBefore: 2026-12-01 x'], ['two pay-by lines', 'mustPayBefore: 2026-12-01\nmustPayBefore: 2026-11-01'],
+      ['a prod pay-by with trailing text', 'mustPayBefore: prod # x'],
+    ])('a pay-by line with %s that does not parse strictly fails closed', async (_n, body) => {
+      for (const stage of ['prerelease', 'prod']) {
+        expect((await compute([d2()], options(stage, { readCard: reader(`${body}\n`), now: NOW }))).verdict).toBe('WEAKENED');
+      }
+    });
     it('a card due before prod ships at prerelease and blocks at prod', async () => {
       const due = () => reader('status: open\nmustPayBefore: prod\n');
       expect((await compute([d2()], options('prerelease', { readCard: due(), now: NOW }))).verdict).toBe('NOT WEAKENED');
