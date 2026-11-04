@@ -264,6 +264,10 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
       '⏸ conveyor fix — paused for a concurrent author, re-arms on the next head\n',
       '⏳ conveyor fix — fix ready, verify red only on host-load timeouts; re-verifies when the host is quiet\n',
       '🚧 review on hold pending operator\n\nsome unknown future hold',
+      'review paused: referral hold\n',
+      'ℹ️ conveyor — note\n',
+      '﻿**🛑 stood down** pending operator\n',
+      '🧭 standing ruling — hold this PR\n',
     ]) expect(seedFromReviewComments([...mk(good), ...mk(control)])).toBeNull();
     // ...but a control comment BEFORE the accept does not
     expect(seedFromReviewComments([...mk('🛑 conveyor fix — stood down, human judgment needed\n'), ...mk(good)])).not.toBeNull();
@@ -272,6 +276,10 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     // fences: a ``` line inside a ~~~ block, and inside a 4-backtick block, does not close it
     expect(seedFromReviewComments(mk(`✅ review — accepted\n\n~~~\n\`\`\`\n<!-- reviewed-sha: ${H(3)} -->\n~~~\n`))).toBeNull();
     expect(seedFromReviewComments(mk(`✅ review — accepted\n\n\`\`\`\`\n\`\`\`\n<!-- reviewed-sha: ${H(3)} -->\n\`\`\`\`\n`))).toBeNull();
+    // a 4-space-indented fence line is not a closer (CommonMark), so the marker stays inside the block
+    expect(seedFromReviewComments(mk(`✅ review — accepted\n\n\`\`\`\n    \`\`\`\n<!-- reviewed-sha: ${H(3)} -->\n`))).toBeNull();
+    // a benign non-control trusted comment after the accept does not void it
+    expect(seedFromReviewComments([...mk(good), ...mk('thanks, merging soon\n')])).not.toBeNull();
     // a closer with an info string does not close; a proper longer closer does, so a marker after it is accepted
     expect(seedFromReviewComments(mk(`✅ review — accepted\n\n\`\`\`\n\`\`\`js\n<!-- reviewed-sha: ${H(3)} -->\n\`\`\`\n`))).toBeNull();
     expect(seedFromReviewComments(mk(`✅ review — accepted\n\n\`\`\`\ncode\n\`\`\`\`\n<!-- reviewed-sha: ${H(3)} -->\n`))).not.toBeNull();
