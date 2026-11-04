@@ -2022,6 +2022,14 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
       const fixed = old({ fingerprint: undefined, base: OTHER_BASE, at: '2026-10-22T12:00:00Z' });
       expect(carried(weak, fixed).ok).toBe(true);
     });
+    it('both verdicts fingerprinted: a superseded WEAKENED never blocks the carry, before or after a fresh live-head audit (round 3 red-team)', () => {
+      const weak = old({ base: OTHER_BASE, verdict: 'WEAKENED', at: '2026-11-01T10:00:00Z' });
+      const fixed = old({ base: OTHER_BASE, at: '2026-11-01T11:00:00Z' });
+      const liveAudit = auditRecord({ head: SHA, base: OTHER_BASE, fingerprint: FP, at: '2026-11-01T12:00:00Z' });
+      expect(prototypeLoad.canonicalAuditEvidence([weak, fixed], SHA, () => true, FP)).toEqual({ ok: true, record: fixed });
+      expect(prototypeLoad.canonicalAuditEvidence([fixed, weak], SHA, () => true, FP)).toEqual({ ok: true, record: fixed });
+      expect(prototypeLoad.canonicalAuditEvidence([weak, fixed, liveAudit], SHA, () => true, FP)).toEqual({ ok: true, record: liveAudit });
+    });
     it('a valid WEAKENED verdict that is the latest for its base still blocks, even next to a contradictory pass', () => {
       const weak = old({ fingerprint: undefined, base: OTHER_BASE, verdict: 'WEAKENED', at: '2026-10-22T12:00:00Z' });
       const earlierPass = old({ fingerprint: undefined, base: OTHER_BASE, at: '2026-10-21T12:00:00Z' });
