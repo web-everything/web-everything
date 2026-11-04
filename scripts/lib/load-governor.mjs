@@ -29,9 +29,19 @@ export function resolveGovernorSettings({ settings, env = {} } = {}) {
   for (const k of ['targetLoadPerCore', 'resumeBelowPerCore']) if (pos(s[k])) r[k] = s[k];
   if (Number.isFinite(s.maxPauseMinutes) && s.maxPauseMinutes >= 1) r.maxPauseMinutes = s.maxPauseMinutes; // a sub-minute TTL would make every pause a no-op
   if (Array.isArray(s.priority) && s.priority.length && s.priority.every((x) => typeof x === 'string')) r.priority = [...s.priority];
-  if (typeof s.holdFromClass === 'string' && r.priority.includes(s.holdFromClass)) r.holdFromClass = s.holdFromClass;
+  const explicitCutoff = typeof s.holdFromClass === 'string' && r.priority.includes(s.holdFromClass);
+  if (explicitCutoff) r.holdFromClass = s.holdFromClass;
   if (s.classPatterns && typeof s.classPatterns === 'object') {
-    for (const [c, p] of Object.entries(s.classPatterns)) if (Array.isArray(p) && p.every((x) => typeof x === 'string' && x.trim())) r.classPatterns[c] = p; // a blank pattern matches every owner
+    for (const [c, p] of Object.entries(s.classPatterns)) {
+      if (c === '__proto__') continue; // assigning it would swap the prototype instead of adding a class
+      if (Array.isArray(p) && p.every((x) => typeof x === 'string' && x.trim())) r.classPatterns[c] = p; // a blank pattern matches every owner
+    }
+  }
+  // No usable cutoff given: resolve one that exists in the resulting priority list (the default if it is there and reachable,
+  // else the first reachable non-exempt class) instead of discarding the whole priority override.
+  if (!explicitCutoff) {
+    const cand = [GOVERNOR_DEFAULTS.holdFromClass, ...r.priority].find((c) => r.priority.includes(c) && !ALWAYS_EXEMPT.includes(c) && isReachable(c, r));
+    if (cand) r.holdFromClass = cand;
   }
   const t = Number(env.WE_LOAD_GOVERNOR_TARGET); if (pos(t)) r.targetLoadPerCore = t;
   const rs = Number(env.WE_LOAD_GOVERNOR_RESUME); if (pos(rs)) r.resumeBelowPerCore = rs;
@@ -50,12 +60,14 @@ export function resolveGovernorSettings({ settings, env = {} } = {}) {
 export function ownerClass(text, settings = GOVERNOR_DEFAULTS) {
   const t = String(text ?? '').toLowerCase();
   // exempt classes are scanned first even when a priority override omits them, so no setting can make them holdable
-  for (const c of new Set([...ALWAYS_EXEMPT, ...settings.priority])) if ((settings.classPatterns[c] ?? []).some((p) => t.includes(p.toLowerCase()))) return c;
+  for (const c of new Set([...ALWAYS_EXEMPT, ...settings.priority])) if (patternsOf(settings, c).some((p) => t.includes(p.toLowerCase()))) return c;
   return fallbackClass(settings);
 }
+/** Own-property lookup only: a class named `constructor`/`toString` must not read inherited Object members. */
+const patternsOf = (settings, c) => (Object.hasOwn(settings.classPatterns ?? {}, c) && Array.isArray(settings.classPatterns[c]) ? settings.classPatterns[c] : []);
 const fallbackClass = (settings) => (settings.priority.includes('build') ? 'build' : settings.priority[settings.priority.length - 1]);
 /** Can some owner text classify as `c`? Only with a pattern, or as the fallback class. */
-const isReachable = (c, settings) => (settings.classPatterns[c] ?? []).length > 0 || fallbackClass(settings) === c;
+const isReachable = (c, settings) => patternsOf(settings, c).length > 0 || fallbackClass(settings) === c;
 export const classRank = (c, settings = GOVERNOR_DEFAULTS) => { const i = settings.priority.indexOf(c); return i < 0 ? settings.priority.length : i; };
 /** PURE: is this class below the exemption cutoff (so subject to holds and pauses)? */
 export const ALWAYS_EXEMPT = Object.freeze(['main-fix', 'delivery-unblock']); // no setting may hold or pause these
@@ -126,8 +138,11 @@ export function governorTick({ loadPerCore, owners = [], settings = GOVERNOR_DEF
   if (st.unreadable) events.push({ event: 'load-unreadable', reason: st.reason });
   for (const { owner, text } of owners) {
     const cls = ownerClass(text ?? owner, settings);
-    if (!isHoldable(cls, settings)) continue;
     const cur = readPause({ dir, owner, maxPauseMinutes: settings.maxPauseMinutes, now });
+    if (!isHoldable(cls, settings)) { // reclassified as exempt (e.g. feature-build -> red-main-repair): drop OUR pause, never an operator's
+      if (cur?.by === GOVERNOR_REASON) { clearPause({ dir, owner }); events.push({ event: 'resumed', owner, cls }); }
+      continue;
+    }
     // cooled holds on-disk (sanitized) names, as sweepExpired returns them, so compare in that key space
     if (st.holding && !cur && !cooled.includes(safe(owner))) { setPause({ dir, owner, reason: `${GOVERNOR_REASON}: ${st.reason}`, by: GOVERNOR_REASON, now }); events.push({ event: 'paused', owner, cls }); }
     else if (!st.holding && cur?.by === GOVERNOR_REASON) { clearPause({ dir, owner }); events.push({ event: 'resumed', owner, cls }); }

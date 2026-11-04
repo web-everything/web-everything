@@ -85,8 +85,44 @@ describe('hold and release', () => {
     expect(ownerClass('anything')).toBe('build');
   });
 });
+describe('settings: class names that collide with Object members', () => {
+  it.each(['constructor', 'toString', 'hasOwnProperty', '__proto__'])('priority naming %s never throws in ownerClass/shouldHold', (name) => {
+    const s = resolveGovernorSettings({ settings: { loadGovernor: { priority: ['daemon-fix', name] } } });
+    expect(() => ownerClass('feature-build', s)).not.toThrow();
+    expect(() => shouldHold({ text: 'feature-build', holding: true, settings: s })).not.toThrow();
+    expect(() => releaseOrder([{ text: 'x' }], s)).not.toThrow();
+  });
+  it('a __proto__ classPatterns key does not swap the prototype', () => {
+    const s = resolveGovernorSettings({ settings: JSON.parse('{"loadGovernor":{"classPatterns":{"__proto__":["x"]}}}') });
+    expect(Object.getPrototypeOf(s.classPatterns)).toBe(Object.prototype);
+  });
+});
+describe('settings: a priority override without a cutoff resolves one inside that list', () => {
+  it('keeps the override and picks the first reachable non-exempt class as cutoff', () => {
+    const s = resolveGovernorSettings({ settings: { loadGovernor: { priority: ['main-fix', 'delivery-unblock', 'build', 'report'] } } });
+    expect(s.priority).toEqual(['main-fix', 'delivery-unblock', 'build', 'report']);
+    expect(s.holdFromClass).toBe('build');
+    expect(shouldHold({ text: 'feature-build', holding: true, settings: s }).hold).toBe(true);
+    expect(shouldHold({ text: 'red-main repair', holding: true, settings: s }).hold).toBe(false);
+  });
+  it('keeps the default cutoff when the override still contains it', () => {
+    const s = resolveGovernorSettings({ settings: { loadGovernor: { priority: ['build', 'daemon-fix', 'report'] } } });
+    expect(s.holdFromClass).toBe('daemon-fix'); expect(s.priority.includes(s.holdFromClass)).toBe(true);
+  });
+});
 describe('pause flags', () => {
   const now = new Date('2026-11-03T13:00:00Z');
+  it('a worker reclassified as exempt loses its governor pause, but never an operator pause', () => {
+    const dir = tmp(); const stateFile = join(tmp(), 'st.json');
+    let r = governorTick({ loadPerCore: 3, owners: [{ owner: 'w1', text: 'feature-build' }, { owner: 'w2', text: 'feature-build' }], stateFile, dir, now });
+    expect(r.events.filter((e) => e.event === 'paused').length).toBe(2);
+    setPause({ dir, owner: 'w2', reason: 'by hand', by: 'operator', now });
+    expect(readPause({ dir, owner: 'w1', now })).not.toBeNull();
+    r = governorTick({ loadPerCore: 3, owners: [{ owner: 'w1', text: 'red-main-repair' }, { owner: 'w2', text: 'red-main-repair' }], stateFile, dir, now });
+    expect(readPause({ dir, owner: 'w1', now })).toBeNull();
+    expect(readPause({ dir, owner: 'w2', now })).toMatchObject({ by: 'operator' });
+    expect(r.events.filter((e) => e.event === 'resumed').map((e) => e.owner)).toEqual(['w1']);
+  });
   it('set, read, expire by TTL', () => {
     const dir = tmp();
     setPause({ dir, owner: 'w1', reason: 'r', now });
@@ -142,6 +178,19 @@ describe('pause flags', () => {
   });
 });
 describe('worker-pause CLI and smell', () => {
+  it.each([['--owner'], ['--owner='], ['--owner=  ']])('--resume %s with no usable value is an argument error and keeps every flag', (flag) => {
+    const dir = tmp(); const out = []; const o = (s) => out.push(s); const now = new Date('2026-11-03T13:00:00Z');
+    setPause({ dir, owner: 'a', reason: 'x', by: 'operator', now }); setPause({ dir, owner: 'b', reason: 'y', by: 'operator', now });
+    expect(main(['--resume', flag], { dir, out: o, now })).not.toBe(0);
+    expect(out.at(-1)).toMatch(/error/);
+    expect(listPauses({ dir, now }).map((x) => x.owner).sort()).toEqual(['a', 'b']);
+  });
+  it('bare --resume still clears every flag', () => {
+    const dir = tmp(); const now = new Date('2026-11-03T13:00:00Z');
+    setPause({ dir, owner: 'a', reason: 'x', now }); setPause({ dir, owner: 'b', reason: 'y', now });
+    expect(main(['--resume'], { dir, out: () => {}, now })).toBe(0);
+    expect(listPauses({ dir, now })).toEqual([]);
+  });
   it('sets, lists, resumes', () => {
     const dir = tmp(); const out = []; const o = (s) => out.push(s);
     expect(main(['--owner=w9', '--reason=x'], { dir, out: o })).toBe(0);

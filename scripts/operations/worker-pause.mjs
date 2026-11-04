@@ -28,6 +28,7 @@ export function main(argv, { out = (s) => writeLineSync(1, s),settings, dir = de
     return 0;
   }
   if (a.resume) {
+    if ('owner' in a && !(typeof a.owner === 'string' && a.owner.trim())) { out('error: --owner needs a non-empty value (use --resume alone to clear every flag)'); return 2; }
     if (typeof a.owner === 'string') { out(clearPause({ dir, owner: a.owner }) ? `resumed ${a.owner}` : `no flag for ${a.owner}`); return 0; }
     const l = listPauses({ dir, maxPauseMinutes: s.maxPauseMinutes, now }); l.forEach((x) => clearPause({ dir, owner: x.owner })); out(`resumed ${l.length} owner(s)`); return 0;
   }
