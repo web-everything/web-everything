@@ -37,7 +37,7 @@ import {
   markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, CI_HEAL_ROUND_CAP,
   CONFLICT_FIX_ROUND_CAP, ADVISORY_FIX_ROUND_CAP, CONFLICT_FIX_ABSOLUTE_CEILING, foldReviewRefusalInto,
   ACCEPT_LABEL_GRACE_MS, acceptLabelDropped, CARD_BATCH_EXTRACT_WIRED, BLOCKED_CANCELLED_RERUN_CAP,
-  greenSettledForRestoreGrace, RESTORE_REVIEW_LABEL_GRACE_MS,
+  greenSettledForRestoreGrace, RESTORE_REVIEW_LABEL_GRACE_MS, checksNotYetRun,
 } from '../reconcile-core.mjs';
 import {
   STAND_DOWN_MARKER, WATCHER_STAND_DOWN_ACTOR, SUPERSEDE_STAND_DOWN_MARKER, buildStandDownComment,
@@ -3988,11 +3988,52 @@ describe('restore-review-label — open green PR with no review label (PR #3830)
       const pr = open({ baseRefName: 'lane/parent', statusCheckRollup, rollupIncomplete: false });
       expect(planReconcile({ prs: [pr], now: NOW, requiredChecks: ['gate'] }).dispatch)
         .toContainEqual(expect.objectContaining({ kind: 'restore-review-label' }));
-      for (const completedAt of ['unreadable', '0001-01-01T00:00:00Z']) {
+      // Malformed timing and a prior run's real timing are not "never started". (The year-0001 value is gh's
+      // own "never set" sentinel, so it is covered as never-started by the mapper test below.)
+      for (const completedAt of ['unreadable', new Date(NOW - HOUR).toISOString()]) {
         expect(planReconcile({ prs: [{ ...pr, statusCheckRollup: [{ name: 'gate', status: 'QUEUED', completedAt }] }], now: NOW }).dispatch
           .some(d => d.kind === 'restore-review-label')).toBe(false);
       }
     });
+  describe('checksNotYetRun — mapped never-started checks vs reruns (judge round 7/9)', () => {
+    const node = over => ({ __typename: 'CheckRun', name: 'gate', status: 'QUEUED', conclusion: null,
+      startedAt: null, completedAt: null, detailsUrl: null, ...over });
+    const mapped = (...nodes) => mapGraphqlPr({ commits: { nodes: [{ commit: { statusCheckRollup: {
+      contexts: { pageInfo: { hasNextPage: false }, nodes } } } }] } });
+    it.each(['QUEUED', 'PENDING', 'WAITING', 'REQUESTED'])('mapper output of a never-started %s check is never-started', status => {
+      const { statusCheckRollup, rollupIncomplete } = mapped(node({ status }));
+      // The mapper fills absent timing with gh's year-0001 sentinel and an absent conclusion with ''.
+      expect(statusCheckRollup[0]).toMatchObject({ startedAt: '0001-01-01T00:00:00Z', completedAt: '0001-01-01T00:00:00Z', conclusion: '' });
+      expect(checksNotYetRun(statusCheckRollup)).toBe(true);
+      const pr = open({ baseRefName: 'lane/parent', statusCheckRollup, rollupIncomplete });
+      expect(planReconcile({ prs: [pr], now: NOW, requiredChecks: ['gate'] }).dispatch)
+        .toContainEqual(expect.objectContaining({ kind: 'restore-review-label' }));
+    });
+    it('a queued RERUN with a populated startedAt is not never-started (raw and mapped)', () => {
+      const startedAt = new Date(NOW - HOUR).toISOString();
+      expect(checksNotYetRun([{ __typename: 'CheckRun', name: 'gate', status: 'QUEUED', conclusion: null, startedAt, completedAt: null }])).toBe(false);
+      const { statusCheckRollup, rollupIncomplete } = mapped(node({ startedAt }));
+      expect(checksNotYetRun(statusCheckRollup)).toBe(false);
+      const pr = open({ baseRefName: 'lane/parent', statusCheckRollup, rollupIncomplete });
+      expect(planReconcile({ prs: [pr], now: NOW, requiredChecks: ['gate'] }).dispatch
+        .some(d => d.kind === 'restore-review-label')).toBe(false);
+    });
+    it.each([
+      ['prior completedAt', { completedAt: new Date(NOW - HOUR).toISOString() }],
+      ['prior conclusion', { conclusion: 'FAILURE' }],
+      ['unreadable startedAt', { startedAt: 'unreadable' }],
+      ['in progress', { status: 'IN_PROGRESS' }],
+    ])('mapped %s is not never-started', (_name, over) => {
+      expect(checksNotYetRun(mapped(node(over)).statusCheckRollup)).toBe(false);
+    });
+    it('one never-started row beside one rerun row is not never-started; StatusContext and non-arrays fail closed', () => {
+      const rerun = node({ name: 'lint', startedAt: new Date(NOW - HOUR).toISOString() });
+      expect(checksNotYetRun(mapped(node(), rerun).statusCheckRollup)).toBe(false);
+      expect(checksNotYetRun(mapped({ __typename: 'StatusContext', context: 'legacy', state: 'PENDING', createdAt: null }).statusCheckRollup)).toBe(false);
+      expect(checksNotYetRun(null)).toBe(false);
+      expect(checksNotYetRun(undefined)).toBe(false);
+    });
+  });
   it('a stacked PR read through the GraphQL snapshot/paged mapper with no checks yet (null rollup) restores review', () => {
     // GitHub's own answer for a commit no check has reported on: statusCheckRollup null.
     const { statusCheckRollup, rollupIncomplete } = mapGraphqlPr({ commits: { nodes: [{ commit: { statusCheckRollup: null } }] } });

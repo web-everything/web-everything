@@ -2094,12 +2094,19 @@ export function greenSettledForRestoreGrace(rollup, now, graceMs = RESTORE_REVIE
   return now - Math.max(...checks.map(completion)) >= graceMs;
 }
 
-/** A stacked PR may need its review label before CI ever starts. Do not mistake a rerun,
- * a missing rollup, or malformed timing for that never-started state. */
-function checksNotYetRun(rollup) {
+/** gh and the paged GraphQL mapper (`we:scripts/lib/pr-list-paged.mjs#mapGraphqlPr`) write a never-set
+ * time as the year-0001 sentinel and a never-set conclusion as ''. Only those exact forms read as absent;
+ * any other string (a real time, or an unreadable one) is present. */
+const unsetTime = v => v == null || v === '' || (typeof v === 'string' && /^0001-01-01T00:00:00(?:\.0+)?Z$/.test(v));
+const unsetConclusion = v => v == null || v === '';
+
+/** A stacked PR may need its review label before CI ever starts. Accepts both raw rows and the mapped
+ * shape. Do not mistake a rerun (a prior real startedAt/completedAt/conclusion), a missing rollup,
+ * or malformed timing for that never-started state. */
+export function checksNotYetRun(rollup) {
   return Array.isArray(rollup) && rollup.every(c => c && c.__typename !== 'StatusContext'
     && ['QUEUED', 'PENDING', 'WAITING', 'REQUESTED'].includes(String(c.status).toUpperCase())
-    && c.conclusion == null && c.completedAt == null && c.startedAt == null);
+    && unsetConclusion(c.conclusion) && unsetTime(c.completedAt) && unsetTime(c.startedAt));
 }
 
 /** #3902 — env switch for the review-label healer: `stuck` (default) | `green` | `off`. */
