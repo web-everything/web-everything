@@ -8,6 +8,7 @@
 import { readdir, readFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { isRunRecordTerminal } from '../operations/run-store.mjs';
+import { parseRunRecord } from '../operations/run-record.mjs';
 
 export const pidAlive = (pid) => {
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
@@ -45,7 +46,7 @@ export function createRunsWriterExclusion({ isPidAlive = pidAlive, list = readdi
  */
 export function runRecordEligible(text) {
   let record;
-  try { record = JSON.parse(text); } catch { return false; }
+  try { const parsed = parseRunRecord(text); if (!parsed.ok) return false; record = parsed.record; } catch { return false; }
   if (!isRunRecordTerminal(record)) return false;
   // Fail closed on unknown shapes: every effect must carry a status known to be final.
   if (!record.effects.every(e => e && typeof e === 'object' && ['declared', 'applied', 'failed'].includes(e.status))) return false;

@@ -319,7 +319,8 @@ it('coordinated writer arriving after final stat waits until removal and its new
 });
 
 // R555: pluggable writer exclusion, batch cap, eligibility, fail-closed.
-const rec = JSON.stringify({ effects: [], pending: null });
+import { newRunRecord } from '../../operations/run-record.mjs';
+const rec = JSON.stringify(newRunRecord({ id: 'r1', op: 'review-pr' }));
 const realRun = (extra = {}) => run({ runEligible: undefined, ...extra });
 it('batch cap archives only the oldest N files per run', async () => {
   const mk = i => file(join(runs, `r${i}.json`), new Date(now - (60 - i) * 86400000));
@@ -372,8 +373,10 @@ it('a writer that appears after a first check is seen (no cached listing)', asyn
 });
 it('records with unknown effect statuses are not eligible', async () => {
   const { runRecordEligible } = await import('../runs-writer-exclusion.mjs');
-  expect(runRecordEligible(JSON.stringify({ effects: [{ status: 'weird' }] }))).toBe(false);
-  expect(runRecordEligible(JSON.stringify({ effects: [{ status: 'applied' }] }))).toBe(true);
+  const base = newRunRecord({ id: 'r1', op: 'review-pr' });
+  expect(runRecordEligible(JSON.stringify({ ...base, effects: [{ status: 'weird' }] }))).toBe(false);
+  expect(runRecordEligible(JSON.stringify({ effects: [] }))).toBe(false); // schema-invalid
+  expect(runRecordEligible(rec)).toBe(true);
 });
 it('a record replaced just before removal is restored, not deleted', async () => {
   const p = await file(join(runs, 'r.json'));
@@ -401,6 +404,6 @@ it('migration-format temp (<name>.<pid>.<uuid>.tmp) of a live pid also blocks re
 });
 it('same-inode rewrite with restored mtime is caught by the content hash at quarantine', async () => {
   const p = join(runs, 'h.json'); await writeFile(p, rec); await utimes(p, old, old);
-  const out = await realRun({ afterSourceStat: async path => { await writeFile(path, rec.replace('[]', '[ ]').padEnd(rec.length)); await utimes(path, old, old); } });
+  const out = await realRun({ afterSourceStat: async path => { await writeFile(path, rec.replace('r1', 'r2')); await utimes(path, old, old); } });
   expect(await exists(p)).toBe(true); expect(out.filesRetained).toBeGreaterThan(0);
 });
