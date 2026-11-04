@@ -683,6 +683,18 @@ describe('the lane comes from the tick core or nowhere', () => {
     expect(legacy.scope).toEqual([`${canonical}:src/a.mjs`]);
   });
 
+  it.each(['foo:src/a.mjs', 'Weird:src/a.mjs', 'we2:src/a.mjs', 'plateau-api:src/a.mjs'])(
+    'send-back item 1 — refuses the unknown scope prefix %s for build and repair scopes', (piece) => {
+      for (const launchKind of ['build', 'fix']) {
+        const read = tickRead({ launchKind, launch: { num: '3037', lane: 8, pr: 6244, reason: 'red-ci' } });
+        expect(() => shapeDispatchRead({ ...read, item: { ...read.item, scope: [piece] } }, { num: '3037' }), `${launchKind} ${piece}`)
+          .toThrow(/unknown scope (repo )?prefix|unsafe scope repository/);
+        expect(() => shapeDispatchRead({ ...read, item: { ...read.item, scope: ['we:src/ok.mjs', `src/b.mjs ${piece}`] } }, { num: '3037' }))
+          .toThrow(/unknown scope (repo )?prefix|unsafe scope repository/);
+      }
+    },
+  );
+
   it('still refuses unsafe paths with legacy prefixes or no prefix', () => {
     const read = tickRead();
     for (const prefix of ['plateau-app:', 'frontierui:', 'webeverything:', 'FUI:', 'WE:', '']) {

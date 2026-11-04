@@ -413,6 +413,7 @@ export const BRIEF_SCOPE_VALUE_RE = /^[A-Za-z0-9_.,:/@#*-]+$/;
 // Mirror repo-profile's scope aliases without importing its filesystem-backed profile resolver into this
 // pure declaration. The dispatch tests pin these values against repoProfile(...).canonicalPrefix.
 export const SCOPE_PREFIX_ALIASES = Object.freeze({ webeverything: 'we', frontierui: 'fui', 'plateau-app': 'plateau', pa: 'plateau' });
+const CANONICAL_SCOPE_REPOS = new Set(Object.values(SCOPE_PREFIX_ALIASES));
 function canonicalScopePrefix(value) {
   const lower = String(value).toLowerCase();
   const key = repoKeyForSlug(lower) ?? lower;
@@ -464,7 +465,11 @@ export function normalizeBriefScope(raw, dispatchRepo = 'we') {
         throw new Error(`dispatch-lane: unsafe scope entry ${JSON.stringify(piece)} — absolute, empty, \`.\` and \`..\` path segments are refused for {{SCOPE}}.`);
       }
       const repo = canonicalScopePrefix(prefix ? prefix.slice(0, -1) : dispatchRepo);
-      if (!/^[a-z][\w-]*$/.test(repo)) throw new Error(`dispatch-lane: unsafe scope repository ${JSON.stringify(repo)}`);
+      // Known aliases were canonicalized above; anything still outside the canonical set is an unknown prefix and
+      // is refused (an unqualified path never gets here with a foreign repo: it takes `dispatchRepo`, the locus).
+      if (!CANONICAL_SCOPE_REPOS.has(repo)) {
+        throw new Error(`dispatch-lane: unknown scope repo prefix ${JSON.stringify(prefix || dispatchRepo)} for {{SCOPE}} — use we:, fui: or plateau: (or a known alias).`);
+      }
       out.push(`${repo}:${piece.slice(prefix.length)}`);
     }
   }
