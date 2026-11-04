@@ -613,6 +613,70 @@ with patch.object(ctypes, 'CDLL') as libc, patch.object(subprocess, 'Popen') as 
     expect(result.status,result.stderr).toBe(0);
     expect(await readFile(status,'utf8')).toBe('3');
   });
+  it.each(['wall limit', 'orphan sweep', 'normal exit'].flatMap(mode => [[mode, false], [mode, true]]))('supervisor enforces %s with cancel configured=%s', async (mode, withCancel) => {
+    const status=join(root,'bounded-supervisor-status');
+    const probe=String.raw`import builtins, ctypes, io, json, os, signal, subprocess, sys, time
+from unittest.mock import patch
+source, root, status, mode, with_cancel = sys.argv[1:]
+now, waits = 0, 0
+killed, swept = [], []
+entries = {
+    101: (b'S', 100), 102: (b'S', 101),
+    201: (b'S', 100), 202: (b'S', 201),
+    203: (b'Z', 100), 204: (b'Z', 201),
+    301: (b'S', 999),
+}
+def listproc(path):
+    assert path == '/proc'
+    if now >= 4: entries[205] = (b'S', 100)
+    return [*(str(pid) for pid in entries), 'self', '9999']
+def proc_open(path, *args, **kwargs):
+    pid = int(path.split('/')[2])
+    if pid not in entries: raise FileNotFoundError(path)
+    state, ppid = entries[pid]
+    return io.BytesIO(str(pid).encode() + b' (name ) with delimiters) ' + state + b' ' + str(ppid).encode() + b' 0 0\n')
+def kill(pid, sig):
+    assert sig == signal.SIGKILL
+    killed.append(pid)
+def wait(timeout=None):
+    global now, waits
+    waits += 1
+    if mode == 'normal exit': return 7
+    assert timeout == (0.1 if with_cancel == 'true' else 2), ('unbounded wait', timeout)
+    assert waits <= 3, 'supervisor did not enforce its bound'
+    if mode == 'orphan sweep' and waits == 3:
+        swept.extend(killed)
+        assert set(swept) == {201, 202}, swept
+        return 9
+    now += 2
+    raise subprocess.TimeoutExpired('fixture', timeout)
+def reap(*args):
+    assert {101, 102}.issubset(killed), killed
+    assert 301 not in killed, killed
+    raise ChildProcessError()
+writer = dict(guard=os.path.join(root, 'bounded-writer'), reservation=os.path.join(root, 'bounded-reservation.json'), run='fixture', nonce='fixture')
+fd = os.open(writer['guard'], os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+os.close(fd)
+with open(writer['reservation'], 'w') as stream: json.dump(dict(run='fixture', nonce='fixture'), stream)
+cfg = dict(uid=os.getuid(), gid=os.getgid(), argv=['unused'], cwd=root, env={}, status=status, writer=writer,
+           wallMs=3000 if mode == 'wall limit' else 10000, orphanGraceMs=3000)
+if with_cancel == 'true': cfg['cancel'] = os.path.join(root, 'not-cancelled')
+with patch.object(ctypes, 'CDLL') as libc, patch.object(subprocess, 'Popen') as worker, \
+     patch.object(os, 'listdir', side_effect=listproc), patch.object(os, 'getpid', return_value=100), \
+     patch.object(builtins, 'open', side_effect=proc_open), patch.object(os, 'kill', side_effect=kill), \
+     patch.object(os, 'waitpid', side_effect=reap), patch.object(time, 'monotonic', side_effect=lambda: now):
+    libc.return_value.prctl.return_value = 0
+    worker.return_value.pid = 101
+    worker.return_value.wait.side_effect = wait
+    sys.argv = ['supervisor', json.dumps(cfg)]
+    exec(source)
+if mode == 'orphan sweep': assert set(swept) == {201, 202}, swept
+`;
+    const result=spawnSync('python3',['-I','-c',probe,supervisorSource,root,status,mode,String(withCancel)],{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
+    expect(result.status,result.stderr).toBe(0);
+    expect(await readFile(status,'utf8')).toBe(mode==='wall limit'?'124':mode==='orphan sweep'?'9':'7');
+    if(mode==='wall limit') expect(result.stderr).toMatch(/wall.*limit/i);
+  });
 });
 
 describe('setup and pruning contract', () => {

@@ -12,6 +12,7 @@ import {cpus, loadavg, freemem, totalmem} from 'node:os';
 import {BASE_RETENTION, baseGuard, readyBases, readBase, copyLeaves, baseFile, createBasePin, claimPrewarm, materializeWorktree} from './forge-exec-bases.mjs';
 import {decodeManifest} from './forge-exec-manifest.mjs';
 const LIMIT = 4 * 1024 * 1024;
+const FORGE_RUN_WALL_MS = 1_740_000;
 const hex = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const runName = value => typeof value === 'string' && /^r-[a-f0-9]{32}$/.test(value);
 const nonceOK = value => typeof value === 'string' && /^[a-f0-9]{32}$/.test(value);
@@ -433,6 +434,40 @@ else:
         finally: os.close(archive)
     else:
         child = subprocess.Popen(cfg['argv'], cwd=cfg['cwd'], env=cfg['env'], stdin=subprocess.DEVNULL, preexec_fn=drop, pass_fds=writer_fds)
+    started = time.monotonic()
+    orphan_seen = {}
+    def supervision_expired():
+        now = time.monotonic()
+        processes = {}
+        for entry in os.listdir('/proc'):
+            if not entry.isdigit(): continue
+            try:
+                with open('/proc/' + entry + '/stat', 'rb') as stream:
+                    data = stream.read()
+                fields = data[data.rfind(b')')+2:].split()
+                processes[int(entry)] = (fields[0], int(fields[1]))
+            except (FileNotFoundError, ProcessLookupError): pass
+        # Age only live, directly adopted orphans, never the main child.
+        orphans = {pid for pid, (state, ppid) in processes.items()
+                   if ppid == os.getpid() and pid != child.pid and state != b'Z'}
+        for pid in list(orphan_seen):
+            if pid not in orphans: del orphan_seen[pid]
+        for pid in orphans: orphan_seen.setdefault(pid, now)
+        expired = {pid for pid, first in orphan_seen.items()
+                   if (now - first) * 1000 >= cfg.get('orphanGraceMs', 60000)}
+        found, frontier = set(expired), set(expired)
+        while frontier:
+            frontier = {pid for pid, (_, ppid) in processes.items()
+                        if ppid in frontier and pid != child.pid} - found
+            found.update(frontier)
+        for pid in found:
+            if processes[pid][0] == b'Z': continue
+            try: os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError: pass
+        if cfg.get('wallMs') is not None and (now - started) * 1000 > cfg['wallMs']:
+            sys.stderr.write('forge-exec-run: wall limit exceeded; killing child tree\n')
+            return True
+        return False
     if cfg.get('cancel'):
         while True:
             if cancelled():
@@ -442,12 +477,22 @@ else:
                 except ProcessLookupError: pass
                 code = 255
                 break
+            if supervision_expired():
+                code = 124
+                break
             try:
                 code = child.wait(timeout=0.1)
                 break
             except subprocess.TimeoutExpired: pass
     else:
-        code = child.wait()
+        while True:
+            if supervision_expired():
+                code = 124
+                break
+            try:
+                code = child.wait(timeout=2)
+                break
+            except subprocess.TimeoutExpired: pass
 # All descendants run as the dedicated uid. Include live descendants before
 # killing their parents, then reap orphans adopted by this subreaper.
 def children():
@@ -848,7 +893,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       const unit='forge-exec-run-'+randomBytes(16).toString('hex'),runFile=statePath(worker.reservation.run,'running'),running=await readRecord(runFile);
       if(running?.owner)await atomicJSON(runFile,{...running,owner:{...running.owner,unit}});
       const launcher=scopeLauncherArgv({slot,unit,sudo:false,source:supervisorSource,
-        json:JSON.stringify({argv,cwd:work,env,status,usage,writer,reapUid:true,...(cancel?{cancel}:{}),...(archive?{archive}:{}),...ids})});
+        json:JSON.stringify({argv,cwd:work,env,status,usage,writer,reapUid:true,wallMs:FORGE_RUN_WALL_MS,...(cancel?{cancel}:{}),...(archive?{archive}:{}),...ids})});
       const result=await execute(launcher[0],launcher.slice(1),{inherit:true});
       if(result.code!==0) throw new Error('Supervisor failed');
       const code=Number((await readPinned(status)).toString());
