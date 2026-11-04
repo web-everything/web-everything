@@ -403,6 +403,15 @@ describe('prior question hashes (AU1 PR-B)', () => {
     expect(find([rec('NOT WEAKENED')], window('2026-11-04T11:00:00.000Z'))).toBeNull();
     expect(find([rec('NOT WEAKENED', { questionHash: 'd'.repeat(64) })], open)).toBeNull();
   });
+  it('a prior NOT WEAKENED never overrides a current-question WEAKENED, in either order', () => {
+    const cur = rec('WEAKENED', { questionHash: QUESTION_HASH, at: '2026-11-01T12:00:00.000Z', findings: ['x.mjs:1 gap'] });
+    const prior = rec('NOT WEAKENED', { at: '2026-11-03T12:00:00.000Z' });
+    expect(find([cur, prior], open)).toBe(cur);
+    expect(find([prior, cur], open)).toBe(cur);
+  });
+  it('windows longer than 30 days out are not honoured', () => {
+    expect(isAcceptedQuestionHash(PRIOR, { priorQuestionHashes: window('2027-06-01T00:00:00.000Z'), now: NOW })).toBe(false);
+  });
   it('contradictory prior records are still rejected', () => {
     expect(find([rec('NOT WEAKENED', { findings: ['WEAKENED'] })], open)).toBeNull();
   });
