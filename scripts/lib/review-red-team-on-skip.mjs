@@ -235,20 +235,23 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (readWitness) {
         const w = readWitness({ repo, pr, head });
         if (w?.ok === false && w.reason !== 'scan-capped') return skip(w.reason);
-        if (w?.ok === false) capped = true;
+        if (w?.ok === false) capped = true; // the witness cannot be judged; the evidence read below carries seat facts
         if (!capped && (['queued', 'running'].includes(w.rawWriter.parsed?.status) || w.rawWriter.parsed?.staleAbandoned)) {
           const recovery = planRedTeamRecovery(w, recoveryOptions);
           return recovery.mode === 'skip' ? skip(recovery.why)
             : dispatchDecision({ action: 'dispatch', mode: recovery.mode, staleRecovery: true, why: 'dead owner recovery' });
         }
       }
-      const evidence = capped ? { ok: false, reason: 'scan-capped' } : readEvidence({ repo, pr, head });
+      const evidence = readEvidence({ repo, pr, head });
       if (evidence?.ok === false && evidence.reason === 'scan-capped') capped = true;
       // "Has this head been reviewed?" is a skip-the-review decision: a capped (unknown) scan means NOT reviewed,
       // so dispatch one. An extra review is harmless; the red-team gate keeps treating unknown as hold.
       if (capped) {
         const acc = Array.isArray(rawPr.labels) && rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:accepted');
         if (!acc) return skip('scan-capped');
+        // Seat/scorecard facts are independent of the run scan: absent or recorded means a pass already exists.
+        if (!(evidence?.recorded === false && evidence.seatRecorded === false && evidence.completedRecorded !== true
+          && evidence.cleanRecorded !== true && !evidence.status)) return skip('scan-capped; red-team seats or status recorded for this head');
         // A stored status for this head (running, queued, retry-spent, finished) is direct evidence the
         // capped scan cannot see past: keep its existing handling instead of forcing a review.
         if (readStatus({ repo, pr, head }) != null) return skip('scan-capped; red-team status recorded for this head');

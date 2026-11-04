@@ -263,7 +263,8 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     statusAt = statSync(statusPath({ repo, pr, head }, env)).mtimeMs;
   } catch (e) { if (e.code !== 'ENOENT') throw e; }
   const scan = latestRun();
-  if (scan.ok === false) return scan;
+  // Additive: the scorecard/status facts do not depend on the capped run scan; gates read only `ok`/`reason`.
+  if (scan.ok === false) return { ...scan, recorded, ...seatEvidence, ...(status ? { status } : {}) };
   const carry = readRedTeamCarry({ repo, pr, head, env });
   const carriedFrom = carry?.loopPayload.carriedFrom ?? status?.loopPayload?.carriedFrom;
   if (carriedFrom) {

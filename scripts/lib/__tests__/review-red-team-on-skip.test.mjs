@@ -1537,14 +1537,14 @@ describe('unprovable accepted head move — fresh full review', () => {
 });
 
 describe('scan-capped run scan — per-caller direction', () => {
-  const capped = { ok: false, reason: 'scan-capped' };
+  const capped = { ok: false, reason: 'scan-capped', recorded: false, seatRecorded: false, completedRecorded: false };
   const accepted = over => ({ rawPrs: [{ number: pr, headRefOid: head, labels: ['review:accepted'], reviews: [], comments: [
     { body: `✅ review — accepted\n<!-- reviewed-sha: ${'b'.repeat(40)} -->`, author: { login: 'web-everything' } }] }], ...over });
   it('review-skip decision: capped evidence on a new head dispatches a review', () => {
     expect(decide(accepted({ readEvidence: () => capped }))).toMatchObject({ action: 'review', head });
   });
   it('review-skip decision: capped recovery witness dispatches a review', () => {
-    expect(decide(accepted({ readWitness: () => capped }))).toMatchObject({ action: 'review', head });
+    expect(decide(accepted({ readEvidence: () => capped, readWitness: () => capped }))).toMatchObject({ action: 'review', head });
   });
   it('a capped scan on an unaccepted PR is still held (no review forced)', () => {
     expect(decide({ readEvidence: () => capped })).toMatchObject({ action: 'skip', why: 'scan-capped' });
@@ -1552,6 +1552,10 @@ describe('scan-capped run scan — per-caller direction', () => {
   it('capped scan with a stored status for the head still holds (running / retry-spent)', () => {
     for (const status of [{ status: 'running', head }, { status: 'finished', head, retries: 3 }])
       expect(decide(accepted({ readEvidence: () => capped, readWitness: () => capped, readStatus: () => status })).action).toBe('skip');
+  });
+  it('capped scan with a recorded seat or no seat facts still holds', () => {
+    for (const ev of [{ ...capped, seatRecorded: true }, { ...capped, recorded: true }, { ...capped, completedRecorded: true }, { ok: false, reason: 'scan-capped' }])
+      expect(decide(accepted({ readEvidence: () => ev })).action).toBe('skip');
   });
   it('other unknowns still hold', () => {
     expect(decide(accepted({ readEvidence: () => ({ ok: false, reason: 'review-unfinished' }) })).action).toBe('skip');

@@ -586,15 +586,19 @@ describe('fail-closed run scan evidence', () => {
     const f = fixture();
     const rows = planRedTeamOnSkip({ repo: f.repo, refusals: [{ kind: 'already-reviewed-head', prNumber: f.pr }],
       rawPrs: [{ number: f.pr, headRefOid: f.head, comments: [], labels: ['review:accepted'] }],
-      readEvidence: () => ({ ok: false, reason: 'scan-capped' }), readStatus: () => null,
+      readEvidence: () => ({ ok: false, reason: 'scan-capped', recorded: false, seatRecorded: false, completedRecorded: false }), readStatus: () => null,
       setting: { enabled: true }, lastDispatch: new Map(), now: 0 });
     // Unreadable formal reviews still hold: a forced full review needs them.
     expect(rows[0]).toMatchObject({ action: 'skip', why: expect.stringMatching(/reviews unreadable/) });
     const withReviews = planRedTeamOnSkip({ repo: f.repo, refusals: [{ kind: 'already-reviewed-head', prNumber: f.pr }],
       rawPrs: [{ number: f.pr, headRefOid: f.head, comments: [], reviews: [], labels: ['review:accepted'] }],
-      readEvidence: () => ({ ok: false, reason: 'scan-capped' }), readStatus: () => null,
+      readEvidence: () => ({ ok: false, reason: 'scan-capped', recorded: false, seatRecorded: false, completedRecorded: false }), readStatus: () => null,
       setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(), now: 0 });
     expect(withReviews[0]).toMatchObject({ action: 'review' });
+    const g = fixture();
+    expect(readDrainRedTeamEvidence({ ...g, list: () => Array.from({ length: 5000 }, (_, i) => `review-pr-${i}`),
+      stat: path => ({ mtimeMs: Number(path.match(/review-pr-(\d+)/)[1]) }), read: () => null }))
+      .toMatchObject({ ok: false, reason: 'scan-capped', recorded: false, seatRecorded: false, completedRecorded: false });
   });
 });
 
