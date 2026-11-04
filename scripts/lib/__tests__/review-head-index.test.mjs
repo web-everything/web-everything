@@ -266,7 +266,7 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
       '🚧 review on hold pending operator\n\nsome unknown future hold',
       'review paused: referral hold\n',
       'ℹ️ conveyor — note\n',
-      '﻿**🛑 stood down** pending operator\n',
+      String.fromCharCode(0xfeff) + '**🛑 stood down** pending operator\n',
       '🧭 standing ruling — hold this PR\n',
       '🛑 stood-down pending\n', '🔁 re armed\n', '⏸ holding for operator\n', 'Please do not merge, wrong approach\n',
       '🚫 blocked on #12\n', 'withdrawn: needs rework\n', '<!-- m -->\n⏸ paused for author\n', '---\n🛑 stand down\n',
@@ -286,7 +286,7 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     expect(seedFromReviewComments(mk(`✅ review — accepted\n\n\`\`\`\n\`\`\`js\n<!-- reviewed-sha: ${H(3)} -->\n\`\`\`\n`))).toBeNull();
     expect(seedFromReviewComments(mk(`✅ review — accepted\n\n\`\`\`\ncode\n\`\`\`\`\n<!-- reviewed-sha: ${H(3)} -->\n`))).not.toBeNull();
     // a closer followed by U+00A0 is not a closer (CommonMark allows only spaces/tabs), so the marker stays fenced
-    expect(seedFromReviewComments(mk(`✅ review — accepted\n\n\`\`\`\n\`\`\` \n<!-- reviewed-sha: ${H(3)} -->\n`))).toBeNull();
+    expect(seedFromReviewComments(mk(`✅ review — accepted\n\n\`\`\`\n\`\`\`${String.fromCharCode(0xa0)}\n<!-- reviewed-sha: ${H(3)} -->\n`))).toBeNull();
     expect(headReviewOwed({ ...base, head: H(3), seed: null }).owed).toBe(true);
     expect(headReviewOwed({ index: { ok: false }, repo: 'o/r', pr: 5, head: H(3), seed })).toMatchObject({ owed: null, held: true });
   });

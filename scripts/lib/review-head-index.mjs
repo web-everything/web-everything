@@ -213,7 +213,10 @@ const CONTROL_KEYWORDS = /conveyor|re[-\s]?armed?|stood[-\s]+down|stand[-\s]*dow
 // The first three non-empty lines are tested (a leading HTML-comment-only or horizontal-rule line must not hide the keyword).
 // Input contract: comments arrive in chronological order and are known to be COMPLETE (a paged/capped list that dropped a later
 // control comment would leave an accept standing; the caller owns that completeness check).
-const isControlComment = body => body.split(/\r?\n/).map(l => l.replace(/^[\s​-‍﻿*_>#]+/u, '')).filter(l => l && !/^<!--.*-->$/.test(l) && !/^[-_*=]{3,}$/.test(l))
+// Leading whitespace, zero-width characters (U+200B..U+200D), BOM (U+FEFF) and markdown emphasis/quote/heading marks. Built from
+// code points so the source carries no invisible characters.
+const LEAD_NOISE = new RegExp('^[\\s' + String.fromCharCode(0x200b) + '-' + String.fromCharCode(0x200d, 0xfeff) + '*_>#]+', 'u');
+const isControlComment = body => body.split(/\r?\n/).map(l => l.replace(LEAD_NOISE, '')).filter(l => l && !/^<!--.*-->$/.test(l) && !/^[-_*=]{3,}$/.test(l))
   .slice(0, 3).some(l => CONTROL_KEYWORDS.test(l));
 const MARKER_LINE = new RegExp(`^<!-- ${REVIEWED_SHA_MARKER}: ([0-9a-f]{40}) -->$`);
 /**
