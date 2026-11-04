@@ -238,6 +238,20 @@ describe('dispatchCiHeal (#3852)', () => {
     expect(out.agentId).toBeNull();
   });
 
+  it('R549: an unreadable launch (handle is only the minted session id) reports launched unverified, never an agentId', async () => {
+    const { sinks } = recordingSink({ handle: 'minted-uuid', dispatch: { handleVerified: false } });
+    const out = await dispatchCiHeal(PLANNED, { readBrief: () => TEMPLATE, sinks });
+    expect(out.agentId).toBeNull();
+    expect(out.launched).toBe('unverified');
+  });
+
+  it('R549: a verified launch keeps its agentId and carries no unverified marker', async () => {
+    const { sinks } = recordingSink({ handle: 'agent-1', dispatch: { handleVerified: true } });
+    const out = await dispatchCiHeal(PLANNED, { readBrief: () => TEMPLATE, sinks });
+    expect(out.agentId).toBe('agent-1');
+    expect(out.launched).toBeUndefined();
+  });
+
   it('refuses a scope token the brief cannot carry safely, before any sink call', async () => {
     const { calls, sinks } = recordingSink();
     await expect(

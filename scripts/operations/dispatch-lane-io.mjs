@@ -1701,6 +1701,8 @@ export function createDispatchSinks({
           ...(wrappedPid ? { wrapped: true, runnerPid: wrappedPid } : {}),
           launchKind: payload?.launchKind ?? 'build',
           route,
+          // R549: false when the launch output could not be read and `handle` is only the minted session id.
+          handleVerified: handle != null && String(handle) !== sessionId,
           executor,
           effort: reportedEffort ?? payload?.routing?.effort ?? table?.effort ?? null,
           supervisorModel: reportedModel ?? modelDecision?.model ?? extractModelFlag(extraArgs.map(String)).value,

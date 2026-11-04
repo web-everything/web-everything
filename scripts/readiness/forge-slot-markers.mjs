@@ -53,8 +53,10 @@ function sidecarRun(file, owner) {
  * The caller guarantees the sample postdates the owner's death by a margin.
  */
 export function runVerdict(telemetry, run) {
-  const evidence = recentEvidence(telemetry);
+  const evidence = recentEvidence(telemetry, run);
   if (!evidence) return 'unknown';
+  // R518: Forge lists its active run ids, so a run in the list is executing, whatever recent says.
+  if (evidence.active) return 'inflight';
   const entry = telemetry.recent.find(item => item?.runId === run);
   if (!entry) return evidence.complete ? 'absent' : 'unknown';
   // The install/supervisor catch paths publish 97/254 even when descendants may survive. Their executing lock
@@ -72,7 +74,7 @@ export function runVerdict(telemetry, run) {
 // Forge caps `recent` at the newest 50 receipts (forge-exec-run.mjs#parseTelemetry). An older run can still be
 // executing outside that window. A finished prepare can leave code:null in recent, so matching counts do not prove
 // membership. Without an authoritative list of active run IDs, only zero active runs can establish completeness.
-function recentEvidence(telemetry) {
+function recentEvidence(telemetry, run) {
   if (!Number.isSafeInteger(telemetry?.activeRuns) || telemetry.activeRuns < 0 || !Array.isArray(telemetry.recent)) return null;
   const runs = new Set();
   for (const item of telemetry.recent) {
@@ -81,7 +83,15 @@ function recentEvidence(telemetry) {
       || !(item.code === null || (Number.isInteger(item.code) && item.code >= 0 && item.code <= 255))) return null;
     runs.add(item.runId);
   }
-  return {complete: telemetry.activeRuns === 0};
+  // R518: activeRunIds (optional; an older Forge omits it) is Forge's own list of active runs. When present it must be
+  // well formed and match the count, else the evidence is unknown. A run missing from it is not executing.
+  const ids = telemetry.activeRunIds;
+  if (ids === undefined) return {complete: telemetry.activeRuns === 0, byIds: false};
+  if (!Array.isArray(ids) || ids.length !== telemetry.activeRuns || new Set(ids).size !== ids.length
+    || ids.some(id => typeof id !== 'string' || !RUN.test(id))) return null;
+  const active = run !== undefined && ids.includes(run);
+  // no target run (run-less marker): only zero active runs proves completeness, as before
+  return {complete: run === undefined ? telemetry.activeRuns === 0 : !active, active, byIds: true};
 }
 
 /**
@@ -294,14 +304,21 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
             let verdict = 'run-less';
             if (entry.run) {
               verdict = runVerdict(telemetry, entry.run);
-              if (verdict !== 'idle') resetIdle(entry);
+              // A per-run verdict taken while Forge is busy rests on ONE directory listing, which can miss a prepared->running
+              // rename: 'absent' and the supervisor failure codes 97/254 need the second own sample too.
+              const code = telemetry.recent.find(item => item?.runId === entry.run)?.code;
+              const confirm = verdict === 'idle' || (evidence.byIds && telemetry.activeRuns > 0
+                && (verdict === 'absent' || (verdict === 'finished' && (code === 97 || code === 254))));
+              if (!confirm) resetIdle(entry);
               if (!['finished', 'absent', 'idle'].includes(verdict)) continue;
               // 'idle' rests on Forge's active-run count, taken from a directory listing without a per-run cleanup
               // receipt. So the run must also have existed for the whole death-sample margin before that sample (both
               // stamps are Forge's clock): a run that old has its state on disk and would be counted if it were active.
-              if (verdict === 'idle') {
-                const started = Date.parse(telemetry.recent.find(item => item?.runId === entry.run)?.startedAtET);
-                if (!Number.isFinite(started) || sampledAt - started < DEATH_SAMPLE_MARGIN_MS) { resetIdle(entry); continue; } // not fully qualifying: restart the window
+              if (confirm) {
+                if (verdict === 'idle') { // 'absent' by activeRunIds has no receipt; the two own samples below are its whole guard
+                  const started = Date.parse(telemetry.recent.find(item => item?.runId === entry.run)?.startedAtET);
+                  if (!Number.isFinite(started) || sampledAt - started < DEATH_SAMPLE_MARGIN_MS) { resetIdle(entry); continue; } // not fully qualifying: restart the window
+                }
                 // The count can miss a concurrent prepared->running rename in ONE listing. Require a second, later sample,
                 // taken by THIS reaper, that still reports zero active runs before releasing.
                 const first = idleStamp(entry.file, entry.key, sampledAt);
