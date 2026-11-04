@@ -1395,7 +1395,8 @@ export function enrichPrsWithSystemFixFacts(prs, { readSystemFixState = defaultR
 export function enrichPrsWithFixClaims(prs, { repo = 'we', readClaim = readLiveFixClaim } = {}) {
   return (Array.isArray(prs) ? prs : []).map((pr) => {
     let entry = null;
-    try { entry = readClaim({ repo, pr: Number(pr?.number) }); } catch { entry = null; }
+    // R502 item 4: a failed read is marked `fixClaimUnknown` (additive) so recovery rules that need PROOF of no claim fail closed.
+    try { entry = readClaim({ repo, pr: Number(pr?.number) }); } catch { return { ...pr, fixClaimUnknown: true }; }
     if (!entry?.meta?.who) return pr;
     return { ...pr, fixClaim: { who: entry.meta.who, why: entry.meta.why ?? '', claimedAt: entry.meta.claimedAt ?? null } };
   });
