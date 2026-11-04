@@ -565,6 +565,26 @@ describe('the lane comes from the tick core or nowhere', () => {
     expect(shaped.prompt).toContain(`scope: we:${read.item.specPath}`);
   });
 
+  it.each(['prepare-decision', 'investigate'])(
+    'send-back item 2 — %s ignores a malformed item.scope and keeps its we:<specPath> lane scope', (launchKind) => {
+      const read = tickRead({ launchKind });
+      // real #2379 shape (cross-repo we:/fui: entries) plus malformed pieces a prepare/investigate card may carry
+      read.item.scope = ['we:tests/a11y/sitemap-routes.ts', 'fui:tests/a11y/sitemap-routes.ts', 'we:../x', 'we:a;id', 'bogus:a.mjs'];
+      const shaped = shapeDispatchRead(read, { num: '3037' });
+      expect(shaped.dispatching).toBe(true);
+      expect(shaped.scope).toEqual([`we:${read.item.specPath}`]);
+    },
+  );
+
+  it('send-back item 1 — normalizes aliases case-insensitively; unknown prefixes are still refused (real #2379 shape)', () => {
+    const read = tickRead();
+    const scope = ['WebEverything:tests/a11y/sitemap-routes.ts', 'FrontierUI:tests/a11y/sitemap-routes.ts', 'PLATEAU-APP:src/x.ts', 'Fui:src/y.ts', 'tests/a11y/z.ts'];
+    const shaped = shapeDispatchRead({ ...read, item: { ...read.item, scope } }, { num: '3037' });
+    expect(shaped.scope).toEqual(['we:tests/a11y/sitemap-routes.ts', 'fui:tests/a11y/sitemap-routes.ts', 'plateau:src/x.ts', 'fui:src/y.ts', 'we:tests/a11y/z.ts']);
+    expect(() => shapeDispatchRead({ ...read, item: { ...read.item, scope: ['unknownrepo:src/x.ts'] } }, { num: '3037' }))
+      .toThrow(/unknown scope (repo )?prefix/);
+  });
+
   it('canonicalizes prefixes before lease overlap matching, including the dispatch repo default (send-back item 2)', async () => {
     const { scopesOverlap } = await import('../../readiness/scope-lease.mjs');
     const { repoProfile } = await import('../../lib/repo-profile.mjs');
