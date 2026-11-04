@@ -25,7 +25,7 @@ describe('shard split', () => {
     expect(() => splitVitestArgs(['npx', 'vitest', 'run'], 2)).toThrow();
   });
 });
-function fixture(modes = [], budgetMs = 100, parallel = 1, acquire = async () => ({ ok: true }), discover = () => null) {
+function fixture(modes = [], budgetMs = 100, parallel = 1, acquire = async () => ({ ok: true }), discover = () => null, extra = {}) {
   let time = 0, calls = [], lines = [], releases = 0;
   const reports = new Map();
   const fs = { mkdtempSync: () => '/scratch/shards', readFileSync: p => { if (!reports.has(p)) throw Error('missing'); return reports.get(p); }, rmSync: () => {} };
@@ -38,7 +38,7 @@ function fixture(modes = [], budgetMs = 100, parallel = 1, acquire = async () =>
     if (mode === 'red-with-ok-remote') reports.set(remoteReport, JSON.stringify({ location: 'remote', exitCode: 0 }) + '\n');
     return { exitCode: mode === 'remote-red-137' ? 137 : ['red', 'remote-red', 'red-with-ok-remote'].includes(mode) ? 1 : 0 };
   };
-  const run = () => runShards({ argv: ['npx', 'vitest', 'run', 'a', 'b', 'c'], shards: 3, parallel, budgetMs }, { discover,
+  const run = () => runShards({ argv: ['npx', 'vitest', 'run', 'a', 'b', 'c'], shards: 3, parallel, budgetMs }, { discover, ...extra,
     fs, execute, now: () => time, tmpdir: () => '/scratch', log: s => lines.push(s), env: {},
     acquireLocal: acquire, releaseLocal: () => { releases++; },
   });
@@ -444,10 +444,26 @@ describe('process boundary and bounds', () => {
 describe('config-excluded selected files', () => {
   const abs = f => resolve(process.cwd(), f);
   it('names and drops a file the vitest config excludes; never runs it', async () => {
-    const f = fixture([], 100, 1, undefined, () => new Set([abs('a'), abs('b')]));
+    const f = fixture([], 100, 1, undefined, () => new Set([abs('a'), abs('b')]), { exists: () => true });
     expect(await f.run()).toBe(0);
     expect(f.calls.flatMap(c => c.files)).toEqual(['a', 'b']);
     expect(f.lines.join('')).toMatch(/NOTE 1 selected file\(s\) are excluded by the vitest config.*: c/);
+  });
+  it('2 selected, 1 not discoverable and absent on disk: RED naming the missing path, nothing executed', async () => {
+    const f = fixture([], 100, 1, undefined, () => new Set([abs('a'), abs('b')]), { exists: p => !p.endsWith('/c') });
+    expect(await f.run()).not.toBe(0);
+    expect(f.calls).toEqual([]);
+    expect(f.lines.join('')).toMatch(/RED.*selected file\(s\) not found.*\bc\b/);
+  });
+  it('remote inventory path: a missing selected file is RED before any remote shard launches', async () => {
+    const f = fixture([], 100, 1, undefined, () => new Set([abs('a'), abs('b')]), { exists: p => !p.endsWith('/c') });
+    expect(await f.run()).not.toBe(0);
+    expect(f.calls.filter(c => c.command === 'node')).toEqual([]);
+  });
+  it('all selected run: GREEN, no exclusion note', async () => {
+    const f = fixture([], 100, 1, undefined, () => new Set([abs('a'), abs('b'), abs('c')]), { exists: () => true });
+    expect(await f.run()).toBe(0);
+    expect(f.lines.join('')).not.toMatch(/NOTE/);
   });
   it('unknown discovery keeps every file (fail closed)', async () => {
     const f = fixture();
