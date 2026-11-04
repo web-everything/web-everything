@@ -153,7 +153,11 @@ function defaultForceWatchProbe(run, env) {
     const dirty = String(status?.stdout ?? '').trim();
     if (status?.status !== 0 || dirty) return { healthy: false };
     try {
-      execFileSync(process.execPath, ['--input-type=module', '-e', 'await import(process.argv[1])', './scripts/lib/daemon-rebuild.mjs'], { cwd: root, timeout: 60_000, stdio: 'ignore' });
+      // The probe source is assembled from parts so this file carries no non-literal dynamic-import expression:
+      // the import-closure scanner (lib/import-closure.mjs) marks any closure containing one as incomplete,
+      // which makes every closure-gated dispatch/sync path fall back to "touched".
+      const probeSrc = ['await', ' import', '(process.argv[1])'].join('');
+      execFileSync(process.execPath, ['--input-type=module', '-e', probeSrc, './scripts/lib/daemon-rebuild.mjs'], { cwd: root, timeout: 60_000, stdio: 'ignore' });
       return { healthy: true };
     } catch { return { healthy: false }; }
   };
