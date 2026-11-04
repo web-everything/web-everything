@@ -69,13 +69,15 @@ export async function mirrorReadOnlyForSlots(mirror,io=fs) {
 }
 // R559: the warmer stamps every successful fetch of public main; a missing, unreadable or implausible stamp is "unknown".
 export const MAIN_FETCH_STAMP='main-fetched.json';
-export async function readMainFetchAge(root,{clock=Date.now,io=fs}={}) {
+export const BUNDLE_MAIN_MAX_AGE_CEILING_MS=1440*60_000;
+export async function readMainFetchStamp(root,{clock=Date.now,io=fs}={}) {
   try {
     const stamp=JSON.parse((await baseFile(join(root,MAIN_FETCH_STAMP),io)).toString('utf8'));
     const age=clock()-stamp.fetchedAtMs;
-    return Number.isSafeInteger(stamp.fetchedAtMs)&&age>=0?age:undefined;
+    return Number.isSafeInteger(stamp.fetchedAtMs)&&age>=0&&revision(stamp.sha)?{ageMs:age,sha:stamp.sha}:undefined;
   } catch {return undefined;}
 }
+export async function readMainFetchAge(root,options) {return (await readMainFetchStamp(root,options))?.ageMs;}
 export async function materializeWorktree({work,root,baseSha,head,manifest,manifestDigest,exec=gitExec,bundle,sharedClone=false,clock=Date.now}) {
   if(!revision(head)||manifest?.git?.head!==head||baseSha!==undefined&&!revision(baseSha)||digestManifest(manifest)!==manifestDigest)throw new Error('Invalid Git evidence');
   const {siblings,git:logical,...primary}=manifest;
@@ -127,19 +129,23 @@ export async function materializeWorktree({work,root,baseSha,head,manifest,manif
       // the verified bundle (or is already in the mirror when mode is none).
       if(!local||!validBundleEvidence(bundle))throw new Error('Bundle transport unavailable');
       // Freshness bound (R559): never fail open on an unknown or old public-main fetch.
-      const mainAge=await readMainFetchAge(root,{clock});
-      if(!(Number.isFinite(bundle.maxMainAgeMs)&&bundle.maxMainAgeMs>0)||mainAge===undefined||mainAge>bundle.maxMainAgeMs)throw new Error('Public main fetch is stale or unknown');
+      // R559 ruling: mirror main counts as fresh public main only inside the bound, ceiling-capped, with the stamp's sha
+      // equal to the mirror ref that this admission actually uses.
+      const stamp=await readMainFetchStamp(root,{clock});
+      if(!(Number.isFinite(bundle.maxMainAgeMs)&&bundle.maxMainAgeMs>0&&bundle.maxMainAgeMs<=BUNDLE_MAIN_MAX_AGE_CEILING_MS)||stamp===undefined||stamp.ageMs>bundle.maxMainAgeMs)throw new Error('Public main fetch is stale or unknown');
       // The warmer refreshes refs/remotes/origin/main in the mirror; the mirror clone copied it. Never fall back to a cached local main.
       if(await git(['rev-parse','--verify','refs/remotes/origin/main^{commit}'],cloned,undefined,true)===null)throw new Error('Mirror public main missing');
+      if(await git(['rev-parse','--verify','refs/remotes/origin/main^{commit}'],cloned)!==stamp.sha)throw new Error('Main fetch stamp does not match the mirror ref');
       if(bundle.mode!=='none') {
         const staged=join(pending,'git.bundle');
         await stageBundle(bundle.file,staged,bundle);
         await git(['bundle','verify',staged],cloned);
-        const heads=await git(['bundle','list-heads',staged],cloned);
-        if(!heads.split('\n').some(line=>line.trim()===head+' HEAD'))throw new Error('Bundle tip mismatch');
+        const heads=(await git(['bundle','list-heads',staged],cloned)).split('\n').filter(Boolean).map(line=>line.trim().split(' '));
+        // Exactly one head, the manifest-bound tip, under the client's temporary ref namespace.
+        if(heads.length!==1||heads[0][0]!==head||!/^refs\/we\/bundle-[a-f0-9]{16}$/.test(heads[0][1]??''))throw new Error('Bundle tip mismatch');
         await git(['config','transfer.fsckObjects','true'],cloned);
         await git(['config','fetch.fsckObjects','true'],cloned);
-        await git(['fetch','--no-tags','--no-write-fetch-head',staged,'+HEAD:refs/we/bundle-tip'],cloned);
+        await git(['fetch','--no-tags','--no-write-fetch-head',staged,'+'+heads[0][1]+':refs/we/bundle-tip'],cloned);
         if(await git(['rev-parse','--verify','refs/we/bundle-tip^{commit}'],cloned)!==head)throw new Error('Bundle tip mismatch');
         await git(['update-ref','-d','refs/we/bundle-tip'],cloned);
       }

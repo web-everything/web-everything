@@ -6,9 +6,9 @@ import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { materializeWorktree, mirrorReadOnlyForSlots, validBundleEvidence, readMainFetchAge } from '../forge-exec-bases.mjs';
+import { materializeWorktree, mirrorReadOnlyForSlots, validBundleEvidence, readMainFetchAge, BUNDLE_MAIN_MAX_AGE_CEILING_MS } from '../forge-exec-bases.mjs';
 import { manifestWire, digestManifest } from '../forge-exec-manifest.mjs';
-import { planBundle, bundleEvidence, resolveTransport, runnerSupportsBundle, capabilityRecord, capabilityAdvertisesBundle, scanBundleRange, mainFreshness } from '../remote-git-bundle.mjs';
+import { planBundle, bundleEvidence, resolveTransport, runnerSupportsBundle, capabilityRecord, capabilityAdvertisesBundle, scanBundleRange, mainFreshness, MAIN_MAX_AGE_CEILING_MS } from '../remote-git-bundle.mjs';
 import { decideRemote, resolveAdmissionPolicy, readRunnerBundleCapability, writeRunnerCapabilities } from '../heavy-admission.mjs';
 
 const ident = ['-c', 'user.name=Fixture', '-c', 'user.email=f@example.invalid'];
@@ -244,5 +244,33 @@ describe('R593 mirror main freshness bound (R559)', () => {
     const bad = resolveAdmissionPolicy({ platform: { remote: { bundle: { mainMaxAgeMin: 0 } } } });
     expect(bad.settings.remote.bundle.mainMaxAgeMin).toBe(10);
     expect(bad.invalid.join(' ')).toContain('mainMaxAgeMin');
+  });
+});
+
+describe('R593 audit round 3 fixes (R559)', () => {
+  it('bundles the pinned sha through a temporary ref, not the live HEAD, and leaves no ref behind', async () => {
+    const pinned = tip;
+    await commit(lane, { 'later.txt': 'later\n' }, 'HEAD moves after the scan');
+    const dir = join(root, 'pin-out'); await fs.mkdir(dir);
+    const plan = await planBundle({ cwd: lane, head: pinned, runnerBase: runnerMain, exec, directory: dir });
+    const heads = git(lane, 'bundle', 'list-heads', plan.file).split('\n');
+    expect(heads).toHaveLength(1);
+    expect(heads[0].startsWith(pinned + ' refs/we/bundle-')).toBe(true);
+    expect(git(lane, 'for-each-ref', 'refs/we')).toBe('');
+  });
+  it('flags a token in a commit message', async () => {
+    await commit(lane, { 'ok.txt': 'ok\n' }, 'deploy with ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8');
+    const head = git(lane, 'rev-parse', 'HEAD');
+    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ path: 'commit-message', finding: 'github-token' });
+  });
+  it('the runner refuses a client-supplied main age above the ceiling', async () => {
+    expect(BUNDLE_MAIN_MAX_AGE_CEILING_MS).toBe(1440 * 60_000);
+    await expect(run({ bundle: { mode: 'incremental', sha256: 'a'.repeat(64), bytes: 1, maxMainAgeMs: BUNDLE_MAIN_MAX_AGE_CEILING_MS + 1 } })).rejects.toMatchObject({ code: 'git-head-unavailable' });
+    expect(MAIN_MAX_AGE_CEILING_MS).toBe(BUNDLE_MAIN_MAX_AGE_CEILING_MS);
+  });
+  it('refuses a stamp whose fetched sha is not the mirror ref', async () => {
+    await fs.writeFile(join(root, 'main-fetched.json'), JSON.stringify({ sha: tip, fetchedAtMs: Date.now() }));
+    await expect(run()).rejects.toMatchObject({ code: 'git-head-unavailable' });
+    expect(existsSync(join(work, '.git'))).toBe(false);
   });
 });

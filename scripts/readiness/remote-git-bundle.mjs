@@ -7,6 +7,7 @@ import { createReadStream } from 'node:fs';
 import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
 import { classifyManifestPath, credentialTextFinding } from './forge-exec-manifest.mjs';
 
 export const REMOTE_TRANSPORTS = Object.freeze(['rsync', 'git-bundle']);
@@ -14,6 +15,8 @@ export const DEFAULT_REMOTE_TRANSPORT = 'rsync';
 export const GIT_BUNDLE_CAPABILITY = 1;
 /** Must match the runner's BUNDLE_MAX_BYTES; a bigger bundle falls back instead of being shipped. */
 export const BUNDLE_MAX_BYTES = 512 * 1024 * 1024;
+/** Same ceiling as the remote.bundle.mainMaxAgeMin setting (1440 min); the runner refuses anything above it. */
+export const MAIN_MAX_AGE_CEILING_MS = 1440 * 60_000;
 
 const REVISION = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/;
 
@@ -59,14 +62,24 @@ export async function planBundle({ cwd, head, runnerBase, exec, directory }) {
   const hit = await scanBundleRange({ cwd, head, prerequisite, exec });
   if (hit) throw bundleError('bundle-credential-hit', `${hit.path}: ${hit.finding}`);
   const file = join(directory, 'git.bundle');
-  // `HEAD` (not a bare sha) so the bundle records a named head the runner can verify against the tip.
-  const created = await git(['bundle', 'create', file, 'HEAD', ...(prerequisite ? [`^${prerequisite}`] : [])]);
-  if (created.code !== 0) throw bundleError('bundle-create-failed', String(created.stderr ?? '').slice(-200));
+  // R559: bundle the exact scanned sha through a unique temporary ref, never the live HEAD (which may have moved
+  // after the scan). The ref is removed again whatever happens.
+  const ref = `refs/we/bundle-${randomBytes(8).toString('hex')}`;
+  const pinned = await git(['update-ref', ref, head]);
+  if (pinned.code !== 0) throw bundleError('bundle-create-failed', 'pin-ref');
+  try {
+    const created = await git(['bundle', 'create', file, ref, ...(prerequisite ? [`^${prerequisite}`] : [])]);
+    if (created.code !== 0) throw bundleError('bundle-create-failed', String(created.stderr ?? '').slice(-200));
+  } finally { await git(['update-ref', '-d', ref]); }
   const info = await stat(file);
   if (!info.isFile() || info.size <= 0 || info.size > BUNDLE_MAX_BYTES) throw bundleError('bundle-size-unsupported');
   // The Mac proves its own file is internally consistent before spending bandwidth on it.
   const verified = await git(['bundle', 'verify', file]);
   if (verified.code !== 0) throw bundleError('bundle-self-verify-failed');
+  // The shipped tip must equal the scanned sha, and be the only head in the file.
+  const listed = await git(['bundle', 'list-heads', file]);
+  const lines = bytes(listed.stdout).toString('utf8').split('\n').filter(Boolean);
+  if (listed.code !== 0 || lines.length !== 1 || lines[0].split(' ')[0] !== head) throw bundleError('bundle-tip-mismatch');
   return { mode: prerequisite ? 'incremental' : 'full', tip: head, file, bytes: info.size, sha256: await digestFile(file),
     ...(prerequisite ? { base: prerequisite } : {}) };
 }
@@ -109,6 +122,13 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
   const range = prerequisite ? `${prerequisite}..${head}` : head;
   const log = await git(['log', '--raw', '-z', '--no-renames', '--no-abbrev', '--root', '-m', '--diff-filter=d', '--format=', range]);
   if (log.code !== 0) throw bundleError('bundle-credential-scan-failed');
+  // Commit messages (and author/committer identity lines) travel in the pack too. Tags are not bundled: only the pinned ref is.
+  const messages = await git(['log', '-z', '--root', '--format=%an%n%ae%n%cn%n%ce%n%B', range]);
+  if (messages.code !== 0) throw bundleError('bundle-credential-scan-failed');
+  for (const message of splitNul(bytes(messages.stdout))) {
+    const finding = credentialTextFinding(message.toString('latin1')) ?? credentialTextFinding(message.toString('utf8'));
+    if (finding) return { path: 'commit-message', finding };
+  }
   const tokens = splitNul(bytes(log.stdout));
   const blobs = new Map(); // sha -> first path
   for (let i = 0; i < tokens.length; i++) {
