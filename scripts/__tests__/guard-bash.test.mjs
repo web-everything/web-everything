@@ -4005,18 +4005,25 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
   // skipping unknown global flags, so every caller's guard still fires; only the daemon path is strict.
   describe('every gitSubcommand caller still fires behind an unknown global flag', () => {
     const FLAGS = ['--attr-source=HEAD', '--list-cmds=main', '--html-path', '--future-option'];
-    it.each(FLAGS)('git-add enumeration (direct, pipe source and pipe sink) behind %s', (flag) => {
+    // `--attr-source <tree>` (separate value) is a known value flag: its value is never the subcommand.
+    const ENUM_FLAGS = [...FLAGS, '--attr-source HEAD'];
+    it.each(ENUM_FLAGS)('git-add enumeration (direct, pipe source and pipe sink) behind %s', (flag) => {
       for (const command of [`git ${flag} add -A`, `git ${flag} add .`, `git ${flag} add --all`,
         `git ls-files --others | xargs git ${flag} add`, `git ${flag} ls-files --others | xargs git add`]) {
         expect(decide(command, { cwd: LANE }), command).toMatch(/enumerat/i);
       }
     });
-    it.each(FLAGS)('the collateral notice still names a dropped git state change behind %s', (flag) => {
+    it.each(ENUM_FLAGS)('the collateral notice still names a dropped git state change behind %s', (flag) => {
       const command = `git ${flag} commit -m x && git add -A`;
-      expect(decide(command, { cwd: LANE })).toMatch(/enumerat/i);
       expect(collateralStepsNotice(command, { cwd: LANE })).toMatch(/runs `git commit` — a repository state change/);
     });
-    it.each(FLAGS)('the daemon path never trusts a subcommand behind %s', (flag) => {
+    it('a separate --attr-source value is read as a value at a daemon clone, never as the subcommand', () => {
+      const ctx = { cwd: CLONE, daemonCloneRoots: roots };
+      expect(decide('git --attr-source HEAD reset --hard', ctx)).toMatch(/DAEMON CLONE/);
+      expect(decide('git --attr-source HEAD log', ctx)).toBeNull();
+    });
+    // Non-regression pin (passes before and after): the daemon path stays strict behind an unknown flag.
+    it.each(FLAGS.filter((flag) => !flag.startsWith('--attr-source')))('the daemon path never trusts a subcommand behind %s', (flag) => {
       const ctx = { cwd: CLONE, daemonCloneRoots: roots };
       for (const rest of ['fetch . HEAD:refs/heads/x', 'fetch origin', 'config x.y z', 'log', 'status']) {
         expect(decide(`git ${flag} ${rest}`, ctx), rest).toMatch(/DAEMON CLONE/);

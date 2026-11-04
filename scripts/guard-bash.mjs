@@ -5211,7 +5211,9 @@ const FS_MUTATING_PROGRAMS = new Set([
 
 /** git's own global flags that SWALLOW the next token, so the subcommand walk below does not mistake their
  *  VALUE for the subcommand (`git -C /some/path add -A` → `add`, never `/some/path`). */
-const GIT_VALUE_FLAGS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--config-env']);
+// `--attr-source <tree>` takes a separate value too (git 2.40+); without it `HEAD` would read as the subcommand.
+const GIT_VALUE_FLAGS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--config-env',
+  '--attr-source']);
 const GIT_GLOBAL_FLAGS = new Set(['-p', '--paginate', '-P', '--no-pager', '--bare', '--no-replace-objects',
   '--literal-pathspecs', '--glob-pathspecs', '--noglob-pathspecs', '--icase-pathspecs',
   '--no-optional-locks', '--no-lazy-fetch', '--no-advice']);
@@ -5249,7 +5251,7 @@ function gitSubcommandIndex(toks) {
       continue;
     }
     if (GIT_GLOBAL_FLAGS.has(toks[i]) || /^-(?:c|C).+/.test(toks[i])
-      || /^--(?:git-dir|work-tree|namespace|exec-path|config-env)=/.test(toks[i])) continue;
+      || /^--(?:git-dir|work-tree|namespace|exec-path|config-env|attr-source)=/.test(toks[i])) continue;
     if (toks[i].startsWith('-')) return -1; // unknown arity: no subsequent token is a proven subcommand
     return i;
   }
