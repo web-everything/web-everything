@@ -2497,7 +2497,8 @@ describe('guard-bash — the guard follows the text bash re-executes (#2994 r5 F
 
   it('the expansion is BOUNDED — a pathological nest neither wedges nor throws', () => {
     let cmd = 'npm run build';
-    for (let i = 0; i < 200; i++) cmd = `bash -c "${cmd.replace(/"/g, '\\"')}"`;
+    // Escaping backslashes too doubles the text per level, so 12 levels (well past NESTED_DEPTH_CAP = 4) stay cheap.
+    for (let i = 0; i < 12; i++) cmd = `bash -c "${cmd.replace(/[\\"]/g, '\\$&')}"`;
     expect(() => decide(cmd, { primaryCwd: true })).not.toThrow();
     let subst = 'npm run build';
     for (let i = 0; i < 200; i++) subst = `echo "$(${subst})"`;
