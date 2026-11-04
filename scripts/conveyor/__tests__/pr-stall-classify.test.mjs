@@ -285,7 +285,8 @@ describe('fail closed', () => {
 
 describe('policy guardrails', () => {
   it.each(['scripts/operations/pr-sweep-core.mjs', 'scripts/lib/red-team-gate.mjs', '.github/workflows/test.yml', 'scripts/lib/merge-gate-ci.mjs', 'scripts/conveyor/pr-stall-classify.mjs',
-    'scripts/lib/round-judge.mjs', 'scripts/conveyor/round-extension-mark.mjs', 'scripts/operations/extend-rounds-io.mjs', 'scripts/operations/record-referral-ruling.mjs'])('a guard path %s blocks every policy action', (path) => {
+    'scripts/lib/round-judge.mjs', 'scripts/conveyor/round-extension-mark.mjs', 'scripts/operations/extend-rounds-io.mjs', 'scripts/operations/record-referral-ruling.mjs',
+    'scripts/lib/red-team-pending-watchdog.mjs'])('a guard path %s blocks every policy action', (path) => {
     for (const v of ['grant', 'send-back']) {
       const r = at('ruling-needed:red-team-round-cap', { verdict: verdict(v), files: ['scripts/foo.mjs', path] });
       expect([r.lane, r.action]).toEqual(['operator', 'guard-file-touched']);
@@ -338,6 +339,8 @@ describe('every policy is a setting, and settings only make it stricter', () => 
       'rerun-red-team-gate': ['red-team-sent-back-cleared'],
       'ask-review-daemon': ['awaiting-review'],
       'tooling-card': ['fixing'],
+      'restart-red-team': ['red-team-pending', null, {}, { redTeam: { ageMinutes: 61, status: null, ownerAlive: null, restarts: 0, minutesSinceLastRestart: null } }],
+      'publish-red-team-result': ['red-team-pending', null, {}, { redTeam: { ageMinutes: 61, status: { status: 'finished', result: { status: 'ran' } }, ownerAlive: null, restarts: 0, minutesSinceLastRestart: null } }],
     },
     policyActions: {
       grant: ['ruling-needed:red-team-round-cap', 'grant'],
@@ -355,8 +358,8 @@ describe('every policy is a setting, and settings only make it stricter', () => 
   });
   it.each(Object.keys(actionCases).flatMap((group) => Object.keys(CLASSIFY_DEFAULTS[group]).map((action) => [group, action])))
   ('%s.%s off sends it to the operator', (group, action) => {
-    const [state, v, settings = {}] = actionCases[group][action];
-    const o = { settings, card, ...(v ? { verdict: verdict(v, TRIGGER[state]) } : {}) };
+    const [state, v, settings = {}, extra = {}] = actionCases[group][action];
+    const o = { settings, card, ...extra, ...(v ? { verdict: verdict(v, TRIGGER[state]) } : {}) };
     expect(at(state, o)).toMatchObject({ lane: group === 'systemActions' ? 'system' : 'policy', action });
     const r = at(state, { ...o, settings: { ...settings, [group]: { [action]: false } } });
     expect([r.lane, r.action]).toEqual(['operator', action]);
@@ -496,5 +499,111 @@ describe('stand-down detection (live #5768 shape)', async () => {
     const row = sweep(pr({ comments: [], labelEvents: [{ label: 'review:changes', at: '2026-10-21T18:00:00Z' }] }));
     expect(row).toMatchObject({ waitingOn: 'fixing', stalled: true });
     expect(classifyStall({ row, head }).lane).toBe('system');
+  });
+});
+
+
+describe('pending red-team watchdog evidence', () => {
+  const pending = (patch = {}) => ({ ageMinutes: 61, status: null, ownerAlive: null,
+    restarts: 0, minutesSinceLastRestart: null, ...patch });
+  const states = ['red-team-pending', 'drain-skip:red-team-pending'];
+  it.each(states)('%s restarts an old head with no live run or result', state => {
+    expect(at(state, { redTeam: pending() })).toMatchObject({ lane: 'system', action: 'restart-red-team',
+      key: `${REPO}#77@${HEAD.toLowerCase()}:${state}:restart-1` });
+  });
+  it.each([0, 1, 2])('configured cap %s controls restart exhaustion, overriding evidence policy', cap => {
+    for (const state of states) for (const restarts of [0, 1, 2]) {
+      const item = at(state, { settings: { maxRedTeamRestartsPerHead: cap },
+        redTeam: pending({ restarts, minutesSinceLastRestart: 60, maxRestarts: 100 }) });
+      expect(item).not.toHaveProperty('headCap');
+      expect(item).toMatchObject(restarts < cap
+        ? { lane: 'system', action: 'restart-red-team', key: expect.stringMatching(new RegExp(`restart-${restarts + 1}$`)) }
+        : { lane: 'operator', action: 'red-team-restart-exhausted', command: expect.any(String), reason: expect.stringContaining('operator') });
+    }
+  });
+  it('zero restart cap still permits publication with no item-level cap', () => {
+    const item = at('red-team-pending', { settings: { maxRedTeamRestartsPerHead: 0 },
+      redTeam: pending({ status: { status: 'finished', result: { status: 'ran' } } }) });
+    expect(item).toMatchObject({ lane: 'system', action: 'publish-red-team-result' });
+    expect(item).not.toHaveProperty('headCap');
+  });
+  it.each([-1, 3, 0.5, NaN, Infinity, '1', null, {}, []])('invalid classifier restart policy %j fails closed to the operator', cap => {
+    expect(at('red-team-pending', { settings: { maxRedTeamRestartsPerHead: cap }, redTeam: pending() }))
+      .toMatchObject({ lane: 'operator', action: 'unclassified', command: null,
+        reason: expect.stringMatching(/fail-closed: classifier error.*maxRedTeamRestartsPerHead/) });
+  });
+  it.each(states)('%s retains the daemon fallback when evidence is omitted', state => {
+    expect(at(state)).toMatchObject({ lane: 'system', action: 'ask-review-daemon' });
+  });
+  it.each(states)('%s never acts while a live job is attached', state => {
+    for (const status of [null, { status: 'finished', result: { status: 'ran' } }]) {
+      expect(at(state, { row: { liveJob: 'review-job' }, redTeam: pending({ status }) })).toBeNull();
+    }
+  });
+  it.each(states)('%s always emits watchdog escalations even with a live job', state => {
+    const attached = { row: { liveJob: 'review-job' } };
+    expect(at(state, { ...attached, redTeam: pending({ ageMinutes: 181, restarts: 2, minutesSinceLastRestart: 60 }) }))
+      .toMatchObject({ lane: 'operator', action: 'red-team-restart-exhausted' });
+    for (const startedAt of [undefined, 'unreadable', new Date(1).toISOString(), new Date(-120 * 60_000).toISOString()]) {
+      expect(at(state, { ...attached, redTeam: pending({ now: 0, ageMinutes: 120, status: { status: 'running', startedAt } }) }))
+        .toMatchObject({ lane: 'operator', action: 'red-team-owner-unknown' });
+    }
+    expect(at(state, { ...attached, redTeam: pending({ ageMinutes: 119, status: { status: 'running' } }) })).toBeNull();
+  });
+  it.each(states)('%s publishes a finished head result while the pending label remains', state => {
+    const item = at(state, { redTeam: pending({ restarts: 2, minutesSinceLastRestart: 0,
+      status: { status: 'finished', result: { status: 'ran' } } }) });
+    expect(item).toMatchObject({ lane: 'system', action: 'publish-red-team-result' });
+    expect(item.action).not.toBe('restart-red-team');
+  });
+  it.each(states)('%s waits on young, alive, unknown-young, unreadable, or recently restarted evidence', state => {
+    for (const patch of [
+      { ageMinutes: 59 }, { ageMinutes: NaN }, { status: { unreadable: true } },
+      { ageMinutes: 300, status: { status: 'running' }, ownerAlive: true },
+      { ageMinutes: 119, status: { status: 'queued' }, ownerAlive: null },
+      { restarts: 1, minutesSinceLastRestart: 59 },
+    ]) expect(at(state, { redTeam: pending(patch) })).toBeNull();
+  });
+  it.each(states)('%s gives the spaced second restart a distinct key under the configured restart budget', state => {
+    expect(at(state, { redTeam: pending({ restarts: 1, minutesSinceLastRestart: 60 }) }))
+      .toMatchObject({ lane: 'system', action: 'restart-red-team',
+        key: `${REPO}#77@${HEAD.toLowerCase()}:${state}:restart-2` });
+  });
+  it.each(states)('%s escalates the two-restart ceiling with restart and age evidence', state => {
+    const item = at(state, { redTeam: pending({ ageMinutes: 181, restarts: 2, minutesSinceLastRestart: 60 }) });
+    expect(item).toMatchObject({ lane: 'operator', action: 'red-team-restart-exhausted', command: expect.any(String) });
+    expect(item.reason).toMatch(/restart/i);
+    expect(item.reason).toMatch(/2/);
+    expect(item.reason).toMatch(/181/);
+  });
+  it.each(['restart-red-team', 'publish-red-team-result'])('%s defaults on and switching it off routes to the operator', action => {
+    expect(CLASSIFY_DEFAULTS.systemActions[action]).toBe(true);
+    const redTeam = pending(action === 'publish-red-team-result' ? { status: { status: 'finished', result: { status: 'ran' } } } : {});
+    const item = at('red-team-pending', { redTeam, settings: { systemActions: { [action]: false } } });
+    expect(item).toMatchObject({ lane: 'operator', action, command: expect.any(String) });
+    expect(item.reason).toContain(`systemActions.${action}`);
+  });
+  it('watchdog outcomes never classify as clear or accept actions', () => {
+    for (const state of states) for (const patch of [{}, { restarts: 2 },
+      { status: { status: 'finished', result: { status: 'ran' } } }, { status: { unreadable: true } }]) {
+      const item = at(state, { redTeam: pending(patch) });
+      if (item) expect(['restart-red-team', 'publish-red-team-result', 'red-team-restart-exhausted']).toContain(item.action);
+    }
+  });
+  it.each(states)('%s restarts a dead owner without waiting 120 minutes', state => {
+    expect(at(state, { redTeam: pending({ status: { status: 'running' }, ownerAlive: false }) }))
+      .toMatchObject({ lane: 'system', action: 'restart-red-team' });
+  });
+  it.each(states)('%s routes unknown ownership to needs-you exactly at the stale deadline', state => {
+    expect(at(state, { redTeam: pending({ now: 0, ageMinutes: 1000, status: { status: 'running', startedAt: new Date(-120 * 60_000).toISOString() } }) }))
+      .toMatchObject({ lane: 'operator', action: 'red-team-owner-unknown', command: expect.any(String),
+        reason: expect.stringMatching(/run age.*120.*ownership could not be proven.*needs-you/) });
+  });
+  it.each(states)('%s does not publish a finished status with only a legacy result string', state => {
+    expect(at(state, { redTeam: pending({ status: { status: 'finished', result: 'ran' } }) }))
+      .toMatchObject({ lane: 'system', action: 'restart-red-team' });
+  });
+  it.each(['awaiting-review', 'human-review-pending-advisory'])('%s keeps ordinary review routing even with red-team evidence', state => {
+    expect(at(state, { redTeam: pending() })).toMatchObject({ lane: 'system', action: 'ask-review-daemon' });
   });
 });

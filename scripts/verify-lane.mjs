@@ -696,7 +696,7 @@ let editedDuringRun = [];
 let baseCandidate = null;
 let baseFailures = null;
 // The final exit code alone cannot say whether a 124 came from an unconfirmed remote attempt; the phases recorded it.
-const infrastructureNow = (exitCode, signal) => verificationInfrastructureFailure({ exitCode, signal }) ?? (remoteUnconfirmed ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null);
+const infrastructureNow = (exitCode, signal, failureDetails) => verificationInfrastructureFailure({ exitCode, signal, failureDetails }) ?? (remoteUnconfirmed ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null);
 async function runGate(command, args, { forgeDispatch = false } = {}) {
   const reportDir = mkdtempSync(join(tmpdir(), 'verify-remote-report-'));
   const reportFile = join(reportDir, 'report.jsonl');
@@ -980,7 +980,7 @@ try {
   // Measured once per main sha (cached); any error leaves `baseFailures` null, i.e. the red stays a real red.
   baseCandidate = baseRerunCandidate({ exitCode, signal, phaseResults, failureDetails,
     changedFiles: Array.isArray(resolvedGate?.decision?.changedFiles) ? [...resolvedGate.decision.changedFiles, ...editedDuringRun] : null });
-  const baseSha = baseCandidate && !infrastructureNow(exitCode, signal) ? tryGit(['rev-parse', 'origin/main']) : null;
+  const baseSha = baseCandidate && !infrastructureNow(exitCode, signal, failureDetails) ? tryGit(['rev-parse', 'origin/main']) : null;
   if (baseSha) {
     process.stderr.write(`Comparing ${baseCandidate.files.length} failing file(s) outside the diff with origin/main @ ${baseSha.slice(0, 8)}\n`);
     baseFailures = await measureBaseFailures({ baseSha, files: baseCandidate.files, cacheDir: join(tmpdir(), 'we-verify-base-failures'),
@@ -1037,7 +1037,7 @@ const retryAudit = isolatedRetryAudit(retriedFailures, isolatedRetry);
 const diagnostic = { ...(exitCode === 0 ? {} : { failureDetails }), ...retryAudit };
 const retryDetail = describeIsolatedRetry(retryAudit);
 // Item 99 — why the gate was red (also when a flaky failure outside the diff went green alone), with the files.
-const infrastructure = verificationInfrastructureFailure({ exitCode, signal, ...(phaseTimeout ? { timedOutPhase: phaseTimeout.phase, ceilingMs: phaseTimeout.ceilingMs, killer: 'verify-lane' } : {}) })
+const infrastructure = verificationInfrastructureFailure({ exitCode, signal, failureDetails, ...(phaseTimeout ? { timedOutPhase: phaseTimeout.phase, ceilingMs: phaseTimeout.ceilingMs, killer: 'verify-lane' } : {}) })
   ?? (remoteUnconfirmed ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null);
 // The gate's own diff plus whatever was edited while it queued or ran (the same set the isolated retry judges against).
 const diffFiles = Array.isArray(resolvedGate?.decision?.changedFiles) ? [...new Set([...resolvedGate.decision.changedFiles, ...editedDuringRun])] : resolvedGate?.decision?.changedFiles;
