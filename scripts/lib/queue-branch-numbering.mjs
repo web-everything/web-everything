@@ -1,5 +1,4 @@
 /** Branch-only queue preparation. Number allocation and reservations share the drain numbering mutex. */
-import { isTransientReadFailure } from './drain-api-reads.mjs';
 import { execFileSync } from 'node:child_process';
 import * as nodeFs from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -323,9 +322,7 @@ export function finishBranchPreparation(out, { c, revalidationAborted, needsAcce
   } else if (out.action === 'skip') {
     try {
       void Promise.resolve(emit({ kind: 'needs-you', pr: c.num, daemon: 'drain',
-        detail: isTransientReadFailure(reason)
-          ? `PR #${c.num}: branch numbering read failed transiently (${reason}) - the PR was not enqueued; retry note: the next pass re-reads it, nothing to do`
-          : `PR #${c.num}: branch numbering refused (${reason}) - the PR was not enqueued; fix the cause or number it by hand` })).catch(() => {});
+        detail: `PR #${c.num}: branch numbering refused (${reason}) - the PR was not enqueued; fix the cause or number it by hand` })).catch(() => {});
     } catch { /* Coordination events must never interrupt branch preparation. */ }
   }
   revalidationAborted.push({ num: c.num, repo: c.repo, reason });
