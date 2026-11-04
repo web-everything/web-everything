@@ -49,7 +49,7 @@ export default {
       if (!String(shaped.prompt).includes(`scope: ${want.join(',')}`)) violations.push('the brief does not carry the comma-joined lease scope');
     } catch (e) { violations.push(`dispatch refused the flattened scope: ${String(e.message).slice(0, 120)}`); }
     // PR #6244: retain legacy input acceptance, but use canonical repo prefixes for the lease and brief.
-    for (const prefix of ['plateau-app:', 'frontierui:', 'webeverything:', 'FUI:', 'WE:', 'custom_repo:', '']) {
+    for (const prefix of ['plateau-app:', 'frontierui:', 'webeverything:', 'FUI:', 'WE:', '']) {
       const input = [`${prefix}src/a.mjs src/b.mjs`];
       const canonical = ({ 'plateau-app:': 'plateau:', 'frontierui:': 'fui:', 'webeverything:': 'we:', 'FUI:': 'fui:', 'WE:': 'we:', '': 'we:' })[prefix] ?? prefix;
       const leaseScope = [`${canonical}src/a.mjs`, `${canonical}src/b.mjs`];
@@ -68,6 +68,18 @@ export default {
           }
         }
       } catch (e) { violations.push(`legacy scope ${JSON.stringify(prefix)} refused: ${String(e.message).slice(0, 120)}`); }
+    }
+    // An unknown repo prefix is refused (send-back item 1): only we:/fui:/plateau: and their known aliases dispatch.
+    for (const unknown of ['custom_repo:', 'foo:', 'we2:']) {
+      try { read([`${unknown}src/a.mjs`]); violations.push(`unknown scope prefix ${JSON.stringify(unknown)} was accepted`); } catch { /* fail closed */ }
+    }
+    // Disjoint globs in one entry (real shape of backlog #4557) dispatch; only globs that can meet are refused.
+    for (const kind of ['build', 'fix', 'ci-heal']) {
+      const disjoint = ['we:scripts/operations/__tests__/explore-io*.test.mjs', 'we:scripts/operations/__tests__/dispatch-lane-io*.test.mjs'];
+      try {
+        const shaped = read([disjoint.join(' ')], kind);
+        if (!shaped.dispatching || JSON.stringify(shaped.scope) !== JSON.stringify(disjoint)) violations.push(`${kind} did not carry disjoint globs in one entry`);
+      } catch (e) { violations.push(`${kind} refused disjoint globs in one entry: ${String(e.message).slice(0, 120)}`); }
     }
     for (const scope of [
       ['we:src/a*b.mjs', 'we:src/ab*.mjs'],
