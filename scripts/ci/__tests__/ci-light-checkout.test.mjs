@@ -120,7 +120,8 @@ describe('test-selection-measure lives in its own workflow (R523)', () => {
 
   it('records the false-green sample only when the shadow report exists', () => {
     const rec = job.steps.find((s) => s.name === 'Record false-green signal (#2681)');
-    expect(rec.if).toContain("steps.report.outcome == 'success'");
+    // Pin the whole expression: a `|| always()` / `|| true` tail would record after a failed validation.
+    expect(String(rec.if).replace(/^\$\{\{\s*|\s*\}\}$/g, '').trim()).toBe("steps.report.outcome == 'success'");
     expect(job.steps.find((s) => s.id === 'report')['continue-on-error']).toBe(true);
   });
 
