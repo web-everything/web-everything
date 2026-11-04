@@ -69,9 +69,9 @@ it.each(['runs', 'sessions'])('unchanged retained sources are archived only once
 it('daily health ticks retain sources and skip their verified versions on the next day', async () => {
   await file(join(runs, 'a.json')); await file(join(sessions, 'project', 'old.jsonl'));
   const archive = request => archiveRetention({ driveRoot: drive, runsDir: runs, sessionsDir: sessions, stateDir,
-    emit: () => {}, env: { WE_PLATFORM_PREFERENCES_FILE: join(root, 'policy.json') }, runEligible: () => true, ...request, withSourceWriterExclusion: undefined });
+    emit: () => {}, env: { WE_PLATFORM_PREFERENCES_FILE: join(root, 'policy.json') }, runEligible: () => true, ...request });
   const first = await runArchiveRetentionTick({ now, archive, log: () => {} });
-  expect(first.results.map(r => [r.filesArchived, r.filesRetained])).toEqual([[1, 1], [1, 1]]);
+  expect(first.results.map(r => [r.filesArchived, r.filesRetained])).toEqual([[1, 0], [1, 1]]); // runs reclaim via the production writer-exclusion provider; sessions stay retain-only
   const second = await runArchiveRetentionTick({ now: now + 86400001, archive, log: () => {} });
   expect(second.results.map(r => r.bundles)).toEqual([[], []]);
   expect(second.error).toBeNull();
@@ -391,4 +391,16 @@ it('Drive verification failure never deletes the local record (runs, real provid
   const p = join(runs, 'v.json'); await writeFile(p, rec); await utimes(p, old, old);
   const out = await realRun({ withSourceWriterExclusion: createRunsWriterExclusion(), listBundle: async () => [] });
   expect(out.errors.length).toBeGreaterThan(0); expect(await exists(p)).toBe(true);
+});
+it('migration-format temp (<name>.<pid>.<uuid>.tmp) of a live pid also blocks removal', async () => {
+  const { createRunsWriterExclusion } = await import('../runs-writer-exclusion.mjs');
+  await writeFile(join(runs, 'm.json.77.00000000-0000-0000-0000-000000000000.tmp'), '{}');
+  let ran = false;
+  await createRunsWriterExclusion({ isPidAlive: () => true })(join(runs, 'm.json'), async () => { ran = true; });
+  expect(ran).toBe(false);
+});
+it('same-inode rewrite with restored mtime is caught by the content hash at quarantine', async () => {
+  const p = join(runs, 'h.json'); await writeFile(p, rec); await utimes(p, old, old);
+  const out = await realRun({ afterSourceStat: async path => { await writeFile(path, rec.replace('[]', '[ ]').padEnd(rec.length)); await utimes(path, old, old); } });
+  expect(await exists(p)).toBe(true); expect(out.filesRetained).toBeGreaterThan(0);
 });

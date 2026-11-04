@@ -12,7 +12,7 @@ import { isRunRecordTerminal } from '../operations/run-store.mjs';
 export const pidAlive = (pid) => {
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
 };
-const TMP = /^(.+)\.(\d+)\.[^.]+\.[^.]+\.tmp$/;
+const TMP = /^(.+?)\.(\d+)\.[^/]+\.tmp$/;
 // writeJsonAtomic: `<name>.<pid>.<Date.now()>.<random>.tmp` (plus the run-store `<dest>.<pid>.<uuid>.tmp` form).
 
 /** @returns {(path:string, critical:()=>Promise<void>)=>Promise<void>} */

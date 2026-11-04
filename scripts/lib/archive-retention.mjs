@@ -5,7 +5,7 @@ import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { sharedRunsDir } from '../operations/run-store.mjs';
 import { resolveCascade, readPlatformPreferences, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { boundedText } from './host-overload-settings.mjs';
@@ -155,7 +155,7 @@ export async function archiveRetention(o = {}) {
       for (const f of old) {
         if (taken >= cap) break;
         let ok = false;
-        try { ok = (o.runEligible ?? runRecordEligible)(await readFile(f.path, 'utf8')); } catch { ok = false; }
+        try { const bytes = await readFile(f.path); ok = (o.runEligible ?? runRecordEligible)(bytes.toString('utf8')); if (ok) f.hash = createHash('sha256').update(bytes).digest('hex'); } catch { ok = false; }
         if (!ok) { out.filesRetained++; continue; }
         add(`runs-${dayOf(f.stat.mtimeMs)}`, [f]); taken++;
       }
@@ -232,7 +232,7 @@ export async function archiveRetention(o = {}) {
             const parked = join(dirname(f.path), `.retiring-${randomUUID()}`);
             await rename(f.path, parked);
             const q = await lstat(parked);
-            if (!(q.isFile() && q.dev === f.stat.dev && q.ino === f.stat.ino && q.size === f.stat.size && q.mtimeMs === f.stat.mtimeMs)) { await link(parked, f.path).then(() => unlink(parked), () => {}); return; }
+            if (!(q.isFile() && (!f.hash || createHash('sha256').update(await readFile(parked)).digest('hex') === f.hash) && q.dev === f.stat.dev && q.ino === f.stat.ino && q.size === f.stat.size && q.mtimeMs === f.stat.mtimeMs)) { await link(parked, f.path).then(() => unlink(parked), () => {}); return; }
             await unlink(parked);
             removed = true;
             out.bytesFreed += f.stat.size;
