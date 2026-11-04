@@ -5,7 +5,21 @@ description: Post-mortem sweep of conveyor sessions to find delivery friction. R
 
 # Coroner sweep
 
-The numbers come from a script, never from throwaway code. Your job is the judgment part.
+The numbers come from a script, never from throwaway code. The nightly job now runs steps 2–4 automatically
+for the top five error causes: rank by measured minutes then count, compare coverage, and file **NEW only**
+through the declared `file-item` operation. Cards remain unqueued for review. Stable metric/cause keys dedupe
+filings across nights; a persisted judge receipt prevents repeat judgment of a completed night.
+
+`coroner.nightly.judge.enabled` defaults to `true`; `coroner.nightly.judge.maxCards` defaults to `3` per night,
+including partial-run retries. Both resolve standard → platform → tool → environment with logged provenance.
+Environment overrides: `WE_CORONER_NIGHTLY_JUDGE_ENABLED` and `WE_CORONER_NIGHTLY_JUDGE_MAX_CARDS`.
+Unreadable/incomplete coverage or failed judgment/filing preserves the extraction and publishes
+`coroner-judge-failed` for retry or a manual sweep. Disabled judgment leaves the published report eligible later.
+
+The manual skill still owns deeper analysis: the wider friction list, bounded evidence checks, root-cause rulings
+and prevention (2b), executor comparisons (2c), false-finding confirmation (2d), and the operator-facing report
+(5). Read the nightly report and existing filed cards before adding anything; automated omissions or failures
+are not NEW verdicts. Additional manual held proposals still follow steps 3–4 below.
 
 ## 1. Extract
 
