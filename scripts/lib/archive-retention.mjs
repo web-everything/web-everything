@@ -1,6 +1,6 @@
 /** R217: archives are retained forever; source removal requires verified Drive evidence. */
 import { lstat, opendir, mkdir, writeFile, rename, unlink, rmdir, mkdtemp, rm, link } from 'node:fs/promises';
-import { join, dirname, relative, resolve } from 'node:path';
+import { join, dirname, basename, relative, resolve } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
@@ -14,7 +14,7 @@ import { createRunsWriterExclusion, runRecordEligible } from './runs-writer-excl
 import { readFile } from 'node:fs/promises';
 const exec = promisify(execFile);
 const DAY = 86400000;
-const standard = { runs: { keepDays: 14 }, sessions: { keepDays: 30 }, runsBatchCap: 5000, runsSchedule: 'daily', driveRoot: join(homedir(), 'Library', 'CloudStorage', 'GoogleDrive-nic.g.gilbert@gmail.com', 'My Drive', 'web-everything-archive') };
+const standard = { runs: { keepDays: 14 }, sessions: { keepDays: 30 }, runsBatchCap: 5000, runsSchedule: 'daily', runsMinAgeDays: 7, driveRoot: join(homedir(), 'Library', 'CloudStorage', 'GoogleDrive-nic.g.gilbert@gmail.com', 'My Drive', 'web-everything-archive') };
 export function archiveSettings({ env = process.env, tool, log = console.error } = {}) {
   const p = readPlatformPreferences({ env, readFile: path => boundedText(path) });
   if (p.errors.length) throw Error(p.errors.join('; '));
@@ -27,17 +27,19 @@ export function archiveSettings({ env = process.env, tool, log = console.error }
     const v = env[`WE_ARCHIVE_${kind.toUpperCase()}_KEEP_DAYS`];
     if (v !== undefined) envValues[kind] = { keepDays: Number(v) };
   }
+  if (env.WE_ARCHIVE_RUNS_MIN_AGE_DAYS !== undefined) envValues.runsMinAgeDays = Number(env.WE_ARCHIVE_RUNS_MIN_AGE_DAYS);
   if (env.WE_ARCHIVE_RUNS_BATCH_CAP !== undefined) envValues.runsBatchCap = Number(env.WE_ARCHIVE_RUNS_BATCH_CAP);
   if (env.WE_ARCHIVE_DRIVE_ROOT !== undefined) envValues.driveRoot = env.WE_ARCHIVE_DRIVE_ROOT;
   const valid = { runs: v => Number.isSafeInteger(v?.keepDays ?? v) && (v?.keepDays ?? v) >= 0,
     sessions: v => Number.isSafeInteger(v?.keepDays ?? v) && (v?.keepDays ?? v) >= 0,
     runsBatchCap: v => Number.isSafeInteger(v) && v > 0,
     runsSchedule: v => v === 'daily',
+    runsMinAgeDays: v => Number.isSafeInteger(v) && v >= 0,
     driveRoot: v => typeof v === 'string' && v.trim().length > 0 };
   // Validate complete blocks too: empty objects must not silently disappear in the cascade.
   for (const layer of [p.prefs.archive, tool, envValues]) if (layer !== undefined) {
     if (!layer || typeof layer !== 'object' || Array.isArray(layer)) throw Error('invalid archive policy');
-    for (const k of Object.keys(valid)) if (Object.hasOwn(layer, k) && (!valid[k](layer[k]) || (!['driveRoot', 'runsBatchCap', 'runsSchedule'].includes(k) && (typeof layer[k] !== 'object' || Array.isArray(layer[k]))))) throw Error(`invalid archive policy: ${k}`);
+    for (const k of Object.keys(valid)) if (Object.hasOwn(layer, k) && (!valid[k](layer[k]) || (!['driveRoot', 'runsBatchCap', 'runsSchedule', 'runsMinAgeDays'].includes(k) && (typeof layer[k] !== 'object' || Array.isArray(layer[k]))))) throw Error(`invalid archive policy: ${k}`);
   }
   const r = resolveCascade({ standard, platform: p.prefs.archive, tool, envValues, valid });
   if (r.invalid.length) throw Error(`invalid archive policy: ${r.invalid.join('; ')}`);
@@ -81,6 +83,11 @@ async function writeArchiveManifest(path, source, drive, files, maxFiles) {
 async function directory(path) { const s = await lstat(path); if (!s.isDirectory() || s.isSymbolicLink()) throw Error('not a real directory'); return s; }
 async function tar(args) { return exec('tar', args, { timeout: 30 * 60 * 1000, maxBuffer: 64 * 1024 * 1024 }); }
 /**
+ * WRITER-EXCLUSION CONTRACT (R559, runs): no writer lock exists or is built. A run record may leave only when it is
+ * FINISHED (parses against the canonical schema, terminal effects, verdict present, cursor > 0) AND its mtime is older
+ * than max(keepDays, runsMinAgeDays=7) days; the live-pid check in runs-writer-exclusion.mjs is defence in depth.
+ * Removal is quarantine-rename, identity+content re-verify, then unlink; a failed restore alerts loudly and every
+ * later runs scan retries `.retiring-<name>.<uuid>` files.
  * Source removal requires `withSourceWriterExclusion(path, criticalSection)`.
  * The provider must exclude ALL writers (including existing open descriptors and atomic
  * replacements) until the awaited critical section returns. An archiver-only lock, quiet
@@ -117,7 +124,8 @@ export async function archiveRetention(o = {}) {
       } catch (e) { if (e.code !== 'ENOENT') throw e; }
     }
     if (o.keepDays !== undefined && (!Number.isSafeInteger(o.keepDays) || o.keepDays < 0)) throw Error('invalid keepDays');
-    const cutoff = Math.min(now - (o.keepDays ?? settings.value[kind].keepDays) * DAY, now - 600000);
+    const keepDays = Math.max(o.keepDays ?? settings.value[kind].keepDays, kind === 'runs' ? (o.minAgeDays ?? settings.value.runsMinAgeDays) : 0);
+    const cutoff = Math.min(now - keepDays * DAY, now - 600000);
     const groups = new Map(); let scanned = 0;
     const maxFiles = o.maxFiles ?? 500000;
     let archived = await readArchiveManifest(archiveManifest, source, drive, maxFiles);
@@ -146,10 +154,26 @@ export async function archiveRetention(o = {}) {
       if (!groups.has(key)) groups.set(key, { files: [], dirs: [] });
       groups.get(key).files.push(...files); groups.get(key).dirs.push(...dirs);
     }
+    // A failed restore is loud (error + event), never silent; the parked file stays discoverable for the next scan.
+    async function restore(parked, canonical) {
+      try { await link(parked, canonical); await unlink(parked); return true; }
+      catch (e) {
+        out.errors.push(`ALERT: restore of ${basename(parked)} failed (${e.code ?? e.message}); operator must inspect`);
+        await (o.emit ?? (ev => appendDaemonEvent(ev, { env })))({ kind: 'archive-retention-alert', daemon: 'archive-retention', detail: { parked, canonical, error: e.message } }).catch(() => {});
+        return false;
+      }
+    }
     if (kind === 'runs') {
       // Oldest first, bounded by the batch cap; unreadable or unfinished records are skipped (never eligible).
       const cap = o.batchCap ?? settings.value.runsBatchCap;
-      const old = (await scan(source, true)).files.filter(f => f.path.endsWith('.json') && f.stat.mtimeMs < cutoff && !(archived.get(relative(source, f.path)) && version(f.stat).every((v, i) => v === archived.get(relative(source, f.path))[i])))
+      const scanned1 = (await scan(source, true)).files;
+      for (const f of scanned1) {
+        const m = /^\.retiring-(.+)\.[0-9a-f-]{36}$/.exec(basename(f.path));
+        if (!m) continue;
+        if (o.dryRun) { out.errors.push(`ALERT: parked ${basename(f.path)} awaits restore`); continue; }
+        await restore(f.path, join(dirname(f.path), m[1]));
+      }
+      const old = scanned1.filter(f => f.path.endsWith('.json') && f.stat.mtimeMs < cutoff && !(archived.get(relative(source, f.path)) && version(f.stat).every((v, i) => v === archived.get(relative(source, f.path))[i])))
         .sort((a, b) => a.stat.mtimeMs - b.stat.mtimeMs);
       let taken = 0;
       for (const f of old) {
@@ -229,10 +253,10 @@ export async function archiveRetention(o = {}) {
             if (!writerExcluded) return;
             // Quarantine by atomic rename, re-verify the bytes' identity, only then unlink: a writer that replaced
             // the record between the stat and here is detected and its new file is restored, never deleted.
-            const parked = join(dirname(f.path), `.retiring-${randomUUID()}`);
+            const parked = join(dirname(f.path), `.retiring-${basename(f.path)}.${randomUUID()}`);
             await rename(f.path, parked);
             const q = await lstat(parked);
-            if (!(q.isFile() && (!f.hash || createHash('sha256').update(await readFile(parked)).digest('hex') === f.hash) && q.dev === f.stat.dev && q.ino === f.stat.ino && q.size === f.stat.size && q.mtimeMs === f.stat.mtimeMs)) { await link(parked, f.path).then(() => unlink(parked), () => {}); return; }
+            if (!(q.isFile() && (!f.hash || createHash('sha256').update(await readFile(parked)).digest('hex') === f.hash) && q.dev === f.stat.dev && q.ino === f.stat.ino && q.size === f.stat.size && q.mtimeMs === f.stat.mtimeMs)) { await restore(parked, f.path); return; }
             await unlink(parked);
             removed = true;
             out.bytesFreed += f.stat.size;

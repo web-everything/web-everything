@@ -320,7 +320,7 @@ it('coordinated writer arriving after final stat waits until removal and its new
 
 // R555: pluggable writer exclusion, batch cap, eligibility, fail-closed.
 import { newRunRecord } from '../../operations/run-record.mjs';
-const rec = JSON.stringify(newRunRecord({ id: 'r1', op: 'review-pr' }));
+const rec = JSON.stringify({ ...newRunRecord({ id: 'r1', op: 'review-pr' }), cursor: 2, verdict: { verdict: 'approve' } });
 const realRun = (extra = {}) => run({ runEligible: undefined, ...extra });
 it('batch cap archives only the oldest N files per run', async () => {
   const mk = i => file(join(runs, `r${i}.json`), new Date(now - (60 - i) * 86400000));
@@ -377,6 +377,10 @@ it('records with unknown effect statuses are not eligible', async () => {
   expect(runRecordEligible(JSON.stringify({ ...base, effects: [{ status: 'weird' }] }))).toBe(false);
   expect(runRecordEligible(JSON.stringify({ effects: [] }))).toBe(false); // schema-invalid
   expect(runRecordEligible(rec)).toBe(true);
+  const fresh = newRunRecord({ id: 'r1', op: 'review-pr' });
+  expect(runRecordEligible(JSON.stringify(fresh))).toBe(false); // cursor 0, no verdict
+  expect(runRecordEligible(JSON.stringify({ ...fresh, cursor: 2 }))).toBe(false); // no verdict
+  expect(runRecordEligible(JSON.stringify({ ...fresh, verdict: { verdict: 'approve' } }))).toBe(false); // cursor 0
 });
 it('a record replaced just before removal is restored, not deleted', async () => {
   const p = await file(join(runs, 'r.json'));
@@ -406,4 +410,26 @@ it('same-inode rewrite with restored mtime is caught by the content hash at quar
   const p = join(runs, 'h.json'); await writeFile(p, rec); await utimes(p, old, old);
   const out = await realRun({ afterSourceStat: async path => { await writeFile(path, rec.replace('r1', 'r2')); await utimes(path, old, old); } });
   expect(await exists(p)).toBe(true); expect(out.filesRetained).toBeGreaterThan(0);
+});
+
+it('runsMinAgeDays (default 7, cascade) holds back records younger than it even with keepDays 0', async () => {
+  const a = archiveSettings({ env: { WE_PLATFORM_PREFERENCES_FILE: join(root, 'p.json') }, tool: {} });
+  expect(a.value.runsMinAgeDays).toBe(7);
+  const b = archiveSettings({ env: { WE_PLATFORM_PREFERENCES_FILE: join(root, 'p.json'), WE_ARCHIVE_RUNS_MIN_AGE_DAYS: '9' }, tool: {} });
+  expect(b.value.runsMinAgeDays).toBe(9); expect(b.sources.runsMinAgeDays).toBe('env');
+  const young = await file(join(runs, 'y.json'), new Date(now - 3 * 86400000));
+  const mid = await file(join(runs, 'm.json'), new Date(now - 8 * 86400000));
+  await run({ keepDays: 0 });
+  expect(await exists(young)).toBe(true); expect(await exists(mid)).toBe(false);
+});
+it('a parked .retiring file is restored by the next runs scan, and a failed restore alerts', async () => {
+  const parked = join(runs, '.retiring-z.json.11111111-1111-1111-1111-111111111111');
+  await writeFile(parked, rec);
+  const out = await run({ keepDays: 100, batchCap: 1 });
+  expect(await exists(join(runs, 'z.json'))).toBe(true); expect(await exists(parked)).toBe(false); expect(out.errors).toEqual([]);
+  // canonical already exists -> restore fails loudly and the parked file stays discoverable
+  await writeFile(parked, rec); const events = [];
+  const out2 = await run({ keepDays: 100, now: now + 2 * 86400000, emit: e => events.push(e) });
+  expect(out2.errors.join()).toMatch(/ALERT/); expect(await exists(parked)).toBe(true);
+  expect(events.some(e => e.kind === 'archive-retention-alert')).toBe(true);
 });

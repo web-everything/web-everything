@@ -48,6 +48,8 @@ export function runRecordEligible(text) {
   let record;
   try { const parsed = parseRunRecord(text); if (!parsed.ok) return false; record = parsed.record; } catch { return false; }
   if (!isRunRecordTerminal(record)) return false;
+  // R559: FINISHED means a verdict is present and the cursor advanced; anything else is never eligible.
+  if (!record.verdict || !(record.cursor > 0)) return false;
   // Fail closed on unknown shapes: every effect must carry a status known to be final.
   if (!record.effects.every(e => e && typeof e === 'object' && ['declared', 'applied', 'failed'].includes(e.status))) return false;
   if (record.op === 'review-pr') {
