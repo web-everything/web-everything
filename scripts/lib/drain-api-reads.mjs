@@ -47,7 +47,7 @@ export function resolveDrainReadsSource({ env = process.env, file, platform } = 
 const SLUG_TTL_MS = 60_000;
 const slugCache = new Map();
 /** `owner/repo` of the checkout's `origin` remote. A parse failure fails closed; GH_REPO must agree or be unset. */
-export function readOriginSlug(cwd, { env = process.env, remote = 'origin', git = (c) => execFileSync('git', ['-C', c, 'remote', 'get-url', remote], { encoding: 'utf8', timeout: 20_000, stdio: ['ignore', 'pipe', 'pipe'] }), now = Date.now } = {}) {
+export function readOriginSlug(cwd, { env = process.env, remote = 'origin', git = (c) => execFileSync('git', ['-C', c, 'remote', 'get-url', remote], { encoding: 'utf8', timeout: 20_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }), now = Date.now } = {}) {
   if (!/^[\w.-]+$/.test(String(remote))) throw new DrainReadError('repo-pin', 'origin-unreadable', 'invalid remote name');
   const dir = cwd || process.cwd();
   const key = `${dir}\0${remote}`;
