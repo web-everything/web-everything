@@ -4074,6 +4074,40 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
       // With no clone registered the wrapper changes nothing.
       expect(decide(`env -C ${CLONE} rm -rf src`, { cwd: LANE })).toBeNull();
     });
+    // Self-review of a7677aba: the scan must stop at the real child, so a read-only command's search term is never
+    // read as a writer, and the child's own `-C` is never read as the wrapper's directory.
+    it('a child command\'s arguments are never read as the writer or the wrapper directory', () => {
+      for (const command of [`timeout 30 grep -rn cp ${CLONE}/scripts`, `nice -n 5 rg touch ${CLONE}`,
+        `timeout 30 grep -C 2 mv ${CLONE}/x`, `xargs -I{} grep -l rm {} ${CLONE}/x`, `env -C ${CLONE} npm ls`,
+        `timeout 5 ls ${CLONE}`, `sudo -u x ls ${CLONE}`]) {
+        expect(decide(command, ctx), command).toBeNull();
+      }
+    });
+    it('bundled short options and unique long-option prefixes still carry the directory', () => {
+      for (const command of [`env -iC ${CLONE} rm -rf src`, `env -vC${CLONE} rm x`, `sudo -nD ${CLONE} rm x`,
+        `env --ch=${CLONE} rm x`, `env --chd ${CLONE} rm x`, `nice env -C ${CLONE} rm x`]) {
+        expect(decide(command, ctx), command).toMatch(/DAEMON CLONE/);
+      }
+    });
+    it('the wrapped child is judged as the command it is: in-place editors, chains, `!` and command strings', () => {
+      for (const command of [`timeout 5 sed -i s/a/b/ ${CLONE}/x`, `timeout 5 perl -pi -e s/a/b/ ${CLONE}/x`,
+        `env -C ${CLONE} sed -i s/a/b/ x`, `timeout 5 env GIT_PAGER="sh -c x" git -C ${CLONE} log`,
+        `timeout 5 env GIT_TRACE=${CLONE}/t git status`, `! env -C ${CLONE} rm x`, `! rm ${CLONE}/x`,
+        `flock /tmp/l -c "rm ${CLONE}/x"`, `watch -n 5 rm ${CLONE}/x`]) {
+        expect(decide(command, ctx), command).toMatch(/DAEMON CLONE/);
+      }
+      for (const command of ['timeout 5 sed -i s/a/b/ /tmp/x', '! rm /tmp/x', 'flock /tmp/l -c "rm /tmp/x"']) {
+        expect(decide(command, ctx), command).toBeNull();
+      }
+    });
+    it('odd wrapper input never throws and stays bounded', () => {
+      for (const command of ['env -S', 'env -S ""', 'timeout', 'env -S\'-S -S\' rm x', 'env --', '!']) {
+        expect(() => decide(command, ctx), command).not.toThrow();
+      }
+      const started = Date.now();
+      decide('env -S a '.repeat(8000), ctx);
+      expect(Date.now() - started).toBeLessThan(3000);
+    });
     it('a redirect into a clone behind a wrapper is still denied', () => {
       expect(decide(`env -i echo hi > ${CLONE}/x`, ctx)).toMatch(/DAEMON CLONE/);
       expect(decide(`env -C ${CLONE} echo hi > /tmp/x`, ctx)).toBeNull();
@@ -4117,6 +4151,31 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
       }
       for (const command of ['env GIT_PAGER="$P" git log', 'env GIT_TRACE=/x git log', 'env PAGER="less; touch x" git log']) {
         expect(decide(command, ctx), command).toMatch(/DAEMON CLONE/);
+      }
+      for (const command of [`GIT_PAGER="less -R" git -C ${CLONE} log`, `GIT_CONFIG_NOSYSTEM=1 git -C ${CLONE} status`,
+        `GIT_CONFIG_GLOBAL=/dev/null git -C ${CLONE} status`, 'GIT_EDITOR=true git rebase --continue',
+        `export GIT_PAGER=cat; git -C ${CLONE} log`]) {
+        expect(decide(command, ctx), command).toBeNull();
+      }
+    });
+    it('a code-running env exported by an earlier statement is read like a prefix', () => {
+      const ctx = { cwd: LANE, daemonCloneRoots: roots };
+      for (const command of [`export GIT_TRACE=${CLONE}/t; git status`, `GIT_PAGER="sh -c x"; export GIT_PAGER; git -C ${CLONE} log`,
+        `export PAGER=x; git -C ${CLONE} log`, `export GIT_EXTERNAL_DIFF=x; git -C ${CLONE} diff --ext-diff`]) {
+        expect(decide(command, ctx), command).toMatch(/DAEMON CLONE/);
+      }
+      expect(decide('export PAGER=x; git log', ctx)).toBeNull();
+    });
+    it('a global -c / --config-env / --exec-path makes a read judged by its target', () => {
+      const ctx = { cwd: LANE, daemonCloneRoots: roots };
+      for (const flag of ['-c core.pager="sh -c x"', '-c core.fsmonitor=x', '-ccore.pager=x', '--exec-path=/tmp',
+        '--config-env=core.pager=X']) {
+        expect(decide(`git -C ${CLONE} ${flag} log`, ctx), flag).toMatch(/DAEMON CLONE/);
+        expect(decide(`git ${flag} log`, ctx), `${flag} at lane`).toBeNull();
+      }
+      // Keys that only pick a target or a display setting run nothing and keep the read.
+      for (const flag of ['-c color.ui=never', '-c core.quotepath=off', `-c core.worktree=${CLONE}`]) {
+        expect(decide(`git -C ${CLONE} ${flag} log`, ctx), flag).toBeNull();
       }
     });
   });

@@ -2408,65 +2408,118 @@ export function gitCodeEnvAssignment(word) {
   if (!m || !GIT_CODE_ENV.some((re) => re.test(m[1]))) return false;
   const value = m[2];
   if (/[$`]/.test(value)) return true;
-  if (/^(?:GIT_)?PAGER$/.test(m[1])) return !['', 'cat', 'less', 'more'].includes(value);
+  // A pager that is a bare `cat`, or `less`/`more` with plain flags, runs nothing else.
+  if (/^(?:GIT_)?PAGER$/.test(m[1])) return !/^(?:|cat|(?:less|more)(?:\s+-[A-Za-z0-9]+)*)$/.test(value);
   if (/^GIT_TRACE\w*$/.test(m[1])) return !/^(?:|0|1|[2-9]|true|false)$/i.test(value);
+  // Switching the system config off, or pointing a config file at /dev/null, adds no config.
+  if (m[1] === 'GIT_CONFIG_NOSYSTEM') return false;
+  if (/^GIT_CONFIG(?:_GLOBAL|_SYSTEM)?$/.test(m[1]) && value === '/dev/null') return false;
   return true;
 }
 
-/** Wrapper programs that run a SEPARATE child command, some with options that change its directory
- *  (`env -C/--chdir`, `sudo -D/--chdir`) or hide it in one string (`env -S`). */
+/** Wrapper programs that run a SEPARATE child command: their own options and operands come first, then the child.
+ *  Some options change the child's directory (`env -C/--chdir`, `sudo -D/--chdir`) or hide it in one string
+ *  (`env -S`, `flock -c`, `npx -c`). */
 const DAEMON_CHILD_WRAPPERS = new Set(['env', 'time', 'command', 'builtin', 'nice', 'sudo', 'doas', 'xargs', 'npx',
   'bunx', 'timeout', 'nohup', 'exec', 'setsid', 'stdbuf', 'ionice', 'chrt', 'taskset', 'caffeinate', 'unbuffer',
-  'flock', 'nsenter', 'watch']);
-const WRAPPER_DIR_OPTION = /^(?:-C|-D|--chdir|--directory)$/;
-const WRAPPER_DIR_ATTACHED = /^(?:-C|-D)(.+)$|^--(?:chdir|directory)=(.*)$/s;
-const WRAPPER_SPLIT_OPTION = /^(?:-S|--split-string)$/;
-const WRAPPER_SPLIT_ATTACHED = /^-S(.+)$|^--split-string=(.*)$/s;
+  'flock', 'watch']);
+// Short option letters that take a value (attached or as the next word), per wrapper.
+const WRAPPER_SHORT_VALUE = {
+  env: 'uCS', sudo: 'ugUDhpCrtTR', doas: 'uC', nice: 'n', ionice: 'cnp', timeout: 'sk', stdbuf: 'ioe',
+  xargs: 'IdELnPsa', exec: 'a', caffeinate: 'tw', flock: 'wEc', npx: 'pc', bunx: 'pc', watch: 'nd',
+};
+// Long options that take the NEXT word as their value when written without `=`.
+const WRAPPER_LONG_VALUE = new Set(['--unset', '--user', '--group', '--host', '--prompt', '--close-from', '--role',
+  '--type', '--command-timeout', '--other-user', '--signal', '--kill-after', '--delimiter', '--eof', '--max-lines',
+  '--max-args', '--max-procs', '--max-chars', '--arg-file', '--replace', '--input', '--output', '--error',
+  '--adjustment', '--class', '--classdata', '--pid', '--package', '--call', '--command', '--interval', '--timeout']);
+// Positional operands the wrapper itself consumes before the child (`timeout 5`, `flock <file>`, `chrt <prio>`).
+const WRAPPER_POSITIONALS = { timeout: 1, flock: 1, chrt: 1, taskset: 1 };
+const WRAPPER_SPLIT_CAP = 8;
 
-/** A file-writing child (`rm`, `cp`, `touch`, `tee`, …) reached through a wrapper, with every directory the
- *  wrapper may run it in CARRIED: a directory option's value is resolved against cwd and the child's operands are
- *  resolved against both. Returns the protected path written, 'unresolved wrapper target' when a directory value
- *  cannot be read statically, or null. Fail closed: a `-S` string is re-read as the child's own words. */
-function daemonWrappedChildWrite(segment, cwd, roots) {
+/** Shell-quote one word so it re-parses to the same text. An expansion stays visible (double quotes), so every
+ *  downstream `$`/backtick check still fails closed on it. */
+function requoteWord(word) {
+  const quote = (text) => (/^[A-Za-z0-9_@%+=:,./-]+$/.test(text) ? text : `"${text.replace(/["\\]/g, '\\$&')}"`);
+  const assignment = /^([A-Za-z_]\w*)=(.*)$/s.exec(word);
+  return assignment ? `${assignment[1]}=${assignment[2] === '' ? '""' : quote(assignment[2])}` : quote(word);
+}
+
+/** Peel the wrappers in front of a segment's real command, carrying their effect: the child command text (with any
+ *  `NAME=value` the segment or an `env`/`time` wrapper sets in front of it) and every directory it may run in
+ *  (cwd, then each `-C`/`--chdir`/`-D` value in order, bundled `-iC dir` and unique `--ch=dir` prefixes included).
+ *  The scan stops at the first word that is not the wrapper's own option or operand, so a child's arguments are never
+ *  read as the child. Returns null when there is no wrapper, 'unresolved' when a directory or split string cannot be
+ *  read statically. */
+function peelDaemonWrapper(segment, cwd) {
   let words = shellTokens(String(segment).trim().replace(/^[({]\s*/, '')).filter((t) => !t.op).map((t) => t.text);
-  while (words.length && /^[A-Za-z_]\w*=/.test(words[0])) words = words.slice(1);
-  const lead = (words[0] ?? '').replace(/^\\+/, '').replace(/^.*\//, '');
-  if (!DAEMON_CHILD_WRAPPERS.has(lead)) return null;
-  const dirs = [];
-  let child = -1;
-  for (let i = 1; i < words.length; i++) {
-    const word = words[i];
-    const base = word.replace(/^\\+/, '').replace(/^.*\//, '');
-    if (['git', 'sh', 'bash', 'zsh', 'eval'].includes(base)) return null; // daemonWrapperUncertain owns these
-    if (FS_MUTATING_PROGRAMS.has(base) || base === 'tee') { child = i; break; }
-    let dir = null;
-    if (WRAPPER_DIR_OPTION.test(word)) dir = words[++i] ?? '';
-    else if (WRAPPER_DIR_ATTACHED.test(word)) { const m = WRAPPER_DIR_ATTACHED.exec(word); dir = m[1] ?? m[2] ?? ''; }
-    if (dir !== null) {
-      if (!dir || /[$`]/.test(dir) || dir.startsWith('~')) return 'unresolved wrapper target';
-      dirs.push(resolve(cwd || '.', dir));
-      continue;
-    }
-    let split = null;
-    if (WRAPPER_SPLIT_OPTION.test(word)) split = words[i + 1] ?? '';
-    else if (WRAPPER_SPLIT_ATTACHED.test(word)) { const m = WRAPPER_SPLIT_ATTACHED.exec(word); split = m[1] ?? m[2] ?? ''; }
-    if (split !== null) {
-      const inner = shellTokens(split).filter((t) => !t.op).map((t) => t.text);
-      words = [...words.slice(0, i), ...inner, ...words.slice(i + (WRAPPER_SPLIT_OPTION.test(word) ? 2 : 1))];
-      i -= 1;
-    }
+  const assigns = [];
+  let peeled = false;
+  const takeAssignments = () => { while (/^[A-Za-z_]\w*=/.test(words[0] ?? '')) assigns.push(words.shift()); };
+  takeAssignments();
+  while (words[0] === '!') { words.shift(); peeled = true; takeAssignments(); }
+  const bases = [cwd || '.'];
+  let splits = 0;
+  for (;;) {
+    const wrapper = (words[0] ?? '').replace(/^\\+/, '').replace(/^.*\//, '');
+    if (!DAEMON_CHILD_WRAPPERS.has(wrapper)) break;
+    peeled = true;
+    words.shift();
+    const shortValue = WRAPPER_SHORT_VALUE[wrapper] || '';
+    const setDir = (dir) => {
+      if (!dir || /[$`]/.test(dir) || dir.startsWith('~')) return false;
+      bases.push(resolve(bases[bases.length - 1], dir));
+      return true;
+    };
+    const split = (text) => {
+      if (++splits > WRAPPER_SPLIT_CAP) return false;
+      words.unshift(...shellTokens(text).filter((t) => !t.op).map((t) => t.text));
+      return true;
+    };
+    let pendingSplit = null;
+    let optionsEnded = false;
+    // The wrapper's own options; false when a directory value cannot be read statically.
+    const readOptions = () => {
+      while (!optionsEnded && words.length && words[0].startsWith('-') && words[0] !== '-') {
+        const option = words.shift();
+        if (option === '--') { optionsEnded = true; break; }
+        if (option.startsWith('--')) {
+          const eq = option.indexOf('=');
+          const name = eq < 0 ? option : option.slice(0, eq);
+          const attached = eq < 0 ? null : option.slice(eq + 1);
+          const isPrefix = (full) => name.length >= 3 && full.startsWith(name); // getopt_long accepts unique prefixes
+          if ((wrapper === 'env' || wrapper === 'sudo') && isPrefix('--chdir')) {
+            if (!setDir(attached ?? words.shift())) return false;
+          } else if (wrapper === 'env' && isPrefix('--split-string')) {
+            pendingSplit = attached ?? words.shift() ?? '';
+          } else if (attached === null && WRAPPER_LONG_VALUE.has(name)) words.shift();
+          continue;
+        }
+        const letters = option.slice(1);
+        for (let k = 0; k < letters.length; k++) {
+          if (!shortValue.includes(letters[k])) continue;
+          const value = letters.slice(k + 1) || words.shift();
+          if ((wrapper === 'env' && letters[k] === 'C') || (wrapper === 'sudo' && letters[k] === 'D')) {
+            if (!setDir(value)) return false;
+          } else if ((wrapper === 'env' && letters[k] === 'S') || (['flock', 'npx', 'bunx'].includes(wrapper) && letters[k] === 'c')) {
+            pendingSplit = value ?? '';
+          }
+          break;
+        }
+      }
+      return true;
+    };
+    if (!readOptions()) return 'unresolved';
+    if (wrapper === 'env' || wrapper === 'time') takeAssignments();
+    if (WRAPPER_POSITIONALS[wrapper]) words.splice(0, WRAPPER_POSITIONALS[wrapper]);
+    // flock takes options after its lock file too (`flock <file> -c "<cmd>"`).
+    if (wrapper === 'flock' && !readOptions()) return 'unresolved';
+    // A split string IS the child (env -S runs it with the remaining words appended).
+    if (pendingSplit !== null && !split(pendingSplit)) return 'unresolved';
+    if (wrapper === 'env' || wrapper === 'time') takeAssignments();
   }
-  if (child < 0) return null;
-  const bases = [cwd || '.', ...dirs];
-  const operands = fileOperands(words.slice(child + 1).map((text) => ({ text, quoted: false, op: false })));
-  if (!operands.length) return bases.find((b) => isDaemonCloneRealpath(resolve(b), roots)) ?? null;
-  for (const operand of operands) {
-    for (const b of bases) {
-      const abs = resolve(b, operand);
-      if (isDaemonCloneRealpath(abs, roots)) return abs;
-    }
-  }
-  return null;
+  if (!peeled || !words.length) return null;
+  return { child: [...assigns, ...words].map(requoteWord).join(' '), bases: [...new Set(bases)] };
 }
 
 /** Wrappers with unmodelled options cannot prove either their command or its cwd. Keep this
@@ -2572,10 +2625,26 @@ export const DAEMON_GIT_READS = new Set(['status', 'log', 'diff', 'show', 'rev-p
   'ls-tree', 'cat-file', 'describe', 'merge-base', 'for-each-ref', 'show-ref', 'name-rev',
   'diff-tree', 'diff-index', 'diff-files', 'count-objects', 'check-ref-format']);
 
+// Config keys a read may be given with `-c` without running anything: target and display settings only.
+const DAEMON_READ_SAFE_CONFIG = /^(?:core\.(?:worktree|quotepath|abbrev|bare)|color\.[\w.-]+|log\.\w+|status\.\w+|advice\.\w+|safe\.directory|user\.\w+|i18n\.\w+|diff\.(?:renames|noprefix|mnemonicprefix|algorithm|context|relative|statgraphwidth))$/i;
+
 function daemonGitRead(segment, sub) {
   const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
   const index = gitSubcommandIndex(toks);
   if (index < 0) return false;
+  // A global `-c key=value` / `--config-env key=ENV` can set a pager, fsmonitor, external diff or other program, and
+  // `--exec-path=<dir>` swaps git's own helpers: a read behind one is judged by its target instead. Only keys known
+  // to run nothing are exempt; an unknown key is never guessed safe.
+  const globals = toks.slice(1, index);
+  for (let i = 0; i < globals.length; i++) {
+    const t = globals[i];
+    if (/^--exec-path/.test(t)) return false;
+    let setting = null;
+    if (t === '-c' || t === '--config-env') setting = globals[++i] ?? '';
+    else if (/^-c./.test(t)) setting = t.slice(2);
+    else if (t.startsWith('--config-env=')) setting = t.slice('--config-env='.length);
+    if (setting !== null && (/[$`]/.test(setting) || !DAEMON_READ_SAFE_CONFIG.test(setting.split('=')[0]))) return false;
+  }
   const args = toks.slice(index + 1);
   if (args.some((a) => /[$`]/.test(a) || /^--out/.test(a))) return false;
   if (DAEMON_GIT_READS.has(sub)) return true;
@@ -2637,13 +2706,21 @@ function daemonCloneWriteMessage(dir) {
  * cwd naming one explicitly (`cp x /…/wev-review-daemon/y` run from a lane) are caught. Falls back to the
  * ambient-cwd test alone when no operand is found at all (e.g. a bare `rm` with nothing to resolve).
  */
-export function daemonCloneWriteReason(segment, { cwd = null, roots = [], envDirs = [], configEnv = {}, fetchConfig = [], daemonFetchConfigReader = null, unknownTarget = false } = {}) {
+export function daemonCloneWriteReason(segment, options = {}) {
+  const { cwd = null, roots = [], envDirs = [], configEnv = {}, fetchConfig = [], daemonFetchConfigReader = null, unknownTarget = false } = options;
   if (!roots.length) return null;
   const s = String(segment || '');
   if (daemonWrapperUncertain(s)) return daemonCloneWriteMessage('unresolved wrapper target');
-  // A file-writing child behind a wrapper (`env -C <clone> rm x`, `timeout 5 rm <clone>/x`), its directory carried.
-  const wrappedWrite = daemonWrappedChildWrite(s, cwd, roots);
-  if (wrappedWrite) return daemonCloneWriteMessage(wrappedWrite);
+  // A wrapped child (`env -C <clone> rm x`, `timeout 5 env GIT_PAGER=… git log`, `! sed -i … <clone>/x`) is judged
+  // as the command it is, once in every directory the wrappers may run it in. The text is shorter each level.
+  const peeled = peelDaemonWrapper(s, cwd);
+  if (peeled === 'unresolved') return daemonCloneWriteMessage('unresolved wrapper target');
+  if (peeled) {
+    for (const base of peeled.bases) {
+      const child = daemonCloneWriteReason(peeled.child, { ...options, cwd: base });
+      if (child) return child;
+    }
+  }
   // Strict: behind an unknown global flag no subcommand is trusted (no read, no fetch exception).
   const sub = gitSubcommandStrict(s);
   if (programWord(s) === 'git') {
@@ -2653,12 +2730,24 @@ export function daemonCloneWriteReason(segment, { cwd = null, roots = [], envDir
     const leadingWords = shellTokens(s.trim().replace(/^[({]\s*/, '')).filter((t) => !t.op).map((t) => t.text);
     let codeEnv = false;
     const tracePaths = [];
+    const leadingAssigned = [];
     for (const word of leadingWords) {
       if (!/^[A-Za-z_]\w*=/.test(word)) break;
-      if (gitCodeEnvAssignment(word)) codeEnv = true;
+      leadingAssigned.push(word);
+    }
+    // Names the command's own earlier statements set (`export GIT_TRACE=…; git status`): the tracked scope values
+    // that differ from the hook's inherited environment. The inherited environment itself is not the command's doing.
+    // The GIT_CONFIG* family is excluded here: the scope tracker already models it as a target/config input (it
+    // stores placeholder values for unmodelled writers), and a read after it is a pinned, deliberate allow.
+    const scopeAssigned = Object.entries(configEnv || {})
+      .filter(([key, value]) => typeof value === 'string' && value !== process.env[key] && !/^GIT_CONFIG/.test(key))
+      .map(([key, value]) => `${key}=${value}`);
+    for (const word of [...scopeAssigned, ...leadingAssigned]) {
+      if (!gitCodeEnvAssignment(word)) continue;
+      codeEnv = true;
       // A GIT_TRACE* path is a file git appends to, wherever the repository is: check the file itself.
       const trace = /^GIT_TRACE\w*=(.+)$/s.exec(word);
-      if (trace && gitCodeEnvAssignment(word)) tracePaths.push(trace[1]);
+      if (trace) tracePaths.push(trace[1]);
     }
     for (const p of tracePaths) {
       if (/[$`]/.test(p) || p.startsWith('~')) return daemonCloneWriteMessage('unresolved GIT_TRACE file');
