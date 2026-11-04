@@ -215,7 +215,7 @@ describe('R549 round: pinned repo, strict base64, 20 s freeze bound', () => {
     expect(bad('abc')).toContain('invalid base64');
     expect(bad('QR==')).toContain('does not round-trip');
     const good = Buffer.from(FREEZE).toString('base64').replace(/(.{20})/g, '$1\n');
-    expect(readSharedFreeze({ board: '/x', branch: 'ops/b', readsSource: 'api', slug: 'o/r', rest: routes({ [SHARED_FREEZE_FILE]: ok({ type: 'file', encoding: 'base64', content: good }) }) })).toMatchObject({ frozen: true });
+    expect(readSharedFreeze({ board: '/x', branch: 'ops/b', readsSource: 'api', slug: 'o/r', rest: routes({ [SHARED_FREEZE_FILE]: ok({ ...b64(FREEZE), content: good }) }) })).toMatchObject({ frozen: true });
   });
   it('corrupt added-card content is held, not admitted', () => {
     const rest = routes({
@@ -353,13 +353,13 @@ describe('verified decode: base64 against reported size and sha', () => {
 describe('pagination: follow to the end or be unreadable', () => {
   const page = (n, status = 'modified') => Array.from({ length: n }, (_x, i) => ({ filename: `f${i}-${n}-${Math.random()}`, status }));
   it('follows pages until a short page and concatenates every page', () => {
-    const rest = routes({ 'page=1': ok({ files: [...page(99), { filename: 'backlog/a.md', status: 'added' }] }), 'page=2': ok({ files: [{ filename: 'backlog/b.md', status: 'added' }] }) });
+    const rest = routes({ '&page=1': ok({ files: [...page(99), { filename: 'backlog/a.md', status: 'added' }] }), '&page=2': ok({ files: [{ filename: 'backlog/b.md', status: 'added' }] }) });
     const r = readAddedFiles('main', SHA, { source: src(rest) });
     expect(r).toMatchObject({ ok: true, value: { added: ['backlog/a.md', 'backlog/b.md'] } });
     expect(rest.seen).toHaveLength(2);
   });
   it('a page failing midway makes the whole read unreadable, not a partial list', () => {
-    const rest = routes({ 'page=1': ok({ files: page(100) }), 'page=2': http(502) });
+    const rest = routes({ '&page=1': ok({ files: page(100) }), '&page=2': http(502) });
     expect(readAddedFiles('main', SHA, { source: src(rest) })).toMatchObject({ ok: false, reason: 'api-http-502' });
   });
   it('hitting the 3000-file ceiling is unreadable (truncated), never complete', () => {
