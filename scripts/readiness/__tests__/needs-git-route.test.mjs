@@ -77,9 +77,71 @@ describe('sourceNeedsGit', () => {
     // ... but text inside one comment stays a comment
     expect(sourceNeedsGit(G + "// execSync('git status')")).toBe(false);
   });
+  it('a function or class EXPRESSION body is an operand (a following `/` divides); a declaration body is not', () => {
+    const E = "import {execSync} from 'node:child_process'; ";
+    const tail = " execSync('git status'); const s = '/tmp';";
+    expect(sourceNeedsGit(E + 'const f = function(){} / 2;' + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'const f = function named(a, b = {}){} / 2;' + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'const f = function*(){} / 2;' + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'const f = async function(){} / 2;' + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'const f = class {} / 2;' + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'const f = class A extends B {} / 2;' + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'const f = class A extends mix({}) {} / 2;' + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'const f = (function(){}) / 2;' + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'f(function(){} / 2);' + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'const o = {a: function(){} / 2};' + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'const f = true ? function(){} / 2 : 0;' + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'const f = `${ function(){} / 2 }`;' + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'const f = [function(){} / 2];' + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'const f = a || function(){} / 2;' + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'const f = typeof function(){} / 2;' + tail)).toBe(true);
+    // declarations (and ASI-separated ones) end a statement: the next `/` starts a regex
+    const rx = "\n/'/.test(a); const u = 'http://x';";
+    expect(sourceNeedsGit(E + 'function g(){}' + rx + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'async function g(){}' + rx + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'class A {}' + rx + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'class A extends B {}' + rx + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'x = 1\nfunction g(){}' + rx + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'x++\nfunction g(){}' + rx + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'export function g(){}' + rx + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'export default function(){}' + rx + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'export default class {}' + rx + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'if (x) {} else function g(){}' + rx + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'const o = {function: 1, b: {}} / 2;' + tail)).toBe(true);
+  });
+  it('shell command position: leading whitespace, newlines, separators, env prefixes, paths', () => {
+    const E = "import { execSync } from 'node:child_process'; ";
+    for (const lit of [
+      "' git rev-parse --show-toplevel'", '"\\tgit status"', "'  /usr/bin/git status'", "' git'",
+      '`\n git status`', '`echo hi\ngit status`', '`echo hi\r\n  git status`', "'cd x && git status'", "'cd x; git status'",
+      "'a | git hash-object --stdin'", "'echo $(git rev-parse HEAD)'", '"echo `git rev-parse HEAD`"',
+      "'GIT_DIR=x git status'", "'A=1 B=2 /usr/bin/git status'", "'(git status)'", '`cd ${dir}\n\tgit log`',
+    ]) expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(true);
+    // still not git: other binaries, prose mentions, env-only strings, comments
+    for (const lit of ["'gitleaks scan'", "'run git later'", "'digit status'", "'  gitx status'", "'GIT_DIR=x'", "'echo git status'", "'a-git status'"]) {
+      expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(false);
+    }
+    expect(sourceNeedsGit(E + "// execSync(' git status')\nexecSync('node x')")).toBe(false);
+  });
+  it('U+2028 / U+2029 are legal inside string literals and do not end them', () => {
+    const E = "import { execSync } from 'node:child_process'; ";
+    for (const sep of [' ', ' ']) {
+      expect(sourceNeedsGit(E + `const s = 'a${sep}//b'; execSync('git status');`)).toBe(true);
+      expect(sourceNeedsGit(E + `const s = "a${sep}/*b"; execSync('git status');`)).toBe(true);
+      expect(sourceNeedsGit(E + `const s = \`a${sep}//b\`; execSync('git status');`)).toBe(true);
+      expect(sourceNeedsGit(E + `const s = \`\${ 'a${sep}//b' }\`; execSync('git status');`)).toBe(true);
+      // ... while a real unterminated line comment still ends at them
+      expect(sourceNeedsGit(E + `// c${sep}execSync('git status');`)).toBe(true);
+      expect(sourceNeedsGit(E + `execSync('node x'); // execSync('git status')`)).toBe(false);
+    }
+    // a string ends at CR / LF (unterminated strings are invalid JS but must not swallow the next line)
+    for (const nl of ['\n', '\r']) expect(sourceNeedsGit(E + `const s = 'a${nl}execSync('git status');`)).toBe(true);
+  });
   it('stays linear on adversarial 300k inputs (no quadratic rescans)', () => {
     const o = { helpers: ['a.mjs'] };
-    const inputs = ['(/['.repeat(100000), 'import' + ' '.repeat(300000) + 'x', 'a'.repeat(300000), "('".repeat(150000), '${'.repeat(100000), '`${'.repeat(100000), '`${' + '(/['.repeat(100000), '`${' + '(/'.repeat(150000)];
+    const inputs = ['(/['.repeat(100000), 'import' + ' '.repeat(300000) + 'x', 'a'.repeat(300000), "('".repeat(150000), '${'.repeat(100000), '`${'.repeat(100000), '`${' + '(/['.repeat(100000), '`${' + '(/'.repeat(150000),
+      ...["'" + 'A=b '.repeat(70000) + "'", "'" + ' '.repeat(300000) + "'", "'" + ';'.repeat(300000) + "'", "'" + ' /'.repeat(150000) + "'",
+        '`' + '\n '.repeat(150000) + '`', 'function(){}'.repeat(25000), 'class{}'.repeat(40000), '=function(){'.repeat(25000)].map(x => "import 'node:child_process'; " + x)];
     const t0 = Date.now();
     for (const s of inputs) expect(sourceNeedsGit(s, o)).toBe(false);
     expect(Date.now() - t0).toBeLessThan(2500);

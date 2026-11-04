@@ -10,54 +10,45 @@ const MAX_BYTES = 1024 * 1024;
 // String-aware: quoted/template literals are kept verbatim, only real comments are dropped. A single linear scan
 // (no regex backtracking, no unbounded rescans) that also recognises regex literals, so the `//` inside
 // /https?:\/\// is not mistaken for a line comment. Regex literals become a neutral token: they are not code.
+// One scanner serves both the top level and every `${ … }` template hole, so the two cannot drift apart.
 const REGEX_AFTER_WORD = new Set(['return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete', 'void', 'throw', 'case', 'do', 'else', 'yield', 'await']);
 const PAREN_KEYWORD = new Set(['if', 'while', 'for', 'with']);
 const MAX_WORD = 12; // longest keyword we compare against; longer identifiers are never sliced
 const MAX_TEMPLATE_DEPTH = 32;
 const isIdent = (c) => /[\w$\u0080-￿]/.test(c);
-// ECMAScript line terminators: a line comment / unterminated string ends at any of them, not only \n.
+// ECMAScript line terminators: a line comment / regex literal ends at any of them, not only \n.
 const isNewline = (c) => c === '\n' || c === '\r' || c === ' ' || c === ' ';
+// A string literal may contain U+2028 / U+2029 (ES2019); only CR and LF end an unterminated one.
+const isStringNewline = (c) => c === '\n' || c === '\r';
 
 function quotedEnd(t, i) {
   const n = t.length;
   const q = t[i];
   let j = i + 1;
-  while (j < n && t[j] !== q && !isNewline(t[j])) j += t[j] === '\\' ? 2 : 1;
+  while (j < n && t[j] !== q && !isStringNewline(t[j])) {
+    if (t[j] === '\\') j += t[j + 1] === '\r' && t[j + 2] === '\n' ? 3 : 2; // `\` + CRLF is one line continuation
+    else j++;
+  }
   return t[j] === q ? j + 1 : Math.min(j, n);
 }
 // Index just past the template literal starting at t[i] (a backtick); `${ … }` holes are parsed so a backtick
 // or quote inside one cannot desynchronise the scan.
-function templateEnd(t, i, depth) {
+function templateEnd(t, i, depth, lits) {
   const n = t.length;
   let j = i + 1;
   while (j < n) {
     const c = t[j];
     if (c === '\\') { j += 2; continue; }
     if (c === '`') return j + 1;
-    if (c === '$' && t[j + 1] === '{' && depth < MAX_TEMPLATE_DEPTH) { j = holeEnd(t, j + 2, depth + 1); continue; }
+    if (c === '$' && t[j + 1] === '{' && depth < MAX_TEMPLATE_DEPTH) { j = scan(t, j + 2, depth + 1, true, lits).end; continue; }
     j++;
   }
   return n;
 }
-// End index (exclusive) of a regex literal starting at t[i] === '/', or -1 when there is no closing `/` on the line.
-function regexEnd(t, i) {
-  const n = t.length;
-  let j = i + 1;
-  let cls = false;
-  while (j < n && !isNewline(t[j])) {
-    const e = t[j];
-    if (e === '\\') { j += 2; continue; }
-    if (e === '[') cls = true; else if (e === ']') cls = false; else if (e === '/' && !cls) break;
-    j++;
-  }
-  if (t[j] !== '/') return -Math.min(j, n) - 2; // not closed: the scan stopped at -(result + 2)
-  j++;
-  while (j < n && isIdent(t[j])) j++;
-  return j;
-}
 // Does a `{` after this token open an object literal / expression (so its `}` is an operand and a following `/`
 // divides) rather than a block (whose `}` ends a statement, so a following `/` starts a regex)? An arrow body
 // (`=> {`), a `)` head (`if (x) {`, `function f() {`), a statement start and a class/else/do body are blocks.
+// (A function / class EXPRESSION body is an expression too: scan() tracks that separately.)
 const EXPR_BRACE_AFTER = '=(,:[?!&|+-*%<>~^';
 function braceOpensExpr(last, prev, word) {
   if (last === '') return false;
@@ -65,70 +56,49 @@ function braceOpensExpr(last, prev, word) {
   if (last === '>' && prev === '=') return false;
   return EXPR_BRACE_AFTER.includes(last);
 }
-function holeEnd(t, i, depth) {
-  const n = t.length;
-  let j = i;
-  const braces = []; // per open `{`: does it open an expression (object literal)?
-  let exprClose = false; // the last token was the `}` of such a brace
-  let last = '('; // last significant character, to tell a regex literal from a division; a hole starts an expression
-  let prev = '';
-  let wordStart = 0;
-  let wordDot = false; // the current word is a property name (`x.in`), never a keyword
-  let noCloseUntil = -1;
-  while (j < n) {
-    const c = t[j];
-    if (c === '`') { j = templateEnd(t, j, depth); last = c; continue; }
-    if (c === "'" || c === '"') { j = quotedEnd(t, j); last = c; continue; }
-    if (c === '/' && t[j + 1] === '/') { while (j < n && !isNewline(t[j])) j++; continue; }
-    if (c === '/' && t[j + 1] === '*') { const e = t.indexOf('*/', j + 2); j = e < 0 ? n : e + 2; continue; }
-    if (c === '/') {
-      const w = isIdent(last) && !wordDot && j - wordStart <= MAX_WORD ? t.slice(wordStart, j).trimEnd() : '';
-      const regexOk = j >= noCloseUntil && (last === '' || (isIdent(last) ? REGEX_AFTER_WORD.has(w)
-        : last === '}' ? !exprClose : !')]\'"`'.includes(last)));
-      const e = regexOk ? regexEnd(t, j) : 0;
-      if (e > 0) { j = e; prev = last; last = '0'; exprClose = false; wordStart = j; continue; }
-      if (e < 0) noCloseUntil = -e - 2; // no closing `/` before here: later `/` on this line are divisions (no rescans)
-      prev = last; last = c; exprClose = false; j++; continue;
-    }
-    let closesExpr = false;
-    if (c === '{') braces.push(braceOpensExpr(last, prev, isIdent(last) && !wordDot && j - wordStart <= MAX_WORD ? t.slice(wordStart, j).trimEnd() : ''));
-    else if (c === '}') { if (braces.length === 0) return j + 1; closesExpr = braces.pop(); }
-    if (!/\s/.test(c)) {
-      if (isIdent(c) && !isIdent(last)) { wordStart = j; wordDot = last === '.'; }
-      prev = last;
-      last = c;
-      exprClose = closesExpr;
-    }
-    j++;
-  }
-  return n;
+// Is a `function` / `class` / `async` keyword starting after this token in expression position (so its body's `}`
+// is an operand) rather than a declaration (statement start, ASI after a value, `export`, `else`)?
+function exprStart(last, prev, word) {
+  if (last === '') return false;
+  if (isIdent(last)) return REGEX_AFTER_WORD.has(word) && word !== 'else' && word !== 'do';
+  if ((last === '+' || last === '-') && prev === last) return false; // postfix `x++` then a new statement
+  return !';{})]\'"`'.includes(last);
 }
 
-export function stripComments(t) {
+// Scans t from `start`. At the top level (inHole false) it runs to the end; inside a `${ … }` hole it stops just past
+// the matching `}`. Returns the comment-stripped text and the index where the scan stopped. String / template
+// literal contents (without their delimiters) are pushed on `lits` when given.
+function scan(t, start, depth, inHole, lits) {
   const n = t.length;
   let out = '';
-  let i = 0;
-  let last = ''; // last significant (non-space) code character
+  let i = start;
+  let last = inHole ? '(' : ''; // last significant (non-space) code character; a hole starts an expression
   let prev = ''; // the one before it (to tell postfix `++ /` from binary `+ /`)
   let wordStart = 0;
   let wordEnd = 0; // the identifier that ends at `last` is t[wordStart, wordEnd)
-  const stack = []; // per open `(`: was it the head of if/while/for/with (a `)` there is followed by a statement)
-  let ctrlParen = false; // the last token was the `)` closing such a head
+  const stack = []; // per open `(`: 1 = head of if/while/for/with, 2 = params of a function expression, 3 = of a declaration
+  let ctrlParen = false; // the last token was the `)` closing a control head
+  let fnBodyExpr = false; // the last token was the `)` closing the params of a function expression
   let noCloseUntil = -1; // a regex scan already found no closing `/` before this index: don't rescan the line
   let wordDot = false; // the current word is a property name (`x.in`, `x.with(...)`), never a keyword
   const word = () => (isIdent(last) && !wordDot && wordEnd - wordStart <= MAX_WORD ? t.slice(wordStart, wordEnd) : '');
-  const braces = []; // per open `{`: does it open an expression (object literal)? see braceOpensExpr
+  const braces = []; // per open `{`: does it open an expression (object literal / function or class expression body)?
   let exprClose = false; // the last token was the `}` of such a brace: an operand, so a following `/` divides
   let postfixBang = false; // the last token was a TypeScript non-null `x!`: an operand, so a following `/` divides
-  const emit = (s, sig) => { out += s; prev = last; last = sig; ctrlParen = false; exprClose = false; postfixBang = false; };
+  let asyncExpr = false; // the last `async` keyword began in expression position
+  let pendKind = ''; // 'function' | 'class' keyword seen, its body `{` not yet opened
+  let pendExpr = false; // ... and it began in expression position
+  let pendDepth = 0; // ... at this paren depth
+  const emit = (s, sig) => { out += s; prev = last; last = sig; ctrlParen = false; exprClose = false; postfixBang = false; fnBodyExpr = false; };
   while (i < n) {
     const c = t[i];
     const d = t[i + 1];
     if (c === '/' && d === '/') { while (i < n && !isNewline(t[i])) i++; out += ' '; continue; }
     if (c === '/' && d === '*') { const j = t.indexOf('*/', i + 2); i = j < 0 ? n : j + 2; out += ' '; continue; }
     if (c === "'" || c === '"' || c === '`') {
-      const end = c === '`' ? templateEnd(t, i, 0) : quotedEnd(t, i);
+      const end = c === '`' ? templateEnd(t, i, depth, lits) : quotedEnd(t, i);
       emit(t.slice(i, end), c);
+      if (lits) lits.push(t.slice(i + 1, end > i + 1 && t[end - 1] === c ? end - 1 : end));
       i = end;
       continue;
     }
@@ -165,36 +135,96 @@ export function stripComments(t) {
     }
     if (/\s/.test(c)) { out += c; i++; continue; }
     if (isIdent(c)) {
-      if (!(isIdent(last) && wordEnd === i)) { wordStart = i; wordDot = last === '.'; }
+      if (!(isIdent(last) && wordEnd === i)) {
+        const dot = last === '.';
+        if (!dot) {
+          let e = i;
+          while (e < n && e - i <= MAX_WORD && isIdent(t[e])) e++;
+          const w = e - i <= MAX_WORD ? t.slice(i, e) : '';
+          if (w === 'function' || w === 'class' || w === 'async') {
+            let ex = exprStart(last, prev, word());
+            if (w === 'function' && isIdent(last) && word() === 'async') ex = asyncExpr; // `async function`: the async decides
+            if (w === 'async') asyncExpr = ex;
+            else { pendKind = w; pendExpr = ex; pendDepth = stack.length; }
+          }
+        }
+        wordStart = i;
+        wordDot = dot;
+      }
       wordEnd = i + 1;
       emit(c, c);
       i++;
       continue;
     }
-    if (c === '(') stack.push(PAREN_KEYWORD.has(word()));
-    const opensExpr = c === '{' ? braceOpensExpr(last, prev, word()) : false;
+    if (c === '(') {
+      let kind = PAREN_KEYWORD.has(word()) ? 1 : 0;
+      if (!kind && pendKind === 'function' && stack.length === pendDepth) kind = pendExpr ? 2 : 3;
+      stack.push(kind);
+    }
+    let opensExpr = false;
+    if (c === '{') {
+      opensExpr = braceOpensExpr(last, prev, word());
+      if (last === ')' && fnBodyExpr) opensExpr = true;
+      if (pendKind && stack.length === pendDepth) {
+        if (pendKind === 'function' && last === ')') pendKind = '';
+        else if (pendKind === 'class' && (isIdent(last) || last === ')')) { opensExpr = pendExpr; pendKind = ''; }
+      }
+    }
+    if (c === '}' && inHole && braces.length === 0) return { out, end: i + 1 };
+    if (c === ';') pendKind = '';
     const nonNull = c === '!' && ((isIdent(last) && !REGEX_AFTER_WORD.has(word())) || (last === ')' && !ctrlParen) || last === ']');
     emit(c, c);
     if (c === '!') postfixBang = nonNull;
     if (c === '{') braces.push(opensExpr);
     if (c === '}') exprClose = braces.pop() ?? false;
-    if (c === ')') ctrlParen = stack.pop() ?? false;
+    if (c === ')') { const k = stack.pop() ?? 0; ctrlParen = k === 1; fnBodyExpr = k === 2; }
     i++;
   }
-  return out;
+  return { out, end: n };
 }
+
+// The source with comments removed, plus the contents of every string / template literal (nested ones included).
+export function scanSource(t) {
+  const literals = [];
+  return { code: scan(t, 0, 0, false, literals).out, literals };
+}
+export function stripComments(t) {
+  return scan(t, 0, 0, false, null).out;
+}
+
 // A test spawns git when it reaches child_process (any import form or alias) AND names git as an executable:
-// a quoted git / git-path literal or a shell string starting with git. Mocked spawns without a child_process
-// import, comments and prose are not flagged. A declared helper matches an import specifier by suffix (so
-// `my-git-helper.mjs` matches `git-helper.mjs`); a specifier built at run time cannot be seen statically.
+// a string whose command text (the start of the string, or after `;` `&` `|` `(` a backtick or a line break) is
+// `git`, a path ending in `/git`, optionally behind `VAR=value` prefixes and whitespace, followed by a space or
+// the end. Mocked spawns without a child_process import, comments and prose are not flagged. A declared helper
+// matches an import specifier by suffix (so `my-git-helper.mjs` matches `git-helper.mjs`); a specifier built at
+// run time cannot be seen statically.
 const CHILD = /\b(?:node:)?child_process\b/;
-const GIT_LITERAL = /(['"`])(?:[^'"`\n]*\/)?git(?:\s[^'"`\n]*)?\1|(['"`])git\s/;
+// the class ends with the literal U+2028 and U+2029 characters (line terminators, written raw so a regex literal stays valid)
+const COMMAND_SEPARATOR = new RegExp('[;&|(`' + String.raw`\n\r  ]`);
+const WS =/\s*/y;
+const ENV_ASSIGN = /[A-Za-z_]\w*=\S*\s+/y;
+const GIT_AT = /(?:[^\n]*\/)?git(?=\s|$)/y;
+// Each step is a sticky match from a moving index, so a long run of spaces or `A=b` prefixes stays linear.
+function commandIsGit(segment) {
+  let pos = 0;
+  for (;;) {
+    WS.lastIndex = pos;
+    WS.test(segment);
+    pos = WS.lastIndex;
+    ENV_ASSIGN.lastIndex = pos;
+    if (!ENV_ASSIGN.test(segment)) break;
+    pos = ENV_ASSIGN.lastIndex;
+  }
+  GIT_AT.lastIndex = pos;
+  return GIT_AT.test(segment);
+}
+const literalNamesGit = (s) => s.split(COMMAND_SEPARATOR).some(commandIsGit);
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 export function sourceNeedsGit(text, { helpers = [] } = {}) {
   if (typeof text !== 'string' || !text || text.length > MAX_BYTES) return false;
-  const code = stripComments(text);
-  if (CHILD.test(code) && GIT_LITERAL.test(code)) return true;
+  const { code, literals } = scanSource(text);
+  if (CHILD.test(code) && literals.some(literalNamesGit)) return true;
   // Every import form: static (`from '…'`), side-effect (`import '…'`), dynamic (`import('…')`), `require('…')`,
   // `require.resolve('…')` and `vi.importActual('…')`; an optional `?query`/`#hash` may follow the file name.
   // Each alternative has one `\s*` per gap (no adjacent `\s*\s*`), so a long whitespace run cannot backtrack quadratically.
