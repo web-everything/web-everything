@@ -5,7 +5,7 @@ import { spawnSync as realSpawnSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { describe, it, expect, vi } from 'vitest';
-import { CANONICAL_QUESTION, QUESTION_HASH, main, findAudit } from '../codex-audit.mjs';
+import { CANONICAL_QUESTION, QUESTION_HASH, main, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes } from '../codex-audit.mjs';
 import { createAuditDeps } from '../codex-audit-io.mjs';
 
 const BASE = 'a'.repeat(40);
@@ -368,5 +368,59 @@ describe('audit IO with injected filesystem and subprocesses', () => {
     f.fs.readFileSync.mockReturnValue(settings);
     expect(() => f.deps.appendRecord({ head: HEAD })).toThrow();
     expect(f.fs.appendFileSync).not.toHaveBeenCalled();
+  });
+});
+
+describe('prior question hashes (AU1 PR-B)', () => {
+  const PRIOR = 'c'.repeat(64);
+  const NOW = Date.parse('2026-11-04T12:00:00.000Z');
+  const window = acceptUntil => [{ hash: PRIOR, acceptUntil }];
+  const open = window('2026-11-10T00:00:00.000Z');
+  const rec = (verdict, over = {}) => ({ head: HEAD, base: BASE, questionHash: PRIOR, at: AT, verdict, findings: [], ...over });
+  const find = (records, priorQuestionHashes) => findAudit(records, { base: BASE, head: HEAD, questionHash: QUESTION_HASH, priorQuestionHashes, now: NOW });
+
+  it('accepts the current hash and a prior hash only inside its window', () => {
+    expect(isAcceptedQuestionHash(QUESTION_HASH, { priorQuestionHashes: [], now: NOW })).toBe(true);
+    expect(isAcceptedQuestionHash(PRIOR, { priorQuestionHashes: open, now: NOW })).toBe(true);
+    expect(isAcceptedQuestionHash(PRIOR, { priorQuestionHashes: window('2026-11-04T11:59:59.000Z'), now: NOW })).toBe(false);
+    expect(isAcceptedQuestionHash('d'.repeat(64), { priorQuestionHashes: open, now: NOW })).toBe(false);
+    expect(isAcceptedQuestionHash(PRIOR, { priorQuestionHashes: [], now: NOW })).toBe(false);
+    expect(isAcceptedQuestionHash(PRIOR, { priorQuestionHashes: [{ hash: PRIOR, acceptUntil: 'nope' }], now: NOW })).toBe(false);
+  });
+  it('a prior NOT WEAKENED passes inside its window', () => {
+    const r = rec('NOT WEAKENED');
+    expect(find([r], open)).toBe(r);
+  });
+  it('a prior WEAKENED still blocks (is returned as WEAKENED)', () => {
+    expect(find([rec('WEAKENED', { findings: ['x.mjs:1 gap'] })], open)?.verdict).toBe('WEAKENED');
+  });
+  it('a later prior WEAKENED beats an earlier prior NOT WEAKENED', () => {
+    const later = rec('WEAKENED', { at: '2026-11-02T12:00:00.000Z', findings: ['x.mjs:1 gap'] });
+    expect(find([rec('NOT WEAKENED'), later], open)).toBe(later);
+  });
+  it('unknown, expired or unlisted prior hashes are ignored', () => {
+    expect(find([rec('NOT WEAKENED')], [])).toBeNull();
+    expect(find([rec('NOT WEAKENED')], window('2026-11-04T11:00:00.000Z'))).toBeNull();
+    expect(find([rec('NOT WEAKENED', { questionHash: 'd'.repeat(64) })], open)).toBeNull();
+  });
+  it('contradictory prior records are still rejected', () => {
+    expect(find([rec('NOT WEAKENED', { findings: ['WEAKENED'] })], open)).toBeNull();
+  });
+  it('the setting lands empty and invalid values resolve to empty', () => {
+    expect(resolvePriorQuestionHashes()).toEqual([]);
+    expect(resolvePriorQuestionHashes({ readFile: () => '{"audit":{"priorQuestionHashes":[{"hash":"zz","acceptUntil":"2026-12-01"}]}}' })).toEqual([]);
+    expect(resolvePriorQuestionHashes({ readFile: () => { throw new Error('unreadable'); } })).toEqual([]);
+  });
+  it('replay over a frozen copy of audits.jsonl is identical with priorQuestionHashes empty', () => {
+    const dir = join(dirname(fileURLToPath(import.meta.url)), 'fixtures');
+    const records = realFs.readFileSync(join(dir, 'audits-frozen.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l));
+    const expected = JSON.parse(realFs.readFileSync(join(dir, 'audits-frozen.expected.json'), 'utf8'));
+    const pairs = [...new Set(records.map(r => `${r.head}/${r.base}`))];
+    expect(pairs.length).toBeGreaterThan(10);
+    for (const key of pairs) {
+      const [head, base] = key.split('/');
+      const got = findAudit(records, { head, base, questionHash: QUESTION_HASH, priorQuestionHashes: [] });
+      expect(got ? { at: got.at, verdict: got.verdict } : null).toEqual(expected[key]);
+    }
   });
 });
