@@ -67,7 +67,7 @@ const APPROVED = [...new Set([...PREVIOUSLY_APPROVED, ...ADDED_2026_09_27, ...AD
 
 describe('NOTIFY_EVEN_IN_SHADOW', () => {
   it('is exactly the union of the approved operator decisions — 33 entries', () => {
-    expect(APPROVED).toHaveLength(33);
+    expect(APPROVED).toHaveLength(34);
     expect([...NOTIFY_EVEN_IN_SHADOW].sort()).toEqual([...APPROVED].sort());
   });
 
