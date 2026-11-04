@@ -2159,6 +2159,21 @@ describe('carried evidence precedence (R503 red team)', () => {
     const out = await auditedFixture('warn', { ready: auditLines([ready(), liveWeak]), fingerprint: () => FP }).run();
     expect(out).toMatchObject({ ok: false, stopReason: 'no-ready' });
   });
+  it('round 3: in warn mode a carried green record never loads over a canonical WEAKENED audit', async () => {
+    const audits = auditLines([auditRecord({ verdict: 'WEAKENED', findings: ['weakened guard'] })]);
+    const out = await auditedFixture('warn', { ready: auditLines([ready()]), audits, auditBaseInMain: TREE, fingerprint: () => FP }).run();
+    expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { mode: 'warn', ok: false, reason: 'weakened' } });
+    // A carried WEAKENED audit of the older head blocks the carried green record the same way.
+    const carriedAudits = auditLines([auditRecord({ head: A, fingerprint: FP, verdict: 'WEAKENED', findings: ['weakened guard'] })]);
+    const carried = await auditedFixture('warn', { ready: auditLines([ready()]), audits: carriedAudits, auditBaseInMain: TREE, fingerprint: () => FP }).run();
+    expect(carried).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { reason: 'weakened' } });
+  });
+  it('round 3: warn mode keeps its existing behaviour for a live-head ready record and for a missing audit', async () => {
+    const own = ready({ sha: SHA, fingerprint: undefined });
+    const audits = auditLines([auditRecord({ verdict: 'WEAKENED', findings: ['weakened guard'] })]);
+    expect(await auditedFixture('warn', { ready: auditLines([own]), audits, auditBaseInMain: TREE }).run()).toMatchObject({ ok: true, canonicalAudit: { reason: 'weakened' } });
+    expect(await auditedFixture('warn', { ready: auditLines([ready()]), audits: '', fingerprint: () => FP }).run()).toMatchObject({ ok: true, canonicalAudit: { reason: 'no-record' } });
+  });
 });
 
 describe('prototype-load daemon key resolution (R502 item 1)', () => {

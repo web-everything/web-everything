@@ -381,6 +381,12 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       if (!out.canonicalAudit.ok) {
         const fallback = `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load.`;
         if (mode === 'refuse') return stop('no-canonical-audit', { fallback });
+        // R503 round 3: warn mode never lets CARRIED readiness (a ready record of an older head) load over a WEAKENED
+        // canonical audit. Only a ruled exception or the live head's own record keeps the existing warn behaviour.
+        const carriedGate = out.gate.record && String(out.gate.record.sha).toLowerCase() !== String(input.sha).toLowerCase();
+        if (out.canonicalAudit.reason === 'weakened' && carriedGate && !out.gate.ruledWeakened) {
+          return stop('no-canonical-audit', { detail: 'carried-ready-over-weakened-audit', fallback: `The canonical audit says WEAKENED, and the ready record was carried from ${out.gate.record.sha}. Fix the weakening and re-audit, or get an operator ruling (ruledWeakened). ${fallback}` });
+        }
         console.warn(`WARNING: canonical audit ${out.canonicalAudit.reason}; proceeding in warn mode. ${fallback}`);
       }
       stage = 'no-ready';
