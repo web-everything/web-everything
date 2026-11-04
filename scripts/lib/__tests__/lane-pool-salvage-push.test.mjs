@@ -158,6 +158,36 @@ describe('salvage push contract', () => {
   });
 });
 
+describe('remoteHeads (the release proof) reads the canonical origin from the primary checkout', () => {
+  const setup = () => {
+    const dir = mkdtempSync(join(tmpdir(), 'salvage-heads-'));
+    const origin = join(dir, 'origin.git'), primary = join(dir, 'primary');
+    execFileSync('git', ['init', '--bare', '-q', '-b', 'main', origin]);
+    execFileSync('git', ['clone', '-q', origin, primary], { stdio: 'ignore' });
+    execFileSync('git', ['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.test', 'commit', '-q', '--allow-empty', '-m', 'base'], { cwd: primary });
+    execFileSync('git', ['push', '-q', 'origin', 'HEAD:refs/heads/main', 'HEAD:refs/heads/ops/ledger'], { cwd: primary });
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: primary, encoding: 'utf8' }).trim();
+    const io = realSalvageIo({ repo: { branch: 'main', originUrl: origin, referencePath: primary }, backupRoot: join(dir, 'backups') });
+    return { dir, primary, sha, io };
+  };
+  it('accepts operator auth/signing keys in the primary and excludes ops/* heads', () => {
+    const { dir, primary, sha, io } = setup();
+    try {
+      // An agent-writable lane may not carry these; the operator's primary legitimately can.
+      execFileSync('git', ['config', 'commit.gpgSign', 'false'], { cwd: primary });
+      execFileSync('git', ['config', 'credential.helper', 'store'], { cwd: primary });
+      expect(io.remoteHeads()).toEqual([sha]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('still refuses a URL rewrite in the primary', () => {
+    const { dir, primary, io } = setup();
+    try {
+      execFileSync('git', ['config', 'url.https://example.invalid/.insteadOf', '/'], { cwd: primary });
+      expect(() => io.remoteHeads()).toThrow(/URL rewriting/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
 describe('real salvage preservation and transport', () => {
   const repo = { branch: 'main', originUrl: 'https://example.test/canonical.git', referencePath: 'reference' };
   describe.each(['local', 'worktree'])('%s signing configuration isolation', scope => {

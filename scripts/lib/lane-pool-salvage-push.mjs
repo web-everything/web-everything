@@ -61,7 +61,7 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
       stdio: ['ignore', 'pipe', 'pipe'],
     }).trim();
   };
-  const checkTransportConfig = dir => {
+  const checkTransportConfig = (dir, { primary = false } = {}) => {
     // An explicit URL still passes through url.*.insteadOf / pushInsteadOf. Refuse
     // every effective rewrite (including includes and global config) before transport.
     // NUL-delimited names keep newlines in a subsection from hiding a rewrite key.
@@ -111,8 +111,10 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
       const remoteName = /^remote\./i.test(key) ? key.slice(7, key.lastIndexOf('.')) : null;
       const unsafeRemote = remoteName !== null && (remoteName !== 'origin'
         || (origin && (normalizeRemoteName(remoteName) === normalizeRemoteName(origin) || sameRepoUrl(remoteName, origin))));
+      // `primary`: the operator's own checkout, not an agent-writable lane, so its auth/signing keys (credential
+      // helper, commit.gpgsign, …) are not lane control. URL rewrites and remote aliasing are still refused there.
       if (['local', 'worktree'].includes(scope)
-        && (unsafeRemote || /^(?:credential\.|https?\.|protocol\.|fetch\.bundleuri$|core\.(?:askpass|gitproxy|sshcommand)$|ssh\.|gpg\.|push\.gpgsign$|user\.signingkey$|commit\.gpgsign$|remote\.[\s\S]*\.(?:proxy|proxyauthmethod|vcs|uploadpack|receivepack|pushurl)$)/i.test(key))) {
+        && (unsafeRemote || !primary && /^(?:credential\.|https?\.|protocol\.|fetch\.bundleuri$|core\.(?:askpass|gitproxy|sshcommand)$|ssh\.|gpg\.|push\.gpgsign$|user\.signingkey$|commit\.gpgsign$|remote\.[\s\S]*\.(?:proxy|proxyauthmethod|vcs|uploadpack|receivepack|pushurl)$)/i.test(key))) {
         throw new Error('lane-controlled transport configuration; inspect the lane manually and remove it before retrying');
       }
     }
@@ -145,7 +147,7 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
      *  Throws on anything but complete `<sha>\trefs/heads/<name>` lines, so a caller can fail closed. */
     remoteHeads: () => {
       const args = transport('ls-remote', origin, 'refs/heads/*');
-      checkTransportConfig(repo.referencePath);
+      checkTransportConfig(repo.referencePath, { primary: true });
       const output = git(repo.referencePath, args, 120_000, true);
       const shas = [];
       for (const line of output ? output.split('\n') : []) {
