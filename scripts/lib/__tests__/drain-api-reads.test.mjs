@@ -35,18 +35,18 @@ const routes = (table) => { const seen = []; const rest = (path) => {
 /** Routes for one file at SHA: commit -> trees along the path -> contents. `contents` overrides the contents response, `entry` the tree entry. */
 const fileWorld = (path, doc, { contents, entry = {} } = {}) => {
   const parts = path.split('/');
-  const t = { 'git/commits/': ok({ tree: { sha: 'rt0' } }) };
+  const t = { 'git/commits/': ok({ truncated: false, tree: { sha: 'rt0' } }) };
   parts.forEach((name, i) => {
-    t[`git/trees/rt${i}`] = ok({ tree: [{ path: name, type: i < parts.length - 1 ? 'tree' : 'blob', mode: '100644', sha: i < parts.length - 1 ? `rt${i + 1}` : doc?.sha, ...(i === parts.length - 1 ? entry : {}) }] });
+    t[`git/trees/rt${i}`] = ok({ truncated: false, tree: [{ path: name, type: i < parts.length - 1 ? 'tree' : 'blob', mode: '100644', sha: i < parts.length - 1 ? `rt${i + 1}` : doc?.sha, ...(i === parts.length - 1 ? entry : {}) }] });
   });
   t[`contents/${path}`] = contents ?? ok(doc);
   return t;
 };
 /** Routes for main's backlog/ listing at SHA. */
 const hwWorld = (names, { bk, over = {} } = {}) => ({
-  'git/commits/': ok({ tree: { sha: 'rt0' } }),
-  'git/trees/rt0': ok({ tree: [{ path: 'backlog', type: 'tree', sha: 'bk' }] }),
-  'git/trees/bk': bk ?? ok({ tree: names.map((n) => ({ path: n, type: 'blob', mode: '100644' })) }),
+  'git/commits/': ok({ truncated: false, tree: { sha: 'rt0' } }),
+  'git/trees/rt0': ok({ truncated: false, tree: [{ path: 'backlog', type: 'tree', sha: 'bk' }] }),
+  'git/trees/bk': bk ?? ok({ truncated: false, tree: names.map((n) => ({ path: n, type: 'blob', mode: '100644' })) }),
   ...over,
 });
 const noGit = (calls = []) => (...a) => { calls.push(a); throw new Error('git must not run'); };
@@ -109,7 +109,7 @@ describe('freeze read over REST', () => {
 });
 
 describe('origin/main high-water mark over REST', () => {
-  const tree = (names, extra = {}) => ({ tree: names.map((path) => ({ path, type: 'blob' })), ...extra });
+  const tree = (names, extra = {}) => ({ truncated: false, tree: names.map((path) => ({ path, type: 'blob' })), ...extra });
   const base = (over = {}) => routes(hwWorld(['100-a.md', '7-b.md', 'README.md'], { over }));
   it('uses the git callback checkout as the REST repository context', () => {
     const seenCwd = [];
@@ -128,7 +128,7 @@ describe('origin/main high-water mark over REST', () => {
   it('304 path: cached trees are used as-is', () => {
     const rest = routes({
       'git/commits/': { status: 304, notModified: true, json: { tree: { sha: 'rt0' } } },
-      'git/trees/rt0': { status: 304, notModified: true, json: { tree: [{ path: 'backlog', type: 'tree', sha: 'bk' }] } },
+      'git/trees/rt0': { status: 304, notModified: true, json: { truncated: false, tree: [{ path: 'backlog', type: 'tree', sha: 'bk' }] } },
       'git/trees/bk': { status: 304, notModified: true, json: tree(['5-a.md']) },
     });
     expect(run(rest, refsGit([])).main).toEqual([5]);
@@ -141,7 +141,7 @@ describe('origin/main high-water mark over REST', () => {
   it('malformed or truncated tree fails closed', () => {
     expect(() => run(base({ 'git/trees/bk': ok({ nope: 1 }) }))).toThrow(/api-malformed/);
     expect(() => run(base({ 'git/trees/bk': ok(tree(['1-a.md'], { truncated: true })) }))).toThrow(/api-truncated/);
-    expect(() => run(base({ 'git/trees/rt0': ok({ tree: [] }) }))).toThrow(/api-malformed/);
+    expect(() => run(base({ 'git/trees/rt0': ok({ truncated: false, tree: [] }) }))).toThrow(/api-malformed/);
   });
   it('refreshTracking: stale local ref after a failed fetch fails closed; a current ref needs no fetch', () => {
     const rest = base({ 'git/ref/heads/main': ok({ object: { sha: SHA } }) });
@@ -358,7 +358,7 @@ describe('verified decode: base64 against reported size and sha', () => {
   const at = (doc) => readFileAtRef('t', 'a/b.md', 'main', { source: src(routes(fileWorld('a/b.md', doc))) });
   it('a matching size and sha decodes', () => { expect(at(file(T))).toMatchObject({ ok: true, value: T }); });
   it('an absent path (404) is a real, ok null', () => {
-    expect(readFileAtRef('t', 'a/b.md', 'main', { source: src(routes({ 'git/commits/': ok({ tree: { sha: 'rt0' } }), 'git/trees/rt0': ok({ tree: [{ path: 'a', type: 'tree', sha: 'rt1' }] }), 'git/trees/rt1': ok({ tree: [] }) })) })).toMatchObject({ ok: true, value: null });
+    expect(readFileAtRef('t', 'a/b.md', 'main', { source: src(routes({ 'git/commits/': ok({ truncated: false, tree: { sha: 'rt0' } }), 'git/trees/rt0': ok({ truncated: false, tree: [{ path: 'a', type: 'tree', sha: 'rt1' }] }), 'git/trees/rt1': ok({ truncated: false, tree: [] }) })) })).toMatchObject({ ok: true, value: null });
   });
   it.each([
     ['size too small', file(T, { size: 3 }), 'size'],
@@ -398,7 +398,7 @@ describe('pagination: follow to the end or be unreadable', () => {
     expect(one(300)).toMatchObject({ ok: false, reason: 'compare-ceiling' });
   });
   it('a tree flagged truncated is unreadable', () => {
-    const rest = routes(hwWorld([], { bk: ok({ tree: [], truncated: true }) }));
+    const rest = routes(hwWorld([], { bk: ok({ truncated: false, tree: [], truncated: true }) }));
     expect(readBacklogNames('main', { source: src(rest) })).toMatchObject({ ok: false, reason: 'api-truncated' });
   });
   it('a missing files list is unreadable', () => {
@@ -490,12 +490,12 @@ describe('R557 one snapshot: every multi-part read resolves ONE commit sha first
     let n = 0;
     const rest = routes({
       'git/ref/heads/main': () => { n += 1; return ok({ object: { sha: n === 1 ? SHA : MOVED } }); },
-      [`git/commits/${SHA}`]: ok({ tree: { sha: 'rt0' } }),
-      [`git/commits/${MOVED}`]: ok({ tree: { sha: 'rtMoved' } }),
-      'git/trees/rt0': ok({ tree: [{ path: 'backlog', type: 'tree', sha: 'bk' }] }),
-      'git/trees/rtMoved': ok({ tree: [{ path: 'backlog', type: 'tree', sha: 'bkMoved' }] }),
-      'git/trees/bk': ok({ tree: [{ path: '5-old.md', type: 'blob', mode: '100644' }] }),
-      'git/trees/bkMoved': ok({ tree: [{ path: '9-new.md', type: 'blob', mode: '100644' }] }),
+      [`git/commits/${SHA}`]: ok({ truncated: false, tree: { sha: 'rt0' } }),
+      [`git/commits/${MOVED}`]: ok({ truncated: false, tree: { sha: 'rtMoved' } }),
+      'git/trees/rt0': ok({ truncated: false, tree: [{ path: 'backlog', type: 'tree', sha: 'bk' }] }),
+      'git/trees/rtMoved': ok({ truncated: false, tree: [{ path: 'backlog', type: 'tree', sha: 'bkMoved' }] }),
+      'git/trees/bk': ok({ truncated: false, tree: [{ path: '5-old.md', type: 'blob', mode: '100644' }] }),
+      'git/trees/bkMoved': ok({ truncated: false, tree: [{ path: '9-new.md', type: 'blob', mode: '100644' }] }),
     });
     return rest;
   };
@@ -556,7 +556,7 @@ describe('R557 only regular files read: tree entry mode and blob identity', () =
     expect(at({ sha: 'd'.repeat(40) })).toMatchObject({ ok: false, reason: 'api-malformed' });
   });
   it('a directory component that is itself a symlink or file is unreadable', () => {
-    const rest = routes({ ...fileWorld('a/b.md', b64(T)), 'git/trees/rt0': ok({ tree: [{ path: 'a', type: 'blob', mode: '120000', sha: 'rt1' }] }) });
+    const rest = routes({ ...fileWorld('a/b.md', b64(T)), 'git/trees/rt0': ok({ truncated: false, tree: [{ path: 'a', type: 'blob', mode: '120000', sha: 'rt1' }] }) });
     expect(readFileAtRef('t', 'a/b.md', 'main', { source: src(rest) })).toMatchObject({ ok: false, reason: 'api-malformed' });
   });
   it('freeze read: a symlinked freeze document holds (fail closed) even with valid target JSON', () => {
@@ -564,5 +564,32 @@ describe('R557 only regular files read: tree entry mode and blob identity', () =
     const r = readSharedFreeze({ board: '/x', branch: 'ops/b', readsSource: 'api', slug: 'o/r', rest });
     expect(r.frozen).toBeUndefined();
     expect(r.error).toContain('not a regular file');
+  });
+});
+
+describe('R559 tree completeness must be known: truncated === false, strictly', () => {
+  const world = (bk) => routes(hwWorld([], { bk }));
+  const rd = (bk) => readBacklogNames('main', { source: src(world(bk)) });
+  it.each([
+    ['truncated the string "true"', { truncated: 'true', tree: [] }],
+    ['truncated the string "false"', { truncated: 'false', tree: [] }],
+    ['truncated missing', { tree: [{ path: '7-a.md', type: 'blob' }] }],
+    ['truncated null', { truncated: null, tree: [] }],
+    ['truncated 0', { truncated: 0, tree: [] }],
+    ['tree: [] with an unknown flag', { truncated: 'maybe', tree: [] }],
+  ])('%s is tree-completeness-unknown, never a zero floor', (_n, body) => {
+    expect(rd(ok(body))).toMatchObject({ ok: false, reason: 'tree-completeness-unknown' });
+  });
+  it('truncated true stays api-truncated; truncated false with an empty tree is a real empty listing', () => {
+    expect(rd(ok({ truncated: true, tree: [] }))).toMatchObject({ ok: false, reason: 'api-truncated' });
+    expect(rd(ok({ truncated: false, tree: [] }))).toMatchObject({ ok: true, value: [] });
+  });
+  it('the root tree and the path walk apply the same rule', () => {
+    const root = routes({ ...hwWorld([]), 'git/trees/rt0': ok({ tree: [{ path: 'backlog', type: 'tree', sha: 'bk' }] }) });
+    expect(readBacklogNames('main', { source: src(root) })).toMatchObject({ ok: false, reason: 'tree-completeness-unknown' });
+    const walk = routes(fileWorld('a/b.md', b64('x\n')));
+    expect(readFileAtRef('t', 'a/b.md', 'main', { source: src(walk) })).toMatchObject({ ok: true });
+    const unknown = routes({ ...fileWorld('a/b.md', b64('x\n')), 'git/trees/rt0': ok({ tree: [{ path: 'a', type: 'tree', sha: 'rt1' }] }) });
+    expect(readFileAtRef('t', 'a/b.md', 'main', { source: src(unknown) })).toMatchObject({ ok: false, reason: 'tree-completeness-unknown' });
   });
 });
