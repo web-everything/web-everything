@@ -84,7 +84,7 @@ import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRe
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
-import { SHARD_RUN_SCRIPT, splitExplicitGate, runGateSegments, localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
+import { SHARD_RUN_SCRIPT, splitExplicitGate, runGateSegments, remainingBudgetMs, budgetExhaustedResult, localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
 import { startTreeWatchdog } from './lib/tree-watchdog.mjs';
 import { shellQuote, isShardWrapperCommand } from './lib/verify-lane-gate.mjs';
 import { randomBytes } from 'node:crypto';
@@ -707,7 +707,7 @@ let baseCandidate = null;
 let baseFailures = null;
 // The final exit code alone cannot say whether a 124 came from an unconfirmed remote attempt; the phases recorded it.
 const infrastructureNow = (exitCode, signal, failureDetails) => verificationInfrastructureFailure({ exitCode, signal, failureDetails }) ?? (remoteUnconfirmed ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null);
-async function runGate(command, args, { forgeDispatch = false } = {}) {
+async function runGate(command, args, { forgeDispatch = false, timeoutMs } = {}) {
   const reportDir = mkdtempSync(join(tmpdir(), 'verify-remote-report-'));
   const reportFile = join(reportDir, 'report.jsonl');
   const childEnv = { ...process.env, WE_VERIFY_REMOTE_REPORT: reportFile };
@@ -769,7 +769,7 @@ async function runGate(command, args, { forgeDispatch = false } = {}) {
       else Promise.resolve(stopped).then(() => resolveGate(result));
     };
     const watchdog = Number.isInteger(child.pid) ? startTreeWatchdog({
-      pid: child.pid, timeoutMs: PHASE_TIMEOUT_MS,
+      pid: child.pid, timeoutMs: timeoutMs ?? PHASE_TIMEOUT_MS,
       kill: { orphansOfOwnGroup: true, marker: phaseMarker, outputFds: [child.stdout?._handle?.fd, child.stderr?._handle?.fd].filter((fd) => Number.isInteger(fd) && fd > 2) },
       ...(currentAdmission.ok ? { heartbeat: { module: HEAVY_ADMISSION_MODULE, exportName: 'heartbeatOwnedSlot', args: { lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO }, everyMs: SLOT_HEARTBEAT_MS } } : {}),
       onFire: () => {
@@ -806,7 +806,7 @@ function recordOutcome(key, outcome) {
   outcomes[key] = outcome;
 }
 // `outcomeKey` separates the always-run guard's outcome from the scanners' (it shares the `scan` admission kind).
-async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
+async function timedRunGate(phase, command, args, { outcomeKey, deadlineAt, noConfirm } = {}) {
   const kind = phase?.replace(/Ms$/, '');
   let acquired = null;
   if (firstPhaseAdmission) acquired = firstPhaseAdmission;
@@ -834,8 +834,12 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
   try {
     // Admission may span the whole gate; a command rewrite belongs only to this phase.
     const plan = phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: currentAdmission.remote === true } });
-    let result = await runGate(args ? command : plan.command, args, { forgeDispatch: !plan.takeLocalSlot });
-    if (shouldConfirmRemoteRed({ plan, ...result })) {
+    // A split gate shares one deadline; the existing worker watchdog gets what remains AFTER admission. Nothing left: nothing runs.
+    const remaining = remainingBudgetMs(deadlineAt);
+    if (remaining === 0) return budgetExhaustedResult();
+    let result = await runGate(args ? command : plan.command, args, { forgeDispatch: !plan.takeLocalSlot, ...(remaining ? { timeoutMs: remaining } : {}) });
+    // A split gate never confirms a red remote locally (the old single-command gate never did): the red stands as is.
+    if (!noConfirm && shouldConfirmRemoteRed({ plan, ...result })) {
       process.stderr.write(`verify-lane: remote phase red (exit ${result.exitCode}) - confirming locally\n`);
       process.stderr.write(`\n⏳ gate queueing for admission (phase: ${kind})${MARKER_NONCE_SUFFIX}\n`);
       acquired = await acquireAdmission(kind, args ? [command, ...args].join(' ') : command, { forceLocal: true });
@@ -912,7 +916,7 @@ const alwaysRun = retryableGate
   : { command: null, declared: [], files: [], skipped: [] };
 const continueAfter = (r) => r.exitCode === 0 || (runAllPhases && !r.signal && !verificationInfrastructureFailure(r));
 try {
-  let result = explicitSegments ? await runGateSegments(explicitSegments, segment => timedRunGate(null, segment)) : await timedRunGate(retryableGate ? 'vitestMs' : null,
+  let result = explicitSegments ? await runGateSegments(explicitSegments, (segment, budget = {}) => timedRunGate(null, segment, undefined, { ...budget, noConfirm: true }), { budgetMs: PHASE_TIMEOUT_MS }) : await timedRunGate(retryableGate ? 'vitestMs' : null,
     // Item 59 (b) — a recognized default gate with a non-`vitest related` test half (`npm test`, a skipped-vitest echo)
     // runs the plan resolved under THIS (the daemon's) standards policy, not the requester's stamped command.
     // `GATE` stays the marker's `suites`, so the cache key still matches.
@@ -990,7 +994,8 @@ try {
   // Measured once per main sha (cached); any error leaves `baseFailures` null, i.e. the red stays a real red.
   baseCandidate = baseRerunCandidate({ exitCode, signal, phaseResults, failureDetails,
     changedFiles: Array.isArray(resolvedGate?.decision?.changedFiles) ? [...resolvedGate.decision.changedFiles, ...editedDuringRun] : null });
-  const baseSha = baseCandidate && !infrastructureNow(exitCode, signal, failureDetails) ? tryGit(['rev-parse', 'origin/main']) : null;
+  // A split gate has no base rerun (the old single-command gate never ran one for it): a red stays a real red.
+  const baseSha = !explicitSegments && baseCandidate && !infrastructureNow(exitCode, signal, failureDetails) ? tryGit(['rev-parse', 'origin/main']) : null;
   if (baseSha) {
     process.stderr.write(`Comparing ${baseCandidate.files.length} failing file(s) outside the diff with origin/main @ ${baseSha.slice(0, 8)}\n`);
     baseFailures = await measureBaseFailures({ baseSha, files: baseCandidate.files, cacheDir: join(tmpdir(), 'we-verify-base-failures'),

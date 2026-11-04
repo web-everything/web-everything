@@ -129,7 +129,6 @@ export function splitExplicitGate(command, { log = () => {} } = {}) {
     const rewritten = rewriteShardWrapperSegment(segment);
     if (rewritten) { out.push(rewritten); continue; }
     if (isVitestSegment(segment) && segmentParts(segment)) { out.push(segment); continue; }
-    if (wrappedNpmScript(segment)) { out.push(segment); continue; }
     log(`explicit-gate-unsplit: unknown-segment (${segment.trim().split(/\s+/).slice(0, 3).join(' ').slice(0, 80)})`);
     return null;
   }
@@ -145,14 +144,28 @@ function rewriteShardWrapperSegment(segment) {
   return `node ${shellQuote(SHARD_RUN_SCRIPT)} ${words.slice(2).join(' ')}`.trimEnd();
 }
 
-// Strict `&&`: run each segment in turn; the first nonzero exit or signal stops the rest and is the result.
-export async function runGateSegments(segments, run) {
+// A split gate's time budget is the single-phase ceiling the whole gate had before the split. It is enforced by the
+// EXISTING worker-thread watchdog: each segment's watchdog gets what remains of one absolute deadline, computed right
+// before it spawns (after admission), so an admission wait can never extend the ceiling.
+export const remainingBudgetMs = (deadlineAt, now = Date.now) =>
+  Number.isFinite(deadlineAt) ? Math.max(0, Math.floor(deadlineAt - now())) : undefined;
+// Nothing ran (the budget was spent before a spawn): a timeout, never a pass.
+export const budgetExhaustedResult = last => ({ exitCode: 124, signal: 'SIGKILL', timedOut: true, budgetExhausted: true, remoteAttempt: false,
+  ranOn: last?.ranOn ?? { location: 'local' }, failureDetails: last?.failureDetails, output: null });
+
+// Strict `&&`: run each segment in turn; the first nonzero exit or signal stops the rest and is the result. A spent
+// budget before a segment is a timeout. A green gate that finished over budget is a timeout too, but it keeps the
+// segment's own `remoteAttempt` and location so an interrupted remote run stays `remote-termination-unconfirmed`.
+export async function runGateSegments(segments, run, { budgetMs, now = Date.now } = {}) {
+  const deadlineAt = Number.isFinite(budgetMs) ? now() + budgetMs : undefined;
   let last = null;
   for (const segment of segments) {
-    last = await run(segment);
+    if (remainingBudgetMs(deadlineAt, now) === 0) return budgetExhaustedResult(last);
+    last = await run(segment, deadlineAt === undefined ? {} : { deadlineAt });
     if (last.exitCode !== 0 || last.signal) return last;
   }
-  return last;
+  return remainingBudgetMs(deadlineAt, now) === 0 && last
+    ? { ...last, exitCode: 124, signal: 'SIGKILL', timedOut: true, budgetExhausted: true } : last;
 }
 
 export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
