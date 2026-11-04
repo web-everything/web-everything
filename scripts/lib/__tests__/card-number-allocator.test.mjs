@@ -12,6 +12,7 @@ import { gitBlobOid, gitRun } from '../git-run.mjs';
 import { rebaseDropManifest } from '../rebase-drop-manifest.mjs';
 import { acquireFixClaim } from '../../conveyor/fix-procedure.mjs';
 import { fixDispatchClaimRoot } from '../../conveyor/fix-claim-store.mjs';
+process.env.WE_DRAIN_READS_SOURCE = 'git'; // these suites stub git; the REST reads are covered by drain-api-reads.test.mjs
 
 const io = vi.hoisted(() => ({ git: null }));
 // Inject the subprocess boundary explicitly: builtin ESM mocks can leave the

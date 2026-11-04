@@ -20,6 +20,7 @@ import { tryAcquireNumberingLock } from '../readiness/drain-lock.mjs';
 import { checkFlow } from '../conveyor/flows/flow-model.mjs';
 import { mergeGroupHashRefusals } from '../lib/queue-branch-numbering.mjs';
 import { strandedHashesOnMain } from '../check-standards-rules.mjs';
+process.env.WE_DRAIN_READS_SOURCE = 'git'; // these suites stub git; the REST reads are covered by drain-api-reads.test.mjs
 
 const DRAIN_CLI = join(process.cwd(), 'scripts/lane-drain.mjs');
 

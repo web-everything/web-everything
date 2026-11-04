@@ -15,6 +15,7 @@ import {
 } from '../enqueue-on-event.mjs';
 import * as enqueueModule from '../enqueue-on-event.mjs';
 import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
+process.env.WE_DRAIN_READS_SOURCE = 'git'; // these suites stub git; the REST reads are covered by drain-api-reads.test.mjs
 
 const REPO = 'web-everything/web-everything';
 const GREEN = 'check_suite.completed=success@12';

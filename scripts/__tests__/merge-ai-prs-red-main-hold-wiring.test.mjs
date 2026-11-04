@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
+process.env.WE_DRAIN_READS_SOURCE = 'git'; // these suites stub git; the REST reads are covered by drain-api-reads.test.mjs
 
 // Cover the 6x load cap (even if load rises later), an explicit override, and fixture cleanup.
 const CLI_TEST_TIMEOUT_MS = 2 * Math.max(180_000, spawnTimeoutMs()) + 10_000;

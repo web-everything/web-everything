@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, basename, delimiter, resolve } from 'node:path';
 import { tryAcquireNumberingLock, releaseNumberingLockIfOwned } from '../../readiness/drain-lock.mjs';
 import { handNumberedNewItems } from '../../check-standards-rules.mjs';
+process.env.WE_DRAIN_READS_SOURCE = 'git'; // these suites stub git; the REST reads are covered by drain-api-reads.test.mjs
 
 const collisionRoots = [];
 afterEach(() => collisionRoots.splice(0).forEach((root) => rmSync(root, { recursive: true, force: true })));

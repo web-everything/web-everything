@@ -12,6 +12,7 @@ import { fixDispatchResource } from '../conveyor/fix-claim-store.mjs';
 import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
 import { createPrestageCache, resolvePrestageSettings, enqueuePrestage } from '../lib/drain-prestage.mjs';
 import { buildLedgerEvent, EVENT_TYPES } from '../lib/verdict-ledger.mjs';
+process.env.WE_DRAIN_READS_SOURCE = 'git'; // these suites stub git; the REST reads are covered by drain-api-reads.test.mjs
 
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs');
 const sha = 'a'.repeat(40);

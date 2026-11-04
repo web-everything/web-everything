@@ -12,6 +12,7 @@ import { healLaneRefs } from '../lane-repair.mjs';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+process.env.WE_DRAIN_READS_SOURCE = 'git'; // these suites stub git; the REST reads are covered by drain-api-reads.test.mjs
 
 vi.mock('../merge-queue-enqueue.mjs', async original => ({
   ...(await original()), enqueuePr: vi.fn(() => ({ ok: true, already: false })),
