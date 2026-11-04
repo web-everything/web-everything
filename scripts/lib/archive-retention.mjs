@@ -10,9 +10,11 @@ import { sharedRunsDir } from '../operations/run-store.mjs';
 import { resolveCascade, readPlatformPreferences, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { boundedText } from './host-overload-settings.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
+import { createRunsWriterExclusion, runRecordEligible } from './runs-writer-exclusion.mjs';
+import { readFile } from 'node:fs/promises';
 const exec = promisify(execFile);
 const DAY = 86400000;
-const standard = { runs: { keepDays: 14 }, sessions: { keepDays: 30 }, driveRoot: join(homedir(), 'Library', 'CloudStorage', 'GoogleDrive-nic.g.gilbert@gmail.com', 'My Drive', 'web-everything-archive') };
+const standard = { runs: { keepDays: 14 }, sessions: { keepDays: 30 }, runsBatchCap: 5000, runsSchedule: 'daily', driveRoot: join(homedir(), 'Library', 'CloudStorage', 'GoogleDrive-nic.g.gilbert@gmail.com', 'My Drive', 'web-everything-archive') };
 export function archiveSettings({ env = process.env, tool, log = console.error } = {}) {
   const p = readPlatformPreferences({ env, readFile: path => boundedText(path) });
   if (p.errors.length) throw Error(p.errors.join('; '));
@@ -25,20 +27,25 @@ export function archiveSettings({ env = process.env, tool, log = console.error }
     const v = env[`WE_ARCHIVE_${kind.toUpperCase()}_KEEP_DAYS`];
     if (v !== undefined) envValues[kind] = { keepDays: Number(v) };
   }
+  if (env.WE_ARCHIVE_RUNS_BATCH_CAP !== undefined) envValues.runsBatchCap = Number(env.WE_ARCHIVE_RUNS_BATCH_CAP);
   if (env.WE_ARCHIVE_DRIVE_ROOT !== undefined) envValues.driveRoot = env.WE_ARCHIVE_DRIVE_ROOT;
   const valid = { runs: v => Number.isSafeInteger(v?.keepDays ?? v) && (v?.keepDays ?? v) >= 0,
     sessions: v => Number.isSafeInteger(v?.keepDays ?? v) && (v?.keepDays ?? v) >= 0,
+    runsBatchCap: v => Number.isSafeInteger(v) && v > 0,
+    runsSchedule: v => v === 'daily',
     driveRoot: v => typeof v === 'string' && v.trim().length > 0 };
   // Validate complete blocks too: empty objects must not silently disappear in the cascade.
   for (const layer of [p.prefs.archive, tool, envValues]) if (layer !== undefined) {
     if (!layer || typeof layer !== 'object' || Array.isArray(layer)) throw Error('invalid archive policy');
-    for (const k of Object.keys(valid)) if (Object.hasOwn(layer, k) && (!valid[k](layer[k]) || (k !== 'driveRoot' && (typeof layer[k] !== 'object' || Array.isArray(layer[k]))))) throw Error(`invalid archive policy: ${k}`);
+    for (const k of Object.keys(valid)) if (Object.hasOwn(layer, k) && (!valid[k](layer[k]) || (!['driveRoot', 'runsBatchCap', 'runsSchedule'].includes(k) && (typeof layer[k] !== 'object' || Array.isArray(layer[k]))))) throw Error(`invalid archive policy: ${k}`);
   }
   const r = resolveCascade({ standard, platform: p.prefs.archive, tool, envValues, valid });
   if (r.invalid.length) throw Error(`invalid archive policy: ${r.invalid.join('; ')}`);
   log(formatCascadeSourcesLine('archive', r));
   return r;
 }
+/** Default provider per kind: runs get the live-writer exclusion; sessions keep the retain-only behaviour. */
+export const defaultWriterExclusion = kind => (kind === 'runs' ? createRunsWriterExclusion() : undefined);
 const dayOf = ms => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(ms);
 const same = (a, b) => a.isFile() && b.isFile() && a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
 // Include identity/ctime so a replacement or a same-size write with restored mtime is new.
@@ -140,7 +147,18 @@ export async function archiveRetention(o = {}) {
       groups.get(key).files.push(...files); groups.get(key).dirs.push(...dirs);
     }
     if (kind === 'runs') {
-      for (const f of (await scan(source, true)).files) if (f.path.endsWith('.json') && f.stat.mtimeMs < cutoff) add(`runs-${dayOf(f.stat.mtimeMs)}`, [f]);
+      // Oldest first, bounded by the batch cap; unreadable or unfinished records are skipped (never eligible).
+      const cap = o.batchCap ?? settings.value.runsBatchCap;
+      const old = (await scan(source, true)).files.filter(f => f.path.endsWith('.json') && f.stat.mtimeMs < cutoff && !(archived.get(relative(source, f.path)) && version(f.stat).every((v, i) => v === archived.get(relative(source, f.path))[i])))
+        .sort((a, b) => a.stat.mtimeMs - b.stat.mtimeMs);
+      let taken = 0;
+      for (const f of old) {
+        if (taken >= cap) break;
+        let ok = false;
+        try { ok = (o.runEligible ?? runRecordEligible)(await readFile(f.path, 'utf8')); } catch { ok = false; }
+        if (!ok) { out.filesRetained++; continue; }
+        add(`runs-${dayOf(f.stat.mtimeMs)}`, [f]); taken++;
+      }
     } else {
       for await (const project of await opendir(source)) {
         if (++scanned > maxFiles) throw Error('scan bound exceeded; operator must split the source or raise maxFiles after inspection');

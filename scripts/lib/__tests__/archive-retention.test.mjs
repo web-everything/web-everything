@@ -17,7 +17,7 @@ async function exists(p) { return access(p).then(() => true, () => false); }
 // Existing fixtures have one writer, so this provider owns their entire write lifecycle.
 // Tests with live/uncoordinated writers explicitly remove it.
 const fixtureWriterExclusion = async (_path, criticalSection) => criticalSection();
-const run = (extra = {}) => archiveRetention({ withSourceWriterExclusion: fixtureWriterExclusion, kind: 'runs', driveRoot: drive, runsDir: runs, sessionsDir: sessions, stateDir, now, emit: () => {}, env: { WE_PLATFORM_PREFERENCES_FILE: join(root, 'policy.json') }, ...extra });
+const run = (extra = {}) => archiveRetention({ withSourceWriterExclusion: fixtureWriterExclusion, runEligible: () => true, kind: 'runs', driveRoot: drive, runsDir: runs, sessionsDir: sessions, stateDir, now, emit: () => {}, env: { WE_PLATFORM_PREFERENCES_FILE: join(root, 'policy.json') }, ...extra });
 it('missing Drive keeps every original and reports skipped', async () => {
   const p = await file(join(runs, 'a.json'));
   expect((await run({ driveRoot: join(root, 'missing') })).status).toBe('skipped');
@@ -69,7 +69,7 @@ it.each(['runs', 'sessions'])('unchanged retained sources are archived only once
 it('daily health ticks retain sources and skip their verified versions on the next day', async () => {
   await file(join(runs, 'a.json')); await file(join(sessions, 'project', 'old.jsonl'));
   const archive = request => archiveRetention({ driveRoot: drive, runsDir: runs, sessionsDir: sessions, stateDir,
-    emit: () => {}, env: { WE_PLATFORM_PREFERENCES_FILE: join(root, 'policy.json') }, ...request });
+    emit: () => {}, env: { WE_PLATFORM_PREFERENCES_FILE: join(root, 'policy.json') }, runEligible: () => true, ...request, withSourceWriterExclusion: undefined });
   const first = await runArchiveRetentionTick({ now, archive, log: () => {} });
   expect(first.results.map(r => [r.filesArchived, r.filesRetained])).toEqual([[1, 1], [1, 1]]);
   const second = await runArchiveRetentionTick({ now: now + 86400001, archive, log: () => {} });
@@ -316,4 +316,61 @@ it('coordinated writer arriving after final stat waits until removal and its new
   await pendingWrite;
   expect(queued).toBe(true); expect(out.errors).toEqual([]); expect(out.bytesFreed).toBe(6);
   expect(await readFile(p, 'utf8')).toBe('-late');
+});
+
+// R555: pluggable writer exclusion, batch cap, eligibility, fail-closed.
+const rec = JSON.stringify({ effects: [], pending: null });
+const realRun = (extra = {}) => run({ runEligible: undefined, ...extra });
+it('batch cap archives only the oldest N files per run', async () => {
+  const mk = i => file(join(runs, `r${i}.json`), new Date(now - (60 - i) * 86400000));
+  const ps = await Promise.all([1, 2, 3, 4, 5].map(mk));
+  const out = await run({ batchCap: 2 });
+  expect(out.filesArchived).toBe(2);
+  expect(await Promise.all(ps.map(exists))).toEqual([false, false, true, true, true]);
+});
+it('settings default the runs batch cap and schedule with provenance, env overrides the cap', () => {
+  const a = archiveSettings({ env: { WE_PLATFORM_PREFERENCES_FILE: join(root, 'p.json') }, tool: {} });
+  expect(a.value.runsBatchCap).toBe(5000); expect(a.value.runsSchedule).toBe('daily');
+  const b = archiveSettings({ env: { WE_PLATFORM_PREFERENCES_FILE: join(root, 'p.json'), WE_ARCHIVE_RUNS_BATCH_CAP: '7' }, tool: {} });
+  expect(b.value.runsBatchCap).toBe(7); expect(b.sources.runsBatchCap).toBe('env');
+  expect(() => archiveSettings({ env: { WE_PLATFORM_PREFERENCES_FILE: join(root, 'p.json'), WE_ARCHIVE_RUNS_BATCH_CAP: '0' }, tool: {} })).toThrow(/invalid archive policy/);
+});
+it('age threshold: records younger than keepDays stay', async () => {
+  const young = await file(join(runs, 'y.json'), new Date(now - 3 * 86400000));
+  const oldp = await file(join(runs, 'o.json'));
+  await realRun({ runEligible: () => true });
+  expect(await exists(young)).toBe(true); expect(await exists(oldp)).toBe(false);
+});
+it('unreadable, non-terminal and PR-evidence records are never eligible', async () => {
+  const bad = await file(join(runs, 'bad.json')); // 'record' is not JSON
+  const pending = join(runs, 'p.json'); await writeFile(pending, JSON.stringify({ effects: [{ status: 'pending' }] })); await utimes(pending, old, old);
+  const pr = join(runs, 'pr.json'); await writeFile(pr, JSON.stringify({ effects: [{ status: 'applied', result: { pr: 1 } }] })); await utimes(pr, old, old);
+  const ok = join(runs, 'ok.json'); await writeFile(ok, rec); await utimes(ok, old, old);
+  await realRun();
+  expect(await Promise.all([bad, pending, pr, ok].map(exists))).toEqual([true, true, true, false]);
+});
+it('a live writer pid skips the record; a dead pid is eligible; unreadable state is skipped', async () => {
+  const { createRunsWriterExclusion } = await import('../runs-writer-exclusion.mjs');
+  const a = join(runs, 'a.json'), b = join(runs, 'b.json'), c = join(runs, 'c.json');
+  for (const p of [a, b, c]) { await writeFile(p, rec); await utimes(p, old, old); }
+  const u = '00000000-0000-0000-0000-000000000000';
+  await writeFile(join(runs, `a.json.111.${u}.tmp`), '{}');
+  await writeFile(join(runs, `b.json.222.${u}.tmp`), '{}');
+  await writeFile(join(runs, 'c.json.lock'), 'garbage');
+  const provider = createRunsWriterExclusion({ isPidAlive: pid => pid === 111 });
+  const out = await realRun({ withSourceWriterExclusion: provider });
+  expect(await Promise.all([a, b, c].map(exists))).toEqual([true, false, true]);
+  expect(out.errors.join()).toMatch(/writer exclusion unavailable/);
+});
+it('an unreadable runs directory snapshot fails closed', async () => {
+  const { createRunsWriterExclusion } = await import('../runs-writer-exclusion.mjs');
+  let ran = false;
+  await createRunsWriterExclusion({ list: async () => { throw Error('EIO'); } })(join(runs, 'x.json'), async () => { ran = true; });
+  expect(ran).toBe(false);
+});
+it('Drive verification failure never deletes the local record (runs, real provider)', async () => {
+  const { createRunsWriterExclusion } = await import('../runs-writer-exclusion.mjs');
+  const p = join(runs, 'v.json'); await writeFile(p, rec); await utimes(p, old, old);
+  const out = await realRun({ withSourceWriterExclusion: createRunsWriterExclusion(), listBundle: async () => [] });
+  expect(out.errors.length).toBeGreaterThan(0); expect(await exists(p)).toBe(true);
 });
