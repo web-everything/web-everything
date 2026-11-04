@@ -8,6 +8,11 @@ import { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-s
 export { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-status-label-meta.mjs';
 
 export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head, evidence = {}, env = {}, standingRuling = null } = {}) {
+  if (evidence.ok === false) {
+    const names = labels.map(label => typeof label === 'string' ? label : label?.name);
+    return { add: names.includes('red-team:pending') || names.includes('red-team:blocked') ? null : 'red-team:pending',
+      remove: names.filter(name => name === 'red-team:clear') };
+  }
   const disposition = readRedTeamDisposition({ comments, pr, head, env, repo, standingRuling });
   const verdict = evidence.status?.status === 'finished' ? evidence.status.result?.foldedVerdict : null;
   const finished = verdict === 'changes' ? 'red-team:blocked' : verdict === 'accept' ? 'red-team:clear' : null;
