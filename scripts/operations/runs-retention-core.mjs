@@ -5,9 +5,9 @@
  *   a `--resume` could need, or anything newer than keepDays. Dry-run (the default) reports counts and bytes only.
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, lstatSync, linkSync, rmdirSync, unlinkSync, rmSync, statSync, statfsSync, writeFileSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, lstatSync, linkSync, realpathSync, rmdirSync, unlinkSync, rmSync, statSync, statfsSync, writeFileSync, mkdtempSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { isRunRecordTerminal, listRunIds, resolveRunsDir, runPath } from './run-store.mjs';
@@ -88,6 +88,12 @@ function defaultVerify(file, batch, codec) {
     }
   } finally { rmSync(tmp, { recursive: true, force: true }); }
 }
+/** Paths under `dir` any process holds open (lsof). Fails CLOSED: if lsof can not answer, every path counts as open. */
+function defaultOpenPaths(dir) {
+  const r = spawnSync('lsof', ['-Fn', '+D', dir], { maxBuffer: 256 * 1024 * 1024 });
+  if (r.error || (r.status !== 0 && r.status !== 1)) return { has: () => true };
+  return new Set(String(r.stdout).split('\n').filter(l => l.startsWith('n')).map(l => l.slice(1)));
+}
 const defaultFreeGiB = dir => { const s = statfsSync(dir); return (s.bavail * s.bsize) / GIB; };
 
 /**
@@ -102,6 +108,7 @@ export function runsRetention(o = {}) {
   const codec = o.codec ?? defaultCodec();
   const tarCreate = o.tarCreate ?? defaultTarCreate, tarList = o.tarList ?? defaultTarList;
   const freeGiB = o.freeGiB ?? defaultFreeGiB;
+  const openPaths = o.openPaths ?? defaultOpenPaths;
   const isComplete = o.isComplete ?? (() => false);
   const verifyContents = o.verifyContents ?? defaultVerify;
   const out = { status: dryRun ? 'dry-run' : 'archived', dryRun, scanned: 0, eligible: 0, eligibleBytes: 0,
@@ -159,6 +166,7 @@ export function runsRetention(o = {}) {
     files.sort((a, b) => a.mtimeMs - b.mtimeMs || a.id.localeCompare(b.id));
     const batches = []; let cur = [], size = 0;
     for (const f of files) {
+      if (f.size > maxBytes) { out.kept.unreadable++; continue; } // a single record over the batch bound is never archived
       if (cur.length && size + f.size > maxBytes) { batches.push(cur); cur = []; size = 0; }
       cur.push(f); size += f.size;
     }
@@ -191,21 +199,27 @@ export function runsRetention(o = {}) {
         unlinkSync(partial); partial = undefined;
         if (!mountSame()) throw new Error('archive mount changed; originals retained');
         out.archives.push(final); out.archived += names.length;
+        // Phase 1: quarantine every record of the batch (atomic rename). A writer replacing one now creates an
+        // independent NEW file; only descriptors opened BEFORE the rename can still reach the quarantined inode.
+        const held = [];
         for (const f of batch) {
-          const path = runPath(f.id, dir), held = join(dir, `.retiring-${f.id}.${randomUUID()}`);
+          const path = runPath(f.id, dir), parked = join(dir, `.retiring-${f.id}.${randomUUID()}`);
+          try { renameSync(path, parked); held.push({ f, path, parked }); }
+          catch (e) { if (e.code !== 'ENOENT') out.errors.push(`${f.id}: quarantine failed (${e.code ?? e.message}); original retained`); }
+        }
+        // Phase 2: refuse any quarantined inode some process still holds open (writer exclusion), then verify + delete.
+        const realDirPath = realpathSync(dir);
+        const open = openPaths(realDirPath);
+        for (const { f, path, parked } of held) {
           try {
-            // Move the record AWAY first (atomic): a writer replacing it now creates an independent new file, and
-            // the exact inode we hash is the one we delete. A changed record is put back, never destroyed.
-            renameSync(path, held);
-            const hs = lstatSync(held);
-            if (hs.isFile() && hs.mtimeMs === f.mtimeMs && hs.ino === f.ino && hs.size === f.size && hashOf(held) === f.hash) { unlinkSync(held); out.deleted++; out.bytesFreed += f.size; }
-            else {
+            const hs = lstatSync(parked);
+            if (!open.has(join(realDirPath, basename(parked))) && hs.isFile() && hs.mtimeMs === f.mtimeMs && hs.ino === f.ino && hs.size === f.size && hashOf(parked) === f.hash) {
+              unlinkSync(parked); out.deleted++; out.bytesFreed += f.size;
+            } else {
               out.kept.young++;
-              try { linkSync(held, path); unlinkSync(held); } catch { out.errors.push(`${f.id}: changed after archive; kept at ${held}`); }
+              try { linkSync(parked, path); unlinkSync(parked); } catch { out.errors.push(`${f.id}: changed or open after archive; kept at ${parked}`); }
             }
-          } catch (e) {
-            if (e.code !== 'ENOENT') out.errors.push(`${f.id}: delete failed (${e.code ?? e.message}); original retained`);
-          }
+          } catch (e) { out.errors.push(`${f.id}: delete failed (${e.code ?? e.message}); original retained`); }
         }
       } catch (e) { if (partial) rmSync(partial, { force: true }); out.errors.push(`${month}: ${e.message}`); out.status = 'partial'; return out; }
     }

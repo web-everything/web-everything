@@ -15,7 +15,7 @@ const put = (id, ageDays, patch = {}) => {
   const t = (NOW - ageDays * DAY) / 1000;
   utimesSync(join(runs, `${id}.json`), t, t);
 };
-const base = (extra = {}) => runsRetention({ runsDir: runs, now: NOW, settings, dryRun: false, freeGiB: () => 500, isComplete: () => true, ...extra });
+const base = (extra = {}) => runsRetention({ runsDir: runs, now: NOW, settings, dryRun: false, freeGiB: () => 500, isComplete: () => true, openPaths: () => new Set(), ...extra });
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'we-runs-ret-'));
@@ -127,6 +127,18 @@ describe('runsRetention', () => {
     renameSync(join(runs, 'run-x.json'), join(runs, '.retiring-run-x.123e4567-e89b-12d3-a456-426614174000'));
     base();
     expect(listRunIds(runs)).toEqual(['run-x']);
+  });
+
+  it('restores (does not delete) a record some process still holds open', () => {
+    put('run-open', 30);
+    const r = base({ openPaths: dir => ({ has: p => p.includes('.retiring-run-open') }) });
+    expect(r.deleted).toBe(0); expect(listRunIds(runs)).toEqual(['run-open']);
+  });
+
+  it('never archives a single record over the batch bound', () => {
+    put('run-big', 30);
+    const r = base({ settings: { ...settings, batchMaxGiB: 0 } });
+    expect(r.archived).toBe(0); expect(listRunIds(runs)).toEqual(['run-big']);
   });
 
   it('settings: defaults to 14 days / 30 GiB; env overrides; invalid throws', () => {
