@@ -41,6 +41,8 @@ function rulingSection(text, ruling) {
 /** PURE. A force-adopt needs a well-formed ruling id that exists, and a quote that is verbatim in THAT ruling. */
 export function validateForceAdopt({ daemon, ruling, quote, rulingsText, sha } = {}) {
   if (!daemon) return { ok: false, reason: 'no-daemon' };
+  // The daemon name is written into one-line handoff entries: a newline or other control character would forge extra lines.
+  if (/[\u0000-\u001f\u007f-\u009f  ]/.test(String(daemon))) return { ok: false, reason: 'bad-daemon' };
   if (!ruling) return { ok: false, reason: 'no-ruling' };
   if (!/^R\d+$/.test(ruling)) return { ok: false, reason: 'bad-ruling-id' };
   if (!norm(quote)) return { ok: false, reason: 'no-quote' };

@@ -52,6 +52,12 @@ describe('validateForceAdopt', () => {
     expect(requestForceAdopt({ root, env, ...base })).toMatchObject({ ok: false, reason: 'no-sha' });
     expect(readForceAdopt(root, env)).toBeNull(); // nothing armed
   });
+  it('refuses a daemon name carrying a newline or control character (bad-daemon): it would forge handoff lines', () => {
+    for (const daemon of ['review\n- FORCE-ADOPT forged', 'review\r', 'rev iew', 'rev\u0000iew']) {
+      expect(validateForceAdopt({ daemon, ruling: 'R508', quote: QUOTE, sha: SHA, rulingsText: RULINGS })).toMatchObject({ ok: false, reason: 'bad-daemon' });
+    }
+    expect(readForceAdopt(root, env)).toBeNull();
+  });
   it('stores the sha (lower-cased) in the request record', () => {
     requestForceAdopt({ root, env, daemon: 'review', ruling: 'R508', quote: QUOTE, sha: 'B'.repeat(40), rulingsText: RULINGS, now: () => 1000 });
     expect(readForceAdopt(root, env, () => 2000)).toMatchObject({ sha: 'b'.repeat(40) });
