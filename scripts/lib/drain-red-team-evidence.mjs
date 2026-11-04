@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { hostname } from 'node:os';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { isRunRecordTerminal, listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operations/run-store.mjs';
-import { createNewestRunFinder } from './stream-filter-runs.mjs';
+import { createNewestRunFinder, runMayBeForPr } from './stream-filter-runs.mjs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { redTeamEnabled, redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
@@ -99,6 +99,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     const startless = []; // ids and mtimes only, never payloads
     let count = 0, newestSettled = false, boundary = -Infinity;
     const find = createNewestRunFinder({ ids: list(runsDir).filter(id => id.startsWith('review-pr-')), tieBreak,
+      mayMatch: id => runMayBeForPr(join(runsDir, `${id}.json`), pr),
       stat: id => stat(join(runsDir, `${id}.json`)), read: id => read(id, runsDir), scanSettings, warn });
     const end = find((run, id, at, nextAt) => {
       if (run?.op === 'review-pr' && run.input?.repo === repo && Number(run.input?.pr) === Number(pr)) {

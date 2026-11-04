@@ -209,3 +209,52 @@ describe('createNewestRunFinder id-asc tie order', () => {
     expect(find(() => true).id).toBe('review-pr-A');
   });
 });
+
+// Interim relief: skip runs that cannot be for the target PR before stat/parse (cheap bounded head check).
+import { mkdtempSync as mkTmp, writeFileSync, rmSync as rmTmp } from 'node:fs';
+import { tmpdir as tmpDir } from 'node:os';
+import { join as joinPath } from 'node:path';
+import { prNumberFromRunHead, runMayBeForPr, RUN_HEAD_BYTES } from '../stream-filter-runs.mjs';
+
+describe('run PR prefilter (bounded head read)', () => {
+  const dir = mkTmp(joinPath(tmpDir(), 'runhead-'));
+  const put = (name, text) => { writeFileSync(joinPath(dir, `${name}.json`), text); return joinPath(dir, `${name}.json`); };
+  const rec = pr => JSON.stringify({ v: 1, id: 'x', op: 'review-pr', input: { pr, repo: 'o/r' }, big: 'z'.repeat(5000) }, null, 2);
+
+  it('finds a target run older than 2000 newer runs from other PRs, parsing none of the others', () => {
+    const ids = Array.from({ length: 2001 }, (_, i) => `r${i}`);
+    const prOf = id => id === 'r0' ? 7 : 8;
+    let reads = 0;
+    const find = createNewestRunFinder({ ids, maxParses: 300, stat: id => ({ mtimeMs: id === 'r0' ? 1 : 1000 + Number(id.slice(1)) }),
+      mayMatch: id => prOf(id) === 7, read: id => { reads++; return { id, pr: prOf(id) }; } });
+    expect(find(run => run.pr === 7)).toMatchObject({ id: 'r0' });
+    expect(reads).toBe(1);
+  });
+  it('reads the PR from the first bytes of a pretty-printed record, and only a different number skips', () => {
+    expect(prNumberFromRunHead(rec(3420))).toBe(3420);
+    expect(prNumberFromRunHead('{"input":{"pr":12,"x":1}}')).toBe(12);
+    expect(prNumberFromRunHead('{"input":{"repo":"o/r"}}')).toBeNull();
+    expect(prNumberFromRunHead(`{"pad":"${'a'.repeat(RUN_HEAD_BYTES)}","input":{"pr":5}}`)).toBeNull();
+    expect(runMayBeForPr(put('a', rec(5)), 5)).toBe(true);
+    expect(runMayBeForPr(put('b', rec(6)), 5)).toBe(false);
+    expect(runMayBeForPr(put('c', 'not json at all'), 5)).toBe(true); // unknown, never skipped
+    expect(runMayBeForPr(joinPath(dir, 'missing.json'), 5)).toBe(true); // the real read decides
+  });
+  it('an unreadable head read throws instead of skipping (fail closed)', () => {
+    expect(() => runMayBeForPr(dir, 5)).toThrow(); // EISDIR
+  });
+  it('a matching-looking run that fails the real parse still throws', () => {
+    const find = createNewestRunFinder({ ids: ['a'], maxParses: 5, stat: () => ({ mtimeMs: 1 }), mayMatch: () => true,
+      read: () => { throw Error('torn'); } });
+    expect(() => find(() => true)).toThrow('torn');
+  });
+  it('the cap still bounds the filtered set', () => {
+    const ids = Array.from({ length: 10 }, (_, i) => `m${i}`);
+    const find = createNewestRunFinder({ ids, maxParses: 3, stat: id => ({ mtimeMs: Number(id.slice(1)) }),
+      mayMatch: () => true, read: id => id, warn: () => {} });
+    expect(find(() => false)).toEqual(RUN_SCAN_CAPPED_FOR_TEST);
+    const skipAll = createNewestRunFinder({ ids, maxParses: 3, stat: () => ({ mtimeMs: 1 }), mayMatch: () => false, read: () => { throw Error('no'); } });
+    expect(skipAll(() => true)).toBeNull();
+  });
+});
+const RUN_SCAN_CAPPED_FOR_TEST = { ok: false, reason: 'scan-capped' };
