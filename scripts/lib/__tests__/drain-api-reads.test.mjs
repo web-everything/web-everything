@@ -6,6 +6,8 @@
 import { describe, it, expect } from 'vitest';
 import { mkdtempSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { chmodSync, readFileSync, writeFileSync } from 'node:fs';
+import { execFileSyncThrottled } from '../gh-throttle.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ghRestGetJson } from '../gh-rest-read.mjs';
@@ -592,5 +594,56 @@ describe('R559 tree completeness must be known: truncated === false, strictly', 
     expect(readFileAtRef('t', 'a/b.md', 'main', { source: src(regular) })).toMatchObject({ ok: true });
     const unknown = routes({ ...fileWorld('a/b.md', b64('x\n')), 'git/trees/rt0': ok({ tree: [{ path: 'a', type: 'tree', sha: 'rt1' }] }) });
     expect(readFileAtRef('t', 'a/b.md', 'main', { source: src(unknown) })).toMatchObject({ ok: false, reason: 'tree-completeness-unknown' });
+  });
+});
+
+describe('R559 safety reads never reuse a cache: the gh env is an allowlist', () => {
+  const FORBIDDEN = ['WE_GH_READ_MEMO_DIR', 'WE_GH_ETAG_DIR', 'WE_GH_ETAG_CACHE', 'WE_FINISHED_CI_CACHE_DIR', 'WE_GH_THROTTLE_GH_BIN',
+    'GH_ENTERPRISE_TOKEN', 'GH_REPO', 'GH_HOST_OVERRIDE', 'WE_GH_REPLAY_DIR', 'SOME_RANDOM_VAR', 'NODE_OPTIONS'];
+  const ALLOWED = ['PATH', 'HOME', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_CALLER', 'WE_GH_AUTH_TOKEN_HASH', 'WE_GH_THROTTLE_CAP', 'WE_GH_THROTTLE_LOCK_ROOT'];
+  const envOf = () => Object.fromEntries([...FORBIDDEN, ...ALLOWED].map((k) => [k, 'x']));
+  const capture = () => { const seen = []; const rest = (_p, o) => { seen.push(o); return ok({ a: 1 }); }; rest.seen = seen; return rest; };
+  it.each(FORBIDDEN)('%s is never passed to gh', (name) => {
+    const rest = capture();
+    src(rest, { env: envOf() }).read('json', 'repos/{owner}/{repo}/x');
+    expect(rest.seen[0].env[name]).toBeUndefined();
+    expect(rest.seen[0].execOpts.env[name]).toBeUndefined();
+  });
+  it.each(ALLOWED)('%s (token, host or throttle setting) is kept', (name) => {
+    const rest = capture();
+    src(rest, { env: envOf() }).read('json', 'repos/{owner}/{repo}/x');
+    expect(rest.seen[0].execOpts.env[name]).toBe('x');
+    expect(rest.seen[0].execOpts.env.GH_HOST).toBe('github.com');
+  });
+  it('the default transport hands gh-throttle an allowlisted env (the memo reads throttle.env, not the child env)', () => {
+    const seen = [];
+    const exec = (_f, _a, opts) => { seen.push(opts); return 'HTTP/2.0 200 OK\r\n\r\n{"object":{"sha":"' + SHA + '"}}'; };
+    const source = createRestSource({ exec, slug: 'o/r', env: { ...envOf(), HOME: '/h' }, now: () => NOW });
+    expect(source.read('json', 'repos/{owner}/{repo}/git/ref/heads/main')).toMatchObject({ ok: true });
+    expect(seen).toHaveLength(1);
+    expect(seen[0].throttle.env.WE_GH_READ_MEMO_DIR).toBeUndefined();
+    expect(seen[0].throttle.env.WE_GH_THROTTLE_CAP).toBe('x');
+  });
+  it('a memoized unfrozen tip is NOT returned after a freeze: two reads reach gh twice even with a memo dir configured', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'memo-'));
+    const counter = join(dir, 'n');
+    const gh = join(dir, 'gh');
+    writeFileSync(gh, `#!/bin/sh\nn=$(cat '${counter}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '${counter}'\nprintf 'HTTP/2.0 200 OK\\r\\n\\r\\n{"object":{"sha":"%040d"}}' $n\n`);
+    chmodSync(gh, 0o755);
+    const saved = { memo: process.env.WE_GH_READ_MEMO_DIR, root: process.env.WE_GH_THROTTLE_LOCK_ROOT };
+    process.env.WE_GH_READ_MEMO_DIR = join(dir, 'memo');
+    process.env.WE_GH_THROTTLE_LOCK_ROOT = join(dir, 'locks');
+    try {
+      const exec = (file, args, opts) => execFileSyncThrottled(file, args, { ...opts, throttle: { ...opts.throttle, bin: gh } });
+      const source = createRestSource({ exec, slug: 'o/r', env: process.env, now: () => NOW });
+      const unfrozen = readBranchSha('main', { source });
+      const afterFreeze = readBranchSha('main', { source });
+      expect(unfrozen).toMatchObject({ ok: true });
+      expect(afterFreeze).toMatchObject({ ok: true });
+      expect(afterFreeze.value).not.toBe(unfrozen.value);
+      expect(readFileSync(counter, 'utf8').trim()).toBe('2');
+    } finally {
+      for (const [k, v] of [['WE_GH_READ_MEMO_DIR', saved.memo], ['WE_GH_THROTTLE_LOCK_ROOT', saved.root]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    }
   });
 });
