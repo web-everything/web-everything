@@ -484,6 +484,9 @@ export function runReviewTick({
     } else {
       plan = reconcile({ repo, defaultBranch });
     }
+    // A deferred PR read (gh low budget / slot throttle / author-lookup budget) planned NOTHING: that is "owed unknown",
+    // never "0 owed". Surface it on the reconcile-failed channel (tick line flags it) so the tick retries visibly.
+    if (plan?.deferred === true) throw new Error(`open-PR read deferred — owed unknown this tick: ${String(plan.message ?? plan.reason ?? 'deferred').split('\n')[0]}`);
   } catch (e) {
     return {
       reviewsOwed: 0, dispatched: [], failed: [], refusals: 0, deferredForLanes: 0,
@@ -1738,7 +1741,7 @@ export function buildCliDaemonEffects({
       // A `withSelfSync`-skipped tick (`skippedTick`: `repos: []`) used to print as "tick () — 0 owed", which read
       // like discovery had watched NO repo. Say what actually happened.
       if (result?.skipped) { log.error(`review-daemon: tick skipped (${result.reason ?? 'unknown'}) — no repo was read this tick`); return; }
-      log.error(`review-daemon: tick (${result.repos.map((r) => r.repo).join(', ')}) — ${result.reviewsOwed} owed, dispatched ${result.dispatched.length}, failed ${result.failed.length}${result.deferredForLanes ? `, deferred ${result.deferredForLanes} (no acquirable lane this tick, #3383)` : ''}${result.deferredForCap ? `, queued ${result.deferredForCap} (live-review cap: ${result.deferredForCapReason ?? 'maxLiveReviewRounds'})` : ''}`);
+      log.error(`review-daemon: tick (${result.repos.map((r) => r.repo).join(', ')}) — ${result.reviewsOwed} owed, dispatched ${result.dispatched.length}, failed ${result.failed.length}${result.deferredForLanes ? `, deferred ${result.deferredForLanes} (no acquirable lane this tick, #3383)` : ''}${result.deferredForCap ? `, queued ${result.deferredForCap} (live-review cap: ${result.deferredForCapReason ?? 'maxLiveReviewRounds'})` : ''}${result.reconcileFailed?.length ? `, LIST/RECONCILE FAILED ${result.reconcileFailed.length} repo(s) — "owed" is NOT trustworthy this tick` : ''}`);
       // card x5kagse (epic #4075/#3383) — logged EVERY tick review dispatch stays paused, exact wording
       // required by the card and matched by the soak scenario/live-proof read.
       // One structured record per successfully planned repository; the health watch's `operator-hold-aged` smell reads

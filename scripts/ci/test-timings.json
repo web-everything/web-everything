@@ -1655,6 +1655,7 @@
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
  "soak": {
+  "scripts/conveyor/soak/breaks/review-pr-list-504-reads-zero-owed.soak.test.mjs": 3.02,
   "scripts/conveyor/soak/breaks/agy-juror-shared-checkout-reset.soak.test.mjs": 1.85,
   "scripts/conveyor/soak/breaks/already-done-burst-unattributed.soak.test.mjs": 0.49,
   "scripts/conveyor/soak/breaks/already-done-recheck-burst-no-cooldown.soak.test.mjs": 1.68,
@@ -1706,6 +1707,7 @@
   "scripts/conveyor/soak/breaks/fix-daemon-lock-wait.soak.test.mjs": 30.42,
   "scripts/conveyor/soak/breaks/fixer-holds-turn-on-verify-wait.soak.test.mjs": 0.86,
   "scripts/conveyor/soak/breaks/fixer-wait-loop-undetected.soak.test.mjs": 0.46,
+  "scripts/conveyor/soak/breaks/fixing-tag-unverified-launch.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/gh-shim-mid-rebuild.soak.test.mjs": 30.85,
   "scripts/conveyor/soak/breaks/green-lane-pr-without-review-label-in-limbo.soak.test.mjs": 1.48,
   "scripts/conveyor/soak/breaks/hung-ci-cancel-run-not-found-loops.soak.test.mjs": 1.29,
@@ -1832,6 +1834,7 @@
   "scripts/conveyor/soak/breaks/merged-prepare-guard-measures-from-merge.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/needs-you-feed-disable.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/nightly-coroner-deadline-stop.soak.test.mjs": 1.4,
+  "scripts/conveyor/soak/breaks/nightly-coroner-never-judges.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/nightly-coroner-retained-failure.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/nightly-coroner-symlinked-lane.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/non-human-referral-hold-never-resumes.soak.test.mjs": 1.48,
