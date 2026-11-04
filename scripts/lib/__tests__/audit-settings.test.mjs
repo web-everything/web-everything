@@ -100,6 +100,23 @@ describe('audit settings (R528)', () => {
     expect(r.warnings.join()).not.toMatch(/\$note/);
     expect(resolve(full()).warnings).toEqual([]);
   });
+  it('a key that differs from a setting only by case fails that setting closed, never reads as omitted (PR #6381)', () => {
+    const top = resolveAuditSettings({ fileRead: file({ ReleaseStage: 'prod' }), platform: null, env: {}, log: () => {} });
+    expect(top.value.releaseStage).toBe('prod');
+    expect(top.sources.releaseStage).toBe('strictest');
+    expect(top.warnings.join()).toMatch(/releaseStage unreadable or invalid/);
+    const all = resolve(full({ releaseStage: 'prerelease', RELEASESTAGE: 'prerelease', recheck: { max: 1, Max: 1 }, Verdict: { mode: 'model' },
+      preExisting: { mode: 'block', baseRecheckMax: 3, BaseRecheckMax: 3 }, Cards: 'x' }));
+    expect(all.value).toMatchObject({ releaseStage: 'prod', recheckMax: 0, verdictMode: 'shadow', baseRecheckMax: 0 });
+    expect(all.sources).toMatchObject({ releaseStage: 'strictest', recheckMax: 'strictest', verdictMode: 'strictest', baseRecheckMax: 'strictest',
+      requireOnMain: 'strictest', requirePayBy: 'strictest' });
+    expect(all.sources.preExistingMode).toBe('file');
+    const plat = resolveAuditSettings({ fileRead: file(full()), platform: { releasestage: 'prod' }, env: {}, log: () => {} });
+    expect(plat.value.releaseStage).toBe('prod');
+    expect(plat.sources.releaseStage).toBe('strictest');
+    const hashes = resolve(full({ priorQuestionHashes: ['abcdef12'], PriorQuestionHashes: [] }));
+    expect(hashes.value.priorQuestionHashes).toEqual([]);
+  });
   it('empty-object path lists and hashes warn instead of vanishing silently', () => {
     const r = resolve(full({ raceBlockPaths: {}, guardFloorPaths: {}, priorQuestionHashes: {} }));
     expect(r.value.raceBlockPaths).toEqual(GUARD_FLOOR);

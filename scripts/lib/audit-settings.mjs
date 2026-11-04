@@ -64,6 +64,23 @@ function rawMalformed(layer, key, valid) {
   if (!isObj(layer[a])) return true;
   return Object.hasOwn(layer[a], b) && !valid(layer[a][b]);
 }
+/**
+ * A key that differs from a setting only by letter case (`ReleaseStage`, `recheck.Max`, `Verdict.mode`) is an explicit
+ * choice the cascade cannot see: it would read as omitted and earn the default. It fails that setting closed instead.
+ * Other misspellings (`verdicts`) cannot be mapped to a setting; they are only named by `unknownKeys`.
+ */
+function caseShadowed(layer, key) {
+  if (!isObj(layer)) return false;
+  const [a, b] = pathOf(key);
+  const fold = s => s.toLowerCase();
+  for (const [ka, x] of Object.entries(layer)) {
+    if (fold(ka) !== fold(a)) continue;
+    if (b === undefined) { if (ka !== a) return true; continue; }
+    if (!isObj(x)) { if (ka !== a) return true; continue; }
+    for (const kb of Object.keys(x)) if (fold(kb) === fold(b) && (ka !== a || kb !== b)) return true;
+  }
+  return false;
+}
 const KNOWN = (() => {
   const m = new Map();
   for (const key of [...Object.keys(STRICTEST), 'raceBlockPaths', 'guardFloorPaths', 'priorQuestionHashes']) {
@@ -126,7 +143,7 @@ export function resolveAuditSettings({ path = AUDIT_SETTINGS_PATH, fileRead = re
     if (unknown.length) warn(`audit ${name} layer has unknown setting(s) ${JSON.stringify(unknown.slice(0, 20))}; ignored (check the spelling)`);
   }
   // Malformed RAW entries in either layer (raw only: the platform-level fault above is reported once, not per key).
-  const malformed = (key, valid) => [plat, tool].some(layer => rawMalformed(layer, key, valid));
+  const malformed = (key, valid) => [plat, tool].some(layer => rawMalformed(layer, key, valid) || caseShadowed(layer, key));
   const value = {}; const sources = {};
   for (const key of Object.keys(DEFAULTS)) {
     let v = get(layered, key); let src = 'file';
