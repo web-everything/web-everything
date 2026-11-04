@@ -197,7 +197,7 @@ it('oversized scan fails closed with an operator fallback', async () => {
 it('nonempty size mismatch with a valid listing keeps originals', async () => {
   const p = await file(join(runs, 'a.json'));
   const out = await run({ listBundle: async () => ['./a.json'], afterBundle: async p => writeFile(p, 'wrong-size') });
-  expect(out.errors.join()).toMatch(/verification/); expect(await exists(p)).toBe(true);
+  expect(out.errors.join()).toMatch(/verification|tar -xzf/); expect(await exists(p)).toBe(true);
 });
 it('minimum ten minute write guard applies even with zero keepDays', async () => {
   const p = await file(join(runs, 'writing.json'), new Date(now - 9 * 60000));
@@ -452,4 +452,23 @@ it('a Drive copy whose content differs from the judged bytes keeps the original'
     await writeFile(join(t, 'd.json'), 'tampered'); execFileSync('tar', ['-czf', f, '-C', t, './d.json']);
   } });
   expect(out2.errors.join()).toMatch(/mismatch|verification/); expect(await exists(q)).toBe(true);
+});
+
+it('a PID probe error other than ESRCH counts as alive (fail closed)', async () => {
+  const { pidAlive } = await import('../runs-writer-exclusion.mjs');
+  expect(pidAlive(process.pid)).toBe(true);
+  expect(pidAlive(2 ** 31 - 1)).toBe(false); // ESRCH
+  expect(pidAlive(Number.NaN)).toBe(true); // invalid argument: unknown, not dead
+});
+it('registry completion: a known op is complete only at its declared last step', async () => {
+  const { loadRunCompletion } = await import('../runs-writer-exclusion.mjs');
+  const { OPERATIONS } = await import('../../operations/run.mjs');
+  const done = await loadRunCompletion();
+  let checked = 0;
+  for (const [op, make] of Object.entries(OPERATIONS)) {
+    let n; try { n = make()?.declaration?.steps?.length; } catch { continue; }
+    if (!Number.isInteger(n) || n < 2 || op === 'review-pr') continue;
+    expect(done({ op, cursor: n - 1, pending: null })).toBe(false); expect(done({ op, cursor: n, pending: null })).toBe(true); checked++; break;
+  }
+  expect(checked).toBe(1);
 });

@@ -11,7 +11,7 @@ import { isRunRecordTerminal } from '../operations/run-store.mjs';
 import { parseRunRecord } from '../operations/run-record.mjs';
 
 export const pidAlive = (pid) => {
-  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code !== 'ESRCH'; } // only ESRCH proves dead; EPERM/EINVAL/other = unknown = alive
 };
 const TMP = /^(.+?)\.(\d+)\.[^/]+\.tmp$/;
 // writeJsonAtomic: `<name>.<pid>.<Date.now()>.<random>.tmp` (plus the run-store `<dest>.<pid>.<uuid>.tmp` form).
