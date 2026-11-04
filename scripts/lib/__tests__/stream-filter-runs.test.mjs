@@ -80,6 +80,12 @@ it('continues the same scan after a match without rereads or exceeding the share
   expect(find(() => true)).toMatchObject({ ok: false, reason: 'scan-capped' });
   expect(reads).toBe(MAX_RUN_RECORDS_PARSED);
 });
+it('tells keep the mtime of the first unscanned candidate so a caller can stop early', () => {
+  const seen = [];
+  const find = createNewestRunFinder({ ids: ['1', '2', '3'], stat: id => ({ mtimeMs: Number(id) * 10 }), read: id => id, maxParses: 5 });
+  expect(find((run, id, at, nextAt) => { seen.push([id, at, nextAt]); return false; })).toBeNull();
+  expect(seen).toEqual([['3', 30, 20], ['2', 20, 10], ['1', 10, -Infinity]]);
+});
 it('refuses unknown mtimes', () => {
   expect(() => findNewestMatchingRun({ ids: ['a'], stat: () => ({ mtimeMs: NaN }) })).toThrow('unreadable mtime');
 });
@@ -102,6 +108,16 @@ describe('runs.scan.maxParses policy setting', () => {
     const tool = resolveRunScanSettings({ file: { runs: { scan: { maxParses: 2 } } }, platform: { scan: { maxParses: 7 } }, env: {} });
     expect(tool.value.scan.maxParses).toBe(2);
     expect(tool.sources['scan.maxParses']).toBe('tool');
+  });
+  it('scan budget exposes no environment override', () => {
+    const env = { WE_RUNS_SCAN_MAX_PARSES: '5000', RUNS_SCAN_MAX_PARSES: '5000', WE_RUNS_SCAN_MAXPARSES: '5000',
+      WE_POLICY_RUNS: JSON.stringify({ scan: { maxParses: 5000 } }) };
+    const standard = resolveRunScanSettings({ file: {}, platform: {}, env });
+    expect(standard.value.scan.maxParses).toBe(300);
+    expect(standard.sources['scan.maxParses']).toBe('standard');
+    const platform = resolveRunScanSettings({ file: {}, platform: { scan: { maxParses: 7 } }, env });
+    expect(platform.value.scan.maxParses).toBe(7);
+    expect(platform.sources['scan.maxParses']).toBe('platform');
   });
   it.each([0, -1, 1.5, '4', null, Infinity])('rejects invalid maxParses=%s, keeping the valid lower layer', maxParses => {
     const resolved = resolveRunScanSettings({ file: { runs: { scan: { maxParses } } }, platform: { scan: { maxParses: 7 } }, env: {} });

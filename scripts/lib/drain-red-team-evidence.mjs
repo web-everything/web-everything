@@ -4,7 +4,7 @@ import { closeSync, mkdirSync, openSync, readFileSync, rmSync, statSync } from '
 import { dirname, join } from 'node:path';
 import { hostname } from 'node:os';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
-import { listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operations/run-store.mjs';
+import { isRunRecordTerminal, listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operations/run-store.mjs';
 import { createNewestRunFinder } from './stream-filter-runs.mjs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
@@ -61,45 +61,84 @@ const reviewStartedAt = hit => {
 const unfinishedReview = run => !run.verdict || run.pending != null
   || run.effects?.some(effect => ['pending', 'in-flight'].includes(effect?.status));
 
+// A run record is written after its read step starts, so its mtime bounds that start from above.
+// The slack covers filesystems that store mtime at 1-2 s granularity.
+export const RUN_MTIME_SLACK_MS = 2000;
+// A verdict-less record that run-store calls terminal (nothing pending or in flight) and that has not
+// been written for this long is an abandoned attempt (a crash or kill): it is neither evidence nor an
+// unfinished review. A run waiting on a pending step or effect is never abandoned, however old.
+export const ABANDONED_REVIEW_AFTER_MS = 60 * 60 * 1000;
+const abandonedReview = (hit, now) => !hit.run.verdict && isRunRecordTerminal(hit.run) && now - hit.at >= ABANDONED_REVIEW_AFTER_MS;
+const TIE_ORDERS = ['id-asc', 'id-desc'];
+
 // Retain only the selected head/PR payloads and the newest unfinished attempt. Finished
-// evidence is usable only after the same bounded window rules out a newer unfinished run.
-function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak = 'id-asc', scanSettings, warn }) {
-  let scanned = false, newest = null, exact = null, unfinished = null, failure = null;
-  const newer = (candidate, selected) => !selected
-    || reviewStartedAt(candidate) > reviewStartedAt(selected)
-    || (reviewStartedAt(candidate) === reviewStartedAt(selected)
-      && (tieBreak === 'id-desc' ? candidate.id.localeCompare(selected.id) > 0 : candidate.id < selected.id));
-  return (exactHead = true) => {
-    if (!scanned) {
-      const find = createNewestRunFinder({ ids: list(runsDir).filter(id => id.startsWith('review-pr-')), tieBreak,
-        stat: id => stat(join(runsDir, `${id}.json`)), read: id => read(id, runsDir), scanSettings, warn });
-      let samePrCount = 0, startMissing = false;
-      const end = find((run, id, at) => {
-        if (run?.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr)) return false;
+// evidence is usable only once the scan rules out a newer unfinished run. The scan stops as
+// soon as every unread record was last written before the exact-head match started (so none
+// of them can have started after it); otherwise it reads up to the shared parse cap.
+// One scan serves both tie orders, so a caller's fallback shares this scan's parse budget.
+function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak = 'id-asc', scanSettings, warn, now = Date.now() }) {
+  if (!TIE_ORDERS.includes(tieBreak)) throw new TypeError('unknown run tieBreak');
+  // A run with a read start outranks a start-less one; start-less runs are ordered by the checks below.
+  const newerBy = order => (candidate, selected) => {
+    if (!selected) return true;
+    const c = reviewStartedAt(candidate), s = reviewStartedAt(selected);
+    if (!Number.isFinite(c) || !Number.isFinite(s)) return Number.isFinite(c);
+    return c > s || (c === s && (order === 'id-desc' ? candidate.id.localeCompare(selected.id) > 0 : candidate.id < selected.id));
+  };
+  let scan = null;
+  const failures = new Map();
+  const runScan = () => {
+    const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, unfinished: null }]));
+    const startless = []; // ids and mtimes only, never payloads
+    let count = 0;
+    const find = createNewestRunFinder({ ids: list(runsDir).filter(id => id.startsWith('review-pr-')), tieBreak,
+      stat: id => stat(join(runsDir, `${id}.json`)), read: id => read(id, runsDir), scanSettings, warn });
+    const end = find((run, id, at, nextAt) => {
+      if (run?.op === 'review-pr' && run.input?.repo === repo && Number(run.input?.pr) === Number(pr)) {
         const hit = { run, id, at };
-        samePrCount++;
-        if (!Number.isFinite(reviewStartedAt(hit))) startMissing = true;
-        if (newer(hit, newest)) newest = hit;
-        if (run.findings?.read?.netBasis?.rev === head && newer(hit, exact)) exact = hit;
-        if (unfinishedReview(run) && newer(hit, unfinished)) unfinished = hit;
-        return false;
-      });
-      const selected = exact ?? newest;
-      if (samePrCount > 1 && startMissing) {
-        failure = { ok: false, reason: 'run-start-missing' };
-      } else if (unfinished && (!selected || unfinished === selected || reviewStartedAt(unfinished) >= reviewStartedAt(selected))) {
-        failure = { ok: false, reason: 'review-unfinished' };
-      } else if (end?.ok === false) failure = end;
-      scanned = true;
+        if (!abandonedReview(hit, now)) {
+          count++;
+          if (!Number.isFinite(reviewStartedAt(hit))) startless.push({ id, at });
+          for (const slot of Object.values(slots)) {
+            if (slot.newer(hit, slot.newest)) slot.newest = hit;
+            if (run.findings?.read?.netBasis?.rev === head && slot.newer(hit, slot.exact)) slot.exact = hit;
+            if (unfinishedReview(run) && slot.newer(hit, slot.unfinished)) slot.unfinished = hit;
+          }
+        }
+      }
+      // Equal starts share one start time, so either tie order gives the same bound.
+      const exact = slots[tieBreak].exact;
+      return exact !== null && reviewStartedAt(exact) > nextAt + RUN_MTIME_SLACK_MS;
+    });
+    scan = { slots, startless, count, end };
+  };
+  const failureFor = order => {
+    const { newest, exact, unfinished } = scan.slots[order];
+    const selected = exact ?? newest;
+    const selectedStart = selected ? reviewStartedAt(selected) : NaN;
+    // A start-less run last written before the selected run started is older; any other cannot be ordered.
+    if (scan.count > 1 && (!Number.isFinite(selectedStart)
+      || scan.startless.some(other => !(other.at + RUN_MTIME_SLACK_MS < selectedStart)))) {
+      return { ok: false, reason: 'run-start-missing' };
     }
-    return failure ?? (exactHead ? exact : newest) ?? { run: null, at: 0 };
+    if (unfinished && (!selected || unfinished.id === selected.id || reviewStartedAt(unfinished) >= selectedStart)) {
+      return { ok: false, reason: 'review-unfinished' };
+    }
+    return scan.end?.ok === false ? scan.end : null;
+  };
+  return (exactHead = true, order = tieBreak) => {
+    if (!TIE_ORDERS.includes(order)) throw new TypeError('unknown run tieBreak');
+    if (!scan) runScan();
+    if (!failures.has(order)) failures.set(order, failureFor(order));
+    const slot = scan.slots[order];
+    return failures.get(order) ?? (exactHead ? slot.exact : slot.newest) ?? { run: null, at: 0 };
   };
 }
 
 /** Raw, head-scoped evidence only. Never select an older accepting verdict over a newer rejection. */
 // Match resolveRunsDir's override precedence without migrating runs during a raw read.
 export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir = env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(env),
-  list = listRunIds, read = readRun, stat = statSync, scanSettings = { env }, warn,
+  list = listRunIds, read = readRun, stat = statSync, scanSettings = { env }, warn, now = Date.now(),
   readScorecards = () => readStore({ path: resolveScorecardStorePath(env), strict: true }).records } = {}) {
   const key = { repo, pr, head }, path = statusPath(key, env), bytes = optionalBytes(path);
   const parsed = bytes === null ? null : JSON.parse(bytes);
@@ -107,14 +146,16 @@ export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir
   const records = readScorecards();
   const seats = records.filter(r => r.dispatchKind === 'review-seat' && r.seat === 'red-team'
     && r.repo === repo && Number(r.pr) === Number(pr) && r.rev === head);
-  const lookup = reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak: 'id-desc', scanSettings, warn });
+  const lookup = reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak: 'id-desc', scanSettings, warn, now });
   const latest = lookup();
   if (latest.ok === false) return latest;
   const newest = latest.run ? { id: latest.id, run: latest.run, at: latest.at } : null;
   const marker = optionalBytes(`${path}.stale-redispatch-1`);
   return { ...key, rawWriter: { bytes, parsed, sha256: digest(bytes) }, seats, newest: newest?.run ?? null,
     // Preserve the existing policy-only carry surface; it never supplies a stale recovery payload.
-    ...(newest ? {} : { carryEvidence: readDrainRedTeamEvidence({ ...key, env, runsDir, list, read, stat, scanSettings, warn, readScorecards: () => records }) }),
+    // The fallback reuses this scan (one parse budget) but reads it in the drain's ascending tie order.
+    ...(newest ? {} : { carryEvidence: readDrainRedTeamEvidence({ ...key, env, runsDir, list, read, stat, scanSettings, warn, now,
+      lookup: (exactHead = true) => lookup(exactHead, 'id-asc'), readScorecards: () => records }) }),
     evidenceSha256: digest(JSON.stringify([seats, newest])),
     markers: { redispatch: marker === null ? null : JSON.parse(marker), retry: retryMarkerSpent(path) } };
 }
@@ -253,7 +294,7 @@ export function historicalCardOnlySkipCandidate(old) {
 
 /** Absence of a review payload is not an accept. Labels alone never schedule a post-accept pass. */
 export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
-  runsDir = resolveRunsDir(), list = listRunIds, read = readRun, stat = statSync, lookup, scanSettings = { env }, warn, isAlive = pidAlive, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime,
+  runsDir = resolveRunsDir(), list = listRunIds, read = readRun, stat = statSync, lookup, scanSettings = { env }, warn, now = Date.now(), isAlive = pidAlive, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime,
   readScorecards = () => readStore({ path: resolveScorecardStorePath(env) }).records } = {}) {
   const seats = readScorecards().filter(row => row.dispatchKind === 'review-seat' && row.seat === 'red-team'
     && row.repo === repo && Number(row.pr) === Number(pr) && row.rev === head);
@@ -261,7 +302,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   const seatEvidence = { seatRecorded: recorded, completedRecorded: seats.some(completedRedTeamSeat),
     failedSeatCount: seats.filter(row => !completedRedTeamSeat(row)).length };
   // The parse cap covers historical and recovery fallbacks too.
-  const latestRun = lookup ?? reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, scanSettings, warn });
+  const latestRun = lookup ?? reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, scanSettings, warn, now });
   // The review loop applies the accept labels before the job can write a status, so a persisted accepting run that
   // owes a pass holds until the job's status supersedes it. It is not a live queue entry: the drain's
   // never-scheduled deadline still applies when no job ever picks it up.
@@ -332,7 +373,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     const older = olderHit.run;
     const oldHead = older?.findings?.read?.netBasis?.rev;
     if (oldHead && oldHead !== head && redTeamCardOnly(older.findings.read)) {
-      const old = readDrainRedTeamEvidence({ repo, pr, head: oldHead, env, runsDir, list, read, stat, lookup: () => olderHit, scanSettings, warn,
+      const old = readDrainRedTeamEvidence({ repo, pr, head: oldHead, env, runsDir, list, read, stat, lookup: () => olderHit, scanSettings, warn, now,
         isAlive, host, namespace, readPidStart, readScorecards });
       if (historicalCardOnlySkipCandidate(old)) return old;
     }

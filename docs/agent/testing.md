@@ -3922,12 +3922,20 @@ The shared finder continues from its cursor; it never retains a folder of payloa
 budget before completion returns `{ok:false, reason:"scan-capped"}` and logs the limit/source. The
 enqueue gate, status labels and recovery scheduler hold on unknown evidence. Inspect omitted run
 records before deliberately raising the limit. Genuine folder exhaustion still means no match.
-Finished evidence requires scanning the bounded window to rule out a newer unfinished re-review;
-choose both head-specific and any-head matches by read-step `startedAt`, never file mtime.
-Equal starts retain the drain's ascending / recovery's descending ID tie order. Two or more
-same-repo/PR runs with any missing/unparseable start return `run-start-missing` and hold; a
-single run needs no ordering and remains usable without a timestamp. A newer
-unfinished attempt holds as `review-unfinished`; unreadable records still throw, never skip.
+Choose both head-specific and any-head matches by read-step `startedAt`, never file mtime.
+A record is written after its read step starts, so its mtime is an upper bound on that start.
+The scan therefore stops early, well below the cap, once every unread record was last written
+more than 2 s (`RUN_MTIME_SLACK_MS`) before the exact-head match started: none of them can be a
+newer run. A match whose start cannot rule out the omitted records still holds as `scan-capped`.
+Recovery's carry fallback reuses the same scan, so one recovery read stays inside one parse budget.
+Equal starts retain the drain's ascending / recovery's descending ID tie order. A start-less
+same-PR run last written before the selected run started is older and ignored; any other start-less
+run among two or more returns `run-start-missing` and holds. A single run needs no ordering and
+remains usable without a timestamp. A newer unfinished attempt holds as `review-unfinished`.
+A verdict-less run that run-store calls terminal (nothing pending or in flight) and that has not been
+written for an hour (`ABANDONED_REVIEW_AFTER_MS`) is abandoned: it is neither evidence nor unfinished,
+so a crashed re-review cannot hold a PR forever. A run waiting on a pending step or effect is never
+abandoned. Unreadable records still throw, never skip.
 
 The scoped regressions are `drain-red-team-evidence`, `stream-filter-runs`, and the settings layout
 test `settings-files`; use heavy admission.

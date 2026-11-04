@@ -503,16 +503,51 @@ it.each([['unparseable', 1, false], ['error', 1, false], ['ok', 0, true]])(
 import { readRecoveryWitness } from '../drain-red-team-evidence.mjs';
 import { MAX_RUN_RECORDS_PARSED } from '../stream-filter-runs.mjs';
 describe('bounded review evidence scans', () => {
-  it.each([['drain', readDrainRedTeamEvidence], ['recovery', readRecoveryWitness]])('%s holds a finished match when a 5000-run window cannot exclude a newer unfinished review', (_name, reader) => {
+  // Records 10 s apart by mtime. A record is written after its read step starts, so its mtime bounds that start.
+  const big = { list: () => Array.from({ length: 5000 }, (_, i) => `review-pr-${i}`),
+    stat: path => ({ mtimeMs: Number(path.match(/review-pr-(\d+)/)[1]) * 10_000 }) };
+  const startedAt = ms => ({ stepTimings: [{ step: 'read', startedAt: new Date(ms).toISOString() }] });
+  it.each([['drain', readDrainRedTeamEvidence], ['recovery', readRecoveryWitness]])('%s resolves the newest finished exact-head run among 5000 records without reaching the cap', (_name, reader) => {
     const f = fixture();
     let reads = 0;
-    const run = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head) };
-    const result = reader({ ...f, list: () => Array.from({ length: 5000 }, (_, i) => `review-pr-${i}`),
-      stat: path => ({ mtimeMs: Number(path.match(/review-pr-(\d+)/)[1]) }),
-      read: id => { reads++; return id === 'review-pr-4999' ? run : null; } });
+    const run = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head), ...startedAt(4999 * 10_000 - 1000) };
+    const result = reader({ ...f, ...big, read: id => { reads++; return id === 'review-pr-4999' ? run : null; } });
+    expect(result.ok).not.toBe(false);
+    expect(result.newest ?? result.loopPayload).toEqual(run);
+    expect(reads).toBe(1);
+  });
+  it.each([['drain', readDrainRedTeamEvidence], ['recovery', readRecoveryWitness]])('%s stops as soon as no unscanned record can have started after the match', (_name, reader) => {
+    const f = fixture();
+    let reads = 0;
+    // The match started 35 s before its own last write, so the three newer-by-mtime records must be read first.
+    const run = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head), ...startedAt(4996 * 10_000 - 1000) };
+    const result = reader({ ...f, ...big, read: id => { reads++; return id === 'review-pr-4996' ? run : null; } });
+    expect(result.newest ?? result.loopPayload).toEqual(run);
+    expect(reads).toBe(4);
+  });
+  it.each([['drain', readDrainRedTeamEvidence], ['recovery', readRecoveryWitness]])('%s holds when the newest exact-head match lies outside the parse window', (_name, reader) => {
+    const f = fixture();
+    let reads = 0;
+    const run = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head), ...startedAt(0) };
+    const result = reader({ ...f, ...big, read: id => { reads++; return id === 'review-pr-0' ? run : null; } });
+    expect(result).toMatchObject({ ok: false, reason: 'scan-capped' });
+    expect(reads).toBe(MAX_RUN_RECORDS_PARSED);
+  });
+  it.each([['drain', readDrainRedTeamEvidence], ['recovery', readRecoveryWitness]])('%s holds a match touched late whose old start cannot rule out the omitted records', (_name, reader) => {
+    const f = fixture();
+    let reads = 0;
+    const run = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head), ...startedAt(1000) };
+    const result = reader({ ...f, ...big, read: id => { reads++; return id === 'review-pr-4999' ? run : null; } });
     expect(result).toMatchObject({ ok: false, reason: 'scan-capped' });
     expect(redTeamEnqueueHold({ ...f, ...result, comments: [] })).toMatch(/scan-capped/);
     expect(reads).toBe(MAX_RUN_RECORDS_PARSED);
+  });
+  it.each([['drain', readDrainRedTeamEvidence], ['recovery', readRecoveryWitness]])('%s still holds for a newer unfinished re-review found before the early stop', (_name, reader) => {
+    const f = fixture();
+    const accepted = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head), ...startedAt(4998 * 10_000 - 1000) };
+    const unfinished = { ...accepted, verdict: null, pending: { kind: 'judge' }, effects: [], ...startedAt(4999 * 10_000 - 1000) };
+    const result = reader({ ...f, ...big, read: id => ({ 'review-pr-4999': unfinished, 'review-pr-4998': accepted })[id] ?? null });
+    expect(result).toMatchObject({ ok: false, reason: 'review-unfinished' });
   });
   it.each([['drain', readDrainRedTeamEvidence], ['recovery', readRecoveryWitness]])('%s explicitly holds beyond the parse cap, including fallback scans', (_name, reader) => {
     const f = fixture();
@@ -592,6 +627,16 @@ describe('fail-closed run scan evidence', () => {
       setting: { enabled: true }, lastDispatch: new Map(), now: 0 });
     expect(rows[0]).toMatchObject({ action: 'skip', why: 'scan-capped' });
   });
+  it.each(['scan-capped', 'review-unfinished', 'run-start-missing'])('skipped-PR scheduling skips one PR on a %s witness instead of reading its writer', reason => {
+    const f = fixture();
+    let evidenceReads = 0;
+    const rows = planRedTeamOnSkip({ repo: f.repo, refusals: [{ kind: 'already-reviewed-head', prNumber: f.pr }],
+      rawPrs: [{ number: f.pr, headRefOid: f.head, comments: [], labels: ['review:accepted'] }],
+      readWitness: () => ({ ok: false, reason }), readEvidence: () => { evidenceReads++; return {}; }, readStatus: () => null,
+      setting: { enabled: true }, lastDispatch: new Map(), now: 0 });
+    expect(rows[0]).toMatchObject({ action: 'skip', why: reason });
+    expect(evidenceReads).toBe(0);
+  });
 });
 
 import { planRedTeamStatusLabels } from '../red-team-status-labels.mjs';
@@ -611,11 +656,85 @@ it('an older unfinished review does not replace a logically newer finished panel
   expect(result.loopPayload).toEqual(completed);
 });
 
-describe('readRecoveryWitness carryEvidence keeps the drain tie order', () => {
-  it('does not reuse the recovery id-desc lookup for the drain fallback', () => {
-    const src = readFileSync(new URL('../drain-red-team-evidence.mjs', import.meta.url), 'utf8');
-    const call = src.split('carryEvidence: readDrainRedTeamEvidence(')[1].split('\n')[0];
-    expect(call).not.toMatch(/\blookup\b/);
+describe('readRecoveryWitness carryEvidence shares the scan but keeps the drain tie order', () => {
+  it('recovery fallback shares the total parse budget', () => {
+    const f = fixture();
+    let reads = 0;
+    const other = { op: 'review-pr', input: { repo: f.repo, pr: f.pr + 1 }, ...payload(f.head) };
+    const result = readRecoveryWitness({ ...f, list: () => Array.from({ length: 200 }, (_, i) => `review-pr-${i}`),
+      stat: path => ({ mtimeMs: Number(path.match(/review-pr-(\d+)/)[1]) }), read: () => { reads++; return other; } });
+    expect(result.newest).toBeNull();
+    expect(result.carryEvidence).toBeDefined();
+    expect(reads).toBe(200);
+  });
+  it('the drain fallback breaks equal starts by ascending id, unlike recovery', () => {
+    const f = fixture(), from = 'c'.repeat(40);
+    recordRedTeamStatus({ ...f, loopPayload: { ...payload(f.head), carriedFrom: from }, status: 'finished', result: 'skipped' }, f);
+    const start = { stepTimings: [{ step: 'read', startedAt: new Date(1000).toISOString() }] };
+    // Ascending id selects the carried-from panel; descending would select the later-head panel (a carry conflict).
+    const runs = { 'review-pr-a': { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(from), ...start },
+      'review-pr-b': { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload('d'.repeat(40)), ...start } };
+    let reads = 0;
+    const args = { ...f, list: () => Object.keys(runs), stat: () => ({ mtimeMs: 5000 }), read: id => { reads++; return runs[id]; } };
+    expect(readDrainRedTeamEvidence(args).carryConflict).toBeFalsy();
+    reads = 0;
+    const witness = readRecoveryWitness(args);
+    expect(witness.carryEvidence.carryConflict).toBeFalsy();
+    expect(reads).toBe(2);
+  });
+});
+
+describe('abandoned and start-less review runs have a defined outcome', () => {
+  const started = ms => ({ stepTimings: [{ step: 'read', startedAt: new Date(ms).toISOString() }] });
+  const HOUR = 60 * 60 * 1000;
+  const both = [['drain', readDrainRedTeamEvidence], ['recovery', readRecoveryWitness]];
+  const setup = (f, other, otherAt) => {
+    const accepted = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head), pending: null, effects: [], ...started(10_000) };
+    const runs = { 'review-pr-accepted': accepted, 'review-pr-other': other(accepted) };
+    return { accepted, args: { ...f, list: () => Object.keys(runs), read: id => runs[id],
+      stat: path => ({ mtimeMs: path.includes('other') ? otherAt : 12_000 }) } };
+  };
+  it.each(both)('%s ignores a start-less record written before the selected run started', (_name, reader) => {
+    const f = fixture();
+    // A record that predates stepTimings: its last write precedes the accepted run's read start.
+    const { accepted, args } = setup(f, a => ({ op: 'review-pr', input: a.input, ...payload(f.head), verdict: { verdict: 'changes' } }), 5_000);
+    const result = reader(args);
+    expect(result.ok).not.toBe(false);
+    expect(result.newest ?? result.loopPayload).toEqual(accepted);
+  });
+  it.each(both)('%s holds a recent start-less record that may have started after the selected run', (_name, reader) => {
+    const f = fixture();
+    const { args } = setup(f, a => ({ op: 'review-pr', input: a.input, verdict: null, pending: null, effects: [], findings: {} }), 20_000);
+    expect(reader({ ...args, now: 20_000 + 60_000 })).toEqual({ ok: false, reason: 'run-start-missing' });
+  });
+  it.each(both)('%s ignores a run that crashed before its read step once it is abandoned', (_name, reader) => {
+    const f = fixture();
+    const { accepted, args } = setup(f, a => ({ op: 'review-pr', input: a.input, verdict: null, pending: null, effects: [], findings: {} }), 20_000);
+    const result = reader({ ...args, now: 20_000 + HOUR });
+    expect(result.ok).not.toBe(false);
+    expect(result.newest ?? result.loopPayload).toEqual(accepted);
+  });
+  it.each(both)('%s holds a newer verdict-less run while it may still be live, then ignores it once abandoned', (_name, reader) => {
+    const f = fixture();
+    const { accepted, args } = setup(f, a => ({ ...a, verdict: null, ...started(15_000) }), 20_000);
+    expect(reader({ ...args, now: 20_000 + 60_000 })).toEqual({ ok: false, reason: 'review-unfinished' });
+    const result = reader({ ...args, now: 20_000 + HOUR });
+    expect(result.ok).not.toBe(false);
+    expect(result.newest ?? result.loopPayload).toEqual(accepted);
+  });
+  it.each(both)('%s never treats a run still waiting on a pending step or effect as abandoned', (_name, reader) => {
+    const f = fixture();
+    for (const waiting of [{ pending: { kind: 'judge' } }, { effects: [{ status: 'in-flight' }] }]) {
+      const { args } = setup(f, a => ({ ...a, verdict: null, ...waiting, ...started(15_000) }), 20_000);
+      expect(reader({ ...args, now: 20_000 + 30 * 24 * HOUR })).toEqual({ ok: false, reason: 'review-unfinished' });
+    }
+  });
+  it.each(both)('%s keeps an older stale verdict-less run from blocking a newer finished accept', (_name, reader) => {
+    const f = fixture();
+    const { accepted, args } = setup(f, a => ({ ...a, verdict: null, ...started(1_000) }), 2_000);
+    const result = reader({ ...args, now: 20_000 });
+    expect(result.ok).not.toBe(false);
+    expect(result.newest ?? result.loopPayload).toEqual(accepted);
   });
 });
 

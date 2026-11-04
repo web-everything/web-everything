@@ -52,6 +52,8 @@ export function resolveRunScanSettings({ file = readSettings(), platform, env = 
 
 /** Stat only before ordering. The finder retains metadata and a cursor, never parsed
  * payloads. Repeated queries continue the SAME bounded scan, stopping at each first match.
+ * `keep(run, id, at, nextAt)` also gets the mtime of the first record not yet read (-Infinity
+ * when none is left), so a caller can stop once no unread record can change its answer.
  * Equal mtimes use id ascending by default (drain); recovery opts into id-desc.
  * Unreadable metadata/records throw rather than supplying incomplete accepting evidence. */
 export function createNewestRunFinder({ ids, stat, read, tieBreak = 'id-asc', maxParses,
@@ -71,7 +73,7 @@ export function createNewestRunFinder({ ids, stat, read, tieBreak = 'id-asc', ma
     for (; cursor < Math.min(candidates.length, maxParses);) {
       const { id, at } = candidates[cursor++];
       const run = read(id);
-      if (keep(run, id, at)) return { id, at, run };
+      if (keep(run, id, at, cursor < candidates.length ? candidates[cursor].at : -Infinity)) return { id, at, run };
     }
     if (cursor < candidates.length) {
       if (!warned) {
