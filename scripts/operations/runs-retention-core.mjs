@@ -121,18 +121,13 @@ export function runsRetention(o = {}) {
   const out = { status: dryRun ? 'dry-run' : 'archived', dryRun, scanned: 0, eligible: 0, eligibleBytes: 0,
     kept: { young: 0, nonTerminal: 0, resumable: 0, unreadable: 0 }, archived: 0, deleted: 0, bytesFreed: 0, archives: [], errors: [], months: {} };
   const cutoff = Math.min(now - settings.keepDays * DAY, now - 600000); // never younger than 10 minutes
-  // Crash recovery: a record parked under .retiring-* by an interrupted pass goes back to its canonical name.
-  if (!dryRun) for (const name of existsSync(dir) ? readdirSync(dir) : []) {
-    const m = /^\.retiring-(.+)\.[0-9a-f-]{36}$/.exec(name);
-    if (m) { try { linkSync(join(dir, name), runPath(m[1], dir)); unlinkSync(join(dir, name)); } catch { /* canonical exists: leave the parked copy for an operator */ } }
-  }
   const ids = listRunIds(dir);
   out.scanned = ids.length;
   const byMonth = new Map();
   for (const id of ids) {
     let st;
     try { st = lstatSync(runPath(id, dir)); } catch { out.kept.unreadable++; continue; }
-    if (!st.isFile() || st.mtimeMs >= cutoff) { out.kept.young++; continue; }
+    if (!st.isFile() || st.nlink > 1 || st.mtimeMs >= cutoff) { out.kept.young++; continue; } // hard-linked records can be reached outside the dir: retained
     const month = monthOf(st.mtimeMs);
     if (o.month && month !== o.month) continue;
     // ONE read: eligibility and the content hash come from the same bytes.
@@ -157,7 +152,10 @@ export function runsRetention(o = {}) {
   if (dryRun || !out.eligible) { if (!dryRun) out.status = 'nothing-to-do'; return out; }
 
   // The archive target must already be mounted: never create the cloud-storage root locally.
-  const srcReal = realpathSync(dir), dstProbe = resolve(settings.archiveDir);
+  const srcReal = realpathSync(dir);
+  let dstProbe = resolve(settings.archiveDir), tail = '';
+  while (!existsSync(dstProbe) && dirname(dstProbe) !== dstProbe) { tail = join(basename(dstProbe), tail); dstProbe = dirname(dstProbe); }
+  dstProbe = join(realpathSync(dstProbe), tail);
   if (dstProbe === srcReal || dstProbe.startsWith(srcReal + '/') || srcReal.startsWith(dstProbe + '/')) {
     out.status = 'skipped'; out.errors.push('source and archive overlap; originals retained'); return out;
   }
@@ -172,6 +170,11 @@ export function runsRetention(o = {}) {
   catch (e) { out.status = 'skipped'; out.errors.push(`archive busy or unwritable (${e.code}); originals retained`); return out; }
   try { return archiveAll(); } finally { rmdirSync(lockDir); }
   function archiveAll() {
+  // Crash recovery (under the archive lock, so a live pass's quarantine is never exposed): a record parked under .retiring-* by an interrupted pass goes back to its canonical name.
+  for (const name of existsSync(dir) ? readdirSync(dir) : []) {
+    const m = /^\.retiring-(.+)\.[0-9a-f-]{36}$/.exec(name);
+    if (m) { try { linkSync(join(dir, name), runPath(m[1], dir)); unlinkSync(join(dir, name)); } catch { /* canonical exists: leave the parked copy for an operator */ } }
+  }
   const maxBytes = settings.batchMaxGiB * GIB, maxCompressed = settings.batchMaxCompressedGiB * GIB;
   for (const [month, files] of [...byMonth].sort()) {
     files.sort((a, b) => a.mtimeMs - b.mtimeMs || a.id.localeCompare(b.id));

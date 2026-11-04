@@ -123,10 +123,10 @@ describe('runsRetention', () => {
   });
 
   it('restores a record parked by an interrupted pass', () => {
-    put('run-x', 1);
+    put('run-x', 1); put('run-old', 30);
     renameSync(join(runs, 'run-x.json'), join(runs, '.retiring-run-x.123e4567-e89b-12d3-a456-426614174000'));
     base();
-    expect(listRunIds(runs)).toEqual(['run-x']);
+    expect(listRunIds(runs)).toEqual(['run-x']); // restored; run-old archived+deleted
   });
 
   it('restores (does not delete) a record some process still holds open', () => {
