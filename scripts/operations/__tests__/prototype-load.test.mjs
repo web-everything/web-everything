@@ -1917,7 +1917,7 @@ describe('prototype-load', () => {
       it('a valid ruling + verbatim quote queues exactly one request and registers nothing', async (t) => {
         const { f, state } = forceFixture(t);
         const r = await f.run({ forceAdopt: true, ruling: 'R508', quote: QUOTE });
-        expect(r).toMatchObject({ ok: true, forceAdopt: { requested: true, dryRun: false, ruling: 'R508' } });
+        expect(r).toMatchObject({ ok: true, forceAdopt: { requested: true, dryRun: false, ruling: 'R508', sha: SHA } }); // echoes the bound build
         expect(pending(f, state)).toMatchObject([{ ruling: 'R508', quote: QUOTE, sha: SHA }]); // bound to the build named on the command
         expect(mutations(f, 'add')).toEqual([]);
       });

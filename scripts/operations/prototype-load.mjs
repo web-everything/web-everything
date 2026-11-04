@@ -76,7 +76,8 @@ export function prototypeLoadOperation() {
   input['dry-run'] = { type: 'boolean', required: false, default: false };
   // R310: retire-only run — drop registrations proved merged, in main, or superseded, and load nothing.
   input.retire = { type: 'boolean', required: false, default: false };
-  // R508: operator force-adopt of the latest registered build over a failed smoke; needs --ruling and a verbatim --quote.
+  // R508: operator force-adopt of ONE build over a failed smoke; needs --ruling, a verbatim --quote and --sha (the full
+  // sha of the build the rebuild holds: the `target` in the daemon's held state, not a branch tip when overlays apply).
   input['force-adopt'] = { type: 'boolean', required: false, default: false };
   return op(PROTOTYPE_LOAD_OP, {
     input, verdictFrom: 'assess',

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { writeReadyCandidate, readReadyCandidate } from '../daemon-rebuild/state.mjs';
-import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync, chmodSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync, chmodSync, readdirSync as nodeFsReaddir } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -254,6 +254,17 @@ describe('runForceWatchTick', () => {
     expect(await runForceWatchTick({ root, env, probe: async () => ({ healthy: true }), rollback, emit: async () => {} })).toMatchObject({ action: 'rollback', reason: 'health-failed' });
     expect(rollback).toHaveBeenCalledTimes(2);
     expect(readForceWatch(root, env)).toBeNull();
+  });
+  it('the in-process rollback marker belongs to its build: a later watch for another sha on the same path starts clean', async () => {
+    await setup();
+    chmodSync(env.WE_DAEMON_STATE_DIR, 0o500);
+    try { await runForceWatchTick({ root, env, probe: async () => ({ healthy: false }), rollback: async () => ({ ok: false }), emit: async () => {} }); } finally { chmodSync(env.WE_DAEMON_STATE_DIR, 0o700); }
+    rmSync(join(env.WE_DAEMON_STATE_DIR, nodeFsReaddir(env.WE_DAEMON_STATE_DIR).find((n) => n.endsWith('.force-watch.json'))), { force: true }); // watch removed without clearWatch
+    await recordForcedAdoption({ root, env, request: { daemon: 'review', ruling: 'R508', quote: QUOTE }, sha: 'c'.repeat(40),
+      lastGood: { head: 'a'.repeat(40) }, smoke: { verdict: 'code', failed: [] }, emit: async () => {}, now: () => 1 });
+    const rollback = vi.fn(async () => ({ ok: true }));
+    expect((await runForceWatchTick({ root, env, probe: async () => ({ healthy: true }), rollback, emit: async () => {} })).action).toBe('continue');
+    expect(rollback).not.toHaveBeenCalled();
   });
   it('an expired watch (forced build never became head) also drops its never-smoked ready candidate', async () => {
     await setup();

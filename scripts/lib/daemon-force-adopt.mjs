@@ -79,6 +79,8 @@ export const readForceWatch = (root, env = process.env) => readJson(watchPath(ro
 /** Rollbacks owed but whose marker could not be written to disk, keyed by watch path (this process only). */
 const pendingRollbacks = new Map();
 const clearWatch = (root, env) => { pendingRollbacks.delete(watchPath(root, env)); removeQuietly(watchPath(root, env)); };
+/** The in-process marker applies only to the build it was recorded for: a later watch on the same path starts clean. */
+const pendingFor = (root, env, sha) => { const p = pendingRollbacks.get(watchPath(root, env)); return p && p.sha === sha ? p.reason : undefined; };
 
 /** true only when the line really landed: a forced adoption refuses to proceed unless every audit sink wrote. */
 const appendLine = (p, line) => { try { mkdirSync(dirname(p), { recursive: true }); appendFileSync(p, line); return true; } catch { return false; } };
@@ -159,7 +161,7 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   if (head !== null && !watch.adoptedSeen) { watch.adoptedSeen = true; persist(watch); }
   let health;
   try { health = await probe(root); } catch { health = { healthy: false }; }
-  const pendingReason = watch.rollbackPending || pendingRollbacks.get(watchPath(root, env)); // disk marker, else the in-process one
+  const pendingReason = watch.rollbackPending || pendingFor(root, env, watch.sha); // disk marker, else the in-process one
   const verdict = evaluateForceWatch({ watch: pendingReason ? { ...watch, rollbackPending: pendingReason } : watch, healthy: health?.healthy, restarts: health?.restarts ?? 0 });
   if (verdict.action === 'continue') { persist(verdict.watch); return { action: 'continue', ticksLeft: verdict.watch.ticksLeft }; }
   if (verdict.action === 'done') { clearWatch(root, env); await emit?.({ kind: 'force-adopt-watch-passed', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha } }); return { action: 'done' }; }
@@ -170,7 +172,7 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
     // The owed-rollback marker must survive a failed state write: write it directly (not the swallowing persist) and, if
     // that throws, keep it in-process and say so in the handoff file so an operator can see the build is still owed a revert.
     try { writeJson(watchPath(root, env), { ...watch, rollbackPending: verdict.reason }); } catch {
-      pendingRollbacks.set(watchPath(root, env), verdict.reason);
+      pendingRollbacks.set(watchPath(root, env), { sha: watch.sha, reason: verdict.reason });
       appendLine(handoffFile(env), `- FORCE-ADOPT ${at} ${watch.daemon} ${watch.ruling}: force-adopt-rollback-failed ${watch.sha} -> ${watch.lastGood?.head ?? '?'} (${verdict.reason}); marker could not be saved, kept in memory\n`);
     }
     await emit?.({ kind: 'force-adopt-rollback-failed', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, reason: verdict.reason } });
