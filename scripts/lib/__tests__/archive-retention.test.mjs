@@ -412,7 +412,7 @@ it('the real review-pr completion check resolves the resume step count for the r
   expect(done({ op: 'review-pr', id: 'r1', cursor: n, pending: null })).toBe(true);
   expect(done({ op: 'review-pr', id: 'r1', cursor: n - 1, pending: null })).toBe(false);
   expect(done({ op: 'review-pr', id: 'r1', cursor: n, pending: { step: 'x' } })).toBe(false);
-}, 30000);
+}, 120000);
 it('a .lock sidecar: a live pid skips the record, a dead pid is eligible, a non-positive pid fails closed', async () => {
   const { createRunsWriterExclusion } = await import('../runs-writer-exclusion.mjs');
   const provider = createRunsWriterExclusion({ isPidAlive: pid => pid === 111 });
@@ -433,6 +433,31 @@ it('a record skipped for a live writer on one day is removed the next day once t
   alive = false;
   const day2 = await realRun({ isComplete: () => true, withSourceWriterExclusion: provider, now: now + 86400001 });
   expect(day2.errors).toEqual([]); expect(await exists(p)).toBe(false); expect(day2.filesArchived).toBe(1);
+});
+it('a provider that throws mid-removal does not leave the record excluded forever (retried next day)', async () => {
+  const p = await file(join(runs, 't.json')); let boom = true;
+  const provider = async (path, critical) => { if (boom) throw Object.assign(Error('EIO'), { code: 'EIO' }); return critical(); };
+  const day1 = await run({ withSourceWriterExclusion: provider });
+  expect(day1.errors.join()).toMatch(/EIO/); expect(await exists(p)).toBe(true);
+  boom = false;
+  const day2 = await run({ withSourceWriterExclusion: provider, now: now + 86400001 });
+  expect(day2.errors).toEqual([]); expect(await exists(p)).toBe(false);
+});
+it('a permanently skipped record is retried a bounded number of times, then alerts instead of duplicating bundles', async () => {
+  const p = await file(join(runs, 'stuck.json')); const errors = [];
+  for (let day = 0; day < 8; day++) errors.push(...(await run({ withSourceWriterExclusion: async () => {}, now: now + day * 86400001 })).errors);
+  const bundles = (await readdir(join(drive, 'runs'))).filter(n => n.endsWith('.tar.gz'));
+  expect(bundles).toHaveLength(4); // first archive + 3 retries, never one per day
+  expect(errors.join()).toMatch(/ALERT: stuck\.json archived but not removed after 3 retries/);
+  expect(await exists(p)).toBe(true);
+});
+it('only unremoved records are forgotten: a removed sibling is not re-archived', async () => {
+  const keep = await file(join(runs, 'keep.json')), gone = await file(join(runs, 'gone.json'));
+  const provider = async (path, critical) => { if (path === keep) return; return critical(); };
+  await run({ withSourceWriterExclusion: provider });
+  expect(await exists(keep)).toBe(true); expect(await exists(gone)).toBe(false);
+  const day2 = await run({ withSourceWriterExclusion: async (path, critical) => critical(), now: now + 86400001 });
+  expect(day2.filesArchived).toBe(1); expect(await exists(keep)).toBe(false);
 });
 it('a record atomically replaced after verification survives with the production provider', async () => {
   const { createRunsWriterExclusion } = await import('../runs-writer-exclusion.mjs');

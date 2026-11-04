@@ -52,6 +52,7 @@ const dayOf = ms => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_Yo
 const same = (a, b) => a.isFile() && b.isFile() && a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
 // Include identity/ctime so a replacement or a same-size write with restored mtime is new.
 const version = s => [s.size, s.mtimeMs, s.ctimeMs, s.dev, s.ino];
+const MAX_REMOVAL_RETRIES = 3;
 const MAX_MANIFEST_BYTES = 128 * 1024 * 1024;
 async function readArchiveManifest(path, source, drive, maxFiles) {
   try {
@@ -164,6 +165,26 @@ export async function archiveRetention(o = {}) {
         return false;
       }
     }
+    // A runs record archived but not removed is forgotten by the manifest so the next run re-verifies and retries removal,
+    // at most MAX_REMOVAL_RETRIES times per path (each retry writes one more verified bundle); then it stays excluded
+    // and an operator-visible error says so. The counter lives in its own state file (keyed by relative path; run ids are unique, so it is never reused).
+    const retriesFile = join(state, 'runs.removal-retries.json');
+    async function retryRemoval(pending, manifest) {
+      let counts = {};
+      try { counts = JSON.parse(boundedText(retriesFile, 1024 * 1024)); if (!counts || typeof counts !== 'object' || Array.isArray(counts)) throw Error('invalid retry state'); }
+      catch (e) { if (e.code !== 'ENOENT') { out.errors.push(`removal-retry state unreadable (${e.message}); records stay excluded, operator must inspect`); return manifest; } }
+      const forget = new Map(manifest); let changed = false;
+      for (const key of pending) {
+        const n = Number.isSafeInteger(counts[key]) ? counts[key] : 0;
+        if (n >= MAX_REMOVAL_RETRIES) { out.errors.push(`ALERT: ${key} archived but not removed after ${n} retries; operator must inspect`); continue; }
+        counts[key] = n + 1; forget.delete(key); changed = true;
+      }
+      if (!changed) return manifest;
+      const temp = `${retriesFile}.${randomUUID()}.partial`;
+      try { await writeFile(temp, JSON.stringify(counts), { flag: 'wx', mode: 0o600 }); await rename(temp, retriesFile); } finally { await unlink(temp).catch(() => {}); }
+      await writeArchiveManifest(archiveManifest, source, drive, forget, maxFiles);
+      return forget;
+    }
     if (kind === 'runs') {
       // Oldest first, bounded by the batch cap; unreadable or unfinished records are skipped (never eligible).
       const cap = o.batchCap ?? settings.value.runsBatchCap;
@@ -254,44 +275,44 @@ export async function archiveRetention(o = {}) {
         await writeArchiveManifest(archiveManifest, source, drive, next, maxFiles);
         archived = next;
         out.bundles.push(final); out.filesArchived += names.length;
-        let uncoordinated = 0; const retry = [];
-        for (const f of group.files) {
-          let removed = false, entered = false;
-          const remove = async (writerExcluded) => {
-            if (entered) throw Error('source writer exclusion invoked removal more than once');
-            entered = true;
-            if (!same(f.stat, await lstat(f.path))) return;
-            // Test seam exercises precisely the former final-stat → unlink interval.
-            await o.afterSourceStat?.(f.path);
-            if (!writerExcluded) return;
-            // Quarantine by atomic rename, re-verify the bytes' identity, only then unlink: a writer that replaced
-            // the record between the stat and here is detected and its new file is restored, never deleted.
-            const parked = join(dirname(f.path), `.retiring-${basename(f.path)}.${randomUUID()}`);
-            await rename(f.path, parked);
-            const q = await lstat(parked);
-            if (!(q.isFile() && (!f.hash || createHash('sha256').update(await readFile(parked)).digest('hex') === f.hash) && q.dev === f.stat.dev && q.ino === f.stat.ino && q.size === f.stat.size && q.mtimeMs === f.stat.mtimeMs)) { await restore(parked, f.path); return; }
-            await unlink(parked);
-            removed = true;
-            out.bytesFreed += f.stat.size;
-          };
-          try {
-            if (o.withSourceWriterExclusion) {
-              await o.withSourceWriterExclusion(f.path, () => remove(true));
-              if (!entered) uncoordinated++;
-            } else {
-              uncoordinated++;
-              await remove(false);
-            }
-          } catch (e) { if (e.code !== 'ENOENT') throw e; }
-          if (!removed) { out.filesRetained++; if (kind === 'runs' && o.withSourceWriterExclusion) retry.push(relative(source, f.path)); }
-        }
-        // A runs record that has a removal path (a provider) but was skipped (live writer, restored quarantine) must not
-        // stay excluded forever by the manifest: forget it so the next run re-verifies and retries removal.
-        // (Cost: one extra Drive bundle per retry; the sources are never deleted without a fresh verified copy.)
-        if (retry.length) {
-          const forget = new Map(archived); for (const key of retry) forget.delete(key);
-          await writeArchiveManifest(archiveManifest, source, drive, forget, maxFiles);
-          archived = forget;
+        let uncoordinated = 0;
+        // Runs with a removal path (a provider): every group file starts "pending" and leaves the set only when removed.
+        const pending = new Set(kind === 'runs' && o.withSourceWriterExclusion ? group.files.map(f => relative(source, f.path)) : []);
+        try {
+          for (const f of group.files) {
+            let removed = false, entered = false;
+            const remove = async (writerExcluded) => {
+              if (entered) throw Error('source writer exclusion invoked removal more than once');
+              entered = true;
+              if (!same(f.stat, await lstat(f.path))) return;
+              // Test seam exercises precisely the former final-stat → unlink interval.
+              await o.afterSourceStat?.(f.path);
+              if (!writerExcluded) return;
+              // Quarantine by atomic rename, re-verify the bytes' identity, only then unlink: a writer that replaced
+              // the record between the stat and here is detected and its new file is restored, never deleted.
+              const parked = join(dirname(f.path), `.retiring-${basename(f.path)}.${randomUUID()}`);
+              await rename(f.path, parked);
+              const q = await lstat(parked);
+              if (!(q.isFile() && (!f.hash || createHash('sha256').update(await readFile(parked)).digest('hex') === f.hash) && q.dev === f.stat.dev && q.ino === f.stat.ino && q.size === f.stat.size && q.mtimeMs === f.stat.mtimeMs)) { await restore(parked, f.path); return; }
+              await unlink(parked);
+              removed = true;
+              out.bytesFreed += f.stat.size;
+            };
+            try {
+              if (o.withSourceWriterExclusion) {
+                await o.withSourceWriterExclusion(f.path, () => remove(true));
+                if (!entered) uncoordinated++;
+              } else {
+                uncoordinated++;
+                await remove(false);
+              }
+            } catch (e) { if (e.code !== 'ENOENT') throw e; }
+            if (removed) pending.delete(relative(source, f.path)); else out.filesRetained++;
+          }
+        } finally {
+          // Applied on EVERY exit (skip, restored quarantine, or a thrown error mid-loop), so no unremoved record is left
+          // excluded forever by the manifest committed above. Bounded: see retryRemoval.
+          if (pending.size) { try { archived = await retryRemoval(pending, archived); } catch (e) { out.errors.push(`retry bookkeeping failed; operator must inspect: ${e.message}`); } }
         }
         if (uncoordinated) out.errors.push(`Source removal skipped for ${uncoordinated} files: writer exclusion unavailable; originals retained. Operator must arrange exclusion of all source writers, including open descriptors, before reclamation.`);
         for (const dir of [...new Set(group.dirs)].sort((a, b) => b.length - a.length)) {
