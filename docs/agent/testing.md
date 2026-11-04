@@ -3903,3 +3903,10 @@ Child report identities re-emitted as FAIL lines must strip C0/C1 controls and U
 line separators; the hostile-input table checks the resulting failure collector entries.
 When changing an existing test's expected verdict, disclose the behavior change in
 the PR description so reviewers can distinguish a policy change from a regression fix.
+
+Persistent GitHub 5xx soak fixtures must account for both retry ladders: `withListRetry`
+repeats the list read three times, and each attempt can sleep again in `gh-throttle`.
+The `smoke-github-outage` break pins `WE_GH_LIST_BACKOFF_MS=5,5` and
+`WE_GH_JSON_RETRY_BACKOFF_MS=5` before the daemon forks. This preserves exhausted,
+fail-closed reads across reconcile and dispatch smoke passes within the unchanged
+90-second tick bound; shortening only the outer list backoff does not suffice.
