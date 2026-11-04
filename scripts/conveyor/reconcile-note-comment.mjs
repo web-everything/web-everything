@@ -37,7 +37,7 @@ import { execFileSync } from 'node:child_process';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import {
-  isRepeatSuppressibleNote, isStatusOnlyNote, loadPrCommentSettings, repeatsLatestComment,
+  isInformationalNote, isRepeatSuppressibleNote, isStatusOnlyNote, loadPrCommentSettings, repeatsLatestComment,
 } from '../lib/pr-comment-policy.mjs';
 
 /**
@@ -46,6 +46,9 @@ import {
  * in this directory so a note-comment count/match can never cross with a ci-heal/advisory-fix/stand-down one.
  */
 export const NOTE_COMMENT_MARKER = '🔔 conveyor — needs your decision';
+
+/** First line of an informational note (a choice the system already made). Never matches {@link NOTE_COMMENT_MARKER}. */
+export const INFO_NOTE_COMMENT_MARKER = 'ℹ️ conveyor — note';
 
 /**
  * we:scripts/conveyor/reconcile-note-comment.mjs#noteEpisodeKey — the stable identity of ONE escalation episode
@@ -130,15 +133,15 @@ export function noteHeadline(note) {
  * @param {object} note - a `planReconcile` note (`{kind, prNumber, text, ...}`).
  * @returns {string}
  */
-export function buildNoteComment(note) {
+export function buildNoteComment(note, { informational = isInformationalNote(note) } = {}) {
   const key = noteEpisodeKey(note);
   // The text can carry agent-supplied strings (e.g. a fixer's `--denied` command). Break any HTML-comment
   // delimiter so it can never forge the machine-read episode key below (which `hasPostedNoteComment` matches).
   const text = String(note?.text ?? '(no detail recorded)').replace(/<!--/g, '<!- -').replace(/--(!?)>/g, '- -$1>');
   const lines = [
-    NOTE_COMMENT_MARKER,
+    informational ? INFO_NOTE_COMMENT_MARKER : NOTE_COMMENT_MARKER,
     '',
-    noteHeadline(note),
+    informational ? `note: ${note?.kind}` : noteHeadline(note),
     '',
     text,
   ];
