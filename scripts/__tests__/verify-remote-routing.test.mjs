@@ -62,7 +62,7 @@ describe('timeout preservation', () => {
       phaseAdmission, localPhaseReason, phaseAdmissionPlan, decidePhaseRemote, acquireSlotBlocking,
       phaseAdmissionKind: () => ({ kind: 'files' }), classifyCommandKind: () => 'selected',
       admissionPhases: {}, laneMatch: null, GATE: command, ADMISSION_TIMEOUT_MS: 1000,
-      shouldConfirmRemoteRed, remoteInfrastructureFailure, mergeRunLocation: (a, b) => a === b ? a : 'mixed',
+      shouldConfirmRemoteRed, remoteInfrastructureFailure, remainingBudgetMs, mergeRunLocation: (a, b) => a === b ? a : 'mixed',
       runGate, recordOutcome: vi.fn(), buildPhaseOutcome: value => value,
       ranOnPhases: {}, phaseMs: {}, remoteUnconfirmed: false, phaseTimeout: null, vitestAdmittedLocally: false,
       resolvedGate: { decision: { changedFiles: ['scripts/changed.test.mjs'] } },
@@ -205,7 +205,7 @@ describe('proven local fallback verdict', () => {
       const recordOutcome = vi.fn();
       const context = {
         phaseAdmission, firstPhaseAdmission: { remote: true }, admission: { remote: true }, currentAdmission: null,
-        phaseAdmissionPlan, shouldConfirmRemoteRed, remoteInfrastructureFailure, mergeRunLocation: (a, b) => a === b ? a : 'mixed',
+        phaseAdmissionPlan, shouldConfirmRemoteRed, remoteInfrastructureFailure, remainingBudgetMs, mergeRunLocation: (a, b) => a === b ? a : 'mixed',
         runGate, acquireAdmission, recordOutcome, buildPhaseOutcome: value => value,
         ranOnPhases: {}, phaseMs: {}, remoteUnconfirmed: false, phaseTimeout: null, vitestAdmittedLocally: false,
         resolvedGate: { decision: { changedFiles: ['scripts/changed.test.mjs'] } },
@@ -1064,8 +1064,6 @@ describe('explicit and compound gates split into per-segment phases (PR-4)', () 
         expect(source).toMatch(/remainingBudgetMs\(deadlineAt/);
         expect(source).toMatch(/remainingBudgetMs\(gateDeadlineAt/);
         expect(source).toMatch(/timeoutMs: Math\.min\(/);
-        for (const retryOnly of ['isolatedRetryMode !== \'off\'', 'resolvedGate.scanCommands', 'alwaysRun.command', 'resolvedGate.standardsCommand'])
-          expect(source.split('\n').filter(l => l.includes(retryOnly) && /retryableGate/.test(l) || !l.includes(retryOnly)).length).toBeGreaterThan(0);
       }],
     ])('%s', async (_name, walk) => { await walk(); });
   });

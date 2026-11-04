@@ -145,22 +145,28 @@ function rewriteShardWrapperSegment(segment) {
   return `node ${shellQuote(SHARD_RUN_SCRIPT)} ${words.slice(2).join(' ')}`.trimEnd();
 }
 
+// The split gate's ONE time budget. Every path that spends time (each segment, a local confirmation of a red remote
+// segment, the base-failure rerun, the final return) draws from the same absolute deadline.
+export const remainingBudgetMs = (deadlineAt, now = Date.now) =>
+  Number.isFinite(deadlineAt) ? Math.max(0, Math.floor(deadlineAt - now())) : undefined;
+export const budgetExhaustedResult = last => ({ exitCode: 124, signal: 'SIGKILL', timedOut: true, budgetExhausted: true, remoteAttempt: false,
+  ranOn: last?.ranOn ?? { location: 'local' }, failureDetails: last?.failureDetails, output: null });
+
 // Strict `&&`: run each segment in turn; the first nonzero exit or signal stops the rest and is the result.
-// The segments share ONE deadline (`budgetMs`, the single-phase ceiling a whole gate had before the split): each gets
-// the time remaining as `timeoutMs`, and once it is spent the rest is not run and the result is a timeout.
-export async function runGateSegments(segments, run, { budgetMs, now = Date.now } = {}) {
-  const startedAt = now();
+// The segments share ONE deadline (`budgetMs`, the single-phase ceiling a whole gate had before the split). Each gets the
+// time remaining (`timeoutMs`) and the absolute `deadlineAt`; a spent budget before a segment, or after the last one,
+// is a timeout, never a pass.
+export async function runGateSegments(segments, run, { budgetMs, now = Date.now, onDeadline } = {}) {
+  const deadlineAt = Number.isFinite(budgetMs) ? now() + budgetMs : undefined;
+  if (deadlineAt !== undefined) onDeadline?.(deadlineAt);
   let last = null;
   for (const segment of segments) {
-    const remaining = Number.isFinite(budgetMs) ? Math.floor(budgetMs - (now() - startedAt)) : undefined;
-    if (remaining !== undefined && remaining <= 0) {
-      return { exitCode: 124, signal: 'SIGKILL', timedOut: true, budgetExhausted: true, remoteAttempt: false,
-        ranOn: last?.ranOn ?? { location: 'local' }, failureDetails: last?.failureDetails, output: null };
-    }
-    last = await run(segment, remaining === undefined ? {} : { timeoutMs: remaining });
+    const remaining = remainingBudgetMs(deadlineAt, now);
+    if (remaining === 0) return budgetExhaustedResult(last);
+    last = await run(segment, remaining === undefined ? {} : { timeoutMs: remaining, deadlineAt });
     if (last.exitCode !== 0 || last.signal) return last;
   }
-  return last;
+  return remainingBudgetMs(deadlineAt, now) === 0 && last ? budgetExhaustedResult(last) : last;
 }
 
 export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {

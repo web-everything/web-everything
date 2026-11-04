@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { runInNewContext } from 'node:vm';
-import { localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, remoteInfrastructureFailure, mergeRunLocation, SHARD_RUN_SCRIPT } from '../verify-remote-routing.mjs';
+import { localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, remoteInfrastructureFailure, remainingBudgetMs, mergeRunLocation, SHARD_RUN_SCRIPT } from '../verify-remote-routing.mjs';
 import { verificationInfrastructureFailure, verifyFinishBody } from '../lane-verify.mjs';
 import { runShards } from '../verify-shard-run.mjs';
 import { createFailureCollector } from '../verify-failures.mjs';
@@ -102,7 +102,7 @@ it.each([1, 75].flatMap(remoteExit => [false, true].flatMap(phaseAdmission => [f
   const acquireAdmission = vi.fn(async () => ({ ok: true }));
   const context = {
     phaseAdmission, firstPhaseAdmission: { remote: true }, admission: { remote: true }, currentAdmission: null,
-    phaseAdmissionPlan, shouldConfirmRemoteRed, remoteInfrastructureFailure, mergeRunLocation,
+    phaseAdmissionPlan, shouldConfirmRemoteRed, remoteInfrastructureFailure, remainingBudgetMs, mergeRunLocation,
     runGate, acquireAdmission, recordOutcome: vi.fn(), buildPhaseOutcome: value => value,
     ranOnPhases: {}, phaseMs: {}, remoteUnconfirmed: false, phaseTimeout: null, vitestAdmittedLocally: false,
     resolvedGate: null, slotHeartbeat: null, setInterval: vi.fn(() => ({ unref() {} })), clearInterval: vi.fn(),
