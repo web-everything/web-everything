@@ -430,11 +430,23 @@ export function refreshLiveFixDispatchClaims({
       }
       continue;
     }
+    // Idle release only speaks for rows POSITIVELY bound to this claim (same sessionId, or — for a claim without
+    // one — started at/after the claim): an older same-named idle session must never release a newer dispatch.
+    const boundToClaim = (a) => (entry.meta.sessionId
+      ? a.sessionId === entry.meta.sessionId
+      : Number.isFinite(claimedMs) && startedAtMs(a.startedAt) >= claimedMs);
     const agentsAll = (Array.isArray(listed) ? listed : []).filter((a) => a && String(a.name ?? '') === name)
       .map((a) => {
         let info = null;
         try { info = hungInfoFor(a, nowMs, hungThresholdMs); } catch { info = null; }
-        return info?.hung === true ? { ...a, hung: true } : a;
+        if (info?.hung !== true) return a;
+        // The real hung detector flags a silent idle holder after the hung threshold (30 min by default), long
+        // before the idle-release quiet floor (90 min): marking it hung here would drop the row out of
+        // isClaimSessionLive and skip the idle-release code below forever. An idle row bound to THIS claim with no
+        // pending tool call is owned by that path (quietLongEnough, awaiting-verify and unchanged-head checks keep
+        // it fail closed). A hung verdict that names a pending call past its grace is kept as hung.
+        if ((a.state === 'idle' || a.status === 'idle') && boundToClaim(a) && info.reason === 'stale-no-activity') return a;
+        return { ...a, hung: true };
       });
     const isAwaiting = typeof awaitingVerifyFor === 'function' && agentsAll.some((row) => {
       try { return awaitingVerifyFor(row, { pr })?.awaiting === true; } catch { return false; }
@@ -467,7 +479,10 @@ export function refreshLiveFixDispatchClaims({
         || (!entry.meta.sessionId && Number.isFinite(claimedMs) && startedAtMs(a.startedAt) >= claimedMs))
       && Number.isInteger(a.pid))) {
       const identities = nonTerminal.map((a) => {
-        try { return identity(a.pid); } catch { return null; }
+        // startedBy arms the pid-reuse guard (a process that launched after this row did is a different one);
+        // an unreadable start time passes null, which skips only that check — unknown identity still retains.
+        const ms = startedAtMs(a.startedAt);
+        try { return identity(a.pid, { startedBy: Number.isFinite(ms) && ms > 0 ? ms : null }); } catch { return null; }
       });
       if (identities.every((verdict) => verdict?.alive === false)) {
         if (readUnchangedClaim(lockRoot, resource, entry)) {
@@ -479,11 +494,6 @@ export function refreshLiveFixDispatchClaims({
         continue;
       }
     }
-    // Idle release only speaks for rows POSITIVELY bound to this claim (same sessionId, or — for a claim without
-    // one — started at/after the claim): an older same-named idle session must never release a newer dispatch.
-    const boundToClaim = (a) => (entry.meta.sessionId
-      ? a.sessionId === entry.meta.sessionId
-      : Number.isFinite(claimedMs) && startedAtMs(a.startedAt) >= claimedMs);
     // A holder whose transcript (or a bound subagent's) changed inside the idle window is working, however idle it
     // reads at each sample; unreadable activity is unknown, so the claim is kept (fail closed).
     const quietLongEnough = (a) => {

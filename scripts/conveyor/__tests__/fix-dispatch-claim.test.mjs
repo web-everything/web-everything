@@ -16,8 +16,8 @@
  *        header). The key is now `(repo, kind, pr)`, with `headSha` carried only as diagnostic `meta` — these
  *        tests prove the SAME head-sha-rotation scenario is now refused.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -26,6 +26,7 @@ import {
   isClaimSessionLive, listFixDispatchClaims, refreshLiveFixDispatchClaims, transcriptActivityMs, MAX_FIX_DISPATCH_CLAIM_REFRESH_MS,
   resolveIdleClaimRelease, readPrHead, recordIdleRelease, MAX_IDLE_CLAIM_OBSERVATION_GAP_MS,
 } from '../fix-dispatch-claim.mjs';
+import { readHungInfo, resolveHungThresholdMs } from '../hung-session.mjs';
 import * as dispatchIo from '../../operations/dispatch-lane-io.mjs';
 import { newEnvelopeRecord } from '../../operations/completion-record.mjs';
 import { writeCompletion } from '../../operations/completion-store.mjs';
@@ -36,6 +37,18 @@ import { dispatchCiHeal } from '../../operations/ci-heal-pr-dispatch.mjs';
 import { buildAuthorActorMarker } from '../../lib/review-independence.mjs';
 import { execFileSyncThrottled } from '../../lib/gh-throttle.mjs';
 import { appendDaemonEvent } from '../../lib/daemon-events.mjs';
+
+// The real hung detector resolves transcripts under CLAUDE_PROJECTS_DIR, read when agent-health.mjs first loads, so
+// the override must be set before the imports above run (vi.hoisted runs first).
+const projectsDir = await vi.hoisted(async () => {
+  const { mkdtempSync: mk } = await import('node:fs');
+  const { tmpdir: tmp } = await import('node:os');
+  const { join: j } = await import('node:path');
+  const dir = mk(j(tmp(), 'fix-claim-projects-'));
+  process.env.CLAUDE_PROJECTS_DIR = dir;
+  return dir;
+});
+afterAll(() => { rmSync(projectsDir, { recursive: true, force: true }); });
 
 vi.mock('../../lib/gh-throttle.mjs', async (importOriginal) => {
   const actual = await importOriginal();
@@ -838,6 +851,122 @@ describe('idle-claim auto-release (R201)', () => {
       }).released ?? []).length;
     }
     expect(released).toBe(expectedReleases);
+  });
+
+  // Production wiring: NO hungInfoFor / hungThresholdMs / activityMsFor stub. The real hung detector flags a silent
+  // idle holder hung after 30 min (no pending call), long before the 90 min idle-release quiet floor; that verdict must
+  // not take an idle holder bound to this claim out of the idle-release path.
+  describe('with the real hung detector (default hungInfoFor, hungThresholdMs, activityMsFor)', () => {
+    const CWD = '/lane-real';
+    const MIN = 60_000;
+    const firstSweep = T0 + 60_000;
+    const lastSweep = firstSweep + IDLE_MS;
+    const SID = 'S-real';
+    const writeTranscript = (lastActivityMs, content = [{ type: 'text', text: 'done' }]) => {
+      const dir = join(projectsDir, CWD.replaceAll('/', '-'));
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, `${SID}.jsonl`), `${JSON.stringify({ type: 'assistant', timestamp: iso(lastActivityMs), message: { role: 'assistant', content } })}\n`);
+    };
+    const row = { name: 'fix-5996', sessionId: SID, cwd: CWD, state: 'working', status: 'idle', startedAt: T0 + 1000 };
+    const sweepAll = ({ lastActivityMs, content, headFor = () => 'sha1' }) => {
+      acquireFixDispatchClaim({ repo: 'we', pr: 5996, kind: 'fix', headSha: 'sha1', owner: 'A', sessionId: SID,
+        lockRoot: claimRoot, nowMs: T0, nowIso: iso(T0), leaseMinutes: 10 });
+      writeTranscript(lastActivityMs, content);
+      const released = [];
+      for (let t = firstSweep; t <= lastSweep; t += 120_000) {
+        released.push(...(refreshLiveFixDispatchClaims({
+          lockRoot: claimRoot, listAgentsAll: () => [row], awaitingVerifyFor: null,
+          prHeadFor: () => headFor(t), recordEvent: () => {}, nowIso: () => iso(t),
+          idleRelease: resolveIdleClaimRelease({ env: {}, platform: null }),
+        }).released ?? []));
+      }
+      return released;
+    };
+
+    it.each([
+      ['exactly 90 min silent at the first sweep (the quiet floor is inclusive)', 90 * MIN],
+      ['3 hours silent', 180 * MIN],
+    ])('releases the claim of a bound, readable, idle holder %s with an unmoved head and no subagents', (_n, silentMs) => {
+      const lastActivityMs = firstSweep - silentMs;
+      // The detector really does flag this holder hung; without the idle-path ownership the claim could never release.
+      expect(readHungInfo({ ...row }, firstSweep, resolveHungThresholdMs())).toMatchObject({ hung: true, reason: 'stale-no-activity' });
+      writeTranscript(lastActivityMs);
+      const released = sweepAll({ lastActivityMs });
+      expect(released).toHaveLength(1);
+      expect(released[0].reason).toMatch(/idle-head-unmoved/);
+    });
+
+    it.each([
+      ['silent 31 min at the last sweep', lastSweep - 31 * MIN, undefined],
+      ['silent 89 min at the last sweep (one minute under the floor)', lastSweep - 89 * MIN, undefined],
+      ['a pending tool call silent 120 min (past the pending-call grace)', firstSweep - 120 * MIN, [{ type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'sleep 600' } }]],
+      ['a pending tool call silent 60 min (inside the grace)', firstSweep - 60 * MIN, [{ type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'sleep 600' } }]],
+    ])('keeps the claim of an idle holder: %s', (_n, lastActivityMs, content) => {
+      expect(sweepAll({ lastActivityMs, content })).toHaveLength(0);
+      expect(readFixDispatchClaim({ repo: 'we', pr: 5996, kind: 'fix', lockRoot: claimRoot })).not.toBeNull();
+    });
+
+    it('keeps the claim when the PR head moves between sweeps, however quiet the holder is', () => {
+      expect(sweepAll({ lastActivityMs: firstSweep - 180 * MIN, headFor: (t) => `sha-${t}` })).toHaveLength(0);
+    });
+
+    it('keeps a claim whose idle row is hung but NOT bound to it (an older same-named session)', () => {
+      acquireFixDispatchClaim({ repo: 'we', pr: 5996, kind: 'fix', headSha: 'sha1', owner: 'A', sessionId: SID,
+        lockRoot: claimRoot, nowMs: T0, nowIso: iso(T0), leaseMinutes: 10 });
+      writeTranscript(firstSweep - 180 * MIN);
+      const other = { ...row, sessionId: SID, startedAt: T0 + 1000 };
+      let released = 0;
+      for (let t = firstSweep; t <= lastSweep; t += 120_000) {
+        released += (refreshLiveFixDispatchClaims({
+          lockRoot: claimRoot, listAgentsAll: () => [{ ...other, sessionId: 'S-other' }], awaitingVerifyFor: null,
+          prHeadFor: () => 'sha1', recordEvent: () => {}, nowIso: () => iso(t),
+          idleRelease: resolveIdleClaimRelease({ env: {}, platform: null }),
+        }).released ?? []).length;
+      }
+      expect(released).toBe(0);
+    });
+  });
+
+  // The session-identity-dead check must arm the pid-reuse guard: identity() gets the row's start time as startedBy.
+  describe('session-identity-dead check passes the row start time to identity()', () => {
+    const claim = () => acquireFixDispatchClaim({ repo: 'we', pr: 5996, kind: 'fix', headSha: 'sha1', owner: 'A', sessionId: 'S1',
+      lockRoot: claimRoot, nowMs: T0, nowIso: iso(T0), leaseMinutes: 10 });
+    const sweepWith = (identity, rowExtra) => refreshLiveFixDispatchClaims({
+      lockRoot: claimRoot, listAgentsAll: () => [{ name: 'fix-5996', sessionId: 'S1', pid: 4242, state: 'working', status: 'busy', ...rowExtra }],
+      hungInfoFor: () => null, awaitingVerifyFor: null, identity, activityMsFor: () => 0,
+      prHeadFor: () => 'sha1', recordEvent: () => {}, nowIso: () => iso(T0 + 60_000),
+      idleRelease: resolveIdleClaimRelease({ env: {}, platform: null }),
+    });
+
+    it.each([
+      ['a numeric epoch-ms startedAt', { startedAt: T0 + 1000 }, T0 + 1000],
+      ['an ISO-string startedAt', { startedAt: iso(T0 + 1000) }, T0 + 1000],
+      ['a numeric-string startedAt', { startedAt: String(T0 + 1000) }, T0 + 1000],
+      ['a missing startedAt (guard skipped, not faked)', {}, null],
+      ['an unparseable startedAt (guard skipped, not faked)', { startedAt: 'not-a-time' }, null],
+    ])('%s', (_n, rowExtra, expectedStartedBy) => {
+      claim();
+      const identity = vi.fn(() => ({ alive: true, reason: 'match' }));
+      sweepWith(identity, rowExtra);
+      expect(identity).toHaveBeenCalledTimes(1);
+      expect(identity).toHaveBeenCalledWith(4242, { startedBy: expectedStartedBy });
+    });
+
+    it('a pid-reuse verdict (started-after-holder) releases the claim with that reason', () => {
+      claim();
+      const result = sweepWith(() => ({ alive: false, reason: 'started-after-holder' }), { startedAt: T0 + 1000 });
+      expect(result.released).toHaveLength(1);
+      expect(result.released[0].reason).toBe('session-identity-dead (started-after-holder)');
+    });
+
+    it.each([
+      ['unknown identity', () => ({ alive: null, reason: 'unreadable' })],
+      ['a throwing probe', () => { throw new Error('ps failed'); }],
+    ])('keeps the claim on %s', (_n, identity) => {
+      claim();
+      expect(sweepWith(identity, { startedAt: T0 + 1000 }).released ?? []).toHaveLength(0);
+      expect(readFixDispatchClaim({ repo: 'we', pr: 5996, kind: 'fix', lockRoot: claimRoot })).not.toBeNull();
+    });
   });
 
   it.each([
