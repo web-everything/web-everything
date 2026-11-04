@@ -3928,7 +3928,9 @@ the PR description so reviewers can distinguish a policy change from a regressio
 ## Review-label restoration requires explicit rollup completeness
 
 The restore-review-label planner gates accept only `rollupIncomplete: false`; old snapshots with no flag
-remain ineligible. Complete GraphQL context pages set false from `hasNextPage: false`, direct gh listings
+remain ineligible. Complete GraphQL context pages set false from `hasNextPage: false`, a commit whose
+`statusCheckRollup` is `null` (no check has reported yet) sets false with an empty rollup (a missing commit
+or rollup field stays true), direct gh listings
 only certify arrays below the 100-context cap, and snapshot projections preserve both boolean values.
 Complete-rollup fixtures (including stacked never-run cases) must carry false explicitly.
 Persistent GitHub 5xx soak fixtures must account for both retry ladders: `withListRetry`
