@@ -1,4 +1,5 @@
 import { decideMemoryFloor } from './memory-available.mjs';
+import { loadHostOverloadSettings } from './host-overload-settings.mjs';
 import { resolveHandoffSettings } from './handoff-settings.mjs';
 /**
  * @file we:scripts/lib/resource-gate.mjs
@@ -284,6 +285,7 @@ export function createResourceFixThrottle({
   sendBackReservedSlots,
   listClaims = () => [], env = process.env, alive = isPidAlive, queueLength = null, settings, root, nowMs = () => Date.now(),
   readSnap = () => readSnapshot(root ? { root } : {}), readHeavyWait = () => readLiveHeavyWaitMinutes({ env }), gate, log = (line) => process.stderr.write(line),
+  resolveFloor = () => { const r = loadHostOverloadSettings({ env, log: () => {} }); return { floorMb: r.settings.host.capacity.memAvailableFloorMb, source: r.sources['host.capacity.memAvailableFloorMb'] ?? 'standard' }; },
   sample, loadavg, cpuCount, // forwarded to the legacy gate (the logged comparison)
 } = {}) {
   sendBackReservedSlots ??= resolveHandoffSettings('fix', { env }).value.sendBackReservedSlots;
@@ -292,7 +294,18 @@ export function createResourceFixThrottle({
     ...(sample ? { sample } : {}), ...(loadavg ? { loadavg } : {}), ...(cpuCount ? { cpuCount } : {}) }));
   if (!settings) logGateSettingsOnce(resolved, log);
   const legacyCap = (() => { try { return resolveFixDispatchMaxConcurrent({ env }); } catch { return resolved.settings.fixCap.floor; } })();
-  let live = null; let capDecision = null; let lastSnap = null;
+  let live = null; let capDecision = null; let lastSnap = null; let lastFloor = null;
+  const floorCheck = (kind) => {
+    let snap = null; let floor = { floorMb: null, source: 'unreadable policy' };
+    try { snap = readSnap(); } catch { snap = null; }
+    try { floor = resolveFloor(); } catch { floor = { floorMb: null, source: 'unreadable policy' }; }
+    lastSnap = snap; lastFloor = floor;
+    const m = snap?.memory ?? {};
+    const fresh = !!snap && Number.isFinite(Date.parse(snap.freshUntil)) && nowMs() <= Date.parse(snap.freshUntil);
+    const d = decideMemoryFloor({ availableMb: m.availableMb, floorMb: floor.floorMb, pressureLevel: m.pressureLevel, snapshotFresh: fresh });
+    if (d.admit) return { admit: true };
+    return { admit: false, refusal: { admit: false, kind: 'host-load', signal: 'mem-floor', why: `memory floor: ${d.reason} (floor ${floor.floorMb ?? '?'} MB from ${floor.source}); ${kind} deferred, no claim taken` } };
+  };
   const currentCap = () => {
     if (capDecision) return capDecision;
     let snap = null;
@@ -308,7 +321,7 @@ export function createResourceFixThrottle({
       const fixCap = { ...RESOURCE_GATE_STANDARD.fixCap, ...resolved.settings.fixCap };
       const thresholds = FIX_CAP_SIGNAL_LEAVES.map((leaf) => `${leaf}=${fixCap[leaf]} (${resolved.sources?.[`fixCap.${leaf}`] ?? 'standard'})`).join(', ');
       log(`resource-gate fix-cap: old: static cap ${legacyCap} | new: cap ${c.cap} (floor ${c.floor}, ceiling ${c.ceiling}; ${c.reason}; ${live} live) → using ${c.effective} (${resolved.settings.cutover})`
-        + ` · mem floor ${v(lastSnap?.memory?.floorMb, ' MB')} (${lastSnap?.memory?.floorSource ?? '?'}) available ${v(lastSnap?.memory?.availableMb, ' MB')} pressure ${v(lastSnap?.memory?.pressureLevel, '')} → ${decideMemoryFloor({ availableMb: lastSnap?.memory?.availableMb, floorMb: lastSnap?.memory?.floorMb, pressureLevel: lastSnap?.memory?.pressureLevel, snapshotFresh: !!lastSnap }).admit ? 'admit' : 'refuse'}`
+        + ` · mem floor ${v(lastFloor?.floorMb, ' MB')} (${lastFloor?.source ?? '?'}) available ${v(lastSnap?.memory?.availableMb, ' MB')} pressure ${v(lastSnap?.memory?.pressureLevel, '')} → ${decideMemoryFloor({ availableMb: lastSnap?.memory?.availableMb, floorMb: lastFloor?.floorMb, pressureLevel: lastSnap?.memory?.pressureLevel, snapshotFresh: !!lastSnap }).admit ? 'admit' : 'refuse'}`
         + ` · inputs: mem free ${v(c.memFreePct, '%')} · swap ${v(c.swapUsedPct, '%')} · heavy wait ${v(c.heavyWaitMinutes, 'm')} · cpu idle ${v(c.cpuIdlePct, '%')} · fix queue ${v(c.queueLength, '')}`
         + ` · thresholds: ${thresholds}\n`);
     } catch { /* best effort */ }
@@ -318,12 +331,12 @@ export function createResourceFixThrottle({
     capDecision: () => capDecision,
     tryAdmit(kind = 'fix', { sendBack = false } = {}) {
       if (live === null) { try { live = countLiveFixSessions(listClaims(), { alive }); } catch { live = 0; } }
+      // R553/R559 hard floor, before any cap arithmetic. The memory reading is re-read on EVERY admission (never the
+      // pass-start copy) and the floor comes from THIS process's own policy cascade, never from the sampler's snapshot.
+      // Below the floor, under pressure warn/critical, stale, or unreadable on either side → refuse.
+      const fl = floorCheck(kind);
+      if (!fl.admit) return fl.refusal;
       const c = currentCap();
-      // R553 hard floor, before any cap arithmetic: below the floor, under pressure warn/critical, or unreadable → refuse.
-      const m = lastSnap?.memory ?? {};
-      const fresh = !!lastSnap && Number.isFinite(Date.parse(lastSnap.freshUntil)) && nowMs() <= Date.parse(lastSnap.freshUntil);
-      const floor = decideMemoryFloor({ availableMb: m.availableMb, floorMb: m.floorMb, pressureLevel: m.pressureLevel, snapshotFresh: fresh });
-      if (!floor.admit) return { admit: false, kind: 'host-load', signal: 'mem-floor', why: `memory floor: ${floor.reason} (floor ${m.floorMb ?? '?'} MB from ${m.floorSource ?? '?'}); ${kind} deferred, no claim taken` };
       // The reserve never takes the last slot: a cap of 1 still runs ordinary repairs. Its refusal IS a fixer-cap
       // refusal (`kind: 'fix-cap'`), so every reader of that kind — the red-main past-the-cap bypass, the builder-slot
       // borrow, the ci-heal reserve, the main-CI-red owner priority — treats a reserved slot like a full cap.

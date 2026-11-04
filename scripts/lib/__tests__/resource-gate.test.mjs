@@ -280,9 +280,43 @@ describe('dynamic fixer cap', () => {
       expect(mk(() => snap({ pressure })).tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
     });
     it.each([['no snapshot', () => null], ['read throws', () => { throw Error('x'); }], ['stale', () => snap({ ageMs: 600000 })],
-      ['no available reading', () => snap({ availableMb: null })], ['no floor', () => snap({ floorMb: null })],
+      ['no available reading', () => snap({ availableMb: null })],
       ['no pressure', () => snap({ pressure: null })]])('fails closed on %s', (_n, readSnap) => {
       expect(mk(readSnap).tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
+    });
+  });
+  describe('R559 fresh read and own-policy floor', () => {
+    const mk2 = (readSnap, resolveFloor, lines = []) => createResourceFixThrottle({ sendBackReservedSlots: 0, listClaims: () => [], queueLength: 0, readSnap, nowMs: () => NOW,
+      resolveFloor, settings: { cutover: 'enforce', fixCap: { ...fixCap, floor: 4, ceiling: 4 } }, gate: () => ({ admit: true }), log: (l) => lines.push(l) });
+    const std = () => ({ floorMb: 2048, source: 'standard' });
+    it('re-reads memory on every admission: a drop mid-pass refuses the next fixer', () => {
+      let cur = snap({ availableMb: 8192 });
+      const t = mk2(() => cur, std);
+      expect(t.tryAdmit('fix').admit).toBe(true);
+      cur = snap({ availableMb: 1024, pressure: 2 });
+      expect(t.tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
+    });
+    it('refuses when a later read is stale or throws, even after an earlier good read', () => {
+      let mode = 'ok';
+      const t = mk2(() => { if (mode === 'throw') throw Error('x'); return mode === 'stale' ? snap({ ageMs: 600000 }) : snap(); }, std);
+      expect(t.tryAdmit('fix').admit).toBe(true);
+      mode = 'stale'; expect(t.tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
+      mode = 'throw'; expect(t.tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
+    });
+    it('takes the floor from the dispatching process policy, never the snapshot floor', () => {
+      // snapshot carries a lax 2048 MB floor; this process demands 16384 MB; 8192 MB available must refuse
+      const d = mk2(() => snap({ availableMb: 8192, floorMb: 2048 }), () => ({ floorMb: 16384, source: 'env WE_HOST_CAPACITY_MEM_AVAILABLE_FLOOR_MB' })).tryAdmit('fix');
+      expect(d).toMatchObject({ admit: false, signal: 'mem-floor' });
+      expect(d.why).toMatch(/8192 MB < floor 16384 MB/); expect(d.why).toContain('env WE_HOST_CAPACITY_MEM_AVAILABLE_FLOOR_MB');
+      // and a snapshot floor of 99999 cannot block a host this process says is fine
+      expect(mk2(() => snap({ availableMb: 8192, floorMb: 99999 }), std).tryAdmit('fix').admit).toBe(true);
+    });
+    it('an unreadable own policy refuses', () => {
+      expect(mk2(() => snap(), () => { throw Error('bad policy'); }).tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
+    });
+    it('logs the effective floor and its source from the own policy', () => {
+      const lines = []; mk2(() => snap(), () => ({ floorMb: 4096, source: 'tool' }), lines).tryAdmit('fix');
+      expect(lines[0]).toMatch(/mem floor 4096 MB \(tool\) available 8192 MB pressure 1 → admit/);
     });
   });
   describe('R559 throwing host gate', () => {
