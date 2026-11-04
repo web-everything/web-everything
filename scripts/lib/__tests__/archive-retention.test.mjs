@@ -202,7 +202,7 @@ it('nonempty size mismatch with a valid listing keeps originals', async () => {
 it('minimum ten minute write guard applies even with zero keepDays', async () => {
   const p = await file(join(runs, 'writing.json'), new Date(now - 9 * 60000));
   const q = await file(join(runs, 'idle.json'), new Date(now - 11 * 60000));
-  const out = await run({ keepDays: 0 });
+  const out = await run({ keepDays: 0, minAgeDays: 0 });
   expect(out.errors).toEqual([]); expect(await exists(p)).toBe(true); expect(await exists(q)).toBe(false);
 });
 it('runs use the Eastern day at the UTC boundary and preserve younger files', async () => {
@@ -347,7 +347,7 @@ it('unreadable, non-terminal and PR-evidence records are never eligible', async 
   const pending = join(runs, 'p.json'); await writeFile(pending, JSON.stringify({ effects: [{ status: 'pending' }] })); await utimes(pending, old, old);
   const pr = join(runs, 'pr.json'); await writeFile(pr, JSON.stringify({ effects: [{ status: 'applied', result: { pr: 1 } }] })); await utimes(pr, old, old);
   const ok = join(runs, 'ok.json'); await writeFile(ok, rec); await utimes(ok, old, old);
-  await realRun();
+  await realRun({ isComplete: () => true });
   expect(await Promise.all([bad, pending, pr, ok].map(exists))).toEqual([true, true, true, false]);
 });
 it('a live writer pid skips the record; a dead pid is eligible; unreadable state is skipped', async () => {
@@ -359,7 +359,7 @@ it('a live writer pid skips the record; a dead pid is eligible; unreadable state
   await writeFile(join(runs, `b.json.222.${u}.tmp`), '{}');
   await writeFile(join(runs, 'c.json.lock'), 'garbage');
   const provider = createRunsWriterExclusion({ isPidAlive: pid => pid === 111 });
-  const out = await realRun({ withSourceWriterExclusion: provider });
+  const out = await realRun({ withSourceWriterExclusion: provider, isComplete: () => true });
   expect(await Promise.all([a, b, c].map(exists))).toEqual([true, false, true]);
   expect(out.errors.join()).toMatch(/writer exclusion unavailable/);
 });
@@ -376,7 +376,9 @@ it('records with unknown effect statuses are not eligible', async () => {
   const base = newRunRecord({ id: 'r1', op: 'review-pr' });
   expect(runRecordEligible(JSON.stringify({ ...base, effects: [{ status: 'weird' }] }))).toBe(false);
   expect(runRecordEligible(JSON.stringify({ effects: [] }))).toBe(false); // schema-invalid
-  expect(runRecordEligible(rec)).toBe(true);
+  expect(runRecordEligible(rec)).toBe(false); // no completion proof: fail closed
+  expect(runRecordEligible(rec, () => true)).toBe(true);
+  expect(runRecordEligible(rec, () => false)).toBe(false); // verdict + cursor 2 but not at the declared last step
   const fresh = newRunRecord({ id: 'r1', op: 'review-pr' });
   expect(runRecordEligible(JSON.stringify(fresh))).toBe(false); // cursor 0, no verdict
   expect(runRecordEligible(JSON.stringify({ ...fresh, cursor: 2 }))).toBe(false); // no verdict
@@ -396,7 +398,7 @@ it('an unreadable runs directory snapshot fails closed', async () => {
 it('Drive verification failure never deletes the local record (runs, real provider)', async () => {
   const { createRunsWriterExclusion } = await import('../runs-writer-exclusion.mjs');
   const p = join(runs, 'v.json'); await writeFile(p, rec); await utimes(p, old, old);
-  const out = await realRun({ withSourceWriterExclusion: createRunsWriterExclusion(), listBundle: async () => [] });
+  const out = await realRun({ isComplete: () => true, withSourceWriterExclusion: createRunsWriterExclusion(), listBundle: async () => [] });
   expect(out.errors.length).toBeGreaterThan(0); expect(await exists(p)).toBe(true);
 });
 it('migration-format temp (<name>.<pid>.<uuid>.tmp) of a live pid also blocks removal', async () => {
@@ -408,7 +410,7 @@ it('migration-format temp (<name>.<pid>.<uuid>.tmp) of a live pid also blocks re
 });
 it('same-inode rewrite with restored mtime is caught by the content hash at quarantine', async () => {
   const p = join(runs, 'h.json'); await writeFile(p, rec); await utimes(p, old, old);
-  const out = await realRun({ afterSourceStat: async path => { await writeFile(path, rec.replace('r1', 'r2')); await utimes(path, old, old); } });
+  const out = await realRun({ isComplete: () => true, afterSourceStat: async path => { await writeFile(path, rec.replace('r1', 'r2')); await utimes(path, old, old); } });
   expect(await exists(p)).toBe(true); expect(out.filesRetained).toBeGreaterThan(0);
 });
 
@@ -432,4 +434,10 @@ it('a parked .retiring file is restored by the next runs scan, and a failed rest
   const out2 = await run({ keepDays: 100, now: now + 2 * 86400000, emit: e => events.push(e) });
   expect(out2.errors.join()).toMatch(/ALERT/); expect(await exists(parked)).toBe(true);
   expect(events.some(e => e.kind === 'archive-retention-alert')).toBe(true);
+});
+
+it('the live registry completion check treats cursor 1 of a multi-step op as unfinished', async () => {
+  const { loadRunCompletion } = await import('../runs-writer-exclusion.mjs');
+  const done = await loadRunCompletion();
+  expect(done({ op: 'no-such-op', cursor: 1, pending: null })).toBe(false);
 });

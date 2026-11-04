@@ -44,12 +44,25 @@ export function createRunsWriterExclusion({ isPidAlive = pidAlive, list = readdi
  * Harvested from the parked lane/runs-retention eligibility rules (R549/R555): only a readable, terminal record
  * may leave; unfinished or resumable review runs and PR evidence stay local. Unreadable = NOT eligible.
  */
-export function runRecordEligible(text) {
+export async function loadRunCompletion() {
+  const { OPERATIONS } = await import('../operations/run.mjs');
+  const counts = new Map();
+  for (const [name, make] of Object.entries(OPERATIONS)) {
+    try { const n = make()?.declaration?.steps?.length; if (Number.isInteger(n)) counts.set(name, n); } catch { /* needs deps: unknown, retained */ }
+  }
+  return r => {
+    let n = counts.get(r.op) ?? null;
+    if (r.op === 'review-pr') { try { n = OPERATIONS['review-pr']({ resumeId: r.id }).declaration.steps.length; } catch { n = null; } }
+    return n !== null && r.cursor === n && !r.pending; // the engine's own 'complete' (cursor reached the last step)
+  };
+}
+
+export function runRecordEligible(text, isComplete = () => false) {
   let record;
   try { const parsed = parseRunRecord(text); if (!parsed.ok) return false; record = parsed.record; } catch { return false; }
   if (!isRunRecordTerminal(record)) return false;
   // R559: FINISHED means a verdict is present and the cursor advanced; anything else is never eligible.
-  if (!record.verdict || !(record.cursor > 0)) return false;
+  if (!record.verdict || !(record.cursor > 0) || !isComplete(record)) return false;
   // Fail closed on unknown shapes: every effect must carry a status known to be final.
   if (!record.effects.every(e => e && typeof e === 'object' && ['declared', 'applied', 'failed'].includes(e.status))) return false;
   if (record.op === 'review-pr') {

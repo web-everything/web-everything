@@ -10,7 +10,7 @@ import { sharedRunsDir } from '../operations/run-store.mjs';
 import { resolveCascade, readPlatformPreferences, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { boundedText } from './host-overload-settings.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
-import { createRunsWriterExclusion, runRecordEligible } from './runs-writer-exclusion.mjs';
+import { createRunsWriterExclusion, runRecordEligible, loadRunCompletion } from './runs-writer-exclusion.mjs';
 import { readFile } from 'node:fs/promises';
 const exec = promisify(execFile);
 const DAY = 86400000;
@@ -176,10 +176,11 @@ export async function archiveRetention(o = {}) {
       const old = scanned1.filter(f => f.path.endsWith('.json') && f.stat.mtimeMs < cutoff && !(archived.get(relative(source, f.path)) && version(f.stat).every((v, i) => v === archived.get(relative(source, f.path))[i])))
         .sort((a, b) => a.stat.mtimeMs - b.stat.mtimeMs);
       let taken = 0;
+      const isComplete = o.runEligible ? undefined : (o.isComplete ?? await loadRunCompletion());
       for (const f of old) {
         if (taken >= cap) break;
         let ok = false;
-        try { const bytes = await readFile(f.path); ok = (o.runEligible ?? runRecordEligible)(bytes.toString('utf8')); if (ok) f.hash = createHash('sha256').update(bytes).digest('hex'); } catch { ok = false; }
+        try { const bytes = await readFile(f.path); ok = (o.runEligible ?? (t => runRecordEligible(t, isComplete)))(bytes.toString('utf8')); if (ok) f.hash = createHash('sha256').update(bytes).digest('hex'); } catch { ok = false; }
         if (!ok) { out.filesRetained++; continue; }
         add(`runs-${dayOf(f.stat.mtimeMs)}`, [f]); taken++;
       }
