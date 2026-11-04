@@ -193,7 +193,7 @@ describe('bornAs read over REST', () => {
   });
   it('malformed or truncated responses fail closed', () => {
     expect(checkBornAsCollision(args(rest0({ 'compare/': ok({ nope: 1 }) }), git())).error).toContain('api-malformed');
-    expect(checkBornAsCollision(args(rest0({ 'compare/': ok({ files: new Array(300).fill({ filename: 'a', status: 'modified' }) }) }), git())).error).toContain('api-truncated');
+    expect(checkBornAsCollision(args(rest0({ 'compare/': ok({ files: new Array(300).fill({ filename: 'a', status: 'modified' }) }) }), git())).error).toContain('compare-ceiling');
     expect(checkBornAsCollision(args(rest0({ 'compare/': ok({ files: [{ filename: 'backlog/xabc123-new.md' }] }) }), git())).error).toContain('api-malformed');
     expect(checkBornAsCollision(args(rest0({ 'compare/': ok({ files: [{ filename: 'backlog/xabc123-new.md', status: 'weird' }] }) }), git())).error).toContain('api-malformed');
     expect(checkBornAsCollision(args(rest0({ 'contents/backlog/xabc123-new.md': ok({ type: 'file', encoding: 'none', content: '' }) }), git())).error).toContain('api-malformed');
@@ -388,10 +388,14 @@ describe('pagination: follow to the end or be unreadable', () => {
     const rest = routes({ '&page=1': ok({ files: page(100) }), '&page=2': http(502) });
     expect(readAddedFiles('main', SHA, { source: src(rest) })).toMatchObject({ ok: false, reason: 'api-http-502' });
   });
-  it('hitting the 3000-file ceiling is unreadable (truncated), never complete', () => {
-    const rest = routes({ 'page=': ok({ files: page(100) }) });
-    expect(readAddedFiles('main', SHA, { source: src(rest) })).toMatchObject({ ok: false, reason: 'api-truncated' });
-    expect(rest.seen).toHaveLength(31); // base-tip read + 30 pages
+  it('the compare lists at most 300 files with no truncation flag: 300 files then an empty page is compare-ceiling, never complete', () => {
+    const rest = routes({ '&page=1': ok({ files: page(100) }), '&page=2': ok({ files: page(100) }), '&page=3': ok({ files: page(100) }), '&page=4': ok({ files: [] }) });
+    expect(readAddedFiles('main', SHA, { source: src(rest) })).toMatchObject({ ok: false, reason: 'compare-ceiling' });
+  });
+  it('299 files are complete; 300 in one page is compare-ceiling', () => {
+    const one = (n) => readAddedFiles('main', SHA, { source: src(routes({ 'compare/': ok({ files: page(n) }) })) });
+    expect(one(299)).toMatchObject({ ok: true });
+    expect(one(300)).toMatchObject({ ok: false, reason: 'compare-ceiling' });
   });
   it('a tree flagged truncated is unreadable', () => {
     const rest = routes(hwWorld([], { bk: ok({ tree: [], truncated: true }) }));
