@@ -1,4 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterAll, describe, expect, it } from 'vitest';
 import { AUDIT_SETTINGS_PATH, GUARD_FLOOR, resolveAuditSettings } from '../audit-settings.mjs';
 
 const file = audit => () => JSON.stringify({ audit });
@@ -54,8 +57,48 @@ describe('audit settings (R528)', () => {
     for (const plat of ['prerelease', ['x'], 7, false]) {
       const r = resolveAuditSettings({ fileRead: file({}), platform: plat, env: {}, log: () => {} });
       expect(r.value).toMatchObject(STRICT);
-      expect(r.warnings.length).toBeGreaterThanOrEqual(7);
+      expect(r.warnings).toEqual(['audit platform preference is not an object; every setting resolves to its strictest option']);
     }
+  });
+  it('a bad platform layer is reported once, with no false per-list warnings, and accepts no hashes', () => {
+    const r = resolveAuditSettings({ fileRead: file({}), platform: 'x', env: {}, log: () => {} });
+    expect(r.warnings).toHaveLength(1);
+    expect(r.value.priorQuestionHashes).toEqual([]);
+    expect(r.sources.priorQuestionHashes).toBe('strictest');
+    expect(r.value.raceBlockPaths).toEqual(GUARD_FLOOR);
+  });
+  it('an unreadable tool file accepts no platform hashes', () => {
+    const r = resolveAuditSettings({ fileRead: () => { throw new Error('x'); }, platform: { priorQuestionHashes: ['deadbeef'] }, env: {}, log: () => {} });
+    expect(r.value.priorQuestionHashes).toEqual([]);
+    expect(r.sources.priorQuestionHashes).toBe('strictest');
+  });
+  describe('platform preferences read from disk', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'audit-settings-'));
+    afterAll(() => rmSync(dir, { recursive: true, force: true }));
+    const prefs = (name, body) => { const p = join(dir, name); writeFileSync(p, body); return p; };
+    const fromDisk = (prefsPath, audit = {}) => resolveAuditSettings({ fileRead: file(audit), env: { WE_PLATFORM_PREFERENCES_FILE: prefsPath }, log: () => {} });
+    it('an unreadable or corrupt platform file fails closed instead of reading as unset', () => {
+      for (const p of [dir, prefs('truncated.json', '{"audit":{"releaseStage":"prod"} ')]) {
+        const r = fromDisk(p);
+        expect(r.value).toMatchObject(STRICT);
+        expect(r.warnings.join()).toMatch(/platform preference unreadable/);
+      }
+    });
+    it('an explicit "audit": null in the platform file fails closed (as the same null in the tool file does)', () => {
+      expect(fromDisk(prefs('null.json', '{"audit":null}')).value).toMatchObject(STRICT);
+    });
+    it('a valid platform file still supplies values the tool file omits', () => {
+      const r = fromDisk(prefs('ok.json', '{"audit":{"recheck":{"max":0}}}'));
+      expect(r.value).toMatchObject({ recheckMax: 0, verdictMode: 'model' });
+      expect(r.warnings).toEqual([]);
+    });
+  });
+  it('misspelled keys are named in a warning instead of vanishing silently', () => {
+    const r = resolve(full({ verdicts: { mode: 'shadow' }, ReleaseStage: 'prod', recheck: { max: 1, Max: 0 }, $note: 'ok' }));
+    for (const k of ['"verdicts"', '"ReleaseStage"', '"recheck.Max"']) expect(r.warnings.join()).toContain(k);
+    expect(r.warnings.join()).toMatch(/unknown setting/);
+    expect(r.warnings.join()).not.toMatch(/\$note/);
+    expect(resolve(full()).warnings).toEqual([]);
   });
   it('empty-object path lists and hashes warn instead of vanishing silently', () => {
     const r = resolve(full({ raceBlockPaths: {}, guardFloorPaths: {}, priorQuestionHashes: {} }));

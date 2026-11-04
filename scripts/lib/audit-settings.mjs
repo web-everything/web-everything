@@ -6,7 +6,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
-import { cascadePolicy } from './policy-cascade.mjs';
+import { cascadePolicy, readPlatformPreferences } from './policy-cascade.mjs';
 
 export const AUDIT_SETTINGS_PATH = fileURLToPath(new NodeURL('../settings/codex-audit.json', import.meta.url));
 /** Built-in race-protected paths; settings and env can only ADD to these. */
@@ -64,6 +64,26 @@ function rawMalformed(layer, key, valid) {
   if (!isObj(layer[a])) return true;
   return Object.hasOwn(layer[a], b) && !valid(layer[a][b]);
 }
+const KNOWN = (() => {
+  const m = new Map();
+  for (const key of [...Object.keys(STRICTEST), 'raceBlockPaths', 'guardFloorPaths', 'priorQuestionHashes']) {
+    const [a, b] = pathOf(key);
+    if (!m.has(a)) m.set(a, new Set());
+    if (b !== undefined) m.get(a).add(b);
+  }
+  return m;
+})();
+/** Misspelled keys (`verdicts`, `ReleaseStage`, `recheck.Max`) read as omitted: name them ($-prefixed notes skipped). */
+function unknownKeys(layer) {
+  if (!isObj(layer)) return [];
+  const out = [];
+  for (const [a, x] of Object.entries(layer)) {
+    if (a.startsWith('$')) continue;
+    if (!KNOWN.has(a)) { out.push(a); continue; }
+    if (KNOWN.get(a).size && isObj(x)) for (const b of Object.keys(x)) if (!b.startsWith('$') && !KNOWN.get(a).has(b)) out.push(`${a}.${b}`);
+  }
+  return out;
+}
 const parseEnv = (key, raw) => {
   if (typeof raw !== 'string') return undefined;
   if (['recheckMax', 'baseRecheckMax'].includes(key)) return /^\d+$/.test(raw) ? Number(raw) : undefined;
@@ -85,21 +105,35 @@ export function resolveAuditSettings({ path = AUDIT_SETTINGS_PATH, fileRead = re
   const warnings = [];
   const warn = m => { warnings.push(m); try { (log ?? (() => {}))(m); } catch { /* never throws */ } };
   const { tool, unreadable } = readFile(path, fileRead);
-  let cascade;
-  try { cascade = cascadePolicy('audit', tool, { standard: undefined, platform, env, log }); } catch { cascade = null; }
-  const layered = cascade?.layered ?? {};
+  // The platform layer is read HERE, not inside the cascade, so its read errors and an explicit `"audit": null`
+  // stay visible: the cascade drops both and they would read as "no platform preference".
+  let plat = platform; let platUnreadable = false;
+  if (plat === undefined) {
+    try {
+      const { prefs, errors } = readPlatformPreferences({ env, warn: () => {} });
+      plat = prefs.audit;
+      platUnreadable = errors.length > 0 || (Object.hasOwn(prefs, 'audit') && prefs.audit === null);
+    } catch { plat = undefined; platUnreadable = true; }
+  }
   // A platform preference that is present but not an object flattens to one root leaf and reads as all-omitted.
-  const plat = cascade?.platform;
-  const platBad = plat !== undefined && plat !== null && !isObj(plat);
-  if (platBad) warn('audit platform preference is not an object; every setting resolves to its strictest option');
-  const malformed = (key, valid) => platBad || [plat, tool].some(layer => rawMalformed(layer, key, valid));
+  const platBad = platUnreadable || (plat !== undefined && plat !== null && !isObj(plat));
+  if (platBad) warn(`audit platform preference ${platUnreadable ? 'unreadable' : 'is not an object'}; every setting resolves to its strictest option`);
+  let cascade;
+  try { cascade = cascadePolicy('audit', tool, { standard: undefined, platform: plat === undefined ? null : plat, env, log }); } catch { cascade = null; }
+  const layered = cascade?.layered ?? {};
+  for (const [name, layer] of [['platform', plat], ['file', tool]]) {
+    const unknown = unknownKeys(layer);
+    if (unknown.length) warn(`audit ${name} layer has unknown setting(s) ${JSON.stringify(unknown.slice(0, 20))}; ignored (check the spelling)`);
+  }
+  // Malformed RAW entries in either layer (raw only: the platform-level fault above is reported once, not per key).
+  const malformed = (key, valid) => [plat, tool].some(layer => rawMalformed(layer, key, valid));
   const value = {}; const sources = {};
   for (const key of Object.keys(DEFAULTS)) {
     let v = get(layered, key); let src = 'file';
-    const bad = malformed(key, VALID[key]);
+    const bad = platBad || malformed(key, VALID[key]);
     if (v === undefined && !unreadable && cascade && !bad) { v = DEFAULTS[key]; src = 'built-in'; }
     if (unreadable || !cascade || bad || !VALID[key](v)) {
-      if (unreadable || bad || v !== undefined) { warn(`audit setting ${key} unreadable or invalid; using strictest ${JSON.stringify(STRICTEST[key])}`); }
+      if (!platBad && (unreadable || bad || v !== undefined)) { warn(`audit setting ${key} unreadable or invalid; using strictest ${JSON.stringify(STRICTEST[key])}`); }
       v = STRICTEST[key]; src = 'strictest';
     }
     // allow is never trusted: it resolves to block.
@@ -127,9 +161,15 @@ export function resolveAuditSettings({ path = AUDIT_SETTINGS_PATH, fileRead = re
     sources[key] = envList.length ? 'env' : list.length ? 'file' : 'built-in';
   }
   // Prior question hashes only widen what is ACCEPTED, so no env route exists; a bad list is empty.
+  // Any unreadable layer accepts none (strictest), like every single-value setting above.
   const hashes = get(layered, 'priorQuestionHashes');
-  const hashesBad = malformed('priorQuestionHashes', validHashes);
-  value.priorQuestionHashes = Object.freeze(hashes === undefined && !hashesBad ? [] : !hashesBad && validHashes(hashes) ? [...hashes] : (warn('audit setting priorQuestionHashes invalid; none accepted'), []));
-  sources.priorQuestionHashes = hashes === undefined && !hashesBad ? 'built-in' : 'file';
+  const hashesInvalid = malformed('priorQuestionHashes', validHashes) || (hashes !== undefined && !validHashes(hashes));
+  if (unreadable || !cascade || platBad || hashesInvalid) {
+    if (hashesInvalid) warn('audit setting priorQuestionHashes invalid; none accepted');
+    value.priorQuestionHashes = Object.freeze([]); sources.priorQuestionHashes = 'strictest';
+  } else {
+    value.priorQuestionHashes = Object.freeze(hashes === undefined ? [] : [...hashes]);
+    sources.priorQuestionHashes = hashes === undefined ? 'built-in' : 'file';
+  }
   return { value: Object.freeze(value), sources, warnings };
 }

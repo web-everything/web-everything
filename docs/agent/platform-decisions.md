@@ -6493,8 +6493,10 @@ D1 → D3 downgrade may restate the trigger.
 `audit.cards.requireOnMain` / `requirePayBy`), resolved by `scripts/lib/audit-settings.mjs` through the shared
 policy cascade from the trusted running checkout, never from the candidate diff. Environment may only tighten;
 any unreadable or invalid value resolves to the strictest option, including a malformed explicit entry the
-cascade would otherwise drop (an empty object at a setting, or a non-object where a section belongs); an empty
-section sets nothing and counts as omitted; `allow` resolves to `block`. Path lists only
+cascade would otherwise drop (an empty object at a setting, or a non-object where a section belongs) in either the
+platform or the file layer, and an unreadable, corrupt, `null` or non-object platform preference (every setting
+strictest, no prior question hashes accepted); an empty section sets nothing and counts as omitted; unknown
+(misspelled) keys are named in a warning; `allow` resolves to `block`. Path lists only
 add to the built-in guard floor. The **prod trigger is the first outside user** of any constellation surface:
 first public npm package publish or first external user/customer on plateau-app. The operator records that level
 move; B rows never relax, and outstanding due debt gates the move.
