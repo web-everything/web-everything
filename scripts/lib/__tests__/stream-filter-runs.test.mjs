@@ -240,6 +240,19 @@ describe('run PR prefilter (bounded head read)', () => {
     expect(runMayBeForPr(put('c', 'not json at all'), 5)).toBe(true); // unknown, never skipped
     expect(runMayBeForPr(joinPath(dir, 'missing.json'), 5)).toBe(true); // the real read decides
   });
+  it('ignores a nested metadata.input decoy and needs the root input first', () => {
+    expect(prNumberFromRunHead('{"metadata":{"input":{"pr":8}},"input":{"pr":7}}')).toBe(7); // the root input, not the decoy
+    expect(prNumberFromRunHead('{"input":{"pr":7}}')).toBe(7);
+    expect(prNumberFromRunHead('{"input":{"x":{"pr":8},"pr":7}}')).toBeNull();
+    expect(prNumberFromRunHead('["input"]')).toBeNull();
+    expect(runMayBeForPr(put('decoy', '{"metadata":{"input":{"pr":8}},"input":{"pr":7}}'), 7)).toBe(true);
+  });
+  it('skips a clean other-PR record but parses a torn one so its throw is kept', () => {
+    expect(runMayBeForPr(put('clean', '{"input":{"pr":8},"x":1}\n'), 7)).toBe(false);
+    expect(runMayBeForPr(put('torn', '{"input":{"pr":8},BROKEN'), 7)).toBe(true);
+    expect(runMayBeForPr(put('trunc', rec(8).slice(0, 3000)), 7)).toBe(true);
+    expect(runMayBeForPr(put('empty', ''), 7)).toBe(true);
+  });
   it('an unreadable head read throws instead of skipping (fail closed)', () => {
     expect(() => runMayBeForPr(dir, 5)).toThrow(); // EISDIR
   });

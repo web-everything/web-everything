@@ -1,6 +1,6 @@
 import { cascadePolicy, platformPreference } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
-import { closeSync, openSync, readSync } from 'node:fs';
+import { closeSync, fstatSync, openSync, readSync } from 'node:fs';
 
 /**
  * Card xwu9oxh slice S1a: the same read set, order and errors as `ids.map(read).filter(keep)`, without holding
@@ -53,24 +53,61 @@ export function resolveRunScanSettings({ file = readSettings(), platform, env = 
 
 /** Bytes of a run record read to learn its PR (the `input.pr` field sits at the top of the record). */
 export const RUN_HEAD_BYTES = 512;
-const HEAD_PR = /"input"\s*:\s*\{[^{}]*?"pr"\s*:\s*(\d+)\s*[,}]/;
+const RUN_TAIL_BYTES = 64;
+const TOKEN = /"(?:[^"\\]|\\.)*"|[{}\[\]:,]|-?\d+(?:\.\d+)?|true|false|null/gy;
 
-/** The PR number named in the first RUN_HEAD_BYTES of a run record, or null when the head does not say. */
+/** The PR number of the ROOT `input` object, read from the head of a record: the head must open the root
+ * object, and `"pr":N` must be a direct member of `input` before any nested object or array. Else null. */
 export function prNumberFromRunHead(text) {
-  const m = HEAD_PR.exec(text.slice(0, RUN_HEAD_BYTES));
-  return m ? Number(m[1]) : null;
+  const t = text.slice(0, RUN_HEAD_BYTES);
+  const tokens = []; TOKEN.lastIndex = 0;
+  const skip = /\s*/y;
+  for (let at = 0; at < t.length;) {
+    skip.lastIndex = at; skip.test(t); at = skip.lastIndex;
+    if (at >= t.length) break;
+    TOKEN.lastIndex = at; const m = TOKEN.exec(t);
+    if (!m) break; // a token cut off by the head bound, or not JSON: decide from what came before
+    tokens.push(m[0]); at = TOKEN.lastIndex;
+  }
+  if (tokens[0] !== '{') return null;
+  let depth = 1;
+  for (let i = 1; i < tokens.length; i++) {
+    const tok = tokens[i];
+    if (tok === '{' || tok === '[') { depth++; continue; }
+    if (tok === '}' || tok === ']') { depth--; continue; }
+    if (depth === 1 && tok === '"input"' && tokens[i + 1] === ':' && tokens[i + 2] === '{') {
+      for (let j = i + 3, d = 2; j < tokens.length; j++) {
+        const u = tokens[j];
+        if (u === '{' || u === '[' || u === '}' || u === ']') return null;
+        if (d === 2 && u === '"pr"' && tokens[j + 1] === ':' && /^\d+$/.test(tokens[j + 2] ?? '') && [',', '}'].includes(tokens[j + 3])) return Number(tokens[j + 2]);
+      }
+      return null;
+    }
+  }
+  return null;
 }
 
-/** False ONLY when a bounded head read proves the run is for a different PR. Anything unclear (no PR in the
- * head, a missing file) answers true so the real parse decides; any other read error throws (fail closed). */
+/** True when the last RUN_TAIL_BYTES of the record end (ignoring whitespace) in `}`, i.e. it is not torn. */
+export function runTailComplete(text) {
+  return /\}\s*$/.test(text.slice(-RUN_TAIL_BYTES));
+}
+
+/** False ONLY when a bounded head read proves the run is for a different PR AND a bounded tail read shows a
+ * complete record. Anything unclear (no PR in the head, torn tail, a missing file) answers true so the real
+ * parse decides and keeps its throw; any other read error throws (fail closed). */
 export function runMayBeForPr(path, pr) {
   let fd;
   try { fd = openSync(path, 'r'); } catch (e) { if (e.code === 'ENOENT') return true; throw e; }
   try {
-    const buf = Buffer.alloc(RUN_HEAD_BYTES);
-    const n = readSync(fd, buf, 0, RUN_HEAD_BYTES, 0);
-    const found = prNumberFromRunHead(buf.toString('utf8', 0, n));
-    return found === null || found === Number(pr);
+    const head = Buffer.alloc(RUN_HEAD_BYTES);
+    const n = readSync(fd, head, 0, RUN_HEAD_BYTES, 0);
+    const found = prNumberFromRunHead(head.toString('utf8', 0, n));
+    if (found === null || found === Number(pr)) return true;
+    const size = fstatSync(fd).size;
+    const len = Math.min(RUN_TAIL_BYTES, size);
+    const tail = Buffer.alloc(len);
+    const m = readSync(fd, tail, 0, len, size - len);
+    return !runTailComplete(tail.toString('utf8', 0, m));
   } finally { closeSync(fd); }
 }
 
