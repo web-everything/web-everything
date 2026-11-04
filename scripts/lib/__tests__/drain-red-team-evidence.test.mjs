@@ -451,13 +451,13 @@ it('surfaces a finished old card-only skip when the live head has no read', () =
     netBasis: { rev: oldHead }, netChangedFiles: ['backlog/123-card.md'], diffText: '+card',
   } } };
   writeRun({ ...newRunRecord({ id: 'review-pr-old-card', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
-    ...loopPayload }, f.runsDir);
+    ...loopPayload, stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(1000).toISOString() }] }, f.runsDir);
   recordRedTeamStatus({ ...f, loopPayload, status: 'finished', result: 'skipped' }, f);
   expect(readDrainRedTeamEvidence(f)).toMatchObject({ loopPayload, recorded: false, seatRecorded: false,
     status: { status: 'finished', head: oldHead, skipCardOnly: true } });
   // The exact live-head read always wins over this historical fallback.
   writeRun({ ...newRunRecord({ id: 'review-pr-live', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
-    ...payload(f.head) }, f.runsDir);
+    ...payload(f.head), stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(2000).toISOString() }] }, f.runsDir);
   expect(readDrainRedTeamEvidence(f).loopPayload.findings.read.netBasis.rev).toBe(f.head);
 });
 
@@ -532,8 +532,10 @@ it.each([
 ])('%s', (_name, reader, expectedId, expectedReads) => {
   const f = fixture();
   const runs = {
-    'review-pr-a': { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head) },
-    'review-pr-b': { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head), verdict: { verdict: 'changes' } },
+    'review-pr-a': { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head),
+      stepTimings: [{ step: 'read', startedAt: new Date(1000).toISOString() }] },
+    'review-pr-b': { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head), verdict: { verdict: 'changes' },
+      stepTimings: [{ step: 'read', startedAt: new Date(1000).toISOString() }] },
     'review-pr-c': { op: 'review-pr', input: { repo: 'other', pr: f.pr }, ...payload(f.head) },
   };
   let reads = 0;
@@ -615,4 +617,57 @@ describe('readRecoveryWitness carryEvidence keeps the drain tie order', () => {
     const call = src.split('carryEvidence: readDrainRedTeamEvidence(')[1].split('\n')[0];
     expect(call).not.toMatch(/\blookup\b/);
   });
+});
+
+describe('review ordering uses persisted run start time', () => {
+  const started = ms => ({ stepTimings: [{ step: 'read', startedAt: new Date(ms).toISOString() }] });
+  it.each([['drain', readDrainRedTeamEvidence], ['recovery', readRecoveryWitness]])('%s selects a newer rejection over an older acceptance touched later', (_name, reader) => {
+    const f = fixture();
+    const older = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head), ...started(1000) };
+    const newer = { ...older, verdict: { verdict: 'changes' }, ...started(2000) };
+    const result = reader({ ...f, list: () => ['review-pr-older', 'review-pr-newer'],
+      stat: path => ({ mtimeMs: path.endsWith('review-pr-older.json') ? 4000 : 3000 }), read: id => id.includes('older') ? older : newer });
+    expect(result.newest ?? result.loopPayload).toEqual(newer);
+  });
+  it.each([['drain', readDrainRedTeamEvidence], ['recovery', readRecoveryWitness]])('%s holds when either of two same-PR runs lacks a parseable start timestamp', (_name, reader) => {
+    const f = fixture();
+    const base = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head) };
+    for (const [missing, invalidStart] of [
+      ['review-pr-a', {}], ['review-pr-b', {}],
+      ['review-pr-a', { stepTimings: [{ step: 'read', startedAt: 'not-a-date' }] }],
+    ]) {
+      const result = reader({ ...f, list: () => ['review-pr-a', 'review-pr-b'], stat: () => ({ mtimeMs: 1 }),
+        read: id => id === missing ? { ...base, ...invalidStart } : { ...base, ...started(2000) } });
+      expect(result).toEqual({ ok: false, reason: 'run-start-missing' });
+      expect(redTeamEnqueueHold({ ...f, ...result, comments: [] })).toMatch(/run-start-missing/);
+    }
+  });
+  it.each([['drain', readDrainRedTeamEvidence], ['recovery', readRecoveryWitness]])('%s still accepts a single run without a timestamp because no ordering is needed', (_name, reader) => {
+    const f = fixture();
+    const run = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head) };
+    const result = reader({ ...f, list: () => ['review-pr-single'], stat: () => ({ mtimeMs: 1 }), read: () => run });
+    expect(result.ok).not.toBe(false);
+    expect(result.newest ?? result.loopPayload).toEqual(run);
+  });
+  it('uses the newer start time for the any-head selection that invalidates a carry', () => {
+    const f = fixture(), from = 'c'.repeat(40), laterHead = 'd'.repeat(40);
+    recordRedTeamStatus({ ...f, loopPayload: { ...payload(f.head), carriedFrom: from }, status: 'finished', result: 'skipped' }, f);
+    const older = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(from), ...started(1000) };
+    const newer = { ...older, ...payload(laterHead), verdict: { verdict: 'changes' }, ...started(2000) };
+    const result = readDrainRedTeamEvidence({ ...f, list: () => ['review-pr-older', 'review-pr-newer'],
+      stat: path => ({ mtimeMs: path.endsWith('review-pr-older.json') ? 4000 : 3000 }), read: id => id.includes('older') ? older : newer });
+    expect(result).toMatchObject({ carryConflict: true, loopPayload: newer });
+  });
+});
+
+it.each([['drain', readDrainRedTeamEvidence, 'review-pr-a'], ['recovery', readRecoveryWitness, 'review-pr-b']])('%s breaks equal start times by its existing id order, never by mtime', (_name, reader, expectedId) => {
+  const f = fixture();
+  const runs = Object.fromEntries(['review-pr-a', 'review-pr-b'].map(id => [id, {
+    op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head),
+    verdict: { verdict: id === 'review-pr-a' ? 'accept' : 'changes' },
+    stepTimings: [{ step: 'read', startedAt: new Date(1000).toISOString() }],
+  }]));
+  const result = reader({ ...f, list: () => Object.keys(runs),
+    stat: path => ({ mtimeMs: path.includes(expectedId) ? 3000 : 4000 }), read: id => runs[id] });
+  expect(result.newest ?? result.loopPayload).toEqual(runs[expectedId]);
 });

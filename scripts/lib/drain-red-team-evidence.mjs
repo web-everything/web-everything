@@ -52,33 +52,42 @@ const digest = bytes => bytes === null ? null : createHash('sha256').update(byte
 const optionalBytes = path => { try { return readFileSync(path); } catch (e) { if (e.code === 'ENOENT') return null; throw e; } };
 
 // mtime orders IO, but finishing an older panel can touch its file after a newer
-// panel started. Compare read-step start times when ruling out unfinished re-reviews.
+// panel started. The record has no createdAt: only the read-step start orders runs.
 const reviewStartedAt = hit => {
   const timings = hit.run.stepTimings;
-  const started = Date.parse(Array.isArray(timings) ? timings.find(t => t?.step === 'read')?.startedAt : '');
-  return Number.isFinite(started) ? started : hit.at;
+  const started = Array.isArray(timings) ? timings.find(t => t?.step === 'read')?.startedAt : undefined;
+  return typeof started === 'string' ? Date.parse(started) : NaN;
 };
 const unfinishedReview = run => !run.verdict || run.pending != null
   || run.effects?.some(effect => ['pending', 'in-flight'].includes(effect?.status));
 
 // Retain only the selected head/PR payloads and the newest unfinished attempt. Finished
 // evidence is usable only after the same bounded window rules out a newer unfinished run.
-function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak, scanSettings, warn }) {
+function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak = 'id-asc', scanSettings, warn }) {
   let scanned = false, newest = null, exact = null, unfinished = null, failure = null;
+  const newer = (candidate, selected) => !selected
+    || reviewStartedAt(candidate) > reviewStartedAt(selected)
+    || (reviewStartedAt(candidate) === reviewStartedAt(selected)
+      && (tieBreak === 'id-desc' ? candidate.id.localeCompare(selected.id) > 0 : candidate.id < selected.id));
   return (exactHead = true) => {
     if (!scanned) {
       const find = createNewestRunFinder({ ids: list(runsDir).filter(id => id.startsWith('review-pr-')), tieBreak,
         stat: id => stat(join(runsDir, `${id}.json`)), read: id => read(id, runsDir), scanSettings, warn });
+      let samePrCount = 0, startMissing = false;
       const end = find((run, id, at) => {
         if (run?.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr)) return false;
         const hit = { run, id, at };
-        newest ??= hit;
-        if (run.findings?.read?.netBasis?.rev === head) exact ??= hit;
-        if (unfinishedReview(run) && (!unfinished || reviewStartedAt(hit) > reviewStartedAt(unfinished))) unfinished = hit;
+        samePrCount++;
+        if (!Number.isFinite(reviewStartedAt(hit))) startMissing = true;
+        if (newer(hit, newest)) newest = hit;
+        if (run.findings?.read?.netBasis?.rev === head && newer(hit, exact)) exact = hit;
+        if (unfinishedReview(run) && newer(hit, unfinished)) unfinished = hit;
         return false;
       });
       const selected = exact ?? newest;
-      if (unfinished && (!selected || reviewStartedAt(unfinished) >= reviewStartedAt(selected))) {
+      if (samePrCount > 1 && startMissing) {
+        failure = { ok: false, reason: 'run-start-missing' };
+      } else if (unfinished && (!selected || unfinished === selected || reviewStartedAt(unfinished) >= reviewStartedAt(selected))) {
         failure = { ok: false, reason: 'review-unfinished' };
       } else if (end?.ok === false) failure = end;
       scanned = true;

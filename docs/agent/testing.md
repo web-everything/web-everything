@@ -3923,7 +3923,10 @@ budget before completion returns `{ok:false, reason:"scan-capped"}` and logs the
 enqueue gate, status labels and recovery scheduler hold on unknown evidence. Inspect omitted run
 records before deliberately raising the limit. Genuine folder exhaustion still means no match.
 Finished evidence requires scanning the bounded window to rule out a newer unfinished re-review;
-compare read-step start times because finishing an older run can advance its mtime. A newer
+choose both head-specific and any-head matches by read-step `startedAt`, never file mtime.
+Equal starts retain the drain's ascending / recovery's descending ID tie order. Two or more
+same-repo/PR runs with any missing/unparseable start return `run-start-missing` and hold; a
+single run needs no ordering and remains usable without a timestamp. A newer
 unfinished attempt holds as `review-unfinished`; unreadable records still throw, never skip.
 
 The scoped regressions are `drain-red-team-evidence`, `stream-filter-runs`, and the settings layout
