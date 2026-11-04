@@ -159,7 +159,7 @@ function discoverDefault({ files, cwd }) {
 export async function runShards({ argv, shards: count, parallel, budgetMs }, deps = {}) {
   const { fs = nodeFs, now = Date.now, tmpdir = nodeTmpdir, log = s => process.stdout.write(s),
     env = process.env, cwd = process.cwd(), execute = executeShard,
-    discover = discoverDefault, acquireLocal = acquireLocalDefault, releaseLocal = slot => releaseOwnedSlot(slot.options) } = deps;
+    discover = discoverDefault, exists = q => nodeFs.existsSync(q), acquireLocal = acquireLocalDefault, releaseLocal = slot => releaseOwnedSlot(slot.options) } = deps;
   let directory;
   try {
     if (!positive(parallel) || !Number.isSafeInteger(budgetMs) || budgetMs < 0) throw Error('invalid parallelism or budget');
@@ -169,6 +169,13 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
     // Discovery that rejects EVERY selected file is more likely a path/config mismatch than a fully excluded selection:
     // keep them all so any file that really cannot run shows up as incomplete inventory instead of a vacuous green.
     if (excluded.length === planned.length) excluded = [];
+    // A selected path discovery did not find is only a legitimate config exclusion if it exists on disk. One that does
+    // not exist can never execute: RED against the ORIGINAL selection, before anything is filtered out of the inventory.
+    const missing = excluded.filter(f => !exists(resolve(cwd, f)));
+    if (missing.length) {
+      log(`verify-shards: RED (${missing.length} selected file(s) not found, so they cannot execute: ${missing.join(' ')})\n`);
+      return 1;
+    }
     if (excluded.length) {
       log(`verify-shards: NOTE ${excluded.length} selected file(s) are excluded by the vitest config (never runnable here or in CI), not run: ${excluded.join(' ')}\n`);
       argv = argv.filter(a => !excluded.includes(a));
