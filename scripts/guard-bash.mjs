@@ -2833,6 +2833,11 @@ export function daemonCloneWriteReason(segment, options = {}) {
     // #xpt9fvd — fetch diagnosis stays allowed (it only updates remote-tracking refs), UNLESS it writes a local
     // branch (a refspec `src:<branch>` or --update-head-ok can move the checked-out branch under the working tree).
     if (sub === 'fetch') {
+      // An unknown target (`read GIT_DIR`, an unresolvable environment or wrapper value) is not the lane: the
+      // lane's own fetch config proves nothing about the repository this fetch writes. Deny before reading it.
+      if (unknownTarget || targets.includes(null)) {
+        return daemonCloneWriteMessage('unresolved git target: fetch config cannot be read for an unknown repository');
+      }
       let config = fetchConfig;
       if (daemonFetchConfigReader) {
         try { config = daemonFetchConfigReader(s, cwd, envDirs, configEnv); } catch { config = null; }

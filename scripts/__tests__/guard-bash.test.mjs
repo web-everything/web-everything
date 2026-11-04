@@ -4896,6 +4896,29 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     })).toMatch(/DAEMON CLONE/);
   });
 
+  it('DENIES fetch with an unmodelled target before reading lane config', () => {
+    // Send-back IC_kwDORBt1-c8AAAABi0HKfg: after `read GIT_DIR` the Git target is unknown, so the lane's own
+    // fetch config proves nothing about the repository the fetch writes. Deny without ever reading it.
+    const reads = [];
+    const reader = (...args) => { reads.push(args); return ['+refs/heads/*:refs/remotes/origin/*']; };
+    for (const command of ['read GIT_DIR; git fetch origin', 'read GIT_DIR; export GIT_DIR; git fetch origin',
+      'read -r GIT_WORK_TREE <f; export GIT_WORK_TREE; git fetch origin']) {
+      expect(decide(command, { cwd: LANE, daemonCloneRoots: roots, daemonFetchConfigReader: reader })).toMatch(/DAEMON CLONE/);
+    }
+    // The same closed path at the pure entry point: an unknown target is a null target.
+    expect(daemonCloneWriteReason('git fetch origin', {
+      cwd: LANE, roots, unknownTarget: true, daemonFetchConfigReader: reader, fetchConfig: [],
+    })).toMatch(/DAEMON CLONE/);
+    expect(reads).toEqual([]);
+    // Resolved-target fetches are unchanged: the config is still read and a remote-tracking fetch stays allowed.
+    expect(decide('git fetch origin', { cwd: CLONE, daemonCloneRoots: roots, daemonFetchConfigReader: reader })).toBeNull();
+    expect(decide(`git -C ${CLONE} fetch origin`, { cwd: LANE, daemonCloneRoots: roots, daemonFetchConfigReader: reader })).toBeNull();
+    expect(reads.length).toBe(2);
+    expect(decide('git fetch origin', {
+      cwd: CLONE, daemonCloneRoots: roots, daemonFetchConfigReader: () => ['+refs/heads/*:refs/heads/*'],
+    })).toMatch(/DAEMON CLONE/);
+  });
+
   it('removes unset tombstones from the config-reader process environment', () => {
     readDaemonFetchConfig('git fetch origin', CLONE, [], { GIT_DIR: undefined, GIT_WORK_TREE: undefined }, (_git, _args, options) => {
       expect(options.env).not.toHaveProperty('GIT_DIR');
