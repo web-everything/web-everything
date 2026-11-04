@@ -167,9 +167,11 @@ describe('sourceNeedsGit', () => {
     for (const lit of [
       "'env -i git status'", "'env -u X git status'", "'command -- git status'", "'sudo -n git status'", "'sudo -u root git status'",
       "'time -p git status'", "'nice -n 5 git status'", "'env -i FOO=1 git status'", "'sudo -E env -i git'", "'xargs -0 git add'", "'env -i /usr/bin/git status'",
-      "\"$'git' status\"", "'$\"git\" status'", "\"$'g\\\\x69t' status\"", "\"$'\\\\147it' status\"", "'FOO=$(echo a) git status'", "'(cd x) git status'",
+      "'bash -c \"git x\"'", "\"sh -c 'git x'\"", "'bash -lc \"git x\"'", "'sudo bash -c \"git x\"'", "'/bin/sh -c \"git x\"'", "\"sh -c 'bash -c \\\"git x\\\"'\"",
+      "'timeout 5 git x'", "'timeout -k 1 5 git x'", "'/usr/bin/env git x'", "'/usr/bin/sudo -n git x'", "'stdbuf -oL git x'", "\"$'\\\\u0067it' x\"",
+      "\"$'git' status\"","'$\"git\" status'", "\"$'g\\\\x69t' status\"", "\"$'\\\\147it' status\"", "'FOO=$(echo a) git status'", "'(cd x) git status'",
     ]) expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(true);
-    for (const lit of ["'env -i ls'", "'nice -n 5 node git.mjs'", "'echo -n git status'", "'-i git status'", "'sudo ls -a'"]) {
+    for (const lit of ["'env -i ls'", "'nice -n 5 node git.mjs'", "'echo -n git status'", "'-i git status'", "'sudo ls -a'", "'bash -c \"ls x\"'", "'bash script.sh git'", "'sh -x git.sh'", "'timeout 5 ls'", "'sh -c'"]) {
       expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(false);
     }
   });
@@ -201,7 +203,7 @@ describe('sourceNeedsGit', () => {
     const o = { helpers: ['a.mjs'] };
     const inputs = ['(/['.repeat(100000), 'import' + ' '.repeat(300000) + 'x', 'a'.repeat(300000), "('".repeat(150000), '${'.repeat(100000), '`${'.repeat(100000), '`${' + '(/['.repeat(100000), '`${' + '(/'.repeat(150000),
       ...["'" + 'A=b '.repeat(70000) + "'", "'" + ' '.repeat(300000) + "'", "'" + ';'.repeat(300000) + "'", "'" + ' /'.repeat(150000) + "'",
-        "'" + 'sudo -a '.repeat(37000) + "'", "'" + 'env -u x '.repeat(33000) + "'", "'" + '\\x'.repeat(140000) + "'", "'" + '"\\'.repeat(140000) + "'", "'" + '$"'.repeat(140000) + "'", "'" + ') '.repeat(140000) + "'",
+        "'" + 'sudo -a '.repeat(37000) + "'", "'" + 'sh -c '.repeat(50000) + "'", "'" + 'bash -x '.repeat(37000) + "'", "'" + 'timeout 5 '.repeat(30000) + "'","'" + 'env -u x '.repeat(33000) + "'", "'" + '\\x'.repeat(140000) + "'", "'" + '"\\'.repeat(140000) + "'", "'" + '$"'.repeat(140000) + "'", "'" + ') '.repeat(140000) + "'",
         '`' + '\n '.repeat(150000) + '`','function(){}'.repeat(25000), 'class{}'.repeat(40000), '=function(){'.repeat(25000)].map(x => "import 'node:child_process'; " + x)];
     const t0 = Date.now();
     for (const s of inputs) expect(sourceNeedsGit(s, o)).toBe(false);

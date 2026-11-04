@@ -229,7 +229,14 @@ const ENV_ASSIGN = /[A-Za-z_]\w*=(?:"[^"\n]*"|'[^'\n]*'|\S*)\s+/y;
 const TOKEN = /\S+/y;
 const GIT_AT = /(?:[^\n]*\/)?git(?:\.exe)?(?=\s|$)/y;
 // Words that run the next word as a command (shell keywords, groups, wrappers); skipped before looking for `git`.
-const COMMAND_PREFIX = new Set(['then', 'else', 'elif', 'do', 'if', 'while', 'until', '!', '{', 'sudo', 'time', 'exec', 'env', 'command', 'nice', 'nohup', 'xargs', 'builtin']);
+const COMMAND_PREFIX = new Set(['then', 'else', 'elif', 'do', 'if', 'while', 'until', '!', '{', 'sudo', 'time', 'exec', 'env', 'command', 'nice', 'nohup', 'xargs', 'builtin',
+  'timeout', 'setsid', 'stdbuf', 'ionice', 'caffeinate', 'doas', 'xcrun', 'arch']);
+// A shell run with `-c` takes the rest of the segment as a command line of its own.
+const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh']);
+const SHELL_C_FLAG = /^-[A-Za-z]*c[A-Za-z]*$/;
+const DURATION = /^\d[\d.]*[smhd]?$/; // `timeout 5 git`, `timeout -k 1 5 git`
+const MAX_SHELL_DEPTH = 3;
+const baseName = (tok) => tok.slice(tok.lastIndexOf('/') + 1);
 // The text a JS string literal evaluates to: `\n` `\t` `\xHH` `\uHHHH` `\u{…}` and the other escapes are decoded in one
 // pass (so `\\n` stays a backslash and an `n`); a `\` + line break is a continuation and vanishes.
 const JS_ESCAPE = /\\(?:x([0-9a-fA-F]{2})|u\{([0-9a-fA-F]{1,6})\}|u([0-9a-fA-F]{4})|(\r\n|[\s\S]))/g;
@@ -246,7 +253,8 @@ const GIT_TOKEN = /^(?:\S*\/)?git(?:\.exe)?$/;
 // Walks the command word of one segment. A work list over (position, behind-a-wrapper) states, each visited once, keeps it
 // linear however many `A=b` prefixes, wrappers or flags there are. Behind a wrapper (`sudo`, `env`, `nice`, `command`, a
 // shell keyword …) an option (`-i`, `--`) is skipped, and so is the value that may follow it (`env -u X git`, `nice -n 5 git`).
-function commandIsGit(segment) {
+// A `sh -c '…'` met on the way pushes its command line on `subs` (the first only: bounded work) for the caller to judge.
+function commandIsGit(segment, subs) {
   const seen = new Set();
   const todo = [[0, false]];
   while (todo.length) {
@@ -264,7 +272,21 @@ function commandIsGit(segment) {
     if (!m) continue;
     const tok = m[0];
     const end = pos + tok.length;
-    if (COMMAND_PREFIX.has(tok)) { todo.push([end, true]); continue; }
+    const base = baseName(tok);
+    if (COMMAND_PREFIX.has(tok) || COMMAND_PREFIX.has(base)) { todo.push([end, true]); continue; }
+    if (SHELLS.has(base) && subs.length === 0) {
+      let p = end;
+      for (;;) {
+        WS.lastIndex = p;
+        WS.test(segment);
+        TOKEN.lastIndex = WS.lastIndex;
+        const o = TOKEN.exec(segment);
+        if (!o || o[0][0] !== '-') break;
+        p = WS.lastIndex + o[0].length;
+        if (SHELL_C_FLAG.test(o[0])) { WS.lastIndex = p; WS.test(segment); subs.push(segment.slice(WS.lastIndex)); break; }
+      }
+    }
+    if (wrapped && DURATION.test(tok)) { todo.push([end, true]); continue; }
     if (wrapped && tok[0] === '-') {
       todo.push([end, true]);
       WS.lastIndex = end;
@@ -285,12 +307,21 @@ function commandIsGit(segment) {
 // applied. (Dropping them can only add matches, never hide one.)
 const SHELL_QUOTING = /["'\\]/;
 const dequote = (s) => s
-  .replace(/\\x([0-9a-fA-F]{2})|\\([0-7]{3})/g, (_, h, o) => String.fromCharCode(h ? parseInt(h, 16) : parseInt(o, 8)))
+  .replace(/\\x([0-9a-fA-F]{1,2})|\\u([0-9a-fA-F]{4})|\\([0-7]{3})/g, (_, h, u, o) => String.fromCharCode(h ? parseInt(h, 16) : u ? parseInt(u, 16) : parseInt(o, 8)))
   .replace(/\$(?=["'])/g, '')
   .replace(/["'\\]/g, '');
-const segmentRunsGit = (seg) => commandIsGit(seg) || (SHELL_QUOTING.test(seg) && commandIsGit(dequote(seg)));
+// Judges one segment, and the command line of a `sh -c '…'` in it (at most MAX_SHELL_DEPTH levels deep, one per level).
+function segmentRunsGit(seg, depth) {
+  for (const text of SHELL_QUOTING.test(seg) ? [seg, dequote(seg)] : [seg]) {
+    const subs = [];
+    if (commandIsGit(text, subs)) return true;
+    if (depth < MAX_SHELL_DEPTH && subs.some(s => namesGit(s, depth + 1))) return true;
+  }
+  return false;
+}
 // `)` also ends a command (`FOO=$(echo a) git status`, `(cd x) git`): over-matching it only routes locally.
-const literalNamesGit = (s) => decodeEscapes(s).split(COMMAND_SEPARATOR).flatMap(p => p.split(')')).some(segmentRunsGit);
+const namesGit = (decoded, depth) => decoded.split(COMMAND_SEPARATOR).flatMap(p => p.split(')')).some(seg => segmentRunsGit(seg, depth));
+const literalNamesGit = (s) => namesGit(decodeEscapes(s), 0);
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 export function sourceNeedsGit(text, { helpers = [] } = {}) {
