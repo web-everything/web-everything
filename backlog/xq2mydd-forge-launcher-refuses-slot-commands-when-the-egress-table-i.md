@@ -15,7 +15,8 @@ Follow-up from PR 6345 review (fail-closed egress readiness). forge-exec-egress.
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A1] **Executable** — `npx vitest run we:scripts/readiness/__tests__/forge-exec-run.test.mjs` passes with a test that mocks `nft list table inet forge_exec_egress` as failing or missing and asserts the launcher refuses the slot and falls back to local with the reason `egress-table-absent`; it fails before the gate exists.
+- [A2] **Executable** — a second test deletes the table after a successful boot check (the `nft flush ruleset` case) and asserts the NEXT slot command is refused, so the gate runs per command, not once at launcher start.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -23,16 +24,16 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] Does not re-install or repair the table (forge-egress.sh and its timer own that), and does not change the allowlist contents.
 
 ## Edge cases this change must handle
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — n/a: the gate reads only the exit status of a fixed nft command, never its output.
+2. **Truncated reads** — n/a: exit status only; no output is parsed.
+3. **Shared state files** — n/a: no state file; the nft table is the state and is read live.
+4. **Fail closed** — a failing, missing, hung (timeout) or unexecutable nft refuses the slot and falls back to local; only a zero exit lets a slot command run.
+5. **Identity scoping** — the check covers the table that matches the slot users; a table with a different name or family does not pass.
+6. **State over time** — the check runs before EVERY slot command. The table can vanish after boot (`nft flush ruleset` from nftables.service, ufw, docker or fail2ban reload, an admin), leaving open egress until the next 5-minute timer tick, so a boot-time-only check is not enough.
+7. **Who wrote it** — n/a: the launcher only asks nft; nothing it reads is written by a slot user.
