@@ -499,3 +499,120 @@ it.each([['unparseable', 1, false], ['error', 1, false], ['ok', 0, true]])(
     f.readScorecards = () => [row, { ...row, rev: 'a'.repeat(40) }, { ...row, repo: 'another/repo' }];
     expect(readDrainRedTeamEvidence(f)).toMatchObject({ failedSeatCount, completedRecorded, seatRecorded: true });
   });
+
+import { readRecoveryWitness } from '../drain-red-team-evidence.mjs';
+import { MAX_RUN_RECORDS_PARSED } from '../stream-filter-runs.mjs';
+describe('bounded review evidence scans', () => {
+  it.each([['drain', readDrainRedTeamEvidence], ['recovery', readRecoveryWitness]])('%s holds a finished match when a 5000-run window cannot exclude a newer unfinished review', (_name, reader) => {
+    const f = fixture();
+    let reads = 0;
+    const run = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head) };
+    const result = reader({ ...f, list: () => Array.from({ length: 5000 }, (_, i) => `review-pr-${i}`),
+      stat: path => ({ mtimeMs: Number(path.match(/review-pr-(\d+)/)[1]) }),
+      read: id => { reads++; return id === 'review-pr-4999' ? run : null; } });
+    expect(result).toMatchObject({ ok: false, reason: 'scan-capped' });
+    expect(redTeamEnqueueHold({ ...f, ...result, comments: [] })).toMatch(/scan-capped/);
+    expect(reads).toBe(MAX_RUN_RECORDS_PARSED);
+  });
+  it.each([['drain', readDrainRedTeamEvidence], ['recovery', readRecoveryWitness]])('%s explicitly holds beyond the parse cap, including fallback scans', (_name, reader) => {
+    const f = fixture();
+    let reads = 0;
+    const result = reader({ ...f, list: () => Array.from({ length: 5000 }, (_, i) => `review-pr-${i}`),
+      stat: path => ({ mtimeMs: Number(path.match(/review-pr-(\d+)/)[1]) }),
+      read: () => { reads++; return null; } });
+    expect(result).toMatchObject({ ok: false, reason: 'scan-capped' });
+    expect(redTeamEnqueueHold({ ...f, ...result, comments: [] })).toMatch(/scan-capped/);
+    expect(reads).toBe(MAX_RUN_RECORDS_PARSED);
+  });
+});
+
+it.each([
+  ['drain preserves ascending id ties below the cap', readDrainRedTeamEvidence, 'review-pr-a', 3],
+  ['recovery preserves descending id ties below the cap', readRecoveryWitness, 'review-pr-b', 3],
+])('%s', (_name, reader, expectedId, expectedReads) => {
+  const f = fixture();
+  const runs = {
+    'review-pr-a': { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head) },
+    'review-pr-b': { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head), verdict: { verdict: 'changes' } },
+    'review-pr-c': { op: 'review-pr', input: { repo: 'other', pr: f.pr }, ...payload(f.head) },
+  };
+  let reads = 0;
+  const result = reader({ ...f, list: () => Object.keys(runs), stat: () => ({ mtimeMs: 1 }), read: id => { reads++; return runs[id]; } });
+  expect(result.newest ?? result.loopPayload).toEqual(runs[expectedId]);
+  expect(reads).toBe(expectedReads);
+});
+
+import { planRedTeamRecovery, planRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
+describe('fail-closed run scan evidence', () => {
+  it.each([['drain', readDrainRedTeamEvidence], ['recovery', readRecoveryWitness]])('%s throws on a corrupt or unreadable record inside the scan window', (_name, reader) => {
+    const f = fixture();
+    expect(() => reader({ ...f, list: () => ['review-pr-a', 'review-pr-b'], stat: () => ({ mtimeMs: 1 }),
+      read: id => { if (id === 'review-pr-b') throw Error('torn run'); return { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head) }; } })).toThrow('torn run');
+  });
+  it.each([['drain', readDrainRedTeamEvidence], ['recovery', readRecoveryWitness]])('%s lets a logically newer unfinished re-review win even when the finished run has a newer mtime', (_name, reader) => {
+    const f = fixture();
+    const completed = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head),
+      stepTimings: [{ step: 'read', startedAt: new Date(1000).toISOString() }] };
+    const unfinished = { ...completed, verdict: null, stepTimings: [{ step: 'read', startedAt: new Date(2000).toISOString() }] };
+    const result = reader({ ...f, list: () => ['review-pr-completed', 'review-pr-unfinished'],
+      stat: path => ({ mtimeMs: path.includes('completed') ? 4000 : 3000 }), read: id => id.includes('completed') ? completed : unfinished });
+    expect(result).toMatchObject({ ok: false, reason: 'review-unfinished' });
+    expect(redTeamEnqueueHold({ ...f, ...result, comments: [] })).toMatch(/unfinished/);
+  });
+  it('holds a finished writer when the cap prevents excluding an unfinished re-review', () => {
+    const f = fixture();
+    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'ran' }, f);
+    const result = readDrainRedTeamEvidence({ ...f, list: () => Array.from({ length: 5000 }, (_, i) => `review-pr-${i}`),
+      stat: () => ({ mtimeMs: 1 }), read: () => null });
+    expect(result).toMatchObject({ ok: false, reason: 'scan-capped' });
+    expect(redTeamEnqueueHold({ ...f, ...result, comments: [], recorded: true })).toMatch(/scan-capped/);
+  });
+  it('uses the configured scan bound in both evidence paths', () => {
+    const f = fixture();
+    const platformPath = join(f.runsDir, '..', 'platform.json');
+    writeFileSync(platformPath, JSON.stringify({ runs: { scan: { maxParses: 2 } } }));
+    // Inject a tool settings block to leave the operator platform preference in control.
+    for (const reader of [readDrainRedTeamEvidence, readRecoveryWitness]) {
+      let reads = 0;
+      const result = reader({ ...f, scanSettings: { file: {}, env: { WE_PLATFORM_PREFERENCES_FILE: platformPath } },
+        list: () => ['review-pr-a', 'review-pr-b', 'review-pr-c'], stat: () => ({ mtimeMs: 1 }),
+        read: () => { reads++; return null; } });
+      expect(result).toMatchObject({ ok: false, reason: 'scan-capped' });
+      expect(reads).toBe(2);
+    }
+  });
+  it('recovery and skipped-PR scheduling explicitly refuse capped evidence', () => {
+    expect(planRedTeamRecovery({ ok: false, reason: 'scan-capped' })).toMatchObject({ mode: 'skip', why: 'scan-capped' });
+    const f = fixture();
+    const rows = planRedTeamOnSkip({ repo: f.repo, refusals: [{ kind: 'already-reviewed-head', prNumber: f.pr }],
+      rawPrs: [{ number: f.pr, headRefOid: f.head, comments: [], labels: ['review:accepted'] }],
+      readEvidence: () => ({ ok: false, reason: 'scan-capped' }), readStatus: () => null,
+      setting: { enabled: true }, lastDispatch: new Map(), now: 0 });
+    expect(rows[0]).toMatchObject({ action: 'skip', why: 'scan-capped' });
+  });
+});
+
+import { planRedTeamStatusLabels } from '../red-team-status-labels.mjs';
+it('capped evidence replaces a stale clear label with pending instead of preserving clearance', () => {
+  const f = fixture();
+  expect(planRedTeamStatusLabels({ ...f, labels: ['red-team:clear'], comments: [],
+    evidence: { ok: false, reason: 'scan-capped' } })).toEqual({ add: 'red-team:pending', remove: ['red-team:clear'] });
+});
+it('an older unfinished review does not replace a logically newer finished panel', () => {
+  const f = fixture();
+  const completed = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head),
+    stepTimings: [{ step: 'read', startedAt: new Date(2000).toISOString() }] };
+  const unfinished = { ...completed, verdict: null, stepTimings: [{ step: 'read', startedAt: new Date(1000).toISOString() }] };
+  const result = readDrainRedTeamEvidence({ ...f, list: () => ['review-pr-completed', 'review-pr-unfinished'],
+    stat: path => ({ mtimeMs: path.includes('completed') ? 4000 : 3000 }), read: id => id.includes('completed') ? completed : unfinished });
+  expect(result.ok).not.toBe(false);
+  expect(result.loopPayload).toEqual(completed);
+});
+
+describe('readRecoveryWitness carryEvidence keeps the drain tie order', () => {
+  it('does not reuse the recovery id-desc lookup for the drain fallback', () => {
+    const src = readFileSync(new URL('../drain-red-team-evidence.mjs', import.meta.url), 'utf8');
+    const call = src.split('carryEvidence: readDrainRedTeamEvidence(')[1].split('\n')[0];
+    expect(call).not.toMatch(/\blookup\b/);
+  });
+});

@@ -3910,3 +3910,21 @@ The `smoke-github-outage` break pins `WE_GH_LIST_BACKOFF_MS=5,5` and
 `WE_GH_JSON_RETRY_BACKOFF_MS=5` before the daemon forks. This preserves exhausted,
 fail-closed reads across reconcile and dispatch smoke passes within the unchanged
 90-second tick bound; shortening only the outer list backoff does not suffice.
+
+
+## Bounded review run scans
+
+Review evidence scans stat candidates before parsing, order by mtime descending (id ascending for drain ties, id descending for recovery ties),
+and parse at most `runs.scan.maxParses` (standard default 300) per read, including historical/recovery fallbacks.
+The setting resolves through the shared standard/platform/tool cascade; `scripts/settings/runs-scan.json`
+leaves the tool value unset so platform preferences apply. No environment override is added.
+The shared finder continues from its cursor; it never retains a folder of payloads. Exhausting the
+budget before completion returns `{ok:false, reason:"scan-capped"}` and logs the limit/source. The
+enqueue gate, status labels and recovery scheduler hold on unknown evidence. Inspect omitted run
+records before deliberately raising the limit. Genuine folder exhaustion still means no match.
+Finished evidence requires scanning the bounded window to rule out a newer unfinished re-review;
+compare read-step start times because finishing an older run can advance its mtime. A newer
+unfinished attempt holds as `review-unfinished`; unreadable records still throw, never skip.
+
+The scoped regressions are `drain-red-team-evidence`, `stream-filter-runs`, and the settings layout
+test `settings-files`; use heavy admission.
