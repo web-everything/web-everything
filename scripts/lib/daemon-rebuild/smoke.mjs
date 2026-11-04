@@ -677,9 +677,16 @@ export async function smokeAndAdopt({
       await hold('force-adopt-refused', failedA);
       return { moved: false, reason: 'force-adopt-refused', detail: opened.reason, plan, alerts: [...prepAlerts, ...alertsList] };
     }
-    const forced = await finalize(plan, undefined, undefined, a.smokeResult);
-    if (forced.moved !== true && forced.readyRecorded !== true) clearReadyCandidate(root, stEnv); // never leave the failed build adoptable unwatched
-    if (forced.moved !== true && forced.readyRecorded !== true) await abortForcedAdoption({ root, env: stEnv, request: forceReq, sha: plan.finalSha, emit });
+    const abort = async () => {
+      clearReadyCandidate(root, stEnv); // never leave the failed build adoptable unwatched
+      await abortForcedAdoption({ root, env: stEnv, request: forceReq, sha: plan.finalSha, emit });
+    };
+    let forced;
+    try { forced = await finalize(plan, undefined, undefined, a.smokeResult); } catch (e) { await abort(); throw e; } // the log + watch must not outlive a finalize that threw
+    // finalize keeps the build as the ready candidate when a reader holds the clone (tick-in-progress / reader-priority):
+    // the durable watch above already covers its later adoption, so only a real failure to adopt aborts the force.
+    const keptForLater = forced.readyRecorded === true || forced.reason === 'tick-in-progress' || forced.reason === 'reader-priority';
+    if (forced.moved !== true && !keptForLater) await abort();
     return forced;
   }
   if (a.reused) {

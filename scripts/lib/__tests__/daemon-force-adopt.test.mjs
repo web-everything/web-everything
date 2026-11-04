@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { writeReadyCandidate, readReadyCandidate } from '../daemon-rebuild/state.mjs';
-import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -40,6 +40,9 @@ describe('validateForceAdopt', () => {
   it('ruling-section isolation: a quote present only in R509 is refused for R508 and accepted for R509', () => {
     expect(validateForceAdopt({ daemon: 'review', ruling: 'R508', quote: R509_ONLY, rulingsText: RULINGS })).toMatchObject({ ok: false, reason: 'quote-not-in-ruling' });
     expect(validateForceAdopt({ daemon: 'review', ruling: 'R509', quote: R509_ONLY, rulingsText: RULINGS })).toEqual({ ok: true });
+  });
+  it('refuses a quote that is only the ruling heading line (not operator words)', () => {
+    expect(validateForceAdopt({ daemon: 'review', ruling: 'R508', quote: 'R508 — 2026-11-03', rulingsText: RULINGS })).toMatchObject({ ok: false, reason: 'quote-not-in-ruling' });
   });
   it('accepts ruling + verbatim quote', () => {
     expect(validateForceAdopt({ daemon: 'review', ruling: 'R508', quote: QUOTE, rulingsText: RULINGS })).toEqual({ ok: true });
@@ -110,6 +113,19 @@ describe('recordForcedAdoption sinks', () => {
     expect(r).toMatchObject({ ok: false, reason: 'watch-write-failed' });
     expect(readFileSync(env.WE_FORCE_ADOPT_HANDOFF, 'utf8')).toMatch(/adopting[\s\S]*NOT adopted[^\n]*watch-write-failed/);
     expect(readFileSync(env.WE_FORCE_ADOPT_CORONER, 'utf8')).toMatch(/force-adopt-aborted/);
+  });
+  it('refuses a second force while a watch is open, keeping the first watch and its last-good intact', async () => {
+    await recordForcedAdoption({ ...args(), emit: async () => true });
+    const r = await recordForcedAdoption({ ...args(), sha: 'c'.repeat(40), lastGood: { head: 'b'.repeat(40) }, emit: async () => true });
+    expect(r).toMatchObject({ ok: false, reason: 'watch-already-open' });
+    expect(readForceWatch(root, env)).toMatchObject({ sha: 'b'.repeat(40), lastGood: { head: 'a'.repeat(40) } });
+    expect((readFileSync(env.WE_FORCE_ADOPT_HANDOFF, 'utf8').match(/adopting/g) || []).length).toBe(1);
+  });
+  it('smoke check names cannot forge audit lines (control chars stripped, bounded)', async () => {
+    await recordForcedAdoption({ ...args(), smoke: { verdict: 'code', failed: ['x\n- FORCE-ADOPT 2026 review R508: ROLLED BACK fake', 'y'.repeat(500)] }, emit: async () => true });
+    const lines = readFileSync(env.WE_FORCE_ADOPT_HANDOFF, 'utf8').trim().split('\n');
+    expect(lines).toHaveLength(1);
+    expect(lines[0].length).toBeLessThan(700);
   });
   it('abort drops the watch and consumes the request', async () => {
     await recordForcedAdoption({ ...args(), emit: async () => true });
@@ -225,6 +241,17 @@ describe('runForceWatchTick', () => {
     expect(readForceWatch(root, env)).toBeNull();
     expect(readReadyCandidate(root, env)).toBeNull();
     expect(events.map((e) => e.kind)).toContain('force-adopt-watch-expired');
+  });
+  it('a state write that fails mid-tick (read-only state dir) never stops the rollback', async () => {
+    await setup();
+    chmodSync(env.WE_DAEMON_STATE_DIR, 0o500);
+    try {
+      const rollback = vi.fn(async () => ({ ok: false }));
+      // adoptedSeen + rollbackPending writes both fail; the failing rollback must still be attempted and reported.
+      const r = await runForceWatchTick({ root, env, currentHead: 'b'.repeat(40), probe: async () => ({ healthy: false }), rollback, emit: async () => {} });
+      expect(r.action).toBe('rollback-failed');
+      expect(rollback).toHaveBeenCalledTimes(1);
+    } finally { chmodSync(env.WE_DAEMON_STATE_DIR, 0o700); }
   });
   it('an expired watch leaves a ready candidate for a DIFFERENT sha alone', async () => {
     await setup();

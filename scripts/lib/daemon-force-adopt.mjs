@@ -35,7 +35,7 @@ function rulingSection(text, ruling) {
   if (start < 0) return null;
   let end = lines.findIndex((l, i) => i > start && /^##\s/.test(l));
   if (end < 0) end = lines.length;
-  return lines.slice(start, end).join('\n');
+  return lines.slice(start + 1, end).join('\n'); // the body only: the "## R508 — date" heading is not operator words
 }
 
 /** PURE. A force-adopt needs a well-formed ruling id that exists, and a quote that is verbatim in THAT ruling. */
@@ -80,8 +80,12 @@ const appendLine = (p, line) => { try { mkdirSync(dirname(p), { recursive: true 
 
 /** BEFORE the adoption: log it loudly (all three sinks must land), write the coroner-review record and open the durable
  *  health watch. Returns { ok:false } (nothing opened) when any sink fails, so the caller then does NOT adopt. */
-export async function recordForcedAdoption({ root, env = process.env, request, sha, lastGood, smoke, emit, now = Date.now }) {
+export async function recordForcedAdoption({ root, env = process.env, request, sha, lastGood, smoke: rawSmoke, emit, now = Date.now }) {
+  // A second force while a watch is open would overwrite its lastGood with the first forced (unproven) build.
+  if (readForceWatch(root, env)) return { ok: false, reason: 'watch-already-open' };
   const at = new Date(now()).toISOString();
+  // Check names come from the candidate's own smoke rows: keep them to printable ASCII and bounded, so they cannot forge audit lines.
+  const smoke = rawSmoke ? { ...rawSmoke, failed: (rawSmoke.failed || []).slice(0, 20).map((n) => String(n).replace(/[^\x20-\x7e]/g, '?').slice(0, 80)) } : rawSmoke;
   const detail = { ruling: request.ruling, quote: request.quote, sha, lastGood: lastGood?.head ?? null, smoke: smoke ?? null, watchTicks: FORCE_ADOPT_WATCH_TICKS };
   const evented = (await emit?.({ kind: 'force-adopt', daemon: request.daemon, detail })) !== false;
   const handed = appendLine(handoffFile(env), `- FORCE-ADOPT ${at} ${request.daemon} ${request.ruling}: adopting ${sha} though smoke ${smoke?.verdict ?? 'unknown'} `
@@ -145,17 +149,19 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
     }
     return { action: 'waiting' };
   }
-  if (head !== null && !watch.adoptedSeen) { watch.adoptedSeen = true; writeJson(watchPath(root, env), watch); }
+  // State writes here are best-effort: a failed write must never stop the health check or the rollback that follows.
+  const persist = (w) => { try { writeJson(watchPath(root, env), w); } catch { /* the next tick re-derives it */ } };
+  if (head !== null && !watch.adoptedSeen) { watch.adoptedSeen = true; persist(watch); }
   let health;
   try { health = await probe(root); } catch { health = { healthy: false }; }
   const verdict = evaluateForceWatch({ watch, healthy: health?.healthy, restarts: health?.restarts ?? 0 });
-  if (verdict.action === 'continue') { writeJson(watchPath(root, env), verdict.watch); return { action: 'continue', ticksLeft: verdict.watch.ticksLeft }; }
+  if (verdict.action === 'continue') { persist(verdict.watch); return { action: 'continue', ticksLeft: verdict.watch.ticksLeft }; }
   if (verdict.action === 'done') { clearWatch(root, env); await emit?.({ kind: 'force-adopt-watch-passed', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha } }); return { action: 'done' }; }
   const at = new Date(now()).toISOString();
   let result;
   try { result = await rollback(watch.lastGood); } catch { result = { ok: false }; }
   if (!result?.ok) {
-    try { writeJson(watchPath(root, env), { ...watch, rollbackPending: verdict.reason }); } catch { /* the next tick re-probes */ }
+    persist({ ...watch, rollbackPending: verdict.reason });
     await emit?.({ kind: 'force-adopt-rollback-failed', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, reason: verdict.reason } });
     return { action: 'rollback-failed', reason: verdict.reason };
   }
