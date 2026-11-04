@@ -24,7 +24,10 @@ function runPool(args, preload = null) {
   const env = { ...process.env, LANE_POOL_ROOT: poolRoot, WE_LANE_SALVAGE_DIR: join(base, 'salvage') };
   delete env.LANE_SESSION;
   delete env.CLAUDE_CODE_SESSION_ID;
-  const r = spawnSync('node', [...(preload ? ['--import', preload] : []), SCRIPT, ...args], { encoding: 'utf8', env });
+  // `spawnSync` blocks the whole vitest worker, so a hung child would stall the CI shard until its job cap. The
+  // timeout turns a hang into a failing test (status null -> code 1, SIGKILL noted in stderr) that names itself.
+  const r = spawnSync('node', [...(preload ? ['--import', preload] : []), SCRIPT, ...args], { encoding: 'utf8', env, timeout: 180_000, killSignal: 'SIGKILL' });
+  if (r.error && r.error.code === 'ETIMEDOUT') return { code: 1, out: String(r.stdout || ''), err: `lane-pool ${args[0]} timed out after 180s\n${String(r.stderr || '')}` };
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }
 
