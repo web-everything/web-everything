@@ -677,7 +677,11 @@ it.each([false, true])('default claim refresh keeps a live wrapped fixing claim 
       ...(awaiting ? { awaitingVerify: { sha: 'a'.repeat(40), pr: 3964, ref: 'lane/fix', requestedAt: iso(T0) } } : {}),
     });
     writeCompletion(record, completions);
-    const result = refreshLiveFixDispatchClaims({ lockRoot: claimRoot, nowMs: T0 + 1000, nowIso: () => iso(T0 + 1000), hungInfoFor: () => null, awaitingVerifyFor: () => null, prHeadFor: () => null });
+    // This test pins the default LISTING wiring, not pid identity. The fixture clock (T0) is in the past, so the real
+    // `ps` start time of this very process would read as "started after the holder" under the pid-reuse guard; the
+    // guard itself is covered by the startedBy tests in 'session-identity-dead check passes the row start time'.
+    const identity = () => ({ alive: true, reason: 'match' });
+    const result = refreshLiveFixDispatchClaims({ lockRoot: claimRoot, nowMs: T0 + 1000, nowIso: () => iso(T0 + 1000), hungInfoFor: () => null, awaitingVerifyFor: () => null, prHeadFor: () => null, identity });
     expect(list).toHaveBeenCalledWith({ all: true });
     expect(result.refreshed).toHaveLength(1);
     expect(result.released ?? []).toEqual([]);
@@ -889,8 +893,9 @@ describe('idle-claim auto-release (R201)', () => {
     ])('releases the claim of a bound, readable, idle holder %s with an unmoved head and no subagents', (_n, silentMs) => {
       const lastActivityMs = firstSweep - silentMs;
       // The detector really does flag this holder hung; without the idle-path ownership the claim could never release.
-      expect(readHungInfo({ ...row }, firstSweep, resolveHungThresholdMs())).toMatchObject({ hung: true, reason: 'stale-no-activity' });
+      // (The transcript must exist before the detector reads it.)
       writeTranscript(lastActivityMs);
+      expect(readHungInfo({ ...row }, firstSweep, resolveHungThresholdMs())).toMatchObject({ hung: true, reason: 'stale-no-activity' });
       const released = sweepAll({ lastActivityMs });
       expect(released).toHaveLength(1);
       expect(released[0].reason).toMatch(/idle-head-unmoved/);
