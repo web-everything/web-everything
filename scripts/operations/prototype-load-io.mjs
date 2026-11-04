@@ -18,7 +18,7 @@ import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
 import { cloneKey } from '../lib/daemon-overlays.mjs';
 import { clearPendingAdoption, recordPendingAdoption, OVERLAY_ADOPTION_MAX_PENDING, OVERLAY_ADOPTION_TTL_MS } from '../lib/overlay-adoption.mjs';
 import { isGraphSourceFile, isVitestTestFile } from '../lib/related-test-selection.mjs';
-import { safeRef, safeRegistrationRef, validSha, jsonLines, readyEvidence, canonicalAuditEvidence, changedPaths, comparePaths, nextMergeRef, refusal } from './prototype-load.mjs';
+import { safeRef, safeRegistrationRef, validSha, jsonLines, readyEvidence, canonicalAuditEvidence, changedPaths, comparePaths, nextMergeRef, refusal, resolveDaemonKey } from './prototype-load.mjs';
 import { planRetirements, planFetchFailed, resolveOriginRepository } from './prototype-retire.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -313,8 +313,14 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       return out.retired.map((r) => r.ref);
     };
     try {
-      const daemon = Object.hasOwn(config.daemons || {}, input.daemon) ? config.daemons[input.daemon] : null;
-      if (!daemon) return stop('unknown-daemon');
+      const resolved = resolveDaemonKey(config.daemons, config.daemonAliases, input.daemon);
+      if (!resolved.key) {
+        const list = resolved.valid.join(', ');
+        return stop('unknown-daemon', { validDaemons: resolved.valid, detail: resolved.reason === 'ambiguous' ? `ambiguous-daemon:${resolved.candidates.join('|')}` : 'unknown-daemon',
+          fallback: `${resolved.reason === 'ambiguous' ? `"${input.daemon}" matches several daemons (${resolved.candidates.join(', ')}). ` : `"${input.daemon}" is not a daemon key. `}Valid keys: ${list}. Pass --daemon=<key>; launchd labels, clone dir names and the daemonAliases table are also accepted when they match exactly one daemon.` });
+      }
+      if (resolved.key !== input.daemon) { out.requestedDaemon = input.daemon; input = { ...input, daemon: resolved.key }; out.daemon = resolved.key; }
+      const daemon = config.daemons[resolved.key];
       if (daemon.clone) {
         out.clone = resolve(expand(config.workspaceRoot), expand(daemon.clone));
         out.cloneSource = `settings:prototype-load.json#daemons.${input.daemon}.clone`;
