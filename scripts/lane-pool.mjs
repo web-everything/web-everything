@@ -2940,13 +2940,21 @@ function releaseWorkRefuses(dir, label, salvage, proof) {
   log(`  ${safe(label)}: UNPUSHED_WORK — ${details}; lane and lease kept. Preserve work (commit tracked changes first):\n` +
     `    git -C ${quote(safe(dir))} push origin HEAD:refs/heads/${quote(safe(branch))}\n` +
     '    Push other unpushed local branches too, then retry release; pass --discard to deliberately release without preserving this work.');
-  // A caller that swallows the exit code (the drain's release-on-land, a launch-failure un-reserve, the reaper) still
-  // leaves this loud journal line, and `--json` names the kept lane, so a kept lease is never a silent ghost.
+  // Even when a caller ignores the exit code (the drain's release-on-land, a launch-failure un-reserve, the reaper),
+  // the refusal leaves this loud journal line, and `--json` names the kept lane. Callers reading `kept`: #x3h0sng.
+  const bounded = boundedDetails(details);
   journalLaneEvent(dir, {
-    action: 'release-refused', reason: `UNPUSHED_WORK — ${details}`.slice(0, 1000), loud: true, unpushed: true,
+    action: 'release-refused', reason: `UNPUSHED_WORK — ${bounded}`, loud: true, unpushed: true,
   }, { unlessRepeat: true });
   process.exitCode = 1;
-  return { reason: 'unpushed-work', details: details.slice(0, 1000) };
+  return { reason: 'unpushed-work', details: bounded };
+}
+
+// Bound a refusal's details for the journal and `--json`; a cut is marked so the text never reads as complete.
+const RELEASE_DETAILS_LIMIT = 1000;
+function boundedDetails(text) {
+  const value = String(text);
+  return value.length <= RELEASE_DETAILS_LIMIT ? value : `${value.slice(0, RELEASE_DETAILS_LIMIT)}… (truncated)`;
 }
 
 // #2667 — cross-pool release-by-session. `release --all-pools --session=<slug>` sweeps EVERY pool under
@@ -3012,7 +3020,7 @@ async function cmdReleaseAllPools(repo) {
   // `execFileSync`, so it inherits whatever directory that process happens to be running from).
   const pools = existingPools();
   const perPool = [];
-  const kept = []; // lanes the unpushed-work guard kept: the drain's release-on-land reads this from the JSON
+  const kept = []; // lanes the unpushed-work guard kept, named in --json (the drain reading it: #x3h0sng)
   let released = 0;
   for (const name of pools) {
     const poolDir = join(POOL_ROOT, name);
@@ -3120,7 +3128,7 @@ async function cmdRelease(repo) {
   else if (flags.lane !== undefined) { targets = [Number(flags.lane)]; targeted = true; }
   else return fail('release needs --lane=N or --all');
   let released = 0;
-  const kept = []; // lanes the unpushed-work guard kept (named in --json so a caller can surface them)
+  const kept = []; // lanes kept by the work guard, a hold or a failed card save (named in --json for callers)
   for (const n of targets) {
     const dir = laneDir(repo, n);
     const lease = readLease(dir);
@@ -3203,7 +3211,9 @@ async function cmdRelease(repo) {
     // spawned share that id, so it cannot tell the holder from a sibling (or from a reaper launched by the same
     // session). Such a caller may still release an unparked lane; it may not drop a parked one.
     const holderProven = leaseOwnedBy(lease, session) || (!!laneHolderSlug(lease) && !!session && laneHolderSlug(lease) === session);
-    if (laneHoldRefuses(dir, 'release', { byHolder: holderProven, unpushed: beforeLitter.unpushed ?? undefined })) continue;
+    const held = laneHoldRefuses(dir, 'release', { byHolder: holderProven, unpushed: beforeLitter.unpushed ?? undefined });
+    // A hold is deliberate (exit stays 0, the refusal is journalled loud above), but a JSON caller still sees why.
+    if (held) { kept.push({ lane: n, reason: 'held', details: String(held.reason).slice(0, 1000) }); continue; }
     const litter = cleanLaneLitter(dir);
     if (litter?.removed?.length) {
       journalLaneEvent(dir, {
@@ -3217,7 +3227,15 @@ async function cmdRelease(repo) {
     const cards = salvageLaneCards({ dir, lane: n, pool: basename(repo.poolDir), reason: `release of lane-${n} (${lease.purpose || 'no purpose'})`,
       isLeaseCurrent: () => sameLease(readLease(dir), lease) });
     if (cards.status === 'unknown') log(`  WARNING lane-${n}: card salvage skipped (${cards.reason}); checking remaining work before release`);
-    if (cards.status === 'failed') { log(`  lane-${n}: KEPT — card files could not be saved (${cards.reason}); not releasing a lane that would lose them`); continue; }
+    if (cards.status === 'failed') {
+      log(`  lane-${n}: KEPT — card files could not be saved (${cards.reason}); not releasing a lane that would lose them`);
+      // Same contract as the unpushed-work refusal: exit 1, a loud journal line, and the lane named in `kept`.
+      const details = boundedDetails(`card files could not be saved: ${String(cards.reason).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ')}`);
+      journalLaneEvent(dir, { action: 'release-refused', reason: `KEPT — ${details}`, loud: true }, { unlessRepeat: true });
+      process.exitCode = 1;
+      kept.push({ lane: n, reason: 'card-salvage-failed', details });
+      continue;
+    }
     if (cards.status === 'salvaged') {
       log(`  lane-${n}: saved ${cards.removed.length} leftover card file(s) to ${cards.outDir} and cleaned them`);
       journalLaneEvent(dir, { action: 'card-salvage', before: beforeLitter, removed: cards.removed, salvagedTo: cards.outDir, reason: 'release saved and cleaned leftover backlog card files' });

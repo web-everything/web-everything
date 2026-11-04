@@ -358,6 +358,11 @@ syncBuiltinESMExports();\n`);
     const release = runPool(['release', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json']);
     expect(JSON.parse(release.out).released).toBe(0);
     expect(release.err + release.out).toMatch(/KEPT — card files could not be saved/);
+    // A caller that only parses the JSON (or only reads the journal) still learns the lane was kept, and why.
+    expect(release.code).toBe(1);
+    expect(JSON.parse(release.out).kept).toEqual([expect.objectContaining({ lane, reason: 'card-salvage-failed' })]);
+    const journal = readFileSync(join(poolRoot, 'litterpool', '.lane-journal.jsonl'), 'utf8').split('\n').filter(Boolean).map(JSON.parse);
+    expect(journal.filter(e => e.lane === lane && e.action === 'release-refused')).toEqual([expect.objectContaining({ loud: true })]);
     expect(git(['status', '--porcelain', '--untracked-files=all'], dir)).toBe(before);
     expect(readFileSync(leasePath, 'utf8')).toBe(leaseBefore);
   });

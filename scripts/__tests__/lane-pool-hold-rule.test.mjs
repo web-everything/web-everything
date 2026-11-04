@@ -99,6 +99,7 @@ describe('release (the reaper path: `release --force`)', () => {
     const r = runPool(['release', '--lane=1', '--force', '--reason=session-gone', ...poolArgs(), '--json'], { CLAUDE_CODE_SESSION_ID: 'reaper' });
     expect(r.code).toBe(0);
     expect(JSON.parse(r.out).released).toBe(0);
+    expect(JSON.parse(r.out).kept).toEqual([expect.objectContaining({ lane: 1, reason: 'held' })]);
     expect(existsSync(join(dir, '.git', '.lane-lease'))).toBe(true);
     const refusal = journal().find((e) => e.action === 'hold-refused');
     expect(refusal).toMatchObject({ hold: 'awaiting-verify' });
