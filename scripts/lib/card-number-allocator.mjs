@@ -75,9 +75,9 @@ export function readNumberingEvidence(git, remote = 'origin', { refreshTracking 
       // The REST repository is the one this checkout (the git callback's target) belongs to - never the ambient cwd.
       cwd ??= String(git(['rev-parse', '--show-toplevel'])).trim();
       if (!cwd) throw new DrainReadError('high-water-mark', 'api-error', 'checkout root unreadable');
-      main = numericIds(unwrap(readBacklogNames('main', { rest, cwd, slug, source: reader })));
+      main = numericIds(unwrap(readBacklogNames('main', { rest, cwd, slug, remote, source: reader })));
       if (refreshTracking) {
-        const tip = unwrap(readBranchSha('main', { rest, cwd, slug, source: reader }));
+        const tip = unwrap(readBranchSha('main', { rest, cwd, slug, remote, source: reader }));
         const local = () => { try { return String(git(['rev-parse', '--verify', '--quiet', `refs/remotes/${remote}/main`])).trim(); } catch { return ''; } };
         if (local() !== tip) {
           try { git(['fetch', '--no-tags', '--no-write-fetch-head', '--refmap=', remote, `+refs/heads/main:refs/remotes/${remote}/main`]); } catch { /* judged by the re-check below */ }

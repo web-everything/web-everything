@@ -5,6 +5,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { mkdtempSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ghRestGetJson } from '../gh-rest-read.mjs';
@@ -39,6 +40,9 @@ describe('drain.reads.source setting', () => {
     expect(resolveDrainReadsSource({ env: {}, file: { drain: { reads: { source: 'git' } } }, platform: {} })).toMatchObject({ value: 'git', source: 'settings' });
     expect(resolveDrainReadsSource({ env: { WE_DRAIN_READS_SOURCE: 'git' }, file: {}, platform: {} }).value).toBe('git');
     expect(resolveDrainReadsSource({ env: { WE_DRAIN_READS_SOURCE: 'bogus' }, file: {}, platform: {} }).value).toBe('api');
+    // Only a test runner flips the standard default to the stubbed-git path; an explicit setting still wins there.
+    expect(resolveDrainReadsSource({ env: { VITEST: 'true' }, file: {}, platform: {} }).value).toBe('git');
+    expect(resolveDrainReadsSource({ env: { VITEST: 'true', WE_DRAIN_READS_SOURCE: 'api' }, file: {}, platform: {} }).value).toBe('api');
   });
 });
 
@@ -430,5 +434,25 @@ describe('callers fail closed on unreadable (no empty/0/false mapping)', () => {
     const exec = (_c, a) => { calls.push(a[0]); if (a[0] === 'rev-parse') return `${OTHER}\n`; if (a[0] === 'grep') throw Object.assign(new Error('none'), { status: 1 }); throw new Error('unexpected'); };
     expect(checkBornAsCollision({ exec, headSha: SHA, readsSource: 'api', rest, slug: 'o/r' })).toEqual({ ok: true });
     expect(calls).toContain('grep');
+  });
+});
+
+describe('the pinned repository is the one of the requested remote', () => {
+  it('derives the slug from the named remote, not always origin', () => {
+    const asked = [];
+    const git = (_c) => 'git@github.com:up/stream.git';
+    expect(readOriginSlug(`/c-${Math.random()}`, { remote: 'upstream', git: (c) => { asked.push(c); return git(c); } })).toBe('up/stream');
+    expect(() => readOriginSlug(`/c-${Math.random()}`, { remote: '--upload-pack=x y', git })).toThrow(/origin-unreadable/);
+  });
+  it('the allocator reads the high-water mark of the requested remote repo, never origin', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'remotes-'));
+    for (const a of [['init', '-q'], ['remote', 'add', 'origin', 'git@github.com:fork/repo.git'], ['remote', 'add', 'upstream', 'git@github.com:up/repo.git']]) execFileSync('git', ['-C', dir, ...a]);
+    const seen = [];
+    const table = routes({ 'git/trees/main': ok({ tree: [{ path: 'backlog', type: 'tree', sha: 'bk' }] }), 'git/trees/bk': ok({ tree: [{ path: '7-a.md', type: 'blob' }] }) });
+    const rest = (path, o) => { seen.push(path); return table(path, o); };
+    const git = (args) => (args[0] === 'ls-remote' ? '' : `${dir}\n`);
+    expect(readNumberingEvidence(git, 'upstream', { source: 'api', rest, cwd: dir }).main).toEqual([7]);
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every((p) => p.startsWith('repos/up/repo/'))).toBe(true);
   });
 });
