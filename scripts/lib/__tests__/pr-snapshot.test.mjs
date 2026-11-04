@@ -21,6 +21,7 @@ import { prSnapshotEnabled, markPrSnapshotDirty, repoFromGhArgs, snapshotPath, P
 const REPO = 'web-everything/web-everything';
 const PRS = Array.from({ length: 14 }, (_, i) => ({
   number: 100 + i, title: `t${i}`, body: `b${i}`, url: `u${i}`, isDraft: false, createdAt: 'c', updatedAt: 'u',
+  author: { login: 'human', is_bot: false }, rollupIncomplete: false,
   headRefName: `lane/x${i}`, headRefOid: `abc${i}`, baseRefName: 'main', isCrossRepository: false, reviewDecision: 'APPROVED', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
   labels: [{ name: 'ready-to-merge' }], files: [{ path: 'a.mjs' }], comments: [{ body: 'hi' }], statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED',
     startedAt: 's', completedAt: 'e', detailsUrl: 'url', workflowName: 'build' }],
@@ -30,7 +31,7 @@ const PAGING = { pageSize: 20, pageRetries: 1, heavyMaxAgeSeconds: 600, source: 
 const pageCalls = calls => calls.filter(a => a[0] === 'api');
 const viewCalls = calls => calls.filter(a => a[0] === 'pr');
 
-function fakeExec(prs = PRS) {
+function fakeExec(prs = PRS, hasNextPage = false) {
   const calls = [];
   const exec = (file, argv) => {
     expect(file).toBe('gh');
@@ -41,8 +42,10 @@ function fakeExec(prs = PRS) {
       const size = Number(query.match(/first:(\d+)/)[1]);
       const start = Number(query.match(/after:"(\d+)"/)?.[1] ?? 0);
       const end = Math.min(start + size, prs.length);
-      const nodes = prs.slice(start, end).map(({ comments, body, files, labels, statusCheckRollup, ...p }) => ({
-        ...p, labels: { nodes: labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: {
+      const nodes = prs.slice(start, end).map(({ comments, body, files, labels, statusCheckRollup, author, ...p }) => ({
+        ...p, author: author && { login: author.login, __typename: author.is_bot ? 'Bot' : 'User' },
+        labels: { nodes: labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: {
+          pageInfo: { hasNextPage },
           nodes: statusCheckRollup.map(({ workflowName, ...c }) => c.__typename === 'CheckRun'
             ? { ...c, checkSuite: { workflowRun: { workflow: { name: workflowName } } } }
             : { ...c, createdAt: c.startedAt }),
@@ -82,6 +85,39 @@ describe('pure helpers', () => {
   it('projectPrs returns exactly the asked-for fields', () => {
     expect(projectPrs([{ number: 1, body: 'x', labels: [] }], ['number', 'labels'])).toEqual([{ number: 1, labels: [] }]);
   });
+  it.each([true, false])('keeps rollup completeness evidence whenever a reader requests the rollup: %s', rollupIncomplete => {
+    const pr = { number: 1, statusCheckRollup: [], rollupIncomplete };
+    expect(projectPrs([pr], ['number', 'statusCheckRollup'])).toEqual([pr]);
+    expect(projectPrs([pr], ['number'])).toEqual([{ number: 1 }]);
+  });
+  it('does not certify old snapshot rows with no completeness evidence', () => {
+    const pr = { number: 1, statusCheckRollup: [] };
+    expect(projectPrs([pr], ['number', 'statusCheckRollup'])).toEqual([pr]);
+    expect(projectPrs([pr], ['statusCheckRollup'])[0].rollupIncomplete).toBeUndefined();
+  });
+  it.each([true, undefined, false])('preserves rollup completeness through hydration and cached reads: %s', hasNextPage => {
+    const { exec, calls } = fakeExec([PRS[0]], hasNextPage);
+    // Explicit undefined models an unreadable GraphQL pageInfo, rather than the helper default.
+    const pageExec = (file, argv) => {
+      const output = exec(file, argv);
+      if (argv[0] !== 'api' || hasNextPage !== undefined) return output;
+      const response = JSON.parse(output);
+      delete response.data.repository.pullRequests.nodes[0].commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.hasNextPage;
+      return JSON.stringify(response);
+    };
+    const fields = 'number,statusCheckRollup,comments,body,files';
+    const first = readSharedOpenPrs(opts({ fields, exec: pageExec }));
+    expect(first[0].rollupIncomplete).toBe(hasNextPage !== false);
+    expect(first[0].comments).toEqual(PRS[0].comments);
+    expect(first[0].body).toBe(PRS[0].body);
+    expect(first[0].files).toEqual(PRS[0].files);
+    expect(readSharedOpenPrs(opts({ fields, exec: pageExec }))).toEqual(first);
+    expect(pageCalls(calls)).toHaveLength(1);
+    expect(viewCalls(calls)).toHaveLength(1);
+    const persisted = JSON.parse(readFileSync(snapshotPath(dir, REPO), 'utf8'));
+    expect(persisted.prs[0].rollupIncomplete).toBe(hasNextPage !== false);
+    expect(persisted.paging.hydrated).toBe(1);
+  });
   it('repoFromGhArgs reads --repo / -R / --repo=', () => {
     expect(repoFromGhArgs(['pr', 'edit', '1', '--repo', 'o/n'])).toBe('o/n');
     expect(repoFromGhArgs(['pr', 'edit', '1', '-R', 'o/n'])).toBe('o/n');
@@ -98,6 +134,22 @@ describe('pure helpers', () => {
 });
 
 describe('readSharedOpenPrs — one fetch serves the fleet', () => {
+  it('refreshes an old field union and preserves bot identity through fresh and cached reads', () => {
+    const author = { login: 'web-everything', is_bot: true };
+    const { exec, calls } = fakeExec([{ ...PRS[0], author }]);
+    writeFileSync(snapshotPath(dir, REPO), JSON.stringify({
+      v: PR_SNAPSHOT_VERSION, repo: REPO, fetchedAtMs: clock, fields: SNAPSHOT_FIELDS.filter(f => f !== 'author'),
+      prs: PRS, count: PRS.length,
+    }));
+    const fields = 'number,author';
+    const first = readSharedOpenPrs(opts({ fields, exec }));
+    expect(first).toEqual([{ number: PRS[0].number, author }]);
+    expect(readSharedOpenPrs(opts({ fields, exec }))).toEqual(first);
+    expect(pageCalls(calls)).toHaveLength(1);
+    expect(pageCalls(calls)[0][3]).toContain('author{login __typename}');
+    expect(viewCalls(calls)).toHaveLength(1);
+  });
+
   it('preserves capped comments unchanged through fresh and cached projections (#5955)', () => {
     const comments = Array.from({ length: 100 }, (_, i) => ({ body: `comment ${i}`, author: { login: 'someone' } }));
     const { exec, calls } = fakeExec([{ ...PRS[0], comments }]);
@@ -124,7 +176,8 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
     for (const fields of fieldSets) {
       const got = readSharedOpenPrs(opts({ fields, exec }));
       expect(got).toHaveLength(14);
-      expect(Object.keys(got[0]).sort()).toEqual(fields.split(',').sort());
+      expect(Object.keys(got[0]).sort()).toEqual([...fields.split(','),
+        ...(fields.split(',').includes('statusCheckRollup') ? ['rollupIncomplete'] : [])].sort());
       expect(got).toEqual(projectPrs(PRS, fields.split(',')));
       clock += 5_000;
     }
@@ -328,7 +381,28 @@ describe('the pass readers are wired to the snapshot (a seeded fresh snapshot is
     const got = m[fn]({ repo: REPO, ...extra });
     expect(got).toHaveLength(14);
     expect(got[0].number).toBe(100);
+    if (fn === 'defaultReadPrs') expect(got[0].author).toEqual(PRS[0].author);
   }, 60_000); // the first dynamic import of a heavy conveyor module can exceed the 5s default on a loaded host
+
+  it('reconcile serves the snapshot author without a REST lookup; a row lacking one is still REST-filled', async () => {
+    const { defaultReadPrs, SNAPSHOT_LIST_FIELDS, PR_LIST_JSON_FIELDS } = await import('../../conveyor/reconcile-pass.mjs');
+    expect(SNAPSHOT_LIST_FIELDS.split(',')).toContain('author');
+    // The snapshot serves every field reconcile lists: none is silently dropped, none makes the snapshot unservable.
+    expect(SNAPSHOT_LIST_FIELDS).toBe(PR_LIST_JSON_FIELDS);
+    expect(PR_LIST_JSON_FIELDS.split(',').filter(f => !SNAPSHOT_FIELDS.includes(f))).toEqual([]);
+    const rest = [];
+    const readRest = path => { rest.push(path); return { json: { user: { login: 'filled', type: 'Bot' } } }; };
+    const served = defaultReadPrs({ repo: REPO, readCommits: () => [], readRest });
+    expect(served.map(p => p.author)).toEqual(PRS.map(p => p.author));
+    expect(rest).toEqual([]);
+    const prs = PRS.map((p, i) => (i === 0 ? { ...p, author: null } : p));
+    writeFileSync(snapshotPath(dir, REPO), JSON.stringify({
+      v: PR_SNAPSHOT_VERSION, repo: REPO, fetchedAtMs: Date.now(), fields: [...SNAPSHOT_FIELDS], limit: 25, count: 14, truncated: false, prs,
+    }));
+    const filled = defaultReadPrs({ repo: REPO, readCommits: () => [], readRest });
+    expect(filled.find(p => p.number === 100).author).toEqual({ login: 'filled', is_bot: true });
+    expect(rest).toEqual([`repos/${REPO}/pulls/100`]);
+  }, 60_000);
 
   it('pr-limit#fetchOpenPrs', async () => {
     const { fetchOpenPrs } = await import('../pr-limit.mjs');

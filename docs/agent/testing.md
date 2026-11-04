@@ -1770,6 +1770,15 @@ card loading through `readTick` and spawn argv: a pure router test cannot catch
 `readPrs` and `readAgents` to exercise its shared PR snapshot; that snapshot carries
 escalation reasons and touched paths into the session model selection.
 
+### Open PR author projections
+
+When a standalone reader adds a field, update both `open-pr-fetch.mjs`'s per-tick union and
+`pr-snapshot.mjs`'s host snapshot union, including the paged GraphQL query and mapper.
+Author projections must carry bot identity: GraphQL Bot logins can lack `app/` or `[bot]`,
+so map `__typename` to `is_bot`. Keep human and missing-author controls in
+`pr-list-paged.test.mjs`, and cover refreshing a persisted snapshot without the field
+and preserving author data on cache hits in `pr-snapshot.test.mjs`.
+
 ### Explicit Claude spawn models
 
 Operator rule (2026-09-29): every fresh daemon-launched Claude session must pass an explicit
@@ -3819,6 +3828,18 @@ keep the live host busy probe, but pin the idle probe's PID listing to the test 
 its real status file. Inject process churn, unreadable entries, and settled scans separately to
 verify the production scanner's fail-closed behavior without relying on host quiescence.
 
+## Review restoration requires complete check evidence
+
+Validate every run's timestamp before collapsing duplicate check names. An unreadable
+run cannot be proven superseded; a readable older failed status may still yield to a
+completed CheckRun. Both lane and bot-head restoration require completed latest runs
+with readable timestamps and the full ten-minute grace.
+
+Paged check fixtures must include `contexts.pageInfo.hasNextPage: false` when complete.
+True or unknown pagination carries `rollupIncomplete` through snapshot projection and
+JSON persistence; all restoration branches hold until a complete read is available.
+Keep regression coverage in `reconcile-core.test.mjs`, `pr-list-paged.test.mjs`, and
+`pr-snapshot.test.mjs`, plus the existing unlabelled-bot daemon soak scenario.
 ## PR sweep invariant replay (R437)
 
 `scripts/conveyor/__tests__/pr-sweep.test.mjs` covers the all-open-PR shell, state clocks
@@ -3904,6 +3925,14 @@ line separators; the hostile-input table checks the resulting failure collector 
 When changing an existing test's expected verdict, disclose the behavior change in
 the PR description so reviewers can distinguish a policy change from a regression fix.
 
+## Review-label restoration requires explicit rollup completeness
+
+The restore-review-label planner gates accept only `rollupIncomplete: false`; old snapshots with no flag
+remain ineligible. Complete GraphQL context pages set false from `hasNextPage: false`, a commit whose
+`statusCheckRollup` is `null` (no check has reported yet) sets false with an empty rollup (a missing commit
+or rollup field stays true), direct gh listings
+only certify arrays below the 100-context cap, and snapshot projections preserve both boolean values.
+Complete-rollup fixtures (including stacked never-run cases) must carry false explicitly.
 Persistent GitHub 5xx soak fixtures must account for both retry ladders: `withListRetry`
 repeats the list read three times, and each attempt can sleep again in `gh-throttle`.
 The `smoke-github-outage` break pins `WE_GH_LIST_BACKOFF_MS=5,5` and

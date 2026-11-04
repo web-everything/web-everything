@@ -411,7 +411,9 @@ describe('runBounded failure details', () => {
     const cli = join(dirname(fileURLToPath(import.meta.url)), '../../conveyor/reconcile-pass.mjs');
     const cause = 'gh-throttle: throttled — no gh slot within 90s (class=read); retry next tick';
     // Inject the failed state read at the module boundary; execute the actual CLI and its catch unchanged.
-    const snapshot = `export { sampleContextDeclared } from ${JSON.stringify(pathToFileURL(join(dirname(cli), '../lib/pr-snapshot.mjs')).href)};
+    // Re-export the real module's whole surface so a new import into the CLI never breaks this stub (PR #6296);
+    // the local readSharedOpenPrs shadows the star export.
+    const snapshot = `export * from ${JSON.stringify(pathToFileURL(join(dirname(cli), '../lib/pr-snapshot.mjs')).href)};
     export function readSharedOpenPrs() {
       process.stderr.write(${JSON.stringify(cause + '\n')});
       throw new Error(${JSON.stringify(cause)});
@@ -443,8 +445,10 @@ describe('runBounded failure details', () => {
     const snapshotUrl = pathToFileURL(join(dirname(cli), '../lib/pr-snapshot.mjs')).href;
     const cause = 'gh-throttle: throttled — no gh slot within 90s (class=background); retry next tick';
     // Replace only the snapshot entry point: its actual page/hydration reader wraps the injected exec failure.
+    // Whole real surface re-exported (PR #6296: the CLI now also imports SNAPSHOT_FIELDS); the local
+    // readSharedOpenPrs shadows the star export.
     const snapshot = `import { fetchSnapshot } from ${JSON.stringify(snapshotUrl)};
-      export { sampleContextDeclared } from ${JSON.stringify(snapshotUrl)};
+      export * from ${JSON.stringify(snapshotUrl)};
       export function readSharedOpenPrs() {
         let calls = 0;
         return fetchSnapshot({ repo: 'example/repo', paging: { pageSize: 1, pageRetries: 0, heavyMaxAgeSeconds: 1 },

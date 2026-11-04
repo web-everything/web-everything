@@ -3,7 +3,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const done = (name) => ({ __typename: 'CheckRun', name, status: 'COMPLETED', conclusion: 'SUCCESS' });
+// The checks completed thirty minutes before the replay, beyond the restoration grace.
+const done = (name) => ({ __typename: 'CheckRun', name, status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-04T11:20:00Z' });
 
 export default {
   id: 'green-lane-pr-without-review-label-in-limbo',
@@ -15,7 +16,7 @@ export default {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
     const { planReconcile } = await import(pathToFileURL(join(root, 'scripts/conveyor/reconcile-core.mjs')).href);
     const pr = { number: 3830, state: 'OPEN', headRefName: 'lane/xw4yqe9-prevention-card', headRefOid: '5dbb97875768544344368071250e485f1b43ebb2',
-      isDraft: false, labels: [], comments: [], mergeStateStatus: 'CLEAN',
+      isDraft: false, labels: [], comments: [], mergeStateStatus: 'CLEAN', rollupIncomplete: false,
       statusCheckRollup: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'].map(done) };
     const plan = planReconcile({ prs: [pr], agents: [], durableCounts: {}, now: Date.parse('2026-10-04T11:50:00Z'),
       requiredChecks: ['test', 'smoke', 'daemon-soak'] });

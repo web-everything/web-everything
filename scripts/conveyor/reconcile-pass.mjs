@@ -82,7 +82,7 @@ import { resolve } from 'node:path';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { codeqlFailureEvidence } from '../lib/codeql-gate.mjs';
 import { makeFixEvidenceReader, checkFixFacts } from '../lib/fix-facts.mjs';
-import { readSharedOpenPrs, sampleContextDeclared } from '../lib/pr-snapshot.mjs';
+import { readSharedOpenPrs, sampleContextDeclared, SNAPSHOT_FIELDS } from '../lib/pr-snapshot.mjs';
 import { prSnapshotEnabled } from '../lib/pr-snapshot-store.mjs';
 import { listOpenPrsPagedHydrated, resolvePrListPaging, assertInventoryComplete, parseListOutput } from '../lib/pr-list-paged.mjs';
 import { ghRestGetJson } from '../lib/gh-rest-read.mjs';
@@ -297,7 +297,7 @@ import { classifyPr as classifyPrLifecycle } from './pr-watch.mjs';
 // straight off each row (`pr.isDraft`) to gate review dispatch off drafts and to plan the `promote-draft`
 // effect once a draft's required checks are green. Costs nothing extra beyond this one query, same as `files`
 // above.
-export const PR_LIST_JSON_FIELDS = 'number,title,headRefName,headRefOid,baseRefName,labels,statusCheckRollup,mergeStateStatus,comments,body,files,isDraft,createdAt';
+export const PR_LIST_JSON_FIELDS = 'number,title,headRefName,headRefOid,baseRefName,labels,statusCheckRollup,mergeStateStatus,comments,body,files,isDraft,createdAt,author';
 
 /** How many open PRs one pass reads. The board's own `OPEN_LIMIT` is 30; a reconciler that silently stopped at
  *  the default page would leave the overflow unowned, which is this item's defect wearing a smaller hat. */
@@ -318,9 +318,10 @@ export function enrichPrsWithReviewEvidence(prs, { repo, readCommits = fetchPrCo
  * @param {{exec?:Function, repo?:string|null}} [o]
  * @returns {Array<object>}
  */
-/** `PR_LIST_JSON_FIELDS` minus `author`: `author` is not a snapshot field, so asking for it made EVERY production read
- *  bypass the shared paged snapshot and run a heavy 200-row `gh pr list` (HTTP 504 all day, 2026-11-03). */
-export const SNAPSHOT_LIST_FIELDS = PR_LIST_JSON_FIELDS.split(',').filter(f => f !== 'author').join(',');
+/** `PR_LIST_JSON_FIELDS` limited to what the shared snapshot stores: asking for a field it lacks made EVERY production
+ *  read bypass the snapshot and run a heavy 200-row `gh pr list` (HTTP 504 all day, 2026-11-03). `author` IS a snapshot
+ *  field (#6254), so the snapshot's own author is served; {@link withRestAuthors} fills only a row that lacks one. */
+export const SNAPSHOT_LIST_FIELDS = PR_LIST_JSON_FIELDS.split(',').filter(f => SNAPSHOT_FIELDS.includes(f)).join(',');
 const pagedHeavyCache = new Map();
 const authorByPr = new Map();
 
@@ -400,7 +401,10 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
     const parsed = parseListOutput(out, { repo });
     // A full page means the inventory may be capped: refuse it rather than plan as if the overflow did not exist.
     if (parsed.length >= PR_LIST_LIMIT) throw Object.assign(new Error(`open-PR list${repo ? ` for ${repo}` : ''} hit the ${PR_LIST_LIMIT} cap — refusing a possibly partial inventory`), { code: 'pr-list-truncated' });
-    return parsed;
+    // The direct gh fallback has no pageInfo; a full 100-context page remains unknown.
+    return parsed.map(pr => pr?.rollupIncomplete === undefined
+      && Array.isArray(pr?.statusCheckRollup) && pr.statusCheckRollup.length < 100
+      ? { ...pr, rollupIncomplete: false } : pr);
   };
   if (exec === execFileSyncThrottled && repo) {
     const usePaged = prSnapshotEnabled(process.env) || listPaged !== listOpenPrsPagedHydrated;
@@ -1467,9 +1471,12 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch })
         const absent = withoutImpliedRequiredChecks(requiredChecks ?? [], rows).filter(name => !rows.some(row => row.name === name));
         const observed = collapseRollupToLatestPerName(rows).some(row => (!requiredChecks?.length || requiredChecks.includes(row.name))
           && (row.status.toLowerCase() !== 'completed' || FAILING_CONCLUSIONS.includes(row.conclusion?.toLowerCase())));
+        // `startedAt`: a feed that never projected `started_at` must not read as "never started" — an unread
+        // field is kept as an unparseable marker so `checksNotYetRun` (a queued rerun guard) fails closed.
         cache.set(key, { rows: rows.map(row => ({ ...row, status: row.status.toUpperCase(),
           detailsUrl: row.detailsUrl ?? row.details_url ?? row.html_url ?? null,
-          conclusion: row.conclusion?.toUpperCase() ?? null, completedAt: row.completed_at ?? null })),
+          conclusion: row.conclusion?.toUpperCase() ?? null, completedAt: row.completed_at ?? null,
+          startedAt: Object.hasOwn(row, 'started_at') ? (row.started_at ?? null) : 'unread' })),
         ...(absent.length && !observed ? { incomplete: `missing required checks: ${absent.join(', ')}` } : {}) });
       } catch (error) { cache.set(key, { error: String(error?.message ?? error) }); }
     }
@@ -1500,7 +1507,7 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch })
     // A refused or never-started read leaves a rollup that may miss a live run (past the page limit, or unread):
     // flag it so a mechanical re-run, which GitHub rejects against a live run, holds instead of guessing.
     ready.push({ ...pr, statusCheckRollup: (refused || neverStarted) && known ? known : result.error ? [] : result.rows,
-      ...((refused || neverStarted) ? { rollupIncomplete: true } : {}) });
+      rollupIncomplete: Boolean(refused || neverStarted) });
   }
   return { prs: ready, refusals, notes, owedTriggers };
 }

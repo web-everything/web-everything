@@ -55,7 +55,7 @@ import {
 export const SNAPSHOT_FIELDS = Object.freeze([
   'number', 'title', 'body', 'url', 'isDraft', 'createdAt', 'updatedAt',
   'headRefName', 'headRefOid', 'baseRefName', 'isCrossRepository', 'mergeable', 'mergeStateStatus', 'reviewDecision',
-  'labels', 'files', 'comments', 'statusCheckRollup',
+  'labels', 'files', 'comments', 'statusCheckRollup', 'author',
 ]);
 
 /** Smoke-only controls; unset keeps the normal snapshot read unchanged. */
@@ -173,11 +173,12 @@ export function isServable(snap, { fields, nowMs, ttlMs, dirtyMs = 0 }) {
   return true;
 }
 
-/** Project each PR to just `fields` — a caller sees the exact shape its own `--json` would have returned. PURE. */
+/** Project requested fields, preserving incomplete-read evidence alongside check data. PURE. */
 export function projectPrs(prs, fields) {
   return prs.map((p) => {
     const o = {};
     for (const f of fields) if (p && Object.prototype.hasOwnProperty.call(p, f)) o[f] = p[f];
+    if (fields.includes('statusCheckRollup') && typeof p?.rollupIncomplete === 'boolean') o.rollupIncomplete = p.rollupIncomplete;
     return o;
   });
 }

@@ -20,7 +20,7 @@ import { isGhDeferred } from './gh-deferred.mjs';
 
 export const HEAVY_FIELDS = Object.freeze(['comments', 'body', 'files']);
 export const PAGED_LIGHT_FIELDS = Object.freeze(['number', 'title', 'url', 'isDraft', 'createdAt', 'updatedAt', 'headRefName',
-  'headRefOid', 'baseRefName', 'isCrossRepository', 'mergeable', 'mergeStateStatus', 'reviewDecision', 'labels', 'statusCheckRollup']);
+  'headRefOid', 'baseRefName', 'isCrossRepository', 'mergeable', 'mergeStateStatus', 'reviewDecision', 'labels', 'statusCheckRollup', 'author']);
 export const PR_LIST_PAGING_DEFAULTS = Object.freeze({ pageSize: 20, pageRetries: 1, heavyMaxAgeSeconds: 600 });
 export const PR_LIST_PAGE_SIZE_ENV = 'WE_PR_LIST_PAGE_SIZE';
 
@@ -72,7 +72,7 @@ export function buildOpenPrPageQuery({ repo, pageSize, after = null }) {
   if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) throw new TypeError('pageSize must be an integer from 1 to 100');
   const [owner, name] = repo.split('/');
   const cursor = after === null ? '' : `,after:${JSON.stringify(after)}`;
-  return `query{repository(owner:"${owner}",name:"${name}"){pullRequests(states:OPEN,first:${pageSize}${cursor},orderBy:{field:CREATED_AT,direction:DESC}){totalCount pageInfo{hasNextPage endCursor} nodes{number title url isDraft createdAt updatedAt headRefName headRefOid baseRefName isCrossRepository mergeable mergeStateStatus reviewDecision labels(first:100){nodes{id name description color}} commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename ...on CheckRun{name status conclusion startedAt completedAt detailsUrl checkSuite{workflowRun{workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}}}}}}`;
+  return `query{repository(owner:"${owner}",name:"${name}"){pullRequests(states:OPEN,first:${pageSize}${cursor},orderBy:{field:CREATED_AT,direction:DESC}){totalCount pageInfo{hasNextPage endCursor} nodes{number title url isDraft createdAt updatedAt headRefName headRefOid baseRefName isCrossRepository mergeable mergeStateStatus reviewDecision author{login __typename} labels(first:100){nodes{id name description color}} commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} nodes{__typename ...on CheckRun{name status conclusion startedAt completedAt detailsUrl checkSuite{workflowRun{workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}}}}}}`;
 }
 
 const ZERO = '0001-01-01T00:00:00Z';
@@ -81,13 +81,22 @@ const mapCtx = c => c.__typename === 'CheckRun'
     name: c.name, startedAt: c.startedAt ?? ZERO, status: c.status, workflowName: c.checkSuite?.workflowRun?.workflow?.name ?? '' }
   : { __typename: 'StatusContext', context: c.context, startedAt: c.createdAt, state: c.state, targetUrl: c.targetUrl ?? '' };
 
-/** PURE: exactly gh pr list --json's labels and flattened statusCheckRollup shape. */
+/** PURE: gh's flattened check shape, plus incomplete-read evidence that must accompany the rollup. */
 export function mapGraphqlPr(n) {
+  const commit = n.commits?.nodes?.[0]?.commit;
+  const contexts = commit?.statusCheckRollup?.contexts;
+  // GitHub answers `statusCheckRollup: null` for a commit no check has reported on: a complete, empty set
+  // (a stacked lane PR before CI starts). A missing commit or rollup field is unread evidence, never empty.
+  const noChecksYet = commit != null && typeof commit === 'object' && commit.statusCheckRollup === null;
   return { number: n.number, title: n.title, url: n.url, isDraft: n.isDraft, createdAt: n.createdAt, updatedAt: n.updatedAt,
     headRefName: n.headRefName, headRefOid: n.headRefOid, baseRefName: n.baseRefName, isCrossRepository: n.isCrossRepository,
     mergeable: n.mergeable, mergeStateStatus: n.mergeStateStatus, reviewDecision: n.reviewDecision ?? '',
     labels: n.labels?.nodes ?? [],
-    statusCheckRollup: (n.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? []).map(mapCtx) };
+    statusCheckRollup: (Array.isArray(contexts?.nodes) ? contexts.nodes : []).map(mapCtx),
+    // GraphQL Bot logins need not carry gh's app/ prefix; preserve bot identity explicitly.
+    author: n.author ? { login: n.author.login, is_bot: n.author.__typename === 'Bot' } : null,
+    // Never certify the first 100 contexts as the full set; unknown pageInfo is also incomplete.
+    rollupIncomplete: !noChecksYet && (contexts?.pageInfo?.hasNextPage !== false || !Array.isArray(contexts?.nodes)) };
 }
 
 /** PURE: reject GraphQL errors even when accompanied by partial data. */

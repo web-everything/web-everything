@@ -13,7 +13,7 @@ const aiCommit = { messageHeadline: 'fix(x): y', messageBody: 'Co-Authored-By: C
 const REQUIRED = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'];
 const pr3902 = (labels = ['ready-to-merge']) => ({
   number: 3902, state: 'OPEN', isDraft: false, headRefName: 'lane/pool-scan-skip-non-dir-entries',
-  headRefOid: '8d0ccb4b51356f760172fb0e79ccc6000a0812a1', mergeStateStatus: 'BLOCKED', comments: [],
+  headRefOid: '8d0ccb4b51356f760172fb0e79ccc6000a0812a1', mergeStateStatus: 'BLOCKED', comments: [], rollupIncomplete: false,
   labels: labels.map((name) => ({ name })), commits: [aiCommit, aiCommit],
   statusCheckRollup: [run('test', 'SUCCESS'), run('smoke', 'SUCCESS'), run('daemon-soak', 'SUCCESS'), run('soak-replay-gate', 'FAILURE')],
 });

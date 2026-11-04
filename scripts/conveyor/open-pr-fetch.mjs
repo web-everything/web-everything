@@ -14,7 +14,7 @@ import { enrichPrsWithCompleteComments } from './pr-comments-complete.mjs';
 // `isDraft` (draft-first PRs, operator-approved 2026-09-27) — see `reconcile-pass.mjs#PR_LIST_JSON_FIELDS`'s
 // own comment; this is the SAME field, on the field list the real daemon actually reads (this fetch feeds the
 // `--prs-file=` every mechanical pass in `skills-src/conveyor/runner.mjs` shares for one tick).
-export const OPEN_PR_LIST_FIELDS = 'number,headRefName,title,body,labels,files,mergeable,mergeStateStatus,headRefOid,baseRefName,statusCheckRollup,comments,isDraft,createdAt';
+export const OPEN_PR_LIST_FIELDS = 'number,headRefName,title,body,labels,files,mergeable,mergeStateStatus,headRefOid,baseRefName,statusCheckRollup,comments,isDraft,createdAt,author';
 export const PR_LIST_LIMIT = 200;
 
 /** Throws on a failed fetch so the runner can fall back to each pass's standalone discovery. */
@@ -23,7 +23,11 @@ export function defaultFetchOpenPrs({ repo = null, exec = runGhSync, readComment
   if (repo) argv.push('--repo', repo);
   const out = exec(argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 });
   const parsed = JSON.parse(String(out || '[]'));
-  return Array.isArray(parsed) ? enrichPrsWithCompleteComments(parsed, { repo, ...(readComments ? { readComments } : {}) }) : [];
+  // gh caps contexts at 100 without pageInfo; only an uncapped array proves completeness.
+  const prs = Array.isArray(parsed) ? parsed.map(pr => pr.rollupIncomplete === undefined
+    && Array.isArray(pr.statusCheckRollup) && pr.statusCheckRollup.length < 100
+    ? { ...pr, rollupIncomplete: false } : pr) : [];
+  return Array.isArray(parsed) ? enrichPrsWithCompleteComments(prs, { repo, ...(readComments ? { readComments } : {}) }) : [];
 }
 
 /** A missing, malformed, or non-array snapshot is an empty safe list, never another network read. */

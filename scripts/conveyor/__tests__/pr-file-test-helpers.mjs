@@ -9,7 +9,7 @@ const fixture = [901, 902].map((number) => ({
   number, headRefName: `lane/3478-delivery-${number}`, headRefOid: `sha-${number}`,
   title: 'WE #3478: implement delivery', body: 'Closes #3478', labels: [{ name: 'review:pending' }],
   files: [{ path: 'scripts/example.mjs' }], mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY',
-  statusCheckRollup: [], comments: [],
+  statusCheckRollup: [], rollupIncomplete: false, comments: [],
 }));
 
 export function prFileContract({ name, load, reader, run, fields, reconcile = false, progress = false }) {

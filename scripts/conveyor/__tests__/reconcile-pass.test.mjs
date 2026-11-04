@@ -120,9 +120,17 @@ describe('mechanical round enrichment port (#5948)', () => {
 prFileContract({
   name: 'reconcile-pass', load: () => import('../reconcile-pass.mjs'),
   reader: 'defaultReadPrs', run: 'runReconcilePass',
-  fields: 'number,title,headRefName,headRefOid,baseRefName,labels,statusCheckRollup,mergeStateStatus,comments,body,files,isDraft,createdAt', reconcile: true,
+  fields: 'number,title,headRefName,headRefOid,baseRefName,labels,statusCheckRollup,mergeStateStatus,comments,body,files,isDraft,createdAt,author', reconcile: true,
 });
 
+
+it.each([0, 99, 100, 101])('direct reconcile discovery certifies only uncapped rollups: %s', async count => {
+  const { defaultReadPrs } = await import('../reconcile-pass.mjs');
+  const pr = { number: 1, labels: [{ name: 'review:pending' }], comments: [],
+    statusCheckRollup: Array.from({ length: count }, () => ({ name: 'test' })) };
+  const [result] = defaultReadPrs({ exec: () => JSON.stringify([pr]) });
+  expect(result.rollupIncomplete).toBe(count < 100 ? false : undefined);
+});
 
 // we:backlog/x81m8xx-*.md (#4189) — a caller passing the internal repo KEY (`--repo=we`, exactly as
 // `constellation-repos.mjs` names it) must not reach `gh` as the bare key: `gh pr list --repo we` fails
@@ -1047,6 +1055,23 @@ it('xxh4zw8 hydrates the crowded snapshot before planning same-tick recovery', a
   expect(plan.dispatch.map(d => d.kind)).toEqual(['ci-heal']);
   expect(readChecks).toHaveBeenCalledTimes(1);
   expect(readChecks).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', sha: XX_HEAD });
+});
+
+// Judge round 7/9 self-review: the REST check-runs feed hydrated here never projects `started_at`, so a queued
+// RERUN read through it must not pass `checksNotYetRun` as a never-started check (fail closed on the unread field).
+it.each([
+  ['no started_at field (unread)', {}, false],
+  ['a populated started_at (queued rerun)', { started_at: '2026-10-01T09:00:00Z' }, false],
+  ['an explicit null started_at (never started)', { started_at: null }, true],
+])('a stacked lane PR hydrated from REST runs with %s restores review: %s', async (_name, extra, restored) => {
+  const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  const pr = { ...xxPr(), isDraft: false, baseRefName: 'lane/parent', headRefName: 'lane/3336-stacked',
+    statusCheckRollup: [{ name: 'test', status: 'QUEUED', conclusion: null }] };
+  const readChecks = vi.fn(() => XX_REQUIRED.map((name, i) => ({ id: 1 + i, name, status: 'queued',
+    conclusion: null, completed_at: null, ...extra })));
+  const plan = runReconcilePass({ ...xxOptions(), readPrs: () => [pr], readChecks });
+  expect(readChecks).toHaveBeenCalledTimes(1);
+  expect(plan.dispatch.some(d => d.kind === 'restore-review-label' && d.prNumber === 3336)).toBe(restored);
 });
 
 it('hydrated REST check origins reach timeout enrichment', async () => {
