@@ -2107,6 +2107,13 @@ describe('carried evidence precedence (R503 red team)', () => {
     // ...while a newer own audit of a covered base does
     expect(prototypeLoad.canonicalAuditEvidence(records, SHA, () => true, FP)).toMatchObject({ ok: true });
   });
+  it('covers() is asked once per base, so a flaky second answer cannot pass an audit older than a carried WEAKENED', () => {
+    const records = [auditRecord({ at: at(1) }), audit({ verdict: 'WEAKENED', at: at(2) }), auditRecord({ base: C, at: at(3) })];
+    const asked = new Map();
+    const flaky = (base) => { const n = (asked.get(base) ?? 0) + 1; asked.set(base, n); return base !== C || n === 1; };
+    expect(prototypeLoad.canonicalAuditEvidence(records, SHA, flaky, FP)).toEqual({ ok: true, record: records[2] });
+    expect([...asked.values()].every((n) => n === 1)).toBe(true);
+  });
   it('an upper-case live sha still finds its own WEAKENED audit before any carried pass', () => {
     expect(prototypeLoad.canonicalAuditEvidence([audit({ at: at(3) }), auditRecord({ verdict: 'WEAKENED', at: at(1) })], SHA.toUpperCase(), () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
   });

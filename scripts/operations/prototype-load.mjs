@@ -83,14 +83,17 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   const carried = [...carriedHeads].flatMap(decisions);
   // Only an own verdict that could itself pass (its base is in main) is a re-audit that supersedes a carried WEAKENED:
   // a newer audit of a narrow, uncovered base never hides it behind an older covered pass.
-  const ownAt = Math.max(-Infinity, ...own.filter((d) => covers(d.base)).map((d) => Date.parse(d.record.at)));
+  // Ask covers() once per base: a flaky second answer must never let the pass loop disagree with this check.
+  const coverMemo = new Map();
+  const covered = (base) => { if (!coverMemo.has(base)) coverMemo.set(base, !!covers(base)); return coverMemo.get(base); };
+  const ownAt = Math.max(-Infinity, ...own.filter((d) => covered(d.base)).map((d) => Date.parse(d.record.at)));
   if (own.some((d) => d.record.verdict === 'WEAKENED')
     || carried.some((d) => d.record.verdict === 'WEAKENED' && !(Date.parse(d.record.at) < ownAt))) return { ok: false, reason: 'weakened' };
   // A pass counts only when covers(base) proves its base is in main; a carried pass must itself hold the fingerprint.
   const passes = own.length ? own : carried.filter((d) => carriesAcross(d.record.fingerprint, liveFp));
   let pass = null;
   for (const { base, record } of passes) {
-    if (covers(base) && (!pass || Date.parse(record.at) >= Date.parse(pass.at))) pass = record;
+    if (covered(base) && (!pass || Date.parse(record.at) >= Date.parse(pass.at))) pass = record;
   }
   return pass ? { ok: true, record: pass } : { ok: false, reason: 'no-record' };
 }
