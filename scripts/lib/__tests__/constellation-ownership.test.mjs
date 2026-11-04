@@ -1,11 +1,11 @@
 // @repo-scanning-test scope=full — ownership coverage and CLI totals require the complete tracked inventory.
 import { describe, expect, it } from 'vitest';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { classify, existingTrackedPaths, totals } from '../constellation-ownership.mjs';
+import { classify, existingTrackedPaths, main, totals } from '../constellation-ownership.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const map = JSON.parse(readFileSync(resolve(root, 'config/constellation-ownership.json'), 'utf8'));
@@ -14,6 +14,8 @@ const tracked = existingTrackedPaths(execFileSync('git', ['ls-files', '-z'], { c
 const proposed = ['config/constellation-ownership.json', 'scripts/lib/constellation-ownership.mjs',
   'scripts/lib/__tests__/constellation-ownership.test.mjs'];
 const paths = [...new Set([...tracked, ...proposed])];
+const baseline = classify(tracked, map);
+const baselineTotals = totals(baseline.files);
 const fixture = rules => ({ order: 'first-match', rules });
 
 describe('constellation ownership', () => {
@@ -75,7 +77,7 @@ describe('constellation ownership', () => {
   });
 
   it('A4: prints file/line totals for all six destinations summing to the tracked inventory', () => {
-    const result = totals(classify(tracked, map).files);
+    const result = baselineTotals;
     expect(Object.keys(result).sort()).toEqual([...map.destinations].sort());
     expect(Object.values(result).reduce((sum, entry) => sum + entry.files, 0)).toBe(tracked.length);
     expect(Object.values(result).every(entry => Number.isInteger(entry.lines) && entry.lines >= 0)).toBe(true);
@@ -110,39 +112,27 @@ describe('constellation ownership', () => {
   });
 
   it.each(['ENOENT', 'ENOTDIR', 'EACCES'])('handles working-tree inventory errors in the CLI (%s)', code => {
-    // Select present paths so deleting a particular fixture cannot break the scanner itself.
-    const deleted = code === 'ENOENT' ? tracked.find(path => path.startsWith('backlog/'))
-      : classify(tracked, map).reclassified[0]?.path;
-    expect(deleted).toBeDefined();
-    const preload = `
-      import fs from 'node:fs';
-      import { syncBuiltinESMExports } from 'node:module';
-      const lstat = fs.lstatSync;
-      fs.lstatSync = (path, ...args) => {
-        if (String(path) === ${JSON.stringify(resolve(root, deleted))}) {
-          throw Object.assign(new Error('simulated unstaged deletion'), { code: ${JSON.stringify(code)} });
-        }
-        return lstat(path, ...args);
-      };
-      syncBuiltinESMExports();
-    `;
-    const child = spawnSync(process.execPath,
-      ['--import', 'data:text/javascript,' + encodeURIComponent(preload),
-        'scripts/lib/constellation-ownership.mjs', 'classify', '--json'],
-      { cwd: root, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 30_000 });
+    // In-process on a small fixture list; lstat is injected so no child or preload is needed.
+    const listed = ['AGENTS.md', 'backlog/x.md', 'scripts/gen-inventory.mjs'];
+    const deleted = 'backlog/x.md';
+    const lstat = path => {
+      if (path === deleted) throw Object.assign(new Error('simulated unstaged deletion'), { code });
+    };
+    let out = '';
+    const run = () => main(['classify', '--json'], {
+      root, listTracked: () => listed, lstat, read: () => Buffer.from('a\n'), out: text => { out += text; },
+    });
     if (code === 'EACCES') {
-      expect(child.status).toBe(1);
-      expect(child.stderr).toBe('"simulated unstaged deletion"\n');
-      expect(child.stdout).toBe('');
+      expect(run).toThrow('simulated unstaged deletion');
+      expect(out).toBe('');
       return;
     }
-    expect(child.stderr).toBe('');
-    expect(child.status).toBe(0);
-    const result = JSON.parse(child.stdout);
-    const remaining = tracked.filter(path => path !== deleted);
+    run();
+    const result = JSON.parse(out);
+    const remaining = listed.filter(path => path !== deleted);
     expect(result.files.map(file => file.path)).toEqual(remaining);
     expect(result.reclassified.some(file => file.path === deleted)).toBe(false);
-    expect(result.totals).toEqual(totals(classify(remaining, map).files));
+    expect(result.totals).toEqual(totals(classify(remaining, map).files, () => Buffer.from('a\n')));
   });
 
   it('filters absent paths and missing or non-directory parents without dropping existing files', () => {
