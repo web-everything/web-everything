@@ -316,7 +316,9 @@ export async function dispatchCiHeal(planned, {
     if (out?.dispatch?.wrapped && Number.isInteger(out.dispatch.runnerPid)) {
       try { stampRunner({ repo, pr: planned.pr, kind: 'ci-heal', owner: claimOwner, pid: out.dispatch.runnerPid, ...(claimRoot ? { lockRoot: claimRoot } : {}) }); } catch { /* best effort: the plain TTL still applies */ }
     }
-    return { agentId: out?.handle ?? null, sessionSlug, pr: planned.pr, itemNum: planned.itemNum ?? null, lane: planned.lane, unknownTokens };
+    // R549: an unreadable launch hands back only the minted session id; report it as unverified, never as an agentId.
+    const unverified = out?.dispatch?.handleVerified === false;
+    return { agentId: unverified ? null : (out?.handle ?? null), ...(unverified ? { launched: 'unverified' } : {}), sessionSlug, pr: planned.pr, itemNum: planned.itemNum ?? null, lane: planned.lane, unknownTokens };
   } catch (e) {
     releaseOurClaim();
     throw e;
