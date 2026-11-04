@@ -28,6 +28,7 @@ import {
 } from '../readiness/heavy-admission.mjs';
 import { SELECTED_GATE_MERGE_SHA } from './heavy-queue.mjs';
 import { redactCommandLine } from './command-redact.mjs';
+import { probeForgeShare } from '../lib/forge-share.mjs';
 
 /** The owner→repo derivation `heavy-admission.mjs#waiterRepo` already uses for a waiting marker with no
  *  explicit `repo` field — reused here (not reimplemented) for a HELD slot's owner, which never carries a
@@ -150,5 +151,6 @@ export function collectHeavyQueue({
     observedAt: new Date(nowMs).toISOString(),
     cap: status.cap, fastSlots: status.fastSlots ?? 0, heldCount: status.heldCount, freeCount: status.freeCount, staleWaiting: status.staleWaiting,
     held, waiting, queue, remoteFallbacks: readRemoteFallbacks(lockRoot, nowMs),
+    forgeShare: probeForgeShare({ lockRoot, now: nowMs }),
   };
 }

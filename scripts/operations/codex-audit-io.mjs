@@ -1,4 +1,5 @@
 /** @file Real Git/Codex and JSONL persistence adapters for the standalone audit. */
+import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
 import * as realFs from 'node:fs';
 import { spawnSync as realSpawnSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
@@ -30,6 +31,7 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
     return result.stdout;
   };
   return {
+    fingerprint: (base, head) => netDiffFingerprint(cwd, base, head),
     resolveSha: ref => run('git', ['rev-parse', '--verify', `${ref}^{commit}`], 30_000).trim(),
     runCodex(prompt) {
       const scratch = fs.mkdtempSync(join(scratchRoot, 'codex-audit-'));

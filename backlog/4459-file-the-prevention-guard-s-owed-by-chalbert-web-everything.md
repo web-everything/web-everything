@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/operations/sweep-orphan-backlog-cards.mjs", "we:scripts/operations/__tests__/sweep-orphan-backlog-cards.test.mjs", "we:docs/agent/testing.md"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-03"
-preparedAgainstSha: "3ad6c4114ae1bd031a903c786de603faef122335"
+preparedDate: "2026-11-04"
+preparedAgainstSha: "967c2ea7268d531dc7fc4a7f8a2f7b859bfa766f"
 tags: []
 ---
 
@@ -78,3 +78,5 @@ All matching source tests live in `we:scripts/operations/__tests__/sweep-orphan-
 - No global retry-loop lint, shared exec helper or source-clone cleanup is required here. The owed conventions and local regression tests are part of this item, not deferred work.
 
 revalidated: The supplied diff adds testing conventions without changing the sweep implementation, preparation premises, scope, or required proof plan.
+
+revalidated: The supplied scope diff adds unrelated testing conventions and does not change the preparation’s premises, design, scope, or test and proof plan.
