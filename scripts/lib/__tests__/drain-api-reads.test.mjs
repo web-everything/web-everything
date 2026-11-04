@@ -25,12 +25,30 @@ const http = (status) => Object.assign(new Error(`gh: HTTP ${status}`), { httpSt
 /** A REST fake keyed by path substring; a function value throws/returns per call. */
 const routes = (table) => { const seen = []; const rest = (path) => {
   seen.push(path);
-  const hit = Object.keys(table).find((k) => path.includes(k));
+  const full = { ...table, 'git/ref/heads/': ok({ object: { sha: SHA } }) }; // default: every branch is at SHA
+  const hit = Object.keys(full).find((k) => path.includes(k));
   if (!hit) throw http(404);
-  const v = typeof table[hit] === 'function' ? table[hit](path) : table[hit];
+  const v = typeof full[hit] === 'function' ? full[hit](path) : full[hit];
   if (v instanceof Error) throw v;
   return v;
 }; rest.seen = seen; return rest; };
+/** Routes for one file at SHA: commit -> trees along the path -> contents. `contents` overrides the contents response, `entry` the tree entry. */
+const fileWorld = (path, doc, { contents, entry = {} } = {}) => {
+  const parts = path.split('/');
+  const t = { 'git/commits/': ok({ tree: { sha: 'rt0' } }) };
+  parts.forEach((name, i) => {
+    t[`git/trees/rt${i}`] = ok({ tree: [{ path: name, type: i < parts.length - 1 ? 'tree' : 'blob', mode: '100644', sha: i < parts.length - 1 ? `rt${i + 1}` : doc?.sha, ...(i === parts.length - 1 ? entry : {}) }] });
+  });
+  t[`contents/${path}`] = contents ?? ok(doc);
+  return t;
+};
+/** Routes for main's backlog/ listing at SHA. */
+const hwWorld = (names, { bk, over = {} } = {}) => ({
+  'git/commits/': ok({ tree: { sha: 'rt0' } }),
+  'git/trees/rt0': ok({ tree: [{ path: 'backlog', type: 'tree', sha: 'bk' }] }),
+  'git/trees/bk': bk ?? ok({ tree: names.map((n) => ({ path: n, type: 'blob', mode: '100644' })) }),
+  ...over,
+});
 const noGit = (calls = []) => (...a) => { calls.push(a); throw new Error('git must not run'); };
 const FREEZE = JSON.stringify({ frozen: true, kind: 'manual', reason: 'r', at: 't' });
 
@@ -49,47 +67,50 @@ describe('drain.reads.source setting', () => {
 describe('freeze read over REST', () => {
   const read = (rest) => readSharedFreeze({ board: '/x', branch: 'ops/red-main-freeze', readsSource: 'api', rest, slug: 'o/r' });
   it('success: parses the doc without a git process', () => {
-    const rest = routes({ [SHARED_FREEZE_FILE]: ok(b64(FREEZE)) });
+    const rest = routes(fileWorld(SHARED_FREEZE_FILE, b64(FREEZE)));
     expect(read(rest)).toMatchObject({ frozen: true, kind: 'manual' });
-    expect(rest.seen[0]).toContain('ref=ops%2Fred-main-freeze');
+    expect(rest.seen[0]).toContain('git/ref/heads/ops/red-main-freeze');
+    expect(rest.seen.at(-1)).toContain(`ref=${SHA}`); // the contents read is pinned to the resolved commit
   });
   it('304: the ETag reader serves the cached body', () => {
-    const rest = routes({ [SHARED_FREEZE_FILE]: { status: 304, notModified: true, json: b64(FREEZE) } });
+    const rest = routes(fileWorld(SHARED_FREEZE_FILE, b64(FREEZE), { contents: { status: 304, notModified: true, json: b64(FREEZE) } }));
     expect(read(rest)).toMatchObject({ frozen: true });
   });
   it('real ETag reader: second call is a conditional 304 that costs no refetch', () => {
     const dir = mkdtempSync(join(tmpdir(), 'etag-'));
     let n = 0;
+    const table = fileWorld(SHARED_FREEZE_FILE, b64(FREEZE));
+    table['git/ref/heads/'] = ok({ object: { sha: SHA } });
     const exec = (cmd, argv) => {
+      const path = argv[argv.length - 1];
+      const hit = Object.keys(table).find((k) => path.includes(k));
       if (argv[0] === 'api' && argv.includes('If-None-Match: "e1"')) throw Object.assign(new Error('gh: HTTP 304'), { stdout: 'HTTP/2.0 304 Not Modified\r\netag: "e1"\r\n\r\n', stderr: 'gh: HTTP 304' });
       n += 1;
-      return `HTTP/2.0 200 OK\r\netag: "e1"\r\n\r\n${JSON.stringify(b64(FREEZE))}`;
+      return `HTTP/2.0 200 OK\r\netag: "e1"\r\n\r\n${JSON.stringify(table[hit].json)}`;
     };
     const rest = (path, o) => ghRestGetJson(path, { ...o, exec, dir, env: { ...o.env, WE_GH_ETAG_CACHE: '1' } });
     expect(read(rest)).toMatchObject({ frozen: true });
+    const first = n;
+    expect(first).toBeGreaterThan(0);
     expect(read(rest)).toMatchObject({ frozen: true });
-    expect(n).toBe(1);
+    expect(n).toBe(first); // every call of the second read was a conditional 304
   });
   it('5xx: fails closed with a named transient reason', () => {
-    const r = read(routes({ [SHARED_FREEZE_FILE]: http(502) }));
+    const r = read(routes(fileWorld(SHARED_FREEZE_FILE, b64(FREEZE), { contents: http(502) })));
     expect(r.frozen).toBeUndefined();
     expect(r.transient).toBe(true);
     expect(r.error).toContain('api-http-502');
     expect(isTransientReadFailure(r.error)).toBe(true);
   });
   it('malformed response fails closed', () => {
-    expect(read(routes({ [SHARED_FREEZE_FILE]: ok({ type: 'dir' }) })).error).toContain('api-malformed');
-    expect(read(routes({ [SHARED_FREEZE_FILE]: ok(b64('not json')) })).error).toContain('not JSON');
+    expect(read(routes(fileWorld(SHARED_FREEZE_FILE, b64(FREEZE), { contents: ok({ type: 'dir' }) }))).error).toContain('api-malformed');
+    expect(read(routes(fileWorld(SHARED_FREEZE_FILE, b64('not json')))).error).toContain('not JSON');
   });
 });
 
 describe('origin/main high-water mark over REST', () => {
   const tree = (names, extra = {}) => ({ tree: names.map((path) => ({ path, type: 'blob' })), ...extra });
-  const base = (over = {}) => routes({
-    'git/trees/main': ok({ tree: [{ path: 'backlog', type: 'tree', sha: 'bk' }] }),
-    'git/trees/bk': ok(tree(['100-a.md', '7-b.md', 'README.md'])),
-    ...over,
-  });
+  const base = (over = {}) => routes(hwWorld(['100-a.md', '7-b.md', 'README.md'], { over }));
   it('uses the git callback checkout as the REST repository context', () => {
     const seenCwd = [];
     const rest = (path, o) => { seenCwd.push(o.context); return base()(path, o); };
@@ -106,7 +127,8 @@ describe('origin/main high-water mark over REST', () => {
   });
   it('304 path: cached trees are used as-is', () => {
     const rest = routes({
-      'git/trees/main': { status: 304, notModified: true, json: { tree: [{ path: 'backlog', type: 'tree', sha: 'bk' }] } },
+      'git/commits/': { status: 304, notModified: true, json: { tree: { sha: 'rt0' } } },
+      'git/trees/rt0': { status: 304, notModified: true, json: { tree: [{ path: 'backlog', type: 'tree', sha: 'bk' }] } },
       'git/trees/bk': { status: 304, notModified: true, json: tree(['5-a.md']) },
     });
     expect(run(rest, refsGit([])).main).toEqual([5]);
@@ -119,7 +141,7 @@ describe('origin/main high-water mark over REST', () => {
   it('malformed or truncated tree fails closed', () => {
     expect(() => run(base({ 'git/trees/bk': ok({ nope: 1 }) }))).toThrow(/api-malformed/);
     expect(() => run(base({ 'git/trees/bk': ok(tree(['1-a.md'], { truncated: true })) }))).toThrow(/api-truncated/);
-    expect(() => run(base({ 'git/trees/main': ok({ tree: [] }) }))).toThrow(/api-malformed/);
+    expect(() => run(base({ 'git/trees/rt0': ok({ tree: [] }) }))).toThrow(/api-malformed/);
   });
   it('refreshTracking: stale local ref after a failed fetch fails closed; a current ref needs no fetch', () => {
     const rest = base({ 'git/ref/heads/main': ok({ object: { sha: SHA } }) });
@@ -137,7 +159,7 @@ describe('bornAs read over REST', () => {
   const args = (rest, git) => ({ exec: (cmd, a) => git(a), headSha: SHA, cwd: undefined, readsSource: 'api', rest, slug: 'o/r' });
   const rest0 = (over = {}) => routes({
     'compare/': ok({ files: [{ filename: 'backlog/xabc123-new.md', status: 'added' }, { filename: 'src/x.ts', status: 'added' }] }),
-    'contents/backlog/xabc123-new.md': ok(b64(CARD)),
+    ...fileWorld('backlog/xabc123-new.md', b64(CARD)),
     'git/ref/heads/main': ok({ object: { sha: OTHER } }),
     ...over,
   });
@@ -214,17 +236,17 @@ describe('R549 round: pinned repo, strict base64, 20 s freeze bound', () => {
     expect(r.error).toMatch(/origin-unreadable|origin-unparseable|repo-mismatch/);
   });
   it('strict base64: bad alphabet, bad length and non-canonical content fail closed', () => {
-    const bad = (content) => readSharedFreeze({ board: '/x', branch: 'ops/b', readsSource: 'api', slug: 'o/r', rest: routes({ [SHARED_FREEZE_FILE]: ok({ type: 'file', encoding: 'base64', content }) }) }).error;
+    const bad = (content) => readSharedFreeze({ board: '/x', branch: 'ops/b', readsSource: 'api', slug: 'o/r', rest: routes(fileWorld(SHARED_FREEZE_FILE, { type: 'file', encoding: 'base64', content, sha: 'c'.repeat(40) })) }).error;
     expect(bad('!!!!')).toContain('invalid base64');
     expect(bad('abc')).toContain('invalid base64');
     expect(bad('QR==')).toContain('does not round-trip');
     const good = Buffer.from(FREEZE).toString('base64').replace(/(.{20})/g, '$1\n');
-    expect(readSharedFreeze({ board: '/x', branch: 'ops/b', readsSource: 'api', slug: 'o/r', rest: routes({ [SHARED_FREEZE_FILE]: ok({ ...b64(FREEZE), content: good }) }) })).toMatchObject({ frozen: true });
+    expect(readSharedFreeze({ board: '/x', branch: 'ops/b', readsSource: 'api', slug: 'o/r', rest: routes(fileWorld(SHARED_FREEZE_FILE, { ...b64(FREEZE), content: good })) })).toMatchObject({ frozen: true });
   });
   it('corrupt added-card content is held, not admitted', () => {
     const rest = routes({
       'compare/': ok({ files: [{ filename: 'backlog/xabc123-new.md', status: 'added' }] }),
-      'contents/backlog/xabc123-new.md': ok({ type: 'file', encoding: 'base64', content: '!!!!' }),
+      ...fileWorld('backlog/xabc123-new.md', { type: 'file', encoding: 'base64', content: '!!!!', sha: 'c'.repeat(40) }),
       'git/ref/heads/main': ok({ object: { sha: OTHER } }),
     });
     const r = checkBornAsCollision({ exec: () => `${OTHER}\n`, headSha: SHA, readsSource: 'api', rest, slug: 'o/r' });
@@ -333,10 +355,10 @@ describe('complete file-status set for added files', () => {
 
 describe('verified decode: base64 against reported size and sha', () => {
   const T = 'hello\nworld\n';
-  const at = (doc) => readFileAtRef('t', 'a/b.md', 'main', { source: src(routes({ 'contents/a/b.md': ok(doc) })) });
+  const at = (doc) => readFileAtRef('t', 'a/b.md', 'main', { source: src(routes(fileWorld('a/b.md', doc))) });
   it('a matching size and sha decodes', () => { expect(at(file(T))).toMatchObject({ ok: true, value: T }); });
   it('an absent path (404) is a real, ok null', () => {
-    expect(readFileAtRef('t', 'a/b.md', 'main', { source: src(routes({ 'contents/a/b.md': http(404) })) })).toMatchObject({ ok: true, value: null });
+    expect(readFileAtRef('t', 'a/b.md', 'main', { source: src(routes({ 'git/commits/': ok({ tree: { sha: 'rt0' } }), 'git/trees/rt0': ok({ tree: [{ path: 'a', type: 'tree', sha: 'rt1' }] }), 'git/trees/rt1': ok({ tree: [] }) })) })).toMatchObject({ ok: true, value: null });
   });
   it.each([
     ['size too small', file(T, { size: 3 }), 'size'],
@@ -360,7 +382,7 @@ describe('pagination: follow to the end or be unreadable', () => {
     const rest = routes({ '&page=1': ok({ files: [...page(99), { filename: 'backlog/a.md', status: 'added' }] }), '&page=2': ok({ files: [{ filename: 'backlog/b.md', status: 'added' }] }) });
     const r = readAddedFiles('main', SHA, { source: src(rest) });
     expect(r).toMatchObject({ ok: true, value: { added: ['backlog/a.md', 'backlog/b.md'] } });
-    expect(rest.seen).toHaveLength(2);
+    expect(rest.seen).toHaveLength(3); // base-tip read + two pages
   });
   it('a page failing midway makes the whole read unreadable, not a partial list', () => {
     const rest = routes({ '&page=1': ok({ files: page(100) }), '&page=2': http(502) });
@@ -369,10 +391,10 @@ describe('pagination: follow to the end or be unreadable', () => {
   it('hitting the 3000-file ceiling is unreadable (truncated), never complete', () => {
     const rest = routes({ 'page=': ok({ files: page(100) }) });
     expect(readAddedFiles('main', SHA, { source: src(rest) })).toMatchObject({ ok: false, reason: 'api-truncated' });
-    expect(rest.seen).toHaveLength(30);
+    expect(rest.seen).toHaveLength(31); // base-tip read + 30 pages
   });
   it('a tree flagged truncated is unreadable', () => {
-    const rest = routes({ 'git/trees/main': ok({ tree: [{ path: 'backlog', type: 'tree', sha: 'bk' }] }), 'git/trees/bk': ok({ tree: [], truncated: true }) });
+    const rest = routes(hwWorld([], { bk: ok({ tree: [], truncated: true }) }));
     expect(readBacklogNames('main', { source: src(rest) })).toMatchObject({ ok: false, reason: 'api-truncated' });
   });
   it('a missing files list is unreadable', () => {
@@ -399,7 +421,7 @@ describe('bounded calls: per-call deadline through the throttled reader', () => 
   });
   it('a paged read stops with deadline once the overall deadline passes mid-way', () => {
     let t = NOW;
-    const rest = (p) => { t += 10; return ok({ files: Array.from({ length: 100 }, (_x, i) => ({ filename: `f${i}-${t}`, status: 'modified' })) }); };
+    const rest = (p) => { t += 10; if (p.includes('git/ref/heads/')) return ok({ object: { sha: SHA } }); return ok({ files: Array.from({ length: 100 }, (_x, i) => ({ filename: `f${i}-${t}`, status: 'modified' })) }); };
     const r = readAddedFiles('main', SHA, { source: createRestSource({ rest, slug: 'o/r', env: {}, now: () => t, deadlineAt: NOW + 25 }) });
     expect(r).toMatchObject({ ok: false, reason: 'deadline' });
   });
@@ -417,7 +439,7 @@ describe('callers fail closed on unreadable (no empty/0/false mapping)', () => {
   it('bornAs: a renamed card into backlog/ with an unreadable body is held', () => {
     const rest = routes({
       'compare/': ok({ files: [{ filename: 'backlog/xabc123-new.md', previous_filename: 'd/x.md', status: 'renamed' }] }),
-      'contents/backlog/xabc123-new.md': ok(file('---\nbornAs: xabc123\n---\n', { size: 1 })),
+      ...fileWorld('backlog/xabc123-new.md', file('---\nbornAs: xabc123\n---\n', { size: 1 })),
       'git/ref/heads/main': ok({ object: { sha: OTHER } }),
     });
     const r = checkBornAsCollision({ exec: () => `${OTHER}\n`, headSha: SHA, readsSource: 'api', rest, slug: 'o/r' });
@@ -427,7 +449,7 @@ describe('callers fail closed on unreadable (no empty/0/false mapping)', () => {
   it('bornAs: a copied card is checked at its new path', () => {
     const rest = routes({
       'compare/': ok({ files: [{ filename: 'backlog/xabc123-new.md', previous_filename: 'backlog/old.md', status: 'copied' }] }),
-      'contents/backlog/xabc123-new.md': ok(file('---\nbornAs: xabc123\n---\n')),
+      ...fileWorld('backlog/xabc123-new.md', file('---\nbornAs: xabc123\n---\n')),
       'git/ref/heads/main': ok({ object: { sha: OTHER } }),
     });
     const calls = [];
@@ -448,11 +470,95 @@ describe('the pinned repository is the one of the requested remote', () => {
     const dir = mkdtempSync(join(tmpdir(), 'remotes-'));
     for (const a of [['init', '-q'], ['remote', 'add', 'origin', 'git@github.com:fork/repo.git'], ['remote', 'add', 'upstream', 'git@github.com:up/repo.git']]) execFileSync('git', ['-C', dir, ...a]);
     const seen = [];
-    const table = routes({ 'git/trees/main': ok({ tree: [{ path: 'backlog', type: 'tree', sha: 'bk' }] }), 'git/trees/bk': ok({ tree: [{ path: '7-a.md', type: 'blob' }] }) });
+    const table = routes(hwWorld(['7-a.md']));
     const rest = (path, o) => { seen.push(path); return table(path, o); };
     const git = (args) => (args[0] === 'ls-remote' ? '' : `${dir}\n`);
     expect(readNumberingEvidence(git, 'upstream', { source: 'api', rest, cwd: dir }).main).toEqual([7]);
     expect(seen.length).toBeGreaterThan(0);
     expect(seen.every((p) => p.startsWith('repos/up/repo/'))).toBe(true);
+  });
+});
+
+describe('R557 one snapshot: every multi-part read resolves ONE commit sha first', () => {
+  const MOVED = 'c'.repeat(40);
+  /** main is at SHA on the first ref read and at MOVED afterwards; each commit has its own tree. */
+  const movingMain = () => {
+    let n = 0;
+    const rest = routes({
+      'git/ref/heads/main': () => { n += 1; return ok({ object: { sha: n === 1 ? SHA : MOVED } }); },
+      [`git/commits/${SHA}`]: ok({ tree: { sha: 'rt0' } }),
+      [`git/commits/${MOVED}`]: ok({ tree: { sha: 'rtMoved' } }),
+      'git/trees/rt0': ok({ tree: [{ path: 'backlog', type: 'tree', sha: 'bk' }] }),
+      'git/trees/rtMoved': ok({ tree: [{ path: 'backlog', type: 'tree', sha: 'bkMoved' }] }),
+      'git/trees/bk': ok({ tree: [{ path: '5-old.md', type: 'blob', mode: '100644' }] }),
+      'git/trees/bkMoved': ok({ tree: [{ path: '9-new.md', type: 'blob', mode: '100644' }] }),
+    });
+    return rest;
+  };
+  it('the high-water read names the commit it read, and reads trees only through that commit', () => {
+    const rest = movingMain();
+    const r = readBacklogNames('main', { source: src(rest) });
+    expect(r).toMatchObject({ ok: true, value: ['backlog/5-old.md'], sha: SHA });
+    expect(rest.seen.filter((p) => p.includes('git/ref/heads/main'))).toHaveLength(1); // the tip is read once
+    expect(rest.seen.some((p) => p.includes(MOVED) || p.includes('rtMoved'))).toBe(false);
+  });
+  it('allocator: main moving between reads cannot pair the older floor with the newer tracking ref', () => {
+    const rest = movingMain();
+    const git = (args) => { if (args[0] === 'rev-parse') return `${MOVED}\n`; if (args[0] === 'ls-remote') return ''; throw new Error('fetch ETIMEDOUT'); };
+    // The local ref already equals the NEWER tip, but the floor came from the OLDER commit: that pairing must be refused.
+    expect(() => readNumberingEvidence(git, 'origin', { source: 'api', rest, cwd: '/c', slug: 'o/r', refreshTracking: true })).toThrow(/tracking-ref-stale/);
+  });
+  it('bornAs: the comparison base is pinned to one sha, and the tip compared is that same sha', () => {
+    let n = 0;
+    const rest = routes({
+      'git/ref/heads/main': () => { n += 1; return ok({ object: { sha: n === 1 ? OTHER : MOVED } }); },
+      'compare/': ok({ files: [{ filename: 'backlog/xabc123-new.md', status: 'added' }] }),
+      ...fileWorld('backlog/xabc123-new.md', b64('---\nbornAs: xabc123\n---\n')),
+    });
+    const git = (a) => { if (a[0] === 'rev-parse') return `${OTHER}\n`; if (a[0] === 'grep') throw Object.assign(new Error('none'), { status: 1 }); throw new Error('unexpected'); };
+    expect(checkBornAsCollision({ exec: (_c, a) => git(a), headSha: SHA, readsSource: 'api', rest, slug: 'o/r' })).toEqual({ ok: true });
+    expect(rest.seen.find((p) => p.includes('compare/'))).toContain(`${OTHER}...${SHA}`);
+    expect(rest.seen.filter((p) => p.includes('git/ref/heads/main'))).toHaveLength(1);
+  });
+  it('a file read resolves the ref once and fetches contents at that sha', () => {
+    const rest = routes({ ...fileWorld('a/b.md', b64('x\n')), 'git/ref/heads/main': () => ok({ object: { sha: SHA } }) });
+    expect(readFileAtRef('t', 'a/b.md', 'main', { source: src(rest) })).toMatchObject({ ok: true, value: 'x\n', sha: SHA });
+    expect(rest.seen.at(-1)).toContain(`?ref=${SHA}`);
+  });
+});
+
+describe('R557 only regular files read: tree entry mode and blob identity', () => {
+  const T = 'frozen\n';
+  const at = (entry, over = {}) => readFileAtRef('t', 'a/b.md', 'main', { source: src(routes(fileWorld('a/b.md', b64(T), { entry, ...over }))) });
+  it.each([['100644'], ['100755']])('mode %s is read', (mode) => {
+    expect(at({ mode })).toMatchObject({ ok: true, value: T });
+  });
+  it.each([
+    ['symlink 120000', { mode: '120000' }],
+    ['submodule 160000', { mode: '160000', type: 'commit' }],
+    ['a tree 040000', { mode: '040000', type: 'tree' }],
+    ['group-writable legacy 100664', { mode: '100664' }],
+    ['no mode', { mode: undefined }],
+    ['mode as a number', { mode: 100644 }],
+  ])('%s is unreadable', (_n, entry) => {
+    expect(at(entry)).toMatchObject({ ok: false, reason: 'api-malformed' });
+  });
+  it('a symlink whose target content verifies still cannot be read (the Contents API dereferences it)', () => {
+    const r = at({ mode: '120000' });
+    expect(r.ok).toBe(false);
+    expect(r.detail).toContain('not a regular file');
+  });
+  it('contents whose sha differs from the tree entry is unreadable', () => {
+    expect(at({ sha: 'd'.repeat(40) })).toMatchObject({ ok: false, reason: 'api-malformed' });
+  });
+  it('a directory component that is itself a symlink or file is unreadable', () => {
+    const rest = routes({ ...fileWorld('a/b.md', b64(T)), 'git/trees/rt0': ok({ tree: [{ path: 'a', type: 'blob', mode: '120000', sha: 'rt1' }] }) });
+    expect(readFileAtRef('t', 'a/b.md', 'main', { source: src(rest) })).toMatchObject({ ok: false, reason: 'api-malformed' });
+  });
+  it('freeze read: a symlinked freeze document holds (fail closed) even with valid target JSON', () => {
+    const rest = routes(fileWorld(SHARED_FREEZE_FILE, b64('{"frozen":false}'), { entry: { mode: '120000' } }));
+    const r = readSharedFreeze({ board: '/x', branch: 'ops/b', readsSource: 'api', slug: 'o/r', rest });
+    expect(r.frozen).toBeUndefined();
+    expect(r.error).toContain('not a regular file');
   });
 });

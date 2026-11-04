@@ -144,39 +144,88 @@ const decode = (r, doc) => {
   return good(r, bytes.toString('utf8'));
 };
 
-/** File text at a ref; value null (ok) when the path is absent (404). Malformed/oversized/unverified responses are unreadable. */
-export function readFileAtRef(read, path, ref, o = {}) {
-  const r = pull(read, `repos/{owner}/{repo}/contents/${path.split('/').map(encodeURIComponent).join('/')}?ref=${encodeURIComponent(ref)}`, o);
-  if (!r.ok) return r.reason === 'api-http-404' ? { read, ok: true, value: null, fetchedAt: r.fetchedAt } : r;
-  return decode(r, r.value);
-}
 
-/** Current tip sha of a branch on GitHub. */
+const isCommitSha = (s) => typeof s === 'string' && /^[0-9a-f]{40}$/.test(s);
+const FILE_MODES = new Set(['100644', '100755']);
+
+/** Resolve a branch to ONE commit sha (a 40-hex ref is already one). Every multi-part read pins to this sha. */
 export function readBranchSha(branch, o = {}) {
+  if (isCommitSha(branch)) return { read: 'branch-tip', ok: true, value: branch, fetchedAt: (o.now ?? Date.now)() };
   const r = pull('branch-tip', `repos/{owner}/{repo}/git/ref/heads/${branch.split('/').map(encodeURIComponent).join('/')}`, o);
   if (!r.ok) return r;
   const sha = r.value?.object?.sha;
   return typeof sha === 'string' && /^[0-9a-f]{40,64}$/.test(sha) ? good(r, sha) : bad(r, 'api-malformed', 'no object sha');
 }
 
-/** `backlog/<name>` for every entry of main's top-level backlog/ tree (non-recursive: nested paths never carry a card number). */
+/** The root tree sha of one commit. */
+function readCommitTree(read, commitSha, o) {
+  const r = pull(read, `repos/{owner}/{repo}/git/commits/${encodeURIComponent(commitSha)}`, o);
+  if (!r.ok) return r;
+  const t = r.value?.tree?.sha;
+  return typeof t === 'string' && /^\w+$/.test(t) ? good(r, t) : bad(r, 'api-malformed', 'commit without a tree sha');
+}
+
+/** One tree's entries; a truncated or malformed tree is unreadable. */
+function readTreeEntries(read, treeSha, o) {
+  const r = pull(read, `repos/{owner}/{repo}/git/trees/${encodeURIComponent(treeSha)}`, o);
+  if (!r.ok) return r;
+  if (r.value?.truncated === true) return bad(r, 'api-truncated', 'tree truncated');
+  if (!Array.isArray(r.value?.tree)) return bad(r, 'api-malformed', 'tree is not a list');
+  for (const t of r.value.tree) if (typeof t?.path !== 'string') return bad(r, 'api-malformed', 'tree entry without a path');
+  return good(r, r.value.tree);
+}
+
+/**
+ * File text at a ref, read at ONE commit sha: the ref resolves to a commit, the path is walked through the commit's trees,
+ * and the entry must be a regular blob (mode 100644/100755 - a symlink 120000, a submodule or a tree is unreadable, because
+ * the Contents API would follow a symlink). The contents body is fetched at that same sha and its blob sha must equal the
+ * tree entry's. value null (ok) when the path is absent. Result carries `sha`, the commit it was read at.
+ */
+export function readFileAtRef(read, path, ref, o = {}) {
+  const tip = readBranchSha(ref, o);
+  if (!tip.ok) return { ...tip, read };
+  const sha = tip.value;
+  const parts = path.split('/');
+  let tree = readCommitTree(read, sha, o);
+  let entry = null;
+  for (let i = 0; i < parts.length; i += 1) {
+    if (!tree.ok) return tree;
+    const entries = readTreeEntries(read, tree.value, o);
+    if (!entries.ok) return entries;
+    entry = entries.value.find((t) => t.path === parts[i]) ?? null;
+    if (!entry) return { read, ok: true, value: null, sha, fetchedAt: entries.fetchedAt };
+    if (i < parts.length - 1) {
+      if (entry.type !== 'tree' || typeof entry.sha !== 'string' || !/^\w+$/.test(entry.sha)) return bad(entries, 'api-malformed', `${parts.slice(0, i + 1).join('/')} is not a directory`);
+      tree = good(entries, entry.sha);
+    } else tree = entries;
+  }
+  if (entry.type !== 'blob' || !FILE_MODES.has(entry.mode)) return bad(tree, 'api-malformed', `${path} is not a regular file (type ${entry.type}, mode ${entry.mode})`);
+  const r = pull(read, `repos/{owner}/{repo}/contents/${parts.map(encodeURIComponent).join('/')}?ref=${sha}`, o);
+  if (!r.ok) return r.reason === 'api-http-404' ? bad(r, 'api-malformed', 'tree lists the path but contents is absent') : r;
+  if (r.value?.sha !== entry.sha) return bad(r, 'api-malformed', 'contents sha is not the tree entry sha (sha mismatch)');
+  const d = decode(r, r.value);
+  return d.ok ? { ...d, sha } : d;
+}
+
+/**
+ * `backlog/<name>` for every entry of the top-level backlog/ tree of ONE commit (non-recursive: nested paths never carry
+ * a card number). The branch resolves to a commit sha first; the result carries that `sha`, so a caller needing the tip
+ * uses it rather than a second, possibly newer, read.
+ */
 export function readBacklogNames(branch = 'main', o = {}) {
   const read = 'high-water-mark';
-  const root = pull(read, `repos/{owner}/{repo}/git/trees/${encodeURIComponent(branch)}`, o);
+  const tip = readBranchSha(branch, o);
+  if (!tip.ok) return { ...tip, read };
+  const sha = tip.value;
+  const rootSha = readCommitTree(read, sha, o);
+  if (!rootSha.ok) return rootSha;
+  const root = readTreeEntries(read, rootSha.value, o);
   if (!root.ok) return root;
-  if (root.value?.truncated === true || !Array.isArray(root.value?.tree)) return bad(root, 'api-malformed', 'root tree unreadable or truncated');
-  const entry = root.value.tree.find((t) => t?.path === 'backlog' && t.type === 'tree');
+  const entry = root.value.find((t) => t?.path === 'backlog' && t.type === 'tree');
   if (!entry || typeof entry.sha !== 'string' || !/^\w+$/.test(entry.sha)) return bad(root, 'api-malformed', 'no backlog tree in root');
-  const dir = pull(read, `repos/{owner}/{repo}/git/trees/${entry.sha}`, o);
+  const dir = readTreeEntries(read, entry.sha, o);
   if (!dir.ok) return dir;
-  if (dir.value?.truncated === true) return bad(dir, 'api-truncated', 'backlog tree truncated');
-  if (!Array.isArray(dir.value?.tree)) return bad(dir, 'api-malformed', 'backlog tree is not a list');
-  const names = [];
-  for (const t of dir.value.tree) {
-    if (typeof t?.path !== 'string') return bad(dir, 'api-malformed', 'tree entry without a path');
-    names.push(`backlog/${t.path}`);
-  }
-  return good(dir, names);
+  return { ...good(dir, dir.value.map((t) => `backlog/${t.path}`)), sha };
 }
 
 const KNOWN_STATUS = new Set(['added', 'modified', 'removed', 'renamed', 'copied', 'changed', 'unchanged']);
@@ -190,11 +239,15 @@ const MAX_PAGES = 30; // GitHub serves at most 3000 compare files; a full last p
  */
 export function readAddedFiles(base, headSha, o = {}) {
   const read = 'bornas-added-files';
+  // The base resolves to ONE commit sha first, so a main that moves between pages cannot mix two comparisons.
+  const baseTip = readBranchSha(base, o);
+  if (!baseTip.ok) return { ...baseTip, read };
+  const baseSha = baseTip.value;
   const added = [];
   const previous = [];
   let last;
   for (let page = 1; page <= MAX_PAGES; page += 1) {
-    const r = pull(read, `repos/{owner}/{repo}/compare/${encodeURIComponent(base)}...${headSha}?per_page=${PAGE}&page=${page}`, o);
+    const r = pull(read, `repos/{owner}/{repo}/compare/${baseSha}...${headSha}?per_page=${PAGE}&page=${page}`, o);
     if (!r.ok) return r;
     last = r;
     const files = r.value?.files;
@@ -208,7 +261,7 @@ export function readAddedFiles(base, headSha, o = {}) {
       }
       if (f.status === 'added' || f.status === 'renamed' || f.status === 'copied') added.push(f.filename);
     }
-    if (files.length < PAGE) return good(last, { added, previous });
+    if (files.length < PAGE) return { ...good(last, { added, previous }), baseSha };
   }
   return bad(last, 'api-truncated', 'compare file list at the 3000-file ceiling');
 }

@@ -13,7 +13,7 @@ import { withNumberingLock } from '../readiness/drain-lock.mjs';
 import { HASH_RE, isNum } from '../backlog/id.mjs';
 import { readSettings } from './settings-files.mjs';
 import { platformPreference, resolveCascade, formatCascadeSourcesLine } from './policy-cascade.mjs';
-import { DrainReadError, resolveDrainReadsSource, readBacklogNames, readBranchSha, unwrap } from './drain-api-reads.mjs';
+import { DrainReadError, resolveDrainReadsSource, readBacklogNames, unwrap } from './drain-api-reads.mjs';
 
 export function loadNumberAtBirthSettings({ file = readSettings(), env = process.env,
   platform = platformPreference('backlog', { env }) } = {}) {
@@ -75,9 +75,11 @@ export function readNumberingEvidence(git, remote = 'origin', { refreshTracking 
       // The REST repository is the one this checkout (the git callback's target) belongs to - never the ambient cwd.
       cwd ??= String(git(['rev-parse', '--show-toplevel'])).trim();
       if (!cwd) throw new DrainReadError('high-water-mark', 'api-error', 'checkout root unreadable');
-      main = numericIds(unwrap(readBacklogNames('main', { rest, cwd, slug, remote, source: reader })));
+      // ONE commit sha backs both the numbering floor and the tracking-ref check (a main that moves between reads cannot mix them).
+      const floor = readBacklogNames('main', { rest, cwd, slug, remote, source: reader });
+      main = numericIds(unwrap(floor));
       if (refreshTracking) {
-        const tip = unwrap(readBranchSha('main', { rest, cwd, slug, remote, source: reader }));
+        const tip = floor.sha;
         const local = () => { try { return String(git(['rev-parse', '--verify', '--quiet', `refs/remotes/${remote}/main`])).trim(); } catch { return ''; } };
         if (local() !== tip) {
           try { git(['fetch', '--no-tags', '--no-write-fetch-head', '--refmap=', remote, `+refs/heads/main:refs/remotes/${remote}/main`]); } catch { /* judged by the re-check below */ }

@@ -3,7 +3,7 @@ import { lstatSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import matter from 'gray-matter';
 import { healLaneRefs, looksLikeCorruption } from './lane-repair.mjs';
-import { DrainReadError, isTransientReadFailure, resolveDrainReadsSource, readAddedFiles, readFileAtRef, readBranchSha, unwrap } from './drain-api-reads.mjs';
+import { DrainReadError, isTransientReadFailure, resolveDrainReadsSource, readAddedFiles, readFileAtRef, unwrap } from './drain-api-reads.mjs';
 
 const HASH = /^x[0-9a-z]{6}$/;
 // A trailing ` # comment` is allowed: the standards check reads `bornAs` with a YAML parser, which drops it. Only
@@ -83,14 +83,15 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
       // R546: the added cards and their text come from GitHub REST (ETag; no fetch of the PR head). Main is judged
       // from the local origin/<base> ref, which must equal GitHub's tip: a stale ref fails closed (transient).
       const o = { rest, cwd, slug, source: reader };
-      names = unwrap(readAddedFiles(base, headSha, o)).added.filter(path => TOP_LEVEL_CARD.test(path));
+      const addedRead = readAddedFiles(base, headSha, o);
+      names = unwrap(addedRead).added.filter(path => TOP_LEVEL_CARD.test(path));
       headText = (path) => {
         const text = unwrap(readFileAtRef('bornas-card', path, headSha, o));
         if (text == null) throw new DrainReadError('bornas-card', 'api-http-404', `${path} missing at the pinned head`);
         return text;
       };
       if (names.length) {
-        const tip = unwrap(readBranchSha(base, o));
+        const tip = addedRead.baseSha; // the commit the comparison was made against
         const local = () => { try { return git(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${base}`]).trim(); } catch { return ''; } };
         if (local() !== tip) {
           try { run(['fetch', '--quiet', '--end-of-options', 'origin', `+refs/heads/${base}:refs/remotes/origin/${base}`]); } catch { /* judged by the re-check */ }
