@@ -117,7 +117,7 @@ describe('audit settings (R528)', () => {
     const hashes = resolve(full({ priorQuestionHashes: ['abcdef12'], PriorQuestionHashes: [] }));
     expect(hashes.value.priorQuestionHashes).toEqual([]);
   });
-  it.each(['releaseStage ', 'releaseStage​', 'ｒeleaseStage', 'releaſeStage', ' release\tStage'])(
+  it.each(['releaseStage ', 'releaseStage\u200B', 'ｒeleaseStage', 'releaſeStage', ' release\tStage'])(
     'a whitespace, invisible or compatibility-form variant %j of a setting key fails it closed (PR #6381)', k => {
       const r = resolveAuditSettings({ fileRead: file({ [k]: 'prerelease' }), platform: null, env: {}, log: () => {} });
       expect(r.value.releaseStage).toBe('prod');
