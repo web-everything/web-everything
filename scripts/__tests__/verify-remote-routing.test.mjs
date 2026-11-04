@@ -937,9 +937,7 @@ describe('explicit and compound gates split into per-segment phases (PR-4)', () 
 
   it('rewrites a foreign-root shard wrapper to this checkout and keeps the env-prefixed scan verbatim', () => {
     const log = vi.fn();
-    const gate = `${foreign} --shards=3 --parallel=3 -- npx vitest run scripts/a.test.mjs && ${scan}`.replace(/^/, '');
-    expect(splitExplicitGate(gate, { log })).toBeNull(); // missing `node` prefix is an unknown shape
-    const full = `${foreign.replace(/^/, '')} --shards=3 --parallel=3 -- npx vitest run scripts/a.test.mjs && ${scan}`;
+    const full = `${foreign} --shards=3 --parallel=3 -- npx vitest run scripts/a.test.mjs && ${scan}`;
     const segments = splitExplicitGate(full, { log });
     expect(segments).toEqual([`${ours} --shards=3 --parallel=3 -- npx vitest run scripts/a.test.mjs`, scan]);
     expect(phaseAdmissionPlan({ command: segments[0], decision: { remote: true } })).toMatchObject({ shardWrapper: true, takeLocalSlot: false });
@@ -951,7 +949,10 @@ describe('explicit and compound gates split into per-segment phases (PR-4)', () 
     expect(splitExplicitGate(`${ours} --shards=2 -- npx vitest run a.test.mjs && npm run check:standards`)).toEqual([
       `${ours} --shards=2 -- npx vitest run a.test.mjs`, 'npm run check:standards']);
     const quoted = `${foreign} --shards=2 -- npx vitest run a.test.mjs && VERIFY_SCAN_FILES='["a && b.mjs"]' npx vitest run c.test.mjs`;
-    expect(splitExplicitGate(quoted)).toHaveLength(2);
+    // The `&&` inside the quoted list is not a boundary: the one segment is rejected whole by Forge's env allowlist.
+    const log = vi.fn();
+    expect(splitExplicitGate(quoted, { log })).toBeNull();
+    expect(log.mock.calls[0][0]).toContain('VERIFY_SCAN_FILES');
   });
 
   it.each([

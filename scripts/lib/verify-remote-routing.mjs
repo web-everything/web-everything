@@ -1,7 +1,7 @@
 import { existsSync, openSync, fstatSync, readSync, closeSync, constants } from 'node:fs';
 import { cpus, loadavg } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { admissionLockRoot, admissionBypassReason, poolRootOf, loadAdmissionPolicy, decideRemote, resolveRemoteClient } from '../readiness/heavy-admission.mjs';
 import { defaultPoolRoot } from './lane-pool-paths.mjs';
 import { allowedCommand, allowedEnv } from '../readiness/forge-exec-run.mjs';
@@ -92,6 +92,67 @@ export const SHARD_RUN_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'v
 export function localPhaseReason(command) {
   return command.split(' && ').some(segment => /^npx vitest related(?=\s|$)/.test(segment.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '')))
     ? 'vitest-related-local-only' : 'raw-command';
+}
+
+// Quote-aware split on top-level ` && `: a single-quoted VERIFY_SCAN_FILES list may itself contain `&&`.
+function splitTopLevelAnd(command) {
+  const parts = [];
+  let current = '';
+  let quoted = false;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (ch === "'") quoted = !quoted;
+    if (!quoted && command.startsWith(' && ', i)) { parts.push(current); current = ''; i += 3; continue; }
+    current += ch;
+  }
+  parts.push(current);
+  return parts;
+}
+
+// An explicit or compound gate such as `node <any checkout>/scripts/lib/verify-shard-run.mjs … && VERIFY_SCAN_FILES=…
+// npx vitest run …` used to fall through to the silent local `raw-command` path. Split it into per-segment phases so
+// each gets its own admission and Forge preflight. Only a gate holding a shard wrapper is split here (plain vitest/npm
+// chains already route through `wrappedChain`). A foreign checkout's wrapper path is rewritten to THIS checkout's
+// copy, never run as given. Any segment of unknown shape keeps the WHOLE gate local and `log` names why.
+// Returns the segment commands, or null.
+export function splitExplicitGate(command, { log = () => {} } = {}) {
+  if (typeof command !== 'string' || /[\r\n]/.test(command)) {
+    if (typeof command === 'string' && command.includes(SHARD_WRAPPER_BASENAME)) log('explicit-gate-unsplit: unknown-segment (multi-line gate)');
+    return null;
+  }
+  const segments = splitTopLevelAnd(command);
+  if (segments.length < 2 && !command.includes(SHARD_WRAPPER_BASENAME)) return null;
+  const isWrapper = segment => segment.includes(SHARD_WRAPPER_BASENAME) || /^node /.test(segment);
+  if (!segments.some(isWrapper)) return null;
+  const out = [];
+  for (const segment of segments) {
+    const rewritten = rewriteShardWrapperSegment(segment);
+    if (rewritten) { out.push(rewritten); continue; }
+    if (isVitestSegment(segment) && segmentParts(segment)) { out.push(segment); continue; }
+    if (wrappedNpmScript(segment)) { out.push(segment); continue; }
+    log(`explicit-gate-unsplit: unknown-segment (${segment.trim().split(/\s+/).slice(0, 3).join(' ').slice(0, 80)})`);
+    return null;
+  }
+  return out;
+}
+const SHARD_WRAPPER_BASENAME = 'scripts/lib/verify-shard-run.mjs';
+function rewriteShardWrapperSegment(segment) {
+  if (/[;&|<>`$()\r\n]/.test(segment.replace(/'(?:[^']|'\\'')*'/g, "''"))) return null;
+  const words = simpleShellWords(segment);
+  if (!words || words[0] !== 'node' || words.length < 2) return null;
+  const script = unquote(words[1]);
+  if (script !== SHARD_RUN_SCRIPT && !(isAbsolute(script) && script.endsWith(`/${SHARD_WRAPPER_BASENAME}`))) return null;
+  return `node ${shellQuote(SHARD_RUN_SCRIPT)} ${words.slice(2).join(' ')}`.trimEnd();
+}
+
+// Strict `&&`: run each segment in turn; the first nonzero exit or signal stops the rest and is the result.
+export async function runGateSegments(segments, run) {
+  let last = null;
+  for (const segment of segments) {
+    last = await run(segment);
+    if (last.exitCode !== 0 || last.signal) return last;
+  }
+  return last;
 }
 
 export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {

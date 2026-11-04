@@ -84,7 +84,7 @@ import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRe
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
-import { SHARD_RUN_SCRIPT, localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
+import { SHARD_RUN_SCRIPT, splitExplicitGate, runGateSegments, localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
 import { startTreeWatchdog } from './lib/tree-watchdog.mjs';
 import { shellQuote, isShardWrapperCommand } from './lib/verify-lane-gate.mjs';
 import { randomBytes } from 'node:crypto';
@@ -626,7 +626,14 @@ const retryableGate = isSelectedTestCommand(resolvedGate?.testCommand ?? '');
 // The helper resolves environment overrides over the running checkout's cached settings file.
 const phaseAdmission = verifyPhaseAdmissionEnabled(process.env) && retryableGate;
 const admissionPhases = {};
-async function acquireAdmission(phase, command, { forceLocal = false } = {}) {
+// An explicit gate holding a shard wrapper (`node <checkout>/scripts/lib/verify-shard-run.mjs … && VERIFY_SCAN_FILES=… npx vitest run …`)
+// runs as per-segment phases: each segment gets its own admission and Forge preflight (the wrapper rewritten to THIS
+// checkout's copy). An unknown segment keeps the whole gate local and logs why. The marker `suites` stays GATE.
+const explicitSegments = retryableGate ? null
+  : splitExplicitGate(resolvedGate?.command ?? GATE, { log: reason => process.stderr.write(`verify-lane: ${reason}\n`) });
+if (explicitSegments) process.stderr.write(`verify-lane: explicit gate split into ${explicitSegments.length} per-segment phases\n`);
+async function acquireAdmission(phase, command, { forceLocal = false, split = false } = {}) {
+  if (split) return { ok: false, waitedMs: 0, remote: true, split: true };
   let decision = { remote: false, reason: localPhaseReason(command) };
   if (!forceLocal && !phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: true } }).takeLocalSlot) {
     decision = await decidePhaseRemote({ cwd: REPO, env: process.env, argv: command.split(/\s+/) });
@@ -655,12 +662,13 @@ async function acquireAdmission(phase, command, { forceLocal = false } = {}) {
   }
   return acquired;
 }
-const admission = await acquireAdmission('vitest', retryableGate ? resolvedGate.testCommand : (resolvedGate?.command ?? GATE));
+// A split gate admits each segment itself (timedRunGate), so there is no whole-gate admission to take or reuse.
+const admission = await acquireAdmission('vitest', retryableGate ? resolvedGate.testCommand : (resolvedGate?.command ?? GATE), { split: Boolean(explicitSegments) });
 let currentAdmission = admission;
 let vitestAdmittedLocally = admission.ok;
 const ranOnPhases = {};
 let remoteUnconfirmed = false;
-let firstPhaseAdmission = admission;
+let firstPhaseAdmission = explicitSegments ? null : admission;
 // verify-admission (2026-10-20) — keep whichever slot this process holds alive while the gate runs. The slot lease
 // had no refresh, so a gate past ADMISSION_LEASE_MINUTES lost its slot to the next waiter and kept running
 // unslotted (12 concurrent verify-lanes, `heavy-queue` showing 0 held). The per-phase timeout below bounds how
@@ -904,7 +912,7 @@ const alwaysRun = retryableGate
   : { command: null, declared: [], files: [], skipped: [] };
 const continueAfter = (r) => r.exitCode === 0 || (runAllPhases && !r.signal && !verificationInfrastructureFailure(r));
 try {
-  let result = await timedRunGate(retryableGate ? 'vitestMs' : null,
+  let result = explicitSegments ? await runGateSegments(explicitSegments, segment => timedRunGate(null, segment)) : await timedRunGate(retryableGate ? 'vitestMs' : null,
     // Item 59 (b) — a recognized default gate with a non-`vitest related` test half (`npm test`, a skipped-vitest echo)
     // runs the plan resolved under THIS (the daemon's) standards policy, not the requester's stamped command.
     // `GATE` stays the marker's `suites`, so the cache key still matches.
