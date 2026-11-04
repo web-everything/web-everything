@@ -69,6 +69,21 @@ export function resolveOwner(pr, signals = {}) {
     state: stuck ? 'stuck' : owner ? 'active' : 'none', why: smell ? `Open health episode: ${smell}` : stuck ? 'Owner signal is stale' : owner ? 'Live owner signal' : base.why,
     ...(smell ? { smell } : {}) };
 }
+/** R502 item 5 - the REAL reason a PR is waiting, so the sweep stops reporting the implied daemon as a stale owner.
+ *  Precedence: a live fixer claim, then the daemon's latest refusal (when no later progress and, if it names a head,
+ *  the current head), then a parked PR (draft or `review:human`). Null when nothing is known: the old report stands. PURE. */
+export function resolveWaitState(pr, { fixClaim = null, daemons = [] } = {}, { now = null, maxAgeMinutes = 360 } = {}) {
+  if (fixClaim?.who) return { kind: 'live-claim', detail: String(fixClaim.who) };
+  // A refusal is current evidence only when fresh: without a clock, or older than maxAgeMinutes, it is not a wait state.
+  const dated = (Array.isArray(daemons) ? daemons : []).filter((d) => Number.isFinite(ms(d?.at)));
+  const progressAt = Math.max(-Infinity, ...dated.filter((d) => d.kind === 'progress').map((d) => ms(d.at)));
+  const refusal = dated.filter((d) => d.kind === 'refusal' && Number.isFinite(now) && ms(d.at) <= now + 60000 && now - ms(d.at) <= maxAgeMinutes * 60000 && ms(d.at) > progressAt && (d.head == null || d.head === pr.headRefOid))
+    .sort((a, b) => ms(b.at) - ms(a.at))[0];
+  if (refusal) return { kind: 'refused', detail: String(refusal.reason ?? '').slice(0, 160), by: refusal.name ?? null, at: new Date(ms(refusal.at)).toISOString() };
+  const labels = labelNames(pr) ?? [];
+  if (pr.isDraft === true || labels.includes('review:human')) return { kind: 'parked', detail: pr.isDraft === true ? 'draft' : 'review:human' };
+  return null;
+}
 export const DEADLINE_MINUTES = { label: 45, 'await-review': 90, 'await-red-team': 60, fix: 120, rebase: 90, 'wait-on': 120, 'close into card': 45 };
 export const labelNames = pr => Array.isArray(pr.labels) ? [...new Set(pr.labels.map(l => typeof l === 'string' ? l : l?.name))].sort() : null;
 export const stateFingerprint = pr => JSON.stringify([pr.headRefOid, labelNames(pr), pr.state ?? 'OPEN']);
@@ -83,7 +98,7 @@ export function repeatDue(record, now, backoff) {
     && now - record.lastAlertAt >= backoff[Math.min(Math.max(0, (record.alertCount ?? 1) - 1), backoff.length - 1)] * 60000;
 }
 /** PURE: one owner, action, deadline and violation for every open PR. */
-export function evaluateInvariant(pr, owner = {}, { now, since = now, settings = {}, blockedBy = [] } = {}) {
+export function evaluateInvariant(pr, owner = {}, { now, since = now, settings = {}, blockedBy = [], waitState = null } = {}) {
   const labels = labelNames(pr);
   const unreadable = !labels || labels.some(l => typeof l !== 'string');
   let nextAction = unreadable ? 'inspect unreadable labels' : !labels.length ? 'label'
@@ -103,9 +118,11 @@ export function evaluateInvariant(pr, owner = {}, { now, since = now, settings =
     || (Number.isFinite(lastSignal) ? now - lastSignal > (settings.idleMinutes ?? 45) * 60000 : !['active', 'waiting-operator'].includes(owner.state) && now - stateSince(pr, since, now) > (settings.idleMinutes ?? 45) * 60000);
   const violation = emptyDiff ? 'empty-diff' : blockedBy.length ? 'waiting-on-blocked'
     : unreadable ? 'owner-stale' : !labels.length ? 'no-labels'
-    : now > Date.parse(deadline) ? 'deadline-passed' : stale ? 'owner-stale' : null;
+    : now > Date.parse(deadline) ? 'deadline-passed' : stale ? (waitState?.kind && !['unknown'].includes(owner.state) && !owner.smell ? `waiting-${waitState.kind}` : 'owner-stale') : null;
   const implied = nextAction === 'fix' || nextAction === 'rebase' ? 'daemon:fix-dispatch-daemon' : nextAction.startsWith('await-') ? 'daemon:review-daemon' : 'operator';
-  return { owner: owner.owner ?? implied, nextAction, deadline, violation };
+  // A stale owner with a known wait state reports THAT, never the stale or implied daemon (R502 item 5).
+  const reported = stale && waitState?.kind && owner.state !== 'unknown' && !owner.smell ? `wait:${waitState.kind}` : owner.owner ?? implied;
+  return { owner: reported, nextAction, deadline, violation, ...(waitState?.kind ? { waitState } : {}) };
 }
 export function planSweep({ idle, owners, prevState = {}, needsYou, now, settings, ownerReadsOk = true, prsReadOk = true }) {
   const alerts = []; const diagnose = new Set();
