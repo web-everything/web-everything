@@ -2,9 +2,10 @@
 import { describe, it, expect, vi } from 'vitest';
 import { appendVerifyRemoteReport, heartbeatOwnedSlot } from '../readiness/heavy-admission.mjs';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
-import { localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, readRemoteReport, remoteInfrastructureFailure, phaseRunLocation, overallRunLocation, decidePhaseRemote } from '../lib/verify-remote-routing.mjs';
+import { localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, readRemoteReport, remoteInfrastructureFailure, phaseRunLocation, overallRunLocation, decidePhaseRemote, recordVerifyLocal, SHARD_RUN_SCRIPT } from '../lib/verify-remote-routing.mjs';
 import { runInNewContext } from 'node:vm';
 import { fstatSync, readSync } from 'node:fs';
+import { shellQuote } from '../lib/verify-lane-gate.mjs';
 
 vi.mock('node:fs', async importOriginal => {
   const fs = await importOriginal();
@@ -926,5 +927,71 @@ describe('R332: scan phases and whole-gate chains route to Forge', () => {
       "npx vitest run a.test.mjs --reporter=default --reporter=json --outputFile.json='/tmp/r/report.json' --testTimeout=15000",
       'npx vitest run --config vitest.soak.config.ts scripts/conveyor/soak/breaks/x.soak.test.mjs',
     ]) expect(phaseAdmissionPlan({ command, decision: remote })).toEqual({ command, takeLocalSlot: true, setHeld: true });
+  });
+});
+
+describe('verify-local decisions are logged as forge-share fallbacks (PR-1)', () => {
+  const sliceAcquire = () => {
+    const source = readFileSync(resolve(repo, 'scripts/verify-lane.mjs'), 'utf8');
+    const start = source.indexOf('async function acquireAdmission(');
+    const end = source.indexOf('const admission = await acquireAdmission(', start);
+    expect(start).toBeGreaterThan(-1);
+    return source.slice(start, end);
+  };
+  const run = async (command, { decision, opts } = {}) => {
+    const recordVerifyLocal = vi.fn();
+    const stderr = [];
+    const context = {
+      phaseAdmission: false, localPhaseReason, phaseAdmissionPlan,
+      decidePhaseRemote: vi.fn(async () => decision ?? { remote: true, reason: 'ok' }),
+      acquireSlotBlocking: vi.fn(async () => ({ ok: true, slot: 0, waitedMs: 0 })),
+      phaseAdmissionKind: () => ({ kind: 'files' }), classifyCommandKind: () => 'selected',
+      admissionPhases: {}, laneMatch: null, GATE: command, ADMISSION_TIMEOUT_MS: 1000, resolvedGate: { decision: {} },
+      ADMISSION_LOCK_ROOT: '/locks', ADMISSION_CAP: 1, REPO: repo, recordVerifyLocal,
+      process: { env: {}, stderr: { write: s => stderr.push(s) } },
+    };
+    const acquireAdmission = runInNewContext(`${sliceAcquire()}; acquireAdmission`, context);
+    await acquireAdmission('vitest', command, opts);
+    return { recordVerifyLocal, stderr: stderr.join('') };
+  };
+
+  it.each([
+    ['echo hi', 'raw-command'],
+    ['npx vitest related src/a.mjs', 'vitest-related-local-only'],
+  ])('a silent local phase prints and records its reason: %s', async (command, reason) => {
+    const { recordVerifyLocal, stderr } = await run(command);
+    expect(stderr).toContain(`local admission (${reason})`);
+    expect(recordVerifyLocal).toHaveBeenCalledTimes(1);
+    expect(recordVerifyLocal).toHaveBeenCalledWith(expect.objectContaining({ reason: `verify-local:${reason}`, command }));
+  });
+
+  it('a preflight refusal that keeps a vitest phase local records the preflight reason', async () => {
+    const command = 'npx vitest run a.test.mjs';
+    const { recordVerifyLocal } = await run(command, { decision: { remote: false, reason: 'forge-unreachable' } });
+    expect(recordVerifyLocal).toHaveBeenCalledTimes(1);
+    expect(recordVerifyLocal).toHaveBeenCalledWith(expect.objectContaining({ reason: 'verify-local:forge-unreachable' }));
+  });
+
+  it('records nothing when the phase goes remote, when the nested wrapper owns it, or for a forced local confirmation', async () => {
+    expect((await run('npx vitest run a.test.mjs')).recordVerifyLocal).not.toHaveBeenCalled();
+    const shard = `node ${shellQuote(SHARD_RUN_SCRIPT)} --shards=2 -- npx vitest run a.test.mjs`;
+    expect((await run(shard, { decision: { remote: false, reason: 'forge-unreachable' } })).recordVerifyLocal).not.toHaveBeenCalled();
+    expect((await run('npx vitest run a.test.mjs', { opts: { forceLocal: true } })).recordVerifyLocal).not.toHaveBeenCalled();
+  });
+
+  it('recordVerifyLocal appends a bounded forge-share row', () => {
+    const lockRoot = mkdtempSync(join(tmpdir(), 'verify-local-'));
+    try {
+      recordVerifyLocal({ lockRoot, reason: 'verify-local:raw-command', command: 'echo hi', cwd: '/x/lane-7', env: {}, now: () => Date.UTC(2026, 10, 4) });
+      const row = JSON.parse(readFileSync(join(lockRoot, 'remote-fallbacks.jsonl'), 'utf8').trim());
+      expect(row).toMatchObject({ ts: '2026-11-04T00:00:00.000Z', reason: 'verify-local:raw-command', lane: 'lane-7' });
+      expect(recordVerifyLocal({ lockRoot: join(lockRoot, 'f', '\0'), reason: 'x', command: 'y', cwd: '/', env: {} })).toBeUndefined();
+    } finally { rmSync(lockRoot, { recursive: true, force: true }); }
+  });
+
+  it('forge-share counts the two by-design verify-local reasons as expected-local and refusals as misses', () => {
+    const settings = JSON.parse(readFileSync(resolve(repo, 'scripts/settings/forge-share.json'), 'utf8'));
+    expect(settings.expectedLocalReasons).toEqual(expect.arrayContaining(['verify-local:raw-command', 'verify-local:vitest-related-local-only']));
+    expect(settings.expectedLocalReasons.some(r => r.startsWith('verify-local:forge'))).toBe(false);
   });
 });
