@@ -61,7 +61,8 @@ const ADDED_2026_10_28 = ['daemon-build-stale'];
 // Operator order R437, 2026-11-02: PR movement and stage stalls notify in shadow.
 const ADDED_2026_11_02 = ['pr-no-movement', 'pr-stage-stall'];
 // Operator R497, 2026-11-03: the forge-share alarm notifies in shadow.
-const ADDED_2026_11_03 = ['forge-share-below-target'];
+// Operator R502, 2026-11-03: a fix claim held with a silent holder and an unmoved head must alert (detection only).
+const ADDED_2026_11_03 = ['forge-share-below-target', 'stale-claim-or-binding'];
 const APPROVED = [...new Set([...PREVIOUSLY_APPROVED, ...ADDED_2026_09_27, ...ADDED_2026_09_30, ...ADDED_2026_10_01, ...ADDED_2026_10_04, ...ADDED_2026_10_06, ...ADDED_2026_10_07, ...ADDED_2026_10_08, ...ADDED_2026_10_27, ...ADDED_2026_10_09, ...ADDED_2026_10_14, ...ADDED_2026_10_15, ...ADDED_2026_10_17, ...ADDED_2026_10_28, ...ADDED_2026_11_02, ...ADDED_2026_11_03, 'disk-space'])];
 
 describe('NOTIFY_EVEN_IN_SHADOW', () => {

@@ -75,7 +75,8 @@ export const OBSERVATION_ONLY = Object.freeze({
   "ruling-needed-waiting": "A ruling is the operator's judgment; never record, infer or auto-answer one.",
   "self-sync-conflict": "Never force or hand-merge a clone/overlay from the responder.",
   "session-stuck": "Silence or repetition is a warning, not proof of death; the session watchdog and reaper alone act on the worker.",
-  "stood-down-prs": "Terminal questions need explicit operator answers; never auto-call stand-down-answer.",
+  "stale-claim-or-binding": "Alert only; a slow or silent holder is not proof of death, so never release the claim or binding from the responder.",
+  "stood-down-prs":"Terminal questions need explicit operator answers; never auto-call stand-down-answer.",
   "untracked-backlog-card": "Do not adopt/commit unknown daemon-clone files; normal owner/file-item delivery is owed."
 });
 export const CATALOGUE = Object.freeze({ ...OBSERVATION_ONLY,
