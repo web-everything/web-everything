@@ -1976,6 +1976,24 @@ function expandHomeTilde(p, home) {
   return home + p.slice(1);
 }
 
+/** A word bash brace-expands into several words (`{a,b}`, `{1..3}`). One linear pass (a regex with two
+ *  stars around the separator backtracks quadratically on a long unclosed `{,,,,`). Exposes `.test`. */
+const BRACE_EXPANSION = {
+  test(word) {
+    const s = String(word);
+    let open = -1;
+    let separated = false;
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i];
+      if (ch === '{') { open = i; separated = false; } else if (open < 0) continue;
+      else if (ch === '}') { if (separated) return true; open = -1; }
+      else if (ch === ',' || (ch === '.' && s[i + 1] === '.')) separated = true;
+      else if (/\s/.test(ch)) open = -1;
+    }
+    return false;
+  },
+};
+
 /** The HOME value that leaves every tilde expansion unresolved (`expandHomeTilde` returns null for it). */
 const UNRESOLVED_HOME = '${HOME}';
 
@@ -2046,7 +2064,10 @@ function gitTargetDirs(segment, cwd, configEnv = {}) {
   const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
   if (!toks.length || toks[0] !== 'git') return [];
   // Unknown option arity can hide a later target. Never interpret its value as the subcommand.
-  if (gitSubcommandIndex(toks) < 0) return [null];
+  const subIndex = gitSubcommandIndex(toks);
+  if (subIndex < 0) return [null];
+  // Brace expansion (`{-C,<dir>}`) turns one word into several global options: the targets are unknown.
+  if (toks.slice(1, subIndex + 1).some((t) => BRACE_EXPANSION.test(t))) return [null];
   const home = tildeHome(segment, configEnv);
   let dir = cwd || '.';
   let gitDir = null;
@@ -2136,6 +2157,9 @@ function fetchWritesLocalBranch(segment, fetchConfig) {
   if (!Array.isArray(fetchConfig) || fetchConfig.some((spec) => typeof spec !== 'string' || fetchDestinationIsBranch(spec))) return true;
   const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
   const subIndex = gitSubcommandIndex(toks);
+  // Brace expansion splits one word into several options or refspecs (`{origin,main:main}`), like `$X`.
+  // Read the segment text: the tokenizer may not keep a brace word as one plain word.
+  if (BRACE_EXPANSION.test(segment) || toks.some((t) => BRACE_EXPANSION.test(t))) return true;
   let i = 1;
   while (i < subIndex) {
     // An unresolved expansion in a global option (attached `-c$X` or separate) can inject a refspec.
@@ -3183,6 +3207,8 @@ function rebindingOf(name) {
       operand: new RegExp(`(?<![\\w{$./-])${name}(?!\\w)`),
       valued: new RegExp(`^${name}${index}\\+?=`),
       descriptor: new RegExp(`(?<![\\w$])\\{${name}\\}[<>]`),
+      // `${NAME:=word}` / `${NAME=word}` assigns NAME as a side effect of expanding it.
+      defaultAssign: new RegExp(`\\$\\{${name}${index}:?=`),
     });
   }
   return rebindPatterns.get(name);
@@ -3224,6 +3250,7 @@ const unquoted = (word) => word.replace(/[\\'"]/g, '');
 // Does this statement rebind `name` in the current shell in a way `valueAfter` cannot read?
 function rebindsUnreadably(s, name, p) {
   if (rebindsInArithmetic(s, p)) return true;
+  if (p.defaultAssign.test(s)) return true;
   const words = shellWords(s);
   let chain = false;                                                        // `name` assigned in the prefix chain
   let j = 0;
@@ -3247,7 +3274,8 @@ function rebindsUnreadably(s, name, p) {
   if (chain && SPECIAL_BUILTIN.test(command)) return true;
   if (command === 'eval' || command === 'source' || command === '.') return true;
   const operands = words.slice(j + 1).map(unquoted);
-  const named = (w) => w === name || w.startsWith('$');                    // `$X` may name anything
+  // `$X` may name anything; `NAME[i]` writes an element of NAME (and `NAME[0]` is NAME itself).
+  const named = (w) => w === name || w.startsWith('$') || (w.startsWith(`${name}[`));
   if (command === 'coproc') return named(operands[0] ?? '');
   if (command === 'for' || command === 'select') return named(operands[0] ?? '');
   if (command === 'printf') {
@@ -3392,13 +3420,17 @@ function writesUnmodelled(stmt, name) {
 
 // Every protected Git environment name `stmt` writes unmodelled (GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR,
 // and the GIT_CONFIG* family, including any GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n> it spells).
+const GIT_CONFIG_NAME_CAP = 16;
 const PROTECTED_GIT_NAMES = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_CONFIG', 'GIT_CONFIG_GLOBAL',
   'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS'];
 function unmodelledGitWrites(stmt, depth = 0) {
   if (!/GIT_/.test(stmt) && !INDIRECT_WRITER.test(stmt)) return [];
   const bodies = literalEvalStatements(stmt, depth);
   if (bodies) return [...new Set(bodies.flatMap((body) => unmodelledGitWrites(body, depth + 1)))];
-  const names = new Set([...PROTECTED_GIT_NAMES, ...(stmt.match(/\bGIT_CONFIG_\w{1,64}/g) || [])]);
+  const spelled = new Set(stmt.match(/\bGIT_CONFIG_\w{1,64}/g) || []);
+  // Bound the per-name work: past the cap the statement is not read name by name and fails closed.
+  if (spelled.size > GIT_CONFIG_NAME_CAP) return ['GIT_CONFIG_COUNT'];
+  const names = new Set([...PROTECTED_GIT_NAMES, ...spelled]);
   return [...names].filter((name) => writesUnmodelled(stmt, name));
 }
 
@@ -3629,6 +3661,17 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
       if (onCdCandidate) {
         for (const value of cdVariableValues(parsed.segments, v[1], home)) {
           onCdCandidate(value === null ? null : value.startsWith('/') ? value : resolvePath(reportedCwd || '.', value));
+        }
+      }
+    } else if (onCdCandidate) {
+      // `cd "$L/"`, `cd $L/sub`, `cd "$L"/.`: main gives up on these and keeps the reported cwd. A variable
+      // this command assigns still says where the cd may land: report each value joined with the suffix.
+      const prefixed = target.replace(/["']/g, '').match(/^\$\{?([A-Za-z_]\w*)\}?(\/.*)$/);
+      if (prefixed) {
+        for (const value of cdVariableValues(parsed.segments, prefixed[1], home)) {
+          if (value === null || /[`$(*?\[{]/.test(prefixed[2])) { onCdCandidate(null); continue; }
+          const joined = value + prefixed[2];
+          onCdCandidate(joined.startsWith('/') ? resolvePath(joined) : resolvePath(reportedCwd || '.', joined));
         }
       }
     }

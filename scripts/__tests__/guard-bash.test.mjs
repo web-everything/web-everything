@@ -4009,7 +4009,9 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     const WRITERS = (n) => [`read ${n} <<< ${CLONE}`, `read -r ${n} <f`, `printf -v ${n} %s ${CLONE}`,
       `for ${n} in ${CLONE}; do :; done`, `${n}+=${CLONE}`, `${n}=/ws; ${n}+=/wev-review-daemon`, `let ${n}=1`,
       `getopts a ${n}`, `mapfile ${n} <f`, `declare ${n}=${CLONE}`, `typeset ${n}=${CLONE}`, `local ${n}=${CLONE}`,
-      `readonly ${n}=${CLONE}`, `readonly ${n}`, `declare -g ${n}=/safe`, `eval 'read ${n}'`, `case x in x) read ${n};; esac`];
+      `readonly ${n}=${CLONE}`, `readonly ${n}`, `declare -g ${n}=/safe`, `eval 'read ${n}'`, `case x in x) read ${n};; esac`,
+      // Self-review variants: a subscripted printf -v target and a default-assigning expansion.
+      `printf -v ${n}[0] %s ${CLONE}`, `: \${${n}:=${CLONE}}`, `: \${${n}=${CLONE}}`];
     it.each(NAMES.flatMap((name) => WRITERS(name).map((writer) => ({ name, writer }))))(
       '$writer then a mutation is denied, a read allowed', ({ name, writer }) => {
         expect(decide(`${writer}; export ${name}; git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
@@ -4023,6 +4025,12 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     ])('an indirect or later writer fails closed: %s', (command) => {
       const full = /git reset/.test(command) ? command : `${command}; git reset --hard`;
       expect(decide(full, ctx)).toMatch(/DAEMON CLONE/);
+    });
+    it('bounds the per-name scan: many distinct GIT_CONFIG_* words fail closed and stay fast', () => {
+      const words = Array.from({ length: 2000 }, (_, i) => `GIT_CONFIG_K${i}`).join(' ');
+      const started = Date.now();
+      expect(decide(`echo ${words}; git commit -m x`, ctx)).toMatch(/DAEMON CLONE/);
+      expect(Date.now() - started).toBeLessThan(3000);
     });
     it('leaves modelled writers and unrelated names as they were', () => {
       expect(decide(`export GIT_DIR=${CLONE}/.git; export GIT_DIR=${LANE}/.git; git reset --hard`, ctx)).toBeNull();
@@ -4042,6 +4050,14 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     it('DENIES an unresolved global -c value before fetch', () => {
       expect(daemonCloneWriteReason(`git -c$X -C ${CLONE} fetch origin`, fetchCtx)).toMatch(/DAEMON CLONE/);
       expect(daemonCloneWriteReason(`git -c "$X" -C ${CLONE} fetch origin`, fetchCtx)).toMatch(/DAEMON CLONE/);
+    });
+    it('DENIES brace expansion that splits into fetch options, refspecs or global options', () => {
+      for (const command of [`git -C ${CLONE} fetch {origin,main:main}`, `git -C ${CLONE} fetch {--update-head-ok,origin} main`,
+        `git -C ${CLONE} fetch origin {1..2}`]) {
+        expect(daemonCloneWriteReason(command, fetchCtx), command).toMatch(/DAEMON CLONE/);
+      }
+      expect(decide(`git {-C,${CLONE}} commit -m x`, { cwd: LANE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
+      expect(decide(`git -C ${LANE} commit -m x`, { cwd: LANE, daemonCloneRoots: roots })).toBeNull();
     });
     it('keeps literal attached values allowed', () => {
       for (const option of ['--upload-pack=git-upload-pack', '--depth=1', '--jobs=4', '-o foo', '--filter=blob:none']) {
@@ -4064,6 +4080,8 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
       ["eval 'HOME=/x'; git -C ~/x reset --hard", '/hook-home'],
       ['HOME=/x; bash -c "git -C ~/y reset --hard"', '/hook-home'],
       ['HOME=/x; git -C ~/y config --file ~/y/config a.b c', '/hook-home'],
+      ['printf -v HOME[0] /ws; git -C ~/wev-review-daemon reset --hard', '/hook-home'],
+      [': ${HOME:=/ws}; git -C ~/wev-review-daemon reset --hard', '/hook-home'],
       ['git -C ~nobody/x reset --hard', '/hook-home'],
       ['git -C ~/x reset --hard', undefined],
       ['git -C ~/x reset --hard', 'relative'],
@@ -4072,7 +4090,8 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
       expect(decide(command.replace(/reset --hard|config --file \S+ a\.b c/, 'log'), ctx(home))).toBeNull();
     });
     it('a HOME write never reaches the cd resolver through the hook HOME', () => {
-      for (const command of ['HOME=/x; cd ~/y && git reset --hard', 'HOME=/hook; true && cd ~/y && git reset --hard']) {
+      for (const command of ['HOME=/x; cd ~/y && git reset --hard', 'HOME=/hook; true && cd ~/y && git reset --hard',
+        'printf -v HOME[0] /ws; cd ~/y && git reset --hard', 'printf -v HOME[0] /ws; cd && git reset --hard']) {
         const candidates = [];
         resolveEffectiveCwd(command, LANE, undefined, '/hook', (c) => candidates.push(c));
         expect(candidates, command).toContain(null);
@@ -4117,6 +4136,10 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
       expect(cwd, command).toBe('/safe');                       // the returned cwd keeps main's resolution
       expect(candidates, command).toContain(CLONE);             // …and the protected value is still reported
     }
+    // A cd target that only starts with the variable reports the same values, joined with its suffix.
+    expect(at(`L=${CLONE}; cd "$L/" && git reset --hard`).candidates).toContain(CLONE);
+    expect(at(`L=${CLONE}; cd "$L"/. && git reset --hard`).candidates).toContain(CLONE);
+    expect(at(`L=/ws; false && L=/safe; cd $L/wev-review-daemon && git reset --hard`).candidates).toContain(CLONE);
     // A write not read here leaves the landing place unknown.
     expect(at(`D=/safe; read D <<< ${CLONE}; cd "$D" && git reset --hard`).candidates).toContain(null);
     expect(at(`D=/safe; D=$(printf ${CLONE}); cd "$D" && git reset --hard`).candidates).toContain(null);
