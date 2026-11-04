@@ -1,8 +1,8 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import yaml from 'js-yaml';
@@ -122,5 +122,60 @@ describe('test-selection-measure lives in its own workflow (R523)', () => {
     const rec = job.steps.find((s) => s.name === 'Record false-green signal (#2681)');
     expect(rec.if).toContain("steps.report.outcome == 'success'");
     expect(job.steps.find((s) => s.id === 'report')['continue-on-error']).toBe(true);
+  });
+
+  describe('Validate shadow report runs its real command against vitest JSON fixtures', () => {
+    const steps = job.steps;
+    const vIdx = steps.findIndex((s) => s.name === 'Validate shadow report');
+    const v = steps[vIdx];
+    const valid = (status) => JSON.stringify({ numTotalTests: 1, testResults: [{ name: '/w/a.test.mjs', status, assertionResults: [] }] });
+    // Run the step's own `run` text exactly as GitHub's default bash shell does, in a scratch working directory.
+    const exitOf = (fixture) => {
+      const dir = mkdtempSync(join(tmpdir(), 'validate-shadow-report-'));
+      try {
+        if (fixture !== undefined) writeFileSync(join(dir, 'vitest-full.json'), fixture);
+        execFileSync('bash', ['--noprofile', '--norc', '-eo', 'pipefail', '-c', v.run], {
+          cwd: dir, stdio: 'pipe', timeout: 10_000, maxBuffer: 1024 * 1024,
+          env: { ...process.env, PATH: `${dirname(process.execPath)}:${process.env.PATH ?? ''}` },
+        });
+        return 0;
+      } catch (e) {
+        if (typeof e.status !== 'number') throw e;
+        return e.status;
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    };
+
+    it('is the step the record step keys on, runs before it in the same directory, on the default shell', () => {
+      expect(v.id).toBe('report');
+      expect(v.shell).toBeUndefined();
+      const rIdx = steps.findIndex((s) => s.name === 'Record false-green signal (#2681)');
+      expect(vIdx).toBeGreaterThan(-1);
+      expect(vIdx).toBeLessThan(rIdx);
+      expect(v['working-directory']).toBe(steps[rIdx]['working-directory']);
+      expect(steps[rIdx].run).toContain('--vitest-json=vitest-full.json');
+    });
+
+    it.each([
+      ['a missing report', undefined],
+      ['an empty file', ''],
+      ['truncated JSON', '{"testResults":[{"name":"a.test.mjs","sta'],
+      ['JSON null', 'null'],
+      ['an empty object', '{}'],
+      ['a non-array testResults', '{"testResults":{"name":"a.test.mjs","status":"passed"}}'],
+      ['an empty testResults', '{"testResults":[]}'],
+      ['an unknown file status', valid('skipped')],
+      ['a missing file status', '{"testResults":[{"name":"a.test.mjs"}]}'],
+      ['an empty file name', '{"testResults":[{"name":"","status":"passed"}]}'],
+      ['a non-string file name', '{"testResults":[{"name":7,"status":"passed"}]}'],
+      ['one bad entry among good ones', '{"testResults":[{"name":"a.test.mjs","status":"passed"},{"name":"b.test.mjs","status":"pending"}]}'],
+    ])('fails closed on %s', (_label, fixture) => {
+      expect(exitOf(fixture)).not.toBe(0);
+    });
+
+    it.each(['passed', 'failed'])('accepts a well-formed report whose files %s', (status) => {
+      expect(exitOf(valid(status))).toBe(0);
+    });
   });
 });
