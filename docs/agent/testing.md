@@ -3931,3 +3931,9 @@ The restore-review-label planner gates accept only `rollupIncomplete: false`; ol
 remain ineligible. Complete GraphQL context pages set false from `hasNextPage: false`, direct gh listings
 only certify arrays below the 100-context cap, and snapshot projections preserve both boolean values.
 Complete-rollup fixtures (including stacked never-run cases) must carry false explicitly.
+Persistent GitHub 5xx soak fixtures must account for both retry ladders: `withListRetry`
+repeats the list read three times, and each attempt can sleep again in `gh-throttle`.
+The `smoke-github-outage` break pins `WE_GH_LIST_BACKOFF_MS=5,5` and
+`WE_GH_JSON_RETRY_BACKOFF_MS=5` before the daemon forks. This preserves exhausted,
+fail-closed reads across reconcile and dispatch smoke passes within the unchanged
+90-second tick bound; shortening only the outer list backoff does not suffice.

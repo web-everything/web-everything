@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:docs/agent/backlog-workflow.md", "we:backlog/4465-builder-routes-a-build-agent-s-not-buildable-already-done-re.md", "we:scripts/__tests__/check-standards-rules-kind-axis.test.mjs", "we:scripts/__tests__/agent-text-authoring-contract.test.mjs"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-02"
-preparedAgainstSha: "ebd25fbfd10e36691a82b3274caacf4790fccc4f"
+preparedDate: "2026-11-03"
+preparedAgainstSha: "906a01abb70b5455f801525d6a82707d81d8f63b"
 tags: []
 ---
 
@@ -74,3 +74,5 @@ Review the diff for the two documentation surfaces: the authoring entry point an
 - [A2] Executable: `preparation links the lens and examples keep findings as data` in planned we:scripts/__tests__/agent-text-authoring-contract.test.mjs fails before the new preparation cross-reference and complete/incomplete examples exist, passes afterward, and fails if the cross-reference or data-only obligation is removed. This covers the changed authoring default and its preparation caller.
 - [A3] Executable: the coverage-presence command `rg -n 'rejects absent kind|rejects null kind|rejects empty kind|rejects unknown kind|accepts story without workItem'` targeting we:scripts/__tests__/check-standards-rules-kind-axis.test.mjs must find each of those five exact test names (assert five matches, not merely successful grep). It fails before those cases are authored and passes afterward. Run that file through the heavy queue; all cases pass with the current validator, while the required-kind and enum mutants fail their respective cases. This guarantees regression coverage, not newly implemented validation.
 - [A4] Executable: `4465 addendum separates intended guards from delivery` in planned we:scripts/__tests__/agent-text-authoring-contract.test.mjs fails before the MVP addendum and passes afterward, asserting intended ancestry/scope verification, outstanding citation-refusal fallback, delivered checks, and unchanged resolved frontmatter. Review the historical-body diff as supporting evidence.
+
+revalidated: The supplied diff only updates backlog page inventory descriptions; it does not affect the authoring lens, runtime premises, scoped delivery, or test/proof plan.

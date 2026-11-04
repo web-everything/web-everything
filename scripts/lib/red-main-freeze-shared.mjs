@@ -295,6 +295,8 @@ export function drainFreezeSignal({ state, mainRedState, priority, now, holdOn =
   const signal = redMainSignal({ mainRedState: holdOn ? mainRedState : null, priority: holdOn ? priority : null, manualFreeze: state.manual || stopAll ? { reason: state.reason } : null, now });
   if (state.auto && holdOn && !stopAll) { signal.red = true; signal.sources.push('local-auto'); }
   if (stopAll) signal.fixPrs = [];
+  // An unreadable freeze is NOT a manual freeze and NOT a red main: it gets its own source so the hold reason says so (and alerts).
+  if (state.error && !state.manual && state.local == null && signal.sources.includes('manual')) signal.sources = signal.sources.map(x => (x === 'manual' ? 'freeze-unreadable' : x));
   return signal;
 }
 

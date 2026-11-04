@@ -39,7 +39,7 @@
 import { isUnderTest } from './under-test.mjs';
 import { isGhDeferred } from './gh-deferred.mjs';
 import { resolveSmokeDryRun } from './smoke-dry-run-settings.mjs';
-import { listOpenPrsLightPaged, hydrateHeavyFields, resolvePrListPaging } from './pr-list-paged.mjs';
+import { assertInventoryComplete, listOpenPrsLightPaged, hydrateHeavyFields, resolvePrListPaging } from './pr-list-paged.mjs';
 import { mkdirSync, readFileSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -99,7 +99,28 @@ function candidateSmokeEnv(env, smokeChild) {
   return effective;
 }
 
+/** A capped snapshot must not read as a complete inventory: carry the flag (non-enumerable) on the projected rows. */
+/** True only when the caller DECLARED a smoke sample (WE_PR_SNAPSHOT_SAMPLE) — smoke/dry-run, never a normal read. */
+export function sampleDeclared(env = process.env) { return positiveInteger(env?.[WE_PR_SNAPSHOT_SAMPLE]) > 0; }
+
+/** The smoke/dry-run context where a sampled snapshot is legitimate: the sample env is set, or this is a rebuild-smoke
+ *  child (WE_SMOKE_LIVE_CLONE — the sample is then injected from settings, not present in process.env). */
+export function sampleContextDeclared(env = process.env) { return sampleDeclared(env) || Boolean(env?.WE_SMOKE_LIVE_CLONE); }
+
+/** A declared sample is NOT truncation: mark it `sampled` (non-enumerable) so readers accept it only while the sample
+ *  env is set. Real truncation (`snap.truncated`) always fails closed; a shortfall with no declared sample too. */
 function smokeProjection(snap, fields, env) {
+  const rows = smokeProjectionRows(snap, fields, env);
+  if (!Array.isArray(rows)) return rows;
+  const declared = sampleDeclared(env);
+  if (declared && rows.length < (snap?.prs?.length ?? 0)) Object.defineProperty(rows, 'sampled', { value: true });
+  if (snap?.truncated === true || (!declared && Array.isArray(snap?.prs) && rows.length < snap.prs.length)) {
+    Object.defineProperty(rows, 'discoveryIncomplete', { value: true });
+  }
+  return rows;
+}
+
+function smokeProjectionRows(snap, fields, env) {
   const sample = positiveInteger(env[WE_PR_SNAPSHOT_SAMPLE]);
   if (!sample) return projectPrs(snap.prs, fields);
   if (!sampleLogged) {
@@ -173,6 +194,7 @@ export function fetchSnapshot({ repo, prevCount, prev = null, exec = execFileSyn
   const light = listOpenPrsLightPaged({ repo, exec, pageSize: paging.pageSize, pageRetries: paging.pageRetries,
     maxRows: MAX_LIMIT, execOpts: { throttle: { op: 'pr list (snapshot page)', deferrable } } });
   if (light.deferred) return light.deferred;
+  assertInventoryComplete({ repo, rows: light.rows, totalCount: light.totalCount, truncated: light.truncated });
   const cache = {};
   for (const p of prev?.prs ?? []) {
     if (prev.heavyMeta?.[p.number]) {
