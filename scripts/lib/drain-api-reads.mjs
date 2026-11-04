@@ -230,7 +230,8 @@ export function readBacklogNames(branch = 'main', o = {}) {
 
 const KNOWN_STATUS = new Set(['added', 'modified', 'removed', 'renamed', 'copied', 'changed', 'unchanged']);
 const PAGE = 100;
-const MAX_PAGES = 30; // GitHub serves at most 3000 compare files; a full last page may hide more, so it is unreadable
+const COMPARE_CEILING = 300; // GitHub lists at most 300 files per compare, with no truncation flag: 300 or more may hide files
+const MAX_PAGES = 4;
 
 /**
  * Files ADDED by headSha relative to base (merge-base compare, like `git diff base...head --diff-filter=A`), following
@@ -245,6 +246,7 @@ export function readAddedFiles(base, headSha, o = {}) {
   const baseSha = baseTip.value;
   const added = [];
   const previous = [];
+  let seen = 0;
   let last;
   for (let page = 1; page <= MAX_PAGES; page += 1) {
     const r = pull(read, `repos/{owner}/{repo}/compare/${baseSha}...${headSha}?per_page=${PAGE}&page=${page}`, o);
@@ -261,7 +263,9 @@ export function readAddedFiles(base, headSha, o = {}) {
       }
       if (f.status === 'added' || f.status === 'renamed' || f.status === 'copied') added.push(f.filename);
     }
+    seen += files.length;
+    if (seen >= COMPARE_CEILING) return bad(r, 'compare-ceiling', `compare returned ${seen} files, at the ${COMPARE_CEILING}-file ceiling`);
     if (files.length < PAGE) return { ...good(last, { added, previous }), baseSha };
   }
-  return bad(last, 'api-truncated', 'compare file list at the 3000-file ceiling');
+  return bad(last, 'compare-ceiling', 'compare pages exhausted');
 }

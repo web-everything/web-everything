@@ -394,7 +394,7 @@ describe('pagination: follow to the end or be unreadable', () => {
   });
   it('299 files are complete; 300 in one page is compare-ceiling', () => {
     const one = (n) => readAddedFiles('main', SHA, { source: src(routes({ 'compare/': ok({ files: page(n) }) })) });
-    expect(one(299)).toMatchObject({ ok: true });
+    expect(readAddedFiles('main', SHA, { source: src(routes({ '&page=1': ok({ files: page(100) }), '&page=2': ok({ files: page(100) }), '&page=3': ok({ files: page(99) }) })) })).toMatchObject({ ok: true });
     expect(one(300)).toMatchObject({ ok: false, reason: 'compare-ceiling' });
   });
   it('a tree flagged truncated is unreadable', () => {
