@@ -2390,6 +2390,85 @@ export function readDaemonFetchConfig(segment, cwd, envDirs = [], configEnv = {}
   }
 }
 
+/** Environment names that make even a "read" git command run code or write a file: an external diff, any
+ *  `*_COMMAND` hook, a pager (`PAGER`/`GIT_PAGER`, and less's own `LESSOPEN`/`LESSCLOSE` preprocessors), editors,
+ *  askpass/ssh programs, an exec path, `GIT_TRACE*` (a path value appends to that file) and config injection.
+ *  ONE list, iterated whole by its test, so a new name is added here rather than in a second regex. */
+export const GIT_CODE_ENV = Object.freeze([
+  /^GIT_EXTERNAL_DIFF$/, /^GIT_\w*_COMMAND$/, /^(?:GIT_)?PAGER$/, /^LESS(?:OPEN|CLOSE)$/,
+  /^GIT_(?:SEQUENCE_)?EDITOR$/, /^(?:GIT|SSH)_ASKPASS$/, /^GIT_SSH$/, /^GIT_EXEC_PATH$/, /^GIT_TRACE\w*$/,
+  /^GIT_CONFIG(?:_\w+)?$/,
+]);
+
+/** Is `word` (`NAME=value`) an assignment of a GIT_CODE_ENV name to a value that can run code or write a file?
+ *  Only plain literal values that do neither are exempt: a pager of `cat`/`less`/`more`/empty, and a GIT_TRACE*
+ *  of off/on/an fd number (a path writes a file). Anything with an expansion is never exempt. */
+export function gitCodeEnvAssignment(word) {
+  const m = /^([A-Za-z_]\w*)=(.*)$/s.exec(String(word));
+  if (!m || !GIT_CODE_ENV.some((re) => re.test(m[1]))) return false;
+  const value = m[2];
+  if (/[$`]/.test(value)) return true;
+  if (/^(?:GIT_)?PAGER$/.test(m[1])) return !['', 'cat', 'less', 'more'].includes(value);
+  if (/^GIT_TRACE\w*$/.test(m[1])) return !/^(?:|0|1|[2-9]|true|false)$/i.test(value);
+  return true;
+}
+
+/** Wrapper programs that run a SEPARATE child command, some with options that change its directory
+ *  (`env -C/--chdir`, `sudo -D/--chdir`) or hide it in one string (`env -S`). */
+const DAEMON_CHILD_WRAPPERS = new Set(['env', 'time', 'command', 'builtin', 'nice', 'sudo', 'doas', 'xargs', 'npx',
+  'bunx', 'timeout', 'nohup', 'exec', 'setsid', 'stdbuf', 'ionice', 'chrt', 'taskset', 'caffeinate', 'unbuffer',
+  'flock', 'nsenter', 'watch']);
+const WRAPPER_DIR_OPTION = /^(?:-C|-D|--chdir|--directory)$/;
+const WRAPPER_DIR_ATTACHED = /^(?:-C|-D)(.+)$|^--(?:chdir|directory)=(.*)$/s;
+const WRAPPER_SPLIT_OPTION = /^(?:-S|--split-string)$/;
+const WRAPPER_SPLIT_ATTACHED = /^-S(.+)$|^--split-string=(.*)$/s;
+
+/** A file-writing child (`rm`, `cp`, `touch`, `tee`, …) reached through a wrapper, with every directory the
+ *  wrapper may run it in CARRIED: a directory option's value is resolved against cwd and the child's operands are
+ *  resolved against both. Returns the protected path written, 'unresolved wrapper target' when a directory value
+ *  cannot be read statically, or null. Fail closed: a `-S` string is re-read as the child's own words. */
+function daemonWrappedChildWrite(segment, cwd, roots) {
+  let words = shellTokens(String(segment).trim().replace(/^[({]\s*/, '')).filter((t) => !t.op).map((t) => t.text);
+  while (words.length && /^[A-Za-z_]\w*=/.test(words[0])) words = words.slice(1);
+  const lead = (words[0] ?? '').replace(/^\\+/, '').replace(/^.*\//, '');
+  if (!DAEMON_CHILD_WRAPPERS.has(lead)) return null;
+  const dirs = [];
+  let child = -1;
+  for (let i = 1; i < words.length; i++) {
+    const word = words[i];
+    const base = word.replace(/^\\+/, '').replace(/^.*\//, '');
+    if (['git', 'sh', 'bash', 'zsh', 'eval'].includes(base)) return null; // daemonWrapperUncertain owns these
+    if (FS_MUTATING_PROGRAMS.has(base) || base === 'tee') { child = i; break; }
+    let dir = null;
+    if (WRAPPER_DIR_OPTION.test(word)) dir = words[++i] ?? '';
+    else if (WRAPPER_DIR_ATTACHED.test(word)) { const m = WRAPPER_DIR_ATTACHED.exec(word); dir = m[1] ?? m[2] ?? ''; }
+    if (dir !== null) {
+      if (!dir || /[$`]/.test(dir) || dir.startsWith('~')) return 'unresolved wrapper target';
+      dirs.push(resolve(cwd || '.', dir));
+      continue;
+    }
+    let split = null;
+    if (WRAPPER_SPLIT_OPTION.test(word)) split = words[i + 1] ?? '';
+    else if (WRAPPER_SPLIT_ATTACHED.test(word)) { const m = WRAPPER_SPLIT_ATTACHED.exec(word); split = m[1] ?? m[2] ?? ''; }
+    if (split !== null) {
+      const inner = shellTokens(split).filter((t) => !t.op).map((t) => t.text);
+      words = [...words.slice(0, i), ...inner, ...words.slice(i + (WRAPPER_SPLIT_OPTION.test(word) ? 2 : 1))];
+      i -= 1;
+    }
+  }
+  if (child < 0) return null;
+  const bases = [cwd || '.', ...dirs];
+  const operands = fileOperands(words.slice(child + 1).map((text) => ({ text, quoted: false, op: false })));
+  if (!operands.length) return bases.find((b) => isDaemonCloneRealpath(resolve(b), roots)) ?? null;
+  for (const operand of operands) {
+    for (const b of bases) {
+      const abs = resolve(b, operand);
+      if (isDaemonCloneRealpath(abs, roots)) return abs;
+    }
+  }
+  return null;
+}
+
 /** Wrappers with unmodelled options cannot prove either their command or its cwd. Keep this
  * daemon-only: other policies retain their existing canonical-command interpretation. */
 function daemonWrapperUncertain(segment) {
@@ -2406,7 +2485,7 @@ function daemonWrapperUncertain(segment) {
     const word = words[i++];
     if (/^[A-Za-z_]\w*=/.test(word)) {
       // code-running Git env (GIT_EXTERNAL_DIFF, GIT_*_COMMAND, GIT_PAGER, config injection) makes even a "read" subcommand run code (`--ext-diff`).
-      if (/^GIT_(?:EXTERNAL_DIFF|\w*_COMMAND|PAGER|EDITOR|SEQUENCE_EDITOR|ASKPASS|SSH|CONFIG_\w+)=/.test(word)) gitEnvSeen = true;
+      if (gitCodeEnvAssignment(word)) gitEnvSeen = true;
       continue;
     }
     const base = word.replace(/^\\+/, '').replace(/^.*\//, '');
@@ -2428,6 +2507,7 @@ function daemonWrapperUncertain(segment) {
       continue;
     }
     if (['time', 'command', 'builtin', 'nice'].includes(word)) {
+      if (word === 'time') wrapperSeen = true; // the `time` keyword takes `NAME=value` prefixes like env does
       // Value-free (`time -p`, `command -p/-v/-V`) and `nice -n N` options leave the child command and its cwd
       // exactly as written; anything else is unmodelled and fails closed.
       while (words[i]?.startsWith('-')) {
@@ -2488,7 +2568,7 @@ function pushHasUnresolvedTarget(command) {
 }
 
 // Separate from GIT_STATE_SUBCOMMANDS: new commands and aliases default to denied at protected targets.
-const DAEMON_GIT_READS = new Set(['status', 'log', 'diff', 'show', 'rev-parse', 'rev-list', 'ls-files',
+export const DAEMON_GIT_READS = new Set(['status', 'log', 'diff', 'show', 'rev-parse', 'rev-list', 'ls-files',
   'ls-tree', 'cat-file', 'describe', 'merge-base', 'for-each-ref', 'show-ref', 'name-rev',
   'diff-tree', 'diff-index', 'diff-files', 'count-objects', 'check-ref-format']);
 
@@ -2561,11 +2641,31 @@ export function daemonCloneWriteReason(segment, { cwd = null, roots = [], envDir
   if (!roots.length) return null;
   const s = String(segment || '');
   if (daemonWrapperUncertain(s)) return daemonCloneWriteMessage('unresolved wrapper target');
+  // A file-writing child behind a wrapper (`env -C <clone> rm x`, `timeout 5 rm <clone>/x`), its directory carried.
+  const wrappedWrite = daemonWrappedChildWrite(s, cwd, roots);
+  if (wrappedWrite) return daemonCloneWriteMessage(wrappedWrite);
   // Strict: behind an unknown global flag no subcommand is trusted (no read, no fetch exception).
   const sub = gitSubcommandStrict(s);
   if (programWord(s) === 'git') {
     const configWrite = (sub === 'config' || sub === 'remote') && gitConfigOrRemoteWrites(s, sub);
-    if (daemonGitRead(s, sub)) return null;
+    // A bare leading code-running env (`PAGER='sh -c …' git log`, `GIT_TRACE=<clone>/t git status`) makes a read
+    // run code or write a file, so it is judged by its target like any other git command.
+    const leadingWords = shellTokens(s.trim().replace(/^[({]\s*/, '')).filter((t) => !t.op).map((t) => t.text);
+    let codeEnv = false;
+    const tracePaths = [];
+    for (const word of leadingWords) {
+      if (!/^[A-Za-z_]\w*=/.test(word)) break;
+      if (gitCodeEnvAssignment(word)) codeEnv = true;
+      // A GIT_TRACE* path is a file git appends to, wherever the repository is: check the file itself.
+      const trace = /^GIT_TRACE\w*=(.+)$/s.exec(word);
+      if (trace && gitCodeEnvAssignment(word)) tracePaths.push(trace[1]);
+    }
+    for (const p of tracePaths) {
+      if (/[$`]/.test(p) || p.startsWith('~')) return daemonCloneWriteMessage('unresolved GIT_TRACE file');
+      const abs = resolve(cwd || '.', p);
+      if (isDaemonCloneRealpath(abs, roots)) return daemonCloneWriteMessage(abs);
+    }
+    if (!codeEnv && daemonGitRead(s, sub)) return null;
     // Named environment follows shell scope/order; envDirs remains a conservative explicit caller input.
     // Git resolves an environment GIT_DIR / GIT_WORK_TREE against its effective directory (after every -C),
     // the same base and tilde normalization gitTargetDirs uses; the reported cwd is kept as well.
@@ -5205,7 +5305,7 @@ const GIT_STATE_SUBCOMMANDS = new Set([
 
 /** Programs whose whole job is to change the filesystem. Same shape and same reasoning as the git set: a
  *  short explicit list, not a "not on the read list" rule. */
-const FS_MUTATING_PROGRAMS = new Set([
+export const FS_MUTATING_PROGRAMS = new Set([
   'cp', 'mv', 'rm', 'rmdir', 'mkdir', 'touch', 'ln', 'install', 'rsync', 'chmod', 'chown', 'truncate', 'patch',
 ]);
 

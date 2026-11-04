@@ -23,6 +23,7 @@ import {
   splitSegments, runnerInvocation, parseSegments, unparseableReason, heredocScan,
   nestedCommandStrings, fileWriteTargets, collateralStepsNotice, mergeBreakGlassUsed,
   rawHeavyCommandReason, vitestRunFileTargetCount,
+  GIT_CODE_ENV, gitCodeEnvAssignment, DAEMON_GIT_READS, FS_MUTATING_PROGRAMS,
 } from '../guard-bash.mjs';
 import { daemonCloneRoots } from '../lib/daemon-clone-registry.mjs';
 import { execFileSync } from 'node:child_process';
@@ -4030,6 +4031,116 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
       }
       // With no clone registered the unknown flag changes nothing.
       expect(decide(`git ${flag} log`, { cwd: LANE })).toBeNull();
+    });
+  });
+
+  // PR #6262 advisory (09:49Z, guard-bash.mjs:2297): a wrapper's directory option (env -C/--chdir, sudo -D/--chdir)
+  // or any option-carrying wrapper in front of a NON-git file writer was never read, so `env -C <clone> rm -rf src`
+  // and `timeout 5 rm <clone>/x` mutated the clone. A2 now holds for every child: the directory is carried.
+  describe('A2 wrapper matrix with non-git file-writing children', () => {
+    const ctx = { cwd: LANE, daemonCloneRoots: roots };
+    const CHILDREN = [...FS_MUTATING_PROGRAMS, 'tee'];
+    const DIR_WRAPPERS = [`env -C ${CLONE}`, `env -C${CLONE}`, `env --chdir=${CLONE}`, `env --chdir ${CLONE}`,
+      `sudo -D ${CLONE}`, `sudo --chdir=${CLONE}`, `/usr/bin/env -C ${CLONE}`, `env -i -C ${CLONE}`,
+      `env -C ${LANE} env -C ../../../wev-review-daemon`];
+    const PLAIN_WRAPPERS = ['env', 'env -i', 'env -u FOO', 'nice -n 5', 'time -p', 'timeout 5', 'nohup', 'stdbuf -o0',
+      'setsid', 'exec', 'sudo -u user', 'ionice -c3', 'command', 'xargs -n1', 'FOO=1 env -i'];
+    it.each(DIR_WRAPPERS)('a directory option into a clone is carried to every file writer: %s', (wrapper) => {
+      for (const child of CHILDREN) {
+        expect(decide(`${wrapper} ${child} x y`, ctx), `${wrapper} ${child}`).toMatch(/DAEMON CLONE/);
+      }
+    });
+    it.each(PLAIN_WRAPPERS)('a clone operand behind an option-carrying wrapper is still a write: %s', (wrapper) => {
+      for (const child of CHILDREN) {
+        expect(decide(`${wrapper} ${child} ${CLONE}/x`, ctx), `${wrapper} ${child}`).toMatch(/DAEMON CLONE/);
+        expect(decide(`${wrapper} ${child} /tmp/x`, ctx), `${wrapper} ${child} outside`).toBeNull();
+      }
+    });
+    it('a -S split string is read as the child command', () => {
+      for (const command of [`env -S "rm -rf ${CLONE}/src"`, `env --split-string="touch ${CLONE}/x"`,
+        `env -S "rm -rf src" -C ${CLONE}`]) {
+        expect(decide(command, ctx), command).toMatch(/DAEMON CLONE/);
+      }
+      expect(decide('env -S "rm -rf /tmp/src"', ctx)).toBeNull();
+    });
+    it('an unresolvable wrapper directory fails closed; a directory outside every clone stays allowed', () => {
+      for (const command of ['env -C "$D" rm x', 'env --chdir=`pwd` touch x', 'sudo -D ~/x cp a b', 'env -C "" rm x']) {
+        expect(decide(command, ctx), command).toMatch(/DAEMON CLONE/);
+      }
+      // `env -C rm x` runs `x` in a directory named `rm`: the option's value is never read as the child.
+      for (const command of ['env -C /tmp rm x', 'sudo -D /tmp cp a b', 'env -i rm /tmp/x', 'timeout 5 touch x', 'env -C rm x']) {
+        expect(decide(command, ctx), command).toBeNull();
+      }
+      // With no clone registered the wrapper changes nothing.
+      expect(decide(`env -C ${CLONE} rm -rf src`, { cwd: LANE })).toBeNull();
+    });
+    it('a redirect into a clone behind a wrapper is still denied', () => {
+      expect(decide(`env -i echo hi > ${CLONE}/x`, ctx)).toMatch(/DAEMON CLONE/);
+      expect(decide(`env -C ${CLONE} echo hi > /tmp/x`, ctx)).toBeNull();
+    });
+  });
+
+  // PR #6262 advisory (09:49Z, guard-bash.mjs:2290): the code-running env list missed PAGER, GIT_EXEC_PATH and the
+  // file-writing GIT_TRACE*. It is now one named constant, GIT_CODE_ENV, iterated whole here.
+  describe('GIT_CODE_ENV: every listed name makes a daemon-clone read unsafe', () => {
+    const SAMPLES = ['GIT_EXTERNAL_DIFF', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'PAGER', 'GIT_PAGER', 'LESSOPEN',
+      'LESSCLOSE', 'GIT_EDITOR', 'GIT_SEQUENCE_EDITOR', 'GIT_ASKPASS', 'SSH_ASKPASS', 'GIT_SSH', 'GIT_EXEC_PATH',
+      'GIT_TRACE', 'GIT_TRACE_PACKET', 'GIT_TRACE2_EVENT', 'GIT_CONFIG', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM',
+      'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'GIT_CONFIG_PARAMETERS'];
+    const WRAPPERS = ['env', 'env -i', 'time', 'time -p', 'env -u FOO'];
+    it('every pattern in the constant is exercised by a sample name, and every sample is listed', () => {
+      for (const re of GIT_CODE_ENV) expect(SAMPLES.some((name) => re.test(name)), String(re)).toBe(true);
+      for (const name of SAMPLES) expect(gitCodeEnvAssignment(`${name}=/x/run`), name).toBe(true);
+    });
+    it.each(SAMPLES)('%s denies every daemon read, behind each wrapper and bare at a clone target', (name) => {
+      const ctx = { cwd: LANE, daemonCloneRoots: roots };
+      for (const read of DAEMON_GIT_READS) {
+        for (const wrapper of WRAPPERS) {
+          expect(decide(`${wrapper} ${name}=/x/run git ${read}`, ctx), `${wrapper} ${name} ${read}`).toMatch(/DAEMON CLONE/);
+        }
+        expect(decide(`${name}=/x/run git -C ${CLONE} ${read}`, ctx), `bare ${name} ${read}`).toMatch(/DAEMON CLONE/);
+      }
+    });
+    it('a GIT_TRACE* file inside a clone is a write even when the repository is the lane', () => {
+      const ctx = { cwd: LANE, daemonCloneRoots: roots };
+      for (const name of ['GIT_TRACE', 'GIT_TRACE_PACKET', 'GIT_TRACE2_EVENT']) {
+        expect(decide(`${name}=${CLONE}/trace git status`, ctx), name).toMatch(/DAEMON CLONE/);
+        expect(decide(`${name}=/tmp/trace git status`, ctx), name).toBeNull();
+      }
+    });
+    it('plain values that neither run code nor write a file stay allowed', () => {
+      const ctx = { cwd: LANE, daemonCloneRoots: roots };
+      for (const command of [`GIT_PAGER=cat git -C ${CLONE} log`, `PAGER=less git -C ${CLONE} diff`, `PAGER= git -C ${CLONE} show`,
+        `GIT_TRACE=1 git -C ${CLONE} status`, `GIT_TRACE=2 git -C ${CLONE} status`, 'env GIT_PAGER=cat git log',
+        'time GIT_PAGER=more git log', `PAGER=x git log`]) {
+        expect(decide(command, ctx), command).toBeNull();
+      }
+      for (const command of ['env GIT_PAGER="$P" git log', 'env GIT_TRACE=/x git log', 'env PAGER="less; touch x" git log']) {
+        expect(decide(command, ctx), command).toMatch(/DAEMON CLONE/);
+      }
+    });
+  });
+
+  // PR #6262 advisory (09:49Z, guard-bash.mjs:4760): the push expansion deny holds with NO clone registered. This
+  // table records the intended verdict for common lane-push idioms, so any change needs an explicit decision.
+  describe('lane push idiom verdicts (intended, recorded)', () => {
+    const TABLE = [
+      ['git push origin HEAD:refs/heads/lane/my-slug', null],
+      ['git push -u origin lane/my-slug', null],
+      ['git push origin HEAD:refs/heads/lane/x -o "$O"', null],
+      ['git push origin HEAD:refs/heads/lane/x 2>/dev/null', null],
+      ['git push origin HEAD:refs/heads/lane/$SLUG', /unresolved git push/],
+      ['git push -u origin "lane/$SLUG"', /unresolved git push/],
+      ['git push origin "HEAD:refs/heads/lane/${SLUG}"', /unresolved git push/],
+      ['git push origin HEAD:refs/heads/lane/x > "$LOG"', /unresolved git push/],
+      ['git push origin "$(git branch --show-current)"', /unresolved git push/],
+    ];
+    it.each(TABLE)('%s', (command, verdict) => {
+      for (const ctx of [{ cwd: LANE }, { cwd: LANE, daemonCloneRoots: roots }]) {
+        const result = decide(command, ctx);
+        if (verdict === null) expect(result, JSON.stringify(ctx)).toBeNull();
+        else expect(result, JSON.stringify(ctx)).toMatch(verdict);
+      }
     });
   });
 
