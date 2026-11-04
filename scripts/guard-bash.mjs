@@ -2422,20 +2422,58 @@ export function gitCodeEnvAssignment(word) {
  *  (`env -S`, `flock -c`, `npx -c`). */
 const DAEMON_CHILD_WRAPPERS = new Set(['env', 'time', 'command', 'builtin', 'nice', 'sudo', 'doas', 'xargs', 'npx',
   'bunx', 'timeout', 'nohup', 'exec', 'setsid', 'stdbuf', 'ionice', 'chrt', 'taskset', 'caffeinate', 'unbuffer',
-  'flock', 'watch']);
-// Short option letters that take a value (attached or as the next word), per wrapper.
+  'flock', 'watch', 'nsenter', 'unshare', 'chpst', 'arch']);
+// Short option letters that take a value (attached or as the next word), per wrapper (GNU and BSD/macOS spellings).
 const WRAPPER_SHORT_VALUE = {
-  env: 'uCS', sudo: 'ugUDhpCrtTR', doas: 'uC', nice: 'n', ionice: 'cnp', timeout: 'sk', stdbuf: 'ioe',
-  xargs: 'IdELnPsa', exec: 'a', caffeinate: 'tw', flock: 'wEc', npx: 'pc', bunx: 'pc', watch: 'nd',
+  env: 'uCSPLa', sudo: 'acugUDpCrtTRh', doas: 'uC', nice: 'n', ionice: 'cnp', timeout: 'sk', stdbuf: 'ioe',
+  xargs: 'IdELnPsaJRS', exec: 'a', caffeinate: 'tw', flock: 'wEc', npx: 'pc', bunx: 'pc', watch: 'nq',
+  time: 'fo', chrt: 'TPD',
+};
+// Short option letters known to take NO value. A letter in neither table is unmodelled: the peel is then uncertain
+// and the any-word writer scan below is the backstop (an unmodelled option's value may be read as the child).
+const WRAPPER_SHORT_FLAG = {
+  env: 'i0v', sudo: 'AbBEHiKklnPSsVv', doas: 'Lns', nice: '', ionice: 't', timeout: 'v', stdbuf: '',
+  xargs: '0ortpx', exec: 'cl', caffeinate: 'dimsu', flock: 'sxunoF', npx: 'y', bunx: 'y', watch: 'bcegptx',
+  time: 'pav', chrt: 'abdefimorRv', command: 'p', builtin: '', setsid: 'cfw', nohup: '', taskset: 'acp', unbuffer: 'p',
 };
 // Long options that take the NEXT word as their value when written without `=`.
 const WRAPPER_LONG_VALUE = new Set(['--unset', '--user', '--group', '--host', '--prompt', '--close-from', '--role',
   '--type', '--command-timeout', '--other-user', '--signal', '--kill-after', '--delimiter', '--eof', '--max-lines',
   '--max-args', '--max-procs', '--max-chars', '--arg-file', '--replace', '--input', '--output', '--error',
-  '--adjustment', '--class', '--classdata', '--pid', '--package', '--call', '--command', '--interval', '--timeout']);
+  '--adjustment', '--class', '--classdata', '--pid', '--package', '--call', '--command', '--interval', '--timeout',
+  '--argv0', '--login-class', '--chroot', '--format', '--append']);
+// Long options known to take no value.
+const WRAPPER_LONG_FLAG = new Set(['--ignore-environment', '--null', '--debug', '--preserve-status', '--foreground',
+  '--verbose', '--login', '--shell', '--non-interactive', '--preserve-env', '--yes', '--no-install', '--portability',
+  '--no-run-if-empty', '--open-tty', '--exit', '--shared', '--exclusive', '--nonblock', '--no-fork', '--fork',
+  '--background', '--set-home', '--stdin', '--reset-timestamp', '--remove-timestamp', '--quiet', '--differences',
+  '--beep', '--errexit', '--chgexit', '--no-title', '--precise', '--color', '--all-tasks', '--reset-on-fork']);
 // Positional operands the wrapper itself consumes before the child (`timeout 5`, `flock <file>`, `chrt <prio>`).
 const WRAPPER_POSITIONALS = { timeout: 1, flock: 1, chrt: 1, taskset: 1 };
 const WRAPPER_SPLIT_CAP = 8;
+// Bounds on re-judging a peeled child: each `!`-separated level recurses once per carried directory.
+const WRAPPER_PEEL_DEPTH_CAP = 3;
+const WRAPPER_BASES_CAP = 6;
+
+/** The old any-word backstop: the first file-writing program word (rm, cp, …, tee, an in-place sed/perl) anywhere in
+ *  `words`, its operands resolved against every base. Used only when the peel met an option it does not model, so a
+ *  value it may have taken for the child cannot hide the real writer. */
+function wrappedWriterScan(words, bases, roots) {
+  for (let i = 0; i < words.length; i++) {
+    const base = words[i].replace(/^\\+/, '').replace(/^.*\//, '');
+    if (!FS_MUTATING_PROGRAMS.has(base) && !['tee', 'sed', 'perl'].includes(base)) continue;
+    const operands = fileOperands(words.slice(i + 1).map((text) => ({ text, quoted: false, op: false })));
+    if (!operands.length) return bases.find((b) => isDaemonCloneRealpath(resolve(b), roots)) ?? null;
+    for (const operand of operands) {
+      for (const b of bases) {
+        const abs = resolve(b, operand);
+        if (isDaemonCloneRealpath(abs, roots)) return abs;
+      }
+    }
+    return null;
+  }
+  return null;
+}
 
 /** Shell-quote one word so it re-parses to the same text. An expansion stays visible (double quotes), so every
  *  downstream `$`/backtick check still fails closed on it. */
@@ -2459,16 +2497,24 @@ function peelDaemonWrapper(segment, cwd) {
   takeAssignments();
   while (words[0] === '!') { words.shift(); peeled = true; takeAssignments(); }
   const bases = [cwd || '.'];
+  let current = cwd || '.';
   let splits = 0;
+  let uncertain = false;
+  let probeOnly = false;
   for (;;) {
     const wrapper = (words[0] ?? '').replace(/^\\+/, '').replace(/^.*\//, '');
     if (!DAEMON_CHILD_WRAPPERS.has(wrapper)) break;
     peeled = true;
     words.shift();
     const shortValue = WRAPPER_SHORT_VALUE[wrapper] || '';
+    const shortFlag = WRAPPER_SHORT_FLAG[wrapper];
+    // Inside ONE wrapper every directory value resolves against that wrapper's starting directory (the last one
+    // wins at run time; every one is kept here). Only nested wrappers chain.
+    const start = current;
     const setDir = (dir) => {
       if (!dir || /[$`]/.test(dir) || dir.startsWith('~')) return false;
-      bases.push(resolve(bases[bases.length - 1], dir));
+      current = resolve(start, dir);
+      bases.push(current);
       return true;
     };
     const split = (text) => {
@@ -2492,12 +2538,18 @@ function peelDaemonWrapper(segment, cwd) {
             if (!setDir(attached ?? words.shift())) return false;
           } else if (wrapper === 'env' && isPrefix('--split-string')) {
             pendingSplit = attached ?? words.shift() ?? '';
-          } else if (attached === null && WRAPPER_LONG_VALUE.has(name)) words.shift();
+          } else if (WRAPPER_LONG_VALUE.has(name)) {
+            if (attached === null) words.shift();
+          } else if (!WRAPPER_LONG_FLAG.has(name)) uncertain = true;
           continue;
         }
         const letters = option.slice(1);
+        if (wrapper === 'command' && /[vV]/.test(letters)) probeOnly = true; // `command -v` never runs its operand
         for (let k = 0; k < letters.length; k++) {
-          if (!shortValue.includes(letters[k])) continue;
+          if (!shortValue.includes(letters[k])) {
+            if (shortFlag === undefined || !shortFlag.includes(letters[k])) uncertain = true;
+            continue;
+          }
           const value = letters.slice(k + 1) || words.shift();
           if ((wrapper === 'env' && letters[k] === 'C') || (wrapper === 'sudo' && letters[k] === 'D')) {
             if (!setDir(value)) return false;
@@ -2518,8 +2570,10 @@ function peelDaemonWrapper(segment, cwd) {
     if (pendingSplit !== null && !split(pendingSplit)) return 'unresolved';
     if (wrapper === 'env' || wrapper === 'time') takeAssignments();
   }
-  if (!peeled || !words.length) return null;
-  return { child: [...assigns, ...words].map(requoteWord).join(' '), bases: [...new Set(bases)] };
+  if (!peeled || !words.length || probeOnly) return null;
+  const unique = [...new Set(bases)];
+  if (unique.length > WRAPPER_BASES_CAP) return 'unresolved';
+  return { child: [...assigns, ...words].map(requoteWord).join(' '), bases: unique, uncertainWords: uncertain ? words : null };
 }
 
 /** Wrappers with unmodelled options cannot prove either their command or its cwd. Keep this
@@ -2716,8 +2770,14 @@ export function daemonCloneWriteReason(segment, options = {}) {
   const peeled = peelDaemonWrapper(s, cwd);
   if (peeled === 'unresolved') return daemonCloneWriteMessage('unresolved wrapper target');
   if (peeled) {
+    const depth = options.peelDepth ?? 0;
+    if (depth >= WRAPPER_PEEL_DEPTH_CAP) return daemonCloneWriteMessage('unresolved wrapper target: too deeply nested');
+    if (peeled.uncertainWords) {
+      const scanned = wrappedWriterScan(peeled.uncertainWords, peeled.bases, roots);
+      if (scanned) return daemonCloneWriteMessage(scanned);
+    }
     for (const base of peeled.bases) {
-      const child = daemonCloneWriteReason(peeled.child, { ...options, cwd: base });
+      const child = daemonCloneWriteReason(peeled.child, { ...options, cwd: base, peelDepth: depth + 1 });
       if (child) return child;
     }
   }
@@ -2743,7 +2803,8 @@ export function daemonCloneWriteReason(segment, options = {}) {
       .filter(([key, value]) => typeof value === 'string' && value !== process.env[key] && !/^GIT_CONFIG/.test(key))
       .map(([key, value]) => `${key}=${value}`);
     for (const word of [...scopeAssigned, ...leadingAssigned]) {
-      if (!gitCodeEnvAssignment(word)) continue;
+      // An editor never runs for a read; it only matters to a write, which is judged by its target anyway.
+      if (!gitCodeEnvAssignment(word) || /^GIT_(?:SEQUENCE_)?EDITOR=/.test(word)) continue;
       codeEnv = true;
       // A GIT_TRACE* path is a file git appends to, wherever the repository is: check the file itself.
       const trace = /^GIT_TRACE\w*=(.+)$/s.exec(word);

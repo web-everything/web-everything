@@ -4100,6 +4100,31 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
         expect(decide(command, ctx), command).toBeNull();
       }
     });
+    // Self-review of 3b27752b: an option the tables do not model may take a value the peel then reads as the child,
+    // so the any-word writer scan stays as the backstop; repeated -C/-D in ONE wrapper resolve against its start.
+    it('an unmodelled wrapper option never hides the real writer', () => {
+      for (const command of [`sudo -c staff rm ${CLONE}/x`, `sudo --login-class staff rm ${CLONE}/x`,
+        `sudo --chroot /x rm ${CLONE}/x`, `/usr/bin/time -f %e rm ${CLONE}/x`, `/usr/bin/time -o /tmp/t rm ${CLONE}/x`,
+        `env -P /usr/bin rm ${CLONE}/x`, `env -L root rm ${CLONE}/x`, `env -a foo rm ${CLONE}/x`,
+        `xargs -J % rm % ${CLONE}/x`, `watch -q 3 rm ${CLONE}/x`, `watch -d rm ${CLONE}/x`, `chrt -T 5 1 rm ${CLONE}/x`,
+        `nsenter -t 1 -m rm ${CLONE}/x`, `env --future-opt v rm ${CLONE}/x`]) {
+        expect(decide(command, ctx), command).toMatch(/DAEMON CLONE/);
+      }
+    });
+    it('repeated directory options in one wrapper each resolve against the wrapper\'s starting directory', () => {
+      for (const command of ['env -C /tmp -C ../../../wev-review-daemon rm x', 'sudo -D /tmp -D ../../../wev-review-daemon rm x',
+        `env -C /tmp -C ${CLONE} rm x`]) {
+        expect(decide(command, ctx), command).toMatch(/DAEMON CLONE/);
+      }
+      expect(decide('env -C /ws/.lanes -C ../wev-review-daemon touch x', ctx)).toBeNull();
+      expect(decide(`command -v rm ${CLONE}`, ctx)).toBeNull();
+    });
+    it('deeply nested wrappers are bounded and fail closed', () => {
+      const dirs = Array.from({ length: 6 }, (_, k) => `-C /t${k}`).join(' ');
+      const started = Date.now();
+      expect(decide(`${`env ${dirs} ! `.repeat(9)}ls`, ctx)).toMatch(/DAEMON CLONE/);
+      expect(Date.now() - started).toBeLessThan(2000);
+    });
     it('odd wrapper input never throws and stays bounded', () => {
       for (const command of ['env -S', 'env -S ""', 'timeout', 'env -S\'-S -S\' rm x', 'env --', '!']) {
         expect(() => decide(command, ctx), command).not.toThrow();
@@ -4132,7 +4157,10 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
         for (const wrapper of WRAPPERS) {
           expect(decide(`${wrapper} ${name}=/x/run git ${read}`, ctx), `${wrapper} ${name} ${read}`).toMatch(/DAEMON CLONE/);
         }
-        expect(decide(`${name}=/x/run git -C ${CLONE} ${read}`, ctx), `bare ${name} ${read}`).toMatch(/DAEMON CLONE/);
+        // An editor never runs for a read: bare (target-judged) it keeps the read; behind a wrapper it still denies.
+        const bare = decide(`${name}=/x/run git -C ${CLONE} ${read}`, ctx);
+        if (/EDITOR$/.test(name)) expect(bare, `bare ${name} ${read}`).toBeNull();
+        else expect(bare, `bare ${name} ${read}`).toMatch(/DAEMON CLONE/);
       }
     });
     it('a GIT_TRACE* file inside a clone is a write even when the repository is the lane', () => {
@@ -4154,6 +4182,7 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
       }
       for (const command of [`GIT_PAGER="less -R" git -C ${CLONE} log`, `GIT_CONFIG_NOSYSTEM=1 git -C ${CLONE} status`,
         `GIT_CONFIG_GLOBAL=/dev/null git -C ${CLONE} status`, 'GIT_EDITOR=true git rebase --continue',
+        `export GIT_EDITOR=vim; git -C ${CLONE} status`,
         `export GIT_PAGER=cat; git -C ${CLONE} log`]) {
         expect(decide(command, ctx), command).toBeNull();
       }
