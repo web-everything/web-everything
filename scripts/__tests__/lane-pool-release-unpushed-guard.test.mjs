@@ -136,6 +136,32 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     git(['branch', 'work/hidden', sha], laneDir);
     refused(release(), sha);
   });
+  // A lane-written commit-graph is trusted for parent links, so it can graft without a replace ref or graft file.
+  it('refuses a commit grafted under the origin tip by a forged commit-graph', () => {
+    const main = git(['rev-parse', 'HEAD'], laneDir);
+    const sha = commitWork();
+    git(['reset', '--quiet', '--hard', main], laneDir);
+    git(['branch', 'work/hidden', sha], laneDir);
+    git(['-c', 'commitGraph.generationVersion=1', 'commit-graph', 'write', '--reachable', '--no-progress'], laneDir);
+    const file = join(laneDir, '.git', 'objects', 'info', 'commit-graph');
+    const graph = readFileSync(file);
+    const chunk = id => {
+      for (let at = 8; at < 8 + 12 * graph[6]; at += 12) {
+        if (graph.toString('latin1', at, at + 4) === id) return Number(graph.readBigUInt64BE(at + 4));
+      }
+      throw new Error(`no ${id} chunk`);
+    };
+    const oids = chunk('OIDL'), cdat = chunk('CDAT');
+    const count = graph.readUInt32BE(chunk('OIDF') + 255 * 4);
+    const index = oid => [...Array(count).keys()].find(i => graph.toString('hex', oids + 20 * i, oids + 20 * i + 20) === oid);
+    const entry = cdat + 36 * index(main);
+    const slot = graph.readUInt32BE(entry + 20) === 0x70000000 ? entry + 20 : entry + 24;
+    graph.writeUInt32BE(index(sha), slot);
+    chmodSync(file, 0o644); // git writes the graph read-only
+    writeFileSync(file, graph);
+    expect(git(['rev-list', 'work/hidden', '--not', main], laneDir)).toBe('');
+    refused(release(), sha);
+  });
   it.each(['with its reflog', 'with an expired reflog'])('refuses tracked work parked in a stash %s', shape => {
     writeFileSync(join(laneDir, 'seed.txt'), 'stashed edit\n');
     git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'stash', '--quiet'], laneDir);
@@ -230,16 +256,19 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     refused(result);
     expect(result.stderr).toContain(`lane config ${key.toLowerCase()}`);
   });
-  it('refuses a submodule change hidden by diff.ignoreSubmodules', () => {
+  it.each(['diff.ignoreSubmodules', 'submodule.sub.ignore', '.gitmodules ignore'])('refuses a submodule change hidden by %s', shape => {
     const sub = join(laneDir, 'sub');
     git(['init', '--quiet', sub]);
     const commitSub = message => git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '--allow-empty', '-m', message], sub);
     commitSub('one');
-    git(['add', 'sub'], laneDir);
+    writeFileSync(join(laneDir, '.gitmodules'),
+      `[submodule "sub"]\n\tpath = sub\n\turl = ./sub\n${shape === '.gitmodules ignore' ? '\tignore = all\n' : ''}`);
+    git(['add', 'sub', '.gitmodules'], laneDir);
     git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '-m', 'add gitlink'], laneDir);
     git(['push', '--quiet', 'origin', 'HEAD:refs/heads/work/gitlink'], laneDir);
     commitSub('two');
-    git(['config', 'diff.ignoreSubmodules', 'all'], laneDir);
+    if (shape === 'diff.ignoreSubmodules') git(['config', 'diff.ignoreSubmodules', 'all'], laneDir);
+    if (shape === 'submodule.sub.ignore') git(['config', 'submodule.sub.ignore', 'all'], laneDir);
     expect(git(['status', '--porcelain', '--untracked-files=no'], laneDir)).toBe('');
     const result = release();
     refused(result);

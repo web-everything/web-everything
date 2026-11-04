@@ -2832,10 +2832,16 @@ function assertReleaseReservedScoped() {
 // by the lane git env). Returns the change lines ('' when clean), or null when any evidence is unreadable.
 // Every release evidence read ignores lane-written history rewrites: a `refs/replace/*` ref or `.git/info/grafts`
 // could otherwise make a listed origin sha appear to contain an unpushed commit, or swap HEAD's tree under status.
+// A lane-written `.git/objects/info/commit-graph` does the same through its cached parent links, so the graph is off.
 // The honest-reporting pins (scripts/lib/health-watch-lane-scan.mjs) also beat a host-level fileMode/ignoreStat that
 // would hide lane edits.
+const withoutCommitGraph = env => {
+  const n = Number.parseInt(String(env.GIT_CONFIG_COUNT ?? '0'), 10);
+  const at = Number.isInteger(n) && n > 0 ? n : 0;
+  return { ...env, [`GIT_CONFIG_KEY_${at}`]: 'core.commitGraph', [`GIT_CONFIG_VALUE_${at}`]: 'false', GIT_CONFIG_COUNT: String(at + 1) };
+};
 const releaseEvidenceGit = (args, dir, opts = {}, extraEnv = {}) => tryGit(args, dir, {
-  ...opts, env: withHonestReportingPins({ ...readOnlyGitEnv(args).env, GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/nonexistent', ...extraEnv }),
+  ...opts, env: withoutCommitGraph(withHonestReportingPins({ ...readOnlyGitEnv(args).env, GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/nonexistent', ...extraEnv })),
 });
 // Stat-trust config (core.checkStat / core.trustctime / core.ignoreStat) is pinned to git's defaults by the shared lane
 // git env (scripts/lib/lane-git-hardening.mjs), for this read and every earlier refreshing status in the release flow.
