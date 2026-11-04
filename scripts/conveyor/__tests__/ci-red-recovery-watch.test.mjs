@@ -294,6 +294,37 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
     expect(result.applied[1]).toMatchObject({ deferred: true, ok: false, budgetExhausted: true });
   });
 
+  // Review round 2 of #6340: `started` was bumped before the refresh ran, so a refresh that came back deferred
+  // (no work done) still spent the floor and the cap, and every later PR in the tick was starved.
+  it.each([
+    ['refresh reports deferred', () => ({ deferred: true, ok: false, error: 'cross-repository PR' })],
+  ])('a free deferral (%s) first in line spends neither the progress floor nor the per-tick cap', (_name, firstResult) => {
+    const prs = [2635, 2636].map((number) => ({ ...PR_2635, number, headRefName: `lane/g${number}` }));
+    let t = 0;
+    const refresh = vi.fn((branch) => (branch === 'lane/g2635' ? firstResult() : { ok: true, action: 'rebased' }));
+    const postComment = vi.fn();
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => { t += 200; return prs; }, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment, apply: true, now: () => t, applyBudgetMs: 150, maxApplyPerTick: 1,
+    });
+    expect(refresh).toHaveBeenCalledTimes(2);
+    expect(postComment).toHaveBeenCalledTimes(1);
+    expect(result.applied.map((a) => [a.prNumber, a.action])).toEqual([[2635, 'deferred'], [2636, 'rebased']]);
+  });
+
+  it('a failed refresh whose claim is found held afterwards is a free deferral too', () => {
+    const prs = [2635, 2636].map((number) => ({ ...PR_2635, number, headRefName: `lane/k${number}` }));
+    let t = 0;
+    const refresh = vi.fn((branch) => (branch === 'lane/k2635' ? { ok: false, error: 'push rejected' } : { ok: true, action: 'rebased' }));
+    let reads = 0;
+    const checkClaim = vi.fn(({ branch }) => (branch === 'lane/k2635' && ++reads === 2 ? { message: 'held' } : null));
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => { t += 200; return prs; }, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment: vi.fn(), apply: true, now: () => t, applyBudgetMs: 150, maxApplyPerTick: 1, checkClaim,
+    });
+    expect(result.applied.map((a) => [a.prNumber, a.action])).toEqual([[2635, 'deferred'], [2636, 'rebased']]);
+  });
+
   it('a claim-held PR first in line does not use up the progress floor', () => {
     const prs = [2635, 2636].map((number) => ({ ...PR_2635, number, headRefName: `lane/f${number}` }));
     let t = 0;

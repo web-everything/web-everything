@@ -39,6 +39,15 @@ export default {
       apply: true, now: () => t2, applyBudgetMs: 150, maxApplyPerTick: 8,
     });
     if (!starved.applied.some((a) => a.ok)) violations.push({ detail: 'discovery outlasted the budget and the tick refreshed nothing (starvation)' });
+    // Review round 2 of #6340: a refresh that comes back deferred (no work) must not spend the progress floor.
+    let t3 = 0;
+    const freeDefer = sweepCiRedRecovery({
+      readOpenPrs: () => { t3 += 200; return prs; }, readMainRuns: () => mainRuns, readAheadBy: () => 5, readComments: () => [],
+      refresh: (branch) => (branch === 'lane/soak1' ? { deferred: true, ok: false, error: 'not same-repo' } : { ok: true, action: 'rebased' }),
+      postComment: () => {}, checkClaim: () => null, readPriority: () => null,
+      apply: true, now: () => t3, applyBudgetMs: 150, maxApplyPerTick: 8,
+    });
+    if (!freeDefer.applied.some((a) => a.ok)) violations.push({ detail: 'a free deferral spent the progress floor and starved the later PRs' });
     return { violations };
   },
   judge(report) { return report.violations.map((v) => v.detail); },

@@ -365,13 +365,16 @@ export function sweepCiRedRecovery({
       const held = checkClaim({ repo, branch: d.headRefName });
       // Passing prNumber makes refreshOntoMain verify the PR is same-repo before it rebases and force-pushes.
       const result = held ? { ok: false, error: held.message }
-        : (started += 1, refresh(d.headRefName, { base: `origin/${defaultBranch}`, root: repoRoot, prNumber: d.prNumber, repo, readIsCrossRepository }));
+        : refresh(d.headRefName, { base: `origin/${defaultBranch}`, root: repoRoot, prNumber: d.prNumber, repo, readIsCrossRepository });
       // 2026-10-10 live: #4784 claim-held refusals burned the cap. A failed push re-reads the claim store (the push
       // race); the failure text is never trusted to say a claim is held (PR #4825 round 4).
       if (held || result.deferred || (!result.ok && checkClaim({ repo, branch: d.headRefName }))) {
+        // A deferral did no work, so it never spends the progress floor or the per-tick cap (review round 2 of #6340:
+        // counting it before the refresh ran let one free deferral starve every later PR in the tick).
         applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, ok: false, action: 'deferred', deferred: true, error: result.error });
         continue;
       }
+      started += 1;
       // Posted on EVERY attempt, success or failure — mirrors `sweepHungCiRecovery`'s own discipline: a
       // permanently-failing refresh must still trip {@link DEFAULT_MAX_REBASE_RETRIES_PER_SHA}'s cap, not
       // retry forever silently.
