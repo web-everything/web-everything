@@ -91,7 +91,8 @@ function defaultVerify(file, batch, codec) {
 /** Paths under `dir` any process holds open (lsof). Fails CLOSED: if lsof can not answer, every path counts as open. */
 function defaultOpenPaths(dir) {
   const r = spawnSync('lsof', ['-Fn', '+D', dir], { maxBuffer: 256 * 1024 * 1024 });
-  if (r.error || (r.status !== 0 && r.status !== 1)) return { has: () => true };
+  // lsof exits 1 for "nothing open" ONLY with empty stderr; any other signal means incomplete visibility -> everything counts as open.
+  if (r.error || (r.status !== 0 && r.status !== 1) || (r.status === 1 && String(r.stderr).trim())) return { has: () => true };
   return new Set(String(r.stdout).split('\n').filter(l => l.startsWith('n')).map(l => l.slice(1)));
 }
 const defaultFreeGiB = dir => { const s = statfsSync(dir); return (s.bavail * s.bsize) / GIB; };

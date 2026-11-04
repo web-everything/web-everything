@@ -2,7 +2,10 @@
 import { runsRetention } from './runs-retention-core.mjs';
 import { RUNS_RETENTION_EFFECT } from './runs-retention.mjs';
 
-/** op name -> declared step count, from the live registry (dynamic import: run.mjs imports this file). */
+/**
+ * Completion is the ENGINE's own definition (`engine.runStatus`: cursor >= the registry declaration's step count, no
+ * pending) - the very declaration `--resume` steps with, so a run that reads complete here has nothing left to resume.
+ * op name -> declared step count, from the live registry (dynamic import: run.mjs imports this file). */
 async function stepCounts() {
   const { OPERATIONS } = await import('./run.mjs');
   const counts = new Map();
