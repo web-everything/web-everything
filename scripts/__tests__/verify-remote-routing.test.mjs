@@ -990,9 +990,8 @@ describe('verify-local decisions are logged as forge-share fallbacks (PR-1)', ()
     } finally { rmSync(lockRoot, { recursive: true, force: true }); }
   });
 
-  it('forge-share counts the two by-design verify-local reasons as expected-local and refusals as misses', () => {
+  it('forge-share keeps every verify-local reason a counted miss (honest denominator)', () => {
     const settings = JSON.parse(readFileSync(resolve(repo, 'scripts/settings/forge-share.json'), 'utf8'));
-    expect(settings.expectedLocalReasons).toEqual(expect.arrayContaining(['verify-local:raw-command', 'verify-local:vitest-related-local-only']));
-    expect(settings.expectedLocalReasons.some(r => r.startsWith('verify-local:forge'))).toBe(false);
+    expect(settings.expectedLocalReasons.some(r => r.startsWith('verify-local:'))).toBe(false);
   });
 });
