@@ -149,7 +149,7 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
   });
 
   it('60 PRs at pageSize 20 use three GraphQL pages', () => {
-    const many = Array.from({ length: 60 }, (_, i) => ({ ...PRS[0], number: i }));
+    const many = Array.from({ length: 60 }, (_, i) => ({ ...PRS[0], number: i + 1 }));
     const { exec, calls } = fakeExec(many);
     const got = readSharedOpenPrs(opts({ fields: 'number', exec }));
     expect(got).toHaveLength(60);
@@ -192,8 +192,37 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
     expect(readSharedOpenPrs(opts({ fields: 'reviewDecision', exec }))).toEqual(PRS.map(p => ({ reviewDecision: p.reviewDecision })));
   });
 
+  it('a DECLARED WE_PR_SNAPSHOT_SAMPLE subset is marked sampled (not truncated); real truncation still fails closed', () => {
+    const { exec } = fakeExec();
+    const rows = readSharedOpenPrs(opts({ fields: 'number', exec, env: { VITEST: '1', WE_PR_SNAPSHOT_SAMPLE: '1' } }));
+    expect(rows.length).toBe(1);
+    expect(PRS.length).toBeGreaterThan(1);
+    expect(rows.sampled).toBe(true);
+    expect(rows.discoveryIncomplete).toBeUndefined();
+    const whole = readSharedOpenPrs(opts({ fields: 'number', exec }));
+    expect(whole.sampled).toBeUndefined();
+    expect(whole.discoveryIncomplete).toBeUndefined();
+  });
+  it('a snapshot truncated at its cap is incomplete even when a sample is declared', () => {
+    const { exec } = fakeExec(Array.from({ length: 3 }, (_, i) => ({ ...PRS[0], number: i + 1 })));
+    const first = readSharedOpenPrs(opts({ fields: 'number', exec }));
+    void first;
+    const snapFile = snapshotPath(dir, REPO);
+    const snap = JSON.parse(readFileSync(snapFile, 'utf8'));
+    writeFileSync(snapFile, JSON.stringify({ ...snap, truncated: true }));
+    const rows = readSharedOpenPrs(opts({ fields: 'number', exec, env: { VITEST: '1', WE_PR_SNAPSHOT_SAMPLE: '1' } }));
+    expect(rows.discoveryIncomplete).toBe(true);
+  });
+
+  it('a short inventory (fewer rows than totalCount) is never published as a complete snapshot', () => {
+    const exec = () => JSON.stringify({ data: { repository: { pullRequests: { nodes: [], totalCount: 7,
+      pageInfo: { hasNextPage: false, endCursor: null } } } } });
+    expect(() => readSharedOpenPrs(opts({ fields: 'number', exec }))).toThrow(/0 of 7/);
+    expect(readSharedOpenPrs(opts({ fields: 'number', exec: fakeExec().exec }))).toHaveLength(PRS.length);
+  });
+
   it.each([false, true])('failed pages never publish or update a snapshot (previous=%s)', previous => {
-    const many = Array.from({ length: 21 }, (_, i) => ({ ...PRS[0], number: i }));
+    const many = Array.from({ length: 21 }, (_, i) => ({ ...PRS[0], number: i + 1 }));
     const fake = fakeExec(many);
     const path = snapshotPath(dir, REPO);
     if (previous) readSharedOpenPrs(opts({ fields: 'number', exec: fake.exec }));
@@ -287,7 +316,7 @@ describe('the pass readers are wired to the snapshot (a seeded fresh snapshot is
 
   it.each([
     // `readCommits` stubbed: its default (`fetchPrCommits`) runs a real `git fetch origin` per unlabelled PR.
-    ['../../conveyor/reconcile-pass.mjs', 'defaultReadPrs', { readCommits: () => [] }],
+    ['../../conveyor/reconcile-pass.mjs', 'defaultReadPrs', { readCommits: () => [], readRest: () => ({ json: { user: { login: 'a', type: 'User' } } }) }],
     ['../../conveyor/advisory-label-sweep.mjs', 'defaultListPrs'],
     ['../../conveyor/ci-red-recovery-watch.mjs', 'defaultReadOpenPrs'],
     ['../../conveyor/parked-pr-conflict-watch.mjs', 'defaultListParkedPrs'],
