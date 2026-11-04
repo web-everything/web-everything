@@ -3917,3 +3917,10 @@ Canonical-origin isolation fixtures must assert refusal and an unchanged lease w
 origin is unresolved. Reclaim fixtures with rejected salvage must first assert that reaper release
 refuses, then explicitly discard the lease to exercise reclaim on unpreserved work. The card-filer soak
 likewise checks that unreadable status keeps the lease before testing a deliberate discard.
+
+Persistent GitHub 5xx soak fixtures must account for both retry ladders: `withListRetry`
+repeats the list read three times, and each attempt can sleep again in `gh-throttle`.
+The `smoke-github-outage` break pins `WE_GH_LIST_BACKOFF_MS=5,5` and
+`WE_GH_JSON_RETRY_BACKOFF_MS=5` before the daemon forks. This preserves exhausted,
+fail-closed reads across reconcile and dispatch smoke passes within the unchanged
+90-second tick bound; shortening only the outer list backoff does not suffice.
