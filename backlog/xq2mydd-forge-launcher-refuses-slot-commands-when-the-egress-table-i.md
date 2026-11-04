@@ -4,7 +4,6 @@ size: 3
 status: active
 scaffoldedBy: "fix-6345"
 dateScaffolded: "2026-11-03"
-blockedBy: ["6193"]
 scope: ["we:scripts/readiness/forge-exec-run.mjs", "we:scripts/readiness/__tests__/forge-exec-run.test.mjs"]
 dateOpened: "2026-11-03"
 tags: []
@@ -12,7 +11,7 @@ tags: []
 
 # Forge launcher refuses slot commands when the egress table is absent
 
-Follow-up from PR 6345 review (fail-closed egress readiness). forge-exec-egress.service is only ordered Before=sshd; if it fails at boot (nft missing, a slot user lookup fails) slot commands run with full outbound network. Add a readiness gate in the execution launcher: before any slot command run 'nft list table inet forge_exec_egress'; when it fails, refuse the slot and fall back to local. Test: mock nft as missing and assert refusal plus the fallback reason. Lands after 6193 (the launcher file is held there).
+Follow-up from PR 6345 review (fail-closed egress readiness). forge-exec-egress.service is only ordered Before=sshd; if it fails at boot (nft missing, a slot user lookup fails) slot commands run with full outbound network. Add a readiness gate in the execution launcher: before any slot command run 'nft list table inet forge_exec_egress'; when it fails, refuse the slot and fall back to local. Test: mock nft as missing and assert refusal plus the fallback reason. Sequence after open PR 6193 (it holds the launcher file); that is a pull request number, not a backlog item, so it is not a blockedBy edge.
 
 ## Acceptance
 
