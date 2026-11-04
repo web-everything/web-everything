@@ -1060,7 +1060,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       // The prerequisite the Mac may use for an incremental bundle: this mirror's own main tip.
       let bundleBase;
       if(bundleReady) try {
-        const mirror=join(bases,'repo.git'),args=['-c','safe.directory='+mirror,'--git-dir',mirror,'rev-parse','--verify','refs/heads/main^{commit}'];
+        const mirror=join(bases,'repo.git'),args=['-c','safe.directory='+mirror,'--git-dir',mirror,'rev-parse','--verify','refs/remotes/origin/main^{commit}'];
         const env={PATH:'/usr/local/bin:/usr/bin:/bin',HOME:'/nonexistent',LANG:'C',GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_NOSYSTEM:'1'};
         const tip=await execute('git',args,{cwd:bases,env});
         const text=String(tip.stdout??'').trim();
@@ -1185,7 +1185,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
         try {
           if(request.bundle!==undefined&&!validBundleEvidence(request.bundle))throw new Error('Invalid bundle evidence');
           await materializeWorktree({work,root:bases,baseSha:request.baseSha,head:request.manifest.git.head,manifest:request.manifest,manifestDigest:request.manifestDigest,
-            ...(request.bundle!==undefined?{bundle:{...request.bundle,file:join(container,'bundle','git.bundle')},sharedClone:true}:{}),
+            ...(request.bundle!==undefined?{bundle:{...request.bundle,file:join(container,'bundle','git.bundle')}}:{}),
             ...(testRoot&&testGitExec?{exec:testGitExec}:{})});
           await handoff(worker,join(work,'.git'),{recursive:true,workerParent:true});
         } catch(error) {throw Object.assign(error,{code:error.code==='diff-coverage-base-unavailable'?error.code:'git-head-unavailable'});}

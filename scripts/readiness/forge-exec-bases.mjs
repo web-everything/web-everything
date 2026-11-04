@@ -117,8 +117,8 @@ export async function materializeWorktree({work,root,baseSha,head,manifest,manif
       // No network: public main comes from the mirror clone; the Mac tip comes from
       // the verified bundle (or is already in the mirror when mode is none).
       if(!local||!validBundleEvidence(bundle))throw new Error('Bundle transport unavailable');
-      if(await git(['rev-parse','--verify','refs/heads/main^{commit}'],cloned,undefined,true)===null)throw new Error('Mirror main missing');
-      await git(['update-ref','refs/remotes/origin/main','refs/heads/main'],cloned);
+      // The warmer refreshes refs/remotes/origin/main in the mirror; the mirror clone copied it. Never fall back to a cached local main.
+      if(await git(['rev-parse','--verify','refs/remotes/origin/main^{commit}'],cloned,undefined,true)===null)throw new Error('Mirror public main missing');
       if(bundle.mode!=='none') {
         const staged=join(pending,'git.bundle');
         await stageBundle(bundle.file,staged,bundle);

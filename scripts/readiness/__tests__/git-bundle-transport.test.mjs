@@ -33,6 +33,7 @@ beforeEach(async () => {
   git(source, 'add', '.'); git(source, ...ident, 'commit', '-m', 'public');
   runnerMain = git(source, 'rev-parse', 'HEAD');
   git(root, 'clone', '--bare', source, join(root, 'repo.git'));
+  git(join(root, 'repo.git'), 'update-ref', 'refs/remotes/origin/main', runnerMain);
   lane = join(root, 'lane');
   git(root, 'clone', source, lane);
   await fs.writeFile(join(lane, 'tracked.txt'), 'changed');
@@ -84,6 +85,10 @@ describe('R593 bundle ingest on the runner', () => {
   it('refuses a bundle whose tip is not the manifest-bound head', async () => {
     await expect(run({ head: runnerMain })).rejects.toMatchObject({ code: 'git-head-unavailable' });
     expect(existsSync(join(work, '.git'))).toBe(false);
+  });
+  it('refuses when the mirror has no refreshed public main (no cached local main fallback)', async () => {
+    git(join(root, 'repo.git'), 'update-ref', '-d', 'refs/remotes/origin/main');
+    await expect(run()).rejects.toMatchObject({ code: 'git-head-unavailable' });
   });
   it('refuses a corrupt bundle (digest mismatch)', async () => {
     await expect(run({ mutate: async file => { const b = await fs.readFile(file); b[b.length - 5] ^= 0xff; await fs.writeFile(file, b); } }))
