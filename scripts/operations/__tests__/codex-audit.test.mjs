@@ -440,8 +440,10 @@ describe('prior question hashes (AU1 PR-B)', () => {
       const platform = { hash: 'e'.repeat(64), acceptUntil: '2026-12-05T00:00:00.000Z' };
       realFs.writeFileSync(file, JSON.stringify({ audit: { priorQuestionHashes: [platform] } }));
       const env = { WE_PLATFORM_PREFERENCES_FILE: file };
-      // platform value alone is ignored; a tool value is kept without the platform entry merged in
-      expect(resolvePriorQuestionHashes({ env, readFile: settingsWith([]) })).toEqual([]);
+      // tool layer unset (empty file, then unreadable): a platform-only value must not surface
+      expect(resolvePriorQuestionHashes({ env, readFile: () => '{}' })).toEqual([]);
+      expect(resolvePriorQuestionHashes({ env, readFile: () => { throw new Error('unreadable'); } })).toEqual([]);
+      // a tool value is kept without the platform entry merged in
       const tool = { hash: PRIOR, acceptUntil: '2026-12-01T00:00:00.000Z' };
       expect(resolvePriorQuestionHashes({ env, readFile: settingsWith([tool]) })).toEqual([tool]);
     } finally { realFs.rmSync(dir, { recursive: true, force: true }); }
@@ -456,6 +458,11 @@ describe('prior question hashes (AU1 PR-B)', () => {
     expect(ok(U, new Date(U + 1).toISOString())).toBe(false);
     expect(ok(U, new Date(U - MAX_PRIOR_WINDOW_MS).toISOString())).toBe(true);
     expect(ok(U, new Date(U - MAX_PRIOR_WINDOW_MS - 1).toISOString())).toBe(false);
+  });
+  it('a current-question record for another head or base does not block the prior fallback', () => {
+    const prior = rec('NOT WEAKENED');
+    expect(find([prior, rec('WEAKENED', { questionHash: QUESTION_HASH, head: BASE, findings: ['x.mjs:1 gap'] })], open)).toBe(prior);
+    expect(find([prior, rec('WEAKENED', { questionHash: QUESTION_HASH, base: HEAD, findings: ['x.mjs:1 gap'] })], open)).toBe(prior);
   });
   it.each([
     ['an invalid timestamp', { at: 'not-a-date' }],
