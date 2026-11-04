@@ -2031,6 +2031,17 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
       expect(carried(earlierPass, weak, contradictoryLaterPass)).toEqual({ ok: false, reason: 'weakened' });
     });
   });
+  describe('non-string head/base never alias a string one (trust boundary)', () => {
+    const B = 'f'.repeat(40);
+    it('an array-wrapped base cannot displace the veto of the real string base it stringifies to', () => {
+      const weak = old({ fingerprint: undefined, base: B, verdict: 'WEAKENED', at: '2026-10-22T12:00:00Z' });
+      const alias = old({ fingerprint: undefined, base: [B], at: '2026-10-23T12:00:00Z' });
+      expect(prototypeLoad.canonicalAuditEvidence([old(), weak, alias], SHA, () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
+    });
+    it('a carried array-based record is never a pass', () => {
+      expect(prototypeLoad.canonicalAuditEvidence([old({ base: [TREE] })], SHA, () => true, FP)).toEqual({ ok: false, reason: 'no-record' });
+    });
+  });
   it('a carried record never lends its head other records without the fingerprint', () => {
     const other = old({ fingerprint: undefined, base: 'f'.repeat(40), at: '2026-10-21T12:00:00Z' });
     const weak = old({ fingerprint: undefined, base: '9'.repeat(40), verdict: 'WEAKENED', at: '2026-10-22T12:00:00Z' });

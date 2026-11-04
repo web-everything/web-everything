@@ -47,8 +47,10 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   // Fail closed the other way too: the latest VALID WEAKENED verdict for any base of a carried head blocks, fingerprint or not.
   // "Valid" is findAudit's own judgment (latest wins per base, contradictory-findings and malformed records rejected,
   // empty-diff base===head never consulted), so the veto can never honor a record the audit reader itself refuses.
+  // Only string heads/bases are keyed: a non-string (an array that stringifies to a real sha) must never alias, and so
+  // displace, the veto of the string base it imitates.
   const vetoBases = new Map();
-  for (const r of records) if (r?.head && r.head !== sha && heads.has(r.head) && r.base !== r.head) vetoBases.set(`${r.head}/${r.base}`, r);
+  for (const r of records) if (typeof r?.head === 'string' && typeof r.base === 'string' && r.head !== sha && heads.has(r.head) && r.base !== r.head) vetoBases.set(JSON.stringify([r.head, r.base]), r);
   for (const { head, base } of vetoBases.values()) {
     if (findAudit(records, { head, base, questionHash: QUESTION_HASH })?.verdict === 'WEAKENED') return { ok: false, reason: 'weakened' };
   }
