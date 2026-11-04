@@ -627,7 +627,7 @@ describe('the lane comes from the tick core or nowhere', () => {
 
   it.each([
     'plateau-app', 'pa', 'PA', 'frontierui', 'webeverything', 'FUI', 'WE', 'PLATEAU',
-    'FrontierUI', 'WebEverything', 'Plateau-App', 'custom-repo', '',
+    'FrontierUI', 'WebEverything', 'Plateau-App', '',
   ])('accepts and canonicalizes legacy scope spelling %j for individual and grouped dispatches', (repo) => {
     const prefix = repo ? `${repo}:` : '';
     const canonical = { 'plateau-app': 'plateau', pa: 'plateau', frontierui: 'fui', webeverything: 'we' }[repo.toLowerCase()] ?? (repo.toLowerCase() || 'we');
@@ -654,7 +654,7 @@ describe('the lane comes from the tick core or nowhere', () => {
     const read = tickRead();
     for (const bad of [
       'we:a.mjs b;c', 'we:a.mjs $(id)', 'we:a.mjs `id`', 'we:a.mjs ../x.mjs', 'we:a.mjs we:../../x', 'we:a.mjs /etc/passwd',
-      'we:a.mjs we:/abs/x', 'we:s/a*b.mjs we:docs/x.md', 'we:a.mjs ./src/t.mjs', 'we:a.mjs src//t.mjs', "we:a.mjs b'c", 'we:a.mjs\nb|c',
+      'we:a.mjs we:/abs/x', 'we:s/a*b.mjs we:s/ab*.mjs', 'we:a.mjs ./src/t.mjs', 'we:a.mjs src//t.mjs', "we:a.mjs b'c", 'we:a.mjs\nb|c',
     ]) {
       expect(() => shapeDispatchRead({ ...read, item: { ...read.item, scope: [bad] } }, { num: '3037' }), JSON.stringify(bad))
         .toThrow(/characters the brief cannot carry|unsafe scope entry/);
@@ -683,7 +683,7 @@ describe('the lane comes from the tick core or nowhere', () => {
     expect(legacy.scope).toEqual([`${canonical}:src/a.mjs`]);
   });
 
-  it.each(['foo:src/a.mjs', 'Weird:src/a.mjs', 'we2:src/a.mjs', 'plateau-api:src/a.mjs'])(
+  it.each(['foo:src/a.mjs', 'Weird:src/a.mjs', 'we2:src/a.mjs', 'plateau-api:src/a.mjs', 'custom-repo:src/a.mjs'])(
     'send-back item 1 — refuses the unknown scope prefix %s for build and repair scopes', (piece) => {
       for (const launchKind of ['build', 'fix']) {
         const read = tickRead({ launchKind, launch: { num: '3037', lane: 8, pr: 6244, reason: 'red-ci' } });
@@ -727,7 +727,7 @@ describe('the lane comes from the tick core or nowhere', () => {
     ['build', true], ['fix', true], ['ci-heal', true],
     ['prepare', false], ['prepare-item', false], ['prepare-decision', false], ['investigate', false],
   ])('%s validates unsafe item scope only when it uses that scope', (launchKind, refuses) => {
-    for (const bad of ['we:../x', 'we:src/./a', 'we:src/a*b.mjs we:docs/x.md', 'we:a;id']) {
+    for (const bad of ['we:../x', 'we:src/./a', 'we:src/a*b.mjs we:src/ab*.mjs', 'we:a;id']) {
       const read = tickRead({ launchKind });
       read.item.scope = [bad];
       const shape = () => shapeDispatchRead(read, { num: '3037' });

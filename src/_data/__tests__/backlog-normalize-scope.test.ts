@@ -17,7 +17,7 @@ const matter = require('gray-matter');
 // Historical malformed scopes restored by the PR #6244 operator cleanup. They must remain refused;
 // accepting every card would require unrelated backlog edits or weakening the dispatch boundary.
 const refusedCorpusEntries = new Map([
-  ['plateau:branding-proposals/loop/ (new fui-*.svg iteration files)', /unsafe scope.*glob/],
+  ['plateau:branding-proposals/loop/ (new fui-*.svg iteration files)', /characters the brief cannot carry/],
   ['plateau:branding.html (regenerated, not hand-edited)', /characters the brief cannot carry/],
   ['plateau-app:src/feature-tracker/read-model.ts (owned re-edit)', /characters the brief cannot carry/],
   ['plateau-app:src/feature-tracker/read-model.test.ts (owned re-edit)', /characters the brief cannot carry/],
@@ -167,7 +167,7 @@ describe('backlog loader normalizeScope — multi-path entries (R372)', () => {
   it('does not inherit a repository prefix across scope entries', () => {
     expect(normalizeScope(['fui:a.mjs b.mjs', 'c.mjs'])).toEqual(['fui:a.mjs', 'fui:b.mjs', 'we:c.mjs']);
   });
-  it.each(['we', 'fui', 'plateau', 'plateau-app', 'pa', 'PA', 'frontierui', 'webeverything', 'WE', 'FUI', 'custom-repo', 'custom_repo', 'repo2'])(
+  it.each(['we', 'fui', 'plateau', 'plateau-app', 'pa', 'PA', 'frontierui', 'webeverything', 'WE', 'FUI'])(
     'loader and dispatcher canonicalize %s identically for leases, including underscores', (prefix) => {
       const scope = [`${prefix}:a.mjs b.mjs`, 'c.mjs'];
       const canonical = ({ 'plateau-app': 'plateau', pa: 'plateau', frontierui: 'fui', webeverything: 'we' } as Record<string, string>)[prefix.toLowerCase()] ?? prefix.toLowerCase();
@@ -175,6 +175,13 @@ describe('backlog loader normalizeScope — multi-path entries (R372)', () => {
       expect(normalizeScope(scope)).toEqual(leaseScope);
       expect(normalizeBriefScope(scope)).toEqual(leaseScope);
       expect(normalizeBriefScope(normalizeScope(scope))).toEqual(leaseScope);
+    },
+  );
+  it.each(['custom-repo', 'custom_repo', 'repo2'])(
+    'the loader keeps unknown prefix %s as authored data but the dispatcher refuses it (send-back item 1)', (prefix) => {
+      const scope = [`${prefix}:a.mjs b.mjs`, 'c.mjs'];
+      expect(() => normalizeBriefScope(scope)).toThrow(/unknown scope repo prefix/);
+      expect(() => normalizeBriefScope(normalizeScope(scope))).toThrow(/unknown scope repo prefix/);
     },
   );
   it('splits a file plus a test glob in one entry (#4701 card shape)', () => {
