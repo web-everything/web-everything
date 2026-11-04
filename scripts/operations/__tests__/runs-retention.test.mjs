@@ -1,5 +1,5 @@
 /** @file runs-retention.test.mjs — R549 archive-then-delete retention on a fixture runs dir. */
-import { mkdtempSync, mkdirSync, rmSync, utimesSync, existsSync, readdirSync } from 'node:fs';
+import { writeFileSync, symlinkSync, mkdtempSync, mkdirSync, rmSync, utimesSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it, expect } from 'vitest';
@@ -11,7 +11,7 @@ const DAY = 86400000;
 let root, runs, drive, settings;
 const NOW = Date.parse('2026-11-03T12:00:00-05:00');
 const put = (id, ageDays, patch = {}) => {
-  writeRun({ ...newRunRecord({ id, op: patch.op ?? 'x' }), ...patch }, runs);
+  writeRun({ ...newRunRecord({ id, op: patch.op ?? 'x' }), cursor: 1, ...patch }, runs);
   const t = (NOW - ageDays * DAY) / 1000;
   utimesSync(join(runs, `${id}.json`), t, t);
 };
@@ -83,7 +83,7 @@ describe('runsRetention', () => {
     put('run-old', 30);
     const r = base({ tarCreate: (dest, dir, names, codec) => {
       defaultTarCreate(dest, dir, names, codec);
-      const t = NOW / 1000; utimesSync(join(dir, names[0]), t, t);
+      writeFileSync(join(dir, names[0]), '{"changed":true}');
     } });
     expect(r.deleted).toBe(0); expect(listRunIds(runs)).toEqual(['run-old']);
   });
@@ -100,6 +100,21 @@ describe('runsRetention', () => {
     mkdirSync(join(drive, '..'), { recursive: true }); mkdirSync(join(drive, '..', '.runs-retention.lock'));
     const r = base();
     expect(r.status).toBe('skipped'); expect(listRunIds(runs)).toEqual(['run-old']);
+  });
+
+  it('keeps a never-advanced (cursor 0) record and skips symlinks', () => {
+    put('run-zero', 30, { cursor: 0 });
+    put('run-real', 30);
+    symlinkSync(join(runs, 'run-real.json'), join(runs, 'run-link.json'));
+    const r = base();
+    expect(listRunIds(runs).sort()).toEqual(['run-link', 'run-zero']);
+    expect(r.deleted).toBe(1);
+  });
+
+  it('a content mismatch in the archive blocks deletion', () => {
+    put('run-old', 30);
+    const r = base({ verifyContents: () => { throw new Error('archive content mismatch'); } });
+    expect(r.deleted).toBe(0); expect(listRunIds(runs)).toEqual(['run-old']);
   });
 
   it('settings: defaults to 14 days / 30 GiB; env overrides; invalid throws', () => {

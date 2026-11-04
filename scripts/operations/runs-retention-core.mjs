@@ -5,7 +5,7 @@
  *   a `--resume` could need, or anything newer than keepDays. Dry-run (the default) reports counts and bytes only.
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, lstatSync, linkSync, rmdirSync, unlinkSync, rmSync, statSync, statfsSync, writeFileSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, lstatSync, linkSync, rmdirSync, unlinkSync, rmSync, statSync, statfsSync, writeFileSync, mkdtempSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -70,6 +70,18 @@ function defaultTarList(file, codec) {
   if (r.status !== 0) throw new Error(`tar list failed: ${String(r.stderr).split('\n')[0]}`);
   return String(r.stdout).split('\n').filter(Boolean);
 }
+function defaultVerify(file, batch, codec) {
+  const tmp = mkdtempSync(join(tmpdir(), 'runs-retention-verify-'));
+  try {
+    const r = spawnSync('tar', ['-x', codec.flag, '-f', file, '-C', tmp], { maxBuffer: 64 * 1024 * 1024 });
+    if (r.status !== 0) throw new Error(`tar extract failed: ${String(r.stderr).split('\n')[0]}`);
+    for (const f of batch) {
+      const p = join(tmp, f.name);
+      const l = lstatSync(p);
+      if (!l.isFile() || hashOf(p) !== f.hash) throw new Error(`archive content mismatch for ${f.name}; originals retained`);
+    }
+  } finally { rmSync(tmp, { recursive: true, force: true }); }
+}
 const defaultFreeGiB = dir => { const s = statfsSync(dir); return (s.bavail * s.bsize) / GIB; };
 
 /**
@@ -84,6 +96,7 @@ export function runsRetention(o = {}) {
   const codec = o.codec ?? defaultCodec();
   const tarCreate = o.tarCreate ?? defaultTarCreate, tarList = o.tarList ?? defaultTarList;
   const freeGiB = o.freeGiB ?? defaultFreeGiB;
+  const verifyContents = o.verifyContents ?? defaultVerify;
   const out = { status: dryRun ? 'dry-run' : 'archived', dryRun, scanned: 0, eligible: 0, eligibleBytes: 0,
     kept: { young: 0, nonTerminal: 0, resumable: 0, unreadable: 0 }, archived: 0, deleted: 0, bytesFreed: 0, archives: [], errors: [], months: {} };
   const cutoff = now - settings.keepDays * DAY;
@@ -92,13 +105,14 @@ export function runsRetention(o = {}) {
   const byMonth = new Map();
   for (const id of ids) {
     let st;
-    try { st = statSync(runPath(id, dir)); } catch { out.kept.unreadable++; continue; }
+    try { st = lstatSync(runPath(id, dir)); } catch { out.kept.unreadable++; continue; }
     if (!st.isFile() || st.mtimeMs >= cutoff) { out.kept.young++; continue; }
     const month = monthOf(st.mtimeMs);
     if (o.month && month !== o.month) continue;
     let record;
     try { record = tryReadRun(id, dir); } catch { out.kept.unreadable++; continue; }
-    if (!record || !isRunRecordTerminal(record)) { out.kept.nonTerminal++; continue; }
+    // cursor 0 = never advanced: a resume would restart it, so it is not treated as finished history.
+    if (!record || !isRunRecordTerminal(record) || !(record.cursor > 0)) { out.kept.nonTerminal++; continue; }
     if (reviewRunMayResume(record)) { out.kept.resumable++; continue; }
     // PR evidence outlives the cursor (same rule as pruneTerminalRuns): retained unless the setting opts in.
     if (!settings.archivePrEvidence && record.effects.some(e => e?.result?.pr)) { out.kept.resumable++; continue; }
@@ -145,6 +159,8 @@ export function runsRetention(o = {}) {
         const listed = tarList(partial, codec).map(x => x.replace(/^\.\//, '')).sort();
         const want = [...names].sort();
         if (listed.length !== want.length || listed.some((x, i) => x !== want[i])) throw new Error('archive read-back mismatch; originals retained');
+        // Content read-back: extract and compare every entry's hash with the source hash taken at selection.
+        verifyContents(partial, batch, codec);
         // Reserve an unused final name atomically: link() fails on EEXIST, so no verified archive is ever replaced.
         let final;
         for (let n = 1; n < 10000 && !final; n++) {
@@ -156,12 +172,19 @@ export function runsRetention(o = {}) {
         if (!mountSame()) throw new Error('archive mount changed; originals retained');
         out.archives.push(final); out.archived += names.length;
         for (const f of batch) {
+          const path = runPath(f.id, dir), held = join(dir, `.retiring-${f.id}.${randomUUID()}`);
           try {
-            const now2 = statSync(runPath(f.id, dir));
-            if (now2.mtimeMs !== f.mtimeMs || now2.size !== f.size || now2.ino !== f.ino || hashOf(runPath(f.id, dir)) !== f.hash) { out.kept.young++; continue; } // a writer advanced it
-            rmSync(runPath(f.id, dir), { force: true });
-            out.deleted++; out.bytesFreed += f.size;
-          } catch { /* vanished: nothing to free */ }
+            // Move the record AWAY first (atomic): a writer replacing it now creates an independent new file, and
+            // the exact inode we hash is the one we delete. A changed record is put back, never destroyed.
+            renameSync(path, held);
+            if (hashOf(held) === f.hash && lstatSync(held).isFile()) { unlinkSync(held); out.deleted++; out.bytesFreed += f.size; }
+            else {
+              out.kept.young++;
+              try { linkSync(held, path); unlinkSync(held); } catch { out.errors.push(`${f.id}: changed after archive; kept at ${held}`); }
+            }
+          } catch (e) {
+            if (e.code !== 'ENOENT') out.errors.push(`${f.id}: delete failed (${e.code ?? e.message}); original retained`);
+          }
         }
       } catch (e) { if (partial) rmSync(partial, { force: true }); out.errors.push(`${month}: ${e.message}`); out.status = 'partial'; return out; }
     }
