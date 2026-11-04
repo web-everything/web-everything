@@ -927,7 +927,7 @@ export function runnerInvocation(head) {
       i += 1;
       continue;
     }
-    if (w === 'exec' || w === 'dlx') { sawExec = true; i += 1; continue; }
+    if (w === 'exec' || w === 'dlx' || (runner === 'npm' && w === 'x' && !sawRun && !sawExec)) { sawExec = true; i += 1; continue; }
     if (w === 'workspace' || w === 'workspaces') { i += 2; continue; }  // `yarn workspace <name> <rest…>`
     if (w === 'run' || w === 'run-script') { sawRun = true; i += 1; continue; }
     break;                                                    // the subcommand / script-name position
@@ -3263,7 +3263,9 @@ const VITEST_WATCH_FLAG = /^(?:--watch|-w)(?:=(?:true|1|yes|on))?$/i;
 const NPM_SCOPE_VALUE_FLAGS = new Set(['-w', '--workspace', '--prefix', '-C']);
 const NPM_SCOPE_BARE_FLAG = /^(?:-ws|--workspaces|--include-workspace-root|-iwr)$/;
 const NODE_SCRIPT_WORD = /\.(?:[cm]?js|ts)$/;
-const NODE_SCRIPT_VALUE_FLAGS = new Set(['--require', '-r', '--import', '--loader', '--experimental-loader']);
+const NODE_SCRIPT_VALUE_FLAGS = new Set(['--require', '-r', '--import', '--loader', '--experimental-loader',
+  '--test-reporter', '--test-reporter-destination', '--test-name-pattern', '--test-skip-pattern',
+  '--test-shard', '--test-concurrency', '--test-timeout']);
 
 /** How many leading words of a canonical head are exec wrappers `canonicalCommand` does not peel
  *  (`timeout [opts] <duration>`, and the `-n <N>` it leaves behind after peeling `nice`)? `nohup` is left
@@ -3333,45 +3335,66 @@ function oneShotVitest(command) {
   return out;
 }
 
-/** Classify only the executable head, never a tool name mentioned in an argument. */
-function ungatedHeavyHead(head, depth = 0) {
+/** Normalize executable wrappers, Node options and runner spellings identically for both heavy guards.
+ *  Node inspection/eval modes stop here: their arguments must never become executable heads. */
+function normalizeHeavyHead(head, depth = 0) {
   if (depth > 8) return null;
   const words = headWords(head);
   const w = words.map((word) => word.text);
   const wrapped = execWrapperWords(w);
-  if (wrapped && words[wrapped]) return ungatedHeavyHead(canonicalCommand(head.slice(words[wrapped].start)), depth + 1);
+  if (wrapped && words[wrapped]) return normalizeHeavyHead(canonicalCommand(head.slice(words[wrapped].start)), depth + 1);
+  if (VITEST_WORD.test(w[0] || '')) return { head: 'vitest' + head.slice(words[0].end) };
+  if (w[0] === 'node') {
+    // Only the script position is executable. --check/-c and eval arguments are not scripts.
+    let i = 1;
+    let testRun = false;
+    while (w[i]?.startsWith('-') && w[i] !== '--') {
+      if (/^(?:--check|-c|--eval|-e|--print|-p|--version|-v|--help|-h)(?:=|$)/.test(w[i])) return null;
+      const flag = w[i];
+      i += 1;
+      // --test is a boolean runtime option, not a value-taking flag or a script argument.
+      if (/^--test(?:=|$)/.test(flag)) { testRun = true; continue; }
+      // Known value options consume even script-like values (or a value spelled `--test`).
+      if (NODE_SCRIPT_VALUE_FLAGS.has(flag) || flag === '--title') i += 1;
+      // a separate option value (`--title standards`, `--env-file .env`, `--max-old-space-size 4096`) is not the script
+      // Known extensionless executable paths are scripts too, not option values.
+      else if (!flag.includes('=') && w[i] && !w[i].startsWith('-') && !NODE_SCRIPT_WORD.test(w[i])
+        && !VITEST_NODE_ENTRY.test(w[i])) i += 1;
+    }
+    if (testRun) return { head, kind: 'node-test' };
+    if (w[i] === '--') i += 1;
+    if (/(?:^|\/)check-standards\.mjs$/.test(w[i] || '')) {
+      return { head, kind: 'standards', tail: head.slice(words[i].end).trim() };
+    }
+    if (VITEST_NODE_ENTRY.test(w[i] || '')) {
+      return normalizeHeavyHead('vitest' + head.slice(words[i].end), depth + 1);
+    }
+    return { head }; // Includes heavy-admission: its child is an argument, not the executable.
+  }
+  const inv = runnerInvocation(head);
+  if (inv?.exec) return normalizeHeavyHead(canonicalCommand(inv.exec), depth + 1);
+  // pnpm/yarn/bun resolve bare tool names to their bins (npm does not).
+  if (w[0] !== 'npm' && inv?.names?.length === 1 && VITEST_WORD.test(inv.names[0])) {
+    return normalizeHeavyHead(inv.names[0] + head.slice(words[w.indexOf(inv.names[0], 1)].end), depth + 1);
+  }
+  return { head };
+}
+
+/** Classify only the executable head, never a tool name mentioned in an argument. */
+function ungatedHeavyHead(head) {
+  const normalized = normalizeHeavyHead(head);
+  if (!normalized) return null;
+  if (normalized.kind) return normalized;
+  head = normalized.head;
+  const words = headWords(head);
+  const w = words.map((word) => word.text);
   if (VITEST_WORD.test(w[0] || '')) {
     // `related` selects tests, but still starts workers; --changed does too.
     if (VITEST_NON_RUN_SUBCOMMANDS.has(w[1]) && w[1] !== 'related') return null;
     if (w.slice(1).some((arg) => /^(?:--version|-v|--help|-h)$/.test(arg))) return null;
     return { kind: 'vitest', watch: w[1] === 'watch' || w[1] === 'dev' || w.slice(1).some((arg) => VITEST_WATCH_FLAG.test(arg)) };
   }
-  if (w[0] === 'node') {
-    // Only the script position is executable. --check/-c and eval arguments are not scripts.
-    let i = 1;
-    while (w[i]?.startsWith('-') && w[i] !== '--') {
-      if (/^(?:--check|-c|--eval|-e|--print|-p)(?:=|$)/.test(w[i])) return null;
-      const flag = w[i];
-      i += 1;
-      if (NODE_SCRIPT_VALUE_FLAGS.has(flag)) i += 1;
-      // a separate option value (`--title standards`, `--env-file .env`, `--max-old-space-size 4096`) is not the script
-      else if (!flag.includes('=') && w[i] && !w[i].startsWith('-') && !NODE_SCRIPT_WORD.test(w[i])) i += 1;
-    }
-    if (w[i] === '--') i += 1;
-    if (/(?:^|\/)check-standards\.mjs$/.test(w[i] || '')) {
-      return { kind: 'standards', tail: head.slice(words[i].end).trim() };
-    }
-    if (VITEST_NODE_ENTRY.test(w[i] || '')) {
-      return ungatedHeavyHead('vitest' + head.slice(words[i].end), depth + 1);
-    }
-    return null; // Includes heavy-admission: its child is an argument, not the executable.
-  }
   const inv = runnerInvocation(head);
-  if (inv?.exec) return ungatedHeavyHead(canonicalCommand(inv.exec), depth + 1);
-  // pnpm/yarn/bun resolve a bare `vitest` script name to the vitest bin (npm does not).
-  if (w[0] !== 'npm' && inv?.names?.length === 1 && VITEST_WORD.test(inv.names[0])) {
-    return ungatedHeavyHead('vitest' + head.slice(words[w.indexOf(inv.names[0], 1)].end), depth + 1);
-  }
   let at = -1;
   const scope = []; // npm's package-selecting options (`-w x`, `--prefix x`, …), kept in the replacement
   if (w[0] === 'npm') { // runner flags may precede the subcommand: `npm -s test`, `npm --prefix . test`
@@ -3474,9 +3497,12 @@ const HEAVY_ADMISSION_SCRIPT = /(?:^|\/)heavy-admission\.mjs$/;
  * @returns {boolean}
  */
 export function isFullSuiteHead(head, depth = 0) {
-  const h = String(head || '');
+  if (depth > 8) return false;
+  const normalized = normalizeHeavyHead(canonicalCommand(String(head || '')));
+  if (!normalized || normalized.kind) return false;
+  const h = normalized.head;
   const words = headWords(h);
-  if (!words.length || depth > 3) return false;
+  if (!words.length) return false;
   const w = words.map((x) => x.text);
   if (w[0] === 'node' && HEAVY_ADMISSION_SCRIPT.test(w[1] || '') && w[2] === 'run') {
     const k = w[3] === '--' ? 4 : 3;
@@ -3488,13 +3514,11 @@ export function isFullSuiteHead(head, depth = 0) {
     const inv = runnerInvocation(h);
     return !!(inv && Array.isArray(inv.names) && inv.names.some((n) => FULL_SUITE_SCRIPTS.has(n)));
   }
-  // vitest's own entry scripts behind `node` (`node node_modules/vitest/dist/cli.js`) are the same bare run.
-  if (w[0] === 'node' && VITEST_NODE_ENTRY.test(w[1] || '')) return isFullSuiteHead('vitest' + h.slice(words[1].end), depth + 1);
   if (RUNNER_NAMES.has(w[0])) {
+    const inv = runnerInvocation(h);
     let idx = -1;
     if (w[0] === 'npm' && ['test', 't', 'tst'].includes(w[1])) { idx = 1; w[1] = 'test'; }
     else {
-      const inv = runnerInvocation(h);
       const name = inv && Array.isArray(inv.names) && inv.names.length === 1 ? inv.names[0] : null;
       if (name) idx = w.indexOf(name, 1);
       if (idx > 0 && (name === 't' || name === 'tst')) w[idx] = 'test';

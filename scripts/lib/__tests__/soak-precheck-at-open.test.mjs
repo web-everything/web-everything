@@ -14,9 +14,10 @@ describe('soak precheck at PR open', () => {
   it('refuses a daemon fix without replay evidence with actionable instructions', () => {
     const verdict = soakPrecheckAtOpen(fix);
     expect(verdict).toMatchObject({ ok: false, applicable: true });
-    for (const text of ['soak-waiver:', 'scripts/conveyor/soak/breaks/', '--body-file', SOAK_PRECHECK_ENV]) {
+    for (const text of ['scripts/conveyor/soak/breaks/', SOAK_PRECHECK_ENV]) {
       expect(verdict.message).toContain(text);
     }
+    expect(verdict.message.toLowerCase()).not.toContain('waiver');
     expect(HOME_REASONS['soak-declaration']).toBe('refused');
   });
   it('passes with a waiver line', () => {

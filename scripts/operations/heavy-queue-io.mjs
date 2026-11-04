@@ -20,6 +20,8 @@
  * throwing — a heavy-command holder/waiter can legitimately finish between the admission read and this
  * follow-up read, and a stale row should read as "unknown", never crash the whole report.
  */
+import { join } from 'node:path';
+import { readTailBytes } from './telemetry-summary-io.mjs';
 import { execFileSync } from 'node:child_process';
 import {
   admissionStatus, admissionLockRoot, resolveCap, readLaneLease, isRankableWaiter, resolveQueueBaseline, resolveFastSlots,
@@ -88,6 +90,23 @@ function buildRawRow(entry, resolveRepo, { readCommand, isAncestorCached, readLe
   };
 }
 
+/** Read the bounded diagnostic log; missing/torn/malformed records carry no count. */
+function readRemoteFallbacks(lockRoot, nowMs) {
+  const byReason = Object.create(null);
+  let total = 0;
+  try {
+    for (const line of readTailBytes(join(lockRoot, 'remote-fallbacks.jsonl'), 1024 * 1024).split('\n')) {
+      try {
+        const row = JSON.parse(line), ts = Date.parse(row.ts);
+        if (!Number.isFinite(ts) || ts < nowMs - 86400000 || ts > nowMs || typeof row.reason !== 'string' || !row.reason) continue;
+        byReason[row.reason] = (byReason[row.reason] ?? 0) + 1;
+        total++;
+      } catch { /* skip malformed line */ }
+    }
+  } catch { /* no readable history yet */ }
+  return {total, byReason};
+}
+
 /**
  * The real collector — the ONE function `run.mjs` binds to the `heavy-queue` operation's `collect` dep.
  * @param {{repo?:string, env?:NodeJS.ProcessEnv, now?:() => number, readAdmission?:Function,
@@ -130,6 +149,6 @@ export function collectHeavyQueue({
   return {
     observedAt: new Date(nowMs).toISOString(),
     cap: status.cap, fastSlots: status.fastSlots ?? 0, heldCount: status.heldCount, freeCount: status.freeCount, staleWaiting: status.staleWaiting,
-    held, waiting, queue,
+    held, waiting, queue, remoteFallbacks: readRemoteFallbacks(lockRoot, nowMs),
   };
 }

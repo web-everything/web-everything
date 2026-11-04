@@ -10,6 +10,7 @@
  *   It reads and acts on nothing. FAIL CLOSED: anything unknown, malformed or throwing is an `operator` item, and no
  *   automatic lane ever produces `not-real`, `clear-human`, `accept` or `supersede`.
  */
+import { planPendingRedTeam } from '../lib/red-team-pending-watchdog.mjs';
 import { validateVerdict, isGuardPath, proposeFix } from '../lib/round-judge.mjs';
 import { MAX_TOTAL_ROUND_EXTENSIONS } from './round-extension-mark.mjs';
 import { nextActions } from '../operations/pr-sweep-core.mjs';
@@ -34,16 +35,18 @@ export function demoteNeverAutomatic(item, operatorCommand) {
  *   - `stateLanes`: per waiting state, `auto` (the mapping below) or `operator` (always ask a person).
  *   - `systemActions` / `policyActions`: turn each automatic action on or off; off sends the item to the operator.
  *   - `grantCeiling`: most rounds granted in total, 1..MAX_TOTAL_ROUND_EXTENSIONS (lowers the shared ceiling, never raises).
+ *   - `maxRedTeamRestartsPerHead`: separate restart budget, 0..2; zero routes orphaned heads to the operator.
  *   - `maxFixListLines`: the longest fix list a policy block may carry (1..20: it can only lower the standard).
  *   - `staleHoldAutoResume`: a stale hold is the system's (true) or the operator's (false).
  */
 export const CLASSIFY_DEFAULTS = Object.freeze({
-  staleHoldAutoResume: false, grantCeiling: MAX_TOTAL_ROUND_EXTENSIONS, maxFixListLines: 20, stateLanes: Object.freeze({}),
-  systemActions: Object.freeze({ 'await-ledger-outbox': true, 'resume-stale-hold': true, 'rerun-red-team-gate': true, 'ask-review-daemon': true, 'tooling-card': true }),
+  maxRedTeamRestartsPerHead: 2, staleHoldAutoResume: false, grantCeiling: MAX_TOTAL_ROUND_EXTENSIONS, maxFixListLines: 20, stateLanes: Object.freeze({}),
+  systemActions: Object.freeze({ 'await-ledger-outbox': true, 'resume-stale-hold': true, 'rerun-red-team-gate': true, 'ask-review-daemon': true, 'tooling-card': true, 'restart-red-team': true, 'publish-red-team-result': true }),
   policyActions: Object.freeze({ grant: true, card: true, block: true }),
 });
 /** Validators for each classifier setting leaf (shared with the sweep's cascade, so a bad value is refused there too). */
 export const CLASSIFY_VALID = Object.freeze({
+  maxRedTeamRestartsPerHead: (v) => Number.isSafeInteger(v) && v >= 0 && v <= 2,
   staleHoldAutoResume: (v) => typeof v === 'boolean',
   grantCeiling: (v) => Number.isSafeInteger(v) && v >= 1 && v <= MAX_TOTAL_ROUND_EXTENSIONS,
   maxFixListLines: (v) => Number.isSafeInteger(v) && v >= 1 && v <= 20,
@@ -122,7 +125,7 @@ const keyOf = (row, head) => `${row.repo}#${row.number}@${String(head ?? '').toL
 const fill = (cmd) => (typeof cmd === 'string' ? cmd : null);
 /** Guard code for THIS policy, on top of the shared roster (`isGuardPath`): the judge, the round ceiling, the ruling and
  *  grant writers, and the stall sweep itself. A PR that edits the rules policy acts under is never acted on by policy. */
-const POLICY_FILE = /(?:^|\/)(?:round-judge[\w-]*|round-extension-mark|extend-rounds[\w-]*|record-referral-ruling[\w-]*|pr-stall-[\w-]+|referral-card-readable|marker-authorship|pr-sweep-core)\.mjs$/;
+const POLICY_FILE = /(?:^|\/)(?:round-judge[\w-]*|round-extension-mark|extend-rounds[\w-]*|record-referral-ruling[\w-]*|pr-stall-[\w-]+|referral-card-readable|marker-authorship|pr-sweep-core|red-team-pending-watchdog)\.mjs$/;
 const guarded = (p) => isGuardPath(p) || POLICY_FILE.test(p);
 /** A plain record: an array (or anything else) dressed up with the right fields is not one. */
 const isRec = (x) => !!x && typeof x === 'object' && !Array.isArray(x);
@@ -162,8 +165,8 @@ function classifyUnsafe(o = {}) {
   const rawSettings = o.settings; // read once: a getter must not validate one value and serve another
   const cfg = classifySettings(rawSettings === undefined ? {} : rawSettings);
   // Every other input is read ONCE into plain data (getters run once, here): what is validated is what is used.
-  const { row, head = '', verdict = null, files = [], card = null, grantsSoFar } = strictClone({ row: o.row, head: o.head, verdict: o.verdict ?? null,
-    files: o.files ?? [], card: o.card ?? null, grantsSoFar: o.grantsSoFar });
+  const { row, head = '', verdict = null, files = [], card = null, grantsSoFar, redTeam } = strictClone({ row: o.row, head: o.head, verdict: o.verdict ?? null,
+    files: o.files ?? [], card: o.card ?? null, grantsSoFar: o.grantsSoFar, redTeam: o.redTeam });
   if (!isRec(row) || typeof row.repo !== 'string' || !/^[\w-]+\/[\w-][\w.-]*$/.test(row.repo) || repoKeyForSlug(row.repo) === null
     || !Number.isSafeInteger(row.number) || row.number <= 0 || typeof row.waitingOn !== 'string' || !row.waitingOn) {
     throw new Error('unreadable row');
@@ -209,7 +212,18 @@ function classifyUnsafe(o = {}) {
   if (state === 'red-team-sent-back-cleared') return out('system', 'rerun-red-team-gate', 'a confirmed red-team break was sent back but no fixer owns it; the gate re-sends it');
   // System nudges never rule on anything, so a guard file does not stop them (it stops every POLICY action, below).
   if (REVIEW_WAITS.has(state)) {
-    return row.liveJob ? null : out('system', 'ask-review-daemon', `waiting on the ${row.actor === 'red-team' ? 'red team' : 'reviewer'} with no live job; ask the review daemon once for this head`,
+    if (['red-team-pending', 'drain-skip:red-team-pending'].includes(state) && redTeam !== undefined) {
+      const plan = planPendingRedTeam(redTeam && typeof redTeam === 'object' && !Array.isArray(redTeam)
+        ? { ...redTeam, maxRestarts: cfg.maxRedTeamRestartsPerHead } : redTeam);
+      if (plan.kind === 'wait') return null;
+      if (plan.kind === 'owner-unknown') return operator('red-team-owner-unknown', plan.reason);
+      if (plan.kind === 'exhausted') return operator('red-team-restart-exhausted', plan.reason);
+      if (row.liveJob) return null;
+      if (plan.kind === 'publish-result') return out('system', 'publish-red-team-result', plan.reason);
+      return out('system', 'restart-red-team', plan.reason, { key: `${key}:restart-${redTeam.restarts + 1}` });
+    }
+    if (row.liveJob) return null;
+    return out('system', 'ask-review-daemon', `waiting on the ${row.actor === 'red-team' ? 'red team' : 'reviewer'} with no live job; ask the review daemon once for this head`,
       { onceKey: `${row.repo}#${row.number}@${head.toLowerCase()}:ask-review-daemon` });
   }
   if (OPERATOR_STATES[state]) return operator(state, OPERATOR_STATES[state]);
@@ -241,6 +255,7 @@ function judged({ head, verdict, trigger, files, card, grantsSoFar, acts, out, o
 
   switch (verdict.verdict) {
     case 'escalate': return operator('escalate', `the judge escalated: ${why}`);
+    case 'non-converging': return operator('non-converging', `the judge marks the PR non-converging (a new finding class each round); redesign, not round 3: ${why}`);
     case 'suggest-split': return operator('suggest-split', `the judge suggests splitting the PR: ${why}`);
     case 'not-real-verified': return operator('suggest-not-real', `every finding was mechanically refuted; only a person rules not-real (${(verdict.proof ?? []).slice(0, 2).join(' | ')})`,
       trigger === 'referral-hold' ? acts.referralRuling.command : acts.redTeamRuling.command);

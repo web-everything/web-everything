@@ -74,6 +74,25 @@ export function isAllowedCommand(argv) {
   return allowedCommand(argv);
 }
 
+/** Strip leading ./ from Vitest file arguments without changing execution policy. */
+export function normalizeRemoteArgv(argv) {
+  if (!Array.isArray(argv) || !argv.every(arg => typeof arg === 'string')
+    || argv[0] !== 'npx' || argv[1] !== 'vitest' || !['run', 'related'].includes(argv[2])) return argv;
+  const normalized = argv.slice(0, 3);
+  for (let i = 3; i < argv.length; i++) {
+    const arg = argv[i];
+    // These two-token options take values, not positional file filters.
+    if (arg === '-t' || arg === '--config') {
+      normalized.push(arg);
+      if (++i < argv.length) normalized.push(argv[i]);
+    } else {
+      // A positional path must never become an option when its prefix is removed.
+      normalized.push(arg.startsWith('./') && !arg.slice(2).startsWith('-') ? arg.slice(2) : arg);
+    }
+  }
+  return normalized;
+}
+
 export function filterEnv(env = {}) {
   if (Object.hasOwn(env, 'DIFF_COVERAGE_BASE') && !allowedEnv({DIFF_COVERAGE_BASE:env.DIFF_COVERAGE_BASE}))
     throw Object.assign(new Error('Invalid DIFF_COVERAGE_BASE: use local fallback'), {code:'invalid-diff-coverage-base'});
@@ -1057,6 +1076,7 @@ export async function runRemote(options={}) {
 
 async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, onRun, log = text=>process.stderr.write(text) } = {}) {
   const fallback = (reason, detail) => ({ mode: 'not-started', terminated: true, reason, detail });
+  argv = normalizeRemoteArgv(argv);
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed');
   let executionEnv;
   try { executionEnv = filterEnv(env); } catch (error) { return fallback(error.code); }
@@ -1319,7 +1339,8 @@ export function verifyReceipt(text, expected, code) {
 
 /** Explicit remote CLI request; the shared decision contract owns safe local admission. */
 export async function main(options = {}) {
-  if (!isAllowedCommand(options.argv)) throw new Error('command-not-allowed: use npm run <allowed-task> -- <task-args>');
+  const remoteArgv = normalizeRemoteArgv(options.argv);
+  if (!isAllowedCommand(remoteArgv)) throw new Error('command-not-allowed: use npm run <allowed-task> -- <task-args>');
   // Import at invocation time: heavy-admission's default executor imports us.
   const { runWithRemoteDecision, loadAdmissionPolicy, adaptLegacyRemoteResult } = await import('./heavy-admission.mjs');
   const loaded = loadAdmissionPolicy({env:options.env,checkoutRoot:options.cwd});
@@ -1332,7 +1353,7 @@ export async function main(options = {}) {
     argv:options.argv, cwd:options.cwd, env:options.env, policy,
     timeoutMs:options.timeoutMs, log:options.log,
     host:options.host, readTelemetry:options.readTelemetry, lockRoot:options.lockRoot, clock:options.clock,
-    remoteExec:async decisionOptions=>{const value=await remoteExecutor(decisionOptions);capturedTimings=value?.timings;return value;},
+    remoteExec:async decisionOptions=>{const value=await remoteExecutor({...decisionOptions,argv:remoteArgv});capturedTimings=value?.timings;return value;},
   });
   if(capturedTimings?.length)(options.stderr??(text=>process.stderr.write(text)))(['forge stages (Eastern) | ms | transfer',...capturedTimings.map(t=>`${t.stage} ${t.startedAtET} | ${t.ms}${t.shipMode ? ` | ${t.shipMode} ${t.fileCount} files ${t.bytesSent} bytes${t.presyncClaimed?` presynced ${t.presyncClaimed.count} files ${t.presyncClaimed.bytes} bytes`:''}`:''}${t.substages?.length ? `\n${t.substages.map(s=>`  ${s.stage} | ${s.ms}`).join('\n')}`:''}`)].join('\n')+'\n');
   if (result.handled) return result.exitCode;

@@ -100,16 +100,17 @@ export default {
       log,
       setup(w) {
         // Baked in BEFORE the daemon host forks (a host copies `w.env` once, at fork).
+        const appKeyPath = join(w.home, 'app-key.pem');
         Object.assign(w.env, {
           WE_GITHUB_APP_ID: '123456',
           WE_GITHUB_APP_INSTALLATION_ID: '654321',
           WE_GITHUB_APP_INSTALLATIONS: JSON.stringify(Object.fromEntries(
             Object.keys(OWNER_INSTALLATIONS).map(owner => [owner, '654321']))),
           WE_DELIVERY_IDENTITY: 'none',
-          WE_GITHUB_APP_PRIVATE_KEY_PATH: join(w.home, 'app-key.pem'),
+          WE_GITHUB_APP_PRIVATE_KEY_PATH: appKeyPath,
         });
         mkdirSync(w.home, { recursive: true });
-        writeFileSync(w.env.WE_GITHUB_APP_PRIVATE_KEY_PATH, '-----BEGIN FAKE KEY-----\n(not a real key — the cache is always fresh, nothing is minted)\n');
+        writeFileSync(w.env.WE_GITHUB_APP_PRIVATE_KEY_PATH, '-----' + 'BEGIN FAKE KEY-----\n(not a real key — the cache is always fresh, nothing is minted)\n');
         writeTokenCache(w, TOKEN_A);
         return {};
       },

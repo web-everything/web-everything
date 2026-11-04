@@ -64,7 +64,7 @@ import { VERIFY_DAEMON_LEASE_KEY } from '../skills-src/conveyor/verify-daemon.mj
 import { readLockEntry } from './readiness/file-locks.mjs';
 import { spawn } from 'node:child_process';
 import { createFailureCollector, mergeFailureDetails } from './lib/verify-failures.mjs';
-import { isolatedRetryFailures, describeIsolatedRetry, isolatedRetryAudit, FLAKY_OUTSIDE_DIFF, STILL_RED_IN_ISOLATION, MAX_TIMEOUT_LOG_BYTES } from './lib/gate-timeout-retry.mjs';
+import { isolatedRetryArgv, isolatedRetryFailures, describeIsolatedRetry, isolatedRetryAudit, FLAKY_OUTSIDE_DIFF, STILL_RED_IN_ISOLATION, MAX_TIMEOUT_LOG_BYTES } from './lib/gate-timeout-retry.mjs';
 import * as nodeFs from 'node:fs';
 import { writeFileSync, renameSync, existsSync, readFileSync, readdirSync, unlinkSync, lstatSync, mkdtempSync, rmSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -78,14 +78,15 @@ import { writeAllSync } from './lib/write-all-sync.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs } from './lib/lane-git-hardening.mjs';
 import { classifyRedCause, reachesChanged } from './lib/red-cause.mjs';
 import { baseRerunCandidate, measureBaseFailures, classifyPreExisting, runVitestOnBase } from './lib/verify-base-rerun.mjs';
-import { CARD_ONLY_SKIP_GATE, alwaysRunPlan, alwaysRunInventory,matchRequestedDefaultGate, verifySetting, verifySettingSource, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, scaledTimeoutFlags, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
+import { CARD_ONLY_SKIP_GATE, alwaysRunPlan, alwaysRunInventory, gateCommandsEqual, matchRequestedDefaultGate, verifySetting, verifySettingSource, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, scaledTimeoutFlags, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
 import { readAwaitVerifyRecord } from './conveyor/await-verify.mjs';
 import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRedToVerdict } from './lib/verify-revert-red.mjs';
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
-import { phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
+import { SHARD_RUN_SCRIPT, phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
 import { startTreeWatchdog } from './lib/tree-watchdog.mjs';
+import { shellQuote, isShardWrapperCommand } from './lib/verify-lane-gate.mjs';
 import { randomBytes } from 'node:crypto';
 import { summarizeSelection, selectionNotice, verdictNotice } from './lib/verify-selection-log.mjs';
 const verificationInfrastructureFailure = result => baseInfrastructureFailure(result) ?? remoteInfrastructureFailure(result);
@@ -350,6 +351,8 @@ function maybeRecordGreen({ status, treeHash, skipped = null }) {
 }
 // The default gate's selected test half: `vitest related <changed>` or (#5128) a bounded `vitest run <tests>`.
 const SELECTED_TEST_COMMAND = /^npx vitest (?:related|run) /;
+// The sharded form of the same selected-test gate (still retryable, still runs the always-run guards).
+const isSelectedTestCommand = c => SELECTED_TEST_COMMAND.test(c) || String(c).startsWith(`node ${shellQuote(SHARD_RUN_SCRIPT)} `);
 // `run` is the fix / ci-heal reproduce-and-confirm gate (`gateFor`): a card-only PR is CI-red exactly when CI's full
 // check:standards fails on a card, so `run` must execute the real gate. Only the marker-producing modes skip.
 const ALLOW_CARD_ONLY_SKIP = MODE !== 'run';
@@ -437,7 +440,7 @@ if (!resolvedGate && typeof flags.gate === 'string') {
   try {
     const resolveUnder = resolveBuildDefaultGate;
     const resolved = resolveUnder(process.env);
-    if (resolved.command === GATE) resolvedGate = resolved;
+    if (gateCommandsEqual(resolved.command, GATE)) resolvedGate = resolved;
     // The requester (an agent session, often on an older lane base) resolves its default gate under ITS settings,
     // which can differ from this dispatched child's (the daemon's env + checkout file): the standards policy,
     // and (#66) the related-test mode or timeout factor. If the stamped command is exactly what some declared
@@ -454,7 +457,7 @@ if (!resolvedGate && typeof flags.gate === 'string') {
       for (const finalGate of [ours, ours === 'full' ? 'related' : 'full']) {
         const env = finalGate === ours ? process.env : { ...process.env, WE_BUILD_FINAL_GATE: finalGate };
         const base = finalGate === ours ? resolved : resolveUnder(env);
-        resolvedGate = (base.command === GATE ? base : matchRequestedDefaultGate({ gate: GATE, env, resolved: base, resolveUnder, variants })) ?? undefined;
+        resolvedGate = (gateCommandsEqual(base.command, GATE) ? base : matchRequestedDefaultGate({ gate: GATE, env, resolved: base, resolveUnder, variants })) ?? undefined;
         if (resolvedGate) break;
         // #5831 — the requester may have stamped under build.finalGateStandards=selected (no standards half) or with the
         // card-only skip on. `always` pins WE_VERIFY_STANDARDS and the skip, so the matcher's probes cannot reproduce
@@ -474,7 +477,8 @@ if (!resolvedGate && typeof flags.gate === 'string') {
   } catch { /* Unknown selection cannot authorize a retry. */ }
   // #66 — never fall back to whole-gate admission silently: say so on stderr (the dispatcher copies this line into
   // the daemon log) and record the reason in the marker's phases.
-  if (!resolvedGate && MODE === 'verify' && typeof flags['run-id'] === 'string' && SELECTED_TEST_COMMAND.test(GATE)) {
+  // A sharded gate stamped in another checkout carries that checkout's wrapper root, so recognize it root-agnostically.
+  if (!resolvedGate && MODE === 'verify' && typeof flags['run-id'] === 'string' && (isSelectedTestCommand(GATE) || isShardWrapperCommand(GATE))) {
     admissionFallback = 'requested gate is not this checkout\'s default selection under any declared settings variant';
     process.stderr.write(`\n⚠ verify-lane: whole-gate admission — ${admissionFallback}\n`);
   }
@@ -618,7 +622,7 @@ const ADMISSION_CAP = resolveCap(process.env);
 const ADMISSION_TIMEOUT_MS = resolveTimeoutMs(process.env);
 const laneMatch = /lane-(\d+)/.exec(REPO);
 // #verify-phase-admission — acquire the first phase before dispatch's execution marker.
-const retryableGate = SELECTED_TEST_COMMAND.test(resolvedGate?.testCommand ?? '');
+const retryableGate = isSelectedTestCommand(resolvedGate?.testCommand ?? '');
 // The helper resolves environment overrides over the running checkout's cached settings file.
 const phaseAdmission = verifyPhaseAdmissionEnabled(process.env) && retryableGate;
 const admissionPhases = {};
@@ -692,7 +696,7 @@ let editedDuringRun = [];
 let baseCandidate = null;
 let baseFailures = null;
 // The final exit code alone cannot say whether a 124 came from an unconfirmed remote attempt; the phases recorded it.
-const infrastructureNow = (exitCode, signal) => verificationInfrastructureFailure({ exitCode, signal }) ?? (remoteUnconfirmed ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null);
+const infrastructureNow = (exitCode, signal, failureDetails) => verificationInfrastructureFailure({ exitCode, signal, failureDetails }) ?? (remoteUnconfirmed ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null);
 async function runGate(command, args, { forgeDispatch = false } = {}) {
   const reportDir = mkdtempSync(join(tmpdir(), 'verify-remote-report-'));
   const reportFile = join(reportDir, 'report.jsonl');
@@ -917,8 +921,8 @@ try {
       // The isolated run keeps the gate's OWN scaled timeouts: without them vitest falls back to its 5 s default and a
       // load-slow file that passed the main run's 15 s budget times out again alone (ci-heal-4017: still-red at load 25).
       const timeoutFlags = scaledTimeoutFlags(resolvedGate.decision?.testTimeoutFactor ?? 1).split(' ').filter(Boolean);
-      result = await timedRunGate('vitestMs', 'npx', ['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism',
-        ...timeoutFlags, ...retriedFailures.map(f => `./${f.file}`)]);
+      const retryArgv = isolatedRetryArgv(retriedFailures.map(f => f.file), timeoutFlags);
+      result = await timedRunGate('vitestMs', retryArgv[0], retryArgv.slice(1));
       isolatedRetry = result.exitCode === 0 && !result.signal ? FLAKY_OUTSIDE_DIFF : STILL_RED_IN_ISOLATION;
     }
   }
@@ -976,7 +980,7 @@ try {
   // Measured once per main sha (cached); any error leaves `baseFailures` null, i.e. the red stays a real red.
   baseCandidate = baseRerunCandidate({ exitCode, signal, phaseResults, failureDetails,
     changedFiles: Array.isArray(resolvedGate?.decision?.changedFiles) ? [...resolvedGate.decision.changedFiles, ...editedDuringRun] : null });
-  const baseSha = baseCandidate && !infrastructureNow(exitCode, signal) ? tryGit(['rev-parse', 'origin/main']) : null;
+  const baseSha = baseCandidate && !infrastructureNow(exitCode, signal, failureDetails) ? tryGit(['rev-parse', 'origin/main']) : null;
   if (baseSha) {
     process.stderr.write(`Comparing ${baseCandidate.files.length} failing file(s) outside the diff with origin/main @ ${baseSha.slice(0, 8)}\n`);
     baseFailures = await measureBaseFailures({ baseSha, files: baseCandidate.files, cacheDir: join(tmpdir(), 'we-verify-base-failures'),
@@ -1033,7 +1037,7 @@ const retryAudit = isolatedRetryAudit(retriedFailures, isolatedRetry);
 const diagnostic = { ...(exitCode === 0 ? {} : { failureDetails }), ...retryAudit };
 const retryDetail = describeIsolatedRetry(retryAudit);
 // Item 99 — why the gate was red (also when a flaky failure outside the diff went green alone), with the files.
-const infrastructure = verificationInfrastructureFailure({ exitCode, signal, ...(phaseTimeout ? { timedOutPhase: phaseTimeout.phase, ceilingMs: phaseTimeout.ceilingMs, killer: 'verify-lane' } : {}) })
+const infrastructure = verificationInfrastructureFailure({ exitCode, signal, failureDetails, ...(phaseTimeout ? { timedOutPhase: phaseTimeout.phase, ceilingMs: phaseTimeout.ceilingMs, killer: 'verify-lane' } : {}) })
   ?? (remoteUnconfirmed ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null);
 // The gate's own diff plus whatever was edited while it queued or ran (the same set the isolated retry judges against).
 const diffFiles = Array.isArray(resolvedGate?.decision?.changedFiles) ? [...new Set([...resolvedGate.decision.changedFiles, ...editedDuringRun])] : resolvedGate?.decision?.changedFiles;

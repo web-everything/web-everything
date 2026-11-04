@@ -66,7 +66,10 @@ import { runReconcileCiHealDispatch, dispatchCiHeal } from '../../scripts/operat
 import { runReconcilePromoteDraftDispatch } from '../../scripts/operations/promote-draft-pr-dispatch.mjs'; // draft-first PRs, operator-approved 2026-09-27 — see runPromoteDraftDispatchAllRepos below
 import { resolveLiveQueueBaseline } from '../../scripts/readiness/heavy-admission.mjs'; // card xkyw1x4
 import { createQueueBudget } from '../../scripts/readiness/heavy-queue-projection.mjs'; // card xkyw1x4
-import { runReconcilePass, defaultReadPrs, enrichPrsWithCodeQL, PR_LIST_LIMIT } from '../../scripts/conveyor/reconcile-pass.mjs'; // #4191
+import { execFileSyncThrottled } from '../../scripts/lib/gh-throttle.mjs';
+import { readStacksForPass } from '../../scripts/conveyor/pr-stack.mjs';
+import { applyNetScopeToReconcile } from '../../scripts/conveyor/net-scope.mjs';
+import { runReconcilePass, defaultReadPrs, defaultReadAgents, enrichAgents, enrichPrsWithCodeQL, PR_LIST_LIMIT } from '../../scripts/conveyor/reconcile-pass.mjs'; // #4191
 import { createResourceFixThrottle } from '../../scripts/lib/resource-gate.mjs'; // x6nuodj: dynamic fixer cap + host gate via admit()
 import { createDispatchSinks } from '../../scripts/operations/dispatch-lane-io.mjs';
 import { repoProfile } from '../../scripts/lib/repo-profile.mjs';
@@ -727,6 +730,166 @@ export function runMissingRunRecoveryAllRepos({ repos = FIX_DISPATCH_DAEMON_REPO
   return { repos: perRepo, dispatched, refusals };
 }
 
+/** How long (ms) a pass-local reconcile plan may be reused. Older than this, the next phase recomputes. */
+export const RECONCILE_PLAN_MAX_AGE_MS = 15 * 60 * 1000;
+
+/** Key (not a PR number) under which the probe records main's CI state. */
+const MAIN_STATE_KEY = 'main-ci-state';
+
+/** Stable per-PR fingerprint of everything a phase's decision reads live: head, draft, merge state, labels, check state, last activity. */
+function prFingerprint(pr) {
+  const checks = (pr.statusCheckRollup ?? []).map((c) => [c?.name ?? c?.context ?? null, c?.workflowName ?? null, c?.status ?? c?.state ?? null,
+    c?.conclusion ?? null, c?.completedAt ?? c?.startedAt ?? null]).map((row) => JSON.stringify(row)).sort();
+  return JSON.stringify([pr.headRefOid, pr.isDraft, pr.mergeStateStatus ?? null, (pr.labels ?? []).map((l) => l?.name ?? l).sort(), checks, pr.updatedAt]);
+}
+
+/**
+ * Default live probe for plan reuse: one light open-PR list per repo, read DIRECTLY from GitHub. It must never use the
+ * host-shared PR snapshot (valid for ~75 s): that could hide a stand-down comment posted after the plan was made.
+ * Throws when a row lacks `updatedAt`, so the cache fails closed to a full recompute.
+ */
+export function readPlanFingerprints(repo, { exec = (...args) => execFileSyncThrottled(...args) } = {}) {
+  // A wrapper `exec` (not the throttled function itself) makes defaultReadOpenPrs skip the shared snapshot.
+  const rows = defaultReadOpenPrs({ exec, repo: CONSTELLATION_REPOS[repo]?.slug ?? repo, extraFields: ['isDraft', 'labels', 'updatedAt', 'mergeStateStatus'] });
+  if (!Array.isArray(rows) || rows.some((pr) => !pr || typeof pr.updatedAt !== 'string')) throw new Error('plan fingerprint unreadable');
+  const map = new Map(rows.map((pr) => [pr.number, prFingerprint(pr)]));
+  // Main's own CI state feeds the planner's main-red attribution (ci-heal authorization): any change drops every row.
+  const slug = CONSTELLATION_REPOS[repo]?.slug ?? repo;
+  const runs = JSON.parse(String(exec('gh', ['run', 'list', '--branch', 'main', '--limit', '20', '--repo', slug,
+    '--json', 'databaseId,status,conclusion,headSha,attempt,updatedAt'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60e3 }) || 'null'));
+  if (!Array.isArray(runs)) throw new Error('plan main-state unreadable');
+  map.set(MAIN_STATE_KEY, JSON.stringify(runs));
+  return map;
+}
+
+/**
+ * Default live probe for claims and sessions: `claim:<repo>:<pr>` for every live fix/ci-heal claim, and
+ * `agent:<id>` for every live agent session (the planner's liveness gate reads these).
+ */
+export function readPlanClaims({ readAgents = () => enrichAgents(defaultReadAgents()) } = {}) {
+  const out = new Set(listFixDispatchClaims(undefined, { liveOnly: true }).map((c) => `claim:${c.meta.repo}:${c.meta.pr}`));
+  const agents = readAgents();
+  if (!Array.isArray(agents)) throw new Error('plan agent probe unreadable');
+  // The WHOLE enriched session record is the key (identity, cwd, lane HEAD, pid liveness, hung / idle / self-reported
+  // flags, wait state): any change means the planner's liveness reading would differ. Only a growing counter
+  // (`hungAgeMs`) and, for a plain chat session outside a lane clone, its busy/idle flip are left out.
+  for (const a of agents) {
+    const { hungAgeMs: _age, ...record } = a ?? {};
+    const laneBound = a?.kind !== 'interactive' || /[\\/]\.lanes[\\/]/.test(String(a?.cwd ?? ''));
+    if (!laneBound) delete record.status;
+    out.add(`agent:${a?.sessionId ?? a?.pid ?? a?.name}:${JSON.stringify(Object.entries(record).sort(([x], [y]) => (x < y ? -1 : 1)))}`);
+  }
+  return out;
+}
+
+/**
+ * One reconcile plan per repo and compatible planner input per pass, reused by fix, ci-heal, promote-draft and notes.
+ * A READ CACHE only: it lives inside one `runTickAllRepos` call and dies with it. It never authorizes an action, and it fails closed:
+ *  - Every reuse re-probes the repo live (one light PR list plus the live claim set) and compares with the probe taken
+ *    just BEFORE the plan was computed. A PR whose head, draft state, labels or last activity (comments, stand-downs,
+ *    pushes) changed, or that gained a live claim, loses its dispatch/notes/owed rows from the reused plan; refusal
+ *    rows are kept (they only explain). Anything an earlier phase acted on is dropped the same way.
+ *  - A new, changed or removed session discards the cached plan and recomputes liveness. Merely dropping every
+ *    dispatch row would starve later phases whenever fix launches a session, including after auth recovery.
+ *  - A failed probe, a plan older than `maxAgeMs`, or one that cannot be cloned is recomputed in full.
+ *  - Each reader gets its own deep copy.
+ *  - Auto-proceed permission must match. Other planner overrides bypass reuse; their effects cannot be inferred
+ *    from the live fingerprint. `readPrs` alone is ignored because planning always replaces it with a direct read.
+ * Each phase still runs its own live gates (fix claim, fresh per-sha check read, stale-main guard) on top.
+ * @param {{reconcile?:Function, now?:Function, maxAgeMs?:number, readFingerprints?:Function, readClaims?:Function}} [o]
+ */
+export function createReconcilePlanCache({ reconcile = (input) => runReconcilePass(input), now = Date.now,
+  maxAgeMs = RECONCILE_PLAN_MAX_AGE_MS, readFingerprints = readPlanFingerprints, readClaims = readPlanClaims } = {}) {
+  const entries = new Map();
+  const touched = new Map();
+  const probe = (repo) => ({ prs: readFingerprints(repo), claims: readClaims() });
+  const filterRows = (plan, stale) => {
+    for (const key of ['dispatch', 'notes', 'owedTriggers']) if (Array.isArray(plan[key])) {
+      plan[key] = plan[key].filter(row => stale !== 'all' && !stale.has(row?.prNumber ?? row?.pr));
+    }
+    return plan;
+  };
+  // PRs whose live state differs from what the plan saw (or that an earlier phase acted on).
+  const staleSet = (repo, baseline) => {
+    const live = probe(repo);
+    const stale = new Set(touched.get(repo) ?? []);
+    // A session can bind by name or lane HEAD to any PR. Re-plan from live evidence rather than returning an
+    // empty plan: otherwise an unrelated fix session can suppress CI-heal on every pass, even after /login.
+    for (const key of new Set([...live.claims, ...baseline.claims])) {
+      if (key.startsWith('agent:') && live.claims.has(key) !== baseline.claims.has(key)) return 'recompute';
+    }
+    if (live.prs.get(MAIN_STATE_KEY) !== baseline.prs.get(MAIN_STATE_KEY)) return 'all';
+    for (const [pr, fp] of baseline.prs) if (live.prs.get(pr) !== fp) stale.add(pr);
+    for (const [pr] of live.prs) if (!baseline.prs.has(pr)) stale.add(pr);
+    for (const key of live.claims) {
+      if (baseline.claims.has(key)) continue;
+      stale.add(Number(key.split(':').pop()));
+    }
+    return stale;
+  };
+  const read = (repo, allowStandDownAutoProceed = false) => {
+    const entry = entries.get(repo);
+    if (!entry || entry.allowStandDownAutoProceed !== allowStandDownAutoProceed || now() - entry.at > maxAgeMs) return null;
+    try {
+      const stale = staleSet(repo, entry.baseline);
+      if (stale === 'recompute') { entries.delete(repo); return null; }
+      const plan = filterRows(structuredClone(entry.plan), stale);
+      const captured = structuredClone(entry.captured).filter((pr) => stale !== 'all' && !stale.has(pr?.number));
+      return { plan, captured };
+    } catch { entries.delete(repo); return null; }
+  };
+  return {
+    /** Same shape as `runReconcilePass`. Reuses only matching planner inputs, with live-validated copies. */
+    reconcile(input = {}) {
+      const repo = input.repo ?? null;
+      const allowStandDownAutoProceed = input.allowStandDownAutoProceed === true;
+      const cacheable = Object.entries(input).every(([key, value]) => value === undefined
+        || ['repo', 'readPrs', 'allowStandDownAutoProceed'].includes(key));
+      const hit = cacheable ? read(repo, allowStandDownAutoProceed) : null;
+      if (hit) return hit.plan;
+      // Do not let notes reuse the preceding plan if an override or a failed recompute replaces it.
+      entries.delete(repo);
+      let baseline = null;
+      try { baseline = probe(repo); } catch { baseline = null; }
+      let captured = [];
+      const tap = (fn, fallback) => (...args) => { captured = (fn ?? fallback)(...args); return captured; };
+      // Always plan from a DIRECT read taken AFTER the baseline probe. A caller-supplied `readPrs` (the pass's earlier
+      // discovery snapshot) and the host-shared PR snapshot (valid ~75 s) can both predate the baseline, which would let
+      // a newer probe certify older evidence. A wrapper `exec` makes the default reader skip the shared snapshot; the
+      // attribution repo it would otherwise get by identity is passed explicitly. Later stages capture the hydrated
+      // rows for notes.
+      const { readPrs: _discovery, ...fresh } = input;
+      const plan = filterRows(reconcile({ ...fresh,
+        readPrs: tap((o = {}) => defaultReadPrs({ ...o, exec: (...args) => execFileSyncThrottled(...args), attributionRepo: o.attributionRepo ?? o.repo })),
+        excuseMergeGateHolds: tap(input.excuseMergeGateHolds, excusePrMergeGateHolds),
+        enrichCodeQL: tap(input.enrichCodeQL, enrichPrsWithCodeQL) }), touched.get(repo) ?? new Set());
+      try { if (baseline && cacheable) entries.set(repo, { at: now(), baseline, allowStandDownAutoProceed,
+        plan: structuredClone(plan), captured: structuredClone(captured) }); }
+      catch { entries.delete(repo); }
+      return plan;
+    },
+    /** Read-only notes view of a live-validated plan; never reuse an auto-proceed-enabled plan here. */
+    notes(repo) {
+      const hit = read(repo);
+      if (!hit) return null;
+      return { notes: Array.isArray(hit.plan.notes) ? hit.plan.notes : [],
+        prsByNumber: new Map((Array.isArray(hit.captured) ? hit.captured : []).map((pr) => [pr.number, pr])) };
+    },
+    /** Record PRs a phase acted on this pass; later phases will not reuse plan rows for them. */
+    markTouched(results) {
+      for (const d of results?.dispatched ?? results?.dispatch ?? []) {
+        const pr = d?.pr ?? d?.prNumber;
+        if (pr == null) continue;
+        const repos = d.repo == null ? [...entries.keys()] : [d.repo];
+        for (const key of repos) {
+          if (!touched.has(key)) touched.set(key, new Set());
+          touched.get(key).add(pr);
+        }
+      }
+    },
+  };
+}
+
 /**
  * we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs#runTickAllRepos — #xngv3vn (epic #3383/#4075): the
  * daemon's WHOLE per-tick unit of work, composing BOTH halves this daemon now owns — the pre-existing `fix`
@@ -790,12 +953,21 @@ export async function runTickAllRepos({
   // default here would spend one for every dispatched row those fakes produce. The real daemon
   // (`buildCliDaemonEffects`, below) opts in via {@link defaultTagDispatchStatus}.
   tagDispatchStatus = null,
+  // Share compatible plans across fix/ci-heal/promote-draft/notes within this pass (see createReconcilePlanCache).
+  // Default on for the real daemon; injected-tick fixtures keep their historical arguments unless they opt in.
+  reuseReconcilePlan,
+  // Injectable planner under the cache (tests count invocations).
+  reconcilePass = (input) => runReconcilePass(input),
+  // Injectable live probes behind plan reuse (default: one light PR list per repo + the live claim set).
+  readPlanFingerprint = readPlanFingerprints, readPlanClaimSet = readPlanClaims,
   // Injectable clock for the per-phase timing (live 2026-10-09: an untimed 15.7-min pass delayed PR #4624's fix).
   now = Date.now,
 } = {}) {
   const passStart = now();
   const anyTickInjected = [fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick,
     promoteDraftTick, notesTick, awaitVerifyTick, stuckFixerTick, supersedeTick, rulingStandDownTick].some(Boolean);
+  const planCache = (reuseReconcilePlan ?? !anyTickInjected)
+    ? createReconcilePlanCache({ reconcile: reconcilePass, now, readFingerprints: readPlanFingerprint, readClaims: readPlanClaimSet }) : null;
   const phaseMs = {};
   const timed = (name, fn) => { const t = now(); try { return fn(); } finally { phaseMs[name] = now() - t; } };
   const timedAsync = async (name, fn) => { const t = now(); try { return await fn(); } finally { phaseMs[name] = now() - t; } };
@@ -869,7 +1041,7 @@ export async function runTickAllRepos({
     let entries = [];
     return runReconcileCiHealDispatch({ ...options,
       reconcile: (input) => {
-        const plan = runReconcilePass(input);
+        const plan = planCache ? planCache.reconcile(input) : runReconcilePass(input);
         entries = plan.dispatch ?? [];
         return plan;
       },
@@ -928,50 +1100,66 @@ export async function runTickAllRepos({
     if (skippedSteps.includes(step)) { phaseMs[step] = 0; return emptyResult(); }
     return timed(step, fn);
   };
+  // Pass-local plan reuse for the two phases routed through sharedTick (ci-heal and notes are wired below).
+  // Fix keeps its net-scope and stack IO, which it only enables for the identity-equal planner.
+  const reuseOptions = (step, tick) => {
+    if (!planCache || (step !== 'fix' && step !== 'promote-draft')) return {};
+    return { reconcile: planCache.reconcile, ...(step === 'fix' && tick === runReconcileFixDispatch
+      ? { netScope: applyNetScopeToReconcile, prStack: readStacksForPass } : {}) };
+  };
   const sharedTick = (step, tick) => options => {
     const snapshot = snapshots.get(options.repo);
-    if (!snapshot) return tick(options);
+    if (!snapshot) return tick({ ...options, ...reuseOptions(step, tick) });
     const sharedRead = () => structuredClone(snapshot.rows);
     // Re-run each owner's reconciliation reads; only PR discovery is shared.
     const reconcile = input => runReconcilePass({ ...input, readPrs: sharedRead });
     if (step === 'fix' && tick === runReconcileFixDispatch) {
       // Preserve reconcile's identity: fix uses it to enable net-scope and stack IO.
-      return tick({ ...options, readPrs: sharedRead });
+      return tick({ ...options, readPrs: sharedRead, ...reuseOptions(step, tick) });
     }
     const readOpenPrs = input => {
       const fields = input?.extraFields ?? [];
       return snapshot.rows.every(pr => fields.every(field => Object.hasOwn(pr, field)))
         ? sharedRead() : defaultReadOpenPrs(input);
     };
-    return tick({ ...options, readPrs: sharedRead, readOpenPrs, reconcile });
+    return tick({ ...options, readPrs: sharedRead, readOpenPrs, reconcile, ...reuseOptions(step, tick) });
   };
   const fix = stepTimed('fix', () => (authGate.paused ? pausedDispatchResult()
     : runReconcileFixDispatchAllRepos({ repos: stepRepos.get('fix'), allowStandDownAutoProceed,
       tick: sharedTick('fix', fixTick ?? runReconcileFixDispatch),
       ...(fixTick ? {} : { queueAdmission, dispatchThrottle, borrowGate, fixExecutorRoute }) })));
+  planCache?.markTouched(fix);
   // R242 audit round 3: CI-heal must retain its historical flushOwed/flushTimeouts
   // ordering, and notes must write from fresh evidence, even on an empty snapshot.
   // Neither step participates in snapshot sharing or empty-work skipping.
   const ciHeal = await timedAsync('ci-heal', async () => (authGate.paused ? pausedDispatchResult()
-    : await runReconcileCiHealDispatchAllRepos({ repos, ...(ciHealTick ? { tick: ciHealTick } : { tick: routedCiHealTick, queueAdmission, dispatchThrottle }) })));
+    : await runReconcileCiHealDispatchAllRepos({ repos, ...(ciHealTick ? { tick: ciHealTick } : { tick: routedCiHealTick, queueAdmission, dispatchThrottle }),
+      ...(planCache ? { reconcile: planCache.reconcile } : {}) })));
+  planCache?.markTouched(ciHeal);
   if (dispatchThrottle) lastFixQueueLength = fixQueueLengthOf(fix, ciHeal);
   const hungCi = stepTimed('hung-ci', () => runHungCiRecoveryAllRepos({ repos: stepRepos.get('hung-ci'), tick: sharedTick('hung-ci', hungCiTick ?? sweepHungCiRecovery) }));
+  planCache?.markTouched(hungCi);
   // x5uqim1 follow-up (#4075/#3383) — the FOURTH half this daemon now owns: see
   // {@link runMainRedRebaseAllRepos}'s own docblock for why this daemon, specifically, is where it lives (same
   // reason `hungCi` already does — the pass's own `daemon-manifest.mjs` entry has no launchd job installed).
   const mainRedRebase = stepTimed('main-red-rebase', () => runMainRedRebaseAllRepos({ repos: stepRepos.get('main-red-rebase'), tick: sharedTick('main-red-rebase', mainRedRebaseTick ?? sweepCiRedRecovery) }));
+  planCache?.markTouched(mainRedRebase);
   // xi4od2p (#4075/#3383) — the SIXTH half this daemon now owns: see {@link runMissingRunRecoveryAllRepos}'s
   // own docblock for why this daemon, specifically, is where it lives (same reason `hungCi`/`mainRedRebase`
   // already do — the pass's own `daemon-manifest.mjs` entry has no launchd job installed).
   const missingRun = stepTimed('missing-run', () => runMissingRunRecoveryAllRepos({ repos: stepRepos.get('missing-run'), tick: sharedTick('missing-run', missingRunTick ?? sweepMissingRunRecovery) }));
+  planCache?.markTouched(missingRun);
   // draft-first PRs (operator-approved 2026-09-27) — the SEVENTH half this daemon now owns: see
   // {@link runPromoteDraftDispatchAllRepos}'s own docblock for why this daemon, specifically, is where it
   // lives (same reason `hungCi`/`mainRedRebase`/`missingRun` already do). UNPAUSED by `authGate` — see that
   // function's own docblock for why (no Claude session is ever spawned by this half).
   const promoteDraft = stepTimed('promote-draft', () => runPromoteDraftDispatchAllRepos({ repos: stepRepos.get('promote-draft'), tick: sharedTick('promote-draft', promoteDraftTick ?? runReconcilePromoteDraftDispatch) }));
-  // #4191: surface notes using fresh evidence after the dispatch/promote steps.
+  planCache?.markTouched(promoteDraft);
+  // #4191: surface notes after the dispatch/promote steps. With plan reuse, notes read the pass's cached plan minus
+  // every PR an earlier phase acted on (fail closed); a missing or too-old plan falls back to a fresh read.
   const notes = timed('notes', () => runReconcileNotesAllRepos({
-    repos, ...(notesTick ? { tick: notesTick } : {}), ...(notesDryRun == null ? {} : { dryRun: notesDryRun }),
+    repos, ...(planCache ? { reconcile: planCache.reconcile } : {}),
+    ...(notesTick ? { tick: notesTick } : planCache ? { tick: (o) => planCache.notes(o.repo) ?? defaultReadNotesForRepo(o) } : {}), ...(notesDryRun == null ? {} : { dryRun: notesDryRun }),
   }));
   // #3383 follow-up — tag EVERY freshly-dispatched fix/ci-heal session's PR right away, `fix`+`ci-heal`
   // ONLY: `hungCi`/`mainRedRebase`/`missingRun` are mechanical git/gh actions with no live Claude session bound

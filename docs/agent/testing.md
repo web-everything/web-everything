@@ -3743,6 +3743,51 @@ invariants: a credential source must pass the public-blob checks before entering
 corpus. Do not claim independent mutation coverage for those redundant checks from a test
 that already refuses at source admission.
 
+
+## Post-accept advisory shadow evidence
+
+`review-loop-policy.test.mjs` exercises invalid settings with advisory-only findings, concurrent
+ledger writers (including separate Node processes), malformed persisted rows, and later loop
+observations. Accept-time `loopsAfter: null` means unmeasured; only later `kind: loops` observations
+supply measurements. A numeric accept-time count seeds the per-accept measurements; only higher
+counts advance the latest value per repo/PR/head. Equal or lower explicit replays append nothing,
+and historical replay rows cannot lower the report or the next run's count. The named accept-count,
+persisted-replay, and interleaved-accept probes in `review-loop-policy.test.mjs` pin these guarantees.
+`review-loop-cli.test.mjs` compares every live effect against mode off for an
+advisory-bearing accept, including settings and recorder failures.
+Persisted observations lock beside the ledger for at most two seconds. A busy/orphaned lock
+reports a shadow miss and preserves live review; an operator can inspect the writer and remove
+an orphaned `.lock` before retrying the observation.
+
+## Post-accept advisory replay probes
+
+The shadow advisory ledger uses recorded order, unique accepted-head identities, and a per-accept
+set of measured run IDs. Persist a run marker even when no earlier accept exists; otherwise a
+restart can turn an old run into a later run against a newly accepted head. Historical accepts
+also fence their own head when migrating to run markers. Probe partial fanout writes followed by
+a later accept and restart, concurrent duplicate and distinct runs, and duplicate or inconsistent
+persisted rows. The report and recorder share the replay reducer so skipped rows cannot suppress
+a valid replacement or inflate measurements. Keep these probes in the three review-loop-policy,
+review-loop-cli, and review-pr-io test files.
+
+
+## Post-accept advisory production ratings
+
+The CLI records later verdict ratings after the loop recorder has established the run marker.
+`advisory-rating` rows name an earlier would-card accept and reuse its repository/PR/head identity.
+Match cited findings with `roundCardsFindingsFingerprint`; without a valid path, require a stable
+finding ID rather than the fingerprint's prose fallback. Replay and the writer share this identity
+helper and the recorded-order boundary. Deduplicate by accepted head, finding identity, impact,
+and verdict across runs. Both confirmed and plausible broken ratings have production writers;
+only confirmed ratings increase `laterBroken`, while plausible ratings feed `unconfirmedBroken`.
+The CLI regression compares all live effects with mode off and exercises replay and writer/logger
+failures. Policy and persisted-IO probes cover refusal, lock ownership, and concurrent deduplication.
+
+The auto-discovered `post-accept-advisory-shadow-replay` soak scenario drives the production
+review loop with in-memory runs, ledger IO and effect sinks. It replays an accepted head and
+a later reviewed head, compares off/shadow/on live effects, distinguishes confirmed from plausible
+broken ratings, and injects writer and logger failures without contacting GitHub or changing Git.
+
 ## Verdict-ledger contention regression (R365 fix 2)
 
 `verdict-ledger-io.test.mjs` uses local bare origins and real rejected pushes to
@@ -3765,3 +3810,103 @@ polling sleep, then adoption and cleanup; immediate adoption alone does not exer
 For new operation refusal branches, use table-driven cases for every bad-input detail and invalid numeric
 shape, and assert the operator-facing fallback text. Pair state producers with a consumer integration test;
 test failed persistence warnings explicitly so callers cannot promise an event that was never tracked.
+
+## UID scanner idle proofs
+
+An absent UID does not guarantee an idle result from a shared host's `/proc`: repeated process
+churn or unreadable credentials deliberately retain reservations. In `forge-exec-run-reap.test.mjs`,
+keep the live host busy probe, but pin the idle probe's PID listing to the test process and read
+its real status file. Inject process churn, unreadable entries, and settled scans separately to
+verify the production scanner's fail-closed behavior without relying on host quiescence.
+
+## PR sweep invariant replay (R437)
+
+`scripts/conveyor/__tests__/pr-sweep.test.mjs` covers the all-open-PR shell, state clocks
+independent of `updatedAt`, dependency ordering, and alert-backoff migration. Backoff is
+explicit in `prSweep.alertBackoffMinutes`; omitted settings retain legacy one-shot callers.
+Dependency annotations are report-only and scoped to one repository. Markdown quotations,
+fences and inline code do not create dependency edges. The four incident shapes are replayed
+with injected readers in `pr-sweep-invariant-four-cases.soak.test.mjs`; run that file with
+`--config vitest.soak.config.ts` through heavy admission (the unit config excludes soak files).
+
+PR dependency edges require the target in the same repository's current open-PR listing.
+The named blocker-removal regression in `pr-sweep.test.mjs` keeps the textual annotation
+unchanged while removing the target, then proves the dependent regains a stall episode and alert.
+The named cross-repository number-collision regression lists the same dependent number in
+two repositories, with its blocker open only in one and absent or merged in the other.
+Both listing orders must preserve the other repository's stall episode and eventual alert.
+Its same-repository control uses
+`Blocked by: #6244`; dependency phrases accept an optional colon, still excluding quoted
+examples and references split across lines.
+
+`prSweep.deadlineMinutes` accepts either a positive scalar for every action budget or a
+per-action map. The settings-to-evaluator contract cases in `pr-sweep.test.mjs` exercise
+both shapes from tool and environment settings, including effective deadlines and provenance.
+
+When the invariant digest producer is enabled, its owner-signal failures must mark the shared digest incomplete.
+`pr-stall-digest.test.mjs` exercises the real sweep and feed publisher across an owner-read
+failure, recovery, and a later confirmed PR removal: incomplete evidence preserves the open
+invariant item, while a complete listing may clear it.
+
+Dependency extraction uses Markdown block structure to exclude indented code and lazy
+blockquote continuations as well as fences; inline code retains the conservative exclusion
+for unterminated spans. The indented/quoted-example sweep regressions prove these examples
+cannot suppress a stall episode. Empty diffs take precedence over dependency waits in the
+action, deadline, violation, legacy report, and digest while preserving dependency metadata.
+The four-case soak keeps a live blocker on its empty-diff fixture to pin that precedence.
+
+Legacy sweep/detector rows retain their original shape unless dependencies, empty-diff
+precedence, or configured alert backoff require enrichment. New invariant rows carry their
+own metadata; the feed serializer omits extensions absent from a legacy item. An explicit
+sweep-off or digest-false pass preserves detector-only behavior: agent listing failures do
+not make the independent detector incomplete, while enabled invariant producers still
+preserve published items when ownership cannot be read.
+
+The named `mode=off`, `digest=false`, and `enabled invariant producer` cases in
+`pr-stall-digest.test.mjs` seed a real detector feed item before an owner-read failure.
+With independent PR/detector reads succeeding, the disabled producers allow complete
+passes to clear the stale item; the enabled producer preserves it as incomplete evidence.
+The tests also require the detector digest to remain enabled, excluding disable-time
+clearing as a false-positive proof of detector completeness.
+
+## Shard split-retry evidence
+
+`verify-shard-run` retries incomplete inventory once in at most two halves to surface
+failures. The retry never yields PASS: the first TIMEOUT, NOT-RUN, or FAIL half
+keeps its status (TIMEOUT/NOT-RUN exit 124). Otherwise, observed failure evidence
+makes the shard FAIL (exit 1). Every other retry
+outcome is UNSETTLED (exit 75), including all halves passing. Retry output and
+failure details remain visible, and each shard contributes one final result.
+Admission forwards child exit codes, so exit 75 cannot prove the command never ran;
+nonzero exits other than 75 are failure evidence even without inventory, and
+cannot be cleared by passing retries. Exit 0 or 75 with missing inventory remains
+unsettled-eligible in the absence of failure evidence. Ordinary complete remote
+failures can be cleared by a complete passing local confirmation, in both the shard
+wrapper and ordinary phases. Incomplete shards retain failure evidence, including
+a complete remote failure or nonzero exit followed by incomplete local confirmation
+and passing split retries.
+Infrastructure
+exits retain their classification, and UNSETTLED retains `verify-unsettled` only
+when the caller supplies no failing-test identities (`failureDetails.tests` is empty
+or absent); an empty collector object or progress summary is not a test failure.
+Exit 75 with recorded failures stays red and does not authorize local confirmation
+in either path. Ordinary remote phases confirm a reported remote exit 75 without
+failures locally because the nested admission wrapper can use it for deferral. The shard wrapper owns its
+own confirmation and retry, so its terminal UNSETTLED result is never confirmed
+again by verify-lane. Signals, watchdog timeouts, unknown run locations, and
+reported local failures still prohibit remote confirmation.
+First-attempt passes are unchanged. The scoped regressions live in
+`scripts/lib/__tests__/verify-shard-run.test.mjs`; run them through heavy admission.
+The cross-path confirmation policy is pinned in `verify-remote-routing-shard.test.mjs`,
+and `verify-lane.test.mjs` exercises exit 75 without FAIL output through the real CLI.
+Child report identities re-emitted as FAIL lines must strip C0/C1 controls and Unicode
+line separators; the hostile-input table checks the resulting failure collector entries.
+When changing an existing test's expected verdict, disclose the behavior change in
+the PR description so reviewers can distinguish a policy change from a regression fix.
+
+Persistent GitHub 5xx soak fixtures must account for both retry ladders: `withListRetry`
+repeats the list read three times, and each attempt can sleep again in `gh-throttle`.
+The `smoke-github-outage` break pins `WE_GH_LIST_BACKOFF_MS=5,5` and
+`WE_GH_JSON_RETRY_BACKOFF_MS=5` before the daemon forks. This preserves exhausted,
+fail-closed reads across reconcile and dispatch smoke passes within the unchanged
+90-second tick bound; shortening only the outer list backoff does not suffice.

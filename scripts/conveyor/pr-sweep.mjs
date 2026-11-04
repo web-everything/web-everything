@@ -16,7 +16,11 @@ import { healthDir } from './health-watch-section.mjs';
 import { handoffHome } from '../operations/handoff-home.mjs';
 import { notifyDesktopChecked } from './branch-sync.mjs';
 import { flushDigest } from '../lib/quiet-hours-io.mjs';
-import { classifyIdlePrs, resolveOwner, planSweep, prKey, isRunningSession } from './pr-sweep-core.mjs';
+import { classifyIdlePrs, resolveOwner, planSweep, prKey, isRunningSession, evaluateInvariant, resolveWaitState, stateFingerprint, stateSince, DEADLINE_MINUTES } from './pr-sweep-core.mjs';
+import { readLiveFixClaim } from './fix-procedure.mjs';
+import { buildBlockedMap, sortUnblockersFirst } from './pr-blocked-by.mjs';
+import { createOpenPrCommentReader } from './pr-comments-complete.mjs';
+import { sanitizeForFeed } from '../operations/needs-you-feed.mjs';
 import { runStallSweep } from './pr-stall-sweep.mjs';
 import { publishStalledDigest } from './pr-stall-digest.mjs';
 import { runDetector } from './pr-stall-detector.mjs';
@@ -25,7 +29,7 @@ const SELF = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(SELF), '../..');
 const exec = promisify(execFile);
 const command = async (bin, args, env) => (await exec(bin, args, { env, encoding: 'utf8', timeout: 120000, maxBuffer: 16 * 1024 * 1024 })).stdout;
-const DEFAULTS = { enabled: true, intervalMinutes: 30, idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90, sessionActiveWithinMinutes: 30, dispatchDiagnosis: false, repos: [CONSTELLATION_REPOS.we.slug, CONSTELLATION_REPOS['plateau-app'].slug] };
+const DEFAULTS = { alertBackoffMinutes: [30, 60, 120, 240], deadlineMinutes: DEADLINE_MINUTES, enabled: true, intervalMinutes: 30, idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90, sessionActiveWithinMinutes: 30, dispatchDiagnosis: false, repos: [CONSTELLATION_REPOS.we.slug, CONSTELLATION_REPOS['plateau-app'].slug] };
 export function resolvePrSweepSettings({ config = {}, env = process.env, read = readFileSync, log = console.error } = {}) {
   const errors = []; let tool = {};
   try { tool = JSON.parse(read(join(ROOT, 'scripts/settings/pr-sweep.json'), 'utf8')).prSweep; } catch (e) { errors.push(`settings: ${e.message}`); }
@@ -34,9 +38,11 @@ export function resolvePrSweepSettings({ config = {}, env = process.env, read = 
     const raw = env[`WE_PR_SWEEP_${k.replace(/[A-Z]/g, (c) => `_${c}`).toUpperCase()}`];
     if (raw === undefined) continue;
     envValues[k] = typeof DEFAULTS[k] === 'boolean' ? (['1', 'true'].includes(raw) ? true : ['0', 'false'].includes(raw) ? false : raw)
-      : k === 'repos' ? raw.split(',').map((v) => v.trim()) : Number(raw);
+      : k === 'repos' ? raw.split(',').map((v) => v.trim()) : ['alertBackoffMinutes', 'deadlineMinutes'].includes(k) ? (() => { try { return JSON.parse(raw); } catch { return raw; } })() : Number(raw);
   }
   const valid = Object.fromEntries(Object.keys(DEFAULTS).map((k) => [k, (v) => typeof DEFAULTS[k] === 'boolean' ? typeof v === 'boolean'
+    : k === 'alertBackoffMinutes' ? Array.isArray(v) && v.length === 4 && v.every((n, i) => n === [30,60,120,240][i])
+    : k === 'deadlineMinutes' ? (Number.isFinite(v) && v > 0) || (v && typeof v === 'object' && !Array.isArray(v) && Object.entries(v).every(([name, n]) => Object.hasOwn(DEADLINE_MINUTES, name) && Number.isFinite(n) && n > 0))
     : k === 'repos' ? Array.isArray(v) && v.length > 0 && v.every((r) => repoKeyForSlug(r) !== null) : Number.isFinite(v) && v > 0]));
   const platform = readPlatformPreferences({ env, readFile: read }); errors.push(...platform.errors);
   const out = cascadePolicy('prSweep', { ...tool, ...config.prSweep }, { standard: DEFAULTS, envValues, valid, platform: platform.prefs.prSweep ?? {}, env });
@@ -87,6 +93,8 @@ export async function collectOwnerSignals({ prs, dir, env, errors, errorSources 
     return readTranscriptTailActivity(agent, { tailLines: 15, maxBytes: 400_000, fieldMax: 200 })?.lastActivityMs ?? null;
   }, readHealth = () => JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')),
   cloneRoots = () => daemonCloneRoots(workspaceOf(sourceRoot)), listLogs = readdirSync, readTail = readLogTail,
+  // R502 item 5: the live fixer claim is a wait state of its own; a failed read just means no claim evidence.
+  readClaim = (pr) => readLiveFixClaim({ repo: repoKeyForSlug(pr.repo), pr: Number(pr.number) }),
 }) {
   let sessions = []; let health = {}; const logs = []; let unreadSessions = [];
   const recordError = (source, text) => { errorSources.push({ index: errors.length, source }); errors.push(text); };
@@ -135,12 +143,15 @@ export async function collectOwnerSignals({ prs, dir, env, errors, errorSources 
     }
     const episode = Object.values(health.episodes ?? {}).find((e) => ['open', 'flapping'].includes(e.status)
       && ['fixer-stuck', 'fix-claim-held-no-progress', 'ruling-needed-waiting'].includes(e.smell) && mentions(`${e.subject} ${JSON.stringify(e.measure)}`, pr));
-    return [prKey(pr), { sessions, daemons, smell: episode?.smell, unreadSessions }];
+    let claim = null;
+    try { claim = readClaim(pr); } catch (e) { claim = null; recordError('claims', `claim ${prKey(pr)}: ${e.message}`); }
+    const fixClaim = claim?.meta?.who ? { who: claim.meta.who, claimedAt: claim.meta.claimedAt ?? null } : null;
+    return [prKey(pr), { sessions, daemons, smell: episode?.smell, unreadSessions, ...(fixClaim ? { fixClaim } : {}) }];
   }));
 }
 export async function runPrSweep({ now = Date.now(), dryRun = false, env = process.env, dir = healthDir(undefined, env), config,
   settings, sourceRoot = ROOT, readPrs, readQueue, readSignals = collectOwnerSignals, readPrevious,
-  notify = notifyDesktopChecked, diagnose, persist, append, flush = flushDigest, stallSweep = runStallSweep, stallDigest = publishStalledDigest } = {}) {
+  notify = notifyDesktopChecked, diagnose, persist, append, flush = flushDigest, stallSweep = runStallSweep, stallDigest = publishStalledDigest, detector = runDetector } = {}) {
   const errors = [];
   const safe = async (name, fn, fallback) => { try { return await fn(); } catch (e) { errors.push(`${name}: ${e.message}`); return fallback; } };
   if (!config && !settings) config = await safe('health config', () => JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8')), {});
@@ -149,13 +160,14 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
   if (settings) console.error(formatCascadeSourcesLine('prSweep', resolved));
   const previous = await safe('previous sweep', () => readPrevious ? readPrevious() : (existsSync(join(dir, 'pr-sweep.json')) ? JSON.parse(readFileSync(join(dir, 'pr-sweep.json'), 'utf8')).nextState : {}), {});
   const prs = []; let prsReadOk = true;
+  const readOpenPrs = readPrs ?? createOpenPrCommentReader({ env });
   for (const repo of value.repos) {
-    const rows = await safe(`prs ${repo}`, async () => readPrs ? readPrs(repo) : JSON.parse(await command('gh', ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '1000', '--json', 'number,title,labels,isDraft,updatedAt,headRefOid'], env)), null);
+    const rows = await safe(`prs ${repo}`, () => readOpenPrs(repo), null);
     if (!Array.isArray(rows) || rows.some((p) => !p || !Number.isInteger(Number(p.number)) || Number(p.number) <= 0 || !Number.isFinite(Date.parse(p.updatedAt)) || typeof p.headRefOid !== 'string')) {
       if (rows !== null) errors.push(`prs ${repo}: invalid PR listing`);
       prsReadOk = false; continue;
     }
-    prs.push(...rows.map((p) => ({ ...p, repo })));
+    prs.push(...rows.filter(p => !p.state || p.state.toUpperCase() === 'OPEN').map((p) => ({ ...p, repo })));
   }
   const queue = await safe('operator queue', async () => readQueue ? readQueue() : JSON.parse(await command(process.execPath, [join(ROOT, 'scripts/operations/operator-queue.mjs'), '--json'], env)), null);
   const queueOk = queue && !queue.incomplete && !(queue.errors?.length) && Array.isArray(queue.ready) && Array.isArray(queue.rulingNeeded)
@@ -164,13 +176,42 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
   const needsYou = queueOk ? [...queue.ready, ...queue.rulingNeeded].map((p) => ({ ...p, repo: CONSTELLATION_REPOS[repoKeyForSlug(p.repo)]?.slug ?? p.repo })) : null;
   const idle = classifyIdlePrs({ prs, now, idleMinutes: value.idleMinutes });
   const before = errors.length;
-  const signals = await safe('owner signals', () => readSignals({ prs: idle, now, dir, env, errors, sourceRoot }), {});
+  const signals = await safe('owner signals', () => readSignals({ prs, now, dir, env, errors, sourceRoot }), {});
   const ownerReadsOk = errors.length === before && queueOk;
-  const owners = Object.fromEntries(idle.map((p) => [prKey(p), resolveOwner(p, { ...value, now, ...(signals ?? {})[prKey(p)], operator: needsYou?.some((n) => prKey(n) === prKey(p)) })]));
-  const planned = planSweep({ idle, owners, prevState: previous ?? {}, needsYou, now, settings: value, ownerReadsOk, prsReadOk });
-  const report = { at: new Date(now).toISOString(), settings: value, sources: resolved.sources, ...planned.report, alerts: planned.alerts, diagnose: planned.diagnose, nextState: planned.nextState, errors };
+  const owners = Object.fromEntries(prs.map((p) => [prKey(p), resolveOwner(p, { ...value, now, ...(signals ?? {})[prKey(p)], operator: needsYou?.some((n) => prKey(n) === prKey(p)) })]));
+  const clocks = prsReadOk ? {} : { ...previous?.invariantClocks };
+  const dependencies = new Map();
+  for (const repo of value.repos) {
+    const map = buildBlockedMap(prs.filter(p => p.repo === repo).map(p => ({ ...p, daemons: signals?.[prKey(p)]?.daemons ?? [] })));
+    for (const p of prs.filter(p => p.repo === repo)) dependencies.set(prKey(p), {
+      blockedBy: map.blockedBy.get(p.number) ?? [], unblocks: map.unblocks.get(p.number) ?? [] });
+  }
+  const decisions = sortUnblockersFirst(prs.map(p => {
+    const key = prKey(p), fingerprint = stateFingerprint(p), old = previous?.invariantClocks?.[key];
+    const since = stateSince(p, old?.fingerprint === fingerprint ? old.since : now, now);
+    clocks[key] = { fingerprint, since };
+    return { ...p, ...dependencies.get(key), ...evaluateInvariant(p, owners[key], { now, since, settings: value, waitState: resolveWaitState(p, (signals ?? {})[key], { now, maxAgeMinutes: value.waitStateMaxAgeMinutes }), ...dependencies.get(key) }) };
+  }));
+  const annotate = item => {
+    const decision = decisions.find(p => p.repo === item.repo && p.number === item.pr);
+    if (!decision) return item;
+    // Legacy rows only need labels for configured repeat identities; unrelated
+    // invariant metadata belongs to the new invariant rows, not every consumer.
+    if (!decision.blockedBy.length && !decision.unblocks.length && decision.violation !== 'empty-diff') {
+      return value.alertBackoffMinutes ? { ...item, labels: decision.labels } : item;
+    }
+    return { ...item, labels: decision.labels, blockedBy: decision.blockedBy, unblocks: decision.unblocks,
+      owner: decision.owner, nextAction: decision.nextAction, deadline: decision.deadline,
+      ...(['empty-diff', 'waiting-on-blocked'].includes(decision.violation) ? { lane: 'operator', state: decision.violation, reason: decision.nextAction, action: decision.nextAction } : {}) };
+  };
+  // Keep the legacy idle report, while ownership and episodes cover every open PR.
+  const episodePrs = prs.filter(p => p.changedFiles === 0 || !dependencies.get(prKey(p)).blockedBy.length);
+  const planned = planSweep({ idle: episodePrs, owners, prevState: previous ?? {}, needsYou: needsYou && sortUnblockersFirst(needsYou.map(p => ({ ...p, ...dependencies.get(prKey(p)) }))), now, settings: value, ownerReadsOk, prsReadOk });
+  planned.report.idle = sortUnblockersFirst(idle.map(p => ({ ...p, ...owners[prKey(p)], ...dependencies.get(prKey(p)), ...(p.changedFiles === 0 ? { state: 'empty-diff', why: 'close into card' } : dependencies.get(prKey(p))?.blockedBy.length ? { state: 'waiting-on-blocked', why: dependencies.get(prKey(p)).blockedBy.map(n => `blocked-by #${n}`).join(', ') } : {}) })));
+  planned.nextState.invariantClocks = clocks;
+  const report = { decisions, at: new Date(now).toISOString(), settings: value, sources: resolved.sources, ...planned.report, alerts: planned.alerts, diagnose: planned.diagnose, nextState: planned.nextState, errors };
   const detect = async () => {
-    const out = await runDetector({ prs, seen: previous?.stallDetector ?? {}, now, env,
+    const out = await detector({ prs, seen: previous?.stallDetector ?? {}, now, env,
       readSignals: async ({ prs }) => {
         const readErrors = [], errorSources = [];
         const signals = await readSignals({ prs, now, dir, env, errors: readErrors, errorSources, sourceRoot });
@@ -182,6 +223,7 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
         if (readErrors.some((_, index) => !agentsOnly.has(index))) throw new Error('owner signals incomplete');
         return signals;
       } });
+    out.items = sortUnblockersFirst(out.items.map(annotate));
     detectorErrors.push(...out.errors);
     errors.push(...detectorErrors.map(e => `stall detector: ${e}`));
     report.stallDetector = { enabled: out.enabled, stalled: out.items.length, ...(dryRun ? { items: out.items } : {}) };
@@ -198,7 +240,12 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
     let needsYouSendFailed = false;
     for (const alert of report.alerts) {
       const sent = await safe('notification', async () => { const out = await notify(alert); if (!out?.ok) throw new Error(out?.error ?? out?.reason ?? 'notification failed'); return true; });
-      if (!sent && alert.kind === 'pr-stuck') report.nextState.episodes[alert.key].alerted = false;
+      if (!sent && alert.kind === 'pr-stuck') {
+        const episode = report.nextState.episodes[alert.key], old = previous?.episodes?.[alert.key];
+        episode.alerted = old?.alerted ?? false;
+        episode.lastAlertAt = old?.lastAlertAt;
+        episode.alertCount = old?.alertCount ?? 0;
+      }
       if (!sent && alert.kind === 'needs-you') needsYouSendFailed = true;
     }
     if (needsYouSendFailed) report.nextState.needsYou = previous.needsYou;
@@ -207,8 +254,10 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
     for (const repo of report.diagnose) await safe(`diagnose ${repo}`, () => diagnose ? diagnose(repo) : command(process.execPath, [join(ROOT, 'scripts/conveyor/stuck-pr-watch.mjs'), 'sweep', `--repo=${repo}`], env));
     await safe('handoff log', () => {
       const at = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', dateStyle: 'short', timeStyle: 'medium' }).format(now);
-      const line = `${at} ET idle=${idle.length} needsYou=${needsYou?.length ?? '?'} alerts=${report.alerts.length} errors=${errors.length} ${report.idle.map((p) => `${prKey(p)}=${p.owner ?? 'none'}(${p.state})`).join(' ')}\n`;
-      if (append) return append(line); const home = handoffHome(); mkdirSync(home, { recursive: true }); appendFileSync(join(home, 'pr-sweep.log'), `${line.trimEnd().replace(/[\r\n]/g, ' ')}\n`);
+      const summary = `${at} ET idle=${idle.length} needsYou=${needsYou?.length ?? '?'} alerts=${report.alerts.length} errors=${errors.length}`;
+      const lines = decisions.map((p, index) => `${index === 0 ? summary : `${at} ET`} ${prKey(p)} owner=${p.owner} next=${p.nextAction} deadline=${p.deadline} violation=${p.violation ?? 'none'} ${p.blockedBy.map(n => `blocked-by #${n}`).join(' ')} ${p.unblocks.map(n => `unblocks #${n}`).join(' ')}`);
+      const cleanLine = `${(lines.length ? lines : [summary]).map(line => sanitizeForFeed(line, Infinity)).join('\n')}\n`;
+      if (append) return append(cleanLine); const home = handoffHome(); mkdirSync(home, { recursive: true }); appendFileSync(join(home, 'pr-sweep.log'), cleanLine);
     });
     const write = () => safe('report write', () => {
       if (persist) return persist(report); mkdirSync(dir, { recursive: true }); const dest = join(dir, 'pr-sweep.json'); const tmp = `${dest}.${process.pid}.tmp`; writeFileSync(tmp, `${JSON.stringify(report, null, 2)}\n`); renameSync(tmp, dest);
@@ -226,13 +275,20 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
       errors.push(...(out.errors ?? []).map((e) => `stall sweep: ${e}`));
       // Operator items go to the needs-you feed (kind `stalled`) and one quiet-hours-gated alert per pass.
       const sweepDigestEnabled = out.mode !== 'off' && out.digest !== false;
-      const published = sweepDigestEnabled ? out.items ?? [] : [];
+      const invariantItems = sweepDigestEnabled && ownerReadsOk && prsReadOk ? decisions.filter(p => p.violation || p.unblocks.length).map(p => annotate({
+        repo: p.repo, pr: p.number, head: p.headRefOid, title: p.title, lane: 'operator', state: p.violation ?? 'unblocks',
+        labels: p.labels, blockedBy: p.blockedBy, unblocks: p.unblocks, owner: p.owner, nextAction: p.nextAction, deadline: p.deadline,
+        action: p.nextAction, reason: `${p.nextAction}; owner=${p.owner}; deadline=${p.deadline}`,
+        command: `gh pr view ${p.number} --repo ${p.repo} --comments`,
+        evidence: [`owner=${p.owner}`, `next=${p.nextAction}`, `deadline=${p.deadline}`] })) : [];
+      const published = [...invariantItems, ...(sweepDigestEnabled ? out.items ?? [] : []).map(annotate)
+        .filter(i => !invariantItems.some(p => p.repo === i.repo && p.pr === i.pr))];
       // A skipped (not-due) sweep has no items, so publishing would clear its open ones: wait for a pass that ran.
       if (out.dir && (out.items || out.mode === 'off' || out.digest === false)) {
-        const d = stallDigest({ ...out, items: [...published, ...detector.items.filter(d => !published.some(i => i.lane === 'operator' && i.repo === d.repo && i.pr === d.pr && String(i.head).toLowerCase() === d.head))],
-          incomplete: out.incomplete || !prsReadOk || detectorErrors.length > 0 },
-        { now, env, stateDir: out.dir, notify,
-          enabled: sweepDigestEnabled || detector.items.length > 0 || detector.enabled });
+        const d = stallDigest({ ...out, items: sortUnblockersFirst([...published, ...detector.items.map(annotate).filter(d => !published.some(i => i.lane === 'operator' && i.repo === d.repo && i.pr === d.pr && String(i.head).toLowerCase() === d.head))]),
+          incomplete: out.incomplete || !prsReadOk || (sweepDigestEnabled && !ownerReadsOk) || detectorErrors.length > 0 },
+        { now, env, stateDir: out.dir, notify, alertBackoffMinutes: value.alertBackoffMinutes,
+          enabled: sweepDigestEnabled || invariantItems.length > 0 || detector.items.length > 0 || detector.enabled });
         report.stallSweep.digest = { published: d.lines?.length ?? 0, alerted: d.fresh?.length ?? 0, notified: !!d.notified };
         errors.push(...(d.errors ?? []).map((e) => `stall digest: ${e}`));
       }
@@ -250,5 +306,5 @@ function isEntry(argv1) {
 }
 if (isEntry(process.argv[1])) {
   if (process.argv[2] !== 'run') { console.error('usage: pr-sweep.mjs run [--dry-run] [--json]'); process.exitCode = 2; }
-  else runPrSweep({ dryRun: process.argv.includes('--dry-run') }).then((r) => console.log(process.argv.includes('--json') ? JSON.stringify(r) : `${r.at}: ${r.idle.length} idle PRs, ${r.alerts.length} alerts, ${r.errors.length} errors`)).catch((e) => { console.error(e); process.exitCode = 1; });
+  else runPrSweep({ dryRun: process.argv.includes('--dry-run') }).then((r) => console.log(process.argv.includes('--json') ? JSON.stringify(r) : `${r.at}: ${r.decisions.length} open PRs, ${r.alerts.length} alerts, ${r.errors.length} errors\n${r.decisions.map(p => sanitizeForFeed(`${prKey(p)} owner=${p.owner} next=${p.nextAction} deadline=${p.deadline} ${p.blockedBy.map(n => `blocked-by #${n}`).join(' ')} ${p.unblocks.map(n => `unblocks #${n}`).join(' ')}`, Infinity)).join('\n')}`)).catch((e) => { console.error(e); process.exitCode = 1; });
 }
