@@ -4,7 +4,8 @@
  *   fixture dir. NEVER deletes without a verified archive; NEVER touches a non-terminal record, a parked review run
  *   a `--resume` could need, or anything newer than keepDays. Dry-run (the default) reports counts and bytes only.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, statfsSync, writeFileSync, mkdtempSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, renameSync, lstatSync, linkSync, rmdirSync, unlinkSync, rmSync, statSync, statfsSync, writeFileSync, mkdtempSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -19,6 +20,7 @@ const DEFAULTS = Object.freeze({
   minFreeGiB: 30,
   batchMaxGiB: 4,
   batchMaxCompressedGiB: 2,
+  archivePrEvidence: false,
 });
 
 /** standard defaults < scripts/settings/runs-retention.json < env. Invalid values throw (never guess). */
@@ -47,6 +49,7 @@ export function reviewRunMayResume(record) {
     verdict && (verdict.verdict === 'needs-human' || (Array.isArray(verdict.pendingReferrals) && verdict.pendingReferrals.length > 0)));
 }
 
+const hashOf = path => createHash('sha256').update(readFileSync(path)).digest('hex');
 const monthOf = ms => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit' }).format(ms).slice(0, 7);
 
 export function defaultCodec() {
@@ -97,8 +100,10 @@ export function runsRetention(o = {}) {
     try { record = tryReadRun(id, dir); } catch { out.kept.unreadable++; continue; }
     if (!record || !isRunRecordTerminal(record)) { out.kept.nonTerminal++; continue; }
     if (reviewRunMayResume(record)) { out.kept.resumable++; continue; }
+    // PR evidence outlives the cursor (same rule as pruneTerminalRuns): retained unless the setting opts in.
+    if (!settings.archivePrEvidence && record.effects.some(e => e?.result?.pr)) { out.kept.resumable++; continue; }
     if (!byMonth.has(month)) byMonth.set(month, []);
-    byMonth.get(month).push({ id, name: `${id}.json`, size: st.size, mtimeMs: st.mtimeMs, ino: st.ino });
+    byMonth.get(month).push({ id, name: `${id}.json`, size: st.size, mtimeMs: st.mtimeMs, ino: st.ino, hash: hashOf(runPath(id, dir)) });
     out.eligible++; out.eligibleBytes += st.size;
     out.months[month] = (out.months[month] ?? 0) + 1;
   }
@@ -106,8 +111,16 @@ export function runsRetention(o = {}) {
 
   // The archive target must already be mounted: never create the cloud-storage root locally.
   const mountRoot = dirname(dirname(settings.archiveDir));
-  if (!existsSync(mountRoot)) { out.status = 'skipped'; out.errors.push(`archive target not mounted (${mountRoot} missing); originals retained`); return out; }
-
+  const realDir = p => { try { const l = lstatSync(p); return l.isDirectory() && !l.isSymbolicLink() ? l : null; } catch { return null; } };
+  const mount0 = realDir(mountRoot);
+  if (!mount0) { out.status = 'skipped'; out.errors.push(`archive target not mounted (${mountRoot} missing or not a real directory); originals retained`); return out; }
+  const mountSame = () => { const m = realDir(mountRoot); return m && m.dev === mount0.dev && m.ino === mount0.ino; };
+  // One invocation at a time: an atomic mkdir lock beside the archives (never overwrite a verified archive).
+  const lockDir = join(dirname(settings.archiveDir), '.runs-retention.lock');
+  try { mkdirSync(dirname(settings.archiveDir), { recursive: true }); mkdirSync(lockDir); }
+  catch (e) { out.status = 'skipped'; out.errors.push(`archive busy or unwritable (${e.code}); originals retained`); return out; }
+  try { return archiveAll(); } finally { rmdirSync(lockDir); }
+  function archiveAll() {
   const maxBytes = settings.batchMaxGiB * GIB, maxCompressed = settings.batchMaxCompressedGiB * GIB;
   for (const [month, files] of [...byMonth].sort()) {
     files.sort((a, b) => a.mtimeMs - b.mtimeMs || a.id.localeCompare(b.id));
@@ -123,9 +136,7 @@ export function runsRetention(o = {}) {
       let partial;
       try {
         mkdirSync(monthDir, { recursive: true });
-        let n = 0, final;
-        do { final = join(monthDir, `runs-${month}-${String(++n).padStart(3, '0')}.${codec.ext}`); } while (existsSync(final));
-        partial = `${final}.partial`;
+        partial = join(monthDir, `.${randomUUID()}.${codec.ext}.partial`);
         const names = batch.map(f => f.name);
         tarCreate(partial, dir, names, codec);
         const written = statSync(partial).size;
@@ -134,12 +145,20 @@ export function runsRetention(o = {}) {
         const listed = tarList(partial, codec).map(x => x.replace(/^\.\//, '')).sort();
         const want = [...names].sort();
         if (listed.length !== want.length || listed.some((x, i) => x !== want[i])) throw new Error('archive read-back mismatch; originals retained');
-        renameSync(partial, final);
+        // Reserve an unused final name atomically: link() fails on EEXIST, so no verified archive is ever replaced.
+        let final;
+        for (let n = 1; n < 10000 && !final; n++) {
+          const candidate = join(monthDir, `runs-${month}-${String(n).padStart(3, '0')}.${codec.ext}`);
+          try { linkSync(partial, candidate); final = candidate; } catch (e) { if (e.code !== 'EEXIST') throw e; }
+        }
+        if (!final) throw new Error('archive part bound exceeded');
+        unlinkSync(partial); partial = undefined;
+        if (!mountSame()) throw new Error('archive mount changed; originals retained');
         out.archives.push(final); out.archived += names.length;
         for (const f of batch) {
           try {
             const now2 = statSync(runPath(f.id, dir));
-            if (now2.mtimeMs !== f.mtimeMs || now2.size !== f.size || now2.ino !== f.ino) { out.kept.young++; continue; } // a writer advanced it
+            if (now2.mtimeMs !== f.mtimeMs || now2.size !== f.size || now2.ino !== f.ino || hashOf(runPath(f.id, dir)) !== f.hash) { out.kept.young++; continue; } // a writer advanced it
             rmSync(runPath(f.id, dir), { force: true });
             out.deleted++; out.bytesFreed += f.size;
           } catch { /* vanished: nothing to free */ }
@@ -148,4 +167,5 @@ export function runsRetention(o = {}) {
     }
   }
   return out;
+  }
 }

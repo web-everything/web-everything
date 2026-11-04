@@ -88,6 +88,20 @@ describe('runsRetention', () => {
     expect(r.deleted).toBe(0); expect(listRunIds(runs)).toEqual(['run-old']);
   });
 
+  it('keeps records with PR evidence unless the setting opts in', () => {
+    put('run-pr', 30, { effects: [{ key: 'a', type: 'open-pr', stepIndex: 0, index: 0, status: 'applied', result: { pr: 7 } }] });
+    expect(base().archived).toBe(0);
+    expect(listRunIds(runs)).toEqual(['run-pr']);
+    expect(base({ settings: { ...settings, archivePrEvidence: true } }).deleted).toBe(1);
+  });
+
+  it('a concurrent lock refuses to run (never two archivers)', () => {
+    put('run-old', 30);
+    mkdirSync(join(drive, '..'), { recursive: true }); mkdirSync(join(drive, '..', '.runs-retention.lock'));
+    const r = base();
+    expect(r.status).toBe('skipped'); expect(listRunIds(runs)).toEqual(['run-old']);
+  });
+
   it('settings: defaults to 14 days / 30 GiB; env overrides; invalid throws', () => {
     expect(resolveRetentionSettings({ env: {}, tool: {} }).keepDays).toBe(14);
     expect(resolveRetentionSettings({ env: { WE_RUNS_RETENTION_KEEP_DAYS: '3' }, tool: {} }).keepDays).toBe(3);

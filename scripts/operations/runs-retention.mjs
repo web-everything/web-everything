@@ -35,9 +35,9 @@ export function runsRetentionOperation() {
 }
 
 export function finishRunsRetention({ run, code, lines, json = false } = {}) {
-  if (json) return { code, lines };
   const effect = (run?.effects ?? []).find(e => e.type === RUNS_RETENTION_EFFECT);
   const r = effect?.result;
+  if (json) return { code: r?.errors?.length || !r ? 1 : code, lines };
   if (!r) return { code: 1, lines: [`runs-retention: FAILED${effect?.error ? ` — ${String(effect.error).split('\n')[0]}` : ''}`] };
   const mb = n => `${(n / 1048576).toFixed(1)} MiB`;
   const out = [
