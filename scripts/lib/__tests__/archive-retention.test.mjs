@@ -466,6 +466,13 @@ it('a record atomically replaced after verification survives with the production
     afterSourceStat: async path => { await writeFile(path + '.n', 'late-writer-bytes'); await rename(path + '.n', path); } });
   expect(await readFile(p, 'utf8')).toBe('late-writer-bytes');
 });
+it('an in-place append (open descriptor) after verification survives with the production provider', async () => {
+  const { createRunsWriterExclusion } = await import('../runs-writer-exclusion.mjs');
+  const p = join(runs, 'late-append.json'); await writeFile(p, rec); await utimes(p, old, old);
+  await realRun({ isComplete: () => true, withSourceWriterExclusion: createRunsWriterExclusion(),
+    afterSourceStat: async path => appendFile(path, '-late') });
+  expect(await readFile(p, 'utf8')).toBe(`${rec}-late`);
+});
 it('a record replaced just before removal is restored, not deleted', async () => {
   const p = await file(join(runs, 'r.json'));
   const out = await run({ afterSourceStat: async path => { await writeFile(path + '.n', 'newer-bytes'); await rename(path + '.n', path); } });
