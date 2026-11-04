@@ -241,7 +241,10 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
   // main-fix-queue-priority — a red-main repair waiter (P0) is admitted to the next free slot ahead of all others.
   priority: Object.freeze({ mode: 'enforce', repairPatterns: DEFAULT_REPAIR_PATTERNS }),
   remote: Object.freeze({ enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null,
-    maxConcurrent: 8, backoffMs: 120000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15 }),
+    maxConcurrent: 8, backoffMs: 120000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15,
+    // R475: raise a health event (coroner trigger) when >= stuckMinSlots dead-owner unconfirmed slots are older than stuckAgeMs,
+    // or when a slot is kept because the Forge probe was unknown; at most one event per kind per stuckSignalEveryMs.
+    stuckMinSlots: 2, stuckAgeMs: 600000, stuckSignalEveryMs: 600000 }),
 });
 
 /** Upper bound on a `run --wait-ms` budget (24h): a typo must not turn into an unbounded wait. */
@@ -275,6 +278,9 @@ const ADMISSION_VALID = {
   'remote.backoffFailures': (v) => Number.isSafeInteger(v) && v >= 1,
   'remote.maxLoadPerCore': (v) => Number.isFinite(v) && v > 0,
   'remote.minFreeRamPct': (v) => Number.isFinite(v) && v >= 0 && v <= 100,
+  'remote.stuckMinSlots': admissionInt(1),
+  'remote.stuckAgeMs': isValidRunWaitMs,
+  'remote.stuckSignalEveryMs': isValidRunWaitMs,
 };
 const ADMISSION_ENV = {
   cap: 'WE_HEAVY_ADMISSION_CAP', fastSlots: 'WE_HEAVY_ADMISSION_FAST_SLOTS', onTimeout: 'WE_HEAVY_ADMISSION_ON_TIMEOUT',
@@ -782,7 +788,7 @@ export async function runWithRemoteDecision({
     : env ? resolveCeilingMs(env) : DEFAULT_ADMISSION_CEILING_MS,
   loadPerCore = () => loadavg()[0] / cpus().length,
   remoteExec, remoteClientOverride = null, onDecision,
-  log = (line) => process.stderr.write(line),
+  log = (line) => process.stderr.write(line), appendEvent = appendClientOverrideEvent,
   // Under test the real host's load must not change routing; tests inject this seam.
   hostOverloaded = () => !isUnderTest(env ?? {}) && hostOverloadedForRemote(env),
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -821,7 +827,10 @@ export async function runWithRemoteDecision({
   let slot;
   let healthAt = waitAt;
   let reapedAt = -Infinity;
-  const markerReaper = createMarkerReaper({root:remoteRoot,host,clock,log});
+  const stuck = policy.settings.remote;
+  const markerReaper = createMarkerReaper({root:remoteRoot,host,clock,log,
+    stuckMinSlots:stuck.stuckMinSlots,stuckAgeMs:stuck.stuckAgeMs,signalEveryMs:stuck.stuckSignalEveryMs,
+    signal:({kind,detail})=>{void appendEvent({kind:'forge-slots-stuck',daemon:'heavy-admission',detail:{reason:kind,host,...detail}});}});
   let overloadWaitLogged = false;
   try {
     for (;;) {

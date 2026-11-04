@@ -55,6 +55,27 @@ export function loadPrCommentSettings({ path = DEFAULT_SETTINGS_PATH, env = glob
 }
 
 /**
+ * Note kinds that report a choice the system already made (no one is asked to act). SETTING:
+ * `conveyor.notes.informationalKinds` in `we:scripts/pr-comments-settings.json` (R528). They post as an
+ * informational note, never as "needs your decision", so the needs-you feed does not raise them.
+ */
+export const DEFAULT_INFORMATIONAL_NOTE_KINDS = Object.freeze(['timeout-retry-fallback-heal']);
+
+/** @returns {string[]} */
+export function loadInformationalNoteKinds({ path = DEFAULT_SETTINGS_PATH } = {}) {
+  try {
+    const list = JSON.parse(readFileSync(path, 'utf8'))?.conveyor?.notes?.informationalKinds;
+    if (Array.isArray(list)) return list.filter((k) => typeof k === 'string');
+  } catch { /* fall through to the default */ }
+  return [...DEFAULT_INFORMATIONAL_NOTE_KINDS];
+}
+
+/** @param {{kind?:string}} note @param {{kinds?:string[]}} [o] @returns {boolean} */
+export function isInformationalNote(note, { kinds = loadInformationalNoteKinds() } = {}) {
+  return kinds.includes(note?.kind);
+}
+
+/**
  * Reconcile note kinds that only say "still waiting": nobody has to act, and the state clears on its own.
  *   - `review-label-missing` — fires minutes after a PR opens, before the review daemon labels it (62 of 62 new
  *     PRs on 2026-10-08). The label healer owns the fix; the health watch still tracks a stuck one.
