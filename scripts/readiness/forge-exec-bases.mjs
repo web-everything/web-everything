@@ -28,7 +28,46 @@ function gitExec({file='git',args,cwd,env,input}) {
 // Trusted wrapper only: never clone client remotes/configuration or fetch a
 // client-supplied URL. The warm mirror is only an object cache: public origin
 // must supply both current main and the exact, manifest-bound Mac HEAD.
-export async function materializeWorktree({work,root,baseSha,head,manifest,manifestDigest,exec=gitExec}) {
+// git-bundle transport (R593): the Mac ships its own tip as a bundle over the
+// rsync channel. The slot user wrote that file, so copy it out of slot reach
+// while hashing, then compare against the Mac-declared size and digest.
+export const BUNDLE_MAX_BYTES=512*1024*1024;
+export const BUNDLE_MODES=Object.freeze(['none','incremental','full']);
+export function validBundleEvidence(bundle) {
+  return !!bundle&&BUNDLE_MODES.includes(bundle.mode)&&(bundle.mode==='none'
+    ||typeof bundle.sha256==='string'&&/^[a-f0-9]{64}$/.test(bundle.sha256)&&Number.isSafeInteger(bundle.bytes)&&bundle.bytes>0&&bundle.bytes<=BUNDLE_MAX_BYTES);
+}
+export async function stageBundle(source,destination,{sha256,bytes},io=fs) {
+  const handle=await io.open(source,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
+  try {
+    const st=await handle.stat();
+    if(!st.isFile()||st.size!==bytes||st.size>BUNDLE_MAX_BYTES)throw new Error('Bundle size mismatch');
+    const out=await io.open(destination,'wx',0o600),hash=createHash('sha256'),buffer=Buffer.allocUnsafe(1024*1024);
+    let total=0;
+    try {
+      for(;;) {
+        const {bytesRead}=await handle.read(buffer,0,buffer.length,null);
+        if(!bytesRead)break;
+        total+=bytesRead;if(total>bytes)throw new Error('Bundle size mismatch');
+        const chunk=buffer.subarray(0,bytesRead);hash.update(chunk);await out.write(chunk);
+      }
+    } finally {await out.close();}
+    if(total!==bytes||hash.digest('hex')!==sha256)throw new Error('Bundle digest mismatch');
+  } finally {await handle.close();}
+}
+// A shared clone borrows objects from repo.git through an alternate, so it is only
+// safe when no slot user can write the mirror (sandbox decision S4). Otherwise
+// keep today's full --no-local copy.
+export async function mirrorReadOnlyForSlots(mirror,io=fs) {
+  try {
+    for(const path of [mirror,join(mirror,'objects')]) {
+      const st=await io.lstat(path);
+      if(!st.isDirectory()||st.isSymbolicLink()||(st.mode&0o022))return false;
+    }
+    return true;
+  } catch {return false;}
+}
+export async function materializeWorktree({work,root,baseSha,head,manifest,manifestDigest,exec=gitExec,bundle,sharedClone=false}) {
   if(!revision(head)||manifest?.git?.head!==head||baseSha!==undefined&&!revision(baseSha)||digestManifest(manifest)!==manifestDigest)throw new Error('Invalid Git evidence');
   const {siblings,git:logical,...primary}=manifest;
   if(logical.diffCoverageBase!==undefined&&!revision(logical.diffCoverageBase))throw new Error('Invalid coverage base SHA');
@@ -68,12 +107,31 @@ export async function materializeWorktree({work,root,baseSha,head,manifest,manif
     await fs.mkdir(cloned);
     // Mirror cloning works even with the warmer's unborn bare HEAD and copies
     // no client configuration. A cached object never proves public availability.
-    await git(['clone','--no-local','--no-hardlinks','--mirror','--template=',local?mirror:PUBLIC_REPOSITORY,join(cloned,'.git')],root);
+    const shared=sharedClone&&local&&await mirrorReadOnlyForSlots(mirror);
+    await git(['clone',...(shared?['--shared']:['--no-local','--no-hardlinks']),'--mirror','--template=',local?mirror:PUBLIC_REPOSITORY,join(cloned,'.git')],root);
     await git(['config','core.bare','false'],cloned);
     await git(['config','remote.origin.mirror','false'],cloned);
     await git(['config','remote.origin.fetch','+refs/heads/*:refs/remotes/origin/*'],cloned);
     await git(['remote','set-url','origin',PUBLIC_REPOSITORY],cloned);
-    await git(['fetch','--no-tags','--no-write-fetch-head','origin',
+    if(bundle!==undefined) {
+      // No network: public main comes from the mirror clone; the Mac tip comes from
+      // the verified bundle (or is already in the mirror when mode is none).
+      if(!local||!validBundleEvidence(bundle))throw new Error('Bundle transport unavailable');
+      if(await git(['rev-parse','--verify','refs/heads/main^{commit}'],cloned,undefined,true)===null)throw new Error('Mirror main missing');
+      await git(['update-ref','refs/remotes/origin/main','refs/heads/main'],cloned);
+      if(bundle.mode!=='none') {
+        const staged=join(pending,'git.bundle');
+        await stageBundle(bundle.file,staged,bundle);
+        await git(['bundle','verify',staged],cloned);
+        const heads=await git(['bundle','list-heads',staged],cloned);
+        if(!heads.split('\n').some(line=>line.trim()===head+' HEAD'))throw new Error('Bundle tip mismatch');
+        await git(['config','transfer.fsckObjects','true'],cloned);
+        await git(['config','fetch.fsckObjects','true'],cloned);
+        await git(['fetch','--no-tags','--no-write-fetch-head',staged,'+HEAD:refs/we/bundle-tip'],cloned);
+        if(await git(['rev-parse','--verify','refs/we/bundle-tip^{commit}'],cloned)!==head)throw new Error('Bundle tip mismatch');
+        await git(['update-ref','-d','refs/we/bundle-tip'],cloned);
+      }
+    } else await git(['fetch','--no-tags','--no-write-fetch-head','origin',
       '+refs/heads/main:refs/remotes/origin/main',head],cloned);
     await git(['rev-parse','--verify','refs/remotes/origin/main^{commit}'],cloned);
     await git(['cat-file','-e',head+'^{commit}'],cloned);

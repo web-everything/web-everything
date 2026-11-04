@@ -144,7 +144,7 @@
  *     fresh resource snapshot permits it. Status and release scan every slot that scaling may hand out.
  */
 import '../lib/tools-root-guard.mjs';
-import { constants, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync } from 'node:fs';
+import { constants, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync, renameSync } from 'node:fs';
 import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
 import { execSync, execFile } from 'node:child_process';
 import { hostname, homedir, userInfo, loadavg, cpus, constants as osConstants } from 'node:os';
@@ -172,7 +172,8 @@ import {
   queueBacklog, laneProjection, slotOrderFor, DEFAULT_QUEUE_MAX_WAIT_MINUTES, QUEUE_MAX_WAIT_ENV,
   QUEUE_ADMISSION_SWITCH_ENV, DEFAULT_ARRIVAL_WINDOW_MINUTES,
 } from './heavy-queue-projection.mjs'; // card xkyw1x4 — the pure projection + fast-lane rules
-import { routeNeedsGit } from './needs-git-route.mjs'; // R501: test files that spawn git cannot run on Forge's .git-less snapshot
+import { routeNeedsGit } from './needs-git-route.mjs';
+import { capabilityAdvertisesBundle, capabilityRecord } from './remote-git-bundle.mjs'; // R501: test files that spawn git cannot run on Forge's .git-less snapshot
 import { recordRemoteRun } from '../lib/forge-share.mjs'; // R501: the one durable remote-success row forgeShare reads
 import { createMarkerReaper, markerContent, recordMarkerRun, blockedSlots, heldTombstone } from './forge-slot-markers.mjs';
 import { classifyWaiterPriority, waiterPriorityClass, validRepairPatterns, DEFAULT_REPAIR_PATTERNS, ADMISSION_PRIORITY_MODES } from './heavy-repair-priority.mjs'; // red-main repair class — kept out of the projection (which the read-only `heavy-queue` op imports) because it needs `node:vm`
@@ -242,7 +243,8 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
   fastScale: Object.freeze({ maxSlots: null, minShortWaiters: 3, minShortShare: 0.6, minCpuIdlePct: 30, maxMemPressureLevel: 1 }),
   // main-fix-queue-priority — a red-main repair waiter (P0) is admitted to the next free slot ahead of all others.
   priority: Object.freeze({ mode: 'enforce', repairPatterns: DEFAULT_REPAIR_PATTERNS }),
-  remote: Object.freeze({ enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null,
+  // transport (R593): 'rsync' (default, rollback value) | 'git-bundle' (ship a verified git bundle; needs a runner advertising gitBundle:1).
+  remote: Object.freeze({ enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null, transport: 'rsync',
     maxConcurrent: 8, backoffMs: 120000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15,
     // R475: raise a health event (coroner trigger) when >= stuckMinSlots dead-owner unconfirmed slots are older than stuckAgeMs,
     // or when a slot is kept because the Forge probe was unknown; at most one event per kind per stuckSignalEveryMs.
@@ -272,6 +274,7 @@ const ADMISSION_VALID = {
   'priority.mode': (v) => ADMISSION_PRIORITY_MODES.includes(v),
   'priority.repairPatterns': validRepairPatterns,
   'remote.clientPath': (v) => v === null || typeof v === 'string',
+  'remote.transport': (v) => v === 'rsync' || v === 'git-bundle',
   'remote.enabled': (v) => typeof v === 'boolean',
   'remote.mode': (v) => v === 'above-threshold' || v === 'always',
   'remote.loadPerCoreThreshold': (v) => Number.isFinite(v) && v > 0,
@@ -460,19 +463,35 @@ export function formatAdmissionPolicy({ settings, sources, ignored = [], invalid
 }
 
 /** Pure remote routing decision; unreadable load keeps threshold routing local. */
-export function decideRemote({ policy, loadPerCore, argv, cwd }) {
+export function decideRemote({ policy, loadPerCore, argv, cwd, runnerBundleOk = false }) {
   const remote = policy.settings.remote;
   const enabled = `remote.enabled=${remote.enabled} (${policy.sources['remote.enabled'] ?? 'standard'})`;
   if (!remote.enabled) return { remote: false, reason: enabled };
-  if (remote.mode === 'always') return withNeedsGit({ remote: true, reason: `${enabled}; mode=always` }, argv, cwd);
+  if (remote.mode === 'always') return withNeedsGit({ remote: true, reason: `${enabled}; mode=always` }, argv, cwd, bundleKeepsRemote(remote, runnerBundleOk));
   if (!Number.isFinite(loadPerCore)) return { remote: false, reason: `${enabled}; load-unreadable` };
   const above = loadPerCore > remote.loadPerCoreThreshold;
-  return withNeedsGit({ remote: above, reason: `${enabled}; loadPerCore=${loadPerCore} ${above ? '>' : '<='} ${remote.loadPerCoreThreshold}` }, argv, cwd);
+  return withNeedsGit({ remote: above, reason: `${enabled}; loadPerCore=${loadPerCore} ${above ? '>' : '<='} ${remote.loadPerCoreThreshold}` }, argv, cwd, bundleKeepsRemote(remote, runnerBundleOk));
+}
+
+/** R593: routing reads the runner capability cache the client wrote at its last prepare; unreadable means no. */
+export function readRunnerBundleCapability({ root, host, clock = Date.now, read = readFileSync }) {
+  try { return capabilityAdvertisesBundle(JSON.parse(read(join(root, 'runner-capabilities.json'), 'utf8')), { host, nowMs: clock() }); }
+  catch { return false; }
+}
+export function writeRunnerCapabilities({ root, host, capabilities, clock = Date.now, write = writeFileSync, mkdir = mkdirSync, rename = renameSync }) {
+  try {
+    mkdir(root, { recursive: true });
+    const file = join(root, 'runner-capabilities.json'), pending = `${file}.${process.pid}.tmp`;
+    write(pending, JSON.stringify(capabilityRecord({ host, capabilities, nowMs: clock() })), { mode: 0o600 });
+    rename(pending, file);
+  } catch { /* advisory cache only: a failed write keeps git tests local */ }
 }
 
 /** R501: a remote decision for a run naming a git-spawning test file becomes local with the named reason `needs-git`. */
-function withNeedsGit(decision, argv, cwd) {
-  if (!decision.remote) return decision;
+/** R593: git-needing tests stay remote only when transport=git-bundle AND the runner recently advertised gitBundle:1. */
+function bundleKeepsRemote(remote, runnerBundleOk) { return remote.transport === 'git-bundle' && runnerBundleOk === true; }
+function withNeedsGit(decision, argv, cwd, bundleOk = false) {
+  if (!decision.remote || bundleOk) return decision;
   let route; try { route = routeNeedsGit({ argv, cwd: cwd ?? process.cwd() }); } catch { return decision; }
   return route.local ? { remote: false, needsGit: true, reason: `${decision.reason}; ${route.reason}: ${route.files.join(', ')}` } : decision;
 }
@@ -811,9 +830,10 @@ export async function runWithRemoteDecision({
     if (overloaded === null) { try { overloaded = hostOverloaded() === true; } catch { overloaded = false; } }
     return overloaded;
   };
-  let decision = decideRemote({ policy, loadPerCore: load, argv, cwd });
+  const runnerBundleOk = readRunnerBundleCapability({ root: join(dirname(lockRoot ?? admissionLockRoot(cwd, env)), 'remote'), host, clock });
+  let decision = decideRemote({ policy, loadPerCore: load, argv, cwd, runnerBundleOk });
   if (!decision.remote && !decision.needsGit && policy.settings.remote.enabled && policy.settings.remote.mode === 'above-threshold'
-    && Number.isFinite(load) && isOverloaded()) decision = withNeedsGit({ remote: true, reason: `${decision.reason}; host overloaded` }, argv, cwd);
+    && Number.isFinite(load) && isOverloaded()) decision = withNeedsGit({ remote: true, reason: `${decision.reason}; host overloaded` }, argv, cwd, policy.settings.remote.transport === 'git-bundle' && runnerBundleOk);
   onDecision?.(decision);
   log(`heavy-admission: ${decision.remote ? 'remote' : 'local'} (${decision.reason})\n`);
   if (decision.needsGit) recordRemoteFallback({lockRoot, reason: 'needs-git', cwd, argv, env, clock});
@@ -915,7 +935,8 @@ export async function runWithRemoteDecision({
         controller.abort();
       }, timeoutMs);
     });
-    const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, onRun: run => recordMarkerRun(executionMarker, {owner, run}) }));
+    const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, transport: policy.settings.remote.transport,
+      onCapabilities: capabilities => writeRunnerCapabilities({ root: remoteRoot, host, capabilities, clock }), onRun: run => recordMarkerRun(executionMarker, {owner, run}) }));
     const result = await Promise.race([remote, timeout]);
     if (result === timedOut) {
       const termination = await Promise.race([

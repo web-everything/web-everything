@@ -9,7 +9,7 @@ import {createHash, randomBytes} from 'node:crypto';
 import {join, relative} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {cpus, loadavg, freemem, totalmem} from 'node:os';
-import {BASE_RETENTION, baseGuard, readyBases, readBase, copyLeaves, baseFile, createBasePin, claimPrewarm, materializeWorktree} from './forge-exec-bases.mjs';
+import {BASE_RETENTION, baseGuard, readyBases, readBase, copyLeaves, baseFile, createBasePin, claimPrewarm, materializeWorktree, mirrorReadOnlyForSlots, validBundleEvidence} from './forge-exec-bases.mjs';
 import {decodeManifest} from './forge-exec-manifest.mjs';
 const LIMIT = 4 * 1024 * 1024;
 const hex = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
@@ -1041,7 +1041,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       },record);
       }finally{if(worker.active)await releaseWorker(record);}
     },
-    async prepare({nonce,label,siblings,baseSha,baseManifestDigest,slot}) {
+    async prepare({nonce,label,siblings,baseSha,baseManifestDigest,slot,gitBundle}) {
       await init();
       await reap();
       if(!nonceOK(nonce) || (label!==undefined && (typeof label!=='string' || !/^[a-z0-9][a-z0-9-]{5,63}$/.test(label)))) throw new Error('Invalid prepare');
@@ -1055,6 +1055,22 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       const work=join(container,'work');
       await mkdir(work,{mode:0o755});
       await handoff(worker,work);
+      // git-bundle transport (R593): advertised only while repo.git is not writable by slot users (S4).
+      const bundleReady=await mirrorReadOnlyForSlots(join(bases,'repo.git'));
+      // The prerequisite the Mac may use for an incremental bundle: this mirror's own main tip.
+      let bundleBase;
+      if(bundleReady) try {
+        const mirror=join(bases,'repo.git'),args=['-c','safe.directory='+mirror,'--git-dir',mirror,'rev-parse','--verify','refs/heads/main^{commit}'];
+        const env={PATH:'/usr/local/bin:/usr/bin:/bin',HOME:'/nonexistent',LANG:'C',GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_NOSYSTEM:'1'};
+        const tip=await execute('git',args,{cwd:bases,env});
+        const text=String(tip.stdout??'').trim();
+        if(tip.code===0&&/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(text))bundleBase=text;
+      } catch { /* no base: the Mac sends a full bundle */ }
+      if(gitBundle===true&&bundleReady) {
+        const bundleDir=join(container,'bundle');
+        await mkdir(bundleDir,{mode:0o755});
+        await handoff(worker,bundleDir);
+      }
       if (siblings === true) {
         const sibling = join(container,'frontierui');
         await mkdir(sibling,{mode:0o755});
@@ -1067,7 +1083,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
         await pinBase(run,baseSha);
         await writeFile(statePath(run,'base'),JSON.stringify({baseSha,baseManifestDigest}),{flag:'wx',mode:0o600});
       });
-      return {run,...(worker.active?{slot:worker.user,worker:{user:worker.user,uid:worker.uid,gid:worker.gid}}:{}),capabilities:{siblings:1,commandClasses:1,gitWorktree:2,...(worker.active?{workers:(await workers()).map(w=>w.user)}:{}),...await this.bases()}};
+      return {run,...(worker.active?{slot:worker.user,worker:{user:worker.user,uid:worker.uid,gid:worker.gid}}:{}),capabilities:{siblings:1,commandClasses:1,gitWorktree:2,...(bundleReady?{gitBundle:1,...(bundleBase?{gitBundleBase:bundleBase}:{})}:{}),...(worker.active?{workers:(await workers()).map(w=>w.user)}:{}),...await this.bases()}};
       }catch(error){
         await rm(container,{recursive:true,force:true});
         await rm(statePath(run,'prepared'),{force:true});
@@ -1163,11 +1179,13 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
         if (info && (info.isSymbolicLink() || !info.isDirectory() || (await readdir(sibling)).length)) throw new Error('Extra sibling snapshot');
       }
       if(await digestInput(work)!==request.inputDigest || lock!==request.lock) throw new Error('Input digest mismatch');
-      if(request.argv[2]==='check:standards'||request.env.DIFF_COVERAGE_BASE!==undefined) {
+      if(request.argv[2]==='check:standards'||request.env.DIFF_COVERAGE_BASE!==undefined||request.bundle!==undefined) {
         if(!request.manifest.git)throw new Error('Missing Git evidence');
         if(request.env.DIFF_COVERAGE_BASE!==request.manifest.git.diffCoverageBase)throw new Error('Coverage base mismatch');
         try {
+          if(request.bundle!==undefined&&!validBundleEvidence(request.bundle))throw new Error('Invalid bundle evidence');
           await materializeWorktree({work,root:bases,baseSha:request.baseSha,head:request.manifest.git.head,manifest:request.manifest,manifestDigest:request.manifestDigest,
+            ...(request.bundle!==undefined?{bundle:{...request.bundle,file:join(container,'bundle','git.bundle')},sharedClone:true}:{}),
             ...(testRoot&&testGitExec?{exec:testGitExec}:{})});
           await handoff(worker,join(work,'.git'),{recursive:true,workerParent:true});
         } catch(error) {throw Object.assign(error,{code:error.code==='diff-coverage-base-unavailable'?error.code:'git-head-unavailable'});}
