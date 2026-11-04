@@ -17,6 +17,29 @@ describe('sourceNeedsGit', () => {
   it('detects declared git helper imports', () => {
     expect(sourceNeedsGit("import { x } from '../git-helper.mjs';", { helpers: ['git-helper.mjs'] })).toBe(true);
   });
+  it('keeps code after a regex literal containing slashes (not a line comment)', () => {
+    const cp = "import { execFileSync } from 'node:child_process';\n";
+    expect(sourceNeedsGit(cp + "const re = /https?:\\/\\//; execFileSync('git', ['ls-files']);")).toBe(true);
+    expect(sourceNeedsGit(cp + "const re = /[/]x\\/\\//g; execFileSync('git', []);")).toBe(true);
+    expect(sourceNeedsGit(cp + "if (/^\\/\\//.test(s)) execFileSync('git', []);")).toBe(true);
+    expect(sourceNeedsGit(cp + "const a = [/\\/\\//, 1]; return /\\/\\//.test(x), execFileSync('git', []);")).toBe(true);
+    expect(sourceNeedsGit(cp + "const q = (a / b) / c; execFileSync('git', []);")).toBe(true);
+    // a regex literal is not code: a quoted git inside it must not count as a spawn
+    expect(sourceNeedsGit(cp + "const re = /'git'/; run('node')")).toBe(false);
+    // a real comment after a regex is still a comment
+    expect(sourceNeedsGit(cp + "const re = /a\\//; // execFileSync('git', [])")).toBe(false);
+  });
+  it('honours declared helpers imported dynamically, by side-effect, or via require', () => {
+    const o = { helpers: ['git-helper.mjs'] };
+    expect(sourceNeedsGit("const { tracked } = await import('../git-helper.mjs'); tracked();", o)).toBe(true);
+    expect(sourceNeedsGit("await import(`../git-helper.mjs`)", o)).toBe(true);
+    expect(sourceNeedsGit("import '../git-helper.mjs';", o)).toBe(true);
+    expect(sourceNeedsGit('import "../git-helper.mjs"', o)).toBe(true);
+    expect(sourceNeedsGit("const h = require('../git-helper.mjs')", o)).toBe(true);
+    expect(sourceNeedsGit("export * from '../git-helper.mjs'", o)).toBe(true);
+    expect(sourceNeedsGit("// import '../git-helper.mjs'\n// await import('../git-helper.mjs')", o)).toBe(false);
+    expect(sourceNeedsGit("const s = 'git-helper.mjs'; other('../git-helper.mjs')", o)).toBe(false);
+  });
   it('does not flag prose or non-spawn mentions', () => {
     expect(sourceNeedsGit("const msg = 'run git later'; execFileSync('node', ['x'])")).toBe(false);
     expect(sourceNeedsGit("execFileSync('gitleaks', [])")).toBe(false);

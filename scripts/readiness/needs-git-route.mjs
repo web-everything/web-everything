@@ -8,7 +8,58 @@ export const NEEDS_GIT_REASON = 'needs-git';
 const MAX_BYTES = 1024 * 1024;
 
 // String-aware: quoted/template literals are kept verbatim, only real comments are dropped.
-const stripComments = (t) => t.replace(/('(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\.|[^`\\])*`)|\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, (m, str) => str ?? ' ');
+// A single linear scan (no regex backtracking) that also recognises regex literals, so the `//` inside
+// /https?:\/\// is not mistaken for a line comment. Regex literals are replaced by a neutral token: they are not code.
+const REGEX_AFTER_WORD = new Set(['return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete', 'void', 'throw', 'case', 'do', 'else', 'yield', 'await']);
+const isIdent = (c) => /[\w$]/.test(c);
+function stripComments(t) {
+  const n = t.length;
+  let out = '';
+  let i = 0;
+  let last = ''; // last significant (non-space) code character emitted
+  let word = ''; // identifier that ends at `last`, if any
+  const emit = (s, sig) => { out += s; last = sig; word = ''; };
+  while (i < n) {
+    const c = t[i];
+    const d = t[i + 1];
+    if (c === '/' && d === '/') { while (i < n && t[i] !== '\n') i++; out += ' '; continue; }
+    if (c === '/' && d === '*') { const j = t.indexOf('*/', i + 2); i = j < 0 ? n : j + 2; out += ' '; continue; }
+    if (c === "'" || c === '"' || c === '`') {
+      let j = i + 1;
+      while (j < n && t[j] !== c && (c === '`' || t[j] !== '\n')) j += t[j] === '\\' ? 2 : 1;
+      const end = t[j] === c ? j + 1 : Math.min(j, n);
+      emit(t.slice(i, end), c);
+      i = end;
+      continue;
+    }
+    if (c === '/') {
+      const regexOk = last === '' || (isIdent(last) ? REGEX_AFTER_WORD.has(word) : !')]}'.includes(last) && last !== '"' && last !== "'" && last !== '`');
+      if (regexOk) {
+        let j = i + 1;
+        let cls = false;
+        while (j < n && t[j] !== '\n') {
+          const e = t[j];
+          if (e === '\\') { j += 2; continue; }
+          if (e === '[') cls = true; else if (e === ']') cls = false; else if (e === '/' && !cls) break;
+          j++;
+        }
+        if (t[j] === '/') {
+          j++;
+          while (j < n && isIdent(t[j])) j++;
+          emit(' 0 ', '0');
+          word = '';
+          i = j;
+          continue;
+        }
+      }
+    }
+    if (/\s/.test(c)) { out += c; i++; continue; }
+    if (isIdent(c)) { word = isIdent(last) && word !== '' && out.endsWith(word) ? word + c : c; last = c; out += c; i++; continue; }
+    emit(c, c);
+    i++;
+  }
+  return out;
+}
 // A test spawns git when it reaches child_process (any import form or alias) AND names git as an executable:
 // a quoted git / git-path literal or a shell string starting with git. Mocked spawns without a child_process
 // import, comments and prose are not flagged. A declared helper matches an import specifier by basename only.
@@ -19,7 +70,8 @@ export function sourceNeedsGit(text, { helpers = [] } = {}) {
   if (typeof text !== 'string' || !text) return false;
   const code = stripComments(text);
   if (CHILD.test(code) && GIT_LITERAL.test(code)) return true;
-  return helpers.some(h => new RegExp(`from\\s*['"][^'"]*${h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}['"]`).test(code));
+  // Every import form: static (`from '…'`), side-effect (`import '…'`), dynamic (`import('…')`) and `require('…')`.
+  return helpers.some(h => new RegExp(`(?:\\bfrom\\s*|\\bimport\\s*\\(?\\s*|\\brequire\\s*\\(\\s*)['"\`][^'"\`\\n]*${h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}['"\`]`).test(code));
 }
 
 // Positional (non-flag) arguments after the vitest/test:unit invocation. Values of known valued flags are skipped.
