@@ -411,7 +411,8 @@ describe('runBounded failure details', () => {
     const cli = join(dirname(fileURLToPath(import.meta.url)), '../../conveyor/reconcile-pass.mjs');
     const cause = 'gh-throttle: throttled — no gh slot within 90s (class=read); retry next tick';
     // Inject the failed state read at the module boundary; execute the actual CLI and its catch unchanged.
-    const snapshot = `export function readSharedOpenPrs() {
+    const snapshot = `export { sampleContextDeclared } from ${JSON.stringify(pathToFileURL(join(dirname(cli), '../lib/pr-snapshot.mjs')).href)};
+    export function readSharedOpenPrs() {
       process.stderr.write(${JSON.stringify(cause + '\n')});
       throw new Error(${JSON.stringify(cause)});
     }`;
@@ -443,13 +444,14 @@ describe('runBounded failure details', () => {
     const cause = 'gh-throttle: throttled — no gh slot within 90s (class=background); retry next tick';
     // Replace only the snapshot entry point: its actual page/hydration reader wraps the injected exec failure.
     const snapshot = `import { fetchSnapshot } from ${JSON.stringify(snapshotUrl)};
+      export { sampleContextDeclared } from ${JSON.stringify(snapshotUrl)};
       export function readSharedOpenPrs() {
         let calls = 0;
         return fetchSnapshot({ repo: 'example/repo', paging: { pageSize: 1, pageRetries: 0, heavyMaxAgeSeconds: 1 },
           exec() {
             if (++calls === 1 && ${JSON.stringify(stage)} !== 'first page') {
               return JSON.stringify({ data: { repository: { pullRequests: {
-                totalCount: 2, nodes: [{ number: 42 }],
+                totalCount: ${JSON.stringify(stage)} === 'hydrate' ? 1 : 2, nodes: [{ number: 42 }],
                 pageInfo: { hasNextPage: ${JSON.stringify(stage)} === 'later page', endCursor: 'next' }
               } } } });
             }
