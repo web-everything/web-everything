@@ -130,8 +130,8 @@ describe('settings — one resourceGate block through the policy cascade, with s
       env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '8', WE_RESOURCE_CUTOVER: 'enforce', WE_FIX_CAP_RAISE_MAX_SWAP_USED_PCT: '50' }, legacyFloor: 2,
     });
     expect(r.settings).toEqual({ cutover: 'enforce', fixCap: { floor: 8, ceiling: 12, ceilingAboveFloor: 4, raiseQueueOver: 3, raiseStepPerPass: 2,
-      raiseMinMemFreePct: 10, raiseMaxSwapUsedPct: 50, raiseMaxHeavyWaitMinutes: 15,
-      lowerBelowMemFreePct: 3, lowerAboveSwapUsedPct: 90, lowerAboveHeavyWaitMinutes: 45, lowerBy: 4, lowerMinimum: 2,
+      raiseMinMemFreePct: 40, raiseMaxSwapUsedPct: 50, raiseMaxHeavyWaitMinutes: 15,
+      lowerBelowMemFreePct: 15, lowerAboveSwapUsedPct: 90, lowerAboveHeavyWaitMinutes: 45, lowerBy: 4, lowerMinimum: 2,
       holdCpuIdleBelowPct: 12 } });
     expect(r.sources).toMatchObject({ cutover: 'env WE_RESOURCE_CUTOVER', 'fixCap.floor': 'env WE_FIX_DISPATCH_MAX_CONCURRENT',
       'fixCap.ceiling': 'floor + 4', 'fixCap.raiseQueueOver': 'platform', 'fixCap.holdCpuIdleBelowPct': 'tool', 'fixCap.raiseStepPerPass': 'standard',
@@ -157,20 +157,20 @@ describe('settings — one resourceGate block through the policy cascade, with s
 describe('dynamic fixer cap', () => {
   const fixCap = { ...RESOURCE_GATE_STANDARD.fixCap, floor: 8, ceiling: 12, ceilingAboveFloor: 4, raiseQueueOver: 5, raiseStepPerPass: 2 };
   const cap = (o) => decideFixCap({ fixCap, nowMs: NOW, liveAtPassStart: 8, queueLength: 7, heavyWaitMinutes: 5,
-    snapshot: snap({ idle: 45, freePct: 30, swapUsedPct: 20 }), ...o });
+    snapshot: snap({ idle: 45, freePct: 50, swapUsedPct: 20 }), ...o });
   it('raises above the floor when memory and swap are healthy, the heavy-queue wait is short and the fix queue is long', () => {
-    expect(cap()).toMatchObject({ cap: 10, raised: true, memFreePct: 30, swapUsedPct: 20, heavyWaitMinutes: 5 });
-    expect(cap().reason).toMatch(/mem free 30% ≥ 10%, swap 20% ≤ 60%, heavy wait 5m ≤ 15m and fix queue 7 > 5/);
+    expect(cap()).toMatchObject({ cap: 10, raised: true, memFreePct: 50, swapUsedPct: 20, heavyWaitMinutes: 5 });
+    expect(cap().reason).toMatch(/mem free 50% ≥ 40%, swap 20% ≤ 60%, heavy wait 5m ≤ 15m and fix queue 7 > 5/);
   });
   it('CPU is only a backstop: 23% idle (live 2026-10-10, held the cap at the floor) now raises; under 10% holds', () => {
-    expect(cap({ snapshot: snap({ idle: 23, freePct: 30, swapUsedPct: 20 }) })).toMatchObject({ cap: 10, raised: true });
-    const held = cap({ snapshot: snap({ idle: 9, freePct: 30, swapUsedPct: 20 }) });
+    expect(cap({ snapshot: snap({ idle: 23, freePct: 50, swapUsedPct: 20 }) })).toMatchObject({ cap: 10, raised: true });
+    const held = cap({ snapshot: snap({ idle: 9, freePct: 50, swapUsedPct: 20 }) });
     expect(held).toMatchObject({ cap: 8, raised: false });
     expect(held.reason).toMatch(/cpu idle 9% < 10% backstop/);
   });
   it.each([
-    ['swap nearly full (live 2026-10-10: 26.5 of 27.6 GB)', { snapshot: snap({ idle: 23, freePct: 30, swapUsedPct: 96 }) }, /swap 96% > 90%/],
-    ['free memory exhausted', { snapshot: snap({ idle: 50, freePct: 2, swapUsedPct: 20 }) }, /mem free 2% < 3%/],
+    ['swap nearly full (live 2026-10-10: 26.5 of 27.6 GB)', { snapshot: snap({ idle: 23, freePct: 50, swapUsedPct: 96 }) }, /swap 96% > 90%/],
+    ['free memory exhausted', { snapshot: snap({ idle: 50, freePct: 2, swapUsedPct: 20 }) }, /mem free 2% < 15%/],
     ['the heavy queue is backed up', { heavyWaitMinutes: 60 }, /heavy wait 60m > 45m/],
   ])('LOWERS below the floor: %s', (_, o, why) => {
     const d = cap(o);
@@ -179,25 +179,25 @@ describe('dynamic fixer cap', () => {
   });
   it('never lowers below lowerMinimum', () => {
     expect(decideFixCap({ fixCap: { ...fixCap, floor: 3 }, nowMs: NOW, liveAtPassStart: 3, queueLength: 7, heavyWaitMinutes: 90,
-      snapshot: snap({ freePct: 30, swapUsedPct: 20 }) })).toMatchObject({ cap: 2, lowered: true });
+      snapshot: snap({ freePct: 50, swapUsedPct: 20 }) })).toMatchObject({ cap: 2, lowered: true });
   });
   it('a ceiling under the floor handed in directly is normalised to the floor, never exceeded', () => {
     const d = decideFixCap({ fixCap: { ...fixCap, floor: 3, ceiling: 2 }, nowMs: NOW, liveAtPassStart: 3, queueLength: 7, heavyWaitMinutes: 5,
-      snapshot: snap({ idle: 45, freePct: 30, swapUsedPct: 20 }) });
+      snapshot: snap({ idle: 45, freePct: 50, swapUsedPct: 20 }) });
     expect(d).toMatchObject({ cap: 3, ceiling: 3, raised: false });
   });
   it.each([
     [1, 1], [1, 3], [2, 2], [3, 3],
   ])('lowering never lifts the cap above the floor (floor %i, ceiling %i, lowerMinimum 2)', (floor, ceiling) => {
     const d = decideFixCap({ fixCap: { ...fixCap, floor, ceiling }, nowMs: NOW, liveAtPassStart: floor, queueLength: 7, heavyWaitMinutes: 90,
-      snapshot: snap({ freePct: 30, swapUsedPct: 96 }) });
+      snapshot: snap({ freePct: 50, swapUsedPct: 96 }) });
     expect(d.cap).toBeLessThanOrEqual(floor);
     expect(d.cap).toBeLessThanOrEqual(ceiling);
     expect(d.lowered).toBe(d.cap < floor);
   });
   it.each([
-    ['swap above the raise threshold', { snapshot: snap({ idle: 45, freePct: 30, swapUsedPct: 70 }) }],
-    ['free memory under the raise threshold', { snapshot: snap({ idle: 45, freePct: 8, swapUsedPct: 20 }) }],
+    ['swap above the raise threshold', { snapshot: snap({ idle: 45, freePct: 50, swapUsedPct: 70 }) }],
+    ['free memory under the raise threshold', { snapshot: snap({ idle: 45, freePct: 30, swapUsedPct: 20 }) }],
     ['heavy wait over the raise threshold', { heavyWaitMinutes: 20 }],
   ])('holds at the floor (no raise, no lower): %s', (_, o) => {
     expect(cap(o)).toMatchObject({ cap: 8, raised: false, lowered: false });
@@ -215,7 +215,7 @@ describe('dynamic fixer cap', () => {
   it.each([
     ['queue at the threshold', { queueLength: 5 }],
     ['unknown queue', { queueLength: null }],
-    ['CPU under the backstop', { snapshot: snap({ idle: 9.9, freePct: 30, swapUsedPct: 20 }) }],
+    ['CPU under the backstop', { snapshot: snap({ idle: 9.9, freePct: 50, swapUsedPct: 20 }) }],
     ['fix not admitted (memory critical)', { snapshot: snap({ idle: 90, pressure: 4 }) }],
     ['stale snapshot', { snapshot: snap({ idle: 90, ageMs: 600000 }) }],
     ['missing snapshot', { snapshot: null }],
@@ -276,6 +276,30 @@ describe('dynamic fixer cap', () => {
       ['no available reading', () => snap({ availableMb: null })], ['no floor', () => snap({ floorMb: null })],
       ['no pressure', () => snap({ pressure: null })]])('fails closed on %s', (_n, readSnap) => {
       expect(mk(readSnap).tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
+    });
+  });
+  describe('R558 available-metric thresholds', () => {
+    const std = { ...RESOURCE_GATE_STANDARD.fixCap, floor: 8, ceiling: 12, ceilingAboveFloor: 4 };
+    const run = (freePct, fc = std) => decideFixCap({ fixCap: fc, liveAtPassStart: 8, queueLength: 20, heavyWaitMinutes: 1,
+      snapshot: snap({ idle: 50, freePct, swapUsedPct: 10 }), nowMs: NOW });
+    it('standard defaults: lower below 15, raise at 40 or more', () => {
+      expect(std).toMatchObject({ lowerBelowMemFreePct: 15, raiseMinMemFreePct: 40 });
+    });
+    it('lowers below 15% available, not at 15%', () => {
+      expect(run(14.9)).toMatchObject({ lowered: true });
+      expect(run(15).lowered).toBe(false);
+    });
+    it('does not raise between 15% and 40%; raises at 40%', () => {
+      expect(run(39.9)).toMatchObject({ raised: false });
+      expect(run(40)).toMatchObject({ raised: true });
+    });
+    it('the probe case: 43% available raises only because the configured rule (40) allows it; a stricter configured rule holds it', () => {
+      expect(run(43).raised).toBe(true);
+      const held = run(43, { ...std, raiseMinMemFreePct: 50 });
+      expect(held.raised).toBe(false); expect(held.reason).toMatch(/43% < 50% raise threshold/);
+    });
+    it('6.9% (the old probe fixture) lowers the cap, never raises it', () => {
+      expect(run(6.9)).toMatchObject({ lowered: true, raised: false });
     });
   });
 });

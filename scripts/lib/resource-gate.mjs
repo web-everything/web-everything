@@ -49,8 +49,11 @@ export const RESOURCE_GATE_STANDARD = Object.freeze({
     // Operator 2026-10-10: a fixer mostly waits on the model and its tests already queue on heavy admission, so CPU
     // idle is the wrong main signal (23% idle held the cap at the floor while swap 26.5/27.6 GB was what hurt).
     // The cap moves on free memory + swap and on the projected heavy-queue wait; CPU is only a backstop.
-    raiseMinMemFreePct: 10, raiseMaxSwapUsedPct: 60, raiseMaxHeavyWaitMinutes: 15,
-    lowerBelowMemFreePct: 3, lowerAboveSwapUsedPct: 90, lowerAboveHeavyWaitMinutes: 45, lowerBy: 4, lowerMinimum: 2,
+    // R558 (2026-11-04): the memory signals read AVAILABLE memory (free+inactive+purgeable+speculative), which sits far
+    // above the old never-used-pages reading, so lower below 15% and raise only above 40% (was 3 / 10). Both stay
+    // policy-cascade leaves (fixCap.*, source logged on every fix-cap line); the hard floor + pressure check still apply.
+    raiseMinMemFreePct: 40, raiseMaxSwapUsedPct: 60, raiseMaxHeavyWaitMinutes: 15,
+    lowerBelowMemFreePct: 15, lowerAboveSwapUsedPct: 90, lowerAboveHeavyWaitMinutes: 45, lowerBy: 4, lowerMinimum: 2,
     holdCpuIdleBelowPct: 10,
   }),
 });
