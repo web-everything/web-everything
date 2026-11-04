@@ -128,7 +128,14 @@ describe('merge-ai-prs CLI — #4108 one `gh pr list` per repo per pass (RECONCI
 
   beforeAll(() => {
     shimDir = mkdtempSync(join(tmpdir(), 'merge-ai-prs-dedupe-gh-shim-'));
-    writeFileSync(join(shimDir, 'gh'), FAKE_GH);
+    // Only `pr list` needs node (fixture slicing + call log). `repo view` / `pr view` are answered by a POSIX sh
+    // wrapper: the 501-PR scenario made ~one `gh pr view` per PR, each a cold node start (R578: ~275 s -> hermetic-fast).
+    writeFileSync(join(shimDir, 'gh-node.js'), FAKE_GH);
+    writeFileSync(join(shimDir, 'gh'), `#!/bin/sh
+if [ "$1" = repo ] && [ "$2" = view ]; then printf main; exit 0; fi
+if [ "$1" = pr ] && [ "$2" = view ]; then printf '{}'; exit 0; fi
+exec node "${join(shimDir, 'gh-node.js')}" "$@"
+`);
     chmodSync(join(shimDir, 'gh'), 0o755);
     // A throwaway git repo (no real remote reached — localRepoSlug() fails soft to null on a bad/absent
     // origin) so the CLI's own `git remote get-url origin` probe never touches the real webeverything checkout.
