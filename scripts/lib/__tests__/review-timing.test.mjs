@@ -34,6 +34,14 @@ describe('pending-CI start policy', () => {
       expect(reviewCiGate({ headSha: head, checks, requiredChecks }).allowed).toBe(false);
       expect(reviewStartGate({ headSha: head, requiredChecks, checks, policy: policy(startEarly) }).allowed).toBe(false);
     });
+    // Self-review on 9d3b3764: a contradictory aggregate (`state` red/pending, `conclusion: success`) is NOT green to
+    // the strict gate (its `state` wins), so it must not imply integration in the registration gate either.
+    it.each([['failure', 'shadow'], ['error', 'on'], ['pending', 'shadow'], ['FAILURE', 'on']])(
+      'a contradictory status (state=%s, conclusion=success) implies nothing (startEarly=%s)', (state, startEarly) => {
+        const checks = [{ context: 'test', state, conclusion: 'success' }];
+        expect(reviewCiGate({ headSha: head, checks, requiredChecks: ['integration'] }).allowed).toBe(false);
+        expect(reviewStartGate({ headSha: head, requiredChecks: ['integration'], checks, policy: policy(startEarly) }).allowed).toBe(false);
+      });
   });
   it('off preserves the exact pre-early-start ci-green refusal for completed red CI', () => {
     expect(reviewStartGate({ headSha: head, requiredChecks: ['test'], checks: [check('test', 'failure')],

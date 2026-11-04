@@ -142,9 +142,16 @@ function registeredStartGate({ headSha, checks, requiredChecks }) {
   // strict gate reads a legacy commit status (`{context, state}`) as a check row first, so a green STATUS aggregate
   // implies too; the per-row judgment below reads the raw row, which already handles `state`. Only a row with NO
   // `status` key is a status (as review-ci-gate.mjs#statusAsCheckRow): `status: null` stays raw and implies nothing.
-  const asCheckRow = row => row && typeof row === 'object' && row.status === undefined && row.conclusion == null
-    && typeof row.state === 'string' && row.state.toLowerCase() === 'success'
-    ? { ...row, status: 'completed', conclusion: 'success' } : row;
+  // The WHOLE mapping mirrors statusAsCheckRow, `state` overriding any `conclusion` on the row: a contradictory
+  // `{state: 'failure', conclusion: 'success'}` aggregate is red to the strict gate, so it must imply nothing here.
+  const asCheckRow = row => {
+    if (!row || typeof row !== 'object' || row.status !== undefined || typeof row.state !== 'string') return row;
+    const state = row.state.toLowerCase();
+    if (state === 'success') return { ...row, status: 'completed', conclusion: 'success' };
+    if (state === 'failure' || state === 'error') return { ...row, status: 'completed', conclusion: state };
+    if (state === 'pending' || state === 'expected') return { ...row, status: 'pending' };
+    return row;
+  };
   const affected = [...new Set(withoutImpliedRequiredChecks(requiredChecks, [...latest.values()].map(asCheckRow)))].flatMap(name => {
     const row = latest.get(name);
     let reason;
