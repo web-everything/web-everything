@@ -104,7 +104,10 @@ export function releaseOrder(waiters, settings = GOVERNOR_DEFAULTS) {
 export const defaultPauseDir = (home = homedir()) => join(home, '.claude', 'conveyor', 'pause');
 const safe = (o) => String(o).replace(/[^A-Za-z0-9._-]/g, '_');
 /** An owner name usable as a flag file: a non-blank string whose on-disk name is not the pause dir (`.`) or its parent (`..`). */
-export const validOwner = (o) => typeof o === 'string' && o.trim() !== '' && !['.', '..'].includes(safe(o));
+export const MAX_OWNER_NAME = 200; // filesystems cap a file name at 255 bytes; past it setPause throws ENAMETOOLONG
+export const validOwner = (o) => typeof o === 'string' && o.trim() !== '' && !['.', '..'].includes(safe(o)) && safe(o).length <= MAX_OWNER_NAME;
+/** Collision key for flag files: the default macOS/Windows filesystems fold case, so `w1` and `W1` are one file. */
+const flagKey = (o) => safe(o).toLowerCase();
 
 export function setPause({ dir = defaultPauseDir(), owner, reason, resumeWhen = 'load below resumeBelowPerCore', by = 'operator', now = new Date() }) {
   mkdirSync(dir, { recursive: true });
@@ -138,23 +141,23 @@ export function governorTick({ loadPerCore, owners = [], settings = GOVERNOR_DEF
   let prev = false; let cooled = []; try { const j = JSON.parse(readFileSync(stateFile, 'utf8')); prev = j.holding === true; cooled = Array.isArray(j.cooled) ? j.cooled : []; } catch { /* first run */ }
   const st = governorState({ loadPerCore, holding: prev, settings });
   const events = [];
-  for (const o of sweepExpired({ dir, maxPauseMinutes: settings.maxPauseMinutes, now })) { events.push({ event: 'expired', owner: o }); if (st.holding && !cooled.includes(o)) cooled.push(o); } // TTL is a hard cap: no re-pause until load clears
+  for (const o of sweepExpired({ dir, maxPauseMinutes: settings.maxPauseMinutes, now })) { events.push({ event: 'expired', owner: o }); if (st.holding && !cooled.includes(flagKey(o))) cooled.push(flagKey(o)); } // TTL is a hard cap: no re-pause until load clears
   if (!st.holding) cooled = [];
   if (st.unreadable) events.push({ event: 'load-unreadable', reason: st.reason });
   // Flags are keyed by the sanitized name, so `w/1` and `w_1` share one file. If any owner on a key is exempt, the key is never
   // paused (an exempt worker must not be held through a sibling's name) and the holdable sibling is reported, not paused.
-  const exemptKeys = new Set(owners.filter((o) => validOwner(o.owner) && !isHoldable(ownerClass(o.text ?? o.owner, settings), settings)).map((o) => safe(o.owner)));
+  const exemptKeys = new Set(owners.filter((o) => validOwner(o.owner) && !isHoldable(ownerClass(o.text ?? o.owner, settings), settings)).map((o) => flagKey(o.owner)));
   for (const { owner, text } of owners) {
     if (!validOwner(owner)) { events.push({ event: 'skipped-invalid-owner', owner: String(owner) }); continue; } // `.`/`..`/blank would hit the pause dir itself
     const cls = ownerClass(text ?? owner, settings);
-    if (isHoldable(cls, settings) && exemptKeys.has(safe(owner))) { events.push({ event: 'skipped-colliding-owner', owner, cls }); continue; }
+    if (isHoldable(cls, settings) && exemptKeys.has(flagKey(owner))) { events.push({ event: 'skipped-colliding-owner', owner, cls }); continue; }
     const cur = readPause({ dir, owner, maxPauseMinutes: settings.maxPauseMinutes, now });
     if (!isHoldable(cls, settings)) { // reclassified as exempt (e.g. feature-build -> red-main-repair): drop OUR pause, never an operator's
       if (cur?.by === GOVERNOR_REASON) { clearPause({ dir, owner }); events.push({ event: 'resumed', owner, cls }); }
       continue;
     }
     // cooled holds on-disk (sanitized) names, as sweepExpired returns them, so compare in that key space
-    if (st.holding && !cur && !cooled.includes(safe(owner))) { setPause({ dir, owner, reason: `${GOVERNOR_REASON}: ${st.reason}`, by: GOVERNOR_REASON, now }); events.push({ event: 'paused', owner, cls }); }
+    if (st.holding && !cur && !cooled.includes(flagKey(owner))) { setPause({ dir, owner, reason: `${GOVERNOR_REASON}: ${st.reason}`, by: GOVERNOR_REASON, now }); events.push({ event: 'paused', owner, cls }); }
     else if (!st.holding && cur?.by === GOVERNOR_REASON) { clearPause({ dir, owner }); events.push({ event: 'resumed', owner, cls }); }
   }
   if (!st.holding) { // owners gone from the list but still flagged by us: clear too

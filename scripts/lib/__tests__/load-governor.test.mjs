@@ -265,3 +265,27 @@ describe('worker-pause CLI and smell', () => {
     expect(s.evaluate({ machineLoad: { load1: NaN, cpuCount: 12 } })[0].summary).toContain('unreadable');
   });
 });
+describe('owner names: length bound and case-folded collisions', () => {
+  const now = new Date('2026-11-03T13:00:00Z');
+  it('an over-long owner is skipped, never crashes the tick, and the other owners are still paused', () => {
+    const dir = tmp(); const stateFile = join(tmp(), 'st.json');
+    const long = 'x'.repeat(300);
+    const r = governorTick({ loadPerCore: 3, owners: [{ owner: 'a', text: 'feature' }, { owner: long, text: 'feature' }, { owner: 'b', text: 'feature' }], stateFile, dir, now });
+    expect(r.events.map((e) => `${e.event}:${e.owner.slice(0, 3)}`)).toEqual(['paused:a', 'skipped-invalid-owner:xxx', 'paused:b']);
+    expect(listPauses({ dir, now }).map((x) => x.owner).sort()).toEqual(['a', 'b']);
+  });
+  it.each([['--owner=' + 'x'.repeat(300)], ['--resume', '--owner=' + 'x'.repeat(300)]])('the CLI rejects an over-long owner (%s) with an argument error', (...argv) => {
+    const dir = tmp(); const out = [];
+    setPause({ dir, owner: 'a', reason: 'x', by: 'operator', now });
+    expect(main(argv, { dir, out: (s) => out.push(s), now })).toBe(2);
+    expect(out.at(-1)).toMatch(/error/);
+    expect(listPauses({ dir, now }).map((x) => x.owner)).toEqual(['a']);
+  });
+  it.each([['w1', 'W1'], ['W1', 'w1']])('owners %s and %s differ only by case: the exempt one wins and the holdable one is not paused', (first, second) => {
+    const dir = tmp(); const stateFile = join(tmp(), 'st.json');
+    const texts = { w1: 'red-main repair', W1: 'feature' };
+    const r = governorTick({ loadPerCore: 3, owners: [first, second].map((owner) => ({ owner, text: texts[owner] })), stateFile, dir, now });
+    expect(listPauses({ dir, now })).toEqual([]);
+    expect(r.events.map((e) => e.event)).toEqual(['skipped-colliding-owner']);
+  });
+});
