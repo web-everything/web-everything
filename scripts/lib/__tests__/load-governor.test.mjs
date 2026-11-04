@@ -75,6 +75,21 @@ describe('pause flags', () => {
     expect(shouldHold({ text: 'main-fix', holding: true, settings: resolveGovernorSettings({ settings: { loadGovernor: { holdFromClass: 'main-fix' } } }) }).hold).toBe(false);
     expect(resolveGovernorSettings({ settings: { loadGovernor: { targetLoadPerCore: 1 } } }).resumeBelowPerCore).toBe(0.8);
   });
+  it('TTL hard cap holds for owners whose name is sanitized on disk (build:42 -> build_42), across ticks and two owners sharing a filename', () => {
+    const dir = tmp(); const stateFile = join(tmp(), 'st.json');
+    const o = [{ owner: 'build:42' }, { owner: 'build/42' }, { owner: 'plain' }];
+    governorTick({ loadPerCore: 3, owners: o, stateFile, dir, now });
+    expect(readPause({ dir, owner: 'build:42', now })).not.toBeNull();
+    const later = new Date(now.getTime() + 91 * 60_000);
+    const r = governorTick({ loadPerCore: 3, owners: o, stateFile, dir, now: later });
+    expect(r.events.filter((e) => e.event === 'paused')).toEqual([]);
+    expect(readPause({ dir, owner: 'build:42', now: later })).toBeNull();
+    const later2 = new Date(later.getTime() + 5 * 60_000); // next tick: still cooled, still not renewed
+    expect(governorTick({ loadPerCore: 3, owners: o, stateFile, dir, now: later2 }).events.filter((e) => e.event === 'paused')).toEqual([]);
+    governorTick({ loadPerCore: 1.0, owners: o, stateFile, dir, now: later2 }); // load clears -> cooldown resets
+    const r3 = governorTick({ loadPerCore: 3, owners: o, stateFile, dir, now: later2 });
+    expect(r3.events.filter((e) => e.event === 'paused').map((e) => e.owner).sort()).toEqual(['build:42', 'plain']); // build/42 shares build_42's file, so it sees the fresh flag
+  });
   it('unreadable load fails open: clears governor flags, sets none', () => {
     const dir = tmp(); const stateFile = join(tmp(), 'st.json');
     governorTick({ loadPerCore: 3, owners: [{ owner: 'build-a' }], stateFile, dir, now });
