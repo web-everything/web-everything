@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import yaml from 'js-yaml';
 
-import { quarantineSkip, renderExclude } from '../quarantine-skip.mjs';
+import { quarantineSkip, renderExclude, changedFilesOf } from '../quarantine-skip.mjs';
 import { decideCiSkip, ciJobContext, addEntries, setFixPrs, pruneOnGreen, validateQuarantineList, testsToSkip, planSafetyNet } from '../../lib/red-main-quarantine.mjs';
 import { skipForList } from '../../lib/red-main-quarantine-io.mjs';
 
@@ -277,5 +277,30 @@ describe('job-specific and nonblocking output', () => {
     expect(run({ ...base, flags: { ...flags, event: 'push', ref: 'refs/heads/main' } }).line).toBe('');
     const named = { ...integration, test: `${integration.test}::named failure` };
     expect(run({ ...base, read: { ok: true, list: { ...read.list, entries: [named] } } }).line).toBe('');
+  });
+
+  describe('changedFilesOf under shallow history fails closed', () => {
+    const mk = (mergeBaseOk) => {
+      const calls = [];
+      let deepened = false;
+      const run = (args) => {
+        calls.push(args.join(' '));
+        if (args[0] === 'fetch' && args.includes('--deepen=200')) { deepened = true; return ''; }
+        if (args[0] === 'merge-base') { if (deepened && mergeBaseOk) return 'abc\n'; throw new Error('no merge base'); }
+        if (args[0] === 'diff') return 'a.mjs\nb.mjs\n';
+        return '';
+      };
+      return { run, calls };
+    };
+    it('deepens when the merge base is missing, then proves the changed files', () => {
+      const { run, calls } = mk(true);
+      expect(changedFilesOf({ board: '.', base: 'main', run })).toEqual(['a.mjs', 'b.mjs']);
+      expect(calls.some((c) => c.includes('--deepen=200'))).toBe(true);
+    });
+    it('returns null (run everything) when the merge base stays unprovable', () => {
+      const { run, calls } = mk(false);
+      expect(changedFilesOf({ board: '.', base: 'main', run })).toBeNull();
+      expect(calls.some((c) => c.startsWith('diff'))).toBe(false);
+    });
   });
 });

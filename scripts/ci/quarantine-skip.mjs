@@ -41,11 +41,23 @@ const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', st
  */
 export const firstSet = (...vs) => { for (const v of vs) if (v != null && String(v).trim() !== '') return String(v).trim(); return null; };
 
-/** The files this PR changes against its base (`origin/<base>...HEAD`), or `null` when not provable. */
+/**
+ * The files this PR changes against its base (`origin/<base>...HEAD`), or `null` when not provable. Fails CLOSED under
+ * shallow history: the merge base must resolve, deepening the history (bounded, blobless) if it does not; if it still
+ * cannot be proven the caller gets `null` and runs every test instead of skipping.
+ */
 export function changedFilesOf({ board, base, run = git }) {
   if (!base) return null;
   try {
     run(['fetch', '--quiet', 'origin', `+refs/heads/${base}:refs/remotes/origin/${base}`], board);
+    const hasBase = () => { try { return run(['merge-base', `origin/${base}`, 'HEAD'], board).trim() !== ''; } catch { return false; } };
+    if (!hasBase()) {
+      for (const depth of [200, 1000, 10000]) {
+        try { run(['fetch', '--quiet', '--no-tags', '--filter=blob:none', `--deepen=${depth}`, 'origin', `+refs/heads/${base}:refs/remotes/origin/${base}`], board); } catch { /* try next */ }
+        if (hasBase()) break;
+      }
+      if (!hasBase()) return null;
+    }
     return run(['diff', '--name-only', `origin/${base}...HEAD`], board).split('\n').map((s) => s.trim()).filter(Boolean);
   } catch { return null; }
 }
