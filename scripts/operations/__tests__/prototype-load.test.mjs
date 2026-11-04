@@ -12,6 +12,7 @@ import { createRequire } from 'node:module';
 import { runInNewContext } from 'node:vm';
 import { withBareOrigin } from './helpers/real-repo.mjs';
 import { createPrototypeLoader, defaultDeps } from '../prototype-load-io.mjs';
+import { netDiffFingerprint } from '../../lib/net-diff-fingerprint.mjs';
 import { changedPaths, comparePaths, nextMergeRef, prototypeLoadOperation, PROTOTYPE_LOAD_EFFECT } from '../prototype-load.mjs';
 import * as prototypeLoad from '../prototype-load.mjs';
 import { QUESTION_HASH, main as auditMain } from '../codex-audit.mjs';
@@ -2021,5 +2022,86 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
       const out = await auditedFixture('refuse', { audits, auditBaseInMain: TREE, fingerprint }).run();
       expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { ok: false, reason: 'no-record' } });
     }
+  });
+  // The live fingerprint costs a fetch plus a git diff, so it is computed only when an older head's stored fingerprint could carry.
+  it.each([
+    ['no audit records at all', ''],
+    ['records without a stored fingerprint', auditLines([old({ fingerprint: undefined })])],
+    ['only records whose head is the live head', auditLines([auditRecord({ fingerprint: FP })])],
+    ['an older-head record with an empty fingerprint', auditLines([old({ fingerprint: '' })])],
+    ['an older-head record without a head', auditLines([old({ head: undefined })])],
+  ])('never computes the live fingerprint for %s', async (_, audits) => {
+    const fingerprint = vi.fn(() => FP);
+    const f = auditedFixture('refuse', { audits, auditBaseInMain: TREE, fingerprint });
+    const out = await f.run();
+    expect(fingerprint).not.toHaveBeenCalled();
+    // a loader that went on past the audit stage legitimately fetches `origin main <branch>` later (admission), so only a stop proves the guard
+    if (out.stopReason === 'no-canonical-audit') expect(f.calls.filter((c) => c.args[0] === 'fetch' && c.args.length > 3)).toEqual([]);
+    else expect(out.canonicalAudit).toMatchObject({ ok: true });
+  });
+  it('computes the live fingerprint exactly once, for origin/main and the live sha, when a candidate exists', async () => {
+    let f, fetchesBefore;
+    const fingerprint = vi.fn(() => { fetchesBefore = f.calls.filter((c) => c.args[0] === 'fetch' && c.args.length > 3).map((c) => c.args); return FP; });
+    f = auditedFixture('refuse', { audits: auditLines([old(), old({ base: 'f'.repeat(40) })]), auditBaseInMain: TREE, fingerprint });
+    await f.run();
+    expect(fingerprint).toHaveBeenCalledTimes(1);
+    expect(fingerprint).toHaveBeenCalledWith('origin/main', SHA);
+    // the live branch was fetched BEFORE it was fingerprinted
+    expect(fetchesBefore).toEqual([['fetch', 'origin', 'main', BASE.branch]]);
+  });
+  it('a failed fetch of the live branch means no carry and the fingerprint is never computed', async () => {
+    const fingerprint = vi.fn(() => FP);
+    const out = await auditedFixture('refuse', { audits: auditLines([old()]), auditBaseInMain: TREE, fingerprint, staleFetchFails: 'main' }).run();
+    expect(fingerprint).not.toHaveBeenCalled();
+    expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { ok: false, reason: 'no-record' } });
+  });
+  // The production wiring: no injected `fingerprint`, so netDiffFingerprint runs over the loader's own exec.
+  describe('default (non-injected) fingerprint wiring', () => {
+    const FORK = '9'.repeat(40);
+    // Canned git for the helper's own calls (the ones carrying --end-of-options); everything else keeps the fixture's handlers.
+    const cannedGit = (text) => {
+      const seen = [];
+      const exec = (cmd, args) => {
+        seen.push(args.slice(2));
+        const verb = args[2];
+        if (verb === 'rev-parse') return Buffer.from(`${args.at(-1).startsWith('origin/main') ? TREE : SHA}\n`);
+        if (verb === 'merge-base') return Buffer.from(`${FORK}\n`);
+        if (verb === 'diff') return Buffer.from(text);
+        throw new Error(`unexpected git ${args.slice(2)}`);
+      };
+      return { seen, exec, combinedIO: { handles: (cmd, args) => cmd === 'git' && args[0] === '-C' && args.includes('--end-of-options'), exec, fs: {} } };
+    };
+    const DIFF = 'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n';
+    const liveOf = (text) => netDiffFingerprint('/repo', 'origin/main', SHA, { exec: cannedGit(text).exec });
+    it('carries when the real helper, run over the loader exec, matches the stored fingerprint', async () => {
+      const fp = liveOf(DIFF);
+      expect(fp).toMatch(/^[0-9a-f]{64}$/);
+      const { combinedIO, seen } = cannedGit(DIFF);
+      const f = auditedFixture('refuse', { audits: auditLines([old({ fingerprint: fp })]), auditBaseInMain: TREE, combinedIO });
+      const out = await f.run();
+      expect(out.canonicalAudit).toEqual({ mode: 'refuse', ok: true, record: old({ fingerprint: fp }) });
+      // the helper saw origin/main as the base, the live sha as the head, and diffed the merge-base against the live sha
+      expect(seen.map((a) => a[0])).toEqual(['rev-parse', 'rev-parse', 'merge-base', 'diff']);
+      expect(seen[0].at(-1)).toBe(`${SHA}^{commit}`);
+      expect(seen[1].at(-1)).toBe('origin/main^{commit}');
+      expect(seen[3].slice(-2)).toEqual([FORK, SHA]);
+      // and the live branch was fetched before the helper first touched git
+      const firstFetch = f.calls.findIndex((c) => c.args[0] === 'fetch' && c.args.length > 3 && c.args[3] === BASE.branch);
+      const firstHelper = f.calls.findIndex((c) => c.cmd === 'git' && c.args.includes('--end-of-options'));
+      expect(firstFetch).toBeGreaterThanOrEqual(0);
+      expect(firstHelper).toBeGreaterThan(firstFetch);
+    });
+    it('does not carry when the live diff differs from the stored fingerprint', async () => {
+      const stored = liveOf(DIFF);
+      const { combinedIO } = cannedGit(`${DIFF}+more\n`);
+      const out = await auditedFixture('refuse', { audits: auditLines([old({ fingerprint: stored })]), auditBaseInMain: TREE, combinedIO }).run();
+      expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { ok: false, reason: 'no-record' } });
+    });
+    it('does not carry when the helper cannot read git (empty diff)', async () => {
+      const stored = liveOf(DIFF);
+      const { combinedIO } = cannedGit('');
+      const out = await auditedFixture('refuse', { audits: auditLines([old({ fingerprint: stored })]), auditBaseInMain: TREE, combinedIO }).run();
+      expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
+    });
   });
 });
