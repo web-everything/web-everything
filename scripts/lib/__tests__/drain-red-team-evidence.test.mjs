@@ -500,7 +500,7 @@ it.each([['unparseable', 1, false], ['error', 1, false], ['ok', 0, true]])(
     expect(readDrainRedTeamEvidence(f)).toMatchObject({ failedSeatCount, completedRecorded, seatRecorded: true });
   });
 
-import { readRecoveryWitness } from '../drain-red-team-evidence.mjs';
+import { readRecoveryWitness, RUN_MTIME_SLACK_MS } from '../drain-red-team-evidence.mjs';
 import { MAX_RUN_RECORDS_PARSED } from '../stream-filter-runs.mjs';
 describe('bounded review evidence scans', () => {
   // Records 10 s apart by mtime. A record is written after its read step starts, so its mtime bounds that start.
@@ -590,6 +590,27 @@ describe('bounded review evidence scans', () => {
     const panel = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(from), ...startedAt(4999 * 10_000 - 1000) };
     const result = readDrainRedTeamEvidence({ ...f, ...big, read: id => id === 'review-pr-4999' ? panel : null });
     expect(result).toMatchObject({ ok: false, reason: 'scan-capped' });
+  });
+  // The first unread record (review-pr-4699) has mtime 46_990_000 ms. Both sides are mtimes, so a
+  // status stamped in the same coarse tick, or within the slack after it, cannot prove the order.
+  it.each([0, RUN_MTIME_SLACK_MS - 1])('drain holds a status stamped %i ms after the first omitted record', offset => {
+    const f = fixture(), from = 'c'.repeat(40);
+    recordRedTeamStatus({ ...f, loopPayload: { ...payload(f.head), carriedFrom: from }, status: 'finished', result: 'skipped' }, f);
+    const at = new Date(4699 * 10_000 + offset);
+    utimesSync(statusFile(f), at, at);
+    const panel = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(from), ...startedAt(4999 * 10_000 - 1000) };
+    const result = readDrainRedTeamEvidence({ ...f, ...big, read: id => id === 'review-pr-4999' ? panel : null });
+    expect(result).toMatchObject({ ok: false, reason: 'scan-capped' });
+  });
+  it('drain resolves a carried head whose status was stamped the full slack after the first omitted record', () => {
+    const f = fixture(), from = 'c'.repeat(40);
+    recordRedTeamStatus({ ...f, loopPayload: { ...payload(f.head), carriedFrom: from }, status: 'finished', result: 'skipped' }, f);
+    const at = new Date(4699 * 10_000 + RUN_MTIME_SLACK_MS);
+    utimesSync(statusFile(f), at, at);
+    const panel = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(from), ...startedAt(4999 * 10_000 - 1000) };
+    const result = readDrainRedTeamEvidence({ ...f, ...big, read: id => id === 'review-pr-4999' ? panel : null });
+    expect(result.ok).not.toBe(false);
+    expect(result).toMatchObject({ status: { status: 'finished' } });
   });
   it.each([['drain', readDrainRedTeamEvidence], ['recovery', readRecoveryWitness]])('%s holds an unreviewed head: absence of an exact-head run cannot be proven past the cap', (_name, reader) => {
     const f = fixture();

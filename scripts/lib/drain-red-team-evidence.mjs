@@ -80,7 +80,7 @@ const TIE_ORDERS = ['id-asc', 'id-desc'];
 // With no exact-head match, a capped scan still answers when the window provably holds the answer:
 // the any-head query once the newest same-PR run started after every unread record was written,
 // and the exact-head query for "nothing written after `writtenAfter`" once, in addition, every
-// unread record was written at or before that time and the newest run reviewed `newestHead`
+// unread record was written at least the mtime slack before that time and the newest run reviewed `newestHead`
 // (a carried head's source). Anything else holds as `scan-capped`.
 // One scan serves both tie orders, so a caller's fallback shares this scan's parse budget.
 function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak = 'id-asc', scanSettings, warn, now = Date.now() }) {
@@ -137,7 +137,10 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     // Capped: usable only when no unread record can change this query's answer (see above).
     // The exact-head relaxation also needs the newest run to be the named head's review (the
     // carried-from panel): an unread exact-head run could otherwise hide an unread unfinished re-review.
-    if (exact === null && scan.newestSettled && (!exactHead || (Number.isFinite(writtenAfter) && scan.boundary <= writtenAfter
+    // `writtenAfter` and the boundary are both mtimes: an unread record stamped in the same coarse
+    // mtime tick as the status may have been written after it, so it must be older by the slack.
+    if (exact === null && scan.newestSettled && (!exactHead || (Number.isFinite(writtenAfter)
+      && scan.boundary + RUN_MTIME_SLACK_MS <= writtenAfter
       && typeof newestHead === 'string' && newest.run.findings?.read?.netBasis?.rev === newestHead))) return null;
     return scan.end;
   };
