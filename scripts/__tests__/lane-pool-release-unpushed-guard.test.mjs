@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
@@ -122,6 +122,26 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     }
     refused(release(), sha);
   });
+  // A lane can rewrite what a listed origin sha "contains" instead of forging the sha itself.
+  it.each(['replace ref', 'graft file'])('refuses a commit grafted under the origin tip by a lane %s', shape => {
+    const main = git(['rev-parse', 'HEAD'], laneDir);
+    const sha = commitWork();
+    if (shape === 'replace ref') {
+      const fake = git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit-tree', `${main}^{tree}`, '-p', main, '-p', sha, '-m', 'fake'], laneDir);
+      git(['replace', main, fake], laneDir);
+    } else {
+      writeFileSync(join(laneDir, '.git', 'info', 'grafts'), `${main} ${sha}\n`);
+    }
+    git(['reset', '--quiet', '--hard', main], laneDir);
+    git(['branch', 'work/hidden', sha], laneDir);
+    refused(release(), sha);
+  });
+  it('refuses tracked work parked in a stash', () => {
+    writeFileSync(join(laneDir, 'seed.txt'), 'stashed edit\n');
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'stash', '--quiet'], laneDir);
+    expect(git(['status', '--porcelain', '--untracked-files=no'], laneDir)).toBe('');
+    refused(release(), git(['rev-parse', 'refs/stash'], laneDir));
+  });
   it('releases a lane whose HEAD is behind an origin tip it has not fetched yet', () => {
     const other = join(base, 'other');
     git(['clone', '--quiet', origin, other]);
@@ -167,6 +187,26 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     if (shape.endsWith('deletion')) rmSync(join(laneDir, 'seed.txt'));
     else writeFileSync(join(laneDir, 'seed.txt'), 'hidden edit\n');
     expect(git(['status', '--porcelain', '--untracked-files=no'], laneDir)).toBe('');
+    const result = release();
+    refused(result);
+    expect(result.stderr).toContain('seed.txt');
+  });
+  it('refuses a same-size edit with a restored mtime that lane stat config would hide', () => {
+    const file = join(laneDir, 'seed.txt');
+    // Age the file and refresh the index first, so the entry is not "racy" (git would rehash a racy entry anyway).
+    const past = new Date(Date.now() - 3600_000);
+    utimesSync(file, past, past);
+    git(['update-index', '--refresh'], laneDir);
+    // Cross a second boundary so the edit's ctime differs at git's (seconds) stat resolution.
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1100);
+    writeFileSync(file, 'SEED\n');
+    utimesSync(file, past, past);
+    git(['config', 'core.checkStat', 'minimal'], laneDir);
+    git(['config', 'core.trustctime', 'false'], laneDir);
+    // Read-only status: a refreshing status would write the new stat into the index and hide the edit by itself.
+    expect(execFileSync('git', ['status', '--porcelain', '--untracked-files=no'], {
+      cwd: laneDir, encoding: 'utf8', env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+    }).trim()).toBe('');
     const result = release();
     refused(result);
     expect(result.stderr).toContain('seed.txt');

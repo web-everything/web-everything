@@ -2829,10 +2829,19 @@ function assertReleaseReservedScoped() {
 // `git status` trusts index flags, so assume-unchanged / skip-worktree entries are compared by content here, and
 // `--ignore-submodules=none` overrides a lane's diff.ignoreSubmodules / submodule.*.ignore (fsmonitor is pinned off
 // by the lane git env). Returns the change lines ('' when clean), or null when any evidence is unreadable.
+// Every release evidence read ignores lane-written history rewrites: a `refs/replace/*` ref or `.git/info/grafts`
+// could otherwise make a listed origin sha appear to contain an unpushed commit, or swap HEAD's tree under status.
+const releaseEvidenceGit = (args, dir, opts = {}) => tryGit(args, dir, {
+  ...opts, env: { ...readOnlyGitEnv(args).env, GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/nonexistent' },
+});
+// Stat-trust config (core.checkStat / core.trustctime / core.ignoreStat) is pinned to git's defaults by the shared lane
+// git env (scripts/lib/lane-git-hardening.mjs), for this read and every earlier refreshing status in the release flow.
+// A hand-forged index stat cache is not covered: a full content rehash costs minutes on a large lane (residual,
+// tracked as a follow-up card).
 const HIDDEN_ENTRY_HASH_LIMIT = 1000;
 function releaseTrackedChanges(dir) {
-  const status = tryGit(['status', '--porcelain', '--untracked-files=no', '--ignore-submodules=none'], dir);
-  const listing = status === null ? null : tryGit(['ls-files', '-z', '-s', '-v'], dir);
+  const status = releaseEvidenceGit(['status', '--porcelain', '--untracked-files=no', '--ignore-submodules=none'], dir);
+  const listing = status === null ? null : releaseEvidenceGit(['ls-files', '-z', '-s', '-v'], dir);
   if (listing === null) return null;
   const hidden = [];
   const compare = [];
@@ -2851,7 +2860,7 @@ function releaseTrackedChanges(dir) {
   }
   if (compare.length > HIDDEN_ENTRY_HASH_LIMIT) return null;
   if (compare.length) {
-    const hashes = tryGit(['hash-object', '--no-filters', '--', ...compare.map(({ path }) => path)], dir);
+    const hashes = releaseEvidenceGit(['hash-object', '--no-filters', '--', ...compare.map(({ path }) => path)], dir);
     const lines = hashes === null ? [] : hashes.split('\n');
     if (lines.length !== compare.length) return null;
     compare.forEach(({ path, sha }, i) => { if (lines[i] !== sha) hidden.push(`${path} (hidden by index flags: modified)`); });
@@ -2868,7 +2877,7 @@ const releaseRemoteHeads = new Map();
 function releaseUnprovenCommits(dir, salvage, proof) {
   // On a refusal without remote proof, name the commits local tracking refs do not cover. This is an operator hint
   // for the message only; it never authorizes a release.
-  const refused = why => ({ commits: null, why, hint: tryGit(['rev-list', '--max-count=20', 'HEAD', '--branches', '--not',
+  const refused = why => ({ commits: null, why, hint: releaseEvidenceGit(['rev-list', '--max-count=20', 'HEAD', '--branches', '--not',
     '--exclude=origin/HEAD', '--exclude=origin/ops/*', '--remotes=origin/*'], dir) });
   let heads = proof?.key ? releaseRemoteHeads.get(proof.key) : undefined;
   if (!heads) {
@@ -2876,8 +2885,15 @@ function releaseUnprovenCommits(dir, salvage, proof) {
     try { heads = proof.io.remoteHeads(); } catch (e) { return refused(msgOf(e)); }
     if (proof.key) releaseRemoteHeads.set(proof.key, heads);
   }
-  const input = [...heads, ...(salvage?.status === 'pushed' ? [salvage.sha] : [])].map(sha => `^${sha}\n`).join('');
-  const unproven = () => tryGit(['rev-list', '--ignore-missing', '--stdin', 'HEAD', '--branches'], dir, { stdio: ['pipe', 'pipe', 'pipe'], input });
+  // A stash holds tracked work too: every stash entry (refs/stash and its reflog) is a tip like any branch.
+  const stashRef = releaseEvidenceGit(['for-each-ref', '--format=%(objectname)', 'refs/stash'], dir);
+  const stashes = stashRef ? releaseEvidenceGit(['reflog', 'show', '--format=%H', 'refs/stash', '--'], dir) : stashRef;
+  if (stashes === null) return { commits: null };
+  const tips = stashes ? stashes.split('\n').filter(Boolean) : [];
+  const input = [...tips, ...[...heads, ...(salvage?.status === 'pushed' ? [salvage.sha] : [])].map(sha => `^${sha}`)]
+    .map(line => `${line}\n`).join('');
+  const unproven = () => releaseEvidenceGit(['rev-list', '--ignore-missing', '--stdin', 'HEAD', '--branches'], dir,
+    { stdio: ['pipe', 'pipe', 'pipe'], input });
   let commits = unproven();
   if (commits !== '') {
     try { proof.io.fetchHeads(dir); commits = unproven(); } catch { /* keep the unfetched, stricter result */ }
