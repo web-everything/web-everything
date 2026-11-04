@@ -43,7 +43,6 @@ import { fileURLToPath } from 'node:url';
 import { stageOnTransportBranch, readFromTransportBranch } from './git-transport-branch.mjs';
 import { loadMergeDeliveryPolicy } from './merge-delivery-policy.mjs';
 import { readSettings } from './settings-files.mjs';
-import { DrainReadError, resolveDrainReadsSource, readFileAtRef, unwrap } from './drain-api-reads.mjs';
 
 export const SHARED_FREEZE_FILE = 'red-main-freeze.json';
 /** How many times the CLI hook tries to land one publish before it reports failure. */
@@ -224,20 +223,11 @@ export async function publishFreezeFromCli({ marker, clear = false, lifted, env 
  * Read the shared freeze for the merge-gate. Never throws; anything unreadable is `{source, error}` (fail closed).
  * @returns {{source:string, frozen?:boolean, reason?:string|null, at?:string|null, publishedAt?:string|null, mergeSha?:string|null, error?:string}}
  */
-export function readSharedFreeze({ board = REPO_ROOT, branch = resolveFreezeBranch(), run, readsSource, rest, slug, reader } = {}) {
+export function readSharedFreeze({ board = REPO_ROOT, branch = resolveFreezeBranch(), run = timedGit() } = {}) {
   const source = flatText(`${branch}:${SHARED_FREEZE_FILE}`);
   let text;
-  // R546: GitHub REST + ETag by default (setting drain.reads.source); an injected git `run` means the git path.
-  // An API failure is a named transient error, never a git fallback.
-  if (run === undefined && (readsSource ?? resolveDrainReadsSource().value) === 'api') {
-    try { text = unwrap(readFileAtRef('freeze-read', SHARED_FREEZE_FILE, branch, { rest, cwd: board, slug, source: reader, timeoutMs: GIT_TIMEOUT_MS })); } // keeps the freeze read's 20 s bound
-    catch (e) { return { source, error: flatText(`branch unreadable: ${e.message}`), transient: e instanceof DrainReadError }; }
-    if (text == null) return { source, error: flatText(`${SHARED_FREEZE_FILE} not on ${branch}`) };
-  } else {
-    run ??= timedGit();
-    try { text = readFromTransportBranch({ board, branch, paths: [SHARED_FREEZE_FILE], run })[SHARED_FREEZE_FILE]; }
-    catch (e) { return { source, error: flatText(`branch unreadable: ${String(e?.stderr || e?.message || e).trim()}`) }; }
-  }
+  try { text = readFromTransportBranch({ board, branch, paths: [SHARED_FREEZE_FILE], run })[SHARED_FREEZE_FILE]; }
+  catch (e) { return { source, error: flatText(`branch unreadable: ${String(e?.stderr || e?.message || e).trim()}`) }; }
   if (text == null) return { source, error: flatText(`${SHARED_FREEZE_FILE} not on ${branch}`) };
   let doc;
   try { doc = JSON.parse(text); } catch { return { source, error: flatText(`${SHARED_FREEZE_FILE} is not JSON`) }; }
