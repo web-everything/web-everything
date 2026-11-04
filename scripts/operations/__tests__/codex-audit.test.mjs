@@ -409,6 +409,10 @@ describe('prior question hashes (AU1 PR-B)', () => {
     expect(find([cur, prior], open)).toBe(cur);
     expect(find([prior, cur], open)).toBe(cur);
   });
+  it('a contradictory current-question record blocks the prior fallback', () => {
+    const bad = rec('NOT WEAKENED', { questionHash: QUESTION_HASH, at: '2026-11-02T12:00:00.000Z', findings: ['WEAKENED'] });
+    expect(find([rec('NOT WEAKENED'), bad], open)).toBeNull();
+  });
   it('prior records older than 30 days before acceptUntil, or dated after it, are ignored', () => {
     expect(find([rec('NOT WEAKENED', { at: '2020-01-01T00:00:00.000Z' })], open)).toBeNull();
     expect(find([rec('NOT WEAKENED', { at: '2026-11-11T00:00:00.000Z' })], open)).toBeNull();
