@@ -994,4 +994,28 @@ describe('explicit and compound gates split into per-segment phases (PR-4)', () 
     expect(source).toContain('suites: GATE');
     expect(source).not.toMatch(/suites: explicitSegments/);
   });
+
+  it('shares ONE gate deadline: each segment gets the time remaining, so segments cannot each use the full ceiling', async () => {
+    let clock = 0;
+    const run = vi.fn(async (_segment, { timeoutMs }) => { clock += 70; return { exitCode: 0, signal: null, seenTimeout: timeoutMs }; });
+    const result = await runGateSegments(['a', 'b', 'c'], run, { budgetMs: 100, now: () => clock });
+    expect(run.mock.calls.map(c => [c[0], c[1].timeoutMs])).toEqual([['a', 100], ['b', 30]]);
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ timedOut: true, budgetExhausted: true, signal: 'SIGKILL' });
+    expect(result.exitCode).not.toBe(0);
+  });
+
+  it('a gate that finishes inside the budget passes every segment and never reports a timeout', async () => {
+    let clock = 0;
+    const run = vi.fn(async () => { clock += 10; return { exitCode: 0, signal: null }; });
+    const result = await runGateSegments(['a', 'b', 'c'], run, { budgetMs: 100, now: () => clock });
+    expect(run).toHaveBeenCalledTimes(3);
+    expect(result.budgetExhausted).toBeUndefined();
+  });
+
+  it('verify-lane hands the remaining budget to the phase watchdog', () => {
+    const source = readFileSync(resolve(repo, 'scripts/verify-lane.mjs'), 'utf8');
+    expect(source).toMatch(/runGateSegments\(explicitSegments, [^\n]*budgetMs: PHASE_TIMEOUT_MS/);
+    expect(source).toMatch(/timeoutMs: timeoutMs \?\? PHASE_TIMEOUT_MS/);
+  });
 });
