@@ -87,7 +87,9 @@ const normalizeScope = (v, defaultPrefix = 'we:') => {
     // separate canonical entries, so planner lease/rival exclusion sees each piece. The rule is ONE shared helper,
     // the one dispatch-lane's refuseMultiPathGlobs calls, so the two can never drift.
     const repoOf = (prefix) => {
-      if (!prefix) return defaultPrefix.replace(/:$/, '');
+      // The first pass runs with no default (locus is inferred AFTER it): a bare piece's repo is unknown then, so it
+      // may meet any repo and the entry stays whole for the second pass (default `we:`/locus) to judge.
+      if (!prefix) return defaultPrefix ? defaultPrefix.replace(/:$/, '') : null;
       const key = prefix.toLowerCase();
       return Object.hasOwn(SCOPE_PREFIX_LOCUS, key) ? SCOPE_LOCUS_PREFIX[SCOPE_PREFIX_LOCUS[key]] : key;
     };

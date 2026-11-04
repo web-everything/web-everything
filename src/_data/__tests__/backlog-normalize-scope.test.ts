@@ -228,6 +228,30 @@ describe('backlog loader normalizeScope — multi-path entries (R372)', () => {
     }
   });
 
+  // The real loader runs normalizeScope TWICE: first with no default repo (locus not yet inferred), then with the
+  // item's locus prefix. A bare piece's repo is unknown in pass one, so pass one must not split an entry whose
+  // pass-two verdict could be "may meet" — it would lose the entry boundary dispatch needs to refuse it.
+  it.each([
+    // [entry, locus prefix of pass two, dispatchRepo, dispatch accepts?]
+    ['src/a*.mjs we:src/ab*.mjs', 'we:', 'we', false],
+    ['src/a*.mjs fui:src/a*.mjs', 'fui:', 'fui', false],
+    ['src/a*.mjs fui:src/a*.mjs', 'we:', 'we', true],
+    ['src/a*.mjs fui:src/b*.mjs', 'fui:', 'fui', true],
+    ['src/a*.mjs plateau:src/ab*.mjs', 'plateau:', 'plateau', false],
+    ['src/a*.mjs we:src/b*.mjs', 'we:', 'we', true],
+  ])('send-back — the loader two-pass pipeline agrees with dispatch on %j (locus %s)', (entry, locus, dispatchRepo, accepted) => {
+    const loaded = normalizeScope(normalizeScope([entry], '') as string[], locus)!;
+    if (accepted) {
+      expect(loaded.every((piece) => !/[\s,]/.test(piece)), entry).toBe(true);
+      expect(normalizeBriefScope(loaded, dispatchRepo), entry).toEqual(loaded);
+      expect(normalizeBriefScope([entry], dispatchRepo), entry).toEqual(loaded);
+    } else {
+      expect(loaded, entry).toHaveLength(1); // still one whole entry
+      expect(() => normalizeBriefScope(loaded, dispatchRepo), entry).toThrow(/unsafe scope.*glob/);
+      expect(() => normalizeBriefScope([entry], dispatchRepo), entry).toThrow(/unsafe scope.*glob/);
+    }
+  });
+
   it('splits on whitespace and commas; unprefixed pieces inherit the entry repo prefix', () => {
     expect(normalizeScope(['we:a.mjs b.mjs', 'fui:c.mjs,d.mjs'])).toEqual(['we:a.mjs', 'we:b.mjs', 'fui:c.mjs', 'fui:d.mjs']);
   });
