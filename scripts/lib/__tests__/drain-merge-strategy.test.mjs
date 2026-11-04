@@ -19,6 +19,7 @@ import { syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 import { sweepAdvisoryLabels } from '../../conveyor/advisory-label-sweep.mjs';
 import * as completeComments from '../../conveyor/pr-comments-complete.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
+process.env.WE_DRAIN_READS_SOURCE = 'git'; // these suites stub git; the REST reads are covered by drain-api-reads.test.mjs
 
 // The real operator feed is never written from this file: every test either injects a publisher or relies on the
 // test-run guard, and the guard's own tests assert against this stand-in.

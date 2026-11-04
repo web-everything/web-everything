@@ -4,6 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { devNull, tmpdir } from 'node:os';
 import { join } from 'node:path';
+process.env.WE_DRAIN_READS_SOURCE = 'git'; // these suites stub git; the REST reads are covered by drain-api-reads.test.mjs
 
 // Register cases before loading the implementation, which is absent in this red phase.
 let checkBornAsCollision, guardEnqueue, enqueueOutcomeEvent;

@@ -18,6 +18,7 @@ import { evaluatePrGates } from '../merge-gate-ci.mjs';
 import { loadMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 import { applyFreezeRecheck, combineRedMain, formatRedMainFreeze, gatherPrFacts, isMainFixPr, readMainCiFact, readRedMainFact } from '../../merge-gate-check.mjs';
 import { isTrustedPrAuthor } from '../../conveyor/main-ci-red-core.mjs';
+process.env.WE_DRAIN_READS_SOURCE = 'git'; // these suites stub git; the REST reads are covered by drain-api-reads.test.mjs
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CLI = resolve(HERE, '..', '..', 'readiness', 'red-main-remediation.mjs');

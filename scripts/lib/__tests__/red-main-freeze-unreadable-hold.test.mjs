@@ -3,6 +3,7 @@
 import { describe, it, expect } from 'vitest';
 import { readSharedFreeze, drainFreezeSignal, evaluateDrainFreeze, resolveDrainFreezeSettings } from '../red-main-freeze-shared.mjs';
 import { decideRedMainHold, redMainHoldReason } from '../red-main-hold.mjs';
+process.env.WE_DRAIN_READS_SOURCE = 'git'; // these suites stub git; the REST reads are covered by drain-api-reads.test.mjs
 
 const BRANCH = 'ops/red-main-freeze';
 const timeoutErr = () => Object.assign(new Error('spawnSync git ETIMEDOUT'), { code: 'ETIMEDOUT' });

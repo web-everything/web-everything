@@ -375,6 +375,7 @@ import { withNumberingLock } from '../../readiness/drain-lock.mjs';
 import { buildFollowupInput } from '../drain-followup-job.mjs';
 import { workflowEditHold } from '../merge-queue-enqueue.mjs';
 import { withHooksDisabled, fallbackMinNext, repairHashOnMain, openReservationPr, probeQueuedLand, sweepQueuedHashCards } from '../queue-branch-numbering.mjs';
+process.env.WE_DRAIN_READS_SOURCE = 'git'; // these suites stub git; the REST reads are covered by drain-api-reads.test.mjs
 
 it.each([
   'backlog/xprg7e1-reap-lane-leases-whose-owner-is-dead-using-a-durable-owner-p.md',

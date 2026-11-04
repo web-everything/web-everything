@@ -10,6 +10,7 @@ import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 import { loadMergeQueueSettings } from '../merge-queue-hook.mjs';
 import { validateQueueSettings } from '../merge-queue.mjs';
 import * as settingsFiles from '../settings-files.mjs';
+process.env.WE_DRAIN_READS_SOURCE = 'git'; // these suites stub git; the REST reads are covered by drain-api-reads.test.mjs
 const HEAD = 'a'.repeat(40), NEXT = 'b'.repeat(40), KEY = 'owner/repo#42';
 const LIVE = `gh: Pull request Required workflows 'CI, CI, Merge gate, Merge gate, Soak replay gate, Soak replay gate' are not satisfied Required status check "merge-gate" is expected.`;
 function execFor(graphql = false) {

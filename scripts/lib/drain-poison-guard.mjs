@@ -3,6 +3,7 @@ import { lstatSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import matter from 'gray-matter';
 import { healLaneRefs, looksLikeCorruption } from './lane-repair.mjs';
+import { DrainReadError, isTransientReadFailure, resolveDrainReadsSource, readAddedFiles, readFileAtRef, readBranchSha } from './drain-api-reads.mjs';
 
 const HASH = /^x[0-9a-z]{6}$/;
 // A trailing ` # comment` is allowed: the standards check reads `bornAs` with a YAML parser, which drops it. Only
@@ -52,7 +53,8 @@ export function healableClone(cwd, primary) {
   } catch { return false; }
 }
 
-export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primary = null, heal = healLaneRefs, log = () => {} }) {
+export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primary = null, heal = healLaneRefs, log = () => {}, readsSource, rest }) {
+  const api = (readsSource ?? resolveDrainReadsSource().value) === 'api';
   const git = args => exec('git', args, { cwd, encoding: 'utf8', timeout: 60_000, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
   let healed = null;
   // A corrupt local cache (e.g. a commit-graph naming a missing object) heals the clone once per check, then the
@@ -75,10 +77,32 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
     if (typeof cwd === 'string' && ['objects/info/commit-graph', 'objects/info/commit-graphs'].some(path => {
       try { lstatSync(join(cwd, '.git', path)); return true; } catch (e) { if (['ENOENT', 'ENOTDIR'].includes(e.code)) return false; throw e; }
     })) run(['commit-graph', 'verify']);
-    run(['fetch', '--quiet', '--end-of-options', 'origin', headSha, `+refs/heads/${base}:refs/remotes/origin/${base}`]);
-    // `-z` keeps paths verbatim: Git otherwise quotes a non-ASCII path, which the filters below would drop.
-    const names = run(['diff', '-z', '--name-only', '--diff-filter=A', `origin/${base}...${headSha}`, '--', 'backlog/'])
-      .split('\0').filter(path => TOP_LEVEL_CARD.test(path));
+    let names;
+    let headText = (path) => run(['show', `${headSha}:${path}`]);
+    if (api) {
+      // R546: the added cards and their text come from GitHub REST (ETag; no fetch of the PR head). Main is judged
+      // from the local origin/<base> ref, which must equal GitHub's tip: a stale ref fails closed (transient).
+      const o = { rest, cwd };
+      names = readAddedFiles(base, headSha, o).filter(path => TOP_LEVEL_CARD.test(path));
+      headText = (path) => {
+        const text = readFileAtRef('bornas-card', path, headSha, o);
+        if (text == null) throw new DrainReadError('bornas-card', 'api-http-404', `${path} missing at the pinned head`);
+        return text;
+      };
+      if (names.length) {
+        const tip = readBranchSha(base, o);
+        const local = () => { try { return git(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${base}`]).trim(); } catch { return ''; } };
+        if (local() !== tip) {
+          try { run(['fetch', '--quiet', '--end-of-options', 'origin', `+refs/heads/${base}:refs/remotes/origin/${base}`]); } catch { /* judged by the re-check */ }
+          if (local() !== tip) throw new DrainReadError('bornas-main-ref', 'tracking-ref-stale', `origin/${base} is behind GitHub`);
+        }
+      }
+    } else {
+      run(['fetch', '--quiet', '--end-of-options', 'origin', headSha, `+refs/heads/${base}:refs/remotes/origin/${base}`]);
+      // `-z` keeps paths verbatim: Git otherwise quotes a non-ASCII path, which the filters below would drop.
+      names = run(['diff', '-z', '--name-only', '--diff-filter=A', `origin/${base}...${headSha}`, '--', 'backlog/'])
+        .split('\0').filter(path => TOP_LEVEL_CARD.test(path));
+    }
     if (!names.length) return done({ ok: true });
     // Every identity an added card carries is checked. Only its file name and readable frontmatter are `confirmed`
     // identities, the ones the standards check also reads. Missing or invalid frontmatter falls back to every identity
@@ -88,7 +112,7 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
     let unreadable = null;
     for (const path of names) {
       const stem = path.split('/').pop().replace(/\.md$/, '').split('-')[0];
-      const { parsed, malformed, opaque, ids } = cardIdentities(run(['show', `${headSha}:${path}`]));
+      const { parsed, malformed, opaque, ids } = cardIdentities(headText(path));
       if (opaque) unreadable ??= `added card ${path} has no readable frontmatter`;
       for (const [hash, confirmed] of [[stem, true], ...ids.map(id => [id, parsed && !malformed])]) {
         if (HASH.test(hash) && !added.get(hash)?.confirmed) added.set(hash, { path, confirmed });
@@ -137,14 +161,16 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
   } catch (e) { return done({ error: String(e?.message ?? e) }); }
 }
 
-export function guardEnqueue({ c, headSha, repo, exec, emit = () => {}, comment = () => {}, seen = new Set(), base, cwd, primary, heal, log }) {
-  const result = checkBornAsCollision({ exec, headSha, base, cwd, primary, heal, log });
+export function guardEnqueue({ c, headSha, repo, exec, emit = () => {}, comment = () => {}, seen = new Set(), base, cwd, primary, heal, log, readsSource, rest }) {
+  const result = checkBornAsCollision({ exec, headSha, base, cwd, primary, heal, log, readsSource, rest });
   if (result.ok) return null;
   const { hash, path, mainCard } = result.collision ?? {};
   const kind = result.collision ? 'bornas-collision' : 'bornas-unreadable';
   const reason = result.collision
     ? `${path} adds bornAs ${hash}, which main already holds as ${mainCard}. Drop the duplicate card or repair its identity before retrying enqueue.`
-    : 'Backlog identity check unreadable. Inspect main and retry enqueue after restoring readable Git evidence.';
+    : isTransientReadFailure(result.error)
+      ? `Backlog identity read failed transiently (${String(result.error).slice(0, 200)}). Retry note: no action needed, the next pass re-reads it.`
+      : 'Backlog identity check unreadable. Inspect main and retry enqueue after restoring readable Git evidence.';
   try { Promise.resolve(emit({ kind: 'enqueue-refused', repo, pr: c.num,
     detail: { pr: c.num, reason: kind, ...(result.collision ? { hash, mainCard } : { error: result.error }),
       ...(result.healed ? { healed: result.healed } : {}) } })).catch(() => {}); } catch { /* Best effort. */ }

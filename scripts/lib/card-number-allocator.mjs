@@ -13,6 +13,7 @@ import { withNumberingLock } from '../readiness/drain-lock.mjs';
 import { HASH_RE, isNum } from '../backlog/id.mjs';
 import { readSettings } from './settings-files.mjs';
 import { platformPreference, resolveCascade, formatCascadeSourcesLine } from './policy-cascade.mjs';
+import { DrainReadError, resolveDrainReadsSource, readBacklogNames, readBranchSha } from './drain-api-reads.mjs';
 
 export function loadNumberAtBirthSettings({ file = readSettings(), env = process.env,
   platform = platformPreference('backlog', { env }) } = {}) {
@@ -64,8 +65,25 @@ function readRemoteRefs(git, remote = 'origin') {
  * Leave tracking refs alone by default: a caller may already have merged their trees.
  * Deferred numbering explicitly refreshes tracking before its separate bornAs reads.
  */
-export function readNumberingEvidence(git, remote = 'origin', { refreshTracking = false } = {}) {
+export function readNumberingEvidence(git, remote = 'origin', { refreshTracking = false, source, rest, cwd } = {}) {
   let main;
+  if ((source ?? resolveDrainReadsSource().value) === 'api') {
+    // R546: the high-water mark is a GitHub REST read (ETag; a 304 spends no git process). An API failure throws a
+    // named transient error - it never falls back to git. A tracking-ref refresh still wants a fetch, but only
+    // when the local ref is behind GitHub; a failed fetch matters only if the ref is then still stale.
+    try {
+      main = numericIds(readBacklogNames('main', { rest, cwd }));
+      if (refreshTracking) {
+        const tip = readBranchSha('main', { rest, cwd });
+        const local = () => { try { return String(git(['rev-parse', '--verify', '--quiet', `refs/remotes/${remote}/main`])).trim(); } catch { return ''; } };
+        if (local() !== tip) {
+          try { git(['fetch', '--no-tags', '--no-write-fetch-head', '--refmap=', remote, `+refs/heads/main:refs/remotes/${remote}/main`]); } catch { /* judged by the re-check below */ }
+          if (local() !== tip) throw new DrainReadError('tracking-ref', 'tracking-ref-stale', `${remote}/main is behind GitHub`);
+        }
+      }
+    } catch (e) { throw Error(`${remote}/main high-water mark unavailable: ${e.message}`); }
+    return { main, refs: readRemoteRefs(git, remote) };
+  }
   const snapshotRef = `refs/tmp/numbering-${process.pid}-${randomUUID()}`;
   try {
     try {
