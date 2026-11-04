@@ -19,6 +19,7 @@ import { cloneKey } from '../lib/daemon-overlays.mjs';
 import { clearPendingAdoption, recordPendingAdoption, OVERLAY_ADOPTION_MAX_PENDING, OVERLAY_ADOPTION_TTL_MS } from '../lib/overlay-adoption.mjs';
 import { isGraphSourceFile, isVitestTestFile } from '../lib/related-test-selection.mjs';
 import { safeRef, safeRegistrationRef, validSha, jsonLines, readyEvidence, canonicalAuditEvidence, changedPaths, comparePaths, nextMergeRef, refusal, resolveDaemonKey } from './prototype-load.mjs';
+import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
 import { planRetirements, planFetchFailed, resolveOriginRepository } from './prototype-retire.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -187,7 +188,7 @@ export function defaultDeps() {
     retirePlanner: defaultRetirePlanner };
 }
 export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, combinedTest, cloneKey: keyForClone = cloneKey,
-  retirePlanner = defaultRetirePlanner }) {
+  retirePlanner = defaultRetirePlanner, fingerprint = null }) {
   const expand = (p) => p.startsWith('~/') ? join(env.HOME, p.slice(2)) : p;
   const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return ''; throw e; } };
   const tool = settings || JSON.parse(read(join(repo, 'scripts/settings/prototype-load.json')));
@@ -362,7 +363,15 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         if (!fetchedMain) { requireGit('fetch', 'origin', 'main'); fetchedMain = true; }
         return ancestor(base, 'origin/main');
       } catch { return false; } };
-      out.canonicalAudit = { mode, ...canonicalAuditEvidence(auditRecords, input.sha, covers) };
+      // R503: fingerprint the live head only when an older head's stored fingerprint could carry; any failure is no carry.
+      let liveFp = null;
+      if (auditRecords.some((r) => r?.fingerprint && r.head && r.head !== input.sha)) {
+        try {
+          requireGit('fetch', 'origin', 'main', input.branch);
+          liveFp = (fingerprint || ((b, h) => netDiffFingerprint(repo, b, h, { exec })))('origin/main', input.sha) || null;
+        } catch { liveFp = null; }
+      }
+      out.canonicalAudit = { mode, ...canonicalAuditEvidence(auditRecords, input.sha, covers, liveFp) };
       if (!out.canonicalAudit.ok) {
         const fallback = `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load.`;
         if (mode === 'refuse') return stop('no-canonical-audit', { fallback });
