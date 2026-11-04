@@ -3910,3 +3910,24 @@ The `smoke-github-outage` break pins `WE_GH_LIST_BACKOFF_MS=5,5` and
 `WE_GH_JSON_RETRY_BACKOFF_MS=5` before the daemon forks. This preserves exhausted,
 fail-closed reads across reconcile and dispatch smoke passes within the unchanged
 90-second tick bound; shortening only the outer list backoff does not suffice.
+
+## Lane release preservation guard
+
+`lane-pool release` checks HEAD and every local branch against the branch tips the pool's canonical
+origin lists right now (`ls-remote` run in the primary checkout, `ops/*` excluded) after known-litter
+cleanup and salvage. No local `refs/remotes/*` ref is proof: stale, forged and symbolic-alias tracking
+refs all still refuse. A listed tip the lane has not fetched triggers one hardened fetch before refusing.
+An unresolved origin or an unreadable listing refuses; every named pool in a fixture therefore needs
+its primary checkout (a sibling of the reference) so release can resolve that origin.
+Tracked changes are read with `--ignore-submodules=none`, and assume-unchanged / skip-worktree entries
+are compared by content, so index flags and submodule-ignore config cannot hide an edit.
+Untracked files deliberately do not block release: the guard covers tracked changes only.
+URL-based salvage may leave no tracking ref: only its verified
+remote SHA is an additional exclusion, and unrelated local branches still block release. Tests that
+intentionally release tracked edits or unpreserved commits must pass `--discard` explicitly; `--force`
+only overrides ownership. Unreadable or oversized Git evidence keeps the lease and names manual
+inspection or deliberate `--discard` as the operator fallback.
+Canonical-origin isolation fixtures must assert refusal and an unchanged lease when the owning pool's
+origin is unresolved. Reclaim fixtures with rejected salvage must first assert that reaper release
+refuses, then explicitly discard the lease to exercise reclaim on unpreserved work. The card-filer soak
+likewise checks that unreadable status keeps the lease before testing a deliberate discard.

@@ -31,6 +31,12 @@ export const LANE_GIT_CONFIG_PINS = Object.freeze([
   ['gpg.ssh.program', 'ssh-keygen'],
   ['gpg.x509.program', 'gpgsm'],
   ['core.alternateRefsCommand', 'true'],
+  // PR #6319 self-review: lane config can make `status` trust stat data the lane controls (`checkStat=minimal`,
+  // `trustctime=false`, `ignoreStat`), so a same-size edit with a restored mtime reads clean — and the refreshing
+  // status of any daemon-side caller then writes that stat into the index, hiding the edit for every later check.
+  ['core.checkStat', 'default'],
+  ['core.trustctime', 'true'],
+  ['core.ignoreStat', 'false'],
 ]);
 
 // Remote proofs use a restricted transport policy. Ordinary hardened callers also fetch/clone
