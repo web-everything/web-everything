@@ -163,6 +163,14 @@
       "findings": [
         "scripts/lib/drain-red-team-evidence.mjs:76 — Retains the pre-existing reliance on mtime to select finished reviews; start times only protect unfinished reviews. An older acceptance updated after a newer rejection wins. A read-only probe confirmed recovery schedules a fresh pass using that stale acceptance, ignoring the newer rejection."
       ]
+    },
+    {
+      "ref": "lane/drain-rest-reader-r557",
+      "sha": "cc8ac117222de6f7146f7a059f55df0fe00aa587",
+      "ruling": "R563",
+      "findings": [
+        "scripts/lib/drain-poison-guard.mjs:130 — The new API path relies on a pre-existing raw-text grep that misses YAML-escaped identities. Main’s `bornAs: \"xabc12\\u0033\"` and an added card’s `bornAs: xabc123` decode identically, but a read-only probe returned `{ok:true}`, allowing the duplicate through admission."
+      ]
     }
   ]
 }
