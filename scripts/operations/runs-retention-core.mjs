@@ -149,7 +149,7 @@ export function runsRetention(o = {}) {
     out.eligible++; out.eligibleBytes += st.size;
     out.months[month] = (out.months[month] ?? 0) + 1;
   }
-  if (dryRun || !out.eligible) { if (!dryRun) out.status = 'nothing-to-do'; return out; }
+  if (dryRun) return out;
 
   // The archive target must already be mounted: never create the cloud-storage root locally.
   const srcReal = realpathSync(dir);
@@ -175,6 +175,7 @@ export function runsRetention(o = {}) {
     const m = /^\.retiring-(.+)\.[0-9a-f-]{36}$/.exec(name);
     if (m) { try { linkSync(join(dir, name), runPath(m[1], dir)); unlinkSync(join(dir, name)); } catch { /* canonical exists: leave the parked copy for an operator */ } }
   }
+  if (!out.eligible) { out.status = 'nothing-to-do'; return out; }
   const maxBytes = settings.batchMaxGiB * GIB, maxCompressed = settings.batchMaxCompressedGiB * GIB;
   for (const [month, files] of [...byMonth].sort()) {
     files.sort((a, b) => a.mtimeMs - b.mtimeMs || a.id.localeCompare(b.id));
@@ -230,7 +231,7 @@ export function runsRetention(o = {}) {
         for (const { f, path, parked } of held) {
           try {
             const hs = lstatSync(parked);
-            if (!open.has(join(realDirPath, basename(parked))) && hs.isFile() && hs.mtimeMs === f.mtimeMs && hs.ino === f.ino && hs.size === f.size && hashOf(parked) === f.hash) {
+            if (!open.has(join(realDirPath, basename(parked))) && hs.isFile() && hs.nlink === 1 && hs.mtimeMs === f.mtimeMs && hs.ino === f.ino && hs.size === f.size && hashOf(parked) === f.hash) {
               unlinkSync(parked); out.deleted++; out.bytesFreed += f.size;
             } else {
               out.kept.young++;
