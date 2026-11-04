@@ -38,3 +38,105 @@ describe('readFilteredInOrder (xwu9oxh S1a)', () => {
       .toEqual([{ id: 'a', run: runs.a }, { id: 'c', run: runs.c }]);
   });
 });
+
+import { findNewestMatchingRun, MAX_RUN_RECORDS_PARSED } from '../stream-filter-runs.mjs';
+describe('findNewestMatchingRun bounded newest-first scan', () => {
+  it('stats 5000 candidates but parses only the cap; older evidence explicitly holds for operator inspection', () => {
+    const ids = Array.from({ length: 5000 }, (_, i) => String(i));
+    let reads = 0, stats = 0;
+    const options = { ids, stat: id => { stats++; return { mtimeMs: Number(id) }; },
+      read: id => { reads++; return { id }; }, keep: run => run.id === '0' };
+    expect(findNewestMatchingRun(options)).toMatchObject({ ok: false, reason: 'scan-capped' });
+    expect(stats).toBe(5000);
+    expect(reads).toBe(MAX_RUN_RECORDS_PARSED);
+    reads = 0;
+    expect(findNewestMatchingRun({ ...options, keep: run => run.id === '4998' })).toMatchObject({ id: '4998', at: 4998 });
+    expect(reads).toBe(2);
+  });
+  it.each([[undefined, 'a'], ['id-asc', 'a'], ['id-desc', 'b']])('matches exhaustive selection below the cap with tieBreak=%s', (tieBreak, expectedId) => {
+    const ids = ['a', 'b', 'c'];
+    const runs = { a: { ok: true }, b: { ok: true }, c: { ok: false } };
+    const expected = ids.map(id => ({ id, run: runs[id], at: 1 })).filter(r => r.run.ok)
+      .sort((a, b) => b.at - a.at || (tieBreak === 'id-desc' ? b.id.localeCompare(a.id) : a.id.localeCompare(b.id)))[0];
+    expect(expected.id).toBe(expectedId);
+    expect(findNewestMatchingRun({ ids, read: id => runs[id], stat: () => ({ mtimeMs: 1 }), keep: r => r.ok, tieBreak })).toEqual(expected);
+  });
+  it('refuses unreadable candidate metadata and unreadable newest records', () => {
+    expect(() => findNewestMatchingRun({ ids: ['a'], stat: () => { throw Error('stat failed'); } })).toThrow('stat failed');
+    expect(() => findNewestMatchingRun({ ids: ['a'], stat: () => ({ mtimeMs: 1 }), read: () => { throw Error('torn'); }, keep: () => true })).toThrow('torn');
+  });
+});
+
+import { createNewestRunFinder } from '../stream-filter-runs.mjs';
+it('continues the same scan after a match without rereads or exceeding the shared cap', () => {
+  let reads = 0;
+  const find = createNewestRunFinder({ ids: Array.from({ length: 5000 }, (_, i) => String(i)),
+    stat: id => ({ mtimeMs: Number(id) }), read: id => { reads++; return id; } });
+  expect(find(run => run === '4999')).toMatchObject({ id: '4999' });
+  expect(reads).toBe(1);
+  expect(find(run => run === '4998')).toMatchObject({ id: '4998' });
+  expect(reads).toBe(2);
+  expect(find(() => false)).toMatchObject({ ok: false, reason: 'scan-capped' });
+  expect(find(() => true)).toMatchObject({ ok: false, reason: 'scan-capped' });
+  expect(reads).toBe(MAX_RUN_RECORDS_PARSED);
+});
+it('refuses unknown mtimes', () => {
+  expect(() => findNewestMatchingRun({ ids: ['a'], stat: () => ({ mtimeMs: NaN }) })).toThrow('unreadable mtime');
+});
+
+it('refuses an unknown tie-break policy', () => {
+  expect(() => createNewestRunFinder({ ids: [], tieBreak: 'unknown' })).toThrow('unknown run tieBreak');
+});
+
+import { resolveRunScanSettings } from '../stream-filter-runs.mjs';
+import { readSettings } from '../settings-files.mjs';
+describe('runs.scan.maxParses policy setting', () => {
+  it('declares the setting and resolves standard, platform and tool with provenance', () => {
+    expect(readSettings().runs.scan).toEqual({});
+    const standard = resolveRunScanSettings({ file: {}, platform: {}, env: {} });
+    expect(standard.value.scan.maxParses).toBe(300);
+    expect(standard.sources['scan.maxParses']).toBe('standard');
+    const platform = resolveRunScanSettings({ file: {}, platform: { scan: { maxParses: 7 } }, env: {} });
+    expect(platform.value.scan.maxParses).toBe(7);
+    expect(platform.sources['scan.maxParses']).toBe('platform');
+    const tool = resolveRunScanSettings({ file: { runs: { scan: { maxParses: 2 } } }, platform: { scan: { maxParses: 7 } }, env: {} });
+    expect(tool.value.scan.maxParses).toBe(2);
+    expect(tool.sources['scan.maxParses']).toBe('tool');
+  });
+  it.each([0, -1, 1.5, '4', null, Infinity])('rejects invalid maxParses=%s, keeping the valid lower layer', maxParses => {
+    const resolved = resolveRunScanSettings({ file: { runs: { scan: { maxParses } } }, platform: { scan: { maxParses: 7 } }, env: {} });
+    expect(resolved.value.scan.maxParses).toBe(7);
+    expect(resolved.invalid.length).toBeGreaterThan(0);
+  });
+  it('bounds parsing by the configured value, warns once with the fallback, and distinguishes exhaustion', () => {
+    const warnings = []; let reads = 0;
+    const find = createNewestRunFinder({ ids: ['a', 'b', 'c'], stat: () => ({ mtimeMs: 1 }),
+      read: id => { reads++; return id; }, maxParses: 2, warn: message => warnings.push(message) });
+    expect(find(() => false)).toEqual({ ok: false, reason: 'scan-capped' });
+    expect(find(() => false)).toEqual({ ok: false, reason: 'scan-capped' });
+    expect(reads).toBe(2);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/runs.scan.maxParses=2.*inspect/i);
+    expect(findNewestMatchingRun({ ids: ['a', 'b'], stat: () => ({ mtimeMs: 1 }), read: id => id,
+      maxParses: 2, keep: () => false })).toBeNull();
+  });
+  it('throws for a corrupt record inside a configured window even after a non-match', () => {
+    expect(() => findNewestMatchingRun({ ids: ['a', 'b', 'c'], stat: () => ({ mtimeMs: 1 }),
+      maxParses: 2, read: id => { if (id === 'b') throw Error('unreadable run'); return id; }, keep: () => false })).toThrow('unreadable run');
+  });
+});
+
+it('logs the effective scan setting and its source through the shared cascade', () => {
+  const lines = [];
+  resolveRunScanSettings({ file: { runs: { scan: { maxParses: 17 } } }, platform: {},
+    env: { WE_POLICY_CASCADE_LOG: '1' }, log: line => lines.push(line) });
+  expect(lines.join('\n')).toContain('scan.maxParses=17 (tool)');
+});
+
+describe('createNewestRunFinder id-asc tie order', () => {
+  it('breaks equal-mtime ties by code-unit order like the pre-bound sorted listing, not locale order', async () => {
+    const { createNewestRunFinder } = await import('../stream-filter-runs.mjs');
+    const find = createNewestRunFinder({ ids: ['review-pr-a', 'review-pr-A'], stat: () => ({ mtimeMs: 5 }), read: id => id, maxParses: 5 });
+    expect(find(() => true).id).toBe('review-pr-A');
+  });
+});

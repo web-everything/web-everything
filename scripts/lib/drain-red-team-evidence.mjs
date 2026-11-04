@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { hostname } from 'node:os';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operations/run-store.mjs';
-import { readFilteredInOrder } from './stream-filter-runs.mjs';
+import { createNewestRunFinder } from './stream-filter-runs.mjs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { redTeamEnabled, redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
@@ -51,9 +51,46 @@ function readStatusFile(path, { repo, pr, head }) {
 const digest = bytes => bytes === null ? null : createHash('sha256').update(bytes).digest('hex');
 const optionalBytes = path => { try { return readFileSync(path); } catch (e) { if (e.code === 'ENOENT') return null; throw e; } };
 
+// mtime orders IO, but finishing an older panel can touch its file after a newer
+// panel started. Compare read-step start times when ruling out unfinished re-reviews.
+const reviewStartedAt = hit => {
+  const timings = hit.run.stepTimings;
+  const started = Date.parse(Array.isArray(timings) ? timings.find(t => t?.step === 'read')?.startedAt : '');
+  return Number.isFinite(started) ? started : hit.at;
+};
+const unfinishedReview = run => !run.verdict || run.pending != null
+  || run.effects?.some(effect => ['pending', 'in-flight'].includes(effect?.status));
+
+// Retain only the selected head/PR payloads and the newest unfinished attempt. Finished
+// evidence is usable only after the same bounded window rules out a newer unfinished run.
+function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak, scanSettings, warn }) {
+  let scanned = false, newest = null, exact = null, unfinished = null, failure = null;
+  return (exactHead = true) => {
+    if (!scanned) {
+      const find = createNewestRunFinder({ ids: list(runsDir).filter(id => id.startsWith('review-pr-')), tieBreak,
+        stat: id => stat(join(runsDir, `${id}.json`)), read: id => read(id, runsDir), scanSettings, warn });
+      const end = find((run, id, at) => {
+        if (run?.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr)) return false;
+        const hit = { run, id, at };
+        newest ??= hit;
+        if (run.findings?.read?.netBasis?.rev === head) exact ??= hit;
+        if (unfinishedReview(run) && (!unfinished || reviewStartedAt(hit) > reviewStartedAt(unfinished))) unfinished = hit;
+        return false;
+      });
+      const selected = exact ?? newest;
+      if (unfinished && (!selected || reviewStartedAt(unfinished) >= reviewStartedAt(selected))) {
+        failure = { ok: false, reason: 'review-unfinished' };
+      } else if (end?.ok === false) failure = end;
+      scanned = true;
+    }
+    return failure ?? (exactHead ? exact : newest) ?? { run: null, at: 0 };
+  };
+}
+
 /** Raw, head-scoped evidence only. Never select an older accepting verdict over a newer rejection. */
 // Match resolveRunsDir's override precedence without migrating runs during a raw read.
 export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir = env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(env),
+  list = listRunIds, read = readRun, stat = statSync, scanSettings = { env }, warn,
   readScorecards = () => readStore({ path: resolveScorecardStorePath(env), strict: true }).records } = {}) {
   const key = { repo, pr, head }, path = statusPath(key, env), bytes = optionalBytes(path);
   const parsed = bytes === null ? null : JSON.parse(bytes);
@@ -61,16 +98,15 @@ export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir
   const records = readScorecards();
   const seats = records.filter(r => r.dispatchKind === 'review-seat' && r.seat === 'red-team'
     && r.repo === repo && Number(r.pr) === Number(pr) && r.rev === head);
-  const runs = readFilteredInOrder(listRunIds(runsDir).filter(id => id.startsWith('review-pr-')), id => readRun(id, runsDir),
-    run => run?.op === 'review-pr' && run.input?.repo === repo && Number(run.input?.pr) === Number(pr)
-      && run.findings?.read?.netBasis?.rev === head, (run, id) => ({ id, run }))
-    .map(hit => ({ ...hit, at: statSync(join(runsDir, `${hit.id}.json`)).mtimeMs }))
-    .sort((a, b) => b.at - a.at || b.id.localeCompare(a.id));
+  const lookup = reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak: 'id-desc', scanSettings, warn });
+  const latest = lookup();
+  if (latest.ok === false) return latest;
+  const newest = latest.run ? { id: latest.id, run: latest.run, at: latest.at } : null;
   const marker = optionalBytes(`${path}.stale-redispatch-1`);
-  return { ...key, rawWriter: { bytes, parsed, sha256: digest(bytes) }, seats, newest: runs[0]?.run ?? null,
+  return { ...key, rawWriter: { bytes, parsed, sha256: digest(bytes) }, seats, newest: newest?.run ?? null,
     // Preserve the existing policy-only carry surface; it never supplies a stale recovery payload.
-    ...(runs.length ? {} : { carryEvidence: readDrainRedTeamEvidence({ ...key, env, runsDir, readScorecards: () => records }) }),
-    evidenceSha256: digest(JSON.stringify([seats, runs[0] ?? null])),
+    ...(newest ? {} : { carryEvidence: readDrainRedTeamEvidence({ ...key, env, runsDir, list, read, stat, scanSettings, warn, readScorecards: () => records }) }),
+    evidenceSha256: digest(JSON.stringify([seats, newest])),
     markers: { redispatch: marker === null ? null : JSON.parse(marker), retry: retryMarkerSpent(path) } };
 }
 
@@ -208,23 +244,15 @@ export function historicalCardOnlySkipCandidate(old) {
 
 /** Absence of a review payload is not an accept. Labels alone never schedule a post-accept pass. */
 export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
-  runsDir = resolveRunsDir(), list = listRunIds, read = readRun, isAlive = pidAlive, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime,
+  runsDir = resolveRunsDir(), list = listRunIds, read = readRun, stat = statSync, lookup, scanSettings = { env }, warn, isAlive = pidAlive, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime,
   readScorecards = () => readStore({ path: resolveScorecardStorePath(env) }).records } = {}) {
   const seats = readScorecards().filter(row => row.dispatchKind === 'review-seat' && row.seat === 'red-team'
     && row.repo === repo && Number(row.pr) === Number(pr) && row.rev === head);
   const recorded = seats.length > 0;
   const seatEvidence = { seatRecorded: recorded, completedRecorded: seats.some(completedRedTeamSeat),
     failedSeatCount: seats.filter(row => !completedRedTeamSeat(row)).length };
-  // Runs are immutable in identity but updated in place: choose the latest read of this exact repo/PR/head.
-  const latestRun = (exactHead = true) => {
-    // Read, test and drop one run at a time (xwu9oxh S1a): same reads, order and errors as map-then-filter.
-    const hits = readFilteredInOrder(list(runsDir).filter(id => id.startsWith('review-pr-')), id => read(id, runsDir),
-      run => run?.op === 'review-pr' && run.input?.repo === repo && Number(run.input?.pr) === Number(pr)
-        && (!exactHead || run.findings?.read?.netBasis?.rev === head), (run, id) => ({ id, run }))
-      .map(hit => ({ ...hit, at: statSync(join(runsDir, `${hit.id}.json`)).mtimeMs }));
-    hits.sort((a, b) => b.at - a.at);
-    return { run: hits[0]?.run ?? null, at: hits[0]?.at ?? 0 };
-  };
+  // The parse cap covers historical and recovery fallbacks too.
+  const latestRun = lookup ?? reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, scanSettings, warn });
   // The review loop applies the accept labels before the job can write a status, so a persisted accepting run that
   // owes a pass holds until the job's status supersedes it. It is not a live queue entry: the drain's
   // never-scheduled deadline still applies when no job ever picks it up.
@@ -234,6 +262,8 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     status = JSON.parse(readFileSync(statusPath({ repo, pr, head }, env), 'utf8'));
     statusAt = statSync(statusPath({ repo, pr, head }, env)).mtimeMs;
   } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  const scan = latestRun();
+  if (scan.ok === false) return scan;
   const carry = readRedTeamCarry({ repo, pr, head, env });
   const carriedFrom = carry?.loopPayload.carriedFrom ?? status?.loopPayload?.carriedFrom;
   if (carriedFrom) {
@@ -289,10 +319,11 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   }
   const loopPayload = latestRun().run;
   if (!loopPayload && !recorded) {
-    const older = latestRun(false).run;
+    const olderHit = latestRun(false);
+    const older = olderHit.run;
     const oldHead = older?.findings?.read?.netBasis?.rev;
     if (oldHead && oldHead !== head && redTeamCardOnly(older.findings.read)) {
-      const old = readDrainRedTeamEvidence({ repo, pr, head: oldHead, env, runsDir, list, read,
+      const old = readDrainRedTeamEvidence({ repo, pr, head: oldHead, env, runsDir, list, read, stat, lookup: () => olderHit, scanSettings, warn,
         isAlive, host, namespace, readPidStart, readScorecards });
       if (historicalCardOnlySkipCandidate(old)) return old;
     }
