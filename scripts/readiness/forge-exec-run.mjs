@@ -9,7 +9,7 @@ import {createHash, randomBytes} from 'node:crypto';
 import {join, relative} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {cpus, loadavg, freemem, totalmem} from 'node:os';
-import {BASE_RETENTION, baseGuard, readyBases, readBase, copyLeaves, baseFile, createBasePin, claimPrewarm, materializeWorktree, mirrorReadOnlyForSlots, validBundleEvidence} from './forge-exec-bases.mjs';
+import {BASE_RETENTION, baseGuard, readyBases, readBase, copyLeaves, baseFile, createBasePin, claimPrewarm, materializeWorktree, mirrorReadOnlyForSlots, validBundleEvidence, readMainFetchAge} from './forge-exec-bases.mjs';
 import {decodeManifest} from './forge-exec-manifest.mjs';
 const LIMIT = 4 * 1024 * 1024;
 const hex = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
@@ -1059,6 +1059,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       const bundleReady=await mirrorReadOnlyForSlots(join(bases,'repo.git'));
       // The prerequisite the Mac may use for an incremental bundle: this mirror's own main tip.
       let bundleBase;
+      const mainAgeMs=bundleReady?await readMainFetchAge(bases,{clock}):undefined;
       if(bundleReady) try {
         const mirror=join(bases,'repo.git'),args=['-c','safe.directory='+mirror,'--git-dir',mirror,'rev-parse','--verify','refs/remotes/origin/main^{commit}'];
         const env={PATH:'/usr/local/bin:/usr/bin:/bin',HOME:'/nonexistent',LANG:'C',GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_NOSYSTEM:'1'};
@@ -1083,7 +1084,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
         await pinBase(run,baseSha);
         await writeFile(statePath(run,'base'),JSON.stringify({baseSha,baseManifestDigest}),{flag:'wx',mode:0o600});
       });
-      return {run,...(worker.active?{slot:worker.user,worker:{user:worker.user,uid:worker.uid,gid:worker.gid}}:{}),capabilities:{siblings:1,commandClasses:1,gitWorktree:2,...(bundleReady?{gitBundle:1,...(bundleBase?{gitBundleBase:bundleBase}:{})}:{}),...(worker.active?{workers:(await workers()).map(w=>w.user)}:{}),...await this.bases()}};
+      return {run,...(worker.active?{slot:worker.user,worker:{user:worker.user,uid:worker.uid,gid:worker.gid}}:{}),capabilities:{siblings:1,commandClasses:1,gitWorktree:2,...(bundleReady?{gitBundle:1,...(bundleBase?{gitBundleBase:bundleBase}:{}),...(mainAgeMs!==undefined?{gitBundleMainAgeMs:mainAgeMs}:{})}:{}),...(worker.active?{workers:(await workers()).map(w=>w.user)}:{}),...await this.bases()}};
       }catch(error){
         await rm(container,{recursive:true,force:true});
         await rm(statePath(run,'prepared'),{force:true});

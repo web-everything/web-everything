@@ -7,6 +7,7 @@ import { createReadStream } from 'node:fs';
 import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { classifyManifestPath, credentialTextFinding } from './forge-exec-manifest.mjs';
 
 export const REMOTE_TRANSPORTS = Object.freeze(['rsync', 'git-bundle']);
 export const DEFAULT_REMOTE_TRANSPORT = 'rsync';
@@ -53,6 +54,10 @@ export async function planBundle({ cwd, head, runnerBase, exec, directory }) {
     }
   }
   if (prerequisite === head) return { mode: 'none', tip: head };
+  // R559: the same credential policy as the rsync path, over EVERY commit in the bundled range (a secret
+  // committed and later deleted still travels in the pack). Fail closed before any bundle is built or sent.
+  const hit = await scanBundleRange({ cwd, head, prerequisite, exec });
+  if (hit) throw bundleError('bundle-credential-hit', `${hit.path}: ${hit.finding}`);
   const file = join(directory, 'git.bundle');
   // `HEAD` (not a bare sha) so the bundle records a named head the runner can verify against the tip.
   const created = await git(['bundle', 'create', file, 'HEAD', ...(prerequisite ? [`^${prerequisite}`] : [])]);
@@ -82,4 +87,84 @@ export function capabilityRecord({ host, capabilities, nowMs }) {
 export function capabilityAdvertisesBundle(record, { host, nowMs, ttlMs = CAPABILITY_TTL_MS }) {
   return !!record && record.host === host && record.gitBundle === GIT_BUNDLE_CAPABILITY
     && Number.isFinite(record.atMs) && nowMs - record.atMs >= 0 && nowMs - record.atMs <= ttlMs;
+}
+
+const SCAN_BATCH_BYTES = 3 * 1024 * 1024; // below the client's 4 MiB capture limit
+const NUL = 0;
+function splitNul(buffer) {
+  const out = []; let start = 0;
+  for (let i = 0; i < buffer.length; i++) if (buffer[i] === NUL) { out.push(buffer.subarray(start, i)); start = i + 1; }
+  if (start < buffer.length) out.push(buffer.subarray(start));
+  return out;
+}
+const bytes = (value) => Buffer.isBuffer(value) ? value : Buffer.from(value ?? '');
+
+/**
+ * R559: scan every blob a bundle of `prerequisite..head` (or the whole history when `prerequisite` is null)
+ * would carry. Path policy is the manifest's own exclusion policy; content uses its raw token patterns.
+ * Returns the first {path, finding} or null; throws bundle-credential-scan-too-large instead of skipping.
+ */
+export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs = 20000, maxTotalBytes = 128 * 1024 * 1024 }) {
+  const git = (args, input) => exec({ file: 'git', args, cwd, ...(input === undefined ? {} : { input }) });
+  const range = prerequisite ? `${prerequisite}..${head}` : head;
+  const log = await git(['log', '--raw', '-z', '--no-renames', '--no-abbrev', '--root', '-m', '--diff-filter=d', '--format=', range]);
+  if (log.code !== 0) throw bundleError('bundle-credential-scan-failed');
+  const tokens = splitNul(bytes(log.stdout));
+  const blobs = new Map(); // sha -> first path
+  for (let i = 0; i < tokens.length; i++) {
+    const meta = tokens[i].toString('latin1');
+    if (!meta.startsWith(':')) continue;
+    const [, newMode, , newSha] = meta.split(' ');
+    const path = tokens[++i];
+    if (!path) throw bundleError('bundle-credential-scan-failed');
+    const label = path.toString('utf8');
+    if (newMode === '160000' || newMode === '120000') return { path: label, finding: newMode === '160000' ? 'gitlink' : 'symlink' };
+    let excluded;
+    try { excluded = classifyManifestPath(path).excluded; } catch { excluded = true; }
+    if (excluded) return { path: label, finding: 'excluded-path' };
+    if (!blobs.has(newSha)) blobs.set(newSha, label);
+    if (blobs.size > maxBlobs) throw bundleError('bundle-credential-scan-too-large');
+  }
+  const shas = [...blobs.keys()];
+  if (!shas.length) return null;
+  const check = await git(['cat-file', '--batch-check=%(objectname) %(objecttype) %(objectsize)'], shas.join('\n') + '\n');
+  if (check.code !== 0) throw bundleError('bundle-credential-scan-failed');
+  const sizes = new Map(); let total = 0;
+  for (const line of bytes(check.stdout).toString('utf8').split('\n')) {
+    if (!line) continue;
+    const [sha, type, size] = line.split(' ');
+    if (type !== 'blob' || !Number.isSafeInteger(Number(size))) throw bundleError('bundle-credential-scan-failed');
+    sizes.set(sha, Number(size)); total += Number(size);
+  }
+  if (sizes.size !== shas.length || total > maxTotalBytes || [...sizes.values()].some(size => size > SCAN_BATCH_BYTES)) throw bundleError('bundle-credential-scan-too-large');
+  let batch = [], batchBytes = 0;
+  const flush = async () => {
+    if (!batch.length) return null;
+    const read = await git(['cat-file', '--batch'], batch.join('\n') + '\n');
+    if (read.code !== 0) throw bundleError('bundle-credential-scan-failed');
+    const out = bytes(read.stdout); let offset = 0;
+    for (const sha of batch) {
+      const newline = out.indexOf(10, offset);
+      const [got, type, size] = out.subarray(offset, newline).toString('utf8').split(' ');
+      if (got !== sha || type !== 'blob') throw bundleError('bundle-credential-scan-failed');
+      const content = out.subarray(newline + 1, newline + 1 + Number(size));
+      offset = newline + 1 + Number(size) + 1;
+      const finding = credentialTextFinding(content.toString('latin1')) ?? credentialTextFinding(content.toString('utf8'));
+      if (finding) return { path: blobs.get(sha), finding };
+    }
+    batch = []; batchBytes = 0;
+    return null;
+  };
+  for (const sha of shas) {
+    if (batchBytes + sizes.get(sha) > SCAN_BATCH_BYTES) { const hit = await flush(); if (hit) return hit; }
+    batch.push(sha); batchBytes += sizes.get(sha);
+  }
+  return flush();
+}
+
+/** R559: 'fresh' only when the runner reported the mirror's main age and it is within the bound. */
+export function mainFreshness(capabilities, maxAgeMs) {
+  const age = capabilities?.gitBundleMainAgeMs;
+  if (!Number.isFinite(age) || age < 0 || !Number.isFinite(maxAgeMs) || maxAgeMs <= 0) return 'unknown';
+  return age <= maxAgeMs ? 'fresh' : 'stale';
 }

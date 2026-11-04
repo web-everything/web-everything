@@ -6,9 +6,9 @@ import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { materializeWorktree, mirrorReadOnlyForSlots, validBundleEvidence } from '../forge-exec-bases.mjs';
+import { materializeWorktree, mirrorReadOnlyForSlots, validBundleEvidence, readMainFetchAge } from '../forge-exec-bases.mjs';
 import { manifestWire, digestManifest } from '../forge-exec-manifest.mjs';
-import { planBundle, bundleEvidence, resolveTransport, runnerSupportsBundle, capabilityRecord, capabilityAdvertisesBundle } from '../remote-git-bundle.mjs';
+import { planBundle, bundleEvidence, resolveTransport, runnerSupportsBundle, capabilityRecord, capabilityAdvertisesBundle, scanBundleRange, mainFreshness } from '../remote-git-bundle.mjs';
 import { decideRemote, resolveAdmissionPolicy, readRunnerBundleCapability, writeRunnerCapabilities } from '../heavy-admission.mjs';
 
 const ident = ['-c', 'user.name=Fixture', '-c', 'user.email=f@example.invalid'];
@@ -42,6 +42,7 @@ beforeEach(async () => {
   work = join(root, 'snapshot'); container = join(root, 'container');
   await fs.mkdir(work); await fs.mkdir(join(container, 'bundle'), { recursive: true });
   await fs.writeFile(join(work, 'tracked.txt'), 'changed');
+  await fs.writeFile(join(root, 'main-fetched.json'), JSON.stringify({ sha: runnerMain, fetchedAtMs: Date.now() }));
   spy = [];
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
@@ -55,7 +56,7 @@ const run = async ({ head = tip, bundle, runnerBase = runnerMain, sharedClone = 
   const plan = await planBundle({ cwd: lane, head: tip, runnerBase, exec, directory: dir });
   if (plan.file) await fs.copyFile(plan.file, join(container, 'bundle', 'git.bundle'));
   if (mutate) await mutate(join(container, 'bundle', 'git.bundle'));
-  const evidence = bundle ?? bundleEvidence(plan);
+  const evidence = { maxMainAgeMs: 600000, ...(bundle ?? bundleEvidence(plan)) };
   const { manifest, manifestDigest } = manifestFor(head);
   const spied = async (call) => { spy.push(call.args); return exec(call); };
   await materializeWorktree({ work, root, head, manifest, manifestDigest, exec: spied, sharedClone,
@@ -157,5 +158,91 @@ describe('R593 client and routing', () => {
       writeRunnerCapabilities({ root: dir, host: 'forge', capabilities: { gitBundle: 1 }, clock });
       expect(readRunnerBundleCapability({ root: dir, host: 'forge', clock })).toBe(true);
     });
+  });
+});
+
+const commit = async (repo, files, message) => {
+  for (const [name, text] of Object.entries(files)) {
+    if (text === null) git(repo, 'rm', '-q', '--', name);
+    else { await fs.writeFile(join(repo, name), text); git(repo, 'add', '--', name); }
+  }
+  git(repo, ...ident, 'commit', '-q', '-m', message);
+  return git(repo, 'rev-parse', 'HEAD');
+};
+
+describe('R593 credential scan over the whole bundled range (R559)', () => {
+  it('passes a clean range', async () => {
+    expect(await scanBundleRange({ cwd: lane, head: tip, prerequisite: runnerMain, exec })).toBeNull();
+  });
+  it('flags a committed .env that a later commit deleted (every commit, not the final tree)', async () => {
+    await commit(lane, { '.env': 'A=1\n' }, 'add env');
+    const head = await commit(lane, { '.env': null }, 'drop env');
+    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ path: '.env' });
+  });
+  it('flags a token-shaped blob that a later commit scrubbed', async () => {
+    await commit(lane, { 'notes.md': 'key ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8' + '\n' }, 'oops');
+    const head = await commit(lane, { 'notes.md': 'clean\n' }, 'scrub');
+    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ path: 'notes.md', finding: 'github-token' });
+  });
+  it('flags a credential-named path and a symlink', async () => {
+    const head = await commit(lane, { 'credentials.txt': 'x\n' }, 'cred');
+    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ path: 'credentials.txt' });
+  });
+  it('ignores secrets that only live in the base history before the prerequisite', async () => {
+    expect(await scanBundleRange({ cwd: lane, head: tip, prerequisite: tip, exec })).toBeNull();
+  });
+  it('planBundle fails closed with bundle-credential-hit and builds no bundle (incremental)', async () => {
+    await commit(lane, { 'aws.md': 'AKIA' + 'ABCDEFGHIJKLMNOP' + '\n' }, 'aws');
+    const head = await commit(lane, { 'aws.md': 'x\n' }, 'scrub');
+    const dir = join(root, 'scan-out'); await fs.mkdir(dir);
+    await expect(planBundle({ cwd: lane, head, runnerBase: runnerMain, exec, directory: dir })).rejects.toMatchObject({ code: 'bundle-credential-hit' });
+    expect(existsSync(join(dir, 'git.bundle'))).toBe(false);
+  });
+  it('the full-bundle path scans the whole bundled history, root commit included', async () => {
+    const solo = join(root, 'solo'); await fs.mkdir(solo); git(solo, 'init', '-b', 'main');
+    await commit(solo, { 'id_rsa': 'k\n' }, 'root');
+    const head = await commit(solo, { 'id_rsa': null, 'a.txt': 'a\n' }, 'next');
+    const dir = join(root, 'scan-full'); await fs.mkdir(dir);
+    await expect(planBundle({ cwd: solo, head, runnerBase: 'f'.repeat(40), exec, directory: dir })).rejects.toMatchObject({ code: 'bundle-credential-hit' });
+  });
+  it('refuses (does not skip) a range too large to scan', async () => {
+    await expect(scanBundleRange({ cwd: lane, head: tip, prerequisite: runnerMain, exec, maxBlobs: 0 })).rejects.toMatchObject({ code: 'bundle-credential-scan-too-large' });
+  });
+});
+
+describe('R593 mirror main freshness bound (R559)', () => {
+  it('fresh within the bound, stale beyond it, unknown when unreadable', () => {
+    expect(mainFreshness({ gitBundleMainAgeMs: 5 * 60_000 }, 10 * 60_000)).toBe('fresh');
+    expect(mainFreshness({ gitBundleMainAgeMs: 11 * 60_000 }, 10 * 60_000)).toBe('stale');
+    expect(mainFreshness({}, 10 * 60_000)).toBe('unknown');
+    expect(mainFreshness({ gitBundleMainAgeMs: -1 }, 10 * 60_000)).toBe('unknown');
+    expect(mainFreshness({ gitBundleMainAgeMs: 1 }, Number.NaN)).toBe('unknown');
+  });
+  it('the runner reads the warmer fetch stamp and refuses a stale or missing one at ingest', async () => {
+    const stamp = join(root, 'main-fetched.json');
+    expect(await readMainFetchAge(root, { clock: () => 1000 })).toBeUndefined();
+    await fs.writeFile(stamp, JSON.stringify({ sha: runnerMain, fetchedAtMs: 400 }));
+    expect(await readMainFetchAge(root, { clock: () => 1000 })).toBe(600);
+    const dir = join(root, 'fresh-out'); await fs.mkdir(dir);
+    const plan = await planBundle({ cwd: lane, head: tip, runnerBase: runnerMain, exec, directory: dir });
+    await fs.copyFile(plan.file, join(container, 'bundle', 'git.bundle'));
+    const { manifest, manifestDigest } = manifestFor(tip);
+    const call = (maxMainAgeMs) => materializeWorktree({ work, root, head: tip, manifest, manifestDigest, exec, clock: () => 1000,
+      bundle: { ...bundleEvidence(plan), file: join(container, 'bundle', 'git.bundle'), maxMainAgeMs } });
+    await expect(call(500)).rejects.toMatchObject({ code: 'git-head-unavailable' });
+    await fs.rm(stamp);
+    await expect(call(5000)).rejects.toMatchObject({ code: 'git-head-unavailable' });
+    await fs.writeFile(stamp, JSON.stringify({ sha: runnerMain, fetchedAtMs: 400 }));
+    await call(5000);
+    expect(git(work, 'rev-parse', 'HEAD')).toBe(tip);
+  });
+  it('remote.bundle.mainMaxAgeMin defaults to 10 and resolves through the policy cascade', () => {
+    expect(resolveAdmissionPolicy({ platform: {} }).settings.remote.bundle.mainMaxAgeMin).toBe(10);
+    const set = resolveAdmissionPolicy({ platform: { remote: { bundle: { mainMaxAgeMin: 3 } } } });
+    expect(set.settings.remote.bundle.mainMaxAgeMin).toBe(3);
+    expect(set.sources['remote.bundle.mainMaxAgeMin']).toBe('platform');
+    const bad = resolveAdmissionPolicy({ platform: { remote: { bundle: { mainMaxAgeMin: 0 } } } });
+    expect(bad.settings.remote.bundle.mainMaxAgeMin).toBe(10);
+    expect(bad.invalid.join(' ')).toContain('mainMaxAgeMin');
   });
 });

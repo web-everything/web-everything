@@ -245,6 +245,8 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
   priority: Object.freeze({ mode: 'enforce', repairPatterns: DEFAULT_REPAIR_PATTERNS }),
   // transport (R593): 'rsync' (default, rollback value) | 'git-bundle' (ship a verified git bundle; needs a runner advertising gitBundle:1).
   remote: Object.freeze({ enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null, transport: 'rsync',
+    // R559: bundle mode needs the Forge mirror's public main fetched within this many minutes (else it falls back to rsync).
+    bundle: Object.freeze({ mainMaxAgeMin: 10 }),
     maxConcurrent: 8, backoffMs: 120000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15,
     // R475: raise a health event (coroner trigger) when >= stuckMinSlots dead-owner unconfirmed slots are older than stuckAgeMs,
     // or when a slot is kept because the Forge probe was unknown; at most one event per kind per stuckSignalEveryMs.
@@ -275,6 +277,7 @@ const ADMISSION_VALID = {
   'priority.repairPatterns': validRepairPatterns,
   'remote.clientPath': (v) => v === null || typeof v === 'string',
   'remote.transport': (v) => v === 'rsync' || v === 'git-bundle',
+  'remote.bundle.mainMaxAgeMin': (v) => Number.isFinite(v) && v > 0 && v <= 1440,
   'remote.enabled': (v) => typeof v === 'boolean',
   'remote.mode': (v) => v === 'above-threshold' || v === 'always',
   'remote.loadPerCoreThreshold': (v) => Number.isFinite(v) && v > 0,
@@ -353,7 +356,7 @@ export function privateAdmissionPool(env, checkoutRoot) {
 export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot } = {}) {
   const isPrivate = privateAdmissionPool(env, checkoutRoot);
   const settings = { ...ADMISSION_POLICY_STANDARD, fastScale: { ...ADMISSION_POLICY_STANDARD.fastScale },
-    remote: { ...ADMISSION_POLICY_STANDARD.remote },
+    remote: { ...ADMISSION_POLICY_STANDARD.remote, bundle: { ...ADMISSION_POLICY_STANDARD.remote.bundle } },
     priority: { ...ADMISSION_POLICY_STANDARD.priority, repairPatterns: [...ADMISSION_POLICY_STANDARD.priority.repairPatterns] } };
   const sources = {}; const invalid = []; const ignored = [];
   for (const [leaf, valid] of Object.entries(ADMISSION_VALID)) {
@@ -389,8 +392,8 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
         else invalid.push(`env ${name}=${oneLine(JSON.stringify(raw))}`);
       }
     }
-    const dot = leaf.indexOf('.');
-    if (dot > 0) settings[leaf.slice(0, dot)][leaf.slice(dot + 1)] = value;
+    const keys = leaf.split('.');
+    if (keys.length > 1) keys.slice(0, -1).reduce((o, k) => o[k], settings)[keys.at(-1)] = value;
     else settings[leaf] = value;
   }
   return { settings, sources, invalid, ignored };
@@ -457,7 +460,7 @@ export function formatAdmissionPolicy({ settings, sources, ignored = [], invalid
   const values = ['cap', 'fastSlots', 'onTimeout', 'fastScale.maxSlots', 'priority.mode',
     ...Object.keys(ADMISSION_POLICY_STANDARD.remote)
       .filter(key => key !== 'clientPath' || settings.remote?.clientPath != null)
-      .map(key => `remote.${key}`)]
+      .flatMap(key => key === 'bundle' ? ['remote.bundle.mainMaxAgeMin'] : [`remote.${key}`])]
     .map((leaf) => `${leaf}=${leaf === 'remote.clientPath' ? clientPathForLog(admissionLeaf(settings, leaf)) : admissionLeaf(settings, leaf)} (${sources[leaf] ?? 'standard'})`);
   return `heavy-admission policy · ${values.join(', ')}${ignored.length ? ` · ignored: ${ignored.join('; ')}` : ''}${invalid.length ? ` · invalid: ${invalid.join('; ')}` : ''}`;
 }
@@ -935,7 +938,7 @@ export async function runWithRemoteDecision({
         controller.abort();
       }, timeoutMs);
     });
-    const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, transport: policy.settings.remote.transport,
+    const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, transport: policy.settings.remote.transport, bundleMainMaxAgeMs: policy.settings.remote.bundle.mainMaxAgeMin * 60_000,
       onCapabilities: capabilities => writeRunnerCapabilities({ root: remoteRoot, host, capabilities, clock }), onRun: run => recordMarkerRun(executionMarker, {owner, run}) }));
     const result = await Promise.race([remote, timeout]);
     if (result === timedOut) {

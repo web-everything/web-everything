@@ -67,7 +67,16 @@ export async function mirrorReadOnlyForSlots(mirror,io=fs) {
     return true;
   } catch {return false;}
 }
-export async function materializeWorktree({work,root,baseSha,head,manifest,manifestDigest,exec=gitExec,bundle,sharedClone=false}) {
+// R559: the warmer stamps every successful fetch of public main; a missing, unreadable or implausible stamp is "unknown".
+export const MAIN_FETCH_STAMP='main-fetched.json';
+export async function readMainFetchAge(root,{clock=Date.now,io=fs}={}) {
+  try {
+    const stamp=JSON.parse((await baseFile(join(root,MAIN_FETCH_STAMP),io)).toString('utf8'));
+    const age=clock()-stamp.fetchedAtMs;
+    return Number.isSafeInteger(stamp.fetchedAtMs)&&age>=0?age:undefined;
+  } catch {return undefined;}
+}
+export async function materializeWorktree({work,root,baseSha,head,manifest,manifestDigest,exec=gitExec,bundle,sharedClone=false,clock=Date.now}) {
   if(!revision(head)||manifest?.git?.head!==head||baseSha!==undefined&&!revision(baseSha)||digestManifest(manifest)!==manifestDigest)throw new Error('Invalid Git evidence');
   const {siblings,git:logical,...primary}=manifest;
   if(logical.diffCoverageBase!==undefined&&!revision(logical.diffCoverageBase))throw new Error('Invalid coverage base SHA');
@@ -117,6 +126,9 @@ export async function materializeWorktree({work,root,baseSha,head,manifest,manif
       // No network: public main comes from the mirror clone; the Mac tip comes from
       // the verified bundle (or is already in the mirror when mode is none).
       if(!local||!validBundleEvidence(bundle))throw new Error('Bundle transport unavailable');
+      // Freshness bound (R559): never fail open on an unknown or old public-main fetch.
+      const mainAge=await readMainFetchAge(root,{clock});
+      if(!(Number.isFinite(bundle.maxMainAgeMs)&&bundle.maxMainAgeMs>0)||mainAge===undefined||mainAge>bundle.maxMainAgeMs)throw new Error('Public main fetch is stale or unknown');
       // The warmer refreshes refs/remotes/origin/main in the mirror; the mirror clone copied it. Never fall back to a cached local main.
       if(await git(['rev-parse','--verify','refs/remotes/origin/main^{commit}'],cloned,undefined,true)===null)throw new Error('Mirror public main missing');
       if(bundle.mode!=='none') {

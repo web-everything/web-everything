@@ -104,6 +104,7 @@ const secretText=[
   [/gh[opsur]_[A-Za-z0-9]{20,}/,'github-token'],[/\bsk-[A-Za-z0-9_-]{16,}/,'sk-token'],
   [/xox[bp]-[A-Za-z0-9-]{8,}/,'slack-token'],
 ];
+export const credentialTextFinding=text=>textFinding(text);
 const textFinding=text=>secretText.find(([pattern])=>pattern.test(text))?.[1]??null;
 function entropy(text) {
   // Count code points on both sides: UTF-16 length would dilute astral characters.
