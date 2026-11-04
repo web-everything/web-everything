@@ -791,6 +791,24 @@ describe('abandoned and start-less review runs have a defined outcome', () => {
     expect(result.ok).not.toBe(false);
     expect(result.newest ?? result.loopPayload).toEqual(accepted);
   });
+  // Each non-verdict clause of the unfinished check, alone: the newer run already carries a verdict,
+  // so only its pending step or pending/in-flight effect can hold it (a verdict-null fixture would mask them).
+  const withWork = [['a pending step', { pending: { kind: 'judge' } }], ['a pending effect', { effects: [{ status: 'pending' }] }],
+    ['an in-flight effect', { effects: [{ status: 'in-flight' }] }]];
+  it.each(both.flatMap(([name, reader]) => withWork.map(([what, work]) => [name, what, reader, work])))(
+    '%s holds a verdict-bearing newer run with %s as review-unfinished', (_name, _what, reader, work) => {
+      const f = fixture();
+      const { args } = setup(f, a => ({ ...a, verdict: { verdict: 'accept' }, ...work, ...started(15_000) }), 20_000);
+      expect(reader({ ...args, now: 20_000 + 60_000 })).toEqual({ ok: false, reason: 'review-unfinished' });
+      expect(reader({ ...args, now: 20_000 + 30 * 24 * HOUR })).toEqual({ ok: false, reason: 'review-unfinished' });
+    });
+  it.each(both)('%s selects the same verdict-bearing newer run once nothing is pending (control)', (_name, reader) => {
+    const f = fixture();
+    const { args } = setup(f, a => ({ ...a, verdict: { verdict: 'accept' }, pending: null, effects: [{ status: 'applied' }], ...started(15_000) }), 20_000);
+    const result = reader({ ...args, now: 20_000 + 60_000 });
+    expect(result.ok).not.toBe(false);
+    expect((result.newest ?? result.loopPayload).stepTimings).toEqual(started(15_000).stepTimings);
+  });
   it.each(both)('%s never treats a run still waiting on a pending step or effect as abandoned', (_name, reader) => {
     const f = fixture();
     for (const waiting of [{ pending: { kind: 'judge' } }, { effects: [{ status: 'in-flight' }] }]) {
