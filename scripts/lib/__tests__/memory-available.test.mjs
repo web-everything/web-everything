@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { memoryFreePct, parseVmStatAvailableBytes } from '../memory-available.mjs';
+import { memoryFreePct, parseVmStatAvailableBytes, decideMemoryFloor, memoryAvailableMb } from '../memory-available.mjs';
 import { resolveHostOverloadSettings } from '../host-overload-settings.mjs';
 import * as hostOverloadSettings from '../host-overload-settings.mjs';
 import { createSampler } from '../resource-sampler.mjs';
@@ -68,5 +68,37 @@ describe('memory-available', () => {
       Object.defineProperty(process, 'platform', platformDescriptor);
       settingsLookup.mockRestore();
     }
+  });
+});
+
+describe('R553 hard memory floor (fail closed)', () => {
+  const ok = { availableMb: 8192, floorMb: 2048, pressureLevel: 1 };
+  it('admits a healthy host', () => { expect(decideMemoryFloor(ok)).toMatchObject({ admit: true }); });
+  it('refuses below the floor, and admits exactly at it', () => {
+    expect(decideMemoryFloor({ ...ok, availableMb: 2047 })).toMatchObject({ admit: false });
+    expect(decideMemoryFloor({ ...ok, availableMb: 2048 }).admit).toBe(true);
+  });
+  it.each([[2, /warn/], [4, /critical/]])('refuses under pressure level %s', (pressureLevel, re) => {
+    const d = decideMemoryFloor({ ...ok, pressureLevel });
+    expect(d.admit).toBe(false); expect(d.reason).toMatch(re);
+  });
+  it.each([
+    ['no available reading', { availableMb: null }], ['NaN available', { availableMb: NaN }], ['string available', { availableMb: '9999' }],
+    ['no pressure', { pressureLevel: null }], ['unknown pressure level', { pressureLevel: 3 }],
+    ['no floor', { floorMb: undefined }], ['zero floor', { floorMb: 0 }], ['stale snapshot', { snapshotFresh: false }],
+  ])('refuses an unreadable input: %s', (_n, patch) => { expect(decideMemoryFloor({ ...ok, ...patch }).admit).toBe(false); });
+  it('refuses with no arguments at all', () => { expect(decideMemoryFloor().admit).toBe(false); });
+  it('memoryAvailableMb throws on an unreadable total instead of reporting plenty', () => {
+    expect(() => memoryAvailableMb({ metric: 'free', freemem: () => NaN })).toThrow();
+  });
+  it('the sampler records availableMb, the floor and its source in the snapshot', () => {
+    const policy = resolveHostOverloadSettings({ platform: {}, tool: {}, env: { WE_HOST_CAPACITY_MEM_AVAILABLE_FLOOR_MB: '3000' }, log: () => {} });
+    const spy = vi.spyOn(hostOverloadSettings, 'loadHostOverloadSettings').mockReturnValue(policy);
+    try {
+      const s = createSampler({ checkoutRoot: process.cwd(), exec: (c) => (c === 'sysctl' ? '2' : ''), now: () => 0, cpus: () => [],
+        freemem: () => 5000 * 1024 * 1024, totalmem: () => TOTAL, readHeavySlots: () => ({ held: 0, cap: 1 }), countLanes: () => 0 });
+      const m = s.sample().memory;
+      expect(m).toMatchObject({ floorMb: 3000, floorSource: 'env', pressureLevel: 2 });
+    } finally { spy.mockRestore(); }
   });
 });

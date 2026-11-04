@@ -10,9 +10,9 @@ import { admitLaunch, resolveCostAdmissionSettings } from '../cost-admission.mjs
 import { lightResourceDecision } from '../cost-admission-facts.mjs';
 
 const NOW = Date.parse('2026-10-10T15:00:00Z');
-const snap = ({ idle = 40, pressure = 1, ageMs = 5000, freshForMs = 20000, freePct, swapUsedPct } = {}) => ({
+const snap = ({ idle = 40, pressure = 1, ageMs = 5000, freshForMs = 20000, freePct, swapUsedPct, availableMb = 8192, floorMb = 2048 } = {}) => ({
   sampledAt: new Date(NOW - ageMs).toISOString(), freshUntil: new Date(NOW - ageMs + freshForMs).toISOString(),
-  cpu: { idlePct: idle, loadAvg: [60] }, memory: { pressureLevel: pressure, ...(freePct !== undefined ? { freePct } : {}), ...(swapUsedPct !== undefined ? { swapUsedPct } : {}) },
+  cpu: { idlePct: idle, loadAvg: [60] }, memory: { pressureLevel: pressure, availableMb, floorMb, floorSource: 'standard', ...(freePct !== undefined ? { freePct } : {}), ...(swapUsedPct !== undefined ? { swapUsedPct } : {}) },
   disk: { busyPct: 100 }, heavySlots: { held: 1, cap: 4 },
 });
 let root;
@@ -256,5 +256,26 @@ describe('dynamic fixer cap', () => {
     expect(t.tryAdmit('fix')).toMatchObject({ admit: false, kind: 'host-load' });
     expect(t.tryAdmit('fix').admit).toBe(true);
     expect(t.tryAdmit('fix')).toMatchObject({ admit: false, kind: 'fix-cap' });
+  });
+  describe('R553 hard memory floor', () => {
+    const mk = (readSnap, lines = []) => createResourceFixThrottle({ sendBackReservedSlots: 0, listClaims: () => [], queueLength: 0, readSnap, nowMs: () => NOW,
+      settings: { cutover: 'enforce', fixCap: { ...fixCap, floor: 4, ceiling: 4 } }, gate: () => ({ admit: true }), log: (l) => lines.push(l) });
+    it('admits when healthy and logs the effective floor, source and decision', () => {
+      const lines = []; const t = mk(() => snap(), lines);
+      expect(t.tryAdmit('fix').admit).toBe(true);
+      expect(lines[0]).toMatch(/mem floor 2048 MB \(standard\) available 8192 MB pressure 1 → admit/);
+    });
+    it('refuses below the floor', () => {
+      const d = mk(() => snap({ availableMb: 1500 })).tryAdmit('fix');
+      expect(d).toMatchObject({ admit: false, kind: 'host-load', signal: 'mem-floor' }); expect(d.why).toMatch(/1500 MB < floor 2048 MB/);
+    });
+    it.each([2, 4])('refuses under memory pressure level %s', (pressure) => {
+      expect(mk(() => snap({ pressure })).tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
+    });
+    it.each([['no snapshot', () => null], ['read throws', () => { throw Error('x'); }], ['stale', () => snap({ ageMs: 600000 })],
+      ['no available reading', () => snap({ availableMb: null })], ['no floor', () => snap({ floorMb: null })],
+      ['no pressure', () => snap({ pressure: null })]])('fails closed on %s', (_n, readSnap) => {
+      expect(mk(readSnap).tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
+    });
   });
 });

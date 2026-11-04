@@ -24,6 +24,8 @@ const leaves = {
   'host.capacitySignal': ['load', 'WE_HOST_CAPACITY_SIGNAL', (v) => ['load', 'cpu-mem'].includes(v)],
   // R528: which memory-free measurement the capacity gates use. available = free+inactive+purgeable+speculative; free = os.freemem.
   'host.capacity.memoryMetric': ['available', 'WE_HOST_CAPACITY_MEMORY_METRIC', (v) => ['available', 'free'].includes(v)],
+  // R553: hard floor. No new fixer is admitted while available memory (under memoryMetric) is below this many MB.
+  'host.capacity.memAvailableFloorMb': [2048, 'WE_HOST_CAPACITY_MEM_AVAILABLE_FLOOR_MB', (v) => Number.isFinite(v) && v > 0],
   'host.capacity.cpuIdleLowPct': [15, 'WE_HOST_CAPACITY_CPU_IDLE_LOW_PCT', pct],
   'host.capacity.memFreeLowPct': [15, 'WE_HOST_CAPACITY_MEM_FREE_LOW_PCT', pct],
   'host.capacity.cpuIdleMediumPct': [30, 'WE_HOST_CAPACITY_CPU_IDLE_MEDIUM_PCT', pct],
