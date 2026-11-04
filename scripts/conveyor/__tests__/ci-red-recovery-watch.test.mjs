@@ -312,6 +312,24 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
     expect(result.applied.map((a) => [a.prNumber, a.action])).toEqual([[2635, 'deferred'], [2636, 'rebased']]);
   });
 
+  // Review round 3 of #6340: deferrals were free for the budget too, so slow deferred verifications (network calls)
+  // never tripped it and the pass deadline killed the sweep. Time spent in the apply loop is bounded on its own.
+  it('slow deferred refreshes still hit the apply time budget (no writes, but real time spent)', () => {
+    const prs = Array.from({ length: 12 }, (_, i) => ({ ...PR_2635, number: 2700 + i, headRefName: `lane/s${2700 + i}` }));
+    let t = 0;
+    const refresh = vi.fn(() => { t += 35; return { deferred: true, ok: false, error: 'cross-repository PR' }; });
+    const postComment = vi.fn();
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment, apply: true, now: () => t, applyBudgetMs: 100, maxApplyPerTick: 8,
+    });
+    expect(refresh).toHaveBeenCalledTimes(3);
+    expect(postComment).not.toHaveBeenCalled();
+    expect(result.applied).toHaveLength(12);
+    expect(result.applied.slice(3)).toEqual(expect.arrayContaining([expect.objectContaining({ deferred: true, budgetExhausted: true })]));
+    expect(result.applied.slice(3).every((a) => a.budgetExhausted === true)).toBe(true);
+  });
+
   it('a failed refresh whose claim is found held afterwards is a free deferral too', () => {
     const prs = [2635, 2636].map((number) => ({ ...PR_2635, number, headRefName: `lane/k${number}` }));
     let t = 0;

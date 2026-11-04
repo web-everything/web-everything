@@ -48,6 +48,16 @@ export default {
       apply: true, now: () => t3, applyBudgetMs: 150, maxApplyPerTick: 8,
     });
     if (!freeDefer.applied.some((a) => a.ok)) violations.push({ detail: 'a free deferral spent the progress floor and starved the later PRs' });
+    // Review round 3 of #6340: slow deferred refreshes (no write, real network time) must still hit the time budget.
+    let t4 = 0;
+    let attempts = 0;
+    sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => mainRuns, readAheadBy: () => 5, readComments: () => [],
+      refresh: () => { attempts += 1; t4 += 100; return { deferred: true, ok: false, error: 'not same-repo' }; },
+      postComment: () => {}, checkClaim: () => null, readPriority: () => null,
+      apply: true, now: () => t4, applyBudgetMs: 150, maxApplyPerTick: 8,
+    });
+    if (attempts > 2) violations.push({ detail: `${attempts} slow deferred refreshes ran past a 150 ms budget` });
     return { violations };
   },
   judge(report) { return report.violations.map((v) => v.detail); },

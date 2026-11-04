@@ -354,10 +354,17 @@ export function sweepCiRedRecovery({
   const applied = [];
   if (apply) {
     let started = 0;
+    const applyStartedAt = now();
     for (const d of plan.dispatch) {
       // Progress floor: the first refresh of a tick always starts. Discovery (per-PR comment reads) can by itself
       // outlast the budget; without the floor every tick would defer everything and the queue would never drain.
-      if (started >= maxApplyPerTick || (started >= 1 && now() - tickStartedAt >= applyBudgetMs)) {
+      // A deferred refresh does no write but its verification calls still take real time (review round 3 of #6340:
+      // 12 PRs x 35 s of deferrals ran past the pass deadline because `started` stayed 0). So time spent INSIDE the
+      // apply loop is bounded on its own, floor or no floor; it cannot starve anyone, since it only trips after the
+      // loop itself has already used the whole budget. Deferrals stay out of `started`/the cap (a persistently
+      // deferred PR at the head of the queue must not block the PRs behind it).
+      if (started >= maxApplyPerTick || now() - applyStartedAt >= applyBudgetMs
+        || (started >= 1 && now() - tickStartedAt >= applyBudgetMs)) {
         applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, ok: false, action: 'deferred', deferred: true, budgetExhausted: true,
           error: 'tick apply budget spent — left for the next tick (no rebase comment posted, the per-sha cap is untouched)' });
         continue;
