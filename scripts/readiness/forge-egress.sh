@@ -55,14 +55,15 @@ RE_V6_FULL="^$HEX(:$HEX){7}\$"
 RE_V6_COMPRESSED="^($HEX(:$HEX){0,6})?::($HEX(:$HEX){0,6})?\$"
 valid_v4() { [[ "$1" =~ $RE_V4 ]]; }
 valid_v6() { # at least two colons, hex groups of 1-4 digits, at most one `::`, optional dotted-v4 tail
-  local a=$1 tail colons
+  local a=$1 tail colons parts
   [[ "$a" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
   tail=${a##*:}
   if [[ "$tail" == *.* ]]; then valid_v4 "$tail" || return 1; a="${a%"$tail"}0:0"; fi   # v4 tail = two groups
   colons=${a//[!:]/}
   (( ${#colons} >= 2 )) || return 1
   if [[ "$a" == *::* ]]; then
-    (( ${#colons} <= 8 )) || return 1   # `::` stands for at least one zero group: at most 7 written groups
+    parts=(${a//:/ })                   # written groups (only hex digits/colons remain: no glob characters)
+    (( ${#parts[@]} <= 7 )) || return 1 # `::` stands for at least one zero group: at most 7 written groups
     [[ "$a" =~ $RE_V6_COMPRESSED ]]
   else
     [[ "$a" =~ $RE_V6_FULL ]]

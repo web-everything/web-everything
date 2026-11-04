@@ -257,7 +257,7 @@ describe('forge-setup egress service',()=>{
 
 describe('forge-egress address validation (only well-formed addresses reach nft)',()=>{
   const V4_JUNK='999.1.1.1 1.2.3 256.0.0.1 01.2.3.4 1.2.3.4.5 1.2.3.-4 dead';
-  const V6_JUNK=': ::::g :::: dead 1:2 :1 1: ::: 1::2::3 12345::1 1:2:3:4:5:6:7:8:9 1:2:3:4:5:6:7::8:9 ::ffff:999.1.1.1 fe80::1%eth0 ::g';
+  const V6_JUNK=': ::::g :::: dead 1:2 :1 1: ::: 1::2::3 12345::1 1:2:3:4:5:6:7:8:9 1:2:3:4:5:6:7::8:9 1:2:3:4:5:6:7::8 1:2:3:4:5:6::1.2.3.4 ::ffff:999.1.1.1 fe80::1%eth0 ::g';
   it('v4: every octet must be 0-255; malformed values never appear in the ruleset',()=>{
     const r=render({FORGE_EGRESS_UIDS:'990',FORGE_EGRESS_REGISTRY_V4:`${V4_JUNK} 8.8.8.8 255.255.255.255 0.0.0.0`,FORGE_EGRESS_REGISTRY_V6:''});
     expect(r.status).toBe(0);
