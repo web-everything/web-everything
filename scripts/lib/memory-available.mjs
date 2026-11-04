@@ -24,11 +24,13 @@ export function parseVmStatAvailableBytes(text) {
 
 /** Memory-available bytes under `metric`. Throws on unreadable evidence. */
 export function memoryAvailableBytes({ metric = DEFAULT_MEMORY_METRIC, exec = execFileSync, platform = process.platform,
-  freemem = os.freemem } = {}) {
+  freemem = os.freemem, strict = false } = {}) {
   let bytes = null;
   if (metric === 'available' && platform === 'darwin') {
     // A failed or unparseable vm_stat degrades to the stricter os.freemem reading, never to "unknown".
     try { bytes = parseVmStatAvailableBytes(exec('vm_stat', [], { encoding: 'utf8', timeout: 5000 })); } catch { bytes = null; }
+    // strict (the hard floor): an unreadable vm_stat is unreadable evidence, never a quiet substitute reading.
+    if (strict && bytes === null) throw Error('vm_stat unreadable');
   }
   if (bytes === null) bytes = freemem(); // 'free', or no vm_stat (non-darwin: freemem is MemAvailable on Linux)
   if (!Number.isFinite(bytes) || bytes < 0) throw Error('invalid memory totals');
@@ -45,7 +47,7 @@ export function memoryFreePct({ metric = DEFAULT_MEMORY_METRIC, exec = execFileS
 }
 
 /** Available memory in whole MB (rounded down). Throws on unreadable evidence. */
-export function memoryAvailableMb(opts = {}) { return Math.floor(memoryAvailableBytes(opts) / (1024 * 1024)); }
+export function memoryAvailableMb(opts = {}) { return Math.floor(memoryAvailableBytes({ strict: true, ...opts }) / (1024 * 1024)); }
 
 export const DEFAULT_MEM_AVAILABLE_FLOOR_MB = 2048;
 /** macOS kern.memorystatus_vm_pressure_level: 1 normal, 2 warn, 4 critical. */

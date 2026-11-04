@@ -43,6 +43,12 @@ describe('memory-available', () => {
   it('a throwing vm_stat degrades to the stricter freemem reading', () => {
     expect(memoryFreePct({ platform: 'darwin', exec: () => { throw Error('denied'); }, totalmem: () => 100, freemem: () => 5 })).toBe(5);
   });
+  it('the hard-floor reading is strict: a failing or unparseable vm_stat throws instead of substituting freemem', () => {
+    const o = { metric: 'available', platform: 'darwin', freemem: () => 4096 * 1024 * 1024 };
+    expect(() => memoryAvailableMb({ ...o, exec: () => { throw Error('denied'); } })).toThrow('vm_stat unreadable');
+    expect(() => memoryAvailableMb({ ...o, exec: () => 'garbage' })).toThrow('vm_stat unreadable');
+    expect(memoryAvailableMb({ metric: 'free', platform: 'darwin', freemem: o.freemem })).toBe(4096);
+  });
   it('metric is a setting with env override and validation', () => {
     const base = { platform: {}, tool: {}, log: () => {} };
     expect(resolveHostOverloadSettings({ ...base, env: {} }).settings.host.capacity.memoryMetric).toBe('available');
