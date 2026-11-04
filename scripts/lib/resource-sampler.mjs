@@ -9,7 +9,7 @@ import { readdirSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { workspaceFor } from './lane-pool-paths.mjs';
-import { memoryFreePct, memoryAvailableMb, DEFAULT_MEM_AVAILABLE_FLOOR_MB } from './memory-available.mjs';
+import { memoryFreePct, memoryAvailableMb } from './memory-available.mjs';
 import { loadHostOverloadSettings } from './host-overload-settings.mjs';
 import { admissionStatus, admissionLockRoot, resolveCap } from '../readiness/heavy-admission.mjs';
 
@@ -125,8 +125,9 @@ export function createSampler({ exec = execFileSync, cpus = os.cpus, loadavg = o
       const value = memoryPressureLevel(run('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level']));
       if (value === null) throw Error('unrecognized memory pressure'); return value;
     });
-    // One policy read per sample. An unreadable or invalid policy takes the stricter metric and the default floor.
-    let memPolicy = { metric: 'free', floorMb: DEFAULT_MEM_AVAILABLE_FLOOR_MB, floorSource: 'default (policy unreadable)' };
+    // One policy read per sample. An unreadable or invalid policy takes the stricter metric and NO floor (null), which
+    // makes the admission gate refuse: a default could sit below a stricter configured floor, so it is never substituted.
+    let memPolicy = { metric: 'free', floorMb: null, floorSource: 'unreadable policy' };
     try {
       const { settings, sources } = loadHostOverloadSettings({ log: () => {} });
       memPolicy = { metric: settings.host.capacity.memoryMetric, floorMb: settings.host.capacity.memAvailableFloorMb,

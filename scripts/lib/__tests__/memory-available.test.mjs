@@ -101,4 +101,14 @@ describe('R553 hard memory floor (fail closed)', () => {
       expect(m).toMatchObject({ floorMb: 3000, floorSource: 'env', pressureLevel: 2 });
     } finally { spy.mockRestore(); }
   });
+  it('an unreadable policy leaves NO floor in the snapshot (never a default that could loosen a stricter configured floor)', () => {
+    const spy = vi.spyOn(hostOverloadSettings, 'loadHostOverloadSettings').mockImplementation(() => { throw Error('invalid policy'); });
+    try {
+      const s = createSampler({ checkoutRoot: process.cwd(), exec: (c) => (c === 'sysctl' ? '1' : ''), now: () => 0, cpus: () => [],
+        freemem: () => 9000 * 1024 * 1024, totalmem: () => TOTAL, readHeavySlots: () => ({ held: 0, cap: 1 }), countLanes: () => 0 });
+      const m = s.sample().memory;
+      expect(m.floorMb).toBeNull();
+      expect(decideMemoryFloor({ availableMb: m.availableMb, floorMb: m.floorMb, pressureLevel: m.pressureLevel }).admit).toBe(false);
+    } finally { spy.mockRestore(); }
+  });
 });
