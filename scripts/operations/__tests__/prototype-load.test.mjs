@@ -150,6 +150,7 @@ function fixture(options = {}) {
     if (args[0] === 'fetch') {
       const ref = args[2]?.replace(/^\+refs\/heads\//, '').split(':')[0];
       if (options.staleFetchFails === ref) return fail(1);
+      if (options.liveFetchFails && args.length > 3 && args[2] === 'main') return fail(1); // only the `origin main <branch>` fetch, not the bare `origin main`
       if (ref === BASE.branch && tipReads > 0 && options.advanceEstablishedBeforeSwap) establishedAdvanced = true;
       if (establishedTips.has(ref)) {
         const count = (establishedFetches.get(ref) || 0) + 1;
@@ -2027,17 +2028,20 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
   it.each([
     ['no audit records at all', ''],
     ['records without a stored fingerprint', auditLines([old({ fingerprint: undefined })])],
-    ['only records whose head is the live head', auditLines([auditRecord({ fingerprint: FP })])],
+    ['only records whose head is the live head', auditLines([auditRecord({ fingerprint: FP })]), true],
     ['an older-head record with an empty fingerprint', auditLines([old({ fingerprint: '' })])],
     ['an older-head record without a head', auditLines([old({ head: undefined })])],
-  ])('never computes the live fingerprint for %s', async (_, audits) => {
+  ])('never computes the live fingerprint for %s', async (_, audits, proceeds = false) => {
     const fingerprint = vi.fn(() => FP);
     const f = auditedFixture('refuse', { audits, auditBaseInMain: TREE, fingerprint });
     const out = await f.run();
     expect(fingerprint).not.toHaveBeenCalled();
     // a loader that went on past the audit stage legitimately fetches `origin main <branch>` later (admission), so only a stop proves the guard
-    if (out.stopReason === 'no-canonical-audit') expect(f.calls.filter((c) => c.args[0] === 'fetch' && c.args.length > 3)).toEqual([]);
-    else expect(out.canonicalAudit).toMatchObject({ ok: true });
+    if (proceeds) expect(out.canonicalAudit).toMatchObject({ ok: true });
+    else {
+      expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
+      expect(f.calls.filter((c) => c.args[0] === 'fetch' && c.args.length > 3)).toEqual([]);
+    }
   });
   it('computes the live fingerprint exactly once, for origin/main and the live sha, when a candidate exists', async () => {
     let f, fetchesBefore;
@@ -2051,7 +2055,10 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
   });
   it('a failed fetch of the live branch means no carry and the fingerprint is never computed', async () => {
     const fingerprint = vi.fn(() => FP);
-    const out = await auditedFixture('refuse', { audits: auditLines([old()]), auditBaseInMain: TREE, fingerprint, staleFetchFails: 'main' }).run();
+    // the injected fingerprint matches and main covers the base, so only the failed live fetch can withhold the carry
+    const control = await auditedFixture('refuse', { audits: auditLines([old()]), auditBaseInMain: TREE, fingerprint: () => FP }).run();
+    expect(control).toMatchObject({ ok: true, canonicalAudit: { ok: true } });
+    const out = await auditedFixture('refuse', { audits: auditLines([old()]), auditBaseInMain: TREE, fingerprint, liveFetchFails: true }).run();
     expect(fingerprint).not.toHaveBeenCalled();
     expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { ok: false, reason: 'no-record' } });
   });
@@ -2093,14 +2100,16 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
     });
     it('does not carry when the live diff differs from the stored fingerprint', async () => {
       const stored = liveOf(DIFF);
-      const { combinedIO } = cannedGit(`${DIFF}+more\n`);
+      const { combinedIO, seen } = cannedGit(`${DIFF}+more\n`);
       const out = await auditedFixture('refuse', { audits: auditLines([old({ fingerprint: stored })]), auditBaseInMain: TREE, combinedIO }).run();
+      expect(seen.map((a) => a[0])).toContain('diff'); // the real helper ran; it is the differing diff that withholds the carry
       expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { ok: false, reason: 'no-record' } });
     });
     it('does not carry when the helper cannot read git (empty diff)', async () => {
       const stored = liveOf(DIFF);
-      const { combinedIO } = cannedGit('');
+      const { combinedIO, seen } = cannedGit('');
       const out = await auditedFixture('refuse', { audits: auditLines([old({ fingerprint: stored })]), auditBaseInMain: TREE, combinedIO }).run();
+      expect(seen.map((a) => a[0])).toContain('diff');
       expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
     });
   });
