@@ -209,11 +209,12 @@ const ACCEPT_HEAD = /^✅ review — accepted\r?\n/, CHANGES_HEAD = /^(?:🔁 )?
 // unknown future hold): a symbol/emoji-led first line naming one of those. A later one withdraws an earlier accept.
 // The first non-empty line (BOM / zero-width / leading markdown emphasis stripped) is tested for the keywords; a wider net only
 // errs toward "review owed", which is the safe direction. It no longer requires a leading symbol (`review paused:`, `ℹ️ conveyor`).
-const CONTROL_KEYWORDS = /conveyor|re-?armed?|stood down|stand[- ]?down|escalat|\bhold\b|\bheld\b|\bpaus|supersed|\bruling\b|exhausted/iu;
-const isControlComment = body => {
-  const first = body.replace(/^[\s​-‍﻿*_>#]+/u, '').split(/\r?\n/, 1)[0] ?? '';
-  return CONTROL_KEYWORDS.test(first);
-};
+const CONTROL_KEYWORDS = /conveyor|re[-\s]?armed?|stood[-\s]+down|stand[-\s]*down|escalat|\bhold(?:ing)?\b|\bheld\b|\bpaus|supersed|\bruling\b|exhausted|\bblock(?:ed|ing)?\b|(?:do not|don'?t)\s+merge|withdr[ae]w|revok/iu;
+// The first three non-empty lines are tested (a leading HTML-comment-only or horizontal-rule line must not hide the keyword).
+// Input contract: comments arrive in chronological order and are known to be COMPLETE (a paged/capped list that dropped a later
+// control comment would leave an accept standing; the caller owns that completeness check).
+const isControlComment = body => body.split(/\r?\n/).map(l => l.replace(/^[\s​-‍﻿*_>#]+/u, '')).filter(l => l && !/^<!--.*-->$/.test(l) && !/^[-_*=]{3,}$/.test(l))
+  .slice(0, 3).some(l => CONTROL_KEYWORDS.test(l));
 const MARKER_LINE = new RegExp(`^<!-- ${REVIEWED_SHA_MARKER}: ([0-9a-f]{40}) -->$`);
 /**
  * Seed for a pre-index PR: the latest trusted VERDICT comment, and only if it is accept-shaped (heading at byte 0) with a
@@ -235,7 +236,7 @@ export function seedFromReviewComments(comments) {
     const f = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line); // CommonMark: at most 3 spaces of indent (4+ is an indented code block, not a fence)
     if (open) {
       // Close only on the same fence char, at least as long as the opener, with nothing after it but whitespace.
-      if (f && f[1][0] === open.ch && f[1].length >= open.len && f[2].trim() === '') open = null;
+      if (f && f[1][0] === open.ch && f[1].length >= open.len && /^[ \t]*$/.test(f[2])) open = null; // CommonMark: only spaces/tabs may follow a closer (not U+00A0)
       continue;
     }
     // A backtick fence's info string cannot contain a backtick (that is inline code, not a fence).
