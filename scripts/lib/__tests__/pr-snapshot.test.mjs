@@ -384,6 +384,24 @@ describe('the pass readers are wired to the snapshot (a seeded fresh snapshot is
     if (fn === 'defaultReadPrs') expect(got[0].author).toEqual(PRS[0].author);
   }, 60_000); // the first dynamic import of a heavy conveyor module can exceed the 5s default on a loaded host
 
+  it('reconcile serves the snapshot author without a REST lookup; a row lacking one is still REST-filled', async () => {
+    const { defaultReadPrs, SNAPSHOT_LIST_FIELDS } = await import('../../conveyor/reconcile-pass.mjs');
+    expect(SNAPSHOT_LIST_FIELDS.split(',')).toContain('author');
+    expect(SNAPSHOT_LIST_FIELDS.split(',').every(f => SNAPSHOT_FIELDS.includes(f))).toBe(true);
+    const rest = [];
+    const readRest = path => { rest.push(path); return { json: { user: { login: 'filled', type: 'Bot' } } }; };
+    const served = defaultReadPrs({ repo: REPO, readCommits: () => [], readRest });
+    expect(served.map(p => p.author)).toEqual(PRS.map(p => p.author));
+    expect(rest).toEqual([]);
+    const prs = PRS.map((p, i) => (i === 0 ? { ...p, author: null } : p));
+    writeFileSync(snapshotPath(dir, REPO), JSON.stringify({
+      v: PR_SNAPSHOT_VERSION, repo: REPO, fetchedAtMs: Date.now(), fields: [...SNAPSHOT_FIELDS], limit: 25, count: 14, truncated: false, prs,
+    }));
+    const filled = defaultReadPrs({ repo: REPO, readCommits: () => [], readRest });
+    expect(filled.find(p => p.number === 100).author).toEqual({ login: 'filled', is_bot: true });
+    expect(rest).toEqual([`repos/${REPO}/pulls/100`]);
+  }, 60_000);
+
   it('pr-limit#fetchOpenPrs', async () => {
     const { fetchOpenPrs } = await import('../pr-limit.mjs');
     expect(fetchOpenPrs(REPO)).toHaveLength(14);

@@ -82,7 +82,7 @@ import { resolve } from 'node:path';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { codeqlFailureEvidence } from '../lib/codeql-gate.mjs';
 import { makeFixEvidenceReader, checkFixFacts } from '../lib/fix-facts.mjs';
-import { readSharedOpenPrs, sampleContextDeclared } from '../lib/pr-snapshot.mjs';
+import { readSharedOpenPrs, sampleContextDeclared, SNAPSHOT_FIELDS } from '../lib/pr-snapshot.mjs';
 import { prSnapshotEnabled } from '../lib/pr-snapshot-store.mjs';
 import { listOpenPrsPagedHydrated, resolvePrListPaging, assertInventoryComplete, parseListOutput } from '../lib/pr-list-paged.mjs';
 import { ghRestGetJson } from '../lib/gh-rest-read.mjs';
@@ -318,9 +318,10 @@ export function enrichPrsWithReviewEvidence(prs, { repo, readCommits = fetchPrCo
  * @param {{exec?:Function, repo?:string|null}} [o]
  * @returns {Array<object>}
  */
-/** `PR_LIST_JSON_FIELDS` minus `author`: `author` is not a snapshot field, so asking for it made EVERY production read
- *  bypass the shared paged snapshot and run a heavy 200-row `gh pr list` (HTTP 504 all day, 2026-11-03). */
-export const SNAPSHOT_LIST_FIELDS = PR_LIST_JSON_FIELDS.split(',').filter(f => f !== 'author').join(',');
+/** `PR_LIST_JSON_FIELDS` limited to what the shared snapshot stores: asking for a field it lacks made EVERY production
+ *  read bypass the snapshot and run a heavy 200-row `gh pr list` (HTTP 504 all day, 2026-11-03). `author` IS a snapshot
+ *  field (#6254), so the snapshot's own author is served; {@link withRestAuthors} fills only a row that lacks one. */
+export const SNAPSHOT_LIST_FIELDS = PR_LIST_JSON_FIELDS.split(',').filter(f => SNAPSHOT_FIELDS.includes(f)).join(',');
 const pagedHeavyCache = new Map();
 const authorByPr = new Map();
 
