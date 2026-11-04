@@ -118,7 +118,8 @@ export function governorTick({ loadPerCore, owners = [], settings = GOVERNOR_DEF
     const cls = ownerClass(text ?? owner, settings);
     if (!isHoldable(cls, settings)) continue;
     const cur = readPause({ dir, owner, maxPauseMinutes: settings.maxPauseMinutes, now });
-    if (st.holding && !cur && !cooled.includes(safe(owner))) { // cooled holds on-disk (sanitized) names, as sweepExpired returns them setPause({ dir, owner, reason: `${GOVERNOR_REASON}: ${st.reason}`, by: GOVERNOR_REASON, now }); events.push({ event: 'paused', owner, cls }); }
+    // cooled holds on-disk (sanitized) names, as sweepExpired returns them, so compare in that key space
+    if (st.holding && !cur && !cooled.includes(safe(owner))) { setPause({ dir, owner, reason: `${GOVERNOR_REASON}: ${st.reason}`, by: GOVERNOR_REASON, now }); events.push({ event: 'paused', owner, cls }); }
     else if (!st.holding && cur?.by === GOVERNOR_REASON) { clearPause({ dir, owner }); events.push({ event: 'resumed', owner, cls }); }
   }
   if (!st.holding) { // owners gone from the list but still flagged by us: clear too
