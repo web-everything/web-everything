@@ -39,7 +39,7 @@ function rulingSection(text, ruling) {
 }
 
 /** PURE. A force-adopt needs a well-formed ruling id that exists, and a quote that is verbatim in THAT ruling. */
-export function validateForceAdopt({ daemon, ruling, quote, rulingsText } = {}) {
+export function validateForceAdopt({ daemon, ruling, quote, rulingsText, sha } = {}) {
   if (!daemon) return { ok: false, reason: 'no-daemon' };
   if (!ruling) return { ok: false, reason: 'no-ruling' };
   if (!/^R\d+$/.test(ruling)) return { ok: false, reason: 'bad-ruling-id' };
@@ -48,6 +48,9 @@ export function validateForceAdopt({ daemon, ruling, quote, rulingsText } = {}) 
   const section = rulingSection(rulingsText, ruling);
   if (section === null) return { ok: false, reason: 'ruling-unknown' };
   if (!norm(section).includes(norm(quote))) return { ok: false, reason: 'quote-not-in-ruling' };
+  // The request names the build the operator saw: without it, any build that fails smoke next would consume the force.
+  if (!sha) return { ok: false, reason: 'no-sha' };
+  if (!/^[0-9a-f]{40}$/i.test(String(sha))) return { ok: false, reason: 'bad-sha' };
   return { ok: true };
 }
 
@@ -55,12 +58,12 @@ const readJson = (p) => { try { return JSON.parse(readFileSync(p, 'utf8')); } ca
 const writeJson = (p, v) => { mkdirSync(dirname(p), { recursive: true }); const t = `${p}.${process.pid}.tmp`; writeFileSync(t, JSON.stringify(v)); renameSync(t, p); };
 
 /** Validate and persist a one-shot request; the next rebuild smoke consumes it. */
-export function requestForceAdopt({ root, env = process.env, daemon, ruling, quote, rulingsText, now = Date.now, dryRun = false } = {}) {
+export function requestForceAdopt({ root, env = process.env, daemon, ruling, quote, sha, rulingsText, now = Date.now, dryRun = false } = {}) {
   const text = rulingsText ?? (() => { try { return readFileSync(rulingsPath(env), 'utf8'); } catch { return ''; } })();
-  const v = validateForceAdopt({ daemon, ruling, quote, rulingsText: text });
+  const v = validateForceAdopt({ daemon, ruling, quote, rulingsText: text, sha });
   if (!v.ok) return v;
   const ttl = Number(env?.WE_FORCE_ADOPT_TTL_MS) > 0 ? Number(env.WE_FORCE_ADOPT_TTL_MS) : FORCE_ADOPT_TTL_MS;
-  const record = { daemon, ruling, quote: norm(quote), requestedAt: new Date(now()).toISOString(), expiresAt: new Date(now() + ttl).toISOString() };
+  const record = { daemon, ruling, quote: norm(quote), sha: String(sha).toLowerCase(), requestedAt: new Date(now()).toISOString(), expiresAt: new Date(now() + ttl).toISOString() };
   if (!dryRun) writeJson(requestPath(root, env), record); // a dry run validates only, never arms an adoption
   return { ok: true, record };
 }
@@ -73,7 +76,9 @@ export function readForceAdopt(root, env = process.env, now = Date.now) {
 const removeQuietly = (p) => { try { rmSync(p, { force: true }); } catch { /* unreachable state dir: nothing to clear */ } };
 export const clearForceAdopt = (root, env = process.env) => removeQuietly(requestPath(root, env));
 export const readForceWatch = (root, env = process.env) => readJson(watchPath(root, env));
-const clearWatch = (root, env) => removeQuietly(watchPath(root, env));
+/** Rollbacks owed but whose marker could not be written to disk, keyed by watch path (this process only). */
+const pendingRollbacks = new Map();
+const clearWatch = (root, env) => { pendingRollbacks.delete(watchPath(root, env)); removeQuietly(watchPath(root, env)); };
 
 /** true only when the line really landed: a forced adoption refuses to proceed unless every audit sink wrote. */
 const appendLine = (p, line) => { try { mkdirSync(dirname(p), { recursive: true }); appendFileSync(p, line); return true; } catch { return false; } };
@@ -154,14 +159,20 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   if (head !== null && !watch.adoptedSeen) { watch.adoptedSeen = true; persist(watch); }
   let health;
   try { health = await probe(root); } catch { health = { healthy: false }; }
-  const verdict = evaluateForceWatch({ watch, healthy: health?.healthy, restarts: health?.restarts ?? 0 });
+  const pendingReason = watch.rollbackPending || pendingRollbacks.get(watchPath(root, env)); // disk marker, else the in-process one
+  const verdict = evaluateForceWatch({ watch: pendingReason ? { ...watch, rollbackPending: pendingReason } : watch, healthy: health?.healthy, restarts: health?.restarts ?? 0 });
   if (verdict.action === 'continue') { persist(verdict.watch); return { action: 'continue', ticksLeft: verdict.watch.ticksLeft }; }
   if (verdict.action === 'done') { clearWatch(root, env); await emit?.({ kind: 'force-adopt-watch-passed', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha } }); return { action: 'done' }; }
   const at = new Date(now()).toISOString();
   let result;
   try { result = await rollback(watch.lastGood); } catch { result = { ok: false }; }
   if (!result?.ok) {
-    persist({ ...watch, rollbackPending: verdict.reason });
+    // The owed-rollback marker must survive a failed state write: write it directly (not the swallowing persist) and, if
+    // that throws, keep it in-process and say so in the handoff file so an operator can see the build is still owed a revert.
+    try { writeJson(watchPath(root, env), { ...watch, rollbackPending: verdict.reason }); } catch {
+      pendingRollbacks.set(watchPath(root, env), verdict.reason);
+      appendLine(handoffFile(env), `- FORCE-ADOPT ${at} ${watch.daemon} ${watch.ruling}: force-adopt-rollback-failed ${watch.sha} -> ${watch.lastGood?.head ?? '?'} (${verdict.reason}); marker could not be saved, kept in memory\n`);
+    }
     await emit?.({ kind: 'force-adopt-rollback-failed', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, reason: verdict.reason } });
     return { action: 'rollback-failed', reason: verdict.reason };
   }

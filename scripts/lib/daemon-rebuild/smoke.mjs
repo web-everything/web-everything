@@ -663,6 +663,13 @@ export async function smokeAndAdopt({
   const failedA = failedRows(a.smokeResult);
   // R508 operator force-adopt: the smoke above STILL ran; its failure is recorded alongside the force, never skipped.
   const forceReq = readForceAdopt(root, stEnv);
+  if (forceReq && String(forceReq.sha ?? '').toLowerCase() !== String(plan.finalSha ?? '').toLowerCase()) {
+    // The operator's ruling vouches for ONE build. A request with no sha (an old record) or another sha never applies here;
+    // it stays pending for its own build until it expires, and this build is held like any failed smoke.
+    alert('force-adopt-refused', { reason: 'sha-mismatch', requested: forceReq.sha ?? null, target: plan.finalSha });
+    await hold('force-adopt-refused', failedA);
+    return { moved: false, reason: 'force-adopt-refused', detail: 'sha-mismatch', plan, alerts: [...prepAlerts, ...alertsList] };
+  }
   if (forceReq) {
     const forceSmoke = { verdict: a.smokeResult.verdict, failed: failedA.map((r) => r.name) };
     alert('force-adopt-over-failed-smoke', { ruling: forceReq.ruling, quote: forceReq.quote, ...forceSmoke, target: plan.finalSha });

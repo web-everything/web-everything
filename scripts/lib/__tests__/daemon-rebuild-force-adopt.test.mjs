@@ -19,6 +19,7 @@ import { defaultPoolRoot } from '../lane-pool-paths.mjs';
 import { DISPATCH_CWD_ENV } from '../../operations/dispatch-lane-io.mjs';
 import { requestForceAdopt, readForceWatch, runForceWatchTick, readForceAdopt } from '../daemon-force-adopt.mjs';
 import { readReadyCandidate } from '../daemon-rebuild/state.mjs';
+import { cloneKeyOf } from '../daemon-last-good.mjs';
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
@@ -147,8 +148,8 @@ describe('R508 force-adopt through rebuildClone', () => {
     writeFileSync(join(base, 'blocker'), 'x');
     const env = { ...forceEnv(env0, base), WE_DAEMON_EVENTS: join(base, 'blocker', 'events.jsonl'), WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' };
     const lastGood = headOf(cloneDir);
-    advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n'));
-    requestForceAdopt({ root: cloneDir, env, daemon: 'review', ruling: 'R508', quote: QUOTE, rulingsText: RULINGS });
+    const target = advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n')); // no overlays: the plan's finalSha is main's tip
+    requestForceAdopt({ root: cloneDir, env, daemon: 'review', ruling: 'R508', quote: QUOTE, sha: target, rulingsText: RULINGS });
     const r = await rebuildClone({ root: cloneDir, env, runSmoke: failing(), prState: async () => null, lockOpts: LOCK_OPTS });
     expect(r.moved).not.toBe(true);
     expect(headOf(cloneDir)).toBe(lastGood);
@@ -160,8 +161,8 @@ describe('R508 force-adopt through rebuildClone', () => {
     writeFileSync(join(base, 'blocker'), 'x');
     const env = { ...forceEnv(env0, base), WE_FORCE_ADOPT_CORONER: join(base, 'blocker', 'coroner.jsonl'), WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' };
     const lastGood = headOf(cloneDir);
-    advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n'));
-    requestForceAdopt({ root: cloneDir, env, daemon: 'review', ruling: 'R508', quote: QUOTE, rulingsText: RULINGS });
+    const target = advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n')); // no overlays: the plan's finalSha is main's tip
+    requestForceAdopt({ root: cloneDir, env, daemon: 'review', ruling: 'R508', quote: QUOTE, sha: target, rulingsText: RULINGS });
     const r = await rebuildClone({ root: cloneDir, env, runSmoke: failing(), prState: async () => null, lockOpts: LOCK_OPTS });
     expect(r.moved).not.toBe(true);
     expect(r.reason).toBe('force-adopt-refused');
@@ -176,8 +177,8 @@ describe('R508 force-adopt through rebuildClone', () => {
     const { base, originDir, cloneDir, env: env0 } = makeFixture();
     const env = forceEnv(env0, base);
     const lastGood = headOf(cloneDir);
-    advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n'));
-    requestForceAdopt({ root: cloneDir, env, daemon: 'review', ruling: 'R508', quote: QUOTE, rulingsText: RULINGS });
+    const target = advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n')); // no overlays: the plan's finalSha is main's tip
+    requestForceAdopt({ root: cloneDir, env, daemon: 'review', ruling: 'R508', quote: QUOTE, sha: target, rulingsText: RULINGS });
     await rebuildClone({ root: cloneDir, env, runSmoke: failing(), prState: async () => null, lockOpts: LOCK_OPTS });
     expect(headOf(cloneDir)).not.toBe(lastGood);
     // No forceWatchProbe injected: the fixture clone has no scripts/lib/daemon-rebuild.mjs, so the default probe is unhealthy.
@@ -185,6 +186,34 @@ describe('R508 force-adopt through rebuildClone', () => {
       prState: async () => null, lockOpts: LOCK_OPTS });
     expect(headOf(cloneDir)).toBe(lastGood);
     expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8')).toMatch(/force-adopt-rolled-back/);
+  });
+
+  it('a request for build X never force-adopts build Y that fails smoke: refused, held, request kept for X', async () => {
+    const { base, originDir, cloneDir, env: env0 } = makeFixture();
+    const env = { ...forceEnv(env0, base), WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' };
+    const lastGood = headOf(cloneDir);
+    const other = advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n'));
+    const wrong = other.replace(/.$/, other.endsWith('0') ? '1' : '0'); // a different, well-formed sha
+    expect(requestForceAdopt({ root: cloneDir, env, daemon: 'review', ruling: 'R508', quote: QUOTE, sha: wrong, rulingsText: RULINGS }).ok).toBe(true);
+    const r = await rebuildClone({ root: cloneDir, env, runSmoke: failing(), prState: async () => null, lockOpts: LOCK_OPTS });
+    expect(r).toMatchObject({ moved: false, reason: 'force-adopt-refused', detail: 'sha-mismatch' });
+    expect(headOf(cloneDir)).toBe(lastGood);
+    expect(readForceWatch(cloneDir, env)).toBeNull();
+    expect(readReadyCandidate(cloneDir, env)).toBeNull();
+    expect(existsSync(env.WE_FORCE_ADOPT_HANDOFF)).toBe(false); // nothing was logged as an adoption
+    expect(readForceAdopt(cloneDir, env)).toMatchObject({ sha: wrong }); // still pending for ITS build
+  });
+
+  it('an old request record with no sha never applies to any build', async () => {
+    const { base, originDir, cloneDir, env: env0 } = makeFixture();
+    const env = { ...forceEnv(env0, base), WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' };
+    const lastGood = headOf(cloneDir);
+    advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n'));
+    const now = Date.now();
+    writeFileSync(join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(cloneDir)}.force-adopt.json`), JSON.stringify({ daemon: 'review', ruling: 'R508', quote: QUOTE, requestedAt: new Date(now).toISOString(), expiresAt: new Date(now + 3600_000).toISOString() }));
+    const r = await rebuildClone({ root: cloneDir, env, runSmoke: failing(), prState: async () => null, lockOpts: LOCK_OPTS });
+    expect(r).toMatchObject({ moved: false, reason: 'force-adopt-refused', detail: 'sha-mismatch' });
+    expect(headOf(cloneDir)).toBe(lastGood);
   });
 
   it('a request without a ruling is refused and changes nothing', () => {
@@ -197,8 +226,8 @@ describe('R508 force-adopt through rebuildClone', () => {
     const { base, originDir, cloneDir, env: env0 } = makeFixture();
     const env = forceEnv(env0, base);
     const lastGood = headOf(cloneDir);
-    advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n'));
-    expect(requestForceAdopt({ root: cloneDir, env, daemon: 'review', ruling: 'R508', quote: QUOTE, rulingsText: RULINGS }).ok).toBe(true);
+    const target = advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n'));
+    expect(requestForceAdopt({ root: cloneDir, env, daemon: 'review', ruling: 'R508', quote: QUOTE, sha: target, rulingsText: RULINGS }).ok).toBe(true);
     const runSmoke = failing();
     const r = await rebuildClone({ root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS });
     expect(runSmoke).toHaveBeenCalled(); // smoke is never skipped

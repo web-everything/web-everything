@@ -11,6 +11,7 @@ import {
 const RULINGS = '## R508 — 2026-11-03\nOperator "Yes": adopt the build now even though smoke failed.\n\n## R509 — x\nother words\nthe exclusive phrase lives only in nine\n';
 const R509_ONLY = 'the exclusive phrase lives only in nine'; // >= 12 chars, present in R509 and nowhere in R508
 const QUOTE = 'adopt the build now even though smoke failed';
+const SHA = 'b'.repeat(40); // the build the operator saw
 let dir; let env; let root;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'force-adopt-'));
@@ -21,13 +22,13 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 describe('validateForceAdopt', () => {
   it('refuses with no ruling id', () => {
-    expect(validateForceAdopt({ daemon: 'review', quote: QUOTE, rulingsText: RULINGS })).toMatchObject({ ok: false, reason: 'no-ruling' });
+    expect(validateForceAdopt({ daemon: 'review', quote: QUOTE, sha: SHA, rulingsText: RULINGS })).toMatchObject({ ok: false, reason: 'no-ruling' });
   });
   it('refuses a malformed ruling id', () => {
-    expect(validateForceAdopt({ daemon: 'review', ruling: '508', quote: QUOTE, rulingsText: RULINGS })).toMatchObject({ ok: false, reason: 'bad-ruling-id' });
+    expect(validateForceAdopt({ daemon: 'review', ruling: '508', quote: QUOTE, sha: SHA, rulingsText: RULINGS })).toMatchObject({ ok: false, reason: 'bad-ruling-id' });
   });
   it('refuses a ruling that is not in the rulings file', () => {
-    expect(validateForceAdopt({ daemon: 'review', ruling: 'R999', quote: QUOTE, rulingsText: RULINGS })).toMatchObject({ ok: false, reason: 'ruling-unknown' });
+    expect(validateForceAdopt({ daemon: 'review', ruling: 'R999', quote: QUOTE, sha: SHA, rulingsText: RULINGS })).toMatchObject({ ok: false, reason: 'ruling-unknown' });
   });
   it('refuses a missing or short quote', () => {
     expect(validateForceAdopt({ daemon: 'review', ruling: 'R508', rulingsText: RULINGS })).toMatchObject({ ok: false, reason: 'no-quote' });
@@ -38,25 +39,36 @@ describe('validateForceAdopt', () => {
     expect(validateForceAdopt({ daemon: 'review', ruling: 'R508', quote: 'other words', rulingsText: RULINGS })).toMatchObject({ ok: false });
   });
   it('ruling-section isolation: a quote present only in R509 is refused for R508 and accepted for R509', () => {
-    expect(validateForceAdopt({ daemon: 'review', ruling: 'R508', quote: R509_ONLY, rulingsText: RULINGS })).toMatchObject({ ok: false, reason: 'quote-not-in-ruling' });
-    expect(validateForceAdopt({ daemon: 'review', ruling: 'R509', quote: R509_ONLY, rulingsText: RULINGS })).toEqual({ ok: true });
+    expect(validateForceAdopt({ daemon: 'review', ruling: 'R508', quote: R509_ONLY, sha: SHA, rulingsText: RULINGS })).toMatchObject({ ok: false, reason: 'quote-not-in-ruling' });
+    expect(validateForceAdopt({ daemon: 'review', ruling: 'R509', quote: R509_ONLY, sha: SHA, rulingsText: RULINGS })).toEqual({ ok: true });
   });
   it('refuses a quote that is only the ruling heading line (not operator words)', () => {
     expect(validateForceAdopt({ daemon: 'review', ruling: 'R508', quote: 'R508 — 2026-11-03', rulingsText: RULINGS })).toMatchObject({ ok: false, reason: 'quote-not-in-ruling' });
   });
+  it('refuses a request that names no build (no-sha) or a malformed one (bad-sha)', () => {
+    const base = { daemon: 'review', ruling: 'R508', quote: QUOTE, rulingsText: RULINGS };
+    expect(validateForceAdopt(base)).toMatchObject({ ok: false, reason: 'no-sha' });
+    for (const bad of ['abc1234', 'z'.repeat(40), 'b'.repeat(41), 'main']) expect(validateForceAdopt({ ...base, sha: bad })).toMatchObject({ ok: false, reason: 'bad-sha' });
+    expect(requestForceAdopt({ root, env, ...base })).toMatchObject({ ok: false, reason: 'no-sha' });
+    expect(readForceAdopt(root, env)).toBeNull(); // nothing armed
+  });
+  it('stores the sha (lower-cased) in the request record', () => {
+    requestForceAdopt({ root, env, daemon: 'review', ruling: 'R508', quote: QUOTE, sha: 'B'.repeat(40), rulingsText: RULINGS, now: () => 1000 });
+    expect(readForceAdopt(root, env, () => 2000)).toMatchObject({ sha: 'b'.repeat(40) });
+  });
   it('accepts ruling + verbatim quote', () => {
-    expect(validateForceAdopt({ daemon: 'review', ruling: 'R508', quote: QUOTE, rulingsText: RULINGS })).toEqual({ ok: true });
+    expect(validateForceAdopt({ daemon: 'review', ruling: 'R508', quote: QUOTE, sha: SHA, rulingsText: RULINGS })).toEqual({ ok: true });
   });
 });
 
 describe('requestForceAdopt', () => {
   it('writes nothing without a ruling', () => {
-    const r = requestForceAdopt({ root, env, daemon: 'review', quote: QUOTE, rulingsText: RULINGS });
+    const r = requestForceAdopt({ root, env, daemon: 'review', quote: QUOTE, sha: SHA, rulingsText: RULINGS });
     expect(r.ok).toBe(false);
     expect(readForceAdopt(root, env)).toBeNull();
   });
   it('writes a one-shot request with a ruling + quote', () => {
-    const r = requestForceAdopt({ root, env, daemon: 'review', ruling: 'R508', quote: QUOTE, rulingsText: RULINGS, now: () => 1000 });
+    const r = requestForceAdopt({ root, env, daemon: 'review', ruling: 'R508', quote: QUOTE, sha: SHA, rulingsText: RULINGS, now: () => 1000 });
     expect(r.ok).toBe(true);
     expect(readForceAdopt(root, env, () => 2000)).toMatchObject({ daemon: 'review', ruling: 'R508', quote: QUOTE });
   });
@@ -64,12 +76,12 @@ describe('requestForceAdopt', () => {
 
 describe('request safety', () => {
   it('a dry run validates but never arms an adoption', () => {
-    const r = requestForceAdopt({ root, env, daemon: 'review', ruling: 'R508', quote: QUOTE, rulingsText: RULINGS, dryRun: true });
+    const r = requestForceAdopt({ root, env, daemon: 'review', ruling: 'R508', quote: QUOTE, sha: SHA, rulingsText: RULINGS, dryRun: true });
     expect(r.ok).toBe(true);
     expect(readForceAdopt(root, env)).toBeNull();
   });
   it('an expired request never fires', () => {
-    requestForceAdopt({ root, env, daemon: 'review', ruling: 'R508', quote: QUOTE, rulingsText: RULINGS, now: () => 1000 });
+    requestForceAdopt({ root, env, daemon: 'review', ruling: 'R508', quote: QUOTE, sha: SHA, rulingsText: RULINGS, now: () => 1000 });
     expect(readForceAdopt(root, env, () => 1000 + 60_000)).not.toBeNull();
     expect(readForceAdopt(root, env, () => 1000 + 3 * 3600_000)).toBeNull();
   });
@@ -92,7 +104,7 @@ describe('recordForcedAdoption sinks', () => {
   it.each(sinkCases)('refuses, retracts and consumes the request when the %s sink fails', async (name, envOverride, extra) => {
     writeFileSync(join(dir, 'blocker'), 'x');
     const e = { ...env, ...envOverride() };
-    requestForceAdopt({ root, env: e, daemon: 'review', ruling: 'R508', quote: QUOTE, rulingsText: RULINGS });
+    requestForceAdopt({ root, env: e, daemon: 'review', ruling: 'R508', quote: QUOTE, sha: SHA, rulingsText: RULINGS });
     expect(readForceAdopt(root, e)).not.toBeNull();
     const events = [];
     const r = await recordForcedAdoption({ ...args(), env: e, emit: async (ev) => { events.push(ev); return extra.emit ? extra.emit() : true; } });
@@ -227,6 +239,20 @@ describe('runForceWatchTick', () => {
     expect(readForceWatch(root, env).ticksLeft).toBe(5); // never counted down
     expect(await healthyTick()).toMatchObject({ action: 'rollback', reason: 'health-failed' });
     expect(rollback).toHaveBeenCalledTimes(3);
+    expect(readForceWatch(root, env)).toBeNull();
+  });
+  it('a failed rollback whose marker cannot be written to disk is still owed: a later healthy probe rolls back', async () => {
+    await setup();
+    const rollback = vi.fn().mockResolvedValueOnce({ ok: false }).mockResolvedValue({ ok: true });
+    chmodSync(env.WE_DAEMON_STATE_DIR, 0o500); // every state write now throws
+    try {
+      expect((await runForceWatchTick({ root, env, probe: async () => ({ healthy: false }), rollback, emit: async () => {} })).action).toBe('rollback-failed');
+    } finally { chmodSync(env.WE_DAEMON_STATE_DIR, 0o700); }
+    expect(readForceWatch(root, env).rollbackPending).toBeUndefined(); // the disk marker really was lost
+    expect(readFileSync(env.WE_FORCE_ADOPT_HANDOFF, 'utf8')).toMatch(/force-adopt-rollback-failed[^\n]*kept in memory/);
+    // next tick: the probe is healthy, but the in-process marker still forces the rollback
+    expect(await runForceWatchTick({ root, env, probe: async () => ({ healthy: true }), rollback, emit: async () => {} })).toMatchObject({ action: 'rollback', reason: 'health-failed' });
+    expect(rollback).toHaveBeenCalledTimes(2);
     expect(readForceWatch(root, env)).toBeNull();
   });
   it('an expired watch (forced build never became head) also drops its never-smoked ready candidate', async () => {

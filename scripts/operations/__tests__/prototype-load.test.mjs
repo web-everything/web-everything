@@ -1918,8 +1918,14 @@ describe('prototype-load', () => {
         const { f, state } = forceFixture(t);
         const r = await f.run({ forceAdopt: true, ruling: 'R508', quote: QUOTE });
         expect(r).toMatchObject({ ok: true, forceAdopt: { requested: true, dryRun: false, ruling: 'R508' } });
-        expect(pending(f, state)).toMatchObject([{ ruling: 'R508', quote: QUOTE }]);
+        expect(pending(f, state)).toMatchObject([{ ruling: 'R508', quote: QUOTE, sha: SHA }]); // bound to the build named on the command
         expect(mutations(f, 'add')).toEqual([]);
+      });
+      it('a request that names no build is refused and arms nothing (no-sha)', async (t) => {
+        const { f, state } = forceFixture(t);
+        const r = await f.run({ forceAdopt: true, ruling: 'R508', quote: QUOTE, sha: '' });
+        expect(r).toMatchObject({ ok: false, stopReason: 'force-adopt-refused', forceAdopt: { requested: false, refused: 'no-sha' } });
+        expect(pending(f, state)).toEqual([]);
       });
       it('--dry-run validates but arms nothing (requested:false, dryRun:true, no request file)', async (t) => {
         const { f, state } = forceFixture(t);
