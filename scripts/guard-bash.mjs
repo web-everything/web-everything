@@ -2561,7 +2561,8 @@ export function daemonCloneWriteReason(segment, { cwd = null, roots = [], envDir
   if (!roots.length) return null;
   const s = String(segment || '');
   if (daemonWrapperUncertain(s)) return daemonCloneWriteMessage('unresolved wrapper target');
-  const sub = gitSubcommand(s);
+  // Strict: behind an unknown global flag no subcommand is trusted (no read, no fetch exception).
+  const sub = gitSubcommandStrict(s);
   if (programWord(s) === 'git') {
     const configWrite = (sub === 'config' || sub === 'remote') && gitConfigOrRemoteWrites(s, sub);
     if (daemonGitRead(s, sub)) return null;
@@ -5219,6 +5220,22 @@ const GIT_GLOBAL_FLAGS = new Set(['-p', '--paginate', '-P', '--no-pager', '--bar
  *  resolved `canonicalCommand` view, so `/usr/bin/git`, `env git` and `"git"` all resolve — the same
  *  normalization every deny arm above reads, rather than a second weaker one (the #2788 r3 lesson). */
 function gitSubcommand(segment) {
+  if (programWord(segment) !== 'git') return '';
+  const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
+  // Skip unknown global flags and still find the subcommand (`git --attr-source=HEAD add -A` → `add`), so
+  // every deny arm keyed on the subcommand (git-add enumeration, the collateral notice) keeps firing. An
+  // unknown flag can only HIDE a subcommand here, never invent a safe one.
+  for (let i = 1; i < toks.length; i++) {
+    if (GIT_VALUE_FLAGS.has(toks[i])) { i += 1; continue; }
+    if (toks[i].startsWith('-')) continue;
+    return toks[i];
+  }
+  return '';
+}
+
+/** The subcommand only when the global options before it are all known (`gitSubcommandIndex`), else ''.
+ *  The daemon-clone path uses this: an unknown flag's arity may hide a target, so it never guesses one. */
+function gitSubcommandStrict(segment) {
   if (programWord(segment) !== 'git') return '';
   const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
   return toks[gitSubcommandIndex(toks)] || '';

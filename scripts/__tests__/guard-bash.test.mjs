@@ -4001,6 +4001,31 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     });
   });
 
+  // PR #6262 advisory round 13 (guard-bash.mjs:4521): the shared gitSubcommand() keeps main's behavior of
+  // skipping unknown global flags, so every caller's guard still fires; only the daemon path is strict.
+  describe('every gitSubcommand caller still fires behind an unknown global flag', () => {
+    const FLAGS = ['--attr-source=HEAD', '--list-cmds=main', '--html-path', '--future-option'];
+    it.each(FLAGS)('git-add enumeration (direct, pipe source and pipe sink) behind %s', (flag) => {
+      for (const command of [`git ${flag} add -A`, `git ${flag} add .`, `git ${flag} add --all`,
+        `git ls-files --others | xargs git ${flag} add`, `git ${flag} ls-files --others | xargs git add`]) {
+        expect(decide(command, { cwd: LANE }), command).toMatch(/enumerat/i);
+      }
+    });
+    it.each(FLAGS)('the collateral notice still names a dropped git state change behind %s', (flag) => {
+      const command = `git ${flag} commit -m x && git add -A`;
+      expect(decide(command, { cwd: LANE })).toMatch(/enumerat/i);
+      expect(collateralStepsNotice(command, { cwd: LANE })).toMatch(/runs `git commit` — a repository state change/);
+    });
+    it.each(FLAGS)('the daemon path never trusts a subcommand behind %s', (flag) => {
+      const ctx = { cwd: CLONE, daemonCloneRoots: roots };
+      for (const rest of ['fetch . HEAD:refs/heads/x', 'fetch origin', 'config x.y z', 'log', 'status']) {
+        expect(decide(`git ${flag} ${rest}`, ctx), rest).toMatch(/DAEMON CLONE/);
+      }
+      // With no clone registered the unknown flag changes nothing.
+      expect(decide(`git ${flag} log`, { cwd: LANE })).toBeNull();
+    });
+  });
+
   // PR #6262 operator send-back (judge round 11), one named test per item.
   describe('send-back item 1: unmodelled writers of protected Git names fail closed', () => {
     const ctx = { cwd: LANE, daemonCloneRoots: roots };

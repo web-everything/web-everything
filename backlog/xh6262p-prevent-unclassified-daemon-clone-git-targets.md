@@ -68,6 +68,18 @@ If the reconciled semantics require tracked HOME, carry the same effective value
 - State over time — preserve assignment order, conditional alternatives and function/subshell scope.
 - Who wrote it — candidate command text is data; never execute it to discover targets.
 
+## Risks
+
+Each risk names the test that pins it.
+
+- R1 An unclassified Git command or unknown global flag reads as a safe subcommand → A1 inventory test, `DENIES unknown global Git options without guessing a subcommand`, and `every gitSubcommand caller still fires behind an unknown global flag` (the shared helper must not weaken the git-add enumeration guard or the collateral notice).
+- R2 A wrapper changes git's directory unseen → A2 wrapper matrix.
+- R3 An export or unmodelled writer in a compound, loop or function hides a protected target → A3 and `send-back item 1: unmodelled writers of protected Git names fail closed`.
+- R4 A tilde resolves with a stale or hook HOME → A4 and `send-back item 3: a tilde after a HOME write, or with an unknown HOME, is denied`.
+- R5 A possibly-skipped reassignment erases a protected target → `send-back item 5` (decide and hook JSON).
+- R6 Unbounded scanning on hostile input times the hook out (a timed-out hook lets the command run) → the 4000-segment timing test and `bounds the per-name scan`.
+- R7 Over-denying ordinary lane commands → read controls in every table above.
+
 ## Test and proof plan
 
 Run the focused guard test file through the admitted unit-test command. Demonstrate each new regression on the pre-change implementation before repairing that behavior, except where the current ruling already establishes a non-defect; record that case explicitly. Verify decision-level cases and the real hook JSON boundary using temporary registry fixtures. The final gate must report the affected tests and whether each new regression discriminates with the source change reverted.

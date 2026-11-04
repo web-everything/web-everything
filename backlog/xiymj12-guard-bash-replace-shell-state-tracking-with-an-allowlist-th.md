@@ -43,3 +43,9 @@ The final audit found one origin/main deny that HEAD no longer denies: `git bran
 ## Residual carried from the PR 6262 judge send-back (round 11)
 
 The send-back made unmodelled writers (`read`, `printf -v`, `for NAME in`, `+=`, `let`, `getopts`, `mapfile`, declaration builtins, eval/source) of GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR and GIT_CONFIG* fail closed for the whole scope, so loop back-edges and earlier-defined functions are covered for them. A MODELLED export reached through a back-edge is still read in text order and stays open: `g(){ git reset --hard; }; export GIT_DIR=<clone>/.git; g` and `while :; do git reset --hard; export GIT_DIR=<clone>/.git; done` are allowed. The allowlist redesign should close it (a function call or loop body runs with every value its scope assigns).
+
+## Residuals carried from the PR 6262 advisory (round 13) — both also on main
+
+- A git command classed as a read (`DAEMON_GIT_READS`) returns before any redirect target is checked: a `git status` or `git log` redirected into a file under a daemon clone, run from a lane, writes inside the clone.
+- A read can still run code in the clone: bare `GIT_EXTERNAL_DIFF` with `diff --ext-diff`, bare `GIT_PAGER` / `GIT_CONFIG_*` env, `-c core.fsmonitor=…`, `-c core.pager=…`, `-c diff.external=…`, `--ext-diff`, `--textconv`. Only the env forms behind an `env`/`time`/`command` wrapper are denied today.
+- Prevention asked for: a deterministic matrix test — every `DAEMON_GIT_READS` entry crossed with a redirect into a clone and with each code-running env / `-c` key / option — that must deny at a protected target.
