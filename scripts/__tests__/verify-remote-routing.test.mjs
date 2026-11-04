@@ -2,7 +2,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import { appendVerifyRemoteReport, heartbeatOwnedSlot } from '../readiness/heavy-admission.mjs';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
-import { localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, readRemoteReport, remoteInfrastructureFailure, phaseRunLocation, overallRunLocation, decidePhaseRemote } from '../lib/verify-remote-routing.mjs';
+import { localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, readRemoteReport, remoteInfrastructureFailure, phaseRunLocation, overallRunLocation, decidePhaseRemote, splitExplicitGate, runGateSegments, SHARD_RUN_SCRIPT } from '../lib/verify-remote-routing.mjs';
+import { shellQuote } from '../lib/verify-lane-gate.mjs';
 import { runInNewContext } from 'node:vm';
 import { fstatSync, readSync } from 'node:fs';
 
@@ -926,5 +927,70 @@ describe('R332: scan phases and whole-gate chains route to Forge', () => {
       "npx vitest run a.test.mjs --reporter=default --reporter=json --outputFile.json='/tmp/r/report.json' --testTimeout=15000",
       'npx vitest run --config vitest.soak.config.ts scripts/conveyor/soak/breaks/x.soak.test.mjs',
     ]) expect(phaseAdmissionPlan({ command, decision: remote })).toEqual({ command, takeLocalSlot: true, setHeld: true });
+  });
+});
+
+describe('explicit and compound gates split into per-segment phases (PR-4)', () => {
+  const ours = `node ${shellQuote(SHARD_RUN_SCRIPT)}`;
+  const foreign = 'node /Users/x/workspace/.lanes/web-everything/lane-3/scripts/lib/verify-shard-run.mjs';
+  const scan = `VERIFY_SCAN_FILES='["scripts/a.mjs"]' npx vitest run scripts/b.test.mjs`;
+
+  it('rewrites a foreign-root shard wrapper to this checkout and keeps the env-prefixed scan verbatim', () => {
+    const log = vi.fn();
+    const gate = `${foreign} --shards=3 --parallel=3 -- npx vitest run scripts/a.test.mjs && ${scan}`.replace(/^/, '');
+    expect(splitExplicitGate(gate, { log })).toBeNull(); // missing `node` prefix is an unknown shape
+    const full = `${foreign.replace(/^/, '')} --shards=3 --parallel=3 -- npx vitest run scripts/a.test.mjs && ${scan}`;
+    const segments = splitExplicitGate(full, { log });
+    expect(segments).toEqual([`${ours} --shards=3 --parallel=3 -- npx vitest run scripts/a.test.mjs`, scan]);
+    expect(phaseAdmissionPlan({ command: segments[0], decision: { remote: true } })).toMatchObject({ shardWrapper: true, takeLocalSlot: false });
+    expect(phaseAdmissionPlan({ command: segments[1], decision: { remote: true } }).command)
+      .toBe(`VERIFY_SCAN_FILES='["scripts/a.mjs"]' npm run test:unit -- scripts/b.test.mjs`);
+  });
+
+  it('accepts check:standards and this checkout\'s own wrapper, and never splits inside single quotes', () => {
+    expect(splitExplicitGate(`${ours} --shards=2 -- npx vitest run a.test.mjs && npm run check:standards`)).toEqual([
+      `${ours} --shards=2 -- npx vitest run a.test.mjs`, 'npm run check:standards']);
+    const quoted = `${foreign} --shards=2 -- npx vitest run a.test.mjs && VERIFY_SCAN_FILES='["a && b.mjs"]' npx vitest run c.test.mjs`;
+    expect(splitExplicitGate(quoted)).toHaveLength(2);
+  });
+
+  it.each([
+    ['an unknown segment', `${foreign} --shards=2 -- npx vitest run a.test.mjs && echo hi`, 'unknown-segment'],
+    ['a disallowed env key', `${foreign} --shards=2 -- npx vitest run a.test.mjs && FOO=1 npx vitest run b.test.mjs`, 'unknown-segment'],
+    ['a wrapper that is not verify-shard-run', 'node /tmp/evil/scripts/lib/other.mjs --shards=2 && npm run check:standards', 'unknown-segment'],
+    ['a shell operator in the wrapper args', `${foreign} --shards=2 -- npx vitest run a.test.mjs; rm x && npm run check:standards`, 'unknown-segment'],
+    ['a multi-line gate', `${foreign} --shards=2\n&& npm run check:standards`, 'unknown-segment'],
+  ])('keeps the whole gate local and logs the reason for %s', (_name, gate, reason) => {
+    const log = vi.fn();
+    expect(splitExplicitGate(gate, { log })).toBeNull();
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][0]).toContain(reason);
+  });
+
+  it('leaves a gate with no shard wrapper to the existing chain handling without logging', () => {
+    const log = vi.fn();
+    expect(splitExplicitGate('npx vitest run a.test.mjs && npm run check:standards', { log })).toBeNull();
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it('runs segments with strict && semantics: the first failure or signal stops the rest', async () => {
+    const run = vi.fn(async segment => ({ exitCode: segment === 'b' ? 3 : 0, signal: null }));
+    const result = await runGateSegments(['a', 'b', 'c'], run);
+    expect(run.mock.calls.map(c => c[0])).toEqual(['a', 'b']);
+    expect(result.exitCode).toBe(3);
+    const ok = vi.fn(async () => ({ exitCode: 0, signal: null }));
+    await runGateSegments(['a', 'b', 'c'], ok);
+    expect(ok).toHaveBeenCalledTimes(3);
+    const killed = vi.fn(async () => ({ exitCode: 0, signal: 'SIGKILL' }));
+    await runGateSegments(['a', 'b'], killed);
+    expect(killed).toHaveBeenCalledTimes(1);
+  });
+
+  it('verify-lane admits each segment on its own and leaves the marker suites value alone', () => {
+    const source = readFileSync(resolve(repo, 'scripts/verify-lane.mjs'), 'utf8');
+    expect(source).toMatch(/splitExplicitGate\(/);
+    expect(source).toMatch(/runGateSegments\(\s*explicitSegments/);
+    expect(source).toContain('suites: GATE');
+    expect(source).not.toMatch(/suites: explicitSegments/);
   });
 });
