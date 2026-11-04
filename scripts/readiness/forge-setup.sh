@@ -303,7 +303,7 @@ cat > /etc/systemd/system/forge-exec-egress.service <<EGRESS
 Description=Drop outbound network for Forge slot users (registry allowlist only)
 # Before sshd so no run can start on a rebooted Forge before the table exists. At boot the registry usually
 # does not resolve yet: the table installs CLOSED (no registry) and the timer opens the allowlist after 1 min.
-Before=ssh.service sshd.service
+Before=ssh.socket ssh.service sshd.service
 DefaultDependencies=no
 After=systemd-user-sessions.service local-fs.target
 [Service]
@@ -313,6 +313,16 @@ ExecStart=/usr/local/libexec/forge-egress.sh apply
 [Install]
 WantedBy=multi-user.target
 EGRESS
+# Fail closed: Before= only orders startup. Requires= makes ssh refuse to start when the egress apply failed,
+# so a Forge whose table is missing accepts no slot commands. Ubuntu starts sshd through ssh.socket, which is
+# why the unit above is also ordered Before=ssh.socket. The drop-in is read once at start; the 5-minute timer
+# re-running the oneshot does not stop or restart an sshd that is already up.
+mkdir -p /etc/systemd/system/ssh.service.d
+cat > /etc/systemd/system/ssh.service.d/forge-egress.conf <<'SSHDROPIN'
+[Unit]
+Requires=forge-exec-egress.service
+After=forge-exec-egress.service
+SSHDROPIN
 cat > /etc/systemd/system/forge-exec-egress.timer <<'EGRESST'
 [Unit]
 Description=Refresh the Forge slot egress registry allowlist

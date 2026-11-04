@@ -192,8 +192,21 @@ describe('forge-egress registry grace window (rotating CDN pool)',()=>{
 describe('forge-setup egress service',()=>{
   it('boot ordering: egress service runs before sshd and refreshes after 1 minute',()=>{
     const setup=setupSrc();
-    expect(setup).toContain('Before=ssh.service sshd.service');
+    expect(setup).toContain('Before=ssh.socket ssh.service sshd.service');
     expect(setup).toContain('OnBootSec=1min');
+  });
+  it('fail closed: ssh.service drop-in requires the egress service, written before daemon-reload',()=>{
+    const setup=setupSrc();
+    const m=setup.match(/ssh\.service\.d\/forge-egress\.conf <<'SSHDROPIN'\n([\s\S]*?)\nSSHDROPIN\n/);
+    expect(m,'drop-in heredoc missing').not.toBeNull();
+    const lines=m[1].split('\n');
+    expect(lines).toEqual(['[Unit]','Requires=forge-exec-egress.service','After=forge-exec-egress.service']);
+    // The drop-in exists before the reload that makes systemd read it, and before ssh could be restarted.
+    const dropAt=setup.indexOf('ssh.service.d/forge-egress.conf <<');
+    const reloadAt=setup.indexOf('systemctl daemon-reload',dropAt);
+    expect(reloadAt).toBeGreaterThan(dropAt);
+    expect(reloadAt).toBeLessThan(setup.indexOf('systemctl start forge-exec-egress.service'));
+    expect(setup.indexOf('mkdir -p /etc/systemd/system/ssh.service.d')).toBeLessThan(dropAt);
   });
   it('setup installs and activates the egress service with five-minute refresh',()=>{
     const setup=setupSrc();
