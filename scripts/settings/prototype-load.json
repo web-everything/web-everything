@@ -18,6 +18,10 @@
     "lease-reaper": {
       "label": "com.we.lease-reaper"
     },
+    "pass-readers": {
+      "label": "com.we.conveyor-pass-daemon.ci-red-recovery-watch-we",
+      "note": "The label is the ci-red-recovery-watch-we pass daemon launchd job. No explicit clone: prototype-load resolves the clone from that installed plist WorkingDirectory, so overlays register on the clone the watcher actually runs from (the shipped template installs wev-review-daemon; the live install runs wev-pass-readers), and self-sync adopts the new code."
+    },
     "control": {
       "label": "com.we.control",
       "clone": "wev-control"
@@ -158,6 +162,14 @@
       "ruling": "R545",
       "findings": [
         "scripts/lib/drain-red-team-evidence.mjs:76 — Retains the pre-existing reliance on mtime to select finished reviews; start times only protect unfinished reviews. An older acceptance updated after a newer rejection wins. A read-only probe confirmed recovery schedules a fresh pass using that stale acceptance, ignoring the newer rejection."
+      ]
+    },
+    {
+      "ref": "lane/drain-rest-reader-r557",
+      "sha": "cc8ac117222de6f7146f7a059f55df0fe00aa587",
+      "ruling": "R563",
+      "findings": [
+        "scripts/lib/drain-poison-guard.mjs:130 — The new API path relies on a pre-existing raw-text grep that misses YAML-escaped identities. Main’s `bornAs: \"xabc12\\u0033\"` and an added card’s `bornAs: xabc123` decode identically, but a read-only probe returned `{ok:true}`, allowing the duplicate through admission."
       ]
     }
   ]

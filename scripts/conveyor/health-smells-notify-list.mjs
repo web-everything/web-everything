@@ -72,4 +72,6 @@ export const NOTIFY_EVEN_IN_SHADOW = new Set([
   'operator-hold-aged',
   // R179 (2026-10-28): all four daemons sat days behind main unflagged; a stale daemon build must reach the operator.
   'daemon-build-stale',
+  // R502 (2026-11-03): a claim held by a silent holder on an unmoved head must reach the operator (detection only).
+  'stale-claim-or-binding',
 ]);
