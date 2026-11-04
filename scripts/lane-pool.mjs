@@ -2840,7 +2840,7 @@ const releaseEvidenceGit = (args, dir, opts = {}, extraEnv = {}) => tryGit(args,
 // Stat-trust config (core.checkStat / core.trustctime / core.ignoreStat) is pinned to git's defaults by the shared lane
 // git env (scripts/lib/lane-git-hardening.mjs), for this read and every earlier refreshing status in the release flow.
 // A hand-forged index stat cache is not covered: a full content rehash costs minutes on a large lane (residual,
-// tracked in we:backlog/xuuhfpf-release-guard-detect-tracked-edits-hidden-by-a-hand-forged-i.md).
+// tracked as #xuuhfpf).
 const HIDDEN_ENTRY_HASH_LIMIT = 1000;
 function releaseTrackedChanges(dir) {
   // Lane-owned config that makes status under-report (core.fileMode=false, autocrlf, sparse, …) or points it at another
