@@ -1707,6 +1707,7 @@
   "scripts/conveyor/soak/breaks/fix-daemon-lock-wait.soak.test.mjs": 30.42,
   "scripts/conveyor/soak/breaks/fixer-holds-turn-on-verify-wait.soak.test.mjs": 0.86,
   "scripts/conveyor/soak/breaks/fixer-wait-loop-undetected.soak.test.mjs": 0.46,
+  "scripts/conveyor/soak/breaks/fixing-tag-unverified-launch.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/gh-shim-mid-rebuild.soak.test.mjs": 30.85,
   "scripts/conveyor/soak/breaks/green-lane-pr-without-review-label-in-limbo.soak.test.mjs": 1.48,
   "scripts/conveyor/soak/breaks/hung-ci-cancel-run-not-found-loops.soak.test.mjs": 1.29,
