@@ -420,13 +420,31 @@ function canonicalScopePrefix(value) {
   return Object.hasOwn(SCOPE_PREFIX_ALIASES, key) ? SCOPE_PREFIX_ALIASES[key] : key;
 }
 
-function refuseMultiPathGlobs(parts) {
-  // A file plus a test glob (`a.mjs __tests__/a*.test.mjs`) is the normal card shape (#4701) and is accepted, in one
-  // entry or as separate entries. Only ONE authored entry holding two or more globs is refused: the lease matcher
-  // cannot judge glob-vs-glob overlap, and flattening would hide that behind a clean-looking list.
+function refuseMultiPathGlobs(parts, dispatchRepo = 'we') {
+  // A file plus test globs (`a.mjs __tests__/a*.test.mjs`) is the normal card shape (#4701) and is accepted, in one
+  // entry or as separate entries, and so are several globs whose fixed leading paths cannot meet
+  // (`explore-io*` and `dispatch-lane-io*`). Only globs inside ONE authored entry that COULD overlap are refused:
+  // the lease matcher cannot judge glob-vs-glob overlap, and flattening would hide that behind a clean list.
   // Cross-entry glob-vs-glob overlap is pre-existing (R412), carded; the lease matcher does not judge it.
-  if (parts.filter((piece) => /[*?]/.test(piece)).length > 1) {
-    throw new Error('dispatch-lane: unsafe scope entry — more than one glob in a multi-path scope entry is refused for {{SCOPE}}; use explicit paths, one glob per entry, or a directory scope.');
+  let inherited = '';
+  const globs = [];
+  for (const piece of parts) {
+    const own = /^[A-Za-z][\w-]*:/.exec(piece)?.[0] ?? '';
+    if (own) inherited = own;
+    if (!/[*?]/.test(piece)) continue;
+    const path = own ? piece.slice(own.length) : piece;
+    const repo = canonicalScopePrefix(inherited ? inherited.slice(0, -1) : dispatchRepo);
+    globs.push({ repo, fixed: path.slice(0, path.search(/[*?]/)) });
+  }
+  // Two globs are provably disjoint only when they sit in different repos or their fixed leading text diverges;
+  // otherwise one fixed prefix starts the other and they may match the same file.
+  const mayMeet = (a, b) => a.repo === b.repo && (a.fixed.startsWith(b.fixed) || b.fixed.startsWith(a.fixed));
+  for (let i = 0; i < globs.length; i += 1) {
+    for (let j = i + 1; j < globs.length; j += 1) {
+      if (mayMeet(globs[i], globs[j])) {
+        throw new Error('dispatch-lane: unsafe scope entry — two globs in one multi-path scope entry could overlap for {{SCOPE}}; use explicit paths, globs with disjoint leading paths, or a directory scope.');
+      }
+    }
   }
 }
 
@@ -444,7 +462,7 @@ export function normalizeBriefScope(raw, dispatchRepo = 'we') {
     // is `we:a.mjs,we:b.mjs` and the lease overlap check sees both paths in the repo they belong to.
     let inherited = '';
     const parts = String(entry ?? '').split(/[\s,]+/).filter(Boolean);
-    refuseMultiPathGlobs(parts);
+    refuseMultiPathGlobs(parts, dispatchRepo);
     for (const raw0 of parts) {
       const own = /^[A-Za-z][\w-]*:/.exec(raw0)?.[0] ?? '';
       if (own) inherited = own;

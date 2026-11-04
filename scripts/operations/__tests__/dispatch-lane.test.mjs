@@ -507,6 +507,47 @@ describe('the lane comes from the tick core or nowhere', () => {
     },
   );
 
+  it.each([' ', ',', '\n'])(
+    'send-back item 3 — accepts disjoint globs in one entry separated by %j (real shapes of backlog #4557 and #4124)', (separator) => {
+      const shapes = [
+        ['we:scripts/operations/__tests__/explore-io*.test.mjs', 'we:scripts/operations/__tests__/dispatch-lane-io*.test.mjs'],
+        ['we:scripts/__tests__/merge-ai-prs*.test.mjs', 'we:scripts/__tests__/lane-drain*.test.mjs', 'we:scripts/__tests__/drain-followup-job-entry.test.mjs'],
+        ['we:scripts/conveyor/__tests__/credential-inventory*.test.mjs', 'we:scripts/conveyor/health-smells/__tests__/credential-inventory-stale*.test.mjs'],
+      ];
+      for (const want of shapes) {
+        for (const launchKind of ['build', 'fix', 'ci-heal']) {
+          const read = tickRead({
+            launchKind,
+            launch: { num: '3037', lane: 8, pr: 6244, reason: 'red-ci' },
+            laneRef: 'lane/dispatch-scope-multi',
+            briefTemplate: 'scope: {{SCOPE}}',
+            repoTokens: briefTokensForRepo('we', { itemNum: '3037' }),
+          });
+          const shaped = shapeDispatchRead({ ...read, item: { ...read.item, scope: [want.join(separator)] } }, { num: '3037' });
+          expect(shaped.dispatching).toBe(true);
+          expect(shaped.scope).toEqual(want);
+        }
+      }
+    },
+  );
+
+  it('send-back item 3 — still refuses globs in one entry whose leading paths can meet, across prefix spellings', () => {
+    for (const scope of [
+      ['we:scripts/a*.mjs we:scripts/ab*.mjs'],
+      ['we:scripts/__tests__/x*.test.mjs WE:scripts/__tests__/x*.test.mjs'],
+      ['scripts/a*.mjs we:scripts/a*.mjs'],
+      ['we:scripts/*/a.mjs we:scripts/x/*.mjs'],
+    ]) {
+      const read = tickRead();
+      expect(() => shapeDispatchRead({ ...read, item: { ...read.item, scope } }, { num: '3037' }), scope[0])
+        .toThrow(/unsafe scope.*glob/);
+    }
+    // different repos can never meet
+    const read = tickRead();
+    const shaped = shapeDispatchRead({ ...read, item: { ...read.item, scope: ['we:src/a*.mjs fui:src/a*.mjs'] } }, { num: '3037' });
+    expect(shaped.scope).toEqual(['we:src/a*.mjs', 'fui:src/a*.mjs']);
+  });
+
   it('accepts the requested legacy aliases in separate entries', () => {
     const read = tickRead();
     read.item.scope = ['plateau-app:a.mjs', 'frontierui:b.mjs', 'FUI:c.mjs', 'WE:d.mjs'];
