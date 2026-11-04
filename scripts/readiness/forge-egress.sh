@@ -10,7 +10,12 @@
 # Residual (accepted, see the PR): the allowlist matches destination IP + tcp/443 only. The registry shares CDN addresses
 # with other sites, so a slot process can reach any host served from those addresses (SNI is not inspected). Real
 # containment needs a non-slot installer user or an SNI-aware proxy.
-# Rollback: nft delete table inet forge_exec_egress; systemctl disable --now forge-exec-egress.timer
+# Rollback (in this order; forge-setup.sh gives ssh.service a drop-in with Requires=forge-exec-egress.service, so remove
+# it and reload FIRST, otherwise stopping the egress service can stop sshd):
+#   rm -f /etc/systemd/system/ssh.service.d/forge-egress.conf;
+#   systemctl daemon-reload;
+#   nft delete table inet forge_exec_egress;
+#   systemctl disable --now forge-exec-egress.timer forge-exec-egress.service
 set -euo pipefail
 
 SLOTS=${FORGE_EXEC_SLOTS:-8}
@@ -43,17 +48,39 @@ KEEP=${FORGE_EGRESS_KEEP_SNAPSHOTS:-3}
 [[ "$KEEP" =~ ^[1-9][0-9]*$ ]] || KEEP=3
 # Only well-formed addresses of the right family ever reach the nft ruleset (history is read back from disk, so it is not
 # trusted text; a hex-only word like `dead` must not be left for nft to resolve as a hostname). $1 = 4|6.
+OCT='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'   # 0-255, no leading zeros (never read as octal)
+HEX='[0-9A-Fa-f]{1,4}'
+RE_V4="^$OCT(\.$OCT){3}\$"
+RE_V6_FULL="^$HEX(:$HEX){7}\$"
+RE_V6_COMPRESSED="^($HEX(:$HEX){0,6})?::($HEX(:$HEX){0,6})?\$"
+valid_v4() { [[ "$1" =~ $RE_V4 ]]; }
+valid_v6() { # at least two colons, hex groups of 1-4 digits, at most one `::`, optional dotted-v4 tail
+  local a=$1 tail colons
+  [[ "$a" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
+  tail=${a##*:}
+  if [[ "$tail" == *.* ]]; then valid_v4 "$tail" || return 1; a="${a%"$tail"}0:0"; fi   # v4 tail = two groups
+  colons=${a//[!:]/}
+  (( ${#colons} >= 2 )) || return 1
+  if [[ "$a" == *::* ]]; then
+    (( ${#colons} <= 8 )) || return 1   # `::` stands for at least one zero group: at most 7 written groups
+    [[ "$a" =~ $RE_V6_COMPRESSED ]]
+  else
+    [[ "$a" =~ $RE_V6_FULL ]]
+  fi
+}
 addr_only() {
-  local re='^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
-  [[ "$1" == 6 ]] && re='^[0-9A-Fa-f]*:[0-9A-Fa-f:.]*$'
-  { tr ' ' '\n' | grep -E "$re" | sort -u; } || true
+  local a
+  { tr ' ' '\n' | { while IFS= read -r a || [[ -n "$a" ]]; do
+      if [[ "$1" == 6 ]]; then valid_v6 "$a" && printf '%s\n' "$a"; else valid_v4 "$a" && printf '%s\n' "$a"; fi
+    done; } | sort -u; } || true
 }
 snapshot() { # fix ONE lookup per apply: the table that is installed is the table that gets recorded
   CUR4=$(resolve_registry 4 | addr_only 4); CUR6=$(resolve_registry 6 | addr_only 6); SNAPSHOT_TAKEN=1
 }
 registry_ips() { # $1 = 4|6 — current lookup plus the retained snapshots
   local cur="CUR$1" hist=''
-  [[ -r "$STATE_DIR/registry$1" ]] && hist=$(addr_only "$1" < "$STATE_DIR/registry$1")
+  # History we cannot maintain (state dir not writable) is not trusted: a failed write must only ever narrow the allowlist.
+  [[ -r "$STATE_DIR/registry$1" && -w "$STATE_DIR" ]] && hist=$(addr_only "$1" < "$STATE_DIR/registry$1")
   printf '%s\n%s\n' "${!cur}" "$hist" | addr_only "$1"
 }
 record_snapshot() { # $1 = 4|6 — append the current non-empty lookup, keep the last KEEP lines (atomic rename)
@@ -103,7 +130,13 @@ case "${1:-}" in
     # Always install the freshly rendered table. A DNS blip yields an EMPTY allowlist (closed) unless a recent
     # snapshot (grace window, see above) still holds addresses; never the stale LIVE table itself: availability of cold installs yields to the no-egress guarantee (they fall back to local).
     nft -f - <<<"$rules"
-    # Remember what resolved only after the table loaded. A state-write failure only narrows the next allowlist (closed side).
-    record_snapshot 4 && record_snapshot 6 || echo 'forge-egress: could not record the registry snapshot (grace window not extended)' >&2 ;;
+    # Remember what resolved only after the table loaded. The v4 and v6 records are independent. If one fails, its old
+    # state file is removed so the next allowlist holds only the then-current lookup (it can only narrow: closed side).
+    for fam in 4 6; do
+      record_snapshot "$fam" || {
+        rm -f -- "$STATE_DIR/registry$fam" 2>/dev/null || true
+        echo "forge-egress: could not record the registry$fam snapshot (history cleared, grace window not extended)" >&2
+      }
+    done ;;
   *) echo 'usage: forge-egress.sh render|apply' >&2; exit 2 ;;
 esac

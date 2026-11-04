@@ -20,7 +20,12 @@
 # - R497 egress: slot users forge-exec-1..N get no outbound network except loopback and
 #   TCP 443 to registry.npmjs.org (cold npm ci runs as the slot user). Rules come from
 #   /usr/local/libexec/forge-egress.sh (nft table inet forge_exec_egress), refreshed every
-#   5 min by forge-exec-egress.timer. Rollback: nft delete table inet forge_exec_egress &&
+#   5 min by forge-exec-egress.timer. ssh.service gets a drop-in (ssh.service.d/forge-egress.conf) that
+#   Requires= the egress service, so sshd refuses to start when the table could not be applied. Rollback, in
+#   this order (drop-in first: with it in place, stopping the egress service can stop sshd):
+#   rm -f /etc/systemd/system/ssh.service.d/forge-egress.conf;
+#   systemctl daemon-reload;
+#   nft delete table inet forge_exec_egress;
 #   systemctl disable --now forge-exec-egress.timer forge-exec-egress.service;
 # - installs python3, rsync and nftables if missing. Never prunes active slot locks.
 set -euo pipefail
@@ -316,7 +321,8 @@ EGRESS
 # Fail closed: Before= only orders startup. Requires= makes ssh refuse to start when the egress apply failed,
 # so a Forge whose table is missing accepts no slot commands. Ubuntu starts sshd through ssh.socket, which is
 # why the unit above is also ordered Before=ssh.socket. The drop-in is read once at start; the 5-minute timer
-# re-running the oneshot does not stop or restart an sshd that is already up.
+# re-running the oneshot does not stop or restart an sshd that is already up. Rollback (see the header) removes this
+# drop-in and reloads BEFORE stopping the egress service; otherwise Requires= would stop sshd with it.
 mkdir -p /etc/systemd/system/ssh.service.d
 cat > /etc/systemd/system/ssh.service.d/forge-egress.conf <<'SSHDROPIN'
 [Unit]

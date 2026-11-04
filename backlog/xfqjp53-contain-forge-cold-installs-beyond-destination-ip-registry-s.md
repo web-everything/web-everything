@@ -15,8 +15,8 @@ Follow-up from PR 6345 review (security residual). The slot egress allowlist mat
 
 ## Acceptance
 
-- [A1] **Executable** — `npx vitest run we:scripts/readiness/__tests__/forge-egress.test.mjs` passes with a test showing a slot-user connection to a non-registry host served from a registry IP is refused; it fails while the allowlist is destination-IP only.
-- [A2] **Executable** — a test shows the slot user can reach only loopback services the design names, since `oifname "lo" accept` currently lets slot users reach every local listening service (an undocumented trust boundary).
+- [A1] **Executable** — `npx vitest run we:scripts/readiness/__tests__/forge-egress.test.mjs` passes with a test showing a slot-user connection to a non-registry host served from a registry IP is refused; it fails while the allowlist is destination-IP only. Planned test: `we:scripts/readiness/__tests__/forge-egress.test.mjs`, case `containment: a slot-user connection to a non-registry host on a registry IP is refused`.
+- [A2] **Executable** — a test shows the slot user can reach only loopback services the design names, since `oifname "lo" accept` currently lets slot users reach every local listening service (an undocumented trust boundary). Planned test: `we:scripts/readiness/__tests__/forge-egress.test.mjs`, case `containment: slot users reach only the named loopback services`.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

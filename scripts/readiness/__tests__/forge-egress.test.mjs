@@ -2,7 +2,7 @@
 // R497 step 3: the generated nftables rule set drops slot-user egress except loopback and the npm registry.
 import {describe,it,expect} from 'vitest';
 import {spawnSync} from 'node:child_process';
-import {readFileSync,mkdtempSync,writeFileSync,rmSync,existsSync,mkdirSync} from 'node:fs';
+import {readFileSync,mkdtempSync,writeFileSync,rmSync,existsSync,mkdirSync,chmodSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {dirname,join} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -231,4 +231,98 @@ describe('forge-setup egress service',()=>{
     expect(setup).toContain('systemctl enable --now forge-exec-egress.timer');
     expect(setup).toContain('nft delete table inet forge_exec_egress');
   });
+  // The documented rollback (header comment of BOTH scripts) must undo the ssh.service drop-in FIRST: the drop-in has
+  // Requires=forge-exec-egress.service, so stopping the egress service with it still in place can stop sshd.
+  const rollbackOf=(src)=>{
+    // Header = everything before `set -euo pipefail`; join wrapped comment lines so a command may span a line break.
+    const text=src.slice(0,src.indexOf('\nset -euo pipefail')).replace(/\n#[ \t]*/g,' ');
+    const at=text.indexOf('Rollback');
+    expect(at,'no Rollback in the header').toBeGreaterThan(-1);
+    return text.slice(at);
+  };
+  const ROLLBACK_STEPS=[
+    'rm -f /etc/systemd/system/ssh.service.d/forge-egress.conf',
+    'systemctl daemon-reload',
+    'nft delete table inet forge_exec_egress',
+    'systemctl disable --now forge-exec-egress.timer forge-exec-egress.service',
+  ];
+  for(const [name,read] of [['forge-setup.sh',setupSrc],['forge-egress.sh',()=>readFileSync(script,'utf8')]]){
+    it(`${name} documents a rollback that removes the ssh drop-in and reloads BEFORE stopping the egress service`,()=>{
+      const rb=rollbackOf(read());
+      const idx=ROLLBACK_STEPS.map(s=>{const i=rb.indexOf(s);expect(i,`${name} rollback is missing: ${s}`).toBeGreaterThan(-1);return i;});
+      expect(idx).toEqual([...idx].sort((a,b)=>a-b));
+    });
+  }
+});
+
+describe('forge-egress address validation (only well-formed addresses reach nft)',()=>{
+  const V4_JUNK='999.1.1.1 1.2.3 256.0.0.1 01.2.3.4 1.2.3.4.5 1.2.3.-4 dead';
+  const V6_JUNK=': ::::g :::: dead 1:2 :1 1: ::: 1::2::3 12345::1 1:2:3:4:5:6:7:8:9 1:2:3:4:5:6:7::8:9 ::ffff:999.1.1.1 fe80::1%eth0 ::g';
+  it('v4: every octet must be 0-255; malformed values never appear in the ruleset',()=>{
+    const r=render({FORGE_EGRESS_UIDS:'990',FORGE_EGRESS_REGISTRY_V4:`${V4_JUNK} 8.8.8.8 255.255.255.255 0.0.0.0`,FORGE_EGRESS_REGISTRY_V6:''});
+    expect(r.status).toBe(0);
+    expect(elements(r.stdout,'registry4')).toEqual(['0.0.0.0','255.255.255.255','8.8.8.8']);
+    for(const bad of V4_JUNK.split(' ')) expect(r.stdout.split(/[\s,{}]+/)).not.toContain(bad);
+  });
+  it('v6: needs at least two colons and well-formed groups; junk like ":" or "dead" never appears',()=>{
+    const good='2606:4700::6810:2323 ::1 1:2:3:4:5:6:7:8 ::ffff:1.2.3.4 1:2:3:4:5:6:7::';
+    const r=render({FORGE_EGRESS_UIDS:'990',FORGE_EGRESS_REGISTRY_V4:'',FORGE_EGRESS_REGISTRY_V6:`${V6_JUNK} ${good}`});
+    expect(r.status).toBe(0);
+    expect(elements(r.stdout,'registry6')).toEqual(good.split(' ').sort());
+    const tokens=r.stdout.split(/[\s,{}]+/);
+    for(const bad of V6_JUNK.split(' ')) expect(tokens,`junk reached ruleset: ${bad}`).not.toContain(bad);
+  });
+  it('the same validation applies to retained history read back from disk',()=>sandbox(dir=>{
+    fake(dir,'nft',NFT_CAPTURE);
+    const state=join(dir,'state');mkdirSync(state);
+    writeFileSync(join(state,'registry4'),'999.1.1.1 1.2.3 7.7.7.7\n');
+    writeFileSync(join(state,'registry6'),': ::::g 2606:4700::1\n');
+    const r=apply(dir,{FORGE_EGRESS_UIDS:'990',FORGE_EGRESS_STATE_DIR:state,FORGE_EGRESS_REGISTRY_V4:'',FORGE_EGRESS_REGISTRY_V6:''});
+    expect(r.status).toBe(0);
+    const got=captured(dir);
+    expect(elements(got,'registry4')).toEqual(['7.7.7.7']);
+    expect(elements(got,'registry6')).toEqual(['2606:4700::1']);
+  }));
+});
+
+describe('forge-egress snapshot-write failure only narrows the next allowlist (fail closed)',()=>{
+  const REAL_MV=spawnSync('sh',['-c','command -v mv'],{encoding:'utf8'}).stdout.trim();
+  const slot={FORGE_EGRESS_UIDS:'990'};
+  const seed=(state)=>{mkdirSync(state,{recursive:true});writeFileSync(join(state,'registry4'),'9.9.9.9\n');writeFileSync(join(state,'registry6'),'2606:4700::9\n');};
+  const runApply=(dir,state,v4,v6)=>apply(dir,{...slot,FORGE_EGRESS_STATE_DIR:state,FORGE_EGRESS_REGISTRY_V4:v4,FORGE_EGRESS_REGISTRY_V6:v6});
+  it('a failed write removes the old state file, so the next allowlist holds only current lookup addresses',()=>sandbox(dir=>{
+    fake(dir,'nft',NFT_CAPTURE);
+    fake(dir,'mv','exit 1'); // the atomic rename fails (disk full / read-only): the old file would otherwise stay
+    const state=join(dir,'state');seed(state);
+    const r=runApply(dir,state,'1.1.1.1','2606:4700::1');
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('could not record the registry4 snapshot');
+    expect(existsSync(join(state,'registry4'))).toBe(false);
+    expect(existsSync(join(state,'registry6'))).toBe(false);
+    rmSync(join(dir,'mv'));
+    runApply(dir,state,'2.2.2.2','2606:4700::2');
+    const got=captured(dir);
+    expect(elements(got,'registry4')).toEqual(['2.2.2.2']);
+    expect(elements(got,'registry6')).toEqual(['2606:4700::2']);
+  }));
+  it('the v4 and v6 records are independent: a v4 failure still records v6 (and clears only the v4 history)',()=>sandbox(dir=>{
+    fake(dir,'nft',NFT_CAPTURE);
+    fake(dir,'mv',`case "$*" in *registry4) exit 1;; esac\nexec "${REAL_MV}" "$@"`);
+    const state=join(dir,'state');seed(state);
+    const r=runApply(dir,state,'1.1.1.1','2606:4700::1');
+    expect(r.status).toBe(0);
+    expect(existsSync(join(state,'registry4'))).toBe(false);
+    expect(readFileSync(join(state,'registry6'),'utf8').trim().split('\n').pop()).toBe('2606:4700::1');
+  }));
+  it('an unwritable state dir never extends history: the next render holds only current lookup addresses',()=>sandbox(dir=>{
+    if(typeof process.getuid==='function'&&process.getuid()===0) return; // root bypasses mode bits
+    fake(dir,'nft',NFT_CAPTURE);
+    const state=join(dir,'state');seed(state);chmodSync(state,0o500);
+    try {
+      const r=runApply(dir,state,'2.2.2.2','');
+      expect(r.status).toBe(0);
+      expect(elements(captured(dir),'registry4')).toEqual(['2.2.2.2']);
+      expect(readFileSync(join(state,'registry4'),'utf8').trim()).toBe('9.9.9.9'); // could not be removed: ignored, not trusted
+    } finally { chmodSync(state,0o700); }
+  }));
 });

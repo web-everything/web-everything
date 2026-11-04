@@ -15,8 +15,8 @@ Follow-up from PR 6345 review (fail-closed egress readiness). forge-exec-egress.
 
 ## Acceptance
 
-- [A1] **Executable** — `npx vitest run we:scripts/readiness/__tests__/forge-exec-run.test.mjs` passes with a test that mocks `nft list table inet forge_exec_egress` as failing or missing and asserts the launcher refuses the slot and falls back to local with the reason `egress-table-absent`; it fails before the gate exists.
-- [A2] **Executable** — a second test deletes the table after a successful boot check (the `nft flush ruleset` case) and asserts the NEXT slot command is refused, so the gate runs per command, not once at launcher start.
+- [A1] **Executable** — `npx vitest run we:scripts/readiness/__tests__/forge-exec-run.test.mjs` passes with a test that mocks `nft list table inet forge_exec_egress` as failing or missing and asserts the launcher refuses the slot and falls back to local with the reason `egress-table-absent`; it fails before the gate exists. Planned test: `we:scripts/readiness/__tests__/forge-exec-run.test.mjs`, case `egress readiness: refuses the slot and falls back to local when the egress table is absent`.
+- [A2] **Executable** — a second test deletes the table after a successful boot check (the `nft flush ruleset` case) and asserts the NEXT slot command is refused, so the gate runs per command, not once at launcher start. Planned test: `we:scripts/readiness/__tests__/forge-exec-run.test.mjs`, case `egress readiness: rechecks per command (the table deleted after a passing check refuses the next command)`.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
