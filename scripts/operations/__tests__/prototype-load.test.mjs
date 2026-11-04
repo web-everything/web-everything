@@ -2003,6 +2003,34 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
   it('a WEAKENED audit on the carried head blocks', () => {
     expect(prototypeLoad.canonicalAuditEvidence([old({ verdict: 'WEAKENED' })], SHA, () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
   });
+  // The carry veto must judge a carried head's WEAKENED verdicts exactly as findAudit does (round 3): a record findAudit
+  // rejects, or supersedes, or never consults must not block a carry; a record it accepts still must (fail closed).
+  describe('carry veto follows findAudit', () => {
+    const OTHER_BASE = 'f'.repeat(40);
+    const carried = (...extra) => prototypeLoad.canonicalAuditEvidence([old(), ...extra], SHA, () => true, FP);
+    it.each([
+      ['a contradictory-findings WEAKENED record', { verdict: 'WEAKENED', findings: ['NOT WEAKENED'] }],
+      ['a contradictory-findings WEAKENED record (zero-width and line-break shapes)', { verdict: 'WEAKENED', findings: ['note\n​NOT WEAKENED'] }],
+      ['a WEAKENED record with an unparseable timestamp', { verdict: 'WEAKENED', at: 'not-a-date' }],
+      ['a WEAKENED record with a malformed base', { verdict: 'WEAKENED', base: 'zz' }],
+      ['a WEAKENED empty-diff record (base equals head)', { verdict: 'WEAKENED', base: OLD }],
+    ])('%s on the carried head does not block the carry', (_, overrides) => {
+      expect(carried(old({ fingerprint: undefined, base: OTHER_BASE, at: '2026-10-22T12:00:00Z', ...overrides })).ok).toBe(true);
+    });
+    it('a WEAKENED verdict superseded by a later NOT WEAKENED on the same base does not block (latest wins)', () => {
+      const weak = old({ fingerprint: undefined, base: OTHER_BASE, verdict: 'WEAKENED', at: '2026-10-21T12:00:00Z' });
+      const fixed = old({ fingerprint: undefined, base: OTHER_BASE, at: '2026-10-22T12:00:00Z' });
+      expect(carried(weak, fixed).ok).toBe(true);
+    });
+    it('a valid WEAKENED verdict that is the latest for its base still blocks, even next to a contradictory pass', () => {
+      const weak = old({ fingerprint: undefined, base: OTHER_BASE, verdict: 'WEAKENED', at: '2026-10-22T12:00:00Z' });
+      const earlierPass = old({ fingerprint: undefined, base: OTHER_BASE, at: '2026-10-21T12:00:00Z' });
+      const contradictoryLaterPass = old({ fingerprint: undefined, base: OTHER_BASE, at: '2026-10-23T12:00:00Z', findings: ['WEAKENED'] });
+      expect(carried(earlierPass, weak)).toEqual({ ok: false, reason: 'weakened' });
+      // a later pass findAudit rejects does not supersede the valid WEAKENED verdict
+      expect(carried(earlierPass, weak, contradictoryLaterPass)).toEqual({ ok: false, reason: 'weakened' });
+    });
+  });
   it('a carried record never lends its head other records without the fingerprint', () => {
     const other = old({ fingerprint: undefined, base: 'f'.repeat(40), at: '2026-10-21T12:00:00Z' });
     const weak = old({ fingerprint: undefined, base: '9'.repeat(40), verdict: 'WEAKENED', at: '2026-10-22T12:00:00Z' });

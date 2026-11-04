@@ -44,9 +44,14 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   // can never lend its head's other (unfingerprinted or foreign) records.
   const eligible = records.filter((r) => r?.head === sha || (r?.head && validSha(r.head) && carriesAcross(r.fingerprint, liveFp)));
   const heads = new Set(eligible.map((r) => r.head));
-  // Fail closed the other way too: a valid WEAKENED verdict anywhere on a carried head blocks, fingerprint or not.
-  for (const r of records) if (r?.head && r.head !== sha && heads.has(r.head) && r.verdict === 'WEAKENED'
-    && r.questionHash === QUESTION_HASH && Number.isFinite(Date.parse(r.at))) return { ok: false, reason: 'weakened' };
+  // Fail closed the other way too: the latest VALID WEAKENED verdict for any base of a carried head blocks, fingerprint or not.
+  // "Valid" is findAudit's own judgment (latest wins per base, contradictory-findings and malformed records rejected,
+  // empty-diff base===head never consulted), so the veto can never honor a record the audit reader itself refuses.
+  const vetoBases = new Map();
+  for (const r of records) if (r?.head && r.head !== sha && heads.has(r.head) && r.base !== r.head) vetoBases.set(`${r.head}/${r.base}`, r);
+  for (const { head, base } of vetoBases.values()) {
+    if (findAudit(records, { head, base, questionHash: QUESTION_HASH })?.verdict === 'WEAKENED') return { ok: false, reason: 'weakened' };
+  }
   let pass = null;
   for (const head of heads) {
     const bases = new Set(eligible.filter((r) => r.head === head && r.base !== head).map((r) => r.base));
