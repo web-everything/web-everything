@@ -2101,6 +2101,15 @@ describe('carried evidence precedence (R503 red team)', () => {
       expect(prototypeLoad.canonicalAuditEvidence([audit({ at: carried }), auditRecord({ verdict: 'WEAKENED', at: own })], SHA, () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
     }
   });
+  it('a newer own audit of an uncovered base does not supersede a carried WEAKENED (self-review)', () => {
+    const records = [auditRecord({ at: at(1) }), audit({ verdict: 'WEAKENED', at: at(2) }), auditRecord({ base: C, at: at(3) })];
+    expect(prototypeLoad.canonicalAuditEvidence(records, SHA, (base) => base !== C, FP)).toEqual({ ok: false, reason: 'weakened' });
+    // ...while a newer own audit of a covered base does
+    expect(prototypeLoad.canonicalAuditEvidence(records, SHA, () => true, FP)).toMatchObject({ ok: true });
+  });
+  it('an upper-case live sha still finds its own WEAKENED audit before any carried pass', () => {
+    expect(prototypeLoad.canonicalAuditEvidence([audit({ at: at(3) }), auditRecord({ verdict: 'WEAKENED', at: at(1) })], SHA.toUpperCase(), () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
+  });
   it('the live head\'s own verdict outranks a carried pass: an uncovered own base does not fall back to the carry', () => {
     const own = auditRecord({ base: C, at: at(1) });
     expect(prototypeLoad.canonicalAuditEvidence([audit({ at: at(2) }), own], SHA, (base) => base !== C, FP)).toEqual({ ok: false, reason: 'no-record' });
@@ -2112,6 +2121,10 @@ describe('carried evidence precedence (R503 red team)', () => {
   it('round 2: a live-head WEAKENED record blocks an older carried green record in either order', () => {
     expect(prototypeLoad.readyEvidence([ready(), liveWeak], input, [], FP)).toBeNull();
     expect(prototypeLoad.readyEvidence([liveWeak, ready()], input, [], FP)).toBeNull();
+  });
+  it('an upper-case live sha (or record sha) still finds the live head\'s own WEAKENED record', () => {
+    expect(prototypeLoad.readyEvidence([ready(), liveWeak], { ...input, sha: SHA.toUpperCase() }, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([ready(), { ...liveWeak, sha: SHA.toUpperCase() }], input, [], FP)).toBeNull();
   });
   it('a live-head non-green record also blocks the carried green record', () => {
     expect(prototypeLoad.readyEvidence([ready(), ready({ sha: SHA, fingerprint: undefined, tests: 'red' })], input, [], FP)).toBeNull();

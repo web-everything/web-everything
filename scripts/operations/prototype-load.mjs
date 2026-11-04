@@ -13,6 +13,7 @@ export const safeRegistrationRef = (ref) => typeof ref === 'string' && /^[A-Za-z
   && !/\.\.|\/\/|\/\.|@\{|\.$|\/$|\.lock(?:\/|$)/.test(ref);
 export const safeRef = (ref) => safeRegistrationRef(ref) && ref.startsWith('lane/');
 export const validSha = (sha) => /^[a-f0-9]{40}$/i.test(sha || '');
+const lowerSha = (sha) => (typeof sha === 'string' ? sha.toLowerCase() : sha);
 export function jsonLines(text) {
   return String(text).split(/\r?\n/).flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } });
 }
@@ -25,10 +26,12 @@ export function readyEvidence(records, input, ruledWeakened = [], liveFp = null)
   if (input.testsRun?.trim() && /^NOT WEAKENED$/i.test(input.audit || '')) return { source: 'arguments', testsRun: input.testsRun };
   // R503: a record speaks for the live sha when it names it exactly, or its stored net-diff fingerprint equals the live one.
   // A rebase or merge of main that leaves the code alone therefore keeps the evidence; any code change does not.
-  const list = Array.isArray(records) ? records : [];
+  // Shas compare case-insensitively (validSha accepts either case): an upper-case --sha must still find its own records.
+  const live = lowerSha(input.sha);
+  const list = (Array.isArray(records) ? records : []).map((r) => (r && typeof r === 'object' ? { ...r, sha: lowerSha(r.sha) } : r));
   const carries = (r) => validSha(r.sha) && carriesAcross(r.fingerprint, liveFp);
   // The allowlist entry binds to the record by its exact sha, or (carry) by holding the live fingerprint itself.
-  const binds = (e, r) => e.sha === r.sha && r.sha === input.sha || validSha(e.sha) && validSha(r.sha) && carriesAcross(e.fingerprint, liveFp) && carriesAcross(r.fingerprint, liveFp);
+  const binds = (e, r) => lowerSha(e.sha) === r.sha && r.sha === live || validSha(e.sha) && validSha(r.sha) && carriesAcross(e.fingerprint, liveFp) && carriesAcross(r.fingerprint, liveFp);
   const judge = (r) => {
     if (r.tests === 'green' && /^NOT WEAKENED$/i.test(r.audit || '')) return { source: 'ready-record', record: r };
     const ruled = r.tests === 'green' && r.audit === 'WEAKENED'
@@ -45,9 +48,9 @@ export function readyEvidence(records, input, ruledWeakened = [], liveFp = null)
   //  - a carried head whose latest record would not load (WEAKENED unruled, not green, unbound) blocks unless the
   //    live sha has a NEWER record of its own — newer negative evidence about the same code is never bypassed.
   const latest = new Map();
-  list.forEach((r, i) => { if (r?.ref === input.branch && (r.sha === input.sha || validSha(r.sha))) latest.set(r.sha, i); });
-  const ownAt = latest.has(input.sha) ? latest.get(input.sha) : -1;
-  const carried = [...latest].filter(([sha]) => sha !== input.sha && list.some((r) => r?.ref === input.branch && r.sha === sha && carries(r)))
+  list.forEach((r, i) => { if (r?.ref === input.branch && (r.sha === live || validSha(r.sha))) latest.set(r.sha, i); });
+  const ownAt = latest.has(live) ? latest.get(live) : -1;
+  const carried = [...latest].filter(([sha]) => sha !== live &&list.some((r) => r?.ref === input.branch && r.sha === sha && carries(r)))
     .map(([, i]) => i).sort((a, b) => a - b);
   if (carried.some((i) => i > ownAt && !judge(list[i]))) return null;
   if (ownAt >= 0) return judge(list[ownAt]);
@@ -69,13 +72,18 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   //    or not — so a superseded WEAKENED never blocks forever, and an unsuperseded one is never hidden;
   //  - the live head's own verdicts decide whenever it has any, and a carried pass can never outrank them;
   //  - a carried head's latest WEAKENED blocks unless the live head has a NEWER verdict of its own (a fresh re-audit).
-  const list = Array.isArray(records) ? records : [];
+  // Shas compare case-insensitively (validSha accepts either case), so the live head always finds its own verdicts.
+  sha = lowerSha(sha);
+  const list = (Array.isArray(records) ? records : [])
+    .map((r) => (r && typeof r === 'object' ? { ...r, head: lowerSha(r.head), base: lowerSha(r.base) } : r));
   const decisions = (head) => [...new Set(list.filter((r) => r?.head === head && r.base !== head).map((r) => r.base))]
     .map((base) => ({ base, record: findAudit(list, { head, base, questionHash: QUESTION_HASH }) })).filter((d) => d.record);
   const own = decisions(sha);
   const carriedHeads = new Set(list.filter((r) => r?.head && r.head !== sha && validSha(r.head) && carriesAcross(r.fingerprint, liveFp)).map((r) => r.head));
   const carried = [...carriedHeads].flatMap(decisions);
-  const ownAt = Math.max(-Infinity, ...own.map((d) => Date.parse(d.record.at)));
+  // Only an own verdict that could itself pass (its base is in main) is a re-audit that supersedes a carried WEAKENED:
+  // a newer audit of a narrow, uncovered base never hides it behind an older covered pass.
+  const ownAt = Math.max(-Infinity, ...own.filter((d) => covers(d.base)).map((d) => Date.parse(d.record.at)));
   if (own.some((d) => d.record.verdict === 'WEAKENED')
     || carried.some((d) => d.record.verdict === 'WEAKENED' && !(Date.parse(d.record.at) < ownAt))) return { ok: false, reason: 'weakened' };
   // A pass counts only when covers(base) proves its base is in main; a carried pass must itself hold the fingerprint.
