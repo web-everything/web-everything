@@ -3948,15 +3948,17 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
       });
 
     it.each([
-      ['an assignment after the command', 'git -C ~/wev-review-daemon reset --hard; HOME=/ws', HOOK_HOME, false],
-      ['a command-local HOME prefix leaves command words on the shell HOME', 'HOME=/ws git -C ~/wev-review-daemon reset --hard', HOOK_HOME, false],
+      // PR #6262 send-back item 3 (operator ruling): once the command writes HOME anywhere in the scope (a loop
+      // can run the write first), a tilde never trusts the tracked HOME or the hook's: these were allowed before.
+      ['an assignment after the command', 'git -C ~/wev-review-daemon reset --hard; HOME=/ws', HOOK_HOME, true],
+      ['a command-local HOME prefix leaves the tilde unresolved', 'HOME=/ws git -C ~/wev-review-daemon reset --hard', HOOK_HOME, true],
       ['a command-local HOME prefix cannot move command words away', 'HOME=/elsewhere git -C ~/wev-review-daemon reset --hard', '/ws', true],
-      ['an earlier HOME moves the target away from the hook HOME', 'HOME=/elsewhere; git -C ~/wev-review-daemon reset --hard', '/ws', false],
+      ['an earlier HOME leaves the tilde unresolved', 'HOME=/elsewhere; git -C ~/wev-review-daemon reset --hard', '/ws', true],
       ['a possibly skipped HOME keeps the earlier value', 'false && HOME=/elsewhere; git -C ~/wev-review-daemon reset --hard', '/ws', true],
       ['a child shell uses its own HOME', "bash -c 'HOME=/ws; git -C ~/wev-review-daemon reset --hard'", HOOK_HOME, true],
       ['an earlier prefix HOME applies to a later prefix value', 'HOME=/ws GIT_DIR=~/wev-review-daemon/.git git reset --hard', HOOK_HOME, true],
       ['an assignment value expands when it runs', 'export GIT_DIR=~/wev-review-daemon/.git; HOME=/elsewhere; git reset --hard', '/ws', true],
-      ['a later HOME does not retarget an earlier value', 'export GIT_WORK_TREE=~/wev-review-daemon; HOME=/ws; git clean -fd', HOOK_HOME, false],
+      ['a HOME written anywhere in the scope leaves an earlier tilde value unresolved', 'export GIT_WORK_TREE=~/wev-review-daemon; HOME=/ws; git clean -fd', HOOK_HOME, true],
       ['a possibly skipped HOME keeps both values for a later assignment', 'false && HOME=/elsewhere; export GIT_DIR=~/wev-review-daemon/.git; git reset --hard', '/ws', true],
       ['unset HOME is unknown', 'unset HOME; git -C ~/wev-review-daemon reset --hard', HOOK_HOME, true],
       ['an unresolved HOME is unknown', 'HOME=$(mktemp -d); git -C ~/wev-review-daemon reset --hard', HOOK_HOME, true],
@@ -3971,7 +3973,7 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
       ['a HOME prefix on export keeps the earlier HOME', 'HOME=/ws; HOME=/tmp export X=1; git -C ~/wev-review-daemon reset --hard', HOOK_HOME, true],
       ['a HOME prefix on a special builtin may persist', 'HOME=/ws :; git -C ~/wev-review-daemon reset --hard', HOOK_HOME, true],
       ['a GIT_DIR prefix on export keeps the earlier GIT_DIR', 'export GIT_DIR=/ws/wev-review-daemon/.git; GIT_DIR=/tmp export X=1; git reset --hard', HOOK_HOME, true],
-      ['readonly HOME refuses the reassignment', 'readonly HOME; HOME=/ws; git -C ~/wev-review-daemon reset --hard', HOOK_HOME, false],
+      ['an assignment to a readonly HOME still leaves the tilde unresolved', 'readonly HOME; HOME=/ws; git -C ~/wev-review-daemon reset --hard', HOOK_HOME, true],
     ])('%s', (_name, command, home, denied) => {
       const out = decide(command, ctx(home));
       if (denied) expect(out).toMatch(/DAEMON CLONE/);
@@ -3997,6 +3999,130 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
       expect(decide(command.replace(/HOME=\/h/g, () => `HOME=/h${n++}`), ctx())).toMatch(/DAEMON CLONE/);
       expect(Date.now() - started).toBeLessThan(6000);
     });
+  });
+
+  // PR #6262 operator send-back (judge round 11), one named test per item.
+  describe('send-back item 1: unmodelled writers of protected Git names fail closed', () => {
+    const ctx = { cwd: LANE, daemonCloneRoots: roots };
+    const NAMES = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_CONFIG', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM',
+      'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'];
+    const WRITERS = (n) => [`read ${n} <<< ${CLONE}`, `read -r ${n} <f`, `printf -v ${n} %s ${CLONE}`,
+      `for ${n} in ${CLONE}; do :; done`, `${n}+=${CLONE}`, `${n}=/ws; ${n}+=/wev-review-daemon`, `let ${n}=1`,
+      `getopts a ${n}`, `mapfile ${n} <f`, `declare ${n}=${CLONE}`, `typeset ${n}=${CLONE}`, `local ${n}=${CLONE}`,
+      `readonly ${n}=${CLONE}`, `readonly ${n}`, `declare -g ${n}=/safe`, `eval 'read ${n}'`, `case x in x) read ${n};; esac`];
+    it.each(NAMES.flatMap((name) => WRITERS(name).map((writer) => ({ name, writer }))))(
+      '$writer then a mutation is denied, a read allowed', ({ name, writer }) => {
+        expect(decide(`${writer}; export ${name}; git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
+        expect(decide(`${writer}; export ${name}; git log`, ctx)).toBeNull();
+      });
+    it.each([
+      'read "$N" <f', 'printf -v "$N" x', 'eval "$CMD"', 'source ./env.sh', '. ./env.sh',
+      // A loop back-edge or a function defined earlier can run the mutation after the writer.
+      'while :; do git reset --hard; read GIT_DIR; done',
+      `g(){ git reset --hard; }; read GIT_DIR <<< ${CLONE}/.git; export GIT_DIR; g`,
+    ])('an indirect or later writer fails closed: %s', (command) => {
+      const full = /git reset/.test(command) ? command : `${command}; git reset --hard`;
+      expect(decide(full, ctx)).toMatch(/DAEMON CLONE/);
+    });
+    it('leaves modelled writers and unrelated names as they were', () => {
+      expect(decide(`export GIT_DIR=${CLONE}/.git; export GIT_DIR=${LANE}/.git; git reset --hard`, ctx)).toBeNull();
+      expect(decide(`export GIT_DIR=${CLONE}/.git; unset GIT_DIR; git reset --hard`, ctx)).toBeNull();
+      expect(decide(`export GIT_DIR=${CLONE}/.git; eval 'unset GIT_DIR'; git reset --hard`, ctx)).toBeNull();
+      expect(decide('read -r line <f; printf -v OUT %s x; for f in a b; do :; done; git reset --hard', ctx)).toBeNull();
+    });
+  });
+
+  describe('send-back item 2: attached fetch option values get the unresolved-expansion check', () => {
+    const fetchCtx = { cwd: LANE, roots, fetchConfig: [] };
+    it.each(['--upload-pack=$X', '--upload-pack=`x`', '--upload-p=$X', '-o$X', '-vo$X', '--server-option=$X',
+      '--$X', '--refmap=$X', '--filter=$X', '-j$X', '--deepen=$X', '--negotiation-tip=$X', '--upload-pack $X'])(
+      'DENIES git fetch %s on a daemon clone', (option) => {
+        expect(daemonCloneWriteReason(`git -C ${CLONE} fetch ${option} origin`, fetchCtx)).toMatch(/DAEMON CLONE/);
+      });
+    it('DENIES an unresolved global -c value before fetch', () => {
+      expect(daemonCloneWriteReason(`git -c$X -C ${CLONE} fetch origin`, fetchCtx)).toMatch(/DAEMON CLONE/);
+      expect(daemonCloneWriteReason(`git -c "$X" -C ${CLONE} fetch origin`, fetchCtx)).toMatch(/DAEMON CLONE/);
+    });
+    it('keeps literal attached values allowed', () => {
+      for (const option of ['--upload-pack=git-upload-pack', '--depth=1', '--jobs=4', '-o foo', '--filter=blob:none']) {
+        expect(daemonCloneWriteReason(`git -C ${CLONE} fetch ${option} origin`, fetchCtx), option).toBeNull();
+      }
+    });
+  });
+
+  describe('send-back item 3: a tilde after a HOME write, or with an unknown HOME, is denied', () => {
+    const ctx = (home) => ({ cwd: LANE, daemonCloneRoots: roots, gitConfigEnv: home === undefined ? {} : { HOME: home } });
+    it.each([
+      // [command, hook HOME]. None of these resolves to the clone through the hook's HOME.
+      ['HOME=/elsewhere; git -C ~/wev-review-daemon reset --hard', '/ws'],
+      ['export HOME=/hook-home; git -C ~/wev-review-daemon reset --hard', '/hook-home'],
+      ['HOME=/ws git -C ~/wev-review-daemon reset --hard', '/hook-home'],
+      ['HOME=/a GIT_DIR=~/wev-review-daemon/.git git reset --hard', '/hook-home'],
+      ['HOME=/a; export GIT_DIR=~/x/.git; git reset --hard', '/hook-home'],
+      ['readonly HOME; HOME=/x; git -C ~/x reset --hard', '/hook-home'],
+      ['while :; do git -C ~/wev-review-daemon reset --hard; HOME=/ws; done', '/hook-home'],
+      ["eval 'HOME=/x'; git -C ~/x reset --hard", '/hook-home'],
+      ['HOME=/x; bash -c "git -C ~/y reset --hard"', '/hook-home'],
+      ['HOME=/x; git -C ~/y config --file ~/y/config a.b c', '/hook-home'],
+      ['git -C ~nobody/x reset --hard', '/hook-home'],
+      ['git -C ~/x reset --hard', undefined],
+      ['git -C ~/x reset --hard', 'relative'],
+    ])('%s (hook HOME %s)', (command, home) => {
+      expect(decide(command, ctx(home))).toMatch(/DAEMON CLONE/);
+      expect(decide(command.replace(/reset --hard|config --file \S+ a\.b c/, 'log'), ctx(home))).toBeNull();
+    });
+    it('a HOME write never reaches the cd resolver through the hook HOME', () => {
+      for (const command of ['HOME=/x; cd ~/y && git reset --hard', 'HOME=/hook; true && cd ~/y && git reset --hard']) {
+        const candidates = [];
+        resolveEffectiveCwd(command, LANE, undefined, '/hook', (c) => candidates.push(c));
+        expect(candidates, command).toContain(null);
+      }
+    });
+    it('pins the operator cases: `git -C ~/workspace/wev-review-daemon log` allowed, `~` + reset denied', () => {
+      const pinned = { cwd: LANE, daemonCloneRoots: ['/u/workspace/wev-review-daemon'], gitConfigEnv: { HOME: '/u' } };
+      expect(decide('git -C ~/workspace/wev-review-daemon log', pinned)).toBeNull();
+      expect(decide('git -C ~/workspace/wev-review-daemon reset --hard', pinned)).toMatch(/DAEMON CLONE/);
+      expect(decide('git -C ~ reset --hard', { ...pinned, daemonCloneRoots: ['/u'] })).toMatch(/DAEMON CLONE/);
+    });
+  });
+
+  it('send-back item 4: envDirs resolve against the effective -C directory with tilde expansion', () => {
+    const configEnv = { HOME: '/ws' };
+    expect(daemonCloneWriteReason('git -C /ws reset --hard', { cwd: LANE, roots, envDirs: ['wev-review-daemon/.git'], configEnv }))
+      .toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason('git reset --hard', { cwd: LANE, roots, envDirs: ['~/wev-review-daemon'], configEnv }))
+      .toMatch(/DAEMON CLONE/);
+    expect(decide('git -C /ws reset --hard', { cwd: LANE, daemonCloneRoots: roots, gitEnvDirs: ['wev-review-daemon'], gitConfigEnv: configEnv }))
+      .toMatch(/DAEMON CLONE/);
+    // A command-local HOME prefix leaves an envDirs tilde unresolved too.
+    expect(daemonCloneWriteReason('HOME=/elsewhere git reset --hard', { cwd: LANE, roots, envDirs: ['~/x'], configEnv }))
+      .toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason('git -C /elsewhere reset --hard', { cwd: LANE, roots, envDirs: ['wev-review-daemon'], configEnv }))
+      .toBeNull();
+  });
+
+  it('send-back item 5: a possibly-skipped assignment never erases a protected cd target (only adds)', () => {
+    const at = (command) => {
+      const candidates = [];
+      const cwd = resolveEffectiveCwd(command, LANE, undefined, '/hook', (c) => candidates.push(c));
+      return { cwd, candidates };
+    };
+    for (const command of [
+      `D=${CLONE}; false && D=/safe; cd "$D" && git reset --hard`,
+      `D=${CLONE}; true || D=/safe; cd $D && git reset --hard`,
+      `export D=${CLONE}; [ -n "$X" ] && export D=/safe; cd "\${D}" && git reset --hard`,
+      `D=${CLONE}; cd "$D" && git reset --hard; D=/safe`,
+    ]) {
+      const { cwd, candidates } = at(command);
+      expect(cwd, command).toBe('/safe');                       // the returned cwd keeps main's resolution
+      expect(candidates, command).toContain(CLONE);             // …and the protected value is still reported
+    }
+    // A write not read here leaves the landing place unknown.
+    expect(at(`D=/safe; read D <<< ${CLONE}; cd "$D" && git reset --hard`).candidates).toContain(null);
+    expect(at(`D=/safe; D=$(printf ${CLONE}); cd "$D" && git reset --hard`).candidates).toContain(null);
+    // The env tracker keeps both values for a skipped Git target assignment as well.
+    expect(decide(`export GIT_DIR=${CLONE}/.git; false && export GIT_DIR=/safe; git reset --hard`, { cwd: LANE, daemonCloneRoots: roots }))
+      .toMatch(/DAEMON CLONE/);
   });
 
   it.each(['--git-dir', '--work-tree'].flatMap((option) =>
@@ -4047,7 +4173,9 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
         expect(decide(`${declaration}; unset ${key}; ${mutation}`, ctx), declaration).toMatch(/DAEMON CLONE/);
       }
       expect(decide(`export ${key}=${target}; readonly ${key}; unset ${key}; ${mutation}`, ctx)).toMatch(/DAEMON CLONE/);
-      expect(decide(`export ${key}=${target}; readonly ${key}; bash -c 'unset ${key}; ${mutation}'`, ctx)).toBeNull();
+      // PR #6262 send-back item 1: `readonly` naming a protected Git name fails closed for the rest of the
+      // command, child shells included (allowed before).
+      expect(decide(`export ${key}=${target}; readonly ${key}; bash -c 'unset ${key}; ${mutation}'`, ctx)).toMatch(/DAEMON CLONE/);
       for (const skipped of [`false && unset ${key}`, `true || unset ${key}`, `unset ${key} | cat`, `false && eval 'unset ${key}'`, `if false; then true; unset ${key}; fi`]) {
         expect(decide(`export ${key}=${target}; ${skipped}; ${mutation}`, ctx), skipped).toMatch(/DAEMON CLONE/);
       }
@@ -4118,8 +4246,10 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     'DENIES after a printing or function-only directive that assigns nothing: %s', (directive) => {
       const ctx = { cwd: LANE, daemonCloneRoots: roots };
       expect(decide(`export GIT_DIR=${CLONE}/.git; ${directive} GIT_DIR=/safe/.git; git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
-      // A printing directive is not a readonly lock either: a later safe assignment still replaces the target.
-      expect(decide(`export GIT_DIR=${CLONE}/.git; ${directive} GIT_DIR; export GIT_DIR=${LANE}/.git; git reset --hard`, ctx)).toBeNull();
+      // PR #6262 send-back item 1: any declaration builtin naming a protected Git name fails closed, so even a
+      // later safe assignment does not clear it (this was allowed before). export -f names functions only.
+      expect(decide(`export GIT_DIR=${CLONE}/.git; ${directive} GIT_DIR; export GIT_DIR=${LANE}/.git; git reset --hard`, ctx))
+        .toSatisfy((r) => (directive === 'export -f' ? r === null : /DAEMON CLONE/.test(r)));
     },
   );
 
@@ -4171,10 +4301,11 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
       expect(decide(`export GIT_DIR='${CLONE}'/.git; ${directive} GIT_DIR="/safe"; git reset --hard`, ctx), directive)
         .toMatch(/DAEMON CLONE/);
     }
-    // A plain string declaration and options after the first name retain their established semantics.
-    expect(decide(`export GIT_DIR=${CLONE}/.git; declare -x GIT_DIR=${LANE}/.git -i; git reset --hard`, ctx)).toBeNull();
+    // PR #6262 send-back item 1: a declaration naming a protected Git name fails closed (allowed before);
+    // one naming an unrelated variable still does not.
+    expect(decide(`export GIT_DIR=${CLONE}/.git; declare -x GIT_DIR=${LANE}/.git -i; git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
     expect(decide(`declare -i COUNT=1; git reset --hard`, ctx)).toBeNull();
-    expect(decide(`declare -p GIT_DIR; git reset --hard`, ctx)).toBeNull();
+    expect(decide(`declare -p GIT_DIR; git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
   });
 
   it('carries uncertain declaration attributes through eval and child scopes without leaking child changes', () => {
@@ -4214,8 +4345,10 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
       `export GIT_DIR=${CLONE}/.git; readonly -Q GIT_DIR=${LANE}/.git; git reset --hard`,
       `export GIT_DIR=${CLONE}/.git; enable -n export; export GIT_DIR=${LANE}/.git; git reset --hard`,
     ]) expect(decide(command, ctx), command).toMatch(/DAEMON CLONE/);
-    // Known options and no redirection still replace the earlier value.
-    expect(decide(`export GIT_DIR=${CLONE}/.git; declare -x GIT_DIR=${LANE}/.git; git reset --hard`, ctx)).toBeNull();
+    // PR #6262 send-back item 1: a declaration builtin is never trusted to replace a protected target (it
+    // was before); a plain export still is.
+    expect(decide(`export GIT_DIR=${CLONE}/.git; declare -x GIT_DIR=${LANE}/.git; git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
+    expect(decide(`export GIT_DIR=${CLONE}/.git; export GIT_DIR=${LANE}/.git; git reset --hard`, ctx)).toBeNull();
   });
 
   it('ALLOWS an unconditional reassignment after a file-descriptor redirection', () => {
@@ -4848,7 +4981,8 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
         [`export HOME=${hookHome} GIT_DIR=~/workspace/wev-review-daemon/.git; git reset --hard`, root, true],
         [`export HOME=${root} GIT_DIR=~/workspace/wev-review-daemon/.git; git reset --hard`, hookHome, true],
         [`env HOME=${root} GIT_DIR=~/workspace/wev-review-daemon/.git git log`, hookHome, false],
-        [`git -C ~/workspace/wev-review-daemon reset --hard; HOME=${root}`, hookHome, false],
+        // PR #6262 send-back item 3: a HOME write anywhere in the scope leaves the tilde unresolved (allowed before).
+        [`git -C ~/workspace/wev-review-daemon reset --hard; HOME=${root}`, hookHome, true],
         // A leading `cd ~` the cd resolver cannot follow leaves the target unknown, not the literal `~` join.
         [`read HOME <<< ${root}; cd ~/workspace/wev-review-daemon && git reset --hard`, hookHome, true],
         [`HOME=${root}; HOME=/tmp export X=1; cd ~/workspace/wev-review-daemon && git reset --hard`, hookHome, true],
@@ -4874,10 +5008,25 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
         expect(readDaemonFetchConfig(fetch('branch'), lane, [], { HOME: root })).toEqual(['+refs/heads/*:refs/heads/*']);
         expect(readDaemonFetchConfig(fetch('tracking'), lane, [], { HOME: root })).toEqual(['+refs/heads/*:refs/remotes/origin/*']);
         expect(runHook(`HOME=${root}; ${fetch('branch')}`, lane, hookHome)?.hookSpecificOutput?.permissionDecision).toBe('deny');
-        expect(runHook(`HOME=${root}; ${fetch('tracking')}`, lane, hookHome)).toBeNull();
+        // PR #6262 send-back item 3: after a HOME write the tilde target is unresolved, so even a tracking-only
+        // fetch config cannot be proven safe (allowed before). Without the write it stays allowed.
+        expect(runHook(`HOME=${root}; ${fetch('tracking')}`, lane, hookHome)?.hookSpecificOutput?.permissionDecision).toBe('deny');
+        expect(runHook(fetch('tracking'), lane, root)).toBeNull();
       });
     });
   });
+  // PR #6262 send-back items 5 and 6 at the hook JSON boundary (the CLI collects every cd candidate).
+  it.each([
+    `D=${fakeClone}; false && D=/tmp; cd "$D" && git checkout --detach`,
+    `D=${fakeClone}; cd "$D" && git checkout --detach; D=/tmp`,
+    `D=/tmp; read D <f; cd "$D" && git checkout --detach`,
+  ])('send-back item 5: a possibly-skipped or unread reassignment cannot move the cd off the clone: %s', (command) => {
+    const out = runHook(command, lane);
+    expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+    expect(runHook(command.replace('git checkout --detach', 'git status'), lane)).toBeNull();
+  });
+
   // These preserve main's single-directory behavior; the proposed shell strings are never executed.
   it.each([
     ['nested-subshell fallback', `((cd ${fakeClone}; git checkout --detach) )`, true],

@@ -39,3 +39,7 @@ One line per class: either the handling, or `n/a: <why>`.
 ## Audit finding carried from PR 6262 (R451)
 
 The final audit found one origin/main deny that HEAD no longer denies: `git branch -C <name> <copy>` read as a `-C <dir>` target on main (a false positive, since `branch -C` copies a branch). The new parser stops reading `-C` at the subcommand. No protected-clone write bypass was shown. Decide in the allowlist redesign whether to restore a deny for this shape.
+
+## Residual carried from the PR 6262 judge send-back (round 11)
+
+The send-back made unmodelled writers (`read`, `printf -v`, `for NAME in`, `+=`, `let`, `getopts`, `mapfile`, declaration builtins, eval/source) of GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR and GIT_CONFIG* fail closed for the whole scope, so loop back-edges and earlier-defined functions are covered for them. A MODELLED export reached through a back-edge is still read in text order and stays open: `g(){ git reset --hard; }; export GIT_DIR=<clone>/.git; g` and `while :; do git reset --hard; export GIT_DIR=<clone>/.git; done` are allowed. The allowlist redesign should close it (a function call or loop body runs with every value its scope assigns).
