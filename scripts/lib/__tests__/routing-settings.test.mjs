@@ -168,6 +168,15 @@ describe('routing settings', () => {
     expect(BUILD_KINDS).toContain('build');
     expect(BUILD_KINDS).not.toContain('review');
     expect(BUILD_KINDS).toEqual(expect.arrayContaining(DOCUMENTED_BUILD_KINDS));
+    // The full held list, pinned literally: dropping any kind (prepare-item, worker, ...) lets Codex write code under builder=claude.
+    expect([...BUILD_KINDS].sort()).toEqual(['build', 'ci-heal', 'design', 'doc-fix', 'fix', 'prepare', 'prepare-card', 'prepare-complex', 'prepare-item', 'prevention-card', 'takeover', 'worker']);
+  });
+  it('fix-executor-chain honours a caller-passed env WE_ROUTING_BUILDER over the repo builder', () => {
+    const chain = ['codex', 'codex-alt', 'claude'];
+    const claudeRepo = { routing: { builder: 'claude' }, fixExecutor: { fallbackChain: chain } };
+    expect(resolveFixExecutorChain({ env: { WE_ROUTING_BUILDER: 'codex' }, platform: {}, repo: claudeRepo }).value).toEqual(chain);
+    const codexRepo = { routing: { builder: 'codex' }, fixExecutor: { fallbackChain: chain } };
+    expect(resolveFixExecutorChain({ env: { WE_ROUTING_BUILDER: 'claude' }, platform: {}, repo: codexRepo }).value).toEqual(['claude']);
   });
   it('builder claude collapses the repair chain; an env chain cannot bring codex back, only builder=codex can', () => {
     const repo = { routing: { builder: 'claude' }, fixExecutor: { fallbackChain: ['codex', 'codex-alt', 'claude'] } };
