@@ -581,14 +581,20 @@ describe('fail-closed run scan evidence', () => {
       expect(reads).toBe(2);
     }
   });
-  it('recovery and skipped-PR scheduling explicitly refuse capped evidence', () => {
+  it('recovery gate holds on capped evidence; the review-skip scheduler dispatches a review instead (unknown = not reviewed)', () => {
     expect(planRedTeamRecovery({ ok: false, reason: 'scan-capped' })).toMatchObject({ mode: 'skip', why: 'scan-capped' });
     const f = fixture();
     const rows = planRedTeamOnSkip({ repo: f.repo, refusals: [{ kind: 'already-reviewed-head', prNumber: f.pr }],
       rawPrs: [{ number: f.pr, headRefOid: f.head, comments: [], labels: ['review:accepted'] }],
       readEvidence: () => ({ ok: false, reason: 'scan-capped' }), readStatus: () => null,
       setting: { enabled: true }, lastDispatch: new Map(), now: 0 });
-    expect(rows[0]).toMatchObject({ action: 'skip', why: 'scan-capped' });
+    // Unreadable formal reviews still hold: a forced full review needs them.
+    expect(rows[0]).toMatchObject({ action: 'skip', why: expect.stringMatching(/reviews unreadable/) });
+    const withReviews = planRedTeamOnSkip({ repo: f.repo, refusals: [{ kind: 'already-reviewed-head', prNumber: f.pr }],
+      rawPrs: [{ number: f.pr, headRefOid: f.head, comments: [], reviews: [], labels: ['review:accepted'] }],
+      readEvidence: () => ({ ok: false, reason: 'scan-capped' }), readStatus: () => null,
+      setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(), now: 0 });
+    expect(withReviews[0]).toMatchObject({ action: 'review' });
   });
 });
 

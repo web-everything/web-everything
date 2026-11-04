@@ -1535,3 +1535,21 @@ describe('unprovable accepted head move — fresh full review', () => {
     expect(o.dispatch).toHaveBeenCalledTimes(1); expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, redTeamOnly: true, redTeamMode: 'fresh' });
   });
 });
+
+describe('scan-capped run scan — per-caller direction', () => {
+  const capped = { ok: false, reason: 'scan-capped' };
+  const accepted = over => ({ rawPrs: [{ number: pr, headRefOid: head, labels: ['review:accepted'], reviews: [], comments: [
+    { body: `✅ review — accepted\n<!-- reviewed-sha: ${'b'.repeat(40)} -->`, author: { login: 'web-everything' } }] }], ...over });
+  it('review-skip decision: capped evidence on a new head dispatches a review', () => {
+    expect(decide(accepted({ readEvidence: () => capped }))).toMatchObject({ action: 'review', head });
+  });
+  it('review-skip decision: capped recovery witness dispatches a review', () => {
+    expect(decide(accepted({ readWitness: () => capped }))).toMatchObject({ action: 'review', head });
+  });
+  it('a capped scan on an unaccepted PR is still held (no review forced)', () => {
+    expect(decide({ readEvidence: () => capped })).toMatchObject({ action: 'skip', why: 'scan-capped' });
+  });
+  it('other unknowns still hold', () => {
+    expect(decide(accepted({ readEvidence: () => ({ ok: false, reason: 'review-unfinished' }) })).action).toBe('skip');
+  });
+});

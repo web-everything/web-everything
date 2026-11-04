@@ -224,6 +224,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (last != null && now - last < setting.retryCooldownMin * 60_000) return skip('retry cooldown active');
       return { ...row, ...decision };
     };
+    let capped = false;
     try {
       if (!setting.enabled) return skip('reviewRedTeamOnSkip.enabled=false');
       if (!isRealHead(head) || (refusal.headSha != null && refusal.headSha !== head)) return skip('live head missing or changed');
@@ -233,14 +234,29 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (redTeamForHead(rawPr.comments, pr, head) && (!journal || journal.step === 'done')) return skip('red-team result already on head');
       if (readWitness) {
         const w = readWitness({ repo, pr, head });
-        if (w?.ok === false) return skip(w.reason);
-        if (['queued', 'running'].includes(w.rawWriter.parsed?.status) || w.rawWriter.parsed?.staleAbandoned) {
+        if (w?.ok === false && w.reason !== 'scan-capped') return skip(w.reason);
+        if (w?.ok === false) capped = true;
+        if (!capped && (['queued', 'running'].includes(w.rawWriter.parsed?.status) || w.rawWriter.parsed?.staleAbandoned)) {
           const recovery = planRedTeamRecovery(w, recoveryOptions);
           return recovery.mode === 'skip' ? skip(recovery.why)
             : dispatchDecision({ action: 'dispatch', mode: recovery.mode, staleRecovery: true, why: 'dead owner recovery' });
         }
       }
-      const evidence = readEvidence({ repo, pr, head });
+      const evidence = capped ? { ok: false, reason: 'scan-capped' } : readEvidence({ repo, pr, head });
+      if (evidence?.ok === false && evidence.reason === 'scan-capped') capped = true;
+      // "Has this head been reviewed?" is a skip-the-review decision: a capped (unknown) scan means NOT reviewed,
+      // so dispatch one. An extra review is harmless; the red-team gate keeps treating unknown as hold.
+      if (capped) {
+        const acc = Array.isArray(rawPr.labels) && rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:accepted');
+        if (!acc) return skip('scan-capped');
+        const acceptanceC = latestAcceptRecord(rawPr.comments, Array.isArray(rawPr.reviews) ? rawPr.reviews : null);
+        const reviewsC = Array.isArray(rawPr.reviews) ? rawPr.reviews : null;
+        const refusalC = publishableClearGuard({ labels: rawPr.labels, acceptance: acceptanceC, comments: rawPr.comments, reviews: reviewsC });
+        if (refusalC) return skip(refusalC);
+        if (reviewsC === null) return skip('PR reviews unreadable; inspect formal reviews before full review');
+        if (laterReviewHold(reviewsC)) return skip('formal review hold prevents full review; inspect formal reviews');
+        return dispatchDecision({ action: 'review', why: 'run scan capped: head review unprovable; dispatching a review' });
+      }
       if (evidence?.ok === false) return skip(evidence.reason);
       if (evidence?.carryConflict) return skip('later review supersedes the carry');
       const unfinishedCarry = evidence?.carry && evidence.carry.step !== 'done';
