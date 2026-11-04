@@ -114,9 +114,11 @@ export async function main(argv, deps) {
       if (f.disputed || classification.recheck.length) {
         try {
           const checked = await deps.recheck?.(f, { base, head });
-          // Keep or downgrade only: the same full fingerprint (D1 may downgrade to D3). Otherwise void.
+          // Keep or downgrade only: the same full fingerprint, trigger included. Only a D1 -> D3 downgrade may
+          // restate the trigger (its investigation result); location, consequence, card and ruling stay bound.
           const samePrint = validFinding(checked) && (findingFingerprint(checked) === findingFingerprint(f)
-            || (f.class === 'D1' && checked.class === 'D3' && findingFingerprint({ ...checked, class: 'D1' }) === findingFingerprint(f)));
+            || (f.class === 'D1' && checked.class === 'D3'
+              && findingFingerprint({ ...checked, class: 'D1', trigger: f.trigger }) === findingFingerprint(f)));
           if (samePrint) {
             // A failed repro never disproves a safety finding. Retain the effective B class.
             const safety = classification.blocks.find(b => b.class?.startsWith('B'));

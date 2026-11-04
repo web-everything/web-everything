@@ -342,11 +342,26 @@ describe('R473 structured concurrency evidence', () => {
         expect((await compute([d2()], options('prerelease', { readCard, now: NOW }))).verdict).toBe('WEAKENED');
       }
     });
-    it('blocks once the mustPayBefore date has passed, ships before it', async () => {
-      expect((await compute([d2({ mustPayBefore: '2026-11-01' })], options('prerelease', { readCard: reader(), now: NOW }))).verdict).toBe('WEAKENED');
+    it('blocks once the card mustPayBefore date has passed, ships before it', async () => {
       expect((await compute([d2()], options('prerelease', { readCard: reader('mustPayBefore: 2026-11-01\n'), now: NOW }))).verdict).toBe('WEAKENED');
-      expect((await compute([d2({ mustPayBefore: '2026-12-01' })], options('prerelease', { readCard: reader(), now: NOW }))).verdict).toBe('NOT WEAKENED');
-      expect((await compute([d2({ mustPayBefore: 'garbage' })], options('prerelease', { readCard: reader(), now: NOW }))).verdict).toBe('WEAKENED');
+      expect((await compute([d2()], options('prerelease', { readCard: reader('mustPayBefore: 2026-12-01\n'), now: NOW }))).verdict).toBe('NOT WEAKENED');
+      expect((await compute([d2()], options('prerelease', { readCard: reader('mustPayBefore: garbage\n'), now: NOW }))).verdict).toBe('WEAKENED');
+    });
+    it('takes the pay-by date only from the card on main, never from the model finding', async () => {
+      // An overdue card cannot be revived by a later model-supplied date.
+      expect((await compute([d2({ mustPayBefore: '2026-12-01' })], options('prerelease', { readCard: reader('mustPayBefore: 2026-11-01\n'), now: NOW }))).verdict).toBe('WEAKENED');
+      expect((await compute([d2({ mustPayBefore: 'prod' })], options('prerelease', { readCard: reader('mustPayBefore: 2026-11-01\n'), now: NOW }))).verdict).toBe('WEAKENED');
+      // A model-supplied overdue date does not override a card with no pay-by either way.
+      expect((await compute([d2({ mustPayBefore: '2026-11-01' })], options('prerelease', { readCard: reader(), now: NOW }))).verdict).toBe('NOT WEAKENED');
+    });
+    it('a card due before prod ships at prerelease and blocks at prod', async () => {
+      const due = () => reader('status: open\nmustPayBefore: prod\n');
+      expect((await compute([d2()], options('prerelease', { readCard: due(), now: NOW }))).verdict).toBe('NOT WEAKENED');
+      const prod = await compute([d2()], options('prod', { readCard: due(), now: NOW }));
+      expect(prod.verdict).toBe('WEAKENED');
+      expect(ids(prod.blocks)).toEqual(['f1']);
+      // The default stage is prerelease; an omitted stage keeps prerelease behaviour.
+      expect((await compute([d2()], { raceBlockPaths: [], rulings: [], readCard: due(), now: NOW })).verdict).toBe('NOT WEAKENED');
     });
   });
 

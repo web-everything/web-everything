@@ -6453,6 +6453,8 @@ newly blocking/unresolved result invalidate clearance and require a new audit or
 a previous block is never automatically cleared by a settings change.
 The model's opening verdict is informational. Every shipped finding retains a card record, including
 advisory and accepted risk; D2 carries `mustPayBefore: prod` and the requirement that its card exist on main.
+The pay-by date is read only from that card on main, never from the model finding; an overdue date blocks,
+and a card due `prod` blocks once `releaseStage` is `prod`.
 A D2 with introduced/newly-relied-on exposure cannot defer as untouched debt. A prod contract requirement
 must be classified as the corresponding defect, rather than hidden as D3.
 
@@ -6481,6 +6483,9 @@ the exact original base/head. Never use 2-of-3 full-audit voting. A concrete inp
 D1 to B/E; explicit advisory D3 is possible after investigation. Failed reproduction cannot downgrade a B
 class. Unavailable, malformed, timeout, identity mismatch, still-D1 or contradictory results retain unresolved
 evidence for retry or human adjudication. Resolving one finding does not clear any separate block.
+The re-check is bound to the finding's full fingerprint: id, file, line, invariant, class, relation,
+trigger, consequence, card, ruling and hunk. A re-check that changes any of them is void, except that a
+D1 → D3 downgrade may restate the trigger.
 
 **Settings and prod trigger.** `review.releaseStage` in `scripts/review-settings.json` defaults to
 `prerelease` when omitted, including historical files. Only exact `prerelease` / `prod` tokens are accepted;

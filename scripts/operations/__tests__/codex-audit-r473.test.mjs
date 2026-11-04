@@ -307,6 +307,8 @@ describe('R473 recheck fingerprint binding (D-R451)', () => {
     ['relation', { relation: 'untouched' }], ['class', { class: 'E2' }],
     ['id', { id: 'other' }], ['file', { file: 'scripts/else.mjs' }], ['invariant', { invariant: 'Something else' }],
     ['hunkHash', { hunkHash: 'f'.repeat(64) }],
+    ['line', { line: 13 }], ['consequence', { consequence: 'Milder cosmetic output' }],
+    ['card', { card: 'backlog/9999-swapped.md' }], ['ruling', { ruling: 'R-swapped' }],
   ])('a recheck that changes %s is void and the original stands', async (_name, change) => {
     const claim = finding({ class: 'D1', trigger: null });
     const f = fixture([claim], { recheck: vi.fn(async x => ({ ...x, class: 'D3', trigger: 'Swapped', ...change })) });
@@ -317,6 +319,22 @@ describe('R473 recheck fingerprint binding (D-R451)', () => {
   it('a same-fingerprint D1 to D3 downgrade clears with a card', async () => {
     const f = fixture([finding({ class: 'D1', trigger: null })]);
     expect(await main(ARGS, f.deps)).toBe(0);
+  });
+  // Same-class keep path (no D1 downgrade): the trigger is bound too, so a disputed finding cannot be
+  // cleared by a recheck that swaps any evidence column; only the downgrade may restate the trigger.
+  it.each([
+    ['trigger', { trigger: 'Swapped trigger' }], ['line', { line: 13 }],
+    ['consequence', { consequence: 'Milder cosmetic output' }], ['card', { card: 'backlog/9999-swapped.md' }],
+  ])('a same-class recheck of a disputed finding that changes %s is void (stays X2)', async (_name, change) => {
+    const f = fixture([finding({ disputed: true })], { recheck: vi.fn(async x => ({ ...x, disputed: false, ...change })) });
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.result().recheck).toContainEqual(expect.objectContaining({ id: 'f1', class: 'X2' }));
+    expect(f.result().ships).toEqual([]);
+  });
+  it('a same-class recheck of a disputed finding that keeps every evidence column clears', async () => {
+    const f = fixture([finding({ disputed: true })], { recheck: vi.fn(async x => ({ ...x, disputed: false })) });
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.result().ships).toContainEqual(expect.objectContaining({ id: 'f1', class: 'E1' }));
   });
   it('uses deps.hunkHash when supplied and binds to it', async () => {
     const f = fixture([finding({ class: 'D1', trigger: null })], { recheck: vi.fn(async x => ({ ...x, class: 'D3', hunkHash: 'a'.repeat(64) })) });
