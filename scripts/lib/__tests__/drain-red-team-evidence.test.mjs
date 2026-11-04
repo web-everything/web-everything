@@ -574,6 +574,14 @@ describe('bounded review evidence scans', () => {
     const result = readDrainRedTeamEvidence({ ...f, ...big, read: id => id === 'review-pr-4999' ? panel : null });
     expect(result).toMatchObject({ ok: false, reason: 'scan-capped' });
   });
+  it('drain holds an uncarried status head whose exact-head review the window omitted', () => {
+    const f = fixture();
+    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'ran' }, f);
+    // The newest run reviewed another head; the head's own review (and any re-review after it) lies past the cap.
+    const other = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload('d'.repeat(40)), ...startedAt(4999 * 10_000 - 1000) };
+    const result = readDrainRedTeamEvidence({ ...f, ...big, read: id => id === 'review-pr-4999' ? other : null });
+    expect(result).toMatchObject({ ok: false, reason: 'scan-capped' });
+  });
   it('drain holds a status written before records the window omitted', () => {
     const f = fixture(), from = 'c'.repeat(40);
     recordRedTeamStatus({ ...f, loopPayload: { ...payload(f.head), carriedFrom: from }, status: 'finished', result: 'skipped' }, f);

@@ -80,7 +80,8 @@ const TIE_ORDERS = ['id-asc', 'id-desc'];
 // With no exact-head match, a capped scan still answers when the window provably holds the answer:
 // the any-head query once the newest same-PR run started after every unread record was written,
 // and the exact-head query for "nothing written after `writtenAfter`" once, in addition, every
-// unread record was written at or before that time. Anything else holds as `scan-capped`.
+// unread record was written at or before that time and the newest run reviewed `newestHead`
+// (a carried head's source). Anything else holds as `scan-capped`.
 // One scan serves both tie orders, so a caller's fallback shares this scan's parse budget.
 function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak = 'id-asc', scanSettings, warn, now = Date.now() }) {
   if (!TIE_ORDERS.includes(tieBreak)) throw new TypeError('unknown run tieBreak');
@@ -120,7 +121,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     });
     scan = { slots, startless, count, end, newestSettled, boundary };
   };
-  const failureFor = (order, exactHead, writtenAfter) => {
+  const failureFor = (order, exactHead, writtenAfter, newestHead) => {
     const { newest, exact, unfinished } = scan.slots[order];
     const selected = exact ?? newest;
     const selectedStart = selected ? reviewStartedAt(selected) : NaN;
@@ -134,15 +135,17 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     }
     if (scan.end?.ok !== false) return null;
     // Capped: usable only when no unread record can change this query's answer (see above).
-    if (exact === null && scan.newestSettled
-      && (!exactHead || (Number.isFinite(writtenAfter) && scan.boundary <= writtenAfter))) return null;
+    // The exact-head relaxation also needs the newest run to be the named head's review (the
+    // carried-from panel): an unread exact-head run could otherwise hide an unread unfinished re-review.
+    if (exact === null && scan.newestSettled && (!exactHead || (Number.isFinite(writtenAfter) && scan.boundary <= writtenAfter
+      && typeof newestHead === 'string' && newest.run.findings?.read?.netBasis?.rev === newestHead))) return null;
     return scan.end;
   };
-  return (exactHead = true, order = tieBreak, { writtenAfter } = {}) => {
+  return (exactHead = true, order = tieBreak, { writtenAfter, newestHead } = {}) => {
     if (!TIE_ORDERS.includes(order)) throw new TypeError('unknown run tieBreak');
     if (!scan) runScan();
-    const key = `${order}|${exactHead}|${writtenAfter}`;
-    if (!failures.has(key)) failures.set(key, failureFor(order, exactHead, writtenAfter));
+    const key = `${order}|${exactHead}|${writtenAfter}|${newestHead}`;
+    if (!failures.has(key)) failures.set(key, failureFor(order, exactHead, writtenAfter, newestHead));
     const slot = scan.slots[order];
     return failures.get(key) ?? (exactHead ? slot.exact : slot.newest) ?? { run: null, at: 0 };
   };
@@ -351,7 +354,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     }
   }
   if (status?.repo === repo && Number(status.pr) === Number(pr) && status.head === head) {
-    const latest = latestRun(true, undefined, { writtenAfter: statusAt });
+    const latest = latestRun(true, undefined, { writtenAfter: statusAt, newestHead: carriedFrom });
     if (latest.ok === false) return latest;
     // A finished status from an earlier review of this same head never supersedes a newer accepting run (a re-review
     // of an unchanged head labels its accept before its job writes `queued`).
