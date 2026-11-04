@@ -811,7 +811,7 @@ describe('abandoned and start-less review runs have a defined outcome', () => {
   });
   it.each(both)('%s never treats a run still waiting on a pending step or effect as abandoned', (_name, reader) => {
     const f = fixture();
-    for (const waiting of [{ pending: { kind: 'judge' } }, { effects: [{ status: 'in-flight' }] }]) {
+    for (const waiting of [{ pending: { kind: 'judge' } }, { effects: [{ status: 'pending' }] }, { effects: [{ status: 'in-flight' }] }]) {
       const { args } = setup(f, a => ({ ...a, verdict: null, ...waiting, ...started(15_000) }), 20_000);
       expect(reader({ ...args, now: 20_000 + 30 * 24 * HOUR })).toEqual({ ok: false, reason: 'review-unfinished' });
     }
