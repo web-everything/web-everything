@@ -261,3 +261,41 @@ it('an unwritable author memo is reported (once), not swallowed', async () => {
     expect(warns).toHaveLength(1);
   } finally { err.mockRestore(); if (prev === undefined) delete process.env.WE_PR_SNAPSHOT_DIR; else process.env.WE_PR_SNAPSHOT_DIR = prev; rmSync(dir, { recursive: true, force: true }); }
 });
+
+describe('author lookup: a gh call TIMEOUT defers like a slot throttle; the default limits are pinned', () => {
+  const timedOut = () => Object.assign(new Error('spawnSync gh ETIMEDOUT'), { code: 'ETIMEDOUT', signal: 'SIGKILL', status: null, stderr: '' });
+  it('an 8 s call timeout (ETIMEDOUT / SIGKILL) defers the whole read, never a hard pr-author-unreadable', async () => {
+    const { withRestAuthors } = await import('../reconcile-pass.mjs');
+    for (const err of [timedOut(), Object.assign(new Error('killed'), { signal: 'SIGKILL', status: null }),
+      Object.assign(new Error('x'), { stderr: 'context deadline exceeded (Client.Timeout exceeded)' })]) {
+      let thrown;
+      try { withRestAuthors([{ number: 9700 + Math.floor(Math.random() * 1e4) }], { repo: 'o/r', readRest: () => { throw err; } }); } catch (e) { thrown = e; }
+      expect(thrown?.authorLookupDeferred).toBe(true);
+      expect(thrown?.code).not.toBe('pr-author-unreadable');
+    }
+  });
+  it('a read-through timeout in defaultReadPrs returns the deferred marker (retry next tick)', async () => {
+    const { defaultReadPrs } = await import('../reconcile-pass.mjs');
+    const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
+    const out = defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readCommits: () => [],
+      readShared: () => [{ number: 9801, labels: [], comments: [], statusCheckRollup: [] }], readRest: () => { throw timedOut(); },
+      retryOpts: { sleep: () => {}, persist: false, onEvent: () => {} } });
+    expect(out.deferred).toBe(true);
+  });
+  it('a genuine non-timeout failure (HTTP 404) still fails closed', async () => {
+    const { withRestAuthors } = await import('../reconcile-pass.mjs');
+    expect(() => withRestAuthors([{ number: 9802 }], { repo: 'o/r', readRest: () => { throw Object.assign(new Error('x'), { stderr: 'HTTP 404: Not Found' }); } })).toThrow(/author/);
+  });
+  it('pins the default limits: 16 lookups, 12 s total, 8 s per call (passed to the REST reader)', async () => {
+    const m = await import('../reconcile-pass.mjs');
+    expect(m.AUTHOR_LOOKUP_BUDGET).toBe(16);
+    expect(m.AUTHOR_LOOKUP_DEADLINE_MS).toBe(12_000);
+    expect(m.AUTHOR_LOOKUP_TIMEOUT_MS).toBe(8_000);
+    const rest = vi.fn(() => ({ json: { user: { login: 'u', type: 'User' } } }));
+    const rows = Array.from({ length: 17 }, (_, i) => ({ number: 9900 + i }));
+    let err; try { m.withRestAuthors(rows, { repo: 'o/r', readRest: rest }); } catch (e) { err = e; }
+    expect(err?.authorLookupDeferred).toBe(true);   // the 17th lookup is over the default budget
+    expect(rest).toHaveBeenCalledTimes(16);
+    expect(rest.mock.calls[0][1].execOpts.timeout).toBe(8_000);
+  });
+});
