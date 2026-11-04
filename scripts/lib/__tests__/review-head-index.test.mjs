@@ -53,15 +53,35 @@ describe('durability and growth', () => {
     for (let i = 2; i < 400; i++) rec({ pr: i, head: H(i % 9), netPatchHash: `p${i}` });
     expect(headReviewOwed({ index: readHeadIndex({ dir }), repo: 'o/r', pr: 1, head: H(1) }).reason).toBe('same-head');
   });
-  it('atomic write order: log append is durable before the map temp write, then rename', () => {
+  it('atomic write order: log append fsynced before the map temp write, temp fsynced before rename', () => {
     const ops = [];
+    const kind = p => (String(p).endsWith('.tmp') ? 'tmp' : 'log');
     const fs = { ...nodeFs,
-      appendFileSync: (p, ...a) => { ops.push('append'); return nodeFs.appendFileSync(p, ...a); },
-      writeFileSync: (p, ...a) => { ops.push(`write:${String(p).endsWith('.tmp') ? 'tmp' : 'other'}`); return nodeFs.writeFileSync(p, ...a); },
+      openSync: (p, f) => { ops.push(`open:${f}:${kind(p)}`); return nodeFs.openSync(p, f); },
+      fsyncSync: fd => { ops.push('fsync'); return nodeFs.fsyncSync(fd); },
       renameSync: (a, b) => { ops.push('rename'); return nodeFs.renameSync(a, b); } };
     rec({ fs });
-    expect(ops).toEqual(['append', 'write:tmp', 'rename']);
+    expect(ops).toEqual(['open:a:log', 'fsync', 'open:w:tmp', 'fsync', 'rename']);
     expect(existsSync(headIndexPaths(dir).map)).toBe(true);
+  });
+  it('a cached map with an invalid entry is rebuilt from the log, never trusted', () => {
+    rec(); rec({ head: H(2), netPatchHash: 'p2' });
+    const { map: mp, log } = headIndexPaths(dir);
+    const stored = JSON.parse(readFileSync(mp, 'utf8'));
+    stored.map['o/r#7'] = { lastReviewedHead: H(2) };
+    writeFileSync(mp, JSON.stringify({ ...stored, logBytes: nodeFs.statSync(log).size }));
+    const d = headReviewOwed({ index: readHeadIndex({ dir }), repo: 'o/r', pr: 7, head: H(2) });
+    expect(d).toMatchObject({ owed: false, verdict: 'accept' });
+  });
+  it('compaction keeps keyless reviews and the current verdict exactly', () => {
+    rec({ netPatchHash: 'p1', verdict: 'accept', at: '2026-11-04T10:00:01Z', logMaxLines: 2 });
+    rec({ netPatchHash: null, verdict: 'reject', at: '2026-11-04T10:00:02Z', logMaxLines: 2 });
+    rec({ head: H(2), netPatchHash: null, verdict: 'accept', at: '2026-11-04T10:00:03Z', logMaxLines: 2 });
+    const before = readHeadIndex({ dir }).map;
+    const rebuilt = JSON.parse(JSON.stringify(before));
+    writeFileSync(headIndexPaths(dir).map, '{{');
+    expect(readHeadIndex({ dir }).map).toEqual(rebuilt);
+    expect(headReviewOwed({ index: readHeadIndex({ dir }), repo: 'o/r', pr: 7, head: H(2) })).toMatchObject({ owed: false, verdict: 'accept' });
   });
   it('a crash between append and rename is recovered from the log, not lost', () => {
     const fs = { ...nodeFs, renameSync: () => { throw Error('crash'); } };
