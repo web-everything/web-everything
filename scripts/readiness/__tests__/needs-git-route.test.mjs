@@ -39,6 +39,20 @@ describe('sourceNeedsGit', () => {
     expect(sourceNeedsGit(G + 'let r = f(i) / 2;' + spawn + ' // see /x')).toBe(true);
     expect(sourceNeedsGit(G + "const a=`${ '`' }`; const u='http://x';" + spawn)).toBe(true);
     expect(sourceNeedsGit(G + "const a=`x${ `y${ '}' }` }z`; const u='http://x';" + spawn)).toBe(true);
+    // `}` closing an object literal / expression is an operand: the next `/` divides. `}` closing a block is not.
+    const tail = " execFileSync('git', ['rev-parse']); const path = '/tmp';";
+    const E = "import {execFileSync} from 'node:child_process'; ";
+    expect(sourceNeedsGit(E + 'const ratio = {valueOf: () => 10} / 2;' + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'const r = ({a: 1}).a / 2;' + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'const r = [{}, {a: {}}] / 2;' + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'const r = f({a: 1} / 2);' + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'x = cond ? {} / 2 : {} / 3;' + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'function g() { return {a: 1} / 2; }' + tail)).toBe(true);
+    expect(sourceNeedsGit(E + 'const s = `${ {valueOf: () => 1} / 2 }`;' + tail)).toBe(true);
+    expect(sourceNeedsGit(E + "if (x) {}\n/'/.test(a); const u = 'http://x';" + tail)).toBe(true);
+    expect(sourceNeedsGit(E + "const f = () => {}\n/'/.test(a); const u = 'http://x';" + tail)).toBe(true);
+    expect(sourceNeedsGit(E + "class A { m() {} }\n/'/.test(a); const u = 'http://x';" + tail)).toBe(true);
+    expect(sourceNeedsGit(E + "else {}\n/'/.test(a); const u = 'http://x';" + tail)).toBe(true);
     // a quote/backtick/brace inside a regex literal in a `${ }` hole does not end the hole early
     expect(sourceNeedsGit(G + "function f() {\n  const a = `${ s.replace(/\"/g, '\\\\\"') }`;\n}\nconst b = `**/*.js`;" + spawn)).toBe(true);
     expect(sourceNeedsGit(G + "it('a', () => { const c = `${s.replace(/`/g, '')}`; const g = `**/*.js`;" + spawn + ' });')).toBe(true);

@@ -55,11 +55,23 @@ function regexEnd(t, i) {
   while (j < n && isIdent(t[j])) j++;
   return j;
 }
+// Does a `{` after this token open an object literal / expression (so its `}` is an operand and a following `/`
+// divides) rather than a block (whose `}` ends a statement, so a following `/` starts a regex)? An arrow body
+// (`=> {`), a `)` head (`if (x) {`, `function f() {`), a statement start and a class/else/do body are blocks.
+const EXPR_BRACE_AFTER = '=(,:[?!&|+-*%<>~^';
+function braceOpensExpr(last, prev, word) {
+  if (last === '') return false;
+  if (isIdent(last)) return REGEX_AFTER_WORD.has(word) && word !== 'else' && word !== 'do';
+  if (last === '>' && prev === '=') return false;
+  return EXPR_BRACE_AFTER.includes(last);
+}
 function holeEnd(t, i, depth) {
   const n = t.length;
   let j = i;
-  let braces = 0;
-  let last = ''; // last significant character, to tell a regex literal from a division
+  const braces = []; // per open `{`: does it open an expression (object literal)?
+  let exprClose = false; // the last token was the `}` of such a brace
+  let last = '('; // last significant character, to tell a regex literal from a division; a hole starts an expression
+  let prev = '';
   let wordStart = 0;
   let noCloseUntil = -1;
   while (j < n) {
@@ -70,17 +82,21 @@ function holeEnd(t, i, depth) {
     if (c === '/' && t[j + 1] === '*') { const e = t.indexOf('*/', j + 2); j = e < 0 ? n : e + 2; continue; }
     if (c === '/') {
       const w = isIdent(last) && j - wordStart <= MAX_WORD ? t.slice(wordStart, j).trimEnd() : '';
-      const regexOk = j >= noCloseUntil && (last === '' || (isIdent(last) ? REGEX_AFTER_WORD.has(w) : !')]\'"`'.includes(last)));
+      const regexOk = j >= noCloseUntil && (last === '' || (isIdent(last) ? REGEX_AFTER_WORD.has(w)
+        : last === '}' ? !exprClose : !')]\'"`'.includes(last)));
       const e = regexOk ? regexEnd(t, j) : 0;
-      if (e > 0) { j = e; last = '0'; wordStart = j; continue; }
+      if (e > 0) { j = e; prev = last; last = '0'; exprClose = false; wordStart = j; continue; }
       if (e < 0) noCloseUntil = -e - 2; // no closing `/` before here: later `/` on this line are divisions (no rescans)
-      last = c; j++; continue;
+      prev = last; last = c; exprClose = false; j++; continue;
     }
-    if (c === '{') braces++;
-    else if (c === '}') { if (braces === 0) return j + 1; braces--; }
+    let closesExpr = false;
+    if (c === '{') braces.push(braceOpensExpr(last, prev, isIdent(last) && j - wordStart <= MAX_WORD ? t.slice(wordStart, j).trimEnd() : ''));
+    else if (c === '}') { if (braces.length === 0) return j + 1; closesExpr = braces.pop(); }
     if (!/\s/.test(c)) {
       if (isIdent(c) && !isIdent(last)) wordStart = j;
+      prev = last;
       last = c;
+      exprClose = closesExpr;
     }
     j++;
   }
@@ -99,7 +115,9 @@ export function stripComments(t) {
   let ctrlParen = false; // the last token was the `)` closing such a head
   let noCloseUntil = -1; // a regex scan already found no closing `/` before this index: don't rescan the line
   const word = () => (isIdent(last) && wordEnd - wordStart <= MAX_WORD ? t.slice(wordStart, wordEnd) : '');
-  const emit = (s, sig) => { out += s; prev = last; last = sig; ctrlParen = false; };
+  const braces = []; // per open `{`: does it open an expression (object literal)? see braceOpensExpr
+  let exprClose = false; // the last token was the `}` of such a brace: an operand, so a following `/` divides
+  const emit = (s, sig) => { out += s; prev = last; last = sig; ctrlParen = false; exprClose = false; };
   while (i < n) {
     const c = t[i];
     const d = t[i + 1];
@@ -119,7 +137,8 @@ export function stripComments(t) {
       else if (last === ')') regexOk = ctrlParen;
       else if (last === ']' || last === '"' || last === "'" || last === '`') regexOk = false;
       else if ((last === '+' || last === '-') && prev === last) regexOk = false; // postfix ++ / --
-      else regexOk = true; // operator, `(`, `,`, `=`, `{`, `;`, and `}` (end of a block)
+      else if (last === '}') regexOk = !exprClose; // end of a block starts a statement; end of an object literal is an operand
+      else regexOk = true; // operator, `(`, `,`, `=`, `{`, `;`
       if (regexOk) {
         let j = i + 1;
         let cls = false;
@@ -149,7 +168,10 @@ export function stripComments(t) {
       continue;
     }
     if (c === '(') stack.push(PAREN_KEYWORD.has(word()));
+    const opensExpr = c === '{' ? braceOpensExpr(last, prev, word()) : false;
     emit(c, c);
+    if (c === '{') braces.push(opensExpr);
+    if (c === '}') exprClose = braces.pop() ?? false;
     if (c === ')') ctrlParen = stack.pop() ?? false;
     i++;
   }
