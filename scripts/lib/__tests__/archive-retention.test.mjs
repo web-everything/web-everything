@@ -466,6 +466,18 @@ it('a record atomically replaced after verification survives with the production
     afterSourceStat: async path => { await writeFile(path + '.n', 'late-writer-bytes'); await rename(path + '.n', path); } });
   expect(await readFile(p, 'utf8')).toBe('late-writer-bytes');
 });
+it('bytes written through an already-open descriptor after quarantine verification survive (production provider)', async () => {
+  const { createRunsWriterExclusion } = await import('../runs-writer-exclusion.mjs');
+  const p = join(runs, 'fd.json'); await writeFile(p, rec); await utimes(p, old, old);
+  const fh = await open(p, 'a'); // a writer that opened the record before the archiver started
+  let out;
+  try {
+    out = await realRun({ isComplete: () => true, withSourceWriterExclusion: createRunsWriterExclusion(),
+      afterQuarantineVerify: async () => { await fh.appendFile('LATE-FD-BYTES'); } });
+  } finally { await fh.close(); }
+  expect(await exists(p)).toBe(true); expect(await readFile(p, 'utf8')).toBe(rec + 'LATE-FD-BYTES');
+  expect(out.filesRetained).toBeGreaterThan(0); expect(out.bytesFreed).toBe(0);
+});
 it('a record replaced just before removal is restored, not deleted', async () => {
   const p = await file(join(runs, 'r.json'));
   const out = await run({ afterSourceStat: async path => { await writeFile(path + '.n', 'newer-bytes'); await rename(path + '.n', path); } });

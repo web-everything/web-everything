@@ -294,6 +294,11 @@ export async function archiveRetention(o = {}) {
               await rename(f.path, parked);
               const q = await lstat(parked);
               if (!(q.isFile() && (!f.hash || createHash('sha256').update(await readFile(parked)).digest('hex') === f.hash) && q.dev === f.stat.dev && q.ino === f.stat.ino && q.size === f.stat.size && q.mtimeMs === f.stat.mtimeMs)) { await restore(parked, f.path); return; }
+              // A writer holding a descriptor opened earlier can still append to the parked inode after the hash above:
+              // re-stat right before unlink and restore the record if it changed. (Only the instants between this stat
+              // and unlink remain open; a kernel-level lock would be needed to close them, see the operator error.)
+              await o.afterQuarantineVerify?.(parked);
+              if (!same(q, await lstat(parked))) { await restore(parked, f.path); return; }
               await unlink(parked);
               removed = true;
               out.bytesFreed += f.stat.size;
