@@ -114,7 +114,9 @@ describe('free-lane list is refreshed by lane-pool events', () => {
     expect(runPool(['release', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json']).code).toBe(0);
     writeFileSync(join(laneDir(lane), 'file.txt'), 'edited after publication\n'); // dirties a tracked file
     writeFileSync(listFile(), JSON.stringify({ v: 1, writtenAt: Date.now(), repo: 'freepool', poolDir: null, lanes: [{ lane, at: Date.now() }] }));
-    const r = runPool(['acquire', ...poolArgs(), '--no-reset', '--session=other', '--json']);
+    // `--hard-max=1` caps pool growth: with the only lane dirty and refused, an uncapped acquire would fall through to
+    // the scan and then PROVISION a new lane (a full clone — minutes under CI load, which stalled a whole unit shard).
+    const r = runPool(['acquire', ...poolArgs(), '--no-reset', '--session=other', '--hard-max=1', '--json']);
     expect(r.code).not.toBe(0);
     expect(readFileSync(join(laneDir(lane), 'file.txt'), 'utf8')).toBe('edited after publication\n');
   });
