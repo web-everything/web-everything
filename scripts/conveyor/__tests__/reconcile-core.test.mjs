@@ -2685,8 +2685,9 @@ describe('case 6 — the discovery queries, pinned literally (#3296)', () => {
     ]);
   });
 
-  it('an empty listing is an empty array, not a throw — and yields an empty plan, not a silent one', () => {
-    expect(defaultReadPrs({ exec: () => '' })).toEqual([]);
+  it('a real empty listing is an empty array, not a throw — and yields an empty plan, not a silent one', () => {
+    expect(defaultReadPrs({ exec: () => '[]' })).toEqual([]);
+    expect(() => defaultReadPrs({ exec: () => '' })).toThrow(/empty output/); // fail closed: silence is not an empty inventory
     expect(planReconcile({ prs: [], agents: [], durableCounts: {}, now: NOW }))
       .toEqual({ dispatch: [], refusals: [], notes: [] });
   });
