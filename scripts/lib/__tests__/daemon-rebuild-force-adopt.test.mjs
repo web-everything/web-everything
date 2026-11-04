@@ -18,6 +18,7 @@ import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs'
 import { defaultPoolRoot } from '../lane-pool-paths.mjs';
 import { DISPATCH_CWD_ENV } from '../../operations/dispatch-lane-io.mjs';
 import { requestForceAdopt, readForceWatch, runForceWatchTick, readForceAdopt } from '../daemon-force-adopt.mjs';
+import { readReadyCandidate } from '../daemon-rebuild/state.mjs';
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
@@ -154,6 +155,38 @@ describe('R508 force-adopt through rebuildClone', () => {
     expect(readForceWatch(cloneDir, env)).toBeNull();
   });
 
+  it('does not adopt when the coroner sink cannot be written, retracts the log, and leaves no adoptable ready candidate', async () => {
+    const { base, originDir, cloneDir, env: env0 } = makeFixture();
+    writeFileSync(join(base, 'blocker'), 'x');
+    const env = { ...forceEnv(env0, base), WE_FORCE_ADOPT_CORONER: join(base, 'blocker', 'coroner.jsonl'), WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' };
+    const lastGood = headOf(cloneDir);
+    advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n'));
+    requestForceAdopt({ root: cloneDir, env, daemon: 'review', ruling: 'R508', quote: QUOTE, rulingsText: RULINGS });
+    const r = await rebuildClone({ root: cloneDir, env, runSmoke: failing(), prState: async () => null, lockOpts: LOCK_OPTS });
+    expect(r.moved).not.toBe(true);
+    expect(r.reason).toBe('force-adopt-refused');
+    expect(headOf(cloneDir)).toBe(lastGood);
+    expect(readForceWatch(cloneDir, env)).toBeNull();
+    expect(readReadyCandidate(cloneDir, env)).toBeNull();
+    expect(readForceAdopt(cloneDir, env)).toBeNull(); // consumed, so the next tick does not re-log "adopting"
+    expect(readFileSync(env.WE_FORCE_ADOPT_HANDOFF, 'utf8')).toMatch(/NOT adopted[^\n]*audit-sink-failed/);
+  });
+
+  it('the default health probe fails closed: a clone whose entry module cannot load is rolled back', async () => {
+    const { base, originDir, cloneDir, env: env0 } = makeFixture();
+    const env = forceEnv(env0, base);
+    const lastGood = headOf(cloneDir);
+    advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n'));
+    requestForceAdopt({ root: cloneDir, env, daemon: 'review', ruling: 'R508', quote: QUOTE, rulingsText: RULINGS });
+    await rebuildClone({ root: cloneDir, env, runSmoke: failing(), prState: async () => null, lockOpts: LOCK_OPTS });
+    expect(headOf(cloneDir)).not.toBe(lastGood);
+    // No forceWatchProbe injected: the fixture clone has no scripts/lib/daemon-rebuild.mjs, so the default probe is unhealthy.
+    await rebuildClone({ root: cloneDir, env, runSmoke: vi.fn(async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } })),
+      prState: async () => null, lockOpts: LOCK_OPTS });
+    expect(headOf(cloneDir)).toBe(lastGood);
+    expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8')).toMatch(/force-adopt-rolled-back/);
+  });
+
   it('a request without a ruling is refused and changes nothing', () => {
     const { cloneDir, env } = makeFixture();
     expect(requestForceAdopt({ root: cloneDir, env, daemon: 'review', quote: QUOTE, rulingsText: RULINGS }).ok).toBe(false);
@@ -171,8 +204,12 @@ describe('R508 force-adopt through rebuildClone', () => {
     expect(runSmoke).toHaveBeenCalled(); // smoke is never skipped
     expect(r.moved).toBe(true);
     expect(headOf(cloneDir)).not.toBe(lastGood);
-    expect(readFileSync(env.WE_FORCE_ADOPT_HANDOFF, 'utf8')).toMatch(/FORCE-ADOPT.*R508.*daemon-entries-boot|FORCE-ADOPT.*R508/s);
-    expect(readFileSync(env.WE_FORCE_ADOPT_CORONER, 'utf8')).toMatch(/force-adopt-review/);
+    // The failed check's NAME is recorded next to the force: it comes from smoke.mjs mapping the real smoke rows.
+    expect(readFileSync(env.WE_FORCE_ADOPT_HANDOFF, 'utf8')).toMatch(/FORCE-ADOPT [^\n]*R508: adopting [^\n]*\(failed: daemon-entries-boot\)/);
+    const coroner = JSON.parse(readFileSync(env.WE_FORCE_ADOPT_CORONER, 'utf8').trim().split('\n')[0]);
+    expect(coroner).toMatchObject({ kind: 'force-adopt-review', ruling: 'R508', smoke: { failed: ['daemon-entries-boot'] } });
+    const forceEvent = readFileSync(env.WE_DAEMON_EVENTS, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)).find((e) => e.kind === 'force-adopt');
+    expect(forceEvent.detail.smoke.failed).toEqual(['daemon-entries-boot']);
     expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8')).toMatch(/"kind":"force-adopt"/);
     expect(readForceAdopt(cloneDir, env)).toBeNull(); // one-shot
     expect(readForceWatch(cloneDir, env)).not.toBeNull(); // opened now, first checked on the NEXT tick

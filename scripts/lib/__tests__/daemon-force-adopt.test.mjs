@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { writeReadyCandidate, readReadyCandidate } from '../daemon-rebuild/state.mjs';
 import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,7 +8,8 @@ import {
   evaluateForceWatch, runForceWatchTick,
 } from '../daemon-force-adopt.mjs';
 
-const RULINGS = '## R508 — 2026-11-03\nOperator "Yes": adopt the build now even though smoke failed.\n\n## R509 — x\nother words\n';
+const RULINGS = '## R508 — 2026-11-03\nOperator "Yes": adopt the build now even though smoke failed.\n\n## R509 — x\nother words\nthe exclusive phrase lives only in nine\n';
+const R509_ONLY = 'the exclusive phrase lives only in nine'; // >= 12 chars, present in R509 and nowhere in R508
 const QUOTE = 'adopt the build now even though smoke failed';
 let dir; let env; let root;
 beforeEach(() => {
@@ -34,6 +36,10 @@ describe('validateForceAdopt', () => {
   it('refuses a quote that is not verbatim in THAT ruling (even if in another)', () => {
     expect(validateForceAdopt({ daemon: 'review', ruling: 'R508', quote: 'other words entirely here', rulingsText: RULINGS })).toMatchObject({ ok: false, reason: 'quote-not-in-ruling' });
     expect(validateForceAdopt({ daemon: 'review', ruling: 'R508', quote: 'other words', rulingsText: RULINGS })).toMatchObject({ ok: false });
+  });
+  it('ruling-section isolation: a quote present only in R509 is refused for R508 and accepted for R509', () => {
+    expect(validateForceAdopt({ daemon: 'review', ruling: 'R508', quote: R509_ONLY, rulingsText: RULINGS })).toMatchObject({ ok: false, reason: 'quote-not-in-ruling' });
+    expect(validateForceAdopt({ daemon: 'review', ruling: 'R509', quote: R509_ONLY, rulingsText: RULINGS })).toEqual({ ok: true });
   });
   it('accepts ruling + verbatim quote', () => {
     expect(validateForceAdopt({ daemon: 'review', ruling: 'R508', quote: QUOTE, rulingsText: RULINGS })).toEqual({ ok: true });
@@ -73,10 +79,37 @@ describe('recordForcedAdoption sinks', () => {
     expect(r).toMatchObject({ ok: false, reason: 'audit-sink-failed' });
     expect(readForceWatch(root, env)).toBeNull();
   });
-  it('refuses when the handoff file cannot be written', async () => {
+  // Each audit sink in turn: a failure refuses the adoption, opens no watch, consumes the request (so no tick re-logs
+  // "adopting"), and retracts what the other sinks already recorded.
+  const sinkCases = [
+    ['daemon-events', () => ({}), { emit: async () => false }],
+    ['handoff', () => ({ WE_FORCE_ADOPT_HANDOFF: join(dir, 'blocker', 'x') }), {}],
+    ['coroner', () => ({ WE_FORCE_ADOPT_CORONER: join(dir, 'blocker', 'x') }), {}],
+  ];
+  it.each(sinkCases)('refuses, retracts and consumes the request when the %s sink fails', async (name, envOverride, extra) => {
     writeFileSync(join(dir, 'blocker'), 'x');
-    const r = await recordForcedAdoption({ ...args(), env: { ...env, WE_FORCE_ADOPT_HANDOFF: join(dir, 'blocker', 'x') }, emit: async () => true });
-    expect(r.ok).toBe(false);
+    const e = { ...env, ...envOverride() };
+    requestForceAdopt({ root, env: e, daemon: 'review', ruling: 'R508', quote: QUOTE, rulingsText: RULINGS });
+    expect(readForceAdopt(root, e)).not.toBeNull();
+    const events = [];
+    const r = await recordForcedAdoption({ ...args(), env: e, emit: async (ev) => { events.push(ev); return extra.emit ? extra.emit() : true; } });
+    expect(r).toMatchObject({ ok: false, reason: 'audit-sink-failed' });
+    expect(readForceWatch(root, e)).toBeNull();
+    expect(readForceAdopt(root, e)).toBeNull(); // consumed: the next tick cannot re-run it
+    if (name !== 'handoff') {
+      const handoff = readFileSync(e.WE_FORCE_ADOPT_HANDOFF, 'utf8');
+      expect(handoff).toMatch(/NOT adopted/);
+    }
+    if (name !== 'coroner') expect(readFileSync(e.WE_FORCE_ADOPT_CORONER, 'utf8')).toMatch(/force-adopt-aborted/);
+    expect(events.map((ev) => ev.kind)).toContain('force-adopt-aborted');
+  });
+  it('refuses with watch-write-failed (and retracts the logged adoption) when the durable watch cannot be written', async () => {
+    writeFileSync(join(dir, 'blocker'), 'x');
+    const e = { ...env, WE_DAEMON_STATE_DIR: join(dir, 'blocker', 'state') };
+    const r = await recordForcedAdoption({ ...args(), env: e, emit: async () => true });
+    expect(r).toMatchObject({ ok: false, reason: 'watch-write-failed' });
+    expect(readFileSync(env.WE_FORCE_ADOPT_HANDOFF, 'utf8')).toMatch(/adopting[\s\S]*NOT adopted[^\n]*watch-write-failed/);
+    expect(readFileSync(env.WE_FORCE_ADOPT_CORONER, 'utf8')).toMatch(/force-adopt-aborted/);
   });
   it('abort drops the watch and consumes the request', async () => {
     await recordForcedAdoption({ ...args(), emit: async () => true });
@@ -162,5 +195,39 @@ describe('runForceWatchTick', () => {
     const r = await runForceWatchTick({ root, env, probe: async () => ({ healthy: false }), rollback: async () => ({ ok: false }), emit: async () => {} });
     expect(r.action).toBe('rollback-failed');
     expect(readForceWatch(root, env)).not.toBeNull();
+  });
+  it('a failed rollback stays mandatory: later healthy probes never count the watch down or clear it', async () => {
+    await setup();
+    const rollback = vi.fn().mockResolvedValueOnce({ ok: false }).mockResolvedValueOnce({ ok: false }).mockResolvedValue({ ok: true });
+    const healthyTick = () => runForceWatchTick({ root, env, probe: async () => ({ healthy: true }), rollback, emit: async () => {} });
+    // tick 1: unhealthy + rollback fails. ticks 2..: healthy, but the owed rollback is retried (and fails once more).
+    expect((await runForceWatchTick({ root, env, probe: async () => ({ healthy: false }), rollback, emit: async () => {} })).action).toBe('rollback-failed');
+    expect(readForceWatch(root, env)).toMatchObject({ rollbackPending: 'health-failed', ticksLeft: 5 });
+    expect((await healthyTick()).action).toBe('rollback-failed');
+    expect(readForceWatch(root, env).ticksLeft).toBe(5); // never counted down
+    expect(await healthyTick()).toMatchObject({ action: 'rollback', reason: 'health-failed' });
+    expect(rollback).toHaveBeenCalledTimes(3);
+    expect(readForceWatch(root, env)).toBeNull();
+  });
+  it('an expired watch (forced build never became head) also drops its never-smoked ready candidate', async () => {
+    await setup();
+    const sha = 'b'.repeat(40);
+    expect(writeReadyCandidate(root, { adopt: { finalSha: sha }, prevHead: 'a'.repeat(40) }, env)).toBe(true);
+    const startedAt = Date.parse(readForceWatch(root, env).startedAt);
+    const events = [];
+    const r = await runForceWatchTick({ root, env, currentHead: 'a'.repeat(40), now: () => startedAt + 3 * 3600_000,
+      probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async (e) => { events.push(e); } });
+    expect(r.action).toBe('expired');
+    expect(readForceWatch(root, env)).toBeNull();
+    expect(readReadyCandidate(root, env)).toBeNull();
+    expect(events.map((e) => e.kind)).toContain('force-adopt-watch-expired');
+  });
+  it('an expired watch leaves a ready candidate for a DIFFERENT sha alone', async () => {
+    await setup();
+    writeReadyCandidate(root, { adopt: { finalSha: 'c'.repeat(40) }, prevHead: 'a'.repeat(40) }, env);
+    const startedAt = Date.parse(readForceWatch(root, env).startedAt);
+    await runForceWatchTick({ root, env, currentHead: 'a'.repeat(40), now: () => startedAt + 3 * 3600_000,
+      probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async () => {} });
+    expect(readReadyCandidate(root, env)).not.toBeNull();
   });
 });

@@ -1900,6 +1900,40 @@ describe('prototype-load', () => {
       expect(r2).toMatchObject({ ok: false, forceAdopt: { requested: false } });
       expect(mutations(f, 'add')).toEqual([]);
     });
+    describe('force-adopt (R508) positive and dry-run wiring', () => {
+      const QUOTE = 'adopt the build now even though smoke failed';
+      const forceFixture = (t) => {
+        const dir = mkdtempSync(join(tmpdir(), 'pl-force-'));
+        t.onTestFinished(() => rmSync(dir, { recursive: true, force: true }));
+        const rulings = join(dir, 'rulings.md');
+        writeFileSync(rulings, `## R508 — x\nOperator "Yes": ${QUOTE}.\n`);
+        const state = join(dir, 'state');
+        return { state, f: fixture({ list: [], ready: '', env: { WE_RULINGS_FILE: rulings, WE_DAEMON_STATE_DIR: state } }) };
+      };
+      const pending = (f, state) => {
+        const files = nodeFs.existsSync(state) ? nodeFs.readdirSync(state).filter((n) => n.endsWith('.force-adopt.json')) : [];
+        return files.map((n) => JSON.parse(nodeFs.readFileSync(join(state, n), 'utf8')));
+      };
+      it('a valid ruling + verbatim quote queues exactly one request and registers nothing', async (t) => {
+        const { f, state } = forceFixture(t);
+        const r = await f.run({ forceAdopt: true, ruling: 'R508', quote: QUOTE });
+        expect(r).toMatchObject({ ok: true, forceAdopt: { requested: true, dryRun: false, ruling: 'R508' } });
+        expect(pending(f, state)).toMatchObject([{ ruling: 'R508', quote: QUOTE }]);
+        expect(mutations(f, 'add')).toEqual([]);
+      });
+      it('--dry-run validates but arms nothing (requested:false, dryRun:true, no request file)', async (t) => {
+        const { f, state } = forceFixture(t);
+        const r = await f.run({ forceAdopt: true, ruling: 'R508', quote: QUOTE, dryRun: true });
+        expect(r).toMatchObject({ ok: true, forceAdopt: { requested: false, dryRun: true, ruling: 'R508' } });
+        expect(pending(f, state)).toEqual([]);
+      });
+      it('a dry run with a bad quote is still refused', async (t) => {
+        const { f, state } = forceFixture(t);
+        const r = await f.run({ forceAdopt: true, ruling: 'R508', quote: 'this quote is not in any ruling', dryRun: true });
+        expect(r).toMatchObject({ ok: false, forceAdopt: { requested: false, refused: 'quote-not-in-ruling' } });
+        expect(pending(f, state)).toEqual([]);
+      });
+    });
     it('declares the force-adopt operation inputs', () => {
       const op = prototypeLoadOperation();
       expect(Object.keys(op.input)).toEqual(expect.arrayContaining(['force-adopt', 'ruling', 'quote']));

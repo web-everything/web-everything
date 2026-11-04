@@ -12,7 +12,7 @@
 import { appendFileSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { stateDir } from './daemon-rebuild/state.mjs';
+import { stateDir, readReadyCandidate, clearReadyCandidate } from './daemon-rebuild/state.mjs';
 import { cloneKeyOf } from './daemon-last-good.mjs';
 
 export const FORCE_ADOPT_WATCH_TICKS = 5;
@@ -69,9 +69,11 @@ export function readForceAdopt(root, env = process.env, now = Date.now) {
   const r = readJson(requestPath(root, env));
   return r && Date.parse(r.expiresAt) > now() ? r : null;
 }
-export const clearForceAdopt = (root, env = process.env) => rmSync(requestPath(root, env), { force: true });
+// Best-effort: an unwritable/unreadable state dir (ENOTDIR, EACCES) must not turn a refusal into a throw.
+const removeQuietly = (p) => { try { rmSync(p, { force: true }); } catch { /* unreachable state dir: nothing to clear */ } };
+export const clearForceAdopt = (root, env = process.env) => removeQuietly(requestPath(root, env));
 export const readForceWatch = (root, env = process.env) => readJson(watchPath(root, env));
-const clearWatch = (root, env) => rmSync(watchPath(root, env), { force: true });
+const clearWatch = (root, env) => removeQuietly(watchPath(root, env));
 
 /** true only when the line really landed: a forced adoption refuses to proceed unless every audit sink wrote. */
 const appendLine = (p, line) => { try { mkdirSync(dirname(p), { recursive: true }); appendFileSync(p, line); return true; } catch { return false; } };
@@ -85,8 +87,18 @@ export async function recordForcedAdoption({ root, env = process.env, request, s
   const handed = appendLine(handoffFile(env), `- FORCE-ADOPT ${at} ${request.daemon} ${request.ruling}: adopting ${sha} though smoke ${smoke?.verdict ?? 'unknown'} `
     + `(failed: ${(smoke?.failed || []).join(',') || 'none'}); operator quote: "${request.quote}"; auto-rollback watch ${FORCE_ADOPT_WATCH_TICKS} ticks\n`);
   const coroned = appendLine(coronerFile(env), `${JSON.stringify({ kind: 'force-adopt-review', at, daemon: request.daemon, ruling: request.ruling, quote: request.quote, sha, lastGood: lastGood?.head ?? null, smoke: smoke ?? null })}\n`);
-  if (!(evented && handed && coroned)) return { ok: false, reason: 'audit-sink-failed' };
-  try { writeJson(watchPath(root, env), { daemon: request.daemon, ruling: request.ruling, sha, lastGood, ticksLeft: FORCE_ADOPT_WATCH_TICKS, bad: 0, startedAt: at }); } catch { return { ok: false, reason: 'watch-write-failed' }; }
+  // A sink that failed leaves the ones that landed claiming "adopting": retract them and consume the request, so a
+  // later tick cannot re-log "adopting" on every retry, and a reader of the log is not told an adoption is in progress.
+  const retract = async (reason) => {
+    appendLine(handoffFile(env), `- FORCE-ADOPT ${at} ${request.daemon} ${request.ruling}: NOT adopted ${sha} (${reason}); request consumed\n`);
+    appendLine(coronerFile(env), `${JSON.stringify({ kind: 'force-adopt-aborted', at, daemon: request.daemon, ruling: request.ruling, sha, reason })}\n`);
+    clearWatch(root, env);
+    clearForceAdopt(root, env);
+    try { await emit?.({ kind: 'force-adopt-aborted', daemon: request.daemon, detail: { ruling: request.ruling, sha, reason } }); } catch { /* best effort: the events sink may be the one that failed */ }
+    return { ok: false, reason };
+  };
+  if (!(evented && handed && coroned)) return retract('audit-sink-failed');
+  try { writeJson(watchPath(root, env), { daemon: request.daemon, ruling: request.ruling, sha, lastGood, ticksLeft: FORCE_ADOPT_WATCH_TICKS, bad: 0, startedAt: at }); } catch { return retract('watch-write-failed'); }
   clearForceAdopt(root, env);
   return { ok: true };
 }
@@ -101,6 +113,8 @@ export async function abortForcedAdoption({ root, env = process.env, request, sh
 
 /** PURE. One watch tick: fail closed on a failed health check or a crash loop, else count down. */
 export function evaluateForceWatch({ watch, healthy, restarts = 0, maxRestarts = FORCE_ADOPT_MAX_RESTARTS }) {
+  // A rollback that already failed stays mandatory: a later healthy probe must not forget it and count the watch down.
+  if (watch.rollbackPending) return { action: 'rollback', reason: watch.rollbackPending, watch };
   if (healthy !== true) return { action: 'rollback', reason: 'health-failed', watch };
   if (restarts >= maxRestarts) return { action: 'rollback', reason: 'crash-loop', watch };
   const ticksLeft = (watch.ticksLeft ?? 0) - 1;
@@ -118,7 +132,14 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   // Ticks only count once the forced build is really the running head (a ready-only job adopts a tick or more later).
   if (head !== null && head !== watch.sha) {
     if (watch.adoptedSeen) { clearWatch(root, env); await emit?.({ kind: 'force-adopt-watch-superseded', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, head } }); return { action: 'superseded' }; }
-    if (now() - Date.parse(watch.startedAt) > FORCE_ADOPT_TTL_MS) { clearWatch(root, env); return { action: 'expired' }; }
+    if (now() - Date.parse(watch.startedAt) > FORCE_ADOPT_TTL_MS) {
+      // The forced build never became head. Its ready candidate never passed smoke, so drop it too: left behind, a later
+      // write-lock holder would adopt it with no health watch.
+      if (readReadyCandidate(root, env)?.adopt?.finalSha === watch.sha) clearReadyCandidate(root, env);
+      clearWatch(root, env);
+      await emit?.({ kind: 'force-adopt-watch-expired', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, head } });
+      return { action: 'expired' };
+    }
     return { action: 'waiting' };
   }
   if (head !== null && !watch.adoptedSeen) { watch.adoptedSeen = true; writeJson(watchPath(root, env), watch); }
@@ -131,6 +152,7 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   let result;
   try { result = await rollback(watch.lastGood); } catch { result = { ok: false }; }
   if (!result?.ok) {
+    try { writeJson(watchPath(root, env), { ...watch, rollbackPending: verdict.reason }); } catch { /* the next tick re-probes */ }
     await emit?.({ kind: 'force-adopt-rollback-failed', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, reason: verdict.reason } });
     return { action: 'rollback-failed', reason: verdict.reason };
   }
