@@ -72,6 +72,9 @@ export function readNumberingEvidence(git, remote = 'origin', { refreshTracking 
     // named transient error - it never falls back to git. A tracking-ref refresh still wants a fetch, but only
     // when the local ref is behind GitHub; a failed fetch matters only if the ref is then still stale.
     try {
+      // The REST repository is the one this checkout (the git callback's target) belongs to - never the ambient cwd.
+      cwd ??= String(git(['rev-parse', '--show-toplevel'])).trim();
+      if (!cwd) throw new DrainReadError('high-water-mark', 'api-error', 'checkout root unreadable');
       main = numericIds(readBacklogNames('main', { rest, cwd }));
       if (refreshTracking) {
         const tip = readBranchSha('main', { rest, cwd });

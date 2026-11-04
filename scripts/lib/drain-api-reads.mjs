@@ -96,8 +96,10 @@ export function readAddedFiles(base, headSha, o = {}) {
   if (!Array.isArray(j?.files)) throw new DrainReadError(read, 'api-malformed', 'no files list');
   // The compare API lists at most 300 files with no truncation flag: a full page may hide more, so fail closed.
   if (j.files.length >= 300) throw new DrainReadError(read, 'api-truncated', 'file list at the 300-file ceiling');
-  return j.files.filter((f) => f?.status === 'added').map((f) => {
-    if (typeof f.filename !== 'string') throw new DrainReadError(read, 'api-malformed', 'file without a name');
-    return f.filename;
-  });
+  const KNOWN = new Set(['added', 'modified', 'removed', 'renamed', 'copied', 'changed', 'unchanged']);
+  for (const f of j.files) {
+    // Unknown evidence is never skipped: an entry without a name or a known status could hide an added card.
+    if (typeof f?.filename !== 'string' || !KNOWN.has(f.status)) throw new DrainReadError(read, 'api-malformed', 'file entry without a name or a known status');
+  }
+  return j.files.filter((f) => f.status === 'added').map((f) => f.filename);
 }

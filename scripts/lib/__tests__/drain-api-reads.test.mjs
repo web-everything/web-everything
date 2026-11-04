@@ -84,7 +84,14 @@ describe('origin/main high-water mark over REST', () => {
     'git/trees/bk': ok(tree(['100-a.md', '7-b.md', 'README.md'])),
     ...over,
   });
-  const run = (rest, git = noGit()) => readNumberingEvidence(git, 'origin', { source: 'api', rest });
+  it('uses the git callback checkout as the REST repository context', () => {
+    const seenCwd = [];
+    const rest = (path, o) => { seenCwd.push(o.context); return base()(path, o); };
+    readNumberingEvidence((a) => (a[0] === 'rev-parse' ? '/the/checkout\n' : ''), 'origin', { source: 'api', rest });
+    expect(seenCwd.length).toBeGreaterThan(0);
+    expect(new Set(seenCwd)).toEqual(new Set(['/the/checkout']));
+  });
+  const run = (rest, git = noGit()) => readNumberingEvidence(git, 'origin', { source: 'api', rest, cwd: '/c' });
   const refsGit = (calls) => (args) => { calls.push(args); if (args[0] === 'ls-remote') return ''; throw new Error('only ls-remote allowed'); };
   it('success: max card number from the REST tree, no fetch/ls-tree', () => {
     const calls = [];
@@ -159,6 +166,8 @@ describe('bornAs read over REST', () => {
   it('malformed or truncated responses fail closed', () => {
     expect(checkBornAsCollision(args(rest0({ 'compare/': ok({ nope: 1 }) }), git())).error).toContain('api-malformed');
     expect(checkBornAsCollision(args(rest0({ 'compare/': ok({ files: new Array(300).fill({ filename: 'a', status: 'modified' }) }) }), git())).error).toContain('api-truncated');
+    expect(checkBornAsCollision(args(rest0({ 'compare/': ok({ files: [{ filename: 'backlog/xabc123-new.md' }] }) }), git())).error).toContain('api-malformed');
+    expect(checkBornAsCollision(args(rest0({ 'compare/': ok({ files: [{ filename: 'backlog/xabc123-new.md', status: 'weird' }] }) }), git())).error).toContain('api-malformed');
     expect(checkBornAsCollision(args(rest0({ 'contents/backlog/xabc123-new.md': ok({ type: 'file', encoding: 'none', content: '' }) }), git())).error).toContain('api-malformed');
   });
   it('a stale origin/main ref (after a failed fetch) fails closed', () => {
