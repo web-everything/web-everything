@@ -781,7 +781,8 @@ async function checkDispatchDryRun({ root, budgets, runChild, env }) {
       if (!Array.isArray(rows) || !rows.length) {
         return { ok: false, detail: `dispatch dry-run reported no rows (${pass ?? 'direct'}) — refusing to treat "nothing ran" as a pass` };
       }
-      parsed.push(...rows);
+      // A row is one (kind, pr) fact; a child repeating an earlier child's row never doubles the count.
+      for (const row of rows) if (!parsed.some((seen) => seen.kind === row.kind && seen.pr === row.pr)) parsed.push(row);
     }
   } catch (e) {
     return { ok: false, detail: `dispatch dry-run child failed: ${pass ? `${pass} ` : ''}${failureLine(e)}`, ...childFailureDiagnostics(e) };
