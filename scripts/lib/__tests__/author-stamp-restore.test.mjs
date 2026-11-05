@@ -16,6 +16,12 @@ const history = () => [
   edit('First operator edit', 'chalbert', '2026-10-01T11:00:00Z'),
   edit(BODY, 'chalbert', '2026-10-01T12:00:00Z'),
 ];
+// Live #6244 shape: full plain bodies, newest first; equal timestamps retain list order.
+const plainHistory = () => [
+  edit(BODY, 'chalbert', '2026-11-03T01:58:16Z'),
+  edit('First operator edit', 'chalbert', '2026-11-02T13:10:21Z'),
+  edit(`Original body\n\n${buildAuthorActorMarker(ID)}`, AUTHOR, '2026-11-02T13:10:21Z'),
+];
 const live = (body = BODY) => ({ state: 'OPEN', body, author: { login: AUTHOR } });
 const plan = (overrides = {}) => planStampRestore({ state: 'OPEN', body: BODY, authorLogin: AUTHOR, edits: history(), ...overrides });
 const expectReason = (result, action) => {
@@ -79,6 +85,69 @@ describe('planStampRestore — agreement and author-of-record provenance', () =>
 
   it.each(['CLOSED', 'MERGED'])('skips a non-OPEN PR: %s', (state) => {
     expectReason(plan({ state }), 'skip');
+  });
+});
+
+describe('plain snapshot provenance — oldest author snapshot and agreeing ids', () => {
+  it('restores the live #6244 newest-first history using the later list position for tied timestamps', () => {
+    const edits = plainHistory();
+    const marker = buildAuthorActorMarker(ID);
+    const result = plan({ edits });
+    expectReason(result, 'restore');
+    expect(result).toMatchObject({ id: ID, source: edits[2], marker, body: `${BODY}\n\n${marker}\n` });
+  });
+
+  it('uses the earliest createdAt even when the oldest author snapshot is not last in the list', () => {
+    const edits = plainHistory();
+    edits[2].createdAt = '2026-11-02T13:10:20Z';
+    const result = plan({ edits: [edits[2], edits[0], edits[1]] });
+    expectReason(result, 'restore');
+    expect(result).toMatchObject({ id: ID, source: edits[2] });
+  });
+
+  it('allows later non-author snapshots retaining the same stamp as the oldest author snapshot', () => {
+    const edits = plainHistory();
+    edits[1].diff += `\n\n${buildAuthorActorMarker(ID)}`;
+    expect(plan({ edits })).toMatchObject({ action: 'restore', id: ID, source: edits[2] });
+  });
+
+  it.each([
+    ['oldest stamped snapshot belongs to a non-author despite a newer author retaining it', () => [
+      edit(`Author revision\n\n${buildAuthorActorMarker(ID)}`, AUTHOR, '2026-11-03T01:58:16Z'),
+      edit(`Original body\n\n${buildAuthorActorMarker(ID)}`, 'chalbert', '2026-11-02T13:10:21Z'),
+    ]],
+    ['stamp appears only in a newer author snapshot and the oldest has no stamp', () => [
+      edit(`Author revision\n\n${buildAuthorActorMarker(ID)}`, AUTHOR, '2026-11-03T01:58:16Z'),
+      edit('Original unstamped body', AUTHOR, '2026-11-02T13:10:21Z'),
+    ]],
+    ['oldest author snapshot carries stamp A but a middle snapshot carries stamp B', () => {
+      const edits = plainHistory();
+      edits[1].diff += `\n\n${buildAuthorActorMarker(OTHER)}`;
+      return edits;
+    }],
+    ['tied timestamps put the non-author stamped snapshot after an author retaining it', () => [
+      edit(`Author revision\n\n${buildAuthorActorMarker(ID)}`, AUTHOR, '2026-11-02T13:10:21Z'),
+      edit(`Original body\n\n${buildAuthorActorMarker(ID)}`, 'chalbert', '2026-11-02T13:10:21Z'),
+    ]],
+  ])('refuses without writing when %s', async (_name, makeEdits) => {
+    const edits = makeEdits();
+    expectReason(plan({ edits }), 'refuse');
+    const seams = io({ readEdits: vi.fn(() => edits) });
+    expectReason(await restoreAuthorStamp(seams), 'refuse');
+    expect(seams.writeBody).not.toHaveBeenCalled();
+  });
+
+  it('restores #6244 plain snapshots with body plus verbatim marker exactly once across two runs', async () => {
+    let body = BODY;
+    const marker = buildAuthorActorMarker(ID);
+    const seams = io({ readEdits: vi.fn(plainHistory), readPr: vi.fn(() => live(body)),
+      writeBody: vi.fn((_pr, next) => { body = next; }) });
+    expectReason(await restoreAuthorStamp(seams), 'restore');
+    expectReason(await restoreAuthorStamp(seams), 'skip');
+    expect(seams.writeBody).toHaveBeenCalledExactlyOnceWith(6244, `${BODY}\n\n${marker}\n`);
+    expect(seams.readEdits).toHaveBeenCalledExactlyOnceWith(6244);
+    expect(body).toBe(`${BODY}\n\n${marker}\n`);
+    expect(readAuthorActorStamps(body)).toEqual([ID]);
   });
 });
 
