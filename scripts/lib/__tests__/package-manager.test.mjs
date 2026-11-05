@@ -92,17 +92,22 @@ describe('installWithFallback', () => {
   it('a failed pnpm install falls back to npm ci and logs it', () => {
     const calls = []; const logs = [];
     const r = installWithFallback({ frozen: true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => '9', log: (l) => logs.push(l),
-      exec: (bin, args) => { calls.push([bin, ...args]); if (bin === 'pnpm') throw new Error('boom'); } });
+      exec: (bin, args) => { calls.push([bin, ...args]); if (bin === 'pnpm') throw Object.assign(new Error('boom ENOTFOUND registry'), { code: 'ENOTFOUND' }); } });
     expect(calls).toEqual([['pnpm', 'install', '--frozen-lockfile'], ['npm', 'ci']]);
-    expect(r).toMatchObject({ fellBack: true, manager: 'npm', pnpmError: 'boom' });
+    expect(r).toMatchObject({ fellBack: true, manager: 'npm', pnpmError: 'boom ENOTFOUND registry' });
     
     expect(logs.join('\n')).toMatch(/pnpm install failed.*falling back to npm ci/);
   });
-  it('a pnpm lockfile rejection is NOT masked by the npm fallback', () => {
+  it.each([
+    ['lockfile refusal on stderr', { stderr: 'ERR_PNPM_OUTDATED_LOCKFILE frozen-lockfile' }],
+    ['lockfile refusal on stdout', { stdout: 'ERR_PNPM_OUTDATED_LOCKFILE frozen-lockfile' }],
+    ['integrity failure', { stderr: 'ERR_PNPM_TARBALL_INTEGRITY' }],
+    ['lifecycle script failure', { stderr: 'ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL postinstall' }],
+    ['unrecognised failure', {}],
+  ])('fails closed (no npm fallback) on %s', (_n, extra) => {
     const calls = []; const logs = [];
-    const err = Object.assign(new Error('pnpm failed'), { stderr: 'ERR_PNPM_OUTDATED_LOCKFILE Cannot install with "frozen-lockfile"' });
     expect(() => installWithFallback({ frozen: true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => '9', log: (l) => logs.push(l),
-      exec: (bin, args) => { calls.push([bin, ...args]); throw err; } })).toThrow('pnpm failed');
+      exec: (bin, args) => { calls.push([bin, ...args]); throw Object.assign(new Error('pnpm failed'), extra); } })).toThrow('pnpm failed');
     expect(calls).toEqual([['pnpm', 'install', '--frozen-lockfile']]);
     expect(logs.join('\n')).toMatch(/NOT falling back/);
   });

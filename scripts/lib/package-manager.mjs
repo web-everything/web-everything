@@ -25,8 +25,13 @@ export function resolvePackageManager({ env = process.env, tool, platform, log }
   return { manager: 'npm', source, value, note: `unknown packageManager ${JSON.stringify(value)} (from ${source}); using npm` };
 }
 
-/** pnpm errors that mean the lockfile gate refused the install (never masked by an npm fallback). */
-const LOCKFILE_REJECTION = /ERR_PNPM_\w*LOCKFILE|frozen-lockfile|lockfile.*(out of date|not up to date|needs? to be updated)/i;
+/**
+ * ALLOWLIST of pnpm failures that fall back to npm: pnpm could not run, or could not reach the registry. Any other
+ * failure (lockfile refusal, integrity, lifecycle script, anything unrecognised) fails closed and is rethrown,
+ * because npm checks a different lockfile and would mask it.
+ */
+const FALLBACK_OK = /\b(ENOENT|EACCES|ETIMEDOUT|ENOTFOUND|ECONNRESET|ECONNREFUSED|EAI_AGAIN)\b|ERR_PNPM_(META_)?FETCH_FAIL/;
+const runnerFailure = (e) => FALLBACK_OK.test(`${e?.code ?? ''}\n${e?.message ?? ''}\n${e?.stdout ?? ''}\n${e?.stderr ?? ''}`);
 
 const defaultPnpmVersion = () => execFileSync('pnpm', ['--version'], { stdio: 'pipe', timeout: 30_000 }).toString().trim();
 
@@ -50,16 +55,14 @@ export function installCommand({ frozen = false, log = (l) => console.error(l), 
 }
 
 /** Run the install; a failed pnpm install falls back to `npm ci`/`npm install` and logs it. */
-export function installWithFallback({ frozen = false, ignoreScripts = false, cwd, exec = (bin, args, o) => execFileSync(bin, args, { stdio: ['ignore', 'inherit', 'pipe'], ...o }), log = (l) => console.error(l), ...opts } = {}) {
+export function installWithFallback({ frozen = false, ignoreScripts = false, cwd, exec = (bin, args, o) => execFileSync(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], ...o }), log = (l) => console.error(l), ...opts } = {}) {
   const first = installArgv({ ...opts, ci: frozen, ignoreScripts });
   if (first.note) log(`package-manager · ${first.note}`);
   try { exec(first.bin, first.args, { cwd }); return { ...first, fellBack: false }; }
   catch (e) {
     if (first.manager !== 'pnpm') throw e;
-    // Fail closed: a lockfile rejection is the reproducibility gate doing its job. npm ci checks a different lockfile,
-    // so falling back would mask it. Only environment/tooling failures fall back.
-    const detail = `${e?.message ?? e}\n${e?.stderr ?? ''}`;
-    if (LOCKFILE_REJECTION.test(detail)) { log(`package-manager · pnpm rejected the lockfile (${detail.split('\n')[0]}); NOT falling back to npm`); throw e; }
+    // Fail closed: only a pnpm that could not run, or reach the registry, falls back (see FALLBACK_OK).
+    if (!runnerFailure(e)) { log(`package-manager · pnpm install failed and is not a runner/network failure (${String(e?.message ?? e).split('\n')[0]}); NOT falling back to npm`); throw e; }
     log(`package-manager · pnpm install failed (${String(e?.message ?? e).split('\n')[0]}); falling back to npm ${frozen ? 'ci' : 'install'}`);
     const args = [frozen ? 'ci' : 'install', ...(ignoreScripts ? ['--ignore-scripts'] : [])];
     exec('npm', args, { cwd });
