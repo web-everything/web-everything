@@ -2,8 +2,14 @@
 // R622: the review side saw "red-team result already on head" while the drain held the same head as
 // unknown run evidence (review-unfinished / scan-capped). A trusted result comment bound to the exact
 // head settles those two reasons; a recorded break still sends back; missing evidence still fails closed.
-import { describe, expect, it } from 'vitest';
-import { readDrainRedTeamEvidence, settleUnknownEvidenceByComment } from '../drain-red-team-evidence.mjs';
+import { describe, expect, it, vi } from 'vitest';
+import { readDrainRedTeamEvidence, settleUnknownEvidenceByComment, RUN_MTIME_SLACK_MS } from '../drain-red-team-evidence.mjs';
+import { createDrainMergeStrategy } from '../drain-merge-strategy.mjs';
+import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
+
+// The real operator feed and daemon event log are never written from this file.
+vi.mock('../../operations/needs-you-feed.mjs', async importOriginal => ({ ...(await importOriginal()), publishAttention: vi.fn() }));
+vi.mock('../daemon-events.mjs', () => ({ appendDaemonEvent: vi.fn().mockResolvedValue(true) }));
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 
@@ -139,4 +145,78 @@ describe('R622 settlement uses the NEWEST trusted result comment for this head',
       expect(holdFor(unknown('review-unfinished', bounds), [stale, noise])).toMatch(/evidence unknown/);
     }
   });
+});
+
+describe('R622 chronology bounds are strict: a result comment EQUAL to a bound never settles', () => {
+  it('equal to the unfinished review start stays held', () => {
+    expect(holdFor(unknown('review-unfinished', { unfinishedStartedAt: T }), [comment()])).toMatch(/evidence unknown/);
+  });
+  it('equal to the unread boundary plus the mtime slack stays held (scan-capped and review-unfinished)', () => {
+    const edge = T - RUN_MTIME_SLACK_MS;
+    expect(holdFor(unknown('scan-capped', { unreadBoundaryAt: edge, unfinishedStartedAt: -Infinity }), [comment()])).toMatch(/evidence unknown/);
+    expect(holdFor(unknown('review-unfinished', { unfinishedStartedAt: T - 3600e3, unreadBoundaryAt: edge }), [comment()])).toMatch(/evidence unknown/);
+    expect(holdFor(unknown('scan-capped', { unreadBoundaryAt: edge - 1, unfinishedStartedAt: -Infinity }), [comment()])).toBeNull();
+  });
+  it('equal to the unfinished start stays held on a capped scan too', () => {
+    expect(holdFor(unknown('scan-capped', { unreadBoundaryAt: T - 3600e3, unfinishedStartedAt: T }), [comment()])).toMatch(/evidence unknown/);
+  });
+});
+
+describe('R622 the strategy wires the settlement into BOTH admission paths (prestage and enqueue)', () => {
+  const ACCEPTED = ['review:accepted', 'ready-to-merge'];
+  const repo = 'web-everything/web-everything', headSha = 'b'.repeat(40), num = 5283;
+  const result = { author: { login: 'web-everything' }, createdAt: '2026-11-05T12:00:00Z',
+    body: renderRedTeamComment({ pr: num, rev: headSha, findings: [], provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'accept' }) };
+  const harness = (thread, evidence) => {
+    const calls = [];
+    let labels = [...ACCEPTED];
+    const exec = (cmd, args) => {
+      calls.push([cmd, ...args]);
+      if (args.includes('--slurp')) return JSON.stringify([thread]);
+      if (cmd === 'git') return args[0] === 'diff' ? 'scripts/x.mjs\0' : args[0] === 'ls-remote' ? `${'e'.repeat(40)}\t${args.at(-1)}\n` : args[0] === 'rev-parse' ? `${'e'.repeat(40)}\n` : '';
+      if (args[0] === 'pr' && args[1] === 'edit') {
+        for (let i = 0; i < args.length; i++) {
+          if (args[i] === '--remove-label') labels = labels.filter(l => l !== args[i + 1]);
+          if (args[i] === '--add-label') labels = [...labels, args[i + 1]];
+        }
+        return '';
+      }
+      if (args[0] === 'pr' && args[1] === 'comment') return '';
+      if (args[0] === 'label') return '';
+      if (args[0] === 'api' && args[1] === 'user') return 'drain-bot\n';
+      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ state: 'OPEN', id: 'PR_NODE', headRefOid: headSha, baseRefName: 'main', labels });
+      if (args[0] === 'api' && args[1] === 'graphql') {
+        if (args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: calls.some(c => c.some(a => String(a).includes('enqueuePullRequest'))), headRefOid: headSha } } } });
+        if (args.some(a => a.includes('mergeQueue(branch:'))) return JSON.stringify({ data: { repository: { mergeQueue: { entries: { nodes: [], pageInfo: { hasNextPage: false } } } } } });
+        return JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: { id: 'E', position: 1, state: 'QUEUED' } } } });
+      }
+      throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
+    };
+    let stored = null;
+    const s = createDrainMergeStrategy({
+      dryRun: false, env: { WE_UNDER_TEST: '1' }, exec, isLocalRepo: () => true, localSlug: repo, statePath: '/x/state.json', writeFile: () => {},
+      readRedTeamEvidence: () => evidence, cancelObsoleteRuns: () => {}, batching: { gate: () => ({ admit: true }), observe: () => ({}) },
+      resolved: { policy: resolveMergeDeliveryPolicy({ tool: { strategy: 'github-merge-queue' } }), note: null }, log: { write: () => {} },
+      readFile: () => { if (stored == null) { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; } return JSON.stringify(stored); },
+      writeState: (_p, st) => { stored = JSON.parse(JSON.stringify(st)); },
+    });
+    return { s, calls, labels: () => labels };
+  };
+  const enqueued = h => h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')));
+  for (const reason of ['review-unfinished', 'scan-capped']) {
+    it(`prestage: ${reason} + a trusted head-bound result comment admits; without it, it holds`, () => {
+      expect(harness([result], unknown(reason, older)).s.prestage({ num }, headSha)).toMatchObject({ allowed: true });
+      expect(harness([], unknown(reason, older)).s.prestage({ num }, headSha)).toMatchObject({ allowed: false, reason: expect.stringMatching(/evidence unknown/) });
+    });
+    it(`enqueue: ${reason} + a trusted head-bound result comment enqueues and publishes red-team:clear; without it, nothing is enqueued`, () => {
+      const settled = harness([result], unknown(reason, older));
+      expect(settled.s.enqueue({ num }, headSha, { comments: [result] })).toMatchObject({ enqueued: true });
+      expect(enqueued(settled)).toBe(true);
+      expect(settled.labels()).toContain('red-team:clear');
+      const held = harness([], unknown(reason, older));
+      expect(held.s.enqueue({ num }, headSha, { comments: [] })).toMatchObject({ enqueued: false, kind: 'red-team-pending' });
+      expect(enqueued(held)).toBe(false);
+      expect(held.labels()).not.toContain('red-team:clear');
+    });
+  }
 });
