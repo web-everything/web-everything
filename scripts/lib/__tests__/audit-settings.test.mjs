@@ -262,6 +262,26 @@ describe('audit settings (R528)', () => {
     const shadow = resolveAuditSettings({ fileRead: file(full()), platform: { PriorQuestionHashes: [HASH_B] }, env: {}, log: () => {} });
     expect(shadow.value.priorQuestionHashes).toEqual([]);
   });
+  it.each([
+    ['a list over 64 records', Array.from({ length: 65 }, (_, i) => ({ hash: i.toString(16).padStart(64, '0'), acceptUntil: '2026-12-01T00:00:00.000Z' }))],
+    ['a non-string hash', [{ hash: ['a'.repeat(64)], acceptUntil: '2026-12-01T00:00:00.000Z' }]],
+  ])('the audit resolver is only ever stricter than findAudit: %s accepts nothing (PR #6381 merge)', (_, list) => {
+    const read = () => JSON.stringify({ audit: { priorQuestionHashes: list } });
+    expect(resolveAuditSettings({ fileRead: read, platform: null, env: {}, log: () => {} }).value.priorQuestionHashes).toEqual([]);
+  });
+  it('the key beside a case variant of itself accepts nothing (stricter than findAudit, PR #6381 merge)', () => {
+    const r = resolve(full({ priorQuestionHashes: [HASH_A], 'priorQuestionHashes​': [] }));
+    expect(r.value.priorQuestionHashes).toEqual([]);
+  });
+  it('an inherited (prototype) priorQuestionHashes is never read as a setting, as findAudit never reads one (PR #6381 merge)', () => {
+    // The parsed file object is a plain JSON value, so emulate a polluted prototype on the shared Object.prototype.
+    Object.defineProperty(Object.prototype, 'priorQuestionHashes', { value: [HASH_A], configurable: true, writable: true });
+    try {
+      const polluted = resolveAuditSettings({ fileRead: () => JSON.stringify({ audit: {} }), platform: null, env: {}, log: () => {} });
+      expect(polluted.value.priorQuestionHashes).toEqual([]);
+      expect(polluted.value.priorQuestionHashes).toEqual(resolvePriorQuestionHashes({ readFile: () => JSON.stringify({ audit: {} }), env: {} }));
+    } finally { delete Object.prototype.priorQuestionHashes; }
+  });
   it('the shipped settings file reads the same prior question hashes through both readers (PR #6381 merge)', () => {
     expect(resolveAuditSettings({ platform: null, env: {}, log: () => {} }).value.priorQuestionHashes).toEqual(resolvePriorQuestionHashes({ env: {} }));
   });

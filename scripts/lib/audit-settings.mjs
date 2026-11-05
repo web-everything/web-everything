@@ -235,7 +235,8 @@ export function resolveAuditSettings({ path = AUDIT_SETTINGS_PATH, fileRead = re
   if (isObj(plat) && Object.keys(plat).some(k => foldKey(k) === foldKey('priorQuestionHashes'))) {
     warn('audit platform preference priorQuestionHashes ignored; only the trusted settings file may accept prior hashes');
   }
-  const hashes = isObj(tool) ? tool.priorQuestionHashes : undefined;
+  // Own keys only, as the cascade reads them: an inherited (prototype) value is never a setting.
+  const hashes = isObj(tool) && Object.hasOwn(tool, 'priorQuestionHashes') ? tool.priorQuestionHashes : undefined;
   const hashesInvalid = rawMalformed(tool, 'priorQuestionHashes', validHashes) || caseShadowed(tool, 'priorQuestionHashes')
     || (hashes !== undefined && !validHashes(hashes));
   if (unreadable || !cascade || platBad || hashesInvalid) {

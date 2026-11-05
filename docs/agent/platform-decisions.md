@@ -6501,7 +6501,9 @@ strictest, no prior question hashes accepted); an empty section sets nothing and
 (misspelled) keys are named in a warning; `allow` resolves to `block`. `audit.priorQuestionHashes` is a list of
 `{hash, acceptUntil}` records (the hash 64 lowercase hex characters), the same shape `findAudit` reads; only the
 settings file may set it (no environment route, and a platform value is ignored with a warning), and any invalid
-entry empties the whole list. An environment value that does not parse
+entry empties the whole list. The audit resolver is stricter than `findAudit`'s reader in three cases, each one
+accepting nothing: a list over 64 records, the key beside a case or invisible-character variant of itself, and an
+unreadable platform preference. It never accepts a record `findAudit` would refuse. An environment value that does not parse
 or is not a known option resolves to that setting's strictest option too. Path lists only add to the built-in
 guard floor: the concurrency modules (locks, leases including `scripts/lib/lane-lease.mjs`, slots, lane pool,
 merge, drain) and the guard hooks (`scripts/guard-*.mjs` and the other guard scripts) with their registration in
