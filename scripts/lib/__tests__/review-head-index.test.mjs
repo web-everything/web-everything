@@ -713,6 +713,11 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
       '🛑 stood-down pending\n', '🔁 re armed\n', '⏸ holding for operator\n', 'Please do not merge, wrong approach\n',
       '🚫 blocked on #12\n', 'withdrawn: needs rework\n', '<!-- m -->\n⏸ paused for author\n', '---\n🛑 stand down\n',
     ]) expect(seedFromReviewComments([...mk(good), ...mk(control)])).toBeNull();
+    // a later heading nobody listed also withdraws it: symbol-led trusted comments are control comments whatever they say, and new reject-ish prose is listed
+    for (const unlisted of ['❌ review — rejected\n\nsee findings', '🟥 verdict\n', '⚠️ something the daemon has not said before\n', '[bot] notice\n', '(auto) result recorded\n',
+      '- queued\n', '“quoted” heading\n', 'needs more work\n', 'Not accepted, see thread\n', 'the check failed\n', 'Declined by the owner\n']) {
+      expect(seedFromReviewComments([...mk(good), ...mk(unlisted)])).toBeNull();
+    }
     // ...but a control comment BEFORE the accept does not
     expect(seedFromReviewComments([...mk('🛑 conveyor fix — stood down, human judgment needed\n'), ...mk(good)])).not.toBeNull();
     // ...and an untrusted control comment does not

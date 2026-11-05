@@ -307,15 +307,21 @@ const ACCEPT_HEAD = /^✅ review — accepted\r?\n/, CHANGES_HEAD = /^(?:🔁 )?
 // unknown future hold): a symbol/emoji-led first line naming one of those. A later one withdraws an earlier accept.
 // The first non-empty line (BOM / zero-width / leading markdown emphasis stripped) is tested for the keywords; a wider net only
 // errs toward "review owed", which is the safe direction. It no longer requires a leading symbol (`review paused:`, `ℹ️ conveyor`).
-const CONTROL_KEYWORDS = /conveyor|re[-\s]?armed?|stood[-\s]+down|stand[-\s]*down|escalat|\bhold(?:ing)?\b|\bheld\b|\bpaus|supersed|\bruling\b|exhausted|\bblock(?:ed|ing)?\b|(?:do not|don'?t)\s+merge|withdr[ae]w|revok/iu;
+const CONTROL_KEYWORDS = /conveyor|re[-\s]?armed?|stood[-\s]+down|stand[-\s]*down|escalat|\bhold(?:ing)?\b|\bheld\b|\bpaus|supersed|\bruling\b|exhausted|\bblock(?:ed|ing)?\b|(?:do not|don'?t)\s+merge|withdr[ae]w|revok|reject|declin|not\s+(?:accepted|approved)|needs?\s+(?:more\s+)?(?:work|rework|changes)|\bfail(?:ed|s|ure)\b/iu;
 // The first three non-empty lines are tested (a leading HTML-comment-only or horizontal-rule line must not hide the keyword).
 // Input contract: comments arrive in chronological order and are known to be COMPLETE (a paged/capped list that dropped a later
 // control comment would leave an accept standing; the caller owns that completeness check).
 // Leading whitespace, zero-width characters (U+200B..U+200D), BOM (U+FEFF) and markdown emphasis/quote/heading marks. Built from
 // code points so the source carries no invisible characters.
 const LEAD_NOISE = new RegExp('^[\\s' + String.fromCharCode(0x200b) + '-' + String.fromCharCode(0x200d, 0xfeff) + '*_>#]+', 'u');
-const isControlComment = body => body.split(/\r?\n/).map(l => l.replace(LEAD_NOISE, '')).filter(l => l && !(l.startsWith('<!--') && l.endsWith('-->')) && !/^[-_*=]{3,}$/.test(l))
-  .slice(0, 3).some(l => CONTROL_KEYWORDS.test(l));
+// A denylist alone fails open on a heading nobody listed. Daemon and verdict comments are symbol-led (an emoji or mark, never a
+// letter or digit), so a trusted comment whose first meaningful line is NOT led by a letter or digit counts as a control comment
+// whatever it says: an unknown later heading withdraws the accept. Plain prose from a trusted author is still judged by the keywords.
+const SYMBOL_LED = /^[^\p{L}\p{N}]/u;
+const isControlComment = body => {
+  const lines = body.split(/\r?\n/).map(l => l.replace(LEAD_NOISE, '')).filter(l => l && !(l.startsWith('<!--') && l.endsWith('-->')) && !/^[-_*=]{3,}$/.test(l)).slice(0, 3);
+  return lines.length > 0 && (SYMBOL_LED.test(lines[0]) || lines.some(l => CONTROL_KEYWORDS.test(l)));
+};
 const MARKER_LINE = new RegExp(`^<!-- ${REVIEWED_SHA_MARKER}: ([0-9a-f]{40}) -->$`);
 /**
  * Seed for a pre-index PR: the latest trusted VERDICT comment, and only if it is accept-shaped (heading at byte 0) with a
