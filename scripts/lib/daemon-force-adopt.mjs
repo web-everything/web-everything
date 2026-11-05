@@ -86,6 +86,11 @@ export function forceRequestFor(root, env, sha, now = Date.now) {
 const removeQuietly = (p) => { try { rmSync(p, { force: true }); } catch { /* unreachable state dir: nothing to clear */ } };
 export const clearForceAdopt = (root, env = process.env) => removeQuietly(requestPath(root, env));
 export const readForceWatch = (root, env = process.env) => readJson(watchPath(root, env));
+/** true when a watch file EXISTS but cannot be read or parsed (EACCES, EIO, corrupt JSON). That is not "no watch": a second
+ *  force would overwrite the open watch's last-good with an unproven build. Only a missing file (ENOENT) means absent. */
+const watchUnreadable = (root, env) => {
+  try { JSON.parse(readFileSync(watchPath(root, env), 'utf8')); return false; } catch (e) { return e?.code !== 'ENOENT' && e?.code !== 'ENOTDIR'; } // a state dir that is not a directory cannot hold a watch
+};
 /** Rollbacks owed but whose marker could not be written to disk, keyed by watch path (this process only). Each entry keeps the
  *  whole watch, so the obligation survives a lost or unreadable watch file. */
 const pendingRollbacks = new Map();
@@ -103,6 +108,7 @@ const appendLine = (p, line) => { try { mkdirSync(dirname(p), { recursive: true 
 export async function recordForcedAdoption({ root, env = process.env, request, sha, lastGood, smoke: rawSmoke, emit, now = Date.now }) {
   // A second force while a watch is open would overwrite its lastGood with the first forced (unproven) build.
   if (readForceWatch(root, env)) return { ok: false, reason: 'watch-already-open' };
+  if (watchUnreadable(root, env)) return { ok: false, reason: 'watch-unreadable' }; // fail closed: an unreadable watch may be an open one
   // A rollback owed but never saved to disk (the state write failed) still binds: fail closed until it is paid, never adopt over it.
   if (pendingRollbacks.has(watchPath(root, env))) return { ok: false, reason: 'rollback-owed' };
   const at = new Date(now()).toISOString();

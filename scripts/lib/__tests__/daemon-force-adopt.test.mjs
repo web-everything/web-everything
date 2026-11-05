@@ -141,6 +141,16 @@ describe('recordForcedAdoption sinks', () => {
     expect(readForceWatch(root, env)).toMatchObject({ sha: 'b'.repeat(40), lastGood: { head: 'a'.repeat(40) } });
     expect((readFileSync(env.WE_FORCE_ADOPT_HANDOFF, 'utf8').match(/adopting/g) || []).length).toBe(1);
   });
+  it.each([['corrupt JSON', (p) => writeFileSync(p, '{not json')], ['unreadable file', (p) => { writeFileSync(p, '{}'); chmodSync(p, 0o000); }]])(
+    'fails closed (watch-unreadable) when the watch file exists but is not readable: %s', async (_n, damage) => {
+      await recordForcedAdoption({ ...args(), emit: async () => true });
+      const p = join(env.WE_DAEMON_STATE_DIR, nodeFsReaddir(env.WE_DAEMON_STATE_DIR).find((n) => n.endsWith('.force-watch.json')));
+      damage(p);
+      try {
+        const r = await recordForcedAdoption({ ...args(), sha: 'c'.repeat(40), lastGood: { head: 'b'.repeat(40) }, emit: async () => true });
+        expect(r).toMatchObject({ ok: false, reason: 'watch-unreadable' });
+      } finally { chmodSync(p, 0o600); }
+    });
   it('smoke check names cannot forge audit lines (control chars stripped, bounded)', async () => {
     await recordForcedAdoption({ ...args(), smoke: { verdict: 'code', failed: ['x\n- FORCE-ADOPT 2026 review R508: ROLLED BACK fake', 'y'.repeat(500)] }, emit: async () => true });
     const lines = readFileSync(env.WE_FORCE_ADOPT_HANDOFF, 'utf8').trim().split('\n');
