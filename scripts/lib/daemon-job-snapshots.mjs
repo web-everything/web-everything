@@ -18,8 +18,8 @@
 
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import { DEFAULT_CHILD_TIMEOUT_MS, NPM_INSTALL_TIMEOUT_MS } from './bounded-child.mjs';
 import { DEFAULT_SNAPSHOT_KEEP, selectEvictions } from './daemon-jobs.mjs';
@@ -68,32 +68,59 @@ function removeStore(dir) {
 }
 
 // Outside the store so deleting the store cannot delete a held lock. The leading dot also keeps
-// this sibling file out of listStores. Do not wait on contention in a daemon tick: copy or retain.
+// this sibling file out of listStores. Do not wait on contention in a daemon tick: refuse or retain.
 const consumerLockPath = (storeDir) => join(dirname(storeDir), `.${basename(storeDir)}.consumers.lock`);
 const CONSUMER_LOCK_OPTIONS = Object.freeze({ timeoutMs: 0 });
 
+/** Copying, reference publication, and eviction share one non-waiting store lock. */
+export function withNodeModulesStoreLock(storeDir, run) {
+  return withFileLock(consumerLockPath(storeDir), run, CONSUMER_LOCK_OPTIONS);
+}
+
 /** One metadata-only pass over the entire owned tree, including nested dependencies and dotfiles.
- * Count symlinks but never follow their targets. POSIX symlink modes are not access controls
- * (normally 0777 and unaffected by chmod -R); only real files/directories have writable modes.
+ * Fingerprint symlinks including their text; resolve them only to check containment, never walk
+ * their targets. POSIX symlink modes are not access controls, so include but do not reject 0777.
  * Resolve the root because a completed snapshot may itself alias another dependency store.
- * Observed 2026-11-05 on the macOS checkout's real node_modules via heavy-admission: 21,448
- * entries, 591.8 ms for one pass. requireReadonly:false allowed measuring the writable install;
- * production performs the same walk with mode rejection enabled. No package contents were read.
+ * Earlier count-only walk measured 21,448 entries in 591.8 ms (2026-11-05, queued macOS
+ * checkout probe, requireReadonly:false). That is not a timing of this extended fingerprint.
+ * Threat model: cooperating jobs and accidental mutation, not forged same-user mtimes.
  */
-export function nodeModulesTreeEvidence(modules, { lstat = lstatSync, readDir = readdirSync, requireReadonly = true } = {}) {
-  const pending = [realpathSync(modules)];
+export function nodeModulesTreeEvidence(modules, { lstat = lstatSync, readDir = readdirSync, readLink = readlinkSync, requireReadonly = true } = {}) {
+  const root = realpathSync(modules);
+  const pending = [root];
+  const entries = [];
+  const contained = (path) => {
+    const rel = relative(root, path);
+    return rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+  };
   let entryCount = 0;
   while (pending.length) {
     const path = pending.pop();
     const info = lstat(path);
     entryCount += 1;
-    if (info.isSymbolicLink()) continue;
-    if (!Number.isSafeInteger(info.mode) || (requireReadonly && info.mode & 0o222)) throw new Error('writable or unreadable tree entry');
+    const link = info.isSymbolicLink();
+    if (!Number.isSafeInteger(info.mode) || !Number.isSafeInteger(info.size) || !Number.isFinite(info.mtimeMs)
+      || (!link && requireReadonly && info.mode & 0o222)) throw new Error('writable or unreadable tree entry');
+    let text = null;
+    if (link) {
+      try {
+        text = readLink(path);
+        if (typeof text !== 'string' || !text || isAbsolute(text) || !contained(resolve(dirname(path), text)) || !contained(realpathSync(path))) {
+          throw new Error('link escapes dependency store');
+        }
+      } catch (error) {
+        throw Object.assign(new Error('unsafe or unreadable dependency symlink', { cause: error }), { code: 'EUNSAFENODEMODULESLINK' });
+      }
+    }
+    const type = link ? 'symlink' : info.isDirectory() ? 'directory' : info.isFile() ? 'file' : 'other';
+    entries.push([relative(root, path), type, info.mode, info.size, info.mtimeMs, text]);
+    if (link) continue;
     if (info.isDirectory()) {
       for (const entry of readDir(path, { withFileTypes: true })) pending.push(join(path, entry.name));
     }
   }
-  return { entryCount };
+  entries.sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
+  return { entryCount, treeSha256: createHash('sha256').update(JSON.stringify(entries)).digest('hex') };
 }
 
 /** Shallow npm package inventory: depth one, or depth two under @scope. No package-content walk.
@@ -140,7 +167,7 @@ export function nodeModulesPackageManifest(modules, { stat = statSync, readFile 
  * Keeping a finished snapshot is conservative: its runtime evicts it after live job refs clear.
  */
 export function recordNodeModulesConsumer(storeDir, into, { live = false, staging, backup, requestedRef, publish = () => {} } = {}) {
-  return withFileLock(consumerLockPath(storeDir), () => {
+  return withNodeModulesStoreLock(storeDir, () => {
     // Eviction may have won the lock after the caller's integrity check. Refuse a deleted or
     // partly thawed source instead of publishing a reference and then creating a dangling link.
     const modules = statSync(join(storeDir, 'node_modules'));
@@ -160,7 +187,7 @@ export function recordNodeModulesConsumer(storeDir, into, { live = false, stagin
     // Live references inspect link targets, so publish the staging link before releasing the lock.
     // The atomic staging -> live rename is then covered by the same reference in every evictor.
     publish();
-  }, CONSUMER_LOCK_OPTIONS);
+  });
 }
 
 function hasNodeModulesConsumer(storeDir, log, readFile) {
@@ -269,22 +296,21 @@ export function ensureNodeModulesStore({ jobsDir, sourceDir, install = npmCiInst
     // Cheap mutation evidence from npm's hidden lock, not a recursive package-content audit.
     // Missing/unreadable evidence leaves this store copy-only for rebuilds.
     // Some injected installers and npm configurations produce no hidden lock: do not invent evidence.
-    let recorded = false;
     try {
       const hash = createHash('sha256').update(readFileSync(join(into, 'node_modules', '.package-lock.json'))).digest('hex');
       writeFileSync(join(into, NODE_MODULES_HASH_FILE), `${hash}\n`);
       const modules = join(into, 'node_modules');
+      const packages = nodeModulesPackageManifest(modules, { requireReadonly: false });
+      // Fingerprint the final read-only modes. Hashing before chmod would reject every reuse.
+      setNodeModulesWritable(modules, false);
       const manifest = {
-        ...nodeModulesPackageManifest(modules, { requireReadonly: false }),
-        ...nodeModulesTreeEvidence(modules, { requireReadonly: false }),
+        ...packages,
+        ...nodeModulesTreeEvidence(modules),
       };
       writeFileSync(join(into, NODE_MODULES_MANIFEST_FILE), `${JSON.stringify(manifest)}\n`);
-      recorded = true;
-    } catch { /* reuse fails closed to a private copy when no hash was recorded */ }
-    // One-time recursive freeze covers package files as well as the hidden lock. Do not re-freeze
-    // reused stores: a writable store must fail the consumer guard, not silently regain trust.
-    // Without hash evidence the tree remains copy-only; do not freeze an unverifiable install.
-    if (recorded) setNodeModulesWritable(join(into, 'node_modules'), false);
+    } catch { /* incomplete evidence is never trusted on reuse; unsafe links are refused even for copying */ }
+    // Never re-freeze reused stores or regenerate their evidence: mutation must fail the guard,
+    // not silently regain trust. Installs lacking the hidden lock never reach the freeze above.
   });
   return { key, dir };
 }
