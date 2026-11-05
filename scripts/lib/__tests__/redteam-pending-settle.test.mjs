@@ -1128,3 +1128,15 @@ describe('pending soak always replays recovery availability', () => {
     } finally { rmSync(sourceRoot, { recursive: true, force: true }); }
   });
 });
+
+describe('a confirmed-break comment with unknown hold text stays visible to hold detection', () => {
+  it('an older break comment containing a human hold phrase blocks a later clean result from clearing', () => {
+    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: payload('accept'), recorded: false, seatRecorded: false,
+      status: { status: 'finished', result: { comment: 'posted', foldedVerdict: 'accept' } } })), readIgnorableConfirms: () => [] });
+    o.rawPrs[0].comments.push({ author: { login: 'web-everything' }, createdAt: iso(acceptedAt + 1),
+      body: `${redTeamMarker(pr, head)}\n### Post-accept red team \u2014 1 possible break(s), 1 confirmed by Claude's re-check\n\n1. [**confirmed**] (edge-case, broken) \u2014 real\n\n\u{1F501} review \u2014 changes requested: do not merge` },
+    { ...resultComment(), createdAt: iso(acceptedAt + 2) });
+    mod.runRedTeamOnSkip(o);
+    expect(o.syncLabels).not.toHaveBeenCalled();
+  });
+});
