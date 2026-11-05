@@ -94,7 +94,7 @@ function report(options, evidence = 'passed', status = 0) {
     const state = file === failedFile ? evidence : 'passed';
     if (state === 'missing') return [];
     return [{ name: join(fs.realpathSync(options.root), file),
-      assertionResults: state === 'empty' ? [] : [{ status: state }] }];
+      assertionResults: state === 'empty' ? [] : [{ status: state, title: 'worker behaves', ancestorTitles: ['worker'] }] }];
   });
   fs.writeFileSync(options.testReport, JSON.stringify({ testResults }));
   return { status, stdout: '', stderr: '' };
@@ -223,6 +223,104 @@ describe('overlay main sync failed-file reruns', () => {
     expect(f.deps.testRunner).toHaveBeenCalledTimes(3);
     expect(f.deps.mainTestRunner).toHaveBeenCalledOnce();
     noPublication(f);
+  });
+});
+
+// Override only assertion evidence while retaining the real checkout and report path checks.
+function assertionRunner(runner, assertions) {
+  return async options => {
+    const result = await runner(options);
+    const evidence = json(options.testReport);
+    evidence.testResults.find(r => r.name.endsWith(`/${failedFile}`)).assertionResults = assertions;
+    fs.writeFileSync(options.testReport, JSON.stringify(evidence));
+    return result;
+  };
+}
+const failedAssertion = title => ({ status: 'failed', title, ancestorTitles: ['worker'] });
+
+describe('main-red assertion identity and bookkeeping', () => {
+  it.each([
+    ['different assertion in the same file', [failedAssertion('overlay only')], [failedAssertion('main only')]],
+    ['strict subset on main', [failedAssertion('shared'), failedAssertion('overlay only')], [failedAssertion('shared')]],
+    ['same title under different ancestors', [failedAssertion('same')], [{ ...failedAssertion('same'), ancestorTitles: ['other'] }]],
+    ['missing identity on merged tree', [{ status: 'failed' }], [failedAssertion('shared')]],
+    ['missing identity on main', [failedAssertion('shared')], [{ status: 'failed' }]],
+  ])('%s retains operator-review failure', async (_label, merged, main) => {
+    const f = fixture(); runners(f, ['failed', 'failed'], 'failed');
+    f.deps.testRunner = assertionRunner(f.deps.testRunner, merged);
+    f.deps.mainTestRunner = assertionRunner(f.deps.mainTestRunner, main);
+    await expect(job(f)).rejects.toThrow(failure);
+    expect(kinds(f)).not.toContain('overlay-main-red');
+    expect(f.outcomes.some(e => e.kind === 'overlay-main-sync-failed')).toBe(true);
+    noPublication(f);
+  });
+
+  it.each(['fullName', 'title'])('main may have additional failures when every persistent %s identity matches', async form => {
+    const f = fixture(); runners(f, ['failed', 'failed'], 'failed');
+    const shared = form === 'fullName' ? { status: 'failed', fullName: 'worker shared' } : failedAssertion('shared');
+    f.deps.testRunner = assertionRunner(f.deps.testRunner, [shared]);
+    f.deps.mainTestRunner = assertionRunner(f.deps.mainTestRunner, [shared, failedAssertion('main only')]);
+    expect(await job(f)).toMatchObject({ skipped: true, reason: 'main-red' });
+    noPublication(f);
+  });
+
+  it.each(['main', 'tip'])('known main-red pair skips the second kick and reruns when %s moves', async moved => {
+    const f = fixture(); runners(f, ['failed', 'failed'], 'failed');
+    const spawnFn = vi.fn(() => ({ once: vi.fn(), unref: vi.fn() }));
+    const kick = () => sync.kickOverlayMainSync({ root: f.root, env: f.env, mode: 'on',
+      git: f.deps.git, spawnFn, deps: f.deps });
+    expect(await job(f)).toMatchObject({ skipped: true, reason: 'main-red' });
+    const saved = json(`${overlayFilePath(f.root, f.env)}.main-sync.state`);
+    expect(saved.mainRedMain[ref]).toBe(f.mainSha);
+    expect(saved.mainRedTip[ref]).toBe(ok(f.root, ['rev-parse', `origin/${ref}`]));
+    expect(saved.attemptedMain[ref]).toBeUndefined();
+    expect(saved.retryMain[ref]).toBeUndefined();
+    expect(await job(f)).toMatchObject({ skipped: true, reason: 'main-red-known' });
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    expect(kick()).toMatchObject({ started: [], skipped: [ref] });
+    expect(spawnFn).not.toHaveBeenCalled();
+    const movedRef = moved === 'main' ? 'origin/main' : `origin/${ref}`;
+    const previous = ok(f.root, ['rev-parse', movedRef]);
+    const tree = ok(f.root, ['rev-parse', `${previous}^{tree}`]);
+    const next = ok(f.root, ['commit-tree', tree, '-p', previous, '-m', 'advance pair']);
+    ok(f.root, ['update-ref', `refs/remotes/${movedRef}`, next]);
+    expect(kick()).toMatchObject({ started: [ref] });
+    expect(spawnFn).toHaveBeenCalledOnce();
+    expect(f.outcomes.some(e => /failed|needs-you/.test(e.kind))).toBe(false);
+    expect(fs.existsSync(f.env.WE_NEEDS_YOU_FEED) ? fs.readFileSync(f.env.WE_NEEDS_YOU_FEED, 'utf8') : '').not.toContain('needs-you');
+    noPublication(f);
+  });
+
+  it('compares the final persistent rerun assertions rather than the initial failure', async () => {
+    const f = fixture(); runners(f, ['failed', 'failed'], 'failed');
+    const runner = f.deps.testRunner;
+    let attempt = 0;
+    f.deps.testRunner = options => assertionRunner(runner,
+      [failedAssertion(attempt++ === 0 ? 'initial' : 'persistent')])(options);
+    f.deps.mainTestRunner = assertionRunner(f.deps.mainTestRunner, [failedAssertion('initial')]);
+    await expect(job(f)).rejects.toThrow(failure);
+    expect(kinds(f)).not.toContain('overlay-main-red');
+    noPublication(f);
+  });
+
+  it.each([
+    { mainRedMain: { [ref]: 'a'.repeat(40) } },
+    { mainRedTip: { [ref]: 'b'.repeat(40) } },
+    { mainRedMain: { [ref]: 'invalid' }, mainRedTip: { [ref]: 'b'.repeat(40) } },
+  ])('incomplete or invalid persisted main-red evidence fails closed (%j)', async state => {
+    const f = fixture(); runners(f, ['failed', 'failed'], 'failed');
+    fs.writeFileSync(`${overlayFilePath(f.root, f.env)}.main-sync.state`, JSON.stringify({ lastSyncedMain: {}, ...state }));
+    await expect(job(f)).rejects.toThrow(/state.*operator repair required/);
+    expect(f.deps.testRunner).not.toHaveBeenCalled();
+    noPublication(f);
+  });
+
+  it('flaky-retried event includes the effective rerun value and source', async () => {
+    const f = fixture({ reruns: 2 }); runners(f, ['failed', 'passed']);
+    expect(await job(f)).toMatchObject({ pushed: true });
+    expect(f.events).toContainEqual(expect.objectContaining({
+      kind: 'overlay-main-flaky-retried', flakeReruns: 2, flakeRerunsSource: 'env',
+    }));
   });
 });
 

@@ -116,7 +116,7 @@ function readSyncState(file, io = fs) {
 }
 function validateSyncState(data) {
   if (!data || !Object.hasOwn(data, 'lastSyncedMain')) throw new Error('invalid main-sync state; operator repair required');
-  for (const key of ['lastSyncedMain', 'attemptedMain', 'shadowMain', 'pushRetryMain', 'pushRetryAfter', 'errorAt', 'firstFailureAt', 'failureAlertedAt', 'failureReason', 'staleRef', 'staleRegistration', 'conflictMain', 'conflictTip', ...retryKeys]) {
+  for (const key of ['lastSyncedMain', 'attemptedMain', 'shadowMain', 'pushRetryMain', 'pushRetryAfter', 'errorAt', 'firstFailureAt', 'failureAlertedAt', 'failureReason', 'staleRef', 'staleRegistration', 'conflictMain', 'conflictTip', 'mainRedMain', 'mainRedTip', ...retryKeys]) {
     if (!Object.hasOwn(data, key)) data[key] = {};
     const map = data[key], timestamp = ['pushRetryAfter', 'errorAt', 'retryAfter', 'retryTries', 'firstFailureAt', 'failureAlertedAt', 'staleRef'].includes(key);
     const invalid = value => {
@@ -138,6 +138,10 @@ function validateSyncState(data) {
   const pairRefs = new Set([...Object.keys(data.conflictMain), ...Object.keys(data.conflictTip)]);
   if ([...pairRefs].some(ref => !Object.hasOwn(data.conflictMain, ref) || !Object.hasOwn(data.conflictTip, ref))) {
     throw new Error('incomplete conflict pair state; operator repair required');
+  }
+  const redRefs = new Set([...Object.keys(data.mainRedMain), ...Object.keys(data.mainRedTip)]);
+  if ([...redRefs].some(ref => !Object.hasOwn(data.mainRedMain, ref) || !Object.hasOwn(data.mainRedTip, ref))) {
+    throw new Error('incomplete main-red pair state; operator repair required');
   }
   const retryRefs = new Set(retryKeys.flatMap(key => Object.keys(data[key])));
   if ([...retryRefs].some(ref => retryKeys.some(key => !Object.hasOwn(data[key], ref)))) {
@@ -317,6 +321,7 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
       const main = sha(run(['rev-parse', 'origin/main']));
       if (synced.retryMain[ref] === main && Date.now() < synced.retryAfter[ref]) { skip('cooldown'); continue; }
       const tip = sha(run(['rev-parse', `origin/${ref}`]));
+      if (synced.mainRedMain[ref] === main && synced.mainRedTip[ref] === tip) { skip('main-red-known'); continue; }
       const pairKnown = synced.conflictMain[ref] === main && synced.conflictTip[ref] === tip;
       // A known conflicting (main, tip) pair is final: silent skip (its one conflict event was already emitted).
       if (pairKnown) {
@@ -448,6 +453,18 @@ function failedTestReport(stdout, options) {
   });
   return report;
 }
+// Scope identities to their file; never infer a test identity from a failing filename.
+function assertionIdentity(file, assertion) {
+  if (typeof assertion.fullName === 'string' && assertion.fullName.trim()) {
+    return JSON.stringify([file, 'fullName', assertion.fullName]);
+  }
+  if (typeof assertion.title === 'string' && assertion.title.trim()
+    && Array.isArray(assertion.ancestorTitles)
+    && assertion.ancestorTitles.every(title => typeof title === 'string' && title.trim())) {
+    return JSON.stringify([file, 'title', assertion.ancestorTitles, assertion.title]);
+  }
+  return null;
+}
 async function syncTestEvidence({ root, scratch, selected, testReport, env, io, runner }) {
   io.rmSync(testReport, { force: true }); // Never consume a previous attempt's evidence.
   const invocation = buildHeavyTestInvocation({ root, scratch, selected, testReport, env, io });
@@ -474,14 +491,17 @@ async function syncTestEvidence({ root, scratch, selected, testReport, env, io, 
   const results = report?.testResults;
   if (!Array.isArray(results)) throw testFailure();
   const names = selected.map(file => join(io.realpathSync(scratch), file));
-  const failed = [], passed = [];
+  const failed = [], passed = [], failedAssertions = [];
   for (let i = 0; i < selected.length; i++) {
     const matches = results.filter(r => r?.name === names[i]);
     if (matches.length !== 1) continue;
     const r = matches[0], assertions = r.assertionResults;
     if (!Array.isArray(assertions) || !assertions.length
       || assertions.some(a => !['passed', 'failed'].includes(a?.status))) continue;
-    if (assertions.some(a => a.status === 'failed')) failed.push(selected[i]);
+    if (assertions.some(a => a.status === 'failed')) {
+      failed.push(selected[i]);
+      failedAssertions.push(...assertions.filter(a => a.status === 'failed').map(a => assertionIdentity(selected[i], a)));
+    }
     else if (r.status !== 'failed') passed.push(selected[i]);
   }
   const complete = passed.length + failed.length === selected.length
@@ -491,7 +511,7 @@ async function syncTestEvidence({ root, scratch, selected, testReport, env, io, 
   if (!commandOk && !(result?.status === 1 && !result.error && complete && failed.length)) {
     output({ ...result, step: 'tests' });
   }
-  return { green, failed, complete };
+  return { green, failed, complete, failedAssertions };
 }
 export async function runOverlayMainSync({ root, ref, token, env = process.env, deps = {} }) {
   const io = deps.io ?? fs, event = deps.appendOverlayEvent ?? appendOverlayEvent;
@@ -557,6 +577,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     output(git(['checkout', '--force', '-b', ref, `origin/${ref}`], scratch, [], { timeout: 300_000 }));
     const from = sha(git(['rev-parse', 'HEAD'], scratch));
     main = sha(git(['rev-parse', 'origin/main'], scratch));
+    if (synced.mainRedMain[ref] === main && synced.mainRedTip[ref] === from) return await skip('main-red-known');
     if (synced.conflictMain[ref] === main && synced.conflictTip[ref] === from) return await skip('conflict-known');
     const base = sha(git(['merge-base', main, from], scratch));
     const own = paths(git(['diff', '--name-only', '-z', base, from], scratch));
@@ -608,7 +629,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     // forced every scratch test run back onto the Mac. A local clone is cheap (hardlinked objects) and committed-only.
     if (io.existsSync(frontier)) output(git(['clone', '--quiet', '--local', frontier, join(scratchParent, 'frontierui')], scratchParent));
     setStep('tests');
-    const reruns = resolveOverlayFlakeReruns(env).value;
+    const { value: reruns, source: rerunsSource } = resolveOverlayFlakeReruns(env);
     for (let offset = 0; offset < tests.length; offset += 50) {
       const chunk = tests.slice(offset, offset + 50);
       const check = (selected, attempt, tree = scratch, runner = deps.testRunner) => syncTestEvidence({
@@ -628,7 +649,8 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
         remaining = evidence.failed;
       }
       if (evidence.green) {
-        event(root, { kind: 'overlay-main-flaky-retried', ref, files: retried }, { env });
+        event(root, { kind: 'overlay-main-flaky-retried', ref, files: retried,
+          flakeReruns: reruns, flakeRerunsSource: rerunsSource }, { env });
         continue;
       }
       let mainRed = false;
@@ -639,11 +661,18 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
         io.appendFileSync(join(mainScratch, '.git', 'info', 'exclude'), '\n/node_modules\n');
         io.symlinkSync(join(root, 'node_modules'), join(mainScratch, 'node_modules'), 'dir');
         const comparison = await check(remaining, 'main', mainScratch, deps.mainTestRunner ?? null);
-        mainRed = evidence.complete && evidence.failed.length === remaining.length
-          && comparison.complete && comparison.failed.length === remaining.length;
+        const mainFailures = new Set(comparison.failedAssertions);
+        mainRed = evidence.complete && evidence.failedAssertions.length > 0
+          && evidence.failedAssertions.every(identity => identity !== null)
+          && comparison.complete && comparison.failedAssertions.every(identity => identity !== null)
+          && evidence.failedAssertions.every(identity => mainFailures.has(identity));
       } catch { /* Unknown main evidence must retain the ordinary operator-review failure. */ }
       setStep('tests');
       if (mainRed) {
+        updateSyncState(sidecar(root, env), state => {
+          state.mainRedMain[ref] = main; state.mainRedTip[ref] = from;
+          clearRetry(state, ref);
+        }, io);
         event(root, { kind: 'overlay-main-red', ref, files: remaining }, { env });
         return await skip('main-red');
       }
@@ -682,6 +711,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
       state.lastSyncedMain[ref] = main;
       delete state.pushRetryAfter[ref]; delete state.pushRetryMain[ref];
       delete state.conflictMain[ref]; delete state.conflictTip[ref];
+      delete state.mainRedMain[ref]; delete state.mainRedTip[ref];
     }, io);
     const diagnostic = failureMarker(root, env, ref);
     transaction(diagnostic, () => io.rmSync(diagnostic, { force: true }), io);
