@@ -5,7 +5,7 @@
  */
 import { op } from './registry.mjs';
 import { compute, effect } from './step-kinds.mjs';
-import { QUESTION_HASH, findAudit } from './codex-audit.mjs';
+import { QUESTION_HASH, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes } from './codex-audit.mjs';
 import { carriesAcross } from '../lib/net-diff-fingerprint.mjs';
 export const PROTOTYPE_LOAD_OP = 'prototype-load';
 export const PROTOTYPE_LOAD_EFFECT = 'prototype-load.apply';
@@ -104,7 +104,12 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   if (own.some((d) => d.record.verdict === 'WEAKENED')) return { ok: false, reason: 'weakened' };
   // Round 3: a live-head WEAKENED that findAudit cannot use (contradictory findings, unparsable time) must not vanish
   // and leave the live head looking unaudited, which would let a carried pass decide. Only a foreign question is ignored.
-  if (!own.length && list.some((r) => r?.head === sha && r.base !== sha && r.verdict === 'WEAKENED' && r.questionHash === QUESTION_HASH)) return { ok: false, reason: 'weakened' };
+  // The same holds for a PRIOR-question WEAKENED still inside its accepted window (round 5): it is a real negative
+  // verdict on this head that findAudit may reject (contradictory findings), so the veto judges it by the same
+  // acceptance rule, with the same defaults, and an expired or unknown hash stays ignored.
+  const { priorQuestionHashes = resolvePriorQuestionHashes(), now = Date.now() } = auditOptions ?? {};
+  if (!own.length && list.some((r) => r?.head === sha && r.base !== sha && r.verdict === 'WEAKENED'
+    && isAcceptedQuestionHash(r.questionHash, { priorQuestionHashes, now, at: r.at }))) return { ok: false, reason: 'weakened' };
   const carriedWeak = carried.filter((d) => d.record.verdict === 'WEAKENED');
   if (carriedWeak.length) {
     const ownAt = Math.max(-Infinity, ...own.filter((d) => covered(d.base)).map((d) => Date.parse(d.record.at)));

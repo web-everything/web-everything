@@ -9,6 +9,14 @@ import { describe, it, expect, vi } from 'vitest';
 import { CANONICAL_QUESTION, QUESTION_HASH, main, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes, MAX_PRIOR_WINDOW_MS } from '../codex-audit.mjs';
 import { createAuditDeps } from '../codex-audit-io.mjs';
 
+// Lets one test swap the text codex-audit.mjs reads for its settings file; every other read passes through.
+const settingsOverride = vi.hoisted(() => ({ text: null }));
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal();
+  const readFileSync = (path, ...rest) => settingsOverride.text !== null && String(path).endsWith('settings/codex-audit.json') ? settingsOverride.text : actual.readFileSync(path, ...rest);
+  return { ...actual, readFileSync, default: { ...actual.default, readFileSync } };
+});
+
 const BASE = 'a'.repeat(40);
 const HEAD = 'b'.repeat(40);
 const ARGS = ['--base=origin/main', `--head=${HEAD}`];
@@ -472,6 +480,22 @@ describe('prior question hashes (AU1 PR-B)', () => {
     const bad = rec('NOT WEAKENED', { questionHash: QUESTION_HASH, ...over });
     expect(find([rec('NOT WEAKENED'), bad], open)).toBeNull();
     expect(find([bad, rec('NOT WEAKENED')], open)).toBeNull();
+  });
+  it('findAudit accepts configured prior hashes when options omit priorQuestionHashes', () => {
+    // The default parameter resolves the tool-layer setting; feed it a nonempty value through the mocked read.
+    const list = [{ hash: PRIOR, acceptUntil: '2099-01-01T00:00:00.000Z' }];
+    const prior = rec('NOT WEAKENED', { at: '2098-12-20T00:00:00.000Z' });
+    const omit = records => findAudit(records, { base: BASE, head: HEAD, questionHash: QUESTION_HASH, now: Date.parse('2098-12-25T00:00:00.000Z') });
+    try {
+      settingsOverride.text = JSON.stringify({ audit: { priorQuestionHashes: list } });
+      expect(omit([prior])).toBe(prior);
+      // the same configured window still honours a prior WEAKENED and the current-question block
+      const weak = rec('WEAKENED', { at: '2098-12-21T00:00:00.000Z', findings: ['x.mjs:1 gap'] });
+      expect(omit([prior, weak])).toBe(weak);
+      expect(omit([prior, rec('NOT WEAKENED', { questionHash: QUESTION_HASH, at: 'not-a-date' })])).toBeNull();
+    } finally { settingsOverride.text = null; }
+    // the shipped (empty) setting accepts nothing extra
+    expect(omit([prior])).toBeNull();
   });
   it('replay over a frozen copy of audits.jsonl is identical with priorQuestionHashes empty', () => {
     const dir = join(dirname(fileURLToPath(import.meta.url)), 'fixtures');

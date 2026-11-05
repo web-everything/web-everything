@@ -2074,6 +2074,28 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
     it('a current-question record for another base does not block the carried prior pass', () => {
       expect(carry(prior(), old({ fingerprint: undefined, base: 'f'.repeat(40) }))).toEqual({ ok: true, record: prior() });
     });
+    // Round 5: a live-head in-window prior-question WEAKENED must veto a carried current-question pass even when
+    // findAudit cannot use it (here: contradictory findings), and a usable one must keep blocking.
+    describe('a live-head prior-question WEAKENED record', () => {
+      const live = (o = {}) => auditRecord({ head: SHA, questionHash: PRIOR, verdict: 'WEAKENED', at: '2026-10-21T12:00:00Z', ...o });
+      const carried = () => old({ at: '2026-10-19T12:00:00Z' });
+      it('a usable in-window one blocks the carried current-question pass through canonicalAuditEvidence', () => {
+        expect(carry(carried(), live())).toEqual({ ok: false, reason: 'weakened' });
+        expect(carry(live(), carried())).toEqual({ ok: false, reason: 'weakened' });
+      });
+      it('an in-window one findAudit rejects (contradictory findings) still blocks the carried pass, in either order', () => {
+        const unusable = live({ findings: ['NOT WEAKENED'] });
+        expect(carry(carried(), unusable)).toEqual({ ok: false, reason: 'weakened' });
+        expect(carry(unusable, carried())).toEqual({ ok: false, reason: 'weakened' });
+      });
+      it('an out-of-window or unknown-hash one does not block (and the carried pass still holds)', () => {
+        expect(carry(carried(), live({ at: '2026-08-01T00:00:00Z', findings: ['NOT WEAKENED'] }))).toEqual({ ok: true, record: carried() });
+        expect(carry(carried(), live({ questionHash: 'd'.repeat(64), findings: ['NOT WEAKENED'] }))).toEqual({ ok: true, record: carried() });
+      });
+      it('a prior-question NOT WEAKENED on the live head never blocks the carried pass', () => {
+        expect(carry(carried(), live({ verdict: 'NOT WEAKENED', findings: ['WEAKENED'] }))).toEqual({ ok: true, record: carried() });
+      });
+    });
   });
   it('the base must still be covered by main', () => {
     expect(prototypeLoad.canonicalAuditEvidence([old()], SHA, () => false, FP)).toEqual({ ok: false, reason: 'no-record' });
