@@ -217,9 +217,10 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
           const attemptEnv = { ...childEnv, WE_VERIFY_REMOTE_REPORT: attemptRemoteReport };
           // A shard that must run here (needs-git) cannot go to Forge, so it queues for host load / a slot instead of
           // deferring at once. Bounded by the verify budget; a shard still without a slot then exits 75 as before.
-          const waitMs = !local && localWait.ms > 0 && needsGit({ argv: args, cwd }) ? Math.min(localWait.ms, remaining()) : 0;
+          const mustRunLocal = !local && needsGit({ argv: args, cwd });
+          const waitMs = mustRunLocal ? Math.min(localWait.ms, remaining()) : 0;
           const result = await execute({ command: local ? 'npx' : 'node',
-            args: local ? args.slice(1) : [HEAVY_ADMISSION_SCRIPT, 'run', ...(waitMs > 0 ? [`--wait-ms=${waitMs}`] : []), '--', ...args],
+            args: local ? args.slice(1) : [HEAVY_ADMISSION_SCRIPT, 'run', ...(mustRunLocal ? [`--wait-ms=${waitMs}`] : []), '--', ...args],
             files: attemptFiles, report, remoteReport: attemptRemoteReport, cwd, env: local ? { ...attemptEnv, [ADMISSION_HELD_ENV]: '1' } : attemptEnv,
             timeoutMs: remaining(), prefix: `[verify-shard ${index + 1}/${shards.length}] `, log });
           lastResult = result;
