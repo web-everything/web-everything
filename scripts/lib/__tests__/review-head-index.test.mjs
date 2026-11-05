@@ -515,6 +515,33 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     expect(m.lastReviewedHead).toBe(H(2));                      // B's row (txn b) survives and is the latest; C's is not promoted
     expect(Object.keys(m.history).sort()).toEqual(['p2', 'p3']);
   });
+  it('compaction preserves a retraction arriving before its own append (compaction is derived from the log snapshot, not the earlier read)', () => {
+    const { log } = headIndexPaths(dir);
+    nodeFs.mkdirSync(dir, { recursive: true });
+    const x = { repo: 'o/r', pr: 8, head: H(3), netPatchHash: 'p9', verdict: 'accept', at: '2026-11-04T09:00:00Z' };
+    writeFileSync(log, `${JSON.stringify({ ...x, txn: 'x' })}\n${JSON.stringify({ repo: 'o/r', pr: 7, head: H(1), netPatchHash: 'p1', verdict: 'accept', at: '2026-11-04T08:00:00Z' })}\n`);
+    let appended = false, done = false;
+    const fs = { ...nodeFs,
+      openSync: (p, f) => { if (f === 'a') appended = true; return nodeFs.openSync(p, f); },
+      readFileSync: (p, ...a) => { const out = nodeFs.readFileSync(p, ...a);
+        if (!appended && !done && p === log) { done = true; nodeFs.appendFileSync(log, `${JSON.stringify({ rollback: contentHash(x), txn: 'x' })}\n`); } // X's writer retracts it after our read of the index
+        return out; } };
+    rec({ fs, head: H(2), netPatchHash: 'p2', logMaxLines: 2 });  // 4 rows > 2: compacts
+    expect(done).toBe(true);
+    expect(readHeadIndex({ dir }).map['o/r#8']).toBeUndefined();   // the compacted log did not restore the retracted review
+    nodeFs.rmSync(headIndexPaths(dir).map, { force: true });
+    expect(readHeadIndex({ dir }).map['o/r#8']).toBeUndefined();   // nor does a rebuild from the compacted log
+    expect(readHeadIndex({ dir }).map['o/r#7'].lastReviewedHead).toBe(H(2));
+  });
+  it('a tombstone naming an unknown txn never removes a different transaction that still carries its own txn', () => {
+    const { log } = headIndexPaths(dir);
+    nodeFs.mkdirSync(dir, { recursive: true });
+    const base = { repo: 'o/r', pr: 7, head: H(2), netPatchHash: 'p2', verdict: 'accept', at: '2026-11-04T10:00:00Z' };
+    writeFileSync(log, [{ ...base, txn: 'b' }, { rollback: contentHash(base), txn: 'a' }].map(r => `${JSON.stringify(r)}\n`).join(''));
+    expect(readHeadIndex({ dir, keepPerPr: 20 }).map['o/r#7']).toMatchObject({ lastReviewedHead: H(2) }); // B's valid review survives A's delayed tombstone
+    writeFileSync(log, [{ ...base }, { rollback: contentHash(base), txn: 'a' }].map(r => `${JSON.stringify(r)}\n`).join(''));
+    expect(readHeadIndex({ dir, keepPerPr: 20 }).map['o/r#7']).toBeUndefined(); // a compacted (txn-less) copy is still retracted by content
+  });
   it('a late tombstone after the writer read the log never survives in the published map (map and logHash come from the same bytes)', () => {
     const first = { repo: 'o/r', pr: 7, head: H(1), netPatchHash: 'p1', verdict: 'accept', at: '2026-11-04T10:00:00Z' };
     rec();

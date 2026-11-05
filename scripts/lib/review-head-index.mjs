@@ -91,8 +91,11 @@ const parseLog = (text, keepPerPr) => {
   for (const l of lines) {
     const rec = JSON.parse(l);
     if (rec && typeof rec === 'object' && typeof rec.rollback === 'string' && Object.keys(rec).every(k => k === 'rollback' || k === 'txn')) {
-      let at = typeof rec.txn === 'string' ? kept.findLastIndex(k => k.rec.txn === rec.txn) : -1;
-      if (at < 0) at = kept.findLastIndex(k => k.hash === rec.rollback);
+      // A tombstone naming a txn that is not in the log means that row was compacted (rewritten without a txn): fall back to
+      // content, but only over rows that carry no txn, so another transaction's row with identical content is never taken.
+      const named = typeof rec.txn === 'string';
+      let at = named ? kept.findLastIndex(k => k.rec.txn === rec.txn) : -1;
+      if (at < 0) at = kept.findLastIndex(k => k.hash === rec.rollback && (!named || typeof k.rec.txn !== 'string'));
       if (at >= 0) kept.splice(at, 1);
       continue;
     }
@@ -238,8 +241,10 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
     // so we append a tombstone naming our row; replay then drops it, whatever else was appended around it.
     const lineBytes = Buffer.from(line);
     const tombstone = `${JSON.stringify({ rollback: contentHash(rec), txn })}\n`;
-    let before = null, compacted = null; // before: the log bytes we replaced when compacting; compacted: the bytes we wrote
+    let before = null, compacted = null, retracted = false, publishing = false; // before: the log bytes we replaced when compacting; compacted: the bytes we wrote
     const rollback = () => {
+      if (retracted) return;                                    // idempotent: a second retraction would tombstone a row that is already gone
+      retracted = true;
       try {
         if (compacted === null) {
           if (size(fs, log) === (sizeBefore ?? 0) + lineBytes.length) { if (sizeBefore === null) fs.unlinkSync(log); else fs.truncateSync(log, sizeBefore); return; }
@@ -252,9 +257,14 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
     };
     const fenced = () => { try { fence(); } catch (e) { rollback(); throw e; } };
     durable(fs, log, 'a', line);                                // 1. durable log line (fsynced)
+    try {
     fenced();                                                   //    lock lost during the append: roll the line back, no publish
-    const map = applyRecord(current.map, rec, keepPerPr);       // 2. compacted map, temp then rename
-    let lines = fs.readFileSync(log, 'utf8').split('\n').filter(l => l.trim()).length;
+    // 2. Everything below is derived from ONE snapshot of the log taken after our append, not from `current.map` (read before it):
+    // a retraction another writer appended in between is applied by the replay, so compaction cannot restore a retracted review.
+    const snapshot = fs.readFileSync(log);
+    const parsed = parseLog(snapshot.toString('utf8'), keepPerPr);
+    const map = parsed.map;
+    let lines = parsed.lines;
     if (lines > logMaxLines) { // 3. bound growth: rewrite the log from the compacted map, atomically, then the map
       const compact = Object.entries(map).flatMap(([k, v]) => {
         const [r, p] = [k.slice(0, k.lastIndexOf('#')), Number(k.slice(k.lastIndexOf('#') + 1))];
@@ -265,9 +275,11 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
         return [...older, { repo: r, pr: p, head: v.lastReviewedHead, netPatchHash: v.netPatchHash, verdict: v.verdict, at: v.at }];
       });
       const text = compact.map(c => `${JSON.stringify(c)}\n`).join('');
-      before = fs.readFileSync(log);
+      before = snapshot;
       if (!before.subarray(Math.max(0, before.length - lineBytes.length)).equals(lineBytes)) { rollback(); throw Error('review-head-index: log changed under the lock; refusing to compact'); }
       fenced();
+      // The rewrite replaces the file, so it must replace exactly the bytes the compaction was derived from.
+      if (!fs.readFileSync(log).equals(snapshot)) { rollback(); throw Error('review-head-index: log changed under the lock; refusing to compact'); }
       atomicWrite(fs, log, `${log}.tmp`, text);
       compacted = Buffer.from(text);
       fenced();                                                 // lock lost during the rewrite: put the replaced log back
@@ -277,8 +289,11 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
     // The map and its logHash come from the SAME bytes: a late append by a rejected writer (its row or its tombstone) can land
     // after this read, but then the hash no longer matches the log and readers rebuild.
     const raw = fs.readFileSync(log);
-    atomicWrite(fs, mapPath, tmp, JSON.stringify({ version: MAP_VERSION, logHash: hashText(raw), keepPerPr, map: parseLog(raw.toString('utf8'), keepPerPr).map }));
+    const published = JSON.stringify({ version: MAP_VERSION, logHash: hashText(raw), keepPerPr, map: parseLog(raw.toString('utf8'), keepPerPr).map });
+    publishing = true;
+    atomicWrite(fs, mapPath, tmp, published);
     return { ok: true, lines };
+    } catch (e) { if (!publishing) rollback(); throw e; }       // a failure before the map publish must not leave our row visible; once publishing, the log is ahead of the map and readers rebuild
   }, { fs });
 }
 
