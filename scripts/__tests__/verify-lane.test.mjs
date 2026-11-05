@@ -243,6 +243,20 @@ try {
     expectDead(grandchild);
   }, 70_000);
 
+  it('records the last output lines of a timed-out phase so the next timeout names the running test file', () => {
+    const gateScript = join(dir, 'hang-tail.mjs');
+    writeFileSync(gateScript, "console.log('RUN scripts/__tests__/the-slow-one.test.mjs'); console.log('token=' + 'Ab3' + 'xY9zQ7wK2mN'); setInterval(() => {}, 1000);\n");
+    const r = spawnSync('node', [VERIFY_LANE, `--gate=node ${gateScript}`, '--json'], { cwd: dir, encoding: 'utf8', timeout: 60_000,
+      env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_PHASE_TIMEOUT_MS: '2000' } });
+    const onDisk = JSON.parse(readFileSync(marker(), 'utf8'));
+    expect(onDisk.infrastructure).toMatchObject({ reason: 'verify-timeout' });
+    const tail = onDisk.infrastructure.outputTail;
+    expect(Array.isArray(tail) && tail.length <= 200).toBe(true);
+    expect(tail.join('\n')).toContain('the-slow-one.test.mjs');
+    expect(tail.join('\n')).not.toContain('xY9zQ7wK2mN');
+    expect(r.status).not.toBe(0);
+  }, 70_000);
+
   it('also kills a descendant reparented out of the tree that still holds the output pipe (audit finding 1)', () => {
     // The gate double-forks a sleeper (its parent exits at once, so it is reparented to init but keeps stdout open),
     // then hangs. Before: tree discovery missed it and 'close' never fired, so the run outlived its ceiling.
