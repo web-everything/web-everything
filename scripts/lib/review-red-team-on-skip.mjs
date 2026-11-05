@@ -544,6 +544,9 @@ export function readCompletePrReviews({ repo, pr, env = process.env, exec = runG
 function strictBodyKind(body, pr, head) {
   const parsed = parseRedTeamComment(body);
   if (!parsed) return false;
+  // Every finding-shaped line must have been parsed: an indented or oddly tagged one is silently skipped downstream.
+  const findingShaped = body.split(/\r?\n/).filter(line => /^\s*(?:\d+[.)]|[-*•])\s*\[/.test(line)).length;
+  if (findingShaped !== parsed.findings.length) return false;
   if (parsed.findings.some(finding => breakClass(finding) === 'broken')) return 'broken';
   if (parsed.findings.length !== 0) return false;
   const advisory = "Advisory only: this comment changes no label itself; the red-team gate (setting `redTeam.confirmedBreaks`) sends a confirmed broken break back to the fixer. Head `"
