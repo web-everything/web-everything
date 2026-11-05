@@ -11,8 +11,8 @@ it('stale-code-service is discoverable using an existing probe', () => {
 it('stale flag true/false and unreadable plist require operator action', () => {
   const cloneRoot = resolve('fixtures/clone');
   const findStale = vi.fn(() => [{ label: 'com.we.sampler', plistPath: 'sampler.plist', reason: 'stale-code' }, { label: null, plistPath: 'bad.plist', reason: 'plist-unreadable' }]);
-  const rows = smell.evaluate({ cloneLag: [{ cloneRoot }] }, { findStaleCodeServices: findStale, listCloneRoots: () => [cloneRoot] });
-  expect(findStale).toHaveBeenCalledWith({ cloneRoot, onFreshService: expect.any(Function) }); expect(rows).toHaveLength(3);
+  const rows = smell.evaluate({ cloneLag: [{ cloneRoot }] }, { findStaleCodeServices: findStale, listCloneRoots: () => [cloneRoot], env: {} });
+  expect(findStale).toHaveBeenCalledWith({ cloneRoot, selfLabel: null, onFreshService: expect.any(Function) }); expect(rows).toHaveLength(3);
   expect(rows.map(row => row.breach)).toEqual([false, true, true]);
   expect(rows[0].subject).toBe(`clone:${cloneRoot}:service:unknown`);
   expect(rows.slice(1).map(row => row.measure.reason)).toEqual(['stale-code', 'plist-unreadable']);
@@ -102,4 +102,61 @@ it.each(['thrown inspection', 'incomplete result', 'explicit unknown evidence'])
   expect(recovered.evaluations[0].results).toContainEqual(expect.objectContaining({
     subject: `clone:${f.cloneRoot}:service:unknown`, breach: false,
   }));
+});
+
+it('the watching daemon passes its own launchd label so it is never flagged for its own pre-adoption start', () => {
+  const cloneRoot = resolve('fixtures/clone');
+  const findStale = vi.fn(() => []);
+  smell.evaluate({ cloneLag: [{ cloneRoot }] }, { findStaleCodeServices: findStale, listCloneRoots: () => [cloneRoot], env: { XPC_SERVICE_NAME: 'com.we.adopter' } });
+  expect(findStale).toHaveBeenCalledWith(expect.objectContaining({ cloneRoot, selfLabel: 'com.we.adopter' }));
+});
+
+// Subjects that are never re-emitted (removed/renamed plist, service no longer clone-backed, recovered
+// agentsDir, retired clone) must still close, but only on positive evidence in the real health engine.
+function stuckFixture(subjectOf, seeded = { label: 'com.we.gone', plistPath: 'gone.plist', reason: 'stale-code' }) {
+  const f = episodeFixture();
+  const staleKey = subjectOf(f.cloneRoot);
+  let flags = [seeded];
+  f.inspect.mockImplementation(() => flags);
+  const probes = { selfSync: f.selfSync, cloneLag: [] };
+  const opened = runHealthTick(emptyHealthState(), probes, [f.descriptor], 1000);
+  const key = episodeKey(smell.id, staleKey);
+  expect(opened.state.episodes[key]?.status).toBe('open');
+  return { ...f, key, probes, opened, setFlags: v => { flags = v; } };
+}
+const serviceSubject = label => root => `clone:${root}:service:${label}`;
+it('a stale service whose plist was removed (never re-emitted) closes after a complete inspection', () => {
+  const f = stuckFixture(serviceSubject('com.we.gone'));
+  f.setFlags([]);
+  const next = runHealthTick(f.opened.state, f.probes, [f.descriptor], 2000);
+  expect(next.state.episodes[f.key]).toBeUndefined();
+  expect(next.transitions).toContainEqual(expect.objectContaining({ type: 'closed', key: f.key }));
+});
+it('a recovered unreadable agentsDir subject closes once the inspection completes', () => {
+  const f = stuckFixture(root => `clone:${root}:service:/Users/x/LaunchAgents`, { label: null, plistPath: '/Users/x/LaunchAgents', reason: 'plist-unreadable' });
+  f.setFlags([{ label: null, plistPath: '/Users/x/LaunchAgents', reason: 'plist-unreadable' }]);
+  const stillBad = runHealthTick(f.opened.state, f.probes, [f.descriptor], 2000);
+  expect(stillBad.state.episodes[f.key]?.status).toBe('open');
+  f.setFlags([]);
+  const recovered = runHealthTick(stillBad.state, f.probes, [f.descriptor], 3000);
+  expect(recovered.state.episodes[f.key]).toBeUndefined();
+});
+it.each([['unreadable plist elsewhere', [{ label: null, plistPath: 'other.plist', reason: 'plist-unreadable' }]],
+  ['thrown inspection', null]])('an absent subject stays open while the clone inspection is incomplete: %s', (_n, flags) => {
+  const f = stuckFixture(serviceSubject('com.we.gone'));
+  f.inspect.mockImplementation(() => { if (flags === null) throw new Error('cannot inspect'); return flags; });
+  const next = runHealthTick(f.opened.state, f.probes, [f.descriptor], 2000);
+  expect(next.state.episodes[f.key]?.status).toBe('open');
+  expect(next.transitions.some(t => t.type === 'closed' && t.key === f.key)).toBe(false);
+});
+it('an episode of a clone that left a fully-known managed inventory closes; unknown inventory keeps it open', () => {
+  const f = stuckFixture(serviceSubject('com.we.gone'));
+  const other = resolve('fixtures/other-clone');
+  f.setRoots([other]); f.setFlags([]);
+  const probes = { selfSync: [{ cloneKey: cloneKey(other) }], cloneLag: [] };
+  const retired = runHealthTick(f.opened.state, probes, [f.descriptor], 2000);
+  expect(retired.state.episodes[f.key]).toBeUndefined();
+  f.setRoots([]);
+  const unknown = runHealthTick(f.opened.state, f.probes, [f.descriptor], 2000);
+  expect(unknown.state.episodes[f.key]?.status).toBe('open');
 });

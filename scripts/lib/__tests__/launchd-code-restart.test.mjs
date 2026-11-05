@@ -256,7 +256,7 @@ describe('launchd clone restart', () => {
     expect(result.errors).toHaveLength(1);
   });
   it('two adopting processes contending for one label perform exactly one kickstart', async () => {
-    const root = await fsAsync.mkdtemp(join(process.env.TMPDIR, 'launchd-two-process-'));
+    const root = await fsAsync.mkdtemp(join(process.env.TMPDIR ?? '/tmp', 'launchd-two-process-'));
     const moduleUrl = pathToFileURL(resolve('scripts/lib/launchd-code-restart.mjs')).href;
     const workerSource = String.raw`
       import fs from 'node:fs/promises';
@@ -570,5 +570,54 @@ describe('launchd clone ownership: interpreter options and filesystem aliases', 
   it('unknown option followed by an operand then a clone script is still surfaced', () => {
     const o = fixture([{ ...sampler, ProgramArguments: ['/usr/local/bin/node', '--made-up-option', '512', join(cloneRoot, 'sampler.mjs')] }]);
     expect(findServicesRunningFromClone(o).unreadable).toHaveLength(1);
+  });
+});
+
+describe('python interpreter options never hide a clone script', () => {
+  const sampler = { Label: 'com.we.resource-sampler' };
+  it.each([
+    ['-O optimise flag', ['-O']],
+    ['-OO optimise flags', ['-OO']],
+    ['-O combined with -u', ['-O', '-u']],
+    ['-B -d -q -R flags', ['-B', '-d', '-q', '-R']],
+    ['-W with separate operand', ['-W', 'ignore']],
+    ['-W with attached operand', ['-Wignore']],
+    ['-X with separate operand', ['-X', 'dev']],
+    ['-X with attached operand', ['-Xdev']],
+    ['-O before -W operand', ['-O', '-W', 'error']],
+  ])('python %s before a clone script still matches (sync, async restart, stale detection)', async (_name, opts) => {
+    const o = fixture([{ ...sampler, ProgramArguments: ['/usr/bin/python3', ...opts, join(cloneRoot, 'sampler.py')] }]);
+    expect(findServicesRunningFromClone(o)).toEqual({ matches: [expect.objectContaining({ label: sampler.Label })], unreadable: [] });
+    expect((await restartServicesForClone(o)).restarted).toHaveLength(1);
+    expect(findStaleCodeServices({ ...o, readProcessStartMs: () => 1000, readAdoptedAtMs: () => 2000 }))
+      .toEqual([expect.objectContaining({ reason: 'stale-code' })]);
+  });
+  it('python -O with an unrelated script and a clone data path stays unrelated', () => {
+    const o = fixture([{ ...sampler, ProgramArguments: ['/usr/bin/python3', '-O', resolve('..', 'other', 'x.py'), cloneRoot] }]);
+    expect(findServicesRunningFromClone(o)).toEqual({ matches: [], unreadable: [] });
+  });
+});
+
+describe('stale detection honours the restart policy', () => {
+  const stale = o => findStaleCodeServices({ ...o, readProcessStartMs: () => 1000, readAdoptedAtMs: () => 2000 });
+  const svc = (Label, ProgramArguments = ['node', join(cloneRoot, 'sampler.mjs')]) => ({ Label, ProgramArguments });
+  it.each([
+    ['dev-server label', svc('com.we.dev-server')],
+    ['dev-server argv', svc('com.we.web', [join(cloneRoot, 'node_modules/.bin/vite')])],
+    ['non-allowed namespace', svc('com.other.writer')],
+    ['allowed but not approved stateless', svc('com.we.writer')],
+  ])('a service policy never restarts is not flagged stale: %s', (_n, plist) => {
+    const fresh = vi.fn();
+    expect(stale({ ...fixture([plist]), onFreshService: fresh })).toEqual([]);
+    expect(fresh).not.toHaveBeenCalled();
+  });
+  it('an explicitly denied label is not flagged; the approved sampler still is', () => {
+    const o = fixture([svc('com.we.resource-sampler'), svc('com.we.denied')]);
+    expect(stale({ ...o, settings: { deny: ['com.we.denied'], approvedStatelessLabels: ['com.we.resource-sampler', 'com.we.denied'] } }).map(f => f.label)).toEqual(['com.we.resource-sampler']);
+  });
+  it('the adopting daemon itself (selfLabel) is not flagged stale', () => {
+    const o = fixture([svc('com.we.resource-sampler')]);
+    expect(stale({ ...o, selfLabel: 'com.we.resource-sampler' })).toEqual([]);
+    expect(stale(o)).toHaveLength(1);
   });
 });

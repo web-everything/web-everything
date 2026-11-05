@@ -31,8 +31,11 @@ function codeArguments(args) {
   const result = { owners: [executable], unknownAt: null };
   if (!/^(?:node|nodejs|python(?:\d+(?:\.\d+)*)?|pypy\d*|bash|sh|zsh|dash|ksh|ruby|perl)$/.test(name)) return result;
   const noScript = new Set(['-e', '--eval', '-p', '--print', '-c', '-m', '--command']);
-  const operand = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader', '--conditions', '-W', '-X', '-O', '+O']);
-  const flag = /^(?:--(?:trace-warnings|no-warnings|no-deprecation|trace-deprecation|throw-deprecation|pending-deprecation|expose-gc|use-strict|harmony|preserve-symlinks|preserve-symlinks-main|abort-on-uncaught-exception|enable-source-maps|experimental-strip-types|noprofile|norc)|-[uBbEIsSOivx]+)$/;
+  // Only options that take a SEPARATE operand belong here. Python's -O/-OO are operand-free
+  // optimisation flags: listing them would swallow the script path and hide the service.
+  const operand = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader', '--conditions', '-W', '-X']);
+  // Operand-free short flags (python -B -E -I -O -P -R -S -b -d -i -q -s -u -v -x; ruby/perl -w -v), alone or combined.
+  const flag = /^(?:--(?:trace-warnings|no-warnings|no-deprecation|trace-deprecation|throw-deprecation|pending-deprecation|expose-gc|use-strict|harmony|preserve-symlinks|preserve-symlinks-main|abort-on-uncaught-exception|enable-source-maps|experimental-strip-types|noprofile|norc)|-[uBbEIsSOivxdqRPw]+)$/;
   for (let i = 1; i < args.length; i += 1) {
     const arg = args[i];
     if (arg === '--') { result.owners.push(...args.slice(i + 1, i + 2)); return result; }
@@ -41,7 +44,8 @@ function codeArguments(args) {
     if (arg.startsWith('-') || arg.startsWith('+')) {
       // `--name=value` carries its value attached, so it can never consume the next argument
       // (covers --max-old-space-size=N, --stack-size=N and the other V8/Node valued options).
-      if (flag.test(arg) || /^--[A-Za-z][\w-]*=/.test(arg)) continue;
+      // `-Wignore` / `-Xdev` carry their value attached too, so they never consume the next argument.
+      if (flag.test(arg) || /^--[A-Za-z][\w-]*=/.test(arg) || /^-[WX]./.test(arg)) continue;
       result.unknownAt = i;
       return result;
     }
@@ -226,6 +230,26 @@ const defaults = { enabled: true, allow: ['com.we.*', 'com.webeverything.*'], de
   // Namespace membership alone does not establish that a service is stateless.
   approvedStatelessLabels: ['com.we.resource-sampler'], minIntervalMs: 600_000 };
 
+// One policy for both restart and stale detection, so detection never alerts on a service
+// that policy intentionally leaves alone (dev servers, non-allowed or non-approved writers).
+function resolveRestartPolicy({ settings, platform, env, envValues, log }) {
+  const values = envValues ?? {
+    enabled: env.WE_DAEMON_SERVICE_RESTART_ENABLED === undefined ? undefined
+      : ({ true: true, false: false, '1': true, '0': false })[env.WE_DAEMON_SERVICE_RESTART_ENABLED],
+    minIntervalMs: env.WE_DAEMON_SERVICE_RESTART_MIN_INTERVAL_MS === undefined ? undefined : Number(env.WE_DAEMON_SERVICE_RESTART_MIN_INTERVAL_MS),
+  };
+  return cascadePolicy('daemon.serviceRestart', settings, { standard: defaults, platform, env, envValues: values,
+    valid: { enabled: v => typeof v === 'boolean', allow: patterns, deny: patterns,
+      approvedStatelessLabels: v => Array.isArray(v) && v.every(x => typeof x === 'string' && x.length > 0 && !x.includes('*')),
+      minIntervalMs: v => Number.isFinite(v) && v >= 0 }, log: line => safeLog(log, line) });
+}
+// Why policy never restarts this service (null when it is restartable). Independent of `enabled`.
+const neverRestartReason = (label, args, p) =>
+  /dev|vite|storybook|playground|npm-start/i.test(label) || devServer(args) ? 'built-in-never'
+  : p.deny.some(x => glob(label, x)) ? 'denied'
+  : !p.allow.some(x => glob(label, x)) ? 'not-allowed'
+  : !p.approvedStatelessLabels.includes(label) ? 'stateless-approval-required' : null;
+
 export async function restartServicesForClone({ settings, platform, env = process.env, envValues,
   launchctl = launchHost, uid = userId, log = console, now = Date.now, stateStore = diskState, lockStore = diskLocks,
   adoptedSha, signal, ...options } = {}) {
@@ -237,26 +261,14 @@ export async function restartServicesForClone({ settings, platform, env = proces
     safeLog(log, `daemon.serviceRestart ${kind} ${service.label ?? service.plistPath ?? '?'}: ${reason} (source ${source})`);
   };
   try {
-    const values = envValues ?? {
-      enabled: env.WE_DAEMON_SERVICE_RESTART_ENABLED === undefined ? undefined
-        : ({ true: true, false: false, '1': true, '0': false })[env.WE_DAEMON_SERVICE_RESTART_ENABLED],
-      minIntervalMs: env.WE_DAEMON_SERVICE_RESTART_MIN_INTERVAL_MS === undefined ? undefined : Number(env.WE_DAEMON_SERVICE_RESTART_MIN_INTERVAL_MS),
-    };
-    const policy = cascadePolicy('daemon.serviceRestart', settings, { standard: defaults, platform, env, envValues: values,
-      valid: { enabled: v => typeof v === 'boolean', allow: patterns, deny: patterns,
-        approvedStatelessLabels: v => Array.isArray(v) && v.every(x => typeof x === 'string' && x.length > 0 && !x.includes('*')),
-        minIntervalMs: v => Number.isFinite(v) && v >= 0 }, log: line => safeLog(log, line) });
+    const policy = resolveRestartPolicy({ settings, platform, env, envValues, log });
     source = JSON.stringify({ values: policy.value, sources: policy.sources });
     const { matches, unreadable } = await scanAsync({ ...options, signal });
     for (const bad of unreadable) report('flagged', bad, 'plist-unreadable: inspect and repair plist before restarting');
     const p = policy.value;
     for (const { args, ...service } of matches) {
       const { label } = service;
-      let reason = !p.enabled ? 'disabled'
-        : /dev|vite|storybook|playground|npm-start/i.test(label) || devServer(args) ? 'built-in-never'
-        : p.deny.some(x => glob(label, x)) ? 'denied'
-        : !p.allow.some(x => glob(label, x)) ? 'not-allowed'
-        : !p.approvedStatelessLabels.includes(label) ? 'stateless-approval-required' : null;
+      let reason = !p.enabled ? 'disabled' : neverRestartReason(label, args, p);
       if (reason) { report('skipped', service, reason); continue; }
       if (inFlight.has(label)) { report('skipped', service, 'restart-in-flight'); continue; }
       inFlight.add(label);
@@ -336,11 +348,18 @@ function processStart(label, { launchctl, uid, ps }) {
  * onFreshService reports positive clean evidence so health episodes can close without treating absence as clean. */
 export function findStaleCodeServices({ readProcessStartMs = processStart, onFreshService = () => {},
   readAdoptedAtMs = root => Date.parse(readRebuildState(root)?.adopted?.at ?? ''),
-  launchctl = printHost, uid = userId, ps = argv => execFileSync('ps', argv, commandOptions), ...options } = {}) {
+  launchctl = printHost, uid = userId, ps = argv => execFileSync('ps', argv, commandOptions),
+  settings, platform, env = process.env, envValues, log, ...options } = {}) {
   const { matches, unreadable } = scan(options);
   const flagged = unreadable.map(x => ({ label: null, ...x, reason: 'plist-unreadable' }));
+  // Same policy as the restart path; an unreadable policy fails closed into an unreadable flag.
+  let p = null, policyError = null;
+  try { p = resolveRestartPolicy({ settings, platform, env, envValues, log }).value; } catch (error) { policyError = error; }
   for (const { args, ...service } of matches) {
     try {
+      if (policyError) throw policyError;
+      // Services policy never restarts are neither stale nor fresh evidence: stay silent.
+      if (neverRestartReason(service.label, args, p)) continue;
       const start = readProcessStartMs(service.label, { launchctl, uid, ps });
       if (start === null) { onFreshService(service); continue; }
       if (!Number.isFinite(start)) throw new Error('unreadable process start');

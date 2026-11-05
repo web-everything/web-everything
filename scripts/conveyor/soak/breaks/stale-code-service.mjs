@@ -98,6 +98,14 @@ export default {
           || after.intent?.sha !== ADOPTED_SHA) {
         violations.push({ invariant: 'restart-on-adoption', detail: 'expected exactly one kickstart with persisted adoption intent' });
       }
+      // A python service started with the operand-free -O flag must stay visible to restart and stale detection.
+      if (helper) {
+        const cloneRoot = join(ROOT, 'fixtures', 'sampler-clone');
+        const seen = helper.findServicesRunningFromClone({ cloneRoot, agentsDir: join(ROOT, 'fixtures', 'LaunchAgents'),
+          listPlists: () => ['py.plist'],
+          readPlist: () => ({ Label: LABEL, ProgramArguments: ['/usr/bin/python3', '-O', join(cloneRoot, 'sampler.py')] }) });
+        if (seen.matches.length !== 1) violations.push({ invariant: 'interpreter-option', detail: 'python -O hid a clone-backed service from restart and stale detection' });
+      }
       log?.(`stale-code-service: without restart=${before.stale.length}, with restart=${after.stale.length}, kicks=${after.kicks.length}`);
       return { violations, report: { before, after } };
     } catch (error) {

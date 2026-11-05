@@ -22,8 +22,11 @@ export default {
   missingSubjectsUnknown: true,
   openAfter: 1, closeAfter: 1, severity: 'high', action: 'alert',
   recommendationHint: 'Inspect the LaunchAgent and rebuild state; restart approved stateless samplers onto adopted code.',
-  evaluate({ selfSync, cloneLag }, { findStaleCodeServices: findStale = findStaleCodeServices, listCloneRoots = managedRoots } = {}) {
-    const rows = [], roots = new Set();
+  evaluate({ selfSync, cloneLag }, { findStaleCodeServices: findStale = findStaleCodeServices, listCloneRoots = managedRoots,
+    episodes, env = process.env } = {}) {
+    // The watching daemon is itself clone-backed and restarts through self-sync, not as a service to alert on.
+    const selfLabel = env.XPC_SERVICE_NAME || env.LAUNCH_JOB_LABEL || null;
+    const rows = [], roots = new Set(), completeRoots = new Set();
     try {
       const managed = listCloneRoots();
       if (!Array.isArray(managed)) throw new Error('managed clone list unreadable');
@@ -42,11 +45,13 @@ export default {
       const fresh = [];
       let flags;
       try {
-        flags = findStale({ cloneRoot, onFreshService: service => fresh.push(service) });
+        flags = findStale({ cloneRoot, selfLabel, onFreshService: service => fresh.push(service) });
         if (!Array.isArray(flags)) throw new Error('service inspection returned incomplete evidence');
         // Recover the synthetic inspection-failure episode independently of service
         // freshness. Returned unknown evidence still owns that subject and cannot clear it.
         const inspectionSubject = subject(cloneRoot, {});
+        // Complete = every flag is a per-service result; an unreadable plist, directory or process table hides services.
+        if (flags.every(flag => typeof flag.label === 'string')) completeRoots.add(cloneRoot);
         if (!flags.some(flag => subject(cloneRoot, flag) === inspectionSubject)) rows.push({
           subject: inspectionSubject, breach: false, measure: { cloneRoot, inspection: 'complete' },
           summary: 'Service inspection completed successfully; individual service results remain authoritative.',
@@ -68,6 +73,19 @@ export default {
         // A readable fresh plist also clears its earlier label-unknown read-error subject.
         if (service.plistPath) rows.push({ ...clean, subject: subject(cloneRoot, { plistPath: service.plistPath }) });
       }
+    }
+    // missingSubjectsUnknown keeps an episode open when its subject is not re-emitted. Close it only on
+    // positive evidence: its clone was inspected completely (service removed, renamed or no longer
+    // clone-backed), or coverage is fully known and the clone left the managed inventory.
+    const inventoryKnown = roots.size > 0 && !rows.some(row => row.breach && row.subject.startsWith('coverage:'));
+    const emitted = new Set(rows.map(row => row.subject));
+    for (const ep of Object.values(episodes ?? {})) {
+      if (ep?.smell !== 'stale-code-service' || typeof ep.subject !== 'string' || emitted.has(ep.subject)) continue;
+      const cloneRoot = /^clone:(.+?):service:/.exec(ep.subject)?.[1];
+      if (cloneRoot === undefined || !(completeRoots.has(cloneRoot) || inventoryKnown && !roots.has(cloneRoot))) continue;
+      rows.push({ subject: ep.subject, breach: false, measure: { cloneRoot },
+        summary: 'Service is no longer observed in a complete inspection of its clone, or the clone is no longer managed.',
+        recommendation: 'No repair needed.' });
     }
     return rows;
   },
