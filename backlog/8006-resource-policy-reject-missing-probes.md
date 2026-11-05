@@ -1,4 +1,5 @@
 ---
+bornAs: xjk5gog
 kind: story
 size: 2
 status: open
@@ -6,7 +7,7 @@ dateOpened: "2026-11-04"
 tags: []
 ---
 
-# Reject impossible memory totals in we:scripts/lib/memory-available.mjs:46 instead of clamping to 100%
+# Shared admission must refuse fresh snapshots with missing CPU or memory-pressure probes (we:scripts/lib/resource-policy.mjs:80)
 
 TODO digest — one ≤100-word paragraph: what this item does and why (replace this line).
 
