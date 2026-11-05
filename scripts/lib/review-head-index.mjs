@@ -256,12 +256,13 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
       } catch { /* best effort: the fence error below is what the caller sees */ }
     };
     const fenced = () => { try { fence(); } catch (e) { rollback(); throw e; } };
-    durable(fs, log, 'a', line);                                // 1. durable log line (fsynced)
     try {
+    durable(fs, log, 'a', line);                                // 1. durable log line (fsynced); a failed fsync after the write retracts it too
     fenced();                                                   //    lock lost during the append: roll the line back, no publish
     // 2. Everything below is derived from ONE snapshot of the log taken after our append, not from `current.map` (read before it):
     // a retraction another writer appended in between is applied by the replay, so compaction cannot restore a retracted review.
     const snapshot = fs.readFileSync(log);
+    if (!snapshot.includes(lineBytes)) throw Error('review-head-index: appended row missing from the log; refusing to publish'); // never report ok for a lost append
     const parsed = parseLog(snapshot.toString('utf8'), keepPerPr);
     const map = parsed.map;
     let lines = parsed.lines;

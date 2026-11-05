@@ -533,6 +533,24 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     expect(readHeadIndex({ dir }).map['o/r#8']).toBeUndefined();   // nor does a rebuild from the compacted log
     expect(readHeadIndex({ dir }).map['o/r#7'].lastReviewedHead).toBe(H(2));
   });
+  it('an fsync failure after the append retracts our row; a snapshot that lacks our row is refused, never reported ok', () => {
+    rec();
+    const { log } = headIndexPaths(dir);
+    let logFd = null, fail = true;
+    const failing = { ...nodeFs,
+      openSync: (p, f) => { const fd = nodeFs.openSync(p, f); if (f === 'a' && p === log) logFd = fd; return fd; },
+      fsyncSync: fd => { if (fail && fd === logFd) throw Error('EIO'); return nodeFs.fsyncSync(fd); } };
+    expect(() => rec({ fs: failing, head: H(2), netPatchHash: 'p2' })).toThrow(/EIO/);
+    fail = false;
+    expect(readHeadIndex({ dir }).map['o/r#7'].history.p2).toBeUndefined(); // the written-but-unflushed row is not visible
+    const sizeBefore = nodeFs.statSync(log).size;
+    let appended = false;
+    const lost = { ...nodeFs,
+      openSync: (p, f) => { if (f === 'a' && p === log) appended = true; return nodeFs.openSync(p, f); },
+      readFileSync: (p, ...a) => { const out = nodeFs.readFileSync(p, ...a); return appended && p === log && !a.length ? out.subarray(0, sizeBefore) : out; } };
+    expect(() => rec({ fs: lost, head: H(3), netPatchHash: 'p3' })).toThrow(/appended row missing/);
+    expect(readHeadIndex({ dir }).map['o/r#7'].history.p3).toBeUndefined();
+  });
   it('a tombstone naming an unknown txn never removes a different transaction that still carries its own txn', () => {
     const { log } = headIndexPaths(dir);
     nodeFs.mkdirSync(dir, { recursive: true });
