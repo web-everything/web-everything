@@ -2210,6 +2210,18 @@ describe('readyEvidence fingerprint carry (R503)', () => {
     const fresh = green({ sha: SHA });
     expect(prototypeLoad.readyEvidence([weak({ sha: SHA }), fresh], input, [], FP)).toEqual({ source: 'ready-record', record: fresh });
   });
+  // Fail closed on the current head's own latest record, whatever its shape: it is authoritative unless green NOT WEAKENED.
+  it.each([
+    ['a later red-tests NOT WEAKENED record', [weak({ sha: SHA }), green({ sha: SHA, tests: 'red' })]],
+    ['an unrecognised verdict string', [green({ sha: SHA, audit: 'WEAKENED (R396 pending)' })]],
+    ['a trailing-space verdict', [green({ sha: SHA, audit: 'WEAKENED ' })]],
+    ['a FAIL verdict', [green({ sha: SHA, audit: 'FAIL' })]],
+    ['a missing verdict', [green({ sha: SHA, audit: undefined })]],
+  ])('the current head\'s latest record (%s) is not masked by an older carried green record', (_, exactRecords) => {
+    expect(prototypeLoad.readyEvidence([green(), ...exactRecords], input, [], FP)).toBeNull();
+    // ...nor by an older carried ruled exception with its allowlist entry
+    expect(prototypeLoad.readyEvidence([weak(), ...exactRecords], input, [entry()], FP)).toBeNull();
+  });
   it('a current-head WEAKENED record for another ref or sha does not veto', () => {
     const older = green();
     expect(prototypeLoad.readyEvidence([older, weak({ sha: SHA, ref: 'lane/other' })], input, [], FP)).toEqual({ source: 'ready-record', record: older });
@@ -2277,16 +2289,29 @@ describe('readyEvidence fingerprint carry (R503)', () => {
       const out = await auditedFixture('warn', { ready: auditLines([weak()]), settings: { ruledWeakened: [entry()] }, fingerprint }).run();
       expect(out.gate).toMatchObject({ ruledWeakened: { ruling: 'R396' } });
       expect(fingerprint).toHaveBeenCalledTimes(1);
+      // The entry alone is a trigger: the record stores no fingerprint, so only the entry's fingerprint can start the read.
+      const alone = vi.fn(() => FP);
+      const refused = await auditedFixture('warn', { ready: auditLines([weak({ fingerprint: undefined })]), settings: { ruledWeakened: [entry()] }, fingerprint: alone }).run();
+      expect(refused).toMatchObject({ ok: false, stopReason: 'no-ready' });
+      expect(alone).toHaveBeenCalledTimes(1);
     });
     it.each([
-      ['an exact-sha ready record', [green({ sha: SHA })]],
-      ['an other-sha ready record without a fingerprint', [green({ fingerprint: undefined, sha: SHA })]],
-    ])('%s never triggers the read', async (_, records) => {
+      ['an exact-sha ready record', [green({ sha: SHA })], { source: 'ready-record' }],
+      ['an other-sha ready record without a fingerprint', [green({ fingerprint: undefined })], null],
+    ])('%s never triggers the read', async (_, records, gate) => {
       const fingerprint = vi.fn(() => FP);
       const f = auditedFixture('warn', { ready: auditLines(records), fingerprint });
-      expect((await f.run()).gate).toMatchObject({ source: 'ready-record' });
+      const out = await f.run();
+      if (gate) expect(out.gate).toMatchObject(gate); else expect(out).toMatchObject({ ok: false, stopReason: 'no-ready' });
       expect(fingerprint).not.toHaveBeenCalled();
-      expect(branchFetches(f)).toBe(await baselineFetches());
+      if (gate) expect(branchFetches(f)).toBe(await baselineFetches());
+      else expect(branchFetches(f)).toBe(0); // refused at the ready stage, before any fetch of the live branch
+    });
+    it('a failed (null) read is memoized too: the audit stage does not repeat it', async () => {
+      const fingerprint = vi.fn(() => null);
+      const f = auditedFixture('warn', { ready: auditLines([green(), green({ sha: SHA })]), audits: auditLines([oldAudit()]), fingerprint });
+      await f.run();
+      expect(fingerprint).toHaveBeenCalledTimes(1);
     });
     it('the ready and audit stages share ONE read (memoized across stages)', async () => {
       const fingerprint = vi.fn(() => FP);

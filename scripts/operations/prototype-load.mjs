@@ -31,8 +31,10 @@ export function readyEvidence(records, input, ruledWeakened = [], liveFpSource =
   // An explicit verdict recorded for the CURRENT head outranks carried evidence: when the latest audit verdict naming the
   // live sha exactly (any tests state, either case) is WEAKENED, an older carried NOT WEAKENED record must not mask it;
   // the head then loads only through the ruled-exception path below. A later exact-head NOT WEAKENED re-audit lifts it.
-  const exact = records.filter((r) => r?.ref === input.branch && r.sha === input.sha && /^(?:NOT )?WEAKENED$/i.test(r.audit || '')).at(-1);
-  const headWeakened = /^WEAKENED$/i.test(exact?.audit || '');
+  // Fail closed on the shape too: the latest record for the live sha counts whatever its verdict string or tests state, and
+  // anything but a green NOT WEAKENED record (red tests, WEAKENED, an unrecognised or malformed verdict) is authoritative.
+  const exact = records.filter((r) => r?.ref === input.branch && r.sha === input.sha).at(-1);
+  const headWeakened = !!exact && !(exact.tests === 'green' && /^NOT WEAKENED$/i.test(exact.audit || ''));
   const record = headWeakened ? null : records.find((r) => covers(r) && r.tests === 'green' && /^NOT WEAKENED$/i.test(r.audit || ''));
   if (record) return { source: 'ready-record', record };
   // The allowlist entry binds to the record by its exact sha, or (carry) by holding the live fingerprint itself.
