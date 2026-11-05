@@ -379,3 +379,40 @@ describe('R593 degraded coverage (R559)', () => {
     expect(git(work, 'rev-parse', 'HEAD')).toBe(tip);
   });
 });
+
+describe('R593 empty directory tree entries (R559)', () => {
+  const tokenDir = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8';
+  const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+  /** A commit whose root tree carries `<name>` as an EMPTY subtree entry (git add can never produce this; mktree can). */
+  const emptyDirCommit = (name, repo = lane, parent = tip) => {
+    const base = git(repo, 'rev-parse', `${parent}^{tree}`);
+    const entries = git(repo, 'ls-tree', base).split('\n').filter(Boolean);
+    const mk = spawnSync('git', ['mktree'], { cwd: repo, input: `${entries.join('\n')}\n040000 tree ${EMPTY_TREE}\t${name}\n`, encoding: 'utf8' });
+    if (mk.status !== 0) throw new Error(mk.stderr);
+    const out = spawnSync('git', [...ident, 'commit-tree', mk.stdout.trim(), '-p', parent, '-m', 'empty dir'], { cwd: repo, encoding: 'utf8' });
+    if (out.status !== 0) throw new Error(out.stderr);
+    return out.stdout.trim();
+  };
+  it('flags a token in an empty directory entry name (no blob below it)', async () => {
+    const head = emptyDirCommit(tokenDir);
+    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ path: 'tree-entry-name', finding: 'github-token' });
+  });
+  it('flags a token in an empty directory nested under a real directory', async () => {
+    await fs.mkdir(join(lane, 'pkg'));
+    const parentSha = await commit(lane, { 'pkg/a.txt': 'a\n' }, 'pkg');
+    const pkgTree = git(lane, 'rev-parse', `${parentSha}:pkg`);
+    const inner = spawnSync('git', ['mktree'], { cwd: lane, input: `100644 blob ${git(lane, 'rev-parse', `${parentSha}:pkg/a.txt`)}\ta.txt\n040000 tree ${EMPTY_TREE}\t${tokenDir}\n`, encoding: 'utf8' }).stdout.trim();
+    expect(inner).not.toBe(pkgTree);
+    const root2 = spawnSync('git', ['mktree'], { cwd: lane, input: `${git(lane, 'ls-tree', `${parentSha}^{tree}`).split('\n').filter(l => !l.endsWith('\tpkg')).join('\n')}\n040000 tree ${inner}\tpkg\n`, encoding: 'utf8' }).stdout.trim();
+    const head = spawnSync('git', [...ident, 'commit-tree', root2, '-p', parentSha, '-m', 'nested empty dir'], { cwd: lane, encoding: 'utf8' }).stdout.trim();
+    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ path: 'tree-entry-name', finding: 'github-token' });
+  });
+  it('flags it when a later commit removed the empty directory (historical tree entry still travels)', async () => {
+    const bad = emptyDirCommit(tokenDir);
+    const clean = spawnSync('git', [...ident, 'commit-tree', git(lane, 'rev-parse', `${tip}^{tree}`), '-p', bad, '-m', 'drop'], { cwd: lane, encoding: 'utf8' }).stdout.trim();
+    expect(await scanBundleRange({ cwd: lane, head: clean, prerequisite: runnerMain, exec })).toMatchObject({ path: 'tree-entry-name', finding: 'github-token' });
+  });
+  it('passes an empty directory entry with a clean name', async () => {
+    expect(await scanBundleRange({ cwd: lane, head: emptyDirCommit('vendor-empty'), prerequisite: runnerMain, exec })).toBeNull();
+  });
+});
