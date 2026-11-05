@@ -471,3 +471,112 @@ describe('plain snapshots containing literal diff-like text', () => {
     expect(seams.writeBody).not.toHaveBeenCalled();
   });
 });
+
+// PR #6409 review: each clause of the "history is complete" condition and each bound gets its own named test.
+describe('readAuthorStampEdits — complete, bounded history only', () => {
+  const connection = (nodes, extra = {}) => ({ totalCount: nodes.length, pageInfo: { hasNextPage: false }, nodes, ...extra });
+  const reply = (userContentEdits) => JSON.stringify({ data: { repository: { pullRequest: { userContentEdits } } } });
+  const stamped = (n) => Array.from({ length: n }, (_, i) =>
+    edit(`Original body\n\n${buildAuthorActorMarker(ID)}`, AUTHOR, new Date(Date.parse('2026-10-01T00:00:00Z') + i * 60_000).toISOString()));
+  // Real readAuthorStampEdits behind restoreAuthorStamp: only the gh transport is injected.
+  const transportSeams = (userContentEdits) => ({ pr: 6244, repo: 'o/r', readPr: vi.fn(() => live()),
+    exec: vi.fn(() => reply(userContentEdits)), writeBody: vi.fn(), log: vi.fn() });
+
+  it.each([
+    ['a next page exists (hasNextPage:true)', () => connection(history(), { pageInfo: { hasNextPage: true } })],
+    ['hasNextPage is missing', () => connection(history(), { pageInfo: {} })],
+    ['hasNextPage is null', () => connection(history(), { pageInfo: { hasNextPage: null } })],
+    ['pageInfo is missing', () => connection(history(), { pageInfo: undefined })],
+    ['totalCount exceeds the nodes returned (truncated page)', () => connection(history(), { totalCount: 4 })],
+    ['totalCount is below the nodes returned', () => connection(history(), { totalCount: 2 })],
+    ['totalCount is missing', () => connection(history(), { totalCount: undefined })],
+    ['totalCount is not an integer', () => connection(history(), { totalCount: '3' })],
+    ['more than 100 nodes arrive in one reply', () => connection(stamped(101))],
+  ])('refuses incomplete history when %s, and restore writes nothing', async (_name, make) => {
+    expect(() => readAuthorStampEdits(6244, { repo: 'o/r', exec: () => reply(make()) }))
+      .toThrow(/incomplete edit history/);
+    const seams = transportSeams(make());
+    const result = await restoreAuthorStamp(seams);
+    expectReason(result, 'refuse');
+    expect(result.reason).toMatch(/incomplete edit history/);
+    expect(seams.writeBody).not.toHaveBeenCalled();
+  });
+
+  it('restores through the same transport when the history is complete (control for the refusals above)', async () => {
+    const seams = transportSeams(connection(history()));
+    expectReason(await restoreAuthorStamp(seams), 'restore');
+    expect(seams.writeBody).toHaveBeenCalledTimes(1);
+  });
+
+  it('requests at most 100 edit snapshots in one call with an 8 MiB buffer', () => {
+    const exec = vi.fn(() => reply(connection([])));
+    readAuthorStampEdits(6244, { repo: 'owner/name', exec });
+    expect(exec).toHaveBeenCalledTimes(1);
+    const [cmd, args, options] = exec.mock.calls[0];
+    expect(cmd).toBe('gh');
+    expect(args.find((a) => a.startsWith('query='))).toContain('userContentEdits(first:100)');
+    expect(args).toEqual(expect.arrayContaining(['owner=owner', 'name=name', 'number=6244']));
+    expect(options).toEqual(expect.objectContaining({ maxBuffer: 8 * 1024 * 1024 }));
+  });
+
+  it.each([
+    ['empty repo', '', 6244], ['repo without owner', 'name', 6244], ['three-part repo', 'o/r/x', 6244],
+    ['blank owner', ' /r', 6244], ['blank name', 'o/ ', 6244], ['non-string repo', null, 6244],
+    ['zero PR', 'o/r', 0], ['negative PR', 'o/r', -1], ['fractional PR', 'o/r', 1.5],
+    ['non-numeric PR', 'o/r', 'abc'], ['leading-zero PR', 'o/r', '01'], ['injected PR', 'o/r', '1 -f x=y'],
+  ])('refuses a %s before any request', (_name, repo, pr) => {
+    const exec = vi.fn();
+    expect(() => readAuthorStampEdits(pr, { repo, exec })).toThrow(/invalid repository or PR number/);
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('plans from exactly 100 snapshots but refuses 101 handed in by another reader', () => {
+    expect(plan({ edits: stamped(100) })).toMatchObject({ action: 'restore', id: ID });
+    const result = plan({ edits: stamped(101) });
+    expectReason(result, 'refuse');
+    expect(result.reason).toMatch(/snapshot bound/);
+  });
+});
+
+describe('sweepAuthorStamps — listing bounds', () => {
+  const listed = (number, body = buildAuthorActorMarker(ID)) => ({ number, body, author: { login: `app/${AUTHOR}` } });
+
+  it('throws on a listing that hit the 100-PR cap, before any per-PR read', () => {
+    const seams = io({ repo: 'o/stamp-cap', listPrs: () => Array.from({ length: 100 }, (_, i) => listed(i + 1, BODY)) });
+    expect(() => sweepAuthorStamps(seams)).toThrow(/capped PR listing/);
+    expect(seams.readPr).not.toHaveBeenCalled();
+    expect(seams.writeBody).not.toHaveBeenCalled();
+  });
+
+  it('sweeps a 99-PR listing of stamped PRs with skips only', () => {
+    const seams = io({ repo: 'o/stamp-99', listPrs: () => Array.from({ length: 99 }, (_, i) => listed(i + 1)) });
+    const results = sweepAuthorStamps(seams);
+    expect(results).toHaveLength(99);
+    expect(results.every((r) => r.action === 'skip')).toBe(true);
+    expect(seams.readPr).not.toHaveBeenCalled();
+  });
+
+  it.each([null, {}, 'prs'])('throws on an unreadable listing: %j', (prs) => {
+    expect(() => sweepAuthorStamps(io({ repo: 'o/stamp-bad', listPrs: () => prs }))).toThrow(/unreadable or capped/);
+  });
+
+  it.each([0, -1, 1.5, '7', null])('refuses listed PR number %j without reading or writing', (number) => {
+    const seams = io({ repo: `o/stamp-num-${String(number)}`, listPrs: () => [listed(number, BODY)] });
+    const [result] = sweepAuthorStamps(seams);
+    expectReason(result, 'refuse');
+    expect(result.reason).toMatch(/invalid listed PR number/);
+    expect(seams.readPr).not.toHaveBeenCalled();
+    expect(seams.writeBody).not.toHaveBeenCalled();
+  });
+});
+
+describe('restoreAuthorStamp — the historical marker is written verbatim', () => {
+  it('preserves a noncanonical historical marker byte-for-byte', async () => {
+    const marker = `<!--authored-by-actor:\t${ID}   -->`;
+    expect(marker).not.toBe(buildAuthorActorMarker(ID));
+    expect(readAuthorActorStamps(marker)).toEqual([ID]);
+    const seams = io({ readEdits: vi.fn(() => [edit(`Original body\n\n${marker}  `)]) });
+    expectReason(await restoreAuthorStamp(seams), 'restore');
+    expect(seams.writeBody).toHaveBeenCalledWith(6244, `${BODY}\n\n${marker}\n`);
+  });
+});

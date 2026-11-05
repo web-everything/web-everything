@@ -40,6 +40,13 @@ vi.mock('../../../scripts/conveyor/human-surface-repark.mjs', async (importOrigi
   const actual = await importOriginal();
   return { ...actual, sweepHumanSurfaceRepark: (...args) => sweepHumanSurfaceReparkMock(...args) };
 });
+// PR #6409 review: the author-stamp sweep shells real `gh` reads. The daemon and the real hold sweep both import
+// this one wrapper, so a test can prove the stamp sweep is reached through the unmocked hold sweep.
+const sweepAuthorStampsMock = vi.fn(() => []);
+vi.mock('../../../scripts/lib/author-stamp-restore.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, sweepAuthorStamps: (...args) => sweepAuthorStampsMock(...args) };
+});
 
 import {
   runDaemonLoop, runReviewTick, runReviewTickAllRepos, REVIEW_DAEMON_REPOS, buildCliDaemonEffects, realSleep,
@@ -1680,6 +1687,33 @@ describe('runReviewTick — the review-hold reconcile sweep (#x01u7az)', () => {
     expect(holdReconcile).toHaveBeenCalledWith({ repo: 'o/n', restoreStamps: sweepAuthorStamps,
       listPrs: expect.any(Function) });
     expect(listedPrs).toBe(prs);
+  });
+
+  it('runs the stamp sweep exactly once through the real hold sweep on the shared-reads path', async () => {
+    const { sweepReviewHoldLabels: realSweep } = await vi.importActual('../../../scripts/conveyor/review-hold-reconcile.mjs');
+    // Only the hold sweep's GitHub-facing seams are hermetic; the daemon's own arguments pass through untouched.
+    sweepReviewHoldLabelsMock.mockImplementationOnce((opts) => realSweep({
+      provider: { currentRepo: () => 'o/n', readPrState: () => ({}), setLabels: () => {}, postComment: () => {} },
+      exec: () => '', numberingRestamp: () => null, readComments: () => [], acceptCarry: () => null,
+      settings: { referralDefault: 'operator' },
+      readPr: ({ number }) => ({ number, state: 'OPEN', headRefOid: 'a'.repeat(40), labels: [], comments: [] }),
+      log: () => {}, ...opts,
+    }));
+    sweepAuthorStampsMock.mockClear();
+    sweepAuthorStampsMock.mockReturnValueOnce([
+      { num: 6244, action: 'restore', detail: { reason: 'history agrees' } },
+      { num: 6245, action: 'skip', detail: { reason: 'already stamped' } },
+    ]);
+    const r = runReviewTick({
+      reconcile: () => ({ dispatch: [], refusals: [] }), dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {},
+      statusCandidates: () => [], repo: 'o/n',
+      readPrs: () => [{ number: 6244, labels: [] }, { number: 6245, labels: [] }], readAgents: () => [],
+    });
+    expect(sweepAuthorStampsMock).toHaveBeenCalledTimes(1);
+    expect(sweepAuthorStampsMock).toHaveBeenCalledWith(expect.objectContaining({ repo: 'o/n', dryRun: false }));
+    expect(r.holdReconcile.filter((h) => h.stampRestore)).toEqual([
+      { num: 6244, stampRestore: 'restore', detail: { reason: 'history agrees' } },
+    ]);
   });
 
   it('folds a real finding onto the tick result under `holdReconcile`', () => {
