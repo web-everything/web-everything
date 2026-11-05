@@ -531,9 +531,33 @@ describe('launchd clone ownership: interpreter options and filesystem aliases', 
     const o = { ...fixture([{ ...sampler, ProgramArguments: ['/usr/local/bin/node', join(lexical, 'sampler.mjs')] }]), cloneRoot: join(real, 'x') };
     expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
   });
-  it('an unreadable realpath fails closed as unreadable evidence', () => {
-    const o = { ...fixture([{ ...sampler, ProgramArguments: ['/usr/local/bin/node', '/elsewhere/sampler.mjs'] }]),
+  it('an unreadable clone root fails closed as unreadable evidence', async () => {
+    const o = { ...fixture([{ ...sampler, ProgramArguments: ['/usr/local/bin/node', join(cloneRoot, 'sampler.mjs')] }]),
       realpath: () => { throw Object.assign(new Error('EACCES'), { code: 'EACCES' }); } };
+    expect(findServicesRunningFromClone(o).unreadable).toHaveLength(1);
+    const asyncOptions = { ...o, realpath: async () => { throw Object.assign(new Error('EACCES'), { code: 'EACCES' }); } };
+    expect((await restartServicesForClone(asyncOptions)).flagged).toHaveLength(1);
+    expect(o.launchctl).not.toHaveBeenCalled();
+  });
+  it('an unresolvable path unrelated to the clone does not flag the service (sync and async)', async () => {
+    const fails = path => { if (path.startsWith('/protected')) throw Object.assign(new Error('EPERM'), { code: 'EPERM' }); return path; };
+    const o = { ...fixture([{ ...sampler, ProgramArguments: ['/usr/local/bin/node', '/protected/run.mjs'] }]), realpath: fails };
+    expect(findServicesRunningFromClone(o)).toEqual({ matches: [], unreadable: [] });
+    expect((await restartServicesForClone({ ...o, realpath: async p => fails(p) })).flagged).toEqual([]);
+  });
+  it('an unresolvable realpath on a path inside the clone still matches, sync and async alike', async () => {
+    const o = { ...fixture(), realpath: path => { if (path.startsWith(cloneRoot + '/')) throw Object.assign(new Error('EACCES'), { code: 'EACCES' }); return path; } };
+    expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
+    expect((await restartServicesForClone({ ...o, realpath: async p => o.realpath(p) })).restarted).toHaveLength(1);
+  });
+  it.each([
+    ['later data path', ['/usr/local/bin/node', '--made-up-option', '/other/x.mjs', 'mode', join(cloneRoot, 'cfg.json')]],
+    ['option operand then other script', ['/usr/local/bin/node', '--made-up-option', 'v', '/other/x.mjs', join(cloneRoot, 'cfg.json')]],
+  ])('unknown option does not flag on a clone path in script data: %s', (_n, ProgramArguments) => {
+    expect(findServicesRunningFromClone(fixture([{ ...sampler, ProgramArguments }]))).toEqual({ matches: [], unreadable: [] });
+  });
+  it('unknown option followed by an operand then a clone script is still surfaced', () => {
+    const o = fixture([{ ...sampler, ProgramArguments: ['/usr/local/bin/node', '--made-up-option', '512', join(cloneRoot, 'sampler.mjs')] }]);
     expect(findServicesRunningFromClone(o).unreadable).toHaveLength(1);
   });
 });

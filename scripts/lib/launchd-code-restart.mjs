@@ -110,13 +110,18 @@ function parsePlist(p, { selfLabel, plistPath }) {
   // not this process's cwd. Only explicit absolute/home-relative paths prove ownership.
   return { label: p.Label, plistPath, args, unknownOption: unknownAt === null ? null : args[unknownAt],
     paths: owners.filter(isPathArg).map(expand),
-    unknownPaths: unknownAt === null ? [] : args.slice(unknownAt + 1).filter(isPathArg).map(expand) };
+    // The script is the first non-option argument after the unknown option, or the second
+    // when that option consumed an operand. Later arguments are script data, not code.
+    unknownPaths: unknownAt === null ? []
+      : args.slice(unknownAt + 1).filter(a => !a.startsWith('-') && !a.startsWith('+')).slice(0, 2).filter(isPathArg).map(expand) };
 }
 
 // Lexical prefix OR same location after resolving symlinks/aliases (/var vs /private/var).
 function decide(parsed, { root, canonRoot, canon }) {
   if (!parsed) return null;
-  const owned = paths => paths.some(path => inside(path, root) || inside(canon(path), canonRoot));
+  // canon() returns null when a path cannot be resolved (permission, loop): that path is
+  // unrelated evidence we cannot link to the clone, so it does not flag the service.
+  const owned = paths => paths.some(path => inside(path, root) || (canon(path) !== null && inside(canon(path), canonRoot)));
   if (owned(parsed.paths)) return { label: parsed.label, plistPath: parsed.plistPath, args: parsed.args };
   // An unclassifiable option hides the script position: if a clone path follows it, say so
   // instead of silently excluding the service from restart and stale detection.
@@ -146,8 +151,12 @@ async function scanAsync({ cloneRoot, agentsDir = join(homedir(), 'Library', 'La
     try {
       const parsed = parsePlist(await readPlist(plistPath), { selfLabel, plistPath });
       const resolved = new Map();
-      for (const path of parsed ? [...parsed.paths, ...parsed.unknownPaths] : []) resolved.set(path, await canonicalAsync(path, realpath));
-      const match = decide(parsed, { root, canonRoot, canon: path => resolved.get(path) });
+      // Same laziness as the sync scan: only paths the lexical check did not already claim.
+      for (const path of parsed ? [...parsed.paths, ...parsed.unknownPaths] : []) {
+        if (inside(path, root)) continue;
+        resolved.set(path, await canonicalAsync(path, realpath).catch(() => null));
+      }
+      const match = decide(parsed, { root, canonRoot, canon: path => resolved.get(path) ?? null });
       if (match) matches.push(match);
     } catch (error) { unreadable.push({ plistPath, error: message(error) }); }
   }
@@ -168,7 +177,7 @@ function scan({ cloneRoot, agentsDir = join(homedir(), 'Library', 'LaunchAgents'
     const plistPath = resolve(agentsDir, file);
     try {
       const match = decide(parsePlist(readPlist(plistPath), { selfLabel, plistPath }),
-        { root, canonRoot, canon: path => canonicalSync(path, realpath) });
+        { root, canonRoot, canon: path => { try { return canonicalSync(path, realpath); } catch { return null; } } });
       if (match) matches.push(match);
     } catch (error) { unreadable.push({ plistPath, error: message(error) }); }
   }
