@@ -279,13 +279,18 @@ describe('ignorableConfirmRunIds chronology and closed scan', () => {
     return { repo, pr, head, comments: [accept()], reviews: [], labels: ['review:accepted', 'red-team:pending'],
       runsDir: 'fixture-runs', now: acceptedAt + 10_000,
       list: vi.fn(() => Object.keys(records)), read: vi.fn(id => records[id]),
-      // Recent writes must not override read-start chronology.
-      stat: vi.fn(() => ({ mtimeMs: acceptedAt + 1000 })) };
+      // A superseded confirm must have both started and last been written before acceptance.
+      stat: vi.fn(() => ({ mtimeMs: before })) };
   }
   function scan(f) {
     expect(mod.ignorableConfirmRunIds, 'export the fail-closed confirm-run scanner').toBeTypeOf('function');
     return mod.ignorableConfirmRunIds(f);
   }
+  it.each([acceptedAt + 1000, acceptedAt - RUN_MTIME_SLACK_MS, undefined, NaN, Infinity])(
+    'refuses an old-start confirm with late or unreadable last-write time %s', mtimeMs => {
+      const f = scanFixture(); f.stat = () => ({ mtimeMs });
+      expect(scan(f)).toEqual({ ok: false, ids: [] });
+    });
   it('ignores only old needs-human confirm runs, excluding finished and unrelated runs', () => {
     const f = scanFixture({ 'review-pr-confirm': run(),
       'review-pr-finished': run({ verdict: { verdict: 'accept' }, pending: null }),
@@ -365,6 +370,68 @@ describe('ignorableConfirmRunIds chronology and closed scan', () => {
     const records = Object.fromEntries(Array.from({ length: 401 }, (_, i) => [`review-pr-${i}`, run()]));
     const f = scanFixture(records); expect(scan(f)).toEqual({ ok: false, ids: [] });
     expect(f.read.mock.calls.length).toBeLessThanOrEqual(400);
+  });
+});
+
+describe('pending removal requires a review that can start', () => {
+  it.each(['missing evidence', 'unreadable evidence', 'cooldown', 'formal hold', 'unreadable reviews'])(
+    'retains pending for %s', kind => {
+      const o = runFixture({ readEvidence: () => evidence({ loopPayload: undefined }) });
+      if (kind === 'missing evidence') o.readEvidence = () => undefined;
+      if (kind === 'unreadable evidence') o.readEvidence = () => { throw Error('evidence offline'); };
+      if (kind === 'cooldown') o.lastDispatch.set(`${repo}#${pr}@${head}`, o.now() - 1);
+      if (kind === 'formal hold') {
+        o.rawPrs[0].comments = [];
+        o.rawPrs[0].reviews = [{ state: 'CHANGES_REQUESTED', submittedAt: iso(acceptedAt + 1) }];
+      }
+      if (kind === 'unreadable reviews') {
+        o.rawPrs[0].comments = []; o.rawPrs[0].reviews = null; o.readReviews = () => { throw Error('offline'); };
+      }
+      const row = mod.runRedTeamOnSkip(o).rows[0];
+      expect(row.action).toBe('skip'); expect(row).not.toHaveProperty('settle');
+      expect(o.settlePending).not.toHaveBeenCalled(); expect(o.dispatch).not.toHaveBeenCalled();
+    });
+  it.each([
+    { lanes: 0, budget: { left: 1 } }, { lanes: 1, budget: { left: 0 } },
+    { lanes: 1, remainingStarts: 0 }, undefined,
+  ])('retains pending when execution capacity is exhausted: %j', capacity => {
+    const o = runFixture({ capacity, readEvidence: () => evidence({ loopPayload: undefined }) });
+    mod.runRedTeamOnSkip(o);
+    expect(o.settlePending).not.toHaveBeenCalled(); expect(o.dispatch).not.toHaveBeenCalled();
+  });
+});
+
+describe('head-bound default pending settlement', () => {
+  function setup(state = { headRefOid: head, labels: [{ name: 'red-team:pending' }, { name: 'keep-me' }] }) {
+    const provider = { readPrState: vi.fn(() => state), setLabels: vi.fn() };
+    expect(mod.settlePendingFor).toBeTypeOf('function');
+    return { provider, settle: mod.settlePendingFor({ provider, env: {} }) };
+  }
+  it('reads the live head and removes only pending', () => {
+    const { provider, settle } = setup();
+    settle({ repo, pr, head, remove: ['keep-me'] });
+    expect(provider.readPrState).toHaveBeenCalledWith(repo, pr);
+    expect(provider.setLabels).toHaveBeenCalledOnce();
+    expect(provider.setLabels).toHaveBeenCalledWith(repo, pr, { remove: ['red-team:pending'] });
+  });
+  it('refuses a head moved since planning', () => {
+    const { provider, settle } = setup({ headRefOid: old, labels: ['red-team:pending'] });
+    expect(settle({ repo, pr, head })).toEqual({ skipped: 'head-moved' });
+    expect(provider.setLabels).not.toHaveBeenCalled();
+  });
+  it.each([['red-team:pending', 'red-team:blocked'], [{ name: 'red-team:pending' }, { name: 'red-team:blocked' }],
+    ['keep-me'], undefined].map(labels => [labels]))('preserves blocked, absent or unreadable pending labels %j', labels => {
+    const { provider, settle } = setup({ headRefOid: head, labels });
+    try { settle({ repo, pr, head }); } catch { /* Unreadable labels may throw, but never write. */ }
+    expect(provider.setLabels).not.toHaveBeenCalled();
+  });
+  it.each(['not-owed', 'pending-only-conflict'])('unreadable live state reports settleError for %s', kind => {
+    const { provider, settle } = setup();
+    provider.readPrState.mockImplementation(() => { throw Error('live state unreadable'); });
+    const o = runFixture({ settlePending: settle,
+      ...(kind === 'pending-only-conflict' ? { readEvidence: () => evidence({ loopPayload: undefined }) } : {}) });
+    expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ settle: kind, settleError: 'live state unreadable' });
+    expect(provider.setLabels).not.toHaveBeenCalled(); expect(o.dispatch).not.toHaveBeenCalled();
   });
 });
 
