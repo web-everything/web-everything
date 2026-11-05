@@ -95,3 +95,48 @@ describe('R622 several unfinished reviews', () => {
     expect(settledFor([mk('review-pr-a', T - 7200e3), mk('review-pr-b', T - 3600e3)])).toMatchObject({ ok: true });
   });
 });
+
+describe('R622 capped scan settles from the reader\'s own boundary, not a fabricated one', () => {
+  // maxParses=1 reads only the newest-mtime record; the other record stays unread, so the reader reports scan-capped.
+  const finished = startedAt => ({ op: 'review-pr', input: { repo: 'o/r', pr }, findings: { read: { netBasis: { rev: other } } },
+    stepTimings: [{ step: 'read', startedAt: new Date(startedAt).toISOString() }], verdict: { verdict: 'accept' } });
+  const scanSettings = { file: { runs: { scan: { maxParses: 1 } } }, platform: {}, env: {} };
+  const capped = (unreadMtime, readMtime = unreadMtime + 60e3) => {
+    const mtimes = { 'review-pr-new': readMtime, 'review-pr-old': unreadMtime };
+    return readDrainRedTeamEvidence({ repo: 'o/r', pr, head, env: { WE_SHARED_RUNS_DIR: '/nonexistent-r622' }, runsDir: '/runs', scanSettings, warn: () => {},
+      list: () => Object.keys(mtimes), stat: p => ({ mtimeMs: mtimes[p.split('/').pop().replace('.json', '')] }),
+      read: id => (id === 'review-pr-new' ? finished(T - 7200e3) : finished(T - 9000e3)), readScorecards: () => [], now: T });
+  };
+  it('the reader reports scan-capped with the first unread record\'s mtime as the boundary', () => {
+    const evidence = capped(T - 3600e3);
+    expect(evidence).toMatchObject({ ok: false, reason: 'scan-capped' });
+    expect(evidence.settleBounds).toMatchObject({ unreadBoundaryAt: T - 3600e3 });
+  });
+  it('an unread record older than the result comment (by the mtime slack) settles', () => {
+    expect(settleUnknownEvidenceByComment(capped(T - 3600e3), [comment()], pr, head)).toMatchObject({ ok: true, settledByComment: 'scan-capped' });
+  });
+  it('an unread record newer than the result comment stays held', () => {
+    expect(settleUnknownEvidenceByComment(capped(T + 60e3, T + 120e3), [comment()], pr, head)).toMatchObject({ ok: false, reason: 'scan-capped' });
+  });
+  it('an unread record inside the mtime slack of the result comment stays held', () => {
+    expect(settleUnknownEvidenceByComment(capped(T - 1000, T - 500), [comment()], pr, head)).toMatchObject({ ok: false, reason: 'scan-capped' });
+  });
+});
+
+describe('R622 settlement uses the NEWEST trusted result comment for this head', () => {
+  const at = (iso, rev = head, findings = [], login = 'web-everything') => ({ ...comment(rev, findings, login), createdAt: new Date(iso).toISOString() });
+  const bounds = { unfinishedStartedAt: T - 1800e3, unreadBoundaryAt: T - 3600e3 };
+  const stale = at(T - 3600e3), fresh = at(T);
+  it('an old comment alone (before the unfinished review) stays held', () => {
+    expect(holdFor(unknown('review-unfinished', bounds), [stale])).toMatch(/evidence unknown/);
+  });
+  it('a newer comment settles whichever order the comments arrive in', () => {
+    expect(holdFor(unknown('review-unfinished', bounds), [stale, fresh])).toBeNull();
+    expect(holdFor(unknown('review-unfinished', bounds), [fresh, stale])).toBeNull();
+  });
+  it('an old comment never settles when the newest is untrusted, for another head, or lacks a time', () => {
+    for (const noise of [at(T, head, [], 'someone-else'), at(T, other), { ...comment(), createdAt: undefined }]) {
+      expect(holdFor(unknown('review-unfinished', bounds), [stale, noise])).toMatch(/evidence unknown/);
+    }
+  });
+});
