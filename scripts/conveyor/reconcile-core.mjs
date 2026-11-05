@@ -1582,22 +1582,29 @@ function advisoryHeadState(pr) {
   return { headSha, latest, advisoryIsCurrent, alreadyReviewed, unpinnedAdvisory };
 }
 
-/** Chronology grants nothing when any trusted review has an unreadable time or an unpinned head. */
-function latestHeadReview(pr) {
+/** Unreadable or unpinned history grants nothing; cross-head chronology must agree with thread order. */
+function latestHeadReview(pr, { currentHeadOnly = false } = {}) {
   const reviews = (Array.isArray(pr?.comments) ? pr.comments : [])
     .filter(c => isTrustedMarkerAuthor(c) && (isReviewVerdictComment(c) || latestAdvisory([c])))
     // Operator send-backs are requests, not finished reviews of a head.
     .filter(c => !isOperatorAuthored(c) || !openOperatorSendBacks({ comments: [c] }).length)
     .map(c => ({ head: reviewedHeadsOf(c).at(-1) ?? latestAdvisory([c])?.head, at: Date.parse(c.createdAt) }));
   if (!reviews.length || reviews.some(r => !r.head || !Number.isFinite(r.at))) return null;
-  reviews.sort((a, b) => b.at - a.at);
-  if (reviews.length > 1 && reviews[0].at === reviews[1].at) return null;
-  return reviews[0];
+  const current = reviews.filter(r => sameHeadSha(r.head, pr.headRefOid));
+  if (currentHeadOnly) {
+    // Other heads' clocks cannot hide a newer operator request on this head.
+    current.sort((a, b) => b.at - a.at);
+    if (current.length > 1 && current[0].at === current[1].at) return null;
+    return current[0] ?? null;
+  }
+  // Coverage is independent of chronology: a skewed old-head review cannot reopen this head.
+  if (current.length || reviews.some((r, i) => i > 0 && r.at <= reviews[i - 1].at)) return null;
+  return reviews.at(-1);
 }
 
 /** A fresh operator request takes ownership even when this head already has its advisory. */
 function operatorSendBackAfterReview(pr) {
-  const review = latestHeadReview(pr);
+  const review = latestHeadReview(pr, { currentHeadOnly: true });
   if (!review || !sameHeadSha(review.head, pr.headRefOid)) return null;
   const item = openOperatorSendBacks(pr).at(-1);
   if (!item?.body || !Number.isFinite(Date.parse(item.at)) || Date.parse(item.at) <= review.at
