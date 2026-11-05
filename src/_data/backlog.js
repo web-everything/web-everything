@@ -26,10 +26,15 @@ const { readRaisedBy, withRaisedBy } = require('../../scripts/lib/raised-by.cjs'
 const matter = require('gray-matter');
 const { createHash } = require('node:crypto');
 const { createBacklogIndex } = require('../../scripts/lib/backlog-index.cjs');
-const LOADER_VERSION = createHash('sha1')
-  .update(readFileSync(__filename))
-  .update(JSON.parse(readFileSync(require.resolve('gray-matter/package.json'), 'utf8')).version)
-  .digest('hex');
+// The cache key covers every file whose content changes what a card loads as: this loader, the shared scope
+// glob-overlap rule normalizeScope calls (editing that rule alone must invalidate the cached index), and gray-matter.
+const LOADER_VERSION_FILES = [__filename, require.resolve('../../scripts/lib/scope-glob-overlap.cjs')];
+const computeLoaderVersion = (read = (path) => readFileSync(path)) => {
+  const hash = createHash('sha1');
+  for (const file of LOADER_VERSION_FILES) hash.update(read(file));
+  return hash.update(JSON.parse(readFileSync(require.resolve('gray-matter/package.json'), 'utf8')).version).digest('hex');
+};
+const LOADER_VERSION = computeLoaderVersion();
 const { normalizeRelatedReport } = require('../../scripts/lib/related-report.cjs');
 const { entryGlobsMayMeet } = require('../../scripts/lib/scope-glob-overlap.cjs');
 const MarkdownIt = require('markdown-it');
@@ -168,10 +173,14 @@ function inferLocusFromScope(scope) {
   // do not invent a locus for a bare path. Scheduling's normalizeScope still qualifies every bare path.
   const list = normalizeScope(scope, '');
   if (!list) return null;
+  // An entry whose globs may meet stays whole (several pieces in one string): look at EVERY piece, not only the
+  // first, or a bare leading glob would hide a later explicit repo prefix and pick the wrong gate.
   for (const entry of list) {
-    const m = /^([a-z][a-z0-9-]*):/i.exec(entry);
-    const locus = m && Object.hasOwn(SCOPE_PREFIX_LOCUS, m[1].toLowerCase()) ? SCOPE_PREFIX_LOCUS[m[1].toLowerCase()] : null;
-    if (locus) return locus;
+    for (const piece of entry.split(/[\s,]+/)) {
+      const m = /^([a-z][\w-]*):/i.exec(piece);
+      const locus = m && Object.hasOwn(SCOPE_PREFIX_LOCUS, m[1].toLowerCase()) ? SCOPE_PREFIX_LOCUS[m[1].toLowerCase()] : null;
+      if (locus) return locus;
+    }
   }
   return null;
 }
@@ -1074,6 +1083,8 @@ module.exports.HUMAN_GATE_KINDS = HUMAN_GATE_KINDS;
 // Named export of the pure `scope:` sanitizer (#x53zzf9) for direct regression testing — inert to the
 // Eleventy build, which only invokes the default function export.
 module.exports.normalizeScope = normalizeScope;
+// Pure cache-key derivation, exported so a test can prove every dependency file feeds the hash.
+module.exports.computeLoaderVersion = computeLoaderVersion;
 // Expose the declared prefixes so parity tests cover newly added aliases automatically.
 module.exports.SCOPE_PREFIX_LOCUS = SCOPE_PREFIX_LOCUS;
 // Named export of the pure has-predicted-scope lens predicate (#2618) for direct regression testing — inert

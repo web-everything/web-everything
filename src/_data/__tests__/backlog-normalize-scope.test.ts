@@ -11,7 +11,7 @@ import { repoProfile } from '../../../scripts/lib/repo-profile.mjs';
 import { LOCI } from '../../../scripts/check-standards-rules.mjs';
 
 const require = createRequire(import.meta.url);
-const { normalizeScope, SCOPE_PREFIX_LOCUS, inferLocusFromScope } = require('../backlog.js');
+const { normalizeScope, SCOPE_PREFIX_LOCUS, inferLocusFromScope, computeLoaderVersion } = require('../backlog.js');
 const matter = require('gray-matter');
 
 // Historical malformed scopes restored by the PR #6244 operator cleanup. They must remain refused;
@@ -301,5 +301,33 @@ describe('backlog loader normalizeScope — multi-path entries (R372)', () => {
     expect(normalizeScope(['we:scripts/lib/'])).toEqual(['we:scripts/lib/']);
     expect(normalizeScope([' , ', ''])).toBeUndefined();
     expect(normalizeScope('we:a')).toBeUndefined();
+  });
+
+  // Round 11 — a kept-whole entry (its globs may meet) used to show locus inference only its FIRST piece, so a bare
+  // leading glob hid a later explicit `fui:`/`plateau:` prefix and the item was gated in the wrong repo.
+  describe('locus inference sees every piece of a kept-whole entry', () => {
+    it.each([
+      ['space', 'src/a*.mjs fui:src/a*b.mjs', 'frontierui'],
+      ['comma', 'src/a*.mjs, plateau:src/a*b.mjs', 'plateau-app'],
+      ['alias + case', 'src/a*.mjs FrontierUI:src/a*b.mjs', 'frontierui'],
+    ])('bare glob first, explicit prefix later (%s)', (_label, entry, locus) => {
+      // Guard the premise: the entry really is kept whole (one string), so inference cannot rely on a split.
+      expect(normalizeScope([entry], '')).toHaveLength(1);
+      expect(inferLocusFromScope([entry])).toBe(locus);
+    });
+    it('still reports no locus for an all-bare entry and takes the first explicit prefix otherwise', () => {
+      expect(inferLocusFromScope(['src/a*.mjs src/a*b.mjs'])).toBeNull();
+      expect(inferLocusFromScope(['we:src/a*.mjs fui:src/a*b.mjs'])).toBe('webeverything');
+    });
+  });
+
+  // Round 11 — the loader cache version must cover every file normalizeScope's behaviour depends on.
+  it('loader cache version changes when the shared glob-overlap rule file changes', () => {
+    const files: Record<string, string> = {};
+    const read = (path: string) => files[path] ?? readFileSync(path, 'utf8');
+    const base = computeLoaderVersion(read);
+    files[require.resolve('../../../scripts/lib/scope-glob-overlap.cjs')] = 'module.exports = {};';
+    expect(computeLoaderVersion(read)).not.toBe(base);
+    expect(computeLoaderVersion(read)).toBe(computeLoaderVersion(read));
   });
 });
