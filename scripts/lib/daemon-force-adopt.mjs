@@ -86,11 +86,14 @@ export function forceRequestFor(root, env, sha, now = Date.now) {
 const removeQuietly = (p) => { try { rmSync(p, { force: true }); } catch { /* unreachable state dir: nothing to clear */ } };
 export const clearForceAdopt = (root, env = process.env) => removeQuietly(requestPath(root, env));
 export const readForceWatch = (root, env = process.env) => readJson(watchPath(root, env));
-/** Rollbacks owed but whose marker could not be written to disk, keyed by watch path (this process only). */
+/** Rollbacks owed but whose marker could not be written to disk, keyed by watch path (this process only). Each entry keeps the
+ *  whole watch, so the obligation survives a lost or unreadable watch file. */
 const pendingRollbacks = new Map();
 const clearWatch = (root, env) => { pendingRollbacks.delete(watchPath(root, env)); removeQuietly(watchPath(root, env)); };
 /** The in-process marker applies only to the build it was recorded for: a later watch on the same path starts clean. */
 const pendingFor = (root, env, sha) => { const p = pendingRollbacks.get(watchPath(root, env)); return p && p.sha === sha ? p.reason : undefined; };
+/** The watch on disk, else the one an unsaved obligation is kept for in memory (a rollback owed must not vanish with its file). */
+const currentWatch = (root, env) => readForceWatch(root, env) ?? pendingRollbacks.get(watchPath(root, env))?.watch ?? null;
 
 /** true only when the line really landed: a forced adoption refuses to proceed unless every audit sink wrote. */
 const appendLine = (p, line) => { try { mkdirSync(dirname(p), { recursive: true }); appendFileSync(p, line); return true; } catch { return false; } };
@@ -100,6 +103,8 @@ const appendLine = (p, line) => { try { mkdirSync(dirname(p), { recursive: true 
 export async function recordForcedAdoption({ root, env = process.env, request, sha, lastGood, smoke: rawSmoke, emit, now = Date.now }) {
   // A second force while a watch is open would overwrite its lastGood with the first forced (unproven) build.
   if (readForceWatch(root, env)) return { ok: false, reason: 'watch-already-open' };
+  // A rollback owed but never saved to disk (the state write failed) still binds: fail closed until it is paid, never adopt over it.
+  if (pendingRollbacks.has(watchPath(root, env))) return { ok: false, reason: 'rollback-owed' };
   const at = new Date(now()).toISOString();
   // Check names come from the candidate's own smoke rows: keep them to printable ASCII and bounded, so they cannot forge audit lines.
   const smoke = rawSmoke ? { ...rawSmoke, failed: (rawSmoke.failed || []).slice(0, 20).map((n) => String(n).replace(/[^\x20-\x7e]/g, '?').slice(0, 80)) } : rawSmoke;
@@ -173,14 +178,23 @@ export function evaluateForceWatch({ watch, healthy, restarts = 0, maxRestarts =
 
 /** One tick of the post-force health watch. `probe(root)` -> { healthy, restarts? }; `rollback(lastGood)` -> { ok }. */
 export async function runForceWatchTick({ root, env = process.env, probe, rollback, emit, now = Date.now, notBefore = null, currentHead = null }) {
-  let watch = readForceWatch(root, env);
+  let watch = currentWatch(root, env);
   if (!watch) return { action: 'none' };
   // A watch opened by THIS tick's own forced adoption starts counting at the next tick.
   if (notBefore !== null && Date.parse(watch.startedAt) >= notBefore) return { action: 'none' };
-  const head = typeof currentHead === 'function' ? currentHead() : currentHead; // lazy: no git call unless a watch exists
+  // A `currentHead` FUNCTION that returns nothing (or throws) means git could not be read: that is a failure, never the same as
+  // "no currentHead supplied" (a plain value, or null), which skips head tracking. Unknown never counts down or completes a watch.
+  const readHead = () => {
+    if (typeof currentHead !== 'function') return { head: currentHead, unreadable: false };
+    let h = null;
+    try { h = currentHead(); } catch { h = null; }
+    return typeof h === 'string' && h ? { head: h, unreadable: false } : { head: null, unreadable: true };
+  };
+  const first = readHead(); // lazy: no git call unless a watch exists
+  const head = first.head;
   // Ticks only count once the forced build is really the running head (a ready-only job adopts a tick or more later).
   if (head !== null && head !== watch.sha) {
-    if (watch.adoptedSeen) { clearWatch(root, env); await emit?.({ kind: 'force-adopt-watch-superseded', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, head } }); return { action: 'superseded' }; }
+    if (watch.adoptedSeen || watch.rollbackPending) { clearWatch(root, env); await emit?.({ kind: 'force-adopt-watch-superseded', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, head } }); return { action: 'superseded' }; }
     if (now() - Date.parse(watch.startedAt) > FORCE_ADOPT_TTL_MS) {
       // The forced build never became head. Its ready candidate never passed smoke, so drop it too: left behind, a later
       // write-lock holder would adopt it with no health watch.
@@ -195,26 +209,31 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   const persist = (w) => { try { writeJson(watchPath(root, env), w); } catch { /* the next tick re-derives it */ } };
   if (head !== null && !watch.adoptedSeen) { watch.adoptedSeen = true; persist(watch); }
   let health;
-  try { health = await probe(root); } catch { health = { healthy: false }; }
+  if (first.unreadable) health = { healthy: false }; // no head, no verdict on the build: do not even trust a healthy probe
+  else { try { health = await probe(root); } catch { health = { healthy: false }; } }
   // The probe is async: a concurrent tick may have recorded an owed rollback, or closed the watch, since our first read. Decide
   // from the CURRENT record, never the stale snapshot, so a healthy result can neither erase a mandatory rollback nor
   // count down / re-create a watch another tick already closed.
-  const fresh = readForceWatch(root, env);
+  const fresh = currentWatch(root, env);
   if (!fresh || fresh.sha !== watch.sha) return { action: 'none' };
   watch = { ...fresh, adoptedSeen: fresh.adoptedSeen === true || watch.adoptedSeen === true };
   // The head was read BEFORE the probe too: a sibling that adopted a newer build meanwhile means this build is no longer running, so a
   // healthy result says nothing about it (no countdown, no false "passed") and an unhealthy one owes no revert.
-  const headNow = typeof currentHead === 'function' ? currentHead() : currentHead;
+  const second = first.unreadable ? first : readHead();
+  const headNow = second.head;
   if (headNow !== null && headNow !== watch.sha) {
     clearWatch(root, env);
     await emit?.({ kind: 'force-adopt-watch-superseded', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, head: headNow } });
     return { action: 'superseded' };
   }
+  const headUnreadable = first.unreadable || second.unreadable;
+  if (headUnreadable) health = { healthy: false }; // unreadable after the probe: the probe's verdict cannot be tied to this build
   // Every write/clear below follows an await on a rollback that may take the clone lock: act only if this exact watch is still the
-  // one on disk, never on the snapshot (it may have been closed, or replaced by a force for another build, in the meantime).
-  const sameWatch = () => readForceWatch(root, env)?.sha === watch.sha;
+  // one on disk (or kept in memory), never on the snapshot (it may have been closed, or replaced by a force for another build).
+  const sameWatch = () => currentWatch(root, env)?.sha === watch.sha;
   const pendingReason = watch.rollbackPending || pendingFor(root, env, watch.sha); // disk marker, else the in-process one
-  const verdict = evaluateForceWatch({ watch: pendingReason ? { ...watch, rollbackPending: pendingReason } : watch, healthy: health?.healthy, restarts: health?.restarts ?? 0 });
+  let verdict = evaluateForceWatch({ watch: pendingReason ? { ...watch, rollbackPending: pendingReason } : watch, healthy: health?.healthy, restarts: health?.restarts ?? 0 });
+  if (headUnreadable && !pendingReason && verdict.action === 'rollback') verdict = { ...verdict, reason: 'head-unreadable' };
   if (verdict.action === 'continue') { persist(verdict.watch); return { action: 'continue', ticksLeft: verdict.watch.ticksLeft }; }
   if (verdict.action === 'done') { clearWatch(root, env); await emit?.({ kind: 'force-adopt-watch-passed', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha } }); return { action: 'done' }; }
   const at = new Date(now()).toISOString();
@@ -232,8 +251,10 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   if (!result?.ok) {
     // The owed-rollback marker must survive a failed state write: write it directly (not the swallowing persist) and, if
     // that throws, keep it in-process and say so in the handoff file so an operator can see the build is still owed a revert.
-    try { writeJson(watchPath(root, env), { ...watch, rollbackPending: verdict.reason }); } catch {
-      pendingRollbacks.set(watchPath(root, env), { sha: watch.sha, reason: verdict.reason });
+    const owed = { ...watch, rollbackPending: verdict.reason };
+    try { writeJson(watchPath(root, env), owed); pendingRollbacks.delete(watchPath(root, env)); } catch {
+      // Not saved: the whole obligation stays in memory (it blocks any new force-adopt and is retried each tick) until a write lands.
+      pendingRollbacks.set(watchPath(root, env), { sha: watch.sha, reason: verdict.reason, watch: owed });
       appendLine(handoffFile(env), `- FORCE-ADOPT ${at} ${watch.daemon} ${watch.ruling}: force-adopt-rollback-failed ${watch.sha} -> ${watch.lastGood?.head ?? '?'} (${verdict.reason}); marker could not be saved, kept in memory\n`);
     }
     await emit?.({ kind: 'force-adopt-rollback-failed', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, reason: verdict.reason } });

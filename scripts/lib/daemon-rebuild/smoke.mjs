@@ -10,7 +10,7 @@ import { isRepoFile, pickSmokeDiagnostics, sourceFilesIn } from '../daemon-boot-
 import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidate, clearReadyCandidate } from './state.mjs';
 import { releaseBuildLease } from './lease.mjs';
-import { forceRequestFor, recordForcedAdoption, abortForcedAdoption } from '../daemon-force-adopt.mjs';
+import { forceRequestFor, readForceAdopt, recordForcedAdoption, abortForcedAdoption } from '../daemon-force-adopt.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { finalizeRebuild, staleAlertDetail, dropSuspectOverlays } from './adopt.mjs';
 import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
@@ -666,6 +666,11 @@ export async function smokeAndAdopt({
   // for another build stays pending for its own build until it expires, and THIS build falls through to the ordinary
   // failed-smoke ladder below (reuse / environment verdicts / sticky rejection / fallback), exactly as if no request existed.
   const forceReq = forceRequestFor(root, stEnv, plan.finalSha);
+  if (!forceReq) {
+    // Refused, and said so: a pending request that names another build (or no valid build) never authorizes this one.
+    const pending = readForceAdopt(root, stEnv);
+    if (pending) alert('force-adopt-sha-mismatch', { requested: pending.sha ?? null, target: plan.finalSha, ruling: pending.ruling });
+  }
   if (forceReq) {
     const forceSmoke = { verdict: a.smokeResult.verdict, failed: failedA.map((r) => r.name) };
     alert('force-adopt-over-failed-smoke', { ruling: forceReq.ruling, quote: forceReq.quote, ...forceSmoke, target: plan.finalSha });

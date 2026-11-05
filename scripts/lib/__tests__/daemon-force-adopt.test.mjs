@@ -322,16 +322,67 @@ describe('runForceWatchTick', () => {
     expect(rollback).toHaveBeenCalledTimes(2);
     expect(readForceWatch(root, env)).toBeNull();
   });
-  it('the in-process rollback marker belongs to its build: a later watch for another sha on the same path starts clean', async () => {
-    await setup();
+  const lose = () => rmSync(join(env.WE_DAEMON_STATE_DIR, nodeFsReaddir(env.WE_DAEMON_STATE_DIR).find((n) => n.endsWith('.force-watch.json'))), { force: true }); // watch file removed without clearWatch
+  const failRollbackUnsaved = async () => {
     chmodSync(env.WE_DAEMON_STATE_DIR, 0o500);
     try { await runForceWatchTick({ root, env, probe: async () => ({ healthy: false }), rollback: async () => ({ ok: false }), emit: async () => {} }); } finally { chmodSync(env.WE_DAEMON_STATE_DIR, 0o700); }
-    rmSync(join(env.WE_DAEMON_STATE_DIR, nodeFsReaddir(env.WE_DAEMON_STATE_DIR).find((n) => n.endsWith('.force-watch.json'))), { force: true }); // watch removed without clearWatch
-    await recordForcedAdoption({ root, env, request: { daemon: 'review', ruling: 'R508', quote: QUOTE }, sha: 'c'.repeat(40),
-      lastGood: { head: 'a'.repeat(40) }, smoke: { verdict: 'code', failed: [] }, emit: async () => {}, now: () => 1 });
+  };
+  it('a rollback obligation that could not be saved fails closed: no new force-adopt until the rollback is done, then the next build starts clean', async () => {
+    await setup();
+    await failRollbackUnsaved();
+    lose();
+    const force = (sha) => recordForcedAdoption({ root, env, request: { daemon: 'review', ruling: 'R508', quote: QUOTE }, sha, lastGood: { head: 'a'.repeat(40) }, smoke: { verdict: 'code', failed: [] }, emit: async () => {}, now: () => 1 });
+    expect(await force('c'.repeat(40))).toMatchObject({ ok: false, reason: 'rollback-owed' }); // refused: the unsaved obligation is still owed
+    expect(readForceWatch(root, env)).toBeNull();
+    // the obligation lives on in memory and is paid by the next tick even though the watch file is gone
     const rollback = vi.fn(async () => ({ ok: true }));
-    expect((await runForceWatchTick({ root, env, probe: async () => ({ healthy: true }), rollback, emit: async () => {} })).action).toBe('continue');
-    expect(rollback).not.toHaveBeenCalled();
+    expect(await runForceWatchTick({ root, env, probe: async () => ({ healthy: true }), rollback, emit: async () => {} })).toMatchObject({ action: 'rollback', reason: 'health-failed' });
+    expect(rollback).toHaveBeenCalledTimes(1);
+    expect((await force('c'.repeat(40))).ok).toBe(true); // settled: the next force is accepted and starts clean
+    const clean = vi.fn(async () => ({ ok: true }));
+    expect((await runForceWatchTick({ root, env, probe: async () => ({ healthy: true }), rollback: clean, emit: async () => {} })).action).toBe('continue');
+    expect(clean).not.toHaveBeenCalled();
+  });
+  it('an unsaved obligation is persisted on a later tick and then stops blocking on the in-memory copy', async () => {
+    await setup();
+    await failRollbackUnsaved();
+    const rollback = vi.fn(async () => ({ ok: false }));
+    expect((await runForceWatchTick({ root, env, probe: async () => ({ healthy: true }), rollback, emit: async () => {} })).action).toBe('rollback-failed');
+    expect(readForceWatch(root, env)).toMatchObject({ rollbackPending: 'health-failed' }); // now durable on disk
+  });
+  it('the rollback is told which build is under watch, so it can refuse to revert a newer one', async () => {
+    await setup();
+    const rollback = vi.fn(async () => ({ ok: true }));
+    await runForceWatchTick({ root, env, currentHead: 'b'.repeat(40), probe: async () => ({ healthy: false }), rollback, emit: async () => {} });
+    expect(rollback).toHaveBeenCalledWith(expect.objectContaining({ head: 'a'.repeat(40) }), { sha: 'b'.repeat(40) });
+  });
+  describe('an unreadable HEAD is a failure, never "no head supplied"', () => {
+    const unreadable = () => null; // a currentHead FUNCTION that cannot read git
+    it('never counts the watch down or completes it, and owes a rollback instead', async () => {
+      await setup();
+      const rollback = vi.fn(async () => ({ ok: false }));
+      const probe = vi.fn(async () => ({ healthy: true }));
+      for (let i = 0; i < 8; i++) {
+        const r = await runForceWatchTick({ root, env, currentHead: unreadable, probe, rollback, emit: async () => {} });
+        expect(r).toMatchObject({ action: 'rollback-failed', reason: 'head-unreadable' });
+      }
+      expect(readForceWatch(root, env)).toMatchObject({ ticksLeft: 5, rollbackPending: 'head-unreadable' });
+      expect(rollback).toHaveBeenCalledTimes(8);
+    });
+    it('a head that becomes unreadable only AFTER the probe is also a failure', async () => {
+      await setup();
+      let reads = 0;
+      const currentHead = () => (++reads === 1 ? 'b'.repeat(40) : null);
+      const rollback = vi.fn(async () => ({ ok: false }));
+      const r = await runForceWatchTick({ root, env, currentHead, probe: async () => ({ healthy: true }), rollback, emit: async () => {} });
+      expect(r).toMatchObject({ action: 'rollback-failed', reason: 'head-unreadable' });
+      expect(readForceWatch(root, env).ticksLeft).toBe(5);
+    });
+    it('a thrown head read is the same failure', async () => {
+      await setup();
+      const r = await runForceWatchTick({ root, env, currentHead: () => { throw new Error('git gone'); }, probe: async () => ({ healthy: true }), rollback: async () => ({ ok: false }), emit: async () => {} });
+      expect(r).toMatchObject({ action: 'rollback-failed', reason: 'head-unreadable' });
+    });
   });
   it('an expired watch (forced build never became head) also drops its never-smoked ready candidate', async () => {
     await setup();

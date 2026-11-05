@@ -18,7 +18,7 @@ import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs'
 import { defaultPoolRoot } from '../lane-pool-paths.mjs';
 import { DISPATCH_CWD_ENV } from '../../operations/dispatch-lane-io.mjs';
 import { requestForceAdopt, readForceWatch, runForceWatchTick, readForceAdopt, recordForcedAdoption } from '../daemon-force-adopt.mjs';
-import { readReadyCandidate } from '../daemon-rebuild/state.mjs';
+import { readReadyCandidate, alertsFilePath } from '../daemon-rebuild/state.mjs';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
 import { gitRun } from '../main-staleness.mjs';
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
@@ -211,6 +211,11 @@ describe('R508 force-adopt through rebuildClone', () => {
     expect(readReadyCandidate(forced.cloneDir, forced.env)).toBeNull();
     expect(existsSync(forced.env.WE_FORCE_ADOPT_HANDOFF)).toBe(false); // nothing was logged as an adoption
     expect(readForceAdopt(forced.cloneDir, forced.env)).toMatchObject({ sha: forced.wrong }); // still pending for ITS build
+    // the refusal is visible to the operator: a sha mismatch is logged, naming both builds (never silent)
+    const alerts = readFileSync(alertsFilePath(forced.cloneDir, forced.env), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    expect(alerts.find((a) => a.kind === 'force-adopt-sha-mismatch')?.detail).toMatchObject({ requested: forced.wrong });
+    const plainFile = alertsFilePath(plain.cloneDir, plain.env);
+    expect(existsSync(plainFile) ? readFileSync(plainFile, 'utf8') : '').not.toMatch(/force-adopt-sha-mismatch/);
   });
 
   it('an old request record with no sha never applies to any build, and does not block the normal ladder', async () => {
@@ -488,6 +493,24 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     await tick(cloneDir, env, { runSmoke: passing(), forceWatchProbe: healthy }); // a healthy probe still honours the owed revert
     expect(headOf(cloneDir)).toBe(lastGood);
     expect(readForceWatch(cloneDir, env)).toBeNull();
+  });
+
+  it('a HEAD that git cannot read on the watch tick is a failure: the watch is neither counted down nor completed', async () => {
+    const { cloneDir, env, target, arm } = setup();
+    arm();
+    await tick(cloneDir, env, { runSmoke: failing() });
+    expect(headOf(cloneDir)).toBe(target);
+    const ticksBefore = readForceWatch(cloneDir, env).ticksLeft;
+    let gitBroken = false;
+    const run = (args, opts) => (gitBroken && args[0] === 'rev-parse' ? { status: 128, stdout: '', stderr: 'fatal' } : gitRun(args, opts));
+    const probe = vi.fn(async () => { gitBroken = true; return { healthy: true }; }); // the first (pre-probe) head read succeeds; every later one fails
+    await tick(cloneDir, env, { runSmoke: passing(), forceWatchProbe: probe, run });
+    gitBroken = false;
+    const watch = readForceWatch(cloneDir, env);
+    expect(watch).not.toBeNull(); // not completed
+    expect(watch.ticksLeft).toBe(ticksBefore); // not counted down by the healthy probe
+    expect(watch.rollbackPending).toBe('head-unreadable');
+    expect(headOf(cloneDir)).toBe(target); // nothing reverted blind
   });
 
   it('a finalization that fails clears the watch AND the ready candidate, and logs the build as not adopted', async () => {

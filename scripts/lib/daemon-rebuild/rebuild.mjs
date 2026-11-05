@@ -127,10 +127,10 @@ async function forceWatch(options, emitEvent, startedAtMs) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   try {
     await runForceWatchTick({
-      root, env: stEnv, notBefore: startedAtMs, currentHead: () => verifyRev(makeGit({ run, cwd: root, env }), 'HEAD') || null, emit: (e) => emitEvent(e, { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } }),
+      root, env: stEnv, notBefore: startedAtMs, currentHead: () => verifyRev(makeGit({ run, cwd: root, env }), 'HEAD'), emit: (e) => emitEvent(e, { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } }),
       probe: options.forceWatchProbe ?? defaultForceWatchProbe(run, env),
       rollback: async (lastGood, { sha } = {}) => {
-        if (!lastGood?.head) return { ok: false };
+        if (!lastGood?.head || !sha) return { ok: false }; // no watched build named: nothing proves it is still the one running, so never revert
         const git = makeGit({ run, cwd: root, env });
         // HEAD is read INSIDE the write lock and compared with the watched build: a sibling that adopted a newer build while the
         // health probe ran must not be reset to last-good (finalize would accept the newer head as `prevHead` and revert it).
@@ -138,7 +138,7 @@ async function forceWatch(options, emitEvent, startedAtMs) {
           const head = verifyRev(git, 'HEAD');
           if (!head) return { ok: false }; // HEAD unreadable: unknown is not "superseded" — the rollback stays owed and is retried
           if (head === lastGood.head) { clearReadyCandidate(root, stEnv); return { ok: true }; } // already reverted
-          if (sha && head !== sha) return { superseded: true, head };
+          if (head !== sha) return { superseded: true, head };
           clearReadyCandidate(root, stEnv);
           const done = await finalizeRebuild({
             root, env, log, run, stateOpts, now, prevHead: head, lease: { token: 'force-adopt-rollback' },
