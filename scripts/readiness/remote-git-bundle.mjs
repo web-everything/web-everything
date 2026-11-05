@@ -132,7 +132,8 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
     if (finding) return { path: 'commit-message', finding };
   }
   const tokens = splitNul(bytes(log.stdout));
-  const blobs = new Map(); // sha -> first path
+  const blobs = new Map(); // sha -> Map(path key -> {label, path}): the policy scan is path-dependent, so EVERY path adding a blob is scanned
+  let pathCount = 0;
   for (let i = 0; i < tokens.length; i++) {
     const meta = tokens[i].toString('latin1');
     if (!meta.startsWith(':')) continue;
@@ -144,8 +145,11 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
     let excluded;
     try { excluded = classifyManifestPath(path).excluded; } catch { excluded = true; }
     if (excluded) return { path: label, finding: 'excluded-path' };
-    if (!blobs.has(newSha)) blobs.set(newSha, { label, path });
-    if (blobs.size > maxBlobs) throw bundleError('bundle-credential-scan-too-large');
+    const paths = blobs.get(newSha) ?? new Map();
+    blobs.set(newSha, paths);
+    const key = path.toString('latin1');
+    if (!paths.has(key)) { paths.set(key, { label, path }); pathCount++; }
+    if (blobs.size > maxBlobs || pathCount > maxBlobs) throw bundleError('bundle-credential-scan-too-large');
   }
   const shas = [...blobs.keys()];
   if (!shas.length) return null;
@@ -174,11 +178,12 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
       const finding = credentialTextFinding(content.toString('latin1')) ?? credentialTextFinding(content.toString('utf8'));
       // R559: the SAME content scanner the rsync path uses for credential-named files, applied to every added blob
       // (binary or unreadable text fails closed as unsupported-text-encoding), plus the raw token patterns.
-      const { label, path } = blobs.get(sha);
-      let policy = null;
-      try { policy = credentialContentFinding(path, content); } catch { policy = 'content-scan-error'; }
-      const hit = policy ?? finding;
-      if (hit) return { path: label, finding: hit };
+      for (const { label, path } of blobs.get(sha).values()) {
+        let policy = null;
+        try { policy = credentialContentFinding(path, content); } catch { policy = 'content-scan-error'; }
+        const hit = policy ?? finding;
+        if (hit) return { path: label, finding: hit };
+      }
     }
     batch = []; batchBytes = 0;
     return null;

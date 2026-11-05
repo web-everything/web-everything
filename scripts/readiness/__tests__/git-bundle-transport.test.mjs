@@ -288,6 +288,25 @@ describe('R593 content scanner parity with the rsync path (R559)', () => {
   });
 });
 
+describe('R593 identical blob under several paths (path-dependent scanner)', () => {
+  it('scans a deduplicated blob under every path that adds it, not only the first', async () => {
+    // Same bytes: clean as plain text at a-notes.txt (sorts first), a secret under the structural JSON scanner at z-settings.json.
+    const body = '{"password":"actual-private-value-1234567890"}\n';
+    const head = await commit(lane, { 'a-notes.txt': body, 'z-settings.json': body }, 'same blob twice');
+    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ path: 'z-settings.json' });
+  });
+  it('flags it when the benign path is the newest commit that adds the blob', async () => {
+    const body = '{"password":"actual-private-value-1234567890"}\n';
+    await commit(lane, { 'z-settings.json': body }, 'json path');
+    const head = await commit(lane, { 'a-notes.txt': body }, 'newer plain path');
+    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ path: 'z-settings.json' });
+  });
+  it('refuses (does not skip) when the path fan-out of one blob exceeds the bound', async () => {
+    const head = await commit(lane, { 'a1.txt': 'same\n', 'a2.txt': 'same\n', 'a3.txt': 'same\n' }, 'fan-out');
+    await expect(scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec, maxBlobs: 2 })).rejects.toMatchObject({ code: 'bundle-credential-scan-too-large' });
+  });
+});
+
 describe('R593 commit-message scanner parity (R559)', () => {
   it('flags a secret assignment in a commit message', async () => {
     await commit(lane, { 'ok.txt': 'ok\n' }, 'notes\npassword=actual-private-value');
