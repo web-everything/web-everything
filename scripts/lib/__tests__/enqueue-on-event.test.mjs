@@ -660,6 +660,110 @@ describe('readCatchUpCandidates', () => {
   });
 });
 
+describe('catch-up during a daemon refresh (last-good enqueue)', () => {
+  const pendingRefresh = () => ({ pending: true, reason: 'unadopted-overlay' });
+  const warn = (lines) => lines.filter((line) => line.includes('refresh pending'));
+
+  it('keeps enqueuing on last-good while an unrelated overlay is pending, and logs the decision with provenance', async () => {
+    const { handle, calls, lines } = catchUpSetup({
+      refreshPending: pendingRefresh,
+      readPendingChange: () => ({ ok: true, paths: ['scripts/lib/unrelated.mjs'], source: 'overlay lane/x' }),
+    });
+    await handle.catchUp();
+    expect(calls.map((call) => call.args[1])).toEqual(['--only=42', '--only=43']);
+    expect(lines.filter((line) => line.includes('catch-up paused'))).toEqual([]);
+    const decision = warn(lines);
+    expect(decision).toHaveLength(1);
+    expect(decision[0]).toMatch(/continuing on last-good/);
+    expect(decision[0]).toContain('overlay lane/x');
+  });
+
+  it.each([
+    'scripts/lib/enqueue-on-event.mjs',
+    'scripts/lib/drain-queue-safety.mjs',
+    'scripts/merge-ai-prs.mjs',
+  ])('pauses when the pending change touches %s', async (path) => {
+    const { handle, calls, lines } = catchUpSetup({
+      refreshPending: pendingRefresh,
+      readPendingChange: () => ({ ok: true, paths: ['README.md', path], source: 'overlay lane/x' }),
+    });
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+    const pauses = lines.filter((line) => line.includes('catch-up paused'));
+    expect(pauses).toHaveLength(1);
+    expect(pauses[0]).toContain(path);
+  });
+
+  it('pauses when the pending diff cannot be read (fail closed)', async () => {
+    const { handle, calls, lines } = catchUpSetup({
+      refreshPending: pendingRefresh,
+      readPendingChange: () => ({ ok: false, error: 'git diff failed' }),
+    });
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+    expect(lines.filter((line) => line.includes('catch-up paused'))[0]).toContain('git diff failed');
+  });
+
+  it('pauses when reading the pending diff throws', async () => {
+    const { handle, calls } = catchUpSetup({
+      refreshPending: pendingRefresh,
+      readPendingChange: () => { throw new Error('boom'); },
+    });
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+  });
+
+  it('bounds a pause: after maxPauseMinutes it enqueues on last-good with a warning', async () => {
+    const { handle, calls, lines, advance } = catchUpSetup({
+      refreshPending: pendingRefresh,
+      readPendingChange: () => ({ ok: true, paths: ['scripts/lib/enqueue-on-event.mjs'], source: 'overlay lane/x' }),
+    });
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+    advance(9 * 60_000);
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+    advance(2 * 60_000);
+    await handle.catchUp();
+    expect(calls.length).toBeGreaterThan(0);
+    expect(lines.some((line) => /WARN/.test(line) && /max pause/.test(line))).toBe(true);
+  });
+
+  it('restarts the pause clock once the refresh clears', async () => {
+    let refresh = pendingRefresh();
+    const { handle, calls, advance } = catchUpSetup({
+      refreshPending: () => refresh,
+      readPendingChange: () => ({ ok: true, paths: ['scripts/lib/enqueue-on-event.mjs'], source: 'overlay lane/x' }),
+    });
+    await handle.catchUp();
+    advance(20 * 60_000);
+    refresh = { pending: false, reason: null };
+    await handle.catchUp();
+    expect(calls.length).toBeGreaterThan(0);
+    calls.length = 0;
+    refresh = pendingRefresh();
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+  });
+
+  it('resolves refreshPause with standard defaults', () => {
+    expect(resolveSetting().catchUp.refreshPause).toEqual({
+      paths: ['scripts/lib/drain-queue-safety', 'scripts/merge-ai-prs', 'scripts/lib/enqueue-on-event'],
+      maxPauseMinutes: 10,
+    });
+    expect(resolveSetting().sources['catchUp.refreshPause.maxPauseMinutes']).toBe('standard');
+  });
+
+  it('takes refreshPause from the tool layer and ignores invalid values', () => {
+    const ok = resolveSetting({ tool: { catchUp: { refreshPause: { paths: ['scripts/x'], maxPauseMinutes: 3 } } } });
+    expect(ok.catchUp.refreshPause).toEqual({ paths: ['scripts/x'], maxPauseMinutes: 3 });
+    expect(ok.sources['catchUp.refreshPause.maxPauseMinutes']).toBe('tool');
+    const bad = resolveSetting({ tool: { catchUp: { refreshPause: { paths: [], maxPauseMinutes: -1 } } } });
+    expect(bad.catchUp.refreshPause.maxPauseMinutes).toBe(10);
+    expect(bad.catchUp.refreshPause.paths.length).toBe(3);
+  });
+});
+
 describe('catch-up handle', () => {
   it.each(['building', 'unadopted-overlay'])('pauses catch-up before any fast drain and logs the %s reason once', async (reason) => {
     const { handle, calls, lines } = catchUpSetup({ refreshPending: () => ({ pending: true, reason }) });
