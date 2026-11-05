@@ -1656,6 +1656,7 @@
  },
  "soak": {
   "scripts/conveyor/soak/breaks/review-pr-list-504-reads-zero-owed.soak.test.mjs": 3.02,
+  "scripts/conveyor/soak/breaks/recovery-apply-unbounded-hits-pass-deadline.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/agy-juror-shared-checkout-reset.soak.test.mjs": 1.85,
   "scripts/conveyor/soak/breaks/already-done-burst-unattributed.soak.test.mjs": 0.49,
   "scripts/conveyor/soak/breaks/already-done-recheck-burst-no-cooldown.soak.test.mjs": 1.68,
