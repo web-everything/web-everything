@@ -79,28 +79,38 @@ const validEntry = e => e && SHA.test(e.lastReviewedHead ?? '') && typeof e.verd
 const validMap = m => m && typeof m === 'object' && Object.values(m).every(validEntry);
 // Replay applies the SAME keepPerPr the writer used, so a rebuilt map equals the published one: evicted history is not
 // resurrected, and a compacted log (older rows then the PR's current record last, keyed or keyless) replays to the same map.
+// A rejected writer (it lost the lock after appending) cannot rewrite the log: a live holder may be appending to it. It appends a
+// tombstone naming its row by content hash instead; replay drops the last matching row written BEFORE the tombstone. A tombstone
+// is `{rollback: <sha256 of the row's JSON>}` and nothing else.
+const hashText = text => createHash('sha256').update(text).digest('hex');
+const tombstoneOf = row => ({ rollback: hashText(row) });
 const parseLog = (text, keepPerPr) => {
   const lines = text.split('\n').filter(l => l.trim());
-  const map = {};
+  const kept = []; // [{ hash, rec }] in log order, after tombstones
   for (const l of lines) {
     const rec = JSON.parse(l);
+    if (rec && typeof rec === 'object' && typeof rec.rollback === 'string' && Object.keys(rec).length === 1) {
+      for (let i = kept.length - 1; i >= 0; i--) if (kept[i].hash === rec.rollback) { kept.splice(i, 1); break; }
+      continue;
+    }
     if (!validRecord(rec)) throw Error('invalid log record');
-    applyRecord(map, rec, keepPerPr);
+    kept.push({ hash: hashText(l), rec });
   }
+  const map = {};
+  for (const { rec } of kept) applyRecord(map, rec, keepPerPr);
   return { map, lines: lines.length };
 };
-/** keepPerPr for a rebuild: explicit option, else the value the last published map recorded, else the resolved setting. */
-const rebuildKeep = (explicit, stored) => {
+/** keepPerPr for a rebuild: explicit option, else the value the last published map recorded, else the resolved setting (`.value`). */
+const rebuildKeep = (explicit, stored, settingsFile) => {
   if (posInt(explicit)) return explicit;
   if (posInt(stored?.keepPerPr)) return stored.keepPerPr;
-  try { const k = resolveHeadIndexSettings().keepPerPr; if (posInt(k)) return k; } catch { /* fall through to the standard */ }
+  try { const k = resolveHeadIndexSettings(settingsFile === undefined ? {} : { file: settingsFile }).value?.keepPerPr; if (posInt(k)) return k; } catch { /* fall through to the standard */ }
   return HEAD_INDEX_STANDARD.keepPerPr;
 };
-const hashText = text => createHash('sha256').update(text).digest('hex');
 const size = (fs, p) => { try { return fs.statSync(p).size; } catch (e) { if (e?.code === 'ENOENT') return null; throw e; } };
 
 /** Read the index. Uses the cached map only when its log content hash matches; rebuilds from the log otherwise. Never throws. */
-export function readHeadIndex({ dir = defaultHeadIndexDir(), fs = nodeFs, keepPerPr } = {}) {
+export function readHeadIndex({ dir = defaultHeadIndexDir(), fs = nodeFs, keepPerPr, settingsFile } = {}) {
   try {
     const { log, map: mapPath } = headIndexPaths(dir);
     const logSize = size(fs, log);
@@ -115,7 +125,7 @@ export function readHeadIndex({ dir = defaultHeadIndexDir(), fs = nodeFs, keepPe
     const text = raw.toString('utf8');
     const logHash = hashText(raw);
     if (stored && stored.map && typeof stored.map === 'object' && stored.version === MAP_VERSION && stored.logHash === logHash && validMap(stored.map)) return { ok: true, map: stored.map };
-    return { ok: true, map: parseLog(text, rebuildKeep(keepPerPr, stored)).map, rebuilt: true };
+    return { ok: true, map: parseLog(text, rebuildKeep(keepPerPr, stored, settingsFile)).map, rebuilt: true };
   } catch { return { ok: false, reason: 'index-unreadable' }; }
 }
 // Only ENOENT means absent; any other stat failure (EACCES, EIO, ...) throws so the caller fails closed instead of reading an empty index.
@@ -140,7 +150,7 @@ export function withHeadIndexLock(dir, fn, { fs = nodeFs, staleMs = LOCK_STALE_M
   const { lock } = headIndexPaths(dir);
   const token = `${pid}-${now()}-${Math.random().toString(36).slice(2)}`;
   const deadline = now() + waitMs;
-  const holder = () => { try { return JSON.parse(fs.readFileSync(lock, 'utf8')); } catch { return null; } };
+  const holder = () => { try { const v = JSON.parse(fs.readFileSync(lock, 'utf8')); return v && typeof v === 'object' ? v : null; } catch { return null; } }; // a non-object body (0, false, 5) is as unreadable as garbage
   const takeover = `${lock}.takeover`;
   /**
    * Take over a lock judged dead (`deadHolder` = the holder we read, or null for an unreadable one). Takeovers are serialised by a
@@ -168,7 +178,8 @@ export function withHeadIndexLock(dir, fn, { fs = nodeFs, staleMs = LOCK_STALE_M
     try {
       const cur = holder();
       let curAge; try { curAge = now() - fs.statSync(lock).mtimeMs; } catch { return false; } // vanished: let the normal path create it
-      if (deadHolder ? cur?.token !== deadHolder.token : cur !== null || curAge <= staleMs) return false; // changed hands: a live owner's lock
+      const ownerless = !Number.isInteger(cur?.pid); // the grace applies to an ownerless lock at the re-read too
+      if (deadHolder ? cur?.token !== deadHolder.token || (ownerless && curAge <= staleMs) : cur !== null || curAge <= staleMs) return false; // changed hands: a live owner's lock
       durable(fs, fresh, 'w', JSON.stringify({ pid, token, at: now() }));
       fs.renameSync(fresh, lock);
       return holder()?.token === token;
@@ -187,7 +198,8 @@ export function withHeadIndexLock(dir, fn, { fs = nodeFs, staleMs = LOCK_STALE_M
       const held = holder();
       let age = Infinity;
       try { age = now() - fs.statSync(lock).mtimeMs; } catch { continue; } // vanished: retry
-      const dead = held ? Number.isInteger(held.pid) && !pidAlive(held.pid) : age > staleMs; // no readable owner: only after the grace
+      // No integer pid (unreadable file, or JSON without an owner pid): no owner to probe, so only after the grace, like the takeover file.
+      const dead = Number.isInteger(held?.pid) ? !pidAlive(held.pid) : age > staleMs;
       if (dead && takeOver(held)) break; // took the lock over; otherwise wait like any other contender
       if (now() >= deadline) throw Error('review-head-index: lock busy (holder pid ' + (held?.pid ?? '?') + ')');
       sleepMs(10 + Math.floor(Math.random() * 20));
@@ -216,19 +228,22 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
     fence();
     const line = `${JSON.stringify(rec)}\n`;
     const sizeBefore = size(fs, log);                           // null: the log did not exist yet
-    // Once our line is in the log, a lost lock means our transaction was rejected, so the line must not stay in the source
-    // of truth. Every fence after the append rolls it back before throwing. A log that no longer has exactly the shape we
-    // left (another holder wrote after us) is never touched: we cannot undo ours without discarding theirs.
+    // Once our line is in the log, a lost lock means our transaction was rejected, so the line must not stay visible. Every fence
+    // after the append rolls it back before throwing. If the log still has exactly the shape we left, the line is physically
+    // removed (truncate / restore). If another holder wrote after us, we cannot rewrite the log (they may be appending to it),
+    // so we append a tombstone naming our row; replay then drops it, whatever else was appended around it.
     const lineBytes = Buffer.from(line);
+    const tombstone = `${JSON.stringify(tombstoneOf(line.slice(0, -1)))}\n`;
     let before = null, compacted = null; // before: the log bytes we replaced when compacting; compacted: the bytes we wrote
     const rollback = () => {
       try {
         if (compacted === null) {
-          if (size(fs, log) !== (sizeBefore ?? 0) + Buffer.byteLength(line)) return;
-          if (sizeBefore === null) fs.unlinkSync(log); else fs.truncateSync(log, sizeBefore);
+          if (size(fs, log) === (sizeBefore ?? 0) + lineBytes.length) { if (sizeBefore === null) fs.unlinkSync(log); else fs.truncateSync(log, sizeBefore); return; }
         } else if (fs.readFileSync(log).equals(compacted)) {
           atomicWrite(fs, log, `${log}.tmp`, before.subarray(0, before.length - lineBytes.length));
+          return;
         }
+        durable(fs, log, 'a', tombstone);                       // the log moved on: retract our row without touching theirs
       } catch { /* best effort: the fence error below is what the caller sees */ }
     };
     const fenced = () => { try { fence(); } catch (e) { rollback(); throw e; } };

@@ -447,6 +447,52 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     expect(() => rec({ fs: statFail(mp) })).toThrow(/unreadable/);                          // and a write refuses
     expect(existsSync(log)).toBe(false);
   });
+  it('rebuild honors the RESOLVED retention setting (value.keepPerPr), not the standard 20', () => {
+    for (let i = 1; i <= 6; i++) rec({ head: H(i), netPatchHash: `p${i}`, at: `2026-11-04T10:00:0${i}Z`, keepPerPr: 6 });
+    const { map: mp } = headIndexPaths(dir);
+    writeFileSync(mp, '{{');                                   // no cache and no stored keepPerPr: the resolved setting decides
+    const settingsFile = { reviewHeadIndex: { keepPerPr: 3 } };
+    expect(resolveHeadIndexSettings({ file: settingsFile }).value.keepPerPr).toBe(3);
+    const rebuilt = readHeadIndex({ dir, settingsFile });
+    expect(rebuilt.rebuilt).toBe(true);
+    expect(Object.keys(rebuilt.map['o/r#7'].history).sort()).toEqual(['p4', 'p5', 'p6']); // 3 kept, not 6 (standard would keep all 6)
+  });
+  it('fencing: a writer that loses its lock after the line-count read (no compaction) leaves no visible review once another writer appends', () => {
+    rec();
+    const { log, lock } = headIndexPaths(dir);
+    const theirs = `${JSON.stringify({ repo: 'o/r', pr: 8, head: H(3), netPatchHash: 'p9', verdict: 'accept', at: '2026-11-04T11:00:00Z' })}\n`;
+    let appended = false, done = false;
+    const fs = { ...nodeFs,
+      openSync: (p, f) => { if (f === 'a' && p === log) appended = true; return nodeFs.openSync(p, f); },
+      readFileSync: (p, ...a) => { // the line-count read that follows our append: after it, the lock is stolen and writer B appends
+        const out = nodeFs.readFileSync(p, ...a);
+        if (appended && !done && p === log) { done = true; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'thief', at: 1 })); nodeFs.appendFileSync(log, theirs); }
+        return out; } };
+    expect(() => rec({ fs, head: H(2), netPatchHash: 'p2' })).toThrow(/lock lost/);
+    expect(done).toBe(true);
+    const index = readHeadIndex({ dir });
+    expect(index.ok).toBe(true);
+    expect(headReviewOwed({ index, repo: 'o/r', pr: 7, head: H(2), netPatchHash: 'p2' })).toMatchObject({ owed: true, reason: 'new-head', lastReviewedHead: H(1) }); // A's review is not visible
+    expect(index.map['o/r#7'].history.p2).toBeUndefined();
+    expect(index.map['o/r#8']).toMatchObject({ lastReviewedHead: H(3) });  // B's record is intact
+    rmSync(lock, { force: true });                              // the other writer finished
+    rec({ head: H(4), netPatchHash: 'p4', at: '2026-11-04T12:00:00Z', logMaxLines: 2 }); // a later compaction + rebuild never resurrects it either
+    writeFileSync(headIndexPaths(dir).map, '{{');
+    expect(readHeadIndex({ dir }).map['o/r#7'].history.p2).toBeUndefined();
+  });
+  it('a main-lock file with parseable JSON but no integer pid is stale by age, like the takeover file', () => {
+    const { lock } = headIndexPaths(dir);
+    nodeFs.mkdirSync(dir, { recursive: true });
+    writeFileSync(lock, JSON.stringify({ token: 'orphan', at: 0 }));          // no pid
+    expect(() => withHeadIndexLock(dir, () => 'no', { waitMs: 60, staleMs: 60_000 })).toThrow(/lock busy/); // fresh: still respected
+    nodeFs.utimesSync(lock, new Date(0), new Date(0));
+    expect(withHeadIndexLock(dir, () => 'ok', { waitMs: 200, staleMs: 1000 })).toBe('ok'); // old: taken over
+    expect(existsSync(lock)).toBe(false);
+    for (const body of ['{"pid":"12"}', '{"pid":1.5}', '[]', '5']) {
+      writeFileSync(lock, body); nodeFs.utimesSync(lock, new Date(0), new Date(0));
+      expect(withHeadIndexLock(dir, () => body, { waitMs: 200, staleMs: 1000 })).toBe(body);
+    }
+  });
   it('recordReview refuses an unreadable existing index and leaves the log and map bytes unchanged', () => {
     rec();
     const { log, map } = headIndexPaths(dir);
