@@ -69,8 +69,11 @@ export function installCommand({ frozen = false, log = (l) => console.error(l), 
   return [bin, ...args].join(' ');
 }
 
-/** Run the install; a failed pnpm install falls back to `npm ci`/`npm install` and logs it. */
-export function installWithFallback({ frozen = false, ignoreScripts = false, cwd, exec = (bin, args, o) => execFileSync(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], ...o }), log = (l) => console.error(l), ...opts } = {}) {
+/**
+ * Run the install. A pnpm that cannot run or reach the registry falls back to npm and logs it; a FROZEN fallback also
+ * needs `lockfileParity()` to return true (npm ci validates a different lockfile). Every other failure is rethrown.
+ */
+export function installWithFallback({ frozen = false, ignoreScripts = false, cwd, exec = (bin, args, o) => execFileSync(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], ...o }), log = (l) => console.error(l), lockfileParity, ...opts } = {}) {
   const first = installArgv({ ...opts, ci: frozen, ignoreScripts });
   if (first.note) log(`package-manager · ${first.note}`);
   try { exec(first.bin, first.args, { cwd }); return { ...first, fellBack: false }; }
@@ -78,6 +81,11 @@ export function installWithFallback({ frozen = false, ignoreScripts = false, cwd
     if (first.manager !== 'pnpm') throw e;
     // Fail closed: only a pnpm that could not run, or reach the registry, falls back (see FALLBACK_OK).
     if (!runnerFailure(e)) { log(`package-manager · pnpm install failed and is not a runner/network failure (${String(e?.message ?? e).split('\n')[0]}); NOT falling back to npm`); throw e; }
+    // A frozen npm fallback checks package-lock.json, not pnpm-lock.yaml, so it needs a caller-supplied parity proof.
+    if (frozen && !(typeof lockfileParity === 'function' && lockfileParity() === true)) {
+      log('package-manager · pnpm frozen install failed (runner/network); NOT falling back to npm ci: no lockfileParity proof supplied');
+      throw e;
+    }
     log(`package-manager · pnpm install failed (${String(e?.message ?? e).split('\n')[0]}); falling back to npm ${frozen ? 'ci' : 'install'}`);
     const args = [frozen ? 'ci' : 'install', ...(ignoreScripts ? ['--ignore-scripts'] : [])];
     exec('npm', args, { cwd });

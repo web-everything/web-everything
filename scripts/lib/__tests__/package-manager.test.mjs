@@ -102,9 +102,9 @@ describe('installWithFallback', () => {
     expect(calls).toEqual([['pnpm', 'install', '--frozen-lockfile']]);
     expect(r.fellBack).toBe(false);
   });
-  it('a failed pnpm install falls back to npm ci and logs it', () => {
+  it('a failed pnpm install falls back to npm ci and logs it (parity proven)', () => {
     const calls = []; const logs = [];
-    const r = installWithFallback({ frozen: true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => '9', log: (l) => logs.push(l),
+    const r = installWithFallback({ frozen: true, lockfileParity: () => true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => '9', log: (l) => logs.push(l),
       exec: (bin, args) => { calls.push([bin, ...args]); if (bin === 'pnpm') throw Object.assign(new Error('ERR_PNPM_FETCH_FAIL GET registry'), { stderr: 'ERR_PNPM_FETCH_FAIL' }); } });
     expect(calls).toEqual([['pnpm', 'install', '--frozen-lockfile'], ['npm', 'ci']]);
     expect(r).toMatchObject({ fellBack: true, manager: 'npm', pnpmError: 'ERR_PNPM_FETCH_FAIL GET registry' });
@@ -127,6 +127,20 @@ describe('installWithFallback', () => {
       exec: (bin, args) => { calls.push([bin, ...args]); throw Object.assign(new Error('pnpm failed'), extra); } })).toThrow('pnpm failed');
     expect(calls).toEqual([['pnpm', 'install', '--frozen-lockfile']]);
     expect(logs.join('\n')).toMatch(/NOT falling back/);
+  });
+  it.each([['no proof supplied', undefined], ['proof says false', () => false], ['proof throws', () => { throw new Error('x'); }]])(
+    'a frozen fallback is refused when lockfile parity is not proven (%s)', (_n, lockfileParity) => {
+      const calls = [];
+      expect(() => installWithFallback({ frozen: true, lockfileParity, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => '9', log: () => {},
+        exec: (bin, args) => { calls.push([bin, ...args]); throw Object.assign(new Error('ERR_PNPM_FETCH_FAIL'), {}); } })).toThrow();
+      expect(calls).toEqual([['pnpm', 'install', '--frozen-lockfile']]);
+    });
+  it('a non-frozen install falls back on a network failure without a parity proof', () => {
+    const calls = [];
+    const r = installWithFallback({ frozen: false, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => '9', log: () => {},
+      exec: (bin, args) => { calls.push([bin, ...args]); if (bin === 'pnpm') throw new Error('ERR_PNPM_FETCH_FAIL'); } });
+    expect(calls).toEqual([['pnpm', 'install'], ['npm', 'install']]);
+    expect(r.fellBack).toBe(true);
   });
   it('a failed npm install propagates (no silent success)', () => {
     expect(() => installWithFallback({ frozen: true, env: {}, exec: () => { throw new Error('npm down'); } })).toThrow('npm down');
