@@ -119,11 +119,12 @@ const bytes = (value) => Buffer.isBuffer(value) ? value : Buffer.from(value ?? '
  * Returns the first {path, finding} or null; throws bundle-credential-scan-too-large instead of skipping.
  */
 export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs = 20000, maxTotalBytes = 128 * 1024 * 1024 }) {
-  const git = (args, input) => exec({ file: 'git', args, cwd, ...(input === undefined ? {} : { input }) });
+  // The pack carries the RAW stored objects. --no-replace-objects keeps refs/replace/* from showing the scan a clean substitute.
+  const git = (args, input) => exec({ file: 'git', args: ['--no-replace-objects', ...args], cwd, ...(input === undefined ? {} : { input }) });
   const range = prerequisite ? `${prerequisite}..${head}` : head;
   // -t lists tree (directory) entries too: without it an EMPTY subtree entry (crafted with mktree) has no file below it
   // and never shows up, yet its name travels in the pack.
-  const log = await git(['log', '--raw', '-t', '-z', '--no-renames', '--no-abbrev', '--root', '-m', '--diff-filter=d', '--format=', range]);
+  const log = await git(['log', '--raw', '-t', '--ignore-submodules=none', '-z', '--no-renames', '--no-abbrev', '--root', '-m', '--diff-filter=d', '--format=', range]);
   if (log.code !== 0) throw bundleError('bundle-credential-scan-failed');
   // Commit messages (and author/committer identity lines) travel in the pack too. Tags are not bundled: only the pinned ref is.
   const messages = await git(['log', '-z', '--root', '--format=%an%n%ae%n%cn%n%ce%n%B', range]);
@@ -193,11 +194,11 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
     // Every path that adds an entry in the range is listed here, including ones a later commit deleted.
     const pathFinding = credentialTextFinding(path.toString('latin1')) ?? credentialTextFinding(label);
     if (pathFinding) return { path: 'tree-entry-name', finding: pathFinding }; // never echo the secret-bearing name
-    // A directory entry carries no blob: its name was scanned above, its files are classified and read under their own paths.
-    if (newMode === '040000') continue;
     let excluded;
     try { excluded = classifyManifestPath(path).excluded; } catch { excluded = true; }
     if (excluded) return { path: label, finding: 'excluded-path' };
+    // A directory entry carries no blob: its name was scanned and classified above, its files are read under their own paths.
+    if (newMode === '040000') continue;
     const paths = blobs.get(newSha) ?? new Map();
     blobs.set(newSha, paths);
     const key = path.toString('latin1');

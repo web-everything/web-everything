@@ -415,4 +415,21 @@ describe('R593 empty directory tree entries (R559)', () => {
   it('passes an empty directory entry with a clean name', async () => {
     expect(await scanBundleRange({ cwd: lane, head: emptyDirCommit('vendor-empty'), prerequisite: runnerMain, exec })).toBeNull();
   });
+  it('applies the excluded-path policy to an empty directory entry', async () => {
+    expect(await scanBundleRange({ cwd: lane, head: emptyDirCommit('.env'), prerequisite: runnerMain, exec })).toMatchObject({ finding: 'excluded-path' });
+  });
+  it('still flags the dirty empty directory when refs/replace/* substitutes a clean tree', async () => {
+    const head = emptyDirCommit(tokenDir);
+    const dirtyTree = git(lane, 'rev-parse', `${head}^{tree}`);
+    const cleanTree = git(lane, 'rev-parse', `${tip}^{tree}`);
+    git(lane, 'replace', '-f', dirtyTree, cleanTree);
+    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ path: 'tree-entry-name', finding: 'github-token' });
+  });
+  it('still lists a gitlink when diff.ignoreSubmodules=all would hide it', async () => {
+    const base = git(lane, 'ls-tree', `${tip}^{tree}`).split('\n').filter(Boolean);
+    const tree = spawnSync('git', ['mktree'], { cwd: lane, input: `${base.join('\n')}\n160000 commit ${tip}\tvendored\n`, encoding: 'utf8' }).stdout.trim();
+    const head = spawnSync('git', [...ident, 'commit-tree', tree, '-p', tip, '-m', 'gitlink'], { cwd: lane, encoding: 'utf8' }).stdout.trim();
+    git(lane, 'config', 'diff.ignoreSubmodules', 'all');
+    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ finding: 'gitlink' });
+  });
 });
