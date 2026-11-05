@@ -2505,6 +2505,10 @@ async function cmdAcquire(repo) {
     // the SAME static list again on a later poll tick, which would just re-try the identical dead ends until
     // `--wait-ms` ran out instead of ever reaching the scan.
     let freeListExhausted = !freeList;
+    // The `--no-reset` guard's live remote heads: ONE lazy ls-remote per acquire call (only if a candidate is ahead),
+    // shared by every candidate. A failed probe is an empty set, so an ahead lane then fails closed.
+    let noResetRemoteShasValue = null;
+    const noResetRemoteShas = () => (noResetRemoteShasValue ??= liveRemoteShas(repo));
     while (chosen === null) {
       // #3383 — the scan's own budget is now the FULL configured/default scan timeout (`--scan-timeout-ms` /
       // `LANE_POOL_LIST_SCAN_TIMEOUT_MS`), never shrunk to this caller's OWN remaining `--wait-ms`: the
@@ -2580,10 +2584,13 @@ async function cmdAcquire(repo) {
         try {
           // `--no-reset` skips every dirty/ahead check inside provisionClaimedLane, but a lane named by the (possibly
           // event-refreshed) free list may have changed since it was published: auto-pick may only hand out a lane
-          // PROVEN clean and fully pushed right now. A failed probe (null) is not proof, so it is refused too.
+          // PROVEN clean and fully pushed right now. A failed probe is not proof, so it is refused too. The bar is the
+          // scan's own (`effectiveDirtyOrAhead`: litter-only dirt is clean; an ahead commit counts as pushed only if a
+          // LIVE remote head contains it or it is patch-equivalent, e.g. squash-merged) — never a stricter or looser
+          // hand-rolled one, and never a possibly-stale local remote-tracking ref.
           if (flags['no-reset']) {
-            const snap = laneStateSnapshot(laneDir(repo, pick), `origin/${repo.branch}`);
-            if (!isProvablyCleanAndPushed(snap)) throw new Error(`lane-${pick} is not provably clean and pushed (workDirty=${snap.workDirty}, unpushedCommits=${snap.unpushedCommits}) — --no-reset will not hand it out`);
+            const doa = effectiveDirtyOrAhead(laneDir(repo, pick), repo.branch, noResetRemoteShas);
+            if (doa.probeFailed || doa.dirty || doa.ahead !== 0) throw new Error(`lane-${pick} is not provably clean and pushed (dirty=${doa.dirty}, ahead=${doa.ahead}, probeFailed=${doa.probeFailed}) — --no-reset will not hand it out`);
           }
           provisionClaimedLane(repo, pick, false); // auto-pick never targets a reserved lane
           chosen = pick;
@@ -3141,7 +3148,8 @@ async function cmdRelease(repo) {
     // `release --force` reclaim, which delegates here) leaves the registry pointing at a lane that is free
     // again, and conveyor-state.mjs's health-stall scan overcounts `building` forever.
     unmapLanes({ ...repo, referencePath: repo.registryReferencePath || repo.referencePath }, [n]);
-    // Only a lane PROVEN clean and fully pushed right now is published as free (the same bar auto-pick's scan applies).
+    // Only a lane PROVEN clean and IN SYNC with the integration branch right now is published as free. Stricter than the
+    // scan's bar (an ahead-but-pushed lane is not published; the scan can still find it), so a lane is never over-advertised.
     const afterRelease = isReservedLease(lease) ? null : laneStateSnapshot(dir, `origin/${repo.branch}`);
     touchFreeList(repo, n, isProvablyCleanAndPushed(afterRelease, { requireInSync: true }));
     log(`  released lane-${n} (was ${describeLease(lease)})`);

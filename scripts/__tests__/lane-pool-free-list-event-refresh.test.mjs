@@ -150,6 +150,38 @@ describe('free-lane list is refreshed by lane-pool events', () => {
     expect(git(['log', '-1', '--format=%s'], dir)).toBe('unpushed-work'); // the work is untouched
   });
 
+  it('auto-pick --no-reset still hands out a lane whose ahead commit was squash-merged and its branch pruned (the scan\'s own bar)', () => {
+    const lane = releasedLane();
+    const dir = laneDir(lane);
+    writeFileSync(join(dir, 'feat.txt'), 'feature\n'); git(['add', 'feat.txt'], dir); git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'feature'], dir);
+    git(['push', '-q', 'origin', 'HEAD:refs/heads/lane/feat'], dir);
+    // Squash-merge: the SAME patch lands on trunk as a brand-new commit, then the feature branch is deleted.
+    const squash = join(base, 'squash');
+    git(['clone', '-q', '--branch', 'trunk', originDir, squash]);
+    writeFileSync(join(squash, 'feat.txt'), 'feature\n'); git(['add', 'feat.txt'], squash);
+    git(['-c', 'user.email=s@s', '-c', 'user.name=s', 'commit', '-q', '-m', 'feature (squashed)'], squash);
+    git(['push', '-q', 'origin', 'HEAD:refs/heads/trunk'], squash);
+    git(['update-ref', '-d', 'refs/heads/lane/feat'], originDir);
+    git(['fetch', '-q', '--prune', 'origin'], dir); // the lane's commit is now on NO remote-tracking ref
+    seedList([{ lane, at: Date.now() }]);
+    const r = runPool(['acquire', ...poolArgs(), '--no-reset', '--session=other', '--hard-max=1', '--json']);
+    expect(r.code, r.err).toBe(0);
+    expect(JSON.parse(r.out).lane).toBe(lane);
+  });
+
+  it('auto-pick --no-reset refuses a lane whose commit survives only in a STALE tracking ref (branch deleted on origin)', () => {
+    const lane = releasedLane();
+    const dir = laneDir(lane);
+    writeFileSync(join(dir, 'wip.txt'), 'wip\n'); git(['add', 'wip.txt'], dir); git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'stale-ref-work'], dir);
+    git(['push', '-q', 'origin', 'HEAD:refs/heads/lane/gone'], dir);
+    git(['update-ref', '-d', 'refs/heads/lane/gone'], originDir); // deleted on origin; the lane's tracking ref lingers
+    expect(git(['rev-parse', 'refs/remotes/origin/lane/gone'], dir)).toBe(git(['rev-parse', 'HEAD'], dir));
+    seedList([{ lane, at: Date.now() }]);
+    const r = runPool(['acquire', ...poolArgs(), '--no-reset', '--session=other', '--hard-max=1', '--json']);
+    expect(r.code).not.toBe(0);
+    expect(git(['log', '-1', '--format=%s'], dir)).toBe('stale-ref-work'); // the work is untouched
+  });
+
   it('a release of a lane with a dirty tracked file does NOT publish it as free', () => {
     const { lane } = acquireOneLane();
     writeFileSync(join(laneDir(lane), 'file.txt'), 'dirty tracked edit\n');
