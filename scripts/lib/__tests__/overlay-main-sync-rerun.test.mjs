@@ -1,0 +1,273 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import * as fs from 'node:fs';
+import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
+import * as sync from '../daemon-rebuild/overlay-main-sync.mjs';
+import { addOverlay, appendOverlayEvent, overlayFilePath } from '../daemon-overlays.mjs';
+import { alertsFilePath } from '../daemon-rebuild/state.mjs';
+
+// Same real-tree / injected-runner fixture style as daemon-rebuild-overlay-main-sync.test.mjs.
+const temps = [], ref = 'lane/fix', failedFile = 'worker0.test.mjs';
+const selectedFiles = options => options.args.filter(arg => /\.test\.mjs$/.test(arg));
+const temp = () => {
+  const path = fs.mkdtempSync(join(tmpdir(), 'we-main-sync-rerun-test-'));
+  temps.push(path);
+  return path;
+};
+afterEach(() => {
+  vi.restoreAllMocks();
+  temps.splice(0).forEach(path => fs.rmSync(path, { recursive: true, force: true }));
+});
+const run = (args, opts = {}) => spawnSync('git',
+  ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', ...args],
+  { encoding: 'utf8', timeout: 20_000, maxBuffer: 8 * 1024 * 1024, ...opts,
+    env: { ...process.env, ...opts.env } });
+const ok = (cwd, args) => {
+  const result = run(args, { cwd });
+  if (result.status !== 0) throw new Error(`${args}: ${result.stderr}`);
+  return result.stdout.trim();
+};
+const write = (root, file, text) => {
+  fs.mkdirSync(dirname(join(root, file)), { recursive: true });
+  fs.writeFileSync(join(root, file), text);
+};
+const json = file => JSON.parse(fs.readFileSync(file, 'utf8'));
+
+function fixture({ reruns } = {}) {
+  const base = temp(), root = join(base, 'clone'), origin = join(base, 'origin.git');
+  fs.mkdirSync(root); fs.mkdirSync(join(root, 'node_modules'));
+  ok(root, ['init', '-q', '-b', 'main']);
+  write(root, '.gitignore', 'node_modules/\n');
+  const lines = Array.from({ length: 30 }, (_, i) => `export const value${i} = ${i};`);
+  write(root, 'worker.mjs', `${lines.join('\n')}\n`);
+  for (let i = 0; i < 3; i++) write(root, `worker${i}.test.mjs`, "import './worker.mjs';\n");
+  ok(root, ['add', '.']); ok(root, ['commit', '-qm', 'base']);
+  ok(root, ['checkout', '-qb', ref]);
+  const overlay = [...lines]; overlay[0] = 'export const value0 = 100;';
+  write(root, 'worker.mjs', `${overlay.join('\n')}\n`);
+  ok(root, ['commit', '-qam', 'overlay']);
+  const oldSha = ok(root, ['rev-parse', 'HEAD']);
+  ok(root, ['checkout', '-q', 'main']);
+  const main = [...lines]; main[29] = 'export const value29 = 200;';
+  write(root, 'worker.mjs', `${main.join('\n')}\n`);
+  ok(root, ['commit', '-qam', 'main advanced']);
+  const mainSha = ok(root, ['rev-parse', 'HEAD']);
+  ok(base, ['clone', '-q', '--bare', root, origin]);
+  ok(root, ['remote', 'add', 'origin', origin]);
+  ok(root, ['update-ref', 'refs/remotes/origin/main', mainSha]);
+  ok(root, ['update-ref', `refs/remotes/origin/${ref}`, oldSha]);
+  const env = { ...process.env, TMPDIR: base, WE_DAEMON_OVERLAY_DIR: join(base, 'overlays'),
+    WE_DAEMON_STATE_DIR: join(base, 'state'), WE_DAEMON_EVENTS: join(base, 'daemon-events.jsonl'),
+    WE_NEEDS_YOU_FEED: join(base, 'needs-you-events.jsonl'),
+    WE_PLATFORM_PREFERENCES_FILE: join(base, 'missing'), WE_DAEMON_OVERLAY_MAIN_SYNC: 'on' };
+  delete env.WE_DAEMON_OVERLAY_MAIN_SYNC_FLAKE_RERUNS;
+  if (reruns !== undefined) env.WE_DAEMON_OVERLAY_MAIN_SYNC_FLAKE_RERUNS = String(reruns);
+  addOverlay(root, { ref, pr: 123 }, { env });
+  // Make an accidental operator failure observable immediately rather than waiting two hours.
+  fs.writeFileSync(`${overlayFilePath(root, env)}.main-sync.state`, JSON.stringify({
+    lastSyncedMain: {}, firstFailureAt: { [ref]: Date.now() - 3 * 60 * 60_000 },
+  }));
+  const events = [], outcomes = [], pushes = [], scratched = [];
+  const deps = {
+    io: { ...fs, mkdtempSync: prefix => {
+      const path = fs.mkdtempSync(prefix); scratched.push(path); temps.push(path); return path;
+    } },
+    git: vi.fn((args, opts) => {
+      // All objects already exist locally; observe publication without fetching or pushing.
+      if (args[0] === 'push') { pushes.push([...args]); return { status: 0, stdout: '', stderr: '' }; }
+      if (args[0] === 'fetch') return { status: 0, stdout: '', stderr: '' };
+      return run(args, opts);
+    }),
+    appendOverlayEvent: (root, event, opts) => {
+      events.push(event); return appendOverlayEvent(root, event, opts);
+    },
+    appendDaemonEvent: event => { outcomes.push(event); },
+    now: () => new Date().toISOString(),
+  };
+  return { base, root, env, mainSha, events, outcomes, pushes, scratched, deps };
+}
+
+// Return valid Vitest evidence; a zero exit alone must never hide failed or unexecuted files.
+function report(options, evidence = 'passed', status = 0) {
+  const testResults = selectedFiles(options).flatMap(file => {
+    const state = file === failedFile ? evidence : 'passed';
+    if (state === 'missing') return [];
+    return [{ name: join(fs.realpathSync(options.root), file),
+      assertionResults: state === 'empty' ? [] : [{ status: state }] }];
+  });
+  fs.writeFileSync(options.testReport, JSON.stringify({ testResults }));
+  return { status, stdout: '', stderr: '' };
+}
+function runners(f, sequence, mainEvidence = 'passed', initialStatus = 0) {
+  const trees = [];
+  f.deps.testRunner = vi.fn(async options => {
+    const index = trees.length;
+    trees.push({ root: fs.realpathSync(options.root), head: ok(options.root, ['rev-parse', 'HEAD']) });
+    expect(fs.readFileSync(join(options.root, 'worker.mjs'), 'utf8')).toContain('value0 = 100');
+    expect(fs.readFileSync(join(options.root, 'worker.mjs'), 'utf8')).toContain('value29 = 200');
+    return report(options, sequence[index] ?? 'failed', index === 0 ? initialStatus : 0);
+  });
+  // New injection contract: same invocation shape as testRunner, in a plain-main scratch checkout.
+  f.deps.mainTestRunner = vi.fn(async options => {
+    expect(selectedFiles(options)).toEqual([failedFile]);
+    expect(fs.realpathSync(options.root)).not.toBe(fs.realpathSync(f.root));
+    expect(ok(options.root, ['rev-parse', 'HEAD'])).toBe(f.mainSha);
+    expect(fs.readFileSync(join(options.root, 'worker.mjs'), 'utf8')).toContain('value0 = 0;');
+    return report(options, mainEvidence);
+  });
+  return trees;
+}
+const job = f => sync.runOverlayMainSync({ root: f.root, ref, env: f.env, deps: f.deps });
+const kinds = f => f.events.map(event => event.kind);
+const failure = 'selected tests did not pass or execute; operator review required';
+const noPublication = f => {
+  expect(f.pushes).toEqual([]);
+  expect(kinds(f)).not.toContain('overlay-main-synced');
+  expect(f.outcomes.some(event => event.kind === 'overlay-main-sync-synced')).toBe(false);
+};
+const sameMergedTree = trees => {
+  expect(trees.length).toBeGreaterThan(1);
+  for (const tree of trees.slice(1)) expect(tree).toEqual(trees[0]);
+};
+
+describe('overlay main sync failed-file reruns', () => {
+  it.each([0, 1])('flaky pass emits retried event and ends synced with push (initial exit %i)', async status => {
+    const f = fixture(), trees = runners(f, ['failed', 'passed'], 'passed', status);
+    expect(await job(f)).toMatchObject({ pushed: true });
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    sameMergedTree(trees);
+    expect(f.deps.mainTestRunner).not.toHaveBeenCalled();
+    expect(f.events).toContainEqual(expect.objectContaining({
+      kind: 'overlay-main-flaky-retried', ref, files: [failedFile],
+    }));
+    expect(kinds(f).indexOf('overlay-main-flaky-retried')).toBeLessThan(kinds(f).indexOf('overlay-main-synced'));
+    expect(f.outcomes.map(event => event.kind)).toContain('overlay-main-sync-synced');
+    expect(f.outcomes.map(event => event.kind)).not.toContain('overlay-main-sync-failed');
+    expect(f.pushes).toHaveLength(1);
+  });
+
+  it('reruns only failed files, excluding the two passing files in the chunk', async () => {
+    const f = fixture(); runners(f, ['failed', 'passed']);
+    await job(f);
+    expect(selectedFiles(f.deps.testRunner.mock.calls[0][0])).toEqual([
+      failedFile, 'worker1.test.mjs', 'worker2.test.mjs',
+    ]);
+    expect(selectedFiles(f.deps.testRunner.mock.calls[1][0])).toEqual([failedFile]);
+  });
+
+  it('persistent failure also red on plain main emits main-red, with no failed outcome, needs-you or push', async () => {
+    const f = fixture(), trees = runners(f, ['failed', 'failed'], 'failed');
+    expect(await job(f)).toMatchObject({ skipped: true, reason: 'main-red' });
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    sameMergedTree(trees);
+    expect(f.deps.mainTestRunner).toHaveBeenCalledOnce();
+    expect(f.events).toContainEqual(expect.objectContaining({ kind: 'overlay-main-red', ref, files: [failedFile] }));
+    expect(f.outcomes.some(event => /failed|needs-you/.test(event.kind))).toBe(false);
+    const alerts = alertsFilePath(f.root, f.env);
+    expect(fs.existsSync(alerts) ? fs.readFileSync(alerts, 'utf8') : '').not.toContain('needs-you');
+    expect(fs.existsSync(f.env.WE_NEEDS_YOU_FEED) ? fs.readFileSync(f.env.WE_NEEDS_YOU_FEED, 'utf8') : '').not.toContain('needs-you');
+    noPublication(f);
+  });
+
+  it('persistent failure with green main fails exactly as today after one main comparison', async () => {
+    const f = fixture(); runners(f, ['failed', 'failed']);
+    await expect(job(f)).rejects.toThrow(failure);
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    expect(f.deps.mainTestRunner).toHaveBeenCalledOnce();
+    expect(f.outcomes.map(event => event.kind)).toContain('overlay-main-sync-failed');
+    expect(kinds(f)).not.toContain('overlay-main-red');
+    noPublication(f);
+  });
+
+  it.each(['missing', 'empty'])('not-executed evidence on rerun (%s) is not a pass', async evidence => {
+    const f = fixture(); runners(f, ['failed', evidence]);
+    await expect(job(f)).rejects.toThrow(failure);
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    expect(f.deps.mainTestRunner).toHaveBeenCalledOnce();
+    expect(kinds(f)).not.toContain('overlay-main-flaky-retried');
+    noPublication(f);
+  });
+
+  it.each(['missing', 'empty'])('not-executed evidence on main (%s) fails closed instead of declaring main-red', async evidence => {
+    const f = fixture(); runners(f, ['failed', 'failed'], evidence);
+    await expect(job(f)).rejects.toThrow(failure);
+    expect(f.deps.mainTestRunner).toHaveBeenCalledOnce();
+    expect(kinds(f)).not.toContain('overlay-main-red');
+    noPublication(f);
+  });
+
+  it('flakeReruns=0 disables reruns and main comparison and fails as today', async () => {
+    const f = fixture({ reruns: 0 }); runners(f, ['failed', 'passed']);
+    await expect(job(f)).rejects.toThrow(failure);
+    expect(f.deps.testRunner).toHaveBeenCalledOnce();
+    expect(f.deps.mainTestRunner).not.toHaveBeenCalled();
+    expect(f.outcomes.map(event => event.kind)).toContain('overlay-main-sync-failed');
+    noPublication(f);
+  });
+
+  it('flakeReruns=2 permits two reruns on the same merged tree before syncing', async () => {
+    const f = fixture({ reruns: 2 }), trees = runners(f, ['failed', 'failed', 'passed']);
+    expect(await job(f)).toMatchObject({ pushed: true });
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(3);
+    sameMergedTree(trees);
+    for (const [options] of f.deps.testRunner.mock.calls.slice(1)) expect(selectedFiles(options)).toEqual([failedFile]);
+    expect(f.deps.mainTestRunner).not.toHaveBeenCalled();
+    expect(kinds(f)).toContain('overlay-main-flaky-retried');
+    expect(f.pushes).toHaveLength(1);
+  });
+
+  it('flakeReruns=2 stops after exactly two failing reruns then compares main once', async () => {
+    const f = fixture({ reruns: 2 }); runners(f, ['failed', 'failed', 'failed']);
+    await expect(job(f)).rejects.toThrow(failure);
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(3);
+    expect(f.deps.mainTestRunner).toHaveBeenCalledOnce();
+    noPublication(f);
+  });
+});
+
+describe('resolveOverlayFlakeReruns policy cascade', () => {
+  function policy() {
+    const base = temp(), settingsPath = join(base, 'settings.json');
+    const preferences = join(base, 'preferences.json');
+    const env = { WE_PLATFORM_PREFERENCES_FILE: preferences };
+    const resolve = (overrides = {}) => sync.resolveOverlayFlakeReruns({ ...env, ...overrides }, { settingsPath });
+    return { base, settingsPath, preferences, resolve };
+  }
+
+  it('defaults to one rerun with standard provenance when settings are absent', () => {
+    expect(policy().resolve()).toEqual({ value: 1, source: 'standard' });
+  });
+
+  it('resolves overlay.mainSync.flakeReruns through platform, tool and environment layers', () => {
+    const p = policy();
+    fs.writeFileSync(p.preferences, JSON.stringify({ overlay: { mainSync: { flakeReruns: 2 } } }));
+    expect(p.resolve()).toEqual({ value: 2, source: 'platform' });
+    fs.writeFileSync(p.settingsPath, JSON.stringify({ overlay: { mainSync: { flakeReruns: 0 } } }));
+    expect(p.resolve()).toEqual({ value: 0, source: 'tool' });
+    expect(p.resolve({ WE_DAEMON_OVERLAY_MAIN_SYNC_FLAKE_RERUNS: '1' })).toEqual({ value: 1, source: 'env' });
+  });
+
+  it.each(['0', '1', '2'])('accepts environment override %s with env provenance', value => {
+    expect(policy().resolve({ WE_DAEMON_OVERLAY_MAIN_SYNC_FLAKE_RERUNS: value }))
+      .toEqual({ value: Number(value), source: 'env' });
+  });
+
+  it.each(['', '-1', '1.5', 'bogus', 'Infinity', '9007199254740992'])('invalid environment value %j falls back to default one', value => {
+    expect(policy().resolve({ WE_DAEMON_OVERLAY_MAIN_SYNC_FLAKE_RERUNS: value }))
+      .toEqual({ value: 1, source: 'standard' });
+  });
+
+  it.each([-1, 1.5, 'bogus', null, true, 9007199254740992])('invalid settings value %j falls back to default one', value => {
+    const p = policy();
+    fs.writeFileSync(p.settingsPath, JSON.stringify({ overlay: { mainSync: { flakeReruns: value } } }));
+    expect(p.resolve()).toEqual({ value: 1, source: 'standard' });
+  });
+
+  it('logs the effective rerun setting and its source', () => {
+    const p = policy(), log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(p.resolve({ WE_DAEMON_OVERLAY_MAIN_SYNC_FLAKE_RERUNS: '2', WE_POLICY_CASCADE_LOG: '1' }))
+      .toEqual({ value: 2, source: 'env' });
+    expect(log.mock.calls.flat().join('\n')).toMatch(/(?:flakeReruns|FlakeReruns).*2.*env/);
+  });
+});
