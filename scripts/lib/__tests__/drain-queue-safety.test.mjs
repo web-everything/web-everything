@@ -849,7 +849,9 @@ describe('merge-queue same-head failure admission', () => {
       f.guard = () => mqSameHeadGuard({ repo, pr, head, exec: f.exec, log: f.log });
       f.expectHeld = () => {
         expect(f.guard()).toEqual({ hold: true, line: holdLine });
-        expect(f.log.mock.calls).toEqual([[holdLine]]);
+        expect(f.log.mock.calls[0]).toEqual([holdLine]);
+        // Only a decline-reason line may follow the unchanged hold line.
+        for (const [line] of f.log.mock.calls.slice(1)) expect(line).toMatch(/^mq-same-head-retry-declined: #6215 head \w+ — \S/);
       };
       test(f);
     }
@@ -922,6 +924,27 @@ describe('merge-queue same-head failure admission', () => {
       const result = f.guard();
       expect(result.hold).toBe(true);
       expect(result.line).toMatch(/already spent/);
+    }));
+    it('logs why the retry was declined: a non-infrastructure failed check and main not red at removal', () => fixture(f => {
+      f.checks = [{ id: 21, status: 'completed', conclusion: 'cancelled', name: 'test', output: {} },
+        { id: 22, status: 'completed', conclusion: 'failure', name: 'merge-gate', output: { title: '', summary: '' } }];
+      f.expectHeld();
+      expect(f.log.mock.calls[1][0]).toBe(`mq-same-head-retry-declined: #${pr} head ${head} — non-infrastructure failed check(s): merge-gate; main was not red at removal`);
+    }));
+    it('logs why the retry was declined: main CI not green', () => fixture(f => {
+      f.runs[0].conclusion = 'failure';
+      f.expectHeld();
+      expect(f.log.mock.calls[1][0]).toBe(`mq-same-head-retry-declined: #${pr} head ${head} — main CI is not green`);
+    }));
+    it('logs why the retry was declined: PR not CLEAN', () => fixture(f => {
+      f.live.mergeStateStatus = 'BEHIND';
+      f.expectHeld();
+      expect(f.log.mock.calls[1][0]).toBe(`mq-same-head-retry-declined: #${pr} head ${head} — PR is not CLEAN (BEHIND)`);
+    }));
+    it('logs why the retry was declined: unreadable evidence', () => fixture(f => {
+      f.checkError = true;
+      f.expectHeld();
+      expect(f.log.mock.calls[1][0]).toBe(`mq-same-head-retry-declined: #${pr} head ${head} — retry evidence unreadable or incomplete`);
     }));
     it('a main run with unreadable completion time keeps the hold', () => fixture(f => {
       delete f.runs[0].updated_at;
