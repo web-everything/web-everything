@@ -623,6 +623,23 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     expect(index.map['o/r#7'].lastReviewedHead).toBe(H(1));
     expect(index.map['o/r#9']).toMatchObject({ lastReviewedHead: H(5) }); // the foreign record is untouched
   });
+  it('a failed retraction marker write is retried once; if it still fails the error says rollback-failed (never a silent fail-open)', () => {
+    rec();
+    const markerFail = n => { let calls = 0; return { ...nodeFs, openSync: (p, f) => { if (f === 'wx' && String(p).includes('retract.') && ++calls <= n) throw Object.assign(Error('EIO'), { code: 'EIO' }); return nodeFs.openSync(p, f); } }; };
+    const steal = fs => ({ ...fs, openSync: (p, f) => { if (f === 'a') writeFileSync(headIndexPaths(dir).lock, JSON.stringify({ pid: process.pid, token: 'thief', at: 1 })); return fs.openSync(p, f); } });
+    expect(() => rec({ fs: steal(markerFail(1)), head: H(2), netPatchHash: 'p2' })).toThrow(/lock lost(?!.*rollback-failed)/); // one failure: the retry succeeds
+    expect(readHeadIndex({ dir }).map['o/r#7'].history.p2).toBeUndefined();
+    rmSync(headIndexPaths(dir).lock, { force: true });
+    expect(() => rec({ fs: steal(markerFail(5)), head: H(3), netPatchHash: 'p3' })).toThrow(/lock lost.*rollback-failed/);   // both attempts fail
+  });
+  it('log rows must carry string head and at (an array or a number is not coerced into a valid record)', () => {
+    nodeFs.mkdirSync(dir, { recursive: true });
+    const row = { repo: 'o/r', pr: 7, head: H(1), netPatchHash: 'p1', verdict: 'accept', at: '2026-11-04T10:00:00Z' };
+    for (const bad of [{ ...row, head: [H(1)] }, { ...row, at: 1793890331573 }]) {
+      writeFileSync(headIndexPaths(dir).log, `${JSON.stringify(bad)}\n`);
+      expect(readHeadIndex({ dir })).toMatchObject({ ok: false, reason: 'index-unreadable' });
+    }
+  });
   it('pr must be a positive integer: null, empty, zero, boolean and non-numeric values are rejected on write and fail closed on replay', () => {
     for (const pr of [null, undefined, '', 0, -3, true, 'x', '7.5', 1.5]) expect(() => rec({ pr })).toThrow(/invalid record/);
     expect(existsSync(headIndexPaths(dir).log)).toBe(false);

@@ -61,8 +61,8 @@ const NOKEY = 'head:';
 const prKey = (repo, pr) => `${repo}#${Number(pr)}`;
 const TXN = /^[\w-]{1,64}$/;
 // pr must already BE a positive safe integer: Number() coercion would accept null, '', true and '7' as PR numbers.
-const validRecord = r => r && typeof r.repo === 'string' && r.repo && Number.isSafeInteger(r.pr) && r.pr > 0 && SHA.test(r.head ?? '')
-  && typeof r.verdict === 'string' && r.verdict && Number.isFinite(Date.parse(r.at)) && (r.txn === undefined || (typeof r.txn === 'string' && TXN.test(r.txn)));
+const validRecord = r => r && typeof r.repo === 'string' && r.repo && Number.isSafeInteger(r.pr) && r.pr > 0 && typeof r.head === 'string' && SHA.test(r.head)
+  && typeof r.verdict === 'string' && r.verdict && typeof r.at === 'string' && Number.isFinite(Date.parse(r.at)) && (r.txn === undefined || (typeof r.txn === 'string' && TXN.test(r.txn)));
 
 /** PURE: fold one record into the map and keep only the latest `keepPerPr` history entries for that PR. */
 export function applyRecord(map, rec, keepPerPr) {
@@ -242,13 +242,17 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
     // row must not stay visible. We never touch the log again to say so (a live holder may be appending to it or renaming a new
     // one over it, which would swallow our write): we create the marker file `retract.<txn>`, which replay applies to our row.
     const lineBytes = Buffer.from(line);
-    let retracted = false, publishing = false;
+    let retracted = false, rollbackFailed = false, publishing = false;
     const rollback = () => {
       if (retracted) return;                                    // idempotent
       retracted = true;
-      try { durable(fs, retractPath(dir, txn), 'wx', `${JSON.stringify({ txn })}\n`); } catch { /* best effort: the error below is what the caller sees */ }
+      for (let attempt = 0; attempt < 2; attempt++) {            // one retry; EEXIST means the marker is already there
+        try { durable(fs, retractPath(dir, txn), 'wx', `${JSON.stringify({ txn })}\n`); return; } catch (e) { if (e?.code === 'EEXIST') return; }
+      }
+      rollbackFailed = true;                                    // the row may stay visible: say so loudly instead of looking like an ordinary failure
     };
-    const fenced = () => { try { fence(); } catch (e) { rollback(); throw e; } };
+    const tag = e => { if (rollbackFailed && e instanceof Error && !e.message.includes('rollback-failed')) e.message += ' (rollback-failed: could not write the retraction marker, so this rejected row may remain visible)'; return e; };
+    const fenced = () => { try { fence(); } catch (e) { rollback(); throw tag(e); } };
     try {
     durable(fs, log, 'a', line);                                // 1. durable log line (fsynced); a failed fsync after the write retracts it too
     fenced();                                                   //    lock lost during the append: roll the line back, no publish
@@ -271,11 +275,11 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
         return [...older, { repo: r, pr: p, head: v.lastReviewedHead, netPatchHash: v.netPatchHash, verdict: v.verdict, at: v.at, ...tx(v) }];
       });
       const text = compact.map(c => `${JSON.stringify(c)}\n`).join('');
-      if (!snapshot.subarray(Math.max(0, snapshot.length - lineBytes.length)).equals(lineBytes)) { rollback(); throw Error('review-head-index: log changed under the lock; refusing to compact'); }
+      if (!snapshot.subarray(Math.max(0, snapshot.length - lineBytes.length)).equals(lineBytes)) { rollback(); throw tag(Error('review-head-index: log changed under the lock; refusing to compact')); }
       fenced();
       // The rewrite replaces the file, so it must replace exactly the bytes the compaction was derived from. A rejected writer's
       // retraction is a separate marker file, so nothing it does can be lost to this rename.
-      if (!fs.readFileSync(log).equals(snapshot)) { rollback(); throw Error('review-head-index: log changed under the lock; refusing to compact'); }
+      if (!fs.readFileSync(log).equals(snapshot)) { rollback(); throw tag(Error('review-head-index: log changed under the lock; refusing to compact')); }
       atomicWrite(fs, log, `${log}.tmp`, text);
       fenced();                                                 // lock lost during the rewrite: the compacted log replays to the same map, so it stays; our row is retracted
       for (const t of folded) { try { fs.unlinkSync(retractPath(dir, t)); } catch { /* gone */ } } // folded into the log we just wrote; later markers are not in `folded` and stay
@@ -290,7 +294,7 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
     publishing = true;
     atomicWrite(fs, mapPath, tmp, published);
     return { ok: true, lines };
-    } catch (e) { if (!publishing) rollback(); throw e; }       // a failure before the map publish must not leave our row visible; once publishing, the log is ahead of the map and readers rebuild
+    } catch (e) { if (!publishing) rollback(); throw tag(e); }       // a failure before the map publish must not leave our row visible; once publishing, the log is ahead of the map and readers rebuild
   }, { fs });
 }
 
