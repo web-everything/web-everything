@@ -188,32 +188,47 @@ describe('R508 force-adopt through rebuildClone', () => {
     expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8')).toMatch(/force-adopt-rolled-back/);
   });
 
-  it('a request for build X never force-adopts build Y that fails smoke: refused, held, request kept for X', async () => {
-    const { base, originDir, cloneDir, env: env0 } = makeFixture();
-    const env = { ...forceEnv(env0, base), WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' };
-    const lastGood = headOf(cloneDir);
-    const other = advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n'));
-    const wrong = other.replace(/.$/, other.endsWith('0') ? '1' : '0'); // a different, well-formed sha
-    expect(requestForceAdopt({ root: cloneDir, env, daemon: 'review', ruling: 'R508', quote: QUOTE, sha: wrong, rulingsText: RULINGS }).ok).toBe(true);
-    const r = await rebuildClone({ root: cloneDir, env, runSmoke: failing(), prState: async () => null, lockOpts: LOCK_OPTS });
-    expect(r).toMatchObject({ moved: false, reason: 'force-adopt-refused', detail: 'sha-mismatch' });
-    expect(headOf(cloneDir)).toBe(lastGood);
-    expect(readForceWatch(cloneDir, env)).toBeNull();
-    expect(readReadyCandidate(cloneDir, env)).toBeNull();
-    expect(existsSync(env.WE_FORCE_ADOPT_HANDOFF)).toBe(false); // nothing was logged as an adoption
-    expect(readForceAdopt(cloneDir, env)).toMatchObject({ sha: wrong }); // still pending for ITS build
+  it('a request for build X never force-adopts build Y: Y gets the normal failed-smoke ladder and the request stays pending', async () => {
+    const run = async (withRequest) => {
+      const { base, originDir, cloneDir, env: env0 } = makeFixture();
+      const env = { ...forceEnv(env0, base), WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' };
+      const lastGood = headOf(cloneDir);
+      const other = advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n'));
+      const wrong = other.replace(/.$/, other.endsWith('0') ? '1' : '0'); // a different, well-formed sha
+      if (withRequest) expect(requestForceAdopt({ root: cloneDir, env, daemon: 'review', ruling: 'R508', quote: QUOTE, sha: wrong, rulingsText: RULINGS }).ok).toBe(true);
+      const r = await rebuildClone({ root: cloneDir, env, runSmoke: failing(), prState: async () => null, lockOpts: LOCK_OPTS });
+      return { r, env, cloneDir, lastGood, wrong, state: readRebuildState(cloneDir, env) };
+    };
+    const plain = await run(false);
+    const forced = await run(true);
+    expect(forced.r.reason).not.toBe('force-adopt-refused');
+    expect(forced.r.reason).toBe(plain.r.reason); // identical outcome to a clone with no request pending
+    expect(forced.state.rejected?.reason).toBe(plain.state.rejected?.reason); // the sticky rejection is recorded, so Y is not re-smoked every tick
+    expect(forced.state.rejected).toBeTruthy();
+    expect(headOf(forced.cloneDir)).toBe(forced.lastGood);
+    expect(readForceWatch(forced.cloneDir, forced.env)).toBeNull();
+    expect(readReadyCandidate(forced.cloneDir, forced.env)).toBeNull();
+    expect(existsSync(forced.env.WE_FORCE_ADOPT_HANDOFF)).toBe(false); // nothing was logged as an adoption
+    expect(readForceAdopt(forced.cloneDir, forced.env)).toMatchObject({ sha: forced.wrong }); // still pending for ITS build
   });
 
-  it('an old request record with no sha never applies to any build', async () => {
-    const { base, originDir, cloneDir, env: env0 } = makeFixture();
-    const env = { ...forceEnv(env0, base), WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' };
-    const lastGood = headOf(cloneDir);
-    advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n'));
-    const now = Date.now();
-    writeFileSync(join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(cloneDir)}.force-adopt.json`), JSON.stringify({ daemon: 'review', ruling: 'R508', quote: QUOTE, requestedAt: new Date(now).toISOString(), expiresAt: new Date(now + 3600_000).toISOString() }));
-    const r = await rebuildClone({ root: cloneDir, env, runSmoke: failing(), prState: async () => null, lockOpts: LOCK_OPTS });
-    expect(r).toMatchObject({ moved: false, reason: 'force-adopt-refused', detail: 'sha-mismatch' });
-    expect(headOf(cloneDir)).toBe(lastGood);
+  it('an old request record with no sha never applies to any build, and does not block the normal ladder', async () => {
+    const run = async (withRecord) => {
+      const { base, originDir, cloneDir, env: env0 } = makeFixture();
+      const env = { ...forceEnv(env0, base), WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' };
+      const lastGood = headOf(cloneDir);
+      advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n'));
+      const now = Date.now();
+      if (withRecord) writeFileSync(join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(cloneDir)}.force-adopt.json`), JSON.stringify({ daemon: 'review', ruling: 'R508', quote: QUOTE, requestedAt: new Date(now).toISOString(), expiresAt: new Date(now + 3600_000).toISOString() }));
+      const r = await rebuildClone({ root: cloneDir, env, runSmoke: failing(), prState: async () => null, lockOpts: LOCK_OPTS });
+      return { r, cloneDir, env, lastGood };
+    };
+    const plain = await run(false);
+    const old = await run(true);
+    expect(old.r.reason).not.toBe('force-adopt-refused');
+    expect(old.r.reason).toBe(plain.r.reason);
+    expect(headOf(old.cloneDir)).toBe(old.lastGood);
+    expect(readForceWatch(old.cloneDir, old.env)).toBeNull();
   });
 
   it('a request without a ruling is refused and changes nothing', () => {

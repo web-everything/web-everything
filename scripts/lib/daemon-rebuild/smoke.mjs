@@ -662,16 +662,15 @@ export async function smokeAndAdopt({
 
   const failedA = failedRows(a.smokeResult);
   // R508 operator force-adopt: the smoke above STILL ran; its failure is recorded alongside the force, never skipped.
-  const forceReq = readForceAdopt(root, stEnv);
-  const forceSha = String(forceReq?.sha ?? '').toLowerCase();
-  // Fail closed: a stored sha that is not a full 40-hex id never matches, even against an empty plan sha.
-  if (forceReq && (!/^[0-9a-f]{40}$/.test(forceSha) || forceSha !== String(plan.finalSha ?? '').toLowerCase())) {
-    // The operator's ruling vouches for ONE build. A request with no sha (an old record) or another sha never applies here;
-    // it stays pending for its own build until it expires, and this build is held like any failed smoke.
-    alert('force-adopt-refused', { reason: 'sha-mismatch', requested: forceReq.sha ?? null, target: plan.finalSha });
-    await hold('force-adopt-refused', failedA);
-    return { moved: false, reason: 'force-adopt-refused', detail: 'sha-mismatch', plan, alerts: [...prepAlerts, ...alertsList] };
-  }
+  const pendingForce = readForceAdopt(root, stEnv);
+  const forceSha = String(pendingForce?.sha ?? '').toLowerCase();
+  // The operator's ruling vouches for ONE build. Fail closed: a stored sha that is not a full 40-hex id never matches,
+  // even against an empty plan sha. A request with no sha (an old record) or another sha never applies to this build:
+  // it stays pending for its own build until it expires, and THIS build falls through to the ordinary failed-smoke ladder
+  // below (reuse / environment verdicts / sticky rejection / fallback), exactly as if no request existed.
+  const forceReq = pendingForce
+    && /^[0-9a-f]{40}$/.test(forceSha) && forceSha === String(plan.finalSha ?? '').toLowerCase()
+    ? pendingForce : null;
   if (forceReq) {
     const forceSmoke = { verdict: a.smokeResult.verdict, failed: failedA.map((r) => r.name) };
     alert('force-adopt-over-failed-smoke', { ruling: forceReq.ruling, quote: forceReq.quote, ...forceSmoke, target: plan.finalSha });
