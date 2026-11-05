@@ -336,13 +336,17 @@ describe('non-accept verdicts retain pending', () => {
 });
 
 describe('confirm exclusion revalidates at list time', () => {
-  const before = acceptedAt - RUN_MTIME_SLACK_MS - 1;
+  const panelAt = acceptedAt - 10_000;
+  const before = panelAt - RUN_MTIME_SLACK_MS - 1;
   function setup() {
     const id = 'review-pr-confirm';
     const run = { op: 'review-pr', input: { repo, pr }, verdict: { verdict: 'needs-human' },
       pending: { kind: 'confirm' }, effects: [], ...{ findings: payload().findings },
       stepTimings: [{ step: 'read', startedAt: iso(before) }] };
-    const io = { runsDir: 'fixture-runs', list: () => [id], read: vi.fn(() => run),
+    const panel = { ...run, verdict: { verdict: 'accept' }, pending: null,
+      stepTimings: [{ step: 'read', startedAt: iso(panelAt) }] };
+    const io = { runsDir: 'fixture-runs', list: () => [id, 'review-pr-accepting-panel'],
+      read: vi.fn(key => key === id ? run : panel),
       stat: vi.fn(() => ({ mtimeMs: before })) };
     const key = { repo, pr, head };
     const scan = mod.ignorableConfirmRunIds({ ...key, ...io, comments: [accept()], reviews: [],
@@ -350,8 +354,8 @@ describe('confirm exclusion revalidates at list time', () => {
     return { id, run, io, key, scan };
   }
   it('carries acceptance time and excludes a still-inert confirm', () => {
-    const f = setup(); expect(f.scan.acceptedAt).toBe(acceptedAt);
-    expect(mod.revalidatedConfirmList({ ...f.key, ...f.io, ignoreRunIds: f.scan.ids, acceptedAt: f.scan.acceptedAt })(f.io.runsDir)).toEqual([]);
+    const f = setup(); expect(f.scan.acceptedAt).toBe(panelAt);
+    expect(mod.revalidatedConfirmList({ ...f.key, ...f.io, ignoreRunIds: f.scan.ids, acceptedAt: f.scan.acceptedAt })(f.io.runsDir)).toEqual(['review-pr-accepting-panel']);
   });
   it.each(['mtime', 'resume', 'effect', 'read failure', 'stat failure', 'missing acceptance time'])(
     '%s changing after scan retains the run and review-unfinished evidence', kind => {
@@ -620,11 +624,15 @@ describe('headNeverReviewedFromRuns complete bounded proof', () => {
 });
 
 describe('ignorableConfirmRunIds chronology and closed scan', () => {
-  const before = acceptedAt - RUN_MTIME_SLACK_MS - 1;
+  const panelAt = acceptedAt - 10_000;
+  const before = panelAt - RUN_MTIME_SLACK_MS - 1;
   const run = (over = {}) => ({ op: 'review-pr', input: { repo, pr },
     verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' }, effects: [],
     stepTimings: [{ step: 'read', startedAt: iso(before) }], ...over });
   function scanFixture(records = { 'review-pr-confirm': run() }) {
+    records = { ...records, 'review-pr-accepting-panel': run({ verdict: { verdict: 'accept' },
+      pending: null, findings: payload('accept').findings,
+      stepTimings: [{ step: 'read', startedAt: iso(panelAt) }] }) };
     return { repo, pr, head, comments: [accept()], reviews: [], labels: ['review:accepted', 'red-team:pending'],
       runsDir: 'fixture-runs', now: acceptedAt + 10_000,
       list: vi.fn(() => Object.keys(records)), read: vi.fn(id => records[id]),
@@ -635,6 +643,48 @@ describe('ignorableConfirmRunIds chronology and closed scan', () => {
     expect(mod.ignorableConfirmRunIds, 'export the fail-closed confirm-run scanner').toBeTypeOf('function');
     return mod.ignorableConfirmRunIds(f);
   }
+  it('refuses a confirm started after the accepting panel but before its acceptance comment', () => {
+    const f = scanFixture({ 'review-pr-confirm': run({
+      stepTimings: [{ step: 'read', startedAt: iso(panelAt + 1) }] }) });
+    expect(scan(f)).toEqual({ ok: false, ids: [] });
+  });
+  it('refuses confirm exclusion without an exact-head accepting finished panel', () => {
+    const f = scanFixture(); f.list = () => ['review-pr-confirm'];
+    expect(scan(f)).toEqual({ ok: false, ids: [] });
+  });
+  it.each(['wrong head', 'non-accept', 'pending confirm', 'pending effect', 'unknown effect', 'missing start', 'invalid start'])(
+    '%s cannot supply an accepting-panel anchor', kind => {
+      const f = scanFixture(); const read = f.read;
+      f.read = id => {
+        const record = read(id);
+        if (id !== 'review-pr-accepting-panel') return record;
+        if (kind === 'wrong head') record.findings = payload('accept', old).findings;
+        if (kind === 'non-accept') record.verdict = { verdict: 'needs-human' };
+        if (kind === 'pending confirm') record.pending = { kind: 'confirm' };
+        if (kind === 'pending effect') record.effects = [{ status: 'pending' }];
+        if (kind === 'unknown effect') record.effects = [{ status: 'bogus' }];
+        if (kind === 'missing start') record.stepTimings = [];
+        if (kind === 'invalid start') record.stepTimings = [{ step: 'read', startedAt: 'invalid' }];
+        return record;
+      };
+      expect(scan(f)).toEqual({ ok: false, ids: [] });
+    });
+  it('uses the earliest accepting-panel start regardless of scan order', () => {
+    const f = scanFixture({ 'review-pr-earlier-panel': run({ pending: null, verdict: { verdict: 'accept' },
+      findings: payload('accept').findings, stepTimings: [{ step: 'read', startedAt: iso(before - 1) }] }) });
+    expect(scan(f)).toMatchObject({ ok: true, ids: [], acceptedAt: before - 1 });
+  });
+  it.each(['mtime', 'resumedAt'])(
+    '%s after the panel started prevents exclusion even before the acceptance comment', kind => {
+      const f = scanFixture();
+      if (kind === 'mtime') f.stat = () => ({ mtimeMs: panelAt + 1 });
+      else {
+        const read = f.read;
+        f.read = id => ({ ...read(id), ...(id === 'review-pr-confirm' ? {
+          resumeOf: 'review-pr-origin', resumedAt: iso(panelAt + 1) } : {}) });
+      }
+      expect(scan(f)).toEqual({ ok: false, ids: [] });
+    });
   it.each([acceptedAt + 1000, acceptedAt - RUN_MTIME_SLACK_MS, undefined, NaN, Infinity])(
     'refuses an old-start confirm with late or unreadable last-write time %s', mtimeMs => {
       const f = scanFixture(); f.stat = () => ({ mtimeMs });
@@ -648,7 +698,7 @@ describe('ignorableConfirmRunIds chronology and closed scan', () => {
       'review-pr-other-op': run({ op: 'other' }), 'other-op': run(),
     });
     expect(latestAcceptRecord(f.comments, f.reviews)).toMatchObject({ sha: head, laterVerdict: false, laterBodyDerivedHold: false });
-    expect(scan(f)).toEqual({ ok: true, ids: ['review-pr-confirm'], acceptedAt });
+    expect(scan(f)).toEqual({ ok: true, ids: ['review-pr-confirm'], acceptedAt: panelAt });
     expect(f.read.mock.calls.map(([id]) => id)).not.toContain('other-op');
   });
   it.each([{}, [], { op: 'review-pr' }, { op: 'review-pr', input: { repo } }])('malformed review run invalidates all ignorable ids: %j', record => {
@@ -656,14 +706,14 @@ describe('ignorableConfirmRunIds chronology and closed scan', () => {
   });
   it('accepts object-shaped accepted labels', () => {
     const f = scanFixture(); f.labels = [{ name: 'review:accepted' }];
-    expect(scan(f)).toEqual({ ok: true, ids: ['review-pr-confirm'], acceptedAt });
+    expect(scan(f)).toEqual({ ok: true, ids: ['review-pr-confirm'], acceptedAt: panelAt });
   });
   it('returns no ids for a fully finished scan', () => {
-    expect(scan(scanFixture({ 'review-pr-done': run({ pending: null }) }))).toEqual({ ok: true, ids: [], acceptedAt });
+    expect(scan(scanFixture({ 'review-pr-done': run({ pending: null }) }))).toEqual({ ok: true, ids: [], acceptedAt: panelAt });
   });
   it('accepts an old resumed confirm only when both starts precede the slack boundary', () => {
     expect(scan(scanFixture({ 'review-pr-confirm': run({ resumeOf: 'review-pr-origin', resumedAt: iso(before) }) })))
-      .toEqual({ ok: true, ids: ['review-pr-confirm'], acceptedAt });
+      .toEqual({ ok: true, ids: ['review-pr-confirm'], acceptedAt: panelAt });
   });
   it.each([
     ['no verdict', { verdict: null }], ['wrong verdict', { verdict: { verdict: 'accept' } }],
@@ -682,12 +732,12 @@ describe('ignorableConfirmRunIds chronology and closed scan', () => {
   });
   it('finished effects do not prevent ignoring an otherwise old confirm', () => {
     expect(scan(scanFixture({ 'review-pr-confirm': run({ effects: [{ status: 'applied' }] }) })))
-      .toEqual({ ok: true, ids: ['review-pr-confirm'], acceptedAt });
+      .toEqual({ ok: true, ids: ['review-pr-confirm'], acceptedAt: panelAt });
   });
   it('omits abandoned verdict-less terminal attempts using the drain abandonment age', () => {
     const f = scanFixture({ 'review-pr-abandoned': run({ verdict: null, pending: null }) });
     f.stat = () => ({ mtimeMs: f.now - ABANDONED_REVIEW_AFTER_MS });
-    expect(scan(f)).toEqual({ ok: true, ids: [], acceptedAt });
+    expect(scan(f)).toEqual({ ok: true, ids: [], acceptedAt: panelAt });
   });
   it('an old rewound resume is never treated as abandoned', () => {
     const f = scanFixture({ 'review-pr-rewound': run({ verdict: null, pending: null, resumeOf: 'review-pr-origin' }) });
@@ -711,8 +761,8 @@ describe('ignorableConfirmRunIds chronology and closed scan', () => {
     const f = scanFixture(); mutate(f); expect(scan(f)).toEqual({ ok: false, ids: [] });
   });
   it('allows exactly 400 parsed review runs', () => {
-    const records = Object.fromEntries(Array.from({ length: 400 }, (_, i) => [`review-pr-${i}`, run({ pending: null })]));
-    const f = scanFixture(records); expect(scan(f)).toEqual({ ok: true, ids: [], acceptedAt });
+    const records = Object.fromEntries(Array.from({ length: 399 }, (_, i) => [`review-pr-${i}`, run({ pending: null })]));
+    const f = scanFixture(records); expect(scan(f)).toEqual({ ok: true, ids: [], acceptedAt: panelAt });
     expect(f.read).toHaveBeenCalledTimes(400);
   });
   it('over 400 parses fails closed for operator inspection without partial ids or extra reads', () => {
@@ -914,7 +964,9 @@ describe('audit hardening: unknown effect statuses and checked comments', () => 
         pending: kind === 'confirm' ? { kind: 'confirm' } : null, effects: [{ status }],
         stepTimings: [{ step: 'read', startedAt: iso(acceptedAt - RUN_MTIME_SLACK_MS - 1) }] };
       if (kind === 'abandoned') run.verdict = null;
-      const input = { repo, pr, head, runsDir: 'fixture-runs', list: () => ['review-pr-unknown'], read: () => run,
+      const input = { repo, pr, head, runsDir: 'fixture-runs', list: () => ['review-pr-unknown', 'review-pr-accepting-panel'],
+        read: id => id === 'review-pr-unknown' ? run : { ...run, ...payload('accept'), pending: null, effects: [],
+          stepTimings: [{ step: 'read', startedAt: iso(acceptedAt - 10_000) }] },
         stat: () => ({ mtimeMs: acceptedAt - ABANDONED_REVIEW_AFTER_MS - 1 }), now: acceptedAt,
         comments: [accept()], labels: ['review:accepted', 'red-team:pending'], reviews: [] };
       expect(mod.ignorableConfirmRunIds(input)).toEqual({ ok: false, ids: [] });
