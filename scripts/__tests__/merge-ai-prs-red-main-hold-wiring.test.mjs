@@ -156,6 +156,8 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
     // Pin the hold + mode: with VITEST cleared the live scripts/settings/red-main-hold.json would otherwise be read.
     env.WE_DRAIN_RED_MAIN_HOLD = holdSetting || 'on';
     env.WE_DRAIN_RED_MAIN_MODE = 'stop';
+    // R546: with VITEST cleared the drain-read source defaults to GitHub REST; this fixture serves a fake git, so pin it.
+    env.WE_DRAIN_READS_SOURCE = 'git';
     env.WE_DRAIN_RED_MAIN_MANUAL_FREEZE_FIX_PR = manualFix;
     env.WE_DRAIN_RED_MAIN_FREEZE_READER = shared === null ? 'local-only' : 'shared-first';
     delete env.RMH_SHARED_FREEZE;

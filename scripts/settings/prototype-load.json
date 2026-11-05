@@ -180,6 +180,14 @@
         "scripts/lib/drain-queue-safety.mjs:59 — One or two `merge_conflict` removals now bypass commit-binding validation and the same-head failure hold whenever the live PR is CLEAN. CLEAN does not prove the failed merge-group conditions changed; previously these cases required operator inspection.",
         "scripts/__tests__/merge-ai-prs-prestage.test.mjs:188 — Replacing `merge_conflict` with `ci_failure` removes integration coverage that prevented a force-push from bypassing an unbound conflict failure. The test now passes despite that protection being removed."
       ]
+    },
+    {
+      "ref": "lane/platform-settings-reach-verify",
+      "sha": "33b0209818ac4016f8428bc3e880e327a183328e",
+      "ruling": "R606",
+      "findings": [
+        "scripts/lib/policy-cascade.mjs:79 — Per-leaf merging retains the repository’s weaker build gates when an operator supplies only `build.priority` or `build: {}`. A read-only probe confirmed the effective policy changes from `full`/`always` to `related`/`selected`, reducing verification from the full unit suite plus standards to diff-selected checks (scripts/verify-lane.mjs:366)."
+      ]
     }
   ]
 }

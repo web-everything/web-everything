@@ -18,10 +18,19 @@ import { createResourceFixThrottle } from '../resource-gate.mjs';
 const HOST_NOW = Date.parse('2026-11-04T12:00:00Z');
 const healthyHost = {
   nowMs: () => HOST_NOW,
-  readSnap: () => ({ sampledAt: new Date(HOST_NOW - 5000).toISOString(), freshUntil: new Date(HOST_NOW + 20000).toISOString(),
+  readSnap: () => ({ sampledAt: new Date(HOST_NOW - 5000).toISOString(), freshUntil: new Date(HOST_NOW + 15000).toISOString(),
     cpu: { idlePct: 40, loadAvg: [1] }, memory: { pressureLevel: 1, metric: 'available', availableMb: 8192 } }),
   resolveFloor: () => ({ metric: 'available', floorMb: 2048, source: 'test' }),
 };
+it('the healthy host fixture is fresh within the 20s maximum and reaches the host gate', () => {
+  const snap = healthyHost.readSnap();
+  expect(Date.parse(snap.freshUntil) - Date.parse(snap.sampledAt)).toBeLessThanOrEqual(20000);
+  let gateCalls = 0;
+  const throttle = createResourceFixThrottle({ listClaims: () => [], ...healthyHost, readHeavyWait: () => 0,
+    settings: { cutover: 'enforce', fixCap: { floor: 2, ceiling: 2 } }, gate: () => { gateCalls += 1; return { admit: false, kind: 'host-load' }; }, log: () => {} });
+  expect(throttle.tryAdmit('fix')).toMatchObject({ admit: false, kind: 'host-load' });
+  expect(gateCalls).toBe(1);
+});
 it('keeps a send-back slot inside a reduced cap without bypassing host admission', () => {
   const throttle = createResourceFixThrottle({ listClaims: () => [], ...healthyHost, readHeavyWait: () => 100,
     settings: { cutover: 'enforce', fixCap: { floor: 8, lowerBy: 4, lowerMinimum: 1, ceiling: 8 } },
