@@ -75,6 +75,16 @@ describe('degraded platform layer', () => {
   });
 });
 
+describe('degraded layers are logged, not silent', () => {
+  it('a non-frozen install carries the degraded reason as its note and logs it', () => {
+    const bad = () => ({ prefs: {}, errors: ['prefs.json: Unexpected token'] });
+    expect(installArgv({ ci: false, env: {}, readPlatform: bad }).note).toMatch(/unreadable/);
+    const logs = [];
+    installWithFallback({ frozen: false, env: {}, readPlatform: bad, log: (l) => logs.push(l), exec: () => {} });
+    expect(logs.join('\n')).toMatch(/unreadable/);
+  });
+});
+
 describe('installArgv / installCommand', () => {
   it('npm: ci when frozen, install otherwise', () => {
     expect(installArgv({ ci: true, ...none })).toMatchObject({ bin: 'npm', args: ['ci'], manager: 'npm' });
@@ -163,6 +173,7 @@ describe('installWithFallback', () => {
     ['integrity failure', { stderr: 'ERR_PNPM_TARBALL_INTEGRITY' }],
     ['lifecycle script failure', { stderr: 'ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL postinstall' }],
     ['unrecognised failure', {}],
+    ['timeout while pnpm was running', { code: 'ETIMEDOUT' }],
     ['fetch failure alongside a signature rejection', { stderr: 'ERR_PNPM_FETCH_FAIL Cannot find matching keyid' }],
     ['fetch failure alongside a lifecycle failure', { stderr: 'ERR_PNPM_FETCH_FAIL ELIFECYCLE' }],
     ['timeout carrying a lifecycle failure', { code: 'ETIMEDOUT', stderr: 'ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL' }],
