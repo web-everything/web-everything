@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
+import { newRunRecord, readRun, writeRun } from '../../operations/run-store.mjs';
 import { historicalCardOnlySkipCandidate, readDrainRedTeamEvidence, recordRedTeamStatus, readRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { redTeamOwedFor } from '../review-red-team-policy.mjs';
@@ -810,6 +810,49 @@ it('capped evidence replaces a stale clear label with pending instead of preserv
   const f = fixture();
   expect(planRedTeamStatusLabels({ ...f, labels: ['red-team:clear'], comments: [],
     evidence: { ok: false, reason: 'scan-capped' } })).toEqual({ add: 'red-team:pending', remove: ['red-team:clear'] });
+});
+it.each([
+  ['an existing blocked label', ['red-team:blocked'], { add: null, remove: [] }],
+  ['an existing pending label', ['red-team:pending'], { add: null, remove: [] }],
+  ['a blocked label beside a stale clear label', ['red-team:clear', 'red-team:blocked'], { add: null, remove: ['red-team:clear'] }],
+])('capped evidence keeps %s and adds nothing', (_name, labels, expected) => {
+  const f = fixture();
+  expect(planRedTeamStatusLabels({ ...f, labels, comments: [], evidence: { ok: false, reason: 'scan-capped' } })).toEqual(expected);
+});
+
+import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
+describe('capped evidence never hides a recorded confirmed break', () => {
+  const breakComment = f => ({ author: { login: 'web-everything' }, body: renderRedTeamComment({ pr: f.pr, rev: f.head,
+    findings: [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }],
+    provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes' }) });
+  it.each(['scan-capped', 'review-unfinished', 'run-start-missing'])('enqueue hold keeps send-back precedence on %s evidence', reason => {
+    const f = fixture();
+    expect(redTeamEnqueueHold({ ...f, ok: false, reason, comments: [breakComment(f)], env: {} })).toMatch(/requiring send-back/);
+    // Without a break the unknown evidence still holds; it is never released.
+    expect(redTeamEnqueueHold({ ...f, ok: false, reason, comments: [], env: {} })).toMatch(new RegExp(`evidence unknown \\(${reason}\\)`));
+  });
+  it.each([[[]], [['red-team:pending']], [['red-team:clear']]])('status labels mark a capped PR with a confirmed break blocked (labels %j)', labels => {
+    const f = fixture();
+    const plan = planRedTeamStatusLabels({ ...f, labels, comments: [breakComment(f)], evidence: { ok: false, reason: 'scan-capped' } });
+    expect(plan.add).toBe('red-team:blocked');
+    expect(plan.remove).toEqual(labels);
+  });
+});
+
+it('historical card-only fallback shares the total parse budget: the recursion parses no record again', () => {
+  const f = fixture(), oldHead = 'c'.repeat(40);
+  f.head = 'a'.repeat(40);
+  const loopPayload = { verdict: { verdict: 'changes' }, findings: { read: {
+    netBasis: { rev: oldHead }, netChangedFiles: ['backlog/123-card.md'], diffText: '+card',
+  } } };
+  writeRun({ ...newRunRecord({ id: 'review-pr-old-card', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
+    ...loopPayload, stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(1000).toISOString() }] }, f.runsDir);
+  recordRedTeamStatus({ ...f, loopPayload, status: 'finished', result: 'skipped' }, f);
+  const reads = [];
+  const result = readDrainRedTeamEvidence({ ...f, read: (id, dir) => { reads.push(id); return readRun(id, dir); } });
+  expect(result).toMatchObject({ loopPayload, status: { status: 'finished', head: oldHead, skipCardOnly: true } });
+  // The outer exact-head and any-head scans parse the one record once; the recursive old-head read reuses that hit.
+  expect(reads).toEqual(['review-pr-old-card']);
 });
 it('an older unfinished review does not replace a logically newer finished panel', () => {
   const f = fixture();

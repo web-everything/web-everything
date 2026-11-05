@@ -3920,7 +3920,11 @@ The setting resolves through the shared standard/platform/tool cascade; `scripts
 leaves the tool value unset so platform preferences apply. No environment override is added.
 The shared finder continues from its cursor; it never retains a folder of payloads. Exhausting the
 budget before completion returns `{ok:false, reason:"scan-capped"}` and logs the limit/source. The
-enqueue gate, status labels and recovery scheduler hold on unknown evidence. Inspect omitted run
+enqueue gate, status labels and recovery scheduler hold on unknown evidence. A confirmed break
+recorded in the PR's comments still takes precedence: the gate returns its send-back hold and the
+status labels mark the PR `red-team:blocked`. Past the red-team deadline, unknown evidence never
+counts as "no run": it is neither re-requested nor enqueued by the operator override, and it holds
+with its reason named. Inspect omitted run
 records before deliberately raising the limit. Genuine folder exhaustion still means no match.
 Choose both head-specific and any-head matches by read-step `startedAt`, never file mtime.
 A record is written after its read step starts, so its mtime is an upper bound on that start.
