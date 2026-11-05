@@ -208,6 +208,12 @@ describe('settlement reads fresh PR state and result evidence', () => {
     expect(o.syncLabels).not.toHaveBeenCalled();
     expect(row.settleError).toBe('red-team pass still active; label unchanged');
   });
+  it('a result comment holding only the head marker (no explicit outcome) never synchronizes', () => {
+    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: {}, recorded: false, seatRecorded: false })), readIgnorableConfirms: () => [] });
+    o.rawPrs[0].comments.push({ author: { login: 'web-everything' }, body: redTeamMarker(pr, head) });
+    mod.runRedTeamOnSkip(o);
+    expect(o.syncLabels).not.toHaveBeenCalled();
+  });
   it('a throwing result evidence read settles nothing and reports settleError', () => {
     const o = runFixture({ readEvidence: () => { throw Error('fresh evidence offline'); } });
     o.rawPrs[0].comments.push(resultComment());

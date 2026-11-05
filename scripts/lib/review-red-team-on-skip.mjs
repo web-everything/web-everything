@@ -542,7 +542,12 @@ function resultMaySynchronize(comments, pr, head) {
   if (parsed.findings.length !== 0) return false;
   const advisory = "Advisory only: this comment changes no label itself; the red-team gate (setting `redTeam.confirmedBreaks`) sends a confirmed broken break back to the fixer. Head `"
     + String(head).slice(0, 12) + '` · red team ';
-  return newest.body.split(/\r?\n/).filter(line => line.trim()).every(line =>
+  const lines = newest.body.split(/\r?\n/).filter(line => line.trim());
+  // An explicit completed outcome is required: a bare marker (or marker plus advisory) proves no pass.
+  const outcome = line => line === 'The red team tried to break this change and reported nothing.'
+    || /^Red team not required on this head: [^\r\n]+$/.test(line) || /^Findings: none\.?$/i.test(line);
+  if (!lines.some(outcome)) return false;
+  return lines.every(line =>
     line === redTeamMarker(pr, head)
     || line === '### Post-accept red team — no break found'
     || line === 'The red team tried to break this change and reported nothing.'
