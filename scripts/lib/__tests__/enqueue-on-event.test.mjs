@@ -1006,6 +1006,47 @@ describe('catch-up during a daemon refresh (last-good enqueue)', () => {
     expect(catchUp.catchUp).toMatchObject({ intervalMinutes: 20, enabled: true });
     expect(resolveSetting({ catchUp: 'x' }).invalid).toContain('catchUp="x"');
   });
+
+  // Production passes no `platform`: the cascade reads the operator's preferences file itself, so that layer must be cleaned too.
+  describe('platform layer read from the preferences file (no platform argument)', () => {
+    const fromFile = (prefs, tool) => {
+      const dir = mkdtempSync(join(tmpdir(), 'enq-prefs-'));
+      const file = join(dir, 'platform-preferences.json');
+      writeFileSync(file, JSON.stringify(prefs));
+      try { return resolveEnqueueOnEventSetting({ tool, env: { WE_PLATFORM_PREFERENCES_FILE: file } }); } finally { rmSync(dir, { recursive: true, force: true }); }
+    };
+    const K = 'mergeQueue.enqueueOnEvent';
+    it.each([
+      ['enabled', { enabled: { x: true } }, { enabled: true }, (s) => expect(s.enabled).toBe(true)],
+      ['debounceSeconds', { debounceSeconds: { a: 5 } }, { enabled: true, debounceSeconds: 30 }, (s) => expect(s.debounceSeconds).toBe(30)],
+      ['catchUp.intervalMinutes', { catchUp: { intervalMinutes: { m: 5 } } }, { enabled: true, catchUp: { intervalMinutes: 20 } }, (s) => expect(s.catchUp.intervalMinutes).toBe(20)],
+      ['catchUp.enabled', { catchUp: { enabled: { x: true } } }, { enabled: true, catchUp: { enabled: true } }, (s) => expect(s.catchUp.enabled).toBe(true)],
+    ])('a nested object in the platform file %s does not override a valid tool value', (_leaf, platformBlock, tool, check) => {
+      const s = fromFile({ [K]: platformBlock }, tool);
+      check(s);
+      expect(s.invalid.length).toBeGreaterThan(0);
+    });
+    it('a nested object in a platform-file refreshPause / missBackoff leaf falls to the standard value and is named', () => {
+      const s = fromFile({ [`${K}.catchUp.refreshPause`]: { paths: { p: ['scripts/p'] }, maxPauseMinutes: { m: 2 } }, [`${K}.catchUp.missBackoff`]: { ttlMinutes: { x: 5 } } }, { enabled: true });
+      expect(s.catchUp.refreshPause).toEqual({ paths: DEFAULT_PAUSE_PATHS, maxPauseMinutes: 10 });
+      expect(s.catchUp.missBackoff.ttlMinutes).toBe(30);
+      expect(s.invalid).toEqual(expect.arrayContaining(['platform.catchUp.refreshPause.paths={"p":["scripts/p"]}', 'platform.catchUp.missBackoff.ttlMinutes={"x":5}']));
+    });
+    it('a valid platform-file refreshPause is applied', () => {
+      const s = fromFile({ [`${K}.catchUp.refreshPause`]: { paths: ['scripts/p'], maxPauseMinutes: 4 } }, { enabled: true });
+      expect(s.catchUp.refreshPause).toEqual({ paths: ['scripts/p'], maxPauseMinutes: 4 });
+      expect(s.sources['catchUp.refreshPause.paths']).toBe('platform');
+    });
+  });
+
+  it('rejects control characters in a pause path and bounds the logged invalid value', () => {
+    const s = resolveSetting({ catchUp: { refreshPause: { paths: ['a\nb · ignored invalid: x'] } } });
+    expect(s.catchUp.refreshPause.paths).toEqual(DEFAULT_PAUSE_PATHS);
+    expect(s.line).not.toContain('\n');
+    expect(resolveSetting({ debounceSeconds: { a: 'x'.repeat(500) } }).invalid[0].length).toBeLessThan(120);
+    const dup = resolveSetting({ catchUp: { order: 'x' } }, { platform: { catchUp: { order: 'x' } } });
+    expect(dup.invalid.filter((i) => i === 'catchUp.order="x"')).toHaveLength(1);
+  });
 });
 
 describe('catch-up handle', () => {

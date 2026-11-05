@@ -73,7 +73,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { cascadePolicy } from './policy-cascade.mjs';
+import { cascadePolicy, platformPreference } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { readBuildPrioritySettings, readBuildQueuePrioritySettings } from './build-queue.mjs';
 import { rankByDeliveryPriority, PRIORITY_CLASSES } from './delivery-priority.mjs';
@@ -139,7 +139,8 @@ const VALID = {
   timeoutSeconds: (v) => Number.isInteger(v) && v >= 60 && v <= 3600,
 };
 
-const showValue = (v) => { try { return JSON.stringify(v) ?? String(v); } catch { return String(v); } };
+// Bounded: an invalid value can be arbitrarily large and lands in the one-line setting log.
+const showValue = (v) => { let s; try { s = JSON.stringify(v) ?? String(v); } catch { s = String(v); } return s.length > 80 ? `${s.slice(0, 77)}...` : s; };
 
 /**
  * Keep only the declared leaves of one settings layer whose value is valid AS A WHOLE, and name the rest in `invalid`.
@@ -152,12 +153,13 @@ const showValue = (v) => { try { return JSON.stringify(v) ?? String(v); } catch 
 function validLeaves(layer, validators, { name, at, invalid }) {
   if (layer === undefined) return undefined;
   const label = (rest) => `${name ? `${name}.` : ''}${rest}`;
-  if (!isObj(layer)) { if (at) invalid.push(`${label(at)}=${showValue(layer)}`); return undefined; }
+  const note = (s) => { if (!invalid.includes(s)) invalid.push(s); }; // the bare catchUp label is shared by tool and platform
+  if (!isObj(layer)) { if (at) note(`${label(at)}=${showValue(layer)}`); return undefined; }
   const out = {};
   for (const [key, valid] of Object.entries(validators)) {
     if (layer[key] === undefined) continue;
     if (valid(layer[key])) out[key] = layer[key];
-    else invalid.push(`${label(`${at ? `${at}.` : ''}${key}`)}=${showValue(layer[key])}`);
+    else note(`${label(`${at ? `${at}.` : ''}${key}`)}=${showValue(layer[key])}`);
   }
   return out;
 }
@@ -185,9 +187,19 @@ export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform
   const raw = String(env?.[ENQUEUE_ON_EVENT_ENV] ?? '').trim().toLowerCase();
   const envEnabled = raw === 'on' || raw === '1' || raw === 'true' ? true : raw === 'off' || raw === '0' || raw === 'false' ? false : undefined;
   const layerInvalid = [];
+  // The platform layer is cleaned whether it was passed in or (the production path) read from the preferences file by the
+  // cascade: handing the cascade an explicit layer stops it re-reading the file uncleaned. A non-object layer is an empty one.
+  const platformLayer = (policy, passed, clean) => {
+    let raw = passed;
+    if (raw === undefined) { try { raw = platformPreference(policy, { env }); } catch { raw = undefined; } }
+    return raw === undefined ? undefined : (clean(raw) ?? {});
+  };
   const c = cascadePolicy(ENQUEUE_ON_EVENT_POLICY, cleanLayer(block, 'tool', layerInvalid), {
     env, standard: { ...ENQUEUE_ON_EVENT_DEFAULTS }, envValues: { enabled: envEnabled }, valid: VALID,
-    ...(platform !== undefined ? { platform: cleanLayer(platform, 'platform', layerInvalid) } : {}), log: () => {},
+    platform: platformLayer(ENQUEUE_ON_EVENT_POLICY, platform, (raw) => {
+      if (!isObj(raw)) layerInvalid.push(`platform=${showValue(raw)}`);
+      return cleanLayer(raw, 'platform', layerInvalid);
+    }), log: () => {},
   });
   const v = isObj(c.value) ? c.value : {};
   const out = {
@@ -215,17 +227,17 @@ export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform
   const missValid = { enabled: CATCH_UP_VALID['missBackoff.enabled'], ttlMinutes: CATCH_UP_VALID['missBackoff.ttlMinutes'] };
   const miss = cascadePolicy(`${ENQUEUE_ON_EVENT_POLICY}.catchUp.missBackoff`, validLeaves(block?.catchUp?.missBackoff, missValid, { name: 'tool', at: 'catchUp.missBackoff', invalid: out.invalid }), {
     env, standard: ENQUEUE_ON_EVENT_DEFAULTS.catchUp.missBackoff, valid: missValid,
-    ...(platform !== undefined ? { platform: validLeaves(platform?.catchUp?.missBackoff, missValid, { name: 'platform', at: 'catchUp.missBackoff', invalid: out.invalid }) } : {}), log: () => {},
+    platform: platformLayer(`${ENQUEUE_ON_EVENT_POLICY}.catchUp.missBackoff`, platform?.catchUp?.missBackoff, (raw) => validLeaves(raw, missValid, { name: 'platform', at: 'catchUp.missBackoff', invalid: out.invalid })), log: () => {},
   });
   out.catchUp.missBackoff = miss.value;
   for (const [key, source] of Object.entries(miss.sources)) out.sources[`catchUp.missBackoff.${key}`] = source;
   const pauseValid = {
-    paths: (x) => Array.isArray(x) && x.length > 0 && x.every((p) => typeof p === 'string' && p === p.trim() && p !== '' && p.split('/').every((seg, i, all) => seg !== '.' && seg !== '..' && (seg !== '' || i === all.length - 1)) && !p.startsWith('/')),
+    paths: (x) => Array.isArray(x) && x.length > 0 && x.every((p) => typeof p === 'string' && p === p.trim() && p !== '' && !/[\u0000-\u001f\u007f]/.test(p) && p.split('/').every((seg, i, all) => seg !== '.' && seg !== '..' && (seg !== '' || i === all.length - 1)) && !p.startsWith('/')),
     maxPauseMinutes: (x) => Number.isFinite(x) && x > 0 && x <= 1440,
   };
   const pause = cascadePolicy(`${ENQUEUE_ON_EVENT_POLICY}.catchUp.refreshPause`, validLeaves(block?.catchUp?.refreshPause, pauseValid, { name: 'tool', at: 'catchUp.refreshPause', invalid: out.invalid }), {
     env, standard: { paths: [...REFRESH_PAUSE_PATHS], maxPauseMinutes: ENQUEUE_ON_EVENT_DEFAULTS.catchUp.refreshPause.maxPauseMinutes }, valid: pauseValid,
-    ...(platform !== undefined ? { platform: validLeaves(platform?.catchUp?.refreshPause, pauseValid, { name: 'platform', at: 'catchUp.refreshPause', invalid: out.invalid }) } : {}), log: () => {},
+    platform: platformLayer(`${ENQUEUE_ON_EVENT_POLICY}.catchUp.refreshPause`, platform?.catchUp?.refreshPause, (raw) => validLeaves(raw, pauseValid, { name: 'platform', at: 'catchUp.refreshPause', invalid: out.invalid })), log: () => {},
   });
   out.catchUp.refreshPause = pause.value;
   for (const [key, source] of Object.entries(pause.sources)) out.sources[`catchUp.refreshPause.${key}`] = source;
