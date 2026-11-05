@@ -72,6 +72,30 @@ function removeStore(dir) {
 const consumerLockPath = (storeDir) => join(dirname(storeDir), `.${basename(storeDir)}.consumers.lock`);
 const CONSUMER_LOCK_OPTIONS = Object.freeze({ timeoutMs: 0 });
 
+/** One metadata-only pass over the entire owned tree, including nested dependencies and dotfiles.
+ * Count symlinks but never follow their targets. POSIX symlink modes are not access controls
+ * (normally 0777 and unaffected by chmod -R); only real files/directories have writable modes.
+ * Resolve the root because a completed snapshot may itself alias another dependency store.
+ * Observed 2026-11-05 on the macOS checkout's real node_modules via heavy-admission: 21,448
+ * entries, 591.8 ms for one pass. requireReadonly:false allowed measuring the writable install;
+ * production performs the same walk with mode rejection enabled. No package contents were read.
+ */
+export function nodeModulesTreeEvidence(modules, { lstat = lstatSync, readDir = readdirSync, requireReadonly = true } = {}) {
+  const pending = [realpathSync(modules)];
+  let entryCount = 0;
+  while (pending.length) {
+    const path = pending.pop();
+    const info = lstat(path);
+    entryCount += 1;
+    if (info.isSymbolicLink()) continue;
+    if (!Number.isSafeInteger(info.mode) || (requireReadonly && info.mode & 0o222)) throw new Error('writable or unreadable tree entry');
+    if (info.isDirectory()) {
+      for (const entry of readDir(path, { withFileTypes: true })) pending.push(join(path, entry.name));
+    }
+  }
+  return { entryCount };
+}
+
 /** Shallow npm package inventory: depth one, or depth two under @scope. No package-content walk.
  * Manifest stats and permissions must be readable; workspace links are checked via their targets.
  */
@@ -249,7 +273,12 @@ export function ensureNodeModulesStore({ jobsDir, sourceDir, install = npmCiInst
     try {
       const hash = createHash('sha256').update(readFileSync(join(into, 'node_modules', '.package-lock.json'))).digest('hex');
       writeFileSync(join(into, NODE_MODULES_HASH_FILE), `${hash}\n`);
-      writeFileSync(join(into, NODE_MODULES_MANIFEST_FILE), `${JSON.stringify(nodeModulesPackageManifest(join(into, 'node_modules'), { requireReadonly: false }))}\n`);
+      const modules = join(into, 'node_modules');
+      const manifest = {
+        ...nodeModulesPackageManifest(modules, { requireReadonly: false }),
+        ...nodeModulesTreeEvidence(modules, { requireReadonly: false }),
+      };
+      writeFileSync(join(into, NODE_MODULES_MANIFEST_FILE), `${JSON.stringify(manifest)}\n`);
       recorded = true;
     } catch { /* reuse fails closed to a private copy when no hash was recorded */ }
     // One-time recursive freeze covers package files as well as the hidden lock. Do not re-freeze

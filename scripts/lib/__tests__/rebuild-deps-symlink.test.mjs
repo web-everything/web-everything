@@ -12,10 +12,11 @@ import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import * as deps from '../daemon-rebuild/deps-job.mjs';
 import { cloneNodeModulesInstaller, REBUILD_JOB_KIND } from '../daemon-rebuild/rebuild-job.mjs';
-import { ensureNodeModulesStore, evictSnapshots, NODE_MODULES_MANIFEST_FILE, nodeModulesRef, setNodeModulesWritable } from '../daemon-job-snapshots.mjs';
+import { ensureNodeModulesStore, evictSnapshots, NODE_MODULES_MANIFEST_FILE, nodeModulesRef, nodeModulesTreeEvidence, setNodeModulesWritable } from '../daemon-job-snapshots.mjs';
 import { createJobStore, enqueueJob, launchJob, prepareJobCode } from '../daemon-jobs-runtime.mjs';
 import { markClaimed, markLaunching } from '../daemon-jobs.mjs';
 import { withFileLock } from '../atomic-json-file.mjs';
+import { LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH, operatorPreferencesPath } from '../policy-cascade.mjs';
 
 const temporary = [];
 afterEach(() => {
@@ -45,6 +46,11 @@ function fixture() {
     writeFileSync(join(into, 'node_modules', 'pkg', 'index.js'), 'export default 1;');
     mkdirSync(join(into, 'node_modules', '@scope', 'other'), { recursive: true });
     writeFileSync(join(into, 'node_modules', '@scope', 'other', 'package.json'), '{"name":"@scope/other","version":"2.0.0"}');
+    mkdirSync(join(into, 'node_modules', 'pkg', 'node_modules', 'inner', 'lib'), { recursive: true });
+    writeFileSync(join(into, 'node_modules', 'pkg', 'node_modules', 'inner', 'package.json'), '{"name":"inner","version":"1.0.0"}');
+    writeFileSync(join(into, 'node_modules', 'pkg', 'node_modules', 'inner', 'lib', 'nested.js'), 'export default 2;');
+    mkdirSync(join(into, 'node_modules', '.bin'));
+    symlinkSync('../pkg/index.js', join(into, 'node_modules', '.bin', 'pkg'));
   });
   const store = ensureNodeModulesStore({ jobsDir: join(base, 'jobs'), sourceDir, install });
   const log = vi.fn();
@@ -588,5 +594,148 @@ describe('read-only dependency stores and rebuild consumer retention', () => {
     expect(evict).toHaveBeenCalledTimes(1);
     expect(evict.mock.results[0].type).toBe('return');
     expectLinked(f);
+  });
+});
+
+describe('whole-tree read-only reuse evidence', () => {
+  it('a writable nested package file falls back to copy and logs', () => {
+    const f = fixture();
+    chmodSync(join(f.storeDir, 'node_modules', 'pkg', 'node_modules', 'inner', 'lib', 'nested.js'), 0o644);
+    deps.linkOrCopyNodeModules(f);
+    expectCopied(f, /tree.*writable/i);
+  });
+
+  it('an added read-only nested file changes the recorded count and falls back to copy', () => {
+    const f = fixture();
+    const dir = join(f.storeDir, 'node_modules', 'pkg', 'node_modules', 'inner', 'lib');
+    chmodSync(dir, 0o755);
+    writeFileSync(join(dir, 'extra.js'), 'extra');
+    chmodSync(join(dir, 'extra.js'), 0o444);
+    chmodSync(dir, 0o555);
+    deps.linkOrCopyNodeModules(f);
+    expectCopied(f, /tree entry count mismatch/i);
+  });
+
+  it('a writable nested dependency directory falls back to copy and logs', () => {
+    const f = fixture();
+    chmodSync(join(f.storeDir, 'node_modules', 'pkg', 'node_modules', 'inner'), 0o755);
+    deps.linkOrCopyNodeModules(f);
+    expectCopied(f, /tree.*writable/i);
+  });
+
+  it('an unreadable nested lstat fails closed to copy with a reason', () => {
+    const f = fixture();
+    const lstat = vi.fn((path) => {
+      if (String(path).endsWith('nested.js')) throw Object.assign(new Error('entry denied'), { code: 'EACCES' });
+      return lstatSync(path);
+    });
+    deps.linkOrCopyNodeModules({ ...f, lstat });
+    expect(lstat).toHaveBeenCalled();
+    expectCopied(f, /tree.*unreadable/i);
+  });
+
+  it('unreadable nested directory contents fail closed to copy with a reason', () => {
+    const f = fixture();
+    const readDir = vi.fn((path, options) => {
+      if (String(path).endsWith('lib')) throw Object.assign(new Error('directory denied'), { code: 'EACCES' });
+      return readdirSync(path, options);
+    });
+    deps.linkOrCopyNodeModules({ ...f, readDir });
+    expect(readDir).toHaveBeenCalled();
+    expectCopied(f, /tree.*unreadable/i);
+  });
+
+  it('missing recorded tree count in an older manifest fails closed to copy', () => {
+    const f = fixture();
+    const path = join(f.storeDir, NODE_MODULES_MANIFEST_FILE);
+    const manifest = JSON.parse(readFileSync(path, 'utf8'));
+    delete manifest.entryCount;
+    writeFileSync(path, JSON.stringify(manifest));
+    deps.linkOrCopyNodeModules(f);
+    expectCopied(f, /tree entry count evidence missing/i);
+  });
+
+  it('one lstat per entry matches the completion count and never follows symlink targets', () => {
+    const f = fixture();
+    const manifest = JSON.parse(readFileSync(join(f.storeDir, NODE_MODULES_MANIFEST_FILE), 'utf8'));
+    const lstat = vi.fn(lstatSync);
+    const evidence = nodeModulesTreeEvidence(join(f.storeDir, 'node_modules'), { lstat });
+    expect(evidence.entryCount).toBe(manifest.entryCount);
+    expect(lstat).toHaveBeenCalledTimes(evidence.entryCount);
+    const paths = lstat.mock.calls.map(([path]) => path);
+    expect(new Set(paths).size).toBe(evidence.entryCount);
+    expect(paths).toContain(join(realpathSync(join(f.storeDir, 'node_modules')), '.bin', 'pkg'));
+    expect(paths.some((path) => path.includes('/.bin/pkg/'))).toBe(false);
+    deps.linkOrCopyNodeModules(f);
+    expectLinked(f);
+  });
+});
+
+describe('raw dependency settings and every platform file fail closed', () => {
+  const invalidValues = [{}, { nested: 'symlink' }, [], null, true, 0, 'unknown'];
+  for (const layer of ['file', 'platform', 'env']) {
+    it.each(invalidValues.map((value) => [value]))(`invalid raw ${layer} depsMode %j cannot disappear or be hidden by a valid override`, (value) => {
+      const log = vi.fn();
+      const env = { WE_PLATFORM_PREFERENCES_FILE: 'fixture-platform.json', WE_DAEMON_REBUILD_DEPS_MODE: layer === 'env' ? value : 'symlink' };
+      const settings = layer === 'file' ? { rebuild: { depsMode: value } } : {};
+      const readFile = vi.fn(() => JSON.stringify(layer === 'platform' ? { rebuild: { depsMode: value } } : {}));
+      expect(deps.resolveRebuildDepsMode({ env, settings, log, readFile })).toEqual({ mode: 'copy', source: 'invalid' });
+      expect(readFile).toHaveBeenCalledTimes(1);
+      expect(messages(log)).toMatch(/copy.*invalid/i);
+    });
+  }
+
+  it('an explicitly present undefined environment mode is invalid rather than absent', () => {
+    const log = vi.fn();
+    expect(deps.resolveRebuildDepsMode({
+      env: { WE_PLATFORM_PREFERENCES_FILE: 'fixture-platform.json', WE_DAEMON_REBUILD_DEPS_MODE: undefined },
+      settings: {}, readFile: () => '{}', log,
+    })).toEqual({ mode: 'copy', source: 'invalid' });
+    expect(messages(log)).toMatch(/copy.*invalid/i);
+  });
+
+  const platformPaths = [...LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH, operatorPreferencesPath({})];
+  for (const [index, path] of platformPaths.entries()) {
+    it.each(['read denied', 'invalid JSON'])(`platform file ${index + 1}: %s forces copy even with a valid environment override`, (failure) => {
+      const log = vi.fn();
+      const readFile = vi.fn((requested) => {
+        if (requested !== path) return '{}';
+        if (failure === 'invalid JSON') return '{';
+        throw Object.assign(new Error('policy denied'), { code: 'EACCES' });
+      });
+      expect(deps.resolveRebuildDepsMode({ env: { WE_DAEMON_REBUILD_DEPS_MODE: 'symlink' }, settings: {}, log, readFile }))
+        .toEqual({ mode: 'copy', source: 'invalid' });
+      expect(readFile).toHaveBeenCalledTimes(platformPaths.length);
+      for (const expected of platformPaths) expect(readFile).toHaveBeenCalledWith(expected, 'utf8');
+      expect(messages(log)).toMatch(/copy.*invalid.*unreadable/i);
+    });
+  }
+
+  it('an unreadable explicit platform override forces copy and bypasses all default platform paths', () => {
+    const readFile = vi.fn(() => { throw Object.assign(new Error('override denied'), { code: 'EACCES' }); });
+    const log = vi.fn();
+    expect(deps.resolveRebuildDepsMode({ env: { WE_PLATFORM_PREFERENCES_FILE: 'override.json' }, settings: {}, log, readFile }))
+      .toEqual({ mode: 'copy', source: 'invalid' });
+    expect(readFile).toHaveBeenCalledTimes(1);
+    expect(readFile).toHaveBeenCalledWith('override.json', 'utf8');
+    expect(messages(log)).toMatch(/unreadable/i);
+  });
+
+  it('ENOENT platform files are absent preferences and preserve the symlink default', () => {
+    const log = vi.fn();
+    const readFile = vi.fn(() => { throw Object.assign(new Error('not found'), { code: 'ENOENT' }); });
+    expect(deps.resolveRebuildDepsMode({ env: {}, settings: {}, log, readFile })).toEqual({ mode: 'symlink', source: 'built-in' });
+    expect(readFile).toHaveBeenCalledTimes(platformPaths.length);
+  });
+
+  it('an unreadable rebuild settings file forces copy even with valid platform and environment modes', () => {
+    const log = vi.fn();
+    const readFile = vi.fn((path) => {
+      if (String(path).endsWith('daemon-rebuild-settings.json')) throw Object.assign(new Error('settings denied'), { code: 'EACCES' });
+      return '{"rebuild":{"depsMode":"symlink"}}';
+    });
+    expect(deps.resolveRebuildDepsMode({ env: { WE_DAEMON_REBUILD_DEPS_MODE: 'symlink' }, log, readFile }))
+      .toEqual({ mode: 'copy', source: 'invalid' });
+    expect(messages(log)).toMatch(/unreadable/i);
   });
 });
