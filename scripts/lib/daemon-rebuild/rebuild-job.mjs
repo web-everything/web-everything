@@ -43,6 +43,7 @@ import { lockIdFor } from '../../readiness/file-locks.mjs';
 import { alertsFilePath } from './state.mjs';
 import { readGit } from '../proc-read.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
+import { linkOrCopyNodeModules } from './deps-job.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const SETTINGS_PATH = resolve(SELF, '..', '..', 'daemon-rebuild-settings.json');
@@ -102,16 +103,14 @@ export function rebuildJobsDir(root, env = process.env) {
   return daemonJobsDir(`rebuild-${cloneKey(root)}`, env);
 }
 
-/** Snapshot `node_modules` installer: an APFS clone of the clone's own tree when the lockfile matches, else npm ci. */
-export function cloneNodeModulesInstaller(sourceRoot, { exec = execFileSync, fallback = npmCiInstaller() } = {}) {
+/** Snapshot installer: guarded store link (or private copy) when lockfiles match, else npm ci. */
+export function cloneNodeModulesInstaller(sourceRoot, { exec = execFileSync, fallback = npmCiInstaller(), ...options } = {}) {
   return (into) => {
     const src = join(sourceRoot, 'node_modules');
     let same = false;
     try { same = readFileSync(join(sourceRoot, 'package-lock.json'), 'utf8') === readFileSync(join(into, 'package-lock.json'), 'utf8'); } catch { same = false; }
     if (same && existsSync(src)) {
-      try { exec('cp', ['-cR', src, join(into, 'node_modules')], { stdio: 'ignore', timeout: 5 * 60_000 }); return; } catch { /* no clonefile */ }
-      rmSync(join(into, 'node_modules'), { recursive: true, force: true });
-      exec('cp', ['-R', src, join(into, 'node_modules')], { stdio: 'ignore', timeout: 10 * 60_000 });
+      linkOrCopyNodeModules({ ...options, root: into, storeDir: sourceRoot, exec });
       return;
     }
     fallback(into);
@@ -160,7 +159,7 @@ export async function rebuildCloneAsJob({
   mkdirSync(store.dir, { recursive: true });
   const kind = REBUILD_JOB_KIND.kind;
   const mine = () => store.list().records.filter((r) => r.job.kind === kind);
-  const snap = snapshot ?? { repoDir: root, install: cloneNodeModulesInstaller(root) };
+  const snap = snapshot ?? { repoDir: root, install: cloneNodeModulesInstaller(root, { env, log: say, step: 'rebuild' }) };
   const tickClock = clock ?? clockFor(store.dir);
 
   // 1. Consume finished jobs once (oldest first) and say what each did — the job's outcome reaches the daemon log.

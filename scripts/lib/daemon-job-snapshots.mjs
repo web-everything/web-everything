@@ -25,6 +25,8 @@ import { DEFAULT_CHILD_TIMEOUT_MS, NPM_INSTALL_TIMEOUT_MS } from './bounded-chil
 import { DEFAULT_SNAPSHOT_KEEP, selectEvictions } from './daemon-jobs.mjs';
 
 const COMPLETE_MARKER = '.snapshot-complete';
+/** Recorded before completion, never regenerated on reuse (including legacy stores). */
+export const NODE_MODULES_HASH_FILE = '.node-modules-lock.sha256';
 const KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 /** `<jobsDir>/.snapshots` — dot-named so the run store's `*.json` listing never sees it. */
@@ -110,6 +112,13 @@ export function ensureNodeModulesStore({ jobsDir, sourceDir, install = npmCiInst
     copyFileSync(join(sourceDir, 'package.json'), join(into, 'package.json'));
     copyFileSync(join(sourceDir, 'package-lock.json'), join(into, 'package-lock.json'));
     install(into);
+    // Cheap mutation evidence from npm's hidden lock, not a recursive package-content audit.
+    // Missing/unreadable evidence leaves this store copy-only for rebuilds.
+    // Some injected installers and npm configurations produce no hidden lock: do not invent evidence.
+    try {
+      const hash = createHash('sha256').update(readFileSync(join(into, 'node_modules', '.package-lock.json'))).digest('hex');
+      writeFileSync(join(into, NODE_MODULES_HASH_FILE), `${hash}\n`);
+    } catch { /* reuse fails closed to a private copy when no hash was recorded */ }
   });
   return { key, dir };
 }
