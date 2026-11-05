@@ -418,16 +418,21 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       const finishedNotOwed = [evidence?.status, status].every(candidate => candidate?.status === 'finished'
         && normalizeRedTeamResult(candidate.result).priorResult === 'not-owed'
         && !candidate.result?.deferredByGuard && !candidate.result?.deferredByCap);
-      const recordedNotOwed = (verdict === VERDICTS.ACCEPT && !owed)
-        || finishedNotOwed;
-      const notOwed = () => {
+      const recordedNotOwed = verdict === VERDICTS.ACCEPT && !owed;
+      const keepsPending = Array.isArray(rawPr.labels) && rawPr.labels.some(label =>
+        (typeof label === 'string' ? label : label?.name) === 'red-team:pending');
+      const acceptedReview = verdict === VERDICTS.ACCEPT && accepted && acceptance?.sha === head
+        && !acceptance.laterVerdict && !acceptance.laterBodyDerivedHold;
+      const provenanceEscalation = keepsPending && !acceptedReview ? { escalate: true,
+        escalationContext: 'red-team:pending kept: not-owed review lacks acceptance provenance; needs a human look' } : {};
+      const notOwed = (why = 'stored review does not owe a red team') => {
         // Review labels independently block merge; thread/formal holds still forbid settlement.
         const acceptance = latestAcceptRecord(rawPr.comments, reviews);
         const hold = reviews === null || laterReviewHold(reviews)
           || (acceptance ? acceptance.laterVerdict || acceptance.laterBodyDerivedHold
             : rawPr.comments.some(comment => isLaterVerdictBody(comment?.body)));
-        return { ...skip('stored review does not owe a red team'),
-        ...(!hold && recordedNotOwed && evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
+        return { ...skip(why), ...provenanceEscalation,
+        ...(!hold && acceptedReview && recordedNotOwed && evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
           && evidence.inFlight === false && !evidence.queued
           && evidence.recorded === false && evidence.seatRecorded === false ? { settle: 'not-owed' } : {}) };
       };
@@ -473,7 +478,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           if (acceptance?.sha !== head) return notOwed();
           const context = { labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews, settlesPending: true };
           const refusal = publishableClearGuard(context);
-          if (refusal) return guardedSkip(refusal);
+          if (refusal) return { ...guardedSkip(refusal), ...provenanceEscalation };
+          if (keepsPending && !acceptedReview) return notOwed();
           return { ...row, action: 'clear', why: 'not owed (stored review)' };
         }
         if (!owed || finishedNotOwed) return notOwed();
