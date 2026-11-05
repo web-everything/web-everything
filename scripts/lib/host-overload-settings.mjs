@@ -19,9 +19,14 @@ export function boundedText(path, maxBytes = 256 * 1024) {
 }
 export const DEFAULT_HOST_MAX_WAIT_MS = 15 * 60 * 1000;
 export const DEFAULT_MIN_MEMORY_HEADROOM_MB = 2048;
+export const DEFAULT_SNAPSHOT_MAX_FRESH_MS = 20000;
+export const DEFAULT_SNAPSHOT_CLOCK_SKEW_MS = 2000;
 const pct = (v) => Number.isFinite(v) && v >= 0 && v <= 100;
 const leaves = {
   'host.capacitySignal': ['load', 'WE_HOST_CAPACITY_SIGNAL', (v) => ['load', 'cpu-mem'].includes(v)],
+  // R559: bound freshness independently of elapsed sampling time (2 × nominal 10s cadence).
+  'host.capacity.snapshotClockSkewMs': [DEFAULT_SNAPSHOT_CLOCK_SKEW_MS, 'WE_HOST_CAPACITY_SNAPSHOT_CLOCK_SKEW_MS', (v) => Number.isFinite(v) && v >= 0],
+  'host.capacity.snapshotMaxFreshMs': [DEFAULT_SNAPSHOT_MAX_FRESH_MS, 'WE_HOST_CAPACITY_SNAPSHOT_MAX_FRESH_MS', (v) => Number.isFinite(v) && v > 0],
   // R528: which memory-free measurement the capacity gates use. available = free+inactive+purgeable+speculative; free = os.freemem.
   'host.capacity.memoryMetric': ['available', 'WE_HOST_CAPACITY_MEMORY_METRIC', (v) => ['available', 'free'].includes(v)],
   // R553: hard floor. No new fixer is admitted while available memory (under memoryMetric) is below this many MB.
