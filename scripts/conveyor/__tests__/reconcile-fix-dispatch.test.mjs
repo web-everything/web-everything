@@ -2168,10 +2168,10 @@ it('fills a planned fix brief from a combined item scope entry without throwing'
   expect(spawnAgent.mock.calls[0][0].at(-1)).toContain('--scope=we:a,we:b ');
 });
 
-it('splits the card-at-ref scope before returning it', () => {
+it('returns the card-at-ref scope entries unsplit, so the resolver can judge each authored entry whole', () => {
   const exec = vi.fn(() => Buffer.from('---\nscope: ["we:a b", "we:a"]\n---\n').toString('base64'));
   expect(fetchCardScopeAtRef('backlog/7594-fixture.md', 'sha', { exec, root: '/repo' }))
-    .toEqual(['we:a', 'we:b']);
+    .toEqual(['we:a b', 'we:a']);
 });
 
 // Red-team break on #6424: splitting an unmerged card's combined entry must not let a safe piece survive
@@ -2205,6 +2205,22 @@ describe('card-at-ref scope: one unsafe piece rejects its whole authored entry',
     const unit = resolveWith(yamlList);
     expect(unit.scopeSource).toBe('diff');
     expect(unit.scope).toEqual(['we:backlog/7594-fixture.md', 'we:a.mjs', 'we:b.mjs', 'we:c.mjs']);
+  });
+
+  it.each([
+    ['a piece outside the diff', '["we:a.mjs we:zz.mjs"]'],
+    // the split inherits only the repo prefix, not a folder: `b.mjs` reads as `we:b.mjs`, not `we:x/b.mjs`
+    ['a bare piece that loses its sibling folder', '["we:c.mjs x/b.mjs"]'],
+  ])('%s drops the whole entry (containment is all-or-nothing too)', (_label, yamlList) => {
+    const unit = resolveWith(yamlList);
+    expect(unit.scopeSource).toBe('diff');
+    expect(unit.scope).toEqual(['we:backlog/7594-fixture.md', 'we:a.mjs', 'we:b.mjs', 'we:c.mjs']);
+  });
+
+  it('a bad entry is dropped alone; a separate clean entry still forms the card scope', () => {
+    const unit = resolveWith('["we:a.mjs,we:b.mjs we:c.mjs", "we:b.mjs c.mjs"]');
+    expect(unit.scopeSource).toBe('card');
+    expect(unit.scope).toEqual(['we:b.mjs', 'we:c.mjs']);
   });
 
   it('a clean combined entry still splits into card scope', () => {

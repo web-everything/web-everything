@@ -80,7 +80,7 @@ import { fixerRulingBrief, renderRulingNotAddressed } from '../lib/ruling-ledger
 import { withSalvageHint } from '../lib/salvage-index.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS, ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { repoProfile, briefTokensForRepo } from '../lib/repo-profile.mjs';
-import { resolvePrWorkUnit, isSafeFallbackScopeEntry, splitScopeEntries } from './pr-work-unit.mjs';
+import { resolvePrWorkUnit, isSafeFallbackScopeEntry } from './pr-work-unit.mjs';
 import { resolveFixScopePolicy, resolveOperatorPriorityPrs, createRegionReader, createLiveRegionOverlap, createHolderStateReader, landingHolderDecision } from './fix-scope-policy.mjs';
 import { DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES } from './fix-claim-store.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -709,14 +709,9 @@ export function fetchCardScopeAtRef(path, ref, { exec = execFileSyncThrottled, r
     });
     const decoded = Buffer.from(String(out || '').trim(), 'base64').toString('utf8');
     const { data } = matter(decoded);
-    if (!Array.isArray(data?.scope)) return [];
-    // Split each authored entry on its own; if ANY piece is unsafe, keep the raw entry whole so the resolver's
-    // safety filter rejects it as one unit (as before splitting) — a safe sibling never survives alone (#6424).
-    const entries = data.scope.flatMap((entry) => {
-      const pieces = splitScopeEntries([entry]);
-      return pieces.every(isSafeFallbackScopeEntry) ? pieces : [String(entry ?? '').trim()];
-    });
-    return [...new Set(entries)];
+    // Raw authored entries, unsplit: resolvePrWorkUnit splits each one and keeps it only when EVERY piece is
+    // safe and in the PR's diff, so one bad piece never leaves a sibling alone in the fence (#6424).
+    return Array.isArray(data?.scope) ? data.scope.map(String) : [];
   } catch {
     return [];
   }

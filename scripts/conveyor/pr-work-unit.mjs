@@ -181,7 +181,12 @@ export function resolvePrWorkUnit({ repo, pr, findItem, fetchDiffPaths, fetchCar
       //      safe for the live case this feature exists for (PR #2553): every one of its card's 7 declared
       //      scope entries is also in that PR's own diff.
       const diffScopeSet = new Set(diffScope);
-      const safeCardScope = cardScope.filter(isSafeFallbackScopeEntry).filter((entry) => diffScopeSet.has(entry));
+      // An authored entry may join several paths with whitespace (#6424): split it, and keep it only when EVERY
+      // piece passes both guards — one bad piece rejects the whole entry, never leaving a sibling alone.
+      const safeCardScope = [...new Set(cardScope.flatMap((entry) => {
+        const pieces = splitScopeEntries([entry]);
+        return pieces.length && pieces.every((p) => isSafeFallbackScopeEntry(p) && diffScopeSet.has(p)) ? pieces : [];
+      }))];
       if (safeCardScope.length) {
         return { attribution: 'item', itemNum, scope: safeCardScope, gate, scopeSource: 'card' };
       }
