@@ -41,6 +41,9 @@ import { resolveDispatchRoute } from '../../lib/dispatch-routing-policy-io.mjs';
 import { AGY_CLAUDE_MODEL_BY_TIER, PROBATION_ROSTER, PROBATION_WORKERS } from '../../lib/provider-routing.mjs';
 import { parseArgs as parseProbationBuildArgs } from '../probation-build-run.mjs';
 import { probationLaunchDecision, probationWorkerDetachedProvider, PROBATION_LAUNCHABLE_KINDS, PROBATION_RECORD_ONLY_TASK_TYPES } from '../dispatch-providers/probation-worker.mjs';
+
+// These tests describe codex-first routing; the shipped routing.builder=claude is covered in routing-settings.test.mjs.
+process.env.WE_ROUTING_BUILDER = 'codex';
 const decideDispatchRoute = (dispatch, options) => currentRoute(dispatch, { routingPolicy: inheritedRoutingPolicy, ...options });
 
 describe('probation roster models reach the build runner parser', () => {

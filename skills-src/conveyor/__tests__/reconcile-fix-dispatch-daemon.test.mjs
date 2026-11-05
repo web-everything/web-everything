@@ -1748,7 +1748,7 @@ describe('xn025gx glue — buildAwaitVerifyStep, buildFixThrottle, buildDaemonEx
     // R559: admission refuses on an unreadable/stale memory reading, so inject a healthy host (never the machine's real one).
     const hostNow = Date.parse('2026-11-04T12:00:00Z');
     const healthy = { nowMs: () => hostNow, resolveFloor: () => ({ metric: 'available', floorMb: 2048, source: 'test' }),
-      readSnap: () => ({ sampledAt: new Date(hostNow - 5000).toISOString(), freshUntil: new Date(hostNow + 20000).toISOString(),
+      readSnap: () => ({ sampledAt: new Date(hostNow - 5000).toISOString(), freshUntil: new Date(hostNow + 15000).toISOString(),
         cpu: { idlePct: 40, loadAvg: [1] }, memory: { pressureLevel: 1, metric: 'available', availableMb: 8192 } }) };
     const base = { ...healthy, sendBackReservedSlots: 0, env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '1' }, sample: () => null, loadavg: () => 0, cpuCount: () => 8, alive: () => true };
     const full = buildFixThrottle({ ...base, slotClaims: () => [fix] }).tryAdmit('fix');
@@ -1769,7 +1769,7 @@ describe('xn025gx glue — buildAwaitVerifyStep, buildFixThrottle, buildDaemonEx
     const claims = Array.from({ length: 2 }, (_, i) => ({ meta: { kind: 'fix', repo: 'we', pr: i + 1 } }));
     const fixCap = { floor: 2, ceiling: 4, ceilingAboveFloor: 2, raiseQueueOver: 5, raiseMinCpuIdlePct: 30, raiseStepPerPass: 2 };
     const now = Date.parse('2026-10-10T15:00:00Z');
-    const readSnap = () => ({ sampledAt: new Date(now - 5000).toISOString(), freshUntil: new Date(now + 20000).toISOString(),
+    const readSnap = () => ({ sampledAt: new Date(now - 5000).toISOString(), freshUntil: new Date(now + 15000).toISOString(),
       cpu: { idlePct: 45, loadAvg: [40] }, memory: { pressureLevel: 1, metric: 'available', availableMb: 8192, freePct: 60, swapUsedPct: 10 }, disk: { busyPct: 100 } });
     const t = buildFixThrottle({ slotClaims: () => claims, alive: () => true, queueLength: () => 7, readSnap, nowMs: () => now,
       resolveFloor: () => ({ metric: 'available', floorMb: 2048, source: 'test' }), readHeavyWait: () => 0,
@@ -1929,14 +1929,15 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     expect(cache.reconcile({ repo: 'repo-a', allowStandDownAutoProceed: true }).dispatch).toEqual([]);
   });
 
-  it('planner bypasses poisoned discovery and shared snapshots, reading directly after the baseline', () => {
+  it('planner bypasses poisoned discovery and shared snapshots, reading FRESH small pages after the baseline (never the heavy pr list)', () => {
     const order = [];
     const discovery = vi.fn(() => [{ number: 7, comments: ['stale'] }]);
     const shared = vi.spyOn(prSnapshot, 'readSharedOpenPrs').mockImplementation(() => {
       throw new Error('poisoned shared snapshot must never be consulted');
     });
     const exec = vi.spyOn(ghThrottle, 'execFileSyncThrottled').mockImplementation(() => {
-      order.push('direct-read'); return '[]';
+      order.push('direct-read');
+      return JSON.stringify({ data: { repository: { pullRequests: { nodes: [], totalCount: 0, pageInfo: { hasNextPage: false, endCursor: null } } } } });
     });
     const reader = vi.spyOn(reconcilePass, 'defaultReadPrs');
     const cache = createReconcilePlanCache({
@@ -1952,10 +1953,12 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     expect(order).toEqual(['baseline', 'claims', 'planner', 'direct-read']);
     expect(discovery).not.toHaveBeenCalled();
     expect(shared).not.toHaveBeenCalled();
-    expect(reader.mock.calls[0][0].exec).not.toBe(execFileSyncThrottled);
+    expect(reader.mock.calls[0][0].fresh).toBe(true);
+    expect(reader.mock.calls[0][0].exec).toBeUndefined(); // the REAL throttled exec: a wrapper knocked the read off the production path
     expect(reader.mock.calls[0][0].attributionRepo).toBe('web-everything/web-everything');
     expect(exec.mock.calls[0][0]).toBe('gh');
-    expect(exec.mock.calls[0][1]).toEqual(expect.arrayContaining(['pr', 'list', '--repo', 'web-everything/web-everything']));
+    expect(exec.mock.calls[0][1].slice(0, 3)).toEqual(['api', 'graphql', '-f']); // a small GraphQL page
+    expect(exec.mock.calls.some(c => c[1][0] === 'pr' && c[1][1] === 'list')).toBe(false); // never the heavy 200-row list
   });
 
   it.each(['plan', 'captured PRs'])('clone failure in %s recomputes in full without exposing a partial cache entry', target => {

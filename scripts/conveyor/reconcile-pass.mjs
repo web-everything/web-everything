@@ -323,6 +323,24 @@ export function enrichPrsWithReviewEvidence(prs, { repo, readCommits = fetchPrCo
  *  bypass the shared paged snapshot and run a heavy 200-row `gh pr list` (HTTP 504 all day, 2026-11-03). */
 export const SNAPSHOT_LIST_FIELDS = PR_LIST_JSON_FIELDS.split(',').filter(f => f !== 'author').join(',');
 const pagedHeavyCache = new Map();
+/** A `fresh` read may reuse a cached heavy read (comments/body/files) only if it was taken AFTER its PR's `updatedAt`
+ *  second had ended: updatedAt has 1 s granularity, so a comment posted in the same second as a cached read would leave
+ *  updatedAt unchanged and stay invisible (a stand-down missed after the planner's baseline probe).
+ *  The proof uses SERVER timestamps only (never the local clock, which may be skewed against GitHub's): each newly
+ *  fetched entry is stamped `serverSeenMs` = the newest `updatedAt` in the same listing that preceded its heavy read.
+ *  Server time was therefore at least that value when the heavy read ran, so the entry is settled iff
+ *  `serverSeenMs - updatedAt >= FRESH_SETTLE_MS`. No stamp (a legacy or injected entry) fails closed: re-fetched. */
+export const FRESH_SETTLE_MS = 2000;
+export function stampServerSeen(prior, next, rows) {
+  const seen = Math.max(...(rows || []).map(r => Date.parse(r?.updatedAt)).filter(Number.isFinite));
+  if (!Number.isFinite(seen)) return next;
+  return Object.fromEntries(Object.entries(next || {}).map(([n, e]) =>
+    [n, e && e !== prior?.[n] && !Number.isFinite(e.serverSeenMs) ? { ...e, serverSeenMs: seen } : e]));
+}
+export function settledHeavyCache(cache) {
+  return Object.fromEntries(Object.entries(cache || {}).filter(([, e]) => Number.isFinite(e?.serverSeenMs)
+    && Number.isFinite(Date.parse(e?.updatedAt)) && e.serverSeenMs - Date.parse(e.updatedAt) >= FRESH_SETTLE_MS));
+}
 const authorByPr = new Map();
 
 /** An immutable per-PR fact (author), read through the ETag-cached REST reader and remembered in-process.
@@ -395,7 +413,10 @@ export function withRestAuthors(rows, { repo, readRest = ghRestGetJson, budget =
 }
 
 export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, readCommits = fetchPrCommits, attributionRepo = repo, readComments, factCache = null,
-  readShared = readSharedOpenPrs, listPaged = listOpenPrsPagedHydrated, readRest = ghRestGetJson, retryOpts = {} } = {}) {
+  readShared = readSharedOpenPrs, listPaged = listOpenPrsPagedHydrated, readRest = ghRestGetJson, retryOpts = {},
+  // `fresh`: skip the host-shared snapshot (valid ~75 s, may predate the caller's own baseline probe) but still read small
+  // pages — never the heavy 200-row `gh pr list`. The fix daemon plans from such a read.
+  fresh = false } = {}) {
   const enrichFresh = (rows, extra = {}) => enrichPrsWithCompleteComments(enrichPrsWithReviewEvidence(rows, { repo: attributionRepo, readCommits: (slug, number, opts) => readCommits(slug, number, { ...opts, ...(exec !== execFileSyncThrottled ? { exec: args => exec('gh', args) } : {}) }) }), { repo: attributionRepo ?? repo, ...(readComments ? { readComments } : {}), ...extra });
   const enrich = rows => {
     if (factCache?.mode !== 'shadow') return enrichFresh(rows);
@@ -453,10 +474,10 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
     return parsed;
   };
   if (exec === execFileSyncThrottled && repo) {
-    const usePaged = prSnapshotEnabled(process.env) || listPaged !== listOpenPrsPagedHydrated;
+    const usePaged = fresh || prSnapshotEnabled(process.env) || listPaged !== listOpenPrsPagedHydrated;
     let listed;
     try { listed = withListRetry(() => {
-      const shared = readShared({ repo, fields: SNAPSHOT_LIST_FIELDS, allowDeferred: true });
+      const shared = fresh ? null : readShared({ repo, fields: SNAPSHOT_LIST_FIELDS, allowDeferred: true });
       if (shared) {
         // A declared smoke sample (WE_PR_SNAPSHOT_SAMPLE or a rebuild-smoke child) is accepted; a sample flag in a live read is not.
         if (shared.sampled === true && !sampleContextDeclared(process.env)) throw Object.assign(new Error(`open-PR snapshot for ${repo} is a sample but no sample is declared — refusing a partial inventory`), { code: 'pr-list-truncated' });
@@ -465,8 +486,8 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
       }
       if (!usePaged) return direct(); // snapshot explicitly disabled (opt-out / hermetic tests): the legacy direct read, no author fill
       const paged = listPaged({ repo, exec, paging: resolvePrListPaging(), heavyFields: ['comments', 'body', 'files'],
-        cache: pagedHeavyCache.get(repo) || {}, maxRows: PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (reconcile page)' } } });
-      pagedHeavyCache.set(repo, paged.cache);
+        cache: fresh ? settledHeavyCache(pagedHeavyCache.get(repo)) : (pagedHeavyCache.get(repo) || {}), maxRows: PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (reconcile page)' } } });
+      pagedHeavyCache.set(repo, stampServerSeen(pagedHeavyCache.get(repo), paged.cache, paged.rows));
       // A capped inventory is incomplete discovery: fail loudly rather than plan as if the omitted PRs did not exist.
       if (paged.truncated) throw Object.assign(new Error(`open-PR list for ${repo} truncated at ${PR_LIST_LIMIT} rows (${paged.totalCount} open) — refusing a partial inventory`), { code: 'pr-list-truncated' });
       // The page reader trusts GitHub's own totalCount only loosely: fewer rows than it reported is a partial inventory.
