@@ -1,4 +1,8 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { runGhSync } from '../gh-throttle.mjs';
 import { planStampRestore, readAuthorStampEdits, restoreAuthorStamp, sweepAuthorStamps } from '../author-stamp-restore.mjs';
 import { buildAuthorActorMarker, buildStampLostMarker, hasStampLostMarker, readAuthorActorStamps } from '../review-independence.mjs';
 
@@ -629,5 +633,100 @@ describe('restoreAuthorStamp — the historical marker is written verbatim', () 
     expect(options.env.PR_BODY_STAMP_OK).toBe('1');
     expect(options.maxBuffer).toBe(8 * 1024 * 1024);
     expect(options.env).not.toBe(process.env); // a copy: the bypass never leaks into this process
+  });
+});
+
+// Red-team break on 610291eb8: with the smoke read memo on, the pre-write PR read was served from the
+// memo, so an operator edit made during the history read was overwritten. Every restoration read is live.
+describe('restoration evidence bypasses the gh read memo', () => {
+  const made = [];
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    for (const dir of made.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  // The real gh-throttle memo in front of a fake gh: each `pr view` returns the next queued body.
+  function realThrottle(bodies, { listing = [] } = {}) {
+    const dir = mkdtempSync(join(tmpdir(), 'stamp-restore-memo-'));
+    made.push(dir);
+    const memo = join(dir, 'memo');
+    mkdirSync(memo);
+    vi.stubEnv('WE_GH_READ_MEMO_DIR', memo);
+    vi.stubEnv('WE_GH_PERSONAL_READS', '0');
+    const state = join(dir, 'state.json');
+    writeFileSync(state, JSON.stringify({ bodies, views: 0, lists: 0, graphql: 0, writes: [] }));
+    const bin = join(dir, 'fake-gh');
+    writeFileSync(bin, `#!/usr/bin/env node
+const fs = require('node:fs');
+const s = JSON.parse(fs.readFileSync(${JSON.stringify(state)}, 'utf8'));
+const a = process.argv.slice(2);
+let out = '';
+if (a[0] === 'pr' && a[1] === 'view') {
+  const body = s.bodies[Math.min(s.views, s.bodies.length - 1)];
+  s.views += 1;
+  out = JSON.stringify({ state: 'OPEN', body, author: { login: 'app/${AUTHOR}' } });
+} else if (a[0] === 'pr' && a[1] === 'list') {
+  s.lists += 1;
+  out = JSON.stringify(${JSON.stringify(listing)});
+} else if (a[0] === 'api' && a[1] === 'graphql') {
+  s.graphql += 1;
+  const nodes = ${JSON.stringify(history())};
+  out = JSON.stringify({ data: { repository: { pullRequest: { userContentEdits: {
+    totalCount: nodes.length, pageInfo: { hasNextPage: false }, nodes } } } } });
+} else if (a[0] === 'pr' && a[1] === 'edit') {
+  s.writes.push(fs.readFileSync(0, 'utf8'));
+}
+fs.writeFileSync(${JSON.stringify(state)}, JSON.stringify(s));
+process.stdout.write(out);
+`);
+    chmodSync(bin, 0o755);
+    const exec = (file, args, opts = {}) => runGhSync(args, { ...opts, throttle: {
+      ...opts.throttle, bin, lockRoot: join(dir, 'locks'), logPath: join(dir, 'calls.jsonl'), maxAttempts: 1,
+      env: { ...(opts.throttle?.env ?? process.env), GH_TOKEN: 'test' } } });
+    return { exec, read: () => JSON.parse(readFileSync(state, 'utf8')) };
+  }
+
+  it('refuses without writing when an operator edits the body during the history read, memo on', () => {
+    const operatorEdit = `${BODY}\n\nOperator edit made while the history was being read.`;
+    const gh = realThrottle([BODY, operatorEdit]);
+    const result = restoreAuthorStamp({ pr: 6244, repo: 'o/stamp-restore', exec: gh.exec, log: vi.fn() });
+    expectReason(result, 'refuse');
+    expect(result.reason).toMatch(/changed before write/);
+    expect(gh.read().views).toBe(2); // the pre-write read reached GitHub, not the memo
+    expect(gh.read().writes).toEqual([]);
+  });
+
+  it('reads the history live on every call, memo on', () => {
+    const gh = realThrottle([BODY]);
+    readAuthorStampEdits(6244, { repo: 'o/stamp-restore', exec: gh.exec });
+    readAuthorStampEdits(6244, { repo: 'o/stamp-restore', exec: gh.exec });
+    expect(gh.read().graphql).toBe(2);
+  });
+
+  it('lists PRs live on every sweep, memo on', () => {
+    const listing = [{ number: 6244, body: buildAuthorActorMarker(ID), author: { login: `app/${AUTHOR}` } }];
+    const gh = realThrottle([BODY], { listing });
+    sweepAuthorStamps({ repo: 'o/stamp-restore', exec: gh.exec });
+    sweepAuthorStamps({ repo: 'o/stamp-restore', exec: gh.exec });
+    expect(gh.read().lists).toBe(2);
+  });
+
+  it('strips the memo from both environments on every default GitHub read and write', () => {
+    vi.stubEnv('WE_GH_READ_MEMO_DIR', 'memo-dir');
+    const exec = vi.fn((file, args) => {
+      if (args[1] === 'view') return JSON.stringify(live());
+      if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: { userContentEdits: {
+        totalCount: 3, pageInfo: { hasNextPage: false }, nodes: history() } } } } });
+      if (args[1] === 'list') return JSON.stringify([{ number: 6244, body: BODY, author: { login: `app/${AUTHOR}` } }]);
+      return '';
+    });
+    sweepAuthorStamps({ repo: 'o/stamp-restore', exec, log: vi.fn() });
+    expect(exec.mock.calls.map(([, args]) => args.slice(0, 2))).toEqual([
+      ['pr', 'list'], ['pr', 'view'], ['api', 'graphql'], ['pr', 'view'], ['pr', 'edit']]);
+    for (const [, , opts] of exec.mock.calls) {
+      expect(opts.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+      expect(opts.throttle.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+    }
+    expect(process.env.WE_GH_READ_MEMO_DIR).toBe('memo-dir');
   });
 });

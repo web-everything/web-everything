@@ -1,9 +1,13 @@
 /** Recover author stamps only from complete, agreeing GitHub edit-history evidence. */
 import { execFileSyncThrottled } from './gh-throttle.mjs';
+import { createMqLiveReader } from './drain-queue-safety.mjs';
 import { readAuthorActorStamps, hasStampLostMarker } from './review-independence.mjs';
 import { writeLineSync } from './write-all-sync.mjs';
 
 const IO_OPTIONS = { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 };
+// Restoration evidence is compared against itself before a write: a memoized read would let a cached
+// body pass the pre-write check and overwrite an intervening edit. Every GitHub call here is live.
+const live = (exec) => createMqLiveReader(exec);
 const refusal = (reason) => ({ action: 'refuse', reason });
 const safe = (value) => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
 
@@ -14,7 +18,7 @@ export function readAuthorStampEdits(pr, { repo, exec = execFileSyncThrottled } 
     throw new Error('invalid repository or PR number');
   }
   const query = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){userContentEdits(first:100){totalCount pageInfo{hasNextPage} nodes{createdAt editor{__typename login} diff}}}}}`;
-  const data = JSON.parse(exec('gh', ['api', 'graphql', '-f', `query=${query}`,
+  const data = JSON.parse(live(exec)('gh', ['api', 'graphql', '-f', `query=${query}`,
     '-f', `owner=${parts[0]}`, '-f', `name=${parts[1]}`, '-F', `number=${pr}`], IO_OPTIONS));
   const connection = data?.data?.repository?.pullRequest?.userContentEdits;
   if (data.errors != null || !Array.isArray(connection?.nodes)
@@ -96,10 +100,10 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
 
 export function restoreAuthorStamp({ pr, repo, dryRun = false,
   exec = execFileSyncThrottled,
-  readPr = (number) => JSON.parse(exec('gh', ['pr', 'view', String(number), '--repo', repo,
+  readPr = (number) => JSON.parse(live(exec)('gh', ['pr', 'view', String(number), '--repo', repo,
     '--json', 'state,body,author'], IO_OPTIONS)),
   readEdits = (number) => readAuthorStampEdits(number, { repo, exec }),
-  writeBody = (number, body) => exec('gh', ['pr', 'edit', String(number), '--repo', repo, '--body-file', '-'],
+  writeBody = (number, body) => live(exec)('gh', ['pr', 'edit', String(number), '--repo', repo, '--body-file', '-'],
     { ...IO_OPTIONS, input: body, env: { ...process.env, PR_BODY_STAMP_OK: '1' } }),
   log = (line) => writeLineSync(2, line),
 } = {}) {
@@ -125,7 +129,7 @@ const refusedUntil = new Map();
 const RETRY_MS = 5 * 60_000;
 
 export function sweepAuthorStamps({ repo, exec = execFileSyncThrottled,
-  listPrs = () => JSON.parse(exec('gh', ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '100',
+  listPrs = () => JSON.parse(live(exec)('gh', ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '100',
     '--json', 'number,body,author'], IO_OPTIONS)), now = Date.now, ...io } = {}) {
   const time = now();
   for (const [key, entry] of refusedUntil) if (entry.until <= time) refusedUntil.delete(key);

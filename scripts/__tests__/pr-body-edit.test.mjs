@@ -2,7 +2,7 @@
  * @file pr-body-edit.test.mjs — the stamp survives a body rewrite, and the guard denies the raw command.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { withCarriedStamps, recoverAuthorIdFromHistory, repair } from '../pr-body-edit.mjs';
+import { withCarriedStamps, recoverAuthorIdFromHistory, repair, cliGh } from '../pr-body-edit.mjs';
 import {
   buildAuthorActorMarker, parseAuthorActorId, readAuthorActorStamps, hasStampLostMarker,
 } from '../lib/review-independence.mjs';
@@ -73,6 +73,25 @@ describe('recoverAuthorIdFromHistory — #3067\'s recovery from GitHub\'s OWN ed
     const recovered = recoverAuthorIdFromHistory([`Original body\n\n${stamp(A)}`]);
     const { body } = withCarriedStamps(stamp(recovered), 'Operator revision');
     expect(parseAuthorActorId(body)).toBe(A);
+  });
+});
+
+describe('cliGh() — the CLI PR reader is live', () => {
+  it('strips the smoke read memo from the gh child environment and appends --repo', () => {
+    vi.stubEnv('WE_GH_READ_MEMO_DIR', 'memo-dir');
+    try {
+      const exec = vi.fn(() => '{}');
+      cliGh('o/r', exec)(['pr', 'view', '6244', '--json', 'state,body,author']);
+      const [cmd, args, opts] = exec.mock.calls[0];
+      expect(cmd).toBe('gh');
+      expect(args).toEqual(['pr', 'view', '6244', '--json', 'state,body,author', '--repo', 'o/r']);
+      expect(opts.encoding).toBe('utf8');
+      expect(opts.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+      expect(opts.throttle.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+      expect(process.env.WE_GH_READ_MEMO_DIR).toBe('memo-dir');
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });
 

@@ -22,6 +22,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { readAuthorStampEdits, restoreAuthorStamp } from './lib/author-stamp-restore.mjs';
 import { execFileSyncThrottled } from './lib/gh-throttle.mjs';
+import { createMqLiveReader } from './lib/drain-queue-safety.mjs';
 import {
   readAuthorActorStamps, buildAuthorActorMarker,
 } from './lib/review-independence.mjs';
@@ -99,12 +100,18 @@ export function repair(gh, pr, repo, execFile = execFileSyncThrottled) {
   }
 }
 
+/** The CLI's PR reader. Its body read is compared before a write, so a gh shim must never serve it from the
+ * smoke read memo: the memo is stripped from the child environment. */
+export function cliGh(repo, exec = execFileSync) {
+  return (args) => createMqLiveReader(exec)('gh', repo ? [...args, '--repo', repo] : args, { encoding: 'utf8' });
+}
+
 function main(argv) {
   const arg = (n) => (argv.find((a) => a.startsWith(`--${n}=`)) || '').split('=').slice(1).join('=');
   const pr = arg('pr');
   const file = arg('body-file');
   const repo = arg('repo');
-  const gh = (args) => execFileSync('gh', repo ? [...args, '--repo', repo] : args, { encoding: 'utf8' });
+  const gh = cliGh(repo);
   if (argv.includes('--repair')) {
     if (!pr) {
       writeLineSync(2, 'usage: pr-body-edit.mjs --pr=<n> --repair [--repo=<owner/name>]');

@@ -3919,6 +3919,9 @@ The review daemon must explicitly pass `restoreStamps: sweepAuthorStamps` to hol
 including with shared PR reads: an injected listing otherwise suppresses the default stamp sweep.
 Keep daemon wiring tests hermetic by inspecting the passed function without invoking it;
 the stamp and hold-reconcile suites exercise the repair through injected IO.
+Every default restoration read (listing, live body, history, pre-write body) goes through
+`createMqLiveReader`, so the smoke read memo (`WE_GH_READ_MEMO_DIR`) can never serve the pre-write
+comparison a cached body. The regression drives the real `gh-throttle` memo with a fake `gh`.
 
 ### Author-stamp restoration evidence
 
