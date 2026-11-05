@@ -63,6 +63,51 @@ function resultComment(confirmed = false) {
     }] : [] }));
 }
 
+describe('not-owed settlement evidence and holds', () => {
+  it('never settles pending for an unknown verdict string', () => {
+    const o = runFixture({ readEvidence: () => evidence({ loopPayload: payload('bogus') }) });
+    expect(mod.runRedTeamOnSkip(o).rows[0]).not.toHaveProperty('settle');
+    expect(o.settlePending).not.toHaveBeenCalled();
+  });
+  it.each(['missing reviews', 'null reviews', 'formal hold', 'hold without acceptance', 'later verdict', 'later body hold'])(
+    'planner retains pending for %s', kind => {
+      const f = fixture();
+      if (kind === 'missing reviews') delete f.rawPrs[0].reviews;
+      if (kind === 'null reviews') f.rawPrs[0].reviews = null;
+      if (kind === 'formal hold') f.rawPrs[0].reviews = [{ state: 'CHANGES_REQUESTED', submittedAt: iso(acceptedAt + 1) }];
+      if (kind === 'hold without acceptance') {
+        f.rawPrs[0].labels = ['review:prep', 'red-team:pending'];
+        f.rawPrs[0].comments = [trusted('🔁 review — changes requested')];
+      }
+      if (kind === 'later verdict' || kind === 'later body hold') f.rawPrs[0].comments.push(
+        trusted(kind === 'later verdict' ? '❌ review — changes requested' : 'manifest baseline mismatch', iso(acceptedAt + 1)));
+      expect(decide(f)).not.toHaveProperty('settle');
+      const o = runFixture({ ...f, now: () => f.now, readReviews: () => { throw Error('reviews unreadable'); } });
+      mod.runRedTeamOnSkip(o);
+      expect(o.settlePending).not.toHaveBeenCalled(); expect(o.dispatch).not.toHaveBeenCalled();
+    });
+  it.each(['review:prep', 'review:changes', 'review-status:running'])(
+    'reads unaccepted reviews once and permits pending removal beside %s', label => {
+      const o = runFixture(); o.rawPrs[0].labels = [label, 'red-team:pending'];
+      o.rawPrs[0].comments = []; delete o.rawPrs[0].reviews;
+      o.rawPrs.push({ ...o.rawPrs[0] });
+      expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ settle: 'not-owed' });
+      expect(o.readReviews).toHaveBeenCalledOnce(); expect(o.readReviews).toHaveBeenCalledWith({ repo, pr });
+      expect(o.settlePending).toHaveBeenCalledWith({ repo, pr, head, remove: ['red-team:pending'] });
+    });
+  it.each(['throws', 'unknown', 'formal hold'])(
+    'unaccepted review read %s retains pending', kind => {
+      const readReviews = vi.fn(() => {
+        if (kind === 'throws') throw Error('unreadable');
+        return kind === 'unknown' ? null : [{ state: 'CHANGES_REQUESTED', submittedAt: iso(acceptedAt + 1) }];
+      });
+      const o = runFixture({ readReviews });
+      o.rawPrs[0].labels = ['review:prep', 'red-team:pending']; o.rawPrs[0].comments = []; delete o.rawPrs[0].reviews;
+      expect(mod.runRedTeamOnSkip(o).rows[0]).not.toHaveProperty('settle');
+      expect(readReviews).toHaveBeenCalledOnce(); expect(o.settlePending).not.toHaveBeenCalled();
+    });
+});
+
 describe('planner settlement annotations', () => {
   it.each([null, {}, undefined, { verdict: 7 }, { verdict: '' }, { verdict: '  ' }])(
     'never settles pending without a recorded review verdict: %j', verdict => {

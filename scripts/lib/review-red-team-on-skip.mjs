@@ -21,7 +21,7 @@ import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun, completedRedTeamSeat } from './red-team-run-result.mjs';
 
-import { redTeamRequired } from './jury-core.mjs';
+import { redTeamRequired, VERDICTS } from './jury-core.mjs';
 import { isLaterVerdictBody, latestAcceptRecord, laterReviewHold } from './accept-carry-forward.mjs';
 import { restampRecord, strandedNumberingRecords } from './numbering-carry.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
@@ -397,12 +397,19 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       const finishedNotOwed = [evidence?.status, status].every(candidate => candidate?.status === 'finished'
         && normalizeRedTeamResult(candidate.result).priorResult === 'not-owed'
         && !candidate.result?.deferredByGuard && !candidate.result?.deferredByCap);
-      const recordedNotOwed = (typeof verdict === 'string' && verdict.trim().length > 0 && !owed)
+      const recordedNotOwed = (Object.values(VERDICTS).includes(verdict) && !owed)
         || finishedNotOwed;
-      const notOwed = () => ({ ...skip('stored review does not owe a red team'),
-        ...(recordedNotOwed && evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
+      const notOwed = () => {
+        // Review labels independently block merge; thread/formal holds still forbid settlement.
+        const acceptance = latestAcceptRecord(rawPr.comments, reviews);
+        const hold = reviews === null || laterReviewHold(reviews)
+          || (acceptance ? acceptance.laterVerdict || acceptance.laterBodyDerivedHold
+            : rawPr.comments.some(comment => isLaterVerdictBody(comment?.body)));
+        return { ...skip('stored review does not owe a red team'),
+        ...(!hold && recordedNotOwed && evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
           && evidence.inFlight === false && !evidence.queued
-          && evidence.recorded === false && evidence.seatRecorded === false ? { settle: 'not-owed' } : {}) });
+          && evidence.recorded === false && evidence.seatRecorded === false ? { settle: 'not-owed' } : {}) };
+      };
       // A missing live-head review requires the full loop; stale reads cannot authorize a red-team-only pass.
       const storedHead = evidence?.loopPayload?.findings?.read?.netBasis?.rev;
       const needsReview = !movedCardOnly && !pendingCardOnly && !unfinishedCarry && accepted
@@ -539,9 +546,10 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     const at = now();
     const resolved = setting ?? resolveReviewRedTeamOnSkip({ env, log: note }).value;
     const refusals = plan?.refusals ?? [];
-    // Reconcile rows omit formal reviews. Read only accepted recovery candidates,
+    // Reconcile rows omit formal reviews. Read recovery candidates, including unaccepted not-owed heads,
     // once per PR, without mutating the daemon's shared snapshot. Failed/oversized
     // reads stay unknown: the planner requires operator inspection before clearing.
+    const reviewsByPr = new Map();
     const planningPrs = (rawPrs ?? []).map(rawPr => {
       const pr = Number(rawPr?.number), head = rawPr?.headRefOid;
       if (!resolved.enabled || Array.isArray(rawPr?.reviews) || !isRealHead(head)
@@ -549,12 +557,14 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           && (r.headSha == null || r.headSha === head))
         || !Array.isArray(rawPr.comments) || redTeamForHead(rawPr.comments, pr, head)
         || !Array.isArray(rawPr.labels) || !rawPr.labels.some(label =>
-          (typeof label === 'string' ? label : label?.name) === 'review:accepted')) return rawPr;
+          ['review:accepted', 'red-team:pending'].includes(typeof label === 'string' ? label : label?.name))) return rawPr;
+      if (reviewsByPr.has(pr)) return { ...rawPr, reviews: reviewsByPr.get(pr) };
       let reviews;
       try {
         const result = readReviews({ repo, pr });
         if (Array.isArray(result)) reviews = result;
       } catch { /* Unknown reviews must keep policy-clear closed. */ }
+      reviewsByPr.set(pr, reviews);
       return { ...rawPr, reviews };
     });
     rows.push(...planRedTeamOnSkip({ repo, refusals, rawPrs: planningPrs,
