@@ -662,38 +662,59 @@ describe('readCatchUpCandidates', () => {
 
 describe('readPendingChangePaths', () => {
   const base = { root: '/code', cwd: '/clone', overlays: () => [{ ref: 'lane/x', addedAt: '2026-11-05T00:00:00Z' }], rebuildState: () => ({ adopted: { at: '2026-11-04T00:00:00Z' } }) };
+  const TIP = 'c'.repeat(40);
+  const PROTECTED = 'scripts/lib/enqueue-on-event.mjs';
+  const gitErr = (status) => Object.assign(new Error(`git exited ${status}`), { status });
+  /** Fake git: `inHead` = is the overlay tip an ancestor of the code clone's HEAD; `tip` = rev-parse answer ('' = ref missing). */
+  const fakeGit = ({ inHead = false, tip = TIP, ancestorError = null } = {}, calls = []) => (_c, args) => {
+    calls.push(args);
+    if (args[0] === 'rev-parse') { if (!tip) throw gitErr(1); return `${tip}\n`; }
+    if (args[0] === 'merge-base') { if (ancestorError) throw ancestorError; if (inHead) return ''; throw gitErr(1); }
+    return args.some((a) => String(a).includes('...origin/lane/x')) ? `${PROTECTED}\0` : '';
+  };
+  const adoptedState = (applied) => () => ({ adopted: { at: '2026-11-06T00:00:00Z', applied } });
   it('unions the main delta and each unadopted overlay diff', () => {
-    const exec = (_c, args) => (args[0] === 'rev-parse' ? `${'c'.repeat(40)}\n` : args.includes('HEAD') ? 'a.mjs\n' : 'b.mjs\n');
+    const exec = (_c, args) => (args[0] === 'rev-parse' ? `${TIP}\n` : args[0] === 'merge-base' ? (() => { throw gitErr(1); })() : args.includes('HEAD') ? 'a.mjs\0' : 'b.mjs\0');
     expect(readPendingChangePaths({ ...base, execFileSyncImpl: exec })).toMatchObject({ ok: true, paths: ['a.mjs', 'b.mjs'] });
   });
-  const SHA_A = 'a'.repeat(40);
-  const SHA_B = 'b'.repeat(40);
-  const adoptedState = (applied) => () => ({ adopted: { at: '2026-11-06T00:00:00Z', applied } });
-  const execWithTip = (tip, calls) => (_c, args) => { calls.push(args); return args[0] === 'rev-parse' ? `${tip}\n` : (args.some((a) => String(a).includes('...origin/lane/x')) ? 'scripts/lib/enqueue-on-event.mjs\n' : ''); };
-  it('skips an overlay whose current tip is the adopted sha', () => {
+  it('skips an overlay whose current tip is already in the code clone HEAD', () => {
     const calls = [];
-    const out = readPendingChangePaths({ ...base, rebuildState: adoptedState([{ ref: 'lane/x', sha: SHA_A }]), execFileSyncImpl: execWithTip(SHA_A, calls) });
+    const out = readPendingChangePaths({ ...base, rebuildState: adoptedState([{ ref: 'lane/x', sha: TIP }]), execFileSyncImpl: fakeGit({ inHead: true }, calls) });
     expect(out).toMatchObject({ ok: true, paths: [] });
     expect(calls.some((args) => args.some((a) => String(a).includes('...origin/lane/x')))).toBe(false);
   });
-  it('still inspects an overlay that advanced past its adopted sha even though its registration predates adoption', () => {
+  it('still inspects an overlay registered before adoption whose branch advanced past HEAD', () => {
+    const out = readPendingChangePaths({ ...base, rebuildState: adoptedState([{ ref: 'lane/x', sha: 'a'.repeat(40) }]), execFileSyncImpl: fakeGit({ inHead: false }) });
+    expect(out).toMatchObject({ ok: true, paths: [PROTECTED] });
+  });
+  it('does not trust the recorded adopted sha when HEAD does not carry the tip (held, rejected or rolled-back build)', () => {
+    const out = readPendingChangePaths({ ...base, rebuildState: adoptedState([{ ref: 'lane/x', sha: TIP }]), execFileSyncImpl: fakeGit({ inHead: false }) });
+    expect(out.paths).toContain(PROTECTED);
+  });
+  it('inspects an overlay with no adoption record at all', () => {
+    expect(readPendingChangePaths({ ...base, rebuildState: adoptedState([]), execFileSyncImpl: fakeGit() }).paths).toContain(PROTECTED);
+    expect(readPendingChangePaths({ ...base, rebuildState: () => ({ adopted: { at: '2026-11-06T00:00:00Z' } }), execFileSyncImpl: fakeGit() }).paths).toContain(PROTECTED);
+    expect(readPendingChangePaths({ ...base, rebuildState: () => ({}), execFileSyncImpl: fakeGit() }).paths).toContain(PROTECTED);
+  });
+  it('fails closed when an overlay never applied has no resolvable tip', () => {
+    expect(readPendingChangePaths({ ...base, rebuildState: adoptedState([]), execFileSyncImpl: fakeGit({ tip: '' }) })).toMatchObject({ ok: false });
+  });
+  it('does not hold on a previously applied overlay whose branch was deleted', () => {
+    const out = readPendingChangePaths({ ...base, rebuildState: adoptedState([{ ref: 'lane/x', sha: TIP }]), execFileSyncImpl: fakeGit({ tip: '' }) });
+    expect(out).toMatchObject({ ok: true, paths: [] });
+  });
+  it('fails closed when the ancestry check errors for a reason other than "not an ancestor"', () => {
+    expect(readPendingChangePaths({ ...base, execFileSyncImpl: fakeGit({ ancestorError: gitErr(128) }) })).toMatchObject({ ok: false });
+  });
+  it('reads NUL-separated paths so a quoted non-ASCII protected path still matches by name', () => {
     const calls = [];
-    const out = readPendingChangePaths({ ...base, rebuildState: adoptedState([{ ref: 'lane/x', sha: SHA_A }]), execFileSyncImpl: execWithTip(SHA_B, calls) });
-    expect(out).toMatchObject({ ok: true, paths: ['scripts/lib/enqueue-on-event.mjs'] });
-  });
-  it('inspects an overlay that was never recorded as applied (registration age is not proof of adoption)', () => {
-    const out = readPendingChangePaths({ ...base, rebuildState: adoptedState([]), execFileSyncImpl: execWithTip(SHA_A, []) });
-    expect(out.paths).toContain('scripts/lib/enqueue-on-event.mjs');
-    const legacy = readPendingChangePaths({ ...base, rebuildState: () => ({ adopted: { at: '2026-11-06T00:00:00Z' } }), execFileSyncImpl: execWithTip(SHA_A, []) });
-    expect(legacy.paths).toContain('scripts/lib/enqueue-on-event.mjs');
-  });
-  it('fails closed when the overlay tip cannot be resolved', () => {
-    const exec = (_c, args) => { if (args[0] === 'rev-parse') throw new Error('unknown revision'); return ''; };
-    expect(readPendingChangePaths({ ...base, rebuildState: adoptedState([{ ref: 'lane/x', sha: SHA_A }]), execFileSyncImpl: exec })).toMatchObject({ ok: false });
+    const exec = (_c, args) => { calls.push(args); return args[0] === 'rev-parse' ? `${TIP}\n` : args[0] === 'merge-base' ? (() => { throw gitErr(1); })() : 'scripts/lib/enqueue-on-event/é.mjs\0'; };
+    expect(readPendingChangePaths({ ...base, execFileSyncImpl: exec }).paths).toEqual(['scripts/lib/enqueue-on-event/é.mjs']);
+    expect(calls.filter((args) => args[0] === 'diff').every((args) => args.includes('-z'))).toBe(true);
   });
   it('disables rename detection so a moved protected file still shows its source path', () => {
     const calls = [];
-    readPendingChangePaths({ ...base, execFileSyncImpl: (_c, args) => { calls.push(args); return args[0] === 'rev-parse' ? `${'c'.repeat(40)}\n` : ''; } });
+    readPendingChangePaths({ ...base, execFileSyncImpl: fakeGit({}, calls) });
     const diffs = calls.filter((args) => args[0] === 'diff');
     expect(diffs).toHaveLength(2);
     expect(diffs.every((args) => args.includes('--no-renames'))).toBe(true);

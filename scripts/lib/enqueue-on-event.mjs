@@ -600,21 +600,31 @@ export function readPendingChangePaths({ root, cwd, env = process.env, execFileS
   try {
     if (!root || root === cwd) return { ok: true, paths: [], source: 'no separate code clone' };
     const git = (args) => String(execFileSyncImpl('git', args, { cwd: root, env, encoding: 'utf8', timeout: 30_000, maxBuffer: 4 * 1024 * 1024 }));
-    const lines = (out) => out.split('\n').map((l) => l.trim()).filter(Boolean);
-    // An overlay counts as adopted only when its CURRENT tip is the sha the last adoption recorded for it. Registration age
-    // proves nothing: re-registering an existing overlay keeps addedAt, and its branch can advance after adoption.
+    // NUL-separated (-z): git quotes non-ASCII or special paths otherwise, and a quoted path never matches a protected prefix.
+    const names = (out) => out.split('\0').filter(Boolean);
+    // An overlay counts as adopted only when its CURRENT tip is already in the code clone's HEAD history. Registration age and
+    // a recorded sha prove nothing: re-registering keeps addedAt, the branch can advance, and a held or rolled-back build
+    // leaves HEAD behind its own record.
     const applied = rebuildState()?.adopted?.applied;
-    const adoptedSha = new Map((Array.isArray(applied) ? applied : []).filter((a) => isObj(a) && typeof a.ref === 'string' && typeof a.sha === 'string').map((a) => [a.ref, a.sha]));
-    const paths = new Set(lines(git(['diff', '--name-only', '--no-renames', 'HEAD', 'origin/main'])));
+    const everApplied = new Set((Array.isArray(applied) ? applied : []).filter((a) => isObj(a) && typeof a.ref === 'string').map((a) => a.ref));
+    const paths = new Set(names(git(['diff', '--name-only', '-z', '--no-renames', 'HEAD', 'origin/main'])));
     let inspected = 0;
     for (const o of overlays()) {
       const ref = o?.ref;
       if (typeof ref !== 'string' || !/^[A-Za-z0-9._/-]+$/.test(ref) || ref.startsWith('-')) return { ok: false, error: `overlay ref ${JSON.stringify(ref)} unsafe` };
-      const tip = git(['rev-parse', '--verify', '--quiet', `origin/${ref}^{commit}`]).trim();
-      if (!/^[0-9a-f]{40}$/.test(tip)) return { ok: false, error: `overlay ref ${JSON.stringify(ref)} tip unreadable` };
-      if (adoptedSha.get(ref) === tip) continue;
+      let tip;
+      try { tip = git(['rev-parse', '--verify', '--quiet', `origin/${ref}^{commit}`]).trim(); } catch { tip = ''; }
+      if (!tip) {
+        // The branch is gone (merged and deleted, not yet dropped by a rebuild): nothing left to inspect if it was applied before.
+        if (everApplied.has(ref)) continue;
+        return { ok: false, error: `overlay ref ${JSON.stringify(ref)} tip unreadable` };
+      }
+      if (!/^[0-9a-f]{40,64}$/.test(tip)) return { ok: false, error: `overlay ref ${JSON.stringify(ref)} tip unreadable` };
+      let inHead;
+      try { git(['merge-base', '--is-ancestor', tip, 'HEAD']); inHead = true; } catch (e) { if (e?.status === 1) inHead = false; else throw e; }
+      if (inHead) continue;
       inspected += 1;
-      for (const p of lines(git(['diff', '--name-only', '--no-renames', `origin/main...origin/${ref}`, '--']))) paths.add(p);
+      for (const p of names(git(['diff', '--name-only', '-z', '--no-renames', `origin/main...origin/${ref}`, '--']))) paths.add(p);
     }
     return { ok: true, paths: [...paths], source: `main delta + ${inspected} overlay(s)` };
   } catch (e) { return { ok: false, error: String(e?.message || e).split('\n')[0] }; }
