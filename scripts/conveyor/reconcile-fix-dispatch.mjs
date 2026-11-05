@@ -709,7 +709,14 @@ export function fetchCardScopeAtRef(path, ref, { exec = execFileSyncThrottled, r
     });
     const decoded = Buffer.from(String(out || '').trim(), 'base64').toString('utf8');
     const { data } = matter(decoded);
-    return splitScopeEntries(data?.scope);
+    if (!Array.isArray(data?.scope)) return [];
+    // Split each authored entry on its own; if ANY piece is unsafe, keep the raw entry whole so the resolver's
+    // safety filter rejects it as one unit (as before splitting) — a safe sibling never survives alone (#6424).
+    const entries = data.scope.flatMap((entry) => {
+      const pieces = splitScopeEntries([entry]);
+      return pieces.every(isSafeFallbackScopeEntry) ? pieces : [String(entry ?? '').trim()];
+    });
+    return [...new Set(entries)];
   } catch {
     return [];
   }

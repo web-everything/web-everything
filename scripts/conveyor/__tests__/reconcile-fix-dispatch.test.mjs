@@ -14,6 +14,7 @@ import {
   findResumeCandidate, buildResumePrompt, tryResumeFix, tryResumeRoundFix, filterFixesByInFlightScope, dropTerminalFixClaims, routeFixExecutor,
 } from '../reconcile-fix-dispatch.mjs';
 import { CONFLICT_LABEL } from '../parked-pr-conflict-watch.mjs';
+import { resolvePrWorkUnit } from '../pr-work-unit.mjs';
 import { DISPATCHED_AGENT_SYSTEM_PROMPT_FILE, dispatchSessionCwd } from '../../operations/dispatch-lane-io.mjs';
 import { buildAuthorActorMarker } from '../../lib/review-independence.mjs';
 
@@ -2171,4 +2172,44 @@ it('splits the card-at-ref scope before returning it', () => {
   const exec = vi.fn(() => Buffer.from('---\nscope: ["we:a b", "we:a"]\n---\n').toString('base64'));
   expect(fetchCardScopeAtRef('backlog/7594-fixture.md', 'sha', { exec, root: '/repo' }))
     .toEqual(['we:a', 'we:b']);
+});
+
+// Red-team break on #6424: splitting an unmerged card's combined entry must not let a safe piece survive
+// alone when another piece of the SAME entry is unsafe — that silently narrowed the fix fence to the safe
+// piece instead of rejecting the whole entry (and falling back to the PR's full diff) as before the split.
+describe('card-at-ref scope: one unsafe piece rejects its whole authored entry', () => {
+  const cardScope = (yamlList) => {
+    const exec = vi.fn(() => Buffer.from(`---\nscope: ${yamlList}\n---\n`).toString('base64'));
+    return (path, ref) => fetchCardScopeAtRef(path, ref, { exec, root: '/repo' });
+  };
+  const resolveWith = (yamlList) => resolvePrWorkUnit({
+    repo: 'we',
+    pr: { number: 7594, headRefName: 'lane/7594-fixture', headRefOid: 'cafe'.repeat(10) },
+    findItem: () => null,
+    fetchDiffPaths: () => ['backlog/7594-fixture.md', 'a.mjs', 'b.mjs', 'c.mjs'],
+    fetchCardScopeAtRef: cardScope(yamlList),
+  });
+
+  it('mixed comma + whitespace separators fall back to the full diff, keeping a, b and c in scope', () => {
+    const unit = resolveWith('["we:a.mjs,we:b.mjs we:c.mjs"]');
+    expect(unit.scopeSource).toBe('diff');
+    expect(unit.scope).toEqual(['we:backlog/7594-fixture.md', 'we:a.mjs', 'we:b.mjs', 'we:c.mjs']);
+  });
+
+  it.each([
+    ['a `..` piece', '["we:c.mjs we:../c.mjs"]'],
+    ['a leading-slash piece', '["we:c.mjs /c.mjs"]'],
+    ['a single glob piece', '["we:c.mjs we:*.mjs"]'],
+    ['a control-character piece', '["we:c.mjs we:b\\x01.mjs"]'],
+  ])('%s drops the whole entry, never its safe sibling alone', (_label, yamlList) => {
+    const unit = resolveWith(yamlList);
+    expect(unit.scopeSource).toBe('diff');
+    expect(unit.scope).toEqual(['we:backlog/7594-fixture.md', 'we:a.mjs', 'we:b.mjs', 'we:c.mjs']);
+  });
+
+  it('a clean combined entry still splits into card scope', () => {
+    const unit = resolveWith('["we:a.mjs b.mjs"]');
+    expect(unit.scopeSource).toBe('card');
+    expect(unit.scope).toEqual(['we:a.mjs', 'we:b.mjs']);
+  });
 });
