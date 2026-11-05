@@ -89,6 +89,35 @@ describe('backlog loader normalizeScope — multi-path entries (R372)', () => {
     }
   });
 
+  // Wiring: the real loader (both public entry points) must gate a card whose ONLY repo signal sits behind a bare
+  // leading glob in a kept-whole entry, and must emit that entry canonically in the inferred repo, which dispatch refuses.
+  it.each([
+    ['src/a*.mjs fui:src/a*b.mjs', 'frontierui', 'fui:src/a*.mjs fui:src/a*b.mjs'],
+    ['src/a*.mjs, plateau:src/a*b.mjs', 'plateau-app', 'plateau:src/a*.mjs plateau:src/a*b.mjs'],
+  ])('loader infers locus from a later prefix of a kept-whole entry: %s', (entry, locus, expected) => {
+    const dir = mkdtempSync(join(tmpdir(), 'scope-locus-whole-'));
+    const modulePath = require.resolve('../backlog.js');
+    const cached = require.cache[modulePath];
+    try {
+      writeFileSync(join(dir, '99998-scope.md'), matter.stringify('Scope fixture.', {
+        title: 'Scope', status: 'open', tags: [], scope: [entry],
+      }));
+      delete require.cache[modulePath];
+      const load = withFrozenBacklogDir(dir, () => require('../backlog.js'));
+      for (let read = 0; read < 2; read++) {
+        const cards = read === 0 ? load() : load.loadBacklogScoped(['99998-scope.md']);
+        const item = cards.find((card: { num: string }) => card.num === '99998');
+        expect.soft(item.locus).toBe(locus);
+        expect.soft(item.scope).toEqual([expected]);
+        expect.soft(() => normalizeBriefScope(item.scope)).toThrow();
+      }
+    } finally {
+      if (cached) require.cache[modulePath] = cached;
+      else delete require.cache[modulePath];
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it.each([...refusedCorpusEntries])('refuses historical malformed scope %s before and after loading', (entry, reason) => {
     const scope = ['we:src/safe.mjs', entry];
     expect(() => normalizeBriefScope(scope)).toThrow(reason);
