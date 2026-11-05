@@ -5,7 +5,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { fork } from 'node:child_process';
 import { withHeadIndexLock, seedFromReviewComments, recordReview, readHeadIndex, headReviewOwed, netPatchKey, resolveHeadIndexSettings, headIndexPaths } from '../review-head-index.mjs';
 
@@ -329,22 +328,23 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     // the swap happens as the append opens; the next fence (before the map publish) must refuse
     expect(() => rec({ fs })).toThrow(/lock lost/);
     expect(existsSync(headIndexPaths(dir).map)).toBe(false);
-    expect(existsSync(headIndexPaths(dir).log)).toBe(false); // the rejected record is rolled back out of the source-of-truth log
+    expect(readHeadIndex({ dir })).toMatchObject({ ok: true, map: {} }); // the rejected record is retracted: no reader sees it
+    expect(nodeFs.readdirSync(dir).filter(n => n.startsWith('retract.'))).toHaveLength(1); // by a marker file, never by writing to the log
   });
-  it('fencing: a writer whose lock is stolen between the fence and the append leaves the log bytes unchanged and the map unpublished', () => {
+  it('fencing: a writer whose lock is stolen between the fence and the append never publishes the map and leaves no visible review', () => {
     rec();
     const { log, map, lock } = headIndexPaths(dir);
-    const [logBefore, mapBefore] = [readFileSync(log, 'utf8'), readFileSync(map, 'utf8')];
+    const mapBefore = readFileSync(map, 'utf8');
     // the lock is stolen as the append opens, i.e. after the pre-append fence and before the line lands
     const fs = { ...nodeFs, openSync: (p, f) => { if (f === 'a') writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'thief', at: 1 })); return nodeFs.openSync(p, f); } };
     expect(() => rec({ fs, head: H(2), netPatchHash: 'p2' })).toThrow(/lock lost/);
-    expect(readFileSync(log, 'utf8')).toBe(logBefore);
     expect(readFileSync(map, 'utf8')).toBe(mapBefore);
+    expect(readHeadIndex({ dir }).map['o/r#7']).toMatchObject({ lastReviewedHead: H(1) }); // the rejected review is not the head record
     const owed = headReviewOwed({ index: readHeadIndex({ dir }), repo: 'o/r', pr: 7, head: H(2), netPatchHash: 'p2' });
     expect(owed).toMatchObject({ owed: true });                  // readers cannot see the rejected review
     expect(JSON.parse(readFileSync(lock, 'utf8')).token).toBe('thief'); // the new holder's lock is left alone
   });
-  it('fencing rollback never truncates away a record another writer appended after ours', () => {
+  it('fencing rollback never rewrites the log: a record another writer appended after ours survives, ours is retracted', () => {
     rec();
     const { log, lock } = headIndexPaths(dir);
     const theirs = `${JSON.stringify({ repo: 'o/r', pr: 8, head: H(3), netPatchHash: 'p9', verdict: 'accept', at: '2026-11-04T11:00:00Z' })}\n`;
@@ -355,6 +355,9 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     } };
     expect(() => rec({ fs, head: H(2), netPatchHash: 'p2' })).toThrow(/lock lost/);
     expect(readFileSync(log, 'utf8')).toContain(theirs);        // the other holder's record survives the rollback
+    const index = readHeadIndex({ dir });
+    expect(index.map['o/r#8']).toMatchObject({ lastReviewedHead: H(3) });
+    expect(index.map['o/r#7'].history.p2).toBeUndefined();
   });
   it('fencing: a writer that loses its lock before the append never touches the log or the map', () => {
     rec();
@@ -373,18 +376,20 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     const { log, map, lock } = headIndexPaths(dir);
     const [logBefore, mapBefore] = [readFileSync(log, 'utf8'), readFileSync(map, 'utf8')];
     let appended = false;
+    const stillThere = () => { const t = readFileSync(log, 'utf8'); return t.startsWith(logBefore) && t.split('\n').filter(Boolean).length === 3; };
     const fs = { ...nodeFs,
       openSync: (p, f) => { if (f === 'a') appended = true; return nodeFs.openSync(p, f); },
       readFileSync: (p, ...a) => { if (appended && p === log) { appended = false; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'thief', at: 1 })); } return nodeFs.readFileSync(p, ...a); } };
     // logMaxLines=1 forces compaction; the steal lands right before the pre-rewrite fence, which must refuse
     expect(() => rec({ fs, head: H(3), netPatchHash: 'p3', logMaxLines: 1 })).toThrow(/lock lost/);
-    expect(readFileSync(log, 'utf8')).toBe(logBefore);              // not replaced from a stale map, and our line rolled back
+    expect(stillThere()).toBe(true);                                // the log was not replaced from a stale map (old rows + our one line)
+    expect(readHeadIndex({ dir }).map['o/r#7'].history.p3).toBeUndefined(); // and our line is retracted
     expect(readFileSync(map, 'utf8')).toBe(mapBefore);              // map never published
   });
-  it('fencing: a writer that loses its lock right after the compaction rewrite restores the log it replaced and publishes nothing', () => {
+  it('fencing: a writer that loses its lock right after the compaction rewrite publishes nothing and its row is retracted from the compacted log', () => {
     rec(); rec({ head: H(2), netPatchHash: 'p2' });
     const { log, map, lock } = headIndexPaths(dir);
-    const [logBefore, mapBefore] = [readFileSync(log, 'utf8'), readFileSync(map, 'utf8')];
+    const mapBefore = readFileSync(map, 'utf8');
     let stolen = false;
     const fs = { ...nodeFs, renameSync: (a, b) => { // the compacted log lands, then the lock is lost before the next fence
       const r = nodeFs.renameSync(a, b);
@@ -392,8 +397,11 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
       return r; } };
     expect(() => rec({ fs, head: H(3), netPatchHash: 'p3', logMaxLines: 1 })).toThrow(/lock lost/);
     expect(stolen).toBe(true);
-    expect(readFileSync(log, 'utf8')).toBe(logBefore);
     expect(readFileSync(map, 'utf8')).toBe(mapBefore);
+    const m = readHeadIndex({ dir }).map['o/r#7'];
+    expect(m.history.p3).toBeUndefined();                          // the compacted log carries our row with its txn, and the marker retracts it
+    expect(m.history.p2).toBeDefined();                            // earlier records are intact
+    expect(m.lastReviewedHead).toBe(H(2));
   });
   it('rebuild from an uncompacted log honors keepPerPr: evicted history is not resurrected and the map equals the published one', () => {
     for (let i = 1; i <= 6; i++) rec({ head: H(i), netPatchHash: `p${i}`, at: `2026-11-04T10:00:0${i}Z`, keepPerPr: 3 });
@@ -481,8 +489,9 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     writeFileSync(headIndexPaths(dir).map, '{{');
     expect(readHeadIndex({ dir }).map['o/r#7'].history.p2).toBeUndefined();
   });
-  const contentHash = r => createHash('sha256').update(JSON.stringify([r.repo, r.pr, r.head, r.netPatchHash, r.verdict, r.at])).digest('hex');
-  it('a tombstone retracts a row that another holder already compacted (one copy per record, matched by content)', () => {
+  const marker = txn => writeFileSync(join(dir, `retract.${txn}`), '{}\n');   // what a rejected writer creates: its own file, never a write to the log
+  const logRows = () => readFileSync(headIndexPaths(dir).log, 'utf8').trim().split('\n').map(l => JSON.parse(l));
+  it('a retraction retracts a row that another holder already compacted (compaction keeps the row\'s txn)', () => {
     rec();
     const { lock } = headIndexPaths(dir);
     let appended = false, done = false;
@@ -497,23 +506,53 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
         return out; } };
     expect(() => rec({ fs, head: H(2), netPatchHash: 'p2', at: '2026-11-04T10:30:00Z' })).toThrow(/lock lost/);
     expect(done).toBe(true);
-    const rows = readFileSync(headIndexPaths(dir).log, 'utf8').trim().split('\n').map(l => JSON.parse(l)).filter(r => r.head === H(2));
+    const rows = logRows().filter(r => r.head === H(2));
     expect(rows).toHaveLength(1);                               // compaction emits the current record once, not twice
+    expect(typeof rows[0].txn).toBe('string');                  // and keeps the writer's transaction id
     const index = readHeadIndex({ dir });
     expect(index.map['o/r#7'].history.p2).toBeUndefined();
     expect(headReviewOwed({ index, repo: 'o/r', pr: 7, head: H(2), netPatchHash: 'p2' }).owed).toBe(true);
     expect(index.map['o/r#8']).toMatchObject({ lastReviewedHead: H(3) });
   });
-  it('a tombstone removes the writer\'s own row (by txn), not a later row with identical content', () => {
+  it('a retraction removes the writer\'s own row (by txn), not a later row with identical content', () => {
     const { log } = headIndexPaths(dir);
     nodeFs.mkdirSync(dir, { recursive: true });
     const base = { repo: 'o/r', pr: 7, head: H(2), netPatchHash: 'p2', verdict: 'accept', at: '2026-11-04T10:00:00Z' };
     const other = { repo: 'o/r', pr: 7, head: H(3), netPatchHash: 'p3', verdict: 'accept', at: '2026-11-04T10:00:01Z' };
-    const rows = [{ ...base, txn: 'a' }, { ...other, txn: 'c' }, { ...base, txn: 'b' }, { rollback: contentHash(base), txn: 'a' }];
-    writeFileSync(log, rows.map(r => `${JSON.stringify(r)}\n`).join(''));
+    writeFileSync(log, [{ ...base, txn: 'a' }, { ...other, txn: 'c' }, { ...base, txn: 'b' }].map(r => `${JSON.stringify(r)}\n`).join(''));
+    marker('a');
     const m = readHeadIndex({ dir, keepPerPr: 20 }).map['o/r#7'];
     expect(m.lastReviewedHead).toBe(H(2));                      // B's row (txn b) survives and is the latest; C's is not promoted
     expect(Object.keys(m.history).sort()).toEqual(['p2', 'p3']);
+    expect(m.txn).toBe('b');
+  });
+  it('compaction keeps each row\'s txn: a delayed retraction of one transaction never removes another writer\'s identical review', () => {
+    const { log } = headIndexPaths(dir);
+    nodeFs.mkdirSync(dir, { recursive: true });
+    const base = { repo: 'o/r', pr: 7, head: H(2), netPatchHash: 'p2', verdict: 'accept', at: '2026-11-04T10:00:00Z' };
+    writeFileSync(log, [{ ...base, txn: 'a' }, { ...base, txn: 'b' }].map(r => `${JSON.stringify(r)}\n`).join(''));
+    rec({ pr: 9, head: H(4), netPatchHash: 'p4', logMaxLines: 1 });     // compaction rewrites the log; A and B collapse to one row
+    const kept = logRows().find(r => r.pr === 7);
+    expect(kept).toMatchObject({ head: H(2), txn: 'b' });             // the row keeps the identity of the transaction it came from
+    marker('a');                                                       // A's rollback arrives after the compaction
+    expect(readHeadIndex({ dir }).map['o/r#7']).toMatchObject({ lastReviewedHead: H(2) }); // B's valid review survives
+    marker('b');
+    expect(readHeadIndex({ dir }).map['o/r#7']).toBeUndefined();       // B's own retraction still removes it
+  });
+  it('a retraction made after the compaction snapshot check is not lost to the log rename (it is a separate file)', () => {
+    const { log } = headIndexPaths(dir);
+    nodeFs.mkdirSync(dir, { recursive: true });
+    writeFileSync(log, `${JSON.stringify({ repo: 'o/r', pr: 8, head: H(3), netPatchHash: 'p9', verdict: 'accept', at: '2026-11-04T09:00:00Z', txn: 'x' })}\n`);
+    let done = false;
+    const fs = { ...nodeFs, renameSync: (a, b) => { // X's writer is rejected right now: after our snapshot check, just before the log is replaced
+      if (!done && b === log) { done = true; marker('x'); }
+      return nodeFs.renameSync(a, b); } };
+    rec({ fs, head: H(2), netPatchHash: 'p2', logMaxLines: 1 });
+    expect(done).toBe(true);
+    expect(logRows().some(r => r.txn === 'x')).toBe(true);        // the rename carried X's row over (it could not know about the marker)
+    expect(existsSync(join(dir, 'retract.x'))).toBe(true);        // and the marker is still there: only markers a compaction listed are deleted
+    expect(readHeadIndex({ dir }).map['o/r#8']).toBeUndefined();
+    expect(JSON.parse(readFileSync(headIndexPaths(dir).map, 'utf8')).map['o/r#8']).toBeUndefined();
   });
   it('compaction preserves a retraction arriving before its own append (compaction is derived from the log snapshot, not the earlier read)', () => {
     const { log } = headIndexPaths(dir);
@@ -524,11 +563,13 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     const fs = { ...nodeFs,
       openSync: (p, f) => { if (f === 'a') appended = true; return nodeFs.openSync(p, f); },
       readFileSync: (p, ...a) => { const out = nodeFs.readFileSync(p, ...a);
-        if (!appended && !done && p === log) { done = true; nodeFs.appendFileSync(log, `${JSON.stringify({ rollback: contentHash(x), txn: 'x' })}\n`); } // X's writer retracts it after our read of the index
+        if (!appended && !done && p === log) { done = true; marker('x'); } // X's writer retracts it after our read of the index
         return out; } };
-    rec({ fs, head: H(2), netPatchHash: 'p2', logMaxLines: 2 });  // 4 rows > 2: compacts
+    rec({ fs, head: H(2), netPatchHash: 'p2', logMaxLines: 2 });  // 3 rows > 2: compacts
     expect(done).toBe(true);
     expect(readHeadIndex({ dir }).map['o/r#8']).toBeUndefined();   // the compacted log did not restore the retracted review
+    expect(logRows().some(r => r.txn === 'x')).toBe(false);        // it was folded into the rewrite
+    expect(existsSync(join(dir, 'retract.x'))).toBe(false);        // and its marker removed
     nodeFs.rmSync(headIndexPaths(dir).map, { force: true });
     expect(readHeadIndex({ dir }).map['o/r#8']).toBeUndefined();   // nor does a rebuild from the compacted log
     expect(readHeadIndex({ dir }).map['o/r#7'].lastReviewedHead).toBe(H(2));
@@ -543,37 +584,28 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     expect(() => rec({ fs: failing, head: H(2), netPatchHash: 'p2' })).toThrow(/EIO/);
     fail = false;
     expect(readHeadIndex({ dir }).map['o/r#7'].history.p2).toBeUndefined(); // the written-but-unflushed row is not visible
-    const sizeBefore = nodeFs.statSync(log).size;
     let appended = false;
     const lost = { ...nodeFs,
       openSync: (p, f) => { if (f === 'a' && p === log) appended = true; return nodeFs.openSync(p, f); },
-      readFileSync: (p, ...a) => { const out = nodeFs.readFileSync(p, ...a); return appended && p === log && !a.length ? out.subarray(0, sizeBefore) : out; } };
+      readFileSync: (p, ...a) => { const out = nodeFs.readFileSync(p, ...a); return appended && p === log && !a.length ? out.subarray(0, 1) : out; } };
     expect(() => rec({ fs: lost, head: H(3), netPatchHash: 'p3' })).toThrow(/appended row missing/);
     expect(readHeadIndex({ dir }).map['o/r#7'].history.p3).toBeUndefined();
   });
-  it('a tombstone naming an unknown txn never removes a different transaction that still carries its own txn', () => {
-    const { log } = headIndexPaths(dir);
-    nodeFs.mkdirSync(dir, { recursive: true });
-    const base = { repo: 'o/r', pr: 7, head: H(2), netPatchHash: 'p2', verdict: 'accept', at: '2026-11-04T10:00:00Z' };
-    writeFileSync(log, [{ ...base, txn: 'b' }, { rollback: contentHash(base), txn: 'a' }].map(r => `${JSON.stringify(r)}\n`).join(''));
-    expect(readHeadIndex({ dir, keepPerPr: 20 }).map['o/r#7']).toMatchObject({ lastReviewedHead: H(2) }); // B's valid review survives A's delayed tombstone
-    writeFileSync(log, [{ ...base }, { rollback: contentHash(base), txn: 'a' }].map(r => `${JSON.stringify(r)}\n`).join(''));
-    expect(readHeadIndex({ dir, keepPerPr: 20 }).map['o/r#7']).toBeUndefined(); // a compacted (txn-less) copy is still retracted by content
-  });
-  it('a late tombstone after the writer read the log never survives in the published map (map and logHash come from the same bytes)', () => {
-    const first = { repo: 'o/r', pr: 7, head: H(1), netPatchHash: 'p1', verdict: 'accept', at: '2026-11-04T10:00:00Z' };
+  it('a retraction made after the map was published is not served from the cache: readers rebuild', () => {
     rec();
-    const { log } = headIndexPaths(dir);
-    let appended = false, done = false;
+    const first = logRows()[0];
+    let appended = false, reads = 0, done = false;
+    const log = headIndexPaths(dir).log;
     const fs = { ...nodeFs,
       openSync: (p, f) => { if (f === 'a') appended = true; return nodeFs.openSync(p, f); },
       readFileSync: (p, ...a) => { const out = nodeFs.readFileSync(p, ...a);
-        if (appended && !done && p === log) { done = true; nodeFs.appendFileSync(log, `${JSON.stringify({ rollback: contentHash(first) })}\n`); } // a retraction lands after our read of the log
+        if (appended && p === log && !a.length && ++reads === 2 && !done) { done = true; marker(first.txn); } // after our final listing, before the map is written
         return out; } };
     rec({ fs, pr: 9, head: H(4), netPatchHash: 'p4' });
     expect(done).toBe(true);
-    expect(readHeadIndex({ dir }).map['o/r#7']).toBeUndefined(); // the cache is not trusted past the retraction
-    expect(JSON.parse(readFileSync(headIndexPaths(dir).map, 'utf8')).map['o/r#7']).toBeUndefined(); // and the published map already reflects it
+    const index = readHeadIndex({ dir });
+    expect(index.rebuilt).toBe(true);                             // the published map's state hash no longer matches
+    expect(index.map['o/r#7']).toBeUndefined();
   });
   it('a refused compaction (log changed under the lock) retracts the writer\'s own row before throwing', () => {
     rec();
@@ -582,13 +614,34 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     const fs = { ...nodeFs,
       openSync: (p, f) => { if (f === 'a') appended = true; return nodeFs.openSync(p, f); },
       readFileSync: (p, ...a) => { const out = nodeFs.readFileSync(p, ...a);
-        if (appended && !done && p === log) { done = true; nodeFs.appendFileSync(log, `${JSON.stringify({ rollback: 'unrelated' })}\n`); } // a foreign append after our row
+        if (appended && !done && p === log) { done = true; nodeFs.appendFileSync(log, `${JSON.stringify({ repo: 'o/r', pr: 9, head: H(5), netPatchHash: 'p5', verdict: 'accept', at: '2026-11-04T12:00:00Z' })}\n`); } // a foreign append after our row
         return out; } };
     expect(() => rec({ fs, head: H(2), netPatchHash: 'p2', logMaxLines: 1 })).toThrow(/log changed under the lock/);
     const index = readHeadIndex({ dir });
     expect(index.ok).toBe(true);
     expect(index.map['o/r#7'].history.p2).toBeUndefined();
     expect(index.map['o/r#7'].lastReviewedHead).toBe(H(1));
+    expect(index.map['o/r#9']).toMatchObject({ lastReviewedHead: H(5) }); // the foreign record is untouched
+  });
+  it('pr must be a positive integer: null, empty, zero, boolean and non-numeric values are rejected on write and fail closed on replay', () => {
+    for (const pr of [null, undefined, '', 0, -3, true, 'x', '7.5', 1.5]) expect(() => rec({ pr })).toThrow(/invalid record/);
+    expect(existsSync(headIndexPaths(dir).log)).toBe(false);
+    expect(rec({ pr: '12' })).toMatchObject({ ok: true });         // a decimal string is still accepted and stored as the number
+    expect(readHeadIndex({ dir }).map['o/r#12']).toBeDefined();
+    for (const pr of [null, '7', true]) {                           // a corrupt log row is never coerced into a PR number
+      writeFileSync(headIndexPaths(dir).log, `${JSON.stringify({ repo: 'o/r', pr, head: H(1), netPatchHash: 'p1', verdict: 'accept', at: '2026-11-04T10:00:00Z' })}\n`);
+      writeFileSync(headIndexPaths(dir).map, '{{');
+      expect(readHeadIndex({ dir })).toMatchObject({ ok: false, reason: 'index-unreadable' });
+    }
+  });
+  it('headReviewOwed fails closed on a missing or malformed head', () => {
+    rec();
+    const index = readHeadIndex({ dir });
+    for (const head of [undefined, null, '', 'abc', 'A'.repeat(40), `${H(1)}0`]) {
+      expect(headReviewOwed({ index, repo: 'o/r', pr: 7, head, netPatchHash: 'p1' })).toEqual({ owed: null, held: true, reason: 'head-unreadable' });
+    }
+    expect(headReviewOwed({ index, repo: 'o/r', pr: 7, head: H(1), netPatchHash: 'p1', seed: { lastReviewedHead: 'not-a-sha', verdict: 'marker' } }).owed).toBe(false); // a recorded PR ignores the seed
+    expect(headReviewOwed({ index: readHeadIndex({ dir: join(dir, 'none') }), repo: 'o/r', pr: 99, head: H(1), seed: { lastReviewedHead: 'not-a-sha', verdict: 'marker' } })).toMatchObject({ owed: true, reason: 'no-record' });
   });
   it('a main-lock file with parseable JSON but no integer pid is stale by age, like the takeover file', () => {
     const { lock } = headIndexPaths(dir);

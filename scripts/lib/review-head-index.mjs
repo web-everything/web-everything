@@ -59,8 +59,10 @@ export function netPatchKey({ exec, cwd, sha, mainRef = 'origin/main' } = {}) {
 
 const NOKEY = 'head:';
 const prKey = (repo, pr) => `${repo}#${Number(pr)}`;
-const validRecord = r => r && typeof r.repo === 'string' && r.repo && Number.isSafeInteger(Number(r.pr)) && SHA.test(r.head ?? '')
-  && typeof r.verdict === 'string' && r.verdict && Number.isFinite(Date.parse(r.at));
+const TXN = /^[\w-]{1,64}$/;
+// pr must already BE a positive safe integer: Number() coercion would accept null, '', true and '7' as PR numbers.
+const validRecord = r => r && typeof r.repo === 'string' && r.repo && Number.isSafeInteger(r.pr) && r.pr > 0 && SHA.test(r.head ?? '')
+  && typeof r.verdict === 'string' && r.verdict && Number.isFinite(Date.parse(r.at)) && (r.txn === undefined || (typeof r.txn === 'string' && TXN.test(r.txn)));
 
 /** PURE: fold one record into the map and keep only the latest `keepPerPr` history entries for that PR. */
 export function applyRecord(map, rec, keepPerPr) {
@@ -68,9 +70,11 @@ export function applyRecord(map, rec, keepPerPr) {
   const prev = map[key] ?? { history: {} };
   const history = { ...prev.history };
   // A review without a net-patch key is kept under a head-scoped key so compaction never drops it; it can never be carried.
-  history[rec.netPatchHash ?? `${NOKEY}${rec.head}`] = { head: rec.head, verdict: rec.verdict, at: rec.at };
+  // The writer's txn rides along with every kept entry, so compaction can write it back and a retraction still finds its row.
+  const txn = rec.txn === undefined ? {} : { txn: rec.txn };
+  history[rec.netPatchHash ?? `${NOKEY}${rec.head}`] = { head: rec.head, verdict: rec.verdict, at: rec.at, ...txn };
   const kept = Object.entries(history).sort((a, b) => Date.parse(b[1].at) - Date.parse(a[1].at) || (a[0] < b[0] ? -1 : 1)).slice(0, keepPerPr);
-  map[key] = { lastReviewedHead: rec.head, netPatchHash: rec.netPatchHash ?? null, verdict: rec.verdict, at: rec.at, history: Object.fromEntries(kept) };
+  map[key] = { lastReviewedHead: rec.head, netPatchHash: rec.netPatchHash ?? null, verdict: rec.verdict, at: rec.at, ...txn, history: Object.fromEntries(kept) };
   return map;
 }
 
@@ -79,31 +83,27 @@ const validEntry = e => e && SHA.test(e.lastReviewedHead ?? '') && typeof e.verd
 const validMap = m => m && typeof m === 'object' && Object.values(m).every(validEntry);
 // Replay applies the SAME keepPerPr the writer used, so a rebuilt map equals the published one: evicted history is not
 // resurrected, and a compacted log (older rows then the PR's current record last, keyed or keyless) replays to the same map.
-// A rejected writer (it lost the lock after appending) cannot rewrite the log: a live holder may be appending to it. It appends a
-// tombstone naming its row by content hash instead; replay drops the last matching row written BEFORE the tombstone. A tombstone
-// is `{rollback: <content hash>, txn?: <writer's transaction id>}`. A row is matched by its txn when it still carries one, else
-// (compaction rewrites rows without a txn) by content hash. Both go through contentHash, the single normalisation of a row.
+// A rejected writer (it lost the lock after appending) never writes to the log again: a live holder may be appending to it or
+// replacing it by rename, which would swallow the write. It creates a marker file `retract.<txn>` (O_EXCL, a name of its own, so
+// no rewrite of the log can lose it) naming its row by the txn every row carries and compaction preserves. Replay drops every row
+// whose txn has a marker. Markers are removed only by the compaction that folded them in.
 const hashText = text => createHash('sha256').update(text).digest('hex');
-const contentHash = r => hashText(JSON.stringify([r.repo, Number(r.pr), r.head, r.netPatchHash ?? null, r.verdict, r.at]));
-const parseLog = (text, keepPerPr) => {
+const RETRACT = /^retract\.([\w-]{1,64})$/;
+const retractPath = (dir, txn) => join(dir, `retract.${txn}`);
+/** Retraction markers present now, sorted. Always listed BEFORE the log is read (see readHeadIndex). ENOENT means no directory yet. */
+const listRetractions = (fs, dir) => { try { return fs.readdirSync(dir).map(n => RETRACT.exec(n)?.[1]).filter(Boolean).sort(); } catch (e) { if (e?.code === 'ENOENT') return []; throw e; } };
+/** The cache key: the raw log bytes plus the set of markers, so a marker that appears after the map was published invalidates it. */
+const stateHash = (raw, retractions) => (retractions.length ? hashText(Buffer.concat([raw, Buffer.from(`\0retract:${retractions.join(',')}`)])) : hashText(raw));
+const parseLog = (text, keepPerPr, retractions = []) => {
   const lines = text.split('\n').filter(l => l.trim());
-  const kept = []; // [{ hash, rec }] in log order, after tombstones
+  const gone = new Set(retractions);
+  const map = {};
   for (const l of lines) {
     const rec = JSON.parse(l);
-    if (rec && typeof rec === 'object' && typeof rec.rollback === 'string' && Object.keys(rec).every(k => k === 'rollback' || k === 'txn')) {
-      // A tombstone naming a txn that is not in the log means that row was compacted (rewritten without a txn): fall back to
-      // content, but only over rows that carry no txn, so another transaction's row with identical content is never taken.
-      const named = typeof rec.txn === 'string';
-      let at = named ? kept.findLastIndex(k => k.rec.txn === rec.txn) : -1;
-      if (at < 0) at = kept.findLastIndex(k => k.hash === rec.rollback && (!named || typeof k.rec.txn !== 'string'));
-      if (at >= 0) kept.splice(at, 1);
-      continue;
-    }
     if (!validRecord(rec)) throw Error('invalid log record');
-    kept.push({ hash: contentHash(rec), rec });
+    if (typeof rec.txn === 'string' && gone.has(rec.txn)) continue; // retracted by its writer
+    applyRecord(map, rec, keepPerPr);
   }
-  const map = {};
-  for (const { rec } of kept) applyRecord(map, rec, keepPerPr);
   return { map, lines: lines.length };
 };
 /** keepPerPr for a rebuild: explicit option, else the value the last published map recorded, else the resolved setting (`.value`). */
@@ -127,11 +127,14 @@ export function readHeadIndex({ dir = defaultHeadIndexDir(), fs = nodeFs, keepPe
       return { ok: false, reason: 'index-unreadable' }; // a map with no log is not a state we write
     }
     // An unreadable log throws here and fails closed. The cache is trusted only when the log's content hash matches.
+    // Markers are listed BEFORE the log is read: a compaction renames the new log into place and only then deletes the markers it
+    // folded, so a marker missing from this listing was already folded into the log we read next.
+    const retractions = listRetractions(fs, dir);
     const raw = fs.readFileSync(log); // the cache key is the digest of the RAW bytes: a UTF-8 decode would alias distinct corrupt logs
     const text = raw.toString('utf8');
-    const logHash = hashText(raw);
+    const logHash = stateHash(raw, retractions);
     if (stored && stored.map && typeof stored.map === 'object' && stored.version === MAP_VERSION && stored.logHash === logHash && validMap(stored.map)) return { ok: true, map: stored.map };
-    return { ok: true, map: parseLog(text, rebuildKeep(keepPerPr, stored, settingsFile)).map, rebuilt: true };
+    return { ok: true, map: parseLog(text, rebuildKeep(keepPerPr, stored, settingsFile), retractions).map, rebuilt: true };
   } catch { return { ok: false, reason: 'index-unreadable' }; }
 }
 // Only ENOENT means absent; any other stat failure (EACCES, EIO, ...) throws so the caller fails closed instead of reading an empty index.
@@ -223,7 +226,8 @@ export function withHeadIndexLock(dir, fn, { fs = nodeFs, staleMs = LOCK_STALE_M
  */
 export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netPatchHash = null, verdict, at = new Date().toISOString(),
   keepPerPr = HEAD_INDEX_STANDARD.keepPerPr, logMaxLines = HEAD_INDEX_STANDARD.logMaxLines, fs = nodeFs } = {}) {
-  const rec = { repo, pr: Number(pr), head, netPatchHash, verdict, at };
+  // A PR number is a number or a plain decimal string. Number() alone would turn null, '' and true into 0 or 1.
+  const rec = { repo, pr: typeof pr === 'string' && /^[1-9]\d*$/.test(pr) ? Number(pr) : pr, head, netPatchHash, verdict, at };
   if (!validRecord(rec)) throw Error(`review-head-index: invalid record (repo/pr/head/verdict/at): head=${String(head).slice(0, 12)} verdict=${String(verdict)}`);
   if (!posInt(keepPerPr) || !posInt(logMaxLines)) throw Error('review-head-index: invalid keepPerPr/logMaxLines');
   fs.mkdirSync(dir, { recursive: true });
@@ -232,65 +236,57 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
     const current = readHeadIndex({ dir, fs, keepPerPr });
     if (!current.ok) throw Error('review-head-index: existing index unreadable; refusing to write');
     fence();
-    const txn = randomUUID();                                   // names OUR row in a tombstone, even if another row has identical content
+    const txn = randomUUID();                                   // names OUR row for its whole life, through compaction
     const line = `${JSON.stringify({ ...rec, txn })}\n`;
-    const sizeBefore = size(fs, log);                           // null: the log did not exist yet
-    // Once our line is in the log, a lost lock means our transaction was rejected, so the line must not stay visible. Every fence
-    // after the append rolls it back before throwing. If the log still has exactly the shape we left, the line is physically
-    // removed (truncate / restore). If another holder wrote after us, we cannot rewrite the log (they may be appending to it),
-    // so we append a tombstone naming our row; replay then drops it, whatever else was appended around it.
+    // Once our line is in the log, a lost lock (or any failure before the map publish) means our transaction was rejected, so the
+    // row must not stay visible. We never touch the log again to say so (a live holder may be appending to it or renaming a new
+    // one over it, which would swallow our write): we create the marker file `retract.<txn>`, which replay applies to our row.
     const lineBytes = Buffer.from(line);
-    const tombstone = `${JSON.stringify({ rollback: contentHash(rec), txn })}\n`;
-    let before = null, compacted = null, retracted = false, publishing = false; // before: the log bytes we replaced when compacting; compacted: the bytes we wrote
+    let retracted = false, publishing = false;
     const rollback = () => {
-      if (retracted) return;                                    // idempotent: a second retraction would tombstone a row that is already gone
+      if (retracted) return;                                    // idempotent
       retracted = true;
-      try {
-        if (compacted === null) {
-          if (size(fs, log) === (sizeBefore ?? 0) + lineBytes.length) { if (sizeBefore === null) fs.unlinkSync(log); else fs.truncateSync(log, sizeBefore); return; }
-        } else if (fs.readFileSync(log).equals(compacted)) {
-          atomicWrite(fs, log, `${log}.tmp`, before.subarray(0, before.length - lineBytes.length));
-          return;
-        }
-        durable(fs, log, 'a', tombstone);                       // the log moved on: retract our row without touching theirs
-      } catch { /* best effort: the fence error below is what the caller sees */ }
+      try { durable(fs, retractPath(dir, txn), 'wx', `${JSON.stringify({ txn })}\n`); } catch { /* best effort: the error below is what the caller sees */ }
     };
     const fenced = () => { try { fence(); } catch (e) { rollback(); throw e; } };
     try {
     durable(fs, log, 'a', line);                                // 1. durable log line (fsynced); a failed fsync after the write retracts it too
     fenced();                                                   //    lock lost during the append: roll the line back, no publish
-    // 2. Everything below is derived from ONE snapshot of the log taken after our append, not from `current.map` (read before it):
-    // a retraction another writer appended in between is applied by the replay, so compaction cannot restore a retracted review.
+    // 2. Everything below is derived from ONE snapshot of the log taken after our append (markers listed first, as readers do), not
+    // from `current.map` (read before it): a retraction made in between is applied by the replay.
+    const folded = listRetractions(fs, dir);
     const snapshot = fs.readFileSync(log);
     if (!snapshot.includes(lineBytes)) throw Error('review-head-index: appended row missing from the log; refusing to publish'); // never report ok for a lost append
-    const parsed = parseLog(snapshot.toString('utf8'), keepPerPr);
+    const parsed = parseLog(snapshot.toString('utf8'), keepPerPr, folded);
     const map = parsed.map;
     let lines = parsed.lines;
     if (lines > logMaxLines) { // 3. bound growth: rewrite the log from the compacted map, atomically, then the map
       const compact = Object.entries(map).flatMap(([k, v]) => {
         const [r, p] = [k.slice(0, k.lastIndexOf('#')), Number(k.slice(k.lastIndexOf('#') + 1))];
-        const row = (hash, h) => ({ repo: r, pr: p, head: h.head, netPatchHash: hash.startsWith(NOKEY) ? null : hash, verdict: h.verdict, at: h.at });
+        const tx = h => (h.txn === undefined ? {} : { txn: h.txn }); // every row keeps its writer's txn, so a later retraction still finds it
+        const row = (hash, h) => ({ repo: r, pr: p, head: h.head, netPatchHash: hash.startsWith(NOKEY) ? null : hash, verdict: h.verdict, at: h.at, ...tx(h) });
         const cur = v.netPatchHash ?? `${NOKEY}${v.lastReviewedHead}`; // the current record's own history entry is emitted once, as the LAST row
         const older = Object.entries(v.history).filter(([hash]) => hash !== cur).sort((a, b) => Date.parse(a[1].at) - Date.parse(b[1].at)).map(([hash, h]) => row(hash, h));
         // The PR's current record goes LAST so a rebuild restores lastReviewedHead and its verdict exactly.
-        return [...older, { repo: r, pr: p, head: v.lastReviewedHead, netPatchHash: v.netPatchHash, verdict: v.verdict, at: v.at }];
+        return [...older, { repo: r, pr: p, head: v.lastReviewedHead, netPatchHash: v.netPatchHash, verdict: v.verdict, at: v.at, ...tx(v) }];
       });
       const text = compact.map(c => `${JSON.stringify(c)}\n`).join('');
-      before = snapshot;
-      if (!before.subarray(Math.max(0, before.length - lineBytes.length)).equals(lineBytes)) { rollback(); throw Error('review-head-index: log changed under the lock; refusing to compact'); }
+      if (!snapshot.subarray(Math.max(0, snapshot.length - lineBytes.length)).equals(lineBytes)) { rollback(); throw Error('review-head-index: log changed under the lock; refusing to compact'); }
       fenced();
-      // The rewrite replaces the file, so it must replace exactly the bytes the compaction was derived from.
+      // The rewrite replaces the file, so it must replace exactly the bytes the compaction was derived from. A rejected writer's
+      // retraction is a separate marker file, so nothing it does can be lost to this rename.
       if (!fs.readFileSync(log).equals(snapshot)) { rollback(); throw Error('review-head-index: log changed under the lock; refusing to compact'); }
       atomicWrite(fs, log, `${log}.tmp`, text);
-      compacted = Buffer.from(text);
-      fenced();                                                 // lock lost during the rewrite: put the replaced log back
+      fenced();                                                 // lock lost during the rewrite: the compacted log replays to the same map, so it stays; our row is retracted
+      for (const t of folded) { try { fs.unlinkSync(retractPath(dir, t)); } catch { /* gone */ } } // folded into the log we just wrote; later markers are not in `folded` and stay
       lines = compact.length;
     }
     fenced();
-    // The map and its logHash come from the SAME bytes: a late append by a rejected writer (its row or its tombstone) can land
-    // after this read, but then the hash no longer matches the log and readers rebuild.
+    // The map and its hash come from the SAME markers and bytes: a marker made after this listing changes the state hash, so
+    // readers rebuild instead of trusting this map.
+    const live = listRetractions(fs, dir);
     const raw = fs.readFileSync(log);
-    const published = JSON.stringify({ version: MAP_VERSION, logHash: hashText(raw), keepPerPr, map: parseLog(raw.toString('utf8'), keepPerPr).map });
+    const published = JSON.stringify({ version: MAP_VERSION, logHash: stateHash(raw, live), keepPerPr, map: parseLog(raw.toString('utf8'), keepPerPr, live).map });
     publishing = true;
     atomicWrite(fs, mapPath, tmp, published);
     return { ok: true, lines };
