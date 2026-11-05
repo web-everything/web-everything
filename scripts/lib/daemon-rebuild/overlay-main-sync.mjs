@@ -116,9 +116,9 @@ function readSyncState(file, io = fs) {
 }
 function validateSyncState(data) {
   if (!data || !Object.hasOwn(data, 'lastSyncedMain')) throw new Error('invalid main-sync state; operator repair required');
-  for (const key of ['lastSyncedMain', 'attemptedMain', 'shadowMain', 'pushRetryMain', 'pushRetryAfter', 'errorAt', 'firstFailureAt', 'failureAlertedAt', 'failureReason', 'staleRef', 'staleRegistration', 'conflictMain', 'conflictTip', 'mainRedMain', 'mainRedTip', ...retryKeys]) {
+  for (const key of ['lastSyncedMain', 'attemptedMain', 'shadowMain', 'pushRetryMain', 'pushRetryAfter', 'errorAt', 'firstFailureAt', 'failureAlertedAt', 'failureReason', 'staleRef', 'staleRegistration', 'conflictMain', 'conflictTip', 'mainRedMain', 'mainRedTip', 'mainRedAt', ...retryKeys]) {
     if (!Object.hasOwn(data, key)) data[key] = {};
-    const map = data[key], timestamp = ['pushRetryAfter', 'errorAt', 'retryAfter', 'retryTries', 'firstFailureAt', 'failureAlertedAt', 'staleRef'].includes(key);
+    const map = data[key], timestamp = ['pushRetryAfter', 'errorAt', 'retryAfter', 'retryTries', 'firstFailureAt', 'failureAlertedAt', 'staleRef', 'mainRedAt'].includes(key);
     const invalid = value => {
       if (key === 'failureReason') return typeof value !== 'string';
       if (key === 'staleRegistration') return typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value);
@@ -139,7 +139,7 @@ function validateSyncState(data) {
   if ([...pairRefs].some(ref => !Object.hasOwn(data.conflictMain, ref) || !Object.hasOwn(data.conflictTip, ref))) {
     throw new Error('incomplete conflict pair state; operator repair required');
   }
-  const redRefs = new Set([...Object.keys(data.mainRedMain), ...Object.keys(data.mainRedTip)]);
+  const redRefs = new Set([...Object.keys(data.mainRedMain), ...Object.keys(data.mainRedTip), ...Object.keys(data.mainRedAt)]);
   if ([...redRefs].some(ref => !Object.hasOwn(data.mainRedMain, ref) || !Object.hasOwn(data.mainRedTip, ref))) {
     throw new Error('incomplete main-red pair state; operator repair required');
   }
@@ -277,6 +277,25 @@ export function resolveOverlayFlakeReruns(env = process.env, { settingsPath = SE
     valid: { flakeReruns: n => Number.isSafeInteger(n) && n >= 0 && n <= 2 } });
   return { value: r.value.flakeReruns, source: r.sources.flakeReruns };
 }
+export function resolveOverlayMainRedExpiryHours(env = process.env, { settingsPath = SETTINGS } = {}) {
+  let tool;
+  try { tool = JSON.parse(fs.readFileSync(settingsPath, 'utf8')).overlay?.mainSync; } catch { /* standard */ }
+  const raw = env.WE_DAEMON_OVERLAY_MAIN_SYNC_MAIN_RED_EXPIRY_HOURS;
+  const r = cascadePolicy('overlay.mainSync', tool, { env,
+    platform: platformPreference('overlay', { env })?.mainSync ?? {},
+    standard: { mainRedExpiryHours: 6 },
+    envValues: { mainRedExpiryHours: typeof raw === 'string' && raw.trim() ? Number(raw) : undefined },
+    valid: { mainRedExpiryHours: n => typeof n === 'number' && Number.isFinite(n)
+      && n >= 0 && n <= Number.MAX_SAFE_INTEGER / 3_600_000 } });
+  return { value: r.value.mainRedExpiryHours, source: r.sources.mainRedExpiryHours };
+}
+function mainRedKnown(state, ref, main, tip, env, now = () => new Date().toISOString()) {
+  if (state.mainRedMain[ref] !== main || state.mainRedTip[ref] !== tip
+    || !Object.hasOwn(state.mainRedAt, ref)) return false;
+  const age = new Date(now()).getTime() - state.mainRedAt[ref];
+  const { value: hours } = resolveOverlayMainRedExpiryHours(env);
+  return age >= 0 && age < hours * 3_600_000;
+}
 export function selectSyncTargets(state) {
   if (state?.corrupt || !Array.isArray(state?.overlays)) throw new Error('overlay state unavailable; operator repair required');
   return state.overlays.filter(o => !state.overlays.some(other => other !== o && other.stackBases?.includes(o.ref))).map(o => o.ref);
@@ -321,7 +340,7 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
       const main = sha(run(['rev-parse', 'origin/main']));
       if (synced.retryMain[ref] === main && Date.now() < synced.retryAfter[ref]) { skip('cooldown'); continue; }
       const tip = sha(run(['rev-parse', `origin/${ref}`]));
-      if (synced.mainRedMain[ref] === main && synced.mainRedTip[ref] === tip) { skip('main-red-known'); continue; }
+      if (mainRedKnown(synced, ref, main, tip, env, deps.now)) { skip('main-red-known'); continue; }
       const pairKnown = synced.conflictMain[ref] === main && synced.conflictTip[ref] === tip;
       // A known conflicting (main, tip) pair is final: silent skip (its one conflict event was already emitted).
       if (pairKnown) {
@@ -581,7 +600,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     output(git(['checkout', '--force', '-b', ref, `origin/${ref}`], scratch, [], { timeout: 300_000 }));
     const from = sha(git(['rev-parse', 'HEAD'], scratch));
     main = sha(git(['rev-parse', 'origin/main'], scratch));
-    if (synced.mainRedMain[ref] === main && synced.mainRedTip[ref] === from) return await skip('main-red-known');
+    if (mainRedKnown(synced, ref, main, from, env, now)) return await skip('main-red-known');
     if (synced.conflictMain[ref] === main && synced.conflictTip[ref] === from) return await skip('conflict-known');
     const base = sha(git(['merge-base', main, from], scratch));
     const own = paths(git(['diff', '--name-only', '-z', base, from], scratch));
@@ -674,7 +693,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
       setStep('tests');
       if (mainRed) {
         updateSyncState(sidecar(root, env), state => {
-          state.mainRedMain[ref] = main; state.mainRedTip[ref] = from;
+          state.mainRedMain[ref] = main; state.mainRedTip[ref] = from; state.mainRedAt[ref] = new Date(now()).getTime();
           clearRetry(state, ref);
         }, io);
         event(root, { kind: 'overlay-main-red', ref, files: remaining }, { env });
@@ -715,7 +734,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
       state.lastSyncedMain[ref] = main;
       delete state.pushRetryAfter[ref]; delete state.pushRetryMain[ref];
       delete state.conflictMain[ref]; delete state.conflictTip[ref];
-      delete state.mainRedMain[ref]; delete state.mainRedTip[ref];
+      delete state.mainRedMain[ref]; delete state.mainRedTip[ref]; delete state.mainRedAt[ref];
     }, io);
     const diagnostic = failureMarker(root, env, ref);
     transaction(diagnostic, () => io.rmSync(diagnostic, { force: true }), io);

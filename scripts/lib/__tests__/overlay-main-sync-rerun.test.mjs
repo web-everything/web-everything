@@ -64,6 +64,7 @@ function fixture({ reruns } = {}) {
     WE_NEEDS_YOU_FEED: join(base, 'needs-you-events.jsonl'),
     WE_PLATFORM_PREFERENCES_FILE: join(base, 'missing'), WE_DAEMON_OVERLAY_MAIN_SYNC: 'on' };
   delete env.WE_DAEMON_OVERLAY_MAIN_SYNC_FLAKE_RERUNS;
+  delete env.WE_DAEMON_OVERLAY_MAIN_SYNC_MAIN_RED_EXPIRY_HOURS;
   if (reruns !== undefined) env.WE_DAEMON_OVERLAY_MAIN_SYNC_FLAKE_RERUNS = String(reruns);
   addOverlay(root, { ref, pr: 123 }, { env });
   // Make an accidental operator failure observable immediately rather than waiting two hours.
@@ -344,15 +345,19 @@ describe('main-red assertion identity and bookkeeping', () => {
 
   it.each(['main', 'tip'])('known main-red pair skips the second kick and reruns when %s moves', async moved => {
     const f = fixture(); runners(f, ['failed', 'failed'], 'failed');
+    const recordedAt = Date.now();
+    f.deps.now = () => new Date(recordedAt).toISOString();
     const spawnFn = vi.fn(() => ({ once: vi.fn(), unref: vi.fn() }));
     const kick = () => sync.kickOverlayMainSync({ root: f.root, env: f.env, mode: 'on',
       git: f.deps.git, spawnFn, deps: f.deps });
     expect(await job(f)).toMatchObject({ skipped: true, reason: 'main-red' });
     const saved = json(`${overlayFilePath(f.root, f.env)}.main-sync.state`);
+    expect(saved.mainRedAt[ref]).toBe(recordedAt);
     expect(saved.mainRedMain[ref]).toBe(f.mainSha);
     expect(saved.mainRedTip[ref]).toBe(ok(f.root, ['rev-parse', `origin/${ref}`]));
     expect(saved.attemptedMain[ref]).toBeUndefined();
     expect(saved.retryMain[ref]).toBeUndefined();
+    f.deps.now = () => new Date(recordedAt + 6 * 3_600_000 - 1).toISOString();
     expect(await job(f)).toMatchObject({ skipped: true, reason: 'main-red-known' });
     expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
     expect(kick()).toMatchObject({ started: [], skipped: [ref] });
@@ -369,6 +374,44 @@ describe('main-red assertion identity and bookkeeping', () => {
     noPublication(f);
   });
 
+  it.each(['expired', 'missing timestamp', 'future timestamp', 'zero expiry', 'configured expiry'])(
+    '%s main-red evidence is re-tested by the worker and admitted by the kick', async scenario => {
+      const f = fixture(); runners(f, ['failed', 'failed'], 'failed');
+      const recordedAt = Date.now();
+      f.deps.now = () => new Date(recordedAt).toISOString();
+      expect(await job(f)).toMatchObject({ skipped: true, reason: 'main-red' });
+      const file = `${overlayFilePath(f.root, f.env)}.main-sync.state`;
+      if (scenario === 'missing timestamp') {
+        // Old workers persisted only the SHA pair. Exercise both rollout copies.
+        for (const path of [file, file.replace(/\.state$/, '.json')]) {
+          const saved = json(path);
+          delete saved.mainRedAt;
+          fs.writeFileSync(path, JSON.stringify(saved));
+        }
+      } else if (scenario === 'expired') {
+        f.deps.now = () => new Date(recordedAt + 6 * 3_600_000).toISOString();
+      } else if (scenario === 'future timestamp') {
+        f.deps.now = () => new Date(recordedAt - 1).toISOString();
+      } else {
+        f.env.WE_DAEMON_OVERLAY_MAIN_SYNC_MAIN_RED_EXPIRY_HOURS = scenario === 'zero expiry' ? '0' : '2';
+        if (scenario === 'configured expiry') f.deps.now = () => new Date(recordedAt + 2 * 3_600_000).toISOString();
+      }
+      const spawnFn = vi.fn(() => ({ once: vi.fn(), unref: vi.fn() }));
+      expect(sync.kickOverlayMainSync({ root: f.root, env: f.env, mode: 'on',
+        git: f.deps.git, spawnFn, deps: f.deps })).toMatchObject({ started: [ref] });
+      expect(spawnFn).toHaveBeenCalledOnce();
+      // Run with the marker ownership passed to the detached worker.
+      runners(f, ['passed']);
+      expect(await sync.runOverlayMainSync({ root: f.root, ref, env: f.env,
+        token: spawnFn.mock.calls[0][1].find(arg => arg.startsWith('--token=')).slice('--token='.length),
+        deps: f.deps })).toMatchObject({ pushed: true });
+      expect(f.deps.testRunner).toHaveBeenCalledOnce();
+      const saved = json(file);
+      expect(saved.mainRedMain[ref]).toBeUndefined();
+      expect(saved.mainRedTip[ref]).toBeUndefined();
+      expect(saved.mainRedAt[ref]).toBeUndefined();
+    });
+
   it('compares the final persistent rerun assertions rather than the initial failure', async () => {
     const f = fixture(); runners(f, ['failed', 'failed'], 'failed');
     const runner = f.deps.testRunner;
@@ -384,6 +427,10 @@ describe('main-red assertion identity and bookkeeping', () => {
   it.each([
     { mainRedMain: { [ref]: 'a'.repeat(40) } },
     { mainRedTip: { [ref]: 'b'.repeat(40) } },
+    { mainRedAt: { [ref]: 1 } },
+    ...[-1, 'yesterday', null, 9007199254740992].map(value => ({
+      mainRedMain: { [ref]: 'a'.repeat(40) }, mainRedTip: { [ref]: 'b'.repeat(40) }, mainRedAt: { [ref]: value },
+    })),
     { mainRedMain: { [ref]: 'invalid' }, mainRedTip: { [ref]: 'b'.repeat(40) } },
   ])('incomplete or invalid persisted main-red evidence fails closed (%j)', async state => {
     const f = fixture(); runners(f, ['failed', 'failed'], 'failed');
@@ -445,5 +492,54 @@ describe('resolveOverlayFlakeReruns policy cascade', () => {
     expect(p.resolve({ WE_DAEMON_OVERLAY_MAIN_SYNC_FLAKE_RERUNS: '2', WE_POLICY_CASCADE_LOG: '1' }))
       .toEqual({ value: 2, source: 'env' });
     expect(log.mock.calls.flat().join('\n')).toMatch(/(?:flakeReruns|FlakeReruns).*2.*env/);
+  });
+});
+
+
+describe('resolveOverlayMainRedExpiryHours policy cascade', () => {
+  function policy() {
+    const base = temp(), settingsPath = join(base, 'settings.json');
+    const preferences = join(base, 'preferences.json');
+    const env = { WE_PLATFORM_PREFERENCES_FILE: preferences };
+    const resolve = (overrides = {}) => sync.resolveOverlayMainRedExpiryHours({ ...env, ...overrides }, { settingsPath });
+    return { settingsPath, preferences, resolve };
+  }
+
+  it('defaults to six hours with standard provenance', () => {
+    expect(policy().resolve()).toEqual({ value: 6, source: 'standard' });
+  });
+
+  it('resolves platform, tool and environment overrides with provenance', () => {
+    const p = policy();
+    fs.writeFileSync(p.preferences, JSON.stringify({ overlay: { mainSync: { mainRedExpiryHours: 12 } } }));
+    expect(p.resolve()).toEqual({ value: 12, source: 'platform' });
+    fs.writeFileSync(p.settingsPath, JSON.stringify({ overlay: { mainSync: { mainRedExpiryHours: 3 } } }));
+    expect(p.resolve()).toEqual({ value: 3, source: 'tool' });
+    expect(p.resolve({ WE_DAEMON_OVERLAY_MAIN_SYNC_MAIN_RED_EXPIRY_HOURS: '2' }))
+      .toEqual({ value: 2, source: 'env' });
+  });
+
+  it.each(['0', '0.5', '24'])('accepts environment override %s', value => {
+    expect(policy().resolve({ WE_DAEMON_OVERLAY_MAIN_SYNC_MAIN_RED_EXPIRY_HOURS: value }))
+      .toEqual({ value: Number(value), source: 'env' });
+  });
+
+  it.each(['', ' ', '-1', 'bogus', 'Infinity', 'NaN', '9007199254740992'])(
+    'invalid environment value %j falls back to six hours', value => {
+      expect(policy().resolve({ WE_DAEMON_OVERLAY_MAIN_SYNC_MAIN_RED_EXPIRY_HOURS: value }))
+        .toEqual({ value: 6, source: 'standard' });
+    });
+
+  it.each([-1, 'bogus', null, true, 9007199254740992])('invalid settings value %j falls back to six hours', value => {
+    const p = policy();
+    fs.writeFileSync(p.settingsPath, JSON.stringify({ overlay: { mainSync: { mainRedExpiryHours: value } } }));
+    expect(p.resolve()).toEqual({ value: 6, source: 'standard' });
+  });
+
+  it('logs the effective expiry setting and source', () => {
+    const p = policy(), log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(p.resolve({ WE_DAEMON_OVERLAY_MAIN_SYNC_MAIN_RED_EXPIRY_HOURS: '2', WE_POLICY_CASCADE_LOG: '1' }))
+      .toEqual({ value: 2, source: 'env' });
+    expect(log.mock.calls.flat().join('\n')).toMatch(/mainRedExpiryHours.*2.*env/);
   });
 });
