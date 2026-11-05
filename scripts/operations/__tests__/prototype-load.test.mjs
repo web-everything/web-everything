@@ -2092,6 +2092,16 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
         expect(carry(carried(), live({ at: '2026-08-01T00:00:00Z', findings: ['NOT WEAKENED'] }))).toEqual({ ok: true, record: carried() });
         expect(carry(carried(), live({ questionHash: 'd'.repeat(64), findings: ['NOT WEAKENED'] }))).toEqual({ ok: true, record: carried() });
       });
+      it('variant: an unusable WEAKENED on another base of the live head blocks a usable pass on a different base', () => {
+        const Y = 'f'.repeat(40);
+        const pass = old({ head: SHA, fingerprint: undefined, at: '2026-10-20T00:00:00Z' });
+        const bad = { findings: ['NOT WEAKENED'], at: '2026-10-21T12:00:00Z' };
+        expect(carry(pass, live({ base: Y, ...bad }))).toEqual({ ok: false, reason: 'weakened' });
+        expect(carry(pass, live({ base: Y, questionHash: QUESTION_HASH, ...bad }))).toEqual({ ok: false, reason: 'weakened' });
+        expect(carry(live({ base: Y, ...bad }), pass)).toEqual({ ok: false, reason: 'weakened' });
+        // a base with a usable decision is judged by findAudit alone: an unusable WEAKENED on the same base does not block
+        expect(carry(pass, live({ base: TREE, ...bad }))).toMatchObject({ ok: true });
+      });
       it('a prior-question NOT WEAKENED on the live head never blocks the carried pass', () => {
         expect(carry(carried(), live({ verdict: 'NOT WEAKENED', findings: ['WEAKENED'] }))).toEqual({ ok: true, record: carried() });
       });

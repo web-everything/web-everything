@@ -108,8 +108,12 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   // verdict on this head that findAudit may reject (contradictory findings), so the veto judges it by the same
   // acceptance rule, with the same defaults, and an expired or unknown hash stays ignored.
   const { priorQuestionHashes = resolvePriorQuestionHashes(), now = Date.now() } = auditOptions ?? {};
-  if (!own.length && list.some((r) => r?.head === sha && r.base !== sha && r.verdict === 'WEAKENED'
-    && isAcceptedQuestionHash(r.questionHash, { priorQuestionHashes, now, at: r.at }))) return { ok: false, reason: 'weakened' };
+  // The veto holds per BASE, not only when the live head has no decision at all (a usable pass on base X must not hide
+  // an unusable WEAKENED on base Y). A base with a usable decision is judged by findAudit alone, so a superseded record
+  // never blocks forever. A CARRIED head is deliberately not widened: "carry veto follows findAudit" (round 4) pins that
+  // an unusable record on a carried head never blocks the carry.
+  if (list.some((r) => r?.head === sha && r.base !== sha && r.verdict === 'WEAKENED'
+    && isAcceptedQuestionHash(r.questionHash, { priorQuestionHashes, now, at: r.at }) && !own.some((d) => d.base === r.base))) return { ok: false, reason: 'weakened' };
   const carriedWeak = carried.filter((d) => d.record.verdict === 'WEAKENED');
   if (carriedWeak.length) {
     const ownAt = Math.max(-Infinity, ...own.filter((d) => covered(d.base)).map((d) => Date.parse(d.record.at)));
