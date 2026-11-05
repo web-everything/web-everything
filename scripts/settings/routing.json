@@ -1,0 +1,9 @@
+{
+  "$comment": "Who writes code. routing.builder: claude | codex | auto. 'claude' sends the build kinds (prepare, takeover, design, fix, ci-heal) to Claude and drops the codex rungs from the repair chain; 'codex' is the pre-R477 behaviour; 'auto' uses claude once the newest Codex rate-limit reading is at or above autoClaudeAbovePercent (unknown reading goes to claude). codexReserveForAudit keeps Codex for audits and review seats only: it is never held by this setting. auditProvider names the canonical audit provider. Cascade: this file, then env WE_ROUTING_BUILDER. Shipped as claude per R477 (Codex quota ~90% used, resets ~02:30 ET 11-04); set codex to restore. Note: the fix-executor chain cascade is platform < repo < env, so a platform-file override cannot beat this repo file.",
+  "routing": {
+    "builder": "claude",
+    "auditProvider": "codex",
+    "codexReserveForAudit": true,
+    "autoClaudeAbovePercent": 70
+  }
+}

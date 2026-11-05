@@ -4,7 +4,8 @@ import { ROUTING_POLICY_PATH, trustedSnapshot } from './dispatch-routing-policy-
 import { validateRoutingPolicy, applyRoutingOverrides, DEFAULT_ROUTING_POLICY, resolveOperationRoute as resolvePureRoute, resolvePolicyModel as resolvePureModel, operationEffort } from './dispatch-routing-policy.mjs';
 import { readPlatformPreferences } from './policy-cascade.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
-import { decideDispatchRoute } from './dispatch-contracts.mjs';
+import { decideDispatchRoute, MARKER_KINDS } from './dispatch-contracts.mjs';
+import { BUILD_KINDS, effectiveBuilder } from './routing-settings.mjs';
 import { providerQuotaHold } from './provider-quota-hold.mjs';
 import { resolveRoutingOverrideRoute } from './dispatch-routing-override-route.mjs';
 function initialPolicy() {
@@ -60,6 +61,12 @@ export function resolvePolicyModel(provider, model, policy = readRoutingPolicy()
   return resolvePureModel(provider, model, policy);
 }
 export function resolveDispatchRoute(dispatch, options = {}) {
+  // Normalise the kind once and hand the same value to the router, so a padded or upper-cased kind can neither
+  // slip past the build-kind hold here nor be read as a different kind there.
+  if (typeof dispatch?.kind === 'string') {
+    const kind = dispatch.kind.trim().toLowerCase();
+    if (kind !== dispatch.kind) dispatch = { ...dispatch, kind };
+  }
   // Production callers already supply the unprojected scorecard snapshot. Derive holds before the
   // evidence router removes quota fields; neither a backend nor its checker may run while held.
   const rawRecords = Array.isArray(options.scorecards) ? options.scorecards : options.scorecards?.records;
@@ -69,7 +76,26 @@ export function resolveDispatchRoute(dispatch, options = {}) {
     const hold = providerQuotaHold(records, provider, options.now ?? Date.now());
     if (hold) availability[provider] = hold;
   }
-  return decideDispatchRoute(dispatch, { ...options, availability, routingPolicy: options.routingPolicy ?? readRoutingPolicy() });
+  // routing.builder=claude: Codex is held for build kinds only; audit and review seats still use it.
+  // Resolve the builder once, so an `auto` quota reading cannot change between the refusal and the hold.
+  const builder = BUILD_KINDS.includes(dispatch?.kind) ? effectiveBuilder() : null;
+  const claudeBuilds = builder?.builder === 'claude';
+  // Only the marker kinds read deliveryAgent (dispatch-contracts ignores it elsewhere), so only they count as explicit.
+  const explicitCodex = MARKER_KINDS.includes(dispatch?.kind) && String(dispatch?.deliveryAgent ?? '').trim().toLowerCase() === 'codex';
+  if (claudeBuilds && explicitCodex && builder.settings.codexReserveForAudit) {
+    return { outcome: 'refused', refusal: 'deliveryAgent=codex refused: routing.builder=claude and codexReserveForAudit is true (Codex quota is reserved for audits); set codexReserveForAudit=false or routing.builder=codex to honour it', auditTrail: [] };
+  }
+  // With the reserve off, an explicit deliveryAgent=codex is honoured (the refusal above promises this); every other build stays held.
+  if (claudeBuilds && !explicitCodex && !availability.codex) {
+    availability.codex = 'routing.builder=claude: Codex is reserved for audit';
+  }
+  // builder=claude asks for Claude, so a ci-heal whose probation roster is all held runs on native Claude instead of
+  // being refused — unless native Claude is held too (from the caller or from a quota scorecard).
+  const ciHealNativeHold = dispatch?.kind === 'ci-heal'
+    ? (availability.claude || options.ciHealAvailability?.claude || providerQuotaHold(records, 'claude', options.now ?? Date.now()) || null)
+    : null;
+  const ciHealNativeFallback = claudeBuilds && dispatch?.kind === 'ci-heal' && !ciHealNativeHold;
+  return decideDispatchRoute(dispatch, { ...options, availability, ciHealNativeFallback, routingPolicy: options.routingPolicy ?? readRoutingPolicy() });
 }
 export function routingPolicyEnv() {
   return { WE_DISPATCH_ROUTING_SNAPSHOT: JSON.stringify(readRoutingPolicy()) };
