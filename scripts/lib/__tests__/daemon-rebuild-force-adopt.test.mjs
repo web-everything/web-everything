@@ -488,7 +488,7 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     await tick(cloneDir, env, { runSmoke: passing(), forceWatchProbe: probe, run });
     gitBroken = false;
     expect(headOf(cloneDir)).toBe(target); // not reverted yet ...
-    expect(readForceWatch(cloneDir, env)).toMatchObject({ sha: target, rollbackPending: 'health-failed' }); // ... but still owed, watch kept
+    expect(readForceWatch(cloneDir, env)).toMatchObject({ sha: target, rollbackPending: 'head-unreadable' }); // ... but still owed (an unreadable HEAD after the probe is itself the failure reason), watch kept
     expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8')).not.toMatch(/force-adopt-watch-superseded/);
     await tick(cloneDir, env, { runSmoke: passing(), forceWatchProbe: healthy }); // a healthy probe still honours the owed revert
     expect(headOf(cloneDir)).toBe(lastGood);
