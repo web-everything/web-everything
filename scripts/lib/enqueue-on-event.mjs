@@ -598,7 +598,8 @@ const lastJsonLine = (s) => {
  */
 export function readPendingChangePaths({ root, cwd, env = process.env, execFileSyncImpl, overlays, rebuildState }) {
   try {
-    if (!root || root === cwd) return { ok: true, paths: [], source: 'no separate code clone' };
+    // A pending refresh with no separate code clone to read is an inconsistent state, not an empty change: fail closed.
+    if (!root || root === cwd) return { ok: false, error: 'no separate code clone to read the pending change from' };
     const git = (args) => String(execFileSyncImpl('git', args, { cwd: root, env, encoding: 'utf8', timeout: 30_000, maxBuffer: 4 * 1024 * 1024 }));
     // NUL-separated (-z): git quotes non-ASCII or special paths otherwise, and a quoted path never matches a protected prefix.
     const names = (out) => out.split('\0').filter(Boolean);
@@ -607,9 +608,12 @@ export function readPendingChangePaths({ root, cwd, env = process.env, execFileS
     // leaves HEAD behind its own record.
     const applied = rebuildState()?.adopted?.applied;
     const everApplied = new Set((Array.isArray(applied) ? applied : []).filter((a) => isObj(a) && typeof a.ref === 'string').map((a) => a.ref));
-    const paths = new Set(names(git(['diff', '--name-only', '-z', '--no-renames', 'HEAD', 'origin/main'])));
+    // Three-dot: only what main gained since it diverged from HEAD. A two-dot diff also lists files an overlay already merged into HEAD
+    // carries (HEAD has them, main does not), which the refresh would not change.
+    const overlayList = overlays(); // read the registry first: an unreadable one fails closed before any git call
+    const paths = new Set(names(git(['diff', '--name-only', '-z', '--no-renames', 'HEAD...origin/main', '--'])));
     let inspected = 0;
-    for (const o of overlays()) {
+    for (const o of overlayList) {
       const ref = o?.ref;
       if (typeof ref !== 'string' || !/^[A-Za-z0-9._/-]+$/.test(ref) || ref.startsWith('-')) return { ok: false, error: `overlay ref ${JSON.stringify(ref)} unsafe` };
       let tip;
@@ -731,11 +735,9 @@ export function createEnqueueOnEvent({
 
   let pauseSince = null;
   /** While a refresh is pending: keep enqueuing on last-good unless the pending change touches enqueue/merge code (bounded pause). */
-  function refreshDecision(refresh) {
+  function refreshDecision(refresh, change) {
     const cfg = { ...ENQUEUE_ON_EVENT_DEFAULTS.catchUp.refreshPause, ...setting.catchUp?.refreshPause };
     const src = `paths ${setting.sources?.['catchUp.refreshPause.paths'] || 'standard'}, maxPause ${setting.sources?.['catchUp.refreshPause.maxPauseMinutes'] || 'standard'}`;
-    let change;
-    try { change = readPendingChange(); } catch (e) { change = { ok: false, error: String(e?.message || e).split('\n')[0] }; }
     const touched = change?.ok === true && Array.isArray(change.paths)
       ? change.paths.filter((p) => cfg.paths.some((prefix) => p === prefix || p.startsWith(prefix))) : null;
     if (touched && !touched.length) {
@@ -753,11 +755,18 @@ export function createEnqueueOnEvent({
 
   async function runDue({ catchUpOnly = false } = {}) {
     let refreshLogged = false;
+    // The pending-change read spawns git per overlay and mayStart() runs per candidate: read it once per run, not per call.
+    let changeOnce;
+    const pendingChange = () => {
+      if (changeOnce) return changeOnce;
+      try { changeOnce = readPendingChange(); } catch (e) { changeOnce = { ok: false, error: String(e?.message || e).split('\n')[0] }; }
+      return changeOnce;
+    };
     const mayStart = () => {
       if (!allowed()) return false;
       const refresh = refreshPending();
       if (!refresh.pending) { pauseSince = null; return true; }
-      const decision = refreshDecision(refresh);
+      const decision = refreshDecision(refresh, pendingChange());
       if (decision.go) {
         if (!refreshLogged) { log(decision.line); refreshLogged = true; }
         return true;

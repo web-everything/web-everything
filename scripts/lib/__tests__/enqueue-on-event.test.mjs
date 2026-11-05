@@ -15,6 +15,8 @@ import {
   fastDrainArgs, summarizeFastDrain, resolveEnqueueOnEventSetting, createEnqueueOnEvent, wakeWorthy,
 } from '../enqueue-on-event.mjs';
 import * as enqueueModule from '../enqueue-on-event.mjs';
+import { overlayFilePath, WE_DAEMON_OVERLAY_DIR_ENV } from '../daemon-overlays.mjs';
+import { WE_DAEMON_STATE_DIR_ENV } from '../daemon-rebuild/state.mjs';
 import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
 
 const REPO = 'web-everything/web-everything';
@@ -675,7 +677,7 @@ describe('readPendingChangePaths', () => {
   };
   const adoptedState = (applied) => () => ({ adopted: { at: '2026-11-06T00:00:00Z', applied } });
   it('unions the main delta and each unadopted overlay diff', () => {
-    const exec = (_c, args) => (args[0] === 'rev-parse' ? `${TIP}\n` : args[0] === 'merge-base' ? (() => { throw gitErr(1); })() : args.includes('HEAD') ? 'a.mjs\0' : 'b.mjs\0');
+    const exec = (_c, args) => (args[0] === 'rev-parse' ? `${TIP}\n` : args[0] === 'merge-base' ? (() => { throw gitErr(1); })() : args.includes('HEAD...origin/main') ? 'a.mjs\0' : 'b.mjs\0');
     expect(readPendingChangePaths({ ...base, execFileSyncImpl: exec })).toMatchObject({ ok: true, paths: ['a.mjs', 'b.mjs'] });
   });
   it('skips an overlay whose current tip is already in the code clone HEAD', () => {
@@ -747,6 +749,33 @@ describe('readPendingChangePaths', () => {
       expect(probe()).toMatchObject({ ok: true, paths: [PROTECTED] });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+  it('reads only what main gained since HEAD (three-dot), not files an already-merged overlay carries', () => {
+    const calls = [];
+    readPendingChangePaths({ ...base, overlays: () => [], execFileSyncImpl: fakeGit({}, calls) });
+    expect(calls.filter((args) => args[0] === 'diff').map((args) => args.find((a) => a.includes('origin/main')))).toEqual(['HEAD...origin/main']);
+  });
+  it('real git: a protected file carried by an overlay already merged into HEAD (not yet in main) is not pending', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pending-main-'));
+    const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
+    const git = (...args) => execFileSync('git', args, { cwd: dir, env, encoding: 'utf8' });
+    try {
+      git('init', '-q', '-b', 'main');
+      mkdirSync(join(dir, 'scripts/lib'), { recursive: true });
+      writeFileSync(join(dir, PROTECTED), 'x'); writeFileSync(join(dir, 'README.md'), 'a');
+      git('add', '-A'); git('commit', '-qm', 'base'); git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+      writeFileSync(join(dir, PROTECTED), 'overlay'); git('commit', '-qam', 'overlay already merged into HEAD');
+      const probe = () => readPendingChangePaths({ root: dir, cwd: '/elsewhere', execFileSyncImpl: execFileSync, overlays: () => [], rebuildState: () => ({}) });
+      expect(probe()).toMatchObject({ ok: true, paths: [] });
+      git('checkout', '-q', '-b', 'side', 'origin/main'); writeFileSync(join(dir, 'README.md'), 'main moved'); git('commit', '-qam', 'main gains a file');
+      git('update-ref', 'refs/remotes/origin/main', 'HEAD'); git('checkout', '-q', 'main');
+      expect(probe()).toMatchObject({ ok: true, paths: ['README.md'] });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('fails closed when there is no separate code clone to read (missing root, or root equal to cwd)', () => {
+    for (const root of [undefined, '', '/clone']) {
+      expect(readPendingChangePaths({ ...base, root, execFileSyncImpl: () => '' })).toMatchObject({ ok: false });
+    }
+  });
   it('fails closed on a git error or an unsafe ref', () => {
     expect(readPendingChangePaths({ ...base, execFileSyncImpl: () => { throw new Error('bad object'); } })).toMatchObject({ ok: false });
     expect(readPendingChangePaths({ ...base, overlays: () => [{ ref: '--evil' }], execFileSyncImpl: () => '' })).toMatchObject({ ok: false });
@@ -757,6 +786,43 @@ describe('catch-up during a daemon refresh (last-good enqueue)', () => {
   const pendingRefresh = () => ({ pending: true, reason: 'unadopted-overlay' });
   const warn = (lines) => lines.filter((line) => line.includes('refresh pending'));
 
+  /** Default readPendingChange wiring: real registry files in a temp dir, a fake git. */
+  const wired = ({ registry, git }) => {
+    const dir = mkdtempSync(join(tmpdir(), 'pending-wiring-'));
+    const env = { [WE_DAEMON_OVERLAY_DIR_ENV]: dir, [WE_DAEMON_STATE_DIR_ENV]: dir };
+    if (registry !== undefined) { mkdirSync(dir, { recursive: true }); writeFileSync(overlayFilePath('/code', env), registry); }
+    const gitCalls = [];
+    const execFileSyncImpl = (cmd, args, opts) => { gitCalls.push(args); return git ? git(args, opts) : ''; };
+    return { ...catchUpSetup({ refreshPending: pendingRefresh, env, execFileSyncImpl }), gitCalls, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  };
+
+  it('default wiring: a corrupt overlay registry pauses catch-up (fails closed) without running git', async () => {
+    const t = wired({ registry: '{not json' });
+    try {
+      await t.handle.catchUp();
+      expect(t.calls).toEqual([]);
+      expect(t.gitCalls).toEqual([]);
+      const paused = t.lines.filter((line) => line.includes('catch-up paused'));
+      expect(paused).toHaveLength(1);
+      expect(paused[0]).toMatch(/overlay registry unreadable.*failing closed/);
+    } finally { t.cleanup(); }
+  });
+  it('default wiring: a readable registry reads the pending change through git and continues on last-good when it is unrelated', async () => {
+    const t = wired({ registry: JSON.stringify({ clone: null, overlays: [] }), git: () => 'README.md\0' });
+    try {
+      await t.handle.catchUp();
+      expect(t.calls.map((call) => call.args[1])).toEqual(['--only=42', '--only=43']);
+      expect(t.gitCalls.some((args) => args[0] === 'diff' && args.includes('HEAD...origin/main'))).toBe(true);
+      expect(warn(t.lines)[0]).toMatch(/continuing on last-good/);
+    } finally { t.cleanup(); }
+  });
+  it('reads the pending change once per run, not once per candidate', async () => {
+    const reads = vi.fn(() => ({ ok: true, paths: ['README.md'], source: 'overlay lane/x' }));
+    const { handle, calls } = catchUpSetup({ refreshPending: pendingRefresh, readPendingChange: reads });
+    await handle.catchUp();
+    expect(calls.length).toBeGreaterThan(1);
+    expect(reads).toHaveBeenCalledTimes(1);
+  });
   it('keeps enqueuing on last-good while an unrelated overlay is pending, and logs the decision with provenance', async () => {
     const { handle, calls, lines } = catchUpSetup({
       refreshPending: pendingRefresh,
