@@ -11,7 +11,9 @@ import { allowedCommand } from '../../readiness/forge-exec-run.mjs';
 import { runRemote } from '../../readiness/remote-exec.mjs';
 import { keepAliveScript } from '../test-keepalive.mjs';
 import { pidIdentity } from '../pid-alive.mjs';
-import { splitVitestArgs, runShards, executeShard, inventoryVerdict, parseShardCli, streamedInventory, SHARD_REPORT_MAX_BYTES } from '../verify-shard-run.mjs';
+import { createFailureCollector } from '../verify-failures.mjs';
+import { verifyFinishBody } from '../lane-verify.mjs';
+import { splitVitestArgs, runShards, executeShard, inventoryVerdict, parseShardCli, streamedInventory, SHARD_REPORT_MAX_BYTES, SHARD_UNSETTLED_EXIT } from '../verify-shard-run.mjs';
 
 describe('shard split', () => {
   it('balances deterministically, covers files once, and preserves flags including values', () => {
@@ -102,10 +104,15 @@ describe('fail-closed wrapper', () => {
     expect(f.lines.filter(l => l.startsWith('verify-shard '))).toHaveLength(3);
     expect(f.calls[0].args.some(a => a.endsWith('scripts/readiness/heavy-admission.mjs'))).toBe(true);
   });
-  it.each(['red', 'missing', 'unreadable'])('%s cannot turn green', async mode => {
-    const f = fixture([mode]); expect(await f.run()).toBe(1);
+  it.each(['red', 'missing', 'unreadable'])('%s cannot turn green without complete retry evidence', async mode => {
+    const f = fixture(mode === 'red' ? [mode] : [mode, mode]);
+    expect(await f.run()).toBe(mode === 'red' ? 1 : 75);
     expect(f.lines.join('')).not.toContain('GREEN');
-    if (mode !== 'red') expect(f.lines.join('')).toContain('INVENTORY-INCOMPLETE');
+    if (mode !== 'red') {
+      expect(f.lines.join('')).toContain('UNSETTLED');
+      expect(f.lines.join('')).not.toContain('RED');
+      expect(f.calls).toHaveLength(4);
+    }
   });
   it('timeout exhausts budget and records unstarted shards NOT-RUN', async () => {
     const f = fixture(['timeout']); expect(await f.run()).toBe(124);
@@ -126,6 +133,270 @@ describe('fail-closed wrapper', () => {
     const f = fixture(['remote-red', local]); expect(await f.run()).toBe(local === 'pass' ? 0 : 1);
     expect(f.calls).toHaveLength(4); expect(f.calls[1].command).toBe('npx');
     expect(f.calls[1].env.WE_HEAVY_ADMISSION_HELD).toBe('1'); expect(f.releases()).toBe(1);
+  });
+});
+
+describe('one split retry for incomplete inventory', () => {
+  async function run(modes, files = ['a', 'b', 'c', 'd'], shards = 1) {
+    let clock = 0;
+    const calls = [], lines = [];
+    const reports = new Map();
+    const code = await runShards({ argv: ['npx', 'vitest', 'run', ...files, '--pool', 'forks'], shards, parallel: 1, budgetMs: 10000 }, {
+      discover: () => null, env: {}, now: () => clock, log: s => lines.push(s), tmpdir: () => '/scratch',
+      fs: { mkdtempSync: () => '/scratch/shards', rmSync: () => {}, readFileSync: p => { if (!reports.has(p)) throw Error('missing'); return reports.get(p); } },
+      acquireLocal: async () => ({ ok: true }), releaseLocal: () => {},
+      execute: async options => {
+        calls.push(options);
+        const mode = modes[calls.length - 1];
+        if (mode?.remote) reports.set(options.remoteReport, JSON.stringify({ location: 'remote', exitCode: mode.exitCode }) + '\n');
+        if (['remote-incomplete', 'remote-fail'].includes(mode)) reports.set(options.remoteReport, JSON.stringify({ location: 'remote', exitCode: 1 }) + '\n');
+        if (mode === 'timeout') return { exitCode: 124, timedOut: true };
+        if (mode === 'exit-failure') {
+          options.log(`${options.prefix}runner failed before writing inventory\n`);
+          return { exitCode: 2, reportText: null };
+        }
+        if (mode === 'fail') options.log(`${options.prefix}retry assertion failed: expected true, received false\n`);
+        if (mode === 'exhausted') { clock = 10000; return { exitCode: 0, reportText: JSON.stringify({ testResults: [] }) }; }
+        if (mode === 'killed') return { exitCode: 137 };
+        if (mode === 'signal') return { exitCode: null, signal: 'SIGKILL' };
+        if (typeof mode === 'object') return Object.hasOwn(mode, 'exitCode') ? mode : { exitCode: 1, reportText: JSON.stringify(mode) };
+        if (mode === 'malformed') return { exitCode: 1, reportText: '{invalid JSON' };
+        const reportText = mode === 'oversized' ? streamedInventory('x'.repeat(SHARD_REPORT_MAX_BYTES + 1))
+          : JSON.stringify({ testResults: (['missing', 'remote-incomplete'].includes(mode) ? [] : options.files).map(name => ({ name,
+            status: ['fail', 'remote-fail'].includes(mode) ? 'failed' : 'passed', assertionResults: [{ status: mode === 'fail' ? 'failed' : 'passed' }] })) });
+        return { exitCode: ['fail', 'remote-incomplete', 'remote-fail'].includes(mode) ? 1 : 0, reportText };
+      },
+    });
+    return { code, calls, output: lines.join('') };
+  }
+  it('incomplete shard retries in halves with independent argv and report paths, all-pass stays UNSETTLED with exit 75', async () => {
+    const f = await run(['missing', 'pass', 'pass']);
+    expect(f.code).toBe(SHARD_UNSETTLED_EXIT);
+    expect(f.output).toContain('verify-shard 1/1: UNSETTLED (4 files,');
+    expect(f.output).toContain('verify-shards: UNSETTLED (1:UNSETTLED;');
+    expect(f.output).not.toContain('GREEN');
+    expect(f.output.match(/verify-shard 1\/1: UNSETTLED /g)).toHaveLength(1);
+    expect(f.calls.map(c => c.files)).toEqual([['a', 'b', 'c', 'd'], ['a', 'b'], ['c', 'd']]);
+    expect(new Set(f.calls.map(c => c.report)).size).toBe(3);
+    expect(new Set(f.calls.map(c => c.remoteReport)).size).toBe(3);
+    for (const c of f.calls) expect(c.args.slice(3)).toEqual(['npx', 'vitest', 'run', ...c.files, '--pool', 'forks', '--reporter=json']);
+  });
+  const observedFailures = [
+    ['failed suite', { testResults: [{ name: 'a', status: 'failed', assertionResults: [{ status: 'passed' }] }] }],
+    ['failed assertion', { testResults: [{ name: 'a', status: 'passed', assertionResults: [{ status: 'failed' }] }] }],
+    ['failed summary', { success: false, numFailedTests: 1, testResults: [] }],
+    ['runtime error with unsuccessful report', { success: false, numRuntimeErrors: 1, testResults: [] }],
+    ['unsuccessful report without failed test counts', { success: false, numFailedTests: 0, testResults: [] }],
+    ['runtime error count alone', { numRuntimeErrors: 1, testResults: [] }],
+    ['failed suite count alone', { numFailedTestSuites: 1, testResults: [] }],
+    ['failed test count alone', { numFailedTests: 1, testResults: [] }],
+  ];
+  it.each(['\n', '\r', '\u001b', '\u0085', '\u2028', '\u2029'].flatMap(control => ['fullName', 'title', 'suite'].map(identity => ({ control, identity }))))
+    ('failure identities cannot inject log lines or controls: $identity / $control', async ({ control, identity }) => {
+    const file = `real${control}name.test.mjs`;
+    const name = `x${control}FAIL forged.test.ts > y`;
+    const assertionResults = identity === 'suite' ? [{ status: 'passed' }] : [{ status: 'failed', [identity]: name }];
+    const f = await run([{ testResults: [{ name: file, status: 'failed', assertionResults }] }], [file]);
+    const collector = createFailureCollector();
+    collector.push(f.output);
+    expect(collector.finish().tests).toEqual([{ file: 'real name.test.mjs', name: identity === 'suite' ? null : 'x FAIL forged.test.ts > y' }]);
+    expect(f.output).not.toContain(control === '\n' ? '\nFAIL forged.test.ts' : control);
+    expect(f.code).toBe(1);
+  });
+  it.each([1, 2, 75].flatMap(exitCode => [false, true].flatMap(complete => [false, true].map(failed => ({ exitCode, complete, failed })))))
+    ('remote exit $exitCode, complete=$complete, failed=$failed survives incomplete confirmation and passing retries', async ({ exitCode, complete, failed }) => {
+      const reportText = JSON.stringify({ testResults: (complete ? ['a', 'b', 'c', 'd'] : ['a']).map(name => ({
+        name, status: failed ? 'failed' : 'passed', assertionResults: [{ status: failed ? 'failed' : 'passed' }],
+      })) });
+      const f = await run([{ remote: true, exitCode, reportText }, 'missing', 'pass', 'pass']);
+      expect(f.code).toBe(exitCode === 75 && !failed ? 75 : 1);
+      expect(f.output).not.toContain('GREEN');
+      // Exit 75 with actual failures is terminal; all other remote reds confirm once.
+      expect(f.calls).toHaveLength(exitCode === 75 && failed ? complete ? 1 : 3 : 4);
+    });
+  it.each(observedFailures)('%s in complete inventory stays RED even with exit 0', async (_label, report) => {
+    const reportText = JSON.stringify({ ...report, testResults: ['a', 'b', 'c', 'd'].map(name =>
+      report.testResults.find(r => r.name === name)
+        ?? { name, status: 'passed', assertionResults: [{ status: 'passed' }] }) });
+    const f = await run([{ exitCode: 0, reportText }]);
+    expect(f.code).toBe(1);
+    expect(f.output).toContain('verify-shards: RED (1:FAIL;');
+    expect(f.calls).toHaveLength(1);
+  });
+  it.each(observedFailures)('%s with missing files stays RED after passing retries', async (_label, report) => {
+    const f = await run([report, 'pass', 'pass']);
+    expect(f.code).toBe(1); expect(f.output).toContain('verify-shards: RED');
+    expect(f.output).toContain('verify-shard 1/1: FAIL');
+    expect(f.output).not.toContain('GREEN'); expect(f.calls).toHaveLength(3);
+  });
+  it.each(observedFailures)('%s with missing files stays RED after incomplete retries', async (_label, report) => {
+    const f = await run([report, 'missing', 'pass']);
+    expect(f.code).toBe(1); expect(f.output).toContain('verify-shards: RED');
+    expect(f.output).not.toContain('verify-shards: UNSETTLED'); expect(f.calls).toHaveLength(3);
+  });
+  it.each([
+    ['passing partial report', { success: true, testResults: [{ name: 'a', status: 'passed', assertionResults: [{ status: 'passed' }] }] }],
+    ['unparseable report', 'malformed'],
+  ])('%s with exit 1 stays FAIL after passing retries', async (_label, report) => {
+    const f = await run([report, 'pass', 'pass']);
+    expect(f.code).toBe(1); expect(f.output).toContain('verify-shards: RED (1:FAIL;');
+    expect(f.output).not.toContain('GREEN');
+    expect(f.calls).toHaveLength(3);
+  });
+  it('exit 75 with no report stays UNSETTLED after passing retries', async () => {
+    const f = await run([{ exitCode: 75, reportText: null }, 'pass', 'pass']);
+    expect(f.code).toBe(75); expect(f.output).toContain('verify-shards: UNSETTLED');
+    expect(f.output).not.toContain('GREEN');
+    expect(f.calls).toHaveLength(3);
+  });
+  it.each([null, '{invalid JSON', 'x'.repeat(SHARD_REPORT_MAX_BYTES + 1)].map((reportText, i) => [
+    ['missing', 'malformed', 'oversized'][i], reportText,
+  ]))('exit 1 with %s report stays FAIL after passing retries', async (_label, reportText) => {
+    const f = await run([{ exitCode: 1, reportText }, 'pass', 'pass']);
+    expect(f.code).toBe(1); expect(f.output).toContain('verify-shards: RED (1:FAIL;');
+    expect(f.output).not.toContain('GREEN'); expect(f.calls).toHaveLength(3);
+  });
+  it('incomplete shard with a failing retry half is FAIL with exit 1 and preserves failure output', async () => {
+    const f = await run([{ exitCode: 1, reportText: null }, 'pass', 'fail']);
+    expect(f.code).toBe(1); expect(f.output).toContain('verify-shard 1/1: FAIL');
+    expect(f.output).toContain('[verify-shard 1/1] retry assertion failed: expected true, received false');
+    expect(f.output).toContain('verify-shards: RED (1:FAIL;');
+    expect(f.output.match(/verify-shard 1\/1: FAIL /g)).toHaveLength(1);
+  });
+  it.each(['pending', 'skipped', 'todo', 'disabled', undefined])(
+    'retry half with one passed and one %s assertion stays UNSETTLED', async status => {
+      const retry = { exitCode: 0, reportText: JSON.stringify({ testResults: ['a', 'b'].map(name => ({
+        name, status: 'passed', assertionResults: [{ status: 'passed' }, { status }],
+      })) }) };
+      const f = await run(['missing', retry, 'pass']);
+      expect(f.code).toBe(SHARD_UNSETTLED_EXIT);
+      expect(f.output).toContain('verify-shards: UNSETTLED');
+      expect(f.output).not.toContain('GREEN'); expect(f.calls).toHaveLength(3);
+    });
+  it('passing retry with pending assertions in an extra file stays UNSETTLED', async () => {
+    const retry = { exitCode: 0, reportText: JSON.stringify({ testResults: ['c', 'd', 'extra'].map(name => ({
+      name, status: 'passed', assertionResults: [{ status: 'passed' }, { status: name === 'extra' ? 'pending' : 'passed' }],
+    })) }) };
+    const f = await run(['missing', 'pass', retry]);
+    expect(f.code).toBe(SHARD_UNSETTLED_EXIT);
+    expect(f.output).toContain('verify-shards: UNSETTLED');
+    expect(f.output).not.toContain('GREEN'); expect(f.calls).toHaveLength(3);
+  });
+  it('first-attempt inventory still allows passed assertions alongside pending assertions', async () => {
+    const reportText = JSON.stringify({ testResults: [{ name: 'a', status: 'passed',
+      assertionResults: [{ status: 'passed' }, { status: 'pending' }] }] });
+    expect(inventoryVerdict(reportText, ['a'])).toBe('PASS');
+    const f = await run([{ exitCode: 0, reportText }], ['a']);
+    expect(f.code).toBe(0); expect(f.calls).toHaveLength(1);
+  });
+  it('a failed assertion in an incomplete retry makes the shard RED', async () => {
+    const f = await run(['missing', observedFailures[1][1], 'pass']);
+    expect(f.code).toBe(1); expect(f.output).toContain('verify-shards: RED');
+    expect(f.calls).toHaveLength(3);
+  });
+  it.each(['missing', 'oversized'])('%s half stays UNSETTLED, never PASS; split depth and execute count are bounded', async mode => {
+    const f = await run(['missing', mode, 'pass']);
+    expect(SHARD_UNSETTLED_EXIT).toBe(75); expect(f.code).toBe(75);
+    expect(f.output).toContain('verify-shards: UNSETTLED (');
+    expect(f.output).not.toMatch(/RED|GREEN/); expect(f.calls).toHaveLength(3);
+  });
+  it.each([['fail', 'missing', 1], ['missing', 'fail', 1], ['timeout', 'missing', 124], ['missing', 'timeout', 124]])('real %s / %s half takes precedence over incomplete inventory', async (left, right, code) => {
+    const f = await run(['missing', left, right]);
+    expect(f.code).toBe(code); expect(f.output).toContain(`verify-shards: RED (1:${code === 124 ? 'TIMEOUT' : 'FAIL'};`);
+    expect(f.calls).toHaveLength(['fail', 'timeout'].includes(left) ? 2 : 3);
+  });
+  it.each(['missing', 'exit-failure'])('retry timeout preserves TIMEOUT and stops later shards after %s evidence', async initial => {
+    const f = await run([initial, 'timeout', 'pass'], ['a', 'b', 'c', 'd', 'e', 'f'], 2);
+    expect(f.code).toBe(124);
+    expect(f.output).toContain('verify-shards: RED (1:TIMEOUT, 2:NOT-RUN;');
+    expect(f.calls.map(c => c.files)).toEqual([['a', 'b', 'c'], ['a', 'b']]);
+  });
+  it('budget exhaustion after failure evidence preserves retry NOT-RUN', async () => {
+    const f = await run(['exit-failure', 'exhausted', 'pass']);
+    expect(f.code).toBe(124);
+    expect(f.output).toContain('verify-shards: RED (1:NOT-RUN;');
+    expect(f.calls).toHaveLength(2);
+  });
+  it.each([
+    ['initial', ['exit-failure', 'pass', 'pass']],
+    ['retry', ['missing', 'exit-failure', 'pass']],
+    ['initial with incomplete retry', ['exit-failure', 'missing', 'pass']],
+  ])('%s nonzero exit without inventory stays FAIL and preserves failure details', async (_label, modes) => {
+    const f = await run(modes);
+    expect(f.code).toBe(1);
+    expect(f.output).toContain('verify-shards: RED (1:FAIL;');
+    expect(f.output).toContain('[verify-shard 1/1] runner failed before writing inventory');
+    expect(f.output).not.toContain('GREEN');
+    expect(f.calls).toHaveLength(3);
+  });
+  it('retry exit 75 without inventory remains unsettled-eligible', async () => {
+    const f = await run(['missing', { exitCode: SHARD_UNSETTLED_EXIT, reportText: null }, 'pass']);
+    expect(f.code).toBe(SHARD_UNSETTLED_EXIT);
+    expect(f.output).toContain('verify-shards: UNSETTLED (1:UNSETTLED;');
+    expect(f.calls).toHaveLength(3);
+  });
+  it.each(['killed', 'signal'])('first split half %s halts before the second half and preserves infrastructure exit', async mode => {
+    const f = await run(['missing', mode, 'pass']);
+    expect(f.code).toBe(137); expect(f.output).toContain('verify-shards: RED');
+    expect(f.calls.map(c => c.files)).toEqual([['a', 'b', 'c', 'd'], ['a', 'b']]);
+  });
+  it.each(['killed', 'signal'])('failed assertion with missing inventory then %s retry stays red with failure details', async mode => {
+    const initial = { exitCode: 1, reportText: JSON.stringify({ testResults: [{ name: 'a.test.mjs', status: 'failed',
+      assertionResults: [{ status: 'failed', fullName: 'retained assertion', failureMessages: ['expected true, received false'] }] }] }) };
+    const f = await run([initial, mode, 'pass'], ['a.test.mjs', 'b.test.mjs']);
+    expect(f.code).toBe(1);
+    expect(f.output).toContain('INVENTORY-INCOMPLETE; retrying once');
+    expect(f.output).toContain('retry infrastructure failure; retaining observed test failure');
+    expect(f.output).toContain('verify-shards: RED (1:FAIL;');
+    expect(f.output).toContain('expected true, received false');
+    expect(f.calls.map(c => c.files)).toEqual([['a.test.mjs', 'b.test.mjs'], ['a.test.mjs']]);
+    const collector = createFailureCollector();
+    collector.push(f.output);
+    const failureDetails = collector.finish();
+    expect(failureDetails.tests).toEqual([{ file: 'a.test.mjs', name: 'retained assertion' }]);
+    const record = verifyFinishBody({ sha: 'a'.repeat(40) }, { exitCode: f.code, failureDetails });
+    expect(record).toMatchObject({ status: 'red', failureDetails });
+    expect(record.infrastructure).toBeUndefined();
+  });
+  it('NOT-RUN after budget exhaustion launches neither split half', async () => {
+    const f = await run(['exhausted', 'pass', 'pass']);
+    expect(f.code).toBe(124); expect(f.output).toContain('verify-shard 1/1: NOT-RUN');
+    expect(f.calls).toHaveLength(1);
+  });
+  it('both incomplete halves remain unsettled without another split', async () => {
+    const f = await run(['missing', 'missing', 'missing']);
+    expect(f.code).toBe(75); expect(f.calls).toHaveLength(3);
+  });
+  it('single-file incomplete shard retries once whole then is unsettled', async () => {
+    const f = await run(['missing', 'missing'], ['a']);
+    expect(f.code).toBe(75); expect(f.calls.map(c => c.files)).toEqual([['a'], ['a']]);
+    expect(new Set(f.calls.map(c => c.report)).size).toBe(2);
+  });
+  it('remote incomplete nonzero exit cannot become GREEN after passing local confirmation', async () => {
+    const f = await run(['remote-incomplete', 'pass']);
+    expect(f.code).toBe(1);
+    expect(f.output).toContain('remote red; confirming locally');
+    expect(f.output).toContain('verify-shards: RED (1:FAIL;');
+    expect(f.output).not.toContain('GREEN');
+    expect(f.calls.map(c => c.command)).toEqual(['node', 'npx']);
+    expect(f.calls.map(c => c.files)).toEqual([['a', 'b', 'c', 'd'], ['a', 'b', 'c', 'd']]);
+  });
+  it('confirms remote incomplete evidence locally but preserves its failure exit after the split retry', async () => {
+    const f = await run(['remote-incomplete', 'missing', 'pass', 'pass']);
+    expect(f.code).toBe(1); expect(f.output).toContain('verify-shards: RED (1:FAIL;');
+    expect(f.output).not.toContain('GREEN'); expect(f.calls).toHaveLength(4);
+    expect(f.calls.map(c => c.command)).toEqual(['node', 'npx', 'node', 'node']);
+    expect(f.calls.map(c => c.files.length)).toEqual([4, 4, 2, 2]);
+  });
+  it('complete remote failure then incomplete local confirmation and passing split retries stays FAIL with exit 1', async () => {
+    const f = await run(['remote-fail', 'missing', 'pass', 'pass']);
+    expect(f.code).toBe(1);
+    expect(f.output).toContain('remote red; confirming locally');
+    expect(f.output).toContain('verify-shards: RED (1:FAIL;');
+    expect(f.output).not.toContain('UNSETTLED');
+    expect(f.output).not.toContain('GREEN');
+    expect(f.calls.map(c => c.command)).toEqual(['node', 'npx', 'node', 'node']);
+    expect(f.calls.map(c => c.files.length)).toEqual([4, 4, 2, 2]);
   });
 });
 

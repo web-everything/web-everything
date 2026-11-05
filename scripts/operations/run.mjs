@@ -215,9 +215,14 @@ export function createCodexAuditSink({ auditMain = codexAuditMain, makeDeps } = 
 
 export function finishCodexAudit({ run, code, lines, json }) {
   const v = run?.verdict;
-  const outCode = v?.code ?? code;
-  return { code: outCode, lines: json || !v ? lines
-    : [v.stdout, v.stderr].filter(Boolean).map(text => text.trimEnd()) };
+  const outCode = code !== 0 ? code : (v?.code ?? code);
+  if (json || !v) return { code: outCode, lines };
+  const saved = [v.stdout, v.stderr].filter(Boolean).map(text => text.trimEnd());
+  // A non-zero exit (e.g. `--resume=<completed run> --answer=accept` refusing, exit 2) must still show WHY:
+  // append the refusal/diagnostic lines the saved verdict does not already carry.
+  // Only when the CLI exit differs from the audit's own verdict code: a plain WEAKENED (same code) already says why.
+  const extra = code !== 0 && code !== v.code ? (lines ?? []).filter(l => l !== '' && !saved.some(s => s.includes(l))) : [];
+  return { code: outCode, lines: [...saved, ...extra] };
 }
 
 
@@ -803,6 +808,7 @@ export function operatorControlCliPolicy(name, argv) {
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
 if (IS_CLI) {
   const [name, ...rest] = process.argv.slice(2);
+  if (name === 'worker-pause') { const { main: pause } = await import('./worker-pause.mjs'); const pauseCode = pause(rest); process.exit(pauseCode); } // R480: tiny flag CLI, not a run-record operation
   if (!name || name === '--help' || name === '-h') {
     writeAllSync(1, `${rootUsage()}\n`);
     process.exit(name ? 0 : 2);

@@ -26,7 +26,7 @@ import { roundExtensionGrants } from '../conveyor/round-extension-mark.mjs';
 import { verifyFinding } from './round-judge-verify.mjs';
 import { isTrustChainPath, isPolicyCorePath, isEngineTierPath, isPolicySpecPath, isStatutePath } from './gate-config.mjs';
 
-export const VERDICTS = Object.freeze(['grant', 'send-back', 'card-the-rest', 'suggest-split', 'escalate', 'not-real-verified']);
+export const VERDICTS = Object.freeze(['grant', 'send-back', 'card-the-rest', 'suggest-split', 'non-converging', 'escalate', 'not-real-verified']);
 export const TRIGGERS = Object.freeze(['red-team-cap', 'review-cap', 'referral-hold']);
 /** Hard backstop on total grants per PR (operator 2026-10-21: progress decides, this only stops a runaway). Setting `rounds.judge.maxGrants`. */
 export const MAX_JUDGE_GRANTS = 20;
@@ -227,10 +227,10 @@ export function judgeRound(o) {
   }
 }
 
-const STRICT_ORDER = ['not-real-verified', 'grant', 'card-the-rest', 'send-back', 'suggest-split', 'escalate'];
+const STRICT_ORDER = ['not-real-verified', 'grant', 'card-the-rest', 'send-back', 'suggest-split', 'non-converging', 'escalate'];
 const strictness = (v) => STRICT_ORDER.indexOf(v);
 
-function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = [], diff = {}, setting = CONFIRMED_BREAKS_DEFAULTS, verify = null, maxGrants = MAX_JUDGE_GRANTS }) {
+function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = [], diff = {}, setting = CONFIRMED_BREAKS_DEFAULTS, verify = null, maxGrants = MAX_JUDGE_GRANTS, nonConverging = null }) {
   if (!TRIGGERS.includes(trigger)) throw new Error(`unknown trigger ${JSON.stringify(trigger)}`);
   const rounds = extractRounds(comments, pr);
   const sourceOf = { 'red-team-cap': 'red-team', 'review-cap': 'review', 'referral-hold': 'referral' }[trigger];
@@ -345,6 +345,12 @@ function judgeRoundUnsafe({ pr, repo = null, head, trigger, comments, files = []
   if (!latest) return done('send-back', ['no-parseable-findings-for-trigger']);
   if (diffGrowing) return done('suggest-split', [`diff-grew-${growth}-lines${growthRatio ? `-x${growthRatio.toFixed(2)}` : ''}`]);
   if (surfaceWidening) return done('suggest-split', [`finding-surface-widening:${newFiles.slice(0, 3).join(',')}`]);
+  // R469 / D-R451: a NEW finding class in each of rounds 1 and 2 (nothing in the latest round was raised before, and the
+  // count is not shrinking) is non-converging: route to redesign instead of granting round 3. Opt-in (settings-gated).
+  if (nonConverging?.enabled === true && same.length >= 2 && prev && annotated.length && repeated.length === 0 && !guardFindings.length
+    && latestOpen.length >= prevOpen.length) {
+    return done('non-converging', [`new-finding-class-each-round:${same.length}-rounds-${annotated.length}-new-findings`, 'route-to-redesign-D-R451']);
+  }
 
   if (annotated.length && !brokenOpen.length && !crossBroken.length && annotated.every((f) => planKeys.card.has(keyOf(f)) || !planKeys.sendBack.has(keyOf(f)))) {
     if (guardFindings.length) return done('escalate', [`card-on-guard-code:${guardFindings[0].file}:${guardFindings[0].line}`]);

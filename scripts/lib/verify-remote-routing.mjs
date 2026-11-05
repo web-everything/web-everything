@@ -6,6 +6,7 @@ import { admissionLockRoot, admissionBypassReason, poolRootOf, loadAdmissionPoli
 import { defaultPoolRoot } from './lane-pool-paths.mjs';
 import { allowedCommand, allowedEnv } from '../readiness/forge-exec-run.mjs';
 import { verificationInfrastructureFailure } from './lane-verify.mjs';
+import { SHARD_UNSETTLED_EXIT } from './verify-exit-codes.mjs';
 import { shellQuote } from './verify-lane-gate.mjs';
 
 function simpleShellWords(command) {
@@ -86,6 +87,13 @@ function wrappedChain(command) {
 
 // Only THIS checkout-independent wrapper (beside this module) owns its own admission; any other path is an ordinary command.
 export const SHARD_RUN_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'verify-shard-run.mjs');
+// Why a phase the wrapper cannot take stays local. `vitest related` is local by design today: Forge's allowlist
+// accepts it, but the nested heavy-admission wrapper maps only `vitest run`, so it never reaches the remote path.
+export function localPhaseReason(command) {
+  return command.split(' && ').some(segment => /^npx vitest related(?=\s|$)/.test(segment.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '')))
+    ? 'vitest-related-local-only' : 'raw-command';
+}
+
 export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
   if (!/[;&|<>`$()\r\n]/.test(command.replace(/'(?:[^']|'\\'')*'/g, "''")) && command.startsWith(`node ${shellQuote(SHARD_RUN_SCRIPT)} `)) {
     return { command, takeLocalSlot: false, setHeld: false, shardWrapper: true };
@@ -106,13 +114,17 @@ export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
   return { command, takeLocalSlot: !remote, setHeld: !remote };
 }
 
-export function shouldConfirmRemoteRed({ plan, exitCode, signal, timedOut, ranOn } = {}) {
+export function shouldConfirmRemoteRed({ plan, exitCode, signal, timedOut, ranOn, failureDetails } = {}) {
   // The nested wrapper owns local fallback. Only a reported remote red authorizes confirmation:
   // missing/malformed reports or a successful prefix cannot rule out an already-local failure.
+  // Outside the shard wrapper, 75 without failures can be a nested admission deferral. Confirm it locally;
+  // the shard wrapper owns its retries and must retain its terminal UNSETTLED verdict.
+  const infrastructure = verificationInfrastructureFailure({ exitCode, signal });
   return !plan?.shardWrapper && plan?.takeLocalSlot === false && ['remote', 'mixed'].includes(ranOn?.location)
     && ranOn.failureLocation === 'remote'
+    && !(exitCode === SHARD_UNSETTLED_EXIT && failureDetails?.tests?.length)
     && Number.isInteger(exitCode) && exitCode > 0 && exitCode !== 124
-    && !timedOut && !verificationInfrastructureFailure({ exitCode, signal });
+    && !timedOut && (!infrastructure || infrastructure.reason === 'verify-unsettled');
 }
 
 // This is a preflight only. The nested wrapper remains the sole remote executor and fallback owner.

@@ -69,6 +69,61 @@ export function resolveOwner(pr, signals = {}) {
     state: stuck ? 'stuck' : owner ? 'active' : 'none', why: smell ? `Open health episode: ${smell}` : stuck ? 'Owner signal is stale' : owner ? 'Live owner signal' : base.why,
     ...(smell ? { smell } : {}) };
 }
+/** R502 item 5 - the REAL reason a PR is waiting, so the sweep stops reporting the implied daemon as a stale owner.
+ *  Precedence: a live fixer claim, then the daemon's latest refusal (when no later progress and, if it names a head,
+ *  the current head), then a parked PR (draft or `review:human`). Null when nothing is known: the old report stands. PURE. */
+export function resolveWaitState(pr, { fixClaim = null, daemons = [] } = {}, { now = null, maxAgeMinutes = 360 } = {}) {
+  if (fixClaim?.who) return { kind: 'live-claim', detail: String(fixClaim.who) };
+  // A refusal is current evidence only when fresh: without a clock, or older than maxAgeMinutes, it is not a wait state.
+  const dated = (Array.isArray(daemons) ? daemons : []).filter((d) => Number.isFinite(ms(d?.at)));
+  const progressAt = Math.max(-Infinity, ...dated.filter((d) => d.kind === 'progress').map((d) => ms(d.at)));
+  const refusal = dated.filter((d) => d.kind === 'refusal' && Number.isFinite(now) && ms(d.at) <= now + 60000 && now - ms(d.at) <= maxAgeMinutes * 60000 && ms(d.at) > progressAt && (d.head == null || d.head === pr.headRefOid))
+    .sort((a, b) => ms(b.at) - ms(a.at))[0];
+  if (refusal) return { kind: 'refused', detail: String(refusal.reason ?? '').slice(0, 160), by: refusal.name ?? null, at: new Date(ms(refusal.at)).toISOString() };
+  const labels = labelNames(pr) ?? [];
+  if (pr.isDraft === true || labels.includes('review:human')) return { kind: 'parked', detail: pr.isDraft === true ? 'draft' : 'review:human' };
+  return null;
+}
+export const DEADLINE_MINUTES = { label: 45, 'await-review': 90, 'await-red-team': 60, fix: 120, rebase: 90, 'wait-on': 120, 'close into card': 45 };
+export const labelNames = pr => Array.isArray(pr.labels) ? [...new Set(pr.labels.map(l => typeof l === 'string' ? l : l?.name))].sort() : null;
+export const stateFingerprint = pr => JSON.stringify([pr.headRefOid, labelNames(pr), pr.state ?? 'OPEN']);
+/** Same-head state time only: updatedAt is not a label event and never renews this clock. */
+export function stateSince(pr, fallback, now) {
+  const real = ms(pr.stateSince ?? pr.labelStateSince ?? pr.headStateSince);
+  return Number.isFinite(real) && real <= now ? real : fallback;
+}
+/** An omitted backoff preserves once-per-head consumers. Legacy alerted episodes start a repeat clock on migration. */
+export function repeatDue(record, now, backoff) {
+  return Array.isArray(backoff) && backoff.length > 0 && Number.isFinite(record?.lastAlertAt)
+    && now - record.lastAlertAt >= backoff[Math.min(Math.max(0, (record.alertCount ?? 1) - 1), backoff.length - 1)] * 60000;
+}
+/** PURE: one owner, action, deadline and violation for every open PR. */
+export function evaluateInvariant(pr, owner = {}, { now, since = now, settings = {}, blockedBy = [], waitState = null } = {}) {
+  const labels = labelNames(pr);
+  const unreadable = !labels || labels.some(l => typeof l !== 'string');
+  let nextAction = unreadable ? 'inspect unreadable labels' : !labels.length ? 'label'
+    : labels.includes('red-team:pending') ? 'await-red-team'
+    : labels.some(l => /^(review:changes|status:fixing)$/.test(l)) ? 'fix'
+    : labels.some(l => /rebase|conflict/.test(l)) ? 'rebase' : 'await-review';
+  if (blockedBy.length) nextAction = blockedBy.map(n => `blocked-by #${n}`).join(', ');
+  const emptyDiff = pr.changedFiles === 0;
+  if (emptyDiff) nextAction = 'close into card';
+  const budget = !emptyDiff && blockedBy.length ? 'wait-on' : nextAction;
+  const configured = settings.deadlineMinutes;
+  // The settings cascade accepts a global scalar as well as per-action budgets.
+  const minutes = (Number.isFinite(configured) && configured > 0 ? configured : configured?.[budget]) ?? DEADLINE_MINUTES[budget] ?? 45;
+  const deadline = new Date(stateSince(pr, since, now) + minutes * 60000).toISOString();
+  const lastSignal = ms(owner.ownerLastSeenAt);
+  const stale = owner.state === 'unknown' || owner.state === 'stuck'
+    || (Number.isFinite(lastSignal) ? now - lastSignal > (settings.idleMinutes ?? 45) * 60000 : !['active', 'waiting-operator'].includes(owner.state) && now - stateSince(pr, since, now) > (settings.idleMinutes ?? 45) * 60000);
+  const violation = emptyDiff ? 'empty-diff' : blockedBy.length ? 'waiting-on-blocked'
+    : unreadable ? 'owner-stale' : !labels.length ? 'no-labels'
+    : now > Date.parse(deadline) ? 'deadline-passed' : stale ? (waitState?.kind && !['unknown'].includes(owner.state) && !owner.smell ? `waiting-${waitState.kind}` : 'owner-stale') : null;
+  const implied = nextAction === 'fix' || nextAction === 'rebase' ? 'daemon:fix-dispatch-daemon' : nextAction.startsWith('await-') ? 'daemon:review-daemon' : 'operator';
+  // A stale owner with a known wait state reports THAT, never the stale or implied daemon (R502 item 5).
+  const reported = stale && waitState?.kind && owner.state !== 'unknown' && !owner.smell ? `wait:${waitState.kind}` : owner.owner ?? implied;
+  return { owner: reported, nextAction, deadline, violation, ...(waitState?.kind ? { waitState } : {}) };
+}
 export function planSweep({ idle, owners, prevState = {}, needsYou, now, settings, ownerReadsOk = true, prsReadOk = true }) {
   const alerts = []; const diagnose = new Set();
   if (Array.isArray(needsYou)) needsYou = [...new Map(needsYou.map((p) => [prKey(p), p])).values()];
@@ -78,12 +133,18 @@ export function planSweep({ idle, owners, prevState = {}, needsYou, now, setting
     const key = prKey(p); const owner = owners[key];
     if (!ownerReadsOk || !prsReadOk || !['none', 'stuck', 'unknown'].includes(owner?.state)) continue;
     const old = prevState.episodes?.[key];
-    const episode = old?.head === p.headRefOid && old?.updatedAt === p.updatedAt ? { ...old } : { head: p.headRefOid, updatedAt: p.updatedAt, firstUnownedAt: now, alerted: false };
+    const fingerprint = stateFingerprint(p);
+    const same = settings.alertBackoffMinutes ? (old?.fingerprint === fingerprint || (!old?.fingerprint && old?.head === p.headRefOid && old?.updatedAt === p.updatedAt)) : old?.head === p.headRefOid && old?.updatedAt === p.updatedAt;
+    const episode = same ? { ...old } : { head: p.headRefOid, updatedAt: p.updatedAt, fingerprint, firstUnownedAt: now, alerted: false };
+    episode.fingerprint = fingerprint;
+    if (episode.alerted && settings.alertBackoffMinutes && !Number.isFinite(episode.lastAlertAt)) {
+      episode.lastAlertAt = now; episode.alertCount = episode.alertCount ?? 1;
+    }
     // An unreadable owner keeps the episode clock running but waits twice as long,
     // so a brief unreadable tick never alerts and a permanent one still does.
     const alertAfter = settings.stuckAlertMinutes * (owner.state === 'unknown' ? 2 : 1);
-    if (!episode.alerted && now - episode.firstUnownedAt > alertAfter * 60000) {
-      alerts.push({ kind: 'pr-stuck', title: 'PR movement stalled', body: `${key} ${p.title}: ${owner.why}`, key }); episode.alerted = true;
+    if ((!episode.alerted && now - episode.firstUnownedAt > alertAfter * 60000) || repeatDue(episode, now, settings.alertBackoffMinutes)) {
+      alerts.push({ kind: 'pr-stuck', title: 'PR movement stalled', body: `${key} ${p.title}: ${owner.why}`, key }); episode.alerted = true; episode.lastAlertAt = now; episode.alertCount = (episode.alertCount ?? 0) + 1;
     }
     episodes[key] = episode;
     if (settings.dispatchDiagnosis && (owner.state === 'stuck' || episode.alerted)) diagnose.add(p.repo);

@@ -168,6 +168,61 @@ function segmentRelated(a, b) {
   return x === y || x.startsWith(y + '/') || y.startsWith(x + '/') || x === '' || y === '';
 }
 
+/** Product-automaton reachability: stars have an empty transition and a consuming self-loop.
+ * Each pair of positions is visited once, with a shared budget across path and character matching.
+ * Exhaustion means unknown, so retain the lease conflict (operator fallback: narrow the scopes). */
+function patternsMayIntersect(a, b, star, compatible, budget) {
+  const pending = [[0, 0]];
+  const seen = new Set();
+  while (pending.length) {
+    const [i, j] = pending.pop();
+    const key = i * (b.length + 1) + j;
+    if (seen.has(key)) continue;
+    if (--budget.remaining < 0) return true;
+    seen.add(key);
+    if (i === a.length && j === b.length) return true;
+    const sa = i < a.length && a[i] === star;
+    const sb = j < b.length && b[j] === star;
+    if (sa) pending.push([i + 1, j]);
+    if (sb) pending.push([i, j + 1]);
+    if (i < a.length && j < b.length && (sa || sb || compatible(a[i], b[j]))) {
+      // Two stars consuming together only revisit this same state; their empty transitions suffice.
+      if (!sa || !sb) pending.push([sa ? i : i + 1, sb ? j : j + 1]);
+    }
+  }
+  return false;
+}
+
+/** Conservative intersection of repo-relative scope paths. `*`/`?` stay within a segment;
+ * standalone `**` consumes zero or more segments. Directory entries and wildcard entries retain prefix
+ * semantics: an extension-shaped glob can name a dotted directory without a trailing slash.
+ * Unsupported syntax, embedded globstars, >4096-character inputs or >20000 visited states return true:
+ * unknown intersections must serialize, and authors can narrow scopes to recover concurrency. */
+export function globsMayIntersect(pathA, pathB) {
+  if (pathA.length > 4096 || pathB.length > 4096) return true;
+  if (/[\[\]{}!\\]/.test(pathA + pathB)) return true;
+  const segments = (path) => {
+    const parts = path.replace(/\/$/, '').split('/');
+    // A glob can name a directory even with a file-shaped suffix (`*.v2`, `.git*`, `*/foo.mjs`).
+    // Keep its descendant form too; the matched ancestor must still satisfy every authored segment.
+    if (parts.at(-1) !== '**' && (path.endsWith('/') || /[*?]/.test(path) || !/\.[^./]+$/.test(parts.at(-1)))) parts.push('**');
+    return parts;
+  };
+  const a = segments(pathA);
+  const b = segments(pathB);
+  if ([...a, ...b].some((part) => part !== '**' && part.includes('**'))) return true;
+  const budget = { remaining: 20000 };
+  const segmentCache = new Map();
+  return patternsMayIntersect(a, b, '**', (x, y) => {
+    const key = JSON.stringify([x, y]);
+    if (!segmentCache.has(key)) {
+      segmentCache.set(key, patternsMayIntersect(x, y, '*',
+        (cx, cy) => cx === '?' || cy === '?' || cx === cy, budget));
+    }
+    return segmentCache.get(key);
+  }, budget);
+}
+
 /** Do two scope entries overlap (their leases contend)? Same repo first, then GRANULARITY-AWARE (WE #2679):
  *    • FILE ↔ FILE       → contend ONLY if they name the same path. Disjoint files under a shared directory do
  *                          NOT contend — the parallelism this story unlocks.
@@ -175,19 +230,25 @@ function segmentRelated(a, b) {
  *    • SUBTREE ↔ SUBTREE → contend if their module-roots are in a path-segment relation — the pre-#2679
  *                          behavior, preserved so a genuinely-spanning declaration still serializes.
  *  Implemented as coverage-in-either-direction ({@link coversFile}, at each entry's authored granularity) OR a
- *  {@link segmentRelated} fallback on the wildcard-free ROOTS. The fallback is what makes finer granularity
+ *  {@link segmentRelated} fallback on the wildcard-free ROOTS, OR conservative glob intersection.
+ *  The fallback is what makes finer granularity
  *  SAFE: it catches every genuine parent↔child overlap the coverage test can't (a directory declared without a
  *  trailing slash — dotted or not — vs a glob/file beneath it), so the classifier can only ever err toward
  *  OVER-serializing, never toward a missed conflict. MIRRORS `overlap-chain.intersects` (list-membership
  *  overlap) generalized to module patterns — see the file header for why exact-set `intersects`/`disjoint`
  *  under-matches here. */
 export function scopeEntriesOverlap(x, y) {
-  const [rx] = splitRepo(x);
-  const [ry] = splitRepo(y);
+  const [rx, px] = splitRepo(x);
+  const [ry, py] = splitRepo(y);
   if (rx !== ry) return false; // different repos never contend
+  // Run the bounded intersection first: a positive result also avoids regex backtracking on long globs.
+  if (globsMayIntersect(px, py)) return true;
   // Coverage handles FILE-in-SUBTREE + glob matches at the authored granularity (and same-file/exact for two
   // files); the segment-ancestor fallback on the literal roots catches directory↔child overlaps coverage misses.
   if (coversFile(x, y) || coversFile(y, x)) return true;
+  // Two wildcard globs: the segment-aware intersection above is authoritative (it already failed closed on
+  // unsupported syntax), so a mere shared literal ancestor (`src/*.mjs` vs `src/x/*.mjs`) is NOT a conflict.
+  if (/[*?]/.test(px) && /[*?]/.test(py)) return false;
   const [, rootX] = litRoot(x);
   const [, rootY] = litRoot(y);
   return segmentRelated(rootX, rootY);

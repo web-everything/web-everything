@@ -8,6 +8,8 @@
  *   `git merge-base --is-ancestor` check per repo); everything in THIS file is a pure function over that raw
  *   snapshot.
  *
+ * Remote fallback counts cover the last 24h of `<lockRoot>/remote-fallbacks.jsonl`.
+ *
  * WHY A PID'S OWN COMMAND LINE, NOT A STORED "kind" FIELD. `heavy-admission.mjs`'s lock entries carry no `meta`
  * for its `run` wrapper or for `verify-lane.mjs`'s direct acquire (see that module's own `tryAcquireSlot`/
  * `acquireSlotBlocking` call sites) — the ONE thing every holder/waiter really has is the real pid it acquired
@@ -158,6 +160,11 @@ export function assessHeavyQueue(read) {
     waitingCount: rows.filter((r) => r.state === 'WAIT').length,
     projectedWaitMinutesForNewJob: projected, rows, headline,
     queueAdmission: admission,
+    remoteFallbacks: read.remoteFallbacks ?? {total:0, byReason:{}},
+    // R497 — fail closed: no read means UNKNOWN, never a default share.
+    forgeShare: read.forgeShare?.current
+      ? { ...read.forgeShare.current, earlier: { status: read.forgeShare.earlier?.status ?? 'unknown', share: read.forgeShare.earlier?.share ?? null } }
+      : { status: 'unknown', share: null, belowTarget: null, unknownReason: 'not-collected' },
   };
 }
 

@@ -1,3 +1,5 @@
+import { decideMemoryFloor } from './memory-available.mjs';
+import { loadHostOverloadSettings, DEFAULT_SNAPSHOT_MAX_FRESH_MS, DEFAULT_SNAPSHOT_CLOCK_SKEW_MS } from './host-overload-settings.mjs';
 import { resolveHandoffSettings } from './handoff-settings.mjs';
 /**
  * @file we:scripts/lib/resource-gate.mjs
@@ -48,8 +50,11 @@ export const RESOURCE_GATE_STANDARD = Object.freeze({
     // Operator 2026-10-10: a fixer mostly waits on the model and its tests already queue on heavy admission, so CPU
     // idle is the wrong main signal (23% idle held the cap at the floor while swap 26.5/27.6 GB was what hurt).
     // The cap moves on free memory + swap and on the projected heavy-queue wait; CPU is only a backstop.
-    raiseMinMemFreePct: 10, raiseMaxSwapUsedPct: 60, raiseMaxHeavyWaitMinutes: 15,
-    lowerBelowMemFreePct: 3, lowerAboveSwapUsedPct: 90, lowerAboveHeavyWaitMinutes: 45, lowerBy: 4, lowerMinimum: 2,
+    // R558 (2026-11-04): the memory signals read AVAILABLE memory (free+inactive+purgeable+speculative), which sits far
+    // above the old never-used-pages reading, so lower below 15% and raise only above 40% (was 3 / 10). Both stay
+    // policy-cascade leaves (fixCap.*, source logged on every fix-cap line); the hard floor + pressure check still apply.
+    raiseMinMemFreePct: 40, raiseMaxSwapUsedPct: 60, raiseMaxHeavyWaitMinutes: 15,
+    lowerBelowMemFreePct: 15, lowerAboveSwapUsedPct: 90, lowerAboveHeavyWaitMinutes: 45, lowerBy: 4, lowerMinimum: 2,
     holdCpuIdleBelowPct: 10,
   }),
 });
@@ -172,7 +177,7 @@ const summary = (d) => ({ verdict: d.verdict, reason: d.reason, snapshotAge: d.s
 /**
  * THE cut-over step. `legacy` is the old gate's `{admit, why?, note?, kind?}`. Logs old | new (via
  * `shadowAdmission`), then: `enforce` → the shared verdict decides (`admit` only on verdict `admit`); `shadow` →
- * the legacy result stands. Never throws; if no shared decision can be had at all, the legacy result stands.
+ * the legacy result stands. Never throws; unavailable shared decisions refuse in enforce mode.
  * @returns {{admit:boolean, decidedBy:'admit'|'legacy', why?:string, note?:string, kind?:string, admission?:object}}
  */
 export function cutoverDecision({ gate, kind, legacy = { admit: true }, mode = 'enforce', env = process.env, nowMs = Date.now(),
@@ -182,7 +187,13 @@ export function cutoverDecision({ gate, kind, legacy = { admit: true }, mode = '
   let decision;
   try { decision = shadow({ gate, kind, oldVerdict, oldReason, env, nowMs, ...(root ? { root } : {}), ...(log ? { log } : {}) }); } catch { decision = undefined; }
   if (!isDecision(decision)) { try { decision = admitFn({ kind, env, nowMs, ...(root ? { root } : {}) }); } catch { decision = undefined; } }
-  if (mode !== 'enforce' || !isDecision(decision)) {
+  if (mode === 'enforce' && !isDecision(decision)) {
+    const out = { admit: false, reason: 'gate-error', kind: 'gate-error',
+      why: 'gate-error: shared decision unavailable', decidedBy: 'legacy' };
+    try { (log ?? ((l) => process.stderr.write(l)))(`resource-gate gate=${gate} kind=${kind} ${out.why}\n`); } catch { /* best effort */ }
+    return out;
+  }
+  if (mode !== 'enforce') {
     return { ...legacy, decidedBy: 'legacy', ...(isDecision(decision) ? { admission: summary(decision) } : {}) };
   }
   const age = decision.snapshotAge == null ? '?' : `${decision.snapshotAge}s`;
@@ -202,7 +213,12 @@ export function cutoverDecision({ gate, kind, legacy = { admit: true }, mode = '
 export function gateLaunch({ kind = 'fix', gate, env = process.env, settings, legacyGate = gateHost, nowMs = Date.now(), root,
   shadow, admitFn, log, sample, loadavg = () => os.loadavg()[0], cpuCount = () => os.cpus().length } = {}) {
   let legacy;
-  try { legacy = legacyGate({ kind, env, loadavg, cpuCount, ...(sample ? { sample } : {}) }); } catch { legacy = { admit: true }; }
+  try { legacy = legacyGate({ kind, env, loadavg, cpuCount, ...(sample ? { sample } : {}) }); } catch (e) {
+    // Fail closed (R559): a swallowed legacy-gate exception must never admit work, in any cutover mode.
+    const why = `gate-error: ${String(e?.message ?? e).split('\n')[0]}`;
+    try { (log ?? ((l) => process.stderr.write(l)))(`resource-gate gate=${gate ?? `launch.${kind}`} kind=${kind} ${why}\n`); } catch { /* best effort */ }
+    return { admit: false, reason: 'gate-error', kind: 'gate-error', why, decidedBy: 'legacy' };
+  }
   let mode = 'enforce';
   try { mode = (settings ?? loadResourceGateSettings({ env }).settings).cutover; } catch { /* the standard */ }
   return cutoverDecision({ gate: gate ?? `launch.${kind}`, kind, legacy, mode, env, nowMs, root,
@@ -214,7 +230,7 @@ export function gateLaunch({ kind = 'fix', gate, env = process.env, settings, le
  * LOWERED below the floor (to floor - lowerBy, never under lowerMinimum) when free memory, swap or the projected
  * heavy-queue wait is past its lower threshold. RAISED above the floor only when the snapshot is fresh, `fix` is
  * admitted, CPU idle is at least the backstop, free memory / swap / heavy wait are inside their raise thresholds
- * and queueLength > raiseQueueOver. An unknown memory, swap or wait reading never blocks on its own (named as `?`).
+ * and queueLength > raiseQueueOver. An unknown cpu, memory, swap or wait reading never permits a RAISE (R559) but never blocks a hold or a lower.
  * @param {{fixCap:object, liveAtPassStart:number, queueLength:number|null, heavyWaitMinutes?:number|null, snapshot:object|null, nowMs:number, policy?:object}} o
  */
 export function decideFixCap({ fixCap, liveAtPassStart = 0, queueLength = null, heavyWaitMinutes = null, snapshot = null, nowMs = Date.now(), policy } = {}) {
@@ -245,6 +261,9 @@ export function decideFixCap({ fixCap, liveAtPassStart = 0, queueLength = null, 
   }
   if (d.unknown) return { ...base, reason: `floor: ${d.reason} (never raise on an unknown snapshot)` };
   if (d.verdict !== 'admit') return { ...base, reason: `floor: fix not admitted (${d.reason})` };
+  // R559: an unknown reading never permits a raise (holding or lowering stay available on what is known).
+  const unknownRaise = [['cpu idle', cpu], ['mem free', mem], ['swap', swap], ['heavy wait', wait]].filter(([, v]) => v === null).map(([n]) => n);
+  if (unknownRaise.length) return { ...base, reason: `floor: ${unknownRaise.join(', ')} unknown (never raise on an unknown reading)` };
   if (cpu !== null && cpu < f.holdCpuIdleBelowPct) return { ...base, reason: `floor: cpu idle ${cpu}% < ${f.holdCpuIdleBelowPct}% backstop` };
   if (mem !== null && mem < f.raiseMinMemFreePct) return { ...base, reason: `floor: mem free ${mem}% < ${f.raiseMinMemFreePct}% raise threshold` };
   if (swap !== null && swap > f.raiseMaxSwapUsedPct) return { ...base, reason: `floor: swap ${swap}% > ${f.raiseMaxSwapUsedPct}% raise threshold` };
@@ -277,6 +296,7 @@ export function createResourceFixThrottle({
   sendBackReservedSlots,
   listClaims = () => [], env = process.env, alive = isPidAlive, queueLength = null, settings, root, nowMs = () => Date.now(),
   readSnap = () => readSnapshot(root ? { root } : {}), readHeavyWait = () => readLiveHeavyWaitMinutes({ env }), gate, log = (line) => process.stderr.write(line),
+  resolveFloor = () => { const r = loadHostOverloadSettings({ env, log: () => {} }); return { snapshotClockSkewMs: r.settings.host.capacity.snapshotClockSkewMs, snapshotMaxFreshMs: r.settings.host.capacity.snapshotMaxFreshMs, metric: r.settings.host.capacity.memoryMetric, floorMb: r.settings.host.capacity.memAvailableFloorMb, source: r.sources['host.capacity.memAvailableFloorMb'] ?? 'standard' }; },
   sample, loadavg, cpuCount, // forwarded to the legacy gate (the logged comparison)
 } = {}) {
   sendBackReservedSlots ??= resolveHandoffSettings('fix', { env }).value.sendBackReservedSlots;
@@ -285,11 +305,33 @@ export function createResourceFixThrottle({
     ...(sample ? { sample } : {}), ...(loadavg ? { loadavg } : {}), ...(cpuCount ? { cpuCount } : {}) }));
   if (!settings) logGateSettingsOnce(resolved, log);
   const legacyCap = (() => { try { return resolveFixDispatchMaxConcurrent({ env }); } catch { return resolved.settings.fixCap.floor; } })();
-  let live = null; let capDecision = null;
+  let live = null; let capDecision = null; let lastSnap = null; let lastFloor = null;
+  const floorCheck = (kind) => {
+    let snap = null; let floor = { floorMb: null, source: 'unreadable policy' };
+    try { snap = readSnap(); } catch { snap = null; }
+    try { floor = resolveFloor(); } catch { floor = { floorMb: null, source: 'unreadable policy' }; }
+    lastSnap = snap; lastFloor = floor;
+    const m = snap?.memory ?? {};
+    const sampledAt = Date.parse(snap?.sampledAt);
+    const freshUntil = Date.parse(snap?.freshUntil);
+    const maxFreshMs = floor.snapshotMaxFreshMs ?? DEFAULT_SNAPSHOT_MAX_FRESH_MS;
+    const skewMs = floor.snapshotClockSkewMs ?? DEFAULT_SNAPSHOT_CLOCK_SKEW_MS;
+    const fresh = !!snap && Number.isFinite(sampledAt) && Number.isFinite(freshUntil)
+      && freshUntil - sampledAt <= maxFreshMs && sampledAt <= nowMs() + skewMs && nowMs() <= freshUntil;
+    // R559: the reading must have been taken under the SAME metric this process's policy names; a missing or different
+    // stamp is a mismatch and refuses (a stricter "free" dispatcher never trusts a larger "available" reading).
+    const metricOk = typeof floor.metric === 'string' && m.metric === floor.metric;
+    const d = !metricOk && fresh && floor.floorMb != null
+      ? { admit: false, reason: `memory metric mismatch (snapshot ${m.metric ?? 'unstamped'}, policy ${floor.metric ?? 'unknown'})` }
+      : decideMemoryFloor({ availableMb: m.availableMb, floorMb: floor.floorMb, pressureLevel: m.pressureLevel, snapshotFresh: fresh });
+    if (d.admit) return { admit: true };
+    return { admit: false, refusal: { admit: false, kind: 'host-load', signal: 'mem-floor', why: `memory floor: ${d.reason} (floor ${floor.floorMb ?? '?'} MB from ${floor.source}); ${kind} deferred, no claim taken` } };
+  };
   const currentCap = () => {
     if (capDecision) return capDecision;
     let snap = null;
     try { snap = readSnap(); } catch { snap = null; }
+    lastSnap = snap;
     const q = typeof queueLength === 'function' ? queueLength() : queueLength;
     let wait = null;
     try { wait = readHeavyWait(); } catch { wait = null; }
@@ -300,6 +342,7 @@ export function createResourceFixThrottle({
       const fixCap = { ...RESOURCE_GATE_STANDARD.fixCap, ...resolved.settings.fixCap };
       const thresholds = FIX_CAP_SIGNAL_LEAVES.map((leaf) => `${leaf}=${fixCap[leaf]} (${resolved.sources?.[`fixCap.${leaf}`] ?? 'standard'})`).join(', ');
       log(`resource-gate fix-cap: old: static cap ${legacyCap} | new: cap ${c.cap} (floor ${c.floor}, ceiling ${c.ceiling}; ${c.reason}; ${live} live) → using ${c.effective} (${resolved.settings.cutover})`
+        + ` · mem floor ${v(lastFloor?.floorMb, ' MB')} (${lastFloor?.source ?? '?'}) available ${v(lastSnap?.memory?.availableMb, ' MB')} pressure ${v(lastSnap?.memory?.pressureLevel, '')} → ${decideMemoryFloor({ availableMb: lastSnap?.memory?.availableMb, floorMb: lastFloor?.floorMb, pressureLevel: lastSnap?.memory?.pressureLevel, snapshotFresh: !!lastSnap }).admit ? 'admit' : 'refuse'}`
         + ` · inputs: mem free ${v(c.memFreePct, '%')} · swap ${v(c.swapUsedPct, '%')} · heavy wait ${v(c.heavyWaitMinutes, 'm')} · cpu idle ${v(c.cpuIdlePct, '%')} · fix queue ${v(c.queueLength, '')}`
         + ` · thresholds: ${thresholds}\n`);
     } catch { /* best effort */ }
@@ -309,6 +352,11 @@ export function createResourceFixThrottle({
     capDecision: () => capDecision,
     tryAdmit(kind = 'fix', { sendBack = false } = {}) {
       if (live === null) { try { live = countLiveFixSessions(listClaims(), { alive }); } catch { live = 0; } }
+      // R553/R559 hard floor, before any cap arithmetic. The memory reading is re-read on EVERY admission (never the
+      // pass-start copy) and the floor comes from THIS process's own policy cascade, never from the sampler's snapshot.
+      // Below the floor, under pressure warn/critical, stale, or unreadable on either side → refuse.
+      const fl = floorCheck(kind);
+      if (!fl.admit) return fl.refusal;
       const c = currentCap();
       // The reserve never takes the last slot: a cap of 1 still runs ordinary repairs. Its refusal IS a fixer-cap
       // refusal (`kind: 'fix-cap'`), so every reader of that kind — the red-main past-the-cap bypass, the builder-slot
@@ -321,7 +369,11 @@ export function createResourceFixThrottle({
         return { admit: false, kind: 'fix-cap', why: `${live} live fix/ci-heal session(s) >= cap ${c.effective} (dynamic fixer cap: floor ${c.floor}, ceiling ${c.ceiling}; ${c.reason}); ${kind} deferred, no claim taken` };
       }
       let g = { admit: true };
-      try { g = gateFor(kind); } catch { g = { admit: true }; }
+      try { g = gateFor(kind); } catch (e) {
+        const why = `host gate threw (${String(e?.message ?? e).slice(0, 120)}); ${kind} refused, no claim taken`;
+        try { log(`resource-gate fix-throttle: ${why}\n`); } catch { /* best effort */ }
+        return { admit: false, kind: 'host-load', signal: 'gate-error', why };
+      }
       if (!g.admit) return g;
       live += 1;
       const above = live > legacyCap ? ` — fixer ${live} is above the old static cap ${legacyCap} (${c.reason})` : '';

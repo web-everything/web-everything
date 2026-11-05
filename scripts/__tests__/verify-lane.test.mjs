@@ -243,6 +243,20 @@ try {
     expectDead(grandchild);
   }, 70_000);
 
+  it('records the last output lines of a timed-out phase so the next timeout names the running test file', () => {
+    const gateScript = join(dir, 'hang-tail.mjs');
+    writeFileSync(gateScript, "console.log('RUN scripts/__tests__/the-slow-one.test.mjs'); console.log('token=' + 'Ab3' + 'xY9zQ7wK2mN');\n" + keepAliveScript() + '\n');
+    const r = spawnSync('node', [VERIFY_LANE, `--gate=node ${gateScript}`, '--json'], { cwd: dir, encoding: 'utf8', timeout: 60_000,
+      env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_PHASE_TIMEOUT_MS: '2000' } });
+    const onDisk = JSON.parse(readFileSync(marker(), 'utf8'));
+    expect(onDisk.infrastructure).toMatchObject({ reason: 'verify-timeout' });
+    const tail = onDisk.infrastructure.outputTail;
+    expect(Array.isArray(tail) && tail.length <= 200).toBe(true);
+    expect(tail.join('\n')).toContain('the-slow-one.test.mjs');
+    expect(tail.join('\n')).not.toContain('xY9zQ7wK2mN');
+    expect(r.status).not.toBe(0);
+  }, 70_000);
+
   it('also kills a descendant reparented out of the tree that still holds the output pipe (audit finding 1)', () => {
     // The gate double-forks a sleeper (its parent exits at once, so it is reparented to init but keeps stdout open),
     // then hangs. Before: tree discovery missed it and 'close' never fired, so the run outlived its ceiling.
@@ -1358,6 +1372,31 @@ describe('red diagnostics transport', () => {
     const result = spawnSync('node', [VERIFY_LANE, ...args, '--json'], { cwd: dir, encoding: 'utf8' });
     return { code: result.status, json: JSON.parse(result.stdout.trim().split('\n').at(-1)), stdout: result.stdout };
   }
+  it.each([['marker', []], ['run', ['run']]])('exit 75 without FAIL output is unsettled through the real collector: %s', (_label, mode) => {
+    for (const gate of ['exit 75', "printf 'verify-shards: UNSETTLED\\n'; exit 75"]) {
+      const result = invoke([...mode, `--gate=${gate}`]);
+      expect(result.code).toBe(3);
+      expect(result.json).toMatchObject({ status: 'infrastructure-failure', exitCode: 75,
+        infrastructure: { reason: 'verify-unsettled' } });
+      if (!mode.length) {
+        expect(JSON.parse(readFileSync(marker(), 'utf8'))).toMatchObject({ status: 'infrastructure-failure',
+          infrastructure: { reason: 'verify-unsettled' } });
+        expect(invoke(['check']).json).toMatchObject({ status: 'infrastructure-failure', reason: 'verify-unsettled' });
+      }
+    }
+  });
+  it.each([['marker', []], ['run', ['run']]])('exit 75 with recorded failures stays red with details: %s', (_label, mode) => {
+    const result = invoke([...mode, `--gate=printf ' FAIL  example.test.ts > outer > broken\\n'; exit 75`]);
+    expect(result.code).toBe(2);
+    expect(result.json).toMatchObject({ status: 'red', exitCode: 75,
+      failureDetails: { tests: [{ file: 'example.test.ts', name: 'outer > broken' }] } });
+    expect(result.json.infrastructure).toBeUndefined();
+    if (!mode.length) {
+      const record = JSON.parse(readFileSync(marker(), 'utf8'));
+      expect(record).toMatchObject({ status: 'red', exitCode: 75, failureDetails: result.json.failureDetails });
+      expect(record.infrastructure).toBeUndefined();
+    }
+  });
   it('streams the evidence and round trips marker, check and wait; green clears', () => {
     const ran = invoke([`--gate=${gate}`]);
     expect(ran.code).toBe(2);

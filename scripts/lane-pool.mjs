@@ -85,6 +85,7 @@ import { homedir, hostname, tmpdir } from 'node:os';
 import { join, basename, resolve, dirname, sep } from 'node:path';
 import { resolveReal } from './guard-lane.mjs';
 import { readGit, execRead } from './lib/proc-read.mjs';
+import { createBuildOutputCleaner } from './lib/lane-build-output.mjs';
 import { boundedGitCommand, BOUNDED_GIT_GRACE_MS } from './lib/git-bounded.mjs';
 import { ensureLaneAlternates, findPrimaryForPool, poolNameFromLanePath } from './lib/lane-alternates.mjs';
 // #4415 — live incident 2026-09-29: `deadLeasePlan`'s own `gh pr list --state all` (below) was a bare,
@@ -298,6 +299,8 @@ const tryGit = (args, cwd, opts = {}) => {
   }
 };
 
+const { cleanIgnoredBuildOutput } = createBuildOutputCleaner(git);
+
 // Live-fire dispatch test, 2026-08-29: `git fetch origin --prune` crashed `provision`/`acquire` outright —
 // "error: cannot lock ref '<ref>': is at X but expected Y" — a transient race over the SHARED object store
 // every lane clones `--reference` (two lanes' fetches touching the same `refs/remotes/origin/*` at once).
@@ -331,8 +334,7 @@ function fetchOriginPruneWithRetry(dir, dietConfig) {
 const expandHome = (p) => (p && p.startsWith('~') ? join(homedir(), p.slice(1)) : p);
 
 // #3265 — the pool root is DERIVED from the checkout, not assumed from `$HOME`. Pure core + its
-// rationale live in `./lib/lane-pool-paths.mjs` (this file runs its CLI at import, so nothing here is
-// unit-testable by importing it).
+// rationale live in `./lib/lane-pool-paths.mjs`.
 // The checkout ROOT, not the cwd: `defaultPoolRoot` is pure and cannot tell `<checkout>/scripts` from
 // `<checkout>`, so handing it a subdirectory would put the pool INSIDE the repo (#1539 reviewer, round 2).
 // A lane needs no normalising — `workspaceFor` strips at `.lanes` from any depth — but this is the honest
@@ -1462,6 +1464,7 @@ function refreshLane(repo, n, { force = false } = {}) {
     action: 'refresh-reset', before, headAfter: laneHead(dir),
     reason: force ? `refresh --force (${verdict.reason})` : 'refresh — clean lane fast-forwarded', loud: verdict.loud || undefined,
   });
+  cleanIgnoredBuildOutput(dir);
   return { skipped: false, dirty: false, uncommitted: 0, ahead: 0 };
 }
 
@@ -2239,6 +2242,8 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
       reason: `acquire → ${baseRef}${flags.force ? ' (--force)' : ''}`, session: flags.session || process.env.LANE_SESSION || undefined,
       loud: before.unpushed ? true : undefined,
     });
+    // Cleanup failures reach claim rollback after journalling, outside the corruption retry.
+    cleanIgnoredBuildOutput(dir);
     unmapLanes(repo, [chosen]); // a reset lane no longer renders its old item (#2139)
     clearForeignVerifyMarker(dir);
   }
@@ -4888,6 +4893,8 @@ async function cmdGc(repo) {
 }
 
 // ── dispatch ──────────────────────────────────────────────────────────────────────────────────────
+// Forwarding entry modules and symlinked scripts also dispatch this CLI on import.
+// Importable cleanup helpers live in lib/lane-build-output.mjs instead.
 const COMMANDS = {
   // Scheduler entrypoint: safe to invoke every tick; interval + host mutex suppress duplicate passes.
   gc: cmdGc,

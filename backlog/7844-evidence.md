@@ -1,0 +1,37 @@
+---
+bornAs: xlqw3ci
+kind: story
+size: 2
+status: open
+scope: ["we:CLAUDE.md"]
+dateOpened: "2026-11-02"
+tags: []
+---
+
+# Evidence
+
+HIGH priority hint. - [HIGH 2026-10-31 08:09 ET] Evidence: subagent Bash auto-moved to background at 180s IS harness-tracked — the subagent was resumed on completion (test worker a13ab…: 08:05:49→08:09:09, resumed, reported). Update we:CLAUDE.md pinned rule + worker-brief: harness-auto-backgrounded calls (and run_in_background) in subagents DO wake the agent; only self-detached shell jobs (&/nohup/setsid) do not. Stop instructing workers to avoid it; stop the poll-guard confusion.
+
+## Acceptance
+
+- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+
+Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+
+Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+
+## Non-goals
+
+- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+
+## Edge cases this change must handle
+
+One line per class: either the handling, or `n/a: <why>`.
+
+1. **Untrusted text** — TODO: the handling, or n/a: <why>.
+2. **Truncated reads** — TODO: the handling, or n/a: <why>.
+3. **Shared state files** — TODO: the handling, or n/a: <why>.
+4. **Fail closed** — TODO: the handling, or n/a: <why>.
+5. **Identity scoping** — TODO: the handling, or n/a: <why>.
+6. **State over time** — TODO: the handling, or n/a: <why>.
+7. **Who wrote it** — TODO: the handling, or n/a: <why>.

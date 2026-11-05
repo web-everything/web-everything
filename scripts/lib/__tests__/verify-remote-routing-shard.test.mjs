@@ -1,10 +1,14 @@
-import { it, expect } from 'vitest';
+import { it, expect, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { phaseAdmissionPlan, shouldConfirmRemoteRed, SHARD_RUN_SCRIPT } from '../verify-remote-routing.mjs';
+import { runInNewContext } from 'node:vm';
+import { localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, remoteInfrastructureFailure, mergeRunLocation, SHARD_RUN_SCRIPT } from '../verify-remote-routing.mjs';
+import { verificationInfrastructureFailure, verifyFinishBody } from '../lane-verify.mjs';
+import { runShards } from '../verify-shard-run.mjs';
+import { createFailureCollector } from '../verify-failures.mjs';
 it('a wrapper executing from an apostrophe path owns admission under every decision', () => {
   const directory = mkdtempSync(join(tmpdir(), "verify-executing-checkout's-"));
   try {
@@ -55,4 +59,111 @@ it('a lookalike wrapper elsewhere does not bypass admission', () => {
 it('ordinary local and remote plans stay unchanged', () => {
   expect(phaseAdmissionPlan({ command: 'npx vitest run a', decision: { remote: false } })).toEqual({ command: 'npx vitest run a', takeLocalSlot: true, setHeld: true });
   expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode: 1, ranOn: { location: 'remote', failureLocation: 'remote' } })).toBe(true);
+});
+
+it.each([
+  ['remote admission deferral', {}, true],
+  ['remote failure with details', { failureDetails: { tests: [{ file: 'a.test.mjs', name: 'failure' }], summary: 'remote failure' } }, false],
+  ['empty collector details', { failureDetails: { tests: [], summary: 'UNSETTLED', truncated: false } }, true],
+  ['mixed remote failure', { ranOn: { location: 'mixed', failureLocation: 'remote' } }, true],
+  ['shard unsettled', { plan: { takeLocalSlot: false, shardWrapper: true } }, false],
+  ['shard failure with details', { plan: { takeLocalSlot: false, shardWrapper: true }, failureDetails: { summary: 'shard failure' } }, false],
+  ['local plan', { plan: { takeLocalSlot: true } }, false],
+  ['local fallback', { ranOn: { location: 'local', failureLocation: 'local' } }, false],
+  ['mixed local failure', { ranOn: { location: 'mixed', failureLocation: 'local' } }, false],
+  ['unknown location', { ranOn: { location: 'unknown' } }, false],
+  ['remote successful prefix', { ranOn: { location: 'remote' } }, false],
+  ['signal', { signal: 'SIGTERM' }, false],
+  ['watchdog timeout', { timedOut: true }, false],
+])('exit 75 confirmation respects ownership and evidence: %s', (_name, overrides, expected) => {
+  expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode: 75,
+    ranOn: { location: 'remote', failureLocation: 'remote' }, ...overrides })).toBe(expected);
+});
+
+// Run the production phase orchestration with injected child IO and admission, without Git writes.
+it.each([1, 75].flatMap(remoteExit => [false, true].flatMap(phaseAdmission => [false, true].flatMap(remoteFailure => [
+  { remoteExit, phaseAdmission, remoteFailure, localExit: 0, localFailure: false, status: remoteExit === 75 && remoteFailure ? 'red' : 'green' },
+  { remoteExit, phaseAdmission, remoteFailure, localExit: 1, localFailure: true, status: 'red' },
+  { remoteExit, phaseAdmission, remoteFailure, localExit: 75, localFailure: true, status: 'red' },
+  { remoteExit, phaseAdmission, remoteFailure, localExit: 75, localFailure: false, status: remoteExit === 75 && remoteFailure ? 'red' : 'infrastructure-failure' },
+]))))('remote confirmation policy across phase and shard paths: remoteExit=$remoteExit, phase=$phaseAdmission, remoteFailure=$remoteFailure, localExit=$localExit, localFailure=$localFailure', async ({ remoteExit, phaseAdmission, remoteFailure, localExit, localFailure, status }) => {
+  const source = readFileSync(resolve('scripts/verify-lane.mjs'), 'utf8');
+  const start = source.indexOf('async function timedRunGate(');
+  const end = source.indexOf('// runVitestOnBase', start);
+  expect(start).toBeGreaterThan(-1);
+  expect(end).toBeGreaterThan(start);
+  const remoteDetails = remoteFailure
+    ? { tests: [{ file: 'remote.test.mjs', name: 'remote failure' }], summary: 'remote failure', truncated: false } : createFailureCollector().finish();
+  const localDetails = localFailure
+    ? { tests: [{ file: 'local.test.mjs', name: 'local failure' }], summary: 'local failure', truncated: false } : createFailureCollector().finish();
+  const runGate = vi.fn().mockResolvedValueOnce({ exitCode: remoteExit, remoteAttempt: true,
+    ranOn: { location: 'remote', failureLocation: 'remote' }, failureDetails: remoteDetails })
+    .mockResolvedValue({ exitCode: localExit, failureDetails: localDetails, ranOn: { location: 'local' } });
+  const acquireAdmission = vi.fn(async () => ({ ok: true }));
+  const context = {
+    phaseAdmission, firstPhaseAdmission: { remote: true }, admission: { remote: true }, currentAdmission: null,
+    phaseAdmissionPlan, shouldConfirmRemoteRed, remoteInfrastructureFailure, mergeRunLocation,
+    runGate, acquireAdmission, recordOutcome: vi.fn(), buildPhaseOutcome: value => value,
+    ranOnPhases: {}, phaseMs: {}, remoteUnconfirmed: false, phaseTimeout: null, vitestAdmittedLocally: false,
+    resolvedGate: null, slotHeartbeat: null, setInterval: vi.fn(() => ({ unref() {} })), clearInterval: vi.fn(),
+    heartbeatOwnedSlot: vi.fn(), releaseOwnedSlot: vi.fn(), ADMISSION_LOCK_ROOT: '', ADMISSION_CAP: 1,
+    REPO: process.cwd(), SLOT_HEARTBEAT_MS: 1000, PHASE_TIMEOUT_MS: 10000, MARKER_NONCE_SUFFIX: '', performance,
+    process: { stderr: { write: vi.fn() } },
+  };
+  const timedRunGate = runInNewContext(`${source.slice(start, end)}; timedRunGate`, context);
+  const result = await timedRunGate('standardsMs', 'npm run check:standards');
+  if (localExit === 0) {
+    const remoteReports = new Map();
+    let attempts = 0;
+    const shardExit = await runShards({ argv: ['npx', 'vitest', 'run', 'remote.test.mjs'], shards: 1, parallel: 1, budgetMs: 10000 }, {
+      discover: () => null, env: {}, log: () => {}, tmpdir: () => '/scratch',
+      fs: { mkdtempSync: () => '/scratch/shards', rmSync: () => {}, readFileSync: path => {
+        if (!remoteReports.has(path)) throw Error('missing');
+        return remoteReports.get(path);
+      } },
+      acquireLocal: async () => ({ ok: true }), releaseLocal: () => {},
+      execute: async options => {
+        const initial = attempts++ === 0;
+        if (initial) remoteReports.set(options.remoteReport, JSON.stringify({ location: 'remote', exitCode: remoteExit }) + '\n');
+        const verdict = initial && remoteFailure ? 'failed' : 'passed';
+        return { exitCode: initial ? remoteExit : 0, reportText: JSON.stringify({ testResults: [
+          { name: 'remote.test.mjs', status: verdict, assertionResults: [{ status: verdict, fullName: 'remote failure' }] },
+        ] }) };
+      },
+    });
+    expect(shardExit).toBe(status === 'green' ? 0 : 1);
+    expect(attempts).toBe(remoteExit === 75 && remoteFailure ? 1 : 2);
+  }
+  if (remoteExit === 75 && remoteFailure) {
+    expect(runGate).toHaveBeenCalledTimes(1);
+    expect(acquireAdmission).not.toHaveBeenCalled();
+    expect(result.failureDetails).toBe(remoteDetails);
+    expect(verifyFinishBody({}, result)).toMatchObject({ status: 'red', exitCode: 75, failureDetails: remoteDetails });
+    return;
+  }
+  expect(runGate).toHaveBeenCalledTimes(2);
+  expect(runGate).toHaveBeenNthCalledWith(1, 'npm run check:standards', undefined, { forgeDispatch: true });
+  expect(runGate).toHaveBeenNthCalledWith(2, 'npm run check:standards', undefined);
+  expect(acquireAdmission).toHaveBeenCalledTimes(1);
+  expect(acquireAdmission).toHaveBeenCalledWith('standards', 'npm run check:standards', { forceLocal: true });
+  expect(context.releaseOwnedSlot).toHaveBeenCalledTimes(1);
+  expect(result.exitCode).toBe(localExit);
+  expect(result.failureDetails).toBe(localDetails);
+  expect(result.ranOn).toEqual({ location: 'local', remoteRedConfirmedLocally: true });
+  expect(context.ranOnPhases.standards).toEqual(result.ranOn);
+  expect(context.recordOutcome).toHaveBeenCalledWith('standards', expect.objectContaining({ exitCode: localExit, failureDetails: localDetails }));
+  const infrastructure = verificationInfrastructureFailure(result);
+  const marker = verifyFinishBody({}, { ...result, infrastructure });
+  expect(marker.status).toBe(status);
+  if (status === 'red') expect(marker.failureDetails.summary).toBe('local failure');
+  if (status === 'infrastructure-failure') expect(marker.infrastructure.reason).toBe('verify-unsettled');
+});
+
+// R495 — `vitest related` stays on the Mac by design (the remote wrapper maps only `vitest run`); name why.
+it('names the local-only reason for a vitest related phase and keeps raw-command for the rest', () => {
+  expect(localPhaseReason("npx vitest related 'scripts/a.mjs' --run --passWithNoTests && npm run check:standards"))
+    .toBe('vitest-related-local-only');
+  expect(localPhaseReason('NODE_ENV=x npx vitest related a.mjs --run')).toBe('vitest-related-local-only');
+  expect(localPhaseReason('npx vitest run a.test.mjs')).toBe('raw-command');
+  expect(localPhaseReason('echo hi')).toBe('raw-command');
 });

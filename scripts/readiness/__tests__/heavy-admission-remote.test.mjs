@@ -2,7 +2,7 @@
 /** Contract tests for the pending remote admission exports; all execution and load IO is injected. */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { execSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, readFileSync, utimesSync, statSync } from 'node:fs';
+import { readdirSync, mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, readFileSync, utimesSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { main, decideRemote, runWithRemoteDecision, adaptLegacyRemoteResult, resolveAdmissionPolicy, heldSlots, shellQuoteWord, DEFAULT_ADMISSION_CEILING_MS, DEFAULT_FAST_RUN_TIMEOUT_MS } from '../heavy-admission.mjs';
@@ -23,7 +23,7 @@ vi.mock('../../lib/container-exec.mjs', async (importOriginal) => ({
 
 const argv = ['npm', 'run', 'test:unit', '--', 'a file.test.mjs', '$(must-stay-literal)'];
 const remoteDefaults = { enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null,
-  maxConcurrent:8, backoffMs:120000, backoffFailures:3, maxLoadPerCore:0.8, minFreeRamPct:15 };
+  maxConcurrent:8, backoffMs:120000, backoffFailures:3, maxLoadPerCore:0.8, minFreeRamPct:15, stuckMinSlots:2, stuckAgeMs:600000, stuckSignalEveryMs:600000 };
 const testRoots=[];
 afterEach(()=>{for(const root of testRoots.splice(0))rmSync(root,{recursive:true,force:true});});
 const healthyRead=async()=>({sampledAtET:(await import('../forge-exec-run.mjs')).easternTimestamp(Date.now()),
@@ -109,11 +109,13 @@ describe('remote admission policy', () => {
     }
   });
 
-  it('runs unsupported check:standards arguments locally with a reason and no remote staging',async()=>{
+  it.each([
+    ['unsupported standards', ['npm','run','check:standards','--','--unknown']],
+    ['serial retry local-only by design', ['npx','vitest','run','scripts/example.test.mjs','--maxWorkers=1','--minWorkers=1','--no-file-parallelism']],
+  ])('runs %s locally with a reason and no remote staging',async(_name,command)=>{
     const root=mkdtempSync(join(process.env.TMPDIR,'standards-fallback-')),pool=join(root,'pool');mkdirSync(pool);
     const preferences=join(root,'preferences.json');
     writeFileSync(preferences,JSON.stringify({heavyAdmission:{remote:{enabled:true,mode:'always'}}}));
-    const command=['npm','run','check:standards','--','--unknown'];
     const exited=new Error('test exit'),transport=vi.fn(),stage=vi.fn();
     const exit=vi.spyOn(process,'exit').mockImplementation(()=>{throw exited;});
     const stderr=vi.spyOn(process.stderr,'write').mockImplementation(()=>true);
@@ -185,7 +187,9 @@ describe('remote admission policy', () => {
       expect(remoteExec).toHaveBeenCalledWith(expect.objectContaining({ argv:expected, cwd: root, signal: expect.any(AbortSignal) }));
       expect(exit).toHaveBeenCalledWith(23);
       expect(JSON.parse(readFileSync(join(root, 'verify-report.jsonl'), 'utf8'))).toEqual({ location: 'remote', receiptId: 'run-123456', exitCode: 23 });
-      expect(existsSync(join(pool, '.admission','heavy'))).toBe(false);
+      // R501: the only thing a remote success may leave in the heavy root is the forgeShare record
+      expect(existsSync(join(pool, '.admission','heavy','slot-0'))).toBe(false);
+      expect(readdirSync(join(pool, '.admission','heavy'))).toEqual(['remote-runs.jsonl']);
       expect(heldSlots({lockRoot:join(pool,'.admission','remote'),cap:8})).toHaveLength(0);
     } finally { exit.mockRestore(); stderr.mockRestore(); vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); }
   });
@@ -412,6 +416,40 @@ describe('runWithRemoteDecision', () => {
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
     expect(f.log.mock.calls[1][0]).toContain(reason);
     expect(f.log.mock.calls[1][0]).toContain('refusing local rerun');
+  });
+
+  it.each(['not-started','cancelled'].flatMap(mode=>
+    ['copy-failed'].map(reason=>[mode,reason])))
+  ('records exactly one structured fallback for %s / %s', async (mode, reason) => {
+    const f = fixture({result:{mode,terminated:true,reason,detail:'fixture-file.mjs'}});
+    const now = Date.now();
+    expect(await runWithRemoteDecision({...f,clock:()=>now})).toEqual({handled:false});
+    const lines = readFileSync(join(f.lockRoot,'remote-fallbacks.jsonl'),'utf8').trim().split('\n');
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0])).toEqual({ts:new Date(now).toISOString(),reason,
+      detail:'fixture-file.mjs',lane:'fixture-checkout',kind:'files'});
+  });
+
+  it('records health refusals without dispatching remotely', async () => {
+    const f = fixture();
+    expect(await runWithRemoteDecision({...f,readTelemetry:async()=>null})).toEqual({handled:false});
+    expect(f.remoteExec).not.toHaveBeenCalled();
+    const rows = readFileSync(join(f.lockRoot,'remote-fallbacks.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({reason:expect.any(String),detail:null,lane:'fixture-checkout',kind:'files'});
+  });
+
+  it('bounds fallback log growth and tolerates an unwritable log', async () => {
+    const f = fixture({result:{mode:'not-started',terminated:true,reason:'copy-failed',detail:'x'.repeat(20000)}});
+    mkdirSync(f.lockRoot,{recursive:true});
+    const file = join(f.lockRoot,'remote-fallbacks.jsonl');
+    writeFileSync(file,'x'.repeat(2*1024*1024));
+    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(statSync(file).size).toBeLessThanOrEqual(1024*1024);
+    const last = JSON.parse(readFileSync(file,'utf8').trim().split('\n').at(-1));
+    expect(last.detail.length).toBeLessThanOrEqual(4096);
+    rmSync(file); mkdirSync(file);
+    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
   });
 
   it.each(['not-started', 'cancelled'])('%s with terminated=true falls back to local admission', async (mode) => {
