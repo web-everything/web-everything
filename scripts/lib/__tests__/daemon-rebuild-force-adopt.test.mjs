@@ -449,6 +449,29 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     expect(headOf(cloneDir)).toBe(lastGood);
   });
 
+  it('a rollback never reverts a build a sibling adopted while the health probe ran: the watch closes and the newer build keeps running', async () => {
+    const { originDir, cloneDir, env, lastGood, target, arm } = setup();
+    arm();
+    await tick(cloneDir, env, { runSmoke: failing() }); // the forced build is adopted and watched
+    expect(headOf(cloneDir)).toBe(target);
+    let successor = null;
+    const probe = async () => { // a sibling lands a newer healthy build while this probe is in flight, then this probe reports unhealthy
+      successor = advanceMainEmpty(originDir);
+      gitOk(cloneDir, ['fetch', '-q', 'origin']);
+      gitOk(cloneDir, ['reset', '-q', '--hard', successor]);
+      return { healthy: false };
+    };
+    await tick(cloneDir, env, { runSmoke: passing(), forceWatchProbe: probe });
+    expect(successor).not.toBeNull();
+    expect(headOf(cloneDir)).toBe(successor); // NOT reset to last-good
+    expect(headOf(cloneDir)).not.toBe(lastGood);
+    expect(readForceWatch(cloneDir, env)).toBeNull();
+    const events = readFileSync(env.WE_DAEMON_EVENTS, 'utf8');
+    expect(events).toMatch(/force-adopt-watch-superseded/);
+    expect(events).not.toMatch(/force-adopt-rolled-back/);
+    expect(handoffOf(env)).not.toMatch(/ROLLED BACK/);
+  });
+
   it('a finalization that fails clears the watch AND the ready candidate, and logs the build as not adopted', async () => {
     const { cloneDir, env, lastGood, target, arm } = setup();
     arm();

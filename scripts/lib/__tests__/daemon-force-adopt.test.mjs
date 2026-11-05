@@ -249,6 +249,42 @@ describe('runForceWatchTick', () => {
     expect(rollback).toHaveBeenCalledTimes(3);
     expect(readForceWatch(root, env)).toBeNull();
   });
+  it('a healthy probe that resolves after a concurrent tick recorded a failed rollback does not erase the owed rollback', async () => {
+    await setup();
+    const healthy = async () => ({ healthy: true });
+    for (let i = 0; i < 4; i++) await runForceWatchTick({ root, env, probe: healthy, rollback: async () => ({ ok: true }), emit: async () => {} });
+    expect(readForceWatch(root, env).ticksLeft).toBe(1); // the next healthy tick would end the watch
+    let release; const gate = new Promise((r) => { release = r; });
+    const firstRollback = vi.fn(async () => ({ ok: true }));
+    const first = runForceWatchTick({ root, env, probe: async () => { await gate; return { healthy: true }; }, rollback: firstRollback, emit: async () => {} });
+    const second = await runForceWatchTick({ root, env, probe: async () => ({ healthy: false }), rollback: async () => ({ ok: false }), emit: async () => {} });
+    expect(second.action).toBe('rollback-failed');
+    expect(readForceWatch(root, env)).toMatchObject({ rollbackPending: 'health-failed' });
+    release();
+    // the stale healthy result must not end the watch: the owed rollback is honoured by this tick
+    expect(await first).toMatchObject({ action: 'rollback', reason: 'health-failed' });
+    expect(firstRollback).toHaveBeenCalledTimes(1);
+    expect(readForceWatch(root, env)).toBeNull(); // cleared by the successful rollback, not by a countdown
+  });
+  it('a tick whose probe resolves after another tick closed the watch neither counts down nor re-creates it', async () => {
+    await setup();
+    let release; const gate = new Promise((r) => { release = r; });
+    const first = runForceWatchTick({ root, env, probe: async () => { await gate; return { healthy: true }; }, rollback: async () => ({ ok: true }), emit: async () => {} });
+    expect((await runForceWatchTick({ root, env, probe: async () => ({ healthy: false }), rollback: async () => ({ ok: true }), emit: async () => {} })).action).toBe('rollback');
+    expect(readForceWatch(root, env)).toBeNull();
+    release();
+    expect(await first).toEqual({ action: 'none' });
+    expect(readForceWatch(root, env)).toBeNull(); // the stale 'continue' write did not resurrect the closed watch
+  });
+  it('a rollback that reports a superseding build closes the watch without reverting and without logging ROLLED BACK', async () => {
+    await setup();
+    const events = [];
+    const r = await runForceWatchTick({ root, env, probe: async () => ({ healthy: false }), rollback: async () => ({ superseded: true, head: 'c'.repeat(40) }), emit: async (e) => { events.push(e); } });
+    expect(r).toEqual({ action: 'superseded' });
+    expect(readForceWatch(root, env)).toBeNull();
+    expect(events.map((e) => e.kind)).toEqual(['force-adopt-watch-superseded']);
+    expect(existsSync(env.WE_FORCE_ADOPT_HANDOFF) ? readFileSync(env.WE_FORCE_ADOPT_HANDOFF, 'utf8') : '').not.toMatch(/ROLLED BACK/);
+  });
   it('a failed rollback whose marker cannot be written to disk is still owed: a later healthy probe rolls back', async () => {
     await setup();
     const rollback = vi.fn().mockResolvedValueOnce({ ok: false }).mockResolvedValue({ ok: true });

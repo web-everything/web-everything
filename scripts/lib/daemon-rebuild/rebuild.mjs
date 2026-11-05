@@ -129,17 +129,24 @@ async function forceWatch(options, emitEvent, startedAtMs) {
     await runForceWatchTick({
       root, env: stEnv, notBefore: startedAtMs, currentHead: () => verifyRev(makeGit({ run, cwd: root, env }), 'HEAD') || null, emit: (e) => emitEvent(e, { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } }),
       probe: options.forceWatchProbe ?? defaultForceWatchProbe(run, env),
-      rollback: async (lastGood) => {
+      rollback: async (lastGood, { sha } = {}) => {
         if (!lastGood?.head) return { ok: false };
         const git = makeGit({ run, cwd: root, env });
-        const head = verifyRev(git, 'HEAD');
-        clearReadyCandidate(root, stEnv);
-        if (head === lastGood.head) return { ok: true };
-        const fin = await withWriteLock(root, () => finalizeRebuild({
-          root, env, log, run, stateOpts, now, prevHead: head, lease: { token: 'force-adopt-rollback' },
-          plan: { ok: true, finalSha: lastGood.head, inputsKey: lastGood.inputsKey, mainSha: lastGood.mainSha, applied: lastGood.applied || [] },
-        }), { now });
-        return { ok: fin.ok === true && fin.value?.adopted === true };
+        // HEAD is read INSIDE the write lock and compared with the watched build: a sibling that adopted a newer build while the
+        // health probe ran must not be reset to last-good (finalize would accept the newer head as `prevHead` and revert it).
+        const fin = await withWriteLock(root, async () => {
+          const head = verifyRev(git, 'HEAD');
+          if (head === lastGood.head) { clearReadyCandidate(root, stEnv); return { ok: true }; } // already reverted
+          if (sha && head !== sha) return { superseded: true, head };
+          clearReadyCandidate(root, stEnv);
+          const done = await finalizeRebuild({
+            root, env, log, run, stateOpts, now, prevHead: head, lease: { token: 'force-adopt-rollback' },
+            plan: { ok: true, finalSha: lastGood.head, inputsKey: lastGood.inputsKey, mainSha: lastGood.mainSha, applied: lastGood.applied || [] },
+          });
+          return { ok: done?.adopted === true };
+        }, { now });
+        if (fin.ok !== true) return { ok: false };
+        return fin.value;
       },
     });
   } catch { /* a watch failure never changes the rebuild outcome */ }

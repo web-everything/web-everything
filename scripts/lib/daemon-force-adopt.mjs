@@ -173,7 +173,7 @@ export function evaluateForceWatch({ watch, healthy, restarts = 0, maxRestarts =
 
 /** One tick of the post-force health watch. `probe(root)` -> { healthy, restarts? }; `rollback(lastGood)` -> { ok }. */
 export async function runForceWatchTick({ root, env = process.env, probe, rollback, emit, now = Date.now, notBefore = null, currentHead = null }) {
-  const watch = readForceWatch(root, env);
+  let watch = readForceWatch(root, env);
   if (!watch) return { action: 'none' };
   // A watch opened by THIS tick's own forced adoption starts counting at the next tick.
   if (notBefore !== null && Date.parse(watch.startedAt) >= notBefore) return { action: 'none' };
@@ -196,13 +196,27 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   if (head !== null && !watch.adoptedSeen) { watch.adoptedSeen = true; persist(watch); }
   let health;
   try { health = await probe(root); } catch { health = { healthy: false }; }
+  // The probe is async: a concurrent tick may have recorded an owed rollback, or closed the watch, since our first read. Decide
+  // from the CURRENT record, never the stale snapshot, so a healthy result can neither erase a mandatory rollback nor
+  // count down / re-create a watch another tick already closed.
+  const fresh = readForceWatch(root, env);
+  if (!fresh || fresh.sha !== watch.sha) return { action: 'none' };
+  watch = { ...fresh, adoptedSeen: fresh.adoptedSeen === true || watch.adoptedSeen === true };
   const pendingReason = watch.rollbackPending || pendingFor(root, env, watch.sha); // disk marker, else the in-process one
   const verdict = evaluateForceWatch({ watch: pendingReason ? { ...watch, rollbackPending: pendingReason } : watch, healthy: health?.healthy, restarts: health?.restarts ?? 0 });
   if (verdict.action === 'continue') { persist(verdict.watch); return { action: 'continue', ticksLeft: verdict.watch.ticksLeft }; }
   if (verdict.action === 'done') { clearWatch(root, env); await emit?.({ kind: 'force-adopt-watch-passed', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha } }); return { action: 'done' }; }
   const at = new Date(now()).toISOString();
   let result;
-  try { result = await rollback(watch.lastGood); } catch { result = { ok: false }; }
+  // `sha` lets the rollback verify, under the clone's write lock, that the watched build is STILL head before it reverts anything.
+  try { result = await rollback(watch.lastGood, { sha: watch.sha }); } catch { result = { ok: false }; }
+  if (result?.superseded === true) {
+    // A superseding build was adopted while the probe/rollback ran: it is running, the watched build is not, so there is nothing
+    // to revert. Close the watch without touching the newer build.
+    clearWatch(root, env);
+    await emit?.({ kind: 'force-adopt-watch-superseded', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, head: result.head ?? null } });
+    return { action: 'superseded' };
+  }
   if (!result?.ok) {
     // The owed-rollback marker must survive a failed state write: write it directly (not the swallowing persist) and, if
     // that throws, keep it in-process and say so in the handoff file so an operator can see the build is still owed a revert.
