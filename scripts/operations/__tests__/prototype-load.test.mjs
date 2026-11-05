@@ -2195,6 +2195,29 @@ describe('readyEvidence fingerprint carry (R503)', () => {
     const r = weak({ sha: SHA, fingerprint: undefined });
     expect(prototypeLoad.readyEvidence([r], input, [entry({ sha: SHA, fingerprint: undefined })])).toMatchObject({ ruledWeakened: { ruling: 'R396' } });
   });
+  // An explicit audit of the CURRENT head outranks older carried evidence: a WEAKENED live-head record needs its ruled exception.
+  it('a current-head WEAKENED record is not masked by an older carried green record', () => {
+    const older = green();
+    const current = weak({ sha: SHA });
+    expect(prototypeLoad.readyEvidence([older, current], input, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([older, weak({ sha: SHA, tests: 'red' })], input, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([older, { ...current, audit: 'weakened' }], input, [], FP)).toBeNull();
+    // The ruled exception (record + allowlist entry for the live head) still loads.
+    expect(prototypeLoad.readyEvidence([older, current], input, [entry({ sha: SHA })], FP))
+      .toEqual({ source: 'ready-record', record: current, ruledWeakened: { ruling: 'R396', findings } });
+  });
+  it('a later current-head NOT WEAKENED re-audit supersedes an earlier current-head WEAKENED record', () => {
+    const fresh = green({ sha: SHA });
+    expect(prototypeLoad.readyEvidence([weak({ sha: SHA }), fresh], input, [], FP)).toEqual({ source: 'ready-record', record: fresh });
+  });
+  it('a current-head WEAKENED record for another ref or sha does not veto', () => {
+    const older = green();
+    expect(prototypeLoad.readyEvidence([older, weak({ sha: SHA, ref: 'lane/other' })], input, [], FP)).toEqual({ source: 'ready-record', record: older });
+  });
+  it('the loader refuses with no-ready when the current head is WEAKENED over an older carried green record', async () => {
+    const out = await auditedFixture('warn', { ready: auditLines([green(), weak({ sha: SHA })]), fingerprint: () => FP }).run();
+    expect(out).toMatchObject({ ok: false, stopReason: 'no-ready' });
+  });
   it('the loader loads the live tip on a matching fingerprint and refuses with no-ready otherwise', async () => {
     const ready = auditLines([weak()]);
     const settings = { ruledWeakened: [entry()] };

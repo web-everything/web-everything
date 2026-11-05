@@ -26,7 +26,12 @@ export function readyEvidence(records, input, ruledWeakened = [], liveFp = null)
   // R503: a record speaks for the live sha when it names it exactly, or its stored net-diff fingerprint equals the live one.
   // A rebase or merge of main that leaves the code alone therefore keeps the evidence; any code change does not.
   const covers = (r) => r?.ref === input.branch && (r.sha === input.sha || validSha(r.sha) && carriesAcross(r.fingerprint, liveFp));
-  const record = records.find((r) => covers(r) && r.tests === 'green' && /^NOT WEAKENED$/i.test(r.audit || ''));
+  // An explicit verdict recorded for the CURRENT head outranks carried evidence: when the latest audit verdict naming the
+  // live sha exactly (any tests state, either case) is WEAKENED, an older carried NOT WEAKENED record must not mask it;
+  // the head then loads only through the ruled-exception path below. A later exact-head NOT WEAKENED re-audit lifts it.
+  const exact = records.filter((r) => r?.ref === input.branch && r.sha === input.sha && /^(?:NOT )?WEAKENED$/i.test(r.audit || '')).at(-1);
+  const headWeakened = /^WEAKENED$/i.test(exact?.audit || '');
+  const record = headWeakened ? null : records.find((r) => covers(r) && r.tests === 'green' && /^NOT WEAKENED$/i.test(r.audit || ''));
   if (record) return { source: 'ready-record', record };
   // The allowlist entry binds to the record by its exact sha, or (carry) by holding the live fingerprint itself.
   const binds = (e, r) => e.sha === r.sha && r.sha === input.sha || validSha(e.sha) && validSha(r.sha) && carriesAcross(e.fingerprint, liveFp) && carriesAcross(r.fingerprint, liveFp);
