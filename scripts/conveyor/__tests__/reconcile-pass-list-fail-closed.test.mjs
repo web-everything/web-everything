@@ -4,7 +4,17 @@
  * ETag-cached REST reader), 5xx retried with backoff, and every incomplete, failed or empty read FAILS CLOSED with a
  * named reason (504 incident 2026-11-03). Split out of reconcile-pass.test.mjs so it never collides with that file.
  */
-import { vi, it, expect, describe } from 'vitest';
+import { vi, it, expect, describe, beforeAll } from 'vitest';
+
+// Every test below pays a dynamic `import('../reconcile-pass.mjs')`. Under a loaded host that first import alone exceeds
+// the 5 s default test timeout; the timed-out test's still-running body then leaks a live `gh pr list` into the hermetic
+// guard and cascades red onto its neighbours (verify of PR #6407, load average ~48). Warm the module graph once, here,
+// with a budget sized for load, so the per-test timeouts measure the test and not the cold import.
+beforeAll(async () => {
+  await import('../reconcile-pass.mjs');
+  await import('../../lib/gh-throttle.mjs');
+  await import('../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs');
+}, 180_000);
 
 vi.mock('node:child_process', async (importOriginal) => ({
   ...await importOriginal(), execFileSync: vi.fn(),
