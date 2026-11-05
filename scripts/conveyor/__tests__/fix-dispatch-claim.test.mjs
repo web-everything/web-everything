@@ -768,17 +768,34 @@ describe('idle-claim auto-release (R201)', () => {
       invalid: ['platform.enabled="yes"', 'env.idleMinutes=0'] });
   });
 
-  it('releases a claim whose live listing row is state:working but status:idle (the real `claude agents` shape)', () => {
+  const runIdle = (rows, { hung = () => ({ ageMs: IDLE_MS + 60_000 }), identity } = {}) => {
     acquire();
-    const extra = { };
-    const rows = () => [{ name: 'fix-5996', state: 'working', status: 'idle' }];
-    const run = (at) => refreshLiveFixDispatchClaims({
-      lockRoot: claimRoot, listAgentsAll: rows, hungInfoFor: () => null, awaitingVerifyFor: null,
-      prHeadFor: () => 'sha1', recordEvent: () => {}, nowIso: () => iso(at),
-      idleRelease: resolveIdleClaimRelease({ env: {}, platform: null }), ...extra,
-    });
     const released = [];
-    for (let t = T0 + 60_000; t <= T0 + 60_000 + IDLE_MS; t += 120_000) released.push(...(run(t).released ?? []));
+    for (let t = T0 + 60_000; t <= T0 + 60_000 + IDLE_MS; t += 120_000) {
+      released.push(...(refreshLiveFixDispatchClaims({
+        lockRoot: claimRoot, listAgentsAll: () => rows, hungInfoFor: hung, awaitingVerifyFor: null,
+        prHeadFor: () => 'sha1', recordEvent: () => {}, nowIso: () => iso(t),
+        ...(identity ? { identity } : {}),
+        idleRelease: resolveIdleClaimRelease({ env: {}, platform: null }),
+      }).released ?? []));
+    }
+    return released;
+  };
+
+  it('keeps a claim whose row is state:working even when status:idle (working is never released)', () => {
+    expect(runIdle([{ name: 'fix-5996', state: 'working', status: 'idle' }])).toHaveLength(0);
+  });
+
+  it.each([undefined, 'unknown', '', 'some-new-state'])('keeps a status:idle claim whose state is unknown (%s)', (state) => {
+    expect(runIdle([{ name: 'fix-5996', ...(state === undefined ? {} : { state }), status: 'idle' }])).toHaveLength(0);
+  });
+
+  it('keeps a claim whose row is status:idle with a non-idle state (status alone is not evidence)', () => {
+    expect(runIdle([{ name: 'fix-5996', state: 'waiting', status: 'idle' }])).toHaveLength(0);
+  });
+
+  it('releases a state:idle claim with no bound pid (positive idle evidence)', () => {
+    const released = runIdle([{ name: 'fix-5996', state: 'idle' }]);
     expect(released).toHaveLength(1);
     expect(released[0].reason).toMatch(/idle-head-unmoved/);
   });
