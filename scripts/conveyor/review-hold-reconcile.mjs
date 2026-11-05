@@ -76,6 +76,7 @@ import { ADVISORY_LABELS } from '../lib/advisory-labels.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { LIST_COMMENTS_CAP, defaultListPrs, defaultReadPr } from './advisory-label-sweep.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
+import { sweepAuthorStamps } from '../lib/author-stamp-restore.mjs';
 import { sweepAutoBlock } from './referral-auto-block.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { sweepAcceptCarry, defaultCloneDirFor } from './accept-carry-sweep.mjs';
@@ -160,7 +161,7 @@ export function _resetStrandedCheckMemo() { strandedChecked.clear(); }
 export function sweepReviewHoldLabels({
   repo = null, listPrs = defaultListPrs, provider = createGhProvider(), dryRun = false, settings, runRuling, acceptCarry,
   readComments = readCompletePrComments, readPr = defaultReadPr,
-  numberingRestamp = restampAfterNumbering, exec = execFileSync, now = Date.now, log = (line) => writeLineSync(2, line),
+  numberingRestamp = restampAfterNumbering, restoreStamps, exec = execFileSync, now = Date.now, log = (line) => writeLineSync(2, line),
 } = {}) {
   // The ONE source of the accept-carry setting (WE_ACCEPT_CARRY_FORWARD > settings/accept-carry-forward.json >
   // default), read once per sweep and logged with its source. No timing setting (review.skipDrainMechanical) governs it.
@@ -176,6 +177,19 @@ export function sweepReviewHoldLabels({
     if (typeof resolvedRepo !== 'string' || !resolvedRepo.trim()) throw new Error('missing repository');
     return resolvedRepo;
   };
+  // Injected listings remain hermetic unless their caller explicitly supplies the restore seam.
+  if (restoreStamps !== undefined || listPrs === defaultListPrs) {
+    try {
+      for (const r of (restoreStamps ?? sweepAuthorStamps)({ repo: repoOf(), dryRun, log })) {
+        results.push({ num: r.num, stampRestore: r.action, detail: r.detail });
+        log(`  PR #${r.num}: author stamp ${r.action} — ${String(r.detail?.reason ?? '').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ')}`);
+      }
+    } catch (e) {
+      const reason = String(e?.message ?? e).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
+      results.push({ num: 0, stampRestore: 'refuse', detail: { reason } });
+      log(`  author stamp sweep refused: ${reason}`);
+    }
+  }
   const restamped = new Set();
   for (const pr of Array.isArray(prs) ? prs : []) {
     const names = labelNames(pr.labels);

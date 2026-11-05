@@ -105,7 +105,7 @@ describe('repair() — GraphQL userContentEdits recovery', () => {
 
   it('recovers #6244 via GraphQL userContentEdits, never the REST issues timeline', () => {
     const nodes = [
-      { createdAt: '2026-10-01T10:00:00Z', editor: { login: 'plateau-worker' }, diff: `Original\n\n${stamp(A)}` },
+      { createdAt: '2026-10-01T10:00:00Z', editor: { login: 'plateau-worker' }, diff: `@@ -0,0 +1,3 @@\n+Original\n+\n+${stamp(A)}` },
       { createdAt: '2026-10-01T11:00:00Z', editor: { login: 'chalbert' }, diff: 'First web edit' },
       { createdAt: '2026-10-01T12:00:00Z', editor: { login: 'chalbert' }, diff: unstamped },
     ];
