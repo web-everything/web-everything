@@ -246,6 +246,15 @@ describe('settlement reads fresh PR state and result evidence', () => {
       expect(o.syncLabels).not.toHaveBeenCalled();
     }
   });
+  it('a parsed confirmed break plus an extra indented unparsed finding line never clears, even with a later clean result', () => {
+    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: {}, recorded: false, seatRecorded: false,
+      status: { status: 'finished', result: { foldedVerdict: 'accept' } } })), readIgnorableConfirms: () => [] });
+    o.rawPrs[0].comments.push({ author: { login: 'web-everything' }, createdAt: iso(acceptedAt + 1),
+      body: `${redTeamMarker(pr, head)}\n### Post-accept red team — 1 possible break(s), 1 confirmed by Claude's re-check\n\n1. [**confirmed**] (edge-case, broken) — real\n  2. [**confirmed**] (edge-case, broken) — hidden` },
+    { ...resultComment(), createdAt: iso(acceptedAt + 2) });
+    mod.runRedTeamOnSkip(o);
+    expect(o.syncLabels).not.toHaveBeenCalled();
+  });
   it('a throwing result evidence read settles nothing and reports settleError', () => {
     const o = runFixture({ readEvidence: () => { throw Error('fresh evidence offline'); } });
     o.rawPrs[0].comments.push(resultComment());
