@@ -206,6 +206,21 @@ describe('bornAs read over REST', () => {
       const rest = rest0({ 'compare/': ok({ files: [{ filename: 'backlog/12-new.md', status: 'added' }, { filename: 'backlog/12-old.md', status: 'removed' }] }), ...fileWorld('backlog/12-new.md', b64(CARD)) });
       expect(checkBornAsCollision(args(rest, g))).toEqual({ ok: true });
     });
+    it('a renamed main card edited after the merge-base keeps its new identity: it still collides', () => {
+      // The PR renames 12-old -> 12-new (head bornAs xold111) and adds 13-r (bornAs xabc123). Main then edited 12-old
+      // to bornAs xabc123; git carries that edit into the rename, so the old path must still be read.
+      const q = b64('---\nbornAs: xold111\n---\nq\n');
+      const r = b64('---\nbornAs: xabc123\n---\nr\n');
+      const rest = rest0({
+        'compare/': ok({ files: [{ filename: 'backlog/12-new.md', status: 'renamed', previous_filename: 'backlog/12-old.md' }, { filename: 'backlog/13-r.md', status: 'added' }] }),
+        'git/commits/': ok({ truncated: false, tree: { sha: 'rt0' } }),
+        'git/trees/rt0': ok({ truncated: false, tree: [{ path: 'backlog', type: 'tree', sha: 'rt1' }] }),
+        'git/trees/rt1': ok({ truncated: false, tree: [{ path: '12-new.md', type: 'blob', mode: '100644', sha: q.sha }, { path: '13-r.md', type: 'blob', mode: '100644', sha: r.sha }] }),
+        'contents/backlog/12-new.md': ok(q),
+        'contents/backlog/13-r.md': ok(r),
+      });
+      expect(checkBornAsCollision(args(rest, g))).toMatchObject({ collision: { hash: 'xabc123', path: 'backlog/13-r.md', mainCard: 'backlog/12-old.md' } });
+    });
     it('another main card holding the identity still collides when one is vacated', () => {
       const two = 'origin/main:backlog/12-old.md\0bornAs: xabc123\norigin/main:backlog/13-other.md\0bornAs: xabc123\n';
       const rest = world({ status: 'renamed', previous_filename: 'backlog/12-old.md' });
@@ -453,7 +468,7 @@ describe('bounded calls: per-call deadline through the throttled reader', () => 
   });
   it('a multi-call read stops with deadline once the overall deadline passes mid-way', () => {
     let t = NOW;
-    const rest = (p) => { t += 20; if (p.includes('git/ref/heads/')) return ok({ object: { sha: SHA } }); return ok({ files: Array.from({ length: 100 }, (_x, i) => ({ filename: `f${i}-${t}`, status: 'modified' })) }); };
+    const rest = (p) => { t += 30; if (p.includes('git/ref/heads/')) return ok({ object: { sha: SHA } }); return ok({ files: Array.from({ length: 100 }, (_x, i) => ({ filename: `f${i}-${t}`, status: 'modified' })) }); };
     const r = readAddedFiles('main', SHA, { source: createRestSource({ rest, slug: 'o/r', env: {}, now: () => t, deadlineAt: NOW + 25 }) });
     expect(r).toMatchObject({ ok: false, reason: 'deadline' });
   });

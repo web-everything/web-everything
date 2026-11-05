@@ -78,9 +78,13 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
       try { lstatSync(join(cwd, '.git', path)); return true; } catch (e) { if (['ENOENT', 'ENOTDIR'].includes(e.code)) return false; throw e; }
     })) run(['commit-graph', 'verify']);
     let names;
-    // Main paths this change itself empties (a removed card, the old path of a renamed one): a main card there is not
-    // a second holder of its identity once the change lands. A copy leaves its source in place, so it is not listed.
-    let vacated = new Set();
+    // Main cards this change itself empties. A removed card is not a second holder once the change lands (a main edit
+    // to a path the change deletes is a modify/delete conflict, so it cannot merge silently). A renamed card is skipped
+    // only when its identities on main are all still carried by the card at its new path: main may have edited the old
+    // path after the merge-base, and git carries that edit over, so a path-only skip could hide a new duplicate.
+    // A copy leaves its source in place, so it is neither.
+    let removed = new Set();
+    let renamedTo = new Map();
     let headText = (path) => run(['show', `${headSha}:${path}`]);
     if (api) {
       // R546: the added cards and their text come from GitHub REST (ETag; no fetch of the PR head). Main is judged
@@ -89,7 +93,8 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
       const addedRead = readAddedFiles(base, headSha, o);
       const changes = unwrap(addedRead);
       names = changes.added.filter(path => TOP_LEVEL_CARD.test(path));
-      vacated = new Set(changes.vacated);
+      removed = new Set(changes.removed);
+      renamedTo = new Map(changes.renames.map(({ from, to }) => [from, to]));
       headText = (path) => {
         const text = unwrap(readFileAtRef('bornas-card', path, headSha, o));
         if (text == null) throw new DrainReadError('bornas-card', 'api-http-404', `${path} missing at the pinned head`);
@@ -115,11 +120,13 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
     // line in the file, so a malformed card can never slip a duplicate past the check; a main hit on such a line is
     // held, never labelled, since the line may be a body example. A card with an opaque opener has unknown identities.
     const added = new Map();
+    const carried = new Map(); // added card path -> every identity string it carries
     let unreadable = null;
     for (const path of names) {
       const stem = path.split('/').pop().replace(/\.md$/, '').split('-')[0];
       const { parsed, malformed, opaque, ids } = cardIdentities(headText(path));
       if (opaque) unreadable ??= `added card ${path} has no readable frontmatter`;
+      carried.set(path, new Set([stem, ...ids]));
       for (const [hash, confirmed] of [[stem, true], ...ids.map(id => [id, parsed && !malformed])]) {
         if (HASH.test(hash) && !added.get(hash)?.confirmed) added.set(hash, { path, confirmed });
       }
@@ -147,7 +154,7 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
       if (line && (!line.startsWith(prefix) || split < 0)) throw new Error('main grep output names a path it cannot delimit');
       if (!line || !mentions.test(line.slice(split + 1))) continue;
       const mainPath = line.slice(prefix.length, split);
-      if (TOP_LEVEL_CARD.test(mainPath) && !vacated.has(mainPath)) mainCards.add(mainPath);
+      if (TOP_LEVEL_CARD.test(mainPath) && !removed.has(mainPath)) mainCards.add(mainPath);
     }
     if (mainCards.size > MAX_MAIN_READS) throw new Error(`${mainCards.size} main cards mention an added hash, over the ${MAX_MAIN_READS}-card read bound`);
     // Only readable frontmatter on both sides confirms a collision. A top-level main card whose frontmatter is
@@ -157,6 +164,9 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
       const { parsed, malformed, opaque, ids } = cardIdentities(run(['show', `${prefix}${mainCard}`]));
       const hash = ids.find(id => added.has(id));
       if (!hash && !opaque) continue;
+      // The renamed card's own identities, all still carried at its new path, are not a second holder.
+      const kept = carried.get(renamedTo.get(mainCard));
+      if (!opaque && parsed && !malformed && kept && ids.every(id => kept.has(id))) continue;
       const card = added.get(hash);
       if (parsed && !malformed && card.confirmed) return done({ collision: { hash, path: card.path, mainCard } });
       unreadable ??= card && !opaque && parsed && !malformed

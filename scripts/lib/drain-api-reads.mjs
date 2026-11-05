@@ -253,10 +253,10 @@ const COMPARE_CEILING = 300; // GitHub lists at most 300 files per compare, with
 /**
  * Files ADDED by headSha relative to base (merge-base compare, like `git diff base...head --diff-filter=A`).
  * GitHub returns the WHOLE file list (up to 300) on the first response; `page` pages the commits and later pages
- * carry no files, so the files are read from that one response and never paged. value: { added, previous, vacated } -
+ * carry no files, so the files are read from that one response and never paged. value: { added, previous, removed, renames } -
  * `added` is every added file plus the NEW path of every renamed/copied entry (the old no-rename git diff counted a
- * rename as an addition); `previous` is the old path of renamed/copied entries; `vacated` is every path the change
- * leaves empty (a removed file, the old path of a rename), which a main card at that path no longer occupies.
+ * rename as an addition); `previous` is the old path of renamed/copied entries; `removed` is every deleted path;
+ * `renames` is each { from, to } of a renamed entry (a copy leaves its source in place, so it is in neither).
  */
 export function readAddedFiles(base, headSha, o = {}) {
   const read = 'bornas-added-files';
@@ -270,18 +270,19 @@ export function readAddedFiles(base, headSha, o = {}) {
   if (!Array.isArray(files)) return bad(r, 'api-malformed', 'no files list');
   const added = [];
   const previous = [];
-  const vacated = [];
+  const removed = [];
+  const renames = [];
   for (const f of files) {
     // Unknown evidence is never skipped: an entry without a name or a known status could hide an added card.
     if (typeof f?.filename !== 'string' || !KNOWN_STATUS.has(f.status)) return bad(r, 'api-malformed', 'file entry without a name or a known status');
     if (f.status === 'renamed' || f.status === 'copied') {
       if (typeof f.previous_filename !== 'string') return bad(r, 'api-malformed', `${f.status} entry without previous_filename`);
       previous.push(f.previous_filename);
-      if (f.status === 'renamed') vacated.push(f.previous_filename);
+      if (f.status === 'renamed') renames.push({ from: f.previous_filename, to: f.filename });
     }
-    if (f.status === 'removed') vacated.push(f.filename);
+    if (f.status === 'removed') removed.push(f.filename);
     if (f.status === 'added' || f.status === 'renamed' || f.status === 'copied') added.push(f.filename);
   }
   if (files.length >= COMPARE_CEILING) return bad(r, 'compare-ceiling', `compare returned ${files.length} files, at the ${COMPARE_CEILING}-file ceiling`);
-  return { ...good(r, { added, previous, vacated }), baseSha };
+  return { ...good(r, { added, previous, removed, renames }), baseSha };
 }
