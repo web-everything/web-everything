@@ -253,9 +253,7 @@ export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
       if (!isRealHead(rev) || rev === head) return false;
       const activeEffects = run.effects.some(effect => ['pending', 'in-flight'].includes(effect?.status));
       const unfinished = !run.verdict || run.pending != null || activeEffects;
-      // Only an inert needs-human confirm on a different head may be left behind.
-      if (unfinished && !(run.verdict?.verdict === 'needs-human'
-        && run.pending?.kind === 'confirm' && !activeEffects)) return false;
+      if (unfinished) return false;
     }
     return true;
   } catch { return false; }
@@ -327,17 +325,9 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (last != null && now - last < setting.retryCooldownMin * 60_000) return skip('retry cooldown active');
       return { ...row, ...decision };
     };
-    const fullReview = why => {
-      const reviews = Array.isArray(rawPr.reviews) ? rawPr.reviews : null;
-      const accepted = Array.isArray(rawPr.labels) && rawPr.labels.some(l => (typeof l === 'string' ? l : l?.name) === 'review:accepted');
-      const acceptance = accepted ? latestAcceptRecord(rawPr.comments, reviews) : null;
-      const context = { labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews };
-      const refusal = publishableClearGuard(context);
-      if (refusal) return guardedSkip(refusal);
-      if (reviews === null) return skip('PR reviews unreadable; inspect formal reviews before full review');
-      if (laterReviewHold(reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
-      return dispatchDecision({ action: 'review', why });
-    };
+    const failedRead = result => ({ ...skip(result.reason),
+      ...(result.reason === 'review-unfinished' ? { escalate: true,
+        ...(result.neverReviewed ? { escalationContext: 'head has no recorded review; inspect unfinished review evidence' } : {}) } : {}) });
     const readWithConfirms = reader => {
       const key = { repo, pr, head };
       const first = reader(key);
@@ -349,7 +339,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           ...(Number.isFinite(confirms.acceptedAt) ? { acceptedAt: confirms.acceptedAt } : {}) });
       } catch { return first; }
       try {
-        if (headNeverReviewed?.({ ...key, rawPr }) === true) return { neverReviewed: true };
+        if (headNeverReviewed?.({ ...key, rawPr }) === true) return { ...first, neverReviewed: true };
       } catch { /* Unknown scan retains review-unfinished. */ }
       return first;
     };
@@ -362,8 +352,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (redTeamForHead(rawPr.comments, pr, head) && (!journal || journal.step === 'done')) return { ...skip('red-team result already on head'), settle: 'result' };
       if (readWitness) {
         const w = readWithConfirms(readWitness);
-        if (w?.neverReviewed) return fullReview('head never reviewed; full review required');
-        if (w?.ok === false) return skip(w.reason);
+        if (w?.ok === false) return failedRead(w);
         if (['queued', 'running'].includes(w.rawWriter.parsed?.status) || w.rawWriter.parsed?.staleAbandoned) {
           const recovery = planRedTeamRecovery(w, recoveryOptions);
           return recovery.mode === 'skip' ? skip(recovery.why)
@@ -371,8 +360,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         }
       }
       const evidence = readWithConfirms(readEvidence);
-      if (evidence?.neverReviewed) return fullReview('head never reviewed; full review required');
-      if (evidence?.ok === false) return skip(evidence.reason);
+      if (evidence?.ok === false) return failedRead(evidence);
       if (evidence?.carryConflict) return skip('later review supersedes the carry');
       const unfinishedCarry = evidence?.carry && evidence.carry.step !== 'done';
       if (redTeamForHead(rawPr.comments, pr, head) && !unfinishedCarry) return { ...skip('red-team result already on head'), settle: 'result' };
@@ -591,19 +579,21 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       reviewsByPr.set(pr, reviews);
       return { ...rawPr, reviews };
     });
-    rows.push(...planRedTeamOnSkip({ repo, refusals, rawPrs: planningPrs,
+    const planningOptions = { repo, refusals, rawPrs: planningPrs,
       readEvidence: readEvidence === readDrainRedTeamEvidence ? ({ ignoreRunIds = [], acceptedAt, ...key }) => readEvidence({ ...key, env,
         runsDir: runsDirectory(env), list: revalidatedConfirmList({ ...key, ignoreRunIds, acceptedAt, list: listReviewRuns, read: readReviewRun, stat: statReviewRun }) }) : readEvidence,
       readStatus: readStatus === readRedTeamStatus ? key => readStatus({ ...key, env }) : readStatus,
       now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, readWitness,
       readIgnorableConfirms, headNeverReviewed,
-      recoveryOptions: { now: at, probe: recoveryProbe(), deadlineMs: staleRunDeadlineMs(env) } }));
+      recoveryOptions: { now: at, probe: recoveryProbe(), deadlineMs: staleRunDeadlineMs(env) } };
+    rows.push(...planRedTeamOnSkip(planningOptions));
     for (const row of rows) {
       let started = false;
       if (!dryRun && row.action === 'skip') {
         try {
           const key = { repo, pr: row.prNumber, head: row.head };
           if (row.escalate) {
+            if (row.escalationContext) note(`review-daemon: ${repo}#${row.prNumber} ${row.why}: ${row.escalationContext}`);
             const result = escalate({ ...key, why: row.why });
             if (result?.error || result?.outcome === 'error') {
               row.settleError = safeErrorText(result.error ?? result.reason ?? 'unknown error');
@@ -617,7 +607,14 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           else if (row.settle === 'not-owed') {
             const rawPr = planningPrs.find(p => Number(p?.number) === row.prNumber);
             if (Array.isArray(rawPr?.labels) && !rawPr.labels.some(l => (typeof l === 'string' ? l : l?.name) === 'red-team:blocked')) {
-              settlePending({ ...key, remove: ['red-team:pending'] });
+              const refusal = refusals.find(r => r.kind === 'already-reviewed-head' && Number(r.prNumber) === row.prNumber);
+              const currentPrs = (rawPrs ?? []).map(raw => Array.isArray(raw.reviews) ? raw : { ...raw,
+                reviews: planningPrs.find(p => Number(p.number) === Number(raw.number) && p.headRefOid === raw.headRefOid)?.reviews });
+              const [fresh] = planRedTeamOnSkip({ ...planningOptions, refusals: refusal ? [refusal] : [],
+                rawPrs: currentPrs, now: now() });
+              if (fresh?.action !== 'skip' || fresh.settle !== 'not-owed' || fresh.head !== row.head) {
+                row.settleError = 'evidence changed before settlement';
+              } else settlePending({ ...key, remove: ['red-team:pending'] });
             }
           }
         } catch (error) { row.settleError = safeErrorText(error); }

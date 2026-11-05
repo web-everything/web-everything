@@ -3,7 +3,7 @@
  * Replay the production skip runner and its bounded run scanners with injected evidence and IO.
  * No processes, network, or persisted run state; production modules always come from sourceRoot.
  */
-import { readFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -16,11 +16,7 @@ export default {
   card: 'LIVE: #6418, #6414, #6193, #6345',
   fixedBy: { sha: 'pending', where: 'lane/redteam-pending-label-never-settles', paths: [RECOVERY] },
   fixPresent(root) {
-    try {
-      const source = readFileSync(join(root, RECOVERY), 'utf8');
-      return ['ignorableConfirmRunIds', 'headNeverReviewedFromRuns']
-        .every(name => source.includes(`export function ${name}(`));
-    } catch { return false; }
+    return existsSync(join(root, RECOVERY));
   },
   async run({ sourceRoot = ROOT } = {}) {
     const violations = [];
@@ -51,7 +47,7 @@ export default {
           labels: ['review:accepted', 'red-team:pending'], comments: [accept], reviews: [], ...over.raw };
         const records = over.records ?? {};
         const scanIO = { runsDir: 'soak-runs', list: () => Object.keys(records),
-          read: id => records[id], stat: () => ({ mtimeMs: acceptedAt + 1000 }) };
+          read: id => records[id], stat: () => ({ mtimeMs: acceptedAt - RUN_MTIME_SLACK_MS - 1 }) };
         const out = runRedTeamOnSkip({ repo, env: {},
           plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] }, rawPrs: [raw],
           setting: { enabled: true, retryCooldownMin: 30 }, now: () => acceptedAt + 10_000,
@@ -90,7 +86,8 @@ export default {
       };
       const notOwed = replay('unaccepted stored review does not owe', {
         raw: { labels: ['red-team:pending', 'keep-me'], comments: [] },
-        readEvidence: () => evidence({ loopPayload: payload('needs-human') }),
+        readEvidence: () => evidence({ loopPayload: payload('needs-human'), status: { status: 'finished', result: 'not-owed' } }),
+        status: { status: 'finished', result: 'not-owed' },
       });
       effects(notOwed, { pending: 1 });
       check(notOwed.row?.settle === 'not-owed' && JSON.stringify(notOwed.raw.labels) === '["keep-me"]',
@@ -104,12 +101,13 @@ export default {
 
       const needsReview = () => evidence({ loopPayload: undefined });
       const selfBlock = replay('pending self-block on head needing review', { readEvidence: needsReview });
-      effects(selfBlock, { pending: 1 });
-      check(selfBlock.row?.settle === 'pending-only-conflict', 'pending self-block was not recognized');
+      effects(selfBlock, { escalate: 1 });
+      check(selfBlock.row?.action === 'skip' && selfBlock.row?.escalate === true && !selfBlock.row?.settle
+        && selfBlock.raw.labels.includes('red-team:pending'), 'pending self-block lost its merge hold');
       const next = replay('self-block next tick', { raw: selfBlock.raw, readEvidence: needsReview });
-      effects(next, { dispatch: 1 });
-      check(next.row?.action === 'review' && next.calls.dispatch[0]?.redTeamOnly === undefined,
-        'self-block next tick did not start a full review');
+      effects(next, { escalate: 1 });
+      check(next.row?.action === 'skip' && next.raw.labels.includes('red-team:pending'),
+        'self-block next tick removed pending or dispatched a review');
       const conflict = replay('real blocked conflict', { raw: { labels: ['review:accepted', 'red-team:pending', 'red-team:blocked'] },
         readEvidence: needsReview });
       effects(conflict, { escalate: 1 });
@@ -123,9 +121,9 @@ export default {
       check(oldConfirm.row?.action === 'dispatch' && oldConfirm.calls.dispatch[0]?.redTeamOnly === true
         && oldConfirm.calls.dispatch[0]?.redTeamMode === 'fresh', 'old confirm still blocked the owed red team');
       const never = replay('head never reviewed', { raw: { labels: ['review:accepted'] }, readEvidence: () => unfinished });
-      effects(never, { dispatch: 1 });
-      check(never.row?.action === 'review' && never.calls.dispatch[0]?.redTeamOnly === undefined,
-        'never-reviewed head did not dispatch a full review');
+      effects(never, { escalate: 1 });
+      check(never.row?.action === 'skip' && never.row?.why === 'review-unfinished' && never.row?.escalate === true,
+        'never-reviewed head bypassed unfinished review evidence');
 
       for (const [name, options, why] of [
         ['owed review in flight', { readEvidence: () => evidence({ inFlight: true }) }, 'red-team pass in flight'],
@@ -138,7 +136,7 @@ export default {
           readEvidence: () => unfinished }, 'review-unfinished'],
       ]) {
         const control = replay(name, options);
-        effects(control, {});
+        effects(control, name === 'newer unfinished review' ? { escalate: 1 } : {});
         check(control.row?.action === 'skip' && control.row?.why === why, `${name}: closed path did not retain its hold`);
       }
     } catch (error) { violations.push(`scenario failed: ${error.stack ?? error}`); }

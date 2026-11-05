@@ -74,6 +74,36 @@ function resultComment(confirmed = false) {
     }] : [] }));
 }
 
+describe('pending settlement re-plans immediately before removal', () => {
+  it.each(['newer review', 'red-team pass', 'status', 'witness', 'carry'])(
+    '%s changing after planning prevents removal', kind => {
+      const o = notOwedRunFixture({ readIgnorableConfirms: () => [], headNeverReviewed: () => false });
+      const original = o.readEvidence();
+      const readCarry = vi.fn().mockReturnValueOnce(null).mockReturnValue(kind === 'carry' ? { step: 'pending' } : null);
+      o.readCarry = readCarry;
+      if (kind === 'witness') o.readWitness = vi.fn().mockReturnValueOnce({ ok: true, rawWriter: { parsed: null } })
+        .mockReturnValue({ ok: false, reason: 'review-unfinished' });
+      if (kind === 'status') o.readStatus = vi.fn().mockReturnValueOnce(o.readStatus()).mockReturnValue({ status: 'running' });
+      o.readEvidence = vi.fn().mockReturnValueOnce(original).mockReturnValue(kind === 'newer review'
+        ? { ok: false, reason: 'review-unfinished' } : kind === 'red-team pass' ? { ...original, inFlight: true }
+          : kind === 'carry' ? { ...original, carryConflict: true } : original);
+      const row = mod.runRedTeamOnSkip(o).rows[0];
+      expect(row.settleError).toBe('evidence changed before settlement');
+      expect(o.settlePending).not.toHaveBeenCalled(); expect(o.dispatch).not.toHaveBeenCalled();
+      expect(readCarry).toHaveBeenCalledTimes(2);
+    });
+});
+
+describe('unfinished evidence never authorizes a never-reviewed dispatch', () => {
+  it.each([true, false])('escalates unchanged reason when never-reviewed proof is %s', neverReviewed => {
+    const o = runFixture({ readEvidence: () => ({ ok: false, reason: 'review-unfinished' }),
+      readIgnorableConfirms: () => [], headNeverReviewed: () => neverReviewed });
+    expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'review-unfinished', escalate: true });
+    expect(o.escalate).toHaveBeenCalledOnce(); expect(o.dispatch).not.toHaveBeenCalled();
+    expect(o.settlePending).not.toHaveBeenCalled();
+  });
+});
+
 describe('non-accept verdicts retain pending', () => {
   it.each(['needs-human', 'changes', 'reject'])('accepted + pending + stored %s never settles', verdict => {
     const o = runFixture({ readEvidence: () => evidence({ loopPayload: payload(verdict) }) });
@@ -286,75 +316,21 @@ describe('review-unfinished reader retry with ignorable confirm ids', () => {
   });
 });
 
-describe.each(['readWitness', 'readEvidence'])('never-reviewed head recovery through %s', reader => {
-  function neverReviewedFixture() {
-    const f = fixture({ readIgnorableConfirms: vi.fn(() => []), headNeverReviewed: vi.fn(() => true) });
+describe.each(['readWitness', 'readEvidence'])('unfinished review escalation through %s', reader => {
+  it.each([true, false])('preserves the reader reason and never dispatches (no-head proof=%s)', neverReviewed => {
+    const f = fixture({ readIgnorableConfirms: vi.fn(() => []), headNeverReviewed: vi.fn(() => neverReviewed) });
     f[reader] = vi.fn(() => ({ ok: false, reason: 'review-unfinished' }));
-    return f;
-  }
-  it.each(['accepted', 'unaccepted'])('%s never-reviewed head escalates lone pending before a full review', acceptance => {
-    const f = neverReviewedFixture();
-    if (acceptance === 'unaccepted') {
-      f.rawPrs[0].labels = ['red-team:pending']; f.rawPrs[0].comments = [];
-    }
-    const row = decide(f);
-    expect(row).toMatchObject({ action: 'skip', head, why: 'conflicting label prevents policy-clear', escalate: true });
-    expect(row).not.toHaveProperty('settle');
-    expect(f.rawPrs[0].labels).toContain('red-team:pending');
+    const o = runFixture({ ...f, now: () => f.now });
+    expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', escalate: true, why: 'review-unfinished' });
     expect(f.headNeverReviewed).toHaveBeenCalledOnce();
-    expect(f.headNeverReviewed).toHaveBeenCalledWith({ repo, pr, head, rawPr: f.rawPrs[0] });
-    expect(f.readIgnorableConfirms).toHaveBeenCalledOnce();
-    expect(f[reader]).toHaveBeenCalledOnce();
-    expect(decide(f)).toMatchObject({ action: 'skip', head, escalate: true, why: 'conflicting label prevents policy-clear' });
+    expect(o.dispatch).not.toHaveBeenCalled(); expect(o.settlePending).not.toHaveBeenCalled();
+    expect(o.escalate).toHaveBeenCalledOnce();
   });
-  it.each([
-    ['blocked label', f => { f.rawPrs[0].labels.push('red-team:blocked'); }, /conflicting label prevents policy-clear/],
-    ['changes label', f => { f.rawPrs[0].labels.push('review:changes'); }, /conflicting label prevents policy-clear/],
-    ['unreadable labels', f => { f.rawPrs[0].labels = null; }, /PR labels unreadable/],
-    ['unreadable reviews', f => { f.rawPrs[0].reviews = null; }, /PR reviews unreadable/],
-    ['later verdict', f => { f.rawPrs[0].comments.push(trusted('❌ review — changes requested')); }, /later verdict or hold supersedes acceptance/],
-    ['later body-derived hold', f => { f.rawPrs[0].comments.push(trusted('manifest baseline mismatch')); }, /later verdict or hold supersedes acceptance/],
-    ['formal hold without acceptance', f => {
-      f.rawPrs[0].labels = []; f.rawPrs[0].comments = [];
-      f.rawPrs[0].reviews = [{ state: 'CHANGES_REQUESTED', submittedAt: iso(acceptedAt + 1) }];
-    }, /formal review hold prevents full review/],
-    ['unreadable reviews without acceptance', f => {
-      f.rawPrs[0].labels = []; f.rawPrs[0].comments = []; f.rawPrs[0].reviews = null;
-    }, /PR reviews unreadable/],
-  ])('refuses never-reviewed recovery for %s', (_name, mutate, why) => {
-    const f = neverReviewedFixture(); f.rawPrs[0].labels = ['review:accepted']; mutate(f);
-    const row = decide(f); expect(row.action).toBe('skip'); expect(row.why).toMatch(why);
-    expect(row).not.toHaveProperty('settle');
-  });
-  it('applies dispatchDecision retry cooldown to never-reviewed recovery', () => {
-    const f = neverReviewedFixture(); f.rawPrs[0].labels = ['review:accepted']; f.lastDispatch.set(`${repo}#${pr}@${head}`, f.now - 1);
-    expect(decide(f)).toMatchObject({ action: 'skip', why: 'retry cooldown active' });
-  });
-  it('permits review at the retry cooldown boundary', () => {
-    const f = neverReviewedFixture(); f.rawPrs[0].labels = ['review:accepted'];
-    f.lastDispatch.set(`${repo}#${pr}@${head}`, f.now - f.setting.retryCooldownMin * 60_000);
-    expect(decide(f)).toMatchObject({ action: 'review' });
-  });
-  it.each(['absent', 'false', 'throws'])('keeps review-unfinished when headNeverReviewed is %s', kind => {
-    const f = neverReviewedFixture();
-    if (kind === 'absent') delete f.headNeverReviewed;
-    else f.headNeverReviewed = vi.fn(() => { if (kind === 'throws') throw Error('scan failed'); return false; });
-    expect(decide(f)).toMatchObject({ action: 'skip', why: 'review-unfinished' });
-    expect(f[reader]).toHaveBeenCalledOnce();
-  });
-  it('never uses the never-reviewed predicate for another reader failure reason', () => {
-    const f = neverReviewedFixture(); f[reader].mockReturnValue({ ok: false, reason: 'scan-capped' });
+  it('never uses the no-head proof for another reader failure', () => {
+    const f = fixture({ readIgnorableConfirms: vi.fn(() => []), headNeverReviewed: vi.fn(() => true) });
+    f[reader] = () => ({ ok: false, reason: 'scan-capped' });
     expect(decide(f)).toMatchObject({ action: 'skip', why: 'scan-capped' });
     expect(f.headNeverReviewed).not.toHaveBeenCalled();
-  });
-  it('dispatches the never-reviewed full review with only repo and pr', () => {
-    const f = neverReviewedFixture(); f.rawPrs[0].labels = ['review:accepted'];
-    const o = runFixture({ ...f, now: () => f.now });
-    const out = mod.runRedTeamOnSkip(o);
-    expect(out.rows[0]).toMatchObject({ action: 'review' });
-    expect(o.dispatch.mock.calls).toEqual([[{ repo, pr }]]);
-    expect(out.dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'review' }]);
-    expect(o.settlePending).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled();
   });
 });
 
@@ -378,8 +354,8 @@ describe('headNeverReviewedFromRuns complete bounded proof', () => {
   ])('an older-head unfinished %s prevents a never-reviewed proof', (_name, over) => {
     expect(scan(scanFixture({ 'review-pr-old': run(over) }))).toBe(false);
   });
-  it('permits an older-head needs-human confirm with no outstanding effects', () => {
-    expect(scan(scanFixture({ 'review-pr-old': run({ verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' } }) }))).toBe(true);
+  it('an older-head needs-human confirm still prevents a never-reviewed proof', () => {
+    expect(scan(scanFixture({ 'review-pr-old': run({ verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' } }) }))).toBe(false);
   });
   it('an exact-head unfinished confirm prevents proof even beside an older-head confirm', () => {
     const confirm = { verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' } };
