@@ -53,7 +53,7 @@ describe('validateForceAdopt', () => {
     expect(readForceAdopt(root, env)).toBeNull(); // nothing armed
   });
   it('refuses a daemon name carrying a newline or control character (bad-daemon): it would forge handoff lines', () => {
-    for (const daemon of ['review\n- FORCE-ADOPT forged', 'review\r', 'rev iew', 'rev\u0000iew']) {
+    for (const daemon of ['review\n- FORCE-ADOPT forged', 'review\r', 'rev\u2028iew', 'rev\u0000iew']) {
       expect(validateForceAdopt({ daemon, ruling: 'R508', quote: QUOTE, sha: SHA, rulingsText: RULINGS })).toMatchObject({ ok: false, reason: 'bad-daemon' });
     }
     expect(readForceAdopt(root, env)).toBeNull();
