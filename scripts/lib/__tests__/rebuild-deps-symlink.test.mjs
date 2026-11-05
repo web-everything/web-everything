@@ -12,8 +12,8 @@ import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import * as deps from '../daemon-rebuild/deps-job.mjs';
 import { cloneNodeModulesInstaller, REBUILD_JOB_KIND } from '../daemon-rebuild/rebuild-job.mjs';
-import { ensureNodeModulesStore, evictSnapshots, nodeModulesRef, setNodeModulesWritable } from '../daemon-job-snapshots.mjs';
-import { createJobStore, enqueueJob, prepareJobCode } from '../daemon-jobs-runtime.mjs';
+import { ensureNodeModulesStore, evictSnapshots, NODE_MODULES_MANIFEST_FILE, nodeModulesRef, setNodeModulesWritable } from '../daemon-job-snapshots.mjs';
+import { createJobStore, enqueueJob, launchJob, prepareJobCode } from '../daemon-jobs-runtime.mjs';
 import { markClaimed, markLaunching } from '../daemon-jobs.mjs';
 import { withFileLock } from '../atomic-json-file.mjs';
 
@@ -41,7 +41,10 @@ function fixture() {
     writeFileSync(join(into, 'node_modules', '.package-lock.json'), '{"lockfileVersion":3,"packages":{}}');
     writeFileSync(join(into, 'node_modules', 'payload.txt'), 'store payload');
     mkdirSync(join(into, 'node_modules', 'pkg'));
+    writeFileSync(join(into, 'node_modules', 'pkg', 'package.json'), '{"name":"pkg","version":"1.0.0"}');
     writeFileSync(join(into, 'node_modules', 'pkg', 'index.js'), 'export default 1;');
+    mkdirSync(join(into, 'node_modules', '@scope', 'other'), { recursive: true });
+    writeFileSync(join(into, 'node_modules', '@scope', 'other', 'package.json'), '{"name":"@scope/other","version":"2.0.0"}');
   });
   const store = ensureNodeModulesStore({ jobsDir: join(base, 'jobs'), sourceDir, install });
   const log = vi.fn();
@@ -464,5 +467,126 @@ describe('read-only dependency stores and rebuild consumer retention', () => {
     expect(messages(log)).toMatch(/retaining.*lock unavailable/i);
     expect(statSync(join(f.storeDir, 'node_modules')).mode & 0o222).toBe(0);
     expect(readFileSync(join(f.storeDir, 'node_modules', 'payload.txt'), 'utf8')).toBe('store payload');
+  });
+
+  it.each(['pkg', '@scope/other'])('a writable package directory %s falls back to copy and logs', (name) => {
+    const f = fixture();
+    chmodSync(join(f.storeDir, 'node_modules', name), 0o755);
+    deps.linkOrCopyNodeModules(f);
+    expectCopied(f, /manifest|package|writable/i);
+  });
+
+  it('a writable scope directory falls back to copy and logs', () => {
+    const f = fixture();
+    chmodSync(join(f.storeDir, 'node_modules', '@scope'), 0o755);
+    deps.linkOrCopyNodeModules(f);
+    expectCopied(f, /manifest|package|writable/i);
+  });
+
+  it('a writable package.json with unchanged content falls back to copy and logs', () => {
+    const f = fixture();
+    chmodSync(join(f.storeDir, 'node_modules', 'pkg', 'package.json'), 0o644);
+    deps.linkOrCopyNodeModules(f);
+    expectCopied(f, /manifest|package|writable/i);
+  });
+
+  it('changed package.json size with read-only permissions restored falls back to copy and logs', () => {
+    const f = fixture();
+    const path = join(f.storeDir, 'node_modules', 'pkg', 'package.json');
+    chmodSync(path, 0o644);
+    writeFileSync(path, '{"name":"pkg","version":"1.0.0","added":"new data"}');
+    chmodSync(path, 0o444);
+    deps.linkOrCopyNodeModules(f);
+    expectCopied(f, /manifest.*mismatch/i);
+  });
+
+  it('a missing recorded package manifest falls back to copy and logs', () => {
+    const f = fixture();
+    rmSync(join(f.storeDir, NODE_MODULES_MANIFEST_FILE));
+    deps.linkOrCopyNodeModules(f);
+    expectCopied(f, /manifest.*missing/i);
+  });
+
+  it('unreadable package stat evidence falls back to copy and logs', () => {
+    const f = fixture();
+    const stat = (path) => {
+      if (String(path).endsWith('package.json')) throw Object.assign(new Error('package denied'), { code: 'EACCES' });
+      return statSync(path);
+    };
+    deps.linkOrCopyNodeModules({ ...f, stat });
+    expectCopied(f, /manifest.*unreadable/i);
+  });
+
+  it('completion records a sorted shallow manifest including scoped package identities and stats', () => {
+    const f = fixture();
+    const manifest = JSON.parse(readFileSync(join(f.storeDir, NODE_MODULES_MANIFEST_FILE), 'utf8'));
+    expect(manifest.packages).toEqual(['@scope/other', 'pkg'].map((name) => {
+      const info = statSync(join(f.storeDir, 'node_modules', name, 'package.json'));
+      return [name, name === 'pkg' ? 'pkg@1.0.0' : '@scope/other@2.0.0', info.size, info.mtimeMs];
+    }));
+    expect(manifest.sha256).toMatch(/^[a-f0-9]{64}$/);
+    deps.linkOrCopyNodeModules(f);
+    expectLinked(f);
+  });
+
+  it('eviction immediately after a live swap retains its source without caller-supplied snapshot refs', () => {
+    const f = fixture();
+    deps.swapNodeModules(f);
+    expectLinked(f);
+    expect(evictSnapshots({ jobsDir: join(f.base, 'jobs'), referenced: [], keep: 0 }).evicted).toEqual([]);
+    expectLinked(f);
+    const records = readdirSync(join(f.storeDir, '.node-modules-consumers')).map((name) =>
+      JSON.parse(readFileSync(join(f.storeDir, '.node-modules-consumers', name), 'utf8')));
+    expect(records.some((record) => record.live && record.refs.includes(nodeModulesRef(basename(f.storeDir))))).toBe(true);
+  });
+
+  it('an up-to-date dependency tick registers a persisted live symlink before later job eviction', async () => {
+    const f = fixture();
+    symlinkSync(join(f.storeDir, 'node_modules'), target(f), 'dir');
+    expect(existsSync(join(f.storeDir, '.node-modules-consumers'))).toBe(false);
+    const result = await deps.refreshDepsAsJob({
+      root: f.root, installed: { read: () => basename(f.storeDir), write: vi.fn() },
+      env: {}, log: f.log, store: createJobStore(join(f.base, 'jobs')),
+    });
+    expect(result.reason).toBe('up-to-date');
+    expect(evictSnapshots({ jobsDir: join(f.base, 'jobs'), referenced: [], keep: 0 }).evicted).toEqual([]);
+    expectLinked(f);
+  });
+
+  it('unreadable persisted live target evidence refuses dependency job launch and logs the reason', async () => {
+    const f = fixture();
+    symlinkSync(join(f.base, 'missing-store', 'node_modules'), target(f), 'dir');
+    const reattach = vi.fn();
+    const result = await deps.refreshDepsAsJob({
+      root: f.root, installed: { read: () => null, write: vi.fn() }, reattach,
+      env: {}, log: f.log, store: createJobStore(join(f.base, 'jobs')),
+    });
+    expect(result.reason).toBe('live-reference-failed');
+    expect(reattach).not.toHaveBeenCalled();
+    expect(messages(f.log)).toMatch(/live dependency reference unavailable.*not launching/i);
+  });
+
+  it.each(['swap', 'rollback'])('launchJob eviction after a live %s retains the live source absent from job snapshotKeys', (action) => {
+    const f = fixture();
+    deps.swapNodeModules(f);
+    if (action === 'rollback') {
+      writeFileSync(join(f.sourceDir, 'package-lock.json'), '{"newer":true}');
+      const newer = ensureNodeModulesStore({ jobsDir: join(f.base, 'jobs'), sourceDir: f.sourceDir, install: f.install });
+      deps.swapNodeModules({ ...f, storeDir: newer.dir });
+      deps.swapNodeModules(f); // return to the older store; do not refresh its recency
+    }
+    const store = createJobStore(join(f.base, 'jobs'));
+    const kindDef = deps.DEPS_JOB_KIND; // nodeModules:false: the new job never references the live store
+    const record = enqueueJob({ store, kindDef, codeSha: 'deadc0de', input: {} });
+    const evict = vi.fn((options) => evictSnapshots({ ...options, keep: 0 }));
+    const result = launchJob({
+      store, id: record.id, kindDef, snapshot: { materialize: () => {} },
+      spawnFn: () => 1234, evict, env: {},
+    });
+    expect(result.job.status).toBe('launching');
+    expect(result.job.snapshotKeys).not.toContain(nodeModulesRef(basename(f.storeDir)));
+    expect(evict).toHaveBeenCalledTimes(1);
+    expect(evict.mock.results[0].type).toBe('return');
+    expectLinked(f);
   });
 });

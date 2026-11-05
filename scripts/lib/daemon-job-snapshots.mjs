@@ -18,7 +18,7 @@
 
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 
 import { DEFAULT_CHILD_TIMEOUT_MS, NPM_INSTALL_TIMEOUT_MS } from './bounded-child.mjs';
@@ -28,6 +28,7 @@ import { withFileLock } from './atomic-json-file.mjs';
 const COMPLETE_MARKER = '.snapshot-complete';
 /** Recorded before completion, never regenerated on reuse (including legacy stores). */
 export const NODE_MODULES_HASH_FILE = '.node-modules-lock.sha256';
+export const NODE_MODULES_MANIFEST_FILE = '.node-modules-packages.json';
 const CONSUMER_REFS = '.node-modules-consumers';
 const KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
@@ -71,28 +72,70 @@ function removeStore(dir) {
 const consumerLockPath = (storeDir) => join(dirname(storeDir), `.${basename(storeDir)}.consumers.lock`);
 const CONSUMER_LOCK_OPTIONS = Object.freeze({ timeoutMs: 0 });
 
+/** Shallow npm package inventory: depth one, or depth two under @scope. No package-content walk.
+ * Manifest stats and permissions must be readable; workspace links are checked via their targets.
+ */
+export function nodeModulesPackageManifest(modules, { stat = statSync, readFile = readFileSync, requireReadonly = true } = {}) {
+  const packages = [];
+  const directory = (path) => {
+    const info = stat(path);
+    if (!info.isDirectory() || !Number.isSafeInteger(info.mode) || (requireReadonly && info.mode & 0o222)) {
+      throw new Error('package directory missing or writable');
+    }
+  };
+  const add = (name) => {
+    const dir = join(modules, name);
+    directory(dir);
+    const path = join(dir, 'package.json');
+    const info = stat(path);
+    if (!info.isFile() || !Number.isSafeInteger(info.mode) || (requireReadonly && info.mode & 0o222)
+      || !Number.isSafeInteger(info.size) || !Number.isFinite(info.mtimeMs)) throw new Error('package.json evidence unreadable or writable');
+    const pkg = JSON.parse(readFile(path, 'utf8'));
+    if (typeof pkg.name !== 'string' || !pkg.name || typeof pkg.version !== 'string' || !pkg.version) {
+      throw new Error('package identity missing');
+    }
+    packages.push([name, `${pkg.name}@${pkg.version}`, info.size, info.mtimeMs]);
+  };
+  for (const entry of readdirSync(modules, { withFileTypes: true })) {
+    if (entry.name.startsWith('.') || (!entry.isDirectory() && !entry.isSymbolicLink())) continue;
+    if (entry.name.startsWith('@')) {
+      directory(join(modules, entry.name));
+      for (const child of readdirSync(join(modules, entry.name), { withFileTypes: true })) {
+        if (!child.name.startsWith('.') && (child.isDirectory() || child.isSymbolicLink())) add(`${entry.name}/${child.name}`);
+      }
+    } else add(entry.name);
+  }
+  packages.sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
+  const sha256 = createHash('sha256').update(JSON.stringify(packages)).digest('hex');
+  return { packages, sha256 };
+}
+
 /** A reverse reference keeps a dependency store alive for the lifetime of a rebuild snapshot.
  * Record BEFORE linking. buildOnce atomically promotes `<consumer>.building.<pid>` to consumer;
  * retain both names so the reference survives that rename and an interrupted materialization.
  * Keeping a finished snapshot is conservative: its runtime evicts it after live job refs clear.
  */
-export function recordNodeModulesConsumer(storeDir, into) {
+export function recordNodeModulesConsumer(storeDir, into, { live = false, staging, backup, requestedRef, publish = () => {} } = {}) {
   return withFileLock(consumerLockPath(storeDir), () => {
     // Eviction may have won the lock after the caller's integrity check. Refuse a deleted or
     // partly thawed source instead of publishing a reference and then creating a dangling link.
     const modules = statSync(join(storeDir, 'node_modules'));
-    if (!modules.isDirectory() || modules.mode & 0o222 || !existsSync(join(storeDir, COMPLETE_MARKER))) {
+    if (!modules.isDirectory() || (!live && modules.mode & 0o222) || !existsSync(join(storeDir, COMPLETE_MARKER))) {
       throw new Error('consumer source no longer complete and read-only');
     }
     const building = resolve(into);
     const consumer = building.replace(/\.building\.\d+$/, '');
     const refs = join(storeDir, CONSUMER_REFS);
     try { mkdirSync(refs); } catch (error) { if (error?.code !== 'EEXIST') throw error; }
-    const key = createHash('sha256').update(consumer).digest('hex');
+    const key = createHash('sha256').update(`${live ? 'live:' : ''}${consumer}`).digest('hex');
     const path = join(refs, `${key}.json`);
     const tmp = `${path}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ ref: nodeModulesRef(basename(storeDir)), consumer, building }));
+    const ref = nodeModulesRef(basename(storeDir));
+    writeFileSync(tmp, JSON.stringify({ ref, refs: [...new Set([ref, requestedRef].filter(Boolean))], consumer, building, live, staging, backup }));
     renameSync(tmp, path);
+    // Live references inspect link targets, so publish the staging link before releasing the lock.
+    // The atomic staging -> live rename is then covered by the same reference in every evictor.
+    publish();
   }, CONSUMER_LOCK_OPTIONS);
 }
 
@@ -107,6 +150,19 @@ function hasNodeModulesConsumer(storeDir, log, readFile) {
       const data = JSON.parse(readFile(join(refs, name), 'utf8'));
       if (data.ref !== nodeModulesRef(basename(storeDir)) || !isAbsolute(data.consumer ?? '') || !isAbsolute(data.building ?? '')) {
         throw new Error('invalid consumer reference');
+      }
+      if (data.live === true) {
+        for (const path of [data.staging, join(data.consumer, 'node_modules'), data.backup].filter(Boolean)) {
+          if (!isAbsolute(path)) throw new Error('invalid live link reference');
+          try {
+            if (lstatSync(path).isSymbolicLink() && realpathSync(path) === realpathSync(join(storeDir, 'node_modules'))) return true;
+          } catch (error) {
+            if (error?.code !== 'ENOENT') throw error;
+            // Missing live link can be the interval between swap renames. Keep the store closed.
+            if (path === join(data.consumer, 'node_modules') && existsSync(data.consumer)) return true;
+          }
+        }
+        continue;
       }
       // building first, then consumer: an atomic building -> consumer rename cannot look absent.
       for (const path of [data.building, data.consumer]) {
@@ -193,6 +249,7 @@ export function ensureNodeModulesStore({ jobsDir, sourceDir, install = npmCiInst
     try {
       const hash = createHash('sha256').update(readFileSync(join(into, 'node_modules', '.package-lock.json'))).digest('hex');
       writeFileSync(join(into, NODE_MODULES_HASH_FILE), `${hash}\n`);
+      writeFileSync(join(into, NODE_MODULES_MANIFEST_FILE), `${JSON.stringify(nodeModulesPackageManifest(join(into, 'node_modules'), { requireReadonly: false }))}\n`);
       recorded = true;
     } catch { /* reuse fails closed to a private copy when no hash was recorded */ }
     // One-time recursive freeze covers package files as well as the hidden lock. Do not re-freeze

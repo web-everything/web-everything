@@ -25,7 +25,7 @@ import { createHash } from 'node:crypto';
 import {
   existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync,
 } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { defineJobKind, kindRegistry } from '../daemon-jobs.mjs';
@@ -34,7 +34,7 @@ import {
 } from '../daemon-jobs-runtime.mjs';
 import {
   ensureNodeModulesStore, evictSnapshots, lockfileKey, NODE_MODULES_HASH_FILE, nodeModulesRef,
-  recordNodeModulesConsumer, setNodeModulesWritable, snapshotsRoot,
+  NODE_MODULES_MANIFEST_FILE, nodeModulesPackageManifest, recordNodeModulesConsumer, setNodeModulesWritable, snapshotsRoot,
 } from '../daemon-job-snapshots.mjs';
 import { TERMINAL_JOB_STATUSES } from '../../operations/job-record.mjs';
 import { daemonJobsDir } from '../../operations/run-store.mjs';
@@ -93,6 +93,13 @@ export function resolveRebuildDepsMode({ env = process.env, settings, log = defa
  */
 export const WRITES_NODE_MODULES_STEPS = Object.freeze([]);
 
+function registerCurrentLiveTarget(root, options = {}) {
+  const live = join(root, 'node_modules');
+  let entry;
+  try { entry = lstatSync(live); } catch (error) { if (error?.code === 'ENOENT') return; throw error; }
+  if (entry.isSymbolicLink()) recordNodeModulesConsumer(dirname(realpathSync(live)), root, { ...options, live: true });
+}
+
 /** Guard both rebuild copy sites. `destination` supports staging a swap before touching the live
  * tree. Follow source symlinks first: cp -R of a symlink can otherwise produce another shared link,
  * defeating copy mode. Integrity evidence belongs to the real store, not an aliasing clone root.
@@ -101,7 +108,7 @@ export function linkOrCopyNodeModules({
   root, storeDir, destination = join(root, 'node_modules'), depsMode, step,
   exec = execFileSync, log = defaultLog, stat = statSync, readFile = readFileSync,
   env = process.env, settings,
-  referenceConsumer,
+  referenceConsumer, liveConsumer,
 }) {
   const mode = depsMode === undefined ? resolveRebuildDepsMode({ env, settings, log }).mode : depsMode;
   let reason = mode === 'copy' ? 'copy mode selected' : !validDepsMode(mode) ? 'invalid deps mode' : null;
@@ -132,8 +139,20 @@ export function linkOrCopyNodeModules({
   }
   if (!reason) {
     try {
-      if (referenceConsumer) recordNodeModulesConsumer(dirname(source), referenceConsumer);
-      symlinkSync(source, destination, 'dir');
+      const recorded = JSON.parse(readFile(join(dirname(source), NODE_MODULES_MANIFEST_FILE), 'utf8'));
+      const current = nodeModulesPackageManifest(source, { stat, readFile });
+      if (recorded.sha256 !== current.sha256 || JSON.stringify(recorded.packages) !== JSON.stringify(current.packages)) {
+        reason = 'package manifest integrity mismatch';
+      }
+    } catch { reason = 'package manifest evidence missing, unreadable, or writable'; }
+  }
+  if (!reason) {
+    try {
+      const publish = () => symlinkSync(source, destination, 'dir');
+      if (referenceConsumer) recordNodeModulesConsumer(dirname(source), referenceConsumer, {
+        ...liveConsumer, requestedRef: nodeModulesRef(basename(storeDir)), publish,
+      });
+      else publish();
       return { mode: 'symlink' };
     } catch (error) {
       // Do not delete a pre-existing target on EEXIST; swap callers supply a fresh staging path.
@@ -221,10 +240,14 @@ export function swapNodeModules({ root, storeDir, exec = execFileSync, rename = 
   const live = join(root, 'node_modules');
   const tmp = join(root, `.node_modules.swap.${process.pid}`);
   const old = join(root, `.node_modules.old.${process.pid}`);
+  const liveConsumer = { live: true, staging: tmp, backup: old };
+  // Protect the current real target before cleanup or any new publication. A rollback may be
+  // selecting an older store whose lockfile key differs from both the new key and job snapshotKeys.
+  registerCurrentLiveTarget(root, liveConsumer);
   for (const name of readdirSync(root)) {
     if (/^\.node_modules\.(swap|old)\.\d+$/.test(name)) rmSync(join(root, name), { recursive: true, force: true });
   }
-  linkOrCopyNodeModules({ ...options, root, storeDir, destination: tmp, exec });
+  linkOrCopyNodeModules({ ...options, root, storeDir, destination: tmp, exec, referenceConsumer: root, liveConsumer });
   let hadLive = false;
   try { lstatSync(live); hadLive = true; } catch (error) { if (error?.code !== 'ENOENT') throw error; }
   if (hadLive) rename(live, old);
@@ -266,6 +289,13 @@ export async function refreshDepsAsJob({
   readLock = (r) => readFileSync(join(r, 'package-lock.json'), 'utf8'),
 }) {
   const say = (m) => log(`deps-job: ${m}`);
+  // Migrate existing live symlinks before even an up-to-date return or a reattach/launch pass.
+  // Older persisted state has no live reference, and launchJob's evictor only knows snapshotKeys.
+  try { registerCurrentLiveTarget(root); }
+  catch (error) {
+    say(`live dependency reference unavailable (${error?.code ?? 'unknown'}); not launching dependency jobs`);
+    return { reason: 'live-reference-failed' };
+  }
   let key;
   try { key = lockfileKey(readLock(root)); } catch { return { reason: 'no-lockfile' }; }
   if (installed.read() === key) return { reason: 'up-to-date', key };
@@ -287,6 +317,9 @@ export async function refreshDepsAsJob({
     // A symlink still needs its store, including an older lockfile selected by a rollback.
     // Recency alone can evict precisely that live target.
     referenced.push(nodeModulesRef(key));
+    try {
+      if (lstatSync(join(root, 'node_modules')).isSymbolicLink()) referenced.push(nodeModulesRef(basename(dirname(realpathSync(join(root, 'node_modules'))))));
+    } catch { /* the persisted live reference makes every evictor retain unreadable evidence */ }
     try { evict({ jobsDir: store.dir, referenced }); } catch (e) { say(`snapshot eviction failed: ${e.message}`); }
   };
 
