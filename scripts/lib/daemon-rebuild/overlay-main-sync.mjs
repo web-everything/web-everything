@@ -5,7 +5,7 @@ import { dirname, join, resolve, isAbsolute } from 'node:path';
 import { tmpdir, hostname } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
-import { isDeepStrictEqual } from 'node:util';
+import { isDeepStrictEqual, stripVTControlCharacters } from 'node:util';
 import { cascadePolicy, platformPreference } from '../policy-cascade.mjs';
 import { readOverlayState, overlayFilePath, appendOverlayEvent, registrationIdentity } from '../daemon-overlays.mjs';
 import { isSafeBranchName } from '../daemon-self-sync.mjs';
@@ -434,8 +434,11 @@ function failedTestReport(stdout, options) {
   // Reuse the strict TAP plan and typed-test-count validator. Normalize only red
   // statuses/diagnostics for validation, then restore the observed failed leaves.
   const normalized = stdout.replace(/\r\n/g, '\n').split('\n').flatMap(line => {
+    // BasicReporter colors its summary in CI (same as heavyTestReport): strip ANSI for summary
+    // detection only, so TAP titles stay literal.
+    const plain = stripVTControlCharacters(line);
     if (line === 'TAP version 13') inTap = true;
-    if (/^(?: Test Files|  Snapshots)  /.test(line)) inTap = false;
+    if (/^(?: Test Files|  Snapshots)  /.test(plain)) inTap = false;
     if (diagnostic !== undefined) {
       if (line === `${diagnostic}...`) diagnostic = undefined;
       return [];
@@ -451,8 +454,8 @@ function failedTestReport(stdout, options) {
         leaf++;
       }
     }
-    if (line.startsWith('      Tests  ')) {
-      const summary = /^      Tests  (.+) \((\d+)\)$/.exec(line);
+    if (plain.startsWith('      Tests  ')) {
+      const summary = /^      Tests  (.+) \((\d+)\)$/.exec(plain);
       if (!summary) throw testFailure();
       let passed = 0;
       const pending = [];

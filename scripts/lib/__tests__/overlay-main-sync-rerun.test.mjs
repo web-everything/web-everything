@@ -184,6 +184,17 @@ describe('production heavy runner failing TAP evidence', () => {
     noPublication(f);
   });
 
+  it('classifies main-red when the reporter colors its summary lines (CI)', async () => {
+    // BasicReporter colors "Test Files"/"Tests" in CI; force the same shape regardless of host env.
+    const color = stdout => stdout.replace(/^( *)(Test Files|Tests|Snapshots)( +)(.*)$/gm,
+      (_, pad, label, gap, rest) => `${pad}\u001b[2m${label}\u001b[22m${gap}\u001b[1m\u001b[31m${rest}\u001b[39m\u001b[22m`);
+    const f = fixture(), calls = tapRunners(f, { corrupt: color });
+    expect(await job(f)).toMatchObject({ skipped: true, reason: 'main-red' });
+    expect(calls.map(call => call.main)).toEqual([false, false, true]);
+    expect(kinds(f)).toContain('overlay-main-red');
+    noPublication(f);
+  });
+
   it.each([
     { mainTitle: 'different assertion' },
     { mainSuite: 'different suite' },
