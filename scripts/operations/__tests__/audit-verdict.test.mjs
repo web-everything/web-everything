@@ -691,17 +691,30 @@ describe('card outcomes, proof binding and the default card reader (PR #6381 jud
 });
 
 describe('AU1 PR-A is inert', () => {
+  // One helper, shared by the scan and its own pin below, so the pin tests the rule the scan applies.
+  const commentOnly = text => /^\s*(\/\/|\/\*|\*)/.test(text);
   it('no runtime file imports the rubric core or its settings', async () => {
     const { spawnSync } = await import('node:child_process');
     const root = fileURLToPath(new NodeURL('../../../', import.meta.url));
-    const grep = spawnSync('git', ['grep', '--untracked', '-lE', "audit-verdict\\.mjs|audit-settings\\.mjs", '--', 'scripts', 'skills-src', '.claude', 'src'],
+    const grep = spawnSync('git', ['grep', '--untracked', '-nE', "audit-verdict\\.mjs|audit-settings\\.mjs", '--', 'scripts', 'skills-src', '.claude', 'src'],
       { cwd: root, encoding: 'utf8', maxBuffer: 1 << 24 });
     // A failed grep prints nothing, which would read as "no importers": require a clean run that saw this file.
     expect(grep.error).toBeUndefined();
     expect(grep.status, grep.stderr).toBe(0);
-    expect(grep.stdout.split('\n')).toContain('scripts/operations/__tests__/audit-verdict.test.mjs');
-    const hits = grep.stdout.split('\n').filter(Boolean)
-      .filter(f => /\.(mjs|js|cjs|ts)$/.test(f) && !/__tests__\/|\.test\./.test(f) && !/audit-(verdict|settings)\.mjs$/.test(f));
+    const matches = grep.stdout.split('\n').filter(Boolean).map(l => { const m = /^(.*?):(\d+):(.*)$/.exec(l); return m && { file: m[1], text: m[3] }; });
+    expect(matches.map(m => m?.file)).toContain('scripts/operations/__tests__/audit-verdict.test.mjs');
+    // Any CODE line naming either module counts (an import, a dynamic import, a CLI spawn). A line that is only a
+    // comment does not: main's codex-audit.mjs notes its resolver "moves to scripts/lib/audit-settings.mjs once that
+    // lands" (PR #6381 merge with AU1 PR-B). A comment marker after code on the same line still counts as code.
+    const hits = [...new Set(matches.filter(m => !m || (/\.(mjs|js|cjs|ts)$/.test(m.file) && !/__tests__\/|\.test\./.test(m.file)
+      && !/audit-(verdict|settings)\.mjs$/.test(m.file) && !commentOnly(m.text))).map(m => m?.file ?? 'unparsed grep line'))];
     expect(hits).toEqual([]);
+  });
+  it('the inertness check ignores a comment-only mention but catches code that names the module (PR #6381 merge)', () => {
+    expect(commentOnly(' * scripts/lib/audit-settings.mjs once that lands. */')).toBe(true);
+    expect(commentOnly('// see audit-verdict.mjs')).toBe(true);
+    expect(commentOnly("import { computeVerdict } from './audit-verdict.mjs';")).toBe(false);
+    expect(commentOnly("const v = await import('../lib/audit-settings.mjs'); // lazy")).toBe(false);
+    expect(commentOnly("spawnSync('node', ['scripts/operations/audit-verdict.mjs'])")).toBe(false);
   });
 });
