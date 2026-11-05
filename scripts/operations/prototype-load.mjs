@@ -23,8 +23,10 @@ export function jsonLines(text) {
  *  ref, full 40-hex sha and ruling match the record exactly. Anything else stays refused; a `--audit` argument can
  *  never claim it. Never a blanket bypass. */
 const RULING = /^R\d+(?:\+R\d+)*$/;
-export function readyEvidence(records, input, ruledWeakened = [], liveFp = null) {
+export function readyEvidence(records, input, ruledWeakened = [], liveFpSource = null) {
   if (input.testsRun?.trim() && /^NOT WEAKENED$/i.test(input.audit || '')) return { source: 'arguments', testsRun: input.testsRun };
+  // The live fingerprint may be passed lazily (a function): the arguments path above never pays for the git read.
+  const liveFp = typeof liveFpSource === 'function' ? liveFpSource() : liveFpSource;
   // R503: a record speaks for the live sha when it names it exactly, or its stored net-diff fingerprint equals the live one.
   // A rebase or merge of main that leaves the code alone therefore keeps the evidence; any code change does not.
   // Shas compare case-insensitively (validSha accepts either case): an upper-case --sha must still find its own records.
