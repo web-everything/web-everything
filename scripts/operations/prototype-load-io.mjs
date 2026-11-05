@@ -268,8 +268,11 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
     let liveFpMemo;
     const liveFingerprint = (evidence) => {
       if (liveFpMemo !== undefined) return liveFpMemo;
-      // An audit record names its head (no head = no carry); a ready record or allowlist entry names its sha.
-      if (!evidence.some((r) => r?.fingerprint && (r.head ? r.head !== input.sha : r.sha && r.sha !== input.sha))) return null;
+      // The record must name another head (audit) or sha (ready record): a headless record can never carry (main #6353).
+      // Shas compare case-insensitively, as the pure layer does, so the live head's own records never count as another head.
+      const live = String(input.sha).toLowerCase();
+      const same = (v) => typeof v === 'string' && v.toLowerCase() === live;
+      if (!evidence.some((r) => r?.fingerprint && (r.head || r.sha) && !same(r.sha) && !same(r.head))) return null;
       try {
         requireGit('fetch', 'origin', 'main', input.branch);
         liveFpMemo = (fingerprint || ((b, h) => netDiffFingerprint(repo, b, h, { exec })))('origin/main', input.sha) || null;
@@ -383,6 +386,13 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       if (!out.canonicalAudit.ok) {
         const fallback = `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load.`;
         if (mode === 'refuse') return stop('no-canonical-audit', { fallback });
+        // R503 round 3: warn mode never lets CARRIED readiness (a ready record of an older head) load over a WEAKENED
+        // canonical audit. Only a ruled exception or the live head's own record keeps the existing warn behaviour.
+        // Fail closed: a record sha that is not a string is never the live head's own record.
+        const carriedGate = out.gate.record && (typeof out.gate.record.sha !== 'string' || out.gate.record.sha.toLowerCase() !== String(input.sha).toLowerCase());
+        if (out.canonicalAudit.reason === 'weakened' && carriedGate && !out.gate.ruledWeakened) {
+          return stop('no-canonical-audit', { detail: 'carried-ready-over-weakened-audit', fallback: `The canonical audit says WEAKENED, and the ready record was carried from ${out.gate.record.sha}. Fix the weakening and re-audit, or get an operator ruling (ruledWeakened). ${fallback}` });
+        }
         console.warn(`WARNING: canonical audit ${out.canonicalAudit.reason}; proceeding in warn mode. ${fallback}`);
       }
       stage = 'no-ready';

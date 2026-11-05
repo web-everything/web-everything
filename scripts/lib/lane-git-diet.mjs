@@ -21,6 +21,9 @@
  *
  * Pure planning lives here; `we:scripts/lane-pool.mjs` applies it before every lane fetch and after clone.
  */
+import { isAbsolute, join } from 'node:path';
+import { DAEMON_CLONE_SEED } from './daemon-clone-registry.mjs';
+import { cleanupEligibility } from './lane-git-diet-cleanup.mjs';
 import { LANE_CONFIG_LIST_ARGS } from './lane-git-hardening.mjs';
 
 export const LANE_DEFAULT_FETCH = '+refs/heads/*:refs/remotes/origin/*';
@@ -103,4 +106,31 @@ export function applyLaneDietConfig(run, current) {
   const ops = laneDietConfigOps(current ?? laneDietConfigState(run([...LANE_CONFIG_LIST_ARGS])));
   for (const op of ops) run(op);
   return ops;
+}
+
+/** Exact registry names only: nested paths are permitted solely for explicit seed entries. */
+export function resolveDietDaemonClone(name, workspace) {
+  if (typeof name !== 'string' || isAbsolute(name) || name.includes('..') || !DAEMON_CLONE_SEED.includes(name)) {
+    throw new Error(`unregistered daemon clone name: ${JSON.stringify(name)}`);
+  }
+  return join(workspace, name);
+}
+
+/**
+ * Validate the registered location independently, then reuse ALL lane safety rules. The synthetic pool
+ * namespace below adapts only the pool-location rule; real paths must match BEFORE entering that namespace.
+ * No lease is invented: a verified rebuild write lock replaces the lane claim, and any actual lease refuses.
+ */
+export function daemonDietEligibility(inputs, { registeredDir, lockHeld }) {
+  if (!lockHeld) return { ok: false, reason: 'daemon clone write lock lost or expired' };
+  if (inputs.dir !== registeredDir || inputs.realDir !== registeredDir) return { ok: false, reason: 'daemon clone path is redirected or missing' };
+  for (const [key, suffix] of [['realGitDir', '.git'], ['realCommonDir', '.git'], ['realObjectsDir', '.git/objects']]) {
+    if (inputs[key] !== join(registeredDir, suffix)) return { ok: false, reason: `${key} is redirected or missing (${inputs[key]})` };
+  }
+  const poolRoot = registeredDir;
+  const dir = join(poolRoot, 'web-everything', 'lane-0');
+  return cleanupEligibility({
+    ...inputs, poolRoot, dir, realDir: dir, realGitDir: `${dir}/.git`,
+    realCommonDir: `${dir}/.git`, realObjectsDir: `${dir}/.git/objects`,
+  });
 }

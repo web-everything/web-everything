@@ -34,7 +34,7 @@ import { createSimClock } from './clock.mjs';
 import { nodeRuntimeEnv } from './node-runtime-env.mjs';
 import { seedLaneDependencies } from './dependencies.mjs';
 import { writeFixtureNpm } from './npm-shim.mjs';
-import { isolatedProcessEnv, toolPathDirs } from './environment.mjs';
+import { isolatedProcessEnv, seedHealthyHostSnapshot, toolPathDirs } from './environment.mjs';
 import { createHash } from 'node:crypto';
 import * as act from './agent-actions.mjs';
 import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
@@ -384,6 +384,8 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
   // Keep an explicit undefined so agent actions spreading process.env before this env cannot restore it;
   // Node omits undefined env entries when spawning the child.
   env.WE_DISPATCH_ROUTING_SNAPSHOT = undefined;
+  // R553/R559: the fixer hard memory floor ignores the cut-over pins above; give the world a healthy host.
+  seedHealthyHostSnapshot(env.WE_COORDINATION_ROOT);
 
   // Refuse to run unless the fakes actually win PATH — the same `assertWins` discipline `fake-claude.mjs`
   // itself uses, extended to `gh` too, and run BEFORE anything else touches this env.
