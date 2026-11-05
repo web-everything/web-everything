@@ -78,14 +78,15 @@ import { repoKeyForSlug, CONSTELLATION_REPOS } from '../lib/constellation-repos.
 // `reconcile-core.mjs`-adjacent imports below) so it never collides with an overlay editing that region.
 import { getRequiredStatusChecks, withoutImpliedRequiredChecks } from '../lib/required-status-checks.mjs';
 import { execFileSync } from 'node:child_process';
-import { resolve } from 'node:path';
+import { resolve, join, dirname } from 'node:path';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { codeqlFailureEvidence } from '../lib/codeql-gate.mjs';
 import { makeFixEvidenceReader, checkFixFacts } from '../lib/fix-facts.mjs';
 import { readSharedOpenPrs, sampleContextDeclared, SNAPSHOT_FIELDS } from '../lib/pr-snapshot.mjs';
-import { prSnapshotEnabled } from '../lib/pr-snapshot-store.mjs';
+import { prSnapshotEnabled, prSnapshotDir } from '../lib/pr-snapshot-store.mjs';
 import { listOpenPrsPagedHydrated, resolvePrListPaging, assertInventoryComplete, parseListOutput } from '../lib/pr-list-paged.mjs';
 import { ghRestGetJson } from '../lib/gh-rest-read.mjs';
+import { isGhThrottled } from '../lib/gh-deferred.mjs';
 import { withListRetry } from '../lib/gh-list-retry.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { prFactKey, readThroughShadow } from './planner-fact-cache.mjs';
@@ -94,7 +95,7 @@ import { resolveLanePoolRepoPath } from './lane-pool-health-watch.mjs';
 import { REPO_ROOT, defaultListAgents } from '../operations/dispatch-lane-io.mjs';
 import { listAgentsWithReviewJobs } from '../operations/review-job-store.mjs';
 import { countRearmComments } from './rearm-review.mjs';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
 import { resolveStandDownHoldsAcrossHeads } from './stand-down.mjs';
 import { enrichPrsWithStandDownAutoProceed } from './stand-down-auto-proceed-io.mjs';
 import { resolveRoundCap, planReconcile, DISPATCH_KINDS, REFUSAL_KINDS, markSelfReportedDone, resolveInfraRetryCooloffMs, resolveInfraTransientCooloffMs, markHungSessions, markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, resolveOperatorRulingExtraRounds, resolveRoundExtensionAnchor } from './reconcile-core.mjs';
@@ -327,17 +328,66 @@ const authorByPr = new Map();
 
 /** An immutable per-PR fact (author), read through the ETag-cached REST reader and remembered in-process.
  *  Shape matches `gh pr list --json author`. A failed/empty read FAILS CLOSED (the 5xx retry wrapper covers a transient one). */
-export function withRestAuthors(rows, { repo, readRest = ghRestGetJson } = {}) {
+/** Bounds on ONE read's author lookups: the read runs synchronously inside the daemon's event loop, so it may never
+ *  wait on dozens of gh slots (live 2026-11-03 17:23 ET: a tick wedged for 18 minutes). Past either bound the read
+ *  is deferred (retry next tick); lookups already done stay memoised, so ticks converge. */
+/** The per-call timeout (AUTHOR_LOOKUP_TIMEOUT_MS) kills `gh` (execFileSync: code ETIMEDOUT).
+ *  That says nothing about the PR: it defers the read exactly like a slot throttle, it is no hard failure. */
+export function isGhCallTimeout(e) {
+  if (!e) return false;
+  if (e.code === 'ETIMEDOUT') return true; // execFileSync's own timeout marker; a bare SIGKILL (OOM, operator) is NOT a timeout
+  return /\b(ETIMEDOUT|timed out|Client\.Timeout|context deadline exceeded)\b/i.test(`${e.message ?? ''}\n${e.stderr ?? ''}`);
+}
+export const AUTHOR_LOOKUP_BUDGET = 16;
+export const AUTHOR_LOOKUP_DEADLINE_MS = 12_000;
+export const AUTHOR_LOOKUP_TIMEOUT_MS = 8_000;
+
+// A PR's author never changes, so resolved authors are also persisted (host-shared, next to the PR snapshot): one-shot
+// pass processes (smokes, CLI passes) start cold every time and would otherwise never converge under the per-read budget.
+const authorFile = () => (prSnapshotEnabled(process.env) ? join(prSnapshotDir(process.env), 'pr-authors.json') : null);
+let authorsLoaded = false;
+let authorSaveWarned = false;
+function loadAuthors() {
+  if (authorsLoaded) return;
+  authorsLoaded = true;
+  const f = authorFile();
+  if (!f) return;
+  try { for (const [k, v] of Object.entries(JSON.parse(readFileSync(f, 'utf8')))) if (v?.login && !authorByPr.has(k)) authorByPr.set(k, v); } catch { /* none yet */ }
+}
+function saveAuthors() {
+  const f = authorFile();
+  if (!f) return;
+  try { mkdirSync(dirname(f), { recursive: true }); const tmp = `${f}.${process.pid}.tmp`; writeFileSync(tmp, JSON.stringify(Object.fromEntries(authorByPr))); renameSync(tmp, f); }
+  catch (e) {
+    // Not fatal for this read, but one-shot passes depend on this file to converge under the lookup budget: say so (once).
+    if (!authorSaveWarned) { authorSaveWarned = true; console.error(`reconcile-pass: author memo not persisted (${String(e?.message ?? e).split('\n')[0]}) — cold passes may defer until it is writable`); }
+  }
+}
+
+export function withRestAuthors(rows, { repo, readRest = ghRestGetJson, budget = AUTHOR_LOOKUP_BUDGET, deadlineMs = AUTHOR_LOOKUP_DEADLINE_MS, now = () => Date.now() } = {}) {
   if (!repo) return rows;
+  loadAuthors();
+  const startedAt = now();
+  let lookups = 0;
   const out = rows.map(pr => {
     if (pr?.author || !Number.isInteger(pr?.number)) return pr;
     const key = `${repo}#${pr.number}`;
     if (!authorByPr.has(key)) {
+      if (lookups >= budget || now() - startedAt >= deadlineMs) {
+        throw Object.assign(new Error(`author lookups for ${repo} over budget (${lookups} done) — deferring the read`), { authorLookupDeferred: true });
+      }
+      lookups++;
       let u;
-      try { u = readRest(`repos/${repo}/pulls/${pr.number}`, { context: repo, op: 'pr author (reconcile)' })?.json?.user; }
-      catch (cause) { throw Object.assign(new Error(`author of ${key} unreadable — refusing to accept the row without it`, { cause }), { code: 'pr-author-unreadable', stderr: cause?.stderr }); }
+      try { u = readRest(`repos/${repo}/pulls/${pr.number}`, { context: repo, op: 'pr author (reconcile)', execOpts: { timeout: AUTHOR_LOOKUP_TIMEOUT_MS } })?.json?.user; }
+      catch (cause) {
+        // A gh SLOT throttle (no slot within the wait, not a server failure) defers the WHOLE read: never accept the row
+        // without its author, never hard-fail — the tick retries next time. A genuine 4xx / missing login still fails closed.
+        if (isGhThrottled(cause) || isGhCallTimeout(cause)) throw Object.assign(new Error(`author lookup of ${key} throttled or timed out — deferring the read`, { cause }), { authorLookupDeferred: true });
+        throw Object.assign(new Error(`author of ${key} unreadable — refusing to accept the row without it`, { cause }), { code: 'pr-author-unreadable', stderr: cause?.stderr });
+      }
       if (!u?.login) throw Object.assign(new Error(`author of ${key} missing from the REST response — refusing to accept the row without it`), { code: 'pr-author-unreadable' });
       authorByPr.set(key, { login: u.login, is_bot: u.type === 'Bot' });
+      saveAuthors();
     }
     return { ...pr, author: authorByPr.get(key) };
   });
@@ -408,7 +458,8 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
   };
   if (exec === execFileSyncThrottled && repo) {
     const usePaged = prSnapshotEnabled(process.env) || listPaged !== listOpenPrsPagedHydrated;
-    const listed = withListRetry(() => {
+    let listed;
+    try { listed = withListRetry(() => {
       const shared = readShared({ repo, fields: SNAPSHOT_LIST_FIELDS, allowDeferred: true });
       if (shared) {
         // A declared smoke sample (WE_PR_SNAPSHOT_SAMPLE or a rebuild-smoke child) is accepted; a sample flag in a live read is not.
@@ -416,7 +467,7 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
         if (shared.discoveryIncomplete === true) throw Object.assign(new Error(`open-PR snapshot for ${repo} is truncated — refusing a partial inventory`), { code: 'pr-list-truncated' });
         return Array.isArray(shared) ? withRestAuthors(shared, { repo, readRest }) : shared; // author lookups sit INSIDE the retried read
       }
-      if (!usePaged) return direct(); // the legacy direct list already asks for `author`
+      if (!usePaged) return direct(); // snapshot explicitly disabled (opt-out / hermetic tests): the legacy direct read, no author fill
       const paged = listPaged({ repo, exec, paging: resolvePrListPaging(), heavyFields: ['comments', 'body', 'files'],
         cache: pagedHeavyCache.get(repo) || {}, maxRows: PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (reconcile page)' } } });
       pagedHeavyCache.set(repo, paged.cache);
@@ -425,7 +476,10 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
       // The page reader trusts GitHub's own totalCount only loosely: fewer rows than it reported is a partial inventory.
       assertInventoryComplete({ repo, rows: paged.rows, totalCount: paged.totalCount, truncated: paged.truncated });
       return withRestAuthors(paged.rows, { repo, readRest });
-    }, { repo, op: 'reconcile-pr-list', ...retryOpts });
+    }, { repo, op: 'reconcile-pr-list', ...retryOpts }); } catch (e) {
+      if (e?.authorLookupDeferred) return { outcome: 'deferred-low-budget', deferred: true, priority: 'background', reason: 'author-lookup-throttled', message: String(e.message) };
+      throw e;
+    }
     if (!Array.isArray(listed)) return listed;
     return enrich(listed);
   }
@@ -1345,7 +1399,8 @@ export function enrichPrsWithSystemFixFacts(prs, { readSystemFixState = defaultR
 export function enrichPrsWithFixClaims(prs, { repo = 'we', readClaim = readLiveFixClaim } = {}) {
   return (Array.isArray(prs) ? prs : []).map((pr) => {
     let entry = null;
-    try { entry = readClaim({ repo, pr: Number(pr?.number) }); } catch { entry = null; }
+    // R502 item 4: a failed read is marked `fixClaimUnknown` (additive) so recovery rules that need PROOF of no claim fail closed.
+    try { entry = readClaim({ repo, pr: Number(pr?.number) }); } catch { return { ...pr, fixClaimUnknown: true }; }
     if (!entry?.meta?.who) return pr;
     return { ...pr, fixClaim: { who: entry.meta.who, why: entry.meta.why ?? '', claimedAt: entry.meta.claimedAt ?? null } };
   });
