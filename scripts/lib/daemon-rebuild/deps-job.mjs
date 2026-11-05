@@ -34,14 +34,15 @@ import {
 } from '../daemon-jobs-runtime.mjs';
 import {
   ensureNodeModulesStore, evictSnapshots, lockfileKey, NODE_MODULES_HASH_FILE, nodeModulesRef,
-  NODE_MODULES_MANIFEST_FILE, nodeModulesPackageManifest, recordNodeModulesConsumer, setNodeModulesWritable, snapshotsRoot,
+  NODE_MODULES_MANIFEST_FILE, nodeModulesPackageManifest, nodeModulesTreeEvidence,
+  recordNodeModulesConsumer, setNodeModulesWritable, snapshotsRoot,
 } from '../daemon-job-snapshots.mjs';
 import { TERMINAL_JOB_STATUSES } from '../../operations/job-record.mjs';
 import { daemonJobsDir } from '../../operations/run-store.mjs';
 import { cloneKey } from '../daemon-overlays.mjs';
 import { NPM_INSTALL_TIMEOUT_MS } from '../bounded-child.mjs';
 import { readGit } from '../proc-read.mjs';
-import { cascadePolicy } from '../policy-cascade.mjs';
+import { cascadePolicy, readPlatformPreferences } from '../policy-cascade.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const SETTINGS_PATH = resolve(SELF, '..', '..', 'daemon-rebuild-settings.json');
@@ -61,20 +62,38 @@ const validDepsMode = (mode) => mode === 'symlink' || mode === 'copy';
  * loadRebuildAsJobSettings. Keep file IO here within the rebuild files' ownership boundary.
  * `file` includes platform files; the log additionally names the precise cascade layer.
  */
-export function resolveRebuildDepsMode({ env = process.env, settings, log = defaultLog } = {}) {
+export function resolveRebuildDepsMode({ env = process.env, settings, log = defaultLog, readFile = readFileSync } = {}) {
   let unreadable = false;
+  let invalidRaw = false;
+  const inspect = (data) => {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) { invalidRaw = true; return; }
+    if (!Object.hasOwn(data, 'rebuild')) return;
+    const block = data.rebuild;
+    if (!block || typeof block !== 'object' || Array.isArray(block)) { invalidRaw = true; return; }
+    if (Object.hasOwn(block, 'depsMode') && !validDepsMode(block.depsMode)) invalidRaw = true;
+  };
   if (settings === undefined) {
-    try { settings = JSON.parse(readFileSync(SETTINGS_PATH, 'utf8')); }
+    try { settings = JSON.parse(readFile(SETTINGS_PATH, 'utf8')); }
     catch (error) { unreadable = error?.code !== 'ENOENT'; settings = {}; }
   }
-  // Inspect the winning raw value: cascade validation normally ignores invalid higher layers,
-  // whereas this setting must select copy rather than silently reverting to symlink.
+  inspect(settings);
+  if (Object.hasOwn(env ?? {}, 'WE_DAEMON_REBUILD_DEPS_MODE') && !validDepsMode(env.WE_DAEMON_REBUILD_DEPS_MODE)) invalidRaw = true;
+  // Use the cascade's own file selection: legacy delivery-priority-settings.json, the repo's
+  // delivery-platform-preferences.json, and operatorPreferencesPath (or ONLY the env override).
+  // Inspect each raw file before merging: an empty object leaf can otherwise disappear in the
+  // cascade, and a later preference can conceal an invalid earlier layer. Never reread via cascade.
+  const platform = readPlatformPreferences({ env, readFile: (path, encoding) => {
+    const text = readFile(path, encoding);
+    inspect(JSON.parse(String(text)));
+    return text;
+  } });
+  unreadable ||= platform.errors.length > 0;
   const result = cascadePolicy('rebuild', settings?.rebuild, {
-    env, standard: { depsMode: 'symlink' },
+    env, platform: platform.prefs.rebuild ?? {}, standard: { depsMode: 'symlink' },
     envValues: { depsMode: env?.WE_DAEMON_REBUILD_DEPS_MODE },
   });
   const layer = result.sources.depsMode;
-  const invalid = !validDepsMode(result.value?.depsMode) || (unreadable && layer !== 'env');
+  const invalid = invalidRaw || unreadable || !validDepsMode(result.value?.depsMode);
   const mode = invalid ? 'copy' : result.value.depsMode;
   const source = invalid ? 'invalid' : layer === 'env' ? 'env' : layer === 'standard' ? 'built-in' : 'file';
   sayDeps(log, `rebuild.depsMode=${mode} source=${source} layer=${layer ?? 'unknown'}${unreadable ? ' (settings unreadable)' : ''}`);
@@ -106,7 +125,7 @@ function registerCurrentLiveTarget(root, options = {}) {
  */
 export function linkOrCopyNodeModules({
   root, storeDir, destination = join(root, 'node_modules'), depsMode, step,
-  exec = execFileSync, log = defaultLog, stat = statSync, readFile = readFileSync,
+  exec = execFileSync, log = defaultLog, stat = statSync, readFile = readFileSync, lstat = lstatSync, readDir = readdirSync,
   env = process.env, settings,
   referenceConsumer, liveConsumer,
 }) {
@@ -141,10 +160,15 @@ export function linkOrCopyNodeModules({
     try {
       const recorded = JSON.parse(readFile(join(dirname(source), NODE_MODULES_MANIFEST_FILE), 'utf8'));
       const current = nodeModulesPackageManifest(source, { stat, readFile });
-      if (recorded.sha256 !== current.sha256 || JSON.stringify(recorded.packages) !== JSON.stringify(current.packages)) {
+      const tree = nodeModulesTreeEvidence(source, { lstat, readDir });
+      if (!Number.isSafeInteger(recorded.entryCount) || recorded.entryCount < 1) {
+        reason = 'store tree entry count evidence missing or invalid';
+      } else if (recorded.entryCount !== tree.entryCount) {
+        reason = 'store tree entry count mismatch';
+      } else if (recorded.sha256 !== current.sha256 || JSON.stringify(recorded.packages) !== JSON.stringify(current.packages)) {
         reason = 'package manifest integrity mismatch';
       }
-    } catch { reason = 'package manifest evidence missing, unreadable, or writable'; }
+    } catch { reason = 'tree/package manifest evidence missing, unreadable, or writable'; }
   }
   if (!reason) {
     try {
