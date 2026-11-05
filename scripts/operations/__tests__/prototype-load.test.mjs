@@ -2251,7 +2251,9 @@ describe('readyEvidence fingerprint carry (R503)', () => {
     });
   });
   describe('loader: live fingerprint is read lazily and once (R503)', () => {
-    const liveFetches = (f) => f.calls.filter((c) => c.args[0] === 'fetch' && c.args.length > 3 && c.args[2] === 'main');
+    // The loader fetches the live branch itself; the fingerprint read adds exactly one more `fetch origin main <branch>`.
+    const branchFetches = (f) => f.calls.filter((c) => c.args[0] === 'fetch' && c.args[2] === 'main' && c.args[3] === BASE.branch).length;
+    const baselineFetches = async () => { const f = auditedFixture('warn', { ready: auditLines([green({ sha: SHA })]) }); await f.run(); return branchFetches(f); };
     const oldAudit = () => auditRecord({ head: OLD, fingerprint: FP });
     it('the --tests-run/--audit arguments path never runs the fingerprint read or its fetch', async () => {
       const fingerprint = vi.fn(() => FP);
@@ -2259,7 +2261,7 @@ describe('readyEvidence fingerprint carry (R503)', () => {
       const out = await f.run({ testsRun: 'fixture-green', audit: 'NOT WEAKENED' });
       expect(out.gate).toMatchObject({ source: 'arguments' });
       expect(fingerprint).not.toHaveBeenCalled();
-      expect(liveFetches(f)).toEqual([]);
+      expect(branchFetches(f)).toBe(await baselineFetches());
     });
     it('a ready record for another sha that stores a fingerprint triggers exactly one read, for origin/main and the live sha', async () => {
       const fingerprint = vi.fn(() => FP);
@@ -2268,7 +2270,7 @@ describe('readyEvidence fingerprint carry (R503)', () => {
       expect(out.gate).toMatchObject({ source: 'ready-record' });
       expect(fingerprint).toHaveBeenCalledTimes(1);
       expect(fingerprint).toHaveBeenCalledWith('origin/main', SHA);
-      expect(liveFetches(f)).toHaveLength(1);
+      expect(branchFetches(f)).toBe(await baselineFetches() + 1);
     });
     it('a ruled-exception allowlist entry for another sha that stores a fingerprint also triggers the read', async () => {
       const fingerprint = vi.fn(() => FP);
@@ -2284,7 +2286,7 @@ describe('readyEvidence fingerprint carry (R503)', () => {
       const f = auditedFixture('warn', { ready: auditLines(records), fingerprint });
       expect((await f.run()).gate).toMatchObject({ source: 'ready-record' });
       expect(fingerprint).not.toHaveBeenCalled();
-      expect(liveFetches(f)).toEqual([]);
+      expect(branchFetches(f)).toBe(await baselineFetches());
     });
     it('the ready and audit stages share ONE read (memoized across stages)', async () => {
       const fingerprint = vi.fn(() => FP);
@@ -2292,7 +2294,7 @@ describe('readyEvidence fingerprint carry (R503)', () => {
       const out = await f.run();
       expect(out).toMatchObject({ ok: true });
       expect(fingerprint).toHaveBeenCalledTimes(1);
-      expect(liveFetches(f)).toHaveLength(1);
+      expect(branchFetches(f)).toBe(await baselineFetches() + 1);
     });
     it.each([['null', () => null], ['throw', () => { throw new Error('boom'); }]])('a failed read (%s) is no carry and not a crash', async (_, fingerprint) => {
       const out = await auditedFixture('warn', { ready: auditLines([green()]), fingerprint }).run();
