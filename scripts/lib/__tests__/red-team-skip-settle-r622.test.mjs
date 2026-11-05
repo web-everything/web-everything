@@ -3,7 +3,7 @@
 // unknown run evidence (review-unfinished / scan-capped). A trusted result comment bound to the exact
 // head settles those two reasons; a recorded break still sends back; missing evidence still fails closed.
 import { describe, expect, it } from 'vitest';
-import { settleUnknownEvidenceByComment } from '../drain-red-team-evidence.mjs';
+import { readDrainRedTeamEvidence, settleUnknownEvidenceByComment } from '../drain-red-team-evidence.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 
@@ -57,5 +57,24 @@ describe('R622 unknown run evidence settled by a head-bound result comment', () 
   it('known evidence passes through untouched', () => {
     const evidence = { scheduled: true, recorded: false };
     expect(settleUnknownEvidenceByComment(evidence, [comment()], pr, head)).toBe(evidence);
+  });
+  it('a resumed review stamps a later resume time: a comment older than the resume stays held', () => {
+    expect(holdFor(unknown('review-unfinished', { unfinishedStartedAt: T + 60e3 }), [comment()])).toMatch(/evidence unknown/);
+  });
+});
+
+describe('R622 the evidence reader bounds a resumed unfinished review by its resume stamp', () => {
+  const rev = head;
+  const run = extra => ({ op: 'review-pr', input: { repo: 'o/r', pr }, findings: { read: { netBasis: { rev } } },
+    stepTimings: [{ step: 'read', startedAt: new Date(T - 7200e3).toISOString() }], verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' }, ...extra });
+  const read = r => readDrainRedTeamEvidence({ repo: 'o/r', pr, head: rev, env: { WE_SHARED_RUNS_DIR: '/nonexistent-r622' },
+    runsDir: '/runs', list: () => ['review-pr-1'], stat: () => ({ mtimeMs: T - 60e3 }), read: () => r, readScorecards: () => [], now: T });
+  const settled = r => settleUnknownEvidenceByComment(read(r), [comment()], pr, head);
+  it('plain unfinished run older than the comment settles', () => { expect(settled(run({}))).toMatchObject({ ok: true }); });
+  it('a resume stamped after the comment stays held', () => {
+    expect(settled(run({ resumeOf: 'x', resumedAt: new Date(T + 60e3).toISOString() }))).toMatchObject({ ok: false, reason: 'review-unfinished' });
+  });
+  it('a resumed run with no readable stamp stays held', () => {
+    expect(settled(run({ resumeOf: 'x' }))).toMatchObject({ ok: false, reason: 'review-unfinished' });
   });
 });

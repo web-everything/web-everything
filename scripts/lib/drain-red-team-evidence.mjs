@@ -60,6 +60,14 @@ const reviewStartedAt = hit => {
   const started = Array.isArray(timings) ? timings.find(t => t?.step === 'read')?.startedAt : undefined;
   return typeof started === 'string' ? Date.parse(started) : NaN;
 };
+// R622: a rewound-and-resumed review keeps its original read start, so the resume stamp counts too. A resumed
+// run with no readable stamp has no usable bound (NaN), so no comment can settle it.
+const unfinishedSince = run => {
+  const started = reviewStartedAt({ run });
+  if (run.resumeOf == null && run.resumedAt == null) return started;
+  const resumed = typeof run.resumedAt === 'number' ? run.resumedAt : Date.parse(run.resumedAt);
+  return Number.isFinite(resumed) ? Math.max(started, resumed) : NaN;
+};
 const unfinishedReview = run => !run.verdict || run.pending != null
   || run.effects?.some(effect => ['pending', 'in-flight'].includes(effect?.status));
 
@@ -140,7 +148,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     }
     if (unfinished && (!selected || unfinished.id === selected.id || reviewStartedAt(unfinished) >= selectedStart)) {
       return withSettleBounds({ ok: false, reason: 'review-unfinished' },
-        { unfinishedStartedAt: reviewStartedAt(unfinished), ...(scan.end?.ok === false ? { unreadBoundaryAt: scan.boundary } : {}) });
+        { unfinishedStartedAt: unfinishedSince(unfinished.run), ...(scan.end?.ok === false ? { unreadBoundaryAt: scan.boundary } : {}) });
     }
     if (scan.end?.ok !== false) return null;
     // Capped: usable only when no unread record can change this query's answer (see above).
