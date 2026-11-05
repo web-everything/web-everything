@@ -325,11 +325,21 @@ export const SNAPSHOT_LIST_FIELDS = PR_LIST_JSON_FIELDS.split(',').filter(f => f
 const pagedHeavyCache = new Map();
 /** A `fresh` read may reuse a cached heavy read (comments/body/files) only if it was taken AFTER its PR's `updatedAt`
  *  second had ended: updatedAt has 1 s granularity, so a comment posted in the same second as a cached read would leave
- *  updatedAt unchanged and stay invisible (a stand-down missed after the planner's baseline probe). */
+ *  updatedAt unchanged and stay invisible (a stand-down missed after the planner's baseline probe).
+ *  The proof uses SERVER timestamps only (never the local clock, which may be skewed against GitHub's): each newly
+ *  fetched entry is stamped `serverSeenMs` = the newest `updatedAt` in the same listing that preceded its heavy read.
+ *  Server time was therefore at least that value when the heavy read ran, so the entry is settled iff
+ *  `serverSeenMs - updatedAt >= FRESH_SETTLE_MS`. No stamp (a legacy or injected entry) fails closed: re-fetched. */
 export const FRESH_SETTLE_MS = 2000;
+export function stampServerSeen(prior, next, rows) {
+  const seen = Math.max(...(rows || []).map(r => Date.parse(r?.updatedAt)).filter(Number.isFinite));
+  if (!Number.isFinite(seen)) return next;
+  return Object.fromEntries(Object.entries(next || {}).map(([n, e]) =>
+    [n, e && e !== prior?.[n] && !Number.isFinite(e.serverSeenMs) ? { ...e, serverSeenMs: seen } : e]));
+}
 export function settledHeavyCache(cache) {
-  return Object.fromEntries(Object.entries(cache || {}).filter(([, e]) => Number.isFinite(e?.fetchedAtMs)
-    && Number.isFinite(Date.parse(e?.updatedAt)) && e.fetchedAtMs - Date.parse(e.updatedAt) >= FRESH_SETTLE_MS));
+  return Object.fromEntries(Object.entries(cache || {}).filter(([, e]) => Number.isFinite(e?.serverSeenMs)
+    && Number.isFinite(Date.parse(e?.updatedAt)) && e.serverSeenMs - Date.parse(e.updatedAt) >= FRESH_SETTLE_MS));
 }
 const authorByPr = new Map();
 
@@ -477,7 +487,7 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
       if (!usePaged) return direct(); // snapshot explicitly disabled (opt-out / hermetic tests): the legacy direct read, no author fill
       const paged = listPaged({ repo, exec, paging: resolvePrListPaging(), heavyFields: ['comments', 'body', 'files'],
         cache: fresh ? settledHeavyCache(pagedHeavyCache.get(repo)) : (pagedHeavyCache.get(repo) || {}), maxRows: PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (reconcile page)' } } });
-      pagedHeavyCache.set(repo, paged.cache);
+      pagedHeavyCache.set(repo, stampServerSeen(pagedHeavyCache.get(repo), paged.cache, paged.rows));
       // A capped inventory is incomplete discovery: fail loudly rather than plan as if the omitted PRs did not exist.
       if (paged.truncated) throw Object.assign(new Error(`open-PR list for ${repo} truncated at ${PR_LIST_LIMIT} rows (${paged.totalCount} open) — refusing a partial inventory`), { code: 'pr-list-truncated' });
       // The page reader trusts GitHub's own totalCount only loosely: fewer rows than it reported is a partial inventory.

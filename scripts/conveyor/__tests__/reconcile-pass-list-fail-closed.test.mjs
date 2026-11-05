@@ -353,7 +353,7 @@ describe('fresh read (the fix daemon plans from a read taken AFTER its baseline 
 
 describe('fresh read wiring: the cache handed to listPaged and the paged path itself are pinned', () => {
   const U = Date.parse('2026-11-03T22:00:00Z');
-  const entry = (fetchedAtMs) => ({ updatedAt: '2026-11-03T22:00:00Z', headRefOid: 'a', fetchedAtMs, comments: [], body: '', files: [] });
+  const entry = (serverSeenMs) => ({ updatedAt: '2026-11-03T22:00:00Z', headRefOid: 'a', fetchedAtMs: 0, serverSeenMs, comments: [], body: '', files: [] });
   const base = { exec: undefined, readCommits: () => [], readShared: () => null,
     readRest: () => ({ json: { user: { login: 'u', type: 'User' } } }),
     retryOpts: { sleep: () => {}, persist: false, onEvent: () => {} } };
@@ -393,14 +393,63 @@ describe('fresh read wiring: the cache handed to listPaged and the paged path it
   });
 });
 
-it('a fresh read reuses a cached heavy read only once its PR updatedAt second had ended (same-second comments stay visible)', async () => {
+it('a fresh read reuses a cached heavy read only once SERVER time had passed its PR updatedAt second (same-second comments stay visible)', async () => {
   const { settledHeavyCache, FRESH_SETTLE_MS } = await import('../reconcile-pass.mjs');
   const U = Date.parse('2026-11-03T22:00:00Z');
   const cache = {
-    1: { updatedAt: '2026-11-03T22:00:00Z', fetchedAtMs: U + 500, comments: ['maybe stale'] },
-    2: { updatedAt: '2026-11-03T22:00:00Z', fetchedAtMs: U + FRESH_SETTLE_MS, comments: ['settled'] },
-    3: { updatedAt: 'garbage', fetchedAtMs: U + 99999 },
+    1: { updatedAt: '2026-11-03T22:00:00Z', serverSeenMs: U + 500, comments: ['maybe stale'] },
+    2: { updatedAt: '2026-11-03T22:00:00Z', serverSeenMs: U + FRESH_SETTLE_MS, comments: ['settled'] },
+    3: { updatedAt: 'garbage', serverSeenMs: U + 99999 },
+    4: { updatedAt: '2026-11-03T22:00:00Z', fetchedAtMs: U + 99999, comments: ['no server stamp: fails closed'] },
   };
   expect(Object.keys(settledHeavyCache(cache))).toEqual(['2']);
   expect(settledHeavyCache(undefined)).toEqual({});
+});
+
+describe('clock skew: settlement is proven by server timestamps only, never the local clock', () => {
+  const U = Date.parse('2026-11-03T22:00:00Z');
+  const row = (number, updatedAt) => ({ number, updatedAt, labels: [], comments: [], statusCheckRollup: [] });
+  const iso = (ms) => new Date(ms).toISOString();
+
+  it('a client clock 5 s AHEAD cannot make a same-second cache entry look settled', async () => {
+    const { stampServerSeen, settledHeavyCache } = await import('../reconcile-pass.mjs');
+    // Heavy read at server U+300 ms, client clock +5 s: the old check saw fetchedAtMs - updatedAt = 5300 ms >= 2000 ms.
+    const fresh = { updatedAt: iso(U), headRefOid: 'a', fetchedAtMs: U + 5300, comments: [] };
+    const stamped = stampServerSeen({}, { 1: fresh }, [row(1, iso(U))]); // newest server updatedAt in the listing = U itself
+    expect(stamped[1].serverSeenMs).toBe(U);
+    expect(settledHeavyCache(stamped)).toEqual({});
+  });
+  it('an entry is settled when the same listing proves server time moved >= 2 s past its updatedAt (skew-free)', async () => {
+    const { stampServerSeen, settledHeavyCache } = await import('../reconcile-pass.mjs');
+    const stamped = stampServerSeen({}, { 1: { updatedAt: iso(U), fetchedAtMs: -1e9 }, 2: { updatedAt: iso(U + 2500), fetchedAtMs: 1e18 } },
+      [row(1, iso(U)), row(2, iso(U + 2500))]);
+    expect(Object.keys(settledHeavyCache(stamped))).toEqual(['1']); // 2 is the newest PR itself: not provably settled
+  });
+  it('a REUSED entry keeps its original stamp (a later listing proves nothing about the earlier heavy read); a missing updatedAt stamps nothing', async () => {
+    const { stampServerSeen } = await import('../reconcile-pass.mjs');
+    const reused = { updatedAt: iso(U), serverSeenMs: U };
+    const out = stampServerSeen({ 1: reused }, { 1: reused, 2: { updatedAt: iso(U) } }, [row(1, iso(U + 60_000))]);
+    expect(out[1].serverSeenMs).toBe(U);
+    expect(out[2].serverSeenMs).toBe(U + 60_000);
+    expect(stampServerSeen({}, { 3: { updatedAt: iso(U) } }, [{ number: 3 }])[3].serverSeenMs).toBeUndefined();
+  });
+  it('end to end through defaultReadPrs: skewed cache is not handed to listPaged on a fresh read; a server-proven one is', async () => {
+    const { defaultReadPrs } = await import('../reconcile-pass.mjs');
+    const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
+    const base = { readCommits: () => [], readShared: () => null, readRest: () => ({ json: { user: { login: 'u', type: 'User' } } }),
+      retryOpts: { sleep: () => {}, persist: false, onEvent: () => {} }, repo: 'o/skew-wiring', exec: execFileSyncThrottled };
+    // First (non-fresh) read: listing shows PR 1 at U and PR 2 at U (newest = U), so entry 1 is stamped U -> unsettled. PR 3 is 3 s newer.
+    const heavy = (n) => ({ updatedAt: iso(U), headRefOid: 'a', fetchedAtMs: U + 9000, comments: [], body: '', files: [], n });
+    const first = vi.fn(() => ({ rows: [row(1, iso(U)), row(2, iso(U))], cache: { 1: heavy(1), 2: heavy(2) }, totalCount: 2 }));
+    defaultReadPrs({ ...base, listPaged: first, fresh: false });
+    const probe = vi.fn(() => ({ rows: [row(1, iso(U)), row(2, iso(U))], cache: {}, totalCount: 2 }));
+    defaultReadPrs({ ...base, listPaged: probe, fresh: true });
+    expect(probe.mock.calls[0][0].cache).toEqual({}); // fetchedAtMs says "9 s old", server stamps say unsettled
+    const second = vi.fn(() => ({ rows: [row(1, iso(U)), row(3, iso(U + 3000))], cache: { 1: heavy(1), 3: { ...heavy(3), updatedAt: iso(U + 3000) } }, totalCount: 2 }));
+    defaultReadPrs({ ...base, listPaged: second, fresh: false });
+    const probe2 = vi.fn(() => ({ rows: [row(1, iso(U))], cache: {}, totalCount: 1 }));
+    defaultReadPrs({ ...base, listPaged: probe2, fresh: true });
+    // entry 1 was re-fetched in a listing whose newest server updatedAt is U+3000 (>= 2 s past U): settled; entry 3 is that newest PR: not
+    expect(Object.keys(probe2.mock.calls[0][0].cache)).toEqual(['1']);
+  });
 });
