@@ -646,4 +646,57 @@ describe('interpreter option shapes that once hid a clone script (value contains
   ])('inline-program option %s never makes a clone data path the script', (_name, ProgramArguments) => {
     expect(findServicesRunningFromClone(fixture([{ Label: 'com.we.resource-sampler', ProgramArguments }]))).toEqual({ matches: [], unreadable: [] });
   });
+  const outside = resolve('..', 'bin', 'node');
+  it.each([
+    ['relative script', [outside, 'scripts/conveyor/resource-sampler-daemon.mjs']],
+    ['dot-relative script', [outside, './sampler.mjs']],
+    ['bare script name', [outside, 'sampler.mjs']],
+    ['interpreter flag before script', [outside, '--no-warnings', 'scripts/sampler.mjs']],
+    ['after --', [outside, '--', 'scripts/sampler.mjs']],
+    ['relative executable', ['./bin/sampler']],
+    ['env wrapper', ['/usr/bin/env', outside, 'scripts/sampler.mjs']],
+  ])('explicit WorkingDirectory in the clone anchors a %s', async (_name, ProgramArguments) => {
+    const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments, WorkingDirectory: cloneRoot }]);
+    expect(findServicesRunningFromClone(o).matches.map(x => x.label)).toEqual(['com.we.resource-sampler']);
+    expect((await restartServicesForClone(o)).restarted).toHaveLength(1);
+    expect(findStaleCodeServices({ ...o, readProcessStartMs: () => 100_000, readAdoptedAtMs: () => 200_000 })).toHaveLength(1);
+  });
+  it.each([
+    ['no WorkingDirectory', undefined, 'scripts/sampler.mjs'],
+    ['relative WorkingDirectory', 'clone', 'scripts/sampler.mjs'],
+    ['WorkingDirectory outside the clone', resolve('..', 'other-clone'), 'scripts/sampler.mjs'],
+    ['bare executable name is a PATH lookup, not cwd-relative', cloneRoot, undefined],
+  ])('does not claim a relative script without an in-clone absolute anchor: %s', (_name, WorkingDirectory, script) => {
+    const ProgramArguments = script ? [outside, script] : ['sampler'];
+    expect(findServicesRunningFromClone(fixture([{ Label: 'com.we.resource-sampler', ProgramArguments, WorkingDirectory }])).matches).toEqual([]);
+  });
+  it.each([
+    ['plain env', ['/usr/bin/env', outside, join(cloneRoot, 'sampler.mjs')], true],
+    ['env with assignments', ['/usr/bin/env', 'A=1', 'B=two', outside, join(cloneRoot, 'sampler.mjs')], true],
+    ['env -i / -u NAME', ['/usr/bin/env', '-i', '-u', 'HOME', outside, join(cloneRoot, 'sampler.mjs')], true],
+    ['env -- separator', ['/usr/bin/env', '--', outside, join(cloneRoot, 'sampler.mjs')], true],
+    ['env with interpreter flags', ['/usr/bin/env', 'A=1', outside, '--no-warnings', join(cloneRoot, 'sampler.mjs')], true],
+    ['env of a clone executable', ['/usr/bin/env', join(cloneRoot, 'bin', 'sampler')], true],
+    ['env -C anchors a relative script', ['/usr/bin/env', '-C', cloneRoot, outside, 'sampler.mjs'], true],
+    ['nohup wrapper', ['/usr/bin/nohup', outside, join(cloneRoot, 'sampler.mjs')], true],
+    ['nice -n wrapper', ['/usr/bin/nice', '-n', '5', outside, join(cloneRoot, 'sampler.mjs')], true],
+    ['nested wrappers', ['/usr/bin/env', 'A=1', '/usr/bin/nohup', outside, join(cloneRoot, 'sampler.mjs')], true],
+    ['env around an unrelated script', ['/usr/bin/env', outside, resolve('..', 'other-clone', 'sampler.mjs')], false],
+    ['clone path only as script data', ['/usr/bin/env', outside, resolve('..', 'other-clone', 'sampler.mjs'), join(cloneRoot, 'data')], false],
+    ['clone path as env assignment value', ['/usr/bin/env', `DATA=${join(cloneRoot, 'x')}`, outside, resolve('..', 'other-clone', 'sampler.mjs')], false],
+    ['env -C outside leaves a relative script unproven', ['/usr/bin/env', '-C', resolve('..', 'other-clone'), outside, 'sampler.mjs'], false],
+    ['env -u operand is not the program', ['/usr/bin/env', '-u', join(cloneRoot, 'x'), outside, resolve('..', 'other-clone', 'sampler.mjs')], false],
+  ])('wrapper commands do not hide the executed program: %s', async (_name, ProgramArguments, owned) => {
+    const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments }]);
+    expect(findServicesRunningFromClone(o).matches).toHaveLength(owned ? 1 : 0);
+    expect((await restartServicesForClone(o)).restarted).toHaveLength(owned ? 1 : 0);
+    expect(findStaleCodeServices({ ...o, readProcessStartMs: () => 100_000, readAdoptedAtMs: () => 200_000 })).toHaveLength(owned ? 1 : 0);
+  });
+  it('an unclassifiable wrapper option followed by a clone path is flagged, never silently excluded', () => {
+    const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/env', '--mystery', outside, join(cloneRoot, 'sampler.mjs')] }]);
+    const result = findServicesRunningFromClone(o);
+    expect(result.matches).toEqual([]);
+    expect(result.unreadable).toHaveLength(1);
+    expect(result.unreadable[0].error).toMatch(/--mystery/);
+  });
 });

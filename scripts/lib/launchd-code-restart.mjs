@@ -26,9 +26,47 @@ const userId = () => process.getuid();
 // Returns { owners, unknownAt }: unknownAt is the index of an option that could not be
 // classified (it may or may not take a separate operand), or null. The caller must not
 // treat that as "not the clone" when a later argument is a clone path.
-function codeArguments(args) {
-  const executable = args[0], name = basename(executable).toLowerCase();
-  const result = { owners: [executable], unknownAt: null };
+// `cwd` is the service's explicit absolute working directory (or null): relative script
+// paths resolve against it, exactly as launchd would run them. Without one they stay
+// unproven (the service's default cwd is not this process's cwd).
+const place = (arg, cwd, exe) => isPathArg(arg) ? expand(arg)
+  : cwd && !arg.startsWith('-') && !arg.startsWith('+') && (!exe || arg.includes('/')) ? resolve(cwd, arg) : arg;
+// Command wrappers that exec their first non-option, non-assignment operand. `env` is the
+// common launchd one; the rest are the same shape. An option we cannot classify is reported
+// as unknownAt so the caller flags a following clone path instead of silently excluding it.
+const WRAPPERS = /^(?:env|nohup|exec|command|time|nice|arch|caffeinate)$/;
+function unwrap(args, start, cwd) {
+  const name = basename(args[start]).toLowerCase();
+  const owners = [place(args[start], cwd, true)];
+  let i = start + 1;
+  for (; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--') { i += 1; break; }
+    if (name === 'env' && /^[A-Za-z_]\w*=/.test(arg)) continue;
+    if (name === 'env' && (arg === '-u' || arg === '--unset')) { i += 1; continue; }
+    if (name === 'env' && (arg === '-C' || arg === '--chdir')) {
+      if (args[i + 1] !== undefined && isAbsolute(args[i + 1])) cwd = args[i + 1]; else cwd = null;
+      i += 1; continue;
+    }
+    if (name === 'env' && /^--(?:unset|chdir)=/.test(arg)) { if (arg.startsWith('--chdir=')) cwd = isAbsolute(arg.slice(8)) ? arg.slice(8) : null; continue; }
+    if (name === 'env' && /^(?:-[i0v]+|--ignore-environment|--null|--debug)$/.test(arg)) continue;
+    if ((name === 'nice' && (arg === '-n' || arg === '--adjustment')) || (name === 'arch' && arg === '-arch')) { i += 1; continue; }
+    if ((name === 'nice' && /^(?:-\d+|-n\d+|--adjustment=.*)$/.test(arg)) || (name === 'time' && /^-[lp]+$/.test(arg))
+      || (name === 'caffeinate' && /^-[dimsu]+$/.test(arg)) || (name === 'command' && /^-[p]$/.test(arg))) continue;
+    if (arg.startsWith('-') || arg.startsWith('+')) return { owners, unknownAt: i };
+    break;
+  }
+  if (i >= args.length) return { owners, unknownAt: null };
+  const inner = codeArguments(args, i, cwd);
+  return { owners: [...owners, ...inner.owners], unknownAt: inner.unknownAt, cwd: inner.cwd };
+}
+function codeArguments(args, start = 0, cwd = null) {
+  const executable = args[start], name = basename(executable).toLowerCase();
+  if (WRAPPERS.test(name)) {
+    const wrapped = unwrap(args, start, cwd);
+    return { ...wrapped, cwd: wrapped.cwd ?? cwd };
+  }
+  const result = { owners: [place(executable, cwd, true)], unknownAt: null, cwd };
   if (!/^(?:node|nodejs|python(?:\d+(?:\.\d+)*)?|pypy\d*|bash|sh|zsh|dash|ksh|ruby|perl)$/.test(name)) return result;
   // In a shell `-e` is errexit (a flag), not "evaluate the next argument"; `-c` is the inline-program option.
   const shell = /^(?:bash|sh|zsh|dash|ksh)$/.test(name), rubyPerl = /^(?:ruby|perl)$/.test(name);
@@ -40,9 +78,9 @@ function codeArguments(args) {
     ...(rubyPerl ? ['-I'] : [])]);
   // Operand-free short flags (python -B -E -I -O -P -R -S -b -d -i -q -s -u -v -x; ruby/perl -w -v), alone or combined.
   const flag = /^(?:--(?:trace-warnings|no-warnings|no-deprecation|trace-deprecation|throw-deprecation|pending-deprecation|expose-gc|use-strict|harmony|preserve-symlinks|preserve-symlinks-main|abort-on-uncaught-exception|enable-source-maps|experimental-strip-types|noprofile|norc)|-[uBbEIsSOivxdqRPw]+)$/;
-  for (let i = 1; i < args.length; i += 1) {
+  for (let i = start + 1; i < args.length; i += 1) {
     const arg = args[i];
-    if (arg === '--') { result.owners.push(...args.slice(i + 1, i + 2)); return result; }
+    if (arg === '--') { result.owners.push(...args.slice(i + 1, i + 2).map(a => place(a, cwd, false))); return result; }
     // An attached `-Wvalue` / `-Xvalue` (value may contain a "c", e.g. -Wignore::DeprecationWarning) is a
     // complete option: check it before the combined-`-c` detector below.
     if (/^-[WX]./.test(arg) || rubyPerl && /^-I./.test(arg)) continue;
@@ -57,7 +95,7 @@ function codeArguments(args) {
       result.unknownAt = i;
       return result;
     }
-    result.owners.push(arg);
+    result.owners.push(place(arg, cwd, false));
     return result;
   }
   return result;
@@ -117,15 +155,19 @@ function parsePlist(p, { selfLabel, plistPath }) {
   const args = hasProgram ? [p.Program, ...argv.slice(1)] : argv;
   // An external interpreter can still execute a clone-backed script; parse its
   // effective argv while keeping Program authoritative over the displayed argv[0].
-  const { owners, unknownAt } = codeArguments(args);
+  // Only an explicit absolute/home-relative WorkingDirectory can anchor relative script paths.
+  const wd = typeof p.WorkingDirectory === 'string' && isPathArg(p.WorkingDirectory) ? expand(p.WorkingDirectory) : null;
+  const { owners, unknownAt, cwd } = codeArguments(args, 0, wd);
   // Bare executables, flags and relative paths belong to the service's context,
-  // not this process's cwd. Only explicit absolute/home-relative paths prove ownership.
+  // not this process's cwd. Only absolute/home-relative paths, or paths resolved against
+  // the service's own explicit WorkingDirectory, prove ownership.
   return { label: p.Label, plistPath, args, unknownOption: unknownAt === null ? null : args[unknownAt],
     paths: owners.filter(isPathArg).map(expand),
     // The script is the first non-option argument after the unknown option, or the second
     // when that option consumed an operand. Later arguments are script data, not code.
     unknownPaths: unknownAt === null ? []
-      : args.slice(unknownAt + 1).filter(a => !a.startsWith('-') && !a.startsWith('+')).slice(0, 2).filter(isPathArg).map(expand) };
+      : args.slice(unknownAt + 1).filter(a => !a.startsWith('-') && !a.startsWith('+')).slice(0, 2)
+        .map(a => place(a, cwd ?? wd, false)).filter(isPathArg).map(expand) };
 }
 
 // Lexical prefix OR same location after resolving symlinks/aliases (/var vs /private/var).
