@@ -193,7 +193,6 @@
   "scripts/__tests__/lane-pool-cap-count.test.mjs": 15.56,
   "scripts/__tests__/lane-pool-clean-verdict-memo.test.mjs": 86.53,
   "scripts/__tests__/lane-pool-flag-validation.test.mjs": 8.96,
-  "scripts/__tests__/lane-pool-free-list-event-refresh.test.mjs": 150,
   "scripts/__tests__/lane-pool-git-diet.test.mjs": 224.68,
   "scripts/__tests__/lane-pool-history-ledger.test.mjs": 14.27,
   "scripts/__tests__/lane-pool-hold-rule.test.mjs": 101.01,
