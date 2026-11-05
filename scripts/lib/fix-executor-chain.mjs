@@ -1,8 +1,9 @@
 /** Configurable repair escalation rungs; launcher availability is supplied by the caller. */
 import { readFileSync } from 'node:fs';
-import { readSettings } from './settings-files.mjs';
+import { readDeclaredSettings } from './settings-files.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { ROUTED_CODEX_MAX_UNPRODUCTIVE } from './fix-slot-borrow.mjs';
+import { effectiveBuilder } from './routing-settings.mjs';
 
 const rung = (id, executor, policyRoute) => Object.freeze({ id, executor,
   ...(policyRoute ? { policyRoute: Object.freeze(policyRoute) } : {}) });
@@ -19,7 +20,10 @@ const platformPreferences = () => {
   try { return JSON.parse(readFileSync(new URL('./delivery-platform-preferences.json', import.meta.url), 'utf8')); }
   catch { return {}; }
 };
-export function resolveFixExecutorChain({ env = process.env, platform = platformPreferences(), repo = readSettings() } = {}) {
+export function resolveFixExecutorChain({ env = process.env, platform = platformPreferences(), repo } = {}) {
+  // Read through the declared reader so a malformed routing.json surfaces and fails closed to claude.
+  const declared = repo === undefined ? readDeclaredSettings() : null;
+  if (declared) repo = declared.settings;
   let rawEnv;
   const raw = env?.WE_FIX_EXECUTOR_FALLBACK_CHAIN;
   if (typeof raw === 'string') {
@@ -29,6 +33,12 @@ export function resolveFixExecutorChain({ env = process.env, platform = platform
   let result = { value: [...FIX_EXECUTOR_CHAIN_DEFAULT], source: 'default' };
   for (const [source, value] of [['platform', platform?.fixExecutor?.fallbackChain], ['repo', repo?.fixExecutor?.fallbackChain], ['env', rawEnv]]) {
     if (valid(value)) result = { value: [...value], source };
+  }
+  // routing.builder=claude (or auto over the quota threshold) drops the codex rungs from every layer, env included.
+  // To use Codex again set routing.builder=codex (or WE_ROUTING_BUILDER=codex); a chain alone cannot override it.
+  if (effectiveBuilder({ env, ...(declared ? { declared } : { repo }) }).builder === 'claude') {
+    const kept = result.value.filter(id => FIX_EXECUTOR_RUNGS[id].executor !== 'codex');
+    result = { value: kept, source: `${result.source}+routing.builder` };
   }
   const rawCritical = env?.WE_FIX_EXECUTOR_CRITICAL_CLAUDE_FROM_RUNG;
   const validCritical = value => Number.isSafeInteger(value) && value >= 1;

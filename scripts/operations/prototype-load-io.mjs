@@ -263,6 +263,22 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
     return { files: [], conflicting: [], ...data.check, exit: result.code, wouldRegister: data.wouldRegister };
   };
   return async function load(input) {
+    // R503: the live head's net-diff fingerprint, computed once and only when some evidence for another sha stores one.
+    // Any git failure is no carry (null), never a throw.
+    let liveFpMemo;
+    const liveFingerprint = (evidence) => {
+      if (liveFpMemo !== undefined) return liveFpMemo;
+      // The record must name another head (audit) or sha (ready record): a headless record can never carry (main #6353).
+      // Shas compare case-insensitively, as the pure layer does, so the live head's own records never count as another head.
+      const live = String(input.sha).toLowerCase();
+      const same = (v) => typeof v === 'string' && v.toLowerCase() === live;
+      if (!evidence.some((r) => r?.fingerprint && (r.head || r.sha) && !same(r.sha) && !same(r.head))) return null;
+      try {
+        requireGit('fetch', 'origin', 'main', input.branch);
+        liveFpMemo = (fingerprint || ((b, h) => netDiffFingerprint(repo, b, h, { exec })))('origin/main', input.sha) || null;
+      } catch { liveFpMemo = null; }
+      return liveFpMemo;
+    };
     const out = { ok: false, daemon: input.daemon, clone: null, cloneSource: null, registered: false, adopted: false,
       stopReason: null, branch: input.branch, sha: input.sha, effectiveRef: input.branch, effectiveSha: input.sha,
       dryRun: !!input.dryRun, stale: [], staleTolerated: [], removed: [], removedTips: {}, why: input.why || '',
@@ -351,7 +367,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         || !Number.isFinite(config.adoption.pollMs) || config.adoption.pollMs <= 0) return stop('bad-input', { detail: 'bad-adoption-settings', fallback: 'Fix adoption.timeoutMs and adoption.pollMs in scripts/settings/prototype-load.json.' });
       if (input.waitAdoptionMs !== undefined && input.waitAdoptionMs !== '' && (!Number.isFinite(Number(input.waitAdoptionMs)) || Number(input.waitAdoptionMs) < 0)) return stop('bad-input', { detail: 'bad-wait-adoption-ms', fallback: 'Pass --wait-adoption-ms as a number of milliseconds (0 returns right after registration; the cap is 160000).' });
       stage = 'no-ready';
-      out.gate = readyEvidence(jsonLines(read(expand(config.readyRecordPath))), input, config.ruledWeakened);
+      const readyRecords = jsonLines(read(expand(config.readyRecordPath)));
+      out.gate = readyEvidence(readyRecords, input, config.ruledWeakened, liveFingerprint([...readyRecords, ...(Array.isArray(config.ruledWeakened) ? config.ruledWeakened : [])]));
       if (out.gate?.ruledWeakened) console.warn(`WARNING: RULED-WEAKENED EXCEPTION ${out.gate.ruledWeakened.ruling}: loading ${input.branch}@${input.sha} despite audit WEAKENED. Disclosed findings: ${out.gate.ruledWeakened.findings.join(' | ')}`);
       if (!out.gate) return stop('no-ready', { detail: 'no-fix-ready-record', fallback: `No fix-ready record in ${config.readyRecordPath} matches ref=${input.branch} sha=${input.sha}. A record needs the fields {"ref":"${input.branch}","sha":"${input.sha}","tests":"green","audit":"NOT WEAKENED"}; write it after the scoped tests pass and the Codex audit says NOT WEAKENED, or pass --tests-run and --audit="NOT WEAKENED".` });
       stage = 'no-canonical-audit';
@@ -363,18 +380,18 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         if (!fetchedMain) { requireGit('fetch', 'origin', 'main'); fetchedMain = true; }
         return ancestor(base, 'origin/main');
       } catch { return false; } };
-      // R503: fingerprint the live head only when an older head's stored fingerprint could carry; any failure is no carry.
-      let liveFp = null;
-      if (auditRecords.some((r) => r?.fingerprint && r.head && r.head !== input.sha)) {
-        try {
-          requireGit('fetch', 'origin', 'main', input.branch);
-          liveFp = (fingerprint || ((b, h) => netDiffFingerprint(repo, b, h, { exec })))('origin/main', input.sha) || null;
-        } catch { liveFp = null; }
-      }
+      const liveFp = liveFingerprint(auditRecords);
       out.canonicalAudit = { mode, ...canonicalAuditEvidence(auditRecords, input.sha, covers, liveFp) };
       if (!out.canonicalAudit.ok) {
         const fallback = `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load.`;
         if (mode === 'refuse') return stop('no-canonical-audit', { fallback });
+        // R503 round 3: warn mode never lets CARRIED readiness (a ready record of an older head) load over a WEAKENED
+        // canonical audit. Only a ruled exception or the live head's own record keeps the existing warn behaviour.
+        // Fail closed: a record sha that is not a string is never the live head's own record.
+        const carriedGate = out.gate.record && (typeof out.gate.record.sha !== 'string' || out.gate.record.sha.toLowerCase() !== String(input.sha).toLowerCase());
+        if (out.canonicalAudit.reason === 'weakened' && carriedGate && !out.gate.ruledWeakened) {
+          return stop('no-canonical-audit', { detail: 'carried-ready-over-weakened-audit', fallback: `The canonical audit says WEAKENED, and the ready record was carried from ${out.gate.record.sha}. Fix the weakening and re-audit, or get an operator ruling (ruledWeakened). ${fallback}` });
+        }
         console.warn(`WARNING: canonical audit ${out.canonicalAudit.reason}; proceeding in warn mode. ${fallback}`);
       }
       stage = 'no-ready';
