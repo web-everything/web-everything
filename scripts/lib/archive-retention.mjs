@@ -170,12 +170,20 @@ export async function archiveRetention(o = {}) {
     // and an operator-visible error says so. The counter lives in its own state file (keyed by relative path; run ids are unique, so it is never reused).
     const retriesFile = join(state, 'runs.removal-retries.json');
     async function retryRemoval(pending, manifest) {
-      let counts = {};
-      try { counts = JSON.parse(boundedText(retriesFile, 1024 * 1024)); if (!counts || typeof counts !== 'object' || Array.isArray(counts)) throw Error('invalid retry state'); }
-      catch (e) { if (e.code !== 'ENOENT') { out.errors.push(`removal-retry state unreadable (${e.message}); records stay excluded, operator must inspect`); return manifest; } }
+      // Null-prototype map: a `__proto__` / `constructor` key in the file is plain data, never a prototype write.
+      let counts = Object.create(null);
+      try {
+        const parsed = JSON.parse(boundedText(retriesFile, 1024 * 1024));
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw Error('invalid retry state');
+        Object.assign(counts, parsed);
+      } catch (e) {
+        // Throw (do not swallow): the caller keeps the removal-intent file, so fixing the state file later still recovers the records.
+        if (e.code !== 'ENOENT') throw Error(`removal-retry state unreadable (${e.message}); records stay excluded, operator must inspect`);
+      }
       const forget = new Map(manifest); let changed = false;
       for (const key of pending) {
-        const n = Number.isSafeInteger(counts[key]) ? counts[key] : 0;
+        // A missing count is a first retry; a present but invalid one (negative, fractional, non-number) fails closed as exhausted.
+        const n = counts[key] === undefined ? 0 : (Number.isSafeInteger(counts[key]) && counts[key] >= 0 ? counts[key] : MAX_REMOVAL_RETRIES);
         if (n >= MAX_REMOVAL_RETRIES) { out.errors.push(`ALERT: ${key} archived but not removed after ${n} retries; operator must inspect`); continue; }
         counts[key] = n + 1; forget.delete(key); changed = true;
       }
@@ -206,8 +214,10 @@ export async function archiveRetention(o = {}) {
         if (keys) {
           const stillThere = new Set();
           for (const k of keys) if (typeof k === 'string' && !isAbsolute(k) && !k.split('/').includes('..') && await access(join(source, k)).then(() => true, () => false)) stillThere.add(k);
-          if (stillThere.size) archived = await retryRemoval(stillThere, archived);
-          await unlink(intentFile).catch(e => { if (e.code !== 'ENOENT') throw e; });
+          let recovered = true;
+          if (stillThere.size) { try { archived = await retryRemoval(stillThere, archived); } catch (e) { recovered = false; out.errors.push(e.message); } }
+          // Keep the intent when the bookkeeping failed, so a repaired state file lets the next run recover these records.
+          if (recovered) await unlink(intentFile).catch(e => { if (e.code !== 'ENOENT') throw e; });
         }
       }
       const old = scanned1.filter(f => f.path.endsWith('.json') && f.stat.mtimeMs < cutoff && !(archived.get(relative(source, f.path)) && version(f.stat).every((v, i) => v === archived.get(relative(source, f.path))[i])))
@@ -289,9 +299,18 @@ export async function archiveRetention(o = {}) {
         for (const f of group.files) next.set(relative(source, f.path), version(f.stat));
         // Runs with a removal path (a provider): every group file starts "pending" and leaves the set only when removed.
         const pending = new Set(kind === 'runs' && o.withSourceWriterExclusion ? group.files.map(f => relative(source, f.path)) : []);
-        if (pending.size) { // intent BEFORE the manifest commit, so a crash right after it is recovered on the next run
+        const groupKeys = new Set(pending);
+        // Keys an earlier group of this run left in the intent (its bookkeeping failed): carried, never overwritten or dropped.
+        let carried = [];
+        async function writeIntent(keys) {
+          if (!keys.length) { await unlink(intentFile).catch(e => { if (e.code !== 'ENOENT') throw e; }); return; }
           const t = `${intentFile}.${randomUUID()}.partial`;
-          try { await writeFile(t, JSON.stringify([...pending]), { flag: 'wx', mode: 0o600 }); await rename(t, intentFile); } finally { await unlink(t).catch(() => {}); }
+          try { await writeFile(t, JSON.stringify(keys), { flag: 'wx', mode: 0o600 }); await rename(t, intentFile); } finally { await unlink(t).catch(() => {}); }
+        }
+        if (pending.size) { // intent BEFORE the manifest commit, so a crash right after it is recovered on the next run
+          try { const prior = JSON.parse(boundedText(intentFile, 1024 * 1024)); if (Array.isArray(prior)) carried = prior.filter(k => typeof k === 'string' && !groupKeys.has(k)); else throw Error('invalid intent state'); }
+          catch (e) { if (e.code !== 'ENOENT') throw Error(`removal-intent state unreadable (${e.message}); operator must inspect`); }
+          await writeIntent([...carried, ...groupKeys]);
         }
         await writeArchiveManifest(archiveManifest, source, drive, next, maxFiles);
         archived = next;
@@ -340,7 +359,7 @@ export async function archiveRetention(o = {}) {
           // The intent file is dropped only once the bookkeeping succeeded; on failure it stays and the next run recovers.
           try {
             if (pending.size) archived = await retryRemoval(pending, archived);
-            await unlink(intentFile).catch(e => { if (e.code !== 'ENOENT') throw e; });
+            await writeIntent(carried); // this group is settled; an earlier group's unsettled keys stay recorded
           } catch (e) { out.errors.push(`retry bookkeeping failed; operator must inspect: ${e.message}`); }
         }
         if (uncoordinated) out.errors.push(`Source removal skipped for ${uncoordinated} files: writer exclusion unavailable; originals retained. Operator must arrange exclusion of all source writers, including open descriptors, before reclamation.`);

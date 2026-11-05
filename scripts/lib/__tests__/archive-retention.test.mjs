@@ -429,6 +429,44 @@ it('a crash between the manifest commit and the removal loop does not exclude th
   const day3 = await run({ now: now + 2 * 86400001 });
   expect(day3.filesArchived).toBe(0);
 });
+it('a later group does not overwrite the removal intent an earlier group left behind', async () => {
+  await file(join(runs, 'g1.json'), new Date(now - 30 * 86400000)); await file(join(runs, 'g2.json'), new Date(now - 40 * 86400000));
+  let calls = 0;
+  const out = await run({ afterManifestCommit: async () => { if (++calls === 1) throw Error('group 1 bookkeeping failed'); }, withSourceWriterExclusion: async () => {} });
+  expect(out.errors.join()).toMatch(/group 1 bookkeeping failed/);
+  // Groups run oldest first: g2 (40 days) is group 1 and fails its bookkeeping; g1 is group 2 and settles. Settling group 2
+  // must neither overwrite nor drop group 1's key.
+  expect(JSON.parse(await readFile(join(stateDir, 'runs.removal-intent.json'), 'utf8'))).toEqual(['g2.json']);
+});
+it('an unreadable retry state keeps the intent, so repairing it later still recovers the record', async () => {
+  const p = await file(join(runs, 'rs.json'));
+  await run({ afterManifestCommit: async () => { throw Error('simulated crash'); } });
+  const retries = join(stateDir, 'runs.removal-retries.json'), intent = join(stateDir, 'runs.removal-intent.json');
+  await writeFile(retries, '{not json');
+  const day2 = await run({ now: now + 86400001 });
+  expect(day2.errors.join()).toMatch(/removal-retry state unreadable/);
+  expect(await exists(intent)).toBe(true); expect(await exists(p)).toBe(true);
+  await rm(retries);
+  const day3 = await run({ now: now + 2 * 86400001 });
+  expect(day3.errors).toEqual([]); expect(await exists(p)).toBe(false); expect(await exists(intent)).toBe(false);
+});
+it('invalid retry counts (negative, non-number, __proto__ key) fail closed instead of granting unlimited retries', async () => {
+  for (const [i, bad] of ['{"neg.json":-5}', '{"neg.json":"x"}', '{"neg.json":1.5}'].entries()) {
+    await rm(runs, { recursive: true, force: true }); await mkdir(runs); await rm(stateDir, { recursive: true, force: true }); await rm(join(drive, 'runs'), { recursive: true, force: true });
+    const p = await file(join(runs, 'neg.json')), at = now + i * 10 * 86400001;
+    await run({ now: at, afterManifestCommit: async () => { throw Error('simulated crash'); } });
+    await writeFile(join(stateDir, 'runs.removal-retries.json'), bad);
+    const out = await run({ now: at + 86400001 });
+    expect(out.errors.join(), bad).toMatch(/ALERT: neg\.json archived but not removed/); expect(await exists(p), bad).toBe(true);
+  }
+  // A `__proto__` key is plain data: it neither throws nor changes another record's count.
+  await rm(runs, { recursive: true, force: true }); await mkdir(runs); await rm(stateDir, { recursive: true, force: true }); await rm(join(drive, 'runs'), { recursive: true, force: true });
+  const q = await file(join(runs, 'ok.json'));
+  await run({ now: now + 100 * 86400001, afterManifestCommit: async () => { throw Error('simulated crash'); } });
+  await writeFile(join(stateDir, 'runs.removal-retries.json'), '{"__proto__":{"ok.json":99}}');
+  const out = await run({ now: now + 101 * 86400001 });
+  expect(out.errors).toEqual([]); expect(await exists(q)).toBe(false);
+});
 it('a normal run leaves no removal-intent file behind', async () => {
   await file(join(runs, 'clean.json'));
   const out = await run();
