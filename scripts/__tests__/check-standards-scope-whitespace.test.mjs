@@ -1,9 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { isTerminalStatus } from '../lib/backlog-status.cjs';
 
 // Exercise the warning producer in isolation, as the scoped-file-scan harness does.
-const source = readFileSync(new URL('../check-standards.mjs', import.meta.url), 'utf8');
+const source = readFileSync(join(process.cwd(), 'scripts/check-standards.mjs'), 'utf8');
 function run(raw) {
   const block = source.match(/\/\/ BEGIN scope whitespace warning([\s\S]*?)\/\/ END scope whitespace warning/);
   expect(block, 'scope whitespace warning block must exist').not.toBeNull();
