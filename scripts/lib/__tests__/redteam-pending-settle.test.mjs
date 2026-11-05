@@ -74,6 +74,59 @@ function resultComment(confirmed = false) {
     }] : [] }));
 }
 
+describe('settlement reads fresh PR state and result evidence', () => {
+  it('passes review-unfinished evidence to label synchronization and preserves pending', () => {
+    const unknown = { ok: false, reason: 'review-unfinished' };
+    const o = runFixture({ readEvidence: vi.fn(() => unknown), readIgnorableConfirms: () => [] });
+    o.rawPrs[0].comments.push(resultComment());
+    const changes = [];
+    o.syncLabels.mockImplementation(input => changes.push(planRedTeamStatusLabels({ ...input,
+      labels: o.rawPrs[0].labels, comments: o.rawPrs[0].comments, standingRuling: null })));
+    mod.runRedTeamOnSkip(o);
+    expect(o.syncLabels).toHaveBeenCalledWith(expect.objectContaining({ repo, pr, head, evidence: unknown }));
+    expect(o.readEvidence).toHaveBeenCalledWith({ repo, pr, head });
+    expect(changes).toEqual([{ add: null, remove: [] }]);
+  });
+  it('a throwing result evidence read settles nothing and reports settleError', () => {
+    const o = runFixture({ readEvidence: () => { throw Error('fresh evidence offline'); } });
+    o.rawPrs[0].comments.push(resultComment());
+    expect(mod.runRedTeamOnSkip(o).rows[0].settleError).toBe('fresh evidence offline');
+    expect(o.syncLabels).not.toHaveBeenCalled();
+  });
+  it('a throwing confirm retry also reports settleError without synchronizing', () => {
+    const readEvidence = vi.fn().mockReturnValueOnce({ ok: false, reason: 'review-unfinished' })
+      .mockImplementation(() => { throw Error('retry evidence offline'); });
+    const o = runFixture({ readEvidence,
+      readIgnorableConfirms: () => ({ ok: true, ids: ['review-pr-old'], acceptedAt }) });
+    o.rawPrs[0].comments.push(resultComment());
+    expect(mod.runRedTeamOnSkip(o).rows[0].settleError).toBe('retry evidence offline');
+    expect(readEvidence).toHaveBeenCalledTimes(2); expect(o.syncLabels).not.toHaveBeenCalled();
+  });
+  it.each(['not-owed', 'result'].flatMap(kind => ['hold comment', 'formal hold', 'head moved', 'state throws',
+    'comments throw', 'reviews throw', 'comments unknown', 'reviews unknown'].map(change => [kind, change])))(
+    '%s retains pending when fresh %s appears after planning', (kind, change) => {
+      const o = kind === 'not-owed' ? notOwedRunFixture() : runFixture();
+      if (kind === 'result') o.rawPrs[0].comments.push(resultComment(change === 'hold comment'));
+      o.provider = { readPrState: vi.fn(() => {
+        if (change === 'state throws') throw Error('state offline');
+        return { ...o.rawPrs[0], headRefOid: change === 'head moved' ? old : head };
+      }), setLabels: vi.fn() };
+      o.readComments = vi.fn(() => {
+        if (change === 'comments throw') throw Error('comments offline');
+        return change === 'comments unknown' ? undefined : [...o.rawPrs[0].comments,
+          ...(change === 'hold comment' ? [trusted('🔁 review — changes requested', iso(acceptedAt + 1))] : [])];
+      });
+      o.readReviews = vi.fn(() => {
+        if (change === 'reviews throw') throw Error('reviews offline');
+        return change === 'reviews unknown' ? undefined : change === 'formal hold'
+          ? [{ state: 'CHANGES_REQUESTED', submittedAt: iso(acceptedAt + 1) }] : [];
+      });
+      expect(mod.runRedTeamOnSkip(o).rows[0].settleError).toBeTruthy();
+      expect(o.settlePending).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled();
+      expect(o.provider.setLabels).not.toHaveBeenCalled();
+    });
+});
+
 describe('pending settlement re-plans immediately before removal', () => {
   it.each(['newer review', 'red-team pass', 'status', 'witness', 'carry'])(
     '%s changing after planning prevents removal', kind => {
@@ -177,12 +230,12 @@ describe('not-owed settlement evidence and holds', () => {
       expect(o.settlePending).not.toHaveBeenCalled(); expect(o.dispatch).not.toHaveBeenCalled();
     });
   it.each(['review:prep', 'review:changes', 'review-status:running'])(
-    'reads unaccepted reviews once and permits pending removal beside %s', label => {
+    'reads unaccepted reviews once for planning and again before removal beside %s', label => {
       const o = notOwedRunFixture(); o.rawPrs[0].labels = [label, 'red-team:pending'];
       o.rawPrs[0].comments = []; delete o.rawPrs[0].reviews;
       o.rawPrs.push({ ...o.rawPrs[0] });
       expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ settle: 'not-owed' });
-      expect(o.readReviews).toHaveBeenCalledOnce(); expect(o.readReviews).toHaveBeenCalledWith({ repo, pr });
+      expect(o.readReviews).toHaveBeenCalledTimes(2); expect(o.readReviews).toHaveBeenCalledWith({ repo, pr });
       expect(o.settlePending).toHaveBeenCalledWith({ repo, pr, head, remove: ['red-team:pending'] });
     });
   it.each(['throws', 'unknown', 'formal hold'])(
