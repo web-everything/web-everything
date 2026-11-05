@@ -2827,7 +2827,7 @@ function assertReleaseReservedScoped() {
 }
 
 // Only tracked changes are in scope by design; untracked files do not block release, and litter is reaped separately.
-// `git status` trusts index flags, so assume-unchanged / skip-worktree entries are compared by content here, and
+// `git status` trusts index flags, so assume-unchanged / skip-worktree entries are compared by mode and content here, and
 // `--ignore-submodules=none` overrides a lane's diff.ignoreSubmodules / submodule.*.ignore (fsmonitor is pinned off
 // by the lane git env). Returns the change lines ('' when clean), or null when any evidence is unreadable.
 // Every release evidence read ignores lane-written history rewrites: a `refs/replace/*` ref or `.git/info/grafts`

@@ -206,6 +206,7 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     expect(result.stderr).toContain('commondir');
     expect(readFileSync(marker, 'utf8')).toBe(lease);
     expect(git(['config', '--get', 'credential.helper'], decoy)).toBe('decoy-helper');
+    expect(git(['ls-remote', origin], reference)).not.toContain(sha);
   });
   // A symlinked `.git` keeps the lease readable but points every git call at whatever the link names.
   it.each(['without', 'with'])('refuses a symlinked .git before release work, %s --discard', mode => {
@@ -269,17 +270,27 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
   });
   // `git status` trusts index flags and submodule-ignore config, so a plain porcelain read can report clean
   // over a real tracked edit. Each shape below must still refuse.
-  it.each(['assume-unchanged edit', 'assume-unchanged deletion', 'assume-unchanged mode change', 'skip-worktree edit',
-    'skip-worktree deletion', 'skip-worktree mode change'])('refuses a tracked %s hidden by index flags', shape => {
+  it.each(['assume-unchanged edit', 'assume-unchanged deletion', 'assume-unchanged mode change', 'assume-unchanged mode drop',
+    'skip-worktree edit', 'skip-worktree deletion', 'skip-worktree mode change', 'skip-worktree mode drop'])('refuses a tracked %s hidden by index flags', shape => {
+    const file = join(laneDir, 'seed.txt');
+    if (shape.endsWith('mode drop')) {
+      // Index mode 100755 on a pushed commit, so only the hidden chmod back to 644 is unpreserved.
+      chmodSync(file, 0o755);
+      git(['add', 'seed.txt'], laneDir);
+      git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '-m', 'executable'], laneDir);
+      git(['push', '--quiet', 'origin', 'HEAD:refs/heads/work/exec'], laneDir);
+    }
     git(['update-index', shape.startsWith('assume') ? '--assume-unchanged' : '--skip-worktree', 'seed.txt'], laneDir);
-    if (shape.endsWith('deletion')) rmSync(join(laneDir, 'seed.txt'));
+    if (shape.endsWith('deletion')) rmSync(file);
     // An executable-bit flip keeps the blob sha, so a content compare alone reads it as clean.
-    else if (shape.endsWith('mode change')) chmodSync(join(laneDir, 'seed.txt'), 0o755);
-    else writeFileSync(join(laneDir, 'seed.txt'), 'hidden edit\n');
+    else if (shape.endsWith('mode change')) chmodSync(file, 0o755);
+    else if (shape.endsWith('mode drop')) chmodSync(file, 0o644);
+    else writeFileSync(file, 'hidden edit\n');
     expect(git(['status', '--porcelain', '--untracked-files=no'], laneDir)).toBe('');
     const result = release();
     refused(result);
     expect(result.stderr).toContain('seed.txt');
+    if (/mode (?:change|drop)$/.test(shape)) expect(result.stderr).toContain('seed.txt (hidden by index flags: mode changed)');
   });
   it('refuses a same-size edit with a restored mtime that lane stat config would hide', () => {
     const file = join(laneDir, 'seed.txt');
