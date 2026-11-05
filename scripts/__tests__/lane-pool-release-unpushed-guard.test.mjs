@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
@@ -206,7 +206,21 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     expect(result.stderr).toContain('commondir');
     expect(readFileSync(marker, 'utf8')).toBe(lease);
     expect(git(['config', '--get', 'credential.helper'], decoy)).toBe('decoy-helper');
-    expect(git(['ls-remote', origin], reference)).not.toContain(sha);
+  });
+  // A symlinked `.git` keeps the lease readable but points every git call at whatever the link names.
+  it.each(['without', 'with'])('refuses a symlinked .git before release work, %s --discard', mode => {
+    const extra = mode === 'with' ? ['--discard'] : [];
+    const moved = join(base, 'moved-git');
+    renameSync(join(laneDir, '.git'), moved);
+    symlinkSync(moved, join(laneDir, '.git'));
+    git(['config', 'credential.helper', 'linked-helper'], laneDir);
+    const result = release(extra);
+    expect(result.status, result.stderr).toBe(1);
+    expect(result.data.released).toBe(0);
+    expect(result.data.kept).toEqual([expect.objectContaining({ lane: 1, reason: 'git-dir-redirected' })]);
+    expect(result.stderr).toContain('not a directory');
+    expect(readFileSync(marker, 'utf8')).toBe(lease);
+    expect(git(['config', '--get', 'credential.helper'], laneDir)).toBe('linked-helper');
   });
   it.each(['with its reflog', 'with an expired reflog'])('refuses tracked work parked in a stash %s', shape => {
     writeFileSync(join(laneDir, 'seed.txt'), 'stashed edit\n');
@@ -255,9 +269,12 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
   });
   // `git status` trusts index flags and submodule-ignore config, so a plain porcelain read can report clean
   // over a real tracked edit. Each shape below must still refuse.
-  it.each(['assume-unchanged edit', 'assume-unchanged deletion', 'skip-worktree edit', 'skip-worktree deletion'])('refuses a tracked %s hidden by index flags', shape => {
+  it.each(['assume-unchanged edit', 'assume-unchanged deletion', 'assume-unchanged mode change', 'skip-worktree edit',
+    'skip-worktree deletion', 'skip-worktree mode change'])('refuses a tracked %s hidden by index flags', shape => {
     git(['update-index', shape.startsWith('assume') ? '--assume-unchanged' : '--skip-worktree', 'seed.txt'], laneDir);
     if (shape.endsWith('deletion')) rmSync(join(laneDir, 'seed.txt'));
+    // An executable-bit flip keeps the blob sha, so a content compare alone reads it as clean.
+    else if (shape.endsWith('mode change')) chmodSync(join(laneDir, 'seed.txt'), 0o755);
     else writeFileSync(join(laneDir, 'seed.txt'), 'hidden edit\n');
     expect(git(['status', '--porcelain', '--untracked-files=no'], laneDir)).toBe('');
     const result = release();

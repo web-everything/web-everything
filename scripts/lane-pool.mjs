@@ -2872,6 +2872,9 @@ function releaseTrackedChanges(dir) {
     try { stat = lstatSync(join(dir, path)); } catch { hidden.push(`${path} (hidden by index flags: missing from worktree)`); continue; }
     // Links and gitlinks are not content-compared here: a flagged one is reported rather than trusted.
     if (!['100644', '100755'].includes(mode) || !stat.isFile()) { hidden.push(`${path} (hidden by index flags)`); continue; }
+    // An executable-bit flip keeps the blob sha, so compare the mode as git records it (owner x bit) before content.
+    // core.fileMode=false is refused above as masking config, so the filesystem bit is always meaningful here.
+    if (((stat.mode & 0o100) ? '100755' : '100644') !== mode) { hidden.push(`${path} (hidden by index flags: mode changed)`); continue; }
     compare.push({ path, sha });
   }
   if (compare.length > HIDDEN_ENTRY_HASH_LIMIT) return null;

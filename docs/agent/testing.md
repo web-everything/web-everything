@@ -3920,7 +3920,8 @@ refs all still refuse. A listed tip the lane has not fetched triggers one harden
 An unresolved origin or an unreadable listing refuses; every named pool in a fixture therefore needs
 its primary checkout (a sibling of the reference) so release can resolve that origin.
 Tracked changes are read with `--ignore-submodules=none`, and assume-unchanged / skip-worktree entries
-are compared by content, so index flags and submodule-ignore config cannot hide an edit.
+are compared by executable mode and content, so index flags and submodule-ignore config cannot hide an edit
+or a chmod.
 Known limit: other entries still trust the index stat cache, so a lane that hand-rewrites `.git/index`
 with stat fields matching an edited file reads clean. Release does not refuse that shape yet; the
 bounded content check is #xuuhfpf. Tests must not promise refusal for it until that lands.
