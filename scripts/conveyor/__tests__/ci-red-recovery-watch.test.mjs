@@ -15,7 +15,8 @@ import {
   HUNG_CI_COMMENT_MARKER, buildHungCiComment, countHungCiComments, countHungCiCommentsByJob, bodyHasExactLine,
   cancelAndRerunHungRun, cancelHungRun, describeExecError, isRunNotFoundError, redactTokenShapes, sweepHungCiRecovery, formatHungReport,
   defaultReadRequiredContexts, defaultReadAttributedRequiredChecks, defaultReadHeadCommittedAt, triggerCiForPr, clearStaleCheckingLabel,
-  sweepMissingRunRecovery as sweepMissingRunRecoveryWithIo, formatMissingRunReport, reconcileAcceptanceAfterRebase, defaultReadPrLabels,
+  sweepMissingRunRecovery as sweepMissingRunRecoveryWithIo, formatMissingRunReport, reconcileAcceptanceAfterRebase, defaultReadPrLabels, detectMainTransition, recordMainState,
+  resolveApplyBudgetMs, resolveMaxApplyPerTick,
 } from '../ci-red-recovery-watch.mjs';
 import { restampAcceptance } from '../../merge-ai-prs.mjs';
 import { spawnCiHealRearm } from '../ci-heal-mark.mjs';
@@ -38,6 +39,36 @@ const MAIN_RUNS = [
   { status: 'completed', conclusion: 'failure', updatedAt: '2026-09-25T01:30:55Z', workflowName: 'CI' },
   { status: 'completed', conclusion: 'success', updatedAt: '2026-09-25T02:31:25Z', workflowName: 'CI' },
 ];
+
+describe('ci-red-recovery-watch — production apply bounds', () => {
+  it('defaults the apply budget to 170000 ms when the environment setting is absent', () => {
+    expect(resolveApplyBudgetMs({})).toBe(170000);
+  });
+
+  it.each(['', ' ', '0', '-1', 'NaN', 'Infinity', '-Infinity', 'invalid'])(
+    'rejects invalid apply budget environment value %j with the 170000 ms fallback', (value) => {
+      expect(resolveApplyBudgetMs({ WE_RECOVERY_APPLY_BUDGET_MS: value })).toBe(170000);
+    },
+  );
+
+  it('accepts a positive finite apply budget environment override', () => {
+    expect(resolveApplyBudgetMs({ WE_RECOVERY_APPLY_BUDGET_MS: '2500' })).toBe(2500);
+  });
+
+  it('defaults the per-tick apply cap to 8 when the environment setting is absent', () => {
+    expect(resolveMaxApplyPerTick({})).toBe(8);
+  });
+
+  it.each(['', ' ', '0', '-1', '1.5', 'NaN', 'Infinity', '-Infinity', 'invalid'])(
+    'rejects invalid per-tick apply cap environment value %j with the 8 PR fallback', (value) => {
+      expect(resolveMaxApplyPerTick({ WE_RECOVERY_MAX_APPLY_PER_TICK: value })).toBe(8);
+    },
+  );
+
+  it('accepts a positive integer per-tick apply cap environment override', () => {
+    expect(resolveMaxApplyPerTick({ WE_RECOVERY_MAX_APPLY_PER_TICK: '3' })).toBe(3);
+  });
+});
 
 describe('ci-red-recovery-watch — buildCandidates', () => {
   it('only builds a candidate for a PR whose required check is currently failing, resolving how far behind main it is', () => {
@@ -223,6 +254,180 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
     expect(postComment).toHaveBeenCalledWith(2635, expect.objectContaining({
       headRefName: 'lane/xdzl6mb', ok: true, action: 'rebased',
     }));
+  });
+
+  // 2026-11-03 live: after main went green the first apply tick refreshed PRs one by one until the 300 s pass
+  // deadline SIGTERMed it mid-batch. The apply loop must stop STARTING refreshes once its time budget is spent
+  // (or the per-tick batch cap is hit) and leave the rest for the next tick, without posting a rebase comment
+  // (a comment burns the per-sha cap) for the ones it deferred.
+  it('stops starting refreshes once the tick time budget is spent, deferring the rest without burning their cap', () => {
+    const prs = [2635, 2636, 2637].map((number) => ({ ...PR_2635, number, headRefName: `lane/b${number}` }));
+    let t = 0;
+    const refresh = vi.fn(() => { t += 100; return { ok: true, action: 'rebased' }; });
+    const postComment = vi.fn();
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment, apply: true, now: () => t, applyBudgetMs: 150, maxApplyPerTick: 10,
+    });
+    expect(refresh).toHaveBeenCalledTimes(2);
+    expect(postComment).toHaveBeenCalledTimes(2);
+    expect(result.applied.map((a) => [a.prNumber, a.action])).toEqual([[2635, 'rebased'], [2636, 'rebased'], [2637, 'deferred']]);
+    expect(result.applied[2]).toMatchObject({ deferred: true, ok: false, budgetExhausted: true });
+  });
+
+  // Review of #6340: with a slow discovery phase (per-PR comment reads) the budget was already spent before the
+  // loop began, so every tick deferred everything and the queue never drained. The first refresh always starts.
+  it('still starts exactly one refresh when discovery alone exhausted the tick apply budget (no starvation)', () => {
+    const prs = [2635, 2636, 2637].map((number) => ({ ...PR_2635, number, headRefName: `lane/d${number}` }));
+    let t = 0;
+    const refresh = vi.fn(() => ({ ok: true, action: 'rebased' }));
+    const postComment = vi.fn();
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => { t += 200; return prs; },
+      readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment, apply: true, now: () => t, applyBudgetMs: 150, maxApplyPerTick: 10,
+    });
+    expect(result.dispatch.map((d) => d.prNumber)).toEqual([2635, 2636, 2637]);
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(postComment).toHaveBeenCalledTimes(1);
+    expect(result.applied.map((a) => [a.prNumber, a.action])).toEqual([[2635, 'rebased'], [2636, 'deferred'], [2637, 'deferred']]);
+    expect(result.applied[1]).toMatchObject({ deferred: true, ok: false, budgetExhausted: true });
+  });
+
+  // Review round 2 of #6340: `started` was bumped before the refresh ran, so a refresh that came back deferred
+  // (no work done) still spent the floor and the cap, and every later PR in the tick was starved.
+  it.each([
+    ['refresh reports deferred', () => ({ deferred: true, ok: false, error: 'cross-repository PR' })],
+  ])('a free deferral (%s) first in line spends neither the progress floor nor the per-tick cap', (_name, firstResult) => {
+    const prs = [2635, 2636].map((number) => ({ ...PR_2635, number, headRefName: `lane/g${number}` }));
+    let t = 0;
+    const refresh = vi.fn((branch) => (branch === 'lane/g2635' ? firstResult() : { ok: true, action: 'rebased' }));
+    const postComment = vi.fn();
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => { t += 200; return prs; }, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment, apply: true, now: () => t, applyBudgetMs: 150, maxApplyPerTick: 1,
+    });
+    expect(refresh).toHaveBeenCalledTimes(2);
+    expect(postComment).toHaveBeenCalledTimes(1);
+    expect(result.applied.map((a) => [a.prNumber, a.action])).toEqual([[2635, 'deferred'], [2636, 'rebased']]);
+  });
+
+  // Review round 3 of #6340: deferrals do no writes but their verification calls cost real time. 12 PRs whose
+  // refresh each takes 35 s then defers must stop at the 170 s budget, not run until the 300 s pass deadline.
+  it('slow deferred refreshes still honour the time budget (no run past the pass deadline)', () => {
+    const prs = Array.from({ length: 12 }, (_, i) => ({ ...PR_2635, number: 2700 + i, headRefName: `lane/s${i}` }));
+    let t = 0;
+    const refresh = vi.fn(() => { t += 35_000; return { deferred: true, ok: false, error: 'verification failed' }; });
+    const postComment = vi.fn();
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment, apply: true, now: () => t, applyBudgetMs: 170_000, maxApplyPerTick: 8,
+    });
+    expect(refresh).toHaveBeenCalledTimes(5);
+    expect(t).toBeLessThanOrEqual(175_000);
+    expect(postComment).not.toHaveBeenCalled();
+    expect(result.applied).toHaveLength(12);
+    expect(result.applied.slice(5).every((a) => a.budgetExhausted && a.deferred)).toBe(true);
+  });
+
+  it('slow discovery plus slow deferrals only gets a bounded grace to find one refresh that does work', () => {
+    const prs = Array.from({ length: 6 }, (_, i) => ({ ...PR_2635, number: 2750 + i, headRefName: `lane/q${i}` }));
+    let t = 0;
+    const refresh = vi.fn(() => { t += 35_000; return { deferred: true, ok: false, error: 'verification failed' }; });
+    sweepCiRedRecovery({
+      readOpenPrs: () => { t += 200_000; return prs; }, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment: vi.fn(), apply: true, now: () => t, applyBudgetMs: 170_000, maxApplyPerTick: 8,
+    });
+    expect(refresh).toHaveBeenCalledTimes(2); // 60 s grace: attempts at +0 s and +35 s, stopped at +70 s
+  });
+
+  // Self-review of the round-3 repair: a count cap on deferrals let a stable run of instant (free) deferrers at the
+  // head of the queue starve every later PR on every tick. Instant deferrals cost no time, so they are never capped.
+  it('a long run of instant deferrals at the head of the queue never starves the refreshable PR behind them', () => {
+    const prs = Array.from({ length: 21 }, (_, i) => ({ ...PR_2635, number: 2800 + i, headRefName: `lane/a${i}` }));
+    const refresh = vi.fn((branch) => (branch === 'lane/a20' ? { ok: true, action: 'rebased' } : { deferred: true, ok: false, error: 'not same-repo' }));
+    const postComment = vi.fn();
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment, apply: true, maxApplyPerTick: 2,
+    });
+    expect(refresh).toHaveBeenCalledTimes(21);
+    expect(postComment).toHaveBeenCalledTimes(1);
+    expect(result.applied.at(-1)).toMatchObject({ prNumber: 2820, ok: true, action: 'rebased' });
+    expect(result.applied.some((a) => a.budgetExhausted)).toBe(false);
+  });
+
+  it('a failed refresh whose claim is found held afterwards is a free deferral too', () => {
+    const prs = [2635, 2636].map((number) => ({ ...PR_2635, number, headRefName: `lane/k${number}` }));
+    let t = 0;
+    const refresh = vi.fn((branch) => (branch === 'lane/k2635' ? { ok: false, error: 'push rejected' } : { ok: true, action: 'rebased' }));
+    let reads = 0;
+    const checkClaim = vi.fn(({ branch }) => (branch === 'lane/k2635' && ++reads === 2 ? { message: 'held' } : null));
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => { t += 200; return prs; }, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment: vi.fn(), apply: true, now: () => t, applyBudgetMs: 150, maxApplyPerTick: 1, checkClaim,
+    });
+    expect(result.applied.map((a) => [a.prNumber, a.action])).toEqual([[2635, 'deferred'], [2636, 'rebased']]);
+  });
+
+  it('a claim-held PR first in line does not use up the progress floor', () => {
+    const prs = [2635, 2636].map((number) => ({ ...PR_2635, number, headRefName: `lane/f${number}` }));
+    let t = 0;
+    const refresh = vi.fn(() => ({ ok: true, action: 'rebased' }));
+    const checkClaim = vi.fn(({ branch }) => (branch === 'lane/f2635' ? { message: 'held' } : null));
+    sweepCiRedRecovery({
+      readOpenPrs: () => { t += 200; return prs; }, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment: vi.fn(), apply: true, now: () => t, applyBudgetMs: 150, maxApplyPerTick: 10, checkClaim,
+    });
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(refresh).toHaveBeenCalledWith('lane/f2636', expect.anything());
+  });
+
+  it('never refreshes more than maxApplyPerTick PRs in one tick (post-green storm bound)', () => {
+    const prs = [2635, 2636, 2637].map((number) => ({ ...PR_2635, number, headRefName: `lane/c${number}` }));
+    const refresh = vi.fn(() => ({ ok: true, action: 'rebased' }));
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment: vi.fn(), apply: true, maxApplyPerTick: 1,
+    });
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(result.applied.filter((a) => a.budgetExhausted).map((a) => a.prNumber)).toEqual([2636, 2637]);
+  });
+
+  it('persists main state across ticks and reports the transition exactly once', async () => {
+    const { mkdtempSync, readFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const path = `${mkdtempSync(`${tmpdir()}/rr-`)}/state.json`;
+    expect(recordMainState({ mainGreen: false, path })).toBe(false);
+    expect(JSON.parse(readFileSync(path, 'utf8')).green).toBe(false);
+    expect(recordMainState({ mainGreen: true, path })).toBe(true);
+    expect(JSON.parse(readFileSync(path, 'utf8')).green).toBe(true);
+    expect(recordMainState({ mainGreen: true, path })).toBe(false);
+  });
+
+  it('held PRs do not consume the per-tick apply cap, and a failed state write never reports a transition', async () => {
+    const prs = [2635, 2636].map((number) => ({ ...PR_2635, number, headRefName: `lane/h${number}` }));
+    const refresh = vi.fn(() => ({ ok: true, action: 'rebased' }));
+    const checkClaim = vi.fn(({ branch }) => (branch === 'lane/h2635' ? { message: 'held' } : null));
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment: vi.fn(), apply: true, maxApplyPerTick: 1, checkClaim,
+    });
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(refresh).toHaveBeenCalledWith('lane/h2636', expect.anything());
+    expect(result.applied.find((a) => a.prNumber === 2635)).toMatchObject({ deferred: true });
+    const { mkdtempSync, writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const dir = mkdtempSync(`${tmpdir()}/rr-`);
+    writeFileSync(`${dir}/state.json`, JSON.stringify({ green: false }));
+    expect(recordMainState({ mainGreen: true, path: `${dir}/state.json/nope/x.json` })).toBe(false);
+  });
+
+  it('detects the main red→green transition from the persisted previous state', () => {
+    expect(detectMainTransition({ prevGreen: false, mainGreen: true })).toBe(true);
+    expect(detectMainTransition({ prevGreen: true, mainGreen: true })).toBe(false);
+    expect(detectMainTransition({ prevGreen: null, mainGreen: true })).toBe(false);
+    expect(detectMainTransition({ prevGreen: false, mainGreen: false })).toBe(false);
   });
 
   // x5uqim1 follow-up (#4075/#3383) part (c) — "check the owed-ci-rerun path for frontierui/plateau-app too":
