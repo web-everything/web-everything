@@ -253,7 +253,7 @@ export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
       if (run.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr)) continue;
       const rev = run.findings?.read?.netBasis?.rev;
       if (!isRealHead(rev) || rev === head) return false;
-      const activeEffects = run.effects.some(effect => ['pending', 'in-flight'].includes(effect?.status));
+      const activeEffects = !Array.isArray(run.effects) || !run.effects.every(effect => ['applied', 'failed'].includes(effect?.status));
       const unfinished = !run.verdict || run.pending != null || activeEffects;
       if (unfinished) return false;
     }
@@ -267,7 +267,7 @@ function ignorableConfirm(run, at, acceptedAt) {
   const resumed = Date.parse(run.resumedAt);
   return Number.isFinite(acceptedAt) && !isRunRecordTerminal(run)
     && run.verdict?.verdict === 'needs-human' && run.pending?.kind === 'confirm'
-    && Array.isArray(run.effects) && !run.effects.some(e => ['pending', 'in-flight'].includes(e?.status))
+    && Array.isArray(run.effects) && run.effects.every(e => ['applied', 'failed'].includes(e?.status))
     && Number.isFinite(start) && start + RUN_MTIME_SLACK_MS < acceptedAt
     && Number.isFinite(at) && at + RUN_MTIME_SLACK_MS < acceptedAt
     && (run.resumeOf == null && run.resumedAt == null
@@ -706,7 +706,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
                 || (evidence?.carry && evidence.carry.step !== 'done');
               if (active) row.settleError = 'red-team pass still active; label unchanged';
               else if (!resultMaySynchronize(live.comments, row.prNumber, row.head)) row.settleError = 'result comment not strictly clean';
-              else syncLabels({ ...key, env, log: note, evidence, provider });
+              else syncLabels({ ...key, env, log: note, evidence, provider, comments: live.comments });
             }
           }
           else if (row.settle === 'not-owed') {

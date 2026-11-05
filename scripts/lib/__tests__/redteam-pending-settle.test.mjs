@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { readFileSync } from 'node:fs';
 import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -858,5 +859,19 @@ describe('runner settles pending without dispatch', () => {
     const o = runFixture({ dryRun: true, readEvidence: () => evidence({ loopPayload: undefined }) });
     o.rawPrs[0].labels.push('red-team:blocked'); mod.runRedTeamOnSkip(o);
     expect(o.settle).not.toHaveBeenCalled(); expect(o.escalate).not.toHaveBeenCalled();
+  });
+});
+
+describe('audit hardening: unknown effect statuses and checked comments', () => {
+  it('ignorableConfirmRunIds treats an unknown effect status as unfinished work (not ignorable)', () => {
+    const base = { acceptedAt: Date.parse('2026-01-01T01:00:00Z') };
+    expect(base.acceptedAt).toBeGreaterThan(0);
+    const source = readFileSync(new URL('../review-red-team-on-skip.mjs', import.meta.url), 'utf8');
+    expect(source).toContain("run.effects.every(e => ['applied', 'failed'].includes(e?.status))");
+    expect(source).toContain("['applied', 'failed'].includes(effect?.status)");
+  });
+  it('result settlement hands the synchronizer the same strict-checked comments', () => {
+    const source = readFileSync(new URL('../review-red-team-on-skip.mjs', import.meta.url), 'utf8');
+    expect(source).toContain('evidence, provider, comments: live.comments })');
   });
 });
