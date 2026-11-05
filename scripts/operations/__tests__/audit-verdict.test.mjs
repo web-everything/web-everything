@@ -220,6 +220,54 @@ describe('R473 pure classified verdict', () => {
     }
   });
 
+  it('glob matching keeps its meaning: * stays in one segment, ** spans directories, other characters are literal', async () => {
+    const isProtected = async (file, pattern) => (await compute([finding({ file })], options('prerelease', { raceBlockPaths: [pattern] }))).recheck.length > 0;
+    for (const [file, pattern, want] of [
+      ['custom/a/b.mjs', 'custom/**', true], ['custom.mjs', 'custom/**', false], ['scripts/x-lease.mjs', 'scripts/*lease*', true],
+      ['scripts/a/x-lease.mjs', 'scripts/*lease*', false], ['scripts/a/b/lease.mjs', 'scripts/**/lease*', true],
+      ['a/b/c', 'a/*/c', true], ['a/b/d/c', 'a/*/c', false], ['a/b/d/c', 'a/**/c', true], ['a/x/y/b', 'a**b', true],
+      ['ab', 'a***b', true], ['a/b', 'a*b', false], ['a.b', 'a.b', true], ['axb', 'a.b', false], ['ab', 'a?b', false],
+      ['a?b', 'a?b', true], ['a[x]', 'a[x]', true], ['ax', 'a[x]', false], ['a+', 'a+', true], ['aa', 'a+', false],
+      ['x', '*', true], ['x/y', '*', false], ['x/y', '**', true], ['xZ', '**Z', true], ['x/Z', '*Z', false]]) {
+      expect(await isProtected(file, pattern), `${file} ~ ${pattern}`).toBe(want);
+    }
+  });
+
+  it('a nested-star glob matches in bounded time, never by exponential backtracking (PR #6381 red team)', async () => {
+    // The old regex form took ~9 s for 8 nested `**` on a 48-character path, and grows exponentially with more.
+    for (const stars of [8, 24]) {
+      const pattern = '**'.repeat(stars) + 'Z';
+      const started = Date.now();
+      const result = await compute([finding({ file: 'a'.repeat(48) })], options('prerelease', { raceBlockPaths: [pattern] }));
+      expect(Date.now() - started, `${stars} nested **`).toBeLessThan(1500);
+      expect(result.recheck).toEqual([]);
+      expect(result.ships).toHaveLength(1);
+      expect((await compute([finding({ file: 'a'.repeat(48) + 'Z' })], options('prerelease', { raceBlockPaths: [pattern] }))).recheck).toHaveLength(1);
+    }
+    // Worst case the bounds allow: the most patterns of the longest length, against the longest accepted path.
+    const most = GUARD_FLOOR.length + 512;
+    const started = Date.now();
+    const many = await compute([finding({ file: 'a'.repeat(511) })], options('prerelease', {
+      raceBlockPaths: Array.from({ length: most }, () => '*a'.repeat(255) + 'Z'), guardFloorPaths: Array.from({ length: most }, () => '**a'.repeat(170) + 'Z') }));
+    expect(many.ships).toHaveLength(1);
+    expect(Date.now() - started).toBeLessThan(5000);
+  });
+
+  it('an over-long reported path or an invalid guard path list fails closed', async () => {
+    const long = await compute([finding({ file: 'a/'.repeat(300) + 'b.mjs' })], options('prerelease'));
+    expect(long.verdict).toBe('WEAKENED');
+    expect(long.ships).toEqual([]);
+    expect((await compute([finding({ file: 'a/'.repeat(250) + 'b.mjs' })], options('prerelease'))).ships).toHaveLength(1);
+    // The resolved settings list (built-in floor + 256 file + 256 env entries) is accepted; one more is invalid.
+    const full = Array.from({ length: GUARD_FLOOR.length + 512 }, (_, i) => `x${i}/`);
+    expect((await compute([finding()], options('prerelease', { guardFloorPaths: full, raceBlockPaths: full }))).ships).toHaveLength(1);
+    for (const guardFloorPaths of ['scripts/', [''], [3], [...full, 'y/'], ['x'.repeat(513)], {}]) {
+      const r = await compute([finding()], options('prerelease', { guardFloorPaths }));
+      expect(r.verdict, JSON.stringify(guardFloorPaths).slice(0, 40)).toBe('WEAKENED');
+      expect(r.blocks).toEqual([expect.objectContaining({ class: 'X2' })]);
+    }
+  });
+
   it('a protected race path alone cannot turn an unsupported D1 into a shipping finding', async () => {
     const result = await compute([finding({ class: 'D1', file: 'scripts/lib/file-locks.mjs',
       invariant: 'Single owner', trigger: null, consequence: 'Might race' })],
@@ -391,6 +439,17 @@ describe('R473 structured concurrency evidence', () => {
       expect((await compute([d2()], options('prerelease', { readCard: reader('mustPayBefore: 2026-11-01\n'), now: NOW }))).verdict).toBe('WEAKENED');
       expect((await compute([d2()], options('prerelease', { readCard: reader('mustPayBefore: 2026-12-01\n'), now: NOW }))).verdict).toBe('NOT WEAKENED');
       expect((await compute([d2()], options('prerelease', { readCard: reader('mustPayBefore: garbage\n'), now: NOW }))).verdict).toBe('WEAKENED');
+    });
+    it('blocks on an impossible or non-canonical pay-by date instead of rolling it into a later month (PR #6381 red team)', async () => {
+      for (const bad of ['2099-02-31', '2099-02-30', '2100-02-29', '2099-04-31', '2099-13-01', '2099-00-10', '2099-01-00',
+        '2099-1-1', '+002099-01-01', '0099-01-01', '2099-01-01T00:00:00Z', '20990101', 'Jan-1-2099', '２０９９-01-01']) {
+        expect((await compute([d2()], options('prod', { readCard: reader(`mustPayBefore: ${bad}\n`), now: NOW }))).verdict, bad).toBe('WEAKENED');
+      }
+      for (const good of ['2099-01-31', '2096-02-29', '2400-02-29', '2026-11-04']) {
+        expect((await compute([d2()], options('prod', { readCard: reader(`mustPayBefore: ${good}\n`), now: NOW }))).verdict, good).toBe('NOT WEAKENED');
+      }
+      // The day itself is not "before": a date equal to today's UTC midnight has passed.
+      expect((await compute([d2()], options('prod', { readCard: reader('mustPayBefore: 2026-11-03\n'), now: NOW }))).verdict).toBe('WEAKENED');
     });
     it('takes the pay-by date only from the card on main, never from the model finding', async () => {
       // An overdue card cannot be revived by a later model-supplied date.

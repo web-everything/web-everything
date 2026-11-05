@@ -37,12 +37,33 @@ export function validFinding(f) {
     && (!Object.hasOwn(f, 'interleaving') || validInterleaving(f.interleaving));
 }
 
-// Bounded literal globs: * matches a segment, ** spans directories; a trailing / is a prefix.
+/**
+ * Literal globs: * matches within one segment, a run of two or more * spans directories, every other character is
+ * literal; a trailing / is a prefix. Matched by a bitset state walk (bit i = "pattern token i is next"), never a
+ * backtracking regex (PR #6381: nested `**` made a regex take exponential time). Cost is a few bitset operations
+ * per path character; path and pattern lengths are bounded upstream.
+ */
 function matchesPath(file, pattern) {
   if (pattern.endsWith('/')) return file.startsWith(pattern);
-  const source = pattern.split(/(\*\*|\*)/).map(part => part === '**' ? '.*' : part === '*' ? '[^/]*'
-    : part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('');
-  return new RegExp(`^${source}$`).test(file);
+  const lit = new Map(); let star = 0n; let globstar = 0n; let n = 0n;
+  for (let i = 0; i < pattern.length; n++) {
+    const bit = 1n << n;
+    if (pattern[i] !== '*') { lit.set(pattern[i], (lit.get(pattern[i]) ?? 0n) | bit); i++; continue; }
+    let j = i; while (pattern[j] === '*') j++;
+    if (j - i >= 2) globstar |= bit; else star |= bit;
+    i = j;
+  }
+  const wild = star | globstar;
+  // A wildcard may match nothing, so reaching it also reaches the next token. Runs of * are one token, so a
+  // wildcard is never followed by another and one shift closes the set.
+  const close = s => s | ((s & wild) << 1n);
+  let s = close(1n);
+  for (let c = 0; c < file.length; c++) {
+    const ch = file[c];
+    s = close((s & (ch === '/' ? globstar : wild)) | ((s & (lit.get(ch) ?? 0n)) << 1n));
+    if (s === 0n) return false;
+  }
+  return ((s >> n) & 1n) === 1n;
 }
 
 const REPO_ROOT = fileURLToPath(new NodeURL('../../', import.meta.url));
@@ -69,13 +90,28 @@ function d2Verified(f, releaseStage, { readCard = readCardFromMain, now = Date.n
     if (lines.length && due === undefined) return false;
     if (due === undefined) return requirePayBy === false;
     if (due === 'prod') return releaseStage !== 'prod';
-    const when = Date.parse(due);
+    const when = payByTime(due);
     return Number.isFinite(when) && when > (typeof now === 'function' ? now() : now);
   } catch { return false; }
 }
+/**
+ * A pay-by date is exactly `YYYY-MM-DD` and a real calendar day (UTC midnight). `Date.parse` is not used: it rolls an
+ * impossible day into the next month (`2099-02-31` → March 3) and accepts other formats (PR #6381). Anything else is NaN.
+ */
+function payByTime(due) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(due);
+  if (!m) return NaN;
+  const [y, mo, d] = m.slice(1).map(Number);
+  const t = Date.UTC(y, mo - 1, d); const day = new Date(t);
+  return day.getUTCFullYear() === y && day.getUTCMonth() === mo - 1 && day.getUTCDate() === d ? t : NaN;
+}
+/** Longest reported path matched against globs; a longer one cannot be established and fails closed (bounds glob cost). */
+const MAX_PATH = 512;
+/** Most globs one list may carry: the built-in floor plus a full settings list and a full env list (audit-settings caps each at 256). */
+const MAX_GLOBS = GUARD_FLOOR.length + 512;
 /** Repo-relative POSIX form of a reported path, or null when it cannot be established (callers fail closed). */
 function pathCandidates(file) {
-  if (typeof file !== 'string' || /[\u0000-\u001f]/.test(file) || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(file)) return null;
+  if (typeof file !== 'string' || file.length > MAX_PATH || /[\u0000-\u001f]/.test(file) || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(file)) return null;
   let path = file.replace(/\\/g, '/');
   if (path.startsWith('/')) {
     if (!path.startsWith(REPO_ROOT.replace(/\\/g, '/'))) return null;
@@ -99,9 +135,10 @@ export function computeVerdict(findings, options = {}) {
   // `allow` is never trusted: it resolves to block. Only an explicit `prove` lets proven D2 debt ship.
   const proveD2 = (options.preExistingMode ?? trusted.preExistingMode) === 'prove';
   const result = { verdict: 'NOT WEAKENED', blocks: [], ships: [], cards: [], recheck: [] };
+  // Both glob lists are bounded (count and length) so matching cost is bounded; a bad list is invalid input.
+  const validGlobs = list => Array.isArray(list) && list.length <= MAX_GLOBS && list.every(p => text(p) && p.length <= 512);
   if (!Array.isArray(findings) || !RELEASE_STAGES.includes(releaseStage)
-    || !Array.isArray(raceBlockPaths) || raceBlockPaths.length > 256
-    || !raceBlockPaths.every(p => text(p) && p.length <= 512) || !Array.isArray(rulings)) {
+    || !validGlobs(raceBlockPaths) || !validGlobs(guardFloorPaths) || !Array.isArray(rulings)) {
     result.blocks.push({ class: 'X2', consequence: 'Invalid audit input/settings; request human adjudication' });
   } else for (const input of findings) {
     const f = { ...input };
