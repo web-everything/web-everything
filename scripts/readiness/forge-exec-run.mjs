@@ -555,7 +555,7 @@ fd = os.open(cfg['status'], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
 with os.fdopen(fd, 'w') as result: result.write(str(code if 0 <= code <= 255 else 255))
 sys.exit(0)
 `;
-function execute(file,args,{cwd,env,input,inherit=false,detached=false,passFd,timeoutMs}={}) {
+export function execute(file,args,{cwd,env,input,inherit=false,detached=false,passFd,timeoutMs}={}) {
   return new Promise((resolve,reject) => {
     const child = spawn(file,args,{cwd,env,detached,stdio:[input === undefined ? 'ignore':'pipe',inherit?'inherit':'pipe',inherit?'inherit':'pipe',...(passFd===undefined?[]:[passFd])]});
     const timer=timeoutMs===undefined?undefined:setTimeout(()=>{
@@ -616,7 +616,7 @@ async function unitActive(unit) {
   if(['inactive','failed'].includes(word))return false;
   return ['active','activating','deactivating','reloading'].includes(word)?true:undefined;
 }
-export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, testEgressProbe, clock=Date.now} = {}) {
+export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, testEgressProbe, testExecute, clock=Date.now} = {}) {
   const bases=testRoot ? join(testRoot,'bases') : '/srv/forge-base';
   const runs = testRoot ? join(testRoot,'runs') : '/srv/forge-exec';
   const receipts = testRoot ? join(testRoot,'receipts') : '/srv/forge-receipts';
@@ -630,9 +630,10 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
   const statePath = (run,phase) => join(receipts,run+'.'+phase);
   const busy=()=>Object.assign(new Error('Worker execution busy or interrupted; use local fallback. Operator must stop the reserved UID before removing its worker-active lock'),{code:'forge-busy'});
   async function requireEgressTable() {
-    if(testRoot&&!testEgressProbe)return;
+    if(testRoot&&!testEgressProbe&&!testExecute)return;
     try {
-      const result=testRoot?await testEgressProbe():await execute('/usr/sbin/nft',['list','table','inet','forge_exec_egress'],{env:{PATH:'/usr/sbin:/usr/bin:/bin',LANG:'C'},timeoutMs:5000});
+      // Exec injection is only available to the explicit test-root harness.
+      const result=testRoot&&testEgressProbe?await testEgressProbe():await (testRoot&&testExecute?testExecute:execute)('/usr/sbin/nft',['list','table','inet','forge_exec_egress'],{env:{PATH:'/usr/sbin:/usr/bin:/bin',LANG:'C'},timeoutMs:5000});
       if(result?.code===0&&!result.timedOut)return;
     } catch { /* all probe failures require local fallback */ }
     throw Object.assign(new Error('Egress table inet forge_exec_egress absent; use local fallback'),{code:'egress-table-absent'});
