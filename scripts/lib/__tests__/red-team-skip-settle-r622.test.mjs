@@ -343,7 +343,7 @@ describe('R622 settlement needs a COMPLETE same-PR, same-head read, whatever the
     expect(settle(evidence)).toMatchObject({ ok: false, reason: 'review-unfinished' });
   });
   it('an unread FINISHED same-head rejection (no open effect) and any unrecognised verdict also keep the hold', () => {
-    for (const verdict of [{ verdict: 'changes' }, 'changes', { verdict: 'prevention-outstanding' }, {}, [], 7]) {
+    for (const verdict of [{ verdict: 'changes' }, 'changes', {}, [], 7]) {
       expect(settle(read(windowed(rec({ verdict })), 2))).toMatchObject({ ok: false, reason: 'scan-capped' });
     }
   });
@@ -366,7 +366,7 @@ describe('R622 settlement needs a COMPLETE same-PR, same-head read, whatever the
     expect(() => read(noMtime, 2)).toThrow(); // the finder itself already refuses an unreadable mtime
   });
   it('the clean path still settles: unread records that are accepts, undecided holds, other heads or other PRs', () => {
-    for (const hidden of [rec({ verdict: { verdict: 'accept' } }), rec({ verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' } }), rec(), rec({ rev: other, verdict: { verdict: 'changes' }, ...open }),
+    for (const hidden of [rec({ verdict: { verdict: 'accept' } }), rec({ verdict: { verdict: 'prevention-outstanding' } }), rec({ verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' } }), rec(), rec({ rev: other, verdict: { verdict: 'changes' }, ...open }),
       rec({ prNum: pr + 1, verdict: { verdict: 'changes' }, ...open }), rec({ repo: 'o/other', verdict: { verdict: 'changes' }, ...open })]) {
       expect(settle(read(windowed(hidden), 2))).toMatchObject({ ok: true, settledByComment: 'scan-capped' });
     }

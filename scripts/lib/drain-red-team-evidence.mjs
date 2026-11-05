@@ -81,8 +81,10 @@ const undecidedUnfinished = run => {
 };
 // R622: a run that blocks comment settlement whatever its start time: a label effect still pending or in flight, or
 // any present verdict other than an accept or the "needs a human" hold (a `changes` rejection above all, and any
-// verdict shape this reader does not recognise, which fails closed).
-const blocksSettlement = run => hasOpenEffect(run) || (Boolean(run.verdict) && !['accept', 'needs-human'].includes(verdictOf(run)));
+// verdict shape this reader does not recognise, which fails closed). `prevention-outstanding` (every finding already
+// resolved, nothing to send back) is accept-class and is a live verdict, so it never blocks on its own.
+const NON_REJECTING_VERDICTS = ['accept', 'needs-human', 'prevention-outstanding'];
+const blocksSettlement = run => hasOpenEffect(run) || (Boolean(run.verdict) && !NON_REJECTING_VERDICTS.includes(verdictOf(run)));
 // What the complete read keeps of a record: never its payload. Cached by (read function, dir, id, mtime, size) so a
 // settle attempt that keeps holding does not re-parse the whole store every tick; any rewrite changes the key.
 const summaryCache = new WeakMap();
