@@ -34,14 +34,14 @@ const DENY = /lockfile|integrity|checksum/i;
 const SPAWN_CODES = new Set(['ENOENT', 'EACCES', 'EPERM', 'ETIMEDOUT']);
 const FETCH_CODES = new Set(['ERR_PNPM_FETCH_FAIL', 'ERR_PNPM_META_FETCH_FAIL']);
 const pnpmCodes = (t) => [...String(t).matchAll(/ERR_PNPM_[A-Z0-9_]+/g)].map((m) => m[0]);
-function pnpmUnusable(e, { probe = false } = {}) {
+function pnpmUnusable(e) {
   const out = `${e?.message ?? ''}\n${e?.stdout ?? ''}\n${e?.stderr ?? ''}`;
   if (DENY.test(out)) return false;
   const codes = pnpmCodes(out);
   if (codes.some((c) => !FETCH_CODES.has(c))) return false; // any non-fetch pnpm error code wins over a spawn code
   if (SPAWN_CODES.has(e?.code)) return true;
   if (codes.length) return true; // only fetch-failure codes
-  return probe; // a version probe that exits non-zero with no pnpm error code: pnpm is not usable (e.g. a broken shim)
+  return false; // unclassified: fail closed (a signature or launcher rejection is not 'pnpm missing')
 }
 const runnerFailure = (e) => pnpmUnusable(e);
 
@@ -53,7 +53,7 @@ export function installArgv({ ci = false, ignoreScripts = false, pnpmVersion = d
   let { manager, note } = r;
   if (manager === 'pnpm') {
     try { pnpmVersion(); } catch (e) {
-      if (!pnpmUnusable(e, { probe: true })) throw e; // fail closed: an integrity/lockfile-class failure is not 'pnpm missing'
+      if (!pnpmUnusable(e)) throw e; // fail closed: an integrity/lockfile-class failure is not 'pnpm missing'
       manager = 'npm'; note = `pnpm --version failed (from ${r.source}); using npm`;
     }
   }
