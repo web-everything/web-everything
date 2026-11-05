@@ -3919,3 +3919,12 @@ The review daemon must explicitly pass `restoreStamps: sweepAuthorStamps` to hol
 including with shared PR reads: an injected listing otherwise suppresses the default stamp sweep.
 Keep daemon wiring tests hermetic by inspecting the passed function without invoking it;
 the stamp and hold-reconcile suites exercise the repair through injected IO.
+
+### Author-stamp restoration evidence
+
+`author-stamp-restore` fixtures must preserve GraphQL editor `__typename` alongside
+`login`: `app/X` PR authors match only `Bot` editors, and plain `X` authors match only
+`User` editors. Missing or unknown types refuse. Historical bodies must be plain
+snapshots; a hunk header, a plus/minus-prefixed marker line, or HTML in any snapshot
+refuses the whole history without writing. Refusal directs operators to inspect
+the complete GitHub history manually; never turn ambiguous delta text into a stamp.

@@ -1,13 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
-import { planStampRestore, restoreAuthorStamp, sweepAuthorStamps } from '../author-stamp-restore.mjs';
+import { planStampRestore, readAuthorStampEdits, restoreAuthorStamp, sweepAuthorStamps } from '../author-stamp-restore.mjs';
 import { buildAuthorActorMarker, buildStampLostMarker, hasStampLostMarker, readAuthorActorStamps } from '../review-independence.mjs';
 
 const ID = '01f39b97-274a-4078-8eeb-e7f8d6008673';
 const OTHER = 'ffffffff-1111-2222-3333-444444444444';
 const AUTHOR = 'plateau-worker';
 const BODY = 'Resolve the review issue.\n\nOperator clarification.';
-const edit = (diff, login = AUTHOR, createdAt = '2026-10-01T10:00:00Z') => ({
-  diff, editor: { login }, createdAt,
+const edit = (diff, login = AUTHOR, createdAt = '2026-10-01T10:00:00Z', __typename = login === AUTHOR ? 'Bot' : 'User') => ({
+  diff, editor: { __typename, login }, createdAt,
 });
 // #6244: the author stamped the original; two later web edits by chalbert dropped it.
 const history = () => [
@@ -21,8 +21,8 @@ const plainHistory = () => [
   edit('First operator edit', 'chalbert', '2026-11-02T13:10:21Z'),
   edit(`Original body\n\n${buildAuthorActorMarker(ID)}`, AUTHOR, '2026-11-02T13:10:21Z'),
 ];
-const live = (body = BODY) => ({ state: 'OPEN', body, author: { login: AUTHOR } });
-const plan = (overrides = {}) => planStampRestore({ state: 'OPEN', body: BODY, authorLogin: AUTHOR, edits: history(), ...overrides });
+const live = (body = BODY) => ({ state: 'OPEN', body, author: { login: `app/${AUTHOR}` } });
+const plan = (overrides = {}) => planStampRestore({ state: 'OPEN', body: BODY, authorLogin: `app/${AUTHOR}`, edits: history(), ...overrides });
 const expectReason = (result, action) => {
   expect(result).toEqual(expect.objectContaining({ action, reason: expect.any(String) }));
   expect(result.reason.trim()).not.toBe('');
@@ -41,10 +41,10 @@ describe('planStampRestore — agreement and author-of-record provenance', () =>
   });
 
   it('compares editor and author logins case-insensitively', () => {
-    expect(plan({ authorLogin: 'PLATEAU-WORKER' })).toMatchObject({ action: 'restore', id: ID });
+    expect(plan({ authorLogin: 'APP/PLATEAU-WORKER' })).toMatchObject({ action: 'restore', id: ID });
   });
 
-  it.each(['app/plateau-worker', 'APP/PLATEAU-WORKER', 'plateau-worker'])(
+  it.each(['app/plateau-worker', 'APP/PLATEAU-WORKER'])(
     'restores a stamp supplied by the bot author %s', (authorLogin) => {
       expect(plan({ authorLogin })).toMatchObject({ action: 'restore', id: ID });
     });
@@ -53,6 +53,35 @@ describe('planStampRestore — agreement and author-of-record provenance', () =>
     'refuses a missing or nonmatching bot author %s', (authorLogin) => {
       expectReason(plan({ authorLogin }), 'refuse');
     });
+
+  it.each([
+    ['User impersonating a bot', 'app/plateau-worker', 'User'],
+    ['Bot impersonating a user', 'plateau-worker', 'Bot'],
+    ['missing editor type', 'app/plateau-worker', undefined],
+    ['unknown editor type', 'app/plateau-worker', 'Organization'],
+  ])('refuses %s without writing', async (_name, authorLogin, __typename) => {
+    const edits = history();
+    edits[0].editor.__typename = __typename;
+    const seams = io({ readPr: vi.fn(() => ({ ...live(), author: { login: authorLogin } })),
+      readEdits: vi.fn(() => edits) });
+    expectReason(plan({ authorLogin, edits }), 'refuse');
+    expectReason(await restoreAuthorStamp(seams), 'refuse');
+    expect(seams.writeBody).not.toHaveBeenCalled();
+  });
+
+  it('restores a matching User editor and plain author case-insensitively', () => {
+    const edits = [edit(buildAuthorActorMarker(ID), 'Chalbert')];
+    expect(plan({ authorLogin: 'CHALBERT', edits })).toMatchObject({ action: 'restore', id: ID });
+  });
+
+  it('requests the editor identity type alongside its login', () => {
+    const exec = vi.fn(() => JSON.stringify({ data: { repository: { pullRequest: {
+      userContentEdits: { totalCount: 0, nodes: [], pageInfo: { hasNextPage: false } },
+    } } } }));
+    expect(readAuthorStampEdits(6244, { repo: 'o/r', exec })).toEqual([]);
+    expect(exec.mock.calls[0][1].find((arg) => arg.startsWith('query=')))
+      .toContain('editor{__typename login}');
+  });
 
   it('does not strip app/ from the editor login', () => {
     expectReason(plan({ authorLogin: 'app/plateau-worker',
@@ -247,7 +276,7 @@ describe('restoreAuthorStamp — injected IO and concurrent edits', () => {
 });
 
 describe('sweepAuthorStamps — isolated failures and bounded retries', () => {
-  const listed = (number, body = BODY) => ({ number, body, author: { login: AUTHOR } });
+  const listed = (number, body = BODY) => ({ number, body, author: { login: `app/${AUTHOR}` } });
 
   it('skips listed stamped PRs without reading history or live metadata', async () => {
     const seams = io({ repo: 'o/stamp-listed', listPrs: vi.fn(() => [listed(1, buildAuthorActorMarker(ID))]) });
@@ -341,15 +370,40 @@ describe('plain snapshots containing literal diff-like text', () => {
       edit(`-${buildAuthorActorMarker(OTHER)}`, 'chalbert')] }), 'refuse');
   });
 
-  it.each(['+', '-', ' ', '@@ -0,0 +1 @@\n+'])('uses oldest-author provenance for literal prefix %j', async (prefix) => {
+  it.each(['+', '-', '@@ -0,0 +1 @@\n+'])('refuses delta-looking marker prefix %j without writing', async (prefix) => {
     const marker = buildAuthorActorMarker(ID);
     const edits = [edit(`${prefix}${marker}`),
+      edit('Later unstamped body', 'chalbert', '2026-10-01T11:00:00Z')];
+    expectReason(plan({ edits }), 'refuse');
+    const seams = io({ readEdits: vi.fn(() => edits) });
+    expectReason(await restoreAuthorStamp(seams), 'refuse');
+    expect(seams.writeBody).not.toHaveBeenCalled();
+  });
+
+  it('restores a plain body with a space-indented marker on its own line', async () => {
+    const marker = buildAuthorActorMarker(ID);
+    const edits = [edit(`Original body\n ${marker}`),
       edit('Later unstamped body', 'chalbert', '2026-10-01T11:00:00Z')];
     expect(plan({ edits })).toMatchObject({ action: 'restore', id: ID, source: edits[0], marker });
     const seams = io({ readEdits: vi.fn(() => edits) });
     expectReason(await restoreAuthorStamp(seams), 'restore');
     expect(seams.writeBody).toHaveBeenCalledTimes(1);
     expect(seams.writeBody).toHaveBeenCalledWith(6244, `${BODY}\n\n${marker}\n`);
+  });
+
+  it.each([
+    ['deletion-only oldest author snapshot', () => [edit(`@@ -1 +0,0 @@\n-${buildAuthorActorMarker(OTHER)}`)]],
+    ['hunk header without a prefixed marker', () => [edit(`@@ -1 +1 @@\n${buildAuthorActorMarker(ID)}`)]],
+    ['later plus-prefixed marker', () => [...history(), edit(`+${buildAuthorActorMarker(ID)}`, 'chalbert', '2026-10-02T10:00:00Z')]],
+    ['later indented minus-prefixed marker', () => [...history(), edit(`  - removed ${buildAuthorActorMarker(ID)}`, 'chalbert', '2026-10-02T10:00:00Z')]],
+    ['later unstamped hunk', () => [...history(), edit('@@ -1 +1 @@\n-old\n+new', 'chalbert', '2026-10-02T10:00:00Z')]],
+    ['later HTML snapshot', () => [...history(), edit('<p>new body</p>', 'chalbert', '2026-10-02T10:00:00Z')]],
+  ])('refuses the whole history for %s without writing', async (_name, makeEdits) => {
+    const edits = makeEdits();
+    expectReason(plan({ edits }), 'refuse');
+    const seams = io({ readEdits: vi.fn(() => edits) });
+    expectReason(await restoreAuthorStamp(seams), 'refuse');
+    expect(seams.writeBody).not.toHaveBeenCalled();
   });
 
   it.each([
