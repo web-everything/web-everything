@@ -404,6 +404,45 @@ it('resumable and referred review records stay local (one rejecting clause per r
   for (const [name, r] of Object.entries(rows)) expect(runRecordEligible(text(r), () => true), name).toBe(false);
   expect(runRecordEligible(text({ ...base, resumeOf: { id: 'r0' }, stepTimings: finishedAdvise }), () => true)).toBe(true); // finished advise lifts the resumeOf clause
 });
+it('finished-record clauses are independent: each rejects an otherwise-eligible record with completion proven', async () => {
+  const { runRecordEligible } = await import('../runs-writer-exclusion.mjs');
+  const finished = JSON.parse(rec); // review-pr, verdict approve, cursor 2
+  const eff = status => ({ key: `k-${status}`, type: 't', stepIndex: 0, index: 0, status });
+  const yes = () => true;
+  expect(runRecordEligible(JSON.stringify(finished), yes)).toBe(true); // control
+  expect(runRecordEligible(JSON.stringify({ ...finished, verdict: null }), yes), 'no verdict').toBe(false);
+  expect(runRecordEligible(JSON.stringify({ ...finished, cursor: 0 }), yes), 'cursor never advanced').toBe(false);
+  expect(runRecordEligible(JSON.stringify({ ...finished, effects: [eff('in-flight')] }), yes), 'in-flight effect').toBe(false);
+  expect(runRecordEligible(JSON.stringify({ ...finished, effects: [eff('pending')] }), yes), 'pending effect').toBe(false);
+  // Statuses the engine finalizes stay eligible. (An unknown status never reaches the whitelist: the run-record schema
+  // rejects it first, and the whitelist exists to keep a future schema status fail-closed.)
+  for (const s of ['declared', 'applied', 'failed']) expect(runRecordEligible(JSON.stringify({ ...finished, effects: [eff(s)] }), yes), s).toBe(true);
+});
+it('a crash between the manifest commit and the removal loop does not exclude the record forever', async () => {
+  const p = await file(join(runs, 'crash.json'));
+  const day1 = await run({ afterManifestCommit: async () => { throw Error('simulated crash'); } });
+  expect(day1.errors.join()).toMatch(/simulated crash/); expect(await exists(p)).toBe(true);
+  expect(await exists(join(stateDir, 'runs.removal-intent.json'))).toBe(true); // intent survived the "crash"
+  const day2 = await run({ now: now + 86400001 });
+  expect(day2.errors).toEqual([]); expect(await exists(p)).toBe(false);
+  expect(await exists(join(stateDir, 'runs.removal-intent.json'))).toBe(false); // consumed
+  const day3 = await run({ now: now + 2 * 86400001 });
+  expect(day3.filesArchived).toBe(0);
+});
+it('a normal run leaves no removal-intent file behind', async () => {
+  await file(join(runs, 'clean.json'));
+  const out = await run();
+  expect(out.errors).toEqual([]);
+  expect(await exists(join(stateDir, 'runs.removal-intent.json'))).toBe(false);
+});
+it('an emitter that throws or rejects does not abort a finished run', async () => {
+  const p = await file(join(runs, 'em.json'));
+  const out = await run({ emit: () => { throw Error('sync emit boom'); } });
+  expect(out.errors.join()).toMatch(/event emit failed: sync emit boom/); expect(await exists(p)).toBe(false);
+  const q = await file(join(runs, 'em2.json'));
+  const out2 = await run({ emit: async () => { throw Error('async emit boom'); }, now: now + 86400001 });
+  expect(out2.errors.join()).toMatch(/event emit failed: async emit boom/); expect(await exists(q)).toBe(false);
+});
 it('the real review-pr completion check resolves the resume step count for the record id', async () => {
   const { loadRunCompletion } = await import('../runs-writer-exclusion.mjs');
   const { OPERATIONS } = await import('../../operations/run.mjs');

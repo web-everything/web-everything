@@ -1,6 +1,6 @@
 /** R217: archives are retained forever; source removal requires verified Drive evidence. */
-import { lstat, opendir, mkdir, writeFile, rename, unlink, rmdir, mkdtemp, rm, link } from 'node:fs/promises';
-import { join, dirname, basename, relative, resolve } from 'node:path';
+import { lstat, opendir, mkdir, writeFile, rename, unlink, rmdir, mkdtemp, rm, link, access } from 'node:fs/promises';
+import { join, dirname, basename, relative, resolve, isAbsolute } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
@@ -185,6 +185,7 @@ export async function archiveRetention(o = {}) {
       await writeArchiveManifest(archiveManifest, source, drive, forget, maxFiles);
       return forget;
     }
+    const intentFile = join(state, 'runs.removal-intent.json');
     if (kind === 'runs') {
       // Oldest first, bounded by the batch cap; unreadable or unfinished records are skipped (never eligible).
       const cap = o.batchCap ?? settings.value.runsBatchCap;
@@ -194,6 +195,20 @@ export async function archiveRetention(o = {}) {
         if (!m) continue;
         if (o.dryRun) { out.errors.push(`ALERT: parked ${basename(f.path)} awaits restore`); continue; }
         await restore(f.path, join(dirname(f.path), m[1]));
+      }
+      // Crash recovery: a run killed between the manifest commit and the removal loop's bookkeeping leaves an intent file
+      // naming the records it archived but had not yet removed. Treat them like skipped records (bounded retry) so the
+      // manifest does not exclude them forever.
+      if (!o.dryRun) {
+        let keys = null;
+        try { keys = JSON.parse(boundedText(intentFile, 1024 * 1024)); if (!Array.isArray(keys)) throw Error('invalid intent state'); }
+        catch (e) { if (e.code !== 'ENOENT') out.errors.push(`removal-intent state unreadable (${e.message}); records may stay excluded, operator must inspect`); }
+        if (keys) {
+          const stillThere = new Set();
+          for (const k of keys) if (typeof k === 'string' && !isAbsolute(k) && !k.split('/').includes('..') && await access(join(source, k)).then(() => true, () => false)) stillThere.add(k);
+          if (stillThere.size) archived = await retryRemoval(stillThere, archived);
+          await unlink(intentFile).catch(e => { if (e.code !== 'ENOENT') throw e; });
+        }
       }
       const old = scanned1.filter(f => f.path.endsWith('.json') && f.stat.mtimeMs < cutoff && !(archived.get(relative(source, f.path)) && version(f.stat).every((v, i) => v === archived.get(relative(source, f.path))[i])))
         .sort((a, b) => a.stat.mtimeMs - b.stat.mtimeMs);
@@ -272,12 +287,17 @@ export async function archiveRetention(o = {}) {
         // differ on the next scan and must get their own verified archive.
         const next = new Map(archived);
         for (const f of group.files) next.set(relative(source, f.path), version(f.stat));
+        // Runs with a removal path (a provider): every group file starts "pending" and leaves the set only when removed.
+        const pending = new Set(kind === 'runs' && o.withSourceWriterExclusion ? group.files.map(f => relative(source, f.path)) : []);
+        if (pending.size) { // intent BEFORE the manifest commit, so a crash right after it is recovered on the next run
+          const t = `${intentFile}.${randomUUID()}.partial`;
+          try { await writeFile(t, JSON.stringify([...pending]), { flag: 'wx', mode: 0o600 }); await rename(t, intentFile); } finally { await unlink(t).catch(() => {}); }
+        }
         await writeArchiveManifest(archiveManifest, source, drive, next, maxFiles);
         archived = next;
         out.bundles.push(final); out.filesArchived += names.length;
+        await o.afterManifestCommit?.(); // test seam: a hard crash between the manifest commit and the removal loop
         let uncoordinated = 0;
-        // Runs with a removal path (a provider): every group file starts "pending" and leaves the set only when removed.
-        const pending = new Set(kind === 'runs' && o.withSourceWriterExclusion ? group.files.map(f => relative(source, f.path)) : []);
         try {
           for (const f of group.files) {
             let removed = false, entered = false;
@@ -317,7 +337,11 @@ export async function archiveRetention(o = {}) {
         } finally {
           // Applied on EVERY exit (skip, restored quarantine, or a thrown error mid-loop), so no unremoved record is left
           // excluded forever by the manifest committed above. Bounded: see retryRemoval.
-          if (pending.size) { try { archived = await retryRemoval(pending, archived); } catch (e) { out.errors.push(`retry bookkeeping failed; operator must inspect: ${e.message}`); } }
+          // The intent file is dropped only once the bookkeeping succeeded; on failure it stays and the next run recovers.
+          try {
+            if (pending.size) archived = await retryRemoval(pending, archived);
+            await unlink(intentFile).catch(e => { if (e.code !== 'ENOENT') throw e; });
+          } catch (e) { out.errors.push(`retry bookkeeping failed; operator must inspect: ${e.message}`); }
         }
         if (uncoordinated) out.errors.push(`Source removal skipped for ${uncoordinated} files: writer exclusion unavailable; originals retained. Operator must arrange exclusion of all source writers, including open descriptors, before reclamation.`);
         for (const dir of [...new Set(group.dirs)].sort((a, b) => b.length - a.length)) {
@@ -333,6 +357,7 @@ export async function archiveRetention(o = {}) {
   }
   if (out.errors.length && out.status === 'archived') out.status = out.filesArchived ? 'partial' : 'skipped';
   const event = { kind: 'archive-retention', daemon: 'archive-retention', detail: out, filesArchived: out.filesArchived, bytesFreed: out.bytesFreed };
-  if (!o.dryRun) await (o.emit ?? (e => appendDaemonEvent(e, { env })))(event);
+  // Best-effort like the restore alert: all work is done, a sync/throwing/rejecting emitter must not turn it into a crash.
+  if (!o.dryRun) { try { await (o.emit ?? (e => appendDaemonEvent(e, { env })))(event); } catch (e) { out.errors.push(`event emit failed: ${e.message}`); } }
   return out;
 }
