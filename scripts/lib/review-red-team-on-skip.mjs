@@ -714,7 +714,8 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       // A trusted red-team result supplies its own blocked/clear disposition. Its finding text
       // is not an independent review hold; all other thread comments still guard settlement.
       const holdComments = row.settle === 'result' ? comments.filter(comment =>
-        !redTeamForHead([comment], row.prNumber, row.head) || isLaterVerdictBody(comment.body)) : comments;
+        !redTeamForHead([comment], row.prNumber, row.head) || strictBodyKind(comment.body, row.prNumber, row.head) !== 'clean'
+          || isLaterVerdictBody(comment.body)) : comments;
       if (row.settle === 'result'
         && !provenAcceptance({ comments: holdComments, reviews, labels: live.labels, head: row.head })) {
         throw Error('no proven acceptance for this head; label unchanged');
