@@ -469,6 +469,24 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     expect(Object.keys(readHeadIndex({ dir, keepPerPr: 3 }).map['o/r#7'].history).sort()).toEqual(['p1', 'p2', 'p3']); // p1 not evicted by a rejected p4
     expect(readHeadIndex({ dir, keepPerPr: 3 }).map).toEqual(before);
   });
+  it('a compaction triggered by a write keeps the writer row last and replays to the published map across PRs and keyless records', () => {
+    const base = { keepPerPr: 5, logMaxLines: 4 };
+    rec({ ...base, head: H(1), netPatchHash: 'p1', at: '2026-11-04T10:00:01Z' });
+    rec({ ...base, pr: 8, head: H(2), netPatchHash: 'q1', at: '2026-11-04T10:00:02Z' });
+    rec({ ...base, head: H(3), netPatchHash: null, at: '2026-11-04T10:00:03Z' });
+    rec({ ...base, pr: 8, head: H(4), netPatchHash: 'q1', at: '2026-11-04T10:00:04Z' }); // same patch again
+    const r = rec({ ...base, head: H(5), netPatchHash: 'p2', at: '2026-11-04T10:00:05Z' }); // 5 rows > 4: compacts
+    const { log, map: mp } = headIndexPaths(dir);
+    const rows = readFileSync(log, 'utf8').trim().split('\n').map(l => JSON.parse(l));
+    expect(r.lines).toBe(rows.length);
+    expect(rows.length).toBeLessThan(5);
+    expect(rows[rows.length - 1]).toMatchObject({ pr: 7, head: H(5), netPatchHash: 'p2' }); // the writer's own row stays last
+    const published = JSON.parse(readFileSync(mp, 'utf8')).map;
+    writeFileSync(mp, '{{');
+    expect(readHeadIndex({ dir, keepPerPr: 5 }).map).toEqual(published);
+    expect(published['o/r#8'].history.q1.head).toBe(H(4));
+    expect(published['o/r#7'].lastReviewedHead).toBe(H(5));
+  });
   it('reader cannot carry a pending review that subsequently fails fencing: the window ends at the retraction, after which the PR is owed again', () => {
     rec({ head: H(1), netPatchHash: 'p1' });
     const { log, lock } = headIndexPaths(dir);
