@@ -439,6 +439,55 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     expect(m.history.p2).toBeDefined();                            // earlier records are intact
     expect(m.lastReviewedHead).toBe(H(2));
   });
+  it('failed compacted replacement restores the previous same-patch verdict: rejecting a new row under a repeated netPatchHash leaves the committed map unchanged', () => {
+    rec({ head: H(1), netPatchHash: 'p1', verdict: 'accept', at: '2026-11-04T10:00:01Z' });
+    const { log, map, lock } = headIndexPaths(dir);
+    const before = readHeadIndex({ dir }).map;
+    const mapBefore = readFileSync(map, 'utf8');
+    let stolen = false;
+    const fs = { ...nodeFs, renameSync: (a, b) => { // the compacted log lands, then the lock is lost before the next fence
+      const r = nodeFs.renameSync(a, b);
+      if (!stolen && b === log) { stolen = true; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'thief', at: 1 })); }
+      return r; } };
+    // same patch hash, new head: the new row REPLACES the p1 entry in the map; logMaxLines=1 forces compaction
+    expect(() => rec({ fs, head: H(2), netPatchHash: 'p1', verdict: 'reject', at: '2026-11-04T10:00:02Z', logMaxLines: 1 })).toThrow(/lock lost/);
+    expect(stolen).toBe(true);
+    expect(readFileSync(map, 'utf8')).toBe(mapBefore);
+    expect(readHeadIndex({ dir }).map).toEqual(before);            // the predecessor survived the compaction the rejected row triggered
+  });
+  it('failed compacted replacement under retention eviction: the entry the rejected row would have evicted survives its rejection', () => {
+    for (let i = 1; i <= 3; i++) rec({ head: H(i), netPatchHash: `p${i}`, at: `2026-11-04T10:00:0${i}Z`, keepPerPr: 3 });
+    const { log, lock } = headIndexPaths(dir);
+    const before = readHeadIndex({ dir, keepPerPr: 3 }).map;
+    let stolen = false;
+    const fs = { ...nodeFs, renameSync: (a, b) => {
+      const r = nodeFs.renameSync(a, b);
+      if (!stolen && b === log) { stolen = true; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'thief', at: 1 })); }
+      return r; } };
+    expect(() => rec({ fs, head: H(4), netPatchHash: 'p4', at: '2026-11-04T10:00:04Z', keepPerPr: 3, logMaxLines: 1 })).toThrow(/lock lost/);
+    expect(stolen).toBe(true);
+    expect(Object.keys(readHeadIndex({ dir, keepPerPr: 3 }).map['o/r#7'].history).sort()).toEqual(['p1', 'p2', 'p3']); // p1 not evicted by a rejected p4
+    expect(readHeadIndex({ dir, keepPerPr: 3 }).map).toEqual(before);
+  });
+  it('reader cannot carry a pending review that subsequently fails fencing: the window ends at the retraction, after which the PR is owed again', () => {
+    rec({ head: H(1), netPatchHash: 'p1' });
+    const { log, lock } = headIndexPaths(dir);
+    const ask = () => headReviewOwed({ index: readHeadIndex({ dir }), repo: 'o/r', pr: 7, head: H(2), netPatchHash: 'p2' });
+    expect(ask().owed).toBe(true);
+    let appended = false, inside = null;
+    const fs = { ...nodeFs,
+      openSync: (p, f) => {
+        if (f === 'a') appended = true;
+        if (f === 'wx' && /retract\./.test(String(p)) && inside === null) inside = ask(); // a lock-free reader, after the append and before the marker exists
+        return nodeFs.openSync(p, f); },
+      readFileSync: (p, ...a) => { if (appended && p === log) { appended = false; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'thief', at: 1 })); } return nodeFs.readFileSync(p, ...a); } };
+    expect(() => rec({ fs, head: H(2), netPatchHash: 'p2' })).toThrow(/lock lost/);
+    expect(inside).not.toBeNull();                                 // the interleaving really happened
+    // In the window the verdict is already durable in its run record (recordReview is called only after it), so a reader that
+    // carries it has not skipped a review that never ran. The guarantee is that the rejection removes it for every later reader.
+    expect(ask().owed).toBe(true);
+    expect(readHeadIndex({ dir }).map['o/r#7'].history.p2).toBeUndefined();
+  });
   it('rebuild from an uncompacted log honors keepPerPr: evicted history is not resurrected and the map equals the published one', () => {
     for (let i = 1; i <= 6; i++) rec({ head: H(i), netPatchHash: `p${i}`, at: `2026-11-04T10:00:0${i}Z`, keepPerPr: 3 });
     const { map: mp } = headIndexPaths(dir);

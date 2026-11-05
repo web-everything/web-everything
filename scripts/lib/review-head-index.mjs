@@ -266,10 +266,13 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
     const snapshot = fs.readFileSync(log);
     if (!snapshot.includes(lineBytes)) throw Error('review-head-index: appended row missing from the log; refusing to publish'); // never report ok for a lost append
     const parsed = parseLog(snapshot.toString('utf8'), keepPerPr, folded);
-    const map = parsed.map;
     let lines = parsed.lines;
     if (lines > logMaxLines) { // 3. bound growth: rewrite the log from the compacted map, atomically, then the map
-      const compact = Object.entries(map).flatMap(([k, v]) => {
+      // The rewrite is derived from the map WITHOUT our row, and our own line is kept verbatim as the last row. Our row can replace
+      // a same-patch predecessor or evict the oldest entry in the map; compacting that map would make those losses permanent, so a
+      // later retraction of our row could not bring them back. Replay applies our row last either way, so the result is the same.
+      const prior = parseLog(snapshot.toString('utf8'), keepPerPr, [...folded, txn]).map;
+      const compact = Object.entries(prior).flatMap(([k, v]) => {
         const [r, p] = [k.slice(0, k.lastIndexOf('#')), Number(k.slice(k.lastIndexOf('#') + 1))];
         const tx = h => (h.txn === undefined ? {} : { txn: h.txn }); // every row keeps its writer's txn, so a later retraction still finds it
         const row = (hash, h) => ({ repo: r, pr: p, head: h.head, netPatchHash: hash.startsWith(NOKEY) ? null : hash, verdict: h.verdict, at: h.at, ...tx(h) });
@@ -278,7 +281,7 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
         // The PR's current record goes LAST so a rebuild restores lastReviewedHead and its verdict exactly.
         return [...older, { repo: r, pr: p, head: v.lastReviewedHead, netPatchHash: v.netPatchHash, verdict: v.verdict, at: v.at, ...tx(v) }];
       });
-      const text = compact.map(c => `${JSON.stringify(c)}\n`).join('');
+      const text = compact.map(c => `${JSON.stringify(c)}\n`).join('') + line;
       if (!snapshot.subarray(Math.max(0, snapshot.length - lineBytes.length)).equals(lineBytes)) { rollback(); throw tag(Error('review-head-index: log changed under the lock; refusing to compact')); }
       fenced();
       // The rewrite replaces the file, so it must replace exactly the bytes the compaction was derived from. A rejected writer's
@@ -287,7 +290,7 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
       atomicWrite(fs, log, `${log}.tmp`, text);
       fenced();                                                 // lock lost during the rewrite: the compacted log replays to the same map, so it stays; our row is retracted
       for (const t of folded) { try { fs.unlinkSync(retractPath(dir, t)); } catch { /* gone */ } } // folded into the log we just wrote; later markers are not in `folded` and stay
-      lines = compact.length;
+      lines = compact.length + 1;
     }
     fenced();
     // The map and its hash come from the SAME markers and bytes: a marker made after this listing changes the state hash, so
