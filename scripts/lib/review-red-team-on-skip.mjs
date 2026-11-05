@@ -135,6 +135,22 @@ function conflictsWithPolicyClear(label, { settlesPending = false } = {}) {
   );
 }
 
+/** A reviewed-sha marker alone never proves acceptance or supersedes a newer hold. */
+function provenAcceptance({ comments, reviews, labels, head }) {
+  if (!isRealHead(head) || !Array.isArray(comments) || comments.some(c => typeof c?.body !== 'string')
+    || !Array.isArray(reviews) || laterReviewHold(reviews) || !Array.isArray(labels)) return null;
+  const names = labels.map(label => typeof label === 'string' ? label : label?.name);
+  if (names.some(name => typeof name !== 'string' || !name.trim()) || !names.includes('review:accepted')) return null;
+  const acceptance = latestAcceptRecord(comments, reviews);
+  if (acceptance?.sha !== head || acceptance.laterVerdict || acceptance.laterBodyDerivedHold) return null;
+  const body = comments[acceptance.index]?.body;
+  if (!/^\s*✅/.test(body) || isLaterVerdictBody(body)) return null;
+  const acceptedAt = Date.parse(acceptance.at);
+  if (comments.some((comment, index) => isLaterVerdictBody(comment.body)
+    && (index > acceptance.index || Date.parse(comment.createdAt ?? comment.created_at) > acceptedAt))) return null;
+  return acceptance;
+}
+
 /** Live holds supersede both carried and stored policy-clears. PURE.
  * Without an acceptance record nothing is "later", so any explicit hold comment stands (any author: fail closed).
  */
@@ -297,16 +313,10 @@ export function ignorableConfirmRunIds({ repo, pr, head, comments, labels, revie
   runsDir = runsDirectory(env), list = strictListRuns, read = readRun, stat = statSync, now = Date.now() } = {}) {
   const closed = { ok: false, ids: [] };
   try {
-    if (!isRealHead(head) || !Array.isArray(comments) || !Array.isArray(reviews)
-      || !Array.isArray(labels) || !labels.some(l => (typeof l === 'string' ? l : l?.name) === 'review:accepted')) return closed;
-    const acceptance = latestAcceptRecord(comments, reviews);
-    const acceptedAt = Date.parse(acceptance?.at);
-    // The marker alone is not an acceptance: the comment must read as an accepting verdict, never a hold.
-    const acceptBody = comments[acceptance?.index]?.body ?? '';
-    if (!/^\s*✅/.test(acceptBody) || isLaterVerdictBody(acceptBody)) return closed;
-    // A re-stamp carries an earlier acceptance forward: its timestamp is not the original acceptance time.
-    if (/^\s*📌 review — acceptance re-stamped/.test(comments[acceptance?.index]?.body ?? '')) return closed;
-    if (acceptance?.sha !== head || !Number.isFinite(acceptedAt)
+    const acceptance = provenAcceptance({ comments, reviews, labels, head });
+    if (!acceptance) return closed;
+    const acceptedAt = Date.parse(acceptance.at);
+    if (!Number.isFinite(acceptedAt)
       || publishableClearGuard({ labels, acceptance, comments, reviews, settlesPending: true })) return closed;
     // A late acceptance comment cannot supersede a confirm opened after its panel began.
     // Materialize the bounded scan once so both chronology passes use identical records.
@@ -436,8 +446,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       const recordedNotOwed = verdict === VERDICTS.ACCEPT && !owed;
       const keepsPending = Array.isArray(rawPr.labels) && rawPr.labels.some(label =>
         (typeof label === 'string' ? label : label?.name) === 'red-team:pending');
-      const acceptedReview = verdict === VERDICTS.ACCEPT && accepted && acceptance?.sha === head
-        && !acceptance.laterVerdict && !acceptance.laterBodyDerivedHold;
+      const acceptedReview = verdict === VERDICTS.ACCEPT
+        && provenAcceptance({ comments: rawPr.comments, reviews, labels: rawPr.labels, head }) !== null;
       const provenanceEscalation = keepsPending && !acceptedReview ? { escalate: true,
         escalationContext: 'red-team:pending kept: not-owed review lacks acceptance provenance; needs a human look' } : {};
       const notOwed = (why = 'stored review does not owe a red team') => {
@@ -705,6 +715,10 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       // is not an independent review hold; all other thread comments still guard settlement.
       const holdComments = row.settle === 'result' ? comments.filter(comment =>
         !redTeamForHead([comment], row.prNumber, row.head) || isLaterVerdictBody(comment.body)) : comments;
+      if (row.settle === 'result'
+        && !provenAcceptance({ comments: holdComments, reviews, labels: live.labels, head: row.head })) {
+        throw Error('no proven acceptance for this head; label unchanged');
+      }
       const acceptance = latestAcceptRecord(holdComments, reviews);
       if (laterReviewHold(reviews) || acceptance?.laterVerdict || acceptance?.laterBodyDerivedHold
         || !acceptance && holdComments.some(comment => isLaterVerdictBody(comment.body))) {

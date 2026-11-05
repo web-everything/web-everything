@@ -3,7 +3,6 @@
  * Replay the production skip runner and its bounded run scanners with injected evidence and IO.
  * No processes, network, or persisted run state; production modules always come from sourceRoot.
  */
-import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -15,15 +14,24 @@ export default {
   title: 'an open PR carrying red-team:pending that the daemon declines to dispatch a red team for never has the label settled',
   card: 'LIVE: #6418, #6414, #6193, #6345',
   fixedBy: { sha: 'pending', where: 'lane/redteam-pending-label-never-settles', paths: [RECOVERY] },
-  fixPresent(root) {
-    return existsSync(join(root, RECOVERY));
+  fixPresent() {
+    return true;
   },
   async run({ sourceRoot = ROOT } = {}) {
     const violations = [];
     const check = (ok, message) => { if (!ok) violations.push(message); };
     try {
       const load = path => import(pathToFileURL(join(sourceRoot, path)).href);
-      const { runRedTeamOnSkip, ignorableConfirmRunIds, headNeverReviewedFromRuns } = await load(RECOVERY);
+      let recovery;
+      try { recovery = await load(RECOVERY); }
+      catch (error) {
+        violations.push(`recovery module import failed: ${error.message ?? error}`);
+        return { violations };
+      }
+      const required = ['runRedTeamOnSkip', 'ignorableConfirmRunIds', 'headNeverReviewedFromRuns'];
+      check(required.every(name => typeof recovery[name] === 'function'), 'recovery module missing required replay exports');
+      if (violations.length) return { violations };
+      const { runRedTeamOnSkip, ignorableConfirmRunIds, headNeverReviewedFromRuns } = recovery;
       const { renderRedTeamComment } = await load('scripts/operations/review-extra-seats.mjs');
       const { CONSTELLATION_REPOS } = await load('scripts/lib/constellation-repos.mjs');
       const { RUN_MTIME_SLACK_MS } = await load('scripts/lib/drain-red-team-evidence.mjs');
