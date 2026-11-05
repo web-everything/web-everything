@@ -81,7 +81,9 @@ export default {
     const emitted = new Set(rows.map(row => row.subject));
     for (const ep of Object.values(episodes ?? {})) {
       if (ep?.smell !== 'stale-code-service' || typeof ep.subject !== 'string' || emitted.has(ep.subject)) continue;
-      const cloneRoot = /^clone:(.+?):service:/.exec(ep.subject)?.[1];
+      // Prefer a known root (a root may itself contain ":service:"); only retired roots fall back to parsing.
+      const cloneRoot = [...roots].find(root => ep.subject.startsWith(`clone:${root}:service:`))
+        ?? /^clone:(.+?):service:/.exec(ep.subject)?.[1];
       if (cloneRoot === undefined || !(completeRoots.has(cloneRoot) || inventoryKnown && !roots.has(cloneRoot))) continue;
       rows.push({ subject: ep.subject, breach: false, measure: { cloneRoot },
         summary: 'Service is no longer observed in a complete inspection of its clone, or the clone is no longer managed.',

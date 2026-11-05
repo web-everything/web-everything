@@ -621,3 +621,29 @@ describe('stale detection honours the restart policy', () => {
     expect(stale(o)).toHaveLength(1);
   });
 });
+
+describe('interpreter option shapes that once hid a clone script (value contains "c", shell -e, ruby -I)', () => {
+  const script = name => join(cloneRoot, name);
+  it.each([
+    ['python -W attached value containing c', ['/usr/bin/python3', '-Wignore::DeprecationWarning', script('s.py')]],
+    ['python -X attached value containing c', ['/usr/bin/python3', '-Xcpu_count=2', script('s.py')]],
+    ['python -O then -W attached with c', ['/usr/bin/python3', '-O', '-Wignore::ResourceWarning', script('s.py')]],
+    ['bash -e errexit flag', ['/bin/bash', '-e', script('s.sh')]],
+    ['sh -eu combined flags', ['/bin/sh', '-eu', script('s.sh')]],
+    ['ruby -I with separate directory', ['/usr/bin/ruby', '-I', 'lib', script('s.rb')]],
+    ['ruby -I attached directory', ['/usr/bin/ruby', '-Ilib', script('s.rb')]],
+    ['perl -I with separate directory', ['/usr/bin/perl', '-I', 'lib', script('s.pl')]],
+  ])('%s still matches the clone script', async (_name, ProgramArguments) => {
+    const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments }]);
+    expect(findServicesRunningFromClone(o)).toEqual({ matches: [expect.objectContaining({ label: 'com.we.resource-sampler' })], unreadable: [] });
+    expect((await restartServicesForClone(o)).restarted).toHaveLength(1);
+  });
+  it.each([
+    ['bash -c inline program', ['/bin/bash', '-c', `cat ${join(cloneRoot, 'data.txt')}`]],
+    ['bash -ec inline program', ['/bin/bash', '-ec', `cat ${join(cloneRoot, 'data.txt')}`]],
+    ['node -e inline program', ['/usr/bin/node', '-e', 'run()', join(cloneRoot, 'data.txt')]],
+    ['python -c inline program', ['/usr/bin/python3', '-c', 'pass', join(cloneRoot, 'data.txt')]],
+  ])('inline-program option %s never makes a clone data path the script', (_name, ProgramArguments) => {
+    expect(findServicesRunningFromClone(fixture([{ Label: 'com.we.resource-sampler', ProgramArguments }]))).toEqual({ matches: [], unreadable: [] });
+  });
+});

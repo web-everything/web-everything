@@ -30,22 +30,30 @@ function codeArguments(args) {
   const executable = args[0], name = basename(executable).toLowerCase();
   const result = { owners: [executable], unknownAt: null };
   if (!/^(?:node|nodejs|python(?:\d+(?:\.\d+)*)?|pypy\d*|bash|sh|zsh|dash|ksh|ruby|perl)$/.test(name)) return result;
-  const noScript = new Set(['-e', '--eval', '-p', '--print', '-c', '-m', '--command']);
+  // In a shell `-e` is errexit (a flag), not "evaluate the next argument"; `-c` is the inline-program option.
+  const shell = /^(?:bash|sh|zsh|dash|ksh)$/.test(name), rubyPerl = /^(?:ruby|perl)$/.test(name);
+  const noScript = new Set(shell ? ['-c', '--command'] : ['-e', '--eval', '-p', '--print', '-c', '-m', '--command']);
   // Only options that take a SEPARATE operand belong here. Python's -O/-OO are operand-free
   // optimisation flags: listing them would swallow the script path and hide the service.
-  const operand = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader', '--conditions', '-W', '-X']);
+  // Ruby/perl `-I dir` takes a directory operand (python's -I is the operand-free isolate flag).
+  const operand = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader', '--conditions', '-W', '-X',
+    ...(rubyPerl ? ['-I'] : [])]);
   // Operand-free short flags (python -B -E -I -O -P -R -S -b -d -i -q -s -u -v -x; ruby/perl -w -v), alone or combined.
   const flag = /^(?:--(?:trace-warnings|no-warnings|no-deprecation|trace-deprecation|throw-deprecation|pending-deprecation|expose-gc|use-strict|harmony|preserve-symlinks|preserve-symlinks-main|abort-on-uncaught-exception|enable-source-maps|experimental-strip-types|noprofile|norc)|-[uBbEIsSOivxdqRPw]+)$/;
   for (let i = 1; i < args.length; i += 1) {
     const arg = args[i];
     if (arg === '--') { result.owners.push(...args.slice(i + 1, i + 2)); return result; }
-    if (noScript.has(arg) || /^-[^-]*c/.test(arg) || /^(?:--eval|--print)=/.test(arg)) return result;
+    // An attached `-Wvalue` / `-Xvalue` (value may contain a "c", e.g. -Wignore::DeprecationWarning) is a
+    // complete option: check it before the combined-`-c` detector below.
+    if (/^-[WX]./.test(arg) || rubyPerl && /^-I./.test(arg)) continue;
+    if (noScript.has(arg) || (shell ? /^-[A-Za-z]*c[A-Za-z]*$/ : /^-[^-]*c/).test(arg) || /^(?:--eval|--print)=/.test(arg)) return result;
     if (operand.has(arg)) { i += 1; continue; }
     if (arg.startsWith('-') || arg.startsWith('+')) {
       // `--name=value` carries its value attached, so it can never consume the next argument
       // (covers --max-old-space-size=N, --stack-size=N and the other V8/Node valued options).
       // `-Wignore` / `-Xdev` carry their value attached too, so they never consume the next argument.
-      if (flag.test(arg) || /^--[A-Za-z][\w-]*=/.test(arg) || /^-[WX]./.test(arg)) continue;
+      // Shell flags that take no operand (-e -u -x -eu ...); -o/-O/-c are deliberately absent.
+      if (flag.test(arg) || /^--[A-Za-z][\w-]*=/.test(arg) || shell && /^-[efhilnrstuvxBCEHPT]+$/.test(arg)) continue;
       result.unknownAt = i;
       return result;
     }
