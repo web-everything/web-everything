@@ -178,6 +178,13 @@ describe('sweepReviewHoldLabels', () => {
     ]));
   });
 
+  it('keeps the normal already-stamped skip out of the results', () => {
+    const restoreStamps = vi.fn(() => [{ num: 6244, action: 'skip', detail: { reason: 'already stamped' } }]);
+    const results = sweepFixture({ repo: 'o/n', provider: provider(), restoreStamps,
+      listPrs: () => [pr(6244, ['review:human'])] });
+    expect(results.some((r) => r.stampRestore)).toBe(false);
+  });
+
   it('contains a throwing restoreStamps seam and still completes label cleanup', () => {
     const p = provider();
     const restoreStamps = vi.fn(() => { throw new Error('stamp history unavailable'); });

@@ -181,6 +181,7 @@ export function sweepReviewHoldLabels({
   if (restoreStamps !== undefined || listPrs === defaultListPrs) {
     try {
       for (const r of (restoreStamps ?? sweepAuthorStamps)({ repo: repoOf(), dryRun, log })) {
+        if (r.action === 'skip') continue; // a stamped PR is the normal case: no result, no log line
         results.push({ num: r.num, stampRestore: r.action, detail: r.detail });
         log(`  PR #${r.num}: author stamp ${r.action} — ${String(r.detail?.reason ?? '').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ')}`);
       }

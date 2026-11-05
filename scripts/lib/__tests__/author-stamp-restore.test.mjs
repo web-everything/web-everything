@@ -44,6 +44,21 @@ describe('planStampRestore — agreement and author-of-record provenance', () =>
     expect(plan({ authorLogin: 'PLATEAU-WORKER' })).toMatchObject({ action: 'restore', id: ID });
   });
 
+  it.each(['app/plateau-worker', 'APP/PLATEAU-WORKER', 'plateau-worker'])(
+    'restores a stamp supplied by the bot author %s', (authorLogin) => {
+      expect(plan({ authorLogin })).toMatchObject({ action: 'restore', id: ID });
+    });
+
+  it.each(['app/other', 'app/', '', 'app/app/plateau-worker', 'plateau-worker[bot]', ' plateau-worker'])(
+    'refuses a missing or nonmatching bot author %s', (authorLogin) => {
+      expectReason(plan({ authorLogin }), 'refuse');
+    });
+
+  it('does not strip app/ from the editor login', () => {
+    expectReason(plan({ authorLogin: 'app/plateau-worker',
+      edits: [edit(buildAuthorActorMarker(ID), 'app/plateau-worker')] }), 'refuse');
+  });
+
   it('allows repeated agreeing stamps, including snapshots by other editors', () => {
     expect(plan({ edits: [...history(), edit(buildAuthorActorMarker(ID), 'chalbert', '2026-10-01T13:00:00Z')] }))
       .toMatchObject({ action: 'restore', id: ID });

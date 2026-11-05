@@ -1,5 +1,6 @@
 import { dispatchReview } from '../../../scripts/operations/review-dispatch.mjs';
 import { readReviewCiGate } from '../../../scripts/lib/review-ci-gate-io.mjs';
+import { sweepAuthorStamps } from '../../../scripts/lib/author-stamp-restore.mjs';
 /**
  * @file skills-src/conveyor/__tests__/review-daemon.test.mjs
  * @description Unit proof of #3876's standalone Review daemon — the pure loop (mirrors #3870's own tests)
@@ -1389,6 +1390,20 @@ describe('buildCliDaemonEffects.onTick — logs the exact pause line when authPa
 });
 
 describe('buildCliDaemonEffects.onTick — logs an accept carry-forward entry from the hold-reconcile sweep (card xu7kxtt)', () => {
+  it('logs stamp restore and refusal outcomes with their reasons and strips terminal controls', () => {
+    const lines = [];
+    const fx = buildCliDaemonEffects({ owner: 'o', log: { error: (l) => lines.push(l) }, reapSessions: () => null, runReview: () => ({}) });
+    fx.onTick({
+      repos: [{ repo: 'o/n' }], reviewsOwed: 0, dispatched: [], failed: [],
+      holdReconcile: [
+        { repo: 'o/n', num: 6244, stampRestore: 'restore', detail: { reason: 'history agrees' } },
+        { repo: 'o/n', num: 7, stampRestore: 'refuse', detail: { reason: 'unreadable\nedit\u001b' } },
+      ],
+    });
+    expect(lines).toContain('review-daemon: o/n#6244 author-stamp restore - history agrees');
+    expect(lines).toContain('review-daemon: o/n#7 author-stamp refuse - unreadable edit ');
+  });
+
   // PR #4631 round 5 (same class as the sweep call): the log line that makes a carry visible was wired with no test, so deleting it
   // left the daemon carrying clearances silently.
   it('logs the carry outcome, its detail and its error, one line per entry', () => {
@@ -1633,7 +1648,8 @@ describe('runReviewTick — the review-hold reconcile sweep (#x01u7az)', () => {
       reconcile: noop, dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
       repo: 'web-everything/web-everything',
     });
-    expect(sweepHumanSurfaceReparkMock).toHaveBeenCalledWith({ repo: 'web-everything/web-everything' });
+    expect(sweepHumanSurfaceReparkMock).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', restoreStamps: sweepAuthorStamps });
+    expect(sweepReviewHoldLabelsMock).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', restoreStamps: sweepAuthorStamps });
     expect(r.holdReconcile.map((h) => h.num)).toEqual([5193, 7]);
     expect(r.holdReconcile[0].repark).toBe('reparked');
   });
@@ -1650,7 +1666,20 @@ describe('runReviewTick — the review-hold reconcile sweep (#x01u7az)', () => {
       reconcile: noop, dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
       holdReconcile, repo: 'plateauapp/plateau-app',
     });
-    expect(holdReconcile).toHaveBeenCalledWith({ repo: 'plateauapp/plateau-app' });
+    expect(holdReconcile).toHaveBeenCalledWith({ repo: 'plateauapp/plateau-app', restoreStamps: sweepAuthorStamps });
+  });
+
+  it('passes the stamp sweep to holdReconcile with shared reads', () => {
+    let listedPrs;
+    const holdReconcile = vi.fn(({ listPrs }) => { listedPrs = listPrs(); return []; });
+    const prs = [{ number: 6244, labels: [] }];
+    runReviewTick({
+      reconcile: noop, dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+      holdReconcile, repo: 'o/n', readPrs: () => prs, readAgents: () => [],
+    });
+    expect(holdReconcile).toHaveBeenCalledWith({ repo: 'o/n', restoreStamps: sweepAuthorStamps,
+      listPrs: expect.any(Function) });
+    expect(listedPrs).toBe(prs);
   });
 
   it('folds a real finding onto the tick result under `holdReconcile`', () => {

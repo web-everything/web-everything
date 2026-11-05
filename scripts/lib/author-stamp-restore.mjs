@@ -35,6 +35,9 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
   if (state === 'CLOSED' || state === 'MERGED') return { action: 'skip', reason: 'PR is not open' };
   if (state !== 'OPEN') return refusal('unreadable PR state');
   if (typeof authorLogin !== 'string' || !authorLogin.trim()) return refusal('missing PR author login');
+  // REST PR authors carry an app/ prefix; GraphQL edit authors do not.
+  const author = authorLogin.toLowerCase().replace(/^app\//, '');
+  if (!author) return refusal('missing PR author login');
   if (!Array.isArray(edits)) return refusal('unreadable edit history');
   if (edits.length > 100) return refusal('history exceeds the snapshot bound; inspect complete GitHub history');
   const ids = new Set();
@@ -66,7 +69,7 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
     }
   }
   if (ids.size !== 1) return refusal('history has no stamp or conflicting stamp ids; inspect GitHub history');
-  if (!oldestMarker || oldest.editor.login.toLowerCase() !== authorLogin.toLowerCase()) {
+  if (!oldestMarker || oldest.editor.login.toLowerCase() !== author) {
     return refusal('no evidence the PR author supplied the stamp in the oldest snapshot; inspect GitHub history');
   }
   return { action: 'restore', reason: 'all historical stamps agree with the oldest author-edited snapshot',

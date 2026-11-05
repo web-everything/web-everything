@@ -3910,3 +3910,12 @@ The `smoke-github-outage` break pins `WE_GH_LIST_BACKOFF_MS=5,5` and
 `WE_GH_JSON_RETRY_BACKOFF_MS=5` before the daemon forks. This preserves exhausted,
 fail-closed reads across reconcile and dispatch smoke passes within the unchanged
 90-second tick bound; shortening only the outer list backoff does not suffice.
+
+## Author-stamp repair daemon wiring
+
+PR author logins from `gh pr view` can carry `app/`, while GraphQL edit editor logins do not.
+Normalize only the PR author by removing one leading `app/` and comparing case-insensitively.
+The review daemon must explicitly pass `restoreStamps: sweepAuthorStamps` to hold reconciliation,
+including with shared PR reads: an injected listing otherwise suppresses the default stamp sweep.
+Keep daemon wiring tests hermetic by inspecting the passed function without invoking it;
+the stamp and hold-reconcile suites exercise the repair through injected IO.
