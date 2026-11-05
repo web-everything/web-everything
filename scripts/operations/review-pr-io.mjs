@@ -435,15 +435,37 @@ export function isPreWriteRefusal(text) {
 /**
  * THE SINKS, bound to a repo root and an output channel.
  *
- * @param {{root?: string, out?: (line: string) => void, runNode?: Function, postComment?: Function}} [o] -
+ * @param {{root?: string, out?: (line: string) => void, runNode?: Function, postComment?: Function, json?: boolean}} [o] -
  *   `runNode` is the injectable subprocess runner (`(argv) => stdout`), so the label sink is testable without
  *   `gh`; `postComment` is the injectable `(repo, pr, body) => void` the `advise` sink posts through (#xlw02hw),
- *   so it too is testable without `gh` — defaults to `createGhProvider().postComment`.
+ *   so it too is testable without `gh` — defaults to `createGhProvider().postComment`. `json` is STDOUT-PURITY
+ *   FOR THE NOTICE SINK ONLY (see the default `out` below) — a caller building sinks for a `--json` invocation
+ *   passes `json: true` so the sink's default writer moves off stdout; every other sink here is unaffected
+ *   because none of them write to stdout at all.
  * @returns {Record<string, Function>} effect type → `async (payload, ctx) => result`.
  */
 export function createReviewPrSinks({
   root = REPO_ROOT,
-  out = (line) => process.stdout.write(`${line}\n`),
+  // #xstdout-json — A `--json` CALLER WANTS STDOUT TO BE ONE PARSEABLE DOCUMENT, END TO END. The `NOTICE`
+  // sink below is the one sink in this file that writes a human-readable line through `out`, and until now it
+  // did so UNCONDITIONALLY to stdout — so `review-loop-cli.mjs --json` (and `run.mjs review-pr --json` on its
+  // recording call) could print `"PR o/n#7 — human review …"` followed by the real JSON on the very same
+  // stream. A strict `JSON.parse` of that combined stdout throws before it ever sees the JSON, which is exactly
+  // what turned a clean review into a reported `blocked-on-infra` for the first non-agentic caller of this CLI
+  // (`review-dispatch-wrapper.mjs`) — every prior caller was an LLM agent reading its own output, which can look
+  // past an extra text line a strict parser cannot.
+  //
+  // `json` decides WHERE the default writer below sends a line; it decides nothing else, and every other sink
+  // in this file is untouched because none of them writes to stdout. The flag is derived from the INVOCATION's
+  // own argv by the caller (`hasJsonFlag`, `we:scripts/operations/cli-adapter.mjs`) before this builder runs —
+  // this function does not re-parse argv itself, so there is exactly one place that decides what `--json` means.
+  json = false,
+  // STDERR, NOT SILENCE, when `json` is set: the notice still has to reach a human somewhere. An operator
+  // running the unattended CLI interactively (or piping only stdout for its JSON) still sees the notice on
+  // their terminal; a machine capturing stdout — `JSON.parse(execFileSync(...))`, `review-dispatch-wrapper.mjs`
+  // — sees only the JSON it asked for. `process.stderr.write` is synchronous in Node (`we:scripts/lib/
+  // write-all-sync.mjs`'s own header), so this needs none of that module's drain-before-exit machinery either.
+  out = (line) => (json ? process.stderr : process.stdout).write(`${line}\n`),
   runNode = (argv, opts) => execFileSync(process.execPath, argv, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, ...opts }),
   postComment = createGhProvider().postComment,
 } = {}) {

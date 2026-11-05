@@ -48,7 +48,7 @@
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { driveRun, outcomePayload, parseOperationArgv, renderOutcome } from './cli-adapter.mjs';
+import { driveRun, hasJsonFlag, outcomePayload, parseOperationArgv, renderOutcome } from './cli-adapter.mjs';
 import { startRun, runStatus } from './engine.mjs';
 import { createFileRunStore, newRunId } from './run-store.mjs';
 import { resolveOperation, createCliJudgeFactory } from './run.mjs';
@@ -271,7 +271,10 @@ export async function runReviewLoopOnce({
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
 if (IS_CLI) {
   const argv = process.argv.slice(2);
-  const { declaration, registry, sinks } = resolveOperation(REVIEW_LOOP_OP);
+  // `argv` is known before the declaration `resolveOperation` binds sinks to — see `hasJsonFlag`'s doc
+  // (`we:scripts/operations/cli-adapter.mjs`). A `--json` invocation must not have this file's own notice
+  // effect (fired mid-run, well before the final JSON line below) land on the same stdout stream.
+  const { declaration, registry, sinks } = resolveOperation(REVIEW_LOOP_OP, { json: hasJsonFlag(argv) });
   runReviewLoopOnce({
     declaration,
     registry,

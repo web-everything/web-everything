@@ -29,7 +29,7 @@ import { fileURLToPath } from 'node:url';
 import { createRegistry } from './registry.mjs';
 import { createFileRunStore, newRunId } from './run-store.mjs';
 import { createFileCallLogStore } from './call-log-store.mjs';
-import { createDefaultJudge, runOperationCli, buildCliSpec } from './cli-adapter.mjs';
+import { createDefaultJudge, runOperationCli, buildCliSpec, hasJsonFlag } from './cli-adapter.mjs';
 import { reviewPrOperation, REVIEW_PR_OP } from './review-pr.mjs';
 import { createReviewPrReader, createReviewPrSinks, PR_VIEW_FIELDS, prViewFileName } from './review-pr-io.mjs';
 import { stagePrViewOperation, STAGE_PR_VIEW_OP } from './stage-pr-view.mjs';
@@ -84,9 +84,14 @@ import { writeAllSync } from '../lib/write-all-sync.mjs';
  * declaration is what {@link ./http-adapter.mjs} derives a route table from, with no third entry anywhere.
  */
 export const OPERATIONS = Object.freeze({
-  [REVIEW_PR_OP]: () => ({
+  // `json` is the ONE operation-table entry that reads its `resolveOperation(name, opts)` opts at all — every
+  // other builder below still takes none, and passing the extra argument to a zero-arg arrow is a harmless
+  // no-op for them. See `createReviewPrSinks`'s own `json` doc (`we:scripts/operations/review-pr-io.mjs`) for
+  // WHY this exists: a `--json` caller's stdout must stay pure JSON even when the `record` step's notice
+  // effect fires mid-run.
+  [REVIEW_PR_OP]: ({ json = false } = {}) => ({
     declaration: reviewPrOperation({ readPr: createReviewPrReader() }),
-    sinks: createReviewPrSinks(),
+    sinks: createReviewPrSinks({ json }),
   }),
   // backlog/xzdi27a-* — the sibling of `review-pr` for a BACKLOG CARD instead of a PR diff (no `gh`, no diff,
   // no confirm suspend: a prep review's verdict is a note + a commit, applied in one CLI call end to end).
@@ -263,8 +268,16 @@ export function createCliJudgeFactory({ env = process.env, factory = createDefau
   });
 }
 
-/** Build an isolated registry plus the bindings for ONE named operation. Throws on an unknown name. */
-export function resolveOperation(name) {
+/**
+ * Build an isolated registry plus the bindings for ONE named operation. Throws on an unknown name.
+ *
+ * @param {string} name
+ * @param {{json?: boolean}} [opts] - passed straight through to the table entry's builder. Every builder
+ *   except `REVIEW_PR_OP`'s ignores it today (see the table above); it exists here so a CALLER can tell a
+ *   builder what its OWN argv already says before the declaration it binds to is resolved — `json` is the one
+ *   case that needs this (stdout purity under `--json`, `we:scripts/operations/review-pr-io.mjs`).
+ */
+export function resolveOperation(name, opts = {}) {
   // `Object.hasOwn`, never a bare bracket read: `OPERATIONS['toString']` on a normal-prototype object returns an
   // INHERITED function, which a `typeof … === 'function'` test then accepts as a real operation. Same hazard the
   // jury enums guard with null-prototype tables (`we:scripts/lib/jury-core.mjs`, #xdompzx).
@@ -274,7 +287,7 @@ export function resolveOperation(name) {
       `operations: no operation named ${JSON.stringify(name)} (known: ${Object.keys(OPERATIONS).sort().join(', ')})`,
     );
   }
-  const { declaration, sinks } = build();
+  const { declaration, sinks } = build(opts);
   const registry = createRegistry();
   registry.register(declaration);
   return { declaration, registry, sinks };
@@ -301,7 +314,9 @@ if (IS_CLI) {
   }
   let resolved;
   try {
-    resolved = resolveOperation(name);
+    // `rest` is this invocation's OWN argv, known before the declaration is — see `hasJsonFlag`'s doc for why
+    // a full `parseOperationArgv` pass cannot run yet at this point.
+    resolved = resolveOperation(name, { json: hasJsonFlag(rest) });
   } catch (e) {
     writeAllSync(1, `error: ${String(e.message ?? e)}\n\n${rootUsage()}\n`);
     process.exit(2);

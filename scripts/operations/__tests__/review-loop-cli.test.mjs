@@ -19,13 +19,14 @@
  *      have. The SAME verdict on a `review:human` PR still parks (property 3's actor refusal fires first).
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 
 import { createRegistry } from '../registry.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { judgeOutcome } from '../cli-adapter.mjs';
 import { REVIEW_EFFECTS, reviewPrOperation } from '../review-pr.mjs';
 import { runReviewLoopOnce } from '../review-loop-cli.mjs';
+import { createReviewPrSinks } from '../review-pr-io.mjs';
 
 const NET_PATHS = ['scripts/operations/review-pr.mjs'];
 
@@ -181,6 +182,69 @@ describe('runReviewLoopOnce — the loop field (converged/in-progress/exhausted/
     });
     const payload = JSON.parse(out.lines[0]);
     expect(payload.verdict.loop).toEqual({ outcome: 'in-progress', round: 1, cap: 5, why: 'round 1 of 5 returned `changes`' });
+  });
+});
+
+/**
+ * THE GAP THIS PINS. Every `--json` test above uses `recordingSinks` — a stub that just records the payload it
+ * was called with — for EVERY effect, `REVIEW_EFFECTS.NOTICE` included. So none of them ever exercises the
+ * REAL notice sink's write, and `out.lines[0]` (the only thing they `JSON.parse`) is only ever the final
+ * rendered payload `runReviewLoopOnce` returns — never the actual, ordered bytes that would land on a real
+ * process's stdout, which is the notice sink's own write (mid-run, inside `driveRun`) FOLLOWED BY the CLI's
+ * `writeAllSync(1, …)` of that final line (`we:scripts/operations/review-loop-cli.mjs`'s `IS_CLI` block). A
+ * caller doing a strict `JSON.parse` of the WHOLE captured stdout — exactly what a mechanical, non-agentic
+ * consumer does, and exactly what an LLM agent reading its own output does not need to — never had a test.
+ *
+ * These two tests wire in the REAL `we:scripts/operations/review-pr-io.mjs#createReviewPrSinks` notice sink
+ * (every other effect stays the cheap `recordingSinks` stub — no `gh`, no ledger, no disk) and reconstruct the
+ * exact bytes a real `--json` invocation would put on fd 1: whatever the notice sink wrote to `process.stdout`
+ * during the run, followed by the final rendered line. The first pins the FIX (`json: true` → stderr, stdout
+ * stays pure JSON); the second is the harness's own self-check — built with the sink's OLD, un-json-aware
+ * default (`json: false`) — proving this file would actually have failed red before the fix, which is the gap
+ * that let the bug ship in the first place.
+ */
+describe('review-loop-cli.mjs --json stdout purity — the notice effect must not land on stdout', () => {
+  function sinksWithRealNotice(json) {
+    return { ...recordingSinks([]), [REVIEW_EFFECTS.NOTICE]: createReviewPrSinks({ json })[REVIEW_EFFECTS.NOTICE] };
+  }
+
+  async function runCapturingStdio(sinks) {
+    const { declaration, registry } = registryFor({});
+    const store = createMemoryRunStore();
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => { stdoutChunks.push(String(chunk)); return true; });
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => { stderrChunks.push(String(chunk)); return true; });
+    try {
+      const out = await runReviewLoopOnce({
+        declaration, registry, argv: [...BASE_ARGV, '--json'], store, sinks,
+        makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => 'r-json-notice-purity',
+        appendLearning: () => { throw new Error('must not be called — nothing to file when accept lands mechanically'); },
+      });
+      // The exact bytes a real invocation puts on fd 1: the notice sink's own write(s), THEN the CLI's final
+      // `writeAllSync(1, \`${lines.join('\n')}\n\`)` — see the IS_CLI block this mirrors.
+      const combinedStdout = `${stdoutChunks.join('')}${out.lines.join('\n')}\n`;
+      return { out, stdoutChunks, stderrChunks, combinedStdout };
+    } finally {
+      stdoutSpy.mockRestore();
+      stderrSpy.mockRestore();
+    }
+  }
+
+  it('with the fix (json:true passed to createReviewPrSinks), stdout is ONE parseable JSON document end to end, even though the notice effect fires mid-run', async () => {
+    const { out, stdoutChunks, stderrChunks, combinedStdout } = await runCapturingStdio(sinksWithRealNotice(true));
+    expect(out.code).toBe(0);
+    // The notice really did fire — on stderr, never stdout — or this test would prove nothing.
+    expect(stderrChunks.join('')).toMatch(/^PR chalbert\/web-everything#1234 — human review accepted/);
+    expect(stdoutChunks).toEqual([]);
+    expect(() => JSON.parse(combinedStdout)).not.toThrow();
+    expect(JSON.parse(combinedStdout).verdict.loop.outcome).toBe('converged');
+  });
+
+  it('self-check: with the sink\'s OLD un-json-aware default (json:false), the notice pollutes stdout and JSON.parse throws — proves this file would have caught the original bug', async () => {
+    const { stdoutChunks, combinedStdout } = await runCapturingStdio(sinksWithRealNotice(false));
+    expect(stdoutChunks.length).toBeGreaterThan(0);
+    expect(() => JSON.parse(combinedStdout)).toThrow();
   });
 });
 

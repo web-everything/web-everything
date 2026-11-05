@@ -255,6 +255,29 @@ export function coerceInputValue(type, raw) {
 }
 
 /**
+ * DOES THIS ARGV CARRY `--json`? A tiny, standalone slice of the SAME rule `parseOperationArgv` uses for the
+ * `json` control flag below (a bare `--json` or a `--json=…` token), but usable BEFORE a declaration exists —
+ * `we:scripts/operations/run.mjs` and `we:scripts/operations/review-loop-cli.mjs` both need to know whether an
+ * invocation asked for `--json` while they are still BUILDING the sinks that `resolveOperation` hands back
+ * (`createReviewPrSinks`'s `json` option, `we:scripts/operations/review-pr-io.mjs`), which is before the
+ * declaration those sinks bind to is even resolved — so `parseOperationArgv`'s full pass, which needs the
+ * declaration for its `spec.fields` lookups, cannot run yet. PURE, and intentionally narrower than a full
+ * parse: it answers exactly one question and refuses nothing, because refusing a malformed flag here would be
+ * a SECOND place that call ever gets rejected — `parseOperationArgv` already owns that.
+ *
+ * @param {string[]} [argv]
+ * @returns {boolean}
+ */
+export function hasJsonFlag(argv = []) {
+  return argv.some((token) => {
+    if (typeof token !== 'string' || !token.startsWith('--')) return false;
+    const eq = token.indexOf('=');
+    const name = eq === -1 ? token.slice(2) : token.slice(2, eq);
+    return name === 'json';
+  });
+}
+
+/**
  * PARSE argv against a declaration. PURE — no process, no env. Unknown flags are REFUSED (the declaration is
  * the whole surface, and `validateInput` already fails closed in both directions; this makes the message
  * arrive before a run exists).
