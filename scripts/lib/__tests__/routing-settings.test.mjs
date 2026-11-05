@@ -5,7 +5,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readDeclaredSettings } from '../settings-files.mjs';
-import { resolveDispatchRoute } from '../dispatch-routing-policy-io.mjs';
+import { resolveDispatchRoute, readRoutingPolicy } from '../dispatch-routing-policy-io.mjs';
 import { resolveFixExecutorChain } from '../fix-executor-chain.mjs';
 import { inheritedRoutingPolicy } from './inherited-routing-policy.mjs';
 
@@ -83,6 +83,36 @@ describe('routing settings', () => {
     for (const agent of [' codex ', 'CODEX', 'Codex\n']) {
       expect(resolveDispatchRoute({ kind: 'build', deliveryAgent: agent }, {}).outcome).toBe('refused');
     }
+  });
+  it('kind is normalised once: a padded or upper-cased build kind is refused and held exactly like the plain one', () => {
+    const plain = resolveDispatchRoute({ kind: 'build', ...SCOPED, deliveryAgent: 'codex' }, {});
+    expect(plain.outcome).toBe('refused');
+    for (const kind of [' build ', 'BUILD', 'build\n', '\tBuild']) {
+      const r = resolveDispatchRoute({ kind, ...SCOPED, deliveryAgent: 'codex' }, {});
+      expect(r.outcome, JSON.stringify(kind)).toBe('refused');
+      expect(r.refusal, JSON.stringify(kind)).toBe(plain.refusal);
+    }
+    for (const kind of [' fix ', 'CI-HEAL', ' prepare ', 'Design\n']) {
+      expect(availabilityFor({ kind, ...SCOPED })?.codex, JSON.stringify(kind)).toMatch(/routing\.builder=claude/);
+      // Both layers see the same kind: the router is handed the normalised kind, not the padded one.
+      expect(state.seen.at(-1).kind, JSON.stringify(kind)).toBe(kind.trim().toLowerCase());
+    }
+  });
+  it('the codex hold never strands a ci-heal while native Claude is available; it still refuses when native Claude is held too', () => {
+    const dispatch = { kind: 'ci-heal', scopePaths: ['we:scripts/example.mjs'], reason: 'red-ci' };
+    const options = { routingPolicy: readRoutingPolicy(), scorecards: [], ciHealAvailability: { 'antigravity-claude': 'quota held' } };
+    const r = resolveDispatchRoute(dispatch, options);
+    expect(r.outcome, r.refusal).not.toBe('refused');
+    expect(r.probationWorker?.provider ?? null).not.toBe('codex');
+    expect(r.auditTrail.some(row => row.criterion === 'ci-heal-native-claude-fallback')).toBe(true);
+    const nativeHeldAvailability = resolveDispatchRoute(dispatch, { ...options, ciHealAvailability: { 'antigravity-claude': 'quota held', claude: 'quota held' } });
+    expect(nativeHeldAvailability.outcome).toBe('refused');
+    const resetsAt = new Date(Date.now() + 3_600_000).toISOString();
+    const nativeHeldScore = resolveDispatchRoute(dispatch, { ...options, scorecards: [{ provider: 'claude', status: 'quota-exhausted', quotaResetsAt: resetsAt }] });
+    expect(nativeHeldScore.outcome).toBe('refused');
+    // builder=codex is unchanged: the roster-exhausted refusal stays (no native fallback without the claude builder).
+    settingsDir({ 'routing.json': { routing: { builder: 'codex' } } });
+    expect(resolveDispatchRoute(dispatch, { ...options, ciHealAvailability: { 'antigravity-claude': 'held', 'antigravity-gemini': 'held', codex: 'held' } }).outcome).toBe('refused');
   });
   it('a malformed routing.json is surfaced by the declared reader and resolves to claude', () => {
     const dir = mkdtempSync(join(tmpdir(), 'route-'));

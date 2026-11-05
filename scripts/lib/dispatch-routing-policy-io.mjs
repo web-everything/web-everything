@@ -61,6 +61,12 @@ export function resolvePolicyModel(provider, model, policy = readRoutingPolicy()
   return resolvePureModel(provider, model, policy);
 }
 export function resolveDispatchRoute(dispatch, options = {}) {
+  // Normalise the kind once and hand the same value to the router, so a padded or upper-cased kind can neither
+  // slip past the build-kind hold here nor be read as a different kind there.
+  if (typeof dispatch?.kind === 'string') {
+    const kind = dispatch.kind.trim().toLowerCase();
+    if (kind !== dispatch.kind) dispatch = { ...dispatch, kind };
+  }
   // Production callers already supply the unprojected scorecard snapshot. Derive holds before the
   // evidence router removes quota fields; neither a backend nor its checker may run while held.
   const rawRecords = Array.isArray(options.scorecards) ? options.scorecards : options.scorecards?.records;
@@ -83,7 +89,13 @@ export function resolveDispatchRoute(dispatch, options = {}) {
   if (claudeBuilds && !explicitCodex && !availability.codex) {
     availability.codex = 'routing.builder=claude: Codex is reserved for audit';
   }
-  return decideDispatchRoute(dispatch, { ...options, availability, routingPolicy: options.routingPolicy ?? readRoutingPolicy() });
+  // builder=claude asks for Claude, so a ci-heal whose probation roster is all held runs on native Claude instead of
+  // being refused — unless native Claude is held too (from the caller or from a quota scorecard).
+  const ciHealNativeHold = dispatch?.kind === 'ci-heal'
+    ? (availability.claude || options.ciHealAvailability?.claude || providerQuotaHold(records, 'claude', options.now ?? Date.now()) || null)
+    : null;
+  const ciHealNativeFallback = claudeBuilds && dispatch?.kind === 'ci-heal' && !ciHealNativeHold;
+  return decideDispatchRoute(dispatch, { ...options, availability, ciHealNativeFallback, routingPolicy: options.routingPolicy ?? readRoutingPolicy() });
 }
 export function routingPolicyEnv() {
   return { WE_DISPATCH_ROUTING_SNAPSHOT: JSON.stringify(readRoutingPolicy()) };

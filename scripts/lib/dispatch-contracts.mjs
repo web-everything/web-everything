@@ -1373,8 +1373,13 @@ export function decideDispatchRoute(dispatch = {}, options = {}) {
       scorecards: routingRecords(options.scorecards), vetoes: criticalMissesFor(options.scorecards ?? [], record.taskType),
       availability });
     record.auditTrail.push(...picked.auditTrail);
-    if (!picked.worker) return { ...record, probationWorker: null, outcome: 'refused', refusal: picked.reason };
-    record.probationWorker = picked.worker;
+    if (picked.worker) record.probationWorker = picked.worker;
+    // routing.builder=claude (resolveDispatchRoute) asks for native Claude when the whole roster is held; the caller
+    // has already checked native Claude is not held. A held native pool is re-checked here and still refuses.
+    else if (options.ciHealNativeFallback === true && !availability.claude) {
+      record.probationWorker = null;
+      record.auditTrail.push({ criterion: 'ci-heal-native-claude-fallback', result: 'native-claude', dataConsulted: picked.reason, reasoning: 'routing.builder=claude: no probation worker is eligible and native Claude is not held' });
+    } else return { ...record, probationWorker: null, outcome: 'refused', refusal: picked.reason };
   }
   // Every policy-routed kind needs a verdict, including roles and future operation names.
   // Keep the inherited evidence router unchanged when no explicit policy route exists.
