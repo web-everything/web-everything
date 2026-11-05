@@ -2,7 +2,8 @@
  * @file Event-driven enqueue eligibility, policy resolution, debounce, and injected fast-drain runs.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import ts from 'typescript';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
@@ -718,6 +719,26 @@ describe('readPendingChangePaths', () => {
     const diffs = calls.filter((args) => args[0] === 'diff');
     expect(diffs).toHaveLength(2);
     expect(diffs.every((args) => args.includes('--no-renames'))).toBe(true);
+  });
+  it('real git: a README-only tip adopted earlier, then advanced with a protected change, is inspected despite its old registration', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pending-change-'));
+    const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
+    const git = (...args) => execFileSync('git', args, { cwd: dir, env, encoding: 'utf8' });
+    try {
+      git('init', '-q', '-b', 'main');
+      mkdirSync(join(dir, 'scripts/lib'), { recursive: true });
+      writeFileSync(join(dir, 'README.md'), 'a'); writeFileSync(join(dir, PROTECTED), 'x');
+      git('add', '-A'); git('commit', '-qm', 'base');
+      git('checkout', '-q', '-b', 'lane/existing'); writeFileSync(join(dir, 'README.md'), 'b'); git('commit', '-qam', 'readme only');
+      git('checkout', '-q', 'main'); git('merge', '-q', '--ff-only', 'lane/existing'); // HEAD adopted the README-only tip
+      git('update-ref', 'refs/remotes/origin/main', 'HEAD'); git('update-ref', 'refs/remotes/origin/lane/existing', 'HEAD');
+      const probe = () => readPendingChangePaths({ root: dir, cwd: '/elsewhere', execFileSyncImpl: execFileSync, overlays: () => [{ ref: 'lane/existing', addedAt: '2026-11-04T00:00:00Z' }],
+        rebuildState: () => ({ adopted: { at: '2026-11-05T00:00:00Z', applied: [{ ref: 'lane/existing', sha: 'd'.repeat(40) }] } }) });
+      expect(probe()).toMatchObject({ ok: true, paths: [] });
+      git('checkout', '-q', 'lane/existing'); writeFileSync(join(dir, PROTECTED), 'y'); git('commit', '-qam', 'protected change'); // the same branch advances
+      git('update-ref', 'refs/remotes/origin/lane/existing', 'HEAD'); git('checkout', '-q', 'main');
+      expect(probe()).toMatchObject({ ok: true, paths: [PROTECTED] });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('fails closed on a git error or an unsafe ref', () => {
     expect(readPendingChangePaths({ ...base, execFileSyncImpl: () => { throw new Error('bad object'); } })).toMatchObject({ ok: false });
