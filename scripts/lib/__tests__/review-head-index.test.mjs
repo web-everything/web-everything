@@ -204,7 +204,7 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     expect(lines).toHaveLength(24);
     expect(Object.keys(fromMap.map['o/r#7'].history)).toHaveLength(24);
     writeFileSync(headIndexPaths(dir).map, '{{');
-    expect(readHeadIndex({ dir }).map).toEqual(fromMap.map);
+    expect(readHeadIndex({ dir, keepPerPr: 100 }).map).toEqual(fromMap.map); // the writers' keepPerPr: replay applies the same bound
   }, 60000);
   it('a stale lock (dead owner or old) is taken over; a live fresh lock blocks until timeout', () => {
     const { lock } = headIndexPaths(dir);
@@ -393,6 +393,59 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     expect(stolen).toBe(true);
     expect(readFileSync(log, 'utf8')).toBe(logBefore);
     expect(readFileSync(map, 'utf8')).toBe(mapBefore);
+  });
+  it('rebuild from an uncompacted log honors keepPerPr: evicted history is not resurrected and the map equals the published one', () => {
+    for (let i = 1; i <= 6; i++) rec({ head: H(i), netPatchHash: `p${i}`, at: `2026-11-04T10:00:0${i}Z`, keepPerPr: 3 });
+    const { map: mp } = headIndexPaths(dir);
+    const published = JSON.parse(readFileSync(mp, 'utf8')).map;
+    expect(Object.keys(published['o/r#7'].history).sort()).toEqual(['p4', 'p5', 'p6']);
+    writeFileSync(mp, '{{');                                   // the cache is lost: the reader rebuilds from the log
+    const rebuilt = readHeadIndex({ dir, keepPerPr: 3 });      // an unreadable cache carries no keepPerPr: the caller's (settings) value applies
+    expect(rebuilt.rebuilt).toBe(true);
+    expect(Object.keys(rebuilt.map['o/r#7'].history).sort()).toEqual(['p4', 'p5', 'p6']);
+    expect(rebuilt.map).toEqual(published);
+    expect(headReviewOwed({ index: rebuilt, repo: 'o/r', pr: 7, head: H(9), netPatchHash: 'p1' }).owed).toBe(true); // p1 stays evicted
+    // a stale map (crash between append and rename) still carries the writer's keepPerPr for the rebuild
+    writeFileSync(mp, JSON.stringify({ version: 2, logHash: 'stale', keepPerPr: 3, map: {} }));
+    expect(readHeadIndex({ dir }).map).toEqual(published);
+  });
+  it('keyless current record: replay of a compacted log equals the published map and stays within retained history', () => {
+    // out-of-order timestamps: the keyless CURRENT record (latest written) is the oldest by `at`, so keepPerPr evicts its history entry
+    const base = { keepPerPr: 2, logMaxLines: 3 };
+    rec({ ...base, head: H(1), netPatchHash: 'p1', at: '2026-11-04T10:00:05Z' });
+    rec({ ...base, head: H(2), netPatchHash: 'p2', at: '2026-11-04T10:00:06Z' });
+    rec({ ...base, head: H(3), netPatchHash: 'p3', at: '2026-11-04T10:00:07Z' });
+    rec({ ...base, head: H(4), netPatchHash: null, at: '2026-11-04T10:00:01Z' }); // keyless, oldest, current -> compacts
+    const { map: mp, log } = headIndexPaths(dir);
+    const published = JSON.parse(readFileSync(mp, 'utf8')).map;
+    expect(published['o/r#7']).toMatchObject({ lastReviewedHead: H(4), netPatchHash: null });
+    expect(Object.keys(published['o/r#7'].history).length).toBeLessThanOrEqual(2);
+    expect(readFileSync(log, 'utf8').trim().split('\n').length).toBeLessThanOrEqual(3); // it did compact
+    writeFileSync(mp, '{{');
+    const rebuilt = readHeadIndex({ dir, keepPerPr: 2 });
+    expect(rebuilt.rebuilt).toBe(true);
+    expect(rebuilt.map).toEqual(published);
+    expect(Object.keys(rebuilt.map['o/r#7'].history).length).toBeLessThanOrEqual(2);
+    // and a keyless current that is NOT evicted replays exactly too
+    rec({ ...base, head: H(5), netPatchHash: null, at: '2026-11-04T10:00:09Z' });
+    const published2 = JSON.parse(readFileSync(mp, 'utf8')).map;
+    writeFileSync(mp, '{{');
+    expect(readHeadIndex({ dir, keepPerPr: 2 }).map).toEqual(published2);
+  });
+  it('stat failures fail closed: a non-ENOENT stat error on the map (log missing) or on the log is an error, never an empty index', () => {
+    const { log, map: mp } = headIndexPaths(dir);
+    nodeFs.mkdirSync(dir, { recursive: true });
+    const eacces = () => Object.assign(Error('EACCES'), { code: 'EACCES' });
+    const statFail = target => ({ ...nodeFs, statSync: (p, ...a) => { if (p === target) throw eacces(); return nodeFs.statSync(p, ...a); } });
+    expect(readHeadIndex({ dir })).toEqual({ ok: true, map: {} });                          // genuinely absent: empty
+    writeFileSync(mp, JSON.stringify({ version: 2, logHash: 'x', map: {} }));
+    expect(readHeadIndex({ dir })).toMatchObject({ ok: false });                           // map without a log: not a state we write
+    rmSync(mp);
+    expect(readHeadIndex({ dir, fs: statFail(mp) })).toMatchObject({ ok: false, reason: 'index-unreadable' }); // log absent, map stat EACCES
+    expect(headReviewOwed({ index: readHeadIndex({ dir, fs: statFail(mp) }), repo: 'o/r', pr: 7, head: H(1) })).toMatchObject({ owed: null, held: true });
+    expect(readHeadIndex({ dir, fs: statFail(log) })).toMatchObject({ ok: false });        // log stat EACCES
+    expect(() => rec({ fs: statFail(mp) })).toThrow(/unreadable/);                          // and a write refuses
+    expect(existsSync(log)).toBe(false);
   });
   it('recordReview refuses an unreadable existing index and leaves the log and map bytes unchanged', () => {
     rec();

@@ -77,21 +77,30 @@ export function applyRecord(map, rec, keepPerPr) {
 const validEntry = e => e && SHA.test(e.lastReviewedHead ?? '') && typeof e.verdict === 'string' && e.verdict && Number.isFinite(Date.parse(e.at))
   && e.history && typeof e.history === 'object' && Object.values(e.history).every(h => h && SHA.test(h.head ?? '') && typeof h.verdict === 'string' && h.verdict && Number.isFinite(Date.parse(h.at)));
 const validMap = m => m && typeof m === 'object' && Object.values(m).every(validEntry);
-const parseLog = text => {
+// Replay applies the SAME keepPerPr the writer used, so a rebuilt map equals the published one: evicted history is not
+// resurrected, and a compacted log (older rows then the PR's current record last, keyed or keyless) replays to the same map.
+const parseLog = (text, keepPerPr) => {
   const lines = text.split('\n').filter(l => l.trim());
   const map = {};
   for (const l of lines) {
     const rec = JSON.parse(l);
     if (!validRecord(rec)) throw Error('invalid log record');
-    applyRecord(map, rec, Infinity);
+    applyRecord(map, rec, keepPerPr);
   }
   return { map, lines: lines.length };
+};
+/** keepPerPr for a rebuild: explicit option, else the value the last published map recorded, else the resolved setting. */
+const rebuildKeep = (explicit, stored) => {
+  if (posInt(explicit)) return explicit;
+  if (posInt(stored?.keepPerPr)) return stored.keepPerPr;
+  try { const k = resolveHeadIndexSettings().keepPerPr; if (posInt(k)) return k; } catch { /* fall through to the standard */ }
+  return HEAD_INDEX_STANDARD.keepPerPr;
 };
 const hashText = text => createHash('sha256').update(text).digest('hex');
 const size = (fs, p) => { try { return fs.statSync(p).size; } catch (e) { if (e?.code === 'ENOENT') return null; throw e; } };
 
 /** Read the index. Uses the cached map only when its log content hash matches; rebuilds from the log otherwise. Never throws. */
-export function readHeadIndex({ dir = defaultHeadIndexDir(), fs = nodeFs } = {}) {
+export function readHeadIndex({ dir = defaultHeadIndexDir(), fs = nodeFs, keepPerPr } = {}) {
   try {
     const { log, map: mapPath } = headIndexPaths(dir);
     const logSize = size(fs, log);
@@ -106,10 +115,11 @@ export function readHeadIndex({ dir = defaultHeadIndexDir(), fs = nodeFs } = {})
     const text = raw.toString('utf8');
     const logHash = hashText(raw);
     if (stored && stored.map && typeof stored.map === 'object' && stored.version === MAP_VERSION && stored.logHash === logHash && validMap(stored.map)) return { ok: true, map: stored.map };
-    return { ok: true, map: parseLog(text).map, rebuilt: true };
+    return { ok: true, map: parseLog(text, rebuildKeep(keepPerPr, stored)).map, rebuilt: true };
   } catch { return { ok: false, reason: 'index-unreadable' }; }
 }
-const existsSafe = (fs, p) => { try { fs.statSync(p); return true; } catch { return false; } };
+// Only ENOENT means absent; any other stat failure (EACCES, EIO, ...) throws so the caller fails closed instead of reading an empty index.
+const existsSafe = (fs, p) => { try { fs.statSync(p); return true; } catch (e) { if (e?.code === 'ENOENT') return false; throw e; } };
 
 // Durable: write, fsync, close. The rename happens only after the temp file is flushed.
 const durable = (fs, path, flag, text) => {
@@ -201,7 +211,7 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
   fs.mkdirSync(dir, { recursive: true });
   return withHeadIndexLock(dir, fence => {  // read, append, compact and publish are ONE transaction
     const { log, map: mapPath, tmp } = headIndexPaths(dir);
-    const current = readHeadIndex({ dir, fs });
+    const current = readHeadIndex({ dir, fs, keepPerPr });
     if (!current.ok) throw Error('review-head-index: existing index unreadable; refusing to write');
     fence();
     const line = `${JSON.stringify(rec)}\n`;
@@ -244,7 +254,7 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
       lines = compact.length;
     }
     fenced();
-    atomicWrite(fs, mapPath, tmp, JSON.stringify({ version: MAP_VERSION, logHash: hashText(fs.readFileSync(log)), map }));
+    atomicWrite(fs, mapPath, tmp, JSON.stringify({ version: MAP_VERSION, logHash: hashText(fs.readFileSync(log)), keepPerPr, map }));
     return { ok: true, lines };
   }, { fs });
 }
