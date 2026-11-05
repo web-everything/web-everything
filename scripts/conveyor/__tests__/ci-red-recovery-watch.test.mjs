@@ -341,15 +341,20 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
     expect(refresh).toHaveBeenCalledTimes(2); // 60 s grace: attempts at +0 s and +35 s, stopped at +70 s
   });
 
-  it('instant deferrals are bounded by the attempt cap (twice the per-tick cap), not unlimited', () => {
-    const prs = Array.from({ length: 10 }, (_, i) => ({ ...PR_2635, number: 2800 + i, headRefName: `lane/a${i}` }));
-    const refresh = vi.fn(() => ({ deferred: true, ok: false, error: 'not same-repo' }));
+  // Self-review of the round-3 repair: a count cap on deferrals let a stable run of instant (free) deferrers at the
+  // head of the queue starve every later PR on every tick. Instant deferrals cost no time, so they are never capped.
+  it('a long run of instant deferrals at the head of the queue never starves the refreshable PR behind them', () => {
+    const prs = Array.from({ length: 21 }, (_, i) => ({ ...PR_2635, number: 2800 + i, headRefName: `lane/a${i}` }));
+    const refresh = vi.fn((branch) => (branch === 'lane/a20' ? { ok: true, action: 'rebased' } : { deferred: true, ok: false, error: 'not same-repo' }));
+    const postComment = vi.fn();
     const result = sweepCiRedRecovery({
       readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
-      refresh, postComment: vi.fn(), apply: true, maxApplyPerTick: 2,
+      refresh, postComment, apply: true, maxApplyPerTick: 2,
     });
-    expect(refresh).toHaveBeenCalledTimes(4);
-    expect(result.applied.filter((a) => a.budgetExhausted)).toHaveLength(6);
+    expect(refresh).toHaveBeenCalledTimes(21);
+    expect(postComment).toHaveBeenCalledTimes(1);
+    expect(result.applied.at(-1)).toMatchObject({ prNumber: 2820, ok: true, action: 'rebased' });
+    expect(result.applied.some((a) => a.budgetExhausted)).toBe(false);
   });
 
   it('a failed refresh whose claim is found held afterwards is a free deferral too', () => {
