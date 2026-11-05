@@ -655,6 +655,40 @@ describe('local shard wait budget (verify.localShardWaitMs)', () => {
     expect(waitFlag((await run({ env: { WE_VERIFY_LOCAL_SHARD_WAIT_MS: 'soon' } })).calls[0])).toBe('--wait-ms=900000');
     expect(waitFlag((await run({ env: { WE_VERIFY_LOCAL_SHARD_WAIT_MS: '0' } })).calls[0])).toBe('--wait-ms=900000');
   });
+  it('a waited deferral is not split-retried: one wait, exit 75 (never 124) even with two needs-git files and a tight budget', async () => {
+    const calls = [], lines = [];
+    let clock = 0;
+    const execute = async ({ args }) => {
+      calls.push(args);
+      const waited = Number(/--wait-ms=(\d+)/.exec(args.join(' '))?.[1] ?? 0);
+      clock += waited; // the admission wait consumes the verify budget
+      return { exitCode: 75, reportText: '' };
+    };
+    const code = await runShards({ argv: ['npx', 'vitest', 'run', 'a', 'b'], shards: 1, parallel: 1, budgetMs: 1_620_000 }, {
+      discover: () => null, execute, now: () => clock, tmpdir: () => '/scratch', env: {}, needsGit: () => true,
+      fs: { mkdtempSync: () => '/scratch/s', readFileSync: () => { throw Error('missing'); }, rmSync: () => {} },
+      acquireLocal: async () => ({ ok: true }), releaseLocal: () => {}, log: s => lines.push(s) });
+    expect(code).toBe(SHARD_UNSETTLED_EXIT);
+    expect(calls).toHaveLength(1);
+    expect(lines.join('')).not.toMatch(/retrying once/);
+  });
+  it('a deferral on the first split half stops the retry: the second half never queues for another wait', async () => {
+    const calls = [];
+    let clock = 0;
+    const execute = async ({ args, files }) => {
+      calls.push(files.length);
+      // Whole shard: ran but inventory incomplete (exit 0, empty report). First half: deferred after its wait.
+      if (files.length === 2) return { exitCode: 0, reportText: '' };
+      clock += Number(/--wait-ms=(\d+)/.exec(args.join(' '))?.[1] ?? 0);
+      return { exitCode: 75, reportText: '' };
+    };
+    const code = await runShards({ argv: ['npx', 'vitest', 'run', 'a', 'b'], shards: 1, parallel: 1, budgetMs: 3_600_000 }, {
+      discover: () => null, execute, now: () => clock, tmpdir: () => '/scratch', env: {}, needsGit: () => true,
+      fs: { mkdtempSync: () => '/scratch/s', readFileSync: () => { throw Error('missing'); }, rmSync: () => {} },
+      acquireLocal: async () => ({ ok: true }), releaseLocal: () => {}, log: () => {} });
+    expect(code).toBe(SHARD_UNSETTLED_EXIT);
+    expect(calls).toEqual([2, 1]);
+  });
   it('a shard that still gets no slot within the budget still exits 75 (contract unchanged)', async () => {
     const { code, lines } = await run({ exitCode: SHARD_UNSETTLED_EXIT });
     expect(code).toBe(SHARD_UNSETTLED_EXIT);

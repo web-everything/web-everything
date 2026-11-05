@@ -205,7 +205,7 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
         // `npx vitest` / `npm run` put node_modules/.bin on PATH for the shell; a bare node child does not.
         const childEnv = { ...env, WE_VERIFY_REMOTE_REPORT: remoteReport, PATH: `${join(cwd, 'node_modules', '.bin')}:${env.PATH ?? ''}` };
         delete childEnv[ADMISSION_HELD_ENV];
-        let lastResult = null, observedFailure = false;
+        let lastResult = null, observedFailure = false, loadDeferred = false;
         async function attempt(local, attemptFiles = files, retry = '') {
           if (!remaining()) return 'NOT-RUN';
           const report = join(directory, `${index}.${retry}${local ? 'local' : 'initial'}.json`);
@@ -224,6 +224,9 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
             files: attemptFiles, report, remoteReport: attemptRemoteReport, cwd, env: local ? { ...attemptEnv, [ADMISSION_HELD_ENV]: '1' } : attemptEnv,
             timeoutMs: remaining(), prefix: `[verify-shard ${index + 1}/${shards.length}] `, log });
           lastResult = result;
+          // A waited deferral ran nothing: splitting the shard cannot help and would only queue for another full wait,
+          // spending the verify budget until the shard reports 124 instead of the contractual 75.
+          if (waitMs > 0 && result.exitCode === SHARD_UNSETTLED_EXIT) loadDeferred = true;
           if (waitMs > 0 && result.exitCode === SHARD_UNSETTLED_EXIT) log(`verify-shard ${index + 1}/${shards.length}: host-load deferral (waited up to ${Math.round(waitMs / 1000)}s for a local slot)\n`);
           if (result.timedOut || result.exitCode === 124) return 'TIMEOUT';
           if (verificationInfrastructureFailure(result) && result.exitCode !== SHARD_UNSETTLED_EXIT) {
@@ -301,7 +304,10 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
               } finally { unlock(); }
             }
           }
-          if (status === 'INVENTORY-INCOMPLETE') {
+          if (status === 'INVENTORY-INCOMPLETE' && loadDeferred) {
+            log(`verify-shard ${index + 1}/${shards.length}: host-load deferral; not splitting (no inventory to recover)\n`);
+            status = observedFailure ? 'FAIL' : 'UNSETTLED';
+          } else if (status === 'INVENTORY-INCOMPLETE') {
             log(`verify-shard ${index + 1}/${shards.length}: INVENTORY-INCOMPLETE; retrying once in ${Math.min(2, files.length)} part(s)\n`);
             const middle = Math.ceil(files.length / 2);
             const halves = files.length === 1 ? [files] : [files.slice(0, middle), files.slice(middle)];
@@ -310,7 +316,8 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
             for (const [half, selected] of halves.entries()) {
               const verdict = await attempt(false, selected, `retry-${half + 1}.`);
               retried.push(verdict);
-              if (infraExit || !['PASS', 'INVENTORY-INCOMPLETE'].includes(verdict)) break;
+              // A deferred half already spent its wait; the other half would queue for a second full wait.
+              if (infraExit || loadDeferred || !['PASS', 'INVENTORY-INCOMPLETE'].includes(verdict)) break;
             }
             status = retried.find(r => ['TIMEOUT', 'NOT-RUN', 'FAIL'].includes(r))
               ?? (observedFailure ? 'FAIL' : 'UNSETTLED');
