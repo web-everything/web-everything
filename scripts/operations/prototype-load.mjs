@@ -6,6 +6,7 @@
 import { op } from './registry.mjs';
 import { compute, effect } from './step-kinds.mjs';
 import { QUESTION_HASH, findAudit } from './codex-audit.mjs';
+import { carriesAcross } from '../lib/net-diff-fingerprint.mjs';
 export const PROTOTYPE_LOAD_OP = 'prototype-load';
 export const PROTOTYPE_LOAD_EFFECT = 'prototype-load.apply';
 export const safeRegistrationRef = (ref) => typeof ref === 'string' && /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(ref)
@@ -36,17 +37,55 @@ export function readyEvidence(records, input, ruledWeakened = []) {
  * base, file order breaks ties, contradictory findings rejected). Fail closed: ANY base whose latest verdict is
  * WEAKENED blocks, and a pass only counts when covers(base) proves the base is already in main (the audit spans the
  * whole change, not just its last commit). */
-export function canonicalAuditEvidence(records, sha, covers = () => true) {
-  const bases = new Set(records.filter((r) => r?.head === sha && r.base !== sha).map((r) => r.base));
+export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp = null) {
+  // R503: an audit of an older head also speaks for this head when its stored net-diff fingerprint equals the live one.
+  // No stored or live fingerprint, or any difference, means no carry (a real code change always re-audits).
+  // Eligibility is per RECORD: each carried record must itself hold the matching fingerprint, so one carried record
+  // can never lend its head's other (unfingerprinted or foreign) records.
+  const eligible = records.filter((r) => r?.head === sha || (r?.head && validSha(r.head) && carriesAcross(r.fingerprint, liveFp)));
+  const heads = new Set(eligible.map((r) => r.head));
+  // Fail closed the other way too: the latest VALID WEAKENED verdict for any base of a carried head blocks, fingerprint or not.
+  // "Valid" is findAudit's own judgment (latest wins per base, contradictory-findings and malformed records rejected,
+  // empty-diff base===head never consulted), so the veto can never honor a record the audit reader itself refuses.
+  // Only string heads/bases are keyed: a non-string (an array that stringifies to a real sha) must never alias, and so
+  // displace, the veto of the string base it imitates.
+  const vetoBases = new Map();
+  for (const r of records) if (typeof r?.head === 'string' && typeof r.base === 'string' && r.head !== sha && heads.has(r.head) && r.base !== r.head) vetoBases.set(JSON.stringify([r.head, r.base]), r);
+  for (const { head, base } of vetoBases.values()) {
+    if (findAudit(records, { head, base, questionHash: QUESTION_HASH })?.verdict === 'WEAKENED') return { ok: false, reason: 'weakened' };
+  }
   let pass = null;
-  for (const base of bases) {
-    const record = findAudit(records, { head: sha, base, questionHash: QUESTION_HASH });
-    if (record?.verdict === 'WEAKENED') return { ok: false, reason: 'weakened' };
-    if (record && covers(base) && (!pass || Date.parse(record.at) >= Date.parse(pass.at))) pass = record;
+  for (const head of heads) {
+    const bases = new Set(eligible.filter((r) => r.head === head && r.base !== head).map((r) => r.base));
+    for (const base of bases) {
+      const record = findAudit(eligible, { head, base, questionHash: QUESTION_HASH });
+      if (record?.verdict === 'WEAKENED') return { ok: false, reason: 'weakened' };
+      if (record && covers(base) && (!pass || Date.parse(record.at) >= Date.parse(pass.at))) pass = record;
+    }
   }
   return pass ? { ok: true, record: pass } : { ok: false, reason: 'no-record' };
 }
 /** Include BOTH sides of renames/copies; NUL output preserves whitespace and quoted paths. */
+/** Resolve a worker-supplied daemon name to its settings key (R502 item 1: workers guessed wrong 3 times).
+ * Accepts: the key, its launchd label (exact, or with the com.we./com.plateau. prefix removed), and the explicit
+ * `daemonAliases` table (clone dir names live there: a generic basename like `code` must never self-select). An exact key always wins. More than one candidate key is
+ * `ambiguous` and refused, never guessed. Returns { key } or { reason: 'unknown'|'ambiguous', valid, candidates? }. */
+export function resolveDaemonKey(daemons = {}, aliases = {}, name = '') {
+  const valid = Object.keys(daemons || {});
+  if (!name || typeof name !== 'string') return { reason: 'unknown', valid };
+  if (Object.hasOwn(daemons, name)) return { key: name };
+  const found = new Set();
+  for (const [key, d] of Object.entries(daemons)) {
+    const names = new Set();
+    if (d?.label) { names.add(d.label); const bare = d.label.replace(/^com\.(?:we|plateau)\./, ''); names.add(bare); }
+    if (names.has(name)) found.add(key);
+  }
+  const explicit = aliases && Object.hasOwn(aliases, name) ? aliases[name] : null;
+  if (explicit && Object.hasOwn(daemons, explicit)) found.add(explicit);
+  if (found.size === 1) return { key: [...found][0] };
+  if (found.size > 1) return { reason: 'ambiguous', valid, candidates: [...found].sort() };
+  return { reason: 'unknown', valid };
+}
 export function changedPaths(text) {
   const fields = String(text).split('\0');
   const paths = [];

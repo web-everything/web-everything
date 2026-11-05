@@ -1886,6 +1886,13 @@ export function runReconcileFixDispatch({
   const reconciledRaw = reconcile({ repo, allowStandDownAutoProceed,
     ...(readPrs ? { readPrs } : {}),
     ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
+  // A DEFERRED read (gh low budget / slot throttle / author-lookup budget) planned nothing: owed is UNKNOWN, not zero.
+  // Skip the tick — no dispatch decision, no refusal records, nothing released — and say so.
+  if (reconciledRaw?.deferred === true) {
+    const readDeferred = String(reconciledRaw.message ?? reconciledRaw.reason ?? 'deferred').split('\n')[0];
+    console.error(`reconcile-fix-dispatch: open-PR read deferred — owed unknown, skipping this tick: ${readDeferred}`);
+    return { dispatched: [], refusals: [], readDeferred, reconcileRefusals: 0, reconcileRefusalDetails: [] };
+  }
   const reconciled = netScope ? netScope(reconciledRaw, { root, repoKey }) : reconciledRaw;
   const dispatchEntries = Array.isArray(reconciled.dispatch) ? reconciled.dispatch : [];
   const profile = resolveProfile(repoKey);
