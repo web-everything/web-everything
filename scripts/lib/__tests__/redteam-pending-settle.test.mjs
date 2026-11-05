@@ -48,6 +48,17 @@ function runFixture(over = {}) {
     capacity: { lanes: 1, budget: { left: 1 } }, dispatch: vi.fn(() => ({ jobPid: 42 })),
     settlePending: vi.fn(), escalate: vi.fn(), syncLabels: vi.fn(), settle: vi.fn(() => ({ outcome: 'policy-clear' })), ...over };
 }
+// Pending may settle only with explicit, matching finished not-owed evidence.
+function notOwedFixture() {
+  const status = { status: 'finished', result: 'not-owed' };
+  const f = fixture({ readEvidence: () => evidence({ status }), readStatus: () => status });
+  f.rawPrs[0].comments = [accept(old)];
+  return f;
+}
+function notOwedRunFixture(over = {}) {
+  const f = notOwedFixture();
+  return runFixture({ ...f, now: () => f.now, ...over });
+}
 function carryFixture() {
   const f = fixture({ readEvidence: () => evidence({ loopPayload: undefined }) });
   f.rawPrs[0].comments = [accept(old),
@@ -63,6 +74,55 @@ function resultComment(confirmed = false) {
     }] : [] }));
 }
 
+describe('non-accept verdicts retain pending', () => {
+  it.each(['needs-human', 'changes', 'reject'])('accepted + pending + stored %s never settles', verdict => {
+    const o = runFixture({ readEvidence: () => evidence({ loopPayload: payload(verdict) }) });
+    expect(mod.runRedTeamOnSkip(o).rows[0]).not.toHaveProperty('settle');
+    expect(o.settlePending).not.toHaveBeenCalled(); expect(o.dispatch).not.toHaveBeenCalled();
+  });
+});
+
+describe('confirm exclusion revalidates at list time', () => {
+  const before = acceptedAt - RUN_MTIME_SLACK_MS - 1;
+  function setup() {
+    const id = 'review-pr-confirm';
+    const run = { op: 'review-pr', input: { repo, pr }, verdict: { verdict: 'needs-human' },
+      pending: { kind: 'confirm' }, effects: [], ...{ findings: payload().findings },
+      stepTimings: [{ step: 'read', startedAt: iso(before) }] };
+    const io = { runsDir: 'fixture-runs', list: () => [id], read: vi.fn(() => run),
+      stat: vi.fn(() => ({ mtimeMs: before })) };
+    const key = { repo, pr, head };
+    const scan = mod.ignorableConfirmRunIds({ ...key, ...io, comments: [accept()], reviews: [],
+      labels: ['review:accepted', 'red-team:pending'] });
+    return { id, run, io, key, scan };
+  }
+  it('carries acceptance time and excludes a still-inert confirm', () => {
+    const f = setup(); expect(f.scan.acceptedAt).toBe(acceptedAt);
+    expect(mod.revalidatedConfirmList({ ...f.key, ...f.io, ignoreRunIds: f.scan.ids, acceptedAt: f.scan.acceptedAt })(f.io.runsDir)).toEqual([]);
+  });
+  it.each(['mtime', 'resume', 'effect', 'read failure', 'stat failure', 'missing acceptance time'])(
+    '%s changing after scan retains the run and review-unfinished evidence', kind => {
+      const f = setup();
+      const o = runFixture({ readIgnorableConfirms: () => f.scan, headNeverReviewed: () => false,
+        readEvidence: ({ ignoreRunIds = [], acceptedAt: stamp } = {}) => {
+          if (!ignoreRunIds.length) return { ok: false, reason: 'review-unfinished' };
+          if (kind === 'mtime') f.io.stat.mockReturnValue({ mtimeMs: acceptedAt + 1 });
+          if (kind === 'resume') { f.run.resumeOf = 'review-pr-origin'; f.run.resumedAt = iso(acceptedAt + 1); }
+          if (kind === 'effect') f.run.effects = [{ status: 'in-flight' }];
+          if (kind === 'read failure') f.io.read.mockImplementation(() => { throw Error('unreadable'); });
+          if (kind === 'stat failure') f.io.stat.mockImplementation(() => { throw Error('unreadable'); });
+          const list = mod.revalidatedConfirmList({ ...f.key, ...f.io, ignoreRunIds,
+            acceptedAt: kind === 'missing acceptance time' ? undefined : stamp });
+          return list(f.io.runsDir).includes(f.id) ? { ok: false, reason: 'review-unfinished' }
+            : evidence({ loopPayload: payload('accept') });
+        } });
+      o.readEvidence = vi.fn(o.readEvidence);
+      expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'review-unfinished' });
+      expect(o.readEvidence).toHaveBeenCalledTimes(2);
+      expect(o.dispatch).not.toHaveBeenCalled(); expect(o.settlePending).not.toHaveBeenCalled();
+    });
+});
+
 describe('not-owed settlement evidence and holds', () => {
   it('never settles pending for an unknown verdict string', () => {
     const o = runFixture({ readEvidence: () => evidence({ loopPayload: payload('bogus') }) });
@@ -71,7 +131,7 @@ describe('not-owed settlement evidence and holds', () => {
   });
   it.each(['missing reviews', 'null reviews', 'formal hold', 'hold without acceptance', 'later verdict', 'later body hold'])(
     'planner retains pending for %s', kind => {
-      const f = fixture();
+      const f = notOwedFixture();
       if (kind === 'missing reviews') delete f.rawPrs[0].reviews;
       if (kind === 'null reviews') f.rawPrs[0].reviews = null;
       if (kind === 'formal hold') f.rawPrs[0].reviews = [{ state: 'CHANGES_REQUESTED', submittedAt: iso(acceptedAt + 1) }];
@@ -88,7 +148,7 @@ describe('not-owed settlement evidence and holds', () => {
     });
   it.each(['review:prep', 'review:changes', 'review-status:running'])(
     'reads unaccepted reviews once and permits pending removal beside %s', label => {
-      const o = runFixture(); o.rawPrs[0].labels = [label, 'red-team:pending'];
+      const o = notOwedRunFixture(); o.rawPrs[0].labels = [label, 'red-team:pending'];
       o.rawPrs[0].comments = []; delete o.rawPrs[0].reviews;
       o.rawPrs.push({ ...o.rawPrs[0] });
       expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ settle: 'not-owed' });
@@ -101,7 +161,7 @@ describe('not-owed settlement evidence and holds', () => {
         if (kind === 'throws') throw Error('unreadable');
         return kind === 'unknown' ? null : [{ state: 'CHANGES_REQUESTED', submittedAt: iso(acceptedAt + 1) }];
       });
-      const o = runFixture({ readReviews });
+      const o = notOwedRunFixture({ readReviews });
       o.rawPrs[0].labels = ['review:prep', 'red-team:pending']; o.rawPrs[0].comments = []; delete o.rawPrs[0].reviews;
       expect(mod.runRedTeamOnSkip(o).rows[0]).not.toHaveProperty('settle');
       expect(readReviews).toHaveBeenCalledOnce(); expect(o.settlePending).not.toHaveBeenCalled();
@@ -138,7 +198,7 @@ describe('planner settlement annotations', () => {
       expect(o.settlePending).not.toHaveBeenCalled();
     });
   it.each(['!owed', 'acceptance sha mismatch', 'not accepted'])('%s non-owing stored review settles pending as not-owed', site => {
-    const f = fixture();
+    const f = notOwedFixture();
     if (site === 'acceptance sha mismatch') {
       f.rawPrs[0].comments = [accept(old)];
       const status = { status: 'finished', result: 'not-owed' };
@@ -389,7 +449,7 @@ describe('ignorableConfirmRunIds chronology and closed scan', () => {
       'review-pr-other-op': run({ op: 'other' }), 'other-op': run(),
     });
     expect(latestAcceptRecord(f.comments, f.reviews)).toMatchObject({ sha: head, laterVerdict: false, laterBodyDerivedHold: false });
-    expect(scan(f)).toEqual({ ok: true, ids: ['review-pr-confirm'] });
+    expect(scan(f)).toEqual({ ok: true, ids: ['review-pr-confirm'], acceptedAt });
     expect(f.read.mock.calls.map(([id]) => id)).not.toContain('other-op');
   });
   it.each([{}, [], { op: 'review-pr' }, { op: 'review-pr', input: { repo } }])('malformed review run invalidates all ignorable ids: %j', record => {
@@ -397,14 +457,14 @@ describe('ignorableConfirmRunIds chronology and closed scan', () => {
   });
   it('accepts object-shaped accepted labels', () => {
     const f = scanFixture(); f.labels = [{ name: 'review:accepted' }];
-    expect(scan(f)).toEqual({ ok: true, ids: ['review-pr-confirm'] });
+    expect(scan(f)).toEqual({ ok: true, ids: ['review-pr-confirm'], acceptedAt });
   });
   it('returns no ids for a fully finished scan', () => {
-    expect(scan(scanFixture({ 'review-pr-done': run({ pending: null }) }))).toEqual({ ok: true, ids: [] });
+    expect(scan(scanFixture({ 'review-pr-done': run({ pending: null }) }))).toEqual({ ok: true, ids: [], acceptedAt });
   });
   it('accepts an old resumed confirm only when both starts precede the slack boundary', () => {
     expect(scan(scanFixture({ 'review-pr-confirm': run({ resumeOf: 'review-pr-origin', resumedAt: iso(before) }) })))
-      .toEqual({ ok: true, ids: ['review-pr-confirm'] });
+      .toEqual({ ok: true, ids: ['review-pr-confirm'], acceptedAt });
   });
   it.each([
     ['no verdict', { verdict: null }], ['wrong verdict', { verdict: { verdict: 'accept' } }],
@@ -423,12 +483,12 @@ describe('ignorableConfirmRunIds chronology and closed scan', () => {
   });
   it('finished effects do not prevent ignoring an otherwise old confirm', () => {
     expect(scan(scanFixture({ 'review-pr-confirm': run({ effects: [{ status: 'applied' }] }) })))
-      .toEqual({ ok: true, ids: ['review-pr-confirm'] });
+      .toEqual({ ok: true, ids: ['review-pr-confirm'], acceptedAt });
   });
   it('omits abandoned verdict-less terminal attempts using the drain abandonment age', () => {
     const f = scanFixture({ 'review-pr-abandoned': run({ verdict: null, pending: null }) });
     f.stat = () => ({ mtimeMs: f.now - ABANDONED_REVIEW_AFTER_MS });
-    expect(scan(f)).toEqual({ ok: true, ids: [] });
+    expect(scan(f)).toEqual({ ok: true, ids: [], acceptedAt });
   });
   it('an old rewound resume is never treated as abandoned', () => {
     const f = scanFixture({ 'review-pr-rewound': run({ verdict: null, pending: null, resumeOf: 'review-pr-origin' }) });
@@ -453,7 +513,7 @@ describe('ignorableConfirmRunIds chronology and closed scan', () => {
   });
   it('allows exactly 400 parsed review runs', () => {
     const records = Object.fromEntries(Array.from({ length: 400 }, (_, i) => [`review-pr-${i}`, run({ pending: null })]));
-    const f = scanFixture(records); expect(scan(f)).toEqual({ ok: true, ids: [] });
+    const f = scanFixture(records); expect(scan(f)).toEqual({ ok: true, ids: [], acceptedAt });
     expect(f.read).toHaveBeenCalledTimes(400);
   });
   it('over 400 parses fails closed for operator inspection without partial ids or extra reads', () => {
@@ -518,7 +578,7 @@ describe('head-bound default pending settlement', () => {
   it('unreadable live state reports settleError for not-owed', () => {
     const { provider, settle } = setup();
     provider.readPrState.mockImplementation(() => { throw Error('live state unreadable'); });
-    const o = runFixture({ settlePending: settle });
+    const o = notOwedRunFixture({ settlePending: settle });
     expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ settle: 'not-owed', settleError: 'live state unreadable' });
     expect(provider.setLabels).not.toHaveBeenCalled(); expect(o.dispatch).not.toHaveBeenCalled();
   });
@@ -563,7 +623,7 @@ describe('runner settles pending without dispatch', () => {
     expect(o.settlePending).not.toHaveBeenCalled(); expect(o.escalate).not.toHaveBeenCalled();
   });
   it('not-owed removes only pending and never adds a label', () => {
-    const o = runFixture(); const out = mod.runRedTeamOnSkip(o);
+    const o = notOwedRunFixture(); const out = mod.runRedTeamOnSkip(o);
     expect(o.settlePending).toHaveBeenCalledOnce();
     expect(o.settlePending).toHaveBeenCalledWith({ repo, pr, head, remove: ['red-team:pending'] });
     expect(out.rows[0]).toMatchObject({ action: 'skip', settle: 'not-owed' });
@@ -571,7 +631,7 @@ describe('runner settles pending without dispatch', () => {
     expect(o.dispatch).not.toHaveBeenCalled(); expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 } });
   });
   it.each(['red-team:blocked', { name: 'red-team:blocked' }])('not-owed preserves blocked label %j', label => {
-    const o = runFixture(); o.rawPrs[0].labels.push(label); mod.runRedTeamOnSkip(o);
+    const o = notOwedRunFixture(); o.rawPrs[0].labels.push(label); mod.runRedTeamOnSkip(o);
     expect(o.settlePending).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled();
   });
   it.each([false, true])('a result (confirmed break=%s) synchronizes labels only', confirmed => {
@@ -589,15 +649,15 @@ describe('runner settles pending without dispatch', () => {
     expect(o.settlePending).not.toHaveBeenCalled(); expect(o.settle).not.toHaveBeenCalled(); expect(o.dispatch).not.toHaveBeenCalled();
   });
   it.each(['not-owed', 'result'])('dryRun settles nothing for %s', kind => {
-    const o = runFixture({ dryRun: true }); if (kind === 'result') o.rawPrs[0].comments.push(resultComment());
+    const o = notOwedRunFixture({ dryRun: true }); if (kind === 'result') o.rawPrs[0].comments.push(resultComment());
     mod.runRedTeamOnSkip(o);
     expect(o.settlePending).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled(); expect(o.settle).not.toHaveBeenCalled();
   });
   it.each(['settlePending', 'syncLabels'])('%s failure is reported in settleError with unchanged why and does not abort the next row', method => {
-    const o = runFixture(); if (method === 'syncLabels') o.rawPrs[0].comments.push(resultComment());
+    const o = notOwedRunFixture(); if (method === 'syncLabels') o.rawPrs[0].comments.push(resultComment());
     o[method] = vi.fn().mockImplementationOnce(() => { throw Error('settlement offline'); }).mockReturnValue(undefined);
     o.plan.refusals.push({ kind: 'already-reviewed-head', prNumber: pr + 1, headSha: head });
-    o.rawPrs.push({ ...o.rawPrs[0], number: pr + 1, comments: [accept()] });
+    o.rawPrs.push({ ...o.rawPrs[0], number: pr + 1, comments: [accept(old)] });
     if (method === 'syncLabels') o.rawPrs[1].comments.push(trusted(`${redTeamMarker(pr + 1, head)}\nRed team not required on this head: card-only diff`));
     const out = mod.runRedTeamOnSkip(o);
     expect(out.rows).toHaveLength(2); expect(out.rows[0].settleError).toBe('settlement offline');

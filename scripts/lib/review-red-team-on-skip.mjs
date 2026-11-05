@@ -261,6 +261,33 @@ export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
   } catch { return false; }
 }
 
+/** The same chronology predicate is required at scan time and every evidence re-read. */
+function ignorableConfirm(run, at, acceptedAt) {
+  const start = Date.parse(run.stepTimings?.find(t => t?.step === 'read')?.startedAt);
+  const resumed = Date.parse(run.resumedAt);
+  return Number.isFinite(acceptedAt) && !isRunRecordTerminal(run)
+    && run.verdict?.verdict === 'needs-human' && run.pending?.kind === 'confirm'
+    && Array.isArray(run.effects) && !run.effects.some(e => ['pending', 'in-flight'].includes(e?.status))
+    && Number.isFinite(start) && start + RUN_MTIME_SLACK_MS < acceptedAt
+    && Number.isFinite(at) && at + RUN_MTIME_SLACK_MS < acceptedAt
+    && (run.resumeOf == null && run.resumedAt == null
+      || Number.isFinite(resumed) && resumed + RUN_MTIME_SLACK_MS < acceptedAt);
+}
+
+/** Revalidate ignored cursors at list time; changed or unreadable rows stay visible to evidence readers. */
+export function revalidatedConfirmList({ repo, pr, head, ignoreRunIds = [], acceptedAt,
+  list = strictListRuns, read = readRun, stat = statSync } = {}) {
+  return runsDir => list(runsDir).filter(id => {
+    if (!isRealHead(head) || !Array.isArray(ignoreRunIds) || !ignoreRunIds.includes(id)
+      || !Number.isFinite(acceptedAt)) return true;
+    try {
+      const [entry] = reviewRuns({ runsDir, list: () => [id], read, stat });
+      return !entry || entry.run.op !== 'review-pr' || entry.run.input.repo !== repo
+        || Number(entry.run.input.pr) !== Number(pr) || !ignorableConfirm(entry.run, entry.at, acceptedAt);
+    } catch { return true; }
+  });
+}
+
 /** Ignore old confirm cursors only after a later, live acceptance supersedes them. */
 export function ignorableConfirmRunIds({ repo, pr, head, comments, labels, reviews, env = process.env,
   runsDir = runsDirectory(env), list = strictListRuns, read = readRun, stat = statSync, now = Date.now() } = {}) {
@@ -277,16 +304,10 @@ export function ignorableConfirmRunIds({ repo, pr, head, comments, labels, revie
       if (run.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr)) continue;
       const terminal = isRunRecordTerminal(run);
       if (terminal && (run.verdict || (run.resumeOf == null && now - at >= ABANDONED_REVIEW_AFTER_MS))) continue;
-      const start = Date.parse(run.stepTimings?.find(t => t?.step === 'read')?.startedAt);
-      const resumed = Date.parse(run.resumedAt);
-      if (run.verdict?.verdict !== 'needs-human' || run.pending?.kind !== 'confirm'
-        || !Array.isArray(run.effects) || run.effects.some(e => ['pending', 'in-flight'].includes(e?.status))
-        || !Number.isFinite(start) || start + RUN_MTIME_SLACK_MS >= acceptedAt
-        || !Number.isFinite(at) || at + RUN_MTIME_SLACK_MS >= acceptedAt
-        || (run.resumeOf != null && (!Number.isFinite(resumed) || resumed + RUN_MTIME_SLACK_MS >= acceptedAt))) return closed;
+      if (!ignorableConfirm(run, at, acceptedAt)) return closed;
       ids.push(id);
     }
-    return { ok: true, ids };
+    return { ok: true, ids, acceptedAt };
   } catch { return closed; }
 }
 
@@ -322,8 +343,10 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       const first = reader(key);
       if (first?.ok !== false || first.reason !== 'review-unfinished') return first;
       try {
-        const ids = readIgnorableConfirms?.({ ...key, rawPr });
-        if (Array.isArray(ids) && ids.length) return reader({ ...key, ignoreRunIds: ids });
+        const confirms = readIgnorableConfirms?.({ ...key, rawPr });
+        const ids = Array.isArray(confirms) ? confirms : confirms?.ok ? confirms.ids : [];
+        if (Array.isArray(ids) && ids.length) return reader({ ...key, ignoreRunIds: ids,
+          ...(Number.isFinite(confirms.acceptedAt) ? { acceptedAt: confirms.acceptedAt } : {}) });
       } catch { return first; }
       try {
         if (headNeverReviewed?.({ ...key, rawPr }) === true) return { neverReviewed: true };
@@ -397,7 +420,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       const finishedNotOwed = [evidence?.status, status].every(candidate => candidate?.status === 'finished'
         && normalizeRedTeamResult(candidate.result).priorResult === 'not-owed'
         && !candidate.result?.deferredByGuard && !candidate.result?.deferredByCap);
-      const recordedNotOwed = (Object.values(VERDICTS).includes(verdict) && !owed)
+      const recordedNotOwed = (verdict === VERDICTS.ACCEPT && !owed)
         || finishedNotOwed;
       const notOwed = () => {
         // Review labels independently block merge; thread/formal holds still forbid settlement.
@@ -522,11 +545,12 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   ], { env, encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 })).reviews,
   exec = execFileSync, cwd = process.cwd(), mainRef = 'origin/main',
   proveMove = move => proveCardOnlyHeadMove({ ...move, exec, cwd, mainRef }),
-  readWitness = readEvidence === readDrainRedTeamEvidence && readStatus === readRedTeamStatus ? ({ ignoreRunIds = [], ...key }) => readRecoveryWitness({ ...key, env,
-    runsDir: runsDirectory(env), list: dir => strictListRuns(dir).filter(id => !ignoreRunIds.includes(id)) }) : null,
+  listReviewRuns = strictListRuns, readReviewRun = readRun, statReviewRun = statSync,
+  readWitness = readEvidence === readDrainRedTeamEvidence && readStatus === readRedTeamStatus ? ({ ignoreRunIds = [], acceptedAt, ...key }) => readRecoveryWitness({ ...key, env,
+    runsDir: runsDirectory(env), list: revalidatedConfirmList({ ...key, ignoreRunIds, acceptedAt, list: listReviewRuns, read: readReviewRun, stat: statReviewRun }) }) : null,
   readIgnorableConfirms = ({ rawPr, ...key }) => {
-    const result = ignorableConfirmRunIds({ ...key, env, comments: rawPr.comments, labels: rawPr.labels, reviews: rawPr.reviews });
-    return result.ok ? result.ids : [];
+    const result = ignorableConfirmRunIds({ ...key, env, list: listReviewRuns, read: readReviewRun, stat: statReviewRun, comments: rawPr.comments, labels: rawPr.labels, reviews: rawPr.reviews });
+    return result;
   },
   headNeverReviewed = key => headNeverReviewedFromRuns({ ...key, env }),
   settlePending = settlePendingFor({ env }),
@@ -568,8 +592,8 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       return { ...rawPr, reviews };
     });
     rows.push(...planRedTeamOnSkip({ repo, refusals, rawPrs: planningPrs,
-      readEvidence: readEvidence === readDrainRedTeamEvidence ? ({ ignoreRunIds = [], ...key }) => readEvidence({ ...key, env,
-        runsDir: runsDirectory(env), list: dir => strictListRuns(dir).filter(id => !ignoreRunIds.includes(id)) }) : readEvidence,
+      readEvidence: readEvidence === readDrainRedTeamEvidence ? ({ ignoreRunIds = [], acceptedAt, ...key }) => readEvidence({ ...key, env,
+        runsDir: runsDirectory(env), list: revalidatedConfirmList({ ...key, ignoreRunIds, acceptedAt, list: listReviewRuns, read: readReviewRun, stat: statReviewRun }) }) : readEvidence,
       readStatus: readStatus === readRedTeamStatus ? key => readStatus({ ...key, env }) : readStatus,
       now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, readWitness,
       readIgnorableConfirms, headNeverReviewed,
