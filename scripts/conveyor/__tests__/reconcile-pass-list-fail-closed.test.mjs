@@ -341,6 +341,48 @@ describe('fresh read (the fix daemon plans from a read taken AFTER its baseline 
   });
 });
 
+describe('fresh read wiring: the cache handed to listPaged and the paged path itself are pinned', () => {
+  const U = Date.parse('2026-11-03T22:00:00Z');
+  const entry = (fetchedAtMs) => ({ updatedAt: '2026-11-03T22:00:00Z', headRefOid: 'a', fetchedAtMs, comments: [], body: '', files: [] });
+  const base = { exec: undefined, readCommits: () => [], readShared: () => null,
+    readRest: () => ({ json: { user: { login: 'u', type: 'User' } } }),
+    retryOpts: { sleep: () => {}, persist: false, onEvent: () => {} } };
+  const page = (cache) => vi.fn(() => ({ rows: [{ number: 1, labels: [], comments: [], statusCheckRollup: [] }], cache, totalCount: 1 }));
+
+  it('a fresh read hands listPaged only the SETTLED heavy entries; a non-fresh read hands it the whole cache', async () => {
+    const { defaultReadPrs } = await import('../reconcile-pass.mjs');
+    const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
+    const seeded = { 1: entry(U + 500), 2: entry(U + 5000) }; // 1 = cached inside its updatedAt second; 2 = settled
+    const read = (listPaged, fresh) => defaultReadPrs({ ...base, repo: 'o/cache-wiring', exec: execFileSyncThrottled, listPaged, fresh });
+    read(page(seeded), false); // seeds pagedHeavyCache for the repo
+    const nonFresh = page(seeded);
+    read(nonFresh, false);
+    expect(Object.keys(nonFresh.mock.calls[0][0].cache).sort()).toEqual(['1', '2']);
+    const fresh = page(seeded);
+    read(fresh, true);
+    expect(Object.keys(fresh.mock.calls[0][0].cache)).toEqual(['2']); // the unsettled entry 1 is NOT reusable
+  });
+
+  it('fresh:true with the DEFAULT listPaged and the snapshot disabled reads small pages — never the heavy `gh pr list`', async () => {
+    const { defaultReadPrs } = await import('../reconcile-pass.mjs');
+    const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
+    const { execFileSync } = await import('node:child_process');
+    const prev = process.env.WE_PR_SNAPSHOT;
+    process.env.WE_PR_SNAPSHOT = '0'; // snapshot explicitly disabled: only `fresh ||` can select the paged path
+    execFileSync.mockClear();
+    execFileSync.mockImplementation(() => { throw Object.assign(new Error('x'), { stderr: 'HTTP 504: 504 Gateway Timeout' }); });
+    try {
+      expect(() => defaultReadPrs({ ...base, repo: 'o/default-paged', exec: execFileSyncThrottled, fresh: true })).toThrow();
+      const argvs = execFileSync.mock.calls.map(c => c[1]);
+      expect(argvs.length).toBeGreaterThan(0);
+      expect(argvs.some(a => a[0] === 'pr' && a[1] === 'list')).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env.WE_PR_SNAPSHOT; else process.env.WE_PR_SNAPSHOT = prev;
+      execFileSync.mockReset();
+    }
+  });
+});
+
 it('a fresh read reuses a cached heavy read only once its PR updatedAt second had ended (same-second comments stay visible)', async () => {
   const { settledHeavyCache, FRESH_SETTLE_MS } = await import('../reconcile-pass.mjs');
   const U = Date.parse('2026-11-03T22:00:00Z');
