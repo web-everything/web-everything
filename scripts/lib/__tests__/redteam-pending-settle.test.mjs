@@ -64,6 +64,34 @@ function resultComment(confirmed = false) {
 }
 
 describe('planner settlement annotations', () => {
+  it.each([null, {}, undefined, { verdict: 7 }, { verdict: '' }, { verdict: '  ' }])(
+    'never settles pending without a recorded review verdict: %j', verdict => {
+      const o = runFixture({ readEvidence: () => evidence({ loopPayload: { ...payload(), verdict } }) });
+      const row = mod.runRedTeamOnSkip(o).rows[0];
+      expect(row).toMatchObject({ action: 'skip', why: 'stored review does not owe a red team' });
+      expect(row).not.toHaveProperty('settle');
+      expect(o.settlePending).not.toHaveBeenCalled(); expect(o.dispatch).not.toHaveBeenCalled();
+      expect(o.rawPrs[0].labels).toContain('red-team:pending');
+    });
+  it('settles a recorded accept with matching finished not-owed evidence and live status', () => {
+    const status = { status: 'finished', result: 'not-owed' };
+    const o = runFixture({ readEvidence: () => evidence({ loopPayload: payload('accept'), status }), readStatus: () => status });
+    o.rawPrs[0].labels = ['red-team:pending']; o.rawPrs[0].comments = [];
+    expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', settle: 'not-owed' });
+    expect(o.settlePending).toHaveBeenCalledWith({ repo, pr, head, remove: ['red-team:pending'] });
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it.each(['stored', 'live'].flatMap(source => ['deferredByGuard', 'deferredByCap', 'missing', 'running'].map(kind => [source, kind])))(
+    'unknown verdict cannot settle with %s status %s', (source, kind) => {
+      const good = { status: 'finished', result: 'not-owed' };
+      const bad = kind === 'missing' ? null : kind === 'running' ? { ...good, status: 'running' }
+        : { status: 'finished', result: { status: 'not-owed', [kind]: true } };
+      const o = runFixture({ readEvidence: () => evidence({ loopPayload: { ...payload(), verdict: null },
+        status: source === 'stored' ? bad : good }), readStatus: () => source === 'live' ? bad : good });
+      o.rawPrs[0].labels = ['red-team:pending']; o.rawPrs[0].comments = [];
+      expect(mod.runRedTeamOnSkip(o).rows[0]).not.toHaveProperty('settle');
+      expect(o.settlePending).not.toHaveBeenCalled();
+    });
   it.each(['!owed', 'acceptance sha mismatch', 'not accepted'])('%s non-owing stored review settles pending as not-owed', site => {
     const f = fixture();
     if (site === 'acceptance sha mismatch') {
@@ -236,6 +264,22 @@ describe('headNeverReviewedFromRuns complete bounded proof', () => {
     expect(mod.headNeverReviewedFromRuns, 'export the complete never-reviewed-head scanner').toBeTypeOf('function');
     return mod.headNeverReviewedFromRuns(f);
   }
+  it.each([
+    ['running review', { verdict: null }],
+    ['pending review', { pending: { kind: 'agent' } }],
+    ['pending effect', { effects: [{ status: 'pending' }] }],
+    ['in-flight effect', { effects: [{ status: 'in-flight' }] }],
+    ['confirm with in-flight effect', { verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' }, effects: [{ status: 'in-flight' }] }],
+  ])('an older-head unfinished %s prevents a never-reviewed proof', (_name, over) => {
+    expect(scan(scanFixture({ 'review-pr-old': run(over) }))).toBe(false);
+  });
+  it('permits an older-head needs-human confirm with no outstanding effects', () => {
+    expect(scan(scanFixture({ 'review-pr-old': run({ verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' } }) }))).toBe(true);
+  });
+  it('an exact-head unfinished confirm prevents proof even beside an older-head confirm', () => {
+    const confirm = { verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' } };
+    expect(scan(scanFixture({ 'review-pr-old': run(confirm), 'review-pr-head': run({ ...confirm, ...payload('needs-human') }) }))).toBe(false);
+  });
   it.each([{}, [], { op: 'review-pr' }, { op: 'review-pr', input: { repo } }])('malformed review run cannot prove an unreviewed head: %j', record => {
     expect(scan(scanFixture({ 'review-pr-malformed': record }))).toBe(false);
   });
