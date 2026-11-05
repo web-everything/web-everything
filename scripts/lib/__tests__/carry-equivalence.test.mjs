@@ -133,7 +133,8 @@ describe('replay proof with real git', () => {
 
 // R503 part 4 — the drain-mechanical set also covers the regenerated CI timing file, so a merge of main that only
 // moves it keeps an operator approval; any other change still invalidates.
-import { MECHANICAL_DIFF_PATHS } from '../transient-paths.mjs';
+import { MECHANICAL_DIFF_PATHS, NOT_A_REFRESH_PREFIXES, isMechanicalDiffSection } from '../transient-paths.mjs';
+import { TRANSIENT_CARRY_PATHS } from '../carry-equivalence.mjs';
 import { normalizeDiffFingerprint, normalizeContributionFingerprint } from '../review-escalation.mjs';
 import { decideHumanClearanceCarry } from '../human-clearance-carry.mjs';
 
@@ -152,15 +153,45 @@ describe('mechanical net-diff paths (R503)', () => {
     const nested = timings(2).replaceAll('scripts/ci/test-timings.json', 'x/scripts/ci/test-timings.json');
     expect(fp(code + nested)).not.toBe(fp(code));
   });
-  it.each([['strict', normalizeDiffFingerprint], ['contribution', normalizeContributionFingerprint]])('%s fingerprint treats a timing-file delete, add, rename or mode change as a real change', (_, fp) => {
-    const T = 'scripts/ci/test-timings.json';
+  // One diff section per NOT_A_REFRESH_PREFIXES entry, each opened by exactly that header line (so dropping any one
+  // prefix from the list reddens its own row), plus the completeness check that a new prefix brings its own row.
+  const T = 'scripts/ci/test-timings.json';
+  const H = `diff --git a/${T} b/${T}\n`;
+  const NOT_A_REFRESH_VARIANTS = {
+    'deleted file mode': `${H}deleted file mode 100644\n`,
+    'new file mode': `${H}new file mode 100644\n`,
+    'old mode': `${H}old mode 100644\n`,
+    'new mode': `${H}new mode 100755\n`,
+    'rename ': `${H}rename from ${T}\n`,
+    'copy ': `${H}copy from ${T}\n`,
+    'similarity index': `${H}similarity index 90%\n`,
+    'dissimilarity index': `${H}dissimilarity index 100%\n`,
+    'Binary files': `${H}index 1..2\nBinary files a/${T} and b/${T} differ\n`,
+    'GIT binary patch': `${H}index 1..2\nGIT binary patch\nliteral 3\nKcmZ?l00000\n\n`,
+  };
+  it('has one timing-file variant per NOT_A_REFRESH prefix', () => {
+    expect(Object.keys(NOT_A_REFRESH_VARIANTS).sort()).toEqual([...NOT_A_REFRESH_PREFIXES].sort());
+  });
+  it.each(Object.entries(NOT_A_REFRESH_VARIANTS))('a timing-file section opened by "%s" is a real change, not a refresh', (_, v) => {
+    const lines = (code + v).split('\n');
+    expect(isMechanicalDiffSection(lines, lines.indexOf(H.trimEnd()))).toBe(false);
+    expect(normalizeDiffFingerprint(code + v)).not.toBe(normalizeDiffFingerprint(code));
+    expect(normalizeContributionFingerprint(code + v)).not.toBe(normalizeContributionFingerprint(code));
+  });
+  it.each([['strict', normalizeDiffFingerprint], ['contribution', normalizeContributionFingerprint]])('%s fingerprint treats a timing-file delete, add, rename, mode change or binary replacement as a real change', (_, fp) => {
     const variants = [
-      `diff --git a/${T} b/${T}\ndeleted file mode 100644\nindex 1..0\n--- a/${T}\n+++ /dev/null\n@@ -1 +0,0 @@\n-{"t":1}\n`,
-      `diff --git a/${T} b/${T}\nnew file mode 100644\nindex 0..1\n--- /dev/null\n+++ b/${T}\n@@ -0,0 +1 @@\n+{"t":1}\n`,
-      `diff --git a/${T} b/${T}\nold mode 100644\nnew mode 100755\n`,
-      `diff --git a/${T} b/${T}\nsimilarity index 90%\nrename from ${T}\nrename to ${T}\n`,
+      `${H}deleted file mode 100644\nindex 1..0\n--- a/${T}\n+++ /dev/null\n@@ -1 +0,0 @@\n-{"t":1}\n`,
+      `${H}new file mode 100644\nindex 0..1\n--- /dev/null\n+++ b/${T}\n@@ -0,0 +1 @@\n+{"t":1}\n`,
+      `${H}old mode 100644\nnew mode 100755\n`,
+      `${H}similarity index 90%\nrename from ${T}\nrename to ${T}\n`,
+      `${H}index 1..2\nBinary files a/${T} and b/${T} differ\n`,
+      `${H}index 1..2\nGIT binary patch\nliteral 3\nKcmZ?l00000\n\nliteral 0\nHcmV?d00001\n\n`,
     ];
     for (const v of variants) expect(fp(code + v)).not.toBe(fp(code));
+  });
+  it('keeps replay equivalence manifest-only: the modify-only timing file is not a transient carry path', () => {
+    expect(TRANSIENT_CARRY_PATHS).toEqual(['.lane-manifest.json']);
+    expect(Object.isFrozen(TRANSIENT_CARRY_PATHS)).toBe(true);
   });
   it('an operator clearance carries across a merge of main that only moved the timing file', () => {
     const cleared = liveCarryFingerprints(code + timings(2));

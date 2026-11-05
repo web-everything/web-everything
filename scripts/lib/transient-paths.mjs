@@ -7,7 +7,10 @@ export const MECHANICAL_DIFF_PATHS = Object.freeze(['.lane-manifest.json', 'scri
 /** The timing file is only mechanical as an in-place content refresh: adding, deleting, renaming, mode changes or
  *  binary replacement of it are real changes. (The drain's lane manifest keeps its historical every-kind exclusion.) */
 const MODIFY_ONLY = new Set(['scripts/ci/test-timings.json']);
-const NOT_A_REFRESH = /^(?:deleted file mode|new file mode|old mode|new mode|rename |copy |similarity index|dissimilarity index|Binary files|GIT binary patch)/;
+/** Extended-header line prefixes that make a timing-file section a real change. Exported so a test pins one variant
+ *  per prefix. */
+export const NOT_A_REFRESH_PREFIXES = Object.freeze(['deleted file mode', 'new file mode', 'old mode', 'new mode', 'rename ', 'copy ', 'similarity index', 'dissimilarity index', 'Binary files', 'GIT binary patch']);
+const NOT_A_REFRESH = { test: (line) => NOT_A_REFRESH_PREFIXES.some((p) => line.startsWith(p)) };
 /** PURE: does the `diff --git` header at lines[i] open a section the fingerprints skip? */
 export function isMechanicalDiffSection(lines, i) {
   const header = lines[i];
