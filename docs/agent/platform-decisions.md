@@ -6500,7 +6500,8 @@ strictest, no prior question hashes accepted); an empty section sets nothing and
 or is not a known option resolves to that setting's strictest option too. Path lists only add to the built-in
 guard floor: the concurrency modules (locks, leases including `scripts/lib/lane-lease.mjs`, slots, lane pool,
 merge, drain) and the guard hooks (`scripts/guard-*.mjs` and the other guard scripts) with their registration in
-`.claude/settings.json`. An invalid or unreadable path list protects every path. A caller of the verdict may only
+`.claude/settings.json`, the git hooks and merge/review gates, and the auditor's own modules and settings. Paths
+match without regard to letter case. An invalid or unreadable path list protects every path. A caller of the verdict may only
 tighten these settings (a stricter stage, more protected paths), never relax them. The **prod trigger is the first outside user** of any constellation surface:
 first public npm package publish or first external user/customer on plateau-app. The operator records that level
 move; B rows never relax, and outstanding due debt gates the move.

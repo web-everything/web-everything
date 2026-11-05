@@ -19,15 +19,26 @@ async function loadComputeVerdict() {
 }
 const BASE = 'b'.repeat(40); const HEAD = 'a'.repeat(40);
 const proofFor = f => ({ ok: true, base: BASE, head: HEAD, fingerprint: proofFingerprint(f) });
-// Hermetic trusted settings: injected through the resolver, never read from the disk or platform file or ambient env.
+// Hermetic trusted settings: the resolver module is mocked so every call validates the layer the test sets, never the
+// disk or platform file or ambient env. computeVerdict itself has no settings argument a caller could use.
 const AUDIT = Object.freeze({ verdict: { mode: 'model' }, preExisting: { mode: 'prove', baseRecheckMax: 3 }, releaseStage: 'prerelease',
   raceBlockPaths: [], guardFloorPaths: [], priorQuestionHashes: [], recheck: { max: 1 }, cards: { requireOnMain: true, requirePayBy: true } });
 const trustedLayer = (over = {}) => ({ audit: { ...AUDIT, ...over }, env: {} });
+const settingsLayer = vi.hoisted(() => ({ current: null }));
+vi.mock('../../lib/audit-settings.mjs', async importOriginal => {
+  const real = await importOriginal();
+  return { ...real, resolveAuditSettings: () => {
+    const { audit, env } = settingsLayer.current;
+    return real.resolveAuditSettings({ fileRead: () => JSON.stringify({ audit }), platform: null, env, log: () => {} });
+  } };
+});
 // Default: trusted prove mode with a valid proof for every D2 (the relation label is irrelevant); opts override.
 const compute = async (findings, opts = {}, layer = trustedLayer()) => {
   const o = { preExistingMode: 'prove', base: BASE, head: HEAD, ...opts };
   if (!('relationProofs' in opts)) o.relationProofs = findings.filter(f => f?.class === 'D2').map(proofFor);
-  return (await loadComputeVerdict())(findings, o, layer);
+  const computeVerdict = await loadComputeVerdict();
+  settingsLayer.current = layer;
+  return computeVerdict(findings, o);
 };
 const finding = (overrides = {}) => ({ id: 'f1', class: 'E1', file: 'scripts/output.mjs', line: 12,
   invariant: 'Output preserves the requested label', trigger: 'Input label is empty',
@@ -408,9 +419,13 @@ describe('R473 structured concurrency evidence', () => {
     it('mode block and mode allow both block even with a valid proof; default settings block', async () => {
       const f = d2();
       for (const preExistingMode of ['block', 'allow', 'bogus']) expect((await run(f, { relationProofs: [proofFor(f)], preExistingMode })).verdict).toBe('WEAKENED');
-      const bare = (await loadComputeVerdict())([f], { relationProofs: [proofFor(f)], base: BASE, head: HEAD, readCard: rc },
-        trustedLayer({ preExisting: { mode: 'block', baseRecheckMax: 3 } }));
+      const computeVerdict = await loadComputeVerdict();
+      settingsLayer.current = trustedLayer({ preExisting: { mode: 'block', baseRecheckMax: 3 } });
+      const bare = computeVerdict([f], { relationProofs: [proofFor(f)], base: BASE, head: HEAD, readCard: rc });
       expect(bare.verdict).toBe('WEAKENED');
+      // There is no settings argument: a third argument carrying relaxed settings changes nothing.
+      expect(computeVerdict([f], { relationProofs: [proofFor(f)], base: BASE, head: HEAD, readCard: rc, preExistingMode: 'prove' },
+        trustedLayer())).toEqual(bare);
     });
     it('a caller cannot relax trusted settings through options (PR #6381 red team)', async () => {
       const f = d2(); const proof = { relationProofs: [proofFor(f)] };
@@ -464,7 +479,14 @@ describe('R473 structured concurrency evidence', () => {
     it.each(['scripts/guard-bash.mjs', 'scripts/guard-git-push.mjs', 'scripts/guard-lane.mjs', 'scripts/guard-stop-passive-wait.mjs',
       'scripts/conveyor/guard-1c-mutation-check.mjs', 'scripts/backlog-guard.mjs', 'scripts/backlog/guarded-write.mjs', '.claude/settings.json',
       'scripts/lib/lane-lease.mjs', 'scripts/readiness/scope-lease.mjs', 'scripts/readiness/scope-lease-live.mjs', 'scripts/lib/daemon-rebuild/lease.mjs',
-    ])('every guard and lease module is on the built-in floor: E2 and D3 in %s never ship', async file => {
+      'scripts/operations/coordination-lock.mjs', 'scripts/lib/daemon-clone-lock.mjs', 'scripts/readiness/with-lock.mjs', 'scripts/readiness/drain-lock.mjs',
+      'skills-src/conveyor/runner-lock.mjs', '.githooks/pre-commit', '.githooks/pre-push', 'scripts/lib/git-hook-surface.mjs',
+      'scripts/lib/permission-change.mjs', 'scripts/lib/pr-merge-gate.mjs', '.github/workflows/merge-gate.yml', '.github/workflows/review-gate.yml',
+      'scripts/operations/audit-verdict.mjs', 'scripts/operations/codex-audit.mjs', 'scripts/operations/codex-audit-io.mjs',
+      'scripts/lib/audit-settings.mjs', 'scripts/lib/policy-cascade.mjs', 'scripts/settings/codex-audit.json',
+      // A case-insensitive file system resolves these to the guard itself.
+      'Scripts/Guard-Bash.mjs', 'scripts/GUARD-bash.mjs', 'SCRIPTS/LIB/LANE-LEASE.MJS',
+    ])('every guard, lease, lock, gate and audit module is on the built-in floor: E1, E2 and D3 in %s never ship', async file => {
       for (const cls of ['E1', 'E2', 'D3']) neverShips(await compute([finding({ class: cls, file })], options()));
     });
   });

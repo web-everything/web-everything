@@ -125,20 +125,17 @@ function pathCandidates(file) {
   }
   return parts.length ? [parts.join('/')] : null;
 }
-const matchesAny = (file, pattern) => { const c = pathCandidates(file); return c === null || c.some(x => matchesPath(x, pattern)); };
+// Case-insensitive: the checkout may sit on a case-insensitive file system, where `Scripts/Guard-Bash.mjs` IS the guard.
+// Folding both sides only ever protects more paths.
+const matchesAny = (file, pattern) => {
+  const c = pathCandidates(file);
+  return c === null || c.some(x => matchesPath(x.toLowerCase(), pattern.toLowerCase()));
+};
 
-/**
- * Settings come from the trusted running checkout (strictest on any failure), never from the candidate. `trustedLayer`
- * is a test seam only: `{ audit, env }` is validated by the same resolver in place of the disk and platform files.
- */
-function trustedSettings(trustedLayer) {
-  if (trustedLayer === undefined) return resolveAuditSettings().value;
-  const { audit, env = {} } = trustedLayer ?? {};
-  return resolveAuditSettings({ fileRead: () => JSON.stringify({ audit }), platform: null, env, log: () => {} }).value;
-}
-
-export function computeVerdict(findings, options = {}, trustedLayer) {
-  const trusted = trustedSettings(trustedLayer);
+export function computeVerdict(findings, options = {}) {
+  // Settings come from the trusted running checkout (strictest on any failure), never from the candidate or the
+  // caller. There is deliberately no settings argument: tests mock the resolver module instead.
+  const trusted = resolveAuditSettings().value;
   // A caller may only TIGHTEN the trusted settings: a stricter stage, more protected paths. It can never relax them.
   const { rulings = [], relationProofs = [], base, head } = options;
   const stageOption = options.releaseStage ?? trusted.releaseStage;

@@ -10,16 +10,22 @@ import { cascadePolicy, readPlatformPreferences } from './policy-cascade.mjs';
 
 export const AUDIT_SETTINGS_PATH = fileURLToPath(new NodeURL('../settings/codex-audit.json', import.meta.url));
 /**
- * Built-in protected paths: the concurrency modules (locks, leases, slots, lane pool, merge, drain) and the guard hooks
- * with their registration (PR #6381 red team: `scripts/guard-bash.mjs` and `scripts/lib/lane-lease.mjs` were missing).
+ * Built-in protected paths: the concurrency modules (locks, leases, slots, lane pool, merge, drain), the guard hooks
+ * with their registration, the git hooks and merge/review gates, and the auditor itself (PR #6381 red team:
+ * `scripts/guard-bash.mjs` and `scripts/lib/lane-lease.mjs` were missing).
  * Every audit path list starts from this floor; settings and env can only ADD to it.
  */
 export const GUARD_FLOOR = Object.freeze(['scripts/**/file-locks*', 'scripts/*file-locks*', 'scripts/**/lease*', 'scripts/*lease*',
   'scripts/lib/lane-lease.mjs', 'scripts/readiness/scope-lease*',
   'scripts/**/slot*', 'scripts/*slot*', 'scripts/**/lock-reaper*', 'scripts/*lock-reaper*', 'scripts/**/lane-pool*', 'scripts/*lane-pool*',
   'scripts/**/merge*', 'scripts/*merge*', 'scripts/**/drain*', 'scripts/*drain*', 'scripts/**/mq*', 'scripts/*mq*',
+  'scripts/*-lock.mjs', 'scripts/**/*-lock.mjs', 'scripts/**/with-lock*', 'skills-src/**/*-lock.mjs',
   'scripts/guard-*', 'scripts/**/guard-*', 'scripts/*-guard*', 'scripts/**/*-guard*', 'scripts/guarded-*', 'scripts/**/guarded-*',
-  '.claude/settings.json']);
+  '.claude/settings.json', '.githooks/', 'scripts/lib/git-hook-surface.mjs', 'scripts/lib/permission-change.mjs',
+  'scripts/lib/pr-merge-gate.mjs', '.github/workflows/',
+  // The auditor itself: weakening it weakens every later audit.
+  'scripts/operations/audit-verdict.mjs', 'scripts/operations/codex-audit*', 'scripts/lib/audit-settings.mjs',
+  'scripts/lib/policy-cascade.mjs', 'scripts/settings/codex-audit.json']);
 /** What an invalid or unreadable path list resolves to: the floor plus every path (`**` matches any path). */
 const STRICTEST_PATHS = Object.freeze([...GUARD_FLOOR, '**']);
 
