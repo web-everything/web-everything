@@ -715,7 +715,12 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
               // Active work outranks a stale result: never lift the hold while a pass is queued, running or unfinished.
               const active = evidence?.inFlight || evidence?.queued || ['queued', 'running'].includes(evidence?.status?.status)
                 || (evidence?.carry && evidence.carry.step !== 'done');
+              let witness = null;
+              if (!active && planningOptions.readWitness) {
+                witness = readWithConfirmExclusions(planningOptions.readWitness, { ...key, rawPr: live, readIgnorableConfirms });
+              }
               if (active) row.settleError = 'red-team pass still active; label unchanged';
+              else if (evidence?.carryConflict || witness?.ok === false) row.settleError = 'conflicting review evidence; label unchanged';
               else if (!resultMaySynchronize(live.comments, row.prNumber, row.head)) row.settleError = 'result comment not strictly clean';
               else {
                 const verdict = evidence?.status?.status === 'finished' ? evidence.status.result?.foldedVerdict : null;
