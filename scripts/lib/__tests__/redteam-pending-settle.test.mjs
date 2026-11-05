@@ -11,6 +11,7 @@ import { redTeamOwedFor } from '../review-red-team-policy.mjs';
 import { settleRedTeamSkip } from '../red-team-skip-outcome.mjs';
 import { planRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
+import { createReviewJobIo } from '../../operations/review-job.mjs';
 
 // Fail any accidental transport call locally; all intended IO is injected below.
 vi.mock('../gh-throttle.mjs', async original => ({
@@ -73,6 +74,74 @@ function resultComment(confirmed = false) {
       confirmedByRecheck: true, file: 'scripts/example.mjs', filesRead: ['scripts/example.mjs'],
     }] : [] }));
 }
+
+describe('result settlement requires a strictly clean comment or a confirmed break', () => {
+  it.each(['indented finding', 'bulleted finding', 'unknown line', 'unconfirmed finding'])(
+    '%s cannot replace pending with clear', kind => {
+      const o = runFixture();
+      const clean = resultComment();
+      const broken = resultComment(true);
+      const body = kind === 'indented finding' ? broken.body.replace(/^1\./m, '  1.')
+        : kind === 'bulleted finding' ? `${clean.body}\n- [**confirmed**] (edge-case, broken) — hidden break`
+          : kind === 'unconfirmed finding' ? broken.body.replace('[**confirmed**]', '[not confirmed]')
+            : `${clean.body}\nSomething else was found.`;
+      o.rawPrs[0].comments.push(clean, trusted(body, iso(acceptedAt + 1)));
+      expect(mod.runRedTeamOnSkip(o).rows[0].settleError).toBe('result comment not strictly clean');
+      expect(o.syncLabels).not.toHaveBeenCalled(); expect(o.settlePending).not.toHaveBeenCalled();
+      expect(o.rawPrs[0].labels).toContain('red-team:pending');
+    });
+  it('selects the newest trusted result by timestamp for the clean check', () => {
+    const o = runFixture();
+    o.rawPrs[0].comments.push(trusted(resultComment().body, iso(acceptedAt + 2)),
+      trusted(`${resultComment().body}\nunknown text`, iso(acceptedAt + 1)));
+    expect(mod.runRedTeamOnSkip(o).rows[0]).not.toHaveProperty('settleError');
+    expect(o.syncLabels).toHaveBeenCalledOnce();
+  });
+});
+
+describe('complete bounded formal-review reads', () => {
+  it('reads successive pages through the bounded injected transport', () => {
+    const exec = vi.fn().mockReturnValueOnce(JSON.stringify(Array.from({ length: 100 }, (_, id) => ({ id, state: 'APPROVED' }))))
+      .mockReturnValueOnce(JSON.stringify([{ id: 101, state: 'CHANGES_REQUESTED' }]));
+    expect(mod.readCompletePrReviews({ repo, pr, exec })).toHaveLength(101);
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(exec.mock.calls[1][0]).toEqual(['api', `repos/${repo}/pulls/${pr}/reviews?per_page=100&page=2`]);
+    expect(exec.mock.calls[1][1]).toMatchObject({ timeout: 60_000, maxBuffer: 1024 * 1024 });
+  });
+  it.each(['parse failure', 'non-array', 'oversize', 'page cap'])(
+    '%s refuses incomplete reviews for operator inspection', kind => {
+      expect(mod.readCompletePrReviews).toBeTypeOf('function');
+      const exec = vi.fn(() => kind === 'parse failure' ? '{' : kind === 'non-array' ? '{}'
+        : kind === 'oversize' ? JSON.stringify([{ body: 'x'.repeat(1024 * 1024) }])
+          : JSON.stringify(Array.from({ length: 100 }, (_, id) => ({ id, state: 'APPROVED' }))));
+      expect(() => mod.readCompletePrReviews({ repo, pr, exec })).toThrow(/review|JSON/i);
+      expect(exec.mock.calls.length).toBeLessThanOrEqual(10);
+    });
+  it('the job keeps its unfinished witness when complete reviews are unreadable', () => {
+    const readCompleteReviews = vi.fn(() => { throw Error('complete reviews unreadable'); });
+    const readWitness = vi.fn(() => ({ ok: false, reason: 'review-unfinished' }));
+    const exec = vi.fn(() => JSON.stringify({ headRefOid: head, labels: ['review:accepted', 'red-team:pending'] }));
+    const io = createReviewJobIo({ env: {}, exec, readWitness, readCompleteReviews });
+    expect(() => io.readRedTeamOnlyPayload({ repo, pr, head })).toThrow(/review-unfinished/);
+    expect(readCompleteReviews).toHaveBeenCalledOnce(); expect(readWitness).toHaveBeenCalledOnce();
+    expect(exec).toHaveBeenCalledOnce();
+  });
+  it.each(['not-owed', 'result', 'clear'])(
+    '%s refuses unreadable complete reviews despite a readable legacy review snapshot', kind => {
+      const status = { status: 'finished', result: 'not-owed' };
+      const o = kind === 'not-owed' ? notOwedRunFixture() : runFixture({
+        readEvidence: () => evidence({ status }), readStatus: () => status });
+      if (kind === 'result') o.rawPrs[0].comments.push(resultComment());
+      const readCompleteReviews = vi.fn(() => { throw Error('complete reviews unreadable'); });
+      o.readCompleteReviews = readCompleteReviews;
+      const row = mod.runRedTeamOnSkip(o).rows[0];
+      if (kind === 'clear') expect(row.why).toBe('clear failed: evidence changed before settlement');
+      else expect(row.settleError).toBe('complete reviews unreadable');
+      expect(readCompleteReviews).toHaveBeenCalledOnce();
+      expect(o.settlePending).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled();
+      expect(o.settle).not.toHaveBeenCalled();
+    });
+});
 
 describe('policy-clear publication revalidates fresh evidence', () => {
   function clearFixture() {

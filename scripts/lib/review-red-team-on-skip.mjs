@@ -12,7 +12,7 @@ import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir, withRedTeamStatusClaim, RUN_MTIME_SLACK_MS, ABANDONED_REVIEW_AFTER_MS } from './drain-red-team-evidence.mjs';
-import { redTeamForHead, redTeamMarker, parseRedTeamComment } from './red-team-gate.mjs';
+import { redTeamForHead, redTeamMarker, parseRedTeamComment, breakClass } from './red-team-gate.mjs';
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 import { isRealHead, safeErrorText, settleRedTeamSkip } from './red-team-skip-outcome.mjs';
@@ -27,6 +27,7 @@ import { restampRecord, strandedNumberingRecords } from './numbering-carry.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { RED_TEAM_STATUS_LABELS } from './red-team-status-label-meta.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
+import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
 
 export const staleRunDeadlineMs = (env = process.env) => /^\d+$/.test(env.WE_RED_TEAM_STALE_RUN_MS ?? '')
   && Number.isSafeInteger(Number(env.WE_RED_TEAM_STALE_RUN_MS)) ? Number(env.WE_RED_TEAM_STALE_RUN_MS) : 7_200_000;
@@ -505,6 +506,51 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
 const lastDispatch = new Map();
 const safeLine = value => String(value).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ').slice(0, 600);
 
+/** Complete review evidence: at most ten requests and one MiB, never a truncated success. */
+export function readCompletePrReviews({ repo, pr, env = process.env, exec = runGhSync } = {}) {
+  if (exec === runGhSync && (isUnderTest() || isUnderTest(env))) return undefined;
+  if (!/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/i.test(repo ?? '') || !Number.isSafeInteger(Number(pr)) || Number(pr) <= 0) {
+    throw Error('PR reviews identity unreadable; inspect complete reviews');
+  }
+  const reviews = [];
+  let bytes = 0;
+  for (let page = 1; page <= 10; page++) {
+    const text = exec(['api', `repos/${repo}/pulls/${Number(pr)}/reviews?per_page=100&page=${page}`],
+      { env, encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 });
+    if (typeof text !== 'string' || (bytes += Buffer.byteLength(text, 'utf8')) > 1024 * 1024) {
+      throw Error('PR reviews size cap exceeded; inspect complete reviews');
+    }
+    let rows;
+    try { rows = JSON.parse(text); }
+    catch { throw Error('PR reviews JSON unreadable; inspect complete reviews'); }
+    if (!Array.isArray(rows) || rows.length > 100) throw Error('PR reviews page unreadable; inspect complete reviews');
+    reviews.push(...rows);
+    if (rows.length < 100) return reviews;
+  }
+  throw Error('PR reviews page cap reached; inspect complete reviews');
+}
+
+/** Only a known clean template can clear; parsed confirmed breaks retain the send-back path. */
+function resultMaySynchronize(comments, pr, head) {
+  const newest = comments.map((comment, index) => ({ comment, index }))
+    .filter(({ comment }) => redTeamForHead([comment], pr, head))
+    .sort((a, b) => (Date.parse(commentCreatedAt(a.comment)) || 0) - (Date.parse(commentCreatedAt(b.comment)) || 0)
+      || a.index - b.index).at(-1)?.comment;
+  const parsed = newest && parseRedTeamComment(newest.body);
+  if (!parsed) return false;
+  if (parsed.findings.some(finding => breakClass(finding) === 'broken')) return true;
+  if (parsed.findings.length !== 0) return false;
+  const advisory = "Advisory only: this comment changes no label itself; the red-team gate (setting `redTeam.confirmedBreaks`) sends a confirmed broken break back to the fixer. Head `"
+    + String(head).slice(0, 12) + '` · red team ';
+  return newest.body.split(/\r?\n/).filter(line => line.trim()).every(line =>
+    line === redTeamMarker(pr, head)
+    || line === '### Post-accept red team — no break found'
+    || line === 'The red team tried to break this change and reported nothing.'
+    || /^Red team not required on this head: [^\r\n]+$/.test(line)
+    || /^Findings: none\.?$/i.test(line)
+    || line.startsWith(advisory) && /^[^\s`/]+\/[^\s`]+ · recorded verdict `(accept|changes|needs-human|prevention-outstanding)`\.$/.test(line.slice(advisory.length)));
+}
+
 /** Re-read the live head and labels before removing a stale pending status. */
 export function settlePendingFor({ provider, env = process.env } = {}) {
   return ({ repo, pr, head }) => {
@@ -533,7 +579,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   env = process.env, setting,
   readEvidence = readDrainRedTeamEvidence, readStatus = readRedTeamStatus,
   readCarry = key => readRedTeamCarry({ ...key, env }),
-  readReviews,
+  readReviews, readCompleteReviews,
   // Test defaults use the supplied fixture without external IO. Race tests inject live readers.
   provider = isUnderTest() || isUnderTest(env) ? {
     readPrState: (_repo, pr) => rawPrs?.find(raw => Number(raw.number) === Number(pr)),
@@ -606,10 +652,11 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     const freshSettlement = row => {
       const live = provider.readPrState(repo, row.prNumber);
       const comments = readComments({ repo, pr: row.prNumber });
-      const reviews = !readReviews && (isUnderTest() || isUnderTest(env))
-        ? (rawPrs?.find(raw => Number(raw.number) === row.prNumber)?.reviews
-          ?? planningPrs.find(raw => Number(raw.number) === row.prNumber)?.reviews)
-        : reviewReader({ repo, pr: row.prNumber });
+      const reviews = readCompleteReviews ? readCompleteReviews({ repo, pr: row.prNumber })
+        : !(isUnderTest() || isUnderTest(env)) ? readCompletePrReviews({ repo, pr: row.prNumber, env })
+          : readReviews ? reviewReader({ repo, pr: row.prNumber })
+            : (rawPrs?.find(raw => Number(raw.number) === row.prNumber)?.reviews
+              ?? planningPrs.find(raw => Number(raw.number) === row.prNumber)?.reviews);
       if (live?.headRefOid !== row.head || !Array.isArray(live.labels)
         || live.labels.some(label => typeof (typeof label === 'string' ? label : label?.name) !== 'string')
         || !Array.isArray(comments) || comments.some(comment => typeof comment?.body !== 'string')
@@ -653,6 +700,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
               const active = evidence?.inFlight || evidence?.queued || ['queued', 'running'].includes(evidence?.status?.status)
                 || (evidence?.carry && evidence.carry.step !== 'done');
               if (active) row.settleError = 'red-team pass still active; label unchanged';
+              else if (!resultMaySynchronize(live.comments, row.prNumber, row.head)) row.settleError = 'result comment not strictly clean';
               else syncLabels({ ...key, env, log: note, evidence, provider, live, comments: live.comments });
             }
           }
