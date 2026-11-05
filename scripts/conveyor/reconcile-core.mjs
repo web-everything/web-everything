@@ -1600,9 +1600,8 @@ function latestHeadReview(pr, { currentHeadOnly = false } = {}) {
   const current = reviews.filter(r => sameHeadSha(r.head, pr.headRefOid));
   if (currentHeadOnly) {
     // Other heads' clocks cannot hide a newer operator request on this head.
-    current.sort((a, b) => b.at - a.at);
-    if (current.length > 1 && current[0].at === current[1].at) return null;
-    return current[0] ?? null;
+    if (current.some((r, i) => i > 0 && r.at <= current[i - 1].at)) return null;
+    return current.at(-1) ?? null;
   }
   // Coverage is independent of chronology: a skewed old-head review cannot reopen this head.
   if (current.length || reviews.some((r, i) => i > 0 && r.at <= reviews[i - 1].at)) return null;
@@ -1615,7 +1614,10 @@ function operatorSendBackAfterReview(pr) {
   if (!review || !sameHeadSha(review.head, pr.headRefOid)) return null;
   const item = openOperatorSendBacks(pr).at(-1);
   if (!item?.body || !Number.isFinite(Date.parse(item.at)) || Date.parse(item.at) <= review.at
+    || item.index <= review.index
     || (item.head && !sameHeadSha(item.head, pr.headRefOid))) return null;
+  // Reuse the same one-shot consumption check as the existing send-back route, with the original ID type.
+  if (!item.id || !operatorSendBackRearm(pr, { verdictId: pr.comments[item.index].id })) return null;
   return { verdictId: item.id, login: item.login, body: item.body };
 }
 

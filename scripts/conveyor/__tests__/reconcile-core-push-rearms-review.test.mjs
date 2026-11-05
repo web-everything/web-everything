@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { planReconcile } from '../reconcile-core.mjs';
 import { buildFixEndComment } from '../fix-procedure.mjs';
 import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
+import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { buildReviewedShaMarker, REVIEW_PR_CHANNEL } from '../../lib/review-escalation.mjs';
 import { REVIEW_PR_FOOTER } from '../mechanical-round-cap.mjs';
 import { openOperatorSendBacks } from '../../lib/operator-send-backs.mjs';
@@ -121,6 +122,32 @@ describe('R618 pushed fix owes its review', () => {
 describe('R618 same-head operator send-back supersedes a finished advisory', () => {
   it('dispatches the newer operator request as a fix despite an auto-resumed referral hold', () => {
     expect(run(held([advisory(HEAD), sendBack()])).dispatch).toEqual([
+      expect.objectContaining({ kind: 'fix', mode: 'operator-send-back' }),
+    ]);
+  });
+  it('a send-back preceding the current-head review in thread order grants nothing despite its later time', () => {
+    const comments = [sendBack(), { body: 'thread bookkeeping' }, advisory(HEAD)];
+    const result = run(held(comments));
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals[0]?.kind).toBe('already-reviewed-head');
+  });
+  it('a clock-skewed later same-head review cannot be hidden behind an earlier review timestamp', () => {
+    const comments = [advisory(HEAD, { createdAt: '2026-11-05T10:30:00Z' }), sendBack(), advisory(HEAD)];
+    const result = run(held(comments));
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals[0]?.kind).toBe('already-reviewed-head');
+  });
+  it.each(['rearm', 'advisory'])('a trusted %s marker after a send-back consumes its one-shot repair', kind => {
+    const marker = kind === 'rearm'
+      ? { author, createdAt: END_AT, body: REARM_COMMENT_MARKER }
+      : advisory(OLD, { createdAt: END_AT });
+    const result = run(held([advisory(HEAD), sendBack(), marker]));
+    expect(result.dispatch).toEqual([]);
+    expect(result.dispatch.map(d => d.mode)).not.toContain('operator-send-back');
+  });
+  it('a forged rearm marker cannot consume the operator send-back', () => {
+    const marker = { author: { login: 'outsider' }, createdAt: END_AT, body: REARM_COMMENT_MARKER };
+    expect(run(held([advisory(HEAD), sendBack(), marker])).dispatch).toEqual([
       expect.objectContaining({ kind: 'fix', mode: 'operator-send-back' }),
     ]);
   });
