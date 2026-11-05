@@ -353,16 +353,26 @@ export function sweepCiRedRecovery({
 
   const applied = [];
   if (apply) {
+    // `started` counts refreshes that did work (they spend the progress floor and the per-tick cap). `attempts` counts
+    // every refresh CALL, deferred or not: a deferral writes nothing but its network reads still cost time (review
+    // round 3 of #6340: slow deferrals bypassed the budget and the cap until the 300 s pass deadline killed the sweep).
     let started = 0;
+    let attempts = 0;
+    const applyStartedAt = now();
+    const floorGraceMs = Math.min(applyBudgetMs, APPLY_FLOOR_GRACE_MS);
     for (const d of plan.dispatch) {
-      // Progress floor: the first refresh of a tick always starts. Discovery (per-PR comment reads) can by itself
-      // outlast the budget; without the floor every tick would defer everything and the queue would never drain.
-      if (started >= maxApplyPerTick || (started >= 1 && now() - tickStartedAt >= applyBudgetMs)) {
+      // Progress floor: once over budget, the tick may still start a refresh that does work — discovery (per-PR
+      // comment reads) can by itself outlast the budget, and without the floor every tick would defer everything.
+      // Deferrals do not spend the floor, but they may only hunt for that refresh for `floorGraceMs` of loop time.
+      const overBudget = now() - tickStartedAt >= applyBudgetMs;
+      if (started >= maxApplyPerTick || attempts >= maxApplyPerTick * APPLY_ATTEMPT_FACTOR
+        || (overBudget && (started >= 1 || now() - applyStartedAt >= floorGraceMs))) {
         applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, ok: false, action: 'deferred', deferred: true, budgetExhausted: true,
           error: 'tick apply budget spent — left for the next tick (no rebase comment posted, the per-sha cap is untouched)' });
         continue;
       }
       const held = checkClaim({ repo, branch: d.headRefName });
+      if (!held) attempts += 1; // a claim-held PR makes no network call, so it costs nothing
       // Passing prNumber makes refreshOntoMain verify the PR is same-repo before it rebases and force-pushes.
       const result = held ? { ok: false, error: held.message }
         : refresh(d.headRefName, { base: `origin/${defaultBranch}`, root: repoRoot, prNumber: d.prNumber, repo, readIsCrossRepository });
@@ -1666,7 +1676,13 @@ function parseFlags(argv) {
   return flags;
 }
 
-/** we:scripts/conveyor/ci-red-recovery-watch.mjs#resolveApplyBudgetMs — how long (from the tick's start) the apply
+/** Refresh CALLS per tick (deferred ones included) may reach this multiple of the per-tick cap; deferrals write
+ *  nothing, so they are cheaper than real refreshes, but never free. */
+const APPLY_ATTEMPT_FACTOR = 2;
+/** Over budget with no refresh that did work yet, the loop may keep probing (deferrals) for at most this long. */
+const APPLY_FLOOR_GRACE_MS = 60_000;
+
+/** we:scripts/conveyor/ci-red-recovery-watch.mjs#resolveApplyBudgetMs —how long (from the tick's start) the apply
  *  loop may keep STARTING refreshes. The pass deadline is 300 s and three more passes follow, so default 170 s. */
 export function resolveApplyBudgetMs(env = process.env) {
   const n = Number(env.WE_RECOVERY_APPLY_BUDGET_MS);

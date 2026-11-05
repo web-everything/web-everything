@@ -312,6 +312,46 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
     expect(result.applied.map((a) => [a.prNumber, a.action])).toEqual([[2635, 'deferred'], [2636, 'rebased']]);
   });
 
+  // Review round 3 of #6340: deferrals do no writes but their verification calls cost real time. 12 PRs whose
+  // refresh each takes 35 s then defers must stop at the 170 s budget, not run until the 300 s pass deadline.
+  it('slow deferred refreshes still honour the time budget (no run past the pass deadline)', () => {
+    const prs = Array.from({ length: 12 }, (_, i) => ({ ...PR_2635, number: 2700 + i, headRefName: `lane/s${i}` }));
+    let t = 0;
+    const refresh = vi.fn(() => { t += 35_000; return { deferred: true, ok: false, error: 'verification failed' }; });
+    const postComment = vi.fn();
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment, apply: true, now: () => t, applyBudgetMs: 170_000, maxApplyPerTick: 8,
+    });
+    expect(refresh).toHaveBeenCalledTimes(5);
+    expect(t).toBeLessThanOrEqual(175_000);
+    expect(postComment).not.toHaveBeenCalled();
+    expect(result.applied).toHaveLength(12);
+    expect(result.applied.slice(5).every((a) => a.budgetExhausted && a.deferred)).toBe(true);
+  });
+
+  it('slow discovery plus slow deferrals only gets a bounded grace to find one refresh that does work', () => {
+    const prs = Array.from({ length: 6 }, (_, i) => ({ ...PR_2635, number: 2750 + i, headRefName: `lane/q${i}` }));
+    let t = 0;
+    const refresh = vi.fn(() => { t += 35_000; return { deferred: true, ok: false, error: 'verification failed' }; });
+    sweepCiRedRecovery({
+      readOpenPrs: () => { t += 200_000; return prs; }, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment: vi.fn(), apply: true, now: () => t, applyBudgetMs: 170_000, maxApplyPerTick: 8,
+    });
+    expect(refresh).toHaveBeenCalledTimes(2); // 60 s grace: attempts at +0 s and +35 s, stopped at +70 s
+  });
+
+  it('instant deferrals are bounded by the attempt cap (twice the per-tick cap), not unlimited', () => {
+    const prs = Array.from({ length: 10 }, (_, i) => ({ ...PR_2635, number: 2800 + i, headRefName: `lane/a${i}` }));
+    const refresh = vi.fn(() => ({ deferred: true, ok: false, error: 'not same-repo' }));
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment: vi.fn(), apply: true, maxApplyPerTick: 2,
+    });
+    expect(refresh).toHaveBeenCalledTimes(4);
+    expect(result.applied.filter((a) => a.budgetExhausted)).toHaveLength(6);
+  });
+
   it('a failed refresh whose claim is found held afterwards is a free deferral too', () => {
     const prs = [2635, 2636].map((number) => ({ ...PR_2635, number, headRefName: `lane/k${number}` }));
     let t = 0;

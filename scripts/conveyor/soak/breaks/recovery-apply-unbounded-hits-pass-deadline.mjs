@@ -48,6 +48,17 @@ export default {
       apply: true, now: () => t3, applyBudgetMs: 150, maxApplyPerTick: 8,
     });
     if (!freeDefer.applied.some((a) => a.ok)) violations.push({ detail: 'a free deferral spent the progress floor and starved the later PRs' });
+    // Review round 3 of #6340: deferrals do no writes but still cost time; slow ones must not run past the budget.
+    let t4 = 0;
+    let slowCalls = 0;
+    sweepCiRedRecovery({
+      readOpenPrs: () => Array.from({ length: 12 }, (_, i) => ({ number: 7100 + i, headRefName: `lane/slow${i}`, headRefOid: String(i % 9).repeat(40), statusCheckRollup: [failing] })),
+      readMainRuns: () => mainRuns, readAheadBy: () => 5, readComments: () => [],
+      refresh: () => { slowCalls += 1; t4 += 35_000; return { deferred: true, ok: false, error: 'verification failed' }; },
+      postComment: () => {}, checkClaim: () => null, readPriority: () => null,
+      apply: true, now: () => t4, applyBudgetMs: 170_000, maxApplyPerTick: 8,
+    });
+    if (t4 > 210_000) violations.push({ detail: `slow deferred refreshes ran ${t4} ms (${slowCalls} calls) past a 170000 ms budget` });
     return { violations };
   },
   judge(report) { return report.violations.map((v) => v.detail); },
