@@ -706,7 +706,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
                 || (evidence?.carry && evidence.carry.step !== 'done');
               if (active) row.settleError = 'red-team pass still active; label unchanged';
               else if (!resultMaySynchronize(live.comments, row.prNumber, row.head)) row.settleError = 'result comment not strictly clean';
-              else syncLabels({ ...key, env, log: note, evidence, provider, live, comments: live.comments });
+              else syncLabels({ ...key, env, log: note, evidence, provider });
             }
           }
           else if (row.settle === 'not-owed') {
