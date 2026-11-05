@@ -3,7 +3,7 @@
 // unknown run evidence (review-unfinished / scan-capped). A trusted result comment bound to the exact
 // head settles those two reasons; a recorded break still sends back; missing evidence still fails closed.
 import { describe, expect, it, vi } from 'vitest';
-import { readDrainRedTeamEvidence, settleUnknownEvidenceByComment, RUN_MTIME_SLACK_MS } from '../drain-red-team-evidence.mjs';
+import { readDrainRedTeamEvidence, settleUnknownEvidenceByComment, UNREAD_SETTLE_MARGIN_MS } from '../drain-red-team-evidence.mjs';
 import { createDrainMergeStrategy } from '../drain-merge-strategy.mjs';
 import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 
@@ -20,7 +20,9 @@ const broken = [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'bro
 const T = Date.parse('2026-11-05T12:00:00Z');
 // Fabricated bounds default to an undecided unfinished review (the settleable shape); the decided shape is pinned below.
 const unknown = (reason, bounds) => Object.defineProperty({ ok: false, reason }, 'settleBounds', { value: { unfinishedUndecided: true, ...bounds }, enumerable: false });
-const older = { unfinishedStartedAt: T - 3600e3, unreadBoundaryAt: T - 3600e3 };
+// An unread record quiet for longer than the settle margin (slack + abandon horizon) before the comment.
+const OLD = T - 3 * 3600e3;
+const older = { unfinishedStartedAt: T - 3600e3, unreadBoundaryAt: OLD };
 const holdFor = (evidence, comments) => redTeamEnqueueHold({ ...settleUnknownEvidenceByComment(evidence, comments, pr, head), comments, pr, head, env: {} });
 
 describe('R622 unknown run evidence settled by a head-bound result comment', () => {
@@ -56,7 +58,7 @@ describe('R622 unknown run evidence settled by a head-bound result comment', () 
   });
   it('review-unfinished that is also capped needs the unread boundary beaten too', () => {
     expect(holdFor(unknown('review-unfinished', { unfinishedStartedAt: T - 3600e3, unreadBoundaryAt: T + 60e3 }), [comment()])).toMatch(/evidence unknown/);
-    expect(holdFor(unknown('review-unfinished', { unfinishedStartedAt: T - 3600e3, unreadBoundaryAt: T - 3600e3 }), [comment()])).toBeNull();
+    expect(holdFor(unknown('review-unfinished', { unfinishedStartedAt: T - 3600e3, unreadBoundaryAt: OLD }), [comment()])).toBeNull();
   });
   it('other unknown reasons are never settled by a comment', () => {
     for (const reason of ['run-start-missing', 'read-failed']) {
@@ -102,6 +104,12 @@ describe('R622 a re-review that already decided is not released by an earlier jo
   it('a rejection verdict held only by a pending step stays held', () => {
     held(base({ verdict: { verdict: 'changes' }, pending: { kind: 'effects' } }));
     held(base({ verdict: 'reject', pending: { kind: 'effects' } }));
+  });
+  it('a present verdict this reader does not recognise counts as decided (fails closed)', () => {
+    for (const verdict of [{}, { decision: 'changes' }, { outcome: 'reject' }, [], 7, 'reject']) {
+      held(base({ verdict, pending: { kind: 'effects' } }));
+      held(base({ verdict, effects: openEffect('pending') }));
+    }
   });
   it('an open label effect on an otherwise undecided run stays held', () => {
     held(base({ verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' }, effects: openEffect('pending') }));
@@ -157,12 +165,12 @@ describe('R622 capped scan settles from the reader\'s own boundary, not a fabric
       read: id => (id === 'review-pr-new' ? finished(T - 7200e3) : finished(T - 9000e3)), readScorecards: () => [], now: T });
   };
   it('the reader reports scan-capped with the first unread record\'s mtime as the boundary', () => {
-    const evidence = capped(T - 3600e3);
+    const evidence = capped(OLD);
     expect(evidence).toMatchObject({ ok: false, reason: 'scan-capped' });
-    expect(evidence.settleBounds).toMatchObject({ unreadBoundaryAt: T - 3600e3 });
+    expect(evidence.settleBounds).toMatchObject({ unreadBoundaryAt: OLD });
   });
   it('an unread record older than the result comment (by the mtime slack) settles', () => {
-    expect(settleUnknownEvidenceByComment(capped(T - 3600e3), [comment()], pr, head)).toMatchObject({ ok: true, settledByComment: 'scan-capped' });
+    expect(settleUnknownEvidenceByComment(capped(OLD), [comment()], pr, head)).toMatchObject({ ok: true, settledByComment: 'scan-capped' });
   });
   it('an unread record newer than the result comment stays held', () => {
     expect(settleUnknownEvidenceByComment(capped(T + 60e3, T + 120e3), [comment()], pr, head)).toMatchObject({ ok: false, reason: 'scan-capped' });
@@ -170,11 +178,17 @@ describe('R622 capped scan settles from the reader\'s own boundary, not a fabric
   it('an unread record inside the mtime slack of the result comment stays held', () => {
     expect(settleUnknownEvidenceByComment(capped(T - 1000, T - 500), [comment()], pr, head)).toMatchObject({ ok: false, reason: 'scan-capped' });
   });
+  it('an unread record written recently enough to hold a still-open rejection effect stays held (not quiet for the settle margin)', () => {
+    // 30 minutes before the comment: older than the slack, but within the abandon horizon an unread rejecting run could still be applying.
+    expect(settleUnknownEvidenceByComment(capped(T - 1800e3), [comment()], pr, head)).toMatchObject({ ok: false, reason: 'scan-capped' });
+    expect(settleUnknownEvidenceByComment(capped(T - UNREAD_SETTLE_MARGIN_MS), [comment()], pr, head)).toMatchObject({ ok: false, reason: 'scan-capped' });
+    expect(settleUnknownEvidenceByComment(capped(T - UNREAD_SETTLE_MARGIN_MS - 1), [comment()], pr, head)).toMatchObject({ ok: true });
+  });
 });
 
 describe('R622 settlement uses the NEWEST trusted result comment for this head', () => {
   const at = (iso, rev = head, findings = [], login = 'web-everything') => ({ ...comment(rev, findings, login), createdAt: new Date(iso).toISOString() });
-  const bounds = { unfinishedStartedAt: T - 1800e3, unreadBoundaryAt: T - 3600e3 };
+  const bounds = { unfinishedStartedAt: T - 1800e3, unreadBoundaryAt: OLD };
   const stale = at(T - 3600e3), fresh = at(T);
   it('an old comment alone (before the unfinished review) stays held', () => {
     expect(holdFor(unknown('review-unfinished', bounds), [stale])).toMatch(/evidence unknown/);
@@ -195,7 +209,7 @@ describe('R622 chronology bounds are strict: a result comment EQUAL to a bound n
     expect(holdFor(unknown('review-unfinished', { unfinishedStartedAt: T }), [comment()])).toMatch(/evidence unknown/);
   });
   it('equal to the unread boundary plus the mtime slack stays held (scan-capped and review-unfinished)', () => {
-    const edge = T - RUN_MTIME_SLACK_MS;
+    const edge = T - UNREAD_SETTLE_MARGIN_MS;
     expect(holdFor(unknown('scan-capped', { unreadBoundaryAt: edge, unfinishedStartedAt: -Infinity }), [comment()])).toMatch(/evidence unknown/);
     expect(holdFor(unknown('review-unfinished', { unfinishedStartedAt: T - 3600e3, unreadBoundaryAt: edge }), [comment()])).toMatch(/evidence unknown/);
     expect(holdFor(unknown('scan-capped', { unreadBoundaryAt: edge - 1, unfinishedStartedAt: -Infinity }), [comment()])).toBeNull();

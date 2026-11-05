@@ -76,7 +76,8 @@ const unfinishedReview = run => !run.verdict || run.pending != null || hasOpenEf
 // is newer than its start must not release it, because those effects can still apply a send-back.
 const undecidedUnfinished = run => {
   const verdict = typeof run.verdict === 'string' ? run.verdict : run.verdict?.verdict;
-  return (verdict == null || verdict === 'needs-human') && !hasOpenEffect(run);
+  // Any PRESENT verdict this reader does not recognise (an empty object, another key, an array) counts as decided.
+  return (!run.verdict || verdict === 'needs-human') && !hasOpenEffect(run);
 };
 
 // A run record is written after its read step starts, so its mtime bounds that start from above.
@@ -462,7 +463,12 @@ const newestResultComment = (comments, pr, head) => (Array.isArray(comments) ? c
   .map((c, i) => ({ c, i, parsed: isTrustedMarkerAuthor(c) ? parseRedTeamComment(typeof c === 'string' ? c : c?.body) : null }))
   .filter(x => x.parsed && x.parsed.pr === Number(pr) && x.parsed.rev === String(head).toLowerCase())
   .sort((a, b) => (Date.parse(commentCreatedAt(a.c)) || 0) - (Date.parse(commentCreatedAt(b.c)) || 0) || a.i - b.i).at(-1)?.c;
-export const COMMENT_SETTLEABLE_REASONS = Object.freeze(['review-unfinished', RUN_SCAN_CAPPED.reason]);
+// An unread record cannot be inspected, so a rejection it recorded whose label effect is still open is invisible
+// (its mtime stays at the time it was written, before the comment). Beyond the mtime slack, the comment must
+// therefore also be a whole abandon-horizon newer than that record, so only a record that has been quiet that
+// long, and is no longer a live review, can be settled past. Anything fresher stays held (fail closed).
+export const UNREAD_SETTLE_MARGIN_MS = RUN_MTIME_SLACK_MS + ABANDONED_REVIEW_AFTER_MS;
+export const COMMENT_SETTLEABLE_REASONS =Object.freeze(['review-unfinished', RUN_SCAN_CAPPED.reason]);
 export function settleUnknownEvidenceByComment(evidence, comments, pr, head) {
   if (evidence?.ok !== false || !COMMENT_SETTLEABLE_REASONS.includes(evidence.reason)) return evidence;
   if (!redTeamForHead(comments, pr, head)) return evidence;
@@ -474,8 +480,8 @@ export function settleUnknownEvidenceByComment(evidence, comments, pr, head) {
   if (bounds.unfinishedUndecided !== true) return evidence;
   if (evidence.reason === 'review-unfinished') {
     if (!(at > bounds.unfinishedStartedAt)) return evidence;
-    if ('unreadBoundaryAt' in bounds && !(at > bounds.unreadBoundaryAt + RUN_MTIME_SLACK_MS)) return evidence;
-  } else if (!(at > bounds.unreadBoundaryAt + RUN_MTIME_SLACK_MS) || !(at > bounds.unfinishedStartedAt)) return evidence;
+    if ('unreadBoundaryAt' in bounds && !(at > bounds.unreadBoundaryAt + UNREAD_SETTLE_MARGIN_MS)) return evidence;
+  } else if (!(at > bounds.unreadBoundaryAt + UNREAD_SETTLE_MARGIN_MS) || !(at > bounds.unfinishedStartedAt)) return evidence;
   return { ok: true, settledByComment: evidence.reason, loopPayload: null, scheduled: false, inFlight: false,
     queued: false, recorded: true, skipCardOnly: false };
 }
