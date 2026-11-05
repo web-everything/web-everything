@@ -26,12 +26,23 @@ export function resolvePackageManager({ env = process.env, tool, platform, log }
 }
 
 /**
- * ALLOWLIST of pnpm failures that fall back to npm: pnpm could not run, or could not reach the registry. Any other
- * failure (lockfile refusal, integrity, lifecycle script, anything unrecognised) fails closed and is rethrown,
- * because npm checks a different lockfile and would mask it.
+ * Fail closed. Falling back to npm is allowed only when pnpm could not run (a spawn error code) or every pnpm error
+ * code in its output is a registry-fetch failure. Any other pnpm error code, and any lockfile or integrity wording
+ * anywhere in the output, always blocks the fallback: npm checks a different lockfile and would mask it.
  */
-const FALLBACK_OK = /\b(ENOENT|EACCES|ETIMEDOUT|ENOTFOUND|ECONNRESET|ECONNREFUSED|EAI_AGAIN)\b|ERR_PNPM_(META_)?FETCH_FAIL/;
-const runnerFailure = (e) => FALLBACK_OK.test(`${e?.code ?? ''}\n${e?.message ?? ''}\n${e?.stdout ?? ''}\n${e?.stderr ?? ''}`);
+const DENY = /lockfile|integrity|checksum/i;
+const SPAWN_CODES = new Set(['ENOENT', 'EACCES', 'EPERM', 'ETIMEDOUT']);
+const FETCH_CODES = new Set(['ERR_PNPM_FETCH_FAIL', 'ERR_PNPM_META_FETCH_FAIL']);
+const pnpmCodes = (t) => [...String(t).matchAll(/ERR_PNPM_[A-Z0-9_]+/g)].map((m) => m[0]);
+function pnpmUnusable(e, { probe = false } = {}) {
+  const out = `${e?.message ?? ''}\n${e?.stdout ?? ''}\n${e?.stderr ?? ''}`;
+  if (DENY.test(out)) return false;
+  if (SPAWN_CODES.has(e?.code)) return true;
+  const codes = pnpmCodes(out);
+  if (codes.length) return codes.every((c) => FETCH_CODES.has(c));
+  return probe; // a version probe that exits non-zero with no pnpm error code: pnpm is not usable (e.g. a broken shim)
+}
+const runnerFailure = (e) => pnpmUnusable(e);
 
 const defaultPnpmVersion = () => execFileSync('pnpm', ['--version'], { stdio: 'pipe', timeout: 30_000 }).toString().trim();
 
@@ -40,7 +51,10 @@ export function installArgv({ ci = false, ignoreScripts = false, pnpmVersion = d
   const r = resolvePackageManager(opts);
   let { manager, note } = r;
   if (manager === 'pnpm') {
-    try { pnpmVersion(); } catch { manager = 'npm'; note = `pnpm --version failed (from ${r.source}); using npm`; }
+    try { pnpmVersion(); } catch (e) {
+      if (!pnpmUnusable(e, { probe: true })) throw e; // fail closed: an integrity/lockfile-class failure is not 'pnpm missing'
+      manager = 'npm'; note = `pnpm --version failed (from ${r.source}); using npm`;
+    }
   }
   const args = manager === 'pnpm' ? ['install', ...(ci ? ['--frozen-lockfile'] : [])] : [ci ? 'ci' : 'install'];
   if (ignoreScripts) args.push('--ignore-scripts');

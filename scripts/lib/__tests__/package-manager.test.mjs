@@ -81,6 +81,16 @@ describe('frozen cannot be weakened by passthrough options', () => {
   });
 });
 
+describe('version probe fails closed on integrity-class errors', () => {
+  it('rethrows an integrity failure instead of switching to npm', () => {
+    expect(() => installArgv({ ci: true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => { throw new Error('ERR_PNPM_TARBALL_INTEGRITY'); } })).toThrow(/INTEGRITY/);
+  });
+  it('a missing pnpm (ENOENT) still falls back to npm', () => {
+    const r = installArgv({ ci: true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => { throw Object.assign(new Error('spawn pnpm'), { code: 'ENOENT' }); } });
+    expect(r.manager).toBe('npm');
+  });
+});
+
 describe('installWithFallback', () => {
   it('runs pnpm and does not touch npm on success', () => {
     const calls = [];
@@ -92,9 +102,9 @@ describe('installWithFallback', () => {
   it('a failed pnpm install falls back to npm ci and logs it', () => {
     const calls = []; const logs = [];
     const r = installWithFallback({ frozen: true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => '9', log: (l) => logs.push(l),
-      exec: (bin, args) => { calls.push([bin, ...args]); if (bin === 'pnpm') throw Object.assign(new Error('boom ENOTFOUND registry'), { code: 'ENOTFOUND' }); } });
+      exec: (bin, args) => { calls.push([bin, ...args]); if (bin === 'pnpm') throw Object.assign(new Error('ERR_PNPM_FETCH_FAIL GET registry'), { stderr: 'ERR_PNPM_FETCH_FAIL' }); } });
     expect(calls).toEqual([['pnpm', 'install', '--frozen-lockfile'], ['npm', 'ci']]);
-    expect(r).toMatchObject({ fellBack: true, manager: 'npm', pnpmError: 'boom ENOTFOUND registry' });
+    expect(r).toMatchObject({ fellBack: true, manager: 'npm', pnpmError: 'ERR_PNPM_FETCH_FAIL GET registry' });
     
     expect(logs.join('\n')).toMatch(/pnpm install failed.*falling back to npm ci/);
   });
@@ -104,6 +114,8 @@ describe('installWithFallback', () => {
     ['integrity failure', { stderr: 'ERR_PNPM_TARBALL_INTEGRITY' }],
     ['lifecycle script failure', { stderr: 'ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL postinstall' }],
     ['unrecognised failure', {}],
+    ['lifecycle failure that merely mentions ENOENT', { stderr: 'ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL postinstall ENOENT' }],
+    ['lockfile refusal alongside a network word', { stderr: 'ERR_PNPM_OUTDATED_LOCKFILE ENOTFOUND' }],
   ])('fails closed (no npm fallback) on %s', (_n, extra) => {
     const calls = []; const logs = [];
     expect(() => installWithFallback({ frozen: true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => '9', log: (l) => logs.push(l),
