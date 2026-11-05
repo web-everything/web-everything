@@ -232,6 +232,24 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     expect(git(['status', '--porcelain', '--untracked-files=no'], laneDir)).toBe('');
     refused(release(), git(['rev-parse', 'refs/stash'], laneDir));
   });
+  // `refs/stash` names only the newest entry; each older entry is a sibling commit off HEAD that only the stash reflog
+  // reaches. With the newest entry preserved on the origin, the older one is the sole unpushed work and must refuse.
+  it('refuses an older stash entry reachable only through the stash reflog', () => {
+    const stash = text => {
+      writeFileSync(join(laneDir, 'seed.txt'), text);
+      git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'stash', '--quiet'], laneDir);
+      return git(['rev-parse', 'refs/stash'], laneDir);
+    };
+    const older = stash('older stashed edit\n');
+    const newer = stash('newer stashed edit\n');
+    expect(spawnSync('git', ['merge-base', '--is-ancestor', older, newer], { cwd: laneDir }).status).toBe(1);
+    expect(git(['rev-parse', 'stash@{1}'], laneDir)).toBe(older);
+    git(['push', '--quiet', origin, `${newer}:refs/heads/preserved-newer-stash`], laneDir);
+    const result = release();
+    refused(result, older);
+    expect(result.stderr).not.toContain(newer.slice(0, 12));
+    expect(git(['stash', 'list', '--format=%H'], laneDir).split('\n')).toEqual([newer, older]);
+  });
   it('releases a lane whose HEAD is behind an origin tip it has not fetched yet', () => {
     const other = join(base, 'other');
     git(['clone', '--quiet', origin, other]);
