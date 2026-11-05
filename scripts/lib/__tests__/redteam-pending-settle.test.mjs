@@ -91,12 +91,12 @@ describe('result settlement requires a strictly clean comment or a confirmed bre
       expect(o.syncLabels).not.toHaveBeenCalled(); expect(o.settlePending).not.toHaveBeenCalled();
       expect(o.rawPrs[0].labels).toContain('red-team:pending');
     });
-  it('selects the newest trusted result by timestamp for the clean check', () => {
+  it('every marker-bearing comment must be strictly understood: an older one with unknown text blocks clearing even beside a newer clean result', () => {
     const o = runFixture();
     o.rawPrs[0].comments.push(trusted(resultComment().body, iso(acceptedAt + 2)),
       trusted(`${resultComment().body}\nunknown text`, iso(acceptedAt + 1)));
-    expect(mod.runRedTeamOnSkip(o).rows[0]).not.toHaveProperty('settleError');
-    expect(o.syncLabels).toHaveBeenCalledOnce();
+    mod.runRedTeamOnSkip(o);
+    expect(o.syncLabels).not.toHaveBeenCalled();
   });
 });
 
@@ -212,6 +212,13 @@ describe('settlement reads fresh PR state and result evidence', () => {
   it('a result comment holding only the head marker (no explicit outcome) never synchronizes', () => {
     const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: {}, recorded: false, seatRecorded: false })), readIgnorableConfirms: () => [] });
     o.rawPrs[0].comments.push({ author: { login: 'web-everything' }, body: redTeamMarker(pr, head) });
+    mod.runRedTeamOnSkip(o);
+    expect(o.syncLabels).not.toHaveBeenCalled();
+  });
+  it('a newer marker-bearing comment with an indented confirmed break blocks clearing despite an older clean result', () => {
+    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: {}, recorded: false, seatRecorded: false })), readIgnorableConfirms: () => [] });
+    o.rawPrs[0].comments.push(resultComment(), { author: { login: 'web-everything' },
+      body: `${redTeamMarker(pr, head)}\nRed team not required on this head: prior policy-clear carried\n  1. [**confirmed**] (edge-case, broken) — hidden break` });
     mod.runRedTeamOnSkip(o);
     expect(o.syncLabels).not.toHaveBeenCalled();
   });

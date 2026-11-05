@@ -530,19 +530,15 @@ export function readCompletePrReviews({ repo, pr, env = process.env, exec = runG
   throw Error('PR reviews page cap reached; inspect complete reviews');
 }
 
-/** Only a known clean template can clear; parsed confirmed breaks retain the send-back path. */
-function resultMaySynchronize(comments, pr, head) {
-  const newest = comments.map((comment, index) => ({ comment, index }))
-    .filter(({ comment }) => redTeamForHead([comment], pr, head))
-    .sort((a, b) => (Date.parse(commentCreatedAt(a.comment)) || 0) - (Date.parse(commentCreatedAt(b.comment)) || 0)
-      || a.index - b.index).at(-1)?.comment;
-  const parsed = newest && parseRedTeamComment(newest.body);
+/** 'clean' only for a known template with an explicit completed outcome; 'broken' for a parsed confirmed break. */
+function strictBodyKind(body, pr, head) {
+  const parsed = parseRedTeamComment(body);
   if (!parsed) return false;
-  if (parsed.findings.some(finding => breakClass(finding) === 'broken')) return true;
+  if (parsed.findings.some(finding => breakClass(finding) === 'broken')) return 'broken';
   if (parsed.findings.length !== 0) return false;
   const advisory = "Advisory only: this comment changes no label itself; the red-team gate (setting `redTeam.confirmedBreaks`) sends a confirmed broken break back to the fixer. Head `"
     + String(head).slice(0, 12) + '` · red team ';
-  const lines = newest.body.split(/\r?\n/).filter(line => line.trim());
+  const lines = body.split(/\r?\n/).filter(line => line.trim());
   // An explicit completed outcome is required: a bare marker (or marker plus advisory) proves no pass.
   const outcome = line => line === 'The red team tried to break this change and reported nothing.'
     || /^Red team not required on this head: [^\r\n]+$/.test(line) || /^Findings: none\.?$/i.test(line);
@@ -553,7 +549,17 @@ function resultMaySynchronize(comments, pr, head) {
     || line === 'The red team tried to break this change and reported nothing.'
     || /^Red team not required on this head: [^\r\n]+$/.test(line)
     || /^Findings: none\.?$/i.test(line)
-    || line.startsWith(advisory) && /^[^\s`/]+\/[^\s`]+ · recorded verdict `(accept|changes|needs-human|prevention-outstanding)`\.$/.test(line.slice(advisory.length)));
+    || line.startsWith(advisory) && /^[^\s`/]+\/[^\s`]+ · recorded verdict `(accept|changes|needs-human|prevention-outstanding)`\.$/.test(line.slice(advisory.length))) ? 'clean' : false;
+}
+
+/** Only known clean templates can clear; parsed confirmed breaks retain the send-back path. */
+function resultMaySynchronize(comments, pr, head) {
+  // Every comment carrying this head's marker must itself be strictly understood: the downstream parser can consume a
+  // malformed or carried comment that redTeamForHead does not accept, and would silently skip its findings.
+  const marker = redTeamMarker(pr, head);
+  const marked = comments.filter(c => typeof c?.body === 'string' && c.body.includes(marker));
+  if (marked.some(c => !strictBodyKind(c.body, pr, head))) return false;
+  return comments.some(c => redTeamForHead([c], pr, head));
 }
 
 /** Re-read the live head and labels before removing a stale pending status. */
