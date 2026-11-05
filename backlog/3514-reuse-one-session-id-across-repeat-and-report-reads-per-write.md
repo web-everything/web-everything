@@ -2,9 +2,10 @@
 bornAs: x5c8zep
 kind: story
 size: 1
-status: open
+status: active
 scope: ["we:scripts/measure-judge-spawn.mjs"]
 dateOpened: "2026-09-06"
+dateStarted: "2026-09-12"
 tags: [cost, prompt-caching, measurement, operations]
 crossRef: { url: /backlog/3369-decouple-agent-dispatch-from-the-claude-cli-introduce-a-mult/, label: "#3369 names this file among four spawn call sites" }
 relatedReport: reports/2026-09-06-backlog-split-analysis.md
