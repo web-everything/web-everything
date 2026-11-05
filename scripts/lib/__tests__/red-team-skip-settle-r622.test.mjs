@@ -39,7 +39,9 @@ describe('R622 unknown run evidence settled by a head-bound result comment', () 
   });
   it('scan-capped with an unread record written after the result comment stays held', () => {
     expect(holdFor(unknown('scan-capped', { unreadBoundaryAt: T + 60e3 }), [comment()])).toMatch(/evidence unknown/);
-    expect(holdFor(unknown('scan-capped', { unreadBoundaryAt: T - 1000 }), [comment()])).toMatch(/evidence unknown/); // inside the mtime slack
+    expect(holdFor(unknown('scan-capped', { unreadBoundaryAt: T - 1000, unfinishedStartedAt: -Infinity }), [comment()])).toMatch(/evidence unknown/); // inside the mtime slack
+    expect(holdFor(unknown('scan-capped', { unreadBoundaryAt: T - 3600e3, unfinishedStartedAt: T + 3600e3 }), [comment()])).toMatch(/evidence unknown/); // a resumed unfinished run
+    expect(holdFor(unknown('scan-capped', { unreadBoundaryAt: T - 3600e3, unfinishedStartedAt: NaN }), [comment()])).toMatch(/evidence unknown/);
   });
   it('missing bounds never settle', () => {
     for (const reason of ['review-unfinished', 'scan-capped']) expect(holdFor(unknown(reason, {}), [comment()])).toMatch(/evidence unknown/);

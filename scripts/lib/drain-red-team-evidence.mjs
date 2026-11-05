@@ -164,7 +164,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     if (exact === null && scan.newestSettled && (!exactHead || (Number.isFinite(writtenAfter)
       && scan.boundary + RUN_MTIME_SLACK_MS <= writtenAfter
       && typeof newestHead === 'string' && newest.run.findings?.read?.netBasis?.rev === newestHead))) return null;
-    return withSettleBounds({ ...scan.end }, { unreadBoundaryAt: scan.boundary });
+    return withSettleBounds({ ...scan.end }, { unreadBoundaryAt: scan.boundary, unfinishedStartedAt: scan.slots[order].since });
   };
   return (exactHead = true, order = tieBreak, { writtenAfter, newestHead } = {}) => {
     if (!TIE_ORDERS.includes(order)) throw new TypeError('unknown run tieBreak');
@@ -463,7 +463,7 @@ export function settleUnknownEvidenceByComment(evidence, comments, pr, head) {
   if (evidence.reason === 'review-unfinished') {
     if (!(at > bounds.unfinishedStartedAt)) return evidence;
     if ('unreadBoundaryAt' in bounds && !(at > bounds.unreadBoundaryAt + RUN_MTIME_SLACK_MS)) return evidence;
-  } else if (!(at > bounds.unreadBoundaryAt + RUN_MTIME_SLACK_MS)) return evidence;
+  } else if (!(at > bounds.unreadBoundaryAt + RUN_MTIME_SLACK_MS) || !(at > bounds.unfinishedStartedAt)) return evidence;
   return { ok: true, settledByComment: evidence.reason, loopPayload: null, scheduled: false, inFlight: false,
     queued: false, recorded: true, skipCardOnly: false };
 }
