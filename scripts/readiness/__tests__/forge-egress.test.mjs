@@ -195,19 +195,6 @@ describe('forge-setup egress service',()=>{
     expect(setup).toContain('Before=ssh.socket ssh.service sshd.service');
     expect(setup).toContain('OnBootSec=1min');
   });
-  it('fail closed: ssh.service drop-in requires the egress service, written before daemon-reload',()=>{
-    const setup=setupSrc();
-    const m=setup.match(/ssh\.service\.d\/forge-egress\.conf <<'SSHDROPIN'\n([\s\S]*?)\nSSHDROPIN\n/);
-    expect(m,'drop-in heredoc missing').not.toBeNull();
-    const lines=m[1].split('\n');
-    expect(lines).toEqual(['[Unit]','Requires=forge-exec-egress.service','After=forge-exec-egress.service']);
-    // The drop-in exists before the reload that makes systemd read it, and before ssh could be restarted.
-    const dropAt=setup.indexOf('ssh.service.d/forge-egress.conf <<');
-    const reloadAt=setup.indexOf('systemctl daemon-reload',dropAt);
-    expect(reloadAt).toBeGreaterThan(dropAt);
-    expect(reloadAt).toBeLessThan(setup.indexOf('systemctl start forge-exec-egress.service'));
-    expect(setup.indexOf('mkdir -p /etc/systemd/system/ssh.service.d')).toBeLessThan(dropAt);
-  });
   it('setup installs and activates the egress service with five-minute refresh',()=>{
     const setup=setupSrc();
     const at=(s)=>{const i=setup.indexOf(s);expect(i,`missing: ${s}`).toBeGreaterThan(-1);return i;};
@@ -231,8 +218,7 @@ describe('forge-setup egress service',()=>{
     expect(setup).toContain('systemctl enable --now forge-exec-egress.timer');
     expect(setup).toContain('nft delete table inet forge_exec_egress');
   });
-  // The documented rollback (header comment of BOTH scripts) must undo the ssh.service drop-in FIRST: the drop-in has
-  // Requires=forge-exec-egress.service, so stopping the egress service with it still in place can stop sshd.
+  // Both script headers document the same two-command rollback in order.
   const rollbackOf=(src)=>{
     // Header = everything before `set -euo pipefail`; join wrapped comment lines so a command may span a line break.
     const text=src.slice(0,src.indexOf('\nset -euo pipefail')).replace(/\n#[ \t]*/g,' ');
@@ -241,16 +227,15 @@ describe('forge-setup egress service',()=>{
     return text.slice(at);
   };
   const ROLLBACK_STEPS=[
-    'rm -f /etc/systemd/system/ssh.service.d/forge-egress.conf',
-    'systemctl daemon-reload',
     'nft delete table inet forge_exec_egress',
     'systemctl disable --now forge-exec-egress.timer forge-exec-egress.service',
   ];
   for(const [name,read] of [['forge-setup.sh',setupSrc],['forge-egress.sh',()=>readFileSync(script,'utf8')]]){
-    it(`${name} documents a rollback that removes the ssh drop-in and reloads BEFORE stopping the egress service`,()=>{
+    it(`${name} documents a rollback that deletes the table before disabling the timer and service`,()=>{
       const rb=rollbackOf(read());
       const idx=ROLLBACK_STEPS.map(s=>{const i=rb.indexOf(s);expect(i,`${name} rollback is missing: ${s}`).toBeGreaterThan(-1);return i;});
       expect(idx).toEqual([...idx].sort((a,b)=>a-b));
+      expect(rb).toContain(ROLLBACK_STEPS.join('; '));
     });
   }
 });

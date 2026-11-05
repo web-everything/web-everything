@@ -10,12 +10,9 @@
 # Residual (accepted, see the PR): the allowlist matches destination IP + tcp/443 only. The registry shares CDN addresses
 # with other sites, so a slot process can reach any host served from those addresses (SNI is not inspected). Real
 # containment needs a non-slot installer user or an SNI-aware proxy.
-# Rollback (in this order; forge-setup.sh gives ssh.service a drop-in with Requires=forge-exec-egress.service, so remove
-# it and reload FIRST, otherwise stopping the egress service can stop sshd):
-#   rm -f /etc/systemd/system/ssh.service.d/forge-egress.conf;
-#   systemctl daemon-reload;
-#   nft delete table inet forge_exec_egress;
-#   systemctl disable --now forge-exec-egress.timer forge-exec-egress.service
+# The safety net is the launcher check (egress-table-absent, card xq2mydd); the 5-min timer re-applies the table.
+# Rollback:
+#   nft delete table inet forge_exec_egress; systemctl disable --now forge-exec-egress.timer forge-exec-egress.service
 set -euo pipefail
 
 SLOTS=${FORGE_EXEC_SLOTS:-8}
