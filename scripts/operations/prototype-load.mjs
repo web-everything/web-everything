@@ -113,7 +113,9 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   // never blocks forever. A CARRIED head is deliberately not widened: "carry veto follows findAudit" (round 4) pins that
   // an unusable record on a carried head never blocks the carry.
   if (list.some((r) => r?.head === sha && r.base !== sha && r.verdict === 'WEAKENED'
-    && isAcceptedQuestionHash(r.questionHash, { priorQuestionHashes, now, at: r.at }) && !own.some((d) => d.base === r.base))) return { ok: false, reason: 'weakened' };
+    // An unparsable time cannot place the record outside its window, so it is judged by the hash's own expiry alone
+    // (fail closed, matching a current-question record, which blocks whatever its time).
+    && isAcceptedQuestionHash(r.questionHash, { priorQuestionHashes, now, at: Number.isFinite(Date.parse(r.at)) ? r.at : undefined }) && !own.some((d) => d.base === r.base))) return { ok: false, reason: 'weakened' };
   const carriedWeak = carried.filter((d) => d.record.verdict === 'WEAKENED');
   if (carriedWeak.length) {
     const ownAt = Math.max(-Infinity, ...own.filter((d) => covered(d.base)).map((d) => Date.parse(d.record.at)));

@@ -2102,6 +2102,11 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
         // a base with a usable decision is judged by findAudit alone: an unusable WEAKENED on the same base does not block
         expect(carry(pass, live({ base: TREE, ...bad }))).toMatchObject({ ok: true });
       });
+      it('variant: an unparsable time on an unexpired prior-hash WEAKENED still blocks (fail closed), unless the hash expired', () => {
+        expect(carry(carried(), live({ at: 'not-a-date', findings: ['NOT WEAKENED'] }))).toEqual({ ok: false, reason: 'weakened' });
+        expect(carry(live({ at: 'not-a-date', findings: ['NOT WEAKENED'] }), carried())).toEqual({ ok: false, reason: 'weakened' });
+        expect(carry(carried(), live({ at: 'not-a-date', questionHash: 'd'.repeat(64) }))).toEqual({ ok: true, record: carried() });
+      });
       it('a prior-question NOT WEAKENED on the live head never blocks the carried pass', () => {
         expect(carry(carried(), live({ verdict: 'NOT WEAKENED', findings: ['WEAKENED'] }))).toEqual({ ok: true, record: carried() });
       });
