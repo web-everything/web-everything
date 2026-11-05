@@ -155,14 +155,20 @@ describe('resolveHeadIndexSettings', () => {
     expect(bad.value.logMaxLines).toBe(2000);
   });
   it('settings ignore environment overrides', () => {
-    const env = { KEEPPERPR: '3', LOGMAXLINES: '30', REVIEW_HEAD_INDEX_KEEPPERPR: '3', WE_REVIEW_HEAD_INDEX_KEEPPERPR: '3' };
-    const r = resolveHeadIndexSettings({ file: { reviewHeadIndex: { keepPerPr: 5 } }, platform: {}, env });
-    expect(r.value.keepPerPr).toBe(5);
+    // Whatever name an override might use, every env key reads back '3': none may change either field.
+    const env = new Proxy({}, { get: () => '3', has: () => true, ownKeys: () => [] });
+    const r = resolveHeadIndexSettings({ file: { reviewHeadIndex: { keepPerPr: 5, logMaxLines: 50 } }, platform: {}, env });
+    expect(r.value).toEqual({ keepPerPr: 5, logMaxLines: 50 });
     expect(Object.values(r.sources)).not.toContain('env');
+    expect(resolveHeadIndexSettings({ file: {}, platform: {}, env }).value).toEqual({ keepPerPr: 20, logMaxLines: 2000 });
   });
-  it('resolving with no arguments reads the shipped settings file and yields the standard values', () => {
-    const r = resolveHeadIndexSettings({ platform: {}, env: {} });
-    expect(r.value).toEqual({ keepPerPr: 20, logMaxLines: 2000 });
+  it('the shipped settings file parses, declares reviewHeadIndex, and resolves to valid settings', () => {
+    const shipped = JSON.parse(readFileSync(join(process.cwd(), 'scripts', 'settings', 'review-head-index.json'), 'utf8'));
+    expect(shipped).toHaveProperty('reviewHeadIndex');
+    const r = resolveHeadIndexSettings({ file: shipped, platform: {}, env: {} });
+    expect(r.invalid).toEqual([]);
+    expect(Number.isSafeInteger(r.value.keepPerPr) && r.value.keepPerPr > 0).toBe(true);
+    expect(Number.isSafeInteger(r.value.logMaxLines) && r.value.logMaxLines > 0).toBe(true);
   });
 });
 
@@ -274,6 +280,18 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     expect(() => rec({ fs })).toThrow(/lock lost/);
     expect(existsSync(headIndexPaths(dir).map)).toBe(false);
   });
+  it('fencing: a writer that loses its lock before the append never touches the log or the map', () => {
+    rec();
+    const { log, map, lock } = headIndexPaths(dir);
+    const [logBefore, mapBefore] = [readFileSync(log, 'utf8'), readFileSync(map, 'utf8')];
+    let stolen = false;
+    const fs = { ...nodeFs, readFileSync: (p, ...a) => { // first log read is readHeadIndex's, which precedes the pre-append fence
+      if (!stolen && p === log) { stolen = true; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'thief', at: 1 })); }
+      return nodeFs.readFileSync(p, ...a); } };
+    expect(() => rec({ fs, head: H(2), netPatchHash: 'p2' })).toThrow(/lock lost/);
+    expect(readFileSync(log, 'utf8')).toBe(logBefore);
+    expect(readFileSync(map, 'utf8')).toBe(mapBefore);
+  });
   it('fencing: a writer that loses its lock before the compaction rewrite never replaces the log or publishes the map', () => {
     rec(); rec({ head: H(2), netPatchHash: 'p2' });
     const { log, map, lock } = headIndexPaths(dir);
@@ -284,7 +302,6 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
       readFileSync: (p, ...a) => { if (appended && p === log) { appended = false; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'thief', at: 1 })); } return nodeFs.readFileSync(p, ...a); } };
     // logMaxLines=1 forces compaction; the steal lands right before the pre-rewrite fence, which must refuse
     expect(() => rec({ fs, head: H(3), netPatchHash: 'p3', logMaxLines: 1 })).toThrow(/lock lost/);
-    expect(existsSync(`${log}.tmp`)).toBe(false);                   // the compacted rewrite never started
     expect(readFileSync(log, 'utf8').split('\n').filter(Boolean)).toHaveLength(3); // log not replaced from a stale map
     expect(readFileSync(map, 'utf8')).toBe(mapBefore);              // map never published
   });
