@@ -186,7 +186,7 @@ export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform
   for (const [key, source] of Object.entries(miss.sources)) out.sources[`catchUp.missBackoff.${key}`] = source;
   for (const invalid of miss.invalid) out.invalid.push(invalid.replace(/^(tool|platform)\./, '$1.catchUp.missBackoff.'));
   const pauseValid = {
-    paths: (x) => Array.isArray(x) && x.length > 0 && x.every((p) => typeof p === 'string' && p === p.trim() && p !== '' && !p.startsWith('/') && !p.startsWith('./') && !p.includes('..')),
+    paths: (x) => Array.isArray(x) && x.length > 0 && x.every((p) => typeof p === 'string' && p === p.trim() && p !== '' && p.split('/').every((seg, i, all) => seg !== '.' && seg !== '..' && (seg !== '' || i === all.length - 1)) && !p.startsWith('/')),
     maxPauseMinutes: (x) => Number.isFinite(x) && x > 0 && x <= 1440,
   };
   const pause = cascadePolicy(`${ENQUEUE_ON_EVENT_POLICY}.catchUp.refreshPause`, isObj(block?.catchUp?.refreshPause) ? block.catchUp.refreshPause : undefined, {

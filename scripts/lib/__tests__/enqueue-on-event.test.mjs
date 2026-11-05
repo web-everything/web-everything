@@ -809,7 +809,9 @@ describe('catch-up during a daemon refresh (last-good enqueue)', () => {
     const bad = resolveSetting({ catchUp: { refreshPause: { paths: [], maxPauseMinutes: -1 } } });
     expect(bad.catchUp.refreshPause.maxPauseMinutes).toBe(10);
     expect(bad.catchUp.refreshPause.paths.length).toBe(3);
-    expect(resolveSetting({ catchUp: { refreshPause: { paths: ['./scripts/x'] } } }).catchUp.refreshPause.paths.length).toBe(3);
+    for (const path of ['./scripts/x', 'scripts/./x', 'scripts//x', ' scripts/x', 'scripts/x ', '/scripts/x', 'scripts/../x']) {
+      expect(resolveSetting({ catchUp: { refreshPause: { paths: [path] } } }).catchUp.refreshPause.paths.length).toBe(3);
+    }
   });
 });
 
