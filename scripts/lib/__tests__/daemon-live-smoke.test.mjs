@@ -2690,3 +2690,64 @@ describe('boot smoke shared budget and full-cap timeout classification', () => {
     }
   });
 });
+
+// ── sticky load-shaped rejection (live 2026-11-05: drain + merge daemons held "still-rejected", retryAt null) ──
+import { isLoadShapedRow as stickyIsLoadShapedRow } from '../daemon-rebuild/smoke-classify/load-shaped.mjs';
+import * as stickyLoadShaped from '../daemon-rebuild/smoke-classify/load-shaped.mjs';
+
+describe('load-shaped rows need host-load evidence (sticky rejection)', () => {
+  const hot = { load1: 120, cores: 12 };
+  const cool = { load1: 2, cores: 12 };
+  const budget = 'skipped: rebuild smoke budget exhausted (0ms left)';
+  const timeoutRow = (ms = 533869) => ({ name: 'dispatch-dry-run', ok: false, ms, mayBeTransient: false,
+    detail: 'dispatch dry-run child failed: timed out after 533869ms (process group killed)' });
+  const budgetRow = (name) => ({ name, ok: false, ms: 0, mayBeTransient: true, detail: budget });
+  const bootRow = (entries) => ({ name: 'daemon-entries-boot', ok: false, ms: 5, mayBeTransient: false, entries,
+    detail: `${entries.length}/${entries.length} daemon entries failed to boot:\n` + entries.map((e) => `- x.mjs: ${e.kind}`).join('\n') });
+  const skipEntry = () => ({ ok: false, kind: `child failed: ${budget}`, timeoutMs: 60000, elapsedMs: 0, attempts: 1 });
+  const throttleMixed = { name: 'dispatch-dry-run', ok: false, ms: 9000, mayBeTransient: false,
+    detail: 'dispatch dry-run failed (2/7): reconcile-ci-heal-pass: gh-throttle: throttled — no gh slot within 8.095s (class=background); retry next tick\n; reconcile-review-pass: reconcile failed: reconcile read failed (exit 1): gh-throttle: throttled — no gh slot within 8.249s (class=background); retry next tick' };
+
+  it('a budget-exhausted skip row is load-shaped on an overloaded host', () => {
+    expect(stickyIsLoadShapedRow({ ...budgetRow('tree-stays-clean'), hostLoad: hot }, {})).toBe(true);
+  });
+  it('a budget-exhausted skip row is NOT load-shaped on an idle host (no laundering)', () => {
+    expect(stickyIsLoadShapedRow({ ...budgetRow('tree-stays-clean'), hostLoad: cool }, {})).toBe(false);
+  });
+  it('a process-group timeout of the dispatch dry-run child is load-shaped when overloaded, code when idle', () => {
+    expect(stickyIsLoadShapedRow({ ...timeoutRow(), hostLoad: hot }, {})).toBe(true);
+    expect(stickyIsLoadShapedRow({ ...timeoutRow(1), hostLoad: cool }, {})).toBe(false);
+  });
+  it('an all-budget-skipped boot row is load-shaped when overloaded; one real crash keeps it code', () => {
+    expect(stickyIsLoadShapedRow({ ...bootRow([skipEntry(), skipEntry()]), hostLoad: hot }, {})).toBe(true);
+    const crash = { ok: false, kind: 'child failed: exited 1', timeoutMs: 60000, elapsedMs: 100, attempts: 1 };
+    expect(stickyIsLoadShapedRow({ ...bootRow([skipEntry(), crash]), hostLoad: hot }, {})).toBe(false);
+    expect(stickyIsLoadShapedRow({ ...bootRow([skipEntry()]), hostLoad: cool }, {})).toBe(false);
+  });
+  it('gh-throttle plus a downstream "reconcile read failed" is load-shaped when overloaded only', () => {
+    expect(stickyIsLoadShapedRow({ ...throttleMixed, hostLoad: hot }, {})).toBe(true);
+    expect(stickyIsLoadShapedRow({ ...throttleMixed, hostLoad: cool }, {})).toBe(false);
+  });
+  it('a real code failure beside the throttle text stays code even when overloaded', () => {
+    const row = { ...throttleMixed, hostLoad: hot, detail: `${throttleMixed.detail}; review: TypeError: x is not a function` };
+    expect(stickyIsLoadShapedRow(row, {})).toBe(false);
+  });
+  it('evidence can come from the env seam; absent or unreadable evidence is not overload', () => {
+    expect(stickyIsLoadShapedRow(budgetRow('tree-stays-clean'), { WE_SMOKE_HOST_LOAD1: '120', WE_SMOKE_HOST_CORES: '12' })).toBe(true);
+    expect(stickyIsLoadShapedRow({ ...budgetRow('tree-stays-clean'), hostLoad: { load1: NaN, cores: 12 } }, {})).toBe(false);
+  });
+  it('cachedRejectionLoadRetry schedules an env-load retry for a cached load-shaped rejection', () => {
+    const state = { rejected: { inputsKey: 'k', reason: 'dispatch-dry-run,tree-stays-clean', at: 'x' },
+      held: { reason: 'smoke-rejected', details: [
+        { name: 'dispatch-dry-run', detail: timeoutRow().detail },
+        { name: 'tree-stays-clean', detail: budget }] } };
+    const now = Date.parse('2026-11-05T17:00:00Z');
+    const r = stickyLoadShaped.cachedRejectionLoadRetry(state, { WE_SMOKE_HOST_LOAD1: '120', WE_SMOKE_HOST_CORES: '12' }, { now });
+    expect(r).toMatchObject({ envLoad: true, attempts: 1 });
+    expect(Date.parse(r.retryAt)).toBeGreaterThan(now);
+    expect(stickyLoadShaped.cachedRejectionLoadRetry(state, { WE_SMOKE_HOST_LOAD1: '1', WE_SMOKE_HOST_CORES: '12' }, { now })).toBeNull();
+    const withCode = { ...state, held: { ...state.held, details: [...state.held.details, { name: 'x', detail: 'TypeError: boom' }] } };
+    expect(stickyLoadShaped.cachedRejectionLoadRetry(withCode, { WE_SMOKE_HOST_LOAD1: '120', WE_SMOKE_HOST_CORES: '12' }, { now })).toBeNull();
+    expect(stickyLoadShaped.cachedRejectionLoadRetry({ ...state, rejected: { ...state.rejected, retryAt: '2026-11-05T18:00:00Z' } }, {}, { now })).toBeNull();
+  });
+});
