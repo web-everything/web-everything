@@ -21,6 +21,8 @@ const refusedCorpusEntries = new Map([
   ['plateau:branding.html (regenerated, not hand-edited)', /characters the brief cannot carry/],
   ['plateau-app:src/feature-tracker/read-model.ts (owned re-edit)', /characters the brief cannot carry/],
   ['plateau-app:src/feature-tracker/read-model.test.ts (owned re-edit)', /characters the brief cannot carry/],
+  // Out-of-scope cards filed on main with a bare prefix and no path (8001, 8002, 8003).
+  ['we:', /unsafe scope entry.*path segments are refused/],
   ...['wip-relay', 'worker', 'vitest.shared', 'bun-test.preload', 'vitest.setup', 'vitest.globalSetup']
     .map((name): [string, RegExp] => [`we:./__tests__/${name}.test.mjs`, /unsafe scope entry.*path segments are refused/]),
 ]);
