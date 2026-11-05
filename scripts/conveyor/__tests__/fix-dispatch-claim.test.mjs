@@ -864,10 +864,10 @@ describe('idle-claim auto-release (R201)', () => {
     const firstSweep = T0 + 60_000;
     const lastSweep = firstSweep + IDLE_MS;
     const SID = 'S-real';
-    const writeTranscript = (lastActivityMs, content = [{ type: 'text', text: 'done' }]) => {
+    const writeTranscript = (lastActivityMs, content = [{ type: 'text', text: 'done' }], sid = SID) => {
       const dir = join(projectsDir, CWD.replaceAll('/', '-'));
       mkdirSync(dir, { recursive: true });
-      writeFileSync(join(dir, `${SID}.jsonl`), `${JSON.stringify({ type: 'assistant', timestamp: iso(lastActivityMs), message: { role: 'assistant', content } })}\n`);
+      writeFileSync(join(dir, `${sid}.jsonl`), `${JSON.stringify({ type: 'assistant', timestamp: iso(lastActivityMs), message: { role: 'assistant', content } })}\n`);
     };
     const row = { name: 'fix-5996', sessionId: SID, cwd: CWD, state: 'working', status: 'idle', startedAt: T0 + 1000 };
     const sweepAll = ({ lastActivityMs, content, headFor = () => 'sha1' }) => {
@@ -915,12 +915,15 @@ describe('idle-claim auto-release (R201)', () => {
     it('keeps a claim whose idle row is hung but NOT bound to it (an older same-named session)', () => {
       acquireFixDispatchClaim({ repo: 'we', pr: 5996, kind: 'fix', headSha: 'sha1', owner: 'A', sessionId: SID,
         lockRoot: claimRoot, nowMs: T0, nowIso: iso(T0), leaseMinutes: 10 });
-      writeTranscript(firstSweep - 180 * MIN);
-      const other = { ...row, sessionId: SID, startedAt: T0 + 1000 };
+      // The foreign row has a READABLE transcript silent 3 h, so the real detector really flags it hung: only the
+      // boundToClaim term of the exemption keeps it hung (dropping that term would release this claim).
+      writeTranscript(firstSweep - 180 * MIN, undefined, 'S-other');
+      const other = { ...row, sessionId: 'S-other', startedAt: T0 + 1000 };
+      expect(readHungInfo({ ...other }, firstSweep, resolveHungThresholdMs())).toMatchObject({ hung: true, reason: 'stale-no-activity' });
       let released = 0;
       for (let t = firstSweep; t <= lastSweep; t += 120_000) {
         released += (refreshLiveFixDispatchClaims({
-          lockRoot: claimRoot, listAgentsAll: () => [{ ...other, sessionId: 'S-other' }], awaitingVerifyFor: null,
+          lockRoot: claimRoot, listAgentsAll: () => [other], awaitingVerifyFor: null,
           prHeadFor: () => 'sha1', recordEvent: () => {}, nowIso: () => iso(t),
           idleRelease: resolveIdleClaimRelease({ env: {}, platform: null }),
         }).released ?? []).length;
