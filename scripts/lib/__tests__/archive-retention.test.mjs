@@ -329,9 +329,9 @@ it('batch cap archives only the oldest N files per run', async () => {
   expect(out.filesArchived).toBe(2);
   expect(await Promise.all(ps.map(exists))).toEqual([false, false, true, true, true]);
 });
-it('settings default the runs batch cap and schedule with provenance, env overrides the cap', () => {
+it('settings default the runs batch cap with provenance, env overrides the cap', () => {
   const a = archiveSettings({ env: { WE_PLATFORM_PREFERENCES_FILE: join(root, 'p.json') }, tool: {} });
-  expect(a.value.runsBatchCap).toBe(5000); expect(a.value.runsSchedule).toBe('daily');
+  expect(a.value.runsBatchCap).toBe(5000); expect(a.value).not.toHaveProperty('runsSchedule'); // the daily cadence is the 24h stamp, not a setting
   const b = archiveSettings({ env: { WE_PLATFORM_PREFERENCES_FILE: join(root, 'p.json'), WE_ARCHIVE_RUNS_BATCH_CAP: '7' }, tool: {} });
   expect(b.value.runsBatchCap).toBe(7); expect(b.sources.runsBatchCap).toBe('env');
   expect(() => archiveSettings({ env: { WE_PLATFORM_PREFERENCES_FILE: join(root, 'p.json'), WE_ARCHIVE_RUNS_BATCH_CAP: '0' }, tool: {} })).toThrow(/invalid archive policy/);
@@ -417,6 +417,12 @@ it('finished-record clauses are independent: each rejects an otherwise-eligible 
   // Statuses the engine finalizes stay eligible. (An unknown status never reaches the whitelist: the run-record schema
   // rejects it first, and the whitelist exists to keep a future schema status fail-closed.)
   for (const s of ['declared', 'applied', 'failed']) expect(runRecordEligible(JSON.stringify({ ...finished, effects: [eff(s)] }), yes), s).toBe(true);
+  // PR evidence: the same schema-valid terminal effect is eligible without result.pr and ineligible with it, so the
+  // PR clause (not schema rejection) is what keeps the record local.
+  const withResult = result => JSON.stringify({ ...finished, effects: [{ ...eff('applied'), result }] });
+  expect(runRecordEligible(withResult({ note: 'x' }), yes), 'control: applied effect with a non-PR result').toBe(true);
+  expect(runRecordEligible(withResult({ pr: 1 }), yes), 'PR evidence').toBe(false);
+  expect(runRecordEligible(JSON.stringify({ ...finished, effects: [eff('applied'), { ...eff('failed'), key: 'k2', index: 1, result: { pr: 7 } }] }), yes), 'PR evidence on a later effect').toBe(false);
 });
 it('a crash between the manifest commit and the removal loop does not exclude the record forever', async () => {
   const p = await file(join(runs, 'crash.json'));
@@ -594,6 +600,15 @@ it('runsMinAgeDays (default 7, cascade) holds back records younger than it even 
   const mid = await file(join(runs, 'm.json'), new Date(now - 8 * 86400000));
   await run({ keepDays: 0 });
   expect(await exists(young)).toBe(true); expect(await exists(mid)).toBe(false);
+});
+it('runsMinAgeDays environment override governs retention (not the default 7)', async () => {
+  const env = { WE_PLATFORM_PREFERENCES_FILE: join(root, 'policy.json'), WE_ARCHIVE_RUNS_MIN_AGE_DAYS: '9' };
+  const eight = await file(join(runs, 'eight.json'), new Date(now - 8 * 86400000));
+  const ten = await file(join(runs, 'ten.json'), new Date(now - 10 * 86400000));
+  const out = await run({ keepDays: 0, env });
+  expect(out.policy.value.runsMinAgeDays).toBe(9);
+  expect(await exists(eight)).toBe(true); // 8d < 9d override (would leave under the default 7)
+  expect(await exists(ten)).toBe(false);
 });
 it('a parked .retiring file is restored by the next runs scan, and a failed restore alerts', async () => {
   const parked = join(runs, '.retiring-z.json.11111111-1111-1111-1111-111111111111');

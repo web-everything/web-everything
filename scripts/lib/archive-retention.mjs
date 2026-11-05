@@ -14,7 +14,7 @@ import { createRunsWriterExclusion, runRecordEligible, loadRunCompletion } from 
 import { readFile } from 'node:fs/promises';
 const exec = promisify(execFile);
 const DAY = 86400000;
-const standard = { runs: { keepDays: 14 }, sessions: { keepDays: 30 }, runsBatchCap: 5000, runsSchedule: 'daily', runsMinAgeDays: 7, driveRoot: join(homedir(), 'Library', 'CloudStorage', 'GoogleDrive-nic.g.gilbert@gmail.com', 'My Drive', 'web-everything-archive') };
+const standard = { runs: { keepDays: 14 }, sessions: { keepDays: 30 }, runsBatchCap: 5000, runsMinAgeDays: 7, driveRoot: join(homedir(), 'Library', 'CloudStorage', 'GoogleDrive-nic.g.gilbert@gmail.com', 'My Drive', 'web-everything-archive') };
 export function archiveSettings({ env = process.env, tool, log = console.error } = {}) {
   const p = readPlatformPreferences({ env, readFile: path => boundedText(path) });
   if (p.errors.length) throw Error(p.errors.join('; '));
@@ -33,13 +33,12 @@ export function archiveSettings({ env = process.env, tool, log = console.error }
   const valid = { runs: v => Number.isSafeInteger(v?.keepDays ?? v) && (v?.keepDays ?? v) >= 0,
     sessions: v => Number.isSafeInteger(v?.keepDays ?? v) && (v?.keepDays ?? v) >= 0,
     runsBatchCap: v => Number.isSafeInteger(v) && v > 0,
-    runsSchedule: v => v === 'daily',
     runsMinAgeDays: v => Number.isSafeInteger(v) && v >= 0,
     driveRoot: v => typeof v === 'string' && v.trim().length > 0 };
   // Validate complete blocks too: empty objects must not silently disappear in the cascade.
   for (const layer of [p.prefs.archive, tool, envValues]) if (layer !== undefined) {
     if (!layer || typeof layer !== 'object' || Array.isArray(layer)) throw Error('invalid archive policy');
-    for (const k of Object.keys(valid)) if (Object.hasOwn(layer, k) && (!valid[k](layer[k]) || (!['driveRoot', 'runsBatchCap', 'runsSchedule', 'runsMinAgeDays'].includes(k) && (typeof layer[k] !== 'object' || Array.isArray(layer[k]))))) throw Error(`invalid archive policy: ${k}`);
+    for (const k of Object.keys(valid)) if (Object.hasOwn(layer, k) && (!valid[k](layer[k]) || (!['driveRoot', 'runsBatchCap', 'runsMinAgeDays'].includes(k) && (typeof layer[k] !== 'object' || Array.isArray(layer[k]))))) throw Error(`invalid archive policy: ${k}`);
   }
   const r = resolveCascade({ standard, platform: p.prefs.archive, tool, envValues, valid });
   if (r.invalid.length) throw Error(`invalid archive policy: ${r.invalid.join('; ')}`);
