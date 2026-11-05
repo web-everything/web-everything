@@ -110,6 +110,7 @@ function splitNul(buffer) {
   if (start < buffer.length) out.push(buffer.subarray(start));
   return out;
 }
+const SIGNATURE_ARMOR = /-----(?:BEGIN|END) (?:PGP SIGNATURE|SSH SIGNATURE|SIGNED MESSAGE)-----/g;
 const bytes = (value) => Buffer.isBuffer(value) ? value : Buffer.from(value ?? '');
 
 /**
@@ -130,6 +131,50 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
     let finding = credentialTextFinding(message.toString('latin1')) ?? credentialTextFinding(message.toString('utf8'));
     try { finding ??= credentialContentFinding(Buffer.from('commit-message.txt'), message); } catch { finding ??= 'content-scan-error'; }
     if (finding) return { path: 'commit-message', finding };
+  }
+  // The formatted log above shows only author/committer/message. Extended headers (multiline gpgsig, mergetag, encoding, ...)
+  // also travel in the pack, so scan the COMPLETE raw object of every commit in the range.
+  const revs = await git(['rev-list', '--root', range]);
+  if (revs.code !== 0) throw bundleError('bundle-credential-scan-failed');
+  const commits = bytes(revs.stdout).toString('utf8').split('\n').filter(Boolean);
+  if (commits.length > maxBlobs) throw bundleError('bundle-credential-scan-too-large');
+  if (commits.length) {
+    const commitCheck = await git(['cat-file', '--batch-check=%(objectname) %(objecttype) %(objectsize)'], commits.join('\n') + '\n');
+    if (commitCheck.code !== 0) throw bundleError('bundle-credential-scan-failed');
+    const commitSizes = new Map(); let commitTotal = 0;
+    for (const line of bytes(commitCheck.stdout).toString('utf8').split('\n')) {
+      if (!line) continue;
+      const [sha, type, size] = line.split(' ');
+      if (type !== 'commit' || !Number.isSafeInteger(Number(size))) throw bundleError('bundle-credential-scan-failed');
+      commitSizes.set(sha, Number(size)); commitTotal += Number(size);
+    }
+    if (commitSizes.size !== commits.length || commitTotal > maxTotalBytes) throw bundleError('bundle-credential-scan-too-large');
+    let group = [], groupBytes = 0;
+    const flushCommits = async () => {
+      if (!group.length) return null;
+      const read = await git(['cat-file', '--batch'], group.join('\n') + '\n');
+      if (read.code !== 0) throw bundleError('bundle-credential-scan-failed');
+      const out = bytes(read.stdout); let offset = 0;
+      for (const sha of group) {
+        const newline = out.indexOf(10, offset);
+        if (newline < 0) throw bundleError('bundle-credential-scan-failed');
+        const [got, type, size] = out.subarray(offset, newline).toString('utf8').split(' ');
+        if (got !== sha || type !== 'commit') throw bundleError('bundle-credential-scan-failed');
+        // Only the signature armor delimiters are neutralised (a signed commit is legitimate); every other header byte is scanned.
+        const raw = Buffer.from(out.subarray(newline + 1, newline + 1 + Number(size)).toString('latin1').replace(SIGNATURE_ARMOR, 'SIGNATURE-ARMOR'), 'latin1');
+        offset = newline + 1 + Number(size) + 1;
+        let finding = credentialTextFinding(raw.toString('latin1')) ?? credentialTextFinding(raw.toString('utf8'));
+        try { finding ??= credentialContentFinding(Buffer.from('commit-object.txt'), raw); } catch { finding ??= 'content-scan-error'; }
+        if (finding) return { path: 'commit-object', finding };
+      }
+      group = []; groupBytes = 0;
+      return null;
+    };
+    for (const sha of commits) {
+      if (groupBytes + commitSizes.get(sha) > SCAN_BATCH_BYTES) { const hit = await flushCommits(); if (hit) return hit; }
+      group.push(sha); groupBytes += commitSizes.get(sha);
+    }
+    const hit = await flushCommits(); if (hit) return hit;
   }
   const tokens = splitNul(bytes(log.stdout));
   const blobs = new Map(); // sha -> Map(path key -> {label, path}): the policy scan is path-dependent, so EVERY path adding a blob is scanned

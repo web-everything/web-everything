@@ -313,3 +313,50 @@ describe('R593 commit-message scanner parity (R559)', () => {
     expect(await scanBundleRange({ cwd: lane, head: git(lane, 'rev-parse', 'HEAD'), prerequisite: runnerMain, exec })).toMatchObject({ path: 'commit-message' });
   });
 });
+
+describe('R593 raw commit object scan (R559)', () => {
+  const rawCommit = (extraHeader) => {
+    const tree = git(lane, 'rev-parse', 'HEAD^{tree}');
+    const body = `tree ${tree}\nparent ${tip}\nauthor F <f@example.invalid> 1700000000 +0000\ncommitter F <f@example.invalid> 1700000000 +0000\n${extraHeader}\nempty child\n`;
+    const r = spawnSync('git', ['hash-object', '-t', 'commit', '-w', '--stdin'], { cwd: lane, input: body, encoding: 'utf8' });
+    if (r.status !== 0) throw new Error(r.stderr);
+    return r.stdout.trim();
+  };
+  const sig = (comment) => `gpgsig -----BEGIN PGP SIGNATURE-----\n Comment: ${comment}\n \n iQEzBAABCAAdFiEE\n -----END PGP SIGNATURE-----\n`;
+  it('flags a token hidden in a multiline gpgsig header (empty child commit)', async () => {
+    const head = rawCommit(sig('ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'));
+    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ path: 'commit-object', finding: 'github-token' });
+  });
+  it('passes the same extended header without a credential', async () => {
+    const head = rawCommit(sig('GnuPG v2'));
+    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toBeNull();
+  });
+  it('refuses (does not skip) a commit range too large to scan', async () => {
+    await expect(scanBundleRange({ cwd: lane, head: tip, prerequisite: runnerMain, exec, maxTotalBytes: 1 })).rejects.toMatchObject({ code: 'bundle-credential-scan-too-large' });
+  });
+});
+
+describe('R593 degraded coverage (R559)', () => {
+  it('refuses a symlink (120000) in the bundled range', async () => {
+    await fs.symlink('tracked.txt', join(lane, 'link'));
+    git(lane, 'add', '--', 'link'); git(lane, ...ident, 'commit', '-q', '-m', 'symlink');
+    expect(await scanBundleRange({ cwd: lane, head: git(lane, 'rev-parse', 'HEAD'), prerequisite: runnerMain, exec })).toMatchObject({ path: 'link', finding: 'symlink' });
+  });
+  it('refuses a gitlink (160000) in the bundled range', async () => {
+    git(lane, 'update-index', '--add', '--cacheinfo', `160000,${tip},sub`);
+    git(lane, ...ident, 'commit', '-q', '-m', 'gitlink');
+    expect(await scanBundleRange({ cwd: lane, head: git(lane, 'rev-parse', 'HEAD'), prerequisite: runnerMain, exec })).toMatchObject({ path: 'sub', finding: 'gitlink' });
+  });
+  it('the main-age ceiling is the only thing refused when the bundle evidence is otherwise valid', async () => {
+    const dir = join(root, 'ceil-out'); await fs.mkdir(dir);
+    const plan = await planBundle({ cwd: lane, head: tip, runnerBase: runnerMain, exec, directory: dir });
+    await fs.copyFile(plan.file, join(container, 'bundle', 'git.bundle'));
+    const { manifest, manifestDigest } = manifestFor(tip);
+    const call = (maxMainAgeMs) => materializeWorktree({ work, root, head: tip, manifest, manifestDigest, exec,
+      bundle: { ...bundleEvidence(plan), file: join(container, 'bundle', 'git.bundle'), maxMainAgeMs } });
+    await expect(call(BUNDLE_MAIN_MAX_AGE_CEILING_MS + 1)).rejects.toMatchObject({ code: 'git-head-unavailable' });
+    expect(existsSync(join(work, '.git'))).toBe(false);
+    await call(BUNDLE_MAIN_MAX_AGE_CEILING_MS);
+    expect(git(work, 'rev-parse', 'HEAD')).toBe(tip);
+  });
+});
