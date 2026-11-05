@@ -33,7 +33,8 @@ import {
   createJobStore, createTickClock, enqueueJob, reattachTick, runJob,
 } from '../daemon-jobs-runtime.mjs';
 import {
-  ensureNodeModulesStore, evictSnapshots, lockfileKey, NODE_MODULES_HASH_FILE, nodeModulesRef, snapshotsRoot,
+  ensureNodeModulesStore, evictSnapshots, lockfileKey, NODE_MODULES_HASH_FILE, nodeModulesRef,
+  recordNodeModulesConsumer, setNodeModulesWritable, snapshotsRoot,
 } from '../daemon-job-snapshots.mjs';
 import { TERMINAL_JOB_STATUSES } from '../../operations/job-record.mjs';
 import { daemonJobsDir } from '../../operations/run-store.mjs';
@@ -100,6 +101,7 @@ export function linkOrCopyNodeModules({
   root, storeDir, destination = join(root, 'node_modules'), depsMode, step,
   exec = execFileSync, log = defaultLog, stat = statSync, readFile = readFileSync,
   env = process.env, settings,
+  referenceConsumer,
 }) {
   const mode = depsMode === undefined ? resolveRebuildDepsMode({ env, settings, log }).mode : depsMode;
   let reason = mode === 'copy' ? 'copy mode selected' : !validDepsMode(mode) ? 'invalid deps mode' : null;
@@ -110,10 +112,13 @@ export function linkOrCopyNodeModules({
   if (!reason && WRITES_NODE_MODULES_STEPS.includes(step)) reason = `step ${step} writes node_modules`;
   if (!reason) {
     try {
-      const sourceDev = stat(source).dev;
+      const sourceStat = stat(source);
+      const sourceDev = sourceStat.dev;
       const jobDev = stat(root).dev;
       if (!Number.isSafeInteger(sourceDev) || !Number.isSafeInteger(jobDev)) reason = 'device evidence unreadable';
       else if (sourceDev !== jobDev) reason = 'cross-volume device mismatch';
+      else if (!Number.isSafeInteger(sourceStat.mode)) reason = 'store integrity readonly mode evidence unreadable';
+      else if (sourceStat.mode & 0o222) reason = 'store integrity readonly protection missing (node_modules writable)';
     } catch { reason = 'device evidence unreadable'; }
   }
   if (!reason) {
@@ -127,20 +132,24 @@ export function linkOrCopyNodeModules({
   }
   if (!reason) {
     try {
+      if (referenceConsumer) recordNodeModulesConsumer(dirname(source), referenceConsumer);
       symlinkSync(source, destination, 'dir');
       return { mode: 'symlink' };
     } catch (error) {
       // Do not delete a pre-existing target on EEXIST; swap callers supply a fresh staging path.
       if (error?.code === 'EEXIST') throw error;
-      reason = `symlink creation failed (${error?.code ?? 'unknown'})`;
+      reason = `${referenceConsumer ? 'consumer registration or symlink creation' : 'symlink creation'} failed (${error?.code ?? 'lock unavailable or unknown'})`;
     }
   }
   sayDeps(log, `rebuild dependencies: copy fallback (${reason})`);
   try { exec('cp', ['-cR', source, destination], { stdio: 'ignore', timeout: 5 * 60_000 }); }
   catch {
+    setNodeModulesWritable(destination, true);
     rmSync(destination, { recursive: true, force: true });
     exec('cp', ['-R', source, destination], { stdio: 'ignore', timeout: 10 * 60_000 });
   }
+  // A private copy must remain usable by a writing step; cp preserves the source's read-only modes.
+  setNodeModulesWritable(destination, true);
   return { mode: 'copy', reason };
 }
 
