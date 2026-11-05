@@ -36,7 +36,10 @@ export default {
         findings: { read: { netBasis: { rev: head } } } });
       const evidence = over => ({ loopPayload: payload(), inFlight: false, queued: false,
         recorded: false, seatRecorded: false, ...over });
-      const confirm = (at = acceptedAt - RUN_MTIME_SLACK_MS - 1) => ({ op: 'review-pr', input: { repo, pr },
+      const panelAt = acceptedAt - 10_000;
+      const acceptingPanel = { op: 'review-pr', input: { repo, pr }, ...payload(), pending: null, effects: [],
+        stepTimings: [{ step: 'read', startedAt: new Date(panelAt).toISOString() }] };
+      const confirm = (at = panelAt - RUN_MTIME_SLACK_MS - 1) => ({ op: 'review-pr', input: { repo, pr },
         verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' }, effects: [],
         findings: { read: { netBasis: { rev: head } } },
         stepTimings: [{ step: 'read', startedAt: new Date(at).toISOString() }] });
@@ -47,7 +50,7 @@ export default {
           labels: ['review:accepted', 'red-team:pending'], comments: [accept], reviews: [], ...over.raw };
         const records = over.records ?? {};
         const scanIO = { runsDir: 'soak-runs', list: () => Object.keys(records),
-          read: id => records[id], stat: () => ({ mtimeMs: acceptedAt - RUN_MTIME_SLACK_MS - 1 }) };
+          read: id => records[id], stat: () => ({ mtimeMs: panelAt - RUN_MTIME_SLACK_MS - 1 }) };
         const out = runRedTeamOnSkip({ repo, env: {},
           plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] }, rawPrs: [raw],
           setting: { enabled: true, retryCooldownMin: 30 }, now: () => acceptedAt + 10_000,
@@ -59,7 +62,7 @@ export default {
           readIgnorableConfirms: ({ rawPr, ...key }) => {
             const result = ignorableConfirmRunIds({ ...key, ...scanIO, comments: rawPr.comments,
               labels: rawPr.labels, reviews: rawPr.reviews, now: acceptedAt + 10_000 });
-            return result.ok ? result.ids : [];
+            return result;
           },
           headNeverReviewed: key => headNeverReviewedFromRuns({ ...key, ...scanIO }),
           settlePending: key => {
@@ -91,13 +94,27 @@ export default {
         readEvidence: () => evidence({ loopPayload: payload('needs-human'), status: { status: 'finished', result: 'not-owed' } }),
         status: { status: 'finished', result: 'not-owed' },
       });
-      effects(notOwed, { pending: 1 });
-      check(notOwed.row?.settle === 'not-owed' && JSON.stringify(notOwed.raw.labels) === '["keep-me"]',
-        'not-owed: pending was not removed while preserving unrelated labels');
+      effects(notOwed, { escalate: 1 });
+      check(notOwed.row?.action === 'skip' && notOwed.row?.escalate === true && !notOwed.row?.settle
+        && JSON.stringify(notOwed.raw.labels) === '["red-team:pending","keep-me"]',
+        'unaccepted not-owed review lost its pending hold instead of escalating');
+
+      const acceptedClear = replay('accepted exact-head not-owed review legitimately clears', {
+        readEvidence: () => evidence({ status: { status: 'finished', result: 'not-owed' } }),
+        status: { status: 'finished', result: 'not-owed' },
+      });
+      effects(acceptedClear, { settle: 1, sync: 1 });
+      check(acceptedClear.row?.action === 'clear' && acceptedClear.calls.settle[0]?.accepted === true
+        && acceptedClear.calls.settle[0]?.head === head
+        && acceptedClear.calls.settle[0]?.comments?.[0] === accept,
+        'accepted exact-head not-owed review did not publish its legitimate policy-clear');
 
       const result = trusted(renderRedTeamComment({ pr, rev: head, provider: 'codex', model: 'soak',
         findings: [], foldedVerdict: 'accept' }));
-      const posted = replay('result already on head', { raw: { comments: [accept, result] } });
+      const posted = replay('result already on head', { raw: { comments: [accept, result] },
+        readEvidence: () => evidence({ recorded: true, status: { status: 'finished',
+          result: { status: 'ran', comment: 'posted', foldedVerdict: 'accept' } } }),
+      });
       effects(posted, { sync: 1 });
       check(posted.row?.settle === 'result' && posted.calls.sync[0]?.head === head, 'posted result did not synchronize this head');
 
@@ -116,7 +133,7 @@ export default {
       check(conflict.row?.escalate === true && conflict.raw.labels.length === 3, 'real conflict was removed instead of escalated');
 
       const oldConfirm = replay('old confirm superseded by acceptance', {
-        records: { 'review-pr-confirm': confirm() },
+        records: { 'review-pr-confirm': confirm(), 'review-pr-accepting-panel': acceptingPanel },
         readEvidence: ({ ignoreRunIds = [] }) => ignoreRunIds.includes('review-pr-confirm') ? evidence() : unfinished,
       });
       effects(oldConfirm, { dispatch: 1 });
@@ -134,7 +151,8 @@ export default {
           completedRecorded: true }), status: { status: 'finished', result: { status: 'ran', comment: 'posted',
           foldedVerdict: 'changes', findings: [{ summary: 'confirmed break', confirmedByRecheck: true }] } } },
         'result posted; comment not visible yet'],
-        ['newer unfinished review', { records: { 'review-pr-old': confirm(), 'review-pr-new': confirm(acceptedAt + 1) },
+        ['newer unfinished review', { records: { 'review-pr-old': confirm(), 'review-pr-new': confirm(acceptedAt + 1),
+          'review-pr-accepting-panel': acceptingPanel },
           readEvidence: () => unfinished }, 'review-unfinished'],
       ]) {
         const control = replay(name, options);
