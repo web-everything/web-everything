@@ -50,17 +50,30 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
       || !edit.editor.login.trim() || typeof edit.createdAt !== 'string' || !Number.isFinite(Date.parse(edit.createdAt))) {
       return refusal('unreadable edit snapshot or editor provenance; inspect complete GitHub history manually');
     }
-    const markers = edit.diff.match(/<!--\s*authored-by-actor:[\s\S]*?-->/g) ?? [];
     // Accept only unambiguous plain bodies: delta text cannot prove marker authorship.
     // Any ambiguous snapshot invalidates the entire history, even when ids agree.
-    if (/^@@ .* @@/m.test(edit.diff) || /^[ \t]*[+-][^\r\n]*authored-by-actor:/m.test(edit.diff)) {
+    if (/^@@ .* @@/m.test(edit.diff) || /\[-|-\]|\{\+|\+\}/.test(edit.diff)) {
       return refusal('unsupported delta edit snapshot; inspect complete GitHub history manually');
     }
     if (/<\/?[a-z][^>]*>/i.test(edit.diff)) {
       return refusal('unsupported HTML edit snapshot; inspect complete GitHub history manually');
     }
-    if (edit.diff.replace(/<!--\s*authored-by-actor:[\s\S]*?-->/g, '').includes('authored-by-actor:')) {
-      return refusal('malformed historical stamp');
+    const markers = [];
+    let fence;
+    for (const line of edit.diff.split(/\r\n|[\r\n]/)) {
+      const delimiter = line.match(/^[ \t]{0,3}(`{3,}|~{3,})(.*)$/);
+      if (line.includes('authored-by-actor:')) {
+        // A stamp is evidence only as a whole, unindented line outside code fences.
+        const marker = line.match(/^(<!--[ \t]*authored-by-actor:[^<>\r\n]*-->)[^\S\r\n]*$/)?.[1];
+        if (fence || !marker || marker.indexOf('authored-by-actor:', marker.indexOf('authored-by-actor:') + 1) !== -1) {
+          return refusal('malformed or non-standalone historical stamp; inspect complete GitHub history manually');
+        }
+        markers.push(marker);
+      }
+      if (delimiter) {
+        if (!fence) fence = delimiter[1];
+        else if (delimiter[1][0] === fence[0] && delimiter[1].length >= fence.length && !delimiter[2].trim()) fence = undefined;
+      }
     }
     // GitHub lists newest first for equal timestamps: the later position is older.
     if (!oldest || Date.parse(edit.createdAt) <= Date.parse(oldest.createdAt)) {

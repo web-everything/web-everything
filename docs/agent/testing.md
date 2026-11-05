@@ -3925,6 +3925,10 @@ the stamp and hold-reconcile suites exercise the repair through injected IO.
 `author-stamp-restore` fixtures must preserve GraphQL editor `__typename` alongside
 `login`: `app/X` PR authors match only `Bot` editors, and plain `X` authors match only
 `User` editors. Missing or unknown types refuse. Historical bodies must be plain
-snapshots; a hunk header, a plus/minus-prefixed marker line, or HTML in any snapshot
-refuses the whole history without writing. Refusal directs operators to inspect
+snapshots; a hunk header, word-diff token (`[-`, `-]`, `{+`, `+}`), or HTML in any snapshot
+refuses the whole history without writing. Every occurrence of `authored-by-actor:`
+must belong to a complete marker occupying an entire unindented line outside a code
+fence, with only optional trailing whitespace. Exercise malformed markers in an
+otherwise eligible oldest author snapshot, without an earlier forgery masking the
+refusal; keep the pr-land final standalone marker as a positive case. Refusal directs operators to inspect
 the complete GitHub history manually; never turn ambiguous delta text into a stamp.

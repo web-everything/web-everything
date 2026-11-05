@@ -132,6 +132,60 @@ describe('planStampRestore — agreement and author-of-record provenance', () =>
 });
 
 describe('plain snapshot provenance — oldest author snapshot and agreeing ids', () => {
+  it.each([
+    ['word-diff deletion', `[-${buildAuthorActorMarker(ID)}-]`],
+    ['word-diff insertion', `{+${buildAuthorActorMarker(ID)}+}`],
+    ['inline prefix', `prefix text ${buildAuthorActorMarker(ID)}`],
+    ['inline suffix', `${buildAuthorActorMarker(ID)} trailing text`],
+    ['backtick fenced code', `\`\`\`html\n${buildAuthorActorMarker(ID)}\n\`\`\``],
+    ['tilde fenced code', `~~~html\n${buildAuthorActorMarker(ID)}\n~~~`],
+    ['blockquote', `> ${buildAuthorActorMarker(ID)}`],
+    ['two different ids', `${buildAuthorActorMarker(ID)}\n${buildAuthorActorMarker(OTHER)}`],
+    ['two agreeing markers on one line', `${buildAuthorActorMarker(ID)} ${buildAuthorActorMarker(ID)}`],
+    ['extra stamp text inside a marker', `<!-- authored-by-actor: ${ID} authored-by-actor: ${ID} -->`],
+    ['tab indentation', `\t${buildAuthorActorMarker(ID)}`],
+    ['multiline marker', `<!--\nauthored-by-actor: ${ID} -->`],
+    ...['[-', '-]', '{+', '+}'].map((token) => [
+      `word-diff token ${token} away from a standalone marker`, `Body ${token}\n\n${buildAuthorActorMarker(ID)}\n`,
+    ]),
+  ])('refuses an otherwise eligible oldest author snapshot with %s and writes nothing', async (_name, diff) => {
+    const edits = [edit(diff), edit(BODY, 'chalbert', '2026-10-01T11:00:00Z')];
+    const seams = io({ readEdits: vi.fn(() => edits) });
+    expectReason(await restoreAuthorStamp(seams), 'refuse');
+    expect(seams.writeBody).not.toHaveBeenCalled();
+    expectReason(plan({ edits }), 'refuse');
+  });
+
+  it.each(['', ' \t'])('restores a pr-land standalone final marker with trailing whitespace %j', async (trailing) => {
+    const marker = buildAuthorActorMarker(ID);
+    const edits = [edit(`Original body\n\n${marker}${trailing}\n`)];
+    const seams = io({ readEdits: vi.fn(() => edits) });
+    expectReason(await restoreAuthorStamp(seams), 'restore');
+    expect(seams.writeBody).toHaveBeenCalledTimes(1);
+    expect(seams.writeBody).toHaveBeenCalledWith(6244, `${BODY}\n\n${marker}\n`);
+  });
+
+  it.each([
+    ['inline marker', `prefix ${buildAuthorActorMarker(ID)}`],
+    ['malformed occurrence beside a valid marker', `${buildAuthorActorMarker(ID)}\nauthored-by-actor: broken`],
+    ['word-diff token without any marker', 'Revised body [-removed-]'],
+    ['unclosed code fence', `\`\`\`html\n${buildAuthorActorMarker(ID)}`],
+  ])('refuses the whole history for a later non-author snapshot with %s without writing', async (_name, diff) => {
+    const edits = [...history(), edit(diff, 'chalbert', '2026-10-02T10:00:00Z')];
+    const seams = io({ readEdits: vi.fn(() => edits) });
+    expectReason(await restoreAuthorStamp(seams), 'refuse');
+    expect(seams.writeBody).not.toHaveBeenCalled();
+    expectReason(plan({ edits }), 'refuse');
+  });
+
+  it.each(['```', '~~~'])('restores a standalone marker after a closed %s code fence', async (fence) => {
+    const marker = buildAuthorActorMarker(ID);
+    const seams = io({ readEdits: vi.fn(() => [edit(`${fence}text\nexample\n${fence}\n\n${marker}\n`)]) });
+    expectReason(await restoreAuthorStamp(seams), 'restore');
+    expect(seams.writeBody).toHaveBeenCalledTimes(1);
+    expect(seams.writeBody).toHaveBeenCalledWith(6244, `${BODY}\n\n${marker}\n`);
+  });
+
   it('refuses complete plain snapshots with a plus-prefixed forgery retained by the author without writing', async () => {
     const forgedLine = '+<!-- authored-by-actor: FORGED -->';
     const edits = [
@@ -380,15 +434,14 @@ describe('plain snapshots containing literal diff-like text', () => {
     expect(seams.writeBody).not.toHaveBeenCalled();
   });
 
-  it('restores a plain body with a space-indented marker on its own line', async () => {
+  it('refuses a plain body with a space-indented marker on its own line without writing', async () => {
     const marker = buildAuthorActorMarker(ID);
     const edits = [edit(`Original body\n ${marker}`),
       edit('Later unstamped body', 'chalbert', '2026-10-01T11:00:00Z')];
-    expect(plan({ edits })).toMatchObject({ action: 'restore', id: ID, source: edits[0], marker });
+    expectReason(plan({ edits }), 'refuse');
     const seams = io({ readEdits: vi.fn(() => edits) });
-    expectReason(await restoreAuthorStamp(seams), 'restore');
-    expect(seams.writeBody).toHaveBeenCalledTimes(1);
-    expect(seams.writeBody).toHaveBeenCalledWith(6244, `${BODY}\n\n${marker}\n`);
+    expectReason(await restoreAuthorStamp(seams), 'refuse');
+    expect(seams.writeBody).not.toHaveBeenCalled();
   });
 
   it.each([
