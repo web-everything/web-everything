@@ -271,7 +271,7 @@ describe('audit settings (R528)', () => {
     // findAudit's reader does accept it, so this really is a documented "stricter" case, not a shared refusal.
     expect(resolvePriorQuestionHashes({ readFile: read, env: {} })).toHaveLength(list.length);
   });
-  it.each([['a case', 'PriorQuestionHashes'], ['an invisible-character', 'priorQuestionHashes​']])(
+  it.each([['a case', 'PriorQuestionHashes'], ['an invisible-character', `priorQuestionHashes${String.fromCharCode(0x200b)}`]])(
     'the key beside %s variant of itself accepts nothing (stricter than findAudit, PR #6381 merge)', (_, variant) => {
     const audit = full({ priorQuestionHashes: [HASH_A], [variant]: [] });
     expect(resolve(audit).value.priorQuestionHashes).toEqual([]);
