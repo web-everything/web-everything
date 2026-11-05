@@ -301,6 +301,9 @@ export function ignorableConfirmRunIds({ repo, pr, head, comments, labels, revie
       || !Array.isArray(labels) || !labels.some(l => (typeof l === 'string' ? l : l?.name) === 'review:accepted')) return closed;
     const acceptance = latestAcceptRecord(comments, reviews);
     const acceptedAt = Date.parse(acceptance?.at);
+    // The marker alone is not an acceptance: the comment must read as an accepting verdict, never a hold.
+    const acceptBody = comments[acceptance?.index]?.body ?? '';
+    if (!/^\s*✅/.test(acceptBody) || isLaterVerdictBody(acceptBody)) return closed;
     // A re-stamp carries an earlier acceptance forward: its timestamp is not the original acceptance time.
     if (/^\s*📌 review — acceptance re-stamped/.test(comments[acceptance?.index]?.body ?? '')) return closed;
     if (acceptance?.sha !== head || !Number.isFinite(acceptedAt)
@@ -736,6 +739,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
               else {
                 const verdict = evidence?.status?.status === 'finished' ? evidence.status.result?.foldedVerdict : null;
                 if (!['accept', 'changes'].includes(verdict)) row.settleError = 'no recorded red-team verdict; label unchanged';
+                else if (verdict === 'accept' && evidence?.loopPayload?.verdict?.verdict !== 'accept') row.settleError = 'review payload is not an accept; label unchanged';
                 else {
                   // A withheld changes result must never inherit the clear disposition of an older comment.
                   const labels = verdict === 'changes' ? planRedTeamStatusLabels({ ...key, env, evidence,
