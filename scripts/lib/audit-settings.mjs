@@ -71,8 +71,11 @@ function readFile(path, read) {
   try { const v = JSON.parse(read(path, 'utf8')); return isObj(v) && isObj(v.audit) ? { tool: v.audit } : { tool: null, unreadable: true }; }
   catch { return { tool: null, unreadable: true }; }
 }
-const pathOf = key => ({ verdictMode: ['verdict', 'mode'], preExistingMode: ['preExisting', 'mode'], baseRecheckMax: ['preExisting', 'baseRecheckMax'],
-  recheckMax: ['recheck', 'max'], requireOnMain: ['cards', 'requireOnMain'], requirePayBy: ['cards', 'requirePayBy'] }[key] ?? [key]);
+const SECTION_PATHS = Object.freeze({ __proto__: null, verdictMode: ['verdict', 'mode'], preExistingMode: ['preExisting', 'mode'],
+  baseRecheckMax: ['preExisting', 'baseRecheckMax'], recheckMax: ['recheck', 'max'], requireOnMain: ['cards', 'requireOnMain'],
+  requirePayBy: ['cards', 'requirePayBy'] });
+// A null-prototype map: a polluted Object.prototype can never turn a setting name into an inherited path.
+const pathOf = key => SECTION_PATHS[key] ?? [key];
 const get = (tool, key) => {
   const [a, b] = pathOf(key);
   return b === undefined ? tool?.[a] : tool?.[a]?.[b];

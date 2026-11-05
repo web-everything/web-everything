@@ -268,18 +268,31 @@ describe('audit settings (R528)', () => {
   ])('the audit resolver is only ever stricter than findAudit: %s accepts nothing (PR #6381 merge)', (_, list) => {
     const read = () => JSON.stringify({ audit: { priorQuestionHashes: list } });
     expect(resolveAuditSettings({ fileRead: read, platform: null, env: {}, log: () => {} }).value.priorQuestionHashes).toEqual([]);
+    // findAudit's reader does accept it, so this really is a documented "stricter" case, not a shared refusal.
+    expect(resolvePriorQuestionHashes({ readFile: read, env: {} })).toHaveLength(list.length);
   });
-  it('the key beside a case variant of itself accepts nothing (stricter than findAudit, PR #6381 merge)', () => {
-    const r = resolve(full({ priorQuestionHashes: [HASH_A], 'priorQuestionHashes​': [] }));
-    expect(r.value.priorQuestionHashes).toEqual([]);
+  it.each([['a case', 'PriorQuestionHashes'], ['an invisible-character', 'priorQuestionHashes​']])(
+    'the key beside %s variant of itself accepts nothing (stricter than findAudit, PR #6381 merge)', (_, variant) => {
+    const audit = full({ priorQuestionHashes: [HASH_A], [variant]: [] });
+    expect(resolve(audit).value.priorQuestionHashes).toEqual([]);
+    expect(resolvePriorQuestionHashes({ readFile: file(audit), env: {} })).toEqual([HASH_A]);
+  });
+  it('an unreadable or non-object platform preference accepts no file hashes (stricter than findAudit, PR #6381 merge)', () => {
+    for (const platform of ['x', 42, []]) {
+      const r = resolveAuditSettings({ fileRead: file(full({ priorQuestionHashes: [HASH_A] })), platform, env: {}, log: () => {} });
+      expect(r.value.priorQuestionHashes).toEqual([]);
+      expect(r.sources.priorQuestionHashes).toBe('strictest');
+    }
   });
   it('an inherited (prototype) priorQuestionHashes is never read as a setting, as findAudit never reads one (PR #6381 merge)', () => {
     // The parsed file object is a plain JSON value, so emulate a polluted prototype on the shared Object.prototype.
     Object.defineProperty(Object.prototype, 'priorQuestionHashes', { value: [HASH_A], configurable: true, writable: true });
     try {
-      const polluted = resolveAuditSettings({ fileRead: () => JSON.stringify({ audit: {} }), platform: null, env: {}, log: () => {} });
-      expect(polluted.value.priorQuestionHashes).toEqual([]);
-      expect(polluted.value.priorQuestionHashes).toEqual(resolvePriorQuestionHashes({ readFile: () => JSON.stringify({ audit: {} }), env: {} }));
+      for (const audit of [{}, full()]) {
+        const polluted = resolveAuditSettings({ fileRead: file(audit), platform: null, env: {}, log: () => {} });
+        expect(polluted.value.priorQuestionHashes).toEqual([]);
+        expect(polluted.value.priorQuestionHashes).toEqual(resolvePriorQuestionHashes({ readFile: file(audit), env: {} }));
+      }
     } finally { delete Object.prototype.priorQuestionHashes; }
   });
   it('the shipped settings file reads the same prior question hashes through both readers (PR #6381 merge)', () => {
