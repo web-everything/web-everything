@@ -4,316 +4,126 @@ import { join } from 'node:path';
 import { describe, it, expect } from 'vitest';
 import { sourceNeedsGit, testFilterArgs, routeNeedsGit, NEEDS_GIT_REASON } from '../needs-git-route.mjs';
 
-// Linear-time guards: wall-clock bound tolerant of a loaded CI shard, per-test timeout above it so the
-// assertion (not vitest's 5s default) is what reports a slow run.
-const WALL_BOUND_MS = 15000;
-const TEST_TIMEOUT_MS = 30000;
+// R90 / R559 fail-closed rule: a file stays remote only when a conservative linear token check finds NO
+// git-related token anywhere. Every past red-team break (hidden by the old hand-rolled lexer) must be needs-git.
+const CP = "import {execSync, execFileSync} from 'node:child_process';\n";
+const BREAKS = {
+  'R8 ASI after debugger hides regex': CP + "debugger\n/'/.test('x'); const u='http://x'; execSync('git rev-parse --is-inside-work-tree', {stdio:'pipe'});",
+  'R8 repeated TS non-null assertion': CP + "const total: number | null = 4; const half = total!! / 2; execSync('git rev-parse HEAD'); const path = '/tmp';",
+  'regex after if head': CP + "if (x) /'/.test(y); const u='http://x'; execSync('git status');",
+  'regex literal with slashes': CP + "const re = /https?:\\/\\//; execFileSync('git', ['ls-files']);",
+  'nested class expressions': CP + "const A = class { m = class { n() {} } }\n/'/.test(a); const u='http://x'; execSync('git status');",
+  'quoted semicolon in shell arg': CP + "execSync('echo \";\" && git status');",
+  'nested template holes': CP + "const a=`x${ `y${ '}' }` }z`; const u='http://x'; execSync('git status');",
+  'object literal then division': CP + "const r = {valueOf: () => 10} / 2; execFileSync('git', ['rev-parse']); const p = '/tmp';",
+  'string concatenation of git': CP + "execSync('gi' + 't status');",
+  'array join of git': CP + "execSync(['g','i','t'].join('') + ' status');",
+  'hex escape': CP + "execSync('\\x67it status');",
+  'unicode escape': CP + "execSync('\\u0067it status');",
+  'template hole fragment': CP + "execSync(`${'g'}it status`);",
+  'comment inside token': CP + "execSync('g' /* x */ + 'it status');",
+  'spawn without literal git': "import cp from 'node:child_process'; const b = process.env.B; cp.spawnSync(b, []);",
+  'dynamic import of child_process': "const m = await import('node:child_' + 'process'); m.execSync(cmd);",
+  'simple-git package': "import simpleGit from 'simple-git'; await simpleGit().status();",
+  'fromCharCode build': "const n = String.fromCharCode(103,105,116); run(n);",
+  'base64 build': "run(Buffer.from('Z2l0', 'base64').toString());",
+  'eval': "eval(code)",
+  'worker threads': "import { Worker } from 'node:worker_threads';",
+  'fork': "import { fork } from 'node:child_process'; fork('x.js');",
+  'audit: comment between split halves': "const cp = await import('node:child_' /* gap */ + 'process'); export default cp.execFileSync('g' + 'it', ['--version']);",
+  'audit: line comment between split halves': "const cp = await import('node:child_' // gap\n + 'process'); cp.execFileSync('g' + 'it', []);",
+  'audit: variable suffix import': "const tail = 'process'; const cp = await import('node:child_' + tail); cp.execFileSync(['g','i','t'].join(''), []);",
+  'audit: computed require': "const cp = require('node:child_' + tail);",
+  'audit2: commented computed import': "const a='node:child'; const b='_process'; const cp = await import/**/(a+b); cp.execFileSync('gi'+'t', []);",
+  'audit2: commented computed require': "const cp = require/**/(a+b);",
+  'audit2: interpolated template import': "const cp = await import(`${a}${b}`); cp.execFileSync('gi'+'t', []);",
+  'audit2: getBuiltinModule': "const cp = process.getBuiltinModule(a + b);",
+  'audit3: aliased require': "const a='node:chi'; const b='ld_process'; const load=require; const cp=load(a+b); cp.execFileSync('gi'+'t', []);",
+  'audit4: computed module.require': "const tail='ld_process', head='node:chi'; const cp=module['requ'+'ire'](head+tail); cp.execFileSync('gi'+'t',[]);",
+  'audit4: computed eval': "globalThis['ev'+'al'](code)",
+  'audit4: this-computed eval': "this['ev'+'al'](code)",
+  'audit5: whitespace global computed eval': "const code='im'+'port(x)'; global ['ev'+'al'](code);",
+  'audit5: call-result computed access': "(function(){return this})()['ev'+'al'](code)",
+  'audit5: variable-built property': "const k = a + b; process[k]('x');",
+  'audit6: aliased global computed eval': "const g=global; await g['ev'+'al'](code);",
+  'audit6: sloppy this global': "const g=(function(){ return this; })(); g['ev'+'al'](code);",
+  'audit6: vm context': "import vm from 'node:vm'; vm.runInThisContext(code);",
+  'audit7: whitespace constructor access': "const F = (() => {}). constructor; const load = F('return im' + 'port(\"' + b + a + '\")');",
+  'audit7: quoted constructor': "const F = fn['constructor'];",
+  'audit8: direct Function call': "const cp=await Function('s','return im'+'port(s)')(head+tail);",
+  'audit9: computed destructuring': "const end='structor', start='con'; const {[start+end]: make}=()=>{}; make('s','return im'+'port(s)');",
+  'audit9: computed destructuring variable key': "const k = a + b; const {[k]: make} = fn;",
+  'audit9: concatenated bracket key on any object': "const o = fn; o[a + b]('x');",
+  'audit11: optional-chain computed read': "const make = fn?.[key]; make('s', 'x');",
+  'audit11: unicode identifier computed read': "const make = \u03C0[key]; make('s', 'x');",
+  'audit11: variable-key constructor': "const key = a + b, fn = () => {}, make = fn[key];",
+  'audit12: unquoted constructor destructuring': "const {constructor: make} = () => {}; make('s', 'x');",
+  'audit13: descriptor-based Function recovery': "const make = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(()=>{}), 'con'.concat('structor')).value;",
+  'audit13: proto walk': "const f = ({}).__proto__;",
+  'audit14: native binding via Object.values': "const load = Object.values(process).find(f => f.name === 'binding'); load('s'.concat('pawn_sync'));",
+  'unparseable binary-ish': '\u0000\u0001\u0002 �',
+};
 
-describe('sourceNeedsGit', () => {
-  it('detects direct git spawns', () => {
-    const cp = "import * as cp from 'node:child_process';\n";
-    expect(sourceNeedsGit(cp + "cp.execFileSync('git', ['ls-files', '-z'])")).toBe(true);
-    expect(sourceNeedsGit(cp + 'spawnSync("git", args)')).toBe(true);
-    expect(sourceNeedsGit(cp + "execSync('git status')")).toBe(true);
-    expect(sourceNeedsGit(cp + 'execSync(`git -C ${dir} log`)')).toBe(true);
-    expect(sourceNeedsGit(cp + "const bin = 'git'; run(bin, [])")).toBe(true);
-    expect(sourceNeedsGit("import { execFileSync as run } from 'child_process'; run('/usr/bin/git', [])")).toBe(true);
-  });
-  it('detects declared git helper imports', () => {
-    expect(sourceNeedsGit("import { x } from '../git-helper.mjs';", { helpers: ['git-helper.mjs'] })).toBe(true);
-  });
-  it('keeps code after a regex literal containing slashes (not a line comment)', () => {
-    const cp = "import { execFileSync } from 'node:child_process';\n";
-    expect(sourceNeedsGit(cp + "const re = /https?:\\/\\//; execFileSync('git', ['ls-files']);")).toBe(true);
-    expect(sourceNeedsGit(cp + "const re = /[/]x\\/\\//g; execFileSync('git', []);")).toBe(true);
-    expect(sourceNeedsGit(cp + "if (/^\\/\\//.test(s)) execFileSync('git', []);")).toBe(true);
-    expect(sourceNeedsGit(cp + "const a = [/\\/\\//, 1]; return /\\/\\//.test(x), execFileSync('git', []);")).toBe(true);
-    expect(sourceNeedsGit(cp + "const q = (a / b) / c; execFileSync('git', []);")).toBe(true);
-    // a regex literal is not code: a quoted git inside it must not count as a spawn
-    expect(sourceNeedsGit(cp + "const re = /'git'/; run('node')")).toBe(false);
-    // a real comment after a regex is still a comment
-    expect(sourceNeedsGit(cp + "const re = /a\\//; // execFileSync('git', [])")).toBe(false);
-  });
-  it('does not lose the scan position after a regex/division/template misjudgment', () => {
-    const G = "import {execSync} from 'node:child_process';\n";
-    const spawn = " execSync('git status');";
-    expect(sourceNeedsGit(G + "if (x) /'/.test(y); const u='http://x';" + spawn)).toBe(true);
-    expect(sourceNeedsGit(G + "while (m=next()) /x'/.exec(m); const u='http://x';" + spawn)).toBe(true);
-    expect(sourceNeedsGit(G + "function f(){}\n/'/.test(a); const u='http://x';" + spawn)).toBe(true);
-    expect(sourceNeedsGit(G + 'let r = i++ / 2;' + spawn + ' // see /x')).toBe(true);
-    expect(sourceNeedsGit(G + 'let r = f(i) / 2;' + spawn + ' // see /x')).toBe(true);
-    expect(sourceNeedsGit(G + "const a=`${ '`' }`; const u='http://x';" + spawn)).toBe(true);
-    expect(sourceNeedsGit(G + "const a=`x${ `y${ '}' }` }z`; const u='http://x';" + spawn)).toBe(true);
-    // `}` closing an object literal / expression is an operand: the next `/` divides. `}` closing a block is not.
-    const tail = " execFileSync('git', ['rev-parse']); const path = '/tmp';";
-    const E = "import {execFileSync} from 'node:child_process'; ";
-    expect(sourceNeedsGit(E + 'const ratio = {valueOf: () => 10} / 2;' + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'const r = ({a: 1}).a / 2;' + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'const r = [{}, {a: {}}] / 2;' + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'const r = f({a: 1} / 2);' + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'x = cond ? {} / 2 : {} / 3;' + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'function g() { return {a: 1} / 2; }' + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'const s = `${ {valueOf: () => 1} / 2 }`;' + tail)).toBe(true);
-    expect(sourceNeedsGit(E + "if (x) {}\n/'/.test(a); const u = 'http://x';" + tail)).toBe(true);
-    expect(sourceNeedsGit(E + "const f = () => {}\n/'/.test(a); const u = 'http://x';" + tail)).toBe(true);
-    expect(sourceNeedsGit(E + "class A { m() {} }\n/'/.test(a); const u = 'http://x';" + tail)).toBe(true);
-    expect(sourceNeedsGit(E + "else {}\n/'/.test(a); const u = 'http://x';" + tail)).toBe(true);
-    // TypeScript non-null `x!`, keyword-named properties and keyword-named methods are operands, not keywords
-    const one = " execFileSync('git', ['status']); expect(half / 2).toBe(1);";
-    expect(sourceNeedsGit(E + 'const half = total! / 2;' + one)).toBe(true);
-    expect(sourceNeedsGit(E + 'const half = f(a)! / 2;' + one)).toBe(true);
-    expect(sourceNeedsGit(E + 'const half = a[0]! / 2;' + one)).toBe(true);
-    expect(sourceNeedsGit(E + 'const half = stats.in / 2;' + one)).toBe(true);
-    expect(sourceNeedsGit(E + 'const half = a?.of / 2;' + one)).toBe(true);
-    expect(sourceNeedsGit(E + 'const half = d.with({day: 1}) / 2;' + one)).toBe(true);
-    expect(sourceNeedsGit(E + 'const half = x.for(1) / 2;' + one)).toBe(true);
-    // ... while a real regex after `!` / `return` / a real control head still reads as a regex
-    expect(sourceNeedsGit(E + "const ok = !/'/.test(s); const u = 'http://x';" + tail)).toBe(true);
-    expect(sourceNeedsGit(E + "function f(s) { return !/'/.test(s); } const u = 'http://x';" + tail)).toBe(true);
-    expect(sourceNeedsGit(E + "if (a) /'/.test(s); const u = 'http://x';" + tail)).toBe(true);
-    // a quote/backtick/brace inside a regex literal in a `${ }` hole does not end the hole early
-    expect(sourceNeedsGit(G + "function f() {\n  const a = `${ s.replace(/\"/g, '\\\\\"') }`;\n}\nconst b = `**/*.js`;" + spawn)).toBe(true);
-    expect(sourceNeedsGit(G + "it('a', () => { const c = `${s.replace(/`/g, '')}`; const g = `**/*.js`;" + spawn + ' });')).toBe(true);
-    expect(sourceNeedsGit(G + "function f() { const a = `${ s.replace(/'/g, '') }`; const b = `http://x`;" + spawn + ' }')).toBe(true);
-    expect(sourceNeedsGit(G + "function f() { const a = `${ s.replace(/}/g, '') }`; const b = `http://x`;" + spawn + ' }')).toBe(true);
-    expect(sourceNeedsGit(G + 'const a = `${ x / 2 } ${ y / 3 }`; const b = `http://x`;' + spawn)).toBe(true);
-    // a comment ends at CR, U+2028 and U+2029 as well as LF
-    for (const nl of ['\r', ' ', ' ']) expect(sourceNeedsGit(G + '// c' + nl + spawn)).toBe(true);
-    // ... but text inside one comment stays a comment
-    expect(sourceNeedsGit(G + "// execSync('git status')")).toBe(false);
-  });
-  it('a function or class EXPRESSION body is an operand (a following `/` divides); a declaration body is not', () => {
-    const E = "import {execSync} from 'node:child_process'; ";
-    const tail = " execSync('git status'); const s = '/tmp';";
-    expect(sourceNeedsGit(E + 'const f = function(){} / 2;' + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'const f = function named(a, b = {}){} / 2;' + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'const f = function*(){} / 2;' + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'const f = async function(){} / 2;' + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'const f = class {} / 2;' + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'const f = class A extends B {} / 2;' + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'const f = class A extends mix({}) {} / 2;' + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'const f = (function(){}) / 2;' + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'f(function(){} / 2);' + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'const o = {a: function(){} / 2};' + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'const f = true ? function(){} / 2 : 0;' + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'const f = `${ function(){} / 2 }`;' + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'const f = [function(){} / 2];' + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'const f = a || function(){} / 2;' + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'const f = typeof function(){} / 2;' + tail)).toBe(true);
-    // declarations (and ASI-separated ones) end a statement: the next `/` starts a regex
-    const rx = "\n/'/.test(a); const u = 'http://x';";
-    expect(sourceNeedsGit(E + 'function g(){}' + rx + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'async function g(){}' + rx + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'class A {}' + rx + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'class A extends B {}' + rx + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'x = 1\nfunction g(){}' + rx + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'x++\nfunction g(){}' + rx + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'export function g(){}' + rx + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'export default function(){}' + rx + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'export default class {}' + rx + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'if (x) {} else function g(){}' + rx + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'const o = {function: 1, b: {}} / 2;' + tail)).toBe(true);
-    // a keyword used as a property name opens no body: it must not turn the next block into an expression
-    const blk = "\nif (ok) { run() }\n/'/.test(s) && execSync('git status');";
-    expect(sourceNeedsGit(E + "const o = {a: 1, class: 'b'}" + blk)).toBe(true);
-    expect(sourceNeedsGit(E + "const o = {a: 1, function: 'b'}" + blk)).toBe(true);
-    expect(sourceNeedsGit(E + "const o = {function: x}; foo(o) {}" + blk)).toBe(true);
-    expect(sourceNeedsGit(E + 'const o = {class: 1, m() {}}' + blk)).toBe(true);
-  });
-  it('nested templates keep literal pieces disjoint (bounded memory and time)', () => {
+describe('sourceNeedsGit (fail-closed)', () => {
+  for (const [name, src] of Object.entries(BREAKS)) {
+    it(`break "${name}" needs git`, () => { expect(sourceNeedsGit(src)).toBe(true); });
+  }
+  it('R8 helper-import string continuation (the quadratic input) is fast and needs git via the helper token', () => {
+    const src = 'const fixture = "import \'' + 'a.mjs?'.repeat(32000) + '\\\n";';
     const t0 = Date.now();
-    expect(sourceNeedsGit("import 'node:child_process'; " + '`${ '.repeat(333000))).toBe(false);
-    // Wall-clock bound sized for a loaded CI shard (≈2.6× idle observed once at 4.7s); a quadratic rescan
-    // over 333k nests would take minutes, so this still fails loudly on a real regression.
-    expect(Date.now() - t0).toBeLessThan(WALL_BOUND_MS);
-  }, TEST_TIMEOUT_MS);
-  it('shell command position: leading whitespace, newlines, separators, env prefixes, paths', () => {
-    const E = "import { execSync } from 'node:child_process'; ";
-    for (const lit of [
-      "' git rev-parse --show-toplevel'", '"\\tgit status"', "'  /usr/bin/git status'", "' git'",
-      '`\n git status`', '`echo hi\ngit status`', '`echo hi\r\n  git status`', "'cd x && git status'", "'cd x; git status'",
-      "'a | git hash-object --stdin'", "'echo $(git rev-parse HEAD)'", '"echo `git rev-parse HEAD`"',
-      "'GIT_DIR=x git status'", "'A=1 B=2 /usr/bin/git status'", "'(git status)'", '`cd ${dir}\n\tgit log`',
-      // newline / tab written as an escape in an ordinary string
-      "'\\ngit status'", "'set -e\\ngit init'", "'a\\r\\n  git status'", "'echo hi\\n git log'",
-      // wrappers, shell keywords and groups before git; quoted env values; an .exe suffix
-      "'sudo git status'", "'time git status'", "'exec git status'", "'env FOO=1 git status'", "'ls | xargs git add'", "'! git diff --quiet'",
-      "'if true; then git status; fi'", "'if a; then b; else git status; fi'", "'{ git status; }'", "'FOO=\"a b\" git status'", "'git.exe'", "'git.exe status'",
-      '`git ${args}`', '`${dir}/git status`', '`cd ${dir} && git log`',
-    ]) expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(true);
-    // still not git: other binaries, prose mentions, env-only strings, comments
-    for (const lit of ["'gitleaks scan'", "'run git later'", "'digit status'", "'  gitx status'", "'GIT_DIR=x'", "'sudo ls'", "'\\\\nls'", "'if true; then ls; fi'","'echo git status'", "'a-git status'"]) {
-      expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(false);
-    }
-    expect(sourceNeedsGit(E + "// execSync(' git status')\nexecSync('node x')")).toBe(false);
+    expect(sourceNeedsGit(src, { helpers: ['a.mjs'] })).toBe(true);
+    expect(Date.now() - t0).toBeLessThan(2000);
   });
-  it('a quoted or escaped shell executable still names git', () => {
-    const E = "import { execSync } from 'node:child_process'; ";
-    for (const lit of [
-      "'\"git\" rev-parse --show-toplevel'", `"'git' status"`, "'\"/usr/bin/git\" status'", "'\"/my dir/git\" status'", "'g\"i\"t status'", "'g\\\\it status'",
-      "'\\\"git\\\" status'", "'cd x && \"git\" status'", "'\"sudo\" \"git\" status'", "'\"FOO=1\" git status'", "'\"git\"'", '`"git" ${args}`',
-    ]) expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(true);
-    // quoted arguments and other binaries are still not git
-    for (const lit of ["'\"gitleaks\" scan'", "'echo \"git status\"'", "'\"node\" git.mjs'", "'\"a-git\" status'"]) {
-      expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(false);
-    }
-  });
-  it('JS string escapes are decoded before the command is read', () => {
-    const E = "import { execSync } from 'node:child_process'; ";
-    for (const lit of [
-      "'\\x67it status'", "'\\u0067it status'", "'\\u{67}it status'", "'echo hi\\x0agit status'", "'echo hi\\u000agit status'",
-      "'\\ngit\\x20status'", "'\\tgit status'", '`\\x67it ${args}`', "'echo hi\\0\\x0agit'",
-    ]) expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(true);
-    // `\\` is one backslash (then `n`), not a line break; a tab between words is not a command break
-    for (const lit of ["'echo \\\\ngit status'", "'echo\\tgit status'", "'\\x65cho git status'", "'\\u{110000}git status'"]) {
-      expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(false);
-    }
-  });
-  it('options after a wrapper, $-quoting, $(…) env values and shell hex escapes', () => {
-    const E = "import { execSync } from 'node:child_process'; ";
-    for (const lit of [
-      "'env -i git status'", "'env -u X git status'", "'command -- git status'", "'sudo -n git status'", "'sudo -u root git status'",
-      "'time -p git status'", "'nice -n 5 git status'", "'env -i FOO=1 git status'", "'sudo -E env -i git'", "'xargs -0 git add'", "'env -i /usr/bin/git status'",
-      "'bash -c \"git x\"'", "\"sh -c 'git x'\"", "'bash -lc \"git x\"'", "'sudo bash -c \"git x\"'", "'/bin/sh -c \"git x\"'", "\"sh -c 'bash -c \\\"git x\\\"'\"",
-      "'timeout 5 git x'", "'timeout -k 1 5 git x'", "'/usr/bin/env git x'", "'/usr/bin/sudo -n git x'", "'stdbuf -oL git x'", "\"$'\\\\u0067it' x\"",
-      "\"$'git' status\"","'$\"git\" status'", "\"$'g\\\\x69t' status\"", "\"$'\\\\147it' status\"", "'FOO=$(echo a) git status'", "'(cd x) git status'",
-    ]) expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(true);
-    for (const lit of ["'env -i ls'", "'nice -n 5 node git.mjs'", "'echo -n git status'", "'-i git status'", "'sudo ls -a'", "'bash -c \"ls x\"'", "'bash script.sh git'", "'sh -x git.sh'", "'timeout 5 ls'", "'sh -c'"]) {
-      expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(false);
-    }
-  });
-  it('nested class / function expressions keep every pending outer state (a stack, not one slot)', () => {
-    const E = "import {execSync} from 'node:child_process'; ";
-    const tail = " execSync('git rev-parse --is-inside-work-tree'); const s = '/tmp';";
-    // the exact input of the operator send-back: the inner `class {}` must not overwrite the outer pending class
-    expect(sourceNeedsGit(E + "const C = class extends (class {}) {} / 2;" + tail)).toBe(true);
-    expect(sourceNeedsGit(E + "const C = class extends (class extends (class {}) {}) {} / 2;" + tail)).toBe(true);
-    expect(sourceNeedsGit(E + "const C = class extends mix(class {}, class {}) {} / 2;" + tail)).toBe(true);
-    expect(sourceNeedsGit(E + "const C = class extends (function(){ return class {}; })() {} / 2;" + tail)).toBe(true);
-    expect(sourceNeedsGit(E + "const C = class extends (class { static a = 1; }) {} / 2;" + tail)).toBe(true);
-    expect(sourceNeedsGit(E + "const f = function(a = class {}, b = function(){}){} / 2;" + tail)).toBe(true);
-    // heritage ending in an index, a template or an unparenthesised function; its body's `;` must not drop the outer class
-    expect(sourceNeedsGit(E + "const C = class extends x[0] {} / 2;" + tail)).toBe(true);
-    expect(sourceNeedsGit(E + "const C = class extends o['x'] {} / 2;" + tail)).toBe(true);
-    expect(sourceNeedsGit(E + "const C = class extends tag`x` {} / 2;" + tail)).toBe(true);
-    expect(sourceNeedsGit(E + "const C = class extends function(){ x; } {} / 2;" + tail)).toBe(true);
-    // a declaration around nested expressions still ends a statement: the next `/` starts a regex
-    expect(sourceNeedsGit(E + "class A extends (class {}) {}\n/'/.test(a);" + tail)).toBe(true);
-  });
-  it('a command separator inside a quoted shell argument does not start a new command', () => {
-    const E = "import { execSync } from 'node:child_process'; ";
-    for (const lit of [
-      `'echo "a; git rev-parse --is-inside-work-tree"'`, `"echo 'a; git status'"`, `'echo "a && git status"'`, `'echo "a | git status"'`,
-      `'echo "a\\ngit status"'`, `"echo 'a & git status'"`, `"sh -c 'echo \\"a; git status\\"'"`, `'echo "(git status)"'`, `'echo "a) git status"'`,
-    ]) expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(false);
-    // real separators (outside quotes, or in a command substitution even inside double quotes) still count
-    for (const lit of [
-      `'echo "a"; git status'`, `'echo "a" && git status'`, `'echo "$(git status)"'`, `'echo "\`git status\`"'`, `"echo 'a' | git apply"`,
-      `'bash -c "echo a; git status"'`, `"sh -c 'echo a; git status'"`, `'echo "unterminated; git status'`, `'echo "a; b" ; git status'`,
-      `'echo "$(echo "x; y"; git status)"'`,
-      // quotes inside a shell comment or heredoc body open nothing: the git line after them is still a command
-      `"echo hi # it's\\ngit status\\n# don't"`, `'echo a #"\\ngit x\\n#"'`, `"cat <<EOF\\nit's here\\nEOF\\ngit status\\ncat <<EOF\\ndon't\\nEOF"`,
-      // options before / after `-c`
-      `'bash -c -e "git x"'`, `'bash -o pipefail -c "git x"'`, `'bash +o history -c "git x"'`,
-    ]) expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(true);
-  });
-  it('a trailing-dot number is an operand: the next `/` divides', () => {
-    const E = "import { execSync } from 'node:child_process'; ";
-    const tail = " execSync('git rev-parse --show-toplevel'); const path = '/tmp';";
-    for (const num of ['1.', '10.', '0.', '1e3.', '0x1F.']) expect(sourceNeedsGit(E + `const ratio = ${num} / 2;` + tail), num).toBe(true);
-    expect(sourceNeedsGit(E + 'const r = f(1. / 2, 3.) / 4;' + tail)).toBe(true);
-    expect(sourceNeedsGit(E + 'const r = 1.5.toFixed(1) / 2;' + tail)).toBe(true);
-    // a spread or member dot is not a number: a regex literal after it is still a regex
-    expect(sourceNeedsGit(E + "const a = [...[/'/]]; const u = 'http://x';" + tail)).toBe(true);
-    expect(sourceNeedsGit(E + "const r = /'/.test(s); const u = 'http://x';" + tail)).toBe(true);
-  });
-  it('a `for await (…)` head is a control head: a regex after it is a regex', () => {
-    const E = "import { execSync } from 'node:child_process'; ";
-    const tail = " const u = 'http://x'; execSync('git status');";
-    for (const head of ['for await (const x of [])', 'for  await  (const x of [])', 'for /* c */ await /* d */ (const x of [])', 'for // c\n await (const x of [])', 'for(;;)', 'while (x)', 'if (x)']) {
-      expect(sourceNeedsGit(E + `async function check() { ${head} /'/.test(x); }` + tail), head).toBe(true);
-    }
-    // `await (…)` that is not behind `for` is a call: the next `/` divides
-    expect(sourceNeedsGit(E + "async function f() { const r = await (x) / 2; const p = '/tmp'; }" + " execSync('git status');")).toBe(true);
-  });
-  it('comments between a function / class keyword and its params / body do not hide the expression', () => {
-    const E = "import { execSync } from 'node:child_process'; ";
-    const tail = " execSync('git rev-parse --show-toplevel'); const path = '/tmp';";
-    for (const expr of [
-      'function /* annotation */ (){}', 'function // c\n (){}', 'function /* a */ * /* b */ (){}', 'function /* a */ name /* b */ (){}', 'async /* a */ function /* b */ (){}',
-      'class /* a */ {}', 'class // c\n {}', 'class /* a */ A /* b */ {}',
-    ]) expect(sourceNeedsGit(E + `const f = ${expr} / 2;` + tail), expr).toBe(true);
-    // a declaration (statement start) followed by a regex still reads the regex
-    expect(sourceNeedsGit(E + "function /* c */ g(){} /'/.test(s); const u = 'http://x'; execSync('git status');")).toBe(true);
-  });
-  it('a `{` after a label / case colon is a block (a regex follows); after a ternary or property colon it is an object (a division follows)', () => {
-    const E = "import { execSync } from 'node:child_process'; ";
-    const tail = " execSync('git status'); const path = '/tmp';";
-    for (const src of [
-      "label: {} /'/.test(1);", "a: { } /'/.test(1);", "switch (a) { case 1: {} /'/.test(1); }", "switch (a) { default: {} /'/.test(1); }",
-      "switch (a) { case b ? 1 : 2: {} /'/.test(1); }", "{ lbl: {} /'/.test(1); }",
-    ]) expect(sourceNeedsGit(E + src + " const u = 'http://x';" + tail), src).toBe(true);
-    for (const src of [
-      'const o = {a: {} / 2};', 'const o = c ? {} / 2 : 0;', 'const o = c ? 1 : {} / 2;', 'const o = {a: c ? 1 : 2, b: {} / 2};', 'const o = c ?? {} / 2;', 'const o = x?.y ? 1 : {} / 2;',
-      'const o = (c ? {a: 1} : {}) / 2;', 'const o = {k: {}} / 2;',
-    ]) expect(sourceNeedsGit(E + src + tail), src).toBe(true);
-  });
-  it('U+2028 / U+2029 are legal inside string literals and do not end them', () => {
-    const E = "import { execSync } from 'node:child_process'; ";
-    for (const sep of [' ', ' ']) {
-      expect(sourceNeedsGit(E + `const s = 'a${sep}//b'; execSync('git status');`)).toBe(true);
-      expect(sourceNeedsGit(E + `const s = "a${sep}/*b"; execSync('git status');`)).toBe(true);
-      expect(sourceNeedsGit(E + `const s = \`a${sep}//b\`; execSync('git status');`)).toBe(true);
-      expect(sourceNeedsGit(E + `const s = \`\${ 'a${sep}//b' }\`; execSync('git status');`)).toBe(true);
-      // ... while a real unterminated line comment still ends at them
-      expect(sourceNeedsGit(E + `// c${sep}execSync('git status');`)).toBe(true);
-      expect(sourceNeedsGit(E + `execSync('node x'); // execSync('git status')`)).toBe(false);
-    }
-    // a string ends at CR / LF (unterminated strings are invalid JS but must not swallow the next line)
-    for (const nl of ['\n', '\r']) expect(sourceNeedsGit(E + `const s = 'a${nl}execSync('git status');`)).toBe(true);
-  });
-  it('stays linear on adversarial 300k inputs (no quadratic rescans)', () => {
-    const o = { helpers: ['a.mjs'] };
-    const inputs = ['(/['.repeat(100000), 'import' + ' '.repeat(300000) + 'x', 'a'.repeat(300000), "('".repeat(150000), '${'.repeat(100000), '`${'.repeat(100000), '`${' + '(/['.repeat(100000), '`${' + '(/'.repeat(150000),
-      ...["'" + 'A=b '.repeat(70000) + "'", "'" + ' '.repeat(300000) + "'", "'" + ';'.repeat(300000) + "'", "'" + ' /'.repeat(150000) + "'",
-        "'" + 'sudo -a '.repeat(37000) + "'", "'" + 'sh -c '.repeat(50000) + "'", "'" + 'bash -x '.repeat(37000) + "'", "'" + 'timeout 5 '.repeat(30000) + "'","'" + 'env -u x '.repeat(33000) + "'", "'" + '\\x'.repeat(140000) + "'", "'" + '"\\'.repeat(140000) + "'", "'" + '$"'.repeat(140000) + "'", "'" + ') '.repeat(140000) + "'",
-        '`' + '\n '.repeat(150000) + '`','function(){}'.repeat(25000), 'class{}'.repeat(40000), '=function(){'.repeat(25000)].map(x => "import 'node:child_process'; " + x)];
-    const t0 = Date.now();
-    for (const s of inputs) expect(sourceNeedsGit(s, o)).toBe(false);
-    // Same loaded-CI sizing as above: idle ≈1.8s, a loaded shard hit 4.7s (PR 6339 CI), quadratic is minutes.
-    expect(Date.now() - t0).toBeLessThan(WALL_BOUND_MS);
-    // oversize input is not judged (same as an unreadable file): stays remote
-    expect(sourceNeedsGit("import 'node:child_process'; run('git', [])" + ' '.repeat(1024 * 1024))).toBe(false);
-  }, TEST_TIMEOUT_MS);
-  it('ignores non-string and empty helper entries', () => {
+  it('declared helpers are tokens too', () => {
+    expect(sourceNeedsGit("import { x } from '../tracked-helper.mjs';", { helpers: ['tracked-helper.mjs'] })).toBe(true);
     expect(sourceNeedsGit("import '../x.mjs'", { helpers: [null, '', undefined, 7] })).toBe(false);
-    expect(sourceNeedsGit("import '../x.mjs'", { helpers: 'x.mjs' })).toBe(false);
   });
-  it('honours declared helpers imported dynamically, by side-effect, or via require', () => {
-    const o = { helpers: ['git-helper.mjs'] };
-    expect(sourceNeedsGit("const { tracked } = await import('../git-helper.mjs'); tracked();", o)).toBe(true);
-    expect(sourceNeedsGit("await import(`../git-helper.mjs`)", o)).toBe(true);
-    expect(sourceNeedsGit("import '../git-helper.mjs';", o)).toBe(true);
-    expect(sourceNeedsGit('import "../git-helper.mjs"', o)).toBe(true);
-    expect(sourceNeedsGit("const h = require('../git-helper.mjs')", o)).toBe(true);
-    expect(sourceNeedsGit("export * from '../git-helper.mjs'", o)).toBe(true);
-    expect(sourceNeedsGit("import\n  '../git-helper.mjs'", o)).toBe(true);
-    expect(sourceNeedsGit("await import(\n  '../git-helper.mjs?raw')", o)).toBe(true);
-    expect(sourceNeedsGit("require.resolve('../git-helper.mjs')", o)).toBe(true);
-    expect(sourceNeedsGit("await vi.importActual('../git-helper.mjs')", o)).toBe(true);
-    expect(sourceNeedsGit("// import '../git-helper.mjs'\n// await import('../git-helper.mjs')", o)).toBe(false);
-    expect(sourceNeedsGit("const s = 'git-helper.mjs'; other('../git-helper.mjs')", o)).toBe(false);
+  it('audit: helpers with no ASCII letters, a split helper import, and an oversized helper list', () => {
+    expect(sourceNeedsGit("const run = require('./\u5DE5\u5177'); run();", { helpers: ['\u5DE5\u5177'] })).toBe(true);
+    expect(sourceNeedsGit("const run = require('./---'); run();", { helpers: ['---'] })).toBe(true);
+    expect(sourceNeedsGit("await import('./run' /* gap */ + 'ner.mjs')", { helpers: ['runner.mjs'] })).toBe(true);
+    expect(sourceNeedsGit('a'.repeat(1000), { helpers: Array(5000).fill('b') })).toBe(true);
   });
-  it('does not flag prose or non-spawn mentions', () => {
-    expect(sourceNeedsGit("const msg = 'run git later'; execFileSync('node', ['x'])")).toBe(false);
-    expect(sourceNeedsGit("execFileSync('gitleaks', [])")).toBe(false);
+  it('audit2: helper that only matches once block comments are removed', () => {
+    expect(sourceNeedsGit("import ''; /*x*/ ''", { helpers: ["';   '"] })).toBe(true);
+  });
+  it('audit3: many import keywords inside one long comment stay linear', () => {
+    const src = '/* ' + 'import/* '.repeat(40000) + ' */\nconst x=1;';
+    const t0 = Date.now();
+    sourceNeedsGit(src);
+    expect(Date.now() - t0).toBeLessThan(2000);
+  });
+  it('audit4: an unterminated // + import/* run stays linear', () => {
+    const src = '// ' + 'import/* '.repeat(40000);
+    const t0 = Date.now();
+    sourceNeedsGit(src);
+    expect(Date.now() - t0).toBeLessThan(2000);
+  });
+  it('audit11: a megabyte of [ stays linear', () => {
+    const t0 = Date.now();
+    sourceNeedsGit('['.repeat(1024 * 1024));
+    sourceNeedsGit('a['.repeat(500000));
+    expect(Date.now() - t0).toBeLessThan(5000);
+  });
+  it('a block comment opener inside a string cannot hide later code', () => {
+    expect(sourceNeedsGit("const g = 'src/**/*.js'; /* x */ import('node:child_process');")).toBe(true);
+    expect(sourceNeedsGit("const u = 'http://x'; import('node:child_process');")).toBe(true);
+  });
+  it('non-string input and oversize input are ambiguous: needs git', () => {
+    expect(sourceNeedsGit(undefined)).toBe(true);
+    expect(sourceNeedsGit(null)).toBe(true);
+    expect(sourceNeedsGit('a'.repeat(1024 * 1024 + 1))).toBe(true);
+  });
+  it('a plain token-free test stays remote', () => {
+    expect(sourceNeedsGit("import { it, expect } from 'vitest';\nit('adds', () => { expect(1 + 1).toBe(2); });")).toBe(false);
     expect(sourceNeedsGit('')).toBe(false);
-    expect(sourceNeedsGit("import { spawn } from 'node:child_process';\n// spawn('git', [])\n/* execSync('git x') */")).toBe(false);
-    expect(sourceNeedsGit("import { spawnSync } from 'node:child_process'; const g = '**/*'; /* c */ spawnSync('git', []); // end")).toBe(true);
-    expect(sourceNeedsGit("vi.mock('x'); spawnSync('git', [])")).toBe(false);
-    expect(sourceNeedsGit("import a from '../my-git-helper.mjs'", { helpers: ['git-helper.mjs'] })).toBe(true);
-    expect(sourceNeedsGit("// from '../git-helper.mjs'", { helpers: ['git-helper.mjs'] })).toBe(false);
   });
+  it('stays linear on adversarial 1MB inputs', () => {
+    const inputs = ['(/['.repeat(300000), 'import' + ' '.repeat(900000) + 'x', 'a.mjs?'.repeat(160000) + '\\\n', '${'.repeat(500000), '`${'.repeat(300000), "'" + ' /'.repeat(450000) + "'", 'function(){}'.repeat(80000), 'gi'.repeat(500000)];
+    const t0 = Date.now();
+    for (const s of inputs) sourceNeedsGit(s.slice(0, 1024 * 1024), { helpers: ['a.mjs'] });
+    expect(Date.now() - t0).toBeLessThan(15000);
+  }, 30000);
 });
 
 describe('testFilterArgs', () => {
@@ -337,27 +147,28 @@ describe('routeNeedsGit', () => {
     expect(r).toEqual({ local: true, reason: NEEDS_GIT_REASON, files: ['a.test.mjs'] });
     expect(NEEDS_GIT_REASON).toBe('needs-git');
   });
-  it('stays remote when no selected file needs git', () => {
+  it('stays remote when no selected file needs git, and for non-test commands', () => {
     expect(routeNeedsGit({ argv: ['vitest', 'run', 'b.test.mjs'], readFile })).toEqual({ local: false });
-  });
-  it('stays remote for unreadable files and non-test commands (no over-routing)', () => {
-    expect(routeNeedsGit({ argv: ['vitest', 'run', 'missing.test.mjs'], readFile })).toEqual({ local: false });
     expect(routeNeedsGit({ argv: ['npm', 'run', 'check:standards'], readFile })).toEqual({ local: false });
+  });
+  it('an unreadable test-file filter is ambiguous: local (fail-closed)', () => {
+    expect(routeNeedsGit({ argv: ['vitest', 'run', 'missing.test.mjs'], readFile }))
+      .toEqual({ local: true, reason: 'needs-git', files: ['missing.test.mjs'] });
   });
   it('honours a declared list', () => {
     expect(routeNeedsGit({ argv: ['vitest', 'run', 'b.test.mjs'], readFile, declared: ['b.test.mjs'] }))
       .toEqual({ local: true, reason: 'needs-git', files: ['b.test.mjs'] });
   });
-  it('default reader refuses outside-root, traversal and non-files', () => {
+  it('default reader: outside-root test file is local, directories/globs stay unjudged', () => {
     const dir = mkdtempSync(join(tmpdir(), 'ngr-'));
     try {
       mkdirSync(join(dir, 'sub'));
-      const body = "import 'node:child_process'; spawnSync('git', [])";
-      writeFileSync(join(dir, 'in.test.mjs'), body);
-      writeFileSync(join(dir, '..', `out-${process.pid}.test.mjs`), body);
+      writeFileSync(join(dir, 'in.test.mjs'), "import 'node:child_process'; spawnSync('git', [])");
+      writeFileSync(join(dir, 'ok.test.mjs'), "expect(1).toBe(1)");
       expect(routeNeedsGit({ argv: ['vitest', 'run', 'in.test.mjs'], cwd: dir }).local).toBe(true);
-      expect(routeNeedsGit({ argv: ['vitest', 'run', `../out-${process.pid}.test.mjs`], cwd: dir })).toEqual({ local: false });
+      expect(routeNeedsGit({ argv: ['vitest', 'run', 'ok.test.mjs'], cwd: dir })).toEqual({ local: false });
+      expect(routeNeedsGit({ argv: ['vitest', 'run', '../escape.test.mjs'], cwd: dir }).local).toBe(true);
       expect(routeNeedsGit({ argv: ['vitest', 'run', 'sub', 'src/**'], cwd: dir })).toEqual({ local: false });
-    } finally { rmSync(join(dir, '..', `out-${process.pid}.test.mjs`), { force: true }); rmSync(dir, { recursive: true, force: true }); }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
