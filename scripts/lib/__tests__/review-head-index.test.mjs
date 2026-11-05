@@ -132,6 +132,23 @@ describe('netPatchKey', () => {
     expect(k(git(r, 'rev-parse', 'HEAD')).key).not.toBe(k(a).key);
     rmSync(r, { recursive: true, force: true });
   });
+  it('patches that differ only in invalid UTF-8 bytes get different keys (the diff is hashed as raw bytes)', () => {
+    const r = mkdtempSync(join(tmpdir(), 'rhi-git-'));
+    git(r, 'init', '-q', '-b', 'main'); git(r, 'config', 'user.email', 'a@b'); git(r, 'config', 'user.name', 'a');
+    writeFileSync(join(r, 'f'), 'one\n'); git(r, 'add', '.'); git(r, 'commit', '-qm', 'base');
+    const variant = (branch, byte) => {
+      git(r, 'checkout', '-q', 'main'); git(r, 'checkout', '-qb', branch);
+      writeFileSync(join(r, 'g'), Buffer.from([0x61, byte, 0x62, 0x0a])); // no NUL: git diffs it as text; 0xff/0xfe are invalid UTF-8
+      git(r, 'add', '.'); git(r, 'commit', '-qm', branch);
+      return git(r, 'rev-parse', 'HEAD');
+    };
+    const [a, b] = [variant('bin-a', 0xff), variant('bin-b', 0xfe)];
+    const k = sha => netPatchKey({ exec: execFileSync, cwd: r, sha, mainRef: 'main' });
+    expect(k(a).ok && k(b).ok).toBe(true);
+    expect(k(a).key).not.toBe(k(b).key);
+    expect(k(a).key).toBe(k(a).key);                              // still deterministic
+    rmSync(r, { recursive: true, force: true });
+  });
   it('fails closed (no key) on a bad sha or unreadable repo', () => {
     expect(netPatchKey({ exec: () => { throw Error('boom'); }, cwd: '.', sha: H(1) })).toMatchObject({ ok: false });
     expect(netPatchKey({ exec: () => '', cwd: '.', sha: 'nope' })).toMatchObject({ ok: false });
@@ -203,47 +220,64 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     nodeFs.utimesSync(lock, new Date(0), new Date(0));
     expect(() => withHeadIndexLock(dir, () => 'old', { waitMs: 60, staleMs: 1 })).toThrow(/lock busy/);
   });
-  it('takeover: an owner that re-creates the lock between the dead-check and the rename keeps it (restored, fence passes)', () => {
+  const takeoverLeftovers = () => nodeFs.readdirSync(dir).filter(f => /\.(takeover|new|stale)/.test(f));
+  it('takeover: an owner that re-creates the lock before the serialised re-read keeps it (never displaced)', () => {
     const { lock } = headIndexPaths(dir);
     nodeFs.mkdirSync(dir, { recursive: true });
     writeFileSync(lock, JSON.stringify({ pid: 999999, token: 'dead', at: 0 }));
     let swapped = false;
-    const fs = { ...nodeFs, renameSync: (a, b) => {
-      if (!swapped && a === lock) { swapped = true; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'live', at: Date.now() })); }
-      return nodeFs.renameSync(a, b);
+    // the live owner re-creates the lock right after the contender takes the takeover mutex, i.e. before its re-read
+    const fs = { ...nodeFs, openSync: (p, f) => {
+      const fd = nodeFs.openSync(p, f);
+      if (!swapped && p === `${lock}.takeover`) { swapped = true; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'live', at: Date.now() })); }
+      return fd;
     } };
     expect(() => withHeadIndexLock(dir, () => 'no', { fs, waitMs: 60 })).toThrow(/lock busy/);
+    expect(swapped).toBe(true);
     expect(JSON.parse(readFileSync(lock, 'utf8')).token).toBe('live'); // the live owner's fence would still pass
-    expect(nodeFs.readdirSync(dir).filter(f => f.includes('.stale.'))).toEqual([]);
+    expect(takeoverLeftovers()).toEqual([]);
   });
-  it('takeover of an unreadable (never-written) holder file: a live owner that replaces it mid-takeover keeps its lock', () => {
+  it('takeover of an unreadable (never-written) holder file: a live owner that replaces it before the re-read keeps its lock', () => {
     const { lock } = headIndexPaths(dir);
     nodeFs.mkdirSync(dir, { recursive: true });
     writeFileSync(lock, ''); // no readable owner: judged stale only by age
     nodeFs.utimesSync(lock, new Date(0), new Date(0));
     let swapped = false;
-    const fs = { ...nodeFs, renameSync: (a, b) => {
-      if (!swapped && a === lock) { swapped = true; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'live', at: Date.now() })); }
-      return nodeFs.renameSync(a, b);
+    const fs = { ...nodeFs, openSync: (p, f) => {
+      const fd = nodeFs.openSync(p, f);
+      if (!swapped && p === `${lock}.takeover`) { swapped = true; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'live', at: Date.now() })); }
+      return fd;
     } };
     expect(() => withHeadIndexLock(dir, () => 'no', { fs, waitMs: 60, staleMs: 1000 })).toThrow(/lock busy/);
     expect(JSON.parse(readFileSync(lock, 'utf8')).token).toBe('live');
-    expect(nodeFs.readdirSync(dir).filter(f => f.includes('.stale.'))).toEqual([]);
+    expect(takeoverLeftovers()).toEqual([]);
   });
-  it('takeover: when a newer lock exists at restore time the newer holder wins and its lock is never unlinked', () => {
+  it('takeover replaces the lock atomically: it is never unlinked and never absent while a takeover runs', () => {
     const { lock } = headIndexPaths(dir);
     nodeFs.mkdirSync(dir, { recursive: true });
     writeFileSync(lock, JSON.stringify({ pid: 999999, token: 'dead', at: 0 }));
-    let swapped = false, newer = false;
+    const seen = [];
     const fs = { ...nodeFs,
-      renameSync: (a, b) => {
-        if (!swapped && a === lock) { swapped = true; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'live', at: Date.now() })); }
-        return nodeFs.renameSync(a, b);
-      },
-      linkSync: (a, b) => { if (!newer) { newer = true; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'newest', at: Date.now() })); } return nodeFs.linkSync(a, b); } };
-    expect(() => withHeadIndexLock(dir, () => 'no', { fs, waitMs: 60 })).toThrow(/lock busy/);
-    expect(JSON.parse(readFileSync(lock, 'utf8')).token).toBe('newest');
-    expect(nodeFs.readdirSync(dir).filter(f => f.includes('.stale.'))).toEqual([]);
+      unlinkSync: p => { seen.push({ op: 'unlink', p }); return nodeFs.unlinkSync(p); },
+      renameSync: (a, b) => { seen.push({ op: 'rename', p: b, lockPresent: existsSync(lock) }); return nodeFs.renameSync(a, b); } };
+    expect(withHeadIndexLock(dir, fence => { fence(); return 'ok'; }, { fs })).toBe('ok');
+    const renamed = seen.findIndex(e => e.op === 'rename' && e.p === lock);
+    expect(renamed).toBeGreaterThanOrEqual(0);                      // our lock lands by rename over the old one
+    expect(seen[renamed].lockPresent).toBe(true);                   // the old lock was still in place: no window without a lock
+    expect(seen.findIndex(e => e.op === 'unlink' && e.p === lock)).toBeGreaterThan(renamed); // lock is only unlinked at our own release
+    expect(takeoverLeftovers()).toEqual([]);
+  });
+  it('takeover is serialised: a live contender holding the takeover file blocks, a dead one is cleared', () => {
+    const { lock } = headIndexPaths(dir);
+    const takeover = `${lock}.takeover`;
+    nodeFs.mkdirSync(dir, { recursive: true });
+    writeFileSync(lock, JSON.stringify({ pid: 999999, token: 'dead', at: 0 }));
+    writeFileSync(takeover, JSON.stringify({ pid: process.pid, token: 'other', at: Date.now() }));
+    expect(() => withHeadIndexLock(dir, () => 'no', { waitMs: 60 })).toThrow(/lock busy/);
+    expect(JSON.parse(readFileSync(lock, 'utf8')).token).toBe('dead'); // untouched while another takeover runs
+    writeFileSync(takeover, JSON.stringify({ pid: 999998, token: 'crashed', at: 0 }));
+    expect(withHeadIndexLock(dir, () => 'ok')).toBe('ok');
+    expect(takeoverLeftovers()).toEqual([]);
   });
   it('releases the lock when the transaction throws', () => {
     const fs = { ...nodeFs, renameSync: () => { throw Error('crash'); } };
@@ -271,6 +305,16 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     rmSync(log); nodeFs.mkdirSync(log); // unreadable: stat works, read throws
     expect(headReviewOwed({ index: readHeadIndex({ dir }), repo: 'o/r', pr: 7, head: H(1) })).toMatchObject({ owed: null, held: true });
   });
+  it('the cache digest covers raw log bytes: a log whose invalid bytes decode to the same text is not served from the cache', () => {
+    rec({ verdict: 'ok�x' });                               // valid UTF-8: EF BF BD
+    const { log } = headIndexPaths(dir);
+    expect(readHeadIndex({ dir }).rebuilt).toBeUndefined();      // served from the cache
+    const bytes = nodeFs.readFileSync(log);
+    const at = bytes.indexOf(Buffer.from([0xef, 0xbf, 0xbd]));
+    writeFileSync(log, Buffer.concat([bytes.subarray(0, at), Buffer.from([0xff]), bytes.subarray(at + 3)])); // 0xFF also decodes to U+FFFD
+    expect(Buffer.from(nodeFs.readFileSync(log, 'utf8')).equals(bytes)).toBe(true); // identical decoded text, different bytes
+    expect(readHeadIndex({ dir }).rebuilt).toBe(true);           // so the cache must not be trusted
+  });
   it('fencing: a writer that lost its lock refuses to publish', () => {
     const { lock } = headIndexPaths(dir);
     expect(() => withHeadIndexLock(dir, fence => { writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'other', at: Date.now() })); fence(); })).toThrow(/lock lost/);
@@ -279,6 +323,32 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     // the swap happens as the append opens; the next fence (before the map publish) must refuse
     expect(() => rec({ fs })).toThrow(/lock lost/);
     expect(existsSync(headIndexPaths(dir).map)).toBe(false);
+    expect(existsSync(headIndexPaths(dir).log)).toBe(false); // the rejected record is rolled back out of the source-of-truth log
+  });
+  it('fencing: a writer whose lock is stolen between the fence and the append leaves the log bytes unchanged and the map unpublished', () => {
+    rec();
+    const { log, map, lock } = headIndexPaths(dir);
+    const [logBefore, mapBefore] = [readFileSync(log, 'utf8'), readFileSync(map, 'utf8')];
+    // the lock is stolen as the append opens, i.e. after the pre-append fence and before the line lands
+    const fs = { ...nodeFs, openSync: (p, f) => { if (f === 'a') writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'thief', at: 1 })); return nodeFs.openSync(p, f); } };
+    expect(() => rec({ fs, head: H(2), netPatchHash: 'p2' })).toThrow(/lock lost/);
+    expect(readFileSync(log, 'utf8')).toBe(logBefore);
+    expect(readFileSync(map, 'utf8')).toBe(mapBefore);
+    const owed = headReviewOwed({ index: readHeadIndex({ dir }), repo: 'o/r', pr: 7, head: H(2), netPatchHash: 'p2' });
+    expect(owed).toMatchObject({ owed: true });                  // readers cannot see the rejected review
+    expect(JSON.parse(readFileSync(lock, 'utf8')).token).toBe('thief'); // the new holder's lock is left alone
+  });
+  it('fencing rollback never truncates away a record another writer appended after ours', () => {
+    rec();
+    const { log, lock } = headIndexPaths(dir);
+    const theirs = `${JSON.stringify({ repo: 'o/r', pr: 8, head: H(3), netPatchHash: 'p9', verdict: 'accept', at: '2026-11-04T11:00:00Z' })}\n`;
+    const fs = { ...nodeFs, openSync: (p, f) => {
+      const fd = nodeFs.openSync(p, f);
+      if (f === 'a') { writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'thief', at: 1 })); nodeFs.appendFileSync(log, theirs); }
+      return fd;
+    } };
+    expect(() => rec({ fs, head: H(2), netPatchHash: 'p2' })).toThrow(/lock lost/);
+    expect(readFileSync(log, 'utf8')).toContain(theirs);        // the other holder's record survives the rollback
   });
   it('fencing: a writer that loses its lock before the append never touches the log or the map', () => {
     rec();
@@ -295,15 +365,29 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
   it('fencing: a writer that loses its lock before the compaction rewrite never replaces the log or publishes the map', () => {
     rec(); rec({ head: H(2), netPatchHash: 'p2' });
     const { log, map, lock } = headIndexPaths(dir);
-    const mapBefore = readFileSync(map, 'utf8');
+    const [logBefore, mapBefore] = [readFileSync(log, 'utf8'), readFileSync(map, 'utf8')];
     let appended = false;
     const fs = { ...nodeFs,
       openSync: (p, f) => { if (f === 'a') appended = true; return nodeFs.openSync(p, f); },
       readFileSync: (p, ...a) => { if (appended && p === log) { appended = false; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'thief', at: 1 })); } return nodeFs.readFileSync(p, ...a); } };
     // logMaxLines=1 forces compaction; the steal lands right before the pre-rewrite fence, which must refuse
     expect(() => rec({ fs, head: H(3), netPatchHash: 'p3', logMaxLines: 1 })).toThrow(/lock lost/);
-    expect(readFileSync(log, 'utf8').split('\n').filter(Boolean)).toHaveLength(3); // log not replaced from a stale map
+    expect(readFileSync(log, 'utf8')).toBe(logBefore);              // not replaced from a stale map, and our line rolled back
     expect(readFileSync(map, 'utf8')).toBe(mapBefore);              // map never published
+  });
+  it('fencing: a writer that loses its lock right after the compaction rewrite restores the log it replaced and publishes nothing', () => {
+    rec(); rec({ head: H(2), netPatchHash: 'p2' });
+    const { log, map, lock } = headIndexPaths(dir);
+    const [logBefore, mapBefore] = [readFileSync(log, 'utf8'), readFileSync(map, 'utf8')];
+    let stolen = false;
+    const fs = { ...nodeFs, renameSync: (a, b) => { // the compacted log lands, then the lock is lost before the next fence
+      const r = nodeFs.renameSync(a, b);
+      if (!stolen && b === log) { stolen = true; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'thief', at: 1 })); }
+      return r; } };
+    expect(() => rec({ fs, head: H(3), netPatchHash: 'p3', logMaxLines: 1 })).toThrow(/lock lost/);
+    expect(stolen).toBe(true);
+    expect(readFileSync(log, 'utf8')).toBe(logBefore);
+    expect(readFileSync(map, 'utf8')).toBe(mapBefore);
   });
   it('recordReview refuses an unreadable existing index and leaves the log and map bytes unchanged', () => {
     rec();

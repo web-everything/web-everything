@@ -39,17 +39,21 @@ export function resolveHeadIndexSettings({ file = readSettings(), platform, env 
     valid: { keepPerPr: posInt, logMaxLines: posInt } });
 }
 
-/** Net-patch identity: sha256 of the merge-base plus the exact net diff. A rebase changes the base, so it is a new key. */
+/**
+ * Net-patch identity: sha256 of the merge-base plus the exact net diff. A rebase changes the base, so it is a new key.
+ * git output is read as 'latin1' (one char per byte, lossless) and hashed back as latin1, so the key covers the raw diff
+ * bytes: patches differing only in invalid UTF-8 bytes (which a UTF-8 decode would all turn into U+FFFD) get different keys.
+ */
 export function netPatchKey({ exec, cwd, sha, mainRef = 'origin/main' } = {}) {
   try {
     if (!SHA.test(sha ?? '')) throw Error('invalid head');
-    const git = args => String(exec('git', args, { cwd, encoding: 'utf8', timeout: 10000, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
+    const git = args => String(exec('git', args, { cwd, encoding: 'latin1', timeout: 10000, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
     const base = git(['merge-base', mainRef, sha]).trim();
     if (!SHA.test(base)) throw Error('unreadable merge-base');
     const diff = git(['diff', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--binary', base, sha, '--']);
     if (!diff.trim()) throw Error('empty net patch');
-    const located = diff.split('\n').filter(l => !/^index [0-9a-f]+\.\.[0-9a-f]+(?: \d+)?$/.test(l)).join('\n');
-    return { ok: true, key: createHash('sha256').update(`${base}\0${located}`).digest('hex'), base };
+    const located = diff.split('\n').filter(l => !/^index [0-9a-f]+\.\.[0-9a-f]+(?: \d+)?$/.test(l)).join('\n'); // ASCII-only header lines: safe to filter on latin1 text
+    return { ok: true, key: createHash('sha256').update(`${base}\0`, 'latin1').update(located, 'latin1').digest('hex'), base };
   } catch (error) { return { ok: false, reason: `net-patch-unreadable: ${String(error?.message ?? error).slice(0, 120)}` }; }
 }
 
@@ -98,8 +102,9 @@ export function readHeadIndex({ dir = defaultHeadIndexDir(), fs = nodeFs } = {})
       return { ok: false, reason: 'index-unreadable' }; // a map with no log is not a state we write
     }
     // An unreadable log throws here and fails closed. The cache is trusted only when the log's content hash matches.
-    const text = fs.readFileSync(log, 'utf8');
-    const logHash = hashText(text);
+    const raw = fs.readFileSync(log); // the cache key is the digest of the RAW bytes: a UTF-8 decode would alias distinct corrupt logs
+    const text = raw.toString('utf8');
+    const logHash = hashText(raw);
     if (stored && stored.map && typeof stored.map === 'object' && stored.version === MAP_VERSION && stored.logHash === logHash && validMap(stored.map)) return { ok: true, map: stored.map };
     return { ok: true, map: parseLog(text).map, rebuilt: true };
   } catch { return { ok: false, reason: 'index-unreadable' }; }
@@ -126,6 +131,39 @@ export function withHeadIndexLock(dir, fn, { fs = nodeFs, staleMs = LOCK_STALE_M
   const token = `${pid}-${now()}-${Math.random().toString(36).slice(2)}`;
   const deadline = now() + waitMs;
   const holder = () => { try { return JSON.parse(fs.readFileSync(lock, 'utf8')); } catch { return null; } };
+  const takeover = `${lock}.takeover`;
+  /**
+   * Take over a lock judged dead (`deadHolder` = the holder we read, or null for an unreadable one). Takeovers are serialised by a
+   * separate O_EXCL `<lock>.takeover` file. Under it the holder is re-read and the lock is replaced ONLY if it is still the
+   * dead one: our lock is written to a temp file and rename()d over `lock` (atomic replace, so there is never a moment without
+   * a lock), and `lock` itself is never unlinked here. A live owner that re-created the lock keeps it. Returns true if we hold it.
+   */
+  const takeOver = deadHolder => {
+    let tfd;
+    try {
+      tfd = fs.openSync(takeover, 'wx');
+      try { fs.writeSync(tfd, JSON.stringify({ pid, token, at: now() })); } finally { fs.closeSync(tfd); }
+    } catch (e) {
+      if (e?.code !== 'EEXIST') throw e;
+      // Another contender is taking over. Clear its file only if its owner is dead (or it is unreadable and past the grace).
+      let other = null; try { other = JSON.parse(fs.readFileSync(takeover, 'utf8')); } catch { /* unreadable */ }
+      let otherAge = 0; try { otherAge = now() - fs.statSync(takeover).mtimeMs; } catch { return false; }
+      if (other ? Number.isInteger(other.pid) && !pidAlive(other.pid) : otherAge > staleMs) { try { fs.unlinkSync(takeover); } catch { /* gone */ } }
+      return false;
+    }
+    const fresh = `${lock}.new.${token}`;
+    try {
+      const cur = holder();
+      let curAge; try { curAge = now() - fs.statSync(lock).mtimeMs; } catch { return false; } // vanished: let the normal path create it
+      if (deadHolder ? cur?.token !== deadHolder.token : cur !== null || curAge <= staleMs) return false; // changed hands: a live owner's lock
+      durable(fs, fresh, 'w', JSON.stringify({ pid, token, at: now() }));
+      fs.renameSync(fresh, lock);
+      return holder()?.token === token;
+    } finally {
+      try { fs.unlinkSync(fresh); } catch { /* consumed by the rename, or never written */ }
+      try { fs.unlinkSync(takeover); } catch { /* best effort */ }
+    }
+  };
   for (;;) {
     try {
       const fd = fs.openSync(lock, 'wx');
@@ -137,22 +175,7 @@ export function withHeadIndexLock(dir, fn, { fs = nodeFs, staleMs = LOCK_STALE_M
       let age = Infinity;
       try { age = now() - fs.statSync(lock).mtimeMs; } catch { continue; } // vanished: retry
       const dead = held ? Number.isInteger(held.pid) && !pidAlive(held.pid) : age > staleMs; // no readable owner: only after the grace
-      if (dead) {
-        // Move the stale lock aside atomically; only one contender wins the rename. What we moved is compared with what we
-        // judged dead BEFORE anything is decided: a lock that changed (its owner re-created it between our read and the
-        // rename) is a live owner's, so it is linked back. If a newer lock already exists, that newer holder wins and its
-        // lock is left alone. Only `aside` is ever unlinked here, never `lock`.
-        const aside = `${lock}.stale.${token}`;
-        let renamed = false;
-        try { fs.renameSync(lock, aside); renamed = true; } catch { /* another contender moved it */ }
-        if (renamed) {
-          let moved = null; try { moved = JSON.parse(fs.readFileSync(aside, 'utf8')); } catch { /* unreadable */ }
-          const changed = held ? moved?.token !== held.token : moved !== null; // unreadable then is only "same" when we saw nothing readable either
-          if (changed) { try { fs.linkSync(aside, lock); } catch { /* EEXIST: a newer holder exists and wins; never unlink `lock` */ } }
-          try { fs.unlinkSync(aside); } catch { /* best effort */ }
-        }
-        continue;
-      }
+      if (dead && takeOver(held)) break; // took the lock over; otherwise wait like any other contender
       if (now() >= deadline) throw Error('review-head-index: lock busy (holder pid ' + (held?.pid ?? '?') + ')');
       sleepMs(10 + Math.floor(Math.random() * 20));
     }
@@ -178,7 +201,26 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
     const current = readHeadIndex({ dir, fs });
     if (!current.ok) throw Error('review-head-index: existing index unreadable; refusing to write');
     fence();
-    durable(fs, log, 'a', `${JSON.stringify(rec)}\n`);            // 1. durable log line (fsynced)
+    const line = `${JSON.stringify(rec)}\n`;
+    const sizeBefore = size(fs, log);                           // null: the log did not exist yet
+    // Once our line is in the log, a lost lock means our transaction was rejected, so the line must not stay in the source
+    // of truth. Every fence after the append rolls it back before throwing. A log that no longer has exactly the shape we
+    // left (another holder wrote after us) is never touched: we cannot undo ours without discarding theirs.
+    const lineBytes = Buffer.from(line);
+    let before = null, compacted = null; // before: the log bytes we replaced when compacting; compacted: the bytes we wrote
+    const rollback = () => {
+      try {
+        if (compacted === null) {
+          if (size(fs, log) !== (sizeBefore ?? 0) + Buffer.byteLength(line)) return;
+          if (sizeBefore === null) fs.unlinkSync(log); else fs.truncateSync(log, sizeBefore);
+        } else if (fs.readFileSync(log).equals(compacted)) {
+          atomicWrite(fs, log, `${log}.tmp`, before.subarray(0, before.length - lineBytes.length));
+        }
+      } catch { /* best effort: the fence error below is what the caller sees */ }
+    };
+    const fenced = () => { try { fence(); } catch (e) { rollback(); throw e; } };
+    durable(fs, log, 'a', line);                                // 1. durable log line (fsynced)
+    fenced();                                                   //    lock lost during the append: roll the line back, no publish
     const map = applyRecord(current.map, rec, keepPerPr);       // 2. compacted map, temp then rename
     let lines = fs.readFileSync(log, 'utf8').split('\n').filter(l => l.trim()).length;
     if (lines > logMaxLines) { // 3. bound growth: rewrite the log from the compacted map, atomically, then the map
@@ -190,12 +232,16 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
         return [...older, { repo: r, pr: p, head: v.lastReviewedHead, netPatchHash: v.netPatchHash, verdict: v.verdict, at: v.at }];
       });
       const text = compact.map(c => `${JSON.stringify(c)}\n`).join('');
-      fence();
+      before = fs.readFileSync(log);
+      if (!before.subarray(Math.max(0, before.length - lineBytes.length)).equals(lineBytes)) throw Error('review-head-index: log changed under the lock; refusing to compact');
+      fenced();
       atomicWrite(fs, log, `${log}.tmp`, text);
+      compacted = Buffer.from(text);
+      fenced();                                                 // lock lost during the rewrite: put the replaced log back
       lines = compact.length;
     }
-    fence();
-    atomicWrite(fs, mapPath, tmp, JSON.stringify({ version: MAP_VERSION, logHash: hashText(fs.readFileSync(log, 'utf8')), map }));
+    fenced();
+    atomicWrite(fs, mapPath, tmp, JSON.stringify({ version: MAP_VERSION, logHash: hashText(fs.readFileSync(log)), map }));
     return { ok: true, lines };
   }, { fs });
 }
