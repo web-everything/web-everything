@@ -34,7 +34,7 @@ describe('resolvePackageManager cascade', () => {
   });
   it('logs the effective value and source', () => {
     const lines = [];
-    resolvePackageManager({ env: { WE_PACKAGE_MANAGER: 'pnpm' }, platform: undefined, log: (l) => lines.push(l) });
+    resolvePackageManager({ env: { WE_PACKAGE_MANAGER: 'pnpm', WE_POLICY_CASCADE_LOG: '1' }, platform: undefined, log: (l) => lines.push(l) });
     expect(lines.join('\n')).toMatch(/packageManager.*pnpm.*env/);
   });
 });
@@ -45,12 +45,12 @@ describe('installArgv / installCommand', () => {
     expect(installArgv({ ci: false, ...none }).args).toEqual(['install']);
   });
   it('pnpm: --frozen-lockfile when ci', () => {
-    const r = installArgv({ ci: true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, platform: undefined });
+    const r = installArgv({ ci: true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, platform: undefined, pnpmVersion: () => '9' });
     expect(r).toMatchObject({ bin: 'pnpm', args: ['install', '--frozen-lockfile'], manager: 'pnpm', source: 'env' });
   });
   it('ignoreScripts adds --ignore-scripts for both', () => {
     expect(installArgv({ ci: true, ignoreScripts: true, ...none }).args).toEqual(['ci', '--ignore-scripts']);
-    expect(installArgv({ ci: true, ignoreScripts: true, env: { WE_PACKAGE_MANAGER: 'pnpm' } }).args)
+    expect(installArgv({ ci: true, ignoreScripts: true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => '9' }).args)
       .toEqual(['install', '--frozen-lockfile', '--ignore-scripts']);
   });
   it('pnpm falls back to npm when pnpm --version fails, and says why', () => {
