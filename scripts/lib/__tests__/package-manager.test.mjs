@@ -95,8 +95,16 @@ describe('installWithFallback', () => {
       exec: (bin, args) => { calls.push([bin, ...args]); if (bin === 'pnpm') throw new Error('boom'); } });
     expect(calls).toEqual([['pnpm', 'install', '--frozen-lockfile'], ['npm', 'ci']]);
     expect(r).toMatchObject({ fellBack: true, manager: 'npm', pnpmError: 'boom' });
-    expect(logs.join('\n')).toMatch(/NOT pnpm-lock/);
+    
     expect(logs.join('\n')).toMatch(/pnpm install failed.*falling back to npm ci/);
+  });
+  it('a pnpm lockfile rejection is NOT masked by the npm fallback', () => {
+    const calls = []; const logs = [];
+    const err = Object.assign(new Error('pnpm failed'), { stderr: 'ERR_PNPM_OUTDATED_LOCKFILE Cannot install with "frozen-lockfile"' });
+    expect(() => installWithFallback({ frozen: true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => '9', log: (l) => logs.push(l),
+      exec: (bin, args) => { calls.push([bin, ...args]); throw err; } })).toThrow('pnpm failed');
+    expect(calls).toEqual([['pnpm', 'install', '--frozen-lockfile']]);
+    expect(logs.join('\n')).toMatch(/NOT falling back/);
   });
   it('a failed npm install propagates (no silent success)', () => {
     expect(() => installWithFallback({ frozen: true, env: {}, exec: () => { throw new Error('npm down'); } })).toThrow('npm down');
