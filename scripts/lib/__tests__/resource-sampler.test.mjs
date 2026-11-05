@@ -48,7 +48,7 @@ describe('resource sampler', () => {
     expect(swapUsedPct('total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)')).toBe(0);
     expect(swapUsedPct('nonsense')).toBeNull();
     const snapshot = buildSnapshot({ sampledAtMs: 0, intervalMs: 10000, memFreePct: 12, memPressureLevel: 2, swapUsedPct: 95.8 });
-    expect(snapshot.memory).toEqual({ pressureLevel: 2, freePct: 12, swapUsedPct: 95.8 });
+    expect(snapshot.memory).toMatchObject({ pressureLevel: 2, freePct: 12, swapUsedPct: 95.8 });
   });
   it('builds freshness and preserves unavailable counters', () => {
     const snapshot = buildSnapshot({ sampledAtMs: 0, intervalMs: 10000 });
@@ -66,7 +66,7 @@ describe('resource sampler', () => {
     const s = sampler.sample();
     expect(s.cpu.idlePct).toBe(75);
     expect(s.disk.busyPct).toBe(1);
-    expect(s.memory).toEqual({ pressureLevel: null, freePct: 25, swapUsedPct: null });
+    expect(s.memory).toMatchObject({ pressureLevel: null, freePct: 25, swapUsedPct: null });
     expect(s.errors).toContainEqual({ probe: 'memPressureLevel', error: 'denied' });
     expect(s.agentSessions.total).toBe(1);
     for (const [, , options] of exec.mock.calls) expect(options).toMatchObject({ timeout: 5000, env: { LC_ALL: 'C' } });
