@@ -16,6 +16,8 @@ import {
   overlayGraduated, reportDiscardedCandidate,
 } from './adopt.mjs';
 import { hostname } from 'node:os';
+import { forceRequestFor, abortForcedWatch } from '../daemon-force-adopt.mjs';
+import { appendDaemonEvent } from '../daemon-events.mjs';
 import {
   findUnsafeLocalState, knownInputsOf, rollbackUnverified, collectUntrackedPaths, ensureSafeToMove,
   pruneLandedBacklogSidecars,
@@ -538,6 +540,15 @@ export async function prepareRebuild({
       });
       if (!m.adopt) {
         clearReadyCandidate(root, stEnv);
+        // A discarded forced build can no longer be adopted, so its rollback watch (it would only wait out the TTL and
+        // block the next force) is closed and the audit log says the build was NOT adopted. A build already running
+        // as head keeps its watch.
+        if (ready.forced === true && m.reason !== 'already-head') {
+          await abortForcedWatch({
+            root, env: stEnv, sha: ready.adopt.finalSha, reason: m.reason,
+            emit: (e) => appendDaemonEvent(e, { env: { WE_DAEMON_EVENTS: env?.WE_DAEMON_EVENTS } }),
+          });
+        }
         reportDiscardedCandidate({
           ready, match: m, alert,
           needsYou: ({ kind, ...detail }) => {
@@ -589,13 +600,20 @@ export async function prepareRebuild({
   // not re-smoked on every main move: it would cost up to three full smokes per move and every one would fail
   // the same way. Until its backoff expires the clone stays on its last-good build (and keeps dispatching —
   // `main-staleness.mjs#assertMainNotStale`), whatever the new inputs are.
-  if (state.held?.reason === 'smoke-harness-broken' && state.rejected?.harnessBroken) {
+  // R508: an operator force-adopt request that names EXACTLY this candidate (same sha) must reach a fresh smoke, so it can be
+  // consumed there, even when this candidate is held by a sticky rejection or the harness-broken backoff. A request for any
+  // other build never lifts a rejection (`forceRequestFor` is the one sha matcher).
+  const forceBypass = !!forceRequestFor(root, stEnv, plan.finalSha);
+  if (forceBypass && (state.rejected?.inputsKey === plan.inputsKey || state.held?.reason === 'smoke-harness-broken')) {
+    alert('force-adopt-bypasses-rejection', { target: plan.finalSha, rejected: state.rejected?.reason ?? null });
+  }
+  if (!forceBypass && state.held?.reason === 'smoke-harness-broken' && state.rejected?.harnessBroken) {
     const retryAtMs = Date.parse(state.rejected.retryAt || '');
     if (Number.isFinite(retryAtMs) && nowMs() < retryAtMs) {
       return terminal({ moved: false, reason: 'smoke-harness-broken-backoff', plan });
     }
   }
-  if (state.rejected?.inputsKey === plan.inputsKey) {
+  if (!forceBypass && state.rejected?.inputsKey === plan.inputsKey) {
     // An external-only rejection (only gh/network checks failed) is never permanent: once its backoff expires
     // the same inputs are smoked again, instead of sticking until main or an overlay moves.
     const retryAtMs = Date.parse(state.rejected.retryAt || '');

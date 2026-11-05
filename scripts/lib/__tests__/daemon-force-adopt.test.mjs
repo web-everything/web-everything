@@ -5,8 +5,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   validateForceAdopt, requestForceAdopt, readForceAdopt, recordForcedAdoption, abortForcedAdoption, readForceWatch,
-  evaluateForceWatch, runForceWatchTick,
+  evaluateForceWatch, runForceWatchTick, forceRequestFor, abortForcedWatch,
 } from '../daemon-force-adopt.mjs';
+import { matchReadyCandidate } from '../daemon-rebuild/adopt.mjs';
+import { cloneKeyOf } from '../daemon-last-good.mjs';
 
 const RULINGS = '## R508 — 2026-11-03\nOperator "Yes": adopt the build now even though smoke failed.\n\n## R509 — x\nother words\nthe exclusive phrase lives only in nine\n';
 const R509_ONLY = 'the exclusive phrase lives only in nine'; // >= 12 chars, present in R509 and nowhere in R508
@@ -303,5 +305,64 @@ describe('runForceWatchTick', () => {
     await runForceWatchTick({ root, env, currentHead: 'a'.repeat(40), now: () => startedAt + 3 * 3600_000,
       probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async () => {} });
     expect(readReadyCandidate(root, env)).not.toBeNull();
+  });
+});
+
+describe('forceRequestFor (the one sha matcher)', () => {
+  const arm = (sha) => requestForceAdopt({ root, env, daemon: 'review', ruling: 'R508', quote: QUOTE, sha, rulingsText: RULINGS });
+  it('returns the request only for exactly its sha, case-insensitively', () => {
+    arm(SHA.toUpperCase()); // stored lower-cased
+    expect(forceRequestFor(root, env, SHA)).toMatchObject({ ruling: 'R508', sha: SHA });
+    expect(forceRequestFor(root, env, SHA.toUpperCase())).not.toBeNull();
+    expect(forceRequestFor(root, env, 'c'.repeat(40))).toBeNull();
+  });
+  it('fails closed: no request, an expired one, an old record with no sha or a malformed sha, and an empty target never match', () => {
+    expect(forceRequestFor(root, env, SHA)).toBeNull();
+    arm(SHA);
+    expect(forceRequestFor(root, env, SHA, () => Date.now() + 3 * 3600_000)).toBeNull(); // past the TTL
+    for (const sha of [undefined, '', null, SHA.slice(1), ` ${SHA}`]) {
+      expect(forceRequestFor(root, env, sha)).toBeNull();
+    }
+    writeFileSync(join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(root)}.force-adopt.json`), JSON.stringify({ daemon: 'review', ruling: 'R508', quote: QUOTE, expiresAt: new Date(Date.now() + 3600_000).toISOString() }));
+    expect(forceRequestFor(root, env, SHA)).toBeNull(); // old record, no sha
+    expect(forceRequestFor(root, env, undefined)).toBeNull();
+  });
+});
+
+describe('abortForcedWatch', () => {
+  const open = () => recordForcedAdoption({ root, env, request: { daemon: 'review', ruling: 'R508', quote: QUOTE }, sha: SHA, lastGood: { head: 'a'.repeat(40) }, smoke: { verdict: 'code', failed: [] }, emit: async () => true, now: () => 1 });
+  it('closes the watch opened for a discarded forced build and logs it as NOT adopted (reason sanitized)', async () => {
+    await open();
+    const events = [];
+    expect(await abortForcedWatch({ root, env, sha: SHA, reason: 'superseded-omits-live-overlay: lane/x\nforged', emit: async (e) => { events.push(e); } })).toBe(true);
+    expect(readForceWatch(root, env)).toBeNull();
+    const lines = readFileSync(env.WE_FORCE_ADOPT_HANDOFF, 'utf8').trim().split('\n');
+    expect(lines).toHaveLength(2); // the adoption line + exactly one NOT-adopted line: the newline in the reason cannot forge another
+    expect(lines[1]).toMatch(/NOT adopted b{40} \(superseded-omits-live-overlay: lane\/x\?forged\); watch closed/);
+    expect(events[0]).toMatchObject({ kind: 'force-adopt-aborted' });
+    expect(readFileSync(env.WE_FORCE_ADOPT_CORONER, 'utf8')).toMatch(/force-adopt-aborted/);
+  });
+  it('leaves a watch for another sha, a build that already ran as head, or no watch alone', async () => {
+    expect(await abortForcedWatch({ root, env, sha: SHA, reason: 'x', emit: async () => {} })).toBe(false); // no watch
+    await open();
+    expect(await abortForcedWatch({ root, env, sha: 'c'.repeat(40), reason: 'x', emit: async () => {} })).toBe(false);
+    await runForceWatchTick({ root, env, currentHead: SHA, probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async () => {} }); // adoptedSeen
+    expect(await abortForcedWatch({ root, env, sha: SHA, reason: 'x', emit: async () => {} })).toBe(false);
+    expect(readForceWatch(root, env)).not.toBeNull();
+  });
+});
+
+describe('matchReadyCandidate: a forced record is pinned to its sha', () => {
+  const ready = (extra = {}) => ({ kind: 'candidate', prevHead: 'p', tree: 'T', passedAt: new Date(0).toISOString(), adopt: { finalSha: SHA, inputsKey: 'k', mainSha: 'm', applied: [] }, ...extra });
+  const match = (r, planSha) => matchReadyCandidate({
+    ready: r, plan: { finalSha: planSha, inputsKey: 'k2', mainSha: 'm2', applied: [] }, prevHead: 'p', treeOf: () => 'T', stillWanted: () => true,
+    verifyBuilt: () => true, liveApplied: [], nowMs: 1000, maxAgeMs: 10_000,
+  });
+  it('an ordinary record is still substituted by a same-tree successor (unchanged)', () => {
+    expect(match(ready(), 'd'.repeat(40))).toMatchObject({ match: 'same-tree' });
+  });
+  it('a forced record is adopted only for its exact sha: no same-tree or superseding substitution', () => {
+    expect(match(ready({ forced: true }), SHA)).toMatchObject({ match: 'exact' });
+    expect(match(ready({ forced: true }), 'd'.repeat(40))).toEqual({ adopt: null, reason: 'forced-sha-pinned' });
   });
 });

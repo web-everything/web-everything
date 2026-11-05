@@ -20,6 +20,7 @@ import { DISPATCH_CWD_ENV } from '../../operations/dispatch-lane-io.mjs';
 import { requestForceAdopt, readForceWatch, runForceWatchTick, readForceAdopt } from '../daemon-force-adopt.mjs';
 import { readReadyCandidate } from '../daemon-rebuild/state.mjs';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
+import { gitRun } from '../main-staleness.mjs';
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
@@ -265,5 +266,193 @@ describe('R508 force-adopt through rebuildClone', () => {
     expect(headOf(cloneDir)).toBe(lastGood);
     expect(readForceWatch(cloneDir, env)).toBeNull();
     expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8')).toMatch(/force-adopt-rolled-back/);
+  });
+});
+
+// ── round 4: the three red-team breaks, the finalization paths and the default health probe ─────────────────────────
+const passing = () => vi.fn(async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }));
+const tick = (cloneDir, env, extra = {}) => rebuildClone({ root: cloneDir, env, prState: async () => null, lockOpts: LOCK_OPTS, ...extra });
+const unhealthy = async () => ({ healthy: false });
+const healthy = async () => ({ healthy: true });
+const handoffOf = (env) => readFileSync(env.WE_FORCE_ADOPT_HANDOFF, 'utf8');
+
+/** An empty commit on main: a new sha with the SAME tree as its parent. */
+function advanceMainEmpty(originDir) {
+  const dir = makeAuthorClone(originDir);
+  gitOk(dir, ['fetch', '-q', 'origin']);
+  gitOk(dir, ['checkout', '-q', '-B', 'main', 'origin/main']);
+  gitOk(dir, ['commit', '-q', '--allow-empty', '-m', 'empty successor']);
+  gitOk(dir, ['push', '-q', 'origin', 'HEAD:refs/heads/main']);
+  return gitOk(dir, ['rev-parse', 'HEAD']).trim();
+}
+
+describe('R508 force-adopt: sticky rejection, pinned ready record, finalization', () => {
+  const setup = () => {
+    const { base, originDir, cloneDir, env: env0 } = makeFixture();
+    const env = { ...forceEnv(env0, base), WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' };
+    const lastGood = headOf(cloneDir);
+    const target = advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n')); // no overlays: the plan's finalSha is main's tip
+    const arm = (sha = target) => expect(requestForceAdopt({ root: cloneDir, env, daemon: 'review', ruling: 'R508', quote: QUOTE, sha, rulingsText: RULINGS }).ok).toBe(true);
+    return { originDir, cloneDir, env, lastGood, target, arm };
+  };
+
+  it('a request for the held candidate reaches a fresh smoke through a sticky rejection and is consumed; a request for another build does not lift it', async () => {
+    const { cloneDir, env, lastGood, target, arm } = setup();
+    // The candidate fails and the last-good control passes: a plain candidate rejection, not a broken harness.
+    const failThenPass = vi.fn().mockResolvedValueOnce((await failing()()))
+      .mockResolvedValue({ verdict: 'pass', attempts: 1, smoke: { results: [] } });
+    await tick(cloneDir, env, { runSmoke: failThenPass });
+    expect(readRebuildState(cloneDir, env).rejected).toMatchObject({ reason: 'daemon-entries-boot' });
+    expect(readRebuildState(cloneDir, env).rejected.retryAt).toBeUndefined(); // sticky: no retryAt for a non-external failure
+    const held = failing();
+    expect((await tick(cloneDir, env, { runSmoke: held })).reason).toBe('still-rejected'); // control: no request, no smoke
+    expect(held).not.toHaveBeenCalled();
+
+    arm(target.replace(/.$/, target.endsWith('0') ? '1' : '0')); // a well-formed request for ANOTHER build
+    const other = failing();
+    expect((await tick(cloneDir, env, { runSmoke: other })).reason).toBe('still-rejected');
+    expect(other).not.toHaveBeenCalled();
+    expect(headOf(cloneDir)).toBe(lastGood);
+
+    arm(); // now the one that names the held candidate
+    const fresh = failing();
+    const r = await tick(cloneDir, env, { runSmoke: fresh });
+    expect(fresh).toHaveBeenCalled(); // a FRESH smoke ran, then the force applied over its failure
+    expect(r.moved).toBe(true);
+    expect(headOf(cloneDir)).toBe(target);
+    expect(readForceAdopt(cloneDir, env)).toBeNull(); // consumed
+    expect(handoffOf(env)).toMatch(/adopting [0-9a-f]{40} though smoke code \(failed: daemon-entries-boot\)/);
+  });
+
+  it('a request for the held candidate also lifts the harness-broken backoff', async () => {
+    const { cloneDir, env, target, arm } = setup();
+    const brokenEnv = { ...env, WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '1' };
+    // Seed the held state a broken harness leaves: held smoke-harness-broken + a rejection with a far-future retryAt.
+    await tick(cloneDir, env, { runSmoke: failing() });
+    const key = readRebuildState(cloneDir, env).rejected.inputsKey;
+    const statePath = rebuildStatePath(cloneDir, env);
+    const st = JSON.parse(readFileSync(statePath, 'utf8'));
+    st.held = { reason: 'smoke-harness-broken', since: new Date().toISOString() };
+    st.rejected = { inputsKey: key, reason: 'daemon-entries-boot', at: new Date().toISOString(), harnessBroken: true, retryAt: new Date(Date.now() + 3600_000).toISOString() };
+    writeFileSync(statePath, JSON.stringify(st));
+    const blocked = failing();
+    expect((await tick(cloneDir, env, { runSmoke: blocked })).reason).toBe('smoke-harness-broken-backoff');
+    expect(blocked).not.toHaveBeenCalled();
+    arm();
+    const fresh = failing();
+    const r = await tick(cloneDir, brokenEnv, { runSmoke: fresh });
+    expect(fresh).toHaveBeenCalled();
+    expect(r.moved).toBe(true);
+    expect(headOf(cloneDir)).toBe(target);
+  });
+
+  it('a forced ready record is pinned to its sha: an empty-commit successor is not adopted off it, and the watch is closed', async () => {
+    const { originDir, cloneDir, env, lastGood, target, arm } = setup();
+    arm();
+    const job = await tick(cloneDir, env, { runSmoke: failing(), readyOnly: true });
+    expect(job).toMatchObject({ reason: 'ready-recorded', readyRecorded: true });
+    expect(readReadyCandidate(cloneDir, env)).toMatchObject({ forced: true, adopt: { finalSha: target } });
+    expect(readForceWatch(cloneDir, env)).toMatchObject({ sha: target });
+    expect(headOf(cloneDir)).toBe(lastGood);
+
+    const successor = advanceMainEmpty(originDir); // same tree, new sha: `same-tree` would substitute it for the forced build
+    const smoke = failing();
+    await tick(cloneDir, env, { runSmoke: smoke, forceWatchProbe: unhealthy });
+    expect(headOf(cloneDir)).not.toBe(successor); // not adopted off the forced record
+    expect(headOf(cloneDir)).toBe(lastGood);
+    expect(smoke).toHaveBeenCalled(); // the successor got its own fresh smoke instead
+    expect(readReadyCandidate(cloneDir, env)).toBeNull();
+    expect(readForceWatch(cloneDir, env)).toBeNull(); // not left to wait out the TTL and block the next force
+    expect(handoffOf(env)).toMatch(new RegExp(`NOT adopted ${target} \\(forced-sha-pinned\\); watch closed`));
+    expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8')).toMatch(/force-adopt-aborted/);
+  });
+
+  it('a deferred forced adoption keeps its watch until the exact build is adopted, then the watch still rolls it back', async () => {
+    const { cloneDir, env, lastGood, target, arm } = setup();
+    arm();
+    await tick(cloneDir, env, { runSmoke: failing(), readyOnly: true });
+    expect(readReadyCandidate(cloneDir, env)).not.toBeNull();
+    const rollback = vi.fn(async () => ({ ok: true }));
+    // before adoption the build is not head: the watch waits and keeps its state
+    const early = await runForceWatchTick({ root: cloneDir, env, probe: unhealthy, rollback, currentHead: () => lastGood });
+    expect(early.action).toBe('waiting');
+    expect(rollback).not.toHaveBeenCalled();
+    expect(readForceWatch(cloneDir, env)).toMatchObject({ sha: target });
+
+    const adopt = passing();
+    const r = await tick(cloneDir, env, { runSmoke: adopt, forceWatchProbe: healthy });
+    expect(r).toMatchObject({ moved: true, reason: 'ready-adopted' });
+    expect(adopt).not.toHaveBeenCalled(); // adopted from the record, no re-smoke
+    expect(headOf(cloneDir)).toBe(target);
+    expect(readForceWatch(cloneDir, env)).toMatchObject({ sha: target, adoptedSeen: true });
+
+    await tick(cloneDir, env, { runSmoke: passing(), forceWatchProbe: unhealthy });
+    expect(headOf(cloneDir)).toBe(lastGood);
+    expect(readForceWatch(cloneDir, env)).toBeNull();
+    expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8')).toMatch(/force-adopt-rolled-back/);
+  });
+
+  it('a sibling that adopts the forced build first leaves the watch in place and logs no "NOT adopted"', async () => {
+    const { cloneDir, env, lastGood, target, arm } = setup();
+    arm();
+    const sibling = vi.fn(async () => {
+      gitOk(cloneDir, ['reset', '--hard', target]); // a sibling process lands this exact build during the unlocked smoke
+      return { verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'daemon-entries-boot', detail: 'boom', mayBeTransient: false }] } };
+    });
+    const r = await tick(cloneDir, env, { runSmoke: sibling });
+    expect(r).toMatchObject({ moved: false, adopted: true, reason: 'already-adopted' });
+    expect(readForceWatch(cloneDir, env)).toMatchObject({ sha: target });
+    expect(handoffOf(env)).not.toMatch(/NOT adopted/);
+    expect(readFileSync(env.WE_FORCE_ADOPT_CORONER, 'utf8')).not.toMatch(/force-adopt-aborted/);
+    expect(readReadyCandidate(cloneDir, env)).toBeNull();
+
+    await tick(cloneDir, env, { runSmoke: passing(), forceWatchProbe: unhealthy }); // the watch is live: it still rolls the build back
+    expect(headOf(cloneDir)).toBe(lastGood);
+  });
+
+  it('a finalization that fails clears the watch AND the ready candidate, and logs the build as not adopted', async () => {
+    const { cloneDir, env, lastGood, target, arm } = setup();
+    arm();
+    const run = (args, opts) => (args[0] === 'reset' && args.includes('--hard') && args.includes(target) && opts?.cwd === cloneDir
+      ? { status: 1, stdout: '', stderr: 'boom' } : gitRun(args, opts));
+    const r = await tick(cloneDir, env, { runSmoke: failing(), run });
+    expect(r).toMatchObject({ moved: false, reason: 'reset-failed' });
+    expect(headOf(cloneDir)).toBe(lastGood);
+    expect(readForceWatch(cloneDir, env)).toBeNull();
+    expect(readReadyCandidate(cloneDir, env)).toBeNull();
+    expect(readForceAdopt(cloneDir, env)).toBeNull();
+    expect(handoffOf(env)).toMatch(/NOT adopted [0-9a-f]{40} \(adoption did not complete\)/);
+  });
+
+  it('a finalization that throws clears the watch AND the ready candidate before the error propagates', async () => {
+    const { cloneDir, env, lastGood, arm } = setup();
+    arm();
+    let smoked = false;
+    const runSmoke = vi.fn(async () => { smoked = true; return { verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'daemon-entries-boot', detail: 'boom', mayBeTransient: false }] } }; });
+    const run = (args, opts) => {
+      if (smoked && args[0] === 'rev-parse' && args.some((a) => String(a).endsWith('^{tree}'))) throw new Error('git gone');
+      return gitRun(args, opts);
+    };
+    await tick(cloneDir, env, { runSmoke, run }).catch(() => null);
+    expect(handoffOf(env)).toMatch(/NOT adopted [0-9a-f]{40} \(adoption did not complete\)/); // the abort ran: the throw was inside finalize
+    expect(headOf(cloneDir)).toBe(lastGood);
+    expect(readForceWatch(cloneDir, env)).toBeNull();
+    expect(readReadyCandidate(cloneDir, env)).toBeNull();
+  });
+
+  it('the default health probe passes a healthy clone: the forced build is kept and the watch counts down', async () => {
+    const { base, originDir, cloneDir, env: env0 } = makeFixture();
+    const env = forceEnv(env0, base);
+    const lastGood = headOf(cloneDir);
+    // The probe loads ./scripts/lib/daemon-rebuild.mjs from the clone: give the forced build a loadable one (tracked, clean).
+    const target = advanceMain(originDir, (dir) => writeFile(dir, 'scripts/lib/daemon-rebuild.mjs', 'export const ok = true;\n'));
+    expect(requestForceAdopt({ root: cloneDir, env, daemon: 'review', ruling: 'R508', quote: QUOTE, sha: target, rulingsText: RULINGS }).ok).toBe(true);
+    await tick(cloneDir, env, { runSmoke: failing() });
+    expect(headOf(cloneDir)).toBe(target);
+    await tick(cloneDir, env, { runSmoke: passing() }); // no forceWatchProbe injected: the real default probe runs
+    expect(headOf(cloneDir)).toBe(target); // healthy: not rolled back
+    expect(headOf(cloneDir)).not.toBe(lastGood);
+    expect(readForceWatch(cloneDir, env)).toMatchObject({ sha: target, ticksLeft: 4, adoptedSeen: true });
+    expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8')).not.toMatch(/force-adopt-rolled-back/);
   });
 });

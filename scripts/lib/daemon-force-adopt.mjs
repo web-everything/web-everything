@@ -74,6 +74,14 @@ export function readForceAdopt(root, env = process.env, now = Date.now) {
   const r = readJson(requestPath(root, env));
   return r && Date.parse(r.expiresAt) > now() ? r : null;
 }
+/** The pending request IF it names exactly `sha` (a full 40-hex id, compared case-insensitively), else null. The ONE place a
+ *  request is matched to a build: a request with no sha, a malformed sha or another sha never applies (fail closed). */
+export function forceRequestFor(root, env, sha, now = Date.now) {
+  const req = readForceAdopt(root, env, now);
+  if (!req) return null;
+  const want = String(req.sha ?? '').toLowerCase();
+  return /^[0-9a-f]{40}$/.test(want) && want === String(sha ?? '').toLowerCase() ? req : null;
+}
 // Best-effort: an unwritable/unreadable state dir (ENOTDIR, EACCES) must not turn a refusal into a throw.
 const removeQuietly = (p) => { try { rmSync(p, { force: true }); } catch { /* unreachable state dir: nothing to clear */ } };
 export const clearForceAdopt = (root, env = process.env) => removeQuietly(requestPath(root, env));
@@ -125,6 +133,21 @@ export async function abortForcedAdoption({ root, env = process.env, request, sh
   appendLine(coronerFile(env), `${JSON.stringify({ kind: 'force-adopt-aborted', at, daemon: request.daemon, ruling: request.ruling, sha, reason: 'adoption-did-not-complete' })}\n`);
   await emit?.({ kind: 'force-adopt-aborted', daemon: request.daemon, detail: { ruling: request.ruling, sha } });
   clearForceAdopt(root, env);
+}
+
+/** A forced ready record was discarded without being adopted (refused as not the authorized sha, expired, other base): close
+ *  the watch opened for it, which would otherwise only wait out the TTL and block the next force. A watch whose build already
+ *  ran as head is left alone. Returns true when a watch was closed. */
+export async function abortForcedWatch({ root, env = process.env, sha, reason, emit, now = Date.now }) {
+  const watch = readForceWatch(root, env);
+  if (!watch || watch.sha !== sha || watch.adoptedSeen) return false;
+  clearWatch(root, env);
+  const at = new Date(now()).toISOString();
+  const why = String(reason ?? 'discarded').replace(/[^\x20-\x7e]/g, '?').slice(0, 80); // the reason can carry a ref name
+  appendLine(handoffFile(env), `- FORCE-ADOPT ${at} ${watch.daemon} ${watch.ruling}: NOT adopted ${sha} (${why}); watch closed\n`);
+  appendLine(coronerFile(env), `${JSON.stringify({ kind: 'force-adopt-aborted', at, daemon: watch.daemon, ruling: watch.ruling, sha, reason: why })}\n`);
+  try { await emit?.({ kind: 'force-adopt-aborted', daemon: watch.daemon, detail: { ruling: watch.ruling, sha, reason: why } }); } catch { /* best effort */ }
+  return true;
 }
 
 /** PURE. One watch tick: fail closed on a failed health check or a crash loop, else count down. */

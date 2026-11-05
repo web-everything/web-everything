@@ -10,7 +10,7 @@ import { isRepoFile, pickSmokeDiagnostics, sourceFilesIn } from '../daemon-boot-
 import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidate, clearReadyCandidate } from './state.mjs';
 import { releaseBuildLease } from './lease.mjs';
-import { readForceAdopt, clearForceAdopt, recordForcedAdoption, abortForcedAdoption } from '../daemon-force-adopt.mjs';
+import { forceRequestFor, recordForcedAdoption, abortForcedAdoption } from '../daemon-force-adopt.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { finalizeRebuild, staleAlertDetail, dropSuspectOverlays } from './adopt.mjs';
 import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
@@ -662,15 +662,10 @@ export async function smokeAndAdopt({
 
   const failedA = failedRows(a.smokeResult);
   // R508 operator force-adopt: the smoke above STILL ran; its failure is recorded alongside the force, never skipped.
-  const pendingForce = readForceAdopt(root, stEnv);
-  const forceSha = String(pendingForce?.sha ?? '').toLowerCase();
-  // The operator's ruling vouches for ONE build. Fail closed: a stored sha that is not a full 40-hex id never matches,
-  // even against an empty plan sha. A request with no sha (an old record) or another sha never applies to this build:
-  // it stays pending for its own build until it expires, and THIS build falls through to the ordinary failed-smoke ladder
-  // below (reuse / environment verdicts / sticky rejection / fallback), exactly as if no request existed.
-  const forceReq = pendingForce
-    && /^[0-9a-f]{40}$/.test(forceSha) && forceSha === String(plan.finalSha ?? '').toLowerCase()
-    ? pendingForce : null;
+  // The operator's ruling vouches for ONE build (`forceRequestFor` fails closed on a missing/malformed/other sha). A request
+  // for another build stays pending for its own build until it expires, and THIS build falls through to the ordinary
+  // failed-smoke ladder below (reuse / environment verdicts / sticky rejection / fallback), exactly as if no request existed.
+  const forceReq = forceRequestFor(root, stEnv, plan.finalSha);
   if (forceReq) {
     const forceSmoke = { verdict: a.smokeResult.verdict, failed: failedA.map((r) => r.name) };
     alert('force-adopt-over-failed-smoke', { ruling: forceReq.ruling, quote: forceReq.quote, ...forceSmoke, target: plan.finalSha });
@@ -690,11 +685,14 @@ export async function smokeAndAdopt({
       await abortForcedAdoption({ root, env: stEnv, request: forceReq, sha: plan.finalSha, emit });
     };
     let forced;
-    try { forced = await finalize(plan, undefined, undefined, a.smokeResult); } catch (e) { await abort(); throw e; } // the log + watch must not outlive a finalize that threw
+    // `forced: true` pins the ready record to this exact sha: prepare never substitutes a same-tree or newer build for it, which
+    // would run with no rollback watch (the watch is keyed to this sha).
+    try { forced = await finalize(plan, undefined, { kind: 'candidate', forced: true }, a.smokeResult); } catch (e) { await abort(); throw e; } // the log + watch must not outlive a finalize that threw
     // finalize keeps the build as the ready candidate when a reader holds the clone (tick-in-progress / reader-priority):
-    // the durable watch above already covers its later adoption, so only a real failure to adopt aborts the force.
+    // the durable watch above already covers its later adoption. A sibling that adopted this exact build first
+    // (`already-adopted`: adopted but not moved) is running it too, so the watch stays. Only a real failure to adopt aborts.
     const keptForLater = forced.readyRecorded === true || forced.reason === 'tick-in-progress' || forced.reason === 'reader-priority';
-    if (forced.moved !== true && !keptForLater) await abort();
+    if (forced.moved !== true && forced.adopted !== true && !keptForLater) await abort();
     return forced;
   }
   if (a.reused) {

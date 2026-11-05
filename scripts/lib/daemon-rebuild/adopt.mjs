@@ -50,6 +50,9 @@ export function matchReadyCandidate({
   if (rejected && rejected.inputsKey === ready.adopt.inputsKey && Date.parse(rejected.at || '') > passedMs) {
     return { adopt: null, reason: 'rejected-since' };
   }
+  // R508: a forced record vouches for exactly ONE sha (its rollback watch is keyed to it). A same-tree or superseding
+  // build substituted for it would be adopted with no health watch, so only an exact match may adopt it.
+  if (ready.forced === true && plan.finalSha !== ready.adopt.finalSha) return { adopt: null, reason: 'forced-sha-pinned' };
   const carriesOnlyWanted = (ready.adopt.applied || []).every((a) => stillWanted(a.ref));
   if (ready.kind === 'fallback') {
     if (!allowFallback) return { adopt: null, reason: 'fallback-not-allowed' };
