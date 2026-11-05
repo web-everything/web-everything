@@ -14,7 +14,7 @@ export default {
   title: 'post-green recovery apply loop has no time budget or batch cap, so the pass deadline kills it mid-batch',
   card: 'backlog 4119 follow-up (2026-11-03 main red-to-green)',
   fixedBy: { sha: 'pending', where: 'lane/recovery-apply-budget', paths: ['scripts/conveyor/ci-red-recovery-watch.mjs'] },
-  fixPresent(root) { return readFileSync(join(root, 'scripts/conveyor/ci-red-recovery-watch.mjs'), 'utf8').includes('budgetExhausted'); },
+  fixPresent(root) { return readFileSync(join(root, 'scripts/conveyor/ci-red-recovery-watch.mjs'), 'utf8').includes('applyLedger'); },
   run() {
     const violations = [];
     const prs = [1, 2, 3, 4].map((n) => ({ number: 7000 + n, headRefName: `lane/soak${n}`, headRefOid: String(n).repeat(40), statusCheckRollup: [failing] }));
@@ -59,6 +59,26 @@ export default {
       apply: true, now: () => t4, applyBudgetMs: 170_000, maxApplyPerTick: 8,
     });
     if (t4 > 210_000) violations.push({ detail: `slow deferred refreshes ran ${t4} ms (${slowCalls} calls) past a 170000 ms budget` });
+    // Review round 4 of #6340: ticks were stateless, so slow free deferrals at the head of a stable queue spent every
+    // tick's budget and the refreshable PR behind them was never tried. The apply ledger rotates the queue.
+    let stored = null;
+    const ledger = { read: () => stored, write: (s) => { stored = JSON.parse(JSON.stringify(s)); } };
+    const queue = Array.from({ length: 6 }, (_, i) => ({ number: 7300 + i, headRefName: `lane/fair${i}`, headRefOid: String(i + 1).repeat(40), statusCheckRollup: [failing] }));
+    let refreshedLast = false;
+    for (let tick = 0; tick < 3; tick += 1) {
+      let t5 = 0;
+      const r = sweepCiRedRecovery({
+        readOpenPrs: () => queue, readMainRuns: () => mainRuns, readAheadBy: () => 5, readComments: () => [],
+        refresh: (branch) => {
+          if (branch === 'lane/fair5') return { ok: true, action: 'rebased' };
+          t5 += 35_000; return { deferred: true, ok: false, error: 'verification unknown' };
+        },
+        postComment: () => {}, checkClaim: () => null, readPriority: () => null,
+        apply: true, now: () => t5, applyBudgetMs: 170_000, maxApplyPerTick: 8, applyLedger: ledger,
+      });
+      if (r.applied.some((a) => a.prNumber === 7305 && a.ok)) refreshedLast = true;
+    }
+    if (!refreshedLast) violations.push({ detail: 'slow deferrals at the queue head starved the refreshable PR behind them for 3 ticks' });
     return { violations };
   },
   judge(report) { return report.violations.map((v) => v.detail); },

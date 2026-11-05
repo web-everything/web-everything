@@ -16,8 +16,11 @@ import {
   cancelAndRerunHungRun, cancelHungRun, describeExecError, isRunNotFoundError, redactTokenShapes, sweepHungCiRecovery, formatHungReport,
   defaultReadRequiredContexts, defaultReadAttributedRequiredChecks, defaultReadHeadCommittedAt, triggerCiForPr, clearStaleCheckingLabel,
   sweepMissingRunRecovery as sweepMissingRunRecoveryWithIo, formatMissingRunReport, reconcileAcceptanceAfterRebase, defaultReadPrLabels, detectMainTransition, recordMainState,
-  resolveApplyBudgetMs, resolveMaxApplyPerTick,
+  resolveApplyBudgetMs, resolveMaxApplyPerTick, createFileApplyLedger, normalizeApplyLedger,
 } from '../ci-red-recovery-watch.mjs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { restampAcceptance } from '../../merge-ai-prs.mjs';
 import { spawnCiHealRearm } from '../ci-heal-mark.mjs';
 import { REVIEW_LABELS } from '../../lib/review-escalation.mjs';
@@ -355,6 +358,143 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
     expect(postComment).toHaveBeenCalledTimes(1);
     expect(result.applied.at(-1)).toMatchObject({ prNumber: 2820, ok: true, action: 'rebased' });
     expect(result.applied.some((a) => a.budgetExhausted)).toBe(false);
+  });
+
+  // Review round 4 of #6340: ticks used to be stateless, so five slow free deferrals at the front of a stable queue
+  // spent every tick's whole budget and the refreshable sixth PR was never tried (three ticks, same result).
+  const memoryLedger = () => {
+    let state = null;
+    return { read: () => state, write: vi.fn((s) => { state = JSON.parse(JSON.stringify(s)); }) };
+  };
+  const slowQueueTick = ({ prs, ledger, refreshable }) => {
+    let t = 0;
+    const tried = [];
+    const refresh = vi.fn((branch) => {
+      tried.push(branch);
+      if (branch === refreshable) return { ok: true, action: 'rebased' };
+      t += 35_000;
+      return { deferred: true, ok: false, error: 'verification unknown' };
+    });
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment: vi.fn(), apply: true, now: () => t, applyBudgetMs: 170_000, maxApplyPerTick: 8, applyLedger: ledger,
+    });
+    return { tried, result };
+  };
+
+  it('slow free deferrals at the queue head cannot starve the refreshable PR behind them on later ticks', () => {
+    const prs = Array.from({ length: 6 }, (_, i) => ({ ...PR_2635, number: 7100 + i, headRefName: `lane/h${i}` }));
+    const ledger = memoryLedger();
+    const first = slowQueueTick({ prs, ledger, refreshable: 'lane/h5' });
+    expect(first.tried).toEqual(['lane/h0', 'lane/h1', 'lane/h2', 'lane/h3', 'lane/h4']); // 175 s, h5 budget-deferred untried
+    expect(first.result.applied.at(-1)).toMatchObject({ prNumber: 7105, deferred: true, budgetExhausted: true });
+    const second = slowQueueTick({ prs, ledger, refreshable: 'lane/h5' });
+    expect(second.tried[0]).toBe('lane/h5'); // never-attempted leads
+    expect(second.result.applied.find((a) => a.prNumber === 7105)).toMatchObject({ ok: true, action: 'rebased' });
+  });
+
+  it('with no ledger the plan order is unchanged (the reviewer\'s scenario starves, which is why the CLI wires one)', () => {
+    const prs = Array.from({ length: 6 }, (_, i) => ({ ...PR_2635, number: 7100 + i, headRefName: `lane/h${i}` }));
+    const first = slowQueueTick({ prs, ledger: null, refreshable: 'lane/h5' });
+    const second = slowQueueTick({ prs, ledger: null, refreshable: 'lane/h5' });
+    expect(second.tried).toEqual(first.tried);
+    expect(second.tried).not.toContain('lane/h5');
+  });
+
+  it('when every PR is a slow deferrer the queue still rotates: each PR is tried within ceil(n/k) ticks', () => {
+    const prs = Array.from({ length: 12 }, (_, i) => ({ ...PR_2635, number: 7200 + i, headRefName: `lane/r${i}` }));
+    const ledger = memoryLedger();
+    const seen = new Set();
+    for (let tick = 0; tick < 3; tick += 1) slowQueueTick({ prs, ledger, refreshable: null }).tried.forEach((b) => seen.add(b));
+    expect(seen.size).toBe(12); // 5 + 5 + 2 across three ticks
+  });
+
+  it('a PR whose head moved (or that left the queue) is dropped from the ledger so it stays bounded', () => {
+    const ledger = memoryLedger();
+    const a = [{ ...PR_2635, number: 7300, headRefName: 'lane/p0' }, { ...PR_2635, number: 7301, headRefName: 'lane/p1' }];
+    slowQueueTick({ prs: a, ledger, refreshable: null });
+    expect(Object.keys(ledger.read().at)).toHaveLength(2);
+    slowQueueTick({ prs: [a[0]], ledger, refreshable: null });
+    expect(Object.keys(ledger.read().at)).toHaveLength(1);
+  });
+
+  it('the attempt is recorded BEFORE the refresh runs, so a sweep killed mid-refresh still rotates the PR back', () => {
+    const prs = [2635, 2636].map((number) => ({ ...PR_2635, number, headRefName: `lane/x${number}` }));
+    const ledger = memoryLedger();
+    const kill = () => sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh: () => { throw new Error('SIGTERM at the pass deadline'); }, postComment: vi.fn(), apply: true, applyLedger: ledger,
+    });
+    expect(kill).toThrow('SIGTERM');
+    const tried = [];
+    sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh: (b) => { tried.push(b); return { ok: true, action: 'rebased' }; }, postComment: vi.fn(), apply: true, applyLedger: ledger,
+    });
+    expect(tried).toEqual(['lane/x2636', 'lane/x2635']);
+  });
+
+  it('a claim-held PR is not recorded as attempted (it cost nothing)', () => {
+    const prs = [2635, 2636].map((number) => ({ ...PR_2635, number, headRefName: `lane/c${number}` }));
+    const ledger = memoryLedger();
+    sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh: () => ({ ok: true, action: 'rebased' }), postComment: vi.fn(), apply: true, applyLedger: ledger,
+      checkClaim: ({ branch }) => (branch === 'lane/c2635' ? { message: 'held' } : null),
+    });
+    expect(Object.keys(ledger.read().at)).toHaveLength(1);
+  });
+
+  it.each([
+    ['read', { read: () => { throw new Error('EACCES'); }, write: vi.fn() }],
+    ['write', { read: () => null, write: () => { throw new Error('ENOSPC'); } }],
+  ])('a failing ledger %s never stops the sweep; it is reported as applyLedgerError', (kind, ledger) => {
+    const prs = [{ ...PR_2635, number: 2635, headRefName: 'lane/e1' }];
+    const refresh = vi.fn(() => ({ ok: true, action: 'rebased' }));
+    const result = sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh, postComment: vi.fn(), apply: true, applyLedger: ledger,
+    });
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(result.applyLedgerError).toMatch(new RegExp(`^${kind}:`));
+  });
+
+  it('without --apply the ledger is neither read nor written', () => {
+    const ledger = { read: vi.fn(), write: vi.fn() };
+    sweepCiRedRecovery({ readOpenPrs: () => [PR_2635], readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [], apply: false, applyLedger: ledger });
+    expect(ledger.read).not.toHaveBeenCalled();
+    expect(ledger.write).not.toHaveBeenCalled();
+  });
+
+  describe('apply ledger file + normalization', () => {
+    it.each([
+      ['null', null], ['string', 'x'], ['array at', { at: [1] }], ['bad stamps', { seq: 'a', at: { '1:a': -1, '2:b': 1.5, '3:c': '4' } }],
+    ])('a malformed ledger (%s) normalizes to empty', (_n, raw) => {
+      expect(normalizeApplyLedger(raw)).toEqual({ seq: 0, at: {} });
+    });
+
+    it('keeps valid stamps and never lets seq fall below the highest stamp', () => {
+      expect(normalizeApplyLedger({ seq: 1, at: { '1:a': 5, '2:b': 3 } })).toEqual({ seq: 5, at: { '1:a': 5, '2:b': 3 } });
+    });
+
+    it('round-trips through a file; a missing or corrupt file reads as nothing', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'apply-ledger-'));
+      try {
+        const path = join(dir, 'ledger.json');
+        const ledger = createFileApplyLedger({ path });
+        expect(ledger.read()).toBeNull();
+        ledger.write({ seq: 2, at: { '1:a': 2 } });
+        expect(normalizeApplyLedger(ledger.read())).toEqual({ seq: 2, at: { '1:a': 2 } });
+        writeFileSync(path, '{not json');
+        expect(ledger.read()).toBeNull();
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    it('is hermetic inside a test run unless given a path: it never touches the live handoff record', () => {
+      const ledger = createFileApplyLedger({ repo: null });
+      ledger.write({ seq: 9, at: { '1:a': 9 } });
+      expect(ledger.read()).toEqual({ seq: 0, at: {} });
+    });
   });
 
   it('a failed refresh whose claim is found held afterwards is a free deferral too', () => {

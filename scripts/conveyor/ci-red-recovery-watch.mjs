@@ -255,6 +255,11 @@ export function sweepCiRedRecovery({
   // SIGTERMed it mid-batch. The apply loop stops STARTING refreshes once the budget (measured from the tick's
   // start, so discovery counts) or the per-tick batch cap is spent; the rest wait for the next tick.
   now = Date.now, applyBudgetMs = resolveApplyBudgetMs(), maxApplyPerTick = resolveMaxApplyPerTick(),
+  // Review round 4 of #6340: ticks are stateless, so slow free deferrals at the front of a stable queue spent every
+  // tick's budget and the refreshable PR behind them was never tried. `applyLedger` ({ read, write }, see
+  // {@link createFileApplyLedger}) remembers which PRs were attempted so the next tick starts with the
+  // least-recently-attempted. null = no memory (the plan's own order); the CLI wires the file-backed one.
+  applyLedger = null,
 } = {}) {
   const tickStartedAt = now();
   const retrySettings = exhaustedRetrySettings ?? resolveExhaustedRetry();
@@ -352,6 +357,7 @@ export function sweepCiRedRecovery({
   const repoRoot = resolveLanePoolRepoPath(repo) ?? REPO_ROOT;
 
   const applied = [];
+  let ledgerError = null;
   if (apply) {
     // `started` counts refreshes that did work (they spend the progress floor and the per-tick cap). A deferral writes
     // nothing, so it is never counted; but its network reads cost TIME, and the time check below runs for every PR, so
@@ -361,7 +367,21 @@ export function sweepCiRedRecovery({
     let started = 0;
     const applyStartedAt = now();
     const floorGraceMs = Math.min(applyBudgetMs, APPLY_FLOOR_GRACE_MS);
-    for (const d of plan.dispatch) {
+    // Fairness across ticks (review round 4 of #6340): least-recently-attempted first, never-attempted before any
+    // attempted, ties in the plan's own order. A PR the budget deferred without trying stays unmarked, so it leads
+    // the next tick; a PR that was tried (even a slow free deferral) goes behind everything not yet tried.
+    // Attempts are recorded BEFORE the refresh runs and written at once, so a sweep killed at the pass deadline
+    // mid-refresh has still moved that PR to the back. Ledger trouble only costs fairness — it never stops the sweep.
+    let ledger = { seq: 0, at: {} };
+    if (applyLedger) {
+      try { ledger = normalizeApplyLedger(applyLedger.read()); } catch (e) { ledgerError = `read: ${e?.message ?? e}`; }
+    }
+    const applyKey = (d) => `${d.prNumber}:${d.headSha}`;
+    const order = plan.dispatch.map((d, i) => ({ d, i, seen: ledger.at[applyKey(d)] ?? 0 }))
+      .sort((a, b) => a.seen - b.seen || a.i - b.i).map((x) => x.d);
+    // Entries for PRs no longer owed a refresh drop out, so the ledger stays bounded by the current queue.
+    ledger = { seq: ledger.seq, at: Object.fromEntries(order.filter((d) => ledger.at[applyKey(d)]).map((d) => [applyKey(d), ledger.at[applyKey(d)]])) };
+    for (const d of order) {
       // Progress floor: once over budget, the tick may still start a refresh that does work — discovery (per-PR
       // comment reads) can by itself outlast the budget, and without the floor every tick would defer everything.
       // Deferrals do not spend the floor, but they may only hunt for that refresh for `floorGraceMs` of loop time.
@@ -373,6 +393,11 @@ export function sweepCiRedRecovery({
         continue;
       }
       const held = checkClaim({ repo, branch: d.headRefName });
+      if (!held && applyLedger) {
+        ledger.seq += 1;
+        ledger.at[applyKey(d)] = ledger.seq;
+        try { applyLedger.write(ledger); } catch (e) { ledgerError = `write: ${e?.message ?? e}`; }
+      }
       // Passing prNumber makes refreshOntoMain verify the PR is same-repo before it rebases and force-pushes.
       const result = held ? { ok: false, error: held.message }
         : refresh(d.headRefName, { base: `origin/${defaultBranch}`, root: repoRoot, prNumber: d.prNumber, repo, readIsCrossRepository });
@@ -405,7 +430,7 @@ export function sweepCiRedRecovery({
   }
   // Keep discovery rows too: a retry can have gone green (or be missing checks) since the last tick.
   // The exhausted pass merges these with the attributed candidates instead of rebuilding ownership.
-  return { ...plan, applied, mainRedWindows, mainLatestCheckRuns, mainRuns, mainGreen: mainGreen ? !mainGreen.red : null, candidates, prs: prList, requiredChecks: checks };
+  return { ...plan, applied, ...(ledgerError ? { applyLedgerError: ledgerError } : {}), mainRedWindows, mainLatestCheckRuns, mainRuns, mainGreen: mainGreen ? !mainGreen.red : null, candidates, prs: prList, requiredChecks: checks };
 }
 
 // live PR #5195, 2026-10-14: read FAILED sibling logs, not just the aggregate check's 3s log.
@@ -1702,6 +1727,36 @@ function mainStatePath(repo = null, home = handoffHome()) {
   return join(home, `ci-red-recovery-main-state.${encodeURIComponent(repoSlug(repo))}.json`);
 }
 
+/** we:scripts/conveyor/ci-red-recovery-watch.mjs#normalizeApplyLedger — any unreadable or malformed ledger is an empty
+ *  one (fairness restarts from the plan's order; it can never block a refresh). Keeps only positive-integer stamps. */
+export function normalizeApplyLedger(raw) {
+  const at = {};
+  if (raw && typeof raw === 'object' && raw.at && typeof raw.at === 'object' && !Array.isArray(raw.at)) {
+    for (const [k, v] of Object.entries(raw.at)) if (Number.isSafeInteger(v) && v > 0) at[k] = v;
+  }
+  const top = Math.max(0, ...Object.values(at));
+  return { seq: Number.isSafeInteger(raw?.seq) && raw.seq >= top ? raw.seq : top, at };
+}
+
+function applyLedgerPath(repo = null, home = handoffHome()) {
+  return join(home, `ci-red-recovery-apply-ledger.${encodeURIComponent(repoSlug(repo))}.json`);
+}
+
+/** File-backed fairness ledger for the apply loop (`{ read, write }`). Hermetic inside a test run unless a `path` is
+ *  given: never the live record. A missing file reads as empty; any other read error propagates to the sweep, which
+ *  reports it as `applyLedgerError` and carries on. */
+export function createFileApplyLedger({ repo = null, path, env = process.env } = {}) {
+  if (path === undefined && (env?.VITEST || env?.WE_UNDER_TEST)) return { read: () => ({ seq: 0, at: {} }), write: () => {} };
+  const file = path ?? applyLedgerPath(repo);
+  return {
+    read() {
+      try { return JSON.parse(readFileSync(file, 'utf8')); }
+      catch (e) { if (e.code === 'ENOENT' || e instanceof SyntaxError) return null; throw e; }
+    },
+    write(state) { writeMainRetriggerRecord(file, { v: 1, seq: state.seq, at: state.at }); },
+  };
+}
+
 /** Reads the previous tick's main state, records this one; returns whether this tick is the red→green flip. */
 export function recordMainState({ repo = null, mainGreen = null, path = mainStatePath(repo) } = {}) {
   if (typeof mainGreen !== 'boolean') return false;
@@ -1742,7 +1797,8 @@ export async function main(argv, { sweepOptions = {}, sweepMainRed = sweepCiRedR
     return;
   }
   const exhaustedRetrySettings = sweepOptions.exhaustedRetrySettings ?? resolveExhaustedRetry();
-  const options = { ...sweepOptions, repo: repoFlag, apply: !!flags.apply };
+  const options = { ...sweepOptions, repo: repoFlag, apply: !!flags.apply,
+    applyLedger: sweepOptions.applyLedger ?? (flags.apply ? createFileApplyLedger({ repo: repoFlag }) : null) };
   let failed = false;
   const runPass = (name, sweep, args) => {
     try { return sweep(args); }
