@@ -613,7 +613,8 @@ export function readPendingChangePaths({ root, cwd, env = process.env, execFileS
       const ref = o?.ref;
       if (typeof ref !== 'string' || !/^[A-Za-z0-9._/-]+$/.test(ref) || ref.startsWith('-')) return { ok: false, error: `overlay ref ${JSON.stringify(ref)} unsafe` };
       let tip;
-      try { tip = git(['rev-parse', '--verify', '--quiet', `origin/${ref}^{commit}`]).trim(); } catch { tip = ''; }
+      // Exit 1 is git's "no such ref". A timeout, buffer overflow or spawn failure means unreadable, so it fails closed instead of looking like a deleted branch.
+      try { tip = git(['rev-parse', '--verify', '--quiet', `origin/${ref}^{commit}`]).trim(); } catch (e) { if (e?.status === 1) tip = ''; else throw e; }
       if (!tip) {
         // The branch is gone (merged and deleted, not yet dropped by a rebuild): nothing left to inspect if it was applied before.
         if (everApplied.has(ref)) continue;

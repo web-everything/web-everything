@@ -704,6 +704,13 @@ describe('readPendingChangePaths', () => {
     const out = readPendingChangePaths({ ...base, rebuildState: adoptedState([{ ref: 'lane/x', sha: TIP }]), execFileSyncImpl: fakeGit({ tip: '' }) });
     expect(out).toMatchObject({ ok: true, paths: [] });
   });
+  it('fails closed on a previously applied overlay when the tip lookup errors (timeout, exit 128) instead of reporting a missing ref', () => {
+    const state = adoptedState([{ ref: 'lane/x', sha: TIP }]);
+    for (const err of [gitErr(128), Object.assign(new Error('spawnSync git ETIMEDOUT'), { code: 'ETIMEDOUT' })]) {
+      const exec = (_c, args) => { if (args[0] === 'rev-parse') throw err; return ''; };
+      expect(readPendingChangePaths({ ...base, rebuildState: state, execFileSyncImpl: exec })).toMatchObject({ ok: false });
+    }
+  });
   it('fails closed when the ancestry check errors for a reason other than "not an ancestor"', () => {
     expect(readPendingChangePaths({ ...base, execFileSyncImpl: fakeGit({ ancestorError: gitErr(128) }) })).toMatchObject({ ok: false });
   });
