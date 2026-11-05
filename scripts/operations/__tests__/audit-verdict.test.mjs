@@ -19,11 +19,15 @@ async function loadComputeVerdict() {
 }
 const BASE = 'b'.repeat(40); const HEAD = 'a'.repeat(40);
 const proofFor = f => ({ ok: true, base: BASE, head: HEAD, fingerprint: proofFingerprint(f) });
-// Default: prove mode with a valid proof for every D2 (the relation label is irrelevant); opts override.
-const compute = async (findings, opts = {}) => {
+// Hermetic trusted settings: injected through the resolver, never read from the disk or platform file or ambient env.
+const AUDIT = Object.freeze({ verdict: { mode: 'model' }, preExisting: { mode: 'prove', baseRecheckMax: 3 }, releaseStage: 'prerelease',
+  raceBlockPaths: [], guardFloorPaths: [], priorQuestionHashes: [], recheck: { max: 1 }, cards: { requireOnMain: true, requirePayBy: true } });
+const trustedLayer = (over = {}) => ({ audit: { ...AUDIT, ...over }, env: {} });
+// Default: trusted prove mode with a valid proof for every D2 (the relation label is irrelevant); opts override.
+const compute = async (findings, opts = {}, layer = trustedLayer()) => {
   const o = { preExistingMode: 'prove', base: BASE, head: HEAD, ...opts };
   if (!('relationProofs' in opts)) o.relationProofs = findings.filter(f => f?.class === 'D2').map(proofFor);
-  return (await loadComputeVerdict())(findings, o);
+  return (await loadComputeVerdict())(findings, o, layer);
 };
 const finding = (overrides = {}) => ({ id: 'f1', class: 'E1', file: 'scripts/output.mjs', line: 12,
   invariant: 'Output preserves the requested label', trigger: 'Input label is empty',
@@ -404,8 +408,29 @@ describe('R473 structured concurrency evidence', () => {
     it('mode block and mode allow both block even with a valid proof; default settings block', async () => {
       const f = d2();
       for (const preExistingMode of ['block', 'allow', 'bogus']) expect((await run(f, { relationProofs: [proofFor(f)], preExistingMode })).verdict).toBe('WEAKENED');
-      const bare = (await loadComputeVerdict())([f], { relationProofs: [proofFor(f)], base: BASE, head: HEAD, readCard: rc });
+      const bare = (await loadComputeVerdict())([f], { relationProofs: [proofFor(f)], base: BASE, head: HEAD, readCard: rc },
+        trustedLayer({ preExisting: { mode: 'block', baseRecheckMax: 3 } }));
       expect(bare.verdict).toBe('WEAKENED');
+    });
+    it('a caller cannot relax trusted settings through options (PR #6381 red team)', async () => {
+      const f = d2(); const proof = { relationProofs: [proofFor(f)] };
+      // requireOnMain / requirePayBy: the trusted value wins over a caller's false.
+      expect((await run(f, { ...proof, readCard: () => null, requireOnMain: false })).verdict).toBe('WEAKENED');
+      expect((await run(f, { ...proof, readCard: () => 'status: open\n', requirePayBy: false })).verdict).toBe('WEAKENED');
+      // Positive control: the same relaxations from the TRUSTED layer do take effect, so the seam is real.
+      const relaxed = trustedLayer({ cards: { requireOnMain: false, requirePayBy: false } });
+      expect((await compute([f], options('prerelease', { ...proof, readCard: () => null }), relaxed)).verdict).toBe('NOT WEAKENED');
+      expect((await compute([f], options('prerelease', { ...proof, readCard: () => 'status: open\n' }), relaxed)).verdict).toBe('NOT WEAKENED');
+      // A trusted `block` mode cannot be raised to `prove` by the caller.
+      expect((await compute([f], options('prerelease', { ...proof, readCard: rc, preExistingMode: 'prove' }),
+        trustedLayer({ preExisting: { mode: 'block', baseRecheckMax: 3 } }))).verdict).toBe('WEAKENED');
+      // A trusted `prod` stage cannot be relaxed to `prerelease`; a caller may still tighten prerelease to prod.
+      const prod = trustedLayer({ releaseStage: 'prod' });
+      expect((await compute([finding()], options('prerelease'), prod)).verdict).toBe('WEAKENED');
+      expect((await compute([finding()], options('prod'))).verdict).toBe('WEAKENED');
+      // Caller path lists only add to the trusted lists: an empty list never drops a trusted guard path.
+      const guarded = trustedLayer({ guardFloorPaths: ['custom/**'] });
+      expect((await compute([finding({ file: 'custom/x.mjs' })], options('prerelease', { guardFloorPaths: [] }), guarded)).blocks).toHaveLength(1);
     });
     it('a card with no pay-by line blocks', async () => {
       const f = d2(); expect((await run(f, { relationProofs: [proofFor(f)], readCard: () => 'status: open\n' })).verdict).toBe('WEAKENED');
@@ -414,6 +439,33 @@ describe('R473 structured concurrency evidence', () => {
       expect((await compute([finding({ file: 'scripts/lib/file-locks.mjs' })], options())).verdict).toBe('WEAKENED');
       expect((await compute([finding({ file: 'custom/x.mjs' })], options('prerelease', { guardFloorPaths: ['custom/**'] }))).blocks).toHaveLength(1);
       expect((await compute([finding({ file: 'custom/x.mjs' })], options())).verdict).toBe('NOT WEAKENED');
+    });
+    // PR #6381 red team: the guard hooks and the lane lease were missing from the floor, so these findings shipped.
+    // The floor is also the race floor, so a finding without an interleaving lands in recheck as X2 and one with an
+    // interleaving blocks as B4; either way it never ships.
+    const neverShips = r => { expect(r.verdict).toBe('WEAKENED'); expect(r.ships).toEqual([]); expect(r.cards).toEqual([]); };
+    it('E2 in scripts/guard-bash.mjs blocks in prerelease, with or without settings paths', async () => {
+      const f = finding({ class: 'E2', file: 'scripts/guard-bash.mjs', invariant: 'The guard denies an unsafe command' });
+      for (const opts of [options(), options('prerelease', { guardFloorPaths: [], raceBlockPaths: [] }), { releaseStage: 'prerelease' }]) {
+        const r = await compute([f], opts);
+        neverShips(r);
+        expect(r.recheck).toEqual([expect.objectContaining({ id: 'f1', class: 'X2' })]);
+      }
+      const raced = await compute([{ ...f, interleaving }], options());
+      neverShips(raced);
+      expect(raced.blocks).toEqual([expect.objectContaining({ id: 'f1', class: 'B4' })]);
+    });
+    it('D3 in scripts/lib/lane-lease.mjs blocks (a lease overwrite never clears)', async () => {
+      const f = finding({ class: 'D3', file: 'scripts/lib/lane-lease.mjs', invariant: 'A live lease is never overwritten' });
+      neverShips(await compute([f], options()));
+      const raced = await compute([{ ...f, interleaving }], options());
+      expect(raced.blocks).toEqual([expect.objectContaining({ id: 'f1', class: 'B4' })]);
+    });
+    it.each(['scripts/guard-bash.mjs', 'scripts/guard-git-push.mjs', 'scripts/guard-lane.mjs', 'scripts/guard-stop-passive-wait.mjs',
+      'scripts/conveyor/guard-1c-mutation-check.mjs', 'scripts/backlog-guard.mjs', 'scripts/backlog/guarded-write.mjs', '.claude/settings.json',
+      'scripts/lib/lane-lease.mjs', 'scripts/readiness/scope-lease.mjs', 'scripts/readiness/scope-lease-live.mjs', 'scripts/lib/daemon-rebuild/lease.mjs',
+    ])('every guard and lease module is on the built-in floor: E2 and D3 in %s never ship', async file => {
+      for (const cls of ['E1', 'E2', 'D3']) neverShips(await compute([finding({ class: cls, file })], options()));
     });
   });
 
@@ -485,8 +537,13 @@ describe('AU1 PR-A is inert', () => {
   it('no runtime file imports the rubric core or its settings', async () => {
     const { spawnSync } = await import('node:child_process');
     const root = fileURLToPath(new NodeURL('../../../', import.meta.url));
-    const hits = spawnSync('git', ['grep', '--untracked', '-lE', "audit-verdict\\.mjs|audit-settings\\.mjs", '--', 'scripts', 'skills-src', '.claude', 'src'],
-      { cwd: root, encoding: 'utf8' }).stdout.split('\n').filter(Boolean)
+    const grep = spawnSync('git', ['grep', '--untracked', '-lE', "audit-verdict\\.mjs|audit-settings\\.mjs", '--', 'scripts', 'skills-src', '.claude', 'src'],
+      { cwd: root, encoding: 'utf8', maxBuffer: 1 << 24 });
+    // A failed grep prints nothing, which would read as "no importers": require a clean run that saw this file.
+    expect(grep.error).toBeUndefined();
+    expect(grep.status, grep.stderr).toBe(0);
+    expect(grep.stdout.split('\n')).toContain('scripts/operations/__tests__/audit-verdict.test.mjs');
+    const hits = grep.stdout.split('\n').filter(Boolean)
       .filter(f => /\.(mjs|js|cjs|ts)$/.test(f) && !/__tests__\/|\.test\./.test(f) && !/audit-(verdict|settings)\.mjs$/.test(f));
     expect(hits).toEqual([]);
   });

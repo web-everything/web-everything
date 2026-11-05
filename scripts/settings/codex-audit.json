@@ -1,11 +1,11 @@
 {
-  "$comment": "Codex-audit rubric decisions (R528: every resilience decision is a named setting). Today's choice is the value. Resolved by scripts/lib/audit-settings.mjs from the TRUSTED RUNNING checkout, never from a candidate diff. Cascade: standard, platform preference 'audit', this file, then env (env may only TIGHTEN). Any unreadable or invalid value resolves to the strictest option. verdict.mode: shadow (model AND computed must pass) | model | computed. preExisting.mode: block | prove | allow (allow resolves to block with a warning). releaseStage: prerelease | prod.",
+  "$comment": "Codex-audit rubric decisions (R528: every resilience decision is a named setting). Today's choice is the value. Resolved by scripts/lib/audit-settings.mjs from the TRUSTED RUNNING checkout, never from a candidate diff. Cascade: standard, platform preference 'audit', this file, then env (env may only TIGHTEN). Any unreadable or invalid value resolves to the strictest option. verdict.mode: shadow (model AND computed must pass) | model | computed. preExisting.mode: block | prove | allow (allow resolves to block with a warning). releaseStage: prerelease | prod. guardFloorPaths: E findings here always block; the built-in floor (GUARD_FLOOR) already holds these entries and every guard and lease module, so removing one here never unprotects it.",
   "audit": {
     "verdict": { "mode": "model" },
     "preExisting": { "mode": "block", "baseRecheckMax": 3 },
     "releaseStage": "prerelease",
     "raceBlockPaths": [],
-    "guardFloorPaths": [],
+    "guardFloorPaths": ["scripts/guard-*", "scripts/**/guard-*", "scripts/lib/lane-lease.mjs", ".claude/settings.json"],
     "priorQuestionHashes": [],
     "recheck": { "max": 1 },
     "cards": { "requireOnMain": true, "requirePayBy": true }

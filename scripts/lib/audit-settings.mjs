@@ -9,10 +9,19 @@ import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { cascadePolicy, readPlatformPreferences } from './policy-cascade.mjs';
 
 export const AUDIT_SETTINGS_PATH = fileURLToPath(new NodeURL('../settings/codex-audit.json', import.meta.url));
-/** Built-in race-protected paths; settings and env can only ADD to these. */
+/**
+ * Built-in protected paths: the concurrency modules (locks, leases, slots, lane pool, merge, drain) and the guard hooks
+ * with their registration (PR #6381 red team: `scripts/guard-bash.mjs` and `scripts/lib/lane-lease.mjs` were missing).
+ * Every audit path list starts from this floor; settings and env can only ADD to it.
+ */
 export const GUARD_FLOOR = Object.freeze(['scripts/**/file-locks*', 'scripts/*file-locks*', 'scripts/**/lease*', 'scripts/*lease*',
+  'scripts/lib/lane-lease.mjs', 'scripts/readiness/scope-lease*',
   'scripts/**/slot*', 'scripts/*slot*', 'scripts/**/lock-reaper*', 'scripts/*lock-reaper*', 'scripts/**/lane-pool*', 'scripts/*lane-pool*',
-  'scripts/**/merge*', 'scripts/*merge*', 'scripts/**/drain*', 'scripts/*drain*', 'scripts/**/mq*', 'scripts/*mq*']);
+  'scripts/**/merge*', 'scripts/*merge*', 'scripts/**/drain*', 'scripts/*drain*', 'scripts/**/mq*', 'scripts/*mq*',
+  'scripts/guard-*', 'scripts/**/guard-*', 'scripts/*-guard*', 'scripts/**/*-guard*', 'scripts/guarded-*', 'scripts/**/guarded-*',
+  '.claude/settings.json']);
+/** What an invalid or unreadable path list resolves to: the floor plus every path (`**` matches any path). */
+const STRICTEST_PATHS = Object.freeze([...GUARD_FLOOR, '**']);
 
 // Ordered strictest first; env may only move toward the front.
 const RANKS = Object.freeze({
@@ -160,24 +169,30 @@ export function resolveAuditSettings({ path = AUDIT_SETTINGS_PATH, fileRead = re
     const envRaw = env?.[AUDIT_SETTINGS_ENV[key]];
     if (envRaw !== undefined) {
       const e = parseEnv(key, envRaw);
-      if (e !== undefined && VALID[key](e) && !(key === 'preExistingMode' && e === 'allow') && tighter(key, e, v)) { v = e; src = 'env'; }
+      // An env value that does not parse or is not a known option is an explicit choice we cannot read: strictest.
+      if (e === undefined || !VALID[key](e)) {
+        warn(`env ${AUDIT_SETTINGS_ENV[key]}=${JSON.stringify(envRaw)} invalid; using strictest ${JSON.stringify(STRICTEST[key])}`);
+        v = STRICTEST[key]; src = 'strictest';
+      } else if (!(key === 'preExistingMode' && e === 'allow') && tighter(key, e, v)) { v = e; src = 'env'; }
       else warn(`env ${AUDIT_SETTINGS_ENV[key]}=${JSON.stringify(envRaw)} ignored (env may only tighten)`);
     }
     value[key] = v; sources[key] = src;
   }
-  // Path lists only ever ADD to the built-in floor; a bad list contributes nothing (the floor remains).
+  // Path lists only ever ADD to the built-in floor. An unreadable layer or an invalid list (file, platform or env) is
+  // an explicit choice we cannot read, so it resolves to the strictest list: the floor plus every path.
   for (const [key, layerVal] of [['raceBlockPaths', get(layered, 'raceBlockPaths')], ['guardFloorPaths', get(layered, 'guardFloorPaths')]]) {
     let list = layerVal === undefined ? [] : layerVal;
-    // A malformed raw entry warns; the valid layered list (if any) still adds, since more protected paths is stricter.
-    if (!validPaths(list)) { warn(`audit setting ${key} invalid; built-in floor only`); list = []; }
-    else if (malformed(key, validPaths)) warn(`audit setting ${key} has a malformed entry; it adds nothing`);
+    let strictest = unreadable || !cascade || platBad;
+    if (!validPaths(list) || malformed(key, validPaths)) { warn(`audit setting ${key} invalid; every path protected`); list = []; strictest = true; }
     let envList = [];
     const raw = env?.[AUDIT_SETTINGS_ENV[key]];
     if (raw !== undefined) {
-      try { const p = JSON.parse(raw); if (validPaths(p)) envList = p; else warn(`env ${AUDIT_SETTINGS_ENV[key]} invalid; ignored`); } catch { warn(`env ${AUDIT_SETTINGS_ENV[key]} invalid; ignored`); }
+      let p; try { p = JSON.parse(raw); } catch { p = undefined; }
+      if (validPaths(p)) envList = p;
+      else { warn(`env ${AUDIT_SETTINGS_ENV[key]} invalid; every path protected`); strictest = true; }
     }
-    value[key] = Object.freeze([...new Set([...GUARD_FLOOR, ...list, ...envList])]);
-    sources[key] = envList.length ? 'env' : list.length ? 'file' : 'built-in';
+    value[key] = Object.freeze([...new Set([...(strictest ? STRICTEST_PATHS : GUARD_FLOOR), ...list, ...envList])]);
+    sources[key] = strictest ? 'strictest' : envList.length ? 'env' : list.length ? 'file' : 'built-in';
   }
   // Prior question hashes only widen what is ACCEPTED, so no env route exists; a bad list is empty.
   // Any unreadable layer accepts none (strictest), like every single-value setting above.

@@ -8,6 +8,7 @@ const file = audit => () => JSON.stringify({ audit });
 const full = (over = {}) => ({ verdict: { mode: 'model' }, preExisting: { mode: 'block', baseRecheckMax: 3 }, releaseStage: 'prerelease',
   raceBlockPaths: [], guardFloorPaths: [], priorQuestionHashes: [], recheck: { max: 1 }, cards: { requireOnMain: true, requirePayBy: true }, ...over });
 const resolve = (audit, env = {}) => resolveAuditSettings({ fileRead: file(audit), platform: null, env, log: () => {} });
+const STRICT_PATHS = [...GUARD_FLOOR, '**'];
 const STRICT = { verdictMode: 'shadow', preExistingMode: 'block', releaseStage: 'prod', recheckMax: 0, baseRecheckMax: 0, requireOnMain: true, requirePayBy: true };
 
 describe('audit settings (R528)', () => {
@@ -21,7 +22,7 @@ describe('audit settings (R528)', () => {
     for (const read of [() => { throw new Error('x'); }, () => 'not json', () => '[]', () => '{"audit":[]}', () => '{}']) {
       const r = resolveAuditSettings({ fileRead: read, platform: null, env: {}, log: () => {} });
       expect(r.value).toMatchObject(STRICT);
-      expect(r.value.guardFloorPaths).toEqual(GUARD_FLOOR);
+      expect(r.value.guardFloorPaths).toEqual(STRICT_PATHS);
     }
   });
   it('an invalid value resolves to that setting\'s strictest option, not a lower layer', () => {
@@ -65,7 +66,7 @@ describe('audit settings (R528)', () => {
     expect(r.warnings).toHaveLength(1);
     expect(r.value.priorQuestionHashes).toEqual([]);
     expect(r.sources.priorQuestionHashes).toBe('strictest');
-    expect(r.value.raceBlockPaths).toEqual(GUARD_FLOOR);
+    expect(r.value.raceBlockPaths).toEqual(STRICT_PATHS);
   });
   it('an unreadable tool file accepts no platform hashes', () => {
     const r = resolveAuditSettings({ fileRead: () => { throw new Error('x'); }, platform: { priorQuestionHashes: ['deadbeef'] }, env: {}, log: () => {} });
@@ -132,8 +133,8 @@ describe('audit settings (R528)', () => {
   });
   it('empty-object path lists and hashes warn instead of vanishing silently', () => {
     const r = resolve(full({ raceBlockPaths: {}, guardFloorPaths: {}, priorQuestionHashes: {} }));
-    expect(r.value.raceBlockPaths).toEqual(GUARD_FLOOR);
-    expect(r.value.guardFloorPaths).toEqual(GUARD_FLOOR);
+    expect(r.value.raceBlockPaths).toEqual(STRICT_PATHS);
+    expect(r.value.guardFloorPaths).toEqual(STRICT_PATHS);
     expect(r.value.priorQuestionHashes).toEqual([]);
     expect(r.warnings.join()).toMatch(/raceBlockPaths.*guardFloorPaths.*priorQuestionHashes/s);
   });
@@ -157,17 +158,40 @@ describe('audit settings (R528)', () => {
     expect(loose.sources.releaseStage).toBe('file');
     expect(loose.warnings.length).toBeGreaterThanOrEqual(4);
   });
-  it('env cannot relax a file value that is already invalid-strict, or garbage env is ignored', () => {
+  it('env cannot relax a file value that is already invalid-strict, and an invalid env value resolves to strictest', () => {
     const r = resolve(full({ releaseStage: 'nope' }), { WE_AUDIT_RELEASE_STAGE: 'prerelease', WE_AUDIT_RECHECK_MAX: 'abc' });
     expect(r.value.releaseStage).toBe('prod');
-    expect(r.value.recheckMax).toBe(1);
+    expect(r.value.recheckMax).toBe(0);
+    expect(r.sources.recheckMax).toBe('strictest');
   });
-  it('path lists only add to the built-in floor; bad lists leave the floor', () => {
+  it.each([
+    ['WE_AUDIT_VERDICT_MODE', 'verdictMode', 'bogus'], ['WE_AUDIT_VERDICT_MODE', 'verdictMode', ''],
+    ['WE_AUDIT_PREEXISTING_MODE', 'preExistingMode', 'Prove'], ['WE_AUDIT_RELEASE_STAGE', 'releaseStage', 'dev'],
+    ['WE_AUDIT_RECHECK_MAX', 'recheckMax', '9'], ['WE_AUDIT_RECHECK_MAX', 'recheckMax', '-1'], ['WE_AUDIT_BASE_RECHECK_MAX', 'baseRecheckMax', '1.5'],
+    ['WE_AUDIT_CARDS_REQUIRE_ON_MAIN', 'requireOnMain', 'no'], ['WE_AUDIT_CARDS_REQUIRE_PAY_BY', 'requirePayBy', 'FALSE'],
+  ])('an invalid env %s=%j resolves %s to its strictest option (PR #6381)', (name, key, raw) => {
+    const r = resolve(full({ preExisting: { mode: 'prove', baseRecheckMax: 3 }, cards: { requireOnMain: true, requirePayBy: true } }), { [name]: raw });
+    expect(r.value[key]).toBe(STRICT[key]);
+    expect(r.sources[key]).toBe('strictest');
+    expect(r.warnings.join()).toMatch(new RegExp(`${name}.*invalid`));
+  });
+  it('path lists only add to the built-in floor; an invalid list protects every path', () => {
     const r = resolve(full({ raceBlockPaths: ['custom/**'] }), { WE_AUDIT_GUARD_FLOOR_PATHS: '["env/**"]' });
     expect(r.value.raceBlockPaths).toEqual([...GUARD_FLOOR, 'custom/**']);
     expect(r.value.guardFloorPaths).toEqual([...GUARD_FLOOR, 'env/**']);
     const bad = resolve(full({ raceBlockPaths: 'x' }), { WE_AUDIT_RACE_BLOCK_PATHS: '{' });
-    expect(bad.value.raceBlockPaths).toEqual(GUARD_FLOOR);
+    expect(bad.value.raceBlockPaths).toEqual([...GUARD_FLOOR, '**']);
+    expect(bad.sources.raceBlockPaths).toBe('strictest');
+    for (const raw of ['{', '"x"', '[""]', '[3]', '{}']) {
+      const e = resolve(full({ guardFloorPaths: ['custom/**'] }), { WE_AUDIT_GUARD_FLOOR_PATHS: raw });
+      expect(e.value.guardFloorPaths, raw).toEqual([...GUARD_FLOOR, '**', 'custom/**']);
+    }
+  });
+  it('the built-in floor and the shipped file hold the guard hooks and the lane lease (PR #6381 red team)', () => {
+    for (const p of ['scripts/guard-*', 'scripts/lib/lane-lease.mjs', '.claude/settings.json']) expect(GUARD_FLOOR).toContain(p);
+    const shipped = resolveAuditSettings({ platform: null, env: {}, log: () => {} });
+    expect(shipped.sources.guardFloorPaths).toBe('file');
+    expect(shipped.value.guardFloorPaths).toEqual(expect.arrayContaining(['scripts/guard-*', 'scripts/lib/lane-lease.mjs']));
   });
   it('prior question hashes have no env route and bad lists are empty', () => {
     expect(resolve(full({ priorQuestionHashes: ['abcdef0123456789'] }), { WE_AUDIT_PRIOR_QUESTION_HASHES: '["deadbeefdeadbeef"]' }).value.priorQuestionHashes).toEqual(['abcdef0123456789']);

@@ -127,18 +127,34 @@ function pathCandidates(file) {
 }
 const matchesAny = (file, pattern) => { const c = pathCandidates(file); return c === null || c.some(x => matchesPath(x, pattern)); };
 
-export function computeVerdict(findings, options = {}) {
-  // Omitted settings come from the trusted running checkout (strictest on any failure), never from the candidate.
-  const trusted = resolveAuditSettings().value;
-  const { releaseStage = trusted.releaseStage, raceBlockPaths = trusted.raceBlockPaths, rulings = [],
-    guardFloorPaths = trusted.guardFloorPaths, relationProofs = [], base, head } = options;
-  // `allow` is never trusted: it resolves to block. Only an explicit `prove` lets proven D2 debt ship.
-  const proveD2 = (options.preExistingMode ?? trusted.preExistingMode) === 'prove';
+/**
+ * Settings come from the trusted running checkout (strictest on any failure), never from the candidate. `trustedLayer`
+ * is a test seam only: `{ audit, env }` is validated by the same resolver in place of the disk and platform files.
+ */
+function trustedSettings(trustedLayer) {
+  if (trustedLayer === undefined) return resolveAuditSettings().value;
+  const { audit, env = {} } = trustedLayer ?? {};
+  return resolveAuditSettings({ fileRead: () => JSON.stringify({ audit }), platform: null, env, log: () => {} }).value;
+}
+
+export function computeVerdict(findings, options = {}, trustedLayer) {
+  const trusted = trustedSettings(trustedLayer);
+  // A caller may only TIGHTEN the trusted settings: a stricter stage, more protected paths. It can never relax them.
+  const { rulings = [], relationProofs = [], base, head } = options;
+  const stageOption = options.releaseStage ?? trusted.releaseStage;
+  const releaseStage = trusted.releaseStage === 'prod' && RELEASE_STAGES.includes(stageOption) ? 'prod' : stageOption;
+  // `allow` is never trusted: it resolves to block. Proven D2 debt ships only when the trusted mode is `prove` and the
+  // caller does not ask for something stricter.
+  const proveD2 = trusted.preExistingMode === 'prove' && (options.preExistingMode ?? 'prove') === 'prove';
   const result = { verdict: 'NOT WEAKENED', blocks: [], ships: [], cards: [], recheck: [] };
-  // Both glob lists are bounded (count and length) so matching cost is bounded; a bad list is invalid input.
+  // Caller glob lists are bounded (count and length) so matching cost is bounded; a bad list is invalid input.
+  // The trusted lists were bounded by the resolver.
   const validGlobs = list => Array.isArray(list) && list.length <= MAX_GLOBS && list.every(p => text(p) && p.length <= 512);
+  const raceOption = options.raceBlockPaths ?? []; const guardOption = options.guardFloorPaths ?? [];
+  const raceBlockPaths = validGlobs(raceOption) ? [...new Set([...trusted.raceBlockPaths, ...raceOption])] : null;
+  const guardFloorPaths = validGlobs(guardOption) ? [...new Set([...trusted.guardFloorPaths, ...guardOption])] : null;
   if (!Array.isArray(findings) || !RELEASE_STAGES.includes(releaseStage)
-    || !validGlobs(raceBlockPaths) || !validGlobs(guardFloorPaths) || !Array.isArray(rulings)) {
+    || raceBlockPaths === null || guardFloorPaths === null || !Array.isArray(rulings)) {
     result.blocks.push({ class: 'X2', consequence: 'Invalid audit input/settings; request human adjudication' });
   } else for (const input of findings) {
     const f = { ...input };
@@ -163,7 +179,7 @@ export function computeVerdict(findings, options = {}) {
     if (f.class === 'D1' || f.class === 'X2') { result.recheck.push(f); continue; }
     // D2: never reads f.relation. It ships only in prove mode, with an ok relationProof bound to base+head+fingerprint,
     // and a card on main whose pay-by is current.
-    if (f.class === 'D2' && !(proveD2 && validProof(f, relationProofs, base, head) && d2Verified(f, releaseStage, { requireOnMain: trusted.requireOnMain, requirePayBy: trusted.requirePayBy, ...options }))) { result.blocks.push(f); continue; }
+    if (f.class === 'D2' && !(proveD2 && validProof(f, relationProofs, base, head) && d2Verified(f, releaseStage, { ...options, requireOnMain: trusted.requireOnMain, requirePayBy: trusted.requirePayBy }))) { result.blocks.push(f); continue; }
     // E findings in guard paths always block; a path that cannot be established blocks too.
     if (f.class.startsWith('E') && [...GUARD_FLOOR, ...guardFloorPaths].some(p => matchesAny(f.file, p))) { result.blocks.push(f); continue; }
     if (f.class.startsWith('B') || (releaseStage === 'prod' && f.class.startsWith('E'))) { result.blocks.push(f); continue; }
