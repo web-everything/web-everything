@@ -454,10 +454,32 @@ describe('R593 merge-resolution blobs are scanned whatever the user diff config 
       expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ path: 'c.txt', finding: 'github-token' });
     });
   }
-  it('refuses (does not parse) a combined-format raw header', async () => {
-    const combined = Buffer.from(`::100644 100644 100644 ${'a'.repeat(40)} ${'b'.repeat(40)} ${'c'.repeat(40)} MM\0c.txt\0`);
-    const faulty = (args, ...rest) => args.includes('--raw') ? { code: 0, stdout: combined, stderr: Buffer.alloc(0) } : exec(args, ...rest);
-    await expect(scanBundleRange({ cwd: lane, head: tip, prerequisite: runnerMain, exec: (call) => call.args.includes('--raw') ? faulty(call.args) : exec(call) }))
-      .rejects.toMatchObject({ code: 'bundle-credential-scan-failed' });
+  const sha = (c) => c.repeat(40);
+  const rawHeaders = {
+    'combined (::, two old modes)': `::100644 100644 100644 ${sha('a')} ${sha('b')} ${sha('c')} MM`,
+    'six fields without ::': `:100644 100644 ${sha('a')} ${sha('b')} M extra`,
+    'non-octal new mode': `:100644 10x644 ${sha('a')} ${sha('b')} M`,
+  };
+  for (const [name, header] of Object.entries(rawHeaders)) {
+    it(`refuses (does not parse) a raw header: ${name}`, async () => {
+      const stub = async (call) => call.args.includes('--raw') ? { code: 0, stdout: Buffer.from(`${header}\0c.txt\0`), stderr: Buffer.alloc(0) } : exec(call);
+      await expect(scanBundleRange({ cwd: lane, head: tip, prerequisite: runnerMain, exec: stub })).rejects.toMatchObject({ code: 'bundle-credential-scan-failed' });
+    });
+  }
+  it('pins --diff-merges=separate on the raw log call (no reliance on user config)', async () => {
+    const seen = [];
+    const spy = async (call) => { if (call.args.includes('--raw')) seen.push(call.args); return exec(call); };
+    await scanBundleRange({ cwd: lane, head: tip, prerequisite: runnerMain, exec: spy });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toEqual(expect.arrayContaining(['--diff-merges=separate', '--no-ext-diff', '--no-textconv']));
+    expect(seen[0]).not.toContain('-m');
+  });
+  it('refuses a repository whose history is cut by .git/info/grafts (bundle would still pack the cut-off objects)', async () => {
+    await fs.writeFile(join(lane, '.git', 'info', 'grafts'), `${tip}\n`);
+    await expect(scanBundleRange({ cwd: lane, head: tip, prerequisite: runnerMain, exec })).rejects.toMatchObject({ code: 'bundle-credential-scan-failed', detail: 'grafts-file' });
+  });
+  it('refuses a shallow repository', async () => {
+    await fs.writeFile(join(lane, '.git', 'shallow'), `${tip}\n`);
+    await expect(scanBundleRange({ cwd: lane, head: tip, prerequisite: runnerMain, exec })).rejects.toMatchObject({ code: 'bundle-credential-scan-failed', detail: 'shallow-repository' });
   });
 });

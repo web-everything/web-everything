@@ -3,10 +3,10 @@
 // ships a verified bundle (public-main..HEAD, or a full bundle when no common base exists) over the same
 // rsync channel instead of making Forge fetch an unpushed HEAD from GitHub. The default stays `rsync`.
 import { createHash } from 'node:crypto';
-import { createReadStream } from 'node:fs';
+import { createReadStream, existsSync } from 'node:fs';
 import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { classifyManifestPath, credentialTextFinding, credentialContentFinding } from './forge-exec-manifest.mjs';
 
@@ -122,6 +122,12 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
   // The pack carries the RAW stored objects. --no-replace-objects keeps refs/replace/* from showing the scan a clean substitute.
   const git = (args, input) => exec({ file: 'git', args: ['--no-replace-objects', ...args], cwd, ...(input === undefined ? {} : { input }) });
   const range = prerequisite ? `${prerequisite}..${head}` : head;
+  // Grafts and shallow files cut history out of rev-list/log but NOT out of `git bundle create` (it still packs the cut-off
+  // objects), so a repo carrying either cannot be scanned faithfully: refuse rather than scan a truncated view.
+  const shallow = await git(['rev-parse', '--is-shallow-repository']);
+  if (shallow.code !== 0 || bytes(shallow.stdout).toString('utf8').trim() !== 'false') throw bundleError('bundle-credential-scan-failed', 'shallow-repository');
+  const graftPath = await git(['rev-parse', '--git-path', 'info/grafts']);
+  if (graftPath.code !== 0 || existsSync(resolve(cwd, bytes(graftPath.stdout).toString('utf8').trim()))) throw bundleError('bundle-credential-scan-failed', 'grafts-file');
   // -t lists tree (directory) entries too: without it an EMPTY subtree entry (crafted with mktree) has no file below it
   // and never shows up, yet its name travels in the pack.
   const log = await git(['log', '--raw', '-t', '--ignore-submodules=none', '-z', '--no-renames', '--no-abbrev', '--root', '--diff-merges=separate', '--no-ext-diff', '--no-textconv', '--no-show-signature', '--diff-filter=d', '--format=', range]);
