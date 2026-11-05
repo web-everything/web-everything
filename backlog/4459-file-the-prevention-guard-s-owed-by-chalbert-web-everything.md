@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/operations/sweep-orphan-backlog-cards.mjs", "we:scripts/operations/__tests__/sweep-orphan-backlog-cards.test.mjs", "we:docs/agent/testing.md"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-04"
-preparedAgainstSha: "967c2ea7268d531dc7fc4a7f8a2f7b859bfa766f"
+preparedDate: "2026-11-05"
+preparedAgainstSha: "b155a88804d349b7ae6729e0cb2bb20bbc315a5f"
 tags: []
 ---
 
@@ -40,6 +40,7 @@ All named tests below are to be added or strengthened in `we:scripts/operations/
 - **Re-preparation scope correction:** the incoming scope already includes the three files above and remains unchanged. The old design used raw GitHub exec and unbounded pagination; the corrected design routes GitHub calls through the existing shared throttle and refuses incomplete bounded discovery. Evidence: the current default exec is raw `execFileSync` at `we:scripts/operations/sweep-orphan-backlog-cards.mjs:392-394`, while `we:scripts/lib/gh-throttle.mjs:54-60` documents the drop-in `runGhSync` adapter. The shared helper is consumed, not edited.
 - **Callers/defaults:** repository search found the CLI wrapper at `we:scripts/operations/sweep-orphan-backlog-cards.mjs:594-624` and the parser-only import at `we:scripts/backlog/__tests__/task-agreement.test.mjs:21`. The latter does not call the sweep and needs no migration. The live default remains non-dry-run; only executions with survivors gain the mandatory PR read. Existing scripted acquisition-first fixtures at `we:scripts/operations/__tests__/sweep-orphan-backlog-cards.test.mjs:426-493` must prepend explicit complete no-match responses rather than relaxing assertions.
 - **Sizing:** old size 3, retained size 3. Expected changed lines: approximately 80 in `we:scripts/operations/sweep-orphan-backlog-cards.mjs` (guards and adapter), 220 in `we:scripts/operations/__tests__/sweep-orphan-backlog-cards.test.mjs` (boundary matrix, caller and real Git fixture), and 15 in `we:docs/agent/testing.md` (two conventions). The existing injected orchestration harness at `we:scripts/operations/__tests__/sweep-orphan-backlog-cards.test.mjs:371-383` avoids a new test plane. This is a story, so no estimatedLoc is added.
+- **Re-preparation 2026-11-05 (main `b155a88804`):** premise re-checked — not delivered. The sweep source, its test file and `we:scripts/lib/gh-throttle.mjs` are unchanged since `967c2ea72`; the only scope drift is an unrelated "Bounded review run scans" section appended to `we:docs/agent/testing.md` (+41 lines), which does not overlap the two owed conventions (no existing exhausted-loop or whole-options entry). Design, MVP, tests and acceptance stand; the new conventions append after that section. Size 3 unchanged.
 - Preparation used source and test inspection only; implementation, red/green execution and stamps remain for the runner/build stages.
 
 ## Design
@@ -71,6 +72,18 @@ All matching source tests live in `we:scripts/operations/__tests__/sweep-orphan-
 - Preserve call-log evidence for exhaustion and pending-PR refusal showing no commit/publication and the correct release behavior. These are probes of the actual exported orchestrator with injected external IO, not proof of a live forge transaction.
 - Preserve the local Git fixture's before/after commit IDs and dedupe assertions as real subprocess evidence for fetch freshness under a restricted fetch mapping. Do not run the production sweep merely to gather proof: it acquires lanes and publishes PRs.
 - Run the queued standards gate after the body/convention changes. Use one admission wait of 60000 ms; if the queue remains busy, stop and report rather than polling. Report any unrelated failure accurately rather than claiming a green gate.
+
+## Edge cases this change must handle
+
+1. **Untrusted text** — PR head refs, numbers and URLs from `gh` are untrusted: match the literal `lane/orphan-card-sweep-` prefix with `startsWith` (no regex/glob), fold newlines and backticks (`foldUntrusted`, `we:scripts/lib/jury-core.mjs`) in the refusal message, and never pass a ref into argv as an option (the fetch refspec derives from a matched `origin/` ref only). Case: head ref containing a newline or leading `--`.
+2. **Truncated reads** — PR listing reads full pages (100) up to ten, with `maxBuffer` 1 MiB; a full tenth page, oversized output or a failed later page is an `open-pr-check` refusal, never "no PR" (A3).
+3. **Shared state files** — n/a: the change writes no shared state file; concurrent-start exclusion is an explicit Follow-up, not claimed here.
+4. **Fail closed** — failed fetch, failed PR read, invalid JSON/shape, and validation exhaustion each return a named failure (`open-pr-check`, `content-check`) before any lane, commit or queue side effect (A1-A3).
+5. **Identity scoping** — the PR check is scoped to this checkout's repository via `cwd: REPO_ROOT`, and fetch refspecs are scoped to the matched origin branch; non-origin refs are left alone (A4).
+6. **State over time** — an earlier session's open sweep PR (different suffix) still refuses; closed/merged PRs do not (open-state request). Restart mid-run: the lane is released in `finally` after exhaustion.
+7. **Who wrote it** — n/a: the guard trusts no comment, label or job name; only open-PR head refs from the forge listing for this repo.
+
+Test-red notes: [A5]'s whole-options pins already pass on current source by design; their red evidence is the separate option-removal mutation per option (cwd, timeout, prompt env), and the docs half is review-verified plus the standards gate. [A4]'s real-Git case is red pre-build only because the fixture's restricted fetch mapping excludes main, which makes the branch-only fetch leave `origin/main` stale; under default mapping it would not.
 
 ## Follow-ups
 
