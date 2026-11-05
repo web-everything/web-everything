@@ -103,9 +103,14 @@ export function overlayGraduated({ ref, sha, build, registered, events, git, rea
   try {
     if (!ref || !sha || !build || registered(ref) !== false || !Array.isArray(events)) return false;
     const last = events.findLast((event) => event?.ref === ref);
-    if (last?.kind === 'auto-dropped' && last.reason === 'in-main') {
-      const timeMs = (value) => typeof value === 'number' ? value
-        : typeof value === 'string' ? Date.parse(value) : NaN;
+    const timeMs = (value) => typeof value === 'number' ? value
+      : typeof value === 'string' ? Date.parse(value) : NaN;
+    // An `auto-retired` event (prototype-load / daemon-overlay: PR merged or in main) is graduation only with its own
+    // proof: the event names this exact tip and records clean merges with the content in main. The tree check below
+    // still has to agree independently; anything else refuses (live 2026-11-04 author-lookup-defer-m2).
+    const retiredWithProof = last?.kind === 'auto-retired' && ['pr-merged', 'in-main'].includes(last.reason)
+      && last.tip === sha && last.evidence?.contentInMain === true && last.evidence?.cleanMerges === true;
+    if ((last?.kind === 'auto-dropped' && last.reason === 'in-main') || retiredWithProof) {
       const droppedMs = timeMs(last.at);
       const readyMs = timeMs(readyAt);
       if (!Number.isFinite(droppedMs) || !Number.isFinite(readyMs) || droppedMs >= readyMs) return false;

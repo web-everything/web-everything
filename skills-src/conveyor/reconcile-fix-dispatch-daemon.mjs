@@ -744,6 +744,14 @@ function prFingerprint(pr) {
 }
 
 /**
+ * The planner's OWN discovery read: it must be taken AFTER the baseline probe, so it may not use the host-shared PR snapshot
+ * (valid ~75 s). It used to force that with a WRAPPER `exec`, which also knocked it off the production path and made it run
+ * the heavy 200-row `gh pr list` (HTTP 504, 23 failed ticks, ci-heals unplanned, 2026-11-03). `fresh: true` skips the snapshot
+ * but keeps the small-page read, the 5xx retry and the fail-closed / deferred contract.
+ */
+export const planFreshReadPrs = (read) => (o = {}) => read({ ...o, fresh: true, attributionRepo: o.attributionRepo ?? o.repo });
+
+/**
  * Default live probe for plan reuse: one light open-PR list per repo, read DIRECTLY from GitHub. It must never use the
  * host-shared PR snapshot (valid for ~75 s): that could hide a stand-down comment posted after the plan was made.
  * Throws when a row lacks `updatedAt`, so the cache fails closed to a full recompute.
@@ -860,7 +868,7 @@ export function createReconcilePlanCache({ reconcile = (input) => runReconcilePa
       // rows for notes.
       const { readPrs: _discovery, ...fresh } = input;
       const plan = filterRows(reconcile({ ...fresh,
-        readPrs: tap((o = {}) => defaultReadPrs({ ...o, exec: (...args) => execFileSyncThrottled(...args), attributionRepo: o.attributionRepo ?? o.repo })),
+        readPrs: tap(planFreshReadPrs(defaultReadPrs)),
         excuseMergeGateHolds: tap(input.excuseMergeGateHolds, excusePrMergeGateHolds),
         enrichCodeQL: tap(input.enrichCodeQL, enrichPrsWithCodeQL) }), touched.get(repo) ?? new Set());
       try { if (baseline && cacheable) entries.set(repo, { at: now(), baseline, allowStandDownAutoProceed,
@@ -1161,18 +1169,35 @@ export async function runTickAllRepos({
     repos, ...(planCache ? { reconcile: planCache.reconcile } : {}),
     ...(notesTick ? { tick: notesTick } : planCache ? { tick: (o) => planCache.notes(o.repo) ?? defaultReadNotesForRepo(o) } : {}), ...(notesDryRun == null ? {} : { dryRun: notesDryRun }),
   }));
-  // #3383 follow-up — tag EVERY freshly-dispatched fix/ci-heal session's PR right away, `fix`+`ci-heal`
+  // #3383 follow-up — tag confirmed freshly-dispatched fix/ci-heal sessions, `fix`+`ci-heal`
   // ONLY: `hungCi`/`mainRedRebase`/`missingRun` are mechanical git/gh actions with no live Claude session bound
   // to a `fix-<pr>`/`ci-heal-<pr>` name, so `review-status:*` (a label about a SESSION, not a mechanical patch)
   // has nothing to say about them. One try/catch per PR — the exact "cosmetic, never fails the tick" discipline
   // `we:scripts/conveyor/review-status-tag.mjs`'s own header already documents for this label family.
   const statusTags = [];
   if (typeof tagDispatchStatus === 'function') {
+    // Dispatch arrays also contain timeout requests and incomplete launch results. A minted slug alone
+    // proves nothing. Refusals from either half (including reconcile's no-findings) veto the same repo/PR.
+    const key = (row) => JSON.stringify([row.repo, String(row.pr ?? row.prNumber)]);
+    // A refusal that only says "a session is already live" (live-process / held / fix-claimed) is the echo of a
+    // launch that just succeeded, so it must not veto that launch's tag; every other kind is a real refusal.
+    const LIVE_ECHO = new Set(['live-process', 'held', 'fix-claimed']);
+    const refused = new Set([...fix.refusals, ...ciHeal.refusals,
+      ...(fix.reconcileRefusals ?? []), ...(ciHeal.reconcileRefusals ?? [])]
+      .filter(r => !LIVE_ECHO.has(r?.kind)).map(key));
+    const hasHandle = value => typeof value === 'string' && value.trim().length > 0 && !/^refused:/.test(value.trim());
+    const launched = d => d?.pr != null && d.kind !== 'ci-heal-salvage'
+      && !d.held && d.launched !== 'unverified' && d.ok !== false && !d.error && !d.refused && !d.failed
+      && !['failed', 'held', 'refused', 'error'].includes(d.status)
+      && !['failed', 'held', 'refused', 'error'].includes(d.outcome)
+      && d.claim?.ok !== false && !refused.has(key(d))
+      // Only the spawn handle (`agentId`, from the launcher's stdout) or a confirmed resume proves a session
+      // exists; a minted `sessionId` or an acquired claim both precede the launch and prove nothing.
+      && ((hasHandle(d.agentId) && d.agentId !== d.sessionId) || (d.resumed === true && hasHandle(d.sessionId)));
     for (const d of [...fix.dispatched, ...ciHeal.dispatched]) {
-      // A salvage push spawned no session — nothing for a session-status label to describe.
-      if (d?.pr == null || d.kind === 'ci-heal-salvage') continue;
+      if (!launched(d)) continue;
       try {
-        const result = tagDispatchStatus({ pr: d.pr, repo: d.repo });
+        const result = await tagDispatchStatus({ pr: d.pr, repo: d.repo });
         statusTags.push({ pr: d.pr, repo: d.repo, ...result });
       } catch (e) {
         statusTags.push({ pr: d.pr, repo: d.repo, changed: false, error: String((e && e.message) || e).split('\n')[0] });

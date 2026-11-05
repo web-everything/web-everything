@@ -51,6 +51,9 @@ afterEach(() => { interruption.boundary = null; dirs.splice(0).forEach(dir => rm
 const repo = 'web-everything/web-everything', pr = 7537, head = 'a'.repeat(40);
 const payload = () => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head }, diffText: '+code', netChangedFiles: ['scripts/example.mjs'] } } });
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+// The lookup orders review runs by their read-step start and fails closed (run-start-missing) when
+// several runs for one PR lack it, so synthetic runs carry an explicit start like real ones do.
+const readStartedAt = startedAt => ({ stepTimings: [{ step: 'read', stepIndex: 0, startedAt }] });
 function fixture({ status = 'running', foreign = false, seats = [], ageMs } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'we-7537-')); dirs.push(dir);
   const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_RED_TEAM_STALE_RUN_MS: '1000' };
@@ -59,7 +62,7 @@ function fixture({ status = 'running', foreign = false, seats = [], ageMs } = {}
   writeFileSync(path, JSON.stringify({ repo, pr, head, status, result: null, pid: 99999999,
     host: foreign ? 'foreign' : hostname(), pidNamespace: pidNamespace(), pidStart: ageMs ? new Date(Date.now() - ageMs).toISOString() : '2020-01-01T00:00:00Z', loopPayload: { findings: {} } }));
   const run = join(env.WE_SHARED_RUNS_DIR, 'review-pr-7537.json');
-  writeFileSync(run, JSON.stringify({ ...newRunRecord({ id: 'review-pr-7537', op: 'review-pr', input: { repo, pr } }), ...payload() }));
+  writeFileSync(run, JSON.stringify({ ...newRunRecord({ id: 'review-pr-7537', op: 'review-pr', input: { repo, pr } }), ...readStartedAt('2026-01-01T00:00:00.000Z'), ...payload() }));
   const probe = { host: hostname(), namespace: pidNamespace(), isAlive: () => false, readPidStart: () => '2020-01-01T00:00:00Z' };
   const readWitness = () => evidence.readRecoveryWitness({ ...key, runsDir: env.WE_SHARED_RUNS_DIR, readScorecards: () => seats });
   const decide = () => recovery.planRedTeamRecovery(readWitness(), { now: Date.now(), probe, deadlineMs: 1000 });
@@ -173,9 +176,9 @@ it.each([10, 12, 'status rewritten', 'marker removed', 'seat appended'])('B / ma
     const original = readFileSync(f.run, 'utf8'), at = statSync(f.run).mtimeMs;
     const older = join(f.env.WE_SHARED_RUNS_DIR, 'review-pr-7537-older-accept.json');
     const newer = join(f.env.WE_SHARED_RUNS_DIR, 'review-pr-7537-newer-reject.json');
-    writeFileSync(older, JSON.stringify({ ...newRunRecord({ id: 'review-pr-7537-older-accept', op: 'review-pr', input: { repo, pr } }), ...payload() }));
+    writeFileSync(older, JSON.stringify({ ...newRunRecord({ id: 'review-pr-7537-older-accept', op: 'review-pr', input: { repo, pr } }), ...readStartedAt('2025-12-31T00:00:00.000Z'), ...payload() }));
     utimesSync(older, new Date(at - 2000), new Date(at - 2000));
-    writeFileSync(newer, JSON.stringify({ ...newRunRecord({ id: 'review-pr-7537-newer-reject', op: 'review-pr', input: { repo, pr } }), ...payload(), verdict: { verdict: 'reject' } }));
+    writeFileSync(newer, JSON.stringify({ ...newRunRecord({ id: 'review-pr-7537-newer-reject', op: 'review-pr', input: { repo, pr } }), ...readStartedAt('2026-01-02T00:00:00.000Z'), ...payload(), verdict: { verdict: 'reject' } }));
     utimesSync(newer, new Date(at + 2000), new Date(at + 2000));
     expect(readFileSync(f.run, 'utf8')).toBe(original);
     expect(f.readWitness().newest).toMatchObject({ id: 'review-pr-7537-newer-reject', verdict: { verdict: 'reject' } });

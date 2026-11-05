@@ -9,9 +9,16 @@ export { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-s
 
 export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head, evidence = {}, env = {}, standingRuling = null } = {}) {
   const disposition = readRedTeamDisposition({ comments, pr, head, env, repo, standingRuling });
+  const broken = disposition.sendBack.length || disposition.held.length;
+  // Unknown run evidence holds, but after the break check: a recorded break still marks the PR blocked.
+  if (evidence.ok === false && !broken) {
+    const names = labels.map(label => typeof label === 'string' ? label : label?.name);
+    return { add: names.includes('red-team:pending') || names.includes('red-team:blocked') ? null : 'red-team:pending',
+      remove: names.filter(name => name === 'red-team:clear') };
+  }
   const verdict = evidence.status?.status === 'finished' ? evidence.status.result?.foldedVerdict : null;
   const finished = verdict === 'changes' ? 'red-team:blocked' : verdict === 'accept' ? 'red-team:clear' : null;
-  const desired = disposition.sendBack.length || disposition.held.length ? 'red-team:blocked'
+  const desired = broken ? 'red-team:blocked'
     : disposition.result ? 'red-team:clear'
       : finished ? finished
       : redTeamOwedOnHead({ read: evidence.loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly }) ? 'red-team:pending' : null;

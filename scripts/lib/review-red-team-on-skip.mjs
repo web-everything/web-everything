@@ -33,6 +33,7 @@ const pendingAbandonment = w => w.markers.redispatch?.priorWriter === w.rawWrite
 
 /** Pure decision on a raw witness. Probes and time are supplied by the caller. */
 export function planRedTeamRecovery(w, { now, probe, deadlineMs } = {}) {
+  if (w?.ok === false) return { mode: 'skip', why: w.reason };
   const raw = w.rawWriter.parsed;
   let executionPrior = raw;
   const reject = why => ({ rawWriter: w.rawWriter, executionPrior, mode: 'skip', why });
@@ -232,6 +233,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (redTeamForHead(rawPr.comments, pr, head) && (!journal || journal.step === 'done')) return skip('red-team result already on head');
       if (readWitness) {
         const w = readWitness({ repo, pr, head });
+        if (w?.ok === false) return skip(w.reason);
         if (['queued', 'running'].includes(w.rawWriter.parsed?.status) || w.rawWriter.parsed?.staleAbandoned) {
           const recovery = planRedTeamRecovery(w, recoveryOptions);
           return recovery.mode === 'skip' ? skip(recovery.why)
@@ -239,6 +241,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         }
       }
       const evidence = readEvidence({ repo, pr, head });
+      if (evidence?.ok === false) return skip(evidence.reason);
       if (evidence?.carryConflict) return skip('later review supersedes the carry');
       const unfinishedCarry = evidence?.carry && evidence.carry.step !== 'done';
       if (redTeamForHead(rawPr.comments, pr, head) && !unfinishedCarry) return skip('red-team result already on head');
