@@ -56,7 +56,12 @@ const DEFAULTS = Object.freeze({ verdictMode: 'model', preExistingMode: 'block',
 
 const isObj = v => v !== null && typeof v === 'object' && !Array.isArray(v);
 const validPaths = v => Array.isArray(v) && v.length <= 256 && v.every(p => typeof p === 'string' && p.trim().length > 0 && p.length <= 512);
-const validHashes = v => Array.isArray(v) && v.length <= 64 && v.every(h => typeof h === 'string' && /^[0-9a-f]{8,128}$/.test(h));
+// The same record shape findAudit reads (scripts/operations/codex-audit.mjs resolvePriorQuestionHashes): one
+// {hash, acceptUntil} object per prior question hash, the hash 64 lowercase hex characters. Two readers of one
+// settings key must agree, so a bare-string list (or any other shape) is invalid here too (PR #6381 merge).
+const HASH_64 = /^[a-f0-9]{64}(?![\s\S])/;
+const validHashes = v => Array.isArray(v) && v.length <= 64
+  && v.every(e => isObj(e) && typeof e.hash === 'string' && HASH_64.test(e.hash) && Number.isFinite(Date.parse(e.acceptUntil)));
 const validCount = v => Number.isInteger(v) && v >= 0 && v <= MAX_RECHECK;
 const enumOf = key => v => RANKS[key].includes(v);
 const VALID = Object.freeze({ verdictMode: enumOf('verdictMode'), preExistingMode: enumOf('preExistingMode'), releaseStage: enumOf('releaseStage'),
@@ -224,10 +229,15 @@ export function resolveAuditSettings({ path = AUDIT_SETTINGS_PATH, fileRead = re
     value[key] = Object.freeze([...new Set([...(strictest ? STRICTEST_PATHS : GUARD_FLOOR), ...list, ...envList])]);
     sources[key] = strictest ? 'strictest' : envList.length ? 'env' : list.length > platList.length ? 'file' : platList.length ? 'platform' : 'built-in';
   }
-  // Prior question hashes only widen what is ACCEPTED, so no env route exists; a bad list is empty.
-  // Any unreadable layer accepts none (strictest), like every single-value setting above.
-  const hashes = get(layered, 'priorQuestionHashes');
-  const hashesInvalid = malformed('priorQuestionHashes', validHashes) || (hashes !== undefined && !validHashes(hashes));
+  // Prior question hashes only widen what is ACCEPTED, so only the trusted file may set them: no env route, and the
+  // platform layer is ignored (as findAudit's reader ignores it — the team platform file must never widen acceptance).
+  // A bad list is empty. Any unreadable layer accepts none (strictest), like every single-value setting above.
+  if (isObj(plat) && Object.keys(plat).some(k => foldKey(k) === foldKey('priorQuestionHashes'))) {
+    warn('audit platform preference priorQuestionHashes ignored; only the trusted settings file may accept prior hashes');
+  }
+  const hashes = isObj(tool) ? tool.priorQuestionHashes : undefined;
+  const hashesInvalid = rawMalformed(tool, 'priorQuestionHashes', validHashes) || caseShadowed(tool, 'priorQuestionHashes')
+    || (hashes !== undefined && !validHashes(hashes));
   if (unreadable || !cascade || platBad || hashesInvalid) {
     if (hashesInvalid) warn('audit setting priorQuestionHashes invalid; none accepted');
     value.priorQuestionHashes = Object.freeze([]); sources.priorQuestionHashes = 'strictest';

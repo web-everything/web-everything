@@ -6498,7 +6498,10 @@ any unreadable or invalid value resolves to the strictest option, including a ma
 cascade would otherwise drop (an empty object at a setting, or a non-object where a section belongs) in either the
 platform or the file layer, and an unreadable, corrupt, `null` or non-object platform preference (every setting
 strictest, no prior question hashes accepted); an empty section sets nothing and counts as omitted; unknown
-(misspelled) keys are named in a warning; `allow` resolves to `block`. An environment value that does not parse
+(misspelled) keys are named in a warning; `allow` resolves to `block`. `audit.priorQuestionHashes` is a list of
+`{hash, acceptUntil}` records (the hash 64 lowercase hex characters), the same shape `findAudit` reads; only the
+settings file may set it (no environment route, and a platform value is ignored with a warning), and any invalid
+entry empties the whole list. An environment value that does not parse
 or is not a known option resolves to that setting's strictest option too. Path lists only add to the built-in
 guard floor: the concurrency modules (locks, leases including `scripts/lib/lane-lease.mjs`, slots, lane pool,
 merge, drain) and the guard hooks (`scripts/guard-*.mjs` and the other guard scripts) with their registration in

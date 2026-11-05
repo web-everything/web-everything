@@ -3,6 +3,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { AUDIT_SETTINGS_PATH, GUARD_FLOOR, resolveAuditSettings } from '../audit-settings.mjs';
+import { resolvePriorQuestionHashes } from '../../operations/codex-audit.mjs';
+
+const HASH_A = Object.freeze({ hash: 'a'.repeat(64), acceptUntil: '2026-12-01T00:00:00.000Z' });
+const HASH_B = Object.freeze({ hash: 'b'.repeat(64), acceptUntil: '2026-12-02T00:00:00.000Z' });
 
 const file = audit => () => JSON.stringify({ audit });
 const full = (over = {}) => ({ verdict: { mode: 'model' }, preExisting: { mode: 'block', baseRecheckMax: 3 }, releaseStage: 'prerelease',
@@ -69,7 +73,7 @@ describe('audit settings (R528)', () => {
     expect(r.value.raceBlockPaths).toEqual(STRICT_PATHS);
   });
   it('an unreadable tool file accepts no platform hashes', () => {
-    const r = resolveAuditSettings({ fileRead: () => { throw new Error('x'); }, platform: { priorQuestionHashes: ['deadbeef'] }, env: {}, log: () => {} });
+    const r = resolveAuditSettings({ fileRead: () => { throw new Error('x'); }, platform: { priorQuestionHashes: [HASH_A] }, env: {}, log: () => {} });
     expect(r.value.priorQuestionHashes).toEqual([]);
     expect(r.sources.priorQuestionHashes).toBe('strictest');
   });
@@ -148,7 +152,7 @@ describe('audit settings (R528)', () => {
     const plat = resolveAuditSettings({ fileRead: file(full()), platform: { releasestage: 'prod' }, env: {}, log: () => {} });
     expect(plat.value.releaseStage).toBe('prod');
     expect(plat.sources.releaseStage).toBe('strictest');
-    const hashes = resolve(full({ priorQuestionHashes: ['abcdef12'], PriorQuestionHashes: [] }));
+    const hashes = resolve(full({ priorQuestionHashes: [HASH_A], PriorQuestionHashes: [] }));
     expect(hashes.value.priorQuestionHashes).toEqual([]);
   });
   it.each(['releaseStage ', 'releaseStage\u200B', 'ｒeleaseStage', 'releaſeStage', ' release\tStage'])(
@@ -227,8 +231,39 @@ describe('audit settings (R528)', () => {
     expect(shipped.value.guardFloorPaths).toEqual(expect.arrayContaining(['scripts/guard-*', 'scripts/lib/lane-lease.mjs']));
   });
   it('prior question hashes have no env route and bad lists are empty', () => {
-    expect(resolve(full({ priorQuestionHashes: ['abcdef0123456789'] }), { WE_AUDIT_PRIOR_QUESTION_HASHES: '["deadbeefdeadbeef"]' }).value.priorQuestionHashes).toEqual(['abcdef0123456789']);
+    expect(resolve(full({ priorQuestionHashes: [HASH_A] }), { WE_AUDIT_PRIOR_QUESTION_HASHES: JSON.stringify([HASH_B]) }).value.priorQuestionHashes).toEqual([HASH_A]);
     expect(resolve(full({ priorQuestionHashes: ['zz'] })).value.priorQuestionHashes).toEqual([]);
+  });
+  // PR #6381 merge with AU1 PR-B: findAudit reads this same key through codex-audit.mjs. Both readers must agree on
+  // the record shape and on which layers may set it, or the first real entry is dropped by one of them.
+  it.each([
+    ['a valid record list', [HASH_A, HASH_B]],
+    ['a bare-string list (the old shape)', ['a'.repeat(64)]],
+    ['a short hash', [{ hash: 'abcdef12', acceptUntil: '2026-12-01T00:00:00.000Z' }]],
+    ['an uppercase hash', [{ hash: 'A'.repeat(64), acceptUntil: '2026-12-01T00:00:00.000Z' }]],
+    ['a hash with a trailing newline', [{ hash: `${'a'.repeat(64)}\n`, acceptUntil: '2026-12-01T00:00:00.000Z' }]],
+    ['an unparseable acceptUntil', [{ hash: 'a'.repeat(64), acceptUntil: 'soon' }]],
+    ['one invalid entry among valid ones', [HASH_A, { hash: 'zz', acceptUntil: '2026-12-01' }]],
+    ['an empty list', []],
+  ])('the audit resolver and findAudit read %s identically (PR #6381 merge)', (_, list) => {
+    const read = () => JSON.stringify({ audit: { priorQuestionHashes: list } });
+    const ours = resolveAuditSettings({ fileRead: read, platform: null, env: {}, log: () => {} }).value.priorQuestionHashes;
+    expect(ours).toEqual(resolvePriorQuestionHashes({ readFile: read, env: {} }));
+  });
+  it('platform prior question hashes never widen acceptance, as findAudit ignores them (PR #6381 merge)', () => {
+    const platform = { priorQuestionHashes: [HASH_B] };
+    const none = resolveAuditSettings({ fileRead: file(full()), platform, env: {}, log: () => {} });
+    expect(none.value.priorQuestionHashes).toEqual([]);
+    expect(none.warnings.join()).toMatch(/platform preference priorQuestionHashes ignored/);
+    const own = resolveAuditSettings({ fileRead: file(full({ priorQuestionHashes: [HASH_A] })), platform, env: {}, log: () => {} });
+    expect(own.value.priorQuestionHashes).toEqual([HASH_A]);
+    expect(own.sources.priorQuestionHashes).toBe('file');
+    // A case or invisible-character variant of the key in the platform layer is ignored the same way.
+    const shadow = resolveAuditSettings({ fileRead: file(full()), platform: { PriorQuestionHashes: [HASH_B] }, env: {}, log: () => {} });
+    expect(shadow.value.priorQuestionHashes).toEqual([]);
+  });
+  it('the shipped settings file reads the same prior question hashes through both readers (PR #6381 merge)', () => {
+    expect(resolveAuditSettings({ platform: null, env: {}, log: () => {} }).value.priorQuestionHashes).toEqual(resolvePriorQuestionHashes({ env: {} }));
   });
   it('is read from the running checkout, not the cwd or a candidate path argument in env', () => {
     const r = resolveAuditSettings({ platform: null, env: { WE_AUDIT_SETTINGS_PATH: '/tmp/evil.json' }, log: () => {} });
