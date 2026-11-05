@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
@@ -11,7 +11,7 @@ const git = (args, cwd) => execFileSync('git', args, {
   cwd, encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024,
 }).trim();
 let fixtureRoot, fixture, origin, reference, base, poolRoot, laneDir, marker, lease;
-function runPool(args, fault = '', remoteFault = '') {
+function runPool(args, fault = '', remoteFault = '', extraEnv = {}) {
   // `remoteFault` runs for the canonical-origin listing (the only ls-remote here: recovery is off), which executes
   // in the primary checkout rather than the lane.
   const preload = `import os from 'node:os'; import cp from 'node:child_process';
@@ -28,7 +28,7 @@ function runPool(args, fault = '', remoteFault = '') {
     '--branch=main', '--no-install', '--session=guard-holder', '--json'], {
     encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024,
     env: withGhStub({ ...process.env, LANE_POOL_NO_RECOVER: '1', LANE_POOL_AUTO_RECOVER: '0',
-      LANE_POOL_ROOT: poolRoot, WE_LANE_BACKUP_ROOT: join(base, 'backups') }),
+      LANE_POOL_ROOT: poolRoot, WE_LANE_BACKUP_ROOT: join(base, 'backups'), ...extraEnv }),
   });
   expect(result.error).toBeUndefined();
   return { ...result, data: result.stdout.trim() ? JSON.parse(result.stdout) : null };
@@ -44,7 +44,9 @@ function refused(result, sha) {
   expect(result.data.released).toBe(0);
   expect(result.stderr).toContain('UNPUSHED_WORK');
   if (sha) expect(result.stderr).toContain(sha.slice(0, 12));
-  expect(result.stderr).toContain(`git -C ${laneDir} push origin HEAD:refs/heads/`);
+  // The preservation command names the canonical origin the guard proves against, never the lane-writable `origin`.
+  expect(result.stderr).toContain(`git -C ${laneDir} push ${origin} HEAD:refs/heads/`);
+  expect(result.stderr).not.toContain(`git -C ${laneDir} push origin `);
   expect(result.stderr).toContain('--discard');
   expect(readFileSync(marker, 'utf8')).toBe(lease);
   expect(existsSync(laneDir)).toBe(true);
@@ -82,12 +84,12 @@ afterEach(() => {
 });
 
 describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector => {
-  const release = (extra = [], fault = '', remoteFault = '') => runPool(['release', selector, ...extra], fault, remoteFault);
+  const release = (extra = [], fault = '', remoteFault = '', extraEnv = {}) => runPool(['release', selector, ...extra], fault, remoteFault, extraEnv);
   it('refuses an unpushed commit and keeps the exact lease, even with --force', () => {
     const sha = commitWork();
     refused(release(['--force']), sha);
     const branch = git(['symbolic-ref', '--short', 'HEAD'], laneDir);
-    expect(release().stderr).toContain(`git -C ${laneDir} push origin HEAD:refs/heads/${branch}`);
+    expect(release().stderr).toContain(`git -C ${laneDir} push ${origin} HEAD:refs/heads/${branch}`);
     expect(git(['rev-parse', 'HEAD'], laneDir)).toBe(sha);
   });
   it('bulk release keeps unsafe work, releases a clean lane, and exits 1 at the end', () => {
@@ -359,7 +361,60 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     git(['checkout', '--quiet', '--detach'], laneDir);
     const result = release();
     refused(result, sha);
-    expect(result.stderr).toContain(`git -C ${laneDir} push origin HEAD:refs/heads/lane/lane-1-preserve`);
+    expect(result.stderr).toContain(`git -C ${laneDir} push ${origin} HEAD:refs/heads/lane/lane-1-preserve`);
+  });
+  it('names the canonical origin in the preservation command even when the lane origin points elsewhere', () => {
+    const sha = commitWork();
+    const decoy = join(base, 'decoy.git');
+    git(['init', '--quiet', '--bare', decoy]);
+    git(['remote', 'set-url', 'origin', decoy], laneDir);
+    const result = release();
+    refused(result, sha);
+    expect(result.stderr).not.toContain(`push ${decoy}`);
+  });
+  // Inherited git config env (command scope) outranks the lane's own config and, for GIT_CONFIG_PARAMETERS, even the
+  // indexed honest-reporting pins. Every release evidence read must drop it before installing its pins.
+  it.each([
+    ['GIT_CONFIG_PARAMETERS', { GIT_CONFIG_PARAMETERS: "'core.fileMode'='false'" }],
+    ['GIT_CONFIG_COUNT/KEY/VALUE', { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.fileMode', GIT_CONFIG_VALUE_0: 'false' }],
+  ])('refuses a pushed lane whose chmod is hidden by inherited %s', (_, env) => {
+    commitWork();
+    git(['push', '--quiet', 'origin', 'HEAD:refs/heads/work/preserved'], laneDir);
+    chmodSync(join(laneDir, 'seed.txt'), 0o755);
+    expect(execFileSync('git', ['status', '--porcelain', '--untracked-files=no'], {
+      cwd: laneDir, encoding: 'utf8', env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', ...env },
+    }).trim()).toBe('');
+    const result = release([], '', '', env);
+    refused(result);
+    expect(result.stderr).toContain('seed.txt');
+  });
+  it('refuses on a failed origin fetch rather than trusting unfetched origin tips', () => {
+    const other = join(base, 'other');
+    git(['clone', '--quiet', origin, other]);
+    writeFileSync(join(other, 'later.txt'), 'later\n');
+    git(['add', 'later.txt'], other);
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '-m', 'later'], other);
+    git(['push', '--quiet', 'origin', 'HEAD:main'], other);
+    const fault = "if (args.includes('fetch')) { const error = new Error('forced fetch failure'); error.code = 'EIO'; throw error; }";
+    const result = release([], fault);
+    refused(result, git(['rev-parse', 'HEAD'], laneDir));
+    expect(result.stderr).toContain('unpushed commits');
+  });
+  // Links and gitlinks are never content-compared: a flagged one is reported, not trusted, even when unchanged.
+  it.each(['symlink', 'gitlink'])('refuses a flagged %s entry without content-comparing it', shape => {
+    const name = shape === 'symlink' ? 'link' : 'sub';
+    if (shape === 'symlink') symlinkSync('seed.txt', join(laneDir, name));
+    else {
+      git(['init', '--quiet', join(laneDir, name)]);
+      git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '--allow-empty', '-m', 'one'], join(laneDir, name));
+    }
+    git(['add', name], laneDir);
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '-m', `add ${shape}`], laneDir);
+    git(['push', '--quiet', 'origin', `HEAD:refs/heads/work/${shape}`], laneDir);
+    git(['update-index', '--assume-unchanged', name], laneDir);
+    const result = release();
+    refused(result);
+    expect(result.stderr).toContain(`${name} (hidden by index flags)`);
   });
   it('proves against the canonical origin even when the lane has no remote-tracking refs', () => {
     git(['remote', 'remove', 'origin'], laneDir);
@@ -389,4 +444,30 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
       released(override);
       expect(override.stderr).toMatch(/WARNING.*--discard.*unreadable or exceeds/);
     });
+});
+
+// Single-lane only: the bound is per lane, and the fixture is heavy enough not to repeat for --all-pools.
+describe('release guard hidden-entry hash bound', () => {
+  const HIDDEN_ENTRY_HASH_LIMIT = 1000; // scripts/lane-pool.mjs
+  it('content-compares up to the limit of flagged entries, and fails closed past it with --discard as the fallback', () => {
+    const files = Array.from({ length: HIDDEN_ENTRY_HASH_LIMIT + 1 }, (_, i) => `many/f${i}.txt`);
+    mkdirSync(join(laneDir, 'many'));
+    for (const file of files) writeFileSync(join(laneDir, file), `${file}\n`);
+    git(['add', 'many'], laneDir);
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '-m', 'many'], laneDir);
+    git(['push', '--quiet', 'origin', 'HEAD:refs/heads/work/many'], laneDir);
+    git(['update-index', '--assume-unchanged', ...files.slice(0, HIDDEN_ENTRY_HASH_LIMIT)], laneDir);
+    const release = (extra = []) => runPool(['release', '--lane=1', ...extra]);
+    // At the limit: every flagged entry is hashed, all match, so the lane is clean. Re-acquire for the next case.
+    released(release());
+    expect(runPool(['acquire', '--lane=1', '--no-reset']).status).toBe(0);
+    lease = readFileSync(marker, 'utf8');
+    git(['update-index', '--assume-unchanged', files[HIDDEN_ENTRY_HASH_LIMIT]], laneDir);
+    const result = release();
+    refused(result);
+    expect(result.stderr).toContain('tracked status unreadable or exceeds');
+    const override = release(['--discard']);
+    released(override);
+    expect(override.stderr).toMatch(/WARNING.*--discard.*tracked status unreadable or exceeds/);
+  });
 });

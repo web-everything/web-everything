@@ -2840,9 +2840,17 @@ const withoutCommitGraph = env => {
   const at = Number.isInteger(n) && n > 0 ? n : 0;
   return { ...env, [`GIT_CONFIG_KEY_${at}`]: 'core.commitGraph', [`GIT_CONFIG_VALUE_${at}`]: 'false', GIT_CONFIG_COUNT: String(at + 1) };
 };
-const releaseEvidenceGit = (args, dir, opts = {}, extraEnv = {}) => tryGit(args, dir, {
-  ...opts, env: withoutCommitGraph(withHonestReportingPins({ ...readOnlyGitEnv(args).env, GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/nonexistent', ...extraEnv })),
-});
+// Inherited git config env is dropped first (PR #6319 send-back): GIT_CONFIG_PARAMETERS outranks the indexed pins below,
+// so an inherited `'core.fileMode'='false'` would hide a chmod from status, and GIT_CONFIG_GLOBAL/SYSTEM can re-scope
+// keys. Only the pins installed here (hardening, honest reporting, commit-graph off) are command-scope config.
+const releaseEvidenceEnv = (args, extraEnv = {}) => {
+  const base = scrubGitRepoEnv(isReadOnlyGit(args) ? { ...LANE_GIT_ENV, GIT_OPTIONAL_LOCKS: '0' } : LANE_GIT_ENV);
+  return withoutCommitGraph(withHonestReportingPins(laneGitHardeningEnv({
+    ...base, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_CONFIG_NOSYSTEM: '1',
+    GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/nonexistent', ...extraEnv,
+  })));
+};
+const releaseEvidenceGit = (args, dir, opts = {}, extraEnv = {}) => tryGit(args, dir, { ...opts, env: releaseEvidenceEnv(args, extraEnv) });
 // Stat-trust config (core.checkStat / core.trustctime / core.ignoreStat) is pinned to git's defaults by the shared lane
 // git env (scripts/lib/lane-git-hardening.mjs), for this read and every earlier refreshing status in the release flow.
 // A hand-forged index stat cache is not covered: a full content rehash costs minutes on a large lane (residual,
@@ -2954,6 +2962,12 @@ function releaseRedirectRefuses(dir, label) {
   return { reason: 'git-dir-redirected', details };
 }
 
+// The canonical origin as the salvage io resolves it (scripts/lib/lane-pool-salvage-push.mjs): a local path is made
+// absolute; a URL keeps its scheme and host, minus any userinfo.
+function releasePushTarget(url) {
+  if (!/^[^/]*:/.test(url)) return resolve(url);
+  return url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^@/]*@/i, '$1');
+}
 function releaseWorkRefuses(dir, label, salvage, proof) {
   const safe = value => String(value).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ');
   const quote = value => /^[a-zA-Z0-9_./:-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
@@ -2973,8 +2987,11 @@ function releaseWorkRefuses(dir, label, salvage, proof) {
     return false;
   }
   const branch = tryGit(['symbolic-ref', '--quiet', '--short', 'HEAD'], dir) || `lane/${basename(dir)}-preserve`;
+  // Push to the canonical origin the guard proves against: the lane's own `origin` remote is lane-writable, so a push
+  // there can land in a repository the retry never lists. Credentials in a URL are never echoed.
+  const target = proof?.url ? releasePushTarget(proof.url) : '<canonical-origin-url>';
   log(`  ${safe(label)}: UNPUSHED_WORK — ${details}; lane and lease kept. Preserve work (commit tracked changes first):\n` +
-    `    git -C ${quote(safe(dir))} push origin HEAD:refs/heads/${quote(safe(branch))}\n` +
+    `    git -C ${quote(safe(dir))} push ${quote(safe(target))} HEAD:refs/heads/${quote(safe(branch))}\n` +
     '    Push other unpushed local branches too, then retry release; pass --discard to deliberately release without preserving this work.');
   // Even when a caller ignores the exit code (the drain's release-on-land, a launch-failure un-reserve, the reaper),
   // the refusal leaves this loud journal line, and `--json` names the kept lane. Callers reading `kept`: #x3h0sng.
@@ -3086,7 +3103,8 @@ async function cmdReleaseAllPools(repo) {
         proofWhy = `origin of pool ${name} unresolved: ${msgOf(e)}`;
       }
       if (recoveryEnabled()) salvageIo = laneIo;
-      const proof = { io: salvageRepo?.originUrl ? laneIo : null, key: salvageRepo?.originUrl ? `${name}\0${salvageRepo.originUrl}` : null, why: proofWhy };
+      const proof = { io: salvageRepo?.originUrl ? laneIo : null, key: salvageRepo?.originUrl ? `${name}\0${salvageRepo.originUrl}` : null, why: proofWhy,
+        url: salvageRepo?.originUrl || null };
       scrubClaimedLaneConfig(dir, 'before release work check');
       cleanLaneLitter(dir);
       if (salvageIo) {
@@ -3296,7 +3314,8 @@ async function cmdRelease(repo) {
         else if (salvage.status === 'pushed') log(`  lane-${n}: salvaged to ${salvage.ref}`);
       }
     }
-    const refusedWork = releaseWorkRefuses(dir, `lane-${n}`, salvage, { io: laneIo, key: repo.originUrl ? `${repo.name}\0${repo.originUrl}` : null });
+    const refusedWork = releaseWorkRefuses(dir, `lane-${n}`, salvage, { io: laneIo, key: repo.originUrl ? `${repo.name}\0${repo.originUrl}` : null,
+      url: repo.originUrl || null });
     if (refusedWork) { kept.push({ lane: n, ...refusedWork }); continue; }
     releaseTestBarrier();
     if (!takeMarkerIf(dir, (moved) => sameLease(moved, lease), n)) {

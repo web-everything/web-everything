@@ -3921,7 +3921,11 @@ An unresolved origin or an unreadable listing refuses; every named pool in a fix
 its primary checkout (a sibling of the reference) so release can resolve that origin.
 Tracked changes are read with `--ignore-submodules=none`, and assume-unchanged / skip-worktree entries
 are compared by executable mode and content, so index flags and submodule-ignore config cannot hide an edit
-or a chmod.
+or a chmod. Past 1000 flagged entries the check fails closed; flagged links and gitlinks are reported, never trusted.
+Every evidence read drops inherited git config env first (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT/KEY/VALUE`,
+global and system config), so a caller's `core.fileMode=false` cannot hide a chmod. Tests pass such env through
+`runPool`'s `extraEnv`. The refusal's preservation command pushes to the canonical origin URL, not the lane's
+own `origin` remote, which the lane can rewrite.
 Known limit: other entries still trust the index stat cache, so a lane that hand-rewrites `.git/index`
 with stat fields matching an edited file reads clean. Release does not refuse that shape yet; the
 bounded content check is #xuuhfpf. Tests must not promise refusal for it until that lands.
