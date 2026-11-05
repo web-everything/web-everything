@@ -110,7 +110,7 @@ export function cloneNodeModulesInstaller(sourceRoot, { exec = execFileSync, fal
     let same = false;
     try { same = readFileSync(join(sourceRoot, 'package-lock.json'), 'utf8') === readFileSync(join(into, 'package-lock.json'), 'utf8'); } catch { same = false; }
     if (same && existsSync(src)) {
-      linkOrCopyNodeModules({ ...options, root: into, storeDir: sourceRoot, exec });
+      linkOrCopyNodeModules({ ...options, root: into, storeDir: sourceRoot, exec, referenceConsumer: into });
       return;
     }
     fallback(into);

@@ -5,18 +5,25 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  cpSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
-  realpathSync, renameSync, rmSync, statSync, writeFileSync,
+  chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
+  realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import * as deps from '../daemon-rebuild/deps-job.mjs';
-import { cloneNodeModulesInstaller } from '../daemon-rebuild/rebuild-job.mjs';
-import { ensureNodeModulesStore } from '../daemon-job-snapshots.mjs';
+import { cloneNodeModulesInstaller, REBUILD_JOB_KIND } from '../daemon-rebuild/rebuild-job.mjs';
+import { ensureNodeModulesStore, evictSnapshots, nodeModulesRef, setNodeModulesWritable } from '../daemon-job-snapshots.mjs';
+import { createJobStore, enqueueJob, prepareJobCode } from '../daemon-jobs-runtime.mjs';
+import { markClaimed, markLaunching } from '../daemon-jobs.mjs';
+import { withFileLock } from '../atomic-json-file.mjs';
 
 const temporary = [];
 afterEach(() => {
-  for (const dir of temporary.splice(0)) rmSync(dir, { recursive: true, force: true });
+  for (const dir of temporary.splice(0)) {
+    // Fixtures now contain frozen stores. Cleanup must not follow links into another store.
+    setNodeModulesWritable(dir, true);
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 function fixture() {
@@ -33,6 +40,8 @@ function fixture() {
     mkdirSync(join(into, 'node_modules'));
     writeFileSync(join(into, 'node_modules', '.package-lock.json'), '{"lockfileVersion":3,"packages":{}}');
     writeFileSync(join(into, 'node_modules', 'payload.txt'), 'store payload');
+    mkdirSync(join(into, 'node_modules', 'pkg'));
+    writeFileSync(join(into, 'node_modules', 'pkg', 'index.js'), 'export default 1;');
   });
   const store = ensureNodeModulesStore({ jobsDir: join(base, 'jobs'), sourceDir, install });
   const log = vi.fn();
@@ -144,6 +153,8 @@ describe('shared link-or-copy safety decision', () => {
 
   it('changed store content hash falls back to copy and logs an integrity mismatch', () => {
     const f = fixture();
+    // Deliberately bypass the new file protection to exercise the existing hash guard independently.
+    chmodSync(join(f.storeDir, 'node_modules', '.package-lock.json'), 0o644);
     writeFileSync(join(f.storeDir, 'node_modules', '.package-lock.json'), '{"tampered":true}');
     deps.linkOrCopyNodeModules({ ...f, depsMode: 'symlink' });
     expectCopied(f, /hash|integrity|mismatch|mutat/i);
@@ -151,7 +162,9 @@ describe('shared link-or-copy safety decision', () => {
 
   it('missing store integrity evidence fails closed to copy with a reason', () => {
     const f = fixture();
+    chmodSync(join(f.storeDir, 'node_modules'), 0o755);
     rmSync(join(f.storeDir, 'node_modules', '.package-lock.json'));
+    chmodSync(join(f.storeDir, 'node_modules'), 0o555);
     deps.linkOrCopyNodeModules({ ...f, depsMode: 'symlink' });
     expectCopied(f, /hash|integrity|evidence|missing|ENOENT/i);
   });
@@ -227,6 +240,7 @@ describe('both rebuild copy sites use the guarded decision', () => {
 
   it('cloneNodeModulesInstaller refuses a mutated store and logs its copy fallback', () => {
     const f = fixture();
+    chmodSync(join(f.storeDir, 'node_modules', '.package-lock.json'), 0o644);
     writeFileSync(join(f.storeDir, 'node_modules', '.package-lock.json'), '{"tampered":true}');
     cloneNodeModulesInstaller(f.storeDir, { exec: f.exec, depsMode: 'symlink', log: f.log })(f.root);
     expectCopied(f, /hash|integrity|mismatch|mutat/i);
@@ -277,5 +291,178 @@ describe('both rebuild copy sites use the guarded decision', () => {
     expect(rename).toHaveBeenCalledTimes(3);
     expect(f.exec).not.toHaveBeenCalled();
     expect(readFileSync(join(f.root, `.node_modules.old.${process.pid}`, 'old.txt'), 'utf8')).toBe('old');
+  });
+});
+
+describe('read-only dependency stores and rebuild consumer retention', () => {
+  it('completion freezes every package directory and file, and shared package writes are denied', () => {
+    const f = fixture();
+    for (const relative of ['', 'payload.txt', '.package-lock.json', 'pkg', 'pkg/index.js']) {
+      expect(statSync(join(f.storeDir, 'node_modules', relative)).mode & 0o222).toBe(0);
+    }
+    deps.linkOrCopyNodeModules(f);
+    expectLinked(f);
+    expect(() => writeFileSync(join(target(f), 'pkg', 'index.js'), 'mutated')).toThrow(/EACCES|EPERM/);
+    expect(readFileSync(join(target(f), 'pkg', 'index.js'), 'utf8')).toBe('export default 1;');
+  });
+
+  it('writable store mode falls back to a writable private copy and logs the integrity reason', () => {
+    const f = fixture();
+    chmodSync(join(f.storeDir, 'node_modules'), 0o755);
+    deps.linkOrCopyNodeModules(f);
+    expectCopied(f, /writable|readonly|read-only/i);
+    writeFileSync(join(target(f), 'pkg', 'index.js'), 'private change');
+    expect(readFileSync(join(f.storeDir, 'node_modules', 'pkg', 'index.js'), 'utf8')).toBe('export default 1;');
+  });
+
+  it('unreadable store permission evidence fails closed to copy with a log', () => {
+    const f = fixture();
+    const stat = (path) => new Proxy(statSync(path), {
+      get: (entry, key) => key === 'mode' ? undefined : Reflect.get(entry, key),
+    });
+    deps.linkOrCopyNodeModules({ ...f, stat });
+    expectCopied(f, /readonly|mode|unreadable/i);
+  });
+
+  it('eviction restores permissions and successfully deletes a read-only dependency store', () => {
+    const f = fixture();
+    expect(statSync(join(f.storeDir, 'node_modules', 'pkg')).mode & 0o222).toBe(0);
+    const result = evictSnapshots({ jobsDir: join(f.base, 'jobs'), referenced: [], keep: 0 });
+    expect(result.evicted).toEqual([nodeModulesRef(basename(f.storeDir))]);
+    expect(existsSync(f.storeDir)).toBe(false);
+  });
+
+  it('dry-run eviction leaves the store read-only and present', () => {
+    const f = fixture();
+    const result = evictSnapshots({ jobsDir: join(f.base, 'jobs'), referenced: [], keep: 0, dryRun: true });
+    expect(result.evicted).toHaveLength(1);
+    expect(statSync(join(f.storeDir, 'node_modules', 'pkg')).mode & 0o222).toBe(0);
+  });
+
+  it('freezing and evicting a store never chmods an external package symlink target', () => {
+    const f = fixture();
+    const external = join(f.base, 'external');
+    mkdirSync(external);
+    writeFileSync(join(external, 'package.js'), 'external');
+    const initialMode = statSync(join(external, 'package.js')).mode;
+    const other = ensureNodeModulesStore({
+      jobsDir: join(f.base, 'linked-jobs'), sourceDir: f.sourceDir,
+      install: (into) => {
+        mkdirSync(join(into, 'node_modules'));
+        symlinkSync(external, join(into, 'node_modules', 'workspace'), 'dir');
+      },
+    });
+    expect(statSync(join(external, 'package.js')).mode).toBe(initialMode);
+    evictSnapshots({ jobsDir: join(f.base, 'linked-jobs'), referenced: [], keep: 0 });
+    expect(existsSync(other.dir)).toBe(false);
+    expect(statSync(join(external, 'package.js')).mode).toBe(initialMode);
+  });
+
+  function runningRebuild(f) {
+    mkdirSync(join(f.base, 'rebuild-jobs'));
+    const store = createJobStore(join(f.base, 'rebuild-jobs'));
+    const record = enqueueJob({ store, kindDef: REBUILD_JOB_KIND, codeSha: 'abc123', input: { root: f.root } });
+    const prepared = prepareJobCode({
+      store, record, kindDef: REBUILD_JOB_KIND,
+      snapshot: {
+        materialize: (into) => {
+          for (const name of ['package.json', 'package-lock.json']) {
+            writeFileSync(join(into, name), readFileSync(join(f.sourceDir, name)));
+          }
+        },
+        install: cloneNodeModulesInstaller(f.storeDir, { exec: f.exec, log: f.log }),
+      },
+    });
+    const at = new Date().toISOString();
+    store.update(record.id, (fresh) => markClaimed(markLaunching(fresh, { at, ...prepared }), {
+      at, handle: 'fixture-host:123:fixture-start', host: 'fixture-host', pid: 123, procStart: 'fixture-start',
+    }));
+    expect(store.read(record.id).job.status).toBe('running');
+    expect(realpathSync(join(prepared.cwd, 'node_modules'))).toBe(realpathSync(join(f.storeDir, 'node_modules')));
+    return { store, prepared };
+  }
+
+  it('a store referenced by a running rebuild snapshot in another job store is not evicted', () => {
+    const f = fixture();
+    const { store, prepared } = runningRebuild(f);
+    expect(evictSnapshots({ jobsDir: store.dir, referenced: prepared.snapshotKeys, keep: 0 }).evicted).toEqual([]);
+    // The dependency job store has no knowledge of the rebuild record's snapshotKeys.
+    expect(evictSnapshots({ jobsDir: join(f.base, 'jobs'), referenced: [], keep: 0 }).evicted).toEqual([]);
+    expect(readFileSync(join(prepared.cwd, 'node_modules', 'payload.txt'), 'utf8')).toBe('store payload');
+    expect(f.exec).not.toHaveBeenCalled();
+  });
+
+  it('consumer eviction leaves the shared source frozen, then releases its reverse reference', () => {
+    const f = fixture();
+    const { store } = runningRebuild(f);
+    // No live refs supplied models the runtime after the job has finished.
+    evictSnapshots({ jobsDir: store.dir, referenced: [], keep: 0 });
+    expect(statSync(join(f.storeDir, 'node_modules')).mode & 0o222).toBe(0);
+    expect(evictSnapshots({ jobsDir: join(f.base, 'jobs'), referenced: [], keep: 0 }).evicted).toHaveLength(1);
+    expect(existsSync(f.storeDir)).toBe(false);
+  });
+
+  it('unreadable rebuild reference evidence retains the store and logs the fail-closed reason', () => {
+    const f = fixture();
+    runningRebuild(f);
+    const log = vi.fn();
+    const readFile = vi.fn(() => { throw Object.assign(new Error('reference denied'), { code: 'EACCES' }); });
+    expect(evictSnapshots({ jobsDir: join(f.base, 'jobs'), referenced: [], keep: 0, readFile, log }).evicted).toEqual([]);
+    expect(readFile).toHaveBeenCalled();
+    expect(messages(log)).toMatch(/retain.*evidence.*unreadable/i);
+    expect(existsSync(f.storeDir)).toBe(true);
+  });
+
+  it('failure to record a rebuild consumer reference falls back to a private copy and logs', () => {
+    const f = fixture();
+    writeFileSync(join(f.storeDir, '.node-modules-consumers'), 'not a directory');
+    cloneNodeModulesInstaller(f.storeDir, { exec: f.exec, log: f.log })(f.root);
+    expectCopied(f, /failed|ENOTDIR/i);
+  });
+
+  it('registration between eviction selection and deletion protects the newly linked consumer source', () => {
+    const f = fixture();
+    expect(existsSync(join(f.storeDir, '.node-modules-consumers'))).toBe(false);
+    const withLock = vi.fn((path, run, options) => {
+      // Eviction has selected an unreferenced store but has not acquired the deletion lock.
+      // Publish a real consumer in this precise gap, through the production lock implementation.
+      cloneNodeModulesInstaller(f.storeDir, { exec: f.exec, log: f.log })(f.root);
+      expectLinked(f);
+      return withFileLock(path, run, options);
+    });
+    const result = evictSnapshots({ jobsDir: join(f.base, 'jobs'), referenced: [], keep: 0, withLock });
+    expect(withLock).toHaveBeenCalledTimes(1);
+    expect(result.evicted).toEqual([]);
+    expectLinked(f);
+    expect(statSync(join(f.storeDir, 'node_modules')).mode & 0o222).toBe(0);
+  });
+
+  it('registration during a locked eviction falls back to a private copy before the source is deleted', () => {
+    const f = fixture();
+    const withLock = vi.fn((path, run, options) => withFileLock(path, () => {
+      // The publisher must use this SAME lock: it cannot publish a consumer behind eviction's back.
+      cloneNodeModulesInstaller(f.storeDir, { exec: f.exec, log: f.log })(f.root);
+      expectCopied(f, /registration.*failed|lock/i);
+      return run();
+    }, options));
+    const result = evictSnapshots({ jobsDir: join(f.base, 'jobs'), referenced: [], keep: 0, withLock });
+    expect(withLock).toHaveBeenCalledTimes(1);
+    expect(result.evicted).toEqual([nodeModulesRef(basename(f.storeDir))]);
+    expect(existsSync(f.storeDir)).toBe(false);
+    expectCopied(f);
+  });
+
+  it('a contended consumer lock makes eviction retain the frozen store and log the reason', () => {
+    const f = fixture();
+    const log = vi.fn();
+    const withLock = vi.fn((path, run, options) => withFileLock(path, () => {
+      // A competing publisher holds the real filesystem lock during the eviction attempt.
+      return withFileLock(path, run, options);
+    }, options));
+    expect(evictSnapshots({ jobsDir: join(f.base, 'jobs'), referenced: [], keep: 0, withLock, log }).evicted).toEqual([]);
+    expect(withLock).toHaveBeenCalledTimes(1);
+    expect(messages(log)).toMatch(/retaining.*lock unavailable/i);
+    expect(statSync(join(f.storeDir, 'node_modules')).mode & 0o222).toBe(0);
+    expect(readFileSync(join(f.storeDir, 'node_modules', 'payload.txt'), 'utf8')).toBe('store payload');
   });
 });
