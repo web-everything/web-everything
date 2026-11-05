@@ -222,6 +222,13 @@ describe('settlement reads fresh PR state and result evidence', () => {
     mod.runRedTeamOnSkip(o);
     expect(o.syncLabels).not.toHaveBeenCalled();
   });
+  it('an uppercase-marker comment with an indented confirmed break also blocks clearing', () => {
+    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: {}, recorded: false, seatRecorded: false })), readIgnorableConfirms: () => [] });
+    o.rawPrs[0].comments.push(resultComment(), { author: { login: 'web-everything' },
+      body: `${redTeamMarker(pr, head).toUpperCase()}\nRed team not required on this head: x\n  1. [**confirmed**] (edge-case, broken) — hidden` });
+    mod.runRedTeamOnSkip(o);
+    expect(o.syncLabels).not.toHaveBeenCalled();
+  });
   it('a throwing result evidence read settles nothing and reports settleError', () => {
     const o = runFixture({ readEvidence: () => { throw Error('fresh evidence offline'); } });
     o.rawPrs[0].comments.push(resultComment());
