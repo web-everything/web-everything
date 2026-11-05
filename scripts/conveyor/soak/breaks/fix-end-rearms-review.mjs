@@ -35,6 +35,8 @@ const FIX_MARKERS = {
     'advisoryReview = null, reviewAfterFix = null,',
     'if (advisoryReview || reviewAfterFix) {',
     'why: advisoryReview?.why ?? reviewAfterFix',
+    ': { reviewAfterFix: why }),',
+    "const why = 'the fixer released a new head after the last review — its review is owed before another repair';",
     "reason: 'fix-pushed'",
     "phase === 'needs-human' ? operatorSendBackAfterReview(pr) : null",
   ],

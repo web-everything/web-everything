@@ -42,6 +42,7 @@ it.each([
   ['review-after-fix consumer signature', CORE, 'advisoryReview = null, reviewAfterFix = null,'],
   ['review-after-fix consumer branch', CORE, 'if (advisoryReview || reviewAfterFix) {'],
   ['review-after-fix consumer reason', CORE, 'why: advisoryReview?.why ?? reviewAfterFix'],
+  ['non-human review-after-fix producer', CORE, ': { reviewAfterFix: why }),'],
   ['release/review thread order', CORE, 'release.index > lastReview.index'],
   ['send-back/review thread order', CORE, 'item.index <= review.index'],
   ['one-shot consumption', CORE, 'operatorSendBackRearm(pr, { verdictId: pr.comments[item.index].id })'],
