@@ -125,7 +125,7 @@ import { retryTransientGit } from './lib/git-fetch-retry.mjs';
 import { healLaneRefs, diagnoseLane, quarantineLane, looksLikeCorruption, looksLikeCommitGraphError, healSharedCommitGraph } from './lib/lane-repair.mjs';
 // #4122 — the free-lane list `acquire`'s auto-pick reads as a fast pre-filter before paying for its own scan
 // (see that module's own header for the full incident/design writeup).
-import { readFreeLaneList, isFreeLaneListFresh, freeLaneCandidates, resolveFreeLaneListPath, DEFAULT_FREE_LANE_LIST_MAX_AGE_MS, FREE_LANE_LIST_MAX_AGE_ENV } from './lib/free-lane-list.mjs';
+import { readFreeLaneList, isFreeLaneListFresh, freeLaneCandidates, resolveFreeLaneListPath, touchFreeLaneList, isProvablyCleanAndPushed, DEFAULT_FREE_LANE_LIST_MAX_AGE_MS, FREE_LANE_LIST_MAX_AGE_ENV } from './lib/free-lane-list.mjs';
 // #2560 — lane-pool may freely import readiness (confirmed no circular import): the advisory scope-lease check
 // at acquire. normScope normalizes the declared `--scope`; candidateLaunch is the pure overlap-at-launch query.
 import { normScope } from './readiness/scope-lease.mjs';
@@ -2253,6 +2253,11 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
   return dir;
 }
 
+// Event-driven free-lane-list refresh (acquire/release/trim): see free-lane-list.mjs#touchFreeLaneList.
+const touchFreeList = (repo, lane, free) => touchFreeLaneList({
+  path: resolveFreeLaneListPath({ repoName: repo.name, poolDir: repo.poolDir }), repoName: repo.name, poolDir: repo.poolDir, lane, free,
+});
+
 async function cmdAcquire(repo) {
   const assertExpectedHolder = (dir) => {
     if (flags['expect-holder'] === undefined) return;
@@ -2500,6 +2505,10 @@ async function cmdAcquire(repo) {
     // the SAME static list again on a later poll tick, which would just re-try the identical dead ends until
     // `--wait-ms` ran out instead of ever reaching the scan.
     let freeListExhausted = !freeList;
+    // The `--no-reset` guard's live remote heads: ONE lazy ls-remote per acquire call (only if a candidate is ahead),
+    // shared by every candidate. A failed probe is an empty set, so an ahead lane then fails closed.
+    let noResetRemoteShasValue = null;
+    const noResetRemoteShas = () => (noResetRemoteShasValue ??= liveRemoteShas(repo));
     while (chosen === null) {
       // #3383 — the scan's own budget is now the FULL configured/default scan timeout (`--scan-timeout-ms` /
       // `LANE_POOL_LIST_SCAN_TIMEOUT_MS`), never shrunk to this caller's OWN remaining `--wait-ms`: the
@@ -2511,7 +2520,7 @@ async function cmdAcquire(repo) {
       let candidateDirs;
       let usingFreeList = false;
       if (!freeListExhausted) {
-        const freeCands = freeLaneCandidates(freeList, { exclude: excluded });
+        const freeCands = freeLaneCandidates(freeList, { exclude: excluded, nowMs: Date.now(), maxAgeMs: freeListMaxAgeMs() });
         if (freeCands.length) {
           candidateDirs = freeCands.map((n) => laneDir(repo, n));
           usingFreeList = true;
@@ -2573,6 +2582,16 @@ async function cmdAcquire(repo) {
         // blip, the #2924 re-verify, a bad `--base`, an npm hiccup) — none of which are reasons to give up on
         // every OTHER candidate this pool might still offer.
         try {
+          // `--no-reset` skips every dirty/ahead check inside provisionClaimedLane, but a lane named by the (possibly
+          // event-refreshed) free list may have changed since it was published: auto-pick may only hand out a lane
+          // PROVEN clean and fully pushed right now. A failed probe is not proof, so it is refused too. The bar is the
+          // scan's own (`effectiveDirtyOrAhead`: litter-only dirt is clean; an ahead commit counts as pushed only if a
+          // LIVE remote head contains it or it is patch-equivalent, e.g. squash-merged) — never a stricter or looser
+          // hand-rolled one, and never a possibly-stale local remote-tracking ref.
+          if (flags['no-reset']) {
+            const doa = effectiveDirtyOrAhead(laneDir(repo, pick), repo.branch, noResetRemoteShas);
+            if (doa.probeFailed || doa.dirty || doa.ahead !== 0) throw new Error(`lane-${pick} is not provably clean and pushed (dirty=${doa.dirty}, ahead=${doa.ahead}, probeFailed=${doa.probeFailed}) — --no-reset will not hand it out`);
+          }
           provisionClaimedLane(repo, pick, false); // auto-pick never targets a reserved lane
           chosen = pick;
           break;
@@ -2783,6 +2802,7 @@ async function cmdAcquire(repo) {
   }
   if (occupant) log(`  occupant: ${occupant} (--adopt) — Edit/Write from any OTHER session is now refused (#2997)`);
   else log(`  occupant: NOT declared — hand this lane off with \`node scripts/lane-pool.mjs adopt --lane=${chosen}\` run BY the agent that will work in it (or re-run acquire with --adopt if that is you); until then the Edit/Write guard stays fail-open for this lane`);
+  touchFreeList(repo, chosen, false);
   if (flags.json) process.stdout.write(JSON.stringify({ lane: chosen, path: dir, session, holder: holderSlug, workerSession: occupant, purpose: flags.purpose || null, branch: repo.branch, base: flags.base || null, reserved: !!flags.reserve }, null, 2) + '\n');
   else process.stdout.write(dir + '\n'); // stdout = path only, so `LANE=$(… acquire)` captures it clean
 }
@@ -3128,6 +3148,10 @@ async function cmdRelease(repo) {
     // `release --force` reclaim, which delegates here) leaves the registry pointing at a lane that is free
     // again, and conveyor-state.mjs's health-stall scan overcounts `building` forever.
     unmapLanes({ ...repo, referencePath: repo.registryReferencePath || repo.referencePath }, [n]);
+    // Only a lane PROVEN clean and IN SYNC with the integration branch right now is published as free. Stricter than the
+    // scan's bar (an ahead-but-pushed lane is not published; the scan can still find it), so a lane is never over-advertised.
+    const afterRelease = isReservedLease(lease) ? null : laneStateSnapshot(dir, `origin/${repo.branch}`);
+    touchFreeList(repo, n, isProvablyCleanAndPushed(afterRelease, { requireInSync: true }));
     log(`  released lane-${n} (was ${describeLease(lease)})`);
     released++;
   }
@@ -4302,6 +4326,7 @@ function cmdTrim(repo) {
     }
     unmapLanes(repo, [...toRemoveSet]); // stop proxying a lane before its files are deleted (#2139)
     for (const t of trashed) rmSync(t, { recursive: true, force: true });
+    for (const t of toRemoveSet) touchFreeList(repo, t, false);
     invalidateListCache(repo); // #xn432dz — the pool shape changed
   }
 

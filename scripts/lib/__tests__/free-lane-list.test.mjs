@@ -20,6 +20,7 @@ import {
   resolveFreeLaneListPath,
   readFreeLaneList,
   writeFreeLaneListAtomic,
+  isProvablyCleanAndPushed,
 } from '../free-lane-list.mjs';
 
 const T0 = Date.parse('2026-09-25T16:00:00.000Z');
@@ -27,7 +28,7 @@ const T0 = Date.parse('2026-09-25T16:00:00.000Z');
 describe('parseFreeLaneList', () => {
   it('parses a well-formed list', () => {
     const text = JSON.stringify({ v: 1, writtenAt: T0, repo: 'web-everything', poolDir: '/pool', lanes: [{ lane: 3, path: '/pool/lane-3', head: 'abc123', branch: 'main' }] }) + '\n';
-    expect(parseFreeLaneList(text)).toEqual({ v: 1, writtenAt: T0, repo: 'web-everything', poolDir: '/pool', lanes: [{ lane: 3, path: '/pool/lane-3', head: 'abc123', branch: 'main' }] });
+    expect(parseFreeLaneList(text)).toEqual({ v: 1, writtenAt: T0, repo: 'web-everything', poolDir: '/pool', lanes: [{ lane: 3, path: '/pool/lane-3', head: 'abc123', branch: 'main', at: T0 }] });
   });
   it('null on empty/missing text', () => {
     expect(parseFreeLaneList('')).toBeNull();
@@ -49,7 +50,7 @@ describe('parseFreeLaneList', () => {
     const parsed = parseFreeLaneList(JSON.stringify({
       v: 1, writtenAt: T0, repo: 'x', lanes: [{ lane: 'not-a-number' }, { lane: -1 }, { lane: 5, path: '/p/lane-5' }],
     }));
-    expect(parsed.lanes).toEqual([{ lane: 5, path: '/p/lane-5', head: null, branch: null }]);
+    expect(parsed.lanes).toEqual([{ lane: 5, path: '/p/lane-5', head: null, branch: null, at: T0 }]);
   });
   it('an array or non-object top level is not a valid list', () => {
     expect(parseFreeLaneList('[]')).toBeNull();
@@ -83,7 +84,7 @@ describe('buildFreeLaneList', () => {
   });
   it('dedupes by lane number, keeping the first occurrence', () => {
     const list = buildFreeLaneList({ repoName: 'we', writtenAt: T0, lanes: [{ lane: 4, head: 'first' }, { lane: 4, head: 'second' }] });
-    expect(list.lanes).toEqual([{ lane: 4, path: null, head: 'first', branch: null }]);
+    expect(list.lanes).toEqual([{ lane: 4, path: null, head: 'first', branch: null, at: T0 }]);
   });
   it('drops non-integer / negative lane numbers', () => {
     const list = buildFreeLaneList({ repoName: 'we', writtenAt: T0, lanes: [{ lane: -1 }, { lane: 'x' }, { lane: 3 }] });
@@ -170,5 +171,32 @@ describe('read/write IO shell', () => {
     const path = join(dir, 'corrupt.json');
     writeFileSync(path, '{not valid json');
     expect(readFreeLaneList(path)).toBeNull();
+  });
+});
+
+describe('freeLaneCandidates per-entry age', () => {
+  it('drops entries older than the limit even when the list itself is fresh', () => {
+    const list = { v: 1, writtenAt: 1_000_000, repo: 'r', poolDir: null, lanes: [{ lane: 1, at: 1_000_000 - 700_000 }, { lane: 2, at: 1_000_000 - 1000 }] };
+    expect(freeLaneCandidates(list, { nowMs: 1_000_000, maxAgeMs: 600_000 })).toEqual([2]);
+    expect(freeLaneCandidates(list)).toEqual([1, 2]);
+  });
+});
+
+describe('isProvablyCleanAndPushed (the shared no-reset / release-publication bar)', () => {
+  const ok = { workDirty: 0, unpushedCommits: 0, ahead: 0 };
+  it.each([
+    ['clean + pushed', ok, {}, true],
+    ['litter-only dirt is already folded into workDirty=0', { ...ok, dirty: 2 }, {}, true],
+    ['real dirt', { ...ok, workDirty: 1 }, {}, false],
+    ['an unpushed commit', { ...ok, unpushedCommits: 1 }, {}, false],
+    ['failed dirt probe (null)', { ...ok, workDirty: null }, {}, false],
+    ['failed unpushed probe (null)', { ...ok, unpushedCommits: null }, {}, false],
+    ['missing fields', {}, {}, false],
+    ['no snapshot', null, {}, false],
+    ['ahead of origin is fine without requireInSync', { ...ok, ahead: 2 }, {}, true],
+    ['ahead of origin fails requireInSync', { ...ok, ahead: 2 }, { requireInSync: true }, false],
+    ['unknown ahead fails requireInSync', { ...ok, ahead: null }, { requireInSync: true }, false],
+  ])('%s', (_name, snap, opts, expected) => {
+    expect(isProvablyCleanAndPushed(snap, opts)).toBe(expected);
   });
 });
