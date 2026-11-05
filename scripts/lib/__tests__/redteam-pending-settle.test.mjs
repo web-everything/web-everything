@@ -46,7 +46,7 @@ function runFixture(over = {}) {
   return { ...f, plan: { refusals: f.refusals }, now: () => f.now, env: {},
     readWitness: null, readReviews: vi.fn(() => []), proveMove: () => ({ ok: false }),
     capacity: { lanes: 1, budget: { left: 1 } }, dispatch: vi.fn(() => ({ jobPid: 42 })),
-    settlePending: vi.fn(), syncLabels: vi.fn(), settle: vi.fn(() => ({ outcome: 'policy-clear' })), ...over };
+    settlePending: vi.fn(), escalate: vi.fn(), syncLabels: vi.fn(), settle: vi.fn(() => ({ outcome: 'policy-clear' })), ...over };
 }
 function carryFixture() {
   const f = fixture({ readEvidence: () => evidence({ loopPayload: undefined }) });
@@ -109,11 +109,14 @@ describe('planner settlement annotations', () => {
   });
 });
 
-describe('pending alone is not a policy-clear conflict', () => {
+describe('pending-only conflict settles before the next recovery tick', () => {
   const pathFixture = path => path === 'carry' ? carryFixture()
     : fixture({ readEvidence: () => evidence({ loopPayload: undefined }) });
-  it.each(['needsReview', 'carry'])('%s proceeds normally with accepted plus lone pending', path => {
-    expect(decide(pathFixture(path))).toMatchObject({ action: path === 'carry' ? 'carry' : 'review' });
+  it.each(['needsReview', 'carry'])('%s skips until lone pending is removed', path => {
+    const f = pathFixture(path);
+    expect(decide(f)).toMatchObject({ action: 'skip', why: 'conflicting label prevents policy-clear', settle: 'pending-only-conflict' });
+    f.rawPrs[0].labels = ['review:accepted'];
+    expect(decide(f)).toMatchObject({ action: path === 'carry' ? 'carry' : 'review' });
   });
   it.each(['needsReview', 'carry'].flatMap(path => ['red-team:blocked', 'review:changes'].map(label => [path, label])))(
     '%s escalates the real conflict %s', (path, label) => {
@@ -156,19 +159,19 @@ describe.each(['readWitness', 'readEvidence'])('never-reviewed head recovery thr
     f[reader] = vi.fn(() => ({ ok: false, reason: 'review-unfinished' }));
     return f;
   }
-  it.each(['accepted', 'unaccepted'])('%s head with no review requests a full review despite lone pending', acceptance => {
+  it.each(['accepted', 'unaccepted'])('%s never-reviewed head skips to settle lone pending before a full review', acceptance => {
     const f = neverReviewedFixture();
     if (acceptance === 'unaccepted') {
       f.rawPrs[0].labels = ['red-team:pending']; f.rawPrs[0].comments = [];
     }
     const row = decide(f);
-    expect(row).toMatchObject({ action: 'review', head });
-    expect(row.why).toMatch(/head.*never.*reviewed/i);
-    expect(row).not.toHaveProperty('settle');
+    expect(row).toMatchObject({ action: 'skip', head, why: 'conflicting label prevents policy-clear', settle: 'pending-only-conflict' });
+    f.rawPrs[0].labels = f.rawPrs[0].labels.filter(l => l !== 'red-team:pending');
     expect(f.headNeverReviewed).toHaveBeenCalledOnce();
     expect(f.headNeverReviewed).toHaveBeenCalledWith({ repo, pr, head, rawPr: f.rawPrs[0] });
     expect(f.readIgnorableConfirms).toHaveBeenCalledOnce();
     expect(f[reader]).toHaveBeenCalledOnce();
+    expect(decide(f)).toMatchObject({ action: 'review', head, why: 'head never reviewed; full review required' });
   });
   it.each([
     ['blocked label', f => { f.rawPrs[0].labels.push('red-team:blocked'); }, /conflicting label prevents policy-clear/],
@@ -178,23 +181,23 @@ describe.each(['readWitness', 'readEvidence'])('never-reviewed head recovery thr
     ['later verdict', f => { f.rawPrs[0].comments.push(trusted('❌ review — changes requested')); }, /later verdict or hold supersedes acceptance/],
     ['later body-derived hold', f => { f.rawPrs[0].comments.push(trusted('manifest baseline mismatch')); }, /later verdict or hold supersedes acceptance/],
     ['formal hold without acceptance', f => {
-      f.rawPrs[0].labels = ['red-team:pending']; f.rawPrs[0].comments = [];
+      f.rawPrs[0].labels = []; f.rawPrs[0].comments = [];
       f.rawPrs[0].reviews = [{ state: 'CHANGES_REQUESTED', submittedAt: iso(acceptedAt + 1) }];
     }, /formal review hold prevents full review/],
     ['unreadable reviews without acceptance', f => {
-      f.rawPrs[0].labels = ['red-team:pending']; f.rawPrs[0].comments = []; f.rawPrs[0].reviews = null;
+      f.rawPrs[0].labels = []; f.rawPrs[0].comments = []; f.rawPrs[0].reviews = null;
     }, /PR reviews unreadable/],
   ])('refuses never-reviewed recovery for %s', (_name, mutate, why) => {
-    const f = neverReviewedFixture(); mutate(f);
+    const f = neverReviewedFixture(); f.rawPrs[0].labels = ['review:accepted']; mutate(f);
     const row = decide(f); expect(row.action).toBe('skip'); expect(row.why).toMatch(why);
     expect(row).not.toHaveProperty('settle');
   });
   it('applies dispatchDecision retry cooldown to never-reviewed recovery', () => {
-    const f = neverReviewedFixture(); f.lastDispatch.set(`${repo}#${pr}@${head}`, f.now - 1);
+    const f = neverReviewedFixture(); f.rawPrs[0].labels = ['review:accepted']; f.lastDispatch.set(`${repo}#${pr}@${head}`, f.now - 1);
     expect(decide(f)).toMatchObject({ action: 'skip', why: 'retry cooldown active' });
   });
   it('permits review at the retry cooldown boundary', () => {
-    const f = neverReviewedFixture();
+    const f = neverReviewedFixture(); f.rawPrs[0].labels = ['review:accepted'];
     f.lastDispatch.set(`${repo}#${pr}@${head}`, f.now - f.setting.retryCooldownMin * 60_000);
     expect(decide(f)).toMatchObject({ action: 'review' });
   });
@@ -211,7 +214,7 @@ describe.each(['readWitness', 'readEvidence'])('never-reviewed head recovery thr
     expect(f.headNeverReviewed).not.toHaveBeenCalled();
   });
   it('dispatches the never-reviewed full review with only repo and pr', () => {
-    const f = neverReviewedFixture();
+    const f = neverReviewedFixture(); f.rawPrs[0].labels = ['review:accepted'];
     const o = runFixture({ ...f, now: () => f.now });
     const out = mod.runRedTeamOnSkip(o);
     expect(out.rows[0]).toMatchObject({ action: 'review' });
@@ -232,6 +235,9 @@ describe('headNeverReviewedFromRuns complete bounded proof', () => {
     expect(mod.headNeverReviewedFromRuns, 'export the complete never-reviewed-head scanner').toBeTypeOf('function');
     return mod.headNeverReviewedFromRuns(f);
   }
+  it.each([{}, [], { op: 'review-pr' }, { op: 'review-pr', input: { repo } }])('malformed review run cannot prove an unreviewed head: %j', record => {
+    expect(scan(scanFixture({ 'review-pr-malformed': record }))).toBe(false);
+  });
   it('proves an empty completed scan has never reviewed the head', () => {
     expect(scan(scanFixture())).toBe(true);
   });
@@ -290,6 +296,9 @@ describe('ignorableConfirmRunIds chronology and closed scan', () => {
     expect(latestAcceptRecord(f.comments, f.reviews)).toMatchObject({ sha: head, laterVerdict: false, laterBodyDerivedHold: false });
     expect(scan(f)).toEqual({ ok: true, ids: ['review-pr-confirm'] });
     expect(f.read.mock.calls.map(([id]) => id)).not.toContain('other-op');
+  });
+  it.each([{}, [], { op: 'review-pr' }, { op: 'review-pr', input: { repo } }])('malformed review run invalidates all ignorable ids: %j', record => {
+    expect(scan(scanFixture({ 'review-pr-confirm': run(), 'review-pr-malformed': record }))).toEqual({ ok: false, ids: [] });
   });
   it('accepts object-shaped accepted labels', () => {
     const f = scanFixture(); f.labels = [{ name: 'review:accepted' }];
@@ -360,6 +369,50 @@ describe('ignorableConfirmRunIds chronology and closed scan', () => {
 });
 
 describe('runner settles pending without dispatch', () => {
+  it.each(['carry', 'needsReview'])('%s removes only a pending-only conflict and proceeds on the next tick', path => {
+    const f = path === 'carry' ? carryFixture() : fixture({ readEvidence: () => evidence({ loopPayload: undefined }) });
+    const o = runFixture({ ...f, now: () => f.now });
+    o.settlePending.mockImplementation(() => { f.rawPrs[0].labels = ['review:accepted']; });
+    expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip',
+      why: 'conflicting label prevents policy-clear', settle: 'pending-only-conflict' });
+    expect(o.settlePending).toHaveBeenCalledOnce();
+    expect(o.settlePending).toHaveBeenCalledWith({ repo, pr, head, remove: ['red-team:pending'] });
+    expect(o.dispatch).not.toHaveBeenCalled(); expect(o.settle).not.toHaveBeenCalled();
+    expect(o.escalate).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled();
+    expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 } });
+    expect(decide(f).action).toBe(path === 'carry' ? 'carry' : 'review');
+  });
+  it('pending-only settlement failure preserves why and retains the guard for the next tick', () => {
+    const o = runFixture({ readEvidence: () => evidence({ loopPayload: undefined }) });
+    o.settlePending.mockImplementation(() => { throw Error('labels offline'); });
+    expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip',
+      why: 'conflicting label prevents policy-clear', settle: 'pending-only-conflict', settleError: 'labels offline' });
+    expect(o.rawPrs[0].labels).toContain('red-team:pending');
+    expect(o.dispatch).not.toHaveBeenCalled(); expect(o.escalate).not.toHaveBeenCalled();
+  });
+  it('escalation failure preserves why and never removes real conflicts', () => {
+    const o = runFixture({ readEvidence: () => evidence({ loopPayload: undefined }) });
+    o.rawPrs[0].labels.push('red-team:blocked');
+    o.escalate.mockImplementation(() => { throw Error('feed offline'); });
+    expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', escalate: true,
+      why: 'conflicting label prevents policy-clear', settleError: 'feed offline' });
+    expect(o.settlePending).not.toHaveBeenCalled(); expect(o.settle).not.toHaveBeenCalled();
+  });
+  it.each(['pending', 'real conflict'])('default settlement is inert under test for %s', kind => {
+    const o = runFixture({ readEvidence: () => evidence({ loopPayload: undefined }),
+      settlePending: undefined, escalate: undefined });
+    if (kind === 'real conflict') o.rawPrs[0].labels.push('red-team:blocked');
+    const row = mod.runRedTeamOnSkip(o).rows[0];
+    expect(row.why).toBe('conflicting label prevents policy-clear');
+    expect(row).not.toHaveProperty('settleError');
+    expect(o.settle).not.toHaveBeenCalled(); expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it.each(['pending', 'real conflict'])('dryRun never settles a guard conflict: %s', kind => {
+    const o = runFixture({ dryRun: true, readEvidence: () => evidence({ loopPayload: undefined }) });
+    if (kind === 'real conflict') o.rawPrs[0].labels.push('red-team:blocked');
+    mod.runRedTeamOnSkip(o);
+    expect(o.settlePending).not.toHaveBeenCalled(); expect(o.escalate).not.toHaveBeenCalled();
+  });
   it('not-owed removes only pending and never adds a label', () => {
     const o = runFixture(); const out = mod.runRedTeamOnSkip(o);
     expect(o.settlePending).toHaveBeenCalledOnce();
@@ -391,14 +444,15 @@ describe('runner settles pending without dispatch', () => {
     mod.runRedTeamOnSkip(o);
     expect(o.settlePending).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled(); expect(o.settle).not.toHaveBeenCalled();
   });
-  it.each(['settlePending', 'syncLabels'])('%s failure is reported in why and does not abort the next row', method => {
+  it.each(['settlePending', 'syncLabels'])('%s failure is reported in settleError with unchanged why and does not abort the next row', method => {
     const o = runFixture(); if (method === 'syncLabels') o.rawPrs[0].comments.push(resultComment());
     o[method] = vi.fn().mockImplementationOnce(() => { throw Error('settlement offline'); }).mockReturnValue(undefined);
     o.plan.refusals.push({ kind: 'already-reviewed-head', prNumber: pr + 1, headSha: head });
     o.rawPrs.push({ ...o.rawPrs[0], number: pr + 1, comments: [accept()] });
     if (method === 'syncLabels') o.rawPrs[1].comments.push(trusted(`${redTeamMarker(pr + 1, head)}\nRed team not required on this head: card-only diff`));
     const out = mod.runRedTeamOnSkip(o);
-    expect(out.rows).toHaveLength(2); expect(out.rows[0].why).toContain('settlement offline');
+    expect(out.rows).toHaveLength(2); expect(out.rows[0].settleError).toBe('settlement offline');
+    expect(out.rows[0].why).toBe(method === 'syncLabels' ? 'red-team result already on head' : 'stored review does not owe a red team');
     expect(out.rows[1]).toMatchObject({ prNumber: pr + 1, settle: method === 'syncLabels' ? 'result' : 'not-owed' });
     expect(o[method]).toHaveBeenCalledTimes(2);
   });
@@ -416,17 +470,18 @@ describe('runner settles pending without dispatch', () => {
       const o = runFixture({ env: { WE_SHARED_RUNS_DIR: join(dir, 'runs') },
         readEvidence: () => evidence({ loopPayload: undefined }) });
       o.rawPrs[0].labels.push('review:changes');
-      o.settle = vi.fn(input => settleRedTeamSkip({ ...input,
-        io: { ...input.io, env: o.env, publishNeedsYou, postComment } }));
+      o.escalate = vi.fn(({ why, ...key }) => settleRedTeamSkip({ ...key,
+        redTeam: { status: 'skipped', reason: why },
+        io: { env: o.env, publishNeedsYou, postComment } }));
       for (let tick = 0; tick < 2; tick++) {
         expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', escalate: true,
           why: 'conflicting label prevents policy-clear' });
-        expect(o.settle).toHaveBeenCalledTimes(tick + 1);
+        expect(o.escalate).toHaveBeenCalledTimes(tick + 1);
       }
-      for (const [input] of o.settle.mock.calls) {
+      for (const [input] of o.escalate.mock.calls) {
         expect(input).toMatchObject({ repo, pr, head,
-          redTeam: { status: 'skipped', reason: 'conflicting label prevents policy-clear' } });
-        expect(input.redTeam).not.toHaveProperty('policy');
+          why: 'conflicting label prevents policy-clear' });
+        expect(input).not.toHaveProperty('policy');
       }
       expect(publishNeedsYou).toHaveBeenCalledOnce();
       expect(publishNeedsYou).toHaveBeenCalledWith(expect.objectContaining({ repo, pr, head,
@@ -437,6 +492,6 @@ describe('runner settles pending without dispatch', () => {
   it('dryRun never publishes conflict escalation', () => {
     const o = runFixture({ dryRun: true, readEvidence: () => evidence({ loopPayload: undefined }) });
     o.rawPrs[0].labels.push('red-team:blocked'); mod.runRedTeamOnSkip(o);
-    expect(o.settle).not.toHaveBeenCalled();
+    expect(o.settle).not.toHaveBeenCalled(); expect(o.escalate).not.toHaveBeenCalled();
   });
 });
