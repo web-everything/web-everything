@@ -16,7 +16,8 @@ import {
   cancelAndRerunHungRun, cancelHungRun, describeExecError, isRunNotFoundError, redactTokenShapes, sweepHungCiRecovery, formatHungReport,
   defaultReadRequiredContexts, defaultReadAttributedRequiredChecks, defaultReadHeadCommittedAt, triggerCiForPr, clearStaleCheckingLabel,
   sweepMissingRunRecovery as sweepMissingRunRecoveryWithIo, formatMissingRunReport, reconcileAcceptanceAfterRebase, defaultReadPrLabels, detectMainTransition, recordMainState,
-  resolveApplyBudgetMs, resolveMaxApplyPerTick, createFileApplyLedger, normalizeApplyLedger,
+  resolveApplyBudgetMs, resolveMaxApplyPerTick, createFileApplyLedger, normalizeApplyLedger, main,
+  mergeApplyLedgers, pruneApplyLedger, APPLY_LEDGER_TTL_MS, APPLY_LEDGER_MAX_ENTRIES, APPLY_LEDGER_SEQ_REBASE,
 } from '../ci-red-recovery-watch.mjs';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -409,13 +410,51 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
     expect(seen.size).toBe(12); // 5 + 5 + 2 across three ticks
   });
 
-  it('a PR whose head moved (or that left the queue) is dropped from the ledger so it stays bounded', () => {
+  // Self-review of the round-4 repair: pruning to the current queue (and keying on the head sha) reset a slow
+  // deferrer's place whenever it dropped out for one tick or its head moved, re-creating the head-of-line burn.
+  it('a PR that drops out of the plan for a tick, or whose head moves, keeps its place in the rotation', () => {
     const ledger = memoryLedger();
-    const a = [{ ...PR_2635, number: 7300, headRefName: 'lane/p0' }, { ...PR_2635, number: 7301, headRefName: 'lane/p1' }];
+    const prs = Array.from({ length: 6 }, (_, i) => ({ ...PR_2635, number: 7400 + i, headRefName: `lane/m${i}` }));
+    slowQueueTick({ prs, ledger, refreshable: 'lane/m5' }); // m0..m4 tried, m5 untried
+    const flapped = [...prs.slice(0, 2), ...prs.slice(3)]; // m2 missing this tick (transient read failure)
+    const moved = flapped.map((p) => (p.number === 7400 ? { ...p, headRefOid: 'f'.repeat(40) } : p)); // m0's head moved
+    const tick = slowQueueTick({ prs: moved, ledger, refreshable: 'lane/m5' });
+    expect(tick.tried[0]).toBe('lane/m5'); // m0's moved head did not make it "never attempted" again (it would lead m5)
+    expect(ledger.read().at['7402']).toBe(3); // m2 was absent this tick and kept its tick-1 stamp
+    const third = slowQueueTick({ prs, ledger, refreshable: null }); // m2 is back and is now the least recently tried
+    expect(third.tried[0]).toBe('lane/m2');
+  });
+
+  it('entries expire only after the TTL, and the file stays bounded by it', () => {
+    const ledger = memoryLedger();
+    const a = [{ ...PR_2635, number: 7500, headRefName: 'lane/t0' }, { ...PR_2635, number: 7501, headRefName: 'lane/t1' }];
     slowQueueTick({ prs: a, ledger, refreshable: null });
-    expect(Object.keys(ledger.read().at)).toHaveLength(2);
-    slowQueueTick({ prs: [a[0]], ledger, refreshable: null });
-    expect(Object.keys(ledger.read().at)).toHaveLength(1);
+    expect(Object.keys(ledger.read().at).sort()).toEqual(['7500', '7501']);
+    const t = APPLY_LEDGER_TTL_MS + 100_000;
+    sweepCiRedRecovery({
+      readOpenPrs: () => [a[0]], readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh: () => ({ deferred: true, ok: false, error: 'x' }), postComment: vi.fn(), apply: true, now: () => t, applyLedger: ledger,
+    });
+    expect(Object.keys(ledger.read().at)).toEqual(['7500']); // 7501's record was older than the TTL
+  });
+
+  it('overlapping sweeps merge: a stamp another writer added while this tick ran is not lost', () => {
+    const ledger = memoryLedger();
+    const prs = [{ ...PR_2635, number: 7600, headRefName: 'lane/w0' }, { ...PR_2635, number: 7601, headRefName: 'lane/w1' }];
+    sweepCiRedRecovery({
+      readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      refresh: (branch) => {
+        if (branch === 'lane/w0') { // a concurrent sweep stamps PR 7999 (and a higher seq) while w0 refreshes
+          const cur = ledger.read();
+          ledger.write({ seq: cur.seq + 5, at: { ...cur.at, 7999: cur.seq + 5 }, ts: { ...cur.ts, 7999: 1 } });
+        }
+        return { ok: true, action: 'rebased' };
+      },
+      postComment: vi.fn(), apply: true, now: () => 1, applyLedger: ledger,
+    });
+    const end = ledger.read();
+    expect(end.at['7999']).toBeDefined();
+    expect(end.at['7601']).toBeGreaterThan(end.at['7999']); // seq kept advancing past the other writer's
   });
 
   it('the attempt is recorded BEFORE the refresh runs, so a sweep killed mid-refresh still rotates the PR back', () => {
@@ -466,15 +505,55 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
     expect(ledger.write).not.toHaveBeenCalled();
   });
 
+  it.each([[['sweep', '--apply'], true], [['sweep'], false]])('main(%j) wires a file-backed apply ledger into the main-red sweep only with --apply', async (argv, wired) => {
+    const seen = [];
+    const empty = () => ({ dispatch: [], refusals: [], applied: [] });
+    const prevExit = process.exitCode;
+    await main(argv, {
+      sweepOptions: { exhaustedRetrySettings: {} },
+      sweepMainRed: (args) => { seen.push(args.applyLedger); return { ...empty(), mainGreen: null }; },
+      sweepExhausted: empty, sweepHung: empty, sweepMissingRun: empty, sweepMainCancelled: empty,
+      writeLine: () => {}, writeAll: () => {},
+    });
+    process.exitCode = prevExit;
+    expect(seen).toHaveLength(1);
+    if (wired) expect(seen[0]).toEqual({ read: expect.any(Function), write: expect.any(Function) });
+    else expect(seen[0]).toBeNull();
+  });
+
   describe('apply ledger file + normalization', () => {
     it.each([
-      ['null', null], ['string', 'x'], ['array at', { at: [1] }], ['bad stamps', { seq: 'a', at: { '1:a': -1, '2:b': 1.5, '3:c': '4' } }],
+      ['null', null], ['string', 'x'], ['array at', { at: [1] }], ['bad stamps', { seq: 'a', at: { 11: -1, 12: 1.5, 13: '4' } }],
+      ['__proto__ key', JSON.parse('{"at":{"__proto__":7}}')],
     ])('a malformed ledger (%s) normalizes to empty', (_n, raw) => {
-      expect(normalizeApplyLedger(raw)).toEqual({ seq: 0, at: {} });
+      expect(normalizeApplyLedger(raw)).toEqual({ seq: 0, at: {}, ts: {} });
     });
 
     it('keeps valid stamps and never lets seq fall below the highest stamp', () => {
-      expect(normalizeApplyLedger({ seq: 1, at: { '1:a': 5, '2:b': 3 } })).toEqual({ seq: 5, at: { '1:a': 5, '2:b': 3 } });
+      expect(normalizeApplyLedger({ seq: 1, at: { 11: 5, 12: 3 }, ts: { 11: 100 } })).toEqual({ seq: 5, at: { 11: 5, 12: 3 }, ts: { 11: 100, 12: 0 } });
+    });
+
+    it('caps the ledger at APPLY_LEDGER_MAX_ENTRIES, keeping the most recently stamped', () => {
+      const at = Object.fromEntries(Array.from({ length: APPLY_LEDGER_MAX_ENTRIES + 20 }, (_, i) => [String(i + 1), i + 1]));
+      const n = normalizeApplyLedger({ seq: APPLY_LEDGER_MAX_ENTRIES + 20, at });
+      expect(Object.keys(n.at)).toHaveLength(APPLY_LEDGER_MAX_ENTRIES);
+      expect(n.at['1']).toBeUndefined();
+      expect(n.at[String(APPLY_LEDGER_MAX_ENTRIES + 20)]).toBe(APPLY_LEDGER_MAX_ENTRIES + 20);
+    });
+
+    it('re-ranks a near-saturated sequence so new stamps keep advancing (no permanent ties)', () => {
+      const big = APPLY_LEDGER_SEQ_REBASE + 5;
+      const n = normalizeApplyLedger({ seq: big, at: { 1: big, 2: big - 1, 3: big - 2 } });
+      expect(n).toMatchObject({ seq: 3, at: { 1: 3, 2: 2, 3: 1 } });
+    });
+
+    it('merge keeps the max stamp per PR from both writers; prune drops only entries past the TTL', () => {
+      const a = normalizeApplyLedger({ seq: 4, at: { 1: 4, 2: 1 }, ts: { 1: 1000, 2: 1000 } });
+      const b = normalizeApplyLedger({ seq: 6, at: { 1: 2, 2: 6, 3: 5 }, ts: { 1: 900, 2: 2000, 3: 2000 } });
+      const m = mergeApplyLedgers(a, b);
+      expect(m).toMatchObject({ seq: 6, at: { 1: 4, 2: 6, 3: 5 }, ts: { 1: 1000, 2: 2000, 3: 2000 } });
+      const p = pruneApplyLedger(m, 2000 + APPLY_LEDGER_TTL_MS, APPLY_LEDGER_TTL_MS);
+      expect(Object.keys(p.at).sort()).toEqual(['2', '3']);
     });
 
     it('round-trips through a file; a missing or corrupt file reads as nothing', () => {
@@ -483,8 +562,8 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
         const path = join(dir, 'ledger.json');
         const ledger = createFileApplyLedger({ path });
         expect(ledger.read()).toBeNull();
-        ledger.write({ seq: 2, at: { '1:a': 2 } });
-        expect(normalizeApplyLedger(ledger.read())).toEqual({ seq: 2, at: { '1:a': 2 } });
+        ledger.write({ seq: 2, at: { 11: 2 }, ts: { 11: 50 } });
+        expect(normalizeApplyLedger(ledger.read())).toEqual({ seq: 2, at: { 11: 2 }, ts: { 11: 50 } });
         writeFileSync(path, '{not json');
         expect(ledger.read()).toBeNull();
       } finally { rmSync(dir, { recursive: true, force: true }); }

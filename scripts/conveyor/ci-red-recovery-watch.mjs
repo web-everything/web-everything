@@ -372,15 +372,16 @@ export function sweepCiRedRecovery({
     // the next tick; a PR that was tried (even a slow free deferral) goes behind everything not yet tried.
     // Attempts are recorded BEFORE the refresh runs and written at once, so a sweep killed at the pass deadline
     // mid-refresh has still moved that PR to the back. Ledger trouble only costs fairness — it never stops the sweep.
-    let ledger = { seq: 0, at: {} };
-    if (applyLedger) {
-      try { ledger = normalizeApplyLedger(applyLedger.read()); } catch (e) { ledgerError = `read: ${e?.message ?? e}`; }
-    }
-    const applyKey = (d) => `${d.prNumber}:${d.headSha}`;
+    // The key is the PR number alone (the file is per repo): a head that moves between ticks (author push, our own
+    // rebase) must not reset a PR's place. An entry also survives the PR dropping out of the plan for a tick (a
+    // transient comment-read failure) — it expires only after APPLY_LEDGER_TTL_MS, and the file is capped.
+    const applyKey = (d) => String(d.prNumber);
+    const readLedger = () => {
+      try { return normalizeApplyLedger(applyLedger.read()); } catch (e) { ledgerError = `read: ${e?.message ?? e}`; return null; }
+    };
+    let ledger = (applyLedger && readLedger()) || normalizeApplyLedger(null);
     const order = plan.dispatch.map((d, i) => ({ d, i, seen: ledger.at[applyKey(d)] ?? 0 }))
       .sort((a, b) => a.seen - b.seen || a.i - b.i).map((x) => x.d);
-    // Entries for PRs no longer owed a refresh drop out, so the ledger stays bounded by the current queue.
-    ledger = { seq: ledger.seq, at: Object.fromEntries(order.filter((d) => ledger.at[applyKey(d)]).map((d) => [applyKey(d), ledger.at[applyKey(d)]])) };
     for (const d of order) {
       // Progress floor: once over budget, the tick may still start a refresh that does work — discovery (per-PR
       // comment reads) can by itself outlast the budget, and without the floor every tick would defer everything.
@@ -394,8 +395,14 @@ export function sweepCiRedRecovery({
       }
       const held = checkClaim({ repo, branch: d.headRefName });
       if (!held && applyLedger) {
+        // Re-read and merge (max per key) just before writing: a sweep that overlapped this one (a manual run, or a
+        // slow predecessor) must not lose its stamps to this tick's older snapshot.
+        const fresh = readLedger();
+        if (fresh) ledger = mergeApplyLedgers(ledger, fresh);
+        ledger = pruneApplyLedger(ledger, now());
         ledger.seq += 1;
         ledger.at[applyKey(d)] = ledger.seq;
+        ledger.ts[applyKey(d)] = now();
         try { applyLedger.write(ledger); } catch (e) { ledgerError = `write: ${e?.message ?? e}`; }
       }
       // Passing prNumber makes refreshOntoMain verify the PR is same-repo before it rebases and force-pushes.
@@ -1727,15 +1734,63 @@ function mainStatePath(repo = null, home = handoffHome()) {
   return join(home, `ci-red-recovery-main-state.${encodeURIComponent(repoSlug(repo))}.json`);
 }
 
+/** An attempt record older than this is forgotten (the PR is then "never attempted" and leads again). */
+export const APPLY_LEDGER_TTL_MS = 24 * 60 * 60 * 1000;
+/** The ledger keeps at most this many PRs (highest stamps win), so a hostile or huge file stays bounded. */
+export const APPLY_LEDGER_MAX_ENTRIES = 500;
+/** Past this stamp the ledger is re-ranked 1..n, so `seq + 1` can never saturate and tie every new stamp. */
+export const APPLY_LEDGER_SEQ_REBASE = 1_000_000_000;
+
 /** we:scripts/conveyor/ci-red-recovery-watch.mjs#normalizeApplyLedger — any unreadable or malformed ledger is an empty
- *  one (fairness restarts from the plan's order; it can never block a refresh). Keeps only positive-integer stamps. */
+ *  one (fairness restarts from the plan's order; it can never block a refresh). Keeps only positive-integer stamps
+ *  with a numeric attempt time, at most {@link APPLY_LEDGER_MAX_ENTRIES}, and re-ranks a near-saturated sequence. */
 export function normalizeApplyLedger(raw) {
-  const at = {};
+  const rows = [];
   if (raw && typeof raw === 'object' && raw.at && typeof raw.at === 'object' && !Array.isArray(raw.at)) {
-    for (const [k, v] of Object.entries(raw.at)) if (Number.isSafeInteger(v) && v > 0) at[k] = v;
+    const times = raw.ts && typeof raw.ts === 'object' && !Array.isArray(raw.ts) ? raw.ts : {};
+    for (const [k, v] of Object.entries(raw.at)) {
+      if (k === '__proto__' || !Number.isSafeInteger(v) || v <= 0) continue;
+      rows.push([k, v, Number.isFinite(times[k]) ? times[k] : 0]);
+    }
   }
-  const top = Math.max(0, ...Object.values(at));
-  return { seq: Number.isSafeInteger(raw?.seq) && raw.seq >= top ? raw.seq : top, at };
+  rows.sort((a, b) => b[1] - a[1]);
+  const kept = rows.slice(0, APPLY_LEDGER_MAX_ENTRIES);
+  const top = kept.length ? kept[0][1] : 0;
+  let seq = Number.isSafeInteger(raw?.seq) && raw.seq >= top ? raw.seq : top;
+  const at = Object.create(null);
+  const ts = Object.create(null);
+  if (seq > APPLY_LEDGER_SEQ_REBASE) {
+    kept.reverse().forEach(([k, , t], i) => { at[k] = i + 1; ts[k] = t; });
+    seq = kept.length;
+  } else {
+    for (const [k, v, t] of kept) { at[k] = v; ts[k] = t; }
+  }
+  return { seq, at, ts };
+}
+
+/** Max stamp and latest attempt time per PR, max sequence — two writers can only ever move a PR further back. */
+export function mergeApplyLedgers(a, b) {
+  const at = Object.create(null);
+  const ts = Object.create(null);
+  for (const src of [a, b]) {
+    for (const k of Object.keys(src.at)) {
+      if (!(k in at) || src.at[k] > at[k]) at[k] = src.at[k];
+      ts[k] = Math.max(ts[k] ?? 0, src.ts[k] ?? 0);
+    }
+  }
+  return normalizeApplyLedger({ seq: Math.max(a.seq, b.seq), at, ts });
+}
+
+/** Forgets attempts older than the TTL (a future-dated time, e.g. after a clock step back, is kept, never trusted to expire). */
+export function pruneApplyLedger(ledger, nowMs, ttlMs = APPLY_LEDGER_TTL_MS) {
+  const at = Object.create(null);
+  const ts = Object.create(null);
+  for (const k of Object.keys(ledger.at)) {
+    if (nowMs - (ledger.ts[k] ?? 0) > ttlMs) continue;
+    at[k] = ledger.at[k];
+    ts[k] = ledger.ts[k] ?? 0;
+  }
+  return { seq: ledger.seq, at, ts };
 }
 
 function applyLedgerPath(repo = null, home = handoffHome()) {
@@ -1753,7 +1808,7 @@ export function createFileApplyLedger({ repo = null, path, env = process.env } =
       try { return JSON.parse(readFileSync(file, 'utf8')); }
       catch (e) { if (e.code === 'ENOENT' || e instanceof SyntaxError) return null; throw e; }
     },
-    write(state) { writeMainRetriggerRecord(file, { v: 1, seq: state.seq, at: state.at }); },
+    write(state) { writeMainRetriggerRecord(file, { v: 1, seq: state.seq, at: { ...state.at }, ts: { ...state.ts } }); },
   };
 }
 
