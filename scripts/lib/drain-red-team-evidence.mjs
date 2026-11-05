@@ -68,8 +68,16 @@ const unfinishedSince = run => {
   const resumed = typeof run.resumedAt === 'number' ? run.resumedAt : Date.parse(run.resumedAt);
   return Number.isFinite(resumed) ? Math.max(started, resumed) : NaN;
 };
-const unfinishedReview = run => !run.verdict || run.pending != null
-  || run.effects?.some(effect => ['pending', 'in-flight'].includes(effect?.status));
+const hasOpenEffect = run => run.effects?.some(effect => ['pending', 'in-flight'].includes(effect?.status));
+const unfinishedReview = run => !run.verdict || run.pending != null || hasOpenEffect(run);
+// R622: an unfinished run a comment may settle is one that has NOT decided anything yet: no verdict, or only the
+// "needs a human" hold awaiting its confirm, and no label effect still pending or in flight. A run that already
+// recorded any other verdict (a rejection above all) is only waiting on its effects: a clean result comment that
+// is newer than its start must not release it, because those effects can still apply a send-back.
+const undecidedUnfinished = run => {
+  const verdict = typeof run.verdict === 'string' ? run.verdict : run.verdict?.verdict;
+  return (verdict == null || verdict === 'needs-human') && !hasOpenEffect(run);
+};
 
 // A run record is written after its read step starts, so its mtime bounds that start from above.
 // The slack covers filesystems that store mtime at 1-2 s granularity.
@@ -108,7 +116,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
   let scan = null;
   const failures = new Map();
   const runScan = () => {
-    const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, unfinished: null, since: -Infinity }]));
+    const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, unfinished: null, since: -Infinity, undecided: true }]));
     const startless = []; // ids and mtimes only, never payloads
     let count = 0, newestSettled = false, boundary = -Infinity;
     // The read window is fixed in one order (equal mtimes by ascending id) for every caller: the tie
@@ -130,6 +138,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
               // R622: the settle bound covers EVERY unfinished run of this PR (any may be resumed later), NaN if any is unreadable.
               const since = unfinishedSince(run);
               slot.since = Number.isNaN(slot.since) || Number.isNaN(since) ? NaN : Math.max(slot.since, since);
+              if (!undecidedUnfinished(run)) slot.undecided = false;
             }
           }
         }
@@ -143,7 +152,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     scan = { slots, startless, count, end, newestSettled, boundary };
   };
   const failureFor = (order, exactHead, writtenAfter, newestHead) => {
-    const { newest, exact, unfinished, since } = scan.slots[order];
+    const { newest, exact, unfinished, since, undecided } = scan.slots[order];
     const selected = exact ?? newest;
     const selectedStart = selected ? reviewStartedAt(selected) : NaN;
     // A start-less run last written before the selected run started is older; any other cannot be ordered.
@@ -153,7 +162,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     }
     if (unfinished && (!selected || unfinished.id === selected.id || reviewStartedAt(unfinished) >= selectedStart)) {
       return withSettleBounds({ ok: false, reason: 'review-unfinished' },
-        { unfinishedStartedAt: since, ...(scan.end?.ok === false ? { unreadBoundaryAt: scan.boundary } : {}) });
+        { unfinishedStartedAt: since, unfinishedUndecided: undecided, ...(scan.end?.ok === false ? { unreadBoundaryAt: scan.boundary } : {}) });
     }
     if (scan.end?.ok !== false) return null;
     // Capped: usable only when no unread record can change this query's answer (see above).
@@ -164,7 +173,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     if (exact === null && scan.newestSettled && (!exactHead || (Number.isFinite(writtenAfter)
       && scan.boundary + RUN_MTIME_SLACK_MS <= writtenAfter
       && typeof newestHead === 'string' && newest.run.findings?.read?.netBasis?.rev === newestHead))) return null;
-    return withSettleBounds({ ...scan.end }, { unreadBoundaryAt: scan.boundary, unfinishedStartedAt: scan.slots[order].since });
+    return withSettleBounds({ ...scan.end }, { unreadBoundaryAt: scan.boundary, unfinishedStartedAt: since, unfinishedUndecided: undecided });
   };
   return (exactHead = true, order = tieBreak, { writtenAfter, newestHead } = {}) => {
     if (!TIE_ORDERS.includes(order)) throw new TypeError('unknown run tieBreak');
@@ -460,6 +469,9 @@ export function settleUnknownEvidenceByComment(evidence, comments, pr, head) {
   const at = Date.parse(commentCreatedAt(newestResultComment(comments, pr, head)));
   const bounds = evidence.settleBounds ?? {};
   if (!Number.isFinite(at)) return evidence;
+  // An unfinished run that already decided (a rejection with its label effect still open) is not answered by a
+  // clean comment from an earlier job; a bound that does not say so fails closed.
+  if (bounds.unfinishedUndecided !== true) return evidence;
   if (evidence.reason === 'review-unfinished') {
     if (!(at > bounds.unfinishedStartedAt)) return evidence;
     if ('unreadBoundaryAt' in bounds && !(at > bounds.unreadBoundaryAt + RUN_MTIME_SLACK_MS)) return evidence;

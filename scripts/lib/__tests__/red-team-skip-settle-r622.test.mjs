@@ -18,7 +18,8 @@ const comment = (rev = head, findings = [], login = 'web-everything') => ({ auth
   body: renderRedTeamComment({ pr, rev, findings, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: findings.length ? 'changes' : 'accept' }) });
 const broken = [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }];
 const T = Date.parse('2026-11-05T12:00:00Z');
-const unknown = (reason, bounds) => Object.defineProperty({ ok: false, reason }, 'settleBounds', { value: bounds, enumerable: false });
+// Fabricated bounds default to an undecided unfinished review (the settleable shape); the decided shape is pinned below.
+const unknown = (reason, bounds) => Object.defineProperty({ ok: false, reason }, 'settleBounds', { value: { unfinishedUndecided: true, ...bounds }, enumerable: false });
 const older = { unfinishedStartedAt: T - 3600e3, unreadBoundaryAt: T - 3600e3 };
 const holdFor = (evidence, comments) => redTeamEnqueueHold({ ...settleUnknownEvidenceByComment(evidence, comments, pr, head), comments, pr, head, env: {} });
 
@@ -84,6 +85,48 @@ describe('R622 the evidence reader bounds a resumed unfinished review by its res
   });
   it('a resumed run with no readable stamp stays held', () => {
     expect(settled(run({ resumeOf: 'x' }))).toMatchObject({ ok: false, reason: 'review-unfinished' });
+  });
+});
+
+describe('R622 a re-review that already decided is not released by an earlier job\'s clean comment', () => {
+  // The break: a re-review started before the comment, recorded a rejection, and only its label effect is still open.
+  const base = extra => ({ op: 'review-pr', input: { repo: 'o/r', pr }, findings: { read: { netBasis: { rev: head } } },
+    stepTimings: [{ step: 'read', startedAt: new Date(T - 3600e3).toISOString() }], ...extra });
+  const read = r => readDrainRedTeamEvidence({ repo: 'o/r', pr, head, env: { WE_SHARED_RUNS_DIR: '/nonexistent-r622' },
+    runsDir: '/runs', list: () => ['review-pr-1'], stat: () => ({ mtimeMs: T - 60e3 }), read: () => r, readScorecards: () => [], now: T });
+  const held = r => expect(holdFor(read(r), [comment()])).toMatch(/evidence unknown/);
+  const openEffect = status => [{ status }];
+  it('a rejection verdict with a pending or in-flight effect stays held through the real reader', () => {
+    for (const status of ['pending', 'in-flight']) held(base({ verdict: { verdict: 'changes' }, effects: openEffect(status) }));
+  });
+  it('a rejection verdict held only by a pending step stays held', () => {
+    held(base({ verdict: { verdict: 'changes' }, pending: { kind: 'effects' } }));
+    held(base({ verdict: 'reject', pending: { kind: 'effects' } }));
+  });
+  it('an open label effect on an otherwise undecided run stays held', () => {
+    held(base({ verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' }, effects: openEffect('pending') }));
+  });
+  it('the undecided shapes (no verdict, or needs-human awaiting its confirm) still settle', () => {
+    expect(holdFor(read(base({ pending: { kind: 'confirm' } })), [comment()])).toBeNull();
+    expect(holdFor(read(base({ verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' } })), [comment()])).toBeNull();
+  });
+  it('the decided run is reported on the bounds, and a bound that does not say so never settles', () => {
+    expect(read(base({ verdict: { verdict: 'changes' }, effects: openEffect('pending') })).settleBounds).toMatchObject({ unfinishedUndecided: false });
+    const noFlag = Object.defineProperty({ ok: false, reason: 'review-unfinished' }, 'settleBounds', { value: { unfinishedStartedAt: T - 3600e3 }, enumerable: false });
+    expect(holdFor(noFlag, [comment()])).toMatch(/evidence unknown/);
+  });
+  it('a decided unfinished run keeps a capped scan held too (the older-than-selected path)', () => {
+    // 3 records, maxParses=2: the newest finished run and the decided unfinished one are read, the oldest stays unread.
+    const finished = { op: 'review-pr', input: { repo: 'o/r', pr }, findings: { read: { netBasis: { rev: other } } },
+      stepTimings: [{ step: 'read', startedAt: new Date(T - 1800e3).toISOString() }], verdict: { verdict: 'accept' } };
+    const runs = { 'review-pr-c': finished, 'review-pr-b': base({ findings: { read: { netBasis: { rev: other } } }, verdict: { verdict: 'changes' }, effects: openEffect('pending') }), 'review-pr-a': finished };
+    const mtimes = { 'review-pr-c': T - 100e3, 'review-pr-b': T - 200e3, 'review-pr-a': T - 3600e3 };
+    const evidence = readDrainRedTeamEvidence({ repo: 'o/r', pr, head, env: { WE_SHARED_RUNS_DIR: '/nonexistent-r622' }, runsDir: '/runs', warn: () => {},
+      scanSettings: { file: { runs: { scan: { maxParses: 2 } } }, platform: {}, env: {} },
+      list: () => Object.keys(runs), stat: p => ({ mtimeMs: mtimes[p.split('/').pop().replace('.json', '')] }), read: id => runs[id], readScorecards: () => [], now: T });
+    expect(evidence).toMatchObject({ ok: false, reason: 'scan-capped' });
+    expect(evidence.settleBounds).toMatchObject({ unfinishedUndecided: false });
+    expect(settleUnknownEvidenceByComment(evidence, [comment()], pr, head)).toMatchObject({ ok: false, reason: 'scan-capped' });
   });
 });
 
