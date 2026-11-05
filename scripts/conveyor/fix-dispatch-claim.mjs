@@ -445,7 +445,7 @@ export function refreshLiveFixDispatchClaims({
         // isClaimSessionLive and skip the idle-release code below forever. An idle row bound to THIS claim with no
         // pending tool call is owned by that path (quietLongEnough, awaiting-verify and unchanged-head checks keep
         // it fail closed). A hung verdict that names a pending call past its grace is kept as hung.
-        if ((a.state === 'idle' || a.status === 'idle') && boundToClaim(a) && info.reason === 'stale-no-activity') return a;
+        if (a.state === 'idle' && boundToClaim(a) && info.reason === 'stale-no-activity') return a;
         return { ...a, hung: true };
       });
     const isAwaiting = typeof awaitingVerifyFor === 'function' && agentsAll.some((row) => {
@@ -505,7 +505,7 @@ export function refreshLiveFixDispatchClaims({
       return Number.isFinite(at) && nowMs - at >= quietMs;
     };
     const isIdle = nonTerminal.length > 0
-      && nonTerminal.every((a) => (a.state === 'idle' || a.status === 'idle') && boundToClaim(a) && quietLongEnough(a));
+      && nonTerminal.every((a) => a.state === 'idle' && boundToClaim(a) && quietLongEnough(a));
     let idleHeadSha = null;
     if (!isAwaiting && idleRelease.enabled && isIdle) {
       try {

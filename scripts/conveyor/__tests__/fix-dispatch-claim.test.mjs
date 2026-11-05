@@ -783,17 +783,35 @@ describe('idle-claim auto-release (R201)', () => {
       invalid: ['platform.enabled="yes"', 'env.idleMinutes=0'] });
   });
 
-  it('releases a claim whose live listing row is state:working but status:idle (the real `claude agents` shape)', () => {
+  // Only `state === 'idle'` is positive idle evidence (operator ruling R611 item 5): a `status:'idle'` listing field
+  // alone never releases a claim, whatever the state beside it says; the claim's own TTL covers that case.
+  const runIdle = (rows) => {
     acquire();
-    const extra = { };
-    const rows = () => [{ name: 'fix-5996', startedAt: T0 + 1000, state: 'working', status: 'idle', startedAt: T0 + 1000 }];
-    const run = (at) => refreshLiveFixDispatchClaims({
-      lockRoot: claimRoot, listAgentsAll: rows, hungInfoFor: () => null, awaitingVerifyFor: null, activityMsFor: () => 0,
-      prHeadFor: () => 'sha1', recordEvent: () => {}, nowIso: () => iso(at),
-      idleRelease: resolveIdleClaimRelease({ env: {}, platform: null }), ...extra,
-    });
     const released = [];
-    for (let t = T0 + 60_000; t <= T0 + 60_000 + IDLE_MS; t += 120_000) released.push(...(run(t).released ?? []));
+    for (let t = T0 + 60_000; t <= T0 + 60_000 + IDLE_MS; t += 120_000) {
+      released.push(...(refreshLiveFixDispatchClaims({
+        lockRoot: claimRoot, listAgentsAll: () => rows, hungInfoFor: () => null, awaitingVerifyFor: null, activityMsFor: () => 0,
+        prHeadFor: () => 'sha1', recordEvent: () => {}, nowIso: () => iso(t),
+        idleRelease: resolveIdleClaimRelease({ env: {}, platform: null }),
+      }).released ?? []));
+    }
+    return released;
+  };
+
+  it('keeps a claim whose row is state:working even when status:idle (working is never released)', () => {
+    expect(runIdle([{ name: 'fix-5996', startedAt: T0 + 1000, state: 'working', status: 'idle' }])).toHaveLength(0);
+  });
+
+  it.each([undefined, 'unknown', '', 'some-new-state'])('keeps a status:idle claim whose state is unknown (%s)', (state) => {
+    expect(runIdle([{ name: 'fix-5996', startedAt: T0 + 1000, ...(state === undefined ? {} : { state }), status: 'idle' }])).toHaveLength(0);
+  });
+
+  it('keeps a claim whose row is status:idle with a non-idle state (status alone is not evidence)', () => {
+    expect(runIdle([{ name: 'fix-5996', startedAt: T0 + 1000, state: 'waiting', status: 'idle' }])).toHaveLength(0);
+  });
+
+  it('releases a state:idle claim bound to it with an unmoved head (positive idle evidence)', () => {
+    const released = runIdle([{ name: 'fix-5996', startedAt: T0 + 1000, state: 'idle' }]);
     expect(released).toHaveLength(1);
     expect(released[0].reason).toMatch(/idle-head-unmoved/);
   });
@@ -818,7 +836,7 @@ describe('idle-claim auto-release (R201)', () => {
     ['ISO-string row older than the claim', { startedAt: new Date(T0 - 3_600_000).toISOString() }],
   ])('never releases on an idle row not bound to this claim: %s', (_n, extraRow) => {
     acquire();
-    const rows = () => [{ name: 'fix-5996', state: 'working', status: 'idle', ...extraRow }];
+    const rows = () => [{ name: 'fix-5996', state: 'idle', ...extraRow }];
     let released = 0;
     for (let t = T0 + 60_000; t <= T0 + 60_000 + 2 * IDLE_MS; t += 120_000) {
       released += (refreshLiveFixDispatchClaims({
@@ -843,7 +861,7 @@ describe('idle-claim auto-release (R201)', () => {
     expect(acquireFixDispatchClaim({ repo: 'we', pr: 5996, kind: 'fix', headSha: 'sha1', owner: 'A', sessionId: 'S1',
       lockRoot: claimRoot, nowMs: T0, nowIso: iso(T0), leaseMinutes: 10 }).ok).toBe(true);
     expect(readFixDispatchClaim({ repo: 'we', pr: 5996, kind: 'fix', lockRoot: claimRoot }).meta.sessionId).toBe('S1');
-    const rows = () => [{ name: 'fix-5996', state: 'working', status: 'idle', ...extraRow }];
+    const rows = () => [{ name: 'fix-5996', state: 'idle', ...extraRow }];
     let released = 0;
     for (let t = T0 + 60_000; t <= T0 + 60_000 + 2 * IDLE_MS; t += 120_000) {
       released += (refreshLiveFixDispatchClaims({
@@ -869,7 +887,7 @@ describe('idle-claim auto-release (R201)', () => {
       mkdirSync(dir, { recursive: true });
       writeFileSync(join(dir, `${sid}.jsonl`), `${JSON.stringify({ type: 'assistant', timestamp: iso(lastActivityMs), message: { role: 'assistant', content } })}\n`);
     };
-    const row = { name: 'fix-5996', sessionId: SID, cwd: CWD, state: 'working', status: 'idle', startedAt: T0 + 1000 };
+    const row = { name: 'fix-5996', sessionId: SID, cwd: CWD, state: 'idle', startedAt: T0 + 1000 };
     const sweepAll = ({ lastActivityMs, content, headFor = () => 'sha1' }) => {
       acquireFixDispatchClaim({ repo: 'we', pr: 5996, kind: 'fix', headSha: 'sha1', owner: 'A', sessionId: SID,
         lockRoot: claimRoot, nowMs: T0, nowIso: iso(T0), leaseMinutes: 10 });
@@ -1069,7 +1087,7 @@ describe('idle-claim auto-release (R201)', () => {
     ['activity resolver throws', () => { throw new Error('boom'); }],
   ])('keeps the claim when holder activity is %s', (_n, activityMsFor) => {
     acquire();
-    const rows = () => [{ name: 'fix-5996', state: 'working', status: 'idle', startedAt: T0 + 1000 }];
+    const rows = () => [{ name: 'fix-5996', state: 'idle', startedAt: T0 + 1000 }];
     let released = 0;
     for (let t = T0 + 60_000; t <= T0 + 60_000 + 2 * IDLE_MS; t += 120_000) {
       released += (refreshLiveFixDispatchClaims({
