@@ -14,6 +14,9 @@ const soakConfig = readFileSync(new URL('../../../vitest.soak.config.ts', import
 // Worst observed (run 38604669331, slow runner): unit shard 2 = ~14 min of tests, daemon-soak baseline = 615s.
 const WORST_UNIT_SHARD_MIN = 14;
 const WORST_SOAK_BASELINE_MIN = 10.25;
+// Integration tier (serial real-spawn lane-pool tests): 12-14 min on main, ~20 min once one more such file lands (PR #6357 was
+// cancelled at the old 20-min cap).
+const WORST_INTEGRATION_MIN = 20;
 
 describe('CI job caps keep headroom over a slow runner', () => {
   it('test-shard cap is at least 1.5x the slowest observed shard', () => {
@@ -22,6 +25,10 @@ describe('CI job caps keep headroom over a slow runner', () => {
 
   it('soak-shard cap is at least 1.5x the slowest observed shard', () => {
     expect(jobs['soak-shard']['timeout-minutes']).toBeGreaterThanOrEqual(WORST_UNIT_SHARD_MIN * 1.5);
+  });
+
+  it('integration cap is at least 1.5x the slowest observed run', () => {
+    expect(jobs.integration['timeout-minutes']).toBeGreaterThanOrEqual(WORST_INTEGRATION_MIN * 1.5);
   });
 
   it('the soak vitest timeout leaves 1.5x headroom over the slowest baseline and still fires before the job cap', () => {
