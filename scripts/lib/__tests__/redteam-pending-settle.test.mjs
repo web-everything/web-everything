@@ -266,7 +266,7 @@ describe('settlement reads fresh PR state and result evidence', () => {
   });
   it.each(['withheld', 'error', undefined])('an accept whose comment is %s (not confirmed posted) never clears on an older comment', comment => {
     const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: payload('accept'), recorded: false, seatRecorded: false,
-      status: { status: 'finished', result: { foldedVerdict: 'accept', ...(comment ? { comment } : {}) } } })), readIgnorableConfirms: () => [] });
+      status: { status: 'finished', result: { status: 'ran', foldedVerdict: 'accept', ...(comment ? { comment } : {}) } } })), readIgnorableConfirms: () => [] });
     o.rawPrs[0].comments.push(resultComment());
     const row = mod.runRedTeamOnSkip(o).rows[0];
     expect(o.syncLabels).not.toHaveBeenCalled();
@@ -274,12 +274,23 @@ describe('settlement reads fresh PR state and result evidence', () => {
   });
   it('a newer same-head changes run in the witness blocks clearing on an older accepting status', () => {
     const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: payload('accept'), recorded: false, seatRecorded: false,
-      status: { status: 'finished', result: { comment: 'posted', foldedVerdict: 'accept' } } })), readIgnorableConfirms: () => [] });
+      status: { status: 'finished', result: { status: 'ran', comment: 'posted', foldedVerdict: 'accept' } } })), readIgnorableConfirms: () => [] });
     o.readWitness = vi.fn(() => ({ ok: true, newest: { verdict: { verdict: 'changes' } }, rawWriter: { parsed: null }, markers: {}, seats: [] }));
     o.rawPrs[0].comments.push(resultComment());
     const row = mod.runRedTeamOnSkip(o).rows[0];
     expect(o.syncLabels).not.toHaveBeenCalled();
     expect(row.settleError).toBe('newest same-head review is not an accept; label unchanged');
+  });
+  it.each([
+    ['execution failed', { status: 'failed', comment: 'posted', foldedVerdict: 'accept' }, undefined],
+    ['completion not recorded', { status: 'ran', comment: 'posted', foldedVerdict: 'accept' }, false],
+  ])('an accepting status with %s never clears', (_name, result, completedRecorded) => {
+    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: payload('accept'), recorded: false, seatRecorded: false,
+      ...(completedRecorded === undefined ? {} : { completedRecorded }), status: { status: 'finished', result } })), readIgnorableConfirms: () => [] });
+    o.rawPrs[0].comments.push(resultComment());
+    const row = mod.runRedTeamOnSkip(o).rows[0];
+    expect(o.syncLabels).not.toHaveBeenCalled();
+    expect(row.settleError).toBe('red-team execution not proven complete; label unchanged');
   });
   it('a throwing result evidence read settles nothing and reports settleError', () => {
     const o = runFixture({ readEvidence: () => { throw Error('fresh evidence offline'); } });
@@ -977,7 +988,7 @@ describe('audit hardening: unknown effect statuses and checked comments', () => 
       expect(mod.headNeverReviewedFromRuns(input)).toBe(false);
     });
   it('hands the synchronizer freshly checked comments and no cached live state', () => {
-    const o = runFixture({ readEvidence: () => evidence({ loopPayload: payload('accept'), status: { status: 'finished', result: { comment: 'posted', foldedVerdict: 'accept' } } }) });
+    const o = runFixture({ readEvidence: () => evidence({ loopPayload: payload('accept'), status: { status: 'finished', result: { status: 'ran', comment: 'posted', foldedVerdict: 'accept' } } }) });
     o.rawPrs[0].comments.push(resultComment());
     const comments = [...o.rawPrs[0].comments, trusted('🔔 conveyor — newly read status')];
     o.readComments = vi.fn(() => comments);
@@ -1132,7 +1143,7 @@ describe('pending soak always replays recovery availability', () => {
 describe('a clean-shaped red-team comment recording a non-accept verdict never clears', () => {
   it.each(['needs-human', 'changes', 'prevention-outstanding'])('recorded verdict %s beside an older accepting status does not synchronize', verdict => {
     const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: payload('accept'), recorded: false, seatRecorded: false,
-      status: { status: 'finished', result: { comment: 'posted', foldedVerdict: 'accept' } } })), readIgnorableConfirms: () => [] });
+      status: { status: 'finished', result: { status: 'ran', comment: 'posted', foldedVerdict: 'accept' } } })), readIgnorableConfirms: () => [] });
     const advisory = "Advisory only: this comment changes no label itself; the red-team gate (setting `redTeam.confirmedBreaks`) sends a confirmed broken break back to the fixer. Head `"
       + head.slice(0, 12) + '` \u00b7 red team ';
     o.rawPrs[0].comments.push({ author: { login: 'web-everything' }, createdAt: iso(acceptedAt + 5),
@@ -1145,7 +1156,7 @@ describe('a clean-shaped red-team comment recording a non-accept verdict never c
 describe('zero-padded PR numbers in markers are still validated', () => {
   it('a padded-marker comment with an indented confirmed break blocks an older clean result from clearing', () => {
     const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: payload('accept'), recorded: false, seatRecorded: false,
-      status: { status: 'finished', result: { comment: 'posted', foldedVerdict: 'accept' } } })), readIgnorableConfirms: () => [] });
+      status: { status: 'finished', result: { status: 'ran', comment: 'posted', foldedVerdict: 'accept' } } })), readIgnorableConfirms: () => [] });
     o.rawPrs[0].comments.push(resultComment(), { author: { login: 'web-everything' }, createdAt: iso(acceptedAt + 5),
       body: `<!-- we:red-team-advisory pr=0${pr} rev=${head} -->\nRed team not required on this head: x\n  1. [**confirmed**] (edge-case, broken) \u2014 hidden` });
     mod.runRedTeamOnSkip(o);
