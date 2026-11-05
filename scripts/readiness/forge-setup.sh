@@ -310,7 +310,9 @@ Description=Drop outbound network for Forge slot users (registry allowlist only)
 # does not resolve yet: the table installs CLOSED (no registry) and the timer opens the allowlist after 1 min.
 Before=ssh.socket ssh.service sshd.service
 DefaultDependencies=no
-After=systemd-user-sessions.service local-fs.target
+# Only local-fs.target: any After= on a unit behind sockets.target (systemd-user-sessions, network-online) would
+# loop with Before=ssh.socket. Slot users are local accounts, so nothing later is needed to look them up.
+After=local-fs.target
 [Service]
 Type=oneshot
 Environment=FORGE_EXEC_SLOTS=$FORGE_EXEC_SLOTS

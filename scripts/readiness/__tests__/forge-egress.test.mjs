@@ -195,6 +195,17 @@ describe('forge-setup egress service',()=>{
     expect(setup).toContain('Before=ssh.socket ssh.service sshd.service');
     expect(setup).toContain('OnBootSec=1min');
   });
+  it('boot ordering cannot cycle: After= names only early-boot targets, never anything downstream of ssh.socket',()=>{
+    const m=setupSrc().match(/forge-exec-egress\.service <<EGRESS\n([\s\S]*?)\nEGRESS\n/);
+    expect(m,'egress unit heredoc missing').not.toBeNull();
+    const unit=m[1];
+    // DefaultDependencies=no keeps the unit out of basic.target; any After= on a unit that itself sits after
+    // sockets.target/basic.target (systemd-user-sessions, network-online, multi-user...) closes a loop with
+    // Before=ssh.socket (ssh.socket is Before=sockets.target, which basic.target waits for).
+    expect(unit).toContain('DefaultDependencies=no');
+    const after=unit.split('\n').filter(l=>l.startsWith('After=')).flatMap(l=>l.slice(6).trim().split(/\s+/));
+    expect(after).toEqual(['local-fs.target']);
+  });
   it('fail closed: ssh.service drop-in requires the egress service, written before daemon-reload',()=>{
     const setup=setupSrc();
     const m=setup.match(/ssh\.service\.d\/forge-egress\.conf <<'SSHDROPIN'\n([\s\S]*?)\nSSHDROPIN\n/);
