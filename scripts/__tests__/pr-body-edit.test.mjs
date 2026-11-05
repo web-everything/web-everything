@@ -86,6 +86,7 @@ describe('cliGh() — the CLI PR reader is live', () => {
       expect(cmd).toBe('gh');
       expect(args).toEqual(['pr', 'view', '6244', '--json', 'state,body,author', '--repo', 'o/r']);
       expect(opts.encoding).toBe('utf8');
+      expect(opts.maxBuffer).toBe(8 * 1024 * 1024);
       expect(opts.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
       expect(opts.throttle.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
       expect(process.env.WE_GH_READ_MEMO_DIR).toBe('memo-dir');

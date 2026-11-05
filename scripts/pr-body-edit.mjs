@@ -103,7 +103,8 @@ export function repair(gh, pr, repo, execFile = execFileSyncThrottled) {
 /** The CLI's PR reader. Its body read is compared before a write, so a gh shim must never serve it from the
  * smoke read memo: the memo is stripped from the child environment. */
 export function cliGh(repo, exec = execFileSync) {
-  return (args) => createMqLiveReader(exec)('gh', repo ? [...args, '--repo', repo] : args, { encoding: 'utf8' });
+  return (args) => createMqLiveReader(exec)('gh', repo ? [...args, '--repo', repo] : args,
+    { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
 }
 
 function main(argv) {
