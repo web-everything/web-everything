@@ -268,6 +268,15 @@ describe('settlement reads fresh PR state and result evidence', () => {
     expect(o.syncLabels).not.toHaveBeenCalled();
     expect(row.settleError).toBe('red-team result comment not confirmed posted; label unchanged');
   });
+  it('a newer same-head changes run in the witness blocks clearing on an older accepting status', () => {
+    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: payload('accept'), recorded: false, seatRecorded: false,
+      status: { status: 'finished', result: { comment: 'posted', foldedVerdict: 'accept' } } })), readIgnorableConfirms: () => [] });
+    o.readWitness = vi.fn(() => ({ ok: true, newest: { verdict: { verdict: 'changes' } }, rawWriter: { parsed: null }, markers: {}, seats: [] }));
+    o.rawPrs[0].comments.push(resultComment());
+    const row = mod.runRedTeamOnSkip(o).rows[0];
+    expect(o.syncLabels).not.toHaveBeenCalled();
+    expect(row.settleError).toBe('newest same-head review is not an accept; label unchanged');
+  });
   it('a throwing result evidence read settles nothing and reports settleError', () => {
     const o = runFixture({ readEvidence: () => { throw Error('fresh evidence offline'); } });
     o.rawPrs[0].comments.push(resultComment());
