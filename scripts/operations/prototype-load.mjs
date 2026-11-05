@@ -21,8 +21,10 @@ export function jsonLines(text) {
  *  ref, full 40-hex sha and ruling match the record exactly. Anything else stays refused; a `--audit` argument can
  *  never claim it. Never a blanket bypass. */
 const RULING = /^R\d+(?:\+R\d+)*$/;
-export function readyEvidence(records, input, ruledWeakened = [], liveFp = null) {
+export function readyEvidence(records, input, ruledWeakened = [], liveFpSource = null) {
   if (input.testsRun?.trim() && /^NOT WEAKENED$/i.test(input.audit || '')) return { source: 'arguments', testsRun: input.testsRun };
+  // The live fingerprint may be passed lazily (a function): the arguments path above never pays for the git read.
+  const liveFp = typeof liveFpSource === 'function' ? liveFpSource() : liveFpSource;
   // R503: a record speaks for the live sha when it names it exactly, or its stored net-diff fingerprint equals the live one.
   // A rebase or merge of main that leaves the code alone therefore keeps the evidence; any code change does not.
   const covers = (r) => r?.ref === input.branch && (r.sha === input.sha || validSha(r.sha) && carriesAcross(r.fingerprint, liveFp));
@@ -35,7 +37,9 @@ export function readyEvidence(records, input, ruledWeakened = [], liveFp = null)
   if (record) return { source: 'ready-record', record };
   // The allowlist entry binds to the record by its exact sha, or (carry) by holding the live fingerprint itself.
   const binds = (e, r) => e.sha === r.sha && r.sha === input.sha || validSha(e.sha) && validSha(r.sha) && carriesAcross(e.fingerprint, liveFp) && carriesAcross(r.fingerprint, liveFp);
-  const ruled = records.find((r) => covers(r) && r.tests === 'green' && r.audit === 'WEAKENED'
+  // When the current head's own latest verdict is WEAKENED, ONLY that record can be ruled: an older carried (or older
+  // exact-head) record with a ruled exception for different findings must never stand in for it.
+  const ruled = records.find((r) => (!headWeakened || r === exact) && covers(r) && r.tests === 'green' && r.audit === 'WEAKENED'
     && validSha(r.sha) && RULING.test(r.auditRuling || '')
     && Array.isArray(r.auditDisclosed) && r.auditDisclosed.length > 0 && r.auditDisclosed.every((f) => typeof f === 'string' && f.trim())
     && Array.isArray(ruledWeakened) && ruledWeakened.some((e) => e && e.ref === r.ref && binds(e, r) && e.ruling === r.auditRuling
