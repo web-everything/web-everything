@@ -70,6 +70,18 @@ describe('gateLaunch — each kind decides through admit() at its threshold (enf
   });
 });
 
+describe('gateLaunch — a throwing legacy gate fails closed (R559)', () => {
+  for (const cutover of ['enforce', 'shadow']) {
+    it(`refuses with reason gate-error and logs it (${cutover})`, () => {
+      const lines = [];
+      const d = gateLaunch({ kind: 'fix', root, nowMs: NOW, legacyGate: () => { throw new Error('boom'); }, settings: { cutover }, log: (l) => lines.push(l) });
+      expect(d.admit).toBe(false);
+      expect(d.reason).toBe('gate-error');
+      expect(lines.join('')).toMatch(/gate-error: boom/);
+    });
+  }
+});
+
 describe('cutoverDecision — shadow keeps the legacy verdict deciding', () => {
   it('shadow: the legacy verdict stands, the shared one is still computed and attached', () => {
     writeSnap(snap({ idle: 50 }));

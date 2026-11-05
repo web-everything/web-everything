@@ -207,7 +207,12 @@ export function cutoverDecision({ gate, kind, legacy = { admit: true }, mode = '
 export function gateLaunch({ kind = 'fix', gate, env = process.env, settings, legacyGate = gateHost, nowMs = Date.now(), root,
   shadow, admitFn, log, sample, loadavg = () => os.loadavg()[0], cpuCount = () => os.cpus().length } = {}) {
   let legacy;
-  try { legacy = legacyGate({ kind, env, loadavg, cpuCount, ...(sample ? { sample } : {}) }); } catch { legacy = { admit: true }; }
+  try { legacy = legacyGate({ kind, env, loadavg, cpuCount, ...(sample ? { sample } : {}) }); } catch (e) {
+    // Fail closed (R559): a swallowed legacy-gate exception must never admit work, in any cutover mode.
+    const why = `gate-error: ${String(e?.message ?? e).split('\n')[0]}`;
+    try { (log ?? ((l) => process.stderr.write(l)))(`resource-gate gate=${gate ?? `launch.${kind}`} kind=${kind} ${why}\n`); } catch { /* best effort */ }
+    return { admit: false, reason: 'gate-error', kind: 'gate-error', why, decidedBy: 'legacy' };
+  }
   let mode = 'enforce';
   try { mode = (settings ?? loadResourceGateSettings({ env }).settings).cutover; } catch { /* the standard */ }
   return cutoverDecision({ gate: gate ?? `launch.${kind}`, kind, legacy, mode, env, nowMs, root,
