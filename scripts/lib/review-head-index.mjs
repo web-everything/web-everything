@@ -27,7 +27,11 @@ export const MAP_VERSION = 2;
 export const LOCK_STALE_MS = 30_000, LOCK_WAIT_MS = 15_000;
 const posInt = v => Number.isSafeInteger(v) && v > 0;
 
-/** Sibling of the shared runs dir: <operations>/review-head-index. */
+/**
+ * A SIBLING of the coordination root (not inside it, not inside <root>/runs): <dirname(root)>/review-head-index. The default
+ * root is <home>/workspace/.operations/coordination, so the index is <home>/workspace/.operations/review-head-index. A root
+ * overridden through WE_COORDINATION_ROOT moves the index with it (<dirname(override)>/review-head-index).
+ */
 export function defaultHeadIndexDir(env = process.env) { return join(dirname(resolveCoordinationRoot({ env })), 'review-head-index'); }
 export function headIndexPaths(dir) { return { log: join(dir, 'log.jsonl'), map: join(dir, 'map.json'), lock: join(dir, 'lock'), tmp: join(dir, 'map.json.tmp') }; }
 

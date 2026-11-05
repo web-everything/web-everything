@@ -1,16 +1,18 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as nodeFs from 'node:fs';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { fork } from 'node:child_process';
-import { withHeadIndexLock, seedFromReviewComments, recordReview, readHeadIndex, headReviewOwed, netPatchKey, resolveHeadIndexSettings, headIndexPaths } from '../review-head-index.mjs';
+import { withHeadIndexLock, seedFromReviewComments, recordReview, readHeadIndex, headReviewOwed, netPatchKey, resolveHeadIndexSettings, headIndexPaths, defaultHeadIndexDir } from '../review-head-index.mjs';
+import { COORDINATION_ROOT_ENV } from '../../operations/coordination-root.mjs';
 
 const H = n => String(n).repeat(40).slice(0, 40);
 let dir;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'rhi-')); });
+afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 const rec = (o = {}) => recordReview({ dir, repo: 'o/r', pr: 7, head: H(1), netPatchHash: 'p1', verdict: 'accept', at: '2026-11-04T10:00:00Z', keepPerPr: 20, ...o });
 
 describe('headReviewOwed', () => {
@@ -108,6 +110,15 @@ describe('durability and growth', () => {
   it('rejects malformed records instead of writing them', () => {
     expect(() => rec({ head: 'abc' })).toThrow(/head/);
     expect(() => rec({ verdict: '' })).toThrow(/verdict/);
+  });
+});
+
+describe('defaultHeadIndexDir', () => {
+  it('is a sibling of the coordination root: the default root and an overridden root both place it beside, never inside, the root', () => {
+    expect(defaultHeadIndexDir({})).toBe(join(homedir(), 'workspace', '.operations', 'review-head-index'));
+    expect(defaultHeadIndexDir({ [COORDINATION_ROOT_ENV]: '/a/b/coordination' })).toBe(join('/a/b', 'review-head-index'));
+    expect(defaultHeadIndexDir({ [COORDINATION_ROOT_ENV]: '  /x/y/root  ' })).toBe(join('/x/y', 'review-head-index')); // trimmed like the root itself
+    expect(defaultHeadIndexDir({ [COORDINATION_ROOT_ENV]: '/a/b/coordination' })).not.toContain(join('coordination', 'review-head-index'));
   });
 });
 
@@ -282,6 +293,31 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     writeFileSync(lock, JSON.stringify({ pid: 999999, token: 'dead', at: 0 }));
     writeFileSync(takeover, '{"pid":"x"}'); nodeFs.utimesSync(takeover, new Date(0), new Date(0));
     expect(withHeadIndexLock(dir, () => 'ok2', { staleMs: 1000 })).toBe('ok2');
+    expect(takeoverLeftovers()).toEqual([]);
+  });
+  it('racing takeover cleaners never leave two publishing holders: the cleaner whose rename lands first is fenced out by the other', () => {
+    const { lock } = headIndexPaths(dir);
+    const takeover = `${lock}.takeover`;
+    nodeFs.mkdirSync(dir, { recursive: true });
+    writeFileSync(lock, JSON.stringify({ pid: 999999, token: 'dead', at: 0 }));
+    writeFileSync(takeover, JSON.stringify({ pid: 999998, token: 'crashed', at: 0 })); // a dead takeover owner both cleaners race to clear
+    let raced = false, bOutcome = null, aPublished = null;
+    // Cleaner A has taken the takeover file and is about to rename its lock in. Cleaner B (which had read the dead file too and
+    // unlinks whatever sits there) removes A's takeover file, takes its own, and its rename lands first; A's rename follows.
+    const fsA = { ...nodeFs, renameSync: (from, to) => {
+      if (raced || to !== lock) return nodeFs.renameSync(from, to);
+      raced = true;
+      nodeFs.unlinkSync(takeover);
+      withHeadIndexLock(dir, fenceB => {
+        nodeFs.renameSync(from, to); // A's rename lands while B holds the lock
+        try { fenceB(); bOutcome = 'published'; } catch (e) { bOutcome = /lock lost/.test(e.message) ? 'fenced-out' : 'other:' + e.message; }
+      }, { staleMs: 1000 });
+    } };
+    expect(withHeadIndexLock(dir, fenceA => { fenceA(); aPublished = true; return 'a'; }, { fs: fsA, staleMs: 1000 })).toBe('a');
+    expect(raced).toBe(true);
+    expect(bOutcome).toBe('fenced-out'); // B's fence fails closed: only one holder ever publishes
+    expect(aPublished).toBe(true);
+    expect(existsSync(lock)).toBe(false);
     expect(takeoverLeftovers()).toEqual([]);
   });
   it('releases the lock when the transaction throws', () => {
