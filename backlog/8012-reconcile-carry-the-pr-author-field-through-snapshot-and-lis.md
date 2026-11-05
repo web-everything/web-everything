@@ -1,15 +1,16 @@
 ---
+bornAs: xzddyxy
 kind: story
-size: 3
+size: 2
 status: open
-scope: ["we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/soak/breaks/unlabelled-bot-pr-on-non-lane-head-nothing-owed.mjs", "we:scripts/conveyor/__tests__/reconcile-core.test.mjs"]
+scope: ["we:scripts/conveyor/reconcile-pass.mjs", "we:scripts/conveyor/open-pr-fetch.mjs", "we:scripts/lib/pr-list-paged.mjs", "we:scripts/lib/pr-snapshot.mjs"]
 dateOpened: "2026-11-05"
 tags: []
 ---
 
-# Reconcile: restore review label for unlabelled bot-authored PRs on non-lane heads
+# Reconcile: carry the PR author field through snapshot and list fetch
 
-Slice 1 of re-sliced #6296 (R611). restore-review-label covers open non-draft bot-authored (app/ or [bot]) non-lane PRs with green checks. Lineage: #6254 (13x never-reviewed unlabelled PRs answered nothing-owed); branch lane/reconcile-unlabelled-nonlane-pr; soak break unlabelled-bot-pr-on-non-lane-head-nothing-owed.
+Slice 3 of re-sliced #6296 (R611). reconcile-pass fetches the PR author (PR_LIST_JSON_FIELDS) and the snapshot/paged list/open-pr-fetch preserve it, so the bot-author rule can fire in production (found by the audit). Lineage: #6254, #6296.
 
 ## Acceptance
 
