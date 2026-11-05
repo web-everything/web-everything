@@ -1141,3 +1141,14 @@ describe('a clean-shaped red-team comment recording a non-accept verdict never c
     expect(o.syncLabels).not.toHaveBeenCalled();
   });
 });
+
+describe('zero-padded PR numbers in markers are still validated', () => {
+  it('a padded-marker comment with an indented confirmed break blocks an older clean result from clearing', () => {
+    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: payload('accept'), recorded: false, seatRecorded: false,
+      status: { status: 'finished', result: { comment: 'posted', foldedVerdict: 'accept' } } })), readIgnorableConfirms: () => [] });
+    o.rawPrs[0].comments.push(resultComment(), { author: { login: 'web-everything' }, createdAt: iso(acceptedAt + 5),
+      body: `<!-- we:red-team-advisory pr=0${pr} rev=${head} -->\nRed team not required on this head: x\n  1. [**confirmed**] (edge-case, broken) \u2014 hidden` });
+    mod.runRedTeamOnSkip(o);
+    expect(o.syncLabels).not.toHaveBeenCalled();
+  });
+});
