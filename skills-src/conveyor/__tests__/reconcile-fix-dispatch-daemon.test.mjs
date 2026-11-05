@@ -1745,7 +1745,12 @@ describe('xn025gx glue — buildAwaitVerifyStep, buildFixThrottle, buildDaemonEx
     vi.stubEnv('WE_RESOURCE_CUTOVER', 'shadow'); // the legacy cap + gate decide here; the cut-over is tested below
     vi.stubEnv('WE_RESOURCE_SHADOW', 'off');
     const fix = { meta: { kind: 'fix', repo: 'we', pr: 1 } };
-    const base = { sendBackReservedSlots: 0, env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '1' }, sample: () => null, loadavg: () => 0, cpuCount: () => 8, alive: () => true };
+    // R559: admission refuses on an unreadable/stale memory reading, so inject a healthy host (never the machine's real one).
+    const hostNow = Date.parse('2026-11-04T12:00:00Z');
+    const healthy = { nowMs: () => hostNow, resolveFloor: () => ({ metric: 'available', floorMb: 2048, source: 'test' }),
+      readSnap: () => ({ sampledAt: new Date(hostNow - 5000).toISOString(), freshUntil: new Date(hostNow + 15000).toISOString(),
+        cpu: { idlePct: 40, loadAvg: [1] }, memory: { pressureLevel: 1, metric: 'available', availableMb: 8192 } }) };
+    const base = { ...healthy, sendBackReservedSlots: 0, env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '1' }, sample: () => null, loadavg: () => 0, cpuCount: () => 8, alive: () => true };
     const full = buildFixThrottle({ ...base, slotClaims: () => [fix] }).tryAdmit('fix');
     expect(full).toMatchObject({ admit: false, kind: 'fix-cap' });
     const parkedGaveItBack = buildFixThrottle({ ...base, slotClaims: () => [] }).tryAdmit('fix');
@@ -1764,9 +1769,10 @@ describe('xn025gx glue — buildAwaitVerifyStep, buildFixThrottle, buildDaemonEx
     const claims = Array.from({ length: 2 }, (_, i) => ({ meta: { kind: 'fix', repo: 'we', pr: i + 1 } }));
     const fixCap = { floor: 2, ceiling: 4, ceilingAboveFloor: 2, raiseQueueOver: 5, raiseMinCpuIdlePct: 30, raiseStepPerPass: 2 };
     const now = Date.parse('2026-10-10T15:00:00Z');
-    const readSnap = () => ({ sampledAt: new Date(now - 5000).toISOString(), freshUntil: new Date(now + 20000).toISOString(),
-      cpu: { idlePct: 45, loadAvg: [40] }, memory: { pressureLevel: 1 }, disk: { busyPct: 100 } });
+    const readSnap = () => ({ sampledAt: new Date(now - 5000).toISOString(), freshUntil: new Date(now + 15000).toISOString(),
+      cpu: { idlePct: 45, loadAvg: [40] }, memory: { pressureLevel: 1, metric: 'available', availableMb: 8192, freePct: 60, swapUsedPct: 10 }, disk: { busyPct: 100 } });
     const t = buildFixThrottle({ slotClaims: () => claims, alive: () => true, queueLength: () => 7, readSnap, nowMs: () => now,
+      resolveFloor: () => ({ metric: 'available', floorMb: 2048, source: 'test' }), readHeavyWait: () => 0,
       settings: { cutover: 'enforce', fixCap }, gate: () => ({ admit: true }), log: () => {}, env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '2' } });
     expect(t.tryAdmit('fix')).toMatchObject({ admit: true, aboveStaticCap: true });
     expect(t.capDecision()).toMatchObject({ cap: 4, raised: true });

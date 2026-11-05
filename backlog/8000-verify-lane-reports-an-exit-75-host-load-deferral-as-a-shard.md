@@ -1,0 +1,36 @@
+---
+bornAs: x8oo9hx
+kind: story
+size: 3
+status: open
+dateOpened: "2026-11-04"
+tags: []
+---
+
+# verify-lane reports an exit-75 host-load or memory-pressure deferral as a shard INVENTORY-INCOMPLETE (capacity/wait) and fires at once instead of queueing
+
+A verify run that heavy-admission defers for host load or host memory pressure (vitest exit 75; load over host.maxLoadPerCore, or reclaimable headroom under host.minMemoryHeadroomMb) is labelled 'a test shard stayed INVENTORY-INCOMPLETE after one split retry (capacity/wait)' and returns infrastructure-failure within 2-7s, even with --wait=540000. Expected: a truthful 'deferred for host load' label and a queued wait that honours --wait. Evidence: lane-22 verify attempts at load 76-79.
+
+## Acceptance
+
+- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+
+Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+
+Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+
+## Non-goals
+
+- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+
+## Edge cases this change must handle
+
+One line per class: either the handling, or `n/a: <why>`.
+
+1. **Untrusted text** — TODO: the handling, or n/a: <why>.
+2. **Truncated reads** — TODO: the handling, or n/a: <why>.
+3. **Shared state files** — TODO: the handling, or n/a: <why>.
+4. **Fail closed** — TODO: the handling, or n/a: <why>.
+5. **Identity scoping** — TODO: the handling, or n/a: <why>.
+6. **State over time** — TODO: the handling, or n/a: <why>.
+7. **Who wrote it** — TODO: the handling, or n/a: <why>.
