@@ -601,14 +601,22 @@ export function readPendingChangePaths({ root, cwd, env = process.env, execFileS
     if (!root || root === cwd) return { ok: true, paths: [], source: 'no separate code clone' };
     const git = (args) => String(execFileSyncImpl('git', args, { cwd: root, env, encoding: 'utf8', timeout: 30_000, maxBuffer: 4 * 1024 * 1024 }));
     const lines = (out) => out.split('\n').map((l) => l.trim()).filter(Boolean);
-    const adoptedAt = Date.parse(rebuildState()?.adopted?.at);
-    const refs = overlays().filter((o) => !Number.isFinite(adoptedAt) || !(Date.parse(o?.addedAt) <= adoptedAt)).map((o) => o.ref);
+    // An overlay counts as adopted only when its CURRENT tip is the sha the last adoption recorded for it. Registration age
+    // proves nothing: re-registering an existing overlay keeps addedAt, and its branch can advance after adoption.
+    const applied = rebuildState()?.adopted?.applied;
+    const adoptedSha = new Map((Array.isArray(applied) ? applied : []).filter((a) => isObj(a) && typeof a.ref === 'string' && typeof a.sha === 'string').map((a) => [a.ref, a.sha]));
     const paths = new Set(lines(git(['diff', '--name-only', '--no-renames', 'HEAD', 'origin/main'])));
-    for (const ref of refs) {
+    let inspected = 0;
+    for (const o of overlays()) {
+      const ref = o?.ref;
       if (typeof ref !== 'string' || !/^[A-Za-z0-9._/-]+$/.test(ref) || ref.startsWith('-')) return { ok: false, error: `overlay ref ${JSON.stringify(ref)} unsafe` };
+      const tip = git(['rev-parse', '--verify', '--quiet', `origin/${ref}^{commit}`]).trim();
+      if (!/^[0-9a-f]{40}$/.test(tip)) return { ok: false, error: `overlay ref ${JSON.stringify(ref)} tip unreadable` };
+      if (adoptedSha.get(ref) === tip) continue;
+      inspected += 1;
       for (const p of lines(git(['diff', '--name-only', '--no-renames', `origin/main...origin/${ref}`, '--']))) paths.add(p);
     }
-    return { ok: true, paths: [...paths], source: `main delta + ${refs.length} overlay(s)` };
+    return { ok: true, paths: [...paths], source: `main delta + ${inspected} overlay(s)` };
   } catch (e) { return { ok: false, error: String(e?.message || e).split('\n')[0] }; }
 }
 

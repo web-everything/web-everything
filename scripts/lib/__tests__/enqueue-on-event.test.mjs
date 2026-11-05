@@ -663,18 +663,40 @@ describe('readCatchUpCandidates', () => {
 describe('readPendingChangePaths', () => {
   const base = { root: '/code', cwd: '/clone', overlays: () => [{ ref: 'lane/x', addedAt: '2026-11-05T00:00:00Z' }], rebuildState: () => ({ adopted: { at: '2026-11-04T00:00:00Z' } }) };
   it('unions the main delta and each unadopted overlay diff', () => {
-    const exec = (_c, args) => (args.includes('HEAD') ? 'a.mjs\n' : 'b.mjs\n');
+    const exec = (_c, args) => (args[0] === 'rev-parse' ? `${'c'.repeat(40)}\n` : args.includes('HEAD') ? 'a.mjs\n' : 'b.mjs\n');
     expect(readPendingChangePaths({ ...base, execFileSyncImpl: exec })).toMatchObject({ ok: true, paths: ['a.mjs', 'b.mjs'] });
   });
-  it('skips overlays adopted already', () => {
+  const SHA_A = 'a'.repeat(40);
+  const SHA_B = 'b'.repeat(40);
+  const adoptedState = (applied) => () => ({ adopted: { at: '2026-11-06T00:00:00Z', applied } });
+  const execWithTip = (tip, calls) => (_c, args) => { calls.push(args); return args[0] === 'rev-parse' ? `${tip}\n` : (args.some((a) => String(a).includes('...origin/lane/x')) ? 'scripts/lib/enqueue-on-event.mjs\n' : ''); };
+  it('skips an overlay whose current tip is the adopted sha', () => {
     const calls = [];
-    readPendingChangePaths({ ...base, rebuildState: () => ({ adopted: { at: '2026-11-06T00:00:00Z' } }), execFileSyncImpl: (_c, args) => { calls.push(args); return ''; } });
-    expect(calls).toHaveLength(1);
+    const out = readPendingChangePaths({ ...base, rebuildState: adoptedState([{ ref: 'lane/x', sha: SHA_A }]), execFileSyncImpl: execWithTip(SHA_A, calls) });
+    expect(out).toMatchObject({ ok: true, paths: [] });
+    expect(calls.some((args) => args.some((a) => String(a).includes('...origin/lane/x')))).toBe(false);
+  });
+  it('still inspects an overlay that advanced past its adopted sha even though its registration predates adoption', () => {
+    const calls = [];
+    const out = readPendingChangePaths({ ...base, rebuildState: adoptedState([{ ref: 'lane/x', sha: SHA_A }]), execFileSyncImpl: execWithTip(SHA_B, calls) });
+    expect(out).toMatchObject({ ok: true, paths: ['scripts/lib/enqueue-on-event.mjs'] });
+  });
+  it('inspects an overlay that was never recorded as applied (registration age is not proof of adoption)', () => {
+    const out = readPendingChangePaths({ ...base, rebuildState: adoptedState([]), execFileSyncImpl: execWithTip(SHA_A, []) });
+    expect(out.paths).toContain('scripts/lib/enqueue-on-event.mjs');
+    const legacy = readPendingChangePaths({ ...base, rebuildState: () => ({ adopted: { at: '2026-11-06T00:00:00Z' } }), execFileSyncImpl: execWithTip(SHA_A, []) });
+    expect(legacy.paths).toContain('scripts/lib/enqueue-on-event.mjs');
+  });
+  it('fails closed when the overlay tip cannot be resolved', () => {
+    const exec = (_c, args) => { if (args[0] === 'rev-parse') throw new Error('unknown revision'); return ''; };
+    expect(readPendingChangePaths({ ...base, rebuildState: adoptedState([{ ref: 'lane/x', sha: SHA_A }]), execFileSyncImpl: exec })).toMatchObject({ ok: false });
   });
   it('disables rename detection so a moved protected file still shows its source path', () => {
     const calls = [];
-    readPendingChangePaths({ ...base, execFileSyncImpl: (_c, args) => { calls.push(args); return ''; } });
-    expect(calls.every((args) => args.includes('--no-renames'))).toBe(true);
+    readPendingChangePaths({ ...base, execFileSyncImpl: (_c, args) => { calls.push(args); return args[0] === 'rev-parse' ? `${'c'.repeat(40)}\n` : ''; } });
+    const diffs = calls.filter((args) => args[0] === 'diff');
+    expect(diffs).toHaveLength(2);
+    expect(diffs.every((args) => args.includes('--no-renames'))).toBe(true);
   });
   it('fails closed on a git error or an unsafe ref', () => {
     expect(readPendingChangePaths({ ...base, execFileSyncImpl: () => { throw new Error('bad object'); } })).toMatchObject({ ok: false });
