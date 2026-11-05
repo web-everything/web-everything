@@ -261,7 +261,8 @@ describe('plain snapshot provenance — oldest author snapshot and agreeing ids'
     expectReason(await restoreAuthorStamp(seams), 'skip');
     expect(seams.writeBody).toHaveBeenCalledTimes(1);
     expect(seams.writeBody).toHaveBeenCalledWith(6244, `${BODY}\n\n${marker}\n`);
-    expect(seams.readEdits).toHaveBeenCalledTimes(1);
+    // Planning read + pre-write re-read on the restore run; the skip run reads no history.
+    expect(seams.readEdits).toHaveBeenCalledTimes(2);
     expect(seams.readEdits).toHaveBeenCalledWith(6244);
     expect(body).toBe(`${BODY}\n\n${marker}\n`);
     expect(readAuthorActorStamps(body)).toEqual([ID]);
@@ -294,7 +295,8 @@ describe('restoreAuthorStamp — injected IO and concurrent edits', () => {
     expect((await restoreAuthorStamp(seams)).action).toBe('restore');
     expect((await restoreAuthorStamp(seams)).action).toBe('skip');
     expect(seams.writeBody).toHaveBeenCalledTimes(1);
-    expect(seams.readEdits).toHaveBeenCalledTimes(1);
+    // Planning read + pre-write re-read on the restore run; the skip run reads no history.
+    expect(seams.readEdits).toHaveBeenCalledTimes(2);
     expect(readAuthorActorStamps(body)).toEqual([ID]);
   });
 
@@ -324,6 +326,28 @@ describe('restoreAuthorStamp — injected IO and concurrent edits', () => {
       expectReason(await restoreAuthorStamp(seams), 'refuse');
       expect(seams.writeBody).not.toHaveBeenCalled();
     });
+
+  // Red-team break (#6409): another session stamps B then removes it, returning the body to its exact
+  // text. Identical text is not unchanged evidence: the history read again before the write must match.
+  it.each([
+    ['a conflicting stamp added then removed', () => [
+      edit(BODY, 'chalbert', '2026-10-01T14:00:00Z'),
+      edit(`${BODY}\n\n${buildAuthorActorMarker(OTHER)}`, 'chalbert', '2026-10-01T13:00:00Z'),
+      ...history(),
+    ]],
+    ['an agreeing revision that restores the same text', () => [edit(BODY, 'chalbert', '2026-10-01T13:00:00Z'), ...history()]],
+    ['a rewritten snapshot of the same length', () => [edit(`Original body\n\n${buildAuthorActorMarker(OTHER)}`), ...history().slice(1)]],
+    ['an unreadable re-read', () => null],
+    ['a re-read that throws', () => { throw new Error('history unavailable'); }],
+  ])('refuses when the history changed before write (%s) even though the body text is identical', async (_name, later) => {
+    const seams = io({ readEdits: vi.fn().mockReturnValueOnce(history()).mockImplementationOnce(later) });
+    const result = await restoreAuthorStamp(seams);
+    expectReason(result, 'refuse');
+    expect(seams.readEdits).toHaveBeenCalledTimes(2);
+    expect(seams.readEdits.mock.invocationCallOrder[1]).toBeGreaterThan(seams.readPr.mock.invocationCallOrder[1]);
+    expect(seams.writeBody).not.toHaveBeenCalled();
+    expect(seams.log.mock.calls.flat().join('\n')).not.toContain('restored stamp');
+  });
 
   it('dryRun writes nothing and never claims a completed restoration', async () => {
     const seams = io({ dryRun: true });
@@ -369,7 +393,7 @@ describe('sweepAuthorStamps — isolated failures and bounded retries', () => {
     // No production TTL value is mandated; advancing one year proves the memo expires.
     time += 366 * 24 * 60 * 60_000;
     expect((await sweepAuthorStamps(seams))[0].action).toBe('restore');
-    expect(seams.readEdits).toHaveBeenCalledTimes(2);
+    expect(seams.readEdits).toHaveBeenCalledTimes(3); // + planning read and pre-write re-read
     expect(seams.writeBody).toHaveBeenCalledTimes(1);
   });
 });
@@ -595,7 +619,7 @@ describe('sweepAuthorStamps — listing bounds', () => {
         listPrs: () => Array.from({ length: 99 }, (_, i) => listed(0, `fill-${s}-${i}`)) });
     }
     expect(sweepAuthorStamps(seams)[0].action).toBe('restore');
-    expect(seams.readEdits).toHaveBeenCalledTimes(2);
+    expect(seams.readEdits).toHaveBeenCalledTimes(3); // + planning read and pre-write re-read
   });
 
   it.each([null, {}, 'prs'])('throws on an unreadable listing: %j', (prs) => {
@@ -722,7 +746,7 @@ process.stdout.write(out);
     });
     sweepAuthorStamps({ repo: 'o/stamp-restore', exec, log: vi.fn() });
     expect(exec.mock.calls.map(([, args]) => args.slice(0, 2))).toEqual([
-      ['pr', 'list'], ['pr', 'view'], ['api', 'graphql'], ['pr', 'view'], ['pr', 'edit']]);
+      ['pr', 'list'], ['pr', 'view'], ['api', 'graphql'], ['pr', 'view'], ['api', 'graphql'], ['pr', 'edit']]);
     for (const [, , opts] of exec.mock.calls) {
       expect(opts.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
       expect(opts.throttle.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');

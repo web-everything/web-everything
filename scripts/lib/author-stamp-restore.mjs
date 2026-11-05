@@ -98,6 +98,10 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
     id: [...ids][0], source: oldest, marker: oldestMarker, body: `${body}\n\n${oldestMarker}\n` };
 }
 
+// Fails closed: an unreadable re-read never equals a planned (array) history.
+const historyKey = (edits) => (Array.isArray(edits) ? JSON.stringify(edits.map((e) => [e?.createdAt,
+  e?.editor?.__typename, e?.editor?.login, e?.diff])) : null);
+
 export function restoreAuthorStamp({ pr, repo, dryRun = false,
   exec = execFileSyncThrottled,
   readPr = (number) => JSON.parse(live(exec)('gh', ['pr', 'view', String(number), '--repo', repo,
@@ -112,11 +116,17 @@ export function restoreAuthorStamp({ pr, repo, dryRun = false,
     const input = { state: live?.state, body: live?.body, authorLogin: live?.author?.login };
     const initial = planStampRestore(input);
     if (initial.action === 'skip' || initial.reason !== 'unreadable edit history') return initial;
-    const plan = planStampRestore({ ...input, edits: readEdits(pr) });
+    const edits = readEdits(pr);
+    const plan = planStampRestore({ ...input, edits });
     if (plan.action !== 'restore' || dryRun) return plan;
     const latest = readPr(pr);
     if (latest?.body !== live.body || latest?.state !== 'OPEN'
       || latest?.author?.login !== live.author.login) return refusal('live PR changed before write; retry from fresh evidence');
+    // Identical body text is not unchanged evidence: an edit can add a conflicting stamp and remove it again.
+    // History is re-read after the final body read and must match the planned history exactly.
+    if (historyKey(readEdits(pr)) !== historyKey(edits)) {
+      return refusal('edit history changed before write; retry from fresh evidence');
+    }
     writeBody(pr, plan.body);
     log(safe(`author-stamp-restore: #${pr} restored stamp ${plan.id} from edit ${plan.source.createdAt} by ${plan.source.editor.login}`));
     return plan;

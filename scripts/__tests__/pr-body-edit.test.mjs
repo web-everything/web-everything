@@ -139,6 +139,26 @@ describe('repair() — GraphQL userContentEdits recovery', () => {
     expect(hasStampLostMarker(call[2].input)).toBe(false);
   });
 
+  // PR #6409 red team: a conflicting stamp added then removed leaves the body text identical; the CLI must
+  // re-read the history before writing and refuse, not restore the stale plan.
+  it('exits non-zero and writes nothing when a stamp was added then removed after the history read', () => {
+    const nodes = [
+      { createdAt: '2026-10-01T10:00:00Z', editor: { __typename: 'Bot', login: 'plateau-worker' }, diff: `Original\n\n${stamp(A)}` },
+      { createdAt: '2026-10-01T12:00:00Z', editor: { __typename: 'User', login: 'chalbert' }, diff: unstamped },
+    ];
+    const later = [
+      { createdAt: '2026-10-01T14:00:00Z', editor: { __typename: 'User', login: 'chalbert' }, diff: unstamped },
+      { createdAt: '2026-10-01T13:00:00Z', editor: { __typename: 'User', login: 'chalbert' }, diff: `${unstamped}\n\n${stamp(B)}` },
+      ...nodes,
+    ];
+    let reads = 0;
+    const execFile = stubExec(() => response((reads += 1) === 1 ? nodes : later));
+    expect(repair(ghView(unstamped), pr, repo, execFile)).not.toBe(0);
+    expect(reads).toBe(2);
+    expectGraphqlOnly(execFile);
+    expect(editCall(execFile)).toBeUndefined();
+  });
+
   it.each([
     ['failed request', () => { throw new Error('simulated network blip'); }],
     ['invalid JSON', () => 'not JSON'],
