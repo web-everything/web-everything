@@ -587,7 +587,7 @@ function strictBodyKind(body, pr, head) {
     || line === 'The red team tried to break this change and reported nothing.'
     || /^Red team not required on this head: [^\r\n]+$/.test(line)
     || /^Findings: none\.?$/i.test(line)
-    || line.startsWith(advisory) && /^[^\s`/]+\/[^\s`]+ · recorded verdict `(accept|changes|needs-human|prevention-outstanding)`\.$/.test(line.slice(advisory.length))) ? 'clean' : false;
+    || line.startsWith(advisory) && /^[^\s`/]+\/[^\s`]+ · recorded verdict `accept`\.$/.test(line.slice(advisory.length))) ? 'clean' : false;
 }
 
 /** Only known clean templates can clear; parsed confirmed breaks retain the send-back path. */
@@ -714,8 +714,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       // A trusted red-team result supplies its own blocked/clear disposition. Its finding text
       // is not an independent review hold; all other thread comments still guard settlement.
       const holdComments = row.settle === 'result' ? comments.filter(comment =>
-        !redTeamForHead([comment], row.prNumber, row.head) || strictBodyKind(comment.body, row.prNumber, row.head) !== 'clean'
-          || isLaterVerdictBody(comment.body)) : comments;
+        !redTeamForHead([comment], row.prNumber, row.head) || isLaterVerdictBody(comment.body)) : comments;
       if (row.settle === 'result'
         && !provenAcceptance({ comments: holdComments, reviews, labels: live.labels, head: row.head })) {
         throw Error('no proven acceptance for this head; label unchanged');
