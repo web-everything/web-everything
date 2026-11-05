@@ -148,7 +148,10 @@ export function withHeadIndexLock(dir, fn, { fs = nodeFs, staleMs = LOCK_STALE_M
       // Another contender is taking over. Clear its file only if its owner is dead (or it is unreadable and past the grace).
       let other = null; try { other = JSON.parse(fs.readFileSync(takeover, 'utf8')); } catch { /* unreadable */ }
       let otherAge = 0; try { otherAge = now() - fs.statSync(takeover).mtimeMs; } catch { return false; }
-      if (other ? Number.isInteger(other.pid) && !pidAlive(other.pid) : otherAge > staleMs) { try { fs.unlinkSync(takeover); } catch { /* gone */ } }
+      // A file with no integer pid is treated like an unreadable one (cleared by age), so a malformed one cannot block forever.
+      // Two cleaners racing here can at worst let two contenders rename over the lock; the loser's post-rename token check or its
+      // first fence() fails closed, so the lock never has two publishing holders.
+      if (Number.isInteger(other?.pid) ? !pidAlive(other.pid) : otherAge > staleMs) { try { fs.unlinkSync(takeover); } catch { /* gone */ } }
       return false;
     }
     const fresh = `${lock}.new.${token}`;

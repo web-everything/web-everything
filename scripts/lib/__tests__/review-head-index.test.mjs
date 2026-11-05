@@ -278,6 +278,11 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     writeFileSync(takeover, JSON.stringify({ pid: 999998, token: 'crashed', at: 0 }));
     expect(withHeadIndexLock(dir, () => 'ok')).toBe('ok');
     expect(takeoverLeftovers()).toEqual([]);
+    // a malformed takeover file (no integer pid) is cleared by age, never a permanent block
+    writeFileSync(lock, JSON.stringify({ pid: 999999, token: 'dead', at: 0 }));
+    writeFileSync(takeover, '{"pid":"x"}'); nodeFs.utimesSync(takeover, new Date(0), new Date(0));
+    expect(withHeadIndexLock(dir, () => 'ok2', { staleMs: 1000 })).toBe('ok2');
+    expect(takeoverLeftovers()).toEqual([]);
   });
   it('releases the lock when the transaction throws', () => {
     const fs = { ...nodeFs, renameSync: () => { throw Error('crash'); } };
