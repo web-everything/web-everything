@@ -6,9 +6,9 @@ dateOpened: "2026-11-04"
 tags: []
 ---
 
-# verify-lane reports an exit-75 host-load deferral as a shard INVENTORY-INCOMPLETE (capacity/wait) and fires at once instead of queueing
+# verify-lane reports an exit-75 host-load or memory-pressure deferral as a shard INVENTORY-INCOMPLETE (capacity/wait) and fires at once instead of queueing
 
-A verify run that heavy-admission defers for host load (vitest exit 75, load over host.maxLoadPerCore) is labelled 'a test shard stayed INVENTORY-INCOMPLETE after one split retry (capacity/wait)' and returns infrastructure-failure within 2-7s, even with --wait=540000. Expected: a truthful 'deferred for host load' label and a queued wait that honours --wait. Evidence: lane-22 verify attempts at load 76-79.
+A verify run that heavy-admission defers for host load or host memory pressure (vitest exit 75; load over host.maxLoadPerCore, or reclaimable headroom under host.minMemoryHeadroomMb) is labelled 'a test shard stayed INVENTORY-INCOMPLETE after one split retry (capacity/wait)' and returns infrastructure-failure within 2-7s, even with --wait=540000. Expected: a truthful 'deferred for host load' label and a queued wait that honours --wait. Evidence: lane-22 verify attempts at load 76-79.
 
 ## Acceptance
 
