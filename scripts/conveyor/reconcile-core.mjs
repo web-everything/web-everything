@@ -1181,14 +1181,14 @@ export function markIdleFinishedSessions(agents, idleFinishedInfoFor, nowMs, thr
  *   - every marker names a non-blank identity (`**Who:**` for begin, release line for end).
  * Earlier releases at this head remain evidence for their own sessions, until that session claims again.
  * @param {object} pr
- * @returns {{releasedAtMs:number, head:string, who:string, releases:Array<{releasedAtMs:number, head:string, who:string}>}|null}
+ * @returns {{releasedAtMs:number, index:number, head:string, who:string, releases:Array<{releasedAtMs:number, head:string, who:string}>}|null}
  */
 export function releasedFixClaim(pr) {
   const head = String(pr?.headRefOid ?? '');
   if (!head) return null;
   const markers = (Array.isArray(pr?.comments) ? pr.comments : [])
-    .filter((c) => isTrustedMarkerAuthor(c) && typeof c?.body === 'string')
-    .map((c) => ({ c, body: c.body.trimStart(), at: Date.parse(c.createdAt) }))
+    .flatMap((c, index) => isTrustedMarkerAuthor(c) && typeof c?.body === 'string'
+      ? [{ c, index, body: c.body.trimStart(), at: Date.parse(c.createdAt) }] : [])
     .filter((m) => m.body.startsWith(FIX_BEGIN_MARKER) || m.body.startsWith(FIX_END_MARKER));
   if (!markers.length || markers.some((m) => !Number.isFinite(m.at))) return null;
   markers.sort((a, b) => a.at - b.at);
@@ -1196,7 +1196,7 @@ export function releasedFixClaim(pr) {
   // Equal timestamps are ambiguous ordering: array order must never decide, so fail closed.
   if (markers.some((m, i) => i > 0 && markers[i - 1].at === m.at)) return null;
   if (!last.body.startsWith(FIX_END_MARKER)) return null; // a later fix-begin = claim held again
-  const named = /at `([0-9a-f]{7,40})`/.exec(last.body)?.[1];
+  const named = fixClaimReleaseHead(last.c.body);
   if (!named || !sameHeadSha(named, head)) return null;
   const who = /^`([^`\r\n]*)` released the fix claim\b/m.exec(last.body)?.[1];
   if (!who?.trim()) return null;
@@ -1208,12 +1208,18 @@ export function releasedFixClaim(pr) {
       : /^\*\*Who:\*\* `([^`\r\n]*)`/m).exec(marker.body)?.[1];
     if (!identity?.trim()) return null; // cannot safely attribute a later claim to a session
     releasesBySession.delete(identity); // a renewed claim or invalid release supersedes its earlier evidence
-    const releaseHead = isEnd && /at `([0-9a-f]{7,40})`/.exec(marker.body)?.[1];
+    const releaseHead = isEnd && fixClaimReleaseHead(marker.c.body);
     if (releaseHead && sameHeadSha(releaseHead, head)) {
       releasesBySession.set(identity, { releasedAtMs: marker.at, head, who: identity });
     }
   }
-  return { releasedAtMs: last.at, head, who, releases: [...releasesBySession.values()] };
+  return { releasedAtMs: last.at, index: last.index, head, who, releases: [...releasesBySession.values()] };
+}
+
+/** Match the strict producer sentence used by operator-send-backs.mjs; quoted heads grant nothing. */
+function fixClaimReleaseHead(body) {
+  const release = /^🔓 conveyor fix-end — fix claim released\r?\n\r?\n`([^`\r\n]+)` released the fix claim at `([a-f0-9]{7,40})`\.(?:[ \t]|\r?\n|$)/i.exec(body);
+  return release?.[1].trim() ? release[2] : null;
 }
 
 /**
@@ -1582,6 +1588,39 @@ function advisoryHeadState(pr) {
   return { headSha, latest, advisoryIsCurrent, alreadyReviewed, unpinnedAdvisory };
 }
 
+/** Unreadable or unpinned history grants nothing; cross-head chronology must agree with thread order. */
+function latestHeadReview(pr, { currentHeadOnly = false } = {}) {
+  const reviews = (Array.isArray(pr?.comments) ? pr.comments : [])
+    .map((c, index) => ({ c, index }))
+    .filter(({ c }) => isTrustedMarkerAuthor(c) && (isReviewVerdictComment(c) || latestAdvisory([c])))
+    // Operator send-backs are requests, not finished reviews of a head.
+    .filter(({ c }) => !isOperatorAuthored(c) || !openOperatorSendBacks({ comments: [c] }).length)
+    .map(({ c, index }) => ({ index, head: reviewedHeadsOf(c).at(-1) ?? latestAdvisory([c])?.head, at: Date.parse(c.createdAt) }));
+  if (!reviews.length || reviews.some(r => !r.head || !Number.isFinite(r.at))) return null;
+  const current = reviews.filter(r => sameHeadSha(r.head, pr.headRefOid));
+  if (currentHeadOnly) {
+    // Other heads' clocks cannot hide a newer operator request on this head.
+    if (current.some((r, i) => i > 0 && r.at <= current[i - 1].at)) return null;
+    return current.at(-1) ?? null;
+  }
+  // Coverage is independent of chronology: a skewed old-head review cannot reopen this head.
+  if (current.length || reviews.some((r, i) => i > 0 && r.at <= reviews[i - 1].at)) return null;
+  return reviews.at(-1);
+}
+
+/** A fresh operator request takes ownership even when this head already has its advisory. */
+function operatorSendBackAfterReview(pr) {
+  const review = latestHeadReview(pr, { currentHeadOnly: true });
+  if (!review || !sameHeadSha(review.head, pr.headRefOid)) return null;
+  const item = openOperatorSendBacks(pr).at(-1);
+  if (!item?.body || !Number.isFinite(Date.parse(item.at)) || Date.parse(item.at) <= review.at
+    || item.index <= review.index
+    || (item.head && !sameHeadSha(item.head, pr.headRefOid))) return null;
+  // Reuse the same one-shot consumption check as the existing send-back route, with the original ID type.
+  if (!item.id || !operatorSendBackRearm(pr, { verdictId: pr.comments[item.index].id })) return null;
+  return { verdictId: item.id, login: item.login, body: item.body };
+}
+
 /**
  * Common review decision. Allow the last fix its review at the cap; refuse only above it.
  * Preserve draft, reviewed-head and advisory conversion semantics;
@@ -1590,7 +1629,7 @@ function advisoryHeadState(pr) {
  */
 function dispatchReviewRow({
   pr, requiredChecks, withPhase, base, attempts, roundCap, refuse, refuseCapExhausted, dispatch, extra = {}, now = 0,
-  advisoryReview = null,
+  advisoryReview = null, reviewAfterFix = null,
 }) {
   if (refuseReferralHold({ pr, refuse, withPhase, extra })) return;
   // ── `scope-bloat` (card x29vm8a) — a diff that is mostly NOT this PR's own change is never reviewed (live 2026-10-08,
@@ -1718,12 +1757,13 @@ function dispatchReviewRow({
   // ── gate-held advisory (live #4764) — an advisory review is not a repair round, so it skips the findings/cap
   // accounting below, but it passes every gate ABOVE (referral hold, scope-bloat, draft, already-reviewed-head) and
   // the CI gate: it is this function's review, never a second hand-rolled copy of it.
-  if (advisoryReview) {
-    if ((advisoryReview.ciWaived !== true || pr.reviewTiming?.startAfter !== 'ci-green') && !reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra })) return;
+  if (advisoryReview || reviewAfterFix) {
+    if ((advisoryReview?.ciWaived !== true || pr.reviewTiming?.startAfter !== 'ci-green') && !reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra })) return;
     dispatch.push({
       ...base, ...withPhase, kind: 'review', findings: countFindings(pr?.comments), ...extra,
-      advisoryReview: { head: advisoryReview.head, reason: advisoryReview.reason,
-        ...(advisoryReview.ciWaived === true ? { ciWaived: true } : {}) }, why: advisoryReview.why,
+      ...(advisoryReview ? { advisoryReview: { head: advisoryReview.head, reason: advisoryReview.reason,
+        ...(advisoryReview.ciWaived === true ? { ciWaived: true } : {}) } } : {}),
+      why: advisoryReview?.why ?? reviewAfterFix,
     });
     return;
   }
@@ -2943,8 +2983,9 @@ export function planReconcile({
     // guard / timeout-evidence refusal then held with nobody working it). Authenticated by comment author in
     // {@link operatorFixBudget}, never by text; one-shot; counted against the round grants; the loop guard stays
     // for automatic ci-heals.
-    const sendBack = (ciRepairOwed || (phase === 'bounced' && !withPhase.labels.includes(CONFLICT_LABEL)))
-      ? operatorSendBackRearm(pr, operatorBudget) : null;
+    const sendBack = (phase === 'needs-human' ? operatorSendBackAfterReview(pr) : null)
+      ?? ((ciRepairOwed || (phase === 'bounced' && !withPhase.labels.includes(CONFLICT_LABEL)))
+        ? operatorSendBackRearm(pr, operatorBudget) : null);
     if (sendBack) {
       const attempts = roundAttempts();
       if (attempts >= effectiveRoundCap) {
@@ -2957,7 +2998,7 @@ export function planReconcile({
       dispatch.push({
         ...base, ...withPhase, kind: 'fix', mode: 'operator-send-back', findings: 1, attempts, cap: effectiveRoundCap,
         operatorSendBack: sendBack,
-        why: `operator send-back by @${sendBack.login} with a must-fix body on a red-CI PR — re-armed once as a fix (operator re-arm), not a ci-heal`,
+        why: `operator send-back by @${sendBack.login} with a must-fix body — re-armed once as a fix (operator re-arm)`,
       });
       continue;
     }
@@ -3531,6 +3572,26 @@ export function planReconcile({
         attempts, cap: effectiveRoundCap, blockRuledReferrals: pr.blockRuledReferrals,
         why: `${pr.blockRuledReferrals.length} mandatory referral(s) on this head were ruled block and nothing live is working it`
           + ' — the fix that changes the head is owed, not another review of the same head',
+      });
+      continue;
+    }
+
+    // A pushed repair owes its review even if fix-end left the old findings/advisory labels in place.
+    // Claims and live reviewers already refused above; completed red CI still belongs to its repair path.
+    // Both the timestamp and original thread index must put the release after that review.
+    // A released fix does not supersede a conflict still owed its existing repair route and cap.
+    const lastReview = latestHeadReview(pr);
+    const release = releasedFixClaim(pr);
+    if (OWED[phase] && lastReview && release && release.releasedAtMs > lastReview.at
+      && !withPhase.labels.includes(CONFLICT_LABEL) && String(pr?.mergeStateStatus ?? '').toUpperCase() !== 'DIRTY'
+      && release.index > lastReview.index
+      && !sameHeadSha(lastReview.head, pr.headRefOid)) {
+      const why = 'the fixer released a new head after the last review — its review is owed before another repair';
+      dispatchReviewRow({ pr, requiredChecks, withPhase, base, attempts: roundAttempts(),
+        roundCap: effectiveRoundCap, refuse, refuseCapExhausted, dispatch, now,
+        ...(withPhase.labels.includes(REVIEW_LABELS.human)
+          ? { advisoryReview: { head: pr.headRefOid, reason: 'fix-pushed', why } }
+          : { reviewAfterFix: why }),
       });
       continue;
     }
