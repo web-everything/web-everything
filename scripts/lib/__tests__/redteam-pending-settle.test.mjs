@@ -61,7 +61,7 @@ function notOwedRunFixture(over = {}) {
   return runFixture({ ...f, now: () => f.now, ...over });
 }
 function resultRunFixture(over = {}, verdict = 'accept') {
-  return runFixture({ readEvidence: () => evidence({ recorded: true,
+  return runFixture({ readEvidence: () => evidence({ recorded: true, loopPayload: payload('accept'),
     status: { status: 'finished', result: { status: 'ran', foldedVerdict: verdict } } }), ...over });
 }
 function carryFixture() {
@@ -188,18 +188,15 @@ describe('policy-clear publication revalidates fresh evidence', () => {
 });
 
 describe('settlement reads fresh PR state and result evidence', () => {
-  it('passes review-unfinished evidence to label synchronization and preserves pending', () => {
+  it('review-unfinished (unknown) evidence at settle time never synchronizes: pending is preserved', () => {
     const unknown = { ok: false, reason: 'review-unfinished',
       status: { status: 'finished', result: { foldedVerdict: 'accept' } } };
     const o = runFixture({ readEvidence: vi.fn(() => unknown), readIgnorableConfirms: () => [] });
     o.rawPrs[0].comments.push(resultComment());
-    const changes = [];
-    o.syncLabels.mockImplementation(input => changes.push(planRedTeamStatusLabels({ ...input,
-      labels: o.rawPrs[0].labels, comments: o.rawPrs[0].comments, standingRuling: null })));
-    mod.runRedTeamOnSkip(o);
-    expect(o.syncLabels).toHaveBeenCalledWith(expect.objectContaining({ repo, pr, head, evidence: unknown }));
+    const row = mod.runRedTeamOnSkip(o).rows[0];
+    expect(o.syncLabels).not.toHaveBeenCalled();
     expect(o.readEvidence).toHaveBeenCalledWith({ repo, pr, head });
-    expect(changes).toEqual([{ add: null, remove: [] }]);
+    expect(row.settleError).toBeTruthy();
   });
   it.each([
     ['in flight', { inFlight: true }],
@@ -254,6 +251,14 @@ describe('settlement reads fresh PR state and result evidence', () => {
     { ...resultComment(), createdAt: iso(acceptedAt + 2) });
     mod.runRedTeamOnSkip(o);
     expect(o.syncLabels).not.toHaveBeenCalled();
+  });
+  it('a rejecting review payload beside an older accepting red-team status never clears', () => {
+    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: { verdict: { verdict: 'changes' } }, recorded: false, seatRecorded: false,
+      status: { status: 'finished', result: { foldedVerdict: 'accept' } } })), readIgnorableConfirms: () => [] });
+    o.rawPrs[0].comments.push(resultComment());
+    const row = mod.runRedTeamOnSkip(o).rows[0];
+    expect(o.syncLabels).not.toHaveBeenCalled();
+    expect(row.settleError).toBe('review payload is not an accept; label unchanged');
   });
   it('a throwing result evidence read settles nothing and reports settleError', () => {
     const o = runFixture({ readEvidence: () => { throw Error('fresh evidence offline'); } });
@@ -899,7 +904,7 @@ describe('audit hardening: unknown effect statuses and checked comments', () => 
       expect(mod.headNeverReviewedFromRuns(input)).toBe(false);
     });
   it('hands the synchronizer freshly checked comments and no cached live state', () => {
-    const o = runFixture({ readEvidence: () => evidence({ status: { status: 'finished', result: { foldedVerdict: 'accept' } } }) });
+    const o = runFixture({ readEvidence: () => evidence({ loopPayload: payload('accept'), status: { status: 'finished', result: { foldedVerdict: 'accept' } } }) });
     o.rawPrs[0].comments.push(resultComment());
     const comments = [...o.rawPrs[0].comments, trusted('🔔 conveyor — newly read status')];
     o.readComments = vi.fn(() => comments);
@@ -972,5 +977,15 @@ describe('re-stamped acceptance is not a confirm-exclusion anchor', () => {
       runsDir: '/runs', list: () => [], read: () => ({}), stat: () => ({ mtimeMs: acceptedAt - 3600e3 }), now: acceptedAt + 1000 });
     expect(result.ok).toBe(false);
     expect(result.ids).toEqual([]);
+  });
+});
+
+describe('confirm exclusion needs an accepting comment, not just a marker', () => {
+  it('a changes-requested comment carrying a reviewed-sha marker never anchors exclusion', () => {
+    const comments = [{ author: { login: 'web-everything' }, createdAt: iso(acceptedAt),
+      body: `\u{1F501} review \u2014 changes requested\n\nFix it.\n<!-- reviewed-sha: ${head} -->` }];
+    const result = mod.ignorableConfirmRunIds({ repo, pr, head, comments, reviews: [], labels: ['review:accepted'],
+      runsDir: '/runs', list: () => [], read: () => ({}), stat: () => ({ mtimeMs: acceptedAt - 3600e3 }), now: acceptedAt + 1000 });
+    expect(result).toEqual({ ok: false, ids: [] });
   });
 });
