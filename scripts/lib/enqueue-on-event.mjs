@@ -611,6 +611,9 @@ export function readPendingChangePaths({ root, cwd, env = process.env, execFileS
     // leaves HEAD behind its own record.
     const applied = rebuildState()?.adopted?.applied;
     const everApplied = new Set((Array.isArray(applied) ? applied : []).filter((a) => isObj(a) && typeof a.ref === 'string').map((a) => a.ref));
+    // Freshness precondition: this reads the code clone's LOCAL origin/main and origin/<ref> tracking refs and never fetches. The
+    // daemon rebuild's edge fetch (daemon-rebuild/edge-fetch.mjs) refreshes them; a ref that lags it can only hide a change for the
+    // current catch-up window, and the 10-minute max pause and overlayRefreshPending's own age bound still end the refresh.
     // Three-dot: only what main gained since it diverged from HEAD. A two-dot diff also lists files an overlay already merged into HEAD
     // carries (HEAD has them, main does not), which the refresh would not change.
     const overlayList = overlays(); // read the registry first: an unreadable one fails closed before any git call
