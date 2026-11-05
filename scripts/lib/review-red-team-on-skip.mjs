@@ -251,6 +251,11 @@ export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
       if (run.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr)) continue;
       const rev = run.findings?.read?.netBasis?.rev;
       if (!isRealHead(rev) || rev === head) return false;
+      const activeEffects = run.effects.some(effect => ['pending', 'in-flight'].includes(effect?.status));
+      const unfinished = !run.verdict || run.pending != null || activeEffects;
+      // Only an inert needs-human confirm on a different head may be left behind.
+      if (unfinished && !(run.verdict?.verdict === 'needs-human'
+        && run.pending?.kind === 'confirm' && !activeEffects)) return false;
     }
     return true;
   } catch { return false; }
@@ -388,8 +393,14 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       const status = unfinishedCarry ? evidence.status : readStatus({ repo, pr, head });
       const pendingCardOnly = cardOnlySkipSettlementCandidate({ ...evidence, status }, head);
       const owed = redTeamOwedFor(evidence?.loopPayload);
+      const verdict = evidence?.loopPayload?.verdict?.verdict;
+      const finishedNotOwed = [evidence?.status, status].every(candidate => candidate?.status === 'finished'
+        && normalizeRedTeamResult(candidate.result).priorResult === 'not-owed'
+        && !candidate.result?.deferredByGuard && !candidate.result?.deferredByCap);
+      const recordedNotOwed = (typeof verdict === 'string' && verdict.trim().length > 0 && !owed)
+        || finishedNotOwed;
       const notOwed = () => ({ ...skip('stored review does not owe a red team'),
-        ...(!owed && evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
+        ...(recordedNotOwed && evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
           && evidence.inFlight === false && !evidence.queued
           && evidence.recorded === false && evidence.seatRecorded === false ? { settle: 'not-owed' } : {}) });
       // A missing live-head review requires the full loop; stale reads cannot authorize a red-team-only pass.
@@ -411,7 +422,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         if (laterReviewHold(reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
         return dispatchDecision({ action: 'review', why: 'unprovable head move needs a full review' });
       }
-      if (!movedCardOnly && !pendingCardOnly && (!owed || accepted)) {
+      if (!movedCardOnly && !pendingCardOnly && (!owed || accepted || finishedNotOwed)) {
         if (evidence?.inFlight || evidence?.queued) return skip('red-team pass in flight');
         if (evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
           && accepted
@@ -437,7 +448,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           if (refusal) return guardedSkip(refusal);
           return { ...row, action: 'clear', why: 'not owed (stored review)' };
         }
-        if (!owed) return notOwed();
+        if (!owed || finishedNotOwed) return notOwed();
       }
       if (!movedCardOnly && evidence.loopPayload?.findings?.read?.netBasis?.rev !== head) return skip('stored review does not match live head');
       if (evidence.inFlight || evidence.queued) return skip('red-team pass in flight');
