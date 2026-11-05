@@ -2051,6 +2051,30 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
     // a foreign-question record is not a valid verdict and neither blocks nor enables
     expect(prototypeLoad.canonicalAuditEvidence([old(), { ...weak, questionHash: 'foreign' }], SHA, () => true, FP)).toEqual({ ok: true, record: old() });
   });
+  // AU1 PR-B: a current-question record for the carried head+base blocks a PRIOR-question pass even when carry
+  // eligibility (a missing or differing fingerprint) dropped that current record from the eligible set.
+  describe('prior-question pass vs an ineligible current-question record', () => {
+    const PRIOR = 'c'.repeat(64);
+    const opts = { priorQuestionHashes: [{ hash: PRIOR, acceptUntil: '2026-10-30T00:00:00Z' }], now: Date.parse('2026-10-21T00:00:00Z') };
+    const prior = () => old({ questionHash: PRIOR });
+    const carry = (...records) => prototypeLoad.canonicalAuditEvidence(records, SHA, () => true, FP, opts);
+    it('the carried prior pass alone is a pass (the setting is live in this path)', () => {
+      expect(carry(prior())).toEqual({ ok: true, record: prior() });
+    });
+    it.each([
+      ['no fingerprint', { fingerprint: undefined }],
+      ['a differing fingerprint', { fingerprint: '1'.repeat(64) }],
+      ['an unusable timestamp', { fingerprint: undefined, at: 'not-a-date' }],
+      ['an unknown verdict', { fingerprint: undefined, verdict: 'MAYBE' }],
+    ])('a current-question record with %s on the same head+base blocks the carried prior pass, in either order', (_, over) => {
+      const current = old({ at: '2026-10-19T12:00:00Z', ...over });
+      expect(carry(prior(), current)).toEqual({ ok: false, reason: 'no-record' });
+      expect(carry(current, prior())).toEqual({ ok: false, reason: 'no-record' });
+    });
+    it('a current-question record for another base does not block the carried prior pass', () => {
+      expect(carry(prior(), old({ fingerprint: undefined, base: 'f'.repeat(40) }))).toEqual({ ok: true, record: prior() });
+    });
+  });
   it('the base must still be covered by main', () => {
     expect(prototypeLoad.canonicalAuditEvidence([old()], SHA, () => false, FP)).toEqual({ ok: false, reason: 'no-record' });
   });

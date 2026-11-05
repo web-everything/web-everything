@@ -37,7 +37,7 @@ export function readyEvidence(records, input, ruledWeakened = []) {
  * base, file order breaks ties, contradictory findings rejected). Fail closed: ANY base whose latest verdict is
  * WEAKENED blocks, and a pass only counts when covers(base) proves the base is already in main (the audit spans the
  * whole change, not just its last commit). */
-export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp = null) {
+export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp = null, auditOptions = {}) {
   // R503: an audit of an older head also speaks for this head when its stored net-diff fingerprint equals the live one.
   // No stored or live fingerprint, or any difference, means no carry (a real code change always re-audits).
   // Eligibility is per RECORD: each carried record must itself hold the matching fingerprint, so one carried record
@@ -58,8 +58,12 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   for (const head of heads) {
     const bases = new Set(eligible.filter((r) => r.head === head && r.base !== head).map((r) => r.base));
     for (const base of bases) {
-      const record = findAudit(eligible, { head, base, questionHash: QUESTION_HASH });
+      const record = findAudit(eligible, { head, base, questionHash: QUESTION_HASH, ...auditOptions });
       if (record?.verdict === 'WEAKENED') return { ok: false, reason: 'weakened' };
+      // A current-question record for this head+base (usable or not) blocks a PRIOR-question pass, even when carry
+      // eligibility dropped it from `eligible` (no or differing fingerprint): judge against ALL records, fail closed.
+      if (record && record.questionHash !== QUESTION_HASH
+        && records.some(r => r?.head === head && r.base === base && r.questionHash === QUESTION_HASH)) continue;
       if (record && covers(base) && (!pass || Date.parse(record.at) >= Date.parse(pass.at))) pass = record;
     }
   }
