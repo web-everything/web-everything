@@ -106,6 +106,9 @@ function scan(t, start, depth, inHole, lits) {
   let exprClose = false; // the last token was the `}` of such a brace: an operand, so a following `/` divides
   let postfixBang = false; // the last token was a TypeScript non-null `x!`: an operand, so a following `/` divides
   let numDot = false; // the last token was the `.` ending a numeric literal (`1.`): an operand, so a following `/` divides
+  let ternaries = 0; // open `?` of a ternary in the current brace level, still waiting for their `:`
+  const ternaryStack = []; // the count of each enclosing brace level
+  let colonExpr = false; // the last `:` was followed by an expression (ternary / property) rather than a statement (label / case)
   let prevWordFor = false; // the current word directly follows the word `for` (comments and spaces between don't count)
   let asyncExpr = false; // the last `async` keyword began in expression position
   let pendKind = ''; // 'function' | 'class' keyword seen, its body `{` not yet opened
@@ -193,6 +196,7 @@ function scan(t, start, depth, inHole, lits) {
     let opensExpr = false;
     if (c === '{') {
       opensExpr = braceOpensExpr(last, prev, word());
+      if (last === ':') opensExpr = colonExpr; // after a label / `case` / `default` colon the brace is a block
       if (last === ')' && fnBodyExpr) opensExpr = true;
       if (pendKind && stack.length === pendDepth) {
         if (pendKind === 'function' && last === ')') pendKind = '';
@@ -206,8 +210,14 @@ function scan(t, start, depth, inHole, lits) {
     emit(c, c);
     if (c === '!') postfixBang = nonNull;
     if (c === '.') numDot = endsNumber;
-    if (c === '{') braces.push(opensExpr);
-    if (c === '}') exprClose = braces.pop() ?? false;
+    if (c === '?' && t[i + 1] !== '?' && t[i - 1] !== '?' && !(t[i + 1] === '.' && !(t[i + 2] >= '0' && t[i + 2] <= '9'))) ternaries++; // `?` of `a ? b : c`, not `??` / `?.`
+    if (c === ':') {
+      // the colon of a ternary, or of a property in an object literal, is followed by an expression; a label / `case` /
+      // `default` colon in a block is followed by a statement (a `{` there is a block, its `}` ends a statement)
+      if (ternaries > 0) { ternaries--; colonExpr = true; } else colonExpr = braces.length ? braces[braces.length - 1] : inHole;
+    }
+    if (c === '{') { braces.push(opensExpr); ternaryStack.push(ternaries); ternaries = 0; }
+    if (c === '}') { exprClose = braces.pop() ?? false; ternaries = ternaryStack.pop() ?? 0; }
     if (c === ')') {
       const k = stack.pop() ?? 0;
       ctrlParen = k === 1;

@@ -204,6 +204,18 @@ describe('sourceNeedsGit', () => {
     // a declaration (statement start) followed by a regex still reads the regex
     expect(sourceNeedsGit(E + "function /* c */ g(){} /'/.test(s); const u = 'http://x'; execSync('git status');")).toBe(true);
   });
+  it('a `{` after a label / case colon is a block (a regex follows); after a ternary or property colon it is an object (a division follows)', () => {
+    const E = "import { execSync } from 'node:child_process'; ";
+    const tail = " execSync('git status'); const path = '/tmp';";
+    for (const src of [
+      "label: {} /'/.test(1);", "a: { } /'/.test(1);", "switch (a) { case 1: {} /'/.test(1); }", "switch (a) { default: {} /'/.test(1); }",
+      "switch (a) { case b ? 1 : 2: {} /'/.test(1); }", "{ lbl: {} /'/.test(1); }",
+    ]) expect(sourceNeedsGit(E + src + " const u = 'http://x';" + tail), src).toBe(true);
+    for (const src of [
+      'const o = {a: {} / 2};', 'const o = c ? {} / 2 : 0;', 'const o = c ? 1 : {} / 2;', 'const o = {a: c ? 1 : 2, b: {} / 2};', 'const o = c ?? {} / 2;', 'const o = x?.y ? 1 : {} / 2;',
+      'const o = (c ? {a: 1} : {}) / 2;', 'const o = {k: {}} / 2;',
+    ]) expect(sourceNeedsGit(E + src + tail), src).toBe(true);
+  });
   it('U+2028 / U+2029 are legal inside string literals and do not end them', () => {
     const E = "import { execSync } from 'node:child_process'; ";
     for (const sep of [' ', ' ']) {
