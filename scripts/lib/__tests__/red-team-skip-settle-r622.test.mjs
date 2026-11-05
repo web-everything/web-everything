@@ -78,3 +78,18 @@ describe('R622 the evidence reader bounds a resumed unfinished review by its res
     expect(settled(run({ resumeOf: 'x' }))).toMatchObject({ ok: false, reason: 'review-unfinished' });
   });
 });
+
+describe('R622 several unfinished reviews', () => {
+  const mk = (id, startedAt, extra = {}) => ({ id, run: { op: 'review-pr', input: { repo: 'o/r', pr }, findings: { read: { netBasis: { rev: head } } },
+    stepTimings: [{ step: 'read', startedAt: new Date(startedAt).toISOString() }], verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' }, ...extra } });
+  const settledFor = runs => settleUnknownEvidenceByComment(readDrainRedTeamEvidence({ repo: 'o/r', pr, head, env: { WE_SHARED_RUNS_DIR: '/nonexistent-r622' },
+    runsDir: '/runs', list: () => runs.map(r => r.id), stat: () => ({ mtimeMs: T - 60e3 }), read: id => runs.find(r => r.id === id).run, readScorecards: () => [], now: T }), [comment()], pr, head);
+  it('an older run resumed after the comment holds even when a newer unfinished run started before it', () => {
+    const a = mk('review-pr-a', T - 7200e3, { resumeOf: 'x', resumedAt: new Date(T + 3600e3).toISOString() });
+    const b = mk('review-pr-b', T - 3600e3);
+    expect(settledFor([a, b])).toMatchObject({ ok: false, reason: 'review-unfinished' });
+  });
+  it('all unfinished runs older than the comment settle', () => {
+    expect(settledFor([mk('review-pr-a', T - 7200e3), mk('review-pr-b', T - 3600e3)])).toMatchObject({ ok: true });
+  });
+});
