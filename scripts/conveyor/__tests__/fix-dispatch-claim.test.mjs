@@ -932,6 +932,94 @@ describe('idle-claim auto-release (R201)', () => {
     });
   });
 
+  // Named cases for the hung-verdict exemption (`idle && boundToClaim && reason === 'stale-no-activity'`) and for the
+  // 90-minute quiet floor it defers to. hungInfoFor is stubbed to ALWAYS report hung/stale-no-activity, so the only
+  // thing deciding the outcome is the exemption itself. An exempt row stays live: its claim is heartbeat-refreshed
+  // (`refreshed`) and its idle clock runs; a row marked hung drops out of isClaimSessionLive, so the claim is never
+  // refreshed and never idle-released (it is left to its own TTL).
+  describe('hung verdict on an idle holder: the stale-no-activity exemption and the 90-minute quiet floor', () => {
+    const MIN = 60_000;
+    const SID = 'S-exempt';
+    const HUNG_SILENT = () => ({ hung: true, reason: 'stale-no-activity' });
+    const claimWith = (sessionId) => acquireFixDispatchClaim({ repo: 'we', pr: 5996, kind: 'fix', headSha: 'sha1', owner: 'A',
+      ...(sessionId ? { sessionId } : {}), lockRoot: claimRoot, nowMs: T0, nowIso: iso(T0), leaseMinutes: 10 });
+    const run = ({ row, quietMs, hungInfoFor = HUNG_SILENT, sweeps = 1, head = () => 'sha1' }) => {
+      const out = { released: [], refreshed: [] };
+      for (let i = 0, t = T0 + MIN; i < sweeps; i += 1, t += 2 * MIN) {
+        const r = refreshLiveFixDispatchClaims({
+          lockRoot: claimRoot, listAgentsAll: () => [row], hungInfoFor, awaitingVerifyFor: null,
+          activityMsFor: () => t - quietMs, prHeadFor: head, recordEvent: () => {}, nowIso: () => iso(t),
+          idleRelease: resolveIdleClaimRelease({ env: {}, platform: null }),
+        });
+        out.released.push(...(r.released ?? []));
+        out.refreshed.push(...(r.refreshed ?? []));
+      }
+      return out;
+    };
+    const idleRow = { name: 'fix-5996', sessionId: SID, state: 'idle', status: 'idle', startedAt: T0 + 1000 };
+    const claimStillHeld = () => readFixDispatchClaim({ repo: 'we', pr: 5996, kind: 'fix', lockRoot: claimRoot });
+
+    it.each([
+      ['by sessionId', SID, idleRow],
+      ['by start time (claim has no sessionId)', null, { ...idleRow, sessionId: undefined }],
+    ])('(a) an idle row bound %s with a hung/stale-no-activity verdict stays live: not marked hung, claim retained', (_n, claimSid, row) => {
+      claimWith(claimSid);
+      const out = run({ row, quietMs: 120 * MIN });
+      expect(out.released).toHaveLength(0);
+      expect(out.refreshed).toHaveLength(1);
+      expect(claimStillHeld()).not.toBeNull();
+    });
+
+    it('(b) the same bound row with state working (and status busy) is marked hung: never refreshed, never idle-released', () => {
+      claimWith(SID);
+      const out = run({ row: { ...idleRow, state: 'working', status: 'busy' }, quietMs: 120 * MIN, sweeps: 16 });
+      expect(out.refreshed).toHaveLength(0);
+      expect(out.released).toHaveLength(0);
+    });
+
+    it('(b2) a hung verdict that is not stale-no-activity (a pending call past its grace) marks even a bound idle row hung', () => {
+      claimWith(SID);
+      const out = run({ row: idleRow, quietMs: 120 * MIN, hungInfoFor: () => ({ hung: true, reason: 'pending-call-stale' }), sweeps: 16 });
+      expect(out.refreshed).toHaveLength(0);
+      expect(out.released).toHaveLength(0);
+    });
+
+    it.each([
+      ['a different sessionId', SID, { ...idleRow, sessionId: 'S-someone-else' }],
+      ['no sessionId on the claim and a startedAt before the claim', null, { ...idleRow, sessionId: undefined, startedAt: T0 - 1000 }],
+    ])('(c) an idle row NOT bound to the claim (%s) is marked hung: never refreshed, never idle-released', (_n, claimSid, row) => {
+      claimWith(claimSid);
+      const out = run({ row, quietMs: 120 * MIN, sweeps: 16 });
+      expect(out.refreshed).toHaveLength(0);
+      expect(out.released).toHaveLength(0);
+    });
+
+    it('a silent bound idle holder under the 90-minute quiet floor keeps the claim for the whole window, however unmoved the head', () => {
+      claimWith(SID);
+      const out = run({ row: idleRow, quietMs: 89 * MIN, sweeps: 40 });
+      expect(out.released).toHaveLength(0);
+      expect(out.refreshed.length).toBeGreaterThan(0);
+      expect(claimStillHeld()).not.toBeNull();
+      expect(claimStillHeld().meta.idleHead).toBeUndefined();
+    });
+
+    it('a silent bound idle holder at the 90-minute floor with an unchanged head releases the claim once the idle window elapses', () => {
+      claimWith(SID);
+      const out = run({ row: idleRow, quietMs: 90 * MIN, sweeps: 16 });
+      expect(out.released).toHaveLength(1);
+      expect(out.released[0].reason).toMatch(/idle-head-unmoved/);
+      expect(claimStillHeld()).toBeNull();
+    });
+
+    it('at the 90-minute floor but a head that keeps moving, the claim is retained', () => {
+      claimWith(SID);
+      let n = 0;
+      const out = run({ row: idleRow, quietMs: 90 * MIN, sweeps: 16, head: () => `sha-${n++}` });
+      expect(out.released).toHaveLength(0);
+      expect(claimStillHeld()).not.toBeNull();
+    });
+  });
+
   // The session-identity-dead check must arm the pid-reuse guard: identity() gets the row's start time as startedBy.
   describe('session-identity-dead check passes the row start time to identity()', () => {
     const claim = () => acquireFixDispatchClaim({ repo: 'we', pr: 5996, kind: 'fix', headSha: 'sha1', owner: 'A', sessionId: 'S1',
