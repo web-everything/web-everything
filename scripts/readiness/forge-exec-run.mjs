@@ -511,22 +511,31 @@ else:
                 sys.stderr.write('forge-exec-run: cannot pin pid ' + str(pid) + ' (' + type(error).__name__ + '); sweep skips it\n')
                 continue
             try:
-                # Freeze first: a stopped process cannot call setsid()/exec between the check and the kill.
+                # Verify identity through the pin BEFORE any signal: same start time, still in the run
+                # session, and still a descendant (direct orphan of this supervisor, or child of a swept one).
+                before = read_stat(pid)
+                if not before or before[4] != recorded or before[3] != child.pid or (pid in orphan_seen and before[1] != os.getpid()):
+                    sys.stderr.write('forge-exec-run: pid ' + str(pid) + ' changed or unreadable before signal; sweep skips it\n')
+                    continue
+                already_stopped = before[0] in (b'T', b't')
+                # Freeze, then re-verify: a stopped process cannot setsid()/exec before the kill.
                 try: signal.pidfd_send_signal(pidfd, signal.SIGSTOP)
                 except ProcessLookupError: continue
                 current = None
-                for _ in range(20):
+                for _ in range(5):
                     current = read_stat(pid)
                     if current and current[0] in (b'T', b't'): break
-                    time.sleep(0.05)
+                    time.sleep(0.02)
                 if not current or current[0] not in (b'T', b't') or current[4] != recorded or current[3] != child.pid:
-                    sys.stderr.write('forge-exec-run: pid ' + str(pid) + ' changed or unreadable before signal; sweep skips it\n')
-                    try: signal.pidfd_send_signal(pidfd, signal.SIGCONT)
-                    except ProcessLookupError: pass
+                    sys.stderr.write('forge-exec-run: pid ' + str(pid) + ' changed or unreadable after freeze; sweep skips it\n')
+                    if not already_stopped:
+                        try: signal.pidfd_send_signal(pidfd, signal.SIGCONT)
+                        except ProcessLookupError: pass
                     continue
                 try: signal.pidfd_send_signal(pidfd, signal.SIGKILL)
                 except ProcessLookupError: pass
             finally: os.close(pidfd)
+        now = time.monotonic()   # fresh: the sweep above may have taken time
         if deadline_ms is not None and now * 1000 > deadline_ms or cfg.get('wallMs') is not None and (now - started) * 1000 > cfg['wallMs']:
             sys.stderr.write('forge-exec-run: wall limit exceeded; killing child tree\n')
             return True

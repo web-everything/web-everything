@@ -728,7 +728,9 @@ signals = []
 def pidfd_send_signal(fd, sig):
     pid = fd_pid[fd]
     signals.append((pid, sig.name))
-    if sig == signal.SIGSTOP: entries[pid] = (b'T',) + entries[pid][1:]   # frozen: state T
+    if sig == signal.SIGSTOP:
+        entries[pid] = (b'T',) + entries[pid][1:]   # frozen: state T
+        if mode == 'setsid before freeze took hold': entries[pid] = (b'T', 100, 555, 555, entries[pid][4])
     elif sig == signal.SIGKILL: killed.append(pid)
     else: assert sig == signal.SIGCONT, sig
 cleanup_killed = []
@@ -793,11 +795,15 @@ print(json.dumps(signals), file=sys.stderr)
     const for201=signals.filter(([pid])=>pid===201).map(([,sig])=>sig);
     expect(for201.slice(0,2)).toEqual(['SIGSTOP','SIGKILL']);
   });
-  it('resumes a frozen process with SIGCONT when verification fails after the freeze', () => {
+  it('sends no signal at all to a pinned process whose identity does not verify (never SIGSTOP/SIGCONT a stranger)', () => {
     const {signals}=sweep('reused after pin');
+    expect(signals.filter(([pid])=>pid===201)).toEqual([]);
+  });
+  it('resumes a process it froze with SIGCONT, and never kills it, when it left the run session before the freeze took hold', () => {
+    const {signals,killed}=sweep('setsid before freeze took hold');
     const for201=signals.filter(([pid])=>pid===201).map(([,sig])=>sig);
-    expect(for201).toEqual(expect.arrayContaining(['SIGSTOP','SIGCONT']));
-    expect(for201).not.toContain('SIGKILL');
+    expect(for201).toEqual(['SIGSTOP','SIGCONT']);
+    expect(killed).not.toContain(201);
   });
   it('never launches the child when the run deadline passed before the supervisor got to launch it', async () => {
     sweep('deadline passed');
@@ -806,7 +812,7 @@ print(json.dumps(signals), file=sys.stderr)
   it.each(['no pidfd','reused after pin'])('fails closed and signals nothing when the process cannot be pinned or changes after the pin (%s)', mode => {
     const {killed,stderr}=sweep(mode);
     expect(killed).not.toContain(201);
-    expect(stderr).toMatch(/cannot pin pid 201|changed or unreadable before signal/);
+    expect(stderr).toMatch(/cannot pin pid 201|changed or unreadable (before|after)/);
   });
   it('fails closed when the start time cannot be read: no signal, a log line, slot cleanup left to finish', () => {
     const {killed,stderr}=sweep('unreadable start');
