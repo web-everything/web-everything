@@ -78,13 +78,18 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
       try { lstatSync(join(cwd, '.git', path)); return true; } catch (e) { if (['ENOENT', 'ENOTDIR'].includes(e.code)) return false; throw e; }
     })) run(['commit-graph', 'verify']);
     let names;
+    // Main paths this change itself empties (a removed card, the old path of a renamed one): a main card there is not
+    // a second holder of its identity once the change lands. A copy leaves its source in place, so it is not listed.
+    let vacated = new Set();
     let headText = (path) => run(['show', `${headSha}:${path}`]);
     if (api) {
       // R546: the added cards and their text come from GitHub REST (ETag; no fetch of the PR head). Main is judged
       // from the local origin/<base> ref, which must equal GitHub's tip: a stale ref fails closed (transient).
       const o = { rest, cwd, slug, source: reader };
       const addedRead = readAddedFiles(base, headSha, o);
-      names = unwrap(addedRead).added.filter(path => TOP_LEVEL_CARD.test(path));
+      const changes = unwrap(addedRead);
+      names = changes.added.filter(path => TOP_LEVEL_CARD.test(path));
+      vacated = new Set(changes.vacated);
       headText = (path) => {
         const text = unwrap(readFileAtRef('bornas-card', path, headSha, o));
         if (text == null) throw new DrainReadError('bornas-card', 'api-http-404', `${path} missing at the pinned head`);
@@ -141,7 +146,8 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
       // line format cannot name, so the evidence is unreadable.
       if (line && (!line.startsWith(prefix) || split < 0)) throw new Error('main grep output names a path it cannot delimit');
       if (!line || !mentions.test(line.slice(split + 1))) continue;
-      if (TOP_LEVEL_CARD.test(line.slice(prefix.length, split))) mainCards.add(line.slice(prefix.length, split));
+      const mainPath = line.slice(prefix.length, split);
+      if (TOP_LEVEL_CARD.test(mainPath) && !vacated.has(mainPath)) mainCards.add(mainPath);
     }
     if (mainCards.size > MAX_MAIN_READS) throw new Error(`${mainCards.size} main cards mention an added hash, over the ${MAX_MAIN_READS}-card read bound`);
     // Only readable frontmatter on both sides confirms a collision. A top-level main card whose frontmatter is

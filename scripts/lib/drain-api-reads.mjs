@@ -248,43 +248,40 @@ export function readBacklogNames(branch = 'main', o = {}) {
 }
 
 const KNOWN_STATUS = new Set(['added', 'modified', 'removed', 'renamed', 'copied', 'changed', 'unchanged']);
-const PAGE = 100;
 const COMPARE_CEILING = 300; // GitHub lists at most 300 files per compare, with no truncation flag: 300 or more may hide files
-const MAX_PAGES = 4;
 
 /**
- * Files ADDED by headSha relative to base (merge-base compare, like `git diff base...head --diff-filter=A`), following
- * every page. value: { added, previous } - `added` is every added file plus the NEW path of every renamed/copied entry
- * (the old no-rename git diff counted a rename as an addition); `previous` is the old path of renamed/copied entries.
+ * Files ADDED by headSha relative to base (merge-base compare, like `git diff base...head --diff-filter=A`).
+ * GitHub returns the WHOLE file list (up to 300) on the first response; `page` pages the commits and later pages
+ * carry no files, so the files are read from that one response and never paged. value: { added, previous, vacated } -
+ * `added` is every added file plus the NEW path of every renamed/copied entry (the old no-rename git diff counted a
+ * rename as an addition); `previous` is the old path of renamed/copied entries; `vacated` is every path the change
+ * leaves empty (a removed file, the old path of a rename), which a main card at that path no longer occupies.
  */
 export function readAddedFiles(base, headSha, o = {}) {
   const read = 'bornas-added-files';
-  // The base resolves to ONE commit sha first, so a main that moves between pages cannot mix two comparisons.
+  // The base resolves to ONE commit sha first, so the comparison is made against exactly the commit the caller can check.
   const baseTip = readBranchSha(base, o);
   if (!baseTip.ok) return { ...baseTip, read };
   const baseSha = baseTip.value;
+  const r = pull(read, `repos/{owner}/{repo}/compare/${baseSha}...${headSha}?per_page=100&page=1`, o);
+  if (!r.ok) return r;
+  const files = r.value?.files;
+  if (!Array.isArray(files)) return bad(r, 'api-malformed', 'no files list');
   const added = [];
   const previous = [];
-  let seen = 0;
-  let last;
-  for (let page = 1; page <= MAX_PAGES; page += 1) {
-    const r = pull(read, `repos/{owner}/{repo}/compare/${baseSha}...${headSha}?per_page=${PAGE}&page=${page}`, o);
-    if (!r.ok) return r;
-    last = r;
-    const files = r.value?.files;
-    if (!Array.isArray(files)) return bad(r, 'api-malformed', 'no files list');
-    for (const f of files) {
-      // Unknown evidence is never skipped: an entry without a name or a known status could hide an added card.
-      if (typeof f?.filename !== 'string' || !KNOWN_STATUS.has(f.status)) return bad(r, 'api-malformed', 'file entry without a name or a known status');
-      if (f.status === 'renamed' || f.status === 'copied') {
-        if (typeof f.previous_filename !== 'string') return bad(r, 'api-malformed', `${f.status} entry without previous_filename`);
-        previous.push(f.previous_filename);
-      }
-      if (f.status === 'added' || f.status === 'renamed' || f.status === 'copied') added.push(f.filename);
+  const vacated = [];
+  for (const f of files) {
+    // Unknown evidence is never skipped: an entry without a name or a known status could hide an added card.
+    if (typeof f?.filename !== 'string' || !KNOWN_STATUS.has(f.status)) return bad(r, 'api-malformed', 'file entry without a name or a known status');
+    if (f.status === 'renamed' || f.status === 'copied') {
+      if (typeof f.previous_filename !== 'string') return bad(r, 'api-malformed', `${f.status} entry without previous_filename`);
+      previous.push(f.previous_filename);
+      if (f.status === 'renamed') vacated.push(f.previous_filename);
     }
-    seen += files.length;
-    if (seen >= COMPARE_CEILING) return bad(r, 'compare-ceiling', `compare returned ${seen} files, at the ${COMPARE_CEILING}-file ceiling`);
-    if (files.length < PAGE) return { ...good(last, { added, previous }), baseSha };
+    if (f.status === 'removed') vacated.push(f.filename);
+    if (f.status === 'added' || f.status === 'renamed' || f.status === 'copied') added.push(f.filename);
   }
-  return bad(last, 'compare-ceiling', 'compare pages exhausted');
+  if (files.length >= COMPARE_CEILING) return bad(r, 'compare-ceiling', `compare returned ${files.length} files, at the ${COMPARE_CEILING}-file ceiling`);
+  return { ...good(r, { added, previous, vacated }), baseSha };
 }

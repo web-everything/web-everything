@@ -186,6 +186,33 @@ describe('bornAs read over REST', () => {
     const g = (a) => (a[0] === 'show' ? '---\nbornAs: xabc123\n---\nold\n' : git([], { grep })(a));
     expect(checkBornAsCollision(args(rest0(), g))).toMatchObject({ collision: { hash: 'xabc123' } });
   });
+  describe('paths the PR itself vacates are not a main collision', () => {
+    const grep = 'origin/main:backlog/12-old.md\0bornAs: xabc123\n';
+    const g = (a) => (a[0] === 'show' ? '---\nbornAs: xabc123\n---\nold\n' : git([], { grep })(a));
+    const world = (entry) => rest0({ 'compare/': ok({ files: [{ filename: 'backlog/12-new.md', ...entry }] }), ...fileWorld('backlog/12-new.md', b64(CARD)) });
+    it('an identity-preserving rename of the main card is admitted, not its own collision', () => {
+      const rest = world({ status: 'renamed', previous_filename: 'backlog/12-old.md' });
+      expect(checkBornAsCollision(args(rest, g))).toEqual({ ok: true });
+    });
+    it('a rename of a DIFFERENT path does not hide the main card', () => {
+      const rest = world({ status: 'renamed', previous_filename: 'drafts/other.md' });
+      expect(checkBornAsCollision(args(rest, g))).toMatchObject({ collision: { hash: 'xabc123', mainCard: 'backlog/12-old.md' } });
+    });
+    it('a copy leaves the old card in place, so it still collides', () => {
+      const rest = world({ status: 'copied', previous_filename: 'backlog/12-old.md' });
+      expect(checkBornAsCollision(args(rest, g))).toMatchObject({ collision: { hash: 'xabc123', mainCard: 'backlog/12-old.md' } });
+    });
+    it('a main card the PR removes while adding the same identity elsewhere is admitted', () => {
+      const rest = rest0({ 'compare/': ok({ files: [{ filename: 'backlog/12-new.md', status: 'added' }, { filename: 'backlog/12-old.md', status: 'removed' }] }), ...fileWorld('backlog/12-new.md', b64(CARD)) });
+      expect(checkBornAsCollision(args(rest, g))).toEqual({ ok: true });
+    });
+    it('another main card holding the identity still collides when one is vacated', () => {
+      const two = 'origin/main:backlog/12-old.md\0bornAs: xabc123\norigin/main:backlog/13-other.md\0bornAs: xabc123\n';
+      const rest = world({ status: 'renamed', previous_filename: 'backlog/12-old.md' });
+      const g2 = (a) => (a[0] === 'show' ? '---\nbornAs: xabc123\n---\nold\n' : git([], { grep: two })(a));
+      expect(checkBornAsCollision(args(rest, g2))).toMatchObject({ collision: { mainCard: 'backlog/13-other.md' } });
+    });
+  });
   it('5xx: unreadable with a named transient reason; enqueue gives a retry note, not a by-hand text', () => {
     const r = checkBornAsCollision(args(rest0({ 'compare/': http(500) }), git()));
     expect(r.error).toContain('api-http-500');
@@ -381,24 +408,22 @@ describe('verified decode: base64 against reported size and sha', () => {
 
 describe('pagination: follow to the end or be unreadable', () => {
   const page = (n, status = 'modified') => Array.from({ length: n }, (_x, i) => ({ filename: `f${i}-${n}-${Math.random()}`, status }));
-  it('follows pages until a short page and concatenates every page', () => {
-    const rest = routes({ '&page=1': ok({ files: [...page(99), { filename: 'backlog/a.md', status: 'added' }] }), '&page=2': ok({ files: [{ filename: 'backlog/b.md', status: 'added' }] }) });
+  // GitHub's compare returns its whole file list (up to 300) on the FIRST page; `page` pages the commits and later
+  // pages carry no files. A reader that pages files on a full first page would read page 2 and find no files list.
+  it.each([99, 100, 101, 250, 299])('%i files in the one response are complete; exactly one compare call is made', (n) => {
+    const rest = routes({ '&page=1': ok({ files: [...page(n - 1), { filename: 'backlog/a.md', status: 'added' }] }), '&page=2': ok({ commits: [] }) });
     const r = readAddedFiles('main', SHA, { source: src(rest) });
-    expect(r).toMatchObject({ ok: true, value: { added: ['backlog/a.md', 'backlog/b.md'] } });
-    expect(rest.seen).toHaveLength(3); // base-tip read + two pages
+    expect(r).toMatchObject({ ok: true, value: { added: ['backlog/a.md'] } });
+    expect(rest.seen).toHaveLength(2); // base-tip read + the one compare
+    expect(rest.seen.some((p) => p.includes('&page=2'))).toBe(false);
   });
-  it('a page failing midway makes the whole read unreadable, not a partial list', () => {
-    const rest = routes({ '&page=1': ok({ files: page(100) }), '&page=2': http(502) });
-    expect(readAddedFiles('main', SHA, { source: src(rest) })).toMatchObject({ ok: false, reason: 'api-http-502' });
+  it('a compare failing is unreadable, not a partial list', () => {
+    expect(readAddedFiles('main', SHA, { source: src(routes({ 'compare/': http(502) })) })).toMatchObject({ ok: false, reason: 'api-http-502' });
   });
-  it('the compare lists at most 300 files with no truncation flag: 300 files then an empty page is compare-ceiling, never complete', () => {
-    const rest = routes({ '&page=1': ok({ files: page(100) }), '&page=2': ok({ files: page(100) }), '&page=3': ok({ files: page(100) }), '&page=4': ok({ files: [] }) });
-    expect(readAddedFiles('main', SHA, { source: src(rest) })).toMatchObject({ ok: false, reason: 'compare-ceiling' });
-  });
-  it('299 files are complete; 300 in one page is compare-ceiling', () => {
+  it('the compare lists at most 300 files with no truncation flag: 300 or more is compare-ceiling, never complete', () => {
     const one = (n) => readAddedFiles('main', SHA, { source: src(routes({ 'compare/': ok({ files: page(n) }) })) });
-    expect(readAddedFiles('main', SHA, { source: src(routes({ '&page=1': ok({ files: page(100) }), '&page=2': ok({ files: page(100) }), '&page=3': ok({ files: page(99) }) })) })).toMatchObject({ ok: true });
     expect(one(300)).toMatchObject({ ok: false, reason: 'compare-ceiling' });
+    expect(one(301)).toMatchObject({ ok: false, reason: 'compare-ceiling' });
   });
   it('a tree flagged truncated is unreadable', () => {
     const rest = routes(hwWorld([], { bk: ok({ truncated: false, tree: [], truncated: true }) }));
@@ -426,9 +451,9 @@ describe('bounded calls: per-call deadline through the throttled reader', () => 
     expect(src(rest, { deadlineAt: NOW - 1 }).read('json', 'repos/{owner}/{repo}/x')).toMatchObject({ ok: false, reason: 'deadline' });
     expect(rest.seen).toEqual([]);
   });
-  it('a paged read stops with deadline once the overall deadline passes mid-way', () => {
+  it('a multi-call read stops with deadline once the overall deadline passes mid-way', () => {
     let t = NOW;
-    const rest = (p) => { t += 10; if (p.includes('git/ref/heads/')) return ok({ object: { sha: SHA } }); return ok({ files: Array.from({ length: 100 }, (_x, i) => ({ filename: `f${i}-${t}`, status: 'modified' })) }); };
+    const rest = (p) => { t += 20; if (p.includes('git/ref/heads/')) return ok({ object: { sha: SHA } }); return ok({ files: Array.from({ length: 100 }, (_x, i) => ({ filename: `f${i}-${t}`, status: 'modified' })) }); };
     const r = readAddedFiles('main', SHA, { source: createRestSource({ rest, slug: 'o/r', env: {}, now: () => t, deadlineAt: NOW + 25 }) });
     expect(r).toMatchObject({ ok: false, reason: 'deadline' });
   });
