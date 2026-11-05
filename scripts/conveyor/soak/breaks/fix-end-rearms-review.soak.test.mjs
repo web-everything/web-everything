@@ -39,6 +39,9 @@ it.each([SEND_BACKS, CORE])('fixPresent refuses a root with %s reverted to pinne
 
 it.each([
   ['post-fix review rearm', CORE, "reason: 'fix-pushed'"],
+  ['review-after-fix consumer signature', CORE, 'advisoryReview = null, reviewAfterFix = null,'],
+  ['review-after-fix consumer branch', CORE, 'if (advisoryReview || reviewAfterFix) {'],
+  ['review-after-fix consumer reason', CORE, 'why: advisoryReview?.why ?? reviewAfterFix'],
   ['release/review thread order', CORE, 'release.index > lastReview.index'],
   ['send-back/review thread order', CORE, 'item.index <= review.index'],
   ['one-shot consumption', CORE, 'operatorSendBackRearm(pr, { verdictId: pr.comments[item.index].id })'],
