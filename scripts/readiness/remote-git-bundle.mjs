@@ -130,7 +130,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
   if (graftPath.code !== 0 || existsSync(resolve(cwd, bytes(graftPath.stdout).toString('utf8').trim()))) throw bundleError('bundle-credential-scan-failed', 'grafts-file');
   // -t lists tree (directory) entries too: without it an EMPTY subtree entry (crafted with mktree) has no file below it
   // and never shows up, yet its name travels in the pack.
-  const log = await git(['log', '--raw', '-t', '--ignore-submodules=none', '-z', '--no-renames', '--no-abbrev', '--root', '--diff-merges=separate', '--no-ext-diff', '--no-textconv', '--no-show-signature', '--diff-filter=d', '--format=', range]);
+  const log = await git(['log', '--raw', '-t', '--ignore-submodules=none', '-z', '--no-renames', '--no-abbrev', '--root', '--diff-merges=separate', '--no-relative', '--no-ext-diff', '--no-textconv', '--no-show-signature', '--diff-filter=d', '--format=', range]);
   if (log.code !== 0) throw bundleError('bundle-credential-scan-failed');
   // Commit messages (and author/committer identity lines) travel in the pack too. Tags are not bundled: only the pinned ref is.
   const messages = await git(['log', '-z', '--root', '--format=%an%n%ae%n%cn%n%ce%n%B', range]);

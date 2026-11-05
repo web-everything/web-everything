@@ -466,6 +466,12 @@ describe('R593 merge-resolution blobs are scanned whatever the user diff config 
       await expect(scanBundleRange({ cwd: lane, head: tip, prerequisite: runnerMain, exec: stub })).rejects.toMatchObject({ code: 'bundle-credential-scan-failed' });
     });
   }
+  it('flags a token outside the cwd subdirectory with diff.relative=true', async () => {
+    await fs.mkdir(join(lane, 'sub'), { recursive: true });
+    git(lane, 'config', 'diff.relative', 'true');
+    const head = await commit(lane, { 'sub/ok.txt': 'ok\n', 'outside.txt': `key ${secret}\n` }, 'relative');
+    expect(await scanBundleRange({ cwd: join(lane, 'sub'), head, prerequisite: runnerMain, exec })).toMatchObject({ path: 'outside.txt', finding: 'github-token' });
+  });
   it('pins --diff-merges=separate on the raw log call (no reliance on user config)', async () => {
     const seen = [];
     const spy = async (call) => { if (call.args.includes('--raw')) seen.push(call.args); return exec(call); };
