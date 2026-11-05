@@ -74,11 +74,43 @@ const unfinishedReview = run => !run.verdict || run.pending != null || hasOpenEf
 // "needs a human" hold awaiting its confirm, and no label effect still pending or in flight. A run that already
 // recorded any other verdict (a rejection above all) is only waiting on its effects: a clean result comment that
 // is newer than its start must not release it, because those effects can still apply a send-back.
+const verdictOf = run => (typeof run.verdict === 'string' ? run.verdict : run.verdict?.verdict);
 const undecidedUnfinished = run => {
-  const verdict = typeof run.verdict === 'string' ? run.verdict : run.verdict?.verdict;
   // Any PRESENT verdict this reader does not recognise (an empty object, another key, an array) counts as decided.
-  return (!run.verdict || verdict === 'needs-human') && !hasOpenEffect(run);
+  return (!run.verdict || verdictOf(run) === 'needs-human') && !hasOpenEffect(run);
 };
+// R622: a run that blocks comment settlement whatever its start time: a label effect still pending or in flight, or
+// any present verdict other than an accept or the "needs a human" hold (a `changes` rejection above all, and any
+// verdict shape this reader does not recognise, which fails closed).
+const blocksSettlement = run => hasOpenEffect(run) || (Boolean(run.verdict) && !['accept', 'needs-human'].includes(verdictOf(run)));
+// What the complete read keeps of a record: never its payload. Cached by (read function, dir, id, mtime, size) so a
+// settle attempt that keeps holding does not re-parse the whole store every tick; any rewrite changes the key.
+const summaryCache = new WeakMap();
+const summarizeRun = run => ({ review: run?.op === 'review-pr', repo: run?.input?.repo, pr: Number(run?.input?.pr),
+  rev: typeof run?.findings?.read?.netBasis?.rev === 'string' ? run.findings.read.netBasis.rev.toLowerCase() : null, blocks: blocksSettlement(run) });
+// R622: settlement needs a COMPLETE same-PR, same-head read. Run ids carry no PR, so this parses every review-pr
+// record (no parse cap: the bounded scan cannot vouch for what it did not read) and keeps only the summary. Any
+// record of this PR whose head is this head, or whose head cannot be read, that blocks settlement holds; any record
+// that cannot be listed, statted, read or attributed to a PR fails closed.
+function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat }) {
+  const incomplete = { complete: false, blocked: false };
+  try {
+    const cache = summaryCache.get(read) ?? summaryCache.set(read, new Map()).get(read);
+    const want = String(head).toLowerCase();
+    for (const id of list(runsDir).filter(id => id.startsWith('review-pr-'))) {
+      const st = stat(join(runsDir, `${id}.json`));
+      if (!Number.isFinite(st?.mtimeMs)) return incomplete;
+      const key = `${runsDir}|${id}|${st.mtimeMs}|${st.size}`;
+      if (!cache.has(key)) cache.set(key, summarizeRun(read(id, runsDir)));
+      const s = cache.get(key);
+      if (!s.review) continue;
+      if (typeof s.repo !== 'string' || !Number.isFinite(s.pr)) return incomplete;
+      if (s.repo !== repo || s.pr !== Number(pr)) continue;
+      if ((s.rev === null || s.rev === want) && s.blocks) return { complete: true, blocked: true };
+    }
+    return { complete: true, blocked: false };
+  } catch { return incomplete; }
+}
 
 // A run record is written after its read step starts, so its mtime bounds that start from above.
 // The slack covers filesystems that store mtime at 1-2 s granularity.
@@ -116,6 +148,12 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
   };
   let scan = null;
   const failures = new Map();
+  // R622: the complete same-PR, same-head read settlement requires; lazy (only a settle attempt pays) and memoized.
+  let completeRead = null;
+  const completeHeadRead = ({ pr: askedPr, head: askedHead } = {}) => {
+    if (Number(askedPr) !== Number(pr) || String(askedHead).toLowerCase() !== String(head).toLowerCase()) return { complete: false, blocked: false };
+    return completeRead ??= completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat });
+  };
   const runScan = () => {
     const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, unfinished: null, since: -Infinity, undecided: true }]));
     const startless = []; // ids and mtimes only, never payloads
@@ -163,7 +201,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     }
     if (unfinished && (!selected || unfinished.id === selected.id || reviewStartedAt(unfinished) >= selectedStart)) {
       return withSettleBounds({ ok: false, reason: 'review-unfinished' },
-        { unfinishedStartedAt: since, unfinishedUndecided: undecided, ...(scan.end?.ok === false ? { unreadBoundaryAt: scan.boundary } : {}) });
+        { unfinishedStartedAt: since, unfinishedUndecided: undecided, completeHeadRead, ...(scan.end?.ok === false ? { unreadBoundaryAt: scan.boundary } : {}) });
     }
     if (scan.end?.ok !== false) return null;
     // Capped: usable only when no unread record can change this query's answer (see above).
@@ -174,7 +212,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     if (exact === null && scan.newestSettled && (!exactHead || (Number.isFinite(writtenAfter)
       && scan.boundary + RUN_MTIME_SLACK_MS <= writtenAfter
       && typeof newestHead === 'string' && newest.run.findings?.read?.netBasis?.rev === newestHead))) return null;
-    return withSettleBounds({ ...scan.end }, { unreadBoundaryAt: scan.boundary, unfinishedStartedAt: since, unfinishedUndecided: undecided });
+    return withSettleBounds({ ...scan.end }, { unreadBoundaryAt: scan.boundary, unfinishedStartedAt: since, unfinishedUndecided: undecided, completeHeadRead });
   };
   return (exactHead = true, order = tieBreak, { writtenAfter, newestHead } = {}) => {
     if (!TIE_ORDERS.includes(order)) throw new TypeError('unknown run tieBreak');
@@ -482,6 +520,11 @@ export function settleUnknownEvidenceByComment(evidence, comments, pr, head) {
     if (!(at > bounds.unfinishedStartedAt)) return evidence;
     if ('unreadBoundaryAt' in bounds && !(at > bounds.unreadBoundaryAt + UNREAD_SETTLE_MARGIN_MS)) return evidence;
   } else if (!(at > bounds.unreadBoundaryAt + UNREAD_SETTLE_MARGIN_MS) || !(at > bounds.unfinishedStartedAt)) return evidence;
+  // The bounded scan cannot vouch for a same-head rejection (or its pending label effect) it did not read: only a
+  // complete same-PR, same-head read with nothing blocking settles; no such read, or an incomplete one, stays held.
+  let complete = null;
+  try { complete = typeof bounds.completeHeadRead === 'function' ? bounds.completeHeadRead({ pr, head }) : null; } catch { /* unreadable: stays held */ }
+  if (complete?.complete !== true || complete.blocked !== false) return evidence;
   return { ok: true, settledByComment: evidence.reason, loopPayload: null, scheduled: false, inFlight: false,
     queued: false, recorded: true, skipCardOnly: false };
 }

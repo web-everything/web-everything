@@ -19,7 +19,10 @@ const comment = (rev = head, findings = [], login = 'web-everything') => ({ auth
 const broken = [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }];
 const T = Date.parse('2026-11-05T12:00:00Z');
 // Fabricated bounds default to an undecided unfinished review (the settleable shape); the decided shape is pinned below.
-const unknown = (reason, bounds) => Object.defineProperty({ ok: false, reason }, 'settleBounds', { value: { unfinishedUndecided: true, ...bounds }, enumerable: false });
+// They also default to a reader that reported a COMPLETE same-PR, same-head read with nothing blocking; the
+// complete-read requirement itself is pinned in its own describe below.
+const cleanRead = () => ({ complete: true, blocked: false });
+const unknown = (reason, bounds) => Object.defineProperty({ ok: false, reason }, 'settleBounds', { value: { unfinishedUndecided: true, completeHeadRead: cleanRead, ...bounds }, enumerable: false });
 // An unread record quiet for longer than the settle margin (slack + abandon horizon) before the comment.
 const OLD = T - 3 * 3600e3;
 const older = { unfinishedStartedAt: T - 3600e3, unreadBoundaryAt: OLD };
@@ -276,4 +279,108 @@ describe('R622 the strategy wires the settlement into BOTH admission paths (pres
       expect(held.labels()).not.toContain('red-team:clear');
     });
   }
+});
+
+describe('R622 settlement needs a COMPLETE same-PR, same-head read, whatever the bounded scan read', () => {
+  it('bounds without a complete-read result, or with an incomplete or blocked one, never settle (both reasons)', () => {
+    for (const reason of ['review-unfinished', 'scan-capped']) {
+      const without = Object.defineProperty({ ok: false, reason }, 'settleBounds', { value: { unfinishedUndecided: true, ...older }, enumerable: false });
+      expect(holdFor(without, [comment()])).toMatch(/evidence unknown/);
+      for (const result of [{ complete: false, blocked: false }, { complete: true, blocked: true }, { blocked: false }, { complete: true }, null, undefined]) {
+        expect(holdFor(unknown(reason, { ...older, completeHeadRead: () => result }), [comment()])).toMatch(/evidence unknown/);
+      }
+      expect(holdFor(unknown(reason, { ...older, completeHeadRead: () => { throw new Error('boom'); } }), [comment()])).toMatch(/evidence unknown/);
+    }
+  });
+  it('the complete read is asked for THIS pr and head', () => {
+    const asked = vi.fn(cleanRead);
+    settleUnknownEvidenceByComment(unknown('scan-capped', { ...older, completeHeadRead: asked }), [comment()], pr, head);
+    expect(asked).toHaveBeenCalledWith({ pr, head });
+  });
+
+  const rec = ({ prNum = pr, rev = head, startedAt = T - 7200e3, repo = 'o/r', ...extra } = {}) => ({ op: 'review-pr', input: { repo, pr: prNum },
+    findings: { read: { netBasis: { rev } } }, stepTimings: [{ step: 'read', startedAt: new Date(startedAt).toISOString() }], ...extra });
+  const open = { effects: [{ status: 'pending' }] };
+  const idOf = p => p.split('/').pop().replace('.json', '');
+  const read = (runs, maxParses, read = id => { const r = runs[id].run; if (r instanceof Error) throw r; return r; }) => readDrainRedTeamEvidence({ repo: 'o/r', pr, head,
+    env: { WE_SHARED_RUNS_DIR: '/nonexistent-r622' }, runsDir: '/runs', warn: () => {}, readScorecards: () => [], now: T,
+    scanSettings: { file: maxParses ? { runs: { scan: { maxParses } } } : {}, platform: {}, env: {} },
+    list: () => Object.keys(runs), stat: p => ({ mtimeMs: runs[idOf(p)].mtime }), read });
+  const settle = evidence => settleUnknownEvidenceByComment(evidence, [comment()], pr, head);
+  const HIDDEN = T - 5 * 3600e3; // quiet far longer than the settle margin: only the complete read can still catch it
+  // The bounded scan reads `window` newer finished records of another head, then runs out of budget before `hidden`.
+  const windowed = (hidden, window = 2) => ({
+    ...Object.fromEntries(Array.from({ length: window }, (_, i) => [`review-pr-new${i}`, { mtime: T - 60e3 - i * 10, run: rec({ rev: other, startedAt: T - 7200e3 - i * 1000, verdict: { verdict: 'accept' } }) }])),
+    'review-pr-hidden': { mtime: HIDDEN, run: hidden },
+  });
+
+  it('a rejecting re-review with pending effects OUTSIDE the read window keeps the hold (round 2 shape)', () => {
+    const runs = windowed(rec({ verdict: { verdict: 'changes' }, ...open }));
+    const evidence = read(runs, 2);
+    expect(evidence).toMatchObject({ ok: false, reason: 'scan-capped' });
+    expect(settle(evidence)).toMatchObject({ ok: false, reason: 'scan-capped' });
+    expect(holdFor(evidence, [comment()])).toMatch(/evidence unknown/);
+  });
+  it('300 decoy records of other PRs ahead of an unread rejection keep the hold (default parse budget)', () => {
+    const decoys = Object.fromEntries(Array.from({ length: 300 }, (_, i) => [`review-pr-decoy${String(i).padStart(3, '0')}`,
+      { mtime: T - 60e3 - i * 10, run: rec({ prNum: pr + 1, verdict: { verdict: 'accept' } }) }]));
+    const evidence = read({ ...decoys, 'review-pr-hidden': { mtime: HIDDEN, run: rec({ verdict: { verdict: 'changes' }, ...open }) } });
+    expect(evidence).toMatchObject({ ok: false, reason: 'scan-capped' });
+    expect(settle(evidence)).toMatchObject({ ok: false, reason: 'scan-capped' });
+  });
+  it('300 decoys of this PR but another head ahead of an unread rejection keep the hold (the complete read is not itself capped)', () => {
+    const decoys = Object.fromEntries(Array.from({ length: 300 }, (_, i) => [`review-pr-decoy${String(i).padStart(3, '0')}`,
+      { mtime: T - 60e3 - i * 10, run: rec({ rev: other, startedAt: T - 7200e3 - i * 1000, verdict: { verdict: 'accept' } }) }]));
+    const evidence = read({ ...decoys, 'review-pr-hidden': { mtime: HIDDEN, run: rec({ verdict: { verdict: 'changes' }, ...open }) } });
+    expect(evidence).toMatchObject({ ok: false, reason: 'scan-capped' });
+    expect(settle(evidence)).toMatchObject({ ok: false, reason: 'scan-capped' });
+  });
+  it('an unread rejection behind a read unfinished review (review-unfinished that is also capped) keeps the hold', () => {
+    const runs = windowed(rec({ verdict: { verdict: 'changes' }, ...open }), 1);
+    runs['review-pr-new0'] = { mtime: T - 60e3, run: rec({ startedAt: T - 7200e3, verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' } }) };
+    const evidence = read(runs, 1);
+    expect(evidence).toMatchObject({ ok: false, reason: 'review-unfinished' });
+    expect(settle(evidence)).toMatchObject({ ok: false, reason: 'review-unfinished' });
+  });
+  it('an unread FINISHED same-head rejection (no open effect) and any unrecognised verdict also keep the hold', () => {
+    for (const verdict of [{ verdict: 'changes' }, 'changes', { verdict: 'prevention-outstanding' }, {}, [], 7]) {
+      expect(settle(read(windowed(rec({ verdict })), 2))).toMatchObject({ ok: false, reason: 'scan-capped' });
+    }
+  });
+  it('an unread same-head record with an open or in-flight label effect keeps the hold, whatever its verdict', () => {
+    for (const status of ['pending', 'in-flight']) {
+      for (const verdict of [{ verdict: 'accept' }, { verdict: 'needs-human' }, undefined]) {
+        expect(settle(read(windowed(rec({ ...(verdict ? { verdict } : {}), effects: [{ status }] })), 2))).toMatchObject({ ok: false, reason: 'scan-capped' });
+      }
+    }
+  });
+  it('an unread same-PR record whose head cannot be read, and a rejection of a head-less shape, keep the hold', () => {
+    const headless = { op: 'review-pr', input: { repo: 'o/r', pr }, verdict: { verdict: 'changes' } };
+    expect(settle(read(windowed(headless), 2))).toMatchObject({ ok: false, reason: 'scan-capped' });
+  });
+  it('an unreadable record, or one that cannot be attributed to a PR, fails closed', () => {
+    expect(settle(read(windowed(new Error('torn record')), 2))).toMatchObject({ ok: false, reason: 'scan-capped' });
+    expect(settle(read(windowed({ op: 'review-pr', input: {}, verdict: { verdict: 'accept' } }), 2))).toMatchObject({ ok: false, reason: 'scan-capped' });
+    const noMtime = windowed(rec({ verdict: { verdict: 'accept' } }));
+    noMtime['review-pr-hidden'].mtime = NaN;
+    expect(() => read(noMtime, 2)).toThrow(); // the finder itself already refuses an unreadable mtime
+  });
+  it('the clean path still settles: unread records that are accepts, undecided holds, other heads or other PRs', () => {
+    for (const hidden of [rec({ verdict: { verdict: 'accept' } }), rec({ verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' } }), rec(), rec({ rev: other, verdict: { verdict: 'changes' }, ...open }),
+      rec({ prNum: pr + 1, verdict: { verdict: 'changes' }, ...open }), rec({ repo: 'o/other', verdict: { verdict: 'changes' }, ...open })]) {
+      expect(settle(read(windowed(hidden), 2))).toMatchObject({ ok: true, settledByComment: 'scan-capped' });
+    }
+  });
+  it('only a settle attempt pays for the complete read, and a repeat over unchanged records does not re-parse them', () => {
+    const runs = windowed(rec({ verdict: { verdict: 'accept' } }));
+    const reads = vi.fn(id => runs[id].run);
+    const evidence = read(runs, 2, reads);
+    expect(reads).toHaveBeenCalledTimes(2); // the bounded scan alone
+    expect(settleUnknownEvidenceByComment(evidence, [], pr, head)).toBe(evidence); // no result comment: cheap checks fail first
+    expect(reads).toHaveBeenCalledTimes(2);
+    expect(settle(evidence)).toMatchObject({ ok: true });
+    expect(reads).toHaveBeenCalledTimes(2 + 3);
+    expect(settle(read(runs, 2, reads))).toMatchObject({ ok: true }); // a second tick: only its own bounded scan re-reads
+    expect(reads).toHaveBeenCalledTimes(2 + 3 + 2);
+  });
 });
