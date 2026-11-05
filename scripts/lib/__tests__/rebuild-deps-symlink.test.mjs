@@ -178,7 +178,7 @@ describe('shared link-or-copy safety decision', () => {
     expect(Array.isArray(deps.WRITES_NODE_MODULES_STEPS)).toBe(true);
     expect(new Set(deps.WRITES_NODE_MODULES_STEPS).size).toBe(deps.WRITES_NODE_MODULES_STEPS.length);
     if (deps.WRITES_NODE_MODULES_STEPS.length === 0) {
-      const implementation = readFileSync(new URL('../daemon-rebuild/deps-job.mjs', import.meta.url), 'utf8');
+      const implementation = readFileSync(join(process.cwd(), 'scripts/lib/daemon-rebuild/deps-job.mjs'), 'utf8');
       // The allowed no-writer outcome still needs an explicit, reviewable audit trail.
       expect(implementation).toMatch(/\/\*[\s\S]*?(?:no|none|not)[\s\S]*?writ[\s\S]*?\*\/|\/\/.*(?:no|none|not).*writ/i);
       expect(implementation).toMatch(/ready-only/);

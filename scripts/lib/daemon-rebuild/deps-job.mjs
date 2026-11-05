@@ -10,7 +10,7 @@
  *   1. LOOP SIDE — {@link refreshDepsAsJob}, called by the daemon BETWEEN passes. Fast: compares the clone's lockfile
  *      key with the one its `node_modules` was installed for; when they differ it queues ONE install job for the new
  *      lockfile (a fresh `node_modules` store under the job dir, never the live one), watches it, and once the store
- *      is complete SWAPS it in (an APFS clone copy, then two renames) — at a pass boundary, never under a running pass.
+ *      is complete SWAPS it in (a guarded symlink or private copy, then two renames) — at a pass boundary.
  *   2. JOB CHILD — this file run as a script from a pinned code snapshot: `npm ci --ignore-scripts` into the
  *      lockfile-keyed store (`ensureNodeModulesStore`: built in a temp dir and renamed into place, so a half-built
  *      store is never used).
@@ -21,10 +21,11 @@
  *   node scripts/lib/daemon-rebuild/deps-job.mjs           # the job child (env from the runtime)
  */
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
-  existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync,
+  existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync,
 } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { defineJobKind, kindRegistry } from '../daemon-jobs.mjs';
@@ -32,13 +33,14 @@ import {
   createJobStore, createTickClock, enqueueJob, reattachTick, runJob,
 } from '../daemon-jobs-runtime.mjs';
 import {
-  ensureNodeModulesStore, evictSnapshots, lockfileKey, snapshotsRoot,
+  ensureNodeModulesStore, evictSnapshots, lockfileKey, NODE_MODULES_HASH_FILE, nodeModulesRef, snapshotsRoot,
 } from '../daemon-job-snapshots.mjs';
 import { TERMINAL_JOB_STATUSES } from '../../operations/job-record.mjs';
 import { daemonJobsDir } from '../../operations/run-store.mjs';
 import { cloneKey } from '../daemon-overlays.mjs';
 import { NPM_INSTALL_TIMEOUT_MS } from '../bounded-child.mjs';
 import { readGit } from '../proc-read.mjs';
+import { cascadePolicy } from '../policy-cascade.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const SETTINGS_PATH = resolve(SELF, '..', '..', 'daemon-rebuild-settings.json');
@@ -46,6 +48,101 @@ const SETTINGS_PATH = resolve(SELF, '..', '..', 'daemon-rebuild-settings.json');
 export const DEPS_AS_JOB_ENV = 'WE_DAEMON_DEPS_AS_JOB';
 export const DEFAULT_DEPS_JOB_RETRY_MS = 5 * 60_000;
 const COMPLETE_MARKER = '.snapshot-complete';
+
+const defaultLog = (message) => console.error(message);
+const sayDeps = (log, message) => {
+  if (typeof log === 'function') log(message);
+  else log?.error?.(message);
+};
+const validDepsMode = (mode) => mode === 'symlink' || mode === 'copy';
+
+/** No registry is required by cascadePolicy: `rebuild` is the platform/tool block, as in
+ * loadRebuildAsJobSettings. Keep file IO here within the rebuild files' ownership boundary.
+ * `file` includes platform files; the log additionally names the precise cascade layer.
+ */
+export function resolveRebuildDepsMode({ env = process.env, settings, log = defaultLog } = {}) {
+  let unreadable = false;
+  if (settings === undefined) {
+    try { settings = JSON.parse(readFileSync(SETTINGS_PATH, 'utf8')); }
+    catch (error) { unreadable = error?.code !== 'ENOENT'; settings = {}; }
+  }
+  // Inspect the winning raw value: cascade validation normally ignores invalid higher layers,
+  // whereas this setting must select copy rather than silently reverting to symlink.
+  const result = cascadePolicy('rebuild', settings?.rebuild, {
+    env, standard: { depsMode: 'symlink' },
+    envValues: { depsMode: env?.WE_DAEMON_REBUILD_DEPS_MODE },
+  });
+  const layer = result.sources.depsMode;
+  const invalid = !validDepsMode(result.value?.depsMode) || (unreadable && layer !== 'env');
+  const mode = invalid ? 'copy' : result.value.depsMode;
+  const source = invalid ? 'invalid' : layer === 'env' ? 'env' : layer === 'standard' ? 'built-in' : 'file';
+  sayDeps(log, `rebuild.depsMode=${mode} source=${source} layer=${layer ?? 'unknown'}${unreadable ? ' (settings unreadable)' : ''}`);
+  return { mode, source };
+}
+
+/** Audit: no rebuild step currently writes into node_modules. Checked rebuild-job.mjs jobMain
+ * (bare Node child), daemon-rebuild.mjs --ready-only -> rebuild.mjs/prepare.mjs -> smoke.mjs,
+ * candidate.mjs (symlinks dependencies), daemon-live-smoke.mjs SMOKE_CHECKS (lane pool,
+ * gh reads, reconcile/dispatch dry runs, git status), and daemon-boot-smoke.mjs (Node imports).
+ * The optional daemon-load-overlay.mjs dispatchSmokePrompt runs a gh read, writes a scratch
+ * marker, and reports completion to a scratch store; it does not run a build or package installer.
+ * These paths run neither npm rebuild/install nor Vite/Vitest builds that create .vite/.cache.
+ * npm-ci is a separate dependency-store producer, not a consumer of shared node_modules.
+ * Add any future writing consumer's step here and pass its step to the shared decision.
+ */
+export const WRITES_NODE_MODULES_STEPS = Object.freeze([]);
+
+/** Guard both rebuild copy sites. `destination` supports staging a swap before touching the live
+ * tree. Follow source symlinks first: cp -R of a symlink can otherwise produce another shared link,
+ * defeating copy mode. Integrity evidence belongs to the real store, not an aliasing clone root.
+ */
+export function linkOrCopyNodeModules({
+  root, storeDir, destination = join(root, 'node_modules'), depsMode, step,
+  exec = execFileSync, log = defaultLog, stat = statSync, readFile = readFileSync,
+  env = process.env, settings,
+}) {
+  const mode = depsMode === undefined ? resolveRebuildDepsMode({ env, settings, log }).mode : depsMode;
+  let reason = mode === 'copy' ? 'copy mode selected' : !validDepsMode(mode) ? 'invalid deps mode' : null;
+  const original = join(storeDir, 'node_modules');
+  let source = original;
+  try { source = realpathSync(original); }
+  catch { reason = 'source device/integrity evidence unreadable'; }
+  if (!reason && WRITES_NODE_MODULES_STEPS.includes(step)) reason = `step ${step} writes node_modules`;
+  if (!reason) {
+    try {
+      const sourceDev = stat(source).dev;
+      const jobDev = stat(root).dev;
+      if (!Number.isSafeInteger(sourceDev) || !Number.isSafeInteger(jobDev)) reason = 'device evidence unreadable';
+      else if (sourceDev !== jobDev) reason = 'cross-volume device mismatch';
+    } catch { reason = 'device evidence unreadable'; }
+  }
+  if (!reason) {
+    try {
+      const store = dirname(source);
+      if (!String(readFile(join(store, COMPLETE_MARKER), 'utf8')).trim()) throw new Error('incomplete store');
+      const recorded = String(readFile(join(store, NODE_MODULES_HASH_FILE), 'utf8')).trim();
+      const actual = createHash('sha256').update(readFile(join(source, '.package-lock.json'))).digest('hex');
+      if (!/^[a-f0-9]{64}$/.test(recorded) || recorded !== actual) reason = 'store integrity hash mismatch';
+    } catch { reason = 'store integrity hash evidence missing or unreadable'; }
+  }
+  if (!reason) {
+    try {
+      symlinkSync(source, destination, 'dir');
+      return { mode: 'symlink' };
+    } catch (error) {
+      // Do not delete a pre-existing target on EEXIST; swap callers supply a fresh staging path.
+      if (error?.code === 'EEXIST') throw error;
+      reason = `symlink creation failed (${error?.code ?? 'unknown'})`;
+    }
+  }
+  sayDeps(log, `rebuild dependencies: copy fallback (${reason})`);
+  try { exec('cp', ['-cR', source, destination], { stdio: 'ignore', timeout: 5 * 60_000 }); }
+  catch {
+    rmSync(destination, { recursive: true, force: true });
+    exec('cp', ['-R', source, destination], { stdio: 'ignore', timeout: 10 * 60_000 });
+  }
+  return { mode: 'copy', reason };
+}
 
 /**
  * The ONE argv the install job runs `npm` with. `--ignore-scripts` is load-bearing: the daemon runs unattended with
@@ -99,9 +196,9 @@ export function depsStore(jobsDir, key) {
 }
 
 /**
- * Swap a complete store's `node_modules` into `root` — the caller guarantees no pass is running. The copy is an APFS
- * clone (`cp -c`, near-instant; a plain copy where the filesystem has none) into a sibling temp dir; then the live
- * directory is renamed aside, the copy renamed in, and the old one deleted. The store itself is kept (a later
+ * Swap a complete store's `node_modules` into `root` — the caller guarantees no pass is running. Stage a guarded
+ * symlink (or a private APFS/plain copy) at a sibling path; then the live directory is renamed aside,
+ * the staged tree renamed in, and the old one deleted. The store itself is kept (a later
  * rollback or a sibling clone can reuse it).
  *
  * Failure handling: a failed copy leaves the live tree untouched. If the copy cannot be renamed in after the live tree
@@ -111,18 +208,16 @@ export function depsStore(jobsDir, key) {
  * the renames) are removed first. A crash between the two renames leaves no `node_modules` until the next call: the
  * caller's `installed` key is written only after a swap, so that call swaps again from the kept store.
  */
-export function swapNodeModules({ root, storeDir, exec = execFileSync, rename = renameSync }) {
+export function swapNodeModules({ root, storeDir, exec = execFileSync, rename = renameSync, ...options }) {
   const live = join(root, 'node_modules');
   const tmp = join(root, `.node_modules.swap.${process.pid}`);
   const old = join(root, `.node_modules.old.${process.pid}`);
   for (const name of readdirSync(root)) {
     if (/^\.node_modules\.(swap|old)\.\d+$/.test(name)) rmSync(join(root, name), { recursive: true, force: true });
   }
-  try { exec('cp', ['-cR', join(storeDir, 'node_modules'), tmp], { stdio: 'ignore', timeout: 5 * 60_000 }); } catch {
-    rmSync(tmp, { recursive: true, force: true });
-    exec('cp', ['-R', join(storeDir, 'node_modules'), tmp], { stdio: 'ignore', timeout: 10 * 60_000 });
-  }
-  const hadLive = existsSync(live);
+  linkOrCopyNodeModules({ ...options, root, storeDir, destination: tmp, exec });
+  let hadLive = false;
+  try { lstatSync(live); hadLive = true; } catch (error) { if (error?.code !== 'ENOENT') throw error; }
   if (hadLive) rename(live, old);
   try {
     rename(tmp, live);
@@ -180,7 +275,9 @@ export async function refreshDepsAsJob({
   };
   const housekeeping = () => {
     const referenced = store.list().records.filter((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status)).flatMap((r) => r.job.snapshotKeys || []);
-    // The store this clone now runs on is kept by recency (evictSnapshots keeps the newest 2 per type).
+    // A symlink still needs its store, including an older lockfile selected by a rollback.
+    // Recency alone can evict precisely that live target.
+    referenced.push(nodeModulesRef(key));
     try { evict({ jobsDir: store.dir, referenced }); } catch (e) { say(`snapshot eviction failed: ${e.message}`); }
   };
 
@@ -188,7 +285,7 @@ export async function refreshDepsAsJob({
   const st = depsStore(store.dir, key);
   if (st.complete) {
     try {
-      swap({ root, storeDir: st.dir });
+      swap({ root, storeDir: st.dir, env, log: say });
     } catch (e) {
       const intact = e?.liveIntact !== false;
       say(`swap failed (${String(e?.message || e).split('\n')[0]}) — ${intact
