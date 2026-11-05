@@ -120,9 +120,12 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   // current-question record for the same head+base (findAudit lets even an unusable current record block the prior
   // fallback, which is right for a PASS but fail-open for a NEGATIVE verdict). Such a record keeps vetoing, judged by
   // the same supersede rule as any carried WEAKENED; a base with a usable decision of its own is left to findAudit.
-  const hiddenWeak = list.filter((r) => r?.verdict === 'WEAKENED' && typeof r.head === 'string' && carriedHeads.has(r.head) && r.base !== r.head
-    && r.questionHash !== QUESTION_HASH && !carried.some((d) => d.record.head === r.head && d.base === r.base)
-    && findAudit([r], { head: r.head, base: r.base, questionHash: QUESTION_HASH, ...auditOptions }) === r).map((record) => ({ base: record.base, record }));
+  // The latest PRIOR-question record for that head+base decides (a later prior NOT WEAKENED re-audit supersedes it), judged
+  // with the same already-resolved hashes and clock as the veto above.
+  const priorOnly = list.filter((r) => r?.questionHash !== QUESTION_HASH);
+  const hiddenWeak = priorOnly.filter((r) => r?.verdict === 'WEAKENED' && typeof r.head === 'string' && carriedHeads.has(r.head) && r.base !== r.head
+    && !carried.some((d) => d.record.head === r.head && d.base === r.base)
+    && findAudit(priorOnly, { ...auditOptions, head: r.head, base: r.base, questionHash: QUESTION_HASH, priorQuestionHashes, now }) === r).map((record) => ({ base: record.base, record }));
   const carriedWeak = [...carried, ...hiddenWeak].filter((d) => d.record.verdict === 'WEAKENED');
   if (carriedWeak.length) {
     const ownAt = Math.max(-Infinity, ...own.filter((d) => covered(d.base)).map((d) => Date.parse(d.record.at)));

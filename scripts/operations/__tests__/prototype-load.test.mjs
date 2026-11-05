@@ -2091,6 +2091,11 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
       ])('also when the hiding current-question record has %s', (_, over) => {
         expect(carry(livePass(), weak(), hider(over))).toEqual({ ok: false, reason: 'weakened' });
       });
+      it('a later prior-question NOT WEAKENED re-audit of that base supersedes it; an older one does not', () => {
+        const fixed = (at) => old({ base: C, questionHash: PRIOR, at, findings: [] });
+        expect(carry(livePass(), weak(), fixed('2026-10-20T18:00:00Z'), hider()).ok).toBe(true);
+        expect(carry(livePass(), fixed('2026-10-20T06:00:00Z'), weak(), hider())).toEqual({ ok: false, reason: 'weakened' });
+      });
       it('a newer own covered audit still supersedes it (fresh re-audit)', () => {
         const newer = auditRecord({ head: SHA, at: '2026-10-22T12:00:00Z' });
         expect(carry(livePass(), weak(), hider(), newer)).toEqual({ ok: true, record: newer });
