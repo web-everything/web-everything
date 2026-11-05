@@ -4,7 +4,7 @@ size: 3
 status: active
 scaffoldedBy: "fix-6345"
 dateScaffolded: "2026-11-03"
-scope: ["we:scripts/readiness/forge-egress.sh", "we:scripts/readiness/forge-setup.sh"]
+scope: ["we:scripts/readiness/forge-egress.sh", "we:scripts/readiness/forge-setup.sh", "we:scripts/readiness/__tests__/forge-egress.test.mjs"]
 dateOpened: "2026-11-03"
 tags: []
 ---
