@@ -1,7 +1,7 @@
 import { greenLedgerDir, hasGreenLedger } from '../lib/lane-verify.mjs';
 import { unread } from './dispatch-eligibility.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
-import { pidIdentity } from '../lib/pid-alive.mjs';
+import { pidIdentity, holderStartedBy } from '../lib/pid-alive.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 /**
  * reconcile-pass.mjs — the thin IO shell around `we:scripts/conveyor/reconcile-core.mjs` (#3296): read the four
@@ -98,7 +98,7 @@ import { countRearmComments } from './rearm-review.mjs';
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
 import { resolveStandDownHoldsAcrossHeads } from './stand-down.mjs';
 import { enrichPrsWithStandDownAutoProceed } from './stand-down-auto-proceed-io.mjs';
-import { resolveRoundCap, planReconcile, DISPATCH_KINDS, REFUSAL_KINDS, markSelfReportedDone, resolveInfraRetryCooloffMs, resolveInfraTransientCooloffMs, markHungSessions, markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, resolveOperatorRulingExtraRounds, resolveRoundExtensionAnchor } from './reconcile-core.mjs';
+import { resolveRoundCap, planReconcile, DISPATCH_KINDS, REFUSAL_KINDS, markSelfReportedDone, resolveInfraRetryCooloffMs, resolveInfraTransientCooloffMs, markHungSessions, markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, startedAtMs, resolveOperatorRulingExtraRounds, resolveRoundExtensionAnchor } from './reconcile-core.mjs';
 import { tryReadCompletion } from '../operations/completion-store.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 // we:backlog/x5uqim1-*.md (#4075/#3383) — the two extra facts `reconcile-core.mjs#isPrCiFailureOwedRerun` needs
@@ -599,7 +599,7 @@ export function resolveLaneHead(cwd, exec = execFileSync) {
  * @param {Function} [identity]
  * @returns {boolean|null}
  */
-export function probePid(pid, kill = (p, s) => process.kill(p, s), identity = pidIdentity) {
+export function probePid(pid, kill = (p, s) => process.kill(p, s), identity = pidIdentity, { startedBy = null } = {}) {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   try {
     kill(pid, 0);
@@ -607,7 +607,7 @@ export function probePid(pid, kill = (p, s) => process.kill(p, s), identity = pi
     if (e && e.code === 'ESRCH') return false;
     if (e?.code !== 'EPERM') return null;
   }
-  try { return identity(pid).alive; } catch { return null; }
+  try { return (Number.isFinite(startedBy) ? identity(pid, { startedBy }) : identity(pid)).alive; } catch { return null; }
 }
 
 /**
@@ -626,7 +626,8 @@ export function enrichAgents(agents, { readLaneHead = resolveLaneHead, probe = p
   return (Array.isArray(agents) ? agents : []).map((a) => {
     const cwd = String(a?.cwd ?? '');
     if (cwd && !headCache.has(cwd)) headCache.set(cwd, readLaneHead(cwd));
-    const alive = probe(Number.isInteger(a?.pid) ? a.pid : null);
+    const alive = probe(Number.isInteger(a?.pid) ? a.pid : null, undefined, undefined,
+      { startedBy: holderStartedBy(a, startedAtMs) });
     const { pidAlive: previousPidAlive, ...fresh } = a;
     return {
       ...fresh,
