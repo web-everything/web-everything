@@ -87,6 +87,18 @@ describe('settlement reads fresh PR state and result evidence', () => {
     expect(o.readEvidence).toHaveBeenCalledWith({ repo, pr, head });
     expect(changes).toEqual([{ add: null, remove: [] }]);
   });
+  it.each([
+    ['in flight', { inFlight: true }],
+    ['queued', { queued: true }],
+    ['running status', { status: { status: 'running' } }],
+    ['queued status', { status: { status: 'queued' } }],
+  ])('active red-team work (%s) is never lifted by an older result: no label synchronization', (_name, active) => {
+    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: {}, recorded: false, seatRecorded: false, ...active })), readIgnorableConfirms: () => [] });
+    o.rawPrs[0].comments.push(resultComment());
+    const row = mod.runRedTeamOnSkip(o).rows[0];
+    expect(o.syncLabels).not.toHaveBeenCalled();
+    expect(row.settleError).toBe('red-team pass still active; label unchanged');
+  });
   it('a throwing result evidence read settles nothing and reports settleError', () => {
     const o = runFixture({ readEvidence: () => { throw Error('fresh evidence offline'); } });
     o.rawPrs[0].comments.push(resultComment());

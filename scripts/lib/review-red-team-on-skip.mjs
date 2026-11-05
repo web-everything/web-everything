@@ -649,7 +649,11 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
               const live = freshSettlement(row);
               const evidence = readWithConfirmExclusions(planningOptions.readEvidence,
                 { ...key, rawPr: live, readIgnorableConfirms });
-              syncLabels({ ...key, env, log: note, evidence, provider, live, comments: live.comments });
+              // Active work outranks a stale result: never lift the hold while a pass is queued, running or unfinished.
+              const active = evidence?.inFlight || evidence?.queued || ['queued', 'running'].includes(evidence?.status?.status)
+                || (evidence?.carry && evidence.carry.step !== 'done');
+              if (active) row.settleError = 'red-team pass still active; label unchanged';
+              else syncLabels({ ...key, env, log: note, evidence, provider, live, comments: live.comments });
             }
           }
           else if (row.settle === 'not-owed') {

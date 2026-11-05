@@ -53,7 +53,9 @@ export default {
           setting: { enabled: true, retryCooldownMin: 30 }, now: () => acceptedAt + 10_000,
           lastDispatch: new Map(), capacity: { lanes: 1, budget: { left: 1 }, remainingStarts: 1 },
           readEvidence: over.readEvidence ?? (() => evidence()), readStatus: () => over.status ?? null,
-          readWitness: null, readCarry: () => null, readReviews: () => [], proveMove: () => ({ ok: false }),
+          readWitness: null, readCarry: () => null, readReviews: () => [], readComments: () => raw.comments,
+          provider: { readPrState: () => raw, setLabels: () => { throw Error('unexpected direct label write'); } },
+          proveMove: () => ({ ok: false }),
           readIgnorableConfirms: ({ rawPr, ...key }) => {
             const result = ignorableConfirmRunIds({ ...key, ...scanIO, comments: rawPr.comments,
               labels: rawPr.labels, reviews: rawPr.reviews, now: acceptedAt + 10_000 });
