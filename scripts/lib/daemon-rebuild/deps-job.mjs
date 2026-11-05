@@ -23,7 +23,7 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
-  existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync,
+  existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync,
 } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -34,7 +34,8 @@ import {
 } from '../daemon-jobs-runtime.mjs';
 import {
   ensureNodeModulesStore, evictSnapshots, lockfileKey, NODE_MODULES_HASH_FILE, nodeModulesRef,
-  NODE_MODULES_MANIFEST_FILE, nodeModulesPackageManifest, nodeModulesTreeEvidence,
+  NODE_MODULES_MANIFEST_FILE, NODE_MODULES_UNSAFE_FILE, nodeModulesPackageManifest, nodeModulesTreeEvidence,
+  hasQuarantinedNodeModulesStore, quarantineNodeModulesStore,
   recordNodeModulesConsumer, setNodeModulesWritable, snapshotsRoot, withNodeModulesStoreLock,
 } from '../daemon-job-snapshots.mjs';
 import { TERMINAL_JOB_STATUSES } from '../../operations/job-record.mjs';
@@ -116,7 +117,13 @@ function registerCurrentLiveTarget(root, options = {}) {
   const live = join(root, 'node_modules');
   let entry;
   try { entry = lstatSync(live); } catch (error) { if (error?.code === 'ENOENT') return; throw error; }
-  if (entry.isSymbolicLink()) recordNodeModulesConsumer(dirname(realpathSync(live)), root, { ...options, live: true });
+  if (entry.isSymbolicLink()) {
+    try { recordNodeModulesConsumer(dirname(realpathSync(live)), root, { ...options, live: true }); }
+    catch (error) {
+      if (error?.code === 'ENOENT' && hasQuarantinedNodeModulesStore(dirname(resolve(dirname(live), readlinkSync(live))))) return 'quarantined';
+      throw error;
+    }
+  }
 }
 
 /** Guard both rebuild copy sites. `destination` supports staging a swap before touching the live
@@ -135,8 +142,14 @@ export function linkOrCopyNodeModules({
   let source = original;
   try { source = realpathSync(original); }
   catch { reason = 'source device/integrity evidence unreadable'; }
+  let unsafe = false;
+  try { readFile(join(dirname(source), NODE_MODULES_UNSAFE_FILE), 'utf8'); unsafe = true; reason = 'store marked unsafe during evidence generation; private copy only'; }
+  catch (error) { if (error?.code !== 'ENOENT') { unsafe = true; reason = 'unsafe marker evidence unreadable; private copy only'; } }
+  const guarded = !unsafe && existsSync(join(dirname(source), NODE_MODULES_HASH_FILE)) && existsSync(join(dirname(source), NODE_MODULES_MANIFEST_FILE));
+  if (!guarded && !unsafe) reason = 'legacy hash/manifest evidence missing; private copy only';
+  let mutated = false;
   if (!reason && WRITES_NODE_MODULES_STEPS.includes(step)) reason = `step ${step} writes node_modules`;
-  if (!reason) {
+  if ((!reason || guarded) && !mutated) {
     try {
       const sourceStat = stat(source);
       const sourceDev = sourceStat.dev;
@@ -144,19 +157,19 @@ export function linkOrCopyNodeModules({
       if (!Number.isSafeInteger(sourceDev) || !Number.isSafeInteger(jobDev)) reason = 'device evidence unreadable';
       else if (sourceDev !== jobDev) reason = 'cross-volume device mismatch';
       else if (!Number.isSafeInteger(sourceStat.mode)) reason = 'store integrity readonly mode evidence unreadable';
-      else if (sourceStat.mode & 0o222) reason = 'store integrity readonly protection missing (node_modules writable)';
+      else if (sourceStat.mode & 0o222) { reason = 'store integrity readonly protection missing (node_modules writable)'; mutated ||= guarded; }
     } catch { reason = 'device evidence unreadable'; }
   }
-  if (!reason) {
+  if ((!reason || guarded) && !mutated) {
     try {
       const store = dirname(source);
       if (!String(readFile(join(store, COMPLETE_MARKER), 'utf8')).trim()) throw new Error('incomplete store');
       const recorded = String(readFile(join(store, NODE_MODULES_HASH_FILE), 'utf8')).trim();
       const actual = createHash('sha256').update(readFile(join(source, '.package-lock.json'))).digest('hex');
-      if (!/^[a-f0-9]{64}$/.test(recorded) || recorded !== actual) reason = 'store integrity hash mismatch';
-    } catch { reason = 'store integrity hash evidence missing or unreadable'; }
+      if (!/^[a-f0-9]{64}$/.test(recorded) || recorded !== actual) { reason = 'store integrity hash mismatch'; mutated ||= guarded; }
+    } catch (error) { reason = 'store integrity hash evidence missing or unreadable'; mutated ||= guarded && error?.code === 'ENOENT'; }
   }
-  if (!reason) {
+  if ((!reason || guarded) && !mutated) {
     try {
       const recorded = JSON.parse(readFile(join(dirname(source), NODE_MODULES_MANIFEST_FILE), 'utf8'));
       const current = nodeModulesPackageManifest(source, { stat, readFile });
@@ -165,18 +178,31 @@ export function linkOrCopyNodeModules({
         reason = 'store tree entry count evidence missing or invalid';
       } else if (recorded.entryCount !== tree.entryCount) {
         reason = 'store tree entry count mismatch';
+        mutated ||= guarded;
       } else if (recorded.sha256 !== current.sha256 || JSON.stringify(recorded.packages) !== JSON.stringify(current.packages)) {
         reason = 'package manifest integrity mismatch';
+        mutated ||= guarded;
       } else if (!/^[a-f0-9]{64}$/.test(recorded.treeSha256 ?? '') || recorded.treeSha256 !== tree.treeSha256) {
         reason = 'tree manifest fingerprint missing or mismatch';
+        mutated ||= guarded && /^[a-f0-9]{64}$/.test(recorded.treeSha256 ?? '');
       }
     } catch (error) {
-      if (error?.code === 'EUNSAFENODEMODULESLINK') {
+      if (error?.code === 'EUNSAFENODEMODULESLINK' && !guarded) {
         sayDeps(log, 'rebuild dependencies: copy refused (unsafe dependency symlink)');
         throw error;
       }
-      reason = 'tree/package manifest evidence missing, unreadable, or writable';
+      reason = error?.code === 'EUNSAFENODEMODULESLINK' ? 'unsafe dependency symlink' : 'tree/package manifest evidence missing, unreadable, or writable';
+      mutated ||= guarded && (['ENODEMODULESPERMISSION', 'EUNSAFENODEMODULESLINK', 'ENOENT'].includes(error?.code) || error instanceof SyntaxError);
     }
+  }
+  if (mutated) {
+    sayDeps(log, `rebuild dependencies: copy refused; quarantining mutated store (${reason})`);
+    let quarantined;
+    try { quarantined = quarantineNodeModulesStore(dirname(source), reason); }
+    catch (cause) {
+      throw Object.assign(new Error(`dependency store mutated; quarantine failed: ${reason}`, { cause }), { code: 'ENODEMODULESMUTATED' });
+    }
+    throw Object.assign(new Error(`dependency store mutated: ${reason}`), { code: 'ENODEMODULESMUTATED', quarantined });
   }
   if (!reason) {
     try {
@@ -337,14 +363,15 @@ export async function refreshDepsAsJob({
   const say = (m) => log(`deps-job: ${m}`);
   // Migrate existing live symlinks before even an up-to-date return or a reattach/launch pass.
   // Older persisted state has no live reference, and launchJob's evictor only knows snapshotKeys.
-  try { registerCurrentLiveTarget(root); }
+  let liveQuarantined = false;
+  try { liveQuarantined = registerCurrentLiveTarget(root) === 'quarantined'; }
   catch (error) {
     say(`live dependency reference unavailable (${error?.code ?? 'unknown'}); not launching dependency jobs`);
     return { reason: 'live-reference-failed' };
   }
   let key;
   try { key = lockfileKey(readLock(root)); } catch { return { reason: 'no-lockfile' }; }
-  if (installed.read() === key) return { reason: 'up-to-date', key };
+  if (installed.read() === key && !liveQuarantined) return { reason: 'up-to-date', key };
   mkdirSync(store.dir, { recursive: true });
   const kind = DEPS_JOB_KIND.kind;
   const mine = () => store.list().records.filter((r) => r.job.kind === kind && r.input?.key === key);
