@@ -634,7 +634,8 @@ def proc_open(path, *args, **kwargs):
     pid = int(path.split('/')[2])
     if pid not in entries: raise FileNotFoundError(path)
     state, ppid = entries[pid]
-    return io.BytesIO(str(pid).encode() + b' (name ) with delimiters) ' + state + b' ' + str(ppid).encode() + b' 0 0\n')
+    # Real layout: state ppid pgrp session, then filler up to starttime (field index 19).
+    return io.BytesIO(str(pid).encode() + b' (name ) with delimiters) ' + state + b' ' + str(ppid).encode() + b' 101 101' + b' 0' * 15 + b' ' + str(pid).encode() + b'\n')
 def kill(pid, sig):
     assert sig == signal.SIGKILL
     killed.append(pid)
@@ -766,17 +767,17 @@ print(json.dumps(mid_run))
     expect(stderr).toContain('201');
   });
   it('applies one wall deadline across all commands of a run and logs the setting source', async () => {
-    const seen=[];let now=1_000_000;const err=vi.spyOn(process.stderr,'write').mockImplementation(()=>true);
+    let logged='';const seen=[];let now=1_000_000;const err=vi.spyOn(process.stderr,'write').mockImplementation(()=>true);
     try {
       runner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',runWallMs:1000,clock:()=>now,
         testWorkerExec:async call=>{seen.push(call.wallMs);now+=400;return {code:0,stdout:'',stderr:''};}});
       await runner.run(request).catch(()=>{});
-    } finally {err.mockRestore();}
+    } finally {logged=err.mock.calls.map(c=>String(c[0])).join('');err.mockRestore();}
     expect(seen[0]).toBe(1000);
     expect(seen[1]).toBe(600);
     if(seen.length>2) expect(seen[2]).toBe(200);
     expect(seen.length).toBeLessThanOrEqual(3);
-    expect(err.mock.calls.map(c=>String(c[0])).join('')).toMatch(/run wall limit 1000ms \(source: option\)/);
+    expect(logged).toMatch(/run wall limit 1000ms \(source: option\)/);
   });
   it('never launches a command once the run deadline has passed', async () => {
     const seen=[];let now=1_000_000;

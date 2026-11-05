@@ -457,32 +457,53 @@ else:
         child = subprocess.Popen(cfg['argv'], cwd=cfg['cwd'], env=cfg['env'], stdin=subprocess.DEVNULL, preexec_fn=drop, pass_fds=writer_fds)
     started = time.monotonic()
     orphan_seen = {}
+    def read_stat(pid):
+        # Returns (state, ppid, pgrp, session, starttime) or None when any field is unreadable.
+        try:
+            with open('/proc/' + str(pid) + '/stat', 'rb') as stream:
+                data = stream.read()
+            fields = data[data.rfind(b')')+2:].split()
+            return (fields[0], int(fields[1]), int(fields[2]), int(fields[3]), int(fields[19]))
+        except (FileNotFoundError, ProcessLookupError): return None
+        except (IndexError, ValueError, OSError): return False
+    unreadable_logged = set()
     def supervision_expired():
         now = time.monotonic()
         processes = {}
         for entry in os.listdir('/proc'):
             if not entry.isdigit(): continue
-            try:
-                with open('/proc/' + entry + '/stat', 'rb') as stream:
-                    data = stream.read()
-                fields = data[data.rfind(b')')+2:].split()
-                processes[int(entry)] = (fields[0], int(fields[1]))
-            except (FileNotFoundError, ProcessLookupError): pass
-        # Age only live, directly adopted orphans, never the main child.
-        orphans = {pid for pid, (state, ppid) in processes.items()
-                   if ppid == os.getpid() and pid != child.pid and state != b'Z'}
+            stat = read_stat(entry)
+            if stat is None: continue
+            if stat is False:
+                # Fail closed: without a start time this PID is never signalled by the sweep;
+                # the slot-level cleanup after the run still reaps everything under the slot uid.
+                if int(entry) not in unreadable_logged:
+                    unreadable_logged.add(int(entry))
+                    sys.stderr.write('forge-exec-run: cannot read start time for pid ' + entry + '; sweep skips it\n')
+                continue
+            processes[int(entry)] = stat
+        # Age only live, directly adopted orphans of the run's own session, never the main child.
+        # A PID whose start time changed since first seen is a different process: restart its age.
+        orphans = {pid for pid, (state, ppid, _, sid, _) in processes.items()
+                   if ppid == os.getpid() and pid != child.pid and state != b'Z' and sid == child.pid}
         for pid in list(orphan_seen):
-            if pid not in orphans: del orphan_seen[pid]
-        for pid in orphans: orphan_seen.setdefault(pid, now)
-        expired = {pid for pid, first in orphan_seen.items()
+            if pid not in orphans or orphan_seen[pid][1] != processes[pid][4]: del orphan_seen[pid]
+        for pid in orphans: orphan_seen.setdefault(pid, (now, processes[pid][4]))
+        expired = {pid for pid, (first, _) in orphan_seen.items()
                    if (now - first) * 1000 >= cfg.get('orphanGraceMs', 60000)}
         found, frontier = set(expired), set(expired)
         while frontier:
-            frontier = {pid for pid, (_, ppid) in processes.items()
-                        if ppid in frontier and pid != child.pid} - found
+            frontier = {pid for pid, (_, ppid, _, sid, _) in processes.items()
+                        if ppid in frontier and pid != child.pid and sid == child.pid} - found
             found.update(frontier)
         for pid in found:
             if processes[pid][0] == b'Z': continue
+            # Re-read right before signalling: skip on any start-time or session change.
+            recorded = orphan_seen[pid][1] if pid in orphan_seen else processes[pid][4]
+            current = read_stat(pid)
+            if not current or current[4] != recorded or current[3] != child.pid:
+                sys.stderr.write('forge-exec-run: pid ' + str(pid) + ' changed or unreadable before signal; sweep skips it\n')
+                continue
             try: os.kill(pid, signal.SIGKILL)
             except ProcessLookupError: pass
         if cfg.get('wallMs') is not None and (now - started) * 1000 > cfg['wallMs']:
@@ -633,7 +654,7 @@ async function unitActive(unit) {
   if(['inactive','failed'].includes(word))return false;
   return ['active','activating','deactivating','reloading'].includes(word)?true:undefined;
 }
-export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, clock=Date.now} = {}) {
+export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, runWallMs, clock=Date.now} = {}) {
   const bases=testRoot ? join(testRoot,'bases') : '/srv/forge-base';
   const runs = testRoot ? join(testRoot,'runs') : '/srv/forge-exec';
   const receipts = testRoot ? join(testRoot,'receipts') : '/srv/forge-receipts';
@@ -896,7 +917,21 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     // must read every active pin before deciding which public bases to prune.
     await createBasePin(bases,run,baseSha,!testRoot&&process.getuid()===0?operator:undefined);
   }
-  async function workCommand(worker,argv,work,env,archive,{cleanup=false}={}) {
+  // One deadline per run, fixed when the run takes its worker: every command gets the time that is
+  // left, so N commands cannot stretch the limit to N times. Setting order: option, limits file, default.
+  async function startRunDeadline() {
+    let ms=FORGE_RUN_WALL_MS,source='default';
+    if(Number.isSafeInteger(runWallMs)&&runWallMs>0){ms=runWallMs;source='option';}
+    else if(!testRoot){
+      const {limits}=await readLimits();
+      if(Number.isSafeInteger(limits.runWallMs)){ms=limits.runWallMs;source='limits-file';}
+    }
+    process.stderr.write('forge-exec-run: run wall limit '+ms+'ms (source: '+source+')\n');
+    return {at:clock()+ms};
+  }
+  async function workCommand(worker,argv,work,env,archive,{cleanup=false,deadline}={}) {
+    const remaining=!cleanup&&deadline?Math.floor(deadline.at-clock()):undefined;
+    if(remaining!==undefined&&remaining<=0) return {code:124,stdout:'',stderr:'forge-exec-run: run wall limit exceeded before launch\n',slotCpus:undefined};
     const slot=Number(/^forge-exec-([1-9]\d*)$/.exec(worker.user)?.[1]??(testRoot?1:NaN));
     if(!testRoot && process.getuid()!==0) throw new Error('Scoped execution requires the root wrapper; use local fallback');
     if(!Number.isSafeInteger(slot)||slot<1) throw new Error('Scoped execution requires a numbered slot; rerun Forge setup or use local fallback');
@@ -906,7 +941,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     env={WE_VITEST_MAX_WORKERS:String(cpus),...env,FORGE_SLOT_CPUS:String(cpus)};
     const cancel=!cleanup&&worker.reservation?statePath(worker.reservation.run,'cancel'):undefined;
     if(cancel&&await lstat(cancel).catch(error=>{if(error.code!=='ENOENT')throw error;}))return {code:255,stdout:'',stderr:'Run cancelled before worker launch',slotCpus:cpus};
-    if(testRoot) return {...await (testWorkerExec?testWorkerExec({worker,argv,cwd:work,env,archive,cancel}):execute(argv[0],archive ? ['-xf',archive] : argv.slice(1),{cwd:work,env,detached:true})),slotCpus:cpus};
+    if(testRoot) return {...await (testWorkerExec?testWorkerExec({worker,argv,cwd:work,env,archive,cancel,wallMs:remaining}):execute(argv[0],archive ? ['-xf',archive] : argv.slice(1),{cwd:work,env,detached:true})),slotCpus:cpus};
     const ids=await identity(worker.user);
     const status=join(receipts,'supervisor-'+randomBytes(16).toString('hex'));
     const usage=status+'.usage';
@@ -915,7 +950,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       const unit='forge-exec-run-'+randomBytes(16).toString('hex'),runFile=statePath(worker.reservation.run,'running'),running=await readRecord(runFile);
       if(running?.owner)await atomicJSON(runFile,{...running,owner:{...running.owner,unit}});
       const launcher=scopeLauncherArgv({slot,unit,sudo:false,source:supervisorSource,
-        json:JSON.stringify({argv,cwd:work,env,status,usage,writer,reapUid:true,wallMs:FORGE_RUN_WALL_MS,...(cancel?{cancel}:{}),...(archive?{archive}:{}),...ids})});
+        json:JSON.stringify({argv,cwd:work,env,status,usage,writer,reapUid:true,wallMs:remaining,...(cancel?{cancel}:{}),...(archive?{archive}:{}),...ids})});
       const result=await execute(launcher[0],launcher.slice(1),{inherit:true});
       if(result.code!==0) throw new Error('Supervisor failed');
       const code=Number((await readPinned(status)).toString());
@@ -931,7 +966,8 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       const worker=await workerFor(record),executing=join(worker.active,'executing');
       await mkdir(executing,{mode:0o700}).catch(error=>{if(error.code==='EEXIST')throw busy();throw error;});
       let settled=true;
-      const command=async(...args)=>{settled=false;const result=await workCommand(worker,...args);settled=true;return result;};
+      const deadline=await startRunDeadline();
+      const command=async(...args)=>{settled=false;const result=await workCommand(worker,args[0],args[1],args[2],args[3],{deadline});settled=true;return result;};
       try{return await action(command,worker);}
       finally{if(settled)await rmdir(executing);}
     }
@@ -946,9 +982,10 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     });
     await writeFile(join(active,'reservation.json'),JSON.stringify({...record,writerGuard:1}),{flag:'wx',mode:0o600});
     let settled=true;
+    const deadline=await startRunDeadline();
     const command=async (...args)=>{
       settled=false;
-      const result=await workCommand({user:'forge-exec',reservation:record},...args);
+      const result=await workCommand({user:'forge-exec',reservation:record},args[0],args[1],args[2],args[3],{deadline});
       settled=true;
       return result;
     };

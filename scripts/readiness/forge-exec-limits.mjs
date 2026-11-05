@@ -33,6 +33,10 @@ export function parseLimits(text) {
     return result;
   };
   const limits={parent:fields(data.parent,DEFAULT_LIMITS.parent,'parent'),slot:fields(data.slot,DEFAULT_LIMITS.slot,'slot'),slots:{}};
+  if(Object.hasOwn(data,'runWallMs')) {
+    if(Number.isSafeInteger(data.runWallMs)&&data.runWallMs>=1000&&data.runWallMs<=86400000) limits.runWallMs=data.runWallMs;
+    else warnings.push('runWallMs: using default');
+  }
   if(!object(data.slots)) warnings.push('slots: using empty overrides');
   else for(const [key,value] of Object.entries(data.slots)) {
     if(!/^[1-9]\d*$/.test(key)||!Number.isSafeInteger(Number(key))||!object(value)) {warnings.push('Invalid slot override: '+key);continue;}
