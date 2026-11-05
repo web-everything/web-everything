@@ -216,7 +216,7 @@ const CONTROL_KEYWORDS = /conveyor|re[-\s]?armed?|stood[-\s]+down|stand[-\s]*dow
 // Leading whitespace, zero-width characters (U+200B..U+200D), BOM (U+FEFF) and markdown emphasis/quote/heading marks. Built from
 // code points so the source carries no invisible characters.
 const LEAD_NOISE = new RegExp('^[\\s' + String.fromCharCode(0x200b) + '-' + String.fromCharCode(0x200d, 0xfeff) + '*_>#]+', 'u');
-const isControlComment = body => body.split(/\r?\n/).map(l => l.replace(LEAD_NOISE, '')).filter(l => l && !/^<!--.*-->$/.test(l) && !/^[-_*=]{3,}$/.test(l))
+const isControlComment = body => body.split(/\r?\n/).map(l => l.replace(LEAD_NOISE, '')).filter(l => l && !(l.startsWith('<!--') && l.endsWith('-->')) && !/^[-_*=]{3,}$/.test(l))
   .slice(0, 3).some(l => CONTROL_KEYWORDS.test(l));
 const MARKER_LINE = new RegExp(`^<!-- ${REVIEWED_SHA_MARKER}: ([0-9a-f]{40}) -->$`);
 /**
