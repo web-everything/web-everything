@@ -1343,8 +1343,33 @@ describe('runMainRedRebaseAllRepos — one sweepCiRedRecovery call per watched r
     const tick = vi.fn(() => ({ dispatch: [], refusals: [], applied: [] }));
     runMainRedRebaseAllRepos({ repos: ['repo-a', 'repo-b'], tick });
     expect(tick).toHaveBeenCalledTimes(2);
-    expect(tick).toHaveBeenCalledWith({ repo: 'repo-a', apply: true });
-    expect(tick).toHaveBeenCalledWith({ repo: 'repo-b', apply: true });
+    expect(tick).toHaveBeenCalledWith(expect.objectContaining({ repo: 'repo-a', apply: true }));
+    expect(tick).toHaveBeenCalledWith(expect.objectContaining({ repo: 'repo-b', apply: true }));
+  });
+
+  it('runMainRedRebaseAllRepos wires a per-repo applyLedger into the sweep', () => {
+    // The daemon is the only live caller: without a ledger the sweep has no fairness memory and the
+    // budget-capped apply loop starves refreshable PRs behind slow/deferred ones (ci-red-recovery-watch.mjs applyLedger).
+    const tick = vi.fn(() => ({ dispatch: [], refusals: [], applied: [] }));
+    runMainRedRebaseAllRepos({ repos: ['repo-a', 'repo-b'], tick });
+    const [a, b] = tick.mock.calls.map(([o]) => o.applyLedger);
+    for (const l of [a, b]) {
+      expect(typeof l?.read).toBe('function');
+      expect(typeof l?.write).toBe('function');
+    }
+    expect(a).not.toBe(b); // separate ledger per repo
+  });
+
+  it('keys each repo\'s ledger by repo, and an explicitly passed applyLedger wins', () => {
+    const tick = vi.fn(() => ({ dispatch: [], refusals: [], applied: [] }));
+    const createLedger = vi.fn(({ repo }) => ({ read: () => null, write: () => {}, repo }));
+    runMainRedRebaseAllRepos({ repos: ['repo-a', 'repo-b'], tick, createLedger });
+    expect(createLedger.mock.calls.map(([o]) => o.repo)).toEqual(['repo-a', 'repo-b']);
+    expect(tick.mock.calls.map(([o]) => o.applyLedger.repo)).toEqual(['repo-a', 'repo-b']);
+    const own = { read: () => null, write: () => {} };
+    const tick2 = vi.fn(() => ({ dispatch: [], refusals: [], applied: [] }));
+    runMainRedRebaseAllRepos({ repos: ['repo-a'], tick: tick2, createLedger, applyLedger: own });
+    expect(tick2.mock.calls[0][0].applyLedger).toBe(own);
   });
 
   it('maps each applied rebase to a repo-tagged dispatched row', () => {
@@ -1362,7 +1387,7 @@ describe('runMainRedRebaseAllRepos — one sweepCiRedRecovery call per watched r
     const tick = vi.fn(({ repo }) => { if (repo === 'repo-bad') throw new Error('gh outage'); return { dispatch: [], refusals: [], applied: [] }; });
     const out = runMainRedRebaseAllRepos({ repos: ['repo-bad', 'repo-good'], tick });
     expect(out.refusals).toEqual([{ repo: 'repo-bad', prNumber: null, kind: 'tick-failed', why: 'gh outage' }]);
-    expect(tick).toHaveBeenCalledWith({ repo: 'repo-good', apply: true });
+    expect(tick).toHaveBeenCalledWith(expect.objectContaining({ repo: 'repo-good', apply: true }));
   });
 
   it('defaults repos to FIX_DISPATCH_DAEMON_REPOS — every watched repo, not just WE (part (c): frontierui/plateau-app too)', () => {
