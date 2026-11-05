@@ -82,7 +82,7 @@ import { extractManifestFromBody, repoKeyFromSlug } from '../readiness/lane-mani
 import { parseVerdictComment } from './review-log-claims.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
-import { readOverlays } from './daemon-overlays.mjs';
+import { readOverlays, readOverlayState } from './daemon-overlays.mjs';
 import { readRebuildState } from './daemon-rebuild/state.mjs';
 
 export const ENQUEUE_ON_EVENT_POLICY = 'mergeQueue.enqueueOnEvent';
@@ -186,7 +186,7 @@ export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform
   for (const [key, source] of Object.entries(miss.sources)) out.sources[`catchUp.missBackoff.${key}`] = source;
   for (const invalid of miss.invalid) out.invalid.push(invalid.replace(/^(tool|platform)\./, '$1.catchUp.missBackoff.'));
   const pauseValid = {
-    paths: (x) => Array.isArray(x) && x.length > 0 && x.every((p) => typeof p === 'string' && p.trim() !== '' && !p.startsWith('/') && !p.includes('..')),
+    paths: (x) => Array.isArray(x) && x.length > 0 && x.every((p) => typeof p === 'string' && p === p.trim() && p !== '' && !p.startsWith('/') && !p.startsWith('./') && !p.includes('..')),
     maxPauseMinutes: (x) => Number.isFinite(x) && x > 0 && x <= 1440,
   };
   const pause = cascadePolicy(`${ENQUEUE_ON_EVENT_POLICY}.catchUp.refreshPause`, isObj(block?.catchUp?.refreshPause) ? block.catchUp.refreshPause : undefined, {
@@ -603,10 +603,10 @@ export function readPendingChangePaths({ root, cwd, env = process.env, execFileS
     const lines = (out) => out.split('\n').map((l) => l.trim()).filter(Boolean);
     const adoptedAt = Date.parse(rebuildState()?.adopted?.at);
     const refs = overlays().filter((o) => !Number.isFinite(adoptedAt) || !(Date.parse(o?.addedAt) <= adoptedAt)).map((o) => o.ref);
-    const paths = new Set(lines(git(['diff', '--name-only', 'HEAD', 'origin/main'])));
+    const paths = new Set(lines(git(['diff', '--name-only', '--no-renames', 'HEAD', 'origin/main'])));
     for (const ref of refs) {
       if (typeof ref !== 'string' || !/^[A-Za-z0-9._/-]+$/.test(ref) || ref.startsWith('-')) return { ok: false, error: `overlay ref ${JSON.stringify(ref)} unsafe` };
-      for (const p of lines(git(['diff', '--name-only', `origin/main...origin/${ref}`, '--']))) paths.add(p);
+      for (const p of lines(git(['diff', '--name-only', '--no-renames', `origin/main...origin/${ref}`, '--']))) paths.add(p);
     }
     return { ok: true, paths: [...paths], source: `main delta + ${refs.length} overlay(s)` };
   } catch (e) { return { ok: false, error: String(e?.message || e).split('\n')[0] }; }
@@ -630,7 +630,7 @@ export function createEnqueueOnEvent({
       return overlayRefreshPending({ overlays: readOverlays(root, { env }), rebuildState: readRebuildState(root, env), now: now() });
     } catch { return { pending: false }; }
   },
-  readPendingChange = () => readPendingChangePaths({ root: scriptRoot(), cwd, env, execFileSyncImpl, overlays: () => readOverlays(scriptRoot(), { env }), rebuildState: () => readRebuildState(scriptRoot(), env) }),
+  readPendingChange = () => readPendingChangePaths({ root: scriptRoot(), cwd, env, execFileSyncImpl, overlays: () => { const st = readOverlayState(scriptRoot(), { env }); if (st.corrupt) throw new Error('overlay registry unreadable'); return st.overlays; }, rebuildState: () => readRebuildState(scriptRoot(), env) }),
   readCandidates = ({ repo }) => readCatchUpCandidates({ repo, env, defaultBranch }), readCapacity = (s) => readQueueCapacity(s),
   readPriorities = () => ({ priority: readBuildQueuePrioritySettings({ env }), buildPriority: readBuildPrioritySettings({ env }).ids, mainFix: readMainRedPriority({ env }) }),
   readQueueDepth = ({ repo }) => readCatchUpQueueDepth({ repo, env }),
@@ -720,11 +720,13 @@ export function createEnqueueOnEvent({
     const touched = change?.ok === true && Array.isArray(change.paths)
       ? change.paths.filter((p) => cfg.paths.some((prefix) => p === prefix || p.startsWith(prefix))) : null;
     if (touched && !touched.length) {
+      pauseSince = null;
       return { go: true, line: `enqueue-on-event: daemon refresh pending (${refresh.reason}) — continuing on last-good: pending change (${change.source || 'unknown source'}) touches none of ${cfg.paths.join(', ')} [${src}]` };
     }
     const why = touched ? `pending change touches ${touched.slice(0, 5).join(', ')}` : `pending diff unreadable (${change?.error || 'unknown'}) — failing closed`;
     pauseSince ??= now();
-    if (now() - pauseSince >= cfg.maxPauseMinutes * 60_000) {
+    // An unreadable diff never expires on this bound (fail closed, as before); overlayRefreshPending's own age bound still applies.
+    if (touched && now() - pauseSince >= cfg.maxPauseMinutes * 60_000) {
       return { go: true, line: `enqueue-on-event: WARN daemon refresh pending (${refresh.reason}) — max pause ${cfg.maxPauseMinutes}m exceeded (${why}) — enqueuing on last-good [${src}]` };
     }
     return { go: false, why: `${why}; pause bounded at ${cfg.maxPauseMinutes}m [${src}]` };

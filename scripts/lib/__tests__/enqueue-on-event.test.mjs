@@ -671,6 +671,11 @@ describe('readPendingChangePaths', () => {
     readPendingChangePaths({ ...base, rebuildState: () => ({ adopted: { at: '2026-11-06T00:00:00Z' } }), execFileSyncImpl: (_c, args) => { calls.push(args); return ''; } });
     expect(calls).toHaveLength(1);
   });
+  it('disables rename detection so a moved protected file still shows its source path', () => {
+    const calls = [];
+    readPendingChangePaths({ ...base, execFileSyncImpl: (_c, args) => { calls.push(args); return ''; } });
+    expect(calls.every((args) => args.includes('--no-renames'))).toBe(true);
+  });
   it('fails closed on a git error or an unsafe ref', () => {
     expect(readPendingChangePaths({ ...base, execFileSyncImpl: () => { throw new Error('bad object'); } })).toMatchObject({ ok: false });
     expect(readPendingChangePaths({ ...base, overlays: () => [{ ref: '--evil' }], execFileSyncImpl: () => '' })).toMatchObject({ ok: false });
@@ -719,6 +724,32 @@ describe('catch-up during a daemon refresh (last-good enqueue)', () => {
     await handle.catchUp();
     expect(calls).toEqual([]);
     expect(lines.filter((line) => line.includes('catch-up paused'))[0]).toContain('git diff failed');
+  });
+
+  it('keeps an unreadable-diff pause past maxPauseMinutes (fail closed)', async () => {
+    const { handle, calls, advance } = catchUpSetup({
+      refreshPending: pendingRefresh,
+      readPendingChange: () => ({ ok: false, error: 'git diff failed' }),
+    });
+    await handle.catchUp();
+    advance(30 * 60_000);
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+  });
+
+  it('a protected change after an unrelated one gets a fresh pause clock', async () => {
+    let change = { ok: true, paths: ['scripts/lib/enqueue-on-event.mjs'], source: 'a' };
+    const { handle, calls, advance } = catchUpSetup({ refreshPending: pendingRefresh, readPendingChange: () => change });
+    await handle.catchUp();
+    advance(8 * 60_000);
+    change = { ok: true, paths: ['README.md'], source: 'b' };
+    await handle.catchUp();
+    expect(calls.length).toBeGreaterThan(0);
+    calls.length = 0;
+    advance(5 * 60_000);
+    change = { ok: true, paths: ['scripts/merge-ai-prs.mjs'], source: 'c' };
+    await handle.catchUp();
+    expect(calls).toEqual([]);
   });
 
   it('pauses when reading the pending diff throws', async () => {
@@ -778,6 +809,7 @@ describe('catch-up during a daemon refresh (last-good enqueue)', () => {
     const bad = resolveSetting({ catchUp: { refreshPause: { paths: [], maxPauseMinutes: -1 } } });
     expect(bad.catchUp.refreshPause.maxPauseMinutes).toBe(10);
     expect(bad.catchUp.refreshPause.paths.length).toBe(3);
+    expect(resolveSetting({ catchUp: { refreshPause: { paths: ['./scripts/x'] } } }).catchUp.refreshPause.paths.length).toBe(3);
   });
 });
 
