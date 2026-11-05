@@ -14,18 +14,16 @@
  *
  * WHY `--repair` (#3067): the carry-forward above only helps a body edited THROUGH this tool. A body edited in
  * the GitHub web UI — the one route no shell guard can intercept — loses its stamp with nothing here ever
- * observing the edit. But GitHub keeps its OWN record of it: the issue/PR timeline API's `edited` events carry
- * `changes.body.from`, the body as it stood immediately before each edit, REGARDLESS of what wrote the edit
- * (`gh`, the API, or the web UI — GitHub does not distinguish). `--repair` walks that timeline looking for the
- * stamp the live body no longer has. Recoverable → carried across, same as the base mode. Not recoverable (no
- * stamp anywhere in the history GitHub kept, or conflicting ids across it) → the PR is marked with
- * `STAMP_LOST_MARKER` instead of silently staying `unknown-author`, so a reader — and, once wired,
- * `review-independence.mjs`'s decider — sees "stripped and unrecoverable", not "predates the stamp regime".
+ * observing the edit. GitHub's GraphQL userContentEdits records the historical snapshots and editors.
+ * Recovery requires agreement across all stamped snapshots and a stamp supplied by the PR author.
+ * Unreadable, incomplete, empty or ambiguous history refuses without changing the body.
  */
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { readAuthorStampEdits, restoreAuthorStamp } from './lib/author-stamp-restore.mjs';
+import { execFileSyncThrottled } from './lib/gh-throttle.mjs';
 import {
-  readAuthorActorStamps, buildAuthorActorMarker, hasStampLostMarker, buildStampLostMarker,
+  readAuthorActorStamps, buildAuthorActorMarker,
 } from './lib/review-independence.mjs';
 // #3061 — `process.exit()` discards a buffered `process.stdout.write`. This script exits on the value of
 // `main()`, which is the shape that truncates most reliably.
@@ -52,13 +50,11 @@ export function withCarriedStamps(current, next) {
 
 /**
  * #3067's RECOVERY — find the author stamp GitHub's own edit history still remembers, when the LIVE body has
- * none. `fromBodies` is every prior body state the caller read off the PR's timeline (`changes.body.from` of
- * each `edited` event, oldest or newest order does not matter — every one is scanned). Pure.
+ * none. `fromBodies` is every prior body state the caller read from GitHub's edit history (oldest or newest order does not matter — every one is scanned). Pure.
  *
  * AGREEMENT-OR-NOTHING, same discipline as `parseAuthorActorId` and for the same reason: if the history shows
  * two DIFFERENT ids across its edits (a re-authored PR, or a forge attempt) there is no honest basis to pick
- * one, so this answers '' rather than guess — the caller then has no choice but to mark the PR stamp-lost
- * rather than silently attribute it to whichever id happened to survive.
+ * one, so this answers '' rather than guess. Provenance must be checked separately before restoration.
  *
  * @param {string[]} fromBodies - prior body snapshots, in any order.
  * @returns {string} the single id every stamped snapshot agrees on, or '' when none/ambiguous.
@@ -81,68 +77,26 @@ function writeBody(pr, repo, body, execFile = execFileSync) {
     { input: body, encoding: 'utf8', env: { ...process.env, PR_BODY_STAMP_OK: '1' } });
 }
 
-/**
- * #3067 — `--repair`: no `--body-file` is given; the LIVE body is read, and if it already carries no stamp, its
- * GitHub timeline (`issues/<n>/timeline`, which records `edited` events with `changes.body.from` — a PR is an
- * issue under the hood, and GitHub does not care whether the edit came from `gh`, the REST/GraphQL API, or the
- * web UI) is searched for one. Recovered → carried onto the live body, same shape as the base mode. Not
- * recovered → the PR is marked `STAMP_LOST_MARKER` (idempotent — a PR already marked is left alone) so a reader
- * sees "stripped and unrecoverable" rather than silently re-reading as `unknown-author`.
- *
- * The timeline FETCH failing (network blip, rate limit, transient auth error, 5xx) is deliberately NOT treated
- * as "timeline searched, nothing found": `stampLostMarked` is a durable, sticky mark — this function's own first
- * check short-circuits on it, so a false mark from a transient failure would never get retried, and a human
- * would have to notice and manually strip it. So a thrown/failed fetch exits non-zero with a distinct
- * "could not investigate" outcome and writes NOTHING; only a fetch that actually SUCCEEDED (even to an
- * honestly empty `[]`) may reach the stamp-lost write below.
- *
- * `execFile` (default: the real `execFileSync`) is the injectable seam a test overrides to stub the timeline
- * fetch and the body write without touching the real `gh` binary — the same shape `computeNetDiffChangedFiles`'s
- * `exec` parameter uses elsewhere in scripts/, not a bespoke pattern for this file.
- */
-export function repair(gh, pr, repo, execFile = execFileSync) {
-  const current = JSON.parse(gh(['pr', 'view', pr, '--json', 'body'])).body || '';
-  if (readAuthorActorStamps(current).length) {
-    writeLineSync(1, `pr-body-edit: #${pr} already stamped — nothing to repair`);
-    return 0;
-  }
-  if (hasStampLostMarker(current)) {
-    writeLineSync(1, `pr-body-edit: #${pr} already marked stamp-lost — nothing to repair`);
-    return 0;
-  }
-  // The timeline endpoint is queried by a fully-qualified `owner/repo` path, never via the `gh()` wrapper's
-  // `--repo` flag (that flag is for `gh pr`/`gh issue` shorthand; `gh api` takes the slug in the path itself).
-  const slug = repo || JSON.parse(gh(['repo', 'view', '--json', 'nameWithOwner'])).nameWithOwner;
-  let events;
+/** Restore only an author-proven stamp from complete GraphQL history; refuse without writes otherwise. */
+export function repair(gh, pr, repo, execFile = execFileSyncThrottled) {
   try {
-    // `per_page=100` covers every realistic PR's edit count in one page — a best-effort recovery step, not a
-    // security boundary: missing an edit only means falling through to the stamp-lost mark below, never a
-    // false positive recovery. But the CALL ITSELF failing (thrown here, e.g. a non-zero `gh` exit or bad JSON)
-    // is a DIFFERENT outcome from "the call succeeded and returned an empty timeline" — see the function doc.
-    events = JSON.parse(execFile('gh', ['api', `repos/${slug}/issues/${pr}/timeline?per_page=100`],
-      { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }));
-  } catch (err) {
-    writeLineSync(2, `pr-body-edit: #${pr} could not investigate — the timeline fetch failed `
-      + `(${err && err.message ? err.message : err}); re-run --repair once the failure clears. `
-      + 'NOT marking stamp-lost (#3067 r2).');
+    const slug = repo || JSON.parse(gh(['repo', 'view', '--json', 'nameWithOwner'])).nameWithOwner;
+    const result = restoreAuthorStamp({
+      pr, repo: slug,
+      readPr: () => JSON.parse(gh(['pr', 'view', pr, '--json', 'state,body,author'])),
+      readEdits: () => readAuthorStampEdits(pr, { repo: slug, exec: execFile }),
+      writeBody: (_, body) => writeBody(pr, repo, body, execFile),
+      log: (line) => writeLineSync(1, line),
+    });
+    if (result.action === 'refuse') {
+      writeLineSync(2, `pr-body-edit: #${pr} refused — ${result.reason}`);
+      return 1;
+    }
+    return 0;
+  } catch {
+    writeLineSync(2, `pr-body-edit: #${pr} could not read repository or PR evidence; retry when readable`);
     return 1;
   }
-  const fromBodies = (Array.isArray(events) ? events : [])
-    .filter((e) => e && e.event === 'edited' && e.changes && typeof e.changes.body?.from === 'string')
-    .map((e) => e.changes.body.from);
-  const recovered = recoverAuthorIdFromHistory(fromBodies);
-  if (recovered) {
-    const { body } = withCarriedStamps(buildAuthorActorMarker(recovered), current);
-    writeBody(pr, repo, body, execFile);
-    writeLineSync(1, `pr-body-edit: #${pr} repaired — restored the stamp for ${recovered}, recovered from `
-      + `${fromBodies.length} prior body snapshot(s) in the PR's timeline`);
-    return 0;
-  }
-  writeBody(pr, repo, `${current.replace(/\s*$/, '')}\n\n${buildStampLostMarker()}\n`, execFile);
-  writeLineSync(1, `pr-body-edit: #${pr} marked stamp-lost — no authored-by-actor stamp recoverable from `
-    + `${fromBodies.length} prior body snapshot(s); the clear must now refuse rather than tolerate this as `
-    + 'unknown-author (#3067)');
-  return 0;
 }
 
 function main(argv) {
