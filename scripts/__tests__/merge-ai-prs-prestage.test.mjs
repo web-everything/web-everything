@@ -185,7 +185,7 @@ describe('real drain pre-stage path', () => {
     if (green) expect(run().stderr).toContain('eligible=true');
     pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
     pr.mqTimeline = [
-      { __typename:'RemovedFromMergeQueueEvent', reason:'merge_conflict', createdAt:'2026-11-01T12:00:00Z', beforeCommit:null },
+      { __typename:'RemovedFromMergeQueueEvent', reason:'ci_failure', createdAt:'2026-11-01T12:00:00Z', beforeCommit:null },
       { __typename:'HeadRefForcePushedEvent', createdAt:'2026-11-01T13:00:00Z', beforeCommit:{oid:'c'.repeat(40)}, afterCommit:{oid:sha} },
     ];
     const next = run(green);

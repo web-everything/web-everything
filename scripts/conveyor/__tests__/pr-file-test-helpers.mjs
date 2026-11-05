@@ -1,9 +1,11 @@
 /** Shared behavioral contract, registered in each consumer's own suite. All subprocesses are mocked. */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { readPrsFromFile } from '../open-pr-fetch.mjs';
+
+const CLI_TEST_TIMEOUT_MS = 60_000;
 
 const fixture = [901, 902].map((number) => ({
   number, headRefName: `lane/3478-delivery-${number}`, headRefOid: `sha-${number}`,
@@ -14,6 +16,11 @@ const fixture = [901, 902].map((number) => ({
 
 export function prFileContract({ name, load, reader, run, fields, reconcile = false, progress = false }) {
   describe(`${name} PR snapshot IO`, () => {
+    // The standalone argv contract is the snapshot-DISABLED path; with the snapshot on, an unservable snapshot falls
+    // back to small GraphQL pages (gh-list-retry incident 2026-11-03), which is asserted in its own suite.
+    let savedDisable;
+    beforeEach(() => { savedDisable = process.env.WE_PR_SNAPSHOT; process.env.WE_PR_SNAPSHOT = '0'; });
+    afterEach(() => { if (savedDisable === undefined) delete process.env.WE_PR_SNAPSHOT; else process.env.WE_PR_SNAPSHOT = savedDisable; });
     async function withFile(fn) {
       const dir = mkdtempSync(join(tmpdir(), 'conveyor-pr-file-test-'));
       const path = join(dir, 'snapshot with spaces.json');
@@ -105,6 +112,9 @@ export function prFileContract({ name, load, reader, run, fields, reconcile = fa
         expect(standalone.throttled).toEqual([['gh',
           ['pr', 'list', '--state', 'open', '--limit', '200', '--json', fields, '--repo', 'web-everything/web-everything'], expect.any(Object)]]);
       });
-    });
+      // Each cli() call resets the module graph and re-imports the whole watch script, twice per test. That is ~2s on an
+      // idle host but exceeded the 5s default on a loaded coverage shard (main red @ 996a30514, shard 6/9), so the budget
+      // is explicit; every assertion above is unchanged.
+    }, CLI_TEST_TIMEOUT_MS);
   });
 }

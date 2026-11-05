@@ -2685,8 +2685,9 @@ describe('case 6 — the discovery queries, pinned literally (#3296)', () => {
     ]);
   });
 
-  it('an empty listing is an empty array, not a throw — and yields an empty plan, not a silent one', () => {
-    expect(defaultReadPrs({ exec: () => '' })).toEqual([]);
+  it('a real empty listing is an empty array, not a throw — and yields an empty plan, not a silent one', () => {
+    expect(defaultReadPrs({ exec: () => '[]' })).toEqual([]);
+    expect(() => defaultReadPrs({ exec: () => '' })).toThrow(/empty output/); // fail closed: silence is not an empty inventory
     expect(planReconcile({ prs: [], agents: [], durableCounts: {}, now: NOW }))
       .toEqual({ dispatch: [], refusals: [], notes: [] });
   });
@@ -3983,7 +3984,53 @@ describe('restore-review-label — open green PR with no review label (PR #3830)
   });
 });
 
+// R502 item 4 (PR #6319, 2026-11-03): only `review-status:fixing` left on the PR, no review:pending, no live fixer claim
+// and no verdict for the head - both daemons saw nothing owed. Reconcile re-arms review:pending.
+describe('restore-review-label - orphaned review-status:fixing tag (R502 item 4)', () => {
+  const timed = (rollup) => rollup.map((c) => ({ ...c, completedAt: new Date(NOW - 30 * 60_000).toISOString() }));
+  const settledPending = [...timed(greenRollup.slice(0, 1)), ...pendingRollup];
+  const orphan = (over = {}) => pr1563({ isDraft: false, labels: lbl('review-status:fixing'), statusCheckRollup: settledPending, comments: [], headRefName: 'lane/x-orphan', headRefOid: 'a'.repeat(40), ...over });
+  const planFor = (p, extra = {}) => planReconcile({ prs: [p], agents: [], durableCounts: {}, now: NOW, ...extra });
+  const owed = (p, extra) => planFor(p, extra).dispatch.filter((d) => d.kind === 'restore-review-label' && d.variant === 'orphaned-fixing');
+  const head = 'a'.repeat(40);
+  const bounceBody = `🔁 review — changes requested\n\nRecorded by agent (unattended review-loop) via ${REVIEW_PR_CHANNEL}.\n\n### Findings\n- bad\n\n---\n\nNet basis: \`${'0'.repeat(40)}..${head}\` — 3 net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.\n\n${REVIEW_PR_FOOTER}`;
+  it('re-adds review:pending when CI is not green (green is healed by the older rule), no live fixer holds the claim and no verdict exists for the head', () => {
+    expect(owed(orphan())).toEqual([expect.objectContaining({ prNumber: 1563, label: 'review:pending', variant: 'orphaned-fixing' })]);
+  });
+  it('a green orphan is already owed review:pending by the older green rule', () => {
+    expect(planFor(orphan({ statusCheckRollup: timed(greenRollup) })).dispatch).toEqual([expect.objectContaining({ kind: 'restore-review-label', label: 'review:pending' })]);
+  });
+  it('never while a fixer holds the claim', () => {
+    expect(owed(orphan({ fixClaim: { who: 'fix-1563', claimedAt: new Date(NOW - 5 * 60_000).toISOString() } }))).toEqual([]);
+  });
+  it('never when any verdict judging this head exists (accept, changes or advisory), or the head is unknown', () => {
+    for (const body of [`review\n<!-- reviewed-sha: ${head} -->`, bounceBody]) {
+      expect(owed(orphan({ comments: [{ body, createdAt: '2026-10-04T18:51:50Z', author: AUTOMATION }] }))).toEqual([]);
+    }
+    expect(owed(orphan({ headRefOid: undefined }))).toEqual([]);
+  });
+  it('never without a readable check timestamp, on a fresh finish, or when the heal policy is not stuck', () => {
+    expect(owed(orphan({ statusCheckRollup: pendingRollup }))).toEqual([]);
+    expect(owed(orphan({ statusCheckRollup: [{ ...greenRollup[0], completedAt: new Date(NOW - 60_000).toISOString() }, ...pendingRollup] }))).toEqual([]);
+    expect(owed(orphan(), { reviewLabelHeal: 'green' })).toEqual([]);
+    expect(owed(orphan(), { reviewLabelHeal: 'off' })).toEqual([]);
+  });
+  it('fails closed on unknowns: claim read failed, comments unreadable, no clock', () => {
+    expect(owed(orphan({ fixClaimUnknown: true }))).toEqual([]);
+    expect(owed(orphan({ comments: undefined }))).toEqual([]);
+    expect(planReconcile({ prs: [orphan()], agents: [], durableCounts: {}, now: 0 }).dispatch.some((d) => d.variant === 'orphaned-fixing')).toBe(false);
+  });
+  it('never for a draft, non-lane, review-labelled, ready-to-merge or untagged PR', () => {
+    for (const p of [orphan({ isDraft: true }), orphan({ headRefName: 'feature/human' }), orphan({ labels: lbl('review-status:fixing', 'review:pending') }),
+      orphan({ labels: lbl('review-status:fixing', 'ready-to-merge') }), orphan({ labels: lbl('review-status:stood-down') })]) {
+      expect(owed(p)).toEqual([]);
+    }
+  });
+});
+
 import { loadFlakeLegacyBody } from './load-flake-fixture.mjs';
+import { REVIEW_PR_FOOTER } from '../mechanical-round-cap.mjs';
+import { REVIEW_PR_CHANNEL } from '../../lib/review-escalation.mjs';
 import { countUnresolvedStandDowns } from '../reconcile-core.mjs';
 it('legacy #3881 waits on host load, not a human', () => {
   const comment = { body: loadFlakeLegacyBody, createdAt: '2026-10-04T18:51:50Z', author: AUTOMATION };
@@ -4241,6 +4288,9 @@ describe('stale required-job base repair (2026-10-19 live PRs)', () => {
   it('finds standards on settled live-shape CI, respecting implied integration', () => {
     expect(repair()).toEqual({ missing: ['standards'] });
     expect(repair({ baseRefName: undefined })).toEqual({ missing: ['standards'] });
+  });
+  it.each(['off', 'shadow', 'on'])('finds the missing job under startEarly=%s (early start must not hide it)', startEarly => {
+    expect(repair({ reviewTiming: { ...reviewTiming, startEarly } })).toEqual({ missing: ['standards'] });
   });
   it.each([
     ['draft', { isDraft: true }], ['DIRTY', { mergeStateStatus: 'dirty' }],

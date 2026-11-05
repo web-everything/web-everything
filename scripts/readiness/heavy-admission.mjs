@@ -172,6 +172,8 @@ import {
   queueBacklog, laneProjection, slotOrderFor, DEFAULT_QUEUE_MAX_WAIT_MINUTES, QUEUE_MAX_WAIT_ENV,
   QUEUE_ADMISSION_SWITCH_ENV, DEFAULT_ARRIVAL_WINDOW_MINUTES,
 } from './heavy-queue-projection.mjs'; // card xkyw1x4 — the pure projection + fast-lane rules
+import { routeNeedsGit } from './needs-git-route.mjs'; // R501: test files that spawn git cannot run on Forge's .git-less snapshot
+import { recordRemoteRun } from '../lib/forge-share.mjs'; // R501: the one durable remote-success row forgeShare reads
 import { createMarkerReaper, markerContent, recordMarkerRun, blockedSlots, heldTombstone } from './forge-slot-markers.mjs';
 import { classifyWaiterPriority, waiterPriorityClass, validRepairPatterns, DEFAULT_REPAIR_PATTERNS, ADMISSION_PRIORITY_MODES } from './heavy-repair-priority.mjs'; // red-main repair class — kept out of the projection (which the read-only `heavy-queue` op imports) because it needs `node:vm`
 export * from './heavy-queue-projection.mjs';
@@ -241,7 +243,10 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
   // main-fix-queue-priority — a red-main repair waiter (P0) is admitted to the next free slot ahead of all others.
   priority: Object.freeze({ mode: 'enforce', repairPatterns: DEFAULT_REPAIR_PATTERNS }),
   remote: Object.freeze({ enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null,
-    maxConcurrent: 8, backoffMs: 120000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15 }),
+    maxConcurrent: 8, backoffMs: 120000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15,
+    // R475: raise a health event (coroner trigger) when >= stuckMinSlots dead-owner unconfirmed slots are older than stuckAgeMs,
+    // or when a slot is kept because the Forge probe was unknown; at most one event per kind per stuckSignalEveryMs.
+    stuckMinSlots: 2, stuckAgeMs: 600000, stuckSignalEveryMs: 600000 }),
 });
 
 /** Upper bound on a `run --wait-ms` budget (24h): a typo must not turn into an unbounded wait. */
@@ -275,6 +280,9 @@ const ADMISSION_VALID = {
   'remote.backoffFailures': (v) => Number.isSafeInteger(v) && v >= 1,
   'remote.maxLoadPerCore': (v) => Number.isFinite(v) && v > 0,
   'remote.minFreeRamPct': (v) => Number.isFinite(v) && v >= 0 && v <= 100,
+  'remote.stuckMinSlots': admissionInt(1),
+  'remote.stuckAgeMs': isValidRunWaitMs,
+  'remote.stuckSignalEveryMs': isValidRunWaitMs,
 };
 const ADMISSION_ENV = {
   cap: 'WE_HEAVY_ADMISSION_CAP', fastSlots: 'WE_HEAVY_ADMISSION_FAST_SLOTS', onTimeout: 'WE_HEAVY_ADMISSION_ON_TIMEOUT',
@@ -452,14 +460,21 @@ export function formatAdmissionPolicy({ settings, sources, ignored = [], invalid
 }
 
 /** Pure remote routing decision; unreadable load keeps threshold routing local. */
-export function decideRemote({ policy, loadPerCore, argv }) {
+export function decideRemote({ policy, loadPerCore, argv, cwd }) {
   const remote = policy.settings.remote;
   const enabled = `remote.enabled=${remote.enabled} (${policy.sources['remote.enabled'] ?? 'standard'})`;
   if (!remote.enabled) return { remote: false, reason: enabled };
-  if (remote.mode === 'always') return { remote: true, reason: `${enabled}; mode=always` };
+  if (remote.mode === 'always') return withNeedsGit({ remote: true, reason: `${enabled}; mode=always` }, argv, cwd);
   if (!Number.isFinite(loadPerCore)) return { remote: false, reason: `${enabled}; load-unreadable` };
   const above = loadPerCore > remote.loadPerCoreThreshold;
-  return { remote: above, reason: `${enabled}; loadPerCore=${loadPerCore} ${above ? '>' : '<='} ${remote.loadPerCoreThreshold}` };
+  return withNeedsGit({ remote: above, reason: `${enabled}; loadPerCore=${loadPerCore} ${above ? '>' : '<='} ${remote.loadPerCoreThreshold}` }, argv, cwd);
+}
+
+/** R501: a remote decision for a run naming a git-spawning test file becomes local with the named reason `needs-git`. */
+function withNeedsGit(decision, argv, cwd) {
+  if (!decision.remote) return decision;
+  let route; try { route = routeNeedsGit({ argv, cwd: cwd ?? process.cwd() }); } catch { return decision; }
+  return route.local ? { remote: false, needsGit: true, reason: `${decision.reason}; ${route.reason}: ${route.files.join(', ')}` } : decision;
 }
 
 const LEGACY_REMOTE_PRE_EXECUTION_REASONS = Object.freeze([
@@ -782,7 +797,7 @@ export async function runWithRemoteDecision({
     : env ? resolveCeilingMs(env) : DEFAULT_ADMISSION_CEILING_MS,
   loadPerCore = () => loadavg()[0] / cpus().length,
   remoteExec, remoteClientOverride = null, onDecision,
-  log = (line) => process.stderr.write(line),
+  log = (line) => process.stderr.write(line), appendEvent = appendClientOverrideEvent,
   // Under test the real host's load must not change routing; tests inject this seam.
   hostOverloaded = () => !isUnderTest(env ?? {}) && hostOverloadedForRemote(env),
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -796,11 +811,12 @@ export async function runWithRemoteDecision({
     if (overloaded === null) { try { overloaded = hostOverloaded() === true; } catch { overloaded = false; } }
     return overloaded;
   };
-  let decision = decideRemote({ policy, loadPerCore: load, argv });
-  if (!decision.remote && policy.settings.remote.enabled && policy.settings.remote.mode === 'above-threshold'
-    && Number.isFinite(load) && isOverloaded()) decision = { remote: true, reason: `${decision.reason}; host overloaded` };
+  let decision = decideRemote({ policy, loadPerCore: load, argv, cwd });
+  if (!decision.remote && !decision.needsGit && policy.settings.remote.enabled && policy.settings.remote.mode === 'above-threshold'
+    && Number.isFinite(load) && isOverloaded()) decision = withNeedsGit({ remote: true, reason: `${decision.reason}; host overloaded` }, argv, cwd);
   onDecision?.(decision);
   log(`heavy-admission: ${decision.remote ? 'remote' : 'local'} (${decision.reason})\n`);
+  if (decision.needsGit) recordRemoteFallback({lockRoot, reason: 'needs-git', cwd, argv, env, clock});
   if (!decision.remote) return { handled: false };
   // Local heartbeat workers can be terminated during import. Keep Forge's top-level awaits out of
   // that import graph: terminating an evaluating async module can crash Node with SIGTRAP.
@@ -821,7 +837,10 @@ export async function runWithRemoteDecision({
   let slot;
   let healthAt = waitAt;
   let reapedAt = -Infinity;
-  const markerReaper = createMarkerReaper({root:remoteRoot,host,clock,log});
+  const stuck = policy.settings.remote;
+  const markerReaper = createMarkerReaper({root:remoteRoot,host,clock,log,
+    stuckMinSlots:stuck.stuckMinSlots,stuckAgeMs:stuck.stuckAgeMs,signalEveryMs:stuck.stuckSignalEveryMs,
+    signal:({kind,detail})=>{void appendEvent({kind:'forge-slots-stuck',daemon:'heavy-admission',detail:{reason:kind,host,...detail}});}});
   let overloadWaitLogged = false;
   try {
     for (;;) {
@@ -2489,6 +2508,7 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
         const rest=requested.slice(integration?4:coverage?3:2);
         remoteArgv=['npm','run',script,...(rest.length?['--',...rest]:[])];
       }
+      const remoteStartedAt = Date.now();
       const result = await runWithRemoteDecision({
         argv: remoteArgv, policy, cwd: repo ?? process.cwd(),
         env: process.env, remoteExec, readTelemetry, lockRoot, remoteClientOverride,
@@ -2496,6 +2516,8 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
         timeoutMs: classifyCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
       });
       if (result.handled) {
+        if (result.remoteResult?.mode === 'remote') recordRemoteRun({ lockRoot, ms: Date.now() - remoteStartedAt, kind: classifyCommandKind(command, process.env),
+          receiptId: result.remoteResult.receiptId ?? result.remoteResult.run });
         if (result.remoteResult?.mode === 'remote') appendVerifyRemoteReport(process.env, {
           location: 'remote', receiptId: result.remoteResult.receiptId ?? result.remoteResult.run, exitCode: result.exitCode,
         });
