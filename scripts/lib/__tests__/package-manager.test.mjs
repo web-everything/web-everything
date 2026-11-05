@@ -75,6 +75,47 @@ describe('degraded platform layer', () => {
   });
 });
 
+describe('a valid env override beats a malformed platform layer', () => {
+  it.each([['nested object', { choice: 'pnpm' }], ['array', ['pnpm']], ['empty object', {}], ['number', 3], ['unknown string', 'yarn']])(
+    'WE_PACKAGE_MANAGER=pnpm wins over an invalid platform value (%s)', (_n, platform) => {
+      const prefs = () => ({ prefs: { packageManager: platform }, errors: [] });
+      const r = resolvePackageManager({ env: { WE_PACKAGE_MANAGER: 'pnpm' }, readPlatform: prefs });
+      expect(r).toMatchObject({ manager: 'pnpm', source: 'env', value: 'pnpm' });
+      expect(r.degraded).toMatch(/invalid platform/);
+      const calls = [];
+      installWithFallback({ frozen: false, env: { WE_PACKAGE_MANAGER: 'pnpm' }, readPlatform: prefs, pnpmVersion: () => '9', log: () => {}, exec: (b, a) => calls.push([b, ...a]) });
+      expect(calls).toEqual([['pnpm', 'install']]);
+    });
+  it('without an env override a malformed platform layer still resolves to npm and stays degraded', () => {
+    const r = resolvePackageManager({ env: {}, readPlatform: () => ({ prefs: { packageManager: { choice: 'pnpm' } }, errors: [] }) });
+    expect(r).toMatchObject({ manager: 'npm', source: 'standard' });
+    expect(r.degraded).toMatch(/invalid platform/);
+  });
+});
+
+describe('a frozen pnpm install needs no npm parity proof until npm is actually used', () => {
+  const missing = { WE_PACKAGE_MANAGER: 'pnpm', WE_PLATFORM_PREFERENCES_FILE: '/nonexistent/we-prefs.json' };
+  const bad = () => ({ prefs: {}, errors: ['prefs.json: Unexpected token'] });
+  it('an explicit env pnpm runs pnpm with a missing/unreadable platform file and no proof', () => {
+    const calls = [];
+    installWithFallback({ frozen: true, env: missing, pnpmVersion: () => '9', log: () => {}, exec: (b, a) => calls.push([b, ...a]) });
+    expect(calls).toEqual([['pnpm', 'install', '--frozen-lockfile']]);
+    expect(installArgv({ ci: true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, readPlatform: bad, pnpmVersion: () => '9' }).args).toEqual(['install', '--frozen-lockfile']);
+  });
+  it('the npm fallback after a pnpm failure still needs the proof', () => {
+    const exec = () => { throw Object.assign(new Error('ERR_PNPM_FETCH_FAIL'), { stderr: 'ERR_PNPM_FETCH_FAIL' }); };
+    expect(() => installWithFallback({ frozen: true, env: missing, pnpmVersion: () => '9', log: () => {}, exec })).toThrow(/ERR_PNPM_FETCH_FAIL/);
+    expect(() => installArgv({ ci: true, env: missing, pnpmVersion: () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); } })).toThrow(/lockfileParity/);
+  });
+  it('an explicit env npm is not gated by a degraded lower layer; the standard default still is', () => {
+    expect(installArgv({ ci: true, env: { WE_PACKAGE_MANAGER: 'npm' }, readPlatform: bad }).args).toEqual(['ci']);
+    expect(() => installArgv({ ci: true, env: {}, readPlatform: bad })).toThrow(/lockfileParity/);
+  });
+  it('an unknown env value is still gated', () => {
+    expect(() => installArgv({ ci: true, env: { WE_PACKAGE_MANAGER: 'yarn' }, readPlatform: bad })).toThrow(/lockfileParity/);
+  });
+});
+
 describe('degraded layers are logged, not silent', () => {
   it('a non-frozen install carries the degraded reason as its note and logs it', () => {
     const bad = () => ({ prefs: {}, errors: ['prefs.json: Unexpected token'] });

@@ -26,6 +26,9 @@ export function resolvePackageManager({ env = process.env, tool, platform, log, 
     if (!degraded && configured && !existsSync(configured)) degraded = 'platform preferences file configured but missing';
   }
   if (!degraded && platform !== undefined && !PACKAGE_MANAGERS.includes(platform)) degraded = `invalid platform packageManager ${JSON.stringify(platform)}`;
+  // A malformed platform value (an object leaf would survive next to a scalar env override) never enters the cascade:
+  // it is dropped here and reported as `degraded`, so a valid higher layer still wins and nothing lower can switch managers.
+  if (platform !== undefined && !PACKAGE_MANAGERS.includes(platform)) platform = null;
   const r = cascadePolicy('packageManager', text(tool), {
     standard: 'npm', platform, env, envValues: { '': text(env.WE_PACKAGE_MANAGER) }, ...(log ? { log } : {}),
   });
@@ -64,7 +67,11 @@ export function installArgv({ ci = false, ignoreScripts = false, pnpmVersion = d
   const r = resolvePackageManager(opts);
   let { manager, note } = r;
   if (r.degraded && !note) note = `${r.degraded}; resolved ${r.manager}`;
-  if ((r.note || r.degraded) && ci) { // unknown value -> npm; a frozen npm ci there still needs the parity proof (it may have masked a pnpm layer)
+  // A frozen npm ci needs the parity proof when an unknown value forced npm, or a degraded platform layer may have masked
+  // a pnpm choice (the standard default won). A valid explicit env/tool value overrides the degraded layer, so a frozen
+  // pnpm install, or an explicit npm one, needs no npm proof: npm parity is only checked if a pnpm fallback to npm happens.
+  const masked = !!r.note || (!!r.degraded && r.source === 'standard');
+  if (masked && ci) {
     let proven = false;
     try { proven = typeof lockfileParity === 'function' && lockfileParity() === true; } catch { proven = false; }
     if (!proven) throw new Error(`${r.note ?? r.degraded}; refusing a frozen npm ci without a lockfileParity proof`);
