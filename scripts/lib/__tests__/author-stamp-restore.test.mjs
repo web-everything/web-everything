@@ -502,6 +502,15 @@ describe('readAuthorStampEdits — complete, bounded history only', () => {
     expect(seams.writeBody).not.toHaveBeenCalled();
   });
 
+  it('refuses a reply carrying GraphQL errors beside an otherwise complete connection', async () => {
+    const withErrors = JSON.stringify({ errors: [{ message: 'partial' }],
+      data: { repository: { pullRequest: { userContentEdits: connection(history()) } } } });
+    expect(() => readAuthorStampEdits(6244, { repo: 'o/r', exec: () => withErrors })).toThrow(/incomplete edit history/);
+    const seams = { ...transportSeams(connection(history())), exec: vi.fn(() => withErrors) };
+    expectReason(await restoreAuthorStamp(seams), 'refuse');
+    expect(seams.writeBody).not.toHaveBeenCalled();
+  });
+
   it('restores through the same transport when the history is complete (control for the refusals above)', async () => {
     const seams = transportSeams(connection(history()));
     expectReason(await restoreAuthorStamp(seams), 'restore');
@@ -556,6 +565,35 @@ describe('sweepAuthorStamps — listing bounds', () => {
     expect(seams.readPr).not.toHaveBeenCalled();
   });
 
+  it('lists open PRs with a 100 limit and an 8 MiB buffer, so the cap check matches the request', () => {
+    const exec = vi.fn(() => '[]');
+    expect(sweepAuthorStamps({ repo: 'o/stamp-default-list', exec })).toEqual([]);
+    expect(exec).toHaveBeenCalledTimes(1);
+    const [cmd, args, options] = exec.mock.calls[0];
+    expect(cmd).toBe('gh');
+    expect(args.slice(0, 2)).toEqual(['pr', 'list']);
+    expect(args[args.indexOf('--limit') + 1]).toBe('100');
+    expect(args[args.indexOf('--state') + 1]).toBe('open');
+    expect(args[args.indexOf('--repo') + 1]).toBe('o/stamp-default-list');
+    expect(options).toEqual(expect.objectContaining({ maxBuffer: 8 * 1024 * 1024 }));
+  });
+
+  it('bounds the refusal memo: the oldest refusal is evicted after 1000 newer ones', () => {
+    const time = Date.parse('2030-01-01T00:00:00Z');
+    const seams = io({ repo: 'o/stamp-evict', listPrs: () => [listed(1, BODY)], now: () => time,
+      readEdits: vi.fn().mockImplementationOnce(() => { throw new Error('unreadable'); }).mockImplementation(history) });
+    expect(sweepAuthorStamps(seams)[0].action).toBe('refuse');
+    expect(sweepAuthorStamps(seams)[0].action).toBe('refuse');
+    expect(seams.readEdits).toHaveBeenCalledTimes(1); // memoised
+    // 11 sweeps x 99 distinct invalid-number refusals = 1089 newer entries, each read-free.
+    for (let s = 0; s < 11; s += 1) {
+      sweepAuthorStamps({ repo: 'o/stamp-evict-fill', now: () => time,
+        listPrs: () => Array.from({ length: 99 }, (_, i) => listed(0, `fill-${s}-${i}`)) });
+    }
+    expect(sweepAuthorStamps(seams)[0].action).toBe('restore');
+    expect(seams.readEdits).toHaveBeenCalledTimes(2);
+  });
+
   it.each([null, {}, 'prs'])('throws on an unreadable listing: %j', (prs) => {
     expect(() => sweepAuthorStamps(io({ repo: 'o/stamp-bad', listPrs: () => prs }))).toThrow(/unreadable or capped/);
   });
@@ -578,5 +616,18 @@ describe('restoreAuthorStamp — the historical marker is written verbatim', () 
     const seams = io({ readEdits: vi.fn(() => [edit(`Original body\n\n${marker}  `)]) });
     expectReason(await restoreAuthorStamp(seams), 'restore');
     expect(seams.writeBody).toHaveBeenCalledWith(6244, `${BODY}\n\n${marker}\n`);
+  });
+
+  it('writes through gh pr edit on stdin with the stamp-guard bypass scoped to that one call', () => {
+    const exec = vi.fn(() => '');
+    expectReason(restoreAuthorStamp({ ...io(), writeBody: undefined, repo: 'o/r', exec }), 'restore');
+    expect(exec).toHaveBeenCalledTimes(1);
+    const [cmd, args, options] = exec.mock.calls[0];
+    expect(cmd).toBe('gh');
+    expect(args).toEqual(['pr', 'edit', '6244', '--repo', 'o/r', '--body-file', '-']);
+    expect(options.input).toBe(`${BODY}\n\n${buildAuthorActorMarker(ID)}\n`);
+    expect(options.env.PR_BODY_STAMP_OK).toBe('1');
+    expect(options.maxBuffer).toBe(8 * 1024 * 1024);
+    expect(options.env).not.toBe(process.env); // a copy: the bypass never leaks into this process
   });
 });
