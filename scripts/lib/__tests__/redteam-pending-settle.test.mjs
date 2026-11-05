@@ -1,9 +1,10 @@
 // @vitest-environment node
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import * as mod from '../review-red-team-on-skip.mjs';
+import pendingBreak from '../../conveyor/soak/breaks/redteam-pending-label-never-settles.mjs';
 import { RUN_MTIME_SLACK_MS, ABANDONED_REVIEW_AFTER_MS } from '../drain-red-team-evidence.mjs';
 import { latestAcceptRecord } from '../accept-carry-forward.mjs';
 import { redTeamMarker, redTeamForHead } from '../red-team-gate.mjs';
@@ -912,7 +913,7 @@ describe('runner settles pending without dispatch', () => {
     if (method === 'syncLabels') o.rawPrs[0].comments.push(resultComment());
     o[method] = vi.fn().mockImplementationOnce(() => { throw Error('settlement offline'); }).mockReturnValue(undefined);
     o.plan.refusals.push({ kind: 'already-reviewed-head', prNumber: pr + 1, headSha: head });
-    o.rawPrs.push({ ...o.rawPrs[0], number: pr + 1, comments: [accept(old)] });
+    o.rawPrs.push({ ...o.rawPrs[0], number: pr + 1, comments: [accept(method === 'syncLabels' ? head : old)] });
     if (method === 'syncLabels') o.rawPrs[1].comments.push(trusted(`${redTeamMarker(pr + 1, head)}\nRed team not required on this head: card-only diff`));
     const out = mod.runRedTeamOnSkip(o);
     expect(out.rows).toHaveLength(2); expect(out.rows[0].settleError).toBe('settlement offline');
@@ -1059,5 +1060,71 @@ describe('confirm exclusion needs an accepting comment, not just a marker', () =
     const result = mod.ignorableConfirmRunIds({ repo, pr, head, comments, reviews: [], labels: ['review:accepted'],
       runsDir: '/runs', list: () => [], read: () => ({}), stat: () => ({ mtimeMs: acceptedAt - 3600e3 }), now: acceptedAt + 1000 });
     expect(result).toEqual({ ok: false, ids: [] });
+  });
+});
+
+
+describe('settlement requires a proven accepting comment', () => {
+  const falseAccept = () => trusted(`🔁 review — changes requested
+<!-- reviewed-sha: ${head} -->`);
+  it.each(['human hold without acceptance', 'changes marker', 'newer explicit hold before acceptance in array'])(
+    '%s cannot authorize result settlement', kind => {
+      const o = resultRunFixture();
+      o.rawPrs[0].comments = kind === 'human hold without acceptance'
+        ? [{ body: 'do not merge', author: { login: 'human-reviewer' }, createdAt: iso(acceptedAt) }]
+        : kind === 'changes marker' ? [falseAccept()]
+          : [trusted('🔁 review — changes requested', iso(acceptedAt + 1)), accept()];
+      o.rawPrs[0].comments.push(resultComment());
+      const row = mod.runRedTeamOnSkip(o).rows[0];
+      expect(row.settleError).toBe('no proven acceptance for this head; label unchanged');
+      expect(o.syncLabels).not.toHaveBeenCalled(); expect(o.settlePending).not.toHaveBeenCalled();
+      expect(o.rawPrs[0].labels).toContain('red-team:pending');
+    });
+  it.each([['red-team:pending'], ['review:accepted', 'red-team:pending', {}]])(
+    'unaccepted or unreadable labels %j cannot authorize result settlement', labels => {
+      const o = resultRunFixture(); o.rawPrs[0].labels = labels; o.rawPrs[0].comments.push(resultComment());
+      expect(mod.runRedTeamOnSkip(o).rows[0].settleError).toBeTruthy();
+      expect(o.syncLabels).not.toHaveBeenCalled(); expect(o.settlePending).not.toHaveBeenCalled();
+    });
+  it('a changes-requested reviewed-sha marker cannot authorize policy-clear or pending removal', () => {
+    const status = { status: 'finished', result: 'not-owed' };
+    const o = runFixture({ readEvidence: () => evidence({ loopPayload: payload('accept'), status }), readStatus: () => status });
+    o.rawPrs[0].comments = [falseAccept()];
+    const row = mod.runRedTeamOnSkip(o).rows[0];
+    expect(row.action).toBe('skip'); expect(row).not.toHaveProperty('settle');
+    expect(o.settle).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled();
+    expect(o.settlePending).not.toHaveBeenCalled(); expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it.each(['changes marker', 'newer explicit hold before acceptance in array'])(
+    '%s cannot authorize confirm exclusion despite a finished accepting panel', kind => {
+      const before = acceptedAt - 30_000;
+      const records = {
+        'review-pr-confirm': { op: 'review-pr', input: { repo, pr }, ...payload('needs-human'),
+          pending: { kind: 'confirm' }, effects: [], stepTimings: [{ step: 'read', startedAt: iso(before) }] },
+        'review-pr-panel': { op: 'review-pr', input: { repo, pr }, ...payload('accept'),
+          pending: null, effects: [], stepTimings: [{ step: 'read', startedAt: iso(acceptedAt - 10_000) }] },
+      };
+      const comments = kind === 'changes marker' ? [falseAccept()]
+        : [trusted('🔁 review — changes requested', iso(acceptedAt + 1)), accept()];
+      expect(mod.ignorableConfirmRunIds({ repo, pr, head, comments, reviews: [],
+        labels: ['review:accepted', 'red-team:pending'], runsDir: 'fixture-runs',
+        list: () => Object.keys(records), read: id => records[id], stat: () => ({ mtimeMs: before }) }))
+        .toEqual({ ok: false, ids: [] });
+    });
+});
+
+describe('pending soak always replays recovery availability', () => {
+  it.each(['missing module', 'missing exports'])('%s fails the replay instead of becoming expected-failure', async kind => {
+    const sourceRoot = mkdtempSync(join(tmpdir(), 'pending-soak-missing-'));
+    try {
+      if (kind === 'missing exports') {
+        mkdirSync(join(sourceRoot, 'scripts/lib'), { recursive: true });
+        writeFileSync(join(sourceRoot, 'scripts/lib/review-red-team-on-skip.mjs'), 'export const unrelated = true;\n');
+      }
+      expect(pendingBreak.fixPresent(sourceRoot)).toBe(true);
+      const report = await pendingBreak.run({ sourceRoot });
+      expect(pendingBreak.judge(report).length).toBeGreaterThan(0);
+      expect(report.violations.join(' ')).toMatch(/recovery module.*(import|export)/i);
+    } finally { rmSync(sourceRoot, { recursive: true, force: true }); }
   });
 });
