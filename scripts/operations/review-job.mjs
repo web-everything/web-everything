@@ -93,7 +93,7 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
 import { liveResultGateState, readRedTeamProbes, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
-import { revalidatedConfirmList, ignorableConfirmRunIds, planRedTeamRecovery, recoveryProbe as defaultRecoveryProbe, staleRunDeadlineMs, normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
+import { readCompletePrReviews, revalidatedConfirmList, ignorableConfirmRunIds, planRedTeamRecovery, recoveryProbe as defaultRecoveryProbe, staleRunDeadlineMs, normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
 import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { createRedTeamCarryIo } from '../lib/red-team-carry-io.mjs';
@@ -311,6 +311,7 @@ export function execReadRaw(file, args, options = {}) {
 
 /** The real effects, each one command. `root` is the checkout the arc runs from (the daemon's clone). */
 export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execReadRaw, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence,
+  readCompleteReviews, readReviews,
   listReviewRuns = listRunIds, readReviewRun = readRun, statReviewRun = statSync,
   readSeatRecords = () => createRedTeamIo({ root, env }).readRecords({ strict: true }),
   readWitness = key => readRecoveryWitness({ ...key, env, readScorecards: readSeatRecords }), recoveryProbe = defaultRecoveryProbe(),
@@ -466,10 +467,13 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           const state = provider.readPrState(repo, pr);
           if (state.headRefOid === head) {
             const runsDir = env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(env);
+            const reviews = readCompleteReviews ? readCompleteReviews({ repo, pr })
+              : isUnderTest() || isUnderTest(env) ? readReviews?.({ repo, pr })
+                : readCompletePrReviews({ repo, pr, env });
+            if (!Array.isArray(reviews)) throw Error('complete PR reviews unreadable; inspect unfinished review evidence');
             const confirms = ignorableConfirmRunIds({ repo, pr, head, env, runsDir, list: listReviewRuns, read: readReviewRun, stat: statReviewRun,
               comments: readComments({ repo, pr }), labels: state.labels,
-              reviews: JSON.parse(exec('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'reviews'],
-                { cwd: root, env, timeout: 60_000, maxBuffer: 1024 * 1024 })).reviews });
+              reviews });
             if (confirms.ok && confirms.ids.length) {
               w = readWitness({ pr, repo, head, runsDir,
                 list: revalidatedConfirmList({ repo, pr, head, ignoreRunIds: confirms.ids, acceptedAt: confirms.acceptedAt,
