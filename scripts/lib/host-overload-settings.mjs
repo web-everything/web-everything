@@ -22,6 +22,10 @@ export const DEFAULT_MIN_MEMORY_HEADROOM_MB = 2048;
 const pct = (v) => Number.isFinite(v) && v >= 0 && v <= 100;
 const leaves = {
   'host.capacitySignal': ['load', 'WE_HOST_CAPACITY_SIGNAL', (v) => ['load', 'cpu-mem'].includes(v)],
+  // R528: which memory-free measurement the capacity gates use. available = free+inactive+purgeable+speculative; free = os.freemem.
+  'host.capacity.memoryMetric': ['available', 'WE_HOST_CAPACITY_MEMORY_METRIC', (v) => ['available', 'free'].includes(v)],
+  // R553: hard floor. No new fixer is admitted while available memory (under memoryMetric) is below this many MB.
+  'host.capacity.memAvailableFloorMb': [2048, 'WE_HOST_CAPACITY_MEM_AVAILABLE_FLOOR_MB', (v) => Number.isFinite(v) && v > 0],
   'host.capacity.cpuIdleLowPct': [15, 'WE_HOST_CAPACITY_CPU_IDLE_LOW_PCT', pct],
   'host.capacity.memFreeLowPct': [15, 'WE_HOST_CAPACITY_MEM_FREE_LOW_PCT', pct],
   'host.capacity.cpuIdleMediumPct': [30, 'WE_HOST_CAPACITY_CPU_IDLE_MEDIUM_PCT', pct],
@@ -68,7 +72,7 @@ function expand(values) {
 export function resolveHostOverloadSettings({ platform = {}, tool = {}, env = process.env, log = (s) => process.stderr.write(`${s}\n`) } = {}) {
   const envValues = {};
   for (const [k, [, name]] of Object.entries(leaves)) if (env[name] !== undefined) {
-    envValues[k] = k === 'host.capacitySignal' ? env[name] : k.endsWith('explicitScan') ? (env[name] === 'true' ? true : env[name] === 'false' ? false : env[name]) : Number(env[name]);
+    envValues[k] = k === 'host.capacitySignal' || k === 'host.capacity.memoryMetric' ? env[name] : k.endsWith('explicitScan') ? (env[name] === 'true' ? true : env[name] === 'false' ? false : env[name]) : Number(env[name]);
   }
   const r = resolveCascade({ standard: Object.fromEntries(Object.entries(leaves).map(([k, [v]]) => [k, v])), platform: flatten(platform, 'platform'), tool: flatten(tool, 'tool'), envValues,
     valid: Object.fromEntries(Object.entries(leaves).map(([k, [, , valid]]) => [k, valid])) });
