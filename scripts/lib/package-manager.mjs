@@ -45,6 +45,8 @@ const SPAWN_CODES = new Set(['ENOENT', 'EACCES', 'EPERM']);
 const FETCH_CODES = new Set(['ERR_PNPM_FETCH_FAIL', 'ERR_PNPM_META_FETCH_FAIL']);
 const pnpmCodes = (t) => [...String(t).matchAll(/ERR_PNPM_[A-Z0-9_]+/g)].map((m) => m[0]);
 function pnpmUnusable(e) {
+  // A timeout or a kill means pnpm was running and was cut off: partial fetch-failure output proves nothing. Never fall back.
+  if (e?.code === 'ETIMEDOUT' || e?.killed === true || e?.signal) return false;
   const out = `${e?.message ?? ''}\n${e?.stdout ?? ''}\n${e?.stderr ?? ''}`;
   if (DENY.test(out)) return false;
   const codes = pnpmCodes(out);
