@@ -737,7 +737,8 @@ with patch.object(ctypes, 'CDLL') as libc, patch.object(subprocess, 'Popen') as 
         finally: mid_run[:] = list(killed)
     worker.return_value.wait.side_effect = wait_and_snapshot
     sys.argv = ['supervisor', json.dumps(cfg)]
-    exec(source)
+    try: exec(source)
+    except SystemExit: pass
 # Judge the sweep itself: the final slot-level cleanup runs after wait() returns, so use the mid-run snapshot.
 print(json.dumps(mid_run), file=sys.stderr)
 print(json.dumps(mid_run))
