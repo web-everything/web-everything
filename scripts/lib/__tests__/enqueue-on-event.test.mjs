@@ -2,7 +2,8 @@
  * @file Event-driven enqueue eligibility, policy resolution, debounce, and injected fast-drain runs.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import ts from 'typescript';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
@@ -10,10 +11,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   extractPassTimings, parseMarkCause, isEligibleCause, parseMarkKey, notePending, duePending,
-  CATCH_UP_QUERY, ENQUEUE_ON_EVENT_DEFAULTS, readCatchUpCandidates, readyAtQuery, planCatchUp,
+  CATCH_UP_QUERY, ENQUEUE_ON_EVENT_DEFAULTS, readPendingChangePaths, readCatchUpCandidates, readyAtQuery, planCatchUp,
   fastDrainArgs, summarizeFastDrain, resolveEnqueueOnEventSetting, createEnqueueOnEvent, wakeWorthy,
 } from '../enqueue-on-event.mjs';
 import * as enqueueModule from '../enqueue-on-event.mjs';
+import { overlayFilePath, WE_DAEMON_OVERLAY_DIR_ENV } from '../daemon-overlays.mjs';
+import { WE_DAEMON_STATE_DIR_ENV } from '../daemon-rebuild/state.mjs';
 import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
 
 const REPO = 'web-everything/web-everything';
@@ -657,6 +660,392 @@ describe('readCatchUpCandidates', () => {
   it('handles a synchronous exec exception', async () => {
     expect(await readCatchUpCandidates({ repo: REPO, readComments: () => [], execFileImpl: () => { throw new Error('spawn failed'); } }))
       .toEqual({ ok: false, error: 'spawn failed' });
+  });
+});
+
+describe('readPendingChangePaths', () => {
+  const base = { root: '/code', cwd: '/clone', overlays: () => [{ ref: 'lane/x', addedAt: '2026-11-05T00:00:00Z' }], rebuildState: () => ({ adopted: { at: '2026-11-04T00:00:00Z' } }) };
+  const TIP = 'c'.repeat(40);
+  const PROTECTED = 'scripts/lib/enqueue-on-event.mjs';
+  const gitErr = (status) => Object.assign(new Error(`git exited ${status}`), { status });
+  /** Fake git: `inHead` = is the overlay tip an ancestor of the code clone's HEAD; `tip` = rev-parse answer ('' = ref missing). */
+  const fakeGit = ({ inHead = false, tip = TIP, ancestorError = null } = {}, calls = []) => (_c, args) => {
+    calls.push(args);
+    if (args[0] === 'rev-parse') { if (!tip) throw gitErr(1); return `${tip}\n`; }
+    if (args[0] === 'merge-base') { if (ancestorError) throw ancestorError; if (inHead) return ''; throw gitErr(1); }
+    return args.some((a) => String(a).includes('...origin/lane/x')) ? `${PROTECTED}\0` : '';
+  };
+  const adoptedState = (applied) => () => ({ adopted: { at: '2026-11-06T00:00:00Z', applied } });
+  it('unions the main delta and each unadopted overlay diff', () => {
+    const exec = (_c, args) => (args[0] === 'rev-parse' ? `${TIP}\n` : args[0] === 'merge-base' ? (() => { throw gitErr(1); })() : args.includes('HEAD...origin/main') ? 'a.mjs\0' : 'b.mjs\0');
+    expect(readPendingChangePaths({ ...base, execFileSyncImpl: exec })).toMatchObject({ ok: true, paths: ['a.mjs', 'b.mjs'] });
+  });
+  it('skips an overlay whose current tip is already in the code clone HEAD', () => {
+    const calls = [];
+    const out = readPendingChangePaths({ ...base, rebuildState: adoptedState([{ ref: 'lane/x', sha: TIP }]), execFileSyncImpl: fakeGit({ inHead: true }, calls) });
+    expect(out).toMatchObject({ ok: true, paths: [] });
+    expect(calls.some((args) => args.some((a) => String(a).includes('...origin/lane/x')))).toBe(false);
+  });
+  it('still inspects an overlay registered before adoption whose branch advanced past HEAD', () => {
+    const out = readPendingChangePaths({ ...base, rebuildState: adoptedState([{ ref: 'lane/x', sha: 'a'.repeat(40) }]), execFileSyncImpl: fakeGit({ inHead: false }) });
+    expect(out).toMatchObject({ ok: true, paths: [PROTECTED] });
+  });
+  it('does not trust the recorded adopted sha when HEAD does not carry the tip (held, rejected or rolled-back build)', () => {
+    const out = readPendingChangePaths({ ...base, rebuildState: adoptedState([{ ref: 'lane/x', sha: TIP }]), execFileSyncImpl: fakeGit({ inHead: false }) });
+    expect(out.paths).toContain(PROTECTED);
+  });
+  it('inspects an overlay with no adoption record at all', () => {
+    expect(readPendingChangePaths({ ...base, rebuildState: adoptedState([]), execFileSyncImpl: fakeGit() }).paths).toContain(PROTECTED);
+    expect(readPendingChangePaths({ ...base, rebuildState: () => ({ adopted: { at: '2026-11-06T00:00:00Z' } }), execFileSyncImpl: fakeGit() }).paths).toContain(PROTECTED);
+    expect(readPendingChangePaths({ ...base, rebuildState: () => ({}), execFileSyncImpl: fakeGit() }).paths).toContain(PROTECTED);
+  });
+  it('fails closed when an overlay never applied has no resolvable tip', () => {
+    expect(readPendingChangePaths({ ...base, rebuildState: adoptedState([]), execFileSyncImpl: fakeGit({ tip: '' }) })).toMatchObject({ ok: false });
+  });
+  it('does not hold on a previously applied overlay whose branch was deleted', () => {
+    const out = readPendingChangePaths({ ...base, rebuildState: adoptedState([{ ref: 'lane/x', sha: TIP }]), execFileSyncImpl: fakeGit({ tip: '' }) });
+    expect(out).toMatchObject({ ok: true, paths: [] });
+  });
+  it('fails closed on a previously applied overlay when the tip lookup errors (timeout, exit 128) instead of reporting a missing ref', () => {
+    const state = adoptedState([{ ref: 'lane/x', sha: TIP }]);
+    for (const err of [gitErr(128), Object.assign(new Error('spawnSync git ETIMEDOUT'), { code: 'ETIMEDOUT' })]) {
+      const exec = (_c, args) => { if (args[0] === 'rev-parse') throw err; return ''; };
+      expect(readPendingChangePaths({ ...base, rebuildState: state, execFileSyncImpl: exec })).toMatchObject({ ok: false });
+    }
+  });
+  it('fails closed when the ancestry check errors for a reason other than "not an ancestor"', () => {
+    expect(readPendingChangePaths({ ...base, execFileSyncImpl: fakeGit({ ancestorError: gitErr(128) }) })).toMatchObject({ ok: false });
+  });
+  it('reads NUL-separated paths so a quoted non-ASCII protected path still matches by name', () => {
+    const calls = [];
+    const exec = (_c, args) => { calls.push(args); return args[0] === 'rev-parse' ? `${TIP}\n` : args[0] === 'merge-base' ? (() => { throw gitErr(1); })() : 'scripts/lib/enqueue-on-event/é.mjs\0'; };
+    expect(readPendingChangePaths({ ...base, execFileSyncImpl: exec }).paths).toEqual(['scripts/lib/enqueue-on-event/é.mjs']);
+    expect(calls.filter((args) => args[0] === 'diff').every((args) => args.includes('-z'))).toBe(true);
+  });
+  it('disables rename detection so a moved protected file still shows its source path', () => {
+    const calls = [];
+    readPendingChangePaths({ ...base, execFileSyncImpl: fakeGit({}, calls) });
+    const diffs = calls.filter((args) => args[0] === 'diff');
+    expect(diffs).toHaveLength(2);
+    expect(diffs.every((args) => args.includes('--no-renames'))).toBe(true);
+  });
+  it('real git: a README-only tip adopted earlier, then advanced with a protected change, is inspected despite its old registration', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pending-change-'));
+    const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
+    const git = (...args) => execFileSync('git', args, { cwd: dir, env, encoding: 'utf8' });
+    try {
+      git('init', '-q', '-b', 'main');
+      mkdirSync(join(dir, 'scripts/lib'), { recursive: true });
+      writeFileSync(join(dir, 'README.md'), 'a'); writeFileSync(join(dir, PROTECTED), 'x');
+      git('add', '-A'); git('commit', '-qm', 'base');
+      git('checkout', '-q', '-b', 'lane/existing'); writeFileSync(join(dir, 'README.md'), 'b'); git('commit', '-qam', 'readme only');
+      git('checkout', '-q', 'main'); git('merge', '-q', '--ff-only', 'lane/existing'); // HEAD adopted the README-only tip
+      git('update-ref', 'refs/remotes/origin/main', 'HEAD'); git('update-ref', 'refs/remotes/origin/lane/existing', 'HEAD');
+      const probe = () => readPendingChangePaths({ root: dir, cwd: '/elsewhere', execFileSyncImpl: execFileSync, overlays: () => [{ ref: 'lane/existing', addedAt: '2026-11-04T00:00:00Z' }],
+        rebuildState: () => ({ adopted: { at: '2026-11-05T00:00:00Z', applied: [{ ref: 'lane/existing', sha: 'd'.repeat(40) }] } }) });
+      expect(probe()).toMatchObject({ ok: true, paths: [] });
+      git('checkout', '-q', 'lane/existing'); writeFileSync(join(dir, PROTECTED), 'y'); git('commit', '-qam', 'protected change'); // the same branch advances
+      git('update-ref', 'refs/remotes/origin/lane/existing', 'HEAD'); git('checkout', '-q', 'main');
+      expect(probe()).toMatchObject({ ok: true, paths: [PROTECTED] });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('reads only what main gained since HEAD (three-dot), not files an already-merged overlay carries', () => {
+    const calls = [];
+    readPendingChangePaths({ ...base, overlays: () => [], execFileSyncImpl: fakeGit({}, calls) });
+    expect(calls.filter((args) => args[0] === 'diff').map((args) => args.find((a) => a.includes('origin/main')))).toEqual(['HEAD...origin/main']);
+  });
+  it('real git: a protected file carried by an overlay already merged into HEAD (not yet in main) is not pending', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pending-main-'));
+    const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
+    const git = (...args) => execFileSync('git', args, { cwd: dir, env, encoding: 'utf8' });
+    try {
+      git('init', '-q', '-b', 'main');
+      mkdirSync(join(dir, 'scripts/lib'), { recursive: true });
+      writeFileSync(join(dir, PROTECTED), 'x'); writeFileSync(join(dir, 'README.md'), 'a');
+      git('add', '-A'); git('commit', '-qm', 'base'); git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+      writeFileSync(join(dir, PROTECTED), 'overlay'); git('commit', '-qam', 'overlay already merged into HEAD');
+      const probe = () => readPendingChangePaths({ root: dir, cwd: '/elsewhere', execFileSyncImpl: execFileSync, overlays: () => [], rebuildState: () => ({}) });
+      expect(probe()).toMatchObject({ ok: true, paths: [] });
+      git('checkout', '-q', '-b', 'side', 'origin/main'); writeFileSync(join(dir, 'README.md'), 'main moved'); git('commit', '-qam', 'main gains a file');
+      git('update-ref', 'refs/remotes/origin/main', 'HEAD'); git('checkout', '-q', 'main');
+      expect(probe()).toMatchObject({ ok: true, paths: ['README.md'] });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('fails closed when there is no separate code clone to read (missing root, or root equal to cwd)', () => {
+    for (const root of [undefined, '', '/clone']) {
+      expect(readPendingChangePaths({ ...base, root, execFileSyncImpl: () => '' })).toMatchObject({ ok: false });
+    }
+  });
+  it('fails closed on a git error or an unsafe ref', () => {
+    expect(readPendingChangePaths({ ...base, execFileSyncImpl: () => { throw new Error('bad object'); } })).toMatchObject({ ok: false });
+    expect(readPendingChangePaths({ ...base, overlays: () => [{ ref: '--evil' }], execFileSyncImpl: () => '' })).toMatchObject({ ok: false });
+  });
+});
+
+describe('catch-up during a daemon refresh (last-good enqueue)', () => {
+  const pendingRefresh = () => ({ pending: true, reason: 'unadopted-overlay' });
+  const warn = (lines) => lines.filter((line) => line.includes('refresh pending'));
+
+  /** Default readPendingChange wiring: real registry files in a temp dir, a fake git. */
+  const wired = ({ registry, git }) => {
+    const dir = mkdtempSync(join(tmpdir(), 'pending-wiring-'));
+    const env = { [WE_DAEMON_OVERLAY_DIR_ENV]: dir, [WE_DAEMON_STATE_DIR_ENV]: dir };
+    if (registry !== undefined) { mkdirSync(dir, { recursive: true }); writeFileSync(overlayFilePath('/code', env), registry); }
+    const gitCalls = [];
+    const execFileSyncImpl = (cmd, args, opts) => { gitCalls.push(args); return git ? git(args, opts) : ''; };
+    return { ...catchUpSetup({ refreshPending: pendingRefresh, env, execFileSyncImpl }), gitCalls, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  };
+
+  it('default wiring: a corrupt overlay registry pauses catch-up (fails closed) without running git', async () => {
+    const t = wired({ registry: '{not json' });
+    try {
+      await t.handle.catchUp();
+      expect(t.calls).toEqual([]);
+      expect(t.gitCalls).toEqual([]);
+      const paused = t.lines.filter((line) => line.includes('catch-up paused'));
+      expect(paused).toHaveLength(1);
+      expect(paused[0]).toMatch(/overlay registry unreadable.*failing closed/);
+    } finally { t.cleanup(); }
+  });
+  it('default wiring: a readable registry reads the pending change through git and continues on last-good when it is unrelated', async () => {
+    const t = wired({ registry: JSON.stringify({ clone: null, overlays: [] }), git: () => 'README.md\0' });
+    try {
+      await t.handle.catchUp();
+      expect(t.calls.map((call) => call.args[1])).toEqual(['--only=42', '--only=43']);
+      expect(t.gitCalls.some((args) => args[0] === 'diff' && args.includes('HEAD...origin/main'))).toBe(true);
+      expect(warn(t.lines)[0]).toMatch(/continuing on last-good/);
+    } finally { t.cleanup(); }
+  });
+  it('reads the pending change once per run, not once per candidate', async () => {
+    const reads = vi.fn(() => ({ ok: true, paths: ['README.md'], source: 'overlay lane/x' }));
+    const { handle, calls } = catchUpSetup({ refreshPending: pendingRefresh, readPendingChange: reads });
+    await handle.catchUp();
+    expect(calls.length).toBeGreaterThan(1);
+    expect(reads).toHaveBeenCalledTimes(1);
+  });
+  it('re-reads the pending change once the memo expires, so a newly registered protected change pauses a running catch-up', async () => {
+    let reads = 0;
+    let tick = () => {};
+    const t = catchUpSetup({
+      refreshPending: () => { tick(); return pendingRefresh(); },
+      readPendingChange: () => { reads += 1; return { ok: true, paths: reads === 1 ? ['README.md'] : ['scripts/lib/enqueue-on-event.mjs'], source: 'overlay lane/x' }; },
+    });
+    tick = () => t.advance(31_000);
+    await t.handle.catchUp();
+    expect(reads).toBeGreaterThanOrEqual(2);
+    expect(t.calls.length).toBeLessThan(2); // the stale "go" did not carry over to both candidates
+  });
+  it('keeps enqueuing on last-good while an unrelated overlay is pending, and logs the decision with provenance', async () => {
+    const { handle, calls, lines } = catchUpSetup({
+      refreshPending: pendingRefresh,
+      readPendingChange: () => ({ ok: true, paths: ['scripts/lib/unrelated.mjs'], source: 'overlay lane/x' }),
+    });
+    await handle.catchUp();
+    expect(calls.map((call) => call.args[1])).toEqual(['--only=42', '--only=43']);
+    expect(lines.filter((line) => line.includes('catch-up paused'))).toEqual([]);
+    const decision = warn(lines);
+    expect(decision).toHaveLength(1);
+    expect(decision[0]).toMatch(/continuing on last-good/);
+    expect(decision[0]).toContain('overlay lane/x');
+  });
+
+  it.each([
+    'scripts/lib/enqueue-on-event.mjs',
+    'scripts/lib/drain-queue-safety.mjs',
+    'scripts/merge-ai-prs.mjs',
+  ])('pauses when the pending change touches %s', async (path) => {
+    const { handle, calls, lines } = catchUpSetup({
+      refreshPending: pendingRefresh,
+      readPendingChange: () => ({ ok: true, paths: ['README.md', path], source: 'overlay lane/x' }),
+    });
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+    const pauses = lines.filter((line) => line.includes('catch-up paused'));
+    expect(pauses).toHaveLength(1);
+    expect(pauses[0]).toContain(path);
+  });
+
+  it('pauses when the pending diff cannot be read (fail closed)', async () => {
+    const { handle, calls, lines } = catchUpSetup({
+      refreshPending: pendingRefresh,
+      readPendingChange: () => ({ ok: false, error: 'git diff failed' }),
+    });
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+    expect(lines.filter((line) => line.includes('catch-up paused'))[0]).toContain('git diff failed');
+  });
+
+  it('keeps an unreadable-diff pause past maxPauseMinutes (fail closed)', async () => {
+    const { handle, calls, advance } = catchUpSetup({
+      refreshPending: pendingRefresh,
+      readPendingChange: () => ({ ok: false, error: 'git diff failed' }),
+    });
+    await handle.catchUp();
+    advance(30 * 60_000);
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+  });
+
+  it('a protected change after an unrelated one gets a fresh pause clock', async () => {
+    let change = { ok: true, paths: ['scripts/lib/enqueue-on-event.mjs'], source: 'a' };
+    const { handle, calls, advance } = catchUpSetup({ refreshPending: pendingRefresh, readPendingChange: () => change });
+    await handle.catchUp();
+    advance(8 * 60_000);
+    change = { ok: true, paths: ['README.md'], source: 'b' };
+    await handle.catchUp();
+    expect(calls.length).toBeGreaterThan(0);
+    calls.length = 0;
+    advance(5 * 60_000);
+    change = { ok: true, paths: ['scripts/merge-ai-prs.mjs'], source: 'c' };
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+  });
+
+  it('pauses when reading the pending diff throws', async () => {
+    const { handle, calls } = catchUpSetup({
+      refreshPending: pendingRefresh,
+      readPendingChange: () => { throw new Error('boom'); },
+    });
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+  });
+
+  it('bounds a pause: after maxPauseMinutes it enqueues on last-good with a warning', async () => {
+    const { handle, calls, lines, advance } = catchUpSetup({
+      refreshPending: pendingRefresh,
+      readPendingChange: () => ({ ok: true, paths: ['scripts/lib/enqueue-on-event.mjs'], source: 'overlay lane/x' }),
+    });
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+    advance(9 * 60_000);
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+    advance(2 * 60_000);
+    await handle.catchUp();
+    expect(calls.length).toBeGreaterThan(0);
+    expect(lines.some((line) => /WARN/.test(line) && /max pause/.test(line))).toBe(true);
+  });
+
+  it('restarts the pause clock once the refresh clears', async () => {
+    let refresh = pendingRefresh();
+    const { handle, calls, advance } = catchUpSetup({
+      refreshPending: () => refresh,
+      readPendingChange: () => ({ ok: true, paths: ['scripts/lib/enqueue-on-event.mjs'], source: 'overlay lane/x' }),
+    });
+    await handle.catchUp();
+    advance(20 * 60_000);
+    refresh = { pending: false, reason: null };
+    await handle.catchUp();
+    expect(calls.length).toBeGreaterThan(0);
+    calls.length = 0;
+    refresh = pendingRefresh();
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+  });
+
+  it('resolves refreshPause with standard defaults', () => {
+    expect(resolveSetting().catchUp.refreshPause).toEqual({
+      paths: ['scripts/lib/drain-queue-safety', 'scripts/merge-ai-prs', 'scripts/lib/enqueue-on-event'],
+      maxPauseMinutes: 10,
+    });
+    expect(resolveSetting().sources['catchUp.refreshPause.maxPauseMinutes']).toBe('standard');
+  });
+
+  it('takes refreshPause from the tool layer and ignores invalid values', () => {
+    const ok = resolveSetting({ catchUp: { refreshPause: { paths: ['scripts/x'], maxPauseMinutes: 3 } } });
+    expect(ok.catchUp.refreshPause).toEqual({ paths: ['scripts/x'], maxPauseMinutes: 3 });
+    expect(ok.sources['catchUp.refreshPause.maxPauseMinutes']).toBe('tool');
+    const bad = resolveSetting({ catchUp: { refreshPause: { paths: [], maxPauseMinutes: -1 } } });
+    expect(bad.catchUp.refreshPause.maxPauseMinutes).toBe(10);
+    expect(bad.catchUp.refreshPause.paths.length).toBe(3);
+    for (const path of ['./scripts/x', 'scripts/./x', 'scripts//x', ' scripts/x', 'scripts/x ', '/scripts/x', 'scripts/../x']) {
+      expect(resolveSetting({ catchUp: { refreshPause: { paths: [path] } } }).catchUp.refreshPause.paths.length).toBe(3);
+    }
+  });
+
+  // A nested object in a leaf slot used to be flattened by the cascade and validated against the TOP-LEVEL key's
+  // validator, so `{prefixes:[…]}` passed as `paths` (then `.paths.join` threw and enqueue switched off).
+  const DEFAULT_PAUSE_PATHS = ['scripts/lib/drain-queue-safety', 'scripts/merge-ai-prs', 'scripts/lib/enqueue-on-event'];
+  it('a nested object in a refreshPause leaf is invalid: never throws, keeps the lower layer, names the leaf', () => {
+    const paths = resolveSetting({ enabled: true, catchUp: { enabled: true, refreshPause: { paths: { prefixes: ['scripts/custom'] } } } },
+      { platform: { catchUp: { refreshPause: { paths: ['scripts/plat'] } } } });
+    expect(paths.enabled).toBe(true);
+    expect(paths.catchUp.refreshPause.paths).toEqual(['scripts/plat']);
+    expect(paths.sources['catchUp.refreshPause.paths']).toBe('platform');
+    expect(paths.invalid).toContain('tool.catchUp.refreshPause.paths={"prefixes":["scripts/custom"]}');
+    expect(paths.line).toContain('catchUp.refreshPause.paths=scripts/plat (platform)');
+    const max = resolveSetting({ catchUp: { refreshPause: { maxPauseMinutes: { minutes: 3 } } } });
+    expect(max.catchUp.refreshPause.maxPauseMinutes).toBe(10);
+    expect(max.invalid).toContain('tool.catchUp.refreshPause.maxPauseMinutes={"minutes":3}');
+    const platformBad = resolveSetting({}, { platform: { catchUp: { refreshPause: { paths: { x: ['scripts/p'] }, maxPauseMinutes: { m: 2 } } } } });
+    expect(platformBad.catchUp.refreshPause).toEqual({ paths: DEFAULT_PAUSE_PATHS, maxPauseMinutes: 10 });
+    expect(platformBad.invalid).toEqual(expect.arrayContaining(['platform.catchUp.refreshPause.paths={"x":["scripts/p"]}', 'platform.catchUp.refreshPause.maxPauseMinutes={"m":2}']));
+    for (const shape of ['x', ['a'], 5, null]) {
+      const s = resolveSetting({ catchUp: { refreshPause: shape } });
+      expect(s.catchUp.refreshPause).toEqual({ paths: DEFAULT_PAUSE_PATHS, maxPauseMinutes: 10 });
+    }
+  });
+
+  it('a valid refreshPause is not reported as ignored-invalid', () => {
+    const s = resolveSetting({ catchUp: { refreshPause: { paths: ['scripts/custom'], maxPauseMinutes: 3 } } });
+    expect(s.catchUp.refreshPause).toEqual({ paths: ['scripts/custom'], maxPauseMinutes: 3 });
+    expect(s.invalid).toEqual([]);
+  });
+
+  it('the same nested-object shape in the sibling and scalar leaves falls to the lower layer', () => {
+    const ttl = resolveSetting({ catchUp: { missBackoff: { ttlMinutes: { x: 5 } } } }, { platform: { catchUp: { missBackoff: { ttlMinutes: 45 } } } });
+    expect(ttl.catchUp.missBackoff.ttlMinutes).toBe(45);
+    expect(ttl.invalid).toContain('tool.catchUp.missBackoff.ttlMinutes={"x":5}');
+    const scalar = resolveSetting({ enabled: true, debounceSeconds: { a: 5 } }, { platform: { debounceSeconds: 20 } });
+    expect(scalar).toMatchObject({ enabled: true, debounceSeconds: 20, sources: { debounceSeconds: 'platform' } });
+    expect(scalar.invalid).toContain('tool.debounceSeconds={"a":5}');
+    const enabled = resolveSetting({ enabled: { x: true } }, { platform: { enabled: true } });
+    expect(enabled.enabled).toBe(true);
+    expect(enabled.invalid).toContain('tool.enabled={"x":true}');
+    const catchUp = resolveSetting({ catchUp: { intervalMinutes: { m: 5 }, enabled: true } }, { platform: { catchUp: { intervalMinutes: 20 } } });
+    expect(catchUp.catchUp).toMatchObject({ intervalMinutes: 20, enabled: true });
+    expect(resolveSetting({ catchUp: 'x' }).invalid).toContain('catchUp="x"');
+  });
+
+  // Production passes no `platform`: the cascade reads the operator's preferences file itself, so that layer must be cleaned too.
+  describe('platform layer read from the preferences file (no platform argument)', () => {
+    const fromFile = (prefs, tool) => {
+      const dir = mkdtempSync(join(tmpdir(), 'enq-prefs-'));
+      const file = join(dir, 'platform-preferences.json');
+      writeFileSync(file, JSON.stringify(prefs));
+      try { return resolveEnqueueOnEventSetting({ tool, env: { WE_PLATFORM_PREFERENCES_FILE: file } }); } finally { rmSync(dir, { recursive: true, force: true }); }
+    };
+    const K = 'mergeQueue.enqueueOnEvent';
+    it.each([
+      ['enabled', { enabled: { x: true } }, { enabled: true }, (s) => expect(s.enabled).toBe(true)],
+      ['debounceSeconds', { debounceSeconds: { a: 5 } }, { enabled: true, debounceSeconds: 30 }, (s) => expect(s.debounceSeconds).toBe(30)],
+      ['catchUp.intervalMinutes', { catchUp: { intervalMinutes: { m: 5 } } }, { enabled: true, catchUp: { intervalMinutes: 20 } }, (s) => expect(s.catchUp.intervalMinutes).toBe(20)],
+      ['catchUp.enabled', { catchUp: { enabled: { x: true } } }, { enabled: true, catchUp: { enabled: true } }, (s) => expect(s.catchUp.enabled).toBe(true)],
+    ])('a nested object in the platform file %s does not override a valid tool value', (_leaf, platformBlock, tool, check) => {
+      const s = fromFile({ [K]: platformBlock }, tool);
+      check(s);
+      expect(s.invalid.length).toBeGreaterThan(0);
+    });
+    it('a nested object in a platform-file refreshPause / missBackoff leaf falls to the standard value and is named', () => {
+      const s = fromFile({ [`${K}.catchUp.refreshPause`]: { paths: { p: ['scripts/p'] }, maxPauseMinutes: { m: 2 } }, [`${K}.catchUp.missBackoff`]: { ttlMinutes: { x: 5 } } }, { enabled: true });
+      expect(s.catchUp.refreshPause).toEqual({ paths: DEFAULT_PAUSE_PATHS, maxPauseMinutes: 10 });
+      expect(s.catchUp.missBackoff.ttlMinutes).toBe(30);
+      expect(s.invalid).toEqual(expect.arrayContaining(['platform.catchUp.refreshPause.paths={"p":["scripts/p"]}', 'platform.catchUp.missBackoff.ttlMinutes={"x":5}']));
+    });
+    it('a valid platform-file refreshPause is applied', () => {
+      const s = fromFile({ [`${K}.catchUp.refreshPause`]: { paths: ['scripts/p'], maxPauseMinutes: 4 } }, { enabled: true });
+      expect(s.catchUp.refreshPause).toEqual({ paths: ['scripts/p'], maxPauseMinutes: 4 });
+      expect(s.sources['catchUp.refreshPause.paths']).toBe('platform');
+    });
+  });
+
+  it('rejects control characters in a pause path and bounds the logged invalid value', () => {
+    const s = resolveSetting({ catchUp: { refreshPause: { paths: ['a\nb · ignored invalid: x'] } } });
+    expect(s.catchUp.refreshPause.paths).toEqual(DEFAULT_PAUSE_PATHS);
+    expect(s.line).not.toContain('\n');
+    expect(resolveSetting({ debounceSeconds: { a: 'x'.repeat(500) } }).invalid[0].length).toBeLessThan(120);
+    const dup = resolveSetting({ catchUp: { order: 'x' } }, { platform: { catchUp: { order: 'x' } } });
+    expect(dup.invalid.filter((i) => i === 'catchUp.order="x"')).toHaveLength(1);
   });
 });
 

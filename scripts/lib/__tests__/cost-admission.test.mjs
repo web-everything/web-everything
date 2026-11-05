@@ -80,6 +80,16 @@ describe('admitLaunch — the rule', () => {
       .toMatchObject({ admit: false, reason: 'mem-free' });
   });
 
+  it('ON: a resource gate-error refusal (decidedBy legacy) still refuses, even with healthy CPU and memory facts', () => {
+    const resource = { admit: false, reason: 'gate-error', kind: 'gate-error', why: 'gate-error: shared decision unavailable', decidedBy: 'legacy' };
+    const d = admitLaunch({ kind: 'prepare-item', settings: ON, facts: { cpuIdlePct: 50, memFreePct: 50, minMemFreePct: 15, lightInFlight: 0, resource } });
+    expect(d).toMatchObject({ admit: false, rule: 'light', reason: 'resource-admission' });
+    expect(d.why).toContain('gate-error: shared decision unavailable');
+    // a legacy-decided ADMIT (shadow mode) is still ignored: the legacy floors apply instead
+    expect(admitLaunch({ kind: 'prepare-item', settings: ON, facts: { cpuIdlePct: 50, lightInFlight: 0, resource: { admit: true, decidedBy: 'legacy' } } }))
+      .toMatchObject({ admit: true, reason: 'admitted' });
+  });
+
   it('unreadable facts fail OPEN (a missing meter never stops work)', () => {
     expect(admitLaunch({ kind: 'prepare-item', settings: { ...ON, claudeDailyUsdBudget: 10 }, facts: {} })).toMatchObject({ admit: true });
     expect(tokenBudgetExhausted({ claudeUsdToday: null }, { claudeDailyUsdBudget: 10 })).toBe(false);
