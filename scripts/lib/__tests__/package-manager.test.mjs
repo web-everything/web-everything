@@ -64,6 +64,23 @@ describe('installArgv / installCommand', () => {
   });
 });
 
+describe('frozen cannot be weakened by passthrough options', () => {
+  it('installCommand ignores a stray ci:false and keeps the frozen install', () => {
+    expect(installCommand({ frozen: true, ci: false, env: {} })).toBe('npm ci');
+  });
+  it('installWithFallback keeps ci when frozen even with a stray ci:false', () => {
+    const calls = [];
+    installWithFallback({ frozen: true, ci: false, env: {}, exec: (b, a) => calls.push([b, ...a]) });
+    expect(calls).toEqual([['npm', 'ci']]);
+  });
+  it('installCommand logs the fallback note when pnpm is unusable', () => {
+    const logs = [];
+    const cmd = installCommand({ frozen: true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => { throw new Error('x'); }, log: (l) => logs.push(l) });
+    expect(cmd).toBe('npm ci');
+    expect(logs.join('')).toMatch(/pnpm --version failed/);
+  });
+});
+
 describe('installWithFallback', () => {
   it('runs pnpm and does not touch npm on success', () => {
     const calls = [];
@@ -77,7 +94,8 @@ describe('installWithFallback', () => {
     const r = installWithFallback({ frozen: true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => '9', log: (l) => logs.push(l),
       exec: (bin, args) => { calls.push([bin, ...args]); if (bin === 'pnpm') throw new Error('boom'); } });
     expect(calls).toEqual([['pnpm', 'install', '--frozen-lockfile'], ['npm', 'ci']]);
-    expect(r).toMatchObject({ fellBack: true, manager: 'npm' });
+    expect(r).toMatchObject({ fellBack: true, manager: 'npm', pnpmError: 'boom' });
+    expect(logs.join('\n')).toMatch(/NOT pnpm-lock/);
     expect(logs.join('\n')).toMatch(/pnpm install failed.*falling back to npm ci/);
   });
   it('a failed npm install propagates (no silent success)', () => {

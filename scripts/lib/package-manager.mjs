@@ -40,22 +40,23 @@ export function installArgv({ ci = false, ignoreScripts = false, pnpmVersion = d
 }
 
 /** The install command line as text (`frozen` = lockfile-exact install). */
-export function installCommand({ frozen = false, ...opts } = {}) {
-  const { bin, args } = installArgv({ ci: frozen, ...opts });
+export function installCommand({ frozen = false, log = (l) => console.error(l), ...opts } = {}) {
+  const { bin, args, note } = installArgv({ ...opts, ci: frozen });
+  if (note) log(`package-manager · ${note}`);
   return [bin, ...args].join(' ');
 }
 
 /** Run the install; a failed pnpm install falls back to `npm ci`/`npm install` and logs it. */
 export function installWithFallback({ frozen = false, ignoreScripts = false, cwd, exec = (bin, args, o) => execFileSync(bin, args, { stdio: 'inherit', ...o }), log = (l) => console.error(l), ...opts } = {}) {
-  const first = installArgv({ ci: frozen, ignoreScripts, ...opts });
+  const first = installArgv({ ...opts, ci: frozen, ignoreScripts });
   if (first.note) log(`package-manager · ${first.note}`);
   try { exec(first.bin, first.args, { cwd }); return { ...first, fellBack: false }; }
   catch (e) {
     if (first.manager !== 'pnpm') throw e;
-    log(`package-manager · pnpm install failed (${String(e?.message ?? e).split('\n')[0]}); falling back to npm ${frozen ? 'ci' : 'install'}`);
+    log(`package-manager · pnpm install failed (${String(e?.message ?? e).split('\n')[0]}); falling back to npm ${frozen ? 'ci' : 'install'} (npm validates package-lock.json, NOT pnpm-lock.yaml: a pnpm lockfile rejection is not cleared by this fallback)`);
     const args = [frozen ? 'ci' : 'install', ...(ignoreScripts ? ['--ignore-scripts'] : [])];
     exec('npm', args, { cwd });
-    return { bin: 'npm', args, manager: 'npm', source: first.source, fellBack: true };
+    return { bin: 'npm', args, manager: 'npm', source: first.source, fellBack: true, pnpmError: String(e?.message ?? e).split('\n')[0] };
   }
 }
 
