@@ -82,12 +82,14 @@ import { extractManifestFromBody, repoKeyFromSlug } from '../readiness/lane-mani
 import { parseVerdictComment } from './review-log-claims.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
-import { readOverlays } from './daemon-overlays.mjs';
+import { readOverlays, readOverlayState } from './daemon-overlays.mjs';
 import { readRebuildState } from './daemon-rebuild/state.mjs';
 
 export const ENQUEUE_ON_EVENT_POLICY = 'mergeQueue.enqueueOnEvent';
 export const ENQUEUE_ON_EVENT_ENV = 'WE_ENQUEUE_ON_EVENT';
-export const ENQUEUE_ON_EVENT_DEFAULTS = Object.freeze({ enabled: false, debounceSeconds: 15, debounceMaxWaitMs: 60_000, timeoutSeconds: 600, catchUp: Object.freeze({ enabled: false, intervalMinutes: 10, pendingExpiryMinutes: 15, concurrency: 3, busyIntervalSeconds: 60, maxQueued: 12, missSmellAfter: 3, blockedBackoffRounds: 6, timeoutBackoffRounds: 3, missBackoff: Object.freeze({ enabled: true, ttlMinutes: 30 }), order: 'priority-then-first-accept' }) });
+/** Enqueue and merge decision modules: a pending change touching these pauses catch-up (path prefixes). */
+const REFRESH_PAUSE_PATHS = Object.freeze(['scripts/lib/drain-queue-safety', 'scripts/merge-ai-prs', 'scripts/lib/enqueue-on-event']);
+export const ENQUEUE_ON_EVENT_DEFAULTS = Object.freeze({ enabled: false, debounceSeconds: 15, debounceMaxWaitMs: 60_000, timeoutSeconds: 600, catchUp: Object.freeze({ enabled: false, intervalMinutes: 10, pendingExpiryMinutes: 15, concurrency: 3, busyIntervalSeconds: 60, maxQueued: 12, missSmellAfter: 3, blockedBackoffRounds: 6, timeoutBackoffRounds: 3, missBackoff: Object.freeze({ enabled: true, ttlMinutes: 30 }), refreshPause: Object.freeze({ paths: Object.freeze(REFRESH_PAUSE_PATHS), maxPauseMinutes: 10 }), order: 'priority-then-first-accept' }) });
 /** Compatibility constant for the standard fast-drain timeout; the setting controls child runs. */
 export const FAST_DRAIN_TIMEOUT_MS = 10 * 60_000;
 const READY_LABEL = 'ready-to-merge';
@@ -183,13 +185,24 @@ export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform
   out.catchUp.missBackoff = miss.value;
   for (const [key, source] of Object.entries(miss.sources)) out.sources[`catchUp.missBackoff.${key}`] = source;
   for (const invalid of miss.invalid) out.invalid.push(invalid.replace(/^(tool|platform)\./, '$1.catchUp.missBackoff.'));
+  const pauseValid = {
+    paths: (x) => Array.isArray(x) && x.length > 0 && x.every((p) => typeof p === 'string' && p === p.trim() && p !== '' && p.split('/').every((seg, i, all) => seg !== '.' && seg !== '..' && (seg !== '' || i === all.length - 1)) && !p.startsWith('/')),
+    maxPauseMinutes: (x) => Number.isFinite(x) && x > 0 && x <= 1440,
+  };
+  const pause = cascadePolicy(`${ENQUEUE_ON_EVENT_POLICY}.catchUp.refreshPause`, isObj(block?.catchUp?.refreshPause) ? block.catchUp.refreshPause : undefined, {
+    env, standard: { paths: [...REFRESH_PAUSE_PATHS], maxPauseMinutes: ENQUEUE_ON_EVENT_DEFAULTS.catchUp.refreshPause.maxPauseMinutes }, valid: pauseValid,
+    ...(platform !== undefined ? { platform: platform?.catchUp?.refreshPause } : {}), log: () => {},
+  });
+  out.catchUp.refreshPause = pause.value;
+  for (const [key, source] of Object.entries(pause.sources)) out.sources[`catchUp.refreshPause.${key}`] = source;
+  for (const invalid of pause.invalid) out.invalid.push(invalid.replace(/^(tool|platform)\./, '$1.catchUp.refreshPause.'));
   // The cascade rejects values outside the union before the per-leaf type check can see them.
   for (const invalid of c.invalid || []) {
-    const match = /^(?:tool|platform)\.(catchUp\.(?:enabled|intervalMinutes|pendingExpiryMinutes|concurrency|busyIntervalSeconds|maxQueued|missSmellAfter|blockedBackoffRounds|timeoutBackoffRounds|missBackoff\.(?:enabled|ttlMinutes)|order)=.*)$/.exec(invalid);
+    const match = /^(?:tool|platform)\.(catchUp\.(?:enabled|intervalMinutes|pendingExpiryMinutes|concurrency|busyIntervalSeconds|maxQueued|missSmellAfter|blockedBackoffRounds|timeoutBackoffRounds|missBackoff\.(?:enabled|ttlMinutes)|refreshPause\.(?:paths|maxPauseMinutes)|order)=.*)$/.exec(invalid);
     if (match && !out.invalid.includes(match[1])) out.invalid.push(match[1]);
   }
   const src = (k) => out.sources[k] || 'standard';
-  out.line = `enqueue-on-event: setting ${ENQUEUE_ON_EVENT_POLICY} enabled=${out.enabled} (${src('enabled')}), debounceSeconds=${out.debounceSeconds} (${src('debounceSeconds')}), debounceMaxWaitMs=${out.debounceMaxWaitMs} (${src('debounceMaxWaitMs')}), timeoutSeconds=${out.timeoutSeconds} (${src('timeoutSeconds')}), catchUp.enabled=${out.catchUp.enabled} (${src('catchUp.enabled')}), catchUp.intervalMinutes=${out.catchUp.intervalMinutes} (${src('catchUp.intervalMinutes')}), catchUp.pendingExpiryMinutes=${out.catchUp.pendingExpiryMinutes} (${src('catchUp.pendingExpiryMinutes')}), catchUp.concurrency=${out.catchUp.concurrency} (${src('catchUp.concurrency')}), catchUp.busyIntervalSeconds=${out.catchUp.busyIntervalSeconds} (${src('catchUp.busyIntervalSeconds')}), catchUp.maxQueued=${out.catchUp.maxQueued} (${src('catchUp.maxQueued')}), catchUp.missSmellAfter=${out.catchUp.missSmellAfter} (${src('catchUp.missSmellAfter')}), catchUp.blockedBackoffRounds=${out.catchUp.blockedBackoffRounds} (${src('catchUp.blockedBackoffRounds')}), catchUp.timeoutBackoffRounds=${out.catchUp.timeoutBackoffRounds} (${src('catchUp.timeoutBackoffRounds')}), catchUp.missBackoff.enabled=${out.catchUp.missBackoff.enabled} (${src('catchUp.missBackoff.enabled')}), catchUp.missBackoff.ttlMinutes=${out.catchUp.missBackoff.ttlMinutes} (${src('catchUp.missBackoff.ttlMinutes')}), catchUp.order=${out.catchUp.order} (${src('catchUp.order')})${out.invalid.length ? ` · ignored invalid: ${out.invalid.join('; ')}` : ''}`;
+  out.line = `enqueue-on-event: setting ${ENQUEUE_ON_EVENT_POLICY} enabled=${out.enabled} (${src('enabled')}), debounceSeconds=${out.debounceSeconds} (${src('debounceSeconds')}), debounceMaxWaitMs=${out.debounceMaxWaitMs} (${src('debounceMaxWaitMs')}), timeoutSeconds=${out.timeoutSeconds} (${src('timeoutSeconds')}), catchUp.enabled=${out.catchUp.enabled} (${src('catchUp.enabled')}), catchUp.intervalMinutes=${out.catchUp.intervalMinutes} (${src('catchUp.intervalMinutes')}), catchUp.pendingExpiryMinutes=${out.catchUp.pendingExpiryMinutes} (${src('catchUp.pendingExpiryMinutes')}), catchUp.concurrency=${out.catchUp.concurrency} (${src('catchUp.concurrency')}), catchUp.busyIntervalSeconds=${out.catchUp.busyIntervalSeconds} (${src('catchUp.busyIntervalSeconds')}), catchUp.maxQueued=${out.catchUp.maxQueued} (${src('catchUp.maxQueued')}), catchUp.missSmellAfter=${out.catchUp.missSmellAfter} (${src('catchUp.missSmellAfter')}), catchUp.blockedBackoffRounds=${out.catchUp.blockedBackoffRounds} (${src('catchUp.blockedBackoffRounds')}), catchUp.timeoutBackoffRounds=${out.catchUp.timeoutBackoffRounds} (${src('catchUp.timeoutBackoffRounds')}), catchUp.missBackoff.enabled=${out.catchUp.missBackoff.enabled} (${src('catchUp.missBackoff.enabled')}), catchUp.missBackoff.ttlMinutes=${out.catchUp.missBackoff.ttlMinutes} (${src('catchUp.missBackoff.ttlMinutes')}), catchUp.refreshPause.paths=${out.catchUp.refreshPause.paths.join(',')} (${src('catchUp.refreshPause.paths')}), catchUp.refreshPause.maxPauseMinutes=${out.catchUp.refreshPause.maxPauseMinutes} (${src('catchUp.refreshPause.maxPauseMinutes')}), catchUp.order=${out.catchUp.order} (${src('catchUp.order')})${out.invalid.length ? ` · ignored invalid: ${out.invalid.join('; ')}` : ''}`;
   return out;
 }
 
@@ -580,6 +593,26 @@ const lastJsonLine = (s) => {
 };
 
 /**
+ * IO: repo-relative paths the pending refresh would change: each unadopted overlay ref and main, against the code clone's HEAD.
+ * Any unreadable piece returns {ok:false} so the caller fails closed.
+ */
+export function readPendingChangePaths({ root, cwd, env = process.env, execFileSyncImpl, overlays, rebuildState }) {
+  try {
+    if (!root || root === cwd) return { ok: true, paths: [], source: 'no separate code clone' };
+    const git = (args) => String(execFileSyncImpl('git', args, { cwd: root, env, encoding: 'utf8', timeout: 30_000, maxBuffer: 4 * 1024 * 1024 }));
+    const lines = (out) => out.split('\n').map((l) => l.trim()).filter(Boolean);
+    const adoptedAt = Date.parse(rebuildState()?.adopted?.at);
+    const refs = overlays().filter((o) => !Number.isFinite(adoptedAt) || !(Date.parse(o?.addedAt) <= adoptedAt)).map((o) => o.ref);
+    const paths = new Set(lines(git(['diff', '--name-only', '--no-renames', 'HEAD', 'origin/main'])));
+    for (const ref of refs) {
+      if (typeof ref !== 'string' || !/^[A-Za-z0-9._/-]+$/.test(ref) || ref.startsWith('-')) return { ok: false, error: `overlay ref ${JSON.stringify(ref)} unsafe` };
+      for (const p of lines(git(['diff', '--name-only', '--no-renames', `origin/main...origin/${ref}`, '--']))) paths.add(p);
+    }
+    return { ok: true, paths: [...paths], source: `main delta + ${refs.length} overlay(s)` };
+  } catch (e) { return { ok: false, error: String(e?.message || e).split('\n')[0] }; }
+}
+
+/**
  * The daemon-side handle.
  * @param {{cwd:string, localSlug:string, defaultBranch?:string, execFileSyncImpl?:Function, scriptRoot?:()=>string, allowed?:()=>boolean, refreshPending?:Function, log?:(m:string)=>void,
  *   env?:object, now?:()=>number, spawnImpl?:Function, resolveSetting?:Function, timeoutMs?:number, readPr?:Function, readMembership?:Function, readCandidates?:Function, readQueueDepth?:Function, readCapacity?:Function, readPriorities?:Function}} o
@@ -597,6 +630,7 @@ export function createEnqueueOnEvent({
       return overlayRefreshPending({ overlays: readOverlays(root, { env }), rebuildState: readRebuildState(root, env), now: now() });
     } catch { return { pending: false }; }
   },
+  readPendingChange = () => readPendingChangePaths({ root: scriptRoot(), cwd, env, execFileSyncImpl, overlays: () => { const st = readOverlayState(scriptRoot(), { env }); if (st.corrupt) throw new Error('overlay registry unreadable'); return st.overlays; }, rebuildState: () => readRebuildState(scriptRoot(), env) }),
   readCandidates = ({ repo }) => readCatchUpCandidates({ repo, env, defaultBranch }), readCapacity = (s) => readQueueCapacity(s),
   readPriorities = () => ({ priority: readBuildQueuePrioritySettings({ env }), buildPriority: readBuildPrioritySettings({ env }).ids, mainFix: readMainRedPriority({ env }) }),
   readQueueDepth = ({ repo }) => readCatchUpQueueDepth({ repo, env }),
@@ -676,14 +710,41 @@ export function createEnqueueOnEvent({
     return true;
   }
 
+  let pauseSince = null;
+  /** While a refresh is pending: keep enqueuing on last-good unless the pending change touches enqueue/merge code (bounded pause). */
+  function refreshDecision(refresh) {
+    const cfg = { ...ENQUEUE_ON_EVENT_DEFAULTS.catchUp.refreshPause, ...setting.catchUp?.refreshPause };
+    const src = `paths ${setting.sources?.['catchUp.refreshPause.paths'] || 'standard'}, maxPause ${setting.sources?.['catchUp.refreshPause.maxPauseMinutes'] || 'standard'}`;
+    let change;
+    try { change = readPendingChange(); } catch (e) { change = { ok: false, error: String(e?.message || e).split('\n')[0] }; }
+    const touched = change?.ok === true && Array.isArray(change.paths)
+      ? change.paths.filter((p) => cfg.paths.some((prefix) => p === prefix || p.startsWith(prefix))) : null;
+    if (touched && !touched.length) {
+      pauseSince = null;
+      return { go: true, line: `enqueue-on-event: daemon refresh pending (${refresh.reason}) — continuing on last-good: pending change (${change.source || 'unknown source'}) touches none of ${cfg.paths.join(', ')} [${src}]` };
+    }
+    const why = touched ? `pending change touches ${touched.slice(0, 5).join(', ')}` : `pending diff unreadable (${change?.error || 'unknown'}) — failing closed`;
+    pauseSince ??= now();
+    // An unreadable diff never expires on this bound (fail closed, as before); overlayRefreshPending's own age bound still applies.
+    if (touched && now() - pauseSince >= cfg.maxPauseMinutes * 60_000) {
+      return { go: true, line: `enqueue-on-event: WARN daemon refresh pending (${refresh.reason}) — max pause ${cfg.maxPauseMinutes}m exceeded (${why}) — enqueuing on last-good [${src}]` };
+    }
+    return { go: false, why: `${why}; pause bounded at ${cfg.maxPauseMinutes}m [${src}]` };
+  }
+
   async function runDue({ catchUpOnly = false } = {}) {
     let refreshLogged = false;
     const mayStart = () => {
       if (!allowed()) return false;
       const refresh = refreshPending();
-      if (!refresh.pending) return true;
+      if (!refresh.pending) { pauseSince = null; return true; }
+      const decision = refreshDecision(refresh);
+      if (decision.go) {
+        if (!refreshLogged) { log(decision.line); refreshLogged = true; }
+        return true;
+      }
       if (!refreshLogged) {
-        log(`enqueue-on-event: catch-up paused — daemon refresh pending (${refresh.reason}) — retrying on next tick`);
+        log(`enqueue-on-event: catch-up paused — daemon refresh pending (${refresh.reason}) — ${decision.why} — retrying on next tick`);
         refreshLogged = true;
       }
       return false;

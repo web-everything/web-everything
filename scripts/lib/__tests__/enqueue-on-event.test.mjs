@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   extractPassTimings, parseMarkCause, isEligibleCause, parseMarkKey, notePending, duePending,
-  CATCH_UP_QUERY, ENQUEUE_ON_EVENT_DEFAULTS, readCatchUpCandidates, readyAtQuery, planCatchUp,
+  CATCH_UP_QUERY, ENQUEUE_ON_EVENT_DEFAULTS, readPendingChangePaths, readCatchUpCandidates, readyAtQuery, planCatchUp,
   fastDrainArgs, summarizeFastDrain, resolveEnqueueOnEventSetting, createEnqueueOnEvent, wakeWorthy,
 } from '../enqueue-on-event.mjs';
 import * as enqueueModule from '../enqueue-on-event.mjs';
@@ -657,6 +657,161 @@ describe('readCatchUpCandidates', () => {
   it('handles a synchronous exec exception', async () => {
     expect(await readCatchUpCandidates({ repo: REPO, readComments: () => [], execFileImpl: () => { throw new Error('spawn failed'); } }))
       .toEqual({ ok: false, error: 'spawn failed' });
+  });
+});
+
+describe('readPendingChangePaths', () => {
+  const base = { root: '/code', cwd: '/clone', overlays: () => [{ ref: 'lane/x', addedAt: '2026-11-05T00:00:00Z' }], rebuildState: () => ({ adopted: { at: '2026-11-04T00:00:00Z' } }) };
+  it('unions the main delta and each unadopted overlay diff', () => {
+    const exec = (_c, args) => (args.includes('HEAD') ? 'a.mjs\n' : 'b.mjs\n');
+    expect(readPendingChangePaths({ ...base, execFileSyncImpl: exec })).toMatchObject({ ok: true, paths: ['a.mjs', 'b.mjs'] });
+  });
+  it('skips overlays adopted already', () => {
+    const calls = [];
+    readPendingChangePaths({ ...base, rebuildState: () => ({ adopted: { at: '2026-11-06T00:00:00Z' } }), execFileSyncImpl: (_c, args) => { calls.push(args); return ''; } });
+    expect(calls).toHaveLength(1);
+  });
+  it('disables rename detection so a moved protected file still shows its source path', () => {
+    const calls = [];
+    readPendingChangePaths({ ...base, execFileSyncImpl: (_c, args) => { calls.push(args); return ''; } });
+    expect(calls.every((args) => args.includes('--no-renames'))).toBe(true);
+  });
+  it('fails closed on a git error or an unsafe ref', () => {
+    expect(readPendingChangePaths({ ...base, execFileSyncImpl: () => { throw new Error('bad object'); } })).toMatchObject({ ok: false });
+    expect(readPendingChangePaths({ ...base, overlays: () => [{ ref: '--evil' }], execFileSyncImpl: () => '' })).toMatchObject({ ok: false });
+  });
+});
+
+describe('catch-up during a daemon refresh (last-good enqueue)', () => {
+  const pendingRefresh = () => ({ pending: true, reason: 'unadopted-overlay' });
+  const warn = (lines) => lines.filter((line) => line.includes('refresh pending'));
+
+  it('keeps enqueuing on last-good while an unrelated overlay is pending, and logs the decision with provenance', async () => {
+    const { handle, calls, lines } = catchUpSetup({
+      refreshPending: pendingRefresh,
+      readPendingChange: () => ({ ok: true, paths: ['scripts/lib/unrelated.mjs'], source: 'overlay lane/x' }),
+    });
+    await handle.catchUp();
+    expect(calls.map((call) => call.args[1])).toEqual(['--only=42', '--only=43']);
+    expect(lines.filter((line) => line.includes('catch-up paused'))).toEqual([]);
+    const decision = warn(lines);
+    expect(decision).toHaveLength(1);
+    expect(decision[0]).toMatch(/continuing on last-good/);
+    expect(decision[0]).toContain('overlay lane/x');
+  });
+
+  it.each([
+    'scripts/lib/enqueue-on-event.mjs',
+    'scripts/lib/drain-queue-safety.mjs',
+    'scripts/merge-ai-prs.mjs',
+  ])('pauses when the pending change touches %s', async (path) => {
+    const { handle, calls, lines } = catchUpSetup({
+      refreshPending: pendingRefresh,
+      readPendingChange: () => ({ ok: true, paths: ['README.md', path], source: 'overlay lane/x' }),
+    });
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+    const pauses = lines.filter((line) => line.includes('catch-up paused'));
+    expect(pauses).toHaveLength(1);
+    expect(pauses[0]).toContain(path);
+  });
+
+  it('pauses when the pending diff cannot be read (fail closed)', async () => {
+    const { handle, calls, lines } = catchUpSetup({
+      refreshPending: pendingRefresh,
+      readPendingChange: () => ({ ok: false, error: 'git diff failed' }),
+    });
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+    expect(lines.filter((line) => line.includes('catch-up paused'))[0]).toContain('git diff failed');
+  });
+
+  it('keeps an unreadable-diff pause past maxPauseMinutes (fail closed)', async () => {
+    const { handle, calls, advance } = catchUpSetup({
+      refreshPending: pendingRefresh,
+      readPendingChange: () => ({ ok: false, error: 'git diff failed' }),
+    });
+    await handle.catchUp();
+    advance(30 * 60_000);
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+  });
+
+  it('a protected change after an unrelated one gets a fresh pause clock', async () => {
+    let change = { ok: true, paths: ['scripts/lib/enqueue-on-event.mjs'], source: 'a' };
+    const { handle, calls, advance } = catchUpSetup({ refreshPending: pendingRefresh, readPendingChange: () => change });
+    await handle.catchUp();
+    advance(8 * 60_000);
+    change = { ok: true, paths: ['README.md'], source: 'b' };
+    await handle.catchUp();
+    expect(calls.length).toBeGreaterThan(0);
+    calls.length = 0;
+    advance(5 * 60_000);
+    change = { ok: true, paths: ['scripts/merge-ai-prs.mjs'], source: 'c' };
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+  });
+
+  it('pauses when reading the pending diff throws', async () => {
+    const { handle, calls } = catchUpSetup({
+      refreshPending: pendingRefresh,
+      readPendingChange: () => { throw new Error('boom'); },
+    });
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+  });
+
+  it('bounds a pause: after maxPauseMinutes it enqueues on last-good with a warning', async () => {
+    const { handle, calls, lines, advance } = catchUpSetup({
+      refreshPending: pendingRefresh,
+      readPendingChange: () => ({ ok: true, paths: ['scripts/lib/enqueue-on-event.mjs'], source: 'overlay lane/x' }),
+    });
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+    advance(9 * 60_000);
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+    advance(2 * 60_000);
+    await handle.catchUp();
+    expect(calls.length).toBeGreaterThan(0);
+    expect(lines.some((line) => /WARN/.test(line) && /max pause/.test(line))).toBe(true);
+  });
+
+  it('restarts the pause clock once the refresh clears', async () => {
+    let refresh = pendingRefresh();
+    const { handle, calls, advance } = catchUpSetup({
+      refreshPending: () => refresh,
+      readPendingChange: () => ({ ok: true, paths: ['scripts/lib/enqueue-on-event.mjs'], source: 'overlay lane/x' }),
+    });
+    await handle.catchUp();
+    advance(20 * 60_000);
+    refresh = { pending: false, reason: null };
+    await handle.catchUp();
+    expect(calls.length).toBeGreaterThan(0);
+    calls.length = 0;
+    refresh = pendingRefresh();
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+  });
+
+  it('resolves refreshPause with standard defaults', () => {
+    expect(resolveSetting().catchUp.refreshPause).toEqual({
+      paths: ['scripts/lib/drain-queue-safety', 'scripts/merge-ai-prs', 'scripts/lib/enqueue-on-event'],
+      maxPauseMinutes: 10,
+    });
+    expect(resolveSetting().sources['catchUp.refreshPause.maxPauseMinutes']).toBe('standard');
+  });
+
+  it('takes refreshPause from the tool layer and ignores invalid values', () => {
+    const ok = resolveSetting({ catchUp: { refreshPause: { paths: ['scripts/x'], maxPauseMinutes: 3 } } });
+    expect(ok.catchUp.refreshPause).toEqual({ paths: ['scripts/x'], maxPauseMinutes: 3 });
+    expect(ok.sources['catchUp.refreshPause.maxPauseMinutes']).toBe('tool');
+    const bad = resolveSetting({ catchUp: { refreshPause: { paths: [], maxPauseMinutes: -1 } } });
+    expect(bad.catchUp.refreshPause.maxPauseMinutes).toBe(10);
+    expect(bad.catchUp.refreshPause.paths.length).toBe(3);
+    for (const path of ['./scripts/x', 'scripts/./x', 'scripts//x', ' scripts/x', 'scripts/x ', '/scripts/x', 'scripts/../x']) {
+      expect(resolveSetting({ catchUp: { refreshPause: { paths: [path] } } }).catchUp.refreshPause.paths.length).toBe(3);
+    }
   });
 });
 
