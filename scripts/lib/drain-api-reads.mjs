@@ -70,7 +70,8 @@ export function readOriginSlug(cwd, { env = process.env, remote = 'origin', git 
   if (!slug) {
     let url;
     try { url = String(git(dir)).trim(); } catch (e) { throw new DrainReadError('repo-pin', 'origin-unreadable', String(e?.message ?? e).split('\n')[0]); }
-    const m = /^(?:https:\/\/(?:[^@/]+@)?github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/.exec(url);
+    // Only GitHub's own default ports are accepted (443 for https and ssh.github.com, 22 for ssh): any other port is not github.com.
+    const m = /^(?:https:\/\/(?:[^@/]+@)?github\.com(?::443)?\/|ssh:\/\/git@github\.com(?::22)?\/|ssh:\/\/git@ssh\.github\.com(?::443)?\/|git@github\.com:)([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/.exec(url);
     if (!m || m[1] === '.' || m[1] === '..' || m[2] === '.' || m[2] === '..') throw new DrainReadError('repo-pin', 'origin-unparseable', 'origin is not a github.com owner/repo URL');
     slug = `${m[1]}/${m[2]}`;
     slugCache.set(key, { slug, at: now() });
@@ -97,7 +98,12 @@ const unreadable = (reason, now, detail = '') => ({ ok: false, reason, ...(detai
 // and binary-override variables (WE_GH_READ_MEMO_DIR, WE_GH_ETAG_*, WE_FINISHED_CI_CACHE_DIR, WE_GH_THROTTLE_GH_BIN, ...) are
 // never inherited: a memoized answer has no expiry, so an old unfrozen tip could outlive a published freeze.
 const ENV_ALLOW = new Set(['PATH', 'HOME', 'XDG_CONFIG_HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'GH_CONFIG_DIR', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_CALLER',
-  'WE_GH_AUTH_TOKEN_HASH', 'WE_GH_AUTH_INSTALLATION', 'WE_GH_AUTH_SOURCE']);
+  'WE_GH_AUTH_TOKEN_HASH', 'WE_GH_AUTH_INSTALLATION', 'WE_GH_AUTH_SOURCE',
+  // Daemon identity and auth policy: the gh App shim reads these to know it is a daemon call and to refuse a personal login
+  // (isDaemonCaller, WE_GH_AUTH_PERSONAL_FALLBACK, the App id/role). Dropping them makes a daemon read look interactive.
+  'WE_GH_DAEMON_CALLER', 'XPC_SERVICE_NAME', 'WE_GH_AUTH_PERSONAL_FALLBACK',
+  'WE_GITHUB_AUTH', 'WE_GITHUB_AUTH_CALLER', 'WE_GITHUB_AUTH_PERSONAL_EXCEPTIONS',
+  'WE_GITHUB_APP_ID', 'WE_GITHUB_APP_INSTALLATION_ID', 'WE_GITHUB_APP_PRIVATE_KEY_PATH', 'WE_GITHUB_APP_ROLE']);
 export function pinnedGhEnv(env = process.env) {
   const out = {};
   for (const [k, v] of Object.entries(env ?? {})) {

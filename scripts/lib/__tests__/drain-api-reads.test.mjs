@@ -296,6 +296,15 @@ describe('R549 round: pinned repo, strict base64, 20 s freeze bound', () => {
     expect(slug('https://x-access-token:t@github.com/a/b.git')).toBe('a/b');
     expect(() => slug('https://gitlab.com/a/b')).toThrow(/origin-unparseable/);
     expect(() => slug('not a url')).toThrow(/origin-unparseable/);
+    // GitHub's own default ports are valid spellings of the same remote; any other port is not github.com.
+    expect(slug('ssh://git@github.com:22/web-everything/web-everything.git')).toBe('web-everything/web-everything');
+    expect(slug('ssh://git@github.com/a/b.git')).toBe('a/b');
+    expect(slug('ssh://git@ssh.github.com:443/a/b.git')).toBe('a/b');
+    expect(slug('https://github.com:443/a/b.git')).toBe('a/b');
+    expect(slug('https://x-access-token:t@github.com:443/a/b')).toBe('a/b');
+    for (const bad of ['ssh://git@github.com:2222/a/b.git', 'ssh://git@github.com:/a/b.git', 'ssh://git@github.com:22x/a/b.git', 'https://github.com:80/a/b', 'https://github.com:8443/a/b', 'ssh://git@ssh.github.com:22/a/b.git', 'ssh://git@evil.com:22/a/b.git']) {
+      expect(() => slug(bad), bad).toThrow(/origin-unparseable/);
+    }
     expect(() => readOriginSlug(`/c-${Math.random()}`, { git: () => { throw new Error('no origin'); } })).toThrow(/origin-unreadable/);
   });
   it('GH_REPO naming another repo is a mismatch (fail closed); the same repo is fine', () => {
@@ -685,7 +694,11 @@ describe('R559 tree completeness must be known: truncated === false, strictly', 
 describe('R559 safety reads never reuse a cache: the gh env is an allowlist', () => {
   const FORBIDDEN = ['WE_GH_READ_MEMO_DIR', 'WE_GH_ETAG_DIR', 'WE_GH_ETAG_CACHE', 'WE_FINISHED_CI_CACHE_DIR', 'WE_GH_THROTTLE_GH_BIN',
     'GH_ENTERPRISE_TOKEN', 'GH_REPO', 'GH_HOST_OVERRIDE', 'WE_GH_REPLAY_DIR', 'SOME_RANDOM_VAR', 'NODE_OPTIONS'];
-  const ALLOWED = ['PATH', 'HOME', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_CALLER', 'WE_GH_AUTH_TOKEN_HASH', 'WE_GH_THROTTLE_CAP', 'WE_GH_THROTTLE_LOCK_ROOT'];
+  // The daemon identity and auth-policy variables the gh App shim reads are kept: dropping them makes a daemon read look
+  // interactive, so the shim would fall back to a personal login it was told to refuse.
+  const ALLOWED = ['PATH', 'HOME', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_CALLER', 'WE_GH_AUTH_TOKEN_HASH', 'WE_GH_THROTTLE_CAP', 'WE_GH_THROTTLE_LOCK_ROOT',
+    'WE_GH_DAEMON_CALLER', 'XPC_SERVICE_NAME', 'WE_GH_AUTH_PERSONAL_FALLBACK', 'WE_GITHUB_AUTH', 'WE_GITHUB_AUTH_CALLER', 'WE_GITHUB_AUTH_PERSONAL_EXCEPTIONS',
+    'WE_GITHUB_APP_ID', 'WE_GITHUB_APP_INSTALLATION_ID', 'WE_GITHUB_APP_PRIVATE_KEY_PATH', 'WE_GITHUB_APP_ROLE'];
   const envOf = () => Object.fromEntries([...FORBIDDEN, ...ALLOWED].map((k) => [k, 'x']));
   const capture = () => { const seen = []; const rest = (_p, o) => { seen.push(o); return ok({ a: 1 }); }; rest.seen = seen; return rest; };
   it.each(FORBIDDEN)('%s is never passed to gh', (name) => {
