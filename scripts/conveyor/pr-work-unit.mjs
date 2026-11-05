@@ -42,6 +42,21 @@
 import { repoProfile, gateFor } from '../lib/repo-profile.mjs';
 import { laneRefItemNum } from './lease-reaper.mjs';
 
+/** Split authored scope entries, inheriting prefixes only within each entry. */
+export function splitScopeEntries(raw) {
+  if (!Array.isArray(raw)) return [];
+  const entries = [];
+  for (const entry of raw) {
+    let inherited = '';
+    for (const piece of String(entry ?? '').trim().split(/\s+/).filter(Boolean)) {
+      const own = /^[A-Za-z][\w-]*:/.exec(piece)?.[0] ?? '';
+      if (own) inherited = own;
+      entries.push(own ? piece : inherited + piece);
+    }
+  }
+  return [...new Set(entries)];
+}
+
 /**
  * we:scripts/conveyor/pr-work-unit.mjs#isSafeFallbackScopeEntry — may this PR-author-controlled string become a
  * scope-fence entry? PURE. MOVED HERE (from `reconcile-fix-dispatch.mjs`, which still re-exports it for
@@ -123,7 +138,7 @@ export function resolvePrWorkUnit({ repo, pr, findItem, fetchDiffPaths, fetchCar
     return {
       attribution: 'item',
       itemNum: String(item.num),
-      scope: Array.isArray(item.scope) ? item.scope.map(String) : [],
+      scope: splitScopeEntries(item.scope),
       gate,
     };
   }

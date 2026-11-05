@@ -80,7 +80,7 @@ import { fixerRulingBrief, renderRulingNotAddressed } from '../lib/ruling-ledger
 import { withSalvageHint } from '../lib/salvage-index.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS, ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { repoProfile, briefTokensForRepo } from '../lib/repo-profile.mjs';
-import { resolvePrWorkUnit, isSafeFallbackScopeEntry } from './pr-work-unit.mjs';
+import { resolvePrWorkUnit, isSafeFallbackScopeEntry, splitScopeEntries } from './pr-work-unit.mjs';
 import { resolveFixScopePolicy, resolveOperatorPriorityPrs, createRegionReader, createLiveRegionOverlap, createHolderStateReader, landingHolderDecision } from './fix-scope-policy.mjs';
 import { DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES } from './fix-claim-store.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -709,7 +709,7 @@ export function fetchCardScopeAtRef(path, ref, { exec = execFileSyncThrottled, r
     });
     const decoded = Buffer.from(String(out || '').trim(), 'base64').toString('utf8');
     const { data } = matter(decoded);
-    return Array.isArray(data?.scope) ? data.scope.map(String) : [];
+    return splitScopeEntries(data?.scope);
   } catch {
     return [];
   }
