@@ -4,6 +4,11 @@ import { join } from 'node:path';
 import { describe, it, expect } from 'vitest';
 import { sourceNeedsGit, testFilterArgs, routeNeedsGit, NEEDS_GIT_REASON } from '../needs-git-route.mjs';
 
+// Linear-time guards: wall-clock bound tolerant of a loaded CI shard, per-test timeout above it so the
+// assertion (not vitest's 5s default) is what reports a slow run.
+const WALL_BOUND_MS = 15000;
+const TEST_TIMEOUT_MS = 30000;
+
 describe('sourceNeedsGit', () => {
   it('detects direct git spawns', () => {
     const cp = "import * as cp from 'node:child_process';\n";
@@ -118,8 +123,10 @@ describe('sourceNeedsGit', () => {
   it('nested templates keep literal pieces disjoint (bounded memory and time)', () => {
     const t0 = Date.now();
     expect(sourceNeedsGit("import 'node:child_process'; " + '`${ '.repeat(333000))).toBe(false);
-    expect(Date.now() - t0).toBeLessThan(2500);
-  });
+    // Wall-clock bound sized for a loaded CI shard (≈2.6× idle observed once at 4.7s); a quadratic rescan
+    // over 333k nests would take minutes, so this still fails loudly on a real regression.
+    expect(Date.now() - t0).toBeLessThan(WALL_BOUND_MS);
+  }, TEST_TIMEOUT_MS);
   it('shell command position: leading whitespace, newlines, separators, env prefixes, paths', () => {
     const E = "import { execSync } from 'node:child_process'; ";
     for (const lit of [
@@ -273,10 +280,11 @@ describe('sourceNeedsGit', () => {
         '`' + '\n '.repeat(150000) + '`','function(){}'.repeat(25000), 'class{}'.repeat(40000), '=function(){'.repeat(25000)].map(x => "import 'node:child_process'; " + x)];
     const t0 = Date.now();
     for (const s of inputs) expect(sourceNeedsGit(s, o)).toBe(false);
-    expect(Date.now() - t0).toBeLessThan(2500);
+    // Same loaded-CI sizing as above: idle ≈1.8s, a loaded shard hit 4.7s (PR 6339 CI), quadratic is minutes.
+    expect(Date.now() - t0).toBeLessThan(WALL_BOUND_MS);
     // oversize input is not judged (same as an unreadable file): stays remote
     expect(sourceNeedsGit("import 'node:child_process'; run('git', [])" + ' '.repeat(1024 * 1024))).toBe(false);
-  });
+  }, TEST_TIMEOUT_MS);
   it('ignores non-string and empty helper entries', () => {
     expect(sourceNeedsGit("import '../x.mjs'", { helpers: [null, '', undefined, 7] })).toBe(false);
     expect(sourceNeedsGit("import '../x.mjs'", { helpers: 'x.mjs' })).toBe(false);
