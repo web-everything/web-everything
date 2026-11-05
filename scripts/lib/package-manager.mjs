@@ -48,12 +48,16 @@ const runnerFailure = (e) => pnpmUnusable(e);
 const defaultPnpmVersion = () => execFileSync('pnpm', ['--version'], { stdio: 'pipe', timeout: 30_000 }).toString().trim();
 
 /** @returns {{bin:string, args:string[], manager:string, source:string, note?:string}} */
-export function installArgv({ ci = false, ignoreScripts = false, pnpmVersion = defaultPnpmVersion, ...opts } = {}) {
+export function installArgv({ ci = false, ignoreScripts = false, pnpmVersion = defaultPnpmVersion, lockfileParity, ...opts } = {}) {
   const r = resolvePackageManager(opts);
   let { manager, note } = r;
   if (manager === 'pnpm') {
     try { pnpmVersion(); } catch (e) {
       if (!pnpmUnusable(e)) throw e; // fail closed: an integrity/lockfile-class failure is not 'pnpm missing'
+      // A frozen npm install checks package-lock.json, not pnpm-lock.yaml: it needs a caller-supplied parity proof.
+      let proven = false;
+      if (ci) { try { proven = typeof lockfileParity === 'function' && lockfileParity() === true; } catch { proven = false; } }
+      if (ci && !proven) throw new Error(`pnpm unusable (${String(e?.message ?? e).split('\n')[0]}); refusing a frozen npm ci without a lockfileParity proof`, { cause: e });
       manager = 'npm'; note = `pnpm --version failed (from ${r.source}); using npm`;
     }
   }
@@ -74,7 +78,7 @@ export function installCommand({ frozen = false, log = (l) => console.error(l), 
  * needs `lockfileParity()` to return true (npm ci validates a different lockfile). Every other failure is rethrown.
  */
 export function installWithFallback({ frozen = false, ignoreScripts = false, cwd, exec = (bin, args, o) => execFileSync(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], ...o }), log = (l) => console.error(l), lockfileParity, ...opts } = {}) {
-  const first = installArgv({ ...opts, ci: frozen, ignoreScripts });
+  const first = installArgv({ ...opts, ci: frozen, ignoreScripts, lockfileParity });
   if (first.note) log(`package-manager · ${first.note}`);
   try { exec(first.bin, first.args, { cwd }); return { ...first, fellBack: false }; }
   catch (e) {
@@ -82,7 +86,9 @@ export function installWithFallback({ frozen = false, ignoreScripts = false, cwd
     // Fail closed: only a pnpm that could not run, or reach the registry, falls back (see FALLBACK_OK).
     if (!runnerFailure(e)) { log(`package-manager · pnpm install failed and is not a runner/network failure (${String(e?.message ?? e).split('\n')[0]}); NOT falling back to npm`); throw e; }
     // A frozen npm fallback checks package-lock.json, not pnpm-lock.yaml, so it needs a caller-supplied parity proof.
-    if (frozen && !(typeof lockfileParity === 'function' && lockfileParity() === true)) {
+    let proven = false;
+    try { proven = typeof lockfileParity === 'function' && lockfileParity() === true; } catch { proven = false; }
+    if (frozen && !proven) {
       log('package-manager · pnpm frozen install failed (runner/network); NOT falling back to npm ci: no lockfileParity proof supplied');
       throw e;
     }

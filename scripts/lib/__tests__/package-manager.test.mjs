@@ -54,7 +54,7 @@ describe('installArgv / installCommand', () => {
       .toEqual(['install', '--frozen-lockfile', '--ignore-scripts']);
   });
   it('pnpm falls back to npm when pnpm --version fails, and says why', () => {
-    const r = installArgv({ ci: true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => { throw Object.assign(new Error('no pnpm'), { code: 'ENOENT' }); } });
+    const r = installArgv({ ci: true, lockfileParity: () => true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => { throw Object.assign(new Error('no pnpm'), { code: 'ENOENT' }); } });
     expect(r).toMatchObject({ bin: 'npm', args: ['ci'], manager: 'npm' });
     expect(r.note).toMatch(/pnpm --version failed/);
   });
@@ -75,7 +75,7 @@ describe('frozen cannot be weakened by passthrough options', () => {
   });
   it('installCommand logs the fallback note when pnpm is unusable', () => {
     const logs = [];
-    const cmd = installCommand({ frozen: true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); }, log: (l) => logs.push(l) });
+    const cmd = installCommand({ frozen: true, lockfileParity: () => true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); }, log: (l) => logs.push(l) });
     expect(cmd).toBe('npm ci');
     expect(logs.join('')).toMatch(/pnpm --version failed/);
   });
@@ -89,8 +89,18 @@ describe('version probe fails closed on integrity-class errors', () => {
     expect(() => installArgv({ ci: true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => { throw new Error('Cannot find matching keyid'); } })).toThrow(/keyid/);
   });
   it('a missing pnpm (ENOENT) still falls back to npm', () => {
-    const r = installArgv({ ci: true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => { throw Object.assign(new Error('spawn pnpm'), { code: 'ENOENT' }); } });
+    const r = installArgv({ ci: true, lockfileParity: () => true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => { throw Object.assign(new Error('spawn pnpm'), { code: 'ENOENT' }); } });
     expect(r.manager).toBe('npm');
+  });
+});
+
+describe('a frozen probe fallback needs a parity proof', () => {
+  it.each([['no proof', undefined], ['proof false', () => false], ['proof throws', () => { throw new Error('x'); }]])('refuses npm ci (%s)', (_n, lockfileParity) => {
+    expect(() => installArgv({ ci: true, lockfileParity, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); } })).toThrow(/lockfileParity/);
+  });
+  it('a non-frozen install falls back to npm install without a proof', () => {
+    const r = installArgv({ ci: false, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); } });
+    expect(r).toMatchObject({ bin: 'npm', args: ['install'] });
   });
 });
 
