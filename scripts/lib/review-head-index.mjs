@@ -13,7 +13,7 @@
  * Nothing calls this module yet; wiring (review-job hook, planRedTeamOnSkip read) follows separately.
  */
 import * as nodeFs from 'node:fs';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
@@ -81,20 +81,23 @@ const validMap = m => m && typeof m === 'object' && Object.values(m).every(valid
 // resurrected, and a compacted log (older rows then the PR's current record last, keyed or keyless) replays to the same map.
 // A rejected writer (it lost the lock after appending) cannot rewrite the log: a live holder may be appending to it. It appends a
 // tombstone naming its row by content hash instead; replay drops the last matching row written BEFORE the tombstone. A tombstone
-// is `{rollback: <sha256 of the row's JSON>}` and nothing else.
+// is `{rollback: <content hash>, txn?: <writer's transaction id>}`. A row is matched by its txn when it still carries one, else
+// (compaction rewrites rows without a txn) by content hash. Both go through contentHash, the single normalisation of a row.
 const hashText = text => createHash('sha256').update(text).digest('hex');
-const tombstoneOf = row => ({ rollback: hashText(row) });
+const contentHash = r => hashText(JSON.stringify([r.repo, Number(r.pr), r.head, r.netPatchHash ?? null, r.verdict, r.at]));
 const parseLog = (text, keepPerPr) => {
   const lines = text.split('\n').filter(l => l.trim());
   const kept = []; // [{ hash, rec }] in log order, after tombstones
   for (const l of lines) {
     const rec = JSON.parse(l);
-    if (rec && typeof rec === 'object' && typeof rec.rollback === 'string' && Object.keys(rec).length === 1) {
-      for (let i = kept.length - 1; i >= 0; i--) if (kept[i].hash === rec.rollback) { kept.splice(i, 1); break; }
+    if (rec && typeof rec === 'object' && typeof rec.rollback === 'string' && Object.keys(rec).every(k => k === 'rollback' || k === 'txn')) {
+      let at = typeof rec.txn === 'string' ? kept.findLastIndex(k => k.rec.txn === rec.txn) : -1;
+      if (at < 0) at = kept.findLastIndex(k => k.hash === rec.rollback);
+      if (at >= 0) kept.splice(at, 1);
       continue;
     }
     if (!validRecord(rec)) throw Error('invalid log record');
-    kept.push({ hash: hashText(l), rec });
+    kept.push({ hash: contentHash(rec), rec });
   }
   const map = {};
   for (const { rec } of kept) applyRecord(map, rec, keepPerPr);
@@ -226,14 +229,15 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
     const current = readHeadIndex({ dir, fs, keepPerPr });
     if (!current.ok) throw Error('review-head-index: existing index unreadable; refusing to write');
     fence();
-    const line = `${JSON.stringify(rec)}\n`;
+    const txn = randomUUID();                                   // names OUR row in a tombstone, even if another row has identical content
+    const line = `${JSON.stringify({ ...rec, txn })}\n`;
     const sizeBefore = size(fs, log);                           // null: the log did not exist yet
     // Once our line is in the log, a lost lock means our transaction was rejected, so the line must not stay visible. Every fence
     // after the append rolls it back before throwing. If the log still has exactly the shape we left, the line is physically
     // removed (truncate / restore). If another holder wrote after us, we cannot rewrite the log (they may be appending to it),
     // so we append a tombstone naming our row; replay then drops it, whatever else was appended around it.
     const lineBytes = Buffer.from(line);
-    const tombstone = `${JSON.stringify(tombstoneOf(line.slice(0, -1)))}\n`;
+    const tombstone = `${JSON.stringify({ rollback: contentHash(rec), txn })}\n`;
     let before = null, compacted = null; // before: the log bytes we replaced when compacting; compacted: the bytes we wrote
     const rollback = () => {
       try {
@@ -255,13 +259,14 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
       const compact = Object.entries(map).flatMap(([k, v]) => {
         const [r, p] = [k.slice(0, k.lastIndexOf('#')), Number(k.slice(k.lastIndexOf('#') + 1))];
         const row = (hash, h) => ({ repo: r, pr: p, head: h.head, netPatchHash: hash.startsWith(NOKEY) ? null : hash, verdict: h.verdict, at: h.at });
-        const older = Object.entries(v.history).sort((a, b) => Date.parse(a[1].at) - Date.parse(b[1].at)).map(([hash, h]) => row(hash, h));
+        const cur = v.netPatchHash ?? `${NOKEY}${v.lastReviewedHead}`; // the current record's own history entry is emitted once, as the LAST row
+        const older = Object.entries(v.history).filter(([hash]) => hash !== cur).sort((a, b) => Date.parse(a[1].at) - Date.parse(b[1].at)).map(([hash, h]) => row(hash, h));
         // The PR's current record goes LAST so a rebuild restores lastReviewedHead and its verdict exactly.
         return [...older, { repo: r, pr: p, head: v.lastReviewedHead, netPatchHash: v.netPatchHash, verdict: v.verdict, at: v.at }];
       });
       const text = compact.map(c => `${JSON.stringify(c)}\n`).join('');
       before = fs.readFileSync(log);
-      if (!before.subarray(Math.max(0, before.length - lineBytes.length)).equals(lineBytes)) throw Error('review-head-index: log changed under the lock; refusing to compact');
+      if (!before.subarray(Math.max(0, before.length - lineBytes.length)).equals(lineBytes)) { rollback(); throw Error('review-head-index: log changed under the lock; refusing to compact'); }
       fenced();
       atomicWrite(fs, log, `${log}.tmp`, text);
       compacted = Buffer.from(text);
@@ -269,7 +274,10 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
       lines = compact.length;
     }
     fenced();
-    atomicWrite(fs, mapPath, tmp, JSON.stringify({ version: MAP_VERSION, logHash: hashText(fs.readFileSync(log)), keepPerPr, map }));
+    // The map and its logHash come from the SAME bytes: a late append by a rejected writer (its row or its tombstone) can land
+    // after this read, but then the hash no longer matches the log and readers rebuild.
+    const raw = fs.readFileSync(log);
+    atomicWrite(fs, mapPath, tmp, JSON.stringify({ version: MAP_VERSION, logHash: hashText(raw), keepPerPr, map: parseLog(raw.toString('utf8'), keepPerPr).map }));
     return { ok: true, lines };
   }, { fs });
 }

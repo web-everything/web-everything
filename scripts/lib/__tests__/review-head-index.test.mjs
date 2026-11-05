@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { fork } from 'node:child_process';
 import { withHeadIndexLock, seedFromReviewComments, recordReview, readHeadIndex, headReviewOwed, netPatchKey, resolveHeadIndexSettings, headIndexPaths } from '../review-head-index.mjs';
 
@@ -479,6 +480,70 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     rec({ head: H(4), netPatchHash: 'p4', at: '2026-11-04T12:00:00Z', logMaxLines: 2 }); // a later compaction + rebuild never resurrects it either
     writeFileSync(headIndexPaths(dir).map, '{{');
     expect(readHeadIndex({ dir }).map['o/r#7'].history.p2).toBeUndefined();
+  });
+  const contentHash = r => createHash('sha256').update(JSON.stringify([r.repo, r.pr, r.head, r.netPatchHash, r.verdict, r.at])).digest('hex');
+  it('a tombstone retracts a row that another holder already compacted (one copy per record, matched by content)', () => {
+    rec();
+    const { lock } = headIndexPaths(dir);
+    let appended = false, done = false;
+    const fs = { ...nodeFs,
+      openSync: (p, f) => { if (f === 'a') appended = true; return nodeFs.openSync(p, f); },
+      readFileSync: (p, ...a) => {
+        const out = nodeFs.readFileSync(p, ...a);
+        if (appended && !done && String(p).endsWith('log.jsonl')) { // the lock passes to writer B, who reads A's row and compacts the log
+          done = true; rmSync(lock, { force: true });
+          recordReview({ dir, repo: 'o/r', pr: 8, head: H(3), netPatchHash: 'p9', verdict: 'accept', at: '2026-11-04T11:00:00Z', logMaxLines: 1 });
+        }
+        return out; } };
+    expect(() => rec({ fs, head: H(2), netPatchHash: 'p2', at: '2026-11-04T10:30:00Z' })).toThrow(/lock lost/);
+    expect(done).toBe(true);
+    const rows = readFileSync(headIndexPaths(dir).log, 'utf8').trim().split('\n').map(l => JSON.parse(l)).filter(r => r.head === H(2));
+    expect(rows).toHaveLength(1);                               // compaction emits the current record once, not twice
+    const index = readHeadIndex({ dir });
+    expect(index.map['o/r#7'].history.p2).toBeUndefined();
+    expect(headReviewOwed({ index, repo: 'o/r', pr: 7, head: H(2), netPatchHash: 'p2' }).owed).toBe(true);
+    expect(index.map['o/r#8']).toMatchObject({ lastReviewedHead: H(3) });
+  });
+  it('a tombstone removes the writer\'s own row (by txn), not a later row with identical content', () => {
+    const { log } = headIndexPaths(dir);
+    nodeFs.mkdirSync(dir, { recursive: true });
+    const base = { repo: 'o/r', pr: 7, head: H(2), netPatchHash: 'p2', verdict: 'accept', at: '2026-11-04T10:00:00Z' };
+    const other = { repo: 'o/r', pr: 7, head: H(3), netPatchHash: 'p3', verdict: 'accept', at: '2026-11-04T10:00:01Z' };
+    const rows = [{ ...base, txn: 'a' }, { ...other, txn: 'c' }, { ...base, txn: 'b' }, { rollback: contentHash(base), txn: 'a' }];
+    writeFileSync(log, rows.map(r => `${JSON.stringify(r)}\n`).join(''));
+    const m = readHeadIndex({ dir, keepPerPr: 20 }).map['o/r#7'];
+    expect(m.lastReviewedHead).toBe(H(2));                      // B's row (txn b) survives and is the latest; C's is not promoted
+    expect(Object.keys(m.history).sort()).toEqual(['p2', 'p3']);
+  });
+  it('a late tombstone after the writer read the log never survives in the published map (map and logHash come from the same bytes)', () => {
+    const first = { repo: 'o/r', pr: 7, head: H(1), netPatchHash: 'p1', verdict: 'accept', at: '2026-11-04T10:00:00Z' };
+    rec();
+    const { log } = headIndexPaths(dir);
+    let appended = false, done = false;
+    const fs = { ...nodeFs,
+      openSync: (p, f) => { if (f === 'a') appended = true; return nodeFs.openSync(p, f); },
+      readFileSync: (p, ...a) => { const out = nodeFs.readFileSync(p, ...a);
+        if (appended && !done && p === log) { done = true; nodeFs.appendFileSync(log, `${JSON.stringify({ rollback: contentHash(first) })}\n`); } // a retraction lands after our read of the log
+        return out; } };
+    rec({ fs, pr: 9, head: H(4), netPatchHash: 'p4' });
+    expect(done).toBe(true);
+    expect(readHeadIndex({ dir }).map['o/r#7']).toBeUndefined(); // the cache is not trusted past the retraction
+    expect(JSON.parse(readFileSync(headIndexPaths(dir).map, 'utf8')).map['o/r#7']).toBeUndefined(); // and the published map already reflects it
+  });
+  it('a refused compaction (log changed under the lock) retracts the writer\'s own row before throwing', () => {
+    rec();
+    let appended = false, done = false;
+    const log = headIndexPaths(dir).log;
+    const fs = { ...nodeFs,
+      openSync: (p, f) => { if (f === 'a') appended = true; return nodeFs.openSync(p, f); },
+      readFileSync: (p, ...a) => { const out = nodeFs.readFileSync(p, ...a);
+        if (appended && !done && p === log) { done = true; nodeFs.appendFileSync(log, `${JSON.stringify({ rollback: 'unrelated' })}\n`); } // a foreign append after our row
+        return out; } };
+    expect(() => rec({ fs, head: H(2), netPatchHash: 'p2', logMaxLines: 1 })).toThrow(/log changed under the lock/);
+    const index = readHeadIndex({ dir });
+    expect(index.ok).toBe(true);
+    expect(index.map['o/r#7'].history.p2).toBeUndefined();
+    expect(index.map['o/r#7'].lastReviewedHead).toBe(H(1));
   });
   it('a main-lock file with parseable JSON but no integer pid is stale by age, like the takeover file', () => {
     const { lock } = headIndexPaths(dir);
