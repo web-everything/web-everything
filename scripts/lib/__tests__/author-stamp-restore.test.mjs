@@ -1,5 +1,4 @@
 import { describe, expect, it, vi } from 'vitest';
-// Phase 1: this module deliberately does not exist yet.
 import { planStampRestore, restoreAuthorStamp, sweepAuthorStamps } from '../author-stamp-restore.mjs';
 import { buildAuthorActorMarker, buildStampLostMarker, hasStampLostMarker, readAuthorActorStamps } from '../review-independence.mjs';
 
@@ -12,7 +11,7 @@ const edit = (diff, login = AUTHOR, createdAt = '2026-10-01T10:00:00Z') => ({
 });
 // #6244: the author stamped the original; two later web edits by chalbert dropped it.
 const history = () => [
-  edit(`@@ -0,0 +1,3 @@\n+Original body\n+\n+${buildAuthorActorMarker(ID)}`),
+  edit(`Original body\n\n${buildAuthorActorMarker(ID)}`),
   edit('First operator edit', 'chalbert', '2026-10-01T11:00:00Z'),
   edit(BODY, 'chalbert', '2026-10-01T12:00:00Z'),
 ];
@@ -46,7 +45,7 @@ describe('planStampRestore — agreement and author-of-record provenance', () =>
   });
 
   it('allows repeated agreeing stamps, including snapshots by other editors', () => {
-    expect(plan({ edits: [...history(), edit(buildAuthorActorMarker(ID), 'chalbert')] }))
+    expect(plan({ edits: [...history(), edit(buildAuthorActorMarker(ID), 'chalbert', '2026-10-01T13:00:00Z')] }))
       .toMatchObject({ action: 'restore', id: ID });
   });
 
@@ -89,6 +88,20 @@ describe('planStampRestore — agreement and author-of-record provenance', () =>
 });
 
 describe('plain snapshot provenance — oldest author snapshot and agreeing ids', () => {
+  it('refuses complete plain snapshots with a plus-prefixed forgery retained by the author without writing', async () => {
+    const forgedLine = '+<!-- authored-by-actor: FORGED -->';
+    const edits = [
+      edit(`Later author revision\n${forgedLine}`, AUTHOR, '2026-11-03T12:00:00Z'),
+      edit(`Third-party body\n${forgedLine}`, 'chalbert', '2026-11-02T12:00:00Z'),
+      edit('Original unstamped body', AUTHOR, '2026-11-01T12:00:00Z'),
+    ];
+    const seams = io({ readEdits: vi.fn(() => edits) });
+    const result = await restoreAuthorStamp(seams);
+    expect(seams.writeBody).not.toHaveBeenCalled();
+    expectReason(result, 'refuse');
+    expectReason(plan({ edits }), 'refuse');
+  });
+
   it('restores the live #6244 newest-first history using the later list position for tied timestamps', () => {
     const edits = plainHistory();
     const marker = buildAuthorActorMarker(ID);
@@ -260,11 +273,11 @@ describe('sweepAuthorStamps — isolated failures and bounded retries', () => {
 });
 
 
-describe('author provenance in edit deltas', () => {
-  it('refuses third-party insertion followed by an author snapshot retaining the forged stamp without writing', async () => {
+describe('plain snapshots containing literal diff-like text', () => {
+  it('refuses an oldest third-party snapshot followed by an author retaining its stamp without writing', async () => {
     const marker = buildAuthorActorMarker(ID);
     const edits = [edit(`@@ -0,0 +1 @@\n+${marker}`, 'chalbert'),
-      edit(`Unrelated author revision\n\n${marker}`)];
+      edit(`Unrelated author revision\n\n${marker}`, AUTHOR, '2026-10-01T11:00:00Z')];
     expectReason(plan({ edits }), 'refuse');
     const seams = io({ readEdits: vi.fn(() => edits) });
     expectReason(await restoreAuthorStamp(seams), 'refuse');
@@ -286,25 +299,53 @@ describe('author provenance in edit deltas', () => {
     ['unknown inline deletion', `[-${buildAuthorActorMarker(ID)}-]`],
     ['unchanged context', `@@ -1,2 +1,2 @@\n ${buildAuthorActorMarker(ID)}\n-old text\n+new text`],
     ['HTML deletion', `<del>${buildAuthorActorMarker(ID)}</del>`],
-  ])('refuses third-party insertion followed by author removal or retention: %s', async (_name, authorDiff) => {
-    const edits = [edit(`+${buildAuthorActorMarker(ID)}`, 'chalbert'), edit(authorDiff)];
+  ])('refuses an oldest third-party stamp even when a later author body contains %s', async (_name, authorDiff) => {
+    const edits = [edit(`+${buildAuthorActorMarker(ID)}`, 'chalbert'),
+      edit(authorDiff, AUTHOR, '2026-10-01T11:00:00Z')];
     expectReason(plan({ edits }), 'refuse');
     const seams = io({ readEdits: vi.fn(() => edits) });
     expectReason(await restoreAuthorStamp(seams), 'refuse');
     expect(seams.writeBody).not.toHaveBeenCalled();
   });
 
-  it('restores a verbatim stamp explicitly added by the author in a unified delta', async () => {
+  it('refuses a later author body containing unified insertion text when the oldest author body is unstamped', async () => {
     const marker = buildAuthorActorMarker(ID);
-    const edits = [edit(`@@ -0,0 +1 @@\n+${marker}`), edit(`-${marker}`, 'chalbert')];
+    const edits = [
+      edit(`@@ -0,0 +1 @@\n+${marker}`, AUTHOR, '2026-10-01T12:00:00Z'),
+      edit(`-${marker}`, 'chalbert', '2026-10-01T11:00:00Z'),
+      edit('Original unstamped body'),
+    ];
     const seams = io({ readEdits: vi.fn(() => edits) });
-    expect(await restoreAuthorStamp(seams)).toMatchObject({ action: 'restore', id: ID, marker });
+    expectReason(plan({ edits }), 'refuse');
+    expectReason(await restoreAuthorStamp(seams), 'refuse');
+    expect(seams.writeBody).not.toHaveBeenCalled();
+  });
+
+  it('refuses conflicting ids even inside literal minus-prefixed lines', () => {
+    expectReason(plan({ edits: [edit(`+${buildAuthorActorMarker(ID)}`),
+      edit(`-${buildAuthorActorMarker(OTHER)}`, 'chalbert')] }), 'refuse');
+  });
+
+  it.each(['+', '-', ' ', '@@ -0,0 +1 @@\n+'])('uses oldest-author provenance for literal prefix %j', async (prefix) => {
+    const marker = buildAuthorActorMarker(ID);
+    const edits = [edit(`${prefix}${marker}`),
+      edit('Later unstamped body', 'chalbert', '2026-10-01T11:00:00Z')];
+    expect(plan({ edits })).toMatchObject({ action: 'restore', id: ID, source: edits[0], marker });
+    const seams = io({ readEdits: vi.fn(() => edits) });
+    expectReason(await restoreAuthorStamp(seams), 'restore');
     expect(seams.writeBody).toHaveBeenCalledTimes(1);
     expect(seams.writeBody).toHaveBeenCalledWith(6244, `${BODY}\n\n${marker}\n`);
   });
 
-  it('still refuses conflicting ids present only on deleted lines', () => {
-    expectReason(plan({ edits: [edit(`+${buildAuthorActorMarker(ID)}`),
-      edit(`-${buildAuthorActorMarker(OTHER)}`, 'chalbert')] }), 'refuse');
+  it.each([
+    ['HTML encoding', `<ins>${buildAuthorActorMarker(ID)}</ins>`],
+    ['unterminated marker', '<!-- authored-by-actor: FORGED'],
+    ['empty marker', '<!-- authored-by-actor: -->'],
+  ])('refuses an oldest author snapshot with %s without writing', async (_name, body) => {
+    const edits = [edit(body)];
+    expectReason(plan({ edits }), 'refuse');
+    const seams = io({ readEdits: vi.fn(() => edits) });
+    expectReason(await restoreAuthorStamp(seams), 'refuse');
+    expect(seams.writeBody).not.toHaveBeenCalled();
   });
 });

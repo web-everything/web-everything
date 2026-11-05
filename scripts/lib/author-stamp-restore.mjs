@@ -7,20 +7,6 @@ const IO_OPTIONS = { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 };
 const refusal = (reason) => ({ action: 'refuse', reason });
 const safe = (value) => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
 
-/** A delta's removed/context text is evidence of an id, never evidence the editor supplied it.
- * Plain snapshots use the separate oldest-snapshot rule, never delta insertion semantics.
- * Unknown HTML diff encodings refuse rather than guessing at insertion semantics;
- * operators must inspect that history manually.
- */
-function suppliedMarkers(diff) {
-  if (/<\/?[a-z][^>]*>/i.test(diff)) return null;
-  const text = diff.split('\n').filter((line) => line.startsWith('+') && !line.startsWith('+++'))
-    .map((line) => line.slice(1)).join('\n');
-  // Only whole, verbatim markers qualify. Do not reconstruct a marker split by delta prefixes.
-  return new Set((text.match(/<!--\s*authored-by-actor:[\s\S]*?-->/g) ?? [])
-    .filter((marker) => diff.includes(marker)));
-}
-
 /** One bounded request. Truncation is not agreement: operators must investigate the full history. */
 export function readAuthorStampEdits(pr, { repo, exec = execFileSyncThrottled } = {}) {
   const parts = typeof repo === 'string' ? repo.split('/') : [];
@@ -52,22 +38,19 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
   if (!Array.isArray(edits)) return refusal('unreadable edit history');
   if (edits.length > 100) return refusal('history exceeds the snapshot bound; inspect complete GitHub history');
   const ids = new Set();
-  let source;
-  let marker;
   let oldest;
   let oldestMarker;
-  let plainHistory = true;
   for (const edit of edits) {
     if (typeof edit?.diff !== 'string' || typeof edit.editor?.login !== 'string'
       || !edit.editor.login.trim() || typeof edit.createdAt !== 'string' || !Number.isFinite(Date.parse(edit.createdAt))) {
       return refusal('unreadable edit snapshot or editor provenance');
     }
     const markers = edit.diff.match(/<!--\s*authored-by-actor:[\s\S]*?-->/g) ?? [];
-    const supplied = suppliedMarkers(edit.diff);
-    if (supplied === null) return refusal('unsupported HTML edit delta; inspect complete GitHub history manually');
-    // Mixed histories cannot use snapshot presence to override delta provenance.
-    // Treat context, bare +/- lines and inline diff encodings conservatively as deltas.
-    if (/^(?:@@|diff |index |[ +\-])|\[-|\{\+/m.test(edit.diff)) plainHistory = false;
+    // GitHub userContentEdits.diff is the full plain body, including literal +/- lines.
+    // Refuse HTML encodings rather than interpreting their contents as plain evidence.
+    if (/<\/?[a-z][^>]*>/i.test(edit.diff)) {
+      return refusal('unsupported HTML edit snapshot; inspect complete GitHub history manually');
+    }
     if (edit.diff.replace(/<!--\s*authored-by-actor:[\s\S]*?-->/g, '').includes('authored-by-actor:')) {
       return refusal('malformed historical stamp');
     }
@@ -80,21 +63,14 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
       const found = readAuthorActorStamps(verbatim);
       if (found.length !== 1 || !found[0]) return refusal('malformed historical stamp');
       ids.add(found[0]);
-      if (!source && supplied.has(verbatim) && edit.editor.login.toLowerCase() === authorLogin.toLowerCase()) {
-        source = edit;
-        marker = verbatim;
-      }
     }
   }
   if (ids.size !== 1) return refusal('history has no stamp or conflicting stamp ids; inspect GitHub history');
-  if (!source && plainHistory && oldestMarker
-    && oldest.editor.login.toLowerCase() === authorLogin.toLowerCase()) {
-    source = oldest;
-    marker = oldestMarker;
+  if (!oldestMarker || oldest.editor.login.toLowerCase() !== authorLogin.toLowerCase()) {
+    return refusal('no evidence the PR author supplied the stamp in the oldest snapshot; inspect GitHub history');
   }
-  if (!source) return refusal('no evidence the PR author supplied the stamp; inspect GitHub history');
-  return { action: 'restore', reason: 'all historical stamps agree with an author-edited snapshot',
-    id: [...ids][0], source, marker, body: `${body}\n\n${marker}\n` };
+  return { action: 'restore', reason: 'all historical stamps agree with the oldest author-edited snapshot',
+    id: [...ids][0], source: oldest, marker: oldestMarker, body: `${body}\n\n${oldestMarker}\n` };
 }
 
 export function restoreAuthorStamp({ pr, repo, dryRun = false,
