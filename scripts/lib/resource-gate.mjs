@@ -1,5 +1,5 @@
 import { decideMemoryFloor } from './memory-available.mjs';
-import { loadHostOverloadSettings, DEFAULT_SNAPSHOT_MAX_FRESH_MS } from './host-overload-settings.mjs';
+import { loadHostOverloadSettings, DEFAULT_SNAPSHOT_MAX_FRESH_MS, DEFAULT_SNAPSHOT_CLOCK_SKEW_MS } from './host-overload-settings.mjs';
 import { resolveHandoffSettings } from './handoff-settings.mjs';
 /**
  * @file we:scripts/lib/resource-gate.mjs
@@ -296,7 +296,7 @@ export function createResourceFixThrottle({
   sendBackReservedSlots,
   listClaims = () => [], env = process.env, alive = isPidAlive, queueLength = null, settings, root, nowMs = () => Date.now(),
   readSnap = () => readSnapshot(root ? { root } : {}), readHeavyWait = () => readLiveHeavyWaitMinutes({ env }), gate, log = (line) => process.stderr.write(line),
-  resolveFloor = () => { const r = loadHostOverloadSettings({ env, log: () => {} }); return { snapshotMaxFreshMs: r.settings.host.capacity.snapshotMaxFreshMs, metric: r.settings.host.capacity.memoryMetric, floorMb: r.settings.host.capacity.memAvailableFloorMb, source: r.sources['host.capacity.memAvailableFloorMb'] ?? 'standard' }; },
+  resolveFloor = () => { const r = loadHostOverloadSettings({ env, log: () => {} }); return { snapshotClockSkewMs: r.settings.host.capacity.snapshotClockSkewMs, snapshotMaxFreshMs: r.settings.host.capacity.snapshotMaxFreshMs, metric: r.settings.host.capacity.memoryMetric, floorMb: r.settings.host.capacity.memAvailableFloorMb, source: r.sources['host.capacity.memAvailableFloorMb'] ?? 'standard' }; },
   sample, loadavg, cpuCount, // forwarded to the legacy gate (the logged comparison)
 } = {}) {
   sendBackReservedSlots ??= resolveHandoffSettings('fix', { env }).value.sendBackReservedSlots;
@@ -315,8 +315,9 @@ export function createResourceFixThrottle({
     const sampledAt = Date.parse(snap?.sampledAt);
     const freshUntil = Date.parse(snap?.freshUntil);
     const maxFreshMs = floor.snapshotMaxFreshMs ?? DEFAULT_SNAPSHOT_MAX_FRESH_MS;
+    const skewMs = floor.snapshotClockSkewMs ?? DEFAULT_SNAPSHOT_CLOCK_SKEW_MS;
     const fresh = !!snap && Number.isFinite(sampledAt) && Number.isFinite(freshUntil)
-      && freshUntil - sampledAt <= maxFreshMs && nowMs() <= freshUntil;
+      && freshUntil - sampledAt <= maxFreshMs && sampledAt <= nowMs() + skewMs && nowMs() <= freshUntil;
     // R559: the reading must have been taken under the SAME metric this process's policy names; a missing or different
     // stamp is a mismatch and refuses (a stricter "free" dispatcher never trusts a larger "available" reading).
     const metricOk = typeof floor.metric === 'string' && m.metric === floor.metric;

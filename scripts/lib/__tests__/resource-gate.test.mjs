@@ -305,6 +305,17 @@ describe('dynamic fixer cap', () => {
       expect(d).toMatchObject({ admit: false, signal: 'mem-floor' });
       expect(d.why).toMatch(/stale|snapshot/i);
     });
+    it('R559 refuses a future sampledAt beyond the clock skew, admits within it', () => {
+      const at = (offMs) => ({ sampledAt: new Date(NOW + offMs).toISOString(), freshUntil: new Date(NOW + offMs + 15000).toISOString() });
+      expect(mk(() => ({ ...snap(), ...at(86400000) })).tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
+      expect(mk(() => ({ ...snap(), ...at(3000) })).tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
+      expect(mk(() => ({ ...snap(), ...at(1500) })).tryAdmit('fix').admit).toBe(true);
+    });
+    it('R559 clock skew is a policy setting', () => {
+      vi.stubEnv('WE_HOST_CAPACITY_SNAPSHOT_CLOCK_SKEW_MS', '5000');
+      const at = (offMs) => ({ sampledAt: new Date(NOW + offMs).toISOString(), freshUntil: new Date(NOW + offMs + 15000).toISOString() });
+      expect(mk(() => ({ ...snap(), ...at(4000) })).tryAdmit('fix').admit).toBe(true);
+    });
     it('R559 floor freshness uses the host policy maximum', () => {
       vi.stubEnv('WE_HOST_CAPACITY_SNAPSHOT_MAX_FRESH_MS', '10000');
       expect(mk(() => snap({ freshForMs: 10001 })).tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
