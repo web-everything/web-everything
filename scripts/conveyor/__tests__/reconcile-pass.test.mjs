@@ -1682,3 +1682,30 @@ it('enrichAgents reads ISO-string and numeric-string startedAt for the reuse gua
     expect(enrichAgents([{ pid: process.pid, startedAt, state: 'working' }], { readLaneHead: () => null })[0].pidAlive).toBe(false);
   }
 });
+
+// Red-team round 5 (PR #6346): a wrapped worker resumed by the harness keeps its first-launch startedAt while its new
+// child pid started later. The reuse guard must not call that live child a recycled pid.
+it('enrichAgents keeps a resumed wrapped worker alive: its startedAt is the first launch, its child pid is newer', async () => {
+  const { enrichAgents } = await import('../reconcile-pass.mjs');
+  const { wrappedRecordToAgentRow } = await import('../../operations/worker-wrapper-launch.mjs');
+  const { COMPLETION_RECORD_V2 } = await import('../../operations/completion-store.mjs');
+  const firstLaunch = Date.parse('2020-01-01T00:00:00Z');
+  const row = wrappedRecordToAgentRow({
+    v: COMPLETION_RECORD_V2, launcher: 'claude-p', role: 'fix', status: 'started', session: 'fix-1', pid: process.pid,
+    startedAt: new Date(firstLaunch).toISOString(), cwd: '/lane',
+  }, { isAlive: () => true });
+  expect(row).toMatchObject({ kind: 'wrapped-worker', pid: process.pid, startedAt: firstLaunch });
+  expect(enrichAgents([row], { readLaneHead: () => null })[0].pidAlive).toBe(true);
+  // the same pid on a NON-wrapped row with the same old start is still a reused pid (the guard stays armed there)
+  expect(enrichAgents([{ ...row, kind: 'bg' }], { readLaneHead: () => null })[0].pidAlive).toBe(false);
+});
+
+it('holderStartedBy: null for a wrapped worker, the parsed start for any other row, null when unreadable', async () => {
+  const { holderStartedBy } = await import('../../lib/pid-alive.mjs');
+  const { startedAtMs } = await import('../reconcile-core.mjs');
+  expect(holderStartedBy({ kind: 'wrapped-worker', startedAt: 1_700_000_000_000 }, startedAtMs)).toBeNull();
+  expect(holderStartedBy({ kind: 'bg', startedAt: 1_700_000_000_000 }, startedAtMs)).toBe(1_700_000_000_000);
+  expect(holderStartedBy({ startedAt: '2020-01-01T00:00:00Z' }, startedAtMs)).toBe(Date.parse('2020-01-01T00:00:00Z'));
+  expect(holderStartedBy({ startedAt: 'nope' }, startedAtMs)).toBeNull();
+  expect(holderStartedBy(null, startedAtMs)).toBeNull();
+});

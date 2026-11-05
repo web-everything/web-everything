@@ -1055,6 +1055,8 @@ describe('idle-claim auto-release (R201)', () => {
       ['a numeric-string startedAt', { startedAt: String(T0 + 1000) }, T0 + 1000],
       ['a missing startedAt (guard skipped, not faked)', {}, null],
       ['an unparseable startedAt (guard skipped, not faked)', { startedAt: 'not-a-time' }, null],
+      // A resumed wrapped worker keeps its first-launch startedAt but its child pid is newer: no bound may be armed.
+      ['a wrapped worker (startedAt is its first launch, not the resumed child\'s)', { kind: 'wrapped-worker', startedAt: T0 + 1000 }, null],
     ])('%s', (_n, rowExtra, expectedStartedBy) => {
       claim();
       const identity = vi.fn(() => ({ alive: true, reason: 'match' }));

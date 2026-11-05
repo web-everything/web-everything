@@ -1,4 +1,4 @@
-import { pidIdentity, pidIdentityStamp } from '../lib/pid-alive.mjs';
+import { pidIdentity, pidIdentityStamp, holderStartedBy } from '../lib/pid-alive.mjs';
 /**
  * @file scripts/conveyor/fix-dispatch-claim.mjs
  * @description #x0jphk5 (parent #4075, epic #3383) — THE REAL PER-(REPO, KIND, PR) CLAIM the fix-dispatch
@@ -481,8 +481,8 @@ export function refreshLiveFixDispatchClaims({
       const identities = nonTerminal.map((a) => {
         // startedBy arms the pid-reuse guard (a process that launched after this row did is a different one);
         // an unreadable start time passes null, which skips only that check — unknown identity still retains.
-        const ms = startedAtMs(a.startedAt);
-        try { return identity(a.pid, { startedBy: Number.isFinite(ms) && ms > 0 ? ms : null }); } catch { return null; }
+        // (a wrapped worker's startedAt is its first launch, not its resumed child's: holderStartedBy returns null for it)
+        try { return identity(a.pid, { startedBy: holderStartedBy(a, startedAtMs) }); } catch { return null; }
       });
       if (identities.every((verdict) => verdict?.alive === false)) {
         if (readUnchangedClaim(lockRoot, resource, entry)) {

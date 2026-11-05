@@ -1,7 +1,7 @@
 import { greenLedgerDir, hasGreenLedger } from '../lib/lane-verify.mjs';
 import { unread } from './dispatch-eligibility.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
-import { pidIdentity } from '../lib/pid-alive.mjs';
+import { pidIdentity, holderStartedBy } from '../lib/pid-alive.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 /**
  * reconcile-pass.mjs — the thin IO shell around `we:scripts/conveyor/reconcile-core.mjs` (#3296): read the four
@@ -490,7 +490,7 @@ export function enrichAgents(agents, { readLaneHead = resolveLaneHead, probe = p
     const cwd = String(a?.cwd ?? '');
     if (cwd && !headCache.has(cwd)) headCache.set(cwd, readLaneHead(cwd));
     const alive = probe(Number.isInteger(a?.pid) ? a.pid : null, undefined, undefined,
-      { startedBy: (() => { const ms = startedAtMs(a?.startedAt); return Number.isFinite(ms) && ms > 0 ? ms : null; })() });
+      { startedBy: holderStartedBy(a, startedAtMs) });
     const { pidAlive: previousPidAlive, ...fresh } = a;
     return {
       ...fresh,
