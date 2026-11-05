@@ -21,6 +21,17 @@ const isNewline = (c) => c === '\n' || c === '\r' || c === ' ' || c === ' ';
 // A string literal may contain U+2028 / U+2029 (ES2019); only CR and LF end an unterminated one.
 const isStringNewline = (c) => c === '\n' || c === '\r';
 
+// Index of the first character at or after i that is not whitespace or part of a comment.
+function skipTrivia(t, i) {
+  const n = t.length;
+  for (;;) {
+    while (i < n && /\s/.test(t[i])) i++;
+    if (t[i] === '/' && t[i + 1] === '/') { while (i < n && !isNewline(t[i])) i++; continue; }
+    if (t[i] === '/' && t[i + 1] === '*') { const j = t.indexOf('*/', i + 2); if (j < 0) return n; i = j + 2; continue; }
+    return i;
+  }
+}
+
 function quotedEnd(t, i) {
   const n = t.length;
   const q = t[i];
@@ -95,6 +106,7 @@ function scan(t, start, depth, inHole, lits) {
   let exprClose = false; // the last token was the `}` of such a brace: an operand, so a following `/` divides
   let postfixBang = false; // the last token was a TypeScript non-null `x!`: an operand, so a following `/` divides
   let numDot = false; // the last token was the `.` ending a numeric literal (`1.`): an operand, so a following `/` divides
+  let prevWordFor = false; // the current word directly follows the word `for` (comments and spaces between don't count)
   let asyncExpr = false; // the last `async` keyword began in expression position
   let pendKind = ''; // 'function' | 'class' keyword seen, its body `{` not yet opened
   let pendExpr = false; // ... and it began in expression position
@@ -152,10 +164,9 @@ function scan(t, start, depth, inHole, lits) {
           let e = i;
           while (e < n && e - i <= MAX_WORD && isIdent(t[e])) e++;
           const w = e - i <= MAX_WORD ? t.slice(i, e) : '';
-          let p = e;
-          while (p < n && /\s/.test(t[p])) p++;
-          const nx = t[p] ?? '';
           // a keyword used as a property name (`{class: 1}`, `{function: x}`) is followed by `:` / `,` / `}`, not a body
+          // (whitespace and comments may sit between the keyword and what follows it)
+          const nx = w === 'function' || w === 'class' ? t[skipTrivia(t, e)] ?? '' : '';
           const keyword = w === 'function' ? nx === '(' || nx === '*' || isIdent(nx) : w === 'class' ? nx === '{' || isIdent(nx) : w === 'async';
           if (keyword) {
             let ex = exprStart(last, prev, word());
@@ -164,6 +175,7 @@ function scan(t, start, depth, inHole, lits) {
             else { pendKind = w; pendExpr = ex; pendDepth = stack.length; }
           }
         }
+        prevWordFor = isIdent(last) && word() === 'for'; // `for await (` is a control head like `for (`
         wordStart = i;
         wordDot = dot;
       }
@@ -173,7 +185,8 @@ function scan(t, start, depth, inHole, lits) {
       continue;
     }
     if (c === '(') {
-      let kind = PAREN_KEYWORD.has(word()) ? 1 : 0;
+      const head = word();
+      let kind = PAREN_KEYWORD.has(head) || (head === 'await' && prevWordFor) ? 1 : 0;
       if (!kind && pendKind === 'function' && stack.length === pendDepth) kind = pendExpr ? 2 : 3;
       stack.push(kind);
     }

@@ -185,6 +185,25 @@ describe('sourceNeedsGit', () => {
     expect(sourceNeedsGit(E + "const a = [...[/'/]]; const u = 'http://x';" + tail)).toBe(true);
     expect(sourceNeedsGit(E + "const r = /'/.test(s); const u = 'http://x';" + tail)).toBe(true);
   });
+  it('a `for await (…)` head is a control head: a regex after it is a regex', () => {
+    const E = "import { execSync } from 'node:child_process'; ";
+    const tail = " const u = 'http://x'; execSync('git status');";
+    for (const head of ['for await (const x of [])', 'for  await  (const x of [])', 'for /* c */ await /* d */ (const x of [])', 'for // c\n await (const x of [])', 'for(;;)', 'while (x)', 'if (x)']) {
+      expect(sourceNeedsGit(E + `async function check() { ${head} /'/.test(x); }` + tail), head).toBe(true);
+    }
+    // `await (…)` that is not behind `for` is a call: the next `/` divides
+    expect(sourceNeedsGit(E + "async function f() { const r = await (x) / 2; const p = '/tmp'; }" + " execSync('git status');")).toBe(true);
+  });
+  it('comments between a function / class keyword and its params / body do not hide the expression', () => {
+    const E = "import { execSync } from 'node:child_process'; ";
+    const tail = " execSync('git rev-parse --show-toplevel'); const path = '/tmp';";
+    for (const expr of [
+      'function /* annotation */ (){}', 'function // c\n (){}', 'function /* a */ * /* b */ (){}', 'function /* a */ name /* b */ (){}', 'async /* a */ function /* b */ (){}',
+      'class /* a */ {}', 'class // c\n {}', 'class /* a */ A /* b */ {}',
+    ]) expect(sourceNeedsGit(E + `const f = ${expr} / 2;` + tail), expr).toBe(true);
+    // a declaration (statement start) followed by a regex still reads the regex
+    expect(sourceNeedsGit(E + "function /* c */ g(){} /'/.test(s); const u = 'http://x'; execSync('git status');")).toBe(true);
+  });
   it('U+2028 / U+2029 are legal inside string literals and do not end them', () => {
     const E = "import { execSync } from 'node:child_process'; ";
     for (const sep of [' ', ' ']) {
