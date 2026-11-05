@@ -6,7 +6,7 @@ import {createRunner as productionRunner, digestArgv, digestInput, manifestWire,
 import {createHash} from 'node:crypto';
 import {spawnSync} from 'node:child_process';
 import * as bases from '../forge-exec-bases.mjs';
-import {buildManifest} from '../remote-exec.mjs';
+import {buildManifest, verifyReceipt} from '../remote-exec.mjs';
 import {scanMaterializedGuards} from './fixtures/forge-git-guards.mjs';
 import {cachedPublicGitExec} from './fixtures/forge-public-git.mjs';
 
@@ -79,6 +79,42 @@ describe('per-user worker reservations',()=>{
     const argv=['npm','run','test:unit'];
     return {...p,nonce,argv,env:{},lock:hash('lock'),manifest,manifestDigest:digestManifest(manifest),inputDigest:await digestInput(dir),argvDigest:digestArgv(argv)};
   }
+  it('persists granted units and runs with 24 workers despite a smaller task env override',async()=>{
+    const calls=vi.fn(async()=>({code:0,stdout:'',stderr:''}));
+    runner=createRunner({testRoot:root,testPath:'/usr/bin:/bin',testWorkerExec:calls});
+    const p=await runner.prepare({nonce,slotUnits:3}),request=await requestFor(p);
+    request.env.WE_VITEST_MAX_WORKERS='1';
+    expect((await runner.run(request)).code).toBe(0);
+    expect(calls).toHaveBeenCalled();
+    for(const [call] of calls.mock.calls)expect(call.env).toMatchObject({WE_VITEST_MAX_WORKERS:'24',FORGE_SLOT_CPUS:'24'});
+    await runner.finish({...p,nonce});
+    expect(await fs.readdir(join(root,'receipts'))).not.toContain('worker-active-1');
+  });
+  it.each([1,3].flatMap(units=>[false,true].flatMap(near=>[false,true].map(optIn=>[units,near,optIn]))))
+  ('runner-to-client receipt contract: %i units, task-pressure note %s, opted-in %s',async(slotUnits,near,optIn)=>{
+    const processCount=near ? 1950*slotUnits : 1;
+    runner=createRunner({testRoot:root,testPath:'/usr/bin:/bin',testWorkerExec:async()=>({
+      code:0,stdout:'',stderr:'',usage:{processCount},
+    })});
+    const p=await runner.prepare({nonce,slotUnits,...(optIn ? {capabilities:{taskPressure:1}} : {})}),request=await requestFor(p);
+    const result=await runner.run(request);
+    expect(result.code).toBe(0);
+    const stored=JSON.parse(await fs.readFile(join(root,'receipts',p.run+'.receipt'),'utf8'));
+    const receipt=await runner.finish({...p,nonce});
+    expect(receipt).toEqual(stored);
+    const expected={v:1,nonce,run:p.run,inputDigest:request.inputDigest,argvDigest:request.argvDigest,
+      manifestDigest:request.manifestDigest,lock:request.lock};
+    expect(verifyReceipt(JSON.stringify(receipt),expected,result.code)).toBe(true);
+    expect(receipt).not.toHaveProperty('slotUnits');
+    expect(receipt).not.toHaveProperty('receiptCapabilities');
+    expect(receipt.resources.slotCpus).toBe(8*slotUnits);
+    if(near && optIn)expect(receipt).toMatchObject({processCount,tasksMax:2048*slotUnits,tasksNear:true,tasksNote:expect.any(String)});
+    else for(const key of ['processCount','tasksMax','tasksNear','tasksNote'])expect(receipt).not.toHaveProperty(key);
+  });
+  it('rejects oversized units before reserving a worker',async()=>{
+    await expect(runner.prepare({nonce,slotUnits:257})).rejects.toThrow('Invalid slot units');
+    expect((await fs.readdir(join(root,'receipts'))).filter(name=>name.startsWith('worker-active'))).toEqual([]);
+  });
   async function pruneWithoutUidProcesses(before='',after='') {
     const setup=await fs.readFile(new URL('../forge-setup.sh',import.meta.url),'utf8');
     const body=setup.match(/<<'PRUNE_PY'\n([\s\S]*?)\nPRUNE_PY/)[1];

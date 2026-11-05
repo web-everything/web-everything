@@ -159,7 +159,7 @@ import { DEFAULT_HOST_MAX_WAIT_MS, loadHostOverloadSettings } from '../lib/host-
 import { LEGACY_SETTINGS_PATH, readDeclaredSettings } from '../lib/settings-files.mjs';
 import { cutoverDecision, loadResourceGateSettings } from '../lib/resource-gate.mjs';
 import { LEASE_FILENAME, isLeaseStale } from '../lib/lane-lease.mjs';
-import { reserve, releaseLockDir, readLockEntry, heartbeatOwn } from './file-locks.mjs';
+import { reserve, releaseLockDir, readLockEntry, heartbeatOwn, lockDirFor } from './file-locks.mjs';
 import { probePidLiveness } from './pid-liveness.mjs';
 import { defaultPoolRoot, guardedPoolRoot, workspaceFor } from '../lib/lane-pool-paths.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
@@ -241,7 +241,8 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
   // main-fix-queue-priority — a red-main repair waiter (P0) is admitted to the next free slot ahead of all others.
   priority: Object.freeze({ mode: 'enforce', repairPatterns: DEFAULT_REPAIR_PATTERNS }),
   remote: Object.freeze({ enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null,
-    maxConcurrent: 8, backoffMs: 120000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15 }),
+    maxConcurrent: 8, slotUnitsByKind: Object.freeze({ FULL: 'auto', soak: 'auto', standards: 'auto' }),
+    elasticSlots: Object.freeze({ enabled: true }), autoSlotUnits: 3, backoffMs: 120000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15 }),
 });
 
 /** Upper bound on a `run --wait-ms` budget (24h): a typo must not turn into an unbounded wait. */
@@ -271,6 +272,10 @@ const ADMISSION_VALID = {
   'remote.mode': (v) => v === 'above-threshold' || v === 'always',
   'remote.loadPerCoreThreshold': (v) => Number.isFinite(v) && v > 0,
   'remote.maxConcurrent': admissionInt(1),
+  'remote.elasticSlots.enabled': (v) => typeof v === 'boolean',
+  'remote.autoSlotUnits': admissionInt(1),
+  'remote.slotUnitsByKind': (v) => admissionObject(v) && Object.keys(v).length <= ADMISSION_MAX_SLOTS
+    && Object.entries(v).every(([key, n]) =>  /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(key) && (n === 'auto' || admissionInt(1)(n))),
   'remote.backoffMs': isValidRunWaitMs,
   'remote.backoffFailures': (v) => Number.isSafeInteger(v) && v >= 1,
   'remote.maxLoadPerCore': (v) => Number.isFinite(v) && v > 0,
@@ -342,7 +347,7 @@ export function privateAdmissionPool(env, checkoutRoot) {
 export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot } = {}) {
   const isPrivate = privateAdmissionPool(env, checkoutRoot);
   const settings = { ...ADMISSION_POLICY_STANDARD, fastScale: { ...ADMISSION_POLICY_STANDARD.fastScale },
-    remote: { ...ADMISSION_POLICY_STANDARD.remote },
+    remote: { ...ADMISSION_POLICY_STANDARD.remote, elasticSlots: { ...ADMISSION_POLICY_STANDARD.remote.elasticSlots } },
     priority: { ...ADMISSION_POLICY_STANDARD.priority, repairPatterns: [...ADMISSION_POLICY_STANDARD.priority.repairPatterns] } };
   const sources = {}; const invalid = []; const ignored = [];
   for (const [leaf, valid] of Object.entries(ADMISSION_VALID)) {
@@ -352,8 +357,8 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
       let v;
       try { v = admissionLeaf(block, leaf); }
       catch (error) {
-        if (leaf !== 'remote.clientPath') throw error;
-        v = Symbol('unreadable clientPath'); // invalid even in the trusted platform layer
+        if (leaf !== 'remote.clientPath' && !leaf.startsWith('remote.slotUnits') && !leaf.startsWith('remote.elasticSlots') && leaf !== 'remote.autoSlotUnits') throw error;
+        v = Symbol('unreadable admission setting'); // invalid even in the trusted platform layer
       }
       if (v === undefined) continue;
       if (layer === 'tool' && leaf === 'remote.clientPath') {
@@ -365,7 +370,12 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
         continue;
       }
       if (valid(v)) { value = v; sources[leaf] = layer; }
-      else invalid.push(`${layer}.${leaf}=${leaf === 'remote.clientPath' ? clientPathForLog(v) : oneLine(JSON.stringify(v))}`);
+      else {
+        invalid.push(`${layer}.${leaf}=${leaf === 'remote.clientPath' ? clientPathForLog(v) : oneLine(JSON.stringify(v))}`);
+        if (leaf === 'remote.slotUnitsByKind') { value = {}; sources[leaf] = layer; }
+        if (leaf === 'remote.elasticSlots.enabled') { value = false; sources[leaf] = layer; }
+        if (leaf === 'remote.autoSlotUnits') { value = 1; sources[leaf] = layer; }
+      }
     }
     const name = ADMISSION_ENV[leaf];
     const raw = name ? env[name] : undefined;
@@ -378,9 +388,9 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
         else invalid.push(`env ${name}=${oneLine(JSON.stringify(raw))}`);
       }
     }
-    const dot = leaf.indexOf('.');
-    if (dot > 0) settings[leaf.slice(0, dot)][leaf.slice(dot + 1)] = value;
-    else settings[leaf] = value;
+    const keys = leaf.split('.');
+    const target = keys.slice(0, -1).reduce((v, key) => v[key], settings);
+    target[keys.at(-1)] = value;
   }
   return { settings, sources, invalid, ignored };
 }
@@ -446,8 +456,8 @@ export function formatAdmissionPolicy({ settings, sources, ignored = [], invalid
   const values = ['cap', 'fastSlots', 'onTimeout', 'fastScale.maxSlots', 'priority.mode',
     ...Object.keys(ADMISSION_POLICY_STANDARD.remote)
       .filter(key => key !== 'clientPath' || settings.remote?.clientPath != null)
-      .map(key => `remote.${key}`)]
-    .map((leaf) => `${leaf}=${leaf === 'remote.clientPath' ? clientPathForLog(admissionLeaf(settings, leaf)) : admissionLeaf(settings, leaf)} (${sources[leaf] ?? 'standard'})`);
+      .map(key => key === 'elasticSlots' ? 'remote.elasticSlots.enabled' : `remote.${key}`)]
+    .map((leaf) => `${leaf}=${leaf === 'remote.clientPath' ? clientPathForLog(admissionLeaf(settings, leaf)) : admissionObject(admissionLeaf(settings, leaf)) ? JSON.stringify(admissionLeaf(settings, leaf)) : admissionLeaf(settings, leaf)} (${sources[leaf] ?? 'standard'})`);
   return `heavy-admission policy · ${values.join(', ')}${ignored.length ? ` · ignored: ${ignored.join('; ')}` : ''}${invalid.length ? ` · invalid: ${invalid.join('; ')}` : ''}`;
 }
 
@@ -740,6 +750,47 @@ export function appendVerifyRemoteReport(env, result) {
   try { appendFileSync(env.WE_VERIFY_REMOTE_REPORT, JSON.stringify(result) + '\n', { mode: 0o600 }); } catch { /* best-effort */ }
 }
 
+/** R324: old Forge runners omit limits; their operator setting is the bounded fallback. */
+export function resolveRemoteSlotUnits({policy, kind, telemetry, priority = false}) {
+  const r = policy.settings.remote;
+  if (!Number.isSafeInteger(telemetry?.activeRuns) || telemetry.activeRuns < 0) throw new Error('Unreadable run count');
+  // An explicitly unreadable limits report must never turn into the legacy setting fallback.
+  let auto = r.autoSlotUnits, source = 'setting';
+  if (Object.hasOwn(telemetry, 'limits')) {
+    const quota = v => typeof v === 'string' && /^[1-9]\d*%$/.test(v) ? Number(v.slice(0, -1)) : NaN;
+    const parent = quota(telemetry.limits?.parent?.cpuQuota), slot = quota(telemetry.limits?.slot?.cpuQuota);
+    auto = Math.floor(parent / slot); source = 'telemetry';
+    if (!Number.isFinite(parent) || !Number.isFinite(slot) || !admissionInt(1)(auto)) throw new Error('Unreadable quota count');
+  }
+  if (r.elasticSlots?.enabled !== true || !['FULL', 'soak', 'standards'].includes(kind)
+    || (!priority && telemetry.activeRuns !== 0)) return {units: 1, source: 'default'};
+  const value = admissionObject(r.slotUnitsByKind) && Object.hasOwn(r.slotUnitsByKind, kind) ? r.slotUnitsByKind[kind] : 1;
+  if (value !== 'auto') return {units: admissionInt(1)(value) ? value : 1, source: 'setting'};
+  return {units: admissionInt(1)(auto) ? auto : 1, source};
+}
+
+/** Acquire distinct units in one synchronous attempt. A partial win never holds capacity while waiting. */
+export function tryAcquireRemoteUnits({units, slots, acquire, release}) {
+  if (!admissionInt(1)(units)) throw new Error('Invalid slot units');
+  const taken = [];
+  let complete = false;
+  try {
+    for (let i = 0; i < units; i++) {
+      const result = acquire(slots.filter(n => !taken.includes(n)));
+      if (!result.ok) return {ok: false, slots: []};
+      taken.push(result.slot);
+    }
+    complete = true;
+    return {ok: true, slot: taken[0], slots: taken};
+  } finally {
+    if (!complete) {
+      let failure;
+      for (const n of taken) { try { release(n); } catch (error) { failure ??= error; } }
+      if (failure) throw failure;
+    }
+  }
+}
+
 /** How long a remote-routed run waits for a free Forge slot before local admission (unless the host is overloaded). */
 export const REMOTE_FULL_WAIT_MS = 30_000;
 
@@ -824,6 +875,19 @@ export async function runWithRemoteDecision({
   const owner = `remote-${process.pid}-${randomBytes(12).toString('hex')}`;
   const cap = policy.settings.remote.maxConcurrent;
   const slotOptions = {lockRoot:remoteRoot,cap,owner,pid:process.pid};
+  let unitPolicy;
+  const kind = classifyCommandKind(argv.map(shellQuoteWord).join(' '), env);
+  let lease = null;
+  try { lease = readLaneLease(cwd); } catch { /* unknown identity grants no priority */ }
+  const priority = classifyWaiterPriority({purpose:lease?.purpose,session:lease?.session,holder:lease?.holder,
+    envSession:clipIdentity(env?.[HOLD_SESSION_ENV])}, policy.settings.priority).class === 'P0';
+  try {
+    if (!admissionInt(1)(cap)) throw new Error('Unreadable slot count');
+    unitPolicy = resolveRemoteSlotUnits({policy, kind, telemetry: peekRemoteTelemetry({root:remoteRoot,host}), priority});
+  } catch { return localFallback('remote-slot-unreadable'); }
+  const units = unitPolicy.units;
+  if (['FULL', 'soak', 'standards'].includes(kind)) log(`${formatAdmissionPolicy(policy)} · remote.slotUnits=${units} (${unitPolicy.source}; ${priority ? 'priority' : 'idle-or-single'})\n`);
+  const releaseUnits = () => { for (let i = 0; i < units; i++) releaseOwnedSlot({...slotOptions,fastSlots:0}); };
   const waitAt = clock();
   let slot;
   let healthAt = waitAt;
@@ -834,23 +898,33 @@ export async function runWithRemoteDecision({
     for (;;) {
       const nowMs = clock();
       // The extended overload wait never acquires a slot past the run's own timeout.
-      if (overloadWaitLogged && nowMs - waitAt >= timeoutMs) return localFallback(`remote-full (host overloaded; ${Math.round((nowMs - waitAt) / 1000)}s wait exhausted)`);
+      if (overloadWaitLogged && nowMs - waitAt >= timeoutMs) return localFallback(units > 1 ? 'remote-units-unavailable' : `remote-full (host overloaded; ${Math.round((nowMs - waitAt) / 1000)}s wait exhausted)`);
       // Dead clients' markers must not wall off the cap: reap by owner liveness plus Forge's own state for that run.
       // Throttled and cheap (one readdir) when no marker is stale, so it runs on every pass, not only once the pool is full.
       if(nowMs-reapedAt>=2000){
         reapedAt=nowMs;
         await markerReaper.step(async()=>{const state=await health();return state.ok?peekRemoteTelemetry({root:remoteRoot,host}):null;},nowMs).catch(()=>[]);
       }
+      // file-locks treats corrupt entries as reclaimable. Remote admission requires readable
+      // evidence instead: an unknown holder could still have an outstanding Forge execution.
+      for (let n = 0; n < cap; n++) {
+        let present = false;
+        try { statSync(lockDirFor(remoteRoot,slotPath(n))); present = true; }
+        catch (error) { if (error.code !== 'ENOENT') throw error; }
+        if (present && !readLockEntry(remoteRoot,slotPath(n))) throw new Error('Unreadable remote slot');
+      }
       const blocked=blockedSlots(remoteRoot,cap),slots=Array.from({length:cap},(_,i)=>i).filter(i=>!blocked.has(i));
-      slot = tryAcquireSlot({...slotOptions,slots,nowMs,nowIso:new Date(nowMs).toISOString()});
+      slot = tryAcquireRemoteUnits({units,slots,
+        acquire: available => tryAcquireSlot({...slotOptions,slots:available,nowMs,nowIso:new Date(nowMs).toISOString()}),
+        release: () => releaseOwnedSlot({...slotOptions,fastSlots:0})});
       if(slot.ok)break;
       const waited = nowMs - waitAt;
       if (waited >= REMOTE_FULL_WAIT_MS) {
         // 7579: local admission would defer an overloaded host at once, so keep queueing for a Forge slot
         // (same cap, same slot locks, health rechecked) up to the run's own timeout instead.
         overloaded = null;
-        if (!isOverloaded()) return localFallback('remote-full (30s wait exhausted)');
-        if (waited >= timeoutMs) return localFallback(`remote-full (host overloaded; ${Math.round(waited / 1000)}s wait exhausted)`);
+        if (!isOverloaded()) return localFallback(units > 1 ? 'remote-units-unavailable' : 'remote-full (30s wait exhausted)');
+        if (waited >= timeoutMs) return localFallback(units > 1 ? 'remote-units-unavailable' : `remote-full (host overloaded; ${Math.round(waited / 1000)}s wait exhausted)`);
         if (!overloadWaitLogged) {
           log(`heavy-admission: remote full (cap=${cap}) and host overloaded - waiting for a remote slot instead of deferring locally\n`);
           overloadWaitLogged = true;
@@ -864,16 +938,27 @@ export async function runWithRemoteDecision({
       await sleep(waited >= REMOTE_FULL_WAIT_MS ? 1000 : Math.min(1000, REMOTE_FULL_WAIT_MS - waited));
     }
   } catch { return localFallback('remote-slot-unreadable'); }
-  const heartbeat = setInterval(() => heartbeatOwnedSlot({...slotOptions,fastSlots:0}),60000);
+  const heartbeat = setInterval(() => {
+    for (const n of slot.slots) {
+      const entry = readLockEntry(remoteRoot, slotPath(n));
+      if (entry?.owner === owner && entry.pid === process.pid) heartbeatOwn(remoteRoot, slotPath(n), owner, new Date().toISOString());
+    }
+  },60000);
   heartbeat.unref();
   const record = async result => {
     try {await recordRemoteResult({root:remoteRoot,settings:policy.settings.remote,clock,result,host});}
     catch {log('heavy-admission: remote-health-unreadable; subsequent remote admission requires readable health state\n');}
   };
   const executionMarker = join(remoteRoot,`slot-${slot.slot}.unconfirmed`);
+  const extraMarkers = [];
+  let primaryCreated = false;
   let outstanding = false;
   let terminated = false;
-  remoteExec = remoteExec ?? createRemoteExec({ policy, cwd, env, lockRoot, log, runOverride: remoteClientOverride });
+  const executor = remoteExec ?? createRemoteExec({ policy, cwd, env, lockRoot, log, runOverride: remoteClientOverride });
+  remoteExec = options => executor({...options,slotUnits:units,onRun:run => {
+    options.onRun(run);
+    for (const file of extraMarkers) recordMarkerRun(file,{owner,run});
+  }});
   const refuseLocal = (reason) => {
     log(`heavy-admission: remote failed (${oneLine(reason)}) - remote termination unconfirmed; refusing local rerun (exit 124). Confirm remote termination before retrying; remote slot-${slot.slot} retained until its .unconfirmed marker is cleared.\n`);
     return { handled: true, exitCode: 124 };
@@ -893,6 +978,8 @@ export async function runWithRemoteDecision({
   try {
     // Waiting for a remote slot can outlive the cached sample. Recheck before dispatch.
     if(clock()-waitAt>=10000){const checked=await health();if(!checked.ok)return localFallback(checked.reason);}
+    try { resolveRemoteSlotUnits({policy,kind,telemetry:peekRemoteTelemetry({root:remoteRoot,host}),priority}); }
+    catch { return localFallback('remote-slot-unreadable'); }
     // Persist dispatch intent BEFORE invoking the executor. SIGKILL bypasses
     // finally, and a dead client PID cannot prove a Forge job has terminated.
     // Exclusive creation also catches a marker created after the slot scan;
@@ -901,9 +988,17 @@ export async function runWithRemoteDecision({
       // A held tombstone for this slot (an in-flight or interrupted reap) still means termination is unconfirmed.
       if(blockedSlots(remoteRoot,slot.slot+1).has(slot.slot))return localFallback('remote-slot-held');
       writeFileSync(executionMarker,markerContent({owner,pid:process.pid,nowMs:clock(),host}),{flag:'wx',mode:0o600});
+      primaryCreated = true;
       // A reaper may have parked a tombstone for this slot between the check and the create. Nothing has been
       // dispatched yet, so withdraw our own marker and fall back; the tombstone keeps its evidence.
       if(heldTombstone(remoteRoot,slot.slot)){unlinkSync(executionMarker);return localFallback('remote-slot-held');}
+      for (const n of slot.slots.slice(1)) {
+        const file = join(remoteRoot,`slot-${n}.unconfirmed`);
+        if (blockedSlots(remoteRoot,n+1).has(n)) throw new Error('Slot held');
+        writeFileSync(file,markerContent({owner,pid:process.pid,nowMs:clock(),host}),{flag:'wx',mode:0o600});
+        extraMarkers.push(file);
+        if (heldTombstone(remoteRoot,n)) throw new Error('Slot held');
+      }
       outstanding = true;
     } catch { return localFallback('remote-execution-marker-unwritable'); }
     signalHandlers = Object.keys(CLIENT_SIGNAL_NUMBERS).map((name) => { const h = () => onSignal(name); process.on(name, h); return [name, h]; });
@@ -967,14 +1062,20 @@ export async function runWithRemoteDecision({
   finally {
     clearTimeout(timer); clearInterval(heartbeat);
     for (const [name, h] of signalHandlers) process.removeListener(name, h);
-    if(!outstanding) releaseOwnedSlot({...slotOptions,fastSlots:0});
-    else if(terminated) {
+    if (!outstanding || terminated) {
+      for (const file of extraMarkers) {
+        try { try {unlinkSync(`${file}.run`);} catch {} unlinkSync(file); }
+        catch { log(`heavy-admission: remote unit marker retained; operator cleanup required\n`); }
+      }
+      if (!outstanding) {if (primaryCreated) {try {unlinkSync(executionMarker);} catch {}} releaseUnits();}
+    }
+    if(outstanding && terminated) {
       // Unconfirmed results, throws and client death leave the pre-dispatch
       // marker intact across PID reclaim and lease expiry. Only confirmed
       // completion/termination can make this index available again.
       try {try{unlinkSync(`${executionMarker}.run`);}catch{/* none */}unlinkSync(executionMarker);outstanding = false;}
       catch {log(`heavy-admission: remote slot-${slot.slot} retained; execution confirmed terminated but its .unconfirmed marker could not be removed; operator cleanup required\n`);}
-      if(!outstanding)releaseOwnedSlot({...slotOptions,fastSlots:0});
+      if(!outstanding)releaseUnits();
     }
   }
   recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock});

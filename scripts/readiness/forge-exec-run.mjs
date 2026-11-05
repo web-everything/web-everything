@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Installed root:root 0755. No executable source or configuration comes from the task.
 import {spawn} from 'node:child_process';
-import {readLimits, slotCpus, scopeLauncherArgv} from './forge-exec-limits.mjs';
+import {readLimits, slotLimits, scopeLauncherArgv, DEFAULT_LIMITS} from './forge-exec-limits.mjs';
 import {constants, realpathSync} from 'node:fs';
 import * as filesystem from 'node:fs/promises';
 import {open, mkdir, readdir, writeFile, appendFile, rename, rm, rmdir, lstat} from 'node:fs/promises';
@@ -107,11 +107,86 @@ const exactKeys = (v,keys) => v && typeof v === 'object' && !Array.isArray(v) &&
 const validET = value => typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}-0[45]:00$/.test(value)
   && Number.isFinite(Date.parse(value)) && easternTimestamp(Date.parse(value)) === value;
 const duration = n => Number.isSafeInteger(n) && n >= 0;
+/** Bounded resource grant from trusted per-slot limits, never from task env. */
+export function elasticRunLimits(limits, slot, units = 1) {
+  if (!Number.isSafeInteger(units) || units < 1 || units > 256) throw new Error('Invalid slot units');
+  const single = slotLimits(limits, slot);
+  const quota = value => typeof value === 'string' && /^[1-9]\d*%$/.test(value) ? Number(value.slice(0, -1)) : NaN;
+  const cpu = quota(single.cpuQuota) * units;
+  const parentCpu = quota(limits.parent?.cpuQuota);
+  if (!Number.isSafeInteger(cpu) || (units > 1 && (!Number.isSafeInteger(parentCpu) || cpu > parentCpu))) throw new Error('Slot units exceed parent CPU quota');
+  const memory = /^([1-9]\d*)([KMGT]?)$/.exec(single.memoryMax);
+  if (units > 1 && !memory) throw new Error('Unreadable slot memory limit');
+  const memoryMax = units === 1 ? single.memoryMax : String(BigInt(memory[1]) * BigInt(units)) + memory[2];
+  return {cpuQuota:cpu+'%',memoryMax,cpus:Math.max(1,Math.ceil(cpu/100)),
+    tasksMax:single.tasksMax === 'infinity' ? 'infinity' : single.tasksMax * units,ioWeight:single.ioWeight};
+}
+
+/** Optional receipt-only diagnostic. Unknown evidence never certifies a healthy task count. */
+export function taskPressureNote(processCount, tasksMax) {
+  if (!Number.isSafeInteger(processCount) || processCount < 0 || !Number.isSafeInteger(tasksMax)
+    || tasksMax < 1 || BigInt(processCount) * 5n <= BigInt(tasksMax) * 4n) return {};
+  return {processCount,tasksMax,tasksNear:true,
+    tasksNote:`${processCount} cgroup tasks (processes and threads) exceed 80% of TasksMax=${tasksMax}`};
+}
+
+/** The transient scope replaces the single-slot slice ceiling only for an elastic grant. */
+export function elasticScopeArgv({limits,slot,units = 1,...options}) {
+  const launcher = scopeLauncherArgv({slot,...options});
+  if (units > 1) {
+    const grant = elasticRunLimits(limits,slot,units);
+    launcher[launcher.findIndex(arg=>arg.startsWith('--slice='))] = '--slice=forge-exec.slice';
+    launcher.splice(launcher.indexOf('--'),0,'--property=CPUQuota='+grant.cpuQuota,
+      '--property=MemoryMax='+grant.memoryMax,'--property=MemorySwapMax=0',
+      '--property=TasksMax='+grant.tasksMax,'--property=IOWeight='+grant.ioWeight);
+  }
+  return launcher;
+}
+
+/** Receipts keep runner allocation and negotiation state private in every protocol version. */
+export function createRunReceipt(prepared, payload, tasks = {}) {
+  const state = {v:prepared.v,nonce:prepared.nonce,run:prepared.run};
+  return {...state,...payload,...(prepared.receiptCapabilities?.taskPressure === 1 ? tasks : {})};
+}
+
+/** Old telemetry clients send no stdin (and old runners ignore it). Bound negotiation before sampling. */
+export function readTelemetryRequest(input) {
+  if (input.isTTY) return Promise.resolve({});
+  return new Promise(resolve => {
+    let text = '', settled = false;
+    const finish = value => {
+      if (settled) return;
+      settled = true; clearTimeout(timer);
+      input.removeListener('data',data); input.removeListener('end',end); input.removeListener('error',unknown);
+      input.pause(); resolve(value);
+    };
+    const unknown = () => {
+      process.stderr.write('forge-exec-run: telemetry capability unavailable; using legacy schema\n');
+      finish({});
+    };
+    const data = chunk => {
+      text += chunk.toString('utf8');
+      if (Buffer.byteLength(text) > 1024) unknown();
+    };
+    const end = () => {
+      if (!text.trim()) return finish({});
+      try {
+        const value = JSON.parse(text);
+        finish(value && typeof value === 'object' && !Array.isArray(value) ? value : {});
+      } catch { unknown(); }
+    };
+    const timer = setTimeout(unknown,250);
+    input.on('data',data); input.once('end',end); input.once('error',unknown);
+    input.resume();
+  });
+}
+
 export function parseTelemetry(text) {
   if ((!Buffer.isBuffer(text) && typeof text !== 'string') || Buffer.byteLength(text)>65536
     || (Buffer.isBuffer(text) && !Buffer.from(text.toString('utf8')).equals(text))) throw new Error('Invalid telemetry size or encoding');
   const v=JSON.parse(text.toString());
-  if (!exactKeys(v,'activeRuns,cores,loadPerCore,memFreePct,recent,sampledAtET') || !validET(v.sampledAtET)
+  const legacy = {...v}; delete legacy.limits;
+  if (!exactKeys(legacy,'activeRuns,cores,loadPerCore,memFreePct,recent,sampledAtET') || !validET(v.sampledAtET)
     || !Number.isSafeInteger(v.cores) || v.cores<1 || !Number.isFinite(v.loadPerCore) || v.loadPerCore<0
     || !Number.isFinite(v.memFreePct) || v.memFreePct<0 || v.memFreePct>100 || !duration(v.activeRuns)
     || !Array.isArray(v.recent) || v.recent.length>50 || v.recent.some(r=>!(exactKeys(r,'code,runId,stageMs,startedAtET')
@@ -477,6 +552,28 @@ def uid_processes():
             if data[data.rfind(b')')+2:].split()[0] != b'Z': found.add(int(entry))
         except (FileNotFoundError, ProcessLookupError): pass
     return found
+# Sample before cleanup erases current task pressure. Kernel task counts include threads.
+# Peak is optional on older kernels; current still captures hung/cancelled children.
+process_count = None
+if cfg.get('usage') is not None:
+    try:
+        with open('/proc/self/cgroup') as stream:
+            cgroup = stream.read(4097)
+        if len(cgroup) > 4096: raise ValueError('oversized cgroup path')
+        task_path = next(line.split(':', 2)[2] for line in cgroup.splitlines() if line.startswith('0::'))
+        task_base = '/sys/fs/cgroup/' + task_path.lstrip('/')
+        samples = []
+        for name in ('pids.peak', 'pids.current'):
+            try:
+                with open(task_base + '/' + name) as stream: value = stream.read(65)
+                if len(value) > 64 or not value.strip().isascii() or not value.strip().isdigit(): continue
+                count = int(value)
+                if count <= 9007199254740991: samples.append(count)
+            except (OSError, ValueError): pass
+        if samples: process_count = max(samples)
+    except (OSError, StopIteration, ValueError): pass
+    if process_count is None:
+        sys.stderr.write('forge-exec-run: task-pressure sample unavailable; near-limit status unknown; inspect the run cgroup\n')
 deadline = time.monotonic() + 30
 while True:
     # Escaped sessions and externally reparented children still belong only to
@@ -504,6 +601,7 @@ if 'usage' in cfg:
             except (OSError, ValueError, KeyError): return None
         usage = {'memoryPeakBytes': counter('memory.peak'), 'cpuUsec': counter('cpu.stat', 'usage_usec'), 'oomKills': counter('memory.events', 'oom_kill')}
     except (OSError, StopIteration): pass
+    usage['processCount'] = process_count
     fd = os.open(cfg['usage'], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
     with os.fdopen(fd, 'w') as result: json.dump(usage, result)
 fd = os.open(cfg['status'], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
@@ -833,13 +931,17 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     const slot=Number(/^forge-exec-([1-9]\d*)$/.exec(worker.user)?.[1]??(testRoot?1:NaN));
     if(!testRoot && process.getuid()!==0) throw new Error('Scoped execution requires the root wrapper; use local fallback');
     if(!Number.isSafeInteger(slot)||slot<1) throw new Error('Scoped execution requires a numbered slot; rerun Forge setup or use local fallback');
-    const {limits,warnings}=testRoot?{limits:{},warnings:[]}:await readLimits();
+    const {limits,warnings}=testRoot?{limits:DEFAULT_LIMITS,warnings:[]}:await readLimits();
     for(const warning of warnings) process.stderr.write('forge-exec-run: '+warning.replace(/[\x00-\x1f\x7f]/g,' ')+'\n');
-    const cpus=slotCpus(limits,slot);
-    env={WE_VITEST_MAX_WORKERS:String(cpus),...env,FORGE_SLOT_CPUS:String(cpus)};
+    const units = worker.reservation?.slotUnits ?? 1;
+    if (units > 1 && warnings.length) throw new Error('Unreadable elastic limits');
+    const grant = elasticRunLimits(limits,slot,units);
+    const cpus = grant.cpus;
+    env={WE_VITEST_MAX_WORKERS:String(cpus),...env,
+      ...(units > 1 ? {WE_VITEST_MAX_WORKERS:String(cpus)} : {}),FORGE_SLOT_CPUS:String(cpus)};
     const cancel=!cleanup&&worker.reservation?statePath(worker.reservation.run,'cancel'):undefined;
     if(cancel&&await lstat(cancel).catch(error=>{if(error.code!=='ENOENT')throw error;}))return {code:255,stdout:'',stderr:'Run cancelled before worker launch',slotCpus:cpus};
-    if(testRoot) return {...await (testWorkerExec?testWorkerExec({worker,argv,cwd:work,env,archive,cancel}):execute(argv[0],archive ? ['-xf',archive] : argv.slice(1),{cwd:work,env,detached:true})),slotCpus:cpus};
+    if(testRoot) return {...await (testWorkerExec?testWorkerExec({worker,argv,cwd:work,env,archive,cancel}):execute(argv[0],archive ? ['-xf',archive] : argv.slice(1),{cwd:work,env,detached:true})),slotCpus:cpus,tasksMax:grant.tasksMax};
     const ids=await identity(worker.user);
     const status=join(receipts,'supervisor-'+randomBytes(16).toString('hex'));
     const usage=status+'.usage';
@@ -847,7 +949,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     try {
       const unit='forge-exec-run-'+randomBytes(16).toString('hex'),runFile=statePath(worker.reservation.run,'running'),running=await readRecord(runFile);
       if(running?.owner)await atomicJSON(runFile,{...running,owner:{...running.owner,unit}});
-      const launcher=scopeLauncherArgv({slot,unit,sudo:false,source:supervisorSource,
+      const launcher=elasticScopeArgv({limits,units,slot,unit,sudo:false,source:supervisorSource,
         json:JSON.stringify({argv,cwd:work,env,status,usage,writer,reapUid:true,...(cancel?{cancel}:{}),...(archive?{archive}:{}),...ids})});
       const result=await execute(launcher[0],launcher.slice(1),{inherit:true});
       if(result.code!==0) throw new Error('Supervisor failed');
@@ -855,7 +957,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       if(!Number.isInteger(code) || code<0 || code>255) throw new Error('Invalid supervisor status');
       let measured;
       try {measured=JSON.parse((await readPinned(usage)).toString());} catch(error) {if(error.code!=='ENOENT')throw error;}
-      return {...result,code,usage:measured,slotCpus:cpus};
+      return {...result,code,usage:measured,slotCpus:cpus,tasksMax:grant.tasksMax};
     } finally {await Promise.all([rm(status,{force:true}),rm(usage,{force:true})]);}
   }
   async function exclusiveWorker(action,record) {
@@ -992,12 +1094,15 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
   }
   return {
     assertContained,
-    async telemetry() {
+    async telemetry(request) {
       // Idle hosts and fresh installs have no background sampler. Sample the
       // actual host on every SSH request; the Mac health cache bounds reads.
       await init();
       await reap();
-      return publishTelemetry();
+      const value = await publishTelemetry();
+      if (request?.capabilities?.limits !== 1) return value;
+      const {limits,warnings} = await readLimits();
+      return {...value,limits:warnings.length ? null : {parent:{cpuQuota:limits.parent.cpuQuota},slot:{cpuQuota:limits.slot.cpuQuota}}};
     },
     async bases() {
       try{return {delta:1,bases:(await readyBases(bases)).slice(0,BASE_RETENTION).map(({sha,manifestDigest})=>({sha,manifestDigest}))};}
@@ -1042,12 +1147,20 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       },record);
       }finally{if(worker.active)await releaseWorker(record);}
     },
-    async prepare({nonce,label,siblings,baseSha,baseManifestDigest,slot}) {
+    async prepare({nonce,label,siblings,baseSha,baseManifestDigest,slot,slotUnits = 1,capabilities}) {
       await init();
       await reap();
       if(!nonceOK(nonce) || (label!==undefined && (typeof label!=='string' || !/^[a-z0-9][a-z0-9-]{5,63}$/.test(label)))) throw new Error('Invalid prepare');
+      if (!Number.isSafeInteger(slotUnits) || slotUnits < 1 || slotUnits > 256) throw new Error('Invalid slot units');
+      // Validate before reservation so invalid or unreadable grants cannot leak a worker.
+      if (slotUnits > 1 && !testRoot) {
+        const {limits,warnings} = await readLimits();
+        if (warnings.length) throw new Error('Unreadable elastic limits');
+        elasticRunLimits(limits,1,slotUnits);
+      }
       const run='r-'+randomBytes(16).toString('hex');
-      const worker=await reserveWorker(run,nonce,slot),record={v:1,nonce,run,...(worker.active?{slot:worker.user}:{})};
+      const worker=await reserveWorker(run,nonce,slot),record={v:1,nonce,run,...(slotUnits > 1 ? {slotUnits} : {}),
+        ...(capabilities?.taskPressure === 1 ? {receiptCapabilities:{taskPressure:1}} : {}),...(worker.active?{slot:worker.user}:{})};
       const prepare=async()=>{
       if(worker.active)await workerFor(record);
       const container=join(worker.root,run);
@@ -1089,10 +1202,13 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
         || request.argvDigest!==digestArgv(request.argv)) throw new Error('Invalid execution parameters');
       return await exclusiveWorker(async (executeCommand,selected) => {
       const resources={memoryPeakBytes:null,cpuUsec:null,oomKills:null,slotCpus:8};
+      let tasks = {};
       const unmeasured=new Set();
       const command=async(...args)=>{
         const value=await executeCommand(...args);
         resources.slotCpus=value.slotCpus??resources.slotCpus;
+        const note = taskPressureNote(value.usage?.processCount,value.tasksMax);
+        if (note.tasksNear && (!tasks.tasksNear || note.processCount > tasks.processCount)) tasks = note;
         for(const key of ['memoryPeakBytes','cpuUsec','oomKills']) {
           const n=value.usage?.[key];
           if(!Number.isSafeInteger(n)||n<0) {
@@ -1210,9 +1326,9 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       } catch(error) {const code=phase==='install'?97:254; if(phase==='test') phase='supervisor'; result={code,stdout:result.stdout,stderr:String(error.message)};}
       finally {clearInterval(telemetryTimer);await updates;}
       if(runAt!==undefined)runMs=Math.max(0,Math.round(clock()-runAt));else installMs=Math.max(0,Math.round(clock()-installAt));
-      const {slot:reservedSlot,...receiptState}=prepared;
-      const receipt={...receiptState,resources,timings:{installMs,runMs},...(request.manifest.siblings ? {siblingShas:siblingShas(request.manifest)} : {}),manifestDigest:request.manifestDigest,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,phase,code:result.code};
+      const receipt=createRunReceipt(prepared,{resources,timings:{installMs,runMs},...(request.manifest.siblings ? {siblingShas:siblingShas(request.manifest)} : {}),manifestDigest:request.manifestDigest,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,phase,code:result.code},tasks);
       await writeFile(statePath(request.run,'receipt'),JSON.stringify(receipt),{flag:'wx',mode:0o600});
+      if (tasks.tasksNear) process.stderr.write('forge-exec-run: '+tasks.tasksNote+'\n');
       await publishTelemetry({runId:request.run,startedAtET,stageMs:{install:installMs,run:runMs},code:result.code,prewarmed});
       if(telemetryError)throw telemetryError;
       return result;
@@ -1310,7 +1426,7 @@ if(process.argv[1] && cliPath === realpathSync(fileURLToPath(import.meta.url))) 
     let input='';
     process.stdin.setEncoding('utf8');
     if(process.argv[2]!=='telemetry')for await(const chunk of process.stdin) {input+=chunk; if(Buffer.byteLength(input)>LIMIT) throw new Error('Request limit exceeded');}
-    const request=process.argv[2]==='telemetry'?undefined:JSON.parse(input);
+    const request=process.argv[2]==='telemetry'?await readTelemetryRequest(process.stdin):JSON.parse(input);
     if(process.argv[2]==='warm-install' && (!request||!/^\/srv\/forge-base\/[a-f0-9]{40}(?:[a-f0-9]{24})?\.tmp\/tree$/.test(request.source)))throw new Error('Invalid warm source');
     const runner=createRunner();
     const result=process.argv[2]==='warm-install'?await runner.warmInstall(request.source,request.manifest):await runner[process.argv[2]](request);

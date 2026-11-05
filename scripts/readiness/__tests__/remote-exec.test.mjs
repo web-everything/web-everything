@@ -2807,3 +2807,53 @@ describe('overlapped Forge discovery',()=>{
     expect(exec.mock.calls.filter(([call])=>!call.args.includes('--show-toplevel'))).toHaveLength(3);
   });
 });
+
+describe('R324 elastic request envelope',()=>{
+  it('passes granted units in prepare while accepting a legacy runner reply',async()=>{
+    const f=fixture();
+    expect(await runRemote({...f,slotUnits:3})).toMatchObject({mode:'remote',code:0});
+    expect(JSON.parse(callsOf(f.exec).find(isPrepare).input)).toMatchObject({slotUnits:3,capabilities:{taskPressure:1}});
+  });
+  it('omits the extension for a one-unit legacy request',async()=>{
+    const f=fixture();await runRemote(f);
+    expect(JSON.parse(callsOf(f.exec).find(isPrepare).input)).not.toHaveProperty('slotUnits');
+    expect(JSON.parse(callsOf(f.exec).find(isPrepare).input).capabilities).toEqual({taskPressure:1});
+  });
+  it.each([0,257,1.5,NaN])('rejects invalid units before transport: %s',async slotUnits=>{
+    const f=fixture();
+    expect(await runRemote({...f,slotUnits})).toMatchObject({mode:'not-started',terminated:true,reason:'invalid-slot-units'});
+    expect(f.exec).not.toHaveBeenCalled();
+  });
+});
+
+describe('optional task-pressure receipt fields',()=>{
+  const note={processCount:1950,tasksMax:2048,tasksNear:true,
+    tasksNote:'1950 cgroup tasks (processes and threads) exceed 80% of TasksMax=2048'};
+  it('accepts the complete note emitted by the runner',async()=>{
+    const {taskPressureNote}=await import('../forge-exec-run.mjs');
+    expect(await runRemote(fixture({receipt:(_nonce,value)=>JSON.stringify({...value,...taskPressureNote(1950,2048)})})))
+      .toMatchObject({mode:'remote',code:0});
+  });
+  it('accepts an old receipt with all four fields absent',async()=>{
+    expect(await runRemote(fixture())).toMatchObject({mode:'remote',code:0});
+  });
+  it.each(Array.from({length:14},(_,i)=>i+1))('rejects partial field set %s',async mask=>{
+    const partial=Object.fromEntries(Object.entries(note).filter((_,i)=>mask & (1 << i)));
+    expect(await runRemote(fixture({receipt:(_nonce,value)=>JSON.stringify({...value,...partial})})))
+      .toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
+  });
+  it.each([
+    {processCount:null},{processCount:'1950'},{processCount:-1},{processCount:1950.5},
+    {processCount:Number.MAX_SAFE_INTEGER+1},{tasksMax:0},{tasksMax:'2048'},{tasksMax:2048.5},
+    {tasksMax:Number.MAX_SAFE_INTEGER+1},{tasksNear:false},{tasksNear:'true'},
+    {tasksNote:''},{tasksNote:'   '},{tasksNote:null},{tasksNote:'x'.repeat(257)},{tasksNote:'unsafe\nmessage'},
+    {tasksNote:'unsafe\u001bmessage'},{processCount:80,tasksMax:100},{processCount:1600},
+  ])('rejects malformed or inconsistent task-pressure evidence %j',async patch=>{
+    expect(await runRemote(fixture({receipt:(_nonce,value)=>JSON.stringify({...value,...note,...patch})})))
+      .toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
+  });
+  it('still rejects unrelated extra receipt fields alongside a valid note',async()=>{
+    expect(await runRemote(fixture({receipt:(_nonce,value)=>JSON.stringify({...value,...note,unexpected:true})})))
+      .toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
+  });
+});

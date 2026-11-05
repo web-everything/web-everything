@@ -1074,8 +1074,9 @@ export async function runRemote(options={}) {
   return {...result,timings};
 }
 
-async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, onRun, log = text=>process.stderr.write(text) } = {}) {
+async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, onRun, slotUnits = 1, log = text=>process.stderr.write(text) } = {}) {
   const fallback = (reason, detail) => ({ mode: 'not-started', terminated: true, reason, detail });
+  if (!Number.isSafeInteger(slotUnits) || slotUnits < 1 || slotUnits > 256) return fallback('invalid-slot-units');
   argv = normalizeRemoteArgv(argv);
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed');
   let executionEnv;
@@ -1204,7 +1205,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       const inputDigest = delta ? await digestDeltaInput(delta,workStage,cwd,exec) : await digestInput(workStage, selected);
       stageDone();
       const prepareDone=begin('forge-prepare');
-      const prepared = await ssh('prepare',{nonce,label:runId,...(delta ? {baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest}:{}),...(manifest.siblings ? {siblings:true} : {})});
+      const prepared = await ssh('prepare',{nonce,label:runId,capabilities:{taskPressure:1},...(slotUnits > 1 ? {slotUnits} : {}),...(delta ? {baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest}:{}),...(manifest.siblings ? {siblings:true} : {})});
       prepareDone();
       if(prepared.code !== 0) {
         // Prepare precedes every byte transfer and cannot have started work.
@@ -1258,7 +1259,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       if(delta) {
         await finish();
         if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,log});
+        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,log});
       }
       if (error.code === 'sibling-inventory-failed') return {mode:'not-started',terminated:true,reason:error.code};
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
@@ -1291,7 +1292,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
           // finish consumed protected prepared state and proved started=false.
           // A fresh full prepare is safe once; disableDelta bounds the retry.
           if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,log});
+          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,log});
           for(const timing of timings)if(timing.stage==='rsync')timing.shipMode='delta-then-full';
           return retried;
         }
@@ -1325,8 +1326,17 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
 export function verifyReceipt(text, expected, code) {
   try {
     const receipt=JSON.parse(text);
-    return receipt && typeof expected?.manifestDigest === 'string' && /^[a-f0-9]{64}$/.test(expected.manifestDigest)
-      && Object.keys(receipt).filter(key=>key!=='timings'&&key!=='resources').sort().join(',') === (expected.siblingShas ? 'argvDigest,code,inputDigest,lock,manifestDigest,nonce,phase,run,siblingShas,v' : 'argvDigest,code,inputDigest,lock,manifestDigest,nonce,phase,run,v')
+    const taskFields=['processCount','tasksMax','tasksNear','tasksNote'];
+    const presentTasks=taskFields.filter(key=>Object.hasOwn(receipt,key));
+    // This diagnostic is optional for old runners, but a partial or inconsistent note is not evidence.
+    const validTasks=presentTasks.length===0 || (presentTasks.length===taskFields.length
+      && Number.isSafeInteger(receipt.processCount) && receipt.processCount>=0
+      && Number.isSafeInteger(receipt.tasksMax) && receipt.tasksMax>0
+      && receipt.tasksNear===true && BigInt(receipt.processCount)*5n>BigInt(receipt.tasksMax)*4n
+      && typeof receipt.tasksNote==='string' && receipt.tasksNote.trim().length>0 && receipt.tasksNote.length<=256
+      && !/[\x00-\x1f\x7f-\x9f]/.test(receipt.tasksNote));
+    return receipt && validTasks && typeof expected?.manifestDigest === 'string' && /^[a-f0-9]{64}$/.test(expected.manifestDigest)
+      && Object.keys(receipt).filter(key=>key!=='timings'&&key!=='resources'&&!taskFields.includes(key)).sort().join(',') === (expected.siblingShas ? 'argvDigest,code,inputDigest,lock,manifestDigest,nonce,phase,run,siblingShas,v' : 'argvDigest,code,inputDigest,lock,manifestDigest,nonce,phase,run,v')
       && (!Object.hasOwn(receipt,'resources') || (receipt.resources && !Array.isArray(receipt.resources)
         && Object.keys(receipt.resources).sort().join(',')==='cpuUsec,memoryPeakBytes,oomKills,slotCpus'
         && ['cpuUsec','memoryPeakBytes','oomKills'].every(key=>receipt.resources[key]===null || Number.isSafeInteger(receipt.resources[key])&&receipt.resources[key]>=0)
