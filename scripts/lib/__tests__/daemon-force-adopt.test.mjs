@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   validateForceAdopt, requestForceAdopt, readForceAdopt, recordForcedAdoption, abortForcedAdoption, readForceWatch,
-  evaluateForceWatch, runForceWatchTick, forceRequestFor, abortForcedWatch, dropReadyCandidate,
+  evaluateForceWatch, runForceWatchTick, forceRequestFor, forceBlockedReason, abortForcedWatch, dropReadyCandidate,
 } from '../daemon-force-adopt.mjs';
 import { matchReadyCandidate } from '../daemon-rebuild/adopt.mjs';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
@@ -318,6 +318,28 @@ describe('runForceWatchTick', () => {
     expect(events.map((e) => e.kind)).toEqual(['force-adopt-watch-superseded']);
     expect(existsSync(env.WE_FORCE_ADOPT_HANDOFF) ? readFileSync(env.WE_FORCE_ADOPT_HANDOFF, 'utf8') : '').not.toMatch(/ROLLED BACK/);
   });
+  it('a superseded rollback also drops the never-adopted forced ready record, so no later lock holder adopts it unwatched', async () => {
+    await setup();
+    expect(writeReadyCandidate(root, { adopt: { finalSha: 'b'.repeat(40) }, prevHead: 'a'.repeat(40), forced: true }, env)).toBe(true);
+    const r = await runForceWatchTick({ root, env, probe: async () => ({ healthy: false }), rollback: async () => ({ superseded: true, head: 'c'.repeat(40) }), emit: async () => {} });
+    expect(r).toEqual({ action: 'superseded' });
+    expect(readReadyCandidate(root, env)).toBeNull();
+  });
+  it('a superseded rollback leaves a ready record for a DIFFERENT build alone', async () => {
+    await setup();
+    writeReadyCandidate(root, { adopt: { finalSha: 'd'.repeat(40) }, prevHead: 'a'.repeat(40) }, env);
+    await runForceWatchTick({ root, env, probe: async () => ({ healthy: false }), rollback: async () => ({ superseded: true, head: 'c'.repeat(40) }), emit: async () => {} });
+    expect(readReadyCandidate(root, env)).not.toBeNull();
+  });
+  it('forceBlockedReason names every refusal: open watch, unreadable watch, unsaved rollback; otherwise null', async () => {
+    expect(forceBlockedReason(root, env)).toBeNull();
+    await setup();
+    expect(forceBlockedReason(root, env)).toBe('watch-already-open');
+    const f = join(env.WE_DAEMON_STATE_DIR, nodeFsReaddir(env.WE_DAEMON_STATE_DIR).find((n) => n.endsWith('.force-watch.json')));
+    writeFileSync(f, '{corrupt');
+    expect(forceBlockedReason(root, env)).toBe('watch-unreadable');
+    rmSync(f, { force: true });
+  });
   it('a failed rollback whose marker cannot be written to disk is still owed: a later healthy probe rolls back', async () => {
     await setup();
     const rollback = vi.fn().mockResolvedValueOnce({ ok: false }).mockResolvedValue({ ok: true });
@@ -342,6 +364,7 @@ describe('runForceWatchTick', () => {
     await failRollbackUnsaved();
     lose();
     const force = (sha) => recordForcedAdoption({ root, env, request: { daemon: 'review', ruling: 'R508', quote: QUOTE }, sha, lastGood: { head: 'a'.repeat(40) }, smoke: { verdict: 'code', failed: [] }, emit: async () => {}, now: () => 1 });
+    expect(forceBlockedReason(root, env)).toBe('rollback-owed');
     expect(await force('c'.repeat(40))).toMatchObject({ ok: false, reason: 'rollback-owed' }); // refused: the unsaved obligation is still owed
     expect(readForceWatch(root, env)).toBeNull();
     // the obligation lives on in memory and is paid by the next tick even though the watch file is gone

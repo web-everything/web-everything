@@ -16,7 +16,7 @@ import {
   overlayGraduated, reportDiscardedCandidate,
 } from './adopt.mjs';
 import { hostname } from 'node:os';
-import { forceRequestFor, readForceWatch, dropReadyCandidate } from '../daemon-force-adopt.mjs';
+import { forceRequestFor, forceBlockedReason, dropReadyCandidate } from '../daemon-force-adopt.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import {
   findUnsafeLocalState, knownInputsOf, rollbackUnverified, collectUntrackedPaths, ensureSafeToMove,
@@ -604,7 +604,7 @@ export async function prepareRebuild({
   // other build never lifts a rejection (`forceRequestFor` is the one sha matcher). While a force watch is still open a second
   // force is refused (`watch-already-open`) WITHOUT consuming the request, so lifting the gate then would re-smoke this
   // candidate on every tick for nothing: the rejection stands until the watch ends.
-  const forceBypass = !readForceWatch(root, stEnv) && !!forceRequestFor(root, stEnv, plan.finalSha);
+  const forceBypass = !forceBlockedReason(root, stEnv) && !!forceRequestFor(root, stEnv, plan.finalSha);
   if (forceBypass && (state.rejected?.inputsKey === plan.inputsKey || state.held?.reason === 'smoke-harness-broken')) {
     alert('force-adopt-bypasses-rejection', { target: plan.finalSha, rejected: state.rejected?.reason ?? null });
   }

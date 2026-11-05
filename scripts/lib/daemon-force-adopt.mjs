@@ -100,6 +100,16 @@ const pendingFor = (root, env, sha) => { const p = pendingRollbacks.get(watchPat
 /** The watch on disk, else the one an unsaved obligation is kept for in memory (a rollback owed must not vanish with its file). */
 const currentWatch = (root, env) => readForceWatch(root, env) ?? pendingRollbacks.get(watchPath(root, env))?.watch ?? null;
 
+/** Why a new force-adopt cannot start for this clone right now, else null. The ONE place these refusals live: the prepare step's
+ *  sticky-rejection bypass asks it too, so a force that `recordForcedAdoption` would refuse never triggers a full re-smoke per tick.
+ *  A watch is open (`watch-already-open`), exists but is unreadable (`watch-unreadable`), or a rollback is owed that never reached disk (`rollback-owed`). */
+export function forceBlockedReason(root, env = process.env) {
+  if (readForceWatch(root, env)) return 'watch-already-open';
+  if (watchUnreadable(root, env)) return 'watch-unreadable'; // fail closed: an unreadable watch may be an open one
+  if (pendingRollbacks.has(watchPath(root, env))) return 'rollback-owed'; // never adopt over an unpaid rollback
+  return null;
+}
+
 /** true only when the line really landed: a forced adoption refuses to proceed unless every audit sink wrote. */
 const appendLine = (p, line) => { try { mkdirSync(dirname(p), { recursive: true }); appendFileSync(p, line); return true; } catch { return false; } };
 
@@ -107,10 +117,8 @@ const appendLine = (p, line) => { try { mkdirSync(dirname(p), { recursive: true 
  *  health watch. Returns { ok:false } (nothing opened) when any sink fails, so the caller then does NOT adopt. */
 export async function recordForcedAdoption({ root, env = process.env, request, sha, lastGood, smoke: rawSmoke, emit, now = Date.now }) {
   // A second force while a watch is open would overwrite its lastGood with the first forced (unproven) build.
-  if (readForceWatch(root, env)) return { ok: false, reason: 'watch-already-open' };
-  if (watchUnreadable(root, env)) return { ok: false, reason: 'watch-unreadable' }; // fail closed: an unreadable watch may be an open one
-  // A rollback owed but never saved to disk (the state write failed) still binds: fail closed until it is paid, never adopt over it.
-  if (pendingRollbacks.has(watchPath(root, env))) return { ok: false, reason: 'rollback-owed' };
+  const blocked = forceBlockedReason(root, env);
+  if (blocked) return { ok: false, reason: blocked };
   const at = new Date(now()).toISOString();
   // Check names come from the candidate's own smoke rows: keep them to printable ASCII and bounded, so they cannot forge audit lines.
   const smoke = rawSmoke ? { ...rawSmoke, failed: (rawSmoke.failed || []).slice(0, 20).map((n) => String(n).replace(/[^\x20-\x7e]/g, '?').slice(0, 80)) } : rawSmoke;
@@ -249,7 +257,9 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   if (!sameWatch()) return { action: 'none' }; // another tick closed (or replaced) this watch during the rollback: it owns the outcome
   if (result?.superseded === true) {
     // A superseding build was adopted while the probe/rollback ran: it is running, the watched build is not, so there is nothing
-    // to revert. Close the watch without touching the newer build.
+    // to revert. Close the watch without touching the newer build. The forced build's own ready record (never adopted, so never
+    // watched again) goes too: left behind, a later write-lock holder would adopt it with no health watch.
+    if (readReadyCandidate(root, env)?.adopt?.finalSha === watch.sha) clearReadyCandidate(root, env);
     clearWatch(root, env);
     await emit?.({ kind: 'force-adopt-watch-superseded', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, head: result.head ?? null } });
     return { action: 'superseded' };

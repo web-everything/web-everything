@@ -389,6 +389,22 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
   });
 
   it.each([
+    ['an unreadable watch file', (cloneDir, env) => writeFileSync(join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(cloneDir)}.force-watch.json`), '{corrupt')],
+  ])('%s: a request for the held candidate does not lift the rejection either (no re-smoke every tick)', async (_name, block) => {
+    const { cloneDir, env, target, arm, lastGood } = setup();
+    const failThenPass = vi.fn().mockResolvedValueOnce((await failing()()))
+      .mockResolvedValue({ verdict: 'pass', attempts: 1, smoke: { results: [] } });
+    await tick(cloneDir, env, { runSmoke: failThenPass });
+    block(cloneDir, env);
+    arm();
+    const smoke = failing();
+    for (let i = 0; i < 2; i += 1) expect((await tick(cloneDir, env, { runSmoke: smoke, forceWatchProbe: healthy })).reason).toBe('still-rejected');
+    expect(smoke).not.toHaveBeenCalled();
+    expect(readForceAdopt(cloneDir, env)).toMatchObject({ sha: target });
+    expect(headOf(cloneDir)).toBe(lastGood);
+  });
+
+  it.each([
     ['up-to-date', 'the clone already runs another current build'],
     ['untracked-collision', 'an untracked file collides with the forced build'],
   ])('a forced ready record dropped as %s (%s) also closes its watch', async (why) => {
