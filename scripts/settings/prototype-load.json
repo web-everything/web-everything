@@ -171,6 +171,14 @@
       "findings": [
         "scripts/lib/drain-poison-guard.mjs:130 — The new API path relies on a pre-existing raw-text grep that misses YAML-escaped identities. Main’s `bornAs: \"xabc12\\u0033\"` and an added card’s `bornAs: xabc123` decode identically, but a read-only probe returned `{ok:true}`, allowing the duplicate through admission."
       ]
+    },
+    {
+      "ref": "lane/platform-settings-reach-verify",
+      "sha": "33b0209818ac4016f8428bc3e880e327a183328e",
+      "ruling": "R606",
+      "findings": [
+        "scripts/lib/policy-cascade.mjs:79 — Per-leaf merging retains the repository’s weaker build gates when an operator supplies only `build.priority` or `build: {}`. A read-only probe confirmed the effective policy changes from `full`/`always` to `related`/`selected`, reducing verification from the full unit suite plus standards to diff-selected checks (scripts/verify-lane.mjs:366)."
+      ]
     }
   ]
 }
