@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { readTick } from '../dispatch-lane-io.mjs';
+// These tests describe codex-first routing; the shipped routing.builder=claude is covered in routing-settings.test.mjs.
+process.env.WE_ROUTING_BUILDER = 'codex';
 const PRIMARY = '/primary/webeverything';
 const NOW = '2026-09-26T10:00:00.000Z';
 

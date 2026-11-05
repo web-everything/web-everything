@@ -131,6 +131,7 @@ import { writeAllSync } from './lib/write-all-sync.mjs';
 import { admittedArgv } from './readiness/heavy-admission.mjs'; // xaipsbs — the heal's check:standards waits for a heavy-command slot
 import { verifyGateDecision, readVerifyMarker, resolveVerifyOptions } from './lib/lane-verify.mjs'; // #2833 — the lane-verification finish-guard: refuse to land a HEAD whose synchronous suite run never finished (or, under --require-verified, was never recorded green). readVerifyMarker/resolveVerifyOptions are the SHARED marker reader + option resolver (findings 2/5) both this gate and verify-lane use, so the two can never drift (readVerifyMarker owns the VERIFY_FILENAME path — no bare JSON.parse of the marker here).
 import { MAIN_CI_RED_DEFAULTS } from './conveyor/main-ci-red-core.mjs'; // card xu1nixv — a red-main fix PR never opens as a draft
+
 import { laneRelevantChangeSinceForRecord } from './lib/verify-lane-gate.mjs'; // #4296 — keys the finish-guard's marker match to what LANE-RELEVANT files changed since the marker's recorded sha, not the exact commit (a no-op merge of BASE that conflicts only outside the lane's own touch-set must not force a fresh full re-verify).
 
 // ── flag parsing (mirrors push-if-green.mjs) ──────────────────────────────────────────────────────────
@@ -356,11 +357,36 @@ export const PARK_LABELS = Object.freeze([REVIEW_LABELS.human, REVIEW_LABELS.pen
  * @param {{mode:string, optOut:boolean}} o
  * @returns {boolean}
  */
-export function resolveDraft({ mode, optOut, ref = '', title = '' }) {
+export function resolveDraft({ mode, optOut, ref = '', title = '', readyOnOpen = false }) {
+  // R502 item 2 (#6323, #6330, #6341, #6339/#6343): an operator-pre-approved or guard-config-only PR opened as a
+  // draft and the review daemon never picked it up, so it needed a hand `gh pr ready`. See decideReadyOnOpen.
+  if (readyOnOpen) return false;
   // Card xu1nixv (incident 2026-10-08: #4522, the fix for red main, opened as a draft and sat refused "still a
   // draft" while main stayed red) — a PR that fixes red main opens READY: it is the one PR that cannot wait.
   if (isMainFixPr({ ref, title })) return false;
   return mode === 'park' && !optOut;
+}
+
+/** R502 item 2 — does this PR skip the draft step? Fail closed; BOTH conditions are required: an
+ *  `Operator-pre-approved: R<id>[+R<id>]` body line AND a non-empty net diff confined to the guard-config
+ *  `guardConfigPaths` (read from the BASE branch, scripts/settings/pr-land-ready.json). A marker alone (any diff)
+ *  or a guard-config diff alone (no marker) stays a draft. Review still happens (the review label is unchanged) and
+ *  required CI still gates the merge: this removes only the draft step for operator-ruled entry PRs. */
+export function decideReadyOnOpen({ body = '', changedFiles = [], guardConfigPaths = null } = {}) {
+  const marked = /^Operator-pre-approved:[ \t]*R\d+(?:\+R\d+)*[ \t]*$/m.test(String(body));
+  const confined = Array.isArray(guardConfigPaths) && guardConfigPaths.length > 0 && Array.isArray(changedFiles) && changedFiles.length > 0
+    && changedFiles.every((f) => guardConfigPaths.includes(f));
+  return marked && confined ? { ready: true, why: 'pre-approved-guard-config' } : { ready: false, why: marked ? 'marker-outside-guard-config' : 'not-flagged' };
+}
+
+/** R502 item 2 — apply a label with bounded retries (a single transient gh failure left #6339/#6343 with no review
+ *  label). Never throws; reports the last error so the caller can say the label is missing. Pure but for `add`. */
+export function applyLabelWithRetry(add, { attempts = 3 } = {}) {
+  let error = null;
+  for (let i = 1; i <= Math.max(1, attempts); i += 1) {
+    try { add(); return { applied: true, attempts: i }; } catch (e) { error = String(e?.message || e).split('\n')[0]; }
+  }
+  return { applied: false, attempts: Math.max(1, attempts), error };
 }
 
 /** A red-main fix PR: from the main-fix owner branch, or titled as a fix of red main (`main-ci-red-core.mjs`'s
@@ -847,7 +873,15 @@ async function runCli() {
   // these same semantic params so the two never drift apart.
   // draft-first PRs — scoped to `park` only; see `DRAFT_OPT_OUT`'s own comment for why `land`/`label-on-green`
   // are excluded (their poll loop has no `'DRAFT'` branch and would spin to timeout).
-  const DRAFT = resolveDraft({ mode: PLAN.mode, optOut: DRAFT_OPT_OUT, ref: REF, title: sourceTitle ?? '' });
+  let readyOnOpen = false;
+  try {
+    // The allowlist is read from the BASE branch, never the PR's own tree: a branch cannot authorise itself.
+    const guardConfigPaths = JSON.parse(gitC(['show', `${REMOTE}/${BASE}:scripts/settings/pr-land-ready.json`])).prLandReady?.guardConfigPaths;
+    let changedFiles = [];
+    try { changedFiles = String(gitC(['diff', '--name-only', `${REMOTE}/${BASE}...${refSha}`])).split('\n').filter(Boolean); } catch { /* fail closed: stays a draft */ }
+    readyOnOpen = decideReadyOnOpen({ body: CREATE_BODY, changedFiles, guardConfigPaths }).ready;
+  } catch { /* fail closed: stays a draft */ }
+  const DRAFT = resolveDraft({ mode: PLAN.mode, optOut: DRAFT_OPT_OUT, ref: REF, title: sourceTitle ?? '', readyOnOpen });
   // Existing PRs keep their title even when their latest commit is a merge/repair. Only CREATE (or its
   // dry-run preview) reads this getter, so absent title metadata cannot block landing an existing PR.
   const createParams = { base: BASE, head: REF, body: CREATE_BODY, draft: DRAFT,
@@ -1278,8 +1312,9 @@ async function runCli() {
     let parkApplied = false;
     try { forge.ensureLabel(parkLabel, { color: meta.color, description: meta.description }); } catch { /* already exists — fine */ }
     ledgerProducerHold(parkLabel, `producer --park ${parkLabel}`, prNum);
-    try { forge.addLabel(prNum, parkLabel); parkApplied = true; }
-    catch (e) { if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · could not apply park label "${parkLabel}" to #${prNum} (${String(e.message || e).split('\n')[0]}) — the PR IS open; set the label by hand\n`); }
+    const parkTry = applyLabelWithRetry(() => forge.addLabel(prNum, parkLabel), { attempts: 3 });
+    parkApplied = parkTry.applied;
+    if (!parkTry.applied && !AS_JSON) process.stderr.write(`pr-land [${REPO}] · could not apply park label "${parkLabel}" to #${prNum} after ${parkTry.attempts} tries (${parkTry.error}) — the PR IS open; set the label by hand\n`);
     emit({
       repo: REPO, merged: false, reason: 'parked', pr: Number(prNum), ref: REF,
       // #984 review (R4) — a `--park` PR is HELD by definition (opened straight into a review hold, never
