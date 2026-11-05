@@ -466,7 +466,8 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
       expect(opts[tickName]).toHaveBeenCalledWith(step === 'fix'
         ? { repo: 'repo-a', allowStandDownAutoProceed: false }
         : ['hung-ci', 'main-red-rebase', 'missing-run'].includes(step)
-          ? { repo: 'repo-a', apply: true } : { repo: 'repo-a' });
+          ? (step === 'main-red-rebase' ? expect.objectContaining({ repo: 'repo-a', apply: true, applyLedger: expect.any(Object) }) : { repo: 'repo-a', apply: true })
+          : { repo: 'repo-a' });
       expect(result.phaseMs[step]).toBeGreaterThan(0);
     }
     expect(readPrs).toHaveBeenCalledTimes(1);
@@ -635,7 +636,8 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
       expect(opts[tickName]).toHaveBeenCalledWith(step === 'fix'
         ? { repo: 'repo-a', allowStandDownAutoProceed: false }
         : ['hung-ci', 'main-red-rebase', 'missing-run'].includes(step)
-          ? { repo: 'repo-a', apply: true } : { repo: 'repo-a' });
+          ? (step === 'main-red-rebase' ? expect.objectContaining({ repo: 'repo-a', apply: true, applyLedger: expect.any(Object) }) : { repo: 'repo-a', apply: true })
+          : { repo: 'repo-a' });
     }
     expect(result.skippedSteps ?? []).toEqual([]);
     expect(skipLines(log)).toEqual([]);
@@ -738,7 +740,8 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
       expect(options).toEqual(step === 'fix'
         ? { repo: 'repo-a', allowStandDownAutoProceed: false }
         : ['hung-ci', 'main-red-rebase', 'missing-run'].includes(step)
-          ? { repo: 'repo-a', apply: true } : { repo: 'repo-a' });
+          ? (step === 'main-red-rebase' ? expect.objectContaining({ repo: 'repo-a', apply: true, applyLedger: expect.any(Object) }) : { repo: 'repo-a', apply: true })
+          : { repo: 'repo-a' });
     }
   });
 
