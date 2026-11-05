@@ -11,6 +11,38 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const CORE = 'scripts/conveyor/reconcile-core.mjs';
+const SEND_BACKS = 'scripts/lib/operator-send-backs.mjs';
+const RELEASE_SENTENCE = String(/^🔓 conveyor fix-end — fix claim released\r?\n\r?\n`([^`\r\n]+)` released the fix claim at `([a-f0-9]{7,40})`\.(?:[ \t]|\r?\n|$)/i);
+// Require the complete R618 delta: either file alone (or a helper declaration) is insufficient.
+const FIX_MARKERS = {
+  [CORE]: [
+    'function latestHeadReview(',
+    'function operatorSendBackAfterReview(',
+    'reviews.some(r => !r.head || !Number.isFinite(r.at))',
+    'if (current.length || reviews.some(',
+    'if (current.some((r, i) => i > 0 && r.at <= current[i - 1].at)) return null;',
+    'latestHeadReview(pr, { currentHeadOnly: true })',
+    'Date.parse(item.at) <= review.at',
+    'item.index <= review.index',
+    'operatorSendBackRearm(pr, { verdictId: pr.comments[item.index].id })',
+    'Math.max(countRearmComments(after), countAdvisoryComments(after)) > 0',
+    'const named = fixClaimReleaseHead(last.c.body)',
+    'const releaseHead = isEnd && fixClaimReleaseHead(marker.c.body)',
+    `${RELEASE_SENTENCE}.exec(body)`,
+    'release.releasedAtMs > lastReview.at',
+    'release.index > lastReview.index',
+    "!withPhase.labels.includes(CONFLICT_LABEL) && String(pr?.mergeStateStatus ?? '').toUpperCase() !== 'DIRTY'",
+    "reason: 'fix-pushed'",
+    "phase === 'needs-human' ? operatorSendBackAfterReview(pr) : null",
+  ],
+  [SEND_BACKS]: [
+    "text.trimStart().startsWith('🔓 conveyor fix-end') && namesSendBack(text, item)",
+    `${RELEASE_SENTENCE}.exec(text)`,
+    'const head = release?.[1].trim() ? release[2] : null;',
+    'Number.isFinite(at) && Number.isFinite(requestedAt) && at > requestedAt',
+    'head && (!item.head || differentHead(item.head, head))) return true;',
+  ],
+};
 
 export default {
   id: 'fix-end-rearms-review',
@@ -18,16 +50,14 @@ export default {
   card: 'R618',
   fixedBy: {
     sha: '9e36a8389f', where: 'lane/r618-push-rearms-review',
-    paths: [CORE, 'scripts/lib/operator-send-backs.mjs'],
+    paths: [CORE, SEND_BACKS],
   },
   fixPresent: root => {
     try {
-      const source = readFileSync(join(root, CORE), 'utf8');
-      return source.includes('function latestHeadReview(')
-        && source.includes('function operatorSendBackAfterReview(')
-        && source.includes('release.index > lastReview.index')
-        && source.includes("reason: 'fix-pushed'")
-        && source.includes("phase === 'needs-human' ? operatorSendBackAfterReview(pr) : null");
+      return Object.entries(FIX_MARKERS).every(([path, markers]) => {
+        const source = readFileSync(join(root, path), 'utf8');
+        return markers.every(marker => source.includes(marker));
+      });
     } catch { return false; }
   },
   async run({ sourceRoot = ROOT } = {}) {
