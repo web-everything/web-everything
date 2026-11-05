@@ -155,6 +155,12 @@ export function computeVerdict(findings, options = {}) {
   // `allow` is never trusted: it resolves to block. Proven D2 debt ships only when the trusted mode is `prove` and the
   // caller does not ask for something stricter.
   const proveD2 = trusted.preExistingMode === 'prove' && (options.preExistingMode ?? 'prove') === 'prove';
+  // Card requirements: the trusted value is a floor (PR #6381 judge). The effective value is trusted || caller, so a
+  // caller can require a card or a pay-by the trusted settings waive, never waive one they require. Only an omitted
+  // caller value defers; any other value that is not exactly `false` (a typo, a string) counts as a request to tighten.
+  const callerRequires = v => v !== undefined && v !== false;
+  const requireOnMain = trusted.requireOnMain !== false || callerRequires(options.requireOnMain);
+  const requirePayBy = trusted.requirePayBy !== false || callerRequires(options.requirePayBy);
   const result = { verdict: 'NOT WEAKENED', blocks: [], ships: [], cards: [], recheck: [] };
   // Caller glob lists are bounded (count and length) so matching cost is bounded; a bad list is invalid input.
   // The trusted lists were bounded by the resolver.
@@ -188,7 +194,7 @@ export function computeVerdict(findings, options = {}) {
     if (f.class === 'D1' || f.class === 'X2') { result.recheck.push(f); continue; }
     // D2: never reads f.relation. It ships only in prove mode, with an ok relationProof bound to base+head+fingerprint,
     // and a card on main whose pay-by is current.
-    if (f.class === 'D2' && !(proveD2 && validProof(f, relationProofs, base, head) && d2Verified(f, releaseStage, { ...options, requireOnMain: trusted.requireOnMain, requirePayBy: trusted.requirePayBy }))) { result.blocks.push(f); continue; }
+    if (f.class === 'D2' && !(proveD2 && validProof(f, relationProofs, base, head) && d2Verified(f, releaseStage, { ...options, requireOnMain, requirePayBy }))) { result.blocks.push(f); continue; }
     // E findings in guard paths always block; a path that cannot be established blocks too.
     if (f.class.startsWith('E') && [...GUARD_FLOOR, ...guardFloorPaths].some(p => matchesAny(f.file, p))) { result.blocks.push(f); continue; }
     if (f.class.startsWith('B') || (releaseStage === 'prod' && f.class.startsWith('E'))) { result.blocks.push(f); continue; }

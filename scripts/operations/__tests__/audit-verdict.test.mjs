@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { URL as NodeURL, fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import { GUARD_FLOOR } from '../../lib/audit-settings.mjs';
-import { proofFingerprint, readCardFromMain } from '../audit-verdict.mjs';
+import { findingFingerprint, proofFingerprint, readCardFromMain } from '../audit-verdict.mjs';
 
 // R473 stage 1 deliberately supplies tests only. Stage 2 supplies the implementation;
 // this suite must stay RED until then. Do not stub the verdict engine or skip cases
@@ -447,6 +447,43 @@ describe('R473 structured concurrency evidence', () => {
       const guarded = trustedLayer({ guardFloorPaths: ['custom/**'] });
       expect((await compute([finding({ file: 'custom/x.mjs' })], options('prerelease', { guardFloorPaths: [] }), guarded)).blocks).toHaveLength(1);
     });
+    // PR #6381 judge: trusted settings are a floor, never a ceiling. For every setting a caller may pass, the effective
+    // requirement is the stricter of trusted and caller, in BOTH directions: a caller cannot relax a strict trusted value,
+    // and a caller's stricter value is honoured when the trusted value is loose. Only loose x loose relaxes.
+    const SETTINGS_TABLE = {
+      requireOnMain: { strict: true, loose: false, findings: () => [d2()], layer: v => ({ cards: { requireOnMain: v, requirePayBy: true } }),
+        opts: v => ({ requireOnMain: v, readCard: () => null }) },
+      requirePayBy: { strict: true, loose: false, findings: () => [d2()], layer: v => ({ cards: { requireOnMain: true, requirePayBy: v } }),
+        opts: v => ({ requirePayBy: v, readCard: () => 'status: open\n' }) },
+      releaseStage: { strict: 'prod', loose: 'prerelease', findings: () => [finding()], layer: v => ({ releaseStage: v }), opts: v => ({ releaseStage: v }) },
+      preExistingMode: { strict: 'block', loose: 'prove', findings: () => [d2()], layer: v => ({ preExisting: { mode: v, baseRecheckMax: 3 } }),
+        opts: v => ({ preExistingMode: v }) },
+      raceBlockPaths: { strict: ['custom/**'], loose: [], findings: () => [finding({ file: 'custom/x.mjs' })], layer: v => ({ raceBlockPaths: v }),
+        opts: v => ({ raceBlockPaths: v }) },
+      guardFloorPaths: { strict: ['custom/**'], loose: [], findings: () => [finding({ file: 'custom/x.mjs' })], layer: v => ({ guardFloorPaths: v }),
+        opts: v => ({ guardFloorPaths: v }) },
+    };
+    it.each(Object.keys(SETTINGS_TABLE).flatMap(setting => [true, false].flatMap(trustedStrict => [true, false]
+      .map(callerStrict => [setting, trustedStrict ? 'strict' : 'loose', callerStrict ? 'strict' : 'loose', trustedStrict || callerStrict]))))(
+      'trusted settings are a floor: %s with trusted %s and caller %s takes the stricter value (PR #6381 judge)',
+      async (setting, trusted, caller, strictWins) => {
+        const row = SETTINGS_TABLE[setting]; const findings = row.findings();
+        const opts = options('prerelease', { relationProofs: findings.filter(f => f.class === 'D2').map(proofFor), readCard: rc, ...row.opts(row[caller]) });
+        const r = await compute(findings, opts, trustedLayer(row.layer(row[trusted])));
+        expect(r.verdict).toBe(strictWins ? 'WEAKENED' : 'NOT WEAKENED');
+        if (strictWins) expect(r.ships).toEqual([]);
+      });
+    it('a caller requirement that is not exactly false counts as a request to tighten, never to relax (PR #6381 judge)', async () => {
+      const f = d2(); const loose = trustedLayer({ cards: { requireOnMain: false, requirePayBy: false } });
+      const base = { relationProofs: [proofFor(f)] };
+      for (const v of [true, 'true', 1, 'false', 0, null, {}]) {
+        expect((await compute([f], options('prerelease', { ...base, readCard: () => null, requireOnMain: v }), loose)).verdict, String(v)).toBe('WEAKENED');
+        expect((await compute([f], options('prerelease', { ...base, readCard: () => 'status: open\n', requirePayBy: v }), loose)).verdict, String(v)).toBe('WEAKENED');
+      }
+      // Omitted caller values defer to the trusted (loose) value.
+      expect((await compute([f], options('prerelease', { ...base, readCard: () => null }), loose)).verdict).toBe('NOT WEAKENED');
+      expect((await compute([f], options('prerelease', { ...base, readCard: () => null, requireOnMain: undefined }), loose)).verdict).toBe('NOT WEAKENED');
+    });
     it('a card with no pay-by line blocks', async () => {
       const f = d2(); expect((await run(f, { relationProofs: [proofFor(f)], readCard: () => 'status: open\n' })).verdict).toBe('WEAKENED');
     });
@@ -585,6 +622,32 @@ describe('card outcomes, proof binding and the default card reader (PR #6381 jud
     'the proof fingerprint binds the %s evidence field', (key, other) => {
       expect(proofFingerprint({ ...full, [key]: other })).not.toBe(proofFingerprint(full));
     });
+  // The full re-check fingerprint guarantee (PR #6381 deferred advisory): a re-check may keep or downgrade the SAME
+  // finding, never another one, so every evidence column — including the model relation label the proof fingerprint
+  // omits — is bound. Only the interleaving stays unbound (adding one only escalates).
+  it('the full re-check fingerprint binds every evidence column, relation included, and never the interleaving (PR #6381 deferred advisory)', () => {
+    const columns = [['id', 'f2'], ['file', 'scripts/other.mjs'], ['line', 13], ['invariant', 'Another invariant'], ['class', 'D3'],
+      ['relation', 'untouched'], ['trigger', 'Another trigger'], ['consequence', 'Another consequence'], ['card', 'backlog/6401-other.md'],
+      ['ruling', 'R2'], ['hunkHash', 'def456']];
+    for (const [key, other] of columns) {
+      expect(findingFingerprint({ ...full, [key]: other }), key).not.toBe(findingFingerprint(full));
+      // Dropping an optional column is a change too, never a wildcard.
+      if (!['id', 'file', 'line', 'invariant', 'class', 'relation', 'consequence'].includes(key)) {
+        const { [key]: _drop, ...rest } = full;
+        expect(findingFingerprint(rest), `${key} dropped`).not.toBe(findingFingerprint(full));
+      }
+    }
+    // The relation label is the one column the full fingerprint binds and the proof fingerprint does not.
+    const relabelled = { ...full, relation: 'untouched' };
+    expect(proofFingerprint(relabelled)).toBe(proofFingerprint(full));
+    expect(findingFingerprint(relabelled)).not.toBe(findingFingerprint(full));
+    // The interleaving is unbound, and the column list is not ambiguous: splitting text across two columns differs.
+    expect(findingFingerprint({ ...full, interleaving })).toBe(findingFingerprint(full));
+    expect(findingFingerprint({ ...full, file: 'a', invariant: 'b","c' })).not.toBe(findingFingerprint({ ...full, file: 'a","b', invariant: 'c' }));
+    // An absent optional column and an explicit null are the same evidence, so a re-check that echoes null keeps it.
+    const { trigger: _t, ...noTrigger } = full;
+    expect(findingFingerprint(noTrigger)).toBe(findingFingerprint({ ...full, trigger: null }));
+  });
   it('the proof fingerprint ignores the model relation label and the interleaving, and a stale proof blocks', async () => {
     expect(proofFingerprint({ ...full, relation: 'untouched' })).toBe(proofFingerprint(full));
     expect(proofFingerprint({ ...full, interleaving })).toBe(proofFingerprint(full));

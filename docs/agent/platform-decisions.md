@@ -6491,7 +6491,9 @@ D1 → D3 downgrade may restate the trigger.
 (`audit.verdict.mode`, `audit.preExisting.mode`, `audit.releaseStage`, `audit.raceBlockPaths`,
 `audit.guardFloorPaths`, `audit.priorQuestionHashes`, `audit.recheck.max`, `audit.preExisting.baseRecheckMax`,
 `audit.cards.requireOnMain` / `requirePayBy`), resolved by `scripts/lib/audit-settings.mjs` through the shared
-policy cascade from the trusted running checkout, never from the candidate diff. Environment may only tighten;
+policy cascade from the trusted running checkout, never from the candidate diff. Environment may only tighten,
+and so may a caller of the verdict: the trusted value is a floor, so each effective requirement is the stricter of
+trusted and caller (a caller can require a card or pay-by the trusted settings waive, never waive one they require);
 any unreadable or invalid value resolves to the strictest option, including a malformed explicit entry the
 cascade would otherwise drop (an empty object at a setting, or a non-object where a section belongs) in either the
 platform or the file layer, and an unreadable, corrupt, `null` or non-object platform preference (every setting
