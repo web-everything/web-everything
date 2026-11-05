@@ -524,6 +524,17 @@ describe('launchd clone ownership: interpreter options and filesystem aliases', 
       expect(findServicesRunningFromClone(other).matches).toEqual([]);
     } finally { await fsAsync.rm(dir, { recursive: true, force: true }); }
   });
+  it('a path that merely contains "vite" (vitest temp dir, vite-named folder) is not a dev server; real dev-server argv still is', async () => {
+    const root = join(cloneRoot, 'we-vitest-501', 'vite-tools');
+    const o = { ...fixture([{ ...sampler, ProgramArguments: ['/usr/local/bin/node', join(root, 'sampler.mjs')] }]), cloneRoot: root };
+    expect((await restartServicesForClone(o)).restarted).toHaveLength(1);
+    for (const argv of [['/bin/sh', '-c', 'vite --port 3000'], ['/bin/sh', '-c', 'npm run dev'], [join(root, 'node_modules/.bin/vite')]]) {
+      const d = { ...fixture([{ ...sampler, ProgramArguments: argv }]), cloneRoot: root };
+      const r = await restartServicesForClone(d);
+      expect(r.restarted).toEqual([]);
+      expect(r.skipped.length === 1 ? r.skipped[0].reason : 'not-matched').toMatch(/^(?:built-in-never|not-matched)$/);
+    }
+  });
   it('the existing /var vs /private/var alias is canonicalized', async () => {
     const real = await fsAsync.realpath(process.env.TMPDIR ?? '/tmp');
     const lexical = join(process.env.TMPDIR ?? '/tmp', 'x');

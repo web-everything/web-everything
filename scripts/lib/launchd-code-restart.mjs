@@ -85,7 +85,7 @@ function devServer(args) {
     if (name === 'php' && tail.some(arg => /^-S/.test(arg))) return true;
     if (name === 'rollup' && tail.some(arg => /^-w|^--watch(?:=|$)/.test(arg))) return true;
     return name === 'esbuild' && tail.some(arg => /^--serve(?:=|$)/.test(arg));
-  }) || /vite|webpack-dev|npm\s+(?:run\s+dev|start)/i.test(args.join(' '));
+  }) || args.some(arg => /(?:^|[\s/\\])(?:vite|webpack-dev(?:-server)?)(?=\s|$)|(?:^|\s)npm\s+(?:run\s+dev|start)(?=\s|$)/i.test(arg));
 }
 
 function assertActive(signal) {
