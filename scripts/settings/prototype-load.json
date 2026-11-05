@@ -192,7 +192,7 @@
     {
       "ref": "lane/overlay-sync-flake-rerun",
       "sha": "23a90dd0f25512eb575f34c8685c8dda8523e2b7",
-      "ruling": "R635",
+      "ruling": "R635+R637",
       "findings": [
         "scripts/lib/daemon-rebuild/overlay-main-sync.mjs:674 — A passing rerun of only failed files now permits publication after an initially failing run; the previous gate rejected that run outright.",
         "scripts/lib/daemon-rebuild/overlay-main-sync.mjs:694 — Matching failed assertion identities on main now clears retry state and returns a skip, bypassing the existing failure outcome and operator-alert escalation; matching names do not establish matching causes.",
