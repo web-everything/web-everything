@@ -114,6 +114,8 @@ describe('installWithFallback', () => {
     ['integrity failure', { stderr: 'ERR_PNPM_TARBALL_INTEGRITY' }],
     ['lifecycle script failure', { stderr: 'ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL postinstall' }],
     ['unrecognised failure', {}],
+    ['timeout carrying a lifecycle failure', { code: 'ETIMEDOUT', stderr: 'ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL' }],
+    ['spawn code carrying an integrity code', { code: 'ENOENT', stderr: 'ERR_PNPM_TARBALL_INTEGRITY' }],
     ['lifecycle failure that merely mentions ENOENT', { stderr: 'ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL postinstall ENOENT' }],
     ['lockfile refusal alongside a network word', { stderr: 'ERR_PNPM_OUTDATED_LOCKFILE ENOTFOUND' }],
   ])('fails closed (no npm fallback) on %s', (_n, extra) => {

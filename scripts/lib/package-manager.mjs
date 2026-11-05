@@ -37,9 +37,10 @@ const pnpmCodes = (t) => [...String(t).matchAll(/ERR_PNPM_[A-Z0-9_]+/g)].map((m)
 function pnpmUnusable(e, { probe = false } = {}) {
   const out = `${e?.message ?? ''}\n${e?.stdout ?? ''}\n${e?.stderr ?? ''}`;
   if (DENY.test(out)) return false;
-  if (SPAWN_CODES.has(e?.code)) return true;
   const codes = pnpmCodes(out);
-  if (codes.length) return codes.every((c) => FETCH_CODES.has(c));
+  if (codes.some((c) => !FETCH_CODES.has(c))) return false; // any non-fetch pnpm error code wins over a spawn code
+  if (SPAWN_CODES.has(e?.code)) return true;
+  if (codes.length) return true; // only fetch-failure codes
   return probe; // a version probe that exits non-zero with no pnpm error code: pnpm is not usable (e.g. a broken shim)
 }
 const runnerFailure = (e) => pnpmUnusable(e);
