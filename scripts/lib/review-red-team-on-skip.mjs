@@ -595,7 +595,7 @@ function resultMaySynchronize(comments, pr, head) {
   // Every comment carrying this head's marker must itself be strictly understood: the downstream parser can consume a
   // malformed or carried comment that redTeamForHead does not accept, and would silently skip its findings.
   // Match like the downstream parser does: case-insensitive and whitespace-tolerant.
-  const markerPattern = new RegExp(`we:red-team-advisory\\s+pr\\s*=\\s*${Number(pr)}\\s+rev\\s*=\\s*${String(head)}`, 'i');
+  const markerPattern = new RegExp(`we:red-team-advisory\\s+pr\\s*=\\s*0*${Number(pr)}\\s+rev\\s*=\\s*${String(head)}`, 'i');
   const marked = comments.filter(c => typeof c?.body === 'string' && markerPattern.test(c.body));
   if (marked.some(c => !strictBodyKind(c.body, pr, head))) return false;
   return comments.some(c => redTeamForHead([c], pr, head));
