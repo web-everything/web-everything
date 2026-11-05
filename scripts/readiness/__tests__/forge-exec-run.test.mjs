@@ -645,8 +645,9 @@ def pidfd_open(pid):
     fd_pid[fd] = pid
     return fd
 def pidfd_send_signal(fd, sig):
-    assert sig == signal.SIGKILL
-    killed.append(fd_pid[fd])
+    pid = fd_pid[fd]
+    if sig == signal.SIGSTOP: entries[pid] = (b'T', entries[pid][1])
+    elif sig == signal.SIGKILL: killed.append(pid)
 def wait(timeout=None):
     global now, waits
     waits += 1
@@ -723,9 +724,13 @@ def pidfd_open(pid):
     fd_pid[fd] = pid
     if mode == 'reused after pin': entries[pid] = (b'S', 100, 555, 555, 900)  # pid reassigned before the verify
     return fd
+signals = []
 def pidfd_send_signal(fd, sig):
-    assert sig == signal.SIGKILL
-    killed.append(fd_pid[fd])
+    pid = fd_pid[fd]
+    signals.append((pid, sig.name))
+    if sig == signal.SIGSTOP: entries[pid] = (b'T',) + entries[pid][1:]   # frozen: state T
+    elif sig == signal.SIGKILL: killed.append(pid)
+    else: assert sig == signal.SIGCONT, sig
 cleanup_killed = []
 def kill(pid, sig):
     # Only the slot-level cleanup after the run may use os.kill; the mid-run sweep uses pidfds.
@@ -747,6 +752,7 @@ with open(writer['reservation'], 'w') as stream: json.dump(dict(run='fixture', n
 cfg = dict(uid=os.getuid(), gid=os.getgid(), argv=['unused'], cwd=root, env={}, status=status, writer=writer,
            wallMs=600000, orphanGraceMs=3000)
 mid_run = []
+if mode == 'deadline passed': cfg['deadlineMonoMs'] = -1   # absolute run deadline already behind us
 with patch.object(ctypes, 'CDLL') as libc, patch.object(subprocess, 'Popen') as worker, \
      patch.object(os, 'listdir', side_effect=listproc), patch.object(os, 'getpid', return_value=100), \
      patch.object(builtins, 'open', side_effect=proc_open), patch.object(os, 'kill', side_effect=kill), \
@@ -761,14 +767,15 @@ with patch.object(ctypes, 'CDLL') as libc, patch.object(subprocess, 'Popen') as 
     sys.argv = ['supervisor', json.dumps(cfg)]
     try: exec(source)
     except SystemExit: pass
+    if mode == 'deadline passed': assert worker.call_count == 0, 'launched after the run deadline'
 # Judge the sweep itself: the final slot-level cleanup runs after wait() returns, so use the mid-run snapshot.
-print(json.dumps(mid_run), file=sys.stderr)
 print(json.dumps(mid_run))
+print(json.dumps(signals), file=sys.stderr)
 `;
   const sweep=mode=>{
     const result=spawnSync('python3',['-I','-c',sweepProbe,supervisorSource,root,join(root,'sweep-status'),mode],{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
     expect(result.status,result.stderr).toBe(0);
-    return {killed:JSON.parse(result.stdout.trim().split('\n').at(-1)),stderr:result.stderr};
+    return {killed:JSON.parse(result.stdout.trim().split('\n').at(-1)),stderr:result.stderr,signals:JSON.parse(result.stderr.trim().split('\n').at(-1))};
   };
   it('sweeps an aged helper in the run own session and its child, but never a double-forked helper that escaped into its own session', () => {
     const {killed}=sweep('session');
@@ -780,6 +787,21 @@ print(json.dumps(mid_run))
     const {killed}=sweep('reused pid');
     expect(killed).not.toContain(201);
     expect(killed).not.toContain(202);
+  });
+  it('freezes a process with SIGSTOP before it verifies and kills it, so it cannot change session in between', () => {
+    const {signals}=sweep('session');
+    const for201=signals.filter(([pid])=>pid===201).map(([,sig])=>sig);
+    expect(for201.slice(0,2)).toEqual(['SIGSTOP','SIGKILL']);
+  });
+  it('resumes a frozen process with SIGCONT when verification fails after the freeze', () => {
+    const {signals}=sweep('reused after pin');
+    const for201=signals.filter(([pid])=>pid===201).map(([,sig])=>sig);
+    expect(for201).toEqual(expect.arrayContaining(['SIGSTOP','SIGCONT']));
+    expect(for201).not.toContain('SIGKILL');
+  });
+  it('never launches the child when the run deadline passed before the supervisor got to launch it', async () => {
+    sweep('deadline passed');
+    expect(await readFile(join(root,'sweep-status'),'utf8')).toBe('124');
   });
   it.each(['no pidfd','reused after pin'])('fails closed and signals nothing when the process cannot be pinned or changes after the pin (%s)', mode => {
     const {killed,stderr}=sweep(mode);

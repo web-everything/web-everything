@@ -443,8 +443,12 @@ def drop():
     elif os.getuid() != uid or os.getgid() != gid:
         raise RuntimeError('cannot drop identity')
     os.close(writer_fd)
+deadline_ms = cfg.get('deadlineMonoMs')
 if cancelled():
     code = 255
+elif deadline_ms is not None and time.monotonic() * 1000 >= deadline_ms:
+    sys.stderr.write('forge-exec-run: wall limit exceeded before launch\n')
+    code = 124
 else:
     if 'archive' in cfg:
         # Only the fixed cache-extraction command receives an archive descriptor.
@@ -507,14 +511,23 @@ else:
                 sys.stderr.write('forge-exec-run: cannot pin pid ' + str(pid) + ' (' + type(error).__name__ + '); sweep skips it\n')
                 continue
             try:
-                current = read_stat(pid)
-                if not current or current[4] != recorded or current[3] != child.pid:
+                # Freeze first: a stopped process cannot call setsid()/exec between the check and the kill.
+                try: signal.pidfd_send_signal(pidfd, signal.SIGSTOP)
+                except ProcessLookupError: continue
+                current = None
+                for _ in range(20):
+                    current = read_stat(pid)
+                    if current and current[0] in (b'T', b't'): break
+                    time.sleep(0.05)
+                if not current or current[0] not in (b'T', b't') or current[4] != recorded or current[3] != child.pid:
                     sys.stderr.write('forge-exec-run: pid ' + str(pid) + ' changed or unreadable before signal; sweep skips it\n')
+                    try: signal.pidfd_send_signal(pidfd, signal.SIGCONT)
+                    except ProcessLookupError: pass
                     continue
                 try: signal.pidfd_send_signal(pidfd, signal.SIGKILL)
                 except ProcessLookupError: pass
             finally: os.close(pidfd)
-        if cfg.get('wallMs') is not None and (now - started) * 1000 > cfg['wallMs']:
+        if deadline_ms is not None and now * 1000 > deadline_ms or cfg.get('wallMs') is not None and (now - started) * 1000 > cfg['wallMs']:
             sys.stderr.write('forge-exec-run: wall limit exceeded; killing child tree\n')
             return True
         return False
@@ -664,7 +677,8 @@ async function unitActive(unit) {
 }
 export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, runWallMs, clock=Date.now} = {}) {
   // The run deadline uses a monotonic clock so a wall-clock step cannot stretch it; an injected clock stands in for it in tests.
-  const monotonic=clock===Date.now?()=>performance.now():clock;
+  const sharedClock=clock===Date.now;
+  const monotonic=sharedClock?()=>Number(process.hrtime.bigint())/1e6:clock; // CLOCK_MONOTONIC, the same epoch as Python's time.monotonic
   const bases=testRoot ? join(testRoot,'bases') : '/srv/forge-base';
   const runs = testRoot ? join(testRoot,'runs') : '/srv/forge-exec';
   const receipts = testRoot ? join(testRoot,'receipts') : '/srv/forge-receipts';
@@ -964,7 +978,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       if(running?.owner)await atomicJSON(runFile,{...running,owner:{...running.owner,unit}});
       if(left()!==undefined&&left()<=0) return expired();
       const launcher=scopeLauncherArgv({slot,unit,sudo:false,source:supervisorSource,
-        json:JSON.stringify({argv,cwd:work,env,status,usage,writer,reapUid:true,wallMs:left(),...(cancel?{cancel}:{}),...(archive?{archive}:{}),...ids})});
+        json:JSON.stringify({argv,cwd:work,env,status,usage,writer,reapUid:true,wallMs:left(),...(sharedClock&&deadline?{deadlineMonoMs:deadline.at}:{}),...(cancel?{cancel}:{}),...(archive?{archive}:{}),...ids})});
       const result=await execute(launcher[0],launcher.slice(1),{inherit:true});
       if(result.code!==0) throw new Error('Supervisor failed');
       const code=Number((await readPinned(status)).toString());
