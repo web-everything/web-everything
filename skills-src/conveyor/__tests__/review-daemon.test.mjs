@@ -1449,6 +1449,13 @@ describe('runReviewTick — reconcile itself is isolated (regression, #xvzwiew l
     expect(dispatch).not.toHaveBeenCalled(); // reconcile crashed before any PR was identified
   });
 
+  it('a DEFERRED PR read is "owed unknown" on the reconcile-failed channel, never a silent 0 owed', () => {
+    const reconcile = vi.fn(() => ({ outcome: 'deferred-low-budget', deferred: true, message: 'author lookup throttled', dispatch: [], refusals: [], notes: [], prs: 0, agents: 0 }));
+    const out = runReviewTick({ reconcile, dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [] });
+    expect(out.reviewsOwed).toBe(0);
+    expect(out.reconcileError).toMatch(/deferred.*owed unknown.*author lookup throttled/);
+  });
+
   it('a successful reconcile still reports reconcileError: null (never undefined)', () => {
     const reconcile = vi.fn(() => ({ dispatch: [], refusals: [] }));
     const out = runReviewTick({ reconcile, dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [] });
@@ -2371,7 +2378,9 @@ it('x6n7c2p required checks before review — synthetic #3432 four-tick soak spe
     });
     dispatched.push(out.dispatched.length);
     if (conclusion !== 'success') {
-      expect(out.notStarted).toEqual([{ prNumber: 3432, reason: expect.stringMatching(/^review-ci: required-checks-not-successful: daemon-soak=\w+$/) }]);
+      expect(out.notStarted).toEqual([{ prNumber: 3432, reason: conclusion === 'failure'
+        ? 'review-ci: ci-red: daemon-soak=failure'
+        : 'review-ci: required-checks-not-successful: daemon-soak=pending' }]);
       expect(tagRound).not.toHaveBeenCalled();
       expect(spawnAgent).not.toHaveBeenCalled();
     }
