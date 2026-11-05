@@ -62,6 +62,19 @@ describe('unreadable platform preferences', () => {
   });
 });
 
+describe('degraded platform layer', () => {
+  it.each([['empty object', {}], ['null', null], ['number', 3]])('invalid platform value (%s) is flagged and gates a frozen install', (_n, platform) => {
+    const prefs = () => ({ prefs: { packageManager: platform }, errors: [] });
+    expect(resolvePackageManager({ env: {}, readPlatform: prefs }).degraded).toMatch(/invalid platform/);
+    expect(() => installArgv({ ci: true, env: {}, readPlatform: prefs })).toThrow(/lockfileParity/);
+  });
+  it('a configured-but-missing preferences file is flagged', () => {
+    const r = resolvePackageManager({ env: { WE_PLATFORM_PREFERENCES_FILE: '/nonexistent/we-prefs.json' } });
+    expect(r.degraded).toMatch(/missing/);
+    expect(() => installArgv({ ci: true, env: { WE_PLATFORM_PREFERENCES_FILE: '/nonexistent/we-prefs.json' } })).toThrow(/lockfileParity/);
+  });
+});
+
 describe('installArgv / installCommand', () => {
   it('npm: ci when frozen, install otherwise', () => {
     expect(installArgv({ ci: true, ...none })).toMatchObject({ bin: 'npm', args: ['ci'], manager: 'npm' });

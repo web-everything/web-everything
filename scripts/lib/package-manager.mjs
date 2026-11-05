@@ -8,6 +8,7 @@
  * pnpm install falls back to npm, and says so.
  */
 import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { cascadePolicy, readPlatformPreferences } from './policy-cascade.mjs';
 
@@ -21,7 +22,10 @@ export function resolvePackageManager({ env = process.env, tool, platform, log, 
     const { prefs, errors } = readPlatform({ env, warn: () => {} });
     platform = prefs.packageManager;
     if (errors.length) degraded = `platform preferences unreadable (${errors[0]})`;
+    const configured = String(env?.WE_PLATFORM_PREFERENCES_FILE ?? '').trim();
+    if (!degraded && configured && !existsSync(configured)) degraded = 'platform preferences file configured but missing';
   }
+  if (!degraded && platform !== undefined && !PACKAGE_MANAGERS.includes(platform)) degraded = `invalid platform packageManager ${JSON.stringify(platform)}`;
   const r = cascadePolicy('packageManager', text(tool), {
     standard: 'npm', platform, env, envValues: { '': text(env.WE_PACKAGE_MANAGER) }, ...(log ? { log } : {}),
   });
