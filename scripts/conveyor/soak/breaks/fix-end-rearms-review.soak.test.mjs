@@ -39,6 +39,10 @@ it.each([SEND_BACKS, CORE])('fixPresent refuses a root with %s reverted to pinne
 
 it.each([
   ['post-fix review rearm', CORE, "reason: 'fix-pushed'"],
+  ["review-history read", CORE, "const reviews = (Array.isArray(pr?.comments) ? pr.comments : [])"],
+  ["trusted-author review filter", CORE, ".filter(({ c }) => isTrustedMarkerAuthor(c) && (isReviewVerdictComment(c) || latestAdvisory([c])))"],
+  ["operator request filter", CORE, ".filter(({ c }) => !isOperatorAuthored(c) || !openOperatorSendBacks({ comments: [c] }).length)"],
+  ["review-after-fix CI gate", CORE, "if ((advisoryReview?.ciWaived !== true || pr.reviewTiming?.startAfter !== 'ci-green') && !reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra })) return;"],
   ['review-after-fix consumer signature', CORE, 'advisoryReview = null, reviewAfterFix = null,'],
   ['review-after-fix consumer branch', CORE, 'if (advisoryReview || reviewAfterFix) {'],
   ['review-after-fix consumer reason', CORE, 'why: advisoryReview?.why ?? reviewAfterFix'],
