@@ -1047,7 +1047,10 @@ function splitScopeEntries(raw) {
   const entries = [];
   for (const entry of raw) {
     let inherited = '';
-    for (const piece of String(entry ?? '').trim().split(/\s+/).filter(Boolean)) {
+    const pieces = String(entry ?? '').trim().split(/\s+/).filter(Boolean);
+    // Several globs in one entry stay joined: normalizeBriefScope refuses them (they may overlap); splitting would bypass that.
+    if (pieces.filter((p) => p.includes('*')).length > 1) { entries.push(String(entry).trim()); continue; }
+    for (const piece of pieces) {
       const own = /^[A-Za-z][\w-]*:/.exec(piece)?.[0] ?? '';
       if (own) inherited = own;
       entries.push(own ? piece : inherited + piece);

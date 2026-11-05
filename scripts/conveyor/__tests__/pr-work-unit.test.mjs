@@ -237,6 +237,9 @@ describe('resolvePrWorkUnit (#xdx3ifb)', () => {
 
 
 describe('splitScopeEntries', () => {
+  it('keeps an entry with several globs unsplit so the brief refusal still applies', () => {
+    expect(splitScopeEntries(['we:s/a*b.mjs we:s/ab*.mjs'])).toEqual(['we:s/a*b.mjs we:s/ab*.mjs']);
+  });
   it('splits a two-path entry', () => {
     expect(splitScopeEntries(['we:a we:b'])).toEqual(['we:a', 'we:b']);
   });
