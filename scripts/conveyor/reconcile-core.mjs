@@ -1181,14 +1181,14 @@ export function markIdleFinishedSessions(agents, idleFinishedInfoFor, nowMs, thr
  *   - every marker names a non-blank identity (`**Who:**` for begin, release line for end).
  * Earlier releases at this head remain evidence for their own sessions, until that session claims again.
  * @param {object} pr
- * @returns {{releasedAtMs:number, head:string, who:string, releases:Array<{releasedAtMs:number, head:string, who:string}>}|null}
+ * @returns {{releasedAtMs:number, index:number, head:string, who:string, releases:Array<{releasedAtMs:number, head:string, who:string}>}|null}
  */
 export function releasedFixClaim(pr) {
   const head = String(pr?.headRefOid ?? '');
   if (!head) return null;
   const markers = (Array.isArray(pr?.comments) ? pr.comments : [])
-    .filter((c) => isTrustedMarkerAuthor(c) && typeof c?.body === 'string')
-    .map((c) => ({ c, body: c.body.trimStart(), at: Date.parse(c.createdAt) }))
+    .flatMap((c, index) => isTrustedMarkerAuthor(c) && typeof c?.body === 'string'
+      ? [{ c, index, body: c.body.trimStart(), at: Date.parse(c.createdAt) }] : [])
     .filter((m) => m.body.startsWith(FIX_BEGIN_MARKER) || m.body.startsWith(FIX_END_MARKER));
   if (!markers.length || markers.some((m) => !Number.isFinite(m.at))) return null;
   markers.sort((a, b) => a.at - b.at);
@@ -1196,7 +1196,7 @@ export function releasedFixClaim(pr) {
   // Equal timestamps are ambiguous ordering: array order must never decide, so fail closed.
   if (markers.some((m, i) => i > 0 && markers[i - 1].at === m.at)) return null;
   if (!last.body.startsWith(FIX_END_MARKER)) return null; // a later fix-begin = claim held again
-  const named = /at `([0-9a-f]{7,40})`/.exec(last.body)?.[1];
+  const named = fixClaimReleaseHead(last.c.body);
   if (!named || !sameHeadSha(named, head)) return null;
   const who = /^`([^`\r\n]*)` released the fix claim\b/m.exec(last.body)?.[1];
   if (!who?.trim()) return null;
@@ -1208,12 +1208,18 @@ export function releasedFixClaim(pr) {
       : /^\*\*Who:\*\* `([^`\r\n]*)`/m).exec(marker.body)?.[1];
     if (!identity?.trim()) return null; // cannot safely attribute a later claim to a session
     releasesBySession.delete(identity); // a renewed claim or invalid release supersedes its earlier evidence
-    const releaseHead = isEnd && /at `([0-9a-f]{7,40})`/.exec(marker.body)?.[1];
+    const releaseHead = isEnd && fixClaimReleaseHead(marker.c.body);
     if (releaseHead && sameHeadSha(releaseHead, head)) {
       releasesBySession.set(identity, { releasedAtMs: marker.at, head, who: identity });
     }
   }
-  return { releasedAtMs: last.at, head, who, releases: [...releasesBySession.values()] };
+  return { releasedAtMs: last.at, index: last.index, head, who, releases: [...releasesBySession.values()] };
+}
+
+/** Match the strict producer sentence used by operator-send-backs.mjs; quoted heads grant nothing. */
+function fixClaimReleaseHead(body) {
+  const release = /^🔓 conveyor fix-end — fix claim released\r?\n\r?\n`([^`\r\n]+)` released the fix claim at `([a-f0-9]{7,40})`\.(?:[ \t]|\r?\n|$)/i.exec(body);
+  return release?.[1].trim() ? release[2] : null;
 }
 
 /**
@@ -1585,10 +1591,11 @@ function advisoryHeadState(pr) {
 /** Unreadable or unpinned history grants nothing; cross-head chronology must agree with thread order. */
 function latestHeadReview(pr, { currentHeadOnly = false } = {}) {
   const reviews = (Array.isArray(pr?.comments) ? pr.comments : [])
-    .filter(c => isTrustedMarkerAuthor(c) && (isReviewVerdictComment(c) || latestAdvisory([c])))
+    .map((c, index) => ({ c, index }))
+    .filter(({ c }) => isTrustedMarkerAuthor(c) && (isReviewVerdictComment(c) || latestAdvisory([c])))
     // Operator send-backs are requests, not finished reviews of a head.
-    .filter(c => !isOperatorAuthored(c) || !openOperatorSendBacks({ comments: [c] }).length)
-    .map(c => ({ head: reviewedHeadsOf(c).at(-1) ?? latestAdvisory([c])?.head, at: Date.parse(c.createdAt) }));
+    .filter(({ c }) => !isOperatorAuthored(c) || !openOperatorSendBacks({ comments: [c] }).length)
+    .map(({ c, index }) => ({ index, head: reviewedHeadsOf(c).at(-1) ?? latestAdvisory([c])?.head, at: Date.parse(c.createdAt) }));
   if (!reviews.length || reviews.some(r => !r.head || !Number.isFinite(r.at))) return null;
   const current = reviews.filter(r => sameHeadSha(r.head, pr.headRefOid));
   if (currentHeadOnly) {
@@ -3569,9 +3576,11 @@ export function planReconcile({
 
     // A pushed repair owes its review even if fix-end left the old findings/advisory labels in place.
     // Claims and live reviewers already refused above; completed red CI still belongs to its repair path.
+    // Both the timestamp and original thread index must put the release after that review.
     const lastReview = latestHeadReview(pr);
     const release = releasedFixClaim(pr);
     if (OWED[phase] && lastReview && release && release.releasedAtMs > lastReview.at
+      && release.index > lastReview.index
       && !sameHeadSha(lastReview.head, pr.headRefOid)) {
       const why = 'the fixer released a new head after the last review — its review is owed before another repair';
       dispatchReviewRow({ pr, requiredChecks, withPhase, base, attempts: roundAttempts(),
