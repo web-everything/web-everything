@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
-  needsReviewHoldCleanup, planReviewHoldCleanup, sweepReviewHoldLabels, _resetStrandedCheckMemo, STRANDED_BACKOFF_MS, STRANDED_RECHECK_MS,
+  createLiveHoldReaders, needsReviewHoldCleanup, planReviewHoldCleanup, sweepReviewHoldLabels, _resetStrandedCheckMemo, STRANDED_BACKOFF_MS, STRANDED_RECHECK_MS,
 } from '../review-hold-reconcile.mjs';
 import { _resetAcceptCarryMemo } from '../accept-carry-sweep.mjs';
 import { resolveAcceptCarryForward } from '../../lib/accept-carry-forward.mjs';
@@ -865,5 +865,33 @@ describe('numbering re-stamp withdrawal on label-held PRs', () => {
         numberingRestamp: (opts) => { seen.push(opts.pr); return null; } });
       expect(seen).toEqual([]);
     });
+  });
+});
+
+// Self-review variant of the #6409 red-team break: the pre-write readLiveState re-read must not be served
+// from the smoke read memo, or a hold that lands mid-proof passes the re-check.
+describe('createLiveHoldReaders — the pre-write re-read is never memoized', () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it('strips the read memo from both environments on every PR state, review and comment read', () => {
+    vi.stubEnv('WE_GH_READ_MEMO_DIR', 'memo-dir');
+    const run = vi.fn(() => JSON.stringify({ number: 7, state: 'OPEN', labels: [], headRefOid: 'a'.repeat(40) }));
+    const read = vi.fn(() => '[]');
+    const { provider, readComments } = createLiveHoldReaders({ run, read });
+    try { provider.readPrState('o/r', 7); } catch { /* only the call's options matter here */ }
+    try { provider.readPrReviews('o/r', 7); } catch { /* only the call's options matter here */ }
+    try { readComments(7, { repo: 'o/r' }); } catch { /* only the call's options matter here */ }
+    expect(run.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(read.mock.calls.length).toBeGreaterThanOrEqual(1);
+    for (const [, opts] of run.mock.calls) {
+      expect(opts.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+      expect(opts.throttle.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+    }
+    for (const [file, , opts] of read.mock.calls) {
+      expect(file).toBe('gh');
+      expect(opts.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+      expect(opts.throttle.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+    }
+    expect(process.env.WE_GH_READ_MEMO_DIR).toBe('memo-dir');
   });
 });

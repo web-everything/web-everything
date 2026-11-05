@@ -68,6 +68,9 @@ import { readNetDiffAtHead } from '../merge-ai-prs.mjs';
 import { assertMandatoryReferralsCleared } from '../review-set-label.mjs';
 import { latestAcceptRecord, resolveAcceptCarryForward } from '../lib/accept-carry-forward.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
+import { runGhSync } from '../lib/gh-throttle.mjs';
+import { createMqLiveReader } from '../lib/drain-queue-safety.mjs';
+import { execRead } from '../lib/proc-read.mjs';
 import {
   REVIEW_LABELS, hasReviewLabel, findContradictoryReviewVerdicts, decideContradictoryVerdictHeal,
   parseLatestHumanClearedSha,
@@ -158,9 +161,23 @@ export const STRANDED_RECHECK_MS = 30 * 60_000;
 export const STRANDED_BACKOFF_MS = 5 * 60_000;
 export function _resetStrandedCheckMemo() { strandedChecked.clear(); }
 
+/**
+ * The default PR state, review and comment readers. Their answers are re-read right before a label write or
+ * comment (a hold can arrive mid-proof), so they must never come from the smoke read memo: a cached answer
+ * would pass that re-check. Both the provider and the comment reader strip the memo on every gh call.
+ */
+export function createLiveHoldReaders({ run = runGhSync, read = execRead } = {}) {
+  const liveRun = createMqLiveReader((file, args, opts) => run(args, opts));
+  const liveRead = createMqLiveReader(read);
+  return {
+    provider: createGhProvider({ exec: (args, opts) => liveRun('gh', args, { encoding: 'utf8', ...opts }) }),
+    readComments: (number, opts = {}) => readCompletePrComments(number, { ...opts, exec: liveRead }),
+  };
+}
+
 export function sweepReviewHoldLabels({
-  repo = null, listPrs = defaultListPrs, provider = createGhProvider(), dryRun = false, settings, runRuling, acceptCarry,
-  readComments = readCompletePrComments, readPr = defaultReadPr,
+  repo = null, listPrs = defaultListPrs, provider = createLiveHoldReaders().provider, dryRun = false, settings, runRuling,
+  acceptCarry, readComments = createLiveHoldReaders().readComments, readPr = defaultReadPr,
   numberingRestamp = restampAfterNumbering, restoreStamps, exec = execFileSync, now = Date.now, log = (line) => writeLineSync(2, line),
 } = {}) {
   // The ONE source of the accept-carry setting (WE_ACCEPT_CARRY_FORWARD > settings/accept-carry-forward.json >

@@ -3922,6 +3922,8 @@ the stamp and hold-reconcile suites exercise the repair through injected IO.
 Every default restoration read (listing, live body, history, pre-write body) goes through
 `createMqLiveReader`, so the smoke read memo (`WE_GH_READ_MEMO_DIR`) can never serve the pre-write
 comparison a cached body. The regression drives the real `gh-throttle` memo with a fake `gh`.
+Hold reconciliation's default PR state, review and comment readers (`createLiveHoldReaders`) strip
+the memo too, because `readLiveState` is re-read right before each label write.
 
 ### Author-stamp restoration evidence
 
