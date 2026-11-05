@@ -673,7 +673,9 @@ it.each([false, true])('default claim refresh keeps a live wrapped fixing claim 
   try {
     acquireFixClaim({ ...key, who: 'fix-3964', sessionId: sid, nowMs: T0 });
     const record = newEnvelopeRecord({ session: 'fix-3964', role: 'fix', launcher: 'claude-p', sessionId: sid,
-      pid: process.pid, cwd: '/lane', timeoutMs: 60_000, now: () => iso(T0),
+      // The wrapped row's startedAt is this record's start. It must be real (not the fixed T0 in the past): the pid-reuse
+      // guard rightly calls this live test process "started after the holder" when the holder starts before it did.
+      pid: process.pid, cwd: '/lane', timeoutMs: 60_000, now: () => iso(Date.now()),
       ...(awaiting ? { awaitingVerify: { sha: 'a'.repeat(40), pr: 3964, ref: 'lane/fix', requestedAt: iso(T0) } } : {}),
     });
     writeCompletion(record, completions);
@@ -888,9 +890,9 @@ describe('idle-claim auto-release (R201)', () => {
       ['3 hours silent', 180 * MIN],
     ])('releases the claim of a bound, readable, idle holder %s with an unmoved head and no subagents', (_n, silentMs) => {
       const lastActivityMs = firstSweep - silentMs;
+      writeTranscript(lastActivityMs);
       // The detector really does flag this holder hung; without the idle-path ownership the claim could never release.
       expect(readHungInfo({ ...row }, firstSweep, resolveHungThresholdMs())).toMatchObject({ hung: true, reason: 'stale-no-activity' });
-      writeTranscript(lastActivityMs);
       const released = sweepAll({ lastActivityMs });
       expect(released).toHaveLength(1);
       expect(released[0].reason).toMatch(/idle-head-unmoved/);
