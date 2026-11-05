@@ -37,7 +37,7 @@ import {
   markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, CI_HEAL_ROUND_CAP,
   CONFLICT_FIX_ROUND_CAP, ADVISORY_FIX_ROUND_CAP, CONFLICT_FIX_ABSOLUTE_CEILING, foldReviewRefusalInto,
   ACCEPT_LABEL_GRACE_MS, acceptLabelDropped, CARD_BATCH_EXTRACT_WIRED, BLOCKED_CANCELLED_RERUN_CAP,
-  greenSettledForRestoreGrace, RESTORE_REVIEW_LABEL_GRACE_MS, checksNotYetRun,
+  greenSettledForRestoreGrace, RESTORE_REVIEW_LABEL_GRACE_MS, checksNotYetRun, checksAgedPastRestoreGrace,
 } from '../reconcile-core.mjs';
 import {
   STAND_DOWN_MARKER, WATCHER_STAND_DOWN_ACTOR, SUPERSEDE_STAND_DOWN_MARKER, buildStandDownComment,
@@ -4312,6 +4312,14 @@ describe('restore-review-label - orphaned review-status:fixing tag (R502 item 4)
     expect(owed(orphan({ statusCheckRollup: [{ ...greenRollup[0], completedAt: new Date(NOW - 60_000).toISOString() }, ...pendingRollup] }))).toEqual([]);
     expect(owed(orphan(), { reviewLabelHeal: 'green' })).toEqual([]);
     expect(owed(orphan(), { reviewLabelHeal: 'off' })).toEqual([]);
+  });
+  it('the mapper\'s year-0001 "never set" completedAt is not a readable timestamp (age-only grace)', () => {
+    const mappedPending = [{ __typename: 'CheckRun', name: 'gate', status: 'IN_PROGRESS', conclusion: '',
+      startedAt: '0001-01-01T00:00:00Z', completedAt: '0001-01-01T00:00:00Z' }];
+    expect(checksAgedPastRestoreGrace(mappedPending, NOW)).toBe(false);
+    expect(owed(orphan({ statusCheckRollup: mappedPending }))).toEqual([]);
+    expect(checksAgedPastRestoreGrace(settledPending, NOW)).toBe(true);
+    expect(checksAgedPastRestoreGrace(settledPending, 0)).toBe(false);
   });
   it('fails closed on unknowns: claim read failed, comments unreadable, no clock', () => {
     expect(owed(orphan({ fixClaimUnknown: true }))).toEqual([]);

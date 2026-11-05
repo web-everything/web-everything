@@ -2101,6 +2101,15 @@ export function greenSettledForRestoreGrace(rollup, now, graceMs = RESTORE_REVIE
 const unsetTime = v => v == null || v === '' || (typeof v === 'string' && /^0001-01-01T00:00:00(?:\.0+)?Z$/.test(v));
 const unsetConclusion = v => v == null || v === '';
 
+/** Age-only grace for ownership rules that are NOT gated on CI state (the `orphaned-fixing` variant): the newest
+ * readable check completion is past the grace. Pending rows (no completion yet) do not block it; with no readable
+ * completion at all, or no usable clock, the PR's age is unknown and it fails closed. */
+export function checksAgedPastRestoreGrace(rollup, now, graceMs = RESTORE_REVIEW_LABEL_GRACE_MS) {
+  if (!Number.isFinite(now) || now <= 0) return false;
+  const times = (Array.isArray(rollup) ? rollup : []).map(c => Date.parse(c?.completedAt)).filter(t => Number.isFinite(t) && t > 0);
+  return times.length > 0 && now - Math.max(...times) >= graceMs;
+}
+
 /** A stacked PR may need its review label before CI ever starts. Accepts both raw rows and the mapped
  * shape. Do not mistake a rerun (a prior real startedAt/completedAt/conclusion), a missing rollup,
  * or malformed timing for that never-started state. */
@@ -2889,8 +2898,8 @@ export function planReconcile({
         && parseReviewedSha(pr?.comments) !== pr.headRefOid.toLowerCase()
         && !(Array.isArray(pr?.comments) && pr.comments.some((c) => isReviewVerdictComment(c) && verdictJudged(c, pr.headRefOid.toLowerCase())))
         // Fail closed on the grace: with no readable check timestamp the PR's age is unknown, so it is not yet an orphan.
-        && (Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : []).some((c) => Number.isFinite(Date.parse(c?.completedAt)))
-        && greenSettledForRestoreGrace(pr?.statusCheckRollup, now)) {
+        // Age-only grace: this rule is not gated on CI state, so the green-settled grace would wrongly exclude a pending orphan.
+        && checksAgedPastRestoreGrace(pr?.statusCheckRollup, now)) {
       dispatch.push({
         ...base, ...withPhase, kind: 'restore-review-label', label: 'review:pending', variant: 'orphaned-fixing',
         why: 'review-status:fixing is the only tag left: no review:* label, no live fixer claim and no verdict for the '
