@@ -662,7 +662,8 @@ describe('local shard wait budget (verify.localShardWaitMs)', () => {
       clock += waited;
       return { exitCode: 75, reportText: '' };
     };
-    const code = await runShards({ argv: ['npx', 'vitest', 'run', 'a', 'b'], shards: 1, parallel: 1, budgetMs: 1_620_000 }, {
+    // 600000 < the 900000 default wait: an uncapped wait would equal the whole watchdog timeout.
+    const code = await runShards({ argv: ['npx', 'vitest', 'run', 'a', 'b'], shards: 1, parallel: 1, budgetMs: 600_000 }, {
       discover: () => null, execute, now: () => clock, tmpdir: () => '/scratch', env: {}, needsGit: () => true,
       fs: { mkdtempSync: () => '/scratch/s', readFileSync: () => { throw Error('missing'); }, rmSync: () => {} },
       acquireLocal: async () => ({ ok: true }), releaseLocal: () => {}, log: () => {} });
