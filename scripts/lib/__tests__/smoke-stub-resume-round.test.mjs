@@ -1,11 +1,56 @@
 import { describe, expect, it, vi } from 'vitest';
 import { tmpdir } from 'node:os';
+import { runInNewContext } from 'node:vm';
 import { DISPATCH_DRY_RUN_SCRIPT, resolveSmokeBudgets, SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
 import b, { probeDryRun } from '../../conveyor/soak/breaks/smoke-dryrun-resumes-real-session.mjs';
 
 const host = { load: () => 0, cores: () => 1 };
 const passes = ['reconcile-fix-pass', 'reconcile-ci-heal-pass', 'reconcile-review-pass'];
 const dispatchCheck = SMOKE_CHECKS.find(check => check.name === 'dispatch-dry-run').run;
+
+// Evaluate each actual call's options without importing production modules or running live reads.
+function dryRunOptions(callee) {
+  const options = DISPATCH_DRY_RUN_SCRIPT.match(new RegExp(`\\b${callee}\\((\\{[\\s\\S]*?\\n  \\})\\);`));
+  expect(options, `${callee} must remain explicitly configured in the dry-run script`).not.toBeNull();
+  return runInNewContext(`(${options[1]})`, {
+    WE_SLUG: 'fixture/repo', stubDispatch: () => {}, skipStaleness: () => ({ fresh: true, behind: 0 }),
+  });
+}
+
+describe('smoke dry-run side-effect stubs', () => {
+  it('stubs CI-heal pollAttempts with no observations', () => {
+    expect(dryRunOptions('runReconcileCiHealDispatch').pollAttempts()).toEqual([]);
+  });
+
+  it('stubs CI-heal flushTimeouts with no followups', async () => {
+    expect(await dryRunOptions('runReconcileCiHealDispatch').flushTimeouts()).toEqual([]);
+  });
+
+  it('stubs CI-heal retryTimeout with an explicit refusal', async () => {
+    expect(await dryRunOptions('runReconcileCiHealDispatch').retryTimeout()).toEqual({
+      status: 'refused', reason: 'smoke-dry-run',
+    });
+  });
+
+  it('stubs CI-heal salvage with no recovered commit', async () => {
+    expect(await dryRunOptions('runReconcileCiHealDispatch').salvage()).toBeNull();
+  });
+
+  it('stubs CI-heal postParkComment with a no-op', () => {
+    expect(dryRunOptions('runReconcileCiHealDispatch').postParkComment()).toBeUndefined();
+  });
+
+  it('stubs review notifyReferral with a no-op', () => {
+    expect(dryRunOptions('runReviewTick').notifyReferral()).toBeUndefined();
+  });
+
+  it('disables fix idle-restack shadow logging with hermetic no-op dependencies', () => {
+    const { shadowDeps } = dryRunOptions('runReconcileFixDispatch');
+    expect(shadowDeps.hermetic).toBe(true);
+    expect(shadowDeps.mode).toBe('off');
+    expect(shadowDeps.appendLine('fixture evidence')).toBeUndefined();
+  });
+});
 
 describe('smoke dry-run fix-pass isolation', () => {
   it('stubs tryResumeRound with an explicit unsuccessful resume result', async () => {
