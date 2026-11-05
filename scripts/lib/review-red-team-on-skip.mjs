@@ -24,7 +24,7 @@ import { failedRedTeamRetry, redTeamStatusWithoutRun, completedRedTeamSeat } fro
 import { redTeamRequired, VERDICTS } from './jury-core.mjs';
 import { isLaterVerdictBody, latestAcceptRecord, laterReviewHold } from './accept-carry-forward.mjs';
 import { restampRecord, strandedNumberingRecords } from './numbering-carry.mjs';
-import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
+import { planRedTeamStatusLabels, syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { RED_TEAM_STATUS_LABELS } from './red-team-status-label-meta.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
@@ -244,6 +244,10 @@ function* reviewRuns({ runsDir, list, read, stat }) {
   }
 }
 
+const settledReviewEffects = run => Array.isArray(run?.effects)
+  && run.effects.every(effect => ['applied', 'failed'].includes(effect?.status));
+const terminalReviewRun = run => settledReviewEffects(run) && isRunRecordTerminal(run);
+
 /** Complete bounded proof; unknown state never establishes a never-reviewed head. */
 export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
   runsDir = runsDirectory(env), list = strictListRuns, read = readRun, stat = statSync } = {}) {
@@ -253,7 +257,7 @@ export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
       if (run.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr)) continue;
       const rev = run.findings?.read?.netBasis?.rev;
       if (!isRealHead(rev) || rev === head) return false;
-      const activeEffects = !Array.isArray(run.effects) || !run.effects.every(effect => ['applied', 'failed'].includes(effect?.status));
+      const activeEffects = !settledReviewEffects(run);
       const unfinished = !run.verdict || run.pending != null || activeEffects;
       if (unfinished) return false;
     }
@@ -265,9 +269,9 @@ export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
 function ignorableConfirm(run, at, acceptedAt) {
   const start = Date.parse(run.stepTimings?.find(t => t?.step === 'read')?.startedAt);
   const resumed = Date.parse(run.resumedAt);
-  return Number.isFinite(acceptedAt) && !isRunRecordTerminal(run)
+  return Number.isFinite(acceptedAt) && !terminalReviewRun(run)
     && run.verdict?.verdict === 'needs-human' && run.pending?.kind === 'confirm'
-    && Array.isArray(run.effects) && run.effects.every(e => ['applied', 'failed'].includes(e?.status))
+    && settledReviewEffects(run)
     && Number.isFinite(start) && start + RUN_MTIME_SLACK_MS < acceptedAt
     && Number.isFinite(at) && at + RUN_MTIME_SLACK_MS < acceptedAt
     && (run.resumeOf == null && run.resumedAt == null
@@ -302,7 +306,7 @@ export function ignorableConfirmRunIds({ repo, pr, head, comments, labels, revie
     const ids = [];
     for (const { id, run, at } of reviewRuns({ runsDir, list, read, stat })) {
       if (run.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr)) continue;
-      const terminal = isRunRecordTerminal(run);
+      const terminal = terminalReviewRun(run);
       if (terminal && (run.verdict || (run.resumeOf == null && now - at >= ABANDONED_REVIEW_AFTER_MS))) continue;
       if (!ignorableConfirm(run, at, acceptedAt)) return closed;
       ids.push(id);
@@ -713,7 +717,21 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
                 || (evidence?.carry && evidence.carry.step !== 'done');
               if (active) row.settleError = 'red-team pass still active; label unchanged';
               else if (!resultMaySynchronize(live.comments, row.prNumber, row.head)) row.settleError = 'result comment not strictly clean';
-              else syncLabels({ ...key, env, log: note, evidence, provider, comments: live.comments });
+              else {
+                const verdict = evidence?.status?.status === 'finished' ? evidence.status.result?.foldedVerdict : null;
+                if (!['accept', 'changes'].includes(verdict)) row.settleError = 'no recorded red-team verdict; label unchanged';
+                else {
+                  // A withheld changes result must never inherit the clear disposition of an older comment.
+                  const labels = verdict === 'changes' ? planRedTeamStatusLabels({ ...key, env, evidence,
+                    comments: live.comments, labels: live.labels, standingRuling: null }) : null;
+                  const blocked = labels?.add === 'red-team:blocked' || labels?.add == null
+                    && live.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'red-team:blocked')
+                    && !labels?.remove.includes('red-team:blocked');
+                  if (verdict === 'changes' && !blocked) row.settleError = 'recorded red-team changes; label unchanged';
+                  else syncLabels({ ...key, env, log: note, evidence, provider, comments: live.comments,
+                    ...(verdict === 'changes' ? { standingRuling: null } : {}) });
+                }
+              }
             }
           }
           else if (row.settle === 'not-owed') {

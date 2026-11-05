@@ -1,5 +1,4 @@
 // @vitest-environment node
-import { readFileSync } from 'node:fs';
 import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -61,6 +60,10 @@ function notOwedRunFixture(over = {}) {
   const f = notOwedFixture();
   return runFixture({ ...f, now: () => f.now, ...over });
 }
+function resultRunFixture(over = {}, verdict = 'accept') {
+  return runFixture({ readEvidence: () => evidence({ recorded: true,
+    status: { status: 'finished', result: { status: 'ran', foldedVerdict: verdict } } }), ...over });
+}
 function carryFixture() {
   const f = fixture({ readEvidence: () => evidence({ loopPayload: undefined }) });
   f.rawPrs[0].comments = [accept(old),
@@ -79,7 +82,7 @@ function resultComment(confirmed = false) {
 describe('result settlement requires a strictly clean comment or a confirmed break', () => {
   it.each(['indented finding', 'bulleted finding', 'unknown line', 'unconfirmed finding'])(
     '%s cannot replace pending with clear', kind => {
-      const o = runFixture();
+      const o = resultRunFixture();
       const clean = resultComment();
       const broken = resultComment(true);
       const body = kind === 'indented finding' ? broken.body.replace(/^1\./m, '  1.')
@@ -92,7 +95,7 @@ describe('result settlement requires a strictly clean comment or a confirmed bre
       expect(o.rawPrs[0].labels).toContain('red-team:pending');
     });
   it('every marker-bearing comment must be strictly understood: an older one with unknown text blocks clearing even beside a newer clean result', () => {
-    const o = runFixture();
+    const o = resultRunFixture();
     o.rawPrs[0].comments.push(trusted(resultComment().body, iso(acceptedAt + 2)),
       trusted(`${resultComment().body}\nunknown text`, iso(acceptedAt + 1)));
     mod.runRedTeamOnSkip(o);
@@ -130,7 +133,7 @@ describe('complete bounded formal-review reads', () => {
   it.each(['not-owed', 'result', 'clear'])(
     '%s refuses unreadable complete reviews despite a readable legacy review snapshot', kind => {
       const status = { status: 'finished', result: 'not-owed' };
-      const o = kind === 'not-owed' ? notOwedRunFixture() : runFixture({
+      const o = kind === 'not-owed' ? notOwedRunFixture() : kind === 'result' ? resultRunFixture() : runFixture({
         readEvidence: () => evidence({ status }), readStatus: () => status });
       if (kind === 'result') o.rawPrs[0].comments.push(resultComment());
       const readCompleteReviews = vi.fn(() => { throw Error('complete reviews unreadable'); });
@@ -186,7 +189,8 @@ describe('policy-clear publication revalidates fresh evidence', () => {
 
 describe('settlement reads fresh PR state and result evidence', () => {
   it('passes review-unfinished evidence to label synchronization and preserves pending', () => {
-    const unknown = { ok: false, reason: 'review-unfinished' };
+    const unknown = { ok: false, reason: 'review-unfinished',
+      status: { status: 'finished', result: { foldedVerdict: 'accept' } } };
     const o = runFixture({ readEvidence: vi.fn(() => unknown), readIgnorableConfirms: () => [] });
     o.rawPrs[0].comments.push(resultComment());
     const changes = [];
@@ -247,7 +251,7 @@ describe('settlement reads fresh PR state and result evidence', () => {
   it.each(['not-owed', 'result'].flatMap(kind => ['hold comment', 'formal hold', 'head moved', 'state throws',
     'comments throw', 'reviews throw', 'comments unknown', 'reviews unknown'].map(change => [kind, change])))(
     '%s retains pending when fresh %s appears after planning', (kind, change) => {
-      const o = kind === 'not-owed' ? notOwedRunFixture() : runFixture();
+      const o = kind === 'not-owed' ? notOwedRunFixture() : resultRunFixture();
       if (kind === 'result') o.rawPrs[0].comments.push(resultComment(change === 'hold comment'));
       o.provider = { readPrState: vi.fn(() => {
         if (change === 'state throws') throw Error('state offline');
@@ -806,12 +810,12 @@ describe('runner settles pending without dispatch', () => {
     expect(o.settlePending).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled();
   });
   it.each([false, true])('a result (confirmed break=%s) synchronizes labels only', confirmed => {
-    const o = runFixture(); o.rawPrs[0].comments.push(resultComment(confirmed));
+    const o = resultRunFixture({}, confirmed ? 'changes' : 'accept'); o.rawPrs[0].comments.push(resultComment(confirmed));
     expect(redTeamForHead(o.rawPrs[0].comments, pr, head)?.findings).toHaveLength(confirmed ? 1 : 0);
     const labels = [];
     o.syncLabels = vi.fn(key => {
       labels.push(planRedTeamStatusLabels({ ...key, labels: o.rawPrs[0].labels,
-        comments: o.rawPrs[0].comments, evidence: evidence(), env: { WE_RED_TEAM_CONFIRMED_BREAKS: 'broken=send-back' }, standingRuling: null }));
+        comments: o.rawPrs[0].comments, evidence: key.evidence, env: { WE_RED_TEAM_CONFIRMED_BREAKS: 'broken=send-back' }, standingRuling: null }));
     });
     mod.runRedTeamOnSkip(o);
     expect(o.syncLabels).toHaveBeenCalledOnce();
@@ -825,7 +829,8 @@ describe('runner settles pending without dispatch', () => {
     expect(o.settlePending).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled(); expect(o.settle).not.toHaveBeenCalled();
   });
   it.each(['settlePending', 'syncLabels'])('%s failure is reported in settleError with unchanged why and does not abort the next row', method => {
-    const o = notOwedRunFixture(); if (method === 'syncLabels') o.rawPrs[0].comments.push(resultComment());
+    const o = method === 'syncLabels' ? resultRunFixture() : notOwedRunFixture();
+    if (method === 'syncLabels') o.rawPrs[0].comments.push(resultComment());
     o[method] = vi.fn().mockImplementationOnce(() => { throw Error('settlement offline'); }).mockReturnValue(undefined);
     o.plan.refusals.push({ kind: 'already-reviewed-head', prNumber: pr + 1, headSha: head });
     o.rawPrs.push({ ...o.rawPrs[0], number: pr + 1, comments: [accept(old)] });
@@ -877,15 +882,50 @@ describe('runner settles pending without dispatch', () => {
 });
 
 describe('audit hardening: unknown effect statuses and checked comments', () => {
-  it('ignorableConfirmRunIds treats an unknown effect status as unfinished work (not ignorable)', () => {
-    const base = { acceptedAt: Date.parse('2026-01-01T01:00:00Z') };
-    expect(base.acceptedAt).toBeGreaterThan(0);
-    const source = readFileSync(new URL('../review-red-team-on-skip.mjs', import.meta.url), 'utf8');
-    expect(source).toContain("run.effects.every(e => ['applied', 'failed'].includes(e?.status))");
-    expect(source).toContain("['applied', 'failed'].includes(effect?.status)");
+  it.each(['bogus', 'weird'].flatMap(status => ['confirm', 'terminal-looking', 'abandoned'].map(kind => [status, kind])))(
+    '%s effects in a %s record keep both run scanners closed', (status, kind) => {
+      const run = { op: 'review-pr', input: { repo, pr }, ...payload(kind === 'confirm' ? 'needs-human' : 'accept', old),
+        pending: kind === 'confirm' ? { kind: 'confirm' } : null, effects: [{ status }],
+        stepTimings: [{ step: 'read', startedAt: iso(acceptedAt - RUN_MTIME_SLACK_MS - 1) }] };
+      if (kind === 'abandoned') run.verdict = null;
+      const input = { repo, pr, head, runsDir: 'fixture-runs', list: () => ['review-pr-unknown'], read: () => run,
+        stat: () => ({ mtimeMs: acceptedAt - ABANDONED_REVIEW_AFTER_MS - 1 }), now: acceptedAt,
+        comments: [accept()], labels: ['review:accepted', 'red-team:pending'], reviews: [] };
+      expect(mod.ignorableConfirmRunIds(input)).toEqual({ ok: false, ids: [] });
+      expect(mod.headNeverReviewedFromRuns(input)).toBe(false);
+    });
+  it('hands the synchronizer freshly checked comments and no cached live state', () => {
+    const o = runFixture({ readEvidence: () => evidence({ status: { status: 'finished', result: { foldedVerdict: 'accept' } } }) });
+    o.rawPrs[0].comments.push(resultComment());
+    const comments = [...o.rawPrs[0].comments, trusted('🔔 conveyor — newly read status')];
+    o.readComments = vi.fn(() => comments);
+    mod.runRedTeamOnSkip(o);
+    expect(o.syncLabels).toHaveBeenCalledOnce();
+    expect(o.syncLabels.mock.calls[0][0].comments).toBe(comments);
+    expect(o.syncLabels.mock.calls[0][0]).not.toHaveProperty('live');
   });
-  it('result settlement hands the synchronizer the same strict-checked comments', () => {
-    const source = readFileSync(new URL('../review-red-team-on-skip.mjs', import.meta.url), 'utf8');
-    expect(source).toContain('evidence, provider, comments: live.comments })');
+});
+
+
+describe('result settlement requires a fresh recorded verdict', () => {
+  it.each([null, { status: 'finished', result: { comment: 'withheld' } },
+    { status: 'finished', result: { foldedVerdict: 'bogus' } },
+    { status: 'error', result: { foldedVerdict: 'accept' } }])('unknown recorded status %j never synchronizes', status => {
+    const o = runFixture({ readEvidence: () => evidence({ status }) });
+    o.rawPrs[0].comments.push(resultComment());
+    expect(mod.runRedTeamOnSkip(o).rows[0].settleError).toBe('no recorded red-team verdict; label unchanged');
+    expect(o.syncLabels).not.toHaveBeenCalled(); expect(o.settlePending).not.toHaveBeenCalled();
+  });
+  it.each([false, true])('a withheld changes result cannot clear pending (new confirmed break=%s)', confirmed => {
+    const status = { status: 'finished', result: { foldedVerdict: 'changes', comment: 'withheld' } };
+    const o = runFixture({ readEvidence: () => evidence({ status }) });
+    o.rawPrs[0].comments.push(resultComment());
+    if (confirmed) o.rawPrs[0].comments.push(trusted(resultComment(true).body, iso(acceptedAt + 1)));
+    const plans = [];
+    o.syncLabels.mockImplementation(input => plans.push(planRedTeamStatusLabels({ ...input,
+      labels: o.rawPrs[0].labels, standingRuling: null })));
+    mod.runRedTeamOnSkip(o);
+    expect(o.syncLabels).toHaveBeenCalledTimes(confirmed ? 1 : 0);
+    expect(plans).toEqual(confirmed ? [{ add: 'red-team:blocked', remove: ['red-team:pending'] }] : []);
   });
 });
