@@ -920,9 +920,9 @@ describe('runTickAllRepos — dispatch-time review-status tagging (#3383 follow-
     expect(out.statusTags).toEqual([]);
   });
 
-  it('tags every dispatched fix AND ci-heal PR this tick, right at dispatch — never waiting on the Review daemon\'s own tick', async () => {
-    const fixTick = vi.fn(({ repo }) => ({ dispatched: repo === 'repo-a' ? [{ pr: 1 }] : [], refusals: [] }));
-    const ciHealTick = vi.fn(async ({ repo }) => ({ dispatched: repo === 'repo-b' ? [{ pr: 2771 }] : [], refusals: [] }));
+  it('tags confirmed fix AND ci-heal launches this tick, right at dispatch — never waiting on the Review daemon\'s own tick', async () => {
+    const fixTick = vi.fn(({ repo }) => ({ dispatched: repo === 'repo-a' ? [{ pr: 1, agentId: 'bg-fix' }] : [], refusals: [] }));
+    const ciHealTick = vi.fn(async ({ repo }) => ({ dispatched: repo === 'repo-b' ? [{ pr: 2771, agentId: 'pid:2771' }] : [], refusals: [] }));
     const tagDispatchStatus = vi.fn(({ pr }) => ({ changed: true, label: `review-status:fixing`, removed: [], pr }));
     const out = await runTickAllRepos({
       repos: ['repo-a', 'repo-b'], fixTick, ciHealTick, hungCiTick: noopHungCiTick, mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
@@ -937,14 +937,14 @@ describe('runTickAllRepos — dispatch-time review-status tagging (#3383 follow-
   });
 
   it('a tag failure is cosmetic — reported in statusTags, never thrown, never drops the dispatch itself', async () => {
-    const fixTick = vi.fn(() => ({ dispatched: [{ pr: 7 }], refusals: [] }));
+    const fixTick = vi.fn(() => ({ dispatched: [{ pr: 7, sessionId: 'fix-session', agentId: 'bg-fix' }], refusals: [] }));
     const ciHealTick = vi.fn(async () => ({ dispatched: [], refusals: [] }));
     const tagDispatchStatus = vi.fn(() => { throw new Error('gh: rate limited'); });
     const out = await runTickAllRepos({
       repos: ['repo-a'], fixTick, ciHealTick, hungCiTick: noopHungCiTick, mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
       tagDispatchStatus,
     });
-    expect(out.dispatched).toEqual([{ pr: 7, repo: 'repo-a' }]); // the dispatch itself is unaffected
+    expect(out.dispatched).toEqual([{ pr: 7, sessionId: 'fix-session', agentId: 'bg-fix', repo: 'repo-a' }]); // the dispatch itself is unaffected
     expect(out.statusTags).toEqual([{ pr: 7, repo: 'repo-a', changed: false, error: 'gh: rate limited' }]);
   });
 
@@ -959,6 +959,69 @@ describe('runTickAllRepos — dispatch-time review-status tagging (#3383 follow-
     });
     expect(tagDispatchStatus).not.toHaveBeenCalled();
     expect(out.statusTags).toEqual([]);
+  });
+
+  const taggedTick = (fix, heal, tagDispatchStatus) => runTickAllRepos({
+    repos: ['repo-a'], fixTick: () => ({ dispatched: [], refusals: [], ...fix }),
+    ciHealTick: async () => ({ dispatched: [], refusals: [], ...heal }),
+    hungCiTick: noopHungCiTick, mainRedRebaseTick: noopMainRedRebaseTick,
+    missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
+    tagDispatchStatus,
+  });
+
+  it.each(['fix', 'ci-heal'])('%s refusal vetoes a launch from either half for the same PR', async half => {
+    for (const field of ['refusals', 'reconcileRefusalDetails']) {
+      const refused = { [field]: [{ [field === 'refusals' ? 'pr' : 'prNumber']: 6356, kind: 'no-findings' }] };
+      const launched = { dispatched: [{ pr: 6356, agentId: 'pid:6356' }] };
+      const tag = vi.fn();
+      const out = await taggedTick(half === 'fix' ? refused : launched, half === 'fix' ? launched : refused, tag);
+      expect(tag).not.toHaveBeenCalled();
+      expect(out.statusTags).toEqual([]);
+    }
+  });
+
+  it.each([
+    ['held', { sessionId: 'minted', held: true }],
+    ['failed', { agentId: 'pid:6355', ok: false }],
+    ['error', { sessionId: 'minted', error: 'spawn failed' }],
+    ['refused', { sessionId: 'minted', refused: 'no-findings' }],
+    ['failed flag', { agentId: 'pid:6355', failed: true }],
+    ['failed status', { agentId: 'pid:6355', status: 'failed' }],
+    ['refused outcome', { agentId: 'pid:6355', outcome: 'refused' }],
+    ['missing evidence', {}],
+    ['null handle', { agentId: null }],
+    ['slug only', { sessionSlug: 'ci-heal-6355' }],
+    ['failed claim', { claim: { ok: false } }],
+    ['minted sessionId only', { sessionId: 'minted', agentId: null }],
+    ['claim only', { claim: { ok: true } }],
+    ['unverified launch', { agentId: 'minted-uuid', launched: 'unverified' }],
+    ['refused sentinel handle', { agentId: 'refused:smoke-sentinel-1' }],
+    ['salvage', { kind: 'ci-heal-salvage', agentId: 'unused' }],
+  ])('never tags a %s launch row from either half', async (_name, row) => {
+    const dispatch = { dispatched: [{ pr: 6355, ...row }] };
+    const tag = vi.fn();
+    await taggedTick(dispatch, dispatch, tag);
+    expect(tag).not.toHaveBeenCalled();
+  });
+
+  it('tags a successful claim and scopes refusal vetoes to repo and PR', async () => {
+    const tag = vi.fn(() => ({ changed: true }));
+    await taggedTick({ dispatched: [{ pr: 1, agentId: 'bg-1' }],
+      refusals: [{ pr: 2, kind: 'no-findings' }, { pr: 1, kind: 'live-process' }] }, {}, tag);
+    expect(tag).toHaveBeenCalledTimes(1);
+    expect(tag).toHaveBeenCalledWith({ pr: 1, repo: 'repo-a' });
+    tag.mockClear();
+    await runTickAllRepos({
+      repos: ['repo-a', 'repo-b'],
+      fixTick: ({ repo }) => ({ dispatched: repo === 'repo-a' ? [{ pr: 1, agentId: 'bg-live' }] : [],
+        refusals: repo === 'repo-b' ? [{ pr: 1, kind: 'no-findings' }] : [] }),
+      ciHealTick: async () => ({ dispatched: [], refusals: [] }),
+      hungCiTick: noopHungCiTick, mainRedRebaseTick: noopMainRedRebaseTick,
+      missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
+      tagDispatchStatus: tag,
+    });
+    expect(tag).toHaveBeenCalledTimes(1);
+    expect(tag).toHaveBeenCalledWith({ pr: 1, repo: 'repo-a' });
   });
 
   it('defaultTagDispatchStatus calls the real applyReviewStatus with state "fixing"', () => {
@@ -1682,7 +1745,12 @@ describe('xn025gx glue — buildAwaitVerifyStep, buildFixThrottle, buildDaemonEx
     vi.stubEnv('WE_RESOURCE_CUTOVER', 'shadow'); // the legacy cap + gate decide here; the cut-over is tested below
     vi.stubEnv('WE_RESOURCE_SHADOW', 'off');
     const fix = { meta: { kind: 'fix', repo: 'we', pr: 1 } };
-    const base = { sendBackReservedSlots: 0, env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '1' }, sample: () => null, loadavg: () => 0, cpuCount: () => 8, alive: () => true };
+    // R559: admission refuses on an unreadable/stale memory reading, so inject a healthy host (never the machine's real one).
+    const hostNow = Date.parse('2026-11-04T12:00:00Z');
+    const healthy = { nowMs: () => hostNow, resolveFloor: () => ({ metric: 'available', floorMb: 2048, source: 'test' }),
+      readSnap: () => ({ sampledAt: new Date(hostNow - 5000).toISOString(), freshUntil: new Date(hostNow + 15000).toISOString(),
+        cpu: { idlePct: 40, loadAvg: [1] }, memory: { pressureLevel: 1, metric: 'available', availableMb: 8192 } }) };
+    const base = { ...healthy, sendBackReservedSlots: 0, env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '1' }, sample: () => null, loadavg: () => 0, cpuCount: () => 8, alive: () => true };
     const full = buildFixThrottle({ ...base, slotClaims: () => [fix] }).tryAdmit('fix');
     expect(full).toMatchObject({ admit: false, kind: 'fix-cap' });
     const parkedGaveItBack = buildFixThrottle({ ...base, slotClaims: () => [] }).tryAdmit('fix');
@@ -1701,9 +1769,10 @@ describe('xn025gx glue — buildAwaitVerifyStep, buildFixThrottle, buildDaemonEx
     const claims = Array.from({ length: 2 }, (_, i) => ({ meta: { kind: 'fix', repo: 'we', pr: i + 1 } }));
     const fixCap = { floor: 2, ceiling: 4, ceilingAboveFloor: 2, raiseQueueOver: 5, raiseMinCpuIdlePct: 30, raiseStepPerPass: 2 };
     const now = Date.parse('2026-10-10T15:00:00Z');
-    const readSnap = () => ({ sampledAt: new Date(now - 5000).toISOString(), freshUntil: new Date(now + 20000).toISOString(),
-      cpu: { idlePct: 45, loadAvg: [40] }, memory: { pressureLevel: 1 }, disk: { busyPct: 100 } });
+    const readSnap = () => ({ sampledAt: new Date(now - 5000).toISOString(), freshUntil: new Date(now + 15000).toISOString(),
+      cpu: { idlePct: 45, loadAvg: [40] }, memory: { pressureLevel: 1, metric: 'available', availableMb: 8192, freePct: 60, swapUsedPct: 10 }, disk: { busyPct: 100 } });
     const t = buildFixThrottle({ slotClaims: () => claims, alive: () => true, queueLength: () => 7, readSnap, nowMs: () => now,
+      resolveFloor: () => ({ metric: 'available', floorMb: 2048, source: 'test' }), readHeavyWait: () => 0,
       settings: { cutover: 'enforce', fixCap }, gate: () => ({ admit: true }), log: () => {}, env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '2' } });
     expect(t.tryAdmit('fix')).toMatchObject({ admit: true, aboveStaticCap: true });
     expect(t.capDecision()).toMatchObject({ cap: 4, raised: true });

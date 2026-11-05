@@ -3,9 +3,10 @@ bornAs: xetrmif
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:scripts/operations/review-extra-seats.mjs", "we:scripts/operations/__tests__/review-extra-seats.test.mjs"]
 dateOpened: "2026-10-16"
+dateResolved: "2026-11-04"
 tags: []
 ---
 
