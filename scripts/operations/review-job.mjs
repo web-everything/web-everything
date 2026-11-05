@@ -9,7 +9,7 @@ import { reviewUsesRequiredChecks } from '../lib/review-timing.mjs';
 import { speculativeSeatTimings } from '../lib/review-speculative-red-team.mjs';
 import { resolveFinalHeadSeats, decideFinalHeadSeats } from '../lib/review-final-head-seats.mjs';
 import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
-import { readRun, writeRun } from './run-store.mjs';
+import { readRun, writeRun, listRunIds, sharedRunsDir } from './run-store.mjs';
 import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.mjs';
 /**
  * @file scripts/operations/review-job.mjs
@@ -93,7 +93,7 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
 import { liveResultGateState, readRedTeamProbes, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
-import { planRedTeamRecovery, recoveryProbe as defaultRecoveryProbe, staleRunDeadlineMs, normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
+import { ignorableConfirmRunIds, planRedTeamRecovery, recoveryProbe as defaultRecoveryProbe, staleRunDeadlineMs, normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
 import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { createRedTeamCarryIo } from '../lib/red-team-carry-io.mjs';
@@ -459,7 +459,23 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       return { head };
     },
     readRedTeamOnlyPayload: ({ pr, repo, head }) => {
-      const w = readWitness({ pr, repo, head });
+      let w = readWitness({ pr, repo, head });
+      if (w?.ok === false && w.reason === 'review-unfinished') {
+        try {
+          const state = provider.readPrState(repo, pr);
+          if (state.headRefOid === head) {
+            const runsDir = env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(env);
+            const confirms = ignorableConfirmRunIds({ repo, pr, head, env, runsDir,
+              comments: readComments({ repo, pr }), labels: state.labels,
+              reviews: JSON.parse(exec('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'reviews'],
+                { cwd: root, env, timeout: 60_000, maxBuffer: 1024 * 1024 })).reviews });
+            if (confirms.ok && confirms.ids.length) {
+              w = readWitness({ pr, repo, head, runsDir,
+                list: dir => listRunIds(dir).filter(id => !confirms.ids.includes(id)) });
+            }
+          }
+        } catch { /* Retain the original unfinished witness on unreadable state. */ }
+      }
       if (w?.ok === false) throw Error(`red-team evidence ${w.reason}; hold and inspect run evidence`);
       if (w?.carryEvidence?.ok === false) throw Error(`red-team evidence ${w.carryEvidence.reason}; hold and inspect run evidence`);
       const legacy = w.carryEvidence;

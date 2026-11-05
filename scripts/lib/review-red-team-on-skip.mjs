@@ -1,14 +1,17 @@
 /** Recover an owed red-team result on an already-reviewed head through the existing review job. */
 import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
+import { isRunRecordTerminal, listRunIds, readRun, sharedRunsDir } from '../operations/run-store.mjs';
+import { createGhProvider } from './review-label-provider.mjs';
+import { isUnderTest } from './under-test.mjs';
 import { createHash } from 'node:crypto';
 import { hostname } from 'node:os';
 import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir, withRedTeamStatusClaim } from './drain-red-team-evidence.mjs';
+import { readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir, withRedTeamStatusClaim, RUN_MTIME_SLACK_MS, ABANDONED_REVIEW_AFTER_MS } from './drain-red-team-evidence.mjs';
 import { redTeamForHead, redTeamMarker, parseRedTeamComment } from './red-team-gate.mjs';
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
@@ -210,19 +213,119 @@ export function resolveReviewRedTeamOnSkip({ env = process.env, log, readFile = 
   });
 }
 
+// Complete scans deliberately do not use a newest-run shortcut: an unread row can
+// hide a review or an unfinished attempt. At the cap, retain the hold for inspection.
+const runsDirectory = env => env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(env);
+const strictListRuns = dir => { statSync(dir); return listRunIds(dir); };
+function* reviewRuns({ runsDir, list, read, stat }) {
+  const ids = list(runsDir).filter(id => id.startsWith('review-pr-'));
+  if (ids.length > 400) throw Error('run scan capped; inspect stored evidence');
+  for (const id of ids) {
+    const at = stat(join(runsDir, `${id}.json`)).mtimeMs;
+    if (!Number.isFinite(at)) throw Error('run metadata unreadable');
+    const run = read(id, runsDir);
+    const object = value => value != null && typeof value === 'object' && !Array.isArray(value);
+    if (!object(run) || typeof run.op !== 'string' || !run.op.trim()) throw Error('run identity unreadable');
+    // The filename is only a candidate selector. Missing identity must not classify
+    // a corrupt review as unrelated and turn an incomplete scan into a proof.
+    if (run.op === 'review-pr' && (!object(run.input)
+      || typeof run.input.repo !== 'string' || !run.input.repo.trim()
+      || !['string', 'number'].includes(typeof run.input.pr)
+      || !Number.isSafeInteger(Number(run.input.pr)) || Number(run.input.pr) <= 0
+      || !Array.isArray(run.effects)
+      || !(run.pending == null || object(run.pending))
+      || !(run.verdict === null || (object(run.verdict)
+        && typeof run.verdict.verdict === 'string' && run.verdict.verdict.trim())))) {
+      throw Error('review run identity or evidence unreadable');
+    }
+    yield { id, run, at };
+  }
+}
+
+/** Complete bounded proof; unknown state never establishes a never-reviewed head. */
+export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
+  runsDir = runsDirectory(env), list = strictListRuns, read = readRun, stat = statSync } = {}) {
+  try {
+    if (!isRealHead(head)) return false;
+    for (const { run } of reviewRuns({ runsDir, list, read, stat })) {
+      if (run.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr)) continue;
+      const rev = run.findings?.read?.netBasis?.rev;
+      if (!isRealHead(rev) || rev === head) return false;
+    }
+    return true;
+  } catch { return false; }
+}
+
+/** Ignore old confirm cursors only after a later, live acceptance supersedes them. */
+export function ignorableConfirmRunIds({ repo, pr, head, comments, labels, reviews, env = process.env,
+  runsDir = runsDirectory(env), list = strictListRuns, read = readRun, stat = statSync, now = Date.now() } = {}) {
+  const closed = { ok: false, ids: [] };
+  try {
+    if (!isRealHead(head) || !Array.isArray(comments) || !Array.isArray(reviews)
+      || !Array.isArray(labels) || !labels.some(l => (typeof l === 'string' ? l : l?.name) === 'review:accepted')) return closed;
+    const acceptance = latestAcceptRecord(comments, reviews);
+    const acceptedAt = Date.parse(acceptance?.at);
+    if (acceptance?.sha !== head || !Number.isFinite(acceptedAt)
+      || publishableClearGuard({ labels, acceptance, comments, reviews, settlesPending: true })) return closed;
+    const ids = [];
+    for (const { id, run, at } of reviewRuns({ runsDir, list, read, stat })) {
+      if (run.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr)) continue;
+      const terminal = isRunRecordTerminal(run);
+      if (terminal && (run.verdict || (run.resumeOf == null && now - at >= ABANDONED_REVIEW_AFTER_MS))) continue;
+      const start = Date.parse(run.stepTimings?.find(t => t?.step === 'read')?.startedAt);
+      const resumed = Date.parse(run.resumedAt);
+      if (run.verdict?.verdict !== 'needs-human' || run.pending?.kind !== 'confirm'
+        || !Array.isArray(run.effects) || run.effects.some(e => ['pending', 'in-flight'].includes(e?.status))
+        || !Number.isFinite(start) || start + RUN_MTIME_SLACK_MS >= acceptedAt
+        || (run.resumeOf != null && (!Number.isFinite(resumed) || resumed + RUN_MTIME_SLACK_MS >= acceptedAt))) return closed;
+      ids.push(id);
+    }
+    return { ok: true, ids };
+  } catch { return closed; }
+}
+
 /** PURE: readers are injected; each refusal produces one decision, including unreadable evidence. */
 export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, now,
-  setting, lastDispatch, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions }) {
+  setting, lastDispatch, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions, readIgnorableConfirms, headNeverReviewed }) {
   return refusals.filter(r => r?.kind === 'already-reviewed-head').map(refusal => {
     const pr = Number(refusal.prNumber);
     const rawPr = (rawPrs ?? []).find(p => Number(p?.number) === pr);
     const head = rawPr?.headRefOid ?? null;
     const row = { prNumber: pr, head, action: 'skip' };
     const skip = why => ({ ...row, why });
+    const guardedSkip = (why, context) => ({ ...skip(why),
+      ...(why === 'conflicting label prevents policy-clear'
+        ? publishableClearGuard({ ...context, settlesPending: true }) === null
+          ? { settle: 'pending-only-conflict' } : { escalate: true }
+        : {}) });
     const dispatchDecision = decision => {
       const last = lastDispatch.get(`${repo}#${pr}@${head}`);
       if (last != null && now - last < setting.retryCooldownMin * 60_000) return skip('retry cooldown active');
       return { ...row, ...decision };
+    };
+    const fullReview = why => {
+      const reviews = Array.isArray(rawPr.reviews) ? rawPr.reviews : null;
+      const accepted = Array.isArray(rawPr.labels) && rawPr.labels.some(l => (typeof l === 'string' ? l : l?.name) === 'review:accepted');
+      const acceptance = accepted ? latestAcceptRecord(rawPr.comments, reviews) : null;
+      const context = { labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews };
+      const refusal = publishableClearGuard(context);
+      if (refusal) return guardedSkip(refusal, context);
+      if (reviews === null) return skip('PR reviews unreadable; inspect formal reviews before full review');
+      if (laterReviewHold(reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
+      return dispatchDecision({ action: 'review', why });
+    };
+    const readWithConfirms = reader => {
+      const key = { repo, pr, head };
+      const first = reader(key);
+      if (first?.ok !== false || first.reason !== 'review-unfinished') return first;
+      try {
+        const ids = readIgnorableConfirms?.({ ...key, rawPr });
+        if (Array.isArray(ids) && ids.length) return reader({ ...key, ignoreRunIds: ids });
+      } catch { return first; }
+      try {
+        if (headNeverReviewed?.({ ...key, rawPr }) === true) return { neverReviewed: true };
+      } catch { /* Unknown scan retains review-unfinished. */ }
+      return first;
     };
     try {
       if (!setting.enabled) return skip('reviewRedTeamOnSkip.enabled=false');
@@ -230,9 +333,10 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       // Unknown comments cannot establish that no result was published.
       if (!Array.isArray(rawPr.comments)) return skip('PR comments unreadable');
       const journal = readCarry({ repo, pr, head });
-      if (redTeamForHead(rawPr.comments, pr, head) && (!journal || journal.step === 'done')) return skip('red-team result already on head');
+      if (redTeamForHead(rawPr.comments, pr, head) && (!journal || journal.step === 'done')) return { ...skip('red-team result already on head'), settle: 'result' };
       if (readWitness) {
-        const w = readWitness({ repo, pr, head });
+        const w = readWithConfirms(readWitness);
+        if (w?.neverReviewed) return fullReview('head never reviewed; full review required');
         if (w?.ok === false) return skip(w.reason);
         if (['queued', 'running'].includes(w.rawWriter.parsed?.status) || w.rawWriter.parsed?.staleAbandoned) {
           const recovery = planRedTeamRecovery(w, recoveryOptions);
@@ -240,11 +344,12 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
             : dispatchDecision({ action: 'dispatch', mode: recovery.mode, staleRecovery: true, why: 'dead owner recovery' });
         }
       }
-      const evidence = readEvidence({ repo, pr, head });
+      const evidence = readWithConfirms(readEvidence);
+      if (evidence?.neverReviewed) return fullReview('head never reviewed; full review required');
       if (evidence?.ok === false) return skip(evidence.reason);
       if (evidence?.carryConflict) return skip('later review supersedes the carry');
       const unfinishedCarry = evidence?.carry && evidence.carry.step !== 'done';
-      if (redTeamForHead(rawPr.comments, pr, head) && !unfinishedCarry) return skip('red-team result already on head');
+      if (redTeamForHead(rawPr.comments, pr, head) && !unfinishedCarry) return { ...skip('red-team result already on head'), settle: 'result' };
       const accepted = Array.isArray(rawPr.labels) && rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:accepted');
       if (evidence?.inFlight || evidence?.queued) return skip('red-team pass in flight');
       const reviews = Array.isArray(rawPr.reviews) ? rawPr.reviews : null;
@@ -274,8 +379,9 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           && latestResult === comment && result && result.findings.length === 0
           && comment.body.split(/\r?\n/).filter(line => line.trim()).length === 2
           && /^Red team not required on this head: [^\r\n]+$/m.test(comment.body)) {
-          const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews });
-          if (refusal) return skip(refusal);
+          const context = { labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews };
+          const refusal = publishableClearGuard(context);
+          if (refusal) return guardedSkip(refusal, context);
           return { ...row, action: 'carry', from: source.sha, why: 'prior policy-clear across acceptance re-stamp' };
         }
       }
@@ -284,6 +390,10 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       const status = unfinishedCarry ? evidence.status : readStatus({ repo, pr, head });
       const pendingCardOnly = cardOnlySkipSettlementCandidate({ ...evidence, status }, head);
       const owed = redTeamOwedFor(evidence?.loopPayload);
+      const notOwed = () => ({ ...skip('stored review does not owe a red team'),
+        ...(!owed && evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
+          && evidence.inFlight === false && !evidence.queued
+          && evidence.recorded === false && evidence.seatRecorded === false ? { settle: 'not-owed' } : {}) });
       // A missing live-head review requires the full loop; stale reads cannot authorize a red-team-only pass.
       const storedHead = evidence?.loopPayload?.findings?.read?.netBasis?.rev;
       const needsReview = !movedCardOnly && !pendingCardOnly && !unfinishedCarry && accepted
@@ -294,8 +404,9 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         && (evidence.status == null || (isRealHead(evidence.status.head) && evidence.status.head !== head))
         && readStatus({ repo, pr, head }) == null;
       if (needsReview) {
-        const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews });
-        if (refusal) return skip(refusal);
+        const context = { labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews };
+        const refusal = publishableClearGuard(context);
+        if (refusal) return guardedSkip(refusal, context);
         // Formal holds apply even without an acceptance comment. No timestamp
         // floor: a missing acceptance cannot establish that a review was cleared.
         if (reviews === null) return skip('PR reviews unreadable; inspect formal reviews before full review');
@@ -322,12 +433,13 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
             || [evidence.status, status].every(candidate => candidate?.status === 'finished'
               && normalizeRedTeamResult(candidate.result).priorResult === 'not-owed'))
           && evidence.recorded !== true && evidence.seatRecorded !== true) {
-          if (acceptance?.sha !== head) return skip('stored review does not owe a red team');
-          const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews, settlesPending: true });
-          if (refusal) return skip(refusal);
+          if (acceptance?.sha !== head) return notOwed();
+          const context = { labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews, settlesPending: true };
+          const refusal = publishableClearGuard(context);
+          if (refusal) return guardedSkip(refusal, context);
           return { ...row, action: 'clear', why: 'not owed (stored review)' };
         }
-        if (!owed) return skip('stored review does not owe a red team');
+        if (!owed) return notOwed();
       }
       if (!movedCardOnly && evidence.loopPayload?.findings?.read?.netBasis?.rev !== head) return skip('stored review does not match live head');
       if (evidence.inFlight || evidence.queued) return skip('red-team pass in flight');
@@ -366,14 +478,34 @@ const safeLine = value => String(value).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, 
  * host start on success or an unknown outcome. Both are optional for standalone callers.
  */
 export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log = () => {}, dryRun = false,
-  env = process.env, setting, readEvidence = readDrainRedTeamEvidence, readStatus = readRedTeamStatus,
+  env = process.env, setting,
+  readEvidence = readDrainRedTeamEvidence, readStatus = readRedTeamStatus,
   readCarry = key => readRedTeamCarry({ ...key, env }),
   readReviews = ({ repo, pr }) => JSON.parse(runGhSync([
     'pr', 'view', String(pr), '--repo', repo, '--json', 'reviews',
   ], { env, encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 })).reviews,
   exec = execFileSync, cwd = process.cwd(), mainRef = 'origin/main',
   proveMove = move => proveCardOnlyHeadMove({ ...move, exec, cwd, mainRef }),
-  readWitness = readEvidence === readDrainRedTeamEvidence && readStatus === readRedTeamStatus ? key => readRecoveryWitness({ ...key, env }) : null,
+  readWitness = readEvidence === readDrainRedTeamEvidence && readStatus === readRedTeamStatus ? ({ ignoreRunIds = [], ...key }) => readRecoveryWitness({ ...key, env,
+    runsDir: runsDirectory(env), list: dir => strictListRuns(dir).filter(id => !ignoreRunIds.includes(id)) }) : null,
+  readIgnorableConfirms = ({ rawPr, ...key }) => {
+    const result = ignorableConfirmRunIds({ ...key, env, comments: rawPr.comments, labels: rawPr.labels, reviews: rawPr.reviews });
+    return result.ok ? result.ids : [];
+  },
+  headNeverReviewed = key => headNeverReviewedFromRuns({ ...key, env }),
+  settlePending = ({ repo, pr, remove }) => {
+    if (isUnderTest() || isUnderTest(env)) return;
+    return createGhProvider({ exec: (args, options) => runGhSync(args,
+      { ...options, env, encoding: 'utf8', timeout: 60_000 }) }).setLabels(repo, pr, { remove });
+  },
+  escalate = ({ repo, pr, head, why }) => {
+    if (isUnderTest() || isUnderTest(env)) return;
+    let error;
+    const result = settleRedTeamSkip({ repo, pr, head, redTeam: { status: 'skipped', reason: why },
+      io: { env, publishNeedsYou: publishAttention, log: message => { error = safeErrorText(message); } } });
+    if (error) throw Error(error);
+    return result;
+  },
   abandon = key => abandonStaleRedTeamRun({ ...key, env }),
   now = Date.now, lastDispatch: history = lastDispatch, preferLane, settle = settleRedTeamSkip, syncLabels = syncRedTeamStatusLabels } = {}) {
   const rows = [], dispatched = [], notStarted = [];
@@ -400,11 +532,37 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       } catch { /* Unknown reviews must keep policy-clear closed. */ }
       return { ...rawPr, reviews };
     });
-    rows.push(...planRedTeamOnSkip({ repo, refusals, rawPrs: planningPrs, readEvidence, readStatus,
+    rows.push(...planRedTeamOnSkip({ repo, refusals, rawPrs: planningPrs,
+      readEvidence: readEvidence === readDrainRedTeamEvidence ? ({ ignoreRunIds = [], ...key }) => readEvidence({ ...key, env,
+        runsDir: runsDirectory(env), list: dir => strictListRuns(dir).filter(id => !ignoreRunIds.includes(id)) }) : readEvidence,
+      readStatus: readStatus === readRedTeamStatus ? key => readStatus({ ...key, env }) : readStatus,
       now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, readWitness,
+      readIgnorableConfirms, headNeverReviewed,
       recoveryOptions: { now: at, probe: recoveryProbe(), deadlineMs: staleRunDeadlineMs(env) } }));
     for (const row of rows) {
       let started = false;
+      if (!dryRun && row.action === 'skip') {
+        try {
+          const key = { repo, pr: row.prNumber, head: row.head };
+          if (row.escalate) {
+            const result = escalate({ ...key, why: row.why });
+            if (result?.error || result?.outcome === 'error') {
+              row.settleError = safeErrorText(result.error ?? result.reason ?? 'unknown error');
+            }
+          } else if (row.settle === 'result') {
+            const rawPr = planningPrs.find(p => Number(p?.number) === row.prNumber);
+            if (rawPr?.labels?.some(l => (typeof l === 'string' ? l : l?.name) === 'red-team:pending')) {
+              syncLabels({ ...key, env, log: note });
+            }
+          }
+          else if (['not-owed', 'pending-only-conflict'].includes(row.settle)) {
+            const rawPr = planningPrs.find(p => Number(p?.number) === row.prNumber);
+            if (Array.isArray(rawPr?.labels) && !rawPr.labels.some(l => (typeof l === 'string' ? l : l?.name) === 'red-team:blocked')) {
+              settlePending({ ...key, remove: ['red-team:pending'] });
+            }
+          }
+        } catch (error) { row.settleError = safeErrorText(error); }
+      }
       if (row.action === 'carry') {
         if (dryRun) row.why = 'dry run (carry)';
         else {
