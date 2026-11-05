@@ -962,6 +962,50 @@ describe('catch-up during a daemon refresh (last-good enqueue)', () => {
       expect(resolveSetting({ catchUp: { refreshPause: { paths: [path] } } }).catchUp.refreshPause.paths.length).toBe(3);
     }
   });
+
+  // A nested object in a leaf slot used to be flattened by the cascade and validated against the TOP-LEVEL key's
+  // validator, so `{prefixes:[…]}` passed as `paths` (then `.paths.join` threw and enqueue switched off).
+  const DEFAULT_PAUSE_PATHS = ['scripts/lib/drain-queue-safety', 'scripts/merge-ai-prs', 'scripts/lib/enqueue-on-event'];
+  it('a nested object in a refreshPause leaf is invalid: never throws, keeps the lower layer, names the leaf', () => {
+    const paths = resolveSetting({ enabled: true, catchUp: { enabled: true, refreshPause: { paths: { prefixes: ['scripts/custom'] } } } },
+      { platform: { catchUp: { refreshPause: { paths: ['scripts/plat'] } } } });
+    expect(paths.enabled).toBe(true);
+    expect(paths.catchUp.refreshPause.paths).toEqual(['scripts/plat']);
+    expect(paths.sources['catchUp.refreshPause.paths']).toBe('platform');
+    expect(paths.invalid).toContain('tool.catchUp.refreshPause.paths={"prefixes":["scripts/custom"]}');
+    expect(paths.line).toContain('catchUp.refreshPause.paths=scripts/plat (platform)');
+    const max = resolveSetting({ catchUp: { refreshPause: { maxPauseMinutes: { minutes: 3 } } } });
+    expect(max.catchUp.refreshPause.maxPauseMinutes).toBe(10);
+    expect(max.invalid).toContain('tool.catchUp.refreshPause.maxPauseMinutes={"minutes":3}');
+    const platformBad = resolveSetting({}, { platform: { catchUp: { refreshPause: { paths: { x: ['scripts/p'] }, maxPauseMinutes: { m: 2 } } } } });
+    expect(platformBad.catchUp.refreshPause).toEqual({ paths: DEFAULT_PAUSE_PATHS, maxPauseMinutes: 10 });
+    expect(platformBad.invalid).toEqual(expect.arrayContaining(['platform.catchUp.refreshPause.paths={"x":["scripts/p"]}', 'platform.catchUp.refreshPause.maxPauseMinutes={"m":2}']));
+    for (const shape of ['x', ['a'], 5, null]) {
+      const s = resolveSetting({ catchUp: { refreshPause: shape } });
+      expect(s.catchUp.refreshPause).toEqual({ paths: DEFAULT_PAUSE_PATHS, maxPauseMinutes: 10 });
+    }
+  });
+
+  it('a valid refreshPause is not reported as ignored-invalid', () => {
+    const s = resolveSetting({ catchUp: { refreshPause: { paths: ['scripts/custom'], maxPauseMinutes: 3 } } });
+    expect(s.catchUp.refreshPause).toEqual({ paths: ['scripts/custom'], maxPauseMinutes: 3 });
+    expect(s.invalid).toEqual([]);
+  });
+
+  it('the same nested-object shape in the sibling and scalar leaves falls to the lower layer', () => {
+    const ttl = resolveSetting({ catchUp: { missBackoff: { ttlMinutes: { x: 5 } } } }, { platform: { catchUp: { missBackoff: { ttlMinutes: 45 } } } });
+    expect(ttl.catchUp.missBackoff.ttlMinutes).toBe(45);
+    expect(ttl.invalid).toContain('tool.catchUp.missBackoff.ttlMinutes={"x":5}');
+    const scalar = resolveSetting({ enabled: true, debounceSeconds: { a: 5 } }, { platform: { debounceSeconds: 20 } });
+    expect(scalar).toMatchObject({ enabled: true, debounceSeconds: 20, sources: { debounceSeconds: 'platform' } });
+    expect(scalar.invalid).toContain('tool.debounceSeconds={"a":5}');
+    const enabled = resolveSetting({ enabled: { x: true } }, { platform: { enabled: true } });
+    expect(enabled.enabled).toBe(true);
+    expect(enabled.invalid).toContain('tool.enabled={"x":true}');
+    const catchUp = resolveSetting({ catchUp: { intervalMinutes: { m: 5 }, enabled: true } }, { platform: { catchUp: { intervalMinutes: 20 } } });
+    expect(catchUp.catchUp).toMatchObject({ intervalMinutes: 20, enabled: true });
+    expect(resolveSetting({ catchUp: 'x' }).invalid).toContain('catchUp="x"');
+  });
 });
 
 describe('catch-up handle', () => {

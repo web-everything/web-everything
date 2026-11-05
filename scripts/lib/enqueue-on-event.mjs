@@ -139,6 +139,40 @@ const VALID = {
   timeoutSeconds: (v) => Number.isInteger(v) && v >= 60 && v <= 3600,
 };
 
+const showValue = (v) => { try { return JSON.stringify(v) ?? String(v); } catch { return String(v); } };
+
+/**
+ * Keep only the declared leaves of one settings layer whose value is valid AS A WHOLE, and name the rest in `invalid`.
+ * The cascade flattens a nested object into leaves and checks each against its TOP-LEVEL key's validator, so
+ * `{ paths: { prefixes: [...] } }` passed as `paths` and `{ maxPauseMinutes: { minutes: 3 } }` as `3`: a malformed shape
+ * reached the resolved value (and `.paths.join` threw, switching enqueue off). Cleaning the layer first makes an
+ * invalid shape fall to the lower layer like any other invalid leaf. `at` is the dotted prefix, `''` for the block root.
+ * @returns {Record<string,unknown>|undefined} undefined when the layer is not an object
+ */
+function validLeaves(layer, validators, { name, at, invalid }) {
+  if (layer === undefined) return undefined;
+  const label = (rest) => `${name ? `${name}.` : ''}${rest}`;
+  if (!isObj(layer)) { if (at) invalid.push(`${label(at)}=${showValue(layer)}`); return undefined; }
+  const out = {};
+  for (const [key, valid] of Object.entries(validators)) {
+    if (layer[key] === undefined) continue;
+    if (valid(layer[key])) out[key] = layer[key];
+    else invalid.push(`${label(`${at ? `${at}.` : ''}${key}`)}=${showValue(layer[key])}`);
+  }
+  return out;
+}
+
+/** Whole-value clean of one tool/platform layer: scalar leaves, `catchUp` scalar leaves (nested policies are cleaned apart). */
+function cleanLayer(layer, name, invalid) {
+  if (!isObj(layer)) return undefined;
+  const scalar = (obj, validators, at) => validLeaves(obj, validators, { name, at, invalid });
+  const out = scalar(layer, Object.fromEntries(['enabled', 'debounceSeconds', 'debounceMaxWaitMs', 'timeoutSeconds'].map((k) => [k, VALID[k]])), '');
+  // catchUp leaves keep their established bare `catchUp.<leaf>=` invalid label (pinned by the per-leaf fallback tests).
+  const catchUp = validLeaves(layer.catchUp, Object.fromEntries(Object.entries(CATCH_UP_VALID).filter(([k]) => !k.includes('.'))), { name: '', at: 'catchUp', invalid });
+  if (catchUp) out.catchUp = catchUp;
+  return out;
+}
+
 /**
  * Resolve the setting. Never throws. `tool` defaults to the declared settings' `mergeQueue.enqueueOnEvent` block.
  * @returns {{enabled:boolean, debounceSeconds:number, debounceMaxWaitMs:number, timeoutSeconds:number, catchUp:{enabled:boolean, intervalMinutes:number, pendingExpiryMinutes:number, concurrency:number, busyIntervalSeconds:number, maxQueued:number, missSmellAfter:number, blockedBackoffRounds:number, timeoutBackoffRounds:number, missBackoff:{enabled:boolean, ttlMinutes:number}, order:string}, sources:Record<string,string>, invalid:string[], line:string}}
@@ -150,9 +184,10 @@ export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform
   }
   const raw = String(env?.[ENQUEUE_ON_EVENT_ENV] ?? '').trim().toLowerCase();
   const envEnabled = raw === 'on' || raw === '1' || raw === 'true' ? true : raw === 'off' || raw === '0' || raw === 'false' ? false : undefined;
-  const c = cascadePolicy(ENQUEUE_ON_EVENT_POLICY, isObj(block) ? block : undefined, {
+  const layerInvalid = [];
+  const c = cascadePolicy(ENQUEUE_ON_EVENT_POLICY, cleanLayer(block, 'tool', layerInvalid), {
     env, standard: { ...ENQUEUE_ON_EVENT_DEFAULTS }, envValues: { enabled: envEnabled }, valid: VALID,
-    ...(platform !== undefined ? { platform } : {}), log: () => {},
+    ...(platform !== undefined ? { platform: cleanLayer(platform, 'platform', layerInvalid) } : {}), log: () => {},
   });
   const v = isObj(c.value) ? c.value : {};
   const out = {
@@ -162,7 +197,7 @@ export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform
     timeoutSeconds: VALID.timeoutSeconds(v.timeoutSeconds) ? v.timeoutSeconds : ENQUEUE_ON_EVENT_DEFAULTS.timeoutSeconds,
     catchUp: {},
     sources: { ...(c.sources || {}) },
-    invalid: [...(c.invalid || []), ...(raw && envEnabled === undefined ? [`env ${ENQUEUE_ON_EVENT_ENV}=${JSON.stringify(raw)}`] : [])],
+    invalid: [...(c.invalid || []), ...layerInvalid, ...(raw && envEnabled === undefined ? [`env ${ENQUEUE_ON_EVENT_ENV}=${JSON.stringify(raw)}`] : [])],
   };
   for (const leaf of Object.keys(CATCH_UP_VALID)) {
     if (leaf.startsWith('missBackoff.')) continue; // resolved as a nested policy below
@@ -177,30 +212,23 @@ export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform
   }
   // Resolve the new nested policy with leaf-specific validation: an invalid tool TTL must
   // retain a valid platform TTL, rather than the catchUp union accepting it as another leaf.
-  const miss = cascadePolicy(`${ENQUEUE_ON_EVENT_POLICY}.catchUp.missBackoff`, isObj(block?.catchUp?.missBackoff) ? block.catchUp.missBackoff : undefined, {
-    env, standard: ENQUEUE_ON_EVENT_DEFAULTS.catchUp.missBackoff,
-    valid: { enabled: CATCH_UP_VALID['missBackoff.enabled'], ttlMinutes: CATCH_UP_VALID['missBackoff.ttlMinutes'] },
-    ...(platform !== undefined ? { platform: platform?.catchUp?.missBackoff } : {}), log: () => {},
+  const missValid = { enabled: CATCH_UP_VALID['missBackoff.enabled'], ttlMinutes: CATCH_UP_VALID['missBackoff.ttlMinutes'] };
+  const miss = cascadePolicy(`${ENQUEUE_ON_EVENT_POLICY}.catchUp.missBackoff`, validLeaves(block?.catchUp?.missBackoff, missValid, { name: 'tool', at: 'catchUp.missBackoff', invalid: out.invalid }), {
+    env, standard: ENQUEUE_ON_EVENT_DEFAULTS.catchUp.missBackoff, valid: missValid,
+    ...(platform !== undefined ? { platform: validLeaves(platform?.catchUp?.missBackoff, missValid, { name: 'platform', at: 'catchUp.missBackoff', invalid: out.invalid }) } : {}), log: () => {},
   });
   out.catchUp.missBackoff = miss.value;
   for (const [key, source] of Object.entries(miss.sources)) out.sources[`catchUp.missBackoff.${key}`] = source;
-  for (const invalid of miss.invalid) out.invalid.push(invalid.replace(/^(tool|platform)\./, '$1.catchUp.missBackoff.'));
   const pauseValid = {
     paths: (x) => Array.isArray(x) && x.length > 0 && x.every((p) => typeof p === 'string' && p === p.trim() && p !== '' && p.split('/').every((seg, i, all) => seg !== '.' && seg !== '..' && (seg !== '' || i === all.length - 1)) && !p.startsWith('/')),
     maxPauseMinutes: (x) => Number.isFinite(x) && x > 0 && x <= 1440,
   };
-  const pause = cascadePolicy(`${ENQUEUE_ON_EVENT_POLICY}.catchUp.refreshPause`, isObj(block?.catchUp?.refreshPause) ? block.catchUp.refreshPause : undefined, {
+  const pause = cascadePolicy(`${ENQUEUE_ON_EVENT_POLICY}.catchUp.refreshPause`, validLeaves(block?.catchUp?.refreshPause, pauseValid, { name: 'tool', at: 'catchUp.refreshPause', invalid: out.invalid }), {
     env, standard: { paths: [...REFRESH_PAUSE_PATHS], maxPauseMinutes: ENQUEUE_ON_EVENT_DEFAULTS.catchUp.refreshPause.maxPauseMinutes }, valid: pauseValid,
-    ...(platform !== undefined ? { platform: platform?.catchUp?.refreshPause } : {}), log: () => {},
+    ...(platform !== undefined ? { platform: validLeaves(platform?.catchUp?.refreshPause, pauseValid, { name: 'platform', at: 'catchUp.refreshPause', invalid: out.invalid }) } : {}), log: () => {},
   });
   out.catchUp.refreshPause = pause.value;
   for (const [key, source] of Object.entries(pause.sources)) out.sources[`catchUp.refreshPause.${key}`] = source;
-  for (const invalid of pause.invalid) out.invalid.push(invalid.replace(/^(tool|platform)\./, '$1.catchUp.refreshPause.'));
-  // The cascade rejects values outside the union before the per-leaf type check can see them.
-  for (const invalid of c.invalid || []) {
-    const match = /^(?:tool|platform)\.(catchUp\.(?:enabled|intervalMinutes|pendingExpiryMinutes|concurrency|busyIntervalSeconds|maxQueued|missSmellAfter|blockedBackoffRounds|timeoutBackoffRounds|missBackoff\.(?:enabled|ttlMinutes)|refreshPause\.(?:paths|maxPauseMinutes)|order)=.*)$/.exec(invalid);
-    if (match && !out.invalid.includes(match[1])) out.invalid.push(match[1]);
-  }
   const src = (k) => out.sources[k] || 'standard';
   out.line = `enqueue-on-event: setting ${ENQUEUE_ON_EVENT_POLICY} enabled=${out.enabled} (${src('enabled')}), debounceSeconds=${out.debounceSeconds} (${src('debounceSeconds')}), debounceMaxWaitMs=${out.debounceMaxWaitMs} (${src('debounceMaxWaitMs')}), timeoutSeconds=${out.timeoutSeconds} (${src('timeoutSeconds')}), catchUp.enabled=${out.catchUp.enabled} (${src('catchUp.enabled')}), catchUp.intervalMinutes=${out.catchUp.intervalMinutes} (${src('catchUp.intervalMinutes')}), catchUp.pendingExpiryMinutes=${out.catchUp.pendingExpiryMinutes} (${src('catchUp.pendingExpiryMinutes')}), catchUp.concurrency=${out.catchUp.concurrency} (${src('catchUp.concurrency')}), catchUp.busyIntervalSeconds=${out.catchUp.busyIntervalSeconds} (${src('catchUp.busyIntervalSeconds')}), catchUp.maxQueued=${out.catchUp.maxQueued} (${src('catchUp.maxQueued')}), catchUp.missSmellAfter=${out.catchUp.missSmellAfter} (${src('catchUp.missSmellAfter')}), catchUp.blockedBackoffRounds=${out.catchUp.blockedBackoffRounds} (${src('catchUp.blockedBackoffRounds')}), catchUp.timeoutBackoffRounds=${out.catchUp.timeoutBackoffRounds} (${src('catchUp.timeoutBackoffRounds')}), catchUp.missBackoff.enabled=${out.catchUp.missBackoff.enabled} (${src('catchUp.missBackoff.enabled')}), catchUp.missBackoff.ttlMinutes=${out.catchUp.missBackoff.ttlMinutes} (${src('catchUp.missBackoff.ttlMinutes')}), catchUp.refreshPause.paths=${out.catchUp.refreshPause.paths.join(',')} (${src('catchUp.refreshPause.paths')}), catchUp.refreshPause.maxPauseMinutes=${out.catchUp.refreshPause.maxPauseMinutes} (${src('catchUp.refreshPause.maxPauseMinutes')}), catchUp.order=${out.catchUp.order} (${src('catchUp.order')})${out.invalid.length ? ` · ignored invalid: ${out.invalid.join('; ')}` : ''}`;
   return out;
