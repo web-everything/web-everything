@@ -109,14 +109,14 @@ describe('planner settlement annotations', () => {
   });
 });
 
-describe('pending-only conflict settles before the next recovery tick', () => {
+describe('pending conflicts retain the merge hold', () => {
   const pathFixture = path => path === 'carry' ? carryFixture()
     : fixture({ readEvidence: () => evidence({ loopPayload: undefined }) });
-  it.each(['needsReview', 'carry'])('%s skips until lone pending is removed', path => {
+  it.each(['needsReview', 'carry'])('%s escalates lone pending without settling it', path => {
     const f = pathFixture(path);
-    expect(decide(f)).toMatchObject({ action: 'skip', why: 'conflicting label prevents policy-clear', settle: 'pending-only-conflict' });
-    f.rawPrs[0].labels = ['review:accepted'];
-    expect(decide(f)).toMatchObject({ action: path === 'carry' ? 'carry' : 'review' });
+    expect(decide(f)).toMatchObject({ action: 'skip', why: 'conflicting label prevents policy-clear', escalate: true });
+    expect(decide(f)).not.toHaveProperty('settle');
+    expect(f.rawPrs[0].labels).toContain('red-team:pending');
   });
   it.each(['needsReview', 'carry'].flatMap(path => ['red-team:blocked', 'review:changes'].map(label => [path, label])))(
     '%s escalates the real conflict %s', (path, label) => {
@@ -159,19 +159,20 @@ describe.each(['readWitness', 'readEvidence'])('never-reviewed head recovery thr
     f[reader] = vi.fn(() => ({ ok: false, reason: 'review-unfinished' }));
     return f;
   }
-  it.each(['accepted', 'unaccepted'])('%s never-reviewed head skips to settle lone pending before a full review', acceptance => {
+  it.each(['accepted', 'unaccepted'])('%s never-reviewed head escalates lone pending before a full review', acceptance => {
     const f = neverReviewedFixture();
     if (acceptance === 'unaccepted') {
       f.rawPrs[0].labels = ['red-team:pending']; f.rawPrs[0].comments = [];
     }
     const row = decide(f);
-    expect(row).toMatchObject({ action: 'skip', head, why: 'conflicting label prevents policy-clear', settle: 'pending-only-conflict' });
-    f.rawPrs[0].labels = f.rawPrs[0].labels.filter(l => l !== 'red-team:pending');
+    expect(row).toMatchObject({ action: 'skip', head, why: 'conflicting label prevents policy-clear', escalate: true });
+    expect(row).not.toHaveProperty('settle');
+    expect(f.rawPrs[0].labels).toContain('red-team:pending');
     expect(f.headNeverReviewed).toHaveBeenCalledOnce();
     expect(f.headNeverReviewed).toHaveBeenCalledWith({ repo, pr, head, rawPr: f.rawPrs[0] });
     expect(f.readIgnorableConfirms).toHaveBeenCalledOnce();
     expect(f[reader]).toHaveBeenCalledOnce();
-    expect(decide(f)).toMatchObject({ action: 'review', head, why: 'head never reviewed; full review required' });
+    expect(decide(f)).toMatchObject({ action: 'skip', head, escalate: true, why: 'conflicting label prevents policy-clear' });
   });
   it.each([
     ['blocked label', f => { f.rawPrs[0].labels.push('red-team:blocked'); }, /conflicting label prevents policy-clear/],
@@ -373,7 +374,7 @@ describe('ignorableConfirmRunIds chronology and closed scan', () => {
   });
 });
 
-describe('pending removal requires a review that can start', () => {
+describe('review recovery never removes pending', () => {
   it.each(['missing evidence', 'unreadable evidence', 'cooldown', 'formal hold', 'unreadable reviews'])(
     'retains pending for %s', kind => {
       const o = runFixture({ readEvidence: () => evidence({ loopPayload: undefined }) });
@@ -425,37 +426,29 @@ describe('head-bound default pending settlement', () => {
     try { settle({ repo, pr, head }); } catch { /* Unreadable labels may throw, but never write. */ }
     expect(provider.setLabels).not.toHaveBeenCalled();
   });
-  it.each(['not-owed', 'pending-only-conflict'])('unreadable live state reports settleError for %s', kind => {
+  it('unreadable live state reports settleError for not-owed', () => {
     const { provider, settle } = setup();
     provider.readPrState.mockImplementation(() => { throw Error('live state unreadable'); });
-    const o = runFixture({ settlePending: settle,
-      ...(kind === 'pending-only-conflict' ? { readEvidence: () => evidence({ loopPayload: undefined }) } : {}) });
-    expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ settle: kind, settleError: 'live state unreadable' });
+    const o = runFixture({ settlePending: settle });
+    expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ settle: 'not-owed', settleError: 'live state unreadable' });
     expect(provider.setLabels).not.toHaveBeenCalled(); expect(o.dispatch).not.toHaveBeenCalled();
   });
 });
 
 describe('runner settles pending without dispatch', () => {
-  it.each(['carry', 'needsReview'])('%s removes only a pending-only conflict and proceeds on the next tick', path => {
+  it.each(['carry', 'needsReview'])('%s escalates lone pending and keeps the merge hold across ticks', path => {
     const f = path === 'carry' ? carryFixture() : fixture({ readEvidence: () => evidence({ loopPayload: undefined }) });
     const o = runFixture({ ...f, now: () => f.now });
-    o.settlePending.mockImplementation(() => { f.rawPrs[0].labels = ['review:accepted']; });
-    expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip',
-      why: 'conflicting label prevents policy-clear', settle: 'pending-only-conflict' });
-    expect(o.settlePending).toHaveBeenCalledOnce();
-    expect(o.settlePending).toHaveBeenCalledWith({ repo, pr, head, remove: ['red-team:pending'] });
-    expect(o.dispatch).not.toHaveBeenCalled(); expect(o.settle).not.toHaveBeenCalled();
-    expect(o.escalate).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled();
-    expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 } });
-    expect(decide(f).action).toBe(path === 'carry' ? 'carry' : 'review');
-  });
-  it('pending-only settlement failure preserves why and retains the guard for the next tick', () => {
-    const o = runFixture({ readEvidence: () => evidence({ loopPayload: undefined }) });
-    o.settlePending.mockImplementation(() => { throw Error('labels offline'); });
-    expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip',
-      why: 'conflicting label prevents policy-clear', settle: 'pending-only-conflict', settleError: 'labels offline' });
-    expect(o.rawPrs[0].labels).toContain('red-team:pending');
-    expect(o.dispatch).not.toHaveBeenCalled(); expect(o.escalate).not.toHaveBeenCalled();
+    for (let tick = 0; tick < 2; tick++) {
+      const row = mod.runRedTeamOnSkip(o).rows[0];
+      expect(row).toMatchObject({ action: 'skip', escalate: true, why: 'conflicting label prevents policy-clear' });
+      expect(row).not.toHaveProperty('settle');
+      expect(o.rawPrs[0].labels).toContain('red-team:pending');
+    }
+    expect(o.escalate).toHaveBeenCalledTimes(2);
+    expect(o.escalate).toHaveBeenCalledWith({ repo, pr, head, why: 'conflicting label prevents policy-clear' });
+    expect(o.settlePending).not.toHaveBeenCalled(); expect(o.dispatch).not.toHaveBeenCalled();
+    expect(o.settle).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled();
   });
   it('escalation failure preserves why and never removes real conflicts', () => {
     const o = runFixture({ readEvidence: () => evidence({ loopPayload: undefined }) });
@@ -530,13 +523,13 @@ describe('runner settles pending without dispatch', () => {
       why: guard === 'head moved' ? 'live head missing or changed' : 'PR comments unreadable' });
     expect(o.settlePending).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled(); expect(o.settle).not.toHaveBeenCalled();
   });
-  it('conflict escalation publishes needs-you once across two ticks using real skip-published dedupe', () => {
+  it.each(['lone pending', 'real conflict'])('%s escalation publishes needs-you once across two ticks using real skip-published dedupe', kind => {
     const dir = mkdtempSync(join(tmpdir(), 'redteam-pending-settle-'));
     try {
       const publishNeedsYou = vi.fn(), postComment = vi.fn();
       const o = runFixture({ env: { WE_SHARED_RUNS_DIR: join(dir, 'runs') },
         readEvidence: () => evidence({ loopPayload: undefined }) });
-      o.rawPrs[0].labels.push('review:changes');
+      if (kind === 'real conflict') o.rawPrs[0].labels.push('review:changes');
       o.escalate = vi.fn(({ why, ...key }) => settleRedTeamSkip({ ...key,
         redTeam: { status: 'skipped', reason: why },
         io: { env: o.env, publishNeedsYou, postComment } }));

@@ -294,13 +294,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
     const head = rawPr?.headRefOid ?? null;
     const row = { prNumber: pr, head, action: 'skip' };
     const skip = why => ({ ...row, why });
-    const guardedSkip = (why, context, reviewCandidate = false) => ({ ...skip(why),
-      ...(why === 'conflicting label prevents policy-clear'
-        ? publishableClearGuard({ ...context, settlesPending: true }) === null
-          ? (reviewCandidate && Array.isArray(context.reviews) && !laterReviewHold(context.reviews)
-            && dispatchDecision({ action: 'review' }).action === 'review'
-            ? { settle: 'pending-only-conflict' } : {}) : { escalate: true }
-        : {}) });
+    const guardedSkip = why => ({ ...skip(why),
+      ...(why === 'conflicting label prevents policy-clear' ? { escalate: true } : {}) });
     const dispatchDecision = decision => {
       const last = lastDispatch.get(`${repo}#${pr}@${head}`);
       if (last != null && now - last < setting.retryCooldownMin * 60_000) return skip('retry cooldown active');
@@ -312,7 +307,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       const acceptance = accepted ? latestAcceptRecord(rawPr.comments, reviews) : null;
       const context = { labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews };
       const refusal = publishableClearGuard(context);
-      if (refusal) return guardedSkip(refusal, context, true);
+      if (refusal) return guardedSkip(refusal);
       if (reviews === null) return skip('PR reviews unreadable; inspect formal reviews before full review');
       if (laterReviewHold(reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
       return dispatchDecision({ action: 'review', why });
@@ -384,13 +379,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           && /^Red team not required on this head: [^\r\n]+$/m.test(comment.body)) {
           const context = { labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews };
           const refusal = publishableClearGuard(context);
-          if (refusal) return guardedSkip(refusal, context,
-            evidence.inFlight === false && !evidence.queued && evidence.recorded === false
-            && evidence.seatRecorded === false && evidence.completedRecorded !== true && evidence.cleanRecorded !== true
-            && (evidence.loopPayload == null || (isRealHead(evidence.loopPayload?.findings?.read?.netBasis?.rev)
-              && evidence.loopPayload.findings.read.netBasis.rev !== head))
-            && (evidence.status == null || (isRealHead(evidence.status.head) && evidence.status.head !== head))
-            && readStatus({ repo, pr, head }) == null);
+          if (refusal) return guardedSkip(refusal);
           return { ...row, action: 'carry', from: source.sha, why: 'prior policy-clear across acceptance re-stamp' };
         }
       }
@@ -415,7 +404,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (needsReview) {
         const context = { labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews };
         const refusal = publishableClearGuard(context);
-        if (refusal) return guardedSkip(refusal, context, true);
+        if (refusal) return guardedSkip(refusal);
         // Formal holds apply even without an acceptance comment. No timestamp
         // floor: a missing acceptance cannot establish that a review was cleared.
         if (reviews === null) return skip('PR reviews unreadable; inspect formal reviews before full review');
@@ -445,7 +434,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           if (acceptance?.sha !== head) return notOwed();
           const context = { labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews, settlesPending: true };
           const refusal = publishableClearGuard(context);
-          if (refusal) return guardedSkip(refusal, context);
+          if (refusal) return guardedSkip(refusal);
           return { ...row, action: 'clear', why: 'not owed (stored review)' };
         }
         if (!owed) return notOwed();
@@ -580,10 +569,9 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
               syncLabels({ ...key, env, log: note });
             }
           }
-          else if (['not-owed', 'pending-only-conflict'].includes(row.settle)) {
+          else if (row.settle === 'not-owed') {
             const rawPr = planningPrs.find(p => Number(p?.number) === row.prNumber);
-            if ((row.settle !== 'pending-only-conflict' || hasReviewCapacity(capacity))
-              && Array.isArray(rawPr?.labels) && !rawPr.labels.some(l => (typeof l === 'string' ? l : l?.name) === 'red-team:blocked')) {
+            if (Array.isArray(rawPr?.labels) && !rawPr.labels.some(l => (typeof l === 'string' ? l : l?.name) === 'red-team:blocked')) {
               settlePending({ ...key, remove: ['red-team:pending'] });
             }
           }
