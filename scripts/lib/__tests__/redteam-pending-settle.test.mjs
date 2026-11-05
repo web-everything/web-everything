@@ -74,6 +74,46 @@ function resultComment(confirmed = false) {
     }] : [] }));
 }
 
+describe('policy-clear publication revalidates fresh evidence', () => {
+  function clearFixture() {
+    const status = { status: 'finished', result: 'not-owed' };
+    const o = runFixture({ readEvidence: () => evidence({ status }), readStatus: () => status });
+    o.provider = { readPrState: vi.fn(() => o.rawPrs[0]), setLabels: vi.fn() };
+    o.readComments = vi.fn(() => o.rawPrs[0].comments);
+    return o;
+  }
+  it.each(['hold comment', 'formal hold', 'head moved', 'state unreadable', 'comments unreadable',
+    'reviews unreadable', 'review changed'])(
+    '%s appearing before publication refuses clear and publishes nothing', change => {
+      const o = clearFixture();
+      if (change === 'hold comment') o.readComments.mockReturnValue([...o.rawPrs[0].comments,
+        trusted('🔁 review — changes requested', iso(acceptedAt + 1))]);
+      if (change === 'formal hold') o.readReviews.mockReturnValue([{ state: 'CHANGES_REQUESTED', submittedAt: iso(acceptedAt + 1) }]);
+      if (change === 'head moved') o.provider.readPrState.mockReturnValue({ ...o.rawPrs[0], headRefOid: old });
+      if (change === 'state unreadable') o.provider.readPrState.mockImplementation(() => { throw Error('state offline'); });
+      if (change === 'comments unreadable') o.readComments.mockImplementation(() => { throw Error('comments offline'); });
+      if (change === 'reviews unreadable') o.readReviews.mockImplementation(() => { throw Error('reviews offline'); });
+      if (change === 'review changed') o.readEvidence = vi.fn().mockReturnValueOnce(o.readEvidence())
+        .mockReturnValue({ ok: false, reason: 'review-unfinished' });
+      expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip',
+        why: 'clear failed: evidence changed before settlement' });
+      expect(o.settle).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled();
+      expect(o.provider.setLabels).not.toHaveBeenCalled();
+    });
+  it('passes freshly read comments to settle after the clear decision is revalidated', () => {
+    const o = clearFixture();
+    const comments = [...o.rawPrs[0].comments, trusted('🔔 conveyor — fresh status note')];
+    o.readComments.mockReturnValue(comments);
+    expect(mod.runRedTeamOnSkip(o).rows[0].action).toBe('clear');
+    expect(o.settle).toHaveBeenCalledWith(expect.objectContaining({ comments }));
+    expect(o.settle.mock.calls[0][0].comments).toBe(comments);
+    expect(o.provider.readPrState).toHaveBeenCalledWith(repo, pr);
+    expect(o.readComments).toHaveBeenCalledWith({ repo, pr });
+    expect(o.readReviews).toHaveBeenCalledWith({ repo, pr });
+    expect(o.syncLabels).toHaveBeenCalledOnce();
+  });
+});
+
 describe('settlement reads fresh PR state and result evidence', () => {
   it('passes review-unfinished evidence to label synchronization and preserves pending', () => {
     const unknown = { ok: false, reason: 'review-unfinished' };

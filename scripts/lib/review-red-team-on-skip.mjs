@@ -627,7 +627,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       const refusal = refusals.find(r => r.kind === 'already-reviewed-head' && Number(r.prNumber) === row.prNumber);
       const [fresh] = planRedTeamOnSkip({ ...planningOptions, refusals: refusal ? [refusal] : [],
         rawPrs: [rawPr], now: now() });
-      if (fresh?.action !== 'skip' || fresh.settle !== row.settle || fresh.head !== row.head) {
+      if (fresh?.action !== row.action || fresh.settle !== row.settle || fresh.head !== row.head) {
         throw Error('evidence changed before settlement');
       }
       return rawPr;
@@ -680,7 +680,9 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         if (dryRun) row.why = 'dry run (clear)';
         else {
           try {
-            const rawPr = rawPrs.find(p => Number(p?.number) === row.prNumber);
+            let rawPr;
+            try { rawPr = freshSettlement(row); }
+            catch { throw Error('evidence changed before settlement'); }
             const result = settle({ redTeam: { status: 'not-owed' }, repo, pr: row.prNumber,
               head: row.head, readHead: row.head, accepted: true, storedReviewPolicyClear: true, comments: rawPr.comments, reason: row.why,
               io: { env, log: note,
