@@ -555,9 +555,13 @@ fd = os.open(cfg['status'], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
 with os.fdopen(fd, 'w') as result: result.write(str(code if 0 <= code <= 255 else 255))
 sys.exit(0)
 `;
-function execute(file,args,{cwd,env,input,inherit=false,detached=false,passFd}={}) {
+function execute(file,args,{cwd,env,input,inherit=false,detached=false,passFd,timeoutMs}={}) {
   return new Promise((resolve,reject) => {
     const child = spawn(file,args,{cwd,env,detached,stdio:[input === undefined ? 'ignore':'pipe',inherit?'inherit':'pipe',inherit?'inherit':'pipe',...(passFd===undefined?[]:[passFd])]});
+    const timer=timeoutMs===undefined?undefined:setTimeout(()=>{
+      try {child.kill('SIGKILL');} catch { /* ignore a process already gone */ }
+      resolve({code:null,timedOut:true});
+    },timeoutMs);
     const stdout=[],stderr=[];
     let bytes=0,overflow=false;
     for (const [name,stream] of [['stdout',child.stdout],['stderr',child.stderr]]) stream?.on('data',chunk => {
@@ -565,13 +569,13 @@ function execute(file,args,{cwd,env,input,inherit=false,detached=false,passFd}={
       if (bytes > LIMIT) {overflow=true; child.kill('SIGKILL'); return;}
       if(name==='stdout') stdout.push(chunk); else stderr.push(chunk);
     });
-    child.on('error',reject);
+    child.on('error',error => {clearTimeout(timer); reject(error);});
     // exit rather than close: detached children must not hold the output pipes open.
     child.on('exit',code => {
       if (detached) {try {process.kill(-child.pid,'SIGKILL');} catch { /* group already gone */ }}
     });
-    child.on('close',code => overflow ? reject(new Error('Output limit exceeded')) : resolve({code:code??254,
-      stdout:Buffer.concat(stdout).toString('utf8'),stderr:Buffer.concat(stderr).toString('utf8')}));
+    child.on('close',code => {clearTimeout(timer); overflow ? reject(new Error('Output limit exceeded')) : resolve({code:code??254,
+      stdout:Buffer.concat(stdout).toString('utf8'),stderr:Buffer.concat(stderr).toString('utf8')});});
     if(input!==undefined) {child.stdin.on('error',()=>{}); child.stdin.end(input);}
   });
 }
@@ -612,7 +616,7 @@ async function unitActive(unit) {
   if(['inactive','failed'].includes(word))return false;
   return ['active','activating','deactivating','reloading'].includes(word)?true:undefined;
 }
-export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, clock=Date.now} = {}) {
+export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, testEgressProbe, clock=Date.now} = {}) {
   const bases=testRoot ? join(testRoot,'bases') : '/srv/forge-base';
   const runs = testRoot ? join(testRoot,'runs') : '/srv/forge-exec';
   const receipts = testRoot ? join(testRoot,'receipts') : '/srv/forge-receipts';
@@ -625,6 +629,14 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
   let operator={uid:process.getuid(),gid:process.getgid()};
   const statePath = (run,phase) => join(receipts,run+'.'+phase);
   const busy=()=>Object.assign(new Error('Worker execution busy or interrupted; use local fallback. Operator must stop the reserved UID before removing its worker-active lock'),{code:'forge-busy'});
+  async function requireEgressTable() {
+    if(testRoot&&!testEgressProbe)return;
+    try {
+      const result=testRoot?await testEgressProbe():await execute('/usr/sbin/nft',['list','table','inet','forge_exec_egress'],{env:{PATH:'/usr/sbin:/usr/bin:/bin',LANG:'C'},timeoutMs:5000});
+      if(result?.code===0&&!result.timedOut)return;
+    } catch { /* all probe failures require local fallback */ }
+    throw Object.assign(new Error('Egress table inet forge_exec_egress absent; use local fallback'),{code:'egress-table-absent'});
+  }
   async function identity(user) {
     if(!isolatedWorkers)return {uid:process.getuid(),gid:process.getgid()};
     let ids;
@@ -1089,6 +1101,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     },
     async prepare({nonce,label,siblings,baseSha,baseManifestDigest,slot}) {
       await init();
+      await requireEgressTable();
       await reap();
       if(!nonceOK(nonce) || (label!==undefined && (typeof label!=='string' || !/^[a-z0-9][a-z0-9-]{5,63}$/.test(label)))) throw new Error('Invalid prepare');
       const run='r-'+randomBytes(16).toString('hex');
@@ -1132,6 +1145,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       try {
       if(!allowedCommand(request.argv) || !allowedEnv(request.env) || !hex(request.lock) || !hex(request.inputDigest)
         || request.argvDigest!==digestArgv(request.argv)) throw new Error('Invalid execution parameters');
+      await requireEgressTable();
       return await exclusiveWorker(async (executeCommand,selected) => {
       const resources={memoryPeakBytes:null,cpuUsec:null,oomKills:null,slotCpus:8};
       const unmeasured=new Set();
@@ -1270,6 +1284,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
           const reason=['git-head-unavailable','diff-coverage-base-unavailable'].includes(error.code) ? error.code
             : error.code==='forge-busy' && !(request.argv?.[0]==='npm' && request.argv?.[2]==='test:unit') ? 'forge-busy' : 'snapshot-rejected';
           if(reason==='git-head-unavailable')process.stderr.write(`forge-exec-run: ${reason}: ${String(error.cause?.message??error.message).replace(/[\x00-\x1f\x7f-\x9f]/g,'')}\n`);
+          if(error.code==='egress-table-absent')process.stderr.write('forge-exec-run: egress-table-absent\n');
           await writeFile(statePath(request.run,'rejected'),JSON.stringify({v:prepared.v,nonce:prepared.nonce,run:prepared.run,phase:'rejected',reason,siblings:!!request.manifest?.siblings,...(request.baseSha!==undefined?{delta:true}:{})}),{flag:'wx',mode:0o600}).catch(async e => {if (e.code !== 'EEXIST') throw e; await state(request,'rejected');});
         }
         throw error;
