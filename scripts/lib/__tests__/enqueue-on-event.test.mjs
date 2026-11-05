@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   extractPassTimings, parseMarkCause, isEligibleCause, parseMarkKey, notePending, duePending,
-  CATCH_UP_QUERY, ENQUEUE_ON_EVENT_DEFAULTS, readCatchUpCandidates, readyAtQuery, planCatchUp,
+  CATCH_UP_QUERY, ENQUEUE_ON_EVENT_DEFAULTS, readPendingChangePaths, readCatchUpCandidates, readyAtQuery, planCatchUp,
   fastDrainArgs, summarizeFastDrain, resolveEnqueueOnEventSetting, createEnqueueOnEvent, wakeWorthy,
 } from '../enqueue-on-event.mjs';
 import * as enqueueModule from '../enqueue-on-event.mjs';
@@ -660,6 +660,23 @@ describe('readCatchUpCandidates', () => {
   });
 });
 
+describe('readPendingChangePaths', () => {
+  const base = { root: '/code', cwd: '/clone', overlays: () => [{ ref: 'lane/x', addedAt: '2026-11-05T00:00:00Z' }], rebuildState: () => ({ adopted: { at: '2026-11-04T00:00:00Z' } }) };
+  it('unions the main delta and each unadopted overlay diff', () => {
+    const exec = (_c, args) => (args.includes('HEAD') ? 'a.mjs\n' : 'b.mjs\n');
+    expect(readPendingChangePaths({ ...base, execFileSyncImpl: exec })).toMatchObject({ ok: true, paths: ['a.mjs', 'b.mjs'] });
+  });
+  it('skips overlays adopted already', () => {
+    const calls = [];
+    readPendingChangePaths({ ...base, rebuildState: () => ({ adopted: { at: '2026-11-06T00:00:00Z' } }), execFileSyncImpl: (_c, args) => { calls.push(args); return ''; } });
+    expect(calls).toHaveLength(1);
+  });
+  it('fails closed on a git error or an unsafe ref', () => {
+    expect(readPendingChangePaths({ ...base, execFileSyncImpl: () => { throw new Error('bad object'); } })).toMatchObject({ ok: false });
+    expect(readPendingChangePaths({ ...base, overlays: () => [{ ref: '--evil' }], execFileSyncImpl: () => '' })).toMatchObject({ ok: false });
+  });
+});
+
 describe('catch-up during a daemon refresh (last-good enqueue)', () => {
   const pendingRefresh = () => ({ pending: true, reason: 'unadopted-overlay' });
   const warn = (lines) => lines.filter((line) => line.includes('refresh pending'));
@@ -755,10 +772,10 @@ describe('catch-up during a daemon refresh (last-good enqueue)', () => {
   });
 
   it('takes refreshPause from the tool layer and ignores invalid values', () => {
-    const ok = resolveSetting({ tool: { catchUp: { refreshPause: { paths: ['scripts/x'], maxPauseMinutes: 3 } } } });
+    const ok = resolveSetting({ catchUp: { refreshPause: { paths: ['scripts/x'], maxPauseMinutes: 3 } } });
     expect(ok.catchUp.refreshPause).toEqual({ paths: ['scripts/x'], maxPauseMinutes: 3 });
     expect(ok.sources['catchUp.refreshPause.maxPauseMinutes']).toBe('tool');
-    const bad = resolveSetting({ tool: { catchUp: { refreshPause: { paths: [], maxPauseMinutes: -1 } } } });
+    const bad = resolveSetting({ catchUp: { refreshPause: { paths: [], maxPauseMinutes: -1 } } });
     expect(bad.catchUp.refreshPause.maxPauseMinutes).toBe(10);
     expect(bad.catchUp.refreshPause.paths.length).toBe(3);
   });
