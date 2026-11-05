@@ -63,7 +63,7 @@ export function isAcceptedQuestionHash(hash, { priorQuestionHashes = [], now = D
 /** Latest timestamp wins, with later appended records breaking ties; foreign hashes never qualify. Records under a
  * prior question hash qualify only while inside their window; a prior WEAKENED is returned (and so blocks). */
 export function findAudit(records, { head, base, questionHash, priorQuestionHashes = resolvePriorQuestionHashes(), now = Date.now() }) {
-  if (!SHA.test(base ?? '') || !SHA.test(head ?? '') || questionHash !== QUESTION_HASH) return null;
+  if (typeof base !== 'string' || typeof head !== 'string' || !SHA.test(base) || !SHA.test(head) || questionHash !== QUESTION_HASH) return null;
   let latest = null, prior = null, sawCurrent = false;
   for (const record of records) {
     if (record?.head !== head || record.base !== base) continue;
@@ -108,9 +108,12 @@ export async function main(argv, deps) {
     if (hasConflictingVerdict(verdict, lines)) throw new Error('conflicting verdict lines');
     const findings = lines.filter(line => line.trim()).map(clean);
     const result = { verdict, base, head, questionHash: QUESTION_HASH, findings };
+    // R503: store the head's net-diff fingerprint so the audit carries across a rebase/merge-of-main; unreadable = omitted.
+    let fingerprint = null;
+    try { fingerprint = (await deps.fingerprint?.(base, head)) || null; } catch { fingerprint = null; }
     try {
       await deps.appendRecord({ at: deps.now(), base, head, baseRef: flags.base,
-        questionHash: QUESTION_HASH, verdict, findings });
+        questionHash: QUESTION_HASH, verdict, findings, ...(fingerprint ? { fingerprint } : {}) });
     } catch {
       deps.stderr('Audit record write failed; repair the record path and retry.\n');
       return 3;
