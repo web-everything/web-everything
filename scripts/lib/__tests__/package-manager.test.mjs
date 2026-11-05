@@ -26,6 +26,11 @@ describe('resolvePackageManager cascade', () => {
   it('blank env is unset', () => {
     expect(resolvePackageManager({ env: { WE_PACKAGE_MANAGER: '  ' }, platform: 'pnpm' }).source).toBe('platform');
   });
+  it('unknown value with a frozen install is refused without a parity proof, allowed with one', () => {
+    const o = { ci: true, env: { WE_PACKAGE_MANAGER: 'yarn' }, platform: 'pnpm' };
+    expect(() => installArgv(o)).toThrow(/lockfileParity/);
+    expect(installArgv({ ...o, lockfileParity: () => true })).toMatchObject({ bin: 'npm', args: ['ci'] });
+  });
   it('unknown value fails closed to npm even when a lower layer says pnpm', () => {
     const r = resolvePackageManager({ env: { WE_PACKAGE_MANAGER: 'yarn' }, platform: 'pnpm' });
     expect(r.manager).toBe('npm');
@@ -127,13 +132,14 @@ describe('installWithFallback', () => {
     ['integrity failure', { stderr: 'ERR_PNPM_TARBALL_INTEGRITY' }],
     ['lifecycle script failure', { stderr: 'ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL postinstall' }],
     ['unrecognised failure', {}],
+    ['fetch failure alongside a lifecycle failure', { stderr: 'ERR_PNPM_FETCH_FAIL ELIFECYCLE' }],
     ['timeout carrying a lifecycle failure', { code: 'ETIMEDOUT', stderr: 'ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL' }],
     ['spawn code carrying an integrity code', { code: 'ENOENT', stderr: 'ERR_PNPM_TARBALL_INTEGRITY' }],
     ['lifecycle failure that merely mentions ENOENT', { stderr: 'ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL postinstall ENOENT' }],
     ['lockfile refusal alongside a network word', { stderr: 'ERR_PNPM_OUTDATED_LOCKFILE ENOTFOUND' }],
   ])('fails closed (no npm fallback) on %s', (_n, extra) => {
     const calls = []; const logs = [];
-    expect(() => installWithFallback({ frozen: true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => '9', log: (l) => logs.push(l),
+    expect(() => installWithFallback({ frozen: true, lockfileParity: () => true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => '9', log: (l) => logs.push(l),
       exec: (bin, args) => { calls.push([bin, ...args]); throw Object.assign(new Error('pnpm failed'), extra); } })).toThrow('pnpm failed');
     expect(calls).toEqual([['pnpm', 'install', '--frozen-lockfile']]);
     expect(logs.join('\n')).toMatch(/NOT falling back/);

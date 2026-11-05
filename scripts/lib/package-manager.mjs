@@ -30,7 +30,7 @@ export function resolvePackageManager({ env = process.env, tool, platform, log }
  * code in its output is a registry-fetch failure. Any other pnpm error code, and any lockfile or integrity wording
  * anywhere in the output, always blocks the fallback: npm checks a different lockfile and would mask it.
  */
-const DENY = /lockfile|integrity|checksum/i;
+const DENY = /lockfile|integrity|checksum|ELIFECYCLE|lifecycle|postinstall|preinstall/i;
 const SPAWN_CODES = new Set(['ENOENT', 'EACCES', 'EPERM', 'ETIMEDOUT']);
 const FETCH_CODES = new Set(['ERR_PNPM_FETCH_FAIL', 'ERR_PNPM_META_FETCH_FAIL']);
 const pnpmCodes = (t) => [...String(t).matchAll(/ERR_PNPM_[A-Z0-9_]+/g)].map((m) => m[0]);
@@ -51,6 +51,11 @@ const defaultPnpmVersion = () => execFileSync('pnpm', ['--version'], { stdio: 'p
 export function installArgv({ ci = false, ignoreScripts = false, pnpmVersion = defaultPnpmVersion, lockfileParity, ...opts } = {}) {
   const r = resolvePackageManager(opts);
   let { manager, note } = r;
+  if (r.note && ci) { // unknown value -> npm; a frozen npm ci there still needs the parity proof (it may have masked a pnpm layer)
+    let proven = false;
+    try { proven = typeof lockfileParity === 'function' && lockfileParity() === true; } catch { proven = false; }
+    if (!proven) throw new Error(`${r.note}; refusing a frozen npm ci without a lockfileParity proof`);
+  }
   if (manager === 'pnpm') {
     try { pnpmVersion(); } catch (e) {
       if (!pnpmUnusable(e)) throw e; // fail closed: an integrity/lockfile-class failure is not 'pnpm missing'
