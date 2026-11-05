@@ -326,3 +326,56 @@ describe('forge-egress snapshot-write failure only narrows the next allowlist (f
     } finally { chmodSync(state,0o700); }
   }));
 });
+
+describe('forge-egress address validation (r595-s0 fix 2)',()=>{
+  it('999.1.1.1, 1.2.3, ::::g and : never appear in render output',()=>{
+    const r=render({FORGE_EGRESS_UIDS:'990',FORGE_EGRESS_REGISTRY_V4:'999.1.1.1 1.2.3 256.0.0.1 1.2.3.4',FORGE_EGRESS_REGISTRY_V6:'::::g : ::: 2606:4700::1'});
+    expect(r.status).toBe(0);
+    for(const bad of ['999.1.1.1','1.2.3,','1.2.3 ','256.0.0.1','::::g',':::'])expect(r.stdout).not.toContain(bad);
+    expect(elements(r.stdout,'registry4')).toEqual(['1.2.3.4']);
+    expect(elements(r.stdout,'registry6')).toEqual(['2606:4700::1']);
+  });
+});
+
+describe('forge-egress snapshot failure fails closed (r595-s0 fix 3)',()=>{
+  it('an unwritable state dir leaves no history; the next render holds only current lookup addresses',()=>sandbox(dir=>{
+    fake(dir,'nft',NFT_CAPTURE);
+    const state=join(dir,'state');mkdirSync(state);
+    writeFileSync(join(state,'registry4'),'9.9.9.9\n');
+    writeFileSync(join(state,'registry6'),'2606:4700::9\n');
+    chmodSync(state,0o500);
+    try {
+      const r=apply(dir,{FORGE_EGRESS_UIDS:'990',FORGE_EGRESS_STATE_DIR:state,FORGE_EGRESS_REGISTRY_V4:'2.2.2.2',FORGE_EGRESS_REGISTRY_V6:'2606:4700::2'});
+      expect(r.status).toBe(0);
+      expect(elements(captured(dir),'registry4')).toEqual(['2.2.2.2']);
+      expect(elements(captured(dir),'registry6')).toEqual(['2606:4700::2']);
+      // Next render (state dir still unwritable): stale history is not trusted, only the current lookup remains.
+      const r2=render({FORGE_EGRESS_UIDS:'990',FORGE_EGRESS_STATE_DIR:state,FORGE_EGRESS_REGISTRY_V4:'3.3.3.3',FORGE_EGRESS_REGISTRY_V6:'2606:4700::3'});
+      expect(elements(r2.stdout,'registry4')).toEqual(['3.3.3.3']);
+      expect(elements(r2.stdout,'registry6')).toEqual(['2606:4700::3']);
+    } finally { chmodSync(state,0o700); }
+  }));
+  it('v4 and v6 snapshots are recorded independently (a v4 record failure does not skip v6)',()=>{
+    const src=readFileSync(script,'utf8');
+    expect(src).not.toMatch(/record_snapshot 4\s*&&\s*record_snapshot 6/);
+    expect(src).toMatch(/rm -f -- "\$STATE_DIR\/registry\$fam"/);
+  });
+});
+
+describe('forge-setup has no ssh dependency (r595-s0 fix 1)',()=>{
+  const docs=()=>[setupSrc(),readFileSync(script,'utf8')];
+  it('no ssh.service.d drop-in and no Requires= on ssh anywhere in the script or the documented rollback',()=>{
+    for(const t of docs()){
+      expect(t).not.toMatch(/ssh\.service\.d/);
+      expect(t).not.toMatch(/SSHDROPIN/);
+      expect(t).not.toMatch(/Requires=[^\n]*(ssh|sshd)(\.service|\.socket)?\b/);
+      expect(t).not.toMatch(/Requires=forge-exec-egress/);
+    }
+  });
+  it('documented rollback is: nft delete table, then disable --now timer and service',()=>{
+    for(const t of docs()){
+      expect(t).toContain('nft delete table inet forge_exec_egress');
+      expect(t).toContain('systemctl disable --now forge-exec-egress.timer forge-exec-egress.service');
+    }
+  });
+});
