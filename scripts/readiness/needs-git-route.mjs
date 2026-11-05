@@ -176,7 +176,7 @@ function scan(t, start, depth, inHole, lits) {
             let ex = exprStart(last, prev, word());
             if (w === 'function' && isIdent(last) && word() === 'async') ex = asyncExpr; // `async function`: the async decides
             if (w === 'async') asyncExpr = ex;
-            else pend.push({ kind: w, expr: ex, depth: stack.length });
+            else pend.push({ kind: w, expr: ex, depth: stack.length, bd: braces.length });
           }
         }
         prevWordFor = isIdent(last) && word() === 'for'; // `for await (` is a control head like `for (`
@@ -192,7 +192,7 @@ function scan(t, start, depth, inHole, lits) {
       const head = word();
       let kind = PAREN_KEYWORD.has(head) || (head === 'await' && prevWordFor) ? 1 : 0;
       const pt = pendTop();
-      if (!kind && pt && pt.kind === 'function' && stack.length === pt.depth) kind = pt.expr ? 2 : 3;
+      if (!kind && pt && pt.kind === 'function' && stack.length === pt.depth && braces.length === pt.bd) kind = pt.expr ? 2 : 3;
       stack.push(kind);
     }
     let opensExpr = false;
@@ -201,13 +201,14 @@ function scan(t, start, depth, inHole, lits) {
       if (last === ':') opensExpr = colonExpr; // after a label / `case` / `default` colon the brace is a block
       if (last === ')' && fnBodyExpr) opensExpr = true;
       const pt = pendTop();
-      if (pt && stack.length === pt.depth) {
+      if (pt && stack.length === pt.depth && braces.length === pt.bd) {
         if (pt.kind === 'function' && last === ')') pend.pop();
-        else if (pt.kind === 'class' && (isIdent(last) || last === ')')) { opensExpr = pt.expr; pend.pop(); }
+        // the class heritage may end in a name, a call / group `)`, an index `]`, a template or string, or a function / object `}`
+        else if (pt.kind === 'class' && (isIdent(last) || ')]}`\'"'.includes(last))) { opensExpr = pt.expr; pend.pop(); }
       }
     }
     if (c === '}' && inHole && braces.length === 0) return { out, end: i + 1 };
-    if (c === ';') while (pend.length && pendTop().depth >= stack.length) pend.pop(); // a statement ended: its own keywords never got a body
+    if (c === ';') while (pend.length && pendTop().depth >= stack.length && pendTop().bd >= braces.length) pend.pop(); // a statement ended: its own keywords never got a body
     const nonNull = c === '!' && ((isIdent(last) && !REGEX_AFTER_WORD.has(word())) || (last === ')' && !ctrlParen) || last === ']');
     const endsNumber = c === '.' && isIdent(last) && !wordDot && wordEnd === i && t[wordStart] >= '0' && t[wordStart] <= '9';
     emit(c, c);
@@ -220,7 +221,11 @@ function scan(t, start, depth, inHole, lits) {
       if (ternaries > 0) { ternaries--; colonExpr = true; } else colonExpr = braces.length ? braces[braces.length - 1] : inHole;
     }
     if (c === '{') { braces.push(opensExpr); ternaryStack.push(ternaries); ternaries = 0; }
-    if (c === '}') { exprClose = braces.pop() ?? false; ternaries = ternaryStack.pop() ?? 0; }
+    if (c === '}') {
+      exprClose = braces.pop() ?? false;
+      ternaries = ternaryStack.pop() ?? 0;
+      while (pend.length && pendTop().bd > braces.length) pend.pop(); // the block holding a pending keyword closed without a body
+    }
     if (c === ')') {
       const k = stack.pop() ?? 0;
       ctrlParen = k === 1;
@@ -323,15 +328,28 @@ function commandIsGit(segment, subs) {
     const base = baseName(tok);
     if (COMMAND_PREFIX.has(tok) || COMMAND_PREFIX.has(base)) { todo.push([end, true]); continue; }
     if (SHELLS.has(base) && subs.length === 0) {
+      // options come first (`-e`, `-o pipefail`, `+o x`, `-O x`); once `-c` was among them, the first word after them is the command line
       let p = end;
+      let sawC = false;
       for (;;) {
         WS.lastIndex = p;
         WS.test(segment);
         TOKEN.lastIndex = WS.lastIndex;
         const o = TOKEN.exec(segment);
-        if (!o || o[0][0] !== '-') break;
+        if (!o) break;
+        if (o[0][0] !== '-' && o[0][0] !== '+') {
+          if (sawC) { const rest = segment.slice(WS.lastIndex); subs.push(shellWord(rest) ?? rest); }
+          break;
+        }
         p = WS.lastIndex + o[0].length;
-        if (SHELL_C_FLAG.test(o[0])) { WS.lastIndex = p; WS.test(segment); const rest = segment.slice(WS.lastIndex); subs.push(shellWord(rest) ?? rest); break; }
+        if (o[0][0] === '-' && SHELL_C_FLAG.test(o[0])) sawC = true;
+        if (o[0] === '-o' || o[0] === '+o' || o[0] === '-O' || o[0] === '+O') { // takes a value: skip it
+          WS.lastIndex = p;
+          WS.test(segment);
+          TOKEN.lastIndex = WS.lastIndex;
+          const v = TOKEN.exec(segment);
+          if (v) p = WS.lastIndex + v[0].length;
+        }
       }
     }
     if (wrapped && DURATION.test(tok)) { todo.push([end, true]); continue; }
@@ -387,6 +405,8 @@ function splitCommands(s) {
       cur += c;
       continue;
     }
+    // a comment (`# it's`) or heredoc body (`<<EOF … don't …`) holds quotes that open nothing: not judged here, split everywhere
+    if ((c === '#' && (cur === '' || /\s/.test(s[i - 1]))) || (c === '<' && s[i + 1] === '<')) return null;
     if (c === "'") { cur += c; ctx.push('sq'); continue; }
     if (c === '"') { cur += c; ctx.push('dq'); continue; }
     if (c === '`') { segs.push(cur); cur = ''; if (top === 'bt') ctx.pop(); else ctx.push('bt'); continue; }

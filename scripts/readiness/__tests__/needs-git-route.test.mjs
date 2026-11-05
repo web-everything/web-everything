@@ -185,6 +185,11 @@ describe('sourceNeedsGit', () => {
     expect(sourceNeedsGit(E + "const C = class extends (function(){ return class {}; })() {} / 2;" + tail)).toBe(true);
     expect(sourceNeedsGit(E + "const C = class extends (class { static a = 1; }) {} / 2;" + tail)).toBe(true);
     expect(sourceNeedsGit(E + "const f = function(a = class {}, b = function(){}){} / 2;" + tail)).toBe(true);
+    // heritage ending in an index, a template or an unparenthesised function; its body's `;` must not drop the outer class
+    expect(sourceNeedsGit(E + "const C = class extends x[0] {} / 2;" + tail)).toBe(true);
+    expect(sourceNeedsGit(E + "const C = class extends o['x'] {} / 2;" + tail)).toBe(true);
+    expect(sourceNeedsGit(E + "const C = class extends tag`x` {} / 2;" + tail)).toBe(true);
+    expect(sourceNeedsGit(E + "const C = class extends function(){ x; } {} / 2;" + tail)).toBe(true);
     // a declaration around nested expressions still ends a statement: the next `/` starts a regex
     expect(sourceNeedsGit(E + "class A extends (class {}) {}\n/'/.test(a);" + tail)).toBe(true);
   });
@@ -199,6 +204,10 @@ describe('sourceNeedsGit', () => {
       `'echo "a"; git status'`, `'echo "a" && git status'`, `'echo "$(git status)"'`, `'echo "\`git status\`"'`, `"echo 'a' | git apply"`,
       `'bash -c "echo a; git status"'`, `"sh -c 'echo a; git status'"`, `'echo "unterminated; git status'`, `'echo "a; b" ; git status'`,
       `'echo "$(echo "x; y"; git status)"'`,
+      // quotes inside a shell comment or heredoc body open nothing: the git line after them is still a command
+      `"echo hi # it's\\ngit status\\n# don't"`, `'echo a #"\\ngit x\\n#"'`, `"cat <<EOF\\nit's here\\nEOF\\ngit status\\ncat <<EOF\\ndon't\\nEOF"`,
+      // options before / after `-c`
+      `'bash -c -e "git x"'`, `'bash -o pipefail -c "git x"'`, `'bash +o history -c "git x"'`,
     ]) expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(true);
   });
   it('a trailing-dot number is an operand: the next `/` divides', () => {
