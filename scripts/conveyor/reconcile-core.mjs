@@ -1582,6 +1582,29 @@ function advisoryHeadState(pr) {
   return { headSha, latest, advisoryIsCurrent, alreadyReviewed, unpinnedAdvisory };
 }
 
+/** Chronology grants nothing when any trusted review has an unreadable time or an unpinned head. */
+function latestHeadReview(pr) {
+  const reviews = (Array.isArray(pr?.comments) ? pr.comments : [])
+    .filter(c => isTrustedMarkerAuthor(c) && (isReviewVerdictComment(c) || latestAdvisory([c])))
+    // Operator send-backs are requests, not finished reviews of a head.
+    .filter(c => !isOperatorAuthored(c) || !openOperatorSendBacks({ comments: [c] }).length)
+    .map(c => ({ head: reviewedHeadsOf(c).at(-1) ?? latestAdvisory([c])?.head, at: Date.parse(c.createdAt) }));
+  if (!reviews.length || reviews.some(r => !r.head || !Number.isFinite(r.at))) return null;
+  reviews.sort((a, b) => b.at - a.at);
+  if (reviews.length > 1 && reviews[0].at === reviews[1].at) return null;
+  return reviews[0];
+}
+
+/** A fresh operator request takes ownership even when this head already has its advisory. */
+function operatorSendBackAfterReview(pr) {
+  const review = latestHeadReview(pr);
+  if (!review || !sameHeadSha(review.head, pr.headRefOid)) return null;
+  const item = openOperatorSendBacks(pr).at(-1);
+  if (!item?.body || !Number.isFinite(Date.parse(item.at)) || Date.parse(item.at) <= review.at
+    || (item.head && !sameHeadSha(item.head, pr.headRefOid))) return null;
+  return { verdictId: item.id, login: item.login, body: item.body };
+}
+
 /**
  * Common review decision. Allow the last fix its review at the cap; refuse only above it.
  * Preserve draft, reviewed-head and advisory conversion semantics;
@@ -1590,7 +1613,7 @@ function advisoryHeadState(pr) {
  */
 function dispatchReviewRow({
   pr, requiredChecks, withPhase, base, attempts, roundCap, refuse, refuseCapExhausted, dispatch, extra = {}, now = 0,
-  advisoryReview = null,
+  advisoryReview = null, reviewAfterFix = null,
 }) {
   if (refuseReferralHold({ pr, refuse, withPhase, extra })) return;
   // ── `scope-bloat` (card x29vm8a) — a diff that is mostly NOT this PR's own change is never reviewed (live 2026-10-08,
@@ -1718,12 +1741,13 @@ function dispatchReviewRow({
   // ── gate-held advisory (live #4764) — an advisory review is not a repair round, so it skips the findings/cap
   // accounting below, but it passes every gate ABOVE (referral hold, scope-bloat, draft, already-reviewed-head) and
   // the CI gate: it is this function's review, never a second hand-rolled copy of it.
-  if (advisoryReview) {
-    if ((advisoryReview.ciWaived !== true || pr.reviewTiming?.startAfter !== 'ci-green') && !reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra })) return;
+  if (advisoryReview || reviewAfterFix) {
+    if ((advisoryReview?.ciWaived !== true || pr.reviewTiming?.startAfter !== 'ci-green') && !reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra })) return;
     dispatch.push({
       ...base, ...withPhase, kind: 'review', findings: countFindings(pr?.comments), ...extra,
-      advisoryReview: { head: advisoryReview.head, reason: advisoryReview.reason,
-        ...(advisoryReview.ciWaived === true ? { ciWaived: true } : {}) }, why: advisoryReview.why,
+      ...(advisoryReview ? { advisoryReview: { head: advisoryReview.head, reason: advisoryReview.reason,
+        ...(advisoryReview.ciWaived === true ? { ciWaived: true } : {}) } } : {}),
+      why: advisoryReview?.why ?? reviewAfterFix,
     });
     return;
   }
@@ -2943,8 +2967,9 @@ export function planReconcile({
     // guard / timeout-evidence refusal then held with nobody working it). Authenticated by comment author in
     // {@link operatorFixBudget}, never by text; one-shot; counted against the round grants; the loop guard stays
     // for automatic ci-heals.
-    const sendBack = (ciRepairOwed || (phase === 'bounced' && !withPhase.labels.includes(CONFLICT_LABEL)))
-      ? operatorSendBackRearm(pr, operatorBudget) : null;
+    const sendBack = (phase === 'needs-human' ? operatorSendBackAfterReview(pr) : null)
+      ?? ((ciRepairOwed || (phase === 'bounced' && !withPhase.labels.includes(CONFLICT_LABEL)))
+        ? operatorSendBackRearm(pr, operatorBudget) : null);
     if (sendBack) {
       const attempts = roundAttempts();
       if (attempts >= effectiveRoundCap) {
@@ -2957,7 +2982,7 @@ export function planReconcile({
       dispatch.push({
         ...base, ...withPhase, kind: 'fix', mode: 'operator-send-back', findings: 1, attempts, cap: effectiveRoundCap,
         operatorSendBack: sendBack,
-        why: `operator send-back by @${sendBack.login} with a must-fix body on a red-CI PR — re-armed once as a fix (operator re-arm), not a ci-heal`,
+        why: `operator send-back by @${sendBack.login} with a must-fix body — re-armed once as a fix (operator re-arm)`,
       });
       continue;
     }
@@ -3531,6 +3556,22 @@ export function planReconcile({
         attempts, cap: effectiveRoundCap, blockRuledReferrals: pr.blockRuledReferrals,
         why: `${pr.blockRuledReferrals.length} mandatory referral(s) on this head were ruled block and nothing live is working it`
           + ' — the fix that changes the head is owed, not another review of the same head',
+      });
+      continue;
+    }
+
+    // A pushed repair owes its review even if fix-end left the old findings/advisory labels in place.
+    // Claims and live reviewers already refused above; completed red CI still belongs to its repair path.
+    const lastReview = latestHeadReview(pr);
+    const release = releasedFixClaim(pr);
+    if (OWED[phase] && lastReview && release && release.releasedAtMs > lastReview.at
+      && !sameHeadSha(lastReview.head, pr.headRefOid)) {
+      const why = 'the fixer released a new head after the last review — its review is owed before another repair';
+      dispatchReviewRow({ pr, requiredChecks, withPhase, base, attempts: roundAttempts(),
+        roundCap: effectiveRoundCap, refuse, refuseCapExhausted, dispatch, now,
+        ...(withPhase.labels.includes(REVIEW_LABELS.human)
+          ? { advisoryReview: { head: pr.headRefOid, reason: 'fix-pushed', why } }
+          : { reviewAfterFix: why }),
       });
       continue;
     }

@@ -74,6 +74,14 @@ export function openOperatorSendBacks(pr) {
       const text = String(c?.body ?? '');
       const proseCoverage = index < (next?.index ?? comments.length)
         && /\boperator send(?:-back|back| back)\b/i.test(stripComments(text));
+      // A released fixer may put the explicit coverage on fix-end instead of a separate evidence comment.
+      // Preserve the old path for missing/ambiguous timestamps, generic releases and unchanged heads.
+      if (text.trimStart().startsWith('🔓 conveyor fix-end') && namesSendBack(text, item)) {
+        const at = Date.parse(c.createdAt), requestedAt = Date.parse(item.at);
+        const head = /at `([a-f0-9]{7,40})`/i.exec(text)?.[1];
+        if (Number.isFinite(at) && Number.isFinite(requestedAt) && at > requestedAt
+          && head && (!item.head || differentHead(item.head, head))) return true;
+      }
       if (!isFixEvidence(text) || !(namesSendBack(text, item) || proseCoverage)) return false;
       if (!item.head) return true;
       const namedHead = /\bHead:\s*`([a-f0-9]{7,40})`/i.exec(stripComments(text));
