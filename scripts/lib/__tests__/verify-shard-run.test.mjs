@@ -617,3 +617,47 @@ describe('review regressions: Forge and supervisor wiring', () => {
     }
   }, 10000);
 });
+
+describe('local shard wait budget (verify.localShardWaitMs)', () => {
+  const run = async ({ env = {}, needsGit = () => true, budgetMs = 3_600_000, exitCode = 0 } = {}) => {
+    const calls = [], lines = [];
+    const execute = async ({ command, args, files, report }) => {
+      calls.push({ command, args });
+      return { exitCode, reportText: exitCode === 75 ? '' : JSON.stringify({ testResults: files.map(name => ({ name, status: 'passed', assertionResults: [{ status: 'passed' }] })) }) };
+    };
+    const code = await runShards({ argv: ['npx', 'vitest', 'run', 'a'], shards: 1, parallel: 1, budgetMs }, {
+      discover: () => null, execute, now: () => 0, tmpdir: () => '/scratch', env, needsGit,
+      fs: { mkdtempSync: () => '/scratch/s', readFileSync: () => { throw Error('missing'); }, rmSync: () => {} },
+      acquireLocal: async () => ({ ok: true }), releaseLocal: () => {}, log: s => lines.push(s) });
+    return { code, calls, lines };
+  };
+  const waitFlag = call => call.args.find(a => a.startsWith('--wait-ms='));
+
+  it('gives a shard that must run locally (needs-git) a bounded wait of 15 minutes by default, before the -- separator', async () => {
+    const { calls } = await run();
+    expect(waitFlag(calls[0])).toBe('--wait-ms=900000');
+    expect(calls[0].args.indexOf(waitFlag(calls[0]))).toBeLessThan(calls[0].args.indexOf('--'));
+  });
+  it('adds no wait to a shard that can run remotely', async () => {
+    const { calls } = await run({ needsGit: () => false });
+    expect(waitFlag(calls[0])).toBeUndefined();
+  });
+  it('reads the budget from the cascade env (WE_VERIFY_LOCAL_SHARD_WAIT_MS), logging value and source', async () => {
+    const { calls, lines } = await run({ env: { WE_VERIFY_LOCAL_SHARD_WAIT_MS: '60000' } });
+    expect(waitFlag(calls[0])).toBe('--wait-ms=60000');
+    expect(lines.join('')).toMatch(/localShardWaitMs=60000/);
+  });
+  it('never waits longer than the remaining verify budget', async () => {
+    const { calls } = await run({ budgetMs: 5_000 });
+    expect(waitFlag(calls[0])).toBe('--wait-ms=5000');
+  });
+  it('ignores an invalid env value (fail closed to the default) and 0 turns the wait off', async () => {
+    expect(waitFlag((await run({ env: { WE_VERIFY_LOCAL_SHARD_WAIT_MS: 'soon' } })).calls[0])).toBe('--wait-ms=900000');
+    expect(waitFlag((await run({ env: { WE_VERIFY_LOCAL_SHARD_WAIT_MS: '0' } })).calls[0])).toBeUndefined();
+  });
+  it('a shard that still gets no slot within the budget still exits 75 (contract unchanged)', async () => {
+    const { code, lines } = await run({ exitCode: SHARD_UNSETTLED_EXIT });
+    expect(code).toBe(SHARD_UNSETTLED_EXIT);
+    expect(lines.join('')).toMatch(/host-load deferral.*waited/);
+  });
+});
