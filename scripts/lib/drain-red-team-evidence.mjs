@@ -9,7 +9,9 @@ import { createNewestRunFinder, RUN_SCAN_CAPPED } from './stream-filter-runs.mjs
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { redTeamEnabled, redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
-import { readRedTeamProbes, redTeamForHead } from './red-team-gate.mjs';
+import { readRedTeamProbes, redTeamForHead, parseRedTeamComment } from './red-team-gate.mjs';
+import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
 import { completedRedTeamSeat } from './red-team-run-result.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 
@@ -72,6 +74,9 @@ export const ABANDONED_REVIEW_AFTER_MS = 60 * 60 * 1000;
 const abandonedReview = (hit, now) => !hit.run.verdict && hit.run.resumeOf == null && isRunRecordTerminal(hit.run)
   && now - hit.at >= ABANDONED_REVIEW_AFTER_MS;
 const TIE_ORDERS = ['id-asc', 'id-desc'];
+// R622: the times a result comment must beat to settle unknown evidence. Non-enumerable, so every existing
+// shape comparison of the failure object is unchanged; only settleUnknownEvidenceByComment reads it.
+const withSettleBounds = (failure, bounds) => Object.defineProperty(failure, 'settleBounds', { value: bounds, enumerable: false });
 
 // Retain only the selected head/PR payloads and the newest unfinished attempt. Finished
 // evidence is usable only once the scan rules out a newer unfinished run. The scan stops as
@@ -134,7 +139,8 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
       return { ok: false, reason: 'run-start-missing' };
     }
     if (unfinished && (!selected || unfinished.id === selected.id || reviewStartedAt(unfinished) >= selectedStart)) {
-      return { ok: false, reason: 'review-unfinished' };
+      return withSettleBounds({ ok: false, reason: 'review-unfinished' },
+        { unfinishedStartedAt: reviewStartedAt(unfinished), ...(scan.end?.ok === false ? { unreadBoundaryAt: scan.boundary } : {}) });
     }
     if (scan.end?.ok !== false) return null;
     // Capped: usable only when no unread record can change this query's answer (see above).
@@ -145,7 +151,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     if (exact === null && scan.newestSettled && (!exactHead || (Number.isFinite(writtenAfter)
       && scan.boundary + RUN_MTIME_SLACK_MS <= writtenAfter
       && typeof newestHead === 'string' && newest.run.findings?.read?.netBasis?.rev === newestHead))) return null;
-    return scan.end;
+    return withSettleBounds({ ...scan.end }, { unreadBoundaryAt: scan.boundary });
   };
   return (exactHead = true, order = tieBreak, { writtenAfter, newestHead } = {}) => {
     if (!TIE_ORDERS.includes(order)) throw new TypeError('unknown run tieBreak');
@@ -423,13 +429,28 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
 
 // R622: unknown run evidence the comment thread can answer. A review run left unfinished (its human confirm never
 // recorded because the accept came by label) or a capped run scan says nothing about a result that is already
-// published. A trusted result comment bound to this exact head (redTeamForHead) is that result; nothing is owed.
-// Breaks are checked by redTeamEnqueueHold BEFORE it reads `ok`, so a recorded break still sends back. Every other
-// unknown reason, and any head without a trusted result comment, stays unknown (fail closed).
+// published. A trusted result comment bound to this exact head (redTeamForHead) is that result; nothing is owed
+// ONLY IF it is newer than the evidence it settles: newer than the start of the unfinished review (a later
+// re-review may still reject), and newer than every unread record of a capped scan (an unread re-review would have
+// been written after it). Breaks are checked by redTeamEnqueueHold BEFORE it reads `ok`, so a recorded break still
+// sends back. Every other unknown reason, any missing bound, and any head without a trusted result comment stays
+// unknown (fail closed).
+// The settling result's own time is the NEWEST trusted comment for this exact head, the one redTeamForHead returns.
+const newestResultComment = (comments, pr, head) => (Array.isArray(comments) ? comments : [])
+  .map((c, i) => ({ c, i, parsed: isTrustedMarkerAuthor(c) ? parseRedTeamComment(typeof c === 'string' ? c : c?.body) : null }))
+  .filter(x => x.parsed && x.parsed.pr === Number(pr) && x.parsed.rev === String(head).toLowerCase())
+  .sort((a, b) => (Date.parse(commentCreatedAt(a.c)) || 0) - (Date.parse(commentCreatedAt(b.c)) || 0) || a.i - b.i).at(-1)?.c;
 export const COMMENT_SETTLEABLE_REASONS = Object.freeze(['review-unfinished', RUN_SCAN_CAPPED.reason]);
 export function settleUnknownEvidenceByComment(evidence, comments, pr, head) {
   if (evidence?.ok !== false || !COMMENT_SETTLEABLE_REASONS.includes(evidence.reason)) return evidence;
   if (!redTeamForHead(comments, pr, head)) return evidence;
+  const at = Date.parse(commentCreatedAt(newestResultComment(comments, pr, head)));
+  const bounds = evidence.settleBounds ?? {};
+  if (!Number.isFinite(at)) return evidence;
+  if (evidence.reason === 'review-unfinished') {
+    if (!(at > bounds.unfinishedStartedAt)) return evidence;
+    if ('unreadBoundaryAt' in bounds && !(at > bounds.unreadBoundaryAt + RUN_MTIME_SLACK_MS)) return evidence;
+  } else if (!(at > bounds.unreadBoundaryAt + RUN_MTIME_SLACK_MS)) return evidence;
   return { ok: true, settledByComment: evidence.reason, loopPayload: null, scheduled: false, inFlight: false,
     queued: false, recorded: true, skipCardOnly: false };
 }
