@@ -99,6 +99,7 @@ describe('egress table readiness', () => {
     ['nonzero exit', () => ({code: 1})],
     ['unexecutable nft', () => { throw Object.assign(new Error('spawn'), {code: 'ENOENT'}); }],
     ['hung (timeout)', () => ({code: null, timedOut: true})],
+    ['timed out even with exit 0', () => ({code: 0, timedOut: true})],
     ['missing exit status', () => ({})],
   ])('egress readiness: fails closed on %s', async (_name, result) => {
     probeResult = result;
