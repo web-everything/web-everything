@@ -7,7 +7,7 @@
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync, existsSync, cpSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { touchFreeLaneList, readFreeLaneList, isFreeLaneListFresh } from '../lib/free-lane-list.mjs';
@@ -33,11 +33,19 @@ function runPool(args, preload = null) {
 
 // One origin + reference per FILE (built once, restored after every test) instead of one per test — see
 // fixtures/shared-git-fixture.mjs. Everything else a test creates still lives in its own fresh `base`.
+// The POOL is built once per file too: provisioning (a clone per lane, ~5-8s each) was most of this file's cost
+// and, in the integration tier, slowed every file running beside it (PR #6357's integration job ran past its cap).
+// `usePool(n)` puts back a pristine n-lane pool at the SAME absolute path it was provisioned at, so every path a
+// lane recorded stays valid. Both templates are taken BEFORE the origin/reference snapshot, so `restore()` always
+// rolls those back to the exact state the template lanes were cloned from.
 let fixtureRoot, sharedFixture;
+const poolTemplates = new Map();
 beforeAll(() => {
   fixtureRoot = mkdtempSync(join(tmpdir(), 'lane-pool-free-list-event-fixture-'));
   originDir = join(fixtureRoot, 'origin.git');
   referenceDir = join(fixtureRoot, 'reference');
+  poolRoot = join(fixtureRoot, 'pool');
+  base = fixtureRoot; // runPool's salvage dir while the templates are built
 
   git(['init', '--quiet', '--bare', '--initial-branch=trunk', originDir]);
   git(['clone', '--quiet', originDir, referenceDir]);
@@ -48,14 +56,29 @@ beforeAll(() => {
   git(['commit', '--quiet', '-m', 'v1'], referenceDir);
   git(['push', '--quiet', originDir, 'HEAD:refs/heads/lane/seed'], referenceDir);
   git(['update-ref', 'refs/heads/trunk', 'refs/heads/lane/seed'], originDir);
+  for (const count of [1, 3]) {
+    const p = runPool(['provision', `--count=${count}`, ...poolArgs()]);
+    if (p.code !== 0) throw new Error(`template provision --count=${count} failed: ${p.err}`);
+    const tpl = join(fixtureRoot, `pool-template-${count}`);
+    cpSync(poolRoot, tpl, { recursive: true });
+    // No scan/status cache or published list may carry a verdict from template-building into a test.
+    const poolDir = join(tpl, 'freepool');
+    for (const f of readdirSync(poolDir)) if (/cache|free-lanes/.test(f)) rmSync(join(poolDir, f), { force: true });
+    poolTemplates.set(count, tpl);
+  }
+  rmSync(poolRoot, { recursive: true, force: true });
   sharedFixture = sharedRepos(fixtureRoot, [originDir, referenceDir]);
-});
+}, 300_000);
 
 afterAll(() => sharedFixture?.dispose());
 
+function usePool(count) {
+  rmSync(poolRoot, { recursive: true, force: true });
+  cpSync(poolTemplates.get(count), poolRoot, { recursive: true });
+}
+
 beforeEach(() => {
   base = mkdtempSync(join(tmpdir(), 'lane-pool-free-list-event-'));
-  poolRoot = join(base, 'pool');
 });
 
 afterEach(() => {
@@ -66,7 +89,7 @@ afterEach(() => {
 const poolArgs = () => [`--origin=${originDir}`, `--reference=${referenceDir}`, '--name=freepool', '--branch=trunk', '--no-install'];
 
 function acquireOneLane() {
-  expect(runPool(['provision', '--count=1', ...poolArgs()]).code).toBe(0);
+  usePool(1);
   const acquire = runPool(['acquire', ...poolArgs(), '--no-reset', '--session=owner', '--json']);
   expect(acquire.code).toBe(0);
   return JSON.parse(acquire.out); // { lane, path?, holder, ... }
@@ -193,7 +216,7 @@ describe('free-lane list is refreshed by lane-pool events', () => {
   });
 
   it('a release of a RESERVED lane does NOT publish it as free', () => {
-    expect(runPool(['provision', '--count=1', ...poolArgs()]).code).toBe(0);
+    usePool(1);
     expect(runPool(['acquire', '--lane=1', '--reserve', ...poolArgs(), '--no-reset', '--session=owner', '--json']).code).toBe(0);
     writeFileSync(listFile(), JSON.stringify({ v: 1, writtenAt: 1, repo: 'freepool', poolDir: null, lanes: [] }));
     const r = runPool(['release', '--lane=1', '--release-reserved', ...poolArgs(), '--session=owner', '--json']);
@@ -203,7 +226,7 @@ describe('free-lane list is refreshed by lane-pool events', () => {
   });
 
   it('acquire removes a FRESH candidate from the list and keeps the other fresh candidate', () => {
-    expect(runPool(['provision', '--count=3', ...poolArgs()]).code).toBe(0);
+    usePool(3);
     seedList([{ lane: 2, at: Date.now() }, { lane: 3, at: Date.now() }]);
     const a = JSON.parse(runPool(['acquire', ...poolArgs(), '--no-reset', '--session=owner', '--json']).out);
     expect([2, 3]).toContain(a.lane); // taken from the list, not the scan (which would pick lane 1)
@@ -212,7 +235,7 @@ describe('free-lane list is refreshed by lane-pool events', () => {
   });
 
   it('acquire ignores a carried entry older than the max age even inside a freshly written list', () => {
-    expect(runPool(['provision', '--count=3', ...poolArgs()]).code).toBe(0);
+    usePool(3);
     // Lane 3 is genuinely free. Fresh `at`: the list wins and hands out lane 3; an `at` an hour old: the entry is
     // skipped, the scan runs and picks its lowest free lane (1). Reddens if nowMs/maxAgeMs stop reaching freeLaneCandidates.
     seedList([{ lane: 3, at: Date.now() }]);
@@ -224,7 +247,7 @@ describe('free-lane list is refreshed by lane-pool events', () => {
   });
 
   it('trim removes deleted lanes from the published free list and keeps the survivors', () => {
-    expect(runPool(['provision', '--count=3', ...poolArgs()]).code).toBe(0);
+    usePool(3);
     seedList([1, 2, 3].map((lane) => ({ lane, at: Date.now() })));
     const r = runPool(['trim', '--max=1', ...poolArgs(), '--json']);
     expect(r.code, r.err).toBe(0);
@@ -236,7 +259,7 @@ describe('free-lane list is refreshed by lane-pool events', () => {
   });
 
   it('an acquire drops the lane from the list and keeps it fresh', () => {
-    expect(runPool(['provision', '--count=1', ...poolArgs()]).code).toBe(0);
+    usePool(1);
     writeFileSync(listFile(), JSON.stringify({ v: 1, writtenAt: 1, repo: 'freepool', poolDir: null, lanes: [{ lane: 1 }] }));
     const a = JSON.parse(runPool(['acquire', ...poolArgs(), '--no-reset', '--session=owner', '--json']).out);
     const list = readFreeLaneList(listFile());

@@ -21,6 +21,7 @@ import {
   readFreeLaneList,
   writeFreeLaneListAtomic,
   isProvablyCleanAndPushed,
+  touchFreeLaneList,
 } from '../free-lane-list.mjs';
 
 const T0 = Date.parse('2026-09-25T16:00:00.000Z');
@@ -198,5 +199,27 @@ describe('isProvablyCleanAndPushed (the shared no-reset / release-publication ba
     ['unknown ahead fails requireInSync', { ...ok, ahead: null }, { requireInSync: true }, false],
   ])('%s', (_name, snap, opts, expected) => {
     expect(isProvablyCleanAndPushed(snap, opts)).toBe(expected);
+  });
+});
+
+describe('touchFreeLaneList cost budget (runs on every acquire, release and trim)', () => {
+  // PR #6357 send-back: the event refresh must stay cheap — one small read + one atomic write, never a pool rescan.
+  // Budget: under 50ms per touch on average with a 35-lane list (measured well under 1ms locally). The list must
+  // still hold all 35 entries at the end, so pruning cannot make the loop trivially fast.
+  it('a touch on a 35-lane list averages under 50ms and keeps every entry', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'free-lane-touch-budget-'));
+    try {
+      const path = join(dir, 'free.json');
+      const now = Date.now();
+      writeFreeLaneListAtomic(path, buildFreeLaneList({ repoName: 'r', poolDir: dir, writtenAt: now, lanes: Array.from({ length: 35 }, (_, i) => ({ lane: i + 1, path: join(dir, `lane-${i + 1}`), at: now })) }));
+      const touches = 20;
+      const t0 = performance.now();
+      for (let i = 0; i < touches; i++) expect(touchFreeLaneList({ path, repoName: 'r', poolDir: dir, lane: (i % 35) + 1, free: true, now: now + i })).toBe(true);
+      const avgMs = (performance.now() - t0) / touches;
+      expect(readFreeLaneList(path).lanes).toHaveLength(35);
+      expect(avgMs).toBeLessThan(50);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
