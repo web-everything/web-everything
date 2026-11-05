@@ -1,0 +1,86 @@
+import { describe, it, expect, beforeEach } from 'vitest';
+import { resolvePackageManager, installArgv, installCommand, installWithFallback } from '../package-manager.mjs';
+import { resetCascadeLogForTest } from '../policy-cascade.mjs';
+
+const none = { env: {}, platform: undefined };
+beforeEach(() => resetCascadeLogForTest());
+
+describe('resolvePackageManager cascade', () => {
+  it('standard default is npm', () => {
+    const r = resolvePackageManager({ ...none });
+    expect(r.manager).toBe('npm');
+    expect(r.source).toBe('standard');
+  });
+  it('platform beats standard', () => {
+    const r = resolvePackageManager({ env: {}, platform: 'pnpm' });
+    expect(r).toMatchObject({ manager: 'pnpm', source: 'platform' });
+  });
+  it('repo (tool) beats platform', () => {
+    const r = resolvePackageManager({ env: {}, platform: 'pnpm', tool: 'npm' });
+    expect(r).toMatchObject({ manager: 'npm', source: 'tool' });
+  });
+  it('env WE_PACKAGE_MANAGER beats repo', () => {
+    const r = resolvePackageManager({ env: { WE_PACKAGE_MANAGER: 'pnpm' }, platform: 'npm', tool: 'npm' });
+    expect(r).toMatchObject({ manager: 'pnpm', source: 'env' });
+  });
+  it('blank env is unset', () => {
+    expect(resolvePackageManager({ env: { WE_PACKAGE_MANAGER: '  ' }, platform: 'pnpm' }).source).toBe('platform');
+  });
+  it('unknown value fails closed to npm even when a lower layer says pnpm', () => {
+    const r = resolvePackageManager({ env: { WE_PACKAGE_MANAGER: 'yarn' }, platform: 'pnpm' });
+    expect(r.manager).toBe('npm');
+    expect(r.source).toBe('env');
+    expect(r.note).toMatch(/unknown.*yarn/);
+  });
+  it('logs the effective value and source', () => {
+    const lines = [];
+    resolvePackageManager({ env: { WE_PACKAGE_MANAGER: 'pnpm' }, platform: undefined, log: (l) => lines.push(l) });
+    expect(lines.join('\n')).toMatch(/packageManager.*pnpm.*env/);
+  });
+});
+
+describe('installArgv / installCommand', () => {
+  it('npm: ci when frozen, install otherwise', () => {
+    expect(installArgv({ ci: true, ...none })).toMatchObject({ bin: 'npm', args: ['ci'], manager: 'npm' });
+    expect(installArgv({ ci: false, ...none }).args).toEqual(['install']);
+  });
+  it('pnpm: --frozen-lockfile when ci', () => {
+    const r = installArgv({ ci: true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, platform: undefined });
+    expect(r).toMatchObject({ bin: 'pnpm', args: ['install', '--frozen-lockfile'], manager: 'pnpm', source: 'env' });
+  });
+  it('ignoreScripts adds --ignore-scripts for both', () => {
+    expect(installArgv({ ci: true, ignoreScripts: true, ...none }).args).toEqual(['ci', '--ignore-scripts']);
+    expect(installArgv({ ci: true, ignoreScripts: true, env: { WE_PACKAGE_MANAGER: 'pnpm' } }).args)
+      .toEqual(['install', '--frozen-lockfile', '--ignore-scripts']);
+  });
+  it('pnpm falls back to npm when pnpm --version fails, and says why', () => {
+    const r = installArgv({ ci: true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => { throw new Error('no pnpm'); } });
+    expect(r).toMatchObject({ bin: 'npm', args: ['ci'], manager: 'npm' });
+    expect(r.note).toMatch(/pnpm --version failed/);
+  });
+  it('installCommand({frozen}) maps frozen to ci', () => {
+    expect(installCommand({ frozen: true, ...none })).toBe('npm ci');
+    expect(installCommand({ frozen: false, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => '9' })).toBe('pnpm install');
+  });
+});
+
+describe('installWithFallback', () => {
+  it('runs pnpm and does not touch npm on success', () => {
+    const calls = [];
+    const r = installWithFallback({ frozen: true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => '9',
+      exec: (bin, args) => { calls.push([bin, ...args]); } });
+    expect(calls).toEqual([['pnpm', 'install', '--frozen-lockfile']]);
+    expect(r.fellBack).toBe(false);
+  });
+  it('a failed pnpm install falls back to npm ci and logs it', () => {
+    const calls = []; const logs = [];
+    const r = installWithFallback({ frozen: true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => '9', log: (l) => logs.push(l),
+      exec: (bin, args) => { calls.push([bin, ...args]); if (bin === 'pnpm') throw new Error('boom'); } });
+    expect(calls).toEqual([['pnpm', 'install', '--frozen-lockfile'], ['npm', 'ci']]);
+    expect(r).toMatchObject({ fellBack: true, manager: 'npm' });
+    expect(logs.join('\n')).toMatch(/pnpm install failed.*falling back to npm ci/);
+  });
+  it('a failed npm install propagates (no silent success)', () => {
+    expect(() => installWithFallback({ frozen: true, env: {}, exec: () => { throw new Error('npm down'); } })).toThrow('npm down');
+  });
+});
