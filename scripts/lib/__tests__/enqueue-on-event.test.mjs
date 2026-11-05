@@ -823,6 +823,18 @@ describe('catch-up during a daemon refresh (last-good enqueue)', () => {
     expect(calls.length).toBeGreaterThan(1);
     expect(reads).toHaveBeenCalledTimes(1);
   });
+  it('re-reads the pending change once the memo expires, so a newly registered protected change pauses a running catch-up', async () => {
+    let reads = 0;
+    let tick = () => {};
+    const t = catchUpSetup({
+      refreshPending: () => { tick(); return pendingRefresh(); },
+      readPendingChange: () => { reads += 1; return { ok: true, paths: reads === 1 ? ['README.md'] : ['scripts/lib/enqueue-on-event.mjs'], source: 'overlay lane/x' }; },
+    });
+    tick = () => t.advance(31_000);
+    await t.handle.catchUp();
+    expect(reads).toBeGreaterThanOrEqual(2);
+    expect(t.calls.length).toBeLessThan(2); // the stale "go" did not carry over to both candidates
+  });
   it('keeps enqueuing on last-good while an unrelated overlay is pending, and logs the decision with provenance', async () => {
     const { handle, calls, lines } = catchUpSetup({
       refreshPending: pendingRefresh,

@@ -592,6 +592,9 @@ const lastJsonLine = (s) => {
   return null;
 };
 
+/** How long one run reuses a pending-change read across its per-candidate mayStart() calls. */
+const PENDING_CHANGE_MEMO_MS = 30_000;
+
 /**
  * IO: repo-relative paths the pending refresh would change: each unadopted overlay ref and main, against the code clone's HEAD.
  * Any unreadable piece returns {ok:false} so the caller fails closed.
@@ -756,11 +759,15 @@ export function createEnqueueOnEvent({
   async function runDue({ catchUpOnly = false } = {}) {
     let refreshLogged = false;
     // The pending-change read spawns git per overlay and mayStart() runs per candidate: read it once per run, not per call.
-    let changeOnce;
+    // A run can last minutes (fast drains), so the read is reused only briefly: a stale "go" must not outlive a newly registered overlay.
+    let changeMemo = null;
     const pendingChange = () => {
-      if (changeOnce) return changeOnce;
-      try { changeOnce = readPendingChange(); } catch (e) { changeOnce = { ok: false, error: String(e?.message || e).split('\n')[0] }; }
-      return changeOnce;
+      const t = now();
+      if (changeMemo && t - changeMemo.at < PENDING_CHANGE_MEMO_MS) return changeMemo.value;
+      let value;
+      try { value = readPendingChange(); } catch (e) { value = { ok: false, error: String(e?.message || e).split('\n')[0] }; }
+      changeMemo = { at: t, value };
+      return value;
     };
     const mayStart = () => {
       if (!allowed()) return false;
