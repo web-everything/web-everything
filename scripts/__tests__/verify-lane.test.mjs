@@ -245,7 +245,7 @@ try {
 
   it('records the last output lines of a timed-out phase so the next timeout names the running test file', () => {
     const gateScript = join(dir, 'hang-tail.mjs');
-    writeFileSync(gateScript, "console.log('RUN scripts/__tests__/the-slow-one.test.mjs'); console.log('token=' + 'Ab3' + 'xY9zQ7wK2mN'); setInterval(() => {}, 1000);\n");
+    writeFileSync(gateScript, "console.log('RUN scripts/__tests__/the-slow-one.test.mjs'); console.log('token=' + 'Ab3' + 'xY9zQ7wK2mN');\n" + keepAliveScript() + '\n');
     const r = spawnSync('node', [VERIFY_LANE, `--gate=node ${gateScript}`, '--json'], { cwd: dir, encoding: 'utf8', timeout: 60_000,
       env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_PHASE_TIMEOUT_MS: '2000' } });
     const onDisk = JSON.parse(readFileSync(marker(), 'utf8'));
