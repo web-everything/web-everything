@@ -186,19 +186,27 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     refused(release(), sha);
   });
   // A lane-written `.git/commondir` moves refs, objects and config to another repository; every evidence read
-  // would then judge a decoy clone and never see the lane's own unpushed branch.
-  it('refuses a lane whose .git/commondir redirects refs to a decoy repository', () => {
+  // would then judge a decoy clone and never see the lane's own unpushed branch. The refusal must come before any
+  // release work, which would otherwise scrub the other repository's config, and --discard must not override it.
+  it.each(['without', 'with'])('refuses a lane whose .git/commondir redirects refs to a decoy repository, %s --discard', mode => {
+    const extra = mode === 'with' ? ['--discard'] : [];
     const main = git(['rev-parse', 'HEAD'], laneDir);
     const sha = commitWork();
     git(['reset', '--quiet', '--hard', main], laneDir);
     git(['branch', 'work/hidden', sha], laneDir);
     const decoy = join(base, 'decoy');
     git(['clone', '--quiet', origin, decoy]);
+    git(['config', 'credential.helper', 'decoy-helper'], decoy);
     writeFileSync(join(laneDir, '.git', 'commondir'), `${join(decoy, '.git')}\n`);
     expect(git(['branch', '--list', 'work/hidden'], laneDir)).toBe('');
-    const result = release();
-    refused(result);
+    const result = release(extra);
+    expect(result.status, result.stderr).toBe(1);
+    expect(result.data.released).toBe(0);
+    expect(result.data.kept).toEqual([expect.objectContaining({ lane: 1, reason: 'git-dir-redirected' })]);
     expect(result.stderr).toContain('commondir');
+    expect(readFileSync(marker, 'utf8')).toBe(lease);
+    expect(git(['config', '--get', 'credential.helper'], decoy)).toBe('decoy-helper');
+    expect(git(['ls-remote', origin], reference)).not.toContain(sha);
   });
   it.each(['with its reflog', 'with an expired reflog'])('refuses tracked work parked in a stash %s', shape => {
     writeFileSync(join(laneDir, 'seed.txt'), 'stashed edit\n');

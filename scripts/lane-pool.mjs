@@ -2937,16 +2937,27 @@ function releaseGitDirRedirect(dir) {
   if (lines.length !== 2 || !lines.every(ownsPath)) return 'lane git dir does not resolve to its own .git; inspect it manually';
   return '';
 }
+// Runs before ANY release work (config scrub, litter cleanup, salvage push): through a redirect those would edit the
+// other repository's config or push its commits. `--discard` does not override it — the lane is not safe to reuse
+// until its own .git is restored. Same contract as the work refusal: exit 1, a loud journal line, the lane in `kept`.
+function releaseRedirectRefuses(dir, label) {
+  const redirect = releaseGitDirRedirect(dir);
+  if (!redirect) return false;
+  const details = boundedDetails(`lane git dir redirected: ${redirect}`);
+  log(`  ${String(label).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ')}: KEPT — ${details}; lane and lease kept, no config scrub, ` +
+    'litter cleanup or salvage push ran, and --discard does not override this. Restore the lane\'s own .git, then retry release.');
+  journalLaneEvent(dir, { action: 'release-refused', reason: `KEPT — ${details}`, loud: true }, { unlessRepeat: true });
+  process.exitCode = 1;
+  return { reason: 'git-dir-redirected', details };
+}
 
 function releaseWorkRefuses(dir, label, salvage, proof) {
   const safe = value => String(value).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ');
   const quote = value => /^[a-zA-Z0-9_./:-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
-  const redirect = releaseGitDirRedirect(dir);
-  const { commits, why, hint } = redirect ? { commits: '' } : releaseUnprovenCommits(dir, salvage, proof);
-  const tracked = redirect ? '' : releaseTrackedChanges(dir);
-  if (!redirect && commits === '' && tracked === '') return false;
+  const { commits, why, hint } = releaseUnprovenCommits(dir, salvage, proof);
+  const tracked = releaseTrackedChanges(dir);
+  if (commits === '' && tracked === '') return false;
   const details = [
-    redirect ? `release evidence cannot be read: ${redirect}` : '',
     why ? `commits cannot be proven on the canonical origin (${safe(why).slice(0, 300)})${hint
       ? `; local commits not on any origin tracking ref: ${hint.split('\n').map(sha => sha.slice(0, 12)).join(', ')}` : ''}; inspect local history manually`
       : commits === null ? 'commit evidence unreadable or exceeds the Git output limit; inspect local history manually'
@@ -3059,6 +3070,8 @@ async function cmdReleaseAllPools(repo) {
         log(`  ${name}/lane-${n}: ${describeLease(lease)} — reserved; skipped (un-reserve is single-lane --release-reserved)`);
         continue;
       }
+      const redirected = releaseRedirectRefuses(dir, `${name}/lane-${n}`);
+      if (redirected) { kept.push({ pool: name, lane: n, ...redirected }); continue; }
       let salvage, salvageIo, laneIo, proofWhy;
       // Other pools must resolve their own primary's origin; never reuse this pool's URL or a lane remote. The
       // release proof needs that origin even when recovery (salvage) is off.
@@ -3222,6 +3235,8 @@ async function cmdRelease(repo) {
     // non-allowlisted dirty state (real uncommitted work) is left completely untouched by this call.
     // The snapshot and litter `status` / `clean` would run a lane-set clean filter, which no env pin reaches (PR #5775).
     // The release proof (releaseWorkRefuses) reads the canonical origin even when recovery (salvage) is off.
+    const redirected = releaseRedirectRefuses(dir, `lane-${n}`);
+    if (redirected) { kept.push({ lane: n, ...redirected }); continue; }
     const laneIo = repo.originUrl ? realSalvageIo({ repo, preflightLaneDir: dir }) : null;
     const salvageIo = recoveryEnabled() ? laneIo : null;
     scrubClaimedLaneConfig(dir, 'before release snapshot');
