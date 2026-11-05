@@ -5,6 +5,7 @@ import {join} from 'node:path';
 import {createHash} from 'node:crypto';
 import {createRunner, digestInput, digestArgv, execute} from '../forge-exec-run.mjs';
 import * as manifestAPI from '../forge-exec-run.mjs';
+import {keepAliveScript} from '../../lib/test-keepalive.mjs';
 const children = vi.hoisted(() => []);
 vi.mock('node:child_process', async importOriginal => {
   const original = await importOriginal();
@@ -64,7 +65,7 @@ describe('egress table readiness', () => {
       {env: {PATH: '/usr/sbin:/usr/bin:/bin', LANG: 'C'}, timeoutMs: 5000});
   });
   it('execute timeout resolves timedOut and kills a real sleeping child with SIGKILL', async () => {
-    const pending = execute(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], {timeoutMs: 100});
+    const pending = execute(process.execPath, ['-e', keepAliveScript()], {timeoutMs: 100});
     const {child, closed} = children.at(-1);
     expect(child.pid).toBeGreaterThan(0);
     await expect(pending).resolves.toEqual({code: null, timedOut: true});
