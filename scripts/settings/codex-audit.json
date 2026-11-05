@@ -1,0 +1,4 @@
+{
+  "$comment": "audit.priorQuestionHashes: [{hash, acceptUntil}] question hashes still accepted by findAudit until acceptUntil. Lands empty.",
+  "audit": { "priorQuestionHashes": [] }
+}

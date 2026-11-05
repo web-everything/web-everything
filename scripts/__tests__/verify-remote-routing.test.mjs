@@ -2,7 +2,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { appendVerifyRemoteReport, heartbeatOwnedSlot } from '../readiness/heavy-admission.mjs';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
-import { phaseAdmissionPlan, shouldConfirmRemoteRed, readRemoteReport, remoteInfrastructureFailure, phaseRunLocation, overallRunLocation, decidePhaseRemote } from '../lib/verify-remote-routing.mjs';
+import { localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, readRemoteReport, remoteInfrastructureFailure, phaseRunLocation, overallRunLocation, decidePhaseRemote } from '../lib/verify-remote-routing.mjs';
 import { runInNewContext } from 'node:vm';
 import { fstatSync, readSync } from 'node:fs';
 
@@ -58,7 +58,7 @@ describe('timeout preservation', () => {
       remoteAttempt: forgeDispatch, ranOn: { location: 'local' },
     }));
     const context = {
-      phaseAdmission, phaseAdmissionPlan, decidePhaseRemote, acquireSlotBlocking,
+      phaseAdmission, localPhaseReason, phaseAdmissionPlan, decidePhaseRemote, acquireSlotBlocking,
       phaseAdmissionKind: () => ({ kind: 'files' }), classifyCommandKind: () => 'selected',
       admissionPhases: {}, laneMatch: null, GATE: command, ADMISSION_TIMEOUT_MS: 1000,
       shouldConfirmRemoteRed, remoteInfrastructureFailure, mergeRunLocation: (a, b) => a === b ? a : 'mixed',
