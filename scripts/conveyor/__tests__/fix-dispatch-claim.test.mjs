@@ -961,13 +961,13 @@ describe('idle-claim auto-release (R201)', () => {
     const HUNG_SILENT = () => ({ hung: true, reason: 'stale-no-activity' });
     const claimWith = (sessionId) => acquireFixDispatchClaim({ repo: 'we', pr: 5996, kind: 'fix', headSha: 'sha1', owner: 'A',
       ...(sessionId ? { sessionId } : {}), lockRoot: claimRoot, nowMs: T0, nowIso: iso(T0), leaseMinutes: 10 });
-    const run = ({ row, quietMs, hungInfoFor = HUNG_SILENT, sweeps = 1, head = () => 'sha1' }) => {
+    const run = ({ row, quietMs, hungInfoFor = HUNG_SILENT, sweeps = 1, head = () => 'sha1', env = {} }) => {
       const out = { released: [], refreshed: [] };
       for (let i = 0, t = T0 + MIN; i < sweeps; i += 1, t += 2 * MIN) {
         const r = refreshLiveFixDispatchClaims({
           lockRoot: claimRoot, listAgentsAll: () => [row], hungInfoFor, awaitingVerifyFor: null,
           activityMsFor: () => t - quietMs, prHeadFor: head, recordEvent: () => {}, nowIso: () => iso(t),
-          idleRelease: resolveIdleClaimRelease({ env: {}, platform: null }),
+          idleRelease: resolveIdleClaimRelease({ env, platform: null }),
         });
         out.released.push(...(r.released ?? []));
         out.refreshed.push(...(r.refreshed ?? []));
@@ -986,6 +986,16 @@ describe('idle-claim auto-release (R201)', () => {
       expect(out.released).toHaveLength(0);
       expect(out.refreshed).toHaveLength(1);
       expect(claimStillHeld()).not.toBeNull();
+    });
+
+    // With idle release switched off (WE_IDLE_CLAIM_RELEASE_ENABLED=0) the exemption has no downstream path to defer
+    // to: a silent bound idle holder must be marked hung exactly as before, so its claim is never heartbeat-refreshed
+    // and falls to its own TTL instead of being held indefinitely.
+    it('(a2) with idle release DISABLED a bound idle row with a hung/stale-no-activity verdict is marked hung: never refreshed, never released', () => {
+      claimWith(SID);
+      const out = run({ row: idleRow, quietMs: 120 * MIN, sweeps: 16, env: { WE_IDLE_CLAIM_RELEASE_ENABLED: '0' } });
+      expect(out.refreshed).toHaveLength(0);
+      expect(out.released).toHaveLength(0);
     });
 
     it('(b) the same bound row with state working (and status busy) is marked hung: never refreshed, never idle-released', () => {
@@ -1384,7 +1394,7 @@ describe('idle-claim auto-release (R201)', () => {
     ['hung idle session', [{ name: 'fix-5996', startedAt: T0 + 1000, state: 'idle', hung: true }]],
     ['self-reported done session', [{ name: 'fix-5996', startedAt: T0 + 1000, state: 'idle', selfReportedDone: true }]],
     ['auth-expired session', [{ name: 'fix-5996', startedAt: T0 + 1000, state: 'idle', authExpired: true }]],
-    ['historical terminal session', [{ name: 'fix-5996', startedAt: T0 + 1000, state: 'done', startedAt: T0 - 1 }]],
+    ['historical terminal session', [{ name: 'fix-5996', startedAt: T0 - 1, state: 'done' }]],
   ])('a sweep with %s breaks the idle window without extending the lease', (_name, rows) => {
     acquire();
     const key = { repo: 'we', pr: 5996, lockRoot: claimRoot };

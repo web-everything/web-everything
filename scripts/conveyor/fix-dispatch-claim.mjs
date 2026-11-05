@@ -444,8 +444,10 @@ export function refreshLiveFixDispatchClaims({
         // before the idle-release quiet floor (90 min): marking it hung here would drop the row out of
         // isClaimSessionLive and skip the idle-release code below forever. An idle row bound to THIS claim with no
         // pending tool call is owned by that path (quietLongEnough, awaiting-verify and unchanged-head checks keep
-        // it fail closed). A hung verdict that names a pending call past its grace is kept as hung.
-        if (a.state === 'idle' && boundToClaim(a) && info.reason === 'stale-no-activity') return a;
+        // it fail closed). A hung verdict that names a pending call past its grace is kept as hung. The exemption defers
+        // to the idle-release path, so it only applies while that path is enabled: with it off (platform setting or
+        // WE_IDLE_CLAIM_RELEASE_ENABLED) a silent holder stays hung and its claim falls to the TTL, never held forever.
+        if (idleRelease.enabled && a.state === 'idle' && boundToClaim(a) && info.reason === 'stale-no-activity') return a;
         return { ...a, hung: true };
       });
     const isAwaiting = typeof awaitingVerifyFor === 'function' && agentsAll.some((row) => {
