@@ -13,7 +13,8 @@ import { readRedTeamDisposition, readRedTeamProbes } from './red-team-gate.mjs';
 
 const mqOid = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.test(value) ? value.toLowerCase() : null;
 // Explicit failure reasons only; future enum values require operator inspection.
-const mqFailureReasons = new Set(['failed_checks', 'ci_failure', 'merge_conflict',
+const MQ_MERGE_CONFLICT_RETRY_CAP = 3;
+const mqFailureReasons = new Set(['failed_checks', 'ci_failure',
   'branch_protection_failure', 'invalid_merge_commit']);
 const mqRemovalReason = event => typeof event?.reason === 'string' ? event.reason.trim().toLowerCase() : '';
 
@@ -38,7 +39,7 @@ function mqSameHeadHold({ pr, head }, reason) {
 }
 
 /** Only the merge-group commit's second parent identifies the tested PR head. */
-export function decideMqSameHead({ pr, head, timeline } = {}) {
+export function decideMqSameHead({ pr, head, timeline, mergeState } = {}) {
   const hold = reason => mqSameHeadHold({ pr, head }, reason);
   const currentHead = mqOid(head);
   if (!currentHead) return hold('missing or invalid head');
@@ -49,11 +50,18 @@ export function decideMqSameHead({ pr, head, timeline } = {}) {
   // Force-push events omit fast-forwards: a push TO this SHA can be a restoration of a failed head.
   // Neither those events nor commit dates can bind an otherwise unbound removal to an older head.
   // Retain the operator-visible hold; a live operator re-enqueue can still reach bookkeeping below.
+  let mergeConflictRemovals = 0;
   for (const event of timeline.nodes) {
     if (event?.__typename === 'AddedToMergeQueueEvent' || event?.__typename === 'HeadRefForcePushedEvent') continue;
     if (event?.__typename !== 'RemovedFromMergeQueueEvent') return hold('unreadable merge-queue event');
     const reason = mqRemovalReason(event);
     if (reason === 'manual' || reason === 'merged') continue;
+    // A base-dependent conflict is not head-failure evidence, but only while the live PR is CLEAN (checked below).
+    // A base-dependent conflict is not head-failure evidence, but only while the live PR is CLEAN (checked below).
+    if (reason === 'merge_conflict') {
+      mergeConflictRemovals++;
+      continue;
+    }
     if (!mqFailureReasons.has(reason))
       return hold('unknown removal reason; operator must inspect history and enqueue manually');
     const testedHead = mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid);
@@ -62,6 +70,10 @@ export function decideMqSameHead({ pr, head, timeline } = {}) {
     }
     if (testedHead === currentHead) return hold(reason || 'unknown removal reason');
   }
+  if (mergeConflictRemovals >= MQ_MERGE_CONFLICT_RETRY_CAP)
+    return hold(`repeated merge_conflict ejection (${mergeConflictRemovals} times); operator must inspect history and enqueue manually`);
+  if (mergeConflictRemovals > 0 && mergeState !== 'CLEAN')
+    return hold(`merge_conflict removal and the PR is not CLEAN (${String(mergeState ?? 'unknown')}); not re-enqueuing`);
   return { hold: false, line: null };
 }
 
@@ -252,6 +264,18 @@ function mqSameHeadRefresh({ repo, pr, head, exec, log, store, allow }) {
   }
 }
 
+const timelineHasConflict = timeline => Array.isArray(timeline?.nodes)
+  && timeline.nodes.some(event => event?.__typename === 'RemovedFromMergeQueueEvent' && mqRemovalReason(event) === 'merge_conflict');
+
+/** Live merge state on the same head, or null (unreadable or head moved) so the conflict exemption fails closed. */
+function readMqMergeState({ repo, pr, head, exec }) {
+  try {
+    const live = JSON.parse(exec('gh', ['pr', 'view', String(pr), '--repo', repo, '--json', 'mergeStateStatus,headRefOid'],
+      { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
+    return mqOid(live?.headRefOid) === head ? live.mergeStateStatus ?? null : null;
+  } catch { return null; }
+}
+
 export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, log = () => {}, allowAlreadyQueued = true, refresh } = {}) {
   // A human's live retry must reach the strategy's already-queued path and its follow-up/ledger writes.
   // This only skips historical admission for bookkeeping. Fresh mutations use allowAlreadyQueued:false
@@ -264,7 +288,8 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
   const decision = queue.error || !currentHead || mqOid(queue.head) !== currentHead
     ? mqSameHeadHold({ pr, head }, 'unreadable or mismatched live merge-queue state; inspect queue before retrying')
     : allowAlreadyQueued && queue.inQueue === true ? { hold: false, line: null }
-      : decideMqSameHead({ pr, head, timeline: (timeline = readMqTimeline({ repo, pr, exec })) });
+      : decideMqSameHead({ pr, head, timeline: (timeline = readMqTimeline({ repo, pr, exec })),
+        mergeState: timelineHasConflict(timeline) ? readMqMergeState({ repo, pr, head: currentHead, exec }) : undefined });
   if (decision.hold) {
     log(decision.line);
     // Unknown/incomplete history cannot authorize recovery. Require a failed removal bound to H.
