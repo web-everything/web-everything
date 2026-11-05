@@ -4,6 +4,8 @@ import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import * as sync from '../daemon-rebuild/overlay-main-sync.mjs';
+import { runHeavyTests } from '../daemon-rebuild/auto-rebase.mjs';
+import { scratchTestOutput } from '../../conveyor/soak/breaks/scratch-tests-forge-command.mjs';
 import { addOverlay, appendOverlayEvent, overlayFilePath } from '../daemon-overlays.mjs';
 import { alertsFilePath } from '../daemon-rebuild/state.mjs';
 
@@ -130,6 +132,82 @@ const sameMergedTree = trees => {
   expect(trees.length).toBeGreaterThan(1);
   for (const tree of trees.slice(1)) expect(tree).toEqual(trees[0]);
 };
+
+// Real Vitest reporters and the production runner; only process execution is injected.
+function tapRunners(f, { flaky = false, mainTitle = 'worker behaves', mainSuite = 'worker', corrupt } = {}) {
+  const calls = [];
+  const runner = vi.fn(async options => runHeavyTests(options, { exec: async () => {
+    const main = ok(options.root, ['rev-parse', 'HEAD']) === f.mainSha;
+    const red = main || !flaky || calls.length === 0;
+    calls.push({ main, files: selectedFiles(options), head: ok(options.root, ['rev-parse', 'HEAD']) });
+    const state = failed => ({ state: failed ? 'fail' : 'pass', duration: 1,
+      ...(failed ? { errors: [{ message: 'expected worker to behave', stack: '' }] } : {}) });
+    let stdout = await scratchTestOutput(selectedFiles(options).map(name => {
+      const failed = red && name === failedFile;
+      return { type: 'suite', name, mode: 'run', result: state(failed), tasks: [
+        { type: 'suite', name: main ? mainSuite : 'worker', mode: 'run', result: state(failed), tasks: [
+          { type: 'suite', name: 'nested', mode: 'run', result: state(failed), tasks: [
+            { type: 'test', name: main ? mainTitle : 'worker behaves', mode: 'run', result: state(failed) },
+          ] },
+        ] },
+      ] };
+    }));
+    if (corrupt) stdout = corrupt(stdout);
+    return { status: red ? 1 : 0, stdout, stderr: red ? 'tests failed' : '',
+      ...(red ? { error: Object.assign(new Error('Command failed: tests'), { code: 1 }) } : {}) };
+  } }));
+  f.deps.testRunner = runner;
+  f.deps.mainTestRunner = runner;
+  return calls;
+}
+
+describe('production heavy runner failing TAP evidence', () => {
+  it('retries a real nonzero-with-error run, then emits flaky-retried and syncs', async () => {
+    const f = fixture(), calls = tapRunners(f, { flaky: true });
+    expect(await job(f)).toMatchObject({ pushed: true });
+    expect(calls).toHaveLength(2);
+    expect(calls[0].files).toHaveLength(3);
+    expect(calls[1]).toMatchObject({ main: false, files: [failedFile], head: calls[0].head });
+    expect(kinds(f)).toContain('overlay-main-flaky-retried');
+    expect(kinds(f)).toContain('overlay-main-synced');
+    expect(f.pushes).toHaveLength(1);
+  });
+
+  it('classifies the same nested assertion on merged tree and plain main as main-red', async () => {
+    const f = fixture(), calls = tapRunners(f);
+    expect(await job(f)).toMatchObject({ skipped: true, reason: 'main-red' });
+    expect(calls.map(call => call.main)).toEqual([false, false, true]);
+    expect(calls.slice(1).map(call => call.files)).toEqual([[failedFile], [failedFile]]);
+    expect(kinds(f)).toContain('overlay-main-red');
+    expect(f.outcomes.some(event => /failed|needs-you/.test(event.kind))).toBe(false);
+    noPublication(f);
+  });
+
+  it.each([
+    { mainTitle: 'different assertion' },
+    { mainSuite: 'different suite' },
+  ])('retains operator failure when main has a different assertion identity (%j)', async different => {
+    const f = fixture(), calls = tapRunners(f, different);
+    await expect(job(f)).rejects.toThrow(failure);
+    expect(calls.map(call => call.main)).toEqual([false, false, true]);
+    expect(kinds(f)).not.toContain('overlay-main-red');
+    expect(f.outcomes.map(event => event.kind)).toContain('overlay-main-sync-failed');
+    noPublication(f);
+  });
+
+  it.each([
+    ['incomplete plan', stdout => stdout.replace('1..3', '1..4')],
+    ['missing typed count', stdout => stdout.replace(/^      Tests  .*$/m, '')],
+    ['oversized inventory', stdout => stdout + ' '.repeat(8 * 1024 * 1024)],
+  ])('fails closed with operator review for nonzero-with-error and %s', async (_, corrupt) => {
+    const f = fixture(), calls = tapRunners(f, { corrupt });
+    await expect(job(f)).rejects.toThrow(/operator review required/);
+    expect(calls).toHaveLength(1);
+    expect(kinds(f)).not.toContain('overlay-main-red');
+    expect(kinds(f)).not.toContain('overlay-main-flaky-retried');
+    noPublication(f);
+  });
+});
 
 describe('overlay main sync failed-file reruns', () => {
   it.each([0, 1])('flaky pass emits retried event and ends synced with push (initial exit %i)', async status => {

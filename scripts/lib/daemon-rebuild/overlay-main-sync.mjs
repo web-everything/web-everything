@@ -410,7 +410,7 @@ const remoteUnconfirmed = result => result?.status === 124 && typeof result.stde
   && result.stderr.includes('remote termination unconfirmed; refusing local rerun (exit 124).');
 function failedTestReport(stdout, options) {
   if (typeof stdout !== 'string' || Buffer.byteLength(stdout) > 8 * 1024 * 1024) throw testFailure();
-  const failed = new Set();
+  const failed = new Map(), titles = [];
   let leaf = 0, diagnostic, inTap = false;
   // Reuse the strict TAP plan and typed-test-count validator. Normalize only red
   // statuses/diagnostics for validation, then restore the observed failed leaves.
@@ -423,10 +423,14 @@ function failedTestReport(stdout, options) {
     }
     const yaml = inTap && /^( +)---$/.exec(line);
     if (yaml) { diagnostic = yaml[1]; return []; }
-    const task = inTap && /^\s*(not )?ok \d+ - /.exec(line);
-    if (task && !line.endsWith(' {')) {
-      if (task[1]) failed.add(leaf);
-      leaf++;
+    const task = inTap && /^( *)(not )?ok \d+ - (.*?)(?: # (SKIP|TODO|time=\d+(?:\.\d+)?ms))?( \{)?$/s.exec(line);
+    if (inTap && /^\s*}$/.test(line)) titles.pop();
+    if (task) {
+      if (task[5]) titles.push(task[3]);
+      else if (titles.length) {
+        if (task[2]) failed.set(leaf, { title: task[3], ancestorTitles: titles.slice(1) });
+        leaf++;
+      }
     }
     if (line.startsWith('      Tests  ')) {
       const summary = /^      Tests  (.+) \((\d+)\)$/.exec(line);
@@ -449,6 +453,7 @@ function failedTestReport(stdout, options) {
     if (failed.has(index)) {
       if (assertion.status !== 'passed') throw testFailure();
       assertion.status = 'failed';
+      Object.assign(assertion, failed.get(index));
     }
   });
   return report;
@@ -468,17 +473,16 @@ function assertionIdentity(file, assertion) {
 async function syncTestEvidence({ root, scratch, selected, testReport, env, io, runner }) {
   io.rmSync(testReport, { force: true }); // Never consume a previous attempt's evidence.
   const invocation = buildHeavyTestInvocation({ root, scratch, selected, testReport, env, io });
-  const result = await (runner ?? (async options => {
-    const result = await runHeavyTests(options, { io });
-    if (result?.status === 1 && !result.error) {
-      try {
-        io.writeFileSync(testReport, JSON.stringify(failedTestReport(result.stdout,
-          { ...options, root: io.realpathSync(scratch) })));
-      } catch { /* No trustworthy inventory: retain the command failure below. */ }
-    }
-    return result;
-  }))(invocation);
+  const result = await (runner ?? (options => runHeavyTests(options, { io })))(invocation);
   if (remoteUnconfirmed(result)) return { remoteUnconfirmed: true };
+  let validatedFailure = false;
+  if (result?.status === 1) {
+    try {
+      const report = failedTestReport(result.stdout, { ...invocation, root: io.realpathSync(scratch) });
+      io.writeFileSync(testReport, JSON.stringify(report));
+      validatedFailure = true;
+    } catch { /* No trustworthy TAP inventory: retain the command failure below. */ }
+  }
   const commandOk = result?.status === 0 && !result.error && typeof result.stdout === 'string';
   let report;
   try {
@@ -508,7 +512,7 @@ async function syncTestEvidence({ root, scratch, selected, testReport, env, io, 
     && results.length === selected.length && results.every(r => names.includes(r?.name));
   const green = commandOk && complete && !failed.length && report.success !== false
     && !(report.numFailedTests > 0) && !(report.numFailedTestSuites > 0);
-  if (!commandOk && !(result?.status === 1 && !result.error && complete && failed.length)) {
+  if (!commandOk && !(result?.status === 1 && (!result.error || validatedFailure) && complete && failed.length)) {
     output({ ...result, step: 'tests' });
   }
   return { green, failed, complete, failedAssertions };
