@@ -124,7 +124,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
   const range = prerequisite ? `${prerequisite}..${head}` : head;
   // -t lists tree (directory) entries too: without it an EMPTY subtree entry (crafted with mktree) has no file below it
   // and never shows up, yet its name travels in the pack.
-  const log = await git(['log', '--raw', '-t', '--ignore-submodules=none', '-z', '--no-renames', '--no-abbrev', '--root', '-m', '--diff-filter=d', '--format=', range]);
+  const log = await git(['log', '--raw', '-t', '--ignore-submodules=none', '-z', '--no-renames', '--no-abbrev', '--root', '--diff-merges=separate', '--no-ext-diff', '--no-textconv', '--no-show-signature', '--diff-filter=d', '--format=', range]);
   if (log.code !== 0) throw bundleError('bundle-credential-scan-failed');
   // Commit messages (and author/committer identity lines) travel in the pack too. Tags are not bundled: only the pinned ref is.
   const messages = await git(['log', '-z', '--root', '--format=%an%n%ae%n%cn%n%ce%n%B', range]);
@@ -185,7 +185,11 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
   for (let i = 0; i < tokens.length; i++) {
     const meta = tokens[i].toString('latin1');
     if (!meta.startsWith(':')) continue;
-    const [, newMode, , newSha] = meta.split(' ');
+    // Fail closed: --diff-merges=separate emits exactly ":old new oldsha newsha status". A combined header ("::", several old
+    // modes/hashes) means the config-independent invocation was not honoured; never parse it as an ordinary diff.
+    const fields = meta.split(' ');
+    if (meta.startsWith('::') || fields.length !== 5 || !/^[0-7]{6}$/.test(fields[0].slice(1)) || !/^[0-7]{6}$/.test(fields[1])) throw bundleError('bundle-credential-scan-failed');
+    const [, newMode, , newSha] = fields;
     const path = tokens[++i];
     if (!path) throw bundleError('bundle-credential-scan-failed');
     const label = path.toString('utf8');

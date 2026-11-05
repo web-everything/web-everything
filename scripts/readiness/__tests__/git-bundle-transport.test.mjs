@@ -433,3 +433,31 @@ describe('R593 empty directory tree entries (R559)', () => {
     expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ finding: 'gitlink' });
   });
 });
+
+describe('R593 merge-resolution blobs are scanned whatever the user diff config says (R559)', () => {
+  const secret = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8';
+  /** Divergent parents; the merge resolution (only) introduces c.txt with a token; a later commit scrubs it. */
+  const mergeWithResolutionSecret = async () => {
+    git(lane, 'checkout', '-q', '-b', 'side', tip);
+    await commit(lane, { 'b.txt': 'b\n' }, 'side');
+    git(lane, 'checkout', '-q', '-');
+    await commit(lane, { 'a.txt': 'a\n' }, 'main side');
+    git(lane, ...ident, 'merge', '--no-commit', '--no-ff', 'side');
+    await fs.writeFile(join(lane, 'c.txt'), `key ${secret}\n`); git(lane, 'add', '--', 'c.txt');
+    git(lane, ...ident, 'commit', '-q', '-m', 'merge');
+    return commit(lane, { 'c.txt': 'clean\n' }, 'scrub');
+  };
+  for (const mode of ['combined', 'dense-combined', 'first-parent', 'remerge']) {
+    it(`flags the resolution-only token with log.diffMerges=${mode}`, async () => {
+      git(lane, 'config', 'log.diffMerges', mode);
+      const head = await mergeWithResolutionSecret();
+      expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ path: 'c.txt', finding: 'github-token' });
+    });
+  }
+  it('refuses (does not parse) a combined-format raw header', async () => {
+    const combined = Buffer.from(`::100644 100644 100644 ${'a'.repeat(40)} ${'b'.repeat(40)} ${'c'.repeat(40)} MM\0c.txt\0`);
+    const faulty = (args, ...rest) => args.includes('--raw') ? { code: 0, stdout: combined, stderr: Buffer.alloc(0) } : exec(args, ...rest);
+    await expect(scanBundleRange({ cwd: lane, head: tip, prerequisite: runnerMain, exec: (call) => call.args.includes('--raw') ? faulty(call.args) : exec(call) }))
+      .rejects.toMatchObject({ code: 'bundle-credential-scan-failed' });
+  });
+});
