@@ -35,6 +35,19 @@ describe('R618 pushed fix owes its review', () => {
   it('reviews a bounced new fixer head rather than fixing the old findings again', () => {
     expect(run({ labels: ['review:changes'] }).dispatch).toEqual([expect.objectContaining({ kind: 'review' })]);
   });
+  it.each([
+    { labels: ['review:changes', 'merge-status:conflicting'], mergeStateStatus: 'CLEAN' },
+    { labels: ['review:changes'], mergeStateStatus: 'DIRTY' },
+    { labels: ['review:changes', 'merge-status:conflicting'], mergeStateStatus: 'DIRTY' },
+  ])('a fix-end preserves conflict-repair priority with green CI: %j', conflict => {
+    const before = run({ ...conflict, comments: [advisory(OLD)] });
+    const after = run({ ...conflict, comments: [advisory(OLD), end()] });
+    const routes = result => result.dispatch.map(({ kind, mode, isConflict, cap }) => ({ kind, mode, isConflict, cap }));
+    expect(before.dispatch).toEqual([expect.objectContaining({ kind: 'fix' })]);
+    if (conflict.labels.includes('merge-status:conflicting')) expect(before.dispatch[0].isConflict).toBe(true);
+    expect(routes(after)).toEqual(routes(before));
+    expect(after.dispatch.map(d => d.kind)).not.toContain('review');
+  });
   it('recognizes the last full review verdict basis, not only advisory and accept markers', () => {
     const verdict = { author, createdAt: REVIEW_AT,
       body: `🔁 review — changes requested\n\nRecorded by agent via ${REVIEW_PR_CHANNEL}.\n\nRepair the export.\n\n---\n\nNet basis: \`${'c'.repeat(40)}..${OLD}\` — 1 net changed file(s) vs current main\n\n${REVIEW_PR_FOOTER}` };

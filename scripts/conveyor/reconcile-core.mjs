@@ -3579,9 +3579,11 @@ export function planReconcile({
     // A pushed repair owes its review even if fix-end left the old findings/advisory labels in place.
     // Claims and live reviewers already refused above; completed red CI still belongs to its repair path.
     // Both the timestamp and original thread index must put the release after that review.
+    // A released fix does not supersede a conflict still owed its existing repair route and cap.
     const lastReview = latestHeadReview(pr);
     const release = releasedFixClaim(pr);
     if (OWED[phase] && lastReview && release && release.releasedAtMs > lastReview.at
+      && !withPhase.labels.includes(CONFLICT_LABEL) && String(pr?.mergeStateStatus ?? '').toUpperCase() !== 'DIRTY'
       && release.index > lastReview.index
       && !sameHeadSha(lastReview.head, pr.headRefOid)) {
       const why = 'the fixer released a new head after the last review — its review is owed before another repair';
