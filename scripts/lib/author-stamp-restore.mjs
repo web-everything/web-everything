@@ -8,7 +8,7 @@ const refusal = (reason) => ({ action: 'refuse', reason });
 const safe = (value) => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
 
 /** A delta's removed/context text is evidence of an id, never evidence the editor supplied it.
- * Plain snapshots contribute to id agreement but cannot establish insertion provenance.
+ * Plain snapshots use the separate oldest-snapshot rule, never delta insertion semantics.
  * Unknown HTML diff encodings refuse rather than guessing at insertion semantics;
  * operators must inspect that history manually.
  */
@@ -54,6 +54,9 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
   const ids = new Set();
   let source;
   let marker;
+  let oldest;
+  let oldestMarker;
+  let plainHistory = true;
   for (const edit of edits) {
     if (typeof edit?.diff !== 'string' || typeof edit.editor?.login !== 'string'
       || !edit.editor.login.trim() || typeof edit.createdAt !== 'string' || !Number.isFinite(Date.parse(edit.createdAt))) {
@@ -62,8 +65,16 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
     const markers = edit.diff.match(/<!--\s*authored-by-actor:[\s\S]*?-->/g) ?? [];
     const supplied = suppliedMarkers(edit.diff);
     if (supplied === null) return refusal('unsupported HTML edit delta; inspect complete GitHub history manually');
+    // Mixed histories cannot use snapshot presence to override delta provenance.
+    // Treat context, bare +/- lines and inline diff encodings conservatively as deltas.
+    if (/^(?:@@|diff |index |[ +\-])|\[-|\{\+/m.test(edit.diff)) plainHistory = false;
     if (edit.diff.replace(/<!--\s*authored-by-actor:[\s\S]*?-->/g, '').includes('authored-by-actor:')) {
       return refusal('malformed historical stamp');
+    }
+    // GitHub lists newest first for equal timestamps: the later position is older.
+    if (!oldest || Date.parse(edit.createdAt) <= Date.parse(oldest.createdAt)) {
+      oldest = edit;
+      oldestMarker = markers[0];
     }
     for (const verbatim of markers) {
       const found = readAuthorActorStamps(verbatim);
@@ -76,6 +87,11 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
     }
   }
   if (ids.size !== 1) return refusal('history has no stamp or conflicting stamp ids; inspect GitHub history');
+  if (!source && plainHistory && oldestMarker
+    && oldest.editor.login.toLowerCase() === authorLogin.toLowerCase()) {
+    source = oldest;
+    marker = oldestMarker;
+  }
   if (!source) return refusal('no evidence the PR author supplied the stamp; inspect GitHub history');
   return { action: 'restore', reason: 'all historical stamps agree with an author-edited snapshot',
     id: [...ids][0], source, marker, body: `${body}\n\n${marker}\n` };

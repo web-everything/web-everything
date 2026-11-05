@@ -144,8 +144,10 @@ describe('plain snapshot provenance — oldest author snapshot and agreeing ids'
       writeBody: vi.fn((_pr, next) => { body = next; }) });
     expectReason(await restoreAuthorStamp(seams), 'restore');
     expectReason(await restoreAuthorStamp(seams), 'skip');
-    expect(seams.writeBody).toHaveBeenCalledExactlyOnceWith(6244, `${BODY}\n\n${marker}\n`);
-    expect(seams.readEdits).toHaveBeenCalledExactlyOnceWith(6244);
+    expect(seams.writeBody).toHaveBeenCalledTimes(1);
+    expect(seams.writeBody).toHaveBeenCalledWith(6244, `${BODY}\n\n${marker}\n`);
+    expect(seams.readEdits).toHaveBeenCalledTimes(1);
+    expect(seams.readEdits).toHaveBeenCalledWith(6244);
     expect(body).toBe(`${BODY}\n\n${marker}\n`);
     expect(readAuthorActorStamps(body)).toEqual([ID]);
   });
@@ -161,10 +163,12 @@ describe('restoreAuthorStamp — injected IO and concurrent edits', () => {
     expect(seams.readPr).toHaveBeenCalledTimes(2);
     expect(seams.readPr).toHaveBeenNthCalledWith(1, 6244);
     expect(seams.readPr).toHaveBeenNthCalledWith(2, 6244);
-    expect(seams.writeBody).toHaveBeenCalledExactlyOnceWith(6244, `${BODY}\n\n${buildAuthorActorMarker(ID)}\n`);
+    expect(seams.writeBody).toHaveBeenCalledTimes(1);
+    expect(seams.writeBody).toHaveBeenCalledWith(6244, `${BODY}\n\n${buildAuthorActorMarker(ID)}\n`);
     expect(seams.readPr.mock.invocationCallOrder[1]).toBeGreaterThan(seams.readEdits.mock.invocationCallOrder[0]);
     expect(seams.writeBody.mock.invocationCallOrder[0]).toBeGreaterThan(seams.readPr.mock.invocationCallOrder[1]);
-    expect(seams.log).toHaveBeenCalledExactlyOnceWith(
+    expect(seams.log).toHaveBeenCalledTimes(1);
+    expect(seams.log).toHaveBeenCalledWith(
       `author-stamp-restore: #6244 restored stamp ${ID} from edit 2026-10-01T10:00:00Z by ${AUTHOR}`,
     );
   });
@@ -267,10 +271,12 @@ describe('author provenance in edit deltas', () => {
     expect(seams.writeBody).not.toHaveBeenCalled();
   });
 
-  it('refuses a lone author snapshot because presence does not prove insertion', async () => {
-    const seams = io({ readEdits: vi.fn(() => [edit(buildAuthorActorMarker(ID))]) });
-    expectReason(await restoreAuthorStamp(seams), 'refuse');
-    expect(seams.writeBody).not.toHaveBeenCalled();
+  it('restores a lone plain author snapshot under the oldest-snapshot rule', async () => {
+    const marker = buildAuthorActorMarker(ID);
+    const seams = io({ readEdits: vi.fn(() => [edit(marker)]) });
+    expectReason(await restoreAuthorStamp(seams), 'restore');
+    expect(seams.writeBody).toHaveBeenCalledTimes(1);
+    expect(seams.writeBody).toHaveBeenCalledWith(6244, `${BODY}\n\n${marker}\n`);
   });
 
   it.each([
@@ -293,7 +299,8 @@ describe('author provenance in edit deltas', () => {
     const edits = [edit(`@@ -0,0 +1 @@\n+${marker}`), edit(`-${marker}`, 'chalbert')];
     const seams = io({ readEdits: vi.fn(() => edits) });
     expect(await restoreAuthorStamp(seams)).toMatchObject({ action: 'restore', id: ID, marker });
-    expect(seams.writeBody).toHaveBeenCalledExactlyOnceWith(6244, `${BODY}\n\n${marker}\n`);
+    expect(seams.writeBody).toHaveBeenCalledTimes(1);
+    expect(seams.writeBody).toHaveBeenCalledWith(6244, `${BODY}\n\n${marker}\n`);
   });
 
   it('still refuses conflicting ids present only on deleted lines', () => {
