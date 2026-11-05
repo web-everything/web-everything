@@ -3924,6 +3924,9 @@ are compared by content, so index flags and submodule-ignore config cannot hide 
 Known limit: other entries still trust the index stat cache, so a lane that hand-rewrites `.git/index`
 with stat fields matching an edited file reads clean. Release does not refuse that shape yet; the
 bounded content check is #xuuhfpf. Tests must not promise refusal for it until that lands.
+A lane whose `.git` is not a real directory, carries a `.git/commondir`, or does not resolve its git dir and
+common dir to its own `.git` refuses before any evidence read: those redirect refs, objects and config to
+another repository, so every later read would judge the wrong one.
 Untracked files deliberately do not block release: the guard covers tracked changes only.
 URL-based salvage may leave no tracking ref: only its verified
 remote SHA is an additional exclusion, and unrelated local branches still block release. Tests that

@@ -2918,13 +2918,35 @@ function releaseUnprovenCommits(dir, salvage, proof) {
   return { commits };
 }
 
+// A lane-written `.git/commondir` (or a `.git` gitfile / symlink) moves refs, objects and config to another
+// repository, so every evidence read would judge that repository instead of the lane. Refuse before reading through
+// it: the lane's .git must be a real directory with no commondir, and git must resolve both its git dir and common
+// dir to it. Returns '' when the lane owns its git dir, else the refusal reason (unreadable counts as redirected).
+function releaseGitDirRedirect(dir) {
+  const own = join(dir, '.git');
+  const present = path => { try { lstatSync(path); return true; } catch (e) { return e?.code !== 'ENOENT'; } };
+  let real;
+  try {
+    if (!lstatSync(own).isDirectory()) return 'lane .git is not a directory (gitfile or symlink); inspect it manually';
+    real = realpathSync(own);
+  } catch { return 'lane .git is unreadable; inspect it manually'; }
+  if (present(join(own, 'commondir'))) return 'lane .git/commondir redirects refs and objects to another repository; remove it';
+  const dirs = releaseEvidenceGit(['rev-parse', '--path-format=absolute', '--absolute-git-dir', '--git-common-dir'], dir);
+  const lines = dirs === null ? [] : dirs.split('\n');
+  const ownsPath = path => { try { return realpathSync(path) === real; } catch { return false; } };
+  if (lines.length !== 2 || !lines.every(ownsPath)) return 'lane git dir does not resolve to its own .git; inspect it manually';
+  return '';
+}
+
 function releaseWorkRefuses(dir, label, salvage, proof) {
   const safe = value => String(value).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ');
   const quote = value => /^[a-zA-Z0-9_./:-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
-  const { commits, why, hint } = releaseUnprovenCommits(dir, salvage, proof);
-  const tracked = releaseTrackedChanges(dir);
-  if (commits === '' && tracked === '') return false;
+  const redirect = releaseGitDirRedirect(dir);
+  const { commits, why, hint } = redirect ? { commits: '' } : releaseUnprovenCommits(dir, salvage, proof);
+  const tracked = redirect ? '' : releaseTrackedChanges(dir);
+  if (!redirect && commits === '' && tracked === '') return false;
   const details = [
+    redirect ? `release evidence cannot be read: ${redirect}` : '',
     why ? `commits cannot be proven on the canonical origin (${safe(why).slice(0, 300)})${hint
       ? `; local commits not on any origin tracking ref: ${hint.split('\n').map(sha => sha.slice(0, 12)).join(', ')}` : ''}; inspect local history manually`
       : commits === null ? 'commit evidence unreadable or exceeds the Git output limit; inspect local history manually'

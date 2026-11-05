@@ -185,6 +185,21 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     expect(git(['rev-list', 'work/hidden', '--not', main], laneDir)).toBe('');
     refused(release(), sha);
   });
+  // A lane-written `.git/commondir` moves refs, objects and config to another repository; every evidence read
+  // would then judge a decoy clone and never see the lane's own unpushed branch.
+  it('refuses a lane whose .git/commondir redirects refs to a decoy repository', () => {
+    const main = git(['rev-parse', 'HEAD'], laneDir);
+    const sha = commitWork();
+    git(['reset', '--quiet', '--hard', main], laneDir);
+    git(['branch', 'work/hidden', sha], laneDir);
+    const decoy = join(base, 'decoy');
+    git(['clone', '--quiet', origin, decoy]);
+    writeFileSync(join(laneDir, '.git', 'commondir'), `${join(decoy, '.git')}\n`);
+    expect(git(['branch', '--list', 'work/hidden'], laneDir)).toBe('');
+    const result = release();
+    refused(result);
+    expect(result.stderr).toContain('commondir');
+  });
   it.each(['with its reflog', 'with an expired reflog'])('refuses tracked work parked in a stash %s', shape => {
     writeFileSync(join(laneDir, 'seed.txt'), 'stashed edit\n');
     git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'stash', '--quiet'], laneDir);
