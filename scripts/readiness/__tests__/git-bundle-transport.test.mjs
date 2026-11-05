@@ -188,6 +188,21 @@ describe('R593 credential scan over the whole bundled range (R559)', () => {
     const head = await commit(lane, { 'credentials.txt': 'x\n' }, 'cred');
     expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ path: 'credentials.txt' });
   });
+  const tokenName = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8';
+  it('flags a token in a FILE NAME (tree entry) even when the content is clean', async () => {
+    const head = await commit(lane, { [`${tokenName}.txt`]: 'clean\n' }, 'token-named file');
+    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ finding: 'github-token' });
+  });
+  it('flags a token in a DIRECTORY name component', async () => {
+    await fs.mkdir(join(lane, tokenName));
+    const head = await commit(lane, { [`${tokenName}/a.txt`]: 'clean\n' }, 'token-named dir');
+    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ finding: 'github-token' });
+  });
+  it('flags a token-named file that a later commit deleted (historical tree entry still travels)', async () => {
+    await commit(lane, { [`${tokenName}.txt`]: 'clean\n' }, 'token-named file');
+    const head = await commit(lane, { [`${tokenName}.txt`]: null }, 'drop it');
+    expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ finding: 'github-token' });
+  });
   it('ignores secrets that only live in the base history before the prerequisite', async () => {
     expect(await scanBundleRange({ cwd: lane, head: tip, prerequisite: tip, exec })).toBeNull();
   });

@@ -187,6 +187,10 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
     if (!path) throw bundleError('bundle-credential-scan-failed');
     const label = path.toString('utf8');
     if (newMode === '160000' || newMode === '120000') return { path: label, finding: newMode === '160000' ? 'gitlink' : 'symlink' };
+    // Tree entries (file AND directory names) travel in the pack: a token in a name is a leak whatever the blob holds.
+    // Every path that adds an entry in the range is listed here, including ones a later commit deleted.
+    const pathFinding = credentialTextFinding(path.toString('latin1')) ?? credentialTextFinding(label);
+    if (pathFinding) return { path: 'tree-entry-name', finding: pathFinding }; // never echo the secret-bearing name
     let excluded;
     try { excluded = classifyManifestPath(path).excluded; } catch { excluded = true; }
     if (excluded) return { path: label, finding: 'excluded-path' };
