@@ -62,4 +62,17 @@ describe('output tail (verify timeout)', () => {
     for (let i = 0; i < 20; i++) wide.push(`${'é'.repeat(30)}\n`);
     expect(Buffer.byteLength(wide.finish().join('\n'))).toBeLessThanOrEqual(100);
   });
+  it('drops the whole overlong line, including a secret that straddles the cut', () => {
+    const secret = 'gh' + 'p_' + 'a1B2c3D4e5F6g7H8i9J0';
+    const tail = createOutputTail();
+    tail.push('z'.repeat(4090) + secret.slice(0, 8)); tail.push(`${secret.slice(8)}\nnext line\n`);
+    const out = tail.finish().join('\n');
+    expect(out).not.toContain('e5F6g7H8i9J0');
+    expect(out).toContain('next line');
+  });
+  it('keeps a single multibyte line within the byte cap', () => {
+    const tail = createOutputTail({ maxBytes: 100, maxLineChars: 400 });
+    tail.push(`${'\u20ac'.repeat(80)}\n`);
+    expect(Buffer.byteLength(tail.finish().join('\n'))).toBeLessThanOrEqual(100);
+  });
 });

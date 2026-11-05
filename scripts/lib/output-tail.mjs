@@ -28,18 +28,30 @@ export function createOutputTail({ maxLines = OUTPUT_TAIL_LINES, maxBytes = OUTP
   };
   return {
     push(chunk, stream = 'out') {
-      const text = (partials.get(stream) ?? '') + String(chunk).replace(/\r\n?/g, '\n');
-      const parts = text.split('\n');
-      const rest = parts.pop();
-      partials.set(stream, rest.length > HARD_LINE_CHARS ? OVERLONG : rest);
-      for (const part of parts) lines.push(tidy(part));
+      const state = partials.get(stream) ?? { text: '', skipping: false };
+      const parts = String(chunk).replace(/\r\n?/g, '\n').split('\n');
+      parts.forEach((part, i) => {
+        const last = i === parts.length - 1;
+        if (state.skipping) {
+          // Discard the rest of an overlong line through its newline, so no secret fragment resumes after the cut.
+          if (!last) { state.skipping = false; lines.push(OVERLONG); }
+          return;
+        }
+        state.text += part;
+        if (state.text.length > HARD_LINE_CHARS) { state.text = ''; if (last) state.skipping = true; else lines.push(OVERLONG); return; }
+        if (!last) { lines.push(tidy(state.text)); state.text = ''; }
+      });
+      partials.set(stream, state);
       if (lines.length > maxLines) lines = lines.slice(-maxLines);
     },
     finish() {
-      const out = [...lines, ...[...partials.values()].filter(Boolean).map(tidy)].slice(-maxLines);
+      const out = [...lines, ...[...partials.values()].filter(st => st.text).map(st => tidy(st.text))].slice(-maxLines);
       let total = out.reduce((n, l) => n + Buffer.byteLength(l) + 1, 0) - 1;
       while (out.length > 1 && total > maxBytes) total -= Buffer.byteLength(out.shift()) + 1;
-      return total > maxBytes ? [Buffer.from(out[0]).subarray(-maxBytes).toString('utf8')] : out;
+      if (total <= maxBytes) return out;
+      let only = out[0];
+      while (Buffer.byteLength(only) > maxBytes) only = only.slice(1);
+      return [only];
     },
   };
 }
