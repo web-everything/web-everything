@@ -10,7 +10,7 @@
  * exercised end-to-end through the resolver, not just re-asserted in isolation.
  */
 import { describe, it, expect } from 'vitest';
-import { resolvePrWorkUnit, isSafeFallbackScopeEntry } from '../pr-work-unit.mjs';
+import { resolvePrWorkUnit, isSafeFallbackScopeEntry, splitScopeEntries } from '../pr-work-unit.mjs';
 import { findItem as realFindItem } from '../../operations/dispatch-lane-io.mjs';
 
 // Bind the real `findItem` to a fixed item corpus, arity-1 — the shape `resolvePrWorkUnit` expects.
@@ -232,5 +232,39 @@ describe('resolvePrWorkUnit (#xdx3ifb)', () => {
       expect(unit.scope).not.toContain('we:.github/workflows/deploy.yml');
       expect(isSafeFallbackScopeEntry('we:.github/workflows/deploy.yml')).toBe(true); // shape alone would have passed
     });
+  });
+});
+
+
+describe('splitScopeEntries', () => {
+  it('splits a two-path entry', () => {
+    expect(splitScopeEntries(['we:a we:b'])).toEqual(['we:a', 'we:b']);
+  });
+  it('deduplicates in first-seen order after splitting', () => {
+    expect(splitScopeEntries(['we:b we:a', 'we:b', 'we:c we:a'])).toEqual(['we:b', 'we:a', 'we:c']);
+  });
+  it('inherits the nearest prefix only within the same entry', () => {
+    expect(splitScopeEntries(['we:a b fui:c d', 'e', 'we:f g'])).toEqual([
+      'we:a', 'we:b', 'fui:c', 'fui:d', 'e', 'we:f', 'we:g',
+    ]);
+  });
+  it.each([undefined, null, 'we:a we:b', {}])('returns [] for non-array input %j', (raw) => {
+    expect(splitScopeEntries(raw)).toEqual([]);
+  });
+  it('trims entries and drops empty whitespace pieces', () => {
+    expect(splitScopeEntries(['  we:a \t we:b\n', '', ' \n\t '])).toEqual(['we:a', 'we:b']);
+  });
+});
+
+describe('combined item scope entries', () => {
+  const item = { num: '7594', slug: 'fixture', scope: ['we:a we:b'] };
+  it('normalizes the item reader scope', () => {
+    expect(realFindItem('7594', () => [item]).scope).toEqual(['we:a', 'we:b']);
+  });
+  it('normalizes resolved scope even with an injected item reader', () => {
+    expect(resolvePrWorkUnit({
+      repo: 'we', pr: { number: 6193, headRefName: 'lane/7594-fixture' },
+      findItem: () => item, fetchDiffPaths: () => { throw new Error('unexpected diff read'); },
+    }).scope).toEqual(['we:a', 'we:b']);
   });
 });

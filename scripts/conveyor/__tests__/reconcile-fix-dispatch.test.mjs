@@ -2150,3 +2150,25 @@ describe('stale-base mechanical fix brief', () => {
     expect(withPlannedContext('brief', planned[0])).toContain('base predates required job(s) standards, new-job');
   });
 });
+
+
+it('fills a planned fix brief from a combined item scope entry without throwing', () => {
+  const { planned, refusals } = planFixesFromReconcile([
+    { kind: 'fix', prNumber: 6193, headRefName: 'lane/7594-fixture' },
+  ], () => ({ num: '7594', slug: 'fixture', scope: ['we:a we:b'] }), () => []);
+  expect(refusals).toEqual([]);
+  expect(planned).toHaveLength(1);
+  const spawnAgent = vi.fn(() => '');
+  expect(() => dispatchFix({ ...planned[0], lane: 9 }, {
+    root: '/repo', grantConflictHelper: vi.fn(), readBrief: () => REAL_TEMPLATE_STUB,
+    mintSessionId: () => '11111111-1111-4111-8111-111111111111', spawnAgent,
+  })).not.toThrow();
+  expect(spawnAgent).toHaveBeenCalledTimes(1);
+  expect(spawnAgent.mock.calls[0][0].at(-1)).toContain('--scope=we:a,we:b ');
+});
+
+it('splits the card-at-ref scope before returning it', () => {
+  const exec = vi.fn(() => Buffer.from('---\nscope: ["we:a b", "we:a"]\n---\n').toString('base64'));
+  expect(fetchCardScopeAtRef('backlog/7594-fixture.md', 'sha', { exec, root: '/repo' }))
+    .toEqual(['we:a', 'we:b']);
+});
