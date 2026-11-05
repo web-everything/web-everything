@@ -331,6 +331,10 @@ describe('R593 raw commit object scan (R559)', () => {
     const head = rawCommit(sig('GnuPG v2'));
     expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toBeNull();
   });
+  it('refuses (does not skip) a single commit object over the per-batch bound', async () => {
+    const head = rawCommit(`x-pad ${'x'.repeat(3 * 1024 * 1024 + 1)}\n`);
+    await expect(scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).rejects.toMatchObject({ code: 'bundle-credential-scan-too-large' });
+  });
   it('refuses (does not skip) a commit range too large to scan', async () => {
     await expect(scanBundleRange({ cwd: lane, head: tip, prerequisite: runnerMain, exec, maxTotalBytes: 1 })).rejects.toMatchObject({ code: 'bundle-credential-scan-too-large' });
   });

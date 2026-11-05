@@ -148,7 +148,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
       if (type !== 'commit' || !Number.isSafeInteger(Number(size))) throw bundleError('bundle-credential-scan-failed');
       commitSizes.set(sha, Number(size)); commitTotal += Number(size);
     }
-    if (commitSizes.size !== commits.length || commitTotal > maxTotalBytes) throw bundleError('bundle-credential-scan-too-large');
+    if (commitSizes.size !== commits.length || commitTotal > maxTotalBytes || [...commitSizes.values()].some(size => size > SCAN_BATCH_BYTES)) throw bundleError('bundle-credential-scan-too-large');
     let group = [], groupBytes = 0;
     const flushCommits = async () => {
       if (!group.length) return null;
@@ -171,8 +171,8 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
       return null;
     };
     for (const sha of commits) {
-      if (groupBytes + commitSizes.get(sha) > SCAN_BATCH_BYTES) { const hit = await flushCommits(); if (hit) return hit; }
-      group.push(sha); groupBytes += commitSizes.get(sha);
+      if (groupBytes + commitSizes.get(sha) + 64 > SCAN_BATCH_BYTES) { const hit = await flushCommits(); if (hit) return hit; }
+      group.push(sha); groupBytes += commitSizes.get(sha) + 64; // + the 'sha type size' header line
     }
     const hit = await flushCommits(); if (hit) return hit;
   }
