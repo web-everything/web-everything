@@ -111,6 +111,18 @@ describe('a frozen pnpm install needs no npm parity proof until npm is actually 
     expect(installArgv({ ci: true, env: { WE_PACKAGE_MANAGER: 'npm' }, readPlatform: bad }).args).toEqual(['ci']);
     expect(() => installArgv({ ci: true, env: {}, readPlatform: bad })).toThrow(/lockfileParity/);
   });
+  it('a valid platform npm next to an unreadable platform file is still gated (the unreadable one may have said pnpm)', () => {
+    const partial = () => ({ prefs: { packageManager: 'npm' }, errors: ['operator.json: Unexpected token'] });
+    const r = resolvePackageManager({ env: {}, readPlatform: partial });
+    expect(r).toMatchObject({ manager: 'npm', source: 'platform' });
+    expect(r.degraded).toMatch(/unreadable/);
+    expect(() => installArgv({ ci: true, env: {}, readPlatform: partial })).toThrow(/lockfileParity/);
+    expect(installArgv({ ci: true, env: {}, readPlatform: partial, lockfileParity: () => true }).args).toEqual(['ci']);
+  });
+  it('a platform pnpm next to an unreadable platform file runs pnpm without a proof', () => {
+    const partial = () => ({ prefs: { packageManager: 'pnpm' }, errors: ['operator.json: Unexpected token'] });
+    expect(installArgv({ ci: true, env: {}, readPlatform: partial, pnpmVersion: () => '9' }).args).toEqual(['install', '--frozen-lockfile']);
+  });
   it('an unknown env value is still gated', () => {
     expect(() => installArgv({ ci: true, env: { WE_PACKAGE_MANAGER: 'yarn' }, readPlatform: bad })).toThrow(/lockfileParity/);
   });

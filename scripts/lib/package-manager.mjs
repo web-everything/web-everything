@@ -70,7 +70,8 @@ export function installArgv({ ci = false, ignoreScripts = false, pnpmVersion = d
   // A frozen npm ci needs the parity proof when an unknown value forced npm, or a degraded platform layer may have masked
   // a pnpm choice (the standard default won). A valid explicit env/tool value overrides the degraded layer, so a frozen
   // pnpm install, or an explicit npm one, needs no npm proof: npm parity is only checked if a pnpm fallback to npm happens.
-  const masked = !!r.note || (!!r.degraded && r.source === 'standard');
+  // A platform-won npm is masked too: an unreadable operator file (merged last) may have said pnpm over the repo file's npm.
+  const masked = !!r.note || (!!r.degraded && r.manager === 'npm' && (r.source === 'standard' || r.source === 'platform'));
   if (masked && ci) {
     let proven = false;
     try { proven = typeof lockfileParity === 'function' && lockfileParity() === true; } catch { proven = false; }
