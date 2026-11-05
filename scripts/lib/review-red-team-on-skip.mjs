@@ -740,6 +740,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
                 const verdict = evidence?.status?.status === 'finished' ? evidence.status.result?.foldedVerdict : null;
                 if (!['accept', 'changes'].includes(verdict)) row.settleError = 'no recorded red-team verdict; label unchanged';
                 else if (verdict === 'accept' && evidence?.loopPayload?.verdict?.verdict !== 'accept') row.settleError = 'review payload is not an accept; label unchanged';
+                else if (verdict === 'accept' && witness && witness.newest?.verdict?.verdict !== 'accept') row.settleError = 'newest same-head review is not an accept; label unchanged';
                 else if (verdict === 'accept' && normalizeRedTeamResult(evidence.status.result).priorComment !== 'posted') row.settleError = 'red-team result comment not confirmed posted; label unchanged';
                 else {
                   // A withheld changes result must never inherit the clear disposition of an older comment.
