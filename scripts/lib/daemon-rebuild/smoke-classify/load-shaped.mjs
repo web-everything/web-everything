@@ -78,7 +78,11 @@ function isBudgetBootRow(row, detail, minElapsedMs) {
   if (Array.isArray(row.entries)) {
     if (!row.entries.length || row.entries.some(entry => !entry || typeof entry.ok !== 'boolean')) return false;
     const failures = row.entries.filter(entry => !entry.ok);
-    return failures.length > 0 && failures.every(entry => CHILD_BUDGET_SKIP.test(entry.kind)
+    // Every recorded attempt must be a budget skip: an earlier real crash must keep the row code-shaped.
+    const allSkipped = entry => Array.isArray(entry.attempts) && entry.attempts.length > 0
+      && entry.attempts.every(a => a && a.ok === false && CHILD_BUDGET_SKIP.test(a.kind));
+    return failures.length > 0 && failures.every(entry => (entry.attempts === undefined
+      ? CHILD_BUDGET_SKIP.test(entry.kind) : allSkipped(entry))
       || isEnvTimeoutRow({ name: row.name, ok: false, entries: [entry] }, { minElapsedMs }));
   }
   const [header, ...lines] = detail.split('\n');
@@ -114,9 +118,8 @@ export function isLoadShapedRow(row, env = {}, probe) {
   if (LOAD_CONTENTION_SIGNATURES.some((re) => re.test(detail))) return true;
   // Our slot refusal is load contention even for code checks such as dispatch-dry-run.
   if (isGhThrottleOnlyDetail(detail)) return true;
-  const killed = BOUNDED_KILL.exec(detail);
   if ((BUDGET_SKIP.test(detail) || isBudgetBootRow(row, detail, minElapsedMs)
-    || (killed && Number(killed[1]) >= MIN_OWN_CAP_MS) || isExtendedGhThrottleOnlyDetail(detail))
+    || isExtendedGhThrottleOnlyDetail(detail))
     && hostOverloaded(row, env, probe)) return true;
   return row.mayBeTransient !== false && TRANSIENT_FAILURE_PATTERNS.some((re) => re.test(detail));
 }
@@ -125,9 +128,12 @@ export function isLoadShapedRow(row, env = {}, probe) {
 export function cachedRejectionLoadRetry(state, env, { now = Date.now(), probe } = {}) {
   if (!state?.rejected || Number.isFinite(Date.parse(state.rejected.retryAt || ''))
     || state.rejected.harnessBroken || !Array.isArray(state.held?.details) || !state.held.details.length) return null;
-  if (!state.held.details.every(detail => detail && isLoadShapedRow({
-    name: detail.name, ok: false, detail: detail.detail,
-  }, env, probe))) return null;
+  // Held details are gate-recorded: a bounded kill's elapsed time is at least its own cap.
+  const rowOf = detail => {
+    const cap = Number(BOUNDED_KILL.exec(String(detail.detail ?? ''))?.[1]);
+    return { name: detail.name, ok: false, detail: detail.detail, ...(cap >= MIN_OWN_CAP_MS ? { ms: cap } : {}) };
+  };
+  if (!state.held.details.every(detail => detail && isLoadShapedRow(rowOf(detail), env, probe))) return null;
   const attempts = (state.rejected.attempts || 0) + 1;
   return { envLoad: true, attempts, retryAt: new Date(now + envLoadRetryDelayMs(env, attempts)).toISOString() };
 }

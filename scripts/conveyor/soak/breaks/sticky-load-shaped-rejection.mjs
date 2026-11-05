@@ -17,7 +17,8 @@ const overloadedRows = () => [
   { name: 'dispatch-dry-run', ok: false, ms: 533869, mayBeTransient: false, detail: 'dispatch dry-run child failed: timed out after 533869ms (process group killed)' },
   { name: 'tree-stays-clean', ok: false, ms: 0, mayBeTransient: true, detail: BUDGET },
   { name: 'daemon-entries-boot', ok: false, ms: 3, mayBeTransient: false,
-    entries: [{ ok: false, kind: `child failed: ${BUDGET}`, timeoutMs: 60000, elapsedMs: 0, attempts: 1 }],
+    entries: [{ ok: false, kind: `child failed: ${BUDGET}`, timeoutMs: 60000, elapsedMs: 0,
+      attempts: [{ ok: false, kind: `child failed: ${BUDGET}` }] }],
     detail: `1/1 daemon entries failed to boot:\n- skills-src/conveyor/runner.mjs: child failed: ${BUDGET}` },
 ];
 const throttleRows = () => [

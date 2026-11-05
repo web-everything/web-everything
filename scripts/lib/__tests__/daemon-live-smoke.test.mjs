@@ -2704,7 +2704,7 @@ describe('load-shaped rows need host-load evidence (sticky rejection)', () => {
   const budgetRow = (name) => ({ name, ok: false, ms: 0, mayBeTransient: true, detail: budget });
   const bootRow = (entries) => ({ name: 'daemon-entries-boot', ok: false, ms: 5, mayBeTransient: false, entries,
     detail: `${entries.length}/${entries.length} daemon entries failed to boot:\n` + entries.map((e) => `- x.mjs: ${e.kind}`).join('\n') });
-  const skipEntry = () => ({ ok: false, kind: `child failed: ${budget}`, timeoutMs: 60000, elapsedMs: 0, attempts: 1 });
+  const skipEntry = () => ({ ok: false, kind: `child failed: ${budget}`, timeoutMs: 60000, elapsedMs: 0, attempts: [{ ok: false, kind: `child failed: ${budget}` }] });
   const throttleMixed = { name: 'dispatch-dry-run', ok: false, ms: 9000, mayBeTransient: false,
     detail: 'dispatch dry-run failed (2/7): reconcile-ci-heal-pass: gh-throttle: throttled — no gh slot within 8.095s (class=background); retry next tick\n; reconcile-review-pass: reconcile failed: reconcile read failed (exit 1): gh-throttle: throttled — no gh slot within 8.249s (class=background); retry next tick' };
 
@@ -2723,6 +2723,8 @@ describe('load-shaped rows need host-load evidence (sticky rejection)', () => {
     const crash = { ok: false, kind: 'child failed: exited 1', timeoutMs: 60000, elapsedMs: 100, attempts: 1 };
     expect(stickyIsLoadShapedRow({ ...bootRow([skipEntry(), crash]), hostLoad: hot }, {})).toBe(false);
     expect(stickyIsLoadShapedRow({ ...bootRow([skipEntry()]), hostLoad: cool }, {})).toBe(false);
+    const hidden = { ...skipEntry(), attempts: [{ ok: false, kind: 'child failed: exited 1' }, { ok: false, kind: `child failed: ${budget}` }] };
+    expect(stickyIsLoadShapedRow({ ...bootRow([hidden]), hostLoad: hot }, {})).toBe(false);
   });
   it('gh-throttle plus a downstream "reconcile read failed" is load-shaped when overloaded only', () => {
     expect(stickyIsLoadShapedRow({ ...throttleMixed, hostLoad: hot }, {})).toBe(true);
