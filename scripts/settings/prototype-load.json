@@ -171,6 +171,15 @@
       "findings": [
         "scripts/lib/drain-poison-guard.mjs:130 — The new API path relies on a pre-existing raw-text grep that misses YAML-escaped identities. Main’s `bornAs: \"xabc12\\u0033\"` and an added card’s `bornAs: xabc123` decode identically, but a read-only probe returned `{ok:true}`, allowing the duplicate through admission."
       ]
+    },
+    {
+      "ref": "lane/mq-same-head-merge-conflict",
+      "sha": "1c2c1cacd9ae0d3bc55324817a705e9a50e38b2c",
+      "ruling": "R594",
+      "findings": [
+        "scripts/lib/drain-queue-safety.mjs:59 — One or two `merge_conflict` removals now bypass commit-binding validation and the same-head failure hold whenever the live PR is CLEAN. CLEAN does not prove the failed merge-group conditions changed; previously these cases required operator inspection.",
+        "scripts/__tests__/merge-ai-prs-prestage.test.mjs:188 — Replacing `merge_conflict` with `ci_failure` removes integration coverage that prevented a force-push from bypassing an unbound conflict failure. The test now passes despite that protection being removed."
+      ]
     }
   ]
 }
