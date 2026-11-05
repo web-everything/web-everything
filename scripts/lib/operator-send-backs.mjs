@@ -78,7 +78,8 @@ export function openOperatorSendBacks(pr) {
       // Preserve the old path for missing/ambiguous timestamps, generic releases and unchanged heads.
       if (text.trimStart().startsWith('🔓 conveyor fix-end') && namesSendBack(text, item)) {
         const at = Date.parse(c.createdAt), requestedAt = Date.parse(item.at);
-        const head = /at `([a-f0-9]{7,40})`/i.exec(text)?.[1];
+        const release = /^🔓 conveyor fix-end — fix claim released\r?\n\r?\n`([^`\r\n]+)` released the fix claim at `([a-f0-9]{7,40})`\.(?:[ \t]|\r?\n|$)/i.exec(text);
+        const head = release?.[1].trim() ? release[2] : null;
         if (Number.isFinite(at) && Number.isFinite(requestedAt) && at > requestedAt
           && head && (!item.head || differentHead(item.head, head))) return true;
       }

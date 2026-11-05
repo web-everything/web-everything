@@ -57,6 +57,14 @@ describe('R618 pushed fix owes its review', () => {
   it('does not re-arm when the reviewed head is unchanged', () => {
     expect(run({ comments: [advisory(HEAD), end()] }).dispatch.map(d => d.kind)).not.toContain('review');
   });
+  it('never rearms a covered current head when a skewed old-head review sorts later', () => {
+    const comments = [advisory(HEAD), advisory(OLD, { createdAt: SEND_AT }), end()];
+    expect(run({ comments }).dispatch.map(d => d.kind)).not.toContain('review');
+  });
+  it.each(['2026-11-05T09:00:00Z', REVIEW_AT])('keeps the old fix path for inconsistent or tied cross-head review time %s', createdAt => {
+    const comments = [advisory(OLD), advisory('d'.repeat(40), { createdAt }), end()];
+    expect(run({ comments }).dispatch[0]?.mode).toBe('advisory-fix');
+  });
   it('keeps an active fix claim authoritative', () => {
     expect(run({ fixClaim: { who: 'new-fixer' } }).refusals[0]?.kind).toBe('fix-claimed');
   });
@@ -98,6 +106,17 @@ describe('R618 same-head operator send-back supersedes a finished advisory', () 
       expect.objectContaining({ kind: 'fix', mode: 'operator-send-back' }),
     ]);
   });
+  it('compares a send-back only with current-head reviews despite a future-dated old-head review', () => {
+    const comments = [advisory(OLD, { createdAt: END_AT }), advisory(HEAD), sendBack()];
+    expect(run(held(comments)).dispatch).toEqual([
+      expect.objectContaining({ kind: 'fix', mode: 'operator-send-back' }),
+    ]);
+  });
+  it('uses the latest current-head review rather than an earlier one for a send-back', () => {
+    const comments = [advisory(HEAD), sendBack(), advisory(HEAD, { createdAt: END_AT }),
+      advisory(OLD, { createdAt: REVIEW_AT })];
+    expect(run(held(comments)).dispatch.map(d => d.mode)).not.toContain('operator-send-back');
+  });
   it('an older send-back leaves already-reviewed-head intact', () => {
     expect(run(held([sendBack({ createdAt: '2026-11-05T09:00:00Z' }), advisory(HEAD)]))
       .refusals[0]?.kind).toBe('already-reviewed-head');
@@ -120,12 +139,36 @@ describe('R618 same-head operator send-back supersedes a finished advisory', () 
     const coverage = end({ body: `${end().body}\n\n<!-- addresses-operator-send-back: send-back -->` });
     expect(openOperatorSendBacks(pr({ comments: [sendBack(), coverage] }))).toHaveLength(1);
   });
+  it.each([
+    `Quoted repair at \`${HEAD.slice(0, 9)}\`.`,
+    `> \`fix-session\` released the fix claim at \`${HEAD.slice(0, 9)}\`.`,
+    `\`\`\`text\n\`fix-session\` released the fix claim at \`${HEAD.slice(0, 9)}\`.\n\`\`\``,
+  ])('a headless fix-end cannot resolve a request using body text: %s', quoted => {
+    const request = sendBack({ body: sendBack().body.replace(HEAD, OLD) });
+    const body = `${buildFixEndComment({ who: 'fix-session' })}\n\n${quoted}\n<!-- addresses-operator-send-back: send-back -->`;
+    expect(openOperatorSendBacks(pr({ comments: [request, end({ body })] }))).toHaveLength(1);
+  });
+  it('a quoted new head cannot supersede the actual unchanged claim-release head', () => {
+    const body = `${buildFixEndComment({ who: 'fix-session', headSha: OLD })}\n\n> at \`${HEAD.slice(0, 9)}\`\n<!-- addresses-operator-send-back: send-back -->`;
+    const request = sendBack({ body: sendBack().body.replace(HEAD, OLD) });
+    expect(openOperatorSendBacks(pr({ comments: [request, end({ body })] }))).toHaveLength(1);
+  });
   it.each(['evidence', 'fix-end'])('does not re-fire after covering %s', kind => {
     const request = sendBack({ body: sendBack().body.replace(HEAD, OLD) });
     const coverage = kind === 'evidence'
       ? { author, createdAt: END_AT, body: `## Fix evidence\n\n<!-- addresses-operator-send-back: send-back -->\nHead: \`${HEAD}\`` }
       : end({ body: `${end().body}\n\n<!-- addresses-operator-send-back: send-back -->` });
     const comments = [advisory(OLD), request, coverage, advisory(HEAD, { createdAt: '2026-11-05T11:30:00Z' })];
+    expect(openOperatorSendBacks(pr({ comments }))).toEqual([]);
+    expect(run(held(comments)).dispatch).toEqual([]);
+    expect(run(held(comments)).refusals[0]?.kind).toBe('already-reviewed-head');
+  });
+  it.each(['\n', '\r\n', '\n\n'])('resolves a changed-head fix-end with coverage metadata immediately after the release sentence (%j)', separator => {
+    const request = sendBack({ body: sendBack().body.replace(HEAD, OLD) });
+    const body = buildFixEndComment({ who: 'fix-session', headSha: HEAD })
+      .replace('. ', `.${separator}<!-- addresses-operator-send-back: send-back -->\n`);
+    const comments = [advisory(OLD), request, end({ body }),
+      advisory(HEAD, { createdAt: '2026-11-05T11:30:00Z' })];
     expect(openOperatorSendBacks(pr({ comments }))).toEqual([]);
     expect(run(held(comments)).dispatch).toEqual([]);
     expect(run(held(comments)).refusals[0]?.kind).toBe('already-reviewed-head');
