@@ -175,6 +175,32 @@ describe('sourceNeedsGit', () => {
       expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(false);
     }
   });
+  it('nested class / function expressions keep every pending outer state (a stack, not one slot)', () => {
+    const E = "import {execSync} from 'node:child_process'; ";
+    const tail = " execSync('git rev-parse --is-inside-work-tree'); const s = '/tmp';";
+    // the exact input of the operator send-back: the inner `class {}` must not overwrite the outer pending class
+    expect(sourceNeedsGit(E + "const C = class extends (class {}) {} / 2;" + tail)).toBe(true);
+    expect(sourceNeedsGit(E + "const C = class extends (class extends (class {}) {}) {} / 2;" + tail)).toBe(true);
+    expect(sourceNeedsGit(E + "const C = class extends mix(class {}, class {}) {} / 2;" + tail)).toBe(true);
+    expect(sourceNeedsGit(E + "const C = class extends (function(){ return class {}; })() {} / 2;" + tail)).toBe(true);
+    expect(sourceNeedsGit(E + "const C = class extends (class { static a = 1; }) {} / 2;" + tail)).toBe(true);
+    expect(sourceNeedsGit(E + "const f = function(a = class {}, b = function(){}){} / 2;" + tail)).toBe(true);
+    // a declaration around nested expressions still ends a statement: the next `/` starts a regex
+    expect(sourceNeedsGit(E + "class A extends (class {}) {}\n/'/.test(a);" + tail)).toBe(true);
+  });
+  it('a command separator inside a quoted shell argument does not start a new command', () => {
+    const E = "import { execSync } from 'node:child_process'; ";
+    for (const lit of [
+      `'echo "a; git rev-parse --is-inside-work-tree"'`, `"echo 'a; git status'"`, `'echo "a && git status"'`, `'echo "a | git status"'`,
+      `'echo "a\\ngit status"'`, `"echo 'a & git status'"`, `"sh -c 'echo \\"a; git status\\"'"`, `'echo "(git status)"'`, `'echo "a) git status"'`,
+    ]) expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(false);
+    // real separators (outside quotes, or in a command substitution even inside double quotes) still count
+    for (const lit of [
+      `'echo "a"; git status'`, `'echo "a" && git status'`, `'echo "$(git status)"'`, `'echo "\`git status\`"'`, `"echo 'a' | git apply"`,
+      `'bash -c "echo a; git status"'`, `"sh -c 'echo a; git status'"`, `'echo "unterminated; git status'`, `'echo "a; b" ; git status'`,
+      `'echo "$(echo "x; y"; git status)"'`,
+    ]) expect(sourceNeedsGit(E + `execSync(${lit});`), lit).toBe(true);
+  });
   it('a trailing-dot number is an operand: the next `/` divides', () => {
     const E = "import { execSync } from 'node:child_process'; ";
     const tail = " execSync('git rev-parse --show-toplevel'); const path = '/tmp';";

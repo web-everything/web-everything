@@ -111,9 +111,10 @@ function scan(t, start, depth, inHole, lits) {
   let colonExpr = false; // the last `:` was followed by an expression (ternary / property) rather than a statement (label / case)
   let prevWordFor = false; // the current word directly follows the word `for` (comments and spaces between don't count)
   let asyncExpr = false; // the last `async` keyword began in expression position
-  let pendKind = ''; // 'function' | 'class' keyword seen, its body `{` not yet opened
-  let pendExpr = false; // ... and it began in expression position
-  let pendDepth = 0; // ... at this paren depth
+  // 'function' | 'class' keywords seen whose body `{` is not yet opened, innermost last: { kind, expr: began in expression
+  // position, depth: paren depth it began at }. A stack, because `class extends (class {}) {}` has two open at once.
+  const pend = [];
+  const pendTop = () => pend[pend.length - 1];
   const emit = (s, sig) => { out += s; prev = last; last = sig; ctrlParen = false; exprClose = false; postfixBang = false; fnBodyExpr = false; numDot = false; };
   while (i < n) {
     const c = t[i];
@@ -175,7 +176,7 @@ function scan(t, start, depth, inHole, lits) {
             let ex = exprStart(last, prev, word());
             if (w === 'function' && isIdent(last) && word() === 'async') ex = asyncExpr; // `async function`: the async decides
             if (w === 'async') asyncExpr = ex;
-            else { pendKind = w; pendExpr = ex; pendDepth = stack.length; }
+            else pend.push({ kind: w, expr: ex, depth: stack.length });
           }
         }
         prevWordFor = isIdent(last) && word() === 'for'; // `for await (` is a control head like `for (`
@@ -190,7 +191,8 @@ function scan(t, start, depth, inHole, lits) {
     if (c === '(') {
       const head = word();
       let kind = PAREN_KEYWORD.has(head) || (head === 'await' && prevWordFor) ? 1 : 0;
-      if (!kind && pendKind === 'function' && stack.length === pendDepth) kind = pendExpr ? 2 : 3;
+      const pt = pendTop();
+      if (!kind && pt && pt.kind === 'function' && stack.length === pt.depth) kind = pt.expr ? 2 : 3;
       stack.push(kind);
     }
     let opensExpr = false;
@@ -198,13 +200,14 @@ function scan(t, start, depth, inHole, lits) {
       opensExpr = braceOpensExpr(last, prev, word());
       if (last === ':') opensExpr = colonExpr; // after a label / `case` / `default` colon the brace is a block
       if (last === ')' && fnBodyExpr) opensExpr = true;
-      if (pendKind && stack.length === pendDepth) {
-        if (pendKind === 'function' && last === ')') pendKind = '';
-        else if (pendKind === 'class' && (isIdent(last) || last === ')')) { opensExpr = pendExpr; pendKind = ''; }
+      const pt = pendTop();
+      if (pt && stack.length === pt.depth) {
+        if (pt.kind === 'function' && last === ')') pend.pop();
+        else if (pt.kind === 'class' && (isIdent(last) || last === ')')) { opensExpr = pt.expr; pend.pop(); }
       }
     }
     if (c === '}' && inHole && braces.length === 0) return { out, end: i + 1 };
-    if (c === ';') pendKind = '';
+    if (c === ';') while (pend.length && pendTop().depth >= stack.length) pend.pop(); // a statement ended: its own keywords never got a body
     const nonNull = c === '!' && ((isIdent(last) && !REGEX_AFTER_WORD.has(word())) || (last === ')' && !ctrlParen) || last === ']');
     const endsNumber = c === '.' && isIdent(last) && !wordDot && wordEnd === i && t[wordStart] >= '0' && t[wordStart] <= '9';
     emit(c, c);
@@ -222,7 +225,7 @@ function scan(t, start, depth, inHole, lits) {
       const k = stack.pop() ?? 0;
       ctrlParen = k === 1;
       fnBodyExpr = k === 2;
-      if (stack.length < pendDepth) pendKind = ''; // the group holding a pending keyword closed without a body
+      while (pend.length && pendTop().depth > stack.length) pend.pop(); // the group holding a pending keyword closed without a body
     }
     i++;
   }
@@ -273,6 +276,28 @@ function decodeEscapes(s) {
   });
 }
 const GIT_TOKEN = /^(?:\S*\/)?git(?:\.exe)?$/;
+// The first word of `s` as the shell reads it (quotes and backslashes removed; `$'` / `$"` read as a plain quote), or null
+// when a quote is left open. This is the command line a `sh -c` runs: the quoted text, not the quotes around it.
+function shellWord(s) {
+  let out = '';
+  let q = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q === "'") { if (c === "'") q = ''; else out += c; continue; }
+    if (q === '"') {
+      if (c === '"') q = '';
+      else if (c === '\\' && '$`"\\'.includes(s[i + 1] ?? '\n')) out += s[++i];
+      else out += c;
+      continue;
+    }
+    if (c === '$' && (s[i + 1] === "'" || s[i + 1] === '"')) continue;
+    if (c === "'" || c === '"') { q = c; continue; }
+    if (c === '\\') { if (i + 1 < s.length) out += s[++i]; continue; }
+    if (/\s/.test(c)) break;
+    out += c;
+  }
+  return q ? null : out;
+}
 // Walks the command word of one segment. A work list over (position, behind-a-wrapper) states, each visited once, keeps it
 // linear however many `A=b` prefixes, wrappers or flags there are. Behind a wrapper (`sudo`, `env`, `nice`, `command`, a
 // shell keyword …) an option (`-i`, `--`) is skipped, and so is the value that may follow it (`env -u X git`, `nice -n 5 git`).
@@ -306,7 +331,7 @@ function commandIsGit(segment, subs) {
         const o = TOKEN.exec(segment);
         if (!o || o[0][0] !== '-') break;
         p = WS.lastIndex + o[0].length;
-        if (SHELL_C_FLAG.test(o[0])) { WS.lastIndex = p; WS.test(segment); subs.push(segment.slice(WS.lastIndex)); break; }
+        if (SHELL_C_FLAG.test(o[0])) { WS.lastIndex = p; WS.test(segment); const rest = segment.slice(WS.lastIndex); subs.push(shellWord(rest) ?? rest); break; }
       }
     }
     if (wrapped && DURATION.test(tok)) { todo.push([end, true]); continue; }
@@ -342,8 +367,39 @@ function segmentRunsGit(seg, depth) {
   }
   return false;
 }
-// `)` also ends a command (`FOO=$(echo a) git status`, `(cd x) git`): over-matching it only routes locally.
-const namesGit = (decoded, depth) => decoded.split(COMMAND_SEPARATOR).flatMap(p => p.split(')')).some(seg => segmentRunsGit(seg, depth));
+// Splits a command line at its command separators, but only where the shell does: not inside '…' or "…" (`echo "a; git x"`
+// is one echo). A command substitution still starts a command inside double quotes (`"$(git x)"`, a backtick pair), and
+// `(` / `)` end a command (`FOO=$(echo a) git status`, `(cd x) git`). A backslash escapes the next character. Returns null
+// when a quote, group or backtick is left open: the caller then splits everywhere (over-matching only routes locally).
+function splitCommands(s) {
+  const segs = [];
+  const ctx = []; // open contexts, innermost last: 'sq' '…', 'dq' "…", 'sub' $( … ) or ( … ), 'bt' `…`
+  let cur = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    const top = ctx[ctx.length - 1];
+    if (top === 'sq') { cur += c; if (c === "'") ctx.pop(); continue; }
+    if (c === '\\') { cur += c + (s[i + 1] ?? ''); i++; continue; }
+    if (top === 'dq') {
+      if (c === '"') { cur += c; ctx.pop(); continue; }
+      if (c === '`') { segs.push(cur); cur = ''; ctx.push('bt'); continue; }
+      if (c === '$' && s[i + 1] === '(') { segs.push(cur); cur = ''; ctx.push('sub'); i++; continue; }
+      cur += c;
+      continue;
+    }
+    if (c === "'") { cur += c; ctx.push('sq'); continue; }
+    if (c === '"') { cur += c; ctx.push('dq'); continue; }
+    if (c === '`') { segs.push(cur); cur = ''; if (top === 'bt') ctx.pop(); else ctx.push('bt'); continue; }
+    if (c === '(') { segs.push(cur); cur = ''; ctx.push('sub'); continue; }
+    if (c === ')') { segs.push(cur); cur = ''; if (top === 'sub') ctx.pop(); continue; }
+    if (COMMAND_SEPARATOR.test(c)) { segs.push(cur); cur = ''; continue; }
+    cur += c;
+  }
+  segs.push(cur);
+  return ctx.length ? null : segs;
+}
+const splitEverywhere = (s) => s.split(COMMAND_SEPARATOR).flatMap(p => p.split(')'));
+const namesGit = (decoded, depth) => (splitCommands(decoded) ?? splitEverywhere(decoded)).some(seg => segmentRunsGit(seg, depth));
 const literalNamesGit = (s) => namesGit(decodeEscapes(s), 0);
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
