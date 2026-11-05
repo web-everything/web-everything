@@ -54,6 +54,18 @@ export function pidIdentityStamp(pid, exec = execFileSync) {
 
 export const PID_START_SLACK_MS = 120_000;
 
+/** The `startedBy` bound for a listing row's pid, or null when the row's start time cannot bound it. A wrapped worker
+ *  keeps its ORIGINAL launch time in `startedAt` while a harness resume spawns a new child (new pid, started later),
+ *  so that start time proves nothing about the current process: arming the guard would call the live resumed child a
+ *  reused pid. null skips only the started-after-holder check; unknown identity still retains the claim.
+ *  @param {{kind?:string, startedAt?:*}} row
+ *  @param {(startedAt:*) => number} toMs   the shared startedAt parser (`reconcile-core.mjs#startedAtMs`) */
+export function holderStartedBy(row, toMs) {
+  if (row?.kind === 'wrapped-worker') return null;
+  const ms = toMs(row?.startedAt);
+  return Number.isFinite(ms) && ms > 0 ? ms : null;
+}
+
 /** Three-valued identity: only positive evidence of death may reclaim a runner's claim. */
 export function pidIdentity(pid, { expectStart = null, expectArgv = null, startedBy = null, exec = execFileSync } = {}) {
   const row = readPidIdentity(pid, exec);

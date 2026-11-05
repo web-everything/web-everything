@@ -172,7 +172,9 @@ export function admitLaunch({ kind, settings, facts = {}, legacy = { admit: true
   }
   // x6nuodj — a shared resource decision (`facts.resource`, from admit({kind:'light'})) replaces the legacy CPU floor
   // and free-memory checks when it decided; the budget and the light cap above are not resource checks and stay.
-  const resource = facts.resource && typeof facts.resource === 'object' && facts.resource.decidedBy === 'admit' ? facts.resource : null;
+  // A gate-error refusal (enforce mode, shared decision unavailable) is decidedBy 'legacy' yet must still refuse (R559).
+  const res = facts.resource && typeof facts.resource === 'object' ? facts.resource : null;
+  const resource = res && (res.decidedBy === 'admit' || (res.admit === false && res.kind === 'gate-error')) ? res : null;
   if (resource) {
     if (!resource.admit) return { ...base, admit: false, reason: 'resource-admission', why: `${resource.why ?? 'held by admit()'}; light ${kind} deferred` };
     return { ...base, admit: true, reason: 'admitted',

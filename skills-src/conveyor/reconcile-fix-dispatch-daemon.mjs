@@ -744,6 +744,14 @@ function prFingerprint(pr) {
 }
 
 /**
+ * The planner's OWN discovery read: it must be taken AFTER the baseline probe, so it may not use the host-shared PR snapshot
+ * (valid ~75 s). It used to force that with a WRAPPER `exec`, which also knocked it off the production path and made it run
+ * the heavy 200-row `gh pr list` (HTTP 504, 23 failed ticks, ci-heals unplanned, 2026-11-03). `fresh: true` skips the snapshot
+ * but keeps the small-page read, the 5xx retry and the fail-closed / deferred contract.
+ */
+export const planFreshReadPrs = (read) => (o = {}) => read({ ...o, fresh: true, attributionRepo: o.attributionRepo ?? o.repo });
+
+/**
  * Default live probe for plan reuse: one light open-PR list per repo, read DIRECTLY from GitHub. It must never use the
  * host-shared PR snapshot (valid for ~75 s): that could hide a stand-down comment posted after the plan was made.
  * Throws when a row lacks `updatedAt`, so the cache fails closed to a full recompute.
@@ -860,7 +868,7 @@ export function createReconcilePlanCache({ reconcile = (input) => runReconcilePa
       // rows for notes.
       const { readPrs: _discovery, ...fresh } = input;
       const plan = filterRows(reconcile({ ...fresh,
-        readPrs: tap((o = {}) => defaultReadPrs({ ...o, exec: (...args) => execFileSyncThrottled(...args), attributionRepo: o.attributionRepo ?? o.repo })),
+        readPrs: tap(planFreshReadPrs(defaultReadPrs)),
         excuseMergeGateHolds: tap(input.excuseMergeGateHolds, excusePrMergeGateHolds),
         enrichCodeQL: tap(input.enrichCodeQL, enrichPrsWithCodeQL) }), touched.get(repo) ?? new Set());
       try { if (baseline && cacheable) entries.set(repo, { at: now(), baseline, allowStandDownAutoProceed,

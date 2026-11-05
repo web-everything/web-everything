@@ -203,6 +203,7 @@ import { createPrestageCache, resolvePrestageSettings, prestageCi, prestageRequi
 import { reviewCiGate } from './lib/review-ci-gate.mjs';
 import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, handleRequiredWorkflowsRefusal, resolveRefreshOnStaleMergeGate, handleStaleMergeGate } from './lib/merge-queue-enqueue.mjs';
 import { recordEnqueueOutcome } from './lib/drain-poison-guard.mjs';
+import { createAsyncShadow } from './lib/drain-async-shadow.mjs';
 import { appendDaemonEvent } from './lib/daemon-events.mjs';
 import { createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, createQueueRequiredChecksOf } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
 // #3215 — the drain applies holds of its own (a fresh park, a #2409 stale-acceptance re-park); this is the
@@ -4825,7 +4826,7 @@ async function runCli() {
   const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, isMainFix,
     withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }), primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: process.env.WE_PRIMARY }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
-  function enqueueWithSameHeadGuard(c, sha, options, approvedHeadHold) {
+  function enqueueWithSameHeadGuard(c, sha, options, approvedHeadHold, shadow) {
     // Live manual retries pass the guard and retain the strategy's already-queued bookkeeping.
     const refresh = DRY_RUN ? undefined : createMqSameHeadRefreshOptions({ store: mqSameHeadRefreshStore,
       approvedHeadHold, repo: c.repo ?? localSlug, pr: c.num, head: sha,
@@ -4874,11 +4875,15 @@ async function runCli() {
     const guard = mqSameHeadGuard({ refresh, repo: c.repo ?? localSlug, pr: c.num, head: sha,
       log: line => process.stderr.write(`${line}\n`) });
     if (guard.hold) return { enqueued: false, kind: 'mq-same-head-failed', reason: guard.line };
-    return mergeStrategy.enqueue(c, sha, { ...options,
+    const result = mergeStrategy.enqueue(c, sha, { ...options,
       // The early queued bypass authorizes bookkeeping only. If membership disappears during the
       // strategy's other checks, require fresh timeline admission immediately before any mutation.
       sameHeadAdmission: () => mqSameHeadGuard({ repo: c.repo ?? localSlug, pr: c.num, head: sha,
         allowAlreadyQueued: false, refresh, log: line => process.stderr.write(`${line}\n`) }) });
+    if (result?.enqueued === true) {
+      try { shadow?.recordActual({ repo: c.repo || localSlug, num: c.num, headSha: sha }); } catch { /* Timing only. */ }
+    }
+    return result;
   }
   // xym8nt4 — post-approval card grouping: sources of a combined card PR are held; groups form/reconcile after each pass.
   const cardGrouping = createCardGrouping({ localSlug, dryRun: DRY_RUN, isMainFix, requiredCheck: REQUIRED, prestage: (c, sha) => mergeStrategy.prestage(c, sha),
@@ -5350,6 +5355,24 @@ async function runCli() {
   // emit/exit), so the watch loop can call it repeatedly. A gh-list failure still hard-fails (bad env).
   const drainHeavyCacheByRepo = new Map(); // Reuse heavy fields across --watch passes.
   const sweepOnce = async () => {
+  // Shared by the full cascade and the green-event shortcut, including --json callers.
+  let asyncShadow;
+  let shadowObserved = false;
+  if (!DRY_RUN) {
+    try { asyncShadow = createAsyncShadow(); } catch { /* Timing only. */ }
+  }
+  const summarizeAsyncShadow = (outcomes, candidates) => {
+    try {
+      const byPr = new Map(candidates.map(c => [`${c.repo || localSlug}#${Number(c.num)}`, c]));
+      for (const outcome of outcomes) {
+        if (outcome.outcome !== 'not-enqueued') continue;
+        const c = byPr.get(`${outcome.repo || localSlug}#${Number(outcome.num)}`);
+        if (c) asyncShadow?.noteSkipReason(`${c.repo || localSlug}#${c.num}@${c.headSha}`, outcome.kind);
+      }
+      const summary = asyncShadow?.emitSummary();
+      if (summary) process.stderr.write(`async-drain-shadow: summary n=${summary.n} median=${summary.medianDeltaMs == null ? 'null' : summary.medianDeltaMs / 1000}s p90=${summary.p90DeltaMs == null ? 'null' : summary.p90DeltaMs / 1000}s readyNotReached=${summary.readyNotReached}\n`);
+    } catch { /* Best-effort timing only. */ }
+  };
   const approvedHeadSetting = resolveSkipRebaseApprovedHumanSurface();
   if (!AS_JSON) process.stderr.write(`  merge-queue: skipRebaseApprovedHumanSurface=${approvedHeadSetting.value} (${approvedHeadSetting.source})\n`);
   const approvedHeadHold = (v, headSha = v.listedHeadSha || v.headSha, { strict = false } = {}) => {
@@ -5389,6 +5412,7 @@ async function runCli() {
     const hold = redMainBypass ? null : drainFreezeSignal({ state: freeze, mainRedState: readMainRedState(), priority: readMainRedPriority(), now: Date.now(), holdOn: resolveRedMainHoldSetting().value === 'on' });
     const blocked = hold?.red && decideRedMainHold({ num: onlyPr, isLocal: true, signal: hold, setting: 'on' }).hold;
     passMainFix = mainFixFrom(hold);
+    let prestageShadowCandidate;
     const fast = blocked ? { fallback: true } : await enqueuePrestage({ cache: prestageCache, repo: localSlug, num: Number(onlyPr), settings: prestageSetting,
       readPr: async () => {
         const { stdout } = await execFileP('gh', ['pr', 'view', String(onlyPr), ...repoFlag(null), '--json',
@@ -5403,8 +5427,16 @@ async function runCli() {
       withLock: fn => withLandWriteLock(fn, { runUnlockedOnContention: false }),
       fixClaimHeld: () => prestageFixClaimHeld(onlyPr, { claimKey: repoKeyForSlug(localSlug) }),
       // The cached base was verified unchanged, and preparation required it to be the default branch.
-      beforeEnqueue: (c, sha, entry) => announceAndRetargetBeforeLand(c, { preread: fetchPrComments(c.repo, c.num), defaultBranch: entry.baseRefName }),
-      enqueue: (c, sha, entry) => enqueueWithSameHeadGuard(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }, approvedHeadHold),
+      beforeEnqueue: (c, sha, entry) => {
+        prestageShadowCandidate = { repo: c.repo || localSlug, num: c.num, headSha: sha };
+        // Eligibility was just checked live. No label reads are added for telemetry.
+        try {
+          asyncShadow?.observePass({ candidates: [prestageShadowCandidate], observedPrs: [prestageShadowCandidate] });
+          shadowObserved = true;
+        } catch { /* Timing only. */ }
+        return announceAndRetargetBeforeLand(c, { preread: fetchPrComments(c.repo, c.num), defaultBranch: entry.baseRefName });
+      },
+      enqueue: (c, sha, entry) => enqueueWithSameHeadGuard(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }, approvedHeadHold, asyncShadow),
       recordLanded: recordLandedLedgerFacts,
       requiredCheck: REQUIRED,
     });
@@ -5413,6 +5445,7 @@ async function runCli() {
         enqueueOutcomes: [] };
       recordEnqueue(result.enqueueOutcomes, localSlug,
         { num: Number(onlyPr), repo: localSlug, outcome: fast.enqueued ? 'enqueued' : 'not-enqueued', kind: fast.kind || 'prestage', ...fast });
+      summarizeAsyncShadow(result.enqueueOutcomes, prestageShadowCandidate ? [prestageShadowCandidate] : []);
       return { result, merged: [], failedMerges: [], pendingRebased: [], deferred: [], duplicateIdsOnMain: [] };
     }
     process.stderr.write('drain-prestage: cache miss/stale — full fast drain\n');
@@ -6733,6 +6766,19 @@ async function runCli() {
     return p;
   };
   const toMerge = verdicts.filter((v) => v.decision === 'merge' && !v.prestagePendingCi); // @merge-gate-exempt the FINAL set actually merged; a held PR is `decision:'skip'` and MUST be excluded here — this is the hard AND that never lands a held PR
+  if (!DRY_RUN) {
+    try {
+      // A dependency-held candidate may not have reached ready ordering. Never trigger a label read for telemetry.
+      // A failed prestage attempt can fall through within this same sweep, not a later missed pass.
+      asyncShadow?.observePass({ countMissed: !shadowObserved,
+        // A filtered/targeted listing is not evidence that another PR disappeared.
+        observedPrs: verdicts.map(c => ({ repo: c.repo || localSlug, num: c.num })),
+        candidates: toMerge.map(c => ({
+          repo: c.repo || localSlug, num: c.num, headSha: c.headSha,
+          readyAtMs: readyInfoMemo.has(`${c.repo || localSlug}#${c.num}@${c.listedHeadSha || c.headSha || null}`) ? readyInfoOf(c).readyAtMs : null,
+        })) });
+    } catch { /* Timing observations never affect enqueue decisions. */ }
+  }
   const skipped = verdicts.filter((v) => v.decision === 'skip' && !v.requiredCheckReadError);
   // #xc7p3q9 (R6) — the held couple's members (its `skip` carrier + its deferred impl half — both carry
   // `coupleDeferReason:'held'`) so `decideBatchesIdleExit` can SUBTRACT them from `considered` rather than waive
@@ -7274,6 +7320,7 @@ async function runCli() {
           if (landLock.result?.enqueued === true) {
             recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'enqueued', already: !!landLock.result.already });
             await recordLandedLedgerFacts(c, traceHeadSha); // PR #5195 — only a confirmed enqueue writes the clearing facts
+            try { asyncShadow?.recordActual({ repo: c.repo || localSlug, num: c.num, headSha: traceHeadSha }); } catch { /* timing only */ }
           }
           if (landLock.result?.enqueued === false) {
             recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: landLock.result.kind || 'batching-deferred', reason: landLock.result.reason, healthSmell: !!landLock.result.healthSmell });
@@ -7656,6 +7703,7 @@ async function runCli() {
   // print `total=` twice (once as an ordinary step, once as the formatter's own).
   // #5444 — SHADOW ONLY: the pure ledger gate beside the label gate for every considered PR, journaled as one run
   // record. Never throws, never mutates a verdict; it runs after every merge decision of this pass is final.
+  summarizeAsyncShadow(enqueueOutcomes, toMerge);
   const ledgerShadow = await runLedgerShadow({ verdicts, localSlug, dryRun: DRY_RUN });
   process.stderr.write(`${formatShadowLine(ledgerShadow)}\n`);
   const skipReasons = buildSkipReasons({ verdicts, merged, failedMerges, revalidationAborted, pendingRebased, coupleHeld, deferred, parked });

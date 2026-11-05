@@ -10,7 +10,7 @@ import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { workspaceFor } from './lane-pool-paths.mjs';
 import { memoryFreePct, memoryAvailableMb } from './memory-available.mjs';
-import { loadHostOverloadSettings } from './host-overload-settings.mjs';
+import { loadHostOverloadSettings, DEFAULT_SNAPSHOT_MAX_FRESH_MS } from './host-overload-settings.mjs';
 import { admissionStatus, admissionLockRoot, resolveCap } from '../readiness/heavy-admission.mjs';
 
 const round = n => Math.round(n * 10) / 10;
@@ -77,9 +77,9 @@ export function swapUsedPct(text) {
   if (!Number.isFinite(total) || !Number.isFinite(used)) return null;
   return total > 0 ? round(used / total * 100) : 0;
 }
-export function buildSnapshot({ sampledAtMs, intervalMs, cpuIdlePct, cores, loadAvg, memPressureLevel, memFreePct, memAvailableMb, memFloorMb, memFloorSource, memMetric, swapUsedPct: swapPct, disk, fseventsdCpuPct, heavySlots, agentSessions, laneCount, errors = [] }) {
+export function buildSnapshot({ sampledAtMs, intervalMs, maxFreshMs = DEFAULT_SNAPSHOT_MAX_FRESH_MS, cpuIdlePct, cores, loadAvg, memPressureLevel, memFreePct, memAvailableMb, memFloorMb, memFloorSource, memMetric, swapUsedPct: swapPct, disk, fseventsdCpuPct, heavySlots, agentSessions, laneCount, errors = [] }) {
   return { schema: 'resource-snapshot/1', sampledAt: new Date(sampledAtMs).toISOString(),
-    freshUntil: new Date(sampledAtMs + 3 * intervalMs).toISOString(), intervalMs,
+    freshUntil: new Date(sampledAtMs + Math.min(3 * intervalMs, maxFreshMs)).toISOString(), intervalMs,
     cpu: { idlePct: finite(cpuIdlePct), cores: finite(cores), loadAvg: [0, 1, 2].map(i => finite(loadAvg?.[i])) },
     memory: { pressureLevel: finite(memPressureLevel), freePct: finite(memFreePct), metric: memMetric ?? null, availableMb: finite(memAvailableMb), floorMb: finite(memFloorMb), floorSource: memFloorSource ?? null, swapUsedPct: finite(swapPct) },
     disk: { busyPct: finite(disk?.busyPct), ioDepth: finite(disk?.ioDepth), readMBps: finite(disk?.readMBps), writeMBps: finite(disk?.writeMBps) },
@@ -128,8 +128,10 @@ export function createSampler({ exec = execFileSync, cpus = os.cpus, loadavg = o
     // One policy read per sample. An unreadable or invalid policy publishes NO memory reading at all (R559): no
     // percent, no available MB, no floor, no metric. The admission gate then refuses (floor) and the cap cannot raise.
     let memPolicy = null;
+    let maxFreshMs = DEFAULT_SNAPSHOT_MAX_FRESH_MS;
     try {
       const { settings, sources } = loadHostOverloadSettings({ log: () => {} });
+      maxFreshMs = settings.host.capacity.snapshotMaxFreshMs;
       memPolicy = { metric: settings.host.capacity.memoryMetric, floorMb: settings.host.capacity.memAvailableFloorMb,
         floorSource: sources['host.capacity.memAvailableFloorMb'] ?? 'standard' };
     } catch { memPolicy = null; }
@@ -141,7 +143,7 @@ export function createSampler({ exec = execFileSync, cpus = os.cpus, loadavg = o
       if (value === null) throw Error('unrecognized swap usage'); return value;
     });
     const procs = probe('ps', () => parsePsCpu(run('ps', ['-A', '-o', 'pid=,pcpu=,comm='])));
-    const snapshot = buildSnapshot({ sampledAtMs, intervalMs, cpuIdlePct, cores: nextCpus?.length,
+    const snapshot = buildSnapshot({ sampledAtMs, intervalMs, maxFreshMs, cpuIdlePct, cores: nextCpus?.length,
       loadAvg: probe('loadavg', loadavg), memPressureLevel, memFreePct, memAvailableMb, memFloorMb: memPolicy?.floorMb, memFloorSource: memPolicy?.floorSource, memMetric: memPolicy?.metric,
       swapUsedPct: swapPct, disk,
       fseventsdCpuPct: procs === null ? null : fseventsCpuPct(procs),

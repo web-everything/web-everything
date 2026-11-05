@@ -1302,6 +1302,12 @@ export function resolveLoadAdmission({ env = process.env, minIdlePct, minPressur
   const cut = cutoverDecision({ gate: 'heavy-admission.load-status', kind, legacy, mode: cutoverMode, env, nowMs: now.getTime(),
     shadow: (args) => shadow({ gate: args.gate, kind: args.kind, oldVerdict: args.oldVerdict, oldReason: args.oldReason, env }),
     ...(admitFn ? { admitFn } : {}) });
+  // R559: a gate-error refusal (no shared decision could be had in enforce mode) is decidedBy 'legacy' but must still
+  // hold — never fall back to the telemetry rule's `held:false` (e.g. no-sample).
+  if (cut.admit === false && cut.kind === 'gate-error') {
+    return { ...decision, held: true, reason: `resource-admission: ${cut.why}`,
+      resourceAdmission: { verdict: 'hold', reason: cut.why, decidedBy: 'legacy', legacyHeld: decision.held } };
+  }
   if (cut.decidedBy !== 'admit') return decision;
   return { ...decision, held: !cut.admit, reason: cut.admit ? undefined : `resource-admission: ${cut.admission.verdict} — ${cut.admission.reason}`,
     resourceAdmission: { ...cut.admission, decidedBy: 'admit', legacyHeld: decision.held } };

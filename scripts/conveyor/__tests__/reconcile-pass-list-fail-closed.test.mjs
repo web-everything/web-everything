@@ -4,7 +4,17 @@
  * ETag-cached REST reader), 5xx retried with backoff, and every incomplete, failed or empty read FAILS CLOSED with a
  * named reason (504 incident 2026-11-03). Split out of reconcile-pass.test.mjs so it never collides with that file.
  */
-import { vi, it, expect, describe } from 'vitest';
+import { vi, it, expect, describe, beforeAll } from 'vitest';
+
+// Every test below pays a dynamic `import('../reconcile-pass.mjs')`. Under a loaded host that first import alone exceeds
+// the 5 s default test timeout; the timed-out test's still-running body then leaks a live `gh pr list` into the hermetic
+// guard and cascades red onto its neighbours (verify of PR #6407, load average ~48). Warm the module graph once, here,
+// with a budget sized for load, so the per-test timeouts measure the test and not the cold import.
+beforeAll(async () => {
+  await import('../reconcile-pass.mjs');
+  await import('../../lib/gh-throttle.mjs');
+  await import('../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs');
+}, 180_000);
 
 vi.mock('node:child_process', async (importOriginal) => ({
   ...await importOriginal(), execFileSync: vi.fn(),
@@ -302,5 +312,144 @@ describe('author lookup: a gh call TIMEOUT defers like a slot throttle; the defa
     expect(err?.authorLookupDeferred).toBe(true);   // the 17th lookup is over the default budget
     expect(rest).toHaveBeenCalledTimes(16);
     expect(rest.mock.calls[0][1].execOpts.timeout).toBe(8_000);
+  });
+});
+
+describe('fresh read (the fix daemon plans from a read taken AFTER its baseline probe): small pages, never the shared snapshot, never the heavy list', () => {
+  const run = async (extra) => {
+    const { defaultReadPrs } = await import('../reconcile-pass.mjs');
+    const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
+    const readShared = vi.fn(() => { throw new Error('the shared snapshot may predate the baseline probe'); });
+    const issued = [];
+    const exec = (...a) => { issued.push(a); return execFileSyncThrottled(...a); };
+    void exec;
+    return { readShared, call: (listPaged) => defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readCommits: () => [],
+      readShared, listPaged, readRest: () => ({ json: { user: { login: 'u', type: 'User' } } }),
+      retryOpts: { sleep: () => {}, persist: false, onEvent: () => {} }, ...extra }) };
+  };
+  it('fresh:true skips the shared snapshot and reads small pages (the planner always sees post-probe evidence)', async () => {
+    const { readShared, call } = await run({ fresh: true });
+    const listPaged = vi.fn(() => ({ rows: [{ number: 9601, labels: [], comments: [], statusCheckRollup: [] }], cache: {}, totalCount: 1 }));
+    expect(call(listPaged).map(p => p.number)).toEqual([9601]);
+    expect(readShared).not.toHaveBeenCalled();
+    expect(listPaged).toHaveBeenCalledTimes(1);
+  });
+  it('fresh:true fails closed like every other list read: a persistent 504 throws, a short inventory is refused', async () => {
+    const { call } = await run({ fresh: true });
+    const e504 = Object.assign(new Error('x'), { stderr: 'HTTP 504: 504 Gateway Timeout' });
+    expect(() => call(() => { throw e504; })).toThrow();
+    expect(() => call(() => ({ rows: [], cache: {}, totalCount: 7 }))).toThrow(/0 of 7|unique/);
+  });
+  it('the fix daemon planning read passes fresh:true and the REAL throttled exec (a wrapper exec forced the heavy list)', async () => {
+    const daemon = await import('../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs');
+    const read = vi.fn(() => []);
+    daemon.planFreshReadPrs(read)({ repo: 'web-everything/web-everything' });
+    const arg = read.mock.calls[0][0];
+    expect(arg.fresh).toBe(true);
+    expect(arg.exec).toBeUndefined();
+    expect(arg.attributionRepo).toBe('web-everything/web-everything');
+  });
+});
+
+describe('fresh read wiring: the cache handed to listPaged and the paged path itself are pinned', () => {
+  const U = Date.parse('2026-11-03T22:00:00Z');
+  const entry = (serverSeenMs) => ({ updatedAt: '2026-11-03T22:00:00Z', headRefOid: 'a', fetchedAtMs: 0, serverSeenMs, comments: [], body: '', files: [] });
+  const base = { exec: undefined, readCommits: () => [], readShared: () => null,
+    readRest: () => ({ json: { user: { login: 'u', type: 'User' } } }),
+    retryOpts: { sleep: () => {}, persist: false, onEvent: () => {} } };
+  const page = (cache) => vi.fn(() => ({ rows: [{ number: 1, labels: [], comments: [], statusCheckRollup: [] }], cache, totalCount: 1 }));
+
+  it('a fresh read hands listPaged only the SETTLED heavy entries; a non-fresh read hands it the whole cache', async () => {
+    const { defaultReadPrs } = await import('../reconcile-pass.mjs');
+    const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
+    const seeded = { 1: entry(U + 500), 2: entry(U + 5000) }; // 1 = cached inside its updatedAt second; 2 = settled
+    const read = (listPaged, fresh) => defaultReadPrs({ ...base, repo: 'o/cache-wiring', exec: execFileSyncThrottled, listPaged, fresh });
+    read(page(seeded), false); // seeds pagedHeavyCache for the repo
+    const nonFresh = page(seeded);
+    read(nonFresh, false);
+    expect(Object.keys(nonFresh.mock.calls[0][0].cache).sort()).toEqual(['1', '2']);
+    const fresh = page(seeded);
+    read(fresh, true);
+    expect(Object.keys(fresh.mock.calls[0][0].cache)).toEqual(['2']); // the unsettled entry 1 is NOT reusable
+  });
+
+  it('fresh:true with the DEFAULT listPaged and the snapshot disabled reads small pages — never the heavy `gh pr list`', async () => {
+    const { defaultReadPrs } = await import('../reconcile-pass.mjs');
+    const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
+    const { execFileSync } = await import('node:child_process');
+    const prev = process.env.WE_PR_SNAPSHOT;
+    process.env.WE_PR_SNAPSHOT = '0'; // snapshot explicitly disabled: only `fresh ||` can select the paged path
+    execFileSync.mockClear();
+    execFileSync.mockImplementation(() => { throw Object.assign(new Error('x'), { stderr: 'HTTP 504: 504 Gateway Timeout' }); });
+    try {
+      expect(() => defaultReadPrs({ ...base, repo: 'o/default-paged', exec: execFileSyncThrottled, fresh: true })).toThrow();
+      const argvs = execFileSync.mock.calls.map(c => c[1]);
+      expect(argvs.length).toBeGreaterThan(0);
+      expect(argvs.some(a => a[0] === 'pr' && a[1] === 'list')).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env.WE_PR_SNAPSHOT; else process.env.WE_PR_SNAPSHOT = prev;
+      execFileSync.mockReset();
+    }
+  });
+});
+
+it('a fresh read reuses a cached heavy read only once SERVER time had passed its PR updatedAt second (same-second comments stay visible)', async () => {
+  const { settledHeavyCache, FRESH_SETTLE_MS } = await import('../reconcile-pass.mjs');
+  const U = Date.parse('2026-11-03T22:00:00Z');
+  const cache = {
+    1: { updatedAt: '2026-11-03T22:00:00Z', serverSeenMs: U + 500, comments: ['maybe stale'] },
+    2: { updatedAt: '2026-11-03T22:00:00Z', serverSeenMs: U + FRESH_SETTLE_MS, comments: ['settled'] },
+    3: { updatedAt: 'garbage', serverSeenMs: U + 99999 },
+    4: { updatedAt: '2026-11-03T22:00:00Z', fetchedAtMs: U + 99999, comments: ['no server stamp: fails closed'] },
+  };
+  expect(Object.keys(settledHeavyCache(cache))).toEqual(['2']);
+  expect(settledHeavyCache(undefined)).toEqual({});
+});
+
+describe('clock skew: settlement is proven by server timestamps only, never the local clock', () => {
+  const U = Date.parse('2026-11-03T22:00:00Z');
+  const row = (number, updatedAt) => ({ number, updatedAt, labels: [], comments: [], statusCheckRollup: [] });
+  const iso = (ms) => new Date(ms).toISOString();
+
+  it('a client clock 5 s AHEAD cannot make a same-second cache entry look settled', async () => {
+    const { stampServerSeen, settledHeavyCache } = await import('../reconcile-pass.mjs');
+    // Heavy read at server U+300 ms, client clock +5 s: the old check saw fetchedAtMs - updatedAt = 5300 ms >= 2000 ms.
+    const fresh = { updatedAt: iso(U), headRefOid: 'a', fetchedAtMs: U + 5300, comments: [] };
+    const stamped = stampServerSeen({}, { 1: fresh }, [row(1, iso(U))]); // newest server updatedAt in the listing = U itself
+    expect(stamped[1].serverSeenMs).toBe(U);
+    expect(settledHeavyCache(stamped)).toEqual({});
+  });
+  it('an entry is settled when the same listing proves server time moved >= 2 s past its updatedAt (skew-free)', async () => {
+    const { stampServerSeen, settledHeavyCache } = await import('../reconcile-pass.mjs');
+    const stamped = stampServerSeen({}, { 1: { updatedAt: iso(U), fetchedAtMs: -1e9 }, 2: { updatedAt: iso(U + 2500), fetchedAtMs: 1e18 } },
+      [row(1, iso(U)), row(2, iso(U + 2500))]);
+    expect(Object.keys(settledHeavyCache(stamped))).toEqual(['1']); // 2 is the newest PR itself: not provably settled
+  });
+  it('a REUSED entry keeps its original stamp (a later listing proves nothing about the earlier heavy read); a missing updatedAt stamps nothing', async () => {
+    const { stampServerSeen } = await import('../reconcile-pass.mjs');
+    const reused = { updatedAt: iso(U), serverSeenMs: U };
+    const out = stampServerSeen({ 1: reused }, { 1: reused, 2: { updatedAt: iso(U) } }, [row(1, iso(U + 60_000))]);
+    expect(out[1].serverSeenMs).toBe(U);
+    expect(out[2].serverSeenMs).toBe(U + 60_000);
+    expect(stampServerSeen({}, { 3: { updatedAt: iso(U) } }, [{ number: 3 }])[3].serverSeenMs).toBeUndefined();
+  });
+  it('end to end through defaultReadPrs: skewed cache is not handed to listPaged on a fresh read; a server-proven one is', async () => {
+    const { defaultReadPrs } = await import('../reconcile-pass.mjs');
+    const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
+    const base = { readCommits: () => [], readShared: () => null, readRest: () => ({ json: { user: { login: 'u', type: 'User' } } }),
+      retryOpts: { sleep: () => {}, persist: false, onEvent: () => {} }, repo: 'o/skew-wiring', exec: execFileSyncThrottled };
+    // First (non-fresh) read: listing shows PR 1 at U and PR 2 at U (newest = U), so entry 1 is stamped U -> unsettled. PR 3 is 3 s newer.
+    const heavy = (n) => ({ updatedAt: iso(U), headRefOid: 'a', fetchedAtMs: U + 9000, comments: [], body: '', files: [], n });
+    const first = vi.fn(() => ({ rows: [row(1, iso(U)), row(2, iso(U))], cache: { 1: heavy(1), 2: heavy(2) }, totalCount: 2 }));
+    defaultReadPrs({ ...base, listPaged: first, fresh: false });
+    const probe = vi.fn(() => ({ rows: [row(1, iso(U)), row(2, iso(U))], cache: {}, totalCount: 2 }));
+    defaultReadPrs({ ...base, listPaged: probe, fresh: true });
+    expect(probe.mock.calls[0][0].cache).toEqual({}); // fetchedAtMs says "9 s old", server stamps say unsettled
+    const second = vi.fn(() => ({ rows: [row(1, iso(U)), row(3, iso(U + 3000))], cache: { 1: heavy(1), 3: { ...heavy(3), updatedAt: iso(U + 3000) } }, totalCount: 2 }));
+    defaultReadPrs({ ...base, listPaged: second, fresh: false });
+    const probe2 = vi.fn(() => ({ rows: [row(1, iso(U))], cache: {}, totalCount: 1 }));
+    defaultReadPrs({ ...base, listPaged: probe2, fresh: true });
+    // entry 1 was re-fetched in a listing whose newest server updatedAt is U+3000 (>= 2 s past U): settled; entry 3 is that newest PR: not
+    expect(Object.keys(probe2.mock.calls[0][0].cache)).toEqual(['1']);
   });
 });

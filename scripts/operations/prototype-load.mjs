@@ -5,7 +5,7 @@
  */
 import { op } from './registry.mjs';
 import { compute, effect } from './step-kinds.mjs';
-import { QUESTION_HASH, findAudit } from './codex-audit.mjs';
+import { QUESTION_HASH, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes } from './codex-audit.mjs';
 import { carriesAcross } from '../lib/net-diff-fingerprint.mjs';
 export const PROTOTYPE_LOAD_OP = 'prototype-load';
 export const PROTOTYPE_LOAD_EFFECT = 'prototype-load.apply';
@@ -23,8 +23,10 @@ export function jsonLines(text) {
  *  ref, full 40-hex sha and ruling match the record exactly. Anything else stays refused; a `--audit` argument can
  *  never claim it. Never a blanket bypass. */
 const RULING = /^R\d+(?:\+R\d+)*$/;
-export function readyEvidence(records, input, ruledWeakened = [], liveFp = null) {
+export function readyEvidence(records, input, ruledWeakened = [], liveFpSource = null) {
   if (input.testsRun?.trim() && /^NOT WEAKENED$/i.test(input.audit || '')) return { source: 'arguments', testsRun: input.testsRun };
+  // The live fingerprint may be passed lazily (a function): the arguments path above never pays for the git read.
+  const liveFp = typeof liveFpSource === 'function' ? liveFpSource() : liveFpSource;
   // R503: a record speaks for the live sha when it names it exactly, or its stored net-diff fingerprint equals the live one.
   // A rebase or merge of main that leaves the code alone therefore keeps the evidence; any code change does not.
   // Shas compare case-insensitively (validSha accepts either case): an upper-case --sha must still find its own records.
@@ -68,7 +70,7 @@ export function readyEvidence(records, input, ruledWeakened = [], liveFp = null)
  * base, file order breaks ties, contradictory findings rejected). Fail closed: ANY base whose latest verdict is
  * WEAKENED blocks, and a pass only counts when covers(base) proves the base is already in main (the audit spans the
  * whole change, not just its last commit). */
-export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp = null) {
+export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp = null, auditOptions = {}) {
   // R503: an audit of an older head also speaks for this head when its stored net-diff fingerprint equals the live one.
   // No stored or live fingerprint, or any difference, means no carry (a real code change always re-audits).
   // Eligibility is per RECORD: each carried record must itself hold the matching fingerprint, so one carried record
@@ -89,7 +91,7 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
     return copy;
   });
   const decisions = (head) => [...new Set(list.filter((r) => r?.head === head && r.base !== head).map((r) => r.base))]
-    .map((base) => ({ base, record: findAudit(list, { head, base, questionHash: QUESTION_HASH }) })).filter((d) => d.record);
+    .map((base) => ({ base, record: findAudit(list, { head, base, questionHash: QUESTION_HASH, ...auditOptions }) })).filter((d) => d.record);
   const own = decisions(sha);
   // Only string heads carry (main #6353): a non-string head that stringifies to a sha never aliases a real one, and
   // findAudit refuses non-string head/base, so a non-string base never decides either.
@@ -104,8 +106,29 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   if (own.some((d) => d.record.verdict === 'WEAKENED')) return { ok: false, reason: 'weakened' };
   // Round 3: a live-head WEAKENED that findAudit cannot use (contradictory findings, unparsable time) must not vanish
   // and leave the live head looking unaudited, which would let a carried pass decide. Only a foreign question is ignored.
-  if (!own.length && list.some((r) => r?.head === sha && r.base !== sha && r.verdict === 'WEAKENED' && r.questionHash === QUESTION_HASH)) return { ok: false, reason: 'weakened' };
-  const carriedWeak = carried.filter((d) => d.record.verdict === 'WEAKENED');
+  // The same holds for a PRIOR-question WEAKENED still inside its accepted window (round 5): it is a real negative
+  // verdict on this head that findAudit may reject (contradictory findings), so the veto judges it by the same
+  // acceptance rule, with the same defaults, and an expired or unknown hash stays ignored.
+  const { priorQuestionHashes = resolvePriorQuestionHashes(), now = Date.now() } = auditOptions ?? {};
+  // The veto holds per BASE, not only when the live head has no decision at all (a usable pass on base X must not hide
+  // an unusable WEAKENED on base Y). A base with a usable decision is judged by findAudit alone, so a superseded record
+  // never blocks forever. A CARRIED head is deliberately not widened: "carry veto follows findAudit" (round 4) pins that
+  // an unusable record on a carried head never blocks the carry.
+  if (list.some((r) => r?.head === sha && r.base !== sha && r.verdict === 'WEAKENED'
+    // An unparsable time cannot place the record outside its window, so it is judged by the hash's own expiry alone
+    // (fail closed, matching a current-question record, which blocks whatever its time).
+    && isAcceptedQuestionHash(r.questionHash, { priorQuestionHashes, now, at: Number.isFinite(Date.parse(r.at)) ? r.at : undefined }) && !own.some((d) => d.base === r.base))) return { ok: false, reason: 'weakened' };
+  // Round 6: a carried head's PRIOR-question WEAKENED that findAudit would accept on its own can be hidden by an unusable
+  // current-question record for the same head+base (findAudit lets even an unusable current record block the prior
+  // fallback, which is right for a PASS but fail-open for a NEGATIVE verdict). Such a record keeps vetoing, judged by
+  // the same supersede rule as any carried WEAKENED; a base with a usable decision of its own is left to findAudit.
+  // The latest PRIOR-question record for that head+base decides (a later prior NOT WEAKENED re-audit supersedes it), judged
+  // with the same already-resolved hashes and clock as the veto above.
+  const priorOnly = list.filter((r) => r?.questionHash !== QUESTION_HASH);
+  const hiddenWeak = priorOnly.filter((r) => r?.verdict === 'WEAKENED' && typeof r.head === 'string' && carriedHeads.has(r.head) && r.base !== r.head
+    && !carried.some((d) => d.record.head === r.head && d.base === r.base)
+    && findAudit(priorOnly, { ...auditOptions, head: r.head, base: r.base, questionHash: QUESTION_HASH, priorQuestionHashes, now }) === r).map((record) => ({ base: record.base, record }));
+  const carriedWeak = [...carried, ...hiddenWeak].filter((d) => d.record.verdict === 'WEAKENED');
   if (carriedWeak.length) {
     const ownAt = Math.max(-Infinity, ...own.filter((d) => covered(d.base)).map((d) => Date.parse(d.record.at)));
     if (carriedWeak.some((d) => !(Date.parse(d.record.at) < ownAt))) return { ok: false, reason: 'weakened' };
@@ -114,6 +137,10 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   const passes = own.length ? own : carried.filter((d) => carriesAcross(d.record.fingerprint, liveFp));
   let pass = null;
   for (const { base, record } of passes) {
+    // A current-question record for this head+base (usable or not) blocks a PRIOR-question pass, even when carry
+    // eligibility dropped it (no or differing fingerprint): judge against ALL records, fail closed.
+    if (record.questionHash !== QUESTION_HASH
+      && list.some((r) => r?.head === record.head && r.base === base && r.questionHash === QUESTION_HASH)) continue;
     if (covered(base) && (!pass || Date.parse(record.at) >= Date.parse(pass.at))) pass = record;
   }
   return pass ? { ok: true, record: original.get(pass) ?? pass } : { ok: false, reason: 'no-record' };
