@@ -150,6 +150,16 @@ export async function abortForcedWatch({ root, env = process.env, sha, reason, e
   return true;
 }
 
+/** Drop the clone's ready candidate. When it is a FORCED record that will now never be adopted, its rollback watch is closed
+ *  too (via {@link abortForcedWatch}); `keepSha` is the build that is (or is becoming) head, whose watch must stay. Every
+ *  site that clears a ready record goes through here, so no path can strand a watch that blocks the next force. */
+export async function dropReadyCandidate({ root, env = process.env, keepSha = null, reason, emit, now = Date.now }) {
+  const ready = readReadyCandidate(root, env);
+  clearReadyCandidate(root, env);
+  const sha = ready?.adopt?.finalSha;
+  if (ready?.forced === true && sha && sha !== keepSha) await abortForcedWatch({ root, env, sha, reason, emit, now });
+}
+
 /** PURE. One watch tick: fail closed on a failed health check or a crash loop, else count down. */
 export function evaluateForceWatch({ watch, healthy, restarts = 0, maxRestarts = FORCE_ADOPT_MAX_RESTARTS }) {
   // A rollback that already failed stays mandatory: a later healthy probe must not forget it and count the watch down.

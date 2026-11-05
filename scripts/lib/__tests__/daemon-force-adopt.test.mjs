@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   validateForceAdopt, requestForceAdopt, readForceAdopt, recordForcedAdoption, abortForcedAdoption, readForceWatch,
-  evaluateForceWatch, runForceWatchTick, forceRequestFor, abortForcedWatch,
+  evaluateForceWatch, runForceWatchTick, forceRequestFor, abortForcedWatch, dropReadyCandidate,
 } from '../daemon-force-adopt.mjs';
 import { matchReadyCandidate } from '../daemon-rebuild/adopt.mjs';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
@@ -349,6 +349,31 @@ describe('abortForcedWatch', () => {
     await runForceWatchTick({ root, env, currentHead: SHA, probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async () => {} }); // adoptedSeen
     expect(await abortForcedWatch({ root, env, sha: SHA, reason: 'x', emit: async () => {} })).toBe(false);
     expect(readForceWatch(root, env)).not.toBeNull();
+  });
+});
+
+describe('dropReadyCandidate (every ready-record clear goes through it)', () => {
+  const ready = (extra = {}) => ({ kind: 'candidate', prevHead: 'p', tree: 'T', passedAt: new Date().toISOString(), adopt: { finalSha: SHA, inputsKey: 'k', mainSha: 'm', applied: [] }, ...extra });
+  const open = () => recordForcedAdoption({ root, env, request: { daemon: 'review', ruling: 'R508', quote: QUOTE }, sha: SHA, lastGood: { head: 'a'.repeat(40) }, smoke: { verdict: 'code', failed: [] }, emit: async () => true, now: () => 1 });
+  it('a forced record that will never be adopted takes its watch with it', async () => {
+    await open();
+    writeReadyCandidate(root, ready({ forced: true }), env);
+    await dropReadyCandidate({ root, env, reason: 'clone-recloned', emit: async () => {} });
+    expect(readReadyCandidate(root, env)).toBeNull();
+    expect(readForceWatch(root, env)).toBeNull();
+    expect(readFileSync(env.WE_FORCE_ADOPT_HANDOFF, 'utf8')).toMatch(/NOT adopted b{40} \(clone-recloned\); watch closed/);
+  });
+  it('keepSha (the build that is head) and non-forced records leave the watch alone', async () => {
+    await open();
+    writeReadyCandidate(root, ready({ forced: true }), env);
+    await dropReadyCandidate({ root, env, keepSha: SHA, reason: 'up-to-date', emit: async () => {} });
+    expect(readReadyCandidate(root, env)).toBeNull();
+    expect(readForceWatch(root, env)).not.toBeNull();
+    writeReadyCandidate(root, ready(), env); // an ordinary record
+    await dropReadyCandidate({ root, env, reason: 'up-to-date', emit: async () => {} });
+    expect(readReadyCandidate(root, env)).toBeNull();
+    expect(readForceWatch(root, env)).not.toBeNull();
+    await dropReadyCandidate({ root, env, reason: 'up-to-date', emit: async () => {} }); // nothing recorded: a no-op
   });
 });
 

@@ -4,7 +4,7 @@
 
 import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV, REBUILD_IDENTITY_ENV } from './shared.mjs';
 import {
-  alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate, readReadyCandidate,
+  alertsFilePath, readRebuildState, writeRebuildState, readReadyCandidate,
 } from './state.mjs';
 import { mkdirSync, appendFileSync, statSync, unlinkSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -16,7 +16,7 @@ import {
   overlayGraduated, reportDiscardedCandidate,
 } from './adopt.mjs';
 import { hostname } from 'node:os';
-import { forceRequestFor, abortForcedWatch } from '../daemon-force-adopt.mjs';
+import { forceRequestFor, readForceWatch, dropReadyCandidate } from '../daemon-force-adopt.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import {
   findUnsafeLocalState, knownInputsOf, rollbackUnverified, collectUntrackedPaths, ensureSafeToMove,
@@ -275,6 +275,11 @@ export async function prepareRebuild({
     alert('head-unresolved');
     return terminal({ moved: false, reason: 'head-unresolved' });
   }
+  // Drops the ready candidate; a forced one that will never be adopted also closes its rollback watch (see dropReadyCandidate).
+  const dropReady = (reason, keepSha = null) => dropReadyCandidate({
+    root, env: stEnv, keepSha, reason,
+    emit: (e) => appendDaemonEvent(e, { env: { WE_DAEMON_EVENTS: env?.WE_DAEMON_EVENTS } }),
+  });
 
   // ── Step 2: fetch ────────────────────────────────────────────────────────────────────────────────────
   // A corrupt overlay file reads as an empty list. Building on that would quietly rebuild onto main alone and
@@ -306,7 +311,7 @@ export async function prepareRebuild({
   if (cloneRepair.quarantinedTo) {
     for (const k of ['adopted', 'held', 'rejected', 'inProgress', 'unverified', 'quarantine', 'building', 'smokePassed']) state[k] = null;
     writeState();
-    clearReadyCandidate(root, stEnv);
+    await dropReady('clone-recloned'); // the whole checkout was replaced: no forced build can still be head
     return terminal({ moved: false, reason: 'clone-recloned', quarantinedTo: cloneRepair.quarantinedTo });
   }
   const fetchResult = fetchMainAndOverlays({ git, overlays: overlaysBefore, edgeResolve });
@@ -483,7 +488,7 @@ export async function prepareRebuild({
       state.held = null; // x5wbsbc — current again: no longer held on a last-good build
       writeState();
     }
-    clearReadyCandidate(root, stEnv); // current already — nothing a passed-but-unadopted build could add
+    await dropReady('up-to-date', plan.finalSha); // current already — nothing a passed-but-unadopted build could add
     return terminal({ moved: false, reason: 'up-to-date', plan });
   }
 
@@ -539,16 +544,10 @@ export async function prepareRebuild({
         removedForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
       });
       if (!m.adopt) {
-        clearReadyCandidate(root, stEnv);
         // A discarded forced build can no longer be adopted, so its rollback watch (it would only wait out the TTL and
         // block the next force) is closed and the audit log says the build was NOT adopted. A build already running
         // as head keeps its watch.
-        if (ready.forced === true && m.reason !== 'already-head') {
-          await abortForcedWatch({
-            root, env: stEnv, sha: ready.adopt.finalSha, reason: m.reason,
-            emit: (e) => appendDaemonEvent(e, { env: { WE_DAEMON_EVENTS: env?.WE_DAEMON_EVENTS } }),
-          });
-        }
+        await dropReady(m.reason, prevHead);
         reportDiscardedCandidate({
           ready, match: m, alert,
           needsYou: ({ kind, ...detail }) => {
@@ -561,7 +560,7 @@ export async function prepareRebuild({
       } else {
         const colliding = unsafe.untracked.filter((p) => git(['cat-file', '-e', `${m.adopt.finalSha}:${p}`]).status === 0);
         if (colliding.length > 0) {
-          clearReadyCandidate(root, stEnv);
+          await dropReady('untracked-collision');
           alert('untracked-collision', { paths: colliding });
           return terminal({ moved: false, reason: 'untracked-collision', untracked: colliding, plan });
         }
@@ -602,8 +601,10 @@ export async function prepareRebuild({
   // `main-staleness.mjs#assertMainNotStale`), whatever the new inputs are.
   // R508: an operator force-adopt request that names EXACTLY this candidate (same sha) must reach a fresh smoke, so it can be
   // consumed there, even when this candidate is held by a sticky rejection or the harness-broken backoff. A request for any
-  // other build never lifts a rejection (`forceRequestFor` is the one sha matcher).
-  const forceBypass = !!forceRequestFor(root, stEnv, plan.finalSha);
+  // other build never lifts a rejection (`forceRequestFor` is the one sha matcher). While a force watch is still open a second
+  // force is refused (`watch-already-open`) WITHOUT consuming the request, so lifting the gate then would re-smoke this
+  // candidate on every tick for nothing: the rejection stands until the watch ends.
+  const forceBypass = !readForceWatch(root, stEnv) && !!forceRequestFor(root, stEnv, plan.finalSha);
   if (forceBypass && (state.rejected?.inputsKey === plan.inputsKey || state.held?.reason === 'smoke-harness-broken')) {
     alert('force-adopt-bypasses-rejection', { target: plan.finalSha, rejected: state.rejected?.reason ?? null });
   }

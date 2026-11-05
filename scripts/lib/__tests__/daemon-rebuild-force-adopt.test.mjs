@@ -17,7 +17,7 @@ import {
 import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
 import { defaultPoolRoot } from '../lane-pool-paths.mjs';
 import { DISPATCH_CWD_ENV } from '../../operations/dispatch-lane-io.mjs';
-import { requestForceAdopt, readForceWatch, runForceWatchTick, readForceAdopt } from '../daemon-force-adopt.mjs';
+import { requestForceAdopt, readForceWatch, runForceWatchTick, readForceAdopt, recordForcedAdoption } from '../daemon-force-adopt.mjs';
 import { readReadyCandidate } from '../daemon-rebuild/state.mjs';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
 import { gitRun } from '../main-staleness.mjs';
@@ -365,6 +365,45 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     expect(readForceWatch(cloneDir, env)).toBeNull(); // not left to wait out the TTL and block the next force
     expect(handoffOf(env)).toMatch(new RegExp(`NOT adopted ${target} \\(forced-sha-pinned\\); watch closed`));
     expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8')).toMatch(/force-adopt-aborted/);
+  });
+
+  it('while a force watch is open a request for the held candidate does not lift the rejection (no re-smoke every tick)', async () => {
+    const { cloneDir, env, target, arm, lastGood } = setup();
+    const failThenPass = vi.fn().mockResolvedValueOnce((await failing()()))
+      .mockResolvedValue({ verdict: 'pass', attempts: 1, smoke: { results: [] } });
+    await tick(cloneDir, env, { runSmoke: failThenPass });
+    // an earlier forced adoption of some other build is still under watch: a second force is refused, never consumed
+    const opened = await recordForcedAdoption({ root: cloneDir, env, request: { daemon: 'review', ruling: 'R508', quote: QUOTE }, sha: 'e'.repeat(40), lastGood: { head: lastGood }, smoke: { verdict: 'code', failed: [] }, emit: async () => true });
+    expect(opened.ok).toBe(true);
+    arm();
+    const smoke = failing();
+    for (let i = 0; i < 2; i += 1) expect((await tick(cloneDir, env, { runSmoke: smoke, forceWatchProbe: healthy })).reason).toBe('still-rejected');
+    expect(smoke).not.toHaveBeenCalled();
+    expect(readForceAdopt(cloneDir, env)).toMatchObject({ sha: target }); // still pending for when the watch ends
+    expect(headOf(cloneDir)).toBe(lastGood);
+  });
+
+  it.each([
+    ['up-to-date', 'the clone already runs another current build'],
+    ['untracked-collision', 'an untracked file collides with the forced build'],
+  ])('a forced ready record dropped as %s (%s) also closes its watch', async (why) => {
+    const { originDir, cloneDir, env, target, arm } = setup();
+    arm();
+    await tick(cloneDir, env, { runSmoke: failing(), readyOnly: true });
+    expect(readReadyCandidate(cloneDir, env)).toMatchObject({ forced: true });
+    if (why === 'up-to-date') {
+      const successor = advanceMainEmpty(originDir);
+      gitOk(cloneDir, ['fetch', '-q', 'origin']);
+      gitOk(cloneDir, ['reset', '-q', '--hard', successor]); // the clone now runs main's tip, not the forced build
+    } else {
+      writeFile(cloneDir, 'm.txt', 'untracked and different\n');
+    }
+    const r = await tick(cloneDir, env, { runSmoke: failing(), forceWatchProbe: unhealthy });
+    expect(r.reason).toBe(why);
+    expect(readReadyCandidate(cloneDir, env)).toBeNull();
+    expect(readForceWatch(cloneDir, env)).toBeNull(); // not stranded: the next force is not refused with watch-already-open
+    expect(handoffOf(env)).toMatch(new RegExp(`NOT adopted ${target} \\(${why}\\); watch closed`));
+    expect(headOf(cloneDir)).not.toBe(target); // the forced build was never adopted
   });
 
   it('a deferred forced adoption keeps its watch until the exact build is adopted, then the watch still rolls it back', async () => {
