@@ -1129,13 +1129,14 @@ describe('pending soak always replays recovery availability', () => {
   });
 });
 
-describe('a confirmed-break comment with unknown hold text stays visible to hold detection', () => {
-  it('an older break comment containing a human hold phrase blocks a later clean result from clearing', () => {
+describe('a clean-shaped red-team comment recording a non-accept verdict never clears', () => {
+  it.each(['needs-human', 'changes', 'prevention-outstanding'])('recorded verdict %s beside an older accepting status does not synchronize', verdict => {
     const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: payload('accept'), recorded: false, seatRecorded: false,
       status: { status: 'finished', result: { comment: 'posted', foldedVerdict: 'accept' } } })), readIgnorableConfirms: () => [] });
-    o.rawPrs[0].comments.push({ author: { login: 'web-everything' }, createdAt: iso(acceptedAt + 1),
-      body: `${redTeamMarker(pr, head)}\n### Post-accept red team \u2014 1 possible break(s), 1 confirmed by Claude's re-check\n\n1. [**confirmed**] (edge-case, broken) \u2014 real\n\n\u{1F501} review \u2014 changes requested: do not merge` },
-    { ...resultComment(), createdAt: iso(acceptedAt + 2) });
+    const advisory = "Advisory only: this comment changes no label itself; the red-team gate (setting `redTeam.confirmedBreaks`) sends a confirmed broken break back to the fixer. Head `"
+      + head.slice(0, 12) + '` \u00b7 red team ';
+    o.rawPrs[0].comments.push({ author: { login: 'web-everything' }, createdAt: iso(acceptedAt + 5),
+      body: `${redTeamMarker(pr, head)}\n### Post-accept red team \u2014 no break found\n\n${advisory}codex/m \u00b7 recorded verdict \`${verdict}\`.\n\nThe red team tried to break this change and reported nothing.` });
     mod.runRedTeamOnSkip(o);
     expect(o.syncLabels).not.toHaveBeenCalled();
   });
