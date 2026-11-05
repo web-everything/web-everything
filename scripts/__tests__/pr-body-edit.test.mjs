@@ -132,6 +132,24 @@ describe('repair() — GraphQL userContentEdits recovery', () => {
     expect(editCall(execFile)).toBeUndefined();
   });
 
+  // PR #6409 review: a truncated page must refuse through the CLI path too, not only in the helper's own tests.
+  it('exits non-zero and writes nothing for a truncated history page (hasNextPage:true or a totalCount mismatch)', () => {
+    const nodes = [{ createdAt: '2026-10-01T10:00:00Z', editor: { __typename: 'Bot', login: 'plateau-worker' }, diff: `Original\n\n${stamp(A)}` }];
+    const truncated = (over) => JSON.stringify({ data: { repository: { pullRequest: {
+      userContentEdits: { totalCount: nodes.length, nodes, pageInfo: { hasNextPage: false, endCursor: null }, ...over },
+    } } } });
+    for (const over of [{ pageInfo: { hasNextPage: true, endCursor: 'c1' } }, { totalCount: 101 }]) {
+      const execFile = stubExec(() => truncated(over));
+      expect(repair(ghView(unstamped), pr, repo, execFile)).not.toBe(0);
+      expectGraphqlOnly(execFile);
+      expect(editCall(execFile)).toBeUndefined();
+    }
+    // Control: the same single snapshot, complete, restores.
+    const execFile = stubExec(() => truncated({}));
+    expect(repair(ghView(unstamped), pr, repo, execFile)).toBe(0);
+    expect(editCall(execFile)).toBeTruthy();
+  });
+
   it('refuses successfully read but empty history without writing a stamp-lost marker', () => {
     const execFile = stubExec(() => response([]));
     expect(repair(ghView(unstamped), pr, repo, execFile)).not.toBe(0);
