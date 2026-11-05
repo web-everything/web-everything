@@ -9,7 +9,7 @@ import { createNewestRunFinder, RUN_SCAN_CAPPED } from './stream-filter-runs.mjs
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { redTeamEnabled, redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
-import { readRedTeamProbes } from './red-team-gate.mjs';
+import { readRedTeamProbes, redTeamForHead } from './red-team-gate.mjs';
 import { completedRedTeamSeat } from './red-team-run-result.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 
@@ -419,4 +419,17 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   // An owing run with no job status yet: only the job's process knows its card-only skip decision, so hold the head
   // (skip off) until that status records it. The never-scheduled deadline still applies if no job ever writes one.
   return { loopPayload, inFlight: false, scheduled: recorded || owes(loopPayload), recorded, ...seatEvidence, ...(owes(loopPayload) ? { skipCardOnly: false } : {}) };
+}
+
+// R622: unknown run evidence the comment thread can answer. A review run left unfinished (its human confirm never
+// recorded because the accept came by label) or a capped run scan says nothing about a result that is already
+// published. A trusted result comment bound to this exact head (redTeamForHead) is that result; nothing is owed.
+// Breaks are checked by redTeamEnqueueHold BEFORE it reads `ok`, so a recorded break still sends back. Every other
+// unknown reason, and any head without a trusted result comment, stays unknown (fail closed).
+export const COMMENT_SETTLEABLE_REASONS = Object.freeze(['review-unfinished', RUN_SCAN_CAPPED.reason]);
+export function settleUnknownEvidenceByComment(evidence, comments, pr, head) {
+  if (evidence?.ok !== false || !COMMENT_SETTLEABLE_REASONS.includes(evidence.reason)) return evidence;
+  if (!redTeamForHead(comments, pr, head)) return evidence;
+  return { ok: true, settledByComment: evidence.reason, loopPayload: null, scheduled: false, inFlight: false,
+    queued: false, recorded: true, skipCardOnly: false };
 }

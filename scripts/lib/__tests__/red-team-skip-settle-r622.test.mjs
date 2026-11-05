@@ -10,7 +10,7 @@ import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 const head = 'a'.repeat(40), other = 'b'.repeat(40), pr = 6244;
 const comment = (rev = head, findings = [], login = 'web-everything') => ({ author: { login }, createdAt: '2026-11-05T12:00:00Z',
   body: renderRedTeamComment({ pr, rev, findings, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: findings.length ? 'changes' : 'accept' }) });
-const broken = [{ id: 'f1', class: 'broken', title: 'x', evidence: 'y', confirmed: true, severity: 'high' }];
+const broken = [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }];
 const holdFor = (evidence, comments) => redTeamEnqueueHold({ ...settleUnknownEvidenceByComment(evidence, comments, pr, head), comments, pr, head, env: {} });
 
 describe('R622 unknown run evidence settled by a head-bound result comment', () => {
