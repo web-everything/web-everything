@@ -62,7 +62,7 @@ function notOwedRunFixture(over = {}) {
 }
 function resultRunFixture(over = {}, verdict = 'accept') {
   return runFixture({ readEvidence: () => evidence({ recorded: true, loopPayload: payload('accept'),
-    status: { status: 'finished', result: { status: 'ran', foldedVerdict: verdict } } }), ...over });
+    status: { status: 'finished', result: { status: 'ran', comment: 'posted', foldedVerdict: verdict } } }), ...over });
 }
 function carryFixture() {
   const f = fixture({ readEvidence: () => evidence({ loopPayload: undefined }) });
@@ -259,6 +259,14 @@ describe('settlement reads fresh PR state and result evidence', () => {
     const row = mod.runRedTeamOnSkip(o).rows[0];
     expect(o.syncLabels).not.toHaveBeenCalled();
     expect(row.settleError).toBe('review payload is not an accept; label unchanged');
+  });
+  it.each(['withheld', 'error', undefined])('an accept whose comment is %s (not confirmed posted) never clears on an older comment', comment => {
+    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: payload('accept'), recorded: false, seatRecorded: false,
+      status: { status: 'finished', result: { foldedVerdict: 'accept', ...(comment ? { comment } : {}) } } })), readIgnorableConfirms: () => [] });
+    o.rawPrs[0].comments.push(resultComment());
+    const row = mod.runRedTeamOnSkip(o).rows[0];
+    expect(o.syncLabels).not.toHaveBeenCalled();
+    expect(row.settleError).toBe('red-team result comment not confirmed posted; label unchanged');
   });
   it('a throwing result evidence read settles nothing and reports settleError', () => {
     const o = runFixture({ readEvidence: () => { throw Error('fresh evidence offline'); } });
@@ -904,7 +912,7 @@ describe('audit hardening: unknown effect statuses and checked comments', () => 
       expect(mod.headNeverReviewedFromRuns(input)).toBe(false);
     });
   it('hands the synchronizer freshly checked comments and no cached live state', () => {
-    const o = runFixture({ readEvidence: () => evidence({ loopPayload: payload('accept'), status: { status: 'finished', result: { foldedVerdict: 'accept' } } }) });
+    const o = runFixture({ readEvidence: () => evidence({ loopPayload: payload('accept'), status: { status: 'finished', result: { comment: 'posted', foldedVerdict: 'accept' } } }) });
     o.rawPrs[0].comments.push(resultComment());
     const comments = [...o.rawPrs[0].comments, trusted('🔔 conveyor — newly read status')];
     o.readComments = vi.fn(() => comments);
