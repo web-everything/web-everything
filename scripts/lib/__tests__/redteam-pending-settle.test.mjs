@@ -963,3 +963,14 @@ describe('not-owed removal requires acceptance provenance', () => {
     expect(o.syncLabels).not.toHaveBeenCalled(); expect(o.dispatch).not.toHaveBeenCalled();
   });
 });
+
+describe('re-stamped acceptance is not a confirm-exclusion anchor', () => {
+  it('ignorableConfirmRunIds fails closed when the latest acceptance is a no-new-review re-stamp', () => {
+    const stamp = `\u{1F4CC} review \u2014 acceptance re-stamped after a rebase (no new review)\n<!-- reviewed-sha: ${head} -->`;
+    const comments = [{ author: { login: 'web-everything' }, createdAt: iso(acceptedAt), body: stamp }];
+    const result = mod.ignorableConfirmRunIds({ repo, pr, head, comments, reviews: [], labels: ['review:accepted'],
+      runsDir: '/runs', list: () => [], read: () => ({}), stat: () => ({ mtimeMs: acceptedAt - 3600e3 }), now: acceptedAt + 1000 });
+    expect(result.ok).toBe(false);
+    expect(result.ids).toEqual([]);
+  });
+});
