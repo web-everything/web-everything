@@ -1194,7 +1194,7 @@ describe('merge-queue same-head failure admission', () => {
     const result = mqSameHeadGuard({ repo, pr, head, exec, log });
     expect(result).toEqual(decide(timeline(removed())));
     expect(exec).toHaveBeenCalledTimes(3); // Queue, timeline, then the unreadable infra-retry evidence read (fails closed).
-    expect(log.mock.calls).toEqual([[result.line]]);
+    expect(log.mock.calls).toEqual([[result.line], [`mq-same-head-retry-declined: #${pr} head ${head} — retry evidence unreadable or incomplete`]]);
   });
   it('mqSameHeadGuard releases manual removal without logging a hold', () => {
     const exec = withQueue(() => response(timeline(removed('manual')))), log = vi.fn();
@@ -1215,7 +1215,7 @@ describe('merge-queue same-head failure admission', () => {
       ? queueResponse(true) : response(timeline(removed()))), log = vi.fn();
     expectHold(mqSameHeadGuard({ repo, pr, head, exec, log, allowAlreadyQueued: false }), /failed_checks/);
     expect(exec).toHaveBeenCalledTimes(3); // Queue, timeline, then the unreadable infra-retry evidence read.
-    expect(log).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledTimes(2); // The hold line plus its decline-reason line.
   });
   it.each([true, null, undefined, 'throws'])('mutation admission fails closed for decision %s', decision => {
     const sameHeadAdmission = vi.fn(() => {

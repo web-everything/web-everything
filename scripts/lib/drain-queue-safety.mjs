@@ -365,10 +365,23 @@ function readMqRetryEvidence({ repo, pr, head, timeline, exec }) {
     const before = runs.find(run => run.status === 'completed' && timestamp(run.created_at) < removedAt
       && timestamp(run.updated_at) < removedAt);
     const mainRed = ['failure', 'cancelled', 'timed_out'].includes(before?.conclusion);
-    return { mainGreen: runs[0].status === 'completed' && runs[0].conclusion === 'success',
+    const failedNames = failed.filter(check => !infraConclusions.has(check.conclusion))
+      .map(check => (typeof check.name === 'string' ? check.name : 'unnamed').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ')).slice(0, 5);
+    return { mainGreen: runs[0].status === 'completed' && runs[0].conclusion === 'success', failedNames,
       infra: infra ? 'infra' : mainRed ? 'main-red' : null,
       mergeState: readMqMergeState({ repo, pr, head, exec }) };
   } catch { return null; }
+}
+
+/** Why a same-head failed_checks retry was declined, so a held PR is never silent. */
+function mqRetryDeclineReason(evidence, holdLine) {
+  if (/removals on this head|already spent/.test(holdLine ?? '')) return 'retry bound reached (this head already had its single retry)';
+  if (!evidence) return 'retry evidence unreadable or incomplete';
+  if (evidence.mainGreen !== true) return 'main CI is not green';
+  if (!['infra', 'main-red'].includes(evidence.infra))
+    return `non-infrastructure failed check(s): ${(evidence.failedNames ?? []).join(', ') || 'unknown'}; main was not red at removal`;
+  if (evidence.mergeState !== 'CLEAN') return `PR is not CLEAN (${typeof evidence.mergeState === 'string' && /^[A-Z_]{1,32}$/.test(evidence.mergeState) ? evidence.mergeState : 'unknown'})`;
+  return 'retry conditions not met';
 }
 
 export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, log = () => {}, allowAlreadyQueued = true, refresh } = {}) {
@@ -379,17 +392,19 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
   const queue = readMergeQueueState({ repo, pr, readJson: args => JSON.parse(exec('gh', args,
     { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })) });
   const currentHead = mqOid(head);
-  let timeline;
+  let timeline, retryEvidence;
   const decision = queue.error || !currentHead || mqOid(queue.head) !== currentHead
     ? mqSameHeadHold({ pr, head }, 'unreadable or mismatched live merge-queue state; inspect queue before retrying')
     : allowAlreadyQueued && queue.inQueue === true ? { hold: false, line: null }
       : decideMqSameHead({ pr, head, timeline: (timeline = readMqTimeline({ repo, pr, exec })),
-        retryEvidence: timelineHasFailedChecks(timeline, currentHead)
-          ? readMqRetryEvidence({ repo, pr, head: currentHead, timeline, exec }) : undefined,
+        retryEvidence: (retryEvidence = timelineHasFailedChecks(timeline, currentHead)
+          ? readMqRetryEvidence({ repo, pr, head: currentHead, timeline, exec }) : undefined),
         mergeState: timelineHasConflict(timeline) ? readMqMergeState({ repo, pr, head: currentHead, exec }) : undefined });
   if (!decision.hold && decision.line) log(decision.line);
   if (decision.hold) {
     log(decision.line);
+    if (timelineHasFailedChecks(timeline, currentHead))
+      log(`mq-same-head-retry-declined: #${String(pr).replace(/\D/g, '')} head ${currentHead} — ${mqRetryDeclineReason(retryEvidence, decision.line)}`);
     // Unknown/incomplete history cannot authorize recovery. Require a failed removal bound to H.
     const confirmed = !timeline?.error && timeline?.hasPreviousPage === false
       && Array.isArray(timeline.nodes) && timeline.nodes.every(event =>
