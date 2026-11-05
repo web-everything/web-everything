@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join, relative } from 'node:path';
 import * as deps from '../daemon-rebuild/deps-job.mjs';
 import { cloneNodeModulesInstaller, REBUILD_JOB_KIND } from '../daemon-rebuild/rebuild-job.mjs';
-import { ensureNodeModulesStore, evictSnapshots, NODE_MODULES_MANIFEST_FILE, nodeModulesRef, nodeModulesTreeEvidence, setNodeModulesWritable } from '../daemon-job-snapshots.mjs';
+import { ensureNodeModulesStore, evictSnapshots, NODE_MODULES_HASH_FILE, NODE_MODULES_MANIFEST_FILE, NODE_MODULES_UNSAFE_FILE, nodeModulesRef, nodeModulesTreeEvidence, setNodeModulesWritable } from '../daemon-job-snapshots.mjs';
 import { createJobStore, enqueueJob, launchJob, prepareJobCode } from '../daemon-jobs-runtime.mjs';
 import { markClaimed, markLaunching } from '../daemon-jobs.mjs';
 import { withFileLock } from '../atomic-json-file.mjs';
@@ -79,6 +79,21 @@ function expectCopied(f, reason) {
     expect(messages(f.log)).toMatch(/copy/i);
     expect(messages(f.log)).toMatch(reason);
   }
+}
+
+function expectQuarantined(f, reason, run = () => deps.linkOrCopyNodeModules(f)) {
+  let failure;
+  try { run(); } catch (error) { failure = error; }
+  expect(failure).toMatchObject({ code: 'ENODEMODULESMUTATED' });
+  expect(failure.message).toMatch(reason);
+  expect(basename(failure.quarantined)).toMatch(/^\.quarantined-/);
+  expect(existsSync(f.storeDir)).toBe(false);
+  expect(existsSync(failure.quarantined)).toBe(true);
+  expect(existsSync(target(f))).toBe(false);
+  expect(f.exec).not.toHaveBeenCalled();
+  expect(statSync(join(failure.quarantined, 'node_modules')).mode & 0o200).toBe(0o200);
+  expect(messages(f.log)).toMatch(/copy refused.*quarantining mutated store/i);
+  return failure.quarantined;
 }
 
 describe('rebuild dependency mode and provenance', () => {
@@ -160,22 +175,20 @@ describe('shared link-or-copy safety decision', () => {
     expectCopied(f, /stat|device|volume|unreadable|denied/i);
   });
 
-  it('changed store content hash falls back to copy and logs an integrity mismatch', () => {
+  it('changed store content hash quarantines the rejected store and refuses installation', () => {
     const f = fixture();
     // Deliberately bypass the new file protection to exercise the existing hash guard independently.
     chmodSync(join(f.storeDir, 'node_modules', '.package-lock.json'), 0o644);
     writeFileSync(join(f.storeDir, 'node_modules', '.package-lock.json'), '{"tampered":true}');
-    deps.linkOrCopyNodeModules({ ...f, depsMode: 'symlink' });
-    expectCopied(f, /hash|integrity|mismatch|mutat/i);
+    expectQuarantined(f, /hash.*mismatch/i);
   });
 
-  it('missing store integrity evidence fails closed to copy with a reason', () => {
+  it('removal of a guarded hidden lock is mutation and quarantines the store', () => {
     const f = fixture();
     chmodSync(join(f.storeDir, 'node_modules'), 0o755);
     rmSync(join(f.storeDir, 'node_modules', '.package-lock.json'));
     chmodSync(join(f.storeDir, 'node_modules'), 0o555);
-    deps.linkOrCopyNodeModules({ ...f, depsMode: 'symlink' });
-    expectCopied(f, /hash|integrity|evidence|missing|ENOENT/i);
+    expectQuarantined(f, /hash.*missing/i);
   });
 
   it('unreadable store hash evidence fails closed to copy with a reason', () => {
@@ -194,6 +207,8 @@ describe('shared link-or-copy safety decision', () => {
     writeFileSync(join(legacy, '.snapshot-complete'), 'legacy completion marker\n');
     deps.linkOrCopyNodeModules({ ...f, storeDir: legacy, depsMode: 'symlink' });
     expectCopied(f, /hash|integrity|evidence|missing|legacy/i);
+    expect(existsSync(legacy)).toBe(true);
+    expect(readdirSync(f.base).some((name) => name.startsWith('.quarantined-'))).toBe(false);
   });
 
   it('steps that write node_modules keep copies; an empty list requires the no-writer audit comment', () => {
@@ -247,12 +262,11 @@ describe('both rebuild copy sites use the guarded decision', () => {
     expectCopied(f);
   });
 
-  it('cloneNodeModulesInstaller refuses a mutated store and logs its copy fallback', () => {
+  it('cloneNodeModulesInstaller quarantines a mutated store without copying rejected contents', () => {
     const f = fixture();
     chmodSync(join(f.storeDir, 'node_modules', '.package-lock.json'), 0o644);
     writeFileSync(join(f.storeDir, 'node_modules', '.package-lock.json'), '{"tampered":true}');
-    cloneNodeModulesInstaller(f.storeDir, { exec: f.exec, depsMode: 'symlink', log: f.log })(f.root);
-    expectCopied(f, /hash|integrity|mismatch|mutat/i);
+    expectQuarantined(f, /hash.*mismatch/i, () => cloneNodeModulesInstaller(f.storeDir, { exec: f.exec, depsMode: 'symlink', log: f.log })(f.root));
   });
 
   it('installer lockfile mismatch still uses the injected install fallback', () => {
@@ -315,13 +329,11 @@ describe('read-only dependency stores and rebuild consumer retention', () => {
     expect(readFileSync(join(target(f), 'pkg', 'index.js'), 'utf8')).toBe('export default 1;');
   });
 
-  it('writable store mode falls back to a writable private copy and logs the integrity reason', () => {
+  it('writable guarded store mode quarantines the tree and refuses a private copy', () => {
     const f = fixture();
     chmodSync(join(f.storeDir, 'node_modules'), 0o755);
-    deps.linkOrCopyNodeModules(f);
-    expectCopied(f, /writable|readonly|read-only/i);
-    writeFileSync(join(target(f), 'pkg', 'index.js'), 'private change');
-    expect(readFileSync(join(f.storeDir, 'node_modules', 'pkg', 'index.js'), 'utf8')).toBe('export default 1;');
+    const quarantined = expectQuarantined(f, /writable|readonly|read-only/i);
+    expect(readFileSync(join(quarantined, 'node_modules', 'pkg', 'index.js'), 'utf8')).toBe('export default 1;');
   });
 
   it('unreadable store permission evidence fails closed to copy with a log', () => {
@@ -482,35 +494,31 @@ describe('read-only dependency stores and rebuild consumer retention', () => {
     expect(readFileSync(join(f.storeDir, 'node_modules', 'payload.txt'), 'utf8')).toBe('store payload');
   });
 
-  it.each(['pkg', '@scope/other'])('a writable package directory %s falls back to copy and logs', (name) => {
+  it.each(['pkg', '@scope/other'])('a writable package directory %s is quarantined rather than copied', (name) => {
     const f = fixture();
     chmodSync(join(f.storeDir, 'node_modules', name), 0o755);
-    deps.linkOrCopyNodeModules(f);
-    expectCopied(f, /manifest|package|writable/i);
+    expectQuarantined(f, /manifest|package|writable/i);
   });
 
-  it('a writable scope directory falls back to copy and logs', () => {
+  it('a writable scope directory quarantines the store', () => {
     const f = fixture();
     chmodSync(join(f.storeDir, 'node_modules', '@scope'), 0o755);
-    deps.linkOrCopyNodeModules(f);
-    expectCopied(f, /manifest|package|writable/i);
+    expectQuarantined(f, /manifest|package|writable/i);
   });
 
-  it('a writable package.json with unchanged content falls back to copy and logs', () => {
+  it('a writable package.json with unchanged content quarantines the store', () => {
     const f = fixture();
     chmodSync(join(f.storeDir, 'node_modules', 'pkg', 'package.json'), 0o644);
-    deps.linkOrCopyNodeModules(f);
-    expectCopied(f, /manifest|package|writable/i);
+    expectQuarantined(f, /manifest|package|writable/i);
   });
 
-  it('changed package.json size with read-only permissions restored falls back to copy and logs', () => {
+  it('changed package.json size with read-only permissions restored quarantines the store', () => {
     const f = fixture();
     const path = join(f.storeDir, 'node_modules', 'pkg', 'package.json');
     chmodSync(path, 0o644);
     writeFileSync(path, '{"name":"pkg","version":"1.0.0","added":"new data"}');
     chmodSync(path, 0o444);
-    deps.linkOrCopyNodeModules(f);
-    expectCopied(f, /manifest.*mismatch/i);
+    expectQuarantined(f, /manifest.*mismatch/i);
   });
 
   it('a missing recorded package manifest falls back to copy and logs', () => {
@@ -605,29 +613,26 @@ describe('read-only dependency stores and rebuild consumer retention', () => {
 });
 
 describe('whole-tree read-only reuse evidence', () => {
-  it('a writable nested package file falls back to copy and logs', () => {
+  it('a writable nested package file quarantines the store', () => {
     const f = fixture();
     chmodSync(join(f.storeDir, 'node_modules', 'pkg', 'node_modules', 'inner', 'lib', 'nested.js'), 0o644);
-    deps.linkOrCopyNodeModules(f);
-    expectCopied(f, /tree.*writable/i);
+    expectQuarantined(f, /tree.*writable/i);
   });
 
-  it('an added read-only nested file changes the recorded count and falls back to copy', () => {
+  it('an added read-only nested file changes the recorded count and quarantines the store', () => {
     const f = fixture();
     const dir = join(f.storeDir, 'node_modules', 'pkg', 'node_modules', 'inner', 'lib');
     chmodSync(dir, 0o755);
     writeFileSync(join(dir, 'extra.js'), 'extra');
     chmodSync(join(dir, 'extra.js'), 0o444);
     chmodSync(dir, 0o555);
-    deps.linkOrCopyNodeModules(f);
-    expectCopied(f, /tree entry count mismatch/i);
+    expectQuarantined(f, /tree entry count mismatch/i);
   });
 
-  it('a writable nested dependency directory falls back to copy and logs', () => {
+  it('a writable nested dependency directory quarantines the store', () => {
     const f = fixture();
     chmodSync(join(f.storeDir, 'node_modules', 'pkg', 'node_modules', 'inner'), 0o755);
-    deps.linkOrCopyNodeModules(f);
-    expectCopied(f, /tree.*writable/i);
+    expectQuarantined(f, /tree.*writable/i);
   });
 
   it('an unreadable nested lstat fails closed to copy with a reason', () => {
@@ -679,7 +684,7 @@ describe('whole-tree read-only reuse evidence', () => {
 });
 
 describe('entry fingerprints, contained links, and protected copies', () => {
-  it.each(['size', 'mtime'])('chmod-modify-restore of a nested file changes its %s fingerprint and falls back to copy', (change) => {
+  it.each(['size', 'mtime'])('chmod-modify-restore of a nested file changes its %s fingerprint and quarantines the store', (change) => {
     const f = fixture();
     const path = join(f.storeDir, 'node_modules', 'pkg', 'node_modules', 'inner', 'lib', 'nested.js');
     const before = statSync(path);
@@ -687,9 +692,8 @@ describe('entry fingerprints, contained links, and protected copies', () => {
     writeFileSync(path, change === 'size' ? 'a different and longer implementation' : 'export default 9;');
     if (change === 'mtime') utimesSync(path, before.atime, new Date(before.mtimeMs + 2000));
     chmodSync(path, before.mode);
-    deps.linkOrCopyNodeModules(f);
-    expectCopied(f, /fingerprint.*mismatch/i);
     expect(statSync(path).mode).toBe(before.mode);
+    expectQuarantined(f, /fingerprint.*mismatch/i);
   });
 
   it('completion records the final read-only modes in the whole-tree fingerprint', () => {
@@ -719,9 +723,8 @@ describe('entry fingerprints, contained links, and protected copies', () => {
     rmSync(join(bin, 'pkg'));
     symlinkSync('../pkg/node_modules/inner/lib/nested.js', join(bin, 'pkg'));
     chmodSync(bin, 0o555);
-    deps.linkOrCopyNodeModules(f);
-    expectCopied(f, /fingerprint.*mismatch/i);
-    expect(readlinkSync(join(target(f), '.bin', 'pkg'))).toBe('../pkg/node_modules/inner/lib/nested.js');
+    const quarantined = expectQuarantined(f, /fingerprint.*mismatch/i);
+    expect(readlinkSync(join(quarantined, 'node_modules', '.bin', 'pkg'))).toBe('../pkg/node_modules/inner/lib/nested.js');
   });
 
   for (const depsMode of ['symlink', 'copy']) {
@@ -778,6 +781,138 @@ describe('entry fingerprints, contained links, and protected copies', () => {
     expect(existsSync(f.storeDir)).toBe(false);
     expect(readFileSync(join(target(f), '.bin', 'pkg'), 'utf8')).toBe('export default 1;');
     expect(messages(f.log)).toMatch(/retaining.*lock unavailable/i);
+  });
+});
+
+describe('quarantine recovery and explicit unsafe completion markers', () => {
+  it('a quarantined mutated store is rebuilt at the same key through the normal installer path', () => {
+    const f = fixture();
+    const path = join(f.storeDir, 'node_modules', 'pkg', 'index.js');
+    chmodSync(path, 0o644);
+    writeFileSync(path, 'accidentally changed implementation');
+    chmodSync(path, 0o444);
+    const quarantined = expectQuarantined(f, /fingerprint.*mismatch/i);
+    const rebuilt = ensureNodeModulesStore({ jobsDir: join(f.base, 'jobs'), sourceDir: f.sourceDir, install: f.install });
+    expect(rebuilt.dir).toBe(f.storeDir);
+    expect(f.install).toHaveBeenCalledTimes(2);
+    expect(existsSync(quarantined)).toBe(true);
+    deps.linkOrCopyNodeModules(f);
+    expectLinked(f);
+    const removed = evictSnapshots({ jobsDir: join(f.base, 'jobs'), referenced: [nodeModulesRef(rebuilt.key)], keep: 0 });
+    expect(removed.evicted).toEqual([`quarantine:${basename(quarantined)}`]);
+    expect(existsSync(quarantined)).toBe(false);
+  });
+
+  it('explicit copy mode also quarantines a store whose recorded fingerprint proves mutation', () => {
+    const f = fixture();
+    const path = join(f.storeDir, 'node_modules', 'pkg', 'index.js');
+    chmodSync(path, 0o644);
+    writeFileSync(path, 'unexpected mutation');
+    chmodSync(path, 0o444);
+    expectQuarantined(f, /fingerprint.*mismatch/i, () => deps.linkOrCopyNodeModules({ ...f, depsMode: 'copy' }));
+  });
+
+  it('a quarantined live target queues a replacement install even after quarantine eviction and an unchanged installed key', async () => {
+    const f = fixture();
+    deps.swapNodeModules(f);
+    const path = join(f.storeDir, 'node_modules', 'pkg', 'index.js');
+    chmodSync(path, 0o644);
+    writeFileSync(path, 'mutated while shared');
+    chmodSync(path, 0o444);
+    const quarantined = expectQuarantined(f, /fingerprint.*mismatch/i);
+    expect(lstatSync(target(f)).isSymbolicLink()).toBe(true);
+    evictSnapshots({ jobsDir: join(f.base, 'jobs'), referenced: [], keep: 0 });
+    expect(existsSync(quarantined)).toBe(false);
+    const reattach = vi.fn(async () => null);
+    const result = await deps.refreshDepsAsJob({
+      root: f.root, installed: { read: () => basename(f.storeDir), write: vi.fn() },
+      store: createJobStore(join(f.base, 'jobs')), reattach, codeSha: 'deadbeef', env: {}, log: f.log,
+    });
+    expect(result.reason).toBe('deps-job-started');
+    expect(reattach).toHaveBeenCalledTimes(1);
+    ensureNodeModulesStore({ jobsDir: join(f.base, 'jobs'), sourceDir: f.sourceDir, install: f.install });
+    expectLinked(f);
+  });
+
+  it.each(['hash', 'manifest', 'chmod', 'tree', 'manifest-write'])('evidence failure in %s publishes an unsafe marker BEFORE completion and forces a private copy', (phase) => {
+    const f = fixture();
+    const failure = () => { throw Object.assign(new Error(`${phase} evidence denied`), { code: 'EACCES' }); };
+    const options = {};
+    if (phase === 'hash') options.readFile = failure;
+    if (phase === 'manifest') options.packageManifest = failure;
+    if (phase === 'chmod') options.freeze = failure;
+    if (phase === 'tree') options.treeEvidence = failure;
+    let sawUnsafeBeforeComplete = false;
+    const writeFile = vi.fn((path, text) => {
+      if (basename(path) === NODE_MODULES_UNSAFE_FILE) {
+        expect(existsSync(join(dirname(path), '.snapshot-complete'))).toBe(false);
+        sawUnsafeBeforeComplete = true;
+      }
+      writeFileSync(path, text);
+      // Even a durable, valid manifest cannot override an explicit generation-failure marker.
+      if (phase === 'manifest-write' && basename(path) === NODE_MODULES_MANIFEST_FILE) failure();
+    });
+    const unsafe = ensureNodeModulesStore({
+      jobsDir: join(f.base, 'unsafe-jobs'), sourceDir: f.sourceDir, install: f.install, ...options, writeFile,
+    });
+    expect(sawUnsafeBeforeComplete).toBe(true);
+    expect(JSON.parse(readFileSync(join(unsafe.dir, NODE_MODULES_UNSAFE_FILE), 'utf8')))
+      .toMatchObject({ phase, code: 'EACCES', reason: `${phase} evidence denied` });
+    expect(existsSync(join(unsafe.dir, '.snapshot-complete'))).toBe(true);
+    deps.linkOrCopyNodeModules({ ...f, storeDir: unsafe.dir });
+    expectCopied(f, /marked unsafe.*private copy/i);
+    expect(existsSync(unsafe.dir)).toBe(true);
+    expect(existsSync(join(unsafe.dir, NODE_MODULES_UNSAFE_FILE))).toBe(true);
+  });
+
+  it('an injected installer without a hidden lock completes with an unsafe marker and remains copy-only', () => {
+    const f = fixture();
+    const unsafe = ensureNodeModulesStore({
+      jobsDir: join(f.base, 'injected-jobs'), sourceDir: f.sourceDir,
+      install: (into) => {
+        mkdirSync(join(into, 'node_modules'));
+        writeFileSync(join(into, 'node_modules', 'payload.txt'), 'store payload');
+      },
+    });
+    expect(JSON.parse(readFileSync(join(unsafe.dir, NODE_MODULES_UNSAFE_FILE), 'utf8'))).toMatchObject({ phase: 'hash', code: 'ENOENT' });
+    expect(existsSync(join(unsafe.dir, '.snapshot-complete'))).toBe(true);
+    deps.linkOrCopyNodeModules({ ...f, storeDir: unsafe.dir });
+    expectCopied(f, /marked unsafe.*private copy/i);
+  });
+
+  it('an unsafe nested symlink is marked before completion and the I2 copy-safety guard still refuses it', () => {
+    const f = fixture();
+    const external = join(f.base, 'external.js');
+    writeFileSync(external, 'external');
+    const mode = statSync(external).mode;
+    const unsafe = ensureNodeModulesStore({
+      jobsDir: join(f.base, 'unsafe-link-jobs'), sourceDir: f.sourceDir,
+      install: (into) => {
+        f.install(into);
+        const link = join(into, 'node_modules', '.bin', 'external');
+        symlinkSync(relative(dirname(link), external), link);
+      },
+    });
+    expect(JSON.parse(readFileSync(join(unsafe.dir, NODE_MODULES_UNSAFE_FILE), 'utf8')))
+      .toMatchObject({ phase: 'tree', code: 'EUNSAFENODEMODULESLINK' });
+    expect(existsSync(join(unsafe.dir, '.snapshot-complete'))).toBe(true);
+    expect(() => deps.linkOrCopyNodeModules({ ...f, storeDir: unsafe.dir })).toThrow(/unsafe.*symlink/i);
+    expect(f.exec).not.toHaveBeenCalled();
+    expect(messages(f.log)).toMatch(/marked unsafe/i);
+    expect(statSync(external).mode).toBe(mode);
+  });
+
+  it('failure to write an unsafe marker aborts completion rather than publishing an unmarked store', () => {
+    const f = fixture();
+    const jobsDir = join(f.base, 'marker-denied-jobs');
+    expect(() => ensureNodeModulesStore({
+      jobsDir, sourceDir: f.sourceDir, install: (into) => mkdirSync(join(into, 'node_modules')),
+      writeFile: (path, text) => {
+        if (basename(path) === NODE_MODULES_UNSAFE_FILE) throw new Error('unsafe marker denied');
+        writeFileSync(path, text);
+      },
+    })).toThrow('unsafe marker denied');
+    expect(existsSync(join(jobsDir, '.snapshots', 'node-modules', basename(f.storeDir)))).toBe(false);
   });
 });
 

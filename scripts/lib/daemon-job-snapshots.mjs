@@ -29,6 +29,7 @@ const COMPLETE_MARKER = '.snapshot-complete';
 /** Recorded before completion, never regenerated on reuse (including legacy stores). */
 export const NODE_MODULES_HASH_FILE = '.node-modules-lock.sha256';
 export const NODE_MODULES_MANIFEST_FILE = '.node-modules-packages.json';
+export const NODE_MODULES_UNSAFE_FILE = '.node-modules-unsafe';
 const CONSUMER_REFS = '.node-modules-consumers';
 const KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
@@ -77,6 +78,25 @@ export function withNodeModulesStoreLock(storeDir, run) {
   return withFileLock(consumerLockPath(storeDir), run, CONSUMER_LOCK_OPTIONS);
 }
 
+const quarantineNotice = (storeDir) => join(dirname(storeDir), `.node-modules-quarantined-${basename(storeDir)}.json`);
+
+/** A tombstone survives quarantine eviction until a normal install completes at the original key. */
+export function hasQuarantinedNodeModulesStore(storeDir) {
+  return existsSync(quarantineNotice(storeDir));
+}
+
+export function quarantineNodeModulesStore(storeDir, reason) {
+  return withNodeModulesStoreLock(storeDir, () => {
+    const quarantined = join(dirname(storeDir), `.quarantined-${Date.now()}-${process.pid}-${basename(storeDir)}`);
+    writeFileSync(quarantineNotice(storeDir), JSON.stringify({ reason, quarantined }));
+    renameSync(storeDir, quarantined);
+    // A quarantine is never reusable; leave it removable by the next eviction pass.
+    setNodeModulesWritable(join(quarantined, 'node_modules'), true);
+    writeFileSync(join(quarantined, NODE_MODULES_UNSAFE_FILE), JSON.stringify({ phase: 'quarantine', reason }));
+    return quarantined;
+  });
+}
+
 /** One metadata-only pass over the entire owned tree, including nested dependencies and dotfiles.
  * Fingerprint symlinks including their text; resolve them only to check containment, never walk
  * their targets. POSIX symlink modes are not access controls, so include but do not reject 0777.
@@ -99,8 +119,10 @@ export function nodeModulesTreeEvidence(modules, { lstat = lstatSync, readDir = 
     const info = lstat(path);
     entryCount += 1;
     const link = info.isSymbolicLink();
-    if (!Number.isSafeInteger(info.mode) || !Number.isSafeInteger(info.size) || !Number.isFinite(info.mtimeMs)
-      || (!link && requireReadonly && info.mode & 0o222)) throw new Error('writable or unreadable tree entry');
+    if (!Number.isSafeInteger(info.mode) || !Number.isSafeInteger(info.size) || !Number.isFinite(info.mtimeMs)) throw new Error('unreadable tree entry');
+    if (!link && requireReadonly && info.mode & 0o222) {
+      throw Object.assign(new Error('writable tree entry'), { code: 'ENODEMODULESPERMISSION' });
+    }
     let text = null;
     if (link) {
       try {
@@ -130,17 +152,17 @@ export function nodeModulesPackageManifest(modules, { stat = statSync, readFile 
   const packages = [];
   const directory = (path) => {
     const info = stat(path);
-    if (!info.isDirectory() || !Number.isSafeInteger(info.mode) || (requireReadonly && info.mode & 0o222)) {
-      throw new Error('package directory missing or writable');
-    }
+    if (!info.isDirectory() || !Number.isSafeInteger(info.mode)) throw new Error('package directory evidence unreadable');
+    if (requireReadonly && info.mode & 0o222) throw Object.assign(new Error('package directory writable'), { code: 'ENODEMODULESPERMISSION' });
   };
   const add = (name) => {
     const dir = join(modules, name);
     directory(dir);
     const path = join(dir, 'package.json');
     const info = stat(path);
-    if (!info.isFile() || !Number.isSafeInteger(info.mode) || (requireReadonly && info.mode & 0o222)
+    if (!info.isFile() || !Number.isSafeInteger(info.mode)
       || !Number.isSafeInteger(info.size) || !Number.isFinite(info.mtimeMs)) throw new Error('package.json evidence unreadable or writable');
+    if (requireReadonly && info.mode & 0o222) throw Object.assign(new Error('package.json writable'), { code: 'ENODEMODULESPERMISSION' });
     const pkg = JSON.parse(readFile(path, 'utf8'));
     if (typeof pkg.name !== 'string' || !pkg.name || typeof pkg.version !== 'string' || !pkg.version) {
       throw new Error('package identity missing');
@@ -284,7 +306,9 @@ export function npmCiInstaller({ timeoutMs = NPM_INSTALL_TIMEOUT_MS } = {}) {
  * @param {{jobsDir: string, sourceDir: string, install?: (into: string) => void}} o
  * @returns {{key: string, dir: string}}
  */
-export function ensureNodeModulesStore({ jobsDir, sourceDir, install = npmCiInstaller() }) {
+export function ensureNodeModulesStore({ jobsDir, sourceDir, install = npmCiInstaller(),
+  readFile = readFileSync, writeFile = writeFileSync, freeze = setNodeModulesWritable,
+  packageManifest = nodeModulesPackageManifest, treeEvidence = nodeModulesTreeEvidence }) {
   const lock = readFileSync(join(sourceDir, 'package-lock.json'), 'utf8');
   const key = lockfileKey(lock);
   const dir = join(snapshotsRoot(jobsDir), 'node-modules', key);
@@ -296,22 +320,33 @@ export function ensureNodeModulesStore({ jobsDir, sourceDir, install = npmCiInst
     // Cheap mutation evidence from npm's hidden lock, not a recursive package-content audit.
     // Missing/unreadable evidence leaves this store copy-only for rebuilds.
     // Some injected installers and npm configurations produce no hidden lock: do not invent evidence.
+    let phase = 'hash';
     try {
-      const hash = createHash('sha256').update(readFileSync(join(into, 'node_modules', '.package-lock.json'))).digest('hex');
-      writeFileSync(join(into, NODE_MODULES_HASH_FILE), `${hash}\n`);
+      const hash = createHash('sha256').update(readFile(join(into, 'node_modules', '.package-lock.json'))).digest('hex');
+      writeFile(join(into, NODE_MODULES_HASH_FILE), `${hash}\n`);
       const modules = join(into, 'node_modules');
-      const packages = nodeModulesPackageManifest(modules, { requireReadonly: false });
+      phase = 'manifest';
+      const packages = packageManifest(modules, { requireReadonly: false });
       // Fingerprint the final read-only modes. Hashing before chmod would reject every reuse.
-      setNodeModulesWritable(modules, false);
+      phase = 'chmod';
+      freeze(modules, false);
+      phase = 'tree';
       const manifest = {
         ...packages,
-        ...nodeModulesTreeEvidence(modules),
+        ...treeEvidence(modules),
       };
-      writeFileSync(join(into, NODE_MODULES_MANIFEST_FILE), `${JSON.stringify(manifest)}\n`);
-    } catch { /* incomplete evidence is never trusted on reuse; unsafe links are refused even for copying */ }
+      phase = 'manifest-write';
+      writeFile(join(into, NODE_MODULES_MANIFEST_FILE), `${JSON.stringify(manifest)}\n`);
+    } catch (error) {
+      // buildOnce writes .snapshot-complete only after this marker is durable. If writing the
+      // marker itself fails, abort the build rather than publish an unmarked, unverified store.
+      const reason = String(error?.message ?? error).replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 1000);
+      writeFile(join(into, NODE_MODULES_UNSAFE_FILE), `${JSON.stringify({ phase, reason, code: error?.code ?? null })}\n`);
+    }
     // Never re-freeze reused stores or regenerate their evidence: mutation must fail the guard,
     // not silently regain trust. Installs lacking the hidden lock never reach the freeze above.
   });
+  rmSync(quarantineNotice(dir), { force: true });
   return { key, dir };
 }
 
@@ -342,6 +377,14 @@ export function evictSnapshots({ jobsDir, referenced, keep = DEFAULT_SNAPSHOT_KE
   const evicted = [];
   for (const [sub, ref] of [['code', codeRef], ['node-modules', nodeModulesRef]]) {
     const dir = join(snapshotsRoot(jobsDir), sub);
+    if (sub === 'node-modules' && existsSync(dir)) {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (entry.isDirectory() && entry.name.startsWith('.quarantined-')) {
+          if (!dryRun) removeStore(join(dir, entry.name));
+          evicted.push(`quarantine:${entry.name}`);
+        }
+      }
+    }
     const stores = listStores(dir);
     const held = new Set(stores.filter((s) => refs.has(ref(s.key))).map((s) => s.key));
     if (sub === 'node-modules') for (const store of stores) {
