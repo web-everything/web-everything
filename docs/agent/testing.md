@@ -3921,6 +3921,9 @@ An unresolved origin or an unreadable listing refuses; every named pool in a fix
 its primary checkout (a sibling of the reference) so release can resolve that origin.
 Tracked changes are read with `--ignore-submodules=none`, and assume-unchanged / skip-worktree entries
 are compared by content, so index flags and submodule-ignore config cannot hide an edit.
+Known limit: other entries still trust the index stat cache, so a lane that hand-rewrites `.git/index`
+with stat fields matching an edited file reads clean. Release does not refuse that shape yet; the
+bounded content check is #xuuhfpf. Tests must not promise refusal for it until that lands.
 Untracked files deliberately do not block release: the guard covers tracked changes only.
 URL-based salvage may leave no tracking ref: only its verified
 remote SHA is an additional exclusion, and unrelated local branches still block release. Tests that
