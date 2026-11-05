@@ -162,7 +162,7 @@ export const LOCAL_SHARD_WAIT_STANDARD_MS = 15 * 60_000;
 /** verify.localShardWaitMs: how long a shard that must run LOCALLY may wait for host load / a slot (standard → platform → env). */
 export function resolveLocalShardWait(env = process.env) {
   const raw = env?.WE_VERIFY_LOCAL_SHARD_WAIT_MS;
-  const valid = v => Number.isSafeInteger(v) && v >= 0 && v <= MAX_RUN_WAIT_MS;
+  const valid = v => Number.isSafeInteger(v) && v >= 1 && v <= MAX_RUN_WAIT_MS;
   const c = cascadePolicy('verify', undefined, { env, standard: { localShardWaitMs: LOCAL_SHARD_WAIT_STANDARD_MS },
     envValues: { localShardWaitMs: raw != null && /^\d+$/.test(String(raw).trim()) ? Number(raw) : undefined },
     valid: { localShardWaitMs: valid }, log: () => {} });

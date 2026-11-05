@@ -651,9 +651,9 @@ describe('local shard wait budget (verify.localShardWaitMs)', () => {
     const { calls } = await run({ budgetMs: 5_000 });
     expect(waitFlag(calls[0])).toBe('--wait-ms=5000');
   });
-  it('ignores an invalid env value (fail closed to the default) and 0 passes an explicit zero wait (never an inherited one)', async () => {
+  it('ignores an invalid env value (fail closed to the default) and 0 is invalid too (never a zero or inherited wait)', async () => {
     expect(waitFlag((await run({ env: { WE_VERIFY_LOCAL_SHARD_WAIT_MS: 'soon' } })).calls[0])).toBe('--wait-ms=900000');
-    expect(waitFlag((await run({ env: { WE_VERIFY_LOCAL_SHARD_WAIT_MS: '0' } })).calls[0])).toBe('--wait-ms=0');
+    expect(waitFlag((await run({ env: { WE_VERIFY_LOCAL_SHARD_WAIT_MS: '0' } })).calls[0])).toBe('--wait-ms=900000');
   });
   it('a shard that still gets no slot within the budget still exits 75 (contract unchanged)', async () => {
     const { code, lines } = await run({ exitCode: SHARD_UNSETTLED_EXIT });
