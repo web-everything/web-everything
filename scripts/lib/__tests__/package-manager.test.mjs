@@ -1,8 +1,15 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { resolvePackageManager, installArgv, installCommand, installWithFallback } from '../package-manager.mjs';
+import * as pm from '../package-manager.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
 
-const none = { env: {}, platform: undefined };
+// Hermetic: never read the machine's real platform preferences unless a test passes its own reader.
+const clean = () => ({ prefs: {}, errors: [] });
+const wrap = (f) => (o = {}) => f({ readPlatform: clean, ...o });
+const resolvePackageManager = wrap(pm.resolvePackageManager);
+const installArgv = wrap(pm.installArgv);
+const installCommand = wrap(pm.installCommand);
+const installWithFallback = wrap(pm.installWithFallback);
+const none = { env: {}, platform: undefined, readPlatform: () => ({ prefs: {}, errors: [] }) };
 beforeEach(() => resetCascadeLogForTest());
 
 describe('resolvePackageManager cascade', () => {
@@ -41,6 +48,17 @@ describe('resolvePackageManager cascade', () => {
     const lines = [];
     resolvePackageManager({ env: { WE_PACKAGE_MANAGER: 'pnpm', WE_POLICY_CASCADE_LOG: '1' }, platform: undefined, log: (l) => lines.push(l) });
     expect(lines.join('\n')).toMatch(/packageManager.*pnpm.*env/);
+  });
+});
+
+describe('unreadable platform preferences', () => {
+  const bad = () => ({ prefs: {}, errors: ['prefs.json: Unexpected token'] });
+  it('is flagged on the resolution', () => {
+    expect(resolvePackageManager({ env: {}, readPlatform: bad }).degraded).toMatch(/unreadable/);
+  });
+  it('a frozen install is refused without a parity proof, allowed with one', () => {
+    expect(() => installArgv({ ci: true, env: {}, readPlatform: bad })).toThrow(/lockfileParity/);
+    expect(installArgv({ ci: true, env: {}, readPlatform: bad, lockfileParity: () => true }).args).toEqual(['ci']);
   });
 });
 
@@ -132,6 +150,7 @@ describe('installWithFallback', () => {
     ['integrity failure', { stderr: 'ERR_PNPM_TARBALL_INTEGRITY' }],
     ['lifecycle script failure', { stderr: 'ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL postinstall' }],
     ['unrecognised failure', {}],
+    ['fetch failure alongside a signature rejection', { stderr: 'ERR_PNPM_FETCH_FAIL Cannot find matching keyid' }],
     ['fetch failure alongside a lifecycle failure', { stderr: 'ERR_PNPM_FETCH_FAIL ELIFECYCLE' }],
     ['timeout carrying a lifecycle failure', { code: 'ETIMEDOUT', stderr: 'ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL' }],
     ['spawn code carrying an integrity code', { code: 'ENOENT', stderr: 'ERR_PNPM_TARBALL_INTEGRITY' }],
