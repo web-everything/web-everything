@@ -3910,3 +3910,25 @@ The `smoke-github-outage` break pins `WE_GH_LIST_BACKOFF_MS=5,5` and
 `WE_GH_JSON_RETRY_BACKOFF_MS=5` before the daemon forks. This preserves exhausted,
 fail-closed reads across reconcile and dispatch smoke passes within the unchanged
 90-second tick bound; shortening only the outer list backoff does not suffice.
+
+## Author-stamp repair daemon wiring
+
+PR author logins from `gh pr view` can carry `app/`, while GraphQL edit editor logins do not.
+Normalize only the PR author by removing one leading `app/` and comparing case-insensitively.
+The review daemon must explicitly pass `restoreStamps: sweepAuthorStamps` to hold reconciliation,
+including with shared PR reads: an injected listing otherwise suppresses the default stamp sweep.
+Keep daemon wiring tests hermetic by inspecting the passed function without invoking it;
+the stamp and hold-reconcile suites exercise the repair through injected IO.
+
+### Author-stamp restoration evidence
+
+`author-stamp-restore` fixtures must preserve GraphQL editor `__typename` alongside
+`login`: `app/X` PR authors match only `Bot` editors, and plain `X` authors match only
+`User` editors. Missing or unknown types refuse. Historical bodies must be plain
+snapshots; a hunk header, word-diff token (`[-`, `-]`, `{+`, `+}`), or HTML in any snapshot
+refuses the whole history without writing. Every occurrence of `authored-by-actor:`
+must belong to a complete marker occupying an entire unindented line outside a code
+fence, with only optional trailing whitespace. Exercise malformed markers in an
+otherwise eligible oldest author snapshot, without an earlier forgery masking the
+refusal; keep the pr-land final standalone marker as a positive case. Refusal directs operators to inspect
+the complete GitHub history manually; never turn ambiguous delta text into a stamp.
