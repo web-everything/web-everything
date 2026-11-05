@@ -1,11 +1,13 @@
 /** @file scripts/lib/daemon-rebuild/smoke-classify/load-shaped.mjs — the load-shaped classifier: a failed smoke
  * row explained by host load (timeout on the gate's clock, lock contention, external transient noise), plus the
- * same-run load differential's knobs. Split out of daemon-rebuild.mjs (move-only).
+ * same-run load differential's knobs and cached-rejection retry derivation. Additional budget/kill/throttle
+ * forms require measured host overload; existing timeout, contention and transient classifications remain.
  */
 
+import { loadavg, cpus } from 'node:os';
 import {
   SMOKE_ENV_TIMEOUT_MIN_ELAPSED_MS_ENV, DEFAULT_ENV_TIMEOUT_MIN_ELAPSED_MS, isEnvTimeoutRow,
-  TRANSIENT_FAILURE_PATTERNS,
+  TRANSIENT_FAILURE_PATTERNS, MIN_OWN_CAP_MS,
 } from '../../daemon-live-smoke.mjs';
 
 // ── LOAD-shaped smoke failures: blamed on an overlay only through a same-run differential (live 2026-10-04) ──
@@ -46,6 +48,52 @@ function isGhThrottleOnlyDetail(detail) {
     && segs.every((seg) => GH_THROTTLE_SEGMENT.test(seg) || GH_THROTTLE_TAIL.test(seg));
 }
 
+const BUDGET_SKIP = /^skipped: rebuild smoke budget exhausted \(\d+ms left\)$(?![\s\S])/;
+const CHILD_BUDGET_SKIP = /^child failed: skipped: rebuild smoke budget exhausted \(\d+ms left\)$(?![\s\S])/;
+const BOUNDED_KILL = /^[^:\r\n]+ failed: timed out after (\d+)ms \(process group killed\)$(?![\s\S])/;
+const EXTENDED_GH_THROTTLE_SEGMENT = new RegExp(GH_THROTTLE_SEGMENT.source.replace(
+  'gh-throttle:', '(?:reconcile failed: reconcile read failed \\(exit \\d+\\): )?gh-throttle:',
+));
+
+/** Evidence precedence is deliberate: malformed explicit evidence never falls through to the live host. */
+export function hostOverloaded(row, env = {}, probe = () => ({ load1: loadavg()[0], cores: cpus().length })) {
+  try {
+    let evidence;
+    if (row?.hostLoad !== undefined) evidence = row.hostLoad;
+    else if (env?.WE_SMOKE_HOST_LOAD1 !== undefined || env?.WE_SMOKE_HOST_CORES !== undefined) {
+      const number = value => value == null || String(value).trim() === '' ? NaN : Number(value);
+      evidence = { load1: number(env.WE_SMOKE_HOST_LOAD1), cores: number(env.WE_SMOKE_HOST_CORES) };
+    } else evidence = probe();
+    const rawRatio = env?.WE_SMOKE_LOAD_SHAPED_MIN_RATIO;
+    const ratio = rawRatio === undefined ? 2 : Number(rawRatio);
+    return Number.isFinite(evidence?.load1) && Number.isFinite(evidence?.cores) && evidence.cores >= 1
+      && Number.isFinite(ratio) && ratio > 0 && evidence.load1 / evidence.cores >= ratio;
+  } catch {
+    return false;
+  }
+}
+
+function isBudgetBootRow(row, detail, minElapsedMs) {
+  if (row.name !== 'daemon-entries-boot') return false;
+  if (Array.isArray(row.entries)) {
+    if (!row.entries.length || row.entries.some(entry => !entry || typeof entry.ok !== 'boolean')) return false;
+    const failures = row.entries.filter(entry => !entry.ok);
+    return failures.length > 0 && failures.every(entry => CHILD_BUDGET_SKIP.test(entry.kind)
+      || isEnvTimeoutRow({ name: row.name, ok: false, entries: [entry] }, { minElapsedMs }));
+  }
+  const [header, ...lines] = detail.split('\n');
+  const counts = /^(\d+)\/\1 daemon entries failed to boot:$/.exec(header);
+  return !!counts && Number(counts[1]) > 0 && lines.length === Number(counts[1])
+    && lines.every(line => /^- [^\r\n]+: child failed: skipped: rebuild smoke budget exhausted \(\d+ms left\)$(?![\s\S])/.test(line));
+}
+
+function isExtendedGhThrottleOnlyDetail(detail) {
+  const segments = detail.split(/\n?; /);
+  return segments.every(segment => !/[\r\n]/.test(segment))
+    && segments.some(segment => EXTENDED_GH_THROTTLE_SEGMENT.test(segment))
+    && segments.every(segment => EXTENDED_GH_THROTTLE_SEGMENT.test(segment) || GH_THROTTLE_TAIL.test(segment));
+}
+
 export function loadDifferentialEnabled(env) {
   return String(env?.[SMOKE_LOAD_DIFFERENTIAL_ENV] ?? '').trim() !== '0';
 }
@@ -56,9 +104,8 @@ export function envLoadRetryDelayMs(env, attempts) {
   return Math.min(base * 2 ** Math.max(0, attempts - 1), max);
 }
 
-/** PURE: is this failed smoke row explained by host load (time-out on the gate's clock, lock contention, or
- *  external transient noise from a check allowed to be transient)? */
-export function isLoadShapedRow(row, env = {}) {
+/** Is this failed smoke row load-shaped? New forms need host evidence (the probe can be injected). */
+export function isLoadShapedRow(row, env = {}, probe) {
   if (!row || row.ok) return false;
   const minElapsedMs = Number(env?.[SMOKE_ENV_TIMEOUT_MIN_ELAPSED_MS_ENV]) > 0
     ? Number(env[SMOKE_ENV_TIMEOUT_MIN_ELAPSED_MS_ENV]) : DEFAULT_ENV_TIMEOUT_MIN_ELAPSED_MS;
@@ -67,5 +114,23 @@ export function isLoadShapedRow(row, env = {}) {
   if (LOAD_CONTENTION_SIGNATURES.some((re) => re.test(detail))) return true;
   // Our slot refusal is load contention even for code checks such as dispatch-dry-run.
   if (isGhThrottleOnlyDetail(detail)) return true;
+  const killed = BOUNDED_KILL.exec(detail);
+  if ((BUDGET_SKIP.test(detail) || isBudgetBootRow(row, detail, minElapsedMs)
+    || (killed && Number(killed[1]) >= MIN_OWN_CAP_MS) || isExtendedGhThrottleOnlyDetail(detail))
+    && hostOverloaded(row, env, probe)) return true;
   return row.mayBeTransient !== false && TRANSIENT_FAILURE_PATTERNS.some((re) => re.test(detail));
 }
+
+/** Derive a retry without mutating persisted rejection/hold state. */
+export function cachedRejectionLoadRetry(state, env, { now = Date.now(), probe } = {}) {
+  if (!state?.rejected || Number.isFinite(Date.parse(state.rejected.retryAt || ''))
+    || state.rejected.harnessBroken || !Array.isArray(state.held?.details) || !state.held.details.length) return null;
+  if (!state.held.details.every(detail => detail && isLoadShapedRow({
+    name: detail.name, ok: false, detail: detail.detail,
+  }, env, probe))) return null;
+  const attempts = (state.rejected.attempts || 0) + 1;
+  return { envLoad: true, attempts, retryAt: new Date(now + envLoadRetryDelayMs(env, attempts)).toISOString() };
+}
+
+// TODO: Wire cachedRejectionLoadRetry into the still-rejected short-circuit in
+// scripts/lib/daemon-rebuild/prepare.mjs (Step 4), after PR #6360 (same region).
