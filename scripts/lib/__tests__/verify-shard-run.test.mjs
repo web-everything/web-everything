@@ -647,9 +647,32 @@ describe('local shard wait budget (verify.localShardWaitMs)', () => {
     expect(waitFlag(calls[0])).toBe('--wait-ms=60000');
     expect(lines.join('')).toMatch(/localShardWaitMs=60000/);
   });
-  it('never waits longer than the remaining verify budget', async () => {
+  it('never waits longer than half the remaining verify budget (the other half is watchdog headroom)', async () => {
     const { calls } = await run({ budgetMs: 5_000 });
-    expect(waitFlag(calls[0])).toBe('--wait-ms=5000');
+    expect(waitFlag(calls[0])).toBe('--wait-ms=2500');
+  });
+  it('the admission wait is always strictly shorter than the watchdog timeout, so a persistent deferral exits 75 and the watchdog never wins (budget 1620000, default wait)', async () => {
+    let clock = 0;
+    const seen = [];
+    const execute = async ({ args, timeoutMs }) => {
+      const waited = Number(/--wait-ms=(\d+)/.exec(args.join(' '))?.[1] ?? 0);
+      seen.push({ waited, timeoutMs });
+      // A real watchdog kills the child at timeoutMs; a wait that reaches it is a 124, not a 75.
+      if (waited >= timeoutMs) { clock += timeoutMs; return { exitCode: 124, timedOut: true, reportText: '' }; }
+      clock += waited;
+      return { exitCode: 75, reportText: '' };
+    };
+    const code = await runShards({ argv: ['npx', 'vitest', 'run', 'a', 'b'], shards: 1, parallel: 1, budgetMs: 1_620_000 }, {
+      discover: () => null, execute, now: () => clock, tmpdir: () => '/scratch', env: {}, needsGit: () => true,
+      fs: { mkdtempSync: () => '/scratch/s', readFileSync: () => { throw Error('missing'); }, rmSync: () => {} },
+      acquireLocal: async () => ({ ok: true }), releaseLocal: () => {}, log: () => {} });
+    expect(code).toBe(SHARD_UNSETTLED_EXIT);
+    expect(seen).toHaveLength(1);
+    expect(seen[0].waited).toBeLessThan(seen[0].timeoutMs);
+  });
+  it('a one-millisecond remaining budget still passes a positive explicit wait (never 0 or an inherited default)', async () => {
+    const { calls } = await run({ budgetMs: 1 });
+    expect(waitFlag(calls[0])).toBe('--wait-ms=1');
   });
   it('ignores an invalid env value (fail closed to the default) and 0 is invalid too (never a zero or inherited wait)', async () => {
     expect(waitFlag((await run({ env: { WE_VERIFY_LOCAL_SHARD_WAIT_MS: 'soon' } })).calls[0])).toBe('--wait-ms=900000');

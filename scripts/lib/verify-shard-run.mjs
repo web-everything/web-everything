@@ -218,7 +218,10 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
           // A shard that must run here (needs-git) cannot go to Forge, so it queues for host load / a slot instead of
           // deferring at once. Bounded by the verify budget; a shard still without a slot then exits 75 as before.
           const mustRunLocal = !local && needsGit({ argv: args, cwd });
-          const waitMs = mustRunLocal ? Math.min(localWait.ms, remaining()) : 0;
+          // The watchdog (timeoutMs) is the whole remaining budget, so a wait equal to it would let the watchdog fire as
+          // admission gives up (exit 124 instead of 75). Spend at most half the remaining budget queueing, leaving the
+          // other half as headroom for the deferral to return 75 (or for the shard to run once admitted).
+          const waitMs = mustRunLocal ? Math.max(1, Math.min(localWait.ms, Math.floor(remaining() / 2))) : 0;
           const result = await execute({ command: local ? 'npx' : 'node',
             args: local ? args.slice(1) : [HEAVY_ADMISSION_SCRIPT, 'run', ...(mustRunLocal ? [`--wait-ms=${waitMs}`] : []), '--', ...args],
             files: attemptFiles, report, remoteReport: attemptRemoteReport, cwd, env: local ? { ...attemptEnv, [ADMISSION_HELD_ENV]: '1' } : attemptEnv,
