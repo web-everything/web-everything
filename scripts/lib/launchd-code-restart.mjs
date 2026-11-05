@@ -1,10 +1,10 @@
 /** Restart stateless clone-backed samplers after adoption; all host IO has injectable seams. */
-import { readdirSync } from 'node:fs';
+import { readdirSync, realpathSync } from 'node:fs';
 import fsAsync from 'node:fs/promises';
 import childProcess from 'node:child_process';
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
-import { basename, isAbsolute, join, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { lockDirFor, makeLockEntry } from '../readiness/file-locks.mjs';
 import { readRebuildState } from './daemon-rebuild/state.mjs';
@@ -23,24 +23,54 @@ const userId = () => process.getuid();
 
 // Unknown interpreter options cannot establish a script position: an option's value
 // might be a data path. Recognized options with operands consume those operands.
+// Returns { owners, unknownAt }: unknownAt is the index of an option that could not be
+// classified (it may or may not take a separate operand), or null. The caller must not
+// treat that as "not the clone" when a later argument is a clone path.
 function codeArguments(args) {
   const executable = args[0], name = basename(executable).toLowerCase();
-  if (!/^(?:node|nodejs|python(?:\d+(?:\.\d+)*)?|pypy\d*|bash|sh|zsh|dash|ksh|ruby|perl)$/.test(name)) return [executable];
+  const result = { owners: [executable], unknownAt: null };
+  if (!/^(?:node|nodejs|python(?:\d+(?:\.\d+)*)?|pypy\d*|bash|sh|zsh|dash|ksh|ruby|perl)$/.test(name)) return result;
   const noScript = new Set(['-e', '--eval', '-p', '--print', '-c', '-m', '--command']);
   const operand = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader', '--conditions', '-W', '-X', '-O', '+O']);
-  const flag = /^(?:--(?:trace-warnings|no-warnings|enable-source-maps|experimental-strip-types|noprofile|norc)|-[uBbEIsSOivx]+)$/;
+  const flag = /^(?:--(?:trace-warnings|no-warnings|no-deprecation|trace-deprecation|throw-deprecation|pending-deprecation|expose-gc|use-strict|harmony|preserve-symlinks|preserve-symlinks-main|abort-on-uncaught-exception|enable-source-maps|experimental-strip-types|noprofile|norc)|-[uBbEIsSOivx]+)$/;
   for (let i = 1; i < args.length; i += 1) {
     const arg = args[i];
-    if (arg === '--') return [executable, ...args.slice(i + 1, i + 2)];
-    if (noScript.has(arg) || /^-[^-]*c/.test(arg) || /^(?:--eval|--print)=/.test(arg)) return [executable];
+    if (arg === '--') { result.owners.push(...args.slice(i + 1, i + 2)); return result; }
+    if (noScript.has(arg) || /^-[^-]*c/.test(arg) || /^(?:--eval|--print)=/.test(arg)) return result;
     if (operand.has(arg)) { i += 1; continue; }
     if (arg.startsWith('-') || arg.startsWith('+')) {
-      if (flag.test(arg) || /^(?:--require|--import|--loader|--experimental-loader|--conditions)=/.test(arg)) continue;
-      return [executable];
+      // `--name=value` carries its value attached, so it can never consume the next argument
+      // (covers --max-old-space-size=N, --stack-size=N and the other V8/Node valued options).
+      if (flag.test(arg) || /^--[A-Za-z][\w-]*=/.test(arg)) continue;
+      result.unknownAt = i;
+      return result;
     }
-    return [executable, arg];
+    result.owners.push(arg);
+    return result;
   }
-  return [executable];
+  return result;
+}
+
+const inside = (path, root) => path === root || path.startsWith(root.endsWith(sep) ? root : root + sep);
+const isPathArg = arg => isAbsolute(arg) || arg === '~' || arg.startsWith('~/');
+// Canonical form of a path that may not exist: resolve the deepest existing ancestor and
+// re-append the rest. Only "missing" errors fall through; anything else fails closed.
+const missing = e => e?.code === 'ENOENT' || e?.code === 'ENOTDIR';
+function canonicalSync(path, realpath) {
+  try { return realpath(path); }
+  catch (e) {
+    const parent = dirname(path);
+    if (!missing(e) || parent === path) { if (missing(e)) return path; throw e; }
+    return join(canonicalSync(parent, realpath), basename(path));
+  }
+}
+async function canonicalAsync(path, realpath) {
+  try { return await realpath(path); }
+  catch (e) {
+    const parent = dirname(path);
+    if (!missing(e) || parent === path) { if (missing(e)) return path; throw e; }
+    return join(await canonicalAsync(parent, realpath), basename(path));
+  }
 }
 
 function devServer(args) {
@@ -62,7 +92,9 @@ function assertActive(signal) {
   if (signal?.aborted) throw new Error('service restart cancelled: inspect LaunchAgents before retrying');
 }
 
-function matchPlist(p, { root, selfLabel, plistPath }) {
+// Parse only: which absolute paths hold the service's executable/script, and which paths
+// follow an option we could not classify. Ownership is decided by `decide`.
+function parsePlist(p, { selfLabel, plistPath }) {
   if (!p || typeof p.Label !== 'string' || !p.Label.trim()) throw new Error('Invalid Label');
   const hasProgram = Object.hasOwn(p, 'Program');
   if (hasProgram && (typeof p.Program !== 'string' || !p.Program.trim())) throw new Error('Invalid Program');
@@ -73,32 +105,49 @@ function matchPlist(p, { root, selfLabel, plistPath }) {
   const args = hasProgram ? [p.Program, ...argv.slice(1)] : argv;
   // An external interpreter can still execute a clone-backed script; parse its
   // effective argv while keeping Program authoritative over the displayed argv[0].
-  const owners = codeArguments(args);
-  return owners.some(arg => {
-    // Bare executables, flags and relative paths belong to the service's context,
-    // not this process's cwd. Only explicit absolute/home-relative paths prove ownership.
-    if (!isAbsolute(arg) && arg !== '~' && !arg.startsWith('~/')) return false;
-    const path = expand(arg);
-    return path === root || path.startsWith(root.endsWith(sep) ? root : root + sep);
-  })
-    ? { label: p.Label, plistPath, args } : null;
+  const { owners, unknownAt } = codeArguments(args);
+  // Bare executables, flags and relative paths belong to the service's context,
+  // not this process's cwd. Only explicit absolute/home-relative paths prove ownership.
+  return { label: p.Label, plistPath, args, unknownOption: unknownAt === null ? null : args[unknownAt],
+    paths: owners.filter(isPathArg).map(expand),
+    unknownPaths: unknownAt === null ? [] : args.slice(unknownAt + 1).filter(isPathArg).map(expand) };
+}
+
+// Lexical prefix OR same location after resolving symlinks/aliases (/var vs /private/var).
+function decide(parsed, { root, canonRoot, canon }) {
+  if (!parsed) return null;
+  const owned = paths => paths.some(path => inside(path, root) || inside(canon(path), canonRoot));
+  if (owned(parsed.paths)) return { label: parsed.label, plistPath: parsed.plistPath, args: parsed.args };
+  // An unclassifiable option hides the script position: if a clone path follows it, say so
+  // instead of silently excluding the service from restart and stale detection.
+  if (parsed.unknownOption !== null && owned(parsed.unknownPaths)) {
+    throw new Error(`Unrecognized interpreter option ${parsed.unknownOption}: cannot tell whether the service runs code from the clone`);
+  }
+  return null;
 }
 
 // The adoption hook uses this asynchronous path: no synchronous directory reads or
 // plutil subprocesses run on its tick. Public discovery/staleness APIs remain synchronous.
 async function scanAsync({ cloneRoot, agentsDir = join(homedir(), 'Library', 'LaunchAgents'),
-  readPlist = readHostPlistAsync, listPlists = dir => fsAsync.readdir(dir), selfLabel = null, signal }) {
+  readPlist = readHostPlistAsync, listPlists = dir => fsAsync.readdir(dir), selfLabel = null, signal,
+  realpath = fsAsync.realpath }) {
   const matches = [], unreadable = [];
   let files;
   try { files = await listPlists(agentsDir); }
   catch (error) { return { matches, unreadable: [{ plistPath: agentsDir, error: message(error) }] }; }
   const root = expand(cloneRoot);
+  let canonRoot;
+  try { canonRoot = await canonicalAsync(root, realpath); }
+  catch (error) { return { matches, unreadable: [{ plistPath: root, error: message(error) }] }; }
   for (const file of files) {
     assertActive(signal);
     if (!file.endsWith('.plist')) continue;
     const plistPath = resolve(agentsDir, file);
     try {
-      const match = matchPlist(await readPlist(plistPath), { root, selfLabel, plistPath });
+      const parsed = parsePlist(await readPlist(plistPath), { selfLabel, plistPath });
+      const resolved = new Map();
+      for (const path of parsed ? [...parsed.paths, ...parsed.unknownPaths] : []) resolved.set(path, await canonicalAsync(path, realpath));
+      const match = decide(parsed, { root, canonRoot, canon: path => resolved.get(path) });
       if (match) matches.push(match);
     } catch (error) { unreadable.push({ plistPath, error: message(error) }); }
   }
@@ -106,17 +155,20 @@ async function scanAsync({ cloneRoot, agentsDir = join(homedir(), 'Library', 'La
 }
 
 function scan({ cloneRoot, agentsDir = join(homedir(), 'Library', 'LaunchAgents'), readPlist = readHostPlist,
-  listPlists = readdirSync, selfLabel = null }) {
+  listPlists = readdirSync, selfLabel = null, realpath = realpathSync }) {
   const matches = [], unreadable = [];
   let files;
   try { files = listPlists(agentsDir); } catch (error) { return { matches, unreadable: [{ plistPath: agentsDir, error: message(error) }] }; }
   const root = expand(cloneRoot);
+  let canonRoot;
+  try { canonRoot = canonicalSync(root, realpath); }
+  catch (error) { return { matches, unreadable: [{ plistPath: root, error: message(error) }] }; }
   for (const file of files) {
     if (!file.endsWith('.plist')) continue;
     const plistPath = resolve(agentsDir, file);
     try {
-      const p = readPlist(plistPath);
-      const match = matchPlist(p, { root, selfLabel, plistPath });
+      const match = decide(parsePlist(readPlist(plistPath), { selfLabel, plistPath }),
+        { root, canonRoot, canon: path => canonicalSync(path, realpath) });
       if (match) matches.push(match);
     } catch (error) { unreadable.push({ plistPath, error: message(error) }); }
   }

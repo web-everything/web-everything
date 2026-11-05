@@ -481,3 +481,59 @@ describe('withSelfSync service restart hook', () => {
     } finally { vi.useRealTimers(); }
   });
 });
+
+describe('launchd clone ownership: interpreter options and filesystem aliases', () => {
+  const sampler = { Label: 'com.we.resource-sampler' };
+  it.each([
+    ['attached memory flag', ['--max-old-space-size=512']],
+    ['attached value flag', ['--stack-size=984']],
+    ['operand-free flag', ['--expose-gc']],
+    ['two flags', ['--max-old-space-size=512', '--no-deprecation']],
+  ])('node option does not hide a clone script: %s', async (_name, opts) => {
+    const o = fixture([{ ...sampler, ProgramArguments: ['/usr/local/bin/node', ...opts, join(cloneRoot, 'sampler.mjs')] }]);
+    expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
+    expect((await restartServicesForClone(o)).restarted).toHaveLength(1);
+    expect(findStaleCodeServices({ ...o, readProcessStartMs: () => 1000, readAdoptedAtMs: () => 2000 }))
+      .toEqual([expect.objectContaining({ reason: 'stale-code' })]);
+  });
+  it('an unrecognized bare option before a clone path is surfaced as unreadable evidence, not silently excluded', async () => {
+    const o = fixture([{ ...sampler, ProgramArguments: ['/usr/local/bin/node', '--made-up-option', join(cloneRoot, 'sampler.mjs')] }]);
+    expect(findServicesRunningFromClone(o).unreadable).toEqual([expect.objectContaining({ error: expect.stringMatching(/--made-up-option/) })]);
+    expect((await restartServicesForClone(o)).flagged).toEqual([expect.objectContaining({ reason: expect.stringMatching(/^plist-unreadable/) })]);
+    expect(findStaleCodeServices({ ...o, readProcessStartMs: () => 1000, readAdoptedAtMs: () => 2000 }))
+      .toEqual([expect.objectContaining({ reason: 'plist-unreadable' })]);
+    expect(o.launchctl).not.toHaveBeenCalled();
+  });
+  it('an unrecognized option with no clone path anywhere stays quietly unrelated', () => {
+    const o = fixture([{ ...sampler, ProgramArguments: ['/usr/local/bin/node', '--made-up-option', resolve('..', 'other-clone', 'sampler.mjs')] }]);
+    expect(findServicesRunningFromClone(o)).toEqual({ matches: [], unreadable: [] });
+  });
+  it('symlink alias of the clone is still the clone (sync, async restart and stale detection)', async () => {
+    const dir = await fsAsync.realpath(await fsAsync.mkdtemp(join(process.env.TMPDIR ?? '/tmp', 'launchd-alias-')));
+    try {
+      const real = join(dir, 'clone'), alias = join(dir, 'alias');
+      await fsAsync.mkdir(real); await fsAsync.symlink(real, alias);
+      for (const [root, script] of [[real, join(alias, 'sampler.mjs')], [alias, join(real, 'sampler.mjs')]]) {
+        const o = { ...fixture([{ ...sampler, ProgramArguments: ['/usr/local/bin/node', script] }]), cloneRoot: root };
+        expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
+        expect((await restartServicesForClone(o)).restarted).toHaveLength(1);
+        expect(findStaleCodeServices({ ...o, readProcessStartMs: () => 1000, readAdoptedAtMs: () => 2000 }))
+          .toEqual([expect.objectContaining({ reason: 'stale-code' })]);
+      }
+      const other = { ...fixture([{ ...sampler, ProgramArguments: ['/usr/local/bin/node', join(dir, 'clone2', 'sampler.mjs')] }]), cloneRoot: alias };
+      expect(findServicesRunningFromClone(other).matches).toEqual([]);
+    } finally { await fsAsync.rm(dir, { recursive: true, force: true }); }
+  });
+  it('the existing /var vs /private/var alias is canonicalized', async () => {
+    const real = await fsAsync.realpath(process.env.TMPDIR ?? '/tmp');
+    const lexical = join(process.env.TMPDIR ?? '/tmp', 'x');
+    if (real === process.env.TMPDIR?.replace(/\/$/, '')) return; // no alias on this host
+    const o = { ...fixture([{ ...sampler, ProgramArguments: ['/usr/local/bin/node', join(lexical, 'sampler.mjs')] }]), cloneRoot: join(real, 'x') };
+    expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
+  });
+  it('an unreadable realpath fails closed as unreadable evidence', () => {
+    const o = { ...fixture([{ ...sampler, ProgramArguments: ['/usr/local/bin/node', '/elsewhere/sampler.mjs'] }]),
+      realpath: () => { throw Object.assign(new Error('EACCES'), { code: 'EACCES' }); } };
+    expect(findServicesRunningFromClone(o).unreadable).toHaveLength(1);
+  });
+});
