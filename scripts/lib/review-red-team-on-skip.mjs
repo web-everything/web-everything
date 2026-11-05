@@ -308,15 +308,25 @@ export function ignorableConfirmRunIds({ repo, pr, head, comments, labels, revie
     if (/^\s*📌 review — acceptance re-stamped/.test(comments[acceptance?.index]?.body ?? '')) return closed;
     if (acceptance?.sha !== head || !Number.isFinite(acceptedAt)
       || publishableClearGuard({ labels, acceptance, comments, reviews, settlesPending: true })) return closed;
+    // A late acceptance comment cannot supersede a confirm opened after its panel began.
+    // Materialize the bounded scan once so both chronology passes use identical records.
+    const runs = [...reviewRuns({ runsDir, list, read, stat })].filter(({ run }) =>
+      run.op === 'review-pr' && run.input?.repo === repo && Number(run.input?.pr) === Number(pr));
+    const panelStarts = runs.filter(({ run }) => terminalReviewRun(run)
+      && run.verdict?.verdict === VERDICTS.ACCEPT && run.findings?.read?.netBasis?.rev === head)
+      .map(({ run }) => Date.parse(run.stepTimings?.find(t => t?.step === 'read')?.startedAt))
+      .filter(Number.isFinite);
+    if (!panelStarts.length) return closed;
+    const bound = Math.min(acceptedAt, ...panelStarts);
     const ids = [];
-    for (const { id, run, at } of reviewRuns({ runsDir, list, read, stat })) {
+    for (const { id, run, at } of runs) {
       if (run.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr)) continue;
       const terminal = terminalReviewRun(run);
       if (terminal && (run.verdict || (run.resumeOf == null && now - at >= ABANDONED_REVIEW_AFTER_MS))) continue;
-      if (!ignorableConfirm(run, at, acceptedAt)) return closed;
+      if (!ignorableConfirm(run, at, bound)) return closed;
       ids.push(id);
     }
-    return { ok: true, ids, acceptedAt };
+    return { ok: true, ids, acceptedAt: bound };
   } catch { return closed; }
 }
 
