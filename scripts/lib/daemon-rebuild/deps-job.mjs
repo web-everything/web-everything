@@ -35,7 +35,7 @@ import {
 import {
   ensureNodeModulesStore, evictSnapshots, lockfileKey, NODE_MODULES_HASH_FILE, nodeModulesRef,
   NODE_MODULES_MANIFEST_FILE, nodeModulesPackageManifest, nodeModulesTreeEvidence,
-  recordNodeModulesConsumer, setNodeModulesWritable, snapshotsRoot,
+  recordNodeModulesConsumer, setNodeModulesWritable, snapshotsRoot, withNodeModulesStoreLock,
 } from '../daemon-job-snapshots.mjs';
 import { TERMINAL_JOB_STATUSES } from '../../operations/job-record.mjs';
 import { daemonJobsDir } from '../../operations/run-store.mjs';
@@ -167,8 +167,16 @@ export function linkOrCopyNodeModules({
         reason = 'store tree entry count mismatch';
       } else if (recorded.sha256 !== current.sha256 || JSON.stringify(recorded.packages) !== JSON.stringify(current.packages)) {
         reason = 'package manifest integrity mismatch';
+      } else if (!/^[a-f0-9]{64}$/.test(recorded.treeSha256 ?? '') || recorded.treeSha256 !== tree.treeSha256) {
+        reason = 'tree manifest fingerprint missing or mismatch';
       }
-    } catch { reason = 'tree/package manifest evidence missing, unreadable, or writable'; }
+    } catch (error) {
+      if (error?.code === 'EUNSAFENODEMODULESLINK') {
+        sayDeps(log, 'rebuild dependencies: copy refused (unsafe dependency symlink)');
+        throw error;
+      }
+      reason = 'tree/package manifest evidence missing, unreadable, or writable';
+    }
   }
   if (!reason) {
     try {
@@ -181,19 +189,33 @@ export function linkOrCopyNodeModules({
     } catch (error) {
       // Do not delete a pre-existing target on EEXIST; swap callers supply a fresh staging path.
       if (error?.code === 'EEXIST') throw error;
+      if (referenceConsumer) {
+        sayDeps(log, 'rebuild dependencies: consumer registration/link failed; refusing unprotected copy');
+        throw Object.assign(new Error('dependency consumer registration/link failed', { cause: error }), { code: 'ENODEMODULESCONSUMER' });
+      }
       reason = `${referenceConsumer ? 'consumer registration or symlink creation' : 'symlink creation'} failed (${error?.code ?? 'lock unavailable or unknown'})`;
     }
   }
   sayDeps(log, `rebuild dependencies: copy fallback (${reason})`);
-  try { exec('cp', ['-cR', source, destination], { stdio: 'ignore', timeout: 5 * 60_000 }); }
-  catch {
-    setNodeModulesWritable(destination, true);
-    rmSync(destination, { recursive: true, force: true });
-    exec('cp', ['-R', source, destination], { stdio: 'ignore', timeout: 10 * 60_000 });
+  try {
+    return withNodeModulesStoreLock(dirname(source), () => {
+      // cp -R preserves nested links: reject escaping targets even in explicit copy/legacy mode.
+      // Hold the eviction lock until the private tree is complete, not just until source validation.
+      nodeModulesTreeEvidence(source, { requireReadonly: false });
+      try { exec('cp', ['-cR', source, destination], { stdio: 'ignore', timeout: 5 * 60_000 }); }
+      catch {
+        setNodeModulesWritable(destination, true);
+        rmSync(destination, { recursive: true, force: true });
+        exec('cp', ['-R', source, destination], { stdio: 'ignore', timeout: 10 * 60_000 });
+      }
+      // A private copy must remain usable by a writing step; cp preserves source read-only modes.
+      setNodeModulesWritable(destination, true);
+      return { mode: 'copy', reason };
+    });
+  } catch (error) {
+    sayDeps(log, `rebuild dependencies: copy refused or failed (${error?.code ?? 'store lock unavailable'})`);
+    throw error;
   }
-  // A private copy must remain usable by a writing step; cp preserves the source's read-only modes.
-  setNodeModulesWritable(destination, true);
-  return { mode: 'copy', reason };
 }
 
 /**

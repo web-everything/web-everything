@@ -6,10 +6,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
-  realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync,
+  readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, dirname, join, relative } from 'node:path';
 import * as deps from '../daemon-rebuild/deps-job.mjs';
 import { cloneNodeModulesInstaller, REBUILD_JOB_KIND } from '../daemon-rebuild/rebuild-job.mjs';
 import { ensureNodeModulesStore, evictSnapshots, NODE_MODULES_MANIFEST_FILE, nodeModulesRef, nodeModulesTreeEvidence, setNodeModulesWritable } from '../daemon-job-snapshots.mjs';
@@ -58,7 +58,7 @@ function fixture() {
   const exec = vi.fn((command, args) => {
     expect(command).toBe('cp');
     expect(['-cR', '-R']).toContain(args[0]);
-    cpSync(args[1], args[2], { recursive: true, dereference: true });
+    cpSync(args[1], args[2], { recursive: true, dereference: false, verbatimSymlinks: true });
   });
   return { root, storeDir: store.dir, sourceDir, exec, log, install, base };
 }
@@ -190,7 +190,7 @@ describe('shared link-or-copy safety decision', () => {
     const f = fixture();
     const legacy = join(f.base, 'legacy');
     mkdirSync(legacy);
-    cpSync(join(f.storeDir, 'node_modules'), join(legacy, 'node_modules'), { recursive: true });
+    cpSync(join(f.storeDir, 'node_modules'), join(legacy, 'node_modules'), { recursive: true, dereference: false, verbatimSymlinks: true });
     writeFileSync(join(legacy, '.snapshot-complete'), 'legacy completion marker\n');
     deps.linkOrCopyNodeModules({ ...f, storeDir: legacy, depsMode: 'symlink' });
     expectCopied(f, /hash|integrity|evidence|missing|legacy/i);
@@ -422,11 +422,14 @@ describe('read-only dependency stores and rebuild consumer retention', () => {
     expect(existsSync(f.storeDir)).toBe(true);
   });
 
-  it('failure to record a rebuild consumer reference falls back to a private copy and logs', () => {
+  it('failure to record a rebuild consumer reference refuses an unprotected copy and logs', () => {
     const f = fixture();
     writeFileSync(join(f.storeDir, '.node-modules-consumers'), 'not a directory');
-    cloneNodeModulesInstaller(f.storeDir, { exec: f.exec, log: f.log })(f.root);
-    expectCopied(f, /failed|ENOTDIR/i);
+    expect(() => cloneNodeModulesInstaller(f.storeDir, { exec: f.exec, log: f.log })(f.root))
+      .toThrow(/consumer registration\/link failed/);
+    expect(f.exec).not.toHaveBeenCalled();
+    expect(existsSync(target(f))).toBe(false);
+    expect(messages(f.log)).toMatch(/refusing unprotected copy/i);
   });
 
   it('registration between eviction selection and deletion protects the newly linked consumer source', () => {
@@ -446,19 +449,23 @@ describe('read-only dependency stores and rebuild consumer retention', () => {
     expect(statSync(join(f.storeDir, 'node_modules')).mode & 0o222).toBe(0);
   });
 
-  it('registration during a locked eviction falls back to a private copy before the source is deleted', () => {
+  it('registration during a locked eviction refuses the swap without starting an incomplete copy', () => {
     const f = fixture();
     const withLock = vi.fn((path, run, options) => withFileLock(path, () => {
       // The publisher must use this SAME lock: it cannot publish a consumer behind eviction's back.
-      cloneNodeModulesInstaller(f.storeDir, { exec: f.exec, log: f.log })(f.root);
-      expectCopied(f, /registration.*failed|lock/i);
+      expect(() => cloneNodeModulesInstaller(f.storeDir, { exec: f.exec, log: f.log })(f.root))
+        .toThrow(/consumer registration\/link failed/);
+      expect(f.exec).not.toHaveBeenCalled();
+      expect(existsSync(target(f))).toBe(false);
       return run();
     }, options));
     const result = evictSnapshots({ jobsDir: join(f.base, 'jobs'), referenced: [], keep: 0, withLock });
     expect(withLock).toHaveBeenCalledTimes(1);
     expect(result.evicted).toEqual([nodeModulesRef(basename(f.storeDir))]);
     expect(existsSync(f.storeDir)).toBe(false);
-    expectCopied(f);
+    expect(f.exec).not.toHaveBeenCalled();
+    expect(existsSync(target(f))).toBe(false);
+    expect(messages(f.log)).toMatch(/refusing unprotected copy/i);
   });
 
   it('a contended consumer lock makes eviction retain the frozen store and log the reason', () => {
@@ -668,6 +675,109 @@ describe('whole-tree read-only reuse evidence', () => {
     expect(paths.some((path) => path.includes('/.bin/pkg/'))).toBe(false);
     deps.linkOrCopyNodeModules(f);
     expectLinked(f);
+  });
+});
+
+describe('entry fingerprints, contained links, and protected copies', () => {
+  it.each(['size', 'mtime'])('chmod-modify-restore of a nested file changes its %s fingerprint and falls back to copy', (change) => {
+    const f = fixture();
+    const path = join(f.storeDir, 'node_modules', 'pkg', 'node_modules', 'inner', 'lib', 'nested.js');
+    const before = statSync(path);
+    chmodSync(path, 0o644);
+    writeFileSync(path, change === 'size' ? 'a different and longer implementation' : 'export default 9;');
+    if (change === 'mtime') utimesSync(path, before.atime, new Date(before.mtimeMs + 2000));
+    chmodSync(path, before.mode);
+    deps.linkOrCopyNodeModules(f);
+    expectCopied(f, /fingerprint.*mismatch/i);
+    expect(statSync(path).mode).toBe(before.mode);
+  });
+
+  it('completion records the final read-only modes in the whole-tree fingerprint', () => {
+    const f = fixture();
+    const manifest = JSON.parse(readFileSync(join(f.storeDir, NODE_MODULES_MANIFEST_FILE), 'utf8'));
+    const evidence = nodeModulesTreeEvidence(join(f.storeDir, 'node_modules'));
+    expect(manifest.treeSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(evidence).toEqual({ entryCount: manifest.entryCount, treeSha256: manifest.treeSha256 });
+    deps.linkOrCopyNodeModules(f);
+    expectLinked(f);
+  });
+
+  it('an older manifest without a whole-tree fingerprint fails closed to copy', () => {
+    const f = fixture();
+    const path = join(f.storeDir, NODE_MODULES_MANIFEST_FILE);
+    const manifest = JSON.parse(readFileSync(path, 'utf8'));
+    delete manifest.treeSha256;
+    writeFileSync(path, JSON.stringify(manifest));
+    deps.linkOrCopyNodeModules(f);
+    expectCopied(f, /fingerprint missing/i);
+  });
+
+  it('changing a relative internal link target invalidates the fingerprint', () => {
+    const f = fixture();
+    const bin = join(f.storeDir, 'node_modules', '.bin');
+    chmodSync(bin, 0o755);
+    rmSync(join(bin, 'pkg'));
+    symlinkSync('../pkg/node_modules/inner/lib/nested.js', join(bin, 'pkg'));
+    chmodSync(bin, 0o555);
+    deps.linkOrCopyNodeModules(f);
+    expectCopied(f, /fingerprint.*mismatch/i);
+    expect(readlinkSync(join(target(f), '.bin', 'pkg'))).toBe('../pkg/node_modules/inner/lib/nested.js');
+  });
+
+  for (const depsMode of ['symlink', 'copy']) {
+    it.each(['relative escape', 'absolute external target'])(`${depsMode} mode refuses a %s to a writable external file`, (kind) => {
+      const f = fixture();
+      const external = join(f.base, 'external.js');
+      writeFileSync(external, 'external must stay private');
+      expect(statSync(external).mode & 0o222).not.toBe(0);
+      const bin = join(f.storeDir, 'node_modules', '.bin');
+      const link = join(bin, 'pkg');
+      chmodSync(bin, 0o755);
+      rmSync(link);
+      symlinkSync(kind === 'relative escape' ? relative(dirname(link), external) : external, link);
+      chmodSync(bin, 0o555);
+      expect(() => deps.linkOrCopyNodeModules({ ...f, depsMode })).toThrow(/unsafe.*symlink/i);
+      expect(f.exec).not.toHaveBeenCalled();
+      expect(existsSync(target(f))).toBe(false);
+      expect(messages(f.log)).toMatch(/copy refused/i);
+      expect(readFileSync(external, 'utf8')).toBe('external must stay private');
+    });
+  }
+
+  it('production-style copies preserve relative nested symlinks within a private writable tree', () => {
+    const f = fixture();
+    deps.linkOrCopyNodeModules({ ...f, depsMode: 'copy' });
+    expectCopied(f);
+    const link = join(target(f), '.bin', 'pkg');
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(link)).toBe('../pkg/index.js');
+    expect(realpathSync(link)).toBe(join(realpathSync(target(f)), 'pkg', 'index.js'));
+    writeFileSync(link, 'private implementation');
+    expect(readFileSync(join(f.storeDir, 'node_modules', 'pkg', 'index.js'), 'utf8')).toBe('export default 1;');
+    expect(readFileSync(link, 'utf8')).toBe('private implementation');
+  });
+
+  it('concurrent eviction in the middle of a copy cannot delete its protected source or publish an incomplete tree', () => {
+    const f = fixture();
+    let duringCopy;
+    const exec = vi.fn((command, args, options) => {
+      mkdirSync(args[2]);
+      writeFileSync(join(args[2], 'payload.txt'), 'store payload');
+      expect(existsSync(join(args[2], '.bin'))).toBe(false); // deliberately incomplete so far
+      duringCopy = evictSnapshots({ jobsDir: join(f.base, 'jobs'), referenced: [], keep: 0, log: f.log });
+      expect(duringCopy.evicted).toEqual([]);
+      expect(existsSync(f.storeDir)).toBe(true);
+      f.exec(command, args, options);
+    });
+    deps.linkOrCopyNodeModules({ ...f, depsMode: 'copy', exec });
+    expect(exec).toHaveBeenCalledTimes(1);
+    expectCopied(f);
+    const manifest = JSON.parse(readFileSync(join(f.storeDir, NODE_MODULES_MANIFEST_FILE), 'utf8'));
+    expect(nodeModulesTreeEvidence(target(f), { requireReadonly: false }).entryCount).toBe(manifest.entryCount);
+    expect(evictSnapshots({ jobsDir: join(f.base, 'jobs'), referenced: [], keep: 0 }).evicted).toHaveLength(1);
+    expect(existsSync(f.storeDir)).toBe(false);
+    expect(readFileSync(join(target(f), '.bin', 'pkg'), 'utf8')).toBe('export default 1;');
+    expect(messages(f.log)).toMatch(/retaining.*lock unavailable/i);
   });
 });
 
