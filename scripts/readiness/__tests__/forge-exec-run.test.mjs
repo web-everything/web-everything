@@ -639,6 +639,14 @@ def proc_open(path, *args, **kwargs):
 def kill(pid, sig):
     assert sig == signal.SIGKILL
     killed.append(pid)
+fd_pid = {}
+def pidfd_open(pid):
+    fd = os.open('/dev/null', os.O_RDONLY)
+    fd_pid[fd] = pid
+    return fd
+def pidfd_send_signal(fd, sig):
+    assert sig == signal.SIGKILL
+    killed.append(fd_pid[fd])
 def wait(timeout=None):
     global now, waits
     waits += 1
@@ -665,6 +673,7 @@ if with_cancel == 'true': cfg['cancel'] = os.path.join(root, 'not-cancelled')
 with patch.object(ctypes, 'CDLL') as libc, patch.object(subprocess, 'Popen') as worker, \
      patch.object(os, 'listdir', side_effect=listproc), patch.object(os, 'getpid', return_value=100), \
      patch.object(builtins, 'open', side_effect=proc_open), patch.object(os, 'kill', side_effect=kill), \
+     patch.object(os, 'pidfd_open', side_effect=pidfd_open, create=True), patch.object(signal, 'pidfd_send_signal', side_effect=pidfd_send_signal, create=True), \
      patch.object(os, 'waitpid', side_effect=reap), patch.object(time, 'monotonic', side_effect=lambda: now):
     libc.return_value.prctl.return_value = 0
     worker.return_value.pid = 101
@@ -707,9 +716,21 @@ def proc_open(path, *args, **kwargs):
     pid = int(path.split('/')[2])
     if pid not in entries: raise FileNotFoundError(path)
     return io.BytesIO(stat_bytes(pid))
-def kill(pid, sig):
+fd_pid = {}
+def pidfd_open(pid):
+    if mode == 'no pidfd': raise OSError('unsupported')
+    fd = os.open('/dev/null', os.O_RDONLY)
+    fd_pid[fd] = pid
+    if mode == 'reused after pin': entries[pid] = (b'S', 100, 555, 555, 900)  # pid reassigned before the verify
+    return fd
+def pidfd_send_signal(fd, sig):
     assert sig == signal.SIGKILL
-    killed.append(pid)
+    killed.append(fd_pid[fd])
+cleanup_killed = []
+def kill(pid, sig):
+    # Only the slot-level cleanup after the run may use os.kill; the mid-run sweep uses pidfds.
+    assert sig == signal.SIGKILL
+    cleanup_killed.append(pid)
 def wait(timeout=None):
     global now, waits
     waits += 1
@@ -729,7 +750,7 @@ mid_run = []
 with patch.object(ctypes, 'CDLL') as libc, patch.object(subprocess, 'Popen') as worker, \
      patch.object(os, 'listdir', side_effect=listproc), patch.object(os, 'getpid', return_value=100), \
      patch.object(builtins, 'open', side_effect=proc_open), patch.object(os, 'kill', side_effect=kill), \
-     patch.object(os, 'killpg', side_effect=lambda *a: killed.append(('pg', *a)), create=True), \
+     patch.object(os, 'pidfd_open', side_effect=pidfd_open, create=True), patch.object(signal, 'pidfd_send_signal', side_effect=pidfd_send_signal, create=True), \
      patch.object(os, 'waitpid', side_effect=reap), patch.object(time, 'monotonic', side_effect=lambda: now):
     libc.return_value.prctl.return_value = 0
     worker.return_value.pid = 101
@@ -760,6 +781,11 @@ print(json.dumps(mid_run))
     expect(killed).not.toContain(201);
     expect(killed).not.toContain(202);
   });
+  it.each(['no pidfd','reused after pin'])('fails closed and signals nothing when the process cannot be pinned or changes after the pin (%s)', mode => {
+    const {killed,stderr}=sweep(mode);
+    expect(killed).not.toContain(201);
+    expect(stderr).toMatch(/cannot pin pid 201|changed or unreadable before signal/);
+  });
   it('fails closed when the start time cannot be read: no signal, a log line, slot cleanup left to finish', () => {
     const {killed,stderr}=sweep('unreadable start');
     expect(killed).not.toContain(201);
@@ -778,6 +804,18 @@ print(json.dumps(mid_run))
     if(seen.length>2) expect(seen[2]).toBe(200);
     expect(seen.length).toBeLessThanOrEqual(3);
     expect(logged).toMatch(/run wall limit 1000ms \(source: option\)/);
+  });
+  it('keeps the run deadline monotonic when the wall clock steps backwards', async () => {
+    const seen=[];let wall=5_000_000;
+    const spy=vi.spyOn(Date,'now').mockImplementation(()=>{wall-=60_000;return wall;});
+    try {
+      runner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',runWallMs:1000,
+        testWorkerExec:async call=>{seen.push(call.wallMs);return {code:0,stdout:'',stderr:''};}});
+      await runner.run(request).catch(()=>{});
+    } finally {spy.mockRestore();}
+    expect(seen.length).toBeGreaterThanOrEqual(2);
+    for(const ms of seen) expect(ms).toBeLessThanOrEqual(1000);
+    expect(seen[1]).toBeLessThanOrEqual(seen[0]);
   });
   it('never launches a command once the run deadline has passed', async () => {
     const seen=[];let now=1_000_000;

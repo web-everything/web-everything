@@ -498,14 +498,22 @@ else:
             found.update(frontier)
         for pid in found:
             if processes[pid][0] == b'Z': continue
-            # Re-read right before signalling: skip on any start-time or session change.
+            # Pin the process with a pidfd first, then verify its start time and session through the
+            # pinned PID, then signal the pidfd: the PID cannot be reassigned after the pin. Without
+            # pidfd support the sweep fails closed and the slot-level cleanup finishes the job.
             recorded = orphan_seen[pid][1] if pid in orphan_seen else processes[pid][4]
-            current = read_stat(pid)
-            if not current or current[4] != recorded or current[3] != child.pid:
-                sys.stderr.write('forge-exec-run: pid ' + str(pid) + ' changed or unreadable before signal; sweep skips it\n')
+            try: pidfd = os.pidfd_open(pid)
+            except (AttributeError, OSError) as error:
+                sys.stderr.write('forge-exec-run: cannot pin pid ' + str(pid) + ' (' + type(error).__name__ + '); sweep skips it\n')
                 continue
-            try: os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError: pass
+            try:
+                current = read_stat(pid)
+                if not current or current[4] != recorded or current[3] != child.pid:
+                    sys.stderr.write('forge-exec-run: pid ' + str(pid) + ' changed or unreadable before signal; sweep skips it\n')
+                    continue
+                try: signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                except ProcessLookupError: pass
+            finally: os.close(pidfd)
         if cfg.get('wallMs') is not None and (now - started) * 1000 > cfg['wallMs']:
             sys.stderr.write('forge-exec-run: wall limit exceeded; killing child tree\n')
             return True
@@ -655,6 +663,8 @@ async function unitActive(unit) {
   return ['active','activating','deactivating','reloading'].includes(word)?true:undefined;
 }
 export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, runWallMs, clock=Date.now} = {}) {
+  // The run deadline uses a monotonic clock so a wall-clock step cannot stretch it; an injected clock stands in for it in tests.
+  const monotonic=clock===Date.now?()=>performance.now():clock;
   const bases=testRoot ? join(testRoot,'bases') : '/srv/forge-base';
   const runs = testRoot ? join(testRoot,'runs') : '/srv/forge-exec';
   const receipts = testRoot ? join(testRoot,'receipts') : '/srv/forge-receipts';
@@ -927,11 +937,12 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       if(Number.isSafeInteger(limits.runWallMs)){ms=limits.runWallMs;source='limits-file';}
     }
     process.stderr.write('forge-exec-run: run wall limit '+ms+'ms (source: '+source+')\n');
-    return {at:clock()+ms};
+    return {at:monotonic()+ms};
   }
   async function workCommand(worker,argv,work,env,archive,{cleanup=false,deadline}={}) {
-    const remaining=!cleanup&&deadline?Math.floor(deadline.at-clock()):undefined;
-    if(remaining!==undefined&&remaining<=0) return {code:124,stdout:'',stderr:'forge-exec-run: run wall limit exceeded before launch\n',slotCpus:undefined};
+    const left=()=>!cleanup&&deadline?Math.floor(deadline.at-monotonic()):undefined;
+    const expired=()=>({code:124,stdout:'',stderr:'forge-exec-run: run wall limit exceeded before launch\n',slotCpus:undefined});
+    if(left()!==undefined&&left()<=0) return expired();
     const slot=Number(/^forge-exec-([1-9]\d*)$/.exec(worker.user)?.[1]??(testRoot?1:NaN));
     if(!testRoot && process.getuid()!==0) throw new Error('Scoped execution requires the root wrapper; use local fallback');
     if(!Number.isSafeInteger(slot)||slot<1) throw new Error('Scoped execution requires a numbered slot; rerun Forge setup or use local fallback');
@@ -941,7 +952,9 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     env={WE_VITEST_MAX_WORKERS:String(cpus),...env,FORGE_SLOT_CPUS:String(cpus)};
     const cancel=!cleanup&&worker.reservation?statePath(worker.reservation.run,'cancel'):undefined;
     if(cancel&&await lstat(cancel).catch(error=>{if(error.code!=='ENOENT')throw error;}))return {code:255,stdout:'',stderr:'Run cancelled before worker launch',slotCpus:cpus};
-    if(testRoot) return {...await (testWorkerExec?testWorkerExec({worker,argv,cwd:work,env,archive,cancel,wallMs:remaining}):execute(argv[0],archive ? ['-xf',archive] : argv.slice(1),{cwd:work,env,detached:true})),slotCpus:cpus};
+    // Re-measure after every await above: the budget handed to the child is what is left at launch.
+    if(left()!==undefined&&left()<=0) return expired();
+    if(testRoot) return {...await (testWorkerExec?testWorkerExec({worker,argv,cwd:work,env,archive,cancel,wallMs:left()}):execute(argv[0],archive ? ['-xf',archive] : argv.slice(1),{cwd:work,env,detached:true})),slotCpus:cpus};
     const ids=await identity(worker.user);
     const status=join(receipts,'supervisor-'+randomBytes(16).toString('hex'));
     const usage=status+'.usage';
@@ -949,8 +962,9 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     try {
       const unit='forge-exec-run-'+randomBytes(16).toString('hex'),runFile=statePath(worker.reservation.run,'running'),running=await readRecord(runFile);
       if(running?.owner)await atomicJSON(runFile,{...running,owner:{...running.owner,unit}});
+      if(left()!==undefined&&left()<=0) return expired();
       const launcher=scopeLauncherArgv({slot,unit,sudo:false,source:supervisorSource,
-        json:JSON.stringify({argv,cwd:work,env,status,usage,writer,reapUid:true,wallMs:remaining,...(cancel?{cancel}:{}),...(archive?{archive}:{}),...ids})});
+        json:JSON.stringify({argv,cwd:work,env,status,usage,writer,reapUid:true,wallMs:left(),...(cancel?{cancel}:{}),...(archive?{archive}:{}),...ids})});
       const result=await execute(launcher[0],launcher.slice(1),{inherit:true});
       if(result.code!==0) throw new Error('Supervisor failed');
       const code=Number((await readPinned(status)).toString());
