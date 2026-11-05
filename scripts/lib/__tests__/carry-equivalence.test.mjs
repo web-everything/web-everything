@@ -189,6 +189,14 @@ describe('mechanical net-diff paths (R503)', () => {
     ];
     for (const v of variants) expect(fp(code + v)).not.toBe(fp(code));
   });
+  it.each(Object.entries(NOT_A_REFRESH_VARIANTS))('the root lane manifest keeps its every-kind exclusion: a section opened by "%s" is still skipped', (_, v) => {
+    const M = '.lane-manifest.json';
+    const mv = v.replaceAll(T, M);
+    const lines = (code + mv).split('\n');
+    expect(isMechanicalDiffSection(lines, lines.indexOf(`diff --git a/${M} b/${M}`))).toBe(true);
+    expect(normalizeDiffFingerprint(code + mv)).toBe(normalizeDiffFingerprint(code));
+    expect(normalizeContributionFingerprint(code + mv)).toBe(normalizeContributionFingerprint(code));
+  });
   it('keeps replay equivalence manifest-only: the modify-only timing file is not a transient carry path', () => {
     expect(TRANSIENT_CARRY_PATHS).toEqual(['.lane-manifest.json']);
     expect(Object.isFrozen(TRANSIENT_CARRY_PATHS)).toBe(true);
