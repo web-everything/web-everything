@@ -18,12 +18,25 @@ import { platformPreference, resolveCascade } from './policy-cascade.mjs';
 export const DRAIN_READ_TRANSIENT = 'drain-read-transient';
 export const isTransientReadFailure = (text) => String(text ?? '').includes(DRAIN_READ_TRANSIENT);
 
+/**
+ * Reasons that repeat identically on every pass, so waiting never clears them: a compare listing 300+ files is the same
+ * answer each time. They are still named DrainReadErrors (and still held, never admitted), but carry no transient marker,
+ * so consumers say "needs you" instead of "retry next pass". The old git path could judge such a PR; in `api` mode the
+ * way out is to set `drain.reads.source=git`.
+ */
+export const PERMANENT_READ_REASONS = new Set(['compare-ceiling']);
+export const isPermanentReadReason = (reason) => PERMANENT_READ_REASONS.has(reason);
+
 export class DrainReadError extends Error {
   /** @param {string} reason named reason, e.g. api-http-502, api-malformed, api-truncated */
   constructor(read, reason, detail = '') {
-    super(`${DRAIN_READ_TRANSIENT} (${read}: ${reason}) - retries next pass${detail ? `: ${String(detail).replace(/\s+/g, ' ').slice(0, 200)}` : ''}`);
+    const transient = !isPermanentReadReason(reason);
+    const tail = detail ? `: ${String(detail).replace(/\s+/g, ' ').slice(0, 200)}` : '';
+    super(transient
+      ? `${DRAIN_READ_TRANSIENT} (${read}: ${reason}) - retries next pass${tail}`
+      : `drain-read-permanent (${read}: ${reason}) - a retry gives the same answer; set drain.reads.source=git to judge it with local git${tail}`);
     this.name = 'DrainReadError';
-    this.transient = true;
+    this.transient = transient;
     this.read = read;
     this.reason = reason;
   }
@@ -113,7 +126,8 @@ export function createRestSource({ rest, exec = execFileSyncThrottled, cwd, env 
         res = (rest ?? ghRestGetJson)(key.replace('{owner}/{repo}', pinned), {
           ...(rest ? {} : { exec: pinnedExec }),
           env: cleanEnv, context: `${pinned}@${cwd ?? ''}`,
-          execOpts: { ...(cwd ? { cwd } : {}), env: cleanEnv, timeout: timeoutMs },
+          // The call never outlives the overall deadline: the timeout is the smaller of the per-call bound and the time left.
+          execOpts: { ...(cwd ? { cwd } : {}), env: cleanEnv, timeout: Number.isFinite(deadlineAt) ? Math.max(1, Math.min(timeoutMs, deadlineAt - now())) : timeoutMs },
         });
       } catch (e) {
         const text = String(e?.message ?? e).split('\n')[0];

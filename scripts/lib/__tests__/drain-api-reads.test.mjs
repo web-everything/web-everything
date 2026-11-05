@@ -3,10 +3,10 @@
  * @file drain-api-reads.test.mjs - R515/R546: the drain's freeze, high-water-mark and bornAs reads go through
  *   GitHub REST + ETag (setting drain.reads.source), fail CLOSED with a named transient reason, never fall back to git.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { execFileSyncThrottled } from '../gh-throttle.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -221,6 +221,18 @@ describe('bornAs read over REST', () => {
       });
       expect(checkBornAsCollision(args(rest, g))).toMatchObject({ collision: { hash: 'xabc123', path: 'backlog/13-r.md', mainCard: 'backlog/12-old.md' } });
     });
+    it('a rename plus another added holder of the same identity still collides, naming the other card', () => {
+      const other = b64(CARD);
+      const rest = rest0({
+        'compare/': ok({ files: [{ filename: 'backlog/12-new.md', status: 'renamed', previous_filename: 'backlog/12-old.md' }, { filename: 'backlog/13-other.md', status: 'added' }] }),
+        'git/commits/': ok({ truncated: false, tree: { sha: 'rt0' } }),
+        'git/trees/rt0': ok({ truncated: false, tree: [{ path: 'backlog', type: 'tree', sha: 'rt1' }] }),
+        'git/trees/rt1': ok({ truncated: false, tree: [{ path: '12-new.md', type: 'blob', mode: '100644', sha: other.sha }, { path: '13-other.md', type: 'blob', mode: '100644', sha: other.sha }] }),
+        'contents/backlog/12-new.md': ok(other),
+        'contents/backlog/13-other.md': ok(other),
+      });
+      expect(checkBornAsCollision(args(rest, g))).toMatchObject({ collision: { hash: 'xabc123', path: 'backlog/13-other.md', mainCard: 'backlog/12-old.md' } });
+    });
     it('another main card holding the identity still collides when one is vacated', () => {
       const two = 'origin/main:backlog/12-old.md\0bornAs: xabc123\norigin/main:backlog/13-other.md\0bornAs: xabc123\n';
       const rest = world({ status: 'renamed', previous_filename: 'backlog/12-old.md' });
@@ -235,6 +247,17 @@ describe('bornAs read over REST', () => {
     expect(out).toMatchObject({ enqueued: false, deferred: true, kind: 'bornas-unreadable' });
     expect(out.reason).toContain('Retry note');
     expect(out.reason).not.toContain('Inspect main');
+  });
+  it('a compare at the file ceiling is held with the by-hand wording, never a retry note (waiting cannot clear it)', () => {
+    const files = new Array(300).fill({ filename: 'a', status: 'modified' });
+    expect(isTransientReadFailure(new DrainReadError('bornas-added-files', 'compare-ceiling').message)).toBe(false);
+    expect(new DrainReadError('bornas-added-files', 'compare-ceiling')).toMatchObject({ transient: false });
+    expect(new DrainReadError('bornas-added-files', 'api-http-502')).toMatchObject({ transient: true });
+    const rest = rest0({ 'compare/': ok({ files }) });
+    const out = guardEnqueue({ c: { num: 9 }, headSha: SHA, repo: 'o/r', exec: (c, a) => git()(a), base: 'main', readsSource: 'api', slug: 'o/r', rest });
+    expect(out).toMatchObject({ enqueued: false, deferred: true, kind: 'bornas-unreadable' });
+    expect(out.reason).toContain('Inspect main');
+    expect(out.reason).not.toContain('Retry note');
   });
   it('malformed or truncated responses fail closed', () => {
     expect(checkBornAsCollision(args(rest0({ 'compare/': ok({ nope: 1 }) }), git())).error).toContain('api-malformed');
@@ -256,6 +279,11 @@ describe('transient numbering failures say retry, real refusals still say by han
     expect(t).toContain('retry note');
     expect(t).not.toContain('by hand');
     expect(detailFor('merge-queue: branch numbering refused: bad card')).toContain('number it by hand');
+  });
+  it('a permanent read failure (compare-ceiling) says needs you, not retry', () => {
+    const t = detailFor(new DrainReadError('bornas-added-files', 'compare-ceiling').message);
+    expect(t).toContain('by hand');
+    expect(t).not.toContain('retry note');
   });
 });
 
@@ -298,12 +326,29 @@ describe('R549 round: pinned repo, strict base64, 20 s freeze bound', () => {
     expect(r.ok).toBeUndefined();
     expect(r.error).toContain('invalid base64');
   });
-  it('the freeze read keeps its 20 s bound', () => {
-    const seen = [];
-    const rest = (path, o) => { seen.push(o.execOpts.timeout); return ok(b64(FREEZE)); };
-    readSharedFreeze({ board: '/x', branch: 'ops/b', readsSource: 'api', slug: 'o/r', rest });
-    expect(seen).toEqual([20000]);
+  it('the freeze read keeps its 20 s bound across all its calls, not per call', () => {
+    // A full valid world (ref, commit, tree, contents) where each call takes 8 s: the timeouts shrink to the time left,
+    // and the read gives up with a transient deadline once 20 s are spent.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(NOW);
+      const table = routes(fileWorld(SHARED_FREEZE_FILE, b64(FREEZE)));
+      const timeouts = [];
+      const rest = (path, o) => { timeouts.push(o.execOpts.timeout); const r = table(path, o); vi.setSystemTime(Date.now() + 8000); return r; };
+      const r = readSharedFreeze({ board: '/x', branch: 'ops/b', readsSource: 'api', slug: 'o/r', rest });
+      expect(timeouts).toEqual([20000, 12000, 4000]);
+      expect(r.error).toContain('deadline');
+      expect(r.transient).toBe(true);
+    } finally { vi.useRealTimers(); }
   });
+  it('a fast freeze read still succeeds inside the shared bound', () => {
+    const rest = routes(fileWorld(SHARED_FREEZE_FILE, b64(FREEZE)));
+    expect(readSharedFreeze({ board: '/x', branch: 'ops/b', readsSource: 'api', slug: 'o/r', rest })).toMatchObject({ frozen: true });
+  });
+  it.each(['https://github.com/../x.git', 'https://github.com/x/...git', 'https://github.com/x/..', 'https://github.com/./x.git', 'https://github.com/x/.', 'git@github.com:../x.git'])(
+    'a dot or dot-dot owner/repo (%s) is origin-unparseable, never a path segment', (url) => {
+      expect(() => readOriginSlug(`/c-${Math.random()}`, { git: () => url })).toThrow(/origin-unparseable/);
+    });
 });
 
 
@@ -663,6 +708,20 @@ describe('R559 safety reads never reuse a cache: the gh env is an allowlist', ()
     expect(seen).toHaveLength(1);
     expect(seen[0].throttle.env.WE_GH_READ_MEMO_DIR).toBeUndefined();
     expect(seen[0].throttle.env.WE_GH_THROTTLE_CAP).toBe('x');
+  });
+  it('default transport invokes execFileSyncThrottled: no rest and no exec override still reaches gh through the throttle', () => {
+    // Neither `rest` nor `exec` is injected: the real default executor runs. A stand-in `gh` first on PATH records the
+    // call, and the throttle's lock root (a setting only the throttle reads) is where it leaves its trace.
+    const dir = mkdtempSync(join(tmpdir(), 'default-transport-'));
+    const calls = join(dir, 'calls');
+    const locks = join(dir, 'locks');
+    mkdirSync(join(dir, 'bin'));
+    writeFileSync(join(dir, 'bin', 'gh'), `#!/bin/sh\necho "$@" >> '${calls}'\nprintf 'HTTP/2.0 200 OK\\r\\n\\r\\n{"object":{"sha":"${SHA}"}}'\n`);
+    chmodSync(join(dir, 'bin', 'gh'), 0o755);
+    const source = createRestSource({ slug: 'o/r', env: { PATH: `${join(dir, 'bin')}:${process.env.PATH}`, HOME: dir, WE_GH_THROTTLE_LOCK_ROOT: locks } });
+    expect(source.read('json', 'repos/{owner}/{repo}/git/ref/heads/main')).toMatchObject({ ok: true, value: { object: { sha: SHA } } });
+    expect(readFileSync(calls, 'utf8')).toContain('repos/o/r/git/ref/heads/main');
+    expect(existsSync(locks)).toBe(true); // only the throttle creates its lock root
   });
   it('a memoized unfrozen tip is NOT returned after a freeze: two reads reach gh twice even with a memo dir configured', () => {
     const dir = mkdtempSync(join(tmpdir(), 'memo-'));

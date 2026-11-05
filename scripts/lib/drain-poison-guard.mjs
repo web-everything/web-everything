@@ -121,6 +121,7 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
     // held, never labelled, since the line may be a body example. A card with an opaque opener has unknown identities.
     const added = new Map();
     const carried = new Map(); // added card path -> every identity string it carries
+    const holders = new Map(); // identity -> every added card (path, confirmed) carrying it, not only the first
     let unreadable = null;
     for (const path of names) {
       const stem = path.split('/').pop().replace(/\.md$/, '').split('-')[0];
@@ -129,6 +130,7 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
       carried.set(path, new Set([stem, ...ids]));
       for (const [hash, confirmed] of [[stem, true], ...ids.map(id => [id, parsed && !malformed])]) {
         if (HASH.test(hash) && !added.get(hash)?.confirmed) added.set(hash, { path, confirmed });
+        if (HASH.test(hash)) { if (!holders.has(hash)) holders.set(hash, []); holders.get(hash).push({ path, confirmed }); }
       }
     }
     if (!added.size && unreadable) throw new Error(unreadable);
@@ -162,12 +164,20 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
     // never labelled). Held only after every hit is read, so an unreadable card never hides a readable duplicate.
     for (const mainCard of mainCards) {
       const { parsed, malformed, opaque, ids } = cardIdentities(run(['show', `${prefix}${mainCard}`]));
-      const hash = ids.find(id => added.has(id));
+      let hash = ids.find(id => added.has(id));
       if (!hash && !opaque) continue;
-      // The renamed card's own identities, all still carried at its new path, are not a second holder.
-      const kept = carried.get(renamedTo.get(mainCard));
-      if (!opaque && parsed && !malformed && kept && ids.every(id => kept.has(id))) continue;
-      const card = added.get(hash);
+      let card = added.get(hash);
+      // The renamed card's own identities, all still carried at its new path, are not a second holder. The exemption
+      // covers that card alone: any OTHER added card carrying one of the same identities is a real second holder and
+      // collides, and the collision names that other card, never the renamed one.
+      const own = renamedTo.get(mainCard);
+      const kept = carried.get(own);
+      if (!opaque && parsed && !malformed && kept && ids.every(id => kept.has(id))) {
+        const dup = ids.find(id => holders.get(id)?.some(h => h.path !== own));
+        if (!dup) continue;
+        hash = dup;
+        card = holders.get(dup).find(h => h.path !== own);
+      }
       if (parsed && !malformed && card.confirmed) return done({ collision: { hash, path: card.path, mainCard } });
       unreadable ??= card && !opaque && parsed && !malformed
         ? `added card ${card.path} carries ${hash} outside readable frontmatter, which main card ${mainCard} holds`

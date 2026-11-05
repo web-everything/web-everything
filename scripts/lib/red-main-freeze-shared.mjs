@@ -230,8 +230,9 @@ export function readSharedFreeze({ board = REPO_ROOT, branch = resolveFreezeBran
   // R546: GitHub REST + ETag by default (setting drain.reads.source); an injected git `run` means the git path.
   // An API failure is a named transient error, never a git fallback.
   if (run === undefined && (readsSource ?? resolveDrainReadsSource().value) === 'api') {
-    try { text = unwrap(readFileAtRef('freeze-read', SHARED_FREEZE_FILE, branch, { rest, cwd: board, slug, source: reader, timeoutMs: GIT_TIMEOUT_MS })); } // keeps the freeze read's 20 s bound
-    catch (e) { return { source, error: flatText(`branch unreadable: ${e.message}`), transient: e instanceof DrainReadError }; }
+    // The whole read (ref, commit, each tree, contents: several calls) shares ONE 20 s deadline, like the old single git call.
+    try { text = unwrap(readFileAtRef('freeze-read', SHARED_FREEZE_FILE, branch, { rest, cwd: board, slug, source: reader, timeoutMs: GIT_TIMEOUT_MS, deadlineAt: Date.now() + GIT_TIMEOUT_MS })); }
+    catch (e) { return { source, error: flatText(`branch unreadable: ${e.message}`), transient: e instanceof DrainReadError && e.transient }; }
     if (text == null) return { source, error: flatText(`${SHARED_FREEZE_FILE} not on ${branch}`) };
   } else {
     run ??= timedGit();
