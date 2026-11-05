@@ -13,7 +13,7 @@ function dryRunOptions(callee) {
   const options = DISPATCH_DRY_RUN_SCRIPT.match(new RegExp(`\\b${callee}\\((\\{[\\s\\S]*?\\n  \\})\\);`));
   expect(options, `${callee} must remain explicitly configured in the dry-run script`).not.toBeNull();
   return runInNewContext(`(${options[1]})`, {
-    WE_SLUG: 'fixture/repo', stubDispatch: () => {}, skipStaleness: () => ({ fresh: true, behind: 0 }),
+    process: { env: {}, pid: 1 }, WE_SLUG: 'fixture/repo',stubDispatch: () => {}, skipStaleness: () => ({ fresh: true, behind: 0 }),
   });
 }
 
