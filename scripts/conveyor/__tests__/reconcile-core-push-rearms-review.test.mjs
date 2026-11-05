@@ -98,6 +98,24 @@ describe('R618 pushed fix owes its review', () => {
     expect(run({ comments: [end({ createdAt: '2026-11-05T09:00:00Z' }), advisory()] })
       .dispatch[0]?.mode).toBe('advisory-fix');
   });
+  it.each([
+    `> at \`${HEAD.slice(0, 9)}\``,
+    `\`\`\`text\nat \`${HEAD.slice(0, 9)}\`\n\`\`\``,
+  ])('a headless release with a quoted current head cannot authorize review: %s', quoted => {
+    const body = `${buildFixEndComment({ who: 'fix-session' })}\n\n${quoted}`;
+    const result = run({ comments: [advisory(OLD), end({ body })] });
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'fix', mode: 'advisory-fix' })]);
+  });
+  it('a fix-end before the review in thread order cannot rearm it even when its timestamp is later', () => {
+    // Keep bookkeeping between them so only original thread indexes establish the order.
+    const comments = [end(), { body: 'thread bookkeeping' }, advisory(OLD)];
+    const result = run({ comments });
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'fix', mode: 'advisory-fix' })]);
+  });
+  it('a release after the review in thread order still rearms across unrelated comments', () => {
+    const comments = [{ body: 'earlier discussion' }, advisory(OLD), { body: 'thread bookkeeping' }, end()];
+    expect(run({ comments }).dispatch).toEqual([expect.objectContaining({ kind: 'review' })]);
+  });
 });
 
 describe('R618 same-head operator send-back supersedes a finished advisory', () => {
