@@ -294,10 +294,10 @@ it('host policy regression: preference files merge per leaf and canonical confli
   { host: { maxWaitMs: 250 }, lanes: { gc: { schedule: 120000 } } });
   const policy = loadHostOverloadSettings(opts);
   expect(policy.settings).toEqual({ host: { capacitySignal: 'load',
-    capacity: { cpuIdleLowPct: 15, memFreeLowPct: 15, cpuIdleMediumPct: 30, memFreeMediumPct: 30 },
+    capacity: { memoryMetric: 'available', memAvailableFloorMb: 2048, cpuIdleLowPct: 15, memFreeLowPct: 15, cpuIdleMediumPct: 30, memFreeMediumPct: 30 },
     maxLoadPerCore: 0.5, maxWaitMs: 250, minMemoryHeadroomMb: 2048, maxReviewDispatchPerTick: 2 },
     lanes: { transcripts: { explicitScan: false }, gc: { schedule: 120000 } } });
-  expect(Object.values(policy.sources)).toEqual(['standard', 'standard', 'standard', 'standard', 'standard',
+  expect(Object.values(policy.sources)).toEqual(['standard', 'standard', 'standard', 'standard', 'standard', 'standard', 'standard',
     'platform', 'platform', 'standard', 'standard', 'platform', 'platform']);
   expect(hostLoadAdmission({ ...opts, interactive: false, load: () => [1], cores: () => 1 }).admitted).toBe(false);
 });
@@ -543,4 +543,19 @@ describe('memory-aware host admission (verify-admission, 2026-10-20)', () => {
     expect(() => resolveHostOverloadSettings({ env: { WE_HOST_MIN_MEMORY_HEADROOM_MB: '0' }, log })).toThrow();
     expect(() => resolveHostOverloadSettings({ env: { WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK: '0' }, log })).toThrow();
   });
+});
+
+it('R553: the memory floor defaults to 2048 MB, resolves through the cascade with its source, and rejects zero or junk', async () => {
+  const { resolveHostOverloadSettings } = await import('../lib/host-overload-settings.mjs');
+  const log = [];
+  const s = resolveHostOverloadSettings({ platform: {}, tool: {}, env: {}, log: (l) => log.push(l) });
+  expect(s.settings.host.capacity.memAvailableFloorMb).toBe(2048);
+  expect(s.sources['host.capacity.memAvailableFloorMb']).toBe('standard');
+  expect(log.join('\n')).toMatch(/host\.capacity\.memAvailableFloorMb=2048 \(standard\)/);
+  const env = resolveHostOverloadSettings({ platform: {}, tool: {}, env: { WE_HOST_CAPACITY_MEM_AVAILABLE_FLOOR_MB: '4096' }, log: () => {} });
+  expect(env.settings.host.capacity.memAvailableFloorMb).toBe(4096);
+  expect(env.sources['host.capacity.memAvailableFloorMb']).toBe('env');
+  for (const bad of ['0', '-5', 'abc']) {
+    expect(() => resolveHostOverloadSettings({ platform: {}, tool: {}, env: { WE_HOST_CAPACITY_MEM_AVAILABLE_FLOOR_MB: bad }, log: () => {} })).toThrow();
+  }
 });
