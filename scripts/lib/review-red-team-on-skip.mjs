@@ -301,6 +301,8 @@ export function ignorableConfirmRunIds({ repo, pr, head, comments, labels, revie
       || !Array.isArray(labels) || !labels.some(l => (typeof l === 'string' ? l : l?.name) === 'review:accepted')) return closed;
     const acceptance = latestAcceptRecord(comments, reviews);
     const acceptedAt = Date.parse(acceptance?.at);
+    // A re-stamp carries an earlier acceptance forward: its timestamp is not the original acceptance time.
+    if (/^\s*📌 review — acceptance re-stamped/.test(comments[acceptance?.index]?.body ?? '')) return closed;
     if (acceptance?.sha !== head || !Number.isFinite(acceptedAt)
       || publishableClearGuard({ labels, acceptance, comments, reviews, settlesPending: true })) return closed;
     const ids = [];
