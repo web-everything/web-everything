@@ -6,6 +6,7 @@ parent: "2562"
 status: open
 scope: ["plateau-app:src/backlog-view/proof-tiers.ts", "plateau-app:src/backlog-view/proof-tiers.test.ts"]
 dateOpened: "2026-09-07"
+dateStarted: "2026-09-13"
 tags: []
 ---
 
