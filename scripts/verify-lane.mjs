@@ -730,7 +730,7 @@ async function runGate(command, args, { forgeDispatch = false } = {}) {
       child[name].setEncoding('utf8');
       child[name].on('data', chunk => {
         collector.push(chunk, name);
-        outputTail.push(chunk);
+        outputTail.push(chunk, name);
         bytes += Buffer.byteLength(chunk);
         if (bytes <= MAX_TIMEOUT_LOG_BYTES) output[name] += chunk;
         // Flush each chunk before the terminal JSON; no pending writable queue can overtake it.

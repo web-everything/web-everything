@@ -45,4 +45,21 @@ describe('output tail (verify timeout)', () => {
     tail.push('\u001b[31mFAIL\u001b[0m a.test.mjs\n');
     expect(tail.finish()).toEqual(['FAIL a.test.mjs']);
   });
+  it('does not splice interleaved streams into a secret-shaped line', () => {
+    const tail = createOutputTail();
+    const secret = 'gh' + 'p_' + 'a1B2c3D4e5F6g7H8i9J0';
+    tail.push(`auth ${secret.slice(0, 8)}`, 'stdout'); tail.push('stderr noise\n', 'stderr'); tail.push(`${secret.slice(8)}\n`, 'stdout');
+    const out = tail.finish().join('\n');
+    expect(out).toContain('stderr noise');
+    expect(out).not.toContain(secret);
+  });
+  it('scrubs before clipping and counts bytes, not characters', () => {
+    const secret = 'gh' + 'p_' + 'a1B2c3D4e5F6g7H8i9J0';
+    const tail = createOutputTail({ maxLineChars: 50, maxBytes: 100 });
+    tail.push(`${'x'.repeat(45)} ${secret}\n`);
+    expect(tail.finish().join('\n')).not.toContain('ghp_');
+    const wide = createOutputTail({ maxBytes: 100 });
+    for (let i = 0; i < 20; i++) wide.push(`${'é'.repeat(30)}\n`);
+    expect(Buffer.byteLength(wide.finish().join('\n'))).toBeLessThanOrEqual(100);
+  });
 });

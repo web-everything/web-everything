@@ -11,30 +11,35 @@ export const OUTPUT_TAIL_MAX_BYTES = 32 * 1024;
 export const OUTPUT_TAIL_MAX_LINE_CHARS = 400;
 const ANSI = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
 
+const HARD_LINE_CHARS = 4096;
+const OVERLONG = '[line over 4096 chars omitted]';
+
 export function createOutputTail({ maxLines = OUTPUT_TAIL_LINES, maxBytes = OUTPUT_TAIL_MAX_BYTES, maxLineChars = OUTPUT_TAIL_MAX_LINE_CHARS } = {}) {
   let lines = [];
-  let partial = '';
-  const clip = (line) => (line.length > maxLineChars ? line.slice(0, maxLineChars) : line);
-  const trim = () => {
-    if (lines.length > maxLines) lines = lines.slice(-maxLines);
+  // One partial-line buffer per stream, so interleaved stdout/stderr chunks never splice a line (or a secret) together.
+  const partials = new Map();
+  // A line is scrubbed whole, then clipped: clipping first could leave a secret fragment the scrubber no longer recognises.
+  const tidy = (line) => {
+    if (line.length > HARD_LINE_CHARS) return OVERLONG;
+    const clean = line.replace(ANSI, '');
+    let safe;
+    try { safe = scrubPublish(clean).length ? '[redacted: secret-shaped line]' : clean; } catch { safe = '[redacted: unscrubbable line]'; }
+    return safe.length > maxLineChars ? safe.slice(0, maxLineChars) : safe;
   };
   return {
-    push(chunk) {
-      const text = partial + String(chunk).replace(/\r\n?/g, '\n');
+    push(chunk, stream = 'out') {
+      const text = (partials.get(stream) ?? '') + String(chunk).replace(/\r\n?/g, '\n');
       const parts = text.split('\n');
-      partial = clip(parts.pop());
-      for (const part of parts) lines.push(clip(part));
-      trim();
+      const rest = parts.pop();
+      partials.set(stream, rest.length > HARD_LINE_CHARS ? OVERLONG : rest);
+      for (const part of parts) lines.push(tidy(part));
+      if (lines.length > maxLines) lines = lines.slice(-maxLines);
     },
     finish() {
-      const all = [...lines, ...(partial ? [partial] : [])].slice(-maxLines).map(l => l.replace(ANSI, ''));
-      const scrubbed = all.map(l => {
-        try { return scrubPublish(l).length ? '[redacted: secret-shaped line]' : l; } catch { return '[redacted: unscrubbable line]'; }
-      });
-      // Drop the oldest lines until the joined text fits the byte bound.
-      let total = scrubbed.reduce((n, l) => n + l.length + 1, 0) - 1;
-      while (scrubbed.length > 1 && total > maxBytes) total -= scrubbed.shift().length + 1;
-      return total > maxBytes ? [scrubbed[0].slice(-maxBytes)] : scrubbed;
+      const out = [...lines, ...[...partials.values()].filter(Boolean).map(tidy)].slice(-maxLines);
+      let total = out.reduce((n, l) => n + Buffer.byteLength(l) + 1, 0) - 1;
+      while (out.length > 1 && total > maxBytes) total -= Buffer.byteLength(out.shift()) + 1;
+      return total > maxBytes ? [Buffer.from(out[0]).subarray(-maxBytes).toString('utf8')] : out;
     },
   };
 }
