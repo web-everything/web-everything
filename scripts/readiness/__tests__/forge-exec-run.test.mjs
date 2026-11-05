@@ -679,6 +679,113 @@ if mode == 'orphan sweep': assert set(swept) == {201, 202}, swept
   });
 });
 
+describe('supervisor sweep hardening (R616)', () => {
+  // Fixture /proc entries: pid -> [state, ppid, pgrp, session, starttime]. The probe renders the
+  // real 52-field stat layout so starttime is field 22 (index 19 after the comm).
+  const sweepProbe=String.raw`import builtins, ctypes, io, json, os, signal, subprocess, sys, time
+from unittest.mock import patch
+source, root, status, mode = sys.argv[1:]
+now, waits = 0, 0
+killed = []
+# Run child is 101 (own session 101). Helpers adopted by the supervisor (100) are orphans.
+entries = {
+    101: (b'S', 100, 101, 101, 10),
+    201: (b'S', 100, 101, 101, 500),   # double-forked helper, still in the run session
+    202: (b'S', 201, 101, 101, 501),   # its child
+    301: (b'S', 100, 301, 301, 700),   # double-forked helper that escaped into its own session
+}
+if mode == 'unreadable start': entries[201] = (b'S', 100, 101, 101, None)
+def stat_bytes(pid):
+    state, ppid, pgrp, sid, start = entries[pid]
+    fields = [state, str(ppid).encode(), str(pgrp).encode(), str(sid).encode()] + [b'0'] * 15
+    if start is not None: fields.append(str(start).encode())
+    return str(pid).encode() + b' (na) me) ' + b' '.join(fields) + b'\n'
+def listproc(path):
+    return [str(pid) for pid in entries] + ['self']
+def proc_open(path, *args, **kwargs):
+    pid = int(path.split('/')[2])
+    if pid not in entries: raise FileNotFoundError(path)
+    return io.BytesIO(stat_bytes(pid))
+def kill(pid, sig):
+    assert sig == signal.SIGKILL
+    killed.append(pid)
+def wait(timeout=None):
+    global now, waits
+    waits += 1
+    if waits == 2 and mode == 'reused pid':
+        entries[201] = (b'S', 100, 101, 101, 900)   # PID 201 now names a different process
+    if waits > 3: return 9
+    now += 2
+    raise subprocess.TimeoutExpired('fixture', timeout)
+def reap(*args):
+    raise ChildProcessError()
+writer = dict(guard=os.path.join(root, 'w'), reservation=os.path.join(root, 'r.json'), run='fixture', nonce='fixture')
+os.close(os.open(writer['guard'], os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600))
+with open(writer['reservation'], 'w') as stream: json.dump(dict(run='fixture', nonce='fixture'), stream)
+cfg = dict(uid=os.getuid(), gid=os.getgid(), argv=['unused'], cwd=root, env={}, status=status, writer=writer,
+           wallMs=600000, orphanGraceMs=3000)
+mid_run = []
+with patch.object(ctypes, 'CDLL') as libc, patch.object(subprocess, 'Popen') as worker, \
+     patch.object(os, 'listdir', side_effect=listproc), patch.object(os, 'getpid', return_value=100), \
+     patch.object(builtins, 'open', side_effect=proc_open), patch.object(os, 'kill', side_effect=kill), \
+     patch.object(os, 'killpg', side_effect=lambda *a: killed.append(('pg', *a)), create=True), \
+     patch.object(os, 'waitpid', side_effect=reap), patch.object(time, 'monotonic', side_effect=lambda: now):
+    libc.return_value.prctl.return_value = 0
+    worker.return_value.pid = 101
+    def wait_and_snapshot(timeout=None):
+        try: return wait(timeout)
+        finally: mid_run[:] = list(killed)
+    worker.return_value.wait.side_effect = wait_and_snapshot
+    sys.argv = ['supervisor', json.dumps(cfg)]
+    exec(source)
+# Judge the sweep itself: the final slot-level cleanup runs after wait() returns, so use the mid-run snapshot.
+print(json.dumps(mid_run), file=sys.stderr)
+print(json.dumps(mid_run))
+`;
+  const sweep=mode=>{
+    const result=spawnSync('python3',['-I','-c',sweepProbe,supervisorSource,root,join(root,'sweep-status'),mode],{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
+    expect(result.status,result.stderr).toBe(0);
+    return {killed:JSON.parse(result.stdout.trim().split('\n').at(-1)),stderr:result.stderr};
+  };
+  it('sweeps an aged helper in the run own session and its child, but never a double-forked helper that escaped into its own session', () => {
+    const {killed}=sweep('session');
+    expect(killed).toEqual(expect.arrayContaining([201,202]));
+    expect(killed).not.toContain(301);
+    expect(killed).not.toContain(101);
+  });
+  it('skips a PID whose start time changed since it was first seen (PID reuse) and signals nothing for it', () => {
+    const {killed}=sweep('reused pid');
+    expect(killed).not.toContain(201);
+    expect(killed).not.toContain(202);
+  });
+  it('fails closed when the start time cannot be read: no signal, a log line, slot cleanup left to finish', () => {
+    const {killed,stderr}=sweep('unreadable start');
+    expect(killed).not.toContain(201);
+    expect(stderr).toMatch(/start time.*(unreadable|unknown|cannot)|cannot read start time/i);
+    expect(stderr).toContain('201');
+  });
+  it('applies one wall deadline across all commands of a run and logs the setting source', async () => {
+    const seen=[];let now=1_000_000;const err=vi.spyOn(process.stderr,'write').mockImplementation(()=>true);
+    try {
+      runner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',runWallMs:1000,clock:()=>now,
+        testWorkerExec:async call=>{seen.push(call.wallMs);now+=400;return {code:0,stdout:'',stderr:''};}});
+      await runner.run(request).catch(()=>{});
+    } finally {err.mockRestore();}
+    expect(seen[0]).toBe(1000);
+    expect(seen[1]).toBe(600);
+    if(seen.length>2) expect(seen[2]).toBe(200);
+    expect(seen.length).toBeLessThanOrEqual(3);
+    expect(err.mock.calls.map(c=>String(c[0])).join('')).toMatch(/run wall limit 1000ms \(source: option\)/);
+  });
+  it('never launches a command once the run deadline has passed', async () => {
+    const seen=[];let now=1_000_000;
+    runner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',runWallMs:1000,clock:()=>now,
+      testWorkerExec:async call=>{seen.push(call.wallMs);now+=1500;return {code:0,stdout:'',stderr:''};}});
+    await runner.run(request).catch(()=>{});
+    expect(seen).toEqual([1000]);
+  });
+});
+
 describe('setup and pruning contract', () => {
   it('executes the installed runner with Node 22.1 module resolution outside the repository package', async () => {
     const setup=await readFile(new URL('../forge-setup.sh',import.meta.url),'utf8');

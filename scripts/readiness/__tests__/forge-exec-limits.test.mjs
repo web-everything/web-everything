@@ -76,3 +76,17 @@ describe('Forge slice limits',()=>{
     expect(setup).toContain('/usr/local/libexec/forge-exec-limits.mjs apply');
   });
 });
+
+describe('Forge whole-run wall limit setting (R616)',()=>{
+  it('reads a valid runWallMs from the trusted limits file',()=>{
+    expect(parseLimits(JSON.stringify({runWallMs:600000})).limits.runWallMs).toBe(600000);
+  });
+  it.each([0,-5,1.5,'600000',999,86400001,null])('refuses runWallMs %s with a warning and no value',value=>{
+    const {limits,warnings}=parseLimits(JSON.stringify({runWallMs:value}));
+    expect(limits.runWallMs).toBeUndefined();
+    expect(warnings).toContain('runWallMs: using default');
+  });
+  it('leaves the limits shape unchanged when runWallMs is absent',()=>{
+    expect(parseLimits('{}').limits).toEqual(DEFAULT_LIMITS);
+  });
+});
