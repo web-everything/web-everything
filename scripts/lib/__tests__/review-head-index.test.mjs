@@ -190,6 +190,20 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     expect(JSON.parse(readFileSync(lock, 'utf8')).token).toBe('live'); // the live owner's fence would still pass
     expect(nodeFs.readdirSync(dir).filter(f => f.includes('.stale.'))).toEqual([]);
   });
+  it('takeover of an unreadable (never-written) holder file: a live owner that replaces it mid-takeover keeps its lock', () => {
+    const { lock } = headIndexPaths(dir);
+    nodeFs.mkdirSync(dir, { recursive: true });
+    writeFileSync(lock, ''); // no readable owner: judged stale only by age
+    nodeFs.utimesSync(lock, new Date(0), new Date(0));
+    let swapped = false;
+    const fs = { ...nodeFs, renameSync: (a, b) => {
+      if (!swapped && a === lock) { swapped = true; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'live', at: Date.now() })); }
+      return nodeFs.renameSync(a, b);
+    } };
+    expect(() => withHeadIndexLock(dir, () => 'no', { fs, waitMs: 60, staleMs: 1000 })).toThrow(/lock busy/);
+    expect(JSON.parse(readFileSync(lock, 'utf8')).token).toBe('live');
+    expect(nodeFs.readdirSync(dir).filter(f => f.includes('.stale.'))).toEqual([]);
+  });
   it('takeover: when a newer lock exists at restore time the newer holder wins and its lock is never unlinked', () => {
     const { lock } = headIndexPaths(dir);
     nodeFs.mkdirSync(dir, { recursive: true });
