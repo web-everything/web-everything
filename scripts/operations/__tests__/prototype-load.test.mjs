@@ -2074,6 +2074,37 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
     it('a current-question record for another base does not block the carried prior pass', () => {
       expect(carry(prior(), old({ fingerprint: undefined, base: 'f'.repeat(40) }))).toEqual({ ok: true, record: prior() });
     });
+    // Round 6: a carried head's prior-question WEAKENED must not be hidden by an unusable current-question record for the
+    // same head+base (findAudit lets that record block a prior PASS, which is fail-open for a negative verdict).
+    describe('a carried prior-question WEAKENED hidden by an unusable current-question record', () => {
+      const C = 'c'.repeat(40);
+      const livePass = () => auditRecord({ head: SHA, at: '2026-10-19T12:00:00Z' });
+      const weak = (o = {}) => old({ base: C, questionHash: PRIOR, verdict: 'WEAKENED', at: '2026-10-20T12:00:00Z', findings: ['x.mjs:1 guard removed'], ...o });
+      const hider = (o = {}) => old({ base: C, at: '2026-10-21T12:00:00Z', findings: ['WEAKENED'], ...o });
+      it('still blocks the live head pass, in any record order', () => {
+        for (const records of [[livePass(), weak(), hider()], [hider(), weak(), livePass()], [weak(), livePass(), hider()]])
+          expect(carry(...records)).toEqual({ ok: false, reason: 'weakened' });
+      });
+      it.each([
+        ['unparsable time', { at: 'not-a-date' }],
+        ['unknown verdict', { verdict: 'MAYBE' }],
+      ])('also when the hiding current-question record has %s', (_, over) => {
+        expect(carry(livePass(), weak(), hider(over))).toEqual({ ok: false, reason: 'weakened' });
+      });
+      it('a newer own covered audit still supersedes it (fresh re-audit)', () => {
+        const newer = auditRecord({ head: SHA, at: '2026-10-22T12:00:00Z' });
+        expect(carry(livePass(), weak(), hider(), newer)).toEqual({ ok: true, record: newer });
+      });
+      it('a USABLE current-question re-audit of that base decides instead (findAudit alone)', () => {
+        expect(carry(livePass(), weak(), old({ base: C, at: '2026-10-21T12:00:00Z' })).ok).toBe(true);
+      });
+      it('does not apply to an expired prior hash, a foreign hash, a rejected prior WEAKENED, or a prior NOT WEAKENED', () => {
+        expect(carry(livePass(), weak({ at: '2026-08-01T00:00:00Z' }), hider()).ok).toBe(true);
+        expect(carry(livePass(), weak({ questionHash: 'd'.repeat(64) }), hider()).ok).toBe(true);
+        expect(carry(livePass(), weak({ findings: ['NOT WEAKENED'] }), hider()).ok).toBe(true);
+        expect(carry(livePass(), weak({ verdict: 'NOT WEAKENED', findings: [] }), hider()).ok).toBe(true);
+      });
+    });
     // Round 5: a live-head in-window prior-question WEAKENED must veto a carried current-question pass even when
     // findAudit cannot use it (here: contradictory findings), and a usable one must keep blocking.
     describe('a live-head prior-question WEAKENED record', () => {

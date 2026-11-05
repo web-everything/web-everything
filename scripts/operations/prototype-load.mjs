@@ -116,7 +116,14 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
     // An unparsable time cannot place the record outside its window, so it is judged by the hash's own expiry alone
     // (fail closed, matching a current-question record, which blocks whatever its time).
     && isAcceptedQuestionHash(r.questionHash, { priorQuestionHashes, now, at: Number.isFinite(Date.parse(r.at)) ? r.at : undefined }) && !own.some((d) => d.base === r.base))) return { ok: false, reason: 'weakened' };
-  const carriedWeak = carried.filter((d) => d.record.verdict === 'WEAKENED');
+  // Round 6: a carried head's PRIOR-question WEAKENED that findAudit would accept on its own can be hidden by an unusable
+  // current-question record for the same head+base (findAudit lets even an unusable current record block the prior
+  // fallback, which is right for a PASS but fail-open for a NEGATIVE verdict). Such a record keeps vetoing, judged by
+  // the same supersede rule as any carried WEAKENED; a base with a usable decision of its own is left to findAudit.
+  const hiddenWeak = list.filter((r) => r?.verdict === 'WEAKENED' && typeof r.head === 'string' && carriedHeads.has(r.head) && r.base !== r.head
+    && r.questionHash !== QUESTION_HASH && !carried.some((d) => d.record.head === r.head && d.base === r.base)
+    && findAudit([r], { head: r.head, base: r.base, questionHash: QUESTION_HASH, ...auditOptions }) === r).map((record) => ({ base: record.base, record }));
+  const carriedWeak = [...carried, ...hiddenWeak].filter((d) => d.record.verdict === 'WEAKENED');
   if (carriedWeak.length) {
     const ownAt = Math.max(-Infinity, ...own.filter((d) => covered(d.base)).map((d) => Date.parse(d.record.at)));
     if (carriedWeak.some((d) => !(Date.parse(d.record.at) < ownAt))) return { ok: false, reason: 'weakened' };
