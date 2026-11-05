@@ -670,18 +670,22 @@ it.each([false, true])('default claim refresh keeps a live wrapped fixing claim 
   const completions = join(claimRoot, 'completions');
   vi.stubEnv('OPERATION_COMPLETIONS_DIR', completions);
   const list = vi.spyOn(dispatchIo, 'defaultListAgents').mockReturnValue([]);
+  // The wrapped row's runner is THIS real process, and the claim sweep now arms the pid-reuse guard with the row's
+  // start time (a process that launched later than the holder registered is a different one). So the row must carry a
+  // realistic start: now, not the fixed past T0 (which would make the live test process look like a reused pid).
+  const base = Date.now();
   try {
-    acquireFixClaim({ ...key, who: 'fix-3964', sessionId: sid, nowMs: T0 });
+    acquireFixClaim({ ...key, who: 'fix-3964', sessionId: sid, nowMs: base });
     const record = newEnvelopeRecord({ session: 'fix-3964', role: 'fix', launcher: 'claude-p', sessionId: sid,
-      pid: process.pid, cwd: '/lane', timeoutMs: 60_000, now: () => iso(T0),
-      ...(awaiting ? { awaitingVerify: { sha: 'a'.repeat(40), pr: 3964, ref: 'lane/fix', requestedAt: iso(T0) } } : {}),
+      pid: process.pid, cwd: '/lane', timeoutMs: 60_000, now: () => iso(base),
+      ...(awaiting ? { awaitingVerify: { sha: 'a'.repeat(40), pr: 3964, ref: 'lane/fix', requestedAt: iso(base) } } : {}),
     });
     writeCompletion(record, completions);
-    const result = refreshLiveFixDispatchClaims({ lockRoot: claimRoot, nowMs: T0 + 1000, nowIso: () => iso(T0 + 1000), hungInfoFor: () => null, awaitingVerifyFor: () => null, prHeadFor: () => null });
+    const result = refreshLiveFixDispatchClaims({ lockRoot: claimRoot, nowMs: base + 1000, nowIso: () => iso(base + 1000), hungInfoFor: () => null, awaitingVerifyFor: () => null, prHeadFor: () => null });
     expect(list).toHaveBeenCalledWith({ all: true });
     expect(result.refreshed).toHaveLength(1);
     expect(result.released ?? []).toEqual([]);
-    expect(readFixDispatchClaim(key).heartbeatAt).toBe(iso(T0 + 1000));
+    expect(readFixDispatchClaim(key).heartbeatAt).toBe(iso(base + 1000));
   } finally {
     list.mockRestore();
     vi.unstubAllEnvs();
@@ -888,9 +892,9 @@ describe('idle-claim auto-release (R201)', () => {
       ['3 hours silent', 180 * MIN],
     ])('releases the claim of a bound, readable, idle holder %s with an unmoved head and no subagents', (_n, silentMs) => {
       const lastActivityMs = firstSweep - silentMs;
+      writeTranscript(lastActivityMs);
       // The detector really does flag this holder hung; without the idle-path ownership the claim could never release.
       expect(readHungInfo({ ...row }, firstSweep, resolveHungThresholdMs())).toMatchObject({ hung: true, reason: 'stale-no-activity' });
-      writeTranscript(lastActivityMs);
       const released = sweepAll({ lastActivityMs });
       expect(released).toHaveLength(1);
       expect(released[0].reason).toMatch(/idle-head-unmoved/);
