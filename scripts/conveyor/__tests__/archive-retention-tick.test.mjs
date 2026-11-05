@@ -21,7 +21,7 @@ it('archives runs and sessions sequentially with the tick clock and logger', asy
   const now = Date.parse('2026-10-29T12:00:00Z');
   expect(await runArchiveRetentionTick({ now, archive, log })).toEqual({ results, error: 'Drive unavailable' });
   expect(archive.mock.calls).toEqual([
-    [{ kind: 'runs', now, log }], [{ kind: 'sessions', now, log }],
+    [{ kind: 'runs', now, log, withSourceWriterExclusion: expect.any(Function) }], [{ kind: 'sessions', now, log, withSourceWriterExclusion: undefined }],
   ]);
 });
 
