@@ -490,6 +490,8 @@ describe('R473 structured concurrency evidence', () => {
       'scripts/lib/verify-lane-gate.mjs', 'scripts/lib/codeql-gate.mjs', 'scripts/lib/gate-config.mjs', 'scripts/lib/required-check-implication.mjs',
       'scripts/lib/promotion-required-checks.mjs', 'scripts/rulesets/main-required-checks.merge-queue.json', 'scripts/settings/required-checks-cache.json',
       'scripts/conveyor/delegation-trial-gate.mjs', 'scripts/operations/land-advance-gate.mjs',
+      'scripts/lib/required-status-checks.mjs', 'scripts/lib/rollup-collapse.mjs', 'scripts/lib/review-escalation.mjs', 'scripts/lib/review-timing.mjs',
+      'scripts/lib/review-policy.mjs', 'scripts/lib/github-auth-policy.mjs', 'scripts/operations/gate-health.mjs',
       'scripts/lib/lane-lease.mjs', 'scripts/readiness/scope-lease.mjs', 'scripts/readiness/scope-lease-live.mjs', 'scripts/lib/daemon-rebuild/lease.mjs',
       'scripts/operations/coordination-lock.mjs', 'scripts/lib/daemon-clone-lock.mjs', 'scripts/readiness/with-lock.mjs', 'scripts/readiness/drain-lock.mjs',
       'skills-src/conveyor/runner-lock.mjs', '.githooks/pre-commit', '.githooks/pre-push', 'scripts/lib/git-hook-surface.mjs',
@@ -588,8 +590,11 @@ describe('card outcomes, proof binding and the default card reader (PR #6381 jud
     expect(proofFingerprint({ ...full, interleaving })).toBe(proofFingerprint(full));
     // A proof for the finding as first reported does not cover a restated consequence.
     const restated = { ...full, consequence: 'Restated consequence' };
-    const r = await compute([restated], options('prerelease', { relationProofs: [proofFor(full)], readCard: () => 'mustPayBefore: 2099-01-01\n' }));
+    const card = { readCard: () => 'mustPayBefore: 2099-01-01\n' };
+    const r = await compute([restated], options('prerelease', { relationProofs: [proofFor(full)], ...card }));
     expect(r.verdict).toBe('WEAKENED');
+    // Positive control: the unchanged finding with the same proof ships.
+    expect((await compute([full], options('prerelease', { relationProofs: [proofFor(full)], ...card }))).verdict).toBe('NOT WEAKENED');
   });
 
   const ok = stdout => ({ status: 0, stdout, stderr: '' });
@@ -598,8 +603,12 @@ describe('card outcomes, proof binding and the default card reader (PR #6381 jud
     expect(readCardFromMain('backlog/6400-debt.md', { run })).toBe('mustPayBefore: 2099-01-01\n');
     expect(run.mock.calls.map(c => [c[0], ...c[1]])).toEqual([
       ['git', 'fetch', '--quiet', '--no-tags', 'origin', '+refs/heads/main:refs/remotes/origin/main'],
-      ['git', 'show', 'origin/main:backlog/6400-debt.md']]);
-    for (const call of run.mock.calls) expect(call[2]).toMatchObject({ timeout: 30_000, maxBuffer: 1 << 20 });
+      // The full ref name, so a local branch called `origin/main` cannot shadow it.
+      ['git', 'show', 'refs/remotes/origin/main:backlog/6400-debt.md']]);
+    for (const call of run.mock.calls) {
+      expect(call[2]).toMatchObject({ timeout: 30_000, maxBuffer: 1 << 20 });
+      expect(call[2].env.GIT_TERMINAL_PROMPT).toBe('0');
+    }
   });
   it.each([
     ['the fetch exits non-zero', args => (args[0] === 'fetch' ? { status: 128, stdout: '', stderr: 'offline' } : ok('x'))],

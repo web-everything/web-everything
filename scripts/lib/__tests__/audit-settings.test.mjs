@@ -94,7 +94,9 @@ describe('audit settings (R528)', () => {
       expect(r.warnings).toEqual([]);
     });
     it('an explicitly configured platform file that is missing fails closed instead of reading as unset (PR #6381 judge)', () => {
-      for (const missing of [join(dir, 'missing.json'), join(dir, 'no-such-dir', 'prefs.json')]) {
+      // A relative path resolves against the process cwd, which the auditor does not control: it fails closed too,
+      // even when a file of that name exists relative to the cwd.
+      for (const missing of [join(dir, 'missing.json'), join(dir, 'no-such-dir', 'prefs.json'), 'package.json', './package.json']) {
         const r = fromDisk(missing, full({ preExisting: { mode: 'prove', baseRecheckMax: 3 } }));
         expect(r.value).toMatchObject(STRICT);
         expect(r.value.guardFloorPaths).toEqual(STRICT_PATHS);

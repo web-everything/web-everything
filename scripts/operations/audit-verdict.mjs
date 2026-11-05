@@ -75,11 +75,14 @@ const CARD_PATH = /^backlog\/[A-Za-z0-9._-]+\.md$/;
  */
 export function readCardFromMain(path, { run = spawnSync } = {}) {
   if (typeof path !== 'string' || !CARD_PATH.test(path)) return null;
-  const git = args => run('git', args, { cwd: REPO_ROOT, encoding: 'utf8', timeout: 30_000, maxBuffer: 1 << 20 });
+  // Non-interactive: a credential prompt must fail fast, not wait out the timeout.
+  const git = args => run('git', args, { cwd: REPO_ROOT, encoding: 'utf8', timeout: 30_000, maxBuffer: 1 << 20,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
   try {
     const fetched = git(['fetch', '--quiet', '--no-tags', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
     if (!fetched || fetched.error || fetched.status !== 0) return null;
-    const r = git(['show', `origin/main:${path}`]);
+    // The full ref name: a local branch named `origin/main` would shadow the short name and serve a stale card.
+    const r = git(['show', `refs/remotes/origin/main:${path}`]);
     return !r || r.error || r.status !== 0 || typeof r.stdout !== 'string' ? null : r.stdout;
   } catch { return null; }
 }
@@ -116,7 +119,7 @@ function payByTime(due) {
 }
 /** Longest reported path matched against globs; a longer one cannot be established and fails closed (bounds glob cost). */
 const MAX_PATH = 512;
-/** Most globs one list may carry: the built-in floor plus a full settings list and a full env list (audit-settings caps each at 256). */
+/** Most globs one CALLER list may carry (the trusted lists are bounded by audit-settings: the floor plus 256 per layer). */
 const MAX_GLOBS = GUARD_FLOOR.length + 512;
 /** Repo-relative POSIX form of a reported path, or null when it cannot be established (callers fail closed). */
 function pathCandidates(file) {

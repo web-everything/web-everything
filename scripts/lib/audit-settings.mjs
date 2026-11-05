@@ -5,6 +5,7 @@
  * strictest option. Inert: nothing in the runtime imports this yet (PR-C wires it).
  */
 import { existsSync, readFileSync } from 'node:fs';
+import { isAbsolute } from 'node:path';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { cascadePolicy, PLATFORM_PREFERENCES_ENV, readPlatformPreferences } from './policy-cascade.mjs';
 
@@ -26,6 +27,9 @@ export const GUARD_FLOOR = Object.freeze(['scripts/**/file-locks*', 'scripts/*fi
   // Required-check, review and merge authorization gates (PR #6381 judge: scripts/lib/review-ci-gate.mjs was missing).
   'scripts/lib/review-ci-gate*', 'scripts/*-gate*', 'scripts/**/*-gate*', 'scripts/lib/gate-*', 'scripts/lib/required-check*',
   'scripts/lib/promotion-required-checks.mjs', 'scripts/rulesets/', 'scripts/settings/required-checks-cache.json',
+  // Modules those gates decide with (their imports): weakening one weakens the gate.
+  'scripts/lib/required-status-checks.mjs', 'scripts/lib/rollup-collapse.mjs', 'scripts/lib/review-escalation.mjs',
+  'scripts/lib/review-timing.mjs', 'scripts/lib/review-policy*', 'scripts/lib/github-auth-policy.mjs', 'scripts/operations/gate-health*',
   // The auditor itself: weakening it weakens every later audit.
   'scripts/operations/audit-verdict.mjs', 'scripts/operations/codex-audit*', 'scripts/lib/audit-settings.mjs',
   'scripts/lib/policy-cascade.mjs', 'scripts/settings/codex-audit.json']);
@@ -147,13 +151,16 @@ export function resolveAuditSettings({ path = AUDIT_SETTINGS_PATH, fileRead = re
   let plat = platform; let platUnreadable = false;
   if (plat === undefined) {
     try {
+      // The reader skips a missing file silently. That is right for the default paths, but an EXPLICITLY configured
+      // file that is missing is a choice we cannot read: it fails closed (PR #6381 judge). It is checked before AND
+      // after the read so a file that appears or vanishes in between is not read as unset. A relative path would
+      // resolve against whatever cwd the process has, so it fails closed too.
+      const configured = String(env?.[PLATFORM_PREFERENCES_ENV] ?? '').trim();
+      const configuredBad = () => configured !== '' && (!isAbsolute(configured) || !existsSync(configured));
+      const before = configuredBad();
       const { prefs, errors } = readPlatformPreferences({ env, warn: () => {} });
       plat = prefs.audit;
-      platUnreadable = errors.length > 0 || (Object.hasOwn(prefs, 'audit') && prefs.audit === null);
-      // The reader skips a missing file silently. That is right for the default paths, but an EXPLICITLY configured
-      // file that is missing is a choice we cannot read: it fails closed (PR #6381 judge).
-      const configured = String(env?.[PLATFORM_PREFERENCES_ENV] ?? '').trim();
-      if (configured && !existsSync(configured)) platUnreadable = true;
+      platUnreadable = before || configuredBad() || errors.length > 0 || (Object.hasOwn(prefs, 'audit') && prefs.audit === null);
     } catch { plat = undefined; platUnreadable = true; }
   }
   // A platform preference that is present but not an object flattens to one root leaf and reads as all-omitted.
