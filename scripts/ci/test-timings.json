@@ -1655,6 +1655,7 @@
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
  "soak": {
+  "scripts/conveyor/soak/breaks/stale-code-service.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/review-pr-list-504-reads-zero-owed.soak.test.mjs": 3.02,
   "scripts/conveyor/soak/breaks/agy-juror-shared-checkout-reset.soak.test.mjs": 1.85,
   "scripts/conveyor/soak/breaks/already-done-burst-unattributed.soak.test.mjs": 0.49,
