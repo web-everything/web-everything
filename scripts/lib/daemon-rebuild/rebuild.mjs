@@ -136,6 +136,7 @@ async function forceWatch(options, emitEvent, startedAtMs) {
         // health probe ran must not be reset to last-good (finalize would accept the newer head as `prevHead` and revert it).
         const fin = await withWriteLock(root, async () => {
           const head = verifyRev(git, 'HEAD');
+          if (!head) return { ok: false }; // HEAD unreadable: unknown is not "superseded" — the rollback stays owed and is retried
           if (head === lastGood.head) { clearReadyCandidate(root, stEnv); return { ok: true }; } // already reverted
           if (sha && head !== sha) return { superseded: true, head };
           clearReadyCandidate(root, stEnv);

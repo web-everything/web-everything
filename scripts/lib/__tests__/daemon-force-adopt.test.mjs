@@ -276,6 +276,29 @@ describe('runForceWatchTick', () => {
     expect(await first).toEqual({ action: 'none' });
     expect(readForceWatch(root, env)).toBeNull(); // the stale 'continue' write did not resurrect the closed watch
   });
+  it('a build superseded while a HEALTHY probe ran is not counted down and never logged as passed', async () => {
+    await setup();
+    const events = [];
+    let reads = 0;
+    const currentHead = () => (++reads === 1 ? 'b'.repeat(40) : 'c'.repeat(40)); // the watched build before the probe, a sibling\'s build after
+    const r = await runForceWatchTick({ root, env, currentHead, probe: async () => ({ healthy: true }), rollback: vi.fn(), emit: async (e) => { events.push(e); } });
+    expect(r).toEqual({ action: 'superseded' });
+    expect(readForceWatch(root, env)).toBeNull();
+    expect(events.map((e) => e.kind)).toEqual(['force-adopt-watch-superseded']);
+  });
+  it('a watch another tick closed during the rollback is neither resurrected with an owed marker nor reported again', async () => {
+    await setup();
+    const events = [];
+    const rollback = async () => {
+      // while this rollback is in flight, a second tick completes its own rollback and closes the watch
+      await runForceWatchTick({ root, env, probe: async () => ({ healthy: false }), rollback: async () => ({ ok: true }), emit: async () => {} });
+      return { ok: false };
+    };
+    const r = await runForceWatchTick({ root, env, probe: async () => ({ healthy: false }), rollback, emit: async (e) => { events.push(e); } });
+    expect(r).toEqual({ action: 'none' });
+    expect(readForceWatch(root, env)).toBeNull(); // the failed result did not write rollbackPending back
+    expect(events).toEqual([]);
+  });
   it('a rollback that reports a superseding build closes the watch without reverting and without logging ROLLED BACK', async () => {
     await setup();
     const events = [];

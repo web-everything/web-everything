@@ -202,6 +202,17 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   const fresh = readForceWatch(root, env);
   if (!fresh || fresh.sha !== watch.sha) return { action: 'none' };
   watch = { ...fresh, adoptedSeen: fresh.adoptedSeen === true || watch.adoptedSeen === true };
+  // The head was read BEFORE the probe too: a sibling that adopted a newer build meanwhile means this build is no longer running, so a
+  // healthy result says nothing about it (no countdown, no false "passed") and an unhealthy one owes no revert.
+  const headNow = typeof currentHead === 'function' ? currentHead() : currentHead;
+  if (headNow !== null && headNow !== watch.sha) {
+    clearWatch(root, env);
+    await emit?.({ kind: 'force-adopt-watch-superseded', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, head: headNow } });
+    return { action: 'superseded' };
+  }
+  // Every write/clear below follows an await on a rollback that may take the clone lock: act only if this exact watch is still the
+  // one on disk, never on the snapshot (it may have been closed, or replaced by a force for another build, in the meantime).
+  const sameWatch = () => readForceWatch(root, env)?.sha === watch.sha;
   const pendingReason = watch.rollbackPending || pendingFor(root, env, watch.sha); // disk marker, else the in-process one
   const verdict = evaluateForceWatch({ watch: pendingReason ? { ...watch, rollbackPending: pendingReason } : watch, healthy: health?.healthy, restarts: health?.restarts ?? 0 });
   if (verdict.action === 'continue') { persist(verdict.watch); return { action: 'continue', ticksLeft: verdict.watch.ticksLeft }; }
@@ -210,6 +221,7 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   let result;
   // `sha` lets the rollback verify, under the clone's write lock, that the watched build is STILL head before it reverts anything.
   try { result = await rollback(watch.lastGood, { sha: watch.sha }); } catch { result = { ok: false }; }
+  if (!sameWatch()) return { action: 'none' }; // another tick closed (or replaced) this watch during the rollback: it owns the outcome
   if (result?.superseded === true) {
     // A superseding build was adopted while the probe/rollback ran: it is running, the watched build is not, so there is nothing
     // to revert. Close the watch without touching the newer build.

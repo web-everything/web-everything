@@ -472,6 +472,24 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     expect(handoffOf(env)).not.toMatch(/ROLLED BACK/);
   });
 
+  it('an unreadable HEAD inside the rollback is not "superseded": the revert stays owed and is retried', async () => {
+    const { cloneDir, env, lastGood, target, arm } = setup();
+    arm();
+    await tick(cloneDir, env, { runSmoke: failing() });
+    expect(headOf(cloneDir)).toBe(target);
+    let gitBroken = false;
+    const run = (args, opts) => (gitBroken && args[0] === 'rev-parse' ? { status: 128, stdout: '', stderr: 'fatal' } : gitRun(args, opts));
+    const probe = async () => { gitBroken = true; return { healthy: false }; }; // git fails from the probe on (outer head read is already done)
+    await tick(cloneDir, env, { runSmoke: passing(), forceWatchProbe: probe, run });
+    gitBroken = false;
+    expect(headOf(cloneDir)).toBe(target); // not reverted yet ...
+    expect(readForceWatch(cloneDir, env)).toMatchObject({ sha: target, rollbackPending: 'health-failed' }); // ... but still owed, watch kept
+    expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8')).not.toMatch(/force-adopt-watch-superseded/);
+    await tick(cloneDir, env, { runSmoke: passing(), forceWatchProbe: healthy }); // a healthy probe still honours the owed revert
+    expect(headOf(cloneDir)).toBe(lastGood);
+    expect(readForceWatch(cloneDir, env)).toBeNull();
+  });
+
   it('a finalization that fails clears the watch AND the ready candidate, and logs the build as not adopted', async () => {
     const { cloneDir, env, lastGood, target, arm } = setup();
     arm();
