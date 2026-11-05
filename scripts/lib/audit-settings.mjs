@@ -4,9 +4,9 @@
  * from a candidate diff or the cwd. Env may only TIGHTEN; any unreadable or invalid value resolves to the
  * strictest option. Inert: nothing in the runtime imports this yet (PR-C wires it).
  */
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
-import { cascadePolicy, readPlatformPreferences } from './policy-cascade.mjs';
+import { cascadePolicy, PLATFORM_PREFERENCES_ENV, readPlatformPreferences } from './policy-cascade.mjs';
 
 export const AUDIT_SETTINGS_PATH = fileURLToPath(new NodeURL('../settings/codex-audit.json', import.meta.url));
 /**
@@ -23,6 +23,9 @@ export const GUARD_FLOOR = Object.freeze(['scripts/**/file-locks*', 'scripts/*fi
   'scripts/guard-*', 'scripts/**/guard-*', 'scripts/*-guard*', 'scripts/**/*-guard*', 'scripts/guarded-*', 'scripts/**/guarded-*',
   '.claude/settings.json', '.githooks/', 'scripts/lib/git-hook-surface.mjs', 'scripts/lib/permission-change.mjs',
   'scripts/lib/pr-merge-gate.mjs', '.github/workflows/',
+  // Required-check, review and merge authorization gates (PR #6381 judge: scripts/lib/review-ci-gate.mjs was missing).
+  'scripts/lib/review-ci-gate*', 'scripts/*-gate*', 'scripts/**/*-gate*', 'scripts/lib/gate-*', 'scripts/lib/required-check*',
+  'scripts/lib/promotion-required-checks.mjs', 'scripts/rulesets/', 'scripts/settings/required-checks-cache.json',
   // The auditor itself: weakening it weakens every later audit.
   'scripts/operations/audit-verdict.mjs', 'scripts/operations/codex-audit*', 'scripts/lib/audit-settings.mjs',
   'scripts/lib/policy-cascade.mjs', 'scripts/settings/codex-audit.json']);
@@ -147,6 +150,10 @@ export function resolveAuditSettings({ path = AUDIT_SETTINGS_PATH, fileRead = re
       const { prefs, errors } = readPlatformPreferences({ env, warn: () => {} });
       plat = prefs.audit;
       platUnreadable = errors.length > 0 || (Object.hasOwn(prefs, 'audit') && prefs.audit === null);
+      // The reader skips a missing file silently. That is right for the default paths, but an EXPLICITLY configured
+      // file that is missing is a choice we cannot read: it fails closed (PR #6381 judge).
+      const configured = String(env?.[PLATFORM_PREFERENCES_ENV] ?? '').trim();
+      if (configured && !existsSync(configured)) platUnreadable = true;
     } catch { plat = undefined; platUnreadable = true; }
   }
   // A platform preference that is present but not an object flattens to one root leaf and reads as all-omitted.
@@ -179,17 +186,27 @@ export function resolveAuditSettings({ path = AUDIT_SETTINGS_PATH, fileRead = re
       if (e === undefined || !VALID[key](e)) {
         warn(`env ${AUDIT_SETTINGS_ENV[key]}=${JSON.stringify(envRaw)} invalid; using strictest ${JSON.stringify(STRICTEST[key])}`);
         v = STRICTEST[key]; src = 'strictest';
-      } else if (!(key === 'preExistingMode' && e === 'allow') && tighter(key, e, v)) { v = e; src = 'env'; }
+      } else if (key === 'preExistingMode' && e === 'allow') {
+        // allow is never trusted, from any layer: it resolves to block (PR #6381 judge).
+        warn(`env ${AUDIT_SETTINGS_ENV[key]}=allow resolves to block (the model label is never trusted)`); v = 'block'; src = 'env';
+      } else if (tighter(key, e, v)) { v = e; src = 'env'; }
       else warn(`env ${AUDIT_SETTINGS_ENV[key]}=${JSON.stringify(envRaw)} ignored (env may only tighten)`);
     }
     value[key] = v; sources[key] = src;
   }
   // Path lists only ever ADD to the built-in floor. An unreadable layer or an invalid list (file, platform or env) is
   // an explicit choice we cannot read, so it resolves to the strictest list: the floor plus every path.
-  for (const [key, layerVal] of [['raceBlockPaths', get(layered, 'raceBlockPaths')], ['guardFloorPaths', get(layered, 'guardFloorPaths')]]) {
-    let list = layerVal === undefined ? [] : layerVal;
+  // Each layer's list is read RAW and the lists are unioned: the cascade would let the file list REPLACE a platform
+  // list, silently dropping the platform's extra protected paths (PR #6381 judge).
+  for (const key of ['raceBlockPaths', 'guardFloorPaths']) {
     let strictest = unreadable || !cascade || platBad;
-    if (!validPaths(list) || malformed(key, validPaths)) { warn(`audit setting ${key} invalid; every path protected`); list = []; strictest = true; }
+    const layerLists = [isObj(plat) ? plat[key] : undefined, isObj(tool) ? tool[key] : undefined].filter(l => l !== undefined);
+    let platList = []; let list = [];
+    if (!layerLists.every(validPaths) || malformed(key, validPaths)) { warn(`audit setting ${key} invalid; every path protected`); strictest = true; }
+    else {
+      platList = isObj(plat) && plat[key] !== undefined ? plat[key] : [];
+      list = [...platList, ...(isObj(tool) && tool[key] !== undefined ? tool[key] : [])];
+    }
     let envList = [];
     const raw = env?.[AUDIT_SETTINGS_ENV[key]];
     if (raw !== undefined) {
@@ -198,7 +215,7 @@ export function resolveAuditSettings({ path = AUDIT_SETTINGS_PATH, fileRead = re
       else { warn(`env ${AUDIT_SETTINGS_ENV[key]} invalid; every path protected`); strictest = true; }
     }
     value[key] = Object.freeze([...new Set([...(strictest ? STRICTEST_PATHS : GUARD_FLOOR), ...list, ...envList])]);
-    sources[key] = strictest ? 'strictest' : envList.length ? 'env' : list.length ? 'file' : 'built-in';
+    sources[key] = strictest ? 'strictest' : envList.length ? 'env' : list.length > platList.length ? 'file' : platList.length ? 'platform' : 'built-in';
   }
   // Prior question hashes only widen what is ACCEPTED, so no env route exists; a bad list is empty.
   // Any unreadable layer accepts none (strictest), like every single-value setting above.

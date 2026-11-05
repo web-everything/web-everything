@@ -68,11 +68,20 @@ function matchesPath(file, pattern) {
 
 const REPO_ROOT = fileURLToPath(new NodeURL('../../', import.meta.url));
 const CARD_PATH = /^backlog\/[A-Za-z0-9._-]+\.md$/;
-/** Default card reader: the card must exist on origin/main. Any failure is unavailable (null). */
-export function readCardFromMain(path) {
+/**
+ * Default card reader: the card must exist on origin/main AS IT IS NOW. A local origin/main can be stale (a card since
+ * deleted or a pay-by since moved would still read), so the ref is fetched first (PR #6381 judge). Any failure,
+ * including a failed fetch, is unavailable (null). `run` is a test seam.
+ */
+export function readCardFromMain(path, { run = spawnSync } = {}) {
   if (typeof path !== 'string' || !CARD_PATH.test(path)) return null;
-  const r = spawnSync('git', ['show', `origin/main:${path}`], { cwd: REPO_ROOT, encoding: 'utf8', timeout: 30_000, maxBuffer: 1 << 20 });
-  return r.error || r.status !== 0 ? null : r.stdout;
+  const git = args => run('git', args, { cwd: REPO_ROOT, encoding: 'utf8', timeout: 30_000, maxBuffer: 1 << 20 });
+  try {
+    const fetched = git(['fetch', '--quiet', '--no-tags', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
+    if (!fetched || fetched.error || fetched.status !== 0) return null;
+    const r = git(['show', `origin/main:${path}`]);
+    return !r || r.error || r.status !== 0 || typeof r.stdout !== 'string' ? null : r.stdout;
+  } catch { return null; }
 }
 /**
  * D2 debt ships only when its card exists on main and its pay-by date has not passed. The pay-by date is

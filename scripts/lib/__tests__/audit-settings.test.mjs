@@ -93,6 +93,37 @@ describe('audit settings (R528)', () => {
       expect(r.value).toMatchObject({ recheckMax: 0, verdictMode: 'model' });
       expect(r.warnings).toEqual([]);
     });
+    it('an explicitly configured platform file that is missing fails closed instead of reading as unset (PR #6381 judge)', () => {
+      for (const missing of [join(dir, 'missing.json'), join(dir, 'no-such-dir', 'prefs.json')]) {
+        const r = fromDisk(missing, full({ preExisting: { mode: 'prove', baseRecheckMax: 3 } }));
+        expect(r.value).toMatchObject(STRICT);
+        expect(r.value.guardFloorPaths).toEqual(STRICT_PATHS);
+        expect(r.warnings.join()).toMatch(/platform preference unreadable/);
+      }
+      // A configured file that exists is read normally (the check is about absence, not about being configured).
+      expect(fromDisk(prefs('present.json', '{}'), full()).value.releaseStage).toBe('prerelease');
+    });
+    it('platform path lists are unioned with the tool file lists, never replaced by them (PR #6381 judge)', () => {
+      const r = fromDisk(prefs('lists.json', '{"audit":{"raceBlockPaths":["plat-race/**"],"guardFloorPaths":["plat-guard/**"]}}'),
+        full({ raceBlockPaths: ['tool-race/**'], guardFloorPaths: ['tool-guard/**'] }));
+      expect(r.value.raceBlockPaths).toEqual([...GUARD_FLOOR, 'plat-race/**', 'tool-race/**']);
+      expect(r.value.guardFloorPaths).toEqual([...GUARD_FLOOR, 'plat-guard/**', 'tool-guard/**']);
+      expect(r.sources.guardFloorPaths).toBe('file');
+      const platOnly = fromDisk(prefs('plat-only.json', '{"audit":{"guardFloorPaths":["plat-guard/**"]}}'), full());
+      expect(platOnly.value.guardFloorPaths).toEqual([...GUARD_FLOOR, 'plat-guard/**']);
+      expect(platOnly.sources.guardFloorPaths).toBe('platform');
+      // An invalid platform list still fails closed even when the tool list is valid.
+      const bad = fromDisk(prefs('bad-list.json', '{"audit":{"guardFloorPaths":[""]}}'), full({ guardFloorPaths: ['tool-guard/**'] }));
+      expect(bad.value.guardFloorPaths).toEqual(STRICT_PATHS);
+    });
+  });
+  it('env preExisting mode allow resolves to block, even over a file prove (PR #6381 judge)', () => {
+    for (const fileMode of ['prove', 'block']) {
+      const r = resolve(full({ preExisting: { mode: fileMode, baseRecheckMax: 3 } }), { WE_AUDIT_PREEXISTING_MODE: 'allow' });
+      expect(r.value.preExistingMode).toBe('block');
+      expect(r.sources.preExistingMode).toBe('env');
+      expect(r.warnings.join()).toMatch(/allow resolves to block/);
+    }
   });
   it('misspelled keys are named in a warning instead of vanishing silently', () => {
     const r = resolve(full({ verdicts: { mode: 'shadow' }, ReleaseStage: 'prod', recheck: { max: 1, Max: 0 }, $note: 'ok' }));

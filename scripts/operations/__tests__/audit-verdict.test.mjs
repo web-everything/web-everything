@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { URL as NodeURL, fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import { GUARD_FLOOR } from '../../lib/audit-settings.mjs';
-import { proofFingerprint } from '../audit-verdict.mjs';
+import { proofFingerprint, readCardFromMain } from '../audit-verdict.mjs';
 
 // R473 stage 1 deliberately supplies tests only. Stage 2 supplies the implementation;
 // this suite must stay RED until then. Do not stub the verdict engine or skip cases
@@ -470,6 +470,14 @@ describe('R473 structured concurrency evidence', () => {
       neverShips(raced);
       expect(raced.blocks).toEqual([expect.objectContaining({ id: 'f1', class: 'B4' })]);
     });
+    it('E2 in scripts/lib/review-ci-gate.mjs (the required-check authorization gate) refuses clearance (PR #6381 judge)', async () => {
+      const f = finding({ class: 'E2', file: 'scripts/lib/review-ci-gate.mjs', invariant: 'A required check is authorized only by its own run' });
+      for (const stage of ['prerelease', 'prod']) {
+        const r = await compute([f], options(stage, { guardFloorPaths: [], raceBlockPaths: [] }));
+        neverShips(r);
+        expect([...r.blocks, ...r.recheck].map(x => x.id)).toEqual(['f1']);
+      }
+    });
     it('D3 in scripts/lib/lane-lease.mjs blocks (a lease overwrite never clears)', async () => {
       const f = finding({ class: 'D3', file: 'scripts/lib/lane-lease.mjs', invariant: 'A live lease is never overwritten' });
       neverShips(await compute([f], options()));
@@ -478,6 +486,10 @@ describe('R473 structured concurrency evidence', () => {
     });
     it.each(['scripts/guard-bash.mjs', 'scripts/guard-git-push.mjs', 'scripts/guard-lane.mjs', 'scripts/guard-stop-passive-wait.mjs',
       'scripts/conveyor/guard-1c-mutation-check.mjs', 'scripts/backlog-guard.mjs', 'scripts/backlog/guarded-write.mjs', '.claude/settings.json',
+      'scripts/lib/review-ci-gate.mjs', 'scripts/lib/review-ci-gate-io.mjs', 'scripts/check-review-gate.mjs', 'scripts/lib/red-team-gate.mjs',
+      'scripts/lib/verify-lane-gate.mjs', 'scripts/lib/codeql-gate.mjs', 'scripts/lib/gate-config.mjs', 'scripts/lib/required-check-implication.mjs',
+      'scripts/lib/promotion-required-checks.mjs', 'scripts/rulesets/main-required-checks.merge-queue.json', 'scripts/settings/required-checks-cache.json',
+      'scripts/conveyor/delegation-trial-gate.mjs', 'scripts/operations/land-advance-gate.mjs',
       'scripts/lib/lane-lease.mjs', 'scripts/readiness/scope-lease.mjs', 'scripts/readiness/scope-lease-live.mjs', 'scripts/lib/daemon-rebuild/lease.mjs',
       'scripts/operations/coordination-lock.mjs', 'scripts/lib/daemon-clone-lock.mjs', 'scripts/readiness/with-lock.mjs', 'scripts/readiness/drain-lock.mjs',
       'skills-src/conveyor/runner-lock.mjs', '.githooks/pre-commit', '.githooks/pre-push', 'scripts/lib/git-hook-surface.mjs',
@@ -553,6 +565,57 @@ describe('R473 structured concurrency evidence', () => {
     });
   });
 
+});
+
+describe('card outcomes, proof binding and the default card reader (PR #6381 judge)', () => {
+  it('a prerelease E1 ships with an expedite card due in 72 hours; E2 ships as debt with no deadline', async () => {
+    const e1 = await compute([finding({ class: 'E1' })], options());
+    expect(e1.cards).toEqual([expect.objectContaining({ id: 'f1', class: 'E1', outcome: 'expedite', deadlineHours: 72 })]);
+    const e2 = await compute([finding({ class: 'E2' })], options());
+    expect(e2.cards).toEqual([expect.objectContaining({ id: 'f1', class: 'E2', outcome: 'debt' })]);
+    expect(e2.cards[0]).not.toHaveProperty('deadlineHours');
+    expect((await compute([finding({ class: 'E1' })], options('prod'))).cards).toEqual([]);
+  });
+
+  const full = finding({ class: 'D2', card: 'backlog/6400-debt.md', ruling: 'R1', hunkHash: 'abc123' });
+  it.each([['id', 'f2'], ['file', 'scripts/other.mjs'], ['line', 13], ['invariant', 'Another invariant'], ['class', 'D3'],
+    ['trigger', 'Another trigger'], ['consequence', 'Another consequence'], ['card', 'backlog/6401-other.md'], ['ruling', 'R2'], ['hunkHash', 'def456']])(
+    'the proof fingerprint binds the %s evidence field', (key, other) => {
+      expect(proofFingerprint({ ...full, [key]: other })).not.toBe(proofFingerprint(full));
+    });
+  it('the proof fingerprint ignores the model relation label and the interleaving, and a stale proof blocks', async () => {
+    expect(proofFingerprint({ ...full, relation: 'untouched' })).toBe(proofFingerprint(full));
+    expect(proofFingerprint({ ...full, interleaving })).toBe(proofFingerprint(full));
+    // A proof for the finding as first reported does not cover a restated consequence.
+    const restated = { ...full, consequence: 'Restated consequence' };
+    const r = await compute([restated], options('prerelease', { relationProofs: [proofFor(full)], readCard: () => 'mustPayBefore: 2099-01-01\n' }));
+    expect(r.verdict).toBe('WEAKENED');
+  });
+
+  const ok = stdout => ({ status: 0, stdout, stderr: '' });
+  it('the default reader fetches origin/main, then reads the card from origin/main', () => {
+    const run = vi.fn((_cmd, args) => (args[0] === 'fetch' ? ok('') : ok('mustPayBefore: 2099-01-01\n')));
+    expect(readCardFromMain('backlog/6400-debt.md', { run })).toBe('mustPayBefore: 2099-01-01\n');
+    expect(run.mock.calls.map(c => [c[0], ...c[1]])).toEqual([
+      ['git', 'fetch', '--quiet', '--no-tags', 'origin', '+refs/heads/main:refs/remotes/origin/main'],
+      ['git', 'show', 'origin/main:backlog/6400-debt.md']]);
+    for (const call of run.mock.calls) expect(call[2]).toMatchObject({ timeout: 30_000, maxBuffer: 1 << 20 });
+  });
+  it.each([
+    ['the fetch exits non-zero', args => (args[0] === 'fetch' ? { status: 128, stdout: '', stderr: 'offline' } : ok('x'))],
+    ['the fetch errors', args => (args[0] === 'fetch' ? { error: new Error('ETIMEDOUT'), status: null } : ok('x'))],
+    ['the fetch throws', args => { if (args[0] === 'fetch') throw new Error('spawn failed'); return ok('x'); }],
+    ['the card is not on origin/main', args => (args[0] === 'fetch' ? ok('') : { status: 128, stdout: '', stderr: 'does not exist' })],
+    ['the show errors', args => (args[0] === 'fetch' ? ok('') : { error: new Error('ENOBUFS'), status: null, stdout: 'partial' })],
+    ['the runner returns nothing', () => undefined],
+  ])('the default reader returns null when %s, never a stale card', (_n, impl) => {
+    expect(readCardFromMain('backlog/6400-debt.md', { run: vi.fn((_c, args) => impl(args)) })).toBeNull();
+  });
+  it('the default reader refuses a non-card path without running git', () => {
+    const run = vi.fn(() => ok('x'));
+    for (const p of ['../x.md', 'backlog/a/b.md', 'backlog/x.txt', 'backlog/x.md\n', 7, undefined]) expect(readCardFromMain(p, { run })).toBeNull();
+    expect(run).not.toHaveBeenCalled();
+  });
 });
 
 describe('AU1 PR-A is inert', () => {

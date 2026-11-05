@@ -6501,7 +6501,11 @@ or is not a known option resolves to that setting's strictest option too. Path l
 guard floor: the concurrency modules (locks, leases including `scripts/lib/lane-lease.mjs`, slots, lane pool,
 merge, drain) and the guard hooks (`scripts/guard-*.mjs` and the other guard scripts) with their registration in
 `.claude/settings.json`, the git hooks and merge/review gates, and the auditor's own modules and settings. Paths
-match without regard to letter case. An invalid or unreadable path list protects every path. A caller of the verdict may only
+match without regard to letter case. The required-check, review and merge authorization gates (including
+`scripts/lib/review-ci-gate.mjs`) are on the floor too. Platform and file path lists are unioned, never replaced.
+An invalid or unreadable path list protects every path. An explicitly configured platform-preferences file that
+is missing fails closed like an unreadable one. `allow` from the environment also resolves to `block`. The D2 card
+reader fetches `origin/main` before reading the card; a failed fetch means no card. A caller of the verdict may only
 tighten these settings (a stricter stage, more protected paths), never relax them. The **prod trigger is the first outside user** of any constellation surface:
 first public npm package publish or first external user/customer on plateau-app. The operator records that level
 move; B rows never relax, and outstanding due debt gates the move.
