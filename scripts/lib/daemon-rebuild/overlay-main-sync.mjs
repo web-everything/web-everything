@@ -6,7 +6,7 @@ import { tmpdir, hostname } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import { cascadePolicy } from '../policy-cascade.mjs';
+import { cascadePolicy, platformPreference } from '../policy-cascade.mjs';
 import { readOverlayState, overlayFilePath, appendOverlayEvent, registrationIdentity } from '../daemon-overlays.mjs';
 import { isSafeBranchName } from '../daemon-self-sync.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
@@ -16,7 +16,7 @@ import { buildReverseImportGraph, testDepths, isVitestTestFile, isGraphSourceFil
 import { alertsFilePath } from './state.mjs';
 import { REBUILD_IDENTITY_ENV } from './shared.mjs';
 import { tryLease } from '../../operations/coordination-lock.mjs';
-import { buildHeavyTestInvocation, runHeavyTests } from './auto-rebase.mjs';
+import { buildHeavyTestInvocation, runHeavyTests, heavyTestReport } from './auto-rebase.mjs';
 
 const SELF = fileURLToPath(import.meta.url), SETTINGS = join(dirname(SELF), '../daemon-rebuild-settings.json');
 const validMode = mode => ['off', 'shadow', 'on'].includes(mode);
@@ -262,6 +262,17 @@ export function resolveOverlayMainSyncMode(env = process.env, { settingsPath = S
   if (lastModeLog !== key) { console.error(line); lastModeLog = key; }
   return value;
 }
+export function resolveOverlayFlakeReruns(env = process.env, { settingsPath = SETTINGS } = {}) {
+  let tool;
+  try { tool = JSON.parse(fs.readFileSync(settingsPath, 'utf8')).overlay?.mainSync; } catch { /* standard */ }
+  const raw = env.WE_DAEMON_OVERLAY_MAIN_SYNC_FLAKE_RERUNS;
+  const r = cascadePolicy('overlay.mainSync', tool, { env,
+    platform: platformPreference('overlay', { env })?.mainSync ?? {},
+    standard: { flakeReruns: 1 },
+    envValues: { flakeReruns: typeof raw === 'string' && raw.trim() ? Number(raw) : undefined },
+    valid: { flakeReruns: n => Number.isSafeInteger(n) && n >= 0 && n <= 2 } });
+  return { value: r.value.flakeReruns, source: r.sources.flakeReruns };
+}
 export function selectSyncTargets(state) {
   if (state?.corrupt || !Array.isArray(state?.overlays)) throw new Error('overlay state unavailable; operator repair required');
   return state.overlays.filter(o => !state.overlays.some(other => other !== o && other.stackBases?.includes(o.ref))).map(o => o.ref);
@@ -389,6 +400,99 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
   }
   return result;
 }
+const testFailure = () => new Error('selected tests did not pass or execute; operator review required');
+const remoteUnconfirmed = result => result?.status === 124 && typeof result.stderr === 'string'
+  && result.stderr.includes('remote termination unconfirmed; refusing local rerun (exit 124).');
+function failedTestReport(stdout, options) {
+  if (typeof stdout !== 'string' || Buffer.byteLength(stdout) > 8 * 1024 * 1024) throw testFailure();
+  const failed = new Set();
+  let leaf = 0, diagnostic, inTap = false;
+  // Reuse the strict TAP plan and typed-test-count validator. Normalize only red
+  // statuses/diagnostics for validation, then restore the observed failed leaves.
+  const normalized = stdout.replace(/\r\n/g, '\n').split('\n').flatMap(line => {
+    if (line === 'TAP version 13') inTap = true;
+    if (/^(?: Test Files|  Snapshots)  /.test(line)) inTap = false;
+    if (diagnostic !== undefined) {
+      if (line === `${diagnostic}...`) diagnostic = undefined;
+      return [];
+    }
+    const yaml = inTap && /^( +)---$/.exec(line);
+    if (yaml) { diagnostic = yaml[1]; return []; }
+    const task = inTap && /^\s*(not )?ok \d+ - /.exec(line);
+    if (task && !line.endsWith(' {')) {
+      if (task[1]) failed.add(leaf);
+      leaf++;
+    }
+    if (line.startsWith('      Tests  ')) {
+      const summary = /^      Tests  (.+) \((\d+)\)$/.exec(line);
+      if (!summary) throw testFailure();
+      let passed = 0;
+      const pending = [];
+      for (const part of summary[1].split(' | ')) {
+        const count = /^(\d+) (passed|failed|skipped|todo)$/.exec(part);
+        if (!count) throw testFailure();
+        if (['passed', 'failed'].includes(count[2])) passed += Number(count[1]);
+        else pending.push(part);
+      }
+      return [`      Tests  ${[...(passed ? [`${passed} passed`] : []), ...pending].join(' | ')} (${summary[2]})`];
+    }
+    return [line.replace(/^(\s*)not ok /, '$1ok ')];
+  }).join('\n');
+  if (diagnostic !== undefined || !failed.size) throw testFailure();
+  const report = heavyTestReport(normalized, options);
+  report.testResults.flatMap(r => r.assertionResults).forEach((assertion, index) => {
+    if (failed.has(index)) {
+      if (assertion.status !== 'passed') throw testFailure();
+      assertion.status = 'failed';
+    }
+  });
+  return report;
+}
+async function syncTestEvidence({ root, scratch, selected, testReport, env, io, runner }) {
+  io.rmSync(testReport, { force: true }); // Never consume a previous attempt's evidence.
+  const invocation = buildHeavyTestInvocation({ root, scratch, selected, testReport, env, io });
+  const result = await (runner ?? (async options => {
+    const result = await runHeavyTests(options, { io });
+    if (result?.status === 1 && !result.error) {
+      try {
+        io.writeFileSync(testReport, JSON.stringify(failedTestReport(result.stdout,
+          { ...options, root: io.realpathSync(scratch) })));
+      } catch { /* No trustworthy inventory: retain the command failure below. */ }
+    }
+    return result;
+  }))(invocation);
+  if (remoteUnconfirmed(result)) return { remoteUnconfirmed: true };
+  const commandOk = result?.status === 0 && !result.error && typeof result.stdout === 'string';
+  let report;
+  try {
+    if (io.statSync(testReport).size > 8 * 1024 * 1024) throw new Error('test report over 8 MiB; operator review required');
+    report = JSON.parse(io.readFileSync(testReport, 'utf8'));
+  } catch (error) {
+    if (!commandOk) output({ ...result, step: 'tests' });
+    throw error;
+  }
+  const results = report?.testResults;
+  if (!Array.isArray(results)) throw testFailure();
+  const names = selected.map(file => join(io.realpathSync(scratch), file));
+  const failed = [], passed = [];
+  for (let i = 0; i < selected.length; i++) {
+    const matches = results.filter(r => r?.name === names[i]);
+    if (matches.length !== 1) continue;
+    const r = matches[0], assertions = r.assertionResults;
+    if (!Array.isArray(assertions) || !assertions.length
+      || assertions.some(a => !['passed', 'failed'].includes(a?.status))) continue;
+    if (assertions.some(a => a.status === 'failed')) failed.push(selected[i]);
+    else if (r.status !== 'failed') passed.push(selected[i]);
+  }
+  const complete = passed.length + failed.length === selected.length
+    && results.length === selected.length && results.every(r => names.includes(r?.name));
+  const green = commandOk && complete && !failed.length && report.success !== false
+    && !(report.numFailedTests > 0) && !(report.numFailedTestSuites > 0);
+  if (!commandOk && !(result?.status === 1 && !result.error && complete && failed.length)) {
+    output({ ...result, step: 'tests' });
+  }
+  return { green, failed, complete };
+}
 export async function runOverlayMainSync({ root, ref, token, env = process.env, deps = {} }) {
   const io = deps.io ?? fs, event = deps.appendOverlayEvent ?? appendOverlayEvent;
   const now = deps.now ?? (() => new Date().toISOString());
@@ -504,27 +608,46 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     // forced every scratch test run back onto the Mac. A local clone is cheap (hardlinked objects) and committed-only.
     if (io.existsSync(frontier)) output(git(['clone', '--quiet', '--local', frontier, join(scratchParent, 'frontierui')], scratchParent));
     setStep('tests');
+    const reruns = resolveOverlayFlakeReruns(env).value;
     for (let offset = 0; offset < tests.length; offset += 50) {
       const chunk = tests.slice(offset, offset + 50);
-      const reportFile = join(scratchParent, `tests-${offset / 50}.json`);
-      const invocation = buildHeavyTestInvocation({ root, scratch, selected: chunk, testReport: reportFile, env, io });
-      const result = await (deps.testRunner ?? (o => runHeavyTests(o, { io })))(invocation);
+      const check = (selected, attempt, tree = scratch, runner = deps.testRunner) => syncTestEvidence({
+        root, scratch: tree, selected, env, io, runner,
+        testReport: join(scratchParent, `tests-${offset / 50}-${attempt}.json`) });
+      let evidence = await check(chunk, 'initial');
       // The remote process may still be running: neither publication nor a local rerun is safe.
-      if (result?.status === 124 && typeof result.stderr === 'string'
-        && result.stderr.includes('remote termination unconfirmed; refusing local rerun (exit 124).')) {
-        return await skip('remote-termination-unconfirmed');
+      if (evidence.remoteUnconfirmed) return await skip('remote-termination-unconfirmed');
+      if (evidence.green) continue;
+      if (!reruns || !evidence.complete || !evidence.failed.length) throw testFailure();
+      const retried = [...evidence.failed];
+      let remaining = retried;
+      for (let attempt = 0; attempt < reruns; attempt++) {
+        evidence = await check(remaining, attempt);
+        if (evidence.remoteUnconfirmed) return await skip('remote-termination-unconfirmed');
+        if (evidence.green || !evidence.complete || !evidence.failed.length) break;
+        remaining = evidence.failed;
       }
-      output({ ...result, step });
-      if (io.statSync(reportFile).size > 8 * 1024 * 1024) throw new Error('test report over 8 MiB; operator review required');
-      const report = JSON.parse(io.readFileSync(reportFile, 'utf8'));
-      const results = report.testResults ?? [];
-      const executed = new Set(results.filter(r => Array.isArray(r.assertionResults)
-        && r.assertionResults.length && r.assertionResults.every(a => a.status === 'passed')).map(r => r.name));
-      if (report.success === false || report.numFailedTests > 0 || report.numFailedTestSuites > 0 || results.some(r => r.status === 'failed'
-        || !Array.isArray(r.assertionResults) || !r.assertionResults.length || r.assertionResults.some(a => a.status !== 'passed'))
-        || chunk.some(f => !executed.has(join(io.realpathSync(scratch), f)))) {
-        throw new Error('selected tests did not pass or execute; operator review required');
+      if (evidence.green) {
+        event(root, { kind: 'overlay-main-flaky-retried', ref, files: retried }, { env });
+        continue;
       }
+      let mainRed = false;
+      try {
+        const mainScratch = join(scratchParent, `main-${offset / 50}`);
+        output(git(['clone', '--shared', '--no-checkout', scratch, mainScratch]));
+        output(git(['checkout', '--force', '--detach', main], mainScratch, [], { timeout: 300_000 }));
+        io.appendFileSync(join(mainScratch, '.git', 'info', 'exclude'), '\n/node_modules\n');
+        io.symlinkSync(join(root, 'node_modules'), join(mainScratch, 'node_modules'), 'dir');
+        const comparison = await check(remaining, 'main', mainScratch, deps.mainTestRunner ?? null);
+        mainRed = evidence.complete && evidence.failed.length === remaining.length
+          && comparison.complete && comparison.failed.length === remaining.length;
+      } catch { /* Unknown main evidence must retain the ordinary operator-review failure. */ }
+      setStep('tests');
+      if (mainRed) {
+        event(root, { kind: 'overlay-main-red', ref, files: remaining }, { env });
+        return await skip('main-red');
+      }
+      throw testFailure();
     }
     setStep('verify');
     const current = readOverlayState(root, { env });
