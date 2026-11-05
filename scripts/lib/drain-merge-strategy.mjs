@@ -453,7 +453,10 @@ export function createDrainMergeStrategy({
           // (all read by redTeamEnqueueHold above), or a card-only diff that owes no pass. Never a timed bypass.
           const maxMin = safety.value.redTeamPendingMaxMin ?? 45;
           const source = deadline.sources?.deadlineAction ?? 'standard';
-          const missing = !evidence.inFlight && !evidence.queued && !evidence.recorded;
+          // Unknown run evidence (`ok:false`, e.g. a capped scan) is never "missing": a run may exist past the cap, so
+          // it neither re-requests nor reaches the operator override; it holds below with its reason named.
+          const unknown = evidence.ok === false;
+          const missing = !unknown && !evidence.inFlight && !evidence.queued && !evidence.recorded;
           if (missing && deadlineAction === 'requeue-then-hold') {
             // The one re-request for this head gets its own full wait before the operator is asked.
             if (wait.requestedAt != null && now() - wait.requestedAt < maxMin * 60_000) return outcome;
@@ -480,7 +483,7 @@ export function createDrainMergeStrategy({
             const why = missing ? (wait.requestedAt != null ? 'still none after one re-request'
               : wait.requestAttemptedAt != null ? 'the one re-request was not accepted'
               : deadlineAction === 'hold' ? 'redTeam.deadlineAction=hold' : 'no red-team request path')
-              : evidence.inFlight ? 'run still in flight' : evidence.queued ? 'run still queued' : 'run left no usable result';
+              : unknown ? `run evidence unknown (${evidence.reason})` : evidence.inFlight ? 'run still in flight' : evidence.queued ? 'run still queued' : 'run left no usable result';
             const heldReason = `held: no red-team result on this head after ${Math.floor((now() - wait.firstPendingAt) / 60_000)} min (${why})`;
             if (wait.deadlineHeldAt == null) {
               wait.deadlineHeldAt = now();
