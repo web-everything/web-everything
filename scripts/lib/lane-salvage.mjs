@@ -496,6 +496,13 @@ function nestedGitdir(repoDir) {
   }
   if (!statSync(target).isDirectory()) throw new Error(`nested repo ${repoDir}: gitdir ${target} is not a directory — not salvaging`);
   target = realpathSync(target);
+  // The pointer is lane-written text: refuse a target that is not shaped like a git dir (HEAD plus either
+  // objects/+refs/ or a `commondir` for a linked worktree) so `gitdir: /` or `gitdir: ~/.ssh` is never copied.
+  const isDir = (p) => { try { return statSync(p).isDirectory(); } catch { return false; } };
+  const hasHead = existsSync(join(target, 'HEAD'));
+  if (!hasHead || !((isDir(join(target, 'objects')) && isDir(join(target, 'refs'))) || existsSync(join(target, 'commondir')))) {
+    throw new Error(`nested repo ${repoDir}: gitdir ${target} does not look like a git directory — not salvaging`);
+  }
   const root = realpathSync(repoDir);
   const external = !(target === root || target.startsWith(root + sep));
   return { dir: target, external, rel: external ? null : relative(root, target) };

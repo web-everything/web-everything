@@ -440,10 +440,13 @@ describe('salvageLane (real git)', () => {
     expect(() => externalGitdir(notDir)).toThrow(/not a directory/);
     const real = mk('real'); git(real, 'init', '-q');
     expect(externalGitdir(real)).toBeNull();
-    const inTree = mk('intree'); mkdirSync(join(inTree, 'meta')); writeFileSync(join(inTree, '.git'), 'gitdir: meta\n');
+    const inTree = mk('intree'); git(inTree, 'init', '-q', '--separate-git-dir=meta', '.'); rmSync(join(inTree, '.git'), { force: true }); writeFileSync(join(inTree, '.git'), 'gitdir: meta\n');
     expect(externalGitdir(inTree)).toBeNull();
-    const outside = mk('outside'); const od = mk('outside-db'); writeFileSync(join(outside, '.git'), 'gitdir: ../outside-db\n');
-    expect(externalGitdir(outside)).toBe(realpathSync(od));
+    // A pointer at a directory that is not a git dir (the lane-written text could name `/` or ~/.ssh) is refused.
+    const bogus = mk('bogus'); mk('bogus-target'); writeFileSync(join(bogus, '.git'), 'gitdir: ../bogus-target\n');
+    expect(() => externalGitdir(bogus)).toThrow(/does not look like a git directory/);
+    const outside = mk('outside'); const od = mk('outside-db'); git(od, 'init', '-q'); writeFileSync(join(outside, '.git'), `gitdir: ${join(od, '.git')}\n`);
+    expect(externalGitdir(outside)).toBe(realpathSync(join(od, '.git')));
   });
 
   it('copies an untracked unborn nested repo verbatim while snapshotting normal changes without touching the real index', () => {
