@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest';
 import {
   CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, breakClass, gateOutcomeForHead, gateOutcomesForHead, parseRedTeamComment, planRedTeamActions,
   resolveRedTeamProbes, redTeamForHead, gateRoundCap, sendBackStepState, redTeamGateMarker, redTeamQueueReason, redTeamRulingNeeded, resolveConfirmedBreaks, readRedTeamDisposition,
-  liveResultGateState, redTeamResultId,
+  liveResultGateState, redTeamResultId, classOnlyCards, parseRedTeamGateMarker,
 } from '../red-team-gate.mjs';
 import { buildReviewedShaMarker, buildClearedHumanMarker } from '../review-escalation.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
@@ -450,7 +450,7 @@ describe('finding class gate', () => {
     const parsed = parseRedTeamComment(body);
     const allowed = { ...classSetting, findingClasses: { 'security-reachable-today': 'defer-card', allowSecurityDefer: true } };
     expect(planRedTeamActions(parsed, allowed).card).toHaveLength(1);
-    const comments = [bot(body), bot(`${redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.CARD_QUEUED, redTeamResultId(parsed))}\n- 1 finding(s) filed as a follow-up card (#1).`)];
+    const comments = [bot(body), bot(`${redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.CARD_QUEUED, redTeamResultId(parsed), null, classOnlyCards(planRedTeamActions(parsed, allowed).card, allowed).map(f => f.index))}\n- 1 finding(s) filed as a follow-up card (#1).`)];
     const read = (thread, setting) => readRedTeamDisposition({ comments: thread, pr: 4722, head: HEAD, setting, env: {} });
     expect(read(comments, allowed)).toMatchObject({ sendBack: [], held: [] });
     const revoked = { ...allowed, findingClasses: { ...allowed.findingClasses, allowSecurityDefer: false } };
@@ -468,6 +468,26 @@ describe('finding class gate', () => {
     const comments = [bot(body), bot(`${redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.CARD_QUEUED, redTeamResultId(parsed))}\n- 1 finding(s) filed as a follow-up card (#1).`)];
     expect(readRedTeamDisposition({ comments, pr: 4722, head: HEAD, setting: classSetting, env: {} }))
       .toMatchObject({ sendBack: [], held: [] });
+  });
+  it('preserves a classified ordinary-policy card when ordinary policy later sends back', () => {
+    const body = deferredBody().replace('edge-case, broken)', 'edge-case, degraded)');
+    const parsed = parseRedTeamComment(body);
+    const cardSetting = { ...CONFIRMED_BREAKS_DEFAULTS, degraded: 'card', findingClasses: { 'theoretical-race': 'fix-now' } };
+    const f = parsed.findings[0];
+    expect(f.impact).toBe('degraded');
+    expect(planRedTeamActions({ findings: [f] }, cardSetting).card).toEqual([f]);
+    expect(classOnlyCards([f], cardSetting)).toEqual([]);
+    const marker = redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.CARD_QUEUED, redTeamResultId(parsed), null, classOnlyCards([f], cardSetting).map(x => x.index));
+    expect(marker).not.toContain('class=');
+    const comments = [bot(body), bot(`${marker}\n- 1 finding(s) filed as a follow-up card (#1).`)];
+    expect(readRedTeamDisposition({ comments, pr: 4722, head: HEAD, setting: { ...cardSetting, degraded: 'send-back' }, env: {} }))
+      .toMatchObject({ sendBack: [], held: [] });
+  });
+  it('round-trips the class-only card indices on the gate marker', () => {
+    const marker = redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.CARD_QUEUED, '0123456789abcdef', null, [3, 1, 3]);
+    expect(marker).toContain(' class=1,3 -->');
+    expect(parseRedTeamGateMarker(marker)).toMatchObject({ outcome: 'card-queued', classCards: [1, 3] });
+    expect(parseRedTeamGateMarker(redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.CARD_QUEUED, '0123456789abcdef')).classCards).toBeUndefined();
   });
   it('cards deferred findings without a send-back or admission hold or operator ruling', () => {
     const parsed = parseRedTeamComment(deferredBody());
@@ -492,6 +512,12 @@ describe('finding class gate', () => {
     expect(planRedTeamActions(parsed, { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses: { 'theoretical-race': 'fix-now' } }).sendBack).toHaveLength(1);
     delete parsed.findings[0].classBasis;
     expect(planRedTeamActions(parsed, classSetting).sendBack).toHaveLength(1);
+  });
+  it('rekeys v3 results when only findingClass changes', () => {
+    const a = parseRedTeamComment(deferredBody());
+    const b = parseRedTeamComment(deferredBody().replace('Class: theoretical-race', 'Class: coverage-or-style'));
+    expect(a.findings[0].classBasis).toBe(b.findings[0].classBasis);
+    expect(redTeamResultId(a)).not.toBe(redTeamResultId(b));
   });
   it('keeps old v1/v2 result ids and keys class and basis only in v3', () => {
     const parsed = parseRedTeamComment(BODY_4722);

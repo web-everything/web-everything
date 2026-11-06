@@ -184,5 +184,6 @@ describe('operator-only findingClasses', () => {
     const policy = { 'theoretical-race': 'defer-card', allowSecurityDefer: true };
     expect(cascadePolicy('findingClasses', policy, { platform: {}, envValues: policy, env: {} }).value).toEqual({});
     expect(resolveCascade({ standard: {}, tool: { findingClasses: policy }, envValues: { findingClasses: policy } }).value).toEqual({});
+    expect(resolveCascade({ standard: {}, envValues: { '': { findingClasses: policy } } }).value).toEqual({});
   });
 });
