@@ -470,7 +470,7 @@ acknowledgement — and the resume message tells you which branch you are on:
 and never push `{{LANE_REF}}` yourself. `red` (exit 2) → the failing tests are in the message: repair, commit,
 `request`, `mark` again with `--attempt=<n+1>`, and end your turn; on the third red the message tells you to take
 the gate-red hard stop below. A red the gate classifies as load-only → the message tells you to take the load-flake
-exit below. `infrastructure-failure` or no verdict → the harness re-requests on its own; after repeated failures
+exit below. The harness defers timeout-only reds under high host load and re-verifies when quiet, up to `verify.loadRetry.maxAttempts`. `infrastructure-failure` or no verdict → the harness re-requests on its own; after repeated failures
 the message tells you to report the stalled request with the blocked-on-infra exit (the signal/ceiling evidence,
 without claiming a test failure). A moved or dirty lane → re-commit, `request`, `mark` again.
 
