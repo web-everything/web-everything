@@ -96,8 +96,14 @@ export function reviewRunEvidence(run) {
   const attempted = new Set(records
     .filter(r => r?.repo === read.repo && r.pr === Number(read.pr) && r.head === head && r.attempted)
     .flatMap(r => r.referrals.map(f => f.key)));
+  let ciHeld = false;
+  try {
+    ciHeld = Array.isArray(run.effects) && run.effects.some(e => e?.type === 'review.label-swap'
+      && e.status === 'failed' && typeof e.error === 'string' && /CI still pending on reviewed head/.test(e.error));
+  } catch { /* unreadable effects cannot establish a CI-held publish */ }
   return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt,
     quotaOnly,
+    ...(ciHeld ? { ciHeld: true } : {}),
     ...(resumeAdvise ? { resumeAdvise: true } : {}),
     parked: verdict?.verdict === 'needs-human' && pending.length > 0,
     // A list of only reason tokens names no referral, so it was never "attempted" (not vacuously true).
@@ -359,6 +365,8 @@ export function resolveNoVerdictRetry(env = process.env, { tool } = {}) {
 }
 /** A just-finished run gets this long for its verdict write-back to show up in the (cached) PR listing. */
 export const VERDICT_GRACE_MS = 10 * 60_000;
+/** CI-held publishes that do not spend a no-verdict retry, per head. */
+export const CI_HELD_FREE_RUNS = 4;
 const VERDICT_LABELS = ['review:accepted', 'review:changes', 'review:human'];
 
 /**
@@ -394,7 +402,13 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   const noVerdict = verdictNeverLanded(pr, last, now);
   // Normal same-head and referral holds still require completed panels. A no-verdict retry spends its
   // budget as soon as read identifies the head, even if the process dies before advise can finish.
-  const attempts = history.filter(r => r.startedAt >= wake && (noVerdict || Number.isFinite(r.completedAt)));
+  // Waiting for CI to publish is transient and does not spend a lost write-back retry.
+  // Bounded: only the first CI_HELD_FREE_RUNS such runs are free, so a head whose CI never settles still reaches the cap.
+  let ciHeldFree = 0;
+  const attempts = history.filter(r => {
+    if (!(r.startedAt >= wake && (noVerdict || Number.isFinite(r.completedAt)))) return false;
+    return !(noVerdict && r.ciHeld && ciHeldFree++ < CI_HELD_FREE_RUNS);
+  });
   const count = attempts.length;
   if (count < max) return null;
   if (noVerdict && count < max + VERDICT_RETRY_EXTRA) return null;
