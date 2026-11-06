@@ -2390,6 +2390,14 @@ Exhaustion is logged once and retains the infrastructure wait for operator recov
 it never creates a new fixer. Probe restart persistence, write failure, head movement,
 and both terminal verdicts with the pass's injected ports.
 
+Timeout-only fix reds under high host load wait for a quiet host before a same-head
+reverify. `verify.loadRetry.maxAttempts` defaults to 3 through the policy cascade;
+`WE_VERIFY_LOAD_RETRY_MAX_ATTEMPTS` supplies the environment override. Its counter
+is persisted before requesting and does not consume ordinary retries.
+Missing per-test timeout evidence, assertions, truncated inventories, low load on first
+observation, and exhaustion retain the normal red/escalation path. Inject `loadHigh`
+to probe both transitions, write failure, and the unchanged no-push kinds.
+
 `verify.gateCeiling` defaults to `load-scaled`, using rebuild smoke's bounded load/core
 factor; `fixed` restores 30 minutes. `VERIFY_DISPATCH_TIMEOUT_MS` is an absolute override.
 The gate job records the same resolved budget its supervisor used; admission waits
