@@ -130,6 +130,23 @@ describe('R618 pushed fix owes its review', () => {
     const comments = [{ body: 'earlier discussion' }, advisory(OLD), { body: 'thread bookkeeping' }, end()];
     expect(run({ comments }).dispatch).toEqual([expect.objectContaining({ kind: 'review' })]);
   });
+  // One named case per cited incident (#6360, #6378, #6346). These are MODELS of the thread shapes the review raised
+  // (plain advisory + fix-end; short-SHA review basis; full verdict with no review:human), not recorded replays of the
+  // live threads. A live thread with a different shape is not defended by these tests.
+  describe('incident shapes', () => {
+    it('#6360: advisory:changes + review:human, fix-end on a new head, owes a review', () => {
+      expect(run().dispatch).toEqual([expect.objectContaining({ kind: 'review', headRefOid: HEAD })]);
+    });
+    it('#6378: a short-SHA review basis and a fix-end on a new head still owe a review', () => {
+      const short = OLD.slice(0, 9);
+      expect(run({ comments: [advisory(short), end()] }).dispatch).toEqual([expect.objectContaining({ kind: 'review' })]);
+    });
+    it('#6346: a bounced head whose full verdict has no review:human label owes a review after the fix-end', () => {
+      const verdict = { author, createdAt: REVIEW_AT,
+        body: `🔁 review — changes requested\n\nRecorded by agent via ${REVIEW_PR_CHANNEL}.\n\nRepair the export.\n\n---\n\nNet basis: \`${'c'.repeat(40)}..${OLD}\` — 1 net changed file(s) vs current main\n\n${REVIEW_PR_FOOTER}` };
+      expect(run({ labels: ['review:changes'], comments: [verdict, end()] }).dispatch[0]?.kind).toBe('review');
+    });
+  });
 });
 
 describe('R618 same-head operator send-back supersedes a finished advisory', () => {

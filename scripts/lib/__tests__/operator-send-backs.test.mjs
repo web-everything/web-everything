@@ -373,4 +373,38 @@ describe('quoted and fenced references never resolve an operator request', () =>
     const closed = `${release}\`\`\`\n   \`\`\`\n<!-- addresses-operator-send-back: 1001 -->\n`;
     expect(open([request, comment('end', 'web-everything', '21:00', closed)])).toEqual([]);
   });
+  // CommonMark: a closing fence is indented 0-3 columns whatever the opener's own indent; a list item's content column is
+  // the one exception, so the allowance there is measured from the item's text. Unclosed means the marker stays hidden.
+  it.each([
+    ['plain opener, 0 spaces', '', 4],
+    ['plain opener, 1 space', ' ', 4],
+    ['plain opener, 2 spaces', '  ', 5],
+    ['plain opener, 3 spaces', '   ', 4],
+    ['plain opener, 3 spaces, closer 6 spaces', '   ', 6],
+  ])('an indented opener does not widen the closer: %s', (_name, opener, closerIndent) => {
+    const body = `${release}${opener}\`\`\`\n${' '.repeat(closerIndent)}\`\`\`\n<!-- addresses-operator-send-back: 1001 -->\n`;
+    expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual(['1001']);
+  });
+  it.each([
+    ['plain opener, 3 spaces, closer 3 spaces', '   ', 3],
+    ['plain opener, 1 space, closer 0 spaces', ' ', 0],
+  ])('an indented opener still closes on a valid closer: %s', (_name, opener, closerIndent) => {    const body = `${release}${opener}\`\`\`\n${' '.repeat(closerIndent)}\`\`\`\n<!-- addresses-operator-send-back: 1001 -->\n`;
+    expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual([]);
+  });
+  it('a list-item fence closes at its own content column', () => {
+    const body = `${release}- \`\`\`\n  example\n  \`\`\`\n<!-- addresses-operator-send-back: 1001 -->\n`;
+    expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual([]);
+  });
+  it('html-block stripping stays linear on adversarial inline-code and tag input', () => {
+    // One long backtick run made the old inline-code regex quadratic (60k backticks took ~2s); tags without ">" and
+    // deeply nested openers exercise the tag scan.
+    const longRun = '`'.repeat(200000);
+    const distinct = Array.from({ length: 700 }, (_v, i) => '`'.repeat(i + 1)).join(' ');
+    const tags = '<pre '.repeat(40000), nested = '<pre><blockquote>'.repeat(20000);
+    for (const hostile of [longRun, distinct, tags, nested, `${longRun} ${tags}`]) {
+      const start = Date.now();
+      open([request, comment('fix', 'web-everything', '21:00', `## Fix evidence\nHead: \`${B}\`\n${hostile}\n<!-- addresses-operator-send-back: 1001 -->`)]);
+      expect(Date.now() - start).toBeLessThan(1500);
+    }
+  });
 });
