@@ -171,7 +171,7 @@ function isNonBlockingRedTeamGate(text) {
   const gate = parseRedTeamGateMarker(text);
   if (!gate || ![GATE_OUTCOMES.NOTHING_TO_SEND, GATE_OUTCOMES.CARD_QUEUED].includes(gate.outcome)) return false;
   const lines = text.split('\n');
-  if (lines[0] !== redTeamGateMarker(gate.pr, gate.rev, gate.outcome, gate.result, gate.grantIds)
+  if (lines[0] !== redTeamGateMarker(gate.pr, gate.rev, gate.outcome, gate.result, gate.grantIds, gate.classCards)
     || lines[1] !== `**Red-team gate** (setting \`redTeam.confirmedBreaks\`, card x1b8hlo) on head \`${gate.rev.slice(0, 12)}\`:`) return false;
   // Only successful card/advisory action lines. Landing handles are machine tokens, never free prose.
   const card = /^- [1-9]\d* finding\(s\) filed as a follow-up card \(#[1-9]\d*(?:, #[1-9]\d*)*\) — landing job [A-Za-z0-9:._-]{0,120}\.$/;

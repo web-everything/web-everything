@@ -3,9 +3,10 @@ bornAs: xf81nsn
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:scripts/lib/enqueue-on-event.mjs", "we:scripts/lib/__tests__/enqueue-on-event.test.mjs"]
 dateOpened: "2026-10-14"
+dateResolved: "2026-11-06"
 tags: []
 ---
 
