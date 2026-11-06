@@ -1,6 +1,6 @@
 /**
  * LIVE: #6418, #6414, #6193, #6345 — pending survives when the daemon declines a red team.
- * Replay the production skip runner and its bounded run scanners with injected evidence and IO.
+ * Replay the production skip runner with its refusal guards with injected evidence and IO.
  * No processes, network, or persisted run state; production modules always come from sourceRoot.
  */
 import { join, resolve } from 'node:path';
@@ -28,13 +28,12 @@ export default {
         violations.push(`recovery module import failed: ${error.message ?? error}`);
         return { violations };
       }
-      const required = ['runRedTeamOnSkip', 'ignorableConfirmRunIds', 'headNeverReviewedFromRuns'];
+      const required = ['runRedTeamOnSkip'];
       check(required.every(name => typeof recovery[name] === 'function'), 'recovery module missing required replay exports');
       if (violations.length) return { violations };
-      const { runRedTeamOnSkip, ignorableConfirmRunIds, headNeverReviewedFromRuns } = recovery;
+      const { runRedTeamOnSkip } = recovery;
       const { renderRedTeamComment } = await load('scripts/operations/review-extra-seats.mjs');
       const { CONSTELLATION_REPOS } = await load('scripts/lib/constellation-repos.mjs');
-      const { RUN_MTIME_SLACK_MS } = await load('scripts/lib/drain-red-team-evidence.mjs');
       const repo = CONSTELLATION_REPOS.we.slug, pr = 6418;
       const head = 'a'.repeat(40), old = 'b'.repeat(40);
       const acceptedAt = Date.parse('2026-10-25T12:00:00Z');
@@ -44,21 +43,11 @@ export default {
         findings: { read: { netBasis: { rev: head } } } });
       const evidence = over => ({ loopPayload: payload(), inFlight: false, queued: false,
         recorded: false, seatRecorded: false, ...over });
-      const panelAt = acceptedAt - 10_000;
-      const acceptingPanel = { op: 'review-pr', input: { repo, pr }, ...payload(), pending: null, effects: [],
-        stepTimings: [{ step: 'read', startedAt: new Date(panelAt).toISOString() }] };
-      const confirm = (at = panelAt - RUN_MTIME_SLACK_MS - 1) => ({ op: 'review-pr', input: { repo, pr },
-        verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' }, effects: [],
-        findings: { read: { netBasis: { rev: head } } },
-        stepTimings: [{ step: 'read', startedAt: new Date(at).toISOString() }] });
       const unfinished = { ok: false, reason: 'review-unfinished' };
       const replay = (name, over = {}) => {
         const calls = { pending: [], sync: [], escalate: [], dispatch: [], settle: [] };
         const raw = { number: pr, state: 'OPEN', headRefOid: head,
           labels: ['review:accepted', 'red-team:pending'], comments: [accept], reviews: [], ...over.raw };
-        const records = over.records ?? {};
-        const scanIO = { runsDir: 'soak-runs', list: () => Object.keys(records),
-          read: id => records[id], stat: () => ({ mtimeMs: panelAt - RUN_MTIME_SLACK_MS - 1 }) };
         const out = runRedTeamOnSkip({ repo, env: {},
           plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] }, rawPrs: [raw],
           setting: { enabled: true, retryCooldownMin: 30 }, now: () => acceptedAt + 10_000,
@@ -67,12 +56,6 @@ export default {
           readWitness: null, readCarry: () => null, readReviews: () => [], readComments: () => raw.comments,
           provider: { readPrState: () => raw, setLabels: () => { throw Error('unexpected direct label write'); } },
           proveMove: () => ({ ok: false }),
-          readIgnorableConfirms: ({ rawPr, ...key }) => {
-            const result = ignorableConfirmRunIds({ ...key, ...scanIO, comments: rawPr.comments,
-              labels: rawPr.labels, reviews: rawPr.reviews, now: acceptedAt + 10_000 });
-            return result;
-          },
-          headNeverReviewed: key => headNeverReviewedFromRuns({ ...key, ...scanIO }),
           settlePending: key => {
             calls.pending.push(key);
             raw.labels = raw.labels.filter(label => !key.remove.includes(label));
@@ -140,17 +123,11 @@ export default {
       effects(conflict, { escalate: 1 });
       check(conflict.row?.escalate === true && conflict.raw.labels.length === 3, 'real conflict was removed instead of escalated');
 
-      const oldConfirm = replay('old confirm superseded by acceptance', {
-        records: { 'review-pr-confirm': confirm(), 'review-pr-accepting-panel': acceptingPanel },
-        readEvidence: ({ ignoreRunIds = [] }) => ignoreRunIds.includes('review-pr-confirm') ? evidence() : unfinished,
-      });
-      effects(oldConfirm, { dispatch: 1 });
-      check(oldConfirm.row?.action === 'dispatch' && oldConfirm.calls.dispatch[0]?.redTeamOnly === true
-        && oldConfirm.calls.dispatch[0]?.redTeamMode === 'fresh', 'old confirm still blocked the owed red team');
-      const never = replay('head never reviewed', { raw: { labels: ['review:accepted'] }, readEvidence: () => unfinished });
-      effects(never, { escalate: 1 });
-      check(never.row?.action === 'skip' && never.row?.why === 'review-unfinished' && never.row?.escalate === true,
-        'never-reviewed head bypassed unfinished review evidence');
+      const held = replay('review-unfinished escalates, never dispatches', { readEvidence: () => unfinished });
+      effects(held, { escalate: 1 });
+      check(held.row?.action === 'skip' && held.row?.why === 'review-unfinished' && held.row?.escalate === true
+        && held.row?.escalationContext === 'review-unfinished: an unfinished review run holds this head; a human must answer or cancel the pending confirmation'
+        && held.raw.labels.includes('red-team:pending'), 'unfinished review lost its hold or was not escalated');
 
       for (const [name, options, why] of [
         ['owed review in flight', { readEvidence: () => evidence({ inFlight: true }) }, 'red-team pass in flight'],
@@ -159,9 +136,7 @@ export default {
           completedRecorded: true }), status: { status: 'finished', result: { status: 'ran', comment: 'posted',
           foldedVerdict: 'changes', findings: [{ summary: 'confirmed break', confirmedByRecheck: true }] } } },
         'result posted; comment not visible yet'],
-        ['newer unfinished review', { records: { 'review-pr-old': confirm(), 'review-pr-new': confirm(acceptedAt + 1),
-          'review-pr-accepting-panel': acceptingPanel },
-          readEvidence: () => unfinished }, 'review-unfinished'],
+        ['newer unfinished review', { readEvidence: () => unfinished }, 'review-unfinished'],
       ]) {
         const control = replay(name, options);
         effects(control, name === 'newer unfinished review' ? { escalate: 1 } : {});

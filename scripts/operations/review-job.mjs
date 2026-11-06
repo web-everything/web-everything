@@ -9,7 +9,7 @@ import { reviewUsesRequiredChecks } from '../lib/review-timing.mjs';
 import { speculativeSeatTimings } from '../lib/review-speculative-red-team.mjs';
 import { resolveFinalHeadSeats, decideFinalHeadSeats } from '../lib/review-final-head-seats.mjs';
 import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
-import { readRun, writeRun, listRunIds, sharedRunsDir } from './run-store.mjs';
+import { readRun, writeRun } from './run-store.mjs';
 import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.mjs';
 /**
  * @file scripts/operations/review-job.mjs
@@ -93,7 +93,7 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
 import { liveResultGateState, readRedTeamProbes, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
-import { readCompletePrReviews, revalidatedConfirmList, ignorableConfirmRunIds, planRedTeamRecovery, recoveryProbe as defaultRecoveryProbe, staleRunDeadlineMs, normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
+import { planRedTeamRecovery, recoveryProbe as defaultRecoveryProbe, staleRunDeadlineMs, normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
 import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { createRedTeamCarryIo } from '../lib/red-team-carry-io.mjs';
@@ -102,7 +102,7 @@ import { RED_TEAM_STATUS_LABEL_META } from '../lib/red-team-status-label-meta.mj
 import { publishAttention } from './needs-you-feed.mjs';
 
 import { randomUUID } from 'node:crypto';
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -311,8 +311,6 @@ export function execReadRaw(file, args, options = {}) {
 
 /** The real effects, each one command. `root` is the checkout the arc runs from (the daemon's clone). */
 export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execReadRaw, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence,
-  readCompleteReviews, readReviews,
-  listReviewRuns = listRunIds, readReviewRun = readRun, statReviewRun = statSync,
   readSeatRecords = () => createRedTeamIo({ root, env }).readRecords({ strict: true }),
   readWitness = key => readRecoveryWitness({ ...key, env, readScorecards: readSeatRecords }), recoveryProbe = defaultRecoveryProbe(),
   queueBaseline = () => resolveLiveQueueBaseline({ checkoutRoot: root, env }),
@@ -461,27 +459,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       return { head };
     },
     readRedTeamOnlyPayload: ({ pr, repo, head }) => {
-      let w = readWitness({ pr, repo, head });
-      if (w?.ok === false && w.reason === 'review-unfinished') {
-        try {
-          const state = provider.readPrState(repo, pr);
-          if (state.headRefOid === head) {
-            const runsDir = env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(env);
-            const reviews = readCompleteReviews ? readCompleteReviews({ repo, pr })
-              : isUnderTest() || isUnderTest(env) ? readReviews?.({ repo, pr })
-                : readCompletePrReviews({ repo, pr, env });
-            if (!Array.isArray(reviews)) throw Error('complete PR reviews unreadable; inspect unfinished review evidence');
-            const confirms = ignorableConfirmRunIds({ repo, pr, head, env, runsDir, list: listReviewRuns, read: readReviewRun, stat: statReviewRun,
-              comments: readComments({ repo, pr }), labels: state.labels,
-              reviews });
-            if (confirms.ok && confirms.ids.length) {
-              w = readWitness({ pr, repo, head, runsDir,
-                list: revalidatedConfirmList({ repo, pr, head, ignoreRunIds: confirms.ids, acceptedAt: confirms.acceptedAt,
-                  list: listReviewRuns, read: readReviewRun, stat: statReviewRun }) });
-            }
-          }
-        } catch { /* Retain the original unfinished witness on unreadable state. */ }
-      }
+      const w = readWitness({ pr, repo, head });
       if (w?.ok === false) throw Error(`red-team evidence ${w.reason}; hold and inspect run evidence`);
       if (w?.carryEvidence?.ok === false) throw Error(`red-team evidence ${w.carryEvidence.reason}; hold and inspect run evidence`);
       const legacy = w.carryEvidence;

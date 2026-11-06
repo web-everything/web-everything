@@ -1,8 +1,7 @@
 /** Recover an owed red-team result on an already-reviewed head through the existing review job. */
 import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
-import { readFileSync, statSync } from 'node:fs';
-import { isRunRecordTerminal, listRunIds, readRun, sharedRunsDir } from '../operations/run-store.mjs';
+import { readFileSync } from 'node:fs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { createHash } from 'node:crypto';
@@ -11,7 +10,7 @@ import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir, withRedTeamStatusClaim, RUN_MTIME_SLACK_MS, ABANDONED_REVIEW_AFTER_MS } from './drain-red-team-evidence.mjs';
+import { readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir, withRedTeamStatusClaim } from './drain-red-team-evidence.mjs';
 import { redTeamForHead, redTeamMarker, parseRedTeamComment, breakClass } from './red-team-gate.mjs';
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
@@ -231,135 +230,11 @@ export function resolveReviewRedTeamOnSkip({ env = process.env, log, readFile = 
   });
 }
 
-// Complete scans deliberately do not use a newest-run shortcut: an unread row can
-// hide a review or an unfinished attempt. At the cap, retain the hold for inspection.
-const runsDirectory = env => env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(env);
-const strictListRuns = dir => { statSync(dir); return listRunIds(dir); };
-function* reviewRuns({ runsDir, list, read, stat }) {
-  const ids = list(runsDir).filter(id => id.startsWith('review-pr-'));
-  if (ids.length > 400) throw Error('run scan capped; inspect stored evidence');
-  for (const id of ids) {
-    const at = stat(join(runsDir, `${id}.json`)).mtimeMs;
-    if (!Number.isFinite(at)) throw Error('run metadata unreadable');
-    const run = read(id, runsDir);
-    const object = value => value != null && typeof value === 'object' && !Array.isArray(value);
-    if (!object(run) || typeof run.op !== 'string' || !run.op.trim()) throw Error('run identity unreadable');
-    // The filename is only a candidate selector. Missing identity must not classify
-    // a corrupt review as unrelated and turn an incomplete scan into a proof.
-    if (run.op === 'review-pr' && (!object(run.input)
-      || typeof run.input.repo !== 'string' || !run.input.repo.trim()
-      || !['string', 'number'].includes(typeof run.input.pr)
-      || !Number.isSafeInteger(Number(run.input.pr)) || Number(run.input.pr) <= 0
-      || !Array.isArray(run.effects)
-      || !(run.pending == null || object(run.pending))
-      || !(run.verdict === null || (object(run.verdict)
-        && typeof run.verdict.verdict === 'string' && run.verdict.verdict.trim())))) {
-      throw Error('review run identity or evidence unreadable');
-    }
-    yield { id, run, at };
-  }
-}
-
-const settledReviewEffects = run => Array.isArray(run?.effects)
-  && run.effects.every(effect => ['applied', 'failed'].includes(effect?.status));
-const terminalReviewRun = run => settledReviewEffects(run) && isRunRecordTerminal(run);
-
-/** Complete bounded proof; unknown state never establishes a never-reviewed head. */
-export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
-  runsDir = runsDirectory(env), list = strictListRuns, read = readRun, stat = statSync } = {}) {
-  try {
-    if (!isRealHead(head)) return false;
-    for (const { run } of reviewRuns({ runsDir, list, read, stat })) {
-      if (run.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr)) continue;
-      const rev = run.findings?.read?.netBasis?.rev;
-      if (!isRealHead(rev) || rev === head) return false;
-      const activeEffects = !settledReviewEffects(run);
-      const unfinished = !run.verdict || run.pending != null || activeEffects;
-      if (unfinished) return false;
-    }
-    return true;
-  } catch { return false; }
-}
-
-/** The same chronology predicate is required at scan time and every evidence re-read. */
-function ignorableConfirm(run, at, acceptedAt) {
-  const start = Date.parse(run.stepTimings?.find(t => t?.step === 'read')?.startedAt);
-  const resumed = Date.parse(run.resumedAt);
-  return Number.isFinite(acceptedAt) && !terminalReviewRun(run)
-    && run.verdict?.verdict === 'needs-human' && run.pending?.kind === 'confirm'
-    && settledReviewEffects(run)
-    && Number.isFinite(start) && start + RUN_MTIME_SLACK_MS < acceptedAt
-    && Number.isFinite(at) && at + RUN_MTIME_SLACK_MS < acceptedAt
-    && (run.resumeOf == null && run.resumedAt == null
-      || Number.isFinite(resumed) && resumed + RUN_MTIME_SLACK_MS < acceptedAt);
-}
-
-/** Revalidate ignored cursors at list time; changed or unreadable rows stay visible to evidence readers. */
-export function revalidatedConfirmList({ repo, pr, head, ignoreRunIds = [], acceptedAt,
-  list = strictListRuns, read = readRun, stat = statSync } = {}) {
-  return runsDir => list(runsDir).filter(id => {
-    if (!isRealHead(head) || !Array.isArray(ignoreRunIds) || !ignoreRunIds.includes(id)
-      || !Number.isFinite(acceptedAt)) return true;
-    try {
-      const [entry] = reviewRuns({ runsDir, list: () => [id], read, stat });
-      return !entry || entry.run.op !== 'review-pr' || entry.run.input.repo !== repo
-        || Number(entry.run.input.pr) !== Number(pr) || !ignorableConfirm(entry.run, entry.at, acceptedAt);
-    } catch { return true; }
-  });
-}
-
-/** Ignore old confirm cursors only after a later, live acceptance supersedes them. */
-export function ignorableConfirmRunIds({ repo, pr, head, comments, labels, reviews, env = process.env,
-  runsDir = runsDirectory(env), list = strictListRuns, read = readRun, stat = statSync, now = Date.now() } = {}) {
-  const closed = { ok: false, ids: [] };
-  try {
-    const acceptance = provenAcceptance({ comments, reviews, labels, head });
-    if (!acceptance) return closed;
-    const acceptedAt = Date.parse(acceptance.at);
-    if (!Number.isFinite(acceptedAt)
-      || publishableClearGuard({ labels, acceptance, comments, reviews, settlesPending: true })) return closed;
-    // A late acceptance comment cannot supersede a confirm opened after its panel began.
-    // Materialize the bounded scan once so both chronology passes use identical records.
-    const runs = [...reviewRuns({ runsDir, list, read, stat })].filter(({ run }) =>
-      run.op === 'review-pr' && run.input?.repo === repo && Number(run.input?.pr) === Number(pr));
-    const panelStarts = runs.filter(({ run }) => terminalReviewRun(run)
-      && run.verdict?.verdict === VERDICTS.ACCEPT && run.findings?.read?.netBasis?.rev === head)
-      .map(({ run }) => Date.parse(run.stepTimings?.find(t => t?.step === 'read')?.startedAt))
-      .filter(Number.isFinite);
-    if (!panelStarts.length) return closed;
-    const bound = Math.min(acceptedAt, ...panelStarts);
-    const ids = [];
-    for (const { id, run, at } of runs) {
-      if (run.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr)) continue;
-      const terminal = terminalReviewRun(run);
-      if (terminal && (run.verdict || (run.resumeOf == null && now - at >= ABANDONED_REVIEW_AFTER_MS))) continue;
-      if (!ignorableConfirm(run, at, bound)) return closed;
-      ids.push(id);
-    }
-    return { ok: true, ids, acceptedAt: bound };
-  } catch { return closed; }
-}
-
-/** Retry unfinished evidence only through freshly validated confirm exclusions. */
-function readWithConfirmExclusions(reader, { repo, pr, head, rawPr, readIgnorableConfirms, headNeverReviewed }) {
-  const key = { repo, pr, head };
-  const first = reader(key);
-  if (first?.ok !== false || first.reason !== 'review-unfinished') return first;
-  let confirms;
-  try { confirms = readIgnorableConfirms?.({ ...key, rawPr }); }
-  catch { return first; }
-  const ids = Array.isArray(confirms) ? confirms : confirms?.ok ? confirms.ids : [];
-  if (Array.isArray(ids) && ids.length) return reader({ ...key, ignoreRunIds: ids,
-    ...(Number.isFinite(confirms.acceptedAt) ? { acceptedAt: confirms.acceptedAt } : {}) });
-  try {
-    if (headNeverReviewed?.({ ...key, rawPr }) === true) return { ...first, neverReviewed: true };
-  } catch { /* Unknown scan retains review-unfinished. */ }
-  return first;
-}
+const UNFINISHED_REVIEW_CONTEXT = 'review-unfinished: an unfinished review run holds this head; a human must answer or cancel the pending confirmation';
 
 /** PURE: readers are injected; each refusal produces one decision, including unreadable evidence. */
 export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, now,
-  setting, lastDispatch, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions, readIgnorableConfirms, headNeverReviewed }) {
+  setting, lastDispatch, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions }) {
   return refusals.filter(r => r?.kind === 'already-reviewed-head').map(refusal => {
     const pr = Number(refusal.prNumber);
     const rawPr = (rawPrs ?? []).find(p => Number(p?.number) === pr);
@@ -375,9 +250,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
     };
     const failedRead = result => ({ ...skip(result.reason),
       ...(result.reason === 'review-unfinished' ? { escalate: true,
-        ...(result.neverReviewed ? { escalationContext: 'head has no recorded review; inspect unfinished review evidence' } : {}) } : {}) });
-    const readWithConfirms = reader => readWithConfirmExclusions(reader,
-      { repo, pr, head, rawPr, readIgnorableConfirms, headNeverReviewed });
+        escalationContext: UNFINISHED_REVIEW_CONTEXT } : {}) });
     try {
       if (!setting.enabled) return skip('reviewRedTeamOnSkip.enabled=false');
       if (!isRealHead(head) || (refusal.headSha != null && refusal.headSha !== head)) return skip('live head missing or changed');
@@ -386,7 +259,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       const journal = readCarry({ repo, pr, head });
       if (redTeamForHead(rawPr.comments, pr, head) && (!journal || journal.step === 'done')) return { ...skip('red-team result already on head'), settle: 'result' };
       if (readWitness) {
-        const w = readWithConfirms(readWitness);
+        const w = readWitness({ repo, pr, head });
         if (w?.ok === false) return failedRead(w);
         if (['queued', 'running'].includes(w.rawWriter.parsed?.status) || w.rawWriter.parsed?.staleAbandoned) {
           const recovery = planRedTeamRecovery(w, recoveryOptions);
@@ -394,7 +267,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
             : dispatchDecision({ action: 'dispatch', mode: recovery.mode, staleRecovery: true, why: 'dead owner recovery' });
         }
       }
-      const evidence = readWithConfirms(readEvidence);
+      const evidence = readEvidence({ repo, pr, head });
       if (evidence?.ok === false) return failedRead(evidence);
       if (evidence?.carryConflict) return skip('later review supersedes the carry');
       const unfinishedCarry = evidence?.carry && evidence.carry.step !== 'done';
@@ -657,14 +530,8 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       exec: (_file, args, options) => runGhSync(args, { ...options, env }) }),
   exec = execFileSync, cwd = process.cwd(), mainRef = 'origin/main',
   proveMove = move => proveCardOnlyHeadMove({ ...move, exec, cwd, mainRef }),
-  listReviewRuns = strictListRuns, readReviewRun = readRun, statReviewRun = statSync,
-  readWitness = readEvidence === readDrainRedTeamEvidence && readStatus === readRedTeamStatus ? ({ ignoreRunIds = [], acceptedAt, ...key }) => readRecoveryWitness({ ...key, env,
-    runsDir: runsDirectory(env), list: revalidatedConfirmList({ ...key, ignoreRunIds, acceptedAt, list: listReviewRuns, read: readReviewRun, stat: statReviewRun }) }) : null,
-  readIgnorableConfirms = ({ rawPr, ...key }) => {
-    const result = ignorableConfirmRunIds({ ...key, env, list: listReviewRuns, read: readReviewRun, stat: statReviewRun, comments: rawPr.comments, labels: rawPr.labels, reviews: rawPr.reviews });
-    return result;
-  },
-  headNeverReviewed = key => headNeverReviewedFromRuns({ ...key, env }),
+  readWitness = readEvidence === readDrainRedTeamEvidence && readStatus === readRedTeamStatus
+    ? key => readRecoveryWitness({ ...key, env }) : null,
   settlePending = settlePendingFor({ provider, env }),
   escalate = ({ repo, pr, head, why }) => {
     if (isUnderTest() || isUnderTest(env)) return;
@@ -707,13 +574,26 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       return { ...rawPr, reviews };
     });
     const planningOptions = { repo, refusals, rawPrs: planningPrs,
-      readEvidence: readEvidence === readDrainRedTeamEvidence ? ({ ignoreRunIds = [], acceptedAt, ...key }) => readEvidence({ ...key, env,
-        runsDir: runsDirectory(env), list: revalidatedConfirmList({ ...key, ignoreRunIds, acceptedAt, list: listReviewRuns, read: readReviewRun, stat: statReviewRun }) }) : readEvidence,
+      readEvidence: readEvidence === readDrainRedTeamEvidence ? key => readEvidence({ ...key, env }) : readEvidence,
       readStatus: readStatus === readRedTeamStatus ? key => readStatus({ ...key, env }) : readStatus,
       now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, readWitness,
-      readIgnorableConfirms, headNeverReviewed,
       recoveryOptions: { now: at, probe: recoveryProbe(), deadlineMs: staleRunDeadlineMs(env) } };
     rows.push(...planRedTeamOnSkip(planningOptions));
+    const escalateRow = row => {
+      try {
+        if (row.escalationContext) note(`review-daemon: ${repo}#${row.prNumber} ${row.why}: ${row.escalationContext}`);
+        const result = escalate({ repo, pr: row.prNumber, head: row.head, why: row.why });
+        if (result?.error || result?.outcome === 'error') {
+          row.settleError = safeErrorText(result.error ?? result.reason ?? 'unknown error');
+        }
+      } catch (error) { row.settleError = safeErrorText(error); }
+    };
+    const holdUnfinishedReview = row => {
+      row.action = 'skip'; row.why = 'review-unfinished'; row.escalate = true;
+      row.escalationContext = UNFINISHED_REVIEW_CONTEXT;
+      delete row.settle;
+      escalateRow(row);
+    };
     const freshSettlement = row => {
       const live = provider.readPrState(repo, row.prNumber);
       const comments = readComments({ repo, pr: row.prNumber });
@@ -743,6 +623,10 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       const refusal = refusals.find(r => r.kind === 'already-reviewed-head' && Number(r.prNumber) === row.prNumber);
       const [fresh] = planRedTeamOnSkip({ ...planningOptions, refusals: refusal ? [refusal] : [],
         rawPrs: [rawPr], now: now() });
+      if (fresh?.why === 'review-unfinished' && fresh.escalate) {
+        holdUnfinishedReview(row);
+        return null;
+      }
       if (fresh?.action !== row.action || fresh.settle !== row.settle || fresh.head !== row.head) {
         throw Error('evidence changed before settlement');
       }
@@ -754,26 +638,25 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         try {
           const key = { repo, pr: row.prNumber, head: row.head };
           if (row.escalate) {
-            if (row.escalationContext) note(`review-daemon: ${repo}#${row.prNumber} ${row.why}: ${row.escalationContext}`);
-            const result = escalate({ ...key, why: row.why });
-            if (result?.error || result?.outcome === 'error') {
-              row.settleError = safeErrorText(result.error ?? result.reason ?? 'unknown error');
-            }
+            escalateRow(row);
           } else if (row.settle === 'result') {
             const rawPr = planningPrs.find(p => Number(p?.number) === row.prNumber);
             if (rawPr?.labels?.some(l => (typeof l === 'string' ? l : l?.name) === 'red-team:pending')) {
               const live = freshSettlement(row);
-              const evidence = readWithConfirmExclusions(planningOptions.readEvidence,
-                { ...key, rawPr: live, readIgnorableConfirms });
+              if (!live) continue;
+              const evidence = planningOptions.readEvidence(key);
               // Active work outranks a stale result: never lift the hold while a pass is queued, running or unfinished.
               const active = evidence?.inFlight || evidence?.queued || ['queued', 'running'].includes(evidence?.status?.status)
                 || (evidence?.carry && evidence.carry.step !== 'done');
               let witness = null;
-              if (!active && planningOptions.readWitness) {
-                witness = readWithConfirmExclusions(planningOptions.readWitness, { ...key, rawPr: live, readIgnorableConfirms });
+              if (!active && evidence?.ok !== false && planningOptions.readWitness) {
+                witness = planningOptions.readWitness(key);
               }
-              if (active) row.settleError = 'red-team pass still active; label unchanged';
-              else if (evidence?.carryConflict || witness?.ok === false) row.settleError = 'conflicting review evidence; label unchanged';
+              if ([evidence, witness].some(result => result?.ok === false && result.reason === 'review-unfinished')) {
+                holdUnfinishedReview(row);
+                row.settleError ??= 'unfinished review evidence; label unchanged';
+              } else if (active) row.settleError = 'red-team pass still active; label unchanged';
+              else if (evidence?.ok === false || evidence?.carryConflict || witness?.ok === false) row.settleError = 'conflicting review evidence; label unchanged';
               else if (!resultMaySynchronize(live.comments, row.prNumber, row.head)) row.settleError = 'result comment not strictly clean';
               else {
                 const verdict = evidence?.status?.status === 'finished' ? evidence.status.result?.foldedVerdict : null;
@@ -804,8 +687,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           else if (row.settle === 'not-owed') {
             const rawPr = planningPrs.find(p => Number(p?.number) === row.prNumber);
             if (Array.isArray(rawPr?.labels) && !rawPr.labels.some(l => (typeof l === 'string' ? l : l?.name) === 'red-team:blocked')) {
-              freshSettlement(row);
-              settlePending({ ...key, remove: ['red-team:pending'] });
+              if (freshSettlement(row)) settlePending({ ...key, remove: ['red-team:pending'] });
             }
           }
         } catch (error) { row.settleError = safeErrorText(error); }
@@ -826,7 +708,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         else {
           try {
             let rawPr;
-            try { rawPr = freshSettlement(row); }
+            try { rawPr = freshSettlement(row); if (!rawPr) continue; }
             catch { throw Error('evidence changed before settlement'); }
             const result = settle({ redTeam: { status: 'not-owed' }, repo, pr: row.prNumber,
               head: row.head, readHead: row.head, accepted: true, storedReviewPolicyClear: true, comments: rawPr.comments, reason: row.why,
