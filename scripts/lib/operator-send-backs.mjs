@@ -15,8 +15,9 @@ const stripComments = text => {
  * ever makes the stripper hide more, never less.
  */
 function blankInlineCode(source) {
-  return source.split('\n').map(line => {
-    if (!line.includes('`')) return line;
+  // Split on every line break stripQuoted honours (\r\n, lone \r, \n), keeping them, so a span never crosses a line.
+  return source.split(/(\r\n?|\n)/).map((line, index) => {
+    if (index % 2 || !line.includes('`')) return line;
     const runs = [...line.matchAll(/`+/g)].map(m => ({ start: m.index, end: m.index + m[0].length, len: m[0].length }));
     const next = new Array(runs.length).fill(-1), seen = new Map();
     for (let i = runs.length - 1; i >= 0; i--) {
@@ -30,7 +31,7 @@ function blankInlineCode(source) {
       i = next[i];
     }
     return chars.join('');
-  }).join('\n');
+  }).join('');
 }
 /**
  * Blank every HTML blockquote/pre block, depth-counted so a nested block cannot end its outer one early.
@@ -69,26 +70,40 @@ const FENCE_OPEN = new RegExp(`^${CONTAINER}(\`{3,}|~{3,})(.*)$`);
 const QUOTE_LINE = new RegExp(`^${CONTAINER}(?:>|&gt;)`);
 // A line that opens an HTML comment starts a new block: it ends a lazy quote continuation, so a real marker under a quote still counts.
 const COMMENT_LINE = /^[ \t]*<!--/;
+// Columns a leading-whitespace prefix occupies (a tab advances to the next multiple of 4; anything else is 1).
+const columnsOf = prefix => [...prefix].reduce((col, ch) => ch === '\t' ? col + 4 - (col % 4) : col + 1, 0);
+const CLOSE_FENCE = /^([ \t]*)(`{3,}|~{3,})[ \t]*$/;
+const LIST_PREFIX = /[^ \t ]/;
 function stripQuoted(text) {
   const out = [];
   let fence = null, fenceIndent = 0, fenceInList = false, quoting = false;
   // HTML quote and preformatted blocks render as quoted/code text; an unterminated one runs to the end.
   const source = stripHtmlBlocks(text);
   for (const line of source.split(/\r\n?|\n/)) {
+    let reopen = false;
     if (fence) {
-      // CommonMark: a closing fence is indented at most 3 columns, whatever the opener's own indent (a 3-space opener
-      // does not buy a 6-space closer). Only a fence inside a list item measures from that item's content column.
-      const close = new RegExp(`^[ \\t]{0,${fenceInList ? fenceIndent + 3 : 3}}(\`{3,}|~{3,})[ \\t]*$`).exec(line);
-      if (close && close[1][0] === fence[0] && close[1].length >= fence.length) fence = null;
-      out.push('');
-      continue;
+      // CommonMark: a closing fence is indented at most 3 columns (tabs count to the next multiple of 4), whatever the
+      // opener's own indent: a 3-space opener does not buy a 6-space closer. Only a fence inside a list item measures
+      // from that item's content column, and a closer left of that column ends the item, so it ends the fence AND
+      // starts a fresh fence of its own on this same line.
+      const close = CLOSE_FENCE.exec(line);
+      const col = close ? columnsOf(close[1]) : 0;
+      if (close && close[2][0] === fence[0] && close[2].length >= fence.length) {
+        if (fenceInList && col < fenceIndent) { fence = null; reopen = true; }
+        else if (col <= (fenceInList ? fenceIndent + 3 : 3)) fence = null;
+      }
+      if (!reopen) { out.push(''); continue; }
     }
     const open = FENCE_OPEN.exec(line);
-    // A backtick fence's info string cannot contain a backtick (that is inline code, not a fence).
-    if (open && !(open[1][0] === '`' && open[2].includes('`'))) {
+    // A backtick fence's info string cannot contain a backtick (that is inline code, not a fence). Outside a list item
+    // the opener itself is indented at most 3 columns: four or more is indented code, and reading it as a fence would
+    // flip which later fence line counts as its closer.
+    const openPrefix = open ? line.slice(0, line.indexOf(open[1])) : '';
+    if (open && !(open[1][0] === '`' && open[2].includes('`')) && (LIST_PREFIX.test(openPrefix) || columnsOf(openPrefix) <= 3)) {
       fence = open[1];
-      fenceIndent = line.indexOf(open[1]);
-      fenceInList = /[^ \t ]/.test(line.slice(0, fenceIndent));
+      // fenceIndent is the fence's start COLUMN (tabs expanded), so closer columns compare like with like.
+      fenceIndent = columnsOf(openPrefix);
+      fenceInList = /[^ \t ]/.test(openPrefix);
       quoting = false;
       out.push('');
     } else if (QUOTE_LINE.test(line) || (quoting && line.trim() && !COMMENT_LINE.test(line))) {

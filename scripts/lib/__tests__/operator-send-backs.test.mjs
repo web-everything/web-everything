@@ -391,9 +391,20 @@ describe('quoted and fenced references never resolve an operator request', () =>
   ])('an indented opener still closes on a valid closer: %s', (_name, opener, closerIndent) => {    const body = `${release}${opener}\`\`\`\n${' '.repeat(closerIndent)}\`\`\`\n<!-- addresses-operator-send-back: 1001 -->\n`;
     expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual([]);
   });
-  it('a list-item fence closes at its own content column', () => {
-    const body = `${release}- \`\`\`\n  example\n  \`\`\`\n<!-- addresses-operator-send-back: 1001 -->\n`;
-    expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual([]);
+  const marker = '<!-- addresses-operator-send-back: 1001 -->\n';
+  const hiddenWhen = (name, fenceText, expected) => it(name, () => {
+    expect(open([request, comment('end', 'web-everything', '21:00', `${release}${fenceText}${marker}`)])).toEqual(expected);
+  });
+  // A list item's fence measures its closer from the item's own column (here 2), so up to 5 columns closes it.
+  hiddenWhen('a list-item fence closes a closer indented to its content column plus 3', '- ```\n  example\n     ```\n', []);
+  hiddenWhen('a list-item closer indented past content column plus 3 is content', '- ```\n  example\n      ```\n', ['1001']);
+  hiddenWhen('a closer left of the list item ends the item and opens a new fence that hides the marker', '- ```\n  example\n```\n', ['1001']);
+  hiddenWhen('a tab-indented closer is 4 columns, so it is content and the example stays hidden', '```\n\t```\n', ['1001']);
+  hiddenWhen('a four-space opener is indented code, not a fence, so a later fence cannot be read as its closer', '    ```\ntext\n```\n', ['1001']);
+  hiddenWhen('a tab opener is indented code, not a fence', '\t```\ntext\n```\n', ['1001']);
+  it('an inline-code span never crosses a lone-CR line break, so it cannot hide a real <pre> block', () => {
+    const body = `${release}\`\r<pre>\r${marker}\r</pre>\r\``;
+    expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual(['1001']);
   });
   it('html-block stripping stays linear on adversarial inline-code and tag input', () => {
     // One long backtick run made the old inline-code regex quadratic (60k backticks took ~2s); tags without ">" and
