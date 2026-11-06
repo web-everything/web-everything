@@ -6508,9 +6508,13 @@ path that is missing or relative. It never accepts a record `findAudit` would re
 resolution it cannot complete resolves every setting to its strictest option, with a warning. An environment value that does not parse
 or is not a known option resolves to that setting's strictest option too. Path lists only add to the built-in
 guard floor: the concurrency modules (locks, leases including `scripts/lib/lane-lease.mjs`, slots, claims,
-mutexes, lane pool, merge, drain), every module that imports a lock primitive directly (`LOCK_PRIMITIVES` in
-`scripts/lib/audit-settings.mjs`; a test reads the imports from source, so a lock user such as
-`scripts/conveyor/fix-claim-store.mjs` is protected whatever its name), and the guard hooks (`scripts/guard-*.mjs` and the other guard scripts) with their registration in
+mutexes, lane pool, merge, drain), the modules that take an exclusive hold themselves (`LOCK_PRIMITIVES` and
+`LOCK_HOLDERS` in `scripts/lib/audit-settings.mjs`), and every lock user (`LOCK_USERS`): a module that imports a
+primitive, or imports a holder's or another lock user's lock API by name (`LOCK_API`, so a caller of
+`acquireFixDispatchClaim` is one too). A test computes the lock users from source to a fixed point and requires the
+list to equal them. The floor is read from the trusted checkout, so a PR that adds a lock user is audited against the
+floor without it; that PR's own CI run of the test is what forces the list update. A whole-module import of a lock
+user is not followed (it reaches most of the daemon graph), and the guard hooks (`scripts/guard-*.mjs` and the other guard scripts) with their registration in
 `.claude/settings.json`, the git hooks and merge/review gates, and the auditor's own modules and settings. Paths
 match without regard to letter case. The required-check, review and merge authorization gates (including
 `scripts/lib/review-ci-gate.mjs`) are on the floor too, and so are the review authorization modules that decide

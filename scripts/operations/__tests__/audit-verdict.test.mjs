@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { URL as NodeURL, fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
-import { GUARD_FLOOR, LOCK_PRIMITIVES, REVIEW_AUTH_FLOOR } from '../../lib/audit-settings.mjs';
+import { GUARD_FLOOR, LOCK_API, LOCK_HOLDERS, LOCK_PRIMITIVES, LOCK_USERS, REVIEW_AUTH_FLOOR } from '../../lib/audit-settings.mjs';
 import { findingFingerprint, proofFingerprint, readCardFromMain } from '../audit-verdict.mjs';
 
 // R473 stage 1 deliberately supplies tests only. Stage 2 supplies the implementation;
@@ -212,24 +212,61 @@ describe('R473 pure classified verdict', () => {
       }
     }
   });
-  // The class behind it: a module that takes a lock decides the lock's key and its holder, whatever its name. Every
-  // tracked module that imports a lock primitive directly is read from the source here and must be on the floor, so a
-  // new lock user can never stay unprotected because its name holds no floor word.
+  // The class behind it: a module that takes a lock decides the lock's key and its holder, whatever its name. The lock
+  // users are read from the source here, to their fixed point: a module importing a primitive, or importing a
+  // holder's or another lock user's lock API by name (reconcile-fix-dispatch.mjs calls acquireFixDispatchClaim, two
+  // imports from file-locks.mjs). The result must EQUAL LOCK_USERS, so a new lock user fails here, not silently.
   const lockScanRoot = fileURLToPath(new NodeURL('../../../', import.meta.url));
-  const LOCK_USERS = execFileSync('git', ['ls-files', '-z', '--', ':(glob)scripts/**/*.mjs', ':(glob)skills-src/**/*.mjs'],
+  const lockSources = new Map(execFileSync('git', ['ls-files', '-z', '--', ':(glob)scripts/**/*.mjs', ':(glob)skills-src/**/*.mjs'],
     { cwd: lockScanRoot, encoding: 'utf8', maxBuffer: 8 << 20 }).split('\0').filter(Boolean)
-    .filter(p => !p.includes('/__tests__/') && !/\.test\.mjs$/.test(p) && !LOCK_PRIMITIVES.includes(p))
-    .filter(p => [...readFileSync(`${lockScanRoot}${p}`, 'utf8')
-      .matchAll(/\b(?:from\s*|import\s*\(\s*|import\s+)['"](\.\.?\/[^'"\r\n]+)['"]/g)]
-      .some(m => LOCK_PRIMITIVES.includes(fileURLToPath(new NodeURL(m[1], new NodeURL(p, `file://${lockScanRoot}`))).slice(lockScanRoot.length))))
-    .sort();
-  it('the lock-user scan is live: it finds the claim stores and every primitive is a real file (PR #6381 red team)', () => {
-    expect(LOCK_PRIMITIVES.filter(p => !existsSync(`${lockScanRoot}${p}`))).toEqual([]);
-    expect(LOCK_USERS.length).toBeGreaterThan(20);
+    .filter(p => !p.includes('/__tests__/') && !/\.test\.mjs$/.test(p))
+    .map(p => [p, readFileSync(`${lockScanRoot}${p}`, 'utf8')]));
+  // Named imports and re-exports (`{ a, b as c }`, also after a default import) and destructured dynamic imports
+  // (`const { a, b: c } = await import('./x.mjs')`) carry their names; a namespace import (`* as x`), a whole-module
+  // re-export (`export * from`) or a bare dynamic import reaches every name (null).
+  const importsOf = p => [...lockSources.get(p).matchAll(/\b(?:import|export)\s*(?:[\w$]+\s*,\s*)?\{([^}]*)\}\s*from\s*['"](\.\.?\/[^'"\r\n]+)['"]|\{([^{}]*)\}\s*=\s*await\s+import\s*\(\s*['"](\.\.?\/[^'"\r\n]+)['"]\s*\)|\b(?:import\s*\*\s*as\s+[\w$]+|export\s*\*(?:\s*as\s+[\w$]+)?)\s*from\s*['"](\.\.?\/[^'"\r\n]+)['"]|\bimport\s*\(\s*['"](\.\.?\/[^'"\r\n]+)['"]\s*\)/g)]
+    .map(m => ({ to: fileURLToPath(new NodeURL(m[2] ?? m[4] ?? m[5] ?? m[6], new NodeURL(p, `file://${lockScanRoot}`))).slice(lockScanRoot.length),
+      names: (m[1] ?? m[3]) === undefined ? null
+        : (m[1] ?? m[3]).split(',').map(s => s.trim().replace(/^type\s+/, '').split(/\s+as\s+|\s*:\s*/)[0]).filter(Boolean) }));
+  const lockSeeds = new Set([...LOCK_PRIMITIVES, ...LOCK_HOLDERS]);
+  const scannedLockUsers = new Set();
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const p of lockSources.keys()) {
+      if (lockSeeds.has(p) || scannedLockUsers.has(p)) continue;
+      // Any import of a primitive counts. A holder counts through its lock API or a whole-module import; a lock user
+      // only through its lock API by name: following whole-module imports of lock users reaches most of the daemon
+      // graph (verify-lane.mjs and gh-throttle.mjs are imported everywhere), as REVIEW_AUTH_FLOOR notes for its family.
+      if (importsOf(p).some(({ to, names }) => LOCK_PRIMITIVES.includes(to)
+        || (LOCK_HOLDERS.includes(to) && (names === null || names.some(n => LOCK_API.test(n))))
+        || (scannedLockUsers.has(to) && names !== null && names.some(n => LOCK_API.test(n))))) {
+        scannedLockUsers.add(p); grew = true;
+      }
+    }
+  }
+  it('the lock-user scan is live and equals LOCK_USERS exactly (PR #6381 red team and self-review)', () => {
+    expect([...lockSeeds].filter(p => !existsSync(`${lockScanRoot}${p}`))).toEqual([]);
+    expect([...scannedLockUsers].sort()).toEqual([...LOCK_USERS].sort());
     expect(LOCK_USERS).toEqual(expect.arrayContaining(['scripts/conveyor/fix-claim-store.mjs', 'scripts/conveyor/fix-dispatch-claim.mjs',
-      'scripts/conveyor/build-dispatch-claim.mjs', 'scripts/operations/tick-mutex.mjs', 'skills-src/conveyor/build-dispatch-daemon.mjs']));
+      'scripts/conveyor/reconcile-fix-dispatch.mjs', 'skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs',
+      'scripts/operations/ci-heal-pr-dispatch.mjs', 'scripts/lib/resource-admission.mjs', 'scripts/operations/tick-mutex.mjs']));
   });
-  it.each([...LOCK_PRIMITIVES, ...LOCK_USERS])('every lock primitive and every module that imports one is on the floor: E2 and D3 in %s never ship', async file => {
+  it.each(['acquireFixDispatchClaim', 'releaseFixDispatchClaim', 'refreshLiveFixDispatchClaims', 'withFileLock', 'withAddGuardLock', 'tryLease', 'reserve',
+    'heartbeatRunnerLease', 'tryAcquireTickMutex'])('the lock API matches %s', name => expect(LOCK_API.test(name)).toBe(true));
+  it.each(['writeJsonAtomic', 'readLockEntry', 'releaseNotes', 'holdReason'])('the lock API does not match %s', name => expect(LOCK_API.test(name)).toBe(false));
+  it.each(['scripts/conveyor/reconcile-fix-dispatch.mjs', 'skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs', 'scripts/operations/ci-heal-pr-dispatch.mjs'])(
+    'a D3 claim-key race in %s (a caller of the fix dispatch claim) never clears as NOT WEAKENED (PR #6381 self-review)', async file => {
+      for (const stage of ['prerelease', 'prod']) {
+        const f = finding({ class: 'D3', file, invariant: 'One live dispatch per repo/kind/PR', interleaving,
+          trigger: 'Add headSha to fixDispatchResource so a running fixer can rotate its own claim key',
+          consequence: 'A second dispatcher starts another fixer for the same PR while the first is live' });
+        const result = await compute([f], options(stage));
+        expect(result.verdict).toBe('WEAKENED');
+        expect(result.ships).toEqual([]);
+        expect(result.blocks).toEqual([expect.objectContaining({ id: 'f1', class: 'B4' })]);
+      }
+    });
+  it.each([...LOCK_PRIMITIVES, ...LOCK_HOLDERS, ...LOCK_USERS])('every lock primitive, holder and lock user is on the floor: E2 and D3 in %s never ship', async file => {
     for (const cls of ['E2', 'D3']) {
       for (const stage of ['prerelease', 'prod']) {
         const result = await compute([finding({ class: cls, file })], options(stage, { guardFloorPaths: [], raceBlockPaths: [] }));

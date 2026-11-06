@@ -91,31 +91,90 @@ const FLOOR_SETTINGS = Object.freeze([
   'scripts/exec-output-baseline.json', 'scripts/pr-comment-read-baseline.json', 'scripts/check-standards.contract.json',
   'scripts/lib/dispatch-routing-policy.json', 'scripts/ci/test-timings.json', 'scripts/lib/model-probation.json', 'scripts/lib/swept-repos.json',
   // Read by the lock users added in the PR #6381 red team (the rebuild job and the coroner jobs).
-  'scripts/lib/daemon-rebuild-settings.json', 'scripts/settings/coroner.json', 'scripts/settings/coroner-postmortem.json']);
+  'scripts/lib/daemon-rebuild-settings.json', 'scripts/settings/coroner.json', 'scripts/settings/coroner-postmortem.json',
+  'scripts/lib/dispatch-size-policy.json', 'scripts/lib/dispatch-supervision-promotions.json', 'scripts/lib/review-fix-policy-settings.json',
+  'scripts/settings/delivery-metrics.json', 'scripts/settings/needs-you-feed.json', 'scripts/settings/pr-land-ready.json',
+  'scripts/settings/pr-limit.json', 'scripts/settings/pr-stall-sweep.json', 'scripts/settings/review-concurrency.json',
+  'scripts/settings/review-red-team-on-skip.json']);
 /**
  * The lock primitives: the modules that take an exclusive hold (file-locks.mjs reserves a lock entry, with-lock.mjs
- * wraps it, coordination-lock.mjs takes the coordination lease). A test reads every tracked module and pins each one
- * that imports a primitive directly onto the floor (PR #6381 red team: fix-claim-store.mjs builds the fix dispatch
- * claim's lock key, but its name holds no floor word).
+ * wraps it, coordination-lock.mjs takes the coordination lease). Any import of one makes a module a lock user (PR #6381
+ * red team: fix-claim-store.mjs builds the fix dispatch claim's lock key, but its name holds no floor word).
  */
 export const LOCK_PRIMITIVES = Object.freeze(['scripts/readiness/file-locks.mjs', 'scripts/readiness/with-lock.mjs',
   'scripts/operations/coordination-lock.mjs']);
-/** Every tracked module that imports a lock primitive directly (the source-scan test pins this list complete). */
-const LOCK_USERS = Object.freeze([
-  'scripts/conveyor/await-verify-loop.mjs', 'scripts/conveyor/build-dispatch-claim.mjs', 'scripts/conveyor/build-dispatch-hold-router.mjs',
-  'scripts/conveyor/fix-claim-store.mjs', 'scripts/conveyor/fix-dispatch-claim.mjs', 'scripts/conveyor/fix-procedure.mjs',
-  'scripts/conveyor/land-overlap-yield.mjs', 'scripts/conveyor/nightly-coroner-job.mjs', 'scripts/conveyor/resolve-runner-checkout.mjs',
-  'scripts/conveyor/soak/breaks/lease-reaper-borrowed-fixer-pid-invisible.mjs', 'scripts/held-cards-io.mjs',
-  'scripts/lib/daemon-clone-lock.mjs', 'scripts/lib/daemon-rebuild/overlay-main-sync.mjs', 'scripts/lib/daemon-rebuild/rebuild-job.mjs',
-  'scripts/lib/fix-slot-borrow.mjs', 'scripts/lib/gh-throttle-holders.mjs', 'scripts/lib/gh-throttle.mjs',
-  'scripts/lib/merge-queue-adaptive-batching.mjs', 'scripts/lib/target-registry.mjs', 'scripts/lib/verdict-ledger-outbox-spool.mjs',
-  'scripts/lib/verdict-ledger.mjs', 'scripts/operations/action-ground-truth.mjs', 'scripts/operations/action-store.mjs',
-  'scripts/operations/completion-store.mjs', 'scripts/operations/coroner-pr-postmortem.mjs', 'scripts/operations/daemon-status-io.mjs',
-  'scripts/operations/free-scope-io.mjs', 'scripts/operations/land-advance-gate.mjs', 'scripts/operations/restart-runner-io.mjs',
-  'scripts/operations/runner-activity-io.mjs', 'scripts/operations/tick-mutex.mjs', 'scripts/operations/tick-throttle.mjs',
-  'scripts/readiness/drain-lock.mjs', 'scripts/readiness/file-locks-cli.mjs', 'scripts/readiness/forge-remote-health.mjs',
-  'scripts/readiness/forge-slot-markers.mjs', 'scripts/readiness/heavy-admission.mjs', 'scripts/review-runner.mjs', 'scripts/verify-lane.mjs',
-  'skills-src/conveyor/build-dispatch-daemon.mjs', 'skills-src/conveyor/runner-lock.mjs']);
+/**
+ * Modules that take an exclusive hold of their own (an exclusive `'wx'` create, a lock directory, a reservation or slot
+ * file) besides other work, so only an import of their lock API by name (LOCK_API) makes a module a lock user
+ * (PR #6381 self-review: atomic-json-file.mjs#withFileLock and the inline holds were missed). An inline hold has no
+ * import to scan for, so each is named here.
+ */
+export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', 'scripts/operations/review-extra-seats.mjs',
+  'scripts/conveyor/health-file-request.mjs', 'scripts/lib/review-seat-pool.mjs', 'scripts/daemon-overlay.mjs',
+  'scripts/lib/daemon-overlays.mjs', 'scripts/lib/lane-repair.mjs', 'scripts/lib/overlay-adoption.mjs', 'scripts/lib/we-scan-cache.mjs',
+  'scripts/readiness/forge-exec-run.mjs', 'scripts/lib/review-shadow-budget.mjs', 'scripts/readiness/reservations.mjs',
+  'scripts/readiness/prepare-hold-state.mjs']);
+/** The imported names that take, renew or give up a hold (`withFileLock`, `withAddGuardLock`, `acquireFixDispatchClaim`,
+ *  `tryLease`, …). */
+export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|reserve|try)\w*(?:Claim|Lease|Lock|Hold|Slot|Mutex|Reservation)\w*)$/;
+/**
+ * Every lock user: a tracked module that imports a lock primitive, or imports a holder's or another lock user's
+ * LOCK_API by name (so a caller of acquireFixDispatchClaim, two imports from file-locks.mjs, is one too). The
+ * source-scan test computes this set to its fixed point and requires it to EQUAL this list, so a new or removed lock
+ * user fails the test.
+ */
+export const LOCK_USERS = Object.freeze([
+  // Callers of a `with…Lock` helper (withAddGuardLock, withDaemonCloneLock, …) and of a lock user's lock API through a
+  // destructured dynamic import.
+  'scripts/conveyor/health-watch.mjs', 'scripts/conveyor/liveness-sweep.mjs', 'scripts/conveyor/pass-daemons/pr-postmortem-pass.mjs',
+  'scripts/conveyor/poc-branch-sync.mjs', 'scripts/conveyor/soak/breaks/postmortem-poison-merge.mjs',
+  'scripts/conveyor/soak/breaks/rebuild-coordination-noop-events.mjs', 'scripts/conveyor/soak/breaks/stale-ruling-report-and-rebuild-wait.mjs',
+  'scripts/conveyor/stand-down.mjs', 'scripts/drain-followup-job.mjs', 'scripts/lane-git-diet.mjs', 'scripts/lib/card-number-allocator.mjs',
+  'scripts/lib/clone-maintenance.mjs', 'scripts/lib/daemon-rebuild/rebuild.mjs', 'scripts/lib/daemon-rebuild/smoke.mjs',
+  'scripts/lib/fast-drain-scope.mjs', 'scripts/lib/queue-branch-numbering.mjs', 'scripts/lib/review-red-team-on-skip.mjs',
+  'scripts/operations/card-batch-seal-io.mjs', 'scripts/operations/completion-cli.mjs', 'scripts/operations/poc-land.mjs',
+  'scripts/operations/review-job-envelope.mjs', 'scripts/operations/worker-wrapper.mjs', 'scripts/pr-land.mjs',
+  'scripts/conveyor/auto-round-grant-io.mjs', 'scripts/conveyor/await-verify-loop.mjs',
+  'scripts/conveyor/await-verify.mjs', 'scripts/conveyor/build-dispatch-claim.mjs',
+  'scripts/conveyor/build-dispatch-hold-router.mjs', 'scripts/conveyor/build-dispatch-orphan-adopt.mjs',
+  'scripts/conveyor/fix-claim-store.mjs', 'scripts/conveyor/fix-dispatch-claim.mjs',
+  'scripts/conveyor/fix-procedure.mjs', 'scripts/conveyor/fixer-stuck-reclaim.mjs',
+  'scripts/conveyor/health-responder.mjs', 'scripts/conveyor/land-overlap-yield.mjs',
+  'scripts/conveyor/main-ci-red-io.mjs', 'scripts/conveyor/needs-you-feed-job.mjs',
+  'scripts/conveyor/nightly-coroner-job.mjs', 'scripts/conveyor/pr-stall-digest.mjs',
+  'scripts/conveyor/pr-stall-sweep.mjs', 'scripts/conveyor/reconcile-fix-dispatch.mjs',
+  'scripts/conveyor/resolve-runner-checkout.mjs', 'scripts/conveyor/resource-sampler-daemon.mjs',
+  'scripts/conveyor/session-watchdog.mjs', 'scripts/conveyor/soak/breaks/lease-reaper-borrowed-fixer-pid-invisible.mjs',
+  'scripts/conveyor/soak/breaks/standdown-pr-holds-scope-slot.mjs', 'scripts/conveyor/stand-down-auto-proceed-io.mjs',
+  'scripts/held-cards-io.mjs', 'scripts/lane-drain.mjs', 'scripts/lib/card-group.mjs',
+  'scripts/lib/daemon-clone-lock.mjs', 'scripts/lib/daemon-item-tasks.mjs', 'scripts/lib/daemon-jobs-runtime.mjs',
+  'scripts/lib/daemon-load-overlay.mjs', 'scripts/lib/daemon-rebuild/auto-rebase.mjs',
+  'scripts/lib/daemon-rebuild/overlay-main-sync.mjs', 'scripts/lib/daemon-rebuild/rebuild-job.mjs',
+  'scripts/lib/drain-queue-safety.mjs', 'scripts/lib/drain-red-team-evidence.mjs', 'scripts/lib/fix-slot-borrow.mjs',
+  'scripts/lib/gh-throttle-holders.mjs', 'scripts/lib/gh-throttle.mjs', 'scripts/lib/host-load.mjs',
+  'scripts/lib/merge-queue-adaptive-batching.mjs', 'scripts/lib/pr-limit.mjs', 'scripts/lib/pr-snapshot.mjs',
+  'scripts/lib/red-team-carry-machine.mjs', 'scripts/lib/red-team-withheld-publish.mjs',
+  'scripts/lib/required-status-checks.mjs', 'scripts/lib/resource-admission.mjs', 'scripts/lib/salvage-index.mjs',
+  'scripts/lib/scheduled-lane-maintenance.mjs', 'scripts/lib/target-registry.mjs',
+  'scripts/lib/verdict-ledger-outbox-spool.mjs', 'scripts/lib/verdict-ledger.mjs', 'scripts/lib/verify-shard-run.mjs',
+  'scripts/merge-ai-prs.mjs', 'scripts/operations/action-ground-truth.mjs', 'scripts/operations/action-store.mjs',
+  'scripts/operations/ci-heal-pr-dispatch.mjs', 'scripts/operations/cli-adapter.mjs',
+  'scripts/operations/completion-store.mjs', 'scripts/operations/coroner-pr-postmortem.mjs',
+  'scripts/operations/daemon-status-io.mjs', 'scripts/operations/deliver-item-wrapper.mjs',
+  'scripts/operations/delivery-metrics.mjs', 'scripts/operations/dispatch-lane-io.mjs',
+  'scripts/operations/free-scope-io.mjs', 'scripts/operations/land-advance-gate.mjs',
+  'scripts/operations/needs-you-feed.mjs', 'scripts/operations/operator-controls-io.mjs',
+  'scripts/operations/prepare-stamp-land.mjs', 'scripts/operations/probation-build-run.mjs',
+  'scripts/operations/probation-heal-run.mjs', 'scripts/operations/restart-runner-io.mjs',
+  'scripts/operations/routing-override-file.mjs', 'scripts/operations/runner-activity-io.mjs',
+  'scripts/operations/start-build.mjs', 'scripts/operations/tick-mutex.mjs', 'scripts/operations/tick-throttle.mjs',
+  'scripts/operations/worker-result-router.mjs', 'scripts/readiness/drain-lock.mjs',
+  'scripts/readiness/file-locks-cli.mjs', 'scripts/readiness/forge-remote-health.mjs',
+  'scripts/readiness/forge-slot-markers.mjs', 'scripts/readiness/heavy-admission.mjs', 'scripts/review-runner.mjs',
+  'scripts/verify-lane.mjs', 'skills-src/conveyor/build-dispatch-daemon.mjs', 'skills-src/conveyor/pass-daemon.mjs',
+  'skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs', 'skills-src/conveyor/review-daemon.mjs',
+  'skills-src/conveyor/runner-lock.mjs', 'skills-src/conveyor/runner.mjs', 'skills-src/conveyor/supervisor-launcher.mjs',
+  'skills-src/conveyor/verify-daemon.mjs']);
 // The concurrency words match ANYWHERE in the basename (`forge-slot-markers.mjs`, `lane-worker-without-lease.mjs`), not
 // only at its start (PR #6381 send-back). `**/` needs at least one folder, so each entry has a twin for scripts/ itself.
 // This also protects names holding the word inside another word (`release` holds `lease`): protecting more only ever
@@ -126,7 +185,7 @@ export const GUARD_FLOOR = Object.freeze([...new Set(['scripts/**/*file-locks*',
   'scripts/**/*slot*', 'scripts/*slot*', 'scripts/**/*lock-reaper*', 'scripts/*lock-reaper*', 'scripts/**/*lane-pool*', 'scripts/*lane-pool*',
   'scripts/**/*merge*', 'scripts/*merge*', 'scripts/**/*drain*', 'scripts/*drain*', 'scripts/**/*mq*', 'scripts/*mq*',
   // Claims and mutexes are locks too (PR #6381 red team: the fix dispatch claim store).
-  'scripts/**/*claim*', 'scripts/*claim*', 'scripts/**/*mutex*', 'scripts/*mutex*', ...LOCK_PRIMITIVES, ...LOCK_USERS,
+  'scripts/**/*claim*', 'scripts/*claim*', 'scripts/**/*mutex*', 'scripts/*mutex*', ...LOCK_PRIMITIVES, ...LOCK_HOLDERS, ...LOCK_USERS,
   'scripts/*-lock.mjs', 'scripts/**/*-lock.mjs', 'scripts/**/with-lock*', 'skills-src/**/*-lock.mjs',
   'scripts/guard-*', 'scripts/**/guard-*', 'scripts/*-guard*', 'scripts/**/*-guard*', 'scripts/guarded-*', 'scripts/**/guarded-*',
   '.claude/settings.json', '.githooks/', 'scripts/lib/git-hook-surface.mjs', 'scripts/lib/permission-change.mjs',
