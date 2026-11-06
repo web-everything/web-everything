@@ -81,7 +81,7 @@ const R618_CHANGE_MANIFEST = {
     "continue;"
   ],
   "scripts/lib/operator-send-backs.mjs": [
-    "if (text.trimStart().startsWith('🔓 conveyor fix-end') && namesSendBack(text, item)) {",
+    "if (text.trimStart().startsWith('🔓 conveyor fix-end') && !!item.id && markerLineFor(text, item.id)) {",
     "const at = Date.parse(c.createdAt), requestedAt = Date.parse(item.at);",
     "const release = /^🔓 conveyor fix-end — fix claim released\\r?\\n\\r?\\n`([^`\\r\\n]+)` released the fix claim at `([a-f0-9]{7,40})`\\.(?:[ \\t]|\\r?\\n|$)/i.exec(text);",
     "const head = release?.[1].trim() ? release[2] : null;",
