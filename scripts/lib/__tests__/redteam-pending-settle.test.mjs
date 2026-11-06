@@ -892,3 +892,29 @@ describe.each(['readWitness', 'readEvidence'])('unfinished review holds through 
     expect(o.syncLabels).not.toHaveBeenCalled();
   });
 });
+
+describe('write-time guard also requires acceptance and covers the policy-clear action', () => {
+  const guarded = labelsOnWrite => {
+    let reads = 0;
+    const provider = { readPrState: vi.fn(() => ({ headRefOid: head, labels: ++reads > 1 ? labelsOnWrite : ['review:accepted', 'red-team:pending'], comments: [] })),
+      readComments: vi.fn(() => []), ensureLabel: vi.fn(), setLabels: vi.fn() };
+    return provider;
+  };
+  it.each([[['red-team:pending']], [['review:accepted', 'red-team:pending', 'red-team:blocked']]])('result settle refuses at write time with labels %j', labels => {
+    const provider = guarded(labels);
+    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: payload('accept'), recorded: false, seatRecorded: false,
+      status: { status: 'finished', result: { status: 'ran', comment: 'posted', foldedVerdict: 'accept' } } })), readIgnorableConfirms: () => [], provider });
+    o.syncLabels = input => input.provider.setLabels(repo, pr, { add: 'red-team:clear', remove: ['red-team:pending'] });
+    o.rawPrs[0].comments.push(resultComment());
+    mod.runRedTeamOnSkip(o);
+    expect(provider.setLabels).not.toHaveBeenCalled();
+  });
+  it.each([[['red-team:pending']], [['review:accepted', 'red-team:pending', 'red-team:blocked']]])('the policy-clear action refuses at write time with labels %j', labels => {
+    const provider = guarded(labels);
+    const f = notOwedFixture();
+    const o = runFixture({ ...f, now: () => f.now, provider });
+    o.syncLabels = input => input.provider.setLabels(repo, pr, { add: 'red-team:clear', remove: ['red-team:pending'] });
+    mod.runRedTeamOnSkip(o);
+    expect(provider.setLabels).not.toHaveBeenCalled();
+  });
+});

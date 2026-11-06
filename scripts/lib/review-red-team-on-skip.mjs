@@ -480,6 +480,7 @@ function holdGuardedProvider(provider, head) {
     if (state?.headRefOid !== head) throw Error('head moved before settlement; label unchanged');
     const names = Array.isArray(state?.labels) ? state.labels.map(label => (typeof label === 'string' ? label : label?.name)) : null;
     if (!names || names.some(name => typeof name !== 'string' || !name)
+      || !names.includes('review:accepted')
       || names.some(name => conflictsWithPolicyClear(name, { settlesPending: true }))) {
       throw Error('hold label appeared before settlement; label unchanged');
     }
@@ -719,7 +720,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
                 publishNeedsYou: publishAttention,
               } });
             if (['policy-clear', 'already'].includes(result?.outcome)) {
-              syncLabels({ repo, pr: row.prNumber, head: row.head, env, log: note });
+              syncLabels({ repo, pr: row.prNumber, head: row.head, env, log: note, provider: holdGuardedProvider(provider, row.head) });
             } else {
               row.action = 'skip';
               row.why = `clear failed: ${result?.reason ?? result?.outcome ?? 'unknown outcome'}`;
