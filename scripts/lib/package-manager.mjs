@@ -107,7 +107,15 @@ export function installCommand({ frozen = false, log = (l) => console.error(l), 
  * Run the install. A pnpm that cannot run or reach the registry falls back to npm and logs it; a FROZEN fallback also
  * needs `lockfileParity()` to return true (npm ci validates a different lockfile). Every other failure is rethrown.
  */
-export function installWithFallback({ frozen = false, ignoreScripts = false, cwd, exec = (bin, args, o) => execFileSync(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], ...o }), log = (l) => console.error(l), lockfileParity, ...opts } = {}) {
+/**
+ * Node's default 1 MiB maxBuffer kills a verbose but healthy install (ENOBUFS + SIGTERM). Output is still piped, because a
+ * failure is classified on it, so give it an explicit bound instead: 256 MiB per stream. Past that the install is killed
+ * and the error is unclassified (signal set), so it fails closed and never falls back to npm.
+ */
+export const INSTALL_MAX_BUFFER = 256 * 1024 * 1024;
+export const defaultInstallExec = (bin, args, o) => execFileSync(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: INSTALL_MAX_BUFFER, ...o });
+
+export function installWithFallback({ frozen = false, ignoreScripts = false, cwd, exec = defaultInstallExec, log = (l) => console.error(l), lockfileParity, ...opts } = {}) {
   const first = installArgv({ ...opts, ci: frozen, ignoreScripts, lockfileParity });
   if (first.note) log(`package-manager · ${first.note}`);
   try { exec(first.bin, first.args, { cwd }); return { ...first, fellBack: false }; }

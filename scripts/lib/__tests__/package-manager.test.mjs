@@ -9,6 +9,7 @@ const resolvePackageManager = wrap(pm.resolvePackageManager);
 const installArgv = wrap(pm.installArgv);
 const installCommand = wrap(pm.installCommand);
 const installWithFallback = wrap(pm.installWithFallback);
+const { defaultInstallExec } = pm;
 const none = { env: {}, platform: undefined, readPlatform: () => ({ prefs: {}, errors: [] }) };
 beforeEach(() => resetCascadeLogForTest());
 
@@ -209,6 +210,19 @@ describe('a frozen probe fallback needs a parity proof', () => {
   it('a non-frozen install falls back to npm install without a proof', () => {
     const r = installArgv({ ci: false, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); } });
     expect(r).toMatchObject({ bin: 'npm', args: ['install'] });
+  });
+});
+
+describe('defaultInstallExec output bound', () => {
+  const emit = (stream, bytes) => ['-e', `process.${stream}.write('x'.repeat(${bytes}))`];
+  it.each(['stdout', 'stderr'])('a successful install that writes 2 MiB to %s is not killed by the default 1 MiB maxBuffer', (stream) => {
+    expect(() => defaultInstallExec(process.execPath, emit(stream, 2 * 1024 * 1024), {})).not.toThrow();
+  });
+  it('output beyond the explicit bound still fails closed (ENOBUFS), never falls back to npm', () => {
+    const calls = [];
+    const exec = (bin, args, o) => { calls.push(bin); return defaultInstallExec(process.execPath, emit('stdout', 4096), { ...o, maxBuffer: 1024 }); };
+    expect(() => installWithFallback({ frozen: false, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => '9', log: () => {}, exec })).toThrow(/ENOBUFS|maxBuffer/);
+    expect(calls).toEqual(['pnpm']);
   });
 });
 
