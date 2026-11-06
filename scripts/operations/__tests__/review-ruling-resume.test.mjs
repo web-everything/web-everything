@@ -29,7 +29,7 @@ import { resolveOperation } from '../run.mjs';
 import { advanceReviewPrToWriteUp } from '../record-verdict-io.mjs';
 import { loadReviewSeatSettings } from '../../lib/review-seat-provider.mjs';
 import { REARM_COMMENT_MARKER } from '../../conveyor/rearm-review.mjs';
-import { decideReferralHold, enrichPrsWithReferralHolds, findResumableParkedRun, REFERRAL_RETRY_MS, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
+import { decideReferralHold, enrichPrsWithReferralHolds, findResumableParkedRun, REFERRAL_RETRY_MS, refusedReferralsAreRuled, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 
 const HEAD_1 = 'a'.repeat(40);
 const HEAD_2 = 'b'.repeat(40);
@@ -228,6 +228,18 @@ describe('stale stageVerdict referral refusal', () => {
     expect(out.run.findings.stageVerdict.applied).toBe(true);
     expect(store.read('must-not-start')).toBeNull();
     expect(judge.mock.calls.length).toBe(count);
+  });
+
+  it('a cached author-stamp-missing token does not block the resume once every real finding is ruled', async () => {
+    const { refused, live, rec } = await fixture();
+    const row = reviewRunEvidence(refused.run);
+    const p = { ...live(), number: 4361 };
+    const opts = { repo: 'o/n', cardReadable: () => true };
+    expect(refusedReferralsAreRuled(p, { ...row, pending: [...row.pending, 'author-stamp-missing'] }, opts)).toBe(true);
+    // Fail closed: a token alone proves nothing, and an unruled finding still blocks beside the token.
+    expect(refusedReferralsAreRuled(p, { ...row, pending: ['author-stamp-missing'] }, opts)).toBe(false);
+    expect(refusedReferralsAreRuled(p, { ...row, pending: [...row.pending, 'author-stamp-missing', 'unruled-key'] }, opts)).toBe(false);
+    expect(rec.runId).toBe(row.id);
   });
 
   it.each(['missing', 'partial', 'other-head', 'other-run', 'other-key', 'malformed', 'unreadable-card', 'unreadable-thread', 'missing-record'])('%s ruling keeps the refused run held', async kind => {
