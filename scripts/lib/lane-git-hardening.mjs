@@ -142,6 +142,10 @@ export function laneGitHardeningEnv(env = process.env, { remoteProbe = false } =
   delete out.GIT_EXTERNAL_DIFF;
   delete out.GIT_ASKPASS;
   delete out.SSH_ASKPASS;
+  // The same caller-env rule for ssh: an inherited GIT_SSH_COMMAND beats the core.sshCommand pin and would run (and
+  // could forge the head listing of) any SSH transport; GIT_SSH is dropped with it so the pin alone decides.
+  delete out.GIT_SSH_COMMAND;
+  delete out.GIT_SSH;
   const n = Number.parseInt(String(out.GIT_CONFIG_COUNT ?? '0'), 10);
   const start = Number.isInteger(n) && n > 0 ? n : 0;
   const pins = remoteProbe ? [...LANE_GIT_CONFIG_PINS, ...REMOTE_PROBE_CONFIG_PINS] : LANE_GIT_CONFIG_PINS;

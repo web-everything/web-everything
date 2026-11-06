@@ -187,12 +187,14 @@ describe('remoteHeads (the release proof) reads the canonical origin from the pr
       expect(runGit.mock.calls.every(([, , options]) => options.cwd === primary)).toBe(true);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
-  it('pins every transport to no credential helper, no askpass and no terminal prompt', () => {
+  it('pins every transport to no credential helper, no askpass, no inherited ssh command and no terminal prompt', () => {
     const { dir, primary } = setup();
     try {
       // A caller inside a lane controls its own env: an inherited askpass program must not reach the transport.
       vi.stubEnv('GIT_ASKPASS', join(dir, 'lane-askpass'));
       vi.stubEnv('SSH_ASKPASS', join(dir, 'lane-ssh-askpass'));
+      vi.stubEnv('GIT_SSH_COMMAND', join(dir, 'lane-ssh'));
+      vi.stubEnv('GIT_SSH', join(dir, 'lane-ssh'));
       const runGit = vi.fn(execFileSync);
       const io = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: primary, primaryPath: primary }, backupRoot: join(dir, 'backups'), runGit });
       io.remoteHeads();
@@ -203,6 +205,9 @@ describe('remoteHeads (the release proof) reads the canonical origin from the pr
       expect(env.GIT_TERMINAL_PROMPT).toBe('0');
       expect(env).not.toHaveProperty('GIT_ASKPASS');
       expect(env).not.toHaveProperty('SSH_ASKPASS');
+      expect(env).not.toHaveProperty('GIT_SSH_COMMAND');
+      expect(env).not.toHaveProperty('GIT_SSH');
+      expect(pins['core.sshCommand']).toBe('ssh');
     } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
   });
   it('accepts operator auth/signing keys in the primary and excludes ops/* heads', () => {
