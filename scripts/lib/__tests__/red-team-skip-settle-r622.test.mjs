@@ -458,6 +458,19 @@ describe('R622 review follow-ups: decided-run guard, liveness, id universe, cach
       expect(evidence).toMatchObject({ ok: false });
       expect(settle(evidence)).toMatchObject({ ok: false });
     });
+    it('scan-capped carries the liveness bound too: a live unfinished run that started BEFORE the newest finished run (no exact-head run read) still holds', () => {
+      // 4 records, maxParses=2: the live run (newest mtime) and the newest finished run are read, two older ones stay unread.
+      const runs = { 'review-pr-live': { mtime: T - 20e3, run: rec({ rev: other, startedAt: T - 9000e3 }) },
+        'review-pr-done': { mtime: T - 60e3, run: rec({ rev: other, startedAt: T - 7200e3, verdict: { verdict: 'accept' } }) },
+        'review-pr-old0': { mtime: T - 5 * HOUR, run: rec({ rev: other, startedAt: T - 20000e3, verdict: { verdict: 'accept' } }) },
+        'review-pr-old1': { mtime: T - 6 * HOUR, run: rec({ rev: other, startedAt: T - 21000e3, verdict: { verdict: 'accept' } }) } };
+      const evidence = reader(runs, { maxParses: 2 });
+      expect(evidence).toMatchObject({ ok: false, reason: 'scan-capped' });
+      expect(evidence.settleBounds).toMatchObject({ unfinishedActiveAt: T - 20e3, evaluatedAt: T });
+      expect(settle(evidence)).toMatchObject({ ok: false, reason: 'scan-capped' });
+      runs['review-pr-live'].mtime = T - 2 * HOUR; // quiet for the horizon: the same shape now settles
+      expect(settle(reader(runs, { maxParses: 2 }))).toMatchObject({ ok: true, settledByComment: 'scan-capped' });
+    });
     it('a bound with no read time, no write time, or an unreadable (NaN) write time never settles', () => {
       const base = { unfinishedStartedAt: T - HOUR, unreadBoundaryAt: T - 3 * HOUR, unfinishedUndecided: true, completeHeadRead: () => ({ complete: true, blocked: false }) };
       const go = extra => settle(Object.defineProperty({ ok: false, reason: 'review-unfinished' }, 'settleBounds', { value: { ...base, ...extra }, enumerable: false }));
