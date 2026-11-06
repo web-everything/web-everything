@@ -2051,6 +2051,103 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
     // a foreign-question record is not a valid verdict and neither blocks nor enables
     expect(prototypeLoad.canonicalAuditEvidence([old(), { ...weak, questionHash: 'foreign' }], SHA, () => true, FP)).toEqual({ ok: true, record: old() });
   });
+  // AU1 PR-B: a current-question record for the carried head+base blocks a PRIOR-question pass even when carry
+  // eligibility (a missing or differing fingerprint) dropped that current record from the eligible set.
+  describe('prior-question pass vs an ineligible current-question record', () => {
+    const PRIOR = 'c'.repeat(64);
+    const opts = { priorQuestionHashes: [{ hash: PRIOR, acceptUntil: '2026-10-30T00:00:00Z' }], now: Date.parse('2026-10-21T00:00:00Z') };
+    const prior = () => old({ questionHash: PRIOR });
+    const carry = (...records) => prototypeLoad.canonicalAuditEvidence(records, SHA, () => true, FP, opts);
+    it('the carried prior pass alone is a pass (the setting is live in this path)', () => {
+      expect(carry(prior())).toEqual({ ok: true, record: prior() });
+    });
+    it.each([
+      ['no fingerprint', { fingerprint: undefined }],
+      ['a differing fingerprint', { fingerprint: '1'.repeat(64) }],
+      ['an unusable timestamp', { fingerprint: undefined, at: 'not-a-date' }],
+      ['an unknown verdict', { fingerprint: undefined, verdict: 'MAYBE' }],
+    ])('a current-question record with %s on the same head+base blocks the carried prior pass, in either order', (_, over) => {
+      const current = old({ at: '2026-10-19T12:00:00Z', ...over });
+      expect(carry(prior(), current)).toEqual({ ok: false, reason: 'no-record' });
+      expect(carry(current, prior())).toEqual({ ok: false, reason: 'no-record' });
+    });
+    it('a current-question record for another base does not block the carried prior pass', () => {
+      expect(carry(prior(), old({ fingerprint: undefined, base: 'f'.repeat(40) }))).toEqual({ ok: true, record: prior() });
+    });
+    // Round 6: a carried head's prior-question WEAKENED must not be hidden by an unusable current-question record for the
+    // same head+base (findAudit lets that record block a prior PASS, which is fail-open for a negative verdict).
+    describe('a carried prior-question WEAKENED hidden by an unusable current-question record', () => {
+      const C = 'c'.repeat(40);
+      const livePass = () => auditRecord({ head: SHA, at: '2026-10-19T12:00:00Z' });
+      const weak = (o = {}) => old({ base: C, questionHash: PRIOR, verdict: 'WEAKENED', at: '2026-10-20T12:00:00Z', findings: ['x.mjs:1 guard removed'], ...o });
+      const hider = (o = {}) => old({ base: C, at: '2026-10-21T12:00:00Z', findings: ['WEAKENED'], ...o });
+      it('still blocks the live head pass, in any record order', () => {
+        for (const records of [[livePass(), weak(), hider()], [hider(), weak(), livePass()], [weak(), livePass(), hider()]])
+          expect(carry(...records)).toEqual({ ok: false, reason: 'weakened' });
+      });
+      it.each([
+        ['unparsable time', { at: 'not-a-date' }],
+        ['unknown verdict', { verdict: 'MAYBE' }],
+      ])('also when the hiding current-question record has %s', (_, over) => {
+        expect(carry(livePass(), weak(), hider(over))).toEqual({ ok: false, reason: 'weakened' });
+      });
+      it('a later prior-question NOT WEAKENED re-audit of that base supersedes it; an older one does not', () => {
+        const fixed = (at) => old({ base: C, questionHash: PRIOR, at, findings: [] });
+        expect(carry(livePass(), weak(), fixed('2026-10-20T18:00:00Z'), hider()).ok).toBe(true);
+        expect(carry(livePass(), fixed('2026-10-20T06:00:00Z'), weak(), hider())).toEqual({ ok: false, reason: 'weakened' });
+      });
+      it('a newer own covered audit still supersedes it (fresh re-audit)', () => {
+        const newer = auditRecord({ head: SHA, at: '2026-10-22T12:00:00Z' });
+        expect(carry(livePass(), weak(), hider(), newer)).toEqual({ ok: true, record: newer });
+      });
+      it('a USABLE current-question re-audit of that base decides instead (findAudit alone)', () => {
+        expect(carry(livePass(), weak(), old({ base: C, at: '2026-10-21T12:00:00Z' })).ok).toBe(true);
+      });
+      it('does not apply to an expired prior hash, a foreign hash, a rejected prior WEAKENED, or a prior NOT WEAKENED', () => {
+        expect(carry(livePass(), weak({ at: '2026-08-01T00:00:00Z' }), hider()).ok).toBe(true);
+        expect(carry(livePass(), weak({ questionHash: 'd'.repeat(64) }), hider()).ok).toBe(true);
+        expect(carry(livePass(), weak({ findings: ['NOT WEAKENED'] }), hider()).ok).toBe(true);
+        expect(carry(livePass(), weak({ verdict: 'NOT WEAKENED', findings: [] }), hider()).ok).toBe(true);
+      });
+    });
+    // Round 5: a live-head in-window prior-question WEAKENED must veto a carried current-question pass even when
+    // findAudit cannot use it (here: contradictory findings), and a usable one must keep blocking.
+    describe('a live-head prior-question WEAKENED record', () => {
+      const live = (o = {}) => auditRecord({ head: SHA, questionHash: PRIOR, verdict: 'WEAKENED', at: '2026-10-21T12:00:00Z', ...o });
+      const carried = () => old({ at: '2026-10-19T12:00:00Z' });
+      it('a usable in-window one blocks the carried current-question pass through canonicalAuditEvidence', () => {
+        expect(carry(carried(), live())).toEqual({ ok: false, reason: 'weakened' });
+        expect(carry(live(), carried())).toEqual({ ok: false, reason: 'weakened' });
+      });
+      it('an in-window one findAudit rejects (contradictory findings) still blocks the carried pass, in either order', () => {
+        const unusable = live({ findings: ['NOT WEAKENED'] });
+        expect(carry(carried(), unusable)).toEqual({ ok: false, reason: 'weakened' });
+        expect(carry(unusable, carried())).toEqual({ ok: false, reason: 'weakened' });
+      });
+      it('an out-of-window or unknown-hash one does not block (and the carried pass still holds)', () => {
+        expect(carry(carried(), live({ at: '2026-08-01T00:00:00Z', findings: ['NOT WEAKENED'] }))).toEqual({ ok: true, record: carried() });
+        expect(carry(carried(), live({ questionHash: 'd'.repeat(64), findings: ['NOT WEAKENED'] }))).toEqual({ ok: true, record: carried() });
+      });
+      it('variant: an unusable WEAKENED on another base of the live head blocks a usable pass on a different base', () => {
+        const Y = 'f'.repeat(40);
+        const pass = old({ head: SHA, fingerprint: undefined, at: '2026-10-20T00:00:00Z' });
+        const bad = { findings: ['NOT WEAKENED'], at: '2026-10-21T12:00:00Z' };
+        expect(carry(pass, live({ base: Y, ...bad }))).toEqual({ ok: false, reason: 'weakened' });
+        expect(carry(pass, live({ base: Y, questionHash: QUESTION_HASH, ...bad }))).toEqual({ ok: false, reason: 'weakened' });
+        expect(carry(live({ base: Y, ...bad }), pass)).toEqual({ ok: false, reason: 'weakened' });
+        // a base with a usable decision is judged by findAudit alone: an unusable WEAKENED on the same base does not block
+        expect(carry(pass, live({ base: TREE, ...bad }))).toMatchObject({ ok: true });
+      });
+      it('variant: an unparsable time on an unexpired prior-hash WEAKENED still blocks (fail closed), unless the hash expired', () => {
+        expect(carry(carried(), live({ at: 'not-a-date', findings: ['NOT WEAKENED'] }))).toEqual({ ok: false, reason: 'weakened' });
+        expect(carry(live({ at: 'not-a-date', findings: ['NOT WEAKENED'] }), carried())).toEqual({ ok: false, reason: 'weakened' });
+        expect(carry(carried(), live({ at: 'not-a-date', questionHash: 'd'.repeat(64) }))).toEqual({ ok: true, record: carried() });
+      });
+      it('a prior-question NOT WEAKENED on the live head never blocks the carried pass', () => {
+        expect(carry(carried(), live({ verdict: 'NOT WEAKENED', findings: ['WEAKENED'] }))).toEqual({ ok: true, record: carried() });
+      });
+    });
+  });
   it('the base must still be covered by main', () => {
     expect(prototypeLoad.canonicalAuditEvidence([old()], SHA, () => false, FP)).toEqual({ ok: false, reason: 'no-record' });
   });
