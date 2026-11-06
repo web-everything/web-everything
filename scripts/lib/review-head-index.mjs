@@ -94,10 +94,23 @@ const validMap = m => m && typeof m === 'object' && Object.values(m).every(valid
 const hashText = text => createHash('sha256').update(text).digest('hex');
 const RETRACT = /^retract\.([\w-]{1,64})$/;
 const retractPath = (dir, txn) => join(dir, `retract.${txn}`);
-/** Retraction markers present now, sorted. Always listed BEFORE the log is read (see readHeadIndex). ENOENT means no directory yet. */
-const listRetractions = (fs, dir) => { try { return fs.readdirSync(dir).map(n => RETRACT.exec(n)?.[1]).filter(Boolean).sort(); } catch (e) { if (e?.code === 'ENOENT') return []; throw e; } };
-/** The cache key: the raw log bytes plus the set of markers, so a marker that appears after the map was published invalidates it. */
-const stateHash = (raw, retractions) => (retractions.length ? hashText(Buffer.concat([raw, Buffer.from(`\0retract:${retractions.join(',')}`)])) : hashText(raw));
+// A writer names its transaction BEFORE its row exists: `pending.<txn>` is created (O_EXCL, durable) first and removed only when the
+// transaction is accepted (the map is published and the lock is still ours). Replay and readers treat a row whose txn is pending OR
+// retracted as invisible, so a row is never readable before its retraction can exist: it is hidden from the instant it is appended
+// until the instant it is accepted. A rejected writer leaves its marker (and converts it to `retract.<txn>` when it can). Whoever
+// next holds the lock turns every foreign pending marker into a retraction: once the lock has changed hands the old holder fails
+// its fence, so that transaction can never be accepted, and compaction therefore never folds an uncommitted row.
+const PENDING = /^pending\.([\w-]{1,64})$/;
+const pendingPath = (dir, txn) => join(dir, `pending.${txn}`);
+/** Retraction and pending markers present now, sorted. Always listed BEFORE the log is read (see readHeadIndex). ENOENT means no directory yet. */
+const listMarkers = (fs, dir) => {
+  try { const names = fs.readdirSync(dir); const pick = re => names.map(n => re.exec(n)?.[1]).filter(Boolean).sort(); return { retract: pick(RETRACT), pending: pick(PENDING) }; } catch (e) { if (e?.code === 'ENOENT') return { retract: [], pending: [] }; throw e; }
+};
+/** The cache key: the raw log bytes plus the set of markers, so a marker that appears (or goes) after the map was published invalidates it. */
+const stateHash = (raw, retractions, pending = []) => {
+  const tail = `${retractions.length ? `\0retract:${retractions.join(',')}` : ''}${pending.length ? `\0pending:${pending.join(',')}` : ''}`;
+  return tail ? hashText(Buffer.concat([raw, Buffer.from(tail)])) : hashText(raw);
+};
 const parseLog = (text, keepPerPr, retractions = []) => {
   const lines = text.split('\n').filter(l => l.trim());
   const gone = new Set(retractions);
@@ -133,12 +146,12 @@ export function readHeadIndex({ dir = defaultHeadIndexDir(), fs = nodeFs, keepPe
     // An unreadable log throws here and fails closed. The cache is trusted only when the log's content hash matches.
     // Markers are listed BEFORE the log is read: a compaction renames the new log into place and only then deletes the markers it
     // folded, so a marker missing from this listing was already folded into the log we read next.
-    const retractions = listRetractions(fs, dir);
+    const { retract, pending } = listMarkers(fs, dir);
     const raw = fs.readFileSync(log); // the cache key is the digest of the RAW bytes: a UTF-8 decode would alias distinct corrupt logs
     const text = raw.toString('utf8');
-    const logHash = stateHash(raw, retractions);
+    const logHash = stateHash(raw, retract, pending);
     if (stored && stored.map && typeof stored.map === 'object' && stored.version === MAP_VERSION && stored.logHash === logHash && validMap(stored.map)) return { ok: true, map: stored.map };
-    return { ok: true, map: parseLog(text, rebuildKeep(keepPerPr, stored, settingsFile), retractions).map, rebuilt: true };
+    return { ok: true, map: parseLog(text, rebuildKeep(keepPerPr, stored, settingsFile), [...retract, ...pending]).map, rebuilt: true };
   } catch { return { ok: false, reason: 'index-unreadable' }; }
 }
 // Only ENOENT means absent; any other stat failure (EACCES, EIO, ...) throws so the caller fails closed instead of reading an empty index.
@@ -237,41 +250,52 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
   fs.mkdirSync(dir, { recursive: true });
   return withHeadIndexLock(dir, fence => {  // read, append, compact and publish are ONE transaction
     const { log, map: mapPath, tmp } = headIndexPaths(dir);
+    // We hold the lock, so any pending marker that is not ours belongs to a writer whose lock was taken over: it will fail its fence
+    // and can never be accepted. Reject it for good (retraction first, then drop the pending marker); never leave it to be folded.
+    // A marker that cannot be turned into a retraction fails this write closed rather than risk folding an uncommitted row.
+    for (const t of listMarkers(fs, dir).pending) {
+      try { durable(fs, retractPath(dir, t), 'wx', `${JSON.stringify({ txn: t })}\n`); } catch (e) { if (e?.code !== 'EEXIST') throw e; }
+      try { fs.unlinkSync(pendingPath(dir, t)); } catch { /* gone */ }
+    }
     const current = readHeadIndex({ dir, fs, keepPerPr });
     if (!current.ok) throw Error('review-head-index: existing index unreadable; refusing to write');
     fence();
     const txn = randomUUID();                                   // names OUR row for its whole life, through compaction
     const line = `${JSON.stringify({ ...rec, txn })}\n`;
-    // Once our line is in the log, a lost lock (or any failure before the map publish) means our transaction was rejected, so the
-    // row must not stay visible. We never touch the log again to say so (a live holder may be appending to it or renaming a new
-    // one over it, which would swallow our write): we create the marker file `retract.<txn>`, which replay applies to our row.
+    // Our transaction is named before its row exists. If the marker cannot be written nothing has been appended and we fail closed.
+    durable(fs, pendingPath(dir, txn), 'wx', `${JSON.stringify({ txn, pid: process.pid, at: Date.now() })}\n`);
+    // Our row is hidden by that marker from the instant it is appended until we accept it. A lost lock (or any failure before the
+    // commit) rejects it: we never touch the log again to say so (a live holder may be appending to it or renaming a new one over
+    // it, which would swallow our write); we create the marker file `retract.<txn>` and drop the pending marker.
     const lineBytes = Buffer.from(line);
-    let retracted = false, rollbackFailed = false, publishing = false;
+    let rolledBack = false, rollbackFailed = false, committed = false;
     const rollback = () => {
-      if (retracted) return;                                    // idempotent
-      retracted = true;
-      for (let attempt = 0; attempt < 2; attempt++) {            // one retry; EEXIST means the marker is already there
-        try { durable(fs, retractPath(dir, txn), 'wx', `${JSON.stringify({ txn })}\n`); return; } catch (e) { if (e?.code === 'EEXIST') return; }
+      if (rolledBack) return;                                   // idempotent
+      rolledBack = true;
+      let marked = false;
+      for (let attempt = 0; attempt < 2 && !marked; attempt++) { // one retry; EEXIST means the marker is already there
+        try { durable(fs, retractPath(dir, txn), 'wx', `${JSON.stringify({ txn })}\n`); marked = true; } catch (e) { if (e?.code === 'EEXIST') marked = true; }
       }
-      rollbackFailed = true;                                    // the row may stay visible: say so loudly instead of looking like an ordinary failure
+      if (marked) { try { fs.unlinkSync(pendingPath(dir, txn)); } catch { /* the next writer clears it */ } } else rollbackFailed = true; // the pending marker still hides the row
     };
-    const tag = e => { if (rollbackFailed && e instanceof Error && !e.message.includes('rollback-failed')) e.message += ' (rollback-failed: could not write the retraction marker, so this rejected row may remain visible)'; return e; };
+    const tag = e => { if (rollbackFailed && e instanceof Error && !e.message.includes('rollback-failed')) e.message += ' (rollback-failed: could not write the retraction marker; the row stays hidden by its pending marker until the next writer rejects it)'; return e; };
     const fenced = () => { try { fence(); } catch (e) { rollback(); throw tag(e); } };
     try {
-    durable(fs, log, 'a', line);                                // 1. durable log line (fsynced); a failed fsync after the write retracts it too
+    durable(fs, log, 'a', line);                                // 1. durable log line (fsynced, hidden by our pending marker); a failed fsync after the write rejects it too
     fenced();                                                   //    lock lost during the append: roll the line back, no publish
     // 2. Everything below is derived from ONE snapshot of the log taken after our append (markers listed first, as readers do), not
     // from `current.map` (read before it): a retraction made in between is applied by the replay.
-    const folded = listRetractions(fs, dir);
+    const { retract: folded, pending: pendingNow } = listMarkers(fs, dir);
     const snapshot = fs.readFileSync(log);
     if (!snapshot.includes(lineBytes)) throw Error('review-head-index: appended row missing from the log; refusing to publish'); // never report ok for a lost append
-    const parsed = parseLog(snapshot.toString('utf8'), keepPerPr, folded);
+    // Our pending marker hides our row here, so `parsed.map` is the committed state WITHOUT it. Only committed rows are ever folded.
+    const parsed = parseLog(snapshot.toString('utf8'), keepPerPr, [...folded, ...pendingNow, txn]);
     let lines = parsed.lines;
     if (lines > logMaxLines) { // 3. bound growth: rewrite the log from the compacted map, atomically, then the map
-      // The rewrite is derived from the map WITHOUT our row, and our own line is kept verbatim as the last row. Our row can replace
-      // a same-patch predecessor or evict the oldest entry in the map; compacting that map would make those losses permanent, so a
-      // later retraction of our row could not bring them back. Replay applies our row last either way, so the result is the same.
-      const prior = parseLog(snapshot.toString('utf8'), keepPerPr, [...folded, txn]).map;
+      // The rewrite is derived from the committed map WITHOUT our row, and our own line is kept verbatim as the last row. Our row can
+      // replace a same-patch predecessor or evict the oldest entry in the map; compacting that map would make those losses permanent,
+      // so a later retraction of our row could not bring them back. Replay applies our row last either way, so the result is the same.
+      const prior = parsed.map;
       const compact = Object.entries(prior).flatMap(([k, v]) => {
         const [r, p] = [k.slice(0, k.lastIndexOf('#')), Number(k.slice(k.lastIndexOf('#') + 1))];
         const tx = h => (h.txn === undefined ? {} : { txn: h.txn }); // every row keeps its writer's txn, so a later retraction still finds it
@@ -293,15 +317,19 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
       lines = compact.length + 1;
     }
     fenced();
-    // The map and its hash come from the SAME markers and bytes: a marker made after this listing changes the state hash, so
-    // readers rebuild instead of trusting this map.
-    const live = listRetractions(fs, dir);
+    // The map and its hash describe the state AFTER our commit (our pending marker gone), from the SAME markers and bytes. Until the
+    // commit a reader's hash still includes our marker, so it rebuilds without our row; a marker made after this listing changes the
+    // hash too, so readers rebuild instead of trusting this map.
+    const { retract: live, pending: allPending } = listMarkers(fs, dir);
+    const after = allPending.filter(t => t !== txn);
     const raw = fs.readFileSync(log);
-    const published = JSON.stringify({ version: MAP_VERSION, logHash: stateHash(raw, live), keepPerPr, map: parseLog(raw.toString('utf8'), keepPerPr, live).map });
-    publishing = true;
+    const published = JSON.stringify({ version: MAP_VERSION, logHash: stateHash(raw, live, after), keepPerPr, map: parseLog(raw.toString('utf8'), keepPerPr, [...live, ...after]).map });
+    fenced();                                                   // still the holder: accept. A thief after this finds our row accepted.
+    fs.unlinkSync(pendingPath(dir, txn));                       // COMMIT: the row becomes visible. A missing marker means a new holder already rejected us: fail.
+    committed = true;                                           // past this point the row stays: a failed map write only leaves the cache behind the log
     atomicWrite(fs, mapPath, tmp, published);
     return { ok: true, lines };
-    } catch (e) { if (!publishing) rollback(); throw tag(e); }       // a failure before the map publish must not leave our row visible; once publishing, the log is ahead of the map and readers rebuild
+    } catch (e) { if (!committed) rollback(); throw tag(e); }        // any failure before the commit rejects our row (it is already hidden); after it, readers rebuild from the log
   }, { fs });
 }
 
