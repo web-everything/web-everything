@@ -439,13 +439,22 @@ const defaults = { enabled: true, allow: ['com.we.*', 'com.webeverything.*'], de
   // Namespace membership alone does not establish that a service is stateless.
   approvedStatelessLabels: ['com.we.resource-sampler'], minIntervalMs: 600_000 };
 
+// Kill-switch parsing is case/whitespace-insensitive and FAILS CLOSED: an operator who set the variable
+// meant to stop restarts, so any non-empty value that is not a recognised "enable" word disables them.
+const ENABLE_WORDS = new Set(['true', '1', 'yes', 'on']);
+function parseKillSwitch(raw) {
+  if (raw === undefined || raw === null) return undefined;
+  const word = String(raw).trim().toLowerCase();
+  return word === '' ? undefined : ENABLE_WORDS.has(word);
+}
+
 // One policy for both restart and stale detection, so detection never alerts on a service
 // that policy intentionally leaves alone (dev servers, non-allowed or non-approved writers).
 function resolveRestartPolicy({ settings, platform, env, envValues, log }) {
   const values = envValues ?? {
-    enabled: env.WE_DAEMON_SERVICE_RESTART_ENABLED === undefined ? undefined
-      : ({ true: true, false: false, '1': true, '0': false })[env.WE_DAEMON_SERVICE_RESTART_ENABLED],
-    minIntervalMs: env.WE_DAEMON_SERVICE_RESTART_MIN_INTERVAL_MS === undefined ? undefined : Number(env.WE_DAEMON_SERVICE_RESTART_MIN_INTERVAL_MS),
+    enabled: parseKillSwitch(env.WE_DAEMON_SERVICE_RESTART_ENABLED),
+    // Blank is "unset", not 0 (Number('') === 0 would silently disable the debounce).
+    minIntervalMs: String(env.WE_DAEMON_SERVICE_RESTART_MIN_INTERVAL_MS ?? '').trim() === '' ? undefined : Number(env.WE_DAEMON_SERVICE_RESTART_MIN_INTERVAL_MS),
   };
   return cascadePolicy('daemon.serviceRestart', settings, { standard: defaults, platform, env, envValues: values,
     valid: { enabled: v => typeof v === 'boolean', allow: patterns, deny: patterns,

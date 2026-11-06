@@ -171,6 +171,21 @@ describe('launchd clone restart', () => {
     const o = fixture(); await restartServicesForClone({ ...o, platform: { enabled: true }, settings: { enabled: true }, envValues: { enabled: false } });
     expect(o.launchctl).not.toHaveBeenCalled(); expect(o.log.mock.calls.flat().join(' ')).toMatch(/env/);
   });
+  it.each(['off', 'OFF', 'FALSE', 'False', ' no ', '0', 'false', 'disabled', 'garbage', '2'])(
+    'kill-switch env %j disables restarts (unrecognised values fail closed)', async (value) => {
+      const o = fixture(); const r = await restartServicesForClone({ ...o, env: { WE_DAEMON_SERVICE_RESTART_ENABLED: value } });
+      expect(o.launchctl).not.toHaveBeenCalled(); expect(r.restarted ?? []).toEqual([]);
+      expect(o.log.mock.calls.flat().join(' ')).toMatch(/env/);
+    });
+  it.each(['true', 'TRUE', ' On ', 'yes', '1', ''])('enable env %j leaves restarts enabled', async (value) => {
+    const o = fixture(); const r = await restartServicesForClone({ ...o, env: { WE_DAEMON_SERVICE_RESTART_ENABLED: value } });
+    expect(r.restarted).toHaveLength(1); expect(o.launchctl).toHaveBeenCalled();
+  });
+  it('blank min-interval env is unset, not zero (debounce stays on)', async () => {
+    const o = fixture(); await restartServicesForClone({ ...o, env: { WE_DAEMON_SERVICE_RESTART_MIN_INTERVAL_MS: '  ' } });
+    const again = await restartServicesForClone({ ...o, env: { WE_DAEMON_SERVICE_RESTART_MIN_INTERVAL_MS: '  ' } });
+    expect(o.launchctl).toHaveBeenCalledTimes(1); expect(again.restarted ?? []).toEqual([]);
+  });
   it('unreadable and unparseable plist flagged not restarted', async () => {
     const o = fixture([new Error('bad plist'), { Label: 'com.we.bad' }]);
     expect(findServicesRunningFromClone(o).unreadable).toHaveLength(2);
