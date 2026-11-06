@@ -14,6 +14,7 @@ import {
   findResumeCandidate, buildResumePrompt, tryResumeFix, tryResumeRoundFix, filterFixesByInFlightScope, dropTerminalFixClaims, routeFixExecutor,
 } from '../reconcile-fix-dispatch.mjs';
 import { CONFLICT_LABEL } from '../parked-pr-conflict-watch.mjs';
+import { resolvePrWorkUnit } from '../pr-work-unit.mjs';
 import { DISPATCHED_AGENT_SYSTEM_PROMPT_FILE, dispatchSessionCwd } from '../../operations/dispatch-lane-io.mjs';
 import { buildAuthorActorMarker } from '../../lib/review-independence.mjs';
 
@@ -2148,5 +2149,83 @@ describe('stale-base mechanical fix brief', () => {
     expect(refusals).toEqual([]);
     expect(planned).toMatchObject([{ isConflict: true, staleBase }]);
     expect(withPlannedContext('brief', planned[0])).toContain('base predates required job(s) standards, new-job');
+  });
+});
+
+
+it('fills a planned fix brief from a combined item scope entry without throwing', () => {
+  const { planned, refusals } = planFixesFromReconcile([
+    { kind: 'fix', prNumber: 6193, headRefName: 'lane/7594-fixture' },
+  ], () => ({ num: '7594', slug: 'fixture', scope: ['we:a we:b'] }), () => []);
+  expect(refusals).toEqual([]);
+  expect(planned).toHaveLength(1);
+  const spawnAgent = vi.fn(() => '');
+  expect(() => dispatchFix({ ...planned[0], lane: 9 }, {
+    root: '/repo', grantConflictHelper: vi.fn(), readBrief: () => REAL_TEMPLATE_STUB,
+    mintSessionId: () => '11111111-1111-4111-8111-111111111111', spawnAgent,
+  })).not.toThrow();
+  expect(spawnAgent).toHaveBeenCalledTimes(1);
+  expect(spawnAgent.mock.calls[0][0].at(-1)).toContain('--scope=we:a,we:b ');
+});
+
+it('returns the card-at-ref scope entries unsplit, so the resolver can judge each authored entry whole', () => {
+  const exec = vi.fn(() => Buffer.from('---\nscope: ["we:a b", "we:a"]\n---\n').toString('base64'));
+  expect(fetchCardScopeAtRef('backlog/7594-fixture.md', 'sha', { exec, root: '/repo' }))
+    .toEqual(['we:a b', 'we:a']);
+});
+
+// Red-team break on #6424: splitting an unmerged card's combined entry must not let a safe piece survive
+// alone when another piece of the SAME entry is unsafe — that silently narrowed the fix fence to the safe
+// piece instead of rejecting the whole entry (and falling back to the PR's full diff) as before the split.
+describe('card-at-ref scope: one unsafe piece rejects its whole authored entry', () => {
+  const cardScope = (yamlList) => {
+    const exec = vi.fn(() => Buffer.from(`---\nscope: ${yamlList}\n---\n`).toString('base64'));
+    return (path, ref) => fetchCardScopeAtRef(path, ref, { exec, root: '/repo' });
+  };
+  const resolveWith = (yamlList) => resolvePrWorkUnit({
+    repo: 'we',
+    pr: { number: 7594, headRefName: 'lane/7594-fixture', headRefOid: 'cafe'.repeat(10) },
+    findItem: () => null,
+    fetchDiffPaths: () => ['backlog/7594-fixture.md', 'a.mjs', 'b.mjs', 'c.mjs'],
+    fetchCardScopeAtRef: cardScope(yamlList),
+  });
+
+  it('mixed comma + whitespace separators fall back to the full diff, keeping a, b and c in scope', () => {
+    const unit = resolveWith('["we:a.mjs,we:b.mjs we:c.mjs"]');
+    expect(unit.scopeSource).toBe('diff');
+    expect(unit.scope).toEqual(['we:backlog/7594-fixture.md', 'we:a.mjs', 'we:b.mjs', 'we:c.mjs']);
+  });
+
+  it.each([
+    ['a `..` piece', '["we:c.mjs we:../c.mjs"]'],
+    ['a leading-slash piece', '["we:c.mjs /c.mjs"]'],
+    ['a single glob piece', '["we:c.mjs we:*.mjs"]'],
+    ['a control-character piece', '["we:c.mjs we:b\\x01.mjs"]'],
+  ])('%s drops the whole entry, never its safe sibling alone', (_label, yamlList) => {
+    const unit = resolveWith(yamlList);
+    expect(unit.scopeSource).toBe('diff');
+    expect(unit.scope).toEqual(['we:backlog/7594-fixture.md', 'we:a.mjs', 'we:b.mjs', 'we:c.mjs']);
+  });
+
+  it.each([
+    ['a piece outside the diff', '["we:a.mjs we:zz.mjs"]'],
+    // the split inherits only the repo prefix, not a folder: `b.mjs` reads as `we:b.mjs`, not `we:x/b.mjs`
+    ['a bare piece that loses its sibling folder', '["we:c.mjs x/b.mjs"]'],
+  ])('%s drops the whole entry (containment is all-or-nothing too)', (_label, yamlList) => {
+    const unit = resolveWith(yamlList);
+    expect(unit.scopeSource).toBe('diff');
+    expect(unit.scope).toEqual(['we:backlog/7594-fixture.md', 'we:a.mjs', 'we:b.mjs', 'we:c.mjs']);
+  });
+
+  it('a bad entry is dropped alone; a separate clean entry still forms the card scope', () => {
+    const unit = resolveWith('["we:a.mjs,we:b.mjs we:c.mjs", "we:b.mjs c.mjs"]');
+    expect(unit.scopeSource).toBe('card');
+    expect(unit.scope).toEqual(['we:b.mjs', 'we:c.mjs']);
+  });
+
+  it('a clean combined entry still splits into card scope', () => {
+    const unit = resolveWith('["we:a.mjs b.mjs"]');
+    expect(unit.scopeSource).toBe('card');
+    expect(unit.scope).toEqual(['we:a.mjs', 'we:b.mjs']);
   });
 });
