@@ -789,3 +789,25 @@ describe('red-team send-back queue removal (#5283)', () => {
     expect(removals).toBe(1);
   });
 });
+
+describe('applyRedTeamGate: class-only card indices (writer → reader)', () => {
+  it('records class= on the card-queued marker, and revoking the deferral reopens the finding', async () => {
+    const comments = [comment([F({ findingClass: 'theoretical-race', classBasis: 'needs a concurrent writer' })])];
+    const { io, calls } = fakeIo({ comments });
+    expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'applied' });
+    expect(kinds(calls)).toEqual(['card', 'comment']);
+    expect(parseRedTeamGateMarker(calls[1][1].body)).toMatchObject({ outcome: 'card-queued', classCards: [1] });
+    const read = (findingClasses) => readRedTeamDisposition({ comments, pr: 4722, head: HEAD, setting: { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses }, env: {} });
+    expect(read({ 'theoretical-race': 'defer-card' })).toMatchObject({ sendBack: [], held: [] });
+    expect(read({ 'theoretical-race': 'fix-now' }).sendBack).toHaveLength(1);
+  });
+  it('an ordinary-policy card carries no class= and survives a policy flip', async () => {
+    const comments = [comment([F({ impactIfUnfixed: 'degraded', findingClass: 'live-reproduced', classBasis: 'seen' })])];
+    const { io, calls } = fakeIo({ comments });
+    await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
+    expect(kinds(calls)).toEqual(['card', 'comment']);
+    expect(parseRedTeamGateMarker(calls[1][1].body).classCards).toBeUndefined();
+    expect(readRedTeamDisposition({ comments, pr: 4722, head: HEAD, setting: { ...CONFIRMED_BREAKS_DEFAULTS, degraded: 'send-back' }, env: {} }))
+      .toMatchObject({ sendBack: [], held: [] });
+  });
+});

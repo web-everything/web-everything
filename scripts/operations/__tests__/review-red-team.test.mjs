@@ -9,7 +9,9 @@ import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { assertLaneCwd, buildJudgeArgv, deriveSessionId } from '../../lib/judge-spawn.mjs';
-import { parseRedTeamComment } from '../../lib/red-team-gate.mjs';
+import { classAction } from '../../lib/finding-class-policy.mjs';
+import { normalizeFinding, foldRedTeamVerdict } from '../../lib/jury-core.mjs';
+import { parseRedTeamComment, planRedTeamActions, redTeamResultId } from '../../lib/red-team-gate.mjs';
 import { scrubPublish } from '../../lib/secret-scrub.mjs';
 
 import {
@@ -941,4 +943,50 @@ it('reloads red-team routing each pass, enables unset Gemini, preserves explicit
     expect((await speculateRedTeam({ pr: 7, repo: REPO, read: payload('accept').findings.read, env }, enabled.io)).status).toBe('speculated');
     expect(enabled.calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-gemini');
   } finally { resolveOperationRoute.mockReturnValue(null); }
+});
+
+
+describe('security classification policy transitions', () => {
+  it.each([
+    ['correctness-in-normal-use', 'security-reachable-today', {}],
+    ['security-reachable-today', 'correctness-in-normal-use', { 'security-reachable-today': 'defer-card', allowSecurityDefer: true }],
+  ])('retains security from either reviewer through persistence and replay after policy changes: %s → %s', async (original, rechecked, initialPolicy) => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-security-policy-'));
+    const path = join(dir, 'operator.json');
+    const previous = process.env.WE_PLATFORM_PREFERENCES_FILE;
+    process.env.WE_PLATFORM_PREFERENCES_FILE = path;
+    const save = findingClasses => writeFileSync(path, JSON.stringify({ findingClasses }));
+    try {
+      save(initialPolicy);
+      const { io, rows } = fakeIo({
+        runSeat: seatSays([{ ...BREAK, findingClass: original, classBasis: 'original evidence' }]),
+        runRecheck: async () => ({ checks: [{ index: 0, confirmed: true, reason: 'demonstrated break',
+          findingClass: rechecked, classBasis: 'independent evidence', filesRead: ['x.mjs'], unverifiable: false }] }),
+      });
+      const input = { pr: 5, repo: REPO, loopPayload: payload('accept'), env: { WE_PLATFORM_PREFERENCES_FILE: path } };
+      expect((await runRedTeam(input, io)).status).toBe('ran');
+      const stored = JSON.parse(JSON.stringify(rows.find(row => row.seat === 'red-team')));
+      expect(stored.findings[0].findingClass).toBe('correctness-in-normal-use');
+      const policy = { 'correctness-in-normal-use': 'defer-card', 'security-reachable-today': 'defer-card' };
+      save(policy);
+      io.readRecords = () => [stored];
+      io.runSeat = io.runRecheck = () => { throw Error('replay must not call a model'); };
+      const replay = await runRedTeam(input, io);
+      expect(replay.status).toBe('resumed');
+      expect(classAction(normalizeFinding(stored.findings[0]), policy)).toBe('fix-now');
+      const parsed = parseRedTeamComment(replay.comment.body);
+      expect(classAction(parsed.findings[0], policy)).toBe('fix-now');
+      expect(foldRedTeamVerdict({ ran: true, findings: parsed.findings, findingClasses: policy })).toBe('changes');
+      expect(classAction(parsed.findings[0], { 'correctness-in-normal-use': 'defer-card', allowSecurityDefer: true })).toBe('fix-now');
+      expect(planRedTeamActions(parsed, { broken: 'send-back', findingClasses: policy }).sendBack).toHaveLength(1);
+      const withoutSecurity = structuredClone(parsed);
+      delete withoutSecurity.findings[0].securityReachableToday;
+      expect(redTeamResultId(parsed)).not.toBe(redTeamResultId(withoutSecurity));
+      expect(classAction(parsed.findings[0], { ...policy, allowSecurityDefer: true })).toBe('defer-card');
+    } finally {
+      if (previous === undefined) delete process.env.WE_PLATFORM_PREFERENCES_FILE;
+      else process.env.WE_PLATFORM_PREFERENCES_FILE = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

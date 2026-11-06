@@ -2390,6 +2390,20 @@ Exhaustion is logged once and retains the infrastructure wait for operator recov
 it never creates a new fixer. Probe restart persistence, write failure, head movement,
 and both terminal verdicts with the pass's injected ports.
 
+Timeout-only fix reds under high host load wait for a quiet host before a same-head
+reverify. `verify.loadRetry.maxAttempts` defaults to 3 through the policy cascade;
+`WE_VERIFY_LOAD_RETRY_MAX_ATTEMPTS` supplies the environment override. Its counter
+is persisted before requesting and does not consume ordinary retries. If that request
+fails (or never runs), the old red is not a new verdict: the harness re-requests it under
+the ordinary retry and infra-retry bounds and never escalates it.
+While a load retry exists on the record, its sha is known red: a running or overdue
+retry is never pushed early or handed back as a no-op. A deferral refreshes the
+record's `requestedAt`, so the session reaper keeps the fixer exempt until the
+deferral's own two-hour cap; after that the red ladder resumes it.
+Missing per-test timeout evidence, assertions, truncated inventories, low load on first
+observation, and exhaustion retain the normal red/escalation path. Inject `loadHigh`
+to probe both transitions, write failure, and the unchanged no-push kinds.
+
 `verify.gateCeiling` defaults to `load-scaled`, using rebuild smoke's bounded load/core
 factor; `fixed` restores 30 minutes. `VERIFY_DISPATCH_TIMEOUT_MS` is an absolute override.
 The gate job records the same resolved budget its supervisor used; admission waits
@@ -3910,3 +3924,70 @@ The `smoke-github-outage` break pins `WE_GH_LIST_BACKOFF_MS=5,5` and
 `WE_GH_JSON_RETRY_BACKOFF_MS=5` before the daemon forks. This preserves exhausted,
 fail-closed reads across reconcile and dispatch smoke passes within the unchanged
 90-second tick bound; shortening only the outer list backoff does not suffice.
+
+## Author-stamp repair daemon wiring
+
+PR author logins from `gh pr view` can carry `app/`, while GraphQL edit editor logins do not.
+Normalize only the PR author by removing one leading `app/` and comparing case-insensitively.
+The review daemon must explicitly pass `restoreStamps: sweepAuthorStamps` to hold reconciliation,
+including with shared PR reads: an injected listing otherwise suppresses the default stamp sweep.
+Keep daemon wiring tests hermetic by inspecting the passed function without invoking it;
+the stamp and hold-reconcile suites exercise the repair through injected IO.
+Every default restoration read (listing, live body, history, pre-write body) goes through
+`createMqLiveReader`, so the smoke read memo (`WE_GH_READ_MEMO_DIR`) can never serve the pre-write
+comparison a cached body. The regression drives the real `gh-throttle` memo with a fake `gh`.
+Hold reconciliation's default PR state, review and comment readers (`createLiveHoldReaders`) strip
+the memo too, because `readLiveState` is re-read right before each label write.
+
+### Author-stamp restoration evidence
+
+`author-stamp-restore` fixtures must preserve GraphQL editor `__typename` alongside
+`login`: `app/X` PR authors match only `Bot` editors, and plain `X` authors match only
+`User` editors. Missing or unknown types refuse. Historical bodies must be plain
+snapshots; a hunk header, word-diff token (`[-`, `-]`, `{+`, `+}`), or HTML in any snapshot
+refuses the whole history without writing. Every occurrence of `authored-by-actor:`
+must belong to a complete marker occupying an entire unindented line outside a code
+fence, with only optional trailing whitespace. Exercise malformed markers in an
+otherwise eligible oldest author snapshot, without an earlier forgery masking the
+refusal; keep the pr-land final standalone marker as a positive case. Refusal directs operators to inspect
+the complete GitHub history manually; never turn ambiguous delta text into a stamp.
+
+## Bounded review run scans
+
+Review evidence scans stat candidates before parsing, read them by mtime descending (equal mtimes by
+ascending id, for drain and recovery alike, so both read the same window), and parse at most `runs.scan.maxParses` (standard default 300) per read, including historical/recovery fallbacks.
+The setting resolves through the shared standard/platform/tool cascade; `scripts/settings/runs-scan.json`
+leaves the tool value unset so platform preferences apply. No environment override is added.
+The shared finder continues from its cursor; it never retains a folder of payloads. Exhausting the
+budget before completion returns `{ok:false, reason:"scan-capped"}` and logs the limit/source. The
+enqueue gate, status labels and recovery scheduler hold on unknown evidence. A confirmed break
+recorded in the PR's comments still takes precedence: the gate returns its send-back hold and the
+status labels mark the PR `red-team:blocked`. Past the red-team deadline, unknown evidence never
+counts as "no run": it is neither re-requested nor enqueued by the operator override, and it holds
+with its reason named. Inspect omitted run
+records before deliberately raising the limit. Genuine folder exhaustion still means no match.
+Choose both head-specific and any-head matches by read-step `startedAt`, never file mtime.
+A record is written after its read step starts, so its mtime is an upper bound on that start.
+The scan therefore stops early, well below the cap, once every unread record was last written
+more than 2 s (`RUN_MTIME_SLACK_MS`) before the exact-head match started: none of them can be a
+newer run. A match whose start cannot rule out the omitted records still holds as `scan-capped`.
+With no exact-head match in a capped window, a carried head still resolves through the any-head
+query once the newest same-PR run started after every omitted record was written, and a head with a
+status file also needs every omitted record written no later than that status. An unreviewed head
+holds: past the cap, the absence of an exact-head run cannot be proven.
+Recovery's carry fallback reuses the same scan, so one recovery read stays inside one parse budget.
+When recovery's own exact-head query is capped, it reads that carry fallback before holding: a
+carry the drain can settle from the scan is returned as carry evidence with no newest run (which
+recovery never treats as owed); any other capped answer still holds as `scan-capped`.
+Equal starts retain the drain's ascending / recovery's descending ID tie order. A start-less
+same-PR run last written before the selected run started is older and ignored; any other start-less
+run among two or more returns `run-start-missing` and holds. A single run needs no ordering and
+remains usable without a timestamp. A newer unfinished attempt holds as `review-unfinished`.
+A verdict-less run that run-store calls terminal (nothing pending or in flight) and that has not been
+written for an hour (`ABANDONED_REVIEW_AFTER_MS`) is abandoned: it is neither evidence nor unfinished,
+so a crashed re-review cannot hold a PR forever. A run waiting on a pending step or effect is never
+abandoned, and neither is a rewound resume (`resumeOf`), which the review loop may still finish.
+Unreadable records still throw, never skip.
+
+The scoped regressions are `drain-red-team-evidence`, `stream-filter-runs`, and the settings layout
+test `settings-files`; use heavy admission.

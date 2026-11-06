@@ -9,7 +9,7 @@ import { buildSnapshot, writeSnapshot } from '../resource-sampler.mjs';
 const roots = [];
 const temp = () => { const r = mkdtempSync(join(tmpdir(), 'admission-')); roots.push(r); return r; };
 afterEach(() => roots.splice(0).forEach(r => rmSync(r, { recursive: true, force: true })));
-const snapshot = (extra = {}) => buildSnapshot({ sampledAtMs: 100000, intervalMs: 10000, cpuIdlePct: 37, loadAvg: [63, 60, 50], memPressureLevel: 1, disk: { busyPct: 20 }, ...extra });
+const snapshot = (extra = {}) => buildSnapshot({ sampledAtMs: 100000, intervalMs: 10000, maxFreshMs: 30000, cpuIdlePct: 37, loadAvg: [63, 60, 50], memPressureLevel: 1, disk: { busyPct: 20 }, ...extra });
 const decide = (s, kind = 'build', nowMs = 100000, policy = RESOURCE_POLICY_STANDARD) => decideAdmission({ kind, snapshot: s, nowMs, policy });
 it('freezes standard and merges fields in cascade order', () => {
   expect(Object.isFrozen(RESOURCE_POLICY_STANDARD.build)).toBe(true);

@@ -48,8 +48,8 @@ describe('heavy-admission client signals', () => {
   it('a second signal during the cancel wait stops waiting at once and leaves the marker', async () => {
     const f = fixture(vi.fn(() => new Promise(() => {})));
     f.env = {WE_HEAVY_SIGNAL_CANCEL_WAIT_MS: '60000'};
-    signalWhenMarked(f, 'SIGTERM');
-    setTimeout(() => process.emit('SIGINT'), 150);
+    // Both signals come from the same poll, in order, after the handlers exist (no timer race between them).
+    const poll = setInterval(() => { if (existsSync(marker(f.cwd))) { clearInterval(poll); process.emit('SIGTERM'); setTimeout(() => process.emit('SIGINT'), 20); } }, 5);
     const started = Date.now();
     expect(await runWithRemoteDecision(f)).toMatchObject({handled: true, exitCode: 143});
     expect(Date.now() - started).toBeLessThan(10000);

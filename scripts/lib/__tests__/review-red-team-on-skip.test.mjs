@@ -5,6 +5,7 @@ import { proveCardOnlyHeadMove } from '../card-only-head-move.mjs';
 import * as numbering from '../numbering-carry.mjs';
 import { describe, it, expect, vi } from 'vitest';
 import { cardOnlyHeadMoveCandidate, normalizeRedTeamResult, planRedTeamOnSkip, runRedTeamOnSkip, resolveReviewRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
+import { assertMainNotStale, PreStartDispatchRefusalError } from '../main-staleness.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
 import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
@@ -656,7 +657,7 @@ describe('runRedTeamOnSkip', () => {
     o.plan.refusals.push({ kind: 'already-reviewed-head', prNumber: 5530, headSha: head });
     o.rawPrs.push({ number: 5530, headRefOid: head, comments: [] });
     const out = runRedTeamOnSkip(o);
-    expect(out.rows[0].why).toBe('dispatch failed; start unknown');
+    expect(out.rows[0].why).toBe('dispatch failed; start unknown: unknown start');
     expect(o.dispatch).toHaveBeenCalledTimes(1);
     expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 }, remainingStarts: 0, take });
     expect(take).toHaveBeenCalledTimes(1);
@@ -681,8 +682,67 @@ describe('runRedTeamOnSkip', () => {
   });
   it('a throw retains the reservation and becomes a row, never an exception', () => {
     const o = runFixture({ dispatch: () => { throw Error('failed'); } });
-    expect(runRedTeamOnSkip(o).rows[0].why).toBe('dispatch failed; start unknown');
+    expect(runRedTeamOnSkip(o).rows[0].why).toBe('dispatch failed; start unknown: failed');
     expect(o.capacity.budget.left).toBe(0); expect(o.lastDispatch.size).toBe(0);
+  });
+  it.each(['behind origin/main — refusing', 'stale guard', 'stale abandonment refused'])(
+    'a pre-start refusal refunds capacity, logs the cause and retries next tick: %s', message => {
+      const take = vi.fn(), log = vi.fn();
+      const o = runFixture({ log, capacity: { lanes: 2, budget: { left: 2 }, remainingStarts: 1, take },
+        dispatch: vi.fn(() => { throw new PreStartDispatchRefusalError(message); }) });
+      const out = runRedTeamOnSkip(o);
+      expect(out.rows[0]).toMatchObject({ action: 'skip', why: `dispatch refused before start: ${message}` });
+      expect(out.dispatched).toEqual([]);
+      expect(o.capacity).toEqual({ lanes: 2, budget: { left: 2 }, remainingStarts: 1, take });
+      expect(take).not.toHaveBeenCalled(); expect(o.lastDispatch.size).toBe(0);
+      expect(log).toHaveBeenCalledWith(`review-daemon: ${repo}#${pr} red-team dispatch threw: ${message}`);
+      runRedTeamOnSkip(o);
+      expect(o.dispatch).toHaveBeenCalledTimes(2);
+    });
+  it('the real staleness guard emits a pre-start refusal that refunds recovery capacity', () => {
+    const take = vi.fn(), log = vi.fn();
+    const o = runFixture({ log, capacity: { lanes: 2, budget: { left: 2 }, remainingStarts: 1, take },
+      dispatch: () => assertMainNotStale('/fixture', () => ({ action: 'warn', behind: 1 }), {
+        listBehindFiles: () => null, lastGood: () => null, rebuildGrace: () => null,
+      }) });
+    const out = runRedTeamOnSkip(o);
+    expect(out.rows[0].why).toMatch(/^dispatch refused before start: .*behind origin\/main/);
+    expect(o.capacity).toEqual({ lanes: 2, budget: { left: 2 }, remainingStarts: 1, take });
+    expect(take).not.toHaveBeenCalled(); expect(o.lastDispatch.size).toBe(0);
+    expect(log.mock.calls[0][0]).toContain('red-team dispatch threw: review-dispatch:');
+  });
+  it('an unclassified dispatch error logs boom and retains all start reservations', () => {
+    const take = vi.fn(), log = vi.fn();
+    const o = runFixture({ log, capacity: { lanes: 2, budget: { left: 2 }, remainingStarts: 1, take },
+      dispatch: () => { throw Error('boom'); } });
+    const out = runRedTeamOnSkip(o);
+    expect(out.rows[0]).toMatchObject({ action: 'skip', why: 'dispatch failed; start unknown: boom' });
+    expect(out.dispatched).toEqual([]);
+    expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 }, remainingStarts: 0, take });
+    expect(take).toHaveBeenCalledOnce(); expect(o.lastDispatch.size).toBe(0);
+    expect(log).toHaveBeenCalledWith(`review-daemon: ${repo}#${pr} red-team dispatch threw: boom`);
+  });
+  it.each(['stale post-spawn record', 'refusing post-spawn cleanup', 'behind origin/main — refusing'])(
+    'a post-spawn keyword-bearing error consumes every reservation: %s', message => {
+      const take = vi.fn(), spawn = vi.fn(), log = vi.fn();
+      const o = runFixture({ log, capacity: { lanes: 2, budget: { left: 2 }, remainingStarts: 1, take },
+        dispatch: vi.fn(() => { spawn(); throw Error(message); }) });
+      const out = runRedTeamOnSkip(o);
+      expect(spawn).toHaveBeenCalledOnce();
+      expect(out.rows[0]).toMatchObject({ action: 'skip', why: `dispatch failed; start unknown: ${message}` });
+      expect(out.dispatched).toEqual([]);
+      expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 }, remainingStarts: 0, take });
+      expect(take).toHaveBeenCalledOnce(); expect(o.lastDispatch.size).toBe(0);
+      expect(log).toHaveBeenCalledWith(`review-daemon: ${repo}#${pr} red-team dispatch threw: ${message}`);
+    });
+  it('bounds oversized dispatch error text and strips controls from rows and logs', () => {
+    const log = vi.fn(), message = `boom\n\u001b${'x'.repeat(500)}`;
+    const o = runFixture({ log, dispatch: () => { throw Error(message); } });
+    const out = runRedTeamOnSkip(o);
+    const text = `boom  ${'x'.repeat(294)}`;
+    expect(out.rows[0].why).toBe(`dispatch failed; start unknown: ${text}`);
+    expect(log).toHaveBeenCalledWith(`review-daemon: ${repo}#${pr} red-team dispatch threw: ${text}`);
+    expect(o.capacity.budget.left).toBe(0);
   });
   it('bounds starts across multiple refusals', () => {
     const o = runFixture();
@@ -1487,12 +1547,19 @@ describe('unprovable accepted head move — fresh full review', () => {
     expect(o.dispatch).not.toHaveBeenCalled();
     expect(o.lastDispatch.size).toBe(0);
   });
-  it.each(['review:human', 'review:held-mechanical', 'review-status:reviewing', 'red-team:blocked', 'red-team:pending'])(
+  it.each(['review:human', 'review:held-mechanical', 'review-status:reviewing', 'red-team:blocked'])(
     'does not re-review a held PR with %s', label => {
       const o = moved(); o.rawPrs[0].labels.push(label);
       expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
       expect(o.dispatch).not.toHaveBeenCalled();
     });
+  // R640: operator-accepted change, class correctness-in-normal-use.
+  it('R640 (operator ruling): a lone red-team:pending does not block the full review', () => {
+    const o = moved(); o.rawPrs[0].labels.push('red-team:pending');
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('review');
+    expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
+    expect(o.rawPrs[0].labels).toContain('red-team:pending');
+  });
   it.each(['inFlight', 'queued', 'recorded', 'seatRecorded', 'completedRecorded', 'status', 'unknown'])(
     'fails closed with live-head %s evidence', kind => {
       const o = moved(), evidence = o.readEvidence();

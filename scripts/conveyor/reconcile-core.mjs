@@ -546,7 +546,8 @@ export function staleRequiredBaseRepair({ pr, requiredChecks, defaultBranch }) {
     ['queued', 'in_progress', 'pending', 'waiting', 'requested'].includes(String(row?.status ?? row?.state).toLowerCase())
     || String(row?.state).toLowerCase() === 'expected')) return null;
   const gate = reviewStartGate({ headSha: pr.headRefOid, requiredChecks, checks: pr.statusCheckRollup, verifyGreen: pr.verifyGreen, policy: pr.reviewTiming });
-  if (gate.allowed || gate.reason !== 'required-checks-not-successful' || !gate.affected.length
+  // 'ci-not-registered' is the early-start gate's name for the same all-missing shape (startEarly shadow/on).
+  if (gate.allowed || !['required-checks-not-successful', 'ci-not-registered'].includes(gate.reason) || !gate.affected.length
       || gate.affected.some(row => row.reason !== 'missing')) return null;
   return { missing: gate.affected.map(row => row.name) };
 }
@@ -2825,6 +2826,33 @@ export function planReconcile({
         ...base, ...withPhase, kind: 'restore-review-label', label: 'review:pending',
         why: 'open lane PR, every required check is green, and it carries no review:* (or ready-to-merge) label — '
           + 'nothing would ever own it; apply review:pending so the ordinary review path picks it up',
+      });
+      continue;
+    }
+    // ── `restore-review-label`, ORPHANED-FIXING variant (R502 item 4; LIVE 2026-11-03, PR #6319). A fixer set
+    // `review-status:fixing`, then died or finished without pushing or re-arming: the PR carries that tag and NO
+    // `review:*` / `ready-to-merge` label, no live fixer holds the claim (a live session or `pr.fixClaim` refused
+    // above), and no verdict names the current head - so no daemon owned it and the old rules skipped it (phase is
+    // not `open`). Owed: the neutral `review:pending`. Not gated on CI state (ownership, not readiness: review itself
+    // waits on CI via reviewChecksAllow) but only under policy `stuck`, past the same grace as the sibling variants and
+    // only with a readable check timestamp. Unknown head fails closed; any verdict judging the head (accept, changes,
+    // advisory) means a verdict exists.
+    if (reviewLabelHeal === 'stuck' && !pr?.isDraft && (pr?.state ?? 'OPEN') === 'OPEN'
+        && String(pr?.headRefName ?? '').startsWith('lane/')
+        && withPhase.labels.includes('review-status:fixing')
+        && !withPhase.labels.some((l) => l.startsWith('review:') || l === 'ready-to-merge')
+        && !(pr?.fixClaim && pr.fixClaim.who) && !pr?.fixClaimUnknown
+        && Array.isArray(pr?.comments) && Number.isFinite(now) && now > 0
+        && typeof pr?.headRefOid === 'string' && pr.headRefOid
+        && parseReviewedSha(pr?.comments) !== pr.headRefOid.toLowerCase()
+        && !(Array.isArray(pr?.comments) && pr.comments.some((c) => isReviewVerdictComment(c) && verdictJudged(c, pr.headRefOid.toLowerCase())))
+        // Fail closed on the grace: with no readable check timestamp the PR's age is unknown, so it is not yet an orphan.
+        && (Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : []).some((c) => Number.isFinite(Date.parse(c?.completedAt)))
+        && greenSettledForRestoreGrace(pr?.statusCheckRollup, now)) {
+      dispatch.push({
+        ...base, ...withPhase, kind: 'restore-review-label', label: 'review:pending', variant: 'orphaned-fixing',
+        why: 'review-status:fixing is the only tag left: no review:* label, no live fixer claim and no verdict for the '
+          + 'current head - nothing owns this PR; re-arm review:pending so the review path picks it up',
       });
       continue;
     }

@@ -10,7 +10,9 @@ import { boundFailureDetails } from './verify-failures.mjs';
 import { SHARD_UNSETTLED_EXIT } from './verify-exit-codes.mjs';
 export { SHARD_UNSETTLED_EXIT } from './verify-exit-codes.mjs';
 import { startTreeWatchdog } from './tree-watchdog.mjs';
-import { acquireSlotBlocking, releaseOwnedSlot, admissionLockRoot, resolveCap, ADMISSION_HELD_ENV } from '../readiness/heavy-admission.mjs';
+import { cascadePolicy } from './policy-cascade.mjs';
+import { routeNeedsGit } from '../readiness/needs-git-route.mjs';
+import { acquireSlotBlocking, MAX_RUN_WAIT_MS, releaseOwnedSlot, admissionLockRoot, resolveCap, ADMISSION_HELD_ENV } from '../readiness/heavy-admission.mjs';
 
 const positive = n => Number.isSafeInteger(n) && n > 0;
 // Gate arguments use --key=value. Also preserve ordinary two-token Vitest options;
@@ -156,10 +158,23 @@ function discoverDefault({ files, cwd }) {
   } catch { return null; }
 }
 
+export const LOCAL_SHARD_WAIT_STANDARD_MS = 15 * 60_000;
+/** verify.localShardWaitMs: how long a shard that must run LOCALLY may wait for host load / a slot (standard → platform → env). */
+export function resolveLocalShardWait(env = process.env) {
+  const raw = env?.WE_VERIFY_LOCAL_SHARD_WAIT_MS;
+  const valid = v => Number.isSafeInteger(v) && v >= 1 && v <= MAX_RUN_WAIT_MS;
+  const c = cascadePolicy('verify', undefined, { env, standard: { localShardWaitMs: LOCAL_SHARD_WAIT_STANDARD_MS },
+    envValues: { localShardWaitMs: raw != null && /^\d+$/.test(String(raw).trim()) ? Number(raw) : undefined },
+    valid: { localShardWaitMs: valid }, log: () => {} });
+  const ms = c.value?.localShardWaitMs;
+  return valid(ms) ? { ms, source: c.sources?.localShardWaitMs ?? 'standard' } : { ms: LOCAL_SHARD_WAIT_STANDARD_MS, source: 'standard' };
+}
+const needsGitDefault = ({ argv, cwd }) => { try { return routeNeedsGit({ argv, cwd }).local === true; } catch { return false; } };
+
 export async function runShards({ argv, shards: count, parallel, budgetMs }, deps = {}) {
   const { fs = nodeFs, now = Date.now, tmpdir = nodeTmpdir, log = s => process.stdout.write(s),
     env = process.env, cwd = process.cwd(), execute = executeShard,
-    discover = discoverDefault, acquireLocal = acquireLocalDefault, releaseLocal = slot => releaseOwnedSlot(slot.options) } = deps;
+    discover = discoverDefault, needsGit = needsGitDefault, acquireLocal = acquireLocalDefault, releaseLocal = slot => releaseOwnedSlot(slot.options) } = deps;
   let directory;
   try {
     if (!positive(parallel) || !Number.isSafeInteger(budgetMs) || budgetMs < 0) throw Error('invalid parallelism or budget');
@@ -174,6 +189,8 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
       argv = argv.filter(a => !excluded.includes(a));
     }
     const { shards, flags } = splitVitestArgs(argv, Math.max(1, Math.min(count, planned.length - excluded.length)));
+    const localWait = resolveLocalShardWait(env);
+    log(`verify-shards: verify.localShardWaitMs=${localWait.ms} (${localWait.source})\n`);
     const deadline = now() + budgetMs, results = new Array(shards.length);
     directory = fs.mkdtempSync(join(tmpdir(), 'verify-shards-'));
     let next = 0, infraExit = 0, stopLaunching = false, failureBeforeInfra = false;
@@ -188,7 +205,7 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
         // `npx vitest` / `npm run` put node_modules/.bin on PATH for the shell; a bare node child does not.
         const childEnv = { ...env, WE_VERIFY_REMOTE_REPORT: remoteReport, PATH: `${join(cwd, 'node_modules', '.bin')}:${env.PATH ?? ''}` };
         delete childEnv[ADMISSION_HELD_ENV];
-        let lastResult = null, observedFailure = false;
+        let lastResult = null, observedFailure = false, loadDeferred = false;
         async function attempt(local, attemptFiles = files, retry = '') {
           if (!remaining()) return 'NOT-RUN';
           const report = join(directory, `${index}.${retry}${local ? 'local' : 'initial'}.json`);
@@ -198,11 +215,22 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
           const args = shardRunArgv(attemptFiles, flags);
           const attemptRemoteReport = retry ? join(directory, `${index}.${retry}remote.jsonl`) : remoteReport;
           const attemptEnv = { ...childEnv, WE_VERIFY_REMOTE_REPORT: attemptRemoteReport };
+          // A shard that must run here (needs-git) cannot go to Forge, so it queues for host load / a slot instead of
+          // deferring at once. Bounded by the verify budget; a shard still without a slot then exits 75 as before.
+          const mustRunLocal = !local && needsGit({ argv: args, cwd });
+          // The watchdog (timeoutMs) is the whole remaining budget, so a wait equal to it would let the watchdog fire as
+          // admission gives up (exit 124 instead of 75). Spend at most half the remaining budget queueing, leaving the
+          // other half as headroom for the deferral to return 75 (or for the shard to run once admitted).
+          const waitMs = mustRunLocal ? Math.max(1, Math.min(localWait.ms, Math.floor(remaining() / 2))) : 0;
           const result = await execute({ command: local ? 'npx' : 'node',
-            args: local ? args.slice(1) : [HEAVY_ADMISSION_SCRIPT, 'run', '--', ...args],
+            args: local ? args.slice(1) : [HEAVY_ADMISSION_SCRIPT, 'run', ...(mustRunLocal ? [`--wait-ms=${waitMs}`] : []), '--', ...args],
             files: attemptFiles, report, remoteReport: attemptRemoteReport, cwd, env: local ? { ...attemptEnv, [ADMISSION_HELD_ENV]: '1' } : attemptEnv,
             timeoutMs: remaining(), prefix: `[verify-shard ${index + 1}/${shards.length}] `, log });
           lastResult = result;
+          // A waited deferral ran nothing: splitting the shard cannot help and would only queue for another full wait,
+          // spending the verify budget until the shard reports 124 instead of the contractual 75.
+          if (waitMs > 0 && result.exitCode === SHARD_UNSETTLED_EXIT) loadDeferred = true;
+          if (waitMs > 0 && result.exitCode === SHARD_UNSETTLED_EXIT) log(`verify-shard ${index + 1}/${shards.length}: host-load deferral (waited up to ${Math.round(waitMs / 1000)}s for a local slot)\n`);
           if (result.timedOut || result.exitCode === 124) return 'TIMEOUT';
           if (verificationInfrastructureFailure(result) && result.exitCode !== SHARD_UNSETTLED_EXIT) {
             infraExit ||= result.signal ? 137 : result.exitCode;
@@ -279,7 +307,10 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
               } finally { unlock(); }
             }
           }
-          if (status === 'INVENTORY-INCOMPLETE') {
+          if (status === 'INVENTORY-INCOMPLETE' && loadDeferred) {
+            log(`verify-shard ${index + 1}/${shards.length}: host-load deferral; not splitting (no inventory to recover)\n`);
+            status = observedFailure ? 'FAIL' : 'UNSETTLED';
+          } else if (status === 'INVENTORY-INCOMPLETE') {
             log(`verify-shard ${index + 1}/${shards.length}: INVENTORY-INCOMPLETE; retrying once in ${Math.min(2, files.length)} part(s)\n`);
             const middle = Math.ceil(files.length / 2);
             const halves = files.length === 1 ? [files] : [files.slice(0, middle), files.slice(middle)];
@@ -288,7 +319,8 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
             for (const [half, selected] of halves.entries()) {
               const verdict = await attempt(false, selected, `retry-${half + 1}.`);
               retried.push(verdict);
-              if (infraExit || !['PASS', 'INVENTORY-INCOMPLETE'].includes(verdict)) break;
+              // A deferred half already spent its wait; the other half would queue for a second full wait.
+              if (infraExit || loadDeferred || !['PASS', 'INVENTORY-INCOMPLETE'].includes(verdict)) break;
             }
             status = retried.find(r => ['TIMEOUT', 'NOT-RUN', 'FAIL'].includes(r))
               ?? (observedFailure ? 'FAIL' : 'UNSETTLED');

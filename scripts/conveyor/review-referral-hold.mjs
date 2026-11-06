@@ -11,7 +11,7 @@ import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { liveReferralState } from '../lib/referral-live-context.mjs';
 import { resolveRunsDir, tryReadRun } from '../operations/run-store.mjs';
 import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER, activeReferrals,
-  referralRecordState, AUTO_POLICY_ACTOR } from '../lib/jury-core.mjs';
+  referralRecordState, AUTO_POLICY_ACTOR, findingIdentityTable } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -23,6 +23,7 @@ import { isUnderTest } from '../lib/under-test.mjs';
 import { createActionStore } from '../operations/action-store.mjs';
 import { actionResource } from '../operations/action-record.mjs';
 import { isQuotaError } from '../lib/provider-quota-hold.mjs';
+import { reverifyStaleReferrals } from './referral-reverify.mjs';
 
 export const REFERRAL_HOLD_MARKER = 'review paused:';
 export const GH_LIST_COMMENT_CAP = 100;
@@ -95,8 +96,14 @@ export function reviewRunEvidence(run) {
   const attempted = new Set(records
     .filter(r => r?.repo === read.repo && r.pr === Number(read.pr) && r.head === head && r.attempted)
     .flatMap(r => r.referrals.map(f => f.key)));
+  let ciHeld = false;
+  try {
+    ciHeld = Array.isArray(run.effects) && run.effects.some(e => e?.type === 'review.label-swap'
+      && e.status === 'failed' && typeof e.error === 'string' && /CI still pending on reviewed head/.test(e.error));
+  } catch { /* unreadable effects cannot establish a CI-held publish */ }
   return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt,
     quotaOnly,
+    ...(ciHeld ? { ciHeld: true } : {}),
     ...(resumeAdvise ? { resumeAdvise: true } : {}),
     parked: verdict?.verdict === 'needs-human' && pending.length > 0,
     // A list of only reason tokens names no referral, so it was never "attempted" (not vacuously true).
@@ -358,6 +365,8 @@ export function resolveNoVerdictRetry(env = process.env, { tool } = {}) {
 }
 /** A just-finished run gets this long for its verdict write-back to show up in the (cached) PR listing. */
 export const VERDICT_GRACE_MS = 10 * 60_000;
+/** CI-held publishes that do not spend a no-verdict retry, per head. */
+export const CI_HELD_FREE_RUNS = 4;
 const VERDICT_LABELS = ['review:accepted', 'review:changes', 'review:human'];
 
 /**
@@ -393,7 +402,13 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   const noVerdict = verdictNeverLanded(pr, last, now);
   // Normal same-head and referral holds still require completed panels. A no-verdict retry spends its
   // budget as soon as read identifies the head, even if the process dies before advise can finish.
-  const attempts = history.filter(r => r.startedAt >= wake && (noVerdict || Number.isFinite(r.completedAt)));
+  // Waiting for CI to publish is transient and does not spend a lost write-back retry.
+  // Bounded: only the first CI_HELD_FREE_RUNS such runs are free, so a head whose CI never settles still reaches the cap.
+  let ciHeldFree = 0;
+  const attempts = history.filter(r => {
+    if (!(r.startedAt >= wake && (noVerdict || Number.isFinite(r.completedAt)))) return false;
+    return !(noVerdict && r.ciHeld && ciHeldFree++ < CI_HELD_FREE_RUNS);
+  });
   const count = attempts.length;
   if (count < max) return null;
   if (noVerdict && count < max + VERDICT_RETRY_EXTRA) return null;
@@ -730,7 +745,37 @@ export function raiseNoVerdictNeedsYou({ repo, prNumber, hold, dir, now = Date.n
 /** Reserve before sending: an ambiguous transport failure must not create duplicate comments on every tick.
  * Known pre-send rate-limit failures can retry with bounded backoff; all other failures remain visible locally.
  */
-export function notifyReferralHold({ repo, prNumber, hold, comments = [],
+export function notifyReferralHold(args) {
+  notifyReferralHoldNotice(args);
+  if (args.hold.kind === 'same-head') return;
+  // The original notice stays synchronous. Even when its receipt suppresses a repeat notice,
+  // stale findings get their own bounded, best-effort advisory pass. Never write a ruling here.
+  return (async () => {
+    try {
+      const { repo, prNumber, hold, comments = [], pr = {}, env = process.env,
+        dir = join(dirname(resolveRunsDir()), 'review-referral-notices'),
+        log = line => console.error(line), reverifyPost, spawn, now } = args;
+      const live = liveReferralState({ ...pr, headRefOid: hold.head, comments }, {
+        repo, pr: prNumber, cardReadable: ref => referralCardReadable(ref, REPO_ROOT),
+      });
+      const table = findingIdentityTable(live.records.filter(r => r.repo === repo && r.pr === Number(prNumber)));
+      const pending = live.pendingFindings.map(f => {
+        const identity = table.find(e => e.keys.some(k => k.head === hold.head && k.runId === f.runId && k.key === f.key));
+        return { ...f, raisedHeads: identity
+          ? [identity.firstSeenHead, ...identity.heads.filter(h => h !== identity.firstSeenHead)] : [] };
+      });
+      // Nothing stale: no setting log, no spawn, no comment (same-head behaviour is unchanged).
+      if (!pending.some(f => /^[a-f0-9]{40}$/.test(f.raisedHeads[0] ?? '') && f.raisedHeads[0] !== hold.head)) return;
+      await reverifyStaleReferrals({ repo, prNumber, head: hold.head, pending, comments,
+        env, dir: join(dir, 'reverify'), log, ...(reverifyPost ? { post: reverifyPost } : {}), spawn, now });
+    } catch {
+      try { (args.log ?? console.error)('referral reverify unavailable; referrals kept for operator ruling'); }
+      catch { /* advisory must never throw out of notifyReferralHold */ }
+    }
+  })();
+}
+
+function notifyReferralHoldNotice({ repo, prNumber, hold, comments = [],
   dir = join(dirname(resolveRunsDir()), 'review-referral-notices'), now = Date.now(),
   log = line => console.error(line), publishNeedsYou,
   post = body => execFileSyncThrottled('gh', ['pr', 'comment', String(prNumber), '--repo', repo, '--body', body],

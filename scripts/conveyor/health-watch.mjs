@@ -75,6 +75,7 @@ import { SMELLS } from './health-smells/index.mjs';
 import { readRecentSamples, appendSample, summarizeSample, findUngatedHeavyRuns } from './heavy-run-ungated.mjs';
 import { healthDir, healthSectionLines } from './health-watch-section.mjs';
 import { runDailyReadinessCheck, ledgerReadinessHistoryPath } from '../lib/ledger-readiness-daily.mjs';
+import { probeForgeShareForWatch } from './forge-share-probe.mjs';
 import { runInvestigations } from './health-investigate-dispatch.mjs';
 import {
   planFileRequests, recordRequested, readLedgerStrict, writeLedger, spliceFilingSection, withLedgerLock,
@@ -1233,6 +1234,8 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   probes.heavyQueue = attempt('heavyQueue', () => (flags['heavy-status-file']
     ? JSON.parse(readFileSync(flags['heavy-status-file'], 'utf8'))
     : JSON.parse(run(process.execPath, [join(REPO_ROOT, 'scripts/readiness/heavy-admission.mjs'), 'status', '--json'], { timeoutMs: 15_000 }))));
+  // R497 — Forge share (settings-driven, never throws: any failure reads as unknown, which the smell alarms on).
+  probes.forgeShare = probeForgeShareForWatch({ repoRoot: REPO_ROOT });
   // `machine-overload`'s own inputs — every tick, cheap, never gh-gated. `--ps-fixture`/`--machine-load-fixture`
   // are the incident-reproduction path: this repo never runs a load generator to test this smell (see that
   // smell's own header) — it feeds a real-shaped `ps` snapshot through the exact same tick instead.
