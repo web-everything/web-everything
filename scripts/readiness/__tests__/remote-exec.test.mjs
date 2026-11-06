@@ -1099,6 +1099,16 @@ describe('runRemote', () => {
       : {mode:'unconfirmed',reason:'ambiguous-result'});
   });
 
+  // R595 S1: the launcher's run-time egress-table-absent rejection is written as a plain `snapshot-rejected` record
+  // (siblings:false, no delta). The Mac only certifies not-started for siblings/delta/forge-busy rejections, so this
+  // record fails closed to unconfirmed (heavy-admission then refuses) rather than silently rerunning local.
+  // A dedicated Mac-side egress-table-absent reason is the planned follow-up; this pins today's behaviour.
+  it('a launcher run-time egress-table-absent rejection (plain snapshot-rejected, siblings:false) stays unconfirmed', async () => {
+    const f = fixture({runCode:1, receipt:(_nonce, value) => JSON.stringify(
+      {v:1,nonce:value.nonce,run:value.run,phase:'rejected',reason:'snapshot-rejected',siblings:false,started:false})});
+    expect(await runRemote(f)).toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
+  });
+
   it('aborts not-started before rsync when an ancestor is redirected to different bytes at staging open', async () => {
     const f = fixture();
     const source = join(cwd,'fixtures');

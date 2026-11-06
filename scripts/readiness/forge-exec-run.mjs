@@ -1100,6 +1100,8 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       },record);
       }finally{if(worker.active)await releaseWorker(record);}
     },
+    // Read-only readiness probe; exposed so the test-seam guarantee (injection only under testRoot) is checkable.
+    async egressReady() {await requireEgressTable();},
     async prepare({nonce,label,siblings,baseSha,baseManifestDigest,slot}) {
       await init();
       await requireEgressTable();
@@ -1356,6 +1358,14 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     },
   };
 }
+// The CLI's failure mapping, exported so tests can pin what the Mac sees (exit 254, stderr, forge-busy stdout).
+export function cliFailure(subcommand,error) {
+  return {
+    stdout:subcommand==='prepare'&&error.code==='forge-busy'?JSON.stringify({reason:'forge-busy'})+'\n':'',
+    stderr:'forge-exec-run: '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n',
+    exitCode:254,
+  };
+}
 const cliPath = (()=>{try{return realpathSync(process.argv[1]);}catch{return '';}})();
 if(process.argv[1] && cliPath === realpathSync(fileURLToPath(import.meta.url))) {
   (async()=>{
@@ -1379,8 +1389,9 @@ if(process.argv[1] && cliPath === realpathSync(fileURLToPath(import.meta.url))) 
     else process.stdout.write(JSON.stringify(result)+'\n');
     }
   } catch(error) {
-    if(process.argv[2]==='prepare'&&error.code==='forge-busy')process.stdout.write(JSON.stringify({reason:'forge-busy'})+'\n');
-    process.stderr.write('forge-exec-run: '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n'); process.exitCode=254;
+    const failure=cliFailure(process.argv[2],error);
+    if(failure.stdout)process.stdout.write(failure.stdout);
+    process.stderr.write(failure.stderr); process.exitCode=failure.exitCode;
   }
   })();
 }

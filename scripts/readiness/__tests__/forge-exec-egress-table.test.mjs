@@ -3,16 +3,23 @@ import {beforeEach, afterEach, describe, it, expect, vi} from 'vitest';
 import {mkdtemp, mkdir, writeFile, readFile, rm, symlink, realpath} from 'node:fs/promises';
 import {join} from 'node:path';
 import {createHash} from 'node:crypto';
-import {createRunner, digestInput, digestArgv, execute} from '../forge-exec-run.mjs';
+import {createRunner, digestInput, digestArgv, execute, cliFailure} from '../forge-exec-run.mjs';
 import * as manifestAPI from '../forge-exec-run.mjs';
 import {keepAliveScript} from '../../lib/test-keepalive.mjs';
 const children = vi.hoisted(() => []);
+// When set, a spawn of the production nft path is replaced by a child exiting with this code
+// (the original file/argv are still recorded), so the production probe is observable and hermetic.
+const nftStub = vi.hoisted(() => ({code: undefined}));
 vi.mock('node:child_process', async importOriginal => {
   const original = await importOriginal();
   return {...original, spawn: (...args) => {
-    const child = original.spawn(...args);
+    const [file, argv] = args;
+    const stubbed = file === '/usr/sbin/nft' && nftStub.code !== undefined;
+    const child = stubbed
+      ? original.spawn(process.execPath, ['-e', `process.exit(${nftStub.code})`], args[2])
+      : original.spawn(...args);
     const closed = new Promise(resolve => child.once('close', (code, signal) => resolve({code, signal})));
-    children.push({child, closed});
+    children.push({child, closed, file, argv});
     return child;
   }};
 });
@@ -41,9 +48,11 @@ beforeEach(async () => {
   await writeFile(join(bin, 'npm'), `#!/bin/bash\necho ran >> '${root}/npm.log'\nmkdir -p node_modules\nexit 0\n`, {mode: 0o755});
   probeCalls = 0;
   probeResult = {code: 0};
+  nftStub.code = undefined;
 });
 afterEach(async () => {
   vi.restoreAllMocks();
+  nftStub.code = undefined;
   for (const {child} of children) if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
   await Promise.all(children.splice(0).map(({closed}) => closed));
   await rm(root, {recursive: true, force: true});
@@ -77,7 +86,41 @@ describe('egress table readiness', () => {
     probeResult = {code: 1};
     await expect(makeRunner().prepare({nonce, label: 'abcdef-1'})).rejects.toMatchObject({code: 'egress-table-absent'});
   });
-  it('egress readiness: refuses the slot and falls back to local when the egress table is absent', async () => {
+  // The CLI main maps any thrown prepare error to cliFailure(); the Mac reads exit 254 before any bytes move as a safe local fallback.
+  it('egress readiness: the prepare CLI failure mapping exits 254 and prints the egress-table-absent diagnostic', async () => {
+    probeResult = {code: 1};
+    const error = await makeRunner().prepare({nonce, label: 'abcdef-1'}).catch(e => e);
+    expect(error.code).toBe('egress-table-absent');
+    expect(cliFailure('prepare', error)).toEqual({
+      stdout: '', exitCode: 254,
+      stderr: 'forge-exec-run: Egress table inet forge_exec_egress absent; use local fallback\n',
+    });
+    // forge-busy keeps its protected stdout line; other subcommands never print it.
+    const busy = Object.assign(new Error('busy'), {code: 'forge-busy'});
+    expect(cliFailure('prepare', busy)).toEqual({stdout: '{"reason":"forge-busy"}\n', stderr: 'forge-exec-run: busy\n', exitCode: 254});
+    expect(cliFailure('run', busy).stdout).toBe('');
+  });
+  it.each([
+    ['testEgressProbe', () => ({testEgressProbe: vi.fn(() => ({code: 0}))})],
+    ['testExecute', () => ({testExecute: vi.fn(() => ({code: 0}))})],
+    ['both', () => ({testEgressProbe: vi.fn(() => ({code: 0})), testExecute: vi.fn(() => ({code: 0}))})],
+  ])('egress readiness: ignores %s without testRoot and uses the production nft probe', async (_name, make) => {
+    const injected = make();
+    nftStub.code = 1;
+    const before = children.length;
+    await expect(createRunner(injected).egressReady()).rejects.toMatchObject({code: 'egress-table-absent'});
+    for (const callback of Object.values(injected)) expect(callback).not.toHaveBeenCalled();
+    const nft = children.slice(before).filter(c => c.file === '/usr/sbin/nft');
+    expect(nft).toHaveLength(1);
+    expect(nft[0].argv).toEqual(['list', 'table', 'inet', 'forge_exec_egress']);
+    // A zero exit from the production probe is the only thing that lets it pass.
+    nftStub.code = 0;
+    await expect(createRunner(injected).egressReady()).resolves.toBeUndefined();
+    for (const callback of Object.values(injected)) expect(callback).not.toHaveBeenCalled();
+  });
+  // Honest scope: this pins the launcher side only. The Mac's reaction to this exact record (it does NOT treat it as
+  // a certified not-started, so heavy-admission refuses rather than rerunning local) is pinned in remote-exec.test.mjs.
+  it('egress readiness: a run-time absent table rejects the slot, records the rejection and never executes', async () => {
     const runner = makeRunner(), request = await requestFor(runner);
     probeResult = {code: 1};
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
@@ -88,7 +131,7 @@ describe('egress table readiness', () => {
     });
     expect(await ran()).toBe(false);
   });
-  it('egress readiness: rechecks per command (the table deleted after a passing check refuses the next command)', async () => {
+  it('egress readiness: rechecks per run (the table deleted after a passing prepare refuses the run; it is not re-polled mid-run)', async () => {
     const runner = makeRunner(), request = await requestFor(runner);
     const before = probeCalls;
     expect(before).toBeGreaterThan(0);
