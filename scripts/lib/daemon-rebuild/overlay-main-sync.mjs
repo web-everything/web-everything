@@ -716,19 +716,15 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
       let remaining = retried, previous = evidence;
       // Coverage is always measured against the ORIGINAL failure, never the previous rerun: with several
       // reruns an assertion that vanished in rerun 1 would otherwise be forgotten by rerun 2.
-      const original = evidence, passedAcross = new Map();
+      // A file is only checked on the rerun where it clears, and that single run must itself re-execute
+      // every originally failed assertion (passes are not pooled across reruns: pooling over-credits twins).
+      const original = evidence;
       for (let attempt = 0; attempt < reruns; attempt++) {
         evidence = await check(remaining, attempt);
         if (evidence.remoteUnconfirmed) return await skip('remote-termination-unconfirmed');
-        // Passes accumulate across reruns: an original failure may clear in an earlier rerun than its file.
-        for (const [file, entry] of evidence.byFile) {
-          passedAcross.set(file, [...(passedAcross.get(file) ?? []), ...entry.passedIds]);
-        }
-        const cumulative = { byFile: new Map([...evidence.byFile].map(([file, entry]) =>
-          [file, { ...entry, passedIds: passedAcross.get(file) }])) };
         // A file that stops failing must have re-executed what failed originally; otherwise it is no pass.
         const cleared = previous.failed.filter(file => !evidence.failed.includes(file) && evidence.byFile.has(file));
-        if (cleared.length && !rerunCoversFailures(original, cumulative, cleared)) throw testFailure();
+        if (cleared.length && !rerunCoversFailures(original, evidence, cleared)) throw testFailure();
         if (evidence.green && !cleared.length) throw testFailure();
         if (evidence.green || !evidence.complete || !evidence.failed.length) break;
         remaining = evidence.failed; previous = evidence;
