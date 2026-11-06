@@ -27,6 +27,7 @@
  * `codex-prepare-pr-redispatched-as-unstamped.mjs` uses the same automatic registration.
  * `lease-reaper-stale-terminal-row.mjs` uses the same automatic registration.
  * `red-team-finished-result-never-published.mjs` uses the same automatic registration.
+ * `red-team-stale-refusal-burns-start-slot.mjs` uses the same automatic registration.
  * `review-hold-red-draft-deadlock.mjs` uses the same automatic registration.
  * `verdict-ledger-slow-push-race-refused.mjs` uses the same automatic registration.
  * `fixing-tag-unverified-launch.mjs` uses the same automatic registration.

@@ -16,6 +16,7 @@ import { redTeamForHead, redTeamMarker, parseRedTeamComment } from './red-team-g
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 import { isRealHead, safeErrorText, settleRedTeamSkip } from './red-team-skip-outcome.mjs';
+import { PreStartDispatchRefusalError } from './main-staleness.mjs';
 import { runGhSync } from './gh-throttle.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
@@ -722,7 +723,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           const reserved = budget && Number.isFinite(budget.left);
           if (reserved) budget.left--;
           try {
-            if (row.staleRecovery && !abandon({ repo, pr: row.prNumber, head: row.head }).ok) throw Error('stale abandonment refused');
+            if (row.staleRecovery && !abandon({ repo, pr: row.prNumber, head: row.head }).ok) throw new PreStartDispatchRefusalError('stale abandonment refused');
             const result = dispatch({ pr: row.prNumber, repo,
               ...(row.action === 'dispatch' ? { redTeamOnly: true, redTeamMode: row.mode } : {}),
               ...(preferLane != null ? { preferLane } : {}) });
@@ -739,12 +740,21 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
               dispatched.push({ prNumber: row.prNumber, jobPid: result.jobPid, mode: row.mode ?? row.action });
               started = true;
             }
-          } catch {
-            // A throw may follow a spawn: retain its reservation until the next live process read.
-            capacity.lanes--;
-            if (capacity.remainingStarts != null) capacity.remainingStarts--;
-            capacity.take?.();
-            row.why = 'dispatch failed; start unknown';
+          } catch (error) {
+            const message = safeErrorText(error);
+            const text = safeLine(message).slice(0, 300);
+            note(`review-daemon: ${repo}#${row.prNumber} red-team dispatch threw: ${text}`);
+            if (error instanceof PreStartDispatchRefusalError) {
+              // These guards refuse before spawning; leave capacity and cooldown available for retry.
+              if (reserved) budget.left++;
+              row.why = `dispatch refused before start: ${text}`;
+            } else {
+              // An unclassified throw may follow a spawn: retain its reservation until the next live process read.
+              capacity.lanes--;
+              if (capacity.remainingStarts != null) capacity.remainingStarts--;
+              capacity.take?.();
+              row.why = `dispatch failed; start unknown: ${text}`;
+            }
           }
         }
         if (!started) { row.action = 'skip'; notStarted.push({ prNumber: row.prNumber, reason: row.why }); }
