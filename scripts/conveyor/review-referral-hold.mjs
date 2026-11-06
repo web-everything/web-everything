@@ -247,7 +247,10 @@ export function refusedReferralsAreRuled(pr, run, { repo,
     if (live.pending.length) return false;
     const keys = new Set(live.records.filter(r => r.repo === repo && r.pr === run.pr
       && r.head === run.head && r.runId === run.id).flatMap(r => activeReferrals(r).map(f => f.key)));
-    return run.pending.every(key => keys.has(key));
+    // A cached reason token (author-stamp-missing) is not a finding key; the live read already cleared it. Only real
+    // finding keys must be ruled, and at least one must exist so a token alone never authorizes a rewind.
+    const findingKeys = run.pending.filter(key => !PENDING_REASON_TOKENS.has(key));
+    return findingKeys.length > 0 && findingKeys.every(key => keys.has(key));
   } catch { return false; }
 }
 
