@@ -449,7 +449,15 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           if (keepsPending && !acceptedReview) return notOwed();
           return { ...row, action: 'clear', why: 'not owed (stored review)' };
         }
-        if (!owed || finishedNotOwed) return notOwed();
+        // A judge/round-budget accept on this exact head (provable accept comment) leaves a non-accepting stored
+        // verdict behind, so pending can neither clear nor be told "not owed". Without any red-team state for the
+        // head, the pass has never run: dispatch it (the job settles not-owed itself) instead of a human look.
+        const acceptedByJudge = keepsPending && !acceptedReview && verdict === VERDICTS.PREVENTION_OUTSTANDING && !finishedNotOwed && !owed
+          && provenAcceptance({ comments: rawPr.comments, reviews, labels: rawPr.labels, head }) !== null
+          && !publishableClearGuard({ labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews, settlesPending: true })
+          && evidence?.status == null && status == null && evidence.recorded === false && evidence.seatRecorded === false
+          && !evidence.inFlight && !evidence.queued;
+        if ((!owed || finishedNotOwed) && !acceptedByJudge) return notOwed();
       }
       if (!movedCardOnly && evidence.loopPayload?.findings?.read?.netBasis?.rev !== head) return skip('stored review does not match live head');
       if (evidence.inFlight || evidence.queued) return skip('red-team pass in flight');
