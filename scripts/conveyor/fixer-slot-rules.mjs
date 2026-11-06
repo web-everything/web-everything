@@ -117,13 +117,16 @@ export function slotCountedItems({ items, cap, parkedReleasesSlot, parkedCapFact
 }
 
 /** Stale owed keys. PR facts are a Map keyed by record key; unknown facts retain the record.
- * Only an explicitly closed PR or a strictly newer, different SHA for the same repo/PR retires a wait.
+ * Only an explicitly closed PR or a strictly newer, different SHA in the same repo/PR, kind and session lineage
+ * retires a wait. Preserve previousCi inventory until PR closure; normal cleanup may still need its repair handoff.
  * `records` may include newer waits that have not yet become owed. */
 export function classifyStaleOwed({ owed, prFacts = new Map(), records = owed }) {
   return owed.filter(({ key, record: r }) => prFacts.get(key)?.open === false
-    || records.some(({ record: newer }) => r.repo && r.pr && r.sha && newer?.sha
+    || (!r.previousCi && records.some(({ record: newer }) => r.repo && r.pr && r.sha && newer?.sha
       && newer.repo === r.repo && newer.pr === r.pr && newer.sha !== r.sha
-      && Date.parse(newer.requestedAt) > Date.parse(r.requestedAt)))
+      && newer.kind === r.kind
+      && ['who', 'sessionId', 'lane'].some(field => r[field] && newer[field] === r[field])
+      && Date.parse(newer.requestedAt) > Date.parse(r.requestedAt))))
     .map(({ key }) => key);
 }
 

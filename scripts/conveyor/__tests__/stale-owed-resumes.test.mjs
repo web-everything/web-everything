@@ -40,16 +40,17 @@ describe('stale owed resumes (R618)', () => {
   });
 
   it('clears a superseded SHA even without a PR-state port', async () => {
-    const h = harness([entry('superseded', 6360), entry('newer', 6360, 1000, { sha: 'b'.repeat(40) })]);
+    const h = harness([entry('superseded', 6360), entry('newer', 6360, 1000, { who: 'superseded', sha: 'b'.repeat(40) })]);
     const out = await h.pass();
     expect(out.cleared).toEqual(['superseded']);
     expect(h.resumed).toEqual(['newer']);
   });
 
-  it('a cleared stale waiter does not turn its claim into a working slot', async () => {
+  it('keeps every claim counted conservatively after retiring its stale waiter', async () => {
     const h = harness([entry('claimed-stale', 6360), entry('claimed-live', 6193, 1000)], (_repo, pr) => ({ open: pr !== 6360 }));
     const claims = [{ meta: { repo: 'we', pr: 6360, kind: 'fix', sessionId: 'claimed-stale' } }];
-    expect((await h.pass(1, claims)).admitted).toEqual(['claimed-live']);
+    expect((await h.pass(1, claims)).admitted).toEqual([]);
+    expect(h.resumed).toEqual([]);
   });
 
   it('retains an open PR with a moved head and no newer record', async () => {
@@ -105,8 +106,79 @@ describe('stale owed resumes (R618)', () => {
 
   it('pure classification requires a later time, different SHA, and the same repo and PR', () => {
     const owed = [entry('original', 1), entry('equal-time', 1, 0, { sha: 'b'.repeat(40) }),
-      entry('same-sha', 1, 1000), entry('other-pr', 2, 2000, { sha: 'c'.repeat(40) }),
+      entry('same-sha', 1, 1000, { who: 'equal-time' }), entry('other-pr', 2, 2000, { sha: 'c'.repeat(40) }),
       entry('other-repo', 1, 2000, { repo: 'other/repo', sha: 'c'.repeat(40) })];
     expect(classifyStaleOwed({ owed, prFacts: new Map() })).toEqual(['equal-time']);
+  });
+
+  it.each(['who', 'sessionId', 'lane'])('supersedes only with a matching %s lineage', field => {
+    const old = entry('lineage-old', 1);
+    const newer = entry('lineage-new', 1, 1000, { sha: 'b'.repeat(40) });
+    expect(classifyStaleOwed({ owed: [old], records: [old, newer] })).toEqual([]);
+    newer.record[field] = old.record[field];
+    expect(classifyStaleOwed({ owed: [old], records: [old, newer] })).toEqual([old.key]);
+  });
+
+  it('missing lineage and a different kind cannot supersede a waiter', () => {
+    const old = entry('kind-old', 1, 0, { who: undefined, sessionId: undefined, lane: undefined });
+    const newer = entry('kind-new', 1, 1000, { ...old.record, requestedAt: new Date(T0 + 1000).toISOString(), sha: 'b'.repeat(40) });
+    expect(classifyStaleOwed({ owed: [old], records: [old, newer] })).toEqual([]);
+    old.record.who = newer.record.who = 'shared-worker';
+    newer.record.kind = 'ci-heal';
+    expect(classifyStaleOwed({ owed: [old], records: [old, newer] })).toEqual([]);
+  });
+
+  it.each([null, { open: true }, { open: false }])('retains previousCi inventory unless PR closure is confirmed: %j', state => {
+    const old = entry('inventory-old', 1, 0, { pendingResume: { kind: 'red', delivered: true },
+      previousCi: { ready: { ciFailures: [{ name: 'unit', conclusion: 'FAILURE' }] } } });
+    const newer = entry('inventory-new', 1, 1000, { who: old.record.who, sha: 'b'.repeat(40) });
+    expect(classifyStaleOwed({ owed: [old], records: [old, newer], prFacts: new Map([[old.key, state]]) }))
+      .toEqual(state?.open === false ? [old.key] : []);
+  });
+
+  it.each(['expired', 'future', 'invalid'])('a stale waiter with an %s time cannot hide an active claim', async mode => {
+    const requestedAt = mode === 'expired' ? new Date(T0 - 7_200_000).toISOString()
+      : mode === 'future' ? new Date(T0 + 7_200_000).toISOString() : 'unknown';
+    const old = entry(`active-${mode}`, 1, 0, { requestedAt });
+    const h = harness([old, entry(`waiting-${mode}`, 2)], (_repo, pr) => ({ open: pr !== 1 }));
+    const out = await h.pass(1, [{ meta: { repo: 'we', pr: 1, kind: 'fix', sessionId: old.record.sessionId } }]);
+    expect(out.cleared).toEqual([old.key]);
+    expect(out.admitted).toEqual([]);
+    expect(h.resumed).toEqual([]);
+  });
+
+  it.each(['sha', 'requestedAt', 'pendingResume', 'pendingResume-kind', 'pendingResume-detail', 'previousCi', 'missing', 'unreadable'])('fresh cleanup read retains a concurrent change to %s', async field => {
+    const old = entry(`concurrent-${field}`, 1);
+    const h = harness([old], () => ({ open: false }));
+    const replacement = { ...old.record };
+    if (field === 'sha') replacement.sha = 'b'.repeat(40);
+    if (field === 'requestedAt') replacement.requestedAt = new Date(T0 + 1000).toISOString();
+    if (field === 'pendingResume') delete replacement.pendingResume;
+    if (field === 'pendingResume-kind') replacement.pendingResume = { kind: 'red' };
+    if (field === 'pendingResume-detail') replacement.pendingResume = { ...old.record.pendingResume, detail: 'new repair work' };
+    if (field === 'previousCi') replacement.previousCi = { ready: { ciFailures: [{ name: 'unit', conclusion: 'FAILURE' }] } };
+    const list = h.io.listRecords;
+    h.io.prState = () => {
+      h.store.set(old.key, replacement);
+      if (field === 'missing') h.store.delete(old.key);
+      if (field === 'unreadable') h.io.listRecords = vi.fn().mockImplementationOnce(() => { throw Error('unreadable'); }).mockImplementation(list);
+      return { open: false };
+    };
+    expect((await h.pass(0)).cleared).toEqual([]);
+    expect(h.io.clearRecord).not.toHaveBeenCalled();
+    expect(h.store.get(old.key)).toBe(field === 'missing' ? undefined : replacement);
+  });
+
+  it('cleanup preserves an in-place change to nested previousCi inventory', async () => {
+    const old = entry('concurrent-nested-inventory', 1, 0, {
+      previousCi: { ready: { ciFailures: [] } },
+    });
+    const h = harness([old], () => {
+      old.record.previousCi.ready.ciFailures.push({ name: 'unit', conclusion: 'FAILURE' });
+      return { open: false };
+    });
+    expect((await h.pass(0)).cleared).toEqual([]);
+    expect(h.io.clearRecord).not.toHaveBeenCalled();
+    expect(h.store.get(old.key).previousCi.ready.ciFailures).toHaveLength(1);
   });
 });

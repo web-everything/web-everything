@@ -24,6 +24,7 @@ import { readFileSync, writeFileSync, renameSync, mkdirSync, rmSync } from 'node
 import { hostname } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { resolveFixDispatchMaxConcurrent, isPidAlive } from '../lib/dispatch-throttle.mjs';
@@ -102,7 +103,8 @@ const resumeMisses = new Map();
 export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings, claims, nowMs, ttlMs, cap }) {
   if (!settings.parkedReleasesSlot || !allowResume) return runPass({ io, allowResume, nowMs, ttlMs });
   const a = await runPass({ io, allowResume: false, nowMs, ttlMs });
-  const allRecords = io.listRecords();
+  // Detach the snapshot so even an in-place update during a PR read is detectable.
+  const allRecords = structuredClone(io.listRecords());
   const allOwed = allRecords.filter(({ record: r }) => r?.pendingResume?.kind && SLOT_KINDS.has(r.kind));
   const prFacts = new Map();
   const states = new Map(); // At most one state read per distinct owed PR per pass.
@@ -118,6 +120,10 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
   const cleared = [];
   for (const { key, record } of allOwed) if (stale.has(key)) {
     try {
+      // PR reads can yield while a worker re-marks this key. Never clear that replacement.
+      const current = io.listRecords().find(e => e.key === key)?.record;
+      if (!current?.pendingResume?.kind || !isDeepStrictEqual(current, record)) continue;
+      // Pass the compared snapshot, with no yield between comparison and invoking deletion.
       if (typeof io.clearRecord === 'function' && (await io.clearRecord(key, record))?.cleared !== false) cleared.push(key);
     } catch { /* Failed cleanup must not reserve admission capacity or stop live resumes. */ }
   }
@@ -125,10 +131,8 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
   const owedFix = allOwed.filter(({ key }) => !stale.has(key));
   const owedKeys = new Set(owedFix.map(({ key }) => key));
   for (const key of resumeMisses.keys()) if (!owedKeys.has(key)) resumeMisses.delete(key);
-  // Retiring a waiter must not turn its matching claim into a newly "working" session.
-  const staleRecords = allOwed.filter(({ key }) => stale.has(key));
-  const liveClaims = claims.filter(c => waitRecordForClaim(c, records) || !waitRecordForClaim(c, staleRecords));
-  const activeCount = claimStates(liveClaims, records, { nowMs, ttlMs }).filter((x) => x.state === 'active').length;
+  // Keep every claim: without a retained wait, its worker conservatively counts as active.
+  const activeCount = claimStates(claims, records, { nowMs, ttlMs }).filter((x) => x.state === 'active').length;
   const { admit, defer } = admitResumes({
     owed: owedFix.map(({ key, record }) => ({ key, requestedAtMs: ms(record.requestedAt), deprioritized: (resumeMisses.get(key) ?? 0) >= 3 })), activeCount, cap, parkedReleasesSlot: true,
   });
