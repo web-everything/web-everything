@@ -88,6 +88,9 @@ export function applyRecord(map, rec, keepPerPr) {
   // A review without a net-patch key is kept under a head-scoped key so compaction never drops it; it can never be carried.
   // The writer's txn rides along with every kept entry so compaction preserves the row's identity.
   const txn = rec.txn === undefined ? {} : { txn: rec.txn };
+  // The latest verdict for a head supersedes every earlier entry for that same head, whatever its key: otherwise a later
+  // keyless reject leaves the keyed accept for the head in place and a later head with that patch key carries the superseded accept.
+  for (const [k, entry] of Object.entries(history)) if (entry.head === rec.head) delete history[k];
   history[rec.netPatchHash ?? `${NOKEY}${rec.head}`] = { head: rec.head, verdict: rec.verdict, at: rec.at, ...txn };
   const kept = Object.entries(history).sort((a, b) => Date.parse(b[1].at) - Date.parse(a[1].at) || (a[0] < b[0] ? -1 : 1)).slice(0, keepPerPr);
   map[key] = { lastReviewedHead: rec.head, netPatchHash: rec.netPatchHash ?? null, verdict: rec.verdict, at: rec.at, ...txn, history: Object.fromEntries(kept) };

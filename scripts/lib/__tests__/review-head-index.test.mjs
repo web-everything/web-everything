@@ -100,6 +100,30 @@ describe('durability and growth', () => {
     for (const netPatchHash of [null, undefined, `head:${H(1)}`])
       expect(headReviewOwed({ index, repo: 'o/r', pr: 7, head: H(4), netPatchHash }), String(netPatchHash)).toMatchObject({ owed: true, reason: 'new-head' });
   });
+  it('the latest verdict for a head supersedes its earlier entries under any key: a later keyless reject never leaves the keyed accept carryable', () => {
+    rec({ head: H(1), netPatchHash: 'p1', verdict: 'accept', at: '2026-11-04T10:00:01Z' });
+    rec({ head: H(1), netPatchHash: null, verdict: 'reject', at: '2026-11-04T10:00:02Z' });
+    const check = index => {
+      expect(Object.keys(index.map['o/r#7'].history)).toEqual([`head:${H(1)}`]); // one entry per head, the latest
+      expect(headReviewOwed({ index, repo: 'o/r', pr: 7, head: H(1) })).toMatchObject({ owed: false, reason: 'same-head', verdict: 'reject' });
+      const later = headReviewOwed({ index, repo: 'o/r', pr: 7, head: H(2), netPatchHash: 'p1' });
+      expect(later).toMatchObject({ owed: true, reason: 'new-head' });
+      expect(later.carried).toBeUndefined();
+    };
+    check(readHeadIndex({ dir }));
+    // log-replay variant: the cached map is gone, so the index is rebuilt from the log rows alone
+    writeFileSync(headIndexPaths(dir).map, '{{');
+    check(readHeadIndex({ dir }));
+  });
+  it('a later keyed record for a head supersedes its earlier keyless entry, and survives compaction and replay', () => {
+    rec({ head: H(1), netPatchHash: null, verdict: 'reject', at: '2026-11-04T10:00:01Z', logMaxLines: 2 });
+    rec({ head: H(1), netPatchHash: 'p1', verdict: 'accept', at: '2026-11-04T10:00:02Z', logMaxLines: 2 });
+    rec({ head: H(2), netPatchHash: 'p2', verdict: 'accept', at: '2026-11-04T10:00:03Z', logMaxLines: 2 }); // 3 rows > 2: compacts
+    writeFileSync(headIndexPaths(dir).map, '{{');
+    const index = readHeadIndex({ dir });
+    expect(Object.keys(index.map['o/r#7'].history).sort()).toEqual(['p1', 'p2']);
+    expect(headReviewOwed({ index, repo: 'o/r', pr: 7, head: H(3), netPatchHash: 'p1' })).toMatchObject({ owed: false, carried: true, verdict: 'accept', fromHead: H(1) });
+  });
   it('a cached map with an invalid entry is rebuilt from the log, never trusted', () => {
     rec(); rec({ head: H(2), netPatchHash: 'p2' });
     const { map: mp, log } = headIndexPaths(dir);
