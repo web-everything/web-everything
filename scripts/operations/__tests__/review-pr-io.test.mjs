@@ -3509,3 +3509,83 @@ describe('post-accept advisory rating IO', () => {
     expect(logs.every(line => line.includes('live review unaffected'))).toBe(true);
   });
 });
+
+describe('strict accept publish wait ignores verdict-dependent required checks', async () => {
+  const { reviewCiGate } = await import('../../lib/review-ci-gate.mjs');
+  const head = 'f'.repeat(40);
+  const required = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'];
+  const ok = name => ({ name, status: 'completed', conclusion: 'success', head_sha: head });
+  const run = async (checks, { requiredChecks = required, decorate = gate => gate } = {}) => {
+    let time = 0;
+    const runNode = vi.fn(() => '{"ok":true}');
+    const sleep = vi.fn(async ms => { time += ms; });
+    const sinks = createReviewPrSinks({
+      env: { WE_REVIEW_START_EARLY: 'on', WE_REVIEW_START_AFTER: 'push', WE_REVIEW_START_EARLY_PUBLISH_WAIT_MS: '250', WE_REVIEW_START_EARLY_POLL_MS: '100' },
+      runNode, sleep, now: () => time, out: () => {}, readPublishHead: () => head,
+      publishGate: async () => decorate({ ...reviewCiGate({ headSha: head, requiredChecks, checks }), requiredChecks, checks }),
+    });
+    const publish = () => sinks[REVIEW_EFFECTS.LABEL]({ repo: 'o/n', pr: 7, to: 'accepted', actor: 'operator', bodyFile: 'v.md', reviewedHead: head }, { runId: 'r' });
+    return { publish, runNode };
+  };
+  const allButMerge = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'].map(ok);
+
+  it('publishes when only merge-gate (which runs after the verdict) is missing', async () => {
+    const f = await run(allButMerge);
+    await expect(f.publish()).resolves.toEqual({ ok: true });
+    expect(f.runNode).toHaveBeenCalledTimes(1);
+  });
+  it('still holds when a non-verdict required check is missing', async () => {
+    const f = await run(allButMerge.filter(row => row.name !== 'test'));
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+  it('still holds when test is pending even though merge-gate is also missing', async () => {
+    const f = await run([...allButMerge.filter(row => row.name !== 'test'), { name: 'test', status: 'in_progress', head_sha: head }]);
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+
+  // A required review-gate turns the strict reason into `required-review-gate-conflict` (review-ci-gate.mjs), and a
+  // trusted stale required-set read suffixes the reason (review-ci-gate-io.mjs#withSource): both still qualify.
+  const withReviewGate = ['test', 'review-gate'];
+  it.each([
+    ['missing', [ok('test')]],
+    ['pending', [ok('test'), { name: 'review-gate', status: 'in_progress', head_sha: head }]],
+    ['queued', [ok('test'), { name: 'review-gate', status: 'queued', head_sha: head }]],
+  ])('publishes when a required review-gate is %s and everything else is green', async (_label, checks) => {
+    const f = await run(checks, { requiredChecks: withReviewGate });
+    await expect(f.publish()).resolves.toEqual({ ok: true });
+    expect(f.runNode).toHaveBeenCalledTimes(1);
+  });
+  it('publishes when both merge-gate and review-gate are missing and everything else is green', async () => {
+    const f = await run(allButMerge, { requiredChecks: [...required, 'review-gate'] });
+    await expect(f.publish()).resolves.toEqual({ ok: true });
+    expect(f.runNode).toHaveBeenCalledTimes(1);
+  });
+  it('publishes on a trusted stale-cache read whose only gaps are verdict-dependent', async () => {
+    const f = await run([ok('test')], { requiredChecks: withReviewGate,
+      decorate: gate => ({ ...gate, source: 'stale-cache', cacheAgeMs: 5, reason: `${gate.reason} (stale-cache cache-age-ms=5)` }) });
+    await expect(f.publish()).resolves.toEqual({ ok: true });
+    expect(f.runNode).toHaveBeenCalledTimes(1);
+  });
+  it('still holds when review-gate is missing but test is pending', async () => {
+    const f = await run([{ name: 'test', status: 'in_progress', head_sha: head }], { requiredChecks: withReviewGate });
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['failed', { name: 'review-gate', status: 'completed', conclusion: 'failure', head_sha: head }],
+    ['on another head', { name: 'review-gate', status: 'completed', conclusion: 'success', head_sha: 'e'.repeat(40) }],
+    ['malformed', { name: 'review-gate', head_sha: head }],
+  ])('still holds when review-gate is %s (only missing/pending are exempt)', async (_label, row) => {
+    const f = await run([ok('test'), row], { requiredChecks: withReviewGate });
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+  it('still holds on an unrelated refusal reason even when its affected rows look verdict-dependent', async () => {
+    const f = await run([ok('test')], { requiredChecks: withReviewGate,
+      decorate: gate => ({ ...gate, reason: 'untrusted-required-set' }) });
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+});

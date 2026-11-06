@@ -14,6 +14,8 @@
  *                                        then schedule backoff verify-only retries for fixes (other kinds resume with the blocked-on-infra exit)
  *   - red only on timeouts the gate already re-ran alone → resume with a saved-fix hold in WE, a re-dispatch hold elsewhere
  *                                        (the existing quiet-host reverify pass then owns the saved fix)
+ *   - timeout-only red under high load (fixes only) → defer until quiet, then reverify the same head, bounded by
+ *                                        verify.loadRetry.maxAttempts; exhaustion follows the normal red ladder
  *   - red on attempt `maxReds`         → resume with the gate-red exit (the escalation ladder counts it)
  *   - any other red                    → resume the SAME session with the failing tests attached
  *   - the lane moved / went dirty      → resume: the record no longer describes the lane
@@ -23,7 +25,8 @@
  */
 import { execFileSync } from 'node:child_process';
 import { lstatSync, mkdtempSync, rmSync, existsSync, mkdirSync, copyFileSync, realpathSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, loadavg, cpus } from 'node:os';
+import { legacyLoadQuiet, reverifyConfig } from './load-flake-reverify.mjs';
 import { join, resolve, dirname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -52,6 +55,8 @@ import { listSalvage, writeSalvage, clearSalvage, planSalvage, resolveSalvageTun
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 /** Policy limits. `maxReds` counts the record's own `attempt` (the fixer bumps it on each re-mark). */
+/** Longest one load deferral may wait for a quiet host before the red follows the normal ladder (2h). */
+export const AWAIT_LOAD_DEFER_MAX_MS = 2 * 60 * 60_000;
 export const AWAIT_VERIFY_LIMITS = Object.freeze({ maxReds: 3, maxRetries: 2, maxResumeFailures: 3, selfReviewMaxMs: 30 * 60_000 });
 /** Repo keys with a quiet-host reverify worker (mirrors stand-down.mjs#LOAD_FLAKE_REVERIFY_REPOS). */
 export const AWAIT_LOAD_FLAKE_REPO_KEYS = Object.freeze(['we']);
@@ -77,13 +82,53 @@ export function isLoadFlakeRed(marker) {
   return tests.every((t) => files.has(t?.file));
 }
 
+/** Complete per-test timeout evidence; summary text alone cannot exclude assertions. */
+export function isTimeoutOnlyRed(marker) {
+  if (marker?.status !== 'red' || ['standards', 'scan'].includes(marker.redCause)) return false;
+  if (['scan', 'standards', 'guard'].some(phase => marker.phases?.outcomes?.[phase]?.result === 'fail')) return false;
+  const details = marker.failureDetails;
+  const completeTimeoutInventory = !!details && !details.truncated
+    && Array.isArray(details.tests) && details.tests.length > 0
+    && details.tests.every(test => typeof test?.file === 'string' && typeof test.name === 'string' && test.timeout === true);
+  // A process timeout cannot overrule recorded assertions or incomplete failure evidence.
+  if (details !== undefined && !completeTimeoutInventory) return false;
+  // A bare exit 124 is only a timeout when no recorded cause names an assertion/in-diff failure.
+  const processTimeout = marker.exitCode === 124 && (marker.redCause === undefined || marker.redCause === null || marker.redCause === 'test-timeout');
+  return processTimeout || (marker.redCause === 'test-timeout' && completeTimeoutInventory);
+}
+
+/** A decision about a known red the load-retry path still owns. It outranks hand-back and is never pushed early. */
+export const isLoadRedReason = reason => String(reason ?? '').startsWith('red-load-');
+
+/**
+ * Does this record's sha carry a known timeout red still owned by the load-retry path? `loadRetry` is written only on a
+ * red and lives until the record is cleared (a green push or a resume); a new `mark` starts a record without it. While it
+ * is present, a `running` / overdue / no-verdict decision is the retry in flight, not a fresh unverified wait: the sha is
+ * never pushed early and never handed back as a no-op. Pure.
+ */
+export const hasKnownLoadRed = record => record?.loadRetry !== null && typeof record?.loadRetry === 'object';
+
+/**
+ * After a load re-run was persisted, is this red still the verdict it was meant to replace? True when the red started
+ * (or finished) no later than the re-run request: the request failed, or the pass crashed between write and request.
+ * A red with no readable time cannot prove it is the re-run's own verdict, so it counts as stale too. Pure.
+ */
+export function isStaleLoadRerunRed(record, marker) {
+  const retry = record?.loadRetry;
+  if (!retry || retry.waiting !== false || !((retry.attempts ?? 0) > 0)) return false;
+  // Records written before `rerunAt` existed stamped the same instant as requestedAt.
+  const rerunAt = Date.parse(retry.rerunAt ?? record.requestedAt ?? '');
+  const times = [marker?.startedAt, marker?.finishedAt].map(t => Date.parse(t ?? '')).filter(Number.isFinite);
+  return !Number.isFinite(rerunAt) || !times.length || Math.max(...times) <= rerunAt;
+}
+
 /**
  * The one decision for one record. Pure.
  * @param {{record:object, marker:object|null, lane:{head:string|null, dirty:boolean, treeHash:string|null}|null,
- *   nowMs:number, ttlMs:number, limits?:object}} input
+ *   nowMs:number, ttlMs:number, limits?:object, loadHigh?:boolean, loadMaxAttempts?:number}} input
  * @returns {{action:'skip'|'wait'|'push'|'rerequest'|'resume', reason:string, resume?:string}}
  */
-export function classifyAwaitVerdict({ record, marker, lane, nowMs, ttlMs, limits = AWAIT_VERIFY_LIMITS }) {
+export function classifyAwaitVerdict({ record, marker, lane, nowMs, ttlMs, limits = AWAIT_VERIFY_LIMITS, loadHigh = false, loadMaxAttempts = 3 }) {
   if (!isHarnessRecord(record)) return { action: 'skip', reason: 'not-harness-record' };
   if (record.pendingResume?.kind) return { action: 'resume', reason: 'pending-resume', resume: record.pendingResume.kind };
   if (!lane || !lane.head) return { action: 'resume', reason: 'lane-unreadable', resume: 'void' };
@@ -106,8 +151,21 @@ export function classifyAwaitVerdict({ record, marker, lane, nowMs, ttlMs, limit
     return age > ttlMs ? rerequest('verify-overdue') : { action: 'wait', reason: 'running' };
   }
   if (v.status === 'red') {
+    // A failed (or never-sent) load re-run leaves the old red in place. That is no new verdict: re-request it, bounded by
+    // `maxRetries`, then the fix infra-retry ladder. Never red/escalate on it.
+    if (record.kind === 'fix' && isStaleLoadRerunRed(record, marker)) return rerequest('red-load-rerun-unconfirmed');
     if (!isNoPushRecord(record) && AWAIT_LOAD_FLAKE_REPO_KEYS.includes(repoKeyOrNull(record.repo)) && isLoadFlakeRed(marker)) return { action: 'resume', reason: 'red-load-flake', resume: 'load-flake' };
     if (!isNoPushRecord(record) && !AWAIT_LOAD_FLAKE_REPO_KEYS.includes(repoKeyOrNull(record.repo)) && isLoadFlakeRed(marker)) return { action: 'resume', reason: 'red-load-flake', resume: 'load-flake-redispatch' };
+    if (record.kind === 'fix' && isTimeoutOnlyRed(marker) && (record.loadRetry?.attempts ?? 0) < loadMaxAttempts) {
+      // A deferral is bounded in time too: persistent high load past the cap falls through to the normal red ladder.
+      const since = Date.parse(record.loadRetry?.since ?? '');
+      const expired = record.loadRetry?.waiting && Number.isFinite(since) && nowMs - since > AWAIT_LOAD_DEFER_MAX_MS;
+      if (expired || (record.loadRetry?.waiting && !Number.isFinite(since))) { /* red ladder */ }
+      else if (record.loadRetry?.waiting) return loadHigh
+        ? { action: 'wait', reason: 'red-load-deferred' }
+        : { action: 'rerequest', reason: 'red-load-shaped', loadRerun: true };
+      else if (loadHigh) return { action: 'wait', reason: 'red-load-deferred', loadDefer: 'start' };
+    }
     if ((record.attempt ?? 1) >= limits.maxReds) return { action: 'resume', reason: `red on attempt ${record.attempt}`, resume: 'escalate' };
     return { action: 'resume', reason: 'red', resume: 'red' };
   }
@@ -262,10 +320,11 @@ export function isSessionBusy(session) {
  * fix.pushBeforeGate — is the harness owed an EARLY push of this record's sha (before any verify verdict)? Only a `fix`
  * wait, only while no verdict exists yet (`wait`, or `rerequest` with the lane still at the recorded sha and clean — the
  * classifier answers `resume` for a moved or dirty lane before either), and only until that sha's early push is done or
- * its transient retries are spent. A known red is never pushed early: a red verdict classifies `resume`. Pure.
+ * its transient retries are spent. A known red is never pushed early, including a load-deferred red. Pure.
  */
 export function isEarlyPushOwed({ record, decision, policy, limits = AWAIT_VERIFY_LIMITS }) {
   if (policy?.pushBeforeGate !== true) return false;
+  if (isLoadRedReason(decision?.reason) || hasKnownLoadRed(record)) return false;
   if (!isHarnessRecord(record) || record.kind !== 'fix' || record.pendingResume) return false;
   if (decision?.action !== 'wait' && decision?.action !== 'rerequest') return false;
   const ep = record.earlyPush;
@@ -319,7 +378,10 @@ export function selfReviewGate({ io, record, nowMs, limits = AWAIT_VERIFY_LIMITS
 function holdHandBack(row, record, gate, persist, nowMs, kind = 'green') {
   const verdict = kind === 'no-new-commit' ? kind : 'verify green';
   if (!record.selfReviewHeldAt) {
-    if (!persist({ ...record, selfReviewHeldAt: new Date(nowMs).toISOString() })) return;
+    // The hold is bounded by `selfReviewMaxMs` (well under the await TTL). Restart `requestedAt` with it, so the session
+    // reaper (classifyAwaitVerify) keeps the idle fixer exempt for the whole hold, even when the green came late.
+    const at = new Date(nowMs).toISOString();
+    if (!persist({ ...record, requestedAt: at, selfReviewHeldAt: at })) return;
     Object.assign(row, { action: 'self-review-hold', reason: gate.hold, result: `${verdict}; push + resume withheld until the self-review returns (fix claim still held)` });
   } else Object.assign(row, { action: 'wait', reason: `${kind}; ${gate.hold}` });
 }
@@ -408,13 +470,17 @@ export async function runAwaitVerifyPass({
       const pendingNoOp = record?.pendingResume?.kind === 'no-new-commit';
       const lane = isHarnessRecord(record) && (!record.pendingResume || pendingNoOp) ? io.laneState(record.lane, { hashDirty: isNoPushRecord(record) }) : null;
       let marker = lane ? io.readMarker(record.lane) : null;
-      let d = classifyAwaitVerdict({ record, marker, lane: record.pendingResume ? { head: record.sha } : lane, nowMs, ttlMs, limits });
+      let loadHigh = false;
+      try { loadHigh = io.loadHigh?.() === true; } catch { /* Unknown load follows the normal red ladder. */ }
+      const loadMaxAttempts = recovery.value.loadRetry?.maxAttempts ?? 3;
+      const loadInput = { loadHigh, loadMaxAttempts };
+      let d = classifyAwaitVerdict({ record, marker, lane: record.pendingResume ? { head: record.sha } : lane, nowMs, ttlMs, limits, ...loadInput });
       if (pendingNoOp) {
         // A deferred no-op is not a verify verdict. Red/void/infra recovery takes precedence over hand-back,
         // even after an auth pause, busy session or failed delivery. Preserve valid no-ops without re-pushing.
         const current = { ...record }; delete current.pendingResume;
-        const fresh = classifyAwaitVerdict({ record: current, marker, lane, nowMs, ttlMs, limits });
-        if (fresh.action === 'resume') { record = current; d = fresh; }
+        const fresh = classifyAwaitVerdict({ record: current, marker, lane, nowMs, ttlMs, limits, ...loadInput });
+        if (fresh.action === 'resume' || isLoadRedReason(fresh.reason) || hasKnownLoadRed(current)) { record = current; d = fresh; }
         // Replacement is persisted below before any resume/retry effect; read/write errors retain the waiter.
       }
       Object.assign(row, { action: d.action, reason: d.reason });
@@ -433,7 +499,7 @@ export async function runAwaitVerifyPass({
         // verdict before either push path; a newly red or moved lane takes precedence.
         const currentLane = io.laneState(record.lane);
         marker = currentLane ? io.readMarker(record.lane) : null;
-        d = classifyAwaitVerdict({ record, marker, lane: currentLane, nowMs, ttlMs, limits });
+        d = classifyAwaitVerdict({ record, marker, lane: currentLane, nowMs, ttlMs, limits, ...loadInput });
         Object.assign(row, { action: d.action, reason: d.reason });
         earlyOwed = !(record?.infraRetry?.scheduled && d.action === 'wait') && isEarlyPushOwed({ record, decision: d, policy, limits });
       }
@@ -467,10 +533,30 @@ export async function runAwaitVerifyPass({
           // takes precedence over hand-back. Read errors retain the persisted waiter for retry.
           const currentLane = io.laneState(record.lane, { hashDirty: isNoPushRecord(record) });
           marker = currentLane ? io.readMarker(record.lane) : null;
-          const fresh = classifyAwaitVerdict({ record, marker, lane: currentLane, nowMs, ttlMs, limits });
-          if (fresh.action === 'resume') d = fresh;
+          const fresh = classifyAwaitVerdict({ record, marker, lane: currentLane, nowMs, ttlMs, limits, ...loadInput });
+          if (fresh.action === 'resume' || isLoadRedReason(fresh.reason)) d = fresh;
           Object.assign(row, { action: d.action, reason: d.reason });
         }
+      }
+      if (d.loadDefer || d.loadRerun || d.reason === 'red-load-deferred') {
+        row.reason = `${d.reason}; loadHigh=${loadHigh}; verify.loadRetry.maxAttempts=${loadMaxAttempts} (${recovery.sources?.['loadRetry.maxAttempts'] ?? recovery.sources?.loadRetry ?? 'standard'})`;
+        row.action = d.loadRerun ? 'load-rerun' : 'load-deferred';
+        // The session reaper exempts a fixer only within `ttlMs` of `requestedAt` (classifyAwaitVerify). A deferral is
+        // bounded by its own `since` (AWAIT_LOAD_DEFER_MAX_MS), so keep `requestedAt` fresh while it waits: the fixer stays
+        // exempt until the deferral's own deadline, and the red ladder resumes it after that.
+        const exemptionStale = !(nowMs - Date.parse(record.requestedAt) <= ttlMs / 2);
+        if (d.loadDefer) persist({ ...record, requestedAt: new Date(nowMs).toISOString(), loadRetry: {
+          attempts: record.loadRetry?.attempts ?? 0, waiting: true, since: new Date(nowMs).toISOString(),
+        } });
+        else if (d.reason === 'red-load-deferred' && exemptionStale) persist({ ...record, requestedAt: new Date(nowMs).toISOString() });
+        // `rerunAt` lets the next tick tell the re-run's verdict from the red it replaces, should this request fail.
+        if (d.loadRerun && persist({ ...record, requestedAt: new Date(nowMs).toISOString(), loadRetry: {
+          attempts: (record.loadRetry?.attempts ?? 0) + 1, waiting: false, rerunAt: new Date(nowMs).toISOString(),
+        } })) {
+          const r = io.rerequest(record.lane);
+          row.result = r?.status ?? (r?.ok ? 'requested' : 'request-failed');
+        }
+        rows.push(row); continue;
       }
       if (record?.kind === 'fix' && (d.resume === 'infra' || (record.infraRetry?.scheduled && d.action === 'wait'))) {
         const { maxAttempts, backoffMinutes } = recovery.value.infraRetry;
@@ -502,7 +588,9 @@ export async function runAwaitVerifyPass({
       }
       if (record?.kind === 'fix' && !record.pendingResume && record.earlyPush?.ok && record.earlyPush.upToDate
         && (record.attempt ?? 1) === 1 && record.earlyPush.attempts === 1
-        && lower(record.earlyPush.sha) === lower(record.sha) && (d.action === 'wait' || d.action === 'rerequest')) {
+        && lower(record.earlyPush.sha) === lower(record.sha) && (d.action === 'wait' || d.action === 'rerequest')
+        // A known red awaiting (or running) its load re-run is never handed back as a no-op.
+        && !isLoadRedReason(d.reason) && !hasKnownLoadRed(record)) {
         // A no-op still hands the claim back. Retain the original wait while review is open, so a later
         // verify red or moved lane is still observed; only an overdue review may resume for recovery.
         const gate = selfReviewGate({ io, record, nowMs, limits });
@@ -846,6 +934,10 @@ export async function defaultAwaitVerifyIo({
     readPreviousChecks: readReviewChecks,
     readPreviousRequired: getRequiredStatusChecks,
     retryPolicy: () => loadVerifyRecoverySettings({ env }),
+    loadHigh: () => {
+      try { return !legacyLoadQuiet(loadavg(), cpus().length, reverifyConfig(env)); }
+      catch { return false; }
+    },
     // Match fix-end: missing is allowed; unreadable/malformed must retain the waiter and report the error.
     readSelfReview: (record) => readSelfReview({ repo: record.repo, pr: record.pr }, { dir: selfReviewStoreDir(env), strict: true }),
     listRecords: () => listStoredAwaitVerify(),

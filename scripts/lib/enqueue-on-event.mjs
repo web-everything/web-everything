@@ -706,7 +706,10 @@ export function createEnqueueOnEvent({
   readMembership = ({ repo, num }) => readMergeQueueMembership({ repo, num, env }),
   prestageCache = createPrestageCache({ env }),
   timeoutMs, readPr = ({ repo, num }) => readPrForWake({ repo, num, env }),
+  // The drain's own code version (full sha). A miss-backoff recorded under older code is re-evaluated once.
+  readCodeVersion = () => String(execFileSyncImpl('git', ['rev-parse', 'HEAD'], { cwd: scriptRoot(), env, encoding: 'utf8', timeout: 10_000 })).trim(),
 } = {}) {
+  const codeVersion = () => { try { const v = String(readCodeVersion() ?? '').trim(); return /^[0-9a-f]{40}$/.test(v) ? v : null; } catch { return null; } };
   const staged = p => {
     const s = resolvePrestageSettings({ env });
     return s.value.prestageWhileCiRuns && prestageCache.get(p.repo, p.num, s.value.prestageTtlMin)?.eligible;
@@ -721,6 +724,8 @@ export function createEnqueueOnEvent({
   const missHold = (num, pr, s) => {
     const held = missBackoff.get(num);
     if (!held) return null;
+    const nowCode = held.codeVersion ? codeVersion() : null; // unreadable on either side keeps today's behaviour
+    if (nowCode && nowCode !== held.codeVersion) { missBackoff.delete(num); return null; }
     if (!missSettings(s).enabled || typeof pr?.headRefOid !== 'string' || !pr.headRefOid || held.headSha !== pr.headRefOid || held.labelsDigest !== labelsDigest(pr)
       || pr.state && pr.state !== 'OPEN') { missBackoff.delete(num); return null; }
     return now() - held.at < missSettings(s).ttlMinutes * 60_000 ? held : null;
@@ -1000,7 +1005,7 @@ export function createEnqueueOnEvent({
         const holdEligible = enqueueOutcome?.outcome === 'not-enqueued' && isMissBackoffHoldEligible(enqueueOutcome.kind);
         if (missSettings(s).enabled && holdEligible && summary.startsWith('not enqueued:') && typeof pr?.headRefOid === 'string' && pr.headRefOid && digest) {
           const reason = summary.slice('not enqueued:'.length).trim();
-          missBackoff.set(p.num, { pr: p.num, headSha: pr.headRefOid, labelsDigest: digest, reason, at: now(),
+          missBackoff.set(p.num, { pr: p.num, headSha: pr.headRefOid, labelsDigest: digest, reason, at: now(), codeVersion: codeVersion(),
             logged: previous?.reason === reason && previous.logged === true });
         }
         if (!r.error && (summary.startsWith('passed every drain gate — enqueued') || summary.startsWith('not listed'))) backoff.delete(p.num);
