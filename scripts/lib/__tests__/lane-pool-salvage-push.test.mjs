@@ -576,7 +576,9 @@ describe('real salvage preservation and transport', () => {
       writeFileSync(join(gitDir, 'refs', 'remotes', 'origin', 'work', 'x'), `${head}\n`);
       const { io, runGit } = realHarness({ gitDir, symrefs: '' });
       io.fetchHeads(laneDir);
-      expect(runGit.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(true);
+      // The salvage fetch writes no FETCH_HEAD and runs no lane-configured maintenance (reflog expiry, gc, pack-refs).
+      const fetchArgs = runGit.mock.calls.find(([, args]) => args.includes('fetch'))[1];
+      expect(fetchArgs).toEqual(expect.arrayContaining(['--no-write-fetch-head', '--no-auto-maintenance', '--recurse-submodules=no']));
     } finally { rmSync(gitDir, { recursive: true, force: true }); }
     const relative = realHarness({ gitDir: '.git', symrefs: '' });
     expect(() => relative.io.fetchHeads(laneDir)).toThrow(/unreadable lane git dir/);
@@ -603,7 +605,7 @@ describe('real salvage preservation and transport', () => {
     io.fetchVerifyObjects(laneDir);
     expect(fetched).toMatch(/^refs\/release-verify\/[a-f0-9]{16}$/);
     const fetchArgs = runGit.mock.calls.find(([, args]) => args.includes('fetch'))[1];
-    expect(fetchArgs).toEqual(expect.arrayContaining(['--no-write-fetch-head', '--no-tags', repo.originUrl, `+refs/heads/*:${fetched}/*`, '^refs/heads/ops/*']));
+    expect(fetchArgs).toEqual(expect.arrayContaining(['--no-write-fetch-head', '--no-auto-maintenance', '--no-tags', repo.originUrl, `+refs/heads/*:${fetched}/*`, '^refs/heads/ops/*']));
     expect(fetchArgs).not.toContain('--prune');
     expect(fetchArgs.some(arg => arg.includes('refs/remotes/'))).toBe(false);
     expect(runGit.mock.calls.filter(([, args]) => args.includes('update-ref'))).toHaveLength(1);

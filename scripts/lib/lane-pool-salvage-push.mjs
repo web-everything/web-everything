@@ -196,8 +196,9 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
   // Fetch every non-ops origin head into refs/remotes/origin/*. Explicit refspecs make pruning independent of lane config.
   // No FETCH_HEAD (nothing reads it): Git opens it with a plain fopen, so a lane-made `.git/FETCH_HEAD ->
   // refs/heads/<branch>` symlink would overwrite that branch before the release guard looks (PR #6319 self-review).
-  const fetchHeads = dir => transportGit(dir, 'fetch', '--recurse-submodules=no', '--no-write-fetch-head', '--prune', '--no-tags',
-    origin, '+refs/heads/*:refs/remotes/origin/*', notOps);
+  // No auto-maintenance either: lane gc.*/maintenance.* config must not expire reflogs, repack or prune during release.
+  const fetchHeads = dir => transportGit(dir, 'fetch', '--recurse-submodules=no', '--no-write-fetch-head', '--no-auto-maintenance',
+    '--prune', '--no-tags', origin, '+refs/heads/*:refs/remotes/origin/*', notOps);
   // The release proof needs only the origin's OBJECTS, never its refs: fetch into a fresh private namespace (no
   // FETCH_HEAD, no tracking refs) and delete it again without dereferencing, so no lane-controlled ref is ever written.
   const fetchVerifyObjects = dir => {
