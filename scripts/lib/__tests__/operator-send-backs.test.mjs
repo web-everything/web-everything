@@ -375,6 +375,19 @@ describe('quoted and fenced references never resolve an operator request', () =>
     const body = `${release}<pre>\n<!-- addresses-operator-send-back: 1001 -->\n</pre>\n`;
     expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual(['1001']);
   });
+  // An unrelated closing tag must not close the open block: only a closer naming the innermost open tag does.
+  it.each([
+    ['a stray </blockquote> inside <pre>', '<pre>\n</blockquote>\n<!-- addresses-operator-send-back: 1001 -->\n</pre>\n'],
+    ['a stray </pre> inside <blockquote>', '<blockquote>\n</pre>\n<!-- addresses-operator-send-back: 1001 -->\n</blockquote>\n'],
+    ['a stray </PRE > with attributes-free spacing inside <blockquote>', '<blockquote>\n</PRE >\n<!-- addresses-operator-send-back: 1001 -->\n</blockquote>\n'],
+    ['crossed nesting <pre><blockquote></pre>', '<pre><blockquote>x</pre>\n<!-- addresses-operator-send-back: 1001 -->\n</blockquote></pre>\n'],
+  ])('%s does not expose the marker still inside the block', (_name, block) => {
+    expect(open([request, comment('end', 'web-everything', '21:00', `${release}${block}`)])).toEqual(['1001']);
+  });
+  it('properly nested mixed blocks still close, so a marker after them resolves', () => {
+    const body = `${release}<pre><blockquote>x</blockquote></pre>\n<!-- addresses-operator-send-back: 1001 -->\n`;
+    expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual([]);
+  });
   it('a closing fence indented four or more spaces is content, so the example stays hidden', () => {
     const body = `${release}\`\`\`\n    \`\`\`\n<!-- addresses-operator-send-back: 1001 -->\n`;
     expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual(['1001']);

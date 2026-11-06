@@ -43,19 +43,25 @@ function stripHtmlBlocks(text) {
   // whole tag name counts: `<pre-commit>` or `<blockquote styling` must not hide a real marker.
   const scan = blankInlineCode(source);
   const tag = /<(\/?)(blockquote|pre)(?:\s[^<>]*)?\/?>/gi;
-  let out = '', last = 0, depth = 0, start = 0, m;
+  // Open tag names, innermost last. A closer only counts when it names the innermost open tag: an unrelated one
+  // (`</blockquote>` inside `<pre>`) is ignored, so a marker still inside the example stays hidden (fails closed).
+  const open = [];
+  let out = '', last = 0, start = 0, m;
   while ((m = tag.exec(scan))) {
+    const name = m[2].toLowerCase();
     if (!m[1]) {
-      if (!depth) start = m.index;
-      depth++;
-    } else if (depth && --depth === 0) {
+      if (!open.length) start = m.index;
+      open.push(name);
+    } else if (open.length && open[open.length - 1] === name) {
+      open.pop();
+      if (open.length) continue;
       const end = source.indexOf('>', m.index);
-      if (end === -1) { depth = 1; break; } // a closing tag with no ">" is still unterminated
+      if (end === -1) { open.push(name); break; } // a closing tag with no ">" is still unterminated
       out += source.slice(last, start) + ' ';
       last = tag.lastIndex = end + 1;
     }
   }
-  return depth ? out + source.slice(last, start) + ' ' : out + source.slice(last);
+  return open.length ? out + source.slice(last, start) + ' ' : out + source.slice(last);
 }
 /**
  * Only text a fixer actually wrote as a claim can resolve a request: blockquoted lines ("> Request 1001 remains
