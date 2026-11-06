@@ -38,7 +38,9 @@ describe('launchd clone restart', () => {
     ['data argument', [resolve('..', 'bin', 'sampler'), '--data-dir', cloneRoot]],
     ['script data argument', ['node', resolve('..', 'other-clone', 'sampler.mjs'), '--data-dir', cloneRoot]],
     ['working directory alone', [resolve('..', 'bin', 'sampler')]],
-    ['interpreter option value', ['node', '--require', join(cloneRoot, 'loader.mjs'), resolve('..', 'other-clone', 'sampler.mjs')]],
+    // --require/--import/--loader values are CODE the service runs (covered by the preload tests below); a
+    // --conditions value is only data.
+    ['interpreter option value that is data', ['node', '--conditions', join(cloneRoot, 'loader.mjs'), resolve('..', 'other-clone', 'sampler.mjs')]],
   ])('ownership counts executable/script positions only: %s', async (_name, ProgramArguments) => {
     const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments, WorkingDirectory: cloneRoot }]);
     expect(findServicesRunningFromClone(o).matches).toEqual([]);
@@ -390,6 +392,21 @@ describe('withSelfSync service restart hook', () => {
       finish(); await expect(pending).resolves.toBe('restarted');
       expect(events).toEqual(['kicked', 'exit']);
     } finally { finish?.(); vi.useRealTimers(); }
+  });
+  it('a recovered adoption (moved=false, adopted=true) restarts services once with the adopted head', async () => {
+    const restart = vi.fn(async () => {});
+    await wrapped({ moved: false, adopted: true, reason: 'recovered-adopted', head: 'recovered-sha' }, restart, { diffFiles: () => null }).tickOnce();
+    expect(restart).toHaveBeenCalledTimes(1);
+    expect(restart.mock.calls[0][0]).toMatchObject({ adoptedSha: 'recovered-sha' });
+  });
+  it.each([
+    ['up-to-date', { moved: false, adopted: false, reason: 'up-to-date', head: 'same' }],
+    ['adopted without a move or recovery', { moved: false, adopted: true, reason: 'other', head: 'same' }],
+    ['moved but not adopted', { moved: true, adopted: false, head: 'new' }],
+  ])('a %s result does not restart services', async (_name, result) => {
+    const restart = vi.fn(async () => {});
+    await wrapped(result, restart, { diffFiles: () => null }).tickOnce();
+    expect(restart).not.toHaveBeenCalled();
   });
   it('hung restartServices times out at default 15 seconds with operator fallback', async () => {
     vi.useFakeTimers(); const log = { error: vi.fn() }, onRestart = vi.fn(() => 'restarted');
@@ -818,6 +835,32 @@ describe('interpreter option shapes that once hid a clone script (value contains
   it('quoted env -S string running an unrelated script is not claimed', () => {
     const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/env', '-S', `"${outside}" "${other}" "${join(cloneRoot, 'data')}"`] }]);
     expect(findServicesRunningFromClone(o).matches).toEqual([]);
+  });
+  describe('node preload options run clone code before an external entry', () => {
+    const boot = join(cloneRoot, 'bootstrap.cjs');
+    it.each([
+      ['--require', [outside, '--require', boot, other]],
+      ['-r', [outside, '-r', boot, other]],
+      ['--import', [outside, '--import', boot, other]],
+      ['--loader', [outside, '--loader', boot, other]],
+      ['--experimental-loader', [outside, '--experimental-loader', boot, other]],
+      ['--require=', [outside, `--require=${boot}`, other]],
+      ['--import=', [outside, `--import=${boot}`, other]],
+      ['--loader=', [outside, `--loader=${boot}`, other]],
+      ['--experimental-loader=', [outside, `--experimental-loader=${boot}`, other]],
+      ['via env -S', ['/usr/bin/env', '-S', `"${outside}" --require "${boot}" "${other}"`]],
+    ])('%s is discovered, restarted and flagged stale', async (_name, ProgramArguments) => {
+      const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments }]);
+      expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
+      expect((await restartServicesForClone(o)).restarted).toHaveLength(1);
+      expect(findStaleCodeServices({ ...o, readProcessStartMs: () => 100_000, readAdoptedAtMs: () => 200_000 })).toHaveLength(1);
+    });
+    it.each([
+      ['separate operand', [outside, '--require', other, other]],
+      ['attached operand', [outside, `--require=${other}`, other]],
+    ])('a preload outside the clone with an external entry is not claimed: %s', (_name, ProgramArguments) => {
+      expect(findServicesRunningFromClone(fixture([{ Label: 'com.we.resource-sampler', ProgramArguments }])).matches).toEqual([]);
+    });
   });
   it.each(['"unterminated', "'unterminated", 'trailing\\', '${HOME}/x', '"${HOME}/x"', 'a\\_b', 'a\\cb'])('unparsable env -S string %s is flagged unreadable, never silently excluded', value => {
     const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/env', '-S', `${outside} ${cloneScript} ${value}`] }]);

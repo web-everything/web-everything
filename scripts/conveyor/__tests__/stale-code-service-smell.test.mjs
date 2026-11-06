@@ -160,3 +160,20 @@ it('an episode of a clone that left a fully-known managed inventory closes; unkn
   const unknown = runHealthTick(f.opened.state, f.probes, [f.descriptor], 2000);
   expect(unknown.state.episodes[f.key]?.status).toBe('open');
 });
+it('non-clone state-directory rows (conveyor-state, plain dirs) with clean service evidence open zero coverage episodes', () => {
+  const cloneRoot = resolve('fixtures/state-layout-clone');
+  const inspect = ({ onFreshService }) => { onFreshService({ label: 'com.we.sampler', plistPath: 'sampler.plist' }); return []; };
+  const descriptor = { ...smell, evaluate: (probes, ctx) => smell.evaluate(probes, { ...ctx, listCloneRoots: () => [cloneRoot], findStaleCodeServices: inspect }) };
+  const selfSync = [{ cloneKey: cloneKey(cloneRoot), alerts: [], rebuild: null }, { cloneKey: 'conveyor-state', alerts: [], rebuild: null },
+    { cloneKey: 'locks', alerts: [], rebuild: null }, { cloneKey: 'jobs', alerts: [], rebuild: null }];
+  const tick = runHealthTick(emptyHealthState(), { selfSync, cloneLag: [{ cloneRoot }] }, [descriptor], 1000);
+  expect(Object.values(tick.state.episodes).filter(ep => ep.subject.startsWith('coverage:'))).toEqual([]);
+  expect(Object.keys(tick.state.episodes)).toEqual([]);
+});
+it('a real clone key (hashed) with no known root still yields unknown coverage', () => {
+  const known = resolve('fixtures/known-clone'), stray = cloneKey(resolve('fixtures/unlisted-clone'));
+  const rows = smell.evaluate({ selfSync: [{ cloneKey: cloneKey(known) }, { cloneKey: stray }, { cloneKey: 'conveyor-state' }], cloneLag: [{ cloneRoot: known }] },
+    { findStaleCodeServices: () => [], listCloneRoots: () => [known], env: {} });
+  expect(rows.find(row => row.subject === `coverage:${stray}`)?.breach).toBe(true);
+  expect(rows.some(row => row.subject === 'coverage:conveyor-state')).toBe(false);
+});

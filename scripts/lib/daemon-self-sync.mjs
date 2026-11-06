@@ -739,7 +739,8 @@ export function withSelfSync(effects, {
   };
   const rebuild = async (...args) => {
     const result = await rebuildImpl(...args);
-    if (result?.moved && result?.adopted) await runRestart(restartServices, { adoptedSha: result.head });
+    // A recovered adoption (moved=false, adopted=true) also put new code on disk that running services have not loaded.
+    if (result?.adopted && (result.moved || result.reason === 'recovered-adopted')) await runRestart(restartServices, { adoptedSha: result.head });
     else if (retryPendingRestarts) await runRestart(retryPendingRestarts, { pendingOnly: true });
     return result;
   };

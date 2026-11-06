@@ -166,6 +166,7 @@ function codeArguments(args, start = 0, cwd = null, depth = 0) {
   // Ruby/perl `-I dir` takes a directory operand (python's -I is the operand-free isolate flag).
   const operand = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader', '--conditions', '-W', '-X',
     ...(rubyPerl ? ['-I'] : [])]);
+  const PRELOAD = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader']);
   // Operand-free short flags (python -B -E -I -O -P -R -S -b -d -i -q -s -u -v -x; ruby/perl -w -v), alone or combined.
   const flag = /^(?:--(?:trace-warnings|no-warnings|no-deprecation|trace-deprecation|throw-deprecation|pending-deprecation|expose-gc|use-strict|harmony|preserve-symlinks|preserve-symlinks-main|abort-on-uncaught-exception|enable-source-maps|experimental-strip-types|noprofile|norc)|-[uBbEIsSOivxdqRPw]+)$/;
   for (let i = start + 1; i < args.length; i += 1) {
@@ -175,7 +176,14 @@ function codeArguments(args, start = 0, cwd = null, depth = 0) {
     // complete option: check it before the combined-`-c` detector below.
     if (/^-[WX]./.test(arg) || rubyPerl && /^-I./.test(arg)) continue;
     if (noScript.has(arg) || (shell ? /^-[A-Za-z]*c[A-Za-z]*$/ : /^-[^-]*c/).test(arg) || /^(?:--eval|--print)=/.test(arg)) return result;
-    if (operand.has(arg)) { i += 1; continue; }
+    // Preload options run the named module before the entry script, so their value is code the service
+    // executes: it is an owner (a clone-backed bootstrap makes the service clone-backed), not skipped data.
+    const attachedPreload = /^--(?:require|import|loader|experimental-loader)=(.+)$/.exec(arg);
+    if (attachedPreload) { result.owners.push(place(attachedPreload[1], cwd, false)); continue; }
+    if (operand.has(arg)) {
+      if (PRELOAD.has(arg) && args[i + 1] !== undefined) result.owners.push(place(args[i + 1], cwd, false));
+      i += 1; continue;
+    }
     if (arg.startsWith('-') || arg.startsWith('+')) {
       // `--name=value` carries its value attached, so it can never consume the next argument
       // (covers --max-old-space-size=N, --stack-size=N and the other V8/Node valued options).

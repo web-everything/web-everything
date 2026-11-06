@@ -8,6 +8,8 @@ import { cloneKey } from '../../lib/daemon-overlays.mjs';
 
 // This registry includes overlay clones without requiring HEAD to be an ancestor of main.
 const managedRoots = () => daemonCloneRoots(workspaceOf(resolve(dirname(fileURLToPath(import.meta.url)), '../../..')));
+// cloneKey(root): first 16 hex chars of a sha256 — the only shape a real clone's state sidecars use.
+const CLONE_KEY = /^[0-9a-f]{16}$/;
 const subject = (root, service) => `clone:${root}:service:${service.label ?? service.plistPath ?? 'unknown'}`;
 const covered = key => ({ subject: `coverage:${key}`, breach: false, measure: { coverage: 'known' },
   summary: 'Managed clone inventory is readable and its root is known.', recommendation: 'No inventory repair needed.' });
@@ -39,7 +41,9 @@ export default {
     const knownKeys = new Set([...roots].map(root => cloneKey(root)));
     if (roots.size && Array.isArray(selfSync)) rows.push(covered('managed-clones'));
     for (const c of selfSync || []) {
-      if (c.cloneKey) rows.push(knownKeys.has(c.cloneKey) ? covered(c.cloneKey) : unknown(c.cloneKey, 'self-sync clone has no known root'));
+      // probeSelfSync emits a row per state-directory entry (e.g. `conveyor-state`). Only a row that is a clone
+      // (a hashed clone key, or one carrying its root) counts; plain state dirs are skipped, not reported unknown.
+      if (typeof c.cloneKey === 'string' && (CLONE_KEY.test(c.cloneKey) || c.cloneRoot !== undefined || c.root !== undefined)) rows.push(knownKeys.has(c.cloneKey) ? covered(c.cloneKey) : unknown(c.cloneKey, 'self-sync clone has no known root'));
     }
     for (const cloneRoot of roots) {
       const fresh = [];
