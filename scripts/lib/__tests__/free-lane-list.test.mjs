@@ -278,8 +278,8 @@ describe('touchFreeLaneList', () => {
 
 // The release publication bar on REAL git states (one shared origin + lane clone per file, restored after every
 // test — never re-cloned). This is the exact pair lane-pool's release runs:
-// `isProvablyCleanAndPushed(laneStateSnapshot(dir, 'origin/<branch>'), { requireInSync: true })`; a reserved lease
-// passes no snapshot at all. The --no-reset acquire guard's own git cases run end to end in
+// `isProvablyCleanAndPushed(laneStateSnapshot(dir, 'origin/<branch>'), { requireInSync: true })`. The reserved-lease
+// release, the --no-reset acquire guard's git cases and the release wiring run end to end in
 // scripts/__tests__/lane-pool-free-list-event-refresh.test.mjs.
 describe('release publication bar on real git states', () => {
   const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', timeout: 30_000 }).trim();
@@ -337,11 +337,11 @@ describe('release publication bar on real git states', () => {
     expect(git(['rev-parse', 'refs/remotes/origin/lane/gone'], lane)).toBe(git(['rev-parse', 'HEAD'], lane));
     expect(publishes()).toBe(false);
   });
-  it('a squash-merged commit whose branch was pruned is not published (release is stricter than the scan)', () => {
+  it('a squash-merged commit whose branch was pruned is not published (the --no-reset acquire guard would hand it out)', () => {
     commit('feat.txt', 'feature');
     const squash = join(root, 'squash');
-    git(['clone', '-q', '--branch', 'trunk', origin, squash], root);
     try {
+      git(['clone', '-q', '--branch', 'trunk', origin, squash], root);
       writeFileSync(join(squash, 'feat.txt'), 'feature\n');
       git(['add', 'feat.txt'], squash);
       git(['-c', 'user.email=s@s', '-c', 'user.name=s', 'commit', '-q', '-m', 'feature (squashed)'], squash);
@@ -352,8 +352,5 @@ describe('release publication bar on real git states', () => {
   });
   it('a lane that is not a git checkout at all fails closed', () => {
     expect(isProvablyCleanAndPushed(laneStateSnapshot(join(root, 'nope'), 'origin/trunk'), { requireInSync: true })).toBe(false);
-  });
-  it('a reserved lease passes no snapshot and is never published', () => {
-    expect(isProvablyCleanAndPushed(null, { requireInSync: true })).toBe(false);
   });
 });

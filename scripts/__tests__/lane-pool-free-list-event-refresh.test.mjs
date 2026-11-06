@@ -2,7 +2,7 @@
  * @file scripts/__tests__/lane-pool-free-list-event-refresh.test.mjs
  * @description The published free-lane list is refreshed by lane-pool's own acquire/release/trim events, not only
  *   by the periodic health-watch pass (whose gaps of 8-44 min let it go stale and sent `acquire` into the full scan).
- *   Spawns the real CLI against a throwaway pool — but only for the end-to-end wiring: 8 lane-pool children in all
+ *   Spawns the real CLI against a throwaway pool — but only for the end-to-end wiring: 10 lane-pool children in all
  *   (one provision, then acquire/release/trim). The list logic itself (`touchFreeLaneList`, per-entry age, the
  *   release publication bar on real git states) is tested in-process in `scripts/lib/__tests__/free-lane-list.test.mjs`.
  */
@@ -26,7 +26,7 @@ function git(args, cwd) {
 let base, originDir, referenceDir, poolRoot;
 
 // PR #6357 send-back (R547): this file once ran ~30 lane-pool children (a fresh pool copy and acquire/release round
-// trip for most tests) and pushed the integration job past its 20-min cap. It now runs 8: ONE provision in
+// trip for most tests) and pushed the integration job past its 20-min cap. It now runs 10: ONE provision in
 // `beforeAll`, copied back per test, and only the CLI wiring cases below. Each child is still bounded (local runs take
 // 1-8s): the FIRST overrun throws with the child's process tree and stderr, and every later child in this file is
 // refused at once, so a CI-only stall costs about one bound in total and names the test that hit it. The whole file
@@ -154,7 +154,7 @@ beforeAll(async () => {
   cpSync(poolRoot, poolTemplate, { recursive: true });
   // No scan/status cache or published list may carry a verdict from template-building into a test.
   const poolDir = join(poolTemplate, 'freepool');
-  for (const f of readdirSync(poolDir)) if (/cache|free-lanes/.test(f)) rmSync(join(poolDir, f), { force: true });
+  for (const f of readdirSync(poolDir)) if (/cache|memo|free-lanes/.test(f)) rmSync(join(poolDir, f), { force: true });
   rmSync(poolRoot, { recursive: true, force: true });
   sharedFixture = sharedRepos(fixtureRoot, [originDir, referenceDir]);
 }, PROVISION_BOUND_MS + 60_000);
@@ -231,13 +231,14 @@ describe('free-lane list is refreshed by lane-pool events (real CLI, one pool pr
     expect(JSON.parse(second.out).lane).toBe(5); // squash-merged + pruned counts as pushed
     const third = await acquire('third');
     expect(third.code).not.toBe(0); // only the dirty / unpushed / stale-ref lanes are left
+    for (const n of [1, 2, 3]) expect(third.err).toMatch(new RegExp(`lane-${n} is not provably clean and pushed`));
     // The refused lanes' work is untouched.
     expect(readFileSync(join(laneDir(1), 'file.txt'), 'utf8')).toBe('edited after publication\n');
     expect(git(['log', '-1', '--format=%s'], laneDir(2))).toBe('unpushed-work');
     expect(git(['log', '-1', '--format=%s'], laneDir(3))).toBe('stale-ref-work');
 
     // Release: an ancient list becomes fresh. Lane 4 (litter-only, level with its origin) is published as free; lane 5
-    // (its commit is ahead of trunk and on no remote ref) is not — release is stricter than the scan's bar.
+    // (its commit is ahead of trunk and on no remote ref) is not, although the --no-reset guard above handed it out.
     seedList([], 1);
     const before = Date.now();
     const r4 = await runPool(['release', '--lane=4', ...poolArgs(), '--session=first', '--json']);
@@ -254,12 +255,25 @@ describe('free-lane list is refreshed by lane-pool events (real CLI, one pool pr
     usePool();
     // Every lane is genuinely free; the scan would pick lane 1. Lane 2's entry is an hour old: skipped (and pruned on
     // the next touch). Reddens if nowMs/maxAgeMs stop reaching freeLaneCandidates or the acquire stops touching the list.
-    seedList([{ lane: 2, at: Date.now() - 3_600_000 }, { lane: 3, at: Date.now() }, { lane: 4, at: Date.now() }]);
-    const r = await runPool(['acquire', ...poolArgs(), '--no-reset', '--session=owner', '--json']);
+    // The list itself is fresh (so acquire reads it); `writtenAt` is in the past so the touch must move it forward.
+    const now = Date.now();
+    seedList([{ lane: 2, at: now - 3_600_000 }, { lane: 3, at: now }, { lane: 4, at: now }], now - 30_000);
+    const r = await runPool(['acquire', ...poolArgs(), '--no-reset', '--session=owner', `--hard-max=${POOL_SIZE}`, '--json']);
     expect(r.code, r.err).toBe(0);
     expect(JSON.parse(r.out).lane).toBe(3);
-    expect(isFreeLaneListFresh(readFreeLaneList(listFile()), Date.now(), 60_000)).toBe(true);
+    expect(readFreeLaneList(listFile()).writtenAt).toBeGreaterThanOrEqual(now);
     expect(listed()).toEqual([4]);
+  });
+
+  it('a release of a RESERVED lane does NOT publish it as free (even a clean one), but still stamps the list fresh', async () => {
+    usePool();
+    const a = await runPool(['acquire', '--lane=1', '--reserve', ...poolArgs(), '--no-reset', '--session=owner', `--hard-max=${POOL_SIZE}`, '--json']);
+    expect(a.code, a.err).toBe(0);
+    seedList([], 1); // ancient
+    const r = await runPool(['release', '--lane=1', '--release-reserved', ...poolArgs(), '--session=owner', '--json']);
+    expect(r.code, r.err).toBe(0);
+    expect(isFreeLaneListFresh(readFreeLaneList(listFile()), Date.now(), 60_000)).toBe(true); // the release event ran
+    expect(listed()).not.toContain(1);
   });
 
   it('trim removes deleted lanes from the published free list and keeps the survivors', async () => {
