@@ -170,3 +170,19 @@ describe('readPlatformPreferences — platform files merge per leaf, not per pol
     expect(prefs.verify).toEqual({ shardMinTests: 0 });
   });
 });
+
+
+describe('operator-only findingClasses', () => {
+  it('ignores repo and legacy copies with warnings and accepts the operator file', () => {
+    const warnings = [];
+    const r = readPlatformPreferences({ env: {}, warn: m => warnings.push(m), readFile: path =>
+      JSON.stringify({ findingClasses: { 'theoretical-race': path.includes('.claude') ? 'fix-now' : 'defer-card' } }) });
+    expect(r.prefs.findingClasses).toEqual({ 'theoretical-race': 'fix-now' });
+    expect(warnings.filter(m => m.includes('findingClasses'))).toHaveLength(2);
+  });
+  it('ignores tool and env values in both the named and nested cascade', () => {
+    const policy = { 'theoretical-race': 'defer-card', allowSecurityDefer: true };
+    expect(cascadePolicy('findingClasses', policy, { platform: {}, envValues: policy, env: {} }).value).toEqual({});
+    expect(resolveCascade({ standard: {}, tool: { findingClasses: policy }, envValues: { findingClasses: policy } }).value).toEqual({});
+  });
+});
