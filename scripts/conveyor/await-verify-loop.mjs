@@ -155,6 +155,12 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
   // A record pushed in phase A keeps its push row, with the phase-B wake (or the deferral) appended to its result.
   const pushedA = (r) => (r.result && r.result !== 'resume-paused' ? `${r.result}; ` : '');
   const rows = (a.rows ?? []).filter((r) => !skipped.has(r.key) && !wakeKeys.has(r.key) && !deferred.has(r.key));
+  for (const { key, record } of allOwed) {
+    if (prFacts.get(key)?.open === false && !stale.has(key)) {
+      rows.push({ key, pr: record.pr, who: record.who, action: 'resume',
+        reason: 'closed-pr-inventory-held', result: 'closed PR, failure inventory held' });
+    }
+  }
   for (const r of a.rows ?? []) {
     if (deferred.has(r.key)) {
       const record = owedFix.find(e => e.key === r.key)?.record;

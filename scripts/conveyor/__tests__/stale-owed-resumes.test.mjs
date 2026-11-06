@@ -43,6 +43,42 @@ function harness(entries, state) {
 
 describe('stale owed resumes (R618)', () => {
 
+  it('reports held closed-PR failure inventory on every pass without clearing, waking or taking a slot', async () => {
+    const old = entry('held-status', 1, 0, { pendingResume: { kind: 'red', delivered: true },
+      previousCi: { ready: { ciFailures: [{ name: 'unit', conclusion: 'FAILURE' }] } } });
+    const h = harness([old, entry('held-status-live', 2, 1000)], (_repo, pr) => ({ open: pr !== 1 }));
+    h.io.fixTimingPolicy = () => ({ pushAfterCi: true });
+    const first = await h.pass();
+    const second = await h.pass();
+    const heldRow = { key: old.key, pr: old.record.pr, who: old.record.who,
+      action: 'resume', reason: 'closed-pr-inventory-held', result: 'closed PR, failure inventory held' };
+    expect(first.rows.filter(r => r.key === old.key)).toEqual([heldRow]);
+    expect(second.rows.filter(r => r.key === old.key)).toEqual([heldRow]);
+    expect(first.admitted).toEqual(['held-status-live']);
+    expect(second.admitted).toEqual([]);
+    expect(first.cleared).toEqual([]);
+    expect(second.cleared).toEqual([]);
+    expect(h.store.get(old.key)).toEqual(old.record);
+    expect(h.resumed).toEqual(['held-status-live']);
+    expect(h.io.clearStoredRecordIf).not.toHaveBeenCalled();
+    expect(h.io.clearRecord).not.toHaveBeenCalledWith(old.key);
+  });
+
+  it('requires lane and worker name when either session id is missing', () => {
+    for (const missing of ['old', 'newer', 'both']) {
+      for (const matching of ['lane', 'who', 'both', 'neither']) {
+        const old = entry('fallback-old', 1);
+        const newer = entry('fallback-new', 1, 1000, { sha: 'b'.repeat(40) });
+        if (missing !== 'newer') delete old.record.sessionId;
+        if (missing !== 'old') delete newer.record.sessionId;
+        if (matching === 'lane' || matching === 'both') newer.record.lane = old.record.lane;
+        if (matching === 'who' || matching === 'both') newer.record.who = old.record.who;
+        expect(classifyStaleOwed({ owed: [old], records: [old, newer] }), `${missing}: ${matching}`)
+          .toEqual(matching === 'both' ? [old.key] : []);
+      }
+    }
+  });
+
   it.each(['who', 'lane'])('conflicting sessions cannot supersede via matching %s', field => {
     const old = entry('old-session', 1);
     const newer = entry('new-session', 1, 1000, { [field]: old.record[field], sha: 'b'.repeat(40) });
@@ -287,7 +323,8 @@ describe('stale owed resumes (R618)', () => {
   });
 
   it('clears a superseded SHA even without a PR-state port', async () => {
-    const h = harness([entry('superseded', 6360), entry('newer', 6360, 1000, { lane: '/lanes/superseded', sessionId: null, sha: 'b'.repeat(40) })]);
+    const h = harness([entry('superseded', 6360), entry('newer', 6360, 1000, { lane: '/lanes/superseded', who: 'superseded', sessionId: null, sha: 'b'.repeat(40) })]);
+    h.io.listSessions = () => [{ sessionId: 'newer', name: 'superseded', status: 'idle', kind: 'background' }];
     const out = await h.pass();
     expect(out.cleared).toEqual(['superseded']);
     expect(h.resumed).toEqual(['newer']);
@@ -393,17 +430,14 @@ describe('stale owed resumes (R618)', () => {
 
   it('pure classification requires a later time, different SHA, and the same repo and PR', () => {
     const owed = [entry('original', 1), entry('equal-time', 1, 0, { sha: 'b'.repeat(40) }),
-      entry('same-sha', 1, 1000, { who: 'equal-time', sessionId: null }), entry('other-pr', 2, 2000, { sha: 'c'.repeat(40) }),
+      entry('same-sha', 1, 1000, { who: 'equal-time', lane: '/lanes/equal-time', sessionId: null }), entry('other-pr', 2, 2000, { sha: 'c'.repeat(40) }),
       entry('other-repo', 1, 2000, { repo: 'other/repo', sha: 'c'.repeat(40) })];
     expect(classifyStaleOwed({ owed, prFacts: new Map() })).toEqual(['equal-time']);
   });
 
-  it.each(['who', 'sessionId', 'lane'])('supersedes only with a matching %s lineage', field => {
-    const old = entry('lineage-old', 1);
-    const newer = entry('lineage-new', 1, 1000, { sha: 'b'.repeat(40) });
-    expect(classifyStaleOwed({ owed: [old], records: [old, newer] })).toEqual([]);
-    newer.record[field] = old.record[field];
-    if (field !== 'sessionId') newer.record.sessionId = null;
+  it('matching session ids supersede even with different lanes and worker names', () => {
+    const old = entry('matching-session-old', 1);
+    const newer = entry('matching-session-new', 1, 1000, { sessionId: old.record.sessionId, sha: 'b'.repeat(40) });
     expect(classifyStaleOwed({ owed: [old], records: [old, newer] })).toEqual([old.key]);
   });
 
