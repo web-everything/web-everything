@@ -718,7 +718,11 @@ function changedLineCount(section) {
       if (oldLeft < 0 || newLeft < 0) return null;
     }
   }
-  return seen && !oldLeft && !newLeft ? count : null;
+  // A present section with no hunk at all (binary, pure rename, mode-only, empty new file) changes no counted
+  // line — numstat reports 0 or `-` for it. The caller's total-equality check still refuses a section that
+  // was truncated before its first hunk.
+  if (!seen) return section.split('\n').some(line => line.startsWith('@@')) ? null : 0;
+  return !oldLeft && !newLeft ? count : null;
 }
 
 export function scoreEscalation({

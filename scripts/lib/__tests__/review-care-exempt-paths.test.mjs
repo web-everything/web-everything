@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { scoreEscalation } from '../review-escalation.mjs';
-import { DEFAULT_CARE_EXEMPT_PATHS, MAX_CARE_EXEMPT_GLOB_LENGTH, matchesCareExemptPath, resolveReviewCareExemptPaths,
+import { DEFAULT_CARE_EXEMPT_PATHS, MAX_CARE_EXEMPT_GLOB_LENGTH, MAX_CARE_EXEMPT_PATH_LENGTH,
+  MAX_CARE_EXEMPT_PATH_SEGMENTS, matchesCareExemptPath, resolveReviewCareExemptPaths,
   validateCareExemptPaths } from '../review-care-exempt-paths.mjs';
 
 const timings = 'scripts/ci/test-timings.json';
@@ -172,11 +173,26 @@ describe('R641 care exemptions', () => {
     expect(scoreEscalation({ changedFiles: [timings, 'app.js'], diffLines: 900, diffHunks }).signals.size).toBe(400);
   });
 
+  // #6433 self-review: binary, pure-rename, mode-only and empty files change no counted line, so they must not
+  // switch the exemption off for the rest of the PR.
+  it('still subtracts when the PR also has binary, pure-rename, mode-only and empty-file sections', () => {
+    const files = [timings, 'app.js', 'img.png', 'old.md => new.md', 'run.sh', 'empty.txt'];
+    const diffHunks = section(timings, 1000) + section('app.js', 10)
+      + 'diff --git a/img.png b/img.png\nnew file mode 100644\nindex 0000000..1111111\nBinary files /dev/null and b/img.png differ\n'
+      + 'diff --git a/old.md b/new.md\nsimilarity index 100%\nrename from old.md\nrename to new.md\n'
+      + 'diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n'
+      + 'diff --git a/empty.txt b/empty.txt\nnew file mode 100644\nindex 0000000..e69de29\n';
+    const result = scoreEscalation({ changedFiles: files, diffLines: 1010, humanBasisFiles: files,
+      cumulativeDiffLines: 1010, diffHunks });
+    expect(result.signals.size).toBeUndefined();
+  });
+
   // #6433 self-review: hunks that do not provably describe the counted basis subtract nothing.
   it.each([
     ['ancestry counts paired with base-tip hunks (upstream drift on the exempt file)', 401, section(timings, 5000) + section('app.js', 400)],
     ['a non-exempt section missing from the hunks', 1400, section(timings, 1000)],
-    ['a binary or mode-only section with no hunk body', 1400, `${section(timings, 1000)}diff --git a/app.js b/app.js\nBinary files differ\n`],
+    ['a hunk-less section that cannot account for the counted lines', 1400, `${section(timings, 1000)}diff --git a/app.js b/app.js\nBinary files differ\n`],
+    ['a section truncated inside its hunk', 1010, section(timings, 1000) + section('app.js', 10).replace(/\+data\n$/, '')],
   ])('subtracts nothing when %s', (_name, lines, diffHunks) => {
     const files = [timings, 'app.js'];
     const result = scoreEscalation({ changedFiles: files, diffLines: lines, humanBasisFiles: files,
@@ -222,6 +238,7 @@ describe('care exemption settings resolver', () => {
   // #6433 self-review: resource bound — many wildcard runs backtrack for seconds per author-chosen path.
   it.each([
     'x/y/*a*a*a*a*a*a*a*a*a*ab', 'scripts/ci/*a*.json', 'scripts/ci/*/*/*/*.json',
+    'a/b/**/x/**/z', 'a/b/**/x/**/x/**/z', 'a/b/**/x/x/**/x/x/**/z',
     `scripts/ci/${'a'.repeat(MAX_CARE_EXEMPT_GLOB_LENGTH)}.json`,
   ])('refuses backtracking-prone or oversized glob %s through every settings layer', glob => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -243,6 +260,16 @@ describe('care exemption settings resolver', () => {
     const started = Date.now();
     expect(matchesCareExemptPath(`scripts/ci/${'a/'.repeat(2)}${'a'.repeat(5000)}`, [glob])).toBe(false);
     expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  it('never exempts an over-long or over-deep author-chosen path (bounded match cost, fail closed)', () => {
+    const deep = `data/generated/${'x/'.repeat(MAX_CARE_EXEMPT_PATH_SEGMENTS)}f.json`;
+    const long = `data/generated/${'a'.repeat(MAX_CARE_EXEMPT_PATH_LENGTH)}.json`;
+    for (const file of [deep, long]) {
+      expect(matchesCareExemptPath(file, DEFAULT_CARE_EXEMPT_PATHS)).toBe(false);
+      expect(scoreEscalation({ changedFiles: [file], diffLines: 1000 }).signals.size).toBe(1000);
+    }
+    expect(matchesCareExemptPath('data/generated/x/f.json', DEFAULT_CARE_EXEMPT_PATHS)).toBe(true);
   });
 
   it('a piped scope cannot exempt scripts/** through the environment (live repro)', () => {

@@ -13,7 +13,7 @@ export const DEFAULT_CARE_EXEMPT_PATHS = Object.freeze([
   '**/fixtures/**',
 ]);
 export const MAX_CARE_EXEMPT_GLOB_LENGTH = 200;
-const SETTINGS_FILE =join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'review.json');
+const SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'review.json');
 const logged = new Set();
 const logOnce = message => {
   if (!logged.has(message)) { logged.add(message); console.error(message); }
@@ -40,9 +40,11 @@ export function validateCareExemptPaths(value, { warn = m => console.warn(m) } =
     if (!/^[A-Za-z0-9._\-/*?]+$/.test(glob) || glob.startsWith('/')
       || glob.split('/').some(s => s === '..' || s === '.' || !s)) return false;
     // Resource bound: PR authors pick the matched path names, so a pattern with many wildcard runs (`*a*a*a…b`)
-    // can backtrack for seconds per path. Bound the length, one wildcard run per segment, three in all.
+    // can backtrack for seconds per path, and nested globstars grow with the path's depth. Bound the length, one
+    // wildcard run per segment, three in all, and a single `**`.
     const runs = segment => (segment.match(/[*?]+/g) || []).length;
-    if (glob.length > MAX_CARE_EXEMPT_GLOB_LENGTH || glob.split('/').some(s => runs(s) > 1) || runs(glob) > 3) return false;
+    if (glob.length > MAX_CARE_EXEMPT_GLOB_LENGTH || glob.split('/').some(s => runs(s) > 1) || runs(glob) > 3
+      || (glob.match(/\*\*/g) || []).length > 1) return false;
     const wildcard = glob.search(/[*?]/);
     // Count complete literal directories before the first wildcard. Equivalent broad
     // spellings must not evade the scope bound; exact file names remain allowed.
@@ -86,4 +88,9 @@ export function resolveReviewCareExemptPaths({ env = process.env, file = SETTING
   return result;
 }
 
-export const matchesCareExemptPath = (file, patterns) => micromatch.isMatch(file, patterns, { dot: true });
+/** Paths are author-chosen: an over-long or over-deep one is never exempt (fail closed, bounded match cost). */
+export const MAX_CARE_EXEMPT_PATH_LENGTH = 1024;
+export const MAX_CARE_EXEMPT_PATH_SEGMENTS = 32;
+export const matchesCareExemptPath = (file, patterns) => typeof file === 'string'
+  && file.length <= MAX_CARE_EXEMPT_PATH_LENGTH && file.split('/').length <= MAX_CARE_EXEMPT_PATH_SEGMENTS
+  && micromatch.isMatch(file, patterns, { dot: true });
