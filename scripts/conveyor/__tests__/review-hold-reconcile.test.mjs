@@ -6,11 +6,17 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
-  needsReviewHoldCleanup, planReviewHoldCleanup, sweepReviewHoldLabels, _resetStrandedCheckMemo, STRANDED_BACKOFF_MS, STRANDED_RECHECK_MS,
+  createLiveHoldReaders, needsReviewHoldCleanup, planReviewHoldCleanup, sweepReviewHoldLabels, _resetStrandedCheckMemo, STRANDED_BACKOFF_MS, STRANDED_RECHECK_MS,
 } from '../review-hold-reconcile.mjs';
 import { _resetAcceptCarryMemo } from '../accept-carry-sweep.mjs';
 import { resolveAcceptCarryForward } from '../../lib/accept-carry-forward.mjs';
 import { buildNumberingRestampBody, restampAfterNumbering, _resetNumberingRestampMemo } from '../../lib/numbering-carry.mjs';
+import { sweepAuthorStamps } from '../../lib/author-stamp-restore.mjs';
+
+// Keep the default-seam regression hermetic even if the listing-injection guard regresses.
+vi.mock('../../lib/author-stamp-restore.mjs', () => ({
+  sweepAuthorStamps: vi.fn(() => { throw new Error('unexpected default stamp sweep in an injected-list fixture'); }),
+}));
 
 // The REAL #4535 measurement (card xu7kxtt): a cleared-human accept on an older head, the merge queue moved the head, the drain re-parked.
 const fx = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../lib/__tests__/fixtures/accept-carry-forward-4535.json'), 'utf8'));
@@ -155,6 +161,49 @@ describe('needsReviewHoldCleanup', () => {
 });
 
 describe('sweepReviewHoldLabels', () => {
+  it.each([false, true])('invokes restoreStamps once per sweep with repo and dryRun=%s and exposes each result', (dryRun) => {
+    const detail = { id: 'actor-from-history', reason: 'author snapshot agrees' };
+    const refused = { reason: 'history unreadable' };
+    const restoreStamps = vi.fn(() => [
+      { num: 6244, action: 'restore', detail },
+      { num: 6245, action: 'refuse', detail: refused },
+    ]);
+    const results = sweepFixture({ repo: 'o/n', provider: provider(), dryRun, restoreStamps,
+      listPrs: () => [pr(6244, ['review:human']), pr(6245, ['review:human'])] });
+    expect(restoreStamps).toHaveBeenCalledTimes(1);
+    expect(restoreStamps).toHaveBeenCalledWith(expect.objectContaining({ repo: 'o/n', dryRun }));
+    expect(results).toEqual(expect.arrayContaining([
+      { num: 6244, stampRestore: 'restore', detail },
+      { num: 6245, stampRestore: 'refuse', detail: refused },
+    ]));
+  });
+
+  it('keeps the normal already-stamped skip out of the results', () => {
+    const restoreStamps = vi.fn(() => [{ num: 6244, action: 'skip', detail: { reason: 'already stamped' } }]);
+    const results = sweepFixture({ repo: 'o/n', provider: provider(), restoreStamps,
+      listPrs: () => [pr(6244, ['review:human'])] });
+    expect(results.some((r) => r.stampRestore)).toBe(false);
+  });
+
+  it('contains a throwing restoreStamps seam and still completes label cleanup', () => {
+    const p = provider();
+    const restoreStamps = vi.fn(() => { throw new Error('stamp history unavailable'); });
+    const results = sweepFixture({ repo: 'o/n', provider: p, restoreStamps,
+      listPrs: () => [pr(2549, ['review:human', 'review:pending'])] });
+    expect(restoreStamps).toHaveBeenCalledTimes(1);
+    expect(results).toContainEqual({ num: 2549, remove: ['review:pending'] });
+    expect(p.calls.set).toEqual([{ repo: 'o/n', number: 2549, spec: { remove: ['review:pending'] } }]);
+  });
+
+  it('keeps injected listPrs fixtures isolated from the default real stamp sweep', () => {
+    // No restoreStamps seam: injected listings must retain their existing no-GitHub behavior.
+    vi.mocked(sweepAuthorStamps).mockClear();
+    const results = sweepFixture({ repo: 'o/n', provider: provider(),
+      listPrs: () => [{ ...pr(6244, ['review:human']), body: 'unstamped fixture', author: { login: 'plateau-worker' } }] });
+    expect(results).toEqual([]);
+    expect(sweepAuthorStamps).not.toHaveBeenCalled();
+  });
+
   it('skips a PR carrying review:human + review:changes — no entry, no readPrState call', () => {
     const p = provider();
     const results = sweepFixture({
@@ -816,5 +865,33 @@ describe('numbering re-stamp withdrawal on label-held PRs', () => {
         numberingRestamp: (opts) => { seen.push(opts.pr); return null; } });
       expect(seen).toEqual([]);
     });
+  });
+});
+
+// Self-review variant of the #6409 red-team break: the pre-write readLiveState re-read must not be served
+// from the smoke read memo, or a hold that lands mid-proof passes the re-check.
+describe('createLiveHoldReaders — the pre-write re-read is never memoized', () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it('strips the read memo from both environments on every PR state, review and comment read', () => {
+    vi.stubEnv('WE_GH_READ_MEMO_DIR', 'memo-dir');
+    const run = vi.fn(() => JSON.stringify({ number: 7, state: 'OPEN', labels: [], headRefOid: 'a'.repeat(40) }));
+    const read = vi.fn(() => '[]');
+    const { provider, readComments } = createLiveHoldReaders({ run, read });
+    try { provider.readPrState('o/r', 7); } catch { /* only the call's options matter here */ }
+    try { provider.readPrReviews('o/r', 7); } catch { /* only the call's options matter here */ }
+    try { readComments(7, { repo: 'o/r' }); } catch { /* only the call's options matter here */ }
+    expect(run.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(read.mock.calls.length).toBeGreaterThanOrEqual(1);
+    for (const [, opts] of run.mock.calls) {
+      expect(opts.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+      expect(opts.throttle.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+    }
+    for (const [file, , opts] of read.mock.calls) {
+      expect(file).toBe('gh');
+      expect(opts.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+      expect(opts.throttle.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+    }
+    expect(process.env.WE_GH_READ_MEMO_DIR).toBe('memo-dir');
   });
 });

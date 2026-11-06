@@ -1090,6 +1090,14 @@ mark("6d-quinquies. Unquoted-colon scalar in frontmatter (#453)");
     if (bare.length)
       err(`Backlog item "${id}" scope has non-repo-qualified entr${bare.length > 1 ? 'ies' : 'y'} ${JSON.stringify(bare)} — every scope entry must carry a <repo>: locus prefix (e.g. "we:src/backlog-view/", "fui:plugs/…", "plateau:…"), NOT a bare path. A bare path is rejected by the write-time locus-prefix hook (#883) and, unqualified, the scope-lease engine (readiness/scope-lease.mjs) reads its repo as null so it never matches an observed we:-qualified file — the lane's overlap is silently never detected and two overlapping lanes could both launch.`);
 
+    // BEGIN scope whitespace warning
+    if (!isTerminalStatus(raw?.status)) {
+      const combined = scope.filter((entry) => /\s/.test(entry));
+      if (combined.length)
+        warn(`Backlog item "${id}" has scope entries containing whitespace ${JSON.stringify(combined)} — list one path per array entry.`);
+    }
+    // END scope whitespace warning
+
     // ── Scope defaults to FILE-LEVEL — flag a bare DIRECTORY scope unless justified (#2739) ──
     // The #2619/#2679 finer-lease principle: a lane's scope-lease should cover the SPECIFIC files it writes, not
     // a whole directory. A dir-level entry — a repo-qualified prefix ending in `/` with no filename (e.g.

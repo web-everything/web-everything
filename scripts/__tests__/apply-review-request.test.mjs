@@ -468,18 +468,14 @@ describe('the ledger push can only fast-forward the transport branch (C3)', () =
 describe('no other code on the ledger path pushes (C3)', () => {
   const SCRIPTS = join(REPO_ROOT, 'scripts');
   const TRANSPORT = 'scripts/lib/git-transport-branch.mjs';
-  // The ledger append's push is the transport's. The other files are in the STATIC import closure only because
-  // the verdict-ledger / review-escalation modules import them; they push lane refs, not the transport branch,
-  // and are not on the ledger-append call path. They are pinned by count rather than ignored: a NEW push in any
-  // file here, or in a file newly pulled into the closure, changes this map and must be reviewed on purpose.
-  // (`fix-procedure.mjs` counts three because one hit is the `cmd === 'push'` CLI verb, not a git call.)
-  // The allocator's two atomic pushes create number-reservations/card-ids refs, not ledger transport refs.
+  // The ledger append's push is the transport's, and it is the ONLY push site in the STATIC import closure.
+  // (R503: review-escalation no longer imports rebase-drop-manifest.mjs — it takes its transient-path names from
+  // transient-paths.mjs — so rebase-drop-manifest, nnn-collision-heal, fix-procedure and card-number-allocator,
+  // which only entered the closure through that import and push lane/number-reservation refs, are out of it.)
+  // A NEW push in any file here, or in a file newly pulled into the closure, changes this map and must be
+  // reviewed on purpose: pin it by count rather than ignoring it.
   const KNOWN_PUSH_SITES = {
     [TRANSPORT]: 1,
-    'scripts/lib/rebase-drop-manifest.mjs': 1,
-    'scripts/lib/nnn-collision-heal.mjs': 1,
-    'scripts/conveyor/fix-procedure.mjs': 3,
-    'scripts/lib/card-number-allocator.mjs': 2,
   };
   const rel = (f) => f.slice(REPO_ROOT.length + 1).split(sep).join('/');
 

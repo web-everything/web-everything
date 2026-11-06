@@ -1223,6 +1223,38 @@ describe('red-team wait deadline never merges without a result (redTeam.deadline
     expect(h.logs.join('')).not.toContain('OPERATOR OVERRIDE');
   });
 
+  it.each(['scan-capped', 'review-unfinished', 'run-start-missing'])('%s run evidence past the deadline never re-requests or takes the operator override', reason => {
+    const requests = [];
+    const { h, clock, notes } = pastDeadline({ labels: [...ACCEPTED, 'red-team:pending'], env: OVERRIDE_ENV,
+      evidence: { ok: false, reason }, requestRedTeam: input => { requests.push(input); return { requested: true }; } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true,
+      reason: expect.stringContaining(`run evidence unknown (${reason})`) });
+    clock.t += 10 * 60 * 60_000;
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
+    expect(requests).toHaveLength(0);
+    expect(notes).toHaveLength(1);
+    expect(enqueuedAny(h)).toBe(false);
+    expect(h.logs.join('')).not.toContain('OPERATOR OVERRIDE');
+  });
+
+  it('capped run evidence with a confirmed break keeps send-back routing ahead of the deadline path', async () => {
+    const { renderRedTeamComment } = await import('../../operations/review-extra-seats.mjs');
+    const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
+      pr: 5283, rev: HEAD, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+      findings: [{ summary: 'unresolved security break', category: 'security', impactIfUnfixed: 'broken', confirmedByRecheck: true }],
+    }) }];
+    const requests = [];
+    const { h, firstAttempt } = pastDeadline({ labels: [...ACCEPTED, 'red-team:pending'],
+      env: { ...OVERRIDE_ENV, WE_UNDER_TEST: '1', WE_RED_TEAM_STATUS_LABELS: 'false' }, liveComments: thread,
+      evidence: { ok: false, reason: 'scan-capped' }, requestRedTeam: input => { requests.push(input); return { requested: true }; } });
+    expect(firstAttempt).toMatchObject({ enqueued: false, reason: expect.stringContaining('requiring send-back') });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: thread })).toMatchObject({ enqueued: false,
+      reason: expect.stringContaining('requiring send-back') });
+    expect(requests).toHaveLength(0);
+    expect(enqueuedAny(h)).toBe(false);
+    expect(h.logs.join('')).not.toContain('OPERATOR OVERRIDE');
+  });
+
   it.each([true, false])('the operator override never waives a confirmed break, even with no run evidence (statusLabels=%s)', async statusLabels => {
     const { renderRedTeamComment } = await import('../../operations/review-extra-seats.mjs');
     const thread = [{ user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
