@@ -10,6 +10,8 @@ import { fileURLToPath } from 'node:url';
 import { allowedCommand, allowedEnv, normalizeScanFilesValue, digestInput, digestArgv, digestLock, isTestFile, validateTestNames, pathParts, bytePath, splitPaths, manifestWire, digestManifest, readManifestFile, SIBLING_PATHS, siblingShas, sameSiblingShas } from './forge-exec-run.mjs';
 
 import {BASE_RETENTION} from './forge-exec-bases.mjs';
+import {resolveTransport,runnerSupportsBundle,planBundle,mainFreshness,bundleEvidence,makeBundleDirectory,removeBundleDirectory} from './remote-git-bundle.mjs';
+import {routeNeedsGit} from './needs-git-route.mjs';
 import {writeJsonAtomic} from '../lib/atomic-json-file.mjs';
 
 const ROOT = '/srv/forge-exec';
@@ -1074,14 +1076,20 @@ export async function runRemote(options={}) {
   return {...result,timings};
 }
 
-async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, onRun, slotUnits = 1, log = text=>process.stderr.write(text) } = {}) {
+async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, onRun, slotUnits = 1, transport, onCapabilities, bundleMainMaxAgeMs = 600000, log = text=>process.stderr.write(text) } = {}) {
   const fallback = (reason, detail) => ({ mode: 'not-started', terminated: true, reason, detail });
   if (!Number.isSafeInteger(slotUnits) || slotUnits < 1 || slotUnits > 256) return fallback('invalid-slot-units');
   argv = normalizeRemoteArgv(argv);
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed');
   let executionEnv;
   try { executionEnv = filterEnv(env); } catch (error) { return fallback(error.code); }
-  const needsGit=argv[2]==='check:standards'||Object.hasOwn(executionEnv,'DIFF_COVERAGE_BASE');
+  const bundleTransport=resolveTransport(transport)==='git-bundle';
+  const standardsNeedGit=argv[2]==='check:standards'||Object.hasOwn(executionEnv,'DIFF_COVERAGE_BASE');
+  // git-bundle only: a test file that spawns git also gets a real worktree (otherwise it stays on the git-less snapshot).
+  let testNeedsGit=false;
+  if(bundleTransport&&!standardsNeedGit)try{testNeedsGit=routeNeedsGit({argv,cwd}).local===true;}catch{testNeedsGit=false;}
+  const needsGit=standardsNeedGit||testNeedsGit;
+  let bundleDirectory;
   if (!validateRunId(runId) || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host)) return fallback('invalid-parameters');
   try {exec=await bindGit({cwd,env,exec});}catch(error){return fallback(error.code??'unbound-worktree');}
   sshOptions ??= connectionOptions();
@@ -1119,7 +1127,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
     try{return await ssh('finish', {nonce,run,...(cancel.signal.aborted?{cancel:true}:{})});}finally{done();}
   };
   try {
-    let expected, expectedManifest, delta, transferBytes=0, transferCount=0;
+    let expected, expectedManifest, delta, transferBytes=0, transferCount=0, bundlePlan;
     try {
       const manifestDone=begin('manifest-build');
       const substages=substageTimer(clock),beginSub=stage=>substages.begin(stage);
@@ -1205,7 +1213,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       const inputDigest = delta ? await digestDeltaInput(delta,workStage,cwd,exec) : await digestInput(workStage, selected);
       stageDone();
       const prepareDone=begin('forge-prepare');
-      const prepared = await ssh('prepare',{nonce,label:runId,capabilities:{taskPressure:1},...(slotUnits > 1 ? {slotUnits} : {}),...(delta ? {baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest}:{}),...(manifest.siblings ? {siblings:true} : {})});
+      const prepared = await ssh('prepare',{nonce,label:runId,capabilities:{taskPressure:1},...(slotUnits > 1 ? {slotUnits} : {}),...(bundleTransport?{gitBundle:true}:{}),...(delta ? {baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest}:{}),...(manifest.siblings ? {siblings:true} : {})});
       prepareDone();
       if(prepared.code !== 0) {
         // Prepare precedes every byte transfer and cannot have started work.
@@ -1220,7 +1228,26 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       const slot=preparation.slot??'forge-exec';
       if(slot!=='forge-exec'&&(!/^forge-exec-[1-9]\d*$/.test(slot)||!Array.isArray(preparation.capabilities?.workers)||!preparation.capabilities.workers.includes(slot)))throw new Error('Invalid server slot');
       const runRoot=slot==='forge-exec'?ROOT:ROOT+'/'+slot.replace('forge-exec-','slot-');
+      if(bundleTransport)try{onCapabilities?.(preparation.capabilities);}catch{ /* advisory routing cache only */ }
       if(needsGit&&preparation.capabilities?.gitWorktree!==2)return {mode:'not-started',terminated:true,reason:'forge-runner-too-old'};
+      // An old runner is never fed a bundle: check:standards keeps the GitHub-fetch path, a git-spawning test stays local.
+      let useBundle=bundleTransport&&needsGit&&runnerSupportsBundle(preparation.capabilities);
+      // R559: bundle mode needs a recently fetched public main on the mirror and a credential-clean range. Either
+      // failure falls back: check:standards keeps the rsync/GitHub-fetch path, a git-spawning test stays local.
+      let bundleRefusal;
+      if(useBundle&&mainFreshness(preparation.capabilities,bundleMainMaxAgeMs)!=='fresh')bundleRefusal='bundle-main-stale';
+      if(useBundle&&!bundleRefusal){
+        const planDone=begin('git-bundle-plan');
+        bundleDirectory=await makeBundleDirectory();
+        try{bundlePlan=await planBundle({cwd,head:logicalHead,runnerBase:preparation.capabilities.gitBundleBase,exec,directory:bundleDirectory});}
+        catch(error){
+          bundleRefusal=['bundle-credential-hit','bundle-credential-scan-too-large'].includes(error.code)?error.code:'git-bundle-failed';
+          log(`bundle: refused (${bundleRefusal}${error.detail?': '+error.detail:''}); falling back\n`);
+        }
+        planDone({shipMode:bundlePlan?.mode??'refused'});
+      }
+      if(bundleRefusal){useBundle=false;bundlePlan=undefined;}
+      if(testNeedsGit&&!useBundle)return {mode:'not-started',terminated:true,reason:bundleRefusal??'forge-runner-too-old'};
       // forge-exec-run.mjs is separately installed by forge-setup.sh. Redeploy
       // that fixed wrapper before siblings can run; old runners stay local.
       if (manifest.siblings && preparation.capabilities?.siblings !== 1)
@@ -1245,6 +1272,18 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
         '--from0','--files-from=-',`--rsync-path=sudo -u ${slot} rsync`,'-e',`ssh ${sshOptions.map(quote).join(' ')}`,
         './',`${host}:${runRoot}/${run}/work/`],cwd:workStage,input:inventory});
       if(copied.code !== 0) throw new Error('Copy failed');
+      if(bundlePlan){
+        const bundleDone=begin('git-bundle');
+        if(bundlePlan.mode!=='none'){
+          const sent=await exec({file:'rsync',args:['-a','--chmod=Fa+r','--no-links','--safe-links',`--rsync-path=sudo -u ${slot} rsync`,'-e',`ssh ${sshOptions.map(quote).join(' ')}`,
+            bundlePlan.file,`${host}:${runRoot}/${run}/bundle/git.bundle`],cwd:bundleDirectory});
+          if(sent.code!==0)throw Object.assign(new Error('Bundle copy failed'),{code:'git-bundle-failed',detail:'bundle-copy-failed'});
+        }
+        // The tip must still be the one that was bundled.
+        const after=await exec({file:'git',args:['rev-parse','HEAD'],cwd});
+        if(after.code!==0||protocolText(after.stdout,128).trim()!==logicalHead)throw new Error('Git HEAD changed during snapshot; use local fallback');
+        bundleDone({shipMode:bundlePlan.mode,bytesSent:bundlePlan.bytes??0});
+      }
       if (manifest.siblings) {
         const inventory = Buffer.concat(manifest.siblings.frontierui.entries.flatMap(entry => [Buffer.from('./'),entry.path,Buffer.from([0])]));
         const siblingsCopied = await exec({file:'rsync',args:['-a','--chmod=Da+rx','--no-recursive','--no-dirs','--no-links','--safe-links','--exclude=.exit-code',
@@ -1259,10 +1298,11 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       if(delta) {
         await finish();
         if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,log});
+        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,onCapabilities,bundleMainMaxAgeMs,log});
       }
       if (error.code === 'sibling-inventory-failed') return {mode:'not-started',terminated:true,reason:error.code};
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
+      if (error.code === 'git-bundle-failed') return fallback(error.code,error.detail);
       if (['coverage-report-not-portable','diff-coverage-base-unavailable'].includes(error.code)) return fallback(error.code);
       if (error.code === 'excluded-source-file') return {mode:'not-started', terminated:true, reason:error.code};
       return fallback(['ignored-test-file','unshipped-test-file','unshipped-symlink','manifest-worktree-mismatch','manifest-walk-limit','unbound-worktree'].includes(error.code) ? error.code : 'copy-failed',error.detail);
@@ -1271,7 +1311,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       const runAt=clock(),runDone=begin('forge-run');
       let result;
       try {
-        if (!cancel.signal.aborted) result = await ssh('run',{...expected,manifest:expectedManifest,argv,env:executionEnv,...(delta ? {baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest,deletions:nulPaths(delta.deletions).toString('base64')}: {})},true);
+        if (!cancel.signal.aborted) result = await ssh('run',{...expected,manifest:expectedManifest,argv,env:executionEnv,...(delta ? {baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest,deletions:nulPaths(delta.deletions).toString('base64')}: {}),...(bundlePlan?{bundle:{...bundleEvidence(bundlePlan),maxMainAgeMs:bundleMainMaxAgeMs}}:{})},true);
       } catch { /* Only a protected finish response can resolve lost run output. */ }
       finally {runDone();}
       const receipt = await finish();
@@ -1292,7 +1332,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
           // finish consumed protected prepared state and proved started=false.
           // A fresh full prepare is safe once; disableDelta bounds the retry.
           if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,log});
+          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,onCapabilities,bundleMainMaxAgeMs,log});
           for(const timing of timings)if(timing.stage==='rsync')timing.shipMode='delta-then-full';
           return retried;
         }
@@ -1319,7 +1359,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
     } catch {return {mode:'unconfirmed',reason:'ambiguous-result'};}
   } finally {
     try {await finish();} catch { /* Pruning is the cleanup backstop; never retry execution. */ }
-    finally {if (staging) await fs.rm(staging, {recursive:true, force:true});}
+    finally {await removeBundleDirectory(bundleDirectory).catch(()=>{});if (staging) await fs.rm(staging, {recursive:true, force:true});}
   }
 }
 
