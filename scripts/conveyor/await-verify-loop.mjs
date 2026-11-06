@@ -116,7 +116,7 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
     }
     prFacts.set(key, states.get(id));
   }
-  const stale = new Set(classifyStaleOwed({ owed: allOwed, prFacts, records: allRecords }));
+  const stale = new Set(classifyStaleOwed({ owed: allOwed, prFacts, records: allRecords, nowMs }));
   const cleared = [];
   for (const { key, record } of allOwed) if (stale.has(key)) {
     try {

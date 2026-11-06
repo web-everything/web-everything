@@ -17,7 +17,7 @@ const entry = (key, pr, age = 0, extra = {}) => ({ key, record: {
   v: 1, sessionId: key, who: key, repo: 'web-everything/web-everything', pr,
   sha: 'a'.repeat(40), kind: 'fix', requestedAt: new Date(T0 + age).toISOString(),
   lane: `/lanes/${key}`, ref: `lane/${key}`, attempt: 1,
-  pendingResume: { kind: 'green' }, ...extra,
+  pendingResume: { kind: 'green', at: new Date(T0).toISOString() }, ...extra,
 } });
 
 function harness(entries, state) {
@@ -277,7 +277,7 @@ describe('stale owed resumes (R618)', () => {
   });
 
   it.each([
-    ['OPEN', { open: true }], ['MERGED', { open: false }], ['CLOSED', { open: false }],
+    ['OPEN', { open: true, headSha: null }], ['MERGED', { open: false }], ['CLOSED', { open: false }],
     ['UNKNOWN', null], ['PENDING', null], ['', null],
   ])('real PR-state port retains unknown evidence and classifies %j explicitly', async (state, expected) => {
     const io = await defaultAwaitVerifyIo({
@@ -353,13 +353,40 @@ describe('stale owed resumes (R618)', () => {
     expect(h.resumed).toEqual([]);
   });
 
-  it('retains an open PR with a moved head and no newer record', async () => {
-    const h = harness([entry('moved', 6360)], () => ({ open: true, sha: 'b'.repeat(40) }));
+  it('retires an owed record whose sha is not the open PR head, whatever its session (red-team break)', async () => {
+    const h = harness([entry('old-session', 6360), entry('new-session', 6360, 1000, { sha: 'b'.repeat(40) })], () => ({ open: true, headSha: 'b'.repeat(40) }));
+    h.io.listSessions = () => [{ sessionId: 'new-session', name: 'new-session', status: 'idle', kind: 'background' }];
+    const out = await h.pass(8);
+    expect(out.cleared).toEqual(['old-session']);
+    expect(h.resumed).toEqual(['new-session']);
+  });
+
+  it.each([
+    ['unreadable head sha', { open: true }],
+    ['malformed head sha', { open: true, headSha: 'zz' }],
+    ['same head sha in another case', { open: true, headSha: 'A'.repeat(40) }],
+  ])('retains an open PR record when head is %s', async (_n, facts) => {
+    const h = harness([entry('keep', 6360)], () => facts);
     const out = await h.pass(0);
     expect(out.cleared).toEqual([]);
-    expect(h.store.has('moved')).toBe(true);
-    expect(h.io.clearStoredRecordIf).not.toHaveBeenCalled();
-    expect(h.io.clearRecord).not.toHaveBeenCalled();
+    expect(h.store.has('keep')).toBe(true);
+  });
+
+  it.each([
+    ['red', { pendingResume: { kind: 'red' } }],
+    ['escalate', { pendingResume: { kind: 'escalate' } }],
+    ['push-refused', { pendingResume: { kind: 'push-refused' } }],
+    ['pushed too recently for a lagging head read (old requestedAt, fresh push)', { requestedAt: new Date(T0 - 3_600_000).toISOString(), pendingResume: { kind: 'green', at: new Date(T0 + 30_000).toISOString() } }],
+    ['legacy green (no push time) requested too recently', { pendingResume: { kind: 'green' }, requestedAt: new Date(T0 + 30_000).toISOString() }],
+  ])('keeps a moved-head record that is %s', (_n, extra) => {
+    const owed = [entry('live', 1, 0, extra)];
+    const prFacts = new Map([['live', { open: true, headSha: 'b'.repeat(40) }]]);
+    expect(classifyStaleOwed({ owed, prFacts, nowMs: T0 + 60_000 })).toEqual([]);
+  });
+
+  it('keeps a moved-head record that holds previousCi failure inventory', () => {
+    const owed = [entry('inv', 1, 0, { previousCi: { ready: { ciFailures: ['unit'] } } })];
+    expect(classifyStaleOwed({ owed, prFacts: new Map([['inv', { open: true, headSha: 'b'.repeat(40) }]]), nowMs: T0 + 60_000 })).toEqual([]);
   });
 
   it('retains unknown PR state and reports the real admission counts', async () => {

@@ -548,7 +548,7 @@ export async function runAwaitVerifyPass({
         const transientGone = !pushed?.ok && pushed?.transient;
         const salvaged = transientGone ? io.saveSalvage?.({ record, nowMs, reason: pushed.reason }) : null;
         pending = pushed?.ok
-          ? { kind: 'green', detail: record.earlyPush?.ok && lower(record.earlyPush.sha) === lower(record.sha) ? `on ${record.ref} since ${record.earlyPush.at} (push-before-gate), verified at ${new Date(nowMs).toISOString()}` : `pushed at ${new Date(nowMs).toISOString()}`, ...(srOverdue ? { selfReviewOverdue: srOverdue } : {}) }
+          ? { kind: 'green', at: new Date(Math.max(nowMs, Date.now())).toISOString(), detail: record.earlyPush?.ok && lower(record.earlyPush.sha) === lower(record.sha) ? `on ${record.ref} since ${record.earlyPush.at} (push-before-gate), verified at ${new Date(nowMs).toISOString()}` : `pushed at ${new Date(nowMs).toISOString()}`, ...(srOverdue ? { selfReviewOverdue: srOverdue } : {}) }
           : transientGone
             ? { kind: 'push-transient', detail: `${pushed.reason}${salvaged?.ok ? ' (the verified commit is saved; the harness keeps retrying the push)' : ''}` }
             : { kind: pushed?.moved ? 'push-rejected' : 'push-refused', detail: pushed?.reason ?? 'push failed' };
@@ -821,11 +821,19 @@ export async function defaultAwaitVerifyIo({
       return state && url && cross && rest.length ? { state, open: state === 'OPEN', ref: rest.join(' '), remoteUrl: repoUrlFromPrUrl(url), crossRepo: cross !== 'false' } : null;
     } catch { return null; }
   };
+  /** The PR's current head sha from GitHub, or null when unreadable (a null keeps the owed record). */
+  const prHeadSha = (repo, pr) => {
+    try {
+      const sha = String(exec('gh', ['pr', 'view', String(pr), '--repo', String(repo), '--json', 'headRefOid', '--jq', '.headRefOid'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env, timeout: 60_000 })).trim();
+      return /^[0-9a-f]{40}$/i.test(sha) ? sha : null;
+    } catch { return null; }
+  };
   return {
     // fix.pushBeforeGate through the policy cascade, re-read every pass so a settings flip applies without a restart.
     prState: (repo, pr) => {
       const head = prHead(repo, pr);
-      if (head?.state === 'OPEN') return { open: true };
+      if (head?.state === 'OPEN') return { open: true, headSha: prHeadSha(repo, pr) };
       if (head?.state === 'MERGED' || head?.state === 'CLOSED') return { open: false };
       return null;
     },
