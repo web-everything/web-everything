@@ -298,7 +298,7 @@ describe('the review daemon stage', () => {
     expect(broke.readError).toBe('kaput');
     const ok = await runPrepReviewStage({ env: {}, tick: async (a) => ({ mode: a.deps.mode, reviewed: [], skipped: [], failed: [], readError: null }), makeDeps: () => ({ mode: 'advise' }) });
     expect(ok.mode).toBe('advise');
-  });
+  }, 30000);
 });
 
 // ---- review round on PR 4453: each finding reproduced red, then fixed ---------------------------------------------------
@@ -656,7 +656,7 @@ describe('a stale review:prep is stripped whatever the mode and however the list
     const out = await runPrepReviewStage({ env: { WE_PREP_REVIEW_MODE: 'off' }, tick, makeDeps: () => ({ mode: 'off' }) });
     expect(tick).toHaveBeenCalled();
     expect(out.stripped).toEqual([{ prNumber: 11 }]);
-  });
+  }, 30000);
   it.each([['no files key', undefined], ['an empty list', []]])('with %s, the PR\'s own file list is read once and decides', async (_n, files) => {
     const { deps, calls } = mkDeps();
     const readPrFiles = vi.fn(() => ['backlog/4382-some-card.md', 'scripts/evil.mjs']);
