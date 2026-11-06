@@ -314,6 +314,28 @@ describe('carryForceWatch: a successor adopted without its own smoke inherits th
     expect(w).toMatchObject({ sha: 'd'.repeat(40), lastGood: { head: 'a'.repeat(40) } });
     expect(w.carryTo).toBeUndefined();
   });
+  it('an intent declared in the gap between the post-probe record read and the head read (git spawns there) still rebinds', async () => {
+    await rec();
+    await runForceWatchTick({ root, env, currentHead: 'b'.repeat(40), probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async () => {} });
+    let calls = 0;
+    const r = await runForceWatchTick({ root, env, probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async () => {},
+      currentHead: () => { calls += 1; if (calls < 2) return 'b'.repeat(40); declareForceCarry({ root, env, fromSha: 'b'.repeat(40), toSha: 'd'.repeat(40) }); return 'd'.repeat(40); } });
+    expect(r.action).not.toBe('superseded');
+    expect(readForceWatch(root, env)).toMatchObject({ sha: 'd'.repeat(40), lastGood: { head: 'a'.repeat(40) } });
+  });
+  it('chained unsmoked successors (F -> S1 -> S2 before any carry ran) keep the watch: the second move names the first intent as its source', async () => {
+    await rec();
+    await runForceWatchTick({ root, env, currentHead: 'b'.repeat(40), probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async () => {} });
+    expect(declareForceCarry({ root, env, fromSha: 'b'.repeat(40), toSha: 'd'.repeat(40) })).toBe(true); // S1; its carry never ran
+    expect(declareForceCarry({ root, env, fromSha: 'd'.repeat(40), toSha: 'e'.repeat(40) })).toBe(true); // S2
+    expect((await runForceWatchTick({ root, env, currentHead: () => 'e'.repeat(40), probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async () => {} })).action).toBe('continue');
+    expect(readForceWatch(root, env)).toMatchObject({ sha: 'e'.repeat(40), lastGood: { head: 'a'.repeat(40) } });
+    // and with no tick in between, the carries alone chain too
+    await rec();
+    declareForceCarry({ root, env, fromSha: 'b'.repeat(40), toSha: 'd'.repeat(40) });
+    expect(await carryForceWatch({ root, env, fromSha: 'd'.repeat(40), toSha: 'e'.repeat(40) })).toBe(true);
+    expect(readForceWatch(root, env)).toMatchObject({ sha: 'e'.repeat(40) });
+  });
   it('a head that is NOT the declared successor still closes the watch as superseded after the probe', async () => {
     await rec();
     await runForceWatchTick({ root, env, currentHead: 'b'.repeat(40), probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async () => {} });

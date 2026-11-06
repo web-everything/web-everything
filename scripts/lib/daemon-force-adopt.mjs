@@ -202,11 +202,11 @@ export async function carryForceWatch({ root, env = process.env, fromSha, toSha,
   const watch = currentWatch(root, env);
   // Already moved by a watch tick that saw the intent (`carryTo`) and HEAD on the successor: nothing left to do.
   if (watch && watch.sha === toSha && !watch.carryTo) return true;
-  if (!watch || watch.sha !== fromSha) return false;
+  if (!watch || (watch.sha !== fromSha && watch.carryTo !== fromSha)) return false; // chained: the previous intent is the source
   const { carryTo: _intent, ...rest } = watch;
   const moved = { ...rest, sha: toSha };
   const pending = pendingRollbacks.get(path);
-  if (pending && pending.sha === fromSha) pendingRollbacks.set(path, { ...pending, sha: toSha, watch: { ...pending.watch, sha: toSha } });
+  if (pending && (pending.sha === fromSha || pending.sha === watch.sha)) pendingRollbacks.set(path, { ...pending, sha: toSha, watch: { ...pending.watch, sha: toSha } });
   try { writeJson(path, moved); } catch {
     if (!pending) {
       // Not saved and nothing keeps it in memory: say so where an operator reads it, never a silent loss of rollback protection.
@@ -223,7 +223,8 @@ export async function carryForceWatch({ root, env = process.env, fromSha, toSha,
  *  reset and the carry) rebinds the watch itself instead of closing it as superseded. `toSha: null` withdraws the intent (the move failed). */
 export function declareForceCarry({ root, env = process.env, fromSha, toSha = null }) {
   const watch = currentWatch(root, env);
-  if (!watch || watch.sha !== fromSha) return false;
+  // A chained move (F -> S1 -> S2 before any tick or carry rebound the watch) names the previous intent as its source.
+  if (!watch || (watch.sha !== fromSha && watch.carryTo !== fromSha)) return false;
   const { carryTo: _old, ...rest } = watch;
   try { writeJson(watchPath(root, env), toSha ? { ...rest, carryTo: toSha } : rest); return true; } catch { return false; }
 }
@@ -320,7 +321,9 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   // A skip-unrelated successor may have been adopted while the probe ran (intent declared, HEAD reset, the adopter's own carry not
   // yet run): HEAD on the DECLARED successor is the same watched code, so the watch follows it (keeping any owed rollback) instead
   // of being closed as superseded. The probe judged the old head, so this tick neither counts down nor rolls back.
-  if (watch.carryTo && headNow !== null && headNow === watch.carryTo) { rebindToCarry(root, env, watch); return { action: 'none' }; }
+  // Re-read the record AFTER the head read: the intent may be declared in the gap between our first read and the (git-spawning) head read.
+  const latest = currentWatch(root, env);
+  if (latest?.sha === watch.sha && latest.carryTo && headNow !== null && headNow === latest.carryTo) { rebindToCarry(root, env, latest); return { action: 'none' }; }
   if (headNow !== null && headNow !== watch.sha) {
     clearWatch(root, env);
     await emit?.({ kind: 'force-adopt-watch-superseded', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, head: headNow } });
