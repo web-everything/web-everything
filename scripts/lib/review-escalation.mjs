@@ -750,6 +750,7 @@ export function scoreEscalation({
   // The CUMULATIVE list, exactly as supplied — this and only this is the hunks' basis (#2890 finding 4 below).
   const cumulativeFiles = Array.isArray(humanBasisFiles) ? humanBasisFiles : ownFiles;
   const gateBasis = unionPaths(cumulativeFiles, ownFiles);
+  // @invariant human-gate-reads-each-files-own-hunks (#human-is-principle-surface-not-path) — a file is judged against ITS OWN diff section, never the PR's whole text
   const fileHunksOf = fileHunksResolver(diffHunks);
   const permissionHits = sensitiveSurfaceHits(gateBasis, fileHunksOf, resolvedSurfaces);
   // Sensitive surfaces stay in care even when their human category is currently disabled.
@@ -772,7 +773,6 @@ export function scoreEscalation({
 
   // All touch-set gates use the cumulative basis and each file's own hunks. The configured categories
   // decide which principle triggers require human review; inactive triggers still raise AI care via blast-radius.
-  // @invariant human-gate-reads-each-files-own-hunks (#human-is-principle-surface-not-path) — a file is judged against ITS OWN diff section, never the PR's whole text
   const surfaces = gateBasis.map((f) => { const hunks = fileHunksOf(f); return { file: f, hunks, triggers: principleSurfaceTriggers(f, hunks) }; });
   const categoryFor = { 'leash-path': 'gate-self', 'statute-anchor': 'statute', 'marked-invariant': 'marked-invariant' };
   const demoted = {};
