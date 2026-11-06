@@ -7,7 +7,7 @@ import {createHash} from 'node:crypto';
 import {spawn, spawnSync} from 'node:child_process';
 import {once} from 'node:events';
 import {fileURLToPath} from 'node:url';
-import {createRunner, digestInput, digestArgv, supervisorSource} from '../forge-exec-run.mjs';
+import {createRunner, digestInput, digestArgv, supervisorSource, elasticRunLimits, taskPressureNote} from '../forge-exec-run.mjs';
 import * as manifestAPI from '../forge-exec-run.mjs';
 import {verifiedCopySource} from '../forge-exec-bases.mjs';
 import {scanScope} from '../../lib/repo-scan-tests.mjs';
@@ -1385,6 +1385,37 @@ describe('sibling manifest verification', () => {
 
 
 describe('slot resource environment and receipts',()=>{
+  it.each([[1950,2048,true],[1600,2048,false],[1638,2048,false],[1639,2048,true],
+    [80,100,false],[81,100,true],[1950,6144,false],[4916,6144,true],
+    [null,2048,false],[-1,2048,false],[Number.MAX_SAFE_INTEGER+1,2048,false]])
+  ('receipt task pressure count=%s limit=%s near=%s stays out of Mac telemetry',async(processCount,tasksMax,near)=>{
+    runner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',testWorkerExec:async()=>({
+      code:0,stdout:'',stderr:'',usage:{processCount},tasksMax,
+    })});
+    const opted=await runner.prepare({nonce:request.nonce,capabilities:{taskPressure:1}});
+    work=join(root,'runs',opted.run,'work');
+    await writeFile(join(work,'package-lock.json'),'lock');
+    request={...request,run:opted.run};
+    await runner.run(request);
+    const receipt=JSON.parse(await readFile(join(root,'receipts',request.run+'.receipt'),'utf8'));
+    expect(taskPressureNote(processCount,tasksMax).tasksNear === true).toBe(near);
+    const expectedNote = taskPressureNote(processCount,2048);
+    if(expectedNote.tasksNear)expect(receipt).toMatchObject({...expectedNote,tasksNote:expect.stringContaining('80%')});
+    else for(const key of ['processCount','tasksMax','tasksNear','tasksNote'])expect(receipt).not.toHaveProperty(key);
+    const telemetry=JSON.parse(await readFile(join(root,'receipts','telemetry.json'),'utf8'));
+    // Exact legacy keys are checked without testRoot in forge-protocol-capabilities.test.mjs.
+    expect(()=>manifestAPI.parseTelemetry(JSON.stringify(telemetry))).not.toThrow();
+    for(const row of telemetry.recent)for(const key of ['processCount','tasksMax','tasksNear','tasksNote'])expect(row).not.toHaveProperty(key);
+    const {checkRemoteHealth}=await import('../forge-remote-health.mjs');
+    expect(await checkRemoteHealth({root:join(root,'health'),settings:{maxLoadPerCore:1e6,minFreeRamPct:0},readTelemetry:async()=>telemetry})).toEqual({ok:true});
+  });
+  it('scales TasksMax with the elastic grant and preserves an unlimited operator cap',()=>{
+    const limits={parent:{cpuQuota:'2800%'},slot:{cpuQuota:'800%',memoryMax:'12G',tasksMax:2048}};
+    expect(elasticRunLimits(limits,1,1).tasksMax).toBe(2048);
+    expect(elasticRunLimits(limits,1,3).tasksMax).toBe(6144);
+    expect(elasticRunLimits({...limits,slot:{...limits.slot,tasksMax:'infinity'}},1,3).tasksMax).toBe('infinity');
+  });
+
   it.each([undefined,'3'])('defaults worker count while permitting a request override %s',async workers=>{
     const seen=[];
     runner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',testWorkerExec:async call=>{
@@ -1442,6 +1473,7 @@ it.each([false,true])('reads supervisor cgroup counters with missing counters=%s
 from unittest.mock import patch
 source, usage, missing = sys.argv[1:]
 cfg = {'usage': usage}
+process_count = None
 files = {'/proc/self/cgroup': '0::/forge-exec.slice/forge-exec-3.slice/scope\n',
          '/sys/fs/cgroup/forge-exec.slice/forge-exec-3.slice/scope/memory.peak': '12345',
          '/sys/fs/cgroup/forge-exec.slice/forge-exec-3.slice/scope/cpu.stat': 'usage_usec 678\nuser_usec 600\n',
@@ -1463,7 +1495,63 @@ else:
   const result=spawnSync('python3',['-I','-c',probe,source,usage,String(missing)],{encoding:'utf8',timeout:10000});
   expect(result.status,result.stderr).toBe(0);
   expect(JSON.parse(await readFile(usage,'utf8'))).toEqual(missing
-    ? {memoryPeakBytes:null,cpuUsec:null,oomKills:null}
-    : {memoryPeakBytes:12345,cpuUsec:678,oomKills:1});
+    ? {memoryPeakBytes:null,cpuUsec:null,oomKills:null,processCount:null}
+    : {memoryPeakBytes:12345,cpuUsec:678,oomKills:1,processCount:null});
   expect(supervisorSource.indexOf("if 'usage' in cfg:")).toBeGreaterThan(supervisorSource.indexOf('if not uid_processes(): break'));
+});
+
+describe('bounded supervisor task pressure sample',()=>{
+  it.each([
+    ['peak','1950','1',1950,false],
+    ['kill',null,'1950',1950,true],
+    ['unreadable',null,null,null,false],
+    ['oversized','9'.repeat(100),'9'.repeat(100),null,false],
+  ])('samples %s before cleanup without scanning proc for the count',async(label,peak,current,expected,cancel)=>{
+    const usage=join(root,'task-usage'),status=join(root,'task-status');
+    const probe=String.raw`import builtins, ctypes, io, json, os, subprocess, sys
+from unittest.mock import patch
+source, root, status, usage, peak, current, cancel = sys.argv[1:]
+peak, current, cancel = json.loads(peak), json.loads(current), json.loads(cancel)
+real_open = builtins.open
+writer = dict(guard=os.path.join(root, 'tasks-writer'), reservation=os.path.join(root, 'tasks-reservation'), run='fixture', nonce='fixture')
+fd = os.open(writer['guard'], os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+os.close(fd)
+with real_open(writer['reservation'], 'w') as stream: json.dump(dict(run='fixture', nonce='fixture'), stream)
+reads = []
+def proc_open(path, *args, **kwargs):
+    if path == '/proc/self/cgroup': return io.StringIO('0::/test-scope\n')
+    if path.startswith('/sys/fs/cgroup/test-scope/'):
+        name = path.rsplit('/', 1)[1]
+        values = {'pids.peak': peak, 'pids.current': current, 'memory.peak': '100', 'cpu.stat': 'usage_usec 10', 'memory.events': 'oom_kill 0'}
+        value = values.get(name)
+        if value is None: raise FileNotFoundError(path)
+        class Counter(io.StringIO):
+            def read(self, size=-1):
+                if name.startswith('pids.'):
+                    assert 0 < size <= 65, size
+                    reads.append(name)
+                return super().read(size)
+        return Counter(value)
+    return real_open(path, *args, **kwargs)
+def reap(*args):
+    if peak is not None or current is not None: assert reads, 'task count sampled after cleanup'
+    raise ChildProcessError()
+cfg = dict(uid=os.getuid(), gid=os.getgid(), argv=['unused'], cwd=root, env={}, status=status, usage=usage, writer=writer)
+if cancel:
+    cfg['cancel'] = os.path.join(root, 'tasks-cancel')
+    with real_open(cfg['cancel'], 'w') as stream: stream.write('')
+with patch.object(ctypes, 'CDLL') as libc, patch.object(subprocess, 'Popen') as worker, \
+     patch.object(os, 'listdir', return_value=[]), patch.object(os, 'waitpid', side_effect=reap), \
+     patch.object(builtins, 'open', side_effect=proc_open):
+    libc.return_value.prctl.return_value = 0
+    worker.return_value.wait.return_value = 0
+    sys.argv = ['supervisor', json.dumps(cfg)]
+    exec(source)
+`;
+    const result=spawnSync('python3',['-I','-c',probe,supervisorSource,root,status,usage,JSON.stringify(peak),JSON.stringify(current),JSON.stringify(cancel)],
+      {encoding:'utf8',timeout:10000,maxBuffer:65536});
+    expect(result.status,result.stderr).toBe(0);
+    expect(JSON.parse(await readFile(usage,'utf8')).processCount).toBe(expected);
+    if(expected===null)expect(result.stderr).toContain('task-pressure sample unavailable');
+  });
 });
