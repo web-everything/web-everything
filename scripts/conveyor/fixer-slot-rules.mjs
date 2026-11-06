@@ -24,6 +24,7 @@
  *   releaseOnCompletion     env WE_FIX_RELEASE_ON_COMPLETION   built-in off (off: release waits for the next claim sweep)
  */
 import { readSettings } from '../lib/settings-files.mjs';
+import { isHarnessRecord, previousCiFailurePending } from './await-verify.mjs';
 
 export const FIXER_SLOT_SETTINGS_BUILT_IN = Object.freeze({
   awaitVerifyLoopSeconds: 0, parkedReleasesSlot: false, parkedCapFactor: 2, releaseOnCompletion: false,
@@ -114,6 +115,31 @@ export function slotCountedItems({ items, cap, parkedReleasesSlot, parkedCapFact
   const working = list.filter((x) => x.state !== 'parked');
   const parked = list.filter((x) => x.state === 'parked');
   return [...working, ...parked].slice(0, n).map((x) => x.item);
+}
+
+export const STALE_HEAD_GRACE_MS = 60_000;
+
+/** Stale owed keys. PR facts are a Map keyed by record key; unknown facts retain the record.
+ * Only an explicitly closed PR, an open PR whose readable head sha differs from the record's (any session), or a valid, strictly newer, different SHA in the same repo/PR, kind and session lineage
+ * retires a wait. Preserve pending previousCi failure inventory even after PR closure; normal cleanup may still need its repair handoff.
+ * When either session id is missing, lineage requires both the same lane and worker name.
+ * `records` may include newer waits that have not yet become owed. */
+export function classifyStaleOwed({ owed, prFacts = new Map(), records = owed, nowMs = Date.now() }) {
+  // Only a `green` wait (its sha was pushed by phase A before the head was read), pushed (pendingResume.at) long enough ago that a lagging head read
+  // cannot predate the push; records written before `at` existed fall back to requestedAt. red / escalate / push-refused waits may name a never-pushed sha and are always kept.
+  const movedHead = (r, f) => r.pendingResume?.kind === 'green' && nowMs - Date.parse(r.pendingResume.at ?? r.requestedAt) >= STALE_HEAD_GRACE_MS && f?.open === true && /^[0-9a-f]{40}$/i.test(String(f.headSha ?? '')) && /^[0-9a-f]{40}$/i.test(String(r.sha ?? ''))
+    && f.headSha.toLowerCase() !== r.sha.toLowerCase();
+  return owed.filter(({ key, record: r }) => (prFacts.get(key)?.open === false && !previousCiFailurePending(r))
+    // Any session: an owed wait for a sha that is no longer the open PR's head is obsolete. Unreadable head keeps it.
+    || (!r.previousCi && movedHead(r, prFacts.get(key)))
+    || (!r.previousCi && records.some(({ record: newer }) => isHarnessRecord(newer) && r.repo && r.pr && r.sha
+      && newer.repo === r.repo && newer.pr === r.pr && newer.sha.toLowerCase() !== String(r.sha).toLowerCase()
+      && newer.kind === r.kind
+      && (r.sessionId && newer.sessionId
+        ? r.sessionId === newer.sessionId
+        : r.lane && newer.lane === r.lane && r.who && newer.who === r.who)
+      && Date.parse(newer.requestedAt) > Date.parse(r.requestedAt))))
+    .map(({ key }) => key);
 }
 
 /**
