@@ -97,7 +97,18 @@ function report(options, evidence = 'passed', status = 0) {
     const state = file === failedFile ? evidence : 'passed';
     if (state === 'missing') return [];
     return [{ name: join(fs.realpathSync(options.root), file),
-      assertionResults: state === 'empty' ? [] : [{ status: state, title: 'worker behaves', ancestorTitles: ['worker'] }] }];
+      assertionResults: state === 'empty' ? []
+        // 'renamed': the failed assertion vanished and only a different one ran (and passed).
+        : state === 'renamed' ? [{ status: 'passed', title: 'another behaves', ancestorTitles: ['worker'] }]
+        // 'baseline-passed': both assertions run and pass.
+        : state === 'baseline-passed' ? [{ status: 'passed', title: 'baseline', ancestorTitles: ['worker'] },
+          { status: 'passed', title: 'worker behaves', ancestorTitles: ['worker'] }]
+        // 'baseline-failed': one assertion passes and a second one fails.
+        : state === 'baseline-failed' ? [{ status: 'passed', title: 'baseline', ancestorTitles: ['worker'] },
+          { status: 'failed', title: 'worker behaves', ancestorTitles: ['worker'] }]
+        // 'twin-failed': two same-titled assertions both failed.
+        : state === 'twin-failed' ? [0, 1].map(() => ({ status: 'failed', title: 'worker behaves', ancestorTitles: ['worker'] }))
+        : [{ status: state, title: 'worker behaves', ancestorTitles: ['worker'] }] }];
   });
   fs.writeFileSync(options.testReport, JSON.stringify({ testResults }));
   return { status, stdout: '', stderr: '' };
@@ -301,6 +312,37 @@ describe('overlay main sync failed-file reruns', () => {
     await expect(job(f)).rejects.toThrow(failure);
     expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
     expect(f.deps.mainTestRunner).toHaveBeenCalledOnce();
+    expect(kinds(f)).not.toContain('overlay-main-flaky-retried');
+    noPublication(f);
+  });
+
+  it('a rerun in which the previously failing assertion no longer runs is not a pass', async () => {
+    // Initial: baseline-style assertion fails. Rerun: that assertion is gone, a different one passes.
+    const f = fixture(); runners(f, ['failed', 'renamed']);
+    await expect(job(f)).rejects.toThrow(failure);
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    expect(kinds(f)).not.toContain('overlay-main-flaky-retried');
+    expect(kinds(f)).not.toContain('overlay-main-red');
+    noPublication(f);
+  });
+
+  it('a rerun that runs only the baseline assertion (the failing one vanished) is not a pass', async () => {
+    const f = fixture(); runners(f, ['baseline-failed', 'passed']);
+    await expect(job(f)).rejects.toThrow(failure);
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    expect(kinds(f)).not.toContain('overlay-main-flaky-retried');
+    noPublication(f);
+  });
+
+  it('a rerun that re-executes every assertion, failing one included, still syncs', async () => {
+    const f = fixture(); runners(f, ['baseline-failed', 'baseline-passed']);
+    expect(await job(f)).toMatchObject({ pushed: true });
+    expect(kinds(f)).toContain('overlay-main-flaky-retried');
+  });
+
+  it('duplicate assertion titles cannot cover each other: two failed twins need two passes on rerun', async () => {
+    const f = fixture(); runners(f, ['twin-failed', 'passed']);
+    await expect(job(f)).rejects.toThrow(failure);
     expect(kinds(f)).not.toContain('overlay-main-flaky-retried');
     noPublication(f);
   });

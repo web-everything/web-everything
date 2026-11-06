@@ -530,13 +530,15 @@ async function syncTestEvidence({ root, scratch, selected, testReport, env, io, 
   const results = report?.testResults;
   if (!Array.isArray(results)) throw testFailure();
   const names = selected.map(file => join(io.realpathSync(scratch), file));
-  const failed = [], passed = [], failedAssertions = [];
+  const failed = [], passed = [], failedAssertions = [], byFile = new Map();
   for (let i = 0; i < selected.length; i++) {
     const matches = results.filter(r => r?.name === names[i]);
     if (matches.length !== 1) continue;
     const r = matches[0], assertions = r.assertionResults;
     if (!Array.isArray(assertions) || !assertions.length
       || assertions.some(a => !['passed', 'failed'].includes(a?.status))) continue;
+    const ids = status => assertions.filter(a => a.status === status).map(a => assertionIdentity(selected[i], a));
+    byFile.set(selected[i], { total: assertions.length, failedIds: ids('failed'), passedIds: ids('passed') });
     if (assertions.some(a => a.status === 'failed')) {
       failed.push(selected[i]);
       failedAssertions.push(...assertions.filter(a => a.status === 'failed').map(a => assertionIdentity(selected[i], a)));
@@ -550,7 +552,28 @@ async function syncTestEvidence({ root, scratch, selected, testReport, env, io, 
   if (!commandOk && !(result?.status === 1 && (!result.error || validatedFailure) && complete && failed.length)) {
     output({ ...result, step: 'tests' });
   }
-  return { green, failed, complete, failedAssertions };
+  return { green, failed, complete, failedAssertions, byFile };
+}
+// A green rerun only clears a failure it actually re-executed. Per previously failed file the rerun must
+// run at least as many assertions as the failing run did (a vanished assertion fails closed), and, when
+// both sides carry assertion identities, every previously failed identity must reappear among the
+// rerun's passed ones (counted, so duplicate titles cannot cover each other). A TAP-derived passing
+// report carries no titles, so there the count is the guarantee.
+function rerunCoversFailures(previous, rerun, files) {
+  for (const file of files) {
+    const before = previous.byFile.get(file), after = rerun.byFile.get(file);
+    if (!before || !after || after.total < before.total) return false;
+    if (before.failedIds.some(id => id === null)) return false;
+    if (after.passedIds.some(id => id === null)) continue;
+    const available = new Map();
+    for (const id of after.passedIds) available.set(id, (available.get(id) ?? 0) + 1);
+    for (const id of before.failedIds) {
+      const left = available.get(id) ?? 0;
+      if (left < 1) return false;
+      available.set(id, left - 1);
+    }
+  }
+  return true;
 }
 export async function runOverlayMainSync({ root, ref, token, env = process.env, deps = {} }) {
   const io = deps.io ?? fs, event = deps.appendOverlayEvent ?? appendOverlayEvent;
@@ -680,12 +703,16 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
       if (evidence.green) continue;
       if (!reruns || !evidence.complete || !evidence.failed.length) throw testFailure();
       const retried = [...evidence.failed];
-      let remaining = retried;
+      let remaining = retried, previous = evidence;
       for (let attempt = 0; attempt < reruns; attempt++) {
         evidence = await check(remaining, attempt);
         if (evidence.remoteUnconfirmed) return await skip('remote-termination-unconfirmed');
+        // A file that stops failing must have re-executed what failed before; otherwise it is no pass.
+        const cleared = previous.failed.filter(file => !evidence.failed.includes(file) && evidence.byFile.has(file));
+        if (cleared.length && !rerunCoversFailures(previous, evidence, cleared)) throw testFailure();
+        if (evidence.green && !cleared.length) throw testFailure();
         if (evidence.green || !evidence.complete || !evidence.failed.length) break;
-        remaining = evidence.failed;
+        remaining = evidence.failed; previous = evidence;
       }
       if (evidence.green) {
         event(root, { kind: 'overlay-main-flaky-retried', ref, files: retried,
