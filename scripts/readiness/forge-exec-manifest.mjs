@@ -111,6 +111,31 @@ function entropy(text) {
   const chars=[...text],counts=new Map();for(const char of chars)counts.set(char,(counts.get(char)??0)+1);
   return [...counts.values()].reduce((bits,n)=>bits-(n/chars.length)*Math.log2(n/chars.length),0);
 }
+// R651: an assigned value is judged by its VALUE candidates, not by the whole line tail. A single token (env-style
+// KEY=abc..., JSON/YAML scalar) and every quoted literal are scanned exactly as before; a multi-token tail (code
+// expression or prose such as `previousPathKey = parsed.pathKey ?? null;`) is scanned token by token, so a real
+// high-entropy token anywhere in it still refuses while the entropy of the surrounding words no longer counts.
+const highEntropy=text=>text.length>=20&&entropy(text)>=3.5;
+function assignedValueHighEntropy(value) {
+  const trimmed=value.trim().replace(/[;,]+$/,'');
+  if(!/\s/.test(trimmed))return highEntropy(trimmed)||highEntropy(value);
+  // Space-separated secrets (a passphrase) keep the whole-value check. A multi-token tail is judged token by token only
+  // when it is visibly code or a documentation placeholder, never plain words: either its first token closes a
+  // markdown span after the placeholder word (docs spelling `key=value`), or it carries a `??`-style operator, backtick or dotted-path
+  // marker AND every token is a digit-free, symbol-free, pronounceable identifier path/flag/operator AND no two
+  // plain words are adjacent (word passphrases always have adjacent words). Anything else falls to the whole-value check.
+  const tokens=trimmed.split(/\s+/);
+  const placeholder=/^value`[,.;:)]*$/.test(tokens[0])&&/^[^`]*`/.test(value);
+  const marker=/(?:^|\s)(?:\?\?|\|\||&&|=>|[!=]==)(?:\s|$)|`|[A-Za-z]\.[A-Za-z]/.test(value);
+  const wordLike=token=>/^[`'"(\[]*[A-Za-z_][A-Za-z_.\/'-]*[`'")\]();,.:?]*$|^(?:\?\?|\|\||&&|=>|[!=]==?|\?|:)$|^--?[A-Za-z-]+`?[,.]?$/.test(token);
+  const pronounceable=token=>!/[^aeiou\W\d_]{5}/i.test(token);
+  const plain=token=>/^[`'"(\[]*[A-Za-z]{2,}[`'")\]();,.:?]*$/.test(token);
+  const adjacentWords=tokens.some((token,i)=>i&&plain(token)&&plain(tokens[i-1]));
+  const codeLike=marker&&!adjacentWords&&tokens.every(token=>wordLike(token)&&pronounceable(token));
+  if(!placeholder&&!codeLike&&highEntropy(value))return true;
+  for(const [,,inner] of trimmed.matchAll(/(["'`])((?:\\.|(?!\1).)*)\1/g))if(highEntropy(inner))return true;
+  return trimmed.split(/\s+/).some(token=>highEntropy(token.replace(/^[^\w]+|[^\w]+$/g,''))||highEntropy(token));
+}
 // Content scan for a name-flagged file (R323: EVERY type, no type-based skip).
 // JSON gets the full structural scan; other UTF-8 text gets raw token patterns
 // and fail-closed secret assignments. Unknown encodings stay excluded.
@@ -130,7 +155,7 @@ export function credentialContentFinding(path,content) {
   // YAML/INI/plain-text assignments, including quoted fields and YAML lists.
   // This is a conservative exclusion heuristic, not a parser for arbitrary formats.
   for(const [,field,value] of text.matchAll(/(?:^|[\r\n])[\t ]*(?:-[\t ]+)?["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?[\t ]*[:=][\t ]*([^\r\n]*)/g)) {
-    if(secretField.test(field)&&value.length>=20&&entropy(value)>=3.5)return `high-entropy-${field}`;
+    if(secretField.test(field)&&assignedValueHighEntropy(value))return `high-entropy-${field}`;
     if(/password|passwd|secret|token|api[_-]?key/i.test(field)) {
       // Only whole, explicit placeholders qualify; expressions and suffixes do not.
       const trimmed=value.trim(),literal=/^(["'])(.*)\1$/.exec(trimmed)?.[2]??trimmed;
