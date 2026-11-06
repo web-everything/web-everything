@@ -124,6 +124,14 @@ describe('#6345 — resume a stored needs-human review after its refused referra
     expect(o.lastDispatch.size).toBe(0);
   });
 
+  it('fails closed: an older ruled run does not mask a newer same-head run that is not ruled', () => {
+    const o = parkedFixture();
+    const [ruledRun] = o.readReviewRuns();
+    o.readReviewRuns = vi.fn(() => [{ ...ruledRun, startedAt: 1 }, { ...ruledRun, id: 'review-pr-newer', startedAt: 2 }]);
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+
   it('shares the full-review per-head retry cooldown', () => {
     const o = parkedFixture();
     o.lastDispatch.set(`${repo}#${pr}@${head}`, o.now() - 1);

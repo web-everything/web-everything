@@ -441,7 +441,10 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (verdict === VERDICTS.NEEDS_HUMAN && storedHead === head) {
         let ruled = false;
         try {
-          ruled = readReviewRuns().some(run => refusedReferralsAreRuled({ ...rawPr, number: pr }, run, { repo }));
+          // Only the newest attempt on this head counts: an older ruled run must not mask a newer one that still owes a human.
+          const newest = readReviewRuns().filter(run => run?.repo === repo && Number(run.pr) === pr && run.head === head)
+            .reduce((best, run) => !best || Number(run.startedAt) > Number(best.startedAt) ? run : best, null);
+          ruled = newest != null && refusedReferralsAreRuled({ ...rawPr, number: pr }, newest, { repo });
         } catch { /* Unknown run evidence preserves the existing not-owed decision. */ }
         if (ruled) return fullReviewDecision('stored review needs-human only on referrals now ruled; resume the parked run');
       }
