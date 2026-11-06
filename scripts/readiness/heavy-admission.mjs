@@ -144,7 +144,7 @@
  *     fresh resource snapshot permits it. Status and release scan every slot that scaling may hand out.
  */
 import '../lib/tools-root-guard.mjs';
-import { constants, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync } from 'node:fs';
+import { constants, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync, renameSync } from 'node:fs';
 import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
 import { execSync, execFile } from 'node:child_process';
 import { hostname, homedir, userInfo, loadavg, cpus, constants as osConstants } from 'node:os';
@@ -172,7 +172,8 @@ import {
   queueBacklog, laneProjection, slotOrderFor, DEFAULT_QUEUE_MAX_WAIT_MINUTES, QUEUE_MAX_WAIT_ENV,
   QUEUE_ADMISSION_SWITCH_ENV, DEFAULT_ARRIVAL_WINDOW_MINUTES,
 } from './heavy-queue-projection.mjs'; // card xkyw1x4 — the pure projection + fast-lane rules
-import { routeNeedsGit } from './needs-git-route.mjs'; // R501: test files that spawn git cannot run on Forge's .git-less snapshot
+import { routeNeedsGit } from './needs-git-route.mjs';
+import { capabilityAdvertisesBundle, capabilityRecord } from './remote-git-bundle.mjs'; // R501: test files that spawn git cannot run on Forge's .git-less snapshot
 import { recordRemoteRun } from '../lib/forge-share.mjs'; // R501: the one durable remote-success row forgeShare reads
 import { createMarkerReaper, markerContent, recordMarkerRun, blockedSlots, heldTombstone } from './forge-slot-markers.mjs';
 import { classifyWaiterPriority, waiterPriorityClass, validRepairPatterns, DEFAULT_REPAIR_PATTERNS, ADMISSION_PRIORITY_MODES } from './heavy-repair-priority.mjs'; // red-main repair class — kept out of the projection (which the read-only `heavy-queue` op imports) because it needs `node:vm`
@@ -242,7 +243,10 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
   fastScale: Object.freeze({ maxSlots: null, minShortWaiters: 3, minShortShare: 0.6, minCpuIdlePct: 30, maxMemPressureLevel: 1 }),
   // main-fix-queue-priority — a red-main repair waiter (P0) is admitted to the next free slot ahead of all others.
   priority: Object.freeze({ mode: 'enforce', repairPatterns: DEFAULT_REPAIR_PATTERNS }),
-  remote: Object.freeze({ enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null,
+  // transport (R593): 'rsync' (default, rollback value) | 'git-bundle' (ship a verified git bundle; needs a runner advertising gitBundle:1).
+  remote: Object.freeze({ enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null, transport: 'rsync',
+    // R559: bundle mode needs the Forge mirror's public main fetched within this many minutes (else it falls back to rsync).
+    bundle: Object.freeze({ mainMaxAgeMin: 10 }),
     maxConcurrent: 8, backoffMs: 120000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15,
     // R475: raise a health event (coroner trigger) when >= stuckMinSlots dead-owner unconfirmed slots are older than stuckAgeMs,
     // or when a slot is kept because the Forge probe was unknown; at most one event per kind per stuckSignalEveryMs.
@@ -272,6 +276,8 @@ const ADMISSION_VALID = {
   'priority.mode': (v) => ADMISSION_PRIORITY_MODES.includes(v),
   'priority.repairPatterns': validRepairPatterns,
   'remote.clientPath': (v) => v === null || typeof v === 'string',
+  'remote.transport': (v) => v === 'rsync' || v === 'git-bundle',
+  'remote.bundle.mainMaxAgeMin': (v) => Number.isFinite(v) && v > 0 && v <= 1440,
   'remote.enabled': (v) => typeof v === 'boolean',
   'remote.mode': (v) => v === 'above-threshold' || v === 'always',
   'remote.loadPerCoreThreshold': (v) => Number.isFinite(v) && v > 0,
@@ -350,7 +356,7 @@ export function privateAdmissionPool(env, checkoutRoot) {
 export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot } = {}) {
   const isPrivate = privateAdmissionPool(env, checkoutRoot);
   const settings = { ...ADMISSION_POLICY_STANDARD, fastScale: { ...ADMISSION_POLICY_STANDARD.fastScale },
-    remote: { ...ADMISSION_POLICY_STANDARD.remote },
+    remote: { ...ADMISSION_POLICY_STANDARD.remote, bundle: { ...ADMISSION_POLICY_STANDARD.remote.bundle } },
     priority: { ...ADMISSION_POLICY_STANDARD.priority, repairPatterns: [...ADMISSION_POLICY_STANDARD.priority.repairPatterns] } };
   const sources = {}; const invalid = []; const ignored = [];
   for (const [leaf, valid] of Object.entries(ADMISSION_VALID)) {
@@ -386,8 +392,8 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
         else invalid.push(`env ${name}=${oneLine(JSON.stringify(raw))}`);
       }
     }
-    const dot = leaf.indexOf('.');
-    if (dot > 0) settings[leaf.slice(0, dot)][leaf.slice(dot + 1)] = value;
+    const keys = leaf.split('.');
+    if (keys.length > 1) keys.slice(0, -1).reduce((o, k) => o[k], settings)[keys.at(-1)] = value;
     else settings[leaf] = value;
   }
   return { settings, sources, invalid, ignored };
@@ -454,25 +460,41 @@ export function formatAdmissionPolicy({ settings, sources, ignored = [], invalid
   const values = ['cap', 'fastSlots', 'onTimeout', 'fastScale.maxSlots', 'priority.mode',
     ...Object.keys(ADMISSION_POLICY_STANDARD.remote)
       .filter(key => key !== 'clientPath' || settings.remote?.clientPath != null)
-      .map(key => `remote.${key}`)]
+      .flatMap(key => key === 'bundle' ? ['remote.bundle.mainMaxAgeMin'] : [`remote.${key}`])]
     .map((leaf) => `${leaf}=${leaf === 'remote.clientPath' ? clientPathForLog(admissionLeaf(settings, leaf)) : admissionLeaf(settings, leaf)} (${sources[leaf] ?? 'standard'})`);
   return `heavy-admission policy · ${values.join(', ')}${ignored.length ? ` · ignored: ${ignored.join('; ')}` : ''}${invalid.length ? ` · invalid: ${invalid.join('; ')}` : ''}`;
 }
 
 /** Pure remote routing decision; unreadable load keeps threshold routing local. */
-export function decideRemote({ policy, loadPerCore, argv, cwd }) {
+export function decideRemote({ policy, loadPerCore, argv, cwd, runnerBundleOk = false }) {
   const remote = policy.settings.remote;
   const enabled = `remote.enabled=${remote.enabled} (${policy.sources['remote.enabled'] ?? 'standard'})`;
   if (!remote.enabled) return { remote: false, reason: enabled };
-  if (remote.mode === 'always') return withNeedsGit({ remote: true, reason: `${enabled}; mode=always` }, argv, cwd);
+  if (remote.mode === 'always') return withNeedsGit({ remote: true, reason: `${enabled}; mode=always` }, argv, cwd, bundleKeepsRemote(remote, runnerBundleOk));
   if (!Number.isFinite(loadPerCore)) return { remote: false, reason: `${enabled}; load-unreadable` };
   const above = loadPerCore > remote.loadPerCoreThreshold;
-  return withNeedsGit({ remote: above, reason: `${enabled}; loadPerCore=${loadPerCore} ${above ? '>' : '<='} ${remote.loadPerCoreThreshold}` }, argv, cwd);
+  return withNeedsGit({ remote: above, reason: `${enabled}; loadPerCore=${loadPerCore} ${above ? '>' : '<='} ${remote.loadPerCoreThreshold}` }, argv, cwd, bundleKeepsRemote(remote, runnerBundleOk));
+}
+
+/** R593: routing reads the runner capability cache the client wrote at its last prepare; unreadable means no. */
+export function readRunnerBundleCapability({ root, host, clock = Date.now, read = readFileSync }) {
+  try { return capabilityAdvertisesBundle(JSON.parse(read(join(root, 'runner-capabilities.json'), 'utf8')), { host, nowMs: clock() }); }
+  catch { return false; }
+}
+export function writeRunnerCapabilities({ root, host, capabilities, clock = Date.now, write = writeFileSync, mkdir = mkdirSync, rename = renameSync }) {
+  try {
+    mkdir(root, { recursive: true });
+    const file = join(root, 'runner-capabilities.json'), pending = `${file}.${process.pid}.tmp`;
+    write(pending, JSON.stringify(capabilityRecord({ host, capabilities, nowMs: clock() })), { mode: 0o600 });
+    rename(pending, file);
+  } catch { /* advisory cache only: a failed write keeps git tests local */ }
 }
 
 /** R501: a remote decision for a run naming a git-spawning test file becomes local with the named reason `needs-git`. */
-function withNeedsGit(decision, argv, cwd) {
-  if (!decision.remote) return decision;
+/** R593: git-needing tests stay remote only when transport=git-bundle AND the runner recently advertised gitBundle:1. */
+function bundleKeepsRemote(remote, runnerBundleOk) { return remote.transport === 'git-bundle' && runnerBundleOk === true; }
+function withNeedsGit(decision, argv, cwd, bundleOk = false) {
+  if (!decision.remote || bundleOk) return decision;
   let route; try { route = routeNeedsGit({ argv, cwd: cwd ?? process.cwd() }); } catch { return decision; }
   return route.local ? { remote: false, needsGit: true, reason: `${decision.reason}; ${route.reason}: ${route.files.join(', ')}` } : decision;
 }
@@ -789,6 +811,13 @@ function recordRemoteFallback({lockRoot, reason, detail = null, cwd, argv, env, 
  * After timeout-abort, allow up to one second for cancelled+terminated acknowledgement.
  * Everything else (including legacy fallback, throws, malformed results and unacknowledged
  * timeouts) refuses local reruns with exit 124. */
+const CLIENT_SIGNAL_NUMBERS = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 };
+/** x40a9dk: how long a killed client waits for its remote cancel to be confirmed (default 90s; the protected finish took 14s live). */
+function resolveSignalCancelWaitMs(env) {
+  const n = Number((env ?? {}).WE_HEAVY_SIGNAL_CANCEL_WAIT_MS);
+  return Number.isInteger(n) && n >= 0 ? n : 90000;
+}
+
 export async function runWithRemoteDecision({
   argv, policy, cwd, env, host = 'forge', clock = Date.now,
   lockRoot = admissionLockRoot(cwd, env), readTelemetry,
@@ -811,9 +840,10 @@ export async function runWithRemoteDecision({
     if (overloaded === null) { try { overloaded = hostOverloaded() === true; } catch { overloaded = false; } }
     return overloaded;
   };
-  let decision = decideRemote({ policy, loadPerCore: load, argv, cwd });
+  const runnerBundleOk = readRunnerBundleCapability({ root: join(dirname(lockRoot ?? admissionLockRoot(cwd, env)), 'remote'), host, clock });
+  let decision = decideRemote({ policy, loadPerCore: load, argv, cwd, runnerBundleOk });
   if (!decision.remote && !decision.needsGit && policy.settings.remote.enabled && policy.settings.remote.mode === 'above-threshold'
-    && Number.isFinite(load) && isOverloaded()) decision = withNeedsGit({ remote: true, reason: `${decision.reason}; host overloaded` }, argv, cwd);
+    && Number.isFinite(load) && isOverloaded()) decision = withNeedsGit({ remote: true, reason: `${decision.reason}; host overloaded` }, argv, cwd, policy.settings.remote.transport === 'git-bundle' && runnerBundleOk);
   onDecision?.(decision);
   log(`heavy-admission: ${decision.remote ? 'remote' : 'local'} (${decision.reason})\n`);
   if (decision.needsGit) recordRemoteFallback({lockRoot, reason: 'needs-git', cwd, argv, env, clock});
@@ -879,7 +909,8 @@ export async function runWithRemoteDecision({
   const heartbeat = setInterval(() => heartbeatOwnedSlot({...slotOptions,fastSlots:0}),60000);
   heartbeat.unref();
   const record = async result => {
-    try {await recordRemoteResult({root:remoteRoot,settings:policy.settings.remote,clock,result,host});}
+    // A repeated client signal stops waiting for the health write too (the marker stays for the reaper).
+    try {await Promise.race([recordRemoteResult({root:remoteRoot,settings:policy.settings.remote,clock,result,host}),escalatePromise]);}
     catch {log('heavy-admission: remote-health-unreadable; subsequent remote admission requires readable health state\n');}
   };
   const executionMarker = join(remoteRoot,`slot-${slot.slot}.unconfirmed`);
@@ -892,6 +923,15 @@ export async function runWithRemoteDecision({
   };
   let reason; let detail; let timer;
   const controller = new AbortController();
+  // x40a9dk: a killed client (SIGTERM/SIGINT/SIGHUP) cancels its own remote run and clears its marker only on
+  // confirmed termination; otherwise the marker stays for the reaper. Installed only while a marker is outstanding.
+  const cancelController = new AbortController();
+  let signalled = null; let onSignal;
+  let escalate; const escalatePromise = new Promise((resolve) => { escalate = () => resolve(null); });
+  const signalPromise = new Promise((resolve) => { onSignal = (name) => { if (signalled) { escalate(); return; } signalled = name; resolve({ clientSignal: name }); cancelController.abort(); controller.abort(); }; });
+  let signalHandlers = [];
+  // A kill that lands while a result is being recorded is honoured: exit with the signal code, keeping `terminated` as is.
+  const killedExit = () => signalled ? { handled: true, exitCode: 128 + CLIENT_SIGNAL_NUMBERS[signalled], signal: signalled } : null;
   const timedOut = Symbol('remote-timeout');
   try {
     // Waiting for a remote slot can outlive the cached sample. Recheck before dispatch.
@@ -909,42 +949,68 @@ export async function runWithRemoteDecision({
       if(heldTombstone(remoteRoot,slot.slot)){unlinkSync(executionMarker);return localFallback('remote-slot-held');}
       outstanding = true;
     } catch { return localFallback('remote-execution-marker-unwritable'); }
+    signalHandlers = Object.keys(CLIENT_SIGNAL_NUMBERS).map((name) => { const h = () => onSignal(name); process.on(name, h); return [name, h]; });
     const timeout = new Promise((resolve) => {
       timer = setTimeout(() => {
         resolve(timedOut);
         controller.abort();
       }, timeoutMs);
     });
-    const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, onRun: run => recordMarkerRun(executionMarker, {owner, run}) }));
-    const result = await Promise.race([remote, timeout]);
+    const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, cancelSignal: cancelController.signal, transport: policy.settings.remote.transport, bundleMainMaxAgeMs: policy.settings.remote.bundle.mainMaxAgeMin * 60_000,
+      onCapabilities: capabilities => writeRunnerCapabilities({ root: remoteRoot, host, capabilities, clock }), onRun: run => recordMarkerRun(executionMarker, {owner, run}) }));
+    const result = await Promise.race([remote, timeout, signalPromise]);
+    const cancelOnClientSignal = async (signalName) => {
+      clearTimeout(timer);
+      let cancelTimer;
+      const termination = await Promise.race([
+        remote.catch(() => null),
+        new Promise((resolve) => { cancelTimer = setTimeout(() => resolve(null), resolveSignalCancelWaitMs(env)); }),
+        escalatePromise, // a repeated signal during the cancel wait stops waiting at once (marker stays for the reaper)
+      ]);
+      clearTimeout(cancelTimer);
+      terminated = (termination?.mode === 'remote' && Number.isInteger(termination.code) && termination.code >= 0 && termination.code <= 254)
+        || ((termination?.mode === 'not-started' || termination?.mode === 'cancelled') && termination.terminated === true);
+      await record(terminated ? termination : { mode: 'unconfirmed' });
+      log(terminated
+        ? `heavy-admission: ${signalName} received; remote run cancelled and slot-${slot.slot} released\n`
+        : `heavy-admission: ${signalName} received; remote termination unconfirmed (${oneLine(termination?.reason ?? termination?.mode ?? 'no answer')}) - slot-${slot.slot} marker left for the reaper\n`);
+      return { handled: true, exitCode: 128 + CLIENT_SIGNAL_NUMBERS[signalName], signal: signalName };
+    };
+    if (typeof result?.clientSignal === 'string') return await cancelOnClientSignal(result.clientSignal);
     if (result === timedOut) {
       const termination = await Promise.race([
         remote.catch(() => null),
         new Promise((resolve) => {
           timer = setTimeout(() => resolve(null), 1000);
         }),
+        signalPromise,
       ]);
+      // A client kill during the timeout grace period still cancels and exits with the signal code.
+      if (typeof termination?.clientSignal === 'string') return await cancelOnClientSignal(termination.clientSignal);
       if (termination?.mode !== 'cancelled' || termination.terminated !== true) {
         await record({mode:'unconfirmed'});
-        return refuseLocal('remote-timeout');
+        return killedExit() ?? refuseLocal('remote-timeout');
       }
       reason = 'remote-timeout';
       terminated = true;
       await record(termination);
+      if (killedExit()) return killedExit();
     } else {
       terminated = (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254)
         || ((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true);
       await record(result);
+      if (killedExit()) return killedExit();
       if (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254) return { handled: true, exitCode: result.code, remoteResult: result };
       // Only explicit non-start or cancellation with confirmed termination is safe. Throws and malformed
       // replies may come from an executor whose remote child is still alive.
-      if (!((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true)) return refuseLocal(result?.reason ?? 'unconfirmed remote result');
+      if (!((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true)) return killedExit() ?? refuseLocal(result?.reason ?? 'unconfirmed remote result');
       reason = result?.reason ?? 'unconfirmed remote result';
       detail = result?.detail;
     }
-  } catch (error) { await record({mode:'unconfirmed'}); return refuseLocal(error?.message ?? error); }
+  } catch (error) { await record({mode:'unconfirmed'}); return killedExit() ?? refuseLocal(error?.message ?? error); }
   finally {
     clearTimeout(timer); clearInterval(heartbeat);
+    for (const [name, h] of signalHandlers) process.removeListener(name, h);
     if(!outstanding) releaseOwnedSlot({...slotOptions,fastSlots:0});
     else if(terminated) {
       // Unconfirmed results, throws and client death leave the pre-dispatch
@@ -1302,6 +1368,12 @@ export function resolveLoadAdmission({ env = process.env, minIdlePct, minPressur
   const cut = cutoverDecision({ gate: 'heavy-admission.load-status', kind, legacy, mode: cutoverMode, env, nowMs: now.getTime(),
     shadow: (args) => shadow({ gate: args.gate, kind: args.kind, oldVerdict: args.oldVerdict, oldReason: args.oldReason, env }),
     ...(admitFn ? { admitFn } : {}) });
+  // R559: a gate-error refusal (no shared decision could be had in enforce mode) is decidedBy 'legacy' but must still
+  // hold — never fall back to the telemetry rule's `held:false` (e.g. no-sample).
+  if (cut.admit === false && cut.kind === 'gate-error') {
+    return { ...decision, held: true, reason: `resource-admission: ${cut.why}`,
+      resourceAdmission: { verdict: 'hold', reason: cut.why, decidedBy: 'legacy', legacyHeld: decision.held } };
+  }
   if (cut.decidedBy !== 'admit') return decision;
   return { ...decision, held: !cut.admit, reason: cut.admit ? undefined : `resource-admission: ${cut.admission.verdict} — ${cut.admission.reason}`,
     resourceAdmission: { ...cut.admission, decidedBy: 'admit', legacyHeld: decision.held } };

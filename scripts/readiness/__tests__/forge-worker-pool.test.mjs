@@ -19,6 +19,9 @@ const workerIdentity=user=>{
 const slotStat=async path=>Object.assign(await fs.lstat(path),{uid:process.getuid(),gid:workerIdentity(path).gid});
 const createRunner=options=>productionRunner({testSlotStat:slotStat,
   testWorkerIdentity:workerIdentity,...options});
+// Every case does real fs/chmod work and many spawn real git/bash; vitest's 5s
+// default times out under loaded CI shards (red main @ e4acbe7ac).
+vi.setConfig({testTimeout:60_000});
 let root, runner;
 const nonce='a'.repeat(32), hash=value=>createHash('sha256').update(value).digest('hex');
 beforeEach(async()=>{
@@ -373,7 +376,8 @@ with patch.object(ctypes, 'CDLL') as libc, patch.object(os, 'listdir', return_va
     }
     const running=requests.map(r=>runner.run(r));
     try {
-      await vi.waitFor(()=>expect(pending).toHaveLength(2));
+      // waitFor defaults to 1s; a miss would also strand `running` in the finally.
+      await vi.waitFor(()=>expect(pending).toHaveLength(2),{timeout:30_000});
       const tasks=calls.filter(c=>c.argv[1]==='run');
       expect(tasks.map(c=>c.worker.uid).sort()).toEqual([workerIdentity('forge-exec-1').uid,workerIdentity('forge-exec-2').uid]);
       expect(tasks.map(c=>c.cwd).sort()).toEqual([work(a),work(b)].sort());

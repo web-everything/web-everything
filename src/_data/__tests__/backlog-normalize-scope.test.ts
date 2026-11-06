@@ -1,0 +1,364 @@
+// R372 — the loader flattens a multi-path `scope:` entry so routing, locus and lease arbitration all see one path per entry.
+import { describe, it, expect } from 'vitest';
+import { createRequire } from 'node:module';
+import { mkdtempSync, writeFileSync, rmSync, readdirSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { withFrozenBacklogDir } from './frozen-backlog';
+import { normalizeBriefScope, SCOPE_PREFIX_ALIASES } from '../../../scripts/operations/dispatch-lane.mjs';
+import { dispatchPlan } from '../../../scripts/readiness/dispatch-plan.mjs';
+import { repoProfile } from '../../../scripts/lib/repo-profile.mjs';
+import { LOCI } from '../../../scripts/check-standards-rules.mjs';
+
+const require = createRequire(import.meta.url);
+const { normalizeScope, SCOPE_PREFIX_LOCUS, inferLocusFromScope, computeLoaderVersion } = require('../backlog.js');
+const matter = require('gray-matter');
+
+// Historical malformed scopes restored by the PR #6244 operator cleanup. They must remain refused;
+// accepting every card would require unrelated backlog edits or weakening the dispatch boundary.
+const refusedCorpusEntries = new Map([
+  ['plateau:branding-proposals/loop/ (new fui-*.svg iteration files)', /characters the brief cannot carry/],
+  ['plateau:branding.html (regenerated, not hand-edited)', /characters the brief cannot carry/],
+  ['plateau-app:src/feature-tracker/read-model.ts (owned re-edit)', /characters the brief cannot carry/],
+  ['plateau-app:src/feature-tracker/read-model.test.ts (owned re-edit)', /characters the brief cannot carry/],
+  // Out-of-scope cards filed on main with a bare prefix and no path (8001, 8002, 8003).
+  ['we:', /unsafe scope entry.*path segments are refused/],
+  ...['wip-relay', 'worker', 'vitest.shared', 'bun-test.preload', 'vitest.setup', 'vitest.globalSetup']
+    .map((name): [string, RegExp] => [`we:./__tests__/${name}.test.mjs`, /unsafe scope entry.*path segments are refused/]),
+]);
+
+describe('backlog loader normalizeScope — multi-path entries (R372)', () => {
+  it('keeps every declared loader and dispatcher prefix in parity with repoProfile', () => {
+    const prefixes = new Set([
+      ...Object.keys(SCOPE_PREFIX_LOCUS),
+      ...Object.keys(SCOPE_PREFIX_ALIASES),
+    ]);
+    for (const prefix of prefixes) {
+      const profile = repoProfile(prefix);
+      expect(profile, prefix).not.toBeNull();
+      const locus = profile.key === 'we' ? 'webeverything' : profile.key;
+      expect(SCOPE_PREFIX_LOCUS[prefix], prefix).toBe(locus);
+      expect(inferLocusFromScope([`${prefix}:src/a.mjs`]), prefix).toBe(locus);
+      for (const spelling of [prefix, prefix.toUpperCase()]) {
+        const input = [`${spelling}:src/a.mjs src/b.mjs`];
+        const expected = ['src/a.mjs', 'src/b.mjs'].map((path) => `${profile.canonicalPrefix}:${path}`);
+        expect(normalizeScope(input), spelling).toEqual(expected);
+        expect(normalizeBriefScope(input), spelling).toEqual(expected);
+        expect(normalizeBriefScope(normalizeScope(input)), spelling).toEqual(expected);
+      }
+    }
+  });
+
+  it.each([
+    { name: 'FrontierUI tag with bare paths', tags: ['frontierui'], scope: ['src/a.mjs b.mjs,src/c.mjs'], locus: 'frontierui', expected: ['fui:src/a.mjs', 'fui:b.mjs', 'fui:src/c.mjs'] },
+    { name: 'FrontierUI tag alias', tags: ['frontier-ui'], scope: ['src/a.mjs'], locus: 'frontierui', expected: ['fui:src/a.mjs'] },
+    { name: 'Plateau tag', tags: ['plateau-app'], scope: ['src/a.mjs'], locus: 'plateau-app', expected: ['plateau:src/a.mjs'] },
+    { name: 'explicit locus overrides tags', tags: ['frontierui'], authored: 'plateau-app', scope: ['src/a.mjs'], locus: 'plateau-app', expected: ['plateau:src/a.mjs'] },
+    { name: 'bare entry before explicit scope overrides tags', tags: ['frontierui'], scope: ['src/a.mjs', 'WE:src/b.mjs'], locus: 'webeverything', expected: ['we:src/a.mjs', 'we:src/b.mjs'] },
+    { name: 'bare entry inherits inferred scope locus', tags: [], scope: ['src/a.mjs', 'FrontierUI:src/b.mjs'], locus: 'frontierui', expected: ['fui:src/a.mjs', 'fui:src/b.mjs'] },
+    { name: 'no signals defaults to WE', tags: [], scope: ['src/a.mjs'], locus: 'webeverything', expected: ['we:src/a.mjs'] },
+  ])('infers locus before qualifying scope: $name', ({ tags, scope, authored, locus, expected }) => {
+    const dir = mkdtempSync(join(tmpdir(), 'scope-locus-'));
+    const modulePath = require.resolve('../backlog.js');
+    const cached = require.cache[modulePath];
+    try {
+      writeFileSync(join(dir, '99999-scope.md'), matter.stringify('Scope fixture.', {
+        title: 'Scope', status: 'open', tags, scope, ...(authored ? { locus: authored } : {}),
+      }));
+      delete require.cache[modulePath];
+      const load = withFrozenBacklogDir(dir, () => require('../backlog.js'));
+      // Both public entry points must derive the same gate and canonical scheduling scope.
+      for (let read = 0; read < 2; read++) {
+        const cards = read === 0 ? load() : load.loadBacklogScoped(['99999-scope.md']);
+        const item = cards.find((card: { num: string }) => card.num === '99999');
+        expect.soft(item.locus).toBe(locus);
+        expect.soft(item.locusAuthored).toBe(Boolean(authored));
+        expect.soft(item.scope).toEqual(expected);
+        expect.soft(item.scopeDisplay).toEqual(scope);
+        expect.soft(LOCI[item.locus]).toEqual(LOCI[locus]);
+        if (locus === 'frontierui') {
+          expect.soft(LOCI[item.locus].repoPath).toBe('../frontierui');
+          expect.soft(LOCI[item.locus].gateCommand).toBe('npm run check:standards');
+        }
+        expect.soft(normalizeBriefScope(item.scope)).toEqual(expected);
+      }
+    } finally {
+      if (cached) require.cache[modulePath] = cached;
+      else delete require.cache[modulePath];
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // Wiring: the real loader (both public entry points) must gate a card whose ONLY repo signal sits behind a bare
+  // leading glob in a kept-whole entry, and must emit that entry canonically in the inferred repo, which dispatch refuses.
+  it.each([
+    ['src/a*.mjs fui:src/a*b.mjs', 'frontierui', 'fui:src/a*.mjs fui:src/a*b.mjs'],
+    ['src/a*.mjs, plateau:src/a*b.mjs', 'plateau-app', 'plateau:src/a*.mjs plateau:src/a*b.mjs'],
+  ])('loader infers locus from a later prefix of a kept-whole entry: %s', (entry, locus, expected) => {
+    const dir = mkdtempSync(join(tmpdir(), 'scope-locus-whole-'));
+    const modulePath = require.resolve('../backlog.js');
+    const cached = require.cache[modulePath];
+    try {
+      writeFileSync(join(dir, '99998-scope.md'), matter.stringify('Scope fixture.', {
+        title: 'Scope', status: 'open', tags: [], scope: [entry],
+      }));
+      delete require.cache[modulePath];
+      const load = withFrozenBacklogDir(dir, () => require('../backlog.js'));
+      for (let read = 0; read < 2; read++) {
+        const cards = read === 0 ? load() : load.loadBacklogScoped(['99998-scope.md']);
+        const item = cards.find((card: { num: string }) => card.num === '99998');
+        expect.soft(item.locus).toBe(locus);
+        expect.soft(item.scope).toEqual([expected]);
+        expect.soft(() => normalizeBriefScope(item.scope)).toThrow();
+      }
+    } finally {
+      if (cached) require.cache[modulePath] = cached;
+      else delete require.cache[modulePath];
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([...refusedCorpusEntries])('refuses historical malformed scope %s before and after loading', (entry, reason) => {
+    const scope = ['we:src/safe.mjs', entry];
+    expect(() => normalizeBriefScope(scope)).toThrow(reason);
+    expect(() => normalizeBriefScope(normalizeScope(scope))).toThrow(reason);
+  });
+
+  it('accepts open backlog scopes except explicitly pinned malformed entries, which remain refused', () => {
+    const dir = join(dirname(require.resolve('../backlog.js')), '../../backlog');
+    const open = readdirSync(dir).filter((file) => file.endsWith('.md')).map((file) => ({
+      file, data: matter(readFileSync(join(dir, file), 'utf8'), {}).data,
+    })).filter(({ data }) => data.status === 'open');
+    expect(open.length).toBeGreaterThan(0);
+    for (const { file, data } of open) {
+      const malformed = Array.isArray(data.scope)
+        ? data.scope.find((entry: string) => refusedCorpusEntries.has(entry)) : undefined;
+      for (const scope of [data.scope, normalizeScope(data.scope)]) {
+        if (malformed) {
+          expect.soft(() => normalizeBriefScope(scope), file).toThrow(refusedCorpusEntries.get(malformed));
+        } else {
+          expect.soft(() => normalizeBriefScope(scope), file).not.toThrow();
+        }
+      }
+    }
+  });
+
+  it('inherits fui for the last path after switching from we within one entry', () => {
+    const scope = ['we:a.mjs fui:b.mjs c.mjs'];
+    const expected = ['we:a.mjs', 'fui:b.mjs', 'fui:c.mjs'];
+    expect(normalizeScope(scope)).toEqual(expected);
+    expect(normalizeBriefScope(scope)).toEqual(expected);
+    expect(normalizeBriefScope(normalizeScope(scope))).toEqual(expected);
+  });
+
+  it('retains authored scope only as display data while loading canonical scheduling scope', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'scope-prefix-'));
+    const modulePath = require.resolve('../backlog.js');
+    const cached = require.cache[modulePath];
+    try {
+      writeFileSync(join(dir, '99999-scope.md'), '---\ntitle: Scope\nstatus: open\nscope:\n  - WE:src/A.mjs b.mjs\n  - src/c.mjs\n---\nScope fixture.\n');
+      delete require.cache[modulePath];
+      const load = withFrozenBacklogDir(dir, () => require('../backlog.js'));
+      const item = load().find((card: { num: string }) => card.num === '99999');
+      expect(item.scope).toEqual(['we:src/A.mjs', 'we:b.mjs', 'we:src/c.mjs']);
+      expect(item.scopeDisplay).toEqual(['WE:src/A.mjs b.mjs', 'src/c.mjs']);
+    } finally {
+      if (cached) require.cache[modulePath] = cached;
+      else delete require.cache[modulePath];
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('canonicalizes before planner lease and rival exclusion (send-back item 2)', () => {
+    for (const [input, canonical] of [
+      ['WE:src/a.mjs', 'we:src/a.mjs'], ['webeverything:src/a.mjs', 'we:src/a.mjs'],
+      ['FrontierUI:src/a.mjs', 'fui:src/a.mjs'], ['PLATEAU-APP:src/a.mjs', 'plateau:src/a.mjs'],
+      ['pa:src/a.mjs', 'plateau:src/a.mjs'], ['PA:src/a.mjs', 'plateau:src/a.mjs'],
+      ['src/a.mjs', 'we:src/a.mjs'],
+    ]) {
+      const scope = normalizeScope([input]);
+      const leased = dispatchPlan({ queue: [{ num: 1, scope }], leases: [{ lane: 2, scope: [canonical] }], freeLanes: [3] });
+      expect(leased.launch, input).toEqual([]);
+      expect(leased.held[0].reason).toBe('overlaps lane-2');
+      const rivals = dispatchPlan({ queue: [{ num: 1, scope: [canonical] }, { num: 2, scope }], leases: [], freeLanes: [3, 4] });
+      expect(rivals.launch, input).toEqual([{ num: 1, lane: 3 }]);
+      expect(rivals.held[0].reason).toBe('overlaps lane-3');
+    }
+  });
+  it('unprefixed pieces inherit the nearest earlier prefix when an entry changes repos', () => {
+    expect(normalizeScope(['we:a.mjs b.mjs,fui:c.mjs d.mjs,we:e.mjs f.mjs', 'g.mjs h.mjs']))
+      .toEqual(['we:a.mjs', 'we:b.mjs', 'fui:c.mjs', 'fui:d.mjs', 'we:e.mjs', 'we:f.mjs', 'we:g.mjs', 'we:h.mjs']);
+  });
+  // send-back (R547/R10/R559) — the loader must split every entry dispatch-lane accepts, or the planner sees one
+  // whitespace-joined string and lease/rival exclusion is bypassed (fail-open; base refused such cards).
+  it('send-back (a) — a disjoint multi-glob entry (the #4557 shape) is split and held by the planner on lease and on rival', () => {
+    const e1 = 'we:scripts/operations/__tests__/explore-io*.test.mjs';
+    const e2 = 'we:scripts/operations/__tests__/dispatch-lane-io*.test.mjs';
+    for (const separator of [' ', ',', '\n']) {
+      const scope = normalizeScope([`${e1}${separator}${e2}`]);
+      expect(scope, JSON.stringify(separator)).toEqual([e1, e2]);
+      for (const touched of ['we:scripts/operations/__tests__/explore-io.test.mjs', 'we:scripts/operations/__tests__/dispatch-lane-io-wiring.test.mjs']) {
+        const leased = dispatchPlan({ queue: [{ num: 1, scope }], leases: [{ lane: 2, scope: [touched] }], freeLanes: [3] });
+        expect(leased.launch, touched).toEqual([]);
+        expect(leased.held[0].reason, touched).toBe('overlaps lane-2');
+        // the same card as the lower-ranked RIVAL of a higher-ranked item that just launched on `touched`
+        const rivals = dispatchPlan({ queue: [{ num: 1, scope: [touched] }, { num: 2, scope }], leases: [], freeLanes: [3, 4] });
+        expect(rivals.launch, touched).toEqual([{ num: 1, lane: 3 }]);
+        expect(rivals.held[0].reason, touched).toBe('overlaps lane-3');
+      }
+    }
+  });
+
+  it('send-back (b) — a mixed-prefix entry is split with each piece canonical, and the fui lease is seen', () => {
+    expect(normalizeScope(['we:src/a*.mjs fui:src/b*.mjs'])).toEqual(['we:src/a*.mjs', 'fui:src/b*.mjs']);
+    expect(normalizeScope(['WE:src/a*.mjs FrontierUI:src/b*.mjs'])).toEqual(['we:src/a*.mjs', 'fui:src/b*.mjs']);
+    expect(normalizeScope(['webeverything:src/a*.mjs,pa:src/b*.mjs'])).toEqual(['we:src/a*.mjs', 'plateau:src/b*.mjs']);
+    const scope = normalizeScope(['we:src/a*.mjs fui:src/b*.mjs']);
+    const fui = dispatchPlan({ queue: [{ num: 1, scope }], leases: [{ lane: 2, scope: ['fui:src/b.mjs'] }], freeLanes: [3] });
+    expect(fui.launch).toEqual([]);
+    expect(fui.held[0].reason).toBe('overlaps lane-2');
+    const we = dispatchPlan({ queue: [{ num: 1, scope }], leases: [{ lane: 2, scope: ['we:src/a.mjs'] }], freeLanes: [3] });
+    expect(we.held[0].reason).toBe('overlaps lane-2');
+    // the same path under the OTHER repo is not a conflict
+    const other = dispatchPlan({ queue: [{ num: 1, scope }], leases: [{ lane: 2, scope: ['plateau:src/b.mjs'] }], freeLanes: [3] });
+    expect(other.launch).toEqual([{ num: 1, lane: 3 }]);
+  });
+
+  // Parity: for every multi-glob entry shape, the loader leaves it unsplit EXACTLY when dispatch-lane refuses it.
+  it.each([
+    // [entry, dispatch accepts?]
+    ['we:scripts/a*.mjs we:scripts/b*.mjs', true],
+    ['we:scripts/operations/__tests__/explore-io*.test.mjs we:scripts/operations/__tests__/dispatch-lane-io*.test.mjs', true],
+    ['we:scripts/__tests__/merge-ai-prs*.test.mjs, we:scripts/__tests__/lane-drain*.test.mjs, we:scripts/__tests__/drain-followup-job-entry.test.mjs', true],
+    ['we:scripts/x.mjs we:scripts/__tests__/x*.test.mjs', true],
+    ['we:src/a*.mjs fui:src/a*.mjs', true],
+    ['we:src/a*.mjs FUI:src/a*.mjs', true],
+    ['src/a*.mjs fui:src/a*.mjs', true],
+    ['we:src/a*.mjs fui:src/b*.mjs src/c*.mjs', true],
+    ['we:src/a*.mjs PA:src/a*.mjs', true],
+    ['we:scripts/a*.mjs we:scripts/ab*.mjs', false],
+    ['we:scripts/a*.mjs we:scripts/a*.mjs', false],
+    ['we:scripts/__tests__/x*.test.mjs WE:scripts/__tests__/x*.test.mjs', false],
+    ['scripts/a*.mjs we:scripts/a*.mjs', false],
+    ['we:scripts/*/a.mjs we:scripts/x/*.mjs', false],
+    ['we:src/a*.mjs fui:src/b*.mjs we:src/ab*.mjs', false],
+    ['frontierui:src/a*.mjs FUI:src/ab*.mjs', false],
+  ])('send-back (c) — loader and dispatch agree on %j (dispatch accepts: %s)', (entry, accepted) => {
+    for (const text of [entry, entry.replace(/, ?/g, ' ')]) {
+      const loaded = normalizeScope([text])!;
+      if (accepted) {
+        const dispatched = normalizeBriefScope([text]);
+        expect(loaded.every((piece) => !/[\s,]/.test(piece)), text).toBe(true); // split into separate entries
+        expect(loaded, text).toEqual(dispatched); // and canonical exactly as dispatch canonicalizes them
+        expect(normalizeBriefScope(loaded), text).toEqual(dispatched); // dispatch re-reads loader output unchanged
+      } else {
+        expect(() => normalizeBriefScope([text]), text).toThrow(/unsafe scope.*glob/);
+        expect(loaded, text).toHaveLength(1); // left unsplit, so dispatch refuses it too (fail closed)
+        expect(() => normalizeBriefScope(loaded), text).toThrow(/unsafe scope.*glob/);
+      }
+    }
+  });
+
+  // The real loader runs normalizeScope TWICE: first with no default repo (locus not yet inferred), then with the
+  // item's locus prefix. A bare piece's repo is unknown in pass one, so pass one must not split an entry whose
+  // pass-two verdict could be "may meet" — it would lose the entry boundary dispatch needs to refuse it.
+  // Production dispatch ALWAYS judges a bare piece under `we` (dispatch-lane-io: briefTokensForRepo('we')), whatever
+  // the item's locus — so the loader's output must be refused/accepted by dispatch-under-`we` exactly as the loader
+  // judged it under the locus. A whole entry is therefore emitted canonically qualified (never as authored text).
+  it.each([
+    // [entry, locus prefix of pass two, whole entry kept? (dispatch refuses it)]
+    ['src/a*.mjs we:src/ab*.mjs', 'we:', true],
+    ['src/a*.mjs fui:src/a*.mjs', 'fui:', true], // bare piece is fui under this locus: it MEETS fui:src/a*
+    ['src/a*.mjs fui:src/a*.mjs', 'we:', false],
+    ['src/a*.mjs fui:src/b*.mjs', 'fui:', false],
+    ['src/a*.mjs plateau:src/ab*.mjs', 'plateau:', true],
+    ['plateau:src/a*.mjs src/a*.mjs', 'fui:', true], // reverse order, bare piece inherits plateau:
+    ['src/a*.mjs we:src/b*.mjs', 'we:', false],
+  ])('send-back — the loader two-pass pipeline agrees with production dispatch on %j (locus %s)', (entry, locus, whole) => {
+    const loaded = normalizeScope(normalizeScope([entry], '') as string[], locus)!;
+    if (!whole) {
+      expect(loaded.every((piece) => !/[\s,]/.test(piece)), entry).toBe(true);
+      expect(normalizeBriefScope(loaded, 'we'), entry).toEqual(loaded);
+    } else {
+      expect(loaded, entry).toHaveLength(1); // still one whole entry …
+      expect(loaded[0].split(' ').every((piece) => /^[a-z]+:/.test(piece)), entry).toBe(true); // … canonically qualified
+      expect(() => normalizeBriefScope(loaded, 'we'), entry).toThrow(/unsafe scope.*glob/);
+    }
+    if (locus === 'we:') { // the authored entry itself reaches the same verdict when locus and dispatch repo coincide
+      if (whole) expect(() => normalizeBriefScope([entry], 'we'), entry).toThrow(/unsafe scope.*glob/);
+      else expect(normalizeBriefScope([entry], 'we'), entry).toEqual(loaded);
+    }
+  });
+
+  it('splits on whitespace and commas; unprefixed pieces inherit the entry repo prefix', () => {
+    expect(normalizeScope(['we:a.mjs b.mjs', 'fui:c.mjs,d.mjs'])).toEqual(['we:a.mjs', 'we:b.mjs', 'fui:c.mjs', 'fui:d.mjs']);
+  });
+  it('a bare multi-path entry defaults to the dispatching WE repo per piece', () => {
+    expect(normalizeScope(['heavy-admission.mjs remote-exec.mjs'])).toEqual(['we:heavy-admission.mjs', 'we:remote-exec.mjs']);
+  });
+  it('does not inherit a repository prefix across scope entries', () => {
+    expect(normalizeScope(['fui:a.mjs b.mjs', 'c.mjs'])).toEqual(['fui:a.mjs', 'fui:b.mjs', 'we:c.mjs']);
+  });
+  it.each(['we', 'fui', 'plateau', 'plateau-app', 'pa', 'PA', 'frontierui', 'webeverything', 'WE', 'FUI'])(
+    'loader and dispatcher canonicalize %s identically for leases, including underscores', (prefix) => {
+      const scope = [`${prefix}:a.mjs b.mjs`, 'c.mjs'];
+      const canonical = ({ 'plateau-app': 'plateau', pa: 'plateau', frontierui: 'fui', webeverything: 'we' } as Record<string, string>)[prefix.toLowerCase()] ?? prefix.toLowerCase();
+      const leaseScope = [`${canonical}:a.mjs`, `${canonical}:b.mjs`, 'we:c.mjs'];
+      expect(normalizeScope(scope)).toEqual(leaseScope);
+      expect(normalizeBriefScope(scope)).toEqual(leaseScope);
+      expect(normalizeBriefScope(normalizeScope(scope))).toEqual(leaseScope);
+    },
+  );
+  it.each(['custom-repo', 'custom_repo', 'repo2'])(
+    'the loader keeps unknown prefix %s as authored data but the dispatcher refuses it (send-back item 1)', (prefix) => {
+      const scope = [`${prefix}:a.mjs b.mjs`, 'c.mjs'];
+      expect(() => normalizeBriefScope(scope)).toThrow(/unknown scope repo prefix/);
+      expect(() => normalizeBriefScope(normalizeScope(scope))).toThrow(/unknown scope repo prefix/);
+    },
+  );
+  it('splits a file plus a test glob in one entry (#4701 card shape)', () => {
+    const entry = ['we:scripts/lib/daemon-rebuild/prepare.mjs we:scripts/lib/daemon-rebuild/__tests__/prepare*.test.mjs'];
+    const want = ['we:scripts/lib/daemon-rebuild/prepare.mjs', 'we:scripts/lib/daemon-rebuild/__tests__/prepare*.test.mjs'];
+    expect(normalizeScope(entry)).toEqual(want);
+    expect(normalizeBriefScope(normalizeScope(entry))).toEqual(want);
+  });
+  it('keeps a multi-path entry holding two globs UNSPLIT, so dispatch refuses it (fail closed)', () => {
+    expect(normalizeScope(['we:scripts/a*b.mjs we:scripts/ab*.mjs'])).toEqual(['we:scripts/a*b.mjs we:scripts/ab*.mjs']);
+    expect(() => normalizeBriefScope(normalizeScope(['we:scripts/a*b.mjs we:scripts/ab*.mjs'])))
+      .toThrow(/unsafe scope.*glob/);
+    expect(normalizeScope(['we:scripts/a*b.mjs'])).toEqual(['we:scripts/a*b.mjs']);
+  });
+  it('keeps the single-entry shape and the absent/empty/blank collapse', () => {
+    expect(normalizeScope(['we:scripts/lib/'])).toEqual(['we:scripts/lib/']);
+    expect(normalizeScope([' , ', ''])).toBeUndefined();
+    expect(normalizeScope('we:a')).toBeUndefined();
+  });
+
+  // Round 11 — a kept-whole entry (its globs may meet) used to show locus inference only its FIRST piece, so a bare
+  // leading glob hid a later explicit `fui:`/`plateau:` prefix and the item was gated in the wrong repo.
+  describe('locus inference sees every piece of a kept-whole entry', () => {
+    it.each([
+      ['space', 'src/a*.mjs fui:src/a*b.mjs', 'frontierui'],
+      ['comma', 'src/a*.mjs, plateau:src/a*b.mjs', 'plateau-app'],
+      ['alias + case', 'src/a*.mjs FrontierUI:src/a*b.mjs', 'frontierui'],
+    ])('bare glob first, explicit prefix later (%s)', (_label, entry, locus) => {
+      // Guard the premise: the entry really is kept whole (one string), so inference cannot rely on a split.
+      expect(normalizeScope([entry], '')).toHaveLength(1);
+      expect(inferLocusFromScope([entry])).toBe(locus);
+    });
+    it('still reports no locus for an all-bare entry and takes the first explicit prefix otherwise', () => {
+      expect(inferLocusFromScope(['src/a*.mjs src/a*b.mjs'])).toBeNull();
+      expect(inferLocusFromScope(['we:src/a*.mjs fui:src/a*b.mjs'])).toBe('webeverything');
+    });
+  });
+
+  // Round 11 — the loader cache version must cover every file normalizeScope's behaviour depends on.
+  it('loader cache version changes when the shared glob-overlap rule file changes', () => {
+    const files: Record<string, string> = {};
+    const read = (path: string) => files[path] ?? readFileSync(path, 'utf8');
+    const base = computeLoaderVersion(read);
+    files[require.resolve('../../../scripts/lib/scope-glob-overlap.cjs')] = 'module.exports = {};';
+    expect(computeLoaderVersion(read)).not.toBe(base);
+    expect(computeLoaderVersion(read)).toBe(computeLoaderVersion(read));
+  });
+});

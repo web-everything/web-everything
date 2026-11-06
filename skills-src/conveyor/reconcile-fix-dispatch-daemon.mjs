@@ -95,7 +95,7 @@ import { getRequiredStatusChecks } from '../../scripts/lib/required-status-check
 
 /** The checkout this daemon runs from — its heavy-admission root is the host-wide `<workspace>/.lanes` one. */
 const DAEMON_REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..');
-import { sweepHungCiRecovery, sweepCiRedRecovery, sweepMissingRunRecovery, defaultReadOpenPrs } from '../../scripts/conveyor/ci-red-recovery-watch.mjs';
+import { sweepHungCiRecovery, sweepCiRedRecovery, sweepMissingRunRecovery, defaultReadOpenPrs, createFileApplyLedger } from '../../scripts/conveyor/ci-red-recovery-watch.mjs';
 import { runRulingResolvesStandDownPass } from '../../scripts/conveyor/ruling-resolved-stand-down.mjs';
 import { resolveReviewSettings, resolveReviewSettingSource } from '../../scripts/lib/review-settings.mjs';
 import { CONSTELLATION_REPOS } from '../../scripts/lib/constellation-repos.mjs';
@@ -674,8 +674,11 @@ export function runHungCiRecoveryAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, t
  *   refusals:Array<object>}} `dispatched`/`refusals` here are the pass's own `applied`/`dispatch`+`refusals`
  *   rows, repo-tagged the same way {@link runHungCiRecoveryAllRepos} tags its own.
  */
-export function runMainRedRebaseAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, tick = sweepCiRedRecovery, ...tickOpts } = {}) {
-  const perRepo = forEachRepo(repos, (repo) => tick({ ...tickOpts, repo, apply: true }));
+export function runMainRedRebaseAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, tick = sweepCiRedRecovery, createLedger = createFileApplyLedger, ...tickOpts } = {}) {
+  // This daemon is the only live caller: without a per-repo file-backed fairness ledger the budget-capped apply
+  // loop restarts at the head of the queue every tick and slow/deferred PRs starve later recoverable ones.
+  // Built inside the per-repo callback so a ledger construction failure is isolated to that repo (tick-failed).
+  const perRepo = forEachRepo(repos, (repo) => tick({ ...tickOpts, repo, apply: true, applyLedger: tickOpts.applyLedger ?? createLedger({ repo }) }));
   const dispatched = [];
   const refusals = [];
   for (const entry of perRepo) {
@@ -742,6 +745,14 @@ function prFingerprint(pr) {
     c?.conclusion ?? null, c?.completedAt ?? c?.startedAt ?? null]).map((row) => JSON.stringify(row)).sort();
   return JSON.stringify([pr.headRefOid, pr.isDraft, pr.mergeStateStatus ?? null, (pr.labels ?? []).map((l) => l?.name ?? l).sort(), checks, pr.updatedAt]);
 }
+
+/**
+ * The planner's OWN discovery read: it must be taken AFTER the baseline probe, so it may not use the host-shared PR snapshot
+ * (valid ~75 s). It used to force that with a WRAPPER `exec`, which also knocked it off the production path and made it run
+ * the heavy 200-row `gh pr list` (HTTP 504, 23 failed ticks, ci-heals unplanned, 2026-11-03). `fresh: true` skips the snapshot
+ * but keeps the small-page read, the 5xx retry and the fail-closed / deferred contract.
+ */
+export const planFreshReadPrs = (read) => (o = {}) => read({ ...o, fresh: true, attributionRepo: o.attributionRepo ?? o.repo });
 
 /**
  * Default live probe for plan reuse: one light open-PR list per repo, read DIRECTLY from GitHub. It must never use the
@@ -860,7 +871,7 @@ export function createReconcilePlanCache({ reconcile = (input) => runReconcilePa
       // rows for notes.
       const { readPrs: _discovery, ...fresh } = input;
       const plan = filterRows(reconcile({ ...fresh,
-        readPrs: tap((o = {}) => defaultReadPrs({ ...o, exec: (...args) => execFileSyncThrottled(...args), attributionRepo: o.attributionRepo ?? o.repo })),
+        readPrs: tap(planFreshReadPrs(defaultReadPrs)),
         excuseMergeGateHolds: tap(input.excuseMergeGateHolds, excusePrMergeGateHolds),
         enrichCodeQL: tap(input.enrichCodeQL, enrichPrsWithCodeQL) }), touched.get(repo) ?? new Set());
       try { if (baseline && cacheable) entries.set(repo, { at: now(), baseline, allowStandDownAutoProceed,

@@ -1,4 +1,4 @@
-import { pidIdentity, pidIdentityStamp } from '../lib/pid-alive.mjs';
+import { pidIdentity, pidIdentityStamp, holderStartedBy } from '../lib/pid-alive.mjs';
 /**
  * @file scripts/conveyor/fix-dispatch-claim.mjs
  * @description #x0jphk5 (parent #4075, epic #3383) — THE REAL PER-(REPO, KIND, PR) CLAIM the fix-dispatch
@@ -86,7 +86,34 @@ import {
 import { defaultListAgents } from '../operations/dispatch-lane-io.mjs';
 import { listWrappedWorkerAgents } from '../operations/worker-wrapper-launch.mjs';
 import { startedAtMs } from './reconcile-core.mjs';
-import { readHungInfo, resolveHungThresholdMs } from './hung-session.mjs';
+import { readdirSync, statSync } from 'node:fs';
+import { dirname, join as joinPath, basename } from 'node:path';
+
+/** Newest activity (ms) of the holder: the SAME transcript-tail read the hung detector uses for the main transcript
+ *  (so a missing, unreadable or partly unparseable transcript is unknown, exactly as `readHungInfo` treats it), and the
+ *  newest mtime of any bound subagent transcript. Null = unknown; callers fail closed and keep the claim. */
+export function transcriptActivityMs(row, { tail = readTranscriptTailActivity, stat = statSync, list = readdirSync } = {}) {
+  let t;
+  try { t = tail(row, { tailLines: 15, maxBytes: 400_000, fieldMax: 200 }); } catch { return null; }
+  if (!t || t.hadUnparseableLine || !Number.isFinite(t.lastActivityMs)) return null;
+  const file = t.file;
+  let newest = t.lastActivityMs;
+  const subDir = joinPath(dirname(file), basename(file, '.jsonl'), 'subagents');
+  let names;
+  try { names = list(subDir); } catch (e) {
+    if (e?.code === 'ENOENT' || e?.code === 'ENOTDIR') return newest; // no subagents were ever bound
+    return null; // unreadable child activity is unknown: fail closed
+  }
+  for (const f of names) {
+    if (!f.endsWith('.jsonl')) continue;
+    try { newest = Math.max(newest, stat(joinPath(subDir, f)).mtimeMs); } catch (e) {
+      if (e?.code === 'ENOENT') continue; // vanished between listing and stat
+      return null;
+    }
+  }
+  return newest;
+}
+import { readHungInfo, readTranscriptTailActivity, resolveHungThresholdMs, PENDING_CALL_GRACE_MULTIPLIER } from './hung-session.mjs';
 import { isClaimRunnerDead, isPidAlive } from '../lib/dispatch-throttle.mjs';
 import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -343,6 +370,7 @@ export function refreshLiveFixDispatchClaims({
   hungThresholdMs = resolveHungThresholdMs(),
   alive = isPidAlive,
   identity = pidIdentity,
+  activityMsFor = transcriptActivityMs,
   idleRelease = resolveIdleClaimRelease(),
   prHeadFor = readPrHead,
   recordEvent = appendDaemonEvent,
@@ -402,11 +430,25 @@ export function refreshLiveFixDispatchClaims({
       }
       continue;
     }
+    // Idle release only speaks for rows POSITIVELY bound to this claim (same sessionId, or — for a claim without
+    // one — started at/after the claim): an older same-named idle session must never release a newer dispatch.
+    const boundToClaim = (a) => (entry.meta.sessionId
+      ? a.sessionId === entry.meta.sessionId
+      : Number.isFinite(claimedMs) && startedAtMs(a.startedAt) >= claimedMs);
     const agentsAll = (Array.isArray(listed) ? listed : []).filter((a) => a && String(a.name ?? '') === name)
       .map((a) => {
         let info = null;
         try { info = hungInfoFor(a, nowMs, hungThresholdMs); } catch { info = null; }
-        return info?.hung === true ? { ...a, hung: true } : a;
+        if (info?.hung !== true) return a;
+        // The real hung detector flags a silent idle holder after the hung threshold (30 min by default), long
+        // before the idle-release quiet floor (90 min): marking it hung here would drop the row out of
+        // isClaimSessionLive and skip the idle-release code below forever. An idle row bound to THIS claim with no
+        // pending tool call is owned by that path (quietLongEnough, awaiting-verify and unchanged-head checks keep
+        // it fail closed). A hung verdict that names a pending call past its grace is kept as hung. The exemption defers
+        // to the idle-release path, so it only applies while that path is enabled: with it off (platform setting or
+        // WE_IDLE_CLAIM_RELEASE_ENABLED) a silent holder stays hung and its claim falls to the TTL, never held forever.
+        if (idleRelease.enabled && a.state === 'idle' && boundToClaim(a) && info.reason === 'stale-no-activity') return a;
+        return { ...a, hung: true };
       });
     const isAwaiting = typeof awaitingVerifyFor === 'function' && agentsAll.some((row) => {
       try { return awaitingVerifyFor(row, { pr })?.awaiting === true; } catch { return false; }
@@ -439,7 +481,10 @@ export function refreshLiveFixDispatchClaims({
         || (!entry.meta.sessionId && Number.isFinite(claimedMs) && startedAtMs(a.startedAt) >= claimedMs))
       && Number.isInteger(a.pid))) {
       const identities = nonTerminal.map((a) => {
-        try { return identity(a.pid); } catch { return null; }
+        // startedBy arms the pid-reuse guard (a process that launched after this row did is a different one);
+        // an unreadable start time passes null, which skips only that check — unknown identity still retains.
+        // (a wrapped worker's startedAt is its first launch, not its resumed child's: holderStartedBy returns null for it)
+        try { return identity(a.pid, { startedBy: holderStartedBy(a, startedAtMs) }); } catch { return null; }
       });
       if (identities.every((verdict) => verdict?.alive === false)) {
         if (readUnchangedClaim(lockRoot, resource, entry)) {
@@ -451,7 +496,18 @@ export function refreshLiveFixDispatchClaims({
         continue;
       }
     }
-    const isIdle = nonTerminal.length > 0 && nonTerminal.every((a) => a.state === 'idle');
+    // A holder whose transcript (or a bound subagent's) changed inside the idle window is working, however idle it
+    // reads at each sample; unreadable activity is unknown, so the claim is kept (fail closed).
+    const quietLongEnough = (a) => {
+      let at = null;
+      try { at = activityMsFor(a); } catch { at = null; }
+      // Minimum quiet = the hung detector's own pending-tool-call grace (threshold x multiplier, 90 min by default):
+      // a transcript is silent during a long foreground call, which is not idleness.
+      const quietMs = Math.max(idleRelease.idleMinutes * 60_000, hungThresholdMs * PENDING_CALL_GRACE_MULTIPLIER);
+      return Number.isFinite(at) && nowMs - at >= quietMs;
+    };
+    const isIdle = nonTerminal.length > 0
+      && nonTerminal.every((a) => a.state === 'idle' && boundToClaim(a) && quietLongEnough(a));
     let idleHeadSha = null;
     if (!isAwaiting && idleRelease.enabled && isIdle) {
       try {

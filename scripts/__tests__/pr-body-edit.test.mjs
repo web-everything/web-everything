@@ -2,7 +2,7 @@
  * @file pr-body-edit.test.mjs — the stamp survives a body rewrite, and the guard denies the raw command.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { withCarriedStamps, recoverAuthorIdFromHistory, repair } from '../pr-body-edit.mjs';
+import { withCarriedStamps, recoverAuthorIdFromHistory, repair, cliGh } from '../pr-body-edit.mjs';
 import {
   buildAuthorActorMarker, parseAuthorActorId, readAuthorActorStamps, hasStampLostMarker,
 } from '../lib/review-independence.mjs';
@@ -68,88 +68,138 @@ describe('recoverAuthorIdFromHistory — #3067\'s recovery from GitHub\'s OWN ed
     expect(recoverAuthorIdFromHistory(null)).toBe('');
   });
 
-  // THE WEB-UI TEST CASE (#3067's own "done when" bullet: "the web-UI route is the test case"). No shell
-  // command can intercept a web-UI body edit — `guard-bash.mjs` has nothing to deny — so the live body simply
-  // arrives with its stamp gone, indistinguishable BY ORIGIN from any other edit route. What recovers it is
-  // that GitHub's timeline records `changes.body.from` identically no matter what wrote the edit — `gh`, the
-  // REST/GraphQL API, or a human typing into the web UI. This proves the recovery logic doesn't need to know,
-  // or care, which route stripped the stamp.
-  it('recovers a stamp stripped by a route no shell guard can see — the timeline does not care who edited', () => {
-    const openedBody = `Resolve #1234: fix the thing.\n\n${stamp(A)}`;
-    // The web UI edit: GitHub's timeline records the body AS IT STOOD before the edit (`changes.body.from`),
-    // then the live body moves on to whatever the human typed — here, with the stamp gone.
-    const timelineFromBodies = [openedBody];
-    const liveBodyAfterWebEdit = 'Resolve #1234: fix the thing, revised for clarity.'; // no stamp
-    expect(readAuthorActorStamps(liveBodyAfterWebEdit)).toEqual([]); // confirms the strip actually happened
-    const recovered = recoverAuthorIdFromHistory(timelineFromBodies);
-    expect(recovered).toBe(A);
-    // And the recovered id restores cleanly onto the live body via the SAME carry-forward the base mode uses.
-    const { body } = withCarriedStamps(buildAuthorActorMarker(recovered), liveBodyAfterWebEdit);
+  it('restores a supplied historical body snapshot using the carry-forward helper', () => {
+    // This pure helper consumes body strings; GraphQL transport and editor provenance are tested below.
+    const recovered = recoverAuthorIdFromHistory([`Original body\n\n${stamp(A)}`]);
+    const { body } = withCarriedStamps(stamp(recovered), 'Operator revision');
     expect(parseAuthorActorId(body)).toBe(A);
   });
 });
 
-describe('repair() — #3067 r2: a failed timeline FETCH must not read as a genuinely-empty timeline', () => {
-  const pr = '1308';
+describe('cliGh() — the CLI PR reader is live', () => {
+  it('strips the smoke read memo from the gh child environment and appends --repo', () => {
+    vi.stubEnv('WE_GH_READ_MEMO_DIR', 'memo-dir');
+    try {
+      const exec = vi.fn(() => '{}');
+      cliGh('o/r', exec)(['pr', 'view', '6244', '--json', 'state,body,author']);
+      const [cmd, args, opts] = exec.mock.calls[0];
+      expect(cmd).toBe('gh');
+      expect(args).toEqual(['pr', 'view', '6244', '--json', 'state,body,author', '--repo', 'o/r']);
+      expect(opts.encoding).toBe('utf8');
+      expect(opts.maxBuffer).toBe(8 * 1024 * 1024);
+      expect(opts.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+      expect(opts.throttle.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+      expect(process.env.WE_GH_READ_MEMO_DIR).toBe('memo-dir');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+});
+
+describe('repair() — GraphQL userContentEdits recovery', () => {
+  const pr = '6244';
   const repo = 'o/r';
   const unstamped = 'live body with no stamp';
   const ghView = (body) => vi.fn((args) => {
-    if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ body });
+    if (args[0] === 'pr' && args[1] === 'view') {
+      return JSON.stringify({ state: 'OPEN', body, author: { login: 'app/plateau-worker' } });
+    }
     throw new Error(`unexpected gh() call in test: ${args.join(' ')}`);
   });
-  // `repair`'s 4th param is the injectable `execFileSync`-shaped seam (default: the real one) — the same
-  // dependency-injection shape `computeNetDiffChangedFiles`'s `exec` uses elsewhere in scripts/. Both the
-  // timeline fetch (`gh api …`) and the body write (`gh pr edit …`, via `writeBody`) funnel through it, keyed
-  // here on the subcommand.
+  const response = (nodes) => JSON.stringify({ data: { repository: { pullRequest: {
+    userContentEdits: { totalCount: nodes?.length ?? 0, nodes, pageInfo: { hasNextPage: false, endCursor: null } },
+  } } } });
   const editCall = (execFile) => execFile.mock.calls.find(([, args]) => args[0] === 'pr' && args[1] === 'edit');
-
-  it('a THROWN/failed timeline fetch does NOT mark the PR stamp-lost, and exits non-zero', () => {
-    const execFile = vi.fn((cmd, args) => {
-      if (args[0] === 'api') throw new Error('simulated network blip');
-      throw new Error(`unexpected execFile call in test: ${args.join(' ')}`);
-    });
-    const result = repair(ghView(unstamped), pr, repo, execFile);
-    expect(result).not.toBe(0); // a distinct "could not investigate" outcome, not the happy-path 0
-    expect(editCall(execFile)).toBeUndefined(); // never wrote ANYTHING back to the PR — no stamp-lost marker
+  const stubExec = (readHistory) => vi.fn((cmd, args) => {
+    if (cmd === 'gh' && args[0] === 'api' && args[1] === 'graphql') return readHistory();
+    if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'edit') return '';
+    throw new Error(`unexpected execFile call in test: ${args.join(' ')}`);
   });
+  const expectGraphqlOnly = (execFile) => {
+    const apiCalls = execFile.mock.calls.filter(([, args]) => args[0] === 'api');
+    expect(apiCalls.length).toBeGreaterThan(0);
+    expect(apiCalls.every(([cmd, args]) => cmd === 'gh' && args[1] === 'graphql')).toBe(true);
+    expect(JSON.stringify(apiCalls)).toContain('userContentEdits');
+    expect(JSON.stringify(execFile.mock.calls)).not.toContain('/timeline');
+  };
 
-  it('a genuinely-empty timeline (the fetch SUCCEEDS, returns no edits) still marks the PR stamp-lost', () => {
-    const execFile = vi.fn((cmd, args) => {
-      if (args[0] === 'api') return JSON.stringify([]); // a real, successful, empty result
-      if (args[0] === 'pr' && args[1] === 'edit') return '';
-      throw new Error(`unexpected execFile call in test: ${args.join(' ')}`);
-    });
-    const result = repair(ghView(unstamped), pr, repo, execFile);
-    expect(result).toBe(0);
+  it('recovers #6244 via GraphQL userContentEdits, never the REST issues timeline', () => {
+    const nodes = [
+      { createdAt: '2026-10-01T10:00:00Z', editor: { __typename: 'Bot', login: 'plateau-worker' }, diff: `Original\n\n${stamp(A)}` },
+      { createdAt: '2026-10-01T11:00:00Z', editor: { __typename: 'User', login: 'chalbert' }, diff: 'First web edit' },
+      { createdAt: '2026-10-01T12:00:00Z', editor: { __typename: 'User', login: 'chalbert' }, diff: unstamped },
+    ];
+    const execFile = stubExec(() => response(nodes));
+    expect(repair(ghView(unstamped), pr, repo, execFile)).toBe(0);
+    expectGraphqlOnly(execFile);
     const call = editCall(execFile);
     expect(call).toBeTruthy();
-    expect(hasStampLostMarker(call[2].input)).toBe(true);
-  });
-
-  it('a genuinely-searched timeline that DOES recover a stamp restores it — not stamp-lost', () => {
-    const id = '01f39b97-274a-4078-8eeb-e7f8d6008673';
-    const events = [{ event: 'edited', changes: { body: { from: `old\n\n${buildAuthorActorMarker(id)}` } } }];
-    const execFile = vi.fn((cmd, args) => {
-      if (args[0] === 'api') return JSON.stringify(events);
-      if (args[0] === 'pr' && args[1] === 'edit') return '';
-      throw new Error(`unexpected execFile call in test: ${args.join(' ')}`);
-    });
-    const result = repair(ghView(unstamped), pr, repo, execFile);
-    expect(result).toBe(0);
-    const call = editCall(execFile);
-    expect(readAuthorActorStamps(call[2].input)).toEqual([id]);
+    expect(call[2].input).toBe(`${unstamped}\n\n${stamp(A)}\n`);
+    expect(readAuthorActorStamps(call[2].input)).toEqual([A]);
     expect(hasStampLostMarker(call[2].input)).toBe(false);
   });
 
-  it('a PR already marked stamp-lost short-circuits without ever calling the timeline endpoint again', () => {
-    // This is WHY the false-mark bug matters: the mark is sticky, so a transient failure that wrongly wrote it
-    // would never get another chance to recover for real.
-    const alreadyMarked = 'live body\n\n<!-- author-stamp-lost: unrecoverable -->';
-    const execFile = vi.fn((cmd, args) => {
-      throw new Error(`unexpected execFile call in test: ${args.join(' ')}`);
-    });
-    const result = repair(ghView(alreadyMarked), pr, repo, execFile);
-    expect(result).toBe(0);
+  // PR #6409 red team: a conflicting stamp added then removed leaves the body text identical; the CLI must
+  // re-read the history before writing and refuse, not restore the stale plan.
+  it('exits non-zero and writes nothing when a stamp was added then removed after the history read', () => {
+    const nodes = [
+      { createdAt: '2026-10-01T10:00:00Z', editor: { __typename: 'Bot', login: 'plateau-worker' }, diff: `Original\n\n${stamp(A)}` },
+      { createdAt: '2026-10-01T12:00:00Z', editor: { __typename: 'User', login: 'chalbert' }, diff: unstamped },
+    ];
+    const later = [
+      { createdAt: '2026-10-01T14:00:00Z', editor: { __typename: 'User', login: 'chalbert' }, diff: unstamped },
+      { createdAt: '2026-10-01T13:00:00Z', editor: { __typename: 'User', login: 'chalbert' }, diff: `${unstamped}\n\n${stamp(B)}` },
+      ...nodes,
+    ];
+    let reads = 0;
+    const execFile = stubExec(() => response((reads += 1) === 1 ? nodes : later));
+    expect(repair(ghView(unstamped), pr, repo, execFile)).not.toBe(0);
+    expect(reads).toBe(2);
+    expectGraphqlOnly(execFile);
+    expect(editCall(execFile)).toBeUndefined();
+  });
+
+  it.each([
+    ['failed request', () => { throw new Error('simulated network blip'); }],
+    ['invalid JSON', () => 'not JSON'],
+    ['GraphQL errors', () => JSON.stringify({ errors: [{ message: 'forbidden' }], data: null })],
+    ['missing connection', () => JSON.stringify({ data: { repository: { pullRequest: {} } } })],
+    ['null nodes', () => response(null)],
+  ])('exits non-zero and writes nothing for unreadable history: %s', (_name, readHistory) => {
+    const execFile = stubExec(readHistory);
+    expect(repair(ghView(unstamped), pr, repo, execFile)).not.toBe(0);
+    expectGraphqlOnly(execFile);
+    expect(editCall(execFile)).toBeUndefined();
+  });
+
+  // PR #6409 review: a truncated page must refuse through the CLI path too, not only in the helper's own tests.
+  it('exits non-zero and writes nothing for a truncated history page (hasNextPage:true or a totalCount mismatch)', () => {
+    const nodes = [{ createdAt: '2026-10-01T10:00:00Z', editor: { __typename: 'Bot', login: 'plateau-worker' }, diff: `Original\n\n${stamp(A)}` }];
+    const truncated = (over) => JSON.stringify({ data: { repository: { pullRequest: {
+      userContentEdits: { totalCount: nodes.length, nodes, pageInfo: { hasNextPage: false, endCursor: null }, ...over },
+    } } } });
+    for (const over of [{ pageInfo: { hasNextPage: true, endCursor: 'c1' } }, { totalCount: 101 }]) {
+      const execFile = stubExec(() => truncated(over));
+      expect(repair(ghView(unstamped), pr, repo, execFile)).not.toBe(0);
+      expectGraphqlOnly(execFile);
+      expect(editCall(execFile)).toBeUndefined();
+    }
+    // Control: the same single snapshot, complete, restores.
+    const execFile = stubExec(() => truncated({}));
+    expect(repair(ghView(unstamped), pr, repo, execFile)).toBe(0);
+    expect(editCall(execFile)).toBeTruthy();
+  });
+
+  it('refuses successfully read but empty history without writing a stamp-lost marker', () => {
+    const execFile = stubExec(() => response([]));
+    expect(repair(ghView(unstamped), pr, repo, execFile)).not.toBe(0);
+    expectGraphqlOnly(execFile);
+    expect(editCall(execFile)).toBeUndefined();
+  });
+
+  it('a PR already marked stamp-lost short-circuits without any history request', () => {
+    const execFile = stubExec(() => { throw new Error('history must not be read'); });
+    expect(repair(ghView('live body\n\n<!-- author-stamp-lost: unrecoverable -->'), pr, repo, execFile)).toBe(0);
     expect(execFile).not.toHaveBeenCalled();
   });
 });

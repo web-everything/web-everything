@@ -9,7 +9,7 @@ import {createHash, randomBytes} from 'node:crypto';
 import {join, relative} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {cpus, loadavg, freemem, totalmem} from 'node:os';
-import {BASE_RETENTION, baseGuard, readyBases, readBase, copyLeaves, baseFile, createBasePin, claimPrewarm, materializeWorktree} from './forge-exec-bases.mjs';
+import {BASE_RETENTION, baseGuard, readyBases, readBase, copyLeaves, baseFile, createBasePin, claimPrewarm, materializeWorktree, mirrorReadOnlyForSlots, validBundleEvidence, readMainFetchStamp} from './forge-exec-bases.mjs';
 import {decodeManifest} from './forge-exec-manifest.mjs';
 const LIMIT = 4 * 1024 * 1024;
 const hex = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
@@ -426,6 +426,10 @@ with os.fdopen(fd) as stream:
     reservation = json.load(stream)
 if any(reservation.get(key) != writer.get(key) for key in ('run', 'nonce', 'slot')):
     raise RuntimeError('Reservation mismatch; use local fallback')
+# The cancellation path is root/ops-owned and unique to this run, so a late
+# cancellation cannot stop a replacement reservation on the same worker UID.
+def cancelled():
+    return bool(cfg.get('cancel')) and os.path.lexists(cfg['cancel'])
 # Keep the lease in a root child even if the supervisor is killed mid-fork.
 # Close its copy only AFTER UID drop, before exposing any task-controlled code.
 writer_fds = (writer_fd,)
@@ -438,16 +442,33 @@ def drop():
     elif os.getuid() != uid or os.getgid() != gid:
         raise RuntimeError('cannot drop identity')
     os.close(writer_fd)
-if 'archive' in cfg:
-    # Only the fixed cache-extraction command receives an archive descriptor.
-    # It runs as the worker; neither tar nor the task can write the cache.
-    archive = os.open(cfg['archive'], os.O_RDONLY | os.O_NOFOLLOW)
-    try:
-        child = subprocess.Popen(cfg['argv'], cwd=cfg['cwd'], env=cfg['env'], stdin=archive, preexec_fn=drop, pass_fds=writer_fds)
-    finally: os.close(archive)
+if cancelled():
+    code = 255
 else:
-    child = subprocess.Popen(cfg['argv'], cwd=cfg['cwd'], env=cfg['env'], stdin=subprocess.DEVNULL, preexec_fn=drop, pass_fds=writer_fds)
-code = child.wait()
+    if 'archive' in cfg:
+        # Only the fixed cache-extraction command receives an archive descriptor.
+        # It runs as the worker; neither tar nor the task can write the cache.
+        archive = os.open(cfg['archive'], os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            child = subprocess.Popen(cfg['argv'], cwd=cfg['cwd'], env=cfg['env'], stdin=archive, preexec_fn=drop, pass_fds=writer_fds)
+        finally: os.close(archive)
+    else:
+        child = subprocess.Popen(cfg['argv'], cwd=cfg['cwd'], env=cfg['env'], stdin=subprocess.DEVNULL, preexec_fn=drop, pass_fds=writer_fds)
+    if cfg.get('cancel'):
+        while True:
+            if cancelled():
+                # Stop the direct child even on a host with no readable proc entry;
+                # the existing descendant/UID sweep below proves full termination.
+                try: child.kill()
+                except ProcessLookupError: pass
+                code = 255
+                break
+            try:
+                code = child.wait(timeout=0.1)
+                break
+            except subprocess.TimeoutExpired: pass
+    else:
+        code = child.wait()
 # All descendants run as the dedicated uid. Include live descendants before
 # killing their parents, then reap orphans adopted by this subreaper.
 def children():
@@ -830,7 +851,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     // must read every active pin before deciding which public bases to prune.
     await createBasePin(bases,run,baseSha,!testRoot&&process.getuid()===0?operator:undefined);
   }
-  async function workCommand(worker,argv,work,env,archive) {
+  async function workCommand(worker,argv,work,env,archive,{cleanup=false}={}) {
     const slot=Number(/^forge-exec-([1-9]\d*)$/.exec(worker.user)?.[1]??(testRoot?1:NaN));
     if(!testRoot && process.getuid()!==0) throw new Error('Scoped execution requires the root wrapper; use local fallback');
     if(!Number.isSafeInteger(slot)||slot<1) throw new Error('Scoped execution requires a numbered slot; rerun Forge setup or use local fallback');
@@ -838,7 +859,9 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     for(const warning of warnings) process.stderr.write('forge-exec-run: '+warning.replace(/[\x00-\x1f\x7f]/g,' ')+'\n');
     const cpus=slotCpus(limits,slot);
     env={WE_VITEST_MAX_WORKERS:String(cpus),...env,FORGE_SLOT_CPUS:String(cpus)};
-    if(testRoot) return {...await (testWorkerExec?testWorkerExec({worker,argv,cwd:work,env,archive}):execute(argv[0],archive ? ['-xf',archive] : argv.slice(1),{cwd:work,env,detached:true})),slotCpus:cpus};
+    const cancel=!cleanup&&worker.reservation?statePath(worker.reservation.run,'cancel'):undefined;
+    if(cancel&&await lstat(cancel).catch(error=>{if(error.code!=='ENOENT')throw error;}))return {code:255,stdout:'',stderr:'Run cancelled before worker launch',slotCpus:cpus};
+    if(testRoot) return {...await (testWorkerExec?testWorkerExec({worker,argv,cwd:work,env,archive,cancel}):execute(argv[0],archive ? ['-xf',archive] : argv.slice(1),{cwd:work,env,detached:true})),slotCpus:cpus};
     const ids=await identity(worker.user);
     const status=join(receipts,'supervisor-'+randomBytes(16).toString('hex'));
     const usage=status+'.usage';
@@ -847,7 +870,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       const unit='forge-exec-run-'+randomBytes(16).toString('hex'),runFile=statePath(worker.reservation.run,'running'),running=await readRecord(runFile);
       if(running?.owner)await atomicJSON(runFile,{...running,owner:{...running.owner,unit}});
       const launcher=scopeLauncherArgv({slot,unit,sudo:false,source:supervisorSource,
-        json:JSON.stringify({argv,cwd:work,env,status,usage,writer,reapUid:true,...(archive?{archive}:{}),...ids})});
+        json:JSON.stringify({argv,cwd:work,env,status,usage,writer,reapUid:true,...(cancel?{cancel}:{}),...(archive?{archive}:{}),...ids})});
       const result=await execute(launcher[0],launcher.slice(1),{inherit:true});
       if(result.code!==0) throw new Error('Supervisor failed');
       const code=Number((await readPinned(status)).toString());
@@ -1041,7 +1064,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       },record);
       }finally{if(worker.active)await releaseWorker(record);}
     },
-    async prepare({nonce,label,siblings,baseSha,baseManifestDigest,slot}) {
+    async prepare({nonce,label,siblings,baseSha,baseManifestDigest,slot,gitBundle}) {
       await init();
       await reap();
       if(!nonceOK(nonce) || (label!==undefined && (typeof label!=='string' || !/^[a-z0-9][a-z0-9-]{5,63}$/.test(label)))) throw new Error('Invalid prepare');
@@ -1055,6 +1078,23 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       const work=join(container,'work');
       await mkdir(work,{mode:0o755});
       await handoff(worker,work);
+      // git-bundle transport (R593): advertised only while repo.git is not writable by slot users (S4).
+      const bundleReady=await mirrorReadOnlyForSlots(join(bases,'repo.git'));
+      // The prerequisite the Mac may use for an incremental bundle: this mirror's own main tip.
+      let bundleBase;
+      const mainStamp=bundleReady?await readMainFetchStamp(bases,{clock}):undefined;
+      if(bundleReady) try {
+        const mirror=join(bases,'repo.git'),args=['-c','safe.directory='+mirror,'--git-dir',mirror,'rev-parse','--verify','refs/remotes/origin/main^{commit}'];
+        const env={PATH:'/usr/local/bin:/usr/bin:/bin',HOME:'/nonexistent',LANG:'C',GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_NOSYSTEM:'1'};
+        const tip=await execute('git',args,{cwd:bases,env});
+        const text=String(tip.stdout??'').trim();
+        if(tip.code===0&&/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(text))bundleBase=text;
+      } catch { /* no base: the Mac sends a full bundle */ }
+      if(gitBundle===true&&bundleReady) {
+        const bundleDir=join(container,'bundle');
+        await mkdir(bundleDir,{mode:0o755});
+        await handoff(worker,bundleDir);
+      }
       if (siblings === true) {
         const sibling = join(container,'frontierui');
         await mkdir(sibling,{mode:0o755});
@@ -1067,7 +1107,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
         await pinBase(run,baseSha);
         await writeFile(statePath(run,'base'),JSON.stringify({baseSha,baseManifestDigest}),{flag:'wx',mode:0o600});
       });
-      return {run,...(worker.active?{slot:worker.user,worker:{user:worker.user,uid:worker.uid,gid:worker.gid}}:{}),capabilities:{siblings:1,commandClasses:1,gitWorktree:2,...(worker.active?{workers:(await workers()).map(w=>w.user)}:{}),...await this.bases()}};
+      return {run,...(worker.active?{slot:worker.user,worker:{user:worker.user,uid:worker.uid,gid:worker.gid}}:{}),capabilities:{siblings:1,commandClasses:1,gitWorktree:2,...(bundleReady?{gitBundle:1,...(bundleBase?{gitBundleBase:bundleBase}:{}),...(mainStamp!==undefined&&mainStamp.sha===bundleBase?{gitBundleMainAgeMs:mainStamp.ageMs}:{})}:{}),...(worker.active?{workers:(await workers()).map(w=>w.user)}:{}),...await this.bases()}};
       }catch(error){
         await rm(container,{recursive:true,force:true});
         await rm(statePath(run,'prepared'),{force:true});
@@ -1163,11 +1203,13 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
         if (info && (info.isSymbolicLink() || !info.isDirectory() || (await readdir(sibling)).length)) throw new Error('Extra sibling snapshot');
       }
       if(await digestInput(work)!==request.inputDigest || lock!==request.lock) throw new Error('Input digest mismatch');
-      if(request.argv[2]==='check:standards'||request.env.DIFF_COVERAGE_BASE!==undefined) {
+      if(request.argv[2]==='check:standards'||request.env.DIFF_COVERAGE_BASE!==undefined||request.bundle!==undefined) {
         if(!request.manifest.git)throw new Error('Missing Git evidence');
         if(request.env.DIFF_COVERAGE_BASE!==request.manifest.git.diffCoverageBase)throw new Error('Coverage base mismatch');
         try {
+          if(request.bundle!==undefined&&!validBundleEvidence(request.bundle))throw new Error('Invalid bundle evidence');
           await materializeWorktree({work,root:bases,baseSha:request.baseSha,head:request.manifest.git.head,manifest:request.manifest,manifestDigest:request.manifestDigest,
+            ...(request.bundle!==undefined?{bundle:{...request.bundle,file:join(container,'bundle','git.bundle')}}:{}),
             ...(testRoot&&testGitExec?{exec:testGitExec}:{})});
           await handoff(worker,join(work,'.git'),{recursive:true,workerParent:true});
         } catch(error) {throw Object.assign(error,{code:error.code==='diff-coverage-base-unavailable'?error.code:'git-head-unavailable'});}
@@ -1233,6 +1275,18 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       let phase='running',record;
       try{record=await state(request,phase);}catch{record=await state(request,'prepared');}
       return withWorkerWriter(writerName(record),async()=>{
+      if(request.cancel===true) {
+        const worker=await workerFor(record,request);
+        if(!worker.active)throw new Error('Cancellation requires a numbered worker; operator must stop the reserved UID');
+        // Do not bypass executing: ask the supervisor to reap its UID, then
+        // let the active controller settle before any filesystem cleanup.
+        await writeFile(statePath(request.run,'cancel'),'',{flag:'wx',mode:0o600}).catch(error=>{if(error.code!=='EEXIST')throw error;});
+        const deadline=process.hrtime.bigint()+45000000000n;
+        while(await lstat(join(worker.active,'executing')).catch(error=>{if(error.code!=='ENOENT')throw error;})) {
+          if(process.hrtime.bigint()>=deadline)throw new Error('Worker cancellation unconfirmed; operator must stop the reserved UID');
+          await new Promise(resolve=>setTimeout(resolve,50));
+        }
+      }
       let finishingWorker,settled=true;
       try {
       // Only the protected state is evidence; receipt-like files in work are data.
@@ -1250,7 +1304,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       if(worker.active){
         // Includes cancelled rsync and children left before task execution.
         settled=false;
-        const reaped=await workCommand(worker,['/usr/bin/true'],container,{PATH:path,HOME:'/nonexistent'});
+        const reaped=await workCommand(worker,['/usr/bin/true'],container,{PATH:path,HOME:'/nonexistent'},undefined,{cleanup:true});
         if(reaped.code!==0)throw new Error('Worker cleanup unconfirmed');
         settled=true;
       }
@@ -1272,10 +1326,11 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       await rm(join(bases,'active',request.run),{force:true});
       await rm(statePath(request.run,'base'),{force:true});
       if(worker.active){await rmdir(join(worker.active,'executing'));finishingWorker=undefined;await releaseWorker(record);}
+      await rm(statePath(request.run,'cancel'),{force:true});
       await publishTelemetry();
       // Legacy callers retain their null finish response for non-sibling failures.
       // Never certify rejection once the protected run phase has started.
-      return receipt ?? (phase === 'prepared' && (rejected?.siblings||rejected?.delta||['forge-busy','git-head-unavailable','diff-coverage-base-unavailable'].includes(rejected?.reason)) ? {...rejected,started:false} : null) ?? null;
+      return receipt ?? (phase === 'prepared' && (rejected?.siblings||rejected?.delta||['forge-busy','git-head-unavailable','diff-coverage-base-unavailable'].includes(rejected?.reason)) ? {...rejected,started:false} : null) ?? (request.cancel===true ? {v:1,nonce:request.nonce,run:request.run,cancelAck:true} : null);
       }finally{if(finishingWorker&&settled)await rmdir(join(finishingWorker.active,'executing'));}
       });
     },

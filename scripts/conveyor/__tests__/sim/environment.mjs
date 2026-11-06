@@ -15,6 +15,9 @@ export function isolatedProcessEnv(root, ambient = process.env) {
   return env;
 }
 
+/** Freshness cap (ms) the sim world's policy must allow: covers the seeded 2026-01-01 → 2999-01-01 window below. */
+export const SIM_SNAPSHOT_MAX_FRESH_MS = Date.parse('2999-01-01T00:00:00.000Z') - Date.parse('2026-01-01T00:00:00.000Z');
+
 /**
  * R553/R559: fixer admission refuses on a missing, stale or unreadable memory reading, and a CI runner has no macOS
  * memory-pressure level, so a world with no snapshot never dispatches a fixer. Seed the world's OWN coordination root

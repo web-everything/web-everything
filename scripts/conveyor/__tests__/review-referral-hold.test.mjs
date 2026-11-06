@@ -583,6 +583,40 @@ describe('same-head hold never silences a review whose verdict never landed (liv
   }));
   const oldWhy = count => `review paused: head ${head.slice(0, 9)} was already reviewed ${count} time(s); it resumes on a new push or an explicit re-arm`
     + " (no verdict ever landed on the PR for those runs, and the 2 automatic re-runs are spent: a person must look at why the review's write-back fails)";
+  it('does not spend no-verdict retries on four completed CI-held publishes', () => {
+    const p = labelled(['review:pending']), runs = lostRuns(4);
+    const opts = { repo, env: {}, now: at + 30 * 60_000 };
+    expect(decideSameHeadHold(p, runs.map(r => ({ ...r, ciHeld: true })), opts)).toBeNull();
+    expect(decideSameHeadHold(p, runs, opts)).toMatchObject({ kind: 'same-head', count: 4,
+      retryAt: at + 7200_000, why: `${oldWhy(4)}; the next automatic re-run is due at ${iso(at + 7200_000)}` });
+  });
+  it('still reaches the hold when CI-held publishes never settle (bounded exemption)', () => {
+    const p = labelled(['review:pending']), runs = lostRuns(8).map(r => ({ ...r, ciHeld: true }));
+    expect(decideSameHeadHold(p, runs, { repo, env: {}, now: at + 30 * 60_000 })).toMatchObject({ kind: 'same-head', count: 4 });
+  });
+  it('derives ciHeld from a failed label-swap waiting for CI on the reviewed head', () => {
+    const r = run();
+    r.effects = [{ type: 'review.label-swap', status: 'failed',
+      error: 'review held: CI still pending on reviewed head' }];
+    expect(reviewRunEvidence(r)).toMatchObject({ completedAt: at, ciHeld: true });
+  });
+  it.each([
+    undefined, null, {}, [null],
+    [{ type: 'review.label-swap', status: 'applied', error: 'CI still pending on reviewed head' }],
+    [{ type: 'review.comment', status: 'failed', error: 'CI still pending on reviewed head' }],
+    [{ type: 'review.label-swap', status: 'failed', error: 'GitHub unavailable' }],
+    [{ type: 'review.label-swap', status: 'failed', error: { message: 'CI still pending on reviewed head' } }],
+  ])('does not exempt missing, malformed or unrelated effect evidence (%j)', effects => {
+    const r = run();
+    r.effects = effects;
+    expect(reviewRunEvidence(r)?.ciHeld).not.toBe(true);
+  });
+  it('does not throw or exempt a publish when effect evidence is unreadable', () => {
+    const r = run();
+    Object.defineProperty(r, 'effects', { get() { throw new Error('unreadable effects'); } });
+    expect(reviewRunEvidence(r)).toMatchObject({ completedAt: at });
+    expect(reviewRunEvidence(r)?.ciHeld).not.toBe(true);
+  });
   it('holds three no-verdict runs under one hour with retryAt and the due-time text', () => {
     const held = decideSameHeadHold(labelled(['review:pending']), lostRuns(3), { repo, env: {}, now: at + 30 * 60_000 });
     expect(VERDICT_COOLDOWN_BASE_MS).toBe(3600_000);

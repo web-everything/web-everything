@@ -1,5 +1,5 @@
 import { decideMemoryFloor } from './memory-available.mjs';
-import { loadHostOverloadSettings } from './host-overload-settings.mjs';
+import { loadHostOverloadSettings, DEFAULT_SNAPSHOT_MAX_FRESH_MS, DEFAULT_SNAPSHOT_CLOCK_SKEW_MS } from './host-overload-settings.mjs';
 import { resolveHandoffSettings } from './handoff-settings.mjs';
 /**
  * @file we:scripts/lib/resource-gate.mjs
@@ -177,7 +177,7 @@ const summary = (d) => ({ verdict: d.verdict, reason: d.reason, snapshotAge: d.s
 /**
  * THE cut-over step. `legacy` is the old gate's `{admit, why?, note?, kind?}`. Logs old | new (via
  * `shadowAdmission`), then: `enforce` → the shared verdict decides (`admit` only on verdict `admit`); `shadow` →
- * the legacy result stands. Never throws; if no shared decision can be had at all, the legacy result stands.
+ * the legacy result stands. Never throws; unavailable shared decisions refuse in enforce mode.
  * @returns {{admit:boolean, decidedBy:'admit'|'legacy', why?:string, note?:string, kind?:string, admission?:object}}
  */
 export function cutoverDecision({ gate, kind, legacy = { admit: true }, mode = 'enforce', env = process.env, nowMs = Date.now(),
@@ -187,7 +187,13 @@ export function cutoverDecision({ gate, kind, legacy = { admit: true }, mode = '
   let decision;
   try { decision = shadow({ gate, kind, oldVerdict, oldReason, env, nowMs, ...(root ? { root } : {}), ...(log ? { log } : {}) }); } catch { decision = undefined; }
   if (!isDecision(decision)) { try { decision = admitFn({ kind, env, nowMs, ...(root ? { root } : {}) }); } catch { decision = undefined; } }
-  if (mode !== 'enforce' || !isDecision(decision)) {
+  if (mode === 'enforce' && !isDecision(decision)) {
+    const out = { admit: false, reason: 'gate-error', kind: 'gate-error',
+      why: 'gate-error: shared decision unavailable', decidedBy: 'legacy' };
+    try { (log ?? ((l) => process.stderr.write(l)))(`resource-gate gate=${gate} kind=${kind} ${out.why}\n`); } catch { /* best effort */ }
+    return out;
+  }
+  if (mode !== 'enforce') {
     return { ...legacy, decidedBy: 'legacy', ...(isDecision(decision) ? { admission: summary(decision) } : {}) };
   }
   const age = decision.snapshotAge == null ? '?' : `${decision.snapshotAge}s`;
@@ -207,7 +213,12 @@ export function cutoverDecision({ gate, kind, legacy = { admit: true }, mode = '
 export function gateLaunch({ kind = 'fix', gate, env = process.env, settings, legacyGate = gateHost, nowMs = Date.now(), root,
   shadow, admitFn, log, sample, loadavg = () => os.loadavg()[0], cpuCount = () => os.cpus().length } = {}) {
   let legacy;
-  try { legacy = legacyGate({ kind, env, loadavg, cpuCount, ...(sample ? { sample } : {}) }); } catch { legacy = { admit: true }; }
+  try { legacy = legacyGate({ kind, env, loadavg, cpuCount, ...(sample ? { sample } : {}) }); } catch (e) {
+    // Fail closed (R559): a swallowed legacy-gate exception must never admit work, in any cutover mode.
+    const why = `gate-error: ${String(e?.message ?? e).split('\n')[0]}`;
+    try { (log ?? ((l) => process.stderr.write(l)))(`resource-gate gate=${gate ?? `launch.${kind}`} kind=${kind} ${why}\n`); } catch { /* best effort */ }
+    return { admit: false, reason: 'gate-error', kind: 'gate-error', why, decidedBy: 'legacy' };
+  }
   let mode = 'enforce';
   try { mode = (settings ?? loadResourceGateSettings({ env }).settings).cutover; } catch { /* the standard */ }
   return cutoverDecision({ gate: gate ?? `launch.${kind}`, kind, legacy, mode, env, nowMs, root,
@@ -285,7 +296,7 @@ export function createResourceFixThrottle({
   sendBackReservedSlots,
   listClaims = () => [], env = process.env, alive = isPidAlive, queueLength = null, settings, root, nowMs = () => Date.now(),
   readSnap = () => readSnapshot(root ? { root } : {}), readHeavyWait = () => readLiveHeavyWaitMinutes({ env }), gate, log = (line) => process.stderr.write(line),
-  resolveFloor = () => { const r = loadHostOverloadSettings({ env, log: () => {} }); return { metric: r.settings.host.capacity.memoryMetric, floorMb: r.settings.host.capacity.memAvailableFloorMb, source: r.sources['host.capacity.memAvailableFloorMb'] ?? 'standard' }; },
+  resolveFloor = () => { const r = loadHostOverloadSettings({ env, log: () => {} }); return { snapshotClockSkewMs: r.settings.host.capacity.snapshotClockSkewMs, snapshotMaxFreshMs: r.settings.host.capacity.snapshotMaxFreshMs, metric: r.settings.host.capacity.memoryMetric, floorMb: r.settings.host.capacity.memAvailableFloorMb, source: r.sources['host.capacity.memAvailableFloorMb'] ?? 'standard' }; },
   sample, loadavg, cpuCount, // forwarded to the legacy gate (the logged comparison)
 } = {}) {
   sendBackReservedSlots ??= resolveHandoffSettings('fix', { env }).value.sendBackReservedSlots;
@@ -301,7 +312,12 @@ export function createResourceFixThrottle({
     try { floor = resolveFloor(); } catch { floor = { floorMb: null, source: 'unreadable policy' }; }
     lastSnap = snap; lastFloor = floor;
     const m = snap?.memory ?? {};
-    const fresh = !!snap && Number.isFinite(Date.parse(snap.freshUntil)) && nowMs() <= Date.parse(snap.freshUntil);
+    const sampledAt = Date.parse(snap?.sampledAt);
+    const freshUntil = Date.parse(snap?.freshUntil);
+    const maxFreshMs = floor.snapshotMaxFreshMs ?? DEFAULT_SNAPSHOT_MAX_FRESH_MS;
+    const skewMs = floor.snapshotClockSkewMs ?? DEFAULT_SNAPSHOT_CLOCK_SKEW_MS;
+    const fresh = !!snap && Number.isFinite(sampledAt) && Number.isFinite(freshUntil)
+      && freshUntil - sampledAt <= maxFreshMs && sampledAt <= nowMs() + skewMs && nowMs() <= freshUntil;
     // R559: the reading must have been taken under the SAME metric this process's policy names; a missing or different
     // stamp is a mismatch and refuses (a stricter "free" dispatcher never trusts a larger "available" reading).
     const metricOk = typeof floor.metric === 'string' && m.metric === floor.metric;

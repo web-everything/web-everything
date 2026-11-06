@@ -73,7 +73,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { cascadePolicy } from './policy-cascade.mjs';
+import { cascadePolicy, platformPreference } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { readBuildPrioritySettings, readBuildQueuePrioritySettings } from './build-queue.mjs';
 import { rankByDeliveryPriority, PRIORITY_CLASSES } from './delivery-priority.mjs';
@@ -82,12 +82,14 @@ import { extractManifestFromBody, repoKeyFromSlug } from '../readiness/lane-mani
 import { parseVerdictComment } from './review-log-claims.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
-import { readOverlays } from './daemon-overlays.mjs';
+import { readOverlays, readOverlayState } from './daemon-overlays.mjs';
 import { readRebuildState } from './daemon-rebuild/state.mjs';
 
 export const ENQUEUE_ON_EVENT_POLICY = 'mergeQueue.enqueueOnEvent';
 export const ENQUEUE_ON_EVENT_ENV = 'WE_ENQUEUE_ON_EVENT';
-export const ENQUEUE_ON_EVENT_DEFAULTS = Object.freeze({ enabled: false, debounceSeconds: 15, debounceMaxWaitMs: 60_000, timeoutSeconds: 600, catchUp: Object.freeze({ enabled: false, intervalMinutes: 10, pendingExpiryMinutes: 15, concurrency: 3, busyIntervalSeconds: 60, maxQueued: 12, missSmellAfter: 3, blockedBackoffRounds: 6, timeoutBackoffRounds: 3, missBackoff: Object.freeze({ enabled: true, ttlMinutes: 30 }), order: 'priority-then-first-accept' }) });
+/** Enqueue and merge decision modules: a pending change touching these pauses catch-up (path prefixes). */
+const REFRESH_PAUSE_PATHS = Object.freeze(['scripts/lib/drain-queue-safety', 'scripts/merge-ai-prs', 'scripts/lib/enqueue-on-event']);
+export const ENQUEUE_ON_EVENT_DEFAULTS = Object.freeze({ enabled: false, debounceSeconds: 15, debounceMaxWaitMs: 60_000, timeoutSeconds: 600, catchUp: Object.freeze({ enabled: false, intervalMinutes: 10, pendingExpiryMinutes: 15, concurrency: 3, busyIntervalSeconds: 60, maxQueued: 12, missSmellAfter: 3, blockedBackoffRounds: 6, timeoutBackoffRounds: 3, missBackoff: Object.freeze({ enabled: true, ttlMinutes: 30 }), refreshPause: Object.freeze({ paths: Object.freeze(REFRESH_PAUSE_PATHS), maxPauseMinutes: 10 }), order: 'priority-then-first-accept' }) });
 /** Compatibility constant for the standard fast-drain timeout; the setting controls child runs. */
 export const FAST_DRAIN_TIMEOUT_MS = 10 * 60_000;
 const READY_LABEL = 'ready-to-merge';
@@ -137,6 +139,42 @@ const VALID = {
   timeoutSeconds: (v) => Number.isInteger(v) && v >= 60 && v <= 3600,
 };
 
+// Bounded: an invalid value can be arbitrarily large and lands in the one-line setting log.
+const showValue = (v) => { let s; try { s = JSON.stringify(v) ?? String(v); } catch { s = String(v); } return s.length > 80 ? `${s.slice(0, 77)}...` : s; };
+
+/**
+ * Keep only the declared leaves of one settings layer whose value is valid AS A WHOLE, and name the rest in `invalid`.
+ * The cascade flattens a nested object into leaves and checks each against its TOP-LEVEL key's validator, so
+ * `{ paths: { prefixes: [...] } }` passed as `paths` and `{ maxPauseMinutes: { minutes: 3 } }` as `3`: a malformed shape
+ * reached the resolved value (and `.paths.join` threw, switching enqueue off). Cleaning the layer first makes an
+ * invalid shape fall to the lower layer like any other invalid leaf. `at` is the dotted prefix, `''` for the block root.
+ * @returns {Record<string,unknown>|undefined} undefined when the layer is not an object
+ */
+function validLeaves(layer, validators, { name, at, invalid }) {
+  if (layer === undefined) return undefined;
+  const label = (rest) => `${name ? `${name}.` : ''}${rest}`;
+  const note = (s) => { if (!invalid.includes(s)) invalid.push(s); }; // the bare catchUp label is shared by tool and platform
+  if (!isObj(layer)) { if (at) note(`${label(at)}=${showValue(layer)}`); return undefined; }
+  const out = {};
+  for (const [key, valid] of Object.entries(validators)) {
+    if (layer[key] === undefined) continue;
+    if (valid(layer[key])) out[key] = layer[key];
+    else note(`${label(`${at ? `${at}.` : ''}${key}`)}=${showValue(layer[key])}`);
+  }
+  return out;
+}
+
+/** Whole-value clean of one tool/platform layer: scalar leaves, `catchUp` scalar leaves (nested policies are cleaned apart). */
+function cleanLayer(layer, name, invalid) {
+  if (!isObj(layer)) return undefined;
+  const scalar = (obj, validators, at) => validLeaves(obj, validators, { name, at, invalid });
+  const out = scalar(layer, Object.fromEntries(['enabled', 'debounceSeconds', 'debounceMaxWaitMs', 'timeoutSeconds'].map((k) => [k, VALID[k]])), '');
+  // catchUp leaves keep their established bare `catchUp.<leaf>=` invalid label (pinned by the per-leaf fallback tests).
+  const catchUp = validLeaves(layer.catchUp, Object.fromEntries(Object.entries(CATCH_UP_VALID).filter(([k]) => !k.includes('.'))), { name: '', at: 'catchUp', invalid });
+  if (catchUp) out.catchUp = catchUp;
+  return out;
+}
+
 /**
  * Resolve the setting. Never throws. `tool` defaults to the declared settings' `mergeQueue.enqueueOnEvent` block.
  * @returns {{enabled:boolean, debounceSeconds:number, debounceMaxWaitMs:number, timeoutSeconds:number, catchUp:{enabled:boolean, intervalMinutes:number, pendingExpiryMinutes:number, concurrency:number, busyIntervalSeconds:number, maxQueued:number, missSmellAfter:number, blockedBackoffRounds:number, timeoutBackoffRounds:number, missBackoff:{enabled:boolean, ttlMinutes:number}, order:string}, sources:Record<string,string>, invalid:string[], line:string}}
@@ -148,9 +186,20 @@ export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform
   }
   const raw = String(env?.[ENQUEUE_ON_EVENT_ENV] ?? '').trim().toLowerCase();
   const envEnabled = raw === 'on' || raw === '1' || raw === 'true' ? true : raw === 'off' || raw === '0' || raw === 'false' ? false : undefined;
-  const c = cascadePolicy(ENQUEUE_ON_EVENT_POLICY, isObj(block) ? block : undefined, {
+  const layerInvalid = [];
+  // The platform layer is cleaned whether it was passed in or (the production path) read from the preferences file by the
+  // cascade: handing the cascade an explicit layer stops it re-reading the file uncleaned. A non-object layer is an empty one.
+  const platformLayer = (policy, passed, clean) => {
+    let raw = passed;
+    if (raw === undefined) { try { raw = platformPreference(policy, { env }); } catch { raw = undefined; } }
+    return raw === undefined ? undefined : (clean(raw) ?? {});
+  };
+  const c = cascadePolicy(ENQUEUE_ON_EVENT_POLICY, cleanLayer(block, 'tool', layerInvalid), {
     env, standard: { ...ENQUEUE_ON_EVENT_DEFAULTS }, envValues: { enabled: envEnabled }, valid: VALID,
-    ...(platform !== undefined ? { platform } : {}), log: () => {},
+    platform: platformLayer(ENQUEUE_ON_EVENT_POLICY, platform, (raw) => {
+      if (!isObj(raw)) layerInvalid.push(`platform=${showValue(raw)}`);
+      return cleanLayer(raw, 'platform', layerInvalid);
+    }), log: () => {},
   });
   const v = isObj(c.value) ? c.value : {};
   const out = {
@@ -160,7 +209,7 @@ export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform
     timeoutSeconds: VALID.timeoutSeconds(v.timeoutSeconds) ? v.timeoutSeconds : ENQUEUE_ON_EVENT_DEFAULTS.timeoutSeconds,
     catchUp: {},
     sources: { ...(c.sources || {}) },
-    invalid: [...(c.invalid || []), ...(raw && envEnabled === undefined ? [`env ${ENQUEUE_ON_EVENT_ENV}=${JSON.stringify(raw)}`] : [])],
+    invalid: [...(c.invalid || []), ...layerInvalid, ...(raw && envEnabled === undefined ? [`env ${ENQUEUE_ON_EVENT_ENV}=${JSON.stringify(raw)}`] : [])],
   };
   for (const leaf of Object.keys(CATCH_UP_VALID)) {
     if (leaf.startsWith('missBackoff.')) continue; // resolved as a nested policy below
@@ -175,21 +224,25 @@ export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform
   }
   // Resolve the new nested policy with leaf-specific validation: an invalid tool TTL must
   // retain a valid platform TTL, rather than the catchUp union accepting it as another leaf.
-  const miss = cascadePolicy(`${ENQUEUE_ON_EVENT_POLICY}.catchUp.missBackoff`, isObj(block?.catchUp?.missBackoff) ? block.catchUp.missBackoff : undefined, {
-    env, standard: ENQUEUE_ON_EVENT_DEFAULTS.catchUp.missBackoff,
-    valid: { enabled: CATCH_UP_VALID['missBackoff.enabled'], ttlMinutes: CATCH_UP_VALID['missBackoff.ttlMinutes'] },
-    ...(platform !== undefined ? { platform: platform?.catchUp?.missBackoff } : {}), log: () => {},
+  const missValid = { enabled: CATCH_UP_VALID['missBackoff.enabled'], ttlMinutes: CATCH_UP_VALID['missBackoff.ttlMinutes'] };
+  const miss = cascadePolicy(`${ENQUEUE_ON_EVENT_POLICY}.catchUp.missBackoff`, validLeaves(block?.catchUp?.missBackoff, missValid, { name: 'tool', at: 'catchUp.missBackoff', invalid: out.invalid }), {
+    env, standard: ENQUEUE_ON_EVENT_DEFAULTS.catchUp.missBackoff, valid: missValid,
+    platform: platformLayer(`${ENQUEUE_ON_EVENT_POLICY}.catchUp.missBackoff`, platform?.catchUp?.missBackoff, (raw) => validLeaves(raw, missValid, { name: 'platform', at: 'catchUp.missBackoff', invalid: out.invalid })), log: () => {},
   });
   out.catchUp.missBackoff = miss.value;
   for (const [key, source] of Object.entries(miss.sources)) out.sources[`catchUp.missBackoff.${key}`] = source;
-  for (const invalid of miss.invalid) out.invalid.push(invalid.replace(/^(tool|platform)\./, '$1.catchUp.missBackoff.'));
-  // The cascade rejects values outside the union before the per-leaf type check can see them.
-  for (const invalid of c.invalid || []) {
-    const match = /^(?:tool|platform)\.(catchUp\.(?:enabled|intervalMinutes|pendingExpiryMinutes|concurrency|busyIntervalSeconds|maxQueued|missSmellAfter|blockedBackoffRounds|timeoutBackoffRounds|missBackoff\.(?:enabled|ttlMinutes)|order)=.*)$/.exec(invalid);
-    if (match && !out.invalid.includes(match[1])) out.invalid.push(match[1]);
-  }
+  const pauseValid = {
+    paths: (x) => Array.isArray(x) && x.length > 0 && x.every((p) => typeof p === 'string' && p === p.trim() && p !== '' && !/[\u0000-\u001f\u007f]/.test(p) && p.split('/').every((seg, i, all) => seg !== '.' && seg !== '..' && (seg !== '' || i === all.length - 1)) && !p.startsWith('/')),
+    maxPauseMinutes: (x) => Number.isFinite(x) && x > 0 && x <= 1440,
+  };
+  const pause = cascadePolicy(`${ENQUEUE_ON_EVENT_POLICY}.catchUp.refreshPause`, validLeaves(block?.catchUp?.refreshPause, pauseValid, { name: 'tool', at: 'catchUp.refreshPause', invalid: out.invalid }), {
+    env, standard: { paths: [...REFRESH_PAUSE_PATHS], maxPauseMinutes: ENQUEUE_ON_EVENT_DEFAULTS.catchUp.refreshPause.maxPauseMinutes }, valid: pauseValid,
+    platform: platformLayer(`${ENQUEUE_ON_EVENT_POLICY}.catchUp.refreshPause`, platform?.catchUp?.refreshPause, (raw) => validLeaves(raw, pauseValid, { name: 'platform', at: 'catchUp.refreshPause', invalid: out.invalid })), log: () => {},
+  });
+  out.catchUp.refreshPause = pause.value;
+  for (const [key, source] of Object.entries(pause.sources)) out.sources[`catchUp.refreshPause.${key}`] = source;
   const src = (k) => out.sources[k] || 'standard';
-  out.line = `enqueue-on-event: setting ${ENQUEUE_ON_EVENT_POLICY} enabled=${out.enabled} (${src('enabled')}), debounceSeconds=${out.debounceSeconds} (${src('debounceSeconds')}), debounceMaxWaitMs=${out.debounceMaxWaitMs} (${src('debounceMaxWaitMs')}), timeoutSeconds=${out.timeoutSeconds} (${src('timeoutSeconds')}), catchUp.enabled=${out.catchUp.enabled} (${src('catchUp.enabled')}), catchUp.intervalMinutes=${out.catchUp.intervalMinutes} (${src('catchUp.intervalMinutes')}), catchUp.pendingExpiryMinutes=${out.catchUp.pendingExpiryMinutes} (${src('catchUp.pendingExpiryMinutes')}), catchUp.concurrency=${out.catchUp.concurrency} (${src('catchUp.concurrency')}), catchUp.busyIntervalSeconds=${out.catchUp.busyIntervalSeconds} (${src('catchUp.busyIntervalSeconds')}), catchUp.maxQueued=${out.catchUp.maxQueued} (${src('catchUp.maxQueued')}), catchUp.missSmellAfter=${out.catchUp.missSmellAfter} (${src('catchUp.missSmellAfter')}), catchUp.blockedBackoffRounds=${out.catchUp.blockedBackoffRounds} (${src('catchUp.blockedBackoffRounds')}), catchUp.timeoutBackoffRounds=${out.catchUp.timeoutBackoffRounds} (${src('catchUp.timeoutBackoffRounds')}), catchUp.missBackoff.enabled=${out.catchUp.missBackoff.enabled} (${src('catchUp.missBackoff.enabled')}), catchUp.missBackoff.ttlMinutes=${out.catchUp.missBackoff.ttlMinutes} (${src('catchUp.missBackoff.ttlMinutes')}), catchUp.order=${out.catchUp.order} (${src('catchUp.order')})${out.invalid.length ? ` · ignored invalid: ${out.invalid.join('; ')}` : ''}`;
+  out.line = `enqueue-on-event: setting ${ENQUEUE_ON_EVENT_POLICY} enabled=${out.enabled} (${src('enabled')}), debounceSeconds=${out.debounceSeconds} (${src('debounceSeconds')}), debounceMaxWaitMs=${out.debounceMaxWaitMs} (${src('debounceMaxWaitMs')}), timeoutSeconds=${out.timeoutSeconds} (${src('timeoutSeconds')}), catchUp.enabled=${out.catchUp.enabled} (${src('catchUp.enabled')}), catchUp.intervalMinutes=${out.catchUp.intervalMinutes} (${src('catchUp.intervalMinutes')}), catchUp.pendingExpiryMinutes=${out.catchUp.pendingExpiryMinutes} (${src('catchUp.pendingExpiryMinutes')}), catchUp.concurrency=${out.catchUp.concurrency} (${src('catchUp.concurrency')}), catchUp.busyIntervalSeconds=${out.catchUp.busyIntervalSeconds} (${src('catchUp.busyIntervalSeconds')}), catchUp.maxQueued=${out.catchUp.maxQueued} (${src('catchUp.maxQueued')}), catchUp.missSmellAfter=${out.catchUp.missSmellAfter} (${src('catchUp.missSmellAfter')}), catchUp.blockedBackoffRounds=${out.catchUp.blockedBackoffRounds} (${src('catchUp.blockedBackoffRounds')}), catchUp.timeoutBackoffRounds=${out.catchUp.timeoutBackoffRounds} (${src('catchUp.timeoutBackoffRounds')}), catchUp.missBackoff.enabled=${out.catchUp.missBackoff.enabled} (${src('catchUp.missBackoff.enabled')}), catchUp.missBackoff.ttlMinutes=${out.catchUp.missBackoff.ttlMinutes} (${src('catchUp.missBackoff.ttlMinutes')}), catchUp.refreshPause.paths=${out.catchUp.refreshPause.paths.join(',')} (${src('catchUp.refreshPause.paths')}), catchUp.refreshPause.maxPauseMinutes=${out.catchUp.refreshPause.maxPauseMinutes} (${src('catchUp.refreshPause.maxPauseMinutes')}), catchUp.order=${out.catchUp.order} (${src('catchUp.order')})${out.invalid.length ? ` · ignored invalid: ${out.invalid.join('; ')}` : ''}`;
   return out;
 }
 
@@ -579,6 +632,55 @@ const lastJsonLine = (s) => {
   return null;
 };
 
+/** How long one run reuses a pending-change read across its per-candidate mayStart() calls. */
+const PENDING_CHANGE_MEMO_MS = 30_000;
+
+/**
+ * IO: repo-relative paths the pending refresh would change: each unadopted overlay ref and main, against the code clone's HEAD.
+ * Any unreadable piece returns {ok:false} so the caller fails closed.
+ */
+export function readPendingChangePaths({ root, cwd, env = process.env, execFileSyncImpl, overlays, rebuildState }) {
+  try {
+    // A pending refresh with no separate code clone to read is an inconsistent state, not an empty change: fail closed.
+    if (!root || root === cwd) return { ok: false, error: 'no separate code clone to read the pending change from' };
+    const git = (args) => String(execFileSyncImpl('git', args, { cwd: root, env, encoding: 'utf8', timeout: 30_000, maxBuffer: 4 * 1024 * 1024 }));
+    // NUL-separated (-z): git quotes non-ASCII or special paths otherwise, and a quoted path never matches a protected prefix.
+    const names = (out) => out.split('\0').filter(Boolean);
+    // An overlay counts as adopted only when its CURRENT tip is already in the code clone's HEAD history. Registration age and
+    // a recorded sha prove nothing: re-registering keeps addedAt, the branch can advance, and a held or rolled-back build
+    // leaves HEAD behind its own record.
+    const applied = rebuildState()?.adopted?.applied;
+    const everApplied = new Set((Array.isArray(applied) ? applied : []).filter((a) => isObj(a) && typeof a.ref === 'string').map((a) => a.ref));
+    // Freshness precondition: this reads the code clone's LOCAL origin/main and origin/<ref> tracking refs and never fetches. The
+    // daemon rebuild's edge fetch (daemon-rebuild/edge-fetch.mjs) refreshes them; a ref that lags it can only hide a change for the
+    // current catch-up window, and the 10-minute max pause and overlayRefreshPending's own age bound still end the refresh.
+    // Three-dot: only what main gained since it diverged from HEAD. A two-dot diff also lists files an overlay already merged into HEAD
+    // carries (HEAD has them, main does not), which the refresh would not change.
+    const overlayList = overlays(); // read the registry first: an unreadable one fails closed before any git call
+    const paths = new Set(names(git(['diff', '--name-only', '-z', '--no-renames', 'HEAD...origin/main', '--'])));
+    let inspected = 0;
+    for (const o of overlayList) {
+      const ref = o?.ref;
+      if (typeof ref !== 'string' || !/^[A-Za-z0-9._/-]+$/.test(ref) || ref.startsWith('-')) return { ok: false, error: `overlay ref ${JSON.stringify(ref)} unsafe` };
+      let tip;
+      // Exit 1 is git's "no such ref". A timeout, buffer overflow or spawn failure means unreadable, so it fails closed instead of looking like a deleted branch.
+      try { tip = git(['rev-parse', '--verify', '--quiet', `origin/${ref}^{commit}`]).trim(); } catch (e) { if (e?.status === 1) tip = ''; else throw e; }
+      if (!tip) {
+        // The branch is gone (merged and deleted, not yet dropped by a rebuild): nothing left to inspect if it was applied before.
+        if (everApplied.has(ref)) continue;
+        return { ok: false, error: `overlay ref ${JSON.stringify(ref)} tip unreadable` };
+      }
+      if (!/^[0-9a-f]{40,64}$/.test(tip)) return { ok: false, error: `overlay ref ${JSON.stringify(ref)} tip unreadable` };
+      let inHead;
+      try { git(['merge-base', '--is-ancestor', tip, 'HEAD']); inHead = true; } catch (e) { if (e?.status === 1) inHead = false; else throw e; }
+      if (inHead) continue;
+      inspected += 1;
+      for (const p of names(git(['diff', '--name-only', '-z', '--no-renames', `origin/main...origin/${ref}`, '--']))) paths.add(p);
+    }
+    return { ok: true, paths: [...paths], source: `main delta + ${inspected} overlay(s)` };
+  } catch (e) { return { ok: false, error: String(e?.message || e).split('\n')[0] }; }
+}
+
 /**
  * The daemon-side handle.
  * @param {{cwd:string, localSlug:string, defaultBranch?:string, execFileSyncImpl?:Function, scriptRoot?:()=>string, allowed?:()=>boolean, refreshPending?:Function, log?:(m:string)=>void,
@@ -597,6 +699,7 @@ export function createEnqueueOnEvent({
       return overlayRefreshPending({ overlays: readOverlays(root, { env }), rebuildState: readRebuildState(root, env), now: now() });
     } catch { return { pending: false }; }
   },
+  readPendingChange = () => readPendingChangePaths({ root: scriptRoot(), cwd, env, execFileSyncImpl, overlays: () => { const st = readOverlayState(scriptRoot(), { env }); if (st.corrupt) throw new Error('overlay registry unreadable'); return st.overlays; }, rebuildState: () => readRebuildState(scriptRoot(), env) }),
   readCandidates = ({ repo }) => readCatchUpCandidates({ repo, env, defaultBranch }), readCapacity = (s) => readQueueCapacity(s),
   readPriorities = () => ({ priority: readBuildQueuePrioritySettings({ env }), buildPriority: readBuildPrioritySettings({ env }).ids, mainFix: readMainRedPriority({ env }) }),
   readQueueDepth = ({ repo }) => readCatchUpQueueDepth({ repo, env }),
@@ -676,14 +779,50 @@ export function createEnqueueOnEvent({
     return true;
   }
 
+  let pauseSince = null;
+  /** While a refresh is pending: keep enqueuing on last-good unless the pending change touches enqueue/merge code (bounded pause). */
+  function refreshDecision(refresh, change) {
+    const cfg = { ...ENQUEUE_ON_EVENT_DEFAULTS.catchUp.refreshPause, ...setting.catchUp?.refreshPause };
+    const src = `paths ${setting.sources?.['catchUp.refreshPause.paths'] || 'standard'}, maxPause ${setting.sources?.['catchUp.refreshPause.maxPauseMinutes'] || 'standard'}`;
+    const touched = change?.ok === true && Array.isArray(change.paths)
+      ? change.paths.filter((p) => cfg.paths.some((prefix) => p === prefix || p.startsWith(prefix))) : null;
+    if (touched && !touched.length) {
+      pauseSince = null;
+      return { go: true, line: `enqueue-on-event: daemon refresh pending (${refresh.reason}) — continuing on last-good: pending change (${change.source || 'unknown source'}) touches none of ${cfg.paths.join(', ')} [${src}]` };
+    }
+    const why = touched ? `pending change touches ${touched.slice(0, 5).join(', ')}` : `pending diff unreadable (${change?.error || 'unknown'}) — failing closed`;
+    pauseSince ??= now();
+    // An unreadable diff never expires on this bound (fail closed, as before); overlayRefreshPending's own age bound still applies.
+    if (touched && now() - pauseSince >= cfg.maxPauseMinutes * 60_000) {
+      return { go: true, line: `enqueue-on-event: WARN daemon refresh pending (${refresh.reason}) — max pause ${cfg.maxPauseMinutes}m exceeded (${why}) — enqueuing on last-good [${src}]` };
+    }
+    return { go: false, why: `${why}; pause bounded at ${cfg.maxPauseMinutes}m [${src}]` };
+  }
+
   async function runDue({ catchUpOnly = false } = {}) {
     let refreshLogged = false;
+    // The pending-change read spawns git per overlay and mayStart() runs per candidate: read it once per run, not per call.
+    // A run can last minutes (fast drains), so the read is reused only briefly: a stale "go" must not outlive a newly registered overlay.
+    let changeMemo = null;
+    const pendingChange = () => {
+      const t = now();
+      if (changeMemo && t - changeMemo.at < PENDING_CHANGE_MEMO_MS) return changeMemo.value;
+      let value;
+      try { value = readPendingChange(); } catch (e) { value = { ok: false, error: String(e?.message || e).split('\n')[0] }; }
+      changeMemo = { at: t, value };
+      return value;
+    };
     const mayStart = () => {
       if (!allowed()) return false;
       const refresh = refreshPending();
-      if (!refresh.pending) return true;
+      if (!refresh.pending) { pauseSince = null; return true; }
+      const decision = refreshDecision(refresh, pendingChange());
+      if (decision.go) {
+        if (!refreshLogged) { log(decision.line); refreshLogged = true; }
+        return true;
+      }
       if (!refreshLogged) {
-        log(`enqueue-on-event: catch-up paused — daemon refresh pending (${refresh.reason}) — retrying on next tick`);
+        log(`enqueue-on-event: catch-up paused — daemon refresh pending (${refresh.reason}) — ${decision.why} — retrying on next tick`);
         refreshLogged = true;
       }
       return false;

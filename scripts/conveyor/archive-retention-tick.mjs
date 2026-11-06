@@ -1,5 +1,5 @@
 /** Archive-only host maintenance, separate from health-watch's lane probes. */
-import { archiveRetention } from '../lib/archive-retention.mjs';
+import { archiveRetention, defaultWriterExclusion } from '../lib/archive-retention.mjs';
 import { scrubText } from './health-watch-core.mjs';
 
 /** Host retention is excluded from fixture and redirected maintenance ticks. */
@@ -12,7 +12,7 @@ export function archiveRetentionTickAllowed(flags = {}) {
 export async function runArchiveRetentionTick({ flags = {}, now, archive = archiveRetention, log = console.error } = {}) {
   if (!archiveRetentionTickAllowed(flags)) return { results: [], error: null };
   const results = [];
-  for (const kind of ['runs', 'sessions']) results.push(await archive({ kind, now, log }));
+  for (const kind of ['runs', 'sessions']) results.push(await archive({ kind, now, log, withSourceWriterExclusion: defaultWriterExclusion(kind) }));
   const errors = results.flatMap(result => result.errors);
   return { results, error: errors.length ? scrubText(errors.join('; ')) : null };
 }

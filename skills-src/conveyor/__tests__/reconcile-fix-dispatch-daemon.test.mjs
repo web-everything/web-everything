@@ -465,8 +465,11 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
       expect(opts[tickName]).toHaveBeenCalledTimes(1);
       expect(opts[tickName]).toHaveBeenCalledWith(step === 'fix'
         ? { repo: 'repo-a', allowStandDownAutoProceed: false }
-        : ['hung-ci', 'main-red-rebase', 'missing-run'].includes(step)
-          ? { repo: 'repo-a', apply: true } : { repo: 'repo-a' });
+        : step === 'main-red-rebase'
+          // The daemon wires a per-repo file-backed fairness ledger into the main-red rebase sweep only.
+          ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
+          : ['hung-ci', 'missing-run'].includes(step)
+            ? { repo: 'repo-a', apply: true } : { repo: 'repo-a' });
       expect(result.phaseMs[step]).toBeGreaterThan(0);
     }
     expect(readPrs).toHaveBeenCalledTimes(1);
@@ -634,8 +637,11 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
       expect(opts[tickName]).toHaveBeenCalledTimes(1);
       expect(opts[tickName]).toHaveBeenCalledWith(step === 'fix'
         ? { repo: 'repo-a', allowStandDownAutoProceed: false }
-        : ['hung-ci', 'main-red-rebase', 'missing-run'].includes(step)
-          ? { repo: 'repo-a', apply: true } : { repo: 'repo-a' });
+        : step === 'main-red-rebase'
+          // The daemon wires a per-repo file-backed fairness ledger into the main-red rebase sweep only.
+          ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
+          : ['hung-ci', 'missing-run'].includes(step)
+            ? { repo: 'repo-a', apply: true } : { repo: 'repo-a' });
     }
     expect(result.skippedSteps ?? []).toEqual([]);
     expect(skipLines(log)).toEqual([]);
@@ -737,8 +743,11 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
       expect(opts[tickName]).toHaveBeenCalledTimes(1);
       expect(options).toEqual(step === 'fix'
         ? { repo: 'repo-a', allowStandDownAutoProceed: false }
-        : ['hung-ci', 'main-red-rebase', 'missing-run'].includes(step)
-          ? { repo: 'repo-a', apply: true } : { repo: 'repo-a' });
+        : step === 'main-red-rebase'
+          // The daemon wires a per-repo file-backed fairness ledger into the main-red rebase sweep only.
+          ? { repo: 'repo-a', apply: true, applyLedger: { read: expect.any(Function), write: expect.any(Function) } }
+          : ['hung-ci', 'missing-run'].includes(step)
+            ? { repo: 'repo-a', apply: true } : { repo: 'repo-a' });
     }
   });
 
@@ -1343,8 +1352,33 @@ describe('runMainRedRebaseAllRepos — one sweepCiRedRecovery call per watched r
     const tick = vi.fn(() => ({ dispatch: [], refusals: [], applied: [] }));
     runMainRedRebaseAllRepos({ repos: ['repo-a', 'repo-b'], tick });
     expect(tick).toHaveBeenCalledTimes(2);
-    expect(tick).toHaveBeenCalledWith({ repo: 'repo-a', apply: true });
-    expect(tick).toHaveBeenCalledWith({ repo: 'repo-b', apply: true });
+    expect(tick).toHaveBeenCalledWith(expect.objectContaining({ repo: 'repo-a', apply: true }));
+    expect(tick).toHaveBeenCalledWith(expect.objectContaining({ repo: 'repo-b', apply: true }));
+  });
+
+  it('runMainRedRebaseAllRepos wires a per-repo applyLedger into the sweep', () => {
+    // The daemon is the only live caller: without a ledger the sweep has no fairness memory and the
+    // budget-capped apply loop starves refreshable PRs behind slow/deferred ones (ci-red-recovery-watch.mjs applyLedger).
+    const tick = vi.fn(() => ({ dispatch: [], refusals: [], applied: [] }));
+    runMainRedRebaseAllRepos({ repos: ['repo-a', 'repo-b'], tick });
+    const [a, b] = tick.mock.calls.map(([o]) => o.applyLedger);
+    for (const l of [a, b]) {
+      expect(typeof l?.read).toBe('function');
+      expect(typeof l?.write).toBe('function');
+    }
+    expect(a).not.toBe(b); // separate ledger per repo
+  });
+
+  it('keys each repo\'s ledger by repo, and an explicitly passed applyLedger wins', () => {
+    const tick = vi.fn(() => ({ dispatch: [], refusals: [], applied: [] }));
+    const createLedger = vi.fn(({ repo }) => ({ read: () => null, write: () => {}, repo }));
+    runMainRedRebaseAllRepos({ repos: ['repo-a', 'repo-b'], tick, createLedger });
+    expect(createLedger.mock.calls.map(([o]) => o.repo)).toEqual(['repo-a', 'repo-b']);
+    expect(tick.mock.calls.map(([o]) => o.applyLedger.repo)).toEqual(['repo-a', 'repo-b']);
+    const own = { read: () => null, write: () => {} };
+    const tick2 = vi.fn(() => ({ dispatch: [], refusals: [], applied: [] }));
+    runMainRedRebaseAllRepos({ repos: ['repo-a'], tick: tick2, createLedger, applyLedger: own });
+    expect(tick2.mock.calls[0][0].applyLedger).toBe(own);
   });
 
   it('maps each applied rebase to a repo-tagged dispatched row', () => {
@@ -1362,7 +1396,7 @@ describe('runMainRedRebaseAllRepos — one sweepCiRedRecovery call per watched r
     const tick = vi.fn(({ repo }) => { if (repo === 'repo-bad') throw new Error('gh outage'); return { dispatch: [], refusals: [], applied: [] }; });
     const out = runMainRedRebaseAllRepos({ repos: ['repo-bad', 'repo-good'], tick });
     expect(out.refusals).toEqual([{ repo: 'repo-bad', prNumber: null, kind: 'tick-failed', why: 'gh outage' }]);
-    expect(tick).toHaveBeenCalledWith({ repo: 'repo-good', apply: true });
+    expect(tick).toHaveBeenCalledWith(expect.objectContaining({ repo: 'repo-good', apply: true }));
   });
 
   it('defaults repos to FIX_DISPATCH_DAEMON_REPOS — every watched repo, not just WE (part (c): frontierui/plateau-app too)', () => {
@@ -1748,7 +1782,7 @@ describe('xn025gx glue — buildAwaitVerifyStep, buildFixThrottle, buildDaemonEx
     // R559: admission refuses on an unreadable/stale memory reading, so inject a healthy host (never the machine's real one).
     const hostNow = Date.parse('2026-11-04T12:00:00Z');
     const healthy = { nowMs: () => hostNow, resolveFloor: () => ({ metric: 'available', floorMb: 2048, source: 'test' }),
-      readSnap: () => ({ sampledAt: new Date(hostNow - 5000).toISOString(), freshUntil: new Date(hostNow + 20000).toISOString(),
+      readSnap: () => ({ sampledAt: new Date(hostNow - 5000).toISOString(), freshUntil: new Date(hostNow + 15000).toISOString(),
         cpu: { idlePct: 40, loadAvg: [1] }, memory: { pressureLevel: 1, metric: 'available', availableMb: 8192 } }) };
     const base = { ...healthy, sendBackReservedSlots: 0, env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '1' }, sample: () => null, loadavg: () => 0, cpuCount: () => 8, alive: () => true };
     const full = buildFixThrottle({ ...base, slotClaims: () => [fix] }).tryAdmit('fix');
@@ -1769,7 +1803,7 @@ describe('xn025gx glue — buildAwaitVerifyStep, buildFixThrottle, buildDaemonEx
     const claims = Array.from({ length: 2 }, (_, i) => ({ meta: { kind: 'fix', repo: 'we', pr: i + 1 } }));
     const fixCap = { floor: 2, ceiling: 4, ceilingAboveFloor: 2, raiseQueueOver: 5, raiseMinCpuIdlePct: 30, raiseStepPerPass: 2 };
     const now = Date.parse('2026-10-10T15:00:00Z');
-    const readSnap = () => ({ sampledAt: new Date(now - 5000).toISOString(), freshUntil: new Date(now + 20000).toISOString(),
+    const readSnap = () => ({ sampledAt: new Date(now - 5000).toISOString(), freshUntil: new Date(now + 15000).toISOString(),
       cpu: { idlePct: 45, loadAvg: [40] }, memory: { pressureLevel: 1, metric: 'available', availableMb: 8192, freePct: 60, swapUsedPct: 10 }, disk: { busyPct: 100 } });
     const t = buildFixThrottle({ slotClaims: () => claims, alive: () => true, queueLength: () => 7, readSnap, nowMs: () => now,
       resolveFloor: () => ({ metric: 'available', floorMb: 2048, source: 'test' }), readHeavyWait: () => 0,
@@ -1929,14 +1963,15 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     expect(cache.reconcile({ repo: 'repo-a', allowStandDownAutoProceed: true }).dispatch).toEqual([]);
   });
 
-  it('planner bypasses poisoned discovery and shared snapshots, reading directly after the baseline', () => {
+  it('planner bypasses poisoned discovery and shared snapshots, reading FRESH small pages after the baseline (never the heavy pr list)', () => {
     const order = [];
     const discovery = vi.fn(() => [{ number: 7, comments: ['stale'] }]);
     const shared = vi.spyOn(prSnapshot, 'readSharedOpenPrs').mockImplementation(() => {
       throw new Error('poisoned shared snapshot must never be consulted');
     });
     const exec = vi.spyOn(ghThrottle, 'execFileSyncThrottled').mockImplementation(() => {
-      order.push('direct-read'); return '[]';
+      order.push('direct-read');
+      return JSON.stringify({ data: { repository: { pullRequests: { nodes: [], totalCount: 0, pageInfo: { hasNextPage: false, endCursor: null } } } } });
     });
     const reader = vi.spyOn(reconcilePass, 'defaultReadPrs');
     const cache = createReconcilePlanCache({
@@ -1952,10 +1987,12 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     expect(order).toEqual(['baseline', 'claims', 'planner', 'direct-read']);
     expect(discovery).not.toHaveBeenCalled();
     expect(shared).not.toHaveBeenCalled();
-    expect(reader.mock.calls[0][0].exec).not.toBe(execFileSyncThrottled);
+    expect(reader.mock.calls[0][0].fresh).toBe(true);
+    expect(reader.mock.calls[0][0].exec).toBeUndefined(); // the REAL throttled exec: a wrapper knocked the read off the production path
     expect(reader.mock.calls[0][0].attributionRepo).toBe('web-everything/web-everything');
     expect(exec.mock.calls[0][0]).toBe('gh');
-    expect(exec.mock.calls[0][1]).toEqual(expect.arrayContaining(['pr', 'list', '--repo', 'web-everything/web-everything']));
+    expect(exec.mock.calls[0][1].slice(0, 3)).toEqual(['api', 'graphql', '-f']); // a small GraphQL page
+    expect(exec.mock.calls.some(c => c[1][0] === 'pr' && c[1][1] === 'list')).toBe(false); // never the heavy 200-row list
   });
 
   it.each(['plan', 'captured PRs'])('clone failure in %s recomputes in full without exposing a partial cache entry', target => {
