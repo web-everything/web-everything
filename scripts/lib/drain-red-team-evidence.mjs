@@ -13,6 +13,7 @@ import { readRedTeamProbes, redTeamForHead, parseRedTeamComment } from './red-te
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
 import { completedRedTeamSeat } from './red-team-run-result.mjs';
+import { latestAcceptRecord } from './accept-carry-forward.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 
 export const redTeamStatusDir = (env = process.env) => join(dirname(sharedRunsDir(env)), 'red-team-status');
@@ -579,8 +580,17 @@ export const COMMENT_SETTLEABLE_REASONS =Object.freeze(['review-unfinished', RUN
 export function settleUnknownEvidenceByComment(evidence, comments, pr, head) {
   if (evidence?.ok !== false || !COMMENT_SETTLEABLE_REASONS.includes(evidence.reason)) return evidence;
   if (!redTeamForHead(comments, pr, head)) return evidence;
-  const at = Date.parse(commentCreatedAt(newestResultComment(comments, pr, head)));
+  const resultAt = Date.parse(commentCreatedAt(newestResultComment(comments, pr, head)));
   const bounds = evidence.settleBounds ?? {};
+  // A result older than the unfinished review is still answered when the operator's accept (a trusted record bound to
+  // this exact head, with nothing held after it) came after that review started: the accept is the verdict the
+  // unfinished run never recorded, and its time stands in for the result's in every bound and the complete read.
+  let at = resultAt;
+  if (evidence.reason === 'review-unfinished' && Number.isFinite(resultAt) && Number.isFinite(bounds.unfinishedStartedAt) && !(resultAt > bounds.unfinishedStartedAt)) {
+    const rec = latestAcceptRecord(comments, undefined, { sha: String(head).toLowerCase() });
+    const acceptAt = Date.parse(rec?.at ?? '');
+    if (rec && !rec.laterBodyDerivedHold && !rec.laterVerdict && Number.isFinite(acceptAt) && acceptAt > bounds.unfinishedStartedAt) at = acceptAt;
+  }
   if (!Number.isFinite(at)) return evidence;
   // An unfinished run that already decided (a rejection with its label effect still open) is not answered by a
   // clean comment from an earlier job; a bound that does not say so fails closed.
