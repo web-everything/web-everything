@@ -1,0 +1,170 @@
+import { describe, it, expect, vi } from 'vitest';
+import { scoreEscalation } from '../review-escalation.mjs';
+import { DEFAULT_CARE_EXEMPT_PATHS, resolveReviewCareExemptPaths, validateCareExemptPaths } from '../review-care-exempt-paths.mjs';
+
+const timings = 'scripts/ci/test-timings.json';
+const section = (file, count) => `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -0,0 +1,${count} @@\n${'+data\n'.repeat(count)}`;
+
+describe('R641 care exemptions', () => {
+  it.each([
+    'scripts/guard-bash.mjs', 'scripts/guard-git-push.mjs', 'scripts/lib/permission-change.mjs',
+    ...['scripts', '.github', '.claude'].flatMap(root => ['guard', 'egress', 'permission'].flatMap(prefix => [
+      `${root}/${prefix}/fixtures/sample.json`, `${root}/tools/fixtures/${prefix}-check.mjs`,
+    ])),
+  ])('always counts protected machinery %s despite explicit or fixture exemptions', file => {
+    for (const careExemptPaths of [[file], ['**/fixtures/**']]) {
+      const result = scoreEscalation({ changedFiles: [file], careExemptPaths, diffLines: 1000 });
+      expect(result.signals.careExempt).toBeUndefined();
+      expect(result.basisFiles).toEqual([file]);
+      expect(result.signals.size).toBe(1000);
+    }
+  });
+
+  it.each([
+    'scripts/ci/old-timings.json => scripts/ci/test-timings.json',
+    'scripts/ci/{old-timings => test-timings}.json',
+  ])('subtracts one section only for rename alias %s and its plain path', renamed => {
+    const diffHunks = section(timings, 200).replace(
+      `diff --git a/${timings} b/${timings}`,
+      `diff --git a/scripts/ci/old-timings.json b/${timings}\nrename from scripts/ci/old-timings.json\nrename to ${timings}`,
+    ) + section('app.js', 400);
+    const result = scoreEscalation({ changedFiles: [renamed, timings, 'app.js'], diffLines: 600, diffHunks });
+    expect(result.signals.size).toBe(400);
+  });
+
+  it('timings alone have no size or blast-radius care and need no human', () => {
+    const result = scoreEscalation({ changedFiles: [timings], diffLines: 10000 });
+    expect(result.humanRequired).toBe(false);
+    expect(result.careLevel).toBe('none');
+    expect(result.signals.careExempt).toEqual([timings]);
+    expect(result.basisFiles).toEqual([]);
+  });
+
+  it('a guard alongside timings retains human review even when explicitly matched', () => {
+    const guard = 'scripts/lib/gate-config.mjs';
+    const result = scoreEscalation({ changedFiles: [timings, guard], humanSurfaces: 'broad',
+      careExemptPaths: [timings, guard], diffLines: 10000 });
+    expect(result.humanRequired).toBe(true);
+    expect(result.signals.careExempt).toEqual([timings]);
+    expect(result.basisFiles).toEqual([guard]);
+    expect(result.signals.size).toBe(10000);
+  });
+
+  it('subtracts only exempt per-file changed lines when hunks are available', () => {
+    const result = scoreEscalation({ changedFiles: [timings, 'app.js'], diffLines: 1002,
+      diffHunks: section(timings, 1000) + section('app.js', 2) });
+    expect(result.signals.size).toBeUndefined();
+    expect(result.careLevel).toBe('none');
+    expect(result.diffHunksBasisFiles).toEqual([timings, 'app.js']);
+  });
+
+  it('retains mixed-file size when exempt hunks are unavailable', () => {
+    expect(scoreEscalation({ changedFiles: [timings, 'app.js'], diffLines: 1002 }).signals.size).toBe(1002);
+  });
+
+  it('retains mixed-file size when exempt hunks are truncated', () => {
+    const diffHunks = section(timings, 1000).replace('@@ -0,0 +1,1000 @@', '@@ -0,0 +1,1001 @@');
+    expect(scoreEscalation({ changedFiles: [timings, 'app.js'], diffLines: 1002, diffHunks }).signals.size).toBe(1002);
+  });
+
+  it('filters cumulative exempt files without losing a cumulative guard', () => {
+    const guard = 'scripts/lib/gate-config.mjs';
+    const result = scoreEscalation({ changedFiles: [timings], humanBasisFiles: [guard, timings],
+      humanSurfaces: 'broad', diffLines: 1000 });
+    expect(result.basisFiles).toEqual([guard]);
+    expect(result.humanRequired).toBe(true);
+  });
+
+  it('counts additions and removals without subtracting diff headers', () => {
+    const diffHunks = `diff --git a/${timings} b/${timings}\n--- a/${timings}\n+++ b/${timings}\n@@ -1,250 +1,250 @@\n${'-old\n'.repeat(250)}${'+new\n'.repeat(250)}`;
+    expect(scoreEscalation({ changedFiles: [timings, 'app.js'], diffLines: 900, diffHunks }).signals.size).toBe(400);
+  });
+
+  it('allows an empty list to disable exemptions', () => {
+    const result = scoreEscalation({ changedFiles: [timings], diffLines: 1000, careExemptPaths: [] });
+    expect(result.signals.careExempt).toBeUndefined();
+    expect(result.signals.size).toBe(1000);
+  });
+
+  it('retains engine and sensitive surfaces even when explicitly matched', () => {
+    for (const file of ['scripts/merge-ai-prs.mjs', '.github/workflows/build.yml', '.env', 'scripts/lib/github-auth-policy.mjs']) {
+      const result = scoreEscalation({ changedFiles: [file], careExemptPaths: [file], diffLines: 1000 });
+      expect(result.signals.careExempt).toBeUndefined();
+      expect(result.basisFiles).toEqual([file]);
+      expect(result.signals.size).toBe(1000);
+    }
+  });
+
+  it('matches fixture globs while preserving independent signals and human triggers', () => {
+    const file = 'scripts/tools/fixtures/sample.json';
+    const result = scoreEscalation({ changedFiles: [file], diffLines: 1000, crossRepo: true, dismissedFindings: 1 });
+    expect(result.signals.careExempt).toEqual([file]);
+    expect(result.signals.blastRadius).toBeUndefined();
+    expect(result.signals.crossRepo).toBe(true);
+    expect(result.signals.dismissedFindings).toBe(1);
+    expect(scoreEscalation({ changedFiles: [file], deviation: 'declared deviation' }).humanRequired).toBe(true);
+  });
+});
+
+describe('care exemption settings resolver', () => {
+  const broadGlobs = ['scripts/**/*', 'scripts/**/**', 'scripts/*', '**/*', '*/**',
+    'scripts/g*.mjs', 'scripts/[ab]/**', 'scripts/?/file.json', 's*/lib/**'];
+
+  it.each(broadGlobs)('refuses shallow matching scope %s directly and through every settings layer', glob => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(validateCareExemptPaths([glob])).toEqual(DEFAULT_CARE_EXEMPT_PATHS);
+      for (const options of [
+        { readFile: () => JSON.stringify({ careExemptPaths: [glob] }) },
+        { env: { WE_REVIEW_CARE_EXEMPT_PATHS: JSON.stringify([glob]) } },
+      ]) {
+        const result = resolveReviewCareExemptPaths({ env: {}, readFile: () => '{"careExemptPaths":["app/safe.json"]}',
+          log: () => {}, ...options });
+        expect(result.value).toEqual(DEFAULT_CARE_EXEMPT_PATHS);
+        expect(result.sources['']).toBe('standard');
+      }
+      expect(warn).toHaveBeenCalled();
+    } finally { warn.mockRestore(); }
+  });
+
+  it('allows specific files, narrow glob scopes and the explicit fixtures exception', () => {
+    const patterns = ['app.js', 'scripts/tool.mjs', 'scripts/ci/*.json', 'data/generated/**', '**/fixtures/**'];
+    expect(validateCareExemptPaths(patterns)).toEqual(patterns);
+  });
+
+  const resolve = async (options = {}) => {
+    return resolveReviewCareExemptPaths({ env: {}, readFile: () => '{}', log: () => {}, ...options });
+  };
+
+  it.each(['**', '*', 'scripts/**', 'src/**', '**/*.json', '', 4])('refuses unsafe glob %j as a whole list with a warning and built-in fallback', async glob => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const result = await resolve({ readFile: () => JSON.stringify({ careExemptPaths: ['app/safe.json', glob] }) });
+      expect(result.value).toContain(timings);
+      expect(result.value).not.toContain('app/safe.json');
+      expect(result.sources['']).toBe('standard');
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('careExemptPaths'));
+    } finally { warn.mockRestore(); }
+  });
+
+  it('resolves tool then JSON environment overrides and logs provenance', async () => {
+    const log = vi.fn();
+    const readFile = () => JSON.stringify({ careExemptPaths: ['data/generated/**'] });
+    expect((await resolve({ readFile })).value).toEqual(['data/generated/**']);
+    const result = await resolve({ readFile, env: { WE_REVIEW_CARE_EXEMPT_PATHS: '["app/snapshot.json"]' }, log });
+    expect(result.value).toEqual(['app/snapshot.json']);
+    expect(result.sources['']).toBe('env');
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/careExemptPaths.*env/));
+  });
+
+  it('invalid environment JSON falls back to built-in rather than tool exemptions', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const result = await resolve({ readFile: () => '{"careExemptPaths":["app/snapshot.json"]}',
+        env: { WE_REVIEW_CARE_EXEMPT_PATHS: 'invalid' } });
+      expect(result.value).toContain(timings);
+      expect(result.sources['']).toBe('standard');
+      expect(warn).toHaveBeenCalled();
+    } finally { warn.mockRestore(); }
+  });
+});

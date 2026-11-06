@@ -1,5 +1,6 @@
 import { RED_TEAM_STATUS_LABEL_META } from './red-team-status-label-meta.mjs';
 import { proposeHumanRequired } from './direction-aware-human.mjs';
+import { resolveReviewCareExemptPaths, validateCareExemptPaths, matchesCareExemptPath, isProtectedCarePath } from './review-care-exempt-paths.mjs';
 /**
  * review-escalation.mjs — the DETERMINISTIC drain review-escalation rubric (#2171, under #2162).
  *
@@ -682,6 +683,28 @@ export function parseDeviationDisclosure(body) {
   return text === '' ? '(no reason provided)' : text;
 }
 
+/** Count additions/deletions only from complete unified hunks; missing/truncated evidence cannot reduce care. */
+function changedLineCount(section) {
+  if (typeof section !== 'string') return null;
+  let oldLeft = 0, newLeft = 0, count = 0, seen = false;
+  for (const line of section.split('\n')) {
+    const header = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+    if (header) {
+      if (oldLeft || newLeft) return null;
+      oldLeft = Number(header[2] ?? 1);
+      newLeft = Number(header[4] ?? 1);
+      seen = true;
+    } else if (seen && (oldLeft || newLeft)) {
+      if (line.startsWith('+')) { newLeft--; count++; }
+      else if (line.startsWith('-')) { oldLeft--; count++; }
+      else if (line.startsWith(' ')) { oldLeft--; newLeft--; }
+      else if (!line.startsWith('\\')) return null;
+      if (oldLeft < 0 || newLeft < 0) return null;
+    }
+  }
+  return seen && !oldLeft && !newLeft ? count : null;
+}
+
 export function scoreEscalation({
   changedFiles = [],
   diffLines = 0,
@@ -696,6 +719,7 @@ export function scoreEscalation({
   basisNarrowed = true,
   deviation = null,
   humanSurfaces,
+  careExemptPaths = resolveReviewCareExemptPaths().value,
   readOnlyOps = new Set(),
   directionAwareLive = false,
 } = {}) {
@@ -725,7 +749,19 @@ export function scoreEscalation({
   const ownFiles = Array.isArray(changedFiles) ? changedFiles : [];
   // The CUMULATIVE list, exactly as supplied — this and only this is the hunks' basis (#2890 finding 4 below).
   const cumulativeFiles = Array.isArray(humanBasisFiles) ? humanBasisFiles : ownFiles;
-  const basisFiles = unionPaths(cumulativeFiles, ownFiles);
+  const gateBasis = unionPaths(cumulativeFiles, ownFiles);
+  const fileHunksOf = fileHunksResolver(diffHunks);
+  const permissionHits = sensitiveSurfaceHits(gateBasis, fileHunksOf, resolvedSurfaces);
+  // Sensitive surfaces stay in care even when their human category is currently disabled.
+  const sensitiveFiles = new Set(sensitiveSurfaceHits(gateBasis, fileHunksOf,
+    normalizeHumanSurfaces('broad')).map(hit => hit.file));
+  const exemptions = validateCareExemptPaths(careExemptPaths);
+  const exemptFiles = gateBasis.filter(f => !isTrustChainPath(f) && !isEngineTierPath(f)
+    && !isProtectedCarePath(plainDiffPath(f))
+    && !sensitiveFiles.has(f) && matchesCareExemptPath(plainDiffPath(f), exemptions));
+  const exemptSet = new Set(exemptFiles);
+  const basisFiles = gateBasis.filter(f => !exemptSet.has(f));
+  if (exemptFiles.length) signals.careExempt = exemptFiles;
 
   // A trust-chain path ALWAYS escalates (even a relocated engine file that no longer matches `^scripts/`) —
   // isTrustChainPath covers both tiers, so the lander always gets an independent review whether or not it also
@@ -736,15 +772,13 @@ export function scoreEscalation({
 
   // All touch-set gates use the cumulative basis and each file's own hunks. The configured categories
   // decide which principle triggers require human review; inactive triggers still raise AI care via blast-radius.
-  const gateBasis = basisFiles;
   // @invariant human-gate-reads-each-files-own-hunks (#human-is-principle-surface-not-path) — a file is judged against ITS OWN diff section, never the PR's whole text
-  const fileHunksOf = fileHunksResolver(diffHunks);
   const surfaces = gateBasis.map((f) => { const hunks = fileHunksOf(f); return { file: f, hunks, triggers: principleSurfaceTriggers(f, hunks) }; });
   const categoryFor = { 'leash-path': 'gate-self', 'statute-anchor': 'statute', 'marked-invariant': 'marked-invariant' };
   const demoted = {};
   for (const [trigger, category] of Object.entries(categoryFor)) {
     if (resolvedSurfaces.categories.includes(category)) continue;
-    const files = surfaces.filter(x => x.triggers.includes(trigger)).map(x => x.file);
+    const files = surfaces.filter(x => !exemptSet.has(x.file) && x.triggers.includes(trigger)).map(x => x.file);
     if (files.length) {
       demoted[category] = files;
       for (const file of files) if (!blastFiles.includes(file)) blastFiles.push(file);
@@ -770,7 +804,6 @@ export function scoreEscalation({
 
   // Keep one permission-change token so every existing clearance consumer sees the same sensitive holds.
   const otherHumanForced = humanForced;
-  const permissionHits = sensitiveSurfaceHits(gateBasis, fileHunksOf, resolvedSurfaces);
   if (permissionHits.length) {
     humanForced = true;
     signals.permissionChange = [...new Set(permissionHits.map((x) => x.file))];
@@ -814,7 +847,7 @@ export function scoreEscalation({
   //
   // Default `true`: every caller that supplies no flag (including every pre-#3343 one) scores exactly as before.
   // Flagged only when something was actually scored — an empty basis has no verdict to qualify.
-  const basisUntrusted = basisNarrowed === false && basisFiles.length > 0;
+  const basisUntrusted = basisNarrowed === false && gateBasis.length > 0;
   if (basisUntrusted) {
     signals.basisUntrusted = true;
     reasons.push('basis un-narrowed (merge-base unresolved) — the scored file set may include upstream-only changes');
@@ -824,7 +857,17 @@ export function scoreEscalation({
   // monotone rule as the file basis above: a stacked/self-declared base can raise this number, never lower it.
   // Still a CAPACITY dial and never a refusal (#3320) — crossing the threshold adds a reason and lifts the care
   // level, which is what routes more reviewers at it.
-  const scoredDiffLines = Math.max(Number(diffLines) || 0, Number(cumulativeDiffLines) || 0);
+  let scoredDiffLines = Math.max(Number(diffLines) || 0, Number(cumulativeDiffLines) || 0);
+  if (exemptFiles.length) {
+    if (!basisFiles.length) scoredDiffLines = 0;
+    else {
+      // Rename display spellings and the plain target resolve to the same section.
+      // Subtract each section once; an unavailable section still prevents subtraction.
+      const sections = new Set(exemptFiles.map(f => fileHunksOf(f)));
+      const counts = [...sections].map(section => changedLineCount(section));
+      if (counts.every(n => n !== null)) scoredDiffLines = Math.max(0, scoredDiffLines - counts.reduce((a, b) => a + b, 0));
+    }
+  }
   if (scoredDiffLines >= t.diffLines) { signals.size = scoredDiffLines; reasons.push(`size (${scoredDiffLines} ≥ ${t.diffLines} changed lines)`); }
 
   if (Number(dismissedFindings) > 0) { signals.dismissedFindings = Number(dismissedFindings); reasons.push(`dismissed-findings (${dismissedFindings} pre-PR review finding(s) the lane dismissed)`); }
