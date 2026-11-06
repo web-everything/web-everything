@@ -517,17 +517,33 @@ export function deriveCareLevel({ signals = {}, humanRequired = false } = {}) {
  */
 export function plainDiffPath(entry) {
   if (typeof entry !== 'string' || !entry) return entry;
+  const sides = diffPathSides(entry);
+  return sides[sides.length - 1];
+}
+
+/**
+ * ONE numstat display entry → its plain paths: `[old, new]` for a rename, `[path]` otherwise. Same decoding as
+ * `plainDiffPath` (which returns the last element). A rule that must hold for a file wherever it moved — e.g.
+ * "guard, egress and trust-chain files always contribute review care" — checks EVERY side, so renaming a
+ * protected file into an exempt location cannot drop it (#6433 review).
+ * @param {string} entry one `parseNumstat` changed-file entry
+ * @returns {string[]} the plain old and new paths (one element when not a rename)
+ */
+export function diffPathSides(entry) {
+  if (typeof entry !== 'string' || !entry) return [entry];
   // Quoted rename: git quotes each SIDE in full and never uses the brace form when quoting is needed.
   const quotedRename = entry.match(/^(".*")\s=>\s(".*")$/);
-  if (quotedRename) return unquoteGitPath(quotedRename[2]);
+  if (quotedRename) return [unquoteGitPath(quotedRename[1]), unquoteGitPath(quotedRename[2])];
   // Compact brace rename — `<prefix>{<old> => <new>}<suffix>`; either side may be empty. Non-greedy on the old
   // side so the FIRST `{…}` group wins (git emits at most one).
   const braced = entry.match(/^(.*?)\{(.*?) => (.*?)\}(.*)$/);
-  if (braced) return collapseSlashes(`${braced[1]}${braced[3]}${braced[4]}`);
+  if (braced) {
+    return [collapseSlashes(`${braced[1]}${braced[2]}${braced[4]}`), collapseSlashes(`${braced[1]}${braced[3]}${braced[4]}`)];
+  }
   // Plain rename (no quoting, no common prefix/suffix). See the residual above for the ` => `-in-path case.
   const idx = entry.indexOf(' => ');
-  if (idx !== -1) return unquoteGitPath(entry.slice(idx + 4));
-  return unquoteGitPath(entry);
+  if (idx !== -1) return [unquoteGitPath(entry.slice(0, idx)), unquoteGitPath(entry.slice(idx + 4))];
+  return [unquoteGitPath(entry)];
 }
 
 // `dir/{sub => }/thing.md` → `dir/` + `` + `/thing.md` → `dir//thing.md`; git's own rendering of the same
@@ -753,13 +769,20 @@ export function scoreEscalation({
   // @invariant human-gate-reads-each-files-own-hunks (#human-is-principle-surface-not-path) — a file is judged against ITS OWN diff section, never the PR's whole text
   const fileHunksOf = fileHunksResolver(diffHunks);
   const permissionHits = sensitiveSurfaceHits(gateBasis, fileHunksOf, resolvedSurfaces);
+  // Protected rules are judged on EVERY side of an entry — the raw display string and both plain rename paths —
+  // so moving a guard, egress, trust-chain, engine or sensitive file into an exempt location keeps its care.
+  const careSides = f => [...new Set([f, ...diffPathSides(f)])];
   // Sensitive surfaces stay in care even when their human category is currently disabled.
-  const sensitiveFiles = new Set(sensitiveSurfaceHits(gateBasis, fileHunksOf,
+  const sensitiveFiles = new Set(sensitiveSurfaceHits(gateBasis.flatMap(careSides), fileHunksOf,
     normalizeHumanSurfaces('broad')).map(hit => hit.file));
+  const isCareProtected = f => careSides(f).some(side => isTrustChainPath(side) || isEngineTierPath(side)
+    || isProtectedCarePath(side) || sensitiveFiles.has(side));
+  // A plain target alias of a protected rename (`changedFiles` may list both spellings) resolves to the same
+  // diff section, so it must not subtract that section's lines either.
+  const protectedTargets = new Set(gateBasis.filter(isCareProtected).map(plainDiffPath));
   const exemptions = validateCareExemptPaths(careExemptPaths);
-  const exemptFiles = gateBasis.filter(f => !isTrustChainPath(f) && !isEngineTierPath(f)
-    && !isProtectedCarePath(plainDiffPath(f))
-    && !sensitiveFiles.has(f) && matchesCareExemptPath(plainDiffPath(f), exemptions));
+  const exemptFiles = gateBasis.filter(f => !isCareProtected(f) && !protectedTargets.has(plainDiffPath(f))
+    && matchesCareExemptPath(plainDiffPath(f), exemptions));
   const exemptSet = new Set(exemptFiles);
   const basisFiles = gateBasis.filter(f => !exemptSet.has(f));
   if (exemptFiles.length) signals.careExempt = exemptFiles;

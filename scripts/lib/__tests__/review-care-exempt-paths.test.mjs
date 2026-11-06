@@ -50,6 +50,40 @@ describe('R641 care exemptions', () => {
     expect(result.signals.size).toBe(10000);
   });
 
+  // #6433 review: protected rules must hold on BOTH sides of a rename, in every numstat display form.
+  const renameForms = {
+    plain: (from, to) => `${from} => ${to}`,
+    brace: (from, to) => {
+      let i = 0;
+      while (i < from.length && from[i] === to[i]) i += 1;
+      const cut = from.lastIndexOf('/', i - 1) + 1;
+      return `${from.slice(0, cut)}{${from.slice(cut)} => ${to.slice(cut)}}`;
+    },
+    quoted: (from, to) => `"${from}" => "${to}"`,
+  };
+  const protectedSources = ['scripts/guard-bash.mjs', 'scripts/lib/egress-policy.mjs',
+    'scripts/lib/permission-change.mjs', 'scripts/merge-ai-prs.mjs', '.github/workflows/build.yml', '.env'];
+  const exemptTargets = ['data/generated/g.json', 'scripts/lib/__tests__/fixtures/policy.mjs',
+    'scripts/ci/test-timings.json', 'src/_data/referenceIndex.json'];
+  it.each(Object.keys(renameForms).flatMap(form => protectedSources.flatMap(from =>
+    exemptTargets.map(to => [form, from, to]))))('keeps care for a %s rename of %s into exempt %s', (form, from, to) => {
+    const entry = renameForms[form](from, to);
+    for (const changedFiles of [[entry], [entry, to]]) {
+      const diffHunks = `diff --git a/${from} b/${to}\nrename from ${from}\nrename to ${to}\n--- a/${from}\n+++ b/${to}\n`
+        + `@@ -1,500 +1,500 @@\n${'-old\n'.repeat(500)}${'+new\n'.repeat(500)}`;
+      const result = scoreEscalation({ changedFiles, diffLines: 1000, diffHunks });
+      expect(result.signals.careExempt).toBeUndefined();
+      expect(result.basisFiles).toEqual(changedFiles);
+      expect(result.signals.size).toBe(1000);
+      expect(result.careLevel).not.toBe('none');
+    }
+  });
+
+  it('still exempts a rename between two unprotected paths into an exempt location', () => {
+    const entry = 'scripts/ci/{old-timings.json => test-timings.json}';
+    expect(scoreEscalation({ changedFiles: [entry], diffLines: 1000 }).signals.careExempt).toEqual([entry]);
+  });
+
   it('subtracts only exempt per-file changed lines when hunks are available', () => {
     const result = scoreEscalation({ changedFiles: [timings, 'app.js'], diffLines: 1002,
       diffHunks: section(timings, 1000) + section('app.js', 2) });
@@ -156,6 +190,30 @@ describe('care exemption settings resolver', () => {
     expect(result.sources['']).toBe('env');
     expect(log).toHaveBeenCalledWith(expect.stringMatching(/careExemptPaths.*env/));
   });
+
+  // Any invalid layer resets the WHOLE list to built-in: tool valid/invalid × env valid/invalid/absent.
+  const toolLayers = { valid: '{"careExemptPaths":["app/snapshot.json"]}', invalid: '{"careExemptPaths":["**"]}',
+    empty: '{"careExemptPaths":[]}', unparseable: 'not json' };
+  const envLayers = { valid: '["app/env.json"]', invalid: '["scripts/**"]', empty: '[]', unparseable: 'invalid',
+    absent: undefined };
+  const expectedLayer = (tool, env) => {
+    if ([tool, env].some(l => l === 'invalid' || l === 'unparseable')) return [[...DEFAULT_CARE_EXEMPT_PATHS], 'standard'];
+    if (env !== 'absent') return [env === 'valid' ? ['app/env.json'] : [], 'env'];
+    return [tool === 'valid' ? ['app/snapshot.json'] : [], 'tool'];
+  };
+  it.each(Object.keys(toolLayers).flatMap(tool => Object.keys(envLayers).map(env => [tool, env])))(
+    'settings matrix: tool %s × env %s', async (tool, env) => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const envValue = envLayers[env];
+        const result = await resolve({ readFile: () => toolLayers[tool],
+          env: envValue === undefined ? {} : { WE_REVIEW_CARE_EXEMPT_PATHS: envValue } });
+        const [value, source] = expectedLayer(tool, env);
+        expect(result.value).toEqual(value);
+        expect(result.sources['']).toBe(source);
+        expect(warn.mock.calls.length > 0).toBe(source === 'standard');
+      } finally { warn.mockRestore(); }
+    });
 
   it('invalid environment JSON falls back to built-in rather than tool exemptions', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
