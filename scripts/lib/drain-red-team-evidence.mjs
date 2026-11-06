@@ -75,16 +75,29 @@ const unfinishedReview = run => !run.verdict || run.pending != null || hasOpenEf
 // recorded any other verdict (a rejection above all) is only waiting on its effects: a clean result comment that
 // is newer than its start must not release it, because those effects can still apply a send-back.
 const verdictOf = run => (typeof run.verdict === 'string' ? run.verdict : run.verdict?.verdict);
+// A verdict is PRESENT when it is anything but undefined or null: false, 0 and '' are malformed present verdicts, not absent ones.
+const hasVerdict = run => run.verdict !== undefined && run.verdict !== null;
 const undecidedUnfinished = run => {
-  // Any PRESENT verdict this reader does not recognise (an empty object, another key, an array) counts as decided.
-  return (!run.verdict || verdictOf(run) === 'needs-human') && !hasOpenEffect(run);
+  // Any PRESENT verdict this reader does not recognise (an empty object, another key, an array, false, 0, '') counts as decided.
+  return (!hasVerdict(run) || verdictOf(run) === 'needs-human') && !hasOpenEffect(run);
 };
-// R622: a run that blocks comment settlement whatever its start time: a label effect still pending or in flight, or
-// any present verdict other than an accept or the "needs a human" hold (a `changes` rejection above all, and any
-// verdict shape this reader does not recognise, which fails closed). `prevention-outstanding` (every finding already
-// resolved, nothing to send back) is accept-class and is a live verdict, so it never blocks on its own.
-const NON_REJECTING_VERDICTS = ['accept', 'needs-human', 'prevention-outstanding'];
-const blocksSettlement = run => hasOpenEffect(run) || (Boolean(run.verdict) && !NON_REJECTING_VERDICTS.includes(verdictOf(run)));
+// R622: how a record weighs on comment settlement (what the complete same-head read keeps of it):
+//  hard      a label effect still pending or in flight, a rejection still waiting on a step, or a present verdict this
+//            reader does not recognise (fails closed): blocks whatever else exists, whatever its start time.
+//  reject    a finished rejection (`changes`, or any other recognised non-accept string) with no open effect: blocks only
+//            while it is the NEWEST completed review of its head (a later completed accept supersedes it).
+//  accept    a finished accept-class review (`prevention-outstanding`: every finding resolved, nothing to send back).
+//  undecided no verdict yet, or the "needs a human" hold: settleable once quiet, never a completed review.
+const ACCEPT_VERDICTS = ['accept', 'prevention-outstanding'];
+const settleKind = run => {
+  if (hasOpenEffect(run)) return 'hard';
+  if (!hasVerdict(run)) return 'undecided';
+  const verdict = verdictOf(run);
+  if (typeof verdict !== 'string' || verdict === '') return 'hard';
+  if (verdict === 'needs-human') return 'undecided';
+  if (ACCEPT_VERDICTS.includes(verdict)) return run.pending != null ? 'undecided' : 'accept';
+  return run.pending != null ? 'hard' : 'reject';
+};
 // What the complete read keeps of a record: never its payload. Cached per (read function, dir, id) with the mtime and
 // size it was read at, so a settle attempt that keeps holding does not re-parse the whole store every tick; a rewrite
 // changes mtime or size and replaces the entry (bounded by the number of records, not by the number of rewrites).
@@ -95,18 +108,24 @@ const summaryCache = new WeakMap();
 const strictPr = value => (Number.isSafeInteger(value) && value > 0 ? value : typeof value === 'string' && /^[1-9]\d*$/.test(value.trim()) ? Number(value.trim()) : NaN);
 const cleanRev = value => (typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value) ? value.toLowerCase() : null);
 const summarizeRun = run => ({ review: run?.op === 'review-pr', repo: typeof run?.input?.repo === 'string' ? run.input.repo.trim().toLowerCase() : undefined,
-  pr: strictPr(run?.input?.pr), rev: cleanRev(run?.findings?.read?.netBasis?.rev), blocks: blocksSettlement(run) });
+  pr: strictPr(run?.input?.pr), rev: cleanRev(run?.findings?.read?.netBasis?.rev), kind: settleKind(run), startedAt: reviewStartedAt({ run }) });
 // R622: settlement needs a COMPLETE same-PR, same-head read. Run ids carry no PR, so this parses every review-pr
-// record (no parse cap: the bounded scan cannot vouch for what it did not read) and keeps only the summary. Any
-// record of this PR whose head is this head, or whose head cannot be read, that blocks settlement holds; any record
-// that cannot be listed, statted, read or attributed to a PR fails closed.
-function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat }) {
+// record (no parse cap: the bounded scan cannot vouch for what it did not read) and keeps only the summary. Over the
+// records of this PR whose head is this head (or whose head cannot be read):
+//  - a `hard` record (open label effect, pending rejection, unrecognised verdict) holds, as does any head-less
+//    blocking record, whose place among the heads cannot be ordered;
+//  - an undecided record still inside the abandon horizon (a review that may be running) holds;
+//  - otherwise only the NEWEST completed same-head review decides: a finished rejection holds while it is the newest,
+//    and a later completed accept of the same head supersedes it. Newest is by read-step start, else by record mtime.
+// Any record that cannot be listed, statted, read or attributed to a PR fails closed.
+function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now }) {
   const incomplete = { complete: false, blocked: false };
   try {
     const cache = summaryCache.get(read) ?? summaryCache.set(read, new Map()).get(read);
     const want = String(head).toLowerCase(), wantRepo = String(repo).trim().toLowerCase();
     // Same id universe as the bounded scan and every other review-run reader: the `review-pr-` id minted for the op.
     // A review run given another id by `--run-id` is invisible to all of them before settlement is ever asked.
+    let newest = null; // the newest completed review of this exact head: { at, rejects }
     for (const id of list(runsDir).filter(id => id.startsWith('review-pr-'))) {
       const st = stat(join(runsDir, `${id}.json`));
       if (!Number.isFinite(st?.mtimeMs)) return incomplete;
@@ -120,9 +139,22 @@ function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat }) {
       if (!s.review) continue;
       if (typeof s.repo !== 'string' || !s.repo || !Number.isFinite(s.pr)) return incomplete;
       if (s.repo !== wantRepo || s.pr !== Number(pr)) continue;
-      if ((s.rev === null || s.rev === want) && s.blocks) return { complete: true, blocked: true };
+      if (s.rev !== null && s.rev !== want) continue;
+      if (s.kind === 'hard') return { complete: true, blocked: true };
+      if (s.kind === 'undecided') {
+        if (!(now - st.mtimeMs >= ABANDONED_REVIEW_AFTER_MS)) return { complete: true, blocked: true }; // maybe still running
+        continue;
+      }
+      if (s.rev === null) { // a damaged head cannot be ordered among the heads: a rejection of it holds, an accept proves nothing
+        if (s.kind === 'reject') return { complete: true, blocked: true };
+        continue;
+      }
+      const at = Number.isFinite(s.startedAt) ? s.startedAt : st.mtimeMs; // a tie keeps the rejection: fail closed
+      const rejects = s.kind === 'reject';
+      if (!newest || at > newest.at) newest = { at, rejects };
+      else if (at === newest.at) newest.rejects ||= rejects;
     }
-    return { complete: true, blocked: false };
+    return { complete: true, blocked: newest?.rejects === true };
   } catch { return incomplete; }
 }
 
@@ -166,7 +198,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
   let completeRead = null;
   const completeHeadRead = ({ pr: askedPr, head: askedHead } = {}) => {
     if (Number(askedPr) !== Number(pr) || String(askedHead).toLowerCase() !== String(head).toLowerCase()) return { complete: false, blocked: false };
-    return completeRead ??= completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat });
+    return completeRead ??= completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now });
   };
   const runScan = () => {
     const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, unfinished: null, since: -Infinity, active: -Infinity, undecided: true }]));
@@ -509,8 +541,8 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
 // recorded because the accept came by label) or a capped run scan says nothing about a result that is already
 // published. A trusted result comment bound to this exact head (redTeamForHead) is that result; nothing is owed
 // ONLY IF it is newer than the evidence it settles: newer than the start of the unfinished review (a later
-// re-review may still reject), and newer than every unread record of a capped scan (an unread re-review would have
-// been written after it). Breaks are checked by redTeamEnqueueHold BEFORE it reads `ok`, so a recorded break still
+// re-review may still reject). A capped scan's unread records are covered by the complete same-head read instead.
+// Breaks are checked by redTeamEnqueueHold BEFORE it reads `ok`, so a recorded break still
 // sends back. Every other unknown reason, any missing bound, and any head without a trusted result comment stays
 // unknown (fail closed).
 // The settling result's own time is the NEWEST trusted comment for this exact head, the one redTeamForHead returns.
@@ -518,10 +550,10 @@ const newestResultComment = (comments, pr, head) => (Array.isArray(comments) ? c
   .map((c, i) => ({ c, i, parsed: isTrustedMarkerAuthor(c) ? parseRedTeamComment(typeof c === 'string' ? c : c?.body) : null }))
   .filter(x => x.parsed && x.parsed.pr === Number(pr) && x.parsed.rev === String(head).toLowerCase())
   .sort((a, b) => (Date.parse(commentCreatedAt(a.c)) || 0) - (Date.parse(commentCreatedAt(b.c)) || 0) || a.i - b.i).at(-1)?.c;
-// An unread record cannot be inspected, so a rejection it recorded whose label effect is still open is invisible
-// (its mtime stays at the time it was written, before the comment). Beyond the mtime slack, the comment must
-// therefore also be a whole abandon-horizon newer than that record, so only a record that has been quiet that
-// long, and is no longer a live review, can be settled past. Anything fresher stays held (fail closed).
+// review-unfinished only: its bounded scan may also have left records unread, and the settle bound it carries is the
+// unfinished review's, so the comment must be a whole abandon-horizon newer than the first unread record (one that has
+// been quiet that long is no longer a live review). A scan-capped read needs no such margin: the complete read inspects
+// every unread record, holding on any open effect, rejection or review that may still be running.
 export const UNREAD_SETTLE_MARGIN_MS = RUN_MTIME_SLACK_MS + ABANDONED_REVIEW_AFTER_MS;
 export const COMMENT_SETTLEABLE_REASONS =Object.freeze(['review-unfinished', RUN_SCAN_CAPPED.reason]);
 export function settleUnknownEvidenceByComment(evidence, comments, pr, head) {
@@ -540,7 +572,9 @@ export function settleUnknownEvidenceByComment(evidence, comments, pr, head) {
   if (evidence.reason === 'review-unfinished') {
     if (!(at > bounds.unfinishedStartedAt)) return evidence;
     if ('unreadBoundaryAt' in bounds && !(at > bounds.unreadBoundaryAt + UNREAD_SETTLE_MARGIN_MS)) return evidence;
-  } else if (!(at > bounds.unreadBoundaryAt + UNREAD_SETTLE_MARGIN_MS) || !(at > bounds.unfinishedStartedAt)) return evidence;
+  } else if (!(at > bounds.unfinishedStartedAt)) return evidence;
+  // scan-capped: the complete same-head read below covers every unread record (a rejection or open effect holds, and a
+  // same-head review that may still be running holds), so the unread boundary needs no margin of its own here.
   // The bounded scan cannot vouch for a same-head rejection (or its pending label effect) it did not read: only a
   // complete same-PR, same-head read with nothing blocking settles; no such read, or an incomplete one, stays held.
   let complete = null;
