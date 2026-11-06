@@ -384,6 +384,24 @@ describe('stale owed resumes (R618)', () => {
     expect(classifyStaleOwed({ owed, prFacts, nowMs: T0 + 60_000 })).toEqual([]);
   });
 
+  it.each([
+    ['empty ciFailures (clean previous-CI gate)', { ready: { ciFailures: [] } }],
+    ['no ready block', {}],
+    ['inventory already handed off with a green resume', { failuresHandedOff: true, ready: { ciFailures: ['unit'] } }],
+  ])('retires a moved-head green wait whose previousCi holds no pending failure: %s', (_n, previousCi) => {
+    const owed = [entry('clean', 1, 0, { previousCi })];
+    expect(classifyStaleOwed({ owed, prFacts: new Map([['clean', { open: true, headSha: 'b'.repeat(40) }]]), nowMs: T0 + 60_000 })).toEqual(['clean']);
+  });
+
+  it('clean previousCi on an obsolete wait releases the admission slot to a live waiter', async () => {
+    const stale = entry('stale-clean', 1, 0, { previousCi: { ready: { ciFailures: [] } } });
+    const live = entry('live', 2, 1000);
+    const h = harness([stale, live], (_repo, pr) => ({ open: true, headSha: (pr === 1 ? 'b' : 'a').repeat(40) }));
+    const out = await h.pass(1);
+    expect(out.cleared).toEqual([stale.key]);
+    expect(out.admitted).toEqual(['live']);
+  });
+
   it('keeps a moved-head record that holds previousCi failure inventory', () => {
     const owed = [entry('inv', 1, 0, { previousCi: { ready: { ciFailures: ['unit'] } } })];
     expect(classifyStaleOwed({ owed, prFacts: new Map([['inv', { open: true, headSha: 'b'.repeat(40) }]]), nowMs: T0 + 60_000 })).toEqual([]);
@@ -500,6 +518,7 @@ describe('stale owed resumes (R618)', () => {
     ['equal request time', {}, { requestedAt: new Date(T0).toISOString() }, false],
     ['earlier request time', {}, { requestedAt: new Date(T0 - 1000).toISOString() }, false],
     ['superseded waiter holds previousCi inventory', { previousCi: { ready: { ciFailures: ['unit'] } } }, {}, false],
+    ['superseded waiter has clean previousCi (no failures)', { previousCi: { ready: { ciFailures: [] } } }, {}, true],
     ['superseded waiter lacks repo', { repo: undefined }, { repo: undefined }, false],
     ['superseded waiter lacks sha', { sha: undefined }, {}, false],
   ])('supersession eligibility: %s', (_name, oldExtra, newerExtra, retires) => {

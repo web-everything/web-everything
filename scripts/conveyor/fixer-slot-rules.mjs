@@ -121,7 +121,8 @@ export const STALE_HEAD_GRACE_MS = 60_000;
 
 /** Stale owed keys. PR facts are a Map keyed by record key; unknown facts retain the record.
  * Only an explicitly closed PR, an open PR whose readable head sha differs from the record's (any session), or a valid, strictly newer, different SHA in the same repo/PR, kind and session lineage
- * retires a wait. Preserve pending previousCi failure inventory even after PR closure; normal cleanup may still need its repair handoff.
+ * retires a wait. Preserve pending previousCi failure inventory (previousCiFailurePending) even after PR closure or a moved head; normal cleanup may still need its repair handoff.
+ * Clean previousCi metadata (empty or already handed-off inventory, as the pushAfterCi gate writes on success) never keeps an obsolete wait.
  * When either session id is missing, lineage requires both the same lane and worker name.
  * `records` may include newer waits that have not yet become owed. */
 export function classifyStaleOwed({ owed, prFacts = new Map(), records = owed, nowMs = Date.now() }) {
@@ -131,8 +132,8 @@ export function classifyStaleOwed({ owed, prFacts = new Map(), records = owed, n
     && f.headSha.toLowerCase() !== r.sha.toLowerCase();
   return owed.filter(({ key, record: r }) => (prFacts.get(key)?.open === false && !previousCiFailurePending(r))
     // Any session: an owed wait for a sha that is no longer the open PR's head is obsolete. Unreadable head keeps it.
-    || (!r.previousCi && movedHead(r, prFacts.get(key)))
-    || (!r.previousCi && records.some(({ record: newer }) => isHarnessRecord(newer) && r.repo && r.pr && r.sha
+    || (!previousCiFailurePending(r) && movedHead(r, prFacts.get(key)))
+    || (!previousCiFailurePending(r) && records.some(({ record: newer }) => isHarnessRecord(newer) && r.repo && r.pr && r.sha
       && newer.repo === r.repo && newer.pr === r.pr && newer.sha.toLowerCase() !== String(r.sha).toLowerCase()
       && newer.kind === r.kind
       && (r.sessionId && newer.sessionId
