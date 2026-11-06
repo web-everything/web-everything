@@ -397,12 +397,45 @@ describe('salvageLane (real git)', () => {
     expect(isSalvageLanded(rec, { repoDir: lane })).toBeNull();
   });
 
+  it('a nested LINKED-WORKTREE checkout (gitdir + commondir) keeps its staged v1 blob after the stray clone AND its parent repo are deleted', () => {
+    const parent = join(root, 'parent-repo');
+    execFileSync('git', ['init', '-q', '-b', 'main', parent]);
+    for (const [k, v] of [['user.name', 't'], ['user.email', 't@t'], ['commit.gpgsign', 'false']]) git(parent, 'config', k, v);
+    writeFileSync(join(parent, 'seed.txt'), 'seed\n'); git(parent, 'add', '.'); git(parent, 'commit', '-qm', 'seed');
+    const nested = join(lane, 'scratch');
+    git(parent, 'worktree', 'add', '-q', '--detach', nested);
+    writeFileSync(join(nested, 'notes.txt'), 'v1 staged\n'); git(nested, 'add', 'notes.txt');
+    writeFileSync(join(nested, 'notes.txt'), 'v2 working tree\n');
+
+    const rec = salvageLane({ dir: lane, lane: 5, pool: 'p', branchRef: 'origin/main', salvageRoot, now: new Date('2026-09-27T02:00:00Z') });
+    const dest = join(rec.outDir, 'lane-5.nested-repos', 'scratch');
+    expect(rec.nestedRepos).toEqual([{ rel: 'scratch', dest, gitdir: `${dest}.gitdir`, commondir: `${dest}.commondir` }]);
+    git(lane, 'clean', '-ffd', '--quiet');
+    rmSync(parent, { recursive: true, force: true });
+    expect(existsSync(nested)).toBe(false);
+    expect(git(root, '--git-dir', `${dest}.gitdir`, 'show', ':notes.txt')).toBe('v1 staged');
+    expect(isSalvageLanded(rec, { repoDir: lane })).toBeNull();
+  });
+
+  it('a nested repo borrowing objects via alternates (clone --shared) aborts the whole salvage: THROWS, writes no index record, leaves the nested repo in place', () => {
+    const parent = join(root, 'parent-repo');
+    execFileSync('git', ['init', '-q', '-b', 'main', parent]);
+    for (const [k, v] of [['user.name', 't'], ['user.email', 't@t'], ['commit.gpgsign', 'false']]) git(parent, 'config', k, v);
+    writeFileSync(join(parent, 'seed.txt'), 'seed\n'); git(parent, 'add', '.'); git(parent, 'commit', '-qm', 'seed');
+    const nested = join(lane, 'scratch');
+    execFileSync('git', ['clone', '-q', '--shared', parent, nested], { stdio: 'ignore' });
+    expect(existsSync(join(nested, '.git', 'objects', 'info', 'alternates'))).toBe(true);
+    expect(() => salvageLane({ dir: lane, lane: 5, pool: 'p', branchRef: 'origin/main', salvageRoot, now: new Date('2026-09-27T02:00:00Z') })).toThrow(/alternates/);
+    expect(existsSync(join(salvageRoot, 'index.jsonl'))).toBe(false);
+    expect(existsSync(join(nested, 'seed.txt'))).toBe(true);
+  });
+
   it('externalGitdir fails closed: an unparseable pointer, a missing target or a non-directory target THROWS; a real .git dir or an in-tree target needs no extra copy', () => {
     const mk = (name) => { const d = join(root, name); mkdirSync(d); return d; };
     const garbage = mk('garbage'); writeFileSync(join(garbage, '.git'), 'not a pointer\n');
     expect(() => externalGitdir(garbage)).toThrow(/not a "gitdir: <path>" pointer/);
     const missing = mk('missing'); writeFileSync(join(missing, '.git'), 'gitdir: ../no-such-gitdir\n');
-    expect(() => externalGitdir(missing)).toThrow();
+    expect(() => externalGitdir(missing)).toThrow(/no-such-gitdir/);
     const notDir = mk('notdir'); writeFileSync(join(root, 'afile'), 'x'); writeFileSync(join(notDir, '.git'), 'gitdir: ../afile\n');
     expect(() => externalGitdir(notDir)).toThrow(/not a directory/);
     const real = mk('real'); git(real, 'init', '-q');

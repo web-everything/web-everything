@@ -47,7 +47,7 @@ import {
   readFileSync, readdirSync, lstatSync, copyFileSync, symlinkSync, readlinkSync, constants as fsConstants,
 } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
-import { join, resolve, sep, dirname } from 'node:path';
+import { join, resolve, sep, dirname, relative } from 'node:path';
 import { LEASE_FILENAME } from './lane-lease.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs } from './lane-git-hardening.mjs';
 
@@ -477,9 +477,15 @@ function copyLitterTreeSync(src, dest) {
  * THROWS, so `salvageLane` aborts and the caller never resets/deletes a clone whose staged objects were not saved.
  */
 export function externalGitdir(repoDir) {
+  const g = nestedGitdir(repoDir);
+  return g.external ? g.dir : null;
+}
+
+/** The directory holding a nested repo's git metadata, and whether it lies outside the nested tree. */
+function nestedGitdir(repoDir) {
   const dotGit = join(repoDir, '.git');
   const st = lstatSync(dotGit);
-  if (st.isDirectory()) return null;
+  if (st.isDirectory()) return { dir: dotGit, external: false, rel: '.git' };
   let target;
   if (st.isSymbolicLink()) {
     target = realpathSync(dotGit);
@@ -491,7 +497,31 @@ export function externalGitdir(repoDir) {
   if (!statSync(target).isDirectory()) throw new Error(`nested repo ${repoDir}: gitdir ${target} is not a directory — not salvaging`);
   target = realpathSync(target);
   const root = realpathSync(repoDir);
-  return target === root || target.startsWith(root + sep) ? null : target;
+  const external = !(target === root || target.startsWith(root + sep));
+  return { dir: target, external, rel: external ? null : relative(root, target) };
+}
+
+/**
+ * Fail-closed check of one nested repo's metadata, returning the common dir to copy too (or null). A linked
+ * worktree's gitdir (`<repo>/.git/worktrees/x`) holds only HEAD + index; its objects and refs live in the dir its
+ * `commondir` file names, so copying the gitdir alone would lose the staged blobs. A repo whose objects depend on
+ * `objects/info/alternates` (`git clone --shared|--reference`) keeps them in ANOTHER repo that is not copied, so
+ * the salvage would be incomplete — THROW rather than report a salvage that cannot restore the work.
+ */
+export function nestedGitMeta(repoDir) {
+  const g = nestedGitdir(repoDir);
+  const guardAlternates = (d) => {
+    if (existsSync(join(d, 'objects', 'info', 'alternates'))) throw new Error(`nested repo ${repoDir}: ${d} borrows objects via objects/info/alternates — not salvaging`);
+  };
+  guardAlternates(g.dir);
+  let commondir = null;
+  const cf = join(g.dir, 'commondir');
+  if (existsSync(cf)) {
+    commondir = realpathSync(resolve(g.dir, readFileSync(cf, 'utf8').trim()));
+    if (!statSync(commondir).isDirectory()) throw new Error(`nested repo ${repoDir}: commondir ${commondir} is not a directory — not salvaging`);
+    guardAlternates(commondir);
+  }
+  return { gitdir: g.external ? g.dir : null, inTreeRel: g.external ? null : g.rel, commondir };
 }
 
 /**
@@ -557,12 +587,19 @@ export function salvageLane({ dir, lane, pool, branchRef, salvageRoot = resolveS
     // A `.git` pointer file leads OUTSIDE the tree (e.g. <clone>/.git/nested-db): the verbatim copy alone would
     // keep only the pointer and lose every staged object once the stray clone is deleted. Resolve it BEFORE any
     // copy so an unresolvable pointer aborts the salvage with nothing half-written for this repo.
-    const gitdir = externalGitdir(src);
+    const { gitdir, inTreeRel, commondir } = nestedGitMeta(src);
     copyLitterTreeSync(src, dest);
-    if (!gitdir) return { rel, dest };
-    const gitdirDest = `${dest}.gitdir`;
-    copyLitterTreeSync(gitdir, gitdirDest);
-    return { rel, dest, gitdir: gitdirDest };
+    const out = { rel, dest };
+    if (gitdir) { out.gitdir = `${dest}.gitdir`; copyLitterTreeSync(gitdir, out.gitdir); }
+    if (commondir) {
+      // A linked-worktree gitdir names its common dir relatively; the copy sits elsewhere, so point the copy at
+      // the copied common dir by absolute path (git accepts one) — the salvaged gitdir then opens as a repo.
+      out.commondir = `${dest}.commondir`;
+      copyLitterTreeSync(commondir, out.commondir);
+      const gitdirCopy = out.gitdir || join(dest, inTreeRel);
+      writeFileSync(join(gitdirCopy, 'commondir'), `${out.commondir}\n`);
+    }
+    return out;
   }));
   // #4273 — copy every unregistered `.claude/worktrees/` item BEFORE the caller's `git clean -fd` can delete
   // it. Mirrors each item's own relative path under `.claude/worktrees/` (never a sanitized/collapsed name),
