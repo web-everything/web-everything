@@ -233,8 +233,10 @@ export function declareForceCarry({ root, env = process.env, fromSha, toSha = nu
  *  An unsmoked-successor adoption must fail closed when this holds and the carry intent could not be declared: the watch would be
  *  left on a superseded sha and erased, dropping automatic rollback protection for the unverified code. */
 export function forceWatchGuards({ root, env = process.env, sha }) {
+  if (!sha) return false;
   const watch = currentWatch(root, env);
-  return Boolean(watch && sha && (watch.sha === sha || watch.carryTo === sha));
+  if (watch) return watch.sha === sha || watch.carryTo === sha;
+  return watchUnreadable(root, env); // fail closed: an unreadable watch file may be an open one (same rule as forceBlockedReason)
 }
 
 /** Move a watch that declared `carryTo` onto that successor: same last-good, ticks left and owed-rollback marker (on disk and in memory),

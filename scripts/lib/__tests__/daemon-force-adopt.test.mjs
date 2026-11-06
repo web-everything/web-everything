@@ -370,6 +370,11 @@ describe('carryForceWatch: a successor adopted without its own smoke inherits th
     declareForceCarry({ root, env, fromSha: 'b'.repeat(40), toSha: 'd'.repeat(40) });
     expect(forceWatchGuards({ root, env, sha: 'd'.repeat(40) })).toBe(true);
   });
+  it('forceWatchGuards fails closed on an unreadable watch file, but not on a missing one', async () => {
+    await rec();
+    writeFileSync(join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(root)}.force-watch.json`), '{corrupt');
+    expect(forceWatchGuards({ root, env, sha: 'b'.repeat(40) })).toBe(true);
+  });
   it('does nothing for a watch of another build, no watch, or the same sha', async () => {
     expect(await carryForceWatch({ root, env, fromSha: 'b'.repeat(40), toSha: 'd'.repeat(40) })).toBe(false);
     await rec();
