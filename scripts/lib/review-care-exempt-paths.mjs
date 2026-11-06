@@ -12,7 +12,8 @@ export const DEFAULT_CARE_EXEMPT_PATHS = Object.freeze([
   'src/_data/referenceIndex.json',
   '**/fixtures/**',
 ]);
-const SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'review.json');
+export const MAX_CARE_EXEMPT_GLOB_LENGTH = 200;
+const SETTINGS_FILE =join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'review.json');
 const logged = new Set();
 const logOnce = message => {
   if (!logged.has(message)) { logged.add(message); console.error(message); }
@@ -38,6 +39,10 @@ export function validateCareExemptPaths(value, { warn = m => console.warn(m) } =
     // whitespace, control and format characters) is refused rather than enumerated (#6433 red team).
     if (!/^[A-Za-z0-9._\-/*?]+$/.test(glob) || glob.startsWith('/')
       || glob.split('/').some(s => s === '..' || s === '.' || !s)) return false;
+    // Resource bound: PR authors pick the matched path names, so a pattern with many wildcard runs (`*a*a*a…b`)
+    // can backtrack for seconds per path. Bound the length, one wildcard run per segment, three in all.
+    const runs = segment => (segment.match(/[*?]+/g) || []).length;
+    if (glob.length > MAX_CARE_EXEMPT_GLOB_LENGTH || glob.split('/').some(s => runs(s) > 1) || runs(glob) > 3) return false;
     const wildcard = glob.search(/[*?]/);
     // Count complete literal directories before the first wildcard. Equivalent broad
     // spellings must not evade the scope bound; exact file names remain allowed.

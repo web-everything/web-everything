@@ -892,10 +892,18 @@ export function scoreEscalation({
       const ownLines = Number(diffLines) || 0;
       const cumulativeLines = Number(cumulativeDiffLines) || 0;
       // Exempt lines in one basis, from its own hunks. Rename display spellings and the plain target resolve to
-      // the same section, so each section is counted once; an unavailable or incomplete section subtracts nothing.
-      const exemptLinesIn = (files) => {
-        const counts = [...new Set(files.filter(f => exemptSet.has(f)).map(f => fileHunksOf(f)))].map(changedLineCount);
-        return counts.every(n => n !== null) ? counts.reduce((a, b) => a + b, 0) : 0;
+      // the same section, so each section is counted once. The hunks must PROVABLY describe this basis: every
+      // file's section complete and their total equal to the basis's line count. Otherwise (a missing, binary or
+      // truncated section; or hunks from another basis, such as the base-tip text paired with ancestry counts
+      // when the merge-base lookup failed) nothing is subtracted, so upstream drift on an exempt file can never
+      // hide this PR's own lines (#6433 self-review).
+      const exemptLinesIn = (files, total) => {
+        const sum = list => {
+          const counts = [...new Set(list.map(f => fileHunksOf(f)))].map(changedLineCount);
+          return counts.every(n => n !== null) ? counts.reduce((a, b) => a + b, 0) : null;
+        };
+        if (sum(files) !== total) return 0;
+        return sum(files.filter(f => exemptSet.has(f))) ?? 0;
       };
       const allExempt = (files) => files.length > 0 && files.every(f => exemptSet.has(f));
       // The own delta IS the hunks' basis only when no separate cumulative list was supplied, or when the caller
@@ -904,9 +912,9 @@ export function scoreEscalation({
       // count stays whole unless every own file is exempt (fail closed).
       const ownIsHunkBasis = !Array.isArray(humanBasisFiles) || humanBasisFiles === changedFiles;
       const ownScored = allExempt(ownFiles) ? 0
-        : ownIsHunkBasis ? Math.max(0, ownLines - exemptLinesIn(ownFiles)) : ownLines;
+        : ownIsHunkBasis ? Math.max(0, ownLines - exemptLinesIn(ownFiles, ownLines)) : ownLines;
       const cumulativeScored = allExempt(cumulativeFiles) ? 0
-        : Math.max(0, cumulativeLines - exemptLinesIn(cumulativeFiles));
+        : Math.max(0, cumulativeLines - exemptLinesIn(cumulativeFiles, cumulativeLines));
       scoredDiffLines = Math.max(ownScored, cumulativeScored);
     }
   }
