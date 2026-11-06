@@ -44,7 +44,7 @@ export const FIX_MARKERS = {
     '|| item.index <= review.index',
     '|| (item.head && !sameHeadSha(item.head, pr.headRefOid))) return null;',
     'if (!item.id || !operatorSendBackRearm(pr, { verdictId: pr.comments[item.index].id })) return null;',
-    'return { verdictId: item.id, login: item.login, body: item.body };',
+    'return { verdictId: item.id, login: item.login, body: item.fullBody };',
     // Shared review emission must preserve advisory metadata and the ordinary send-back fallback.
     '...(advisoryReview ? { advisoryReview: { head: advisoryReview.head, reason: advisoryReview.reason,',
     '...(advisoryReview.ciWaived === true ? { ciWaived: true } : {}) } } : {}),',

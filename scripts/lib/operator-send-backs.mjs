@@ -4,6 +4,27 @@ import { isOperatorAuthored, isTrustedMarkerAuthor } from './marker-authorship.m
 const commentsOf = pr => Array.isArray(pr?.comments) ? pr.comments : [];
 // Keep a separator so removal cannot assemble new comment delimiters or evidence references.
 const stripComments = text => String(text ?? '').replace(/<!--[\s\S]*?-->/g, ' ');
+/**
+ * Only text a fixer actually wrote as a claim can resolve a request: blockquoted lines ("> Request 1001 remains
+ * unaddressed.") and fenced code blocks (``` or ~~~ examples of the marker) are references, not coverage.
+ * An unterminated fence runs to the end of the text, as Markdown renders it.
+ */
+function stripQuoted(text) {
+  const out = [];
+  let fence = null;
+  for (const line of String(text ?? '').split(/\r\n?|\n/)) {
+    const open = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+    if (fence) {
+      const close = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(line);
+      if (close && close[1][0] === fence[0] && close[1].length >= fence.length) fence = null;
+      out.push('');
+    } else if (open) {
+      fence = open[1];
+      out.push('');
+    } else out.push(/^ {0,3}>/.test(line) ? '' : line);
+  }
+  return out.join('\n');
+}
 const shaOf = value => /^[a-f0-9]{7,40}$/i.test(String(value ?? '')) ? String(value).toLowerCase() : null;
 // Short and full spellings of the same head must never count as a push.
 const differentHead = (from, to) => {
@@ -27,7 +48,8 @@ export function operatorSendBacks(comments) {
       at: Number.isFinite(time) ? new Date(time).toISOString() : null, login,
       head: /\b(?:at|on) head\s+`?([a-f0-9]{7,40})\b/i.exec(text)?.[1]?.toLowerCase() ?? null,
       etLabel: /~?\b\d{1,2}:\d{2}\s+ET\b/.exec(text)?.[0] ?? null,
-      body: text.slice(0, 4000), index }];
+      // `body` is bounded for review prompts; `fullBody` is what a fixer needs, with nothing cut off.
+      body: text.slice(0, 4000), fullBody: text, index }];
   });
 }
 
@@ -71,7 +93,7 @@ export function openOperatorSendBacks(pr) {
     if (superseded) resolved.add(item.index);
     if (comments.some((c, index) => {
       if (index <= item.index || !isTrustedMarkerAuthor(c)) return false;
-      const text = String(c?.body ?? '');
+      const text = stripQuoted(String(c?.body ?? ''));
       const proseCoverage = index < (next?.index ?? comments.length)
         && /\boperator send(?:-back|back| back)\b/i.test(stripComments(text));
       // A released fixer may put the explicit coverage on fix-end instead of a separate evidence comment.

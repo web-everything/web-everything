@@ -272,3 +272,37 @@ describe('operator re-rulings and legacy fixer evidence', () => {
     expect(openOperatorSendBacks(fixture({ comments: [a, comment('fix', 'web-everything', '21:00', body), b] })).map(x => x.id)).toEqual(['B']);
   });
 });
+
+describe('quoted and fenced references never resolve an operator request', () => {
+  const A = 'aaaaaaaaa', B = 'bbbbbbbbb';
+  const request = comment('1001', 'chalbert', '20:07',
+    `🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\nAt head ${A}: fix the export.`);
+  const release = `🔓 conveyor fix-end — fix claim released\n\n\`fix-1\` released the fix claim at \`${B}\`.\n`;
+  const quote = '> Request 1001 remains unaddressed.\n';
+  const fenced = '\n```\n<!-- addresses-operator-send-back: 1001 -->\n```\n\n~~~text\nRequest 1001 was fixed\n~~~\n';
+  const open = comments => openOperatorSendBacks(fixture({ headRefOid: B, comments })).map(x => x.id);
+  it.each([
+    ['blockquote', release + quote],
+    ['fenced marker + tilde fence', release + fenced],
+    ['both', release + quote + fenced],
+  ])('a trusted fix-end for a new head quoting it (%s) leaves the request open', (_name, body) => {
+    expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual(['1001']);
+  });
+  it('a quoted or fenced marker in fix evidence leaves the request open', () => {
+    const body = `## Fix evidence\nHead: \`${B}\`\n${quote}${fenced}Fixed.`;
+    expect(open([request, comment('fix', 'web-everything', '21:00', body)])).toEqual(['1001']);
+  });
+  it('a real marker line beside a quote and a fence still resolves it', () => {
+    const body = `## Fix evidence\nHead: \`${B}\`\n${quote}${fenced}<!-- addresses-operator-send-back: 1001 -->\nFixed.`;
+    expect(open([request, comment('fix', 'web-everything', '21:00', body)])).toEqual([]);
+    expect(open([request, comment('end', 'web-everything', '21:00', `${release}<!-- addresses-operator-send-back: 1001 -->\n${quote}`)])).toEqual([]);
+  });
+  it('keeps the whole body of a long request for the fixer while the brief body stays bounded', () => {
+    const tail = 'REQUIRED REPAIR AFTER CHAR 4100';
+    const long = comment('1001', 'chalbert', '20:07',
+      `🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\nAt head ${A}: ${'x'.repeat(4200)}\n${tail}`);
+    const [item] = operatorSendBacks([long]);
+    expect(item.body).not.toContain(tail);
+    expect(item.fullBody).toContain(tail);
+  });
+});

@@ -55,7 +55,7 @@ const R618_CHANGE_MANIFEST = {
     "|| item.index <= review.index",
     "|| (item.head && !sameHeadSha(item.head, pr.headRefOid))) return null;",
     "if (!item.id || !operatorSendBackRearm(pr, { verdictId: pr.comments[item.index].id })) return null;",
-    "return { verdictId: item.id, login: item.login, body: item.body };",
+    "return { verdictId: item.id, login: item.login, body: item.fullBody };",
     "advisoryReview = null, reviewAfterFix = null,",
     "if (advisoryReview || reviewAfterFix) {",
     "if ((advisoryReview?.ciWaived !== true || pr.reviewTiming?.startAfter !== 'ci-green') && !reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra })) return;",

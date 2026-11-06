@@ -232,3 +232,13 @@ describe('R618 same-head operator send-back supersedes a finished advisory', () 
     expect(run(held(comments)).refusals[0]?.kind).toBe('already-reviewed-head');
   });
 });
+
+describe('R618 operator send-back route hands the fixer the whole request', () => {
+  it('keeps a required repair that sits after char 4100 of a long send-back body', () => {
+    const tail = 'REQUIRED REPAIR AFTER CHAR 4100';
+    const long = sendBack({ body: `${sendBack().body}\n\n${'x'.repeat(4200)}\n${tail}` });
+    const [fix] = run(held([advisory(HEAD), long])).dispatch;
+    expect(fix).toEqual(expect.objectContaining({ kind: 'fix', mode: 'operator-send-back' }));
+    expect(JSON.stringify(fix)).toContain(tail);
+  });
+});

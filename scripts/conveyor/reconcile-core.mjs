@@ -1618,7 +1618,8 @@ function operatorSendBackAfterReview(pr) {
     || (item.head && !sameHeadSha(item.head, pr.headRefOid))) return null;
   // Reuse the same one-shot consumption check as the existing send-back route, with the original ID type.
   if (!item.id || !operatorSendBackRearm(pr, { verdictId: pr.comments[item.index].id })) return null;
-  return { verdictId: item.id, login: item.login, body: item.body };
+  // `item.body` is bounded for review prompts; the fixer needs every must-fix line.
+  return { verdictId: item.id, login: item.login, body: item.fullBody };
 }
 
 /**
