@@ -223,6 +223,25 @@ describe('R324 elastic remote slot units',()=>{
     expect(await runWithRemoteDecision(f)).toMatchObject({handled:true,exitCode:0});
     expect(f.log.mock.calls.flat().join('')).not.toContain('remote-slot-unreadable');
   });
+  it('a young slot dir holding the torn empty lock.json is initializing, not unreadable',async()=>{
+    const f=fixture(),dir=lockDirFor(f.remoteRoot,'slot-0');
+    mkdirSync(dir,{recursive:true});writeFileSync(join(dir,'lock.json'),'');
+    f.remoteExec.mockResolvedValue({mode:'remote',code:0});
+    expect(await runWithRemoteDecision(f)).toMatchObject({handled:true,exitCode:0});
+    expect(f.log.mock.calls.flat().join('')).not.toContain('remote-slot-unreadable');
+  });
+  it('a corrupt non-empty lock.json and a future-mtime entryless dir both fail closed',async()=>{
+    const corrupt=fixture(),cdir=lockDirFor(corrupt.remoteRoot,'slot-0');
+    mkdirSync(cdir,{recursive:true});writeFileSync(join(cdir,'lock.json'),'{not json');
+    expect(await runWithRemoteDecision(corrupt)).toEqual({handled:false});
+    const future=fixture(),fdir=lockDirFor(future.remoteRoot,'slot-0'),later=new Date(Date.now()+3600000);
+    mkdirSync(fdir,{recursive:true});utimesSync(fdir,later,later);
+    expect(await runWithRemoteDecision(future)).toEqual({handled:false});
+    for(const f of [corrupt,future]){
+      expect(f.remoteExec).not.toHaveBeenCalled();
+      expect(f.log.mock.calls.flat().join('')).toContain('remote-slot-unreadable');
+    }
+  });
   it('an entryless slot dir past the crash grace fails closed',async()=>{
     const f=fixture(),dir=lockDirFor(f.remoteRoot,'slot-0'),old=new Date(Date.now()-60000);
     mkdirSync(dir,{recursive:true});utimesSync(dir,old,old);

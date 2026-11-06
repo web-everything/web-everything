@@ -917,8 +917,12 @@ export async function runWithRemoteDecision({
         // A winner that has made the dir but not yet written lock.json is initializing (as file-locks.reserve
         // treats it): the acquire below sees it held. A corrupt lock.json, or an entryless dir past the grace,
         // is unreadable evidence and still fails closed.
-        const initializing = !existsSync(join(dir,'lock.json')) && ageMs < ENTRYLESS_LOCK_DIR_GRACE_MS;
-        if (present && !initializing && !readLockEntry(remoteRoot,slotPath(n))) throw new Error('Unreadable remote slot');
+        // Same test as file-locks.reserve: no readable entry (absent, or the torn empty file between the
+        // exclusive create and the write) in a young dir. A future mtime (clock skew) is never "young".
+        const entry = present ? readLockEntry(remoteRoot,slotPath(n)) : null;
+        const initializing = present && !entry && ageMs >= 0 && ageMs < ENTRYLESS_LOCK_DIR_GRACE_MS
+          && (!existsSync(join(dir,'lock.json')) || statSync(join(dir,'lock.json')).size === 0);
+        if (present && !entry && !initializing) throw new Error('Unreadable remote slot');
       }
       const blocked=blockedSlots(remoteRoot,cap),slots=Array.from({length:cap},(_,i)=>i).filter(i=>!blocked.has(i));
       slot = tryAcquireRemoteUnits({units,slots,
