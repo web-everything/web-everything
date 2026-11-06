@@ -1913,9 +1913,9 @@
   "scripts/conveyor/soak/breaks/prepare-stamped-needs-you-park.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/quarantine-safety-net-twice-per-tick.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/red-team-deadline-merges-without-result.soak.test.mjs": 1.4,
+  "scripts/conveyor/soak/breaks/stale-owed-resumes-starve-live.soak.test.mjs": 2.2,
   "scripts/conveyor/soak/breaks/red-team-round-cap-never-rulable.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/ruling-answers-unrelated-or-stale-stand-down.soak.test.mjs": 1.4,
-  "scripts/conveyor/soak/breaks/stale-referral-hold-never-resumes.soak.test.mjs": 1.4,
-  "scripts/conveyor/soak/breaks/stale-owed-resumes-starve-live.soak.test.mjs": 2.2
+  "scripts/conveyor/soak/breaks/stale-referral-hold-never-resumes.soak.test.mjs": 1.4
  }
 }
