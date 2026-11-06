@@ -174,7 +174,7 @@ async function prewarmSlots(root,runs,receipts,fs,log) {
     finally{if(pinned)await baseGuard(root,()=>fs.rm(join(root,'active',ownPin),{force:true}),fs);}
   }
 }
-export async function warmTick({root='/srv/forge-base',exec=run,clock=Date.now,fs=filesystem,install=installWarm,runs='/srv/forge-exec',receipts='/srv/forge-receipts',log=message=>process.stderr.write('forge-warm-base: '+String(message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n')}={}) {
+export async function warmTick({root='/srv/forge-base',exec=run,clock=Date.now,fs=filesystem,install=installWarm,runs='/srv/forge-exec',receipts='/srv/forge-receipts',heuristic,onWarn,log=message=>process.stderr.write('forge-warm-base: '+String(message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n')}={}) {
   await baseDirectory(root,fs);
   // The timer's flock serializes ticks. The short base guard is also shared
   // with runner pin creation, closing the prune-vs-prepare race.
@@ -216,7 +216,7 @@ export async function warmTick({root='/srv/forge-base',exec=run,clock=Date.now,f
       // Checkout exactly the tracked regular blobs. No archive extraction,
       // submodule operation, hooks, credentials, or private sibling lookup.
       const inventory=parseGitTree(await git(['ls-tree','-r','-z',sha]));validateTestNames(inventory.map(e=>e.path));
-      const entries=[],excluded=[];
+      const entries=[],excluded=[],credentialWarnings=[];
       for(const entry of inventory.sort((a,b)=>Buffer.compare(a.path,b.path))) {
         const policy=classifyManifestPath(entry.path);
         if((policy.excluded&&!policy.credentialSource)||policy.names.includes('node_modules')) {
@@ -228,10 +228,16 @@ export async function warmTick({root='/srv/forge-base',exec=run,clock=Date.now,f
         const oid=createHash(entry.oid.length===64?'sha256':'sha1').update(`blob ${content.length}\0`).update(content).digest('hex');
         if(oid!==entry.oid)throw new Error('Public blob changed');
         // R321: a name-flagged public file with secret-like content stays out of the base.
-        if(policy.credentialSource&&credentialContentFinding(entry.path,content)){excluded.push(entry.path);continue;}
+        const scanOptions={heuristic,onWarn:rule=>{
+          const file=entry.path.toString('utf8');
+          credentialWarnings.push({file,rule});
+          log(`bundle: credential-warning ${file}: ${rule}`.replace(/[\x00-\x1f\x7f]/g,' '));
+          onWarn?.(file,rule);
+        }};
+        if(policy.credentialSource&&credentialContentFinding(entry.path,content,scanOptions)){excluded.push(entry.path);continue;}
         let dest=Buffer.from(tree);const parts=pathParts(entry.path);
         for(const [i,part] of parts.entries()){dest=bytePath(dest,part);if(i<parts.length-1)await fs.mkdir(dest,{recursive:true,mode:0o755});else await fs.writeFile(dest,content,{flag:'wx',mode:entry.executable?0o755:0o644});}
-        entries.push(manifestEntry(entry.path,content,entry.executable,true));
+        entries.push(manifestEntry(entry.path,content,entry.executable,true,{...scanOptions,onWarn:undefined}));
       }
       const manifest=manifestWire({entries,excluded}),manifestDigest=digestManifest(manifest);
       if(Buffer.byteLength(JSON.stringify(manifest))>LIMIT-16384)throw new Error('Warm manifest bound exceeded: use full shipping');
@@ -252,7 +258,7 @@ export async function warmTick({root='/srv/forge-base',exec=run,clock=Date.now,f
         await fs.rename(pending,join(root,sha));
         await pruneBases(root,fs);
       },fs);
-      await fs.appendFile(join(root,'latency.log'),JSON.stringify({sha,mergeCommitDate,fetchedAt:new Date(fetchedAtMs).toISOString(),readyAt:new Date(readyAtMs).toISOString(),latencyMs:readyAtMs-Date.parse(mergeCommitDate)})+'\n',{mode:0o600});
+      await fs.appendFile(join(root,'latency.log'),JSON.stringify({sha,...(credentialWarnings.length?{credentialWarnings}:{}),mergeCommitDate,fetchedAt:new Date(fetchedAtMs).toISOString(),readyAt:new Date(readyAtMs).toISOString(),latencyMs:readyAtMs-Date.parse(mergeCommitDate)})+'\n',{mode:0o600});
       return ready;
     }catch(error){await fs.rm(pending,{recursive:true,force:true});throw error;}
   };

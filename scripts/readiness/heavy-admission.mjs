@@ -247,6 +247,7 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
   remote: Object.freeze({ enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null, transport: 'rsync',
     // R559: bundle mode needs the Forge mirror's public main fetched within this many minutes (else it falls back to rsync).
     bundle: Object.freeze({ mainMaxAgeMin: 10 }),
+    credentialScan: Object.freeze({ heuristic: 'warn' }),
     maxConcurrent: 8, slotUnitsByKind: Object.freeze({ FULL: 'auto', soak: 'auto', standards: 'auto' }),
     elasticSlots: Object.freeze({ enabled: true }), autoSlotUnits: 3, backoffMs: 120000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15,
     // R475: raise a health event (coroner trigger) when >= stuckMinSlots dead-owner unconfirmed slots are older than stuckAgeMs,
@@ -277,6 +278,7 @@ const ADMISSION_VALID = {
   'priority.mode': (v) => ADMISSION_PRIORITY_MODES.includes(v),
   'priority.repairPatterns': validRepairPatterns,
   'remote.clientPath': (v) => v === null || typeof v === 'string',
+  'remote.credentialScan.heuristic': (v) => v === 'warn' || v === 'refuse',
   'remote.transport': (v) => v === 'rsync' || v === 'git-bundle',
   'remote.bundle.mainMaxAgeMin': (v) => Number.isFinite(v) && v > 0 && v <= 1440,
   'remote.enabled': (v) => typeof v === 'boolean',
@@ -361,7 +363,7 @@ export function privateAdmissionPool(env, checkoutRoot) {
 export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot } = {}) {
   const isPrivate = privateAdmissionPool(env, checkoutRoot);
   const settings = { ...ADMISSION_POLICY_STANDARD, fastScale: { ...ADMISSION_POLICY_STANDARD.fastScale },
-    remote: { ...ADMISSION_POLICY_STANDARD.remote, elasticSlots: { ...ADMISSION_POLICY_STANDARD.remote.elasticSlots }, bundle: { ...ADMISSION_POLICY_STANDARD.remote.bundle } },
+    remote: { ...ADMISSION_POLICY_STANDARD.remote, credentialScan: { ...ADMISSION_POLICY_STANDARD.remote.credentialScan }, elasticSlots: { ...ADMISSION_POLICY_STANDARD.remote.elasticSlots }, bundle: { ...ADMISSION_POLICY_STANDARD.remote.bundle } },
     priority: { ...ADMISSION_POLICY_STANDARD.priority, repairPatterns: [...ADMISSION_POLICY_STANDARD.priority.repairPatterns] } };
   const sources = {}; const invalid = []; const ignored = [];
   for (const [leaf, valid] of Object.entries(ADMISSION_VALID)) {
@@ -470,7 +472,7 @@ export function formatAdmissionPolicy({ settings, sources, ignored = [], invalid
   const values = ['cap', 'fastSlots', 'onTimeout', 'fastScale.maxSlots', 'priority.mode',
     ...Object.keys(ADMISSION_POLICY_STANDARD.remote)
       .filter(key => key !== 'clientPath' || settings.remote?.clientPath != null)
-      .map(key => key === 'elasticSlots' ? 'remote.elasticSlots.enabled' : key === 'bundle' ? 'remote.bundle.mainMaxAgeMin' : `remote.${key}`)]
+      .map(key => key === 'elasticSlots' ? 'remote.elasticSlots.enabled' : key === 'credentialScan' ? 'remote.credentialScan.heuristic' : key === 'bundle' ? 'remote.bundle.mainMaxAgeMin' : `remote.${key}`)]
     .map((leaf) => `${leaf}=${leaf === 'remote.clientPath' ? clientPathForLog(admissionLeaf(settings, leaf)) : admissionObject(admissionLeaf(settings, leaf)) ? JSON.stringify(admissionLeaf(settings, leaf)) : admissionLeaf(settings, leaf)} (${sources[leaf] ?? 'standard'})`);
   return `heavy-admission policy · ${values.join(', ')}${ignored.length ? ` · ignored: ${ignored.join('; ')}` : ''}${invalid.length ? ` · invalid: ${invalid.join('; ')}` : ''}`;
 }
@@ -1062,7 +1064,7 @@ export async function runWithRemoteDecision({
         controller.abort();
       }, timeoutMs);
     });
-    const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, cancelSignal: cancelController.signal, transport: policy.settings.remote.transport, bundleMainMaxAgeMs: policy.settings.remote.bundle.mainMaxAgeMin * 60_000,
+    const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, cancelSignal: cancelController.signal, transport: policy.settings.remote.transport, heuristic: policy.settings.remote.credentialScan.heuristic, bundleMainMaxAgeMs: policy.settings.remote.bundle.mainMaxAgeMin * 60_000,
       onCapabilities: capabilities => writeRunnerCapabilities({ root: remoteRoot, host, capabilities, clock }), onRun: run => recordMarkerRun(executionMarker, {owner, run}) }));
     const result = await Promise.race([remote, timeout, signalPromise]);
     const cancelOnClientSignal = async (signalName) => {

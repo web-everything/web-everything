@@ -31,6 +31,23 @@ beforeEach(async()=>{
   const full=await buildManifest({cwd,env});base={sha:git(['rev-parse','HEAD']).toString().trim(),manifest:manifestWire(full),manifestDigest:full.manifestDigest};
 });
 
+it('threads entropy warnings through full and delta scans while retaining later hard refusals',async()=>{
+  const path='tokens.txt',value='aB3dE5fG7hJ9kL2mN4pQ6rS8';
+  await write(path,`previousPathKey: "${value}"`);commit();
+  git(['update-ref','refs/remotes/origin/main','HEAD']);
+  for(const scan of [buildManifest,options=>buildDeltaManifest({...options,base})]) {
+    const onWarn=vi.fn();
+    const manifest=await scan({cwd,env,heuristic:'warn',onWarn});
+    expect(manifest.entries.some(entry=>entry.path.toString()===path)).toBe(true);
+    expect(onWarn).toHaveBeenCalledWith(path,'high-entropy-previousPathKey');
+    expect((await scan({cwd,env,heuristic:'refuse'})).excluded.map(String)).toContain(path);
+  }
+  await write(path,`previousPathKey: "${value}"\npassword: real`);commit();
+  git(['update-ref','refs/remotes/origin/main','HEAD']);
+  for(const scan of [buildManifest,options=>buildDeltaManifest({...options,base})])
+    expect((await scan({cwd,env,heuristic:'warn'})).excluded.map(String)).toContain(path);
+});
+
 it.each(['selected','timeout','invalid JSON','non-vitest argv','unknown flag','missing argv'])('refuses ignored tests in full/delta and before transport: %s',async fault=>{
   const path='_site/assets/js/__tests__/x.test.ts';
   await write(path,'export {};');await write('.gitignore','_site/\n');

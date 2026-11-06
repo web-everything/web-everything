@@ -399,7 +399,7 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
   }
 }
 
-export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, env=process.env, beginSub=noTiming} = {}) {
+export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, env=process.env, beginSub=noTiming,heuristic,onWarn} = {}) {
   exec=await bindGit({cwd,env,exec});
   if(head!==undefined&&!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(head))throw new Error('Invalid Git HEAD');
   // Neither Git ignores nor Vitest discovery prove that a file is unused:
@@ -569,8 +569,9 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     // Match warm export: pattern-spelling public files stay excluded without
     // aborting unrelated work. The public worktree identity check above still
     // refuses private edits; manifestEntry remains a fail-closed leaf guard.
-    if(credentialSource&&credentialContentFinding(path,content))return {excluded:path};
-    return {entry:manifestEntry(path,content,!!(st.mode & 0o111),indexBlobs.has(path.toString('base64')))};
+    const scanOptions={heuristic,onWarn:rule=>onWarn?.(path.toString('utf8'),rule)};
+    if(credentialSource&&credentialContentFinding(path,content,scanOptions))return {excluded:path};
+    return {entry:manifestEntry(path,content,!!(st.mode & 0o111),indexBlobs.has(path.toString('base64')), {...scanOptions,onWarn:undefined})};
   });
   for (const leaf of leaves) {
     if (leaf?.entry) entries.push(leaf.entry);
@@ -638,7 +639,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       const prefixes = Object.values(SIBLING_PATHS).map(path => Buffer.from(path.slice('../frontierui/'.length)+'/'));
       if (files.some(path => !prefixes.some(prefix => path.subarray(0,prefix.length).equals(prefix)))) throw new Error('Unsupported sibling inventory');
       const siblingDone=beginSub('sibling-inventory');
-      const snapshot = await buildManifest({cwd:siblingRoot,exec,fs,listFiles:async()=>files,trackedOnly:true});
+      const snapshot = await buildManifest({cwd:siblingRoot,exec,fs,listFiles:async()=>files,trackedOnly:true,heuristic,onWarn});
       siblingDone();
       if (!sameSiblingEvidence(await checkSibling(siblingRoot,exec,fs),checked)) throw new Error('Sibling HEAD changed');
       siblings = {frontierui:{sha:checked.sha,roots:checked.roots,entries:snapshot.entries,excluded:snapshot.excluded}};
@@ -686,7 +687,7 @@ export async function rankBases({cwd=process.cwd(),exec=defaultExec,env=process.
 export async function selectBase(options={}) {return (await rankBases(options))[0]??null;}
 const manifestFailure=error=>String(error?.message??error??'Base evidence unavailable').replace(/[\x00-\x1f\x7f-\x9f]/g,' ').slice(0,200)||'Base evidence unavailable';
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
-export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=filesystem,base,head,env=process.env,beginSub=noTiming}={}) {
+export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=filesystem,base,head,env=process.env,beginSub=noTiming,heuristic,onWarn}={}) {
   exec=await bindGit({cwd,env,exec});
   if(!base || digestManifest(base.manifest)!==base.manifestDigest)throw new Error('Base manifest digest mismatch');
   const snapshot=decodeManifest(base.manifest);
@@ -785,7 +786,7 @@ export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=
     } finally {await reader?.close();}
     manifestMode='git-delta';
   } catch {manifestReason ??='base or git evidence unavailable';reuse=undefined;}
-  const manifest=await buildManifest({cwd,exec,fs,head,reuse,env,beginSub});
+  const manifest=await buildManifest({cwd,exec,fs,head,reuse,env,beginSub,heuristic,onWarn});
   // Transfer decisions still compare the complete manifest, including fresh modes.
   const final=new Set(manifest.entries.map(e=>e.path.toString('hex')));
   const deltaPaths=manifest.entries.filter(entry=>{
@@ -918,7 +919,7 @@ async function stageSnapshot({fs,stageDirectory,source:sourceRoot,destination:de
 
 // Shared by the run and presync: one base selection and one delta manifest
 // builder, so both apply identical exclusion and walk checks.
-async function discoverDelta({cwd,exec,fs,env,host,discovery,fetchBaseManifest,head,beginSub=noTiming}) {
+async function discoverDelta({cwd,exec,fs,env,host,discovery,fetchBaseManifest,head,beginSub=noTiming,heuristic,onWarn}) {
   const gitDir=exec[gitBinding]?.dir;
   if(discovery.code!==0)throw new Error('No base capabilities');
   const caps=JSON.parse(protocolText(discovery.stdout,8192));
@@ -946,7 +947,7 @@ async function discoverDelta({cwd,exec,fs,env,host,discovery,fetchBaseManifest,h
     if(selected)break;
   }
   if(!selected)throw lastError;
-  return buildDeltaManifest({cwd,exec,fs,base:selected,head,env,beginSub});
+  return buildDeltaManifest({cwd,exec,fs,base:selected,head,env,beginSub,heuristic,onWarn});
 }
 
 // Presync (card 7515): ship a lane's delta leaves to a per-lane Forge cache
@@ -1076,7 +1077,16 @@ export async function runRemote(options={}) {
   return {...result,timings};
 }
 
-async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, onRun, slotUnits = 1, transport, onCapabilities, bundleMainMaxAgeMs = 600000, log = text=>process.stderr.write(text) } = {}) {
+async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, onRun, slotUnits = 1, transport, onCapabilities, bundleMainMaxAgeMs = 600000, heuristic, log = text=>process.stderr.write(text) } = {}) {
+  const warnings=new Set();
+  const onWarn=(file,rule)=>{
+    const key=JSON.stringify([file,rule]);
+    if(warnings.has(key))return;
+    warnings.add(key);
+    const safe=value=>String(value).replace(/[\x00-\x1f\x7f]/g,' ');
+    log(`bundle: credential-warning ${safe(file)}: ${safe(rule)}\n`);
+    begin('credential-warning')({file,rule});
+  };
   const fallback = (reason, detail) => ({ mode: 'not-started', terminated: true, reason, detail });
   if (!Number.isSafeInteger(slotUnits) || slotUnits < 1 || slotUnits > 256) return fallback('invalid-slot-units');
   argv = normalizeRemoteArgv(argv);
@@ -1150,14 +1160,14 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       // subcommand; their full-ship path retains its existing admission order.
       try {
         if(disableDelta)throw new Error('Full ship selected');
-        delta=await discoverDelta({cwd,exec,fs,env,host,discovery:unwrap(initial[2]),fetchBaseManifest:sha=>ssh('base-manifest',{sha}),head:logicalHead,beginSub});
+        delta=await discoverDelta({cwd,exec,fs,env,host,discovery:unwrap(initial[2]),fetchBaseManifest:sha=>ssh('base-manifest',{sha}),head:logicalHead,beginSub,heuristic,onWarn});
         // Warm-leaf assembly recreates mtimes; coverage freshness needs full ship.
         if (delta.entries.some(entry => entry.path.equals(Buffer.from('coverage/coverage-final.json')))) throw new Error('Coverage inputs require full ship');
         manifest=delta;
         if(delta.manifestMode==='full-scan'){manifestReason=manifestFailure(delta.manifestReason);delta=undefined;}
       } catch(error) {manifestReason=manifestFailure(error);delta=undefined;}
 
-      manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead,env,beginSub});
+      manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead,env,beginSub,heuristic,onWarn});
       log(`manifest: ${delta ? `git-delta (${delta.changedCount} changed of ${delta.baseCount})` : `full-scan (${manifestReason})`}\n`);
       manifestDone({...(!delta?{manifestReason}:{}),substages:[...substages.values].map(([stage,ms])=>({stage,ms:Math.round(ms)}))});
       // Scanners may skip nonexistent paths. Require the entire requested scope
@@ -1239,7 +1249,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       if(useBundle&&!bundleRefusal){
         const planDone=begin('git-bundle-plan');
         bundleDirectory=await makeBundleDirectory();
-        try{bundlePlan=await planBundle({cwd,head:logicalHead,runnerBase:preparation.capabilities.gitBundleBase,exec,directory:bundleDirectory});}
+        try{bundlePlan=await planBundle({cwd,head:logicalHead,runnerBase:preparation.capabilities.gitBundleBase,exec,directory:bundleDirectory,heuristic,onWarn});}
         catch(error){
           bundleRefusal=['bundle-credential-hit','bundle-credential-scan-too-large'].includes(error.code)?error.code:'git-bundle-failed';
           log(`bundle: refused (${bundleRefusal}${error.detail?': '+error.detail:''}); falling back\n`);
@@ -1298,7 +1308,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       if(delta) {
         await finish();
         if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,onCapabilities,bundleMainMaxAgeMs,log});
+        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,onCapabilities,bundleMainMaxAgeMs,heuristic,log});
       }
       if (error.code === 'sibling-inventory-failed') return {mode:'not-started',terminated:true,reason:error.code};
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
@@ -1332,7 +1342,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
           // finish consumed protected prepared state and proved started=false.
           // A fresh full prepare is safe once; disableDelta bounds the retry.
           if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,onCapabilities,bundleMainMaxAgeMs,log});
+          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,onCapabilities,bundleMainMaxAgeMs,heuristic,log});
           for(const timing of timings)if(timing.stage==='rsync')timing.shipMode='delta-then-full';
           return retried;
         }

@@ -44,7 +44,7 @@ async function digestFile(path) {
  * Modes: none (Forge already has `head`), incremental (`^merge-base`), full (no usable base).
  * The caller owns `directory` and removes it.
  */
-export async function planBundle({ cwd, head, runnerBase, exec, directory }) {
+export async function planBundle({ cwd, head, runnerBase, exec, directory, heuristic, onWarn }) {
   if (!REVISION.test(head ?? '')) throw bundleError('invalid-head');
   const git = (args) => exec({ file: 'git', args, cwd });
   let prerequisite = null;
@@ -59,7 +59,7 @@ export async function planBundle({ cwd, head, runnerBase, exec, directory }) {
   if (prerequisite === head) return { mode: 'none', tip: head };
   // R559: the same credential policy as the rsync path, over EVERY commit in the bundled range (a secret
   // committed and later deleted still travels in the pack). Fail closed before any bundle is built or sent.
-  const hit = await scanBundleRange({ cwd, head, prerequisite, exec });
+  const hit = await scanBundleRange({ cwd, head, prerequisite, exec, heuristic, onWarn });
   if (hit) throw bundleError('bundle-credential-hit', `${hit.path}: ${hit.finding}`);
   const file = join(directory, 'git.bundle');
   // R559: bundle the exact scanned sha through a unique temporary ref, never the live HEAD (which may have moved
@@ -118,7 +118,7 @@ const bytes = (value) => Buffer.isBuffer(value) ? value : Buffer.from(value ?? '
  * would carry. Path policy is the manifest's own exclusion policy; content uses its raw token patterns.
  * Returns the first {path, finding} or null; throws bundle-credential-scan-too-large instead of skipping.
  */
-export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs = 20000, maxTotalBytes = 128 * 1024 * 1024 }) {
+export async function scanBundleRange({ cwd, head, prerequisite, exec, heuristic, onWarn, maxBlobs = 20000, maxTotalBytes = 128 * 1024 * 1024 }) {
   // The pack carries the RAW stored objects. --no-replace-objects keeps refs/replace/* from showing the scan a clean substitute.
   const git = (args, input) => exec({ file: 'git', args: ['--no-replace-objects', ...args], cwd, ...(input === undefined ? {} : { input }) });
   const range = prerequisite ? `${prerequisite}..${head}` : head;
@@ -138,7 +138,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
   for (const message of splitNul(bytes(messages.stdout))) {
     // Same scanner as blobs (secret assignments included); a message is plain text.
     let finding = credentialTextFinding(message.toString('latin1')) ?? credentialTextFinding(message.toString('utf8'));
-    try { finding ??= credentialContentFinding(Buffer.from('commit-message.txt'), message); } catch { finding ??= 'content-scan-error'; }
+    try { finding ??= credentialContentFinding(Buffer.from('commit-message.txt'), message, {heuristic,onWarn:rule=>onWarn?.('commit-message',rule)}); } catch { finding ??= 'content-scan-error'; }
     if (finding) return { path: 'commit-message', finding };
   }
   // The formatted log above shows only author/committer/message. Extended headers (multiline gpgsig, mergetag, encoding, ...)
@@ -173,7 +173,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
         const raw = Buffer.from(out.subarray(newline + 1, newline + 1 + Number(size)).toString('latin1').replace(SIGNATURE_ARMOR, 'SIGNATURE-ARMOR'), 'latin1');
         offset = newline + 1 + Number(size) + 1;
         let finding = credentialTextFinding(raw.toString('latin1')) ?? credentialTextFinding(raw.toString('utf8'));
-        try { finding ??= credentialContentFinding(Buffer.from('commit-object.txt'), raw); } catch { finding ??= 'content-scan-error'; }
+        try { finding ??= credentialContentFinding(Buffer.from('commit-object.txt'), raw, {heuristic,onWarn:rule=>onWarn?.('commit-object',rule)}); } catch { finding ??= 'content-scan-error'; }
         if (finding) return { path: 'commit-object', finding };
       }
       group = []; groupBytes = 0;
@@ -246,7 +246,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
       // (binary or unreadable text fails closed as unsupported-text-encoding), plus the raw token patterns.
       for (const { label, path } of blobs.get(sha).values()) {
         let policy = null;
-        try { policy = credentialContentFinding(path, content); } catch { policy = 'content-scan-error'; }
+        try { policy = credentialContentFinding(path, content, {heuristic,onWarn:rule=>onWarn?.(label,rule)}); } catch { policy = 'content-scan-error'; }
         const hit = policy ?? finding;
         if (hit) return { path: label, finding: hit };
       }

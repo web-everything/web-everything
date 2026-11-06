@@ -975,6 +975,21 @@ describe('warm-base tick',()=>{
     const install=vi.fn(async()=>({code:0}));
     return {warm,base,target,gitExec,install,options:{root:target,exec:gitExec,install,clock:()=>now++,fs,runs:join(root,'slots'),receipts:join(root,'receipts')}};
   }
+  it('warmTick warns, records and exports entropy-only public files while excluding later hard findings',async()=>{
+    const value='aB3dE5fG7hJ9kL2mN4pQ6rS8';
+    await fs.writeFile(join(repo,'tokens.txt'),`previousPathKey: "${value}"`);
+    await fs.writeFile(join(repo,'credentials.txt'),`previousPathKey: "${value}"\npassword: real`);
+    git(['add','.']);commit();git(['update-ref','refs/remotes/origin/main','HEAD']);
+    const f=await tickFixture(),log=vi.fn(),onWarn=vi.fn();
+    await f.warm.warmTick({...f.options,heuristic:'warn',log,onWarn});
+    const wire=JSON.parse(await fs.readFile(join(f.target,f.base.sha,'manifest.json'),'utf8'));
+    expect(Buffer.from(wire.paths,'base64').toString().split('\0')).toContain('tokens.txt');
+    expect(Buffer.from(wire.excluded,'base64').toString().split('\0')).toContain('credentials.txt');
+    expect(onWarn).toHaveBeenCalledWith('tokens.txt','high-entropy-previousPathKey');
+    expect(log).toHaveBeenCalledWith('bundle: credential-warning tokens.txt: high-entropy-previousPathKey');
+    const row=JSON.parse((await fs.readFile(join(f.target,'latency.log'),'utf8')).trim());
+    expect(row.credentialWarnings).toContainEqual({file:'tokens.txt',rule:'high-entropy-previousPathKey'});
+  });
   it('warmTick excludes flagged public files with secret-like content and matches full/delta inventories',async()=>{
     const refused={
       'token-patterns.mjs':'const sample = "ghp_abcdefghijklmnopqrstuvwxyz0123";',

@@ -117,11 +117,17 @@ function entropy(text) {
 // A file that fails (scrubbers, docs spelling out secrets) stays
 // excluded, so a run that needs it falls back to the Mac. Returns the first
 // finding or null when clean.
-export function credentialContentFinding(path,content) {
+// Only entropy findings are advisory in warn mode; every other rule stays fail closed.
+function heuristicRefusal(rule,options) {
+  if(options.heuristic!=='warn')return rule;
+  options.onWarn?.(rule);
+  return null;
+}
+export function credentialContentFinding(path,content,options={}) {
   // The SAME normalized name admission used (NFKC, trailing dots/spaces, case), so
   // `token.json.` or fullwidth `.ｊｓｏｎ` cannot dodge the scanner chosen by extension.
   const leaf=classifyManifestPath(path).names.at(-1);
-  if(/\.json$/.test(leaf))return designTokenSecretFinding(content);
+  if(/\.json$/.test(leaf))return designTokenSecretFinding(content,options);
   let text;
   try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return 'unsupported-text-encoding';}
   if(text.includes('\0'))return 'unsupported-text-encoding';
@@ -130,7 +136,10 @@ export function credentialContentFinding(path,content) {
   // YAML/INI/plain-text assignments, including quoted fields and YAML lists.
   // This is a conservative exclusion heuristic, not a parser for arbitrary formats.
   for(const [,field,value] of text.matchAll(/(?:^|[\r\n])[\t ]*(?:-[\t ]+)?["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?[\t ]*[:=][\t ]*([^\r\n]*)/g)) {
-    if(secretField.test(field)&&value.length>=20&&entropy(value)>=3.5)return `high-entropy-${field}`;
+    if(secretField.test(field)&&value.length>=20&&entropy(value)>=3.5) {
+      const finding=heuristicRefusal(`high-entropy-${field}`,options);
+      if(finding)return finding;
+    }
     if(/password|passwd|secret|token|api[_-]?key/i.test(field)) {
       // Only whole, explicit placeholders qualify; expressions and suffixes do not.
       const trimmed=value.trim(),literal=/^(["'])(.*)\1$/.exec(trimmed)?.[2]??trimmed;
@@ -140,7 +149,7 @@ export function credentialContentFinding(path,content) {
   return null;
 }
 // Returns the first secret-like finding, or null when the content is clean.
-export function designTokenSecretFinding(content) {
+export function designTokenSecretFinding(content,options={}) {
   let text;
   try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return 'unsupported-text-encoding';}
   const raw=textFinding(text);
@@ -161,10 +170,16 @@ export function designTokenSecretFinding(content) {
     const value=JSON.parse(literal),decoded=textFinding(value);
     if(decoded)return decoded;
     // Under a tainted container, property names are secret candidates too.
-    if(colon&&stack.at(-1)&&value.length>=20&&entropy(value)>=3.5)return 'high-entropy-nested-key';
+    if(colon&&stack.at(-1)&&value.length>=20&&entropy(value)>=3.5) {
+      const finding=heuristicRefusal('high-entropy-nested-key',options);
+      if(finding)return finding;
+    }
     if(colon) {field=value;continue;}
     const name=field!==undefined&&secretField.test(field)?field:stack.at(-1)?'nested':null;
-    if(name&&value.length>=20&&entropy(value)>=3.5)return `high-entropy-${name}`;
+    if(name&&value.length>=20&&entropy(value)>=3.5) {
+      const finding=heuristicRefusal(`high-entropy-${name}`,options);
+      if(finding)return finding;
+    }
     field=undefined;
   }
   return null;
@@ -178,11 +193,11 @@ export function classifyManifestPath(path) {
   const credentialSource=excluded && !names.some((name,i)=>excludedComponent(name,i===names.length-1,true));
   return {parts,names,excluded,credentialSource};
 }
-export function manifestEntry(path,content,executable,tracked) {
+export function manifestEntry(path,content,executable,tracked,options={}) {
   pathParts(path);
   if(typeof tracked!=='boolean')throw new Error('Missing manifest tracking evidence');
   if(classifyManifestPath(path).credentialSource) {
-    const finding=tracked?credentialContentFinding(path,content):'untracked';
+    const finding=tracked?credentialContentFinding(path,content,options):'untracked';
     if(finding)throw Object.assign(new Error(`Excluded credential-named file ${path.toString('latin1')} (${finding}): use local fallback`),{code:'excluded-source-file'});
   }
   return {path,sha256:sha(content),executable,tracked};

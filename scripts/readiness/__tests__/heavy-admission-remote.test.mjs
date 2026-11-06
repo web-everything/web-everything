@@ -24,7 +24,7 @@ vi.mock('../../lib/container-exec.mjs', async (importOriginal) => ({
 const argv = ['npm', 'run', 'test:unit', '--', 'a file.test.mjs', '$(must-stay-literal)'];
 const remoteDefaults = { enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null,
   slotUnitsByKind:{FULL:"auto",soak:"auto",standards:"auto"},elasticSlots:{enabled:true},autoSlotUnits:3,
-  maxConcurrent:8, backoffMs:120000, backoffFailures:3, maxLoadPerCore:0.8, minFreeRamPct:15, stuckMinSlots:2, stuckAgeMs:600000, stuckSignalEveryMs:600000, transport:'rsync', bundle:{ mainMaxAgeMin:10 } };
+  maxConcurrent:8, backoffMs:120000, backoffFailures:3, maxLoadPerCore:0.8, minFreeRamPct:15, stuckMinSlots:2, stuckAgeMs:600000, stuckSignalEveryMs:600000, transport:'rsync', bundle:{ mainMaxAgeMin:10 }, credentialScan:{ heuristic:'warn' } };
 const testRoots=[];
 afterEach(()=>{for(const root of testRoots.splice(0))rmSync(root,{recursive:true,force:true});});
 const healthyRead=async()=>({sampledAtET:(await import('../forge-exec-run.mjs')).easternTimestamp(Date.now()),
@@ -185,7 +185,7 @@ describe('remote admission policy', () => {
     try {
       const remoteExec = vi.fn(async () => ({ mode: 'remote', code: 23, run: 'run-123456' }));
       await expect(main(['run', `--repo=${root}`, '--', ...command], { remoteExec, readTelemetry:healthyRead })).rejects.toBe(exited);
-      expect(remoteExec).toHaveBeenCalledWith(expect.objectContaining({ argv:expected, cwd: root, signal: expect.any(AbortSignal) }));
+      expect(remoteExec).toHaveBeenCalledWith(expect.objectContaining({ argv:expected, cwd: root, signal: expect.any(AbortSignal), heuristic:'warn' }));
       expect(exit).toHaveBeenCalledWith(23);
       expect(JSON.parse(readFileSync(join(root, 'verify-report.jsonl'), 'utf8'))).toEqual({ location: 'remote', receiptId: 'run-123456', exitCode: 23 });
       // R501: the only thing a remote success may leave in the heavy root is the forgeShare record
