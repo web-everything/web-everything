@@ -55,6 +55,8 @@ import { listSalvage, writeSalvage, clearSalvage, planSalvage, resolveSalvageTun
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 /** Policy limits. `maxReds` counts the record's own `attempt` (the fixer bumps it on each re-mark). */
+/** Longest one load deferral may wait for a quiet host before the red follows the normal ladder (2h). */
+export const AWAIT_LOAD_DEFER_MAX_MS = 2 * 60 * 60_000;
 export const AWAIT_VERIFY_LIMITS = Object.freeze({ maxReds: 3, maxRetries: 2, maxResumeFailures: 3, selfReviewMaxMs: 30 * 60_000 });
 /** Repo keys with a quiet-host reverify worker (mirrors stand-down.mjs#LOAD_FLAKE_REVERIFY_REPOS). */
 export const AWAIT_LOAD_FLAKE_REPO_KEYS = Object.freeze(['we']);
@@ -90,7 +92,9 @@ export function isTimeoutOnlyRed(marker) {
     && details.tests.every(test => typeof test?.file === 'string' && typeof test.name === 'string' && test.timeout === true);
   // A process timeout cannot overrule recorded assertions or incomplete failure evidence.
   if (details !== undefined && !completeTimeoutInventory) return false;
-  return marker.exitCode === 124 || (marker.redCause === 'test-timeout' && completeTimeoutInventory);
+  // A bare exit 124 is only a timeout when no recorded cause names an assertion/in-diff failure.
+  const processTimeout = marker.exitCode === 124 && (marker.redCause === undefined || marker.redCause === null || marker.redCause === 'test-timeout');
+  return processTimeout || (marker.redCause === 'test-timeout' && completeTimeoutInventory);
 }
 
 /**
@@ -125,10 +129,14 @@ export function classifyAwaitVerdict({ record, marker, lane, nowMs, ttlMs, limit
     if (!isNoPushRecord(record) && AWAIT_LOAD_FLAKE_REPO_KEYS.includes(repoKeyOrNull(record.repo)) && isLoadFlakeRed(marker)) return { action: 'resume', reason: 'red-load-flake', resume: 'load-flake' };
     if (!isNoPushRecord(record) && !AWAIT_LOAD_FLAKE_REPO_KEYS.includes(repoKeyOrNull(record.repo)) && isLoadFlakeRed(marker)) return { action: 'resume', reason: 'red-load-flake', resume: 'load-flake-redispatch' };
     if (record.kind === 'fix' && isTimeoutOnlyRed(marker) && (record.loadRetry?.attempts ?? 0) < loadMaxAttempts) {
-      if (record.loadRetry?.waiting) return loadHigh
+      // A deferral is bounded in time too: persistent high load past the cap falls through to the normal red ladder.
+      const since = Date.parse(record.loadRetry?.since ?? '');
+      const expired = record.loadRetry?.waiting && Number.isFinite(since) && nowMs - since > AWAIT_LOAD_DEFER_MAX_MS;
+      if (expired || (record.loadRetry?.waiting && !Number.isFinite(since))) { /* red ladder */ }
+      else if (record.loadRetry?.waiting) return loadHigh
         ? { action: 'wait', reason: 'red-load-deferred' }
         : { action: 'rerequest', reason: 'red-load-shaped', loadRerun: true };
-      if (loadHigh) return { action: 'wait', reason: 'red-load-deferred', loadDefer: 'start' };
+      else if (loadHigh) return { action: 'wait', reason: 'red-load-deferred', loadDefer: 'start' };
     }
     if ((record.attempt ?? 1) >= limits.maxReds) return { action: 'resume', reason: `red on attempt ${record.attempt}`, resume: 'escalate' };
     return { action: 'resume', reason: 'red', resume: 'red' };

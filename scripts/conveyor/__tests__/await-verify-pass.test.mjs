@@ -1185,6 +1185,16 @@ describe('timeout-only load recovery', () => {
     expect(classify({ marker: timeout({ exitCode: 124 }), loadHigh: true })).toMatchObject({ action: 'wait', reason: 'red-load-deferred', loadDefer: 'start' });
     expect(classify({ marker: marker('red', { exitCode: 124 }), loadHigh: true })).toMatchObject({ action: 'wait', reason: 'red-load-deferred', loadDefer: 'start' });
   });
+  it('exit 124 with a recorded in-diff cause is a normal red, not a timeout', () => {
+    expect(classify({ marker: marker('red', { exitCode: 124, redCause: 'in-diff-failure' }), loadHigh: true })).toMatchObject({ action: 'resume', resume: 'red' });
+  });
+  it('a load deferral that outlives the wait cap (or has no start time) follows the red ladder', () => {
+    const waiting = (since) => rec({ kind: 'fix', loadRetry: { attempts: 0, waiting: true, ...(since ? { since } : {}) } });
+    const old = new Date(T0 - 3 * 60 * 60_000).toISOString();
+    expect(classify({ record: waiting(old), marker: timeout({ exitCode: 124 }), loadHigh: true })).toMatchObject({ action: 'resume', resume: 'red' });
+    expect(classify({ record: waiting(null), marker: timeout({ exitCode: 124 }), loadHigh: true })).toMatchObject({ action: 'resume', resume: 'red' });
+    expect(classify({ record: waiting(new Date(T0).toISOString()), marker: timeout({ exitCode: 124 }), loadHigh: true })).toMatchObject({ action: 'wait', reason: 'red-load-deferred' });
+  });
   it.each([
     ['exit 124 with a recorded assertion before timeout', timeout({ exitCode: 124, failureDetails: {
       tests: [{ file: 'a.test.mjs', name: 'slow', timeout: true }, { file: 'b.test.mjs', name: 'assertion' }],
