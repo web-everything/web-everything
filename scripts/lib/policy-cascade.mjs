@@ -55,7 +55,7 @@ function mergeLeaves(base, over) {
 }
 
 /**
- * IO: every platform preference, keyed by policy. routingOverrides is operator-only;
+ * IO: every platform preference, keyed by policy. routingOverrides and findingClasses are operator-only;
  * repo platform copies are ignored with a warning. Never throws.
  * @returns {{prefs:object, errors:string[]}}
  */
@@ -69,9 +69,9 @@ export function readPlatformPreferences({ env = process.env, readFile = readFile
       const data = JSON.parse(String(readFile(path, 'utf8')));
       if (!isObj(data)) { errors.push(`${path}: not a JSON object`); continue; }
       for (const [k, v] of Object.entries(data)) {
-        if (k === 'routingOverrides' && (path !== operatorPreferencesPath(env)
+        if (['routingOverrides', 'findingClasses'].includes(k) && (path !== operatorPreferencesPath(env)
           || [...LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH].some(repoPath => resolve(repoPath) === resolve(path)))) {
-          warn(`policy-cascade: ${path}: ignoring routingOverrides; only the operator-owned preferences file may set it`);
+          warn(`policy-cascade: ${path}: ignoring ${k}; only the operator-owned preferences file may set it`);
           continue;
         }
         // Per-leaf merge: a later file (the operator's) overrides only the leaves it sets; it never drops the
@@ -128,12 +128,23 @@ export function resolveCascade({ standard, platform, tool, envValues = {}, valid
   for (const [name, layer] of [['platform', platform], ['tool', tool]]) {
     if (layer === undefined || layer === null) continue;
     for (const [key, { path, v }] of leaves(layer)) {
+      if (name === 'tool' && path[0] === 'findingClasses') {
+        console.error('policy-cascade: ignoring tool findingClasses; only the operator-owned preferences file may set it');
+        continue;
+      }
       if (!check(path, v)) { invalid.push(`${name}${at(path)}=${JSON.stringify(v)}`); continue; }
       eff.set(key, { path, v, layer: name });
     }
   }
-  for (const [k, v] of Object.entries(envValues ?? {})) {
+  for (const [k, raw] of Object.entries(envValues ?? {})) {
+    let v = raw;
     if (v === undefined) continue;
+    if (k === 'findingClasses' || (k === '' && isObj(v) && Object.hasOwn(v, 'findingClasses'))) {
+      console.error('policy-cascade: ignoring env findingClasses; only the operator-owned preferences file may set it');
+      if (k === 'findingClasses') continue;
+      const { findingClasses: _ignored, ...rest } = v;
+      v = rest;
+    }
     const path = k === '' ? [] : [k];
     if (!check(path, v)) { invalid.push(`env${at(path)}=${JSON.stringify(v)}`); continue; }
     // An env value replaces the whole top-level key (drop the nested leaves it shadows).
@@ -198,6 +209,12 @@ export function logCascadeSources(policy, resolved, { env = process.env, log = (
  *   env?:object, log?:Function}} [o]
  */
 export function cascadePolicy(policy, tool, { standard, envValues, valid, platform, env = process.env, log } = {}) {
+  if (policy === 'findingClasses') {
+    if (tool != null || Object.values(envValues ?? {}).some(v => v !== undefined))
+      console.error('policy-cascade: ignoring tool/env findingClasses; only the operator-owned preferences file may set it');
+    tool = undefined;
+    envValues = {};
+  }
   let plat = platform;
   if (plat === undefined) { try { plat = platformPreference(policy, { env }); } catch { plat = undefined; } }
   const resolved = resolveCascade({ standard, platform: plat, tool, envValues, valid });

@@ -1,3 +1,5 @@
+import { parseRedTeamComment } from '../../lib/red-team-gate.mjs';
+import { FINDING_CLASSES } from '../../lib/finding-class-policy.mjs';
 import { readRoutingPolicy } from '../../lib/dispatch-routing-policy-io.mjs';
 /**
  * #4194 — ADDED NON-CLAUDE REVIEW SEATS: advisory lenses + one extra juror routed to Codex/Gemini through the
@@ -20,7 +22,7 @@ import {
   renderSeatSummary, EXTRA_SEATS_ENV, DAILY_CAP_ENV, DEFAULT_DAILY_CAP, PROVIDER_CAP_ENV, PROVIDER_CAP_DEFAULT,
   resolveProviderCap, reviewSeatCapUsage, toIsoInstant, extractAnswerJson, reserveSeatCalls, createExtraSeatsIo,
   withLedgerLock, isPinnedRev, repoRelativeFindings, readSeatCapUsage,
-  seatAnswerJsonSchema, preserveSeatRawAnswer, buildRedTeamTask, speculateRedTeam, completeRedTeam, buildRedTeamDiscardRow,
+  applyRecheck, RECHECK_SHAPE, renderRedTeamComment, seatAnswerJsonSchema, preserveSeatRawAnswer, buildRedTeamTask, speculateRedTeam, completeRedTeam, buildRedTeamDiscardRow,
 } from '../review-extra-seats.mjs';
 import { runReviewJob, summarizeExtraSeats } from '../review-job.mjs';
 import { ADVISORY_JUDGE_LENS, JUDGE_SEATS } from '../review-pr.mjs';
@@ -1384,7 +1386,7 @@ describe('seat answer extraction — realistic provider replies, fail closed', (
     for (const build of [buildSeatTask, buildRedTeamTask]) {
       const task = build({ pr: 5, repo: REPO, title: 'T', seats, inline: { diffText: 'diff', body: '' } });
       expect(task).toContain('ONLY this single JSON object');
-      expect(task).toContain('Every finding must include all six fields above; summary and impactIfUnfixed must be non-empty strings.');
+      expect(task).toContain(`Every finding must include all ${build === buildSeatTask ? 'six' : 'eight'} fields above; summary and impactIfUnfixed must be non-empty strings.`);
       expect(task).toContain('Include only the requested seat keys under lenses.');
       expect(task).toContain('"line": integer|null');
       expect(task).not.toContain('Only category is optional');
@@ -1394,7 +1396,10 @@ describe('seat answer extraction — realistic provider replies, fail closed', (
         expect(task).toContain('For the red-team seat, category and failure_scenario must be strings, never null.');
       } else {
         expect(task).toContain('"category": string,');
-        expect(task).toContain('"failure_scenario": string}');
+        expect(task).toContain('"failure_scenario": string, "findingClass": string, "classBasis": string}');
+        for (const findingClass of FINDING_CLASSES) expect(task).toContain(findingClass);
+        expect(task).toContain('Unclassified findings block.');
+        expect(task).toContain('security-reachable-today is never deferred unless the operator explicitly allows it.');
         expect(task).toContain('category and failure_scenario must be strings, never null.');
       }
       expect(task).toContain('put NO commentary after it.');
@@ -1427,6 +1432,7 @@ describe('seat answer schemas and provider argv', () => {
     expect(seat.properties.findings.items.properties).toEqual({
       summary: { type: 'string', minLength: 1, pattern: '\\S' }, category: { type: 'string' }, file: { type: ['string', 'null'] },
       line: { type: ['integer', 'null'] }, impactIfUnfixed: { type: 'string', minLength: 1, pattern: '\\S' }, failure_scenario: { type: 'string' },
+      findingClass: { type: 'string', enum: FINDING_CLASSES }, classBasis: { type: 'string' },
     });
     expect(schema.properties.lenses.properties['claim-accuracy'].properties.findings.items.properties).toEqual({
       summary: { type: 'string', minLength: 1, pattern: '\\S' }, category: { type: ['string', 'null'] }, file: { type: ['string', 'null'] },
@@ -1615,5 +1621,31 @@ describe('durable raw seat evidence', () => {
     const discard = buildRedTeamDiscardRow({ pr: 5, repo: REPO, pass, reason: 'cancelled', now: NOW });
     expect(discard.rawAnswerPath).toBe(pass.rawAnswerPath);
     expect(calls.find(call => call[0] === 'seat')[1].schemaFile).toMatch(/task-red-team-codex\.md\.schema\.json$/);
+  });
+});
+
+
+describe('red-team finding classes', () => {
+  it('declares strict required classification fields for seats and re-checks', () => {
+    const f = seatAnswerJsonSchema(['red-team']).properties.lenses.properties['red-team'].properties.findings.items;
+    expect(f.properties.findingClass.enum).toEqual(FINDING_CLASSES);
+    expect(f.required).toEqual(expect.arrayContaining(['findingClass', 'classBasis']));
+    expect(RECHECK_SHAPE.properties.checks.items.required).toEqual(expect.arrayContaining(['findingClass', 'classBasis']));
+  });
+  it('round-trips class and basis, recomputes action and retains classification through seat parsing', () => {
+    const f = { ...VALID_SEAT_FINDING, findingClass: 'theoretical-race', classBasis: 'requires concurrent writes' };
+    const parsed = parseSeatAnswer(answer({ 'red-team': { verdict: 'changes', findings: [f] } }), [{ key: 'red-team' }]);
+    expect(parsed['red-team'].findings[0]).toMatchObject({ summary: f.summary, findingClass: f.findingClass, classBasis: f.classBasis });
+    const body = renderRedTeamComment({ pr: 1, rev: 'a'.repeat(40), provider: 'codex', model: 'm', findings: [f], findingClasses: {} });
+    expect(body).toContain('- Class: theoretical-race → defer-card (basis: requires concurrent writes)');
+    expect(parseRedTeamComment(body).findings[0]).toMatchObject({ findingClass: f.findingClass, classBasis: f.classBasis });
+    expect(renderRedTeamComment({ pr: 1, rev: 'a'.repeat(40), findings: [f], findingClasses: { 'theoretical-race': 'fix-now' } })).toContain('→ fix-now');
+  });
+  it('uses the stricter re-check class, fails closed if absent, and carries the selected basis', () => {
+    const f = { ...VALID_SEAT_FINDING, findingClass: 'theoretical-race', classBasis: 'first basis' };
+    const check = { index: 0, confirmed: true, findingClass: 'live-reproduced', classBasis: 'observed failure' };
+    expect(applyRecheck([f], { checks: [check] })[0]).toMatchObject({ findingClass: 'live-reproduced', classBasis: 'observed failure' });
+    expect(applyRecheck([f], { checks: [{ ...check, findingClass: undefined }] })[0].findingClass).toBeUndefined();
+    expect(applyRecheck([f], { checks: [{ ...check, findingClass: 'coverage-or-style' }] })[0]).toMatchObject({ findingClass: f.findingClass, classBasis: f.classBasis });
   });
 });

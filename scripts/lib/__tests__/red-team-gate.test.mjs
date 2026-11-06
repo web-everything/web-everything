@@ -1,3 +1,5 @@
+import { buildRedTeamCardInput } from '../../operations/red-team-gate-apply.mjs';
+import { createHash } from 'node:crypto';
 /**
  * Card x1b8hlo — the red-team gate's pure half: the parser (pinned against the real renderer and the live #4722
  * comment), the setting cascade, the decision, and the operator-queue reason.
@@ -417,5 +419,90 @@ describe('redTeamResultId digest covers every finding-shaped line (card 43)', ()
     const after = liveResultGateState([bot(added(FORGED[0])), record], 4722, HEAD);
     expect(after.resultId).not.toBe(ID);
     expect(after.outcomes.has(GATE_OUTCOMES.SENT_BACK)).toBe(false);
+  });
+});
+
+
+describe('finding class gate', () => {
+  const classSetting = { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses: {} };
+  const deferredBody = () => BODY_4722.split('2. [**confirmed**]')[0] + '   - Class: theoretical-race → defer-card (basis: requires concurrent replacement)\n';
+  it('preserves an operator block on a class-deferred finding', () => {
+    const body = deferredBody();
+    const parsed = parseRedTeamComment(body);
+    const id = redTeamResultId(parsed);
+    const comments = [bot(body),
+      bot(`${redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.ROUND_CAP, id)}\n- 1 confirmed break(s) NOT sent back: cap (#1).`),
+      { author: { login: 'chalbert' }, createdAt: '2026-10-10T02:05:41Z',
+        body: `${redTeamGateMarker(4722, HEAD, 'operator-block', id)}\n- 1 confirmed break(s) sent back to the fixer (#1).` }];
+    const read = setting => readRedTeamDisposition({ comments, pr: 4722, head: HEAD, setting, env: {} });
+    expect(planRedTeamActions(parsed, classSetting).card).toHaveLength(1);
+    const deferred = read(classSetting);
+    expect(deferred.held).toEqual(parsed.findings);
+    expect(deferred.sendBack).toEqual([]);
+    expect(deferred.dispositions.get(1).state).toBe('held');
+    const fixNow = read({ ...classSetting, findingClasses: { 'theoretical-race': 'fix-now' } });
+    expect(fixNow.held).toEqual(parsed.findings);
+    expect(fixNow.dispositions.get(1).state).toBe('held');
+  });
+  it.each(['security-reachable-today', 'theoretical-race'])('revoking security deferral reopens a recorded class-only card (%s)', findingClass => {
+    const body = deferredBody().replace('Class: theoretical-race', `Class: ${findingClass}`)
+      + '   - Security class: security-reachable-today\n';
+    const parsed = parseRedTeamComment(body);
+    const allowed = { ...classSetting, findingClasses: { 'security-reachable-today': 'defer-card', allowSecurityDefer: true } };
+    expect(planRedTeamActions(parsed, allowed).card).toHaveLength(1);
+    const comments = [bot(body), bot(`${redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.CARD_QUEUED, redTeamResultId(parsed))}\n- 1 finding(s) filed as a follow-up card (#1).`)];
+    const read = (thread, setting) => readRedTeamDisposition({ comments: thread, pr: 4722, head: HEAD, setting, env: {} });
+    expect(read(comments, allowed)).toMatchObject({ sendBack: [], held: [] });
+    const revoked = { ...allowed, findingClasses: { ...allowed.findingClasses, allowSecurityDefer: false } };
+    const reopened = read(comments, revoked);
+    expect(reopened.sendBack).toHaveLength(1);
+    expect(reopened.held).toEqual([]);
+    expect(reopened.dispositions.get(1).state).toBe('open');
+    const capped = [...comments, bot(`${redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.ROUND_CAP, redTeamResultId(parsed))}\n- 1 confirmed break(s) NOT sent back: cap.`)];
+    expect(read(capped, revoked)).toMatchObject({ sendBack: [], held: parsed.findings });
+    expect(read(comments, { ...revoked, broken: 'card' })).toMatchObject({ sendBack: [], held: [] });
+  });
+  it('preserves an unclassified recorded card when ordinary policy now sends back', () => {
+    const body = BODY_4722.split('2. [**confirmed**]')[0];
+    const parsed = parseRedTeamComment(body);
+    const comments = [bot(body), bot(`${redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.CARD_QUEUED, redTeamResultId(parsed))}\n- 1 finding(s) filed as a follow-up card (#1).`)];
+    expect(readRedTeamDisposition({ comments, pr: 4722, head: HEAD, setting: classSetting, env: {} }))
+      .toMatchObject({ sendBack: [], held: [] });
+  });
+  it('cards deferred findings without a send-back or admission hold or operator ruling', () => {
+    const parsed = parseRedTeamComment(deferredBody());
+    expect(parsed.findings[0]).toMatchObject({ findingClass: 'theoretical-race', classBasis: 'requires concurrent replacement' });
+    expect(planRedTeamActions(parsed, classSetting)).toMatchObject({ sendBack: [], card: parsed.findings });
+    const state = readRedTeamDisposition({ comments: [bot(deferredBody())], pr: 4722, head: HEAD, setting: classSetting });
+    expect(state.sendBack).toEqual([]);
+    expect(state.held).toEqual([]);
+    const comments = [bot(deferredBody()), bot(redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.ROUND_CAP, redTeamResultId(parsed)))];
+    expect(readRedTeamDisposition({ comments, pr: 4722, head: HEAD, setting: classSetting }).held).toEqual([]);
+    expect(redTeamRulingNeeded({ comments: [bot(deferredBody())], number: 4722, headRefOid: HEAD }, classSetting)).toBeNull();
+  });
+  it('puts classification in the follow-up card title and digest', () => {
+    const input = buildRedTeamCardInput({ repo: 'owner/repo', pr: 4722, head: HEAD, findings: parseRedTeamComment(deferredBody()).findings });
+    expect(input.title).toContain('theoretical-race');
+    expect(input.digest).toContain('Class: theoretical-race');
+    expect(input.digest).toContain('requires concurrent replacement');
+  });
+  it('does not trust the rendered action, and missing basis or an operator override blocks', () => {
+    const parsed = parseRedTeamComment(deferredBody().replace('→ defer-card', '→ fix-now'));
+    expect(planRedTeamActions(parsed, classSetting).card).toHaveLength(1);
+    expect(planRedTeamActions(parsed, { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses: { 'theoretical-race': 'fix-now' } }).sendBack).toHaveLength(1);
+    delete parsed.findings[0].classBasis;
+    expect(planRedTeamActions(parsed, classSetting).sendBack).toHaveLength(1);
+  });
+  it('keeps old v1/v2 result ids and keys class and basis only in v3', () => {
+    const parsed = parseRedTeamComment(BODY_4722);
+    const fields = ['index', 'confirmed', 'recheckOutcome', 'category', 'impact', 'file', 'line', 'summary', 'scenario', 'recheck'];
+    const rows = parsed.findings.map(f => fields.map(k => f[k] ?? null));
+    expect(redTeamResultId(parsed)).toBe(createHash('sha256').update(JSON.stringify(['v1', rows])).digest('hex').slice(0, 16));
+    const malformed = parseRedTeamComment(BODY_4722 + '\n 3. [confirmed] malformed');
+    expect(redTeamResultId(malformed)).toBe(createHash('sha256').update(JSON.stringify(['v2', rows, malformed.shapedLines])).digest('hex').slice(0, 16));
+    const classified = parseRedTeamComment(deferredBody());
+    const id = redTeamResultId(classified);
+    classified.findings[0].classBasis = 'other basis';
+    expect(redTeamResultId(classified)).not.toBe(id);
   });
 });
