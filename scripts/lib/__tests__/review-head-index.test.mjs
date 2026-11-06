@@ -133,6 +133,34 @@ describe('durability and growth', () => {
     const d = headReviewOwed({ index: readHeadIndex({ dir }), repo: 'o/r', pr: 7, head: H(2) });
     expect(d).toMatchObject({ owed: false, verdict: 'accept' });
   });
+  it('a cached map whose entry fields are arrays (coerced by the sha regex) is rejected and rebuilt, never carried', () => {
+    rec(); // log: H(1) / p1 / accept
+    const { map: mp, log } = headIndexPaths(dir);
+    const stored = JSON.parse(readFileSync(mp, 'utf8'));
+    const shapes = {
+      'history head as array': m => { m['o/r#7'].history.p1.head = [H(1)]; },
+      'lastReviewedHead as array': m => { m['o/r#7'].lastReviewedHead = [H(1)]; },
+      'history at as array': m => { m['o/r#7'].history.p1.at = [m['o/r#7'].history.p1.at]; },
+      'entry at as array': m => { m['o/r#7'].at = [m['o/r#7'].at]; },
+    };
+    for (const [name, mutate] of Object.entries(shapes)) {
+      const bad = JSON.parse(JSON.stringify(stored));
+      mutate(bad.map);
+      writeFileSync(mp, JSON.stringify({ ...bad, logHash: stored.logHash })); // matching logHash: only validation can reject it
+      expect(nodeFs.statSync(log).size, name).toBeGreaterThan(0);
+      const index = readHeadIndex({ dir });
+      expect(index.rebuilt, name).toBe(true);
+      expect(index.map['o/r#7'].lastReviewedHead, name).toBe(H(1));
+      const d = headReviewOwed({ index, repo: 'o/r', pr: 7, head: H(2), netPatchHash: 'p1' });
+      expect(typeof d.fromHead, name).toBe('string'); // a rebuilt (string) head, never the array
+      expect(d.fromHead, name).toBe(H(1));
+    }
+    // the array-head map is never served: with the cache mutated, the carry decision comes from the log's string head
+    const bad = JSON.parse(JSON.stringify(stored));
+    bad.map['o/r#7'].history.p1.head = [H(1)];
+    writeFileSync(mp, JSON.stringify({ ...bad, logHash: stored.logHash }));
+    expect(readHeadIndex({ dir }).map['o/r#7'].history.p1.head).toBe(H(1));
+  });
   it('compaction keeps keyless reviews and the current verdict exactly', () => {
     rec({ netPatchHash: 'p1', verdict: 'accept', at: '2026-11-04T10:00:01Z', logMaxLines: 2 });
     rec({ netPatchHash: null, verdict: 'reject', at: '2026-11-04T10:00:02Z', logMaxLines: 2 });

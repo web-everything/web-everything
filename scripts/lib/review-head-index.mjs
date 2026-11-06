@@ -97,8 +97,11 @@ export function applyRecord(map, rec, keepPerPr) {
   return map;
 }
 
-const validEntry = e => e && SHA.test(e.lastReviewedHead ?? '') && typeof e.verdict === 'string' && e.verdict && Number.isFinite(Date.parse(e.at))
-  && e.history && typeof e.history === 'object' && Object.values(e.history).every(h => h && SHA.test(h.head ?? '') && typeof h.verdict === 'string' && h.verdict && Number.isFinite(Date.parse(h.at)));
+// typeof string first: SHA.test()/Date.parse() coerce an array like [sha] to its string form and would accept it.
+const validEntry = e => e && typeof e.lastReviewedHead === 'string' && SHA.test(e.lastReviewedHead) && typeof e.verdict === 'string' && e.verdict
+  && typeof e.at === 'string' && Number.isFinite(Date.parse(e.at))
+  && e.history && typeof e.history === 'object' && Object.values(e.history).every(h => h && typeof h.head === 'string' && SHA.test(h.head)
+    && typeof h.verdict === 'string' && h.verdict && typeof h.at === 'string' && Number.isFinite(Date.parse(h.at)));
 const validMap = m => m && typeof m === 'object' && Object.values(m).every(validEntry);
 // Replay applies the SAME keepPerPr the writer used, so a rebuilt map equals the published one: evicted history is not
 // resurrected, and a compacted log (older rows then the PR's current record last, keyed or keyless) replays to the same map.
