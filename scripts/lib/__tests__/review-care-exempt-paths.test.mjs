@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { scoreEscalation } from '../review-escalation.mjs';
-import { DEFAULT_CARE_EXEMPT_PATHS, MAX_CARE_EXEMPT_GLOB_LENGTH, MAX_CARE_EXEMPT_PATH_LENGTH,
+import { DEFAULT_CARE_EXEMPT_PATHS, MAX_CARE_EXEMPT_GLOB_LENGTH, MAX_CARE_EXEMPT_GLOBS, MAX_CARE_EXEMPT_PATH_LENGTH,
   MAX_CARE_EXEMPT_PATH_SEGMENTS, matchesCareExemptPath, resolveReviewCareExemptPaths,
   validateCareExemptPaths } from '../review-care-exempt-paths.mjs';
 
@@ -265,6 +265,24 @@ describe('care exemption settings resolver', () => {
       }
       expect(Date.now() - started).toBeLessThan(1000);
     });
+
+  it('refuses a list longer than the glob-count bound through every settings layer, and accepts one at it', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const list = n => Array.from({ length: n }, (_, i) => `app/data/f${i}.json`);
+      expect(validateCareExemptPaths(list(MAX_CARE_EXEMPT_GLOBS))).toEqual(list(MAX_CARE_EXEMPT_GLOBS));
+      const over = list(MAX_CARE_EXEMPT_GLOBS + 1);
+      expect(validateCareExemptPaths(over)).toEqual(DEFAULT_CARE_EXEMPT_PATHS);
+      for (const options of [
+        { readFile: () => JSON.stringify({ careExemptPaths: over }) },
+        { env: { WE_REVIEW_CARE_EXEMPT_PATHS: JSON.stringify(over) } },
+      ]) {
+        const result = resolveReviewCareExemptPaths({ env: {}, readFile: () => '{}', log: () => {}, ...options });
+        expect(result.value).toEqual(DEFAULT_CARE_EXEMPT_PATHS);
+        expect(result.sources['']).toBe('standard');
+      }
+    } finally { warn.mockRestore(); }
+  });
 
   it('never exempts an over-long or over-deep author-chosen path (bounded match cost, fail closed)', () => {
     const deep = `data/generated/${'x/'.repeat(MAX_CARE_EXEMPT_PATH_SEGMENTS)}f.json`;

@@ -13,6 +13,7 @@ export const DEFAULT_CARE_EXEMPT_PATHS = Object.freeze([
   '**/fixtures/**',
 ]);
 export const MAX_CARE_EXEMPT_GLOB_LENGTH = 200;
+export const MAX_CARE_EXEMPT_GLOBS = 64;
 const SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'review.json');
 const logged = new Set();
 const logOnce = message => {
@@ -53,7 +54,8 @@ export function validateCareExemptPaths(value, { warn = m => console.warn(m) } =
     if (wildcard !== -1 && glob.slice(0, wildcard).split('/').length - 1 <= 1) return false;
     try { micromatch.makeRe(glob); return true; } catch { return false; }
   };
-  if (Array.isArray(value) && value.every(validGlob)) return [...value];
+  // Matching cost grows with the list too, so an oversized list is refused like an invalid one.
+  if (Array.isArray(value) && value.length <= MAX_CARE_EXEMPT_GLOBS && value.every(validGlob)) return [...value];
   warn('review.careExemptPaths: refused invalid or too-broad glob list; using built-in defaults');
   return [...DEFAULT_CARE_EXEMPT_PATHS];
 }
