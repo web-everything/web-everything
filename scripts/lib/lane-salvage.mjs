@@ -490,7 +490,7 @@ export function salvageLane({ dir, lane, pool, branchRef, salvageRoot = resolveS
       if (e.code !== 'ENOENT') throw e;
       // Stale registration: its recorded HEAD can still live in the lane's shared object database.
       if (!w.head) continue;
-      try { git(dir, ['cat-file', '-e', w.head]); } catch { continue; }
+      try { git(dir, ['cat-file', '-e', w.head]); } catch (e) { if (e?.status === 1) continue; throw e; } // only a genuinely absent object is skippable
       const aheadCount = Number(git(dir, ['rev-list', '--count', `${branchRef}..${w.head}`]).trim());
       if (aheadCount > 0) {
         git(dir, ['update-ref', refs.head, w.head]);
