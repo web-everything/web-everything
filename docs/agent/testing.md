@@ -3948,6 +3948,7 @@ Canonical-origin isolation fixtures must assert refusal and an unchanged lease w
 origin is unresolved. Reclaim fixtures with rejected salvage must first assert that reaper release
 refuses, then explicitly discard the lease to exercise reclaim on unpreserved work. The card-filer soak
 likewise checks that unreadable status keeps the lease before testing a deliberate discard.
+
 ## Author-stamp repair daemon wiring
 
 PR author logins from `gh pr view` can carry `app/`, while GraphQL edit editor logins do not.
