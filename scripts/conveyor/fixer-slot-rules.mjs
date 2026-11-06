@@ -24,7 +24,7 @@
  *   releaseOnCompletion     env WE_FIX_RELEASE_ON_COMPLETION   built-in off (off: release waits for the next claim sweep)
  */
 import { readSettings } from '../lib/settings-files.mjs';
-import { isHarnessRecord } from './await-verify.mjs';
+import { isHarnessRecord, previousCiFailurePending } from './await-verify.mjs';
 
 export const FIXER_SLOT_SETTINGS_BUILT_IN = Object.freeze({
   awaitVerifyLoopSeconds: 0, parkedReleasesSlot: false, parkedCapFactor: 2, releaseOnCompletion: false,
@@ -119,13 +119,14 @@ export function slotCountedItems({ items, cap, parkedReleasesSlot, parkedCapFact
 
 /** Stale owed keys. PR facts are a Map keyed by record key; unknown facts retain the record.
  * Only an explicitly closed PR or a valid, strictly newer, different SHA in the same repo/PR, kind and session lineage
- * retires a wait. Preserve previousCi inventory until PR closure; normal cleanup may still need its repair handoff.
+ * retires a wait. Preserve pending previousCi failure inventory even after PR closure; normal cleanup may still need its repair handoff.
  * `records` may include newer waits that have not yet become owed. */
 export function classifyStaleOwed({ owed, prFacts = new Map(), records = owed }) {
-  return owed.filter(({ key, record: r }) => prFacts.get(key)?.open === false
+  return owed.filter(({ key, record: r }) => (prFacts.get(key)?.open === false && !previousCiFailurePending(r))
     || (!r.previousCi && records.some(({ record: newer }) => isHarnessRecord(newer) && r.repo && r.pr && r.sha
       && newer.repo === r.repo && newer.pr === r.pr && newer.sha.toLowerCase() !== String(r.sha).toLowerCase()
       && newer.kind === r.kind
+      && !(r.sessionId && newer.sessionId && r.sessionId !== newer.sessionId)
       && ['who', 'sessionId', 'lane'].some(field => r[field] && newer[field] === r[field])
       && Date.parse(newer.requestedAt) > Date.parse(r.requestedAt))))
     .map(({ key }) => key);

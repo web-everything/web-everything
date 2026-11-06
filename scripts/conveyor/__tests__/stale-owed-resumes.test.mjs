@@ -1,7 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import * as awaitStore from '../await-verify.mjs';
+import { isDeepStrictEqual } from 'node:util';
 import { writeStoredAwaitVerify, listStoredAwaitVerify } from '../await-verify.mjs';
 import { classifyStaleOwed } from '../fixer-slot-rules.mjs';
 import { runSlotAwareAwaitPass } from '../await-verify-loop.mjs';
@@ -21,7 +23,10 @@ function harness(entries, state) {
   const io = {
     listRecords: () => [...store].map(([key, record]) => ({ key, record })),
     clearRecord: vi.fn(key => { store.delete(key); }),
-    clearStoredRecord: vi.fn(key => { store.delete(key); }),
+    clearStoredRecordIf: vi.fn((key, expected) => {
+      if (!isDeepStrictEqual(store.get(key), expected)) return { cleared: false };
+      store.delete(key); return { cleared: true };
+    }),
     writeRecord: r => { store.set(r.sessionId, r); return { ok: true }; },
     listSessions: () => entries.map(({ key }) => ({ sessionId: key, name: key, status: 'idle', kind: 'background' })),
     resume: ({ session }) => { resumed.push(session.sessionId); return { resumed: true }; },
@@ -34,6 +39,72 @@ function harness(entries, state) {
 }
 
 describe('stale owed resumes (R618)', () => {
+
+  it.each(['who', 'lane'])('conflicting sessions cannot supersede via matching %s', field => {
+    const old = entry('old-session', 1);
+    const newer = entry('new-session', 1, 1000, { [field]: old.record[field], sha: 'b'.repeat(40) });
+    expect(classifyStaleOwed({ owed: [old], records: [old, newer] })).toEqual([]);
+  });
+
+  it.each(['MERGED', 'CLOSED'])('%s pending previous-CI repair stays on disk without admission or wake', async () => {
+    const old = entry('pending-inventory', 1, 0, { pendingResume: { kind: 'red', delivered: true },
+      previousCi: { ready: { ciFailures: [{ name: 'unit', conclusion: 'FAILURE' }] } } });
+    const h = harness([old, entry('live-inventory', 2, 1000)], (_repo, pr) => ({ open: pr !== 1 }));
+    h.io.fixTimingPolicy = () => ({ pushAfterCi: true });
+    const out = await h.pass();
+    expect(out.cleared).toEqual([]);
+    expect(h.store.get(old.key)).toEqual(old.record);
+    expect(out.admitted).toEqual(['live-inventory']);
+    expect(h.resumed).toEqual(['live-inventory']);
+    expect(h.io.clearStoredRecordIf).not.toHaveBeenCalled();
+  });
+
+  it.each(['green', 'early-push'])('closed records with completed %s repair handoff can be cleared', async mode => {
+    const old = entry('handed-off', 1, 0, {
+      previousCi: { failuresHandedOff: true, ready: { ciFailures: ['unit'] } },
+      pendingResume: { kind: mode === 'green' ? 'green' : 'red' },
+      ...(mode === 'early-push' ? { earlyPush: { ok: true, sha: 'a'.repeat(40) } } : {}),
+    });
+    const h = harness([old], () => ({ open: false }));
+    expect((await h.pass(0)).cleared).toEqual([old.key]);
+    expect(h.store.has(old.key)).toBe(false);
+  });
+
+  it.each(['sha', 'requestedAt', 'sessionId', 'inventory', 'restore', 'collision', 'after-rename', 'unreadable', 'missing', 'same'])
+  ('conditional store deletion protects concurrent writers: %s', mode => {
+    const dir = mkdtempSync(join(tmpdir(), 'conditional-await-'));
+    const old = entry('atomic', 1).record;
+    const path = join(dir, 'atomic.json');
+    const replacement = { ...old, sha: 'b'.repeat(40) };
+    if (mode === 'requestedAt') Object.assign(replacement, { sha: old.sha, requestedAt: new Date(T0 + 1000).toISOString() });
+    if (mode === 'sessionId') Object.assign(replacement, { sha: old.sha, sessionId: 'replacement' });
+    if (mode === 'inventory') Object.assign(replacement, { sha: old.sha, previousCi: { ready: { ciFailures: ['unit'] } } });
+    let moved;
+    try {
+      writeFileSync(path, JSON.stringify(old));
+      if (['sha', 'requestedAt', 'sessionId', 'inventory'].includes(mode)) writeFileSync(path, JSON.stringify(replacement));
+      if (mode === 'unreadable') writeFileSync(path, '{');
+      if (mode === 'missing') rmSync(path);
+      const result = awaitStore.clearStoredAwaitVerifyIf('atomic', old, { dir,
+        renameSyncFn: (from, to) => {
+          if (from === path) {
+            if (mode === 'restore' || mode === 'collision') writeFileSync(path, JSON.stringify(replacement));
+            renameSync(from, to); moved = to;
+            if (mode === 'collision' || mode === 'after-rename') writeFileSync(path, JSON.stringify({ ...replacement, sessionId: 'latest' }));
+          } else renameSync(from, to);
+        },
+      });
+      expect(result).toEqual({ cleared: ['same', 'after-rename'].includes(mode) });
+      if (mode === 'same' || mode === 'missing') expect(existsSync(path)).toBe(false);
+      else if (mode === 'unreadable') expect(readFileSync(path, 'utf8')).toBe('{');
+      else expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual(
+        ['collision', 'after-rename'].includes(mode) ? { ...replacement, sessionId: 'latest' } : replacement);
+      if (mode === 'collision') expect(JSON.parse(readFileSync(moved, 'utf8'))).toEqual(replacement);
+      expect(awaitStore.clearStoredAwaitVerifyIf('../unsafe', old, { dir })).toEqual({ cleared: false });
+      expect(awaitStore.clearStoredAwaitVerifyIf('atomic', {}, { dir })).toEqual({ cleared: false });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it.each(['lower-to-upper', 'upper-to-lower'])('retains the same commit across SHA case changes: %s', async mode => {
     const old = entry('case-old', 1, 0, { sha: (mode === 'upper-to-lower' ? 'A' : 'a').repeat(40) });
     const newer = entry('case-new', 1, 1000, { who: old.record.who,
@@ -48,8 +119,8 @@ describe('stale owed resumes (R618)', () => {
     const old = entry('store-only', 1);
     const h = harness([old], () => ({ open: false }));
     expect((await h.pass(0)).cleared).toEqual([old.key]);
-    expect(h.io.clearStoredRecord).toHaveBeenCalledTimes(1);
-    expect(h.io.clearStoredRecord).toHaveBeenCalledWith(old.key);
+    expect(h.io.clearStoredRecordIf).toHaveBeenCalledTimes(1);
+    expect(h.io.clearStoredRecordIf).toHaveBeenCalledWith(old.key, old.record);
     expect(h.io.clearRecord).not.toHaveBeenCalled();
   });
 
@@ -109,14 +180,14 @@ describe('stale owed resumes (R618)', () => {
     const old = entry('closed', 6360);
     const h = harness([old, entry('live', 6193, 1000)], (_repo, pr) => ({ open: pr !== 6360 }));
     const out = await h.pass();
-    expect(h.io.clearStoredRecord).toHaveBeenCalledWith(old.key);
+    expect(h.io.clearStoredRecordIf).toHaveBeenCalledWith(old.key, old.record);
     expect(out.cleared).toEqual(['closed']);
     expect(out.admitted).toEqual(['live']);
     expect(h.resumed).toEqual(['live']);
   });
 
   it('clears a superseded SHA even without a PR-state port', async () => {
-    const h = harness([entry('superseded', 6360), entry('newer', 6360, 1000, { who: 'superseded', sha: 'b'.repeat(40) })]);
+    const h = harness([entry('superseded', 6360), entry('newer', 6360, 1000, { lane: '/lanes/superseded', sessionId: null, sha: 'b'.repeat(40) })]);
     const out = await h.pass();
     expect(out.cleared).toEqual(['superseded']);
     expect(h.resumed).toEqual(['newer']);
@@ -134,7 +205,7 @@ describe('stale owed resumes (R618)', () => {
     const out = await h.pass(0);
     expect(out.cleared).toEqual([]);
     expect(h.store.has('moved')).toBe(true);
-    expect(h.io.clearStoredRecord).not.toHaveBeenCalled();
+    expect(h.io.clearStoredRecordIf).not.toHaveBeenCalled();
     expect(h.io.clearRecord).not.toHaveBeenCalled();
   });
 
@@ -199,14 +270,14 @@ describe('stale owed resumes (R618)', () => {
     const out = await h.pass(0);
     expect(out.cleared).toEqual([]);
     expect(h.store.get(old.key)).toEqual(old.record);
-    expect(h.io.clearStoredRecord).not.toHaveBeenCalled();
+    expect(h.io.clearStoredRecordIf).not.toHaveBeenCalled();
     expect(h.io.clearRecord).not.toHaveBeenCalled();
   });
 
   it.each(['missing', 'throws', 'refuses'])('cleanup %s never blocks live admission', async mode => {
     const h = harness([entry('stale-error', 1), entry('live-error', 2, 1000)], (_repo, pr) => ({ open: pr !== 1 }));
-    if (mode === 'missing') delete h.io.clearStoredRecord;
-    else h.io.clearStoredRecord = () => { if (mode === 'throws') throw Error('unreadable'); return { cleared: false }; };
+    if (mode === 'missing') delete h.io.clearStoredRecordIf;
+    else h.io.clearStoredRecordIf = () => { if (mode === 'throws') throw Error('unreadable'); return { cleared: false }; };
     // Keep the live record pending so this test isolates stale cleanup from normal wake cleanup.
     h.io.listSessions = () => [];
     const out = await h.pass();
@@ -222,7 +293,7 @@ describe('stale owed resumes (R618)', () => {
 
   it('pure classification requires a later time, different SHA, and the same repo and PR', () => {
     const owed = [entry('original', 1), entry('equal-time', 1, 0, { sha: 'b'.repeat(40) }),
-      entry('same-sha', 1, 1000, { who: 'equal-time' }), entry('other-pr', 2, 2000, { sha: 'c'.repeat(40) }),
+      entry('same-sha', 1, 1000, { who: 'equal-time', sessionId: null }), entry('other-pr', 2, 2000, { sha: 'c'.repeat(40) }),
       entry('other-repo', 1, 2000, { repo: 'other/repo', sha: 'c'.repeat(40) })];
     expect(classifyStaleOwed({ owed, prFacts: new Map() })).toEqual(['equal-time']);
   });
@@ -232,6 +303,7 @@ describe('stale owed resumes (R618)', () => {
     const newer = entry('lineage-new', 1, 1000, { sha: 'b'.repeat(40) });
     expect(classifyStaleOwed({ owed: [old], records: [old, newer] })).toEqual([]);
     newer.record[field] = old.record[field];
+    if (field !== 'sessionId') newer.record.sessionId = null;
     expect(classifyStaleOwed({ owed: [old], records: [old, newer] })).toEqual([old.key]);
   });
 
@@ -244,12 +316,12 @@ describe('stale owed resumes (R618)', () => {
     expect(classifyStaleOwed({ owed: [old], records: [old, newer] })).toEqual([]);
   });
 
-  it.each([null, { open: true }, { open: false }])('retains previousCi inventory unless PR closure is confirmed: %j', state => {
+  it.each([null, { open: true }, { open: false }])('retains pending previousCi inventory even on PR closure: %j', state => {
     const old = entry('inventory-old', 1, 0, { pendingResume: { kind: 'red', delivered: true },
       previousCi: { ready: { ciFailures: [{ name: 'unit', conclusion: 'FAILURE' }] } } });
     const newer = entry('inventory-new', 1, 1000, { who: old.record.who, sha: 'b'.repeat(40) });
     expect(classifyStaleOwed({ owed: [old], records: [old, newer], prFacts: new Map([[old.key, state]]) }))
-      .toEqual(state?.open === false ? [old.key] : []);
+      .toEqual([]);
   });
 
   it.each(['expired', 'future', 'invalid'])('a stale waiter with an %s time cannot hide an active claim', async mode => {
@@ -281,7 +353,7 @@ describe('stale owed resumes (R618)', () => {
       return { open: false };
     };
     expect((await h.pass(0)).cleared).toEqual([]);
-    expect(h.io.clearStoredRecord).not.toHaveBeenCalled();
+    expect(h.io.clearStoredRecordIf).not.toHaveBeenCalled();
     expect(h.io.clearRecord).not.toHaveBeenCalled();
     expect(h.store.get(old.key)).toBe(field === 'missing' ? undefined : replacement);
   });
@@ -295,7 +367,7 @@ describe('stale owed resumes (R618)', () => {
       return { open: false };
     });
     expect((await h.pass(0)).cleared).toEqual([]);
-    expect(h.io.clearStoredRecord).not.toHaveBeenCalled();
+    expect(h.io.clearStoredRecordIf).not.toHaveBeenCalled();
     expect(h.io.clearRecord).not.toHaveBeenCalled();
     expect(h.store.get(old.key).previousCi.ready.ciFailures).toHaveLength(1);
   });

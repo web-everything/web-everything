@@ -27,7 +27,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve, dirname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  listStoredAwaitVerify, writeStoredAwaitVerify, clearStoredAwaitVerify, clearAwaitVerifyRecord, readAwaitVerifyRecord,
+  listStoredAwaitVerify, writeStoredAwaitVerify, clearStoredAwaitVerify, clearStoredAwaitVerifyIf,
+  previousCiFailurePending as hasPendingPreviousCi, clearAwaitVerifyRecord, readAwaitVerifyRecord,
   resolveAwaitVerifyTtlMs, AWAIT_VERIFY_REF_RE, AWAIT_VERIFY_NO_PUSH_KINDS, isHarnessRecord,
   readSelfReview, selfReviewHold, selfReviewStoreDir, selfReviewBelongsTo,
 } from './await-verify.mjs';
@@ -376,10 +377,7 @@ export async function runAwaitVerifyPass({
 } = {}) {
   const rows = [];
   const timing = io.fixTimingPolicy?.();
-  const previousCiFailurePending = record => timing?.pushAfterCi && record?.kind === 'fix'
-    && record.previousCi?.ready?.ciFailures?.length > 0
-    && !(record.previousCi.failuresHandedOff && (record.pendingResume?.kind === 'green'
-      || (record.earlyPush?.ok && lower(record.earlyPush.sha) === lower(record.sha))));
+  const previousCiFailurePending = record => hasPendingPreviousCi(record, timing ?? null);
   /** Clear a finished record. One that cannot be removed would stay actionable (another push / resume next tick), so it is
    *  remembered for this daemon's lifetime and never acted on again. Returns whether the record is really gone. */
   const clearOrNote = (key, record) => {
@@ -846,6 +844,7 @@ export async function defaultAwaitVerifyIo({
     writeRecord: (record) => writeStoredAwaitVerify(record),
     // Stale retirement removes only the shared key; the lane may already belong to a newer session.
     clearStoredRecord: (key) => clearStoredAwaitVerify(key),
+    clearStoredRecordIf: (key, expected) => clearStoredAwaitVerifyIf(key, expected),
     clearRecord: (key, record) => {
       const store = clearStoredAwaitVerify(key);
       if (record?.lane && !outsidePool(record.lane)) {

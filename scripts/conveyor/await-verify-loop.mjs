@@ -123,12 +123,14 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
       // PR reads can yield while a worker re-marks this key. Never clear that replacement.
       const current = io.listRecords().find(e => e.key === key)?.record;
       if (!current?.pendingResume?.kind || !isDeepStrictEqual(current, record)) continue;
-      // Delete only this shared key, with no yield after comparing the snapshot; leave the lane-local waiter alone.
-      if (typeof io.clearStoredRecord === 'function' && (await io.clearStoredRecord(key))?.cleared !== false) cleared.push(key);
+      // The store also compares after atomically moving the file; leave the lane-local waiter alone.
+      if (typeof io.clearStoredRecordIf === 'function' && (await io.clearStoredRecordIf(key, record))?.cleared === true) cleared.push(key);
     } catch { /* Failed cleanup must not reserve admission capacity or stop live resumes. */ }
   }
-  const records = allRecords.filter(({ key }) => !stale.has(key));
-  const owedFix = allOwed.filter(({ key }) => !stale.has(key));
+  // Closed waits with pending repair inventory stay on disk but cannot consume admission or wake.
+  const skipped = new Set([...stale, ...allOwed.filter(({ key }) => prFacts.get(key)?.open === false).map(({ key }) => key)]);
+  const records = allRecords.filter(({ key }) => !skipped.has(key));
+  const owedFix = allOwed.filter(({ key }) => !skipped.has(key));
   const owedKeys = new Set(owedFix.map(({ key }) => key));
   for (const key of resumeMisses.keys()) if (!owedKeys.has(key)) resumeMisses.delete(key);
   // Keep every claim: without a retained wait, its worker conservatively counts as active.
@@ -152,7 +154,7 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
   // Phase A answers `resume-paused` (allowResume:false) for every record it would have woken; that word is not shown.
   // A record pushed in phase A keeps its push row, with the phase-B wake (or the deferral) appended to its result.
   const pushedA = (r) => (r.result && r.result !== 'resume-paused' ? `${r.result}; ` : '');
-  const rows = (a.rows ?? []).filter((r) => !stale.has(r.key) && !wakeKeys.has(r.key) && !deferred.has(r.key));
+  const rows = (a.rows ?? []).filter((r) => !skipped.has(r.key) && !wakeKeys.has(r.key) && !deferred.has(r.key));
   for (const r of a.rows ?? []) {
     if (deferred.has(r.key)) {
       const record = owedFix.find(e => e.key === r.key)?.record;

@@ -4,9 +4,10 @@
  * requests verification, records the wait, and ends the turn; the harness resumes the SAME session.
  * This slice only supplies the record and liveness exemptions; no fixer writes it automatically yet.
  */
-import { statSync, readFileSync, writeFileSync, renameSync, unlinkSync, mkdirSync, readdirSync } from 'node:fs';
+import { statSync, readFileSync, writeFileSync, renameSync, unlinkSync, mkdirSync, readdirSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
@@ -180,6 +181,39 @@ export function writeStoredAwaitVerify(record, { dir = awaitVerifyStoreDir(), wr
     return { ok: false, reason: 'write-failed' };
   }
 }
+/** Previous-head CI failures remain owned until a verified repair handoff. */
+export function previousCiFailurePending(record, timing = { pushAfterCi: true }) {
+  return Boolean(timing?.pushAfterCi && record?.kind === 'fix'
+    && record.previousCi?.ready?.ciFailures?.length > 0
+    && !(record.previousCi.failuresHandedOff && (record.pendingResume?.kind === 'green'
+      || (record.earlyPush?.ok && String(record.earlyPush.sha ?? '').toLowerCase() === String(record.sha ?? '').toLowerCase()))));
+}
+
+/** Retire only the expected shared record; quarantine first so a concurrent writer is never unlinked. */
+export function clearStoredAwaitVerifyIf(key, expected, { dir = awaitVerifyStoreDir(),
+  readFileSyncFn = readFileSync, renameSyncFn = renameSync, unlinkSyncFn = unlinkSync,
+  existsSyncFn = existsSync, uniqueId = randomUUID } = {}) {
+  if (!nonEmpty(key) || !STORE_KEY_RE.test(key)
+    || !nonEmpty(expected?.sha) || !nonEmpty(expected?.requestedAt)) return { cleared: false };
+  const path = join(dir, `${key}.json`);
+  const tmp = `${path}.${uniqueId()}.tmp`;
+  const matches = file => {
+    try {
+      const current = JSON.parse(readFileSyncFn(file, 'utf8'));
+      return ['sha', 'requestedAt', 'sessionId'].every(field => current?.[field] === expected[field])
+        && isDeepStrictEqual(current, expected);
+    } catch { return false; }
+  };
+  if (!matches(path)) return { cleared: false };
+  try { renameSyncFn(path, tmp); } catch { return { cleared: false }; }
+  if (!matches(tmp)) {
+    // A replacement won the race to rename. Preserve it, and never overwrite a new original.
+    try { if (!existsSyncFn(path)) renameSyncFn(tmp, path); } catch { /* leave quarantined content intact */ }
+    return { cleared: false };
+  }
+  try { unlinkSyncFn(tmp); return { cleared: true }; } catch { return { cleared: false }; }
+}
+
 /** Remove one store record by key. */
 export function clearStoredAwaitVerify(key, { dir = awaitVerifyStoreDir(), unlinkSyncFn = unlinkSync } = {}) {
   try {
