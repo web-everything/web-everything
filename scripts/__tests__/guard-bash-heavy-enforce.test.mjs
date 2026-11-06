@@ -64,6 +64,8 @@ const ordinarySessionRuns = [
   'npx vitest@latest run a.test.mjs', 'npx -y vitest@2 run a.test.mjs',
   'timeout 300 npx vitest run a.test.mjs', 'timeout -s KILL 300 npx vitest run a.test.mjs',
   'nice -n 5 npx vitest run a.test.mjs', 'nice -5 npx vitest run a.test.mjs',
+  'env --version npx vitest run a', 'env --help npx vitest run a',
+  'timeout --version npx vitest run a', 'timeout --help npx vitest run a',
   'node node_modules/vitest/vitest.mjs run a.test.mjs',
   // other direct entry points of the same vitest install (advisory finding on #3932, round 2)
   'node ./node_modules/vitest/dist/cli.js run a.test.mjs', 'node node_modules/vitest/dist/cli.js a.test.mjs',
@@ -75,6 +77,51 @@ const ordinarySessionRuns = [
 ];
 
 describe('heavy-enforce — every direct test run requires admission', () => {
+  const controlBypasses = [
+    'for f in a b; do npx vitest run "$f"; done',
+    'while read f; do npx vitest run $f; done < l',
+    'if true; then npx vitest run a; fi',
+    'if false; then echo ok; else npx vitest run a; fi',
+    'if false; then echo ok; elif npx vitest run a; then echo ok; fi',
+    'until npx vitest run a; do echo ok; done',
+    '! npx vitest run a',
+    'gtimeout 5 npx vitest run a',
+    'env -i X=1 timeout 5 npx vitest run a',
+    'env -u NAME -- X=1 gtimeout 5 npx vitest run a',
+    'exec npx vitest run a',
+    'timeout 290 npx vitest run a.test.mjs 2>&1 | tail -15',
+    ...['timeout', 'gtimeout'].flatMap(wrapper => [
+      `${wrapper} 5 npx playwright test a`,
+      `${wrapper} 5 node --test a.test.mjs`,
+      `${wrapper} 5 node scripts/check-standards.mjs`,
+      `${wrapper} 5 npm test -- a.test.mjs`,
+    ]),
+  ];
+  it.each(controlBypasses)('denies control/wrapper bypass `%s`', cmd => {
+    expect(decide(cmd, {})).not.toBeNull();
+  });
+  it('suggests a runnable single segment for a loop body', () => {
+    const reason = decide('for f in a b; do npx vitest run "$f"; done', {});
+    expect(reason).toContain('`' + queue + 'npx vitest run "$f"`');
+    expect(reason).not.toContain('run -- do ');
+  });
+  it.each([
+    'for f in a b; do ' + queue + 'npx vitest run "$f"; done',
+    'if true; then ' + queue + 'npx vitest run a; fi',
+    queue + 'npx vitest run a',
+    queue + 'gtimeout 5 npx vitest run a',
+    'env -i X=1 ' + queue + 'timeout 5 npx vitest run a',
+    'exec ' + queue + 'npx vitest run a',
+    'grep vitest x', 'echo npx vitest run', 'npx vitest --version', 'vitest --help',
+    'git commit -m "document npx vitest run"',
+  ])('allows admitted control flow or harmless mention `%s`', cmd => {
+    expect(decide(cmd, {})).toBeNull();
+  });
+  it('keeps env options and assignments in a runnable replacement', () => {
+    expect(decide('env -i X=1 timeout 5 npx vitest run a', {}))
+      .toContain('`env -i X=1 ' + queue + 'timeout 5 npx vitest run a`');
+  });
+
   it.each(execVitestRuns)('denies bare whole-suite `%s` both raw and admitted', (cmd) => {
     for (const prefix of ['', queue]) {
       expect(decide(prefix + cmd, {})).toBe(decide(prefix + 'npx vitest run', {}));

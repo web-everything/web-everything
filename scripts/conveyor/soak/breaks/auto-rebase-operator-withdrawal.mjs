@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { admittedArgv } from '../../../readiness/heavy-admission.mjs';
 import { runAutoRebase, finishPendingSwaps, heavyTestReport, runHeavyTests } from '../../../lib/daemon-rebuild/auto-rebase.mjs';
 import { scratchTestOutput } from './scratch-tests-forge-command.mjs';
 import { addOverlay, removeOverlay, readOverlays, overlayFilePath, persistStackBases } from '../../../lib/daemon-overlays.mjs';
@@ -62,7 +63,8 @@ export async function runTestInventoryCase({ mode = 'excluded', realRunner = fal
         }
         // Same exclusion as the repository's unit config; no project setup or external state.
         fs.writeFileSync(join(scratch, 'vitest.config.mjs'), `export default { test: { passWithNoTests: true, exclude: [${JSON.stringify(integration)}], poolOptions: { threads: { minThreads: 1, maxThreads: 1 } } } };\n`);
-        runnerResult = spawnSync(process.execPath, [join(REPO, 'node_modules/vitest/vitest.mjs'), ...args.slice(args.indexOf('--') + 3)], {
+        const admitted = admittedArgv(process.execPath, [join(REPO, 'node_modules/vitest/vitest.mjs'), ...args.slice(args.indexOf('--') + 3)]);
+        runnerResult = spawnSync(admitted.file, admitted.args, {
           cwd: scratch, env, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
         });
         if (runnerResult.status === 0) fs.writeFileSync(testReport, JSON.stringify(heavyTestReport(runnerResult.stdout, { root: fs.realpathSync(scratch), args })));

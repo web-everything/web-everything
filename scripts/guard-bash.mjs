@@ -716,9 +716,34 @@ function wrapperPrefixLength(words) {
   while (i < words.length) {
     const w = words[i];
     if (/^[A-Za-z_]\w*=/.test(w)) { i += 1; continue; }                       // bare `FOO=1 <cmd>` assignment
+    if (/^(?:do|then|else|elif|if|while|until|!)$/.test(w)) { i += 1; continue; }
+    if (w === 'timeout' || w === 'gtimeout') {
+      i += 1;
+      while (i < words.length && words[i].startsWith('-')) {
+        const opt = words[i++];
+        if (/^(?:-s|-k|--signal|--kill-after)$/.test(opt)) i += 1;
+      }
+      i += 1; // duration
+      continue;
+    }
+    if (w === 'exec') {
+      i += 1;
+      while (i < words.length && words[i].startsWith('-')) {
+        const opt = words[i++];
+        if (opt === '-a') i += 1;
+        if (opt === '--') break;
+      }
+      continue;
+    }
     if (w === 'env') {                                                        // env VAR=val … <cmd>
       i += 1;
-      while (i < words.length && /^[A-Za-z_]\w*=/.test(words[i])) i += 1;
+      while (i < words.length) {
+        const opt = words[i];
+        if (opt === '--') { i += 1; break; }
+        if (opt === '-u' || opt === '--unset' || opt === '-C' || opt === '--chdir') { i += 2; continue; }
+        if (opt.startsWith('-') || /^[A-Za-z_]\w*=/.test(opt)) { i += 1; continue; }
+        break;
+      }
       continue;
     }
     if (w === 'time' || w === 'command' || w === 'builtin' || w === 'nice') { i += 1; continue; }
@@ -3271,7 +3296,7 @@ const NODE_SCRIPT_VALUE_FLAGS = new Set(['--require', '-r', '--import', '--loade
  *  (`timeout [opts] <duration>`, and the `-n <N>` it leaves behind after peeling `nice`)? `nohup` is left
  *  alone on purpose: the background-run guard owns it, and a queued replacement keeping it would be denied there. */
 function execWrapperWords(w) {
-  if (w[0] === 'timeout') {
+  if (w[0] === 'timeout' || w[0] === 'gtimeout') {
     let i = 1;
     while (w[i]?.startsWith('-')) i += /^(?:-s|-k|--signal|--kill-after)$/.test(w[i]) ? 2 : 1;
     return i + 1; // the duration
@@ -3431,7 +3456,8 @@ function ungatedHeavyHead(head) {
 
 /** Deny any unqueued test/standards execution, with a runnable replacement. Pure; no escape. */
 export function ungatedHeavyRunReason(segment) {
-  const s = String(segment || '').trim();
+  // Shell control words are syntax, not part of the runnable replacement for this segment.
+  const s = String(segment || '').trim().replace(/^(?:(?:do|then|else|elif|if|while|until|!)\s+)+/, '');
   const run = ungatedHeavyHead(canonicalCommand(s));
   if (!run) return null;
   // Keep assignment spelling/quoting intact, placing it before node so it remains shell syntax. A leading
@@ -3439,9 +3465,21 @@ export function ungatedHeavyRunReason(segment) {
   const words = headWords(s);
   let i = words[0]?.text === 'env' ? 1 : 0;
   const prefix = i ? ['env'] : [];
-  while (/^[A-Za-z_]\w*=/.test(words[i]?.text || '')) {
-    prefix.push(s.slice(words[i].start, words[i].end));
-    i += 1;
+  while (i < words.length) {
+    const word = words[i].text;
+    if (/^[A-Za-z_]\w*=/.test(word)) { prefix.push(s.slice(words[i].start, words[i].end)); i += 1; continue; }
+    if (prefix[0] === 'env' && word.startsWith('-')) {
+      prefix.push(s.slice(words[i].start, words[i].end)); i += 1;
+      if (/^(?:-u|--unset|-C|--chdir)$/.test(word) && words[i]) {
+        prefix.push(s.slice(words[i].start, words[i].end)); i += 1;
+      }
+      if (word === '--') {
+        while (/^[A-Za-z_]\w*=/.test(words[i]?.text || '')) { prefix.push(s.slice(words[i].start, words[i].end)); i += 1; }
+        break;
+      }
+      continue;
+    }
+    break;
   }
   const env = prefix.length ? prefix.join(' ') + ' ' : '';
   const command = i ? s.slice(words[i]?.start ?? s.length) : s;
