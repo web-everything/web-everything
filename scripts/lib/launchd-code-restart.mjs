@@ -7,7 +7,9 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { cascadePolicy } from './policy-cascade.mjs';
-import { lockDirFor, makeLockEntry } from '../readiness/file-locks.mjs';
+import { randomBytes } from 'node:crypto';
+import { lockDirFor, makeLockEntry, parseLockEntry, releaseLockDirIf } from '../readiness/file-locks.mjs';
+import { probePidLiveness } from '../readiness/pid-liveness.mjs';
 import { readRebuildState } from './daemon-rebuild/state.mjs';
 
 const commandOptions = { encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024 };
@@ -416,22 +418,39 @@ const diskState = {
   },
 };
 // Use the shared lock identity/entry format, with async exclusive mkdir so a slow
-// filesystem cannot block the adopter's timeout. Never steal or expire a held lock:
-// a paused holder can resume and still kickstart. An abandoned marker requires an
-// operator to inspect its owner and remove it only after confirming that owner exited.
-const diskLocks = {
-  async acquire(label) {
-    const root = join(homedir(), '.claude', 'launchd-code-restart', 'locks');
-    const dir = lockDirFor(root, `launchd-code-restart:${label}`);
-    await fsAsync.mkdir(root, { recursive: true });
-    try { await fsAsync.mkdir(dir); }
-    catch (error) { if (error.code === 'EEXIST') return null; throw error; }
-    const entry = makeLockEntry(`launchd-code-restart:${process.pid}`, label, new Date().toISOString(), process.pid);
-    // A failed metadata write leaves the exclusive marker in place, failing closed.
-    await fsAsync.writeFile(join(dir, 'lock.json'), JSON.stringify(entry), { flag: 'wx' });
-    return async () => { await fsAsync.rm(dir, { recursive: true }); };
-  },
-};
+// filesystem cannot block the adopter's timeout. A held lock is NEVER expired by age: a paused
+// holder can resume and still kickstart. The only reclaim is of a lock whose recorded owner pid is
+// PROVEN dead (ESRCH / zombie, via probePidLiveness; pid reuse or any doubt reads as alive and keeps
+// the lock). The proof is re-checked against the exact entry judged (releaseLockDirIf), so a
+// contender cannot remove a lock a faster reclaimer just took. Anything else stays blocked and
+// surfaces as a restart-lock-held flag.
+// @test-only-export-ok: test seam for the real disk lock (root dir and liveness probe are injectable); production uses `diskLocks`.
+export function createDiskLocks({ root: rootOpt, liveness = probePidLiveness, pid = process.pid } = {}) {
+  return {
+    async acquire(label) {
+      const root = rootOpt ?? join(homedir(), '.claude', 'launchd-code-restart', 'locks');
+      const key = `launchd-code-restart:${label}`, dir = lockDirFor(root, key);
+      await fsAsync.mkdir(root, { recursive: true });
+      const win = async () => {
+        try { await fsAsync.mkdir(dir); }
+        catch (error) { if (error.code === 'EEXIST') return false; throw error; }
+        const entry = makeLockEntry(`launchd-code-restart:${pid}:${randomBytes(6).toString('hex')}`, label, new Date().toISOString(), pid);
+        // A failed metadata write leaves the exclusive marker in place, failing closed.
+        await fsAsync.writeFile(join(dir, 'lock.json'), JSON.stringify(entry), { flag: 'wx' });
+        return true;
+      };
+      if (!(await win())) {
+        let held = null;
+        try { held = parseLockEntry(await fsAsync.readFile(join(dir, 'lock.json'), 'utf8')); } catch { /* unreadable: fail closed */ }
+        // Unreadable, pid-less, own-pid or not-provably-dead owners all keep the lock.
+        if (!held || liveness(held.pid, pid) !== 'dead') return null;
+        if (!releaseLockDirIf(root, key, held) || !(await win())) return null;
+      }
+      return async () => { await fsAsync.rm(dir, { recursive: true }); };
+    },
+  };
+}
+const diskLocks = createDiskLocks();
 const inFlight = new Set();
 const glob = (label, pattern) => pattern.endsWith('*') ? label.startsWith(pattern.slice(0, -1)) : label === pattern;
 const patterns = value => Array.isArray(value) && value.every(x => typeof x === 'string' && /^(?:[^*]+\*?|\*)$/.test(x));

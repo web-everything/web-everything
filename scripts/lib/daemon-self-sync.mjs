@@ -143,6 +143,13 @@ export function resolveRestartServices(restartServicesOpt, realIo, real = restar
   return restartServicesOpt ?? (realIo ? real : () => {});
 }
 
+// Production wiring for the owed-restart retry on non-adopting ticks: an injected retry always wins; the real
+// launchd retry runs only on the real-IO path AND when no restart hook was injected, otherwise null (no retry),
+// so hermetic tests never read the real state directory or kick a service.
+export function resolveRetryPendingRestarts(retryPendingOpt, restartServicesOpt, realIo, real = restartServicesForClone) {
+  return retryPendingOpt ?? (realIo && restartServicesOpt === undefined ? real : null);
+}
+
 /** PURE: env → rebuild.maxAdoptWaitTicks → default, with the effective policy source. */
 export function resolveMaxAdoptWaitTicks(env = {}, settings = {}) {
   const raw = env?.WE_DAEMON_REBUILD_MAX_ADOPT_WAIT_TICKS;
@@ -716,7 +723,7 @@ export function withSelfSync(effects, {
   };
   // A restart the cooldown deferred is owed to a LATER tick (the adopter exits right after adoption). Only the
   // real launchd restart retries; an injected hook (hermetic tests) is never called on non-adopting ticks.
-  const retryPendingRestarts = retryPendingOpt ?? (realIo && restartServicesOpt === undefined ? restartServicesForClone : null);
+  const retryPendingRestarts = resolveRetryPendingRestarts(retryPendingOpt, restartServicesOpt, realIo);
   const runRestart = async (fn, extra) => {
     const controller = new AbortController();
     let timer;

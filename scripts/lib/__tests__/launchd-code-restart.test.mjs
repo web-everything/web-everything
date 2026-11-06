@@ -1,11 +1,13 @@
 import { describe, it, expect, vi } from 'vitest';
 import { resolve, join } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import fsAsync from 'node:fs/promises';
 import childProcess from 'node:child_process';
-import { findServicesRunningFromClone, restartServicesForClone, findStaleCodeServices } from '../launchd-code-restart.mjs';
-import { withSelfSync, resolveRestartServices } from '../daemon-self-sync.mjs';
+import { findServicesRunningFromClone, restartServicesForClone, findStaleCodeServices, createDiskLocks } from '../launchd-code-restart.mjs';
+import { withSelfSync, resolveRestartServices, resolveRetryPendingRestarts } from '../daemon-self-sync.mjs';
+import { lockDirFor } from '../../readiness/file-locks.mjs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 const cloneRoot = resolve('fixtures/wev-pass-readers');
 function fixture(plists = [{ Label: 'com.we.resource-sampler', ProgramArguments: ['node', join(cloneRoot, 'sampler.mjs')] }]) {
   return { cloneRoot, agentsDir: resolve('fixtures/agents'), listPlists: () => plists.map((_, i) => `${i}.plist`),
@@ -386,6 +388,97 @@ describe('withSelfSync default service-restart wiring', () => {
     const hook = vi.fn();
     expect(resolveRestartServices(hook, true)).toBe(hook);
     expect(resolveRestartServices(hook, false)).toBe(hook);
+  });
+  describe('owed-restart retry wiring (resolveRetryPendingRestarts)', () => {
+    const real = vi.fn(), hook = vi.fn(), retry = vi.fn();
+    it.each([
+      ['real IO, nothing injected: the real retry', [undefined, undefined, true], real],
+      ['hermetic (injected rebuild), nothing injected: no retry, never the real one', [undefined, undefined, false], null],
+      ['real IO but a restart hook injected: no real retry', [undefined, hook, true], null],
+      ['hermetic with a restart hook: no retry', [undefined, hook, false], null],
+      ['an injected retry wins on real IO', [retry, undefined, true], retry],
+      ['an injected retry wins when hermetic', [retry, hook, false], retry],
+    ])('%s', (_name, [retryOpt, restartOpt, realIo], expected) => {
+      expect(resolveRetryPendingRestarts(retryOpt, restartOpt, realIo, real)).toBe(expected);
+    });
+    it('the default real retry is the real launchd restart', () => {
+      expect(resolveRetryPendingRestarts(undefined, undefined, true)).toBe(restartServicesForClone);
+    });
+  });
+});
+describe('disk restart lock: abandoned-owner recovery', () => {
+  const label = 'com.we.resource-sampler', deadPid = 424242, livePid = 515151;
+  function setup(liveness) {
+    const root = mkdtempSync(join(tmpdir(), 'launchd-lock-test-'));
+    return { root, locks: createDiskLocks({ root, liveness, pid: 7 }), dir: lockDirFor(root, `launchd-code-restart:${label}`) };
+  }
+  async function leave(dir, pid, extra = {}) {
+    await fsAsync.mkdir(dir, { recursive: true });
+    await fsAsync.writeFile(join(dir, 'lock.json'), JSON.stringify({ owner: `launchd-code-restart:${pid}:abc`, path: label, pid,
+      heartbeatAt: '2000-01-01T00:00:00.000Z', ...extra }));
+  }
+  it('a lock left by a provably exited holder is reclaimed, and the new holder can release it', async () => {
+    const { root, locks, dir } = setup(pid => (pid === deadPid ? 'dead' : 'alive'));
+    try {
+      await leave(dir, deadPid);
+      const release = await locks.acquire(label);
+      expect(release).toBeTypeOf('function');
+      expect(JSON.parse(await fsAsync.readFile(join(dir, 'lock.json'), 'utf8')).pid).toBe(7);
+      expect(await locks.acquire(label)).toBeNull();
+      await release();
+      expect(await fsAsync.stat(dir).catch(e => e.code)).toBe('ENOENT');
+    } finally { await fsAsync.rm(root, { recursive: true, force: true }); }
+  });
+  it.each(['alive', 'unknown'])('an aged lock whose owner is %s (e.g. a paused owner) is never reclaimed', async verdict => {
+    const { root, locks, dir } = setup(() => verdict);
+    try {
+      await leave(dir, livePid); // heartbeat is decades old: age alone must never free it
+      expect(await locks.acquire(label)).toBeNull();
+      expect(JSON.parse(await fsAsync.readFile(join(dir, 'lock.json'), 'utf8')).pid).toBe(livePid);
+    } finally { await fsAsync.rm(root, { recursive: true, force: true }); }
+  });
+  it.each([
+    ['no lock.json', async dir => { await fsAsync.mkdir(dir, { recursive: true }); }],
+    ['corrupt lock.json', async dir => { await fsAsync.mkdir(dir, { recursive: true }); await fsAsync.writeFile(join(dir, 'lock.json'), '{nope'); }],
+    ['no recorded pid', async dir => leave(dir, deadPid, { pid: null })],
+  ])('an unreadable or pid-less lock (%s) fails closed', async (_name, make) => {
+    const { root, locks, dir } = setup(pid => (Number.isInteger(pid) ? 'dead' : 'unknown'));
+    try {
+      await make(dir);
+      expect(await locks.acquire(label)).toBeNull();
+      expect(await fsAsync.stat(dir)).toBeTruthy();
+    } finally { await fsAsync.rm(root, { recursive: true, force: true }); }
+  });
+  it('with the real liveness probe, a lock left by an exited process is reclaimed and a live pid' + '' + 's lock is not', async () => {
+    const child = childProcess.spawn(process.execPath, ['-e', '']);
+    await new Promise(resolve => child.once('close', resolve));
+    const root = mkdtempSync(join(tmpdir(), 'launchd-lock-test-')), dir = lockDirFor(root, `launchd-code-restart:${label}`);
+    try {
+      const locks = createDiskLocks({ root });
+      await leave(dir, child.pid);
+      expect(await locks.acquire(label)).toBeTypeOf('function');
+      await fsAsync.rm(dir, { recursive: true });
+      await leave(dir, process.ppid);
+      expect(await locks.acquire(label)).toBeNull();
+    } finally { await fsAsync.rm(root, { recursive: true, force: true }); }
+  });
+  it('a lock that changed hands between the judgement and the reclaim is left alone', async () => {
+    // The probe says the judged holder is dead, but by the time it is removed a live holder has taken the path.
+    const { root, dir } = setup(() => 'dead');
+    let swapped = false;
+    const locks = createDiskLocks({ root, pid: 7, liveness: () => {
+      if (!swapped) { swapped = true; swap(); }
+      return 'dead';
+    } });
+    function swap() {
+      writeFileSync(join(dir, 'lock.json'), JSON.stringify({ owner: 'launchd-code-restart:99:new', path: label, pid: 99,
+        heartbeatAt: new Date().toISOString() }));
+    }
+    try {
+      await leave(dir, deadPid);
+      expect(await locks.acquire(label)).toBeNull();
+      expect(JSON.parse(await fsAsync.readFile(join(dir, 'lock.json'), 'utf8')).pid).toBe(99);
+    } finally { await fsAsync.rm(root, { recursive: true, force: true }); }
   });
 });
 describe('withSelfSync service restart hook', () => {
