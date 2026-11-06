@@ -172,8 +172,10 @@ describe('stale stageVerdict referral refusal', () => {
     const seen = [];
     const judge = vi.fn(async () => judgeOutcome({ summary: 'gate seats clean', findings: [] }, {}));
     const makeJudge = () => judge;
-    const body = '<!-- authored-by-actor: author -->';
-    const rec = { ...recordFor(HEAD_1, raised), pr: 4361, runId: 'r-stale', reviewer: mandatoryReferralReviewer('r-stale'), authorBody: body };
+    // An unstamped PR body adds the `author-stamp-missing` reason token to the cached pending list (PR #6465).
+    const unstamped = kind.startsWith('unstamped');
+    const body = unstamped ? 'plain PR body, no author stamp' : '<!-- authored-by-actor: author -->';
+    const rec ={ ...recordFor(HEAD_1, raised), pr: 4361, runId: 'r-stale', reviewer: mandatoryReferralReviewer('r-stale'), authorBody: body };
     rec.referrals[0].seat = 'judgeCorrectnessAdvisory';
     rec.referrals[0].key = referralFindingKey('judgeCorrectnessAdvisory', raised);
     const key = rec.referrals[0].key;
@@ -197,8 +199,9 @@ describe('stale stageVerdict referral refusal', () => {
     const refused = await runReviewLoopOnce({ ...common, argv: [`--resume=${rec.runId}`, '--answer=accept'] });
     expect(refused.stopped).toBe('step-refused');
     expect(refused.run.pending).toBeNull();
-    expect(refused.run.verdict.pendingReferrals).toEqual(rec.referrals.map(f => f.key));
-    if (kind !== 'missing') {
+    expect(refused.run.verdict.pendingReferrals).toEqual([...rec.referrals.map(f => f.key),
+      ...(unstamped ? ['author-stamp-missing'] : [])]);
+    if (kind !== 'missing' && kind !== 'unstamped-missing') {
       const body = buildOperatorRulingComment({ version: 1, repo: 'o/n', pr: 4361,
         head: kind === 'other-head' ? HEAD_2 : HEAD_1,
         rulings: [{ runId: kind === 'other-run' ? 'other' : rec.runId,
@@ -211,8 +214,8 @@ describe('stale stageVerdict referral refusal', () => {
     return { common, store, judge, refused, live, rec };
   }
 
-  it.each([false, true])('re-derives standing same-run/key/head card rulings and rewinds without new jurors (explicit resume: %s)', async explicit => {
-    const { common, store, judge, refused, live, rec } = await fixture();
+  it.each([[false, 'card'], [true, 'card'], [false, 'unstamped'], [true, 'unstamped']])('re-derives standing same-run/key/head card rulings and rewinds without new jurors (explicit resume: %s, %s body)', async (explicit, kind) => {
+    const { common, store, judge, refused, live, rec } = await fixture(kind);
     const count = judge.mock.calls.length;
     const p = { ...live(), number: 4361 };
     const rows = [reviewRunEvidence(refused.run)];
@@ -230,7 +233,7 @@ describe('stale stageVerdict referral refusal', () => {
     expect(judge.mock.calls.length).toBe(count);
   });
 
-  it.each(['missing', 'partial', 'other-head', 'other-run', 'other-key', 'malformed', 'unreadable-card', 'unreadable-thread', 'missing-record'])('%s ruling keeps the refused run held', async kind => {
+  it.each(['missing', 'partial', 'other-head', 'other-run', 'other-key', 'malformed', 'unreadable-card', 'unreadable-thread', 'missing-record', 'unstamped-missing'])('%s ruling keeps the refused run held', async kind => {
     const { common, refused, live, rec, judge } = await fixture(kind);
     const rows = [reviewRunEvidence(refused.run)];
     const p = { ...live(), number: 4361 };

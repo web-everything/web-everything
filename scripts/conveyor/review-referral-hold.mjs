@@ -28,7 +28,12 @@ import { reverifyStaleReferrals } from './referral-reverify.mjs';
 export const REFERRAL_HOLD_MARKER = 'review paused:';
 export const GH_LIST_COMMENT_CAP = 100;
 export const PENDING_REASON_TOKENS = Object.freeze(new Set(['author-stamp-missing']));
-export const REFERRAL_RETRY_MS = [15, 30, 60].map(n => n * 60_000);
+/** Run-level reasons `mandatoryReferralState` derives afresh from the live thread and PR body. They name no finding, so a
+ * refused run's cached list never matches them to a record key: the live re-read (empty `pending`) is what answers them.
+ * `referral-persistence-failed` is deliberately absent: nothing live re-derives a lost persist, so it stays fail-closed. */
+export const LIVE_REASON_TOKENS = Object.freeze(new Set([...PENDING_REASON_TOKENS,
+  'malformed-referral-record', 'malformed-operator-ruling', 'unavailable-reviewed-head', 'wrong-subject']));
+export const REFERRAL_RETRY_MS =[15, 30, 60].map(n => n * 60_000);
 const sha = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
@@ -234,8 +239,9 @@ export function persistRetryBudgetSpent(run) {
   return Boolean(run?.persistenceFailed) && 1 + (Number(run.persistRetries) || 0) > REFERRAL_RETRY_MS.length;
 }
 
-/** Re-read standing rulings, never a timestamp heuristic or an empty/missing thread. The cached pending keys
+/** Re-read standing rulings, never a timestamp heuristic or an empty/missing thread. The cached pending finding keys
  * must all occur in this run's live record; otherwise an unrelated cleared record could erase a lost referral.
+ * Reason tokens (`author-stamp-missing`, …) are answered by the empty live pending list, never by a record key.
  * This only authorizes a rewind: mandatoryReferrals still derives and persists the actual verdict. */
 export function refusedReferralsAreRuled(pr, run, { repo,
   cardReadable = ref => referralCardReadable(ref, REPO_ROOT) } = {}) {
@@ -247,7 +253,8 @@ export function refusedReferralsAreRuled(pr, run, { repo,
     if (live.pending.length) return false;
     const keys = new Set(live.records.filter(r => r.repo === repo && r.pr === run.pr
       && r.head === run.head && r.runId === run.id).flatMap(r => activeReferrals(r).map(f => f.key)));
-    return run.pending.every(key => keys.has(key));
+    const findingKeys = run.pending.filter(key => !LIVE_REASON_TOKENS.has(key));
+    return findingKeys.length > 0 && findingKeys.every(key => keys.has(key));
   } catch { return false; }
 }
 

@@ -19,7 +19,8 @@ export default {
   fixedBy: { sha: '065ad84674', where: 'main', paths: [HOLD, LOOP] },
   fixPresent(root) {
     try {
-      return readFileSync(join(root, HOLD), 'utf8').includes('export function refusedReferralsAreRuled')
+      const hold = readFileSync(join(root, HOLD), 'utf8');
+      return hold.includes('export function refusedReferralsAreRuled') && hold.includes('LIVE_REASON_TOKENS.has(key)')
         && readFileSync(join(root, LOOP), 'utf8').includes('parkedEvidence?.referralStageRefused');
     } catch { return false; }
   },
@@ -41,11 +42,15 @@ export default {
       const head = 'a'.repeat(40);
       const repo = 'o/n';
       const pr = 4361;
-      const body = '<!-- authored-by-actor: author -->';
       const path = 'scripts/operations/review-pr.mjs';
       const argv = [`--pr=${pr}`, `--repo=${repo}`];
-      for (const kind of ['all-ruled-auto', 'all-ruled-explicit', 'unruled', 'partial', 'other-head', 'other-run', 'other-key']) {
+      // PR #6465 round 2: an unstamped PR body caches `author-stamp-missing` beside the finding keys. That reason
+      // token is answered by the live re-read, never by a record key, so a fully ruled unstamped run still resumes.
+      for (const kind of ['all-ruled-auto', 'all-ruled-explicit', 'unruled', 'partial', 'other-head', 'other-run', 'other-key',
+        'unstamped-all-ruled-auto', 'unstamped-all-ruled-explicit', 'unstamped-unruled']) {
         const runId = `soak-refused-${kind}`;
+        const unstamped = kind.startsWith('unstamped-');
+        const body = unstamped ? 'plain PR body, no author stamp' : '<!-- authored-by-actor: author -->';
         const referrals = [1, 2].map(n => {
           const original = { file: path, line: n, summary: `confirmed defect ${n}`, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
           const seat = 'judgeCorrectnessAdvisory';
@@ -77,14 +82,14 @@ export default {
           advisorySettings: () => ({ value: { mode: 'off' } }) };
         await runReviewLoopOnce({ ...common, argv, mintRunId: () => runId });
         const refused = await runReviewLoopOnce({ ...common, argv: [`--resume=${runId}`, '--answer=accept'] });
-        const keys = referrals.map(f => f.key);
+        const keys = [...referrals.map(f => f.key), ...(unstamped ? ['author-stamp-missing'] : [])];
         const sameKeys = run => JSON.stringify(run?.verdict?.pendingReferrals) === JSON.stringify(keys);
         check(refused.stopped === 'step-refused' && refused.run.pending === null && sameKeys(refused.run)
           && declaration.steps[refused.run.cursor]?.name === 'stageVerdict', `${kind}: fixture must reach a real stageVerdict refusal with cached keys`);
         // Cache the durable projection BEFORE the later ruling; never refresh it from the thread.
         const rows = [reviewRunEvidence(refused.run)];
         const count = jurors;
-        if (kind !== 'unruled') {
+        if (!kind.endsWith('unruled')) {
           const ruled = kind === 'partial' ? referrals.slice(0, 1) : referrals;
           comments = [...comments, { author: { login: OPERATOR_LOGINS[0] }, createdAt: '2026-11-06T13:25:00Z',
             body: buildOperatorRulingComment({ version: 1, repo, pr, head: kind === 'other-head' ? 'b'.repeat(40) : head,
@@ -96,11 +101,11 @@ export default {
         const options = { repo, cardReadable: () => true };
         const held = decideReferralHold(live(), rows, options);
         const resumable = findResumableParkedRun(live(), rows, options);
-        const clears = kind.startsWith('all-ruled');
+        const clears = kind.includes('all-ruled');
         check(clears ? held === null && resumable?.id === runId && resumable?.head === head : held !== null && resumable === null,
           `${kind}: cached evidence must ${clears ? 'release only this ruled run' : 'keep the run blocked'}`);
         const out = await runReviewLoopOnce({ ...common,
-          argv: kind === 'all-ruled-auto' ? argv : [`--resume=${runId}`],
+          argv: kind.endsWith('all-ruled-auto') ? argv : [`--resume=${runId}`],
           findResumableRun: () => resumable?.id ?? null, mintRunId: () => 'must-not-start' });
         if (clears) {
           check(out.stopped === 'complete' && out.run.id === runId && out.run.verdict?.verdict === 'accept'
