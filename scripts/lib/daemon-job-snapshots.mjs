@@ -85,6 +85,22 @@ export function hasQuarantinedNodeModulesStore(storeDir) {
   return existsSync(quarantineNotice(storeDir));
 }
 
+/** Resolve a quarantined generation to a fresh store without disturbing existing consumers.
+ * Tombstone content gives every installer/reader the same next key. Unreadable evidence throws.
+ */
+export function nodeModulesStoreDir(jobsDir, key) {
+  assertKey(key, 'lockfile key');
+  const root = join(snapshotsRoot(jobsDir), 'node-modules');
+  for (let generation = 0; generation < 16; generation += 1) {
+    const dir = join(root, key);
+    if (!hasQuarantinedNodeModulesStore(dir)) return dir;
+    const next = lockfileKey(`${key}:${readFileSync(quarantineNotice(dir), 'utf8')}`);
+    if (!existsSync(dir) && !existsSync(join(root, next))) return dir;
+    key = next;
+  }
+  throw new Error('dependency recovery generation limit reached; operator must stop consumers and perform quarantine cleanup');
+}
+
 export function quarantineNodeModulesStore(storeDir, reason) {
   return withNodeModulesStoreLock(storeDir, () => {
     const quarantined = join(dirname(storeDir), `.quarantined-${Date.now()}-${process.pid}-${basename(storeDir)}`);
@@ -314,23 +330,15 @@ export function npmCiInstaller({ timeoutMs = NPM_INSTALL_TIMEOUT_MS } = {}) {
 /**
  * The `node_modules` store for the lockfile in `sourceDir`, built on first use.
  * @param {{jobsDir: string, sourceDir: string, install?: (into: string) => void}} o
- * @returns {{key: string, dir: string}}
+ * @returns {{key: string, dir: string}} Physical store key (a fresh generation after quarantine).
  */
 export function ensureNodeModulesStore({ jobsDir, sourceDir, install = npmCiInstaller(),
   readFile = readFileSync, writeFile = writeFileSync, freeze = setNodeModulesWritable,
   packageManifest = nodeModulesPackageManifest, treeEvidence = nodeModulesTreeEvidence }) {
   const lock = readFileSync(join(sourceDir, 'package-lock.json'), 'utf8');
   const key = lockfileKey(lock);
-  const dir = join(snapshotsRoot(jobsDir), 'node-modules', key);
+  const dir = nodeModulesStoreDir(jobsDir, key);
   mkdirSync(join(snapshotsRoot(jobsDir), 'node-modules'), { recursive: true });
-  if (hasQuarantinedNodeModulesStore(dir) && existsSync(dir)) {
-    withNodeModulesStoreLock(dir, () => {
-      if (hasNodeModulesConsumer(dir, console.error, readFileSync)) {
-        throw new Error('quarantined dependency store still has a live consumer');
-      }
-      removeStore(dir);
-    });
-  }
   buildOnce(dir, (into) => {
     copyFileSync(join(sourceDir, 'package.json'), join(into, 'package.json'));
     copyFileSync(join(sourceDir, 'package-lock.json'), join(into, 'package-lock.json'));
@@ -365,7 +373,7 @@ export function ensureNodeModulesStore({ jobsDir, sourceDir, install = npmCiInst
     // not silently regain trust. Installs lacking the hidden lock never reach the freeze above.
   });
   rmSync(quarantineNotice(dir), { force: true });
-  return { key, dir };
+  return { key: basename(dir), dir };
 }
 
 /** Link a store's `node_modules` into a code snapshot (idempotent). */

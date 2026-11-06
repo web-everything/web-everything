@@ -3991,3 +3991,13 @@ Unreadable records still throw, never skip.
 
 The scoped regressions are `drain-red-team-evidence`, `stream-filter-runs`, and the settings layout
 test `settings-files`; use heavy admission.
+
+### Dependency-store recovery fixtures
+
+`rebuild-deps-symlink.test.mjs` must recover a quarantined live store without manually
+unlinking its consumer: install a fresh generation, then drive the dependency tick's swap.
+Assert the old contents remain reachable until publication, the installed lockfile key
+updates only after the swap, and eviction protects the new physical store key.
+Dangling live links require installer/private-copy recovery even when the installed key
+matches; present targets with incomplete registration evidence must still refuse launch.
+An ancestor-directory alias must not turn a plain legacy copy into a linked-input check.

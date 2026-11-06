@@ -23,7 +23,7 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
-  existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync,
+  existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync,
 } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -35,8 +35,8 @@ import {
 import {
   ensureNodeModulesStore, evictSnapshots, lockfileKey, NODE_MODULES_HASH_FILE, nodeModulesRef,
   NODE_MODULES_MANIFEST_FILE, NODE_MODULES_UNSAFE_FILE, nodeModulesPackageManifest, nodeModulesTreeEvidence,
-  hasQuarantinedNodeModulesStore, quarantineNodeModulesStore,
-  recordNodeModulesConsumer, setNodeModulesWritable, snapshotsRoot, withNodeModulesStoreLock,
+  hasQuarantinedNodeModulesStore, quarantineNodeModulesStore, nodeModulesStoreDir,
+  recordNodeModulesConsumer, setNodeModulesWritable, withNodeModulesStoreLock,
 } from '../daemon-job-snapshots.mjs';
 import { TERMINAL_JOB_STATUSES } from '../../operations/job-record.mjs';
 import { daemonJobsDir } from '../../operations/run-store.mjs';
@@ -118,15 +118,15 @@ function registerCurrentLiveTarget(root, options = {}) {
   let entry;
   try { entry = lstatSync(live); } catch (error) { if (error?.code === 'ENOENT') return; throw error; }
   if (entry.isSymbolicLink()) {
-    try {
-      const store = dirname(realpathSync(live));
-      recordNodeModulesConsumer(store, root, { ...options, live: true });
-      if (hasQuarantinedNodeModulesStore(store)) return 'quarantined';
-    }
+    let store;
+    try { store = dirname(realpathSync(live)); }
     catch (error) {
-      if (error?.code === 'ENOENT' && hasQuarantinedNodeModulesStore(dirname(resolve(dirname(live), readlinkSync(live))))) return 'quarantined';
+      // Only an absent target is recoverable. Permission/registration failures stay closed.
+      if (error?.code === 'ENOENT') return 'missing';
       throw error;
     }
+    recordNodeModulesConsumer(store, root, { ...options, live: true });
+    if (hasQuarantinedNodeModulesStore(store)) return 'quarantined';
   }
 }
 
@@ -148,7 +148,7 @@ export function linkOrCopyNodeModules({
   catch { reason = 'source device/integrity evidence unreadable'; }
   // The checkout lockfile can move ahead of its live dependency link. Bind the real
   // target to the requested store inputs before trusting (or copying) its contents.
-  if (source !== original) {
+  if (lstatSync(original).isSymbolicLink()) {
     try {
       if (lockfileKey(readFile(join(storeDir, 'package-lock.json'), 'utf8')) !==
           lockfileKey(readFile(join(dirname(source), 'package-lock.json'), 'utf8'))) {
@@ -317,7 +317,7 @@ export function depsJobsDir(root, env = process.env) {
 
 /** The store directory (holding `node_modules/`) for a lockfile key, and whether it is complete. */
 export function depsStore(jobsDir, key) {
-  const dir = join(snapshotsRoot(jobsDir), 'node-modules', key);
+  const dir = nodeModulesStoreDir(jobsDir, key);
   return { dir, complete: !hasQuarantinedNodeModulesStore(dir) && existsSync(join(dir, COMPLETE_MARKER)) && existsSync(join(dir, 'node_modules')) };
 }
 
@@ -341,7 +341,10 @@ export function swapNodeModules({ root, storeDir, exec = execFileSync, rename = 
   const liveConsumer = { live: true, staging: tmp, backup: old };
   // Protect the current real target before cleanup or any new publication. A rollback may be
   // selecting an older store whose lockfile key differs from both the new key and job snapshotKeys.
-  registerCurrentLiveTarget(root, liveConsumer);
+  if (registerCurrentLiveTarget(root, liveConsumer) === 'missing') {
+    sayDeps(options.log ?? defaultLog, 'rebuild dependencies: missing live store; recovering with a private copy');
+    options.depsMode = 'copy';
+  }
   for (const name of readdirSync(root)) {
     if (/^\.node_modules\.(swap|old)\.\d+$/.test(name)) rmSync(join(root, name), { recursive: true, force: true });
   }
@@ -389,15 +392,15 @@ export async function refreshDepsAsJob({
   const say = (m) => log(`deps-job: ${m}`);
   // Migrate existing live symlinks before even an up-to-date return or a reattach/launch pass.
   // Older persisted state has no live reference, and launchJob's evictor only knows snapshotKeys.
-  let liveQuarantined = false;
-  try { liveQuarantined = registerCurrentLiveTarget(root) === 'quarantined'; }
+  let liveState;
+  try { liveState = registerCurrentLiveTarget(root); }
   catch (error) {
     say(`live dependency reference unavailable (${error?.code ?? 'unknown'}); not launching dependency jobs`);
     return { reason: 'live-reference-failed' };
   }
   let key;
   try { key = lockfileKey(readLock(root)); } catch { return { reason: 'no-lockfile' }; }
-  if (installed.read() === key && !liveQuarantined) return { reason: 'up-to-date', key };
+  if (installed.read() === key && !['quarantined', 'missing'].includes(liveState)) return { reason: 'up-to-date', key };
   mkdirSync(store.dir, { recursive: true });
   const kind = DEPS_JOB_KIND.kind;
   const mine = () => store.list().records.filter((r) => r.job.kind === kind && r.input?.key === key);
@@ -415,7 +418,7 @@ export async function refreshDepsAsJob({
     const referenced = store.list().records.filter((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status)).flatMap((r) => r.job.snapshotKeys || []);
     // A symlink still needs its store, including an older lockfile selected by a rollback.
     // Recency alone can evict precisely that live target.
-    referenced.push(nodeModulesRef(key));
+    referenced.push(nodeModulesRef(basename(st.dir)));
     try {
       if (lstatSync(join(root, 'node_modules')).isSymbolicLink()) referenced.push(nodeModulesRef(basename(dirname(realpathSync(join(root, 'node_modules'))))));
     } catch { /* the persisted live reference makes every evictor retain unreadable evidence */ }

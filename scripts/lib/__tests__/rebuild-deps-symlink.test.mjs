@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join, relative } from 'node:path';
 import * as deps from '../daemon-rebuild/deps-job.mjs';
 import { cloneNodeModulesInstaller, REBUILD_JOB_KIND } from '../daemon-rebuild/rebuild-job.mjs';
-import { ensureNodeModulesStore, evictSnapshots, quarantineNodeModulesStore, NODE_MODULES_HASH_FILE, NODE_MODULES_MANIFEST_FILE, NODE_MODULES_UNSAFE_FILE, nodeModulesRef, nodeModulesTreeEvidence, setNodeModulesWritable } from '../daemon-job-snapshots.mjs';
+import { ensureNodeModulesStore, evictSnapshots, quarantineNodeModulesStore, lockfileKey, NODE_MODULES_HASH_FILE, NODE_MODULES_MANIFEST_FILE, NODE_MODULES_UNSAFE_FILE, nodeModulesRef, nodeModulesTreeEvidence, setNodeModulesWritable } from '../daemon-job-snapshots.mjs';
 import { createJobStore, enqueueJob, launchJob, prepareJobCode } from '../daemon-jobs-runtime.mjs';
 import { markClaimed, markLaunching } from '../daemon-jobs.mjs';
 import { withFileLock } from '../atomic-json-file.mjs';
@@ -209,6 +209,18 @@ describe('shared link-or-copy safety decision', () => {
     expectCopied(f, /hash|integrity|evidence|missing|legacy/i);
     expect(existsSync(legacy)).toBe(true);
     expect(readdirSync(f.base).some((name) => name.startsWith('.quarantined-'))).toBe(false);
+  });
+
+  it('an ancestor alias of a plain legacy copy does not require store lockfiles', () => {
+    const f = fixture();
+    const legacy = join(f.base, 'legacy');
+    mkdirSync(legacy);
+    cpSync(join(f.storeDir, 'node_modules'), join(legacy, 'node_modules'), { recursive: true, dereference: false, verbatimSymlinks: true });
+    const alias = join(f.base, 'ancestor-alias');
+    symlinkSync(f.base, alias, 'dir');
+    deps.linkOrCopyNodeModules({ ...f, storeDir: join(alias, 'legacy') });
+    expectCopied(f, /legacy/i);
+    expect(existsSync(join(legacy, 'package-lock.json'))).toBe(false);
   });
 
   it('steps that write node_modules keep copies; an empty list requires the no-writer audit comment', () => {
@@ -622,9 +634,30 @@ describe('read-only dependency stores and rebuild consumer retention', () => {
     expectLinked(f);
   });
 
-  it('unreadable persisted live target evidence refuses dependency job launch and logs the reason', async () => {
+  it.each([false, true])('a dangling live link recovers through the installer/copy path (store ready: %s)', async (ready) => {
     const f = fixture();
     symlinkSync(join(f.base, 'missing-store', 'node_modules'), target(f), 'dir');
+    const reattach = vi.fn(async () => null);
+    const installed = { read: () => basename(f.storeDir), write: vi.fn() };
+    const store = createJobStore(join(f.base, 'jobs'));
+    if (!ready) rmSync(join(f.storeDir, '.snapshot-complete'));
+    const options = { root: f.root, installed, reattach, codeSha: 'deadbeef',
+      env: {}, log: f.log, store, swap: (args) => deps.swapNodeModules({ ...args, exec: f.exec }) };
+    const result = await deps.refreshDepsAsJob(options);
+    expect(result.reason).toBe(ready ? 'swapped' : 'deps-job-started');
+    if (!ready) {
+      expect(reattach).toHaveBeenCalledTimes(1);
+      ensureNodeModulesStore({ jobsDir: store.dir, sourceDir: f.sourceDir, install: f.install });
+      expect((await deps.refreshDepsAsJob(options)).reason).toBe('swapped');
+    }
+    expectCopied(f, /missing.*live|live.*missing/i);
+    expect(installed.write).toHaveBeenCalledWith(basename(f.storeDir));
+  });
+
+  it('a present live target with incomplete registration evidence still refuses launch', async () => {
+    const f = fixture();
+    symlinkSync(join(f.storeDir, 'node_modules'), target(f), 'dir');
+    rmSync(join(f.storeDir, '.snapshot-complete'));
     const reattach = vi.fn();
     const result = await deps.refreshDepsAsJob({
       root: f.root, installed: { read: () => null, write: vi.fn() }, reattach,
@@ -851,6 +884,20 @@ describe('quarantine recovery and explicit unsafe completion markers', () => {
     expect(existsSync(quarantined)).toBe(false);
   });
 
+  it('excessive quarantined recovery generations refuse install and name operator cleanup', () => {
+    const f = fixture();
+    let key = basename(f.storeDir);
+    for (let generation = 0; generation < 16; generation += 1) {
+      const dir = join(dirname(f.storeDir), key);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dirname(dir), `.node-modules-quarantined-${key}.json`), '{}');
+      key = lockfileKey(`${key}:{}`);
+    }
+    expect(() => ensureNodeModulesStore({ jobsDir: join(f.base, 'jobs'), sourceDir: f.sourceDir, install: f.install }))
+      .toThrow(/recovery generation limit.*operator.*cleanup/i);
+    expect(f.install).toHaveBeenCalledTimes(1);
+  });
+
   it('explicit copy mode also quarantines a store whose recorded fingerprint proves mutation', () => {
     const f = fixture();
     const path = join(f.storeDir, 'node_modules', 'pkg', 'index.js');
@@ -860,7 +907,7 @@ describe('quarantine recovery and explicit unsafe completion markers', () => {
     expectQuarantined(f, /fingerprint.*mismatch/i, () => deps.linkOrCopyNodeModules({ ...f, depsMode: 'copy' }));
   });
 
-  it('quarantine retains a mutated live target until its consumer releases it and queues recovery', async () => {
+  it('quarantine recovers through a fresh store and a pass-boundary swap without removing the live link', async () => {
     const f = fixture();
     deps.swapNodeModules(f);
     const path = join(f.storeDir, 'node_modules', 'pkg', 'index.js');
@@ -879,16 +926,23 @@ describe('quarantine recovery and explicit unsafe completion markers', () => {
     });
     expect(result.reason).toBe('deps-job-started');
     expect(reattach).toHaveBeenCalledTimes(1);
-    expect(() => ensureNodeModulesStore({ jobsDir: join(f.base, 'jobs'), sourceDir: f.sourceDir, install: f.install }))
-      .toThrow(/quarantined.*consumer/i);
-    rmSync(target(f));
-    // Publish a private replacement: an absent link alone may be a swap interval.
-    mkdirSync(target(f));
-    evictSnapshots({ jobsDir: join(f.base, 'jobs'), referenced: [], keep: 0 });
+    const rebuilt = ensureNodeModulesStore({ jobsDir: join(f.base, 'jobs'), sourceDir: f.sourceDir, install: f.install });
+    expect(rebuilt.dir).not.toBe(f.storeDir);
+    expect(f.install).toHaveBeenCalledTimes(2);
+    expect(readFileSync(join(target(f), 'pkg', 'index.js'), 'utf8')).toBe('mutated while shared');
+    expect(deps.depsStore(join(f.base, 'jobs'), basename(f.storeDir))).toMatchObject({ dir: rebuilt.dir, complete: true });
+    const write = vi.fn();
+    expect((await deps.refreshDepsAsJob({
+      root: f.root, installed: { read: () => basename(f.storeDir), write },
+      store: createJobStore(join(f.base, 'jobs')), reattach, env: {}, log: f.log,
+      evict: (options) => evictSnapshots({ ...options, keep: 0 }),
+      swap: (args) => deps.swapNodeModules({ ...args, exec: f.exec }),
+    })).reason).toBe('swapped');
+    expect(write).toHaveBeenCalledWith(basename(f.storeDir));
+    expect(readFileSync(join(target(f), 'pkg', 'index.js'), 'utf8')).toBe('export default 1;');
+    expect(realpathSync(target(f))).toBe(realpathSync(join(rebuilt.dir, 'node_modules')));
     expect(existsSync(f.storeDir)).toBe(false);
-    ensureNodeModulesStore({ jobsDir: join(f.base, 'jobs'), sourceDir: f.sourceDir, install: f.install });
-    deps.swapNodeModules(f);
-    expectLinked(f);
+    expect(deps.depsStore(join(f.base, 'jobs'), basename(f.storeDir))).toMatchObject({ dir: rebuilt.dir, complete: true });
   });
 
   it('quarantine retains a rebuild snapshot source until the snapshot is removed', () => {
