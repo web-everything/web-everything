@@ -118,13 +118,14 @@ const summarizeRun = run => ({ review: run?.op === 'review-pr', repo: typeof run
 // records of this PR whose head is this head (or whose head cannot be read):
 //  - a `hard` record (open label effect, pending rejection, unrecognised verdict) holds, as does any head-less
 //    blocking record, whose place among the heads cannot be ordered;
-//  - an undecided record still inside the abandon horizon (a review that may be running) holds;
+//  - an undecided record still inside the abandon horizon (a review that may be running) holds, as does one that started
+//    at or after the settling comment (a later re-review that comment cannot answer) or whose start is unreadable;
 //  - an undecided record that was rewound and resumed holds (the loop may still reject);
 //  - otherwise only the NEWEST completed same-head review decides: a finished rejection holds while it is the newest,
 //    and a later completed accept of the same head supersedes it. Newest is by read-step start (or resume stamp when later);
 //    a record whose start is unreadable or in the future cannot be ordered: a rejection of that kind holds, an accept supersedes nothing.
 // Any record that cannot be listed, statted, read or attributed to a PR fails closed.
-function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now }) {
+function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, settleAt }) {
   const incomplete = { complete: false, blocked: false };
   try {
     const cache = summaryCache.get(read) ?? summaryCache.set(read, new Map()).get(read);
@@ -148,8 +149,10 @@ function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now }
       if (s.rev !== null && s.rev !== want) continue;
       if (s.kind === 'hard') return { complete: true, blocked: true };
       if (s.kind === 'undecided') {
-        // maybe still running, or a rewound run the review loop will resume (which may still reject): holds
-        if (s.resumed || !(now - st.mtimeMs >= ABANDONED_REVIEW_AFTER_MS)) return { complete: true, blocked: true };
+        // maybe still running, or a rewound run the review loop will resume (which may still reject): holds. So does
+        // a review that started at or after the settling comment (a later re-review the comment cannot answer), and one
+        // whose start cannot be read, or a settle attempt that names no comment time: the chronology is strict.
+        if (s.resumed || !(now - st.mtimeMs >= ABANDONED_REVIEW_AFTER_MS) || !(s.orderAt < settleAt)) return { complete: true, blocked: true };
         continue;
       }
       // Order only on a readable start that is not in the future. A rejection that cannot be ordered holds; an accept
@@ -205,10 +208,13 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
   let scan = null;
   const failures = new Map();
   // R622: the complete same-PR, same-head read settlement requires; lazy (only a settle attempt pays) and memoized.
-  let completeRead = null;
-  const completeHeadRead = ({ pr: askedPr, head: askedHead } = {}) => {
+  const completeReads = new Map(); // per settling-comment time: the answer depends on it
+  const completeHeadRead = ({ pr: askedPr, head: askedHead, at } = {}) => {
     if (Number(askedPr) !== Number(pr) || String(askedHead).toLowerCase() !== String(head).toLowerCase()) return { complete: false, blocked: false };
-    return completeRead ??= completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now });
+    const settleAt = Number.isFinite(at) ? at : NaN; // no usable comment time: any unfinished same-head review holds
+    if (!completeReads.has(settleAt) && completeReads.size >= 8) completeReads.clear(); // bounded: few distinct comments per tick
+    if (!completeReads.has(settleAt)) completeReads.set(settleAt, completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, settleAt }));
+    return completeReads.get(settleAt);
   };
   const runScan = () => {
     const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, unfinished: null, since: -Infinity, active: -Infinity, undecided: true }]));
@@ -588,7 +594,7 @@ export function settleUnknownEvidenceByComment(evidence, comments, pr, head) {
   // The bounded scan cannot vouch for a same-head rejection (or its pending label effect) it did not read: only a
   // complete same-PR, same-head read with nothing blocking settles; no such read, or an incomplete one, stays held.
   let complete = null;
-  try { complete = typeof bounds.completeHeadRead === 'function' ? bounds.completeHeadRead({ pr, head }) : null; } catch { /* unreadable: stays held */ }
+  try { complete = typeof bounds.completeHeadRead === 'function' ? bounds.completeHeadRead({ pr, head, at }) : null; } catch { /* unreadable: stays held */ }
   if (complete?.complete !== true || complete.blocked !== false) return evidence;
   return { ok: true, settledByComment: evidence.reason, loopPayload: null, scheduled: false, inFlight: false,
     queued: false, recorded: true, skipCardOnly: false };

@@ -291,7 +291,7 @@ describe('R622 settlement needs a COMPLETE same-PR, same-head read, whatever the
   it('the complete read is asked for THIS pr and head', () => {
     const asked = vi.fn(cleanRead);
     settleUnknownEvidenceByComment(unknown('scan-capped', { ...older, completeHeadRead: asked }), [comment()], pr, head);
-    expect(asked).toHaveBeenCalledWith({ pr, head });
+    expect(asked).toHaveBeenCalledWith({ pr, head, at: T }); // and the settling comment's time, for the chronology check
   });
 
   const rec = ({ prNum = pr, rev = head, startedAt = T - 7200e3, repo = 'o/r', ...extra } = {}) => ({ op: 'review-pr', input: { repo, pr: prNum },
@@ -531,8 +531,8 @@ describe('R639 present-verdict check, capped-scan settlement through the complet
     findings: { read: { netBasis: { rev } } }, ...(withStart ? { stepTimings: [{ step: 'read', startedAt: new Date(startedAt).toISOString() }] } : {}), ...extra });
   const open = { effects: [{ status: 'pending' }] };
   const idOf = p => p.split('/').pop().replace('.json', '');
-  const reader = (runs, maxParses) => readDrainRedTeamEvidence({ repo: 'o/r', pr, head, env: { WE_SHARED_RUNS_DIR: '/nonexistent-r639' }, runsDir: '/runs',
-    warn: () => {}, readScorecards: () => [], now: T, scanSettings: { file: maxParses ? { runs: { scan: { maxParses } } } : {}, platform: {}, env: {} },
+  const reader = (runs, maxParses, nowAt = T) => readDrainRedTeamEvidence({ repo: 'o/r', pr, head, env: { WE_SHARED_RUNS_DIR: '/nonexistent-r639' }, runsDir: '/runs',
+    warn: () => {}, readScorecards: () => [], now: nowAt, scanSettings: { file: maxParses ? { runs: { scan: { maxParses } } } : {}, platform: {}, env: {} },
     list: () => Object.keys(runs), stat: p => ({ mtimeMs: runs[idOf(p)].mtime }), read: id => runs[id].run });
   const settle = evidence => settleUnknownEvidenceByComment(evidence, [comment()], pr, head);
   // 300 newer records of ANOTHER PR (past the default parse budget), all written after `newerThan`.
@@ -625,6 +625,40 @@ describe('R639 present-verdict check, capped-scan settlement through the complet
       expect(settle(behind(resumed, rec({ startedAt: T - 5 * HOUR, ...accept })))).toMatchObject({ ok: false, reason: 'scan-capped' });
       expect(settle(behind(rec({ ...resumed, resumedAt: new Date(T - 6 * HOUR).toISOString() }), rec({ startedAt: T - 5 * HOUR, ...accept })))).toMatchObject({ ok: true });
       expect(settle(behind(rec({ ...resumed, resumedAt: 'garbage' }), rec({ startedAt: T - 5 * HOUR, ...accept })))).toMatchObject({ ok: false, reason: 'scan-capped' });
+    });
+    describe('the complete read enforces comment chronology for unread unfinished same-head reviews', () => {
+      // The drain read happens long after the comment (nowAt), and the unread review has been quiet for hours, yet it STARTED
+      // after the trusted result comment (T): a later re-review the comment cannot answer. Quiet-for-the-horizon is not enough.
+      const NOW = T + 4 * HOUR;
+      const unread = run => reader({ ...decoys(T + 50 * 60e3), 'review-pr-hidden': { mtime: T + 40 * 60e3, run } }, undefined, NOW);
+      const afterComment = startedAt => ({ startedAt });
+      it('control: a quiet unread review that started BEFORE the comment settles (capped read)', () => {
+        const evidence = unread(rec(afterComment(T - HOUR)));
+        expect(evidence).toMatchObject({ ok: false, reason: 'scan-capped' });
+        expect(settle(evidence)).toMatchObject({ ok: true, settledByComment: 'scan-capped' });
+      });
+      it('started after the comment: holds (no verdict; needs-human awaiting confirm; accept with a pending step)', () => {
+        for (const extra of [{}, { verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' } }, { verdict: { verdict: 'accept' }, pending: { kind: 'confirm' } }]) {
+          const evidence = unread(rec({ ...afterComment(T + 30 * 60e3), ...extra }));
+          expect(evidence).toMatchObject({ ok: false, reason: 'scan-capped' });
+          expect(settle(evidence)).toMatchObject({ ok: false, reason: 'scan-capped' });
+          expect(holdFor(evidence, [comment()])).toMatch(/evidence unknown/);
+        }
+      });
+      it('the chronology is strict: started exactly at the comment holds, one ms earlier settles', () => {
+        expect(settle(unread(rec(afterComment(T))))).toMatchObject({ ok: false, reason: 'scan-capped' });
+        expect(settle(unread(rec(afterComment(T - 1))))).toMatchObject({ ok: true });
+      });
+      it('an unreadable start (no read step) holds: it cannot be placed before the comment', () => {
+        expect(settle(unread(rec({ withStart: false })))).toMatchObject({ ok: false, reason: 'scan-capped' });
+        expect(settle(unread(rec({ stepTimings: [{ step: 'read', startedAt: 'garbage' }] })))).toMatchObject({ ok: false, reason: 'scan-capped' });
+      });
+      it('the NEWEST trusted comment is the chronology: a review between an old and a new comment settles only on the new one', () => {
+        const evidence = unread(rec(afterComment(T - 60e3)));
+        const old = { ...comment(), createdAt: new Date(T - 3 * HOUR).toISOString() }, fresh = comment();
+        expect(settleUnknownEvidenceByComment(evidence, [old], pr, head)).toMatchObject({ ok: false, reason: 'scan-capped' });
+        expect(settleUnknownEvidenceByComment(evidence, [old, fresh], pr, head)).toMatchObject({ ok: true });
+      });
     });
     it('an unread rewound-and-resumed review with no verdict holds however quiet it is (the loop may still reject)', () => {
       for (const extra of [{ resumeOf: 'review-pr-x' }, { resumedAt: new Date(T - 4 * HOUR).toISOString() }, { verdict: { verdict: 'needs-human' }, resumeOf: 'review-pr-x' }]) {
