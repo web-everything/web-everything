@@ -1219,3 +1219,16 @@ describe('malformed label entries at the synchronizer are refused', () => {
     expect(provider.setLabels).not.toHaveBeenCalled();
   });
 });
+
+describe('policy-clear needs a proven acceptance even without a pending label', () => {
+  it('a changes-requested comment carrying a reviewed-sha marker never authorises the clear action', () => {
+    const f = notOwedFixture();
+    const o = runFixture({ ...f, now: () => f.now });
+    o.rawPrs[0].labels = o.rawPrs[0].labels.filter(label => (label.name ?? label) !== 'red-team:pending');
+    o.rawPrs[0].comments = [{ author: { login: 'web-everything' }, createdAt: iso(acceptedAt),
+      body: `\u{1F501} review \u2014 changes requested\n\nFix it.\n<!-- reviewed-sha: ${head} -->` }];
+    mod.runRedTeamOnSkip(o);
+    expect(o.settle).not.toHaveBeenCalled();
+    expect(o.syncLabels).not.toHaveBeenCalled();
+  });
+});

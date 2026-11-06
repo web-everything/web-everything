@@ -730,7 +730,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       // is not an independent review hold; all other thread comments still guard settlement.
       const holdComments = row.settle === 'result' ? comments.filter(comment =>
         !redTeamForHead([comment], row.prNumber, row.head) || isLaterVerdictBody(comment.body)) : comments;
-      if (row.settle === 'result'
+      if ((row.settle === 'result' || row.action === 'clear')
         && !provenAcceptance({ comments: holdComments, reviews, labels: live.labels, head: row.head })) {
         throw Error('no proven acceptance for this head; label unchanged');
       }
