@@ -50,7 +50,10 @@ function isGhThrottleOnlyDetail(detail) {
 
 const BUDGET_SKIP_TEXT = 'skipped: rebuild smoke budget exhausted \\(\\d+ms left\\)';
 // `<label> failed: ` (every check's own failure template) or `threw: ` (the gate wrapping an unguarded runChild).
-const BUDGET_SKIP = new RegExp(`^(?:(?:[^:\\r\\n]+ failed|threw): )?${BUDGET_SKIP_TEXT}$(?![\\s\\S])`);
+// dispatch-dry-run runs one child per pass and names the pass that was refused between the label and the skip:
+// `dispatch dry-run child failed: reconcile-fix-pass skipped: ...` (the fixed pass names only, never free text).
+const DISPATCH_PASS = '(?:reconcile-(?:fix|ci-heal|review)-pass )?';
+const BUDGET_SKIP = new RegExp(`^(?:(?:[^:\\r\\n]+ failed|threw): )?${DISPATCH_PASS}${BUDGET_SKIP_TEXT}$(?![\\s\\S])`);
 // reconcile-dry-run aggregates per repo: `reconcile-pass dry-run failed for N/M repo(s): <slug>: <skip>; <slug>: <skip>`.
 const RECONCILE_BUDGET_SKIP_HEAD = /^reconcile-pass dry-run failed for \d+\/\d+ repo\(s\): /;
 const RECONCILE_BUDGET_SKIP_SEG = new RegExp(`^[^:\\s;]+: ${BUDGET_SKIP_TEXT}$`);

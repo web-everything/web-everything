@@ -2758,6 +2758,15 @@ describe('load-shaped rows need host-load evidence (sticky rejection)', () => {
       expect(stickyIsLoadShapedRow({ ...row, hostLoad: hot }, {}), `${row.name} hot: ${row.detail}`).toBe(true);
       expect(stickyIsLoadShapedRow({ ...row, hostLoad: cool }, {}), `${row.name} cool`).toBe(false);
     }
+    // The dispatch dry-run names the refused pass before the skip; only the three real pass names qualify.
+    const dispatch = smoke.results.find((r) => r.name === 'dispatch-dry-run');
+    expect(dispatch.detail).toMatch(/^dispatch dry-run child failed: reconcile-(fix|ci-heal|review)-pass skipped: /);
+    for (const pass of ['reconcile-fix-pass', 'reconcile-ci-heal-pass', 'reconcile-review-pass']) {
+      const detail = dispatch.detail.replace(/reconcile-[\w-]+-pass/, pass);
+      expect(stickyIsLoadShapedRow({ ...dispatch, detail, hostLoad: hot }, {}), `${pass} hot`).toBe(true);
+    }
+    expect(stickyIsLoadShapedRow({ ...dispatch, detail: dispatch.detail.replace(/reconcile-[\w-]+-pass/, 'reconcile-evil-pass'), hostLoad: hot }, {})).toBe(false);
+    expect(stickyIsLoadShapedRow({ ...dispatch, detail: dispatch.detail.replace(/reconcile-[\w-]+-pass/, 'TypeError: x reconcile-fix-pass'), hostLoad: hot }, {})).toBe(false);
     // The reconcile aggregate: one real per-repo failure among the skips keeps the row code-shaped.
     const reconcile = smoke.results.find((r) => r.name === 'reconcile-dry-run');
     expect(reconcile.detail).toMatch(/^reconcile-pass dry-run failed for 3\/3 repo\(s\): .+; .+/);
