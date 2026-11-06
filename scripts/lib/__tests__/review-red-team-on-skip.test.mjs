@@ -71,6 +71,24 @@ describe('R100 — #5910 accepted stored review does not owe a red team', () => 
         action: 'skip', why: 'stored review does not owe a red team' }]);
     });
 
+  it('dispatches a red team for a judge-accepted head whose pending label cannot clear (#6438 deadlock)', () => {
+    const f = storedFixture(); const rev = storedHead;
+    f.rawPrs[0].labels = ['ready-to-merge', 'review:accepted', 'red-team:pending'];
+    f.readEvidence = () => ({ loopPayload: { verdict: { verdict: 'prevention-outstanding' },
+      findings: { read: { netBasis: { rev } } } }, recorded: false, seatRecorded: false, inFlight: false, queued: false });
+    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'dispatch', mode: 'fresh' });
+  });
+
+  it('clears pending for a judge-accepted head whose red team already finished not-owed (#6438 live state)', () => {
+    const f = storedFixture(); const rev = storedHead;
+    f.rawPrs[0].labels = ['ready-to-merge', 'review:accepted', 'red-team:pending'];
+    const status = { status: 'finished', result: 'not-owed' };
+    f.readEvidence = () => ({ loopPayload: { verdict: { verdict: 'prevention-outstanding' },
+      findings: { read: { netBasis: { rev } } } }, recorded: false, seatRecorded: false, inFlight: false, queued: false, status });
+    f.readStatus = () => status;
+    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'clear' });
+  });
+
   it.each(['inFlight', 'queued'])('skips an accepted not-owed review while %s', key => {
     const f = storedFixture(), evidence = { ...f.readEvidence(), [key]: true };
     f.readEvidence = () => evidence;
