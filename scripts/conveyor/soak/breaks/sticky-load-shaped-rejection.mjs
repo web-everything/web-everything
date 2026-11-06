@@ -15,7 +15,8 @@ const THROTTLE = 'gh-throttle: throttled — no gh slot within 8.095s (class=bac
 
 const overloadedRows = () => [
   { name: 'dispatch-dry-run', ok: false, ms: 533869, mayBeTransient: false, detail: 'dispatch dry-run child failed: timed out after 533869ms (process group killed)' },
-  { name: 'tree-stays-clean', ok: false, ms: 0, mayBeTransient: true, detail: BUDGET },
+  // The real check wraps the refusal: `checkTreeStaysClean` emits `git status --porcelain failed: <refusal>`.
+  { name: 'tree-stays-clean', ok: false, ms: 0, mayBeTransient: false, detail: `git status --porcelain failed: ${BUDGET}` },
   { name: 'daemon-entries-boot', ok: false, ms: 3, mayBeTransient: false,
     entries: [{ ok: false, kind: `child failed: ${BUDGET}`, timeoutMs: 60000, elapsedMs: 0,
       attempts: [{ ok: false, kind: `child failed: ${BUDGET}` }] }],

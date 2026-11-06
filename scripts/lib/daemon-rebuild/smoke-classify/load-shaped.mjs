@@ -48,7 +48,7 @@ function isGhThrottleOnlyDetail(detail) {
     && segs.every((seg) => GH_THROTTLE_SEGMENT.test(seg) || GH_THROTTLE_TAIL.test(seg));
 }
 
-const BUDGET_SKIP = /^skipped: rebuild smoke budget exhausted \(\d+ms left\)$(?![\s\S])/;
+const BUDGET_SKIP = /^(?:[^:\r\n]+ failed: )?skipped: rebuild smoke budget exhausted \(\d+ms left\)$(?![\s\S])/;
 const CHILD_BUDGET_SKIP = /^child failed: skipped: rebuild smoke budget exhausted \(\d+ms left\)$(?![\s\S])/;
 const BOUNDED_KILL = /^[^:\r\n]+ failed: timed out after (\d+)ms \(process group killed\)$(?![\s\S])/;
 const EXTENDED_GH_THROTTLE_SEGMENT = new RegExp(GH_THROTTLE_SEGMENT.source.replace(

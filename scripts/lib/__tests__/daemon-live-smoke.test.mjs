@@ -2738,6 +2738,23 @@ describe('load-shaped rows need host-load evidence (sticky rejection)', () => {
     expect(stickyIsLoadShapedRow(budgetRow('tree-stays-clean'), { WE_SMOKE_HOST_LOAD1: '120', WE_SMOKE_HOST_CORES: '12' })).toBe(true);
     expect(stickyIsLoadShapedRow({ ...budgetRow('tree-stays-clean'), hostLoad: { load1: NaN, cores: 12 } }, {})).toBe(false);
   });
+  it('the REAL tree-stays-clean result under an exhausted budget is load-shaped on an overloaded host (retry), code on an idle one', async () => {
+    const runChild = budgetedRunChild({ deadline: 0, now: () => 0, runChild: vi.fn() });
+    const smoke = await runLiveSmoke({ root: '/x', env: { WE_SMOKE_LOAD_SCALE: '0', WE_SMOKE_BUSY_LOAD_RATIO: '1e9' }, runChild, clock: () => 0 });
+    const real = smoke.results.find((r) => r.name === 'tree-stays-clean');
+    // Produced by the check itself (not hand-typed): `<label> failed: ` wraps the budget refusal.
+    expect(real.detail).toBe('git status --porcelain failed: skipped: rebuild smoke budget exhausted (0ms left)');
+    expect(stickyIsLoadShapedRow({ ...real, hostLoad: hot }, {})).toBe(true);
+    expect(stickyIsLoadShapedRow({ ...real, hostLoad: cool }, {})).toBe(false);
+    // A trailing second line or extra text stays code-shaped.
+    expect(stickyIsLoadShapedRow({ ...real, detail: `${real.detail}\nTypeError: x`, hostLoad: hot }, {})).toBe(false);
+    expect(stickyIsLoadShapedRow({ ...real, detail: real.detail.replace('skipped', 'exited 1; skipped'), hostLoad: hot }, {})).toBe(false);
+    const state = { rejected: { inputsKey: 'k', reason: 'tree-stays-clean', at: 'x' },
+      held: { reason: 'smoke-rejected', details: [{ name: 'tree-stays-clean', detail: real.detail }] } };
+    const now = Date.parse('2026-11-05T17:00:00Z');
+    expect(stickyLoadShaped.cachedRejectionLoadRetry(state, { WE_SMOKE_HOST_LOAD1: '120', WE_SMOKE_HOST_CORES: '12' }, { now }))
+      .toMatchObject({ envLoad: true, attempts: 1 });
+  });
   it('cachedRejectionLoadRetry schedules an env-load retry for a cached load-shaped rejection', () => {
     const state = { rejected: { inputsKey: 'k', reason: 'dispatch-dry-run,tree-stays-clean', at: 'x' },
       held: { reason: 'smoke-rejected', details: [
