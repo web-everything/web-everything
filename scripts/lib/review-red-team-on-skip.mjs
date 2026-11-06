@@ -449,6 +449,10 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           // The stored verdict may predate the acceptance (a round-budget accept leaves `changes` behind);
           // a finished not-owed status on this accepted head settles as policy-clear (R100/R338).
           && (redTeamRequired(evidence.loopPayload?.verdict?.verdict)
+            // A judge/round-budget accept (provable accept comment on this head) leaves prevention-outstanding stored.
+            // A red-team-only job returns not-owed for it WITHOUT writing a status, so dispatching one would only
+            // re-run that no-op each cooldown; with no red-team state at all, settle the kept pending label here.
+            || (keepsPending && judgeAccepted && evidence.status == null && status == null)
             || [evidence.status, status].every(candidate => candidate?.status === 'finished'
               && normalizeRedTeamResult(candidate.result).priorResult === 'not-owed'))
           && evidence.recorded !== true && evidence.seatRecorded !== true) {
@@ -459,15 +463,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           if (keepsPending && !acceptedReview && !judgeAccepted) return notOwed();
           return { ...row, action: 'clear', why: 'not owed (stored review)' };
         }
-        // A judge/round-budget accept on this exact head (provable accept comment) leaves a non-accepting stored
-        // verdict behind, so pending can neither clear nor be told "not owed". Without any red-team state for the
-        // head, the pass has never run: dispatch it (the job settles not-owed itself) instead of a human look.
-        const acceptedByJudge = keepsPending && !acceptedReview && verdict === VERDICTS.PREVENTION_OUTSTANDING && !finishedNotOwed && !owed
-          && provenAcceptance({ comments: rawPr.comments, reviews, labels: rawPr.labels, head }) !== null
-          && !publishableClearGuard({ labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews, settlesPending: true })
-          && evidence?.status == null && status == null && evidence.recorded === false && evidence.seatRecorded === false
-          && !evidence.inFlight && !evidence.queued;
-        if ((!owed || finishedNotOwed) && !acceptedByJudge) return notOwed();
+        if (!owed || finishedNotOwed) return notOwed();
       }
       if (!movedCardOnly && evidence.loopPayload?.findings?.read?.netBasis?.rev !== head) return skip('stored review does not match live head');
       if (evidence.inFlight || evidence.queued) return skip('red-team pass in flight');

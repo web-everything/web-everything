@@ -71,12 +71,57 @@ describe('R100 — #5910 accepted stored review does not owe a red team', () => 
         action: 'skip', why: 'stored review does not owe a red team' }]);
     });
 
-  it('dispatches a red team for a judge-accepted head whose pending label cannot clear (#6438 deadlock)', () => {
+  // A red-team-only job on a prevention-outstanding stored verdict returns `red-team-not-owed` before it writes any
+  // status (review-job.mjs), so the planner must never dispatch it: it would re-run the same no-op each cooldown.
+  const judgeAcceptedFixture = (labels, evidenceOver = {}) => {
     const f = storedFixture(); const rev = storedHead;
-    f.rawPrs[0].labels = ['ready-to-merge', 'review:accepted', 'red-team:pending'];
+    f.rawPrs[0].labels = labels;
     f.readEvidence = () => ({ loopPayload: { verdict: { verdict: 'prevention-outstanding' },
-      findings: { read: { netBasis: { rev } } } }, recorded: false, seatRecorded: false, inFlight: false, queued: false });
-    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'dispatch', mode: 'fresh' });
+      findings: { read: { netBasis: { rev } } } }, recorded: false, seatRecorded: false, inFlight: false, queued: false,
+    ...evidenceOver });
+    return f;
+  };
+
+  it('clears pending directly for a judge-accepted head with no red-team state, never dispatching a no-op job (#6438 deadlock)', () => {
+    const [row] = planRedTeamOnSkip(judgeAcceptedFixture(['ready-to-merge', 'review:accepted', 'red-team:pending']));
+    expect(row).toMatchObject({ action: 'clear', why: 'not owed (stored review)' });
+    expect(row.action).not.toBe('dispatch');
+  });
+
+  it('does not clear a judge-accepted head without a pending label (no new policy-clear comment for settled heads)', () => {
+    const [row] = planRedTeamOnSkip(judgeAcceptedFixture(['ready-to-merge', 'review:accepted']));
+    expect(row.action).toBe('skip');
+  });
+
+  it('does not clear a prevention-outstanding head whose accept label has no provable accept comment', () => {
+    const f = judgeAcceptedFixture(['ready-to-merge', 'review:accepted', 'red-team:pending']);
+    f.rawPrs[0].comments = [];
+    expect(planRedTeamOnSkip(f)[0].action).toBe('skip');
+  });
+
+  it('does not clear a judge-accepted head without the review:accepted label', () => {
+    const f = judgeAcceptedFixture(['ready-to-merge', 'red-team:pending']);
+    expect(planRedTeamOnSkip(f)[0].action).toBe('skip');
+  });
+
+  it.each([
+    ['a recorded red-team run', { recorded: true }],
+    ['a recorded seat', { seatRecorded: true }],
+    ['an in-flight pass', { inFlight: true }],
+    ['a queued pass', { queued: true }],
+  ])('does not clear a judge-accepted head with %s', (_name, evidenceOver) => {
+    const f = judgeAcceptedFixture(['ready-to-merge', 'review:accepted', 'red-team:pending'], evidenceOver);
+    expect(planRedTeamOnSkip(f)[0].action).toBe('skip');
+  });
+
+  it.each([
+    ['running', { status: 'running' }],
+    ['failed', { status: 'finished', result: { status: 'failed' } }],
+    ['deferred by cap', { status: 'finished', result: { status: 'not-owed', deferredByCap: true } }],
+  ])('does not clear a judge-accepted head whose red-team status is %s', (_name, status) => {
+    const f = judgeAcceptedFixture(['ready-to-merge', 'review:accepted', 'red-team:pending'], { status });
+    f.readStatus = () => status;
+    expect(planRedTeamOnSkip(f)[0].action).not.toBe('clear');
   });
 
   it('clears pending for a judge-accepted head whose red team already finished not-owed (#6438 live state)', () => {
