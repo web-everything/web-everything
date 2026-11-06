@@ -188,6 +188,18 @@
       "findings": [
         "scripts/lib/policy-cascade.mjs:79 — Per-leaf merging retains the repository’s weaker build gates when an operator supplies only `build.priority` or `build: {}`. A read-only probe confirmed the effective policy changes from `full`/`always` to `related`/`selected`, reducing verification from the full unit suite plus standards to diff-selected checks (scripts/verify-lane.mjs:366)."
       ]
+    },
+    {
+      "ref": "lane/overlay-sync-flake-rerun",
+      "sha": "23a90dd0f25512eb575f34c8685c8dda8523e2b7",
+      "ruling": "R635+R637",
+      "findings": [
+        "scripts/lib/daemon-rebuild/overlay-main-sync.mjs:674 — A passing rerun of only failed files now permits publication after an initially failing run; the previous gate rejected that run outright.",
+        "scripts/lib/daemon-rebuild/overlay-main-sync.mjs:694 — Matching failed assertion identities on main now clears retry state and returns a skip, bypassing the existing failure outcome and operator-alert escalation; matching names do not establish matching causes.",
+        "scripts/lib/daemon-rebuild/overlay-main-sync.mjs:343 — Cached main-red evidence bypasses retesting for six hours by default, delaying detection of changed environmental failures even when commit SHAs remain unchanged.",
+        "scripts/lib/daemon-rebuild/overlay-main-sync.mjs:276 — Missing, unreadable, or invalid rerun configuration falls back to allowing one rerun, enabling the weaker publication policy instead of retaining the original fail-closed behavior.",
+        "scripts/conveyor/__tests__/prep-review.test.mjs:301 — Raises this test’s timeout to 30 seconds; the same relaxation at line 659 allows slower or stalled behavior to escape the previous timeout guard."
+      ]
     }
   ]
 }
