@@ -118,6 +118,13 @@ export const REPO_SCAN_TESTS = Object.freeze([
     inputs: ['scripts/lib/permission-change.mjs', 'scripts/lib/__tests__/permission-change.test.mjs'],
   },
   {
+    test: 'scripts/operations/__tests__/audit-verdict.test.mjs',
+    scope: 'full',
+    why: 'expands REVIEW_AUTH_FLOOR to tracked modules and reads their direct imports, so a new import in any review authorization module must be on the floor (a whole-family fact; not expressible per changed file)',
+    matches: (f) => /\.(mjs|cjs|js)$/.test(f) && !skipped(f) && !/\.test\./.test(f) && inTree(f, ['scripts']),
+    inputs: ['scripts/lib/audit-settings.mjs', 'scripts/operations/audit-verdict.mjs', 'scripts/operations/__tests__/audit-verdict.test.mjs'],
+  },
+  {
     test: 'scripts/operations/__tests__/worker-result.test.mjs',
     scope: 'full',
     why: 'asserts the legacy outcome mapping is total over every `--outcome=` word in skills-src/**/*-brief*.md (item 117 S1); reads the briefs, so a brief change must re-run it',
