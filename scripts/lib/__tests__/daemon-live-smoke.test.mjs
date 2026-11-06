@@ -2749,11 +2749,24 @@ describe('load-shaped rows need host-load evidence (sticky rejection)', () => {
     // A trailing second line or extra text stays code-shaped.
     expect(stickyIsLoadShapedRow({ ...real, detail: `${real.detail}\nTypeError: x`, hostLoad: hot }, {})).toBe(false);
     expect(stickyIsLoadShapedRow({ ...real, detail: real.detail.replace('skipped', 'exited 1; skipped'), hostLoad: hot }, {})).toBe(false);
-    // Sibling checks wrap the same refusal with their own `<label> failed: ` prefix (daemon-live-smoke.mjs detail templates).
-    for (const label of ['dispatch dry-run child failed', 'gh api --method GET repos/o/r failed', 'gh pr list --repo o/r --limit 1 failed']) {
-      expect(stickyIsLoadShapedRow({ name: 'x', ok: false, detail: `${label}: ${budget}`, hostLoad: hot }, {})).toBe(true);
-      expect(stickyIsLoadShapedRow({ name: 'x', ok: false, detail: `${label}: ${budget}`, hostLoad: cool }, {})).toBe(false);
+    // Every sibling check wraps the same refusal in its OWN template (`<label> failed: `, the reconcile per-repo
+    // aggregate): take each string from the real check, never a hand-typed label.
+    const wrapped = smoke.results.filter((r) => !r.ok && r.name !== 'tree-stays-clean');
+    expect(wrapped.map((r) => r.name)).toEqual(expect.arrayContaining(
+      ['lane-pool-list', 'gh-api-repo', 'gh-pr-list', 'reconcile-dry-run', 'dispatch-dry-run', 'daemon-entries-boot']));
+    for (const row of wrapped) {
+      expect(stickyIsLoadShapedRow({ ...row, hostLoad: hot }, {}), `${row.name} hot: ${row.detail}`).toBe(true);
+      expect(stickyIsLoadShapedRow({ ...row, hostLoad: cool }, {}), `${row.name} cool`).toBe(false);
     }
+    // The reconcile aggregate: one real per-repo failure among the skips keeps the row code-shaped.
+    const reconcile = smoke.results.find((r) => r.name === 'reconcile-dry-run');
+    expect(reconcile.detail).toMatch(/^reconcile-pass dry-run failed for 3\/3 repo\(s\): .+; .+/);
+    expect(stickyIsLoadShapedRow({ ...reconcile, detail: `${reconcile.detail}; o/r: exited 1: TypeError`, hostLoad: hot }, {})).toBe(false);
+    expect(stickyIsLoadShapedRow({ ...reconcile, detail: `${reconcile.detail}\nTypeError: x`, hostLoad: hot }, {})).toBe(false);
+    // The gate's own `threw: ` wrapper of an unguarded runChild.
+    expect(stickyIsLoadShapedRow({ name: 'x', ok: false, detail: `threw: ${budget}`, hostLoad: hot }, {})).toBe(true);
+    expect(stickyIsLoadShapedRow({ name: 'x', ok: false, detail: `threw: ${budget}`, hostLoad: cool }, {})).toBe(false);
+    expect(stickyIsLoadShapedRow({ name: 'x', ok: false, detail: 'threw: TypeError: x', hostLoad: hot }, {})).toBe(false);
     const state = { rejected: { inputsKey: 'k', reason: 'tree-stays-clean', at: 'x' },
       held: { reason: 'smoke-rejected', details: [{ name: 'tree-stays-clean', detail: real.detail }] } };
     const now = Date.parse('2026-11-05T17:00:00Z');

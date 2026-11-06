@@ -48,7 +48,19 @@ function isGhThrottleOnlyDetail(detail) {
     && segs.every((seg) => GH_THROTTLE_SEGMENT.test(seg) || GH_THROTTLE_TAIL.test(seg));
 }
 
-const BUDGET_SKIP = /^(?:[^:\r\n]+ failed: )?skipped: rebuild smoke budget exhausted \(\d+ms left\)$(?![\s\S])/;
+const BUDGET_SKIP_TEXT = 'skipped: rebuild smoke budget exhausted \\(\\d+ms left\\)';
+// `<label> failed: ` (every check's own failure template) or `threw: ` (the gate wrapping an unguarded runChild).
+const BUDGET_SKIP = new RegExp(`^(?:(?:[^:\\r\\n]+ failed|threw): )?${BUDGET_SKIP_TEXT}$(?![\\s\\S])`);
+// reconcile-dry-run aggregates per repo: `reconcile-pass dry-run failed for N/M repo(s): <slug>: <skip>; <slug>: <skip>`.
+const RECONCILE_BUDGET_SKIP_HEAD = /^reconcile-pass dry-run failed for \d+\/\d+ repo\(s\): /;
+const RECONCILE_BUDGET_SKIP_SEG = new RegExp(`^[^:\\s;]+: ${BUDGET_SKIP_TEXT}$`);
+
+/** PURE: the WHOLE reconcile detail is per-repo budget skips — one real failure among them keeps it code. */
+function isReconcileBudgetSkipDetail(detail) {
+  if (/[\r\n]/.test(detail) || !RECONCILE_BUDGET_SKIP_HEAD.test(detail)) return false;
+  const segs = detail.replace(RECONCILE_BUDGET_SKIP_HEAD, '').split('; ');
+  return segs.length > 0 && segs.every((seg) => RECONCILE_BUDGET_SKIP_SEG.test(seg));
+}
 const CHILD_BUDGET_SKIP = /^child failed: skipped: rebuild smoke budget exhausted \(\d+ms left\)$(?![\s\S])/;
 const BOUNDED_KILL = /^[^:\r\n]+ failed: timed out after (\d+)ms \(process group killed\)$(?![\s\S])/;
 const EXTENDED_GH_THROTTLE_SEGMENT = new RegExp(GH_THROTTLE_SEGMENT.source.replace(
@@ -118,7 +130,7 @@ export function isLoadShapedRow(row, env = {}, probe) {
   if (LOAD_CONTENTION_SIGNATURES.some((re) => re.test(detail))) return true;
   // Our slot refusal is load contention even for code checks such as dispatch-dry-run.
   if (isGhThrottleOnlyDetail(detail)) return true;
-  if ((BUDGET_SKIP.test(detail) || isBudgetBootRow(row, detail, minElapsedMs)
+  if ((BUDGET_SKIP.test(detail) || isReconcileBudgetSkipDetail(detail) || isBudgetBootRow(row, detail, minElapsedMs)
     || isExtendedGhThrottleOnlyDetail(detail))
     && hostOverloaded(row, env, probe)) return true;
   return row.mayBeTransient !== false && TRANSIENT_FAILURE_PATTERNS.some((re) => re.test(detail));
