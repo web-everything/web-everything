@@ -1048,6 +1048,25 @@ describe('settleUnknownEvidenceByComment: result older than the unfinished revie
   it('holds when a formal CHANGES_REQUESTED review stands after the accept', () => {
     expect(settle(unknown(), [result(), accept()], [review('CHANGES_REQUESTED', T + 20 * 60e3)])).toMatchObject({ ok: false });
   });
+  // "Nothing held after the accept" across the comment channels, not only formal reviews.
+  it('holds when a later trusted comment is a body-derived hold (manifest baseline mismatch)', () => {
+    const park = { author: { login: 'web-everything' }, createdAt: iso(T + 20 * 60e3), body: 'Drain parked: manifest baseline mismatch on this head.' };
+    expect(settle(unknown(), [result(), accept(), park])).toMatchObject({ ok: false });
+  });
+  it('holds when a later human comment is unrecognised (e.g. a "hold" note), from any author', () => {
+    for (const login of ['chalbert', 'web-everything']) {
+      const note = { author: { login }, createdAt: iso(T + 20 * 60e3), body: 'hold — do not merge until I have looked at this' };
+      expect(settle(unknown(), [result(), accept(), note])).toMatchObject({ ok: false });
+    }
+  });
+  it('holds when a later comment is a changes-requested verdict', () => {
+    const verdict = { author: { login: 'web-everything' }, createdAt: iso(T + 20 * 60e3), body: '🔁 review — changes requested\n\nfix the thing' };
+    expect(settle(unknown(), [result(), accept(), verdict])).toMatchObject({ ok: false });
+  });
+  it('still settles when the only later comment is a recognised machine note (non-regression pin)', () => {
+    const note = { author: { login: 'web-everything' }, createdAt: iso(T + 20 * 60e3), body: '' };
+    expect(settle(unknown(), [result(), accept(), note])).toMatchObject({ ok: true, settledByComment: 'review-unfinished' });
+  });
   it('holds (fails closed) when the formal reviews are unreadable or not supplied', () => {
     expect(settle(unknown(), [result(), accept()], null)).toMatchObject({ ok: false });
     expect(settleUnknownEvidenceByComment(unknown(), [result(), accept()], pr, head)).toMatchObject({ ok: false });
