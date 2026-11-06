@@ -195,13 +195,27 @@ describe('R473 pure classified verdict', () => {
     }
   });
   // The anywhere-in-basename globs also capture files whose name holds the word inside another word (`release` holds
-  // `lease`) and golden-corpus data. Protecting more only ever blocks more, so this over-capture is accepted and listed.
-  it.each(['scripts/conveyor/orphan-claim-release.mjs', 'scripts/conveyor/prepare-failure-releases.json',
-    'scripts/golden-corpus/hook-guard-lane/own-leased-lane-edit.json',
-    'scripts/golden-corpus/backlog-resolve/b10e9466-2290-collapse-all-land-routes-to-drain-only-the-drain-is-the-sole.json'])(
-    'the accepted over-capture %s is on the floor', async file => {
-      expect((await compute([finding({ class: 'E2', file })], options())).verdict).toBe('WEAKENED');
-    });
+  // `lease`), tests and golden-corpus data. Protecting more only ever blocks more, so this over-capture is accepted.
+  // Every tracked file the wide form captures and the old start-of-name form did not is derived from git and listed.
+  const overCaptureRoot = fileURLToPath(new NodeURL('../../../', import.meta.url));
+  const tracked = spec => execFileSync('git', ['ls-files', '-z', '--', spec], { cwd: overCaptureRoot, encoding: 'utf8', maxBuffer: 4 << 20 })
+    .split('\0').filter(Boolean);
+  const WORDS = ['file-locks', 'lease', 'slot', 'lock-reaper', 'lane-pool', 'merge', 'drain', 'mq'];
+  const OVER_CAPTURE = [...new Set(WORDS.flatMap(w => {
+    const prefixOnly = new Set([...tracked(`:(glob)scripts/**/${w}*`), ...tracked(`:(glob)scripts/${w}*`)]);
+    return tracked(`:(glob)scripts/**/*${w}*`).filter(p => !prefixOnly.has(p));
+  }))].sort();
+  it('the over-capture list is derived from git and holds every word-inside-word capture (PR #6381 send-back)', () => {
+    expect(OVER_CAPTURE).toEqual(expect.arrayContaining(['scripts/readiness/forge-slot-markers.mjs',
+      'scripts/conveyor/orphan-claim-release.mjs', 'scripts/conveyor/prepare-failure-releases.json',
+      'scripts/conveyor/__tests__/orphan-claim-release.test.mjs', 'scripts/__tests__/lane-pool-release-salvage.test.mjs',
+      'scripts/conveyor/soak/breaks/card-filer-releases-dirty-lane.mjs', 'scripts/conveyor/soak/breaks/detail-head-must-not-release-human-hold.mjs',
+      'scripts/conveyor/soak/breaks/idle-status-fixer-claim-never-released.mjs', 'scripts/conveyor/soak/breaks/prepare-released-needs-you-park.mjs',
+      'scripts/conveyor/soak/breaks/successive-released-fix-pids.mjs', 'scripts/golden-corpus/hook-guard-lane/own-leased-lane-edit.json']));
+  });
+  it.each(OVER_CAPTURE)('the accepted over-capture %s is on the floor', async file => {
+    expect((await compute([finding({ class: 'E2', file })], options())).verdict).toBe('WEAKENED');
+  });
   it.each([
     './scripts/lib/file-locks.mjs',
     'a/../scripts/lib/file-locks.mjs',
