@@ -1648,6 +1648,23 @@ describe('red-team finding classes', () => {
     expect(applyRecheck([f], { checks: [{ ...check, findingClass: undefined }] })[0].findingClass).toBeUndefined();
     expect(applyRecheck([f], { checks: [{ ...check, findingClass: 'coverage-or-style' }] })[0]).toMatchObject({ findingClass: f.findingClass, classBasis: f.classBasis });
   });
+  it('a reviewer without a basis keeps the merged finding blocking under any policy', () => {
+    const deferAll = { 'theoretical-race': 'defer-card', 'coverage-or-style': 'defer-card' };
+    const cases = [
+      [{ findingClass: 'theoretical-race', classBasis: 'Requires overlapping writes' }, { findingClass: 'coverage-or-style', classBasis: '' }],
+      [{ findingClass: 'theoretical-race', classBasis: '  ' }, { findingClass: 'coverage-or-style', classBasis: 'style only' }],
+      [{ findingClass: 'theoretical-race', classBasis: 'Requires overlapping writes' }, { findingClass: 'coverage-or-style' }],
+    ];
+    for (const [orig, check] of cases) {
+      const [out] = applyRecheck([{ ...VALID_SEAT_FINDING, ...orig }], { checks: [{ index: 0, confirmed: true, ...check }] });
+      expect(out.findingClass).toBeUndefined();
+      expect(out.alsoClasses).toBeUndefined();
+      const body = renderRedTeamComment({ pr: 1, rev: 'a'.repeat(40), findings: [out], findingClasses: deferAll });
+      expect(planRedTeamActions(parseRedTeamComment(body), { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses: deferAll }).sendBack).toHaveLength(1);
+    }
+    const [both] = applyRecheck([{ ...VALID_SEAT_FINDING, findingClass: 'theoretical-race', classBasis: 'a' }], { checks: [{ index: 0, confirmed: true, findingClass: 'coverage-or-style', classBasis: 'b' }] });
+    expect(both).toMatchObject({ findingClass: 'theoretical-race', alsoClasses: ['coverage-or-style'] });
+  });
   it('a non-enum re-check class is unclassified and cannot re-parse into a deferred class', () => {
     const f = { ...VALID_SEAT_FINDING, findingClass: 'live-reproduced', classBasis: 'seen' };
     const forged = 'theoretical-race → defer-card (basis: x) ';

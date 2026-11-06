@@ -1393,7 +1393,11 @@ export function applyRecheck(findings, value) {
   return findings.map((f, i) => {
     const c = byIndex.get(i);
     const filesRead = publishableFilesRead(c?.filesRead);
-    const findingClass = stricterClass(f.findingClass, c?.findingClass);
+    // Each reviewer's class stands only with that reviewer's own non-empty basis. A reviewer without one blocks under
+    // any policy (classAction), and the merged record keeps a single basis, so the merge is unclassified (fix-now)
+    // rather than letting the other reviewer's basis justify a deferral the first one never supported.
+    const based = (v) => typeof v === 'string' && v.trim() !== '';
+    const findingClass = based(f.classBasis) && based(c?.classBasis) ? stricterClass(f.findingClass, c?.findingClass) : undefined;
     // Both reviewers' classes persist so a later policy change cannot defer a finding whose other class needs a fix.
     const alsoClasses = findingClass ? validAlsoClasses([f.findingClass, c?.findingClass, ...(Array.isArray(f.alsoClasses) ? f.alsoClasses : [])], findingClass) : [];
     const securityReachableToday = f.securityReachableToday === true
