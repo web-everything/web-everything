@@ -95,7 +95,7 @@ import { getRequiredStatusChecks } from '../../scripts/lib/required-status-check
 
 /** The checkout this daemon runs from — its heavy-admission root is the host-wide `<workspace>/.lanes` one. */
 const DAEMON_REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..');
-import { sweepHungCiRecovery, sweepCiRedRecovery, sweepMissingRunRecovery, defaultReadOpenPrs } from '../../scripts/conveyor/ci-red-recovery-watch.mjs';
+import { sweepHungCiRecovery, sweepCiRedRecovery, sweepMissingRunRecovery, defaultReadOpenPrs, createFileApplyLedger } from '../../scripts/conveyor/ci-red-recovery-watch.mjs';
 import { runRulingResolvesStandDownPass } from '../../scripts/conveyor/ruling-resolved-stand-down.mjs';
 import { resolveReviewSettings, resolveReviewSettingSource } from '../../scripts/lib/review-settings.mjs';
 import { CONSTELLATION_REPOS } from '../../scripts/lib/constellation-repos.mjs';
@@ -674,8 +674,11 @@ export function runHungCiRecoveryAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, t
  *   refusals:Array<object>}} `dispatched`/`refusals` here are the pass's own `applied`/`dispatch`+`refusals`
  *   rows, repo-tagged the same way {@link runHungCiRecoveryAllRepos} tags its own.
  */
-export function runMainRedRebaseAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, tick = sweepCiRedRecovery, ...tickOpts } = {}) {
-  const perRepo = forEachRepo(repos, (repo) => tick({ ...tickOpts, repo, apply: true }));
+export function runMainRedRebaseAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, tick = sweepCiRedRecovery, createLedger = createFileApplyLedger, ...tickOpts } = {}) {
+  // This daemon is the only live caller: without a per-repo file-backed fairness ledger the budget-capped apply
+  // loop restarts at the head of the queue every tick and slow/deferred PRs starve later recoverable ones.
+  // Built inside the per-repo callback so a ledger construction failure is isolated to that repo (tick-failed).
+  const perRepo = forEachRepo(repos, (repo) => tick({ ...tickOpts, repo, apply: true, applyLedger: tickOpts.applyLedger ?? createLedger({ repo }) }));
   const dispatched = [];
   const refusals = [];
   for (const entry of perRepo) {
