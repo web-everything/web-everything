@@ -7,7 +7,7 @@ import { computeWorkingTreeHash } from '../../lib/verify-lane-gate.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs, laneFilterDrivers, LANE_CONFIG_LIST_ARGS, LANE_GIT_CONFIG_PINS } from '../../lib/lane-git-hardening.mjs';
 import {
   classifyAwaitVerdict, isTimeoutOnlyRed, isLoadFlakeRed, runAwaitVerifyPass, buildAwaitVerifyResumePrompt, findAwaitSession, lookupAwaitSession,
-  formatAwaitVerifyLines, isHarnessRecord, isEarlyPushOwed, AWAIT_VERIFY_LIMITS, pushShaFromScratch, claimBindingRefusal, isSessionBusy, defaultAwaitVerifyIo,
+  formatAwaitVerifyLines, isHarnessRecord, isEarlyPushOwed, isLoadRedReason, AWAIT_VERIFY_LIMITS, pushShaFromScratch, claimBindingRefusal, isSessionBusy, defaultAwaitVerifyIo,
 } from '../await-verify-pass.mjs';
 
 const SHA = '65a382e81413952ab11e5448e36f01bb7ce4c332';
@@ -1291,6 +1291,18 @@ describe('timeout-only load recovery', () => {
     expect(after.infraRetry).toMatchObject({ exhausted: true });
     expect(h.calls.rerequest.length).toBeGreaterThan(1);
   });
+  it('self-review: a stale load red on an up-to-date early push re-requests instead of handing back a no-op', async () => {
+    const at = new Date(T0 + 2).toISOString();
+    const h = harness({ records: [rec({ attempt: 1, requestedAt: at, loadRetry: { attempts: 1, waiting: false, rerunAt: at },
+      earlyPush: { sha: SHA, ok: true, done: true, upToDate: true, attempts: 1, at } })] });
+    h.state.marker = timeout({ startedAt: new Date(T0).toISOString() }); h.io.loadHigh = () => false;
+    h.io.rerequest = l => { h.calls.rerequest.push(l); return { ok: false, status: 'no-server' }; };
+    const { rows } = await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000, ttlMs: TTL, pushPolicy: { pushBeforeGate: true } });
+    expect(rows[0]).toMatchObject({ action: 'rerequest', reason: 'red-load-rerun-unconfirmed', result: 'no-server' });
+    expect(h.calls.resume).toEqual([]); expect(h.calls.push).toEqual([]);
+    expect(h.store.get(rec().sessionId)).toMatchObject({ retries: 1 });
+    expect(h.store.get(rec().sessionId).pendingResume).toBeUndefined();
+  });
   it('red-team: a crash between the re-run write and its request leaves a stale red that is re-requested', () => {
     const record = rec({ attempt: 3, requestedAt: new Date(T0 + 2).toISOString(), loadRetry: { attempts: 1, waiting: false, rerunAt: new Date(T0 + 2).toISOString() } });
     for (const loadHigh of [false, true]) {
@@ -1305,6 +1317,8 @@ describe('timeout-only load recovery', () => {
     // A legacy re-run record without rerunAt falls back to its requestedAt.
     const legacy = rec({ attempt: 3, requestedAt: new Date(T0 + 2).toISOString(), loadRetry: { attempts: 1, waiting: false } });
     expect(classify({ record: legacy, marker: timeout(), loadHigh: false })).toMatchObject({ action: 'rerequest' });
+    // A stale red is never handed back as a no-op either, even when the remote already had the sha.
+    expect(isLoadRedReason('red-load-rerun-unconfirmed')).toBe(true);
     // A stale red is never pushed early.
     expect(isEarlyPushOwed({ record, decision: { action: 'rerequest', reason: 'red-load-rerun-unconfirmed' }, policy: { pushBeforeGate: true } })).toBe(false);
   });

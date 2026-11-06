@@ -97,6 +97,9 @@ export function isTimeoutOnlyRed(marker) {
   return processTimeout || (marker.redCause === 'test-timeout' && completeTimeoutInventory);
 }
 
+/** A decision about a known red the load-retry path still owns. It outranks hand-back and is never pushed early. */
+export const isLoadRedReason = reason => String(reason ?? '').startsWith('red-load-');
+
 /**
  * After a load re-run was persisted, is this red still the verdict it was meant to replace? True when the red started
  * (or finished) no later than the re-run request: the request failed, or the pass crashed between write and request.
@@ -313,7 +316,7 @@ export function isSessionBusy(session) {
  */
 export function isEarlyPushOwed({ record, decision, policy, limits = AWAIT_VERIFY_LIMITS }) {
   if (policy?.pushBeforeGate !== true) return false;
-  if (String(decision?.reason ?? '').startsWith('red-load-')) return false;
+  if (isLoadRedReason(decision?.reason)) return false;
   if (!isHarnessRecord(record) || record.kind !== 'fix' || record.pendingResume) return false;
   if (decision?.action !== 'wait' && decision?.action !== 'rerequest') return false;
   const ep = record.earlyPush;
@@ -466,7 +469,7 @@ export async function runAwaitVerifyPass({
         // even after an auth pause, busy session or failed delivery. Preserve valid no-ops without re-pushing.
         const current = { ...record }; delete current.pendingResume;
         const fresh = classifyAwaitVerdict({ record: current, marker, lane, nowMs, ttlMs, limits, ...loadInput });
-        if (fresh.action === 'resume' || fresh.reason.startsWith('red-load-')) { record = current; d = fresh; }
+        if (fresh.action === 'resume' || isLoadRedReason(fresh.reason)) { record = current; d = fresh; }
         // Replacement is persisted below before any resume/retry effect; read/write errors retain the waiter.
       }
       Object.assign(row, { action: d.action, reason: d.reason });
@@ -520,7 +523,7 @@ export async function runAwaitVerifyPass({
           const currentLane = io.laneState(record.lane, { hashDirty: isNoPushRecord(record) });
           marker = currentLane ? io.readMarker(record.lane) : null;
           const fresh = classifyAwaitVerdict({ record, marker, lane: currentLane, nowMs, ttlMs, limits, ...loadInput });
-          if (fresh.action === 'resume' || fresh.reason.startsWith('red-load-')) d = fresh;
+          if (fresh.action === 'resume' || isLoadRedReason(fresh.reason)) d = fresh;
           Object.assign(row, { action: d.action, reason: d.reason });
         }
       }
@@ -569,7 +572,9 @@ export async function runAwaitVerifyPass({
       }
       if (record?.kind === 'fix' && !record.pendingResume && record.earlyPush?.ok && record.earlyPush.upToDate
         && (record.attempt ?? 1) === 1 && record.earlyPush.attempts === 1
-        && lower(record.earlyPush.sha) === lower(record.sha) && (d.action === 'wait' || d.action === 'rerequest')) {
+        && lower(record.earlyPush.sha) === lower(record.sha) && (d.action === 'wait' || d.action === 'rerequest')
+        // A known red awaiting its load re-run is never handed back as a no-op.
+        && !isLoadRedReason(d.reason)) {
         // A no-op still hands the claim back. Retain the original wait while review is open, so a later
         // verify red or moved lane is still observed; only an overdue review may resume for recovery.
         const gate = selfReviewGate({ io, record, nowMs, limits });
