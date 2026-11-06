@@ -1,6 +1,7 @@
 import { sameRepoUrl, ensureLaneAlternates } from './lane-alternates.mjs';
 import { boundedGitCommand, BOUNDED_GIT_GRACE_MS } from './git-bounded.mjs';
 import { execFileSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -134,19 +135,62 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
     const transportArgs = transport(command, ...args);
     if (preflightError) throw preflightError;
     checkTransportConfig(dir);
+    if (command === 'fetch') refuseTrackingSymrefs(dir);
     // A fetch into a lane without alternates re-downloads the repository; repair them first (best effort, add-only).
     if (command === 'fetch' && repo.alternatesReferencePath) {
       try { ensureLaneAlternates({ laneDir: dir, referencePath: repo.alternatesReferencePath, laneOrigin: origin, referenceOrigin: origin }); } catch { /* never blocks the salvage */ }
     }
     return git(dir, transportArgs, 120_000, true);
   };
+  // A fetch writes THROUGH a symbolic ref (PR #6319, R639): a lane-made refs/remotes/origin/main -> refs/heads/work/keep
+  // would reset the lane's unpushed branch to the pushed tip. Only the ordinary origin/HEAD alias of a plain origin/*
+  // ref is accepted (Git reports a symref's final target, so a chain through another symref is caught too). Unreadable
+  // counts as unsafe.
+  const refuseTrackingSymrefs = dir => {
+    const listing = git(dir, ['for-each-ref', '--format=%(refname)%00%(symref)', 'refs/remotes/origin/']);
+    const unsafe = [];
+    for (const line of listing ? listing.split('\n') : []) {
+      const [name, target, extra] = line.split('\0');
+      if (extra !== undefined || !name) throw new Error('unreadable origin tracking refs; inspect the lane manually');
+      if (target && !(name === 'refs/remotes/origin/HEAD' && target.startsWith('refs/remotes/origin/') && target !== name)) {
+        unsafe.push(`${clean(name)} is a symbolic ref to ${clean(target)}`);
+      }
+    }
+    if (unsafe.length) {
+      throw new Error(`${unsafe.slice(0, 5).join('; ')}; a fetch would write through it — remove it (git update-ref --no-deref -d <ref>)`);
+    }
+  };
+  // ops/* carries the verdict ledger (huge history, never lane work): the lane's diet config excludes it, and an explicit
+  // refspec would otherwise pull ~117k objects on every release (lane-68, 2026-11-01).
+  const notOps = '^refs/heads/ops/*';
   // Fetch every non-ops origin head into refs/remotes/origin/*. Explicit refspecs make pruning independent of lane config.
-  const fetchHeads = dir => transportGit(dir, 'fetch', '--recurse-submodules=no', '--prune', '--no-tags', origin, '+refs/heads/*:refs/remotes/origin/*',
-    // ops/* carries the verdict ledger (huge history, never lane work): the lane's diet config excludes it, and this explicit
-    // refspec would otherwise pull ~117k objects on every release (lane-68, 2026-11-01).
-    '^refs/heads/ops/*');
+  const fetchHeads = dir => transportGit(dir, 'fetch', '--recurse-submodules=no', '--prune', '--no-tags', origin,
+    '+refs/heads/*:refs/remotes/origin/*', notOps);
+  // The release proof needs only the origin's OBJECTS, never its refs: fetch into a fresh private namespace (no
+  // FETCH_HEAD, no tracking refs) and delete it again without dereferencing, so no lane-controlled ref is ever written.
+  const fetchVerifyObjects = dir => {
+    transport('fetch'); // an unresolved origin refuses before any lane read
+    const ns = `refs/release-verify/${randomBytes(8).toString('hex')}`;
+    const owned = () => {
+      const listing = git(dir, ['for-each-ref', '--format=%(refname)', `${ns}/`]);
+      return listing ? listing.split('\n').filter(Boolean) : [];
+    };
+    if (owned().length) throw new Error(`${ns} already holds refs; inspect the lane manually`);
+    try {
+      transportGit(dir, 'fetch', '--recurse-submodules=no', '--no-write-fetch-head', '--no-tags', origin, `+refs/heads/*:${ns}/*`, notOps);
+    } finally {
+      const refs = owned();
+      if (refs.length) {
+        runGit('git', ['update-ref', '--stdin'], {
+          cwd: dir, env, encoding: 'utf8', timeout: 120_000, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024,
+          stdio: ['pipe', 'pipe', 'pipe'], input: refs.map(ref => `option no-deref\ndelete ${ref}\n`).join(''),
+        });
+      }
+    }
+  };
   return {
     fetchHeads,
+    fetchVerifyObjects,
     /** The canonical origin's branch tips right now (ops/* excluded), read in the primary checkout, never the lane.
      *  Throws on anything but complete `<sha>\trefs/heads/<name>` lines, so a caller can fail closed. */
     remoteHeads: () => {

@@ -515,16 +515,74 @@ describe('real salvage preservation and transport', () => {
     expect(runGit.mock.calls.some(([, args]) => args.includes('push'))).toBe(false);
   });
 
-  function realHarness({ cherry = `+ ${head}\n+ ${older}`, contains = '', fail } = {}) {
+  const SYMREF_LISTING = '--format=%(refname)%00%(symref)';
+  const containsCalls = runGit => runGit.mock.calls.filter(([, args]) => args.includes('for-each-ref') && args.includes('--contains'));
+  function realHarness({ cherry = `+ ${head}\n+ ${older}`, contains = '', symrefs = 'refs/remotes/origin/HEAD\0refs/remotes/origin/main\nrefs/remotes/origin/main\0', verifyRefs = '', fail } = {}) {
     const runGit = vi.fn((_command, args) => {
       if (fail && args.includes(fail)) throw new Error(`${fail} unavailable`);
       if (args.includes('rev-list')) return `${head}\n${older}`;
       if (args.includes('cherry')) return cherry;
+      if (args.includes(SYMREF_LISTING)) return symrefs;
+      if (args.includes('for-each-ref') && args.some(arg => arg.startsWith('refs/release-verify/'))) return verifyRefs;
       if (args.includes('for-each-ref')) return contains;
       return '';
     });
     return { runGit, io: realSalvageIo({ repo, runGit }) };
   }
+
+  // PR #6319 send-back (R639): a fetch writes THROUGH a symbolic ref, so a lane-made tracking symref aimed at a local
+  // branch would reset that branch. Every transport fetch refuses one before running; the ordinary origin/HEAD alias passes.
+  it.each([
+    ['refs/remotes/origin/main\0refs/heads/work/keep', 'refs/remotes/origin/main'],
+    ['refs/remotes/origin/HEAD\0refs/heads/work/keep', 'refs/remotes/origin/HEAD'],
+    ['refs/remotes/origin/HEAD\0refs/remotes/origin/HEAD', 'refs/remotes/origin/HEAD'],
+    ['refs/remotes/origin/x\0refs/remotes/origin/main', 'refs/remotes/origin/x'],
+  ])('refuses every fetch, before fetching, when the lane has the tracking symref %j', (symrefs, name) => {
+    const { io, runGit } = realHarness({ symrefs });
+    for (const operation of [() => io.fetchHeads(laneDir), () => io.fetchVerifyObjects(laneDir), () => io.unmatchedShas(laneDir, [head])]) {
+      expect(operation).toThrow(new RegExp(`${name.replaceAll('/', '\\/')} is a symbolic ref`));
+    }
+    expect(runGit.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
+  });
+  it.each(['unreadable', 'malformed'])('refuses every fetch when the tracking symref listing is %s', failure => {
+    const { io, runGit } = failure === 'unreadable' ? realHarness({ fail: SYMREF_LISTING })
+      : realHarness({ symrefs: 'refs/remotes/origin/main\0refs/heads/a\0extra' });
+    expect(() => io.fetchHeads(laneDir)).toThrow();
+    expect(() => io.fetchVerifyObjects(laneDir)).toThrow();
+    expect(runGit.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
+  });
+  it('fetchVerifyObjects fetches into a fresh private namespace with no FETCH_HEAD and deletes it without dereferencing', () => {
+    let fetched = null;
+    const runGit = vi.fn((_command, args, options) => {
+      if (args.includes(SYMREF_LISTING)) return '';
+      if (args.includes('fetch')) { fetched = args.find(arg => arg.startsWith('+refs/heads/*:')).split(':')[1].replace(/\/\*$/, ''); return ''; }
+      if (args.includes('for-each-ref')) return fetched ? `${fetched}/main\n${fetched}/work/x` : '';
+      if (args.includes('update-ref')) { expect(options.input).toBe(`option no-deref\ndelete ${fetched}/main\noption no-deref\ndelete ${fetched}/work/x\n`); }
+      return '';
+    });
+    const io = realSalvageIo({ repo, runGit });
+    io.fetchVerifyObjects(laneDir);
+    expect(fetched).toMatch(/^refs\/release-verify\/[a-f0-9]{16}$/);
+    const fetchArgs = runGit.mock.calls.find(([, args]) => args.includes('fetch'))[1];
+    expect(fetchArgs).toEqual(expect.arrayContaining(['--no-write-fetch-head', '--no-tags', repo.originUrl, `+refs/heads/*:${fetched}/*`, '^refs/heads/ops/*']));
+    expect(fetchArgs).not.toContain('--prune');
+    expect(fetchArgs.some(arg => arg.includes('refs/remotes/'))).toBe(false);
+    expect(runGit.mock.calls.filter(([, args]) => args.includes('update-ref'))).toHaveLength(1);
+  });
+  it('fetchVerifyObjects deletes its namespace even when the fetch fails, and refuses an occupied namespace', () => {
+    let fetched = null;
+    const runGit = vi.fn((_command, args) => {
+      if (args.includes(SYMREF_LISTING)) return '';
+      if (args.includes('fetch')) { fetched = args.find(arg => arg.startsWith('+refs/heads/*:')).split(':')[1].replace(/\/\*$/, ''); throw new Error('fetch died'); }
+      if (args.includes('for-each-ref')) return fetched ? `${fetched}/main` : '';
+      return '';
+    });
+    expect(() => realSalvageIo({ repo, runGit }).fetchVerifyObjects(laneDir)).toThrow('fetch died');
+    expect(runGit.mock.calls.filter(([, args]) => args.includes('update-ref'))).toHaveLength(1);
+    const { io, runGit: occupied } = realHarness({ verifyRefs: 'refs/release-verify/x/main' });
+    expect(() => io.fetchVerifyObjects(laneDir)).toThrow(/already holds refs/);
+    expect(occupied.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
+  });
 
   it('fetches pruned branch refs and pushes/verifies against the explicit canonical URL with transport pins and hardened env', () => {
     const { io, runGit } = realHarness();
@@ -552,8 +610,10 @@ describe('real salvage preservation and transport', () => {
     expect(fetchArgs).toEqual(expect.arrayContaining(['--recurse-submodules=no', '--prune', '--no-tags', '+refs/heads/*:refs/remotes/origin/*', '^refs/heads/ops/*']));
     const pushArgs = runGit.mock.calls.find(([, args]) => args.includes('push'))[1];
     expect(pushArgs.slice(pushArgs.indexOf('push'))).toEqual(['push', '--recurse-submodules=no', repo.originUrl, `${head}:refs/heads/${ref}`]);
+    expect(runGit.mock.calls.findIndex(([, args]) => args.includes(SYMREF_LISTING)))
+      .toBeLessThan(runGit.mock.calls.findIndex(([, args]) => args.includes('fetch')));
     expect(runGit.mock.calls.findIndex(([, args]) => args.includes('fetch')))
-      .toBeLessThan(runGit.mock.calls.findIndex(([, args]) => args.includes('for-each-ref')));
+      .toBeLessThan(runGit.mock.calls.findIndex(([, args]) => args.includes('--contains')));
   });
 
   it('uses one integration-branch patch check and exact-SHA reachability without enumerating or capping remote refs', () => {
@@ -561,15 +621,16 @@ describe('real salvage preservation and transport', () => {
     expect(io.unmatchedShas(laneDir, [head, older])).toEqual([older]);
     expect(runGit.mock.calls.filter(([, args]) => args.includes('cherry')).map(([, args]) => args))
       .toEqual([['cherry', 'origin/main', 'HEAD']]);
-    expect(runGit.mock.calls.filter(([, args]) => args.includes('for-each-ref')).map(([, args]) => args))
+    expect(containsCalls(runGit).map(([, args]) => args))
       .toEqual([['for-each-ref', '--exclude=refs/remotes/origin/ops/*', '--contains', older, '--format=%(refname)\t%(symref)', 'refs/remotes/origin']]);
+    expect(runGit.mock.calls.filter(([, args]) => args.includes(SYMREF_LISTING))).toHaveLength(1);
   });
 
   it('returns matched without pushing when the exact SHAs are reachable from remote branches', async () => {
     const { io, runGit } = realHarness({ contains: 'refs/remotes/origin/work/published' });
     expect(await salvagePushLane({ lane: 7, laneDir, io })).toMatchObject({ status: 'matched', unmatched: [] });
     expect(runGit.mock.calls.some(([, args]) => args.includes('push'))).toBe(false);
-    expect(runGit.mock.calls.filter(([, args]) => args.includes('for-each-ref'))).toHaveLength(2);
+    expect(containsCalls(runGit)).toHaveLength(2);
   });
 
   it('does not accept a symbolic ref (such as one aimed at origin/ops) as reachability evidence', async () => {

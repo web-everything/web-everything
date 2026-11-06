@@ -2898,8 +2898,9 @@ function releaseTrackedChanges(dir) {
 // Commits count as preserved only when the canonical origin lists them RIGHT NOW (ls-remote of the pool's resolved
 // origin, run in the primary checkout), or when a salvage push verified its remote SHA. No local refs/remotes/* ref is
 // proof: a lane can make one stale, forged or a symbolic alias of its own branch. A listed tip the lane has not
-// fetched is skipped (`--ignore-missing`); if that leaves commits unproven, one hardened fetch of the origin heads runs
-// and the check repeats. A failed listing or fetch never releases: it keeps the stricter result.
+// fetched is skipped (`--ignore-missing`); if that leaves commits unproven, one hardened object-only fetch of the origin
+// heads runs (into a private ref namespace it deletes again, never refs/remotes/*) and the check repeats. A failed
+// listing or fetch never releases: it keeps the stricter result.
 const releaseRemoteHeads = new Map();
 function releaseUnprovenCommits(dir, salvage, proof) {
   // On a refusal without remote proof, name the commits local tracking refs do not cover. This is an operator hint
@@ -2923,10 +2924,37 @@ function releaseUnprovenCommits(dir, salvage, proof) {
   const unproven = () => releaseEvidenceGit(['rev-list', '--ignore-missing', '--stdin', 'HEAD', '--branches'], dir,
     { stdio: ['pipe', 'pipe', 'pipe'], input });
   let commits = unproven();
-  if (commits !== '') {
-    try { proof.io.fetchHeads(dir); commits = unproven(); } catch { /* keep the unfetched, stricter result */ }
+  if (commits === '') return { commits };
+  // The verification fetch must never move lane work (PR #6319, R639). Refuse up front on a symbolic tracking ref a
+  // fetch could write through, snapshot every local branch, the stash and HEAD around the (object-only) fetch, and
+  // refuse naming the ref if anything moved — without recomputing the proof against the changed refs.
+  const symrefs = releaseEvidenceGit(['for-each-ref', '--format=%(refname)%00%(symref)', 'refs/remotes/origin/'], dir);
+  if (symrefs === null) return { commits };
+  // Only the ordinary origin/HEAD alias of a plain origin/* ref passes; Git reports a symref's final target, so a chain
+  // through another symref is caught too.
+  const unsafe = (symrefs ? symrefs.split('\n') : []).map(line => line.split('\0'))
+    .filter(([name, target]) => target && !(name === 'refs/remotes/origin/HEAD' && target.startsWith('refs/remotes/origin/') && target !== name))
+    .map(([name, target]) => `${name} is a symbolic ref to ${target}`);
+  if (unsafe.length) {
+    return { commits, note: `${unsafe.slice(0, 5).join('; ')}; a fetch would write through it — remove it (git update-ref --no-deref -d <ref>)` };
   }
-  return { commits };
+  const snapshot = () => {
+    const refs = releaseEvidenceGit(['for-each-ref', '--format=%(refname) %(objectname) %(symref)', 'refs/heads/', 'refs/stash'], dir);
+    if (refs === null) return null;
+    const head = releaseEvidenceGit(['rev-parse', '--verify', '--quiet', 'HEAD'], dir);
+    const branch = releaseEvidenceGit(['symbolic-ref', '--quiet', 'HEAD'], dir);
+    return new Map([...(refs ? refs.split('\n') : []), `HEAD ${head ?? '-'} ${branch ?? '-'}`].map(line => [line.split(' ')[0], line]));
+  };
+  const before = snapshot();
+  if (!before) return { commits };
+  try { proof.io.fetchVerifyObjects(dir); } catch { return { commits }; /* keep the unfetched, stricter result */ }
+  const after = snapshot();
+  if (!after) return { commits };
+  const moved = [...new Set([...before.keys(), ...after.keys()])].filter(ref => before.get(ref) !== after.get(ref));
+  if (moved.length) {
+    return { commits, note: `${moved.slice(0, 5).join(', ')}${moved.length > 5 ? ` (+${moved.length - 5} more)` : ''} changed during the verification fetch; inspect the lane manually` };
+  }
+  return { commits: unproven() };
 }
 
 // A lane-written `.git/commondir` (or a `.git` gitfile / symlink) moves refs, objects and config to another
@@ -2971,10 +2999,11 @@ function releasePushTarget(url) {
 function releaseWorkRefuses(dir, label, salvage, proof) {
   const safe = value => String(value).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ');
   const quote = value => /^[a-zA-Z0-9_./:-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
-  const { commits, why, hint } = releaseUnprovenCommits(dir, salvage, proof);
+  const { commits, why, hint, note } = releaseUnprovenCommits(dir, salvage, proof);
   const tracked = releaseTrackedChanges(dir);
   if (commits === '' && tracked === '') return false;
   const details = [
+    note ? `verification fetch refused: ${safe(note).slice(0, 300)}` : '',
     why ? `commits cannot be proven on the canonical origin (${safe(why).slice(0, 300)})${hint
       ? `; local commits not on any origin tracking ref: ${hint.split('\n').map(sha => sha.slice(0, 12)).join(', ')}` : ''}; inspect local history manually`
       : commits === null ? 'commit evidence unreadable or exceeds the Git output limit; inspect local history manually'

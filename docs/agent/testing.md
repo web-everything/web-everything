@@ -3917,6 +3917,11 @@ fail-closed reads across reconcile and dispatch smoke passes within the unchange
 origin lists right now (`ls-remote` run in the primary checkout, `ops/*` excluded) after known-litter
 cleanup and salvage. No local `refs/remotes/*` ref is proof: stale, forged and symbolic-alias tracking
 refs all still refuse. A listed tip the lane has not fetched triggers one hardened fetch before refusing.
+That fetch is object-only: it writes into a fresh `refs/release-verify/<nonce>/*` namespace (no
+`FETCH_HEAD`), which it deletes again without dereferencing, so it never writes a lane-controlled ref.
+A symbolic ref under `refs/remotes/origin/` other than the ordinary `origin/HEAD` alias refuses before
+any fetch (the salvage fetch too), and if any local branch, the stash or HEAD moved during the fetch,
+release refuses naming the ref instead of recomputing the proof.
 An unresolved origin or an unreadable listing refuses; every named pool in a fixture therefore needs
 its primary checkout (a sibling of the reference) so release can resolve that origin.
 The listing checks the primary's config with a primary-only rule: ordinary extra remotes (`upstream`, a fork)

@@ -311,6 +311,64 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     git(['push', '--quiet', 'origin', 'HEAD:main'], other);
     released(release());
   });
+  // PR #6319 send-back (R639): the verification fetch must never write through a lane-controlled ref. A symbolic
+  // origin/main aimed at an unpushed branch would otherwise be reset to the pushed tip, erasing the work it guards.
+  it.each(['origin/main', 'origin/HEAD'])('refuses, and keeps the branch, when refs/remotes/%s is a symbolic ref to unpushed work', ref => {
+    const pushed = git(['rev-parse', 'HEAD'], laneDir);
+    const sha = commitWork();
+    git(['branch', 'work/keep', sha], laneDir);
+    git(['reset', '--quiet', '--hard', pushed], laneDir);
+    git(['symbolic-ref', `refs/remotes/${ref}`, 'refs/heads/work/keep'], laneDir);
+    const result = release();
+    expect(git(['rev-parse', 'refs/heads/work/keep'], laneDir)).toBe(sha);
+    refused(result, sha);
+    expect(result.stderr).toContain(`refs/remotes/${ref}`);
+  });
+  // The recovery-on salvage fetches origin heads into refs/remotes/origin/* BEFORE the guard runs: it must refuse the
+  // same symbolic ref (salvage fails closed) so the guard still sees, and keeps, the unpushed branch.
+  it('with recovery on, the salvage fetch refuses a symbolic origin/main and the branch is kept', () => {
+    const pushed = git(['rev-parse', 'HEAD'], laneDir);
+    const sha = commitWork();
+    git(['branch', 'work/keep', sha], laneDir);
+    git(['reset', '--quiet', '--hard', pushed], laneDir);
+    writeFileSync(join(laneDir, 'other.txt'), 'head work\n');
+    git(['add', 'other.txt'], laneDir);
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '-m', 'head work'], laneDir);
+    git(['symbolic-ref', 'refs/remotes/origin/main', 'refs/heads/work/keep'], laneDir);
+    const result = release([], '', '', RECOVERY_ON);
+    expect(git(['rev-parse', 'refs/heads/work/keep'], laneDir)).toBe(sha);
+    expect(result.stderr).toMatch(/SALVAGE PUSH FAILED: .*refs\/remotes\/origin\/main is a symbolic ref to refs\/heads\/work\/keep/);
+    refused(result, sha);
+    expect(salvageSeen()).toEqual({ refs: '', record: false });
+  });
+  // Defense in depth: whatever the fetch does, a local branch or stash that moved during it refuses the release.
+  it('refuses when a local branch moves during the verification fetch', () => {
+    const pushed = git(['rev-parse', 'HEAD'], laneDir);
+    const sha = commitWork();
+    git(['branch', 'work/keep', sha], laneDir);
+    git(['reset', '--quiet', '--hard', pushed], laneDir);
+    const fault = `if (args.includes('fetch')) { const out = original(cmd, args, opts);
+      original('git', ['update-ref', 'refs/heads/work/keep', ${JSON.stringify(pushed)}], { cwd: opts.cwd }); return out; }`;
+    const result = release([], fault);
+    expect(result.status, result.stderr).toBe(1);
+    expect(result.data.released).toBe(0);
+    expect(result.stderr).toContain('refs/heads/work/keep changed during the verification fetch');
+    expect(readFileSync(marker, 'utf8')).toBe(lease);
+  });
+  it('verification fetch writes no ref and no FETCH_HEAD in the lane', () => {
+    const other = join(base, 'other');
+    git(['clone', '--quiet', origin, other]);
+    writeFileSync(join(other, 'later.txt'), 'later\n');
+    git(['add', 'later.txt'], other);
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '-m', 'later'], other);
+    git(['push', '--quiet', 'origin', 'HEAD:main'], other);
+    const sha = commitWork();
+    rmSync(join(laneDir, '.git', 'FETCH_HEAD'), { force: true });
+    const refsBefore = git(['for-each-ref', '--format=%(refname) %(objectname)'], laneDir);
+    refused(release(), sha);
+    expect(git(['for-each-ref', '--format=%(refname) %(objectname)'], laneDir)).toBe(refsBefore);
+    expect(existsSync(join(laneDir, '.git', 'FETCH_HEAD'))).toBe(false);
+  });
   it.each(['unreadable', 'malformed', 'oversized'])('fails closed on a %s canonical origin listing', failure => {
     const remoteFault = failure === 'malformed' ? "return 'not-a-sha\\trefs/heads/main\\n';"
       : `const error = new Error('forced listing failure'); error.code = ${JSON.stringify(failure === 'oversized' ? 'ENOBUFS' : 'EIO')}; throw error;`;
