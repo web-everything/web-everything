@@ -98,6 +98,20 @@ export function isTimeoutOnlyRed(marker) {
 }
 
 /**
+ * After a load re-run was persisted, is this red still the verdict it was meant to replace? True when the red started
+ * (or finished) no later than the re-run request: the request failed, or the pass crashed between write and request.
+ * A red with no readable time cannot prove it is the re-run's own verdict, so it counts as stale too. Pure.
+ */
+export function isStaleLoadRerunRed(record, marker) {
+  const retry = record?.loadRetry;
+  if (!retry || retry.waiting !== false || !((retry.attempts ?? 0) > 0)) return false;
+  // Records written before `rerunAt` existed stamped the same instant as requestedAt.
+  const rerunAt = Date.parse(retry.rerunAt ?? record.requestedAt ?? '');
+  const times = [marker?.startedAt, marker?.finishedAt].map(t => Date.parse(t ?? '')).filter(Number.isFinite);
+  return !Number.isFinite(rerunAt) || !times.length || Math.max(...times) <= rerunAt;
+}
+
+/**
  * The one decision for one record. Pure.
  * @param {{record:object, marker:object|null, lane:{head:string|null, dirty:boolean, treeHash:string|null}|null,
  *   nowMs:number, ttlMs:number, limits?:object, loadHigh?:boolean, loadMaxAttempts?:number}} input
@@ -126,6 +140,9 @@ export function classifyAwaitVerdict({ record, marker, lane, nowMs, ttlMs, limit
     return age > ttlMs ? rerequest('verify-overdue') : { action: 'wait', reason: 'running' };
   }
   if (v.status === 'red') {
+    // A failed (or never-sent) load re-run leaves the old red in place. That is no new verdict: re-request it, bounded by
+    // `maxRetries`, then the fix infra-retry ladder. Never red/escalate on it.
+    if (record.kind === 'fix' && isStaleLoadRerunRed(record, marker)) return rerequest('red-load-rerun-unconfirmed');
     if (!isNoPushRecord(record) && AWAIT_LOAD_FLAKE_REPO_KEYS.includes(repoKeyOrNull(record.repo)) && isLoadFlakeRed(marker)) return { action: 'resume', reason: 'red-load-flake', resume: 'load-flake' };
     if (!isNoPushRecord(record) && !AWAIT_LOAD_FLAKE_REPO_KEYS.includes(repoKeyOrNull(record.repo)) && isLoadFlakeRed(marker)) return { action: 'resume', reason: 'red-load-flake', resume: 'load-flake-redispatch' };
     if (record.kind === 'fix' && isTimeoutOnlyRed(marker) && (record.loadRetry?.attempts ?? 0) < loadMaxAttempts) {
@@ -296,7 +313,7 @@ export function isSessionBusy(session) {
  */
 export function isEarlyPushOwed({ record, decision, policy, limits = AWAIT_VERIFY_LIMITS }) {
   if (policy?.pushBeforeGate !== true) return false;
-  if (['red-load-deferred', 'red-load-shaped'].includes(decision?.reason)) return false;
+  if (String(decision?.reason ?? '').startsWith('red-load-')) return false;
   if (!isHarnessRecord(record) || record.kind !== 'fix' || record.pendingResume) return false;
   if (decision?.action !== 'wait' && decision?.action !== 'rerequest') return false;
   const ep = record.earlyPush;
@@ -513,8 +530,9 @@ export async function runAwaitVerifyPass({
         if (d.loadDefer) persist({ ...record, loadRetry: {
           attempts: record.loadRetry?.attempts ?? 0, waiting: true, since: new Date(nowMs).toISOString(),
         } });
+        // `rerunAt` lets the next tick tell the re-run's verdict from the red it replaces, should this request fail.
         if (d.loadRerun && persist({ ...record, requestedAt: new Date(nowMs).toISOString(), loadRetry: {
-          attempts: (record.loadRetry?.attempts ?? 0) + 1, waiting: false,
+          attempts: (record.loadRetry?.attempts ?? 0) + 1, waiting: false, rerunAt: new Date(nowMs).toISOString(),
         } })) {
           const r = io.rerequest(record.lane);
           row.result = r?.status ?? (r?.ok ? 'requested' : 'request-failed');

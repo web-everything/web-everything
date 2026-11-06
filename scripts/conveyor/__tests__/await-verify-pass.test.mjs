@@ -7,7 +7,7 @@ import { computeWorkingTreeHash } from '../../lib/verify-lane-gate.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs, laneFilterDrivers, LANE_CONFIG_LIST_ARGS, LANE_GIT_CONFIG_PINS } from '../../lib/lane-git-hardening.mjs';
 import {
   classifyAwaitVerdict, isTimeoutOnlyRed, isLoadFlakeRed, runAwaitVerifyPass, buildAwaitVerifyResumePrompt, findAwaitSession, lookupAwaitSession,
-  formatAwaitVerifyLines, isHarnessRecord, AWAIT_VERIFY_LIMITS, pushShaFromScratch, claimBindingRefusal, isSessionBusy, defaultAwaitVerifyIo,
+  formatAwaitVerifyLines, isHarnessRecord, isEarlyPushOwed, AWAIT_VERIFY_LIMITS, pushShaFromScratch, claimBindingRefusal, isSessionBusy, defaultAwaitVerifyIo,
 } from '../await-verify-pass.mjs';
 
 const SHA = '65a382e81413952ab11e5448e36f01bb7ce4c332';
@@ -1231,14 +1231,17 @@ describe('timeout-only load recovery', () => {
   it('caps same-head load reruns at the configured bound, then escalates the third red', async () => {
     const h = harness({ records: [rec({ attempt: 3 })] });
     const retryPolicy = { value: { loadRetry: { maxAttempts: 2 } }, sources: { 'loadRetry.maxAttempts': 'tool' } };
-    const tick = () => runAwaitVerifyPass({ io: h.io, nowMs: T0, retryPolicy });
+    // Each re-run's red starts after its request, so the ladder counts it as a new verdict.
+    let now = T0;
+    const tick = () => runAwaitVerifyPass({ io: h.io, nowMs: now++, retryPolicy });
+    const freshRed = () => timeout({ startedAt: new Date(now).toISOString() });
     for (let attempt = 0; attempt < 2; attempt++) {
-      h.state.marker = timeout(); h.io.loadHigh = () => true;
+      h.state.marker = freshRed(); h.io.loadHigh = () => true;
       const deferred = await tick();
       expect(deferred.rows[0].reason).toContain('verify.loadRetry.maxAttempts=2 (tool)');
       h.io.loadHigh = () => false; await tick();
     }
-    h.state.marker = timeout(); h.io.loadHigh = () => true;
+    h.state.marker = freshRed(); h.io.loadHigh = () => true;
     const exhausted = await tick();
     expect(h.calls.rerequest).toHaveLength(2);
     expect(exhausted.rows[0]).toMatchObject({ action: 'resume', reason: 'red on attempt 3' });
@@ -1270,5 +1273,39 @@ describe('timeout-only load recovery', () => {
     const h = harness(); h.state.marker = timeout(); h.io.loadHigh = () => { throw new Error('unknown'); };
     await runAwaitVerifyPass({ io: h.io, nowMs: T0 });
     expect(h.calls.resume).toHaveLength(1); expect(h.calls.rerequest).toEqual([]);
+  });
+  it('red-team: a failed load re-request never escalates the original red; it re-requests, then holds as infra', async () => {
+    const h = harness({ records: [rec({ attempt: 3 })] });
+    h.state.marker = timeout(); h.io.loadHigh = () => true;
+    const tick = nowMs => runAwaitVerifyPass({ io: h.io, nowMs, ttlMs: TTL });
+    await tick(T0 + 1);
+    h.io.loadHigh = () => false;
+    h.io.rerequest = l => { h.calls.rerequest.push(l); return { ok: false, status: 'no-server' }; };
+    expect((await tick(T0 + 2)).rows[0]).toMatchObject({ action: 'load-rerun', result: 'no-server' });
+    // The marker is still the red the re-run was meant to replace: no new verdict, so no red/escalate resume.
+    for (let n = 3; n < 12; n++) await tick(T0 + n * 60 * 60_000);
+    expect(h.calls.resume).toEqual([]);
+    const after = h.store.get(rec().sessionId);
+    expect(after.pendingResume).toBeUndefined();
+    expect(after.retries).toBe(AWAIT_VERIFY_LIMITS.maxRetries);
+    expect(after.infraRetry).toMatchObject({ exhausted: true });
+    expect(h.calls.rerequest.length).toBeGreaterThan(1);
+  });
+  it('red-team: a crash between the re-run write and its request leaves a stale red that is re-requested', () => {
+    const record = rec({ attempt: 3, requestedAt: new Date(T0 + 2).toISOString(), loadRetry: { attempts: 1, waiting: false, rerunAt: new Date(T0 + 2).toISOString() } });
+    for (const loadHigh of [false, true]) {
+      expect(classify({ record, marker: timeout({ startedAt: new Date(T0).toISOString(), finishedAt: new Date(T0 + 1).toISOString() }), loadHigh }))
+        .toMatchObject({ action: 'rerequest', reason: 'red-load-rerun-unconfirmed' });
+      // A red without a readable time cannot prove it is the re-run's verdict.
+      expect(classify({ record, marker: timeout({ startedAt: null }), loadHigh })).toMatchObject({ action: 'rerequest' });
+    }
+    // The re-run's own red (started after the request) is a real verdict: the ladder escalates it at quiet load.
+    expect(classify({ record, marker: timeout({ startedAt: new Date(T0 + 3).toISOString() }), loadHigh: false }))
+      .toMatchObject({ action: 'resume', resume: 'escalate' });
+    // A legacy re-run record without rerunAt falls back to its requestedAt.
+    const legacy = rec({ attempt: 3, requestedAt: new Date(T0 + 2).toISOString(), loadRetry: { attempts: 1, waiting: false } });
+    expect(classify({ record: legacy, marker: timeout(), loadHigh: false })).toMatchObject({ action: 'rerequest' });
+    // A stale red is never pushed early.
+    expect(isEarlyPushOwed({ record, decision: { action: 'rerequest', reason: 'red-load-rerun-unconfirmed' }, policy: { pushBeforeGate: true } })).toBe(false);
   });
 });
