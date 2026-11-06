@@ -20,14 +20,31 @@ function git(args, cwd) {
 
 let base, originDir, referenceDir, poolRoot;
 
-function runPool(args, preload = null) {
+// `spawnSync` blocks the whole vitest worker (vitest's own test timeout cannot fire meanwhile), so this file bounds
+// its children itself. PR #6357: this file ran beside the integration tier's serial chain until the job hit its
+// 20-min cap, and a cancelled job prints no per-test result. So: each child is capped (a hang fails its test and
+// names itself), the FILE's total child time is capped (past it every further spawn fails at once, naming the
+// budget, instead of eating the job), and any slow child is logged to stderr as it happens (vitest streams test
+// stderr, so it shows in a CI log even when the job is cancelled).
+const SPAWN_TIMEOUT_MS = 60_000;
+const PROVISION_TIMEOUT_MS = 150_000; // a clone per lane
+const FILE_SPAWN_BUDGET_MS = 300_000;
+const SLOW_SPAWN_LOG_MS = 10_000;
+let spawnSpentMs = 0;
+
+function runPool(args, { timeoutMs = SPAWN_TIMEOUT_MS } = {}) {
+  if (spawnSpentMs >= FILE_SPAWN_BUDGET_MS) {
+    return { code: 1, out: '', err: `lane-pool ${args[0]} not run: this file's child budget (${FILE_SPAWN_BUDGET_MS}ms) is spent (${spawnSpentMs}ms)` };
+  }
   const env = { ...process.env, LANE_POOL_ROOT: poolRoot, WE_LANE_SALVAGE_DIR: join(base, 'salvage') };
   delete env.LANE_SESSION;
   delete env.CLAUDE_CODE_SESSION_ID;
-  // `spawnSync` blocks the whole vitest worker, so a hung child would stall the CI shard until its job cap. The
-  // timeout turns a hang into a failing test (status null -> code 1, SIGKILL noted in stderr) that names itself.
-  const r = spawnSync('node', [...(preload ? ['--import', preload] : []), SCRIPT, ...args], { encoding: 'utf8', env, timeout: 180_000, killSignal: 'SIGKILL' });
-  if (r.error && r.error.code === 'ETIMEDOUT') return { code: 1, out: String(r.stdout || ''), err: `lane-pool ${args[0]} timed out after 180s\n${String(r.stderr || '')}` };
+  const started = Date.now();
+  const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', env, timeout: timeoutMs, killSignal: 'SIGKILL' });
+  const ms = Date.now() - started;
+  spawnSpentMs += ms;
+  if (ms >= SLOW_SPAWN_LOG_MS) process.stderr.write(`[free-list-event-refresh] slow child: lane-pool ${args[0]} took ${ms}ms (file total ${spawnSpentMs}ms)\n`);
+  if (r.error && r.error.code === 'ETIMEDOUT') return { code: 1, out: String(r.stdout || ''), err: `lane-pool ${args[0]} timed out after ${timeoutMs}ms\n${String(r.stderr || '')}` };
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }
 
@@ -57,7 +74,7 @@ beforeAll(() => {
   git(['push', '--quiet', originDir, 'HEAD:refs/heads/lane/seed'], referenceDir);
   git(['update-ref', 'refs/heads/trunk', 'refs/heads/lane/seed'], originDir);
   for (const count of [1, 3]) {
-    const p = runPool(['provision', `--count=${count}`, ...poolArgs()]);
+    const p = runPool(['provision', `--count=${count}`, ...poolArgs()], { timeoutMs: PROVISION_TIMEOUT_MS });
     if (p.code !== 0) throw new Error(`template provision --count=${count} failed: ${p.err}`);
     const tpl = join(fixtureRoot, `pool-template-${count}`);
     cpSync(poolRoot, tpl, { recursive: true });
@@ -70,7 +87,10 @@ beforeAll(() => {
   sharedFixture = sharedRepos(fixtureRoot, [originDir, referenceDir]);
 }, 300_000);
 
-afterAll(() => sharedFixture?.dispose());
+afterAll(() => {
+  sharedFixture?.dispose();
+  process.stderr.write(`[free-list-event-refresh] lane-pool children took ${spawnSpentMs}ms in total (budget ${FILE_SPAWN_BUDGET_MS}ms)\n`);
+});
 
 function usePool(count) {
   rmSync(poolRoot, { recursive: true, force: true });
@@ -114,6 +134,11 @@ describe('free-lane list is refreshed by lane-pool events', () => {
   beforeEach(() => { process.env.LANE_POOL_FREE_LIST_FILE = listFile(); });
   afterEach(() => { delete process.env.LANE_POOL_FREE_LIST_FILE; });
 
+  const seedList = (lanes) => writeFileSync(listFile(), JSON.stringify({ v: 1, writtenAt: Date.now(), repo: 'freepool', poolDir: null, lanes }));
+  // A clean lane with no lease — the shape a published free lane has. A freshly provisioned template lane is
+  // exactly that, so no acquire+release pair (two more CLI children) is needed to make one.
+  const releasedLane = () => { usePool(1); return 1; };
+
   it('after a release the list is FRESH and names the lane, with no periodic pass', () => {
     const { lane } = acquireOneLane();
     writeFileSync(listFile(), JSON.stringify({ v: 1, writtenAt: 1, repo: 'freepool', poolDir: null, lanes: [] })); // ancient
@@ -136,8 +161,7 @@ describe('free-lane list is refreshed by lane-pool events', () => {
   });
 
   it('auto-pick --no-reset never hands out a dirty lane that a (stale) list names as free', () => {
-    const { lane } = acquireOneLane();
-    expect(runPool(['release', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json']).code).toBe(0);
+    const lane = releasedLane();
     writeFileSync(join(laneDir(lane), 'file.txt'), 'edited after publication\n'); // dirties a tracked file
     writeFileSync(listFile(), JSON.stringify({ v: 1, writtenAt: Date.now(), repo: 'freepool', poolDir: null, lanes: [{ lane, at: Date.now() }] }));
     // `--hard-max=1` caps pool growth: with the only lane dirty and refused, an uncapped acquire would fall through to
@@ -147,12 +171,6 @@ describe('free-lane list is refreshed by lane-pool events', () => {
     expect(readFileSync(join(laneDir(lane), 'file.txt'), 'utf8')).toBe('edited after publication\n');
   });
 
-  const seedList = (lanes) => writeFileSync(listFile(), JSON.stringify({ v: 1, writtenAt: Date.now(), repo: 'freepool', poolDir: null, lanes }));
-  const releasedLane = () => { // a clean, released lane (no lease) — the shape a published free lane has
-    const { lane } = acquireOneLane();
-    expect(runPool(['release', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json']).code).toBe(0);
-    return lane;
-  };
 
   it('auto-pick --no-reset still hands out a lane whose only dirt is known scratch litter (not a refusal)', () => {
     const lane = releasedLane();
