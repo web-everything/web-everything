@@ -124,7 +124,7 @@ export function slotCountedItems({ items, cap, parkedReleasesSlot, parkedCapFact
 export function classifyStaleOwed({ owed, prFacts = new Map(), records = owed }) {
   return owed.filter(({ key, record: r }) => prFacts.get(key)?.open === false
     || (!r.previousCi && records.some(({ record: newer }) => isHarnessRecord(newer) && r.repo && r.pr && r.sha
-      && newer.repo === r.repo && newer.pr === r.pr && newer.sha !== r.sha
+      && newer.repo === r.repo && newer.pr === r.pr && newer.sha.toLowerCase() !== String(r.sha).toLowerCase()
       && newer.kind === r.kind
       && ['who', 'sessionId', 'lane'].some(field => r[field] && newer[field] === r[field])
       && Date.parse(newer.requestedAt) > Date.parse(r.requestedAt))))

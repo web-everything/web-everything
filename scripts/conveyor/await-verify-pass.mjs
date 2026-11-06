@@ -27,7 +27,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve, dirname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  listStoredAwaitVerify, writeStoredAwaitVerify, clearStoredAwaitVerify, clearAwaitVerifyRecord,
+  listStoredAwaitVerify, writeStoredAwaitVerify, clearStoredAwaitVerify, clearAwaitVerifyRecord, readAwaitVerifyRecord,
   resolveAwaitVerifyTtlMs, AWAIT_VERIFY_REF_RE, AWAIT_VERIFY_NO_PUSH_KINDS, isHarnessRecord,
   readSelfReview, selfReviewHold, selfReviewStoreDir, selfReviewBelongsTo,
 } from './await-verify.mjs';
@@ -820,14 +820,16 @@ export async function defaultAwaitVerifyIo({
       const out = String(exec('gh', ['pr', 'view', String(pr), '--repo', String(repo), '--json', 'headRefName,state,url,isCrossRepository', '--jq', '.state + " " + .url + " " + (.isCrossRepository|tostring) + " " + .headRefName'],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env, timeout: 60_000 })).trim();
       const [state, url, cross, ...rest] = out.split(' ');
-      return state && url && cross && rest.length ? { open: state === 'OPEN', ref: rest.join(' '), remoteUrl: repoUrlFromPrUrl(url), crossRepo: cross !== 'false' } : null;
+      return state && url && cross && rest.length ? { state, open: state === 'OPEN', ref: rest.join(' '), remoteUrl: repoUrlFromPrUrl(url), crossRepo: cross !== 'false' } : null;
     } catch { return null; }
   };
   return {
     // fix.pushBeforeGate through the policy cascade, re-read every pass so a settings flip applies without a restart.
     prState: (repo, pr) => {
       const head = prHead(repo, pr);
-      return head ? { open: head.open } : null;
+      if (head?.state === 'OPEN') return { open: true };
+      if (head?.state === 'MERGED' || head?.state === 'CLOSED') return { open: false };
+      return null;
     },
     pushPolicy: () => loadFixPushPolicy({ env }),
     fixTimingPolicy: () => {
@@ -842,9 +844,15 @@ export async function defaultAwaitVerifyIo({
     readSelfReview: (record) => readSelfReview({ repo: record.repo, pr: record.pr }, { dir: selfReviewStoreDir(env), strict: true }),
     listRecords: () => listStoredAwaitVerify(),
     writeRecord: (record) => writeStoredAwaitVerify(record),
+    // Stale retirement removes only the shared key; the lane may already belong to a newer session.
+    clearStoredRecord: (key) => clearStoredAwaitVerify(key),
     clearRecord: (key, record) => {
       const store = clearStoredAwaitVerify(key);
-      if (record?.lane && !outsidePool(record.lane)) clearAwaitVerifyRecord(record.lane);
+      if (record?.lane && !outsidePool(record.lane)) {
+        const local = readAwaitVerifyRecord(record.lane);
+        if (record.sessionId && record.sha && local?.sessionId === record.sessionId
+          && lower(local.sha) === lower(record.sha)) clearAwaitVerifyRecord(record.lane);
+      }
       return { cleared: store.cleared };
     },
     laneState: (lane, { hashDirty = false } = {}) => {

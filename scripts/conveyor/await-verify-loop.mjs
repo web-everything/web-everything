@@ -123,8 +123,8 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
       // PR reads can yield while a worker re-marks this key. Never clear that replacement.
       const current = io.listRecords().find(e => e.key === key)?.record;
       if (!current?.pendingResume?.kind || !isDeepStrictEqual(current, record)) continue;
-      // Pass the compared snapshot, with no yield between comparison and invoking deletion.
-      if (typeof io.clearRecord === 'function' && (await io.clearRecord(key, record))?.cleared !== false) cleared.push(key);
+      // Delete only this shared key, with no yield after comparing the snapshot; leave the lane-local waiter alone.
+      if (typeof io.clearStoredRecord === 'function' && (await io.clearStoredRecord(key))?.cleared !== false) cleared.push(key);
     } catch { /* Failed cleanup must not reserve admission capacity or stop live resumes. */ }
   }
   const records = allRecords.filter(({ key }) => !stale.has(key));
