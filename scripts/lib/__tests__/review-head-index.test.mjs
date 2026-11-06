@@ -67,8 +67,35 @@ describe('durability and growth', () => {
     rec({ fs });
     // the pending marker (a `wx` open in the index dir, classed 'log' here) is durable BEFORE the row is appended
     // and the directory entry is fsynced right after it (open:r), so the marker survives a power loss together with the row
-    expect(ops).toEqual(['open:wx:lock', 'fsync', 'open:wx:log', 'fsync', 'open:r:log', 'fsync', 'open:a:log', 'fsync', 'open:w:tmp', 'fsync', 'rename']);
+    // and the commit (the pending marker's removal) is made durable by a second directory fsync BEFORE the map is written
+    expect(ops).toEqual(['open:wx:lock', 'fsync', 'open:wx:log', 'fsync', 'open:r:log', 'fsync', 'open:a:log', 'fsync', 'open:r:log', 'fsync', 'open:w:tmp', 'fsync', 'rename']);
     expect(existsSync(headIndexPaths(dir).map)).toBe(true);
+  });
+  it('the commit fsyncs the index directory right after the pending marker is removed (an accepted row is not re-hidden by a crash)', () => {
+    const ops = [];
+    const fs = { ...nodeFs,
+      openSync: (p, f) => { if (f === 'r') ops.push('open-dir'); return nodeFs.openSync(p, f); },
+      unlinkSync: p => { if (/pending\./.test(String(p))) ops.push('unlink-pending'); return nodeFs.unlinkSync(p); } };
+    rec({ fs });
+    expect(ops).toEqual(['open-dir', 'unlink-pending', 'open-dir']); // marker named + dir synced; marker removed + dir synced
+  });
+  it('a net-patch key that names an inherited property is never carried: __proto__, constructor, toString, hasOwnProperty -> owed', () => {
+    rec();
+    const index = readHeadIndex({ dir });
+    for (const netPatchHash of ['__proto__', 'constructor', 'toString', 'hasOwnProperty', 'valueOf'])
+      expect(headReviewOwed({ index, repo: 'o/r', pr: 7, head: H(2), netPatchHash }), netPatchHash).toMatchObject({ owed: true, reason: 'new-head' });
+    // a PR key that names an inherited property is no record either
+    expect(headReviewOwed({ index, repo: 'constructor', pr: 7, head: H(2) })).toMatchObject({ owed: true, reason: 'no-record' });
+  });
+  it('a net-patch key that would set the history prototype is refused on write and fails closed on replay', () => {
+    for (const bad of ['__proto__', '', ' x', 'a'.repeat(129), 'a b', 5, {}]) {
+      expect(() => rec({ netPatchHash: bad }), String(bad)).toThrow(/invalid record/);
+    }
+    expect(existsSync(headIndexPaths(dir).log)).toBe(false);
+    rec();
+    const { log } = headIndexPaths(dir);
+    writeFileSync(log, readFileSync(log, 'utf8') + `${JSON.stringify({ repo: 'o/r', pr: 7, head: H(2), netPatchHash: '__proto__', verdict: 'accept', at: '2026-11-04T10:00:01Z' })}\n`);
+    expect(readHeadIndex({ dir }).ok).toBe(false);
   });
   it('a cached map with an invalid entry is rebuilt from the log, never trusted', () => {
     rec(); rec({ head: H(2), netPatchHash: 'p2' });

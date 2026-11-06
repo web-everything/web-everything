@@ -64,8 +64,13 @@ export function netPatchKey({ exec, cwd, sha, mainRef = 'origin/main' } = {}) {
 const NOKEY = 'head:';
 const prKey = (repo, pr) => `${repo}#${Number(pr)}`;
 const TXN = /^[\w-]{1,64}$/;
+// A net-patch key names a property of the history object, so it must be a plain token: it starts with a letter or digit, which
+// refuses `__proto__` (it would set the object's prototype instead of a key). Real keys are sha256 hex. Lookups also use hasOwn.
+const PATCH_KEY = /^[A-Za-z0-9][\w.:-]{0,127}$/;
+const hasOwn = (o, k) => o != null && Object.prototype.hasOwnProperty.call(o, k);
 // pr must already BE a positive safe integer: Number() coercion would accept null, '', true and '7' as PR numbers.
 const validRecord = r => r && typeof r.repo === 'string' && r.repo && Number.isSafeInteger(r.pr) && r.pr > 0 && typeof r.head === 'string' && SHA.test(r.head)
+  && (r.netPatchHash == null || (typeof r.netPatchHash === 'string' && PATCH_KEY.test(r.netPatchHash)))
   && typeof r.verdict === 'string' && r.verdict && typeof r.at === 'string' && Number.isFinite(Date.parse(r.at)) && (r.txn === undefined || (typeof r.txn === 'string' && TXN.test(r.txn)));
 
 /** PURE: fold one record into the map and keep only the latest `keepPerPr` history entries for that PR. */
@@ -170,7 +175,9 @@ const durable = (fs, path, flag, text) => {
   const fd = fs.openSync(path, flag);
   try { fs.writeSync(fd, text); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
 };
-const atomicWrite = (fs, path, tmp, text) => { durable(fs, tmp, 'w', text); fs.renameSync(tmp, path); };
+// fsync the directory so a created or removed NAME survives a power loss (best effort: a platform that cannot fsync a directory skips it).
+const syncDir = (fs, dir) => { try { const dfd = fs.openSync(dir, 'r'); try { fs.fsyncSync(dfd); } finally { fs.closeSync(dfd); } } catch { /* unsupported */ } };
+const atomicWrite =(fs, path, tmp, text) => { durable(fs, tmp, 'w', text); fs.renameSync(tmp, path); };
 
 const sleepMs = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const pidAlive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; } };
@@ -276,7 +283,7 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
     durable(fs, pendingPath(dir, txn), 'wx', `${JSON.stringify({ txn, pid: process.pid, at: Date.now() })}\n`);
     // fsync the directory too, so the marker's NAME survives a power loss together with the row it hides (best effort: a platform
     // that cannot fsync a directory just skips it).
-    try { const dfd = fs.openSync(dir, 'r'); try { fs.fsyncSync(dfd); } finally { fs.closeSync(dfd); } } catch { /* unsupported */ }
+    syncDir(fs, dir);
     // Our row is hidden by that marker from the instant it is appended until we accept it. A lost lock (or any failure before the
     // commit) rejects it: we never touch the log again to say so (a live holder may be appending to it or renaming a new one over
     // it, which would swallow our write); we create the marker file `retract.<txn>` and drop the pending marker.
@@ -345,6 +352,7 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
     fenced();                                                   // still the holder: accept. A thief after this finds our row accepted.
     fs.unlinkSync(pendingPath(dir, txn));                       // COMMIT: the row becomes visible. A missing marker means a new holder already rejected us: fail.
     committed = true;                                           // past this point the row stays: a failed map write only leaves the cache behind the log
+    syncDir(fs, dir);                                           // make the marker's removal durable too: after a power loss it must not come back and hide an accepted row
     atomicWrite(fs, mapPath, tmp, published);
     return { ok: true, lines };
     } catch (e) { if (!committed) rollback(); throw tag(e); }        // any failure before the commit rejects our row (it is already hidden); after it, readers rebuild from the log
@@ -411,7 +419,7 @@ export function seedFromReviewComments(comments) {
 export function headReviewOwed({ index, repo, pr, head, netPatchHash = null, seed = null } = {}) {
   if (!index || index.ok !== true || !index.map) return { owed: null, held: true, reason: 'index-unreadable' };
   if (!SHA.test(head ?? '')) return { owed: null, held: true, reason: 'head-unreadable' };
-  const r = index.map[prKey(repo, pr)];
+  const r = hasOwn(index.map, prKey(repo, pr)) ? index.map[prKey(repo, pr)] : null;
   if (!r) {
     // Pre-index PR: seed from the latest trusted reviewed-sha marker. No marker (or no seed given) is owed, never nothing-owed.
     if (seed && SHA.test(seed.lastReviewedHead ?? '')) {
@@ -421,7 +429,8 @@ export function headReviewOwed({ index, repo, pr, head, netPatchHash = null, see
     return { owed: true, reason: 'no-record' };
   }
   if (r.lastReviewedHead === head) return { owed: false, reason: 'same-head', verdict: r.verdict };
-  const prior = netPatchHash ? r.history?.[netPatchHash] : null;
+  // Own keys only: a caller-supplied `__proto__` or `constructor` must not resolve to an inherited value and read as a carried review.
+  const prior = typeof netPatchHash === 'string' && hasOwn(r.history, netPatchHash) ? r.history[netPatchHash] : null;
   if (prior) return { owed: false, carried: true, reason: 'same-net-patch', verdict: prior.verdict, fromHead: prior.head };
   return { owed: true, reason: 'new-head', lastReviewedHead: r.lastReviewedHead };
 }
