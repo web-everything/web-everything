@@ -16,7 +16,7 @@ import {
   overlayGraduated, reportDiscardedCandidate,
 } from './adopt.mjs';
 import { hostname } from 'node:os';
-import { forceRequestFor, forceBlockedReason, dropReadyCandidate, forcedWatchStatus } from '../daemon-force-adopt.mjs';
+import { forceRequestFor, forceBlockedReason, dropReadyCandidate, forcedWatchStatus, carryForceWatch } from '../daemon-force-adopt.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import {
   findUnsafeLocalState, knownInputsOf, rollbackUnverified, collectUntrackedPaths, ensureSafeToMove,
@@ -671,6 +671,16 @@ export async function prepareRebuild({
         root, env, log, run, stateOpts, now, plan, prevHead, lease: { token: null },
       });
       const { alerts: finAlerts = [], ...finResult } = fin;
+      // R508: this successor was adopted without a smoke of its own, so an open force watch for the build it replaces keeps
+      // guarding the (unverified) code it carries, with the original last-good, instead of being erased as "superseded".
+      if (finResult.adopted) {
+        try {
+          await carryForceWatch({
+            root, env: stEnv, fromSha: prevHead, toSha: plan.finalSha,
+            emit: (e) => appendDaemonEvent(e, { env: { WE_DAEMON_EVENTS: env?.WE_DAEMON_EVENTS } }),
+          });
+        } catch { /* the carry is best-effort: a failure leaves the watch to its TTL */ }
+      }
       return {
         terminal: true,
         result: { ...finResult, ...(finResult.adopted ? { reason: 'skipped-unrelated', skippedSmoke: true } : {}) },

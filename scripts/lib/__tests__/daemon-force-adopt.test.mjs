@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   validateForceAdopt, requestForceAdopt, readForceAdopt, recordForcedAdoption, abortForcedAdoption, readForceWatch,
-  evaluateForceWatch, runForceWatchTick, forceRequestFor, forceBlockedReason, abortForcedWatch, dropReadyCandidate, forcedWatchStatus,
+  evaluateForceWatch, runForceWatchTick, forceRequestFor, forceBlockedReason, abortForcedWatch, dropReadyCandidate, forcedWatchStatus, carryForceWatch,
 } from '../daemon-force-adopt.mjs';
 import { matchReadyCandidate } from '../daemon-rebuild/adopt.mjs';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
@@ -212,6 +212,61 @@ describe('runForceWatchTick before/after the forced build is the running head', 
     expect((await tick('b'.repeat(40))).action).toBe('continue');
     expect((await tick('c'.repeat(40))).action).toBe('superseded');
     expect(readForceWatch(root, env)).toBeNull();
+  });
+});
+
+describe('a watch opened by this tick: health is checked now, counting starts next tick', () => {
+  const rec = () => recordForcedAdoption({ root, env, request: { daemon: 'review', ruling: 'R508', quote: QUOTE }, sha: 'b'.repeat(40),
+    lastGood: { head: 'a'.repeat(40) }, smoke: { verdict: 'code', failed: [] }, emit: async () => {} });
+  const startedMs = () => Date.parse(readForceWatch(root, env).startedAt);
+  it('an unhealthy build is rolled back on the adoption tick itself (nothing may be left to a watcher that cannot start)', async () => {
+    await rec();
+    let rolled = null;
+    const r = await runForceWatchTick({ root, env, notBefore: startedMs() - 1, currentHead: () => 'b'.repeat(40), probe: async () => ({ healthy: false }),
+      rollback: async (lg) => { rolled = lg; return { ok: true }; }, emit: async () => {} });
+    expect(r).toMatchObject({ action: 'rollback', reason: 'health-failed' });
+    expect(rolled.head).toBe('a'.repeat(40));
+    expect(readForceWatch(root, env)).toBeNull();
+  });
+  it('a healthy build is left uncounted: same ticksLeft, still adopted-pending, no completion', async () => {
+    await rec();
+    const before = readForceWatch(root, env).ticksLeft;
+    const r = await runForceWatchTick({ root, env, notBefore: startedMs() - 1, currentHead: () => 'b'.repeat(40), probe: async () => ({ healthy: true }),
+      rollback: async () => { throw new Error('no'); }, emit: async () => {} });
+    expect(r.action).toBe('none');
+    expect(readForceWatch(root, env).ticksLeft).toBe(before);
+  });
+});
+
+describe('carryForceWatch: a successor adopted without its own smoke inherits the open watch', () => {
+  const rec = () => recordForcedAdoption({ root, env, request: { daemon: 'review', ruling: 'R508', quote: QUOTE }, sha: 'b'.repeat(40),
+    lastGood: { head: 'a'.repeat(40) }, smoke: { verdict: 'code', failed: [] }, emit: async () => {} });
+  it('moves the watch onto the successor, keeping last-good and ticks left; the next tick probes the successor instead of superseding', async () => {
+    await rec();
+    await runForceWatchTick({ root, env, currentHead: 'b'.repeat(40), probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async () => {} });
+    const events = [];
+    expect(await carryForceWatch({ root, env, fromSha: 'b'.repeat(40), toSha: 'd'.repeat(40), emit: async (e) => { events.push(e.kind); } })).toBe(true);
+    expect(readForceWatch(root, env)).toMatchObject({ sha: 'd'.repeat(40), ticksLeft: 4, lastGood: { head: 'a'.repeat(40) } });
+    expect(events).toEqual(['force-adopt-watch-carried']);
+    let rolled = null;
+    const r = await runForceWatchTick({ root, env, currentHead: 'd'.repeat(40), probe: async () => ({ healthy: false }), rollback: async (lg, o) => { rolled = { lg, o }; return { ok: true }; }, emit: async () => {} });
+    expect(r).toMatchObject({ action: 'rollback' });
+    expect(rolled.lg.head).toBe('a'.repeat(40));
+    expect(rolled.o.sha).toBe('d'.repeat(40));
+  });
+  it('an owed-rollback marker moves with the watch, so the revert stays owed on the successor', async () => {
+    await rec();
+    await runForceWatchTick({ root, env, currentHead: 'b'.repeat(40), probe: async () => ({ healthy: false }), rollback: async () => ({ ok: false }), emit: async () => {} });
+    expect(readForceWatch(root, env)).toMatchObject({ rollbackPending: 'health-failed' });
+    expect(await carryForceWatch({ root, env, fromSha: 'b'.repeat(40), toSha: 'd'.repeat(40) })).toBe(true);
+    expect(readForceWatch(root, env)).toMatchObject({ sha: 'd'.repeat(40), rollbackPending: 'health-failed' });
+  });
+  it('does nothing for a watch of another build, no watch, or the same sha', async () => {
+    expect(await carryForceWatch({ root, env, fromSha: 'b'.repeat(40), toSha: 'd'.repeat(40) })).toBe(false);
+    await rec();
+    expect(await carryForceWatch({ root, env, fromSha: 'c'.repeat(40), toSha: 'd'.repeat(40) })).toBe(false);
+    expect(await carryForceWatch({ root, env, fromSha: 'b'.repeat(40), toSha: 'b'.repeat(40) })).toBe(false);
+    expect(readForceWatch(root, env)).toMatchObject({ sha: 'b'.repeat(40) });
   });
 });
 

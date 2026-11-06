@@ -193,6 +193,22 @@ export async function dropReadyCandidate({ root, env = process.env, keepSha = nu
   if (ready?.forced === true && sha && sha !== keepSha) await abortForcedWatch({ root, env, sha, reason, emit, now });
 }
 
+/** A successor adopted WITHOUT its own smoke (skip-unrelated: the move changes nothing the daemon runs) still carries the forced
+ *  build's unverified code, so the open watch moves onto it instead of being dropped as "superseded": same last-good, same ticks
+ *  left, same owed-rollback marker. Only a watch for exactly `fromSha` moves. Returns true when it moved. */
+export async function carryForceWatch({ root, env = process.env, fromSha, toSha, emit }) {
+  if (!fromSha || !toSha || fromSha === toSha) return false;
+  const path = watchPath(root, env);
+  const watch = currentWatch(root, env);
+  if (!watch || watch.sha !== fromSha) return false;
+  const moved = { ...watch, sha: toSha };
+  const pending = pendingRollbacks.get(path);
+  if (pending && pending.sha === fromSha) pendingRollbacks.set(path, { ...pending, sha: toSha, watch: { ...pending.watch, sha: toSha } });
+  try { writeJson(path, moved); } catch { if (!pending) return false; } // an unsaved marker stays in memory; a plain watch that cannot be saved stays on its old sha
+  await emit?.({ kind: 'force-adopt-watch-carried', daemon: watch.daemon, detail: { ruling: watch.ruling, from: fromSha, to: toSha } });
+  return true;
+}
+
 /** PURE. One watch tick: fail closed on a failed health check or a crash loop, else count down. */
 export function evaluateForceWatch({ watch, healthy, restarts = 0, maxRestarts = FORCE_ADOPT_MAX_RESTARTS }) {
   // A rollback that already failed stays mandatory: a later healthy probe must not forget it and count the watch down.
@@ -208,8 +224,10 @@ export function evaluateForceWatch({ watch, healthy, restarts = 0, maxRestarts =
 export async function runForceWatchTick({ root, env = process.env, probe, rollback, emit, now = Date.now, notBefore = null, currentHead = null }) {
   let watch = currentWatch(root, env);
   if (!watch) return { action: 'none' };
-  // A watch opened by THIS tick's own forced adoption starts counting at the next tick.
-  if (notBefore !== null && Date.parse(watch.startedAt) >= notBefore) return { action: 'none' };
+  // A watch opened by THIS tick's own forced adoption starts COUNTING at the next tick, but its health is still checked now: the
+  // running process still has the previous (good) code loaded, so a build that can no longer even import is reverted before the
+  // restart onto it (afterwards nothing would run this watcher: a daemon that fails to import its own rebuild module never ticks).
+  const openedThisTick = notBefore !== null && Date.parse(watch.startedAt) >= notBefore;
   // A `currentHead` FUNCTION that returns nothing (or throws) means git could not be read: that is a failure, never the same as
   // "no currentHead supplied" (a plain value, or null), which skips head tracking. Unknown never counts down or completes a watch.
   const readHead = () => {
@@ -278,6 +296,7 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   const pendingReason = watch.rollbackPending || pendingFor(root, env, watch.sha); // disk marker, else the in-process one
   let verdict = evaluateForceWatch({ watch: pendingReason ? { ...watch, rollbackPending: pendingReason } : watch, healthy: health?.healthy, restarts: health?.restarts ?? 0 });
   if (headUnreadable && !pendingReason && verdict.action === 'rollback') verdict = { ...verdict, reason: 'head-unreadable' };
+  if (openedThisTick && (verdict.action === 'continue' || verdict.action === 'done')) return { action: 'none' }; // healthy on arrival: counting starts next tick
   if (verdict.action === 'continue') { persist(verdict.watch); return { action: 'continue', ticksLeft: verdict.watch.ticksLeft }; }
   if (verdict.action === 'done') { clearWatch(root, env); await emit?.({ kind: 'force-adopt-watch-passed', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha } }); return { action: 'done' }; }
   const at = new Date(now()).toISOString();
