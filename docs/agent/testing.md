@@ -2396,6 +2396,10 @@ reverify. `verify.loadRetry.maxAttempts` defaults to 3 through the policy cascad
 is persisted before requesting and does not consume ordinary retries. If that request
 fails (or never runs), the old red is not a new verdict: the harness re-requests it under
 the ordinary retry and infra-retry bounds and never escalates it.
+While a load retry exists on the record, its sha is known red: a running or overdue
+retry is never pushed early or handed back as a no-op. A deferral refreshes the
+record's `requestedAt`, so the session reaper keeps the fixer exempt until the
+deferral's own two-hour cap; after that the red ladder resumes it.
 Missing per-test timeout evidence, assertions, truncated inventories, low load on first
 observation, and exhaustion retain the normal red/escalation path. Inject `loadHigh`
 to probe both transitions, write failure, and the unchanged no-push kinds.

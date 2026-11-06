@@ -101,6 +101,14 @@ export function isTimeoutOnlyRed(marker) {
 export const isLoadRedReason = reason => String(reason ?? '').startsWith('red-load-');
 
 /**
+ * Does this record's sha carry a known timeout red still owned by the load-retry path? `loadRetry` is written only on a
+ * red and lives until the record is cleared (a green push or a resume); a new `mark` starts a record without it. While it
+ * is present, a `running` / overdue / no-verdict decision is the retry in flight, not a fresh unverified wait: the sha is
+ * never pushed early and never handed back as a no-op. Pure.
+ */
+export const hasKnownLoadRed = record => record?.loadRetry !== null && typeof record?.loadRetry === 'object';
+
+/**
  * After a load re-run was persisted, is this red still the verdict it was meant to replace? True when the red started
  * (or finished) no later than the re-run request: the request failed, or the pass crashed between write and request.
  * A red with no readable time cannot prove it is the re-run's own verdict, so it counts as stale too. Pure.
@@ -316,7 +324,7 @@ export function isSessionBusy(session) {
  */
 export function isEarlyPushOwed({ record, decision, policy, limits = AWAIT_VERIFY_LIMITS }) {
   if (policy?.pushBeforeGate !== true) return false;
-  if (isLoadRedReason(decision?.reason)) return false;
+  if (isLoadRedReason(decision?.reason) || hasKnownLoadRed(record)) return false;
   if (!isHarnessRecord(record) || record.kind !== 'fix' || record.pendingResume) return false;
   if (decision?.action !== 'wait' && decision?.action !== 'rerequest') return false;
   const ep = record.earlyPush;
@@ -469,7 +477,7 @@ export async function runAwaitVerifyPass({
         // even after an auth pause, busy session or failed delivery. Preserve valid no-ops without re-pushing.
         const current = { ...record }; delete current.pendingResume;
         const fresh = classifyAwaitVerdict({ record: current, marker, lane, nowMs, ttlMs, limits, ...loadInput });
-        if (fresh.action === 'resume' || isLoadRedReason(fresh.reason)) { record = current; d = fresh; }
+        if (fresh.action === 'resume' || isLoadRedReason(fresh.reason) || hasKnownLoadRed(current)) { record = current; d = fresh; }
         // Replacement is persisted below before any resume/retry effect; read/write errors retain the waiter.
       }
       Object.assign(row, { action: d.action, reason: d.reason });
@@ -530,9 +538,14 @@ export async function runAwaitVerifyPass({
       if (d.loadDefer || d.loadRerun || d.reason === 'red-load-deferred') {
         row.reason = `${d.reason}; loadHigh=${loadHigh}; verify.loadRetry.maxAttempts=${loadMaxAttempts} (${recovery.sources?.['loadRetry.maxAttempts'] ?? recovery.sources?.loadRetry ?? 'standard'})`;
         row.action = d.loadRerun ? 'load-rerun' : 'load-deferred';
-        if (d.loadDefer) persist({ ...record, loadRetry: {
+        // The session reaper exempts a fixer only within `ttlMs` of `requestedAt` (classifyAwaitVerify). A deferral is
+        // bounded by its own `since` (AWAIT_LOAD_DEFER_MAX_MS), so keep `requestedAt` fresh while it waits: the fixer stays
+        // exempt until the deferral's own deadline, and the red ladder resumes it after that.
+        const exemptionStale = !(nowMs - Date.parse(record.requestedAt) <= ttlMs / 2);
+        if (d.loadDefer) persist({ ...record, requestedAt: new Date(nowMs).toISOString(), loadRetry: {
           attempts: record.loadRetry?.attempts ?? 0, waiting: true, since: new Date(nowMs).toISOString(),
         } });
+        else if (d.reason === 'red-load-deferred' && exemptionStale) persist({ ...record, requestedAt: new Date(nowMs).toISOString() });
         // `rerunAt` lets the next tick tell the re-run's verdict from the red it replaces, should this request fail.
         if (d.loadRerun && persist({ ...record, requestedAt: new Date(nowMs).toISOString(), loadRetry: {
           attempts: (record.loadRetry?.attempts ?? 0) + 1, waiting: false, rerunAt: new Date(nowMs).toISOString(),
@@ -573,8 +586,8 @@ export async function runAwaitVerifyPass({
       if (record?.kind === 'fix' && !record.pendingResume && record.earlyPush?.ok && record.earlyPush.upToDate
         && (record.attempt ?? 1) === 1 && record.earlyPush.attempts === 1
         && lower(record.earlyPush.sha) === lower(record.sha) && (d.action === 'wait' || d.action === 'rerequest')
-        // A known red awaiting its load re-run is never handed back as a no-op.
-        && !isLoadRedReason(d.reason)) {
+        // A known red awaiting (or running) its load re-run is never handed back as a no-op.
+        && !isLoadRedReason(d.reason) && !hasKnownLoadRed(record)) {
         // A no-op still hands the claim back. Retain the original wait while review is open, so a later
         // verify red or moved lane is still observed; only an overdue review may resume for recovery.
         const gate = selfReviewGate({ io, record, nowMs, limits });

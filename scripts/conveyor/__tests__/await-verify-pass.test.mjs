@@ -7,8 +7,9 @@ import { computeWorkingTreeHash } from '../../lib/verify-lane-gate.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs, laneFilterDrivers, LANE_CONFIG_LIST_ARGS, LANE_GIT_CONFIG_PINS } from '../../lib/lane-git-hardening.mjs';
 import {
   classifyAwaitVerdict, isTimeoutOnlyRed, isLoadFlakeRed, runAwaitVerifyPass, buildAwaitVerifyResumePrompt, findAwaitSession, lookupAwaitSession,
-  formatAwaitVerifyLines, isHarnessRecord, isEarlyPushOwed, isLoadRedReason, AWAIT_VERIFY_LIMITS, pushShaFromScratch, claimBindingRefusal, isSessionBusy, defaultAwaitVerifyIo,
+  formatAwaitVerifyLines, isHarnessRecord, isEarlyPushOwed, isLoadRedReason, AWAIT_VERIFY_LIMITS, AWAIT_LOAD_DEFER_MAX_MS, pushShaFromScratch, claimBindingRefusal, isSessionBusy, defaultAwaitVerifyIo,
 } from '../await-verify-pass.mjs';
+import { classifyAwaitVerify } from '../await-verify.mjs';
 
 const SHA = '65a382e81413952ab11e5448e36f01bb7ce4c332';
 const OTHER = 'b96574995e22b8d8087d4a28b7ba7615d4ec8c73';
@@ -1321,5 +1322,71 @@ describe('timeout-only load recovery', () => {
     expect(isLoadRedReason('red-load-rerun-unconfirmed')).toBe(true);
     // A stale red is never pushed early.
     expect(isEarlyPushOwed({ record, decision: { action: 'rerequest', reason: 'red-load-rerun-unconfirmed' }, policy: { pushBeforeGate: true } })).toBe(false);
+  });
+  it('red-team round 2: a running load retry keeps the known-red hold — no no-op hand-back, the retry red still resumes', async () => {
+    const at = new Date(T0).toISOString();
+    const h = harness({ records: [rec({ attempt: 1, earlyPush: { sha: SHA, ok: true, done: true, upToDate: true, attempts: 1, at } })] });
+    const tick = nowMs => runAwaitVerifyPass({ io: h.io, nowMs, ttlMs: TTL, pushPolicy: { pushBeforeGate: true } });
+    h.state.marker = timeout(); h.io.loadHigh = () => true;
+    await tick(T0 + 1);
+    h.io.loadHigh = () => false;
+    expect((await tick(T0 + 2)).rows[0]).toMatchObject({ action: 'load-rerun' });
+    // The retry is running: no verdict yet, and the sha is known red. Never a no-op hand-back.
+    for (let n = 3; n < 6; n++) expect((await tick(T0 + n)).rows[0]).toMatchObject({ action: 'wait', reason: 'running' });
+    expect(h.calls.resume).toEqual([]); expect(h.calls.push).toEqual([]);
+    expect(h.store.get(rec().sessionId).pendingResume).toBeUndefined();
+    // The retry's own red is observed and resumed as a red.
+    h.state.marker = timeout({ startedAt: new Date(T0 + 6).toISOString() });
+    await tick(T0 + 7);
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('--attempt=2');
+    expect(h.calls.resume[0].prompt).not.toContain('already had this exact sha');
+  });
+  it('red-team round 2: a running load retry never pushes the known-red sha early', async () => {
+    const h = harness({ records: [rec({ attempt: 1 })] });
+    const tick = nowMs => runAwaitVerifyPass({ io: h.io, nowMs, ttlMs: TTL, pushPolicy: { pushBeforeGate: true } });
+    h.state.marker = timeout(); h.io.loadHigh = () => true;
+    await tick(T0 + 1);
+    h.io.loadHigh = () => false;
+    await tick(T0 + 2);
+    for (let n = 3; n < 6; n++) await tick(T0 + n);
+    expect(h.calls.push).toEqual([]);
+    const record = h.store.get(rec().sessionId);
+    for (const decision of [{ action: 'wait', reason: 'running' }, { action: 'rerequest', reason: 'verify-overdue' }, { action: 'rerequest', reason: 'no-verdict' }]) {
+      expect(isEarlyPushOwed({ record, decision, policy: { pushBeforeGate: true } })).toBe(false);
+    }
+  });
+  it('red-team round 2: a load deferral keeps the session await exemption until its own deadline', async () => {
+    const h = harness({ records: [rec({ attempt: 1 })] });
+    const session = { sessionId: rec().sessionId, name: 'fix-4115' };
+    const tick = nowMs => runAwaitVerifyPass({ io: h.io, nowMs, ttlMs: TTL });
+    h.state.marker = timeout(); h.io.loadHigh = () => true;
+    const deferAt = T0 + 40 * 60_000;
+    expect((await tick(deferAt)).rows[0]).toMatchObject({ action: 'load-deferred' });
+    // Every tick of the bounded deferral, the reaper still sees the fixer as awaiting verify.
+    for (let now = deferAt + 60_000; now < deferAt + AWAIT_LOAD_DEFER_MAX_MS; now += 10 * 60_000) {
+      expect((await tick(now)).rows[0]).toMatchObject({ action: 'load-deferred' });
+      expect(classifyAwaitVerify({ record: h.store.get(rec().sessionId), session, nowMs: now, ttlMs: TTL })).toMatchObject({ awaiting: true });
+    }
+    // The red-team instant: T0 + TTL + 1 ms, 110 minutes into the deferral.
+    const instant = T0 + TTL + 1;
+    await tick(instant);
+    expect(classifyAwaitVerify({ record: h.store.get(rec().sessionId), session, nowMs: instant, ttlMs: TTL })).toMatchObject({ awaiting: true });
+    // The deferral itself stays bounded by its start: past the cap the red ladder resumes the fixer.
+    await tick(deferAt + AWAIT_LOAD_DEFER_MAX_MS + 1);
+    expect(h.calls.resume).toHaveLength(1);
+  });
+  it('red-team round 2: an await TTL shorter than the deferral cap is refreshed on every deferred tick', async () => {
+    const shortTtl = 60 * 60_000;
+    const h = harness({ records: [rec({ attempt: 1 })] });
+    const session = { sessionId: rec().sessionId, name: 'fix-4115' };
+    const tick = nowMs => runAwaitVerifyPass({ io: h.io, nowMs, ttlMs: shortTtl });
+    h.state.marker = timeout(); h.io.loadHigh = () => true;
+    await tick(T0);
+    for (let now = T0 + 10 * 60_000; now < T0 + AWAIT_LOAD_DEFER_MAX_MS; now += 10 * 60_000) {
+      expect((await tick(now)).rows[0]).toMatchObject({ action: 'load-deferred' });
+      expect(classifyAwaitVerify({ record: h.store.get(rec().sessionId), session, nowMs: now, ttlMs: shortTtl })).toMatchObject({ awaiting: true });
+    }
+    expect(h.store.get(rec().sessionId).loadRetry.since).toBe(new Date(T0).toISOString());
   });
 });
