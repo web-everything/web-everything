@@ -374,6 +374,23 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     refused(result, sha);
     expect(git(['for-each-ref', '--format=%(refname)'], decoy)).toBe('');
   });
+  // Same write-through class via the fetch's scratch file (PR #6319 self-review): a lane-made `.git/FETCH_HEAD ->
+  // refs/heads/work/keep` let the recovery-on salvage fetch overwrite the unpushed branch before the guard looked.
+  it('with recovery on, a FETCH_HEAD symlink onto a branch never moves it, and the release refuses', () => {
+    const pushed = git(['rev-parse', 'HEAD'], laneDir);
+    const sha = commitWork();
+    git(['branch', 'work/keep', sha], laneDir);
+    git(['reset', '--quiet', '--hard', pushed], laneDir);
+    git(['switch', '--quiet', '-c', 'feature'], laneDir);
+    writeFileSync(join(laneDir, 'other.txt'), 'head work\n');
+    git(['add', 'other.txt'], laneDir);
+    git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '-m', 'head work'], laneDir);
+    rmSync(join(laneDir, '.git', 'FETCH_HEAD'), { force: true });
+    symlinkSync('refs/heads/work/keep', join(laneDir, '.git', 'FETCH_HEAD'));
+    const result = release([], '', '', RECOVERY_ON);
+    expect(git(['rev-parse', 'refs/heads/work/keep'], laneDir)).toBe(sha);
+    refused(result, sha);
+  });
   // Defense in depth: whatever the fetch does, a local branch or stash that moved during it refuses the release.
   it('refuses when a local branch moves during the verification fetch', () => {
     const pushed = git(['rev-parse', 'HEAD'], laneDir);
