@@ -1190,3 +1190,18 @@ describe('zero-padded PR numbers in markers are still validated', () => {
     expect(o.syncLabels).not.toHaveBeenCalled();
   });
 });
+
+describe('head movement at the synchronizer is refused', () => {
+  it('a new head observed at the write-time read never gets the previous head\'s clear', () => {
+    let reads = 0;
+    const provider = { readPrState: vi.fn(() => ({ headRefOid: ++reads > 1 ? 'b'.repeat(40) : head, labels: ['review:accepted', 'red-team:pending'], comments: [] })),
+      readComments: vi.fn(() => []), ensureLabel: vi.fn(), setLabels: vi.fn() };
+    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: payload('accept'), recorded: false, seatRecorded: false,
+      status: { status: 'finished', result: { status: 'ran', comment: 'posted', foldedVerdict: 'accept' } } })), readIgnorableConfirms: () => [], provider });
+    o.syncLabels = input => input.provider.setLabels(repo, pr, { add: 'red-team:clear', remove: ['red-team:pending'] });
+    o.rawPrs[0].comments.push(resultComment());
+    const row = mod.runRedTeamOnSkip(o).rows[0];
+    expect(provider.setLabels).not.toHaveBeenCalled();
+    expect(row.settleError).toMatch(/head moved/);
+  });
+});

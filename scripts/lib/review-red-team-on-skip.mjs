@@ -602,8 +602,9 @@ function resultMaySynchronize(comments, pr, head) {
 }
 
 /** Wrap a label provider so a clear is refused when a hold label is seen at the synchronizer's own read or at write time. */
-function holdGuardedProvider(provider) {
+function holdGuardedProvider(provider, head) {
   const refuse = state => {
+    if (state?.headRefOid !== head) throw Error('head moved before settlement; label unchanged');
     if (!Array.isArray(state?.labels) || state.labels.some(label => conflictsWithPolicyClear(label, { settlesPending: true }))) {
       throw Error('hold label appeared before settlement; label unchanged');
     }
@@ -792,7 +793,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
                   if (verdict === 'changes' && !blocked) row.settleError = 'recorded red-team changes; label unchanged';
                   else syncLabels({ ...key, env, log: note, evidence, comments: live.comments,
                     // The synchronizer re-reads PR state itself: refuse a clear if a hold label appeared since our read.
-                    provider: verdict === 'accept' ? holdGuardedProvider(provider) : provider,
+                    provider: verdict === 'accept' ? holdGuardedProvider(provider, row.head) : provider,
                     ...(verdict === 'changes' ? { standingRuling: null } : {}) });
                 }
               }
