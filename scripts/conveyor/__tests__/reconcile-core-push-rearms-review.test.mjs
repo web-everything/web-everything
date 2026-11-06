@@ -68,6 +68,18 @@ describe('R618 pushed fix owes its review', () => {
     expect(run({}, [{ sessionId: 'fix-session', pid: 124, pidAlive: true, laneHeadOid: HEAD,
       startedAt: Date.parse(REVIEW_AT), cwd: '/dispatch/fix-6360' }]).dispatch[0]?.kind).toBe('review');
   });
+  // A fix-end must not shadow the stale-base repair: a clean PR whose base predates a newly required job can only
+  // be unblocked by the rebase, so the owed-review branch yields to it instead of refusing on the missing job.
+  it.each([['review:pending', 'needs-review'], ['review:human', 'needs-human']])(
+    'a pushed repair on a stale base (%s) routes to the stale-base rebase, not a review-ci refusal', (label, phase) => {
+      const verdict = { author, createdAt: REVIEW_AT, body: buildReviewedShaMarker(OLD) };
+      const result = run({ labels: [label], comments: [verdict, end()] }, [],
+        { requiredChecks: ['gate', 'new-required-job'], defaultBranch: 'main' });
+      expect(result.dispatch).toMatchObject([{ phase, kind: 'fix', isConflict: true, mode: 'stale-base-rebase',
+        staleBase: { missing: ['new-required-job'], defaultBranch: 'main' } }]);
+      expect(result.dispatch.map(d => d.kind)).not.toContain('review');
+      expect(result.refusals).toEqual([]);
+    });
   it('does not re-arm when the reviewed head is unchanged', () => {
     expect(run({ comments: [advisory(HEAD), end()] }).dispatch.map(d => d.kind)).not.toContain('review');
   });

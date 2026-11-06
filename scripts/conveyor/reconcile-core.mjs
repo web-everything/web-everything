@@ -3586,7 +3586,10 @@ export function planReconcile({
     if (OWED[phase] && lastReview && release && release.releasedAtMs > lastReview.at
       && !withPhase.labels.includes(CONFLICT_LABEL) && String(pr?.mergeStateStatus ?? '').toUpperCase() !== 'DIRTY'
       && release.index > lastReview.index
-      && !sameHeadSha(lastReview.head, pr.headRefOid)) {
+      && !sameHeadSha(lastReview.head, pr.headRefOid)
+      // A base that predates a newly required job can only be unblocked by the stale-base rebase below; a review
+      // of this head could never start (its CI never publishes the job), so that repair keeps priority.
+      && !(['needs-review', 'needs-human'].includes(phase) && staleRequiredBaseRepair({ pr, requiredChecks, defaultBranch }))) {
       const why = 'the fixer released a new head after the last review — its review is owed before another repair';
       dispatchReviewRow({ pr, requiredChecks, withPhase, base, attempts: roundAttempts(),
         roundCap: effectiveRoundCap, refuse, refuseCapExhausted, dispatch, now,
