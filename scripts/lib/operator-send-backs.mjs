@@ -73,7 +73,7 @@ const COMMENT_LINE = /^[ \t]*<!--/;
 // Columns a leading-whitespace prefix occupies (a tab advances to the next multiple of 4; anything else is 1).
 const columnsOf = prefix => [...prefix].reduce((col, ch) => ch === '\t' ? col + 4 - (col % 4) : col + 1, 0);
 const CLOSE_FENCE = /^([ \t]*)(`{3,}|~{3,})[ \t]*$/;
-const LIST_PREFIX = /[^ \t ]/;
+const LIST_PREFIX = /[^ \t\u00A0]/;
 function stripQuoted(text) {
   const out = [];
   let fence = null, fenceIndent = 0, fenceInList = false, quoting = false;
@@ -103,7 +103,7 @@ function stripQuoted(text) {
       fence = open[1];
       // fenceIndent is the fence's start COLUMN (tabs expanded), so closer columns compare like with like.
       fenceIndent = columnsOf(openPrefix);
-      fenceInList = /[^ \t ]/.test(openPrefix);
+      fenceInList = /[^ \t\u00A0]/.test(openPrefix);
       quoting = false;
       out.push('');
     } else if (QUOTE_LINE.test(line) || (quoting && line.trim() && !COMMENT_LINE.test(line))) {
