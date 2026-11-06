@@ -6502,15 +6502,20 @@ strictest, no prior question hashes accepted); an empty section sets nothing and
 `{hash, acceptUntil}` records (the hash 64 lowercase hex characters), the same shape `findAudit` reads; only the
 settings file may set it (no environment route, and a platform value is ignored with a warning), and any invalid
 entry empties the whole list. The audit resolver is stricter than `findAudit`'s reader in these cases, each one
-accepting nothing: a list over 64 records, a hash that is not a string, the key beside a case or
+accepting nothing: a list over 64 records, a hash or an `acceptUntil` that is not a string, the key beside a case or
 invisible-character variant of itself, and a platform preference that is unreadable, not an object, or a configured
-path that is missing or relative. It never accepts a record `findAudit` would refuse. An environment value that does not parse
+path that is missing or relative. It never accepts a record `findAudit` would refuse, and it never throws: a
+resolution it cannot complete resolves every setting to its strictest option, with a warning. An environment value that does not parse
 or is not a known option resolves to that setting's strictest option too. Path lists only add to the built-in
 guard floor: the concurrency modules (locks, leases including `scripts/lib/lane-lease.mjs`, slots, lane pool,
 merge, drain) and the guard hooks (`scripts/guard-*.mjs` and the other guard scripts) with their registration in
 `.claude/settings.json`, the git hooks and merge/review gates, and the auditor's own modules and settings. Paths
 match without regard to letter case. The required-check, review and merge authorization gates (including
-`scripts/lib/review-ci-gate.mjs`) are on the floor too. Platform and file path lists are unioned, never replaced.
+`scripts/lib/review-ci-gate.mjs`) are on the floor too, and so are the review authorization modules that decide
+who may clear, accept or carry a verdict and which markers are trusted (including
+`scripts/lib/review-independence.mjs`, `scripts/lib/marker-authorship.mjs` and `scripts/review-set-label.mjs`).
+A D2 card's requirements are enforced independently: a missing card clears only when both the card and the
+pay-by requirements are waived. Platform and file path lists are unioned, never replaced.
 An invalid or unreadable path list protects every path. An explicitly configured platform-preferences file that
 is missing fails closed like an unreadable one. `allow` from the environment also resolves to `block`. The D2 card
 reader fetches `origin/main` before reading the card; a failed fetch means no card. A caller of the verdict may only

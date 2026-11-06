@@ -451,7 +451,9 @@ describe('R473 structured concurrency evidence', () => {
     // requirement is the stricter of trusted and caller, in BOTH directions: a caller cannot relax a strict trusted value,
     // and a caller's stricter value is honoured when the trusted value is loose. Only loose x loose relaxes.
     const SETTINGS_TABLE = {
-      requireOnMain: { strict: true, loose: false, findings: () => [d2()], layer: v => ({ cards: { requireOnMain: v, requirePayBy: true } }),
+      // requirePayBy is waived here so this row isolates requireOnMain: a missing card has no pay-by either, and a
+      // required pay-by alone keeps it blocked (the independence test below covers that cell).
+      requireOnMain: { strict: true, loose: false, findings: () => [d2()], layer: v => ({ cards: { requireOnMain: v, requirePayBy: false } }),
         opts: v => ({ requireOnMain: v, readCard: () => null }) },
       requirePayBy: { strict: true, loose: false, findings: () => [d2()], layer: v => ({ cards: { requireOnMain: true, requirePayBy: v } }),
         opts: v => ({ requirePayBy: v, readCard: () => 'status: open\n' }) },
@@ -484,6 +486,24 @@ describe('R473 structured concurrency evidence', () => {
       expect((await compute([f], options('prerelease', { ...base, readCard: () => null }), loose)).verdict).toBe('NOT WEAKENED');
       expect((await compute([f], options('prerelease', { ...base, readCard: () => null, requireOnMain: undefined }), loose)).verdict).toBe('NOT WEAKENED');
     });
+    // PR #6381 red team: each card requirement is enforced on its own. A missing card has no pay-by either, so it
+    // clears only when BOTH are waived; a card with no pay-by line clears only when the pay-by is waived.
+    const CARD_BODIES = { missing: () => null, blank: () => '  \n', 'no pay-by': () => 'status: open\n', 'current pay-by': rc };
+    it.each([true, false].flatMap(onMain => [true, false].flatMap(payBy => Object.keys(CARD_BODIES).map(card => [onMain, payBy, card,
+      card === 'current pay-by' || (card === 'no pay-by' && !payBy) || (card !== 'no pay-by' && !onMain && !payBy)]))))(
+      'card requirements are independent: requireOnMain %s, requirePayBy %s, card %s ships: %s (PR #6381 red team)',
+      async (onMain, payBy, card, ships) => {
+        const f = d2(); const layer = trustedLayer({ cards: { requireOnMain: onMain, requirePayBy: payBy } });
+        const r = await compute([f], options('prerelease', { relationProofs: [proofFor(f)], readCard: CARD_BODIES[card] }), layer);
+        expect(r.verdict).toBe(ships ? 'NOT WEAKENED' : 'WEAKENED');
+        if (!ships) expect(r.ships).toEqual([]);
+      });
+    it('a caller pay-by requirement is honoured for a missing card when trusted settings waive both (PR #6381 red team)', async () => {
+      const f = d2(); const loose = trustedLayer({ cards: { requireOnMain: false, requirePayBy: false } });
+      const base = { relationProofs: [proofFor(f)], readCard: () => null };
+      expect((await compute([f], options('prerelease', { ...base, requirePayBy: true }), loose)).verdict).toBe('WEAKENED');
+      expect((await compute([f], options('prerelease', base), loose)).verdict).toBe('NOT WEAKENED');
+    });
     it('a card with no pay-by line blocks', async () => {
       const f = d2(); expect((await run(f, { relationProofs: [proofFor(f)], readCard: () => 'status: open\n' })).verdict).toBe('WEAKENED');
     });
@@ -515,6 +535,16 @@ describe('R473 structured concurrency evidence', () => {
         expect([...r.blocks, ...r.recheck].map(x => x.id)).toEqual(['f1']);
       }
     });
+    it('E2 in scripts/lib/review-independence.mjs (an author clearing its own review) refuses clearance (PR #6381 red team)', async () => {
+      const f = finding({ id: 'self-clear', class: 'E2', file: 'scripts/lib/review-independence.mjs', line: 261,
+        invariant: 'Only an independent actor may clear an automated review',
+        trigger: 'Remove the author/clearer equality check without a regression test', consequence: 'The author can clear its own review' });
+      for (const stage of ['prerelease', 'prod']) {
+        const r = await compute([f], options(stage, { guardFloorPaths: [], raceBlockPaths: [] }));
+        neverShips(r);
+        expect([...r.blocks, ...r.recheck].map(x => x.id)).toEqual(['self-clear']);
+      }
+    });
     it('D3 in scripts/lib/lane-lease.mjs blocks (a lease overwrite never clears)', async () => {
       const f = finding({ class: 'D3', file: 'scripts/lib/lane-lease.mjs', invariant: 'A live lease is never overwritten' });
       neverShips(await compute([f], options()));
@@ -535,6 +565,12 @@ describe('R473 structured concurrency evidence', () => {
       'scripts/lib/permission-change.mjs', 'scripts/lib/pr-merge-gate.mjs', '.github/workflows/merge-gate.yml', '.github/workflows/review-gate.yml',
       'scripts/operations/audit-verdict.mjs', 'scripts/operations/codex-audit.mjs', 'scripts/operations/codex-audit-io.mjs',
       'scripts/lib/audit-settings.mjs', 'scripts/lib/policy-cascade.mjs', 'scripts/settings/codex-audit.json',
+      // Review authorization (PR #6381 red team): who may clear, accept or carry a verdict, and which markers are trusted.
+      'scripts/lib/review-independence.mjs', 'scripts/lib/marker-authorship.mjs', 'scripts/lib/ai-pr-authorship.mjs',
+      'scripts/operations/build-pr-authorship.mjs', 'scripts/lib/human-clearance-carry.mjs', 'scripts/conveyor/human-clearance-carry-cli.mjs',
+      'scripts/settings/human-clearance-carry.json', 'scripts/settings/numbering-human-clearance.json', 'scripts/lib/accept-carry-forward.mjs',
+      'scripts/conveyor/accept-carry-sweep.mjs', 'scripts/settings/accept-carry-forward.json', 'scripts/lib/unattended-review-accept.mjs',
+      'scripts/lib/trust-chain-tier.mjs', 'scripts/review-set-label.mjs',
       // A case-insensitive file system resolves these to the guard itself.
       'Scripts/Guard-Bash.mjs', 'scripts/GUARD-bash.mjs', 'SCRIPTS/LIB/LANE-LEASE.MJS',
     ])('every guard, lease, lock, gate and audit module is on the built-in floor: E1, E2 and D3 in %s never ship', async file => {

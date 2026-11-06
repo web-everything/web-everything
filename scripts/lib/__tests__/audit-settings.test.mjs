@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { AUDIT_SETTINGS_PATH, GUARD_FLOOR, resolveAuditSettings } from '../audit-settings.mjs';
+import { AUDIT_SETTINGS_ENV, AUDIT_SETTINGS_PATH, GUARD_FLOOR, resolveAuditSettings } from '../audit-settings.mjs';
 import { resolvePriorQuestionHashes } from '../../operations/codex-audit.mjs';
 
 const HASH_A = Object.freeze({ hash: 'a'.repeat(64), acceptUntil: '2026-12-01T00:00:00.000Z' });
@@ -230,6 +230,38 @@ describe('audit settings (R528)', () => {
     expect(shipped.sources.guardFloorPaths).toBe('file');
     expect(shipped.value.guardFloorPaths).toEqual(expect.arrayContaining(['scripts/guard-*', 'scripts/lib/lane-lease.mjs']));
   });
+  it('the built-in floor and the shipped file hold the review authorization modules (PR #6381 red team)', () => {
+    const auth = ['scripts/lib/review-independence.mjs', 'scripts/lib/marker-authorship.mjs', 'scripts/review-set-label.mjs'];
+    for (const p of auth) expect(GUARD_FLOOR).toContain(p);
+    expect(resolveAuditSettings({ platform: null, env: {}, log: () => {} }).value.guardFloorPaths).toEqual(expect.arrayContaining(auth));
+  });
+  // PR #6381 red team: a record field that is valid JSON but no text (`{"toString":0}` cannot be converted, so
+  // `Date.parse` / `RegExp#test` throw on it) empties the list with a warning; the resolver never throws.
+  it.each([
+    ['an acceptUntil object that cannot become text', { hash: 'a'.repeat(64), acceptUntil: { toString: 0 } }],
+    ['a hash object that cannot become text', { hash: { toString: 0 }, acceptUntil: '2026-12-01T00:00:00.000Z' }],
+    ['a null acceptUntil', { hash: 'a'.repeat(64), acceptUntil: null }],
+  ])('a prior hash record with %s accepts nothing and never throws (PR #6381 red team)', (_, record) => {
+    const read = () => JSON.stringify({ audit: { priorQuestionHashes: [record] } });
+    let r; expect(() => { r = resolveAuditSettings({ fileRead: read, platform: null, env: {}, log: () => {} }); }).not.toThrow();
+    expect(r.value.priorQuestionHashes).toEqual([]);
+    expect(r.sources.priorQuestionHashes).toBe('strictest');
+    expect(r.warnings.join()).toMatch(/priorQuestionHashes invalid; none accepted/);
+    // findAudit's reader refuses it too, so both readers still agree.
+    expect(resolvePriorQuestionHashes({ readFile: read, env: {} })).toEqual([]);
+  });
+  it('a resolution that throws resolves every setting to its strictest option with a warning (PR #6381 red team)', () => {
+    const env = { get [AUDIT_SETTINGS_ENV.raceBlockPaths]() { throw new Error('boom'); } };
+    const logged = [];
+    let r; expect(() => { r = resolveAuditSettings({ fileRead: file(full()), platform: null, env, log: m => logged.push(m) }); }).not.toThrow();
+    expect(r.value).toMatchObject({ verdictMode: 'shadow', preExistingMode: 'block', releaseStage: 'prod', recheckMax: 0, baseRecheckMax: 0,
+      requireOnMain: true, requirePayBy: true, priorQuestionHashes: [] });
+    expect(r.value.guardFloorPaths).toEqual([...GUARD_FLOOR, '**']);
+    expect(r.value.raceBlockPaths).toEqual([...GUARD_FLOOR, '**']);
+    expect(new Set(Object.values(r.sources))).toEqual(new Set(['strictest']));
+    expect(r.warnings).toEqual([expect.stringMatching(/could not be resolved \(boom\); every setting resolves to its strictest option/)]);
+    expect(logged).toEqual(r.warnings);
+  });
   it('prior question hashes have no env route and bad lists are empty', () => {
     expect(resolve(full({ priorQuestionHashes: [HASH_A] }), { WE_AUDIT_PRIOR_QUESTION_HASHES: JSON.stringify([HASH_B]) }).value.priorQuestionHashes).toEqual([HASH_A]);
     expect(resolve(full({ priorQuestionHashes: ['zz'] })).value.priorQuestionHashes).toEqual([]);
@@ -265,6 +297,9 @@ describe('audit settings (R528)', () => {
   it.each([
     ['a list over 64 records', Array.from({ length: 65 }, (_, i) => ({ hash: i.toString(16).padStart(64, '0'), acceptUntil: '2026-12-01T00:00:00.000Z' }))],
     ['a non-string hash', [{ hash: ['a'.repeat(64)], acceptUntil: '2026-12-01T00:00:00.000Z' }]],
+    // Date.parse converts these to text that parses, so findAudit's reader accepts them (PR #6381 red team).
+    ['an acceptUntil array', [{ hash: 'a'.repeat(64), acceptUntil: ['2026-12-01'] }]],
+    ['a numeric acceptUntil', [{ hash: 'a'.repeat(64), acceptUntil: 1234 }]],
   ])('the audit resolver is only ever stricter than findAudit: %s accepts nothing (PR #6381 merge)', (_, list) => {
     const read = () => JSON.stringify({ audit: { priorQuestionHashes: list } });
     expect(resolveAuditSettings({ fileRead: read, platform: null, env: {}, log: () => {} }).value.priorQuestionHashes).toEqual([]);

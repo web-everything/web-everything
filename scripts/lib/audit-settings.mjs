@@ -30,6 +30,12 @@ export const GUARD_FLOOR = Object.freeze(['scripts/**/file-locks*', 'scripts/*fi
   // Modules those gates decide with (their imports): weakening one weakens the gate.
   'scripts/lib/required-status-checks.mjs', 'scripts/lib/rollup-collapse.mjs', 'scripts/lib/review-escalation.mjs',
   'scripts/lib/review-timing.mjs', 'scripts/lib/review-policy*', 'scripts/lib/github-auth-policy.mjs', 'scripts/operations/gate-health*',
+  // Review authorization: WHO may clear, accept or carry a verdict, and which markers are trusted (PR #6381 red team:
+  // scripts/lib/review-independence.mjs, the author-cannot-clear-own-review check, was missing).
+  'scripts/lib/review-independence.mjs', 'scripts/lib/marker-authorship.mjs', 'scripts/lib/ai-pr-authorship.mjs',
+  'scripts/operations/build-pr-authorship.mjs', 'scripts/**/human-clearance-carry*', 'scripts/settings/*human-clearance*',
+  'scripts/**/accept-carry-*', 'scripts/lib/unattended-review-accept.mjs', 'scripts/lib/trust-chain-tier.mjs',
+  'scripts/review-set-label.mjs',
   // The auditor itself: weakening it weakens every later audit.
   'scripts/operations/audit-verdict.mjs', 'scripts/operations/codex-audit*', 'scripts/lib/audit-settings.mjs',
   'scripts/lib/policy-cascade.mjs', 'scripts/settings/codex-audit.json']);
@@ -60,8 +66,12 @@ const validPaths = v => Array.isArray(v) && v.length <= 256 && v.every(p => type
 // {hash, acceptUntil} object per prior question hash, the hash 64 lowercase hex characters. Two readers of one
 // settings key must agree, so a bare-string list (or any other shape) is invalid here too (PR #6381 merge).
 const HASH_64 = /^[a-f0-9]{64}(?![\s\S])/;
+// Both fields must be strings BEFORE they reach a parser: `Date.parse` and `RegExp#test` convert their argument to
+// text, and a JSON object such as `{"toString":0}` cannot be converted, so it would throw (PR #6381 red team). A
+// non-string is invalid, which empties the list.
 const validHashes = v => Array.isArray(v) && v.length <= 64
-  && v.every(e => isObj(e) && typeof e.hash === 'string' && HASH_64.test(e.hash) && Number.isFinite(Date.parse(e.acceptUntil)));
+  && v.every(e => isObj(e) && typeof e.hash === 'string' && HASH_64.test(e.hash)
+    && typeof e.acceptUntil === 'string' && Number.isFinite(Date.parse(e.acceptUntil)));
 const validCount = v => Number.isInteger(v) && v >= 0 && v <= MAX_RECHECK;
 const enumOf = key => v => RANKS[key].includes(v);
 const VALID = Object.freeze({ verdictMode: enumOf('verdictMode'), preExistingMode: enumOf('preExistingMode'), releaseStage: enumOf('releaseStage'),
@@ -148,9 +158,21 @@ function tighter(key, candidate, current) {
 
 /**
  * Resolve the audit settings. `fileRead`/`path`/`platform` are test seams; production passes none.
+ * Never throws: anything the resolution itself cannot survive (a value a parser cannot convert, an environment
+ * object that throws on read) resolves EVERY setting to its strictest option, with a warning (PR #6381 red team).
  * @returns {{value: object, sources: Record<string,string>, warnings: string[]}}
  */
-export function resolveAuditSettings({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync, platform, env = process.env, log } = {}) {
+export function resolveAuditSettings(options = {}) {
+  try { return resolveUnguarded(options ?? {}); } catch (err) {
+    let reason = 'unknown error';
+    try { if (typeof err?.message === 'string') reason = err.message.slice(0, 200); } catch { /* keep the generic reason */ }
+    const warning = `audit settings could not be resolved (${reason}); every setting resolves to its strictest option`;
+    try { (options?.log ?? (() => {}))(warning); } catch { /* never throws */ }
+    const value = { ...STRICTEST, raceBlockPaths: STRICTEST_PATHS, guardFloorPaths: STRICTEST_PATHS, priorQuestionHashes: Object.freeze([]) };
+    return { value: Object.freeze(value), sources: Object.fromEntries(Object.keys(value).map(k => [k, 'strictest'])), warnings: [warning] };
+  }
+}
+function resolveUnguarded({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync, platform, env = process.env, log } = {}) {
   const warnings = [];
   const warn = m => { warnings.push(m); try { (log ?? (() => {}))(m); } catch { /* never throws */ } };
   const { tool, unreadable } = readFile(path, fileRead);

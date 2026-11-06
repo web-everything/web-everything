@@ -89,12 +89,16 @@ export function readCardFromMain(path, { run = spawnSync } = {}) {
 /**
  * D2 debt ships only when its card exists on main and its pay-by date has not passed. The pay-by date is
  * read only from that card, never from the model finding. A card due `prod` blocks at prod. Unreadable => false.
+ * Each requirement is enforced on its own: a missing card clears only when both requireOnMain and requirePayBy are
+ * waived, and a card without a pay-by line clears only when requirePayBy is waived.
  */
 function d2Verified(f, releaseStage, { readCard = readCardFromMain, now = Date.now, requireOnMain = true, requirePayBy = true } = {}) {
   try {
     if (typeof f.card !== 'string' || !CARD_PATH.test(f.card)) return false;
     const body = readCard(f.card);
-    if (typeof body !== 'string' || !body.trim()) return requireOnMain === false;
+    // A missing card has no pay-by date either, so it clears only when BOTH requirements are waived: waiving the
+    // card alone never waives a required pay-by (PR #6381 red team).
+    if (typeof body !== 'string' || !body.trim()) return requireOnMain === false && requirePayBy === false;
     // Any pay-by-looking line (indent, case, spacing, trailing text) must parse strictly, or it fails closed.
     const lines = body.split(/\r\n|[\n\r\p{Zl}\p{Zp}]/u).filter(l => /^\s*must[\s_-]*pay[\s_-]*before\s*:/i.test(l.normalize('NFKC')));
     if (lines.length > 1) return false;
