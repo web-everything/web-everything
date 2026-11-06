@@ -200,13 +200,32 @@ export async function carryForceWatch({ root, env = process.env, fromSha, toSha,
   if (!fromSha || !toSha || fromSha === toSha) return false;
   const path = watchPath(root, env);
   const watch = currentWatch(root, env);
+  // Already moved by a watch tick that saw the intent (`carryTo`) and HEAD on the successor: nothing left to do.
+  if (watch && watch.sha === toSha && !watch.carryTo) return true;
   if (!watch || watch.sha !== fromSha) return false;
-  const moved = { ...watch, sha: toSha };
+  const { carryTo: _intent, ...rest } = watch;
+  const moved = { ...rest, sha: toSha };
   const pending = pendingRollbacks.get(path);
   if (pending && pending.sha === fromSha) pendingRollbacks.set(path, { ...pending, sha: toSha, watch: { ...pending.watch, sha: toSha } });
-  try { writeJson(path, moved); } catch { if (!pending) return false; } // an unsaved marker stays in memory; a plain watch that cannot be saved stays on its old sha
+  try { writeJson(path, moved); } catch {
+    if (!pending) {
+      // Not saved and nothing keeps it in memory: say so where an operator reads it, never a silent loss of rollback protection.
+      appendLine(handoffFile(env), `- FORCE-ADOPT ${new Date().toISOString()} ${watch.daemon} ${watch.ruling}: force-adopt-watch-carry-failed ${fromSha} -> ${toSha}; the watch could not be moved onto the unsmoked successor\n`);
+      return false;
+    }
+  }
   await emit?.({ kind: 'force-adopt-watch-carried', daemon: watch.daemon, detail: { ruling: watch.ruling, from: fromSha, to: toSha } });
   return true;
+}
+
+/** Declare, BEFORE the clone's HEAD moves, that the open watch for `fromSha` is about to follow it to `toSha` (a skip-unrelated
+ *  adoption). A watch tick that reads HEAD on `toSha` in the window before {@link carryForceWatch} runs (or after a crash between the
+ *  reset and the carry) rebinds the watch itself instead of closing it as superseded. `toSha: null` withdraws the intent (the move failed). */
+export function declareForceCarry({ root, env = process.env, fromSha, toSha = null }) {
+  const watch = currentWatch(root, env);
+  if (!watch || watch.sha !== fromSha) return false;
+  const { carryTo: _old, ...rest } = watch;
+  try { writeJson(watchPath(root, env), toSha ? { ...rest, carryTo: toSha } : rest); return true; } catch { return false; }
 }
 
 /** PURE. One watch tick: fail closed on a failed health check or a crash loop, else count down. */
@@ -240,6 +259,13 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   const head = first.head;
   // State writes here are best-effort: a failed write must never stop the health check or the rollback that follows.
   const persist = (w) => { try { writeJson(watchPath(root, env), w); } catch { /* the next tick re-derives it */ } };
+  // An unsmoked successor adoption declared this move (`carryTo`) before it reset HEAD: HEAD on that successor is the SAME watched
+  // code, not a superseding build, so rebind to it here (the adopting process's own carry may not have run yet, or may have died).
+  if (watch.carryTo && head !== null && head === watch.carryTo) {
+    const { carryTo, ...rest } = watch;
+    watch = { ...rest, sha: carryTo };
+    persist(watch);
+  }
   const expire = async () => {
     // The forced build never became head. Its ready candidate never passed smoke, so drop it too: left behind, a later
     // write-lock holder would adopt it with no health watch.

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   validateForceAdopt, requestForceAdopt, readForceAdopt, recordForcedAdoption, abortForcedAdoption, readForceWatch,
-  evaluateForceWatch, runForceWatchTick, forceRequestFor, forceBlockedReason, abortForcedWatch, dropReadyCandidate, forcedWatchStatus, carryForceWatch,
+  evaluateForceWatch, runForceWatchTick, forceRequestFor, forceBlockedReason, abortForcedWatch, dropReadyCandidate, forcedWatchStatus, carryForceWatch, declareForceCarry,
 } from '../daemon-force-adopt.mjs';
 import { matchReadyCandidate } from '../daemon-rebuild/adopt.mjs';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
@@ -260,6 +260,36 @@ describe('carryForceWatch: a successor adopted without its own smoke inherits th
     expect(readForceWatch(root, env)).toMatchObject({ rollbackPending: 'health-failed' });
     expect(await carryForceWatch({ root, env, fromSha: 'b'.repeat(40), toSha: 'd'.repeat(40) })).toBe(true);
     expect(readForceWatch(root, env)).toMatchObject({ sha: 'd'.repeat(40), rollbackPending: 'health-failed' });
+  });
+  it('a tick that reads HEAD on the successor BEFORE the carry runs (declared intent) rebinds instead of closing the watch as superseded', async () => {
+    await rec();
+    await runForceWatchTick({ root, env, currentHead: 'b'.repeat(40), probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async () => {} });
+    expect(declareForceCarry({ root, env, fromSha: 'b'.repeat(40), toSha: 'd'.repeat(40) })).toBe(true);
+    const events = [];
+    const r = await runForceWatchTick({ root, env, currentHead: () => 'd'.repeat(40), probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async (e) => { events.push(e.kind); } });
+    expect(r).toMatchObject({ action: 'continue', ticksLeft: 3 });
+    expect(events).not.toContain('force-adopt-watch-superseded');
+    const w = readForceWatch(root, env);
+    expect(w).toMatchObject({ sha: 'd'.repeat(40), lastGood: { head: 'a'.repeat(40) } });
+    expect(w.carryTo).toBeUndefined();
+    expect(await carryForceWatch({ root, env, fromSha: 'b'.repeat(40), toSha: 'd'.repeat(40) })).toBe(true); // the late carry is a no-op, not a failure
+  });
+  it('a declared intent does not make an unrelated head look carried, and a withdrawn intent is gone', async () => {
+    await rec();
+    await runForceWatchTick({ root, env, currentHead: 'b'.repeat(40), probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async () => {} });
+    declareForceCarry({ root, env, fromSha: 'b'.repeat(40), toSha: 'd'.repeat(40) });
+    expect((await runForceWatchTick({ root, env, currentHead: () => 'e'.repeat(40), probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async () => {} })).action).toBe('superseded');
+    await rec();
+    declareForceCarry({ root, env, fromSha: 'b'.repeat(40), toSha: 'd'.repeat(40) });
+    declareForceCarry({ root, env, fromSha: 'b'.repeat(40), toSha: null });
+    expect(readForceWatch(root, env).carryTo).toBeUndefined();
+  });
+  it('a carry that cannot be saved is reported in the handoff file, never silent', async () => {
+    await rec();
+    chmodSync(env.WE_DAEMON_STATE_DIR, 0o500);
+    try { expect(await carryForceWatch({ root, env, fromSha: 'b'.repeat(40), toSha: 'd'.repeat(40) })).toBe(false); } finally { chmodSync(env.WE_DAEMON_STATE_DIR, 0o700); }
+    expect(readFileSync(env.WE_FORCE_ADOPT_HANDOFF, 'utf8')).toMatch(/force-adopt-watch-carry-failed b{40} -> d{40}/);
+    expect(readForceWatch(root, env)).toMatchObject({ sha: 'b'.repeat(40) });
   });
   it('does nothing for a watch of another build, no watch, or the same sha', async () => {
     expect(await carryForceWatch({ root, env, fromSha: 'b'.repeat(40), toSha: 'd'.repeat(40) })).toBe(false);

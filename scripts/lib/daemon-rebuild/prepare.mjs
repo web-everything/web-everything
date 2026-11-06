@@ -16,7 +16,7 @@ import {
   overlayGraduated, reportDiscardedCandidate,
 } from './adopt.mjs';
 import { hostname } from 'node:os';
-import { forceRequestFor, forceBlockedReason, dropReadyCandidate, forcedWatchStatus, carryForceWatch } from '../daemon-force-adopt.mjs';
+import { forceRequestFor, forceBlockedReason, dropReadyCandidate, forcedWatchStatus, carryForceWatch, declareForceCarry } from '../daemon-force-adopt.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import {
   findUnsafeLocalState, knownInputsOf, rollbackUnverified, collectUntrackedPaths, ensureSafeToMove,
@@ -667,19 +667,30 @@ export async function prepareRebuild({
     if (d?.skip) {
       if (readyOnly) return mutationDue('skip-unrelated-adopt');
       log?.error?.(`daemon-rebuild: skipped rebuild+smoke for ${String(plan.finalSha).slice(0, 9)} — ${d.reason} (daemonRebuild.skipUnrelated)`);
-      const fin = await finalizeRebuild({
-        root, env, log, run, stateOpts, now, plan, prevHead, lease: { token: null },
-      });
+      // R508: this successor is adopted without a smoke of its own, so an open force watch for the build it replaces keeps guarding the
+      // (unverified) code it carries, with the original last-good, instead of being erased as "superseded". The move is declared in
+      // the watch BEFORE HEAD changes, so a watch tick that lands between the reset and the carry (or a crash there) rebinds, not closes.
+      let carryDeclared = false;
+      try { carryDeclared = declareForceCarry({ root, env: stEnv, fromSha: prevHead, toSha: plan.finalSha }); } catch { /* handled below */ }
+      let fin;
+      try {
+        fin = await finalizeRebuild({
+          root, env, log, run, stateOpts, now, plan, prevHead, lease: { token: null },
+        });
+      } catch (e) {
+        if (carryDeclared) { try { declareForceCarry({ root, env: stEnv, fromSha: prevHead, toSha: null }); } catch { /* best effort */ } }
+        throw e;
+      }
       const { alerts: finAlerts = [], ...finResult } = fin;
-      // R508: this successor was adopted without a smoke of its own, so an open force watch for the build it replaces keeps
-      // guarding the (unverified) code it carries, with the original last-good, instead of being erased as "superseded".
       if (finResult.adopted) {
         try {
           await carryForceWatch({
             root, env: stEnv, fromSha: prevHead, toSha: plan.finalSha,
             emit: (e) => appendDaemonEvent(e, { env: { WE_DAEMON_EVENTS: env?.WE_DAEMON_EVENTS } }),
           });
-        } catch { /* the carry is best-effort: a failure leaves the watch to its TTL */ }
+        } catch { /* a failed carry is reported in the handoff file by carryForceWatch; the declared intent still covers a watch tick */ }
+      } else if (carryDeclared) {
+        try { declareForceCarry({ root, env: stEnv, fromSha: prevHead, toSha: null }); } catch { /* best effort */ }
       }
       return {
         terminal: true,
