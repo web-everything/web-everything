@@ -239,6 +239,7 @@ describe('care exemption settings resolver', () => {
   it.each([
     'x/y/*a*a*a*a*a*a*a*a*a*ab', 'scripts/ci/*a*.json', 'scripts/ci/*/*/*/*.json',
     'a/b/**/x/**/z', 'a/b/**/x/**/x/**/z', 'a/b/**/x/x/**/x/x/**/z',
+    'a/b/*?*?*?*?z', 'a/b/*?*?*?z', 'a/b/**z', 'a/b/x**', 'a/b/x?.json', 'a/b/***',
     `scripts/ci/${'a'.repeat(MAX_CARE_EXEMPT_GLOB_LENGTH)}.json`,
   ])('refuses backtracking-prone or oversized glob %s through every settings layer', glob => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -254,13 +255,16 @@ describe('care exemption settings resolver', () => {
     } finally { warn.mockRestore(); }
   });
 
-  it('the widest allowed wildcard shape still matches a long author-chosen path quickly', () => {
-    const glob = 'scripts/ci/*/*/*x';
-    expect(validateCareExemptPaths([glob])).toEqual([glob]);
-    const started = Date.now();
-    expect(matchesCareExemptPath(`scripts/ci/${'a/'.repeat(2)}${'a'.repeat(5000)}`, [glob])).toBe(false);
-    expect(Date.now() - started).toBeLessThan(1000);
-  });
+  it.each(['scripts/ci/*/*/*x', 'a/b/**/*x/*y', 'a/b/*x/**/*y'])(
+    'the widest allowed wildcard shape %s still matches long, deep author-chosen paths quickly', glob => {
+      expect(validateCareExemptPaths([glob])).toEqual([glob]);
+      const started = Date.now();
+      // At the matched-path bounds: under 1024 characters, under 32 segments.
+      for (const file of [`a/b/${'x'.repeat(1000)}`, `a/b/${'xa/'.repeat(28)}q`, `scripts/ci/a/a/${'a'.repeat(1000)}`]) {
+        matchesCareExemptPath(file, [glob]);
+      }
+      expect(Date.now() - started).toBeLessThan(1000);
+    });
 
   it('never exempts an over-long or over-deep author-chosen path (bounded match cost, fail closed)', () => {
     const deep = `data/generated/${'x/'.repeat(MAX_CARE_EXEMPT_PATH_SEGMENTS)}f.json`;

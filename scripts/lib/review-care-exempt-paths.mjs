@@ -34,18 +34,20 @@ export function validateCareExemptPaths(value, { warn = m => console.warn(m) } =
   const validGlob = glob => {
     if (typeof glob !== 'string' || !glob.trim() || glob !== glob.trim()) return false;
     if (glob === '**/fixtures/**') return true;
-    // Allow-list, not a deny-list: only plain path characters and the `*`/`?` wildcards. Every glob or regex
+    // Allow-list, not a deny-list: only plain path characters and the `*` wildcard. Every glob or regex
     // metacharacter that can widen reach (`|` alternation, extglob `+@!`, braces, brackets, `$^`, non-ASCII,
     // whitespace, control and format characters) is refused rather than enumerated (#6433 red team).
-    if (!/^[A-Za-z0-9._\-/*?]+$/.test(glob) || glob.startsWith('/')
+    if (!/^[A-Za-z0-9._\-/*]+$/.test(glob) || glob.startsWith('/')
       || glob.split('/').some(s => s === '..' || s === '.' || !s)) return false;
-    // Resource bound: PR authors pick the matched path names, so a pattern with many wildcard runs (`*a*a*a…b`)
-    // can backtrack for seconds per path, and nested globstars grow with the path's depth. Bound the length, one
-    // wildcard run per segment, three in all, and a single `**`.
-    const runs = segment => (segment.match(/[*?]+/g) || []).length;
-    if (glob.length > MAX_CARE_EXEMPT_GLOB_LENGTH || glob.split('/').some(s => runs(s) > 1) || runs(glob) > 3
-      || (glob.match(/\*\*/g) || []).length > 1) return false;
-    const wildcard = glob.search(/[*?]/);
+    // Resource bound: PR authors pick the matched path names, so several wildcards in one segment (`*a*a*a…b`,
+    // `*?*?*?z`) backtrack for seconds per path, and nested globstars grow with the path's depth. Bound the
+    // length; a segment is either exactly `**` or holds at most one `*` character (`?` is refused above); at
+    // most three wildcard segments in all, and a single `**`.
+    const segments = glob.split('/');
+    const stars = segment => segment.split('*').length - 1;
+    if (glob.length > MAX_CARE_EXEMPT_GLOB_LENGTH || segments.some(s => s !== '**' && stars(s) > 1)
+      || segments.filter(s => stars(s) > 0).length > 3 || segments.filter(s => s === '**').length > 1) return false;
+    const wildcard = glob.search(/\*/);
     // Count complete literal directories before the first wildcard. Equivalent broad
     // spellings must not evade the scope bound; exact file names remain allowed.
     if (wildcard !== -1 && glob.slice(0, wildcard).split('/').length - 1 <= 1) return false;
