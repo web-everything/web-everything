@@ -47,6 +47,8 @@ function shellSplit(value) {
   const tokens = []; let cur = '', has = false, quote = null;
   for (let i = 0; i < value.length; i += 1) {
     const c = value[i];
+    // env -S expands ${VAR} itself; the value is unknown here, so the real program/script cannot be resolved.
+    if (c === '$' && value[i + 1] === '{' && quote !== "'") return null;
     if (quote === "'") { if (c === "'") quote = null; else cur += c; continue; }
     if (quote === '"') {
       if (c === '"') quote = null;
@@ -56,7 +58,8 @@ function shellSplit(value) {
     }
     if (/\s/.test(c)) { if (has) { tokens.push(cur); cur = ''; has = false; } continue; }
     if (c === "'" || c === '"') { quote = c; has = true; continue; }
-    if (c === '\\') { if (i + 1 >= value.length) return null; cur += value[i + 1]; i += 1; has = true; continue; }
+    // env -S gives \_ \c \n \t ... special meaning (separator / stop / control char): not modelled, so unsupported.
+    if (c === '\\') { if (i + 1 >= value.length || /[_cntrfv]/.test(value[i + 1])) return null; cur += value[i + 1]; i += 1; has = true; continue; }
     cur += c; has = true;
   }
   if (quote) return null;
@@ -358,7 +361,9 @@ const diskState = {
       if (!file.endsWith('.json')) continue;
       try {
         const state = JSON.parse(await fsAsync.readFile(join(dir, file), 'utf8'));
-        if (typeof state?.pendingSha === 'string' && state.pendingSha) out.push({ label: decodeURIComponent(file.slice(0, -5)), ...state });
+        // A marker we cannot act on (no cooldown anchor / sha) would spam every tick: ignore it here.
+        if (typeof state?.pendingSha === 'string' && state.pendingSha && Number.isFinite(state.at)
+          && typeof state.sha === 'string' && state.sha) out.push({ label: decodeURIComponent(file.slice(0, -5)), ...state });
       } catch { /* not a pending marker we can read */ }
     }
     return out;
@@ -417,19 +422,31 @@ export async function restartServicesForClone({ settings, platform, env = proces
   // pendingOnly (later ticks): retry only the labels whose restart a cooldown deferred. Each owes the sha it
   // was deferred for; nothing is scanned when none is owed, and a label that no longer qualifies is cleared.
   let owed = null;
-  const settle = async (label, previous) => { await stateStore.set(label, { at: previous.at, sha: previous.sha }); };
+  // Clear an owed marker without rolling back a restart another process recorded since we listed it:
+  // re-read first and only write when the marker we listed is still the one on disk.
+  const settle = async (label, previous) => {
+    const fresh = await stateStore.get(label);
+    if (fresh && fresh.pendingSha !== undefined && fresh.pendingSha === previous.pendingSha && fresh.at === previous.at) await stateStore.set(label, { at: fresh.at, sha: fresh.sha });
+  };
   const report = (kind, service, reason) => {
     const entry = { ...service, reason };
     result[kind].push(entry);
     safeLog(log, `daemon.serviceRestart ${kind} ${service.label ?? service.plistPath ?? '?'}: ${reason} (source ${source})`);
   };
   try {
+    // State is keyed by label, shared by every clone's daemon: a marker belongs to the clone that deferred it.
     if (pendingOnly) {
-      owed = new Map(((await stateStore.pending?.()) ?? []).map(x => [x.label, x]));
+      owed = new Map(((await stateStore.pending?.()) ?? []).filter(x => x.pendingRoot === options.cloneRoot).map(x => [x.label, x]));
       if (!owed.size) return result;
     }
     const policy = resolveRestartPolicy({ settings, platform, env, envValues, log });
     source = JSON.stringify({ values: policy.value, sources: policy.sources });
+    if (owed) {
+      // Inside the cooldown there is nothing to do: skip the plist scan (one plutil per plist) until one is due.
+      const current = now();
+      owed = new Map([...owed].filter(([, x]) => !(current - x.at < policy.value.minIntervalMs)));
+      if (!owed.size) return result;
+    }
     const { matches, unreadable } = await scanAsync({ ...options, signal });
     if (!pendingOnly) for (const bad of unreadable) report('flagged', bad, 'plist-unreadable: inspect and repair plist before restarting');
     const p = policy.value;
@@ -472,13 +489,14 @@ export async function restartServicesForClone({ settings, platform, env = proces
         if (reason === 'debounced') {
           // Remember the restart we owe: a later tick retries it once the cooldown has passed.
           // A newer adoption simply replaces the owed sha; a successful restart clears it.
-          if (!owed) await stateStore.set(label, { ...previous, pendingSha: adoptedSha });
+          if (!owed) await stateStore.set(label, { ...previous, pendingSha: adoptedSha, pendingRoot: options.cloneRoot });
           if (!owed) report('skipped', service, reason);
           continue;
         }
         if (reason) {
-          if (owed) await settle(label, previous);
-          else report('skipped', service, reason);
+          // Already running the adopted sha (e.g. A, B deferred, then back to A): nothing is owed any more.
+          if (previous.pendingSha !== undefined) await settle(label, previous);
+          if (!owed) report('skipped', service, reason);
           continue;
         }
         const id = typeof uid === 'function' ? uid() : uid;

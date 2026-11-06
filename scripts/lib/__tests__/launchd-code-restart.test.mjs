@@ -819,7 +819,7 @@ describe('interpreter option shapes that once hid a clone script (value contains
     const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/env', '-S', `"${outside}" "${other}" "${join(cloneRoot, 'data')}"`] }]);
     expect(findServicesRunningFromClone(o).matches).toEqual([]);
   });
-  it.each(['"unterminated', "'unterminated", 'trailing\\'])('unparsable env -S string %s is flagged unreadable, never silently excluded', value => {
+  it.each(['"unterminated', "'unterminated", 'trailing\\', '${HOME}/x', '"${HOME}/x"', 'a\\_b', 'a\\cb'])('unparsable env -S string %s is flagged unreadable, never silently excluded', value => {
     const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/env', '-S', `${outside} ${cloneScript} ${value}`] }]);
     const result = findServicesRunningFromClone(o);
     expect(result.matches).toEqual([]);
@@ -867,6 +867,46 @@ describe('interpreter option shapes that once hid a clone script (value contains
       expect(o.states.get(label)).toEqual({ at: clock.t, sha: 'B' });
       expect((await restartServicesForClone({ ...o, pendingOnly: true })).restarted).toEqual([]);
       expect(o.launchctl).toHaveBeenCalledTimes(2);
+    });
+    it('a still-cooling owed marker costs no plist scan on any later tick', async () => {
+      const clock = { t: 1_000_000 }, o = cooled(clock);
+      await restartServicesForClone({ ...o, adoptedSha: 'A' });
+      clock.t += 1000; await restartServicesForClone({ ...o, adoptedSha: 'B' });
+      o.listPlists = vi.fn(o.listPlists);
+      for (let i = 0; i < 20; i += 1) { clock.t += 1000; await restartServicesForClone({ ...o, pendingOnly: true }); }
+      expect(o.listPlists).not.toHaveBeenCalled();
+    });
+    it("another clone's later tick neither retries nor clears this clone's owed marker", async () => {
+      const clock = { t: 1_000_000 }, o = cooled(clock);
+      await restartServicesForClone({ ...o, adoptedSha: 'A' });
+      clock.t += 1000; await restartServicesForClone({ ...o, adoptedSha: 'B' });
+      clock.t += 600_000;
+      const foreign = await restartServicesForClone({ ...o, cloneRoot: resolve('fixtures/other-clone-root'), listPlists: () => [], pendingOnly: true });
+      expect(foreign).toEqual({ restarted: [], skipped: [], flagged: [], errors: [] });
+      expect(o.states.get(label)).toMatchObject({ sha: 'A', pendingSha: 'B', pendingRoot: cloneRoot });
+    });
+    it('clearing an owed marker never rolls back a restart another process recorded meanwhile', async () => {
+      const clock = { t: 1_000_000 }, o = cooled(clock);
+      await restartServicesForClone({ ...o, adoptedSha: 'A' });
+      clock.t += 1000; await restartServicesForClone({ ...o, adoptedSha: 'B' });
+      const stale = o.stateStore.pending();
+      o.stateStore.pending = () => stale; // listed before the other process finished
+      o.states.set(label, { at: 2_000_000, sha: 'C' }); // that process restarted for C and cleared the marker
+      o.listPlists = () => []; clock.t += 3_000_000;
+      await restartServicesForClone({ ...o, pendingOnly: true });
+      expect(o.states.get(label)).toEqual({ at: 2_000_000, sha: 'C' });
+    });
+    it('returning to the running sha while a restart is owed clears the owed marker', async () => {
+      const clock = { t: 1_000_000 }, o = cooled(clock);
+      await restartServicesForClone({ ...o, adoptedSha: 'A' });
+      clock.t += 1000; await restartServicesForClone({ ...o, adoptedSha: 'B' });
+      clock.t += 1000;
+      const back = await restartServicesForClone({ ...o, adoptedSha: 'A' });
+      expect(back.skipped).toEqual([expect.objectContaining({ reason: 'same-adopted-sha' })]);
+      expect(o.states.get(label)).toEqual({ at: 1_000_000, sha: 'A' });
+      clock.t += 600_000;
+      expect((await restartServicesForClone({ ...o, pendingOnly: true })).restarted).toEqual([]);
+      expect(o.launchctl).toHaveBeenCalledTimes(1);
     });
     it('nothing owed means no plist scan on a later tick', async () => {
       const clock = { t: 1_000_000 }, o = cooled(clock); o.listPlists = vi.fn(o.listPlists);
