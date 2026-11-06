@@ -18,7 +18,7 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  * lanes are long-lived under `~/workspace/.lanes/<repo>/lane-<n>` and merely fetch + hard-reset to
  * origin/main between batches. Git OBJECTS are shared with the primary checkout via `git clone
  * --reference`, so a lane costs little disk and clones fast (objects come from the local primary, not the
- * network). Node deps (`node_modules`) are NOT shared — `ensureDeps` runs `npm ci` per lane on a fresh
+ * network). Node deps (`node_modules`) are per lane — `ensureDeps` prefers pnpm 12 with a shared store on a fresh
  * clone or when the lockfile changes, so each lane can run its own gate.
  *
  * Repo-parameterized: the pool is keyed by repo NAME, so cross-repo slice 4 (lanes of
@@ -77,12 +77,14 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  * `release --lane=N --release-reserved`. (NOTE: this script only PROVISIONS the reserved lane; the live repoint
  * of the machine-global `~/.claude/…/memory` symlink at it is the SUPERVISED, human-gated half of #2350.)
  */
-import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync, realpathSync } from 'node:fs';
+import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { readLockfileParity } from './check-lockfile-parity.mjs';
+import { selectInstaller, runDepsInstaller, markerMatches } from './lib/lane-deps-installer.mjs';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomBytes } from 'node:crypto';
 import { homedir, hostname, tmpdir } from 'node:os';
-import { join, basename, resolve, dirname, sep } from 'node:path';
+import { join, basename, resolve, dirname, sep, delimiter } from 'node:path';
 import { resolveReal } from './guard-lane.mjs';
 import { readGit, execRead } from './lib/proc-read.mjs';
 import { createBuildOutputCleaner } from './lib/lane-build-output.mjs';
@@ -822,7 +824,7 @@ function depsReady(dir) {
   if (want === null) return 'n/a'; // no package.json → nothing to install
   if (!existsSync(join(dir, 'node_modules'))) return 'missing';
   const have = existsSync(DEPS_MARKER(dir)) ? readFileSync(DEPS_MARKER(dir), 'utf8').trim() : null;
-  return have === want ? 'ok' : 'stale';
+  return ['npm', 'pnpm'].some(backend => markerMatches(have, want, backend)) ? 'ok' : 'stale';
 }
 // #3461 — `npm ci`/`npm install` here is a DELIBERATE, NAMED EXCEPTION to the heavy-command admission queue
 // (`scripts/readiness/heavy-admission.mjs`), not an oversight. #3456's own ruling is explicit that the cap
@@ -836,16 +838,34 @@ function depsReady(dir) {
 // that is comparatively cheap and already deduped by `depsReady`'s lockfile-hash skip (most acquires do
 // nothing here at all). This function stays ungated.
 function ensureDeps(dir) {
-  const state = depsReady(dir);
-  if (state === 'n/a' || state === 'ok') return state;
-  const useCi = existsSync(join(dir, 'package-lock.json'));
-  log(`  deps ${state} → npm ${useCi ? 'ci' : 'install'} in ${dir} …`);
-  // #x5n4zn3 review — npm's stdout goes to OUR stderr (fd 2), never our stdout: `acquire --json` prints its
-  // result on stdout, and a caller that captures it (`orphan-claim-release.mjs`'s `acquireLane`) must parse
-  // pure JSON even on the acquires that actually install. Stays visible on a terminal either way.
-  execFileSync('npm', [useCi ? 'ci' : 'install'], { cwd: dir, stdio: ['inherit', 2, 'inherit'], timeout: NPM_TIMEOUT_MS, killSignal: 'SIGKILL' });
-  writeFileSync(DEPS_MARKER(dir), lockHash(dir));
-  return 'installed';
+  const hash = lockHash(dir);
+  if (hash === null) return 'n/a';
+  const plan = selectInstaller({
+    which: name => (process.env.PATH || '').split(delimiter).map(dir => resolve(dir, name)).find(file => {
+      try { accessSync(file, constants.X_OK); return statSync(file).isFile(); } catch { return false; }
+    }),
+    exec: (command, args, { cwd }) => execFileSync(command, args, {
+      cwd, encoding: 'utf8', timeout: 15_000, maxBuffer: 64 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+    }),
+    hasPnpmLock: existsSync(join(dir, 'pnpm-lock.yaml')),
+    hasNpmLock: existsSync(join(dir, 'package-lock.json')),
+    parity: () => readLockfileParity(dir).ok,
+    storeDir: resolve(process.env.WE_PNPM_STORE_DIR || join(homedir(), '.cache', 'we-pnpm-store')),
+  });
+  const marker = existsSync(DEPS_MARKER(dir)) ? readFileSync(DEPS_MARKER(dir), 'utf8').trim() : null;
+  const result = runDepsInstaller({
+    plan, hash, marker, hasNodeModules: existsSync(join(dir, 'node_modules')),
+    invalidate: () => rmSync(DEPS_MARKER(dir), { force: true }),
+    remove: () => rmSync(join(dir, 'node_modules'), { recursive: true, force: true }),
+    log: message => log(`  ${message} in ${dir} …`),
+    // Installer stdout goes to OUR stderr: acquire --json must remain pure JSON.
+    exec: (command, args) => execFileSync(command, args, {
+      cwd: dir, stdio: ['inherit', 2, 'inherit'], timeout: NPM_TIMEOUT_MS, killSignal: 'SIGKILL',
+    }),
+  });
+  // npm install may create/update package-lock.json; stamp the resulting lock just as before.
+  if (result.state === 'installed') writeFileSync(DEPS_MARKER(dir), result.backend + ':' + lockHash(dir));
+  return result.state;
 }
 
 // ── lease (#2275) — an exclusive hold so a lane is never recycled or double-acquired while in use ─────

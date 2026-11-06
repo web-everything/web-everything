@@ -1533,6 +1533,18 @@ Every edit — including an ad-hoc "just fix this one thing" — happens in an *
 node scripts/lane-pool.mjs status --json     # per-lane path / head / clean / deps
 node scripts/lane-pool.mjs provision --count=N   # create/refresh N lanes
 ```
+Lane deps prefer pnpm 12+ with matching lockfiles and a shared store at `~/.cache/we-pnpm-store` (override `WE_PNPM_STORE_DIR`); npm ci remains the per-lane fallback, and backend switches rebuild `node_modules`. Keep `package-lock.json` authoritative for npm and run `npm run check:lockfile-parity` after lockfile updates.
+
+With a `packageManager` pin, pnpm 12 writes a YAML stream containing an environment lockfile
+and a project lockfile. The parity reader and installer helper run before `node_modules`
+exists, so they must import only `node:` builtins. Keep a copied-script child-process
+regression with real YAML lockfiles and no dependency installation. Parity must read all
+documents and select the project importer;
+the environment's own `packages` map is not project dependency evidence. Run the
+`pnpm --version` probe from `os.tmpdir()`, since probing inside the repository can rewrite
+its lockfile. Regression coverage lives in `check-lockfile-parity.test.mjs` and
+`lane-deps-installer.test.mjs` under `scripts/__tests__/`.
+
 Use a `clean` lane. `git -C <lane> reset --hard <sha>` to check out any local commit (shared objects — no fetch needed, works for un-pushed HEADs).
 
 **2 — Boot the lane's OWN dev pair.** The `.env.local` port pair is **not auto-loaded** — export it first, or the servers fall back to the main band (`:3000`/`:8080`) and collide:
