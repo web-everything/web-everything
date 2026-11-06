@@ -175,7 +175,7 @@ describe('stale stageVerdict referral refusal', () => {
     // An unstamped PR body adds the `author-stamp-missing` reason token to the cached pending list (PR #6465).
     const unstamped = kind.startsWith('unstamped');
     const body = unstamped ? 'plain PR body, no author stamp' : '<!-- authored-by-actor: author -->';
-    const rec ={ ...recordFor(HEAD_1, raised), pr: 4361, runId: 'r-stale', reviewer: mandatoryReferralReviewer('r-stale'), authorBody: body };
+    const rec = { ...recordFor(HEAD_1, raised), pr: 4361, runId: 'r-stale', reviewer: mandatoryReferralReviewer('r-stale'), authorBody: body };
     rec.referrals[0].seat = 'judgeCorrectnessAdvisory';
     rec.referrals[0].key = referralFindingKey('judgeCorrectnessAdvisory', raised);
     const key = rec.referrals[0].key;
@@ -183,7 +183,16 @@ describe('stale stageVerdict referral refusal', () => {
       const original = { ...raised, summary: 'another unruled defect' };
       rec.referrals.push({ key: referralFindingKey('judge', original), seat: 'judge', original, finding: normalizeFinding(original) });
     }
-    let comments = [{ body: renderReferralRecord(rec), author: { login: 'web-everything' } }];
+    const record = { body: renderReferralRecord(rec), author: { login: 'web-everything' } };
+    const rulingBody = (ruledKey = key) => buildOperatorRulingComment({ version: 1, repo: 'o/n', pr: 4361,
+      head: kind === 'other-head' ? HEAD_2 : HEAD_1,
+      rulings: [{ runId: kind === 'other-run' ? 'other' : rec.runId, key: ruledKey, result: 'card', card: 'we:backlog/123-test.md' }],
+      actor: 'chalbert', channel: 'terminal', reason: 'track separately', at: '2026-11-06T13:25:00Z', clearerId: 'operator-session' });
+    // `malformed-fixed`: a malformed operator comment caches `malformed-operator-ruling` beside the key at refusal;
+    // the operator later edits it into a valid ruling (PR #6465 round 2 — every reason token, not only the stamp).
+    const malformedFixed = kind === 'malformed-fixed';
+    let comments = [record, ...(malformedFixed ? [{ body: rulingBody() + '\nforged extra text',
+      author: { login: 'chalbert' }, createdAt: '2026-11-06T13:20:00Z' }] : [])];
     const { declaration, registry } = setup(subject => {
       const raw = stubReader()(subject);
       return { ...raw, body, comments, detail: { ...raw.detail, labels: ['review:pending'], humanRequired: false, reviewClass: 'agent' } };
@@ -199,22 +208,18 @@ describe('stale stageVerdict referral refusal', () => {
     const refused = await runReviewLoopOnce({ ...common, argv: [`--resume=${rec.runId}`, '--answer=accept'] });
     expect(refused.stopped).toBe('step-refused');
     expect(refused.run.pending).toBeNull();
-    expect(refused.run.verdict.pendingReferrals).toEqual([...rec.referrals.map(f => f.key),
-      ...(unstamped ? ['author-stamp-missing'] : [])]);
+    expect(refused.run.verdict.pendingReferrals).toEqual([...(malformedFixed ? ['malformed-operator-ruling'] : []),
+      ...rec.referrals.map(f => f.key), ...(unstamped ? ['author-stamp-missing'] : [])]);
     if (kind !== 'missing' && kind !== 'unstamped-missing') {
-      const body = buildOperatorRulingComment({ version: 1, repo: 'o/n', pr: 4361,
-        head: kind === 'other-head' ? HEAD_2 : HEAD_1,
-        rulings: [{ runId: kind === 'other-run' ? 'other' : rec.runId,
-          key: kind === 'other-key' ? 'other' : key, result: 'card', card: 'we:backlog/123-test.md' }],
-        actor: 'chalbert', channel: 'terminal', reason: 'track separately', at: '2026-11-06T13:25:00Z', clearerId: 'operator-session' });
-      comments = [...comments, { body: kind === 'malformed' ? body + '\nforged extra text' : body,
+      const body = rulingBody(kind === 'other-key' ? 'other' : key);
+      comments = [...(malformedFixed ? [record] : comments), { body: kind === 'malformed' ? body + '\nforged extra text' : body,
         author: { login: 'chalbert' }, createdAt: '2026-11-06T13:25:00Z' }];
       if (kind === 'missing-record') comments.shift();
     }
     return { common, store, judge, refused, live, rec };
   }
 
-  it.each([[false, 'card'], [true, 'card'], [false, 'unstamped'], [true, 'unstamped']])('re-derives standing same-run/key/head card rulings and rewinds without new jurors (explicit resume: %s, %s body)', async (explicit, kind) => {
+  it.each([[false, 'card'], [true, 'card'], [false, 'unstamped'], [true, 'unstamped'], [false, 'malformed-fixed'], [true, 'malformed-fixed']])('re-derives standing same-run/key/head card rulings and rewinds without new jurors (explicit resume: %s, %s body)', async (explicit, kind) => {
     const { common, store, judge, refused, live, rec } = await fixture(kind);
     const count = judge.mock.calls.length;
     const p = { ...live(), number: 4361 };

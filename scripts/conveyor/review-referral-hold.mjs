@@ -27,13 +27,13 @@ import { reverifyStaleReferrals } from './referral-reverify.mjs';
 
 export const REFERRAL_HOLD_MARKER = 'review paused:';
 export const GH_LIST_COMMENT_CAP = 100;
-export const PENDING_REASON_TOKENS = Object.freeze(new Set(['author-stamp-missing']));
-/** Run-level reasons `mandatoryReferralState` derives afresh from the live thread and PR body. They name no finding, so a
- * refused run's cached list never matches them to a record key: the live re-read (empty `pending`) is what answers them.
- * `referral-persistence-failed` is deliberately absent: nothing live re-derives a lost persist, so it stays fail-closed. */
-export const LIVE_REASON_TOKENS = Object.freeze(new Set([...PENDING_REASON_TOKENS,
+/** The one set of run-level reasons `mandatoryReferralState` derives afresh from the live thread and PR body. They name
+ * no finding: `attempted`/`count` skip them, and a refused run's cached list never matches them to a record key — the
+ * live re-read (empty `pending`) is what answers them. `referral-persistence-failed` is deliberately absent: nothing live
+ * re-derives a lost persist, so it stays fail-closed (and has its own retry path). */
+export const PENDING_REASON_TOKENS = Object.freeze(new Set(['author-stamp-missing',
   'malformed-referral-record', 'malformed-operator-ruling', 'unavailable-reviewed-head', 'wrong-subject']));
-export const REFERRAL_RETRY_MS =[15, 30, 60].map(n => n * 60_000);
+export const REFERRAL_RETRY_MS = [15, 30, 60].map(n => n * 60_000);
 const sha = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
@@ -253,7 +253,7 @@ export function refusedReferralsAreRuled(pr, run, { repo,
     if (live.pending.length) return false;
     const keys = new Set(live.records.filter(r => r.repo === repo && r.pr === run.pr
       && r.head === run.head && r.runId === run.id).flatMap(r => activeReferrals(r).map(f => f.key)));
-    const findingKeys = run.pending.filter(key => !LIVE_REASON_TOKENS.has(key));
+    const findingKeys = run.pending.filter(key => !PENDING_REASON_TOKENS.has(key));
     return findingKeys.length > 0 && findingKeys.every(key => keys.has(key));
   } catch { return false; }
 }
