@@ -459,6 +459,9 @@ describe('R593 merge-resolution blobs are scanned whatever the user diff config 
     'combined (::, two old modes)': `::100644 100644 100644 ${sha('a')} ${sha('b')} ${sha('c')} MM`,
     'six fields without ::': `:100644 100644 ${sha('a')} ${sha('b')} M extra`,
     'non-octal new mode': `:100644 10x644 ${sha('a')} ${sha('b')} M`,
+    'non-header token (would be silently skipped)': 'unexpected-token',
+    'non-hex new sha': `:100644 100644 ${sha('a')} ${'z'.repeat(40)} M`,
+    'unknown status letter': `:100644 100644 ${sha('a')} ${sha('b')} X`,
   };
   for (const [name, header] of Object.entries(rawHeaders)) {
     it(`refuses (does not parse) a raw header: ${name}`, async () => {

@@ -190,11 +190,13 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
   let pathCount = 0;
   for (let i = 0; i < tokens.length; i++) {
     const meta = tokens[i].toString('latin1');
-    if (!meta.startsWith(':')) continue;
+    if (!meta) continue; // only a bare separator between commits may be skipped; any other token must be a header or its path
     // Fail closed: --diff-merges=separate emits exactly ":old new oldsha newsha status". A combined header ("::", several old
     // modes/hashes) means the config-independent invocation was not honoured; never parse it as an ordinary diff.
+    // A token that is not a header (and was not consumed as a path below) is unknown output: refuse, never skip.
     const fields = meta.split(' ');
-    if (meta.startsWith('::') || fields.length !== 5 || !/^[0-7]{6}$/.test(fields[0].slice(1)) || !/^[0-7]{6}$/.test(fields[1])) throw bundleError('bundle-credential-scan-failed');
+    if (!meta.startsWith(':') || meta.startsWith('::') || fields.length !== 5 || !/^[0-7]{6}$/.test(fields[0].slice(1)) || !/^[0-7]{6}$/.test(fields[1])
+      || !/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(fields[3]) || !/^[ADMT]$/.test(fields[4])) throw bundleError('bundle-credential-scan-failed');
     const [, newMode, , newSha] = fields;
     const path = tokens[++i];
     if (!path) throw bundleError('bundle-credential-scan-failed');
