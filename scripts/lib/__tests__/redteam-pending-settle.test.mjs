@@ -514,6 +514,44 @@ describe('settlement requires a proven accepting comment', () => {
 
 });
 
+describe('prep-advisory PR with no full review settles stale pending (R639, #6418)', () => {
+  const prepNote = (sha = head, extra = '') => trusted(`<!-- prep-review: head=${sha} round=1${extra} -->\n🔎 review — prep advisory (single reviewer)`);
+  const prepFixture = (over = {}) => {
+    const f = fixture({ readEvidence: () => evidence({ loopPayload: undefined }), ...over });
+    f.rawPrs[0].labels = ['review:prep', 'ready-to-merge', 'red-team:pending'];
+    f.rawPrs[0].comments = [prepNote()];
+    return f;
+  };
+  it('plans a not-owed settlement instead of escalating, and removes only pending', () => {
+    const o = runFixture(prepFixture());
+    const row = mod.runRedTeamOnSkip(o).rows[0];
+    expect(row).toMatchObject({ action: 'skip', settle: 'not-owed' });
+    expect(row).not.toHaveProperty('escalate');
+    expect(o.escalate).not.toHaveBeenCalled();
+    expect(o.settlePending).toHaveBeenCalledOnce();
+    expect(o.settlePending.mock.calls[0][0]).toMatchObject({ repo, pr, head, remove: ['red-team:pending'] });
+  });
+  it.each([
+    ['no review:prep label', f => { f.rawPrs[0].labels = ['red-team:pending']; }],
+    ['prep note for another head', f => { f.rawPrs[0].comments = [prepNote(old)]; }],
+    ['prep note blocked', f => { f.rawPrs[0].comments = [prepNote(head, ' blocked=1')]; }],
+    ['prep note from untrusted author', f => { f.rawPrs[0].comments = [{ ...prepNote(), author: { login: 'rando' } }]; }],
+    ['later human hold', f => { f.rawPrs[0].comments = [prepNote(), { body: 'do not merge', createdAt: iso(acceptedAt + 1), author: { login: 'human-reviewer' } }]; }],
+    ['review hold label', f => { f.rawPrs[0].labels.push('review:changes'); }],
+    ['red team blocked', f => { f.rawPrs[0].labels.push('red-team:blocked'); }],
+    ['a stored review exists that owes a red team', f => { f.readEvidence = () => evidence({ loopPayload: payload('accept') }); }],
+    ['a red-team run is recorded', f => { f.readEvidence = () => evidence({ loopPayload: undefined, recorded: true }); }],
+    ['a red-team pass is in flight', f => { f.readEvidence = () => evidence({ loopPayload: undefined, inFlight: true }); }],
+  ])('%s keeps pending and never settles', (_name, mutate) => {
+    const f = prepFixture(); mutate(f);
+    const o = runFixture(f);
+    const row = mod.runRedTeamOnSkip(o).rows[0];
+    expect(row).not.toHaveProperty('settle');
+    expect(o.settlePending).not.toHaveBeenCalled(); expect(o.settle).not.toHaveBeenCalled();
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+});
+
 describe('pending soak always replays recovery availability', () => {
   it.each(['missing module', 'missing exports'])('%s fails the replay instead of becoming expected-failure', async kind => {
     const sourceRoot = mkdtempSync(join(tmpdir(), 'pending-soak-missing-'));
