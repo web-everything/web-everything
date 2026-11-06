@@ -427,6 +427,8 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
 const testFailure = () => new Error('selected tests did not pass or execute; operator review required');
 const remoteUnconfirmed = result => result?.status === 124 && typeof result.stderr === 'string'
   && result.stderr.includes('remote termination unconfirmed; refusing local rerun (exit 124).');
+// Vitest's "Unhandled Errors" section header and its "Errors  N error(s)" summary row.
+const UNHANDLED_ERRORS = /^\s*(?:⎯+\s*)?Unhandled (?:Errors?|Rejections?)\b|^\s*Errors\s+\d+ errors?\s*$/i;
 function failedTestReport(stdout, options) {
   if (typeof stdout !== 'string' || Buffer.byteLength(stdout) > 8 * 1024 * 1024) throw testFailure();
   const failed = new Map(), titles = [];
@@ -448,6 +450,9 @@ function failedTestReport(stdout, options) {
       if (line === `${diagnostic}...`) diagnostic = undefined;
       return [];
     }
+    // Fail closed: an unhandled error is a red run the failed leaves do not explain, so it must
+    // never be rerun away. Checked outside YAML diagnostics; a TAP result line never matches these.
+    if (UNHANDLED_ERRORS.test(plain)) throw testFailure();
     const yaml = inTap && /^( +)---$/.exec(line);
     if (yaml) { diagnostic = yaml[1]; return []; }
     const task = inTap && /^( *)(not )?ok \d+ - (.*?)(?: # (SKIP|TODO|time=\d+(?:\.\d+)?ms))?( \{)?$/s.exec(line);
@@ -565,13 +570,18 @@ function rerunCoversFailures(previous, rerun, files) {
     if (!before || !after || after.total < before.total) return false;
     if (before.failedIds.some(id => id === null)) return false;
     if (after.passedIds.some(id => id === null)) continue;
-    const available = new Map();
-    for (const id of after.passedIds) available.set(id, (available.get(id) ?? 0) + 1);
-    for (const id of before.failedIds) {
-      const left = available.get(id) ?? 0;
-      if (left < 1) return false;
-      available.set(id, left - 1);
-    }
+    if (!coveredWithMultiplicity(before.failedIds, after.passedIds)) return false;
+  }
+  return true;
+}
+// Every needed identity must be matched by its own supplied occurrence: duplicates consume one each.
+function coveredWithMultiplicity(needed, supplied) {
+  const available = new Map();
+  for (const id of supplied) available.set(id, (available.get(id) ?? 0) + 1);
+  for (const id of needed) {
+    const left = available.get(id) ?? 0;
+    if (left < 1) return false;
+    available.set(id, left - 1);
   }
   return true;
 }
@@ -727,11 +737,13 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
         io.appendFileSync(join(mainScratch, '.git', 'info', 'exclude'), '\n/node_modules\n');
         io.symlinkSync(join(root, 'node_modules'), join(mainScratch, 'node_modules'), 'dir');
         const comparison = await check(remaining, 'main', mainScratch, deps.mainTestRunner ?? null);
-        const mainFailures = new Set(comparison.failedAssertions);
+        // The remote process may still be running: do not classify, publish or fail on this evidence.
+        if (comparison.remoteUnconfirmed) return await skip('remote-termination-unconfirmed');
+        // Counted, so two same-titled overlay failures need two main failures (one cannot cover both).
         mainRed = evidence.complete && evidence.failedAssertions.length > 0
           && evidence.failedAssertions.every(identity => identity !== null)
           && comparison.complete && comparison.failedAssertions.every(identity => identity !== null)
-          && evidence.failedAssertions.every(identity => mainFailures.has(identity));
+          && coveredWithMultiplicity(evidence.failedAssertions, comparison.failedAssertions);
       } catch { /* Unknown main evidence must retain the ordinary operator-review failure. */ }
       setStep('tests');
       if (mainRed) {

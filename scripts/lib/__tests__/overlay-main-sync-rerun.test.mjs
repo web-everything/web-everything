@@ -146,7 +146,7 @@ const sameMergedTree = trees => {
 };
 
 // Real Vitest reporters and the production runner; only process execution is injected.
-function tapRunners(f, { flaky = false, mainTitle = 'worker behaves', mainSuite = 'worker', corrupt, hooksFile, hooksNested = false } = {}) {
+function tapRunners(f, { flaky = false, mainTitle = 'worker behaves', mainSuite = 'worker', corrupt, hooksFile, hooksNested = false, dupSiblings = false } = {}) {
   const calls = [];
   const runner = vi.fn(async options => runHeavyTests(options, { exec: async () => {
     const main = ok(options.root, ['rev-parse', 'HEAD']) === f.mainSha;
@@ -159,6 +159,15 @@ function tapRunners(f, { flaky = false, mainTitle = 'worker behaves', mainSuite 
       if (hooksFile && name === hooksFile) {
         // An afterAll/beforeAll hook failure: every leaf passes but the suite itself is red.
         const leaf = { type: 'test', name: 'hooked behaves', mode: 'run', result: state(false) };
+        // Two sibling suites with the SAME name: the first has a failed leaf, the second is red only
+        // because of a hook. The first sibling's failed leaf must not mask the second's hook failure.
+        if (dupSiblings) {
+          return { type: 'suite', name, mode: 'run', result: state(true), tasks: [
+            { type: 'suite', name: 'twin', mode: 'run', result: state(true), tasks: [
+              { type: 'test', name: 'twin fails', mode: 'run', result: state(true) }] },
+            { type: 'suite', name: 'twin', mode: 'run', result: state(true), tasks: [leaf] },
+          ] };
+        }
         return { type: 'suite', name, mode: 'run', result: state(!hooksNested), tasks: [
           hooksNested
             ? { type: 'suite', name: 'hooked', mode: 'run', result: state(true), tasks: [leaf] }
@@ -202,6 +211,33 @@ describe('production heavy runner failing TAP evidence', () => {
     // is red because a hook failed. The rerun must not erase the hook failure and publish.
     const f = fixture(), calls = tapRunners(f, { flaky: true, hooksFile: 'worker1.test.mjs', hooksNested });
     // No trustworthy inventory is written, so the command failure (not the selected-tests message) surfaces.
+    await expect(job(f)).rejects.toThrow(/operator review required/);
+    expect(calls).toHaveLength(1);
+    expect(kinds(f)).not.toContain('overlay-main-flaky-retried');
+    expect(kinds(f)).not.toContain('overlay-main-red');
+    expect(f.outcomes.map(event => event.kind)).toContain('overlay-main-sync-failed');
+    noPublication(f);
+  });
+
+  it('duplicate sibling suite names cannot mask a hook-only failure', async () => {
+    // worker1: suite "twin" has a failed leaf; a second sibling "twin" is red with only passing leaves.
+    const f = fixture(), calls = tapRunners(f, { flaky: true, hooksFile: 'worker1.test.mjs', dupSiblings: true });
+    await expect(job(f)).rejects.toThrow(/operator review required/);
+    expect(calls).toHaveLength(1);
+    expect(kinds(f)).not.toContain('overlay-main-flaky-retried');
+    expect(kinds(f)).not.toContain('overlay-main-red');
+    expect(f.outcomes.map(event => event.kind)).toContain('overlay-main-sync-failed');
+    noPublication(f);
+  });
+
+  it.each([
+    ['summary row', '\n     Errors  1 error\n'],
+    ['section header', '\n⎯⎯⎯⎯⎯⎯ Unhandled Errors ⎯⎯⎯⎯⎯⎯\n'],
+    ['colored summary row', '\n\u001b[31m     Errors  2 errors\u001b[39m\n'],
+  ])('an unhandled error (%s) beside a flaky failed leaf is not rerun away', async (_, extra) => {
+    // worker0 has one failed leaf that passes on rerun; the same run also reports a Vitest unhandled
+    // error that no failed leaf explains. Rerunning only worker0 would erase it and publish.
+    const f = fixture(), calls = tapRunners(f, { flaky: true, corrupt: stdout => stdout + extra });
     await expect(job(f)).rejects.toThrow(/operator review required/);
     expect(calls).toHaveLength(1);
     expect(kinds(f)).not.toContain('overlay-main-flaky-retried');
@@ -355,6 +391,49 @@ describe('overlay main sync failed-file reruns', () => {
     noPublication(f);
   });
 
+  const unconfirmed = { status: 124, stdout: '', error: undefined,
+    stderr: 'remote termination unconfirmed; refusing local rerun (exit 124).' };
+  const expectUnconfirmedSkip = async f => {
+    expect(await job(f)).toMatchObject({ skipped: true, reason: 'remote-termination-unconfirmed' });
+    expect(f.outcomes).toContainEqual({ kind: 'overlay-main-sync-skipped',
+      detail: { ref, reason: 'remote-termination-unconfirmed' } });
+    expect(f.outcomes.some(event => /failed|needs-you/.test(event.kind))).toBe(false);
+    expect(kinds(f)).not.toContain('overlay-main-flaky-retried');
+    expect(kinds(f)).not.toContain('overlay-main-red');
+    noPublication(f);
+  };
+
+  it('an unconfirmed remote termination on the first rerun skips: no failure, rerun chain or push', async () => {
+    const f = fixture(), runner = (runners(f, ['failed']), f.deps.testRunner);
+    f.deps.testRunner = vi.fn(async options => (f.deps.testRunner.mock.calls.length > 1 ? unconfirmed : runner(options)));
+    await expectUnconfirmedSkip(f);
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    expect(f.deps.mainTestRunner).not.toHaveBeenCalled();
+  });
+
+  it('an unconfirmed remote termination on a later rerun skips instead of comparing main', async () => {
+    const f = fixture({ reruns: 2 }), runner = (runners(f, ['failed', 'failed']), f.deps.testRunner);
+    f.deps.testRunner = vi.fn(async options => (f.deps.testRunner.mock.calls.length > 2 ? unconfirmed : runner(options)));
+    await expectUnconfirmedSkip(f);
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(3);
+    expect(f.deps.mainTestRunner).not.toHaveBeenCalled();
+  });
+
+  it('an unconfirmed remote termination on the plain-main comparison skips instead of main-red or failure', async () => {
+    const f = fixture(); runners(f, ['failed', 'failed'], 'failed');
+    f.deps.mainTestRunner = vi.fn(async () => unconfirmed);
+    await expectUnconfirmedSkip(f);
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    expect(f.deps.mainTestRunner).toHaveBeenCalledOnce();
+  });
+
+  it('an unconfirmed remote termination on the initial run skips', async () => {
+    const f = fixture(); runners(f, []);
+    f.deps.testRunner = vi.fn(async () => unconfirmed);
+    await expectUnconfirmedSkip(f);
+    expect(f.deps.testRunner).toHaveBeenCalledOnce();
+  });
+
   it('flakeReruns=0 disables reruns and main comparison and fails as today', async () => {
     const f = fixture({ reruns: 0 }); runners(f, ['failed', 'passed']);
     await expect(job(f)).rejects.toThrow(failure);
@@ -410,6 +489,24 @@ describe('main-red assertion identity and bookkeeping', () => {
     await expect(job(f)).rejects.toThrow(failure);
     expect(kinds(f)).not.toContain('overlay-main-red');
     expect(f.outcomes.some(e => e.kind === 'overlay-main-sync-failed')).toBe(true);
+    noPublication(f);
+  });
+
+  it('duplicate overlay failures are not covered by a single main failure of the same identity', async () => {
+    const f = fixture(); runners(f, ['failed', 'failed'], 'failed');
+    f.deps.testRunner = assertionRunner(f.deps.testRunner, [failedAssertion('same'), failedAssertion('same')]);
+    f.deps.mainTestRunner = assertionRunner(f.deps.mainTestRunner, [failedAssertion('same')]);
+    await expect(job(f)).rejects.toThrow(failure);
+    expect(kinds(f)).not.toContain('overlay-main-red');
+    expect(f.outcomes.some(e => e.kind === 'overlay-main-sync-failed')).toBe(true);
+    noPublication(f);
+  });
+
+  it('duplicate overlay failures matched by as many main failures are main-red', async () => {
+    const f = fixture(); runners(f, ['failed', 'failed'], 'failed');
+    f.deps.testRunner = assertionRunner(f.deps.testRunner, [failedAssertion('same'), failedAssertion('same')]);
+    f.deps.mainTestRunner = assertionRunner(f.deps.mainTestRunner, [failedAssertion('same'), failedAssertion('same')]);
+    expect(await job(f)).toMatchObject({ skipped: true, reason: 'main-red' });
     noPublication(f);
   });
 
