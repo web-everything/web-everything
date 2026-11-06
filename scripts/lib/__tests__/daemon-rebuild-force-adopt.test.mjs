@@ -430,15 +430,12 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
   const alertsOf = (cloneDir, env) => readFileSync(alertsFilePath(cloneDir, env), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
   const watchFileOf = (cloneDir, env) => join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(cloneDir)}.force-watch.json`);
 
-  it.each([
-    ['missing', (cloneDir, env) => rmSync(watchFileOf(cloneDir, env), { force: true })],
-    ['unreadable', (cloneDir, env) => writeFileSync(watchFileOf(cloneDir, env), '{corrupt')],
-  ])('a forced ready candidate whose rollback watch is %s is never adopted (fail closed), and is dropped', async (kind, damage) => {
+  it('a forced ready candidate whose rollback watch is missing is never adopted (fail closed), and is dropped', async () => {
     const { cloneDir, env, lastGood, target, arm } = setup();
     arm();
     await tick(cloneDir, env, { runSmoke: failing(), readyOnly: true });
     expect(readReadyCandidate(cloneDir, env)).toMatchObject({ forced: true });
-    damage(cloneDir, env);
+    rmSync(watchFileOf(cloneDir, env), { force: true });
     // The ordinary ladder runs after the drop and its smoke fails too, so the only way the head could move is the forced record.
     const r = await tick(cloneDir, env, { runSmoke: failing(), forceWatchProbe: healthy });
     expect(r.reason).not.toBe('ready-adopted');
@@ -446,7 +443,26 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     expect(headOf(cloneDir)).not.toBe(target);
     expect(readReadyCandidate(cloneDir, env)).toBeNull();
     const discarded = alertsOf(cloneDir, env).find((a) => a.kind === 'ready-candidate-discarded');
-    expect(discarded?.detail).toMatchObject({ target, reason: `forced-watch-${kind}` });
+    expect(discarded?.detail).toMatchObject({ target, reason: 'forced-watch-missing' });
+  });
+
+  it('a forced ready candidate whose rollback watch is UNREADABLE is not adopted, but is KEPT: a transient read failure must not throw the build away', async () => {
+    const { cloneDir, env, lastGood, target, arm } = setup();
+    arm();
+    await tick(cloneDir, env, { runSmoke: failing(), readyOnly: true });
+    expect(readReadyCandidate(cloneDir, env)).toMatchObject({ forced: true });
+    const intact = readFileSync(watchFileOf(cloneDir, env), 'utf8');
+    writeFileSync(watchFileOf(cloneDir, env), '{corrupt');
+    const r = await tick(cloneDir, env, { runSmoke: failing(), forceWatchProbe: healthy });
+    expect(r.reason).toBe('forced-watch-unreadable');
+    expect(headOf(cloneDir)).toBe(lastGood); // fail closed: never adopted while its watch cannot be read
+    expect(readReadyCandidate(cloneDir, env)).toMatchObject({ forced: true }); // kept, not dropped
+    expect(alertsOf(cloneDir, env).some((a) => a.kind === 'forced-watch-unreadable')).toBe(true);
+    expect(alertsOf(cloneDir, env).some((a) => a.kind === 'ready-candidate-discarded')).toBe(false);
+    writeFileSync(watchFileOf(cloneDir, env), intact); // the read recovers
+    const again = await tick(cloneDir, env, { runSmoke: failing(), forceWatchProbe: healthy });
+    expect(again.reason).toBe('ready-adopted');
+    expect(headOf(cloneDir)).toBe(target);
   });
 
   describe('a refused force-adopt (a watch is open / unreadable, or a rollback is owed) is a sticky rejection that consumes the request', () => {

@@ -549,6 +549,13 @@ export async function prepareRebuild({
         // A discarded forced build can no longer be adopted, so its rollback watch (it would only wait out the TTL and
         // block the next force) is closed and the audit log says the build was NOT adopted. A build already running
         // as head keeps its watch.
+        // …except an UNREADABLE watch: that may be a transient read failure, and dropping would throw the operator's build away while
+        // the abort (which cannot read the file either) leaves the watch behind. Not adopting is already the fail-closed part, so the
+        // record is kept and retried every tick; it is bounded by the ready record's own max age, which drops it as 'expired'.
+        if (m.reason === 'forced-watch-unreadable') {
+          alert('forced-watch-unreadable', { target: ready.adopt.finalSha, message: 'the forced build is NOT adopted while its rollback watch cannot be read; its ready record is kept and retried' });
+          return terminal({ moved: false, reason: 'forced-watch-unreadable', plan });
+        }
         await dropReady(m.reason, prevHead);
         reportDiscardedCandidate({
           ready, match: m, alert,
