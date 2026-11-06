@@ -14,8 +14,11 @@ import { touchFreeLaneList, readFreeLaneList, isFreeLaneListFresh } from '../lib
 
 const SCRIPT = resolve(process.cwd(), 'scripts/lane-pool.mjs');
 
+// The test's own git calls are synchronous (they block the worker), so each is bounded too: a hung one throws and
+// fails the test that made it instead of stalling the worker past every vitest timeout. All are local-only.
+const GIT_BOUND_MS = 30_000;
 function git(args, cwd) {
-  return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+  return execFileSync('git', args, { cwd, encoding: 'utf8', timeout: GIT_BOUND_MS, killSignal: 'SIGKILL' }).trim();
 }
 
 let base, originDir, referenceDir, poolRoot;
@@ -25,11 +28,16 @@ let base, originDir, referenceDir, poolRoot;
 // could run for 30 x 180s, outlast the 20-min job cap, and fail no named test. Now each child is bounded at 60s
 // (local runs take 1-8s). The FIRST overrun throws with the child's process tree and stderr, and every later child in
 // this file is refused at once, so a stall costs this file about one bound in total and names the test that hit it.
+// Many slow children that each stay under 60s are caught too: the whole file has a budget (local runs take 30-60s),
+// every child's bound is cut to what is left of it, and running out latches the same fail-fast.
 const CHILD_BOUND_MS = 60_000;
 const PROVISION_BOUND_MS = 120_000; // the template provision clones a lane per count
+// All lane-pool children of this file together. Idle host: ~25s; a host at load ~50 (12 cores): ~200s.
+const FILE_BUDGET_MS = 8 * 60_000;
 const OUTPUT_CAP = 1 << 20; // bytes kept per stream; a runaway child cannot grow the worker's heap
 const SETTLE_AFTER_EXIT_MS = 2_000; // a descendant still holding the pipes must not keep a finished child "running"
-vi.setConfig({ testTimeout: 3 * CHILD_BOUND_MS, hookTimeout: 3 * PROVISION_BOUND_MS });
+// Slack over the children's bounds for the sync git calls (each bounded at GIT_BOUND_MS) and `ps` in a test.
+vi.setConfig({ testTimeout: 3 * CHILD_BOUND_MS + 60_000, hookTimeout: 2 * PROVISION_BOUND_MS + 120_000 });
 
 /** pid, parent pid, elapsed time and args of `rootPid` and every process below it (best-effort; never throws). */
 function processTree(rootPid) {
@@ -43,49 +51,76 @@ function processTree(rootPid) {
   return { pids, text: text || '(no process left)' };
 }
 
+/** SIGKILL the child's whole process group (it is spawned as a group leader), so descendants that outlive it die too. */
+function killGroup(pid) {
+  try { process.kill(-pid, 'SIGKILL'); } catch { /* group already gone */ }
+}
+
 /**
- * Run `node <argv>` without blocking the worker. Resolves `{ code, out, err }` on exit; REJECTS once `boundMs`
- * passes, after killing the child and everything below it, with the tree and stderr in the message.
+ * Run `node <argv>` without blocking the worker, as its own process group. Resolves `{ code, signal, out, err }` on
+ * exit (then kills any descendant still in the group); REJECTS once `boundMs` passes, after killing the group and
+ * every process below the child, with the tree and stderr in the message.
  */
 function spawnBounded(argv, { env = process.env, boundMs = CHILD_BOUND_MS, label = argv.join(' ') } = {}) {
   return new Promise((resolveRun, rejectRun) => {
-    const child = spawn('node', argv, { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn('node', argv, { env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
     let out = '';
     let err = '';
     let settled = false;
-    let exitCode = null;
+    let exited = null; // { code, signal } once the child itself has exited
     let settleTimer = null;
     const keep = (s, d) => (s.length < OUTPUT_CAP ? s + String(d).slice(0, OUTPUT_CAP - s.length) : s);
     const settle = (fn, value) => { if (settled) return; settled = true; clearTimeout(boundTimer); clearTimeout(settleTimer); fn(value); };
+    const resolveExited = (note = '') => { killGroup(child.pid); settle(resolveRun, { code: exited.code ?? 1, signal: exited.signal ?? null, out, err: err + note }); };
     child.stdout.on('data', (d) => { out = keep(out, d); });
     child.stderr.on('data', (d) => { err = keep(err, d); });
     child.on('error', (e) => settle(rejectRun, new Error(`${label}: spawn failed: ${e.message}`)));
-    child.on('exit', (code) => {
-      exitCode = code ?? 1;
-      settleTimer = setTimeout(() => settle(resolveRun, { code: exitCode, out, err: `${err}\n(stdout/stderr still held open by a descendant ${SETTLE_AFTER_EXIT_MS}ms after exit)` }), SETTLE_AFTER_EXIT_MS);
+    child.on('exit', (code, signal) => {
+      exited = { code, signal };
+      settleTimer = setTimeout(() => resolveExited(`\n(stdout/stderr still held open by a descendant ${SETTLE_AFTER_EXIT_MS}ms after exit)`), SETTLE_AFTER_EXIT_MS);
     });
-    child.on('close', () => { if (exitCode !== null) settle(resolveRun, { code: exitCode, out, err }); });
+    child.on('close', () => { if (exited) resolveExited(); });
     const boundTimer = setTimeout(() => {
+      if (exited) return resolveExited(`\n(stdout/stderr still held open by a descendant at the ${boundMs}ms bound)`);
       const tree = processTree(child.pid);
+      killGroup(child.pid);
       for (const pid of [...tree.pids].reverse()) { try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ } }
       settle(rejectRun, new Error(`${label} still running after ${boundMs}ms — killed.\nprocess tree at the bound (pid ppid elapsed args):\n${tree.text}\nstderr so far:\n${err.slice(-4000)}`));
     }, boundMs);
   });
 }
 
-let firstOverrun = null; // once one child overran, the rest of this file fails fast instead of each waiting out a bound
+/** A child's bound under the file budget: its own bound, cut to what is left of the budget; `null` once none is left. */
+function budgetedBound({ boundMs, startedAt, now, budgetMs = FILE_BUDGET_MS }) {
+  const left = budgetMs - (now - startedAt);
+  return left <= 0 ? null : Math.min(boundMs, left);
+}
+
+let fileStartedAt = null; // set by the first lane-pool child of this file
+let firstOverrun = null; // once one child overran (or the file budget ran out), the rest of the file fails fast
 
 async function runPool(args, { boundMs = CHILD_BOUND_MS } = {}) {
   if (firstOverrun) throw new Error(`lane-pool ${args[0]} not run: an earlier lane-pool child in this file overran its bound — ${firstOverrun}`);
+  fileStartedAt ??= Date.now();
+  const bound = budgetedBound({ boundMs, startedAt: fileStartedAt, now: Date.now() });
+  if (bound === null) {
+    firstOverrun = `this file's lane-pool children used up its ${FILE_BUDGET_MS}ms budget`;
+    throw new Error(`lane-pool ${args[0]} not run: ${firstOverrun}`);
+  }
   const env = { ...process.env, LANE_POOL_ROOT: poolRoot, WE_LANE_SALVAGE_DIR: join(base, 'salvage') };
   delete env.LANE_SESSION;
   delete env.CLAUDE_CODE_SESSION_ID;
+  const label = `lane-pool ${args[0]}${bound < boundMs ? ` (bound cut to the ${bound}ms left of this file's ${FILE_BUDGET_MS}ms budget)` : ''}`;
+  let r;
   try {
-    return await spawnBounded([SCRIPT, ...args], { env, boundMs, label: `lane-pool ${args[0]}` });
+    r = await spawnBounded([SCRIPT, ...args], { env, boundMs: bound, label });
   } catch (e) {
     firstOverrun = String(e.message).split('\n')[0];
     throw e;
   }
+  // A child killed by a signal (e.g. out of memory) is not a refusal: never let it pass an `expect(code).not.toBe(0)`.
+  if (r.signal) throw new Error(`lane-pool ${args[0]} was killed by ${r.signal}\n${r.err.slice(-4000)}`);
+  return r;
 }
 
 // One origin + reference per FILE (built once, restored after every test) instead of one per test — see
@@ -356,34 +391,59 @@ describe('touchFreeLaneList', () => {
 // never a worker blocked until the CI job cap.
 describe('spawnBounded — a stalled child fails within its bound', () => {
   const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const ps = (pid) => { try { return execFileSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8', timeout: 10_000 }).trim(); } catch { return ''; } };
+  // Gone, or a zombie waiting to be reaped (`kill(pid, 0)` still succeeds on a zombie). Polled: the reaper may lag.
+  const waitGone = async (pid, deadlineMs = 10_000) => {
+    const until = Date.now() + deadlineMs;
+    while (Date.now() < until) { if (!alive(pid) || ps(pid).startsWith('Z')) return true; await new Promise((r) => setTimeout(r, 100)); }
+    return false;
+  };
+  const pidFromTree = (message, args) => Number((message.match(new RegExp(`^(\\d+) \\d+ \\S+ ${args}`, 'm')) || [])[1]);
 
   it('rejects at the bound with the process tree, and kills the child and its descendants', async () => {
-    // The child starts an idle grandchild (the CI stall shape: waiting, not burning CPU), reports its pid, then idles.
-    const src = "const c = require('child_process').spawn('sleep', ['300'], { stdio: 'ignore' }); console.log(c.pid); setInterval(() => {}, 1000);";
+    // The child starts an idle grandchild (the CI stall shape: waiting, not burning CPU), then idles. The bound leaves
+    // a loaded host seconds to start node and the grandchild before it fires.
+    const src = "require('child_process').spawn('sleep', ['300'], { stdio: 'ignore' }); setInterval(() => {}, 1000);";
     const started = Date.now();
-    const err = await spawnBounded(['-e', src], { boundMs: 1_500, label: 'stall-probe' }).then(() => null, (e) => e);
+    const err = await spawnBounded(['-e', src], { boundMs: 6_000, label: 'stall-probe' }).then(() => null, (e) => e);
     expect(err).toBeInstanceOf(Error);
-    expect(Date.now() - started).toBeLessThan(15_000);
-    expect(err.message).toMatch(/^stall-probe still running after 1500ms — killed\./);
-    expect(err.message).toMatch(/sleep 300/); // the tree names the stalled grandchild
-    const grandchild = Number((err.message.match(/^(\d+) \d+ \S+ sleep 300/m) || [])[1]);
-    expect(Number.isInteger(grandchild) && grandchild > 0).toBe(true);
-    await new Promise((r) => setTimeout(r, 300));
-    expect(alive(grandchild)).toBe(false);
+    expect(Date.now() - started).toBeLessThan(30_000);
+    expect(err.message).toMatch(/^stall-probe still running after 6000ms — killed\./);
+    const grandchild = pidFromTree(err.message, 'sleep 300'); // the tree names the stalled grandchild
+    expect(grandchild, err.message).toBeGreaterThan(0);
+    expect(await waitGone(grandchild)).toBe(true);
   });
 
-  it('a child that exits while a descendant still holds its pipes settles shortly after exit, with its output', async () => {
-    const src = "require('child_process').spawn('sleep', ['30'], { stdio: 'inherit' }).unref(); console.log('done');";
+  it('a child that exits while a descendant still holds its pipes settles shortly after exit, and the descendant is killed', async () => {
+    const src = "const c = require('child_process').spawn('sleep', ['31'], { stdio: 'inherit' }); c.unref(); console.log('grandchild=' + c.pid);";
     const started = Date.now();
-    const r = await spawnBounded(['-e', src], { boundMs: 20_000 });
-    expect(Date.now() - started).toBeLessThan(10_000);
+    const r = await spawnBounded(['-e', src], { boundMs: 25_000 });
+    expect(Date.now() - started).toBeLessThan(20_000);
     expect(r.code).toBe(0);
-    expect(r.out).toContain('done');
     expect(r.err).toMatch(/still held open by a descendant/);
+    const grandchild = Number((r.out.match(/grandchild=(\d+)/) || [])[1]);
+    expect(grandchild, r.out).toBeGreaterThan(0);
+    expect(await waitGone(grandchild)).toBe(true); // the process-group kill reached it after the child had exited
   });
 
   it('a normal child resolves with its exit code and output', async () => {
-    const r = await spawnBounded(['-e', "process.stdout.write('ok'); process.stderr.write('e'); process.exit(3)"], { boundMs: 20_000 });
-    expect(r).toEqual({ code: 3, out: 'ok', err: 'e' });
+    const r = await spawnBounded(['-e', "process.stdout.write('ok'); process.stderr.write('E-MARK'); process.exit(3)"], { boundMs: 25_000 });
+    expect(r.code).toBe(3);
+    expect(r.signal).toBeNull();
+    expect(r.out).toBe('ok');
+    expect(r.err).toContain('E-MARK');
+  });
+
+  it('a child killed by a signal reports the signal, so runPool can refuse to treat it as a refusal', async () => {
+    const r = await spawnBounded(['-e', "process.kill(process.pid, 'SIGKILL')"], { boundMs: 25_000 });
+    expect(r.signal).toBe('SIGKILL');
+  });
+
+  it('the file budget cuts a child\'s bound to what is left, and leaves none once it is spent', () => {
+    expect(budgetedBound({ boundMs: 60_000, startedAt: 0, now: 10_000, budgetMs: 360_000 })).toBe(60_000);
+    expect(budgetedBound({ boundMs: 60_000, startedAt: 0, now: 330_000, budgetMs: 360_000 })).toBe(30_000);
+    expect(budgetedBound({ boundMs: 60_000, startedAt: 0, now: 360_000, budgetMs: 360_000 })).toBeNull();
+    expect(budgetedBound({ boundMs: 60_000, startedAt: 0, now: 400_000, budgetMs: 360_000 })).toBeNull();
+    expect(FILE_BUDGET_MS).toBeLessThan(20 * 60_000 / 2); // well under the integration job's 20-min cap
   });
 });
