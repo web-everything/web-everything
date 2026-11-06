@@ -270,7 +270,8 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     const fromMap = readHeadIndex({ dir });
     const lines = readFileSync(headIndexPaths(dir).log, 'utf8').trim().split('\n');
     expect(lines).toHaveLength(24);
-    expect(Object.keys(fromMap.map['o/r#7'].history)).toHaveLength(24);
+    // no write lost (24 log rows); history keeps ONE entry per head, the latest (each writer's n=5 record), since a head's latest verdict supersedes its earlier ones
+    expect(Object.keys(fromMap.map['o/r#7'].history).sort()).toEqual(['p0-5', 'p1-5', 'p2-5', 'p3-5']);
     writeFileSync(headIndexPaths(dir).map, '{{');
     expect(readHeadIndex({ dir, keepPerPr: 100 }).map).toEqual(fromMap.map); // the writers' keepPerPr: replay applies the same bound
   }, 60000);
