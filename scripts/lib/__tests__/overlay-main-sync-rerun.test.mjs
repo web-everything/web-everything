@@ -295,6 +295,94 @@ describe('production heavy runner failing TAP evidence', () => {
   });
 });
 
+describe('overlay main sync diagnostics and unit selection', () => {
+  it.each([0, 1])('retains failing files and titles plus bounded ANSI-free output (reruns=%i)', async reruns => {
+    const f = fixture({ reruns });
+    runners(f, ['failed', 'failed']);
+    f.deps.testRunner.mockImplementation(async options => ({
+      ...report(options, 'failed'),
+      stdout: `old output\n${'x'.repeat(2000)}\n\u001b[31massertion diagnostic\u001b[0m\nstdout end`,
+      stderr: 'stderr end',
+    }));
+    await expect(job(f)).rejects.toThrow(failure);
+    const { detail } = f.outcomes.find(event => event.kind === 'overlay-main-sync-failed');
+    expect(detail.stderrTail).toContain(failedFile);
+    expect(detail.stderrTail).toContain('worker behaves');
+    expect(detail.stderrTail).toContain('assertion diagnostic');
+    expect(detail.stderrTail).toContain('stdout end');
+    expect(detail.stderrTail).toContain('stderr end');
+    expect(detail.stderrTail).not.toContain('\u001b');
+    expect(detail.stderrTail.length).toBeLessThanOrEqual(1500);
+    noPublication(f);
+  });
+
+  it.each(['stdout', 'stderr', 'both'])('retains the last output lines without a report (%s)', async stream => {
+    const f = fixture();
+    f.deps.testRunner = async () => ({ status: 1,
+      stdout: stream === 'stderr' ? '' : `${Array.from({ length: 30 }, (_, i) => `line-${i}`).join('\n')}\n\u001b[31mstdout failure\u001b[0m`,
+      stderr: stream === 'stdout' ? '' : 'stderr failure',
+    });
+    await expect(job(f)).rejects.toThrow('tests: command failed or incomplete; operator review required');
+    const { stderrTail } = f.outcomes.find(event => event.kind === 'overlay-main-sync-failed').detail;
+    if (stream !== 'stderr') {
+      expect(stderrTail).toContain('stdout failure');
+      expect(stderrTail).not.toContain('line-0');
+    }
+    if (stream !== 'stdout') expect(stderrTail).toContain('stderr failure');
+    expect(stderrTail).not.toContain('\u001b');
+    expect(stderrTail.length).toBeLessThanOrEqual(1500);
+    noPublication(f);
+  });
+
+  it('retains the original failing identity and latest output when a rerun drops the assertion', async () => {
+    const f = fixture();
+    let calls = 0;
+    f.deps.testRunner = async options => ({
+      ...report(options, calls++ ? 'renamed' : 'failed'),
+      stdout: calls === 1 ? 'initial output' : 'latest rerun output',
+    });
+    await expect(job(f)).rejects.toThrow(failure);
+    const { stderrTail } = f.outcomes.find(event => event.kind === 'overlay-main-sync-failed').detail;
+    expect(stderrTail).toContain(failedFile);
+    expect(stderrTail).toContain('worker behaves');
+    expect(stderrTail).toContain('latest rerun output');
+    noPublication(f);
+  });
+
+  it('excludes touched and reverse-imported soak tests while passing unit tests still sync', async () => {
+    const f = fixture();
+    ok(f.root, ['checkout', '-q', ref]);
+    write(f.root, 'scripts/conveyor/soak/breaks/touched.soak.test.mjs', "import '../../../../worker.mjs';\n");
+    ok(f.root, ['add', '.']); ok(f.root, ['commit', '-qm', 'touch soak test']);
+    ok(f.root, ['update-ref', `refs/remotes/origin/${ref}`, 'HEAD']);
+    ok(f.root, ['checkout', '-q', 'main']);
+    // This file is inherited from main, so only its import edge can select it.
+    write(f.root, 'scripts/conveyor/soak/breaks/related.soak.test.mjs', "import '../../../../worker.mjs';\n");
+    ok(f.root, ['add', '.']); ok(f.root, ['commit', '-qm', 'main soak test']);
+    ok(f.root, ['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+    f.deps.testRunner = vi.fn(async options => {
+      expect(selectedFiles(options)).toEqual([failedFile, 'worker1.test.mjs', 'worker2.test.mjs']);
+      return report(options);
+    });
+    expect(await job(f)).toMatchObject({ pushed: true,
+      tests: [failedFile, 'worker1.test.mjs', 'worker2.test.mjs'] });
+    expect(f.deps.testRunner).toHaveBeenCalledOnce();
+  });
+
+  it('keeps a soak-named file under the unit config __tests__ include', async () => {
+    const f = fixture();
+    const unitFile = 'scripts/__tests__/unit.soak.test.mjs';
+    ok(f.root, ['checkout', '-q', ref]);
+    write(f.root, unitFile, "import '../../worker.mjs';\n");
+    ok(f.root, ['add', '.']); ok(f.root, ['commit', '-qm', 'unit test']);
+    ok(f.root, ['update-ref', `refs/remotes/origin/${ref}`, 'HEAD']);
+    ok(f.root, ['checkout', '-q', 'main']);
+    f.deps.testRunner = vi.fn(async options => report(options));
+    expect(await job(f)).toMatchObject({ pushed: true,
+      tests: [unitFile, failedFile, 'worker1.test.mjs', 'worker2.test.mjs'] });
+  });
+});
+
 describe('overlay main sync failed-file reruns', () => {
   it.each([0, 1])('flaky pass emits retried event and ends synced with push (initial exit %i)', async status => {
     const f = fixture(), trees = runners(f, ['failed', 'passed'], 'passed', status);

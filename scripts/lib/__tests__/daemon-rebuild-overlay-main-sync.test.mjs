@@ -443,9 +443,11 @@ describe('overlay main sync', () => {
     else await expect(job(f)).rejects.toMatchObject({ step, stderrTail: expect.stringContaining('final diagnostic') });
     const failure = fs.readFileSync(f.env.WE_DAEMON_EVENTS, 'utf8').trim().split('\n').map(JSON.parse).at(-1);
     expect(failure).toMatchObject({ kind: 'overlay-main-sync-failed', detail: { ref, step, main: f.mainSha, stderrTail: expect.any(String) } });
-    expect(failure.detail.stderrTail.length).toBeLessThanOrEqual(500);
+    // The tests step keeps a wider tail (failing names + last output lines); other steps stay at 500.
+    expect(failure.detail.stderrTail.length).toBeLessThanOrEqual(step === 'tests' ? 1500 : 500);
     expect(failure.detail.stderrTail).not.toMatch(/[\p{Cc}\p{Cf}]/u);
-    expect(failure.detail.stderrTail).toBe(stderr.replace(/[\p{Cc}\p{Cf}]/gu, '').slice(-500));
+    if (step === 'tests') expect(failure.detail.stderrTail).toContain('final diagnostic');
+    else expect(failure.detail.stderrTail).toBe(stderr.replace(/[\p{Cc}\p{Cf}]/gu, '').slice(-500));
     expect(alerts(f)[0].detail.reason).toContain(step);
     expect(log.mock.calls.flat().join('\n')).toContain(`step=${step}`);
     expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toContainEqual(expect.objectContaining({ kind: 'overlay-main-sync-needs-you', repo: 'web-everything', ref }));
