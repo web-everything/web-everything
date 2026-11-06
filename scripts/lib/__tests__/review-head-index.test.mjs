@@ -716,6 +716,27 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     expect(headReviewOwed({ index, repo: 'o/r', pr: 7, head: H(2), netPatchHash: 'p2' }).owed).toBe(true);
     expect(index.map['o/r#8']).toMatchObject({ lastReviewedHead: H(3) });
   });
+  it('compaction deletes only retraction markers whose row it folded: a rejected writer that appends after the compaction stays hidden even if it never rolls back', () => {
+    rec();
+    const { log, lock } = headIndexPaths(dir);
+    let stolen = false;
+    const fs = { ...nodeFs,
+      openSync: (p, f, ...a) => {
+        if (f === 'a' && p === log && !stolen) { // A named its transaction (pending marker) and has not appended yet: the lock passes to B, who compacts
+          stolen = true; rmSync(lock, { force: true });
+          recordReview({ dir, repo: 'o/r', pr: 8, head: H(3), netPatchHash: 'p9', verdict: 'accept', at: '2026-11-04T11:00:00Z', logMaxLines: 1 });
+        }
+        if (f === 'wx' && /retract\./.test(String(p))) throw Object.assign(Error('disk full'), { code: 'ENOSPC' }); // A can never write its own retraction (crash / failure)
+        return nodeFs.openSync(p, f, ...a); } };
+    expect(() => rec({ fs, head: H(2), netPatchHash: 'p2', at: '2026-11-04T10:30:00Z' })).toThrow(/lock lost/);
+    expect(stolen).toBe(true);
+    expect(logRows().some(r => r.head === H(2))).toBe(true);     // A's row did land in the compacted log, after B's rename
+    expect(nodeFs.readdirSync(dir).filter(n => n.startsWith('retract.'))).toHaveLength(1); // B's retraction of A is kept: A's row never arrived in B's snapshot
+    const index = readHeadIndex({ dir });
+    expect(index.map['o/r#7'].history.p2).toBeUndefined();        // so the rejected review is never readable
+    expect(headReviewOwed({ index, repo: 'o/r', pr: 7, head: H(2), netPatchHash: 'p2' }).owed).toBe(true);
+    expect(index.map['o/r#8']).toMatchObject({ lastReviewedHead: H(3) });
+  });
   it('a retraction removes the writer\'s own row (by txn), not a later row with identical content', () => {
     const { log } = headIndexPaths(dir);
     nodeFs.mkdirSync(dir, { recursive: true });

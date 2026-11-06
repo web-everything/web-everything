@@ -114,14 +114,15 @@ const stateHash = (raw, retractions, pending = []) => {
 const parseLog = (text, keepPerPr, retractions = []) => {
   const lines = text.split('\n').filter(l => l.trim());
   const gone = new Set(retractions);
-  const map = {};
+  const map = {}, seen = new Set(); // seen = every txn that has a row in this text, retracted or not
   for (const l of lines) {
     const rec = JSON.parse(l);
     if (!validRecord(rec)) throw Error('invalid log record');
+    if (typeof rec.txn === 'string') seen.add(rec.txn);
     if (typeof rec.txn === 'string' && gone.has(rec.txn)) continue; // retracted by its writer
     applyRecord(map, rec, keepPerPr);
   }
-  return { map, lines: lines.length };
+  return { map, lines: lines.length, seen };
 };
 /** keepPerPr for a rebuild: explicit option, else the value the last published map recorded, else the resolved setting (`.value`). */
 const rebuildKeep = (explicit, stored, settingsFile) => {
@@ -325,7 +326,11 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
       if (!fs.readFileSync(log).equals(snapshot)) { rollback(); throw tag(Error('review-head-index: log changed under the lock; refusing to compact')); }
       atomicWrite(fs, log, `${log}.tmp`, text);
       fenced();                                                 // lock lost during the rewrite: the compacted log replays to the same map, so it stays; our row is retracted
-      for (const t of folded) { try { fs.unlinkSync(retractPath(dir, t)); } catch { /* gone */ } } // folded into the log we just wrote; later markers are not in `folded` and stay
+      // Delete only a marker whose row this compaction actually saw (and so dropped from the new log). A marker whose row is not in
+      // the snapshot belongs to a rejected writer that has not appended yet (it named its transaction, then lost the lock): its row
+      // can still land in the new log, and the marker is the only thing hiding it. Such markers are never aged out (a paused writer
+      // may append arbitrarily late), so they can pile up; that is the price of never showing a rejected review.
+      for (const t of folded) { if (parsed.seen.has(t)) { try { fs.unlinkSync(retractPath(dir, t)); } catch { /* gone */ } } } // later markers are not in `folded` and stay
       lines = compact.length + 1;
     }
     fenced();
