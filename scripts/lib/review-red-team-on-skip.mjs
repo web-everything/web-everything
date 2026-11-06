@@ -11,7 +11,7 @@ import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir, withRedTeamStatusClaim } from './drain-red-team-evidence.mjs';
-import { redTeamForHead, redTeamMarker, parseRedTeamComment, breakClass } from './red-team-gate.mjs';
+import { redTeamForHead, redTeamMarker, parseRedTeamComment } from './red-team-gate.mjs';
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 import { isRealHead, safeErrorText, settleRedTeamSkip } from './red-team-skip-outcome.mjs';
@@ -23,7 +23,7 @@ import { failedRedTeamRetry, redTeamStatusWithoutRun, completedRedTeamSeat } fro
 import { redTeamRequired, VERDICTS } from './jury-core.mjs';
 import { isLaterVerdictBody, latestAcceptRecord, laterReviewHold } from './accept-carry-forward.mjs';
 import { restampRecord, strandedNumberingRecords } from './numbering-carry.mjs';
-import { planRedTeamStatusLabels, syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
+import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { RED_TEAM_STATUS_LABELS } from './red-team-status-label-meta.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
@@ -241,6 +241,12 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
     const head = rawPr?.headRefOid ?? null;
     const row = { prNumber: pr, head, action: 'skip' };
     const skip = why => ({ ...row, why });
+    const resultOnHead = () => ({ ...skip('red-team result already on head'),
+      ...(Array.isArray(rawPr?.labels) && rawPr.labels.some(label =>
+        (typeof label === 'string' ? label : label?.name) === 'red-team:pending') ? {
+        escalate: true,
+        escalationContext: 'red-team result already on head but red-team:pending is still set; the drain/job label sync did not settle it',
+      } : {}) });
     const guardedSkip = why => ({ ...skip(why),
       ...(why === 'conflicting label prevents policy-clear' ? { escalate: true } : {}) });
     const dispatchDecision = decision => {
@@ -257,7 +263,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       // Unknown comments cannot establish that no result was published.
       if (!Array.isArray(rawPr.comments)) return skip('PR comments unreadable');
       const journal = readCarry({ repo, pr, head });
-      if (redTeamForHead(rawPr.comments, pr, head) && (!journal || journal.step === 'done')) return { ...skip('red-team result already on head'), settle: 'result' };
+      if (redTeamForHead(rawPr.comments, pr, head) && (!journal || journal.step === 'done')) return resultOnHead();
       if (readWitness) {
         const w = readWitness({ repo, pr, head });
         if (w?.ok === false) return failedRead(w);
@@ -271,7 +277,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (evidence?.ok === false) return failedRead(evidence);
       if (evidence?.carryConflict) return skip('later review supersedes the carry');
       const unfinishedCarry = evidence?.carry && evidence.carry.step !== 'done';
-      if (redTeamForHead(rawPr.comments, pr, head) && !unfinishedCarry) return { ...skip('red-team result already on head'), settle: 'result' };
+      if (redTeamForHead(rawPr.comments, pr, head) && !unfinishedCarry) return resultOnHead();
       const accepted = Array.isArray(rawPr.labels) && rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:accepted');
       if (evidence?.inFlight || evidence?.queued) return skip('red-team pass in flight');
       const reviews = Array.isArray(rawPr.reviews) ? rawPr.reviews : null;
@@ -438,43 +444,6 @@ export function readCompletePrReviews({ repo, pr, env = process.env, exec = runG
   throw Error('PR reviews page cap reached; inspect complete reviews');
 }
 
-/** 'clean' only for a known template with an explicit completed outcome; 'broken' for a parsed confirmed break. */
-function strictBodyKind(body, pr, head) {
-  const parsed = parseRedTeamComment(body);
-  if (!parsed) return false;
-  // Every finding-shaped line must have been parsed: an indented or oddly tagged one is silently skipped downstream.
-  const findingShaped = body.split(/\r?\n/).filter(line => /^\s*(?:\d+[.)]|[-*•])\s*\[/.test(line)).length;
-  if (findingShaped !== parsed.findings.length) return false;
-  if (parsed.findings.some(finding => breakClass(finding) === 'broken')) return 'broken';
-  if (parsed.findings.length !== 0) return false;
-  const advisory = "Advisory only: this comment changes no label itself; the red-team gate (setting `redTeam.confirmedBreaks`) sends a confirmed broken break back to the fixer. Head `"
-    + String(head).slice(0, 12) + '` · red team ';
-  const lines = body.split(/\r?\n/).filter(line => line.trim());
-  // An explicit completed outcome is required: a bare marker (or marker plus advisory) proves no pass.
-  const outcome = line => line === 'The red team tried to break this change and reported nothing.'
-    || /^Red team not required on this head: [^\r\n]+$/.test(line) || /^Findings: none\.?$/i.test(line);
-  if (!lines.some(outcome)) return false;
-  return lines.every(line =>
-    line === redTeamMarker(pr, head)
-    || line === '### Post-accept red team — no break found'
-    || line === 'The red team tried to break this change and reported nothing.'
-    || /^Red team not required on this head: [^\r\n]+$/.test(line)
-    || /^Findings: none\.?$/i.test(line)
-    || line.startsWith(advisory) && /^[^\s`/]+\/[^\s`]+ · recorded verdict `accept`\.$/.test(line.slice(advisory.length))) ? 'clean' : false;
-}
-
-/** Only known clean templates can clear; parsed confirmed breaks retain the send-back path. */
-function resultMaySynchronize(comments, pr, head) {
-  // Every comment carrying this head's marker must itself be strictly understood: the downstream parser can consume a
-  // malformed or carried comment that redTeamForHead does not accept, and would silently skip its findings.
-  // Match like the downstream parser does: case-insensitive and whitespace-tolerant.
-  const markerPattern = new RegExp(`we:red-team-advisory\\s+pr\\s*=\\s*0*${Number(pr)}\\s+rev\\s*=\\s*${String(head)}`, 'i');
-  const marked = comments.filter(c => typeof c?.body === 'string' && markerPattern.test(c.body));
-  if (marked.some(c => !strictBodyKind(c.body, pr, head))) return false;
-  return comments.some(c => redTeamForHead([c], pr, head));
-}
-
-/** Wrap a label provider so a clear is refused when a hold label is seen at the synchronizer's own read or at write time. */
 function holdGuardedProvider(provider, head) {
   const refuse = state => {
     if (state?.headRefOid !== head) throw Error('head moved before settlement; label unchanged');
@@ -607,17 +576,13 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         || live.labels.some(label => typeof (typeof label === 'string' ? label : label?.name) !== 'string')
         || !Array.isArray(comments) || comments.some(comment => typeof comment?.body !== 'string')
         || !Array.isArray(reviews)) throw Error('fresh PR evidence unreadable or head changed before settlement');
-      // A trusted red-team result supplies its own blocked/clear disposition. Its finding text
-      // is not an independent review hold; all other thread comments still guard settlement.
-      const holdComments = row.settle === 'result' ? comments.filter(comment =>
-        !redTeamForHead([comment], row.prNumber, row.head) || isLaterVerdictBody(comment.body)) : comments;
-      if ((row.settle === 'result' || row.action === 'clear')
-        && !provenAcceptance({ comments: holdComments, reviews, labels: live.labels, head: row.head })) {
+      if (row.action === 'clear'
+        && !provenAcceptance({ comments, reviews, labels: live.labels, head: row.head })) {
         throw Error('no proven acceptance for this head; label unchanged');
       }
-      const acceptance = latestAcceptRecord(holdComments, reviews);
+      const acceptance = latestAcceptRecord(comments, reviews);
       if (laterReviewHold(reviews) || acceptance?.laterVerdict || acceptance?.laterBodyDerivedHold
-        || !acceptance && holdComments.some(comment => isLaterVerdictBody(comment.body))) {
+        || !acceptance && comments.some(comment => isLaterVerdictBody(comment.body))) {
         throw Error('evidence changed before settlement');
       }
       const rawPr = { ...live, number: row.prNumber, comments, reviews };
@@ -640,52 +605,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           const key = { repo, pr: row.prNumber, head: row.head };
           if (row.escalate) {
             escalateRow(row);
-          } else if (row.settle === 'result') {
-            const rawPr = planningPrs.find(p => Number(p?.number) === row.prNumber);
-            if (rawPr?.labels?.some(l => (typeof l === 'string' ? l : l?.name) === 'red-team:pending')) {
-              const live = freshSettlement(row);
-              if (!live) continue;
-              const evidence = planningOptions.readEvidence(key);
-              // Active work outranks a stale result: never lift the hold while a pass is queued, running or unfinished.
-              const active = evidence?.inFlight || evidence?.queued || ['queued', 'running'].includes(evidence?.status?.status)
-                || (evidence?.carry && evidence.carry.step !== 'done');
-              let witness = null;
-              if (!active && evidence?.ok !== false && planningOptions.readWitness) {
-                witness = planningOptions.readWitness(key);
-              }
-              if ([evidence, witness].some(result => result?.ok === false && result.reason === 'review-unfinished')) {
-                holdUnfinishedReview(row);
-                row.settleError ??= 'unfinished review evidence; label unchanged';
-              } else if (active) row.settleError = 'red-team pass still active; label unchanged';
-              else if (evidence?.ok === false || evidence?.carryConflict || witness?.ok === false) row.settleError = 'conflicting review evidence; label unchanged';
-              else if (!resultMaySynchronize(live.comments, row.prNumber, row.head)) row.settleError = 'result comment not strictly clean';
-              else {
-                const verdict = evidence?.status?.status === 'finished' ? evidence.status.result?.foldedVerdict : null;
-                if (!['accept', 'changes'].includes(verdict)) row.settleError = 'no recorded red-team verdict; label unchanged';
-                else if (verdict === 'accept' && evidence?.loopPayload?.verdict?.verdict !== 'accept') row.settleError = 'review payload is not an accept; label unchanged';
-                else if (verdict === 'accept' && witness && witness.newest?.verdict?.verdict !== 'accept') row.settleError = 'newest same-head review is not an accept; label unchanged';
-                else if (verdict === 'accept' && (!Array.isArray(live.labels)
-                  || live.labels.some(label => conflictsWithPolicyClear(label, { settlesPending: true })))) row.settleError = 'conflicting hold label present; label unchanged';
-                else if (verdict === 'accept' && (!['ran', 'resumed'].includes(normalizeRedTeamResult(evidence.status.result).priorResult)
-                  || evidence.completedRecorded === false)) row.settleError = 'red-team execution not proven complete; label unchanged';
-                else if (verdict === 'accept' && normalizeRedTeamResult(evidence.status.result).priorComment !== 'posted') row.settleError = 'red-team result comment not confirmed posted; label unchanged';
-                else {
-                  // A withheld changes result must never inherit the clear disposition of an older comment.
-                  const labels = verdict === 'changes' ? planRedTeamStatusLabels({ ...key, env, evidence,
-                    comments: live.comments, labels: live.labels, standingRuling: null }) : null;
-                  const blocked = labels?.add === 'red-team:blocked' || labels?.add == null
-                    && live.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'red-team:blocked')
-                    && !labels?.remove.includes('red-team:blocked');
-                  if (verdict === 'changes' && !blocked) row.settleError = 'recorded red-team changes; label unchanged';
-                  else syncLabels({ ...key, env, log: note, evidence, comments: live.comments,
-                    // The synchronizer re-reads PR state itself: refuse a clear if a hold label appeared since our read.
-                    provider: verdict === 'accept' ? holdGuardedProvider(provider, row.head) : provider,
-                    ...(verdict === 'changes' ? { standingRuling: null } : {}) });
-                }
-              }
-            }
-          }
-          else if (row.settle === 'not-owed') {
+          } else if (row.settle === 'not-owed') {
             const rawPr = planningPrs.find(p => Number(p?.number) === row.prNumber);
             if (Array.isArray(rawPr?.labels) && !rawPr.labels.some(l => (typeof l === 'string' ? l : l?.name) === 'red-team:blocked')) {
               if (freshSettlement(row)) settlePending({ ...key, remove: ['red-team:pending'] });

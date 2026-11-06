@@ -5,11 +5,9 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import * as mod from '../review-red-team-on-skip.mjs';
 import pendingBreak from '../../conveyor/soak/breaks/redteam-pending-label-never-settles.mjs';
-import { latestAcceptRecord } from '../accept-carry-forward.mjs';
-import { redTeamMarker, redTeamForHead } from '../red-team-gate.mjs';
+import { redTeamMarker } from '../red-team-gate.mjs';
 import { redTeamOwedFor } from '../review-red-team-policy.mjs';
 import { settleRedTeamSkip } from '../red-team-skip-outcome.mjs';
-import { planRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 
 // Fail any accidental transport call locally; all intended IO is injected below.
@@ -59,10 +57,6 @@ function notOwedRunFixture(over = {}) {
   const f = notOwedFixture();
   return runFixture({ ...f, now: () => f.now, ...over });
 }
-function resultRunFixture(over = {}, verdict = 'accept') {
-  return runFixture({ readEvidence: () => evidence({ recorded: true, loopPayload: payload('accept'),
-    status: { status: 'finished', result: { status: 'ran', comment: 'posted', foldedVerdict: verdict } } }), ...over });
-}
 function carryFixture() {
   const f = fixture({ readEvidence: () => evidence({ loopPayload: undefined }) });
   f.rawPrs[0].comments = [accept(old),
@@ -77,30 +71,6 @@ function resultComment(confirmed = false) {
       confirmedByRecheck: true, file: 'scripts/example.mjs', filesRead: ['scripts/example.mjs'],
     }] : [] }));
 }
-
-describe('result settlement requires a strictly clean comment or a confirmed break', () => {
-  it.each(['indented finding', 'bulleted finding', 'unknown line', 'unconfirmed finding'])(
-    '%s cannot replace pending with clear', kind => {
-      const o = resultRunFixture();
-      const clean = resultComment();
-      const broken = resultComment(true);
-      const body = kind === 'indented finding' ? broken.body.replace(/^1\./m, '  1.')
-        : kind === 'bulleted finding' ? `${clean.body}\n- [**confirmed**] (edge-case, broken) — hidden break`
-          : kind === 'unconfirmed finding' ? broken.body.replace('[**confirmed**]', '[not confirmed]')
-            : `${clean.body}\nSomething else was found.`;
-      o.rawPrs[0].comments.push(clean, trusted(body, iso(acceptedAt + 1)));
-      expect(mod.runRedTeamOnSkip(o).rows[0].settleError).toBe('result comment not strictly clean');
-      expect(o.syncLabels).not.toHaveBeenCalled(); expect(o.settlePending).not.toHaveBeenCalled();
-      expect(o.rawPrs[0].labels).toContain('red-team:pending');
-    });
-  it('every marker-bearing comment must be strictly understood: an older one with unknown text blocks clearing even beside a newer clean result', () => {
-    const o = resultRunFixture();
-    o.rawPrs[0].comments.push(trusted(resultComment().body, iso(acceptedAt + 2)),
-      trusted(`${resultComment().body}\nunknown text`, iso(acceptedAt + 1)));
-    mod.runRedTeamOnSkip(o);
-    expect(o.syncLabels).not.toHaveBeenCalled();
-  });
-});
 
 describe('complete bounded formal-review reads', () => {
   it('reads successive pages through the bounded injected transport', () => {
@@ -121,12 +91,11 @@ describe('complete bounded formal-review reads', () => {
       expect(exec.mock.calls.length).toBeLessThanOrEqual(10);
     });
 
-  it.each(['result', 'clear'])(
+  it.each(['clear'])(
     '%s refuses unreadable complete reviews despite a readable legacy review snapshot', kind => {
       const status = { status: 'finished', result: 'not-owed' };
-      const o = kind === 'result' ? resultRunFixture() : runFixture({
+      const o = runFixture({
         readEvidence: () => evidence({ loopPayload: payload('accept'), status }), readStatus: () => status });
-      if (kind === 'result') o.rawPrs[0].comments.push(resultComment());
       const readCompleteReviews = vi.fn(() => { throw Error('complete reviews unreadable'); });
       o.readCompleteReviews = readCompleteReviews;
       const row = mod.runRedTeamOnSkip(o).rows[0];
@@ -182,169 +151,6 @@ describe('policy-clear publication revalidates fresh evidence', () => {
     expect(o.readReviews).toHaveBeenCalledWith({ repo, pr });
     expect(o.syncLabels).toHaveBeenCalledOnce();
   });
-});
-
-describe('settlement reads fresh PR state and result evidence', () => {
-  it('review-unfinished (unknown) evidence at settle time never synchronizes: pending is preserved', () => {
-    const unknown = { ok: false, reason: 'review-unfinished',
-      status: { status: 'finished', result: { foldedVerdict: 'accept' } } };
-    const o = runFixture({ readEvidence: vi.fn(() => unknown) });
-    o.rawPrs[0].comments.push(resultComment());
-    const row = mod.runRedTeamOnSkip(o).rows[0];
-    expect(o.syncLabels).not.toHaveBeenCalled();
-    expect(o.readEvidence).toHaveBeenCalledWith({ repo, pr, head });
-    expect(row.settleError).toBeTruthy();
-  });
-  it.each([
-    ['in flight', { inFlight: true }],
-    ['queued', { queued: true }],
-    ['running status', { status: { status: 'running' } }],
-    ['queued status', { status: { status: 'queued' } }],
-  ])('active red-team work (%s) is never lifted by an older result: no label synchronization', (_name, active) => {
-    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: {}, recorded: false, seatRecorded: false, ...active })) });
-    o.rawPrs[0].comments.push(resultComment());
-    const row = mod.runRedTeamOnSkip(o).rows[0];
-    expect(o.syncLabels).not.toHaveBeenCalled();
-    expect(row.settleError).toBe('red-team pass still active; label unchanged');
-  });
-  it('a result comment holding only the head marker (no explicit outcome) never synchronizes', () => {
-    const o = resultRunFixture({  });
-    o.rawPrs[0].comments.push({ author: { login: 'web-everything' }, body: redTeamMarker(pr, head) });
-    expect(mod.runRedTeamOnSkip(o).rows[0].settleError).toBe('result comment not strictly clean');
-    expect(o.syncLabels).not.toHaveBeenCalled(); expect(o.settlePending).not.toHaveBeenCalled();
-    expect(o.rawPrs[0].labels).toContain('red-team:pending');
-  });
-  it('a newer marker-bearing comment with an indented confirmed break blocks clearing despite an older clean result', () => {
-    const o = resultRunFixture({  });
-    o.rawPrs[0].comments.push(resultComment(), { author: { login: 'web-everything' },
-      body: `${redTeamMarker(pr, head)}\nRed team not required on this head: prior policy-clear carried\n  1. [**confirmed**] (edge-case, broken) — hidden break` });
-    expect(mod.runRedTeamOnSkip(o).rows[0].settleError).toBe('result comment not strictly clean');
-    expect(o.syncLabels).not.toHaveBeenCalled(); expect(o.settlePending).not.toHaveBeenCalled();
-    expect(o.rawPrs[0].labels).toContain('red-team:pending');
-  });
-  it('an uppercase-marker comment with an indented confirmed break also blocks clearing', () => {
-    const o = resultRunFixture({  });
-    o.rawPrs[0].comments.push(resultComment(), { author: { login: 'web-everything' },
-      body: `${redTeamMarker(pr, head).toUpperCase()}\nRed team not required on this head: x\n  1. [**confirmed**] (edge-case, broken) — hidden` });
-    expect(mod.runRedTeamOnSkip(o).rows[0].settleError).toBe('result comment not strictly clean');
-    expect(o.syncLabels).not.toHaveBeenCalled(); expect(o.settlePending).not.toHaveBeenCalled();
-    expect(o.rawPrs[0].labels).toContain('red-team:pending');
-  });
-  it('carryConflict evidence or an unfinished witness at settle time never lifts the hold', () => {
-    for (const patch of [{ carryConflict: true }, null]) {
-      const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: {}, recorded: false, seatRecorded: false,
-        status: { status: 'finished', result: { foldedVerdict: 'accept' } }, ...(patch ?? {}) })),
-       });
-      if (!patch) {
-        o.readWitness = vi.fn(() => ({ ok: false, reason: 'review-unfinished' }));
-      }
-      o.rawPrs[0].comments.push(resultComment());
-      mod.runRedTeamOnSkip(o);
-      expect(o.syncLabels).not.toHaveBeenCalled();
-    }
-  });
-  it('a parsed confirmed break plus an extra indented unparsed finding line never clears, even with a later clean result', () => {
-    const o = resultRunFixture({  });
-    o.rawPrs[0].comments.push({ author: { login: 'web-everything' }, createdAt: iso(acceptedAt + 1),
-      body: `${redTeamMarker(pr, head)}\n### Post-accept red team — 1 possible break(s), 1 confirmed by Claude's re-check\n\n1. [**confirmed**] (edge-case, broken) — real\n  2. [**confirmed**] (edge-case, broken) — hidden` },
-    { ...resultComment(), createdAt: iso(acceptedAt + 2) });
-    expect(mod.runRedTeamOnSkip(o).rows[0].settleError).toBe('result comment not strictly clean');
-    expect(o.syncLabels).not.toHaveBeenCalled(); expect(o.settlePending).not.toHaveBeenCalled();
-    expect(o.rawPrs[0].labels).toContain('red-team:pending');
-  });
-  it('a rejecting review payload beside an older accepting red-team status never clears', () => {
-    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: { verdict: { verdict: 'changes' } }, recorded: false, seatRecorded: false,
-      status: { status: 'finished', result: { foldedVerdict: 'accept' } } })) });
-    o.rawPrs[0].comments.push(resultComment());
-    const row = mod.runRedTeamOnSkip(o).rows[0];
-    expect(o.syncLabels).not.toHaveBeenCalled();
-    expect(row.settleError).toBe('review payload is not an accept; label unchanged');
-  });
-  it.each(['withheld', 'error', undefined])('an accept whose comment is %s (not confirmed posted) never clears on an older comment', comment => {
-    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: payload('accept'), recorded: false, seatRecorded: false,
-      status: { status: 'finished', result: { status: 'ran', foldedVerdict: 'accept', ...(comment ? { comment } : {}) } } })) });
-    o.rawPrs[0].comments.push(resultComment());
-    const row = mod.runRedTeamOnSkip(o).rows[0];
-    expect(o.syncLabels).not.toHaveBeenCalled();
-    expect(row.settleError).toBe('red-team result comment not confirmed posted; label unchanged');
-  });
-  it('a newer same-head changes run in the witness blocks clearing on an older accepting status', () => {
-    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: payload('accept'), recorded: false, seatRecorded: false,
-      status: { status: 'finished', result: { status: 'ran', comment: 'posted', foldedVerdict: 'accept' } } })) });
-    o.readWitness = vi.fn(() => ({ ok: true, newest: { verdict: { verdict: 'changes' } }, rawWriter: { parsed: null }, markers: {}, seats: [] }));
-    o.rawPrs[0].comments.push(resultComment());
-    const row = mod.runRedTeamOnSkip(o).rows[0];
-    expect(o.syncLabels).not.toHaveBeenCalled();
-    expect(row.settleError).toBe('newest same-head review is not an accept; label unchanged');
-  });
-  it.each([
-    ['execution failed', { status: 'failed', comment: 'posted', foldedVerdict: 'accept' }, undefined],
-    ['completion not recorded', { status: 'ran', comment: 'posted', foldedVerdict: 'accept' }, false],
-  ])('an accepting status with %s never clears', (_name, result, completedRecorded) => {
-    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: payload('accept'), recorded: false, seatRecorded: false,
-      ...(completedRecorded === undefined ? {} : { completedRecorded }), status: { status: 'finished', result } })) });
-    o.rawPrs[0].comments.push(resultComment());
-    const row = mod.runRedTeamOnSkip(o).rows[0];
-    expect(o.syncLabels).not.toHaveBeenCalled();
-    expect(row.settleError).toBe('red-team execution not proven complete; label unchanged');
-  });
-  it.each(['red-team:blocked', 'review:changes', 'review-status:pending'])('a clean accepted result never clears while the hold label %s is present', label => {
-    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: payload('accept'), recorded: false, seatRecorded: false,
-      status: { status: 'finished', result: { status: 'ran', comment: 'posted', foldedVerdict: 'accept' } } })) });
-    o.rawPrs[0].labels.push(label);
-    o.rawPrs[0].comments.push(resultComment());
-    const row = mod.runRedTeamOnSkip(o).rows[0];
-    expect(o.syncLabels).not.toHaveBeenCalled();
-    expect(row.settleError).toBeTruthy();
-  });
-  it('a hold label that appears at the synchronizer\'s own read or write is not overwritten', () => {
-    for (const when of ['read', 'write']) {
-      let reads = 0;
-      const labelsFor = n => (n > (when === 'read' ? 0 : 1) ? ['review:accepted', 'red-team:pending', 'red-team:blocked'] : ['review:accepted', 'red-team:pending']);
-      const provider = { readPrState: vi.fn(() => ({ headRefOid: head, labels: labelsFor(++reads), comments: [] })),
-        readComments: vi.fn(() => []), ensureLabel: vi.fn(), setLabels: vi.fn() };
-      const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: payload('accept'), recorded: false, seatRecorded: false,
-        status: { status: 'finished', result: { status: 'ran', comment: 'posted', foldedVerdict: 'accept' } } })), provider });
-      o.syncLabels = (input) => {
-        input.provider.readPrState(repo, pr);
-        input.provider.setLabels(repo, pr, { add: 'red-team:clear', remove: ['red-team:pending'] });
-      };
-      o.rawPrs[0].comments.push(resultComment());
-      const row = mod.runRedTeamOnSkip(o).rows[0];
-      expect(provider.setLabels).not.toHaveBeenCalled();
-      expect(row.settleError).toMatch(/hold label (appeared before settlement|present); label unchanged/);
-    }
-  });
-  it('a throwing result evidence read settles nothing and reports settleError', () => {
-    const o = runFixture({ readEvidence: () => { throw Error('fresh evidence offline'); } });
-    o.rawPrs[0].comments.push(resultComment());
-    expect(mod.runRedTeamOnSkip(o).rows[0].settleError).toBe('fresh evidence offline');
-    expect(o.syncLabels).not.toHaveBeenCalled();
-  });
-
-  it.each(['result'].flatMap(kind => ['hold comment', 'formal hold', 'head moved', 'state throws',
-    'comments throw', 'reviews throw', 'comments unknown', 'reviews unknown'].map(change => [kind, change])))(
-    '%s retains pending when fresh %s appears after planning', (kind, change) => {
-      const o = kind === 'not-owed' ? notOwedRunFixture() : resultRunFixture();
-      if (kind === 'result') o.rawPrs[0].comments.push(resultComment(change === 'hold comment'));
-      o.provider = { readPrState: vi.fn(() => {
-        if (change === 'state throws') throw Error('state offline');
-        return { ...o.rawPrs[0], headRefOid: change === 'head moved' ? old : head };
-      }), setLabels: vi.fn() };
-      o.readComments = vi.fn(() => {
-        if (change === 'comments throw') throw Error('comments offline');
-        return change === 'comments unknown' ? undefined : [...o.rawPrs[0].comments,
-          ...(change === 'hold comment' ? [trusted('🔁 review — changes requested', iso(acceptedAt + 1))] : [])];
-      });
-      o.readReviews = vi.fn(() => {
-        if (change === 'reviews throw') throw Error('reviews offline');
-        return change === 'reviews unknown' ? undefined : change === 'formal hold'
-          ? [{ state: 'CHANGES_REQUESTED', submittedAt: iso(acceptedAt + 1) }] : [];
-      });
-      expect(mod.runRedTeamOnSkip(o).rows[0].settleError).toBeTruthy();
-      expect(o.settlePending).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled();
-      expect(o.provider.setLabels).not.toHaveBeenCalled();
-    });
 });
 
 describe('non-accept verdicts retain pending', () => {
@@ -442,12 +248,12 @@ describe('planner settlement annotations', () => {
     expect(decide(f)).toMatchObject({ action: 'skip', why: 'stored review does not owe a red team', escalate: true });
   });
 
-  it.each(['early result', 'post-evidence result'])('%s skip settles through result label synchronization', site => {
+  it.each(['early result', 'post-evidence result'])('%s skip escalates pending without label synchronization', site => {
     const f = fixture(); f.rawPrs[0].comments.push(resultComment());
     // The unfinished journal bypasses the first result check; settled evidence reaches the second.
     if (site === 'post-evidence result') f.readCarry = () => ({ step: 'pending' });
     f.readEvidence = vi.fn(() => evidence({ carry: { step: 'done' } }));
-    expect(decide(f)).toMatchObject({ action: 'skip', why: 'red-team result already on head', settle: 'result' });
+    expect(decide(f)).toMatchObject({ action: 'skip', why: 'red-team result already on head', escalate: true });
     expect(f.readEvidence).toHaveBeenCalledTimes(site === 'early result' ? 0 : 1);
   });
 
@@ -603,36 +409,23 @@ describe('runner settles pending without dispatch', () => {
     const o = notOwedRunFixture(); o.rawPrs[0].labels.push(label); mod.runRedTeamOnSkip(o);
     expect(o.settlePending).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled();
   });
-  it.each([false, true])('a result (confirmed break=%s) synchronizes labels only', confirmed => {
-    const o = resultRunFixture({}, confirmed ? 'changes' : 'accept'); o.rawPrs[0].comments.push(resultComment(confirmed));
-    expect(redTeamForHead(o.rawPrs[0].comments, pr, head)?.findings).toHaveLength(confirmed ? 1 : 0);
-    const labels = [];
-    o.syncLabels = vi.fn(key => {
-      labels.push(planRedTeamStatusLabels({ ...key, labels: o.rawPrs[0].labels,
-        comments: o.rawPrs[0].comments, evidence: key.evidence, env: { WE_RED_TEAM_CONFIRMED_BREAKS: 'broken=send-back' }, standingRuling: null }));
-    });
-    mod.runRedTeamOnSkip(o);
-    expect(o.syncLabels).toHaveBeenCalledOnce();
-    expect(o.syncLabels).toHaveBeenCalledWith(expect.objectContaining({ repo, pr, head }));
-    expect(labels).toEqual([{ add: confirmed ? 'red-team:blocked' : 'red-team:clear', remove: ['red-team:pending'] }]);
-    expect(o.settlePending).not.toHaveBeenCalled(); expect(o.settle).not.toHaveBeenCalled(); expect(o.dispatch).not.toHaveBeenCalled();
-  });
+
   it.each(['not-owed', 'result'])('dryRun settles nothing for %s', kind => {
     const o = notOwedRunFixture({ dryRun: true }); if (kind === 'result') o.rawPrs[0].comments.push(resultComment());
     mod.runRedTeamOnSkip(o);
     expect(o.settlePending).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled(); expect(o.settle).not.toHaveBeenCalled();
+    expect(o.escalate).not.toHaveBeenCalled();
   });
-  it.each(['escalate', 'syncLabels'])('%s failure is reported in settleError with unchanged why and does not abort the next row', method => {
-    const o = method === 'syncLabels' ? resultRunFixture() : notOwedRunFixture();
-    if (method === 'syncLabels') o.rawPrs[0].comments.push(resultComment());
+  it('escalation failure is reported without aborting the next row', () => {
+    const method = 'escalate';
+    const o = notOwedRunFixture();
     o[method] = vi.fn().mockImplementationOnce(() => { throw Error('settlement offline'); }).mockReturnValue(undefined);
     o.plan.refusals.push({ kind: 'already-reviewed-head', prNumber: pr + 1, headSha: head });
-    o.rawPrs.push({ ...o.rawPrs[0], number: pr + 1, comments: [accept(method === 'syncLabels' ? head : old)] });
-    if (method === 'syncLabels') o.rawPrs[1].comments.push(trusted(`${redTeamMarker(pr + 1, head)}\nRed team not required on this head: card-only diff`));
+    o.rawPrs.push({ ...o.rawPrs[0], number: pr + 1, comments: [accept(old)] });
     const out = mod.runRedTeamOnSkip(o);
     expect(out.rows).toHaveLength(2); expect(out.rows[0].settleError).toBe('settlement offline');
-    expect(out.rows[0].why).toBe(method === 'syncLabels' ? 'red-team result already on head' : 'stored review does not owe a red team');
-    expect(out.rows[1]).toMatchObject({ prNumber: pr + 1, ...(method === 'syncLabels' ? { settle: 'result' } : { escalate: true }) });
+    expect(out.rows[0].why).toBe('stored review does not owe a red team');
+    expect(out.rows[1]).toMatchObject({ prNumber: pr + 1, escalate: true });
     expect(o[method]).toHaveBeenCalledTimes(2);
   });
   it.each(['unreadable comments', 'head moved'])('%s never settles pending or result labels', guard => {
@@ -675,44 +468,6 @@ describe('runner settles pending without dispatch', () => {
   });
 });
 
-describe('audit hardening: checked comments', () => {
-  it('hands the synchronizer freshly checked comments and no cached live state', () => {
-    const o = runFixture({ readEvidence: () => evidence({ loopPayload: payload('accept'), status: { status: 'finished', result: { status: 'ran', comment: 'posted', foldedVerdict: 'accept' } } }) });
-    o.rawPrs[0].comments.push(resultComment());
-    const comments = [...o.rawPrs[0].comments, trusted('🔔 conveyor — newly read status')];
-    o.readComments = vi.fn(() => comments);
-    mod.runRedTeamOnSkip(o);
-    expect(o.syncLabels).toHaveBeenCalledOnce();
-    expect(o.syncLabels.mock.calls[0][0].comments).toBe(comments);
-    expect(o.syncLabels.mock.calls[0][0]).not.toHaveProperty('live');
-  });
-});
-
-
-describe('result settlement requires a fresh recorded verdict', () => {
-  it.each([null, { status: 'finished', result: { comment: 'withheld' } },
-    { status: 'finished', result: { foldedVerdict: 'bogus' } },
-    { status: 'error', result: { foldedVerdict: 'accept' } }])('unknown recorded status %j never synchronizes', status => {
-    const o = runFixture({ readEvidence: () => evidence({ status }) });
-    o.rawPrs[0].comments.push(resultComment());
-    expect(mod.runRedTeamOnSkip(o).rows[0].settleError).toBe('no recorded red-team verdict; label unchanged');
-    expect(o.syncLabels).not.toHaveBeenCalled(); expect(o.settlePending).not.toHaveBeenCalled();
-  });
-  it.each([false, true])('a withheld changes result cannot clear pending (new confirmed break=%s)', confirmed => {
-    const status = { status: 'finished', result: { foldedVerdict: 'changes', comment: 'withheld' } };
-    const o = runFixture({ readEvidence: () => evidence({ status }) });
-    o.rawPrs[0].comments.push(resultComment());
-    if (confirmed) o.rawPrs[0].comments.push(trusted(resultComment(true).body, iso(acceptedAt + 1)));
-    const plans = [];
-    o.syncLabels.mockImplementation(input => plans.push(planRedTeamStatusLabels({ ...input,
-      labels: o.rawPrs[0].labels, standingRuling: null })));
-    mod.runRedTeamOnSkip(o);
-    expect(o.syncLabels).toHaveBeenCalledTimes(confirmed ? 1 : 0);
-    expect(plans).toEqual(confirmed ? [{ add: 'red-team:blocked', remove: ['red-team:pending'] }] : []);
-  });
-});
-
-
 describe('not-owed removal requires acceptance provenance', () => {
   const context = 'red-team:pending kept: not-owed review lacks acceptance provenance; needs a human look';
   it.each(['unaccepted', 'different head', 'needs-human', 'changes', 'reject'])(
@@ -745,25 +500,6 @@ describe('not-owed removal requires acceptance provenance', () => {
 describe('settlement requires a proven accepting comment', () => {
   const falseAccept = () => trusted(`🔁 review — changes requested
 <!-- reviewed-sha: ${head} -->`);
-  it.each(['human hold without acceptance', 'changes marker', 'newer explicit hold before acceptance in array'])(
-    '%s cannot authorize result settlement', kind => {
-      const o = resultRunFixture();
-      o.rawPrs[0].comments = kind === 'human hold without acceptance'
-        ? [{ body: 'do not merge', author: { login: 'human-reviewer' }, createdAt: iso(acceptedAt) }]
-        : kind === 'changes marker' ? [falseAccept()]
-          : [trusted('🔁 review — changes requested', iso(acceptedAt + 1)), accept()];
-      o.rawPrs[0].comments.push(resultComment());
-      const row = mod.runRedTeamOnSkip(o).rows[0];
-      expect(row.settleError).toBe('no proven acceptance for this head; label unchanged');
-      expect(o.syncLabels).not.toHaveBeenCalled(); expect(o.settlePending).not.toHaveBeenCalled();
-      expect(o.rawPrs[0].labels).toContain('red-team:pending');
-    });
-  it.each([['red-team:pending'], ['review:accepted', 'red-team:pending', {}]])(
-    'unaccepted or unreadable labels %j cannot authorize result settlement', labels => {
-      const o = resultRunFixture(); o.rawPrs[0].labels = labels; o.rawPrs[0].comments.push(resultComment());
-      expect(mod.runRedTeamOnSkip(o).rows[0].settleError).toBeTruthy();
-      expect(o.syncLabels).not.toHaveBeenCalled(); expect(o.settlePending).not.toHaveBeenCalled();
-    });
   it('a changes-requested reviewed-sha marker cannot authorize policy-clear or pending removal', () => {
     const status = { status: 'finished', result: 'not-owed' };
     const o = runFixture({ readEvidence: () => evidence({ loopPayload: payload('accept'), status }), readStatus: () => status });
@@ -792,59 +528,6 @@ describe('pending soak always replays recovery availability', () => {
   });
 });
 
-describe('a clean-shaped red-team comment recording a non-accept verdict never clears', () => {
-  it.each(['needs-human', 'changes', 'prevention-outstanding'])('recorded verdict %s beside an older accepting status does not synchronize', verdict => {
-    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: payload('accept'), recorded: false, seatRecorded: false,
-      status: { status: 'finished', result: { status: 'ran', comment: 'posted', foldedVerdict: 'accept' } } })) });
-    const advisory = "Advisory only: this comment changes no label itself; the red-team gate (setting `redTeam.confirmedBreaks`) sends a confirmed broken break back to the fixer. Head `"
-      + head.slice(0, 12) + '` \u00b7 red team ';
-    o.rawPrs[0].comments.push({ author: { login: 'web-everything' }, createdAt: iso(acceptedAt + 5),
-      body: `${redTeamMarker(pr, head)}\n### Post-accept red team \u2014 no break found\n\n${advisory}codex/m \u00b7 recorded verdict \`${verdict}\`.\n\nThe red team tried to break this change and reported nothing.` });
-    mod.runRedTeamOnSkip(o);
-    expect(o.syncLabels).not.toHaveBeenCalled();
-  });
-});
-
-describe('zero-padded PR numbers in markers are still validated', () => {
-  it('a padded-marker comment with an indented confirmed break blocks an older clean result from clearing', () => {
-    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: payload('accept'), recorded: false, seatRecorded: false,
-      status: { status: 'finished', result: { status: 'ran', comment: 'posted', foldedVerdict: 'accept' } } })) });
-    o.rawPrs[0].comments.push(resultComment(), { author: { login: 'web-everything' }, createdAt: iso(acceptedAt + 5),
-      body: `<!-- we:red-team-advisory pr=0${pr} rev=${head} -->\nRed team not required on this head: x\n  1. [**confirmed**] (edge-case, broken) \u2014 hidden` });
-    mod.runRedTeamOnSkip(o);
-    expect(o.syncLabels).not.toHaveBeenCalled();
-  });
-});
-
-describe('head movement at the synchronizer is refused', () => {
-  it('a new head observed at the write-time read never gets the previous head\'s clear', () => {
-    let reads = 0;
-    const provider = { readPrState: vi.fn(() => ({ headRefOid: ++reads > 1 ? 'b'.repeat(40) : head, labels: ['review:accepted', 'red-team:pending'], comments: [] })),
-      readComments: vi.fn(() => []), ensureLabel: vi.fn(), setLabels: vi.fn() };
-    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: payload('accept'), recorded: false, seatRecorded: false,
-      status: { status: 'finished', result: { status: 'ran', comment: 'posted', foldedVerdict: 'accept' } } })), provider });
-    o.syncLabels = input => input.provider.setLabels(repo, pr, { add: 'red-team:clear', remove: ['red-team:pending'] });
-    o.rawPrs[0].comments.push(resultComment());
-    const row = mod.runRedTeamOnSkip(o).rows[0];
-    expect(provider.setLabels).not.toHaveBeenCalled();
-    expect(row.settleError).toMatch(/head moved/);
-  });
-});
-
-describe('malformed label entries at the synchronizer are refused', () => {
-  it.each([{}, null, 7, { name: 5 }])('a later read containing the label entry %j never authorises the clear', bad => {
-    let reads = 0;
-    const provider = { readPrState: vi.fn(() => ({ headRefOid: head, labels: ++reads > 1 ? ['review:accepted', 'red-team:pending', bad] : ['review:accepted', 'red-team:pending'], comments: [] })),
-      readComments: vi.fn(() => []), ensureLabel: vi.fn(), setLabels: vi.fn() };
-    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: payload('accept'), recorded: false, seatRecorded: false,
-      status: { status: 'finished', result: { status: 'ran', comment: 'posted', foldedVerdict: 'accept' } } })), provider });
-    o.syncLabels = input => input.provider.setLabels(repo, pr, { add: 'red-team:clear', remove: ['red-team:pending'] });
-    o.rawPrs[0].comments.push(resultComment());
-    mod.runRedTeamOnSkip(o);
-    expect(provider.setLabels).not.toHaveBeenCalled();
-  });
-});
-
 describe('policy-clear needs a proven acceptance even without a pending label', () => {
   it('a changes-requested comment carrying a reviewed-sha marker never authorises the clear action', () => {
     const f = notOwedFixture();
@@ -860,13 +543,12 @@ describe('policy-clear needs a proven acceptance even without a pending label', 
 
 
 describe.each(['readWitness', 'readEvidence'])('unfinished review holds through %s', reader => {
-  it.each([false, true])('publishes one needs-you note per head across two ticks (posted result=%s)', posted => {
+  it('publishes one needs-you note per head across two ticks', () => {
     const dir = mkdtempSync(join(tmpdir(), 'unfinished-review-hold-'));
     try {
       const publishNeedsYou = vi.fn(), postComment = vi.fn();
-      const o = posted ? resultRunFixture() : runFixture();
+      const o = runFixture();
       o.env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
-      if (posted) o.rawPrs[0].comments.push(resultComment());
       o[reader] = vi.fn(() => ({ ok: false, reason: 'review-unfinished' }));
       o.escalate = vi.fn(({ why, ...key }) => settleRedTeamSkip({ ...key,
         redTeam: { status: 'skipped', reason: why }, io: { env: o.env, publishNeedsYou, postComment } }));
@@ -894,27 +576,76 @@ describe.each(['readWitness', 'readEvidence'])('unfinished review holds through 
 });
 
 describe('write-time guard also requires acceptance and covers the policy-clear action', () => {
-  const guarded = labelsOnWrite => {
-    let reads = 0;
-    const provider = { readPrState: vi.fn(() => ({ headRefOid: head, labels: ++reads > 1 ? labelsOnWrite : ['review:accepted', 'red-team:pending'], comments: [] })),
-      readComments: vi.fn(() => []), ensureLabel: vi.fn(), setLabels: vi.fn() };
-    return provider;
-  };
-  it.each([[['red-team:pending']], [['review:accepted', 'red-team:pending', 'red-team:blocked']]])('result settle refuses at write time with labels %j', labels => {
-    const provider = guarded(labels);
-    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: payload('accept'), recorded: false, seatRecorded: false,
-      status: { status: 'finished', result: { status: 'ran', comment: 'posted', foldedVerdict: 'accept' } } })), readIgnorableConfirms: () => [], provider });
-    o.syncLabels = input => input.provider.setLabels(repo, pr, { add: 'red-team:clear', remove: ['red-team:pending'] });
-    o.rawPrs[0].comments.push(resultComment());
-    mod.runRedTeamOnSkip(o);
-    expect(provider.setLabels).not.toHaveBeenCalled();
+  function clearFixture(writeState) {
+    const good = { headRefOid: head, labels: ['review:accepted', 'red-team:pending'] };
+    let state = good;
+    const provider = { readPrState: vi.fn(() => state), setLabels: vi.fn() };
+    const status = { status: 'finished', result: 'not-owed' };
+    const o = runFixture({ provider,
+      readEvidence: () => evidence({ loopPayload: payload('accept'), status }), readStatus: () => status });
+    o.syncLabels = vi.fn(input => {
+      if (writeState) state = writeState;
+      input.provider.setLabels(repo, pr, { add: 'red-team:clear', remove: ['red-team:pending'] });
+    });
+    return { o, provider };
+  }
+  it('a proven policy-clear reaches clear and supplies a guarded provider to synchronization', () => {
+    const { o, provider } = clearFixture();
+    expect(mod.runRedTeamOnSkip(o).rows[0].action).toBe('clear');
+    expect(o.settle).toHaveBeenCalledOnce(); expect(o.syncLabels).toHaveBeenCalledOnce();
+    expect(o.syncLabels.mock.calls[0][0].provider).not.toBe(provider);
+    expect(provider.setLabels).toHaveBeenCalledWith(repo, pr, { add: 'red-team:clear', remove: ['red-team:pending'] });
   });
-  it.each([[['red-team:pending']], [['review:accepted', 'red-team:pending', 'red-team:blocked']]])('the policy-clear action refuses at write time with labels %j', labels => {
-    const provider = guarded(labels);
-    const f = notOwedFixture();
-    const o = runFixture({ ...f, now: () => f.now, provider });
-    o.syncLabels = input => input.provider.setLabels(repo, pr, { add: 'red-team:clear', remove: ['red-team:pending'] });
-    mod.runRedTeamOnSkip(o);
+  it.each([
+    ['acceptance removed', { headRefOid: head, labels: ['red-team:pending'] }],
+    ['blocked label added', { headRefOid: head, labels: ['review:accepted', 'red-team:pending', 'red-team:blocked'] }],
+    ['review hold added', { headRefOid: head, labels: ['review:accepted', 'red-team:pending', 'review:changes'] }],
+    ['malformed labels', { headRefOid: head, labels: ['review:accepted', 'red-team:pending', {}] }],
+    ['head moved', { headRefOid: old, labels: ['review:accepted', 'red-team:pending'] }],
+  ])('a policy-clear reaching the write-time guard refuses %s', (_name, writeState) => {
+    const { o, provider } = clearFixture(writeState);
+    const row = mod.runRedTeamOnSkip(o).rows[0];
+    expect(o.settle).toHaveBeenCalledOnce(); expect(o.syncLabels).toHaveBeenCalledOnce();
     expect(provider.setLabels).not.toHaveBeenCalled();
+    expect(row).toMatchObject({ action: 'skip', why: expect.stringMatching(/^clear failed: .*label unchanged$/) });
+    expect(o.dispatch).not.toHaveBeenCalled(); expect(o.settlePending).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('posted red-team results retain pending and escalate', () => {
+  const context = 'red-team result already on head but red-team:pending is still set; the drain/job label sync did not settle it';
+  it.each([false, true])('a posted result (confirmed break=%s) publishes one needs-you note across two ticks', confirmed => {
+    const dir = mkdtempSync(join(tmpdir(), 'posted-result-hold-'));
+    try {
+      const publishNeedsYou = vi.fn(), postComment = vi.fn();
+      const o = runFixture({ env: { WE_SHARED_RUNS_DIR: join(dir, 'runs') } });
+      o.rawPrs[0].comments.push(resultComment(confirmed));
+      o.escalate = vi.fn(({ why, ...key }) => settleRedTeamSkip({ ...key,
+        redTeam: { status: 'skipped', reason: why }, io: { env: o.env, publishNeedsYou, postComment } }));
+      for (let tick = 0; tick < 2; tick++) {
+        const row = mod.runRedTeamOnSkip(o).rows[0];
+        expect(row).toMatchObject({ action: 'skip', why: 'red-team result already on head', escalate: true, escalationContext: context });
+        expect(row).not.toHaveProperty('settle');
+        expect(o.rawPrs[0].labels).toContain('red-team:pending');
+      }
+      expect(publishNeedsYou).toHaveBeenCalledOnce(); expect(o.escalate).toHaveBeenCalledTimes(2);
+      expect(o.syncLabels).not.toHaveBeenCalled(); expect(o.settlePending).not.toHaveBeenCalled();
+      expect(o.settle).not.toHaveBeenCalled(); expect(o.dispatch).not.toHaveBeenCalled(); expect(postComment).not.toHaveBeenCalled();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each([[], ['review:accepted'], undefined, null].map(labels => [labels]))('a result without known pending labels %j has no side effects', labels => {
+    const o = runFixture(); o.rawPrs[0].labels = labels; o.rawPrs[0].comments.push(resultComment());
+    const row = mod.runRedTeamOnSkip(o).rows[0];
+    expect(row).toMatchObject({ action: 'skip', why: 'red-team result already on head' });
+    expect(row).not.toHaveProperty('settle'); expect(row).not.toHaveProperty('escalate');
+    expect(o.escalate).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled();
+    expect(o.settlePending).not.toHaveBeenCalled(); expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it('object-shaped pending labels also escalate', () => {
+    const o = runFixture(); o.rawPrs[0].labels = [{ name: 'red-team:pending' }];
+    o.rawPrs[0].comments.push(resultComment());
+    expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ escalate: true, escalationContext: context });
+    expect(o.escalate).toHaveBeenCalledOnce(); expect(o.syncLabels).not.toHaveBeenCalled();
   });
 });

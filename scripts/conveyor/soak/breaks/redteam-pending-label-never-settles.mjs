@@ -106,8 +106,11 @@ export default {
         readEvidence: () => evidence({ recorded: true, status: { status: 'finished',
           result: { status: 'ran', comment: 'posted', foldedVerdict: 'accept' } } }),
       });
-      effects(posted, { sync: 1 });
-      check(posted.row?.settle === 'result' && posted.calls.sync[0]?.head === head, 'posted result did not synchronize this head');
+      effects(posted, { escalate: 1 });
+      check(posted.row?.action === 'skip' && posted.row?.why === 'red-team result already on head'
+        && posted.row?.escalate === true && !posted.row?.settle
+        && posted.row?.escalationContext === 'red-team result already on head but red-team:pending is still set; the drain/job label sync did not settle it'
+        && posted.raw.labels.includes('red-team:pending'), 'posted result changed labels instead of escalating its pending hold');
 
       const needsReview = () => evidence({ loopPayload: undefined });
       const selfBlock = replay('pending self-block on head needing review', { readEvidence: needsReview });
