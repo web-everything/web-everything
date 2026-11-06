@@ -40,7 +40,7 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2
 
 Deliver all three guards together: scanner plus gate wiring and reviewed exceptions; shared extraction plus scoped caller migration; real-CLI markdown contract tests and any necessary brief corrections. The named shared consumer test covers every migrated source entry in scope, while the scanner integration test covers both standards modules and the markdown test covers the brief. Keep CLI production code unchanged; existing parser behavior is the contract being tested. No changes to CI gate policy, persisted completion schema, or unrelated operational flows.
 
-## Acceptance
+## Done when
 
 Each Executable line names a focused test file to run through the host heavy-admission wrapper with `run -- npx vitest run` and that file's repository-relative path. Repository prefixes below identify paths, not literal argv prefixes. Each acceptance guarantee must have red-before/green-after evidence from its changed-behavior case or a targeted defect mutation; preserved-behavior regression controls may already pass before implementation. Use mutation fixtures to demonstrate that a guard rejects the original defect.
 
@@ -86,6 +86,18 @@ The implementation must record each reader's concrete expected fixture value in 
 - `we:scripts/lib/__tests__/rollup-collapse-order.test.mjs` — “nameless rows retain distinct singleton groups”: two different rows lacking both name and context survive as two distinct original objects, alongside one collapsed named group; assert output length 3 and both nameless references, without a shared empty-string group.
 
 New context-required and queue raw-fold cases supply A4's failing-before/passing-after evidence. Existing ordering, precedence and non-pass controls may already pass before the build; demonstrate their sensitivity with targeted mutations (reverse ordering, coalesce nameless keys, or treat missing/unknown as success) and record the named failing case. Do not claim every regression control fails on unchanged production code.
+
+## Edge cases this change must handle
+
+One line per class: either the handling, or `n/a: <why>`.
+
+1. **Untrusted text** — n/a: no new free text reaches a shell or path; the contract test passes brief templates as inert argv (A5 "template shell metacharacters remain inert argv").
+2. **Truncated reads** — the scanner fails closed on discovery/read/parse errors (A2); no new `gh` read is added.
+3. **Shared state files** — n/a: the only persisted state touched is the planner snapshot key, handled by A6 with a one-time miss; no new writer.
+4. **Fail closed** — unreadable source, stale/duplicate exception selector, missing brief or zero extracted commands is a nonzero result with a named reason (A2, A5, A7).
+5. **Identity scoping** — check identity stays scoped by the existing head sha and row kind; the shared helper changes only name-or-context extraction (A3, A4, A6).
+6. **State over time** — an older failure followed by a newer success of the same identity is superseded in both input orders; the old empty-name snapshot key misses once, then hits (A4, A6).
+7. **Who wrote it** — a context-only (StatusContext) row can be written by any actor with status access, so the shared `checkName` helper must never by itself let such a row satisfy a required name. Each migrated verdict reader keeps its existing head-sha and provenance requirements (author/app or creator source) and only the identity string changes; the A3 "context-only and empty-name identities match the named fixture" case holds those provenance fields constant, and a context-only row with a foreign or missing source must still not satisfy a required check wherever the reader checked source before.
 
 ## Test plan
 
