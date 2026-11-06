@@ -606,10 +606,42 @@ describe('R639 present-verdict check, capped-scan settlement through the complet
       expect(settle(evidence)).toMatchObject({ ok: false, reason: 'scan-capped' });
       expect(holdFor(evidence, [comment()])).toMatch(/evidence unknown/);
     });
-    it('records with no read-step start are ordered by mtime', () => {
+    it('a record with no read-step start cannot be ordered (mtime moves on a rewrite): its rejection holds, its accept supersedes nothing', () => {
       const bare = extra => rec({ withStart: false, ...extra });
-      expect(settle(behind(bare(changes), bare(accept)))).toMatchObject({ ok: true });
+      expect(settle(behind(bare(changes), bare(accept)))).toMatchObject({ ok: false, reason: 'scan-capped' });
       expect(settle(behind(bare(accept), bare(changes)))).toMatchObject({ ok: false, reason: 'scan-capped' });
+      // a late-touched start-less accept does not erase a started rejection; a start-less accept beside an accept is harmless
+      expect(settle(behind(rec({ startedAt: T - 5 * HOUR, ...changes }), bare(accept), { newerMtime: T - 10e3 }))).toMatchObject({ ok: false, reason: 'scan-capped' });
+      expect(settle(behind(rec({ startedAt: T - 5 * HOUR, ...accept }), bare(accept)))).toMatchObject({ ok: true });
+    });
+    it('a start in the future cannot order a record: an accept stamped 2999 does not supersede a rejection', () => {
+      const future = new Date('2999-01-01T00:00:00Z').getTime();
+      expect(settle(behind(rec({ startedAt: T - 6 * HOUR, ...changes }), rec({ startedAt: future, ...accept })))).toMatchObject({ ok: false, reason: 'scan-capped' });
+      expect(settle(behind(rec({ startedAt: future, ...changes }), rec({ startedAt: T - 5 * HOUR, ...accept })))).toMatchObject({ ok: false, reason: 'scan-capped' });
+    });
+    it('a rewound-and-resumed rejection is ordered by its resume stamp, not its original start', () => {
+      // R1 read-started first but resumed (and finished) AFTER the accept started: the rejection is the newest.
+      const resumed = rec({ startedAt: T - 7 * HOUR, resumeOf: 'review-pr-x', resumedAt: new Date(T - 4 * HOUR).toISOString(), ...changes });
+      expect(settle(behind(resumed, rec({ startedAt: T - 5 * HOUR, ...accept })))).toMatchObject({ ok: false, reason: 'scan-capped' });
+      expect(settle(behind(rec({ ...resumed, resumedAt: new Date(T - 6 * HOUR).toISOString() }), rec({ startedAt: T - 5 * HOUR, ...accept })))).toMatchObject({ ok: true });
+      expect(settle(behind(rec({ ...resumed, resumedAt: 'garbage' }), rec({ startedAt: T - 5 * HOUR, ...accept })))).toMatchObject({ ok: false, reason: 'scan-capped' });
+    });
+    it('an unread rewound-and-resumed review with no verdict holds however quiet it is (the loop may still reject)', () => {
+      for (const extra of [{ resumeOf: 'review-pr-x' }, { resumedAt: new Date(T - 4 * HOUR).toISOString() }, { verdict: { verdict: 'needs-human' }, resumeOf: 'review-pr-x' }]) {
+        expect(settle(reader({ ...decoys(T - 5 * HOUR), 'review-pr-hidden': { mtime: T - 5 * HOUR, run: rec(extra) } }))).toMatchObject({ ok: false, reason: 'scan-capped' });
+      }
+    });
+    it('a malformed verdict on a terminal old record is not dropped as abandoned: the bounded scan and the complete read agree it is decided', () => {
+      for (const verdict of [false, 0, '']) {
+        const evidence = reader({ 'review-pr-1': { mtime: T - 5 * HOUR, run: rec({ verdict, effects: [] }) } });
+        expect(evidence).toMatchObject({ ok: false, reason: 'review-unfinished' });
+        expect(settle(evidence)).toMatchObject({ ok: false, reason: 'review-unfinished' });
+      }
+    });
+    it('an unrecognised verdict STRING (case, whitespace, another word) is hard, not a supersedable rejection', () => {
+      for (const verdict of ['Accept', 'accept ', 'rejected', 'bogus', 'reject', 'CHANGES']) {
+        expect(settle(behind(rec({ startedAt: T - 6 * HOUR, verdict }), rec({ startedAt: T - 5 * HOUR, ...accept })))).toMatchObject({ ok: false, reason: 'scan-capped' });
+      }
     });
     it('a tie on the order key keeps the rejection (fail closed)', () => {
       const same = extra => rec({ startedAt: T - 6 * HOUR, ...extra });

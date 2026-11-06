@@ -96,7 +96,9 @@ const settleKind = run => {
   if (typeof verdict !== 'string' || verdict === '') return 'hard';
   if (verdict === 'needs-human') return 'undecided';
   if (ACCEPT_VERDICTS.includes(verdict)) return run.pending != null ? 'undecided' : 'accept';
-  return run.pending != null ? 'hard' : 'reject';
+  // Only the one rejection this pipeline records is a supersedable rejection; any other string ('Accept ', 'rejected',
+  // 'bogus') is a shape this reader does not recognise and fails closed like a non-string one.
+  return verdict === 'changes' && run.pending == null ? 'reject' : 'hard';
 };
 // What the complete read keeps of a record: never its payload. Cached per (read function, dir, id) with the mtime and
 // size it was read at, so a settle attempt that keeps holding does not re-parse the whole store every tick; a rewrite
@@ -108,15 +110,19 @@ const summaryCache = new WeakMap();
 const strictPr = value => (Number.isSafeInteger(value) && value > 0 ? value : typeof value === 'string' && /^[1-9]\d*$/.test(value.trim()) ? Number(value.trim()) : NaN);
 const cleanRev = value => (typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value) ? value.toLowerCase() : null);
 const summarizeRun = run => ({ review: run?.op === 'review-pr', repo: typeof run?.input?.repo === 'string' ? run.input.repo.trim().toLowerCase() : undefined,
-  pr: strictPr(run?.input?.pr), rev: cleanRev(run?.findings?.read?.netBasis?.rev), kind: settleKind(run), startedAt: reviewStartedAt({ run }) });
+  pr: strictPr(run?.input?.pr), rev: cleanRev(run?.findings?.read?.netBasis?.rev), kind: settleKind(run),
+  // Order key: the read start, or the resume stamp when later (a rewound run finishes after it resumes); NaN when unreadable.
+  orderAt: unfinishedSince(run), resumed: run?.resumeOf != null || run?.resumedAt != null });
 // R622: settlement needs a COMPLETE same-PR, same-head read. Run ids carry no PR, so this parses every review-pr
 // record (no parse cap: the bounded scan cannot vouch for what it did not read) and keeps only the summary. Over the
 // records of this PR whose head is this head (or whose head cannot be read):
 //  - a `hard` record (open label effect, pending rejection, unrecognised verdict) holds, as does any head-less
 //    blocking record, whose place among the heads cannot be ordered;
 //  - an undecided record still inside the abandon horizon (a review that may be running) holds;
+//  - an undecided record that was rewound and resumed holds (the loop may still reject);
 //  - otherwise only the NEWEST completed same-head review decides: a finished rejection holds while it is the newest,
-//    and a later completed accept of the same head supersedes it. Newest is by read-step start, else by record mtime.
+//    and a later completed accept of the same head supersedes it. Newest is by read-step start (or resume stamp when later);
+//    a record whose start is unreadable or in the future cannot be ordered: a rejection of that kind holds, an accept supersedes nothing.
 // Any record that cannot be listed, statted, read or attributed to a PR fails closed.
 function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now }) {
   const incomplete = { complete: false, blocked: false };
@@ -142,14 +148,18 @@ function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now }
       if (s.rev !== null && s.rev !== want) continue;
       if (s.kind === 'hard') return { complete: true, blocked: true };
       if (s.kind === 'undecided') {
-        if (!(now - st.mtimeMs >= ABANDONED_REVIEW_AFTER_MS)) return { complete: true, blocked: true }; // maybe still running
+        // maybe still running, or a rewound run the review loop will resume (which may still reject): holds
+        if (s.resumed || !(now - st.mtimeMs >= ABANDONED_REVIEW_AFTER_MS)) return { complete: true, blocked: true };
         continue;
       }
-      if (s.rev === null) { // a damaged head cannot be ordered among the heads: a rejection of it holds, an accept proves nothing
+      // Order only on a readable start that is not in the future. A rejection that cannot be ordered holds; an accept
+      // that cannot be ordered proves nothing (mtime is only an upper bound on a start and moves on a rewrite).
+      const orderable = s.rev !== null && Number.isFinite(s.orderAt) && s.orderAt <= now + RUN_MTIME_SLACK_MS;
+      if (!orderable) {
         if (s.kind === 'reject') return { complete: true, blocked: true };
         continue;
       }
-      const at = Number.isFinite(s.startedAt) ? s.startedAt : st.mtimeMs; // a tie keeps the rejection: fail closed
+      const at = s.orderAt; // a tie keeps the rejection: fail closed
       const rejects = s.kind === 'reject';
       if (!newest || at > newest.at) newest = { at, rejects };
       else if (at === newest.at) newest.rejects ||= rejects;
@@ -166,7 +176,7 @@ export const RUN_MTIME_SLACK_MS = 2000;
 // unfinished review. A run waiting on a pending step or effect is never abandoned, however old, and
 // neither is a rewound resume (`resumeOf`): the review loop resumes that run, which may still reject.
 export const ABANDONED_REVIEW_AFTER_MS = 60 * 60 * 1000;
-const abandonedReview = (hit, now) => !hit.run.verdict && hit.run.resumeOf == null && isRunRecordTerminal(hit.run)
+const abandonedReview = (hit, now) => !hasVerdict(hit.run) &&hit.run.resumeOf == null && isRunRecordTerminal(hit.run)
   && now - hit.at >= ABANDONED_REVIEW_AFTER_MS;
 const TIE_ORDERS = ['id-asc', 'id-desc'];
 // R622: the times a result comment must beat to settle unknown evidence. Non-enumerable, so every existing
