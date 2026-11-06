@@ -20,7 +20,7 @@ export default {
   fixPresent(root) {
     try {
       const hold = readFileSync(join(root, HOLD), 'utf8');
-      return hold.includes('export function refusedReferralsAreRuled') && hold.includes('LIVE_REASON_TOKENS.has(key)')
+      return hold.includes('export function refusedReferralsAreRuled') && hold.includes('run.pending.filter(key => !PENDING_REASON_TOKENS.has(key))')
         && readFileSync(join(root, LOOP), 'utf8').includes('parkedEvidence?.referralStageRefused');
     } catch { return false; }
   },
