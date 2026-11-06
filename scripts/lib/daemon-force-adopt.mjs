@@ -228,6 +228,18 @@ export function declareForceCarry({ root, env = process.env, fromSha, toSha = nu
   try { writeJson(watchPath(root, env), toSha ? { ...rest, carryTo: toSha } : rest); return true; } catch { return false; }
 }
 
+/** Move a watch that declared `carryTo` onto that successor: same last-good, ticks left and owed-rollback marker (on disk and in memory),
+ *  intent cleared. The ONE rebind path for every tick site that finds HEAD on the declared successor. Returns the moved watch. */
+function rebindToCarry(root, env, watch) {
+  const { carryTo, ...rest } = watch;
+  const moved = { ...rest, sha: carryTo };
+  const p = watchPath(root, env);
+  const pending = pendingRollbacks.get(p);
+  if (pending && pending.sha === watch.sha) pendingRollbacks.set(p, { ...pending, sha: carryTo, watch: { ...pending.watch, sha: carryTo } });
+  try { writeJson(p, moved); } catch { /* the next tick re-derives it; an owed rollback is still kept in memory above */ }
+  return moved;
+}
+
 /** PURE. One watch tick: fail closed on a failed health check or a crash loop, else count down. */
 export function evaluateForceWatch({ watch, healthy, restarts = 0, maxRestarts = FORCE_ADOPT_MAX_RESTARTS }) {
   // A rollback that already failed stays mandatory: a later healthy probe must not forget it and count the watch down.
@@ -261,11 +273,7 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   const persist = (w) => { try { writeJson(watchPath(root, env), w); } catch { /* the next tick re-derives it */ } };
   // An unsmoked successor adoption declared this move (`carryTo`) before it reset HEAD: HEAD on that successor is the SAME watched
   // code, not a superseding build, so rebind to it here (the adopting process's own carry may not have run yet, or may have died).
-  if (watch.carryTo && head !== null && head === watch.carryTo) {
-    const { carryTo, ...rest } = watch;
-    watch = { ...rest, sha: carryTo };
-    persist(watch);
-  }
+  if (watch.carryTo && head !== null && head === watch.carryTo) watch = rebindToCarry(root, env, watch);
   const expire = async () => {
     // The forced build never became head. Its ready candidate never passed smoke, so drop it too: left behind, a later
     // write-lock holder would adopt it with no health watch.
@@ -309,6 +317,10 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   // healthy result says nothing about it (no countdown, no false "passed") and an unhealthy one owes no revert.
   const second = first.unreadable ? first : readHead();
   const headNow = second.head;
+  // A skip-unrelated successor may have been adopted while the probe ran (intent declared, HEAD reset, the adopter's own carry not
+  // yet run): HEAD on the DECLARED successor is the same watched code, so the watch follows it (keeping any owed rollback) instead
+  // of being closed as superseded. The probe judged the old head, so this tick neither counts down nor rolls back.
+  if (watch.carryTo && headNow !== null && headNow === watch.carryTo) { rebindToCarry(root, env, watch); return { action: 'none' }; }
   if (headNow !== null && headNow !== watch.sha) {
     clearWatch(root, env);
     await emit?.({ kind: 'force-adopt-watch-superseded', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, head: headNow } });
@@ -343,6 +355,10 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   try { result = await rollback(watch.lastGood, { sha: watch.sha }); } catch { result = { ok: false }; }
   if (!sameWatch()) return { action: 'none' }; // another tick closed (or replaced) this watch during the rollback: it owns the outcome
   if (result?.superseded === true) {
+    // The head the rollback found is the DECLARED successor of an unsmoked adoption: the same code, so the watch (and any owed
+    // rollback) follows it. Re-read the record: the intent may have been declared after our snapshot.
+    const cur = currentWatch(root, env);
+    if (cur?.carryTo && result.head && cur.carryTo === result.head) { rebindToCarry(root, env, cur); return { action: 'none' }; }
     // A superseding build was adopted while the probe/rollback ran: it is running, the watched build is not, so there is nothing
     // to revert. Close the watch without touching the newer build. The forced build's own ready record (never adopted, so never
     // watched again) goes too: left behind, a later write-lock holder would adopt it with no health watch.

@@ -274,6 +274,55 @@ describe('carryForceWatch: a successor adopted without its own smoke inherits th
     expect(w.carryTo).toBeUndefined();
     expect(await carryForceWatch({ root, env, fromSha: 'b'.repeat(40), toSha: 'd'.repeat(40) })).toBe(true); // the late carry is a no-op, not a failure
   });
+  it('a successor adopted WHILE the health probe runs (intent declared, HEAD moved) keeps the watch: rebound onto it, never closed as superseded', async () => {
+    await rec();
+    await runForceWatchTick({ root, env, currentHead: 'b'.repeat(40), probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async () => {} });
+    let head = 'b'.repeat(40);
+    const events = [];
+    const r = await runForceWatchTick({ root, env, currentHead: () => head, rollback: async () => ({ ok: true }), emit: async (e) => { events.push(e.kind); },
+      probe: async () => { declareForceCarry({ root, env, fromSha: 'b'.repeat(40), toSha: 'd'.repeat(40) }); head = 'd'.repeat(40); return { healthy: true }; } });
+    expect(r.action).not.toBe('superseded');
+    expect(events).not.toContain('force-adopt-watch-superseded');
+    const w = readForceWatch(root, env);
+    expect(w).toMatchObject({ sha: 'd'.repeat(40), ticksLeft: 4, lastGood: { head: 'a'.repeat(40) } }); // not counted down: the probe judged the old head
+    expect(w.carryTo).toBeUndefined();
+    expect(await carryForceWatch({ root, env, fromSha: 'b'.repeat(40), toSha: 'd'.repeat(40) })).toBe(true); // the adopter's own late carry is a no-op
+  });
+  it('an owed rollback survives a successor adopted during the probe: the rebound watch still owes the revert', async () => {
+    await rec();
+    await runForceWatchTick({ root, env, currentHead: 'b'.repeat(40), probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async () => {} });
+    let head = 'b'.repeat(40);
+    // Two overlapping ticks on the same build: the first records an owed rollback while the second's probe is still running.
+    await runForceWatchTick({ root, env, currentHead: () => head, rollback: async () => ({ ok: true }), emit: async () => {},
+      probe: async () => {
+        await runForceWatchTick({ root, env, currentHead: () => head, probe: async () => ({ healthy: false }), rollback: async () => ({ ok: false }), emit: async () => {} });
+        declareForceCarry({ root, env, fromSha: 'b'.repeat(40), toSha: 'd'.repeat(40) });
+        head = 'd'.repeat(40);
+        return { healthy: true };
+      } });
+    expect(readForceWatch(root, env)).toMatchObject({ sha: 'd'.repeat(40), rollbackPending: 'health-failed' });
+  });
+  it('a successor adopted WHILE the rollback waits for the clone lock (rollback reports superseded onto the declared successor) keeps the watch on it', async () => {
+    await rec();
+    await runForceWatchTick({ root, env, currentHead: 'b'.repeat(40), probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async () => {} });
+    const events = [];
+    const r = await runForceWatchTick({ root, env, currentHead: () => 'b'.repeat(40), probe: async () => ({ healthy: false }), emit: async (e) => { events.push(e.kind); },
+      rollback: async () => { declareForceCarry({ root, env, fromSha: 'b'.repeat(40), toSha: 'd'.repeat(40) }); return { superseded: true, head: 'd'.repeat(40) }; } });
+    expect(r.action).not.toBe('superseded');
+    expect(events).not.toContain('force-adopt-watch-superseded');
+    const w = readForceWatch(root, env);
+    expect(w).toMatchObject({ sha: 'd'.repeat(40), lastGood: { head: 'a'.repeat(40) } });
+    expect(w.carryTo).toBeUndefined();
+  });
+  it('a head that is NOT the declared successor still closes the watch as superseded after the probe', async () => {
+    await rec();
+    await runForceWatchTick({ root, env, currentHead: 'b'.repeat(40), probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async () => {} });
+    let head = 'b'.repeat(40);
+    const r = await runForceWatchTick({ root, env, currentHead: () => head, rollback: async () => ({ ok: true }), emit: async () => {},
+      probe: async () => { declareForceCarry({ root, env, fromSha: 'b'.repeat(40), toSha: 'd'.repeat(40) }); head = 'e'.repeat(40); return { healthy: true }; } });
+    expect(r.action).toBe('superseded');
+    expect(readForceWatch(root, env)).toBeNull();
+  });
   it('a declared intent does not make an unrelated head look carried, and a withdrawn intent is gone', async () => {
     await rec();
     await runForceWatchTick({ root, env, currentHead: 'b'.repeat(40), probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async () => {} });
