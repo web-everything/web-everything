@@ -273,7 +273,13 @@ export function planRedTeamActions(parsed, setting = CONFIRMED_BREAKS_DEFAULTS) 
   const out = { sendBack: [], card: [], advisory: [] };
   const findingClasses = setting.findingClasses ?? readFindingClassPolicy();
   for (const f of parsed?.findings ?? []) {
-    const action = classAction(f, findingClasses) === 'defer-card' ? CONFIRMED_BREAK_ACTIONS.CARD : setting[breakClass(f)] ?? CONFIRMED_BREAK_ACTIONS.ADVISORY;
+    const base = setting[breakClass(f)] ?? CONFIRMED_BREAK_ACTIONS.ADVISORY;
+    const deferred = classAction(f, findingClasses) === 'defer-card';
+    // Class deferral cards only what the re-check confirmed; an unconfirmed finding is never carded by class, and
+    // deferral can only soften its send-back to advisory.
+    const action = !deferred ? base
+      : breakClass(f) !== 'unconfirmed' ? CONFIRMED_BREAK_ACTIONS.CARD
+        : base === CONFIRMED_BREAK_ACTIONS.SEND_BACK ? CONFIRMED_BREAK_ACTIONS.ADVISORY : base;
     if (action === CONFIRMED_BREAK_ACTIONS.SEND_BACK) out.sendBack.push(f);
     else if (action === CONFIRMED_BREAK_ACTIONS.CARD) out.card.push(f);
     else out.advisory.push(f);

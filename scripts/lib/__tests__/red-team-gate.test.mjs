@@ -506,3 +506,31 @@ describe('finding class gate', () => {
     expect(redTeamResultId(classified)).not.toBe(id);
   });
 });
+
+describe('planRedTeamActions: class deferral × confirmed × impact', () => {
+  const deferredClasses = { 'theoretical-race': 'defer-card', 'coverage-or-style': 'defer-card' };
+  const finding = (confirmed, impact, findingClass) => ({ index: 1, confirmed, impact, findingClass, classBasis: 'basis' });
+  const where = (plan, f) => (plan.card.includes(f) ? 'card' : plan.sendBack.includes(f) ? 'sendBack' : 'advisory');
+  const cases = [];
+  for (const findingClass of ['theoretical-race', 'coverage-or-style']) {
+    for (const impact of ['broken', 'degraded']) {
+      cases.push([true, impact, findingClass, 'card']);
+      cases.push([false, impact, findingClass, 'advisory']);
+    }
+  }
+  it.each(cases)('confirmed=%s impact=%s class=%s → %s', (confirmed, impact, findingClass, expected) => {
+    const f = finding(confirmed, impact, findingClass);
+    const setting = { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses: deferredClasses };
+    expect(where(planRedTeamActions({ findings: [f] }, setting), f)).toBe(expected);
+  });
+  it('an unconfirmed deferred-class finding is never carded even if ordinary policy would send back', () => {
+    const f = finding(false, 'broken', 'theoretical-race');
+    const setting = { ...CONFIRMED_BREAKS_DEFAULTS, unconfirmed: 'send-back', findingClasses: deferredClasses };
+    expect(where(planRedTeamActions({ findings: [f] }, setting), f)).toBe('advisory');
+  });
+  it('an unconfirmed finding of a fix-now class follows ordinary policy', () => {
+    const f = finding(false, 'broken', 'live-reproduced');
+    const setting = { ...CONFIRMED_BREAKS_DEFAULTS, unconfirmed: 'send-back', findingClasses: deferredClasses };
+    expect(where(planRedTeamActions({ findings: [f] }, setting), f)).toBe('sendBack');
+  });
+});
