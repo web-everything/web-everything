@@ -10,7 +10,9 @@ import {resolveAdmissionPolicy, resolveRemoteSlotUnits} from '../heavy-admission
 const io=vi.hoisted(()=>({open:vi.fn(),readdir:vi.fn(),writeFile:vi.fn(),rename:vi.fn(),rm:vi.fn(),lstat:vi.fn(),mkdir:vi.fn()}));
 vi.mock('node:fs/promises',async original=>({...await original(),...io}));
 vi.mock('../forge-exec-limits.mjs',async original=>({...await original(),readLimits:vi.fn()}));
-const legacyTelemetry=['activeRuns','cores','loadPerCore','memFreePct','recent','sampledAtET'];
+// The production base document: R518 publishes activeRunIds when two listings agree (the mocked listing is empty and stable).
+// Opt-in fields such as `limits` must never appear in it.
+const legacyTelemetry=['activeRunIds','activeRuns','cores','loadPerCore','memFreePct','recent','sampledAtET'];
 const legacyReceipt=['argvDigest','code','inputDigest','lock','manifestDigest','nonce','phase','resources','run','timings','v'];
 const expected={v:1,nonce:'a'.repeat(32),run:'r-'+'b'.repeat(32),inputDigest:'c'.repeat(64),
   argvDigest:'d'.repeat(64),lock:'e'.repeat(64),manifestDigest:'f'.repeat(64)};
