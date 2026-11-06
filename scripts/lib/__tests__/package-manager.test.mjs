@@ -168,7 +168,7 @@ describe('installArgv / installCommand', () => {
   });
   it('installCommand({frozen}) maps frozen to ci', () => {
     expect(installCommand({ frozen: true, ...none })).toBe('npm ci');
-    expect(installCommand({ frozen: false, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => '9' })).toBe('pnpm install');
+    expect(installCommand({ frozen: false, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => '9' })).toBe('pnpm install --no-frozen-lockfile');
   });
 });
 
