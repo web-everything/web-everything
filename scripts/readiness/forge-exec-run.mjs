@@ -119,6 +119,12 @@ export function elasticRunLimits(limits, slot, units = 1) {
   // An unlimited operator cap stays unlimited when scaled, as TasksMax does.
   if (units > 1 && single.memoryMax !== 'infinity' && !memory) throw new Error('Unreadable slot memory limit');
   const memoryMax = units === 1 || single.memoryMax === 'infinity' ? single.memoryMax : String(BigInt(memory[1]) * BigInt(units)) + memory[2];
+  // A finite scaled memory grant can never exceed a finite parent ceiling (as the CPU grant above).
+  if (units > 1 && memoryMax !== 'infinity' && limits.parent?.memoryMax !== undefined && limits.parent.memoryMax !== 'infinity') {
+    const bytes = text => { const m = /^([1-9]\d*)([KMGT]?)$/.exec(text); return m ? BigInt(m[1]) * 1024n ** BigInt('KMGT'.indexOf(m[2]) + 1) : null; };
+    const parentBytes = bytes(limits.parent.memoryMax);
+    if (parentBytes === null || bytes(memoryMax) > parentBytes) throw new Error('Slot units exceed parent memory limit');
+  }
   return {cpuQuota:cpu+'%',memoryMax,cpus:Math.max(1,Math.ceil(cpu/100)),
     tasksMax:single.tasksMax === 'infinity' ? 'infinity' : single.tasksMax * units,ioWeight:single.ioWeight};
 }
@@ -1157,9 +1163,9 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       const worker=await reserveWorker(run,nonce,slot),record={v:1,nonce,run,...(slotUnits > 1 ? {slotUnits} : {}),
         ...(capabilities?.taskPressure === 1 ? {receiptCapabilities:{taskPressure:1}} : {}),...(worker.active?{slot:worker.user}:{})};
       const prepare=async()=>{
-      if(worker.active)await workerFor(record);
       const container=join(worker.root,run);
       try {
+      if(worker.active)await workerFor(record); // inside the try so a failure releases the reservation
       // Validate the grant against the worker actually reserved (its own slot limits); the catch
       // below releases the reservation, so a rejected grant never leaks a worker or a receipt.
       if (slotUnits > 1 && (!testRoot || testLimits !== undefined)) {

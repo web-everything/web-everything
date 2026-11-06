@@ -264,4 +264,16 @@ describe('R324 elastic remote slot units',()=>{
     expect(elasticRunLimits(limits('512M'),1,3).memoryMax).toBe('1536M');
     expect(()=>elasticRunLimits(limits('bad'),1,3)).toThrow('Unreadable slot memory limit');
   });
+  it('bounds the scaled memory grant by a finite parent memory ceiling',()=>{
+    const limits=(slotMemory,parentMemory)=>({parent:{cpuQuota:'2800%',memoryMax:parentMemory},slot:{cpuQuota:'100%',memoryMax:slotMemory}});
+    // 28 x 12G = 336G passes the CPU check (28 x 100% = 2800%) but exceeds the 56G parent.
+    expect(()=>elasticRunLimits(limits('12G','56G'),1,28)).toThrow('Slot units exceed parent memory limit');
+    expect(elasticRunLimits(limits('12G','56G'),1,4).memoryMax).toBe('48G');
+    expect(elasticRunLimits(limits('12G','56G'),1,1).memoryMax).toBe('12G');        // a single slot is never scaled
+    expect(elasticRunLimits(limits('1G','1024M'),1,1).memoryMax).toBe('1G');
+    expect(()=>elasticRunLimits(limits('1G','1000M'),1,2)).toThrow('Slot units exceed parent memory limit'); // 2G > ~1G across suffixes
+    expect(elasticRunLimits(limits('12G','infinity'),1,28).memoryMax).toBe('336G'); // unlimited parent: nothing to bound
+    expect(elasticRunLimits(limits('infinity','56G'),1,28).memoryMax).toBe('infinity');
+    expect(()=>elasticRunLimits(limits('12G','garbage'),1,2)).toThrow('Slot units exceed parent memory limit'); // unreadable ceiling fails closed
+  });
 });
