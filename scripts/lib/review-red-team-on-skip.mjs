@@ -394,7 +394,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       // no acceptance can exist. Its pending label came from unreadable run evidence. With a trusted unblocked
       // prep note on this exact head and no review, run, queue or status at all, nothing is owed and nothing hides.
       const prepNotes = priorPrepReviews(rawPr.comments).filter(note => note.head === head);
-      const prepAdvisoryClear = keepsPending && !acceptedReview && Array.isArray(reviews)
+      const prepAdvisoryClear = keepsPending && !acceptedReview && Array.isArray(reviews) && reviews.length === 0
+        && latestAcceptRecord(rawPr.comments, reviews) == null
         && rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:prep')
         // Only a PR whose whole diff is its one prepared card may be advisory-only; a label and note alone never prove it.
         && prepareCardOnly(rawPr) !== null
@@ -669,7 +670,10 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         || !acceptance && comments.some(comment => isLaterVerdictBody(comment.body))) {
         throw Error('evidence changed before settlement');
       }
-      const rawPr = { ...live, number: row.prNumber, comments, reviews };
+      // Head-bound facts the live provider read may omit: the planned row for this exact head supplies them.
+      const planned = planningPrs.find(raw => Number(raw.number) === row.prNumber);
+      const rawPr = { ...live, number: row.prNumber, comments, reviews,
+        headRefName: live.headRefName ?? planned?.headRefName, files: live.files ?? planned?.files };
       const refusal = refusals.find(r => r.kind === 'already-reviewed-head' && Number(r.prNumber) === row.prNumber);
       const [fresh] = planRedTeamOnSkip({ ...planningOptions, refusals: refusal ? [refusal] : [],
         rawPrs: [rawPr], now: now() });

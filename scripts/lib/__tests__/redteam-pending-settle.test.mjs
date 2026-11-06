@@ -532,11 +532,21 @@ describe('prep-advisory PR with no full review settles stale pending (R639, #641
     expect(o.settlePending).toHaveBeenCalledOnce();
     expect(o.settlePending.mock.calls[0][0]).toMatchObject({ repo, pr, head, remove: ['red-team:pending'] });
   });
+  it('still settles when the live provider read omits files and branch name', () => {
+    const f = prepFixture(); const o = runFixture({ ...f, now: () => f.now });
+    o.provider = { readPrState: (_r, n) => { const { files, headRefName, ...rest } = o.rawPrs.find(p => p.number === n); return rest; },
+      setLabels: () => {}, ensureLabel: () => {} };
+    const row = mod.runRedTeamOnSkip(o).rows[0];
+    expect(row).toMatchObject({ settle: 'not-owed' }); expect(row).not.toHaveProperty('settleError');
+    expect(o.settlePending).toHaveBeenCalledOnce();
+  });
   it.each([
     ['no review:prep label', f => { f.rawPrs[0].labels = ['red-team:pending']; }],
     ['code PR carrying the label and note', f => { f.rawPrs[0].files.push({ path: 'scripts/lib/x.mjs' }); }],
     ['non-prepare branch', f => { f.rawPrs[0].headRefName = 'lane/other'; }],
     ['file list missing', f => { delete f.rawPrs[0].files; }],
+    ['an accepting verdict comment on the thread', f => { f.rawPrs[0].comments.push(accept()); }],
+    ['a formal approving review exists', f => { f.rawPrs[0].reviews = [{ state: 'APPROVED', author: { login: 'human-reviewer' } }]; }],
     ['prep note for another head', f => { f.rawPrs[0].comments = [prepNote(old)]; }],
     ['prep note blocked', f => { f.rawPrs[0].comments = [prepNote(head, ' blocked=1')]; }],
     ['prep note from untrusted author', f => { f.rawPrs[0].comments = [{ ...prepNote(), author: { login: 'rando' } }]; }],
