@@ -167,9 +167,44 @@ describe('remoteHeads (the release proof) reads the canonical origin from the pr
     execFileSync('git', ['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.test', 'commit', '-q', '--allow-empty', '-m', 'base'], { cwd: primary });
     execFileSync('git', ['push', '-q', 'origin', 'HEAD:refs/heads/main', 'HEAD:refs/heads/ops/ledger'], { cwd: primary });
     const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: primary, encoding: 'utf8' }).trim();
-    const io = realSalvageIo({ repo: { branch: 'main', originUrl: origin, referencePath: primary }, backupRoot: join(dir, 'backups') });
+    const io = realSalvageIo({ repo: { branch: 'main', originUrl: origin, referencePath: primary, primaryPath: primary }, backupRoot: join(dir, 'backups') });
     return { dir, primary, sha, io };
   };
+  // PR #6319 send-back: the auth exemption follows a VALIDATED primary (resolveRepo's primaryPath), never the
+  // invoking checkout. A release run inside a lane keeps that lane as referencePath: without a validated primary its
+  // credential helper refuses; with one, the listing runs in the primary and the lane's config is never consulted.
+  it.each(['credential.helper', 'http.extraHeader', 'core.askPass'])('refuses %s in a referencePath that is not the validated primary', key => {
+    const { dir, primary, sha } = setup();
+    try {
+      const lane = join(dir, 'lane-1');
+      execFileSync('git', ['clone', '-q', join(dir, 'origin.git'), lane], { stdio: 'ignore' });
+      execFileSync('git', ['config', key, '!touch marker'], { cwd: lane });
+      const unvalidated = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: lane }, backupRoot: join(dir, 'backups') });
+      expect(() => unvalidated.remoteHeads()).toThrow(/lane-controlled transport/);
+      const runGit = vi.fn(execFileSync);
+      const validated = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: lane, primaryPath: primary }, backupRoot: join(dir, 'backups'), runGit });
+      expect(validated.remoteHeads()).toEqual([sha]);
+      expect(runGit.mock.calls.every(([, , options]) => options.cwd === primary)).toBe(true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('pins every transport to no credential helper, no askpass and no terminal prompt', () => {
+    const { dir, primary } = setup();
+    try {
+      // A caller inside a lane controls its own env: an inherited askpass program must not reach the transport.
+      vi.stubEnv('GIT_ASKPASS', join(dir, 'lane-askpass'));
+      vi.stubEnv('SSH_ASKPASS', join(dir, 'lane-ssh-askpass'));
+      const runGit = vi.fn(execFileSync);
+      const io = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: primary, primaryPath: primary }, backupRoot: join(dir, 'backups'), runGit });
+      io.remoteHeads();
+      const listing = runGit.mock.calls.find(([, args]) => args.includes('ls-remote'));
+      const { env } = listing[2];
+      const pins = Object.fromEntries(Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) => [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]));
+      expect(pins).toMatchObject({ 'credential.helper': '', 'core.askPass': '' });
+      expect(env.GIT_TERMINAL_PROMPT).toBe('0');
+      expect(env).not.toHaveProperty('GIT_ASKPASS');
+      expect(env).not.toHaveProperty('SSH_ASKPASS');
+    } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+  });
   it('accepts operator auth/signing keys in the primary and excludes ops/* heads', () => {
     const { dir, primary, sha, io } = setup();
     try {

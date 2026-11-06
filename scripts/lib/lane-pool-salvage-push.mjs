@@ -230,8 +230,14 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
      *  Throws on anything but complete `<sha>\trefs/heads/<name>` lines, so a caller can fail closed. */
     remoteHeads: () => {
       const args = transport('ls-remote', origin, 'refs/heads/*');
-      checkTransportConfig(repo.referencePath, { primary: true });
-      const output = git(repo.referencePath, args, 120_000, true);
+      // The primary's auth keys are exempt only in a checkout resolveRepo validated as the primary (found by name,
+      // or proven not a lane): `primaryPath`. A release run from inside a lane keeps that lane as referencePath, so
+      // without a validated primary the listing runs under the strict lane rules, where a credential helper, http.*
+      // or askpass key refuses (PR #6319 send-back).
+      const primaryDir = repo.primaryPath || null;
+      const dir = primaryDir || repo.referencePath;
+      checkTransportConfig(dir, { primary: !!primaryDir });
+      const output = git(dir, args, 120_000, true);
       const shas = [];
       for (const line of output ? output.split('\n') : []) {
         const match = /^([a-f0-9]{40}|[a-f0-9]{64})\trefs\/heads\/(.+)$/.exec(line);

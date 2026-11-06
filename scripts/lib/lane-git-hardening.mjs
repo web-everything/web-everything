@@ -21,6 +21,11 @@ export const LANE_GIT_CONFIG_PINS = Object.freeze([
   ['core.hooksPath', '/dev/null'],
   ['core.attributesFile', '/dev/null'],
   ['core.sshCommand', 'ssh'],
+  // PR #6319 send-back: no credential helper or askpass program from any config scope runs during an unattended
+  // transport. An empty `credential.helper` resets the helper list; an empty `core.askPass` counts as unset. The
+  // matching env (`GIT_ASKPASS`, `SSH_ASKPASS`) is dropped in laneGitHardeningEnv, which also disables terminal prompts.
+  ['credential.helper', ''],
+  ['core.askPass', ''],
   ['commit.gpgsign', 'false'],
   ['push.gpgSign', 'false'],
   // PR #5775 self-review: `log.showSignature` makes every `git log` run `gpg.program` (lane-chosen) on a commit the
@@ -131,8 +136,12 @@ export function scrubGitRepoEnv(env) {
 export function laneGitHardeningEnv(env = process.env, { remoteProbe = false } = {}) {
   // No lazy fetch: a lane declaring itself a partial clone of a promisor remote would fetch a missing object through
   // its own `remote.<name>.uploadpack` on a plain `show` / `diff` / `cat-file` (PR #5775 self-review).
-  const out = { ...env, GIT_NO_LAZY_FETCH: '1' };
+  // No prompt either: an inherited askpass program (a caller inside a lane controls its env) would run on a credential
+  // request, and a terminal prompt would hang an unattended transport.
+  const out = { ...env, GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' };
   delete out.GIT_EXTERNAL_DIFF;
+  delete out.GIT_ASKPASS;
+  delete out.SSH_ASKPASS;
   const n = Number.parseInt(String(out.GIT_CONFIG_COUNT ?? '0'), 10);
   const start = Number.isInteger(n) && n > 0 ? n : 0;
   const pins = remoteProbe ? [...LANE_GIT_CONFIG_PINS, ...REMOTE_PROBE_CONFIG_PINS] : LANE_GIT_CONFIG_PINS;

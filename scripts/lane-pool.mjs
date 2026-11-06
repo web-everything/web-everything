@@ -391,12 +391,17 @@ function resolveRepo(repoFlags = flags) {
   let discoveredPrimaryPath = null;
   let referenceValidated = false; // true only when the ownership scan above proved the reference is not a lane
   let originBase = topLevel;
-  if (!repoFlags.origin && (needsOrigin || cmd === 'gc' || cmd === 'release')) {
-    const poolRoots = [resolve(POOL_ROOT), resolveReal(POOL_ROOT)];
-    // A linked worktree outside the pool still shares its owner's config (and remote), so its real owner
-    // (the git dir and the common dir) is checked too: a worktree of a lane is refused wherever it sits on
-    // disk. A worktree of a non-lane primary stays usable (the daemon rebuild smoke runs from one).
-    // An unreadable owner is refused: a failed read must not fall back to the path-only check.
+  const poolRoots = [resolve(POOL_ROOT), resolveReal(POOL_ROOT)];
+  // A linked worktree outside the pool still shares its owner's config (and remote), so its real owner
+  // (the git dir and the common dir) is checked too: a worktree of a lane is refused wherever it sits on
+  // disk. A worktree of a non-lane primary stays usable (the daemon rebuild smoke runs from one).
+  // An unreadable owner is refused: a failed read must not fall back to the path-only check.
+  // The reference/cwd can itself be an agent-owned lane. Never promote its remote
+  // into the trust anchor for a preservation proof, even for --dry-run or --pool.
+  // Check both the supplied path and Git's answer (core.worktree can redirect it),
+  // before and after symlink resolution. Recognize lane-N in other pool roots too;
+  // ambiguous lane-shaped checkouts must supply --origin or a primary --reference.
+  const scanOwnership = () => {
     let unreadableOwner = false;
     const owners = [];
     const gitOwnerPaths = [referencePath, topLevel].flatMap((dir) => {
@@ -409,13 +414,13 @@ function resolveRepo(repoFlags = flags) {
       return [gitDir, commonDir, commonDir && dirname(commonDir)].filter(Boolean);
     });
     const originSourcePaths = [referencePath, topLevel, ...gitOwnerPaths].flatMap(path => [resolve(path), resolveReal(path)]);
-    // The reference/cwd can itself be an agent-owned lane. Never promote its remote
-    // into the trust anchor for a preservation proof, even for --dry-run or --pool.
-    // Check both the supplied path and Git's answer (core.worktree can redirect it),
-    // before and after symlink resolution. Recognize lane-N in other pool roots too;
-    // ambiguous lane-shaped checkouts must supply --origin or a primary --reference.
-    if (unreadableOwner || originSourcePaths.some(path => poolRoots.some(root => path === root || path.startsWith(`${root}${sep}`))
-      || path.split(sep).some(part => /^lane-\d+$/.test(part)))) {
+    const laneShaped = unreadableOwner || originSourcePaths.some(path => poolRoots.some(root => path === root || path.startsWith(`${root}${sep}`))
+      || path.split(sep).some(part => /^lane-\d+$/.test(part)));
+    return { unreadableOwner, owners, originSourcePaths, laneShaped };
+  };
+  if (!repoFlags.origin && (needsOrigin || cmd === 'gc' || cmd === 'release')) {
+    const { unreadableOwner, owners, originSourcePaths, laneShaped } = scanOwnership();
+    if (laneShaped) {
       // Old live daemons export the smoke owner, but not LANE_POOL_CANONICAL_ORIGIN.
       // Trust that owner only for its own named, linked candidate; a lane's remote is never an anchor.
       const liveClone = process.env.WE_SMOKE_LIVE_CLONE;
@@ -477,7 +482,13 @@ function resolveRepo(repoFlags = flags) {
   const head = repoFlags.branch ? null : tryGit(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], topLevel, gitOptions);
   const branch = repoFlags.branch || (head ? head.replace(/^origin\//, '') : 'main');
   // alternatesReferencePath: the object store lanes may borrow. A primary found by name replaces the invoking lane.
-  return { name, originUrl: canonicalOrigin ? originUrl || null : null, referencePath: topLevel, alternatesReferencePath: discoveredPrimaryPath || (referenceValidated ? topLevel : null), branch, poolDir: join(POOL_ROOT, name) };
+  const alternatesReferencePath = discoveredPrimaryPath || (referenceValidated ? topLevel : null);
+  // primaryPath: the checkout whose own auth config the release proof may use (PR #6319 send-back). Only a primary
+  // found by name or a reference the ownership scan proved is not a lane — also when an explicit --origin skipped the
+  // origin scan above. Null means no validated primary: the proof then runs under the strict lane transport rules.
+  const primaryPath = alternatesReferencePath
+    || (repoFlags.origin && (cmd === 'gc' || cmd === 'release') && !scanOwnership().laneShaped ? topLevel : null);
+  return { name, originUrl: canonicalOrigin ? originUrl || null : null, referencePath: topLevel, alternatesReferencePath, primaryPath, branch, poolDir: join(POOL_ROOT, name) };
 }
 
 const laneDir = (repo, n) => join(repo.poolDir, `lane-${n}`);

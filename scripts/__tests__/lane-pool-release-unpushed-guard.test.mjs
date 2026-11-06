@@ -668,3 +668,63 @@ describe('release guard hidden-entry hash bound', () => {
     expect(override.stderr).toMatch(/WARNING.*--discard.*tracked status unreadable or exceeds/);
   });
 });
+
+// PR #6319 send-back: a release run from INSIDE a lane keeps that lane as referencePath even when it discovers the
+// pool's primary by name. The canonical-origin listing must never run there under the primary's auth exemption, or
+// the invoking lane's own credential helper runs on an authenticating HTTPS origin. The interceptor stands in for that
+// HTTPS ls-remote: it records where the listing ran and asks git for credentials in that same cwd and env, exactly as
+// an authenticating transport would.
+describe('release from inside a lane with a discoverable primary', () => {
+  it('lists the canonical origin in the primary, never runs the invoking lane\'s credential helper, and keeps its lease', () => {
+    const ws = join(base, 'ws');
+    const lanesRoot = join(ws, '.lanes');
+    const primary = join(ws, 'releaseguard');
+    git(['clone', '--quiet', origin, primary]);
+    git(['remote', 'set-url', 'origin', 'https://github.com/chalbert/releaseguard.git'], primary);
+    const mainSha = git(['rev-parse', 'HEAD'], primary);
+    const env = withGhStub({ ...process.env, LANE_POOL_NO_RECOVER: '1', LANE_POOL_AUTO_RECOVER: '0',
+      LANE_POOL_ROOT: lanesRoot, WE_LANE_BACKUP_ROOT: join(base, 'backups') });
+    delete env.LANE_POOL_CANONICAL_ORIGIN;
+    const cwdLog = join(base, 'ls-remote-cwd.log');
+    const helperMarker = join(base, 'lane-credential-helper-ran');
+    const pool = (args, cwd, intercept = false) => {
+      const preload = `import os from 'node:os'; import cp from 'node:child_process'; import fs from 'node:fs';
+        import { syncBuiltinESMExports } from 'node:module';
+        os.userInfo = () => ({ homedir: ${JSON.stringify(base)} });
+        const original = cp.execFileSync;
+        cp.execFileSync = (cmd, args, opts) => {
+          if (${intercept} && args.includes('ls-remote')) {
+            fs.appendFileSync(${JSON.stringify(cwdLog)}, opts.cwd + '\\n');
+            try {
+              original('git', ['credential', 'fill'], { cwd: opts.cwd, env: { ...opts.env, GIT_TERMINAL_PROMPT: '0' },
+                input: 'protocol=https\\nhost=github.com\\npath=chalbert/releaseguard.git\\n\\n', stdio: ['pipe', 'pipe', 'pipe'], timeout: 10000 });
+            } catch { /* no credential available: the listing would fail closed */ }
+            return ${JSON.stringify(`${mainSha}\trefs/heads/main\n`)};
+          }
+          return original(cmd, args, opts);
+        }; syncBuiltinESMExports();`;
+      const result = spawnSync(process.execPath, [`--import=data:text/javascript,${encodeURIComponent(preload)}`, script, ...args,
+        '--branch=main', '--no-install', '--session=guard-holder', '--json'], {
+        cwd, encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024, env,
+      });
+      expect(result.error).toBeUndefined();
+      return { ...result, data: result.stdout.trim() ? JSON.parse(result.stdout) : null };
+    };
+    const explicit = [`--origin=${origin}`, `--reference=${reference}`, '--name=releaseguard'];
+    expect(pool(['provision', '--count=2', ...explicit], reference).status).toBe(0);
+    for (const n of [1, 2]) expect(pool(['acquire', `--lane=${n}`, '--no-reset', ...explicit], reference).status).toBe(0);
+    const invoking = join(lanesRoot, 'releaseguard', 'lane-1');
+    const invokingMarker = join(invoking, '.git', '.lane-lease');
+    const invokingLease = readFileSync(invokingMarker, 'utf8');
+    git(['config', 'credential.helper', `!f() { touch ${JSON.stringify(helperMarker)}; }; f`], invoking);
+    const result = pool(['release', '--lane=2'], invoking, true);
+    expect(existsSync(helperMarker), 'the invoking lane\'s credential helper ran').toBe(false);
+    const cwds = existsSync(cwdLog) ? readFileSync(cwdLog, 'utf8').split('\n').filter(Boolean) : [];
+    expect(cwds.length, result.stderr).toBeGreaterThan(0);
+    expect(cwds.every(dir => dir === primary), cwds.join(', ')).toBe(true);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.data.released).toBe(1);
+    expect(existsSync(join(lanesRoot, 'releaseguard', 'lane-2', '.git', '.lane-lease'))).toBe(false);
+    expect(readFileSync(invokingMarker, 'utf8')).toBe(invokingLease);
+  });
+});
