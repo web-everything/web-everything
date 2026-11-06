@@ -137,6 +137,12 @@ import { cloneKey } from './daemon-overlays.mjs';
 import { daemonStateDir } from './daemon-last-good.mjs';
 import { maybeMaintainClone, cloneHasRebuildJob } from './clone-maintenance.mjs';
 
+// Production wiring for the post-adoption service restart: an injected hook always wins; the real
+// launchd restart runs only on the real-IO path (no injected `rebuild`), so hermetic tests never kick services.
+export function resolveRestartServices(restartServicesOpt, realIo, real = restartServicesForClone) {
+  return restartServicesOpt ?? (realIo ? real : () => {});
+}
+
 /** PURE: env → rebuild.maxAdoptWaitTicks → default, with the effective policy source. */
 export function resolveMaxAdoptWaitTicks(env = {}, settings = {}) {
   const raw = env?.WE_DAEMON_REBUILD_MAX_ADOPT_WAIT_TICKS;
@@ -703,7 +709,7 @@ export function withSelfSync(effects, {
   const rebuildImpl = rebuildOpt ?? ((o = {}) => rebuildClone({
     root, env, log, mainOnly, entries, asJob: rebuildAsJob, ...o,
   }));
-  const restartServices = restartServicesOpt ?? (realIo ? restartServicesForClone : () => {});
+  const restartServices = resolveRestartServices(restartServicesOpt, realIo);
   const restartWaitMs = Number.isFinite(restartServicesTimeoutMs) && restartServicesTimeoutMs > 0 ? restartServicesTimeoutMs : 15_000;
   const restartError = error => {
     try { log.error?.(`daemon-self-sync: service restart failed: ${String(error?.message ?? error)}`); } catch { /* best effort */ }

@@ -5,7 +5,7 @@ import { pathToFileURL } from 'node:url';
 import fsAsync from 'node:fs/promises';
 import childProcess from 'node:child_process';
 import { findServicesRunningFromClone, restartServicesForClone, findStaleCodeServices } from '../launchd-code-restart.mjs';
-import { withSelfSync } from '../daemon-self-sync.mjs';
+import { withSelfSync, resolveRestartServices } from '../daemon-self-sync.mjs';
 const cloneRoot = resolve('fixtures/wev-pass-readers');
 function fixture(plists = [{ Label: 'com.we.resource-sampler', ProgramArguments: ['node', join(cloneRoot, 'sampler.mjs')] }]) {
   return { cloneRoot, agentsDir: resolve('fixtures/agents'), listPlists: () => plists.map((_, i) => `${i}.plist`),
@@ -352,6 +352,22 @@ describe('launchd clone restart', () => {
   it('stale detection flags unreadable plists and unknown timestamps', () => {
     expect(findStaleCodeServices({ ...fixture([new Error('bad')]), readAdoptedAtMs: () => 200 })).toEqual([expect.objectContaining({ label: null, reason: 'plist-unreadable' })]);
     expect(findStaleCodeServices({ ...fixture(), readProcessStartMs: () => 100, readAdoptedAtMs: () => NaN })[0].reason).toBe('adoption-unreadable');
+  });
+});
+describe('withSelfSync default service-restart wiring', () => {
+  it('real-IO path restarts services with the real launchd restart', () => {
+    expect(resolveRestartServices(undefined, true)).toBe(restartServicesForClone);
+  });
+  it('injected-rebuild (hermetic) path defaults to a no-op that never reaches launchd', async () => {
+    const real = vi.fn(), restart = resolveRestartServices(undefined, false, real);
+    expect(restart).not.toBe(real);
+    await restart({ cloneRoot });
+    expect(real).not.toHaveBeenCalled();
+  });
+  it('an injected restartServices hook wins on both paths', () => {
+    const hook = vi.fn();
+    expect(resolveRestartServices(hook, true)).toBe(hook);
+    expect(resolveRestartServices(hook, false)).toBe(hook);
   });
 });
 describe('withSelfSync service restart hook', () => {
@@ -750,6 +766,31 @@ describe('interpreter option shapes that once hid a clone script (value contains
     const result = findServicesRunningFromClone(fixture([{ Label: 'com.we.resource-sampler', ProgramArguments }]));
     expect(result.matches).toEqual([]);
     expect(result.unreadable[0].error).toMatch(/Too many nested command wrappers/);
+  });
+  it.each([
+    ['sudo first operand', ['/usr/bin/sudo', '-u', 'me', join(cloneRoot, 'bin', 'sampler')]],
+    ['timeout first operand', ['/usr/bin/timeout', '10', join(cloneRoot, 'bin', 'sampler')]],
+    ['xcrun first operand', ['/usr/bin/xcrun', join(cloneRoot, 'bin', 'sampler')]],
+    ['taskpolicy first operand', ['/usr/bin/taskpolicy', '-b', join(cloneRoot, 'bin', 'sampler')]],
+    ['interpreter-named word later is data, not the program', ['/usr/bin/sudo', join(cloneRoot, 'bin', 'sampler'), '--runner', 'node']],
+    ['interpreter-named path later is data, not the program', ['/usr/bin/timeout', '10', join(cloneRoot, 'bin', 'sampler'), outside]],
+    ['nested loose wrappers', ['/usr/bin/taskpolicy', '-b', '/usr/bin/sudo', join(cloneRoot, 'bin', 'sampler')]],
+  ])('a clone executable as the loose wrapper first operand is matched and restarted: %s', async (_name, ProgramArguments) => {
+    const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments }]);
+    expect(findServicesRunningFromClone(o)).toMatchObject({ matches: [{ label: 'com.we.resource-sampler' }], unreadable: [] });
+    expect((await restartServicesForClone(o)).restarted).toHaveLength(1);
+    expect(findStaleCodeServices({ ...o, readProcessStartMs: () => 100_000, readAdoptedAtMs: () => 200_000 })).toHaveLength(1);
+  });
+  it.each([
+    ['option value path is not the program', ['/usr/bin/sandbox-exec', '-f', join(cloneRoot, 'p.sb'), outside, other]],
+    ['unrelated first operand', ['/usr/bin/sudo', '-u', 'me', resolve('..', 'other-clone', 'bin', 'sampler')]],
+    ['clone path only as data after an unrelated program', ['/usr/bin/timeout', '10', resolve('..', 'other-clone', 'bin', 'sampler'), 'node', join(cloneRoot, 'data')]],
+  ])('loose wrapper operands that are not the program stay unflagged: %s', (_name, ProgramArguments) => {
+    expect(findServicesRunningFromClone(fixture([{ Label: 'com.we.resource-sampler', ProgramArguments }])).matches).toEqual([]);
+  });
+  it('a relative first operand of a loose wrapper resolves against the explicit WorkingDirectory', () => {
+    const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/sudo', './bin/sampler'], WorkingDirectory: cloneRoot }]);
+    expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
   });
   it('an unclassifiable wrapper option resumes at the interpreter, so the clone script is matched', () => {
     const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/env', '--mystery', outside, join(cloneRoot, 'sampler.mjs')] }]);

@@ -59,6 +59,24 @@ function unwrap(args, start, cwd, depth) {
       // Options and positional operands (duration, user, profile) are not enumerable: resume at the
       // first later argument that names an interpreter or wrapper, else scan everything after the wrapper.
       const j = a.findIndex((x, k) => k >= i && isCommand(x));
+      // The wrapper's own first operand may itself be the program (`sudo -u me /clone/bin/sampler`,
+      // `timeout 10 /clone/bin/sampler --runner node`): a path-like operand that is not an option value
+      // is an executable candidate even when an interpreter-named word appears later as plain data.
+      // Before a later interpreter, an operand right after an option is more likely that option's value
+      // (`sandbox-exec -f profile node x`); with no interpreter at all it is the best program candidate.
+      let program = -1;
+      for (let k = i; k < (j < 0 ? a.length : j) && program < 0; k += 1) {
+        const x = a[k];
+        if (x === '--' || x.startsWith('-') || x.startsWith('+') || !(isPathArg(x) || x.includes('/'))) continue;
+        if (j >= 0 && k > start + 1 && a[k - 1].startsWith('-') && a[k - 1] !== '--') continue;
+        program = k;
+      }
+      if (program >= 0) {
+        // The first path-like operand is the program; later interpreter-named words are its data.
+        // Its own arguments are unknown, so a clone path among them is flagged, never silently ignored.
+        owners.push(place(a[program], cwd, true));
+        return unknown(start + 1);
+      }
       if (j < 0) return unknown(start + 1);
       i = j; break;
     }
