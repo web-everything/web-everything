@@ -856,6 +856,32 @@ describe('interpreter option shapes that once hid a clone script (value contains
       expect(findStaleCodeServices({ ...o, readProcessStartMs: () => 100_000, readAdoptedAtMs: () => 200_000 })).toHaveLength(1);
     });
     it.each([
+      ['--import file: URL', [outside, '--import', pathToFileURL(boot).href, other], undefined],
+      ['--loader= file: URL', [outside, `--loader=${pathToFileURL(boot).href}`, other], undefined],
+      ['NODE_OPTIONS --require', [outside, other], { NODE_OPTIONS: `--max-old-space-size=64 --require ${boot}` }],
+      ['NODE_OPTIONS quoted --import=', [outside, other], { NODE_OPTIONS: `--import="${boot}"` }],
+      ['NODE_OPTIONS -r on a non-node argv', ['/bin/sh', other], { NODE_OPTIONS: `-r ${boot}` }],
+    ])('%s is discovered, restarted and flagged stale', async (_name, ProgramArguments, EnvironmentVariables) => {
+      const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments, EnvironmentVariables }]);
+      expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
+      expect((await restartServicesForClone(o)).restarted).toHaveLength(1);
+      expect(findStaleCodeServices({ ...o, readProcessStartMs: () => 100_000, readAdoptedAtMs: () => 200_000 })).toHaveLength(1);
+    });
+    it('an unparsable NODE_OPTIONS is flagged unreadable, never silently excluded', () => {
+      const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: [outside, other], EnvironmentVariables: { NODE_OPTIONS: `--require "${boot}` } }]);
+      const result = findServicesRunningFromClone(o);
+      expect(result.matches).toEqual([]);
+      expect(result.unreadable[0].error).toMatch(/Unsupported NODE_OPTIONS/);
+    });
+    it('NODE_OPTIONS preloading code outside the clone is not claimed', () => {
+      const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: [outside, other], EnvironmentVariables: { NODE_OPTIONS: `--require ${other}` } }]);
+      expect(findServicesRunningFromClone(o).matches).toEqual([]);
+    });
+    it('-r is the restricted-mode flag for a shell, not a preload operand', () => {
+      const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/bin/bash', '-r', join(cloneRoot, 'data'), other] }]);
+      expect(findServicesRunningFromClone(o).matches).toEqual([]);
+    });
+    it.each([
       ['separate operand', [outside, '--require', other, other]],
       ['attached operand', [outside, `--require=${other}`, other]],
     ])('a preload outside the clone with an external entry is not claimed: %s', (_name, ProgramArguments) => {

@@ -4,6 +4,7 @@ import fsAsync from 'node:fs/promises';
 import childProcess from 'node:child_process';
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { lockDirFor, makeLockEntry } from '../readiness/file-locks.mjs';
@@ -179,9 +180,10 @@ function codeArguments(args, start = 0, cwd = null, depth = 0) {
     // Preload options run the named module before the entry script, so their value is code the service
     // executes: it is an owner (a clone-backed bootstrap makes the service clone-backed), not skipped data.
     const attachedPreload = /^--(?:require|import|loader|experimental-loader)=(.+)$/.exec(arg);
-    if (attachedPreload) { result.owners.push(place(attachedPreload[1], cwd, false)); continue; }
+    if (attachedPreload) { result.owners.push(preloadOwner(attachedPreload[1], cwd)); continue; }
     if (operand.has(arg)) {
-      if (PRELOAD.has(arg) && args[i + 1] !== undefined) result.owners.push(place(args[i + 1], cwd, false));
+      // `-r` is a preload only for node/ruby; in a shell it is the restricted-mode flag and takes no operand.
+      if (PRELOAD.has(arg) && (arg !== '-r' || /^(?:node|nodejs|ruby)$/.test(name)) && args[i + 1] !== undefined) result.owners.push(preloadOwner(args[i + 1], cwd));
       i += 1; continue;
     }
     if (arg.startsWith('-') || arg.startsWith('+')) {
@@ -197,6 +199,25 @@ function codeArguments(args, start = 0, cwd = null, depth = 0) {
     return result;
   }
   return result;
+}
+
+// A preload operand may be a file: URL (`--import file:///clone/x.mjs`); normalise it to the path it names.
+function preloadOwner(value, cwd) {
+  if (value.startsWith('file://')) { try { return fileURLToPath(value); } catch { return value; } }
+  return place(value, cwd, false);
+}
+// NODE_OPTIONS preloads run in every node process the service starts, whatever its argv looks like.
+// Returns the preload operands found (separate and attached forms); an unparsable string yields null.
+function nodeOptionPreloads(value) {
+  const tokens = shellSplit(value);
+  if (tokens === null) return null;
+  const out = [];
+  for (let i = 0; i < tokens.length; i += 1) {
+    const attached = /^--(?:require|import|loader|experimental-loader)=(.+)$/.exec(tokens[i]);
+    if (attached) out.push(attached[1]);
+    else if (/^(?:-r|--require|--import|--loader|--experimental-loader)$/.test(tokens[i]) && tokens[i + 1] !== undefined) { out.push(tokens[i + 1]); i += 1; }
+  }
+  return out;
 }
 
 const inside = (path, root) => path === root || path.startsWith(root.endsWith(sep) ? root : root + sep);
@@ -256,6 +277,13 @@ function parsePlist(p, { selfLabel, plistPath }) {
   // Only an explicit absolute/home-relative WorkingDirectory can anchor relative script paths.
   const wd = typeof p.WorkingDirectory === 'string' && isPathArg(p.WorkingDirectory) ? expand(p.WorkingDirectory) : null;
   const { owners, unknownAt, cwd, wide, args: effective } = codeArguments(args, 0, wd);
+  const nodeOptions = p.EnvironmentVariables?.NODE_OPTIONS;
+  if (typeof nodeOptions === 'string' && nodeOptions.trim()) {
+    const preloads = nodeOptionPreloads(nodeOptions);
+    // An unparsable NODE_OPTIONS hides what node preloads: surface it, never skip it.
+    if (preloads === null) throw new Error('Unsupported NODE_OPTIONS string (unterminated quote or escape): cannot tell whether the service preloads code from the clone');
+    owners.push(...preloads.map(v => preloadOwner(v, wd)));
+  }
   // Bare executables, flags and relative paths belong to the service's context,
   // not this process's cwd. Only absolute/home-relative paths, or paths resolved against
   // the service's own explicit WorkingDirectory, prove ownership.
