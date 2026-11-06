@@ -4,10 +4,13 @@
  *   the incident this exists to fix (`acquire` measured 240s / `list --acquirable` 66s under load, against
  *   acquire's 180s wait, while 30+ lanes sat free) and why the list is a HINT, never trusted alone.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync, symlinkSync, lstatSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
+import { sharedRepos } from '../../__tests__/fixtures/shared-git-fixture.mjs';
+import { laneStateSnapshot } from '../lane-history.mjs';
 import {
   FREE_LANE_LIST_VERSION,
   DEFAULT_FREE_LANE_LIST_MAX_AGE_MS,
@@ -221,5 +224,136 @@ describe('touchFreeLaneList cost budget (runs on every acquire, release and trim
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// The event-refresh logic in-process (PR #6357 send-back R547: these were real spawned lane-pool children before).
+describe('touchFreeLaneList', () => {
+  let dir;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'free-lane-touch-')); });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  const touch = (lane, now, extra = {}) => touchFreeLaneList({ path: join(dir, 'l.json'), repoName: 'r', poolDir: '/p', lane, free: true, now, ...extra });
+  const lanes = () => readFreeLaneList(join(dir, 'l.json')).lanes;
+
+  it('adds/removes one entry, keeps the others, stamps now, and never throws', () => {
+    expect(touch(3, 100)).toBe(true);
+    touch(1, 200);
+    touch(3, 300, { free: false });
+    expect(lanes().map((x) => x.lane)).toEqual([1]);
+    expect(readFreeLaneList(join(dir, 'l.json')).writtenAt).toBe(300);
+    expect(lanes()[0]).toMatchObject({ lane: 1, path: join('/p', 'lane-1'), at: 200 });
+    writeFileSync(join(dir, 'not-a-dir.json'), 'x'); // a file where a directory is needed: the write fails, never throws
+    expect(touchFreeLaneList({ path: join(dir, 'not-a-dir.json', 'x.json'), repoName: 'r', poolDir: '/p', lane: 1, free: true })).toBe(false);
+    expect(touch(-1, 400)).toBe(false); // not a lane number
+  });
+
+  it('a removal of a lane that is not listed still stamps the list fresh (the acquire/trim event)', () => {
+    touch(2, 100);
+    touch(5, 500, { free: false });
+    expect(lanes().map((x) => x.lane)).toEqual([2]);
+    expect(readFreeLaneList(join(dir, 'l.json')).writtenAt).toBe(500);
+  });
+
+  it('prunes carried entries older than the max age, so a touch never freshens old candidates', () => {
+    touch(3, 0);
+    touch(4, 30_000);
+    touch(5, 700_000, { maxAgeMs: 600_000 });
+    expect(lanes().map((x) => x.lane)).toEqual([5]);
+  });
+
+  it('unrelated touches preserve an entry\'s ORIGINAL timestamp, so it still expires at its original time', () => {
+    touch(3, 0, { maxAgeMs: 600_000 });
+    touch(4, 300_000, { maxAgeMs: 600_000 }); // unrelated touch: lane 3 must keep at=0
+    expect(lanes().find((x) => x.lane === 3).at).toBe(0);
+    touch(5, 700_000, { maxAgeMs: 600_000 }); // lane 3 (at 0) is past the limit and pruned; lane 4 (at 300,000) is not
+    expect(lanes().map((x) => [x.lane, x.at])).toEqual([[4, 300_000], [5, 700_000]]);
+  });
+
+  it('drops a carried entry stamped in the future (clock skew cannot keep it alive)', () => {
+    touch(3, 1_000_000);
+    touch(4, 0);
+    expect(lanes().map((x) => x.lane)).toEqual([4]);
+  });
+});
+
+// The release publication bar on REAL git states (one shared origin + lane clone per file, restored after every
+// test — never re-cloned). This is the exact pair lane-pool's release runs:
+// `isProvablyCleanAndPushed(laneStateSnapshot(dir, 'origin/<branch>'), { requireInSync: true })`; a reserved lease
+// passes no snapshot at all. The --no-reset acquire guard's own git cases run end to end in
+// scripts/__tests__/lane-pool-free-list-event-refresh.test.mjs.
+describe('release publication bar on real git states', () => {
+  const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', timeout: 30_000 }).trim();
+  let root, origin, lane, fixture;
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), 'free-lane-release-bar-'));
+    origin = join(root, 'origin.git');
+    lane = join(root, 'lane');
+    git(['init', '-q', '--bare', '--initial-branch=trunk', origin], root);
+    git(['clone', '-q', origin, lane], root);
+    git(['config', 'user.email', 't@t'], lane);
+    git(['config', 'user.name', 't'], lane);
+    writeFileSync(join(lane, 'file.txt'), 'v1\n');
+    git(['add', 'file.txt'], lane);
+    git(['commit', '-q', '-m', 'v1'], lane);
+    git(['push', '-q', 'origin', 'HEAD:refs/heads/trunk'], lane);
+    git(['fetch', '-q', 'origin'], lane);
+    fixture = sharedRepos(root, [origin, lane]);
+  });
+  afterEach(() => fixture.restore());
+  afterAll(() => fixture.dispose());
+
+  const publishes = () => isProvablyCleanAndPushed(laneStateSnapshot(lane, 'origin/trunk'), { requireInSync: true });
+  const commit = (file, msg) => { writeFileSync(join(lane, file), `${msg}\n`); git(['add', file], lane); git(['commit', '-q', '-m', msg], lane); };
+
+  it('a clean lane level with origin is published', () => {
+    expect(publishes()).toBe(true);
+  });
+  it('a lane whose only dirt is known scratch litter is published', () => {
+    writeFileSync(join(lane, '.pr-body.md'), 'scratch\n');
+    expect(publishes()).toBe(true);
+  });
+  it('a dirty tracked file is not published', () => {
+    writeFileSync(join(lane, 'file.txt'), 'dirty tracked edit\n');
+    expect(publishes()).toBe(false);
+  });
+  it('an untracked non-litter file is not published', () => {
+    writeFileSync(join(lane, 'notes.txt'), 'real work\n');
+    expect(publishes()).toBe(false);
+  });
+  it('an unpushed commit is not published', () => {
+    commit('new.txt', 'unpushed');
+    expect(publishes()).toBe(false);
+  });
+  it('a commit pushed to a lane/* branch but not on the integration branch is not published (not in sync)', () => {
+    commit('feat.txt', 'feature');
+    git(['push', '-q', 'origin', 'HEAD:refs/heads/lane/feat'], lane);
+    git(['fetch', '-q', 'origin'], lane);
+    expect(publishes()).toBe(false);
+  });
+  it('a commit that survives only in a STALE tracking ref (branch deleted on origin) is not published', () => {
+    commit('wip.txt', 'stale-ref-work');
+    git(['push', '-q', 'origin', 'HEAD:refs/heads/lane/gone'], lane);
+    git(['update-ref', '-d', 'refs/heads/lane/gone'], origin);
+    expect(git(['rev-parse', 'refs/remotes/origin/lane/gone'], lane)).toBe(git(['rev-parse', 'HEAD'], lane));
+    expect(publishes()).toBe(false);
+  });
+  it('a squash-merged commit whose branch was pruned is not published (release is stricter than the scan)', () => {
+    commit('feat.txt', 'feature');
+    const squash = join(root, 'squash');
+    git(['clone', '-q', '--branch', 'trunk', origin, squash], root);
+    try {
+      writeFileSync(join(squash, 'feat.txt'), 'feature\n');
+      git(['add', 'feat.txt'], squash);
+      git(['-c', 'user.email=s@s', '-c', 'user.name=s', 'commit', '-q', '-m', 'feature (squashed)'], squash);
+      git(['push', '-q', 'origin', 'HEAD:refs/heads/trunk'], squash);
+    } finally { rmSync(squash, { recursive: true, force: true }); }
+    git(['fetch', '-q', '--prune', 'origin'], lane);
+    expect(publishes()).toBe(false);
+  });
+  it('a lane that is not a git checkout at all fails closed', () => {
+    expect(isProvablyCleanAndPushed(laneStateSnapshot(join(root, 'nope'), 'origin/trunk'), { requireInSync: true })).toBe(false);
+  });
+  it('a reserved lease passes no snapshot and is never published', () => {
+    expect(isProvablyCleanAndPushed(null, { requireInSync: true })).toBe(false);
   });
 });
