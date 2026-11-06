@@ -27,7 +27,7 @@ import { pathToFileURL } from 'node:url';
 const SPECIFIC = new Set([
   'transient-504-not-retried', 'persistent-504-read-as-list', 'persistent-504-no-event',
   'persistent-504-not-bounded', 'heavy-list-issued', 'declared-sample-read-as-truncated',
-  'author-throttle-hard-failed',
+  'author-throttle-hard-failed', 'fresh-read-heavy-or-snapshot',
 ]);
 
 const e504 = () => Object.assign(new Error('gh failed'), { stderr: 'HTTP 504: 504 Gateway Timeout (https://api.github.com/graphql)' });
@@ -75,7 +75,15 @@ export async function replayPrList504(root) {
       readRest: () => { throw throttled; }, retryOpts: retryOpts({ streaks: new Map() }) });
     authorThrottleDeferred = !Array.isArray(out) && out?.deferred === true;
   } catch { authorThrottleDeferred = false; }
-  return { transientOk, persistentReturned, persistentCalls, events, sampleAccepted, authorThrottleDeferred };
+  // Follow-up (2026-11-03 18:01 ET): the fix daemon plans from a FRESH read — no shared snapshot, still small pages.
+  let freshOk = false;
+  try {
+    let snapshotTouched = false, pagedCalls = 0;
+    const out = read.defaultReadPrs({ ...base, fresh: true, readShared: () => { snapshotTouched = true; return null; },
+      listPaged: () => { pagedCalls++; return { rows: [row(1)], cache: {}, totalCount: 1 }; }, retryOpts: retryOpts({ streaks: new Map() }) });
+    freshOk = !snapshotTouched && pagedCalls === 1 && Array.isArray(out) && out.length === 1;
+  } catch { freshOk = false; }
+  return { transientOk, persistentReturned, persistentCalls, events, sampleAccepted, authorThrottleDeferred, freshOk };
 }
 
 export default {
@@ -99,6 +107,7 @@ export default {
     if (!r.events.some((e) => e.kind === 'gh-list-failed')) violations.push({ invariant: 'persistent-504-no-event', detail: 'three failed reads in a row raised no gh-list-failed event' });
     if (!r.sampleAccepted) violations.push({ invariant: 'declared-sample-read-as-truncated', detail: 'a declared WE_PR_SNAPSHOT_SAMPLE sample was refused as a partial inventory' });
     if (!r.authorThrottleDeferred) violations.push({ invariant: 'author-throttle-hard-failed', detail: 'a gh slot throttle during the author lookup did not defer the read' });
+    if (!r.freshOk) violations.push({ invariant: 'fresh-read-heavy-or-snapshot', detail: 'a fresh read consulted the shared snapshot or did not read small pages' });
     return { violations };
   },
   judge(report) {

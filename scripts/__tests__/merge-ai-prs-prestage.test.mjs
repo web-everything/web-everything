@@ -12,6 +12,7 @@ import { fixDispatchResource } from '../conveyor/fix-claim-store.mjs';
 import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
 import { createPrestageCache, resolvePrestageSettings, enqueuePrestage } from '../lib/drain-prestage.mjs';
 import { buildLedgerEvent, EVENT_TYPES } from '../lib/verdict-ledger.mjs';
+import { createAsyncShadow } from '../lib/drain-async-shadow.mjs';
 
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs');
 const sha = 'a'.repeat(40);
@@ -85,24 +86,112 @@ async function world(fn, { slug = 'fixture/prestage' } = {}) {
       commits: [{oid:sha,messageHeadline:'Update readme',authors:[{name:'Claude',email:'noreply@anthropic.com'}]}],
       statusCheckRollup: [{name:'test',status:'IN_PROGRESS',conclusion:null,head_sha:sha}],
       comments: [{author:{login:'chalbert'},body:'<!-- reviewed-sha: '+sha+' -->',createdAt:new Date().toISOString()}], reviews: [] };
-    const run = (green = false, { rebaseDrop = false, numbering = false, thisRepo = true, args = [] } = {}) => {
+    const run = (green = false, { rebaseDrop = false, numbering = false, thisRepo = true, args = [], shadowMode = 'off' } = {}) => {
       writeFileSync(fixture, JSON.stringify(pr)); writeFileSync(log, '');
       const r = spawnSync(process.execPath, [script, ...(thisRepo ? ['--this-repo'] : []),'--label=ready-to-merge','--only=42', '--json', ...args,
         '--no-drain-lease','--no-red-main-freeze',...(!rebaseDrop ? ['--no-rebase-drop'] : []),'--no-heal-collision','--no-overlap-yield',
         ...(green ? ['--from-green-event'] : [])], { cwd:dir,encoding:'utf8',timeout:120_000, // a loaded host can push one real drain run past 30s
         env: { ...process.env, ...daemonAppEnv(dir), PATH:bin+':'+process.env.PATH, PRESTAGE_PR:fixture,PRESTAGE_LOG:log, PRESTAGE_REPO:slug,
-          WE_COORDINATION_ROOT:coord, LANE_POOL_ROOT:dir, WE_MERGE_DELIVERY_SETTINGS_FILE:settings,
+          WE_COORDINATION_ROOT:coord, WE_ASYNC_DRAIN:shadowMode, LANE_POOL_ROOT:dir, WE_MERGE_DELIVERY_SETTINGS_FILE:settings,
           WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE:'off',WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE:numbering ? 'on' : 'off',
           WE_DRAIN_WORKFLOW_EDIT_HUMAN:'off',WE_REVIEW_LEDGER_MODE:'off',WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES:'0',
           WE_VERDICT_LEDGER_DIR:ledger, WE_VERDICT_LEDGER_STORE:'home' } });
       expect(r.status, r.stderr + r.stdout).toBe(0);
-      return { report:JSON.parse(r.stdout), calls:readFileSync(log,'utf8').trim().split('\n').filter(Boolean).map(JSON.parse), stderr:r.stderr };
+      return { report:JSON.parse(r.stdout), stdout:r.stdout, calls:readFileSync(log,'utf8').trim().split('\n').filter(Boolean).map(JSON.parse), stderr:r.stderr };
     };
-    await fn({pr,run,coord,ledger,slug});
+    await fn({pr,run,coord,ledger,slug,dir});
   } finally { rmSync(dir,{recursive:true,force:true}); }
 }
 
 describe('real drain pre-stage path', () => {
+  it.each(['dependency-held', 'cascade', 'prestage'])('shadow adds zero gh calls compared with off (%s)', async path => {
+    const traces = [];
+    for (const shadowMode of ['off', 'shadow']) {
+      await world(({pr,run,dir,coord}) => {
+        if (path === 'dependency-held') {
+          pr.body += '\n<!-- lane-manifest:begin -->\n```json\n' + JSON.stringify({
+            item:'xabc123', repos:[{repo:'we',ref:pr.headRefName}], blockedBy:[], stackParents:['xpar123'],
+          }) + '\n```\n<!-- lane-manifest:end -->';
+        }
+        const calls = [];
+        if (path === 'prestage') {
+          const prepared = run(false, { shadowMode });
+          expect(prepared.stderr).toContain('eligible=true');
+          calls.push(...prepared.calls);
+        }
+        pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+        const next = run(path === 'prestage', { shadowMode });
+        calls.push(...next.calls);
+        if (path === 'dependency-held') {
+          expect(next.report.deferred, next.stderr).toEqual(expect.arrayContaining([
+            expect.objectContaining({num:42,waitOn:['xpar123']}),
+          ]));
+          expect(next.report.enqueueOutcomes ?? []).toEqual([]);
+          // Off's no-op still evaluates its arguments: equality alone could miss
+          // the same accidental readyInfoOf/label read in BOTH modes.
+          expect(calls.filter(a => a[0] === 'api' && a.some(x => x.includes('/issues/42/events')))).toEqual([]);
+          if (shadowMode === 'shadow') {
+            const rows = JSON.parse(readFileSync(join(coord, 'drain-async-shadow', 'state.json'), 'utf8')).records;
+            expect(rows).toEqual([expect.objectContaining({num:42,headSha:sha,actualEnqueueAt:null})]);
+          }
+        } else {
+          expect(next.report.enqueueOutcomes).toMatchObject([{num:42,outcome:'enqueued'}]);
+          if (path === 'prestage') expect(next.report.prestaged).toBe(true);
+        }
+        // Fixture roots differ; preserve every gh argument and its ordering.
+        traces.push(calls.filter(a => a[0] !== 'git').map(a => a.map(x => x.replaceAll(dir, '<fixture>'))));
+      });
+    }
+    expect(traces[1]).toEqual(traces[0]);
+  });
+
+  it.each([false, true])('scoped drain preserves another PR pending timing (prestage: %s)', green => world(({pr,run,coord,slug}) => {
+    const dir = join(coord, 'drain-async-shadow');
+    const other = { repo: slug, num: 43, headSha: 'b'.repeat(40) };
+    if (green) expect(run(false, { shadowMode:'shadow' }).stderr).toContain('eligible=true');
+    const firstSeen = Date.now() - 1000;
+    const target = { repo: slug, num: 42, headSha: sha };
+    createAsyncShadow({ mode: 'shadow', dir, now: () => firstSeen }).observePass({ candidates: [target, other] });
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    expect(run(green, { shadowMode:'shadow' }).report.enqueueOutcomes).toMatchObject([{num:42,outcome:'enqueued'}]);
+    const pending = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')).records.find(row => row.num === 43);
+    expect(pending).toMatchObject({ wouldEnqueueAt: firstSeen, readyNotReached: 0, actualEnqueueAt: null });
+    expect(pending.retired).not.toBe(true);
+    createAsyncShadow({ mode: 'shadow', dir }).recordActual(other);
+    const rows = readFileSync(join(dir, 'shadow.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(rows).toHaveLength(2);
+    expect(rows.find(row => row.num === 42)).toMatchObject({ headSha: sha, actualEnqueueAt: expect.any(Number) });
+    expect(rows.find(row => row.num === 43)).toMatchObject({ wouldEnqueueAt: firstSeen, actualEnqueueAt: expect.any(Number) });
+  }));
+  it('a drain run with json=true and WE_ASYNC_DRAIN=shadow writes rows with unchanged stdout', () => world(({pr,run,coord}) => {
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    const next = run(false, { shadowMode:'shadow' });
+    expect(JSON.parse(next.stdout)).toEqual(next.report);
+    expect(next.report.enqueueOutcomes).toMatchObject([{num:42,outcome:'enqueued'}]);
+    const rows = readFileSync(join(coord, 'drain-async-shadow', 'shadow.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(rows).toEqual([expect.objectContaining({num:42,headSha:sha,actualEnqueueAt:expect.any(Number)})]);
+  }));
+  it('prestage enqueue records shadow timing', () => world(({pr,run,coord}) => {
+    expect(run(false, { shadowMode:'shadow' }).stderr).toContain('eligible=true');
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    const next = run(true, { shadowMode:'shadow' });
+    expect(next.report).toMatchObject({prestaged:true,enqueueOutcomes:[{num:42,outcome:'enqueued'}]});
+    const rows = readFileSync(join(coord, 'drain-async-shadow', 'shadow.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(rows).toEqual([expect.objectContaining({num:42,headSha:sha,actualEnqueueAt:expect.any(Number)})]);
+    expect(rows[0].actualEnqueueAt).toBeGreaterThanOrEqual(rows[0].wouldEnqueueAt);
+    expect(rows[0].deltaMs).toBe(rows[0].actualEnqueueAt - rows[0].wouldEnqueueAt);
+    expect(next.calls.filter(a => a.some(x => x.includes('enqueuePullRequest')))).toHaveLength(1);
+  }));
+  it.each([false, true])('drain wiring records enqueue refusal kind in shadow reasons (prestage: %s)', green => world(({pr,run,coord}) => {
+    if (green) expect(run(false, { shadowMode:'shadow' }).stderr).toContain('eligible=true');
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    pr.mqTimeline = [{ __typename:'RemovedFromMergeQueueEvent', reason:'failed_checks', createdAt:'2026-11-01T12:00:00Z',
+      beforeCommit:{oid:'b'.repeat(40),parents:{nodes:[{oid:'c'.repeat(40)},{oid:sha}]}} }];
+    const next = run(green, { shadowMode:'shadow' });
+    expect(next.report.enqueueOutcomes).toMatchObject([{outcome:'not-enqueued',kind:'mq-same-head-failed'}]);
+    const summaries = readFileSync(join(coord, 'drain-async-shadow', 'summary.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(summaries.at(-1).reasons).toEqual({'mq-same-head-failed':1});
+  }));
   it('both enqueue sites use one local helper that guards before the only mergeStrategy.enqueue call', () => {
     // The local helper is not exported; pin its wiring here and exercise each caller below.
     const source = readFileSync(script, 'utf8');
@@ -387,13 +476,13 @@ describe('real drain pre-stage path', () => {
     expect(next.calls.some(a => a[0] === 'pr' && a[1] === 'list' && !a.includes('--base') || a.some(x => x.includes('pullRequests(')))).toBe(false);
     expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(true);
   }));
-  it('a green-event enqueue runs the cascade pre-landing steps: stacked retarget and review-coverage notice', () => world(({pr,run}) => {
-    expect(run().stderr).toContain('eligible=true');
+  it.each(['off', 'shadow'])('a green-event enqueue runs the cascade pre-landing steps: stacked retarget and review-coverage notice (async drain: %s)', shadowMode => world(({pr,run}) => {
+    expect(run(false, { shadowMode }).stderr).toContain('eligible=true');
     // The pre-landing read is fresh: the reviewed-sha record is gone by green time, so coverage is announced.
     pr.comments = [];
     pr.stacked = [{ number: 43, baseRefName: pr.headRefName }];
     pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
-    const next = run(true);
+    const next = run(true, { shadowMode });
     expect(next.report, next.stderr).toMatchObject({prestaged:true,enqueueOutcomes:[{num:42,outcome:'enqueued'}]});
     const at = pred => next.calls.findIndex(pred);
     const enqueued = at(a => a.some(x => x.includes('enqueuePullRequest')));

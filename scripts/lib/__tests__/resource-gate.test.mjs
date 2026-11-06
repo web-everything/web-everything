@@ -70,6 +70,18 @@ describe('gateLaunch — each kind decides through admit() at its threshold (enf
   });
 });
 
+describe('gateLaunch — a throwing legacy gate fails closed (R559)', () => {
+  for (const cutover of ['enforce', 'shadow']) {
+    it(`refuses with reason gate-error and logs it (${cutover})`, () => {
+      const lines = [];
+      const d = gateLaunch({ kind: 'fix', root, nowMs: NOW, legacyGate: () => { throw new Error('boom'); }, settings: { cutover }, log: (l) => lines.push(l) });
+      expect(d.admit).toBe(false);
+      expect(d.reason).toBe('gate-error');
+      expect(lines.join('')).toMatch(/gate-error: boom/);
+    });
+  }
+});
+
 describe('cutoverDecision — shadow keeps the legacy verdict deciding', () => {
   it('shadow: the legacy verdict stands, the shared one is still computed and attached', () => {
     writeSnap(snap({ idle: 50 }));
@@ -85,10 +97,21 @@ describe('cutoverDecision — shadow keeps the legacy verdict deciding', () => {
     expect(resolveCutoverMode({ WE_RESOURCE_CUTOVER: 'enforce' })).toBe('enforce');
     expect(resolveCutoverMode({ WE_RESOURCE_CUTOVER: 'bogus' })).toBe('enforce');
   });
-  it('a throwing observer and a throwing admit() leave the legacy result (never throws)', () => {
-    const d = cutoverDecision({ gate: 'g', kind: 'build', legacy: { admit: true }, mode: 'enforce',
-      shadow: () => { throw Error('x'); }, admitFn: () => { throw Error('y'); } });
-    expect(d).toEqual({ admit: true, decidedBy: 'legacy' });
+  it.each(['throw', 'invalid'])('enforce refuses and logs when both shared decisions %s', (failure) => {
+    const fail = () => { if (failure === 'throw') throw Error('unavailable'); return {}; };
+    const log = vi.fn();
+    expect(cutoverDecision({ gate: 'g', kind: 'build', legacy: { admit: true }, mode: 'enforce',
+      shadow: fail, admitFn: fail, log })).toEqual({ admit: false, reason: 'gate-error', kind: 'gate-error',
+      why: 'gate-error: shared decision unavailable', decidedBy: 'legacy' });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('gate-error: shared decision unavailable'));
+  });
+  it.each(['shadow', 'other'])('%s preserves legacy admission when shared decisions are unavailable', (mode) => {
+    expect(cutoverDecision({ mode, legacy: { admit: true }, shadow: () => { throw Error('x'); }, admitFn: () => null }))
+      .toEqual({ admit: true, decidedBy: 'legacy' });
+  });
+  it('enforce uses a valid fallback decision after the observer fails', () => {
+    expect(cutoverDecision({ mode: 'enforce', shadow: () => { throw Error('x'); },
+      admitFn: () => ({ verdict: 'admit', reason: 'healthy' }), log: quiet })).toMatchObject({ admit: true, decidedBy: 'admit' });
   });
 });
 
@@ -271,6 +294,36 @@ describe('dynamic fixer cap', () => {
       const lines = []; const t = mk(() => snap(), lines);
       expect(t.tryAdmit('fix').admit).toBe(true);
       expect(lines[0]).toMatch(/mem floor 2048 MB \(standard\) available 8192 MB pressure 1 → admit/);
+    });
+    it.each([
+      ['missing sampledAt', { sampledAt: undefined }],
+      ['invalid sampledAt', { sampledAt: 'invalid' }],
+      ['invalid freshUntil', { freshUntil: 'invalid' }],
+      ['oversized persisted freshness window', { freshUntil: new Date(NOW + 3600000).toISOString() }],
+    ])('R559 refuses %s through the stale snapshot path', (_name, extra) => {
+      const d = mk(() => ({ ...snap(), ...extra })).tryAdmit('fix');
+      expect(d).toMatchObject({ admit: false, signal: 'mem-floor' });
+      expect(d.why).toMatch(/stale|snapshot/i);
+    });
+    it('R559 refuses a future sampledAt beyond the clock skew, admits within it', () => {
+      const at = (offMs) => ({ sampledAt: new Date(NOW + offMs).toISOString(), freshUntil: new Date(NOW + offMs + 15000).toISOString() });
+      expect(mk(() => ({ ...snap(), ...at(86400000) })).tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
+      expect(mk(() => ({ ...snap(), ...at(3000) })).tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
+      expect(mk(() => ({ ...snap(), ...at(1500) })).tryAdmit('fix').admit).toBe(true);
+    });
+    it('R559 clock skew is a policy setting', () => {
+      vi.stubEnv('WE_HOST_CAPACITY_SNAPSHOT_CLOCK_SKEW_MS', '5000');
+      const at = (offMs) => ({ sampledAt: new Date(NOW + offMs).toISOString(), freshUntil: new Date(NOW + offMs + 15000).toISOString() });
+      expect(mk(() => ({ ...snap(), ...at(4000) })).tryAdmit('fix').admit).toBe(true);
+    });
+    it('R559 floor freshness uses the host policy maximum', () => {
+      vi.stubEnv('WE_HOST_CAPACITY_SNAPSHOT_MAX_FRESH_MS', '10000');
+      expect(mk(() => snap({ freshForMs: 10001 })).tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
+      expect(mk(() => snap({ freshForMs: 10000 })).tryAdmit('fix').admit).toBe(true);
+    });
+    it('R559 freshness accepts the exact default window and expiry boundary', () => {
+      expect(mk(() => snap({ ageMs: 20000, freshForMs: 20000 })).tryAdmit('fix').admit).toBe(true);
+      expect(mk(() => snap({ ageMs: 20001, freshForMs: 20000 })).tryAdmit('fix').admit).toBe(false);
     });
     it('refuses below the floor', () => {
       const d = mk(() => snap({ availableMb: 1500 })).tryAdmit('fix');

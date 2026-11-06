@@ -778,3 +778,13 @@ describe('PR 5890 settlement provenance and visible dedupe', () => {
     expect(f.io.runRedTeamGate).toHaveBeenCalledOnce();
   });
 });
+
+describe('readRedTeamOnlyPayload fails closed on a held carry fallback', () => {
+  it.each([
+    ['top-level', { ok: false, reason: 'scan-capped' }],
+    ['carryEvidence', { newest: null, carryEvidence: { ok: false, reason: 'review-unfinished' } }],
+  ])('throws a hold for a %s ok:false witness', (_n, witness) => {
+    const io = createReviewJobIo({ env: {}, readWitness: () => witness, readSeatRecords: () => [] });
+    expect(() => io.readRedTeamOnlyPayload({ pr: 1, repo: 'o/r', head: 'h' })).toThrow(/hold and inspect run evidence/);
+  });
+});

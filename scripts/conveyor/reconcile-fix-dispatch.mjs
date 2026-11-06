@@ -709,6 +709,8 @@ export function fetchCardScopeAtRef(path, ref, { exec = execFileSyncThrottled, r
     });
     const decoded = Buffer.from(String(out || '').trim(), 'base64').toString('utf8');
     const { data } = matter(decoded);
+    // Raw authored entries, unsplit: resolvePrWorkUnit splits each one and keeps it only when EVERY piece is
+    // safe and in the PR's diff, so one bad piece never leaves a sibling alone in the fence (#6424).
     return Array.isArray(data?.scope) ? data.scope.map(String) : [];
   } catch {
     return [];

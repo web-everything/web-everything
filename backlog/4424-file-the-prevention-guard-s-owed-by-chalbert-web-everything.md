@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/lib/lane-salvage.mjs", "we:scripts/lib/salvage-index.mjs", "we:scripts/lib/__tests__/lane-salvage.test.mjs", "we:scripts/lib/__tests__/salvage-index.test.mjs"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-01"
-preparedAgainstSha: "f085212f2ec2fbf4f5de8c23025104875c2a660f"
+preparedDate: "2026-11-05"
+preparedAgainstSha: "1b84dc4b037a3e643ab076be103a49a563e6bb96"
 tags: []
 ---
 
