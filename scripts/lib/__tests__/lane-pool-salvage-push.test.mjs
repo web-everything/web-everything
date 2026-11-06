@@ -179,6 +179,26 @@ describe('remoteHeads (the release proof) reads the canonical origin from the pr
       expect(io.remoteHeads()).toEqual([sha]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+  // The primary is the operator's own checkout: an upstream or fork remote there is normal, and the transport names
+  // the canonical origin URL explicitly, so a remote under any other name cannot redirect it.
+  it('accepts ordinary non-origin remotes (upstream, fork) in the primary for the release proof', () => {
+    const { dir, primary, sha, io } = setup();
+    try {
+      execFileSync('git', ['remote', 'add', 'upstream', 'https://example.invalid/upstream/repo.git'], { cwd: primary });
+      execFileSync('git', ['remote', 'add', 'fork', join(dir, 'fork.git')], { cwd: primary });
+      execFileSync('git', ['config', 'remote.fork.pushurl', 'https://example.invalid/fork/repo.git'], { cwd: primary });
+      expect(io.remoteHeads()).toEqual([sha]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  // A remote NAMED like the canonical origin is what git resolves the explicit URL argument to: that stays refused.
+  it.each(['url', 'pushurl', 'uploadpack'])('still refuses a primary remote aliasing the canonical origin (%s)', key => {
+    const { dir, primary, io } = setup();
+    try {
+      execFileSync('git', ['config', `remote.${join(dir, 'origin.git')}.${key}`, join(dir, 'decoy.git')], { cwd: primary });
+      expect(() => io.remoteHeads()).toThrow(/lane-controlled transport/);
+      expect(() => io.remoteSha('main')).toThrow(/lane-controlled transport/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it('still refuses a URL rewrite in the primary', () => {
     const { dir, primary, io } = setup();
     try {

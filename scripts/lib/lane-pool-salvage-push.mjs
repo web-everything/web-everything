@@ -104,15 +104,19 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
         && !(scope === 'unknown' && externalFile(configOrigin))) || !key || !configOrigin) {
         throw new Error('unknown transport config scope; inspect the lane manually');
       }
-      // Git resolves even a URL argument as a remote name first. Only the exact
-      // origin subsection is allowed in lane config; URL aliases must be refused,
+      // Git resolves even a URL argument as a remote name first, so a remote NAMED
+      // like the canonical origin redirects the transport; URL aliases must be refused,
       // not overridden with -c (remote URLs are multi-valued). Split at the LAST
       // dot because a remote subsection can itself contain dots or line separators.
       const remoteName = /^remote\./i.test(key) ? key.slice(7, key.lastIndexOf('.')) : null;
-      const unsafeRemote = remoteName !== null && (remoteName !== 'origin'
-        || (origin && (normalizeRemoteName(remoteName) === normalizeRemoteName(origin) || sameRepoUrl(remoteName, origin))));
-      // `primary`: the operator's own checkout, not an agent-writable lane, so its auth/signing keys (credential
-      // helper, commit.gpgsign, …) are not lane control. URL rewrites and remote aliasing are still refused there.
+      const aliasesOrigin = remoteName !== null && !!origin
+        && (normalizeRemoteName(remoteName) === normalizeRemoteName(origin) || sameRepoUrl(remoteName, origin));
+      // A lane may configure only the exact `origin` subsection. The primary (the operator's own checkout, not an
+      // agent-writable lane) may carry ordinary extra remotes (upstream, a fork): the transport names the canonical
+      // URL explicitly, so only a remote aliasing that URL can redirect it, and that alias is refused for every key.
+      const unsafeRemote = aliasesOrigin || (!primary && remoteName !== null && remoteName !== 'origin');
+      // `primary`: its auth/signing keys (credential helper, commit.gpgsign, …) are not lane control either.
+      // URL rewrites (insteadOf / pushInsteadOf, above) and origin aliases are still refused there.
       if (['local', 'worktree'].includes(scope)
         && (unsafeRemote || !primary && /^(?:credential\.|https?\.|protocol\.|fetch\.bundleuri$|core\.(?:askpass|gitproxy|sshcommand)$|ssh\.|gpg\.|push\.gpgsign$|user\.signingkey$|commit\.gpgsign$|remote\.[\s\S]*\.(?:proxy|proxyauthmethod|vcs|uploadpack|receivepack|pushurl)$)/i.test(key))) {
         throw new Error('lane-controlled transport configuration; inspect the lane manually and remove it before retrying');

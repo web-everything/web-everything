@@ -126,6 +126,13 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     released(result);
     expect(result.data.kept).toEqual([]);
   });
+  // The operator's primary commonly carries extra remotes; they must not break the canonical-origin proof.
+  it('releases a pushed commit when the primary checkout also has an upstream remote', () => {
+    git(['remote', 'add', 'upstream', join(base, 'upstream.git')], reference);
+    commitWork();
+    git(['push', '--quiet', 'origin', 'HEAD:refs/heads/work/preserved'], laneDir);
+    released(release());
+  });
   it('releases a pushed commit without requiring a particular upstream ref', () => {
     commitWork();
     git(['push', '--quiet', 'origin', 'HEAD:refs/heads/work/preserved'], laneDir);
@@ -224,6 +231,51 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     expect(result.stderr).toContain('not a directory');
     expect(readFileSync(marker, 'utf8')).toBe(lease);
     expect(git(['config', '--get', 'credential.helper'], laneDir)).toBe('linked-helper');
+  });
+  // With recovery ON, a release that ran its work before the redirect refusal would push the ahead commit it sees
+  // (the decoy's, or the moved .git's) to the canonical origin as salvage/lane-1-*, and reap the lane's known litter.
+  // Each shape gives salvage something to push and no transport config to stop it, so only the ordering keeps both off.
+  const RECOVERY_ON = { LANE_POOL_NO_RECOVER: '0', LANE_POOL_AUTO_RECOVER: '1' };
+  const salvageSeen = () => ({
+    refs: git(['ls-remote', origin, 'refs/heads/salvage/*'], reference),
+    record: existsSync(join(base, 'backups', 'lane-1-preserve', 'salvage-ref.txt')),
+  });
+  it.each(['commondir', 'symlinked .git'])('runs no salvage push and no litter cleanup for a %s-redirected lane with recovery on', shape => {
+    let ahead;
+    if (shape === 'commondir') {
+      const decoy = join(base, 'decoy');
+      git(['clone', '--quiet', origin, decoy]);
+      writeFileSync(join(decoy, 'decoy.txt'), 'decoy work\n');
+      git(['add', 'decoy.txt'], decoy);
+      git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '-m', 'decoy work'], decoy);
+      ahead = git(['rev-parse', 'HEAD'], decoy);
+      writeFileSync(join(laneDir, '.git', 'commondir'), `${join(decoy, '.git')}\n`);
+    } else {
+      ahead = commitWork();
+      const moved = join(base, 'moved-git');
+      renameSync(join(laneDir, '.git'), moved);
+      symlinkSync(moved, join(laneDir, '.git'));
+    }
+    expect(git(['rev-list', 'origin/main..HEAD'], laneDir)).toBe(ahead);
+    writeFileSync(join(laneDir, '.commit-msg.txt'), 'known litter\n');
+    const result = release([], '', '', RECOVERY_ON);
+    expect(result.status, result.stderr).toBe(1);
+    expect(result.data.released).toBe(0);
+    expect(result.data.kept).toEqual([expect.objectContaining({ lane: 1, reason: 'git-dir-redirected' })]);
+    expect(result.stderr).not.toContain('salvaged to');
+    expect(salvageSeen()).toEqual({ refs: '', record: false });
+    expect(git(['ls-remote', origin], reference)).not.toContain(ahead);
+    expect(readFileSync(join(laneDir, '.commit-msg.txt'), 'utf8')).toBe('known litter\n');
+    expect(readFileSync(marker, 'utf8')).toBe(lease);
+  });
+  // Control for the spy above: the same recovery-on release of an un-redirected lane does salvage and reap litter.
+  it('salvage-pushes and reaps litter for an un-redirected lane with recovery on (spy control)', () => {
+    const sha = commitWork();
+    writeFileSync(join(laneDir, '.commit-msg.txt'), 'known litter\n');
+    const result = release([], '', '', RECOVERY_ON);
+    released(result);
+    expect(salvageSeen()).toEqual({ refs: expect.stringContaining(sha), record: true });
+    expect(existsSync(join(laneDir, '.commit-msg.txt'))).toBe(false);
   });
   it.each(['with its reflog', 'with an expired reflog'])('refuses tracked work parked in a stash %s', shape => {
     writeFileSync(join(laneDir, 'seed.txt'), 'stashed edit\n');
@@ -467,20 +519,39 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
 // Single-lane only: the bound is per lane, and the fixture is heavy enough not to repeat for --all-pools.
 describe('release guard hidden-entry hash bound', () => {
   const HIDDEN_ENTRY_HASH_LIMIT = 1000; // scripts/lane-pool.mjs
-  it('content-compares up to the limit of flagged entries, and fails closed past it with --discard as the fallback', () => {
-    const files = Array.from({ length: HIDDEN_ENTRY_HASH_LIMIT + 1 }, (_, i) => `many/f${i}.txt`);
+  // Zero-padded names keep this array in `git ls-files` order, so "first" and "last" are the first and last entries
+  // the guard hashes. Only the first `flagged` files get assume-unchanged; the rest stay plain tracked files.
+  const release = (extra = []) => runPool(['release', '--lane=1', ...extra]);
+  const flagFiles = flagged => {
+    const files = Array.from({ length: HIDDEN_ENTRY_HASH_LIMIT + 1 }, (_, i) => `many/f${String(i).padStart(4, '0')}.txt`);
     mkdirSync(join(laneDir, 'many'));
     for (const file of files) writeFileSync(join(laneDir, file), `${file}\n`);
     git(['add', 'many'], laneDir);
     git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '-m', 'many'], laneDir);
     git(['push', '--quiet', 'origin', 'HEAD:refs/heads/work/many'], laneDir);
-    git(['update-index', '--assume-unchanged', ...files.slice(0, HIDDEN_ENTRY_HASH_LIMIT)], laneDir);
-    const release = (extra = []) => runPool(['release', '--lane=1', ...extra]);
-    // At the limit: every flagged entry is hashed, all match, so the lane is clean. Re-acquire for the next case.
+    git(['update-index', '--assume-unchanged', ...files.slice(0, flagged)], laneDir);
+    expect(git(['ls-files', '-v', 'many'], laneDir).split('\n').filter(line => line.startsWith('h ')).length).toBe(flagged);
+    return files;
+  };
+  // Exactly LIMIT flagged entries are all content-compared: a same-mode content edit to ONLY the last (then ONLY the
+  // first) one refuses by name, never as the over-limit fallback, and the restored lane then releases clean.
+  it('compares every one of exactly LIMIT flagged entries: tampering only the last, then only the first, refuses', () => {
+    const files = flagFiles(HIDDEN_ENTRY_HASH_LIMIT);
+    for (const file of [files[HIDDEN_ENTRY_HASH_LIMIT - 1], files[0]]) {
+      writeFileSync(join(laneDir, file), 'tampered\n');
+      expect(git(['status', '--porcelain', '--untracked-files=no'], laneDir)).toBe('');
+      const result = release();
+      refused(result);
+      expect(result.stderr).toContain(`${file} (hidden by index flags: modified)`);
+      expect(result.stderr).not.toContain('exceeds');
+      writeFileSync(join(laneDir, file), `${file}\n`);
+    }
     released(release());
-    expect(runPool(['acquire', '--lane=1', '--no-reset']).status).toBe(0);
-    lease = readFileSync(marker, 'utf8');
-    git(['update-index', '--assume-unchanged', files[HIDDEN_ENTRY_HASH_LIMIT]], laneDir);
+  });
+  // LIMIT+1 flagged entries are not hashed at all: the guard fails closed as unreadable/oversized evidence, and
+  // --discard is the documented operator fallback.
+  it('fails closed with LIMIT+1 flagged entries, with --discard as the fallback', () => {
+    flagFiles(HIDDEN_ENTRY_HASH_LIMIT + 1);
     const result = release();
     refused(result);
     expect(result.stderr).toContain('tracked status unreadable or exceeds');

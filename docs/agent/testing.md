@@ -3919,6 +3919,9 @@ cleanup and salvage. No local `refs/remotes/*` ref is proof: stale, forged and s
 refs all still refuse. A listed tip the lane has not fetched triggers one hardened fetch before refusing.
 An unresolved origin or an unreadable listing refuses; every named pool in a fixture therefore needs
 its primary checkout (a sibling of the reference) so release can resolve that origin.
+The listing checks the primary's config with a primary-only rule: ordinary extra remotes (`upstream`, a fork)
+and operator auth/signing keys pass; URL rewrites (`insteadOf` / `pushInsteadOf`) and any remote named like the
+canonical origin URL still refuse. Salvage transport (`fetchHeads`, `push`, `remoteSha`) keeps the stricter lane rule.
 Tracked changes are read with `--ignore-submodules=none`, and assume-unchanged / skip-worktree entries
 are compared by executable mode and content, so index flags and submodule-ignore config cannot hide an edit
 or a chmod. Past 1000 flagged entries the check fails closed; flagged links and gitlinks are reported, never trusted.
@@ -3933,6 +3936,10 @@ A lane whose `.git` is not a real directory, carries a `.git/commondir`, or does
 common dir to its own `.git` refuses before any release work (config scrub, litter cleanup, salvage push,
 evidence reads): those redirect refs, objects and config to another repository, so every later step would
 read or write the wrong one. `--discard` does not override it; it is listed with `reason: 'git-dir-redirected'`.
+Its tests also run with recovery on, with an ahead commit and litter present, and assert no salvage ref, no
+salvage record and the litter kept; a control case shows the same spy sees an un-redirected lane's salvage.
+The 1000-entry hash bound is pinned by tampering only the last, then only the first, of exactly 1000 flagged
+entries (each refuses by name), and by 1001 flagged entries failing closed.
 Untracked files deliberately do not block release: the guard covers tracked changes only.
 URL-based salvage may leave no tracking ref: only its verified
 remote SHA is an additional exclusion, and unrelated local branches still block release. Tests that
