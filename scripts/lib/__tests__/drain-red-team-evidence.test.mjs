@@ -1039,7 +1039,22 @@ describe('settleUnknownEvidenceByComment: result older than the unfinished revie
   const bounds = o => ({ unfinishedUndecided: true, unfinishedStartedAt: started, unfinishedActiveAt: T + 16 * 60e3, evaluatedAt: T + 2 * 3600e3,
     completeHeadRead: () => ({ complete: true, blocked: false }), ...o });
   const unknown = o => Object.defineProperty({ ok: false, reason: 'review-unfinished' }, 'settleBounds', { value: bounds(o), enumerable: false });
-  const settle = (ev, comments) => settleUnknownEvidenceByComment(ev, comments, pr, head);
+  const settle = (ev, comments, reviews = []) => settleUnknownEvidenceByComment(ev, comments, pr, head, reviews);
+  const review = (state, at, login = 'chalbert') => ({ state, submittedAt: iso(at), author: { login } });
+
+  it('holds when a formal COMMENTED review was submitted after the accept (operator hold)', () => {
+    expect(settle(unknown(), [result(), accept()], [review('COMMENTED', T + 20 * 60e3)])).toMatchObject({ ok: false });
+  });
+  it('holds when a formal CHANGES_REQUESTED review stands after the accept', () => {
+    expect(settle(unknown(), [result(), accept()], [review('CHANGES_REQUESTED', T + 20 * 60e3)])).toMatchObject({ ok: false });
+  });
+  it('holds (fails closed) when the formal reviews are unreadable or not supplied', () => {
+    expect(settle(unknown(), [result(), accept()], null)).toMatchObject({ ok: false });
+    expect(settleUnknownEvidenceByComment(unknown(), [result(), accept()], pr, head)).toMatchObject({ ok: false });
+  });
+  it('still settles when only reviews older than the accept exist', () => {
+    expect(settle(unknown(), [result(), accept()], [review('COMMENTED', T + 8 * 60e3), review('APPROVED', T + 30 * 60e3)])).toMatchObject({ ok: true, settledByComment: 'review-unfinished' });
+  });
 
   it('settles when a trusted accept on this head is newer than the unfinished review start', () => {
     expect(settle(unknown(), [result(), accept()])).toMatchObject({ ok: true, settledByComment: 'review-unfinished' });

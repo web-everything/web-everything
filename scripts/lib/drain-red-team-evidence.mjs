@@ -577,7 +577,7 @@ const newestResultComment = (comments, pr, head) => (Array.isArray(comments) ? c
 // every unread record, holding on any open effect, rejection or review that may still be running.
 export const UNREAD_SETTLE_MARGIN_MS = RUN_MTIME_SLACK_MS + ABANDONED_REVIEW_AFTER_MS;
 export const COMMENT_SETTLEABLE_REASONS =Object.freeze(['review-unfinished', RUN_SCAN_CAPPED.reason]);
-export function settleUnknownEvidenceByComment(evidence, comments, pr, head) {
+export function settleUnknownEvidenceByComment(evidence, comments, pr, head, reviews = undefined) {
   if (evidence?.ok !== false || !COMMENT_SETTLEABLE_REASONS.includes(evidence.reason)) return evidence;
   if (!redTeamForHead(comments, pr, head)) return evidence;
   const resultAt = Date.parse(commentCreatedAt(newestResultComment(comments, pr, head)));
@@ -586,8 +586,10 @@ export function settleUnknownEvidenceByComment(evidence, comments, pr, head) {
   // this exact head, with nothing held after it) came after that review started: the accept is the verdict the
   // unfinished run never recorded, and its time stands in for the result's in every bound and the complete read.
   let at = resultAt;
-  if (evidence.reason === 'review-unfinished' && Number.isFinite(resultAt) && Number.isFinite(bounds.unfinishedStartedAt) && !(resultAt > bounds.unfinishedStartedAt)) {
-    const rec = latestAcceptRecord(comments, undefined, { sha: String(head).toLowerCase() });
+  // The formal reviews must be a complete read (an array): a later COMMENTED / CHANGES_REQUESTED review is a hold that
+  // no comment or label shows, so a missing or unreadable read leaves the accept unusable (fail closed).
+  if (evidence.reason === 'review-unfinished' && Array.isArray(reviews) && Number.isFinite(resultAt) && Number.isFinite(bounds.unfinishedStartedAt) && !(resultAt > bounds.unfinishedStartedAt)) {
+    const rec = latestAcceptRecord(comments, reviews, { sha: String(head).toLowerCase() });
     const acceptAt = Date.parse(rec?.at ?? '');
     if (rec && !rec.laterBodyDerivedHold && !rec.laterVerdict && Number.isFinite(acceptAt) && acceptAt > bounds.unfinishedStartedAt) at = acceptAt;
   }
