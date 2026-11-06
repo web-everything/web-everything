@@ -209,7 +209,8 @@ describe('production heavy runner failing TAP evidence', () => {
 
   it.each([
     ['incomplete plan', stdout => stdout.replace('1..3', '1..4')],
-    ['missing typed count', stdout => stdout.replace(/^      Tests  .*$/m, '')],
+    // Tolerate reporter ANSI coloring (CI colors the label), else the line survives and nothing is corrupted.
+    ['missing typed count', stdout => stdout.replace(/^(?: |\u001b\[[0-9;]*m)*Tests(?:\u001b\[[0-9;]*m| )+.*$/m, '')],
     ['oversized inventory', stdout => stdout + ' '.repeat(8 * 1024 * 1024)],
   ])('fails closed with operator review for nonzero-with-error and %s', async (_, corrupt) => {
     const f = fixture(), calls = tapRunners(f, { corrupt });
