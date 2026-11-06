@@ -3,7 +3,143 @@ import { isOperatorAuthored, isTrustedMarkerAuthor } from './marker-authorship.m
 
 const commentsOf = pr => Array.isArray(pr?.comments) ? pr.comments : [];
 // Keep a separator so removal cannot assemble new comment delimiters or evidence references.
-const stripComments = text => String(text ?? '').replace(/<!--[\s\S]*?-->/g, ' ');
+// Without any "-->" the lazy scan from every "<!--" is quadratic on hostile input; nothing could match anyway.
+const stripComments = text => {
+  const s = String(text ?? '');
+  return s.includes('-->') ? s.replace(/<!--[\s\S]*?-->/g, ' ') : s;
+};
+/**
+ * Same-length copy of `source` with every inline code span (a backtick run closed by the next run of EQUAL length on
+ * the same line, as CommonMark pairs them) blanked. Linear: the old `(`+)[^\n]*?\1` regex backtracked through every
+ * shorter run length, so one long backtick run cost quadratic time. A run with no partner blanks nothing, which only
+ * ever makes the stripper hide more, never less.
+ */
+function blankInlineCode(source) {
+  // Split on every line break stripQuoted honours (\r\n, lone \r, \n), keeping them, so a span never crosses a line.
+  return source.split(/(\r\n?|\n)/).map((line, index) => {
+    if (index % 2 || !line.includes('`')) return line;
+    const runs = [...line.matchAll(/`+/g)].map(m => ({ start: m.index, end: m.index + m[0].length, len: m[0].length }));
+    const next = new Array(runs.length).fill(-1), seen = new Map();
+    for (let i = runs.length - 1; i >= 0; i--) {
+      next[i] = seen.get(runs[i].len) ?? -1;
+      seen.set(runs[i].len, i);
+    }
+    const chars = line.split('');
+    for (let i = 0; i < runs.length; i++) {
+      if (next[i] === -1) continue;
+      for (let k = runs[i].start; k < runs[next[i]].end; k++) chars[k] = ' ';
+      i = next[i];
+    }
+    return chars.join('');
+  }).join('');
+}
+/**
+ * Blank every HTML blockquote/pre block, depth-counted so a nested block cannot end its outer one early.
+ * An unterminated block runs to the end of the text. One linear pass.
+ */
+function blankHtmlComments(source, code) {
+  // Same-length copy with every terminated HTML comment blanked, so a tag written inside a comment is not a tag. A `<!--`
+  // that sits in inline code does not start a comment; an unterminated one blanks nothing (the stripper then hides more).
+  let out = '', last = 0, from = 0;
+  for (;;) {
+    const open = source.indexOf('<!--', from);
+    if (open === -1) break;
+    if (code[open] !== '<') { from = open + 4; continue; }
+    const close = source.indexOf('-->', open + 4);
+    if (close === -1) break;
+    out += source.slice(last, open) + ' '.repeat(close + 3 - open);
+    last = from = close + 3;
+  }
+  return out + source.slice(last);
+}
+function stripHtmlBlocks(text) {
+  const source = String(text ?? '');
+  // Tags are located in a same-length copy with comments blanked. Inline code (`<pre>` in prose is not a block) only
+  // hides a tag while no block is open: inside a real <pre>/<blockquote> there is no Markdown, so a backticked tag is a tag.
+  // Only a whole tag name counts: `<pre-commit>` or `<blockquote styling` must not hide a real marker.
+  const code = blankInlineCode(source);
+  const scan = blankHtmlComments(source, code);
+  const tag = /<(\/?)(blockquote|pre)(?:\s[^<>]*)?\/?>/gi;
+  // Open tag names, innermost last. A closer only counts when it names the innermost open tag: an unrelated one
+  // (`</blockquote>` inside `<pre>`) is ignored, so a marker still inside the example stays hidden (fails closed).
+  const open = [];
+  let out = '', last = 0, start = 0, m;
+  while ((m = tag.exec(scan))) {
+    if (!open.length && code[m.index] !== '<') continue; // a tag inside inline code, outside any block
+    const name = m[2].toLowerCase();
+    if (!m[1]) {
+      if (!open.length) start = m.index;
+      open.push(name);
+    } else if (open.length && open[open.length - 1] === name) {
+      open.pop();
+      if (open.length) continue;
+      const end = source.indexOf('>', m.index);
+      if (end === -1) { open.push(name); break; } // a closing tag with no ">" is still unterminated
+      out += source.slice(last, start) + ' ';
+      last = tag.lastIndex = end + 1;
+    }
+  }
+  return open.length ? out + source.slice(last, start) + ' ' : out + source.slice(last);
+}
+/**
+ * Only text a fixer actually wrote as a claim can resolve a request: blockquoted lines ("> Request 1001 remains
+ * unaddressed.") and fenced code blocks (``` or ~~~ examples of the marker) are references, not coverage.
+ * Variants covered: quotes and fences nested in list items, a lazy quote continuation (the non-blank lines right
+ * after a quote line), tab/4-space indented code, tilde fences, and an unterminated fence (runs to the end of the
+ * text, as Markdown renders it). Every ambiguity here fails closed: the request just stays open.
+ */
+const CONTAINER = '[ \\t\\u00a0]*(?:(?:[-*+]|\\d{1,9}[.)])[ \\t\\u00a0]+)*';
+const FENCE_OPEN = new RegExp(`^${CONTAINER}(\`{3,}|~{3,})(.*)$`);
+// `&gt;` renders as a literal ">" (not a quote), but a reference spelled that way is still a reference, not a claim.
+const QUOTE_LINE = new RegExp(`^${CONTAINER}(?:>|&gt;)`);
+// A line that opens an HTML comment starts a new block: it ends a lazy quote continuation, so a real marker under a quote still counts.
+const COMMENT_LINE = /^[ \t]*<!--/;
+// Columns a leading-whitespace prefix occupies (a tab advances to the next multiple of 4; anything else is 1).
+const columnsOf = prefix => [...prefix].reduce((col, ch) => ch === '\t' ? col + 4 - (col % 4) : col + 1, 0);
+const CLOSE_FENCE = /^([ \t]*)(`{3,}|~{3,})[ \t]*$/;
+const LIST_PREFIX = /[^ \t\u00A0]/;
+function stripQuoted(text) {
+  const out = [];
+  let fence = null, fenceIndent = 0, fenceInList = false, quoting = false;
+  // HTML quote and preformatted blocks render as quoted/code text; an unterminated one runs to the end.
+  const source = stripHtmlBlocks(text);
+  for (const line of source.split(/\r\n?|\n/)) {
+    let reopen = false;
+    if (fence) {
+      // CommonMark: a closing fence is indented at most 3 columns (tabs count to the next multiple of 4), whatever the
+      // opener's own indent: a 3-space opener does not buy a 6-space closer. Only a fence inside a list item measures
+      // from that item's content column, and a closer left of that column ends the item, so it ends the fence AND
+      // starts a fresh fence of its own on this same line.
+      const close = CLOSE_FENCE.exec(line);
+      const col = close ? columnsOf(close[1]) : 0;
+      if (close && close[2][0] === fence[0] && close[2].length >= fence.length) {
+        if (fenceInList && col < fenceIndent) { fence = null; reopen = true; }
+        else if (col <= (fenceInList ? fenceIndent + 3 : 3)) fence = null;
+      }
+      if (!reopen) { out.push(''); continue; }
+    }
+    const open = FENCE_OPEN.exec(line);
+    // A backtick fence's info string cannot contain a backtick (that is inline code, not a fence). Outside a list item
+    // the opener itself is indented at most 3 columns: four or more is indented code, and reading it as a fence would
+    // flip which later fence line counts as its closer.
+    const openPrefix = open ? line.slice(0, line.indexOf(open[1])) : '';
+    if (open && !(open[1][0] === '`' && open[2].includes('`')) && (LIST_PREFIX.test(openPrefix) || columnsOf(openPrefix) <= 3)) {
+      fence = open[1];
+      // fenceIndent is the fence's start COLUMN (tabs expanded), so closer columns compare like with like.
+      fenceIndent = columnsOf(openPrefix);
+      fenceInList = /[^ \t\u00A0]/.test(openPrefix);
+      quoting = false;
+      out.push('');
+    } else if (QUOTE_LINE.test(line) || (quoting && line.trim() && !COMMENT_LINE.test(line))) {
+      quoting = true;
+      out.push('');
+    } else {
+      quoting = false;
+      out.push(/^(?: {4}|\t)/.test(line) ? '' : line);
+    }
+  }
+  return out.join('\n');
+}
 const shaOf = value => /^[a-f0-9]{7,40}$/i.test(String(value ?? '')) ? String(value).toLowerCase() : null;
 // Short and full spellings of the same head must never count as a push.
 const differentHead = (from, to) => {
@@ -27,14 +163,33 @@ export function operatorSendBacks(comments) {
       at: Number.isFinite(time) ? new Date(time).toISOString() : null, login,
       head: /\b(?:at|on) head\s+`?([a-f0-9]{7,40})\b/i.exec(text)?.[1]?.toLowerCase() ?? null,
       etLabel: /~?\b\d{1,2}:\d{2}\s+ET\b/.exec(text)?.[0] ?? null,
-      body: text.slice(0, 4000), index }];
+      // `body` is bounded for review prompts; `fullBody` is what a fixer needs, with nothing cut off.
+      // GitHub caps a comment near 64k; keep the same ceiling explicitly.
+      body: text.slice(0, 4000), fullBody: text.slice(0, 65536), index }];
   });
+}
+
+/**
+ * A real marker is a whole HTML comment, alone at the start of its line. Comment spans are scanned, so a marker
+ * inside another (multi-line or nested) comment is part of that outer span, which is not the marker: it is hidden.
+ */
+function markerLineFor(text, id) {
+  const exact = new RegExp(`^<!--\\s*addresses-operator-send-back:\\s*${escapeRe(id)}\\s*-->$`);
+  const source = String(text ?? '');
+  if (!source.includes('-->')) return false;
+  for (const span of source.matchAll(/<!--[\s\S]*?-->/g)) {
+    if (!exact.test(span[0])) continue;
+    const lineStart = source.lastIndexOf('\n', span.index - 1) + 1;
+    if (!source.slice(lineStart, span.index).trim()) return true;
+  }
+  return false;
 }
 
 /** An explicit reference, never a generic "fixed" assertion or an unrelated timestamp. */
 function namesSendBack(text, item, { carry = false } = {}) {
   const prose = stripComments(text);
-  return (item.id && new RegExp(`<!--\\s*addresses-operator-send-back:\\s*${escapeRe(item.id)}\\s*-->`).test(text))
+  // The marker must start its line: one nested inside another HTML comment or inline prose is a reference.
+  return (item.id && markerLineFor(text, item.id))
     || containsToken(prose, item.id) || (!!item.url && prose.includes(item.url))
     || (!!item.at && prose.includes(item.at))
     || (!!item.etLabel && (carry || /\bsend-back\b/i.test(prose))
@@ -71,9 +226,20 @@ export function openOperatorSendBacks(pr) {
     if (superseded) resolved.add(item.index);
     if (comments.some((c, index) => {
       if (index <= item.index || !isTrustedMarkerAuthor(c)) return false;
-      const text = String(c?.body ?? '');
+      const text = stripQuoted(String(c?.body ?? ''));
       const proseCoverage = index < (next?.index ?? comments.length)
         && /\boperator send(?:-back|back| back)\b/i.test(stripComments(text));
+      // A released fixer may put the explicit coverage on fix-end instead of a separate evidence comment.
+      // Preserve the old path for missing/ambiguous timestamps, generic releases and unchanged heads.
+      // Only the explicit marker line is coverage here: a bare id/url/time mention in a release can just as well say
+      // the request "remains unaddressed", and a claim release is not evidence of a repair on its own.
+      if (text.trimStart().startsWith('🔓 conveyor fix-end') && !!item.id && markerLineFor(text, item.id)) {
+        const at = Date.parse(c.createdAt), requestedAt = Date.parse(item.at);
+        const release = /^🔓 conveyor fix-end — fix claim released\r?\n\r?\n`([^`\r\n]+)` released the fix claim at `([a-f0-9]{7,40})`\.(?:[ \t]|\r?\n|$)/i.exec(text);
+        const head = release?.[1].trim() ? release[2] : null;
+        if (Number.isFinite(at) && Number.isFinite(requestedAt) && at > requestedAt
+          && head && (!item.head || differentHead(item.head, head))) return true;
+      }
       if (!isFixEvidence(text) || !(namesSendBack(text, item) || proseCoverage)) return false;
       if (!item.head) return true;
       const namedHead = /\bHead:\s*`([a-f0-9]{7,40})`/i.exec(stripComments(text));
@@ -85,15 +251,18 @@ export function openOperatorSendBacks(pr) {
     const later = items[n];
     if (!resolved.has(later.index)) continue;
     for (const earlier of items.slice(0, n)) {
-      if (namesSendBack(String(comments[later.index]?.body ?? ''), earlier, { carry: true })) resolved.add(earlier.index);
+      // A quoted or fenced mention of an earlier request is context, not a carry-over of it.
+      if (namesSendBack(stripQuoted(String(comments[later.index]?.body ?? '')), earlier, { carry: true })) resolved.add(earlier.index);
     }
   }
   return items.filter(item => !resolved.has(item.index));
 }
 
 // A body cannot close its own DATA fence, even if the operator quoted Markdown fences in the request.
-function quotedItems(open) {
-  return open.map(item => {
+// The review block stays bounded; the fixer brief (`full`) must carry every must-fix line.
+function quotedItems(open, { full = false } = {}) {
+  return open.map(raw => {
+    const item = full ? { ...raw, body: raw.fullBody ?? raw.body } : raw;
     const longest = Math.max(0, ...(item.body.match(/`+/g) ?? []).map(s => s.length));
     const fence = '`'.repeat(Math.max(3, longest + 1));
     return `## Send-back ${item.id ?? '(id unavailable)'} — ${item.at ?? '(time unavailable)'}${item.etLabel ? ` (${item.etLabel})` : ''}\n`
@@ -110,7 +279,7 @@ export function renderOperatorSendBackBrief(open) {
     + 'It MUST include the following marker per item it addressed (one line each):\n'
     + open.map(item => `<!-- addresses-operator-send-back: ${item.id ?? 'UNKNOWN'} -->`).join('\n')
     + '\nAlso include Head: `<fixed head sha>` and the concrete repair and verification evidence.\n\n'
-    + quotedItems(open) + '\n\n';
+    + quotedItems(open, { full: true }) + '\n\n';
 }
 
 export function renderOperatorSendBackReviewBlock(open) {
