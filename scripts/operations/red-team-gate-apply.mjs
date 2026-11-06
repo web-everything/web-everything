@@ -64,6 +64,7 @@ const where = (f) => (f.file ? `\`${sanitizeCardField(f.file, 200)}${f.line ? `:
 const findingLine = (f, i) => `${i + 1}. ${where(f)} — (${sanitizeCardField(f.category, 40)}, ${sanitizeCardField(f.impact ?? 'impact not stated', 40)}) `
   + `${sanitizeCardField(f.summary, 600)}${f.scenario ? `\n   - Scenario: ${sanitizeCardField(f.scenario, 1200)}` : ''}`
   + `${f.findingClass ? `\n   - Class: ${sanitizeCardField(f.findingClass, 80)}${f.classBasis ? ` (basis: ${sanitizeCardField(f.classBasis, 1200)})` : ''}` : ''}`
+  + `${f.alsoClasses?.length ? `\n   - Also class: ${f.alsoClasses.map(c => sanitizeCardField(c, 80)).join(', ')}` : ''}`
   + `${f.securityReachableToday === true ? '\n   - Security class: security-reachable-today' : ''}`
   + `${f.recheck ? `\n   - Claude's re-check: ${sanitizeCardField(f.recheck, 600)}` : ''}`;
 
@@ -82,7 +83,7 @@ export function buildSendBackBody({ pr, head, findings }) {
 /** The `file-item` input for ONE follow-up card carrying every carded finding. PURE. */
 export function buildRedTeamCardInput({ repo, pr, head, findings }) {
   const files = [...new Set(findings.map(cleanFindingFile).filter(Boolean))];
-  const classes = [...new Set(findings.flatMap(f => [f.findingClass, ...(f.securityReachableToday === true ? ['security-reachable-today'] : [])]).filter(Boolean))].map(c => sanitizeCardField(c, 80));
+  const classes = [...new Set(findings.flatMap(f => [f.findingClass, ...(f.alsoClasses ?? []), ...(f.securityReachableToday === true ? ['security-reachable-today'] : [])]).filter(Boolean))].map(c => sanitizeCardField(c, 80));
   const digest = `Filed mechanically by the red-team gate: the post-accept red team on ${repo}#${pr} (reviewed head \`${head}\`) `
     + 'found these, Claude\'s re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up '
     + 'card instead of blocking the PR:\n\n' + findings.map(findingLine).join('\n');

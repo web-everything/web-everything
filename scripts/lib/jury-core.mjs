@@ -1,4 +1,4 @@
-import { FINDING_CLASSES, classAction, readFindingClassPolicy } from './finding-class-policy.mjs';
+import { FINDING_CLASSES, classAction, readFindingClassPolicy, validAlsoClasses } from './finding-class-policy.mjs';
 /**
  * jury-core.mjs — the subject-agnostic JURY ENGINE core (#2653, foundational slice of epic #2649).
  *
@@ -376,6 +376,7 @@ export function normalizeFinding(raw) {
   const out = { summary: String(summary).trim() };
   if (raw.securityReachableToday === true) out.securityReachableToday = true;
   if (FINDING_CLASSES.includes(raw.findingClass)) out.findingClass = raw.findingClass;
+  if (out.findingClass && validAlsoClasses(raw.alsoClasses, out.findingClass).length) out.alsoClasses = validAlsoClasses(raw.alsoClasses, out.findingClass);
   if (typeof raw.classBasis === 'string') out.classBasis = raw.classBasis.trim();
   if (raw.file) out.file = String(raw.file);
   if (raw.failure_scenario) out.failure_scenario = String(raw.failure_scenario);

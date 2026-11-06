@@ -49,7 +49,15 @@ describe('finding class policy', () => {
     expect(stricterClass('live-reproduced', 'security-reachable-today')).toBe('live-reproduced');
     expect(stricterClass('attacker-same-user', 'coverage-or-style')).toBe('attacker-same-user');
     expect(stricterClass('theoretical-race', undefined)).toBeUndefined();
-    expect(stricterClass('unknown', 'live-reproduced')).toBe('unknown');
+    expect(stricterClass('unknown', 'live-reproduced')).toBeUndefined();
+    expect(stricterClass('live-reproduced', 'theoretical-race → defer-card (basis: x)')).toBeUndefined();
+  });
+  it('a retained class that needs a fix keeps the finding fix-now across policy changes', () => {
+    const f = { findingClass: 'live-reproduced', alsoClasses: ['correctness-in-normal-use'], classBasis: 'basis' };
+    const policy = { 'live-reproduced': 'defer-card' };
+    expect(classAction(f, policy)).toBe('fix-now');
+    expect(classAction(f, { ...policy, 'correctness-in-normal-use': 'defer-card' })).toBe('defer-card');
+    expect(classAction({ ...f, alsoClasses: ['bogus', 'live-reproduced'] }, policy)).toBe('defer-card');
   });
   it('reads only operator preferences through the shared reader', () => {
     const policy = readFindingClassPolicy({ env: { WE_PLATFORM_PREFERENCES_FILE: '/operator/prefs.json' },

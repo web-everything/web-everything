@@ -1,4 +1,4 @@
-import { classAction, readFindingClassPolicy } from './finding-class-policy.mjs';
+import { FINDING_CLASSES, allClasses, classAction, readFindingClassPolicy } from './finding-class-policy.mjs';
 /**
  * @file scripts/lib/red-team-gate.mjs
  * @description CONFIRMED POST-ACCEPT RED-TEAM BREAKS GO BACK TO THE FIXER (card x1b8hlo, operator go 2026-10-10).
@@ -88,6 +88,8 @@ export function parseRedTeamComment(body) {
     }
     if (line === '   - Security class: security-reachable-today' && findings.length)
       findings.at(-1).securityReachableToday = true;
+    const also = /^ {3}- Also class: ([a-z-]+(?:, [a-z-]+)*)$/.exec(line);
+    if (also && findings.length) findings.at(-1).alsoClasses = also[1].split(', ').filter(c => FINDING_CLASSES.includes(c));
     const classification = /^ {3}- Class: (.*?) → (?:fix-now|defer-card)(?: \(basis: (.*)\))?$/.exec(line);
     if (classification && findings.length) {
       findings.at(-1).findingClass = classification[1].trim();
@@ -112,7 +114,8 @@ export function redTeamResultId(parsed) {
   if (!parsed) return null;
   const security = (parsed.findings ?? []).some(f => f?.securityReachableToday === true);
   const classified = security || (parsed.findings ?? []).some(f => f?.findingClass != null);
-  const fields = classified ? [...RESULT_ID_FIELDS, 'findingClass', 'classBasis', ...(security ? ['securityReachableToday'] : [])] : RESULT_ID_FIELDS;
+  const also = (parsed.findings ?? []).some(f => f?.alsoClasses?.length);
+  const fields = classified ? [...RESULT_ID_FIELDS, 'findingClass', 'classBasis', ...(security ? ['securityReachableToday'] : []), ...(also ? ['alsoClasses'] : [])] : RESULT_ID_FIELDS;
   const findings = (parsed.findings ?? []).map(f => fields.map(k => f?.[k] ?? null));
   // A finding-shaped line the strict parser skipped (indented, other case, malformed) also keys the result, so adding
   // one re-keys it and voids every record for the old id (fail closed). A result with none keeps its v1 id, so existing
@@ -272,7 +275,8 @@ export function breakClass(f) {
  */
 export function classOnlyCards(cards, setting = CONFIRMED_BREAKS_DEFAULTS) {
   return (cards ?? []).filter(f => (f.findingClass || f.securityReachableToday)
-    && !planRedTeamActions({ findings: [f] }, { ...setting, findingClasses: { [f.findingClass]: 'fix-now' } }).card.includes(f));
+    && !planRedTeamActions({ findings: [f] }, { ...setting,
+      findingClasses: Object.fromEntries((allClasses(f).length ? allClasses(f) : [f.findingClass]).map(c => [c, 'fix-now'])) }).card.includes(f));
 }
 
 /**

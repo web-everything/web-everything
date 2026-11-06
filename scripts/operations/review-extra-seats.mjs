@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { FINDING_CLASSES, classAction, stricterClass, readFindingClassPolicy } from '../lib/finding-class-policy.mjs';
+import { FINDING_CLASSES, classAction, stricterClass, readFindingClassPolicy, validAlsoClasses } from '../lib/finding-class-policy.mjs';
 import { decodeRecoveryAdmission } from '../lib/drain-red-team-evidence.mjs';
 import { recordRedTeamStatus, readRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
 import { normalizeRedTeamResult } from '../lib/review-red-team-on-skip.mjs';
@@ -1394,11 +1394,13 @@ export function applyRecheck(findings, value) {
     const c = byIndex.get(i);
     const filesRead = publishableFilesRead(c?.filesRead);
     const findingClass = stricterClass(f.findingClass, c?.findingClass);
+    // Both reviewers' classes persist so a later policy change cannot defer a finding whose other class needs a fix.
+    const alsoClasses = findingClass ? validAlsoClasses([f.findingClass, c?.findingClass, ...(Array.isArray(f.alsoClasses) ? f.alsoClasses : [])], findingClass) : [];
     const securityReachableToday = f.securityReachableToday === true
       || [f.findingClass, c?.findingClass].includes('security-reachable-today');
-    const classBasis = findingClass === f.findingClass ? f.classBasis : c?.classBasis;
+    const classBasis = !findingClass ? undefined : findingClass === f.findingClass ? f.classBasis : c?.classBasis;
     const unverifiable = !c || c.unverifiable === true || (c.confirmed !== true && filesRead.length === 0);
-    return { ...f, findingClass, classBasis, ...(securityReachableToday ? { securityReachableToday: true } : {}), confirmedByRecheck: !unverifiable && c?.confirmed === true,
+    return { ...f, findingClass, classBasis, ...(alsoClasses.length ? { alsoClasses } : { alsoClasses: undefined }), ...(securityReachableToday ? { securityReachableToday: true } : {}), confirmedByRecheck: !unverifiable && c?.confirmed === true,
       recheckOutcome: unverifiable ? 'unverifiable' : c.confirmed ? 'confirmed' : 'not confirmed',
       filesRead, recheckReason: c ? publishableRecheckReason(c.reason) : 'insufficient evidence' };
   });
@@ -1469,7 +1471,8 @@ export function renderRedTeamComment({ pr, rev, provider, model, findings, reche
     const where = f.file ? ' ' + BT + file + at + BT : '';
     const cls = (v, fallback) => one(publishable(v)).replace(CLASS_UNSAFE, ' ').trim() || fallback;
     return `${i + 1}. [${tag}] (${cls(f.category, 'uncategorised')}, ${cls(f.impactIfUnfixed, 'impact?')})${where} — ${one(publishable(f.summary))}`
-      + `${f.findingClass ? `\n   - Class: ${one(publishable(f.findingClass))} → ${classAction(f, findingClasses)}${typeof f.classBasis === 'string' ? ` (basis: ${one(publishable(f.classBasis))})` : ''}` : ''}`
+      + `${FINDING_CLASSES.includes(f.findingClass) ? `\n   - Class: ${one(publishable(f.findingClass))} → ${classAction(f, findingClasses)}${typeof f.classBasis === 'string' ? ` (basis: ${one(publishable(f.classBasis))})` : ''}` : ''}`
+      + `${validAlsoClasses(f.alsoClasses, f.findingClass).length && f.findingClass ? `\n   - Also class: ${validAlsoClasses(f.alsoClasses, f.findingClass).join(', ')}` : ''}`
       + `${f.securityReachableToday === true ? '\n   - Security class: security-reachable-today' : ''}`
       + `${f.failure_scenario ? `\n   - Scenario: ${one(publishable(f.failure_scenario))}` : ''}`
       + `${f.recheckReason ? `\n   - Re-check: ${one(publishable(f.recheckReason))}` : ''}`
@@ -1568,7 +1571,7 @@ async function resumeRedTeam({ pr, repo, rev, title, prior, records, post, recor
     return { status: 'error', reason: 'completed red-team row has incomplete verdict evidence; inspect stored evidence — no call launched' };
   }
   const findings = prior.findings.map((f) => withFileReadEvidence({
-    summary: f.summary, findingClass: f.findingClass, classBasis: f.classBasis,
+    summary: f.summary, findingClass: f.findingClass, classBasis: f.classBasis, alsoClasses: f.alsoClasses,
     ...(f.securityReachableToday === true ? { securityReachableToday: true } : {}), category: f.category ?? null, file: f.file ?? null, line: f.line ?? null, impactIfUnfixed: f.impactIfUnfixed ?? null,
     recheckOutcome: f.recheckOutcome ?? (f.confirmedByRecheck ? 'confirmed' : f.filesRead?.length ? 'not confirmed' : 'unverifiable'), filesRead: f.filesRead,
     failure_scenario: f.failure_scenario ?? null, confirmedByRecheck: f.confirmedByRecheck === true, recheckReason: f.recheckReason ?? null,
@@ -1919,7 +1922,7 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
       foldedVerdict,
       builder: { provider: builder.provider, model: builder.model, taskType: builder.taskType, source: builder.source },
       findings: seatRow.findings.map((f, i) => ({
-        ...f, findingClass: findings[i]?.findingClass, classBasis: publishable(findings[i]?.classBasis),
+        ...f, findingClass: findings[i]?.findingClass, classBasis: publishable(findings[i]?.classBasis), alsoClasses: findings[i]?.alsoClasses,
         ...(findings[i]?.securityReachableToday === true ? { securityReachableToday: true } : {}), category: publishable(findings[i]?.category), failure_scenario: publishable(findings[i]?.failure_scenario),
         recheckOutcome: findings[i]?.recheckOutcome, filesRead: findings[i]?.filesRead,
         confirmedByRecheck: findings[i]?.confirmedByRecheck ?? false, recheckReason: publishable(findings[i]?.recheckReason),

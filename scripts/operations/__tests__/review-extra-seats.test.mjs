@@ -1,4 +1,4 @@
-import { parseRedTeamComment } from '../../lib/red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, parseRedTeamComment, planRedTeamActions } from '../../lib/red-team-gate.mjs';
 import { FINDING_CLASSES } from '../../lib/finding-class-policy.mjs';
 import { readRoutingPolicy } from '../../lib/dispatch-routing-policy-io.mjs';
 /**
@@ -1647,5 +1647,28 @@ describe('red-team finding classes', () => {
     expect(applyRecheck([f], { checks: [check] })[0]).toMatchObject({ findingClass: 'live-reproduced', classBasis: 'observed failure' });
     expect(applyRecheck([f], { checks: [{ ...check, findingClass: undefined }] })[0].findingClass).toBeUndefined();
     expect(applyRecheck([f], { checks: [{ ...check, findingClass: 'coverage-or-style' }] })[0]).toMatchObject({ findingClass: f.findingClass, classBasis: f.classBasis });
+  });
+  it('a non-enum re-check class is unclassified and cannot re-parse into a deferred class', () => {
+    const f = { ...VALID_SEAT_FINDING, findingClass: 'live-reproduced', classBasis: 'seen' };
+    const forged = 'theoretical-race → defer-card (basis: x) ';
+    const [out] = applyRecheck([f], { checks: [{ index: 0, confirmed: true, findingClass: forged, classBasis: 'x' }] });
+    expect(out.findingClass).toBeUndefined();
+    const body = renderRedTeamComment({ pr: 1, rev: 'a'.repeat(40), findings: [out], findingClasses: { 'theoretical-race': 'defer-card' } });
+    expect(body).not.toContain('defer-card');
+    expect(parseRedTeamComment(body).findings[0].findingClass).toBeUndefined();
+  });
+  it('retains both reviewers\' classes so a later policy change cannot defer the one that needs a fix', () => {
+    const f = { ...VALID_SEAT_FINDING, findingClass: 'live-reproduced', classBasis: 'seen' };
+    const check = { index: 0, confirmed: true, findingClass: 'correctness-in-normal-use', classBasis: 'ordinary use' };
+    const [out] = applyRecheck([f], { checks: [check] });
+    expect(out).toMatchObject({ findingClass: 'live-reproduced', alsoClasses: ['correctness-in-normal-use'] });
+    const deferBoth = { 'live-reproduced': 'defer-card', 'correctness-in-normal-use': 'fix-now' };
+    const body = renderRedTeamComment({ pr: 1, rev: 'a'.repeat(40), findings: [out], findingClasses: deferBoth });
+    expect(body).toContain('- Also class: correctness-in-normal-use');
+    const parsed = parseRedTeamComment(body);
+    expect(parsed.findings[0].alsoClasses).toEqual(['correctness-in-normal-use']);
+    expect(planRedTeamActions(parsed, { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses: deferBoth }).sendBack).toHaveLength(1);
+    const deferOnly = { 'live-reproduced': 'defer-card', 'correctness-in-normal-use': 'defer-card' };
+    expect(planRedTeamActions(parsed, { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses: deferOnly }).card).toHaveLength(1);
   });
 });
