@@ -34,40 +34,78 @@ const place = (arg, cwd, exe) => isPathArg(arg) ? expand(arg)
 // Command wrappers that exec their first non-option, non-assignment operand. `env` is the
 // common launchd one; the rest are the same shape. An option we cannot classify is reported
 // as unknownAt so the caller flags a following clone path instead of silently excluding it.
+const INTERPRETER = /^(?:node|nodejs|python(?:\d+(?:\.\d+)*)?|pypy\d*|bash|sh|zsh|dash|ksh|ruby|perl)$/;
+// Wrappers whose options we parse precisely, and wrappers we only know by name (their
+// options and positional operands vary too much to enumerate: `timeout 10 node x`, `sudo -u me node x`).
 const WRAPPERS = /^(?:env|nohup|exec|command|time|nice|arch|caffeinate)$/;
-function unwrap(args, start, cwd) {
-  const name = basename(args[start]).toLowerCase();
+const LOOSE_WRAPPERS = /^(?:taskpolicy|sudo|xcrun|timeout|gtimeout|sandbox-exec|setsid|chroot|runuser|doas|stdbuf|ionice|chrt)$/;
+const isCommand = arg => { const n = basename(arg).toLowerCase(); return INTERPRETER.test(n) || WRAPPERS.test(n) || LOOSE_WRAPPERS.test(n); };
+const MAX_WRAPPER_DEPTH = 16;
+// A wrapper option we cannot classify may carry an operand, so the program position is unknown.
+// Resume at the next argument that names an interpreter or another wrapper; failing that, report
+// the option as unknown with an UNBOUNDED scan (`wide`): the 2-operand window used for interpreter
+// options assumes "option, operand, script" and would miss a script behind a wrapper's own operands.
+function unwrap(args, start, cwd, depth) {
+  if (depth > MAX_WRAPPER_DEPTH) throw new Error(`Too many nested command wrappers (more than ${MAX_WRAPPER_DEPTH}): cannot tell what the service runs`);
+  const name = basename(args[start]).toLowerCase(), loose = LOOSE_WRAPPERS.test(name);
   const owners = [place(args[start], cwd, true)];
-  let i = start + 1;
-  for (; i < args.length; i += 1) {
-    const arg = args[i];
-    if (arg === '--') { i += 1; break; }
-    if (name === 'env' && /^[A-Za-z_]\w*=/.test(arg)) continue;
-    if (name === 'env' && (arg === '-u' || arg === '--unset')) { i += 1; continue; }
-    if (name === 'env' && (arg === '-C' || arg === '--chdir')) {
-      if (args[i + 1] !== undefined && isAbsolute(args[i + 1])) cwd = args[i + 1]; else cwd = null;
-      i += 1; continue;
+  let a = args, i = start + 1;
+  const resume = () => { const j = a.findIndex((x, k) => k > i && isCommand(x)); return j; };
+  const unknown = at => ({ owners, unknownAt: at, wide: true, args: a, cwd });
+  const dir = v => cwd ? resolve(cwd, v) : isAbsolute(v) ? v : null;
+  while (i < a.length) {
+    const arg = a[i];
+    if (loose) {
+      // Options and positional operands (duration, user, profile) are not enumerable: resume at the
+      // first later argument that names an interpreter or wrapper, else scan everything after the wrapper.
+      const j = a.findIndex((x, k) => k >= i && isCommand(x));
+      if (j < 0) return unknown(start + 1);
+      i = j; break;
     }
-    if (name === 'env' && /^--(?:unset|chdir)=/.test(arg)) { if (arg.startsWith('--chdir=')) cwd = isAbsolute(arg.slice(8)) ? arg.slice(8) : null; continue; }
-    if (name === 'env' && /^(?:-[i0v]+|--ignore-environment|--null|--debug)$/.test(arg)) continue;
-    if ((name === 'nice' && (arg === '-n' || arg === '--adjustment')) || (name === 'arch' && arg === '-arch')) { i += 1; continue; }
+    if (arg === '--') { i += 1; break; }
+    if (name === 'env' && /^[A-Za-z_]\w*=/.test(arg)) { i += 1; continue; }
+    // env -S "prog args": one argv entry that env splits itself; expand it so the real program is seen.
+    if (name === 'env' && (/^-S./.test(arg) || arg === '-S' || arg === '--split-string' || arg.startsWith('--split-string='))) {
+      const attached = /^-S./.test(arg) ? arg.slice(2) : arg.startsWith('--split-string=') ? arg.slice(15) : null;
+      const value = attached ?? a[i + 1];
+      if (value === undefined) return unknown(i);
+      a = [...a.slice(0, i), ...value.split(/\s+/).filter(Boolean), ...a.slice(i + (attached === null ? 2 : 1))];
+      continue;
+    }
+    if (name === 'env' && (arg === '-u' || arg === '--unset')) { i += 2; continue; }
+    if (name === 'env' && (arg === '-C' || arg === '--chdir' || arg.startsWith('--chdir='))) {
+      const v = arg.startsWith('--chdir=') ? arg.slice(8) : a[i + 1];
+      if (v === undefined) return unknown(i);
+      cwd = dir(v);
+      i += arg.startsWith('--chdir=') ? 1 : 2; continue;
+    }
+    if (name === 'env' && /^(?:-[i0v]+|--unset=.*|--ignore-environment|--null|--debug)$/.test(arg)) { i += 1; continue; }
+    if ((name === 'nice' && (arg === '-n' || arg === '--adjustment')) || (name === 'arch' && arg === '-arch')) { i += 2; continue; }
     if ((name === 'nice' && /^(?:-\d+|-n\d+|--adjustment=.*)$/.test(arg)) || (name === 'time' && /^-[lp]+$/.test(arg))
-      || (name === 'caffeinate' && /^-[dimsu]+$/.test(arg)) || (name === 'command' && /^-[p]$/.test(arg))) continue;
-    if (arg.startsWith('-') || arg.startsWith('+')) return { owners, unknownAt: i };
+      || (name === 'arch' && /^-(?:arm64e?|x86_64h?|i386|32|64)$/.test(arg))
+      || (name === 'caffeinate' && /^-[dimsu]+$/.test(arg)) || (name === 'command' && arg === '-p')) { i += 1; continue; }
+    if (arg.startsWith('-') || arg.startsWith('+')) {
+      const j = resume();
+      if (j < 0) return unknown(i);
+      i = j; break;
+    }
     break;
   }
-  if (i >= args.length) return { owners, unknownAt: null };
-  const inner = codeArguments(args, i, cwd);
-  return { owners: [...owners, ...inner.owners], unknownAt: inner.unknownAt, cwd: inner.cwd };
+  if (i >= a.length) {
+    // A loose wrapper with no recognizable command: any later path might be the program.
+    return loose && start + 1 < a.length ? unknown(start + 1) : { owners, unknownAt: null, args: a, cwd };
+  }
+  const inner = codeArguments(a, i, cwd, depth + 1);
+  return { owners: [...owners, ...inner.owners], unknownAt: inner.unknownAt, wide: inner.wide, args: inner.args, cwd: inner.cwd };
 }
-function codeArguments(args, start = 0, cwd = null) {
+function codeArguments(args, start = 0, cwd = null, depth = 0) {
   const executable = args[start], name = basename(executable).toLowerCase();
-  if (WRAPPERS.test(name)) {
-    const wrapped = unwrap(args, start, cwd);
+  if (WRAPPERS.test(name) || LOOSE_WRAPPERS.test(name)) {
+    const wrapped = unwrap(args, start, cwd, depth);
     return { ...wrapped, cwd: wrapped.cwd ?? cwd };
   }
-  const result = { owners: [place(executable, cwd, true)], unknownAt: null, cwd };
-  if (!/^(?:node|nodejs|python(?:\d+(?:\.\d+)*)?|pypy\d*|bash|sh|zsh|dash|ksh|ruby|perl)$/.test(name)) return result;
+  const result = { owners: [place(executable, cwd, true)], unknownAt: null, cwd, args };
+  if (!INTERPRETER.test(name)) return result;
   // In a shell `-e` is errexit (a flag), not "evaluate the next argument"; `-c` is the inline-program option.
   const shell = /^(?:bash|sh|zsh|dash|ksh)$/.test(name), rubyPerl = /^(?:ruby|perl)$/.test(name);
   const noScript = new Set(shell ? ['-c', '--command'] : ['-e', '--eval', '-p', '--print', '-c', '-m', '--command']);
@@ -157,17 +195,19 @@ function parsePlist(p, { selfLabel, plistPath }) {
   // effective argv while keeping Program authoritative over the displayed argv[0].
   // Only an explicit absolute/home-relative WorkingDirectory can anchor relative script paths.
   const wd = typeof p.WorkingDirectory === 'string' && isPathArg(p.WorkingDirectory) ? expand(p.WorkingDirectory) : null;
-  const { owners, unknownAt, cwd } = codeArguments(args, 0, wd);
+  const { owners, unknownAt, cwd, wide, args: effective } = codeArguments(args, 0, wd);
   // Bare executables, flags and relative paths belong to the service's context,
   // not this process's cwd. Only absolute/home-relative paths, or paths resolved against
   // the service's own explicit WorkingDirectory, prove ownership.
-  return { label: p.Label, plistPath, args, unknownOption: unknownAt === null ? null : args[unknownAt],
+  return { label: p.Label, plistPath, args, unknownOption: unknownAt === null ? null : effective[unknownAt],
     paths: owners.filter(isPathArg).map(expand),
-    // The script is the first non-option argument after the unknown option, or the second
-    // when that option consumed an operand. Later arguments are script data, not code.
+    // After an unknown interpreter option the script is the first non-option argument, or the second
+    // when that option consumed an operand; later arguments are script data, not code. After an
+    // unknown WRAPPER option the program position is unbounded, so every later path is a candidate.
+    // Relative candidates resolve only when they carry a "/" (a bare word may be a program name or operand).
     unknownPaths: unknownAt === null ? []
-      : args.slice(unknownAt + 1).filter(a => !a.startsWith('-') && !a.startsWith('+')).slice(0, 2)
-        .map(a => place(a, cwd ?? wd, false)).filter(isPathArg).map(expand) };
+      : effective.slice(unknownAt + 1).filter(a => !a.startsWith('-') && !a.startsWith('+')).slice(0, wide ? Infinity : 2)
+        .map(a => place(a, cwd ?? wd, true)).filter(isPathArg).map(expand) };
 }
 
 // Lexical prefix OR same location after resolving symlinks/aliases (/var vs /private/var).

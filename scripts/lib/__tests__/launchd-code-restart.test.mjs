@@ -692,11 +692,72 @@ describe('interpreter option shapes that once hid a clone script (value contains
     expect((await restartServicesForClone(o)).restarted).toHaveLength(owned ? 1 : 0);
     expect(findStaleCodeServices({ ...o, readProcessStartMs: () => 100_000, readAdoptedAtMs: () => 200_000 })).toHaveLength(owned ? 1 : 0);
   });
-  it('an unclassifiable wrapper option followed by a clone path is flagged, never silently excluded', () => {
-    const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/env', '--mystery', outside, join(cloneRoot, 'sampler.mjs')] }]);
-    const result = findServicesRunningFromClone(o);
+  describe('same-class wrapper and cwd shapes', () => {
+  const script = join(cloneRoot, 'x.mjs'), other = resolve('..', 'other-clone', 'x.mjs');
+  it.each([
+    ['env -P PATH', ['/usr/bin/env', '-P', '/usr/bin', outside, script]],
+    ['env combined -iu', ['/usr/bin/env', '-iu', 'HOME', outside, script]],
+    ['env -S string', ['/usr/bin/env', '-S', `${outside} ${script}`]],
+    ['env -S attached', ['/usr/bin/env', `-S${outside} ${script}`]],
+    ['env --split-string=', ['/usr/bin/env', `--split-string=${outside} ${script}`]],
+    ['caffeinate -t N', ['/usr/bin/caffeinate', '-t', '3600', outside, script]],
+    ['caffeinate -w N', ['/usr/bin/caffeinate', '-w', '1', outside, script]],
+    ['time -o file', ['/usr/bin/time', '-o', '/tmp/f', outside, script]],
+    ['arch -arm64', ['/usr/bin/arch', '-arm64', outside, script]],
+    ['arch -x86_64', ['/usr/bin/arch', '-x86_64', outside, script]],
+    ['taskpolicy -b', ['/usr/bin/taskpolicy', '-b', outside, script]],
+    ['sudo -u user', ['/usr/bin/sudo', '-u', 'me', outside, script]],
+    ['xcrun', ['/usr/bin/xcrun', outside, script]],
+    ['timeout DURATION', ['/usr/bin/timeout', '10', outside, script]],
+    ['sandbox-exec -f profile', ['/usr/bin/sandbox-exec', '-f', '/tmp/p.sb', outside, script]],
+    ['wrapper chain through a loose wrapper', ['/usr/bin/taskpolicy', '-b', '/usr/bin/env', 'A=1', outside, script]],
+    ['loose wrapper around a clone executable', ['/usr/bin/sudo', '-u', 'me', join(cloneRoot, 'bin', 'sampler')]],
+    ['unknown env option before a non-interpreter clone program', ['/usr/bin/env', '--mystery', 'operand', join(cloneRoot, 'bin', 'sampler')]],
+  ])('same-class wrapper shape is flagged (matched or unreadable), never silently excluded: %s', (_name, ProgramArguments) => {
+    const result = findServicesRunningFromClone(fixture([{ Label: 'com.we.resource-sampler', ProgramArguments }]));
+    expect(result.matches.length + result.unreadable.length).toBe(1);
+  });
+  it.each([
+    ['env -P PATH', ['/usr/bin/env', '-P', '/usr/bin', outside, other]],
+    ['env -S string', ['/usr/bin/env', '-S', `${outside} ${other}`]],
+    ['arch -arm64', ['/usr/bin/arch', '-arm64', outside, other]],
+    ['timeout DURATION', ['/usr/bin/timeout', '10', outside, other]],
+    ['sudo -u user', ['/usr/bin/sudo', '-u', 'me', outside, other]],
+  ])('wrapper shapes running an unrelated script stay unflagged: %s', (_name, ProgramArguments) => {
+    expect(findServicesRunningFromClone(fixture([{ Label: 'com.we.resource-sampler', ProgramArguments }]))).toEqual({ matches: [], unreadable: [] });
+  });
+  it.each([
+    ['arch -arm64 with program name and WorkingDirectory', ['/usr/bin/arch', '-arm64', 'node', other]],
+    ['env -S with program name and WorkingDirectory', ['/usr/bin/env', '-S', `node ${other}`]],
+  ])('a bare program name is never resolved against WorkingDirectory: %s', (_name, ProgramArguments) => {
+    expect(findServicesRunningFromClone(fixture([{ Label: 'com.we.resource-sampler', ProgramArguments, WorkingDirectory: cloneRoot }])))
+      .toEqual({ matches: [], unreadable: [] });
+  });
+  it('relative env -C resolves against the explicit WorkingDirectory', () => {
+    const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/env', '-C', 'scripts', outside, 'x.mjs'], WorkingDirectory: cloneRoot }]);
+    expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
+    const unanchored = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/env', '-C', 'scripts', outside, 'x.mjs'] }]);
+    expect(findServicesRunningFromClone(unanchored).matches).toEqual([]);
+  });
+  it('env -C survives a later unknown option', () => {
+    const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/env', '-C', cloneRoot, '--mystery', 'x.mjs'] }]);
+    expect(findServicesRunningFromClone(o).unreadable).toHaveLength(0);
+    const flagged = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/env', '-C', cloneRoot, '--mystery', './x.mjs'] }]);
+    expect(findServicesRunningFromClone(flagged).unreadable).toHaveLength(1);
+  });
+  it('deeply nested wrappers fail closed with a clear error instead of a stack overflow', () => {
+    const ProgramArguments = [...Array(5000).fill('/usr/bin/env'), outside, script];
+    const result = findServicesRunningFromClone(fixture([{ Label: 'com.we.resource-sampler', ProgramArguments }]));
     expect(result.matches).toEqual([]);
-    expect(result.unreadable).toHaveLength(1);
-    expect(result.unreadable[0].error).toMatch(/--mystery/);
+    expect(result.unreadable[0].error).toMatch(/Too many nested command wrappers/);
+  });
+  it('an unclassifiable wrapper option resumes at the interpreter, so the clone script is matched', () => {
+    const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/env', '--mystery', outside, join(cloneRoot, 'sampler.mjs')] }]);
+    expect(findServicesRunningFromClone(o)).toMatchObject({ matches: [{ label: 'com.we.resource-sampler' }], unreadable: [] });
+  });
+  it('an unclassifiable wrapper option with no interpreter after it names the option when a clone path follows', () => {
+    const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/env', '--mystery', 'operand', join(cloneRoot, 'bin', 'sampler')] }]);
+    expect(findServicesRunningFromClone(o).unreadable[0].error).toMatch(/--mystery/);
+  });
   });
 });
