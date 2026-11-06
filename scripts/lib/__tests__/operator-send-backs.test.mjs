@@ -288,6 +288,30 @@ describe('quoted and fenced references never resolve an operator request', () =>
   ])('a trusted fix-end for a new head quoting it (%s) leaves the request open', (_name, body) => {
     expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual(['1001']);
   });
+  it.each([
+    ['lazy quote continuation', '> quote\nRequest 1001 remains unaddressed.'],
+    ['indented code', '    Request 1001 remains unaddressed.'],
+    ['tab-indented marker', '\t<!-- addresses-operator-send-back: 1001 -->'],
+    ['quote in a list item', '- > Request 1001 remains unaddressed.'],
+    ['fence in a list item', '- ```\n  Request 1001 remains unaddressed.\n  ```'],
+    ['marker nested in another HTML comment', '<!-- quoting <!-- addresses-operator-send-back: 1001 --> -->'],
+    ['marker inline in prose', 'see <!-- addresses-operator-send-back: 1001 --> for the format'],
+    ['unterminated fence', '```\n<!-- addresses-operator-send-back: 1001 -->'],
+  ])('fix evidence containing %s leaves the request open', (_name, quoted) => {
+    expect(open([request, comment('fix', 'web-everything', '21:00', `## Fix evidence\nHead: \`${B}\`\n\n${quoted}\nFixed.`)])).toEqual(['1001']);
+  });
+  it('a backtick in a fence info string is inline code, so a later real marker still resolves', () => {
+    const body = `## Fix evidence\nHead: \`${B}\`\n\n\`\`\`a\`b\n<!-- addresses-operator-send-back: 1001 -->\nFixed.`;
+    expect(open([request, comment('fix', 'web-everything', '21:00', body)])).toEqual([]);
+  });
+  it('gives the fixer brief the whole request but keeps the review block bounded', () => {
+    const tail = 'REQUIRED REPAIR AFTER CHAR 4100';
+    const long = comment('1001', 'chalbert', '20:07',
+      `🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\nAt head ${A}: ${'x'.repeat(4200)}\n${tail}`);
+    const items = openOperatorSendBacks(fixture({ headRefOid: B, comments: [long] }));
+    expect(renderOperatorSendBackBrief(items)).toContain(tail);
+    expect(renderOperatorSendBackReviewBlock(items)).not.toContain(tail);
+  });
   it('a quoted or fenced marker in fix evidence leaves the request open', () => {
     const body = `## Fix evidence\nHead: \`${B}\`\n${quote}${fenced}Fixed.`;
     expect(open([request, comment('fix', 'web-everything', '21:00', body)])).toEqual(['1001']);

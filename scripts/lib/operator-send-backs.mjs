@@ -7,21 +7,36 @@ const stripComments = text => String(text ?? '').replace(/<!--[\s\S]*?-->/g, ' '
 /**
  * Only text a fixer actually wrote as a claim can resolve a request: blockquoted lines ("> Request 1001 remains
  * unaddressed.") and fenced code blocks (``` or ~~~ examples of the marker) are references, not coverage.
- * An unterminated fence runs to the end of the text, as Markdown renders it.
+ * Variants covered: quotes and fences nested in list items, a lazy quote continuation (the non-blank lines right
+ * after a quote line), tab/4-space indented code, tilde fences, and an unterminated fence (runs to the end of the
+ * text, as Markdown renders it). Every ambiguity here fails closed: the request just stays open.
  */
+const CONTAINER = '[ \\t]*(?:(?:[-*+]|\\d{1,9}[.)])[ \\t]+)*';
+const FENCE_OPEN = new RegExp(`^${CONTAINER}(\`{3,}|~{3,})(.*)$`);
+const QUOTE_LINE = new RegExp(`^${CONTAINER}>`);
 function stripQuoted(text) {
   const out = [];
-  let fence = null;
+  let fence = null, quoting = false;
   for (const line of String(text ?? '').split(/\r\n?|\n/)) {
-    const open = /^ {0,3}(`{3,}|~{3,})/.exec(line);
     if (fence) {
-      const close = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(line);
+      const close = /^[ \t]*(`{3,}|~{3,})[ \t]*$/.exec(line);
       if (close && close[1][0] === fence[0] && close[1].length >= fence.length) fence = null;
       out.push('');
-    } else if (open) {
+      continue;
+    }
+    const open = FENCE_OPEN.exec(line);
+    // A backtick fence's info string cannot contain a backtick (that is inline code, not a fence).
+    if (open && !(open[1][0] === '`' && open[2].includes('`'))) {
       fence = open[1];
+      quoting = false;
       out.push('');
-    } else out.push(/^ {0,3}>/.test(line) ? '' : line);
+    } else if (QUOTE_LINE.test(line) || (quoting && line.trim())) {
+      quoting = true;
+      out.push('');
+    } else {
+      quoting = false;
+      out.push(/^(?: {4}|\t)/.test(line) ? '' : line);
+    }
   }
   return out.join('\n');
 }
@@ -49,14 +64,16 @@ export function operatorSendBacks(comments) {
       head: /\b(?:at|on) head\s+`?([a-f0-9]{7,40})\b/i.exec(text)?.[1]?.toLowerCase() ?? null,
       etLabel: /~?\b\d{1,2}:\d{2}\s+ET\b/.exec(text)?.[0] ?? null,
       // `body` is bounded for review prompts; `fullBody` is what a fixer needs, with nothing cut off.
-      body: text.slice(0, 4000), fullBody: text, index }];
+      // GitHub caps a comment near 64k; keep the same ceiling explicitly.
+      body: text.slice(0, 4000), fullBody: text.slice(0, 65536), index }];
   });
 }
 
 /** An explicit reference, never a generic "fixed" assertion or an unrelated timestamp. */
 function namesSendBack(text, item, { carry = false } = {}) {
   const prose = stripComments(text);
-  return (item.id && new RegExp(`<!--\\s*addresses-operator-send-back:\\s*${escapeRe(item.id)}\\s*-->`).test(text))
+  // The marker must start its line: one nested inside another HTML comment or inline prose is a reference.
+  return (item.id && new RegExp(`^[ \\t]*<!--\\s*addresses-operator-send-back:\\s*${escapeRe(item.id)}\\s*-->`, 'm').test(text))
     || containsToken(prose, item.id) || (!!item.url && prose.includes(item.url))
     || (!!item.at && prose.includes(item.at))
     || (!!item.etLabel && (carry || /\bsend-back\b/i.test(prose))
@@ -123,8 +140,10 @@ export function openOperatorSendBacks(pr) {
 }
 
 // A body cannot close its own DATA fence, even if the operator quoted Markdown fences in the request.
-function quotedItems(open) {
-  return open.map(item => {
+// The review block stays bounded; the fixer brief (`full`) must carry every must-fix line.
+function quotedItems(open, { full = false } = {}) {
+  return open.map(raw => {
+    const item = full ? { ...raw, body: raw.fullBody ?? raw.body } : raw;
     const longest = Math.max(0, ...(item.body.match(/`+/g) ?? []).map(s => s.length));
     const fence = '`'.repeat(Math.max(3, longest + 1));
     return `## Send-back ${item.id ?? '(id unavailable)'} — ${item.at ?? '(time unavailable)'}${item.etLabel ? ` (${item.etLabel})` : ''}\n`
@@ -141,7 +160,7 @@ export function renderOperatorSendBackBrief(open) {
     + 'It MUST include the following marker per item it addressed (one line each):\n'
     + open.map(item => `<!-- addresses-operator-send-back: ${item.id ?? 'UNKNOWN'} -->`).join('\n')
     + '\nAlso include Head: `<fixed head sha>` and the concrete repair and verification evidence.\n\n'
-    + quotedItems(open) + '\n\n';
+    + quotedItems(open, { full: true }) + '\n\n';
 }
 
 export function renderOperatorSendBackReviewBlock(open) {
