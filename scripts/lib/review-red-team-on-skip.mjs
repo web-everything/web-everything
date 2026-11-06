@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
 import { readFileSync, statSync } from 'node:fs';
 import { listRunIds, readRun, sharedRunsDir } from '../operations/run-store.mjs';
+import { priorPrepReviews } from '../conveyor/prep-review.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { createHash } from 'node:crypto';
@@ -389,7 +390,25 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         (typeof label === 'string' ? label : label?.name) === 'red-team:pending');
       const acceptedReview = verdict === VERDICTS.ACCEPT
         && provenAcceptance({ comments: rawPr.comments, reviews, labels: rawPr.labels, head }) !== null;
-      const provenanceEscalation = keepsPending && !acceptedReview ? { escalate: true,
+      // R639: a card-only prepare PR gets only the advisory prep note (label review:prep), never a full review, so
+      // no acceptance can exist. Its pending label came from unreadable run evidence. With a trusted unblocked
+      // prep note on this exact head and no review, run, queue or status at all, nothing is owed and nothing hides.
+      const prepNotes = priorPrepReviews(rawPr.comments).filter(note => note.head === head);
+      const prepAdvisoryClear = keepsPending && !acceptedReview && Array.isArray(reviews)
+        && rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:prep')
+        && prepNotes.length > 0 && prepNotes.every(note => !note.blocked)
+        && evidence?.loopPayload == null && status == null
+        && evidence?.inFlight === false && !evidence.queued
+        && evidence.recorded === false && evidence.seatRecorded === false
+        && evidence.completedRecorded !== true && evidence.cleanRecorded !== true
+        && !evidence.status
+        // Any full-review verdict or hold on the thread means this was not an advisory-only PR: fail closed.
+        && !rawPr.comments.some(comment => isLaterVerdictBody(comment?.body))
+        && publishableClearGuard({ acceptance: latestAcceptRecord(rawPr.comments, reviews),
+          // review:prep is the advisory stage's own label, not a hold; every other review hold still refuses.
+          labels: rawPr.labels.filter(label => (typeof label === 'string' ? label : label?.name) !== 'review:prep'),
+          comments: rawPr.comments, reviews, settlesPending: true }) === null;
+      const provenanceEscalation = keepsPending && !acceptedReview && !prepAdvisoryClear ? { escalate: true,
         escalationContext: 'red-team:pending kept: not-owed review lacks acceptance provenance; needs a human look' } : {};
       const notOwed = (why = 'stored review does not owe a red team') => {
         // Review labels independently block merge; thread/formal holds still forbid settlement.
@@ -400,7 +419,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         return { ...skip(why), ...provenanceEscalation,
         ...(!hold && acceptedReview && recordedNotOwed && evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
           && evidence.inFlight === false && !evidence.queued
-          && evidence.recorded === false && evidence.seatRecorded === false ? { settle: 'not-owed' } : {}) };
+          && evidence.recorded === false && evidence.seatRecorded === false ? { settle: 'not-owed' } : !hold && prepAdvisoryClear ? { settle: 'not-owed' } : {}) };
       };
       // A missing live-head review requires the full loop; stale reads cannot authorize a red-team-only pass.
       const storedHead = evidence?.loopPayload?.findings?.read?.netBasis?.rev;

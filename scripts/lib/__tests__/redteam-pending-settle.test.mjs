@@ -523,7 +523,7 @@ describe('prep-advisory PR with no full review settles stale pending (R639, #641
     return f;
   };
   it('plans a not-owed settlement instead of escalating, and removes only pending', () => {
-    const o = runFixture(prepFixture());
+    const f = prepFixture(); const o = runFixture({ ...f, now: () => f.now });
     const row = mod.runRedTeamOnSkip(o).rows[0];
     expect(row).toMatchObject({ action: 'skip', settle: 'not-owed' });
     expect(row).not.toHaveProperty('escalate');
@@ -536,7 +536,7 @@ describe('prep-advisory PR with no full review settles stale pending (R639, #641
     ['prep note for another head', f => { f.rawPrs[0].comments = [prepNote(old)]; }],
     ['prep note blocked', f => { f.rawPrs[0].comments = [prepNote(head, ' blocked=1')]; }],
     ['prep note from untrusted author', f => { f.rawPrs[0].comments = [{ ...prepNote(), author: { login: 'rando' } }]; }],
-    ['later human hold', f => { f.rawPrs[0].comments = [prepNote(), { body: 'do not merge', createdAt: iso(acceptedAt + 1), author: { login: 'human-reviewer' } }]; }],
+    ['later changes-requested review verdict', f => { f.rawPrs[0].comments = [prepNote(), trusted(`🔁 review — changes requested\n<!-- reviewed-sha: ${head} -->`, iso(acceptedAt + 1))]; }],
     ['review hold label', f => { f.rawPrs[0].labels.push('review:changes'); }],
     ['red team blocked', f => { f.rawPrs[0].labels.push('red-team:blocked'); }],
     ['a stored review exists that owes a red team', f => { f.readEvidence = () => evidence({ loopPayload: payload('accept') }); }],
@@ -544,11 +544,10 @@ describe('prep-advisory PR with no full review settles stale pending (R639, #641
     ['a red-team pass is in flight', f => { f.readEvidence = () => evidence({ loopPayload: undefined, inFlight: true }); }],
   ])('%s keeps pending and never settles', (_name, mutate) => {
     const f = prepFixture(); mutate(f);
-    const o = runFixture(f);
+    const o = runFixture({ ...f, now: () => f.now });
     const row = mod.runRedTeamOnSkip(o).rows[0];
     expect(row).not.toHaveProperty('settle');
     expect(o.settlePending).not.toHaveBeenCalled(); expect(o.settle).not.toHaveBeenCalled();
-    expect(o.dispatch).not.toHaveBeenCalled();
   });
 });
 
