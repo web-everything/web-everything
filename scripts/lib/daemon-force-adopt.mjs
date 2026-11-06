@@ -218,8 +218,10 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   // Ticks only count once the forced build is really the running head (a ready-only job adopts a tick or more later).
   if (head !== null && head !== watch.sha) {
     // An owed rollback whose revert already landed (head IS last-good) is paid: record it as a rollback, never as "superseded".
-    if (watch.rollbackPending && watch.lastGood?.head && head === watch.lastGood.head) return finishRollback(watch, watch.rollbackPending);
-    if (watch.adoptedSeen || watch.rollbackPending) { clearWatch(root, env); await emit?.({ kind: 'force-adopt-watch-superseded', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, head } }); return { action: 'superseded' }; }
+    // The owed marker may exist only in memory (its disk write failed): it counts exactly like the one on disk.
+    const owed = watch.rollbackPending || pendingFor(root, env, watch.sha);
+    if (owed && watch.lastGood?.head && head === watch.lastGood.head) return finishRollback(watch, owed);
+    if (watch.adoptedSeen || owed) { clearWatch(root, env); await emit?.({ kind: 'force-adopt-watch-superseded', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, head } }); return { action: 'superseded' }; }
     if (now() - Date.parse(watch.startedAt) > FORCE_ADOPT_TTL_MS) {
       // The forced build never became head. Its ready candidate never passed smoke, so drop it too: left behind, a later
       // write-lock holder would adopt it with no health watch.

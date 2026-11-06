@@ -137,6 +137,7 @@ async function forceWatch(options, emitEvent, startedAtMs) {
         const fin = await withWriteLock(root, async () => {
           const head = verifyRev(git, 'HEAD');
           if (!head) return { ok: false }; // HEAD unreadable: unknown is not "superseded" — the rollback stays owed and is retried
+          if (lastGood.head === sha) return { ok: false }; // last-good IS the watched build: nothing older to go back to, so nothing was reverted
           if (head === lastGood.head) { clearReadyCandidate(root, stEnv); return { ok: true }; } // already reverted
           if (head !== sha) return { superseded: true, head };
           clearReadyCandidate(root, stEnv);

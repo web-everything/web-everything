@@ -493,6 +493,19 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     expect(handoffOf(env)).not.toMatch(/ROLLED BACK/);
   });
 
+  it('a rollback whose last-good IS the watched build reverts nothing and never claims it did: the revert stays owed', async () => {
+    const { cloneDir, env, target, arm } = setup();
+    arm();
+    await tick(cloneDir, env, { runSmoke: failing() });
+    expect(headOf(cloneDir)).toBe(target);
+    const watch = readForceWatch(cloneDir, env);
+    // a stale last-good record naming the very build under watch (nothing older to go back to)
+    writeFileSync(join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(cloneDir)}.force-watch.json`), JSON.stringify({ ...watch, lastGood: { ...watch.lastGood, head: target } }));
+    await tick(cloneDir, env, { runSmoke: passing(), forceWatchProbe: async () => ({ healthy: false }) });
+    expect(headOf(cloneDir)).toBe(target);
+    expect(handoffOf(env)).not.toMatch(/ROLLED BACK/);
+    expect(readForceWatch(cloneDir, env)).toMatchObject({ sha: target, rollbackPending: 'health-failed' }); // still owed, not forgotten
+  });
   it('an unreadable HEAD inside the rollback is not "superseded": the revert stays owed and is retried', async () => {
     const { cloneDir, env, lastGood, target, arm } = setup();
     arm();

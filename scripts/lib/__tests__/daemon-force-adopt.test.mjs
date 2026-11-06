@@ -400,6 +400,19 @@ describe('runForceWatchTick', () => {
     expect((await runForceWatchTick({ root, env, probe: async () => ({ healthy: true }), rollback: clean, emit: async () => {} })).action).toBe('continue');
     expect(clean).not.toHaveBeenCalled();
   });
+  it('an UNSAVED owed rollback whose revert already landed is recorded as ROLLED BACK, never dropped as superseded or left waiting', async () => {
+    await setup();
+    await failRollbackUnsaved();
+    expect(readForceWatch(root, env).rollbackPending).toBeUndefined(); // the disk marker really was lost; only memory knows
+    const events = [];
+    const r = await runForceWatchTick({ root, env, currentHead: 'a'.repeat(40), probe: async () => ({ healthy: true }), rollback: vi.fn(), emit: async (e) => { events.push(e.kind); } });
+    expect(r).toMatchObject({ action: 'rollback', reason: 'health-failed' });
+    expect(events).toContain('force-adopt-rolled-back');
+    expect(events).not.toContain('force-adopt-watch-superseded');
+    expect(readFileSync(env.WE_FORCE_ADOPT_HANDOFF, 'utf8')).toMatch(/ROLLED BACK/);
+    expect(readForceWatch(root, env)).toBeNull();
+    expect(forceBlockedReason(root, env)).toBeNull(); // the in-memory obligation is gone with the paid rollback
+  });
   it('an unsaved obligation is persisted on a later tick and then stops blocking on the in-memory copy', async () => {
     await setup();
     await failRollbackUnsaved();
