@@ -10,6 +10,8 @@ import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
 import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
+import { refusedReferralsAreRuled, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
+import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
 import { mkdtempSync, rmSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -36,6 +38,99 @@ function fixture(over = {}) {
     now: 2_000_000, setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(), ...over };
 }
 const decide = over => planRedTeamOnSkip(fixture(over))[0];
+
+describe('#6345 — resume a stored needs-human review after its refused referrals are ruled', () => {
+  function parkedFixture(kind = 'ruled') {
+    const id = 'review-pr-stale-referral-trigger';
+    const body = '<!-- authored-by-actor: author -->';
+    const at = '2026-11-06T13:25:00Z';
+    const referrals = ['first defect', 'second defect'].map(summary => {
+      const original = { summary, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+      return { key: referralFindingKey('judge', original), seat: 'judge', original, finding: normalizeFinding(original) };
+    });
+    const record = { version: 1, repo, pr, head, runId: id,
+      reviewer: mandatoryReferralReviewer(id), authorBody: body, attempted: true, referrals, rulings: [] };
+    const run = newRunRecord({ id, op: 'review-pr', input: { repo, pr } });
+    run.findings = {
+      read: { repo, pr, netBasis: { rev: head } },
+      mandatoryReferrals: { applied: true, effects: [{ type: 'review.mandatory-referrals', status: 'applied',
+        result: { records: [record], pending: referrals.map(f => f.key) } }] },
+      referralVerdict: { verdict: 'needs-human', pendingReferrals: referrals.map(f => f.key), referrals },
+    };
+    run.verdict = run.findings.referralVerdict;
+    run.pending = null;
+    run.refusedStage = 'stageVerdict';
+    run.stepTimings = [
+      { step: 'read', startedAt: '2026-11-06T13:20:00Z', finishedAt: '2026-11-06T13:21:00Z' },
+      { step: 'advise', startedAt: '2026-11-06T13:22:00Z', finishedAt: '2026-11-06T13:23:00Z' },
+      { step: 'stageVerdict', startedAt: '2026-11-06T13:24:00Z' },
+    ];
+    const comments = [{ body: renderReferralRecord(record), author: { login: 'web-everything' } }];
+    if (kind !== 'unruled referral') comments.push({
+      body: buildOperatorRulingComment({ version: 1, repo, pr,
+        head: kind === 'ruling for other head' ? 'b'.repeat(40) : head,
+        rulings: referrals.slice(0, kind === 'partial rulings' ? 1 : 2).map(f => ({
+          runId: kind === 'ruling for other run' ? 'review-pr-other' : id, key: f.key,
+          result: kind === 'unreadable referral card' ? 'card' : 'not-real',
+          ...(kind === 'unreadable referral card' ? { card: 'we:backlog/9999999-missing-referral-card.md' } : {}),
+        })), actor: 'chalbert', channel: 'terminal', reason: 'verified ruling', at, clearerId: 'operator-session' }),
+      author: { login: 'chalbert' }, createdAt: at,
+    });
+    const projected = reviewRunEvidence(run);
+    expect(projected).toMatchObject({ id, repo, pr, head, parked: true, referralStageRefused: true,
+      pending: referrals.map(f => f.key) });
+    const rawPr = { number: pr, headRefOid: head, body, comments, reviews: [], labels: ['red-team:pending'] };
+    // Validate the fixture through the real shared gate, without a planner-only mock seam.
+    expect(refusedReferralsAreRuled(rawPr, projected, { repo })).toBe(![
+      'unruled referral', 'partial rulings', 'ruling for other head', 'ruling for other run', 'unreadable referral card',
+    ].includes(kind));
+    let runs = [projected];
+    const loopPayload = { verdict: run.verdict, findings: { read: run.findings.read } };
+    if (kind === 'no parked run') runs = [];
+    if (kind === 'run for other head') runs = [{ ...projected, head: 'b'.repeat(40) }];
+    if (kind === 'run for other repo') runs = [{ ...projected, repo: 'other/repo' }];
+    if (kind === 'run for other PR') runs = [{ ...projected, pr: pr + 1 }];
+    if (kind === 'stored verdict not needs-human') loopPayload.verdict = { verdict: 'changes' };
+    if (kind === 'stored review on other head') loopPayload.findings.read = { ...run.findings.read, netBasis: { rev: 'b'.repeat(40) } };
+    if (kind === 'missing comments') rawPr.comments = undefined;
+    if (kind === 'formal review hold') rawPr.reviews = [{ state: 'CHANGES_REQUESTED', author: { login: 'reviewer' } }];
+    if (kind === 'unreadable reviews') rawPr.reviews = undefined;
+    return runFixture({ rawPrs: [rawPr], readReviews: vi.fn(() => rawPr.reviews), readEvidence: () => ({ loopPayload, inFlight: false,
+      queued: false, recorded: false, seatRecorded: false }),
+    readReviewRuns: vi.fn(() => {
+      if (kind === 'unreadable run reader') throw new Error('run evidence unreadable');
+      return runs;
+    }) });
+  }
+
+  it('dispatches one full review for an already-reviewed needs-human head whose refused referrals are all ruled', () => {
+    const o = parkedFixture();
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review', head,
+      why: 'stored review needs-human only on referrals now ruled; resume the parked run' });
+    expect(o.readReviewRuns).toHaveBeenCalled();
+    expect(o.dispatch).toHaveBeenCalledTimes(1);
+    expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
+  });
+
+  it.each([
+    'unruled referral', 'partial rulings', 'ruling for other head', 'ruling for other run',
+    'unreadable run reader', 'no parked run', 'stored verdict not needs-human',
+    'run for other head', 'run for other repo', 'run for other PR', 'stored review on other head',
+    'unreadable referral card', 'missing comments', 'formal review hold', 'unreadable reviews',
+  ])('fails closed: %s skips without dispatch', kind => {
+    const o = parkedFixture(kind);
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+    expect(o.dispatch).not.toHaveBeenCalled();
+    expect(o.lastDispatch.size).toBe(0);
+  });
+
+  it('shares the full-review per-head retry cooldown', () => {
+    const o = parkedFixture();
+    o.lastDispatch.set(`${repo}#${pr}@${head}`, o.now() - 1);
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'retry cooldown active' });
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+});
 
 describe('R100 — #5910 accepted stored review does not owe a red team', () => {
   const storedHead = '682e81b3ae1c'.padEnd(40, '0'), storedPr = 5910;
