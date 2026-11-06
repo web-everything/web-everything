@@ -37,6 +37,9 @@ export function installProbeShutdown() {
           await delay(25);
         }
         clearTimeout(watchdog);
+        // Group is drained. A leader that exits on its own (worker done) keeps its clean exit; one whose worker
+        // is still running is ended after a short grace, as the old handler did. unref: never holds the exit.
+        setTimeout(killGroup, 2000).unref();
       } catch (error) {
         console.error(`health-gh-probe shutdown: ${error.message}; forcing group shutdown`);
         killGroup();

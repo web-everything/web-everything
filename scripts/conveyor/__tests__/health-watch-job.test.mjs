@@ -169,6 +169,68 @@ describe('health-gh-probe job child', () => {
     }
   }, 15000);
 
+  it('kills the detached leader and empties its group when its worker keeps running after SIGTERM', async () => {
+    const fixture = join(dir, 'worker-keeps-running.mjs');
+    writeFileSync(fixture, `
+      import { spawn } from 'node:child_process';
+      import { Worker } from 'node:worker_threads';
+      import { installProbeShutdown } from ${JSON.stringify(pathToFileURL(join(REPO, 'scripts/conveyor/health-probe-shutdown.mjs')).href)};
+      const finish = installProbeShutdown();
+      const worker = new Worker(${JSON.stringify(keepAliveScript({ postlude: "require('node:worker_threads').parentPort.postMessage('ready');" }))}, { eval: true });
+      const workerReady = new Promise(resolve => worker.once('message', resolve));
+      const cli = spawn(process.execPath, ['-e', ${JSON.stringify(keepAliveScript({ prelude: "process.on('SIGTERM', () => process.send('term'));", postlude: "process.send('ready');" }))}], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
+      const cliReady = new Promise(resolve => cli.once('message', resolve));
+      const cliExit = new Promise(resolve => cli.once('exit', (code, signal) => {
+        process.send({ type: 'cli-exit', signal });
+        resolve();
+      }));
+      await Promise.all([workerReady, cliReady]);
+      process.send({ type: 'ready', cliPid: cli.pid });
+      await cliExit;
+      await finish();
+      process.disconnect();
+      // Leave the worker running: only the shutdown handler can end this leader.
+    `);
+    const child = spawn(process.execPath, [fixture], { detached: true, stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+    const messages = [];
+    let stderr = '';
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    const exited = new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('exit', (code, signal) => resolve({ code, signal }));
+    });
+    const deadline = setTimeout(() => {
+      try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+    }, 7000);
+    try {
+      const ready = await new Promise((resolve, reject) => {
+        child.on('message', message => {
+          messages.push(message);
+          if (message.type === 'ready') resolve(message);
+        });
+        child.once('exit', () => reject(new Error(`persistent worker fixture exited before readiness: ${stderr}`)));
+      });
+      expect(ready.cliPid).toBeGreaterThan(0);
+      const started = Date.now();
+      process.kill(child.pid, 'SIGTERM');
+      expect(await exited, stderr).toEqual({ code: null, signal: 'SIGKILL' });
+      expect(Date.now() - started).toBeLessThan(6000);
+      expect(messages.find(message => message.type === 'cli-exit')).toMatchObject({ signal: 'SIGKILL' });
+      let members;
+      try {
+        members = execFileSync('pgrep', ['-g', String(child.pid)], { encoding: 'utf8', timeout: 1000 }).trim();
+      } catch (error) {
+        if (error.status !== 1) throw error;
+        members = '';
+      }
+      expect(members).toBe('');
+    } finally {
+      clearTimeout(deadline);
+      try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+      await exited;
+    }
+  }, 15000);
+
   it('forces group shutdown when process-group evidence is unreadable', async () => {
     const fixture = join(dir, 'unreadable-group.mjs');
     writeFileSync(fixture, `
