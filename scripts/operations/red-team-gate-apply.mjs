@@ -63,6 +63,8 @@ export const RED_TEAM_GATE_CHANNEL = 'review daemon (redTeam.confirmedBreaks)';
 const where = (f) => (f.file ? `\`${sanitizeCardField(f.file, 200)}${f.line ? `:${f.line}` : ''}\`` : '`(no file cited)`');
 const findingLine = (f, i) => `${i + 1}. ${where(f)} — (${sanitizeCardField(f.category, 40)}, ${sanitizeCardField(f.impact ?? 'impact not stated', 40)}) `
   + `${sanitizeCardField(f.summary, 600)}${f.scenario ? `\n   - Scenario: ${sanitizeCardField(f.scenario, 1200)}` : ''}`
+  + `${f.findingClass ? `\n   - Class: ${sanitizeCardField(f.findingClass, 80)}${f.classBasis ? ` (basis: ${sanitizeCardField(f.classBasis, 1200)})` : ''}` : ''}`
+  + `${f.securityReachableToday === true ? '\n   - Security class: security-reachable-today' : ''}`
   + `${f.recheck ? `\n   - Claude's re-check: ${sanitizeCardField(f.recheck, 600)}` : ''}`;
 
 /** The send-back write-up: the fix list. PURE. */
@@ -80,11 +82,12 @@ export function buildSendBackBody({ pr, head, findings }) {
 /** The `file-item` input for ONE follow-up card carrying every carded finding. PURE. */
 export function buildRedTeamCardInput({ repo, pr, head, findings }) {
   const files = [...new Set(findings.map(cleanFindingFile).filter(Boolean))];
+  const classes = [...new Set(findings.flatMap(f => [f.findingClass, ...(f.securityReachableToday === true ? ['security-reachable-today'] : [])]).filter(Boolean))].map(c => sanitizeCardField(c, 80));
   const digest = `Filed mechanically by the red-team gate: the post-accept red team on ${repo}#${pr} (reviewed head \`${head}\`) `
     + 'found these, Claude\'s re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up '
     + 'card instead of blocking the PR:\n\n' + findings.map(findingLine).join('\n');
   return {
-    title: `Red-team follow-ups from ${repo}#${pr} (head ${String(head).slice(0, 9)})`,
+    title: `Red-team follow-ups${classes.length ? ` [${classes.join(', ')}]` : ''} from ${repo}#${pr} (head ${String(head).slice(0, 9)})`,
     kind: 'story', size: '2',
     digest: qualifyLocusRefs(digest, files),
     scope: files.map((f) => `${IN_REPO_LOCUS}${f}`).join(','),
