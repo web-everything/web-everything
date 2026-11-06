@@ -301,6 +301,24 @@ describe('settlement reads fresh PR state and result evidence', () => {
     expect(o.syncLabels).not.toHaveBeenCalled();
     expect(row.settleError).toBeTruthy();
   });
+  it('a hold label that appears at the synchronizer\'s own read or write is not overwritten', () => {
+    for (const when of ['read', 'write']) {
+      let reads = 0;
+      const labelsFor = n => (n > (when === 'read' ? 0 : 1) ? ['review:accepted', 'red-team:pending', 'red-team:blocked'] : ['review:accepted', 'red-team:pending']);
+      const provider = { readPrState: vi.fn(() => ({ headRefOid: head, labels: labelsFor(++reads), comments: [] })),
+        readComments: vi.fn(() => []), ensureLabel: vi.fn(), setLabels: vi.fn() };
+      const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: payload('accept'), recorded: false, seatRecorded: false,
+        status: { status: 'finished', result: { status: 'ran', comment: 'posted', foldedVerdict: 'accept' } } })), readIgnorableConfirms: () => [], provider });
+      o.syncLabels = (input) => {
+        input.provider.readPrState(repo, pr);
+        input.provider.setLabels(repo, pr, { add: 'red-team:clear', remove: ['red-team:pending'] });
+      };
+      o.rawPrs[0].comments.push(resultComment());
+      const row = mod.runRedTeamOnSkip(o).rows[0];
+      expect(provider.setLabels).not.toHaveBeenCalled();
+      expect(row.settleError).toMatch(/hold label (appeared before settlement|present); label unchanged/);
+    }
+  });
   it('a throwing result evidence read settles nothing and reports settleError', () => {
     const o = runFixture({ readEvidence: () => { throw Error('fresh evidence offline'); } });
     o.rawPrs[0].comments.push(resultComment());

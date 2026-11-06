@@ -601,6 +601,18 @@ function resultMaySynchronize(comments, pr, head) {
   return comments.some(c => redTeamForHead([c], pr, head));
 }
 
+/** Wrap a label provider so a clear is refused when a hold label is seen at the synchronizer's own read or at write time. */
+function holdGuardedProvider(provider) {
+  const refuse = state => {
+    if (!Array.isArray(state?.labels) || state.labels.some(label => conflictsWithPolicyClear(label, { settlesPending: true }))) {
+      throw Error('hold label appeared before settlement; label unchanged');
+    }
+  };
+  return { ...provider,
+    readPrState: (repo, pr) => { const state = provider.readPrState(repo, pr); refuse(state); return state; },
+    setLabels: (repo, pr, change) => { refuse(provider.readPrState(repo, pr)); return provider.setLabels(repo, pr, change); } };
+}
+
 /** Re-read the live head and labels before removing a stale pending status. */
 export function settlePendingFor({ provider, env = process.env } = {}) {
   return ({ repo, pr, head }) => {
@@ -778,7 +790,9 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
                     && live.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'red-team:blocked')
                     && !labels?.remove.includes('red-team:blocked');
                   if (verdict === 'changes' && !blocked) row.settleError = 'recorded red-team changes; label unchanged';
-                  else syncLabels({ ...key, env, log: note, evidence, provider, comments: live.comments,
+                  else syncLabels({ ...key, env, log: note, evidence, comments: live.comments,
+                    // The synchronizer re-reads PR state itself: refuse a clear if a hold label appeared since our read.
+                    provider: verdict === 'accept' ? holdGuardedProvider(provider) : provider,
                     ...(verdict === 'changes' ? { standingRuling: null } : {}) });
                 }
               }
