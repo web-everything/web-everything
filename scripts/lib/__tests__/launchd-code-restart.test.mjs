@@ -993,6 +993,60 @@ describe('interpreter option shapes that once hid a clone script (value contains
       await restartServicesForClone({ ...o, pendingOnly: true });
       expect(o.states.get(label)).toEqual({ at: 2_000_000, sha: 'C' });
     });
+    describe('clearing an owed marker is serialised by the label lock', () => {
+      function locked(clock) {
+        const o = cooled(clock), events = []; let busy = false;
+        const get = o.stateStore.get, set = o.stateStore.set;
+        o.stateStore.get = l => { events.push('get'); return get(l); };
+        o.stateStore.set = (l, v) => { events.push('set'); return set(l, v); };
+        o.lockStore = { acquire: async () => { if (busy) return null; events.push('acquire'); return async () => { events.push('release'); }; } };
+        return Object.assign(o, { events, hold: () => { busy = true; }, free: () => { busy = false; } });
+      }
+      async function owe(o, clock) {
+        await restartServicesForClone({ ...o, adoptedSha: 'A' });
+        clock.t += 1000; await restartServicesForClone({ ...o, adoptedSha: 'B' });
+        o.events.length = 0;
+      }
+      it('no-longer-clone-backed cleanup reads and writes only while holding the lock', async () => {
+        const clock = { t: 1_000_000 }, o = locked(clock); await owe(o, clock);
+        o.listPlists = () => []; clock.t += 600_000;
+        await restartServicesForClone({ ...o, pendingOnly: true });
+        expect(o.events).toEqual(['acquire', 'get', 'set', 'release']);
+        expect(o.states.get(label)).toEqual({ at: 1_000_000, sha: 'A' });
+      });
+      it('policy-refused cleanup reads and writes only while holding the lock', async () => {
+        const clock = { t: 1_000_000 }, o = locked(clock); await owe(o, clock);
+        clock.t += 600_000;
+        await restartServicesForClone({ ...o, pendingOnly: true, envValues: { enabled: false } });
+        expect(o.events).toEqual(['acquire', 'get', 'set', 'release']);
+        expect(o.states.get(label)).toEqual({ at: 1_000_000, sha: 'A' });
+      });
+      it('a held lock leaves the marker untouched, still owed, without alarms', async () => {
+        const clock = { t: 1_000_000 }, o = locked(clock); await owe(o, clock);
+        o.listPlists = () => []; clock.t += 600_000; o.hold();
+        const r = await restartServicesForClone({ ...o, pendingOnly: true });
+        expect(o.events).toEqual([]);
+        expect(r.errors).toEqual([]); expect(r.flagged).toEqual([]);
+        expect(o.states.get(label)).toMatchObject({ sha: 'A', pendingSha: 'B' });
+        o.free(); await restartServicesForClone({ ...o, pendingOnly: true });
+        expect(o.states.get(label)).toEqual({ at: 1_000_000, sha: 'A' });
+      });
+      it('an unreadable lock result during cleanup is reported and writes nothing', async () => {
+        const clock = { t: 1_000_000 }, o = locked(clock); await owe(o, clock);
+        o.listPlists = () => []; clock.t += 600_000; o.lockStore.acquire = async () => undefined;
+        const r = await restartServicesForClone({ ...o, pendingOnly: true });
+        expect(r.errors).toHaveLength(1); expect(o.events).toEqual([]);
+        expect(o.states.get(label)).toMatchObject({ pendingSha: 'B' });
+      });
+      it('the lock is released even when the cleanup write fails', async () => {
+        const clock = { t: 1_000_000 }, o = locked(clock); await owe(o, clock);
+        o.listPlists = () => []; clock.t += 600_000;
+        o.stateStore.set = () => { o.events.push('set'); throw new Error('disk full'); };
+        const r = await restartServicesForClone({ ...o, pendingOnly: true });
+        expect(r.errors).toEqual([expect.objectContaining({ reason: 'disk full' })]);
+        expect(o.events).toEqual(['acquire', 'get', 'set', 'release']);
+      });
+    });
     it('returning to the running sha while a restart is owed clears the owed marker', async () => {
       const clock = { t: 1_000_000 }, o = cooled(clock);
       await restartServicesForClone({ ...o, adoptedSha: 'A' });

@@ -470,9 +470,22 @@ export async function restartServicesForClone({ settings, platform, env = proces
   let owed = null;
   // Clear an owed marker without rolling back a restart another process recorded since we listed it:
   // re-read first and only write when the marker we listed is still the one on disk.
-  const settle = async (label, previous) => {
-    const fresh = await stateStore.get(label);
-    if (fresh && fresh.pendingSha !== undefined && fresh.pendingSha === previous.pendingSha && fresh.at === previous.at) await stateStore.set(label, { at: fresh.at, sha: fresh.sha });
+  // The read-then-write must not interleave with a restart recording newer state, so it runs under the
+  // label lock: callers already holding it pass `held`; others take it here and, if it is busy, leave the
+  // marker in place (still owed; the next tick retries).
+  const settle = async (label, previous, held = false) => {
+    let release = null;
+    if (!held) {
+      release = await lockStore.acquire(label);
+      if (release === null) return;
+      if (typeof release !== 'function') throw new Error('unreadable restart lock acquisition result');
+    }
+    try {
+      const fresh = await stateStore.get(label);
+      if (fresh && fresh.pendingSha !== undefined && fresh.pendingSha === previous.pendingSha && fresh.at === previous.at) await stateStore.set(label, { at: fresh.at, sha: fresh.sha });
+    } finally {
+      if (release) await release();
+    }
   };
   const report = (kind, service, reason) => {
     const entry = { ...service, reason };
@@ -541,7 +554,7 @@ export async function restartServicesForClone({ settings, platform, env = proces
         }
         if (reason) {
           // Already running the adopted sha (e.g. A, B deferred, then back to A): nothing is owed any more.
-          if (previous.pendingSha !== undefined) await settle(label, previous);
+          if (previous.pendingSha !== undefined) await settle(label, previous, true);
           if (!owed) report('skipped', service, reason);
           continue;
         }
