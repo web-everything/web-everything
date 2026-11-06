@@ -64,13 +64,19 @@ function unwrap(args, start, cwd, depth) {
       // is an executable candidate even when an interpreter-named word appears later as plain data.
       // Before a later interpreter, an operand right after an option is more likely that option's value
       // (`sandbox-exec -f profile node x`); with no interpreter at all it is the best program candidate.
+      // A dash-word before a path may be a boolean flag (`sudo -E /clone/bin/x`, `timeout --foreground`) or take
+      // this path as its value (`sandbox-exec -f profile`): we cannot tell, so such an operand is an AMBIGUOUS
+      // owner (claimed, never dropped) and the scan still resumes at the interpreter. Env assignments are not programs.
       let program = -1;
-      for (let k = i; k < (j < 0 ? a.length : j) && program < 0; k += 1) {
+      const ambiguous = [];
+      for (let k = i; k < (j < 0 ? a.length : j); k += 1) {
         const x = a[k];
-        if (x === '--' || x.startsWith('-') || x.startsWith('+') || !(isPathArg(x) || x.includes('/'))) continue;
-        if (j >= 0 && k > start + 1 && a[k - 1].startsWith('-') && a[k - 1] !== '--') continue;
+        if (x === '--' || x.startsWith('-') || x.startsWith('+') || /^[A-Za-z_]\w*=/.test(x) || !(isPathArg(x) || x.includes('/'))) continue;
+        if (j >= 0 && k > start + 1 && a[k - 1].startsWith('-') && a[k - 1] !== '--') { ambiguous.push(a[k]); continue; }
         program = k;
+        break;
       }
+      owners.push(...ambiguous.map(x => place(x, cwd, true)));
       if (program >= 0) {
         // The first path-like operand is the program; later interpreter-named words are its data.
         // Its own arguments are unknown, so a clone path among them is flagged, never silently ignored.

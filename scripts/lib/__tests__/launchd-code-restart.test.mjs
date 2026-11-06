@@ -775,6 +775,14 @@ describe('interpreter option shapes that once hid a clone script (value contains
     ['interpreter-named word later is data, not the program', ['/usr/bin/sudo', join(cloneRoot, 'bin', 'sampler'), '--runner', 'node']],
     ['interpreter-named path later is data, not the program', ['/usr/bin/timeout', '10', join(cloneRoot, 'bin', 'sampler'), outside]],
     ['nested loose wrappers', ['/usr/bin/taskpolicy', '-b', '/usr/bin/sudo', join(cloneRoot, 'bin', 'sampler')]],
+    ['sudo boolean flag, later interpreter word', ['/usr/bin/sudo', '-E', join(cloneRoot, 'bin', 'sampler'), '--runner', 'node']],
+    ['sudo -n boolean flag', ['/usr/bin/sudo', '-n', join(cloneRoot, 'bin', 'sampler'), 'node']],
+    ['taskpolicy -b boolean flag', ['/usr/bin/taskpolicy', '-b', join(cloneRoot, 'bin', 'sampler'), '--runner', 'node']],
+    ['timeout --foreground', ['/usr/bin/timeout', '--foreground', join(cloneRoot, 'bin', 'sampler'), 'node']],
+    ['stdbuf -oL', ['/usr/bin/stdbuf', '-oL', join(cloneRoot, 'bin', 'sampler'), 'node']],
+    ['sudo -u me then boolean flag', ['/usr/bin/sudo', '-u', 'me', '-E', join(cloneRoot, 'bin', 'sampler'), 'node']],
+    ['sudo attached -uwho', ['/usr/bin/sudo', '-uwho', join(cloneRoot, 'bin', 'sampler'), 'node']],
+    ['sandbox-exec profile in the clone is claimed', ['/usr/bin/sandbox-exec', '-f', join(cloneRoot, 'p.sb'), '/usr/bin/true']],
   ])('a clone executable as the loose wrapper first operand is matched and restarted: %s', async (_name, ProgramArguments) => {
     const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments }]);
     expect(findServicesRunningFromClone(o)).toMatchObject({ matches: [{ label: 'com.we.resource-sampler' }], unreadable: [] });
@@ -782,7 +790,8 @@ describe('interpreter option shapes that once hid a clone script (value contains
     expect(findStaleCodeServices({ ...o, readProcessStartMs: () => 100_000, readAdoptedAtMs: () => 200_000 })).toHaveLength(1);
   });
   it.each([
-    ['option value path is not the program', ['/usr/bin/sandbox-exec', '-f', join(cloneRoot, 'p.sb'), outside, other]],
+    ['option value path outside the clone', ['/usr/bin/sandbox-exec', '-f', resolve('..', 'other-clone', 'p.sb'), outside, other]],
+    ['env assignment with a slash is not a program', ['/usr/bin/sudo', `FOO=${join(cloneRoot, 'x')}`, outside, other]],
     ['unrelated first operand', ['/usr/bin/sudo', '-u', 'me', resolve('..', 'other-clone', 'bin', 'sampler')]],
     ['clone path only as data after an unrelated program', ['/usr/bin/timeout', '10', resolve('..', 'other-clone', 'bin', 'sampler'), 'node', join(cloneRoot, 'data')]],
   ])('loose wrapper operands that are not the program stay unflagged: %s', (_name, ProgramArguments) => {
