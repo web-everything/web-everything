@@ -113,7 +113,8 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
         && (normalizeRemoteName(remoteName) === normalizeRemoteName(origin) || sameRepoUrl(remoteName, origin));
       // A lane may configure only the exact `origin` subsection. The primary (the operator's own checkout, not an
       // agent-writable lane) may carry ordinary extra remotes (upstream, a fork): the transport names the canonical
-      // URL explicitly, so only a remote aliasing that URL can redirect it, and that alias is refused for every key.
+      // URL explicitly, so only a remote aliasing that URL can redirect it. In the local/worktree scopes checked
+      // below, that alias is refused for every key (global/system remote config is operator-owned and not checked).
       const unsafeRemote = aliasesOrigin || (!primary && remoteName !== null && remoteName !== 'origin');
       // `primary`: its auth/signing keys (credential helper, commit.gpgsign, …) are not lane control either.
       // URL rewrites (insteadOf / pushInsteadOf, above) and origin aliases are still refused there.
