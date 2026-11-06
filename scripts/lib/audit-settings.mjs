@@ -16,6 +16,49 @@ export const AUDIT_SETTINGS_PATH = fileURLToPath(new NodeURL('../settings/codex-
  * `scripts/guard-bash.mjs` and `scripts/lib/lane-lease.mjs` were missing).
  * Every audit path list starts from this floor; settings and env can only ADD to it.
  */
+/**
+ * Review authorization: WHO may clear, accept, carry or escalate a verdict, and which markers are trusted (PR #6381
+ * red team: scripts/lib/review-independence.mjs, the author-cannot-clear-own-review check, was missing). A test reads
+ * every module these entries match from the source and pins each module it imports DIRECTLY onto the floor, so the
+ * scanned set is this list itself and can never drift from it. The scan is one level deep: the full import closure
+ * of this family is most of scripts/, so a module two imports away is protected only if it is named here.
+ */
+export const REVIEW_AUTH_FLOOR = Object.freeze([
+  'scripts/lib/review-independence.mjs', 'scripts/lib/marker-authorship.mjs', 'scripts/lib/ai-pr-authorship.mjs',
+  'scripts/operations/build-pr-authorship.mjs', 'scripts/**/human-clearance-carry*', 'scripts/settings/*human-clearance*',
+  'scripts/**/accept-carry-*', 'scripts/lib/unattended-review-accept.mjs', 'scripts/lib/trust-chain-tier.mjs',
+  'scripts/review-set-label.mjs', 'scripts/**/*verdict-carry*', 'scripts/**/*clear-human*', 'scripts/lib/operator-identity.mjs',
+  'scripts/lib/delegation-marker.mjs', 'scripts/lib/verdict-ledger*', 'scripts/lib/ruling-ledger.mjs', 'scripts/lib/jury-core.mjs',
+  // Each operation with its -io and -cli halves: the I/O half performs the write the pure half decides.
+  'scripts/operations/record-verdict*', 'scripts/operations/record-referral-ruling*', 'scripts/operations/land-human-only*',
+  'scripts/conveyor/hiccup-approve.mjs', 'scripts/settings/delivery-identity.json', 'scripts/lib/review-escalation.mjs',
+  'scripts/lib/identical-net-patch.mjs', 'scripts/lib/carry-equivalence.mjs', 'scripts/lib/numbering-carry.mjs']);
+/** Modules the review authorization family imports directly (the source-scan test pins this list complete). */
+const REVIEW_AUTH_IMPORTS = Object.freeze([
+  'scripts/lib/github-app-identity.mjs', 'scripts/lib/approval-prevention-notice.mjs', 'scripts/lib/review-verdict-carried-marker.mjs',
+  'scripts/lib/rebase-drop-manifest.mjs', 'scripts/lib/settings-files.mjs', 'scripts/lib/review-label-provider.mjs',
+  'scripts/backlog/id.mjs', 'scripts/lib/review-seat-settings.mjs',
+  // PR #6381 self-review: the imports of review-set-label, jury-core, the ledgers, record-verdict and review-escalation.
+  // review-seat-policy and referral-card-readable decide whether a mandatory referral counts as cleared.
+  'scripts/operations/review-seat-policy.mjs', 'scripts/lib/referral-card-readable.mjs', 'scripts/lib/referral-live-context.mjs',
+  'scripts/lib/review-labels.mjs', 'scripts/lib/reasonless-bounce.mjs', 'scripts/lib/red-team-status-label-meta.mjs',
+  'scripts/lib/red-team-status-labels.mjs', 'scripts/lib/human-review-surfaces.mjs', 'scripts/lib/direction-aware-human.mjs',
+  'scripts/lib/false-finding-causes.mjs', 'scripts/lib/mandate-fence.mjs', 'scripts/lib/fixer-escalation-policy.mjs',
+  'scripts/lib/operator-send-backs.mjs', 'scripts/lib/restack-equivalence.mjs', 'scripts/lib/fix-handoff.mjs',
+  'scripts/lib/main-staleness.mjs', 'scripts/lib/pr-liveness.mjs', 'scripts/lib/prevention-landing-job.mjs',
+  'scripts/lib/advisory-labels.mjs', 'scripts/lib/codex-judge-spawn.mjs', 'scripts/lib/judge-spawn.mjs',
+  'scripts/lib/constellation-repos.mjs', 'scripts/lib/repo-slug.mjs', 'scripts/lib/repo-profile.mjs', 'scripts/lib/daemon-events.mjs',
+  'scripts/lib/gh-throttle.mjs', 'scripts/lib/git-transport-branch.mjs', 'scripts/lib/proc-read.mjs', 'scripts/lib/transient-paths.mjs',
+  'scripts/lib/under-test.mjs', 'scripts/lib/write-all-sync.mjs', 'scripts/conveyor/rearm-review.mjs',
+  'scripts/conveyor/review-referral-hold.mjs', 'scripts/conveyor/standing-ruling-io.mjs', 'scripts/conveyor/run-scorecard-store.mjs',
+  'scripts/conveyor/log-delegation-trial.mjs', 'scripts/conveyor/pr-comments-complete.mjs', 'scripts/conveyor/learnings-drop.mjs',
+  'scripts/operations/registry.mjs', 'scripts/operations/step-kinds.mjs', 'scripts/operations/run-store.mjs',
+  'scripts/operations/coordination-root.mjs',
+  // The -io and -cli halves' imports: the seat provider and review settings they decide with, and the operation engine.
+  'scripts/lib/review-seat-provider.mjs', 'scripts/lib/review-settings.mjs', 'scripts/lib/pr-state/referrals.mjs',
+  'scripts/lib/pr-state/snapshot.mjs', 'scripts/lib/gh-app-shim.mjs', 'scripts/apply-review-request.mjs',
+  'scripts/operations/review-pr.mjs', 'scripts/operations/review-pr-io.mjs', 'scripts/operations/engine.mjs',
+  'scripts/operations/effect-executor.mjs', 'scripts/operations/cli-adapter.mjs', 'scripts/operations/run.mjs']);
 export const GUARD_FLOOR = Object.freeze(['scripts/**/file-locks*', 'scripts/*file-locks*', 'scripts/**/lease*', 'scripts/*lease*',
   'scripts/lib/lane-lease.mjs', 'scripts/readiness/scope-lease*',
   'scripts/**/slot*', 'scripts/*slot*', 'scripts/**/lock-reaper*', 'scripts/*lock-reaper*', 'scripts/**/lane-pool*', 'scripts/*lane-pool*',
@@ -28,22 +71,10 @@ export const GUARD_FLOOR = Object.freeze(['scripts/**/file-locks*', 'scripts/*fi
   'scripts/lib/review-ci-gate*', 'scripts/*-gate*', 'scripts/**/*-gate*', 'scripts/lib/gate-*', 'scripts/lib/required-check*',
   'scripts/lib/promotion-required-checks.mjs', 'scripts/rulesets/', 'scripts/settings/required-checks-cache.json',
   // Modules those gates decide with (their imports): weakening one weakens the gate.
-  'scripts/lib/required-status-checks.mjs', 'scripts/lib/rollup-collapse.mjs', 'scripts/lib/review-escalation.mjs',
+  'scripts/lib/required-status-checks.mjs', 'scripts/lib/rollup-collapse.mjs',
   'scripts/lib/review-timing.mjs', 'scripts/lib/review-policy*', 'scripts/lib/github-auth-policy.mjs', 'scripts/operations/gate-health*',
-  // Review authorization: WHO may clear, accept or carry a verdict, and which markers are trusted (PR #6381 red team:
-  // scripts/lib/review-independence.mjs, the author-cannot-clear-own-review check, was missing).
-  'scripts/lib/review-independence.mjs', 'scripts/lib/marker-authorship.mjs', 'scripts/lib/ai-pr-authorship.mjs',
-  'scripts/operations/build-pr-authorship.mjs', 'scripts/**/human-clearance-carry*', 'scripts/settings/*human-clearance*',
-  'scripts/**/accept-carry-*', 'scripts/lib/unattended-review-accept.mjs', 'scripts/lib/trust-chain-tier.mjs',
-  'scripts/review-set-label.mjs', 'scripts/**/*verdict-carry*', 'scripts/**/*clear-human*', 'scripts/lib/operator-identity.mjs',
-  'scripts/lib/delegation-marker.mjs', 'scripts/lib/verdict-ledger*', 'scripts/lib/ruling-ledger.mjs', 'scripts/lib/jury-core.mjs',
-  'scripts/operations/record-verdict.mjs', 'scripts/operations/record-referral-ruling.mjs', 'scripts/operations/land-human-only.mjs',
-  'scripts/conveyor/hiccup-approve.mjs', 'scripts/settings/delivery-identity.json',
-  // Modules the clearance, carry and identity decisions import (a test pins every direct import of that family).
-  'scripts/lib/github-app-identity.mjs', 'scripts/lib/identical-net-patch.mjs', 'scripts/lib/carry-equivalence.mjs',
-  'scripts/lib/numbering-carry.mjs', 'scripts/lib/approval-prevention-notice.mjs', 'scripts/lib/review-verdict-carried-marker.mjs',
-  'scripts/lib/rebase-drop-manifest.mjs', 'scripts/lib/settings-files.mjs', 'scripts/lib/review-label-provider.mjs',
-  'scripts/backlog/id.mjs', 'scripts/lib/review-seat-settings.mjs',
+  // Review authorization and the modules it imports directly (see REVIEW_AUTH_FLOOR).
+  ...REVIEW_AUTH_FLOOR, ...REVIEW_AUTH_IMPORTS,
   // The review settings file: carryAcrossRebase and unattendedAcceptRequiresCleanReferrals decide carries and accepts.
   'scripts/settings/review.json',
   // The auditor itself: weakening it weakens every later audit.

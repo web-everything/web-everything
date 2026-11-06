@@ -6514,12 +6514,14 @@ match without regard to letter case. The required-check, review and merge author
 `scripts/lib/review-ci-gate.mjs`) are on the floor too, and so are the review authorization modules that decide
 who may clear, accept or carry a verdict and which markers are trusted (including
 `scripts/lib/review-independence.mjs`, `scripts/lib/marker-authorship.mjs` and `scripts/review-set-label.mjs`),
-and the review settings file `scripts/settings/review.json`. Every module that the clearance, carry, identity and
-unattended-accept modules named in that test import directly is on the floor too (one level; the test reads those
-imports from source).
+and the review settings file `scripts/settings/review.json`. Every module that a review authorization module
+(`REVIEW_AUTH_FLOOR` in `scripts/lib/audit-settings.mjs`, the test's scanned roots) imports directly is on the floor
+too. The test derives its roots from that list and reads the imports from source, so the two cannot drift. The scan
+is one level deep: the full import closure is most of `scripts/`, so a module two imports away is protected only if
+it is named on the floor itself.
 A D2 card's requirements are enforced independently: a missing card clears only when both the card and the
 pay-by requirements are waived. The card reader and the clock are code hooks only: a plain value passed for either
-(such as `now: 0`) is never used to clear a card. Platform and file path lists are unioned, never replaced.
+(such as `now: 0`) is never used to clear a card, and a plain number may only move the clock later. Platform and file path lists are unioned, never replaced.
 An invalid or unreadable path list protects every path. An explicitly configured platform-preferences file that
 is missing fails closed like an unreadable one. `allow` from the environment also resolves to `block`. The D2 card
 reader fetches `origin/main` before reading the card; a failed fetch means no card. A caller of the verdict may only

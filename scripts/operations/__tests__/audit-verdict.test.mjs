@@ -1,7 +1,8 @@
+import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { URL as NodeURL, fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
-import { GUARD_FLOOR } from '../../lib/audit-settings.mjs';
+import { GUARD_FLOOR, REVIEW_AUTH_FLOOR } from '../../lib/audit-settings.mjs';
 import { findingFingerprint, proofFingerprint, readCardFromMain } from '../audit-verdict.mjs';
 
 // R473 stage 1 deliberately supplies tests only. Stage 2 supplies the implementation;
@@ -584,13 +585,26 @@ describe('R473 structured concurrency evidence', () => {
     });
     // PR #6381 red team: the floor names modules one by one, so a module a protected decision imports can be missed
     // (marker-authorship.mjs decides which marker authors are trusted through github-app-identity.mjs). For the review
-    // clearance, carry and identity family, every module it imports directly is read from the source and must be on the
-    // floor too, so a new import cannot silently stay unprotected.
-    const AUTH_ROOTS = ['scripts/lib/review-independence.mjs', 'scripts/lib/marker-authorship.mjs', 'scripts/lib/operator-identity.mjs',
-      'scripts/lib/human-clearance-carry.mjs', 'scripts/lib/accept-carry-forward.mjs', 'scripts/lib/rebase-verdict-carry.mjs',
-      'scripts/lib/numbering-carry.mjs', 'scripts/lib/carry-equivalence.mjs', 'scripts/lib/identical-net-patch.mjs',
-      'scripts/lib/unattended-review-accept.mjs'];
+    // authorization family, every module it imports directly is read from the source and must be on the floor too, so
+    // a new import cannot silently stay unprotected. The scanned roots are REVIEW_AUTH_FLOOR itself, expanded to the
+    // tracked modules each entry matches, so the scan can never cover fewer modules than the floor names (PR #6381
+    // self-review: a hand-copied root list left review-set-label.mjs and jury-core.mjs unscanned).
     const repoRoot = fileURLToPath(new NodeURL('../../../', import.meta.url));
+    const AUTH_ROOTS = [...new Set(REVIEW_AUTH_FLOOR.flatMap(entry => execFileSync('git', ['ls-files', '-z', '--', `:(glob)${entry}`],
+      { cwd: repoRoot, encoding: 'utf8', maxBuffer: 4 << 20 }).split('\0')))]
+      .filter(p => /\.m?js$/.test(p) && !/\.test\.m?js$/.test(p) && !p.includes('/__tests__/')).sort();
+    it('the review authorization roots are derived from the floor and cover every authorization module', () => {
+      expect(AUTH_ROOTS).toEqual(expect.arrayContaining(['scripts/review-set-label.mjs', 'scripts/lib/jury-core.mjs',
+        'scripts/lib/review-independence.mjs', 'scripts/lib/ruling-ledger.mjs', 'scripts/operations/record-verdict.mjs',
+        'scripts/operations/record-referral-ruling.mjs', 'scripts/operations/land-human-only.mjs', 'scripts/lib/verdict-ledger.mjs',
+        'scripts/lib/delegation-marker.mjs', 'scripts/lib/review-escalation.mjs', 'scripts/lib/human-clearance-carry.mjs']));
+      for (const entry of REVIEW_AUTH_FLOOR) expect(GUARD_FLOOR, entry).toContain(entry);
+    });
+    // PR #6381 self-review: review-set-label.mjs decides whether a mandatory referral is cleared through these two.
+    it.each(['scripts/operations/review-seat-policy.mjs', 'scripts/lib/referral-card-readable.mjs', 'scripts/lib/review-labels.mjs',
+      'scripts/operations/record-verdict-io.mjs'])('E2 in %s (an import of a review authorization module) refuses clearance', async file => {
+      for (const stage of ['prerelease', 'prod']) neverShips(await compute([finding({ class: 'E2', file })], options(stage, { guardFloorPaths: [] })));
+    });
     const directImports = AUTH_ROOTS.flatMap(root => [...readFileSync(`${repoRoot}${root}`, 'utf8')
       .matchAll(/\bfrom\s*['"](\.\.?\/[^'"]+)['"]|\bimport\(\s*['"](\.\.?\/[^'"]+)['"]\s*\)/g)]
       .map(m => fileURLToPath(new NodeURL(m[1] ?? m[2], new NodeURL(root, `file://${repoRoot}`))).slice(repoRoot.length)));
@@ -635,6 +649,11 @@ describe('R473 structured concurrency evidence', () => {
       expect((await compute([d2()], options('prerelease', { readCard: overdue, now: () => 0 }))).verdict).toBe('NOT WEAKENED');
       // A card reader that is not code (a plain value) cannot be called: no card, so it blocks.
       expect((await compute([d2()], options('prerelease', { readCard: 'mustPayBefore: 2099-01-01\n', now: () => NOW }))).verdict).toBe('WEAKENED');
+    });
+    it('a plain-number clock later than the real one is honoured: a pay-by before it blocks (PR #6381 self-review)', async () => {
+      const later = Date.parse('2100-01-01T00:00:00Z');
+      expect((await compute([d2()], options('prerelease', { readCard: reader('mustPayBefore: 2099-01-01\n'), now: later }))).verdict).toBe('WEAKENED');
+      expect((await compute([d2()], options('prerelease', { readCard: reader('mustPayBefore: 2101-01-01\n'), now: later }))).verdict).toBe('NOT WEAKENED');
     });
     it('blocks on an impossible or non-canonical pay-by date instead of rolling it into a later month (PR #6381 red team)', async () => {
       for (const bad of ['2099-02-31', '2099-02-30', '2100-02-29', '2099-04-31', '2099-13-01', '2099-00-10', '2099-01-00',

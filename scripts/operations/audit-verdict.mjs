@@ -108,8 +108,11 @@ function d2Verified(f, releaseStage, { readCard = readCardFromMain, now = Date.n
     if (due === 'prod') return releaseStage !== 'prod';
     const when = payByTime(due);
     // The clock is a code seam only: a plain value (a number from parsed data, `now: 0`) would move "now" into the
-    // past and pass an overdue pay-by, so anything but a function reads the real clock (PR #6381 self-review).
-    return Number.isFinite(when) && when > (typeof now === 'function' ? now() : Date.now());
+    // past and pass an overdue pay-by, so a plain finite number may only move "now" LATER (a stricter clock), and any
+    // other non-function reads the real clock (PR #6381 self-review).
+    const clock = typeof now === 'function' ? now()
+      : (typeof now === 'number' && Number.isFinite(now) ? Math.max(Date.now(), now) : Date.now());
+    return Number.isFinite(when) && when > clock;
   } catch { return false; }
 }
 /**
