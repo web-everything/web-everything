@@ -438,7 +438,6 @@ describe('disk restart lock: abandoned-owner recovery', () => {
     } finally { await fsAsync.rm(root, { recursive: true, force: true }); }
   });
   it.each([
-    ['no lock.json', async dir => { await fsAsync.mkdir(dir, { recursive: true }); }],
     ['corrupt lock.json', async dir => { await fsAsync.mkdir(dir, { recursive: true }); await fsAsync.writeFile(join(dir, 'lock.json'), '{nope'); }],
     ['no recorded pid', async dir => leave(dir, deadPid, { pid: null })],
   ])('an unreadable or pid-less lock (%s) fails closed', async (_name, make) => {
@@ -460,6 +459,35 @@ describe('disk restart lock: abandoned-owner recovery', () => {
       await fsAsync.rm(dir, { recursive: true });
       await leave(dir, process.ppid);
       expect(await locks.acquire(label)).toBeNull();
+    } finally { await fsAsync.rm(root, { recursive: true, force: true }); }
+  });
+  it('an empty lock dir stranded by a crash before the entry was written is replaced, not blocked forever', async () => {
+    const { root, locks, dir } = setup(() => 'alive');
+    try {
+      await fsAsync.mkdir(dir, { recursive: true });
+      expect(await locks.acquire(label)).toBeTypeOf('function');
+      expect(JSON.parse(await fsAsync.readFile(join(dir, 'lock.json'), 'utf8')).pid).toBe(7);
+    } finally { await fsAsync.rm(root, { recursive: true, force: true }); }
+  });
+  it('concurrent acquirers: exactly one wins, and the lock dir never exists without its owner entry', async () => {
+    const { root, locks, dir } = setup(() => 'alive');
+    try {
+      const results = await Promise.all(Array.from({ length: 8 }, () => locks.acquire(label)));
+      expect(results.filter(Boolean)).toHaveLength(1);
+      expect(JSON.parse(await fsAsync.readFile(join(dir, 'lock.json'), 'utf8')).pid).toBe(7);
+      // Losers leave no staging residue behind.
+      expect((await fsAsync.readdir(root)).filter(name => name.startsWith('.staging-'))).toEqual([]);
+    } finally { await fsAsync.rm(root, { recursive: true, force: true }); }
+  });
+  it('a lock dir is only ever published with its lock.json (no entry-less state to strand a label)', async () => {
+    const { root, locks, dir } = setup(() => 'alive');
+    try {
+      const release = await locks.acquire(label);
+      expect(await fsAsync.readdir(dir)).toEqual(['lock.json']);
+      await release();
+      // A staged-but-unpublished attempt (crash before the rename) is not a held lock.
+      await fsAsync.mkdir(join(root, '.staging-1-dead'));
+      expect(await locks.acquire(label)).toBeTypeOf('function');
     } finally { await fsAsync.rm(root, { recursive: true, force: true }); }
   });
   it('a lock that changed hands between the judgement and the reclaim is left alone', async () => {

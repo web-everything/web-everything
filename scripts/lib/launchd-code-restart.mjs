@@ -431,13 +431,23 @@ export function createDiskLocks({ root: rootOpt, liveness = probePidLiveness, pi
       const root = rootOpt ?? join(homedir(), '.claude', 'launchd-code-restart', 'locks');
       const key = `launchd-code-restart:${label}`, dir = lockDirFor(root, key);
       await fsAsync.mkdir(root, { recursive: true });
+      // The lock dir appears already holding its lock.json: it is built in a private sibling and renamed into
+      // place, which POSIX refuses (ENOTEMPTY/EEXIST) when the target exists. So an entry-less lock dir (a
+      // crash between mkdir and the metadata write) can never exist, and every held lock names its owner.
       const win = async () => {
-        try { await fsAsync.mkdir(dir); }
-        catch (error) { if (error.code === 'EEXIST') return false; throw error; }
-        const entry = makeLockEntry(`launchd-code-restart:${pid}:${randomBytes(6).toString('hex')}`, label, new Date().toISOString(), pid);
-        // A failed metadata write leaves the exclusive marker in place, failing closed.
-        await fsAsync.writeFile(join(dir, 'lock.json'), JSON.stringify(entry), { flag: 'wx' });
-        return true;
+        const nonce = randomBytes(6).toString('hex');
+        const entry = makeLockEntry(`launchd-code-restart:${pid}:${nonce}`, label, new Date().toISOString(), pid);
+        const staging = join(root, `.staging-${pid}-${nonce}`);
+        await fsAsync.mkdir(staging);
+        try {
+          await fsAsync.writeFile(join(staging, 'lock.json'), JSON.stringify(entry), { flag: 'wx' });
+          await fsAsync.rename(staging, dir);
+          return true;
+        } catch (error) {
+          await fsAsync.rm(staging, { recursive: true, force: true }).catch(() => {});
+          if (error.code === 'EEXIST' || error.code === 'ENOTEMPTY') return false;
+          throw error;
+        }
       };
       if (!(await win())) {
         let held = null;
