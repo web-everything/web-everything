@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { classifyStaleOwed } from '../fixer-slot-rules.mjs';
 import { runSlotAwareAwaitPass } from '../await-verify-loop.mjs';
-import { runAwaitVerifyPass } from '../await-verify-pass.mjs';
+import { runAwaitVerifyPass, isHarnessRecord } from '../await-verify-pass.mjs';
 
 const T0 = Date.parse('2026-10-08T19:30:00Z');
 const entry = (key, pr, age = 0, extra = {}) => ({ key, record: {
@@ -76,15 +76,53 @@ describe('stale owed resumes (R618)', () => {
     expect(h.resumed).toEqual(['oldest', 'middle']);
   });
 
-  it('moves an admitted record still pending after three misses behind live work', async () => {
+  it('keeps a busy owed claim oldest-first after repeated misses so later passes cannot exceed the cap', async () => {
     const h = harness([entry('stuck-r618', 1), entry('ready-r618', 2, 1000)]);
     h.io.listSessions = () => [
       { sessionId: 'stuck-r618', name: 'stuck-r618', status: 'working', kind: 'background' },
       { sessionId: 'ready-r618', name: 'ready-r618', status: 'idle', kind: 'background' },
     ];
-    for (let i = 0; i < 3; i++) expect((await h.pass()).admitted).toEqual(['stuck-r618']);
-    expect((await h.pass()).admitted).toEqual(['ready-r618']);
-    expect(h.resumed).toEqual(['ready-r618']);
+    const claims = [{ meta: { repo: 'we', pr: 1, kind: 'fix', sessionId: 'stuck-r618' } }];
+    for (let i = 1; i <= 4; i++) {
+      const out = await h.pass(1, claims);
+      expect(out.admitted).toEqual(['stuck-r618']);
+      expect(out.deferred).toEqual(['ready-r618']);
+      expect.soft(out.rows.find(r => r.key === 'stuck-r618').result)
+        .toBe(`session-busy${i >= 3 ? `; missed ${i}x` : ''}`);
+      expect(out.rows.find(r => r.key === 'ready-r618').result).not.toContain('missed');
+      expect(h.resumed).toEqual([]);
+    }
+    // Deferral is not a miss; a successful wake resets consecutive misses.
+    expect((await h.pass(0, claims)).admitted).toEqual([]);
+    expect((await h.pass(1, claims)).rows.find(r => r.key === 'stuck-r618').result).toBe('session-busy; missed 5x');
+    h.io.listSessions = () => [{ sessionId: 'stuck-r618', name: 'stuck-r618', status: 'idle', kind: 'background' }];
+    const success = await h.pass(1, claims);
+    expect(success.rows.find(r => r.key === 'stuck-r618').result).not.toContain('missed');
+    expect(h.resumed).toEqual(['stuck-r618']);
+    h.store.set('stuck-r618', entry('stuck-r618', 1).record);
+    h.io.listSessions = () => [];
+    expect((await h.pass(1, claims)).rows.find(r => r.key === 'stuck-r618').result).not.toContain('missed');
+  });
+
+  it.each([
+    ['version', { v: 2 }], ['SHA', { sha: 'invalid' }],
+    ['relative lane', { lane: 'relative/lane' }], ['missing lane', { lane: undefined }],
+    ['unsafe ref', { ref: 'lane/../main' }], ['missing ref', { ref: undefined }],
+    ['timestamp', { requestedAt: 'invalid' }],
+  ])('a newer record with malformed %s never retires a valid pending waiter', async (_field, malformed) => {
+    const key = _field.replaceAll(' ', '-');
+    const old = entry(`valid-${key}`, 1);
+    const newer = entry(`malformed-${key}`, 1, 1000, {
+      who: old.record.who, sha: 'b'.repeat(40), pendingResume: undefined, ...malformed,
+    });
+    expect(isHarnessRecord(old.record)).toBe(true);
+    expect(isHarnessRecord(newer.record)).toBe(false);
+    expect(classifyStaleOwed({ owed: [old], records: [old, newer] })).toEqual([]);
+    const h = harness([old, newer]);
+    const out = await h.pass(0);
+    expect(out.cleared).toEqual([]);
+    expect(h.store.get(old.key)).toEqual(old.record);
+    expect(h.io.clearRecord).not.toHaveBeenCalled();
   });
 
   it.each(['missing', 'throws', 'refuses'])('cleanup %s never blocks live admission', async mode => {

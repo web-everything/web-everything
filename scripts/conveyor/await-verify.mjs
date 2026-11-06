@@ -263,6 +263,15 @@ export const AWAIT_VERIFY_REF_RE = /^lane\/[A-Za-z0-9._/-]+$/;
 /** Session kinds whose briefs know how to be resumed by the verdict pass. */
 export const AWAIT_VERIFY_KINDS = Object.freeze(['fix', 'ci-heal', 'delivery', 'prepare']);
 
+/** Is this a record the harness pass owns (written by `mark --ref`)? Shared with stale-wait classification. */
+export function isHarnessRecord(record) {
+  return !!record && record.v === 1
+    && ((Number.isInteger(record.pr) && record.pr > 0) || (AWAIT_VERIFY_NO_PUSH_KINDS.includes(record.kind) && Number.isInteger(record.item) && record.item > 0))
+    && /^[a-f\d]{40}$/i.test(String(record.sha ?? '')) && typeof record.lane === 'string' && record.lane.startsWith('/')
+    && AWAIT_VERIFY_REF_RE.test(String(record.ref ?? '')) && !String(record.ref).includes('..')
+    && AWAIT_VERIFY_KINDS.includes(record.kind) && Number.isFinite(Date.parse(record.requestedAt));
+}
+
 /**
  * Thin CLI shell; filesystem, subprocess, environment, clock and output ports are injectable.
  * `mark` refuses a dirty working tree: the harness pushes the committed sha, so the verified tree must BE that

@@ -134,7 +134,7 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
   // Keep every claim: without a retained wait, its worker conservatively counts as active.
   const activeCount = claimStates(claims, records, { nowMs, ttlMs }).filter((x) => x.state === 'active').length;
   const { admit, defer } = admitResumes({
-    owed: owedFix.map(({ key, record }) => ({ key, requestedAtMs: ms(record.requestedAt), deprioritized: (resumeMisses.get(key) ?? 0) >= 3 })), activeCount, cap, parkedReleasesSlot: true,
+    owed: owedFix.map(({ key, record }) => ({ key, requestedAtMs: ms(record.requestedAt) })), activeCount, cap, parkedReleasesSlot: true,
   });
   const deferred = new Set(defer);
   const wake = records.filter(({ key, record }) => record?.pendingResume?.kind && !deferred.has(key));
@@ -162,7 +162,10 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
   }
   for (const r of b.rows ?? []) {
     const before = (a.rows ?? []).find((x) => x.key === r.key && pushedA(x));
-    rows.push(before ? { ...r, action: before.action, reason: before.reason, result: `${pushedA(before)}${r.result}` } : r);
+    const row = before ? { ...r, action: before.action, reason: before.reason, result: `${pushedA(before)}${r.result}` } : { ...r };
+    const misses = order.has(r.key) ? resumeMisses.get(r.key) ?? 0 : 0;
+    if (misses >= 3) row.result = `${row.result}; missed ${misses}x`;
+    rows.push(row);
   }
   return { rows, admitted: admit, deferred: defer, cleared };
 }

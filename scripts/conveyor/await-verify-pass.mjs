@@ -28,7 +28,7 @@ import { join, resolve, dirname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   listStoredAwaitVerify, writeStoredAwaitVerify, clearStoredAwaitVerify, clearAwaitVerifyRecord,
-  resolveAwaitVerifyTtlMs, AWAIT_VERIFY_REF_RE, AWAIT_VERIFY_KINDS, AWAIT_VERIFY_NO_PUSH_KINDS,
+  resolveAwaitVerifyTtlMs, AWAIT_VERIFY_REF_RE, AWAIT_VERIFY_NO_PUSH_KINDS, isHarnessRecord,
   readSelfReview, selfReviewHold, selfReviewStoreDir, selfReviewBelongsTo,
 } from './await-verify.mjs';
 import { readVerifyMarker, verifyGateDecision } from '../lib/lane-verify.mjs';
@@ -62,14 +62,7 @@ const lower = (s) => String(s ?? '').toLowerCase();
 /** A delivery or prepare wait: no PR yet, nothing for the harness to push (the session's own `open-pr` does). */
 export const isNoPushRecord = (record) => AWAIT_VERIFY_NO_PUSH_KINDS.includes(record?.kind);
 
-/** Is this a record the pass owns (written by `mark --ref`)? */
-export function isHarnessRecord(record) {
-  return !!record && record.v === 1
-    && ((Number.isInteger(record.pr) && record.pr > 0) || (isNoPushRecord(record) && Number.isInteger(record.item) && record.item > 0))
-    && SHA_RE.test(String(record.sha ?? '')) && typeof record.lane === 'string' && record.lane.startsWith('/')
-    && AWAIT_VERIFY_REF_RE.test(String(record.ref ?? '')) && !String(record.ref).includes('..')
-    && AWAIT_VERIFY_KINDS.includes(record.kind) && Number.isFinite(Date.parse(record.requestedAt));
-}
+export { isHarnessRecord } from './await-verify.mjs';
 
 /**
  * A red the gate itself classified as load-only: every failing file was re-run alone, every retried file failed
