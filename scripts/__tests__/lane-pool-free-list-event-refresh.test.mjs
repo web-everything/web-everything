@@ -138,6 +138,13 @@ describe('free-lane list is refreshed by lane-pool events', () => {
   // A clean lane with no lease — the shape a published free lane has. A freshly provisioned template lane is
   // exactly that, so no acquire+release pair (two more CLI children) is needed to make one.
   const releasedLane = () => { usePool(1); return 1; };
+  // A refusal must be the --no-reset guard's own refusal of THIS lane — never a child killed at its cap or a
+  // spawn skipped by the file budget, which also exit non-zero and would otherwise pass these tests vacuously.
+  const expectGuardRefusal = (r, lane) => {
+    expect(r.code).not.toBe(0);
+    expect(r.err).not.toMatch(/timed out after|child budget/);
+    expect(r.err).toMatch(new RegExp(`lane-${lane} is not provably clean and pushed`));
+  };
 
   it('after a release the list is FRESH and names the lane, with no periodic pass', () => {
     const { lane } = acquireOneLane();
@@ -167,7 +174,7 @@ describe('free-lane list is refreshed by lane-pool events', () => {
     // `--hard-max=1` caps pool growth: with the only lane dirty and refused, an uncapped acquire would fall through to
     // the scan and then PROVISION a new lane (a full clone — minutes under CI load, which stalled a whole unit shard).
     const r = runPool(['acquire', ...poolArgs(), '--no-reset', '--session=other', '--hard-max=1', '--json']);
-    expect(r.code).not.toBe(0);
+    expectGuardRefusal(r, lane);
     expect(readFileSync(join(laneDir(lane), 'file.txt'), 'utf8')).toBe('edited after publication\n');
   });
 
@@ -187,7 +194,7 @@ describe('free-lane list is refreshed by lane-pool events', () => {
     writeFileSync(join(dir, 'new.txt'), 'x\n'); git(['add', 'new.txt'], dir); git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'unpushed-work'], dir);
     seedList([{ lane, at: Date.now() }]);
     const r = runPool(['acquire', ...poolArgs(), '--no-reset', '--session=other', '--hard-max=1', '--json']);
-    expect(r.code).not.toBe(0);
+    expectGuardRefusal(r, lane);
     expect(git(['log', '-1', '--format=%s'], dir)).toBe('unpushed-work'); // the work is untouched
   });
 
@@ -219,7 +226,7 @@ describe('free-lane list is refreshed by lane-pool events', () => {
     expect(git(['rev-parse', 'refs/remotes/origin/lane/gone'], dir)).toBe(git(['rev-parse', 'HEAD'], dir));
     seedList([{ lane, at: Date.now() }]);
     const r = runPool(['acquire', ...poolArgs(), '--no-reset', '--session=other', '--hard-max=1', '--json']);
-    expect(r.code).not.toBe(0);
+    expectGuardRefusal(r, lane);
     expect(git(['log', '-1', '--format=%s'], dir)).toBe('stale-ref-work'); // the work is untouched
   });
 
