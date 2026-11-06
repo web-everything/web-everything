@@ -220,10 +220,11 @@ export function listLitterWorktrees(dir) {
   let cur = null;
   for (const line of git(dir, ['worktree', 'list', '--porcelain']).split('\n')) {
     if (line.startsWith('worktree ')) { cur = { path: line.slice(9) }; out.push(cur); }
+    else if (cur && line.startsWith('HEAD ')) cur.head = line.slice(5);
   }
   return out
     .filter((w) => w.path.startsWith(root + sep))
-    .map((w) => ({ path: w.path, name: w.path.slice(root.length + 1) }));
+    .map((w) => ({ path: w.path, name: w.path.slice(root.length + 1), head: w.head }));
 }
 
 /** Does `dirAbs` (a real, absolute path) have any registered worktree root somewhere beneath it? PURE-ish
@@ -398,18 +399,27 @@ export function laneLivenessGate({
 /**
  * Snapshot ONE working tree (lane or worktree) into refs WITHOUT touching its working tree or real index: a
  * throwaway index gets HEAD + every tracked change + every untracked (non-ignored) file, written as a `wip`
- * commit whose parent is HEAD. Returns what it saved.
+ * commit whose parent is HEAD. Untracked nested repositories are excluded and returned as `nestedRepos`
+ * (relative paths) for the caller to copy verbatim, including their git metadata and ignored content.
  */
 export function snapshotWorkTree(dir, { refs, branchRef }) {
   const headSha = git(dir, ['rev-parse', 'HEAD']).trim();
   const paths = dirtyPaths(dir);
+  const nestedRepos = git(dir, ['ls-files', '--others', '--exclude-standard', '-z']).split('\0')
+    .filter((p) => p.endsWith('/') && !isWorktreeLitterPath(p))
+    .map((p) => p.slice(0, -1))
+    .filter((p) => {
+      try { lstatSync(join(dir, p, '.git')); return true; }
+      catch (e) { if (e.code === 'ENOENT') return false; throw e; }
+    });
   let wipSha = null;
   if (paths.length) {
     const tmp = mkdtempSync(join(tmpdir(), 'lane-salvage-idx-'));
     try {
       const env = { ...process.env, GIT_INDEX_FILE: join(tmp, 'index') };
       git(dir, ['read-tree', 'HEAD'], { env });
-      git(dir, ['add', '-A', '--', '.', `:(exclude)${WORKTREE_LITTER_PREFIX.slice(0, -1)}`], { env });
+      git(dir, ['add', '-A', '--', '.', `:(exclude)${WORKTREE_LITTER_PREFIX.slice(0, -1)}`,
+        ...nestedRepos.map((p) => `:(exclude,literal)${p}`)], { env });
       const tree = git(dir, ['write-tree'], { env }).trim();
       wipSha = git(dir, ['-c', 'user.name=lane-salvage', '-c', 'user.email=lane-salvage@noreply.local',
         'commit-tree', tree, '-p', headSha, '-m', `lane-salvage: uncommitted + untracked state of ${dir}`], { env }).trim();
@@ -420,7 +430,7 @@ export function snapshotWorkTree(dir, { refs, branchRef }) {
   // Refs always go into the lane's shared repo (a worktree shares it), so one bundle carries everything.
   git(dir, ['update-ref', refs.head, headSha]);
   if (wipSha) git(dir, ['update-ref', refs.wip, wipSha]);
-  return { dir, headSha, wipSha, aheadCount, dirtyCount: paths.length, refs: { head: refs.head, wip: wipSha ? refs.wip : null } };
+  return { dir, headSha, wipSha, aheadCount, dirtyCount: paths.length, refs: { head: refs.head, wip: wipSha ? refs.wip : null }, nestedRepos };
 }
 
 /**
@@ -475,7 +485,20 @@ export function salvageLane({ dir, lane, pool, branchRef, salvageRoot = resolveS
   const litter = listUnregisteredWorktreeLitter(dir);
   const snapshots = [snapshotWorkTree(dir, { refs: salvageRefNames({ lane, stamp }), branchRef })];
   for (const w of worktrees) {
-    snapshots.push({ worktree: w.name, ...snapshotWorkTree(w.path, { refs: salvageRefNames({ lane, stamp, worktree: w.name }), branchRef }) });
+    const refs = salvageRefNames({ lane, stamp, worktree: w.name });
+    try { lstatSync(w.path); } catch (e) {
+      if (e.code !== 'ENOENT') throw e;
+      // Stale registration: its recorded HEAD can still live in the lane's shared object database.
+      if (!w.head) continue;
+      try { git(dir, ['cat-file', '-e', w.head]); } catch { continue; }
+      const aheadCount = Number(git(dir, ['rev-list', '--count', `${branchRef}..${w.head}`]).trim());
+      if (aheadCount > 0) {
+        git(dir, ['update-ref', refs.head, w.head]);
+        snapshots.push({ worktree: w.name, dir: w.path, headSha: w.head, wipSha: null, aheadCount, dirtyCount: 0, refs: { head: refs.head, wip: null }, nestedRepos: [] });
+      }
+      continue;
+    }
+    snapshots.push({ worktree: w.name, ...snapshotWorkTree(w.path, { refs, branchRef }) });
   }
   // Only refs with content not already on origin/<branch> go in the bundle (an all-prerequisite ref would make
   // git refuse or silently drop it). Prerequisites are origin/<branch> commits — never force-pushed, always fetchable.
@@ -500,6 +523,14 @@ export function salvageLane({ dir, lane, pool, branchRef, salvageRoot = resolveS
     }
   }
   const prefix = join(outDir, `lane-${lane}`);
+  const nestedCopies = snapshots.flatMap((s) => (s.nestedRepos || []).map((p) => {
+    // Keep the lane-relative layout for worktree content too, avoiding collisions with the main tree.
+    const rel = s.worktree ? join(WORKTREE_LITTER_PREFIX, s.worktree, p) : p;
+    const dest = join(`${prefix}.nested-repos`, rel);
+    mkdirSync(dirname(dest), { recursive: true });
+    copyLitterTreeSync(join(s.dir, p), dest);
+    return { rel, dest };
+  }));
   // #4273 — copy every unregistered `.claude/worktrees/` item BEFORE the caller's `git clean -fd` can delete
   // it. Mirrors each item's own relative path under `.claude/worktrees/` (never a sanitized/collapsed name),
   // so distinct items can never collide on a shared destination. A symlink is copied as itself, never
@@ -541,7 +572,7 @@ export function salvageLane({ dir, lane, pool, branchRef, salvageRoot = resolveS
   }
   let branch = null;
   try { branch = git(dir, ['rev-parse', '--abbrev-ref', 'HEAD']).trim(); } catch { branch = null; }
-  const worktreeBranches = worktrees.map((w) => { try { return git(w.path, ['rev-parse', '--abbrev-ref', 'HEAD']).trim(); } catch { return null; } }).filter(Boolean);
+  const worktreeBranches = worktrees.filter((w) => existsSync(w.path)).map((w) => { try { return git(w.path, ['rev-parse', '--abbrev-ref', 'HEAD']).trim(); } catch { return null; } }).filter(Boolean);
   const record = buildSalvageRecord({
     now, pool, lane, dir, stamp, outDir, bundle, reason, branch, meta: { ...meta, worktreeBranches: [...(meta.worktreeBranches || []), ...worktreeBranches] },
     refs: bundleRefs.map((r) => r.ref),
@@ -551,6 +582,7 @@ export function salvageLane({ dir, lane, pool, branchRef, salvageRoot = resolveS
     patches: snapshots.map((s) => `${s.worktree ? `${prefix}.wt-${String(s.worktree).replace(/[^A-Za-z0-9._-]/g, '_')}` : prefix}.uncommitted.patch`),
     litter: litterCopies,
   });
+  record.nestedRepos = nestedCopies;
   appendSalvageIndex(salvageRoot, record);
   return { ...record, worktrees };
 }
