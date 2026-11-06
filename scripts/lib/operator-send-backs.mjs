@@ -11,13 +11,18 @@ const stripComments = text => String(text ?? '').replace(/<!--[\s\S]*?-->/g, ' '
  * after a quote line), tab/4-space indented code, tilde fences, and an unterminated fence (runs to the end of the
  * text, as Markdown renders it). Every ambiguity here fails closed: the request just stays open.
  */
-const CONTAINER = '[ \\t]*(?:(?:[-*+]|\\d{1,9}[.)])[ \\t]+)*';
+const CONTAINER = '[ \\t\\u00a0]*(?:(?:[-*+]|\\d{1,9}[.)])[ \\t\\u00a0]+)*';
 const FENCE_OPEN = new RegExp(`^${CONTAINER}(\`{3,}|~{3,})(.*)$`);
-const QUOTE_LINE = new RegExp(`^${CONTAINER}>`);
+// `&gt;` renders as a literal ">" (not a quote), but a reference spelled that way is still a reference, not a claim.
+const QUOTE_LINE = new RegExp(`^${CONTAINER}(?:>|&gt;)`);
+// A line that opens an HTML comment starts a new block: it ends a lazy quote continuation, so a real marker under a quote still counts.
+const COMMENT_LINE = /^[ \t]*<!--/;
 function stripQuoted(text) {
   const out = [];
   let fence = null, quoting = false;
-  for (const line of String(text ?? '').split(/\r\n?|\n/)) {
+  // HTML quote and preformatted blocks render as quoted/code text; an unterminated one runs to the end.
+  const source = String(text ?? '').replace(/<(blockquote|pre)\b[\s\S]*?(?:<\/\1\s*>|$)/gi, ' ');
+  for (const line of source.split(/\r\n?|\n/)) {
     if (fence) {
       const close = /^[ \t]*(`{3,}|~{3,})[ \t]*$/.exec(line);
       if (close && close[1][0] === fence[0] && close[1].length >= fence.length) fence = null;
@@ -30,7 +35,7 @@ function stripQuoted(text) {
       fence = open[1];
       quoting = false;
       out.push('');
-    } else if (QUOTE_LINE.test(line) || (quoting && line.trim())) {
+    } else if (QUOTE_LINE.test(line) || (quoting && line.trim() && !COMMENT_LINE.test(line))) {
       quoting = true;
       out.push('');
     } else {
@@ -69,11 +74,26 @@ export function operatorSendBacks(comments) {
   });
 }
 
+/**
+ * A real marker is a whole HTML comment, alone at the start of its line. Comment spans are scanned, so a marker
+ * inside another (multi-line or nested) comment is part of that outer span, which is not the marker: it is hidden.
+ */
+function markerLineFor(text, id) {
+  const exact = new RegExp(`^<!--\\s*addresses-operator-send-back:\\s*${escapeRe(id)}\\s*-->$`);
+  const source = String(text ?? '');
+  for (const span of source.matchAll(/<!--[\s\S]*?-->/g)) {
+    if (!exact.test(span[0])) continue;
+    const lineStart = source.lastIndexOf('\n', span.index - 1) + 1;
+    if (!source.slice(lineStart, span.index).trim()) return true;
+  }
+  return false;
+}
+
 /** An explicit reference, never a generic "fixed" assertion or an unrelated timestamp. */
 function namesSendBack(text, item, { carry = false } = {}) {
   const prose = stripComments(text);
   // The marker must start its line: one nested inside another HTML comment or inline prose is a reference.
-  return (item.id && new RegExp(`^[ \\t]*<!--\\s*addresses-operator-send-back:\\s*${escapeRe(item.id)}\\s*-->`, 'm').test(text))
+  return (item.id && markerLineFor(text, item.id))
     || containsToken(prose, item.id) || (!!item.url && prose.includes(item.url))
     || (!!item.at && prose.includes(item.at))
     || (!!item.etLabel && (carry || /\bsend-back\b/i.test(prose))
