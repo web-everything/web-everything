@@ -8,7 +8,7 @@ import { removeReadonlyTree } from '../../lib/readonly-tree.mjs';
  *   timeout.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { cpSync, mkdirSync, mkdtempSync, symlinkSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -17,6 +17,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { runGhProbeJobs, ghProbeStep, runProbeWorker, prewarmSnapshots, RESULT_SUFFIX } from '../health-watch-job.mjs';
 import { createJobStore, enqueueJob } from '../../lib/daemon-jobs-runtime.mjs';
 import { HEALTH_GH_PROBE_KIND } from '../../../skills-src/conveyor/daemon-manifest.mjs';
+import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 let dir;
@@ -29,7 +30,13 @@ const snapshot = {
     for (const d of ['scripts', 'skills-src']) cpSync(join(REPO, d), join(into, d), { recursive: true, filter: (s) => !s.includes('__tests__') });
     for (const f of ['package.json', 'package-lock.json']) cpSync(join(REPO, f), join(into, f));
   },
-  install: (into) => symlinkSync(join(REPO, 'node_modules'), join(into, 'node_modules'), 'dir'),
+  // The proof worker uses only Node builtins. Give its snapshot a private dependency tree:
+  // alias validation resolves symlinks and checks quarantine markers beside the target store,
+  // so linking the checkout's node_modules would read live lane-pool state on snapshot reuse.
+  install: (into) => {
+    mkdirSync(join(into, 'node_modules'));
+    writeFileSync(join(into, 'node_modules', '.package-lock.json'), JSON.stringify({ lockfileVersion: 3, packages: {} }));
+  },
 };
 
 describe('health-gh-probe job child', () => {
@@ -95,8 +102,8 @@ describe('health-gh-probe job child', () => {
       import { Worker } from 'node:worker_threads';
       import { installProbeShutdown } from ${JSON.stringify(pathToFileURL(join(REPO, 'scripts/conveyor/health-probe-shutdown.mjs')).href)};
       const finish = installProbeShutdown();
-      const worker = new Worker('setInterval(() => {}, 1000)', { eval: true });
-      const cli = spawn(process.execPath, ['-e', ${JSON.stringify("process.on('SIGTERM', () => process.send('term')); process.send('ready'); setInterval(() => {}, 1000);")}], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
+      const worker = new Worker(${JSON.stringify(keepAliveScript())}, { eval: true });
+      const cli = spawn(process.execPath, ['-e', ${JSON.stringify(keepAliveScript({ prelude: "process.on('SIGTERM', () => process.send('term'));", postlude: "process.send('ready');" }))}], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
       let workerExited = false;
       const workerExit = new Promise(resolve => worker.once('exit', () => {
         workerExited = true;
@@ -171,7 +178,7 @@ describe('health-gh-probe job child', () => {
       syncBuiltinESMExports();
       const { installProbeShutdown } = await import(${JSON.stringify(pathToFileURL(join(REPO, 'scripts/conveyor/health-probe-shutdown.mjs')).href)});
       installProbeShutdown();
-      setInterval(() => {}, 1000);
+      ${keepAliveScript()}
       process.send('ready');
     `);
     const child = spawn(process.execPath, [fixture], { detached: true, stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
