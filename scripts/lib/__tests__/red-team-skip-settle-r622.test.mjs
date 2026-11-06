@@ -22,7 +22,7 @@ const T = Date.parse('2026-11-05T12:00:00Z');
 // They also default to a reader that reported a COMPLETE same-PR, same-head read with nothing blocking; the
 // complete-read requirement itself is pinned in its own describe below.
 const cleanRead = () => ({ complete: true, blocked: false });
-const unknown = (reason, bounds) => Object.defineProperty({ ok: false, reason }, 'settleBounds', { value: { unfinishedUndecided: true, completeHeadRead: cleanRead, ...bounds }, enumerable: false });
+const unknown = (reason, bounds) => Object.defineProperty({ ok: false, reason }, 'settleBounds', { value: { unfinishedUndecided: true, unfinishedActiveAt: T - 3 * 3600e3, evaluatedAt: T, completeHeadRead: cleanRead, ...bounds }, enumerable: false });
 // An unread record quiet for longer than the settle margin (slack + abandon horizon) before the comment.
 const OLD = T - 3 * 3600e3;
 const older = { unfinishedStartedAt: T - 3600e3, unreadBoundaryAt: OLD };
@@ -82,7 +82,7 @@ describe('R622 the evidence reader bounds a resumed unfinished review by its res
   const run = extra => ({ op: 'review-pr', input: { repo: 'o/r', pr }, findings: { read: { netBasis: { rev } } },
     stepTimings: [{ step: 'read', startedAt: new Date(T - 7200e3).toISOString() }], verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' }, ...extra });
   const read = r => readDrainRedTeamEvidence({ repo: 'o/r', pr, head: rev, env: { WE_SHARED_RUNS_DIR: '/nonexistent-r622' },
-    runsDir: '/runs', list: () => ['review-pr-1'], stat: () => ({ mtimeMs: T - 60e3 }), read: () => r, readScorecards: () => [], now: T });
+    runsDir: '/runs', list: () => ['review-pr-1'], stat: () => ({ mtimeMs: T - 2 * 3600e3 }), read: () => r, readScorecards: () => [], now: T });
   const settled = r => settleUnknownEvidenceByComment(read(r), [comment()], pr, head);
   it('plain unfinished run older than the comment settles', () => { expect(settled(run({}))).toMatchObject({ ok: true }); });
   it('a resume stamped after the comment stays held', () => {
@@ -97,8 +97,8 @@ describe('R622 a re-review that already decided is not released by an earlier jo
   // The break: a re-review started before the comment, recorded a rejection, and only its label effect is still open.
   const base = extra => ({ op: 'review-pr', input: { repo: 'o/r', pr }, findings: { read: { netBasis: { rev: head } } },
     stepTimings: [{ step: 'read', startedAt: new Date(T - 3600e3).toISOString() }], ...extra });
-  const read = r => readDrainRedTeamEvidence({ repo: 'o/r', pr, head, env: { WE_SHARED_RUNS_DIR: '/nonexistent-r622' },
-    runsDir: '/runs', list: () => ['review-pr-1'], stat: () => ({ mtimeMs: T - 60e3 }), read: () => r, readScorecards: () => [], now: T });
+  const read = (r, mtimeMs = T - 2 * 3600e3) => readDrainRedTeamEvidence({ repo: 'o/r', pr, head, env: { WE_SHARED_RUNS_DIR: '/nonexistent-r622' },
+    runsDir: '/runs', list: () => ['review-pr-1'], stat: () => ({ mtimeMs }), read: () => r, readScorecards: () => [], now: T });
   const held = r => expect(holdFor(read(r), [comment()])).toMatch(/evidence unknown/);
   const openEffect = status => [{ status }];
   it('a rejection verdict with a pending or in-flight effect stays held through the real reader', () => {
@@ -145,7 +145,7 @@ describe('R622 several unfinished reviews', () => {
   const mk = (id, startedAt, extra = {}) => ({ id, run: { op: 'review-pr', input: { repo: 'o/r', pr }, findings: { read: { netBasis: { rev: head } } },
     stepTimings: [{ step: 'read', startedAt: new Date(startedAt).toISOString() }], verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' }, ...extra } });
   const settledFor = runs => settleUnknownEvidenceByComment(readDrainRedTeamEvidence({ repo: 'o/r', pr, head, env: { WE_SHARED_RUNS_DIR: '/nonexistent-r622' },
-    runsDir: '/runs', list: () => runs.map(r => r.id), stat: () => ({ mtimeMs: T - 60e3 }), read: id => runs.find(r => r.id === id).run, readScorecards: () => [], now: T }), [comment()], pr, head);
+    runsDir: '/runs', list: () => runs.map(r => r.id), stat: () => ({ mtimeMs: T - 2 * 3600e3 }), read: id => runs.find(r => r.id === id).run, readScorecards: () => [], now: T }), [comment()], pr, head);
   it('an older run resumed after the comment holds even when a newer unfinished run started before it', () => {
     const a = mk('review-pr-a', T - 7200e3, { resumeOf: 'x', resumedAt: new Date(T + 3600e3).toISOString() });
     const b = mk('review-pr-b', T - 3600e3);
@@ -411,5 +411,107 @@ describe('R622 settlement needs a COMPLETE same-PR, same-head read, whatever the
     expect(heldBy(rec({ rev: head.toUpperCase(), ...reject }))).toMatchObject({ ok: false, reason: 'scan-capped' });
     expect(heldBy(rec({ repo: ' O/R ', ...reject }))).toMatchObject({ ok: false, reason: 'scan-capped' });
     expect(heldBy(rec({ repo: 'o/other', ...reject }))).toMatchObject({ ok: true }); // a genuinely different repo is still ignored
+  });
+});
+
+describe('R622 review follow-ups: decided-run guard, liveness, id universe, cache size key, complete-read failures', () => {
+  const HOUR = 3600e3;
+  const rec = ({ rev = head, startedAt = T - 7200e3, ...extra } = {}) => ({ op: 'review-pr', input: { repo: 'o/r', pr },
+    findings: { read: { netBasis: { rev } } }, stepTimings: [{ step: 'read', startedAt: new Date(startedAt).toISOString() }], ...extra });
+  const open = { effects: [{ status: 'pending' }] };
+  const reject = { verdict: { verdict: 'changes' }, ...open };
+  const idOf = p => p.split('/').pop().replace('.json', '');
+  // `io` lets a test change what the store reports between the bounded scan and the settle attempt.
+  const reader = (runs, { maxParses, size = () => undefined, list = () => Object.keys(runs), stat, reads, readFn } = {}) => readDrainRedTeamEvidence({ repo: 'o/r', pr, head,
+    env: { WE_SHARED_RUNS_DIR: '/nonexistent-r622' }, runsDir: '/runs', warn: () => {}, readScorecards: () => [], now: T,
+    scanSettings: { file: maxParses ? { runs: { scan: { maxParses } } } : {}, platform: {}, env: {} },
+    list, stat: stat ?? (p => ({ mtimeMs: runs[idOf(p)].mtime, size: size(idOf(p)) })), read: readFn ?? (id => { reads?.(id); return runs[id].run; }) });
+  const settle = evidence => settleUnknownEvidenceByComment(evidence, [comment()], pr, head);
+  const finished = (i, mtime) => [`review-pr-new${i}`, { mtime, run: rec({ rev: other, startedAt: T - 7200e3 - i * 1000, verdict: { verdict: 'accept' } }) }];
+  const windowed = hidden => ({ ...Object.fromEntries([finished(0, T - 60e3), finished(1, T - 70e3)]), 'review-pr-hidden': { mtime: T - 5 * HOUR, run: hidden } });
+
+  it('the decided-run guard holds on its own: a decided unfinished run of ANOTHER head (complete read sees nothing) is not released', () => {
+    // Guard removed => this settles, because the complete read only blocks same-head (or head-less) records.
+    expect(settle(Object.defineProperty({ ok: false, reason: 'review-unfinished' }, 'settleBounds', { value: { unfinishedStartedAt: T - HOUR, unfinishedUndecided: false,
+      unfinishedActiveAt: T - 3 * HOUR, evaluatedAt: T, completeHeadRead: () => ({ complete: true, blocked: false }) }, enumerable: false }))).toMatchObject({ ok: false, reason: 'review-unfinished' });
+    const runs = { 'review-pr-other': { mtime: T - 3 * HOUR, run: rec({ rev: other, ...reject }) } };
+    const evidence = reader(runs);
+    expect(evidence).toMatchObject({ ok: false, reason: 'review-unfinished' });
+    expect(evidence.settleBounds).toMatchObject({ unfinishedUndecided: false });
+    expect(settle(evidence)).toMatchObject({ ok: false, reason: 'review-unfinished' });
+  });
+
+  describe('a review still running is not released by a clean comment posted after its start', () => {
+    const live = mtime => ({ 'review-pr-live': { mtime, run: rec() } }); // no verdict yet, started 2h before the comment
+    it('written within the abandon horizon stays held; quiet for the whole horizon settles; the boundary is inclusive', () => {
+      expect(settle(reader(live(T - 60e3)))).toMatchObject({ ok: false, reason: 'review-unfinished' });
+      expect(settle(reader(live(T - HOUR + 1)))).toMatchObject({ ok: false, reason: 'review-unfinished' });
+      expect(settle(reader(live(T - HOUR)))).toMatchObject({ ok: true, settledByComment: 'review-unfinished' });
+      expect(settle(reader(live(T - 3 * HOUR)))).toMatchObject({ ok: true });
+    });
+    it('one recently written unfinished run among quiet ones keeps the hold', () => {
+      expect(settle(reader({ ...live(T - 3 * HOUR), 'review-pr-live2': { mtime: T - 30e3, run: rec({ startedAt: T - 7000e3 }) } }))).toMatchObject({ ok: false });
+    });
+    it('a live unfinished run inside a capped read window keeps the capped hold too', () => {
+      const runs = { ...windowed(rec({ verdict: { verdict: 'accept' } })), 'review-pr-live': { mtime: T - 20e3, run: rec({ startedAt: T - 9000e3 }) } };
+      const evidence = reader(runs, { maxParses: 3 });
+      expect(evidence).toMatchObject({ ok: false });
+      expect(settle(evidence)).toMatchObject({ ok: false });
+    });
+    it('a bound with no read time, no write time, or an unreadable (NaN) write time never settles', () => {
+      const base = { unfinishedStartedAt: T - HOUR, unreadBoundaryAt: T - 3 * HOUR, unfinishedUndecided: true, completeHeadRead: () => ({ complete: true, blocked: false }) };
+      const go = extra => settle(Object.defineProperty({ ok: false, reason: 'review-unfinished' }, 'settleBounds', { value: { ...base, ...extra }, enumerable: false }));
+      expect(go({ unfinishedActiveAt: T - 3 * HOUR, evaluatedAt: T })).toMatchObject({ ok: true });
+      for (const extra of [{}, { evaluatedAt: T }, { unfinishedActiveAt: T - 3 * HOUR }, { unfinishedActiveAt: NaN, evaluatedAt: T }, { unfinishedActiveAt: T - 3 * HOUR, evaluatedAt: NaN }]) {
+        expect(go(extra)).toMatchObject({ ok: false, reason: 'review-unfinished' });
+      }
+    });
+  });
+
+  it('the complete read covers review-pr-* ids only: a rejecting run under a custom --run-id is invisible and does not block (same id universe as the bounded scan)', () => {
+    const runs = { ...windowed(rec({ verdict: { verdict: 'accept' } })), 'custom-reject': { mtime: T - 5 * HOUR, run: rec(reject) } };
+    expect(settle(reader(runs, { maxParses: 2 }))).toMatchObject({ ok: true, settledByComment: 'scan-capped' });
+    runs['review-pr-reject'] = { mtime: T - 5 * HOUR, run: rec(reject) }; // the same record under the minted id blocks
+    expect(settle(reader(runs, { maxParses: 2 }))).toMatchObject({ ok: false, reason: 'scan-capped' });
+  });
+
+  it('cache invalidation also keys on SIZE: a rewrite with the same mtime but a different size is re-read', () => {
+    const runs = windowed(rec({ verdict: { verdict: 'accept' } }));
+    let hiddenSize = 100;
+    const readFn = vi.fn(id => runs[id].run); // one stable reader: the summary cache is keyed by it
+    const reads = readFn;
+    const go = () => settle(reader(runs, { maxParses: 2, size: id => (id === 'review-pr-hidden' ? hiddenSize : 1), readFn }));
+    expect(go()).toMatchObject({ ok: true });
+    expect(go()).toMatchObject({ ok: true });
+    const parsed = reads.mock.calls.filter(([id]) => id === 'review-pr-hidden').length;
+    runs['review-pr-hidden'].run = rec(reject); // same mtime
+    expect(go()).toMatchObject({ ok: true }); // same mtime AND size: the cached summary is (by design) still used
+    expect(reads.mock.calls.filter(([id]) => id === 'review-pr-hidden').length).toBe(parsed);
+    hiddenSize = 101;
+    expect(go()).toMatchObject({ ok: false, reason: 'scan-capped' }); // size changed: re-parsed, the rejection holds
+  });
+
+  describe('complete-read failures fail closed (listing, stat, read), even though the bounded scan read fine', () => {
+    const attempt = failing => {
+      const runs = windowed(rec({ verdict: { verdict: 'accept' } }));
+      let settling = false;
+      const evidence = reader(runs, { maxParses: 2,
+        list: () => { if (settling && failing === 'list') throw new Error('EIO'); return Object.keys(runs); },
+        stat: p => { if (settling && failing === 'stat-throw') throw new Error('EIO'); if (settling && failing === 'stat-nan') return { mtimeMs: NaN }; return { mtimeMs: runs[idOf(p)].mtime }; } });
+      expect(evidence).toMatchObject({ ok: false, reason: 'scan-capped' });
+      settling = true;
+      return settle(evidence);
+    };
+    it('control: the same store settles when nothing fails', () => { expect(attempt('none')).toMatchObject({ ok: true }); });
+    for (const failing of ['list', 'stat-throw', 'stat-nan']) {
+      it(`${failing} keeps the hold`, () => { expect(attempt(failing)).toMatchObject({ ok: false, reason: 'scan-capped' }); });
+    }
+    it('a record that cannot be parsed keeps the hold', () => {
+      const runs = windowed(rec({ verdict: { verdict: 'accept' } }));
+      let settling = false;
+      const evidence = reader(runs, { maxParses: 2, reads: id => { if (settling && id === 'review-pr-hidden') throw new Error('torn'); } });
+      settling = true;
+      expect(settle(evidence)).toMatchObject({ ok: false, reason: 'scan-capped' });
+    });
   });
 });
