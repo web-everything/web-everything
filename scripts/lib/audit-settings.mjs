@@ -71,7 +71,10 @@ const REVIEW_AUTH_IMPORTS = Object.freeze([
   'scripts/operations/action-record.mjs', 'scripts/operations/action-store.mjs', 'scripts/lib/red-team-disposition.mjs',
   'scripts/lib/review-loop-policy.mjs', 'scripts/operations/land-prevention-card.mjs', 'scripts/operations/card-batch-io.mjs',
   'scripts/operations/detached-dispatch.mjs', 'scripts/operations/call-log-store.mjs', 'scripts/conveyor/stand-down-answer-core.mjs',
-  'scripts/conveyor/stand-down.mjs']);
+  'scripts/conveyor/stand-down.mjs',
+  // Added on main after the list above: the finding-class policy and the care-exempt path list decide which findings
+  // defer or need a fix, and jury-core.mjs / review-escalation.mjs import them directly.
+  'scripts/lib/finding-class-policy.mjs', 'scripts/lib/review-care-exempt-paths.mjs']);
 /**
  * JSON files the floor modules decide with (PR #6381 self-review: red-team.json was read by red-team-gate.mjs but
  * unprotected). A test reads every floor module and pins each tracked scripts/ JSON file whose NAME it quotes, in any
