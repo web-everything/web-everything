@@ -277,7 +277,14 @@ export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
 
 const UNFINISHED_REVIEW_CONTEXT = 'review-unfinished: an unfinished review run holds this head; a human must answer or cancel the pending confirmation';
 
-/** PURE: readers are injected; each refusal produces one decision, including unreadable evidence. */
+/**
+ * PURE: readers are injected; each refusal produces one decision, including unreadable evidence.
+ *
+ * @verdicts-partial the planner is not a verdict reducer. It names only `accept` and `prevention-outstanding`: a stored
+ *   `accept` (or a judge-accepted `prevention-outstanding`) with a provable accept comment on the live head may settle
+ *   a kept `red-team:pending`. Every other stored verdict flows through the evidence and owed-ness checks unchanged,
+ *   so a verdict added to the enum needs no branch here.
+ */
 export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, now,
   setting, lastDispatch, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions,
   headNeverReviewed = headNeverReviewedFromRuns }) {
