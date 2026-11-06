@@ -59,7 +59,8 @@ export function matchReadyCandidate({
   // run with nothing to revert it. Unknown (no `forcedWatch` supplied) is not "ok": fail closed.
   if (ready.forced === true) {
     const watch = forcedWatch(ready.adopt.finalSha);
-    if (watch !== 'ok') return { adopt: null, reason: `forced-watch-${['unreadable', 'owed'].includes(watch) ? watch : 'missing'}` };
+    // Literal reasons (no template): the reason-classification test reads them statically.
+    if (watch !== 'ok') return { adopt: null, reason: watch === 'unreadable' ? 'forced-watch-unreadable' : watch === 'owed' ? 'forced-watch-owed' : 'forced-watch-missing' };
   }
   const carriesOnlyWanted = (ready.adopt.applied || []).every((a) => stillWanted(a.ref));
   if (ready.kind === 'fallback') {

@@ -259,6 +259,7 @@ describe('rebuildClone coordination events', () => {
       'deps-job-started', 'detached-off-main', 'detached-or-unreadable-head', 'detached-with-changes',
       'diff-unknown', 'dirty', 'disabled', 'dispatch-smoke', 'executable-or-runtime-file-change',
       'expired', 'fallback-inputs-moved', 'fallback-not-allowed', 'fallback-plain-main', 'forced-sha-pinned',
+      'forced-watch-missing', 'forced-watch-owed', 'forced-watch-unreadable',
       'harness-broken-adopted-not-worse', 'held-after-rollback', 'imported-change', 'in-main',
       'index-locked', 'local-commits', 'manifest-or-config-change', 'merge-in-progress',
       'merge conflicts remain after the ref tip moved', // overlay-main-sync-conflict diagnostic
