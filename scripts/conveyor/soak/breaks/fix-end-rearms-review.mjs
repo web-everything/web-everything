@@ -59,7 +59,7 @@ export const FIX_MARKERS = {
     'if (OWED[phase] && lastReview && release && release.releasedAtMs > lastReview.at',
     "&& !withPhase.labels.includes(CONFLICT_LABEL) && String(pr?.mergeStateStatus ?? '').toUpperCase() !== 'DIRTY'",
     '&& release.index > lastReview.index',
-    '&& !sameHeadSha(lastReview.head, pr.headRefOid)) {',
+    '&& !sameHeadSha(lastReview.head, pr.headRefOid)',
     [
       '      dispatchReviewRow({ pr, requiredChecks, withPhase, base, attempts: roundAttempts(),',
       '        roundCap: effectiveRoundCap, refuse, refuseCapExhausted, dispatch, now,',
