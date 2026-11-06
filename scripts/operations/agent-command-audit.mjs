@@ -106,6 +106,7 @@ function toolCommands(record) {
 
 /** Pure JSONL reducer. Invalid records are counted and reported rather than silently cleared. */
 export function auditLines(lines, { date, source = 'unknown' } = {}) {
+  // utc-day-slice-ok: UTC-anchored round-trip of a user-supplied YYYY-MM-DD string (Date.parse reads it as UTC), not a wall-clock "today" read
   if (date !== undefined && (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(Date.parse(date)) || new Date(date).toISOString().slice(0, 10) !== date)) throw new Error('Invalid --date; expected YYYY-MM-DD');
   const result = { rows: [], byCategory: {}, bySource: {}, invalidLines: 0 };
   for (const line of typeof lines === 'string' ? lines.split(/\r?\n/) : lines) {
