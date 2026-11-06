@@ -2461,6 +2461,32 @@ describe('catch-up miss backoff', () => {
       expect(attempts(f)).toHaveLength(2);
     });
 
+  describe('code version', () => {
+    const V1 = 'a'.repeat(40), V2 = 'b'.repeat(40);
+    it('retries a held miss once after the drain code version changes', async () => {
+      let v = V1;
+      const f = fixture({ readCodeVersion: () => v });
+      await f.handle.catchUp(); f.advance(600_000); await f.handle.catchUp();
+      expect(attempts(f)).toHaveLength(1);
+      v = V2;
+      f.advance(600_000); await f.handle.catchUp();
+      expect(attempts(f)).toHaveLength(2);
+      expect(f.handle.missBackoff().get(42).codeVersion).toBe(V2);
+      f.advance(600_000); await f.handle.catchUp();
+      expect(attempts(f)).toHaveLength(2);
+    });
+    it('stays backed off while the code version is unchanged', async () => {
+      const f = fixture({ readCodeVersion: () => V1 });
+      await f.handle.catchUp(); f.advance(600_000); await f.handle.catchUp(); f.advance(600_000); await f.handle.catchUp();
+      expect(attempts(f)).toHaveLength(1);
+    });
+    it.each([() => { throw new Error('nope'); }, () => 'not-a-sha', () => ''])('keeps today\'s behaviour when the version is unreadable', async (read) => {
+      const f = fixture({ readCodeVersion: read });
+      await f.handle.catchUp(); f.advance(600_000); await f.handle.catchUp(); f.advance(600_000); await f.handle.catchUp();
+      expect(attempts(f)).toHaveLength(1);
+    });
+  });
+
   it('logs once for each renewed hold after TTL expiry', async () => {
     const f = fixture();
     const logs = () => f.lines.filter(l => l.includes('miss-backoff: skipped'));
