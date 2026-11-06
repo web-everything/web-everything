@@ -15,8 +15,9 @@ import { tmpdir } from 'node:os';
 import {
   salvageStamp, salvageRefNames, isWorktreeLitterPath, parseLsofCwds, pidsWithCwdIn, salvageEligibility,
   liveAgentInLane, deriveSalvageTargets, salvageLane, removeLitterWorktrees, listLitterWorktrees, laneLivenessGate,
-  listUnregisteredWorktreeLitter, newestContentMtimeMs, resolveSalvageQuietMs, nearestAncestorMtimeMs,
+  listUnregisteredWorktreeLitter, newestContentMtimeMs, resolveSalvageQuietMs, nearestAncestorMtimeMs, externalGitdir,
 } from '../lane-salvage.mjs';
+import { isSalvageLanded } from '../salvage-index.mjs';
 
 describe('lane-salvage pure core', () => {
   it('stamps sortable UTC and names refs like the manual salvage', () => {
@@ -369,6 +370,47 @@ describe('salvageLane (real git)', () => {
     expect(rec.nestedRepos).toHaveLength(2);
     expect(readFileSync(join(laneDest, 'notes.txt'), 'utf8')).toBe('lane copy\n');
     expect(readFileSync(join(wtDest, 'notes.txt'), 'utf8')).toBe('worktree copy\n');
+  });
+
+  it('a nested repo using a SEPARATE git dir keeps its staged v1 blob after the stray clone (and its gitdir) is deleted, and is never marked landed', () => {
+    const rel = 'scratch';
+    const nested = join(lane, rel);
+    const gitdirOrig = join(lane, '.git', 'nested-db');
+    git(lane, 'init', '-q', `--separate-git-dir=${gitdirOrig}`, nested);
+    expect(lstatSync(join(nested, '.git')).isFile()).toBe(true);
+    writeFileSync(join(nested, 'notes.txt'), 'v1 staged\n'); git(nested, 'add', 'notes.txt');
+    writeFileSync(join(nested, 'notes.txt'), 'v2 working tree\n');
+
+    const rec = salvageLane({ dir: lane, lane: 5, pool: 'p', branchRef: 'origin/main', salvageRoot, now: new Date('2026-09-27T02:00:00Z') });
+    const dest = join(rec.outDir, 'lane-5.nested-repos', rel);
+    expect(rec.nestedRepos).toEqual([{ rel, dest, gitdir: `${dest}.gitdir` }]);
+    expect(JSON.parse(readFileSync(join(salvageRoot, 'index.jsonl'), 'utf8')).nestedRepos).toEqual(rec.nestedRepos);
+    // The clone is reclaimed: the stray nested tree AND the gitdir that lived under the lane's own .git go away.
+    git(lane, 'clean', '-ffd', '--quiet');
+    rmSync(gitdirOrig, { recursive: true, force: true });
+    expect(existsSync(nested)).toBe(false);
+    expect(existsSync(gitdirOrig)).toBe(false);
+    // The staged v1 content is still recoverable from the salvaged gitdir; the working copy kept v2.
+    expect(git(root, '--git-dir', `${dest}.gitdir`, 'show', ':notes.txt')).toBe('v1 staged');
+    expect(readFileSync(join(dest, 'notes.txt'), 'utf8')).toBe('v2 working tree\n');
+    // Plain files no git tip carries: landing can never be proven for this entry.
+    expect(isSalvageLanded(rec, { repoDir: lane })).toBeNull();
+  });
+
+  it('externalGitdir fails closed: an unparseable pointer, a missing target or a non-directory target THROWS; a real .git dir or an in-tree target needs no extra copy', () => {
+    const mk = (name) => { const d = join(root, name); mkdirSync(d); return d; };
+    const garbage = mk('garbage'); writeFileSync(join(garbage, '.git'), 'not a pointer\n');
+    expect(() => externalGitdir(garbage)).toThrow(/not a "gitdir: <path>" pointer/);
+    const missing = mk('missing'); writeFileSync(join(missing, '.git'), 'gitdir: ../no-such-gitdir\n');
+    expect(() => externalGitdir(missing)).toThrow();
+    const notDir = mk('notdir'); writeFileSync(join(root, 'afile'), 'x'); writeFileSync(join(notDir, '.git'), 'gitdir: ../afile\n');
+    expect(() => externalGitdir(notDir)).toThrow(/not a directory/);
+    const real = mk('real'); git(real, 'init', '-q');
+    expect(externalGitdir(real)).toBeNull();
+    const inTree = mk('intree'); mkdirSync(join(inTree, 'meta')); writeFileSync(join(inTree, '.git'), 'gitdir: meta\n');
+    expect(externalGitdir(inTree)).toBeNull();
+    const outside = mk('outside'); const od = mk('outside-db'); writeFileSync(join(outside, '.git'), 'gitdir: ../outside-db\n');
+    expect(externalGitdir(outside)).toBe(realpathSync(od));
   });
 
   it('copies an untracked unborn nested repo verbatim while snapshotting normal changes without touching the real index', () => {

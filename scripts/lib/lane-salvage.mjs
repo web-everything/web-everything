@@ -470,6 +470,31 @@ function copyLitterTreeSync(src, dest) {
 }
 
 /**
+ * Where a nested repository keeps its git metadata when that is NOT inside the tree we copy verbatim: a `.git`
+ * FILE (`gitdir: <path>`, as `git init --separate-git-dir` and submodules write) or a `.git` symlink. Returns the
+ * absolute external directory, or `null` when the metadata is a real `.git` directory (or lies inside the nested
+ * tree), which the tree copy already carries. Fail closed: an unreadable/unparseable pointer or a missing target
+ * THROWS, so `salvageLane` aborts and the caller never resets/deletes a clone whose staged objects were not saved.
+ */
+export function externalGitdir(repoDir) {
+  const dotGit = join(repoDir, '.git');
+  const st = lstatSync(dotGit);
+  if (st.isDirectory()) return null;
+  let target;
+  if (st.isSymbolicLink()) {
+    target = realpathSync(dotGit);
+  } else {
+    const m = /^gitdir:[ \t]*(.+?)[ \t]*$/m.exec(readFileSync(dotGit, 'utf8'));
+    if (!m) throw new Error(`nested repo ${repoDir}: ${dotGit} is not a "gitdir: <path>" pointer — not salvaging`);
+    target = resolve(repoDir, m[1]);
+  }
+  if (!statSync(target).isDirectory()) throw new Error(`nested repo ${repoDir}: gitdir ${target} is not a directory — not salvaging`);
+  target = realpathSync(target);
+  const root = realpathSync(repoDir);
+  return target === root || target.startsWith(root + sep) ? null : target;
+}
+
+/**
  * Salvage a whole lane: snapshot the lane + every litter worktree, copy every UNREGISTERED
  * `.claude/worktrees/` item verbatim (#4273 — it cannot be captured as a git ref; it isn't one), write
  * bundle/patch/unpushed files, VERIFY the bundle carries every salvage ref, and append an index line. Throws
@@ -528,8 +553,16 @@ export function salvageLane({ dir, lane, pool, branchRef, salvageRoot = resolveS
     const rel = s.worktree ? join(WORKTREE_LITTER_PREFIX, s.worktree, p) : p;
     const dest = join(`${prefix}.nested-repos`, rel);
     mkdirSync(dirname(dest), { recursive: true });
-    copyLitterTreeSync(join(s.dir, p), dest);
-    return { rel, dest };
+    const src = join(s.dir, p);
+    // A `.git` pointer file leads OUTSIDE the tree (e.g. <clone>/.git/nested-db): the verbatim copy alone would
+    // keep only the pointer and lose every staged object once the stray clone is deleted. Resolve it BEFORE any
+    // copy so an unresolvable pointer aborts the salvage with nothing half-written for this repo.
+    const gitdir = externalGitdir(src);
+    copyLitterTreeSync(src, dest);
+    if (!gitdir) return { rel, dest };
+    const gitdirDest = `${dest}.gitdir`;
+    copyLitterTreeSync(gitdir, gitdirDest);
+    return { rel, dest, gitdir: gitdirDest };
   }));
   // #4273 — copy every unregistered `.claude/worktrees/` item BEFORE the caller's `git clean -fd` can delete
   // it. Mirrors each item's own relative path under `.claude/worktrees/` (never a sanitized/collapsed name),
