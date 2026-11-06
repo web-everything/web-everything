@@ -806,7 +806,7 @@ describe('interpreter option shapes that once hid a clone script (value contains
     ['double quotes', ['/usr/bin/env', '-S', `"${outside}" "${cloneScript}"`]],
     ['single quotes', ['/usr/bin/env', '-S', `'${outside}' '${cloneScript}'`]],
     ['mixed with assignment', ['/usr/bin/env', '-S', `A="b c" "${outside}" "${cloneScript}"`]],
-    ['escaped space in the script path', ['/usr/bin/env', '-S', `${outside} ${cloneScript.replace(/ /g, '\\ ')} --flag "x y"`]],
+    ['escaped space in the script path', ['/usr/bin/env', '-S', `${outside} ${cloneScript.replace(/[\\ ]/g, '\\$&')} --flag "x y"`]],
     ['attached -S with quotes', ['/usr/bin/env', `-S"${outside}" "${cloneScript}"`]],
     ['quoted whole command', ['/usr/bin/env', '-S', `"${outside}"   "${cloneScript}"`]],
   ])('quoted env -S string is discovered, restarted and flagged stale: %s', async (_name, ProgramArguments) => {
