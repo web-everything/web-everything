@@ -417,6 +417,16 @@ describe('same-head review loop regression (live #202)', () => {
     'keeps the failure token %s out of the reason set', token => {
       expect(PENDING_REASON_TOKENS.has(token)).toBe(false);
     });
+
+  // Drift guard: a new run-level reason pushed by jury-core must be classified here (reason vs fail-closed failure),
+  // or a fully ruled refused run would silently never resume again.
+  it('classifies every literal reason token jury-core pushes onto the referral pending list', () => {
+    const src = readFileSync(join(process.cwd(), 'scripts/lib/jury-core.mjs'), 'utf8');
+    const produced = new Set([...src.matchAll(/pending\.push\('([a-z]+(?:-[a-z]+)+)'\)|const pending = malformed \? \['([a-z]+(?:-[a-z]+)+)'\]/g)]
+      .map(m => m[1] ?? m[2]));
+    const failureTokens = new Set(['malformed-referral-record']);
+    expect([...produced].sort()).toEqual([...PENDING_REASON_TOKENS, ...failureTokens].sort());
+  });
   it.each(['referral-persistence-failed', 'malformed-referral-record', 'unreadable-referral-result'])
     ('preserves the failure token %s', token => {
       const r = run();
