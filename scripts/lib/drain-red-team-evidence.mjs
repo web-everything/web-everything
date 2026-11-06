@@ -85,8 +85,9 @@ const undecidedUnfinished = run => {
 // resolved, nothing to send back) is accept-class and is a live verdict, so it never blocks on its own.
 const NON_REJECTING_VERDICTS = ['accept', 'needs-human', 'prevention-outstanding'];
 const blocksSettlement = run => hasOpenEffect(run) || (Boolean(run.verdict) && !NON_REJECTING_VERDICTS.includes(verdictOf(run)));
-// What the complete read keeps of a record: never its payload. Cached by (read function, dir, id, mtime, size) so a
-// settle attempt that keeps holding does not re-parse the whole store every tick; any rewrite changes the key.
+// What the complete read keeps of a record: never its payload. Cached per (read function, dir, id) with the mtime and
+// size it was read at, so a settle attempt that keeps holding does not re-parse the whole store every tick; a rewrite
+// changes mtime or size and replaces the entry (bounded by the number of records, not by the number of rewrites).
 const summaryCache = new WeakMap();
 const summarizeRun = run => ({ review: run?.op === 'review-pr', repo: run?.input?.repo, pr: Number(run?.input?.pr),
   rev: typeof run?.findings?.read?.netBasis?.rev === 'string' ? run.findings.read.netBasis.rev.toLowerCase() : null, blocks: blocksSettlement(run) });
@@ -102,9 +103,13 @@ function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat }) {
     for (const id of list(runsDir).filter(id => id.startsWith('review-pr-'))) {
       const st = stat(join(runsDir, `${id}.json`));
       if (!Number.isFinite(st?.mtimeMs)) return incomplete;
-      const key = `${runsDir}|${id}|${st.mtimeMs}|${st.size}`;
-      if (!cache.has(key)) cache.set(key, summarizeRun(read(id, runsDir)));
-      const s = cache.get(key);
+      const key = `${runsDir}|${id}`; // one entry per record: a rewrite replaces it, so the cache never outgrows the store
+      let hit = cache.get(key);
+      if (!hit || hit.mtimeMs !== st.mtimeMs || hit.size !== st.size) {
+        hit = { mtimeMs: st.mtimeMs, size: st.size, summary: summarizeRun(read(id, runsDir)) };
+        cache.set(key, hit);
+      }
+      const s = hit.summary;
       if (!s.review) continue;
       if (typeof s.repo !== 'string' || !Number.isFinite(s.pr)) return incomplete;
       if (s.repo !== repo || s.pr !== Number(pr)) continue;

@@ -383,4 +383,13 @@ describe('R622 settlement needs a COMPLETE same-PR, same-head read, whatever the
     expect(settle(read(runs, 2, reads))).toMatchObject({ ok: true }); // a second tick: only its own bounded scan re-reads
     expect(reads).toHaveBeenCalledTimes(2 + 3 + 2);
   });
+  it('a record rewritten after it was cached (new mtime) is re-read and its new rejection holds', () => {
+    const runs = windowed(rec({ verdict: { verdict: 'accept' } }));
+    const reads = vi.fn(id => runs[id].run);
+    expect(settle(read(runs, 2, reads))).toMatchObject({ ok: true }); // cached as a clean accept
+    runs['review-pr-hidden'] = { mtime: HIDDEN + 1, run: rec({ verdict: { verdict: 'changes' }, ...open }) };
+    expect(settle(read(runs, 2, reads))).toMatchObject({ ok: false, reason: 'scan-capped' }); // new mtime: re-parsed
+    runs['review-pr-hidden'] = { mtime: HIDDEN + 2, run: rec({ verdict: { verdict: 'accept' } }) };
+    expect(settle(read(runs, 2, reads))).toMatchObject({ ok: true }); // the entry was replaced, not appended: clean again
+  });
 });
