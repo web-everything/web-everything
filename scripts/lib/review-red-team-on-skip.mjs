@@ -396,6 +396,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       const prepNotes = priorPrepReviews(rawPr.comments).filter(note => note.head === head);
       const prepAdvisoryClear = keepsPending && !acceptedReview && Array.isArray(reviews) && reviews.length === 0
         && latestAcceptRecord(rawPr.comments, reviews) == null
+        // A full review of any head leaves a reviewed-sha record; none may exist (run scans cap out, so the thread is the proof).
+        && !rawPr.comments.some(comment => /reviewed-sha:/i.test(String(comment?.body ?? '')))
         && rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:prep')
         // Only a PR whose whole diff is its one prepared card may be advisory-only; a label and note alone never prove it.
         && prepareCardOnly(rawPr) !== null
@@ -556,6 +558,10 @@ export function settlePendingFor({ provider, env = process.env } = {}) {
     const names = live.labels.map(label => typeof label === 'string' ? label : label?.name);
     if (names.some(name => typeof name !== 'string')) throw Error('PR labels unreadable');
     if (!names.includes('red-team:pending') || names.includes('red-team:blocked')) return;
+    // A review hold that appeared after the planner's fresh re-read still wins (review:prep is the advisory stage's own label).
+    if (names.some(name => name !== 'review:prep' && conflictsWithPolicyClear(name, { settlesPending: true }))) {
+      throw Error('hold label appeared before settlement; label unchanged');
+    }
     return labels.setLabels(repo, pr, { remove: ['red-team:pending'] });
   };
 }

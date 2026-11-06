@@ -532,6 +532,15 @@ describe('prep-advisory PR with no full review settles stale pending (R639, #641
     expect(o.settlePending).toHaveBeenCalledOnce();
     expect(o.settlePending.mock.calls[0][0]).toMatchObject({ repo, pr, head, remove: ['red-team:pending'] });
   });
+  it('a review hold label that appears after planning vetoes the pending removal', () => {
+    const labels = ['review:prep', 'red-team:pending', 'review:changes'];
+    const provider = { readPrState: () => ({ headRefOid: head, labels }), setLabels: vi.fn() };
+    expect(() => mod.settlePendingFor({ provider, env: {} })({ repo, pr, head })).toThrow(/hold label appeared/);
+    expect(provider.setLabels).not.toHaveBeenCalled();
+    labels.pop();
+    mod.settlePendingFor({ provider, env: {} })({ repo, pr, head });
+    expect(provider.setLabels).toHaveBeenCalledWith(repo, pr, { remove: ['red-team:pending'] });
+  });
   it('still settles when the live provider read omits files and branch name', () => {
     const f = prepFixture(); const o = runFixture({ ...f, now: () => f.now });
     o.provider = { readPrState: (_r, n) => { const { files, headRefName, ...rest } = o.rawPrs.find(p => p.number === n); return rest; },
@@ -547,6 +556,7 @@ describe('prep-advisory PR with no full review settles stale pending (R639, #641
     ['file list missing', f => { delete f.rawPrs[0].files; }],
     ['an accepting verdict comment on the thread', f => { f.rawPrs[0].comments.push(accept()); }],
     ['a formal approving review exists', f => { f.rawPrs[0].reviews = [{ state: 'APPROVED', author: { login: 'human-reviewer' } }]; }],
+    ['a full review of another head left its reviewed-sha record', f => { f.rawPrs[0].comments.push(trusted(`🔁 review — accepted earlier\n<!-- reviewed-sha: ${old} -->`)); }],
     ['prep note for another head', f => { f.rawPrs[0].comments = [prepNote(old)]; }],
     ['prep note blocked', f => { f.rawPrs[0].comments = [prepNote(head, ' blocked=1')]; }],
     ['prep note from untrusted author', f => { f.rawPrs[0].comments = [{ ...prepNote(), author: { login: 'rando' } }]; }],
