@@ -389,6 +389,9 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         (typeof label === 'string' ? label : label?.name) === 'red-team:pending');
       const acceptedReview = verdict === VERDICTS.ACCEPT
         && provenAcceptance({ comments: rawPr.comments, reviews, labels: rawPr.labels, head }) !== null;
+      // A judge accept after the round cap leaves prevention-outstanding stored; the trusted accept comment on this head proves it.
+      const judgeAccepted = verdict === VERDICTS.PREVENTION_OUTSTANDING
+        && provenAcceptance({ comments: rawPr.comments, reviews, labels: rawPr.labels, head }) !== null;
       const provenanceEscalation = keepsPending && !acceptedReview ? { escalate: true,
         escalationContext: 'red-team:pending kept: not-owed review lacks acceptance provenance; needs a human look' } : {};
       const notOwed = (why = 'stored review does not owe a red team') => {
@@ -446,7 +449,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           const context = { labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews, settlesPending: true };
           const refusal = publishableClearGuard(context);
           if (refusal) return { ...guardedSkip(refusal), ...provenanceEscalation };
-          if (keepsPending && !acceptedReview) return notOwed();
+          if (keepsPending && !acceptedReview && !judgeAccepted) return notOwed();
           return { ...row, action: 'clear', why: 'not owed (stored review)' };
         }
         // A judge/round-budget accept on this exact head (provable accept comment) leaves a non-accepting stored
