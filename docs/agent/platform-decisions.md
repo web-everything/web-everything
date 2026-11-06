@@ -6518,11 +6518,13 @@ and the review settings file `scripts/settings/review.json`. Every module that a
 (`REVIEW_AUTH_FLOOR` in `scripts/lib/audit-settings.mjs`, the test's scanned roots) imports directly is on the floor
 too. The test derives its roots from that list and reads the imports from source, so the two cannot drift. The scan
 is one level deep: the full import closure is most of `scripts/`, so a module two imports away is protected only if
-it is named on the floor itself. Every `scripts/settings/*.json` file a floor module names in its source is on the
-floor too (a test reads every floor module), since a module decides with the settings it reads. A reported path also
-matches in the shapes a model copies from a diff or a trace: a leading `a/` or `b/`, a `:line`, `:line:col` or
-`#Lline` suffix, surrounding whitespace and compatibility-form or invisible characters. Each stripped form is an
-extra candidate, so it only ever protects more.
+it is named on the floor itself. Every tracked `scripts/` JSON file whose name a floor module quotes in its source is
+on the floor too (a test reads every floor module), since a module decides with the settings it reads. A reported
+path is not matched only as written: every run of path characters in it (raw and NFKC-folded, invisible characters
+removed) is a token, and so is every trailing run of a token's folders that starts at the first folder a protected
+glob names (`scripts`, `.claude`). So a path wrapped in quotes, a diff header (`+++ b/`), a folder above the repo, a
+line suffix or trailing punctuation still matches the floor, while a glob keeps its meaning (`*` still names only a
+top-level file). A candidate only ever protects more. A path with more than 32 candidates fails closed.
 A D2 card's requirements are enforced independently: a missing card clears only when both the card and the
 pay-by requirements are waived. The card reader and the clock are code hooks only: a plain value passed for either
 (such as `now: 0`) is never used to clear a card, and a plain number may only move the clock later. Platform and file path lists are unioned, never replaced.

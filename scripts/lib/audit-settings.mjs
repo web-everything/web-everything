@@ -73,13 +73,18 @@ const REVIEW_AUTH_IMPORTS = Object.freeze([
   'scripts/operations/detached-dispatch.mjs', 'scripts/operations/call-log-store.mjs', 'scripts/conveyor/stand-down-answer-core.mjs',
   'scripts/conveyor/stand-down.mjs']);
 /**
- * Settings files the floor modules decide with (PR #6381 self-review: red-team.json was read by red-team-gate.mjs but
- * unprotected). A test reads every floor module and pins each `scripts/settings/*.json` it names onto the floor.
+ * JSON files the floor modules decide with (PR #6381 self-review: red-team.json was read by red-team-gate.mjs but
+ * unprotected). A test reads every floor module and pins each tracked scripts/ JSON file whose NAME it quotes, in any
+ * form (`'settings/x.json'`, `join(dir, 'settings', 'x.json')`, a file next to the module), onto the floor.
  */
 const FLOOR_SETTINGS = Object.freeze([
   'scripts/settings/red-team.json', 'scripts/settings/github-auth.json', 'scripts/settings/human-review-surfaces.json',
   'scripts/settings/direction-aware-human.json', 'scripts/settings/review-no-verdict-retry.json', 'scripts/settings/referral-hold-auto-resolve.json',
-  'scripts/settings/gh-throttle.json', 'scripts/settings/red-main-hold.json', 'scripts/settings/prototype-load.json']);
+  'scripts/settings/gh-throttle.json', 'scripts/settings/red-main-hold.json', 'scripts/settings/prototype-load.json',
+  'scripts/settings/stand-down.json', 'scripts/settings/fix.json', 'scripts/review-settings.json', 'scripts/dispatch-settings.json',
+  'scripts/lib/delivery-platform-preferences.json', 'scripts/lib/delivery-priority-settings.json', 'scripts/lib/poc-branches.json',
+  'scripts/exec-output-baseline.json', 'scripts/pr-comment-read-baseline.json', 'scripts/check-standards.contract.json',
+  'scripts/lib/dispatch-routing-policy.json', 'scripts/ci/test-timings.json', 'scripts/lib/model-probation.json', 'scripts/lib/swept-repos.json']);
 export const GUARD_FLOOR = Object.freeze(['scripts/**/file-locks*', 'scripts/*file-locks*', 'scripts/**/lease*', 'scripts/*lease*',
   'scripts/lib/lane-lease.mjs', 'scripts/readiness/scope-lease*',
   'scripts/**/slot*', 'scripts/*slot*', 'scripts/**/lock-reaper*', 'scripts/*lock-reaper*', 'scripts/**/lane-pool*', 'scripts/*lane-pool*',

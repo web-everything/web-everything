@@ -633,17 +633,25 @@ describe('R473 structured concurrency evidence', () => {
       'every direct import of the review authorization family is on the floor: E2 in %s never ships (PR #6381 red team)', async file => {
         neverShips(await compute([finding({ class: 'E2', file })], options()));
       });
-    // PR #6381 self-review: a floor module decides with the settings file it reads (red-team-gate.mjs reads
-    // red-team.json), so weakening that file weakens the module. Every floor module is read from the source and each
-    // scripts/settings/*.json it names must be on the floor too.
-    const FLOOR_MODULES = [...new Set(GUARD_FLOOR.flatMap(entry => execFileSync('git', ['ls-files', '-z', '--', `:(glob)${entry}`],
-      { cwd: repoRoot, encoding: 'utf8', maxBuffer: 4 << 20 }).split('\0')))]
+    // PR #6381 self-review: a floor module decides with the JSON file it reads (red-team-gate.mjs reads red-team.json),
+    // so weakening that file weakens the module. Every floor module is read from the source, and each tracked scripts/
+    // JSON file whose NAME it quotes, in any form (`'settings/x.json'`, `join(dir, 'settings', 'x.json')`, a file next
+    // to the module), must be on the floor too. Fixtures and corpora are data, not settings.
+    const lsFiles = spec => execFileSync('git', ['ls-files', '-z', '--', spec], { cwd: repoRoot, encoding: 'utf8', maxBuffer: 4 << 20 })
+      .split('\0').filter(Boolean);
+    const FLOOR_MODULES = [...new Set(GUARD_FLOOR.flatMap(entry => lsFiles(`:(glob)${entry}`)))]
       .filter(p => /\.m?js$/.test(p) && !/\.test\.m?js$/.test(p) && !p.includes('/__tests__/') && !p.includes('/soak/')).sort();
-    const floorSettings = [...new Set(FLOOR_MODULES.flatMap(m => [...readFileSync(`${repoRoot}${m}`, 'utf8').matchAll(/settings\/([a-z0-9-]+\.json)/g)]
-      .map(x => `scripts/settings/${x[1]}`)))].filter(p => existsSync(`${repoRoot}${p}`)).sort();
-    it('the floor-settings scan is live', () => {
+    const jsonByName = new Map();
+    for (const p of lsFiles('scripts').filter(p => p.endsWith('.json') && !/__tests__|fixtures|golden-corpus|review-corpus|\/soak\//.test(p))) {
+      const name = p.slice(p.lastIndexOf('/') + 1);
+      jsonByName.set(name, [...(jsonByName.get(name) ?? []), p]);
+    }
+    const floorSettings = [...new Set(FLOOR_MODULES.flatMap(m => [...readFileSync(`${repoRoot}${m}`, 'utf8').matchAll(/['"`/]([A-Za-z0-9_.-]+\.json)['"`]/g)]
+      .flatMap(x => jsonByName.get(x[1]) ?? [])))].sort();
+    it('the floor-settings scan is live and reads every quoted form', () => {
       expect(FLOOR_MODULES.length).toBeGreaterThan(100);
-      expect(floorSettings).toEqual(expect.arrayContaining(['scripts/settings/red-team.json', 'scripts/settings/github-auth.json']));
+      expect(floorSettings).toEqual(expect.arrayContaining(['scripts/settings/red-team.json', 'scripts/settings/github-auth.json',
+        'scripts/settings/stand-down.json', 'scripts/settings/fix.json', 'scripts/review-settings.json', 'scripts/lib/delivery-platform-preferences.json']));
     });
     it.each(floorSettings)('every settings file a floor module names is on the floor: E2 in %s never ships (PR #6381 self-review)', async file => {
       neverShips(await compute([finding({ class: 'E2', file })], options()));
@@ -652,11 +660,23 @@ describe('R473 structured concurrency evidence', () => {
     it.each(['a/scripts/lib/review-independence.mjs', 'b/scripts/lib/review-independence.mjs', './a/scripts/lib/review-independence.mjs',
       'scripts/lib/review-independence.mjs:42', 'scripts/lib/review-independence.mjs:42:7', 'scripts/lib/review-independence.mjs#L42',
       'scripts/lib/review-independence.mjs#L42-L50', 'scripts/lib/review-independence.mjs ', ' scripts/lib/review-independence.mjs',
-      'scripts/lib/review-​independence.mjs', 'scripts/lib/ｒeview-independence.mjs', 'a/scripts/guard-bash.mjs:12', 'b/.claude/settings.json'])(
+      'scripts/lib/review-​independence.mjs', 'scripts/lib/ｒeview-independence.mjs', 'a/scripts/guard-bash.mjs:12', 'b/.claude/settings.json',
+      '`scripts/lib/review-independence.mjs`', '"scripts/lib/review-independence.mjs"', '+++ b/scripts/lib/review-independence.mjs',
+      '--- a/scripts/lib/review-independence.mjs', 'i/scripts/lib/review-independence.mjs', 'w/scripts/lib/review-independence.mjs',
+      'web-everything/scripts/lib/review-independence.mjs', 'a/a/scripts/lib/review-independence.mjs', 'scripts/lib/review-independence.mjs,',
+      'scripts/lib/review-independence.mjs.', 'scripts/lib/review-independence.mjs:42-50', 'scripts/lib/review-independence.mjs:L42',
+      'scripts/lib/review-independence.mjs (line 42)', 'scripts/lib/review-independence.mjs#42', 'scripts/lib/review-independence.mjs@ec32b86',
+      'scripts\\lib\\review-independence.mjs', 'see (scripts/lib/review-independence.mjs)'])(
       'a protected file reported as %j still never ships', async file => {
         for (const stage of ['prerelease', 'prod']) neverShips(await compute([finding({ class: 'E2', file })], options(stage, { guardFloorPaths: [] })));
       });
-    it.each(['a/scripts/output.mjs', 'scripts/output.mjs:12', 'scripts/output.mjs#L12', 'scripts/output.mjs '])(
+    it('a path with more candidate forms than can be matched at bounded cost fails closed', async () => {
+      neverShips(await compute([finding({ class: 'E2', file: `${'scripts/'.repeat(40)}output.mjs` })], options()));
+      // A long path with no protected folder in it yields one candidate and ships as before.
+      expect((await compute([finding({ class: 'E2', file: `${'x/'.repeat(200)}output.mjs` })], options())).verdict).toBe('NOT WEAKENED');
+    });
+    it.each(['a/scripts/output.mjs', 'scripts/output.mjs:12', 'scripts/output.mjs#L12', 'scripts/output.mjs ', '`scripts/output.mjs`',
+      '+++ b/scripts/output.mjs', 'src/components/merge-button.ts'])(
       'an unprotected file reported as %j still ships as debt (the stripped forms add protection, never remove a path)', async file => {
         expect((await compute([finding({ class: 'E2', file })], options())).verdict).toBe('NOT WEAKENED');
       });

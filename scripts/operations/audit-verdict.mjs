@@ -130,29 +130,40 @@ function payByTime(due) {
 const MAX_PATH = 512;
 /** Most globs one CALLER list may carry (the trusted lists are bounded by audit-settings: the floor plus 256 per layer). */
 const MAX_GLOBS = GUARD_FLOOR.length + 512;
+/** Most candidate forms one reported path may yield; more cannot be matched at bounded cost and fail closed. */
+const MAX_CANDIDATES = 32;
 /**
  * Every repo-relative POSIX form a reported path may name, or null when it cannot be established (callers fail closed).
- * A model reading a diff or a stack trace reports the file in shapes the floor globs never match: the git-diff side
- * prefix (`a/scripts/x.mjs`), a line or column suffix (`x.mjs:42`, `x.mjs:42:7`, `x.mjs#L42-L50`), surrounding
- * whitespace, a compatibility-form or invisible character (PR #6381 self-review). Each such form adds the stripped
- * path as a further candidate; a path is protected when ANY candidate matches, so a candidate only ever protects more.
+ * A model reading a diff or a trace wraps the file in text the floor globs never match: quotes or backticks, a diff
+ * header or side prefix (`+++ b/`, `a/`, `i/`), a folder above the repo, a line suffix (`:42`, `:42-50`, `#L42`,
+ * `(line 42)`, `@sha`), trailing punctuation, compatibility-form or invisible characters (PR #6381 self-review).
+ * Listing those shapes always misses the next one, so the shape is not listed: every run of path characters in the
+ * report (raw and NFKC-folded) is a token and a candidate, and so is every trailing run of the token's folders that
+ * starts at an ANCHOR, the first folder a protected glob names (`scripts`, `.claude`). Anchoring keeps a glob's
+ * meaning (`*` still names only a top-level file: `x/y` never yields `y`). A path is protected when ANY candidate
+ * matches, so a candidate only ever protects more. The raw report must still normalize.
  */
-function pathCandidates(file) {
+function pathCandidates(file, anchors = new Set()) {
   if (typeof file !== 'string' || file.length > MAX_PATH) return null;
-  const forms = new Set([file]);
-  const add = p => { if (p && p.length) forms.add(p); };
-  add(file.normalize('NFKC').replace(/\p{Default_Ignorable_Code_Point}/gu, ''));
-  for (const f of [...forms]) add(f.trim());
-  for (const f of [...forms]) add(f.replace(/(?::\d+){1,2}$|#L\d+(?:-L?\d+)?$/, ''));
-  for (const f of [...forms]) add(f.replace(/^\.?\/?[ab]\//, ''));
-  const out = new Set();
-  for (const f of forms) {
-    const c = pathCandidate(f);
-    if (c === null) return null;
-    out.add(c);
+  const raw = pathCandidate(file);
+  if (raw === null) return null;
+  const out = new Set([raw]);
+  const folded = file.normalize('NFKC').replace(/\p{Default_Ignorable_Code_Point}/gu, '');
+  for (const form of new Set([file, folded])) {
+    for (const token of form.match(/[\p{L}\p{N}_.\-/\\]+/gu) ?? []) {
+      const segs = token.replace(/\\/g, '/').replace(/\.+$/, '').split('/').filter(s => s !== '' && s !== '.');
+      for (let i = 0; i < segs.length; i++) {
+        if (i > 0 && !anchors.has(segs[i].toLowerCase())) continue;
+        const c = pathCandidate(segs.slice(i).join('/'));
+        if (c !== null) out.add(c);
+        if (out.size > MAX_CANDIDATES) return null;
+      }
+    }
   }
   return [...out];
 }
+/** The literal first folder of each glob (`scripts` of `scripts/**\/x`); a glob that starts with a wildcard names none. */
+const anchorsOf = patterns => new Set(patterns.map(p => p.toLowerCase().split('/')[0]).filter(s => s !== '' && !s.includes('*')));
 function pathCandidate(file) {
   if (/[\u0000-\u001f]/.test(file) || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(file)) return null;
   let path = file.replace(/\\/g, '/');
@@ -171,7 +182,7 @@ function pathCandidate(file) {
 // Case-insensitive: the checkout may sit on a case-insensitive file system, where `Scripts/Guard-Bash.mjs` IS the guard.
 // Folding both sides only ever protects more paths. The candidates are computed once per path, not once per glob.
 const matchesSome = (file, patterns) => {
-  const c = pathCandidates(file)?.map(x => x.toLowerCase());
+  const c = pathCandidates(file, anchorsOf(patterns))?.map(x => x.toLowerCase());
   return c === undefined || patterns.some(p => c.some(x => matchesPath(x, p.toLowerCase())));
 };
 
