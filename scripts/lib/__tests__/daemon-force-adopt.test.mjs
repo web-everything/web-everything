@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   validateForceAdopt, requestForceAdopt, readForceAdopt, recordForcedAdoption, abortForcedAdoption, readForceWatch,
-  evaluateForceWatch, runForceWatchTick, forceRequestFor, forceBlockedReason, abortForcedWatch, dropReadyCandidate, forcedWatchStatus, carryForceWatch, declareForceCarry,
+  evaluateForceWatch, runForceWatchTick, forceRequestFor, forceBlockedReason, abortForcedWatch, dropReadyCandidate, forcedWatchStatus, carryForceWatch, declareForceCarry, forceWatchGuards,
 } from '../daemon-force-adopt.mjs';
 import { matchReadyCandidate } from '../daemon-rebuild/adopt.mjs';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
@@ -361,6 +361,14 @@ describe('carryForceWatch: a successor adopted without its own smoke inherits th
     try { expect(await carryForceWatch({ root, env, fromSha: 'b'.repeat(40), toSha: 'd'.repeat(40) })).toBe(false); } finally { chmodSync(env.WE_DAEMON_STATE_DIR, 0o700); }
     expect(readFileSync(env.WE_FORCE_ADOPT_HANDOFF, 'utf8')).toMatch(/force-adopt-watch-carry-failed b{40} -> d{40}/);
     expect(readForceWatch(root, env)).toMatchObject({ sha: 'b'.repeat(40) });
+  });
+  it('forceWatchGuards: true only for the watched sha (or its declared successor); false with no watch or another sha', async () => {
+    expect(forceWatchGuards({ root, env, sha: 'b'.repeat(40) })).toBe(false); // no watch yet
+    await rec();
+    expect(forceWatchGuards({ root, env, sha: 'b'.repeat(40) })).toBe(true);
+    expect(forceWatchGuards({ root, env, sha: 'c'.repeat(40) })).toBe(false);
+    declareForceCarry({ root, env, fromSha: 'b'.repeat(40), toSha: 'd'.repeat(40) });
+    expect(forceWatchGuards({ root, env, sha: 'd'.repeat(40) })).toBe(true);
   });
   it('does nothing for a watch of another build, no watch, or the same sha', async () => {
     expect(await carryForceWatch({ root, env, fromSha: 'b'.repeat(40), toSha: 'd'.repeat(40) })).toBe(false);

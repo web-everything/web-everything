@@ -229,6 +229,14 @@ export function declareForceCarry({ root, env = process.env, fromSha, toSha = nu
   try { writeJson(watchPath(root, env), toSha ? { ...rest, carryTo: toSha } : rest); return true; } catch { return false; }
 }
 
+/** True when an open force watch (on disk, or an owed rollback held in memory) guards `sha` (or is already declared to move onto it).
+ *  An unsmoked-successor adoption must fail closed when this holds and the carry intent could not be declared: the watch would be
+ *  left on a superseded sha and erased, dropping automatic rollback protection for the unverified code. */
+export function forceWatchGuards({ root, env = process.env, sha }) {
+  const watch = currentWatch(root, env);
+  return Boolean(watch && sha && (watch.sha === sha || watch.carryTo === sha));
+}
+
 /** Move a watch that declared `carryTo` onto that successor: same last-good, ticks left and owed-rollback marker (on disk and in memory),
  *  intent cleared. The ONE rebind path for every tick site that finds HEAD on the declared successor. Returns the moved watch. */
 function rebindToCarry(root, env, watch) {

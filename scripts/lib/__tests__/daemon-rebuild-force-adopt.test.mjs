@@ -564,6 +564,23 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     expect(readForceWatch(cloneDir, env)).toBeNull();
   });
 
+  it('an unsmoked successor is NOT adopted when the open watch cannot be told about the move: it is built and smoked instead (fail closed)', async () => {
+    const { originDir, cloneDir, env, target, arm } = setup();
+    arm();
+    await tick(cloneDir, env, { runSmoke: failing(), forceWatchProbe: healthy }); // forced build adopted and watched
+    const before = readForceWatch(cloneDir, env);
+    expect(before).toMatchObject({ sha: target });
+    const successor = advanceMainEmpty(originDir);
+    // every watch write fails (the atomic temp path is occupied by a directory) while the rest of the state dir stays writable
+    mkdirSync(`${join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(cloneDir)}.force-watch.json`)}.${process.pid}.tmp`);
+    const smoke = passing();
+    const r = await tick(cloneDir, env, { runSmoke: smoke, forceWatchProbe: healthy, skipCheck: () => ({ skip: true, reason: 'docs-only' }) });
+    expect(r.reason).not.toBe('skipped-unrelated');
+    expect(r.skippedSmoke).toBeUndefined();
+    expect(smoke).toHaveBeenCalled(); // the successor got a smoke of its own instead of riding the forced build's watch unprotected
+    expect(headOf(cloneDir)).toBe(successor); // and, smoked green, it is adopted normally
+  });
+
   it('a rollback never reverts a build a sibling adopted while the health probe ran: the watch closes and the newer build keeps running', async () => {
     const { originDir, cloneDir, env, lastGood, target, arm } = setup();
     arm();
