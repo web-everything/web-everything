@@ -402,8 +402,8 @@ describe('same-head review loop regression (live #202)', () => {
   });
 
   // PR #6465 round 2: every run-level reason `mandatoryReferralState` re-derives live is one shared set, so `attempted`
-  // and `count` skip it exactly as the refused-stage resume check does; a lost persist stays a real (fail-closed) entry.
-  it.each(['malformed-referral-record', 'malformed-operator-ruling', 'unavailable-reviewed-head', 'wrong-subject'])(
+  // and `count` skip it exactly as the refused-stage resume check does; failure tokens stay real (fail-closed) entries.
+  it.each(['malformed-operator-ruling', 'unavailable-reviewed-head', 'wrong-subject'])(
     'counts %s as a reason, not a finding, and keeps the attempted referral held', token => {
       const r = run();
       r.findings.referralVerdict.pendingReferrals.unshift(token);
@@ -413,9 +413,10 @@ describe('same-head review loop regression (live #202)', () => {
       expect(hold(pr(), [row])).not.toBeNull();
     });
 
-  it('keeps referral-persistence-failed out of the reason set', () => {
-    expect(PENDING_REASON_TOKENS.has('referral-persistence-failed')).toBe(false);
-  });
+  it.each(['referral-persistence-failed', 'malformed-referral-record', 'unreadable-referral-result'])(
+    'keeps the failure token %s out of the reason set', token => {
+      expect(PENDING_REASON_TOKENS.has(token)).toBe(false);
+    });
   it.each(['referral-persistence-failed', 'malformed-referral-record', 'unreadable-referral-result'])
     ('preserves the failure token %s', token => {
       const r = run();
