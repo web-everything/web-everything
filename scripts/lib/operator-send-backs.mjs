@@ -3,7 +3,32 @@ import { isOperatorAuthored, isTrustedMarkerAuthor } from './marker-authorship.m
 
 const commentsOf = pr => Array.isArray(pr?.comments) ? pr.comments : [];
 // Keep a separator so removal cannot assemble new comment delimiters or evidence references.
-const stripComments = text => String(text ?? '').replace(/<!--[\s\S]*?-->/g, ' ');
+// Without any "-->" the lazy scan from every "<!--" is quadratic on hostile input; nothing could match anyway.
+const stripComments = text => {
+  const s = String(text ?? '');
+  return s.includes('-->') ? s.replace(/<!--[\s\S]*?-->/g, ' ') : s;
+};
+/**
+ * Blank every HTML blockquote/pre block, depth-counted so a nested block cannot end its outer one early.
+ * An unterminated block runs to the end of the text. One linear pass.
+ */
+function stripHtmlBlocks(text) {
+  const source = String(text ?? '');
+  const tag = /<(\/?)(blockquote|pre)\b/gi;
+  let out = '', last = 0, depth = 0, start = 0, m;
+  while ((m = tag.exec(source))) {
+    if (!m[1]) {
+      if (!depth) start = m.index;
+      depth++;
+    } else if (depth && --depth === 0) {
+      const end = source.indexOf('>', m.index);
+      if (end === -1) { depth = 1; break; } // a closing tag with no ">" is still unterminated
+      out += source.slice(last, start) + ' ';
+      last = tag.lastIndex = end + 1;
+    }
+  }
+  return depth ? out + source.slice(last, start) + ' ' : out + source.slice(last);
+}
 /**
  * Only text a fixer actually wrote as a claim can resolve a request: blockquoted lines ("> Request 1001 remains
  * unaddressed.") and fenced code blocks (``` or ~~~ examples of the marker) are references, not coverage.
@@ -21,7 +46,7 @@ function stripQuoted(text) {
   const out = [];
   let fence = null, quoting = false;
   // HTML quote and preformatted blocks render as quoted/code text; an unterminated one runs to the end.
-  const source = String(text ?? '').replace(/<(blockquote|pre)\b[\s\S]*?(?:<\/\1\s*>|$)/gi, ' ');
+  const source = stripHtmlBlocks(text);
   for (const line of source.split(/\r\n?|\n/)) {
     if (fence) {
       const close = /^[ \t]*(`{3,}|~{3,})[ \t]*$/.exec(line);
@@ -81,6 +106,7 @@ export function operatorSendBacks(comments) {
 function markerLineFor(text, id) {
   const exact = new RegExp(`^<!--\\s*addresses-operator-send-back:\\s*${escapeRe(id)}\\s*-->$`);
   const source = String(text ?? '');
+  if (!source.includes('-->')) return false;
   for (const span of source.matchAll(/<!--[\s\S]*?-->/g)) {
     if (!exact.test(span[0])) continue;
     const lineStart = source.lastIndexOf('\n', span.index - 1) + 1;

@@ -300,6 +300,8 @@ describe('quoted and fenced references never resolve an operator request', () =>
     ['marker inside a multi-line HTML comment', '<!--\n<!-- addresses-operator-send-back: 1001 -->\n-->'],
     ['html blockquote', '<blockquote>\nRequest 1001 remains unaddressed.\n</blockquote>'],
     ['unterminated html pre block', '<pre>\n<!-- addresses-operator-send-back: 1001 -->'],
+    ['nested html blockquote', '<blockquote><blockquote>x</blockquote> Request 1001 unaddressed </blockquote>'],
+    ['nested html pre with a marker after the inner close', '<pre><pre>x</pre>\n<!-- addresses-operator-send-back: 1001 -->\n</pre>'],
     ['entity-spelled quote', '&gt; Request 1001 remains unaddressed.'],
     ['non-breaking-space quote', ' > Request 1001 remains unaddressed.'],
   ])('fix evidence containing %s leaves the request open', (_name, quoted) => {
@@ -320,6 +322,13 @@ describe('quoted and fenced references never resolve an operator request', () =>
   it('a quoted or fenced marker in fix evidence leaves the request open', () => {
     const body = `## Fix evidence\nHead: \`${B}\`\n${quote}${fenced}Fixed.`;
     expect(open([request, comment('fix', 'web-everything', '21:00', body)])).toEqual(['1001']);
+  });
+  it('a closed html block before the marker does not hide it, and hostile unclosed comments stay fast', () => {
+    const body = `## Fix evidence\nHead: \`${B}\`\n<pre>x</pre>\n<!-- addresses-operator-send-back: 1001 -->\nDone.`;
+    expect(open([request, comment('fix', 'web-everything', '21:00', body)])).toEqual([]);
+    const start = Date.now();
+    open([request, comment('fix', 'web-everything', '21:00', `## Fix evidence\nHead: \`${B}\`\n${'<!--'.repeat(16000)}`)]);
+    expect(Date.now() - start).toBeLessThan(1500);
   });
   it('a real marker directly under a quote (no blank line) still resolves it', () => {
     const body = `## Fix evidence\nHead: \`${B}\`\n> item 1 text\n<!-- addresses-operator-send-back: 1001 -->\nDone.`;
