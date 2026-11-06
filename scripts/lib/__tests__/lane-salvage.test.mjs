@@ -15,8 +15,9 @@ import { tmpdir } from 'node:os';
 import {
   salvageStamp, salvageRefNames, isWorktreeLitterPath, parseLsofCwds, pidsWithCwdIn, salvageEligibility,
   liveAgentInLane, deriveSalvageTargets, salvageLane, removeLitterWorktrees, listLitterWorktrees, laneLivenessGate,
-  listUnregisteredWorktreeLitter, newestContentMtimeMs, resolveSalvageQuietMs, nearestAncestorMtimeMs,
+  listUnregisteredWorktreeLitter, newestContentMtimeMs, resolveSalvageQuietMs, nearestAncestorMtimeMs, externalGitdir,
 } from '../lane-salvage.mjs';
+import { isSalvageLanded } from '../salvage-index.mjs';
 
 describe('lane-salvage pure core', () => {
   it('stamps sortable UTC and names refs like the manual salvage', () => {
@@ -286,6 +287,217 @@ describe('salvageLane (real git)', () => {
     expect(wts.map((w) => w.name)).toEqual(['fix-2777']);
     expect(removeLitterWorktrees(lane, wts)).toEqual(['fix-2777']);
     expect(existsSync(join(lane, '.claude', 'worktrees', 'fix-2777'))).toBe(false);
+  });
+
+  it.each(['ahead', 'base', 'missing-object'])('salvages a deleted locked worktree (%s) without running git in its missing directory', (kind) => {
+    const wt = join(lane, '.claude', 'worktrees', 'deleted');
+    git(lane, 'worktree', 'add', '-q', '--detach', wt, 'origin/main');
+    if (kind === 'ahead') {
+      writeFileSync(join(wt, 'saved.txt'), 'deleted worktree commit\n');
+      git(wt, 'add', '.'); git(wt, 'commit', '-qm', 'worktree only');
+    }
+    const head = kind === 'missing-object' ? '1'.repeat(40) : git(wt, 'rev-parse', 'HEAD');
+    if (kind === 'missing-object') {
+      const admin = readFileSync(join(wt, '.git'), 'utf8').trim().slice(8);
+      writeFileSync(join(admin, 'HEAD'), `${head}\n`);
+    }
+    git(lane, 'worktree', 'lock', wt);
+    rmSync(wt, { recursive: true });
+
+    const rec = salvageLane({ dir: lane, lane: 5, pool: 'p', branchRef: 'origin/main', salvageRoot, now: new Date('2026-09-27T02:00:00Z') });
+    expect(rec.worktrees[0]).toMatchObject({ name: 'deleted', head });
+    if (kind === 'ahead') {
+      const ref = 'refs/salvage/lane-5-20260927-020000-wt-deleted-head';
+      expect(rec.refs).toContain(ref);
+      const restore = join(root, 'restore');
+      execFileSync('git', ['clone', '-q', origin, restore], { stdio: 'ignore' });
+      git(restore, 'fetch', '-q', rec.bundle, 'refs/salvage/*:refs/salvage/*');
+      expect(git(restore, 'show', `${ref}:saved.txt`)).toBe('deleted worktree commit');
+    } else {
+      expect(rec.bundle).toBeNull();
+      expect(rec.refs).toEqual([]);
+    }
+    removeLitterWorktrees(lane, rec.worktrees);
+    expect(listLitterWorktrees(lane)).toEqual([]);
+  });
+
+  it('a deleted worktree whose HEAD object probe fails for a reason other than "absent" throws and records no salvage', () => {
+    const wt = join(lane, '.claude', 'worktrees', 'faulty');
+    git(lane, 'worktree', 'add', '-q', '--detach', wt, 'origin/main');
+    writeFileSync(join(wt, 'saved.txt'), 'only here\n');
+    git(wt, 'add', '.'); git(wt, 'commit', '-qm', 'worktree only');
+    git(lane, 'worktree', 'lock', wt);
+    rmSync(wt, { recursive: true });
+    // Fault injection: a `git` shim on PATH that fails every `cat-file` with status 128 (a corrupt object database
+    // or malformed head) and runs everything else for real. Only the stale-worktree probe uses `cat-file`, so a
+    // salvage that swallowed this failure would skip the worktree's commits and let the caller's reset discard them.
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const shimDir = join(root, 'shim');
+    mkdirSync(shimDir);
+    const shim = join(shimDir, 'git');
+    writeFileSync(shim, `#!/bin/sh\nfor a in "$@"; do [ "$a" = cat-file ] && { echo 'fatal: injected fault' >&2; exit 128; }; done\nexec '${realGit}' "$@"\n`);
+    chmodSync(shim, 0o755);
+
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${oldPath}`;
+    try {
+      expect(() => salvageLane({ dir: lane, lane: 5, pool: 'p', branchRef: 'origin/main', salvageRoot, now: new Date('2026-09-27T02:00:00Z') })).toThrow(/injected fault|cat-file/);
+    } finally { process.env.PATH = oldPath; }
+    expect(existsSync(join(salvageRoot, 'index.jsonl'))).toBe(false);
+    // Without the fault the same lane salvages the worktree's commit (the probe passes, nothing else differs).
+    const rec = salvageLane({ dir: lane, lane: 5, pool: 'p', branchRef: 'origin/main', salvageRoot, now: new Date('2026-09-27T02:00:01Z') });
+    expect(rec.refs).toContain('refs/salvage/lane-5-20260927-020001-wt-faulty-head');
+  });
+
+  it('a lane and a registered worktree holding a nested repo at the SAME relative path get distinct copies with their own content', () => {
+    const rel = 'scratch/probe';
+    const wt = join(lane, '.claude', 'worktrees', 'fix-1');
+    git(lane, 'worktree', 'add', '-q', '--detach', wt, 'origin/main');
+    for (const [root, text] of [[lane, 'lane copy\n'], [wt, 'worktree copy\n']]) {
+      const nested = join(root, rel);
+      mkdirSync(nested, { recursive: true }); git(nested, 'init', '-q');
+      writeFileSync(join(nested, 'notes.txt'), text);
+    }
+
+    const rec = salvageLane({ dir: lane, lane: 5, pool: 'p', branchRef: 'origin/main', salvageRoot, now: new Date('2026-09-27T02:00:00Z') });
+    const base = join(rec.outDir, 'lane-5.nested-repos');
+    const laneDest = join(base, rel);
+    const wtDest = join(base, '.claude', 'worktrees', 'fix-1', rel);
+    expect(rec.nestedRepos).toEqual(expect.arrayContaining([
+      { rel, dest: laneDest },
+      { rel: join('.claude', 'worktrees', 'fix-1', rel), dest: wtDest },
+    ]));
+    expect(rec.nestedRepos).toHaveLength(2);
+    expect(readFileSync(join(laneDest, 'notes.txt'), 'utf8')).toBe('lane copy\n');
+    expect(readFileSync(join(wtDest, 'notes.txt'), 'utf8')).toBe('worktree copy\n');
+  });
+
+  it('a nested repo using a SEPARATE git dir keeps its staged v1 blob after the stray clone (and its gitdir) is deleted, and is never marked landed', () => {
+    const rel = 'scratch';
+    const nested = join(lane, rel);
+    const gitdirOrig = join(lane, '.git', 'nested-db');
+    git(lane, 'init', '-q', `--separate-git-dir=${gitdirOrig}`, nested);
+    expect(lstatSync(join(nested, '.git')).isFile()).toBe(true);
+    writeFileSync(join(nested, 'notes.txt'), 'v1 staged\n'); git(nested, 'add', 'notes.txt');
+    writeFileSync(join(nested, 'notes.txt'), 'v2 working tree\n');
+
+    const rec = salvageLane({ dir: lane, lane: 5, pool: 'p', branchRef: 'origin/main', salvageRoot, now: new Date('2026-09-27T02:00:00Z') });
+    const dest = join(rec.outDir, 'lane-5.nested-repos', rel);
+    expect(rec.nestedRepos).toEqual([{ rel, dest, gitdir: `${dest}.gitdir` }]);
+    expect(JSON.parse(readFileSync(join(salvageRoot, 'index.jsonl'), 'utf8')).nestedRepos).toEqual(rec.nestedRepos);
+    // The clone is reclaimed: the stray nested tree AND the gitdir that lived under the lane's own .git go away.
+    git(lane, 'clean', '-ffd', '--quiet');
+    rmSync(gitdirOrig, { recursive: true, force: true });
+    expect(existsSync(nested)).toBe(false);
+    expect(existsSync(gitdirOrig)).toBe(false);
+    // The staged v1 content is still recoverable from the salvaged gitdir; the working copy kept v2.
+    expect(git(root, '--git-dir', `${dest}.gitdir`, 'show', ':notes.txt')).toBe('v1 staged');
+    expect(readFileSync(join(dest, 'notes.txt'), 'utf8')).toBe('v2 working tree\n');
+    // Plain files no git tip carries: landing can never be proven for this entry.
+    expect(isSalvageLanded(rec, { repoDir: lane })).toBeNull();
+  });
+
+  it('a nested LINKED-WORKTREE checkout (gitdir + commondir) keeps its staged v1 blob after the stray clone AND its parent repo are deleted', () => {
+    const parent = join(root, 'parent-repo');
+    execFileSync('git', ['init', '-q', '-b', 'main', parent]);
+    for (const [k, v] of [['user.name', 't'], ['user.email', 't@t'], ['commit.gpgsign', 'false']]) git(parent, 'config', k, v);
+    writeFileSync(join(parent, 'seed.txt'), 'seed\n'); git(parent, 'add', '.'); git(parent, 'commit', '-qm', 'seed');
+    const nested = join(lane, 'scratch');
+    git(parent, 'worktree', 'add', '-q', '--detach', nested);
+    writeFileSync(join(nested, 'notes.txt'), 'v1 staged\n'); git(nested, 'add', 'notes.txt');
+    writeFileSync(join(nested, 'notes.txt'), 'v2 working tree\n');
+
+    const rec = salvageLane({ dir: lane, lane: 5, pool: 'p', branchRef: 'origin/main', salvageRoot, now: new Date('2026-09-27T02:00:00Z') });
+    const dest = join(rec.outDir, 'lane-5.nested-repos', 'scratch');
+    expect(rec.nestedRepos).toEqual([{ rel: 'scratch', dest, gitdir: `${dest}.gitdir`, commondir: `${dest}.commondir` }]);
+    git(lane, 'clean', '-ffd', '--quiet');
+    rmSync(parent, { recursive: true, force: true });
+    expect(existsSync(nested)).toBe(false);
+    expect(git(root, '--git-dir', `${dest}.gitdir`, 'show', ':notes.txt')).toBe('v1 staged');
+    expect(isSalvageLanded(rec, { repoDir: lane })).toBeNull();
+  });
+
+  it('a nested repo borrowing objects via alternates (clone --shared) aborts the whole salvage: THROWS, writes no index record, leaves the nested repo in place', () => {
+    const parent = join(root, 'parent-repo');
+    execFileSync('git', ['init', '-q', '-b', 'main', parent]);
+    for (const [k, v] of [['user.name', 't'], ['user.email', 't@t'], ['commit.gpgsign', 'false']]) git(parent, 'config', k, v);
+    writeFileSync(join(parent, 'seed.txt'), 'seed\n'); git(parent, 'add', '.'); git(parent, 'commit', '-qm', 'seed');
+    const nested = join(lane, 'scratch');
+    execFileSync('git', ['clone', '-q', '--shared', parent, nested], { stdio: 'ignore' });
+    expect(existsSync(join(nested, '.git', 'objects', 'info', 'alternates'))).toBe(true);
+    expect(() => salvageLane({ dir: lane, lane: 5, pool: 'p', branchRef: 'origin/main', salvageRoot, now: new Date('2026-09-27T02:00:00Z') })).toThrow(/alternates/);
+    expect(existsSync(join(salvageRoot, 'index.jsonl'))).toBe(false);
+    expect(existsSync(join(nested, 'seed.txt'))).toBe(true);
+  });
+
+  it('externalGitdir fails closed: an unparseable pointer, a missing target or a non-directory target THROWS; a real .git dir or an in-tree target needs no extra copy', () => {
+    const mk = (name) => { const d = join(root, name); mkdirSync(d); return d; };
+    const garbage = mk('garbage'); writeFileSync(join(garbage, '.git'), 'not a pointer\n');
+    expect(() => externalGitdir(garbage)).toThrow(/not a "gitdir: <path>" pointer/);
+    const missing = mk('missing'); writeFileSync(join(missing, '.git'), 'gitdir: ../no-such-gitdir\n');
+    expect(() => externalGitdir(missing)).toThrow(/no-such-gitdir/);
+    const notDir = mk('notdir'); writeFileSync(join(root, 'afile'), 'x'); writeFileSync(join(notDir, '.git'), 'gitdir: ../afile\n');
+    expect(() => externalGitdir(notDir)).toThrow(/not a directory/);
+    const real = mk('real'); git(real, 'init', '-q');
+    expect(externalGitdir(real)).toBeNull();
+    const inTree = mk('intree'); git(inTree, 'init', '-q', '--separate-git-dir=meta', '.'); rmSync(join(inTree, '.git'), { force: true }); writeFileSync(join(inTree, '.git'), 'gitdir: meta\n');
+    expect(externalGitdir(inTree)).toBeNull();
+    // A pointer at a directory that is not a git dir (the lane-written text could name `/` or ~/.ssh) is refused.
+    const bogus = mk('bogus'); mk('bogus-target'); writeFileSync(join(bogus, '.git'), 'gitdir: ../bogus-target\n');
+    expect(() => externalGitdir(bogus)).toThrow(/does not look like a git directory/);
+    const outside = mk('outside'); const od = mk('outside-db'); git(od, 'init', '-q'); writeFileSync(join(outside, '.git'), `gitdir: ${join(od, '.git')}\n`);
+    expect(externalGitdir(outside)).toBe(realpathSync(join(od, '.git')));
+  });
+
+  it('copies an untracked unborn nested repo verbatim while snapshotting normal changes without touching the real index', () => {
+    const rel = '.fix-scratch/probe-run/base-clean';
+    const nested = join(lane, rel);
+    mkdirSync(nested, { recursive: true });
+    git(nested, 'init', '-q');
+    writeFileSync(join(nested, 'notes.txt'), 'scratch work\n');
+    writeFileSync(join(nested, '.gitignore'), 'ignored.txt\n');
+    writeFileSync(join(nested, 'ignored.txt'), 'ignored but preserved\n');
+    symlinkSync('notes.txt', join(nested, 'link'));
+    writeFileSync(join(lane, 'a.txt'), 'staged\n'); git(lane, 'add', 'a.txt');
+    writeFileSync(join(lane, 'a.txt'), 'unstaged\n');
+    writeFileSync(join(lane, 'new.txt'), 'ordinary untracked\n');
+    const before = git(lane, 'status', '--porcelain');
+    const index = readFileSync(join(lane, '.git', 'index'));
+
+    const rec = salvageLane({ dir: lane, lane: 5, pool: 'p', branchRef: 'origin/main', salvageRoot, now: new Date('2026-09-27T02:00:00Z') });
+    const dest = join(rec.outDir, 'lane-5.nested-repos', rel);
+    expect(rec.nestedRepos).toEqual([{ rel, dest }]);
+    expect(JSON.parse(readFileSync(join(salvageRoot, 'index.jsonl'), 'utf8')).nestedRepos).toEqual(rec.nestedRepos);
+    expect(readFileSync(join(dest, 'notes.txt'), 'utf8')).toBe('scratch work\n');
+    expect(readFileSync(join(dest, 'ignored.txt'), 'utf8')).toBe('ignored but preserved\n');
+    expect(readFileSync(join(dest, '.git', 'HEAD'))).toEqual(readFileSync(join(nested, '.git', 'HEAD')));
+    expect(readlinkSync(join(dest, 'link'))).toBe('notes.txt');
+    expect(git(lane, 'status', '--porcelain')).toBe(before);
+    expect(readFileSync(join(lane, '.git', 'index'))).toEqual(index);
+    const wip = 'refs/salvage/lane-5-20260927-020000-wip';
+    expect(git(lane, 'show', `${wip}:a.txt`)).toBe('unstaged');
+    expect(git(lane, 'show', `${wip}:new.txt`)).toBe('ordinary untracked');
+    expect(git(lane, 'ls-tree', '-r', '--name-only', wip)).not.toContain('.fix-scratch');
+    git(lane, 'reset', '--hard', 'origin/main'); git(lane, 'clean', '-ffd', '--quiet');
+    expect(existsSync(nested)).toBe(false);
+    expect(readFileSync(join(dest, 'notes.txt'), 'utf8')).toBe('scratch work\n');
+  });
+
+  it('refuses a nested-repo copy collision without changing the lane or recording salvage as complete', () => {
+    const nested = join(lane, 'scratch');
+    mkdirSync(nested); git(nested, 'init', '-q');
+    writeFileSync(join(nested, 'notes.txt'), 'unsaved work\n');
+    const dest = join(salvageRoot, 'p', '20260927-020000', 'lane-5.nested-repos', 'scratch');
+    mkdirSync(dest, { recursive: true });
+    writeFileSync(join(dest, 'notes.txt'), 'previous salvage\n');
+    const before = git(lane, 'status', '--porcelain');
+    const index = readFileSync(join(lane, '.git', 'index'));
+    expect(() => salvageLane({ dir: lane, lane: 5, pool: 'p', branchRef: 'origin/main', salvageRoot, now: new Date('2026-09-27T02:00:00Z') })).toThrow();
+    expect(existsSync(join(salvageRoot, 'index.jsonl'))).toBe(false);
+    expect(readFileSync(join(dest, 'notes.txt'), 'utf8')).toBe('previous salvage\n');
+    expect(readFileSync(join(nested, 'notes.txt'), 'utf8')).toBe('unsaved work\n');
+    expect(git(lane, 'status', '--porcelain')).toBe(before);
+    expect(readFileSync(join(lane, '.git', 'index'))).toEqual(index);
   });
 
   it('includeLocalBranches (a clone about to be deleted) also bundles a non-HEAD branch no remote has', () => {
