@@ -2749,6 +2749,11 @@ describe('load-shaped rows need host-load evidence (sticky rejection)', () => {
     // A trailing second line or extra text stays code-shaped.
     expect(stickyIsLoadShapedRow({ ...real, detail: `${real.detail}\nTypeError: x`, hostLoad: hot }, {})).toBe(false);
     expect(stickyIsLoadShapedRow({ ...real, detail: real.detail.replace('skipped', 'exited 1; skipped'), hostLoad: hot }, {})).toBe(false);
+    // Sibling checks wrap the same refusal with their own `<label> failed: ` prefix (daemon-live-smoke.mjs detail templates).
+    for (const label of ['dispatch dry-run child failed', 'gh api --method GET repos/o/r failed', 'gh pr list --repo o/r --limit 1 failed']) {
+      expect(stickyIsLoadShapedRow({ name: 'x', ok: false, detail: `${label}: ${budget}`, hostLoad: hot }, {})).toBe(true);
+      expect(stickyIsLoadShapedRow({ name: 'x', ok: false, detail: `${label}: ${budget}`, hostLoad: cool }, {})).toBe(false);
+    }
     const state = { rejected: { inputsKey: 'k', reason: 'tree-stays-clean', at: 'x' },
       held: { reason: 'smoke-rejected', details: [{ name: 'tree-stays-clean', detail: real.detail }] } };
     const now = Date.parse('2026-11-05T17:00:00Z');
