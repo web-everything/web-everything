@@ -289,6 +289,14 @@ describe('quoted and fenced references never resolve an operator request', () =>
     expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual(['1001']);
   });
   it.each([
+    ['bare id', 'Operator send-back 1001 remains unaddressed; I changed only an unrelated test.'],
+    ['bare id, negated', 'Did not address request 1001.'],
+    ['comment id URL', `See ${'https://github.com/o/r/pull/1#issuecomment-1001'} - not addressed.`],
+  ])('a trusted fix-end for a new head only mentioning the request (%s) leaves it open', (_name, prose) => {
+    const withUrl = { ...request, url: 'https://github.com/o/r/pull/1#issuecomment-1001' };
+    expect(open([withUrl, comment('end', 'web-everything', '21:00', `${release}\n${prose}`)])).toEqual(['1001']);
+  });
+  it.each([
     ['lazy quote continuation', '> quote\nRequest 1001 remains unaddressed.'],
     ['indented code', '    Request 1001 remains unaddressed.'],
     ['tab-indented marker', '\t<!-- addresses-operator-send-back: 1001 -->'],

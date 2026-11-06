@@ -207,7 +207,9 @@ export function openOperatorSendBacks(pr) {
         && /\boperator send(?:-back|back| back)\b/i.test(stripComments(text));
       // A released fixer may put the explicit coverage on fix-end instead of a separate evidence comment.
       // Preserve the old path for missing/ambiguous timestamps, generic releases and unchanged heads.
-      if (text.trimStart().startsWith('🔓 conveyor fix-end') && namesSendBack(text, item)) {
+      // Only the explicit marker line is coverage here: a bare id/url/time mention in a release can just as well say
+      // the request "remains unaddressed", and a claim release is not evidence of a repair on its own.
+      if (text.trimStart().startsWith('🔓 conveyor fix-end') && !!item.id && markerLineFor(text, item.id)) {
         const at = Date.parse(c.createdAt), requestedAt = Date.parse(item.at);
         const release = /^🔓 conveyor fix-end — fix claim released\r?\n\r?\n`([^`\r\n]+)` released the fix claim at `([a-f0-9]{7,40})`\.(?:[ \t]|\r?\n|$)/i.exec(text);
         const head = release?.[1].trim() ? release[2] : null;
