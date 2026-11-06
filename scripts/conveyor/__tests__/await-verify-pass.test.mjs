@@ -1376,6 +1376,17 @@ describe('timeout-only load recovery', () => {
     await tick(deferAt + AWAIT_LOAD_DEFER_MAX_MS + 1);
     expect(h.calls.resume).toHaveLength(1);
   });
+  it('red-team round 2 (same class): a self-review hold on a late green keeps the session await exemption for the whole hold', async () => {
+    const h = harness({ records: [rec({ attempt: 1 })] });
+    const session = { sessionId: rec().sessionId, name: 'fix-4115' };
+    h.io.readSelfReview = () => ({ v: 1, repo: rec().repo, pr: rec().pr, sessionId: rec().sessionId, who: rec().who, state: 'pending', sha: SHA,
+      startedAt: new Date(T0 + 135 * 60_000).toISOString() });
+    h.state.marker = marker('green');
+    expect((await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 140 * 60_000, ttlMs: TTL })).rows[0]).toMatchObject({ action: 'self-review-hold' });
+    expect(h.calls.push).toEqual([]); expect(h.calls.resume).toEqual([]);
+    // 160 minutes after the request, still inside the 30-minute review bound: the fixer must not be reapable.
+    expect(classifyAwaitVerify({ record: h.store.get(rec().sessionId), session, nowMs: T0 + 160 * 60_000, ttlMs: TTL })).toMatchObject({ awaiting: true });
+  });
   it('red-team round 2: an await TTL shorter than the deferral cap is refreshed on every deferred tick', async () => {
     const shortTtl = 60 * 60_000;
     const h = harness({ records: [rec({ attempt: 1 })] });

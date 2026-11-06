@@ -378,7 +378,10 @@ export function selfReviewGate({ io, record, nowMs, limits = AWAIT_VERIFY_LIMITS
 function holdHandBack(row, record, gate, persist, nowMs, kind = 'green') {
   const verdict = kind === 'no-new-commit' ? kind : 'verify green';
   if (!record.selfReviewHeldAt) {
-    if (!persist({ ...record, selfReviewHeldAt: new Date(nowMs).toISOString() })) return;
+    // The hold is bounded by `selfReviewMaxMs` (well under the await TTL). Restart `requestedAt` with it, so the session
+    // reaper (classifyAwaitVerify) keeps the idle fixer exempt for the whole hold, even when the green came late.
+    const at = new Date(nowMs).toISOString();
+    if (!persist({ ...record, requestedAt: at, selfReviewHeldAt: at })) return;
     Object.assign(row, { action: 'self-review-hold', reason: gate.hold, result: `${verdict}; push + resume withheld until the self-review returns (fix claim still held)` });
   } else Object.assign(row, { action: 'wait', reason: `${kind}; ${gate.hold}` });
 }
