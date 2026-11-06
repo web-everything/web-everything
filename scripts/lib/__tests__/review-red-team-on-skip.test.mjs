@@ -124,6 +124,43 @@ describe('R100 — #5910 accepted stored review does not owe a red team', () => 
     expect(planRedTeamOnSkip(f)[0].action).not.toBe('clear');
   });
 
+  // Each conjunct of the judge-accepted clear gate, flipped one at a time: the planner must neither clear nor dispatch.
+  const pendingLabels = ['ready-to-merge', 'review:accepted', 'red-team:pending'];
+  const acceptComment = (sha = storedHead) => ({ body: `✅ review — accepted\n<!-- reviewed-sha: ${sha} -->`, author: { login: 'web-everything' } });
+  it.each([
+    ['a later hold comment after the accept', f => { f.rawPrs[0].comments.push({ body: '🔁 review — changes requested', author: { login: 'web-everything' } }); }],
+    ['an accept comment for a different head', f => { f.rawPrs[0].comments = [acceptComment('b'.repeat(40))]; }],
+    ['unreadable formal reviews', f => { f.rawPrs[0].reviews = null; }],
+    ['a formal changes-requested review', f => { f.rawPrs[0].reviews = [{ state: 'CHANGES_REQUESTED', commit: { oid: storedHead }, author: { login: 'someone' } }]; }],
+    ['a blocking review:changes label', f => { f.rawPrs[0].labels = [...pendingLabels, 'review:changes']; }],
+    ['a blocking review:human label', f => { f.rawPrs[0].labels = [...pendingLabels, 'review:human']; }],
+    ['a blocking red-team:blocked label', f => { f.rawPrs[0].labels = [...pendingLabels, 'red-team:blocked']; }],
+  ])('refuses to clear or dispatch a judge-accepted head with %s', (_name, mutate) => {
+    const f = judgeAcceptedFixture(pendingLabels); mutate(f);
+    expect(planRedTeamOnSkip(f)[0].action).toBe('skip');
+  });
+
+  it('refuses to clear a judge-accepted head when the red-team status is finished not-owed but the accept is not provable', () => {
+    const status = { status: 'finished', result: 'not-owed' };
+    const f = judgeAcceptedFixture(pendingLabels, { status }); f.rawPrs[0].comments = []; f.readStatus = () => status;
+    expect(planRedTeamOnSkip(f)[0].action).toBe('skip');
+  });
+
+  it('refuses to clear when only the live status read shows red-team state (evidence status absent)', () => {
+    const f = judgeAcceptedFixture(pendingLabels); f.readStatus = () => ({ status: 'running' });
+    expect(planRedTeamOnSkip(f)[0].action).not.toBe('clear');
+  });
+
+  it.each(['recorded', 'seatRecorded'])('does not treat an omitted %s as proof the head never ran (explicit-false contrast)', key => {
+    const omitted = judgeAcceptedFixture(pendingLabels);
+    const evidence = { loopPayload: { verdict: { verdict: 'prevention-outstanding' }, findings: { read: { netBasis: { rev: storedHead } } } },
+      recorded: false, seatRecorded: false, inFlight: false, queued: false };
+    delete evidence[key];
+    omitted.readEvidence = () => evidence;
+    // Whatever the planner does with an omitted flag, it must never dispatch the known no-op red-team job.
+    expect(planRedTeamOnSkip(omitted)[0].action).not.toBe('dispatch');
+  });
+
   it('clears pending for a judge-accepted head whose red team already finished not-owed (#6438 live state)', () => {
     const f = storedFixture(); const rev = storedHead;
     f.rawPrs[0].labels = ['ready-to-merge', 'review:accepted', 'red-team:pending'];
