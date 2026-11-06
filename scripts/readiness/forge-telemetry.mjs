@@ -7,10 +7,17 @@ export {parseTelemetry, formatTelemetry};
 
 export async function readForgeTelemetry({host='forge',exec=execFile}={}) {
   if(!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host))throw new Error('Invalid host');
-  const output=await new Promise((resolve,reject)=>exec('ssh',[
+  const output=await new Promise((resolve,reject)=>{
+    const child=exec('ssh',[
     '-o','BatchMode=yes','-o','ConnectTimeout=5',host,
     'sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs telemetry',
-  ],{encoding:'utf8',maxBuffer:65536,timeout:8000},(error,stdout)=>error?reject(new Error('forge-unreachable')):resolve(stdout)));
+  ],{encoding:'utf8',maxBuffer:65536,timeout:8000},(error,stdout)=>error?reject(new Error('forge-unreachable')):resolve(stdout));
+    // The command/argv stays legacy-compatible. Old runners ignore the stdin envelope.
+    if (child?.stdin) {
+      child.stdin.on('error',()=>{}); // an old runner may close stdin before reading it
+      child.stdin.end(JSON.stringify({capabilities:{limits:1}}));
+    }
+  });
   return parseTelemetry(output);
 }
 export async function main(args,{read=readForgeTelemetry,write=text=>process.stdout.write(text)}={}) {

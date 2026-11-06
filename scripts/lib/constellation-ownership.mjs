@@ -97,7 +97,8 @@ export function totals(files, readContent = readTracked) {
     const entry = result[destination];
     entry.files++;
     if (content.includes(0)) continue;
-    for (const byte of content) if (byte === 10) entry.lines++;
+    // indexOf is native; a per-byte JS loop over the whole tree made the classify CLI test slow (2.4s idle, 15s timeouts under load, PRs 6419/6426).
+    for (let at = content.indexOf(10); at !== -1; at = content.indexOf(10, at + 1)) entry.lines++;
     if (content.length && content[content.length - 1] !== 10) entry.lines++;
   }
   return result;
