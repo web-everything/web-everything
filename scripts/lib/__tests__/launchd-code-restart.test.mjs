@@ -801,6 +801,118 @@ describe('interpreter option shapes that once hid a clone script (value contains
     const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/sudo', './bin/sampler'], WorkingDirectory: cloneRoot }]);
     expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
   });
+  const cloneScript = join(cloneRoot, 'x.mjs');
+  it.each([
+    ['double quotes', ['/usr/bin/env', '-S', `"${outside}" "${cloneScript}"`]],
+    ['single quotes', ['/usr/bin/env', '-S', `'${outside}' '${cloneScript}'`]],
+    ['mixed with assignment', ['/usr/bin/env', '-S', `A="b c" "${outside}" "${cloneScript}"`]],
+    ['escaped space in the script path', ['/usr/bin/env', '-S', `${outside} ${cloneScript.replace(/ /g, '\\ ')} --flag "x y"`]],
+    ['attached -S with quotes', ['/usr/bin/env', `-S"${outside}" "${cloneScript}"`]],
+    ['quoted whole command', ['/usr/bin/env', '-S', `"${outside}"   "${cloneScript}"`]],
+  ])('quoted env -S string is discovered, restarted and flagged stale: %s', async (_name, ProgramArguments) => {
+    const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments }]);
+    expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
+    expect((await restartServicesForClone(o)).restarted).toHaveLength(1);
+    expect(findStaleCodeServices({ ...o, readProcessStartMs: () => 100_000, readAdoptedAtMs: () => 200_000 })).toHaveLength(1);
+  });
+  it('quoted env -S string running an unrelated script is not claimed', () => {
+    const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/env', '-S', `"${outside}" "${other}" "${join(cloneRoot, 'data')}"`] }]);
+    expect(findServicesRunningFromClone(o).matches).toEqual([]);
+  });
+  it.each(['"unterminated', "'unterminated", 'trailing\\'])('unparsable env -S string %s is flagged unreadable, never silently excluded', value => {
+    const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/env', '-S', `${outside} ${cloneScript} ${value}`] }]);
+    const result = findServicesRunningFromClone(o);
+    expect(result.matches).toEqual([]);
+    expect(result.unreadable[0].error).toMatch(/Unsupported env -S string/);
+  });
+  it.each([
+    ['direct argv', [join(cloneRoot, 'node_modules', '.bin', 'next'), 'dev']],
+    ['env -S next dev', ['/usr/bin/env', '-S', `"${outside}" "${join(cloneRoot, 'node_modules', '.bin', 'next')}" dev`]],
+    ['env -S quoted vite', ['/usr/bin/env', '-S', `"${outside}" "${join(cloneRoot, 'node_modules', '.bin', 'vite')}"`]],
+  ])('dev-server exclusion sees the effective argv: %s is skipped, not kickstarted or flagged stale', async (_name, ProgramArguments) => {
+    const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments }]);
+    expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
+    const r = await restartServicesForClone(o);
+    expect(r.restarted).toEqual([]);
+    expect(r.skipped).toEqual([expect.objectContaining({ reason: 'built-in-never' })]);
+    expect(o.launchctl).not.toHaveBeenCalled();
+    expect(findStaleCodeServices({ ...o, readProcessStartMs: () => 100_000, readAdoptedAtMs: () => 200_000 })).toEqual([]);
+  });
+  describe('restart deferred by the cooldown is owed to a later tick', () => {
+    const label = 'com.we.resource-sampler';
+    function cooled(clock) {
+      const o = fixture(); const states = new Map();
+      o.stateStore = { get: l => states.get(l), set: (l, v) => { states.set(l, v); },
+        pending: () => [...states].filter(([, v]) => v.pendingSha).map(([l, v]) => ({ label: l, ...v })) };
+      o.now = () => clock.t;
+      return Object.assign(o, { states });
+    }
+    it('adopt A, adopt B within cooldown, a later tick after cooldown restarts for B', async () => {
+      const clock = { t: 1_000_000 }, o = cooled(clock);
+      expect((await restartServicesForClone({ ...o, adoptedSha: 'A' })).restarted).toHaveLength(1);
+      clock.t += 60_000;
+      const second = await restartServicesForClone({ ...o, adoptedSha: 'B' });
+      expect(second.skipped).toEqual([expect.objectContaining({ reason: 'debounced' })]);
+      expect(o.states.get(label)).toMatchObject({ sha: 'A', pendingSha: 'B' });
+      // A later tick inside the cooldown does nothing and stays quiet.
+      clock.t += 60_000;
+      const early = await restartServicesForClone({ ...o, pendingOnly: true });
+      expect(early).toEqual({ restarted: [], skipped: [], flagged: [], errors: [] });
+      expect(o.launchctl).toHaveBeenCalledTimes(1);
+      // After the cooldown the owed restart runs once and the owed marker is cleared.
+      clock.t += 600_000;
+      const late = await restartServicesForClone({ ...o, pendingOnly: true });
+      expect(late.restarted).toHaveLength(1);
+      expect(o.launchctl).toHaveBeenCalledTimes(2);
+      expect(o.states.get(label)).toEqual({ at: clock.t, sha: 'B' });
+      expect((await restartServicesForClone({ ...o, pendingOnly: true })).restarted).toEqual([]);
+      expect(o.launchctl).toHaveBeenCalledTimes(2);
+    });
+    it('nothing owed means no plist scan on a later tick', async () => {
+      const clock = { t: 1_000_000 }, o = cooled(clock); o.listPlists = vi.fn(o.listPlists);
+      await restartServicesForClone({ ...o, pendingOnly: true });
+      expect(o.listPlists).not.toHaveBeenCalled();
+    });
+    it('a newer adoption replaces the owed sha', async () => {
+      const clock = { t: 1_000_000 }, o = cooled(clock);
+      await restartServicesForClone({ ...o, adoptedSha: 'A' });
+      clock.t += 1000; await restartServicesForClone({ ...o, adoptedSha: 'B' });
+      clock.t += 1000; await restartServicesForClone({ ...o, adoptedSha: 'C' });
+      expect(o.states.get(label)).toMatchObject({ sha: 'A', pendingSha: 'C' });
+    });
+    it('an owed label that is no longer clone-backed is cleared instead of retried forever', async () => {
+      const clock = { t: 1_000_000 }, o = cooled(clock);
+      await restartServicesForClone({ ...o, adoptedSha: 'A' });
+      clock.t += 1000; await restartServicesForClone({ ...o, adoptedSha: 'B' });
+      o.listPlists = () => []; clock.t += 600_000;
+      await restartServicesForClone({ ...o, pendingOnly: true });
+      expect(o.states.get(label)).toEqual({ at: 1_000_000, sha: 'A' });
+      expect(o.launchctl).toHaveBeenCalledTimes(1);
+    });
+    it('an unreadable scan does not clear an owed restart', async () => {
+      const clock = { t: 1_000_000 }, o = cooled(clock);
+      await restartServicesForClone({ ...o, adoptedSha: 'A' });
+      clock.t += 1000; await restartServicesForClone({ ...o, adoptedSha: 'B' });
+      o.listPlists = () => { throw new Error('EACCES'); }; clock.t += 600_000;
+      await restartServicesForClone({ ...o, pendingOnly: true });
+      expect(o.states.get(label)).toMatchObject({ pendingSha: 'B' });
+    });
+    it('withSelfSync retries owed restarts on a non-adopting tick and not on an adopting one', async () => {
+      const retry = vi.fn(async () => {}), restart = vi.fn(async () => {});
+      const make = result => withSelfSync({ tickOnce: () => 'ticked' }, {
+        root: cloneRoot, env: {}, versions: null, background: null, onRestart: () => 'restarted', rebuild: async () => result,
+        restartServices: restart, retryPendingRestarts: retry, readHead: () => 'boot', readOriginRef: () => null,
+        readState: () => ({}), readReady: () => null, cloneIdentity: () => null, acquireRead: () => ({ ok: true }),
+        releaseRead: () => {}, importClosure: () => new Set(), diffFiles: () => [], log: { error: vi.fn() } });
+      await make({ moved: false }).tickOnce();
+      expect(retry).toHaveBeenCalledWith(expect.objectContaining({ pendingOnly: true, cloneRoot }));
+      expect(restart).not.toHaveBeenCalled();
+      retry.mockClear();
+      await make({ moved: true, adopted: true, head: 'new' }).tickOnce();
+      expect(restart).toHaveBeenCalledWith(expect.objectContaining({ adoptedSha: 'new' }));
+      expect(retry).not.toHaveBeenCalled();
+    });
+  });
   it('an unclassifiable wrapper option resumes at the interpreter, so the clone script is matched', () => {
     const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/env', '--mystery', outside, join(cloneRoot, 'sampler.mjs')] }]);
     expect(findServicesRunningFromClone(o)).toMatchObject({ matches: [{ label: 'com.we.resource-sampler' }], unreadable: [] });

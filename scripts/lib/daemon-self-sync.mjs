@@ -676,7 +676,7 @@ export function recloneConcluded(result, marker, headNow, { asJob } = {}) {
 export function withSelfSync(effects, {
   root, onRestart, sync = selfSyncCheckout, syncPoc = selfSyncCheckoutPoc, base = 'main', pocBranch, env = process.env,
   log = console, timeoutMs, readHead = readHeadSha, readOriginRef = readOriginRefSha, hasStaleRefusal, gate = gateMergedCommit,
-  mainOnly = false, rebuild: rebuildOpt, restartServices: restartServicesOpt, restartServicesTimeoutMs, acquireRead = acquireReadLock, releaseRead = releaseReadLock, readState = readRebuildState,
+  mainOnly = false, rebuild: rebuildOpt, restartServices: restartServicesOpt, retryPendingRestarts: retryPendingOpt, restartServicesTimeoutMs, acquireRead = acquireReadLock, releaseRead = releaseReadLock, readState = readRebuildState,
   readReady = readReadyCandidate, maxAdoptWaitTicks: maxAdoptWaitTicksOpt,
   entries = [process.argv[1]], diffFiles = changedFilesBetween, importClosure = collectImportClosure,
   minRestartIntervalMs = resolveRestartMinIntervalMs(env), now = Date.now,
@@ -714,28 +714,33 @@ export function withSelfSync(effects, {
   const restartError = error => {
     try { log.error?.(`daemon-self-sync: service restart failed: ${String(error?.message ?? error)}`); } catch { /* best effort */ }
   };
+  // A restart the cooldown deferred is owed to a LATER tick (the adopter exits right after adoption). Only the
+  // real launchd restart retries; an injected hook (hermetic tests) is never called on non-adopting ticks.
+  const retryPendingRestarts = retryPendingOpt ?? (realIo && restartServicesOpt === undefined ? restartServicesForClone : null);
+  const runRestart = async (fn, extra) => {
+    const controller = new AbortController();
+    let timer;
+    try {
+      // Finish sibling kickstarts before onRestart can exit this adopter. The timeout
+      // releases a hung inspection; cancellation prevents late kicks after that bound.
+      await Promise.race([
+        Promise.resolve().then(() => fn({ cloneRoot: root,
+          selfLabel: env.XPC_SERVICE_NAME || env.LAUNCH_JOB_LABEL || null,
+          env, log, signal: controller.signal, ...extra })),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            controller.abort();
+            reject(new Error(`timed out after ${restartWaitMs}ms (source ${restartWaitMs === restartServicesTimeoutMs ? 'option' : 'standard'}); inspect LaunchAgents and restart approved samplers manually`));
+          }, restartWaitMs);
+        }),
+      ]);
+    } catch (error) { restartError(error); }
+    finally { clearTimeout(timer); }
+  };
   const rebuild = async (...args) => {
     const result = await rebuildImpl(...args);
-    if (result?.moved && result?.adopted) {
-      const controller = new AbortController();
-      let timer;
-      try {
-        // Finish sibling kickstarts before onRestart can exit this adopter. The timeout
-        // releases a hung inspection; cancellation prevents late kicks after that bound.
-        await Promise.race([
-          Promise.resolve().then(() => restartServices({ cloneRoot: root,
-            selfLabel: env.XPC_SERVICE_NAME || env.LAUNCH_JOB_LABEL || null,
-            adoptedSha: result.head, env, log, signal: controller.signal })),
-          new Promise((_, reject) => {
-            timer = setTimeout(() => {
-              controller.abort();
-              reject(new Error(`timed out after ${restartWaitMs}ms (source ${restartWaitMs === restartServicesTimeoutMs ? 'option' : 'standard'}); inspect LaunchAgents and restart approved samplers manually`));
-            }, restartWaitMs);
-          }),
-        ]);
-      } catch (error) { restartError(error); }
-      finally { clearTimeout(timer); }
-    }
+    if (result?.moved && result?.adopted) await runRestart(restartServices, { adoptedSha: result.head });
+    else if (retryPendingRestarts) await runRestart(retryPendingRestarts, { pendingOnly: true });
     return result;
   };
   const bg = background === undefined

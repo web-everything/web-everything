@@ -41,6 +41,28 @@ const WRAPPERS = /^(?:env|nohup|exec|command|time|nice|arch|caffeinate)$/;
 const LOOSE_WRAPPERS = /^(?:taskpolicy|sudo|xcrun|timeout|gtimeout|sandbox-exec|setsid|chroot|runuser|doas|stdbuf|ionice|chrt)$/;
 const isCommand = arg => { const n = basename(arg).toLowerCase(); return INTERPRETER.test(n) || WRAPPERS.test(n) || LOOSE_WRAPPERS.test(n); };
 const MAX_WRAPPER_DEPTH = 16;
+// Shell-style split for `env -S`: whitespace separates, single quotes are literal, double quotes honour
+// \" \\ \$ \` escapes, a backslash outside quotes escapes the next character. null = unparsable.
+function shellSplit(value) {
+  const tokens = []; let cur = '', has = false, quote = null;
+  for (let i = 0; i < value.length; i += 1) {
+    const c = value[i];
+    if (quote === "'") { if (c === "'") quote = null; else cur += c; continue; }
+    if (quote === '"') {
+      if (c === '"') quote = null;
+      else if (c === '\\' && i + 1 < value.length && '"\\$`'.includes(value[i + 1])) { cur += value[i + 1]; i += 1; }
+      else cur += c;
+      continue;
+    }
+    if (/\s/.test(c)) { if (has) { tokens.push(cur); cur = ''; has = false; } continue; }
+    if (c === "'" || c === '"') { quote = c; has = true; continue; }
+    if (c === '\\') { if (i + 1 >= value.length) return null; cur += value[i + 1]; i += 1; has = true; continue; }
+    cur += c; has = true;
+  }
+  if (quote) return null;
+  if (has) tokens.push(cur);
+  return tokens;
+}
 // A wrapper option we cannot classify may carry an operand, so the program position is unknown.
 // Resume at the next argument that names an interpreter or another wrapper; failing that, report
 // the option as unknown with an UNBOUNDED scan (`wide`): the 2-operand window used for interpreter
@@ -93,7 +115,10 @@ function unwrap(args, start, cwd, depth) {
       const attached = /^-S./.test(arg) ? arg.slice(2) : arg.startsWith('--split-string=') ? arg.slice(15) : null;
       const value = attached ?? a[i + 1];
       if (value === undefined) return unknown(i);
-      a = [...a.slice(0, i), ...value.split(/\s+/).filter(Boolean), ...a.slice(i + (attached === null ? 2 : 1))];
+      const tokens = shellSplit(value);
+      // An unparsable string (unterminated quote, trailing backslash) hides what runs: surface it, never skip it.
+      if (tokens === null) throw new Error(`Unsupported env -S string (unterminated quote or escape): cannot tell whether the service runs code from the clone`);
+      a = [...a.slice(0, i), ...tokens, ...a.slice(i + (attached === null ? 2 : 1))];
       continue;
     }
     if (name === 'env' && (arg === '-u' || arg === '--unset')) { i += 2; continue; }
@@ -223,7 +248,9 @@ function parsePlist(p, { selfLabel, plistPath }) {
   // Bare executables, flags and relative paths belong to the service's context,
   // not this process's cwd. Only absolute/home-relative paths, or paths resolved against
   // the service's own explicit WorkingDirectory, prove ownership.
-  return { label: p.Label, plistPath, args, unknownOption: unknownAt === null ? null : effective[unknownAt],
+  // The policy check (dev servers) must see the EFFECTIVE argv: `env -S "node .../next dev"` is one string in
+  // the plist, so the original args alone would let a dev server through as a restartable sampler.
+  return { label: p.Label, plistPath, args: [...new Set([...args, ...effective])], unknownOption: unknownAt === null ? null : effective[unknownAt],
     paths: owners.filter(isPathArg).map(expand),
     // After an unknown interpreter option the script is the first non-option argument, or the second
     // when that option consumed an operand; later arguments are script data, not code. After an
@@ -319,6 +346,23 @@ const diskState = {
     await fsAsync.mkdir(join(homedir(), '.claude', 'launchd-code-restart'), { recursive: true });
     await fsAsync.writeFile(temp, JSON.stringify(value)); await fsAsync.rename(temp, path);
   },
+  // Labels whose restart was skipped by the cooldown and still owed: [{ label, at, sha, pendingSha }].
+  // Cheap (one small directory listing) so every tick can ask; unreadable entries are ignored here and
+  // surface through the normal `get` path when that label is next adopted.
+  async pending() {
+    const dir = join(homedir(), '.claude', 'launchd-code-restart');
+    let files;
+    try { files = await fsAsync.readdir(dir); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
+    const out = [];
+    for (const file of files) {
+      if (!file.endsWith('.json')) continue;
+      try {
+        const state = JSON.parse(await fsAsync.readFile(join(dir, file), 'utf8'));
+        if (typeof state?.pendingSha === 'string' && state.pendingSha) out.push({ label: decodeURIComponent(file.slice(0, -5)), ...state });
+      } catch { /* not a pending marker we can read */ }
+    }
+    return out;
+  },
 };
 // Use the shared lock identity/entry format, with async exclusive mkdir so a slow
 // filesystem cannot block the adopter's timeout. Never steal or expire a held lock:
@@ -366,24 +410,41 @@ const neverRestartReason = (label, args, p) =>
 
 export async function restartServicesForClone({ settings, platform, env = process.env, envValues,
   launchctl = launchHost, uid = userId, log = console, now = Date.now, stateStore = diskState, lockStore = diskLocks,
-  adoptedSha, signal, ...options } = {}) {
+  adoptedSha: adoptedShaOpt, signal, pendingOnly = false, ...options } = {}) {
   const result = { restarted: [], skipped: [], flagged: [], errors: [] };
   let source = 'unresolved';
+  let adoptedSha = adoptedShaOpt;
+  // pendingOnly (later ticks): retry only the labels whose restart a cooldown deferred. Each owes the sha it
+  // was deferred for; nothing is scanned when none is owed, and a label that no longer qualifies is cleared.
+  let owed = null;
+  const settle = async (label, previous) => { await stateStore.set(label, { at: previous.at, sha: previous.sha }); };
   const report = (kind, service, reason) => {
     const entry = { ...service, reason };
     result[kind].push(entry);
     safeLog(log, `daemon.serviceRestart ${kind} ${service.label ?? service.plistPath ?? '?'}: ${reason} (source ${source})`);
   };
   try {
+    if (pendingOnly) {
+      owed = new Map(((await stateStore.pending?.()) ?? []).map(x => [x.label, x]));
+      if (!owed.size) return result;
+    }
     const policy = resolveRestartPolicy({ settings, platform, env, envValues, log });
     source = JSON.stringify({ values: policy.value, sources: policy.sources });
     const { matches, unreadable } = await scanAsync({ ...options, signal });
-    for (const bad of unreadable) report('flagged', bad, 'plist-unreadable: inspect and repair plist before restarting');
+    if (!pendingOnly) for (const bad of unreadable) report('flagged', bad, 'plist-unreadable: inspect and repair plist before restarting');
     const p = policy.value;
+    const seen = new Set();
     for (const { args, ...service } of matches) {
       const { label } = service;
+      if (owed && !owed.has(label)) continue;
+      seen.add(label);
+      // A deferred restart owes the sha it was deferred for, not the (possibly absent) current adoption.
+      if (owed) adoptedSha = owed.get(label).pendingSha;
       let reason = !p.enabled ? 'disabled' : neverRestartReason(label, args, p);
-      if (reason) { report('skipped', service, reason); continue; }
+      if (reason) {
+        if (owed) { try { await settle(label, owed.get(label)); } catch (error) { report('errors', service, message(error)); } continue; }
+        report('skipped', service, reason); continue;
+      }
       if (inFlight.has(label)) { report('skipped', service, 'restart-in-flight'); continue; }
       inFlight.add(label);
       let phase = 'lock', releaseLock;
@@ -391,6 +452,7 @@ export async function restartServicesForClone({ settings, platform, env = proces
         assertActive(signal);
         releaseLock = await lockStore.acquire(label);
         if (releaseLock === null) {
+          if (owed) continue; // still owed; the next tick retries without repeating the lock alarm
           report('skipped', service, 'restart-lock-held');
           report('flagged', service, 'restart-lock-held: inspect the lock owner if contention persists; remove an abandoned marker only after confirming its owner exited');
           continue;
@@ -407,7 +469,18 @@ export async function restartServicesForClone({ settings, platform, env = proces
         if (typeof adoptedSha !== 'string' || !adoptedSha.trim()) throw new Error('unknown adopted sha: inspect rebuild state');
         reason = previous && adoptedSha && previous.sha === adoptedSha ? 'same-adopted-sha'
           : previous && at - previous.at < p.minIntervalMs ? 'debounced' : null;
-        if (reason) { report('skipped', service, reason); continue; }
+        if (reason === 'debounced') {
+          // Remember the restart we owe: a later tick retries it once the cooldown has passed.
+          // A newer adoption simply replaces the owed sha; a successful restart clears it.
+          if (!owed) await stateStore.set(label, { ...previous, pendingSha: adoptedSha });
+          if (!owed) report('skipped', service, reason);
+          continue;
+        }
+        if (reason) {
+          if (owed) await settle(label, previous);
+          else report('skipped', service, reason);
+          continue;
+        }
         const id = typeof uid === 'function' ? uid() : uid;
         if (!Number.isInteger(id) || id < 0) throw new Error('unreadable uid');
         // Record intent BEFORE kickstart: process death or launchctl failure must not
@@ -433,6 +506,11 @@ export async function restartServicesForClone({ settings, platform, env = proces
         }
         inFlight.delete(label);
       }
+    }
+    // An owed label whose plist is gone (or no longer clone-backed) has nothing to restart: stop retrying it.
+    // Unreadable plists could be the owed service, so absence only counts as evidence on a clean scan.
+    if (owed && unreadable.length === 0) for (const [label, state] of owed) {
+      if (!seen.has(label)) { try { await settle(label, state); } catch (error) { report('errors', { label }, message(error)); } }
     }
   } catch (error) { report('errors', {}, message(error)); }
   return result;
