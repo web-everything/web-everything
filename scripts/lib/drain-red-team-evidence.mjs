@@ -89,8 +89,13 @@ const blocksSettlement = run => hasOpenEffect(run) || (Boolean(run.verdict) && !
 // size it was read at, so a settle attempt that keeps holding does not re-parse the whole store every tick; a rewrite
 // changes mtime or size and replaces the entry (bounded by the number of records, not by the number of rewrites).
 const summaryCache = new WeakMap();
-const summarizeRun = run => ({ review: run?.op === 'review-pr', repo: run?.input?.repo, pr: Number(run?.input?.pr),
-  rev: typeof run?.findings?.read?.netBasis?.rev === 'string' ? run.findings.read.netBasis.rev.toLowerCase() : null, blocks: blocksSettlement(run) });
+// Identity fields are normalised strictly: a PR number is a positive integer or a digit string (never null, '' or
+// false, which Number() turns into 0); a head that is not a clean 40-hex sha reads as unknown (null), which matches
+// every head, so a blocking record with a damaged head still holds; repo names compare case-insensitively.
+const strictPr = value => (Number.isSafeInteger(value) && value > 0 ? value : typeof value === 'string' && /^[1-9]\d*$/.test(value.trim()) ? Number(value.trim()) : NaN);
+const cleanRev = value => (typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value) ? value.toLowerCase() : null);
+const summarizeRun = run => ({ review: run?.op === 'review-pr', repo: typeof run?.input?.repo === 'string' ? run.input.repo.trim().toLowerCase() : undefined,
+  pr: strictPr(run?.input?.pr), rev: cleanRev(run?.findings?.read?.netBasis?.rev), blocks: blocksSettlement(run) });
 // R622: settlement needs a COMPLETE same-PR, same-head read. Run ids carry no PR, so this parses every review-pr
 // record (no parse cap: the bounded scan cannot vouch for what it did not read) and keeps only the summary. Any
 // record of this PR whose head is this head, or whose head cannot be read, that blocks settlement holds; any record
@@ -99,7 +104,9 @@ function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat }) {
   const incomplete = { complete: false, blocked: false };
   try {
     const cache = summaryCache.get(read) ?? summaryCache.set(read, new Map()).get(read);
-    const want = String(head).toLowerCase();
+    const want = String(head).toLowerCase(), wantRepo = String(repo).trim().toLowerCase();
+    // Same id universe as the bounded scan and every other review-run reader: the `review-pr-` id minted for the op.
+    // A review run given another id by `--run-id` is invisible to all of them before settlement is ever asked.
     for (const id of list(runsDir).filter(id => id.startsWith('review-pr-'))) {
       const st = stat(join(runsDir, `${id}.json`));
       if (!Number.isFinite(st?.mtimeMs)) return incomplete;
@@ -111,8 +118,8 @@ function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat }) {
       }
       const s = hit.summary;
       if (!s.review) continue;
-      if (typeof s.repo !== 'string' || !Number.isFinite(s.pr)) return incomplete;
-      if (s.repo !== repo || s.pr !== Number(pr)) continue;
+      if (typeof s.repo !== 'string' || !s.repo || !Number.isFinite(s.pr)) return incomplete;
+      if (s.repo !== wantRepo || s.pr !== Number(pr)) continue;
       if ((s.rev === null || s.rev === want) && s.blocks) return { complete: true, blocked: true };
     }
     return { complete: true, blocked: false };

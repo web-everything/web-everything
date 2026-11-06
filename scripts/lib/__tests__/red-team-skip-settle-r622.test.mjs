@@ -392,4 +392,24 @@ describe('R622 settlement needs a COMPLETE same-PR, same-head read, whatever the
     runs['review-pr-hidden'] = { mtime: HIDDEN + 2, run: rec({ verdict: { verdict: 'accept' } }) };
     expect(settle(read(runs, 2, reads))).toMatchObject({ ok: true }); // the entry was replaced, not appended: clean again
   });
+  // Identity variants of the same defect class: an unread blocking record that the complete read must still attribute.
+  const reject = { verdict: { verdict: 'changes' }, ...open };
+  const heldBy = hidden => settle(read(windowed(hidden), 2));
+  it('an unread review-pr- record whose op is not review-pr is ignored', () => {
+    expect(heldBy({ op: 'file-item', input: { repo: 'o/r', pr }, ...reject })).toMatchObject({ ok: true });
+  });
+  it('an unread rejection whose PR number is null, empty, false, zero or a non-numeric string keeps the hold', () => {
+    for (const bad of [null, '', false, 0, 'x', [], {}, -1, 1.5]) {
+      expect(heldBy({ ...rec(reject), input: { repo: 'o/r', pr: bad } })).toMatchObject({ ok: false, reason: 'scan-capped' });
+    }
+    expect(heldBy(rec({ prNum: String(pr), ...reject }))).toMatchObject({ ok: false, reason: 'scan-capped' }); // a digit string is still this PR
+  });
+  it('an unread rejection with a damaged head matches every head, and a repo written in another case is still this repo', () => {
+    for (const rev of ['', ` ${head}`, head.slice(0, 7), 'zz'.repeat(20), 42, null]) {
+      expect(heldBy(rec({ rev, ...reject }))).toMatchObject({ ok: false, reason: 'scan-capped' });
+    }
+    expect(heldBy(rec({ rev: head.toUpperCase(), ...reject }))).toMatchObject({ ok: false, reason: 'scan-capped' });
+    expect(heldBy(rec({ repo: ' O/R ', ...reject }))).toMatchObject({ ok: false, reason: 'scan-capped' });
+    expect(heldBy(rec({ repo: 'o/other', ...reject }))).toMatchObject({ ok: true }); // a genuinely different repo is still ignored
+  });
 });
