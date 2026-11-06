@@ -239,6 +239,8 @@ describe('R618 operator send-back route hands the fixer the whole request', () =
     const long = sendBack({ body: `${sendBack().body}\n\n${'x'.repeat(4200)}\n${tail}` });
     const [fix] = run(held([advisory(HEAD), long])).dispatch;
     expect(fix).toEqual(expect.objectContaining({ kind: 'fix', mode: 'operator-send-back' }));
-    expect(JSON.stringify(fix)).toContain(tail);
+    // Pin the exact field the fixer brief reads: `base` also carries fullBody, so a whole-object check could pass on the truncated route.
+    expect(fix.operatorSendBack.body).toContain(tail);
+    expect(fix.operatorSendBack.body.length).toBeGreaterThan(4100);
   });
 });

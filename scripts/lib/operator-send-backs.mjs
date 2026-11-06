@@ -14,9 +14,12 @@ const stripComments = text => {
  */
 function stripHtmlBlocks(text) {
   const source = String(text ?? '');
-  const tag = /<(\/?)(blockquote|pre)\b/gi;
+  // Tags are located in a same-length copy with inline code blanked (`<pre>` in prose is not a block), and only a
+  // whole tag name counts: `<pre-commit>` or `<blockquote styling` must not hide a real marker.
+  const scan = source.replace(/(`+)[^\n]*?\1/g, span => span.replace(/[^\n]/g, ' '));
+  const tag = /<(\/?)(blockquote|pre)(?:\s[^<>]*)?\/?>/gi;
   let out = '', last = 0, depth = 0, start = 0, m;
-  while ((m = tag.exec(source))) {
+  while ((m = tag.exec(scan))) {
     if (!m[1]) {
       if (!depth) start = m.index;
       depth++;
@@ -44,12 +47,13 @@ const QUOTE_LINE = new RegExp(`^${CONTAINER}(?:>|&gt;)`);
 const COMMENT_LINE = /^[ \t]*<!--/;
 function stripQuoted(text) {
   const out = [];
-  let fence = null, quoting = false;
+  let fence = null, fenceIndent = 0, quoting = false;
   // HTML quote and preformatted blocks render as quoted/code text; an unterminated one runs to the end.
   const source = stripHtmlBlocks(text);
   for (const line of source.split(/\r\n?|\n/)) {
     if (fence) {
-      const close = /^[ \t]*(`{3,}|~{3,})[ \t]*$/.exec(line);
+      // CommonMark: a closing fence is indented at most 3 columns past its opener; deeper is content.
+      const close = new RegExp(`^[ \\t]{0,${fenceIndent + 3}}(\`{3,}|~{3,})[ \\t]*$`).exec(line);
       if (close && close[1][0] === fence[0] && close[1].length >= fence.length) fence = null;
       out.push('');
       continue;
@@ -58,6 +62,7 @@ function stripQuoted(text) {
     // A backtick fence's info string cannot contain a backtick (that is inline code, not a fence).
     if (open && !(open[1][0] === '`' && open[2].includes('`'))) {
       fence = open[1];
+      fenceIndent = line.indexOf(open[1]);
       quoting = false;
       out.push('');
     } else if (QUOTE_LINE.test(line) || (quoting && line.trim() && !COMMENT_LINE.test(line))) {

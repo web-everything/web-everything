@@ -354,4 +354,23 @@ describe('quoted and fenced references never resolve an operator request', () =>
     expect(item.body).not.toContain(tail);
     expect(item.fullBody).toContain(tail);
   });
+  it.each([
+    ['inline-code <pre>', 'Updated `<pre>` rendering.'],
+    ['inline-code <blockquote>', 'Changed `<blockquote>` css.'],
+    ['<pre-commit> hook', 'Ran the <pre-commit> hook.'],
+    ['unclosed <blockquote styling', 'fixed the <blockquote styling'],
+  ])('%s in a fix-end does not hide its real marker', (_name, prose) => {
+    const body = `${release}${prose}\n<!-- addresses-operator-send-back: 1001 -->\n`;
+    expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual([]);
+  });
+  it('a real <pre> block still hides a marker example', () => {
+    const body = `${release}<pre>\n<!-- addresses-operator-send-back: 1001 -->\n</pre>\n`;
+    expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual(['1001']);
+  });
+  it('a closing fence indented four or more spaces is content, so the example stays hidden', () => {
+    const body = `${release}\`\`\`\n    \`\`\`\n<!-- addresses-operator-send-back: 1001 -->\n`;
+    expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual(['1001']);
+    const closed = `${release}\`\`\`\n   \`\`\`\n<!-- addresses-operator-send-back: 1001 -->\n`;
+    expect(open([request, comment('end', 'web-everything', '21:00', closed)])).toEqual([]);
+  });
 });
