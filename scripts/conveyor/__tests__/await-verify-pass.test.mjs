@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { computeWorkingTreeHash } from '../../lib/verify-lane-gate.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs, laneFilterDrivers, LANE_CONFIG_LIST_ARGS, LANE_GIT_CONFIG_PINS } from '../../lib/lane-git-hardening.mjs';
 import {
-  classifyAwaitVerdict, isLoadFlakeRed, runAwaitVerifyPass, buildAwaitVerifyResumePrompt, findAwaitSession, lookupAwaitSession,
+  classifyAwaitVerdict, isTimeoutOnlyRed, isLoadFlakeRed, runAwaitVerifyPass, buildAwaitVerifyResumePrompt, findAwaitSession, lookupAwaitSession,
   formatAwaitVerifyLines, isHarnessRecord, AWAIT_VERIFY_LIMITS, pushShaFromScratch, claimBindingRefusal, isSessionBusy, defaultAwaitVerifyIo,
 } from '../await-verify-pass.mjs';
 
@@ -1157,5 +1157,118 @@ describe('verify-only infra retries', () => {
     await tick(h, T0);
     expect(h.calls.resume).toHaveLength(0);
     expect([...h.store.values()][0].pendingResume).toBeUndefined();
+  });
+});
+
+
+describe('timeout-only load recovery', () => {
+  const timeout = (over = {}) => marker('red', { redCause: 'test-timeout', failureDetails: {
+    tests: [{ file: 'a.test.mjs', name: 'slow', timeout: true }], summary: 'Error: Test timed out in 15000ms.', truncated: false,
+  }, ...over });
+  it('live shape A: third red defers, persists through ticks, then reruns at low load without spending retries', async () => {
+    const h = harness({ records: [rec({ attempt: 3, retries: 2 })] });
+    h.state.marker = timeout(); h.io.loadHigh = () => true;
+    const tick = nowMs => runAwaitVerifyPass({ io: h.io, nowMs, ttlMs: TTL, pushPolicy: { pushBeforeGate: true } });
+    expect((await tick(T0)).rows.find(row => row.action === 'load-deferred')).toMatchObject({ action: 'load-deferred', reason: expect.stringContaining('red-load-deferred') });
+    expect(h.store.get(rec().sessionId)).toMatchObject({ loadRetry: { attempts: 0, waiting: true, since: new Date(T0).toISOString() } });
+    await tick(T0 + 1);
+    expect(h.calls.resume).toEqual([]); expect(h.calls.rerequest).toEqual([]); expect(h.calls.push).toEqual([]);
+    h.io.loadHigh = () => false;
+    h.io.rerequest = () => {
+      expect(h.store.get(rec().sessionId)).toMatchObject({ retries: 2, loadRetry: { attempts: 1, waiting: false }, requestedAt: new Date(T0 + 2).toISOString() });
+      h.calls.rerequest.push('requested'); return { ok: true };
+    };
+    expect((await tick(T0 + 2)).rows.find(row => row.action === 'load-rerun')).toMatchObject({ action: 'load-rerun', reason: expect.stringContaining('red-load-shaped') });
+    expect(h.calls.rerequest).toHaveLength(1);
+  });
+  it('live shape B: exit 124 defers under load', () => {
+    expect(classify({ marker: timeout({ exitCode: 124 }), loadHigh: true })).toMatchObject({ action: 'wait', reason: 'red-load-deferred', loadDefer: 'start' });
+    expect(classify({ marker: marker('red', { exitCode: 124 }), loadHigh: true })).toMatchObject({ action: 'wait', reason: 'red-load-deferred', loadDefer: 'start' });
+  });
+  it('exit 124 with a recorded in-diff cause is a normal red, not a timeout', () => {
+    expect(classify({ marker: marker('red', { exitCode: 124, redCause: 'in-diff-failure' }), loadHigh: true })).toMatchObject({ action: 'resume', resume: 'red' });
+  });
+  it('a load deferral that outlives the wait cap (or has no start time) follows the red ladder', () => {
+    const waiting = (since) => rec({ kind: 'fix', loadRetry: { attempts: 0, waiting: true, ...(since ? { since } : {}) } });
+    const old = new Date(T0 - 3 * 60 * 60_000).toISOString();
+    expect(classify({ record: waiting(old), marker: timeout({ exitCode: 124 }), loadHigh: true })).toMatchObject({ action: 'resume', resume: 'red' });
+    expect(classify({ record: waiting(null), marker: timeout({ exitCode: 124 }), loadHigh: true })).toMatchObject({ action: 'resume', resume: 'red' });
+    expect(classify({ record: waiting(new Date(T0).toISOString()), marker: timeout({ exitCode: 124 }), loadHigh: true })).toMatchObject({ action: 'wait', reason: 'red-load-deferred' });
+  });
+  it.each([
+    ['exit 124 with a recorded assertion before timeout', timeout({ exitCode: 124, failureDetails: {
+      tests: [{ file: 'a.test.mjs', name: 'slow', timeout: true }, { file: 'b.test.mjs', name: 'assertion' }],
+      summary: 'AssertionError: expected true; Test timed out in 15000ms.', truncated: false,
+    } })],
+    ['exit 124 with a truncated timeout inventory', timeout({ exitCode: 124, failureDetails: {
+      tests: [{ file: 'a.test.mjs', name: 'slow', timeout: true }], summary: 'Test timed out in 15000ms.', truncated: true,
+    } })],
+    ['exit 124 with an empty inventory', timeout({ exitCode: 124, failureDetails: { tests: [], summary: '', truncated: false } })],
+    ['assertion under load', timeout({ redCause: 'in-diff-failure', failureDetails: { tests: [{ file: 'a.test.mjs', name: 'assertion', timeout: false }] } })],
+    ['mixed assertion and timeout', timeout({ failureDetails: { tests: [{ file: 'a.test.mjs', name: 'timeout', timeout: true }, { file: 'b.test.mjs', name: 'assertion', timeout: false }], truncated: false } })],
+    ['truncated inventory', timeout({ failureDetails: { tests: [{ file: 'a.test.mjs', name: 'timeout', timeout: true }], truncated: true } })],
+    ['empty inventory', timeout({ failureDetails: { tests: [], truncated: false } })],
+    ['legacy summary without per-test evidence', timeout({ failureDetails: { tests: [{ name: 'slow' }], summary: 'Test timed out' } })],
+    ['test timeout plus standards red', timeout({ phases: { outcomes: { standards: { result: 'fail' } } } })],
+    ['standards phase', timeout({ redCause: 'standards' })],
+    ['scan phase even with exit 124', timeout({ redCause: 'scan', exitCode: 124 })],
+  ])('%s still resumes red or escalates', (_, m) => {
+    expect(isTimeoutOnlyRed(m)).toBe(false);
+    for (const waiting of [false, true]) for (const attempt of [1, 3]) {
+      expect(classify({ marker: m, loadHigh: true, record: rec({ attempt, loadRetry: { waiting, attempts: 0 } }) }))
+        .toMatchObject({ action: 'resume', resume: attempt === 3 ? 'escalate' : 'red' });
+    }
+  });
+  it('low load at first observation and exhausted load budgets retain the red ladder', () => {
+    for (const attempt of [1, 3]) for (const over of [{ loadHigh: false }, { loadHigh: true, loadRetry: { attempts: 3, waiting: true } }]) {
+      expect(classify({ marker: timeout(), loadHigh: over.loadHigh, record: rec({ attempt, loadRetry: over.loadRetry }) }))
+        .toMatchObject({ action: 'resume', resume: attempt === 3 ? 'escalate' : 'red' });
+    }
+  });
+  it.each(['delivery', 'prepare', 'ci-heal'])('never load-defers %s', kind => {
+    expect(classify({ marker: timeout(), loadHigh: true, record: rec({ kind }) }).action).not.toBe('wait');
+  });
+  it('caps same-head load reruns at the configured bound, then escalates the third red', async () => {
+    const h = harness({ records: [rec({ attempt: 3 })] });
+    const retryPolicy = { value: { loadRetry: { maxAttempts: 2 } }, sources: { 'loadRetry.maxAttempts': 'tool' } };
+    const tick = () => runAwaitVerifyPass({ io: h.io, nowMs: T0, retryPolicy });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      h.state.marker = timeout(); h.io.loadHigh = () => true;
+      const deferred = await tick();
+      expect(deferred.rows[0].reason).toContain('verify.loadRetry.maxAttempts=2 (tool)');
+      h.io.loadHigh = () => false; await tick();
+    }
+    h.state.marker = timeout(); h.io.loadHigh = () => true;
+    const exhausted = await tick();
+    expect(h.calls.rerequest).toHaveLength(2);
+    expect(exhausted.rows[0]).toMatchObject({ action: 'resume', reason: 'red on attempt 3' });
+    expect(h.calls.resume).toHaveLength(1);
+  });
+  it('a failed defer write keeps the original state and spends no effects', async () => {
+    const h = harness(); h.state.marker = timeout(); h.io.loadHigh = () => true;
+    h.io.writeRecord = () => ({ ok: false });
+    const result = await runAwaitVerifyPass({ io: h.io, nowMs: T0 });
+    expect(result.rows[0].result).toBe('persist-failed');
+    expect(h.store.get(rec().sessionId).loadRetry).toBeUndefined();
+    expect(h.calls.resume).toEqual([]); expect(h.calls.rerequest).toEqual([]); expect(h.calls.push).toEqual([]);
+  });
+  it('a timeout-only red takes precedence over a persisted no-op hand-back', async () => {
+    const h = harness({ records: [rec({ pendingResume: { kind: 'no-new-commit' } })] });
+    h.state.marker = timeout(); h.io.loadHigh = () => true;
+    await runAwaitVerifyPass({ io: h.io, nowMs: T0 });
+    expect(h.store.get(rec().sessionId).pendingResume).toBeUndefined();
+    expect(h.store.get(rec().sessionId).loadRetry.waiting).toBe(true);
+    expect(h.calls.resume).toEqual([]);
+  });
+  it('failed persistence prevents a load rerun', async () => {
+    const h = harness({ records: [rec({ loadRetry: { attempts: 0, waiting: true } })] });
+    h.state.marker = timeout(); h.io.loadHigh = () => false; h.io.writeRecord = () => ({ ok: false });
+    await runAwaitVerifyPass({ io: h.io, nowMs: T0 });
+    expect(h.calls.rerequest).toEqual([]); expect(h.calls.resume).toEqual([]);
+  });
+  it('a throwing load probe is low load, retaining the red resume', async () => {
+    const h = harness(); h.state.marker = timeout(); h.io.loadHigh = () => { throw new Error('unknown'); };
+    await runAwaitVerifyPass({ io: h.io, nowMs: T0 });
+    expect(h.calls.resume).toHaveLength(1); expect(h.calls.rerequest).toEqual([]);
   });
 });
