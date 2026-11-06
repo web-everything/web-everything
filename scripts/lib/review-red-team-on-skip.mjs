@@ -605,7 +605,9 @@ function resultMaySynchronize(comments, pr, head) {
 function holdGuardedProvider(provider, head) {
   const refuse = state => {
     if (state?.headRefOid !== head) throw Error('head moved before settlement; label unchanged');
-    if (!Array.isArray(state?.labels) || state.labels.some(label => conflictsWithPolicyClear(label, { settlesPending: true }))) {
+    const names = Array.isArray(state?.labels) ? state.labels.map(label => (typeof label === 'string' ? label : label?.name)) : null;
+    if (!names || names.some(name => typeof name !== 'string' || !name)
+      || names.some(name => conflictsWithPolicyClear(name, { settlesPending: true }))) {
       throw Error('hold label appeared before settlement; label unchanged');
     }
   };

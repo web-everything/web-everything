@@ -1205,3 +1205,17 @@ describe('head movement at the synchronizer is refused', () => {
     expect(row.settleError).toMatch(/head moved/);
   });
 });
+
+describe('malformed label entries at the synchronizer are refused', () => {
+  it.each([{}, null, 7, { name: 5 }])('a later read containing the label entry %j never authorises the clear', bad => {
+    let reads = 0;
+    const provider = { readPrState: vi.fn(() => ({ headRefOid: head, labels: ++reads > 1 ? ['review:accepted', 'red-team:pending', bad] : ['review:accepted', 'red-team:pending'], comments: [] })),
+      readComments: vi.fn(() => []), ensureLabel: vi.fn(), setLabels: vi.fn() };
+    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: payload('accept'), recorded: false, seatRecorded: false,
+      status: { status: 'finished', result: { status: 'ran', comment: 'posted', foldedVerdict: 'accept' } } })), readIgnorableConfirms: () => [], provider });
+    o.syncLabels = input => input.provider.setLabels(repo, pr, { add: 'red-team:clear', remove: ['red-team:pending'] });
+    o.rawPrs[0].comments.push(resultComment());
+    mod.runRedTeamOnSkip(o);
+    expect(provider.setLabels).not.toHaveBeenCalled();
+  });
+});
