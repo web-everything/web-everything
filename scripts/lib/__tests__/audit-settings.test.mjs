@@ -146,6 +146,26 @@ describe('audit settings (R528)', () => {
       const badList = fromDisk(prefs('override-3.json', '{"audit":{}}'), full(), { 'delivery-platform-preferences.json': '{"audit":{"guardFloorPaths":[""]}}' });
       expect(badList.value.guardFloorPaths).toEqual(STRICT_PATHS);
     });
+    it('a later default-chain file adds to an earlier one path lists, never replaces them (PR #6381 self-review)', () => {
+      // The reader merges chain files leaf by leaf and an array is one leaf, so the operator file's list replaced the
+      // repo file's and the repo file's replaced the legacy file's: protected paths vanished with no warning.
+      const chain = { 'delivery-priority-settings.json': '{"audit":{"guardFloorPaths":["legacy/**"]}}',
+        'delivery-platform-preferences.json': '{"audit":{"raceBlockPaths":["custom/**"],"guardFloorPaths":["custom/**"]}}',
+        [join('.claude', 'platform-preferences.json')]: '{"audit":{"raceBlockPaths":[],"guardFloorPaths":["op/**"]}}' };
+      const fromChain = (env = {}, read = platformRead('', chain)) => resolveAuditSettings({ fileRead: file(full()), env, platformRead: read, log: () => {} });
+      const plain = fromChain();
+      expect(plain.value.raceBlockPaths).toEqual([...GUARD_FLOOR, 'custom/**']);
+      expect(plain.value.guardFloorPaths).toEqual([...GUARD_FLOOR, 'legacy/**', 'custom/**', 'op/**']);
+      expect(plain.warnings).toEqual([]);
+      // Under an override the same holds: the override adds to every chain file's list.
+      const override = prefs('chain-override.json', '{"audit":{"raceBlockPaths":["other/**"]}}');
+      const over = fromChain({ WE_PLATFORM_PREFERENCES_FILE: override }, platformRead(override, chain));
+      expect(over.value.raceBlockPaths).toEqual([...GUARD_FLOOR, 'custom/**', 'other/**']);
+      expect(over.value.guardFloorPaths).toEqual([...GUARD_FLOOR, 'legacy/**', 'custom/**', 'op/**']);
+      // An invalid list in a chain file that a later file hides still fails closed.
+      const hidden = { ...chain, 'delivery-priority-settings.json': '{"audit":{"guardFloorPaths":[""]}}' };
+      expect(fromChain({}, platformRead('', hidden)).value.guardFloorPaths).toEqual(STRICT_PATHS);
+    });
     it('an override file may tighten the default chain single-value settings, never loosen them (PR #6381 self-review)', () => {
       const chain = { 'delivery-platform-preferences.json': '{"audit":{"recheck":{"max":0},"releaseStage":"prod","cards":{"requirePayBy":true}}}' };
       const looser = fromDisk(prefs('loose.json', '{"audit":{"recheck":{"max":3},"releaseStage":"prerelease","cards":{"requirePayBy":false}}}'), {}, chain);

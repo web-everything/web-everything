@@ -7,7 +7,8 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
-import { cascadePolicy, PLATFORM_PREFERENCES_ENV, readPlatformPreferences } from './policy-cascade.mjs';
+import { cascadePolicy, LEGACY_PLATFORM_PREFERENCES_PATHS, operatorPreferencesPath, PLATFORM_PREFERENCES_ENV, PLATFORM_PREFERENCES_PATH,
+  readPlatformPreferences } from './policy-cascade.mjs';
 
 export const AUDIT_SETTINGS_PATH = fileURLToPath(new NodeURL('../settings/codex-audit.json', import.meta.url));
 /**
@@ -366,7 +367,10 @@ function resolveUnguarded({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync,
   // stay visible: the cascade drops both and they would read as "no platform preference".
   // `chainPlat` is the default platform chain's audit preference, read only when an override replaces that chain:
   // the override may ADD protected paths, never remove the chain's (PR #6381 judge).
-  let plat = platform; let platUnreadable = false; let chainPlat;
+  // `chainFiles` is each default-chain file's own audit preference. The reader merges the chain leaf by leaf and an
+  // array is one leaf, so a later file's path list REPLACES an earlier one's; the lists are unioned per file instead,
+  // so no chain file can remove another's protected paths (PR #6381 self-review).
+  let plat = platform; let platUnreadable = false; let chainPlat; let chainFiles = [];
   if (plat === undefined) {
     try {
       // The reader skips a missing file silently. That is right for the default paths, but an EXPLICITLY configured
@@ -381,13 +385,20 @@ function resolveUnguarded({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync,
       const { prefs, errors } = readPlatformPreferences({ env: snap, readFile: platformRead, warn: () => {} });
       plat = prefs.audit;
       platUnreadable = before || configuredBad() || errors.length > 0 || (Object.hasOwn(prefs, 'audit') && prefs.audit === null);
+      // The default chain env: the override removed. Each chain file is read on its own through the same reader.
+      const chainEnv = { ...snap }; delete chainEnv[PLATFORM_PREFERENCES_ENV];
+      for (const p of [...LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH, operatorPreferencesPath(chainEnv)]) {
+        const one = readPlatformPreferences({ env: { ...chainEnv, [PLATFORM_PREFERENCES_ENV]: p }, readFile: platformRead, warn: () => {} });
+        // A file unreadable here, or one whose present `audit` is not an object, is a choice we cannot read.
+        if (one.errors.length > 0 || (Object.hasOwn(one.prefs, 'audit') && !isObj(one.prefs.audit))) platUnreadable = true;
+        if (isObj(one.prefs.audit)) chainFiles.push(one.prefs.audit);
+      }
       if (configured !== '') {
         // An explicitly configured file with no object `audit` (absent, null or not an object — a package.json, `{}`)
         // sets no audit preference, yet it replaces the whole default chain: its protected paths would vanish with no
         // warning. That is a choice we cannot read, so it fails closed (PR #6381 judge).
         if (!isObj(prefs.audit)) platUnreadable = true;
         // The default chain, read with the override removed from env, supplies path lists the override adds to.
-        const chainEnv = { ...snap }; delete chainEnv[PLATFORM_PREFERENCES_ENV];
         const chain = readPlatformPreferences({ env: chainEnv, readFile: platformRead, warn: () => {} });
         chainPlat = chain.prefs.audit;
         // Read as it would be with no override: an unreadable chain or a present non-object `audit` fails closed.
@@ -395,7 +406,7 @@ function resolveUnguarded({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync,
         // The chain's single-value settings are a floor too: the override may only tighten them (PR #6381 self-review).
         if (!platUnreadable && isObj(chainPlat)) plat = tightenToChain(plat, chainPlat);
       }
-    } catch { plat = undefined; chainPlat = undefined; platUnreadable = true; }
+    } catch { plat = undefined; chainPlat = undefined; chainFiles = []; platUnreadable = true; }
   }
   // A platform preference that is present but not an object flattens to one root leaf and reads as all-omitted.
   const platBad = platUnreadable || (plat !== undefined && plat !== null && !isObj(plat));
@@ -409,7 +420,7 @@ function resolveUnguarded({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync,
   }
   // Malformed RAW entries in any layer (raw only: the platform-level fault above is reported once, not per key). The
   // default chain read under an override counts: a malformed chain entry fails that setting closed.
-  const malformed = (key, valid) => [chainPlat, plat, tool].some(layer => rawMalformed(layer, key, valid) || caseShadowed(layer, key));
+  const malformed = (key, valid) => [...chainFiles, chainPlat, plat, tool].some(layer => rawMalformed(layer, key, valid) || caseShadowed(layer, key));
   const value = {}; const sources = {};
   for (const key of Object.keys(DEFAULTS)) {
     // The source names the layer the value came from: the cascade layers the file over the platform (PR #6381 send-back).
@@ -446,11 +457,11 @@ function resolveUnguarded({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync,
   for (const key of ['raceBlockPaths', 'guardFloorPaths']) {
     let strictest = unreadable || !cascade || platBad;
     const own = layer => (isObj(layer) ? layer[key] : undefined);
-    const layerLists = [own(chainPlat), own(plat), own(tool)].filter(l => l !== undefined);
+    const layerLists = [...chainFiles.map(own), own(chainPlat), own(plat), own(tool)].filter(l => l !== undefined);
     let platList = []; let list = [];
     if (!layerLists.every(validPaths) || malformed(key, validPaths)) { warn(`audit setting ${key} invalid; every path protected`); strictest = true; }
     else {
-      platList = [...(own(chainPlat) ?? []), ...(own(plat) ?? [])];
+      platList = [...chainFiles.flatMap(f => own(f) ?? []), ...(own(chainPlat) ?? []), ...(own(plat) ?? [])];
       list = [...platList, ...(own(tool) ?? [])];
     }
     let envList = [];
