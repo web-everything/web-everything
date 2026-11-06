@@ -339,6 +339,13 @@ describe('quoted and fenced references never resolve an operator request', () =>
     expect(open([request, comment('fix', 'web-everything', '21:00', body)])).toEqual([]);
     expect(open([request, comment('end', 'web-everything', '21:00', `${release}<!-- addresses-operator-send-back: 1001 -->\n${quote}`)])).toEqual([]);
   });
+  it('a later request that only quotes an earlier one does not carry its resolution to it', () => {
+    const later = comment('1006', 'chalbert', '22:30',
+      `🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\n> Operator send-back (human review ceremony), 2026-10-14 ~16:20 ET, at head e5ed9cb74.\n\`\`\`\n1001\n\`\`\`\nNew ask, at head ${HEAD}.`);
+    const fix = comment('1007', 'web-everything', '23:30', `## Fix evidence\nHead: \`${'c'.repeat(40)}\`\n<!-- addresses-operator-send-back: 1006 -->\nFixed.`);
+    const ids = openOperatorSendBacks(fixture({ comments: [original, later, fix] })).map(x => x.id);
+    expect(ids).toEqual(['1001']);
+  });
   it('keeps the whole body of a long request for the fixer while the brief body stays bounded', () => {
     const tail = 'REQUIRED REPAIR AFTER CHAR 4100';
     const long = comment('1001', 'chalbert', '20:07',

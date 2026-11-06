@@ -179,7 +179,8 @@ export function openOperatorSendBacks(pr) {
     const later = items[n];
     if (!resolved.has(later.index)) continue;
     for (const earlier of items.slice(0, n)) {
-      if (namesSendBack(String(comments[later.index]?.body ?? ''), earlier, { carry: true })) resolved.add(earlier.index);
+      // A quoted or fenced mention of an earlier request is context, not a carry-over of it.
+      if (namesSendBack(stripQuoted(String(comments[later.index]?.body ?? '')), earlier, { carry: true })) resolved.add(earlier.index);
     }
   }
   return items.filter(item => !resolved.has(item.index));
