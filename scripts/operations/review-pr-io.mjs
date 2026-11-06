@@ -907,6 +907,9 @@ export function createChangedLinesReader(ghJson) {
   };
 }
 
+/** Required checks that evaluate the review verdict itself, so they cannot be a precondition of publishing it. */
+const VERDICT_DEPENDENT_CHECKS = Object.freeze(['merge-gate', 'review-gate']);
+
 /**
  * THE SINKS, bound to a repo root and an output channel.
  *
@@ -998,6 +1001,11 @@ export function createReviewPrSinks({
         if (ci?.reason === 'head-changed' || (ci?.headSha && ci.headSha !== payload.reviewedHead))
           throw notApplied('review void: head moved or CI became red');
         if (ci?.allowed === true && ci.headSha === payload.reviewedHead) return;
+        // merge-gate / review-gate evaluate THIS verdict and only appear after it lands: waiting on them deadlocks the
+        // accept. Judge the rest; the merge itself still enforces them. Any other affected row keeps the hold.
+        if (ci?.reason === 'required-checks-not-successful' && ci.headSha === payload.reviewedHead
+          && Array.isArray(ci.affected) && ci.affected.length
+          && ci.affected.every(row => VERDICT_DEPENDENT_CHECKS.includes(row?.name) && ['missing', 'pending'].includes(row?.reason))) return;
         if (ci?.reason === 'ci-red') throw notApplied('review held: CI red on reviewed head; CI-heal path');
         const remaining = deadline - now();
         if (remaining <= 0) throw notApplied('review held: CI still pending on reviewed head');
