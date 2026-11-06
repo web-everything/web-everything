@@ -660,7 +660,7 @@ describe('R473 structured concurrency evidence', () => {
     it.each(['a/scripts/lib/review-independence.mjs', 'b/scripts/lib/review-independence.mjs', './a/scripts/lib/review-independence.mjs',
       'scripts/lib/review-independence.mjs:42', 'scripts/lib/review-independence.mjs:42:7', 'scripts/lib/review-independence.mjs#L42',
       'scripts/lib/review-independence.mjs#L42-L50', 'scripts/lib/review-independence.mjs ', ' scripts/lib/review-independence.mjs',
-      'scripts/lib/review-​independence.mjs', 'scripts/lib/ｒeview-independence.mjs', 'a/scripts/guard-bash.mjs:12', 'b/.claude/settings.json',
+      `scripts/lib/review-${String.fromCharCode(0x200b)}independence.mjs`, `scripts/lib/${String.fromCharCode(0xff52)}eview-independence.mjs`, 'a/scripts/guard-bash.mjs:12', 'b/.claude/settings.json',
       '`scripts/lib/review-independence.mjs`', '"scripts/lib/review-independence.mjs"', '+++ b/scripts/lib/review-independence.mjs',
       '--- a/scripts/lib/review-independence.mjs', 'i/scripts/lib/review-independence.mjs', 'w/scripts/lib/review-independence.mjs',
       'web-everything/scripts/lib/review-independence.mjs', 'a/a/scripts/lib/review-independence.mjs', 'scripts/lib/review-independence.mjs,',
