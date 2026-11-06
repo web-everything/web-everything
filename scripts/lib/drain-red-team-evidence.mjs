@@ -152,7 +152,11 @@ function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, 
         // maybe still running, or a rewound run the review loop will resume (which may still reject): holds. So does
         // a review that started at or after the settling comment (a later re-review the comment cannot answer), and one
         // whose start cannot be read, or a settle attempt that names no comment time: the chronology is strict.
-        if (s.resumed || !(now - st.mtimeMs >= ABANDONED_REVIEW_AFTER_MS) || !(s.orderAt < settleAt)) return { complete: true, blocked: true };
+        // A record with no readable start (a crash before the read step) is bounded from above by its own last write:
+        // it started no later than that, so a quiet one written (beyond the mtime slack) before the comment cannot be a
+        // later re-review, and a newer comment frees it instead of holding it forever.
+        const startedBy = Number.isFinite(s.orderAt) ? s.orderAt : st.mtimeMs + RUN_MTIME_SLACK_MS;
+        if (s.resumed || !(now - st.mtimeMs >= ABANDONED_REVIEW_AFTER_MS) || !(startedBy < settleAt)) return { complete: true, blocked: true };
         continue;
       }
       // Order only on a readable start that is not in the future. A rejection that cannot be ordered holds; an accept

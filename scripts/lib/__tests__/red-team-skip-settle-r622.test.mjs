@@ -3,7 +3,7 @@
 // unknown run evidence (review-unfinished / scan-capped). A trusted result comment bound to the exact
 // head settles those two reasons; a recorded break still sends back; missing evidence still fails closed.
 import { describe, expect, it, vi } from 'vitest';
-import { readDrainRedTeamEvidence, settleUnknownEvidenceByComment, UNREAD_SETTLE_MARGIN_MS } from '../drain-red-team-evidence.mjs';
+import { readDrainRedTeamEvidence, settleUnknownEvidenceByComment, UNREAD_SETTLE_MARGIN_MS, RUN_MTIME_SLACK_MS } from '../drain-red-team-evidence.mjs';
 import { createDrainMergeStrategy } from '../drain-merge-strategy.mjs';
 import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 
@@ -652,6 +652,13 @@ describe('R639 present-verdict check, capped-scan settlement through the complet
       it('an unreadable start (no read step) holds: it cannot be placed before the comment', () => {
         expect(settle(unread(rec({ withStart: false })))).toMatchObject({ ok: false, reason: 'scan-capped' });
         expect(settle(unread(rec({ stepTimings: [{ step: 'read', startedAt: 'garbage' }] })))).toMatchObject({ ok: false, reason: 'scan-capped' });
+      });
+      it('a quiet start-less record (crash before the read step) is bounded by its own mtime: written before the comment settles, never held forever', () => {
+        const crashed = mtime => reader({ ...decoys(T + 50 * 60e3), 'review-pr-hidden': { mtime, run: rec({ withStart: false }) } }, undefined, NOW);
+        expect(settle(crashed(T - 2 * 24 * HOUR))).toMatchObject({ ok: true, settledByComment: 'scan-capped' });
+        expect(settle(crashed(T - RUN_MTIME_SLACK_MS - HOUR))).toMatchObject({ ok: true });
+        expect(settle(crashed(T - 1000))).toMatchObject({ ok: false, reason: 'scan-capped' }); // inside the mtime slack of the comment
+        expect(settle(crashed(T + 30 * 60e3))).toMatchObject({ ok: false, reason: 'scan-capped' }); // written after the comment
       });
       it('the NEWEST trusted comment is the chronology: a review between an old and a new comment settles only on the new one', () => {
         const evidence = unread(rec(afterComment(T - 60e3)));
