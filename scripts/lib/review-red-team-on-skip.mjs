@@ -29,6 +29,10 @@ import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { RED_TEAM_STATUS_LABELS } from './red-team-status-label-meta.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
+import { readReviewRunEvidence, refusedReferralsAreRuled } from '../conveyor/review-referral-hold.mjs';
+
+// The shared reader returns reviewRunEvidence projections, not raw run records.
+const defaultReadReviewRuns = () => isUnderTest() ? [] : readReviewRunEvidence();
 
 export const staleRunDeadlineMs = (env = process.env) => /^\d+$/.test(env.WE_RED_TEAM_STALE_RUN_MS ?? '')
   && Number.isSafeInteger(Number(env.WE_RED_TEAM_STALE_RUN_MS)) ? Number(env.WE_RED_TEAM_STALE_RUN_MS) : 7_200_000;
@@ -288,7 +292,7 @@ const UNFINISHED_REVIEW_CONTEXT = 'review-unfinished: an unfinished review run h
  */
 export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, now,
   setting, lastDispatch, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions,
-  headNeverReviewed = headNeverReviewedFromRuns }) {
+  headNeverReviewed = headNeverReviewedFromRuns, readReviewRuns = defaultReadReviewRuns }) {
   return refusals.filter(r => r?.kind === 'already-reviewed-head').map(refusal => {
     const pr = Number(refusal.prNumber);
     const rawPr = (rawPrs ?? []).find(p => Number(p?.number) === pr);
@@ -422,7 +426,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         && evidence.completedRecorded !== true && evidence.cleanRecorded !== true
         && (evidence.status == null || (isRealHead(evidence.status.head) && evidence.status.head !== head))
         && readStatus({ repo, pr, head }) == null;
-      if (needsReview) {
+      const fullReviewDecision = why => {
         // R640: pending is a merge hold, and does not prevent the full review.
         const context = { labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews, settlesPending: true };
         const refusal = publishableClearGuard(context);
@@ -431,7 +435,15 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         // floor: a missing acceptance cannot establish that a review was cleared.
         if (reviews === null) return skip('PR reviews unreadable; inspect formal reviews before full review');
         if (laterReviewHold(reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
-        return dispatchDecision({ action: 'review', why: 'unprovable head move needs a full review' });
+        return dispatchDecision({ action: 'review', why });
+      };
+      if (needsReview) return fullReviewDecision('unprovable head move needs a full review');
+      if (verdict === VERDICTS.NEEDS_HUMAN && storedHead === head) {
+        let ruled = false;
+        try {
+          ruled = readReviewRuns().some(run => refusedReferralsAreRuled({ ...rawPr, number: pr }, run, { repo }));
+        } catch { /* Unknown run evidence preserves the existing not-owed decision. */ }
+        if (ruled) return fullReviewDecision('stored review needs-human only on referrals now ruled; resume the parked run');
       }
       if (!movedCardOnly && !pendingCardOnly && (!owed || accepted || finishedNotOwed)) {
         if (evidence?.inFlight || evidence?.queued) return skip('red-team pass in flight');
@@ -565,6 +577,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   env = process.env, setting,
   readEvidence = readDrainRedTeamEvidence, readStatus = readRedTeamStatus,
   readCarry = key => readRedTeamCarry({ ...key, env }),
+  readReviewRuns = isUnderTest() || isUnderTest(env) ? () => [] : readReviewRunEvidence,
   readReviews, readCompleteReviews,
   // Test defaults use the supplied fixture without external IO. Race tests inject live readers.
   provider = isUnderTest() || isUnderTest(env) ? {
@@ -623,7 +636,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       return { ...rawPr, reviews };
     });
     const planningOptions = { repo, refusals, rawPrs: planningPrs,
-      readEvidence, readStatus,
+      readEvidence, readStatus, readReviewRuns,
       now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, readWitness, headNeverReviewed,
       recoveryOptions: { now: at, probe: recoveryProbe(), deadlineMs: staleRunDeadlineMs(env) } };
     rows.push(...planRedTeamOnSkip(planningOptions));
