@@ -190,7 +190,8 @@ describe('production heavy runner failing TAP evidence', () => {
     // worker0 has one failed leaf that would pass on rerun; worker1's leaf passes but its suite
     // is red because a hook failed. The rerun must not erase the hook failure and publish.
     const f = fixture(), calls = tapRunners(f, { flaky: true, hooksFile: 'worker1.test.mjs', hooksNested });
-    await expect(job(f)).rejects.toThrow(failure);
+    // No trustworthy inventory is written, so the command failure (not the selected-tests message) surfaces.
+    await expect(job(f)).rejects.toThrow(/operator review required/);
     expect(calls).toHaveLength(1);
     expect(kinds(f)).not.toContain('overlay-main-flaky-retried');
     expect(kinds(f)).not.toContain('overlay-main-red');
