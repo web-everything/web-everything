@@ -35,7 +35,15 @@ export const GUARD_FLOOR = Object.freeze(['scripts/**/file-locks*', 'scripts/*fi
   'scripts/lib/review-independence.mjs', 'scripts/lib/marker-authorship.mjs', 'scripts/lib/ai-pr-authorship.mjs',
   'scripts/operations/build-pr-authorship.mjs', 'scripts/**/human-clearance-carry*', 'scripts/settings/*human-clearance*',
   'scripts/**/accept-carry-*', 'scripts/lib/unattended-review-accept.mjs', 'scripts/lib/trust-chain-tier.mjs',
-  'scripts/review-set-label.mjs',
+  'scripts/review-set-label.mjs', 'scripts/**/*verdict-carry*', 'scripts/**/*clear-human*', 'scripts/lib/operator-identity.mjs',
+  'scripts/lib/delegation-marker.mjs', 'scripts/lib/verdict-ledger*', 'scripts/lib/ruling-ledger.mjs', 'scripts/lib/jury-core.mjs',
+  'scripts/operations/record-verdict.mjs', 'scripts/operations/record-referral-ruling.mjs', 'scripts/operations/land-human-only.mjs',
+  'scripts/conveyor/hiccup-approve.mjs', 'scripts/settings/delivery-identity.json',
+  // Modules the clearance, carry and identity decisions import (a test pins every direct import of that family).
+  'scripts/lib/github-app-identity.mjs', 'scripts/lib/identical-net-patch.mjs', 'scripts/lib/carry-equivalence.mjs',
+  'scripts/lib/numbering-carry.mjs', 'scripts/lib/approval-prevention-notice.mjs', 'scripts/lib/review-verdict-carried-marker.mjs',
+  'scripts/lib/rebase-drop-manifest.mjs', 'scripts/lib/settings-files.mjs', 'scripts/lib/review-label-provider.mjs',
+  'scripts/backlog/id.mjs',
   // The auditor itself: weakening it weakens every later audit.
   'scripts/operations/audit-verdict.mjs', 'scripts/operations/codex-audit*', 'scripts/lib/audit-settings.mjs',
   'scripts/lib/policy-cascade.mjs', 'scripts/settings/codex-audit.json']);
@@ -163,17 +171,19 @@ function tighter(key, candidate, current) {
  * @returns {{value: object, sources: Record<string,string>, warnings: string[]}}
  */
 export function resolveAuditSettings(options = {}) {
-  try { return resolveUnguarded(options ?? {}); } catch (err) {
+  // Shared with the resolution, so warnings it logged before a throw stay in the returned list (log and list agree).
+  const warnings = [];
+  try { return resolveUnguarded(options ?? {}, warnings); } catch (err) {
     let reason = 'unknown error';
     try { if (typeof err?.message === 'string') reason = err.message.slice(0, 200); } catch { /* keep the generic reason */ }
     const warning = `audit settings could not be resolved (${reason}); every setting resolves to its strictest option`;
     try { (options?.log ?? (() => {}))(warning); } catch { /* never throws */ }
     const value = { ...STRICTEST, raceBlockPaths: STRICTEST_PATHS, guardFloorPaths: STRICTEST_PATHS, priorQuestionHashes: Object.freeze([]) };
-    return { value: Object.freeze(value), sources: Object.fromEntries(Object.keys(value).map(k => [k, 'strictest'])), warnings: [warning] };
+    warnings.push(warning);
+    return { value: Object.freeze(value), sources: Object.fromEntries(Object.keys(value).map(k => [k, 'strictest'])), warnings };
   }
 }
-function resolveUnguarded({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync, platform, env = process.env, log } = {}) {
-  const warnings = [];
+function resolveUnguarded({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync, platform, env = process.env, log } = {}, warnings) {
   const warn = m => { warnings.push(m); try { (log ?? (() => {}))(m); } catch { /* never throws */ } };
   const { tool, unreadable } = readFile(path, fileRead);
   // The platform layer is read HERE, not inside the cascade, so its read errors and an explicit `"audit": null`

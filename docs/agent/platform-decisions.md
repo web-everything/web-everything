@@ -6513,9 +6513,11 @@ merge, drain) and the guard hooks (`scripts/guard-*.mjs` and the other guard scr
 match without regard to letter case. The required-check, review and merge authorization gates (including
 `scripts/lib/review-ci-gate.mjs`) are on the floor too, and so are the review authorization modules that decide
 who may clear, accept or carry a verdict and which markers are trusted (including
-`scripts/lib/review-independence.mjs`, `scripts/lib/marker-authorship.mjs` and `scripts/review-set-label.mjs`).
+`scripts/lib/review-independence.mjs`, `scripts/lib/marker-authorship.mjs` and `scripts/review-set-label.mjs`),
+with every module the clearance, carry and identity family imports directly (a test reads those imports from source).
 A D2 card's requirements are enforced independently: a missing card clears only when both the card and the
-pay-by requirements are waived. Platform and file path lists are unioned, never replaced.
+pay-by requirements are waived. The card reader and the clock are code hooks only: a plain value passed for either
+(such as `now: 0`) is never used to clear a card. Platform and file path lists are unioned, never replaced.
 An invalid or unreadable path list protects every path. An explicitly configured platform-preferences file that
 is missing fails closed like an unreadable one. `allow` from the environment also resolves to `block`. The D2 card
 reader fetches `origin/main` before reading the card; a failed fetch means no card. A caller of the verdict may only

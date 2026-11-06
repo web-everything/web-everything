@@ -251,7 +251,8 @@ describe('audit settings (R528)', () => {
     expect(resolvePriorQuestionHashes({ readFile: read, env: {} })).toEqual([]);
   });
   it('a resolution that throws resolves every setting to its strictest option with a warning (PR #6381 red team)', () => {
-    const env = { get [AUDIT_SETTINGS_ENV.raceBlockPaths]() { throw new Error('boom'); } };
+    // An invalid env value warns BEFORE the throw: that warning must stay in the returned list, as it was logged.
+    const env = { [AUDIT_SETTINGS_ENV.verdictMode]: 'bogus', get [AUDIT_SETTINGS_ENV.raceBlockPaths]() { throw new Error('boom'); } };
     const logged = [];
     let r; expect(() => { r = resolveAuditSettings({ fileRead: file(full()), platform: null, env, log: m => logged.push(m) }); }).not.toThrow();
     expect(r.value).toMatchObject({ verdictMode: 'shadow', preExistingMode: 'block', releaseStage: 'prod', recheckMax: 0, baseRecheckMax: 0,
@@ -259,7 +260,8 @@ describe('audit settings (R528)', () => {
     expect(r.value.guardFloorPaths).toEqual([...GUARD_FLOOR, '**']);
     expect(r.value.raceBlockPaths).toEqual([...GUARD_FLOOR, '**']);
     expect(new Set(Object.values(r.sources))).toEqual(new Set(['strictest']));
-    expect(r.warnings).toEqual([expect.stringMatching(/could not be resolved \(boom\); every setting resolves to its strictest option/)]);
+    expect(r.warnings).toEqual([expect.stringMatching(/WE_AUDIT_VERDICT_MODE="bogus" invalid/),
+      expect.stringMatching(/could not be resolved \(boom\); every setting resolves to its strictest option/)]);
     expect(logged).toEqual(r.warnings);
   });
   it('prior question hashes have no env route and bad lists are empty', () => {

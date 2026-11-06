@@ -570,12 +570,35 @@ describe('R473 structured concurrency evidence', () => {
       'scripts/operations/build-pr-authorship.mjs', 'scripts/lib/human-clearance-carry.mjs', 'scripts/conveyor/human-clearance-carry-cli.mjs',
       'scripts/settings/human-clearance-carry.json', 'scripts/settings/numbering-human-clearance.json', 'scripts/lib/accept-carry-forward.mjs',
       'scripts/conveyor/accept-carry-sweep.mjs', 'scripts/settings/accept-carry-forward.json', 'scripts/lib/unattended-review-accept.mjs',
-      'scripts/lib/trust-chain-tier.mjs', 'scripts/review-set-label.mjs',
+      'scripts/lib/trust-chain-tier.mjs', 'scripts/review-set-label.mjs', 'scripts/lib/rebase-verdict-carry.mjs',
+      'scripts/conveyor/delegated-clear-human.mjs', 'scripts/lib/pr-state/admit-clear-human.mjs', 'scripts/lib/operator-identity.mjs',
+      'scripts/lib/delegation-marker.mjs', 'scripts/lib/verdict-ledger.mjs', 'scripts/lib/verdict-ledger-store.mjs', 'scripts/lib/ruling-ledger.mjs',
+      'scripts/lib/jury-core.mjs', 'scripts/operations/record-verdict.mjs', 'scripts/operations/record-referral-ruling.mjs',
+      'scripts/operations/land-human-only.mjs', 'scripts/conveyor/hiccup-approve.mjs', 'scripts/settings/delivery-identity.json',
+      'scripts/lib/github-app-identity.mjs', 'scripts/lib/carry-equivalence.mjs', 'scripts/lib/identical-net-patch.mjs', 'scripts/lib/numbering-carry.mjs',
       // A case-insensitive file system resolves these to the guard itself.
       'Scripts/Guard-Bash.mjs', 'scripts/GUARD-bash.mjs', 'SCRIPTS/LIB/LANE-LEASE.MJS',
     ])('every guard, lease, lock, gate and audit module is on the built-in floor: E1, E2 and D3 in %s never ship', async file => {
       for (const cls of ['E1', 'E2', 'D3']) neverShips(await compute([finding({ class: cls, file })], options()));
     });
+    // PR #6381 red team: the floor names modules one by one, so a module a protected decision imports can be missed
+    // (marker-authorship.mjs decides which marker authors are trusted through github-app-identity.mjs). For the review
+    // clearance, carry and identity family, every module it imports directly is read from the source and must be on the
+    // floor too, so a new import cannot silently stay unprotected.
+    const AUTH_ROOTS = ['scripts/lib/review-independence.mjs', 'scripts/lib/marker-authorship.mjs', 'scripts/lib/operator-identity.mjs',
+      'scripts/lib/human-clearance-carry.mjs', 'scripts/lib/accept-carry-forward.mjs', 'scripts/lib/rebase-verdict-carry.mjs',
+      'scripts/lib/numbering-carry.mjs', 'scripts/lib/carry-equivalence.mjs', 'scripts/lib/identical-net-patch.mjs'];
+    const repoRoot = fileURLToPath(new NodeURL('../../../', import.meta.url));
+    const directImports = AUTH_ROOTS.flatMap(root => [...readFileSync(`${repoRoot}${root}`, 'utf8')
+      .matchAll(/\bfrom\s*['"](\.\.?\/[^'"]+)['"]|\bimport\(\s*['"](\.\.?\/[^'"]+)['"]\s*\)/g)]
+      .map(m => fileURLToPath(new NodeURL(m[1] ?? m[2], new NodeURL(root, `file://${repoRoot}`))).slice(repoRoot.length)));
+    it('the review authorization family has direct imports to check (the source scan is live)', () => {
+      expect(directImports).toEqual(expect.arrayContaining(['scripts/lib/github-app-identity.mjs', 'scripts/lib/carry-equivalence.mjs']));
+    });
+    it.each([...new Set(directImports)].sort())(
+      'every direct import of the review authorization family is on the floor: E2 in %s never ships (PR #6381 red team)', async file => {
+        neverShips(await compute([finding({ class: 'E2', file })], options()));
+      });
   });
 
   describe('D2 debt verification (D-R451)', () => {
@@ -584,40 +607,50 @@ describe('R473 structured concurrency evidence', () => {
     const NOW = Date.parse('2026-11-03T12:00:00Z');
     it.each(['prerelease', 'prod'])('ships with a card that exists on main at %s', async stage => {
       const readCard = reader();
-      const r = await compute([d2()], options(stage, { readCard, now: NOW }));
+      const r = await compute([d2()], options(stage, { readCard, now: () => NOW }));
       expect(r.verdict).toBe('NOT WEAKENED');
       expect(readCard).toHaveBeenCalledWith('backlog/6400-debt.md');
     });
     it.each([['missing card field', { card: undefined }], ['card path outside backlog/', { card: '../x.md' }]])('blocks on %s', async (_n, extra) => {
-      expect((await compute([d2(extra)], options('prerelease', { readCard: reader(), now: NOW }))).blocks).toHaveLength(1);
+      expect((await compute([d2(extra)], options('prerelease', { readCard: reader(), now: () => NOW }))).blocks).toHaveLength(1);
     });
     it('blocks when the card is not on main, the reader throws, or it returns blank', async () => {
       for (const readCard of [() => null, () => { throw new Error('no git'); }, () => '  ']) {
-        expect((await compute([d2()], options('prerelease', { readCard, now: NOW }))).verdict).toBe('WEAKENED');
+        expect((await compute([d2()], options('prerelease', { readCard, now: () => NOW }))).verdict).toBe('WEAKENED');
       }
     });
     it('blocks once the card mustPayBefore date has passed, ships before it', async () => {
-      expect((await compute([d2()], options('prerelease', { readCard: reader('mustPayBefore: 2026-11-01\n'), now: NOW }))).verdict).toBe('WEAKENED');
-      expect((await compute([d2()], options('prerelease', { readCard: reader('mustPayBefore: 2026-12-01\n'), now: NOW }))).verdict).toBe('NOT WEAKENED');
-      expect((await compute([d2()], options('prerelease', { readCard: reader('mustPayBefore: garbage\n'), now: NOW }))).verdict).toBe('WEAKENED');
+      expect((await compute([d2()], options('prerelease', { readCard: reader('mustPayBefore: 2026-11-01\n'), now: () => NOW }))).verdict).toBe('WEAKENED');
+      expect((await compute([d2()], options('prerelease', { readCard: reader('mustPayBefore: 2026-12-01\n'), now: () => NOW }))).verdict).toBe('NOT WEAKENED');
+      expect((await compute([d2()], options('prerelease', { readCard: reader('mustPayBefore: garbage\n'), now: () => NOW }))).verdict).toBe('WEAKENED');
+    });
+    it('a plain-value clock (data, not code) never moves now into the past: an overdue pay-by still blocks (PR #6381 self-review)', async () => {
+      const overdue = reader('mustPayBefore: 2020-01-01\n');
+      for (const now of [0, -Infinity, '1970-01-01', NOW - 1e13, null]) {
+        expect((await compute([d2()], options('prerelease', { readCard: overdue, now }))).verdict, String(now)).toBe('WEAKENED');
+      }
+      // Control: the code seam still works, so the refusal above is the plain value being ignored.
+      expect((await compute([d2()], options('prerelease', { readCard: overdue, now: () => 0 }))).verdict).toBe('NOT WEAKENED');
+      // A card reader that is not code (a plain value) cannot be called: no card, so it blocks.
+      expect((await compute([d2()], options('prerelease', { readCard: 'mustPayBefore: 2099-01-01\n', now: () => NOW }))).verdict).toBe('WEAKENED');
     });
     it('blocks on an impossible or non-canonical pay-by date instead of rolling it into a later month (PR #6381 red team)', async () => {
       for (const bad of ['2099-02-31', '2099-02-30', '2100-02-29', '2099-04-31', '2099-13-01', '2099-00-10', '2099-01-00',
         '2099-1-1', '+002099-01-01', '0099-01-01', '2099-01-01T00:00:00Z', '20990101', 'Jan-1-2099', '２０９９-01-01']) {
-        expect((await compute([d2()], options('prod', { readCard: reader(`mustPayBefore: ${bad}\n`), now: NOW }))).verdict, bad).toBe('WEAKENED');
+        expect((await compute([d2()], options('prod', { readCard: reader(`mustPayBefore: ${bad}\n`), now: () => NOW }))).verdict, bad).toBe('WEAKENED');
       }
       for (const good of ['2099-01-31', '2096-02-29', '2400-02-29', '2026-11-04']) {
-        expect((await compute([d2()], options('prod', { readCard: reader(`mustPayBefore: ${good}\n`), now: NOW }))).verdict, good).toBe('NOT WEAKENED');
+        expect((await compute([d2()], options('prod', { readCard: reader(`mustPayBefore: ${good}\n`), now: () => NOW }))).verdict, good).toBe('NOT WEAKENED');
       }
       // The day itself is not "before": a date equal to today's UTC midnight has passed.
-      expect((await compute([d2()], options('prod', { readCard: reader('mustPayBefore: 2026-11-03\n'), now: NOW }))).verdict).toBe('WEAKENED');
+      expect((await compute([d2()], options('prod', { readCard: reader('mustPayBefore: 2026-11-03\n'), now: () => NOW }))).verdict).toBe('WEAKENED');
     });
     it('takes the pay-by date only from the card on main, never from the model finding', async () => {
       // An overdue card cannot be revived by a later model-supplied date.
-      expect((await compute([d2({ mustPayBefore: '2026-12-01' })], options('prerelease', { readCard: reader('mustPayBefore: 2026-11-01\n'), now: NOW }))).verdict).toBe('WEAKENED');
-      expect((await compute([d2({ mustPayBefore: 'prod' })], options('prerelease', { readCard: reader('mustPayBefore: 2026-11-01\n'), now: NOW }))).verdict).toBe('WEAKENED');
+      expect((await compute([d2({ mustPayBefore: '2026-12-01' })], options('prerelease', { readCard: reader('mustPayBefore: 2026-11-01\n'), now: () => NOW }))).verdict).toBe('WEAKENED');
+      expect((await compute([d2({ mustPayBefore: 'prod' })], options('prerelease', { readCard: reader('mustPayBefore: 2026-11-01\n'), now: () => NOW }))).verdict).toBe('WEAKENED');
       // A model-supplied overdue date does not override a card with no pay-by either way.
-      expect((await compute([d2({ mustPayBefore: '2026-11-01' })], options('prerelease', { readCard: reader(), now: NOW }))).verdict).toBe('NOT WEAKENED');
+      expect((await compute([d2({ mustPayBefore: '2026-11-01' })], options('prerelease', { readCard: reader(), now: () => NOW }))).verdict).toBe('NOT WEAKENED');
     });
     it.each([
       ['a trailing comment', 'mustPayBefore: 2026-12-01 # later'], ['an indent', '  mustPayBefore: 2026-12-01'],
@@ -626,17 +659,17 @@ describe('R473 structured concurrency evidence', () => {
       ['a prod pay-by with trailing text', 'mustPayBefore: prod # x'],
     ])('a pay-by line with %s that does not parse strictly fails closed', async (_n, body) => {
       for (const stage of ['prerelease', 'prod']) {
-        expect((await compute([d2()], options(stage, { readCard: reader(`${body}\n`), now: NOW }))).verdict).toBe('WEAKENED');
+        expect((await compute([d2()], options(stage, { readCard: reader(`${body}\n`), now: () => NOW }))).verdict).toBe('WEAKENED');
       }
     });
     it('a card due before prod ships at prerelease and blocks at prod', async () => {
       const due = () => reader('status: open\nmustPayBefore: prod\n');
-      expect((await compute([d2()], options('prerelease', { readCard: due(), now: NOW }))).verdict).toBe('NOT WEAKENED');
-      const prod = await compute([d2()], options('prod', { readCard: due(), now: NOW }));
+      expect((await compute([d2()], options('prerelease', { readCard: due(), now: () => NOW }))).verdict).toBe('NOT WEAKENED');
+      const prod = await compute([d2()], options('prod', { readCard: due(), now: () => NOW }));
       expect(prod.verdict).toBe('WEAKENED');
       expect(ids(prod.blocks)).toEqual(['f1']);
       // The default stage is prerelease; an omitted stage keeps prerelease behaviour.
-      expect((await compute([d2()], { raceBlockPaths: [], rulings: [], readCard: due(), now: NOW })).verdict).toBe('NOT WEAKENED');
+      expect((await compute([d2()], { raceBlockPaths: [], rulings: [], readCard: due(), now: () => NOW })).verdict).toBe('NOT WEAKENED');
     });
   });
 
