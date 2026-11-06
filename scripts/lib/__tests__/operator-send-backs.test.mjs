@@ -272,3 +272,182 @@ describe('operator re-rulings and legacy fixer evidence', () => {
     expect(openOperatorSendBacks(fixture({ comments: [a, comment('fix', 'web-everything', '21:00', body), b] })).map(x => x.id)).toEqual(['B']);
   });
 });
+
+describe('quoted and fenced references never resolve an operator request', () => {
+  const A = 'aaaaaaaaa', B = 'bbbbbbbbb';
+  const request = comment('1001', 'chalbert', '20:07',
+    `🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\nAt head ${A}: fix the export.`);
+  const release = `🔓 conveyor fix-end — fix claim released\n\n\`fix-1\` released the fix claim at \`${B}\`.\n`;
+  const quote = '> Request 1001 remains unaddressed.\n';
+  const fenced = '\n```\n<!-- addresses-operator-send-back: 1001 -->\n```\n\n~~~text\nRequest 1001 was fixed\n~~~\n';
+  const open = comments => openOperatorSendBacks(fixture({ headRefOid: B, comments })).map(x => x.id);
+  it.each([
+    ['blockquote', release + quote],
+    ['fenced marker + tilde fence', release + fenced],
+    ['both', release + quote + fenced],
+  ])('a trusted fix-end for a new head quoting it (%s) leaves the request open', (_name, body) => {
+    expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual(['1001']);
+  });
+  it.each([
+    ['bare id', 'Operator send-back 1001 remains unaddressed; I changed only an unrelated test.'],
+    ['bare id, negated', 'Did not address request 1001.'],
+    ['comment id URL', `See ${'https://github.com/o/r/pull/1#issuecomment-1001'} - not addressed.`],
+  ])('a trusted fix-end for a new head only mentioning the request (%s) leaves it open', (_name, prose) => {
+    const withUrl = { ...request, url: 'https://github.com/o/r/pull/1#issuecomment-1001' };
+    expect(open([withUrl, comment('end', 'web-everything', '21:00', `${release}\n${prose}`)])).toEqual(['1001']);
+  });
+  it.each([
+    ['lazy quote continuation', '> quote\nRequest 1001 remains unaddressed.'],
+    ['indented code', '    Request 1001 remains unaddressed.'],
+    ['tab-indented marker', '\t<!-- addresses-operator-send-back: 1001 -->'],
+    ['quote in a list item', '- > Request 1001 remains unaddressed.'],
+    ['fence in a list item', '- ```\n  Request 1001 remains unaddressed.\n  ```'],
+    ['marker nested in another HTML comment', '<!-- quoting <!-- addresses-operator-send-back: 1001 --> -->'],
+    ['marker inline in prose', 'see <!-- addresses-operator-send-back: 1001 --> for the format'],
+    ['unterminated fence', '```\n<!-- addresses-operator-send-back: 1001 -->'],
+    ['marker inside a multi-line HTML comment', '<!--\n<!-- addresses-operator-send-back: 1001 -->\n-->'],
+    ['html blockquote', '<blockquote>\nRequest 1001 remains unaddressed.\n</blockquote>'],
+    ['unterminated html pre block', '<pre>\n<!-- addresses-operator-send-back: 1001 -->'],
+    ['nested html blockquote', '<blockquote><blockquote>x</blockquote> Request 1001 unaddressed </blockquote>'],
+    ['nested html pre with a marker after the inner close', '<pre><pre>x</pre>\n<!-- addresses-operator-send-back: 1001 -->\n</pre>'],
+    ['entity-spelled quote', '&gt; Request 1001 remains unaddressed.'],
+    ['non-breaking-space quote', '\u00a0> Request 1001 remains unaddressed.'],
+  ])('fix evidence containing %s leaves the request open', (_name, quoted) => {
+    expect(open([request, comment('fix', 'web-everything', '21:00', `## Fix evidence\nHead: \`${B}\`\n\n${quoted}\nFixed.`)])).toEqual(['1001']);
+  });
+  it('a backtick in a fence info string is inline code, so a later real marker still resolves', () => {
+    const body = `## Fix evidence\nHead: \`${B}\`\n\n\`\`\`a\`b\n<!-- addresses-operator-send-back: 1001 -->\nFixed.`;
+    expect(open([request, comment('fix', 'web-everything', '21:00', body)])).toEqual([]);
+  });
+  it('gives the fixer brief the whole request but keeps the review block bounded', () => {
+    const tail = 'REQUIRED REPAIR AFTER CHAR 4100';
+    const long = comment('1001', 'chalbert', '20:07',
+      `🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\nAt head ${A}: ${'x'.repeat(4200)}\n${tail}`);
+    const items = openOperatorSendBacks(fixture({ headRefOid: B, comments: [long] }));
+    expect(renderOperatorSendBackBrief(items)).toContain(tail);
+    expect(renderOperatorSendBackReviewBlock(items)).not.toContain(tail);
+  });
+  it('a quoted or fenced marker in fix evidence leaves the request open', () => {
+    const body = `## Fix evidence\nHead: \`${B}\`\n${quote}${fenced}Fixed.`;
+    expect(open([request, comment('fix', 'web-everything', '21:00', body)])).toEqual(['1001']);
+  });
+  it('a closed html block before the marker does not hide it, and hostile unclosed comments stay fast', () => {
+    const body = `## Fix evidence\nHead: \`${B}\`\n<pre>x</pre>\n<!-- addresses-operator-send-back: 1001 -->\nDone.`;
+    expect(open([request, comment('fix', 'web-everything', '21:00', body)])).toEqual([]);
+    const start = Date.now();
+    open([request, comment('fix', 'web-everything', '21:00', `## Fix evidence\nHead: \`${B}\`\n${'<!--'.repeat(16000)}`)]);
+    expect(Date.now() - start).toBeLessThan(1500);
+  });
+  it('a real marker directly under a quote (no blank line) still resolves it', () => {
+    const body = `## Fix evidence\nHead: \`${B}\`\n> item 1 text\n<!-- addresses-operator-send-back: 1001 -->\nDone.`;
+    expect(open([request, comment('fix', 'web-everything', '21:00', body)])).toEqual([]);
+  });
+  it('a real marker line beside a quote and a fence still resolves it', () => {
+    const body = `## Fix evidence\nHead: \`${B}\`\n${quote}${fenced}<!-- addresses-operator-send-back: 1001 -->\nFixed.`;
+    expect(open([request, comment('fix', 'web-everything', '21:00', body)])).toEqual([]);
+    expect(open([request, comment('end', 'web-everything', '21:00', `${release}<!-- addresses-operator-send-back: 1001 -->\n${quote}`)])).toEqual([]);
+  });
+  it('a later request that only quotes an earlier one does not carry its resolution to it', () => {
+    const later = comment('1006', 'chalbert', '22:30',
+      `🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\n> Operator send-back (human review ceremony), 2026-10-14 ~16:20 ET, at head e5ed9cb74.\n\`\`\`\n1001\n\`\`\`\nNew ask, at head ${HEAD}.`);
+    const fix = comment('1007', 'web-everything', '23:30', `## Fix evidence\nHead: \`${'c'.repeat(40)}\`\n<!-- addresses-operator-send-back: 1006 -->\nFixed.`);
+    const ids = openOperatorSendBacks(fixture({ comments: [original, later, fix] })).map(x => x.id);
+    expect(ids).toEqual(['1001']);
+  });
+  it('keeps the whole body of a long request for the fixer while the brief body stays bounded', () => {
+    const tail = 'REQUIRED REPAIR AFTER CHAR 4100';
+    const long = comment('1001', 'chalbert', '20:07',
+      `🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\nAt head ${A}: ${'x'.repeat(4200)}\n${tail}`);
+    const [item] = operatorSendBacks([long]);
+    expect(item.body).not.toContain(tail);
+    expect(item.fullBody).toContain(tail);
+  });
+  it.each([
+    ['inline-code <pre>', 'Updated `<pre>` rendering.'],
+    ['inline-code <blockquote>', 'Changed `<blockquote>` css.'],
+    ['<pre-commit> hook', 'Ran the <pre-commit> hook.'],
+    ['unclosed <blockquote styling', 'fixed the <blockquote styling'],
+  ])('%s in a fix-end does not hide its real marker', (_name, prose) => {
+    const body = `${release}${prose}\n<!-- addresses-operator-send-back: 1001 -->\n`;
+    expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual([]);
+  });
+  it('a real <pre> block still hides a marker example', () => {
+    const body = `${release}<pre>\n<!-- addresses-operator-send-back: 1001 -->\n</pre>\n`;
+    expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual(['1001']);
+  });
+  // An unrelated closing tag must not close the open block: only a closer naming the innermost open tag does.
+  it.each([
+    ['a stray </blockquote> inside <pre>', '<pre>\n</blockquote>\n<!-- addresses-operator-send-back: 1001 -->\n</pre>\n'],
+    ['a stray </pre> inside <blockquote>', '<blockquote>\n</pre>\n<!-- addresses-operator-send-back: 1001 -->\n</blockquote>\n'],
+    ['a stray </PRE > with attributes-free spacing inside <blockquote>', '<blockquote>\n</PRE >\n<!-- addresses-operator-send-back: 1001 -->\n</blockquote>\n'],
+    ['crossed nesting <pre><blockquote></pre>', '<pre><blockquote>x</pre>\n<!-- addresses-operator-send-back: 1001 -->\n</blockquote></pre>\n'],
+  ])('%s does not expose the marker still inside the block', (_name, block) => {
+    expect(open([request, comment('end', 'web-everything', '21:00', `${release}${block}`)])).toEqual(['1001']);
+  });
+  it.each([
+    ['a </pre> inside an HTML comment', '<pre>\n<!-- </pre> -->\n<!-- addresses-operator-send-back: 1001 -->\n</pre>\n'],
+    ['a backticked <pre> opener inside an open block', '<pre>\n`<pre>`\n</pre>\n<!-- addresses-operator-send-back: 1001 -->\n</pre>\n'],
+    ['a backticked <blockquote> opener inside an open block', '<blockquote>\n`<blockquote>`\n</blockquote>\n<!-- addresses-operator-send-back: 1001 -->\n</blockquote>\n'],
+  ])('%s does not expose the marker still inside the block', (_name, block) => {
+    expect(open([request, comment('end', 'web-everything', '21:00', `${release}${block}`)])).toEqual(['1001']);
+  });
+  it('a <pre> inside an HTML comment is not an opener, so the real marker after it resolves', () => {
+    const body = `${release}<!-- <pre> -->\n<!-- addresses-operator-send-back: 1001 -->\n`;
+    expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual([]);
+  });
+  it('properly nested mixed blocks still close, so a marker after them resolves', () => {
+    const body = `${release}<pre><blockquote>x</blockquote></pre>\n<!-- addresses-operator-send-back: 1001 -->\n`;
+    expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual([]);
+  });
+  it('a closing fence indented four or more spaces is content, so the example stays hidden', () => {
+    const body = `${release}\`\`\`\n    \`\`\`\n<!-- addresses-operator-send-back: 1001 -->\n`;
+    expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual(['1001']);
+    const closed = `${release}\`\`\`\n   \`\`\`\n<!-- addresses-operator-send-back: 1001 -->\n`;
+    expect(open([request, comment('end', 'web-everything', '21:00', closed)])).toEqual([]);
+  });
+  // CommonMark: a closing fence is indented 0-3 columns whatever the opener's own indent; a list item's content column is
+  // the one exception, so the allowance there is measured from the item's text. Unclosed means the marker stays hidden.
+  it.each([
+    ['plain opener, 0 spaces', '', 4],
+    ['plain opener, 1 space', ' ', 4],
+    ['plain opener, 2 spaces', '  ', 5],
+    ['plain opener, 3 spaces', '   ', 4],
+    ['plain opener, 3 spaces, closer 6 spaces', '   ', 6],
+  ])('an indented opener does not widen the closer: %s', (_name, opener, closerIndent) => {
+    const body = `${release}${opener}\`\`\`\n${' '.repeat(closerIndent)}\`\`\`\n<!-- addresses-operator-send-back: 1001 -->\n`;
+    expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual(['1001']);
+  });
+  it.each([
+    ['plain opener, 3 spaces, closer 3 spaces', '   ', 3],
+    ['plain opener, 1 space, closer 0 spaces', ' ', 0],
+  ])('an indented opener still closes on a valid closer: %s', (_name, opener, closerIndent) => {    const body = `${release}${opener}\`\`\`\n${' '.repeat(closerIndent)}\`\`\`\n<!-- addresses-operator-send-back: 1001 -->\n`;
+    expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual([]);
+  });
+  const marker = '<!-- addresses-operator-send-back: 1001 -->\n';
+  const hiddenWhen = (name, fenceText, expected) => it(name, () => {
+    expect(open([request, comment('end', 'web-everything', '21:00', `${release}${fenceText}${marker}`)])).toEqual(expected);
+  });
+  // A list item's fence measures its closer from the item's own column (here 2), so up to 5 columns closes it.
+  hiddenWhen('a list-item fence closes a closer indented to its content column plus 3', '- ```\n  example\n     ```\n', []);
+  hiddenWhen('a list-item closer indented past content column plus 3 is content', '- ```\n  example\n      ```\n', ['1001']);
+  hiddenWhen('a closer left of the list item ends the item and opens a new fence that hides the marker', '- ```\n  example\n```\n', ['1001']);
+  hiddenWhen('a tab-indented closer is 4 columns, so it is content and the example stays hidden', '```\n\t```\n', ['1001']);
+  hiddenWhen('a four-space opener is indented code, not a fence, so a later fence cannot be read as its closer', '    ```\ntext\n```\n', ['1001']);
+  hiddenWhen('a tab opener is indented code, not a fence', '\t```\ntext\n```\n', ['1001']);
+  it('an inline-code span never crosses a lone-CR line break, so it cannot hide a real <pre> block', () => {
+    const body = `${release}\`\r<pre>\r${marker}\r</pre>\r\``;
+    expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual(['1001']);
+  });
+  it('html-block stripping stays linear on adversarial inline-code and tag input', () => {
+    // One long backtick run made the old inline-code regex quadratic (60k backticks took ~2s); tags without ">" and
+    // deeply nested openers exercise the tag scan.
+    const longRun = '`'.repeat(200000);
+    const distinct = Array.from({ length: 700 }, (_v, i) => '`'.repeat(i + 1)).join(' ');
+    const tags = '<pre '.repeat(40000), nested = '<pre><blockquote>'.repeat(20000);
+    for (const hostile of [longRun, distinct, tags, nested, `${longRun} ${tags}`]) {
+      const start = Date.now();
+      open([request, comment('fix', 'web-everything', '21:00', `## Fix evidence\nHead: \`${B}\`\n${hostile}\n<!-- addresses-operator-send-back: 1001 -->`)]);
+      expect(Date.now() - start).toBeLessThan(1500);
+    }
+  });
+});

@@ -278,7 +278,14 @@ export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
 
 const UNFINISHED_REVIEW_CONTEXT = 'review-unfinished: an unfinished review run holds this head; a human must answer or cancel the pending confirmation';
 
-/** PURE: readers are injected; each refusal produces one decision, including unreadable evidence. */
+/**
+ * PURE: readers are injected; each refusal produces one decision, including unreadable evidence.
+ *
+ * @verdicts-partial the planner is not a verdict reducer. It names only `accept` and `prevention-outstanding`: a stored
+ *   `accept` (or a judge-accepted `prevention-outstanding`) with a provable accept comment on the live head may settle
+ *   a kept `red-team:pending`. Every other stored verdict flows through the evidence and owed-ness checks unchanged,
+ *   so a verdict added to the enum needs no branch here.
+ */
 export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, now,
   setting, lastDispatch, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions,
   headNeverReviewed = headNeverReviewedFromRuns }) {
@@ -390,6 +397,9 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         (typeof label === 'string' ? label : label?.name) === 'red-team:pending');
       const acceptedReview = verdict === VERDICTS.ACCEPT
         && provenAcceptance({ comments: rawPr.comments, reviews, labels: rawPr.labels, head }) !== null;
+      // A judge accept after the round cap leaves prevention-outstanding stored; the trusted accept comment on this head proves it.
+      const judgeAccepted = verdict === VERDICTS.PREVENTION_OUTSTANDING
+        && provenAcceptance({ comments: rawPr.comments, reviews, labels: rawPr.labels, head }) !== null;
       const provenanceEscalation = keepsPending && !acceptedReview ? { escalate: true,
         escalationContext: 'red-team:pending kept: not-owed review lacks acceptance provenance; needs a human look' } : {};
       const notOwed = (why = 'stored review does not owe a red team') => {
@@ -440,6 +450,10 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           // The stored verdict may predate the acceptance (a round-budget accept leaves `changes` behind);
           // a finished not-owed status on this accepted head settles as policy-clear (R100/R338).
           && (redTeamRequired(evidence.loopPayload?.verdict?.verdict)
+            // A judge/round-budget accept (provable accept comment on this head) leaves prevention-outstanding stored.
+            // A red-team-only job returns not-owed for it WITHOUT writing a status, so dispatching one would only
+            // re-run that no-op each cooldown; with no red-team state at all, settle the kept pending label here.
+            || (keepsPending && judgeAccepted && evidence.status == null && status == null)
             || [evidence.status, status].every(candidate => candidate?.status === 'finished'
               && normalizeRedTeamResult(candidate.result).priorResult === 'not-owed'))
           && evidence.recorded !== true && evidence.seatRecorded !== true) {
@@ -447,7 +461,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           const context = { labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews, settlesPending: true };
           const refusal = publishableClearGuard(context);
           if (refusal) return { ...guardedSkip(refusal), ...provenanceEscalation };
-          if (keepsPending && !acceptedReview) return notOwed();
+          if (keepsPending && !acceptedReview && !judgeAccepted) return notOwed();
           return { ...row, action: 'clear', why: 'not owed (stored review)' };
         }
         if (!owed || finishedNotOwed) return notOwed();
