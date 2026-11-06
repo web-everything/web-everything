@@ -772,7 +772,12 @@ describe('standards input parity', () => {
   it.each([['a cancel-acknowledged finish (run killed before a receipt)', ackReceipt, 'cancelled'], ['a legacy runner null finish that never acknowledged cancel', 'null', 'unconfirmed'], ['a finish that failed to parse', 'untrusted', 'unconfirmed'],
     ['a cancel ack for another run', (_n, value) => JSON.stringify({v:1,nonce:value.nonce,run:'other',cancelAck:true}), 'unconfirmed'],
     ['a cancel ack with another nonce', (_n, value) => JSON.stringify({v:1,nonce:'f'.repeat(32),run:value.run,cancelAck:true}), 'unconfirmed'],
-    ['a cancel ack with another version', (_n, value) => JSON.stringify({v:2,nonce:value.nonce,run:value.run,cancelAck:true}), 'unconfirmed']])(
+    ['a cancel ack with another version', (_n, value) => JSON.stringify({v:2,nonce:value.nonce,run:value.run,cancelAck:true}), 'unconfirmed'],
+    ['a cancel ack with a string version', (_n, value) => JSON.stringify({v:'1',nonce:value.nonce,run:value.run,cancelAck:true}), 'unconfirmed'],
+    ['a cancel ack missing its nonce', (_n, value) => JSON.stringify({v:1,run:value.run,cancelAck:true}), 'unconfirmed'],
+    ['a cancel ack missing its run', (_n, value) => JSON.stringify({v:1,nonce:value.nonce,cancelAck:true}), 'unconfirmed'],
+    ['a cancel ack that is false', (_n, value) => JSON.stringify({v:1,nonce:value.nonce,run:value.run,cancelAck:false}), 'unconfirmed'],
+    ['a cancel ack that is the string true', (_n, value) => JSON.stringify({v:1,nonce:value.nonce,run:value.run,cancelAck:'true'}), 'unconfirmed']])(
     'x40a9dk: an aborted client reports %s as %s', async (_name, receipt, mode) => {
     const controller = new AbortController(), abort = () => controller.abort();
     const f = fixture({receipt}), original = f.exec;

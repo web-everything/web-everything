@@ -957,7 +957,8 @@ export async function runWithRemoteDecision({
   },60000);
   heartbeat.unref();
   const record = async result => {
-    try {await recordRemoteResult({root:remoteRoot,settings:policy.settings.remote,clock,result,host});}
+    // A repeated client signal stops waiting for the health write too (the marker stays for the reaper).
+    try {await Promise.race([recordRemoteResult({root:remoteRoot,settings:policy.settings.remote,clock,result,host}),escalatePromise]);}
     catch {log('heavy-admission: remote-health-unreadable; subsequent remote admission requires readable health state\n');}
   };
   const executionMarker = join(remoteRoot,`slot-${slot.slot}.unconfirmed`);
