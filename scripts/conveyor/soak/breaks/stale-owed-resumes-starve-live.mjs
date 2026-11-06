@@ -34,7 +34,7 @@ export default {
       const entries = Array.from({ length: 9 }, (_, i) => {
         const key = i === 8 ? 'r618-live' : `r618-stale-${i}`;
         return { key, record: {
-          v: 1, sessionId: key, who: key, repo: 'web-everything/web-everything', pr: i + 1,
+          v: 1, sessionId: key, who: key, repo: 'we', pr: i + 1,
           sha: 'a'.repeat(40), kind: 'fix', requestedAt: new Date(T0 + i * 1000).toISOString(),
           lane: join(sourceRoot, 'soak', 'lanes', key), ref: `lane/${key}`, attempt: 1, pendingResume: { kind: 'green' },
         } };
