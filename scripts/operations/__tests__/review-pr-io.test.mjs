@@ -264,7 +264,7 @@ describe('the label sink', () => {
 
   it('shells the SINGLE HOME with the target, the actor and the staged body file', async () => {
     const seen = [];
-    const sinks = createReviewPrSinks({ root, runNode: (argv) => { seen.push(argv); return '{"ok":true,"pr":7,"to":"accepted"}'; } });
+    const sinks = createReviewPrSinks({ root, publishGate: async () => ({ allowed: true, headSha: "a".repeat(40), reason: "required-checks-successful" }), runNode: (argv) => { seen.push(argv); return '{"ok":true,"pr":7,"to":"accepted"}'; } });
     const result = await sinks[REVIEW_EFFECTS.LABEL](payload, CTX);
     expect(result).toEqual({ ok: true, pr: 7, to: 'accepted' });
     const argv = seen[0];
@@ -283,14 +283,14 @@ describe('the label sink', () => {
   // surface it never touched, three lines above its own footer naming this operation.
   it('passes the CHANNEL through, so the durable comment names the surface it came through', async () => {
     const seen = [];
-    const sinks = createReviewPrSinks({ root, runNode: (argv) => { seen.push(argv); return '{"ok":true}'; } });
+    const sinks = createReviewPrSinks({ root, publishGate: async () => ({ allowed: true, headSha: "a".repeat(40), reason: "required-checks-successful" }), runNode: (argv) => { seen.push(argv); return '{"ok":true}'; } });
     await sinks[REVIEW_EFFECTS.LABEL]({ ...payload, channel: REVIEW_PR_CHANNEL }, CTX);
     expect(seen[0]).toContain(`--channel=${REVIEW_PR_CHANNEL}`);
   });
 
   it('omits --channel entirely for a payload written before the field existed', async () => {
     const seen = [];
-    const sinks = createReviewPrSinks({ root, runNode: (argv) => { seen.push(argv); return '{"ok":true}'; } });
+    const sinks = createReviewPrSinks({ root, publishGate: async () => ({ allowed: true, headSha: "a".repeat(40), reason: "required-checks-successful" }), runNode: (argv) => { seen.push(argv); return '{"ok":true}'; } });
     await sinks[REVIEW_EFFECTS.LABEL](payload, CTX);
     // The single home's own default for an absent channel is the NEUTRAL sentence, never a wrong one — so a
     // `--resume` across the upgrade degrades to "no surface stated", not to another caller's identity.
@@ -298,7 +298,7 @@ describe('the label sink', () => {
   });
 
   it('maps a PROVEN pre-write refusal to `notApplied`, so it is retried rather than refused', async () => {
-    const sinks = createReviewPrSinks({
+    const sinks = createReviewPrSinks({ publishGate: async () => ({ allowed: true, headSha: "a".repeat(40), reason: "required-checks-successful" }),
       root,
       runNode: () => { throw Object.assign(new Error('exit 1'), { stdout: '{"error":"gate-self: review:human is human-ceremony-only — clear via /review in a session"}' }); },
     });
@@ -306,7 +306,7 @@ describe('the label sink', () => {
   });
 
   it('maps an UNRECOGNISED failure to INDETERMINATE — the comment may already be posted', async () => {
-    const sinks = createReviewPrSinks({
+    const sinks = createReviewPrSinks({ publishGate: async () => ({ allowed: true, headSha: "a".repeat(40), reason: "required-checks-successful" }),
       root,
       runNode: () => { throw Object.assign(new Error('exit 1'), { stdout: '{"error":"could not resolve host: api.github.com"}' }); },
     });
@@ -316,9 +316,9 @@ describe('the label sink', () => {
   });
 
   it('treats a zero-exit `{"error":…}` the same way — refusal vs unknown, never "it worked"', async () => {
-    const refuse = createReviewPrSinks({ root, runNode: () => '{"error":"invalid --repo — expected <owner/name>"}' });
+    const refuse = createReviewPrSinks({ root, publishGate: async () => ({ allowed: true, headSha: "a".repeat(40), reason: "required-checks-successful" }), runNode: () => '{"error":"invalid --repo — expected <owner/name>"}' });
     await expect(refuse[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toMatchObject({ notApplied: true });
-    const unknown = createReviewPrSinks({ root, runNode: () => '{"error":"something nobody has seen"}' });
+    const unknown = createReviewPrSinks({ root, publishGate: async () => ({ allowed: true, headSha: "a".repeat(40), reason: "required-checks-successful" }), runNode: () => '{"error":"something nobody has seen"}' });
     await expect(unknown[REVIEW_EFFECTS.LABEL](payload, CTX)).rejects.toThrow(/outcome is UNKNOWN/);
   });
 

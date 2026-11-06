@@ -156,3 +156,17 @@ describe('source log', () => {
     expect(lines).toEqual([]);
   });
 });
+
+describe('readPlatformPreferences — platform files merge per leaf, not per policy', () => {
+  it('an operator build block adding keys keeps the repo platform build leaves it does not set', () => {
+    const files = {
+      repo: { build: { finalGate: 'related', finalGateStandards: 'selected' }, verify: { shardMinTests: 20 } },
+      operator: { build: { priority: ['1'], finalGate: 'full' }, verify: { shardMinTests: 0 } },
+    };
+    const readFile = (p) => JSON.stringify(/delivery-platform-preferences/.test(p) ? files.repo
+      : /platform-preferences\.json$/.test(p) ? files.operator : (() => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); })());
+    const { prefs } = readPlatformPreferences({ env: {}, readFile });
+    expect(prefs.build).toEqual({ finalGate: 'full', finalGateStandards: 'selected', priority: ['1'] });
+    expect(prefs.verify).toEqual({ shardMinTests: 0 });
+  });
+});

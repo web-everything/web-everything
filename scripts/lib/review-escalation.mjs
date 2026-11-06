@@ -46,7 +46,7 @@ const isQuotedHtmlBlock = (t) => t.type === 'html_block' && /<(?:pre|code)[\s>]/
 const md = new MarkdownIt({ html: true });
 // #x169fqe — the transient lane bookkeeping the reviewed-diff fingerprint excludes, imported rather than
 // re-spelled so the fingerprint and the rebase-drop pass that removes the file can never disagree on its name.
-import { LANE_MANIFEST } from './rebase-drop-manifest.mjs';
+import { isMechanicalDiffSection } from './transient-paths.mjs';
 
 // Keep the forge port independent of the policy graph (which imports the fix-procedure caller).
 import { REVIEW_LABELS } from './review-labels.mjs';
@@ -1537,7 +1537,6 @@ export function normalizeDiffFingerprint(diffText) {
   if (/^[0-9a-f]{64}$/.test(trimmed)) return trimmed;
   // The EXACT header git emits for the repo-root manifest, whatever the change kind (add/modify/delete all carry
   // both sides). An exact-equality test cannot be widened by a crafted path the way a substring test was.
-  const MANIFEST_HEADER = `diff --git a/${LANE_MANIFEST} b/${LANE_MANIFEST}`;
   // SPLIT THE RAW TEXT, NOT THE TRIMMED COPY (PR #1086 review, blocker 2 — second pass). Trimming the whole diff
   // strips trailing whitespace off the LAST line, so a ride-in whose only change was a meaningful trailing space
   // at end-of-diff still collided even after the per-line strip was removed. Whitespace is content everywhere,
@@ -1550,7 +1549,7 @@ export function normalizeDiffFingerprint(diffText) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     // A `diff --git` header opens a new file section and therefore always ends any skip in progress.
-    if (line.startsWith('diff --git ')) inManifestSection = line === MANIFEST_HEADER;
+    if (line.startsWith('diff --git ')) inManifestSection = isMechanicalDiffSection(lines, i);
     if (inManifestSection) continue;
     if (!keepIndexAt.has(i) && /^index [0-9a-f]+\.\.[0-9a-f]+/.test(line)) continue;
     kept.push(line);
@@ -1704,7 +1703,6 @@ export function normalizeContributionFingerprint(diffText) {
   const trimmed = diffText.trim();
   if (!trimmed) return null;
   if (/^[0-9a-f]{64}$/.test(trimmed)) return trimmed;
-  const MANIFEST_HEADER = `diff --git a/${LANE_MANIFEST} b/${LANE_MANIFEST}`;
   // `@@ -<start>[,<len>] +<start>[,<len>] @@[ <section heading>]` — git omits `,<len>` when it is exactly 1.
   const HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/;
   const kept = [];
@@ -1727,7 +1725,7 @@ export function normalizeContributionFingerprint(diffText) {
     if (line.startsWith('diff --git ')) {
       // A new file section always ends any skip AND any hunk in progress.
       closeRun();
-      inManifestSection = line === MANIFEST_HEADER;
+      inManifestSection = isMechanicalDiffSection(lines, i);
       inHunk = false;
       if (!inManifestSection) kept.push(line);
       continue;

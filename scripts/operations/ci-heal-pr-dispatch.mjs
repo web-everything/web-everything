@@ -316,7 +316,9 @@ export async function dispatchCiHeal(planned, {
     if (out?.dispatch?.wrapped && Number.isInteger(out.dispatch.runnerPid)) {
       try { stampRunner({ repo, pr: planned.pr, kind: 'ci-heal', owner: claimOwner, pid: out.dispatch.runnerPid, ...(claimRoot ? { lockRoot: claimRoot } : {}) }); } catch { /* best effort: the plain TTL still applies */ }
     }
-    return { agentId: out?.handle ?? null, sessionSlug, pr: planned.pr, itemNum: planned.itemNum ?? null, lane: planned.lane, unknownTokens };
+    // R549: an unreadable launch hands back only the minted session id; report it as unverified, never as an agentId.
+    const unverified = out?.dispatch?.handleVerified === false;
+    return { agentId: unverified ? null : (out?.handle ?? null), ...(unverified ? { launched: 'unverified' } : {}), sessionSlug, pr: planned.pr, itemNum: planned.itemNum ?? null, lane: planned.lane, unknownTokens };
   } catch (e) {
     releaseOurClaim();
     throw e;
@@ -438,6 +440,13 @@ export async function runReconcileCiHealDispatch({
   const owedFlush = flushOwed(repoKey);
   const timeoutFollowups = await flushTimeouts({ root, repo: CONSTELLATION_REPOS[repoKey].slug });
   const reconciled = reconcile({ repo, ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
+  // A DEFERRED read planned nothing: owed is UNKNOWN, not zero. Skip the tick — no timeout reruns, no dispatch, no
+  // unsupported-row rewrite (that would RELEASE rows the unread PRs still owe) — and say so.
+  if (reconciled?.deferred === true) {
+    const readDeferred = String(reconciled.message ?? reconciled.reason ?? 'deferred').split('\n')[0];
+    console.error(`ci-heal-pr-dispatch: open-PR read deferred — owed unknown, skipping this tick: ${readDeferred}`);
+    return { dispatched: [], refusals: [], readDeferred, timeoutFollowups, reconcileRefusals: 0, reconcileRefusalDetails: [], owedFlush };
+  }
   const timeoutResults = [];
   for (const entry of (reconciled.dispatch ?? []).filter((row) => row.kind === 'ci-timeout-rerun')) {
     try {

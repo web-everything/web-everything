@@ -45,6 +45,15 @@ export const CASCADE_LAYERS = Object.freeze(['standard', 'platform', 'tool', 'en
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const UNSAFE = new Set(['__proto__', 'constructor', 'prototype']);
 
+function mergeLeaves(base, over) {
+  const out = { ...base };
+  for (const [k, v] of Object.entries(over)) {
+    if (UNSAFE.has(k)) continue;
+    out[k] = isObj(out[k]) && isObj(v) ? mergeLeaves(out[k], v) : v;
+  }
+  return out;
+}
+
 /**
  * IO: every platform preference, keyed by policy. routingOverrides is operator-only;
  * repo platform copies are ignored with a warning. Never throws.
@@ -65,7 +74,9 @@ export function readPlatformPreferences({ env = process.env, readFile = readFile
           warn(`policy-cascade: ${path}: ignoring routingOverrides; only the operator-owned preferences file may set it`);
           continue;
         }
-        if (!UNSAFE.has(k) && !k.startsWith('$')) prefs[k] = v;
+        // Per-leaf merge: a later file (the operator's) overrides only the leaves it sets; it never drops the
+        // earlier file's other leaves of the same policy (an operator `build.priority` must not erase `build.finalGate`).
+        if (!UNSAFE.has(k) && !k.startsWith('$')) prefs[k] = isObj(prefs[k]) && isObj(v) ? mergeLeaves(prefs[k], v) : v;
       }
     } catch (e) {
       if (e?.code !== 'ENOENT') errors.push(`${path}: ${String(e?.message ?? e).split('\n')[0]}`);

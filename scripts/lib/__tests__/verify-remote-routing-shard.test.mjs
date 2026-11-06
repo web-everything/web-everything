@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { runInNewContext } from 'node:vm';
-import { phaseAdmissionPlan, shouldConfirmRemoteRed, remoteInfrastructureFailure, mergeRunLocation, SHARD_RUN_SCRIPT } from '../verify-remote-routing.mjs';
+import { localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, remoteInfrastructureFailure, mergeRunLocation, SHARD_RUN_SCRIPT } from '../verify-remote-routing.mjs';
 import { verificationInfrastructureFailure, verifyFinishBody } from '../lane-verify.mjs';
 import { runShards } from '../verify-shard-run.mjs';
 import { createFailureCollector } from '../verify-failures.mjs';
@@ -157,4 +157,13 @@ it.each([1, 75].flatMap(remoteExit => [false, true].flatMap(phaseAdmission => [f
   expect(marker.status).toBe(status);
   if (status === 'red') expect(marker.failureDetails.summary).toBe('local failure');
   if (status === 'infrastructure-failure') expect(marker.infrastructure.reason).toBe('verify-unsettled');
+});
+
+// R495 — `vitest related` stays on the Mac by design (the remote wrapper maps only `vitest run`); name why.
+it('names the local-only reason for a vitest related phase and keeps raw-command for the rest', () => {
+  expect(localPhaseReason("npx vitest related 'scripts/a.mjs' --run --passWithNoTests && npm run check:standards"))
+    .toBe('vitest-related-local-only');
+  expect(localPhaseReason('NODE_ENV=x npx vitest related a.mjs --run')).toBe('vitest-related-local-only');
+  expect(localPhaseReason('npx vitest run a.test.mjs')).toBe('raw-command');
+  expect(localPhaseReason('echo hi')).toBe('raw-command');
 });

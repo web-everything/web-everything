@@ -29,6 +29,7 @@
  * `red-team-finished-result-never-published.mjs` uses the same automatic registration.
  * `review-hold-red-draft-deadlock.mjs` uses the same automatic registration.
  * `verdict-ledger-slow-push-race-refused.mjs` uses the same automatic registration.
+ * `fixing-tag-unverified-launch.mjs` uses the same automatic registration.
  *
  * This file itself stays a thin, EAGER entry point (a top-level `await` builds `BREAKS` once, at import time) —
  * the discovery/validation logic lives in `../registry-discovery.mjs` (generic, no eager directory scan) and

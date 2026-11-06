@@ -50,7 +50,7 @@ describe('merge-queue same-head failure admission', () => {
     __typename: 'HeadRefForcePushedEvent', createdAt, beforeCommit: { oid: prior }, afterCommit: { oid: after },
   });
   const timeline = (...nodes) => ({ nodes, hasPreviousPage: false });
-  const decide = evidence => decideMqSameHead({ pr, head, timeline: evidence });
+  const decide = (evidence, mergeState = 'CLEAN') => decideMqSameHead({ pr, head, timeline: evidence, mergeState });
   const released = { hold: false, line: null };
   const expectHold = (decision, detail) => {
     expect(decision.hold).toBe(true);
@@ -94,6 +94,7 @@ describe('merge-queue same-head failure admission', () => {
         }
         if (args.includes('mergeStateStatus,headRefOid,statusCheckRollup')) return JSON.stringify(f.live);
         if (args.some(arg => arg.includes('isInMergeQueue'))) return queueResponse(false, f.guardHead ?? head);
+        if (args.includes('mergeStateStatus,headRefOid')) return JSON.stringify({ mergeStateStatus: f.live.mergeStateStatus, headRefOid: head });
         return response(f.timeline ?? timeline(removed('failed_checks', f.guardHead ?? head)));
       });
       f.run = (selectedStore = store, identity = {}) => {
@@ -232,7 +233,7 @@ describe('merge-queue same-head failure admission', () => {
         expect(f.approvedHeadHold).not.toHaveBeenCalled();
         expect(f.log).toHaveBeenCalledWith(expect.stringMatching(/operator.*inspect/i));
       }));
-    it.each(['CI_FAILURE', 'MERGE_CONFLICT', 'FAILED_CHECKS', 'BRANCH_PROTECTION_FAILURE', 'INVALID_MERGE_COMMIT'])(
+    it.each(['CI_FAILURE', 'FAILED_CHECKS', 'BRANCH_PROTECTION_FAILURE', 'INVALID_MERGE_COMMIT'])(
       'explicit failure %s bound to the current head permits one refresh', reason => fixture(f => {
         f.timeline = timeline(removed(reason));
         expect(f.run().hold).toBe(true);
@@ -735,6 +736,24 @@ describe('merge-queue same-head failure admission', () => {
       });
       f.run(); expect(f.requests()).toHaveLength(0);
     }));
+    it('an unbound merge_conflict cannot confirm a same-head failure, so no refresh is spent', () => fixture(f => {
+      f.timeline = timeline({ ...removed('merge_conflict'), beforeCommit: null }, removed());
+      expectHold(f.run(), /— failed_checks$/);
+      expect(f.requests()).toHaveLength(0);
+    }));
+    it('a merge_conflict removal on a PR that is not CLEAN holds, and an unreadable state fails closed', () => fixture(f => {
+      f.timeline = timeline({ ...removed('merge_conflict'), beforeCommit: null });
+      f.live.mergeStateStatus = 'UNSTABLE';
+      expectHold(f.run(), /merge_conflict removal and the PR is not CLEAN \(UNSTABLE\)/);
+      f.live.mergeStateStatus = 'CLEAN';
+      expect(f.run()).toEqual({ hold: false, line: null });
+    }));
+    it('repeated merge_conflict alone cannot confirm a failure or spend a refresh', () => fixture(f => {
+      f.timeline = timeline(...Array.from({ length: 3 }, () => removed('merge_conflict')));
+      expectHold(f.run(), /repeated merge_conflict ejection \(3 times\)/);
+      expect(f.requests()).toHaveLength(0);
+      expect(existsSync(f.path)).toBe(false);
+    }));
     it('422 is logged and never retried, including by another store', () => fixture(f => {
       f.refused = true; f.run(); f.run(createMqSameHeadRefreshStore({ path: f.path }));
       expect(f.requests()).toHaveLength(1);
@@ -756,15 +775,280 @@ describe('merge-queue same-head failure admission', () => {
     }));
   });
 
+  describe('bounded failed_checks infrastructure retry', () => {
+    const perfect = { mainGreen: true, infra: 'infra', mergeState: 'CLEAN' };
+    const retryDecision = (retryEvidence = perfect, events = [removed()]) =>
+      decideMqSameHead({ pr, head, timeline: timeline(...events), retryEvidence });
+    const holdLine = `mq-same-head-failed: #${pr} head ${head} — failed_checks`;
+    const retryLine = why => `mq-same-head-retry: #${pr} head ${head} — failed_checks infra retry 1/1 (main green, PR CLEAN, ${why})`;
+
+    it.each(['infra', 'main-red'])('releases one same-head failed_checks removal with main green, CLEAN and %s evidence', infra => {
+      expect(retryDecision({ ...perfect, infra }).hold).toBe(false);
+    });
+    it.each([false, null, undefined])('holds when latest main CI success is absent or unknown (%s)', mainGreen => {
+      expect(retryDecision({ ...perfect, mainGreen })).toEqual({ hold: true, line: holdLine });
+    });
+    it('holds real test failures when main was not red at removal time', () => {
+      expect(retryDecision({ ...perfect, infra: null })).toEqual({ hold: true, line: holdLine });
+    });
+    it.each(['BEHIND', null, undefined])('holds when the same-head live PR is not known CLEAN (%s)', mergeState => {
+      expect(retryDecision({ ...perfect, mergeState })).toEqual({ hold: true, line: holdLine });
+    });
+    it.each([2, 3, 100])('holds %i same-head failed_checks removals even with perfect evidence and names the count', count => {
+      const result = retryDecision(perfect, Array.from({ length: count }, () => removed()));
+      expectHold(result, new RegExp(`failed_checks.*\\b${count}\\b`));
+    });
+    it.each(['ci_failure', 'branch_protection_failure', 'invalid_merge_commit'])(
+      'another same-head %s removal prevents the retry in either timeline order', reason => {
+        for (const events of [[removed(), removed(reason)], [removed(reason), removed()]]) {
+          expectHold(retryDecision(perfect, events), /failed_checks|ci_failure|branch_protection_failure|invalid_merge_commit/);
+        }
+      });
+    it('counts only failures bound to the current head', () => {
+      expect(retryDecision(perfect, [removed('failed_checks', prior), removed('ci_failure', prior), removed()]).hold).toBe(false);
+    });
+    it('perfect retry evidence cannot release a truncated timeline', () => {
+      expectHold(decideMqSameHead({ pr, head, retryEvidence: perfect,
+        timeline: { nodes: [removed()], hasPreviousPage: true } }), /inspect.*history/i);
+    });
+
+    function fixture(test) {
+      const run = (id, conclusion, created_at) => ({ id, conclusion, created_at, updated_at: created_at, status: 'completed',
+        path: '.github/workflows/ci.yml', head_branch: 'main', event: 'push' });
+      const f = { log: vi.fn(), events: [removed()], live: { headRefOid: head, mergeStateStatus: 'CLEAN' },
+        runs: [run(12, 'success', '2026-11-01T13:00:00Z'), run(11, 'success', '2026-11-01T11:00:00Z')],
+        checks: [{ id: 21, status: 'completed', conclusion: 'timed_out', output: { title: '', summary: '' } }] };
+      f.exec = vi.fn((command, args) => {
+        if (command !== 'gh') throw new Error('unexpected non-GitHub IO');
+        if (args.some(arg => arg.includes('isInMergeQueue'))) return queueResponse();
+        if (args.some(arg => arg.includes('timelineItems'))) return response(timeline(...f.events));
+        if (args.includes('mergeStateStatus,headRefOid')) return JSON.stringify(f.live);
+        const endpoint = args.find(arg => arg.startsWith(`repos/${repo}/`));
+        if (endpoint?.includes('/check-runs')) {
+          f.checkReads = (f.checkReads ?? 0) + 1;
+          if (f.checkError) throw new Error('check-runs unavailable');
+          if (f.checkPages) return JSON.stringify({ total_count: f.checkTotal,
+            check_runs: f.checkPages[f.checkReads - 1] });
+          if (f.checkReads > 1) throw new Error('next check-runs page unavailable');
+          return f.checkJson ?? JSON.stringify({ total_count: f.checkTotal ?? f.checks.length, check_runs: f.checks });
+        }
+        if (endpoint?.includes('/actions/') || (args[0] === 'run' && args[1] === 'list')) {
+          f.mainReads = (f.mainReads ?? 0) + 1;
+          if (f.mainError) throw new Error('main runs unavailable');
+          if (f.mainPages) return JSON.stringify({ total_count: f.mainTotal,
+            workflow_runs: f.mainPages[f.mainReads - 1] });
+          const runs = endpoint?.includes('status=completed')
+            ? f.runs.filter(run => run.status === 'completed') : f.runs;
+          return f.mainJson ?? JSON.stringify(args[0] === 'run'
+            ? f.runs.map(r => ({ ...r, databaseId: r.id, createdAt: r.created_at, headBranch: r.head_branch,
+              workflowName: 'CI' }))
+            : { total_count: runs.length, workflow_runs: runs });
+        }
+        throw new Error(`unexpected GitHub read: ${args.join(' ')}`);
+      });
+      f.guard = () => mqSameHeadGuard({ repo, pr, head, exec: f.exec, log: f.log });
+      f.expectHeld = () => {
+        expect(f.guard()).toEqual({ hold: true, line: holdLine });
+        expect(f.log.mock.calls[0]).toEqual([holdLine]);
+        // Only a decline-reason line may follow the unchanged hold line.
+        for (const [line] of f.log.mock.calls.slice(1)) expect(line).toMatch(/^mq-same-head-retry-declined: #6215 head \w+ — \S/);
+      };
+      test(f);
+    }
+
+    it.each(['cancelled', 'timed_out', 'startup_failure'])('guard logs retry 1/1 for infrastructure check conclusion %s', conclusion => fixture(f => {
+      f.checks[0].conclusion = conclusion;
+      expect(f.guard().hold).toBe(false);
+      expect(f.log.mock.calls).toEqual([[retryLine('infra')]]);
+      expect(f.checkReads).toBeGreaterThan(0);
+      expect(f.mainReads).toBeGreaterThan(0);
+      expect(f.exec.mock.calls.some(([, args]) => args.some(arg =>
+        arg.includes(`/commits/${removed().beforeCommit.oid}/check-runs`)))).toBe(true);
+      expect(f.exec.mock.calls.some(([, args]) => args.includes('mergeStateStatus,headRefOid'))).toBe(true);
+    }));
+    it.each([['title', 'Runner disconnected'], ['summary', 'Lost communication with worker'],
+      ['summary', 'SELF-HOSTED RUNNER went away']])('guard treats runner loss in output.%s as infrastructure (%s)', (field, text) => fixture(f => {
+      f.checks[0] = { ...f.checks[0], conclusion: 'failure', output: { [field]: text } };
+      expect(f.guard().hold).toBe(false);
+      expect(f.log.mock.calls).toEqual([[retryLine('infra')]]);
+    }));
+    it('guard holds when any failed check is a real test failure', () => fixture(f => {
+      f.checks.push({ id: 22, status: 'completed', conclusion: 'failure', output: { title: 'Assertion failed', summary: 'expected 1 to equal 2' } });
+      f.expectHeld();
+    }));
+    it.each(['title', 'summary'])('guard holds ordinary test-runner assertion failures in output.%s', field => fixture(f => {
+      f.checks[0] = { ...f.checks[0], conclusion: 'failure',
+        output: { [field]: 'Test runner reported failing assertions' } };
+      f.expectHeld();
+    }));
+    it.each(['Self-hosted runner reported failing assertions', 'Runner failed assertions',
+      'Test runner failed to execute assertions'])('guard holds real test failures mentioning runners: %s', text => fixture(f => {
+      f.checks[0] = { ...f.checks[0], conclusion: 'failure', output: { summary: text } };
+      f.expectHeld();
+    }));
+    it.each(['failure', 'cancelled', 'timed_out'])('guard permits main-red retry when latest CI before removal was %s and main is now green', conclusion => fixture(f => {
+      f.runs[1].conclusion = conclusion;
+      f.checks[0] = { ...f.checks[0], conclusion: 'failure', output: { title: 'Assertion failed' } };
+      expect(f.guard().hold).toBe(false);
+      expect(f.log.mock.calls).toEqual([[retryLine('main-red')]]);
+    }));
+    it('an older red main run cannot override a newer green run before removal', () => fixture(f => {
+      f.runs.push({ ...f.runs[1], id: 10, conclusion: 'failure', created_at: '2026-11-01T10:00:00Z' });
+      f.checks[0].conclusion = 'failure';
+      f.expectHeld();
+    }));
+    it('a red main run created before but completed after removal is not evidence main was red at removal', () => fixture(f => {
+      f.runs[1] = { ...f.runs[1], conclusion: 'failure', created_at: '2026-11-01T11:00:00Z', updated_at: '2026-11-01T13:00:00Z' };
+      f.checks[0] = { ...f.checks[0], conclusion: 'failure', output: { title: 'Assertion failed' } };
+      f.expectHeld();
+    }));
+    it('an assertion failure that mentions a runner disconnect is a real failure, not infrastructure', () => fixture(f => {
+      f.checks[0] = { ...f.checks[0], conclusion: 'failure',
+        output: { title: 'Failed', summary: 'AssertionError: Expected error "Runner disconnected" but received "assertion failed"' } };
+      f.runs[1].conclusion = 'success';
+      f.expectHeld();
+    }));
+    it('assertion text in output.text vetoes a runner-loss title', () => fixture(f => {
+      f.checks[0] = { ...f.checks[0], conclusion: 'failure',
+        output: { title: 'Runner disconnected', summary: '', text: 'AssertionError: expected 1 to be 2' } };
+      f.runs[1].conclusion = 'success';
+      f.expectHeld();
+    }));
+    it('failing-test wording in output.text vetoes a runner-loss title', () => fixture(f => {
+      f.checks[0] = { ...f.checks[0], conclusion: 'failure', output: { title: 'Runner disconnected', summary: '', text: '1 failing test' } };
+      f.expectHeld();
+    }));
+    it('a spent retry (re-enqueued after the failed removal, then manually removed) stays held', () => fixture(f => {
+      f.events = [removed(), { __typename: 'AddedToMergeQueueEvent', createdAt: '2026-11-01T12:30:00Z' },
+        { __typename: 'RemovedFromMergeQueueEvent', reason: 'MANUAL', createdAt: '2026-11-01T12:40:00Z' }];
+      const result = f.guard();
+      expect(result.hold).toBe(true);
+      expect(result.line).toMatch(/already spent/);
+    }));
+    it('logs why the retry was declined: a non-infrastructure failed check and main not red at removal', () => fixture(f => {
+      f.checks = [{ id: 21, status: 'completed', conclusion: 'cancelled', name: 'test', output: {} },
+        { id: 22, status: 'completed', conclusion: 'failure', name: 'merge-gate', output: { title: '', summary: '' } }];
+      f.expectHeld();
+      expect(f.log.mock.calls[1][0]).toBe(`mq-same-head-retry-declined: #${pr} head ${head} — non-infrastructure failed check(s): merge-gate; main was not red at removal`);
+    }));
+    it('logs why the retry was declined: main CI not green', () => fixture(f => {
+      f.runs[0].conclusion = 'failure';
+      f.expectHeld();
+      expect(f.log.mock.calls[1][0]).toBe(`mq-same-head-retry-declined: #${pr} head ${head} — main CI is not green`);
+    }));
+    it('logs why the retry was declined: PR not CLEAN', () => fixture(f => {
+      f.live.mergeStateStatus = 'BEHIND';
+      f.expectHeld();
+      expect(f.log.mock.calls[1][0]).toBe(`mq-same-head-retry-declined: #${pr} head ${head} — PR is not CLEAN (BEHIND)`);
+    }));
+    it('logs why the retry was declined: unreadable evidence', () => fixture(f => {
+      f.checkError = true;
+      f.expectHeld();
+      expect(f.log.mock.calls[1][0]).toBe(`mq-same-head-retry-declined: #${pr} head ${head} — retry evidence unreadable or incomplete`);
+    }));
+    it('a main run with unreadable completion time keeps the hold', () => fixture(f => {
+      delete f.runs[0].updated_at;
+      f.runs[1].conclusion = 'failure';
+      f.checks[0].conclusion = 'failure';
+      f.expectHeld();
+    }));
+    it('a red main run created at removal time is not evidence main was red before removal', () => fixture(f => {
+      f.runs[1] = { ...f.runs[1], conclusion: 'failure', created_at: removed().createdAt };
+      f.checks[0].conclusion = 'failure';
+      f.expectHeld();
+    }));
+    it.each(['failure', null, undefined])('guard holds when latest completed main CI conclusion is %s', conclusion => fixture(f => {
+      f.runs[0].conclusion = conclusion;
+      f.expectHeld();
+    }));
+    it.each(['queued', 'in_progress'])('guard holds for a newer %s main push despite older successful CI', status => fixture(f => {
+      f.runs.push({ ...f.runs[0], id: 13, created_at: '2026-11-01T14:00:00Z', status, conclusion: null });
+      f.expectHeld();
+      const mainArgs = f.exec.mock.calls.find(([, args]) => args.some(arg => arg.includes('/actions/')))[1];
+      expect(mainArgs.join(' ')).not.toContain('status=completed');
+    }));
+    it('guard holds at the five-page check-run cap without reading main or merge state', () => fixture(f => {
+      f.checkTotal = 501;
+      f.checkPages = Array.from({ length: 5 }, (_, page) => Array.from({ length: 100 }, (_, index) =>
+        ({ ...f.checks[0], id: page * 100 + index + 1 })));
+      f.expectHeld();
+      expect(f.checkReads).toBe(5);
+      expect(f.mainReads ?? 0).toBe(0);
+      expect(f.exec).toHaveBeenCalledTimes(7); // Queue, timeline, then five REST pages.
+    }));
+    it('guard holds after ten shared REST pages when main history remains incomplete', () => fixture(f => {
+      f.checkTotal = 500;
+      f.checkPages = Array.from({ length: 5 }, (_, page) => Array.from({ length: 100 }, (_, index) =>
+        ({ ...f.checks[0], id: page * 100 + index + 1 })));
+      f.mainTotal = 501;
+      f.mainPages = Array.from({ length: 5 }, (_, page) => Array.from({ length: 100 }, (_, index) =>
+        ({ ...f.runs[0], id: page * 100 + index + 1 })));
+      f.expectHeld();
+      expect(f.checkReads).toBe(5);
+      expect(f.mainReads).toBe(5);
+      expect(f.exec).toHaveBeenCalledTimes(12); // Queue, timeline, then ten shared REST pages.
+      for (const kind of ['/check-runs', '/actions/']) {
+        const endpoints = f.exec.mock.calls.flatMap(([, args]) => args.filter(arg => arg.includes(kind)));
+        expect(endpoints.map(endpoint => new URLSearchParams(endpoint.split('?')[1]).get('page')))
+          .toEqual(['1', '2', '3', '4', '5']);
+      }
+    }));
+    it.each(['check-runs throws', 'check-runs bad JSON', 'main runs throws', 'main runs bad JSON',
+      'missing check conclusion', 'no check-runs', 'no failed check-runs', 'truncated check-runs',
+      'missing main conclusion', 'no main runs', 'head moved', 'unknown merge state', 'BEHIND'])(
+      'guard fails closed with the existing hold line: %s', kind => fixture(f => {
+        if (kind === 'check-runs throws') f.checkError = true;
+        if (kind === 'check-runs bad JSON') f.checkJson = '{';
+        if (kind === 'main runs throws') f.mainError = true;
+        if (kind === 'main runs bad JSON') f.mainJson = '{';
+        if (kind === 'missing check conclusion') delete f.checks[0].conclusion;
+        if (kind === 'no check-runs') f.checks = [];
+        if (kind === 'no failed check-runs') f.checks[0].conclusion = 'success';
+        if (kind === 'truncated check-runs') f.checkTotal = 100_000;
+        if (kind === 'missing main conclusion') delete f.runs[0].conclusion;
+        if (kind === 'no main runs') f.runs = [];
+        if (kind === 'head moved') f.live.headRefOid = prior;
+        if (kind === 'unknown merge state') delete f.live.mergeStateStatus;
+        if (kind === 'BEHIND') f.live.mergeStateStatus = 'BEHIND';
+        f.expectHeld();
+      }));
+  });
+
   it('#6215 pattern: removed for failed_checks at H holds at H, using the second parent', () => {
     expect(decide(timeline(removed()))).toEqual({ hold: true, line: `mq-same-head-failed: #6215 head ${head} — failed_checks` });
   });
-  it.each(['branch_protection_failure', 'invalid_merge_commit', 'merge_conflict'])('removal for %s holds the tested head', reason => {
+  it.each(['branch_protection_failure', 'invalid_merge_commit', 'ci_failure'])('removal for %s holds the tested head', reason => {
     expect(decide(timeline(removed(reason)))).toEqual({ hold: true, line: `mq-same-head-failed: #6215 head ${head} — ${reason}` });
   });
-  it.each(['manual', 'merged', ' MANUAL ', ' MERGED '])('removed with release reason %s permits re-enqueue regardless of binding', reason => {
+  it.each(['manual', 'merged', ' MANUAL ', ' MERGED ', 'merge_conflict', ' MERGE_CONFLICT '])('removed with release reason %s permits re-enqueue regardless of binding', reason => {
     for (const beforeCommit of [removed(reason).beforeCommit, null, { parents: { nodes: [] } }]) {
       expect(decide(timeline({ ...removed(reason), beforeCommit }))).toEqual(released);
+    }
+  });
+  it.each([['UNSTABLE'], ['DIRTY'], [null]])('merge_conflict removal holds unless the live PR is CLEAN (%s)', state => {
+    expect(decide(timeline({ ...removed('merge_conflict'), beforeCommit: null }), state).hold).toBe(true);
+  });
+  it('#6288: merge_conflict with null commit binding releases a CLEAN candidate', () => {
+    expect(decide(timeline({ ...removed('merge_conflict'), beforeCommit: null }))).toEqual(released);
+  });
+  it('two merge_conflict removals release regardless of head binding', () => {
+    expect(decide(timeline(removed('merge_conflict'),
+      { ...removed('merge_conflict', prior), beforeCommit: null }))).toEqual(released);
+  });
+  it.each([3, 4, 100])('R466: %i merge_conflict removals hold with an operator fallback', count => {
+    const events = Array.from({ length: count }, (_, i) => ({
+      ...removed(i % 2 ? ' MERGE_CONFLICT ' : 'merge_conflict', prior), beforeCommit: null,
+    }));
+    expect(decide(timeline(...events))).toEqual({ hold: true,
+      line: `mq-same-head-failed: #${pr} head ${head} — repeated merge_conflict ejection (${count} times); operator must inspect history and enqueue manually` });
+  });
+  it.each([false, true])('merge_conflict preserves failed_checks head binding (same head: %s)', sameHead => {
+    const conflict = { ...removed('merge_conflict'), beforeCommit: null };
+    const failure = removed('failed_checks', sameHead ? head : prior);
+    for (const events of [[conflict, failure], [failure, conflict]]) {
+      const decision = decide(timeline(...events));
+      if (sameHead) expectHold(decision, /— failed_checks$/);
+      else expect(decision).toEqual(released);
     }
   });
   it('removed with merge-group parent pointing at an OLDER head releases the new head', () => {
@@ -793,10 +1077,10 @@ describe('merge-queue same-head failure admission', () => {
     'compares tested OID %s and current OID %s case-insensitively', (testedHead, currentHead) => {
       expect(decideMqSameHead({ pr, head: currentHead, timeline: timeline(removed('failed_checks', testedHead)) }).hold).toBe(true);
     });
-  // Prevention owed: add recorded GitHub merge_conflict and branch_protection_failure payloads here.
+  // Prevention owed: add recorded GitHub branch_protection_failure payloads here.
   // These null-beforeCommit fixtures are synthetic; this repair runs without live GitHub access.
   it('a server-timestamped force push cannot bind an old unbound failure to a different head', () => {
-    for (const reason of ['merge_conflict', 'branch_protection_failure', 'invalid_merge_commit']) {
+    for (const reason of ['ci_failure', 'branch_protection_failure', 'invalid_merge_commit']) {
       expectHold(decide(timeline({ ...removed(reason), beforeCommit: null }, pushed())), /no commit binding/i);
     }
   });
@@ -805,7 +1089,7 @@ describe('merge-queue same-head failure admission', () => {
     for (let seed = 1; seed <= 64; seed++) {
       const currentHead = seed.toString(16).padStart(40, '0');
       const events = Array.from({ length: seed % 20 + 1 }, (_, i) => ({
-        ...removed(i % 2 ? 'merge_conflict' : 'branch_protection_failure', prior),
+        ...removed(i % 2 ? 'ci_failure' : 'branch_protection_failure', prior),
         createdAt: new Date(Date.UTC(2026, 10, 1, 0, 0, i)).toISOString(),
       }));
       events.push(pushed(currentHead));
@@ -844,7 +1128,7 @@ describe('merge-queue same-head failure admission', () => {
   });
   it('restoring a failed head after an invisible fast-forward detour retains its hold', () => {
     // H -> J is a fast-forward, so the filtered timeline only records J -> H.
-    const failure = { ...removed('merge_conflict'), beforeCommit: null };
+    const failure = { ...removed('failed_checks'), beforeCommit: null };
     expectHold(decide(timeline(failure, pushed())), /no commit binding/i);
   });
   it.each([null, { error: 'API unavailable' }, {}, { nodes: null }, { nodes: {} }])('unreadable timeline %j holds', evidence => {
@@ -909,8 +1193,8 @@ describe('merge-queue same-head failure admission', () => {
     const exec = withQueue(() => response(timeline(removed()))), log = vi.fn();
     const result = mqSameHeadGuard({ repo, pr, head, exec, log });
     expect(result).toEqual(decide(timeline(removed())));
-    expect(exec).toHaveBeenCalledTimes(2);
-    expect(log.mock.calls).toEqual([[result.line]]);
+    expect(exec).toHaveBeenCalledTimes(3); // Queue, timeline, then the unreadable infra-retry evidence read (fails closed).
+    expect(log.mock.calls).toEqual([[result.line], [`mq-same-head-retry-declined: #${pr} head ${head} — retry evidence unreadable or incomplete`]]);
   });
   it('mqSameHeadGuard releases manual removal without logging a hold', () => {
     const exec = withQueue(() => response(timeline(removed('manual')))), log = vi.fn();
@@ -930,8 +1214,8 @@ describe('merge-queue same-head failure admission', () => {
     const exec = vi.fn((_command, args) => args.some(arg => arg.includes('isInMergeQueue'))
       ? queueResponse(true) : response(timeline(removed()))), log = vi.fn();
     expectHold(mqSameHeadGuard({ repo, pr, head, exec, log, allowAlreadyQueued: false }), /failed_checks/);
-    expect(exec).toHaveBeenCalledTimes(2);
-    expect(log).toHaveBeenCalledTimes(1);
+    expect(exec).toHaveBeenCalledTimes(3); // Queue, timeline, then the unreadable infra-retry evidence read.
+    expect(log).toHaveBeenCalledTimes(2); // The hold line plus its decline-reason line.
   });
   it.each([true, null, undefined, 'throws'])('mutation admission fails closed for decision %s', decision => {
     const sameHeadAdmission = vi.fn(() => {

@@ -709,6 +709,8 @@ export function fetchCardScopeAtRef(path, ref, { exec = execFileSyncThrottled, r
     });
     const decoded = Buffer.from(String(out || '').trim(), 'base64').toString('utf8');
     const { data } = matter(decoded);
+    // Raw authored entries, unsplit: resolvePrWorkUnit splits each one and keeps it only when EVERY piece is
+    // safe and in the PR's diff, so one bad piece never leaves a sibling alone in the fence (#6424).
     return Array.isArray(data?.scope) ? data.scope.map(String) : [];
   } catch {
     return [];
@@ -1886,6 +1888,13 @@ export function runReconcileFixDispatch({
   const reconciledRaw = reconcile({ repo, allowStandDownAutoProceed,
     ...(readPrs ? { readPrs } : {}),
     ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
+  // A DEFERRED read (gh low budget / slot throttle / author-lookup budget) planned nothing: owed is UNKNOWN, not zero.
+  // Skip the tick — no dispatch decision, no refusal records, nothing released — and say so.
+  if (reconciledRaw?.deferred === true) {
+    const readDeferred = String(reconciledRaw.message ?? reconciledRaw.reason ?? 'deferred').split('\n')[0];
+    console.error(`reconcile-fix-dispatch: open-PR read deferred — owed unknown, skipping this tick: ${readDeferred}`);
+    return { dispatched: [], refusals: [], readDeferred, reconcileRefusals: 0, reconcileRefusalDetails: [] };
+  }
   const reconciled = netScope ? netScope(reconciledRaw, { root, repoKey }) : reconciledRaw;
   const dispatchEntries = Array.isArray(reconciled.dispatch) ? reconciled.dispatch : [];
   const profile = resolveProfile(repoKey);

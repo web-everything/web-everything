@@ -9,6 +9,8 @@ import { readdirSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { workspaceFor } from './lane-pool-paths.mjs';
+import { memoryFreePct, memoryAvailableMb } from './memory-available.mjs';
+import { loadHostOverloadSettings, DEFAULT_SNAPSHOT_MAX_FRESH_MS } from './host-overload-settings.mjs';
 import { admissionStatus, admissionLockRoot, resolveCap } from '../readiness/heavy-admission.mjs';
 
 const round = n => Math.round(n * 10) / 10;
@@ -75,11 +77,11 @@ export function swapUsedPct(text) {
   if (!Number.isFinite(total) || !Number.isFinite(used)) return null;
   return total > 0 ? round(used / total * 100) : 0;
 }
-export function buildSnapshot({ sampledAtMs, intervalMs, cpuIdlePct, cores, loadAvg, memPressureLevel, memFreePct, swapUsedPct: swapPct, disk, fseventsdCpuPct, heavySlots, agentSessions, laneCount, errors = [] }) {
+export function buildSnapshot({ sampledAtMs, intervalMs, maxFreshMs = DEFAULT_SNAPSHOT_MAX_FRESH_MS, cpuIdlePct, cores, loadAvg, memPressureLevel, memFreePct, memAvailableMb, memFloorMb, memFloorSource, memMetric, swapUsedPct: swapPct, disk, fseventsdCpuPct, heavySlots, agentSessions, laneCount, errors = [] }) {
   return { schema: 'resource-snapshot/1', sampledAt: new Date(sampledAtMs).toISOString(),
-    freshUntil: new Date(sampledAtMs + 3 * intervalMs).toISOString(), intervalMs,
+    freshUntil: new Date(sampledAtMs + Math.min(3 * intervalMs, maxFreshMs)).toISOString(), intervalMs,
     cpu: { idlePct: finite(cpuIdlePct), cores: finite(cores), loadAvg: [0, 1, 2].map(i => finite(loadAvg?.[i])) },
-    memory: { pressureLevel: finite(memPressureLevel), freePct: finite(memFreePct), swapUsedPct: finite(swapPct) },
+    memory: { pressureLevel: finite(memPressureLevel), freePct: finite(memFreePct), metric: memMetric ?? null, availableMb: finite(memAvailableMb), floorMb: finite(memFloorMb), floorSource: memFloorSource ?? null, swapUsedPct: finite(swapPct) },
     disk: { busyPct: finite(disk?.busyPct), ioDepth: finite(disk?.ioDepth), readMBps: finite(disk?.readMBps), writeMBps: finite(disk?.writeMBps) },
     // macOS exposes no public fsevents backlog counter.
     fsevents: { fseventsdCpuPct: finite(fseventsdCpuPct), backlog: null },
@@ -123,18 +125,27 @@ export function createSampler({ exec = execFileSync, cpus = os.cpus, loadavg = o
       const value = memoryPressureLevel(run('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level']));
       if (value === null) throw Error('unrecognized memory pressure'); return value;
     });
-    const memFreePct = probe('memFreePct', () => {
-      const free = freemem(); const total = totalmem();
-      if (!Number.isFinite(free) || !Number.isFinite(total) || total <= 0) throw Error('invalid memory totals');
-      return round(free / total * 100);
-    });
+    // One policy read per sample. An unreadable or invalid policy publishes NO memory reading at all (R559): no
+    // percent, no available MB, no floor, no metric. The admission gate then refuses (floor) and the cap cannot raise.
+    let memPolicy = null;
+    let maxFreshMs = DEFAULT_SNAPSHOT_MAX_FRESH_MS;
+    try {
+      const { settings, sources } = loadHostOverloadSettings({ log: () => {} });
+      maxFreshMs = settings.host.capacity.snapshotMaxFreshMs;
+      memPolicy = { metric: settings.host.capacity.memoryMetric, floorMb: settings.host.capacity.memAvailableFloorMb,
+        floorSource: sources['host.capacity.memAvailableFloorMb'] ?? 'standard' };
+    } catch { memPolicy = null; }
+    const needPolicy = () => { if (!memPolicy) throw Error('memory policy unreadable'); return memPolicy; };
+    const memFreePct = probe('memFreePct', () => memoryFreePct({ metric: needPolicy().metric, exec: run, freemem, totalmem }));
+    const memAvailableMb = probe('memAvailableMb', () => memoryAvailableMb({ metric: needPolicy().metric, exec: run, freemem }));
     const swapPct = probe('swapUsedPct', () => {
       const value = swapUsedPct(run('sysctl', ['-n', 'vm.swapusage']));
       if (value === null) throw Error('unrecognized swap usage'); return value;
     });
     const procs = probe('ps', () => parsePsCpu(run('ps', ['-A', '-o', 'pid=,pcpu=,comm='])));
-    const snapshot = buildSnapshot({ sampledAtMs, intervalMs, cpuIdlePct, cores: nextCpus?.length,
-      loadAvg: probe('loadavg', loadavg), memPressureLevel, memFreePct, swapUsedPct: swapPct, disk,
+    const snapshot = buildSnapshot({ sampledAtMs, intervalMs, maxFreshMs, cpuIdlePct, cores: nextCpus?.length,
+      loadAvg: probe('loadavg', loadavg), memPressureLevel, memFreePct, memAvailableMb, memFloorMb: memPolicy?.floorMb, memFloorSource: memPolicy?.floorSource, memMetric: memPolicy?.metric,
+      swapUsedPct: swapPct, disk,
       fseventsdCpuPct: procs === null ? null : fseventsCpuPct(procs),
       agentSessions: procs === null ? null : countAgentSessions(procs),
       heavySlots: probe('heavySlots', readHeavySlots), laneCount: probe('laneCount', countLanes), errors });
