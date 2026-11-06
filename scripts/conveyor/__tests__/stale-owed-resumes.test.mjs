@@ -79,10 +79,22 @@ describe('stale owed resumes (R618)', () => {
     }
   });
 
-  it.each(['who', 'lane'])('conflicting sessions cannot supersede via matching %s', field => {
+  it.each(['who', 'lane', 'both'])('conflicting sessions cannot supersede via matching %s', field => {
     const old = entry('old-session', 1);
-    const newer = entry('new-session', 1, 1000, { [field]: old.record[field], sha: 'b'.repeat(40) });
+    const shared = field === 'both' ? { who: old.record.who, lane: old.record.lane } : { [field]: old.record[field] };
+    const newer = entry('new-session', 1, 1000, { ...shared, sha: 'b'.repeat(40) });
     expect(classifyStaleOwed({ owed: [old], records: [old, newer] })).toEqual([]);
+  });
+
+  it('item-keyed waiters without a PR never supersede each other', () => {
+    // A no-push kind passes isHarnessRecord with only an item, so only the r.pr guard keeps two such waiters apart.
+    const item = { kind: 'delivery', item: 5 };
+    const old = entry('item-old', undefined, 0, item);
+    const newer = entry('item-new', undefined, 1000, { ...item, sessionId: old.record.sessionId, sha: 'b'.repeat(40) });
+    expect(isHarnessRecord(newer.record)).toBe(true);
+    expect(classifyStaleOwed({ owed: [old], records: [old, newer] })).toEqual([]);
+    old.record.pr = newer.record.pr = 1; // positive control: the same pair with a PR is superseded
+    expect(classifyStaleOwed({ owed: [old], records: [old, newer] })).toEqual([old.key]);
   });
 
   it.each(['MERGED', 'CLOSED'])('%s pending previous-CI repair stays on disk without admission or wake', async () => {
@@ -243,8 +255,12 @@ describe('stale owed resumes (R618)', () => {
 
   it.each(['lower-to-upper', 'upper-to-lower'])('retains the same commit across SHA case changes: %s', async mode => {
     const old = entry('case-old', 1, 0, { sha: (mode === 'upper-to-lower' ? 'A' : 'a').repeat(40) });
-    const newer = entry('case-new', 1, 1000, { who: old.record.who,
+    // Matching session id: lineage is eligible, so only the SHA comparison can keep the waiter.
+    const newer = entry('case-new', 1, 1000, { sessionId: old.record.sessionId,
       sha: (mode === 'upper-to-lower' ? 'a' : 'A').repeat(40) });
+    // Positive control: the same lineage with a genuinely different commit retires the waiter.
+    expect(classifyStaleOwed({ owed: [old], records: [old, { ...newer, record: { ...newer.record, sha: 'b'.repeat(40) } }] }))
+      .toEqual([old.key]);
     expect(classifyStaleOwed({ owed: [old], records: [old, newer] })).toEqual([]);
     const h = harness([old, newer]);
     expect((await h.pass(0)).cleared).toEqual([]);
@@ -397,9 +413,12 @@ describe('stale owed resumes (R618)', () => {
   ])('a newer record with malformed %s never retires a valid pending waiter', async (_field, malformed) => {
     const key = _field.replaceAll(' ', '-');
     const old = entry(`valid-${key}`, 1);
-    const newer = entry(`malformed-${key}`, 1, 1000, {
-      who: old.record.who, sha: 'b'.repeat(40), pendingResume: undefined, ...malformed,
-    });
+    // Matching session id and every other guard satisfied: only the malformed field can keep the waiter.
+    const base = { sessionId: old.record.sessionId, sha: 'b'.repeat(40), pendingResume: undefined };
+    const valid = entry(`valid-successor-${key}`, 1, 1000, base);
+    expect(isHarnessRecord(valid.record)).toBe(true);
+    expect(classifyStaleOwed({ owed: [old], records: [old, valid] })).toEqual([old.key]);
+    const newer = entry(`malformed-${key}`, 1, 1000, { ...base, ...malformed });
     expect(isHarnessRecord(old.record)).toBe(true);
     expect(isHarnessRecord(newer.record)).toBe(false);
     expect(classifyStaleOwed({ owed: [old], records: [old, newer] })).toEqual([]);
@@ -439,6 +458,43 @@ describe('stale owed resumes (R618)', () => {
     const old = entry('matching-session-old', 1);
     const newer = entry('matching-session-new', 1, 1000, { sessionId: old.record.sessionId, sha: 'b'.repeat(40) });
     expect(classifyStaleOwed({ owed: [old], records: [old, newer] })).toEqual([old.key]);
+  });
+
+  // Every case below shares one session lineage with an otherwise-eligible successor and varies a single condition,
+  // so removing any one classification guard turns exactly its own case red.
+  it.each([
+    ['valid successor with a pending resume', {}, {}, true],
+    ['valid successor without pendingResume (non-owed)', {}, { pendingResume: undefined }, true],
+    ['different repo', {}, { repo: 'other/repo' }, false],
+    ['different PR', {}, { pr: 2 }, false],
+    ['different kind', {}, { kind: 'ci-heal' }, false],
+    ['same SHA', {}, { sha: 'a'.repeat(40) }, false],
+    ['same SHA in another case', {}, { sha: 'A'.repeat(40) }, false],
+    ['equal request time', {}, { requestedAt: new Date(T0).toISOString() }, false],
+    ['earlier request time', {}, { requestedAt: new Date(T0 - 1000).toISOString() }, false],
+    ['superseded waiter holds previousCi inventory', { previousCi: { ready: { ciFailures: ['unit'] } } }, {}, false],
+    ['superseded waiter lacks repo', { repo: undefined }, { repo: undefined }, false],
+    ['superseded waiter lacks sha', { sha: undefined }, {}, false],
+  ])('supersession eligibility: %s', (_name, oldExtra, newerExtra, retires) => {
+    const old = entry('elig-old', 1, 0, oldExtra);
+    const newer = entry('elig-new', 1, 1000, { sessionId: old.record.sessionId, sha: 'b'.repeat(40), ...newerExtra });
+    expect(classifyStaleOwed({ owed: [old], records: [old, newer] })).toEqual(retires ? [old.key] : []);
+  });
+
+  it('reads PR state once per distinct repo and PR per pass', async () => {
+    const other = { repo: 'other/repo' };
+    const h = harness([entry('dup-a1', 1), entry('dup-a2', 1, 1), entry('dup-b', 2, 2), entry('dup-other', 1, 3, other),
+      entry('dup-fail1', 3, 4), entry('dup-fail2', 3, 5)]);
+    h.io.prState = vi.fn((repo, pr) => { if (pr === 3) throw Error('offline'); return { open: true }; });
+    await h.pass(0);
+    const calls = h.io.prState.mock.calls.map(c => JSON.stringify(c)).sort();
+    expect(calls).toEqual([
+      ['other/repo', 1], ['web-everything/web-everything', 1],
+      ['web-everything/web-everything', 2], ['web-everything/web-everything', 3],
+    ].map(c => JSON.stringify(c)).sort());
+    await h.pass(0);
+    expect(h.io.prState).toHaveBeenCalledTimes(8);
+    expect(h.store.size).toBe(6); // failed and open lookups retain every record
   });
 
   it('missing lineage and a different kind cannot supersede a waiter', () => {
