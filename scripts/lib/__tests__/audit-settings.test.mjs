@@ -123,6 +123,16 @@ describe('audit settings (R528)', () => {
       expect(bad.value.guardFloorPaths).toEqual(STRICT_PATHS);
     });
   });
+  it('a scalar names the layer it came from: file, platform or built-in (PR #6381 send-back)', () => {
+    const plat = resolveAuditSettings({ fileRead: () => JSON.stringify({ audit: {} }), platform: { releaseStage: 'prod', recheck: { max: 0 } },
+      env: {}, log: () => {} });
+    expect(plat.value).toMatchObject({ releaseStage: 'prod', recheckMax: 0 });
+    expect(plat.sources).toMatchObject({ releaseStage: 'platform', recheckMax: 'platform', verdictMode: 'built-in', preExistingMode: 'built-in' });
+    const both = resolveAuditSettings({ fileRead: file({ releaseStage: 'prod' }), platform: { releaseStage: 'prerelease', recheck: { max: 0 } },
+      env: {}, log: () => {} });
+    expect(both.value).toMatchObject({ releaseStage: 'prod', recheckMax: 0 });
+    expect(both.sources).toMatchObject({ releaseStage: 'file', recheckMax: 'platform', baseRecheckMax: 'built-in' });
+  });
   it('env preExisting mode allow resolves to block, even over a file prove (PR #6381 judge)', () => {
     for (const fileMode of ['prove', 'block']) {
       const r = resolve(full({ preExisting: { mode: fileMode, baseRecheckMax: 3 } }), { WE_AUDIT_PREEXISTING_MODE: 'allow' });

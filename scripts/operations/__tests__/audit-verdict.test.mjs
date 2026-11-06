@@ -173,7 +173,35 @@ describe('R473 pure classified verdict', () => {
 
   const protectedFiles = ['scripts/lib/file-locks.mjs', 'scripts/lib/file-locks-cache.mjs',
     'scripts/lease-reaper.mjs', 'scripts/slot-lock-reaper.mjs', 'scripts/lock-reaper.mjs',
-    'scripts/lane-pool.mjs', 'scripts/merge.mjs', 'scripts/drain.mjs', 'scripts/mq.mjs'];
+    'scripts/lane-pool.mjs', 'scripts/merge.mjs', 'scripts/drain.mjs', 'scripts/mq.mjs',
+    // PR #6381 send-back (R639): the concurrency words match ANYWHERE in the basename, not only at its start.
+    'scripts/readiness/forge-slot-markers.mjs', 'scripts/conveyor/fixer-slot-rules.mjs', 'scripts/lib/fix-slot-borrow.mjs',
+    'scripts/conveyor/health-smells/lane-worker-without-lease.mjs', 'scripts/lib/drain-merge-strategy.mjs', 'scripts/lib/fast-drain-scope.mjs',
+    'scripts/conveyor/load-flake-merge-main.mjs', 'scripts/conveyor/pass-daemons/pr-merge-watch-pass.mjs',
+    'scripts/x-slot.mjs', 'scripts/x-lease.mjs', 'scripts/x-lock-reaper.mjs', 'scripts/x-lane-pool.mjs', 'scripts/x-file-locks.mjs',
+    'scripts/x-merge.mjs', 'scripts/x-drain.mjs', 'scripts/x-mq.mjs', 'scripts/a/x-lock-reaper.mjs', 'scripts/a/x-lane-pool.mjs',
+    'scripts/a/x-file-locks.mjs', 'scripts/a/x-mq.mjs'];
+  it('a D3 slot-ownership race in scripts/readiness/forge-slot-markers.mjs never clears as NOT WEAKENED (PR #6381 send-back)', async () => {
+    for (const stage of ['prerelease', 'prod']) {
+      for (const extra of [{ interleaving }, {}]) {
+        const f = finding({ class: 'D3', file: 'scripts/readiness/forge-slot-markers.mjs', invariant: 'One slot has one owner',
+          trigger: 'A reads the free slot; B claims it; A claims it too', consequence: 'Two workers own one slot', ...extra });
+        const result = await compute([f], options(stage));
+        expect(result.verdict).toBe('WEAKENED');
+        expect(result.ships).toEqual([]);
+        expect(result.cards).toEqual([]);
+        if (extra.interleaving) expect(result.blocks).toEqual([expect.objectContaining({ id: 'f1', class: 'B4' })]);
+      }
+    }
+  });
+  // The anywhere-in-basename globs also capture files whose name holds the word inside another word (`release` holds
+  // `lease`) and golden-corpus data. Protecting more only ever blocks more, so this over-capture is accepted and listed.
+  it.each(['scripts/conveyor/orphan-claim-release.mjs', 'scripts/conveyor/prepare-failure-releases.json',
+    'scripts/golden-corpus/hook-guard-lane/own-leased-lane-edit.json',
+    'scripts/golden-corpus/backlog-resolve/b10e9466-2290-collapse-all-land-routes-to-drain-only-the-drain-is-the-sole.json'])(
+    'the accepted over-capture %s is on the floor', async file => {
+      expect((await compute([finding({ class: 'E2', file })], options())).verdict).toBe('WEAKENED');
+    });
   it.each([
     './scripts/lib/file-locks.mjs',
     'a/../scripts/lib/file-locks.mjs',
@@ -239,8 +267,9 @@ describe('R473 pure classified verdict', () => {
   it('glob matching keeps its meaning: * stays in one segment, ** spans directories, other characters are literal', async () => {
     const isProtected = async (file, pattern) => (await compute([finding({ file })], options('prerelease', { raceBlockPaths: [pattern] }))).recheck.length > 0;
     for (const [file, pattern, want] of [
-      ['custom/a/b.mjs', 'custom/**', true], ['custom.mjs', 'custom/**', false], ['scripts/x-lease.mjs', 'scripts/*lease*', true],
-      ['scripts/a/x-lease.mjs', 'scripts/*lease*', false], ['scripts/a/b/lease.mjs', 'scripts/**/lease*', true],
+      // A word the floor does not name (`lease` is now on it anywhere under scripts/, PR #6381 send-back).
+      ['custom/a/b.mjs', 'custom/**', true], ['custom.mjs', 'custom/**', false], ['scripts/x-widget.mjs', 'scripts/*widget*', true],
+      ['scripts/a/x-widget.mjs', 'scripts/*widget*', false], ['scripts/a/b/widget.mjs', 'scripts/**/widget*', true],
       ['a/b/c', 'a/*/c', true], ['a/b/d/c', 'a/*/c', false], ['a/b/d/c', 'a/**/c', true], ['a/x/y/b', 'a**b', true],
       ['ab', 'a***b', true], ['a/b', 'a*b', false], ['a.b', 'a.b', true], ['axb', 'a.b', false], ['ab', 'a?b', false],
       ['a?b', 'a?b', true], ['a[x]', 'a[x]', true], ['ax', 'a[x]', false], ['a+', 'a+', true], ['aa', 'a+', false],

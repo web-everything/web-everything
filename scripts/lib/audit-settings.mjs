@@ -87,10 +87,14 @@ const FLOOR_SETTINGS = Object.freeze([
   'scripts/lib/delivery-platform-preferences.json', 'scripts/lib/delivery-priority-settings.json', 'scripts/lib/poc-branches.json',
   'scripts/exec-output-baseline.json', 'scripts/pr-comment-read-baseline.json', 'scripts/check-standards.contract.json',
   'scripts/lib/dispatch-routing-policy.json', 'scripts/ci/test-timings.json', 'scripts/lib/model-probation.json', 'scripts/lib/swept-repos.json']);
-export const GUARD_FLOOR = Object.freeze(['scripts/**/file-locks*', 'scripts/*file-locks*', 'scripts/**/lease*', 'scripts/*lease*',
+// The concurrency words match ANYWHERE in the basename (`forge-slot-markers.mjs`, `lane-worker-without-lease.mjs`), not
+// only at its start (PR #6381 send-back). `**/` needs at least one folder, so each entry has a twin for scripts/ itself.
+// This also protects names holding the word inside another word (`release` holds `lease`): protecting more only ever
+// blocks more, and the audit-verdict test lists that over-capture.
+export const GUARD_FLOOR = Object.freeze(['scripts/**/*file-locks*', 'scripts/*file-locks*', 'scripts/**/*lease*', 'scripts/*lease*',
   'scripts/lib/lane-lease.mjs', 'scripts/readiness/scope-lease*',
-  'scripts/**/slot*', 'scripts/*slot*', 'scripts/**/lock-reaper*', 'scripts/*lock-reaper*', 'scripts/**/lane-pool*', 'scripts/*lane-pool*',
-  'scripts/**/merge*', 'scripts/*merge*', 'scripts/**/drain*', 'scripts/*drain*', 'scripts/**/mq*', 'scripts/*mq*',
+  'scripts/**/*slot*', 'scripts/*slot*', 'scripts/**/*lock-reaper*', 'scripts/*lock-reaper*', 'scripts/**/*lane-pool*', 'scripts/*lane-pool*',
+  'scripts/**/*merge*', 'scripts/*merge*', 'scripts/**/*drain*', 'scripts/*drain*', 'scripts/**/*mq*', 'scripts/*mq*',
   'scripts/*-lock.mjs', 'scripts/**/*-lock.mjs', 'scripts/**/with-lock*', 'skills-src/**/*-lock.mjs',
   'scripts/guard-*', 'scripts/**/guard-*', 'scripts/*-guard*', 'scripts/**/*-guard*', 'scripts/guarded-*', 'scripts/**/guarded-*',
   '.claude/settings.json', '.githooks/', 'scripts/lib/git-hook-surface.mjs', 'scripts/lib/permission-change.mjs',
@@ -278,7 +282,9 @@ function resolveUnguarded({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync,
   const malformed = (key, valid) => [plat, tool].some(layer => rawMalformed(layer, key, valid) || caseShadowed(layer, key));
   const value = {}; const sources = {};
   for (const key of Object.keys(DEFAULTS)) {
-    let v = get(layered, key); let src = 'file';
+    // The source names the layer the value came from: the cascade layers the file over the platform (PR #6381 send-back).
+    let v = get(layered, key);
+    let src = get(isObj(tool) ? tool : undefined, key) !== undefined ? 'file' : get(isObj(plat) ? plat : undefined, key) !== undefined ? 'platform' : 'built-in';
     const bad = platBad || malformed(key, VALID[key]);
     if (v === undefined && !unreadable && cascade && !bad) { v = DEFAULTS[key]; src = 'built-in'; }
     if (unreadable || !cascade || bad || !VALID[key](v)) {
