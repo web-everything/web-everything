@@ -812,19 +812,27 @@ function existingPools() {
 
 // ── deps (node_modules) — not shared by --reference, so installed per lane on fresh-clone / lockfile change ──
 const DEPS_MARKER = (dir) => join(dir, '.git', '.lane-pool-deps'); // inside .git ⇒ never tracked or git-cleaned
-function lockHash(dir) {
+function lockHash(dir, backend = 'npm') {
   const lock = join(dir, 'package-lock.json');
   const pkg = join(dir, 'package.json');
   const file = existsSync(lock) ? lock : existsSync(pkg) ? pkg : null;
   if (!file) return null;
-  return createHash('sha256').update(readFileSync(file)).digest('hex');
+  const hash = createHash('sha256').update(readFileSync(file));
+  // pnpm installs also depend on its own lockfile and workspace config (allowBuilds etc.).
+  if (backend === 'pnpm') {
+    for (const extra of ['pnpm-lock.yaml', 'pnpm-workspace.yaml']) {
+      const path = join(dir, extra);
+      if (existsSync(path)) hash.update('\0' + extra + '\0').update(readFileSync(path));
+    }
+  }
+  return hash.digest('hex');
 }
 function depsReady(dir) {
   const want = lockHash(dir);
   if (want === null) return 'n/a'; // no package.json → nothing to install
   if (!existsSync(join(dir, 'node_modules'))) return 'missing';
   const have = existsSync(DEPS_MARKER(dir)) ? readFileSync(DEPS_MARKER(dir), 'utf8').trim() : null;
-  return ['npm', 'pnpm'].some(backend => markerMatches(have, want, backend)) ? 'ok' : 'stale';
+  return ['npm', 'pnpm'].some(backend => markerMatches(have, lockHash(dir, backend), backend)) ? 'ok' : 'stale';
 }
 // #3461 — `npm ci`/`npm install` here is a DELIBERATE, NAMED EXCEPTION to the heavy-command admission queue
 // (`scripts/readiness/heavy-admission.mjs`), not an oversight. #3456's own ruling is explicit that the cap
@@ -854,7 +862,7 @@ function ensureDeps(dir) {
   });
   const marker = existsSync(DEPS_MARKER(dir)) ? readFileSync(DEPS_MARKER(dir), 'utf8').trim() : null;
   const result = runDepsInstaller({
-    plan, hash, marker, hasNodeModules: existsSync(join(dir, 'node_modules')),
+    plan, hash: lockHash(dir, plan.backend), marker, hasNodeModules: existsSync(join(dir, 'node_modules')),
     invalidate: () => rmSync(DEPS_MARKER(dir), { force: true }),
     remove: () => rmSync(join(dir, 'node_modules'), { recursive: true, force: true }),
     log: message => log(`  ${message} in ${dir} …`),
@@ -864,7 +872,7 @@ function ensureDeps(dir) {
     }),
   });
   // npm install may create/update package-lock.json; stamp the resulting lock just as before.
-  if (result.state === 'installed') writeFileSync(DEPS_MARKER(dir), result.backend + ':' + lockHash(dir));
+  if (result.state === 'installed') writeFileSync(DEPS_MARKER(dir), result.backend + ':' + lockHash(dir, result.backend));
   return result.state;
 }
 
