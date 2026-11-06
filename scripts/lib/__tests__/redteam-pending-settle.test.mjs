@@ -292,6 +292,15 @@ describe('settlement reads fresh PR state and result evidence', () => {
     expect(o.syncLabels).not.toHaveBeenCalled();
     expect(row.settleError).toBe('red-team execution not proven complete; label unchanged');
   });
+  it.each(['red-team:blocked', 'review:changes', 'review-status:pending'])('a clean accepted result never clears while the hold label %s is present', label => {
+    const o = runFixture({ readEvidence: vi.fn(() => ({ loopPayload: payload('accept'), recorded: false, seatRecorded: false,
+      status: { status: 'finished', result: { status: 'ran', comment: 'posted', foldedVerdict: 'accept' } } })), readIgnorableConfirms: () => [] });
+    o.rawPrs[0].labels.push(label);
+    o.rawPrs[0].comments.push(resultComment());
+    const row = mod.runRedTeamOnSkip(o).rows[0];
+    expect(o.syncLabels).not.toHaveBeenCalled();
+    expect(row.settleError).toBeTruthy();
+  });
   it('a throwing result evidence read settles nothing and reports settleError', () => {
     const o = runFixture({ readEvidence: () => { throw Error('fresh evidence offline'); } });
     o.rawPrs[0].comments.push(resultComment());

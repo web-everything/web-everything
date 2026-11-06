@@ -765,6 +765,8 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
                 if (!['accept', 'changes'].includes(verdict)) row.settleError = 'no recorded red-team verdict; label unchanged';
                 else if (verdict === 'accept' && evidence?.loopPayload?.verdict?.verdict !== 'accept') row.settleError = 'review payload is not an accept; label unchanged';
                 else if (verdict === 'accept' && witness && witness.newest?.verdict?.verdict !== 'accept') row.settleError = 'newest same-head review is not an accept; label unchanged';
+                else if (verdict === 'accept' && (!Array.isArray(live.labels)
+                  || live.labels.some(label => conflictsWithPolicyClear(label, { settlesPending: true })))) row.settleError = 'conflicting hold label present; label unchanged';
                 else if (verdict === 'accept' && (!['ran', 'resumed'].includes(normalizeRedTeamResult(evidence.status.result).priorResult)
                   || evidence.completedRecorded === false)) row.settleError = 'red-team execution not proven complete; label unchanged';
                 else if (verdict === 'accept' && normalizeRedTeamResult(evidence.status.result).priorComment !== 'posted') row.settleError = 'red-team result comment not confirmed posted; label unchanged';
