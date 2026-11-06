@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as nodeFs from 'node:fs';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
@@ -6,7 +6,8 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { fork } from 'node:child_process';
-import { withHeadIndexLock, seedFromReviewComments, recordReview, readHeadIndex, headReviewOwed, netPatchKey, resolveHeadIndexSettings, headIndexPaths, defaultHeadIndexDir } from '../review-head-index.mjs';
+import { Worker } from 'node:worker_threads';
+import { seedFromReviewComments, recordReview, readHeadIndex, headReviewOwed, netPatchKey, resolveHeadIndexSettings, headIndexPaths, defaultHeadIndexDir } from '../review-head-index.mjs';
 import { COORDINATION_ROOT_ENV } from '../../operations/coordination-root.mjs';
 
 const H = n => String(n).repeat(40).slice(0, 40);
@@ -57,28 +58,6 @@ describe('durability and growth', () => {
     for (let i = 2; i < 400; i++) rec({ pr: i, head: H(i % 9), netPatchHash: `p${i}` });
     expect(headReviewOwed({ index: readHeadIndex({ dir }), repo: 'o/r', pr: 1, head: H(1) }).reason).toBe('same-head');
   });
-  it('atomic write order: log append fsynced before the map temp write, temp fsynced before rename', () => {
-    const ops = [];
-    const kind = p => (String(p).endsWith('.tmp') ? 'tmp' : String(p).endsWith('lock') ? 'lock' : 'log');
-    const fs = { ...nodeFs,
-      openSync: (p, f) => { ops.push(`open:${f}:${kind(p)}`); return nodeFs.openSync(p, f); },
-      fsyncSync: fd => { ops.push('fsync'); return nodeFs.fsyncSync(fd); },
-      renameSync: (a, b) => { ops.push('rename'); return nodeFs.renameSync(a, b); } };
-    rec({ fs });
-    // the pending marker (a `wx` open in the index dir, classed 'log' here) is durable BEFORE the row is appended
-    // and the directory entry is fsynced right after it (open:r), so the marker survives a power loss together with the row
-    // and the commit (the pending marker's removal) is made durable by a second directory fsync BEFORE the map is written
-    expect(ops).toEqual(['open:wx:lock', 'fsync', 'open:wx:log', 'fsync', 'open:r:log', 'fsync', 'open:a:log', 'fsync', 'open:r:log', 'fsync', 'open:w:tmp', 'fsync', 'rename']);
-    expect(existsSync(headIndexPaths(dir).map)).toBe(true);
-  });
-  it('the commit fsyncs the index directory right after the pending marker is removed (an accepted row is not re-hidden by a crash)', () => {
-    const ops = [];
-    const fs = { ...nodeFs,
-      openSync: (p, f) => { if (f === 'r') ops.push('open-dir'); return nodeFs.openSync(p, f); },
-      unlinkSync: p => { if (/pending\./.test(String(p))) ops.push('unlink-pending'); return nodeFs.unlinkSync(p); } };
-    rec({ fs });
-    expect(ops).toEqual(['open-dir', 'unlink-pending', 'open-dir']); // marker named + dir synced; marker removed + dir synced
-  });
   it('a net-patch key that names an inherited property is never carried: __proto__, constructor, toString, hasOwnProperty -> owed', () => {
     rec();
     const index = readHeadIndex({ dir });
@@ -115,13 +94,6 @@ describe('durability and growth', () => {
     writeFileSync(headIndexPaths(dir).map, '{{');
     expect(readHeadIndex({ dir }).map).toEqual(rebuilt);
     expect(headReviewOwed({ index: readHeadIndex({ dir }), repo: 'o/r', pr: 7, head: H(2) })).toMatchObject({ owed: false, verdict: 'accept' });
-  });
-  it('a crash between append and rename is recovered from the log, not lost', () => {
-    const fs = { ...nodeFs, renameSync: () => { throw Error('crash'); } };
-    expect(() => rec({ fs })).toThrow();
-    const index = readHeadIndex({ dir });
-    expect(index.ok).toBe(true);
-    expect(headReviewOwed({ index, repo: 'o/r', pr: 7, head: H(1) }).reason).toBe('same-head');
   });
   it('a corrupt map is rebuilt from the log', () => {
     rec(); writeFileSync(headIndexPaths(dir).map, '{{');
@@ -229,7 +201,15 @@ describe('resolveHeadIndexSettings', () => {
   });
 });
 
-describe('lock, version and pre-index seeding', () => {
+describe('version and pre-index seeding', () => {
+  it('a short fs.writeSync is completed, never renamed half-written into the log', () => {
+    const shortFs = { ...nodeFs, writeSync: (fd, buf, off, len, ...r) => typeof buf === 'string' ? nodeFs.writeSync(fd, buf.slice(0, 5)) : nodeFs.writeSync(fd, buf, off, Math.min(7, len), ...r) };
+    rec({ fs: shortFs });
+    const text = readFileSync(headIndexPaths(dir).log, 'utf8');
+    expect(text.endsWith('\n')).toBe(true);
+    expect(() => JSON.parse(text.trim())).not.toThrow();
+    expect(readHeadIndex({ dir }).ok).toBe(true);
+  });
   it('concurrent writers (separate processes) lose no record and leave a map equal to the log', async () => {
     const mod = pathToFileURL(join(process.cwd(), 'scripts/lib/review-head-index.mjs')).href;
     const script = join(dir, 'w.mjs');
@@ -246,109 +226,6 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     writeFileSync(headIndexPaths(dir).map, '{{');
     expect(readHeadIndex({ dir, keepPerPr: 100 }).map).toEqual(fromMap.map); // the writers' keepPerPr: replay applies the same bound
   }, 60000);
-  it('a stale lock (dead owner or old) is taken over; a live fresh lock blocks until timeout', () => {
-    const { lock } = headIndexPaths(dir);
-    nodeFs.mkdirSync(dir, { recursive: true });
-    writeFileSync(lock, JSON.stringify({ pid: 999999, token: 't', at: 0 }));
-    expect(withHeadIndexLock(dir, () => 'ok')).toBe('ok');
-    expect(existsSync(lock)).toBe(false);
-    writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 't', at: Date.now() }));
-    expect(() => withHeadIndexLock(dir, () => 'no', { waitMs: 60 })).toThrow(/lock busy/);
-    expect(existsSync(lock)).toBe(true);
-    // a LIVE owner is never displaced, however old the lock is
-    writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 't', at: 0 }));
-    nodeFs.utimesSync(lock, new Date(0), new Date(0));
-    expect(() => withHeadIndexLock(dir, () => 'old', { waitMs: 60, staleMs: 1 })).toThrow(/lock busy/);
-  });
-  const takeoverLeftovers = () => nodeFs.readdirSync(dir).filter(f => /\.(takeover|new|stale)/.test(f));
-  it('takeover: an owner that re-creates the lock before the serialised re-read keeps it (never displaced)', () => {
-    const { lock } = headIndexPaths(dir);
-    nodeFs.mkdirSync(dir, { recursive: true });
-    writeFileSync(lock, JSON.stringify({ pid: 999999, token: 'dead', at: 0 }));
-    let swapped = false;
-    // the live owner re-creates the lock right after the contender takes the takeover mutex, i.e. before its re-read
-    const fs = { ...nodeFs, openSync: (p, f) => {
-      const fd = nodeFs.openSync(p, f);
-      if (!swapped && p === `${lock}.takeover`) { swapped = true; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'live', at: Date.now() })); }
-      return fd;
-    } };
-    expect(() => withHeadIndexLock(dir, () => 'no', { fs, waitMs: 60 })).toThrow(/lock busy/);
-    expect(swapped).toBe(true);
-    expect(JSON.parse(readFileSync(lock, 'utf8')).token).toBe('live'); // the live owner's fence would still pass
-    expect(takeoverLeftovers()).toEqual([]);
-  });
-  it('takeover of an unreadable (never-written) holder file: a live owner that replaces it before the re-read keeps its lock', () => {
-    const { lock } = headIndexPaths(dir);
-    nodeFs.mkdirSync(dir, { recursive: true });
-    writeFileSync(lock, ''); // no readable owner: judged stale only by age
-    nodeFs.utimesSync(lock, new Date(0), new Date(0));
-    let swapped = false;
-    const fs = { ...nodeFs, openSync: (p, f) => {
-      const fd = nodeFs.openSync(p, f);
-      if (!swapped && p === `${lock}.takeover`) { swapped = true; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'live', at: Date.now() })); }
-      return fd;
-    } };
-    expect(() => withHeadIndexLock(dir, () => 'no', { fs, waitMs: 60, staleMs: 1000 })).toThrow(/lock busy/);
-    expect(JSON.parse(readFileSync(lock, 'utf8')).token).toBe('live');
-    expect(takeoverLeftovers()).toEqual([]);
-  });
-  it('takeover replaces the lock atomically: it is never unlinked and never absent while a takeover runs', () => {
-    const { lock } = headIndexPaths(dir);
-    nodeFs.mkdirSync(dir, { recursive: true });
-    writeFileSync(lock, JSON.stringify({ pid: 999999, token: 'dead', at: 0 }));
-    const seen = [];
-    const fs = { ...nodeFs,
-      unlinkSync: p => { seen.push({ op: 'unlink', p }); return nodeFs.unlinkSync(p); },
-      renameSync: (a, b) => { seen.push({ op: 'rename', p: b, lockPresent: existsSync(lock) }); return nodeFs.renameSync(a, b); } };
-    expect(withHeadIndexLock(dir, fence => { fence(); return 'ok'; }, { fs })).toBe('ok');
-    const renamed = seen.findIndex(e => e.op === 'rename' && e.p === lock);
-    expect(renamed).toBeGreaterThanOrEqual(0);                      // our lock lands by rename over the old one
-    expect(seen[renamed].lockPresent).toBe(true);                   // the old lock was still in place: no window without a lock
-    expect(seen.findIndex(e => e.op === 'unlink' && e.p === lock)).toBeGreaterThan(renamed); // lock is only unlinked at our own release
-    expect(takeoverLeftovers()).toEqual([]);
-  });
-  it('takeover is serialised: a live contender holding the takeover file blocks, a dead one is cleared', () => {
-    const { lock } = headIndexPaths(dir);
-    const takeover = `${lock}.takeover`;
-    nodeFs.mkdirSync(dir, { recursive: true });
-    writeFileSync(lock, JSON.stringify({ pid: 999999, token: 'dead', at: 0 }));
-    writeFileSync(takeover, JSON.stringify({ pid: process.pid, token: 'other', at: Date.now() }));
-    expect(() => withHeadIndexLock(dir, () => 'no', { waitMs: 60 })).toThrow(/lock busy/);
-    expect(JSON.parse(readFileSync(lock, 'utf8')).token).toBe('dead'); // untouched while another takeover runs
-    writeFileSync(takeover, JSON.stringify({ pid: 999998, token: 'crashed', at: 0 }));
-    expect(withHeadIndexLock(dir, () => 'ok')).toBe('ok');
-    expect(takeoverLeftovers()).toEqual([]);
-    // a malformed takeover file (no integer pid) is cleared by age, never a permanent block
-    writeFileSync(lock, JSON.stringify({ pid: 999999, token: 'dead', at: 0 }));
-    writeFileSync(takeover, '{"pid":"x"}'); nodeFs.utimesSync(takeover, new Date(0), new Date(0));
-    expect(withHeadIndexLock(dir, () => 'ok2', { staleMs: 1000 })).toBe('ok2');
-    expect(takeoverLeftovers()).toEqual([]);
-  });
-  it('racing takeover cleaners never leave two publishing holders: the cleaner whose rename lands first is fenced out by the other', () => {
-    const { lock } = headIndexPaths(dir);
-    const takeover = `${lock}.takeover`;
-    nodeFs.mkdirSync(dir, { recursive: true });
-    writeFileSync(lock, JSON.stringify({ pid: 999999, token: 'dead', at: 0 }));
-    writeFileSync(takeover, JSON.stringify({ pid: 999998, token: 'crashed', at: 0 })); // a dead takeover owner both cleaners race to clear
-    let raced = false, bOutcome = null, aPublished = null;
-    // Cleaner A has taken the takeover file and is about to rename its lock in. Cleaner B (which had read the dead file too and
-    // unlinks whatever sits there) removes A's takeover file, takes its own, and its rename lands first; A's rename follows.
-    const fsA = { ...nodeFs, renameSync: (from, to) => {
-      if (raced || to !== lock) return nodeFs.renameSync(from, to);
-      raced = true;
-      nodeFs.unlinkSync(takeover);
-      withHeadIndexLock(dir, fenceB => {
-        nodeFs.renameSync(from, to); // A's rename lands while B holds the lock
-        try { fenceB(); bOutcome = 'published'; } catch (e) { bOutcome = /lock lost/.test(e.message) ? 'fenced-out' : 'other:' + e.message; }
-      }, { staleMs: 1000 });
-    } };
-    expect(withHeadIndexLock(dir, fenceA => { fenceA(); aPublished = true; return 'a'; }, { fs: fsA, staleMs: 1000 })).toBe('a');
-    expect(raced).toBe(true);
-    expect(bOutcome).toBe('fenced-out'); // B's fence fails closed: only one holder ever publishes
-    expect(aPublished).toBe(true);
-    expect(existsSync(lock)).toBe(false);
-    expect(takeoverLeftovers()).toEqual([]);
-  });
   it('releases the lock when the transaction throws', () => {
     const fs = { ...nodeFs, renameSync: () => { throw Error('crash'); } };
     expect(() => rec({ fs })).toThrow();
@@ -385,119 +262,6 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     expect(Buffer.from(nodeFs.readFileSync(log, 'utf8')).equals(bytes)).toBe(true); // identical decoded text, different bytes
     expect(readHeadIndex({ dir }).rebuilt).toBe(true);           // so the cache must not be trusted
   });
-  it('fencing: a writer that lost its lock refuses to publish', () => {
-    const { lock } = headIndexPaths(dir);
-    expect(() => withHeadIndexLock(dir, fence => { writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'other', at: Date.now() })); fence(); })).toThrow(/lock lost/);
-    rmSync(lock, { force: true });
-    const fs = { ...nodeFs, openSync: (p, f) => { if (f === 'a') writeFileSync(headIndexPaths(dir).lock, JSON.stringify({ pid: process.pid, token: 'thief', at: 1 })); return nodeFs.openSync(p, f); } };
-    // the swap happens as the append opens; the next fence (before the map publish) must refuse
-    expect(() => rec({ fs })).toThrow(/lock lost/);
-    expect(existsSync(headIndexPaths(dir).map)).toBe(false);
-    expect(readHeadIndex({ dir })).toMatchObject({ ok: true, map: {} }); // the rejected record is retracted: no reader sees it
-    expect(nodeFs.readdirSync(dir).filter(n => n.startsWith('retract.'))).toHaveLength(1); // by a marker file, never by writing to the log
-  });
-  it('fencing: a writer whose lock is stolen between the fence and the append never publishes the map and leaves no visible review', () => {
-    rec();
-    const { log, map, lock } = headIndexPaths(dir);
-    const mapBefore = readFileSync(map, 'utf8');
-    // the lock is stolen as the append opens, i.e. after the pre-append fence and before the line lands
-    const fs = { ...nodeFs, openSync: (p, f) => { if (f === 'a') writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'thief', at: 1 })); return nodeFs.openSync(p, f); } };
-    expect(() => rec({ fs, head: H(2), netPatchHash: 'p2' })).toThrow(/lock lost/);
-    expect(readFileSync(map, 'utf8')).toBe(mapBefore);
-    expect(readHeadIndex({ dir }).map['o/r#7']).toMatchObject({ lastReviewedHead: H(1) }); // the rejected review is not the head record
-    const owed = headReviewOwed({ index: readHeadIndex({ dir }), repo: 'o/r', pr: 7, head: H(2), netPatchHash: 'p2' });
-    expect(owed).toMatchObject({ owed: true });                  // readers cannot see the rejected review
-    expect(JSON.parse(readFileSync(lock, 'utf8')).token).toBe('thief'); // the new holder's lock is left alone
-  });
-  it('fencing rollback never rewrites the log: a record another writer appended after ours survives, ours is retracted', () => {
-    rec();
-    const { log, lock } = headIndexPaths(dir);
-    const theirs = `${JSON.stringify({ repo: 'o/r', pr: 8, head: H(3), netPatchHash: 'p9', verdict: 'accept', at: '2026-11-04T11:00:00Z' })}\n`;
-    const fs = { ...nodeFs, openSync: (p, f) => {
-      const fd = nodeFs.openSync(p, f);
-      if (f === 'a') { writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'thief', at: 1 })); nodeFs.appendFileSync(log, theirs); }
-      return fd;
-    } };
-    expect(() => rec({ fs, head: H(2), netPatchHash: 'p2' })).toThrow(/lock lost/);
-    expect(readFileSync(log, 'utf8')).toContain(theirs);        // the other holder's record survives the rollback
-    const index = readHeadIndex({ dir });
-    expect(index.map['o/r#8']).toMatchObject({ lastReviewedHead: H(3) });
-    expect(index.map['o/r#7'].history.p2).toBeUndefined();
-  });
-  it('fencing: a writer that loses its lock before the append never touches the log or the map', () => {
-    rec();
-    const { log, map, lock } = headIndexPaths(dir);
-    const [logBefore, mapBefore] = [readFileSync(log, 'utf8'), readFileSync(map, 'utf8')];
-    let stolen = false;
-    const fs = { ...nodeFs, readFileSync: (p, ...a) => { // first log read is readHeadIndex's, which precedes the pre-append fence
-      if (!stolen && p === log) { stolen = true; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'thief', at: 1 })); }
-      return nodeFs.readFileSync(p, ...a); } };
-    expect(() => rec({ fs, head: H(2), netPatchHash: 'p2' })).toThrow(/lock lost/);
-    expect(readFileSync(log, 'utf8')).toBe(logBefore);
-    expect(readFileSync(map, 'utf8')).toBe(mapBefore);
-  });
-  it('fencing: a writer that loses its lock before the compaction rewrite never replaces the log or publishes the map', () => {
-    rec(); rec({ head: H(2), netPatchHash: 'p2' });
-    const { log, map, lock } = headIndexPaths(dir);
-    const [logBefore, mapBefore] = [readFileSync(log, 'utf8'), readFileSync(map, 'utf8')];
-    let appended = false;
-    const stillThere = () => { const t = readFileSync(log, 'utf8'); return t.startsWith(logBefore) && t.split('\n').filter(Boolean).length === 3; };
-    const fs = { ...nodeFs,
-      openSync: (p, f) => { if (f === 'a') appended = true; return nodeFs.openSync(p, f); },
-      readFileSync: (p, ...a) => { if (appended && p === log) { appended = false; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'thief', at: 1 })); } return nodeFs.readFileSync(p, ...a); } };
-    // logMaxLines=1 forces compaction; the steal lands right before the pre-rewrite fence, which must refuse
-    expect(() => rec({ fs, head: H(3), netPatchHash: 'p3', logMaxLines: 1 })).toThrow(/lock lost/);
-    expect(stillThere()).toBe(true);                                // the log was not replaced from a stale map (old rows + our one line)
-    expect(readHeadIndex({ dir }).map['o/r#7'].history.p3).toBeUndefined(); // and our line is retracted
-    expect(readFileSync(map, 'utf8')).toBe(mapBefore);              // map never published
-  });
-  it('fencing: a writer that loses its lock right after the compaction rewrite publishes nothing and its row is retracted from the compacted log', () => {
-    rec(); rec({ head: H(2), netPatchHash: 'p2' });
-    const { log, map, lock } = headIndexPaths(dir);
-    const mapBefore = readFileSync(map, 'utf8');
-    let stolen = false;
-    const fs = { ...nodeFs, renameSync: (a, b) => { // the compacted log lands, then the lock is lost before the next fence
-      const r = nodeFs.renameSync(a, b);
-      if (!stolen && b === log) { stolen = true; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'thief', at: 1 })); }
-      return r; } };
-    expect(() => rec({ fs, head: H(3), netPatchHash: 'p3', logMaxLines: 1 })).toThrow(/lock lost/);
-    expect(stolen).toBe(true);
-    expect(readFileSync(map, 'utf8')).toBe(mapBefore);
-    const m = readHeadIndex({ dir }).map['o/r#7'];
-    expect(m.history.p3).toBeUndefined();                          // the compacted log carries our row with its txn, and the marker retracts it
-    expect(m.history.p2).toBeDefined();                            // earlier records are intact
-    expect(m.lastReviewedHead).toBe(H(2));
-  });
-  it('failed compacted replacement restores the previous same-patch verdict: rejecting a new row under a repeated netPatchHash leaves the committed map unchanged', () => {
-    rec({ head: H(1), netPatchHash: 'p1', verdict: 'accept', at: '2026-11-04T10:00:01Z' });
-    const { log, map, lock } = headIndexPaths(dir);
-    const before = readHeadIndex({ dir }).map;
-    const mapBefore = readFileSync(map, 'utf8');
-    let stolen = false;
-    const fs = { ...nodeFs, renameSync: (a, b) => { // the compacted log lands, then the lock is lost before the next fence
-      const r = nodeFs.renameSync(a, b);
-      if (!stolen && b === log) { stolen = true; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'thief', at: 1 })); }
-      return r; } };
-    // same patch hash, new head: the new row REPLACES the p1 entry in the map; logMaxLines=1 forces compaction
-    expect(() => rec({ fs, head: H(2), netPatchHash: 'p1', verdict: 'reject', at: '2026-11-04T10:00:02Z', logMaxLines: 1 })).toThrow(/lock lost/);
-    expect(stolen).toBe(true);
-    expect(readFileSync(map, 'utf8')).toBe(mapBefore);
-    expect(readHeadIndex({ dir }).map).toEqual(before);            // the predecessor survived the compaction the rejected row triggered
-  });
-  it('failed compacted replacement under retention eviction: the entry the rejected row would have evicted survives its rejection', () => {
-    for (let i = 1; i <= 3; i++) rec({ head: H(i), netPatchHash: `p${i}`, at: `2026-11-04T10:00:0${i}Z`, keepPerPr: 3 });
-    const { log, lock } = headIndexPaths(dir);
-    const before = readHeadIndex({ dir, keepPerPr: 3 }).map;
-    let stolen = false;
-    const fs = { ...nodeFs, renameSync: (a, b) => {
-      const r = nodeFs.renameSync(a, b);
-      if (!stolen && b === log) { stolen = true; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'thief', at: 1 })); }
-      return r; } };
-    expect(() => rec({ fs, head: H(4), netPatchHash: 'p4', at: '2026-11-04T10:00:04Z', keepPerPr: 3, logMaxLines: 1 })).toThrow(/lock lost/);
-    expect(stolen).toBe(true);
-    expect(Object.keys(readHeadIndex({ dir, keepPerPr: 3 }).map['o/r#7'].history).sort()).toEqual(['p1', 'p2', 'p3']); // p1 not evicted by a rejected p4
-    expect(readHeadIndex({ dir, keepPerPr: 3 }).map).toEqual(before);
-  });
   it('a compaction triggered by a write keeps the writer row last and replays to the published map across PRs and keyless records', () => {
     const base = { keepPerPr: 5, logMaxLines: 4 };
     rec({ ...base, head: H(1), netPatchHash: 'p1', at: '2026-11-04T10:00:01Z' });
@@ -515,123 +279,6 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     expect(readHeadIndex({ dir, keepPerPr: 5 }).map).toEqual(published);
     expect(published['o/r#8'].history.q1.head).toBe(H(4));
     expect(published['o/r#7'].lastReviewedHead).toBe(H(5));
-  });
-  it('reader cannot carry a pending review that subsequently fails fencing: the window ends at the retraction, after which the PR is owed again', () => {
-    rec({ head: H(1), netPatchHash: 'p1' });
-    const { log, lock } = headIndexPaths(dir);
-    const ask = () => headReviewOwed({ index: readHeadIndex({ dir }), repo: 'o/r', pr: 7, head: H(2), netPatchHash: 'p2' });
-    expect(ask().owed).toBe(true);
-    let appended = false, inside = null;
-    const fs = { ...nodeFs,
-      openSync: (p, f) => {
-        if (f === 'a') appended = true;
-        if (f === 'wx' && /retract\./.test(String(p)) && inside === null) inside = ask(); // a lock-free reader, after the append and before the marker exists
-        return nodeFs.openSync(p, f); },
-      readFileSync: (p, ...a) => { if (appended && p === log) { appended = false; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'thief', at: 1 })); } return nodeFs.readFileSync(p, ...a); } };
-    expect(() => rec({ fs, head: H(2), netPatchHash: 'p2' })).toThrow(/lock lost/);
-    expect(inside).not.toBeNull();                                 // the interleaving really happened
-    // The row is hidden by its pending marker from the moment it is appended, so a lock-free reader inside the window
-    // never carries the verdict of a transaction that is then rejected.
-    expect(inside.owed).toBe(true);
-    expect(ask().owed).toBe(true);
-    expect(readHeadIndex({ dir }).map['o/r#7'].history.p2).toBeUndefined();
-  });
-  it('retraction before visibility: a row is invisible to a lock-free reader until its transaction is accepted, then visible with a valid cache', () => {
-    rec({ head: H(1), netPatchHash: 'p1' });
-    const { log, map: mp } = headIndexPaths(dir);
-    const ask = () => headReviewOwed({ index: readHeadIndex({ dir }), repo: 'o/r', pr: 7, head: H(2), netPatchHash: 'p2' });
-    let appended = false, midAppend = null, midPublish = null;
-    const fs = { ...nodeFs,
-      openSync: (p, f) => { if (f === 'a') appended = true; return nodeFs.openSync(p, f); },
-      readFileSync: (p, ...a) => { if (appended && p === log) { appended = false; midAppend = ask(); } return nodeFs.readFileSync(p, ...a); }, // right after the append
-      renameSync: (a, b) => { if (b === mp) midPublish = ask(); return nodeFs.renameSync(a, b); } };                                           // just before the map lands (after the commit)
-    rec({ fs, head: H(2), netPatchHash: 'p2' });
-    expect(midAppend.owed).toBe(true);                             // appended, not yet accepted: not visible
-    expect(midPublish.owed).toBe(false);                           // accepted (committed), the cached map just not published yet: visible via a rebuild
-    expect(ask().owed).toBe(false);                                // accepted: visible
-    expect(readHeadIndex({ dir }).rebuilt).toBeUndefined();        // and the published map is trusted again (no pending marker left)
-    expect(nodeFs.readdirSync(dir).filter(n => /^(pending|retract)\./.test(n))).toEqual([]);
-  });
-  it('compacting before acceptance never folds another writer\'s uncommitted row: its late retraction restores the predecessor', () => {
-    const { log } = headIndexPaths(dir);
-    nodeFs.mkdirSync(dir, { recursive: true });
-    const row = (head, verdict, at, txn) => JSON.stringify({ repo: 'o/r', pr: 7, head, netPatchHash: 'p1', verdict, at, txn });
-    // writer A committed p1 earlier; writer Z appended a same-patch replacement and lost the lock before it could be accepted
-    writeFileSync(log, `${row(H(1), 'accept', '2026-11-04T08:00:00Z', 'a')}\n${row(H(2), 'reject', '2026-11-04T09:00:00Z', 'z')}\n`);
-    writeFileSync(join(dir, 'pending.z'), '{}\n');
-    rec({ head: H(3), netPatchHash: 'p3', at: '2026-11-04T10:00:00Z', logMaxLines: 2 });  // writer W compacts (3 rows > 2)
-    marker('z');                                                    // Z's rollback finally arrives
-    const h = readHeadIndex({ dir }).map['o/r#7'].history;
-    expect(h.p1).toMatchObject({ head: H(1), verdict: 'accept' });  // the predecessor was never folded away
-    expect(logRows().some(r => r.txn === 'z')).toBe(false);        // and Z's uncommitted row was not folded into the rewritten log
-    nodeFs.rmSync(headIndexPaths(dir).map, { force: true });
-    expect(readHeadIndex({ dir }).map['o/r#7'].history.p1.head).toBe(H(1)); // nor does a rebuild bring it back
-  });
-  it('a crashed writer\'s uncommitted row (pending marker, never accepted) stays hidden and the next writer turns it into a retraction', () => {
-    const { log } = headIndexPaths(dir);
-    nodeFs.mkdirSync(dir, { recursive: true });
-    writeFileSync(log, `${JSON.stringify({ repo: 'o/r', pr: 8, head: H(3), netPatchHash: 'p9', verdict: 'accept', at: '2026-11-04T09:00:00Z', txn: 'q' })}\n`);
-    writeFileSync(join(dir, 'pending.q'), '{}\n');
-    expect(readHeadIndex({ dir }).map['o/r#8']).toBeUndefined();   // hidden for readers while it is pending
-    rec();
-    expect(existsSync(join(dir, 'pending.q'))).toBe(false);
-    expect(existsSync(join(dir, 'retract.q'))).toBe(true);         // rejected for good: it can never be committed once the lock changed hands
-    expect(readHeadIndex({ dir }).map['o/r#8']).toBeUndefined();
-  });
-  it('a lock-free reader never shows a row whose writer names it after the reader listed the markers but before it read the log', () => {
-    rec({ head: H(1), netPatchHash: 'p1' });
-    const { log } = headIndexPaths(dir);
-    let injected = false;
-    const fs = { ...nodeFs, readdirSync: (p, ...a) => {
-      const out = nodeFs.readdirSync(p, ...a);                       // the reader has listed: no markers yet
-      if (!injected) { injected = true; // the writer now names its transaction and appends, all between the reader's listing and its log read
-        writeFileSync(join(dir, 'pending.w'), '{}\n');
-        nodeFs.appendFileSync(log, `${JSON.stringify({ repo: 'o/r', pr: 7, head: H(2), netPatchHash: 'p2', verdict: 'accept', at: '2026-11-04T11:00:00Z', txn: 'w' })}\n`); }
-      return out; } };
-    const seen = readHeadIndex({ dir, fs });
-    expect(injected).toBe(true);
-    expect(seen.map['o/r#7'].history.p2).toBeUndefined();            // hidden by the marker the second listing sees
-    expect(seen.map['o/r#7'].lastReviewedHead).toBe(H(1));
-    // the same window for a retraction that lands after the first listing
-    rmSync(join(dir, 'pending.w'));
-    injected = false;
-    const fs2 = { ...nodeFs, readdirSync: (p, ...a) => { const out = nodeFs.readdirSync(p, ...a); if (!injected) { injected = true; marker('w'); } return out; } };
-    expect(readHeadIndex({ dir, fs: fs2 }).map['o/r#7'].history.p2).toBeUndefined();
-  });
-  it('a foreign pending marker is rejected by an atomic rename to its retraction, so it cannot be both accepted by its writer and retracted', () => {
-    const { log } = headIndexPaths(dir);
-    nodeFs.mkdirSync(dir, { recursive: true });
-    writeFileSync(log, `${JSON.stringify({ repo: 'o/r', pr: 8, head: H(3), netPatchHash: 'p9', verdict: 'accept', at: '2026-11-04T09:00:00Z', txn: 'q' })}\n`);
-    writeFileSync(join(dir, 'pending.q'), '{}\n');
-    const seen = [];
-    const fs = { ...nodeFs,
-      renameSync: (a, b) => { seen.push(`rename:${String(a).split('/').pop()}>${String(b).split('/').pop()}`); return nodeFs.renameSync(a, b); },
-      unlinkSync: p => { seen.push(`unlink:${String(p).split('/').pop()}`); return nodeFs.unlinkSync(p); } };
-    rec({ fs });
-    expect(seen).toContain('rename:pending.q>retract.q');
-    expect(seen).not.toContain('unlink:pending.q');                  // never "write the retraction, then remove the marker" (a writer's commit could slip in between)
-  });
-  it('a writer whose row is no longer in the log at commit time fails closed instead of reporting ok', () => {
-    rec();
-    const { log } = headIndexPaths(dir);
-    let afterAppend = 0;
-    const fs = { ...nodeFs,
-      openSync: (p, f) => { if (f === 'a') afterAppend = 1; return nodeFs.openSync(p, f); },
-      readFileSync: (p, ...a) => {
-        const out = nodeFs.readFileSync(p, ...a);
-        if (afterAppend && p === log && ++afterAppend === 3) { // the snapshot is read (2), then the final read before the commit (3): a stale rename swallowed our row
-          const rows = out.toString('utf8').trim().split('\n'); rows.pop(); return Buffer.from(`${rows.join('\n')}\n`); }
-        return out; } };
-    expect(() => rec({ fs, head: H(2), netPatchHash: 'p2' })).toThrow(/missing from the log/);
-    expect(readHeadIndex({ dir }).map['o/r#7'].history.p2).toBeUndefined();
-  });
-  it('fail closed: if the pending marker cannot be written, nothing is appended', () => {
-    rec();
-    const { log } = headIndexPaths(dir);
-    const before = readFileSync(log, 'utf8');
-    const fs = { ...nodeFs, openSync: (p, f) => { if (f === 'wx' && String(p).includes('pending.')) throw Object.assign(Error('EIO'), { code: 'EIO' }); return nodeFs.openSync(p, f); } };
-    expect(() => rec({ fs, head: H(2), netPatchHash: 'p2' })).toThrow(/EIO/);
-    expect(readFileSync(log, 'utf8')).toBe(before);
   });
   it('rebuild from an uncompacted log honors keepPerPr: evicted history is not resurrected and the map equals the published one', () => {
     for (let i = 1; i <= 6; i++) rec({ head: H(i), netPatchHash: `p${i}`, at: `2026-11-04T10:00:0${i}Z`, keepPerPr: 3 });
@@ -696,198 +343,6 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     expect(rebuilt.rebuilt).toBe(true);
     expect(Object.keys(rebuilt.map['o/r#7'].history).sort()).toEqual(['p4', 'p5', 'p6']); // 3 kept, not 6 (standard would keep all 6)
   });
-  it('fencing: a writer that loses its lock after the line-count read (no compaction) leaves no visible review once another writer appends', () => {
-    rec();
-    const { log, lock } = headIndexPaths(dir);
-    const theirs = `${JSON.stringify({ repo: 'o/r', pr: 8, head: H(3), netPatchHash: 'p9', verdict: 'accept', at: '2026-11-04T11:00:00Z' })}\n`;
-    let appended = false, done = false;
-    const fs = { ...nodeFs,
-      openSync: (p, f) => { if (f === 'a' && p === log) appended = true; return nodeFs.openSync(p, f); },
-      readFileSync: (p, ...a) => { // the line-count read that follows our append: after it, the lock is stolen and writer B appends
-        const out = nodeFs.readFileSync(p, ...a);
-        if (appended && !done && p === log) { done = true; writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'thief', at: 1 })); nodeFs.appendFileSync(log, theirs); }
-        return out; } };
-    expect(() => rec({ fs, head: H(2), netPatchHash: 'p2' })).toThrow(/lock lost/);
-    expect(done).toBe(true);
-    const index = readHeadIndex({ dir });
-    expect(index.ok).toBe(true);
-    expect(headReviewOwed({ index, repo: 'o/r', pr: 7, head: H(2), netPatchHash: 'p2' })).toMatchObject({ owed: true, reason: 'new-head', lastReviewedHead: H(1) }); // A's review is not visible
-    expect(index.map['o/r#7'].history.p2).toBeUndefined();
-    expect(index.map['o/r#8']).toMatchObject({ lastReviewedHead: H(3) });  // B's record is intact
-    rmSync(lock, { force: true });                              // the other writer finished
-    rec({ head: H(4), netPatchHash: 'p4', at: '2026-11-04T12:00:00Z', logMaxLines: 2 }); // a later compaction + rebuild never resurrects it either
-    writeFileSync(headIndexPaths(dir).map, '{{');
-    expect(readHeadIndex({ dir }).map['o/r#7'].history.p2).toBeUndefined();
-  });
-  const marker = txn => writeFileSync(join(dir, `retract.${txn}`), '{}\n');   // what a rejected writer creates: its own file, never a write to the log
-  const logRows = () => readFileSync(headIndexPaths(dir).log, 'utf8').trim().split('\n').map(l => JSON.parse(l));
-  it('a row whose writer lost the lock is rejected by the next holder before it can compact, so it is never folded; the late rollback is harmless', () => {
-    rec();
-    const { lock } = headIndexPaths(dir);
-    let appended = false, done = false;
-    const fs = { ...nodeFs,
-      openSync: (p, f) => { if (f === 'a') appended = true; return nodeFs.openSync(p, f); },
-      readFileSync: (p, ...a) => {
-        const out = nodeFs.readFileSync(p, ...a);
-        if (appended && !done && String(p).endsWith('log.jsonl')) { // the lock passes to writer B, who reads A's row and compacts the log
-          done = true; rmSync(lock, { force: true });
-          recordReview({ dir, repo: 'o/r', pr: 8, head: H(3), netPatchHash: 'p9', verdict: 'accept', at: '2026-11-04T11:00:00Z', logMaxLines: 1 });
-        }
-        return out; } };
-    expect(() => rec({ fs, head: H(2), netPatchHash: 'p2', at: '2026-11-04T10:30:00Z' })).toThrow(/lock lost/);
-    expect(done).toBe(true);
-    expect(logRows().filter(r => r.head === H(2))).toHaveLength(0); // writer B turned A's pending marker into a retraction, so its uncommitted row was not folded
-    expect(nodeFs.readdirSync(dir).filter(n => n.startsWith('pending.'))).toEqual([]);
-    const index = readHeadIndex({ dir });
-    expect(index.map['o/r#7'].history.p2).toBeUndefined();
-    expect(headReviewOwed({ index, repo: 'o/r', pr: 7, head: H(2), netPatchHash: 'p2' }).owed).toBe(true);
-    expect(index.map['o/r#8']).toMatchObject({ lastReviewedHead: H(3) });
-  });
-  it('compaction deletes only retraction markers whose row it folded: a rejected writer that appends after the compaction stays hidden even if it never rolls back', () => {
-    rec();
-    const { log, lock } = headIndexPaths(dir);
-    let stolen = false;
-    const fs = { ...nodeFs,
-      openSync: (p, f, ...a) => {
-        if (f === 'a' && p === log && !stolen) { // A named its transaction (pending marker) and has not appended yet: the lock passes to B, who compacts
-          stolen = true; rmSync(lock, { force: true });
-          recordReview({ dir, repo: 'o/r', pr: 8, head: H(3), netPatchHash: 'p9', verdict: 'accept', at: '2026-11-04T11:00:00Z', logMaxLines: 1 });
-        }
-        if (f === 'wx' && /retract\./.test(String(p))) throw Object.assign(Error('disk full'), { code: 'ENOSPC' }); // A can never write its own retraction (crash / failure)
-        return nodeFs.openSync(p, f, ...a); } };
-    expect(() => rec({ fs, head: H(2), netPatchHash: 'p2', at: '2026-11-04T10:30:00Z' })).toThrow(/lock lost/);
-    expect(stolen).toBe(true);
-    expect(logRows().some(r => r.head === H(2))).toBe(true);     // A's row did land in the compacted log, after B's rename
-    expect(nodeFs.readdirSync(dir).filter(n => n.startsWith('retract.'))).toHaveLength(1); // B's retraction of A is kept: A's row never arrived in B's snapshot
-    const index = readHeadIndex({ dir });
-    expect(index.map['o/r#7'].history.p2).toBeUndefined();        // so the rejected review is never readable
-    expect(headReviewOwed({ index, repo: 'o/r', pr: 7, head: H(2), netPatchHash: 'p2' }).owed).toBe(true);
-    expect(index.map['o/r#8']).toMatchObject({ lastReviewedHead: H(3) });
-  });
-  it('a retraction removes the writer\'s own row (by txn), not a later row with identical content', () => {
-    const { log } = headIndexPaths(dir);
-    nodeFs.mkdirSync(dir, { recursive: true });
-    const base = { repo: 'o/r', pr: 7, head: H(2), netPatchHash: 'p2', verdict: 'accept', at: '2026-11-04T10:00:00Z' };
-    const other = { repo: 'o/r', pr: 7, head: H(3), netPatchHash: 'p3', verdict: 'accept', at: '2026-11-04T10:00:01Z' };
-    writeFileSync(log, [{ ...base, txn: 'a' }, { ...other, txn: 'c' }, { ...base, txn: 'b' }].map(r => `${JSON.stringify(r)}\n`).join(''));
-    marker('a');
-    const m = readHeadIndex({ dir, keepPerPr: 20 }).map['o/r#7'];
-    expect(m.lastReviewedHead).toBe(H(2));                      // B's row (txn b) survives and is the latest; C's is not promoted
-    expect(Object.keys(m.history).sort()).toEqual(['p2', 'p3']);
-    expect(m.txn).toBe('b');
-  });
-  it('compaction keeps each row\'s txn: a delayed retraction of one transaction never removes another writer\'s identical review', () => {
-    const { log } = headIndexPaths(dir);
-    nodeFs.mkdirSync(dir, { recursive: true });
-    const base = { repo: 'o/r', pr: 7, head: H(2), netPatchHash: 'p2', verdict: 'accept', at: '2026-11-04T10:00:00Z' };
-    writeFileSync(log, [{ ...base, txn: 'a' }, { ...base, txn: 'b' }].map(r => `${JSON.stringify(r)}\n`).join(''));
-    rec({ pr: 9, head: H(4), netPatchHash: 'p4', logMaxLines: 1 });     // compaction rewrites the log; A and B collapse to one row
-    const kept = logRows().find(r => r.pr === 7);
-    expect(kept).toMatchObject({ head: H(2), txn: 'b' });             // the row keeps the identity of the transaction it came from
-    marker('a');                                                       // A's rollback arrives after the compaction
-    expect(readHeadIndex({ dir }).map['o/r#7']).toMatchObject({ lastReviewedHead: H(2) }); // B's valid review survives
-    marker('b');
-    expect(readHeadIndex({ dir }).map['o/r#7']).toBeUndefined();       // B's own retraction still removes it
-  });
-  it('a retraction made after the compaction snapshot check is not lost to the log rename (it is a separate file)', () => {
-    const { log } = headIndexPaths(dir);
-    nodeFs.mkdirSync(dir, { recursive: true });
-    writeFileSync(log, `${JSON.stringify({ repo: 'o/r', pr: 8, head: H(3), netPatchHash: 'p9', verdict: 'accept', at: '2026-11-04T09:00:00Z', txn: 'x' })}\n`);
-    let done = false;
-    const fs = { ...nodeFs, renameSync: (a, b) => { // X's writer is rejected right now: after our snapshot check, just before the log is replaced
-      if (!done && b === log) { done = true; marker('x'); }
-      return nodeFs.renameSync(a, b); } };
-    rec({ fs, head: H(2), netPatchHash: 'p2', logMaxLines: 1 });
-    expect(done).toBe(true);
-    expect(logRows().some(r => r.txn === 'x')).toBe(true);        // the rename carried X's row over (it could not know about the marker)
-    expect(existsSync(join(dir, 'retract.x'))).toBe(true);        // and the marker is still there: only markers a compaction listed are deleted
-    expect(readHeadIndex({ dir }).map['o/r#8']).toBeUndefined();
-    expect(JSON.parse(readFileSync(headIndexPaths(dir).map, 'utf8')).map['o/r#8']).toBeUndefined();
-  });
-  it('compaction preserves a retraction arriving before its own append (compaction is derived from the log snapshot, not the earlier read)', () => {
-    const { log } = headIndexPaths(dir);
-    nodeFs.mkdirSync(dir, { recursive: true });
-    const x = { repo: 'o/r', pr: 8, head: H(3), netPatchHash: 'p9', verdict: 'accept', at: '2026-11-04T09:00:00Z' };
-    writeFileSync(log, `${JSON.stringify({ ...x, txn: 'x' })}\n${JSON.stringify({ repo: 'o/r', pr: 7, head: H(1), netPatchHash: 'p1', verdict: 'accept', at: '2026-11-04T08:00:00Z' })}\n`);
-    let appended = false, done = false;
-    const fs = { ...nodeFs,
-      openSync: (p, f) => { if (f === 'a') appended = true; return nodeFs.openSync(p, f); },
-      readFileSync: (p, ...a) => { const out = nodeFs.readFileSync(p, ...a);
-        if (!appended && !done && p === log) { done = true; marker('x'); } // X's writer retracts it after our read of the index
-        return out; } };
-    rec({ fs, head: H(2), netPatchHash: 'p2', logMaxLines: 2 });  // 3 rows > 2: compacts
-    expect(done).toBe(true);
-    expect(readHeadIndex({ dir }).map['o/r#8']).toBeUndefined();   // the compacted log did not restore the retracted review
-    expect(logRows().some(r => r.txn === 'x')).toBe(false);        // it was folded into the rewrite
-    expect(existsSync(join(dir, 'retract.x'))).toBe(false);        // and its marker removed
-    nodeFs.rmSync(headIndexPaths(dir).map, { force: true });
-    expect(readHeadIndex({ dir }).map['o/r#8']).toBeUndefined();   // nor does a rebuild from the compacted log
-    expect(readHeadIndex({ dir }).map['o/r#7'].lastReviewedHead).toBe(H(2));
-  });
-  it('an fsync failure after the append retracts our row; a snapshot that lacks our row is refused, never reported ok', () => {
-    rec();
-    const { log } = headIndexPaths(dir);
-    let logFd = null, fail = true;
-    const failing = { ...nodeFs,
-      openSync: (p, f) => { const fd = nodeFs.openSync(p, f); if (f === 'a' && p === log) logFd = fd; return fd; },
-      fsyncSync: fd => { if (fail && fd === logFd) throw Error('EIO'); return nodeFs.fsyncSync(fd); } };
-    expect(() => rec({ fs: failing, head: H(2), netPatchHash: 'p2' })).toThrow(/EIO/);
-    fail = false;
-    expect(readHeadIndex({ dir }).map['o/r#7'].history.p2).toBeUndefined(); // the written-but-unflushed row is not visible
-    let appended = false;
-    const lost = { ...nodeFs,
-      openSync: (p, f) => { if (f === 'a' && p === log) appended = true; return nodeFs.openSync(p, f); },
-      readFileSync: (p, ...a) => { const out = nodeFs.readFileSync(p, ...a); return appended && p === log && !a.length ? out.subarray(0, 1) : out; } };
-    expect(() => rec({ fs: lost, head: H(3), netPatchHash: 'p3' })).toThrow(/appended row missing/);
-    expect(readHeadIndex({ dir }).map['o/r#7'].history.p3).toBeUndefined();
-  });
-  it('a retraction made after the map was published is not served from the cache: readers rebuild', () => {
-    rec();
-    const first = logRows()[0];
-    let appended = false, reads = 0, done = false;
-    const log = headIndexPaths(dir).log;
-    const fs = { ...nodeFs,
-      openSync: (p, f) => { if (f === 'a') appended = true; return nodeFs.openSync(p, f); },
-      readFileSync: (p, ...a) => { const out = nodeFs.readFileSync(p, ...a);
-        if (appended && p === log && !a.length && ++reads === 2 && !done) { done = true; marker(first.txn); } // after our final listing, before the map is written
-        return out; } };
-    rec({ fs, pr: 9, head: H(4), netPatchHash: 'p4' });
-    expect(done).toBe(true);
-    const index = readHeadIndex({ dir });
-    expect(index.rebuilt).toBe(true);                             // the published map's state hash no longer matches
-    expect(index.map['o/r#7']).toBeUndefined();
-  });
-  it('a refused compaction (log changed under the lock) retracts the writer\'s own row before throwing', () => {
-    rec();
-    let appended = false, done = false;
-    const log = headIndexPaths(dir).log;
-    const fs = { ...nodeFs,
-      openSync: (p, f) => { if (f === 'a') appended = true; return nodeFs.openSync(p, f); },
-      readFileSync: (p, ...a) => { const out = nodeFs.readFileSync(p, ...a);
-        if (appended && !done && p === log) { done = true; nodeFs.appendFileSync(log, `${JSON.stringify({ repo: 'o/r', pr: 9, head: H(5), netPatchHash: 'p5', verdict: 'accept', at: '2026-11-04T12:00:00Z' })}\n`); } // a foreign append after our row
-        return out; } };
-    expect(() => rec({ fs, head: H(2), netPatchHash: 'p2', logMaxLines: 1 })).toThrow(/log changed under the lock/);
-    const index = readHeadIndex({ dir });
-    expect(index.ok).toBe(true);
-    expect(index.map['o/r#7'].history.p2).toBeUndefined();
-    expect(index.map['o/r#7'].lastReviewedHead).toBe(H(1));
-    expect(index.map['o/r#9']).toMatchObject({ lastReviewedHead: H(5) }); // the foreign record is untouched
-  });
-  it('a failed retraction marker write is retried once; if it still fails the error says rollback-failed (never a silent fail-open)', () => {
-    rec();
-    const markerFail = n => { let calls = 0; return { ...nodeFs, openSync: (p, f) => { if (f === 'wx' && String(p).includes('retract.') && ++calls <= n) throw Object.assign(Error('EIO'), { code: 'EIO' }); return nodeFs.openSync(p, f); } }; };
-    const steal = fs => ({ ...fs, openSync: (p, f) => { if (f === 'a') writeFileSync(headIndexPaths(dir).lock, JSON.stringify({ pid: process.pid, token: 'thief', at: 1 })); return fs.openSync(p, f); } });
-    expect(() => rec({ fs: steal(markerFail(1)), head: H(2), netPatchHash: 'p2' })).toThrow(/lock lost(?!.*rollback-failed)/); // one failure: the retry succeeds
-    expect(readHeadIndex({ dir }).map['o/r#7'].history.p2).toBeUndefined();
-    rmSync(headIndexPaths(dir).lock, { force: true });
-    expect(() => rec({ fs: steal(markerFail(5)), head: H(3), netPatchHash: 'p3' })).toThrow(/lock lost.*rollback-failed/);   // both attempts fail
-    // The row is still hidden: its pending marker stays until the next writer turns it into a retraction.
-    expect(readHeadIndex({ dir }).map['o/r#7'].history.p3).toBeUndefined();
-    rmSync(headIndexPaths(dir).lock, { force: true });
-    rec({ head: H(4), netPatchHash: 'p4' });
-    expect(nodeFs.readdirSync(dir).filter(n => /^pending\./.test(n))).toEqual([]);
-    expect(readHeadIndex({ dir }).map['o/r#7'].history.p3).toBeUndefined();
-  });
   it('log rows must carry string head and at (an array or a number is not coerced into a valid record)', () => {
     nodeFs.mkdirSync(dir, { recursive: true });
     const row = { repo: 'o/r', pr: 7, head: H(1), netPatchHash: 'p1', verdict: 'accept', at: '2026-11-04T10:00:00Z' };
@@ -915,19 +370,6 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     }
     expect(headReviewOwed({ index, repo: 'o/r', pr: 7, head: H(1), netPatchHash: 'p1', seed: { lastReviewedHead: 'not-a-sha', verdict: 'marker' } }).owed).toBe(false); // a recorded PR ignores the seed
     expect(headReviewOwed({ index: readHeadIndex({ dir: join(dir, 'none') }), repo: 'o/r', pr: 99, head: H(1), seed: { lastReviewedHead: 'not-a-sha', verdict: 'marker' } })).toMatchObject({ owed: true, reason: 'no-record' });
-  });
-  it('a main-lock file with parseable JSON but no integer pid is stale by age, like the takeover file', () => {
-    const { lock } = headIndexPaths(dir);
-    nodeFs.mkdirSync(dir, { recursive: true });
-    writeFileSync(lock, JSON.stringify({ token: 'orphan', at: 0 }));          // no pid
-    expect(() => withHeadIndexLock(dir, () => 'no', { waitMs: 60, staleMs: 60_000 })).toThrow(/lock busy/); // fresh: still respected
-    nodeFs.utimesSync(lock, new Date(0), new Date(0));
-    expect(withHeadIndexLock(dir, () => 'ok', { waitMs: 200, staleMs: 1000 })).toBe('ok'); // old: taken over
-    expect(existsSync(lock)).toBe(false);
-    for (const body of ['{"pid":"12"}', '{"pid":1.5}', '[]', '5']) {
-      writeFileSync(lock, body); nodeFs.utimesSync(lock, new Date(0), new Date(0));
-      expect(withHeadIndexLock(dir, () => body, { waitMs: 200, staleMs: 1000 })).toBe(body);
-    }
   });
   it('recordReview refuses an unreadable existing index and leaves the log and map bytes unchanged', () => {
     rec();
@@ -993,4 +435,382 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     expect(headReviewOwed({ ...base, head: H(3), seed: null }).owed).toBe(true);
     expect(headReviewOwed({ index: { ok: false }, repo: 'o/r', pr: 5, head: H(3), seed })).toMatchObject({ owed: null, held: true });
   });
+});
+
+
+// Mutation targets for the caller's red-first run (no tests run by the builder):
+// - bypass withFileLock: the blocked-writer handshake below never arrives;
+// - publish the log before the temp fsync/rename: byte-identity and step-reader assertions fail;
+// - drop txn / reconstruct rows without writer fields: the identity assertions fail;
+// - trust a stale map without logHash equality: the post-rename recovery assertion fails.
+describe('single-writer acceptance', () => {
+  const rows = () => readFileSync(headIndexPaths(dir).log, 'utf8').trim().split('\n').map(JSON.parse);
+
+
+  it('a contender between the final log read and rename cannot take over and both accepted reviews survive', () => {
+    rec();
+    const { log, lock } = headIndexPaths(dir);
+    let reads = 0, attempted = false;
+    const fs = { ...nodeFs, readFileSync: (p, ...args) => {
+      const bytes = nodeFs.readFileSync(p, ...args);
+      if (p === log && ++reads === 2) {
+        attempted = true;
+        // Model a stale takeover decision targeting A's lock exactly after A has
+        // read its final snapshot. Even apparently abandoned locks cannot be moved.
+        writeFileSync(lock, '2147483647\n');
+        nodeFs.utimesSync(lock, new Date(0), new Date(0));
+        const now = vi.spyOn(Date, 'now').mockReturnValueOnce(60_000).mockReturnValue(65_001);
+        try {
+          expect(() => rec({ pr: 9, head: H(3), netPatchHash: 'B' })).toThrow(/lock acquisition timed out/);
+        } finally { now.mockRestore(); }
+        expect(readFileSync(lock, 'utf8')).toBe('2147483647\n');
+      }
+      return bytes;
+    } };
+    expect(rec({ fs, pr: 8, head: H(2), netPatchHash: 'A' })).toMatchObject({ ok: true });
+    expect(attempted).toBe(true);
+    // B may commit only after A releases the single lock; both rows then survive.
+    expect(rec({ pr: 9, head: H(3), netPatchHash: 'B' })).toMatchObject({ ok: true });
+    expect(rows().map(r => r.pr)).toEqual([7, 8, 9]);
+    expect(readHeadIndex({ dir }).map).toMatchObject({
+      'o/r#8': { lastReviewedHead: H(2) }, 'o/r#9': { lastReviewedHead: H(3) }
+    });
+  });
+
+  it('two writers whose lock was displaced never overwrite each other (temp paths are unique)', () => {
+    rec();
+    const { log, map, lock } = headIndexPaths(dir);
+    const opened = { A: [], B: [] };
+    // Displace A while its map temp exists. B must retain A's accepted log row,
+    // and neither writer may truncate, rename or clean up the other's temp files.
+    let mapFd, aTemp;
+    const bFs = { ...nodeFs, openSync: (p, ...args) => {
+      if (String(p).endsWith('.tmp')) opened.B.push(p);
+      return nodeFs.openSync(p, ...args);
+    } };
+    const fs = { ...nodeFs,
+      openSync: (p, ...args) => {
+        const fd = nodeFs.openSync(p, ...args);
+        if (String(p).endsWith('.tmp')) opened.A.push(p);
+        if (String(p).startsWith(`${map}.`) && String(p).endsWith('.tmp')) { mapFd = fd; aTemp = p; }
+        return fd;
+      },
+      fsyncSync: fd => {
+        nodeFs.fsyncSync(fd);
+        if (fd === mapFd) {
+          mapFd = undefined;
+          const before = readFileSync(aTemp);
+          rmSync(lock);
+          rec({ fs: bFs, pr: 9, head: H(3), netPatchHash: 'B' });
+          expect(readFileSync(aTemp)).toEqual(before);
+        }
+      }
+    };
+    expect(rec({ fs, pr: 8, head: H(2), netPatchHash: 'A' })).toMatchObject({ ok: true });
+    expect(opened.A).toHaveLength(2);
+    expect(opened.B).toHaveLength(2);
+    expect(new Set([...opened.A, ...opened.B]).size).toBe(4);
+    for (const paths of Object.values(opened)) {
+      expect(paths.some(p => p.startsWith(`${log}.`))).toBe(true);
+      expect(paths.some(p => p.startsWith(`${map}.`))).toBe(true);
+    }
+    expect(rows().map(r => r.pr)).toEqual([7, 8, 9]);
+    expect(readHeadIndex({ dir }).map).toMatchObject({
+      'o/r#8': { lastReviewedHead: H(2) }, 'o/r#9': { lastReviewedHead: H(3) }
+    });
+    expect(nodeFs.readdirSync(dir).filter(p => p.endsWith('.tmp'))).toEqual([]);
+  });
+
+  it('a writer whose log changed under it aborts and leaves the log intact', () => {
+    rec();
+    const { log, map, lock } = headIndexPaths(dir);
+    let tempFd, changedLog, changedMap, attemptedRename = false;
+    const temps = [];
+    const fs = { ...nodeFs,
+      openSync: (p, ...args) => {
+        const fd = nodeFs.openSync(p, ...args);
+        if (String(p).endsWith('.tmp')) { temps.push(p); tempFd = fd; }
+        return fd;
+      },
+      fsyncSync: fd => {
+        nodeFs.fsyncSync(fd);
+        if (fd === tempFd) {
+          // B enters through the same shared lock while A is displaced.
+          const ownTemp = readFileSync(temps[0]);
+          rmSync(lock);
+          rec({ head: H(3), netPatchHash: 'B' });
+          changedLog = readFileSync(log); changedMap = readFileSync(map);
+          expect(readFileSync(temps[0])).toEqual(ownTemp);
+        }
+      },
+      renameSync: (from, to) => { attemptedRename = true; return nodeFs.renameSync(from, to); }
+    };
+    expect(() => rec({ fs, head: H(2), netPatchHash: 'A' })).toThrow(/log changed/);
+    expect(attemptedRename).toBe(false);
+    expect(readFileSync(log)).toEqual(changedLog);
+    expect(readFileSync(map)).toEqual(changedMap);
+    expect(rows().map(r => r.head)).toEqual([H(1), H(3)]);
+    expect(readHeadIndex({ dir }).map['o/r#7'].lastReviewedHead).toBe(H(3));
+    expect(temps).toHaveLength(1);
+    expect(temps.every(p => !existsSync(p))).toBe(true);
+    expect(nodeFs.readdirSync(dir).filter(p => p.endsWith('.tmp'))).toEqual([]);
+  });
+
+  it.each(['EACCES', 'ENOENT'])('a log re-read failure (%s) refuses replacement and cleans its own temps', code => {
+    rec();
+    const { log, map } = headIndexPaths(dir);
+    const before = [readFileSync(log), readFileSync(map)];
+    const temps = [];
+    let reads = 0, renamed = false;
+    const fs = { ...nodeFs,
+      readFileSync: (p, ...args) => {
+        if (p === log && ++reads === 2) throw Object.assign(Error('log re-read failed'), { code });
+        return nodeFs.readFileSync(p, ...args);
+      },
+      openSync: (p, ...args) => {
+        if (String(p).endsWith('.tmp')) temps.push(p);
+        return nodeFs.openSync(p, ...args);
+      },
+      renameSync: (from, to) => { renamed = true; return nodeFs.renameSync(from, to); }
+    };
+    expect(() => rec({ fs, head: H(2) })).toThrow(/log changed/);
+    expect(renamed).toBe(false);
+    expect([readFileSync(log), readFileSync(map)]).toEqual(before);
+    expect(temps).toHaveLength(1);
+    expect(temps.every(p => !existsSync(p))).toBe(true);
+  });
+
+  it("a rollback during compaction waits: concurrent writer B is blocked until A's compaction rename completes", async () => {
+    rec();
+    const before = readFileSync(headIndexPaths(dir).log);
+    const barrier = new SharedArrayBuffer(4);
+    const code = `
+      import fs from 'node:fs';
+      import { parentPort, workerData } from 'node:worker_threads';
+      const { recordReview, headIndexPaths } = await import(workerData.moduleURL);
+      const { dir, mode, barrier } = workerData;
+      const { log, lock } = headIndexPaths(dir);
+      const open = fs.openSync.bind(fs);
+      let sent = false, tempFd;
+      fs.openSync = (path, flags, ...args) => {
+        try { return open(path, flags, ...args); }
+        catch (e) {
+          if (mode === 'B' && path === lock && e.code === 'EEXIST' && !sent) {
+            sent = true; parentPort.postMessage('blocked');
+          }
+          throw e;
+        }
+      };
+      const io = { ...fs,
+        openSync(path, flags, ...args) {
+          const fd = fs.openSync(path, flags, ...args);
+          if (String(path).startsWith(log + '.') && String(path).endsWith('.tmp')) tempFd = fd;
+          return fd;
+        },
+        fsyncSync(fd) {
+          if (mode === 'B' && fd === tempFd) throw Error('B rejected before rename');
+          return fs.fsyncSync(fd);
+        },
+        renameSync(from, to) {
+          if (mode === 'A' && to === log) {
+            parentPort.postMessage('ready');
+            if (Atomics.wait(new Int32Array(barrier), 0, 0, 10000) === 'timed-out') throw Error('barrier timeout');
+          }
+          return fs.renameSync(from, to);
+        }
+      };
+      try {
+        recordReview({ dir, repo: 'o/r', pr: 7, head: (mode === 'A' ? '2' : '3').repeat(40),
+          netPatchHash: mode, verdict: 'accept', at: '2026-11-04T11:00:00Z', logMaxLines: 1, fs: io });
+        parentPort.postMessage('accepted');
+      } catch (e) { parentPort.postMessage({ error: e.message }); }
+    `;
+    const start = mode => new Worker(new URL(`data:text/javascript,${encodeURIComponent(code)}`), {
+      workerData: { dir, mode, barrier, moduleURL: pathToFileURL(join(process.cwd(), 'scripts/lib/review-head-index.mjs')).href }
+    });
+    const next = worker => new Promise((resolve, reject) => {
+      worker.once('message', resolve); worker.once('error', reject);
+    });
+    const a = start('A'); let b;
+    try {
+      expect(await next(a)).toBe('ready');
+      // Red on the append-first implementation: A's candidate is already in the readable log.
+      expect(readFileSync(headIndexPaths(dir).log)).toEqual(before);
+      b = start('B');
+      expect(await next(b)).toBe('blocked');
+      expect(readFileSync(headIndexPaths(dir).log)).toEqual(before);
+      const aDone = next(a), bDone = next(b);
+      Atomics.store(new Int32Array(barrier), 0, 1); Atomics.notify(new Int32Array(barrier), 0);
+      expect(await aDone).toBe('accepted');
+      expect(await bDone).toEqual({ error: 'B rejected before rename' });
+      expect(readHeadIndex({ dir }).map['o/r#7'].lastReviewedHead).toBe(H(2));
+      expect(rows().some(r => r.netPatchHash === 'B')).toBe(false);
+    } finally {
+      Atomics.store(new Int32Array(barrier), 0, 1); Atomics.notify(new Int32Array(barrier), 0);
+      await a.terminate(); if (b) await b.terminate();
+    }
+  }, 15000);
+
+  it("compaction keeps each row's txn: a delayed failure of writer A removes nothing of writer B's identical-content review", () => {
+    rec();
+    const { log } = headIndexPaths(dir);
+    const original = rows()[0];
+    // A has written candidate bytes but fails before they can replace the log.
+    let candidate;
+    const fs = { ...nodeFs, renameSync: (from, to) => {
+      if (to === log) { candidate = JSON.parse(readFileSync(from, 'utf8').trim().split('\n').at(-1)); throw Error('A delayed failure'); }
+      return nodeFs.renameSync(from, to);
+    } };
+    expect(() => rec({ fs })).toThrow(/A delayed failure/);
+    // Red on append-first: even a rejected row must never change the readable bytes.
+    expect(rows()).toEqual([original]);
+    rec(); // B's review has exactly A's content, with a different transaction identity.
+    const b = rows().at(-1);
+    expect(b.txn).not.toBe(candidate.txn);
+    expect(b.txn).toMatch(/^[0-9a-f-]{36}$/);
+    // Preserve fields belonging to the original writer, including fields unknown to the map schema.
+    b.writer = { pid: 42, actor: 'B' };
+    writeFileSync(log, `${JSON.stringify(b)}\n`);
+    rec({ pr: 8, head: H(3), netPatchHash: 'p3', logMaxLines: 1 });
+    expect(rows().find(r => r.pr === 7)).toEqual(b);
+    expect(readHeadIndex({ dir }).map['o/r#7'].txn).toBe(b.txn);
+  });
+
+  it('a failed write (error injected before the rename) leaves the log byte-identical and the prior review still current', () => {
+    rec();
+    const { log } = headIndexPaths(dir), before = readFileSync(log);
+    let fd;
+    const fs = { ...nodeFs,
+      openSync: (p, flags) => { const out = nodeFs.openSync(p, flags); if (String(p).startsWith(`${log}.`) && String(p).endsWith('.tmp')) fd = out; return out; },
+      fsyncSync: f => { if (f === fd) throw Error('temp fsync failed'); return nodeFs.fsyncSync(f); }
+    };
+    expect(() => rec({ fs, head: H(2), netPatchHash: 'p2' })).toThrow(/temp fsync failed/);
+    expect(readFileSync(log)).toEqual(before);
+    expect(readHeadIndex({ dir }).map['o/r#7'].lastReviewedHead).toBe(H(1));
+    expect(existsSync(headIndexPaths(dir).lock)).toBe(false);
+  });
+
+  it('compaction never folds an uncommitted row', () => {
+    rec({ keepPerPr: 1 });
+    const { log } = headIndexPaths(dir), before = readFileSync(log);
+    const fs = { ...nodeFs, renameSync: (from, to) => {
+      if (to === log) {
+        const candidateRows = readFileSync(from, 'utf8').trim().split('\n').map(JSON.parse);
+        // The candidate cannot evict the committed predecessor before it is accepted.
+        expect(candidateRows.map(r => r.head)).toEqual([H(1), H(2)]);
+        expect(readFileSync(log)).toEqual(before);
+        throw Error('compaction rejected');
+      }
+      return nodeFs.renameSync(from, to);
+    } };
+    expect(() => rec({ fs, head: H(2), netPatchHash: 'p2', keepPerPr: 1, logMaxLines: 1 })).toThrow(/compaction rejected/);
+    rec({ pr: 8, head: H(3), netPatchHash: 'p3', keepPerPr: 1, logMaxLines: 1 });
+    expect(rows().some(r => r.head === H(2))).toBe(false);
+    expect(readHeadIndex({ dir }).map['o/r#7'].lastReviewedHead).toBe(H(1));
+  });
+
+  it('a reader never observes a rejected review: reads at every fs step during a failing write see only the prior state', () => {
+    rec();
+    const { log } = headIndexPaths(dir), before = readFileSync(log);
+    const prior = readHeadIndex({ dir }).map;
+    const steps = [];
+    const fs = { ...nodeFs };
+    for (const name of ['mkdirSync', 'statSync', 'readFileSync', 'openSync', 'writeSync', 'fsyncSync', 'closeSync', 'renameSync', 'unlinkSync']) {
+      fs[name] = (...args) => {
+        const observe = () => {
+          steps.push(name);
+          expect(readHeadIndex({ dir }).map).toEqual(prior);
+          expect(readFileSync(log)).toEqual(before);
+        };
+        observe();
+        try {
+          if (name === 'renameSync' && args[1] === log) throw Error('rejected at rename');
+          return nodeFs[name](...args);
+        } finally { observe(); }
+      };
+    }
+    expect(() => rec({ fs, head: H(2), netPatchHash: 'p2', logMaxLines: 1 })).toThrow(/rejected at rename/);
+    expect(steps).toContain('writeSync');
+    expect(steps).toContain('renameSync');
+    expect(readHeadIndex({ dir }).map).toEqual(prior);
+  });
+
+  it('an abandoned lock refuses writes until the operator stops writers and removes it', () => {
+    rec();
+    const { log, map, lock } = headIndexPaths(dir);
+    const before = [readFileSync(log), readFileSync(map)];
+    writeFileSync(lock, '2147483647\n');
+    nodeFs.utimesSync(lock, new Date(0), new Date(0));
+    const now = vi.spyOn(Date, 'now').mockReturnValueOnce(60_000).mockReturnValue(65_001);
+    try {
+      expect(() => rec({ head: H(2) })).toThrow(/stop all index writers.*remove.*lock.*retry/i);
+    } finally { now.mockRestore(); }
+    expect(readFileSync(lock, 'utf8')).toBe('2147483647\n');
+    expect([readFileSync(log), readFileSync(map)]).toEqual(before);
+    // This isolated fixture has no active writers; model the explicit operator recovery.
+    rmSync(lock);
+    expect(rec({ head: H(2) })).toMatchObject({ ok: true });
+    expect(readHeadIndex({ dir }).map['o/r#7'].lastReviewedHead).toBe(H(2));
+  });
+
+  it('a failure after the log rename is accepted and readers rebuild until the map is published', () => {
+    rec();
+    const { log, map } = headIndexPaths(dir);
+    let dirFd, dirSynced = false;
+    const fs = { ...nodeFs,
+      openSync: (p, ...args) => { const fd = nodeFs.openSync(p, ...args); if (p === dir) dirFd = fd; return fd; },
+      fsyncSync: fd => { if (fd === dirFd) dirSynced = true; return nodeFs.fsyncSync(fd); },
+      renameSync: (from, to) => {
+        if (to === map) throw Error('map publish failed');
+        return nodeFs.renameSync(from, to);
+      }
+    };
+    expect(() => rec({ fs, head: H(2), netPatchHash: 'p2' })).toThrow(/map publish failed/);
+    expect(readHeadIndex({ dir })).toMatchObject({ ok: true, rebuilt: true,
+      map: { 'o/r#7': { lastReviewedHead: H(2) } } });
+    expect(rows().at(-1).head).toBe(H(2));
+    expect(dirSynced).toBe(true);
+    expect(nodeFs.readdirSync(dir).filter(p => p.endsWith('.tmp'))).toEqual([]);
+  });
+
+  it('flushes the temp log before acceptance, then the temp map before publication, then the directory', () => {
+    const { log, map } = headIndexPaths(dir), ops = [], names = new Map();
+    const fs = { ...nodeFs,
+      openSync: (p, flags) => { const fd = nodeFs.openSync(p, flags); names.set(fd, p); return fd; },
+      fsyncSync: fd => { ops.push(`sync:${names.get(fd)}`); return nodeFs.fsyncSync(fd); },
+      renameSync: (from, to) => { ops.push(`rename:${to}`); return nodeFs.renameSync(from, to); }
+    };
+    rec({ fs });
+    expect(ops).toEqual([expect.stringMatching(/^sync:.*log\.jsonl\.\d+\.[\w-]+\.tmp$/),
+      `rename:${log}`, expect.stringMatching(/^sync:.*map\.json\.\d+\.[\w-]+\.tmp$/), `rename:${map}`, `sync:${dir}`]);
+  });
+
+  it('an unreadable committed log fails closed before any replacement is written', () => {
+    rec();
+    const { log, map } = headIndexPaths(dir);
+    const before = [readFileSync(log), readFileSync(map)];
+    let openedTemp = false;
+    const fs = { ...nodeFs,
+      readFileSync: (p, ...args) => {
+        if (p === log) throw Object.assign(Error('read denied'), { code: 'EACCES' });
+        return nodeFs.readFileSync(p, ...args);
+      },
+      openSync: (p, ...args) => { openedTemp = true; return nodeFs.openSync(p, ...args); }
+    };
+    expect(() => rec({ fs })).toThrow(/existing index unreadable/);
+    expect(openedTemp).toBe(false);
+    expect([readFileSync(log), readFileSync(map)]).toEqual(before);
+  });
+
+  it('directory fsync IO failure is reported after acceptance without retracting the review', () => {
+    rec();
+    let dirFd;
+    const fs = { ...nodeFs,
+      openSync: (p, ...args) => { const fd = nodeFs.openSync(p, ...args); if (p === dir) dirFd = fd; return fd; },
+      fsyncSync: fd => { if (fd === dirFd) throw Object.assign(Error('directory IO failure'), { code: 'EIO' }); return nodeFs.fsyncSync(fd); }
+    };
+    expect(() => rec({ fs, head: H(2), netPatchHash: 'p2' })).toThrow(/directory IO failure/);
+    expect(readHeadIndex({ dir }).map['o/r#7'].lastReviewedHead).toBe(H(2));
+  });
+
 });

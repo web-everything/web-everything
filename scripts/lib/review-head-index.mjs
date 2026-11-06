@@ -1,20 +1,26 @@
 /**
  * @file scripts/lib/review-head-index.mjs
  * @description R554 durable per-head review index. One record per PR: {lastReviewedHead, netPatchHash, verdict, at}
- * plus a history keyed by netPatchHash (latest N kept). Stored as an append-only JSONL log (source of truth) and a
- * compacted map (O(1) read), both under one directory beside the runs dir (.operations/review-head-index).
+ * plus a history keyed by netPatchHash (latest N kept). Stored as a JSONL log (source of truth) and a
+ * cached map, both under one directory beside the runs dir (.operations/review-head-index).
  *
  * - A review is OWED whenever the PR's current head differs from lastReviewedHead, however old the record is or
  *   how many run records exist. It does not depend on any run scan cap.
  * - A verdict already given on the same net patch (same merge-base + exact diff) is carried, not re-reviewed.
  * - Fail closed: an unreadable index answers `{owed:null, held:true}`; it is never read as "nothing owed".
- * - Write order: append the log line (fsync) FIRST, then write the map to a temp file and rename it. A crash in
- *   between leaves a log ahead of the map; the reader detects that (map.logBytes != log size) and rebuilds from the log.
- * Nothing calls this module yet; wiring (review-job hook, planRedTeamOnSkip read) follows separately.
+ * - One shared withFileLock hold serialises every writer: read, prepare/compact in memory, fsync a temp log,
+ *   rename over the log (the sole acceptance point), atomically publish the map, then fsync the directory.
+ *   Automatic stale takeover is disabled: validation plus rename requires uninterrupted exclusion.
+ *   Abandoned locks require an operator to stop index writers, remove the lock, then retry.
+ *   Unique per-writer temps and a final byte comparison also detect changes during candidate preparation.
+ *   Before acceptance failures leave the old log byte-identical; after acceptance readers recover from the log.
+ *   The directory is synced after acceptance even if map publication fails.
+ * - Readers stay lock-free and trust the map only when its logHash matches the complete log bytes they read.
  */
 import * as nodeFs from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
+import { withFileLock } from './atomic-json-file.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
@@ -24,7 +30,6 @@ import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 const SHA = /^[0-9a-f]{40}$/;
 export const HEAD_INDEX_STANDARD = Object.freeze({ keepPerPr: 20, logMaxLines: 2000 });
 export const MAP_VERSION = 2;
-export const LOCK_STALE_MS = 30_000, LOCK_WAIT_MS = 15_000;
 const posInt = v => Number.isSafeInteger(v) && v > 0;
 
 /**
@@ -33,7 +38,7 @@ const posInt = v => Number.isSafeInteger(v) && v > 0;
  * overridden through WE_COORDINATION_ROOT moves the index with it (<dirname(override)>/review-head-index).
  */
 export function defaultHeadIndexDir(env = process.env) { return join(dirname(resolveCoordinationRoot({ env })), 'review-head-index'); }
-export function headIndexPaths(dir) { return { log: join(dir, 'log.jsonl'), map: join(dir, 'map.json'), lock: join(dir, 'lock'), tmp: join(dir, 'map.json.tmp') }; }
+export function headIndexPaths(dir) { return { log: join(dir, 'log.jsonl'), map: join(dir, 'map.json'), lock: join(dir, 'lock') }; }
 
 /** Standard -> platform -> tool via the policy cascade; no env override. */
 export function resolveHeadIndexSettings({ file = readSettings(), platform, env = process.env, log } = {}) {
@@ -79,7 +84,7 @@ export function applyRecord(map, rec, keepPerPr) {
   const prev = map[key] ?? { history: {} };
   const history = { ...prev.history };
   // A review without a net-patch key is kept under a head-scoped key so compaction never drops it; it can never be carried.
-  // The writer's txn rides along with every kept entry, so compaction can write it back and a retraction still finds its row.
+  // The writer's txn rides along with every kept entry so compaction preserves the row's identity.
   const txn = rec.txn === undefined ? {} : { txn: rec.txn };
   history[rec.netPatchHash ?? `${NOKEY}${rec.head}`] = { head: rec.head, verdict: rec.verdict, at: rec.at, ...txn };
   const kept = Object.entries(history).sort((a, b) => Date.parse(b[1].at) - Date.parse(a[1].at) || (a[0] < b[0] ? -1 : 1)).slice(0, keepPerPr);
@@ -92,42 +97,16 @@ const validEntry = e => e && SHA.test(e.lastReviewedHead ?? '') && typeof e.verd
 const validMap = m => m && typeof m === 'object' && Object.values(m).every(validEntry);
 // Replay applies the SAME keepPerPr the writer used, so a rebuilt map equals the published one: evicted history is not
 // resurrected, and a compacted log (older rows then the PR's current record last, keyed or keyless) replays to the same map.
-// A rejected writer (it lost the lock after appending) never writes to the log again: a live holder may be appending to it or
-// replacing it by rename, which would swallow the write. It creates a marker file `retract.<txn>` (O_EXCL, a name of its own, so
-// no rewrite of the log can lose it) naming its row by the txn every row carries and compaction preserves. Replay drops every row
-// whose txn has a marker. Markers are removed only by the compaction that folded them in.
 const hashText = text => createHash('sha256').update(text).digest('hex');
-const RETRACT = /^retract\.([\w-]{1,64})$/;
-const retractPath = (dir, txn) => join(dir, `retract.${txn}`);
-// A writer names its transaction BEFORE its row exists: `pending.<txn>` is created (O_EXCL, durable) first and removed only when the
-// transaction is accepted (the map is published and the lock is still ours). Replay and readers treat a row whose txn is pending OR
-// retracted as invisible, so a row is never readable before its retraction can exist: it is hidden from the instant it is appended
-// until the instant it is accepted. A rejected writer leaves its marker (and converts it to `retract.<txn>` when it can). Whoever
-// next holds the lock turns every foreign pending marker into a retraction: once the lock has changed hands the old holder fails
-// its fence, so that transaction can never be accepted, and compaction therefore never folds an uncommitted row.
-const PENDING = /^pending\.([\w-]{1,64})$/;
-const pendingPath = (dir, txn) => join(dir, `pending.${txn}`);
-/** Retraction and pending markers present now, sorted. Always listed BEFORE the log is read (see readHeadIndex). ENOENT means no directory yet. */
-const listMarkers = (fs, dir) => {
-  try { const names = fs.readdirSync(dir); const pick = re => names.map(n => re.exec(n)?.[1]).filter(Boolean).sort(); return { retract: pick(RETRACT), pending: pick(PENDING) }; } catch (e) { if (e?.code === 'ENOENT') return { retract: [], pending: [] }; throw e; }
-};
-/** The cache key: the raw log bytes plus the set of markers, so a marker that appears (or goes) after the map was published invalidates it. */
-const stateHash = (raw, retractions, pending = []) => {
-  const tail = `${retractions.length ? `\0retract:${retractions.join(',')}` : ''}${pending.length ? `\0pending:${pending.join(',')}` : ''}`;
-  return tail ? hashText(Buffer.concat([raw, Buffer.from(tail)])) : hashText(raw);
-};
-const parseLog = (text, keepPerPr, retractions = []) => {
-  const lines = text.split('\n').filter(l => l.trim());
-  const gone = new Set(retractions);
-  const map = {}, seen = new Set(); // seen = every txn that has a row in this text, retracted or not
-  for (const l of lines) {
-    const rec = JSON.parse(l);
+const parseLog = (text, keepPerPr) => {
+  const allRows = text.split('\n').filter(l => l.trim()).map(l => JSON.parse(l));
+  const map = {}, rows = [];
+  for (const rec of allRows) {
     if (!validRecord(rec)) throw Error('invalid log record');
-    if (typeof rec.txn === 'string') seen.add(rec.txn);
-    if (typeof rec.txn === 'string' && gone.has(rec.txn)) continue; // retracted by its writer
+    rows.push(rec);
     applyRecord(map, rec, keepPerPr);
   }
-  return { map, lines: lines.length, seen };
+  return { map, rows, lines: rows.length };
 };
 /** keepPerPr for a rebuild: explicit option, else the value the last published map recorded, else the resolved setting (`.value`). */
 const rebuildKeep = (explicit, stored, settingsFile) => {
@@ -149,22 +128,10 @@ export function readHeadIndex({ dir = defaultHeadIndexDir(), fs = nodeFs, keepPe
       if (!existsSafe(fs, mapPath)) return { ok: true, map: {} };
       return { ok: false, reason: 'index-unreadable' }; // a map with no log is not a state we write
     }
-    // An unreadable log throws here and fails closed. The cache is trusted only when the log's content hash matches.
-    // Markers are listed BEFORE the log is read and AGAIN after it, and the UNION is used. Before: a compaction renames the new log
-    // into place and only then deletes the markers it folded, so a marker missing from the first listing was already folded into the
-    // log we read next. After: a writer names its transaction (or a rejection lands) between our first listing and our read, so its
-    // row is in the bytes we read but not in the first listing; the second listing sees the marker and hides it. A marker only in the
-    // second listing is never wrong to apply (its row is either in our bytes and must be hidden, or not in them), and one only in
-    // the first belongs to a row that is now committed or folded: hiding it costs one conservative rebuild, never a rejected row.
-    const first = listMarkers(fs, dir);
-    const raw = fs.readFileSync(log); // the cache key is the digest of the RAW bytes: a UTF-8 decode would alias distinct corrupt logs
-    const second = listMarkers(fs, dir);
-    const union = (a, b) => [...new Set([...a, ...b])].sort();
-    const retract = union(first.retract, second.retract), pending = union(first.pending, second.pending);
-    const text = raw.toString('utf8');
-    const logHash = stateHash(raw, retract, pending);
+    const raw = fs.readFileSync(log); // hash raw bytes, never a lossy UTF-8 decode
+    const logHash = hashText(raw);
     if (stored && stored.map && typeof stored.map === 'object' && stored.version === MAP_VERSION && stored.logHash === logHash && validMap(stored.map)) return { ok: true, map: stored.map };
-    return { ok: true, map: parseLog(text, rebuildKeep(keepPerPr, stored, settingsFile), [...retract, ...pending]).map, rebuilt: true };
+    return { ok: true, map: parseLog(raw.toString('utf8'), rebuildKeep(keepPerPr, stored, settingsFile)).map, rebuilt: true };
   } catch { return { ok: false, reason: 'index-unreadable' }; }
 }
 // Only ENOENT means absent; any other stat failure (EACCES, EIO, ...) throws so the caller fails closed instead of reading an empty index.
@@ -173,84 +140,26 @@ const existsSafe = (fs, p) => { try { fs.statSync(p); return true; } catch (e) {
 // Durable: write, fsync, close. The rename happens only after the temp file is flushed.
 const durable = (fs, path, flag, text) => {
   const fd = fs.openSync(path, flag);
-  try { fs.writeSync(fd, text); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  try { const buf = Buffer.from(text); let off = 0; while (off < buf.length) { const n = fs.writeSync(fd, buf, off, buf.length - off); if (!(n > 0)) throw Error('review-head-index: short write'); off += n; } fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
 };
-// fsync the directory so a created or removed NAME survives a power loss (best effort: a platform that cannot fsync a directory skips it).
-const syncDir = (fs, dir) => { try { const dfd = fs.openSync(dir, 'r'); try { fs.fsyncSync(dfd); } finally { fs.closeSync(dfd); } } catch { /* unsupported */ } };
-const atomicWrite =(fs, path, tmp, text) => { durable(fs, tmp, 'w', text); fs.renameSync(tmp, path); };
-
-const sleepMs = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-const pidAlive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; } };
-
-/**
- * Exclusive lock file (O_EXCL) holding {pid, token, at}. A lock is taken over ONLY when its owner pid is dead (or, for a
- * holder file that never got written, after staleMs). A live owner is never displaced, however old the lock. `fn` gets a
- * `fence()` that throws unless the lock file still carries OUR token; call it before every publish.
- */
-export function withHeadIndexLock(dir, fn, { fs = nodeFs, staleMs = LOCK_STALE_MS, waitMs = LOCK_WAIT_MS, now = Date.now, pid = process.pid } = {}) {
-  const { lock } = headIndexPaths(dir);
-  const token = `${pid}-${now()}-${Math.random().toString(36).slice(2)}`;
-  const deadline = now() + waitMs;
-  const holder = () => { try { const v = JSON.parse(fs.readFileSync(lock, 'utf8')); return v && typeof v === 'object' ? v : null; } catch { return null; } }; // a non-object body (0, false, 5) is as unreadable as garbage
-  const takeover = `${lock}.takeover`;
-  /**
-   * Take over a lock judged dead (`deadHolder` = the holder we read, or null for an unreadable one). Takeovers are serialised by a
-   * separate O_EXCL `<lock>.takeover` file. Under it the holder is re-read and the lock is replaced ONLY if it is still the
-   * dead one: our lock is written to a temp file and rename()d over `lock` (atomic replace, so there is never a moment without
-   * a lock), and `lock` itself is never unlinked here. A live owner that re-created the lock keeps it. Returns true if we hold it.
-   */
-  const takeOver = deadHolder => {
-    let tfd;
-    try {
-      tfd = fs.openSync(takeover, 'wx');
-      try { fs.writeSync(tfd, JSON.stringify({ pid, token, at: now() })); } finally { fs.closeSync(tfd); }
-    } catch (e) {
-      if (e?.code !== 'EEXIST') throw e;
-      // Another contender is taking over. Clear its file only if its owner is dead (or it is unreadable and past the grace).
-      let other = null; try { other = JSON.parse(fs.readFileSync(takeover, 'utf8')); } catch { /* unreadable */ }
-      let otherAge = 0; try { otherAge = now() - fs.statSync(takeover).mtimeMs; } catch { return false; }
-      // A file with no integer pid is treated like an unreadable one (cleared by age), so a malformed one cannot block forever.
-      // Two cleaners racing here can at worst let two contenders rename over the lock; the loser's post-rename token check or its
-      // first fence() fails closed, so the lock never has two publishing holders.
-      if (Number.isInteger(other?.pid) ? !pidAlive(other.pid) : otherAge > staleMs) { try { fs.unlinkSync(takeover); } catch { /* gone */ } }
-      return false;
+// Persist the renamed names too. Skip only platforms that do not support directory fsync.
+const syncDir = (fs, dir) => {
+  try { const fd = fs.openSync(dir, 'r'); try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); } }
+  catch (e) { if (!['EINVAL', 'ENOTSUP', 'EISDIR'].includes(e?.code)) throw e; }
+};
+const atomicWrite =(fs, path, tmp, text) => { durable(fs, tmp, 'wx', text); fs.renameSync(tmp, path); };
+// The shared helper moves a stale lock before verifying its holder. Another writer
+// could enter that gap, including between our final read and log rename. Keep the
+// same exclusive lock, but never reclaim it automatically; timeout fails closed.
+const withHeadIndexLock = (lock, fn) => {
+  try { return withFileLock(lock, fn, { staleMs: Infinity }); }
+  catch (e) {
+    if (String(e?.message).startsWith(`withFileLock: timed out waiting for ${lock} `)) {
+      throw Error(`review-head-index: lock acquisition timed out; stop all index writers, remove the abandoned lock at ${lock}, then retry`, { cause: e });
     }
-    const fresh = `${lock}.new.${token}`;
-    try {
-      const cur = holder();
-      let curAge; try { curAge = now() - fs.statSync(lock).mtimeMs; } catch { return false; } // vanished: let the normal path create it
-      const ownerless = !Number.isInteger(cur?.pid); // the grace applies to an ownerless lock at the re-read too
-      if (deadHolder ? cur?.token !== deadHolder.token || (ownerless && curAge <= staleMs) : cur !== null || curAge <= staleMs) return false; // changed hands: a live owner's lock
-      durable(fs, fresh, 'w', JSON.stringify({ pid, token, at: now() }));
-      fs.renameSync(fresh, lock);
-      return holder()?.token === token;
-    } finally {
-      try { fs.unlinkSync(fresh); } catch { /* consumed by the rename, or never written */ }
-      try { fs.unlinkSync(takeover); } catch { /* best effort */ }
-    }
-  };
-  for (;;) {
-    try {
-      const fd = fs.openSync(lock, 'wx');
-      try { fs.writeSync(fd, JSON.stringify({ pid, token, at: now() })); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-      break;
-    } catch (e) {
-      if (e?.code !== 'EEXIST') throw e;
-      const held = holder();
-      let age = Infinity;
-      try { age = now() - fs.statSync(lock).mtimeMs; } catch { continue; } // vanished: retry
-      // No integer pid (unreadable file, or JSON without an owner pid): no owner to probe, so only after the grace, like the takeover file.
-      const dead = Number.isInteger(held?.pid) ? !pidAlive(held.pid) : age > staleMs;
-      if (dead && takeOver(held)) break; // took the lock over; otherwise wait like any other contender
-      if (now() >= deadline) throw Error('review-head-index: lock busy (holder pid ' + (held?.pid ?? '?') + ')');
-      sleepMs(10 + Math.floor(Math.random() * 20));
-    }
+    throw e;
   }
-  const fence = () => { if (holder()?.token !== token) throw Error('review-head-index: lock lost (fencing token mismatch); refusing to publish'); };
-  try { return fn(fence); } finally {
-    try { if (holder()?.token === token) fs.unlinkSync(lock); } catch { /* not ours or gone */ }
-  }
-}
+};
 
 /**
  * Record a durable review verdict. Call only after the verdict itself is durable (its run record exists).
@@ -263,100 +172,70 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
   if (!validRecord(rec)) throw Error(`review-head-index: invalid record (repo/pr/head/verdict/at): head=${String(head).slice(0, 12)} verdict=${String(verdict)}`);
   if (!posInt(keepPerPr) || !posInt(logMaxLines)) throw Error('review-head-index: invalid keepPerPr/logMaxLines');
   fs.mkdirSync(dir, { recursive: true });
-  return withHeadIndexLock(dir, fence => {  // read, append, compact and publish are ONE transaction
-    const { log, map: mapPath, tmp } = headIndexPaths(dir);
-    // We hold the lock, so any pending marker that is not ours belongs to a writer whose lock was taken over: it will fail its fence
-    // and can never be accepted. Reject it for good (retraction first, then drop the pending marker); never leave it to be folded.
-    // A marker that cannot be turned into a retraction fails this write closed rather than risk folding an uncommitted row.
-    // The conversion is ONE atomic rename (pending.<t> -> retract.<t>), so it races a stale writer's commit (its unlink of the same
-    // pending marker) with exactly one winner: either the writer's commit finds the marker gone and fails, or the rename finds it
-    // gone (ENOENT: the writer committed first) and the row stays accepted. The retraction is never created beside a live marker.
-    for (const t of listMarkers(fs, dir).pending) {
-      try { fs.renameSync(pendingPath(dir, t), retractPath(dir, t)); } catch (e) { if (e?.code !== 'ENOENT') throw e; }
+  const { log, map: mapPath, lock } = headIndexPaths(dir);
+  return withHeadIndexLock(lock, () => {
+    let raw, logPresent = true;
+    try { raw = fs.readFileSync(log); }
+    catch (e) {
+      let mapPresent = true;
+      if (e?.code === 'ENOENT') { try { mapPresent = existsSafe(fs, mapPath); } catch { mapPresent = true; } }
+      if (e?.code !== 'ENOENT' || mapPresent) throw Error('review-head-index: existing index unreadable; refusing to write', { cause: e });
+      logPresent = false;
+      raw = Buffer.alloc(0);
     }
-    const current = readHeadIndex({ dir, fs, keepPerPr });
-    if (!current.ok) throw Error('review-head-index: existing index unreadable; refusing to write');
-    fence();
-    const txn = randomUUID();                                   // names OUR row for its whole life, through compaction
-    const line = `${JSON.stringify({ ...rec, txn })}\n`;
-    // Our transaction is named before its row exists. If the marker cannot be written nothing has been appended and we fail closed.
-    durable(fs, pendingPath(dir, txn), 'wx', `${JSON.stringify({ txn, pid: process.pid, at: Date.now() })}\n`);
-    // fsync the directory too, so the marker's NAME survives a power loss together with the row it hides (best effort: a platform
-    // that cannot fsync a directory just skips it).
-    syncDir(fs, dir);
-    // Our row is hidden by that marker from the instant it is appended until we accept it. A lost lock (or any failure before the
-    // commit) rejects it: we never touch the log again to say so (a live holder may be appending to it or renaming a new one over
-    // it, which would swallow our write); we create the marker file `retract.<txn>` and drop the pending marker.
-    const lineBytes = Buffer.from(line);
-    let rolledBack = false, rollbackFailed = false, committed = false;
-    const rollback = () => {
-      if (rolledBack) return;                                   // idempotent
-      rolledBack = true;
-      let marked = false;
-      for (let attempt = 0; attempt < 2 && !marked; attempt++) { // one retry; EEXIST means the marker is already there
-        try { durable(fs, retractPath(dir, txn), 'wx', `${JSON.stringify({ txn })}\n`); marked = true; } catch (e) { if (e?.code === 'EEXIST') marked = true; }
-      }
-      if (marked) { try { fs.unlinkSync(pendingPath(dir, txn)); } catch { /* the next writer clears it */ } } else rollbackFailed = true; // the pending marker still hides the row
-    };
-    const tag = e => { if (rollbackFailed && e instanceof Error && !e.message.includes('rollback-failed')) e.message += ' (rollback-failed: could not write the retraction marker; the row stays hidden by its pending marker until the next writer rejects it)'; return e; };
-    const fenced = () => { try { fence(); } catch (e) { rollback(); throw tag(e); } };
-    try {
-    durable(fs, log, 'a', line);                                // 1. durable log line (fsynced, hidden by our pending marker); a failed fsync after the write rejects it too
-    fenced();                                                   //    lock lost during the append: roll the line back, no publish
-    // 2. Everything below is derived from ONE snapshot of the log taken after our append (markers listed first, as readers do), not
-    // from `current.map` (read before it): a retraction made in between is applied by the replay.
-    const { retract: folded, pending: pendingNow } = listMarkers(fs, dir);
-    const snapshot = fs.readFileSync(log);
-    if (!snapshot.includes(lineBytes)) throw Error('review-head-index: appended row missing from the log; refusing to publish'); // never report ok for a lost append
-    // Our pending marker hides our row here, so `parsed.map` is the committed state WITHOUT it. Only committed rows are ever folded.
-    const parsed = parseLog(snapshot.toString('utf8'), keepPerPr, [...folded, ...pendingNow, txn]);
-    let lines = parsed.lines;
-    if (lines > logMaxLines) { // 3. bound growth: rewrite the log from the compacted map, atomically, then the map
-      // The rewrite is derived from the committed map WITHOUT our row, and our own line is kept verbatim as the last row. Our row can
-      // replace a same-patch predecessor or evict the oldest entry in the map; compacting that map would make those losses permanent,
-      // so a later retraction of our row could not bring them back. Replay applies our row last either way, so the result is the same.
-      const prior = parsed.map;
-      const compact = Object.entries(prior).flatMap(([k, v]) => {
-        const [r, p] = [k.slice(0, k.lastIndexOf('#')), Number(k.slice(k.lastIndexOf('#') + 1))];
-        const tx = h => (h.txn === undefined ? {} : { txn: h.txn }); // every row keeps its writer's txn, so a later retraction still finds it
-        const row = (hash, h) => ({ repo: r, pr: p, head: h.head, netPatchHash: hash.startsWith(NOKEY) ? null : hash, verdict: h.verdict, at: h.at, ...tx(h) });
-        const cur = v.netPatchHash ?? `${NOKEY}${v.lastReviewedHead}`; // the current record's own history entry is emitted once, as the LAST row
-        const older = Object.entries(v.history).filter(([hash]) => hash !== cur).sort((a, b) => Date.parse(a[1].at) - Date.parse(b[1].at)).map(([hash, h]) => row(hash, h));
-        // The PR's current record goes LAST so a rebuild restores lastReviewedHead and its verdict exactly.
-        return [...older, { repo: r, pr: p, head: v.lastReviewedHead, netPatchHash: v.netPatchHash, verdict: v.verdict, at: v.at, ...tx(v) }];
+    let parsed;
+    try { parsed = parseLog(raw.toString('utf8'), keepPerPr); }
+    catch (e) { throw Error('review-head-index: existing index unreadable; refusing to write', { cause: e }); }
+    const row = { ...rec, txn: randomUUID() };
+    const line = `${JSON.stringify(row)}\n`;
+    let text = Buffer.concat([raw, Buffer.from((raw.length && raw.at(-1) !== 10 ? '\n' : '') + line)]);
+    let lines = parsed.lines + 1;
+    if (lines > logMaxLines) {
+      // Compact ONLY the committed snapshot. Select original rows so txn and all writer fields survive.
+      // The candidate remains last and is never folded into the committed history before acceptance.
+      const compact = Object.entries(parsed.map).flatMap(([key, value]) => {
+        const repo = key.slice(0, key.lastIndexOf('#')), pr = Number(key.slice(key.lastIndexOf('#') + 1));
+        const original = (hash, entry) => {
+          const source = parsed.rows.findLast(r => r.repo === repo && r.pr === pr &&
+            (entry.txn === undefined || r.txn === entry.txn) && r.head === entry.head &&
+            (r.netPatchHash ?? null) === hash && r.at === entry.at && r.verdict === entry.verdict);
+          return { ...source };
+        };
+        const current = value.netPatchHash ?? `${NOKEY}${value.lastReviewedHead}`;
+        const older = Object.entries(value.history).filter(([hash]) => hash !== current)
+          .sort((a, b) => Date.parse(a[1].at) - Date.parse(b[1].at))
+          .map(([hash, entry]) => original(hash.startsWith(NOKEY) ? null : hash, entry));
+        return [...older, original(value.netPatchHash, { ...value, head: value.lastReviewedHead })];
       });
-      const text = compact.map(c => `${JSON.stringify(c)}\n`).join('') + line;
-      if (!snapshot.subarray(Math.max(0, snapshot.length - lineBytes.length)).equals(lineBytes)) { rollback(); throw tag(Error('review-head-index: log changed under the lock; refusing to compact')); }
-      fenced();
-      // The rewrite replaces the file, so it must replace exactly the bytes the compaction was derived from. A rejected writer's
-      // retraction is a separate marker file, so nothing it does can be lost to this rename.
-      if (!fs.readFileSync(log).equals(snapshot)) { rollback(); throw tag(Error('review-head-index: log changed under the lock; refusing to compact')); }
-      atomicWrite(fs, log, `${log}.tmp`, text);
-      fenced();                                                 // lock lost during the rewrite: the compacted log replays to the same map, so it stays; our row is retracted
-      // Delete only a marker whose row this compaction actually saw (and so dropped from the new log). A marker whose row is not in
-      // the snapshot belongs to a rejected writer that has not appended yet (it named its transaction, then lost the lock): its row
-      // can still land in the new log, and the marker is the only thing hiding it. Such markers are never aged out (a paused writer
-      // may append arbitrarily late), so they can pile up; that is the price of never showing a rejected review.
-      for (const t of folded) { if (parsed.seen.has(t)) { try { fs.unlinkSync(retractPath(dir, t)); } catch { /* gone */ } } } // later markers are not in `folded` and stay
+      text = compact.map(r => `${JSON.stringify(r)}\n`).join('') + line;
       lines = compact.length + 1;
     }
-    fenced();
-    // The map and its hash describe the state AFTER our commit (our pending marker gone), from the SAME markers and bytes. Until the
-    // commit a reader's hash still includes our marker, so it rebuilds without our row; a marker made after this listing changes the
-    // hash too, so readers rebuild instead of trusting this map.
-    const { retract: live, pending: allPending } = listMarkers(fs, dir);
-    const after = allPending.filter(t => t !== txn);
-    const raw = fs.readFileSync(log);
-    if (!raw.includes(lineBytes)) throw Error('review-head-index: appended row missing from the log at commit; refusing to accept'); // a stale rename swallowed it: never report ok for a lost row
-    const published = JSON.stringify({ version: MAP_VERSION, logHash: stateHash(raw, live, after), keepPerPr, map: parseLog(raw.toString('utf8'), keepPerPr, [...live, ...after]).map });
-    fenced();                                                   // still the holder: accept. A thief after this finds our row accepted.
-    fs.unlinkSync(pendingPath(dir, txn));                       // COMMIT: the row becomes visible. A missing marker means a new holder already rejected us: fail.
-    committed = true;                                           // past this point the row stays: a failed map write only leaves the cache behind the log
-    syncDir(fs, dir);                                           // make the marker's removal durable too: after a power loss it must not come back and hide an accepted row
-    atomicWrite(fs, mapPath, tmp, published);
-    return { ok: true, lines };
-    } catch (e) { if (!committed) rollback(); throw tag(e); }        // any failure before the commit rejects our row (it is already hidden); after it, readers rebuild from the log
-  }, { fs });
+    const published = JSON.stringify({ version: MAP_VERSION, logHash: hashText(text), keepPerPr,
+      map: parseLog(text.toString('utf8'), keepPerPr).map });
+    const suffix = `${process.pid}.${row.txn}.tmp`;
+    const logTmp = `${log}.${suffix}`, mapTmp = `${mapPath}.${suffix}`;
+    try {
+      durable(fs, logTmp, 'wx', text);
+      // Refuse to replace a log changed outside this lock while the candidate
+      // was prepared. Exclusion, rather than this comparison, protects publication.
+      let current;
+      try { current = fs.readFileSync(log); }
+      catch (e) {
+        if (e?.code !== 'ENOENT') throw Error('review-head-index: log changed or unreadable; refusing to write', { cause: e });
+        current = null;
+      }
+      if (current === null ? logPresent : !logPresent || !current.equals(raw)) {
+        throw Error('review-head-index: log changed; refusing to write');
+      }
+      fs.renameSync(logTmp, log); // ACCEPT: no readable candidate exists before this rename
+      try { atomicWrite(fs, mapPath, mapTmp, published); }
+      finally { syncDir(fs, dir); }
+      return { ok: true, lines };
+    } finally {
+      // Cleanup never changes committed state, including after a failed cache publication.
+      for (const path of [logTmp, mapTmp]) { try { fs.unlinkSync(path); } catch { /* absent or cleanup unavailable */ } }
+    }
+  });
 }
 
 /**
