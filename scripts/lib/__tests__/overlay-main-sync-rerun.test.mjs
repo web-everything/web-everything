@@ -97,7 +97,8 @@ function report(options, evidence = 'passed', status = 0) {
     const state = file === failedFile ? evidence : 'passed';
     if (state === 'missing') return [];
     return [{ name: join(fs.realpathSync(options.root), file),
-      assertionResults: state === 'empty' ? []
+      // An explicit assertion list, for sequences the named states cannot express.
+      assertionResults: Array.isArray(state) ? state : state === 'empty' ? []
         // 'renamed': the failed assertion vanished and only a different one ran (and passed).
         : state === 'renamed' ? [{ status: 'passed', title: 'another behaves', ancestorTitles: ['worker'] }]
         // 'baseline-passed': both assertions run and pass.
@@ -381,6 +382,35 @@ describe('overlay main sync failed-file reruns', () => {
     await expect(job(f)).rejects.toThrow(failure);
     expect(kinds(f)).not.toContain('overlay-main-flaky-retried');
     noPublication(f);
+  });
+
+  describe('with several reruns, coverage is measured against the original failure', () => {
+    const a = status => ({ status, title: 'worker behaves', ancestorTitles: ['worker'] });
+    const b = status => ({ status, title: 'baseline', ancestorTitles: ['worker'] });
+    const other = { status: 'passed', title: 'another behaves', ancestorTitles: ['worker'] };
+
+    it('an assertion that vanishes in rerun 1 cannot be forgotten by rerun 2', async () => {
+      // Original: A failed, B passed. Rerun 1 runs only B (fails). Rerun 2 runs B and a new test (pass); A never re-ran.
+      const f = fixture({ reruns: 2 }); runners(f, [[b('passed'), a('failed')], [b('failed')], [b('passed'), other]]);
+      await expect(job(f)).rejects.toThrow(failure);
+      expect(f.deps.testRunner).toHaveBeenCalledTimes(3);
+      expect(kinds(f)).not.toContain('overlay-main-flaky-retried');
+      noPublication(f);
+    });
+
+    it('the same sequence with the same assertion count is still not a pass', async () => {
+      // Count alone (2 >= 2) would hide the vanished A; the identity must reappear.
+      const f = fixture({ reruns: 2 }); runners(f, [[b('passed'), a('failed')], [b('failed'), other], [b('passed'), other]]);
+      await expect(job(f)).rejects.toThrow(failure);
+      expect(kinds(f)).not.toContain('overlay-main-flaky-retried');
+      noPublication(f);
+    });
+
+    it('an original failure that re-executes and passes by the last rerun still syncs', async () => {
+      const f = fixture({ reruns: 2 }); runners(f, [[b('passed'), a('failed')], [b('passed'), a('failed')], [b('passed'), a('passed')]]);
+      expect(await job(f)).toMatchObject({ pushed: true });
+      expect(kinds(f)).toContain('overlay-main-flaky-retried');
+    });
   });
 
   it.each(['missing', 'empty'])('not-executed evidence on main (%s) fails closed instead of declaring main-red', async evidence => {
