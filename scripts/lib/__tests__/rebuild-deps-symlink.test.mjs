@@ -1,3 +1,4 @@
+import { removeReadonlyTree } from '../readonly-tree.mjs';
 /** Round 1 contract tests: no subprocesses, installs, or host filesystem assumptions.
  * Shared helper contract used here: { root, storeDir, depsMode, step, exec, log,
  * stat = statSync, readFile = readFileSync }; destination is root/node_modules.
@@ -21,9 +22,7 @@ import { LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH, operatorP
 const temporary = [];
 afterEach(() => {
   for (const dir of temporary.splice(0)) {
-    // Fixtures now contain frozen stores. Cleanup must not follow links into another store.
-    setNodeModulesWritable(dir, true);
-    rmSync(dir, { recursive: true, force: true });
+    removeReadonlyTree(dir);
   }
 });
 

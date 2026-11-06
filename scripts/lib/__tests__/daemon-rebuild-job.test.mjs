@@ -1,3 +1,4 @@
+import { removeReadonlyTree } from '../readonly-tree.mjs';
 /**
  * @file scripts/lib/__tests__/daemon-rebuild-job.test.mjs
  * @description #4126 — the clone rebuild's build + live smoke run as a detached job, so an opted-in daemon's tick
@@ -9,7 +10,7 @@ import {
   describe, it, expect, beforeEach, afterEach, vi,
 } from 'vitest';
 import {
-  mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync,
+  mkdtempSync, mkdirSync, writeFileSync, existsSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -86,7 +87,7 @@ const quietLog = { error: () => {}, warn: () => {}, log: () => {} };
 
 beforeEach(() => { tempDirs.length = 0; });
 afterEach(() => {
-  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+  for (const dir of tempDirs) removeReadonlyTree(dir);
   tempDirs.length = 0;
 });
 

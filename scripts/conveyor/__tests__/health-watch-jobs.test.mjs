@@ -1,3 +1,4 @@
+import { removeReadonlyTree } from '../../lib/readonly-tree.mjs';
 /**
  * @file scripts/conveyor/__tests__/health-watch-jobs.test.mjs
  * @description #4131 — the health tick's gh-probe JOB path (tick side). A due gh cadence queues ONE detached
@@ -25,7 +26,7 @@ import { HEALTH_WATCH_JOB_KINDS, HEALTH_WATCH_JOB_CAP, HEALTH_GH_PROBE_KIND } fr
 
 let dir;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'health-jobs-')); });
-afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => { removeReadonlyTree(dir); });
 
 const iso = (ms) => new Date(ms).toISOString();
 /** A reattach that never spawns: records which kinds/cap it was handed and leaves queued jobs queued. */

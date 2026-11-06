@@ -1,3 +1,4 @@
+import { removeReadonlyTree } from '../readonly-tree.mjs';
 /**
  * @file scripts/lib/__tests__/daemon-deps-job.test.mjs
  * @description x0m7a8x (card 5691) — a daemon clone's `npm ci` runs as a detached install job and the new
@@ -6,7 +7,7 @@
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
-  existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -23,7 +24,7 @@ import { lockfileKey } from '../daemon-job-snapshots.mjs';
 
 const tmp = [];
 const mk = (p) => { const d = mkdtempSync(join(tmpdir(), p)); tmp.push(d); return d; };
-afterEach(() => { while (tmp.length) rmSync(tmp.pop(), { recursive: true, force: true }); });
+afterEach(() => { while (tmp.length) removeReadonlyTree(tmp.pop()); });
 
 const SHA = 'a'.repeat(40);
 function fixture({ lock = '{"lockfileVersion":3,"v":2}' } = {}) {

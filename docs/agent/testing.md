@@ -4007,3 +4007,22 @@ updates only after the swap, and eviction protects the new physical store key.
 Dangling live links require installer/private-copy recovery even when the installed key
 matches; present targets with incomplete registration evidence must still refuse launch.
 An ancestor-directory alias must not turn a plain legacy copy into a linked-input check.
+
+### Frozen dependency-store cleanup and probe shutdown
+
+Job fixtures can contain read-only dependency stores. Use `removeReadonlyTree` from
+`scripts/lib/readonly-tree.mjs` for owned temporary trees; it restores owner write
+permission without following symlinks into another live store. Temp-root teardown
+and stale-root sweeping use the same helper. `daemon-job-snapshots.test.mjs` covers
+frozen nested stores, missing roots, and external/dangling symlinks.
+
+For health-probe SIGTERM shutdown, let the worker reap its synchronous CLI child
+before the job exits. Simultaneous group SIGKILL can leave a defunct subprocess on
+Linux subreaper hosts; the live `health-watch-job.test.mjs` group-empty assertion
+must include these PIDs. Forward SIGTERM first, with bounded SIGKILL escalation.
+
+The health-probe shutdown regression also launches a SIGTERM-resistant CLI with
+both worker exit orders. Keep escalation referenced when the worker exits first,
+kill descendants before the leader so Node can reap them, and require an empty
+process group (including zombies). Unreadable group evidence forces bounded group
+shutdown and is never treated as proof that cleanup succeeded.

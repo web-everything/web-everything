@@ -1,3 +1,4 @@
+import { removeReadonlyTree } from '../readonly-tree.mjs';
 /**
  * @file scripts/lib/__tests__/daemon-job-snapshots.test.mjs
  * @description #4125 — pinned code snapshots and lockfile-keyed `node_modules` stores: built once, never
@@ -6,7 +7,8 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, chmodSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { finishRunTmpRoot } from '../test-tmp-root.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -16,7 +18,40 @@ import {
 
 let jobsDir;
 beforeEach(() => { jobsDir = mkdtempSync(join(tmpdir(), 'we-job-snapshots-')); });
-afterEach(() => { rmSync(jobsDir, { recursive: true, force: true }); });
+afterEach(() => { removeReadonlyTree(jobsDir); });
+
+describe('read-only tree cleanup', () => {
+  it('global temp teardown removes nested frozen stores and tolerates an absent root', () => {
+    const root = join(jobsDir, 'run');
+    const bin = join(root, 'jobs/.snapshots/node-modules/key/node_modules/.bin');
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(bin, 'tool'), 'fixture');
+    chmodSync(bin, 0o555);
+    chmodSync(join(bin, '..'), 0o555);
+    expect(() => finishRunTmpRoot({ root, policy: { mode: 'off', keep: false } })).not.toThrow();
+    expect(existsSync(root)).toBe(false);
+    expect(() => removeReadonlyTree(root)).not.toThrow();
+  });
+
+  it('removes directory and dangling symlinks without thawing their targets', () => {
+    const target = join(jobsDir, 'external');
+    const root = join(jobsDir, 'owned');
+    mkdirSync(target);
+    writeFileSync(join(target, 'payload'), 'untouched');
+    chmodSync(target, 0o555);
+    mkdirSync(root);
+    symlinkSync(target, join(root, 'node_modules'), 'dir');
+    symlinkSync(join(jobsDir, 'missing'), join(root, 'dangling'), 'dir');
+    removeReadonlyTree(root);
+    expect(existsSync(root)).toBe(false);
+    expect(statSync(target).mode & 0o777).toBe(0o555);
+    expect(readFileSync(join(target, 'payload'), 'utf8')).toBe('untouched');
+    const link = join(jobsDir, 'root-link');
+    symlinkSync(target, link, 'dir');
+    removeReadonlyTree(link);
+    expect(statSync(target).mode & 0o777).toBe(0o555);
+  });
+});
 
 describe('code snapshots', () => {
   it('builds once and reuses the finished snapshot', () => {

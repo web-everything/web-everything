@@ -18,9 +18,10 @@
 
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
+import { setTreeWritable as setNodeModulesWritable, removeReadonlyTree as removeStore } from './readonly-tree.mjs';
 import { DEFAULT_CHILD_TIMEOUT_MS, NPM_INSTALL_TIMEOUT_MS } from './bounded-child.mjs';
 import { DEFAULT_SNAPSHOT_KEEP, selectEvictions } from './daemon-jobs.mjs';
 import { withFileLock } from './atomic-json-file.mjs';
@@ -51,22 +52,7 @@ function assertKey(key, what) {
   if (!KEY_RE.test(String(key))) throw new TypeError(`daemon-jobs: invalid ${what} ${JSON.stringify(key)}`);
 }
 
-/** chmod -R a-w / u+w without following package/workspace symlinks outside the owned tree.
- * Setting directories first permits traversal/removal after a partial freeze or a killed build.
- */
-export function setNodeModulesWritable(path, writable) {
-  let entry;
-  try { entry = lstatSync(path); } catch (error) { if (error?.code === 'ENOENT') return; throw error; }
-  if (entry.isSymbolicLink()) return;
-  chmodSync(path, writable ? entry.mode | 0o200 : entry.mode & ~0o222);
-  if (entry.isDirectory()) for (const name of readdirSync(path)) setNodeModulesWritable(join(path, name), writable);
-}
-
-function removeStore(dir) {
-  // Never thaw through node_modules symlinks: their source may still serve another live job.
-  setNodeModulesWritable(join(dir, 'node_modules'), true);
-  rmSync(dir, { recursive: true, force: true });
-}
+export { setTreeWritable as setNodeModulesWritable } from './readonly-tree.mjs';
 
 // Outside the store so deleting the store cannot delete a held lock. The leading dot also keeps
 // this sibling file out of listStores. Do not wait on contention in a daemon tick: refuse or retain.

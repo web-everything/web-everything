@@ -15,9 +15,10 @@
 //   WE_TMP_LEAK_MODE  'warn' (default) | 'fail' | 'off'
 //   WE_TMP_LEAK_MAX   leftover entries allowed before warn/fail fires (default 50)
 //   WE_TMP_LEAK_KEEP  '1' keeps the root on disk for debugging instead of removing it
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { delimiter, join } from 'node:path';
+import { removeReadonlyTree } from './readonly-tree.mjs';
 import { fakeGhScript, gitShimScript } from './hermetic-tests.mjs';
 
 // Per-user parent: runners share /tmp but run as different users, so a shared `we-vitest` dir made by one
@@ -65,7 +66,7 @@ export function sweepStaleRunRoots({ baseTmp, uid, isAlive = isPidAlive, now = D
     const full = join(parent, name);
     try {
       if (now - statSync(full).mtimeMs < minAgeMs) continue;
-      rmSync(full, { recursive: true, force: true });
+      removeReadonlyTree(full);
       removed.push(full);
     } catch {
       // best-effort
@@ -111,7 +112,7 @@ export function finishRunTmpRoot({ root, policy = resolveTmpLeakPolicy(), log = 
       + 'Remove them in afterEach/afterAll/finally. Tune with WE_TMP_LEAK_MAX / WE_TMP_LEAK_MODE.',
     );
   }
-  if (!policy.keep) rmSync(root, { recursive: true, force: true });
+  if (!policy.keep) removeReadonlyTree(root);
   return { ...summary, exceeded, failed: exceeded && policy.mode === 'fail' };
 }
 
@@ -163,7 +164,7 @@ export function createSharedFakeGh(root) {
   return dir;
 }
 export function removeSharedDir(root) {
-  rmSync(join(root, SHARED_DIR_NAME), { recursive: true, force: true });
+  removeReadonlyTree(join(root, SHARED_DIR_NAME));
 }
 
 // Explicit opt-in for a test that reads a lazy root BEFORE anything wrote to it (and for the old "dir already

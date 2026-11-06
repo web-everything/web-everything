@@ -1,9 +1,10 @@
 /** @file scripts/lib/__tests__/daemon-version.test.mjs — S3 offline version-builder contracts. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { removeReadonlyTree } from '../readonly-tree.mjs';
 import { buildVersion } from '../daemon-version.mjs';
 import { lockfileKey } from '../daemon-job-snapshots.mjs';
 
@@ -32,7 +33,7 @@ describe('buildVersion', () => {
       runSmoke: vi.fn(async () => ({ verdict: 'pass', attempts: 1 })),
     };
   });
-  afterEach(() => rmSync(fixture, { recursive: true, force: true }));
+  afterEach(() => removeReadonlyTree(fixture));
 
   it('reuses a finished SHA despite a new timestamp and ignores stale staging records', async () => {
     const first = await build();

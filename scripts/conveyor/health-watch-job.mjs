@@ -33,6 +33,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isMainThread, parentPort, Worker, workerData } from 'node:worker_threads';
 
+import { installProbeShutdown } from './health-probe-shutdown.mjs';
 import { readGit } from '../lib/proc-read.mjs';
 import { createJobStore, enqueueJob, launchJob, reattachTick, runJob } from '../lib/daemon-jobs-runtime.mjs';
 import { detectSleep, markFailed } from '../lib/daemon-jobs.mjs';
@@ -591,12 +592,13 @@ async function jobMain(argv) {
     console.log(JSON.stringify({ queued: rec.id, codeSha: rec.job.codeSha, dir: store.dir }));
     return 0;
   }
-  // A graceful stop (the runtime's SIGTERM to a stalled job) takes the whole process group with it: the
-  // detached spawn made this process its group leader, so the worker's `gh`/CLI children are in it too.
-  process.once('SIGTERM', () => {
-    try { process.kill(-process.pid, 'SIGKILL'); } catch { process.kill(process.pid, 'SIGKILL'); } // not a group leader: at least this process
-  });
-  const out = await runJob({ steps: [{ name: 'gh-probes', run: (ctx) => ghProbeStep(ctx) }] });
+  const finishShutdown = installProbeShutdown();
+  let out;
+  try {
+    out = await runJob({ steps: [{ name: 'gh-probes', run: (ctx) => ghProbeStep(ctx) }] });
+  } finally {
+    await finishShutdown();
+  }
   console.log(`${new Date().toISOString()} health-gh-probe pid=${process.pid} ${JSON.stringify(out)}`);
   return out.outcome === 'succeeded' ? 0 : 1;
 }

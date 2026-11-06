@@ -1,3 +1,4 @@
+import { removeReadonlyTree } from '../readonly-tree.mjs';
 /**
  * @file scripts/lib/__tests__/daemon-jobs-runtime.test.mjs
  * @description #4125 — the job runtime on real processes and a real temp jobs folder: handle liveness via
@@ -47,7 +48,7 @@ const kinds = kindRegistry([noop]);
 let dir;
 let store;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'we-daemon-jobs-')); store = createJobStore(dir); });
-afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => { removeReadonlyTree(dir); });
 
 describe('createJobStore.list — sidecar files vs torn records', () => {
   // Live case: the rebuild job keeps `consumed.json` (a JSON ARRAY of consumed job ids) in the same folder.
@@ -413,7 +414,7 @@ describe('launchJob snapshot eviction', () => {
       atDelete.push({ spawnedPid: record.job.timeline.findLast((e) => e.event === 'spawned')?.pid, event: record.job.timeline.at(-1).event });
       clock += 180_001; // Model a recursive delete outlasting the health tick's watchdog, without waiting.
       const colon = ref.indexOf(':');
-      rmSync(join(snapshotsRoot(dir), ref.slice(0, colon), ref.slice(colon + 1)), { recursive: true, force: true });
+      removeReadonlyTree(join(snapshotsRoot(dir), ref.slice(0, colon), ref.slice(colon + 1)));
     };
     const out = launch({
       now: () => clock,

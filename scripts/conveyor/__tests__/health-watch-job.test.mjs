@@ -1,3 +1,4 @@
+import { removeReadonlyTree } from '../../lib/readonly-tree.mjs';
 /**
  * @file scripts/conveyor/__tests__/health-watch-job.test.mjs
  * @description #4131 — the health-gh-probe JOB CHILD, for real: a detached process launched by the shared
@@ -7,11 +8,11 @@
  *   timeout.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { cpSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, readFileSync, existsSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, symlinkSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { runGhProbeJobs, ghProbeStep, runProbeWorker, prewarmSnapshots, RESULT_SUFFIX } from '../health-watch-job.mjs';
 import { createJobStore, enqueueJob } from '../../lib/daemon-jobs-runtime.mjs';
@@ -20,7 +21,7 @@ import { HEALTH_GH_PROBE_KIND } from '../../../skills-src/conveyor/daemon-manife
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 let dir;
 beforeAll(() => { dir = mkdtempSync(join(tmpdir(), 'health-job-child-')); });
-afterAll(() => { rmSync(dir, { recursive: true, force: true }); });
+afterAll(() => { removeReadonlyTree(dir); });
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const snapshot = {
@@ -81,8 +82,120 @@ describe('health-gh-probe job child', () => {
     process.kill(pid, 'SIGTERM');
     let left = members;
     for (let i = 0; i < 40 && left.length; i += 1) { await sleep(100); left = group(pid); }
+    if (left.length) console.error(execFileSync('ps', ['-o', 'pid,ppid,pgid,stat,command', '-p', left.join(',')], { encoding: 'utf8' }));
     expect(left).toEqual([]);
   }, 60000);
+
+  it.each([false, true])('escalates a SIGTERM-resistant CLI and empties its group (worker exits first: %s)', async (workerFirst) => {
+    const fixture = join(dir, `resistant-${workerFirst}.mjs`);
+    // Exercise the production shutdown handler in a real detached leader. The CLI and worker
+    // belong to that leader; the worker's early exit must not cancel CLI escalation.
+    writeFileSync(fixture, `
+      import { spawn } from 'node:child_process';
+      import { Worker } from 'node:worker_threads';
+      import { installProbeShutdown } from ${JSON.stringify(pathToFileURL(join(REPO, 'scripts/conveyor/health-probe-shutdown.mjs')).href)};
+      const finish = installProbeShutdown();
+      const worker = new Worker('setInterval(() => {}, 1000)', { eval: true });
+      const cli = spawn(process.execPath, ['-e', ${JSON.stringify("process.on('SIGTERM', () => process.send('term')); process.send('ready'); setInterval(() => {}, 1000);")}], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
+      let workerExited = false;
+      const workerExit = new Promise(resolve => worker.once('exit', () => {
+        workerExited = true;
+        process.send({ type: 'worker-exit' });
+        resolve();
+      }));
+      const cliExit = new Promise(resolve => cli.once('exit', (code, signal) => {
+        process.send({ type: 'cli-exit', signal, workerExited });
+        resolve();
+      }));
+      process.on('SIGTERM', () => { if (${workerFirst}) void worker.terminate(); });
+      cli.on('message', message => {
+        process.send({ type: message, cliPid: cli.pid });
+      });
+      await cliExit;
+      if (!${workerFirst}) await worker.terminate();
+      await workerExit;
+      await finish();
+      process.disconnect();
+    `);
+    const child = spawn(process.execPath, [fixture], { detached: true, stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+    const messages = [];
+    let stderr = '';
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    const exited = new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('exit', (code, signal) => resolve({ code, signal }));
+    });
+    const deadline = setTimeout(() => {
+      try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+    }, 7000);
+    try {
+      const ready = new Promise((resolve, reject) => {
+        child.on('message', message => {
+          messages.push(message);
+          if (message.type === 'ready') resolve(message);
+        });
+        child.once('exit', () => reject(new Error(`resistant fixture exited before readiness: ${stderr}`)));
+      });
+      const cli = await ready;
+      expect(cli.cliPid).toBeGreaterThan(0);
+      const started = Date.now();
+      process.kill(child.pid, 'SIGTERM');
+      expect(await exited, stderr).toEqual({ code: 0, signal: null });
+      expect(Date.now() - started).toBeLessThan(5000);
+      expect(messages.some(message => message.type === 'term')).toBe(true);
+      expect(messages.find(message => message.type === 'cli-exit')).toMatchObject({
+        signal: 'SIGKILL', workerExited: workerFirst,
+      });
+      // pgrep includes zombies. Only exit 1 means an empty group; unreadable evidence fails.
+      let members;
+      try {
+        members = execFileSync('pgrep', ['-g', String(child.pid)], { encoding: 'utf8', timeout: 1000 }).trim();
+      } catch (error) {
+        if (error.status !== 1) throw error;
+        members = '';
+      }
+      expect(members).toBe('');
+    } finally {
+      clearTimeout(deadline);
+      try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+      await exited;
+    }
+  }, 15000);
+
+  it('forces group shutdown when process-group evidence is unreadable', async () => {
+    const fixture = join(dir, 'unreadable-group.mjs');
+    writeFileSync(fixture, `
+      import cp from 'node:child_process';
+      import { syncBuiltinESMExports } from 'node:module';
+      cp.execFileSync = () => { throw new Error('fixture process-group read denied'); };
+      syncBuiltinESMExports();
+      const { installProbeShutdown } = await import(${JSON.stringify(pathToFileURL(join(REPO, 'scripts/conveyor/health-probe-shutdown.mjs')).href)});
+      installProbeShutdown();
+      setInterval(() => {}, 1000);
+      process.send('ready');
+    `);
+    const child = spawn(process.execPath, [fixture], { detached: true, stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+    let stderr = '';
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    const exited = new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('exit', (code, signal) => resolve({ code, signal }));
+    });
+    const deadline = setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch {} }, 7000);
+    try {
+      await new Promise((resolve, reject) => {
+        child.once('message', resolve);
+        child.once('exit', () => reject(new Error(`unreadable fixture exited before readiness: ${stderr}`)));
+      });
+      process.kill(child.pid, 'SIGTERM');
+      expect(await exited).toEqual({ code: null, signal: 'SIGKILL' });
+      expect(stderr).toContain('fixture process-group read denied; forcing group shutdown');
+    } finally {
+      clearTimeout(deadline);
+      try { process.kill(-child.pid, 'SIGKILL'); } catch {}
+      await exited;
+    }
+  }, 15000);
 
   it('the step writes its sidecar atomically and is idempotent on a rerun', async () => {
     const d = mkdtempSync(join(dir, 'step-'));
