@@ -50,7 +50,10 @@ const pnpmCodes = (t) => [...String(t).matchAll(/ERR_PNPM_[A-Z0-9_]+/g)].map((m)
 function pnpmUnusable(e) {
   // A timeout or a kill means pnpm was running and was cut off: partial fetch-failure output proves nothing. Never fall back.
   if (e?.code === 'ETIMEDOUT' || e?.killed === true || e?.signal) return false;
-  const out = `${e?.message ?? ''}\n${e?.stdout ?? ''}\n${e?.stderr ?? ''}`;
+  // Node's execFileSync message starts with "Command failed: <argv>", and the argv names --frozen-lockfile: classifying on
+  // it would make DENY match every failure. Drop that one line; the real output is in stdout/stderr and the message tail.
+  const message = String(e?.message ?? '').replace(/^Command failed:[^\n]*\n?/, '');
+  const out = `${message}\n${e?.stdout ?? ''}\n${e?.stderr ?? ''}`;
   if (DENY.test(out)) return false;
   const codes = pnpmCodes(out);
   if (codes.some((c) => !FETCH_CODES.has(c))) return false; // any non-fetch pnpm error code wins over a spawn code

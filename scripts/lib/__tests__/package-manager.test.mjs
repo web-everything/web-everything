@@ -254,6 +254,36 @@ describe('installWithFallback', () => {
     expect(calls).toEqual([['pnpm', 'install', '--frozen-lockfile']]);
     expect(logs.join('\n')).toMatch(/NOT falling back/);
   });
+  // Node's execFileSync error: message = "Command failed: <argv>\n<stderr>", with stdout/stderr also set. The argv names
+  // --frozen-lockfile, so classification must never match DENY against that first line.
+  const realShape = (argv, stderr, extra = {}) => Object.assign(new Error(`Command failed: ${argv}\n${stderr}`), { status: 1, stdout: '', stderr, ...extra });
+  it.each([
+    ['frozen', true, 'pnpm install --frozen-lockfile', [['pnpm', 'install', '--frozen-lockfile'], ['npm', 'ci']]],
+    ['non-frozen', false, 'pnpm install --no-frozen-lockfile', [['pnpm', 'install', '--no-frozen-lockfile'], ['npm', 'install']]],
+  ])('a pure fetch failure in a real execFileSync-shaped error falls back to npm (%s)', (_n, frozen, argv, expected) => {
+    const calls = [];
+    const r = installWithFallback({ frozen, lockfileParity: () => true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => '9', log: () => {},
+      exec: (bin, args) => { calls.push([bin, ...args]); if (bin === 'pnpm') throw realShape(argv, 'ERR_PNPM_FETCH_FAIL GET https://registry.npmjs.org/x: getaddrinfo ENOTFOUND'); } });
+    expect(calls).toEqual(expected);
+    expect(r.fellBack).toBe(true);
+  });
+  it.each([
+    ['frozen', true, 'pnpm install --frozen-lockfile'],
+    ['non-frozen', false, 'pnpm install --no-frozen-lockfile'],
+  ])('real lockfile or integrity wording in the output still blocks, with the argv-shaped message (%s)', (_n, frozen, argv) => {
+    for (const stderr of ['ERR_PNPM_OUTDATED_LOCKFILE Cannot install with "frozen-lockfile"', 'ERR_PNPM_TARBALL_INTEGRITY', 'ERR_PNPM_FETCH_FAIL lockfile is broken']) {
+      const calls = [];
+      expect(() => installWithFallback({ frozen, lockfileParity: () => true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => '9', log: () => {},
+        exec: (bin, args) => { calls.push([bin, ...args]); throw realShape(argv, stderr); } })).toThrow(/Command failed/);
+      expect(calls).toHaveLength(1);
+    }
+  });
+  it('lockfile wording in stdout still blocks when the message is argv-shaped', () => {
+    const calls = [];
+    expect(() => installWithFallback({ frozen: true, lockfileParity: () => true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => '9', log: () => {},
+      exec: (bin, args) => { calls.push([bin, ...args]); throw realShape('pnpm install --frozen-lockfile', 'ERR_PNPM_FETCH_FAIL', { stdout: 'ERR_PNPM_LOCKFILE_CONFIG_MISMATCH' }); } })).toThrow();
+    expect(calls).toHaveLength(1);
+  });
   it.each([['no proof supplied', undefined], ['proof says false', () => false], ['proof throws', () => { throw new Error('x'); }]])(
     'a frozen fallback is refused when lockfile parity is not proven (%s)', (_n, lockfileParity) => {
       const calls = [];
