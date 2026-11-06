@@ -144,10 +144,17 @@ export function readHeadIndex({ dir = defaultHeadIndexDir(), fs = nodeFs, keepPe
       return { ok: false, reason: 'index-unreadable' }; // a map with no log is not a state we write
     }
     // An unreadable log throws here and fails closed. The cache is trusted only when the log's content hash matches.
-    // Markers are listed BEFORE the log is read: a compaction renames the new log into place and only then deletes the markers it
-    // folded, so a marker missing from this listing was already folded into the log we read next.
-    const { retract, pending } = listMarkers(fs, dir);
+    // Markers are listed BEFORE the log is read and AGAIN after it, and the UNION is used. Before: a compaction renames the new log
+    // into place and only then deletes the markers it folded, so a marker missing from the first listing was already folded into the
+    // log we read next. After: a writer names its transaction (or a rejection lands) between our first listing and our read, so its
+    // row is in the bytes we read but not in the first listing; the second listing sees the marker and hides it. A marker only in the
+    // second listing is never wrong to apply (its row is either in our bytes and must be hidden, or not in them), and one only in
+    // the first belongs to a row that is now committed or folded: hiding it costs one conservative rebuild, never a rejected row.
+    const first = listMarkers(fs, dir);
     const raw = fs.readFileSync(log); // the cache key is the digest of the RAW bytes: a UTF-8 decode would alias distinct corrupt logs
+    const second = listMarkers(fs, dir);
+    const union = (a, b) => [...new Set([...a, ...b])].sort();
+    const retract = union(first.retract, second.retract), pending = union(first.pending, second.pending);
     const text = raw.toString('utf8');
     const logHash = stateHash(raw, retract, pending);
     if (stored && stored.map && typeof stored.map === 'object' && stored.version === MAP_VERSION && stored.logHash === logHash && validMap(stored.map)) return { ok: true, map: stored.map };
@@ -253,9 +260,11 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
     // We hold the lock, so any pending marker that is not ours belongs to a writer whose lock was taken over: it will fail its fence
     // and can never be accepted. Reject it for good (retraction first, then drop the pending marker); never leave it to be folded.
     // A marker that cannot be turned into a retraction fails this write closed rather than risk folding an uncommitted row.
+    // The conversion is ONE atomic rename (pending.<t> -> retract.<t>), so it races a stale writer's commit (its unlink of the same
+    // pending marker) with exactly one winner: either the writer's commit finds the marker gone and fails, or the rename finds it
+    // gone (ENOENT: the writer committed first) and the row stays accepted. The retraction is never created beside a live marker.
     for (const t of listMarkers(fs, dir).pending) {
-      try { durable(fs, retractPath(dir, t), 'wx', `${JSON.stringify({ txn: t })}\n`); } catch (e) { if (e?.code !== 'EEXIST') throw e; }
-      try { fs.unlinkSync(pendingPath(dir, t)); } catch { /* gone */ }
+      try { fs.renameSync(pendingPath(dir, t), retractPath(dir, t)); } catch (e) { if (e?.code !== 'ENOENT') throw e; }
     }
     const current = readHeadIndex({ dir, fs, keepPerPr });
     if (!current.ok) throw Error('review-head-index: existing index unreadable; refusing to write');
@@ -264,6 +273,9 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
     const line = `${JSON.stringify({ ...rec, txn })}\n`;
     // Our transaction is named before its row exists. If the marker cannot be written nothing has been appended and we fail closed.
     durable(fs, pendingPath(dir, txn), 'wx', `${JSON.stringify({ txn, pid: process.pid, at: Date.now() })}\n`);
+    // fsync the directory too, so the marker's NAME survives a power loss together with the row it hides (best effort: a platform
+    // that cannot fsync a directory just skips it).
+    try { const dfd = fs.openSync(dir, 'r'); try { fs.fsyncSync(dfd); } finally { fs.closeSync(dfd); } } catch { /* unsupported */ }
     // Our row is hidden by that marker from the instant it is appended until we accept it. A lost lock (or any failure before the
     // commit) rejects it: we never touch the log again to say so (a live holder may be appending to it or renaming a new one over
     // it, which would swallow our write); we create the marker file `retract.<txn>` and drop the pending marker.
@@ -323,6 +335,7 @@ export function recordReview({ dir = defaultHeadIndexDir(), repo, pr, head, netP
     const { retract: live, pending: allPending } = listMarkers(fs, dir);
     const after = allPending.filter(t => t !== txn);
     const raw = fs.readFileSync(log);
+    if (!raw.includes(lineBytes)) throw Error('review-head-index: appended row missing from the log at commit; refusing to accept'); // a stale rename swallowed it: never report ok for a lost row
     const published = JSON.stringify({ version: MAP_VERSION, logHash: stateHash(raw, live, after), keepPerPr, map: parseLog(raw.toString('utf8'), keepPerPr, [...live, ...after]).map });
     fenced();                                                   // still the holder: accept. A thief after this finds our row accepted.
     fs.unlinkSync(pendingPath(dir, txn));                       // COMMIT: the row becomes visible. A missing marker means a new holder already rejected us: fail.

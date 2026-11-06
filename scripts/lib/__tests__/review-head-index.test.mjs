@@ -66,7 +66,8 @@ describe('durability and growth', () => {
       renameSync: (a, b) => { ops.push('rename'); return nodeFs.renameSync(a, b); } };
     rec({ fs });
     // the pending marker (a `wx` open in the index dir, classed 'log' here) is durable BEFORE the row is appended
-    expect(ops).toEqual(['open:wx:lock', 'fsync', 'open:wx:log', 'fsync', 'open:a:log', 'fsync', 'open:w:tmp', 'fsync', 'rename']);
+    // and the directory entry is fsynced right after it (open:r), so the marker survives a power loss together with the row
+    expect(ops).toEqual(['open:wx:lock', 'fsync', 'open:wx:log', 'fsync', 'open:r:log', 'fsync', 'open:a:log', 'fsync', 'open:w:tmp', 'fsync', 'rename']);
     expect(existsSync(headIndexPaths(dir).map)).toBe(true);
   });
   it('a cached map with an invalid entry is rebuilt from the log, never trusted', () => {
@@ -549,6 +550,53 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     expect(existsSync(join(dir, 'pending.q'))).toBe(false);
     expect(existsSync(join(dir, 'retract.q'))).toBe(true);         // rejected for good: it can never be committed once the lock changed hands
     expect(readHeadIndex({ dir }).map['o/r#8']).toBeUndefined();
+  });
+  it('a lock-free reader never shows a row whose writer names it after the reader listed the markers but before it read the log', () => {
+    rec({ head: H(1), netPatchHash: 'p1' });
+    const { log } = headIndexPaths(dir);
+    let injected = false;
+    const fs = { ...nodeFs, readdirSync: (p, ...a) => {
+      const out = nodeFs.readdirSync(p, ...a);                       // the reader has listed: no markers yet
+      if (!injected) { injected = true; // the writer now names its transaction and appends, all between the reader's listing and its log read
+        writeFileSync(join(dir, 'pending.w'), '{}\n');
+        nodeFs.appendFileSync(log, `${JSON.stringify({ repo: 'o/r', pr: 7, head: H(2), netPatchHash: 'p2', verdict: 'accept', at: '2026-11-04T11:00:00Z', txn: 'w' })}\n`); }
+      return out; } };
+    const seen = readHeadIndex({ dir, fs });
+    expect(injected).toBe(true);
+    expect(seen.map['o/r#7'].history.p2).toBeUndefined();            // hidden by the marker the second listing sees
+    expect(seen.map['o/r#7'].lastReviewedHead).toBe(H(1));
+    // the same window for a retraction that lands after the first listing
+    rmSync(join(dir, 'pending.w'));
+    injected = false;
+    const fs2 = { ...nodeFs, readdirSync: (p, ...a) => { const out = nodeFs.readdirSync(p, ...a); if (!injected) { injected = true; marker('w'); } return out; } };
+    expect(readHeadIndex({ dir, fs: fs2 }).map['o/r#7'].history.p2).toBeUndefined();
+  });
+  it('a foreign pending marker is rejected by an atomic rename to its retraction, so it cannot be both accepted by its writer and retracted', () => {
+    const { log } = headIndexPaths(dir);
+    nodeFs.mkdirSync(dir, { recursive: true });
+    writeFileSync(log, `${JSON.stringify({ repo: 'o/r', pr: 8, head: H(3), netPatchHash: 'p9', verdict: 'accept', at: '2026-11-04T09:00:00Z', txn: 'q' })}\n`);
+    writeFileSync(join(dir, 'pending.q'), '{}\n');
+    const seen = [];
+    const fs = { ...nodeFs,
+      renameSync: (a, b) => { seen.push(`rename:${String(a).split('/').pop()}>${String(b).split('/').pop()}`); return nodeFs.renameSync(a, b); },
+      unlinkSync: p => { seen.push(`unlink:${String(p).split('/').pop()}`); return nodeFs.unlinkSync(p); } };
+    rec({ fs });
+    expect(seen).toContain('rename:pending.q>retract.q');
+    expect(seen).not.toContain('unlink:pending.q');                  // never "write the retraction, then remove the marker" (a writer's commit could slip in between)
+  });
+  it('a writer whose row is no longer in the log at commit time fails closed instead of reporting ok', () => {
+    rec();
+    const { log } = headIndexPaths(dir);
+    let afterAppend = 0;
+    const fs = { ...nodeFs,
+      openSync: (p, f) => { if (f === 'a') afterAppend = 1; return nodeFs.openSync(p, f); },
+      readFileSync: (p, ...a) => {
+        const out = nodeFs.readFileSync(p, ...a);
+        if (afterAppend && p === log && ++afterAppend === 3) { // the snapshot is read (2), then the final read before the commit (3): a stale rename swallowed our row
+          const rows = out.toString('utf8').trim().split('\n'); rows.pop(); return Buffer.from(`${rows.join('\n')}\n`); }
+        return out; } };
+    expect(() => rec({ fs, head: H(2), netPatchHash: 'p2' })).toThrow(/missing from the log/);
+    expect(readHeadIndex({ dir }).map['o/r#7'].history.p2).toBeUndefined();
   });
   it('fail closed: if the pending marker cannot be written, nothing is appended', () => {
     rec();
