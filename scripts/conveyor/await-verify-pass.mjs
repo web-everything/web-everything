@@ -27,8 +27,9 @@ import { tmpdir } from 'node:os';
 import { join, resolve, dirname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  listStoredAwaitVerify, writeStoredAwaitVerify, clearStoredAwaitVerify, clearAwaitVerifyRecord,
-  resolveAwaitVerifyTtlMs, AWAIT_VERIFY_REF_RE, AWAIT_VERIFY_KINDS, AWAIT_VERIFY_NO_PUSH_KINDS,
+  listStoredAwaitVerify, writeStoredAwaitVerify, clearStoredAwaitVerify, clearStoredAwaitVerifyIf,
+  previousCiFailurePending as hasPendingPreviousCi, clearAwaitVerifyRecord, readAwaitVerifyRecord,
+  resolveAwaitVerifyTtlMs, AWAIT_VERIFY_REF_RE, AWAIT_VERIFY_NO_PUSH_KINDS, isHarnessRecord,
   readSelfReview, selfReviewHold, selfReviewStoreDir, selfReviewBelongsTo,
 } from './await-verify.mjs';
 import { readVerifyMarker, verifyGateDecision } from '../lib/lane-verify.mjs';
@@ -62,14 +63,7 @@ const lower = (s) => String(s ?? '').toLowerCase();
 /** A delivery or prepare wait: no PR yet, nothing for the harness to push (the session's own `open-pr` does). */
 export const isNoPushRecord = (record) => AWAIT_VERIFY_NO_PUSH_KINDS.includes(record?.kind);
 
-/** Is this a record the pass owns (written by `mark --ref`)? */
-export function isHarnessRecord(record) {
-  return !!record && record.v === 1
-    && ((Number.isInteger(record.pr) && record.pr > 0) || (isNoPushRecord(record) && Number.isInteger(record.item) && record.item > 0))
-    && SHA_RE.test(String(record.sha ?? '')) && typeof record.lane === 'string' && record.lane.startsWith('/')
-    && AWAIT_VERIFY_REF_RE.test(String(record.ref ?? '')) && !String(record.ref).includes('..')
-    && AWAIT_VERIFY_KINDS.includes(record.kind) && Number.isFinite(Date.parse(record.requestedAt));
-}
+export { isHarnessRecord } from './await-verify.mjs';
 
 /**
  * A red the gate itself classified as load-only: every failing file was re-run alone, every retried file failed
@@ -383,10 +377,7 @@ export async function runAwaitVerifyPass({
 } = {}) {
   const rows = [];
   const timing = io.fixTimingPolicy?.();
-  const previousCiFailurePending = record => timing?.pushAfterCi && record?.kind === 'fix'
-    && record.previousCi?.ready?.ciFailures?.length > 0
-    && !(record.previousCi.failuresHandedOff && (record.pendingResume?.kind === 'green'
-      || (record.earlyPush?.ok && lower(record.earlyPush.sha) === lower(record.sha))));
+  const previousCiFailurePending = record => hasPendingPreviousCi(record, timing ?? null);
   /** Clear a finished record. One that cannot be removed would stay actionable (another push / resume next tick), so it is
    *  remembered for this daemon's lifetime and never acted on again. Returns whether the record is really gone. */
   const clearOrNote = (key, record) => {
@@ -557,7 +548,7 @@ export async function runAwaitVerifyPass({
         const transientGone = !pushed?.ok && pushed?.transient;
         const salvaged = transientGone ? io.saveSalvage?.({ record, nowMs, reason: pushed.reason }) : null;
         pending = pushed?.ok
-          ? { kind: 'green', detail: record.earlyPush?.ok && lower(record.earlyPush.sha) === lower(record.sha) ? `on ${record.ref} since ${record.earlyPush.at} (push-before-gate), verified at ${new Date(nowMs).toISOString()}` : `pushed at ${new Date(nowMs).toISOString()}`, ...(srOverdue ? { selfReviewOverdue: srOverdue } : {}) }
+          ? { kind: 'green', at: new Date(Math.max(nowMs, Date.now())).toISOString(), detail: record.earlyPush?.ok && lower(record.earlyPush.sha) === lower(record.sha) ? `on ${record.ref} since ${record.earlyPush.at} (push-before-gate), verified at ${new Date(nowMs).toISOString()}` : `pushed at ${new Date(nowMs).toISOString()}`, ...(srOverdue ? { selfReviewOverdue: srOverdue } : {}) }
           : transientGone
             ? { kind: 'push-transient', detail: `${pushed.reason}${salvaged?.ok ? ' (the verified commit is saved; the harness keeps retrying the push)' : ''}` }
             : { kind: pushed?.moved ? 'push-rejected' : 'push-refused', detail: pushed?.reason ?? 'push failed' };
@@ -827,11 +818,25 @@ export async function defaultAwaitVerifyIo({
       const out = String(exec('gh', ['pr', 'view', String(pr), '--repo', String(repo), '--json', 'headRefName,state,url,isCrossRepository', '--jq', '.state + " " + .url + " " + (.isCrossRepository|tostring) + " " + .headRefName'],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env, timeout: 60_000 })).trim();
       const [state, url, cross, ...rest] = out.split(' ');
-      return state && url && cross && rest.length ? { open: state === 'OPEN', ref: rest.join(' '), remoteUrl: repoUrlFromPrUrl(url), crossRepo: cross !== 'false' } : null;
+      return state && url && cross && rest.length ? { state, open: state === 'OPEN', ref: rest.join(' '), remoteUrl: repoUrlFromPrUrl(url), crossRepo: cross !== 'false' } : null;
+    } catch { return null; }
+  };
+  /** The PR's current head sha from GitHub, or null when unreadable (a null keeps the owed record). */
+  const prHeadSha = (repo, pr) => {
+    try {
+      const sha = String(exec('gh', ['pr', 'view', String(pr), '--repo', String(repo), '--json', 'headRefOid', '--jq', '.headRefOid'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env, timeout: 60_000 })).trim();
+      return /^[0-9a-f]{40}$/i.test(sha) ? sha : null;
     } catch { return null; }
   };
   return {
     // fix.pushBeforeGate through the policy cascade, re-read every pass so a settings flip applies without a restart.
+    prState: (repo, pr) => {
+      const head = prHead(repo, pr);
+      if (head?.state === 'OPEN') return { open: true, headSha: prHeadSha(repo, pr) };
+      if (head?.state === 'MERGED' || head?.state === 'CLOSED') return { open: false };
+      return null;
+    },
     pushPolicy: () => loadFixPushPolicy({ env }),
     fixTimingPolicy: () => {
       const timing = resolveTimingPolicy({ env });
@@ -845,9 +850,16 @@ export async function defaultAwaitVerifyIo({
     readSelfReview: (record) => readSelfReview({ repo: record.repo, pr: record.pr }, { dir: selfReviewStoreDir(env), strict: true }),
     listRecords: () => listStoredAwaitVerify(),
     writeRecord: (record) => writeStoredAwaitVerify(record),
+    // Stale retirement removes only the shared key; the lane may already belong to a newer session.
+    clearStoredRecord: (key) => clearStoredAwaitVerify(key),
+    clearStoredRecordIf: (key, expected) => clearStoredAwaitVerifyIf(key, expected),
     clearRecord: (key, record) => {
       const store = clearStoredAwaitVerify(key);
-      if (record?.lane && !outsidePool(record.lane)) clearAwaitVerifyRecord(record.lane);
+      if (record?.lane && !outsidePool(record.lane)) {
+        const local = readAwaitVerifyRecord(record.lane);
+        if (record.sessionId && record.sha && local?.sessionId === record.sessionId
+          && lower(local.sha) === lower(record.sha)) clearAwaitVerifyRecord(record.lane);
+      }
       return { cleared: store.cleared };
     },
     laneState: (lane, { hashDirty = false } = {}) => {

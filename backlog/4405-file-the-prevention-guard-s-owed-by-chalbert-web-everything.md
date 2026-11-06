@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/lane-pool.mjs", "we:scripts/__tests__/lane-pool-reap-on-acquire.test.mjs", "we:scripts/conveyor/lease-reaper.mjs", "we:scripts/conveyor/__tests__/lease-reaper.test.mjs", "we:scripts/conveyor/soak/breaks/lease-reaper-graphql-unattributed.mjs", "we:scripts/conveyor/soak/breaks/fixtures/lease-reaper-graphql-unattributed.mjs", "we:scripts/conveyor/soak/breaks/fixtures/__tests__/lease-reaper-graphql-unattributed.test.mjs", "we:scripts/conveyor/soak/breaks/lease-reaper-graphql-unattributed.soak.test.mjs", "we:scripts/conveyor/soak/breaks/__tests__/lease-reaper-graphql-unattributed.test.mjs", "we:docs/agent/testing.md"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-03"
-preparedAgainstSha: "c89ebfe55b9da5ff83f97361c62e413c2a345337"
+preparedDate: "2026-11-06"
+preparedAgainstSha: "fae46eeff7277d28ef932f879198aaa4d68688df"
 tags: []
 ---
 
@@ -30,6 +30,8 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2
 - Additional premise correction: the old acquire plan reused a fixed August merge timestamp while backdating acquisition relative to the current clock. The fixtures at we:scripts/__tests__/lane-pool-reap-on-acquire.test.mjs:200 and we:scripts/__tests__/lane-pool-reap-on-acquire.test.mjs:210 therefore do not establish a merge after acquisition. The current predicate at we:scripts/conveyor/lease-reaper.mjs:694 suppresses terminal evidence older than acquisition. Corrected scope remains fixture-only: explicitly derive merge/close timestamps from each written lease, preserve the captured record separately, and label the time-adjusted records synthetic. Test prior-merge protection separately; do not weaken the production predicate to recover the old stale-twin assertion. This is source evidence, not a claim that the integration suite was run.
 - Current checkout citation corrections: the acquire REST call is at we:scripts/lane-pool.mjs:1932; acquire-suite configuration is at we:vitest.config.ts:205 and we:vitest.integration.config.ts:80. The child still emits only count at we:scripts/conveyor/soak/breaks/fixtures/lease-reaper-graphql-unattributed.mjs:18, and the wrapper at we:scripts/conveyor/soak/breaks/lease-reaper-graphql-unattributed.soak.test.mjs:4 delegates to the break. No delivering change for the outstanding guards was found in these sources.
 - Original broad scope retained: two production consumers as comment/test anchors, acquire and reducer tests, break and child report, their matching tests, existing soak wrapper, and we:docs/agent/testing.md. No runtime API or default changes are needed. Size remains 3: approximately 90 changed lines in the acquire suite, 100 in the reducer suite, 70 in the break, 15 in its child, 60 each in the two planned unit suites, and 25 across documentation/comments/wrapper (about 420 lines). This is a bounded prevention story; no `estimatedLoc` applies.
+
+- Re-stamp against `fae46eeff7`: `git diff c89ebfe..HEAD` over the scoped production files, both test suites, the target break and fixture, the vitest configs and the throttle helper is empty; only we:docs/agent/testing.md gained unrelated additions and other soak breaks were added. Premise, citations, scope and size 3 are unchanged; no body edit beyond this note.
 
 ## Design
 
