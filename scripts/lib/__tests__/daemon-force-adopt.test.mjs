@@ -417,6 +417,19 @@ describe('carryForceWatch: a successor adopted without its own smoke inherits th
       expect(r).toMatchObject({ action: 'rollback-failed', reason: 'health-failed' });
       expect(rollback).toHaveBeenCalledWith({ head: 'a'.repeat(40) }, { sha: D });
     });
+    it('a newer declared successor on disk (another writer chained a further move) is never shadowed by the in-memory move', async () => {
+      const E = 'e'.repeat(40);
+      await rec(); await seen();
+      declareForceCarry({ root, env, fromSha: B, toSha: D });
+      breakWrites();
+      await runForceWatchTick({ root, env, currentHead: () => D, probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async () => {} });
+      fixWrites();
+      const file = join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(root)}.force-watch.json`);
+      writeFileSync(file, JSON.stringify({ ...readForceWatch(root, env), carryTo: E })); // S1 -> S2 declared from elsewhere
+      const r = await runForceWatchTick({ root, env, currentHead: () => E, probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async () => {} });
+      expect(r.action).not.toBe('superseded');
+      expect(readForceWatch(root, env)).toMatchObject({ sha: E });
+    });
     it('a force for another build replaces a stale in-memory move: the overlay never shadows a different watch on disk', async () => {
       await rec(); await seen();
       declareForceCarry({ root, env, fromSha: B, toSha: D });

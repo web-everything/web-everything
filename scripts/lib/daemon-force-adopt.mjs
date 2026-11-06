@@ -121,7 +121,8 @@ function currentWatch(root, env) {
   if (moved) {
     // The in-memory move wins only while the disk still holds the SAME forced adoption at its stale pre-move sha, or cannot be read at
     // all (fail closed). A disk that caught up, was cleared, or holds another force never has its record shadowed.
-    if (disk ? disk.startedAt === moved.startedAt && disk.sha !== moved.sha : watchUnreadable(root, env)) return moved;
+    // A disk record that names a DIFFERENT declared successor is newer than the overlay (another writer chained a further move): it wins.
+    if (disk ? disk.startedAt === moved.startedAt && disk.sha !== moved.sha && (!disk.carryTo || disk.carryTo === moved.sha) : watchUnreadable(root, env)) return moved;
     unsavedMoves.delete(p);
   }
   return disk ?? pendingRollbacks.get(p)?.watch ?? null;
