@@ -76,6 +76,30 @@ describe('durability and growth', () => {
     writeFileSync(log, readFileSync(log, 'utf8') + `${JSON.stringify({ repo: 'o/r', pr: 7, head: H(2), netPatchHash: '__proto__', verdict: 'accept', at: '2026-11-04T10:00:01Z' })}\n`);
     expect(readHeadIndex({ dir }).ok).toBe(false);
   });
+  it('a netPatchHash in the keyless namespace ("head:<sha>") is rejected by the validator and never stored', () => {
+    for (const bad of [`head:${H(1)}`, 'head:abc', 'head:']) {
+      expect(() => rec({ netPatchHash: bad }), bad).toThrow(/invalid record/);
+    }
+    expect(existsSync(headIndexPaths(dir).log)).toBe(false);
+    // a hand-written log row carrying such a key is refused on replay (fails closed), never folded into history
+    rec();
+    const { log } = headIndexPaths(dir);
+    writeFileSync(log, readFileSync(log, 'utf8') + `${JSON.stringify({ repo: 'o/r', pr: 7, head: H(2), netPatchHash: `head:${H(1)}`, verdict: 'accept', at: '2026-11-04T10:00:01Z' })}\n`);
+    expect(readHeadIndex({ dir }).ok).toBe(false);
+  });
+  it('a keyless review (netPatchHash null) is never carried to a later head and survives compaction as keyless', () => {
+    rec({ head: H(1), netPatchHash: null, verdict: 'accept', at: '2026-11-04T10:00:01Z', logMaxLines: 2 });
+    rec({ head: H(2), netPatchHash: 'p2', verdict: 'reject', at: '2026-11-04T10:00:02Z', logMaxLines: 2 });
+    rec({ head: H(3), netPatchHash: 'p3', verdict: 'reject', at: '2026-11-04T10:00:03Z', logMaxLines: 2 }); // 3 rows > 2: compacts
+    const index = readHeadIndex({ dir });
+    // the keyless head-1 review is still held after compaction, under the keyless key, with no patch key
+    expect(index.map['o/r#7'].history[`head:${H(1)}`]).toMatchObject({ head: H(1), verdict: 'accept' });
+    const rows = readFileSync(headIndexPaths(dir).log, 'utf8').trim().split('\n').map(l => JSON.parse(l));
+    expect(rows.find(r => r.head === H(1))).toMatchObject({ netPatchHash: null });
+    // never carried: neither a null key nor the keyless key string carries it to a later head
+    for (const netPatchHash of [null, undefined, `head:${H(1)}`])
+      expect(headReviewOwed({ index, repo: 'o/r', pr: 7, head: H(4), netPatchHash }), String(netPatchHash)).toMatchObject({ owed: true, reason: 'new-head' });
+  });
   it('a cached map with an invalid entry is rebuilt from the log, never trusted', () => {
     rec(); rec({ head: H(2), netPatchHash: 'p2' });
     const { map: mp, log } = headIndexPaths(dir);

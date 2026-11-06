@@ -71,7 +71,9 @@ const prKey = (repo, pr) => `${repo}#${Number(pr)}`;
 const TXN = /^[\w-]{1,64}$/;
 // A net-patch key names a property of the history object, so it must be a plain token: it starts with a letter or digit, which
 // refuses `__proto__` (it would set the object's prototype instead of a key). Real keys are sha256 hex. Lookups also use hasOwn.
-const PATCH_KEY = /^[A-Za-z0-9][\w.:-]{0,127}$/;
+// It must also never start with NOKEY ('head:'): that prefix is the keyless-history namespace, so such a key would collide with
+// a keyless review's slot, compact to a null hash and let a keyless review be carried as if it had a patch key.
+const PATCH_KEY = /^(?!head:)[A-Za-z0-9][\w.:-]{0,127}$/;
 const hasOwn = (o, k) => o != null && Object.prototype.hasOwnProperty.call(o, k);
 // pr must already BE a positive safe integer: Number() coercion would accept null, '', true and '7' as PR numbers.
 const validRecord = r => r && typeof r.repo === 'string' && r.repo && Number.isSafeInteger(r.pr) && r.pr > 0 && typeof r.head === 'string' && SHA.test(r.head)
@@ -309,7 +311,8 @@ export function headReviewOwed({ index, repo, pr, head, netPatchHash = null, see
   }
   if (r.lastReviewedHead === head) return { owed: false, reason: 'same-head', verdict: r.verdict };
   // Own keys only: a caller-supplied `__proto__` or `constructor` must not resolve to an inherited value and read as a carried review.
-  const prior = typeof netPatchHash === 'string' && hasOwn(r.history, netPatchHash) ? r.history[netPatchHash] : null;
+  // A key in the keyless namespace ('head:...') is not a patch key, so it never reads a keyless slot.
+  const prior = typeof netPatchHash === 'string' && PATCH_KEY.test(netPatchHash) && hasOwn(r.history, netPatchHash) ? r.history[netPatchHash] : null;
   if (prior) return { owed: false, carried: true, reason: 'same-net-patch', verdict: prior.verdict, fromHead: prior.head };
   return { owed: true, reason: 'new-head', lastReviewedHead: r.lastReviewedHead };
 }
