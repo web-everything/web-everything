@@ -116,8 +116,9 @@ export function elasticRunLimits(limits, slot, units = 1) {
   const parentCpu = quota(limits.parent?.cpuQuota);
   if (!Number.isSafeInteger(cpu) || (units > 1 && (!Number.isSafeInteger(parentCpu) || cpu > parentCpu))) throw new Error('Slot units exceed parent CPU quota');
   const memory = /^([1-9]\d*)([KMGT]?)$/.exec(single.memoryMax);
-  if (units > 1 && !memory) throw new Error('Unreadable slot memory limit');
-  const memoryMax = units === 1 ? single.memoryMax : String(BigInt(memory[1]) * BigInt(units)) + memory[2];
+  // An unlimited operator cap stays unlimited when scaled, as TasksMax does.
+  if (units > 1 && single.memoryMax !== 'infinity' && !memory) throw new Error('Unreadable slot memory limit');
+  const memoryMax = units === 1 || single.memoryMax === 'infinity' ? single.memoryMax : String(BigInt(memory[1]) * BigInt(units)) + memory[2];
   return {cpuQuota:cpu+'%',memoryMax,cpus:Math.max(1,Math.ceil(cpu/100)),
     tasksMax:single.tasksMax === 'infinity' ? 'infinity' : single.tasksMax * units,ioWeight:single.ioWeight};
 }
@@ -665,7 +666,7 @@ async function unitActive(unit) {
   if(['inactive','failed'].includes(word))return false;
   return ['active','activating','deactivating','reloading'].includes(word)?true:undefined;
 }
-export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, clock=Date.now} = {}) {
+export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, testLimits, clock=Date.now} = {}) {
   const bases=testRoot ? join(testRoot,'bases') : '/srv/forge-base';
   const runs = testRoot ? join(testRoot,'runs') : '/srv/forge-exec';
   const receipts = testRoot ? join(testRoot,'receipts') : '/srv/forge-receipts';
@@ -931,7 +932,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     const slot=Number(/^forge-exec-([1-9]\d*)$/.exec(worker.user)?.[1]??(testRoot?1:NaN));
     if(!testRoot && process.getuid()!==0) throw new Error('Scoped execution requires the root wrapper; use local fallback');
     if(!Number.isSafeInteger(slot)||slot<1) throw new Error('Scoped execution requires a numbered slot; rerun Forge setup or use local fallback');
-    const {limits,warnings}=testRoot?{limits:DEFAULT_LIMITS,warnings:[]}:await readLimits();
+    const {limits,warnings}=testRoot?{limits:testLimits??DEFAULT_LIMITS,warnings:[]}:await readLimits();
     for(const warning of warnings) process.stderr.write('forge-exec-run: '+warning.replace(/[\x00-\x1f\x7f]/g,' ')+'\n');
     const units = worker.reservation?.slotUnits ?? 1;
     if (units > 1 && warnings.length) throw new Error('Unreadable elastic limits');
@@ -1152,12 +1153,6 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       await reap();
       if(!nonceOK(nonce) || (label!==undefined && (typeof label!=='string' || !/^[a-z0-9][a-z0-9-]{5,63}$/.test(label)))) throw new Error('Invalid prepare');
       if (!Number.isSafeInteger(slotUnits) || slotUnits < 1 || slotUnits > 256) throw new Error('Invalid slot units');
-      // Validate before reservation so invalid or unreadable grants cannot leak a worker.
-      if (slotUnits > 1 && !testRoot) {
-        const {limits,warnings} = await readLimits();
-        if (warnings.length) throw new Error('Unreadable elastic limits');
-        elasticRunLimits(limits,1,slotUnits);
-      }
       const run='r-'+randomBytes(16).toString('hex');
       const worker=await reserveWorker(run,nonce,slot),record={v:1,nonce,run,...(slotUnits > 1 ? {slotUnits} : {}),
         ...(capabilities?.taskPressure === 1 ? {receiptCapabilities:{taskPressure:1}} : {}),...(worker.active?{slot:worker.user}:{})};
@@ -1165,6 +1160,13 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       if(worker.active)await workerFor(record);
       const container=join(worker.root,run);
       try {
+      // Validate the grant against the worker actually reserved (its own slot limits); the catch
+      // below releases the reservation, so a rejected grant never leaks a worker or a receipt.
+      if (slotUnits > 1 && (!testRoot || testLimits !== undefined)) {
+        const {limits,warnings} = testRoot ? {limits:testLimits,warnings:[]} : await readLimits();
+        if (warnings.length) throw new Error('Unreadable elastic limits');
+        elasticRunLimits(limits,Number(/^forge-exec-([1-9]\d*)$/.exec(worker.user)?.[1] ?? 1),slotUnits);
+      }
       await mkdir(container,{mode:0o755}); // exclusive server-generated name
       const work=join(container,'work');
       await mkdir(work,{mode:0o755});

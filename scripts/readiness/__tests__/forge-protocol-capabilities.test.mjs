@@ -78,6 +78,27 @@ describe('production protocol capability negotiation',()=>{
     expect(Object.keys(receipt).sort()).toEqual(legacyReceipt);
     expect(verifyReceipt(JSON.stringify(receipt),expected,0)).toBe(true);
   });
+  describe('production prepare validates an elastic grant against operator limits',()=>{
+    const nonce='a'.repeat(32);
+    it('unreadable limits reject the grant and leave no run state',async()=>{
+      vi.mocked(readLimits).mockResolvedValue({limits:DEFAULT_LIMITS,warnings:['unreadable']});
+      await expect(runner.createRunner().prepare({nonce,slotUnits:3})).rejects.toThrow('Unreadable elastic limits');
+      expect(readLimits).toHaveBeenCalledTimes(1);
+      for(const [file] of io.writeFile.mock.calls)expect(String(file)).not.toMatch(/\.prepared$/);
+    });
+    it.each([
+      ['parent below the grant',{parent:{cpuQuota:'2000%'}},'Slot units exceed parent CPU quota'],
+      ['unreadable parent quota',{parent:{cpuQuota:'bad'}},'Slot units exceed parent CPU quota'],
+      ['unreadable memory cap',{slot:{...DEFAULT_LIMITS.slot,memoryMax:'bad'}},'Unreadable slot memory limit'],
+    ])('rejects a grant with %s',async(_name,override,message)=>{
+      vi.mocked(readLimits).mockResolvedValue({limits:{...DEFAULT_LIMITS,...override},warnings:[]});
+      await expect(runner.createRunner().prepare({nonce,slotUnits:3})).rejects.toThrow(message);
+    });
+    it('a single unit never reads operator limits',async()=>{
+      await runner.createRunner().prepare({nonce,slotUnits:1}).catch(()=>{});
+      expect(readLimits).not.toHaveBeenCalled();
+    });
+  });
   it('production receipt serializer emits all four diagnostic fields only for a declared capability',()=>{
     const receipt=runner.createRunReceipt({v:1,nonce:expected.nonce,run:expected.run,slotUnits:3,
       receiptCapabilities:{taskPressure:1}},payload,runner.taskPressureNote(5850,6144));

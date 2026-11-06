@@ -1,6 +1,6 @@
 // @vitest-environment node
 import {afterEach, describe, expect, it, vi} from 'vitest';
-import {mkdtempSync, rmSync, readdirSync, mkdirSync, writeFileSync} from 'node:fs';
+import {mkdtempSync, rmSync, readdirSync, mkdirSync, writeFileSync, utimesSync} from 'node:fs';
 import {join} from 'node:path';
 import {runWithRemoteDecision, resolveAdmissionPolicy, formatAdmissionPolicy, heldSlots,
   tryAcquireSlot, releaseOwnedSlot, tryAcquireRemoteUnits, resolveRemoteSlotUnits} from '../heavy-admission.mjs';
@@ -191,5 +191,58 @@ describe('R324 elastic remote slot units',()=>{
     expect(formatAdmissionPolicy(f.policy)).toContain('remote.elasticSlots.enabled=true (standard)');
     expect(units(fixture({slotUnitsByKind:{FULL:999999}}).policy).units).toBe(1);
     expect(units(fixture().policy)).toMatchObject({units:3,source:'setting'});
+  });
+  it('derives auto units from distinct quota numbers: floor(3000% / 700%) = 4, not round or ceil',()=>{
+    const policy=fixture({maxConcurrent:8}).policy,quota=(parent,slot)=>({activeRuns:0,limits:{parent:{cpuQuota:parent},slot:{cpuQuota:slot}}});
+    expect(units(policy,{telemetry:quota('3000%','700%')})).toMatchObject({units:4,source:'telemetry'});
+    expect(units(policy,{telemetry:quota('3500%','1200%')})).toMatchObject({units:2,source:'telemetry'});
+    expect(()=>units(policy,{telemetry:quota('500%','800%')})).toThrow('Unreadable quota count');
+  });
+  it.each([
+    ['telemetry quota above the client cap',{maxConcurrent:4},{limits:{parent:{cpuQuota:'2800%'},slot:{cpuQuota:'100%'}}},4,'telemetry'],
+    ['fixed kind setting above the client cap',{maxConcurrent:2,slotUnitsByKind:{FULL:6}},{},2,'setting'],
+    ['auto fallback setting above the client cap',{maxConcurrent:2,autoSlotUnits:5},{},2,'setting'],
+  ])('clamps granted units to remote.maxConcurrent: %s',(_name,remote,extra,expectedUnits,source)=>{
+    expect(units(fixture(remote).policy,{telemetry:{activeRuns:0,...extra}})).toEqual({units:expectedUnits,source});
+  });
+  it('logs telemetry and default provenance for the granted units',async()=>{
+    const telemetry=fixture();telemetry.telemetry.limits={parent:{cpuQuota:'3000%'},slot:{cpuQuota:'1000%'}};
+    expect(await runWithRemoteDecision(telemetry)).toMatchObject({handled:true});
+    expect(telemetry.log.mock.calls.flat().join('')).toContain('remote.slotUnits=3 (telemetry;');
+    const disabled=fixture({elasticSlots:{enabled:false}});
+    expect(await runWithRemoteDecision(disabled)).toMatchObject({handled:true});
+    expect(disabled.log.mock.calls.flat().join('')).toContain('remote.slotUnits=1 (default;');
+  });
+  it('a slot dir whose lock.json is still being written is initializing, not unreadable',async()=>{
+    const f=fixture();mkdirSync(lockDirFor(f.remoteRoot,'slot-0'),{recursive:true});
+    f.remoteExec.mockImplementation(async request=>{
+      expect(request.slotUnits).toBe(3);
+      expect(heldSlots({lockRoot:f.remoteRoot,cap:4}).map(entry=>entry.path)).not.toContain('slot-0');
+      return {mode:'remote',code:0};
+    });
+    expect(await runWithRemoteDecision(f)).toMatchObject({handled:true,exitCode:0});
+    expect(f.log.mock.calls.flat().join('')).not.toContain('remote-slot-unreadable');
+  });
+  it('an entryless slot dir past the crash grace fails closed',async()=>{
+    const f=fixture(),dir=lockDirFor(f.remoteRoot,'slot-0'),old=new Date(Date.now()-60000);
+    mkdirSync(dir,{recursive:true});utimesSync(dir,old,old);
+    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(f.remoteExec).not.toHaveBeenCalled();
+    expect(f.log.mock.calls.flat().join('')).toContain('remote-slot-unreadable');
+  });
+  it('transient scope carries multiplied TasksMax, unlimited caps and the slot IOWeight',()=>{
+    const slot={cpuQuota:'800%',memoryMax:'12G',tasksMax:2048,ioWeight:250};
+    const options={limits:{parent:{cpuQuota:'2800%',memoryMax:'56G'},slot},slot:1,unit:'forge-exec-run-'+'a'.repeat(16),source:'source',json:'{}',sudo:false};
+    expect(elasticScopeArgv({...options,units:3})).toEqual(expect.arrayContaining(['--property=TasksMax=6144','--property=IOWeight=250']));
+    const unlimited=elasticScopeArgv({...options,limits:{...options.limits,slot:{...slot,tasksMax:'infinity',memoryMax:'infinity'}},units:3});
+    expect(unlimited).toEqual(expect.arrayContaining(['--property=TasksMax=infinity','--property=MemoryMax=infinity']));
+    expect(elasticScopeArgv(options).some(arg=>arg.startsWith('--property='))).toBe(false);
+  });
+  it('scales every finite memory suffix and preserves an unlimited memory cap',()=>{
+    const limits=memoryMax=>({parent:{cpuQuota:'2800%'},slot:{cpuQuota:'800%',memoryMax}});
+    expect(elasticRunLimits(limits('infinity'),1,3).memoryMax).toBe('infinity');
+    expect(elasticRunLimits(limits('infinity'),1,1).memoryMax).toBe('infinity');
+    expect(elasticRunLimits(limits('512M'),1,3).memoryMax).toBe('1536M');
+    expect(()=>elasticRunLimits(limits('bad'),1,3)).toThrow('Unreadable slot memory limit');
   });
 });

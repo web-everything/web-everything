@@ -159,7 +159,7 @@ import { DEFAULT_HOST_MAX_WAIT_MS, loadHostOverloadSettings } from '../lib/host-
 import { LEGACY_SETTINGS_PATH, readDeclaredSettings } from '../lib/settings-files.mjs';
 import { cutoverDecision, loadResourceGateSettings } from '../lib/resource-gate.mjs';
 import { LEASE_FILENAME, isLeaseStale } from '../lib/lane-lease.mjs';
-import { reserve, releaseLockDir, readLockEntry, heartbeatOwn, lockDirFor } from './file-locks.mjs';
+import { reserve, releaseLockDir, readLockEntry, heartbeatOwn, lockDirFor, ENTRYLESS_LOCK_DIR_GRACE_MS } from './file-locks.mjs';
 import { probePidLiveness } from './pid-liveness.mjs';
 import { defaultPoolRoot, guardedPoolRoot, workspaceFor } from '../lib/lane-pool-paths.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
@@ -765,8 +765,10 @@ export function resolveRemoteSlotUnits({policy, kind, telemetry, priority = fals
   if (r.elasticSlots?.enabled !== true || !['FULL', 'soak', 'standards'].includes(kind)
     || (!priority && telemetry.activeRuns !== 0)) return {units: 1, source: 'default'};
   const value = admissionObject(r.slotUnitsByKind) && Object.hasOwn(r.slotUnitsByKind, kind) ? r.slotUnitsByKind[kind] : 1;
-  if (value !== 'auto') return {units: admissionInt(1)(value) ? value : 1, source: 'setting'};
-  return {units: admissionInt(1)(auto) ? auto : 1, source};
+  // A grant can never exceed the client's own slot cap: more units than slots could never be acquired.
+  const clamp = n => Math.min(n, admissionInt(1)(r.maxConcurrent) ? r.maxConcurrent : n);
+  if (value !== 'auto') return {units: admissionInt(1)(value) ? clamp(value) : 1, source: 'setting'};
+  return {units: admissionInt(1)(auto) ? clamp(auto) : 1, source};
 }
 
 /** Acquire distinct units in one synchronous attempt. A partial win never holds capacity while waiting. */
@@ -908,10 +910,15 @@ export async function runWithRemoteDecision({
       // file-locks treats corrupt entries as reclaimable. Remote admission requires readable
       // evidence instead: an unknown holder could still have an outstanding Forge execution.
       for (let n = 0; n < cap; n++) {
-        let present = false;
-        try { statSync(lockDirFor(remoteRoot,slotPath(n))); present = true; }
+        let present = false, ageMs = 0;
+        const dir = lockDirFor(remoteRoot,slotPath(n));
+        try { ageMs = Date.now() - statSync(dir).mtimeMs; present = true; }
         catch (error) { if (error.code !== 'ENOENT') throw error; }
-        if (present && !readLockEntry(remoteRoot,slotPath(n))) throw new Error('Unreadable remote slot');
+        // A winner that has made the dir but not yet written lock.json is initializing (as file-locks.reserve
+        // treats it): the acquire below sees it held. A corrupt lock.json, or an entryless dir past the grace,
+        // is unreadable evidence and still fails closed.
+        const initializing = !existsSync(join(dir,'lock.json')) && ageMs < ENTRYLESS_LOCK_DIR_GRACE_MS;
+        if (present && !initializing && !readLockEntry(remoteRoot,slotPath(n))) throw new Error('Unreadable remote slot');
       }
       const blocked=blockedSlots(remoteRoot,cap),slots=Array.from({length:cap},(_,i)=>i).filter(i=>!blocked.has(i));
       slot = tryAcquireRemoteUnits({units,slots,

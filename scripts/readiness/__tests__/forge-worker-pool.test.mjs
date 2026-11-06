@@ -111,6 +111,27 @@ describe('per-user worker reservations',()=>{
     if(near && optIn)expect(receipt).toMatchObject({processCount,tasksMax:2048*slotUnits,tasksNear:true,tasksNote:expect.any(String)});
     else for(const key of ['processCount','tasksMax','tasksNear','tasksNote'])expect(receipt).not.toHaveProperty(key);
   });
+  describe('elastic grant validated against the reserved worker',()=>{
+    const testLimits={parent:{cpuQuota:'2800%',memoryMax:'56G'},slot:{cpuQuota:'800%',memoryMax:'12G',tasksMax:2048,ioWeight:100},
+      slots:{2:{cpuQuota:'1200%',memoryMax:'12G',tasksMax:2048,ioWeight:100}}};
+    it('rejects and releases a slot-2 grant that exceeds the parent even though slot 1 would fit',async()=>{
+      runner=createRunner({testRoot:root,testPath:'/usr/bin:/bin',testLimits});
+      const first=await runner.prepare({nonce});          // slot 1 is now busy; the elastic request gets slot 2
+      expect(first.slot).toBe('forge-exec-1');
+      await expect(runner.prepare({nonce,slotUnits:3})).rejects.toThrow('Slot units exceed parent CPU quota');
+      expect((await fs.readdir(join(root,'receipts'))).filter(name=>name.startsWith('worker-active')))
+        .toEqual(['worker-active-1']);
+      expect((await fs.readdir(join(root,'receipts'))).filter(name=>/\.(prepared|running|receipt)$/.test(name)))
+        .toEqual([first.run+'.prepared']);
+      await runner.finish({...first,nonce});
+    });
+    it('accepts the same grant on slot 1 and records its units',async()=>{
+      runner=createRunner({testRoot:root,testPath:'/usr/bin:/bin',testLimits});
+      const granted=await runner.prepare({nonce,slotUnits:3});
+      expect(granted.slot).toBe('forge-exec-1');
+      await runner.finish({...granted,nonce});
+    });
+  });
   it('rejects oversized units before reserving a worker',async()=>{
     await expect(runner.prepare({nonce,slotUnits:257})).rejects.toThrow('Invalid slot units');
     expect((await fs.readdir(join(root,'receipts'))).filter(name=>name.startsWith('worker-active'))).toEqual([]);
