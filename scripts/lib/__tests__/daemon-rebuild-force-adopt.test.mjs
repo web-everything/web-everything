@@ -4,7 +4,7 @@ import {
   describe, it, expect, beforeEach, afterEach, vi,
 } from 'vitest';
 import {
-  mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync,
+  mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync, chmodSync,
 } from 'node:fs';
 import { tmpdir, hostname } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -17,7 +17,7 @@ import {
 import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
 import { defaultPoolRoot } from '../lane-pool-paths.mjs';
 import { DISPATCH_CWD_ENV } from '../../operations/dispatch-lane-io.mjs';
-import { requestForceAdopt, readForceWatch, runForceWatchTick, readForceAdopt, recordForcedAdoption } from '../daemon-force-adopt.mjs';
+import { requestForceAdopt, readForceWatch, runForceWatchTick, readForceAdopt, recordForcedAdoption, forceBlockedReason } from '../daemon-force-adopt.mjs';
 import { readReadyCandidate, alertsFilePath } from '../daemon-rebuild/state.mjs';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
 import { gitRun } from '../main-staleness.mjs';
@@ -425,6 +425,62 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     expect(readForceWatch(cloneDir, env)).toBeNull(); // not stranded: the next force is not refused with watch-already-open
     expect(handoffOf(env)).toMatch(new RegExp(`NOT adopted ${target} \\(${why}\\); watch closed`));
     expect(headOf(cloneDir)).not.toBe(target); // the forced build was never adopted
+  });
+
+  const alertsOf = (cloneDir, env) => readFileSync(alertsFilePath(cloneDir, env), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const watchFileOf = (cloneDir, env) => join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(cloneDir)}.force-watch.json`);
+
+  it.each([
+    ['missing', (cloneDir, env) => rmSync(watchFileOf(cloneDir, env), { force: true })],
+    ['unreadable', (cloneDir, env) => writeFileSync(watchFileOf(cloneDir, env), '{corrupt')],
+  ])('a forced ready candidate whose rollback watch is %s is never adopted (fail closed), and is dropped', async (kind, damage) => {
+    const { cloneDir, env, lastGood, target, arm } = setup();
+    arm();
+    await tick(cloneDir, env, { runSmoke: failing(), readyOnly: true });
+    expect(readReadyCandidate(cloneDir, env)).toMatchObject({ forced: true });
+    damage(cloneDir, env);
+    // The ordinary ladder runs after the drop and its smoke fails too, so the only way the head could move is the forced record.
+    const r = await tick(cloneDir, env, { runSmoke: failing(), forceWatchProbe: healthy });
+    expect(r.reason).not.toBe('ready-adopted');
+    expect(headOf(cloneDir)).toBe(lastGood); // never adopted without its rollback watch
+    expect(headOf(cloneDir)).not.toBe(target);
+    expect(readReadyCandidate(cloneDir, env)).toBeNull();
+    const discarded = alertsOf(cloneDir, env).find((a) => a.kind === 'ready-candidate-discarded');
+    expect(discarded?.detail).toMatchObject({ target, reason: `forced-watch-${kind}` });
+  });
+
+  describe('a refused force-adopt (a watch is open / unreadable, or a rollback is owed) is a sticky rejection that consumes the request', () => {
+    const blockers = {
+      'watch-already-open': async ({ cloneDir, env, lastGood }) => {
+        await recordForcedAdoption({ root: cloneDir, env, request: { daemon: 'review', ruling: 'R508', quote: QUOTE }, sha: 'c'.repeat(40),
+          lastGood: { head: lastGood }, smoke: { verdict: 'code', failed: [] }, emit: async () => {} });
+      },
+      'watch-unreadable': async ({ cloneDir, env }) => { writeFileSync(watchFileOf(cloneDir, env), '{corrupt'); },
+      'rollback-owed': async ({ cloneDir, env, lastGood }) => {
+        await recordForcedAdoption({ root: cloneDir, env, request: { daemon: 'review', ruling: 'R508', quote: QUOTE }, sha: 'c'.repeat(40),
+          lastGood: { head: lastGood }, smoke: { verdict: 'code', failed: [] }, emit: async () => {} });
+        chmodSync(env.WE_DAEMON_STATE_DIR, 0o500); // the owed-rollback marker cannot be saved
+        try { await runForceWatchTick({ root: cloneDir, env, currentHead: 'c'.repeat(40), probe: unhealthy, rollback: async () => ({ ok: false }) }); } finally { chmodSync(env.WE_DAEMON_STATE_DIR, 0o700); }
+        rmSync(watchFileOf(cloneDir, env), { force: true }); // the obligation now lives only in memory
+      },
+    };
+    it.each(Object.keys(blockers))('%s', async (reason) => {
+      const { cloneDir, env, lastGood, arm } = setup();
+      await blockers[reason]({ cloneDir, env, lastGood });
+      expect(forceBlockedReason(cloneDir, env)).toBe(reason);
+      arm();
+      const smoke = failing();
+      const r = await tick(cloneDir, env, { runSmoke: smoke, forceWatchProbe: healthy });
+      expect(r).toMatchObject({ moved: false, reason: 'force-adopt-refused', detail: reason });
+      expect(headOf(cloneDir)).toBe(lastGood);
+      expect(readForceAdopt(cloneDir, env)).toBeNull(); // consumed: it does not stay pending for the next build
+      expect(readRebuildState(cloneDir, env).rejected).toMatchObject({ reason: 'daemon-entries-boot' }); // sticky
+      const refused = alertsOf(cloneDir, env).find((a) => a.kind === 'force-adopt-refused');
+      expect(refused?.detail).toMatchObject({ reason, requestConsumed: true });
+      // the next tick does not re-smoke the rejected inputs
+      expect((await tick(cloneDir, env, { runSmoke: smoke, forceWatchProbe: healthy })).reason).toBe('still-rejected');
+      expect(smoke).toHaveBeenCalledTimes(1);
+    });
   });
 
   it('a deferred forced adoption keeps its watch until the exact build is adopted, then the watch still rolls it back', async () => {

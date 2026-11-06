@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   validateForceAdopt, requestForceAdopt, readForceAdopt, recordForcedAdoption, abortForcedAdoption, readForceWatch,
-  evaluateForceWatch, runForceWatchTick, forceRequestFor, forceBlockedReason, abortForcedWatch, dropReadyCandidate,
+  evaluateForceWatch, runForceWatchTick, forceRequestFor, forceBlockedReason, abortForcedWatch, dropReadyCandidate, forcedWatchStatus,
 } from '../daemon-force-adopt.mjs';
 import { matchReadyCandidate } from '../daemon-rebuild/adopt.mjs';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
@@ -417,6 +417,91 @@ describe('runForceWatchTick', () => {
       expect(r).toMatchObject({ action: 'rollback-failed', reason: 'head-unreadable' });
     });
   });
+  const watchFilePath = () => join(env.WE_DAEMON_STATE_DIR, nodeFsReaddir(env.WE_DAEMON_STATE_DIR).find((n) => n.endsWith('.force-watch.json')));
+  const patchWatch = (patch) => writeFileSync(watchFilePath(), JSON.stringify({ ...JSON.parse(readFileSync(watchFilePath(), 'utf8')), ...patch }));
+  describe('overlapping ticks never erase an owed rollback', () => {
+    it('a healthy tick that would COMPLETE the watch cannot clear it while a failing rollback is in flight', async () => {
+      await setup();
+      patchWatch({ ticksLeft: 1 }); // a healthy tick now would finish the watch and delete it
+      const head = 'b'.repeat(40);
+      let release; const gate = new Promise((r) => { release = r; });
+      let entered; const inRollback = new Promise((r) => { entered = r; });
+      const tickA = runForceWatchTick({ root, env, currentHead: head, probe: async () => ({ healthy: false }),
+        rollback: async () => { entered(); await gate; return { ok: false }; }, emit: async () => {} });
+      await inRollback;
+      // the obligation is durable BEFORE the rollback returns
+      expect(readForceWatch(root, env)).toMatchObject({ rollbackPending: 'health-failed', ticksLeft: 1 });
+      const rollbackB = vi.fn(async () => ({ ok: false }));
+      const b = await runForceWatchTick({ root, env, currentHead: head, probe: async () => ({ healthy: true }), rollback: rollbackB, emit: async () => {} });
+      expect(b.action).toBe('rollback-failed'); // not 'done' / 'continue'
+      expect(rollbackB).toHaveBeenCalledTimes(1);
+      expect(readForceWatch(root, env)).toMatchObject({ rollbackPending: 'health-failed', ticksLeft: 1 });
+      release();
+      expect((await tickA).action).toBe('rollback-failed');
+      expect(readForceWatch(root, env)).toMatchObject({ rollbackPending: 'health-failed', ticksLeft: 1 }); // the obligation survived both
+    });
+    it('the marker is cleared only when the rollback succeeds', async () => {
+      await setup();
+      let seenDuring = null;
+      const r = await runForceWatchTick({ root, env, currentHead: 'b'.repeat(40), probe: async () => ({ healthy: false }),
+        rollback: async () => { seenDuring = readForceWatch(root, env)?.rollbackPending ?? null; return { ok: true }; }, emit: async () => {} });
+      expect(seenDuring).toBe('health-failed');
+      expect(r.action).toBe('rollback');
+      expect(readForceWatch(root, env)).toBeNull();
+    });
+  });
+  describe('a transient unreadable HEAD before the forced build ever ran is a retry, never a supersede', () => {
+    const sha = 'b'.repeat(40); const lastGood = 'a'.repeat(40);
+    const withReady = async () => { await setup(); patchWatch({ startedAt: new Date().toISOString() }); expect(writeReadyCandidate(root, { adopt: { finalSha: sha }, prevHead: lastGood, forced: true }, env)).toBe(true); };
+    const tick = (currentHead, extra = {}) => runForceWatchTick({ root, env, currentHead, probe: async () => ({ healthy: true }), rollback: extra.rollback ?? (async () => ({ ok: true })), emit: async () => {}, ...extra });
+    it('keeps the watch and the ready record, writes no marker and never calls the rollback', async () => {
+      await withReady();
+      const rollback = vi.fn(async () => ({ ok: true })); // HEAD===lastGood would read as "already reverted"
+      expect((await tick(() => null, { rollback })).action).toBe('waiting');
+      expect(rollback).not.toHaveBeenCalled();
+      expect(readForceWatch(root, env)).toMatchObject({ ticksLeft: 5 });
+      expect(readForceWatch(root, env).rollbackPending).toBeUndefined();
+      expect(readReadyCandidate(root, env)).not.toBeNull();
+      expect(forceBlockedReason(root, env)).toBe('watch-already-open'); // and no unsaved in-memory obligation either
+    });
+    it('the next readable tick (still on last-good) keeps waiting: not superseded, ready record kept', async () => {
+      await withReady();
+      await tick(() => null);
+      expect((await tick(lastGood)).action).toBe('waiting');
+      expect(readForceWatch(root, env)).not.toBeNull();
+      expect(readReadyCandidate(root, env)).not.toBeNull();
+    });
+    it('a stale head-unreadable marker from a build that never ran is dropped, not turned into a supersede', async () => {
+      await withReady();
+      patchWatch({ rollbackPending: 'head-unreadable' });
+      expect((await tick(lastGood)).action).toBe('waiting');
+      expect(readForceWatch(root, env)).not.toBeNull();
+      expect(readForceWatch(root, env).rollbackPending).toBeUndefined();
+      expect(readReadyCandidate(root, env)).not.toBeNull();
+    });
+    it('is bounded: a HEAD that stays unreadable past the TTL expires the watch and drops the never-adopted ready record', async () => {
+      await withReady();
+      const startedAt = Date.parse(readForceWatch(root, env).startedAt);
+      const events = [];
+      const r = await tick(() => null, { now: () => startedAt + 3 * 3600_000, emit: async (e) => { events.push(e); } });
+      expect(r.action).toBe('expired');
+      expect(readForceWatch(root, env)).toBeNull();
+      expect(readReadyCandidate(root, env)).toBeNull();
+      expect(events.map((e) => e.kind)).toContain('force-adopt-watch-expired');
+    });
+    it('once the build has been adopted (no ready record left), an unreadable HEAD still owes a rollback', async () => {
+      await setup();
+      const rollback = vi.fn(async () => ({ ok: false }));
+      expect(await tick(() => null, { rollback })).toMatchObject({ action: 'rollback-failed', reason: 'head-unreadable' });
+      expect(rollback).toHaveBeenCalledTimes(1);
+    });
+  });
+  it('abortForcedWatch never closes a watch that owes a rollback', async () => {
+    await setup();
+    patchWatch({ rollbackPending: 'health-failed' }); // adoptedSeen unset: only the marker says the build ran
+    expect(await abortForcedWatch({ root, env, sha: 'b'.repeat(40), reason: 'x', emit: async () => {} })).toBe(false);
+    expect(readForceWatch(root, env)).toMatchObject({ rollbackPending: 'health-failed' });
+  });
   it('an expired watch (forced build never became head) also drops its never-smoked ready candidate', async () => {
     await setup();
     const sha = 'b'.repeat(40);
@@ -522,15 +607,54 @@ describe('dropReadyCandidate (every ready-record clear goes through it)', () => 
 
 describe('matchReadyCandidate: a forced record is pinned to its sha', () => {
   const ready = (extra = {}) => ({ kind: 'candidate', prevHead: 'p', tree: 'T', passedAt: new Date(0).toISOString(), adopt: { finalSha: SHA, inputsKey: 'k', mainSha: 'm', applied: [] }, ...extra });
-  const match = (r, planSha) => matchReadyCandidate({
+  const match = (r, planSha, extra = {}) => matchReadyCandidate({
     ready: r, plan: { finalSha: planSha, inputsKey: 'k2', mainSha: 'm2', applied: [] }, prevHead: 'p', treeOf: () => 'T', stillWanted: () => true,
-    verifyBuilt: () => true, liveApplied: [], nowMs: 1000, maxAgeMs: 10_000,
+    verifyBuilt: () => true, liveApplied: [], nowMs: 1000, maxAgeMs: 10_000, ...extra,
   });
+  const watchOk = { forcedWatch: () => 'ok' };
   it('an ordinary record is still substituted by a same-tree successor (unchanged)', () => {
     expect(match(ready(), 'd'.repeat(40))).toMatchObject({ match: 'same-tree' });
   });
   it('a forced record is adopted only for its exact sha: no same-tree or superseding substitution', () => {
-    expect(match(ready({ forced: true }), SHA)).toMatchObject({ match: 'exact' });
-    expect(match(ready({ forced: true }), 'd'.repeat(40))).toEqual({ adopt: null, reason: 'forced-sha-pinned' });
+    expect(match(ready({ forced: true }), SHA, watchOk)).toMatchObject({ match: 'exact' });
+    expect(match(ready({ forced: true }), 'd'.repeat(40), watchOk)).toEqual({ adopt: null, reason: 'forced-sha-pinned' });
+  });
+  it.each([['missing'], ['unreadable'], ['owed']])('a forced record whose rollback watch is %s is NOT adoptable (fail closed)', (status) => {
+    const seen = [];
+    expect(match(ready({ forced: true }), SHA, { forcedWatch: (sha) => { seen.push(sha); return status; } })).toEqual({ adopt: null, reason: `forced-watch-${status}` });
+    expect(seen).toEqual([SHA]); // asked about exactly the build the record would adopt
+  });
+  it('a forced record is not adoptable when no watch status is supplied at all (unknown is not "ok")', () => {
+    expect(match(ready({ forced: true }), SHA)).toEqual({ adopt: null, reason: 'forced-watch-missing' });
+  });
+  it('an ordinary (non-forced) record never asks about a watch', () => {
+    const forcedWatch = vi.fn(() => 'missing');
+    expect(match(ready(), SHA, { forcedWatch })).toMatchObject({ match: 'exact' });
+    expect(forcedWatch).not.toHaveBeenCalled();
+  });
+});
+
+describe('forcedWatchStatus: the one reader of "is this forced build still watched?"', () => {
+  const setup = () => recordForcedAdoption({ root, env, request: { daemon: 'review', ruling: 'R508', quote: QUOTE }, sha: SHA,
+    lastGood: { head: 'a'.repeat(40) }, smoke: { verdict: 'code', failed: [] }, emit: async () => {}, now: () => 1 });
+  const watchFile = () => join(env.WE_DAEMON_STATE_DIR, nodeFsReaddir(env.WE_DAEMON_STATE_DIR).find((n) => n.endsWith('.force-watch.json')));
+  it('missing: no watch file, or a watch for another build', async () => {
+    expect(forcedWatchStatus(root, env, SHA)).toBe('missing');
+    await setup();
+    expect(forcedWatchStatus(root, env, 'c'.repeat(40))).toBe('missing');
+  });
+  it('ok: an intact watch for exactly this build', async () => {
+    await setup();
+    expect(forcedWatchStatus(root, env, SHA)).toBe('ok');
+  });
+  it('unreadable: the file exists but cannot be parsed (never "missing")', async () => {
+    await setup();
+    writeFileSync(watchFile(), '{corrupt');
+    expect(forcedWatchStatus(root, env, SHA)).toBe('unreadable');
+  });
+  it('owed: the watch carries a rollback obligation', async () => {
+    await setup();
+    await runForceWatchTick({ root, env, currentHead: SHA, probe: async () => ({ healthy: false }), rollback: async () => ({ ok: false }), emit: async () => {} });
+    expect(forcedWatchStatus(root, env, SHA)).toBe('owed');
   });
 });

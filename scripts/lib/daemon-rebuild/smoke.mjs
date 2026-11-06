@@ -10,7 +10,7 @@ import { isRepoFile, pickSmokeDiagnostics, sourceFilesIn } from '../daemon-boot-
 import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidate, clearReadyCandidate } from './state.mjs';
 import { releaseBuildLease } from './lease.mjs';
-import { forceRequestFor, readForceAdopt, recordForcedAdoption, abortForcedAdoption } from '../daemon-force-adopt.mjs';
+import { forceRequestFor, readForceAdopt, recordForcedAdoption, abortForcedAdoption, clearForceAdopt } from '../daemon-force-adopt.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { finalizeRebuild, staleAlertDetail, dropSuspectOverlays } from './adopt.mjs';
 import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
@@ -126,6 +126,9 @@ export function attributeSmokeFailure({ git, files, overlays }) {
   }
   return { culprits, unknown };
 }
+
+/** Refusals that leave the force-adopt request pending in `recordForcedAdoption`: another force watch (or an unpaid rollback) holds the clone. */
+const FORCE_REFUSED_CONSUMES = new Set(['watch-already-open', 'watch-unreadable', 'rollback-owed']);
 
 /** Did only EXTERNAL checks fail? Every failed row is one `daemon-live-smoke.mjs#SMOKE_CHECKS` marks
  *  `mayBeTransient` (it runs `gh`, not code from the tree under test). An empty list is not external-only. */
@@ -681,8 +684,19 @@ export async function smokeAndAdopt({
       root, env: stEnv, request: forceReq, sha: plan.finalSha, lastGood: lastGoodState ?? { head: prevHead }, smoke: forceSmoke, emit,
     });
     if (!opened.ok) {
-      alert('force-adopt-refused', { reason: opened.reason });
-      await hold('force-adopt-refused', failedA);
+      // Refused because another force watch holds this clone (open / unreadable / a rollback still owed): `recordForcedAdoption` left the
+      // request pending, so it would stay pending (and, with no rejection recorded, keep this build re-smoking every tick) until it
+      // expired. Consume it and write the sticky rejection in the SAME lock as the hold; the operator re-requests once the watch is gone.
+      const consume = FORCE_REFUSED_CONSUMES.has(opened.reason);
+      if (consume) clearForceAdopt(root, stEnv);
+      alert('force-adopt-refused', {
+        reason: opened.reason,
+        ...(consume ? { requestConsumed: true, message: 'the force-adopt request was consumed and this build is rejected; request again once the open watch / owed rollback is settled' } : {}),
+      });
+      await hold('force-adopt-refused', failedA, {}, consume ? (st) => {
+        st.rejected = { inputsKey: plan.inputsKey, reason: failedA.map((r) => r.name).join(','), at: nowIso() };
+        if (isExternalOnlyFailure(failedA)) Object.assign(st.rejected, { externalOnly: true, attempts: 1, retryAt: new Date(now() + rejectRetryDelayMs(env, 1)).toISOString() });
+      } : undefined);
       return { moved: false, reason: 'force-adopt-refused', detail: opened.reason, plan, alerts: [...prepAlerts, ...alertsList] };
     }
     const abort = async () => {

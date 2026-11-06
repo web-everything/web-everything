@@ -16,7 +16,7 @@ import {
   overlayGraduated, reportDiscardedCandidate,
 } from './adopt.mjs';
 import { hostname } from 'node:os';
-import { forceRequestFor, forceBlockedReason, dropReadyCandidate } from '../daemon-force-adopt.mjs';
+import { forceRequestFor, forceBlockedReason, dropReadyCandidate, forcedWatchStatus } from '../daemon-force-adopt.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import {
   findUnsafeLocalState, knownInputsOf, rollbackUnverified, collectUntrackedPaths, ensureSafeToMove,
@@ -542,6 +542,8 @@ export async function prepareRebuild({
         }),
         contentInBuild: (sha, build) => contentContainedInBuild(git, sha, build),
         removedForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
+        // R508: a forced record is only adoptable while its rollback watch is intact (read under this write lock).
+        forcedWatch: (sha) => forcedWatchStatus(root, stEnv, sha),
       });
       if (!m.adopt) {
         // A discarded forced build can no longer be adopted, so its rollback watch (it would only wait out the TTL and
@@ -601,9 +603,10 @@ export async function prepareRebuild({
   // `main-staleness.mjs#assertMainNotStale`), whatever the new inputs are.
   // R508: an operator force-adopt request that names EXACTLY this candidate (same sha) must reach a fresh smoke, so it can be
   // consumed there, even when this candidate is held by a sticky rejection or the harness-broken backoff. A request for any
-  // other build never lifts a rejection (`forceRequestFor` is the one sha matcher). While a force watch is still open a second
-  // force is refused (`watch-already-open`) WITHOUT consuming the request, so lifting the gate then would re-smoke this
-  // candidate on every tick for nothing: the rejection stands until the watch ends.
+  // other build never lifts a rejection (`forceRequestFor` is the one sha matcher). While a force watch is open / unreadable or a
+  // rollback is owed, a second force is refused (smoke.mjs `force-adopt-refused`); lifting the gate then would re-smoke this
+  // candidate on every tick for nothing, so the rejection stands until the watch ends. If such a refusal DOES happen (the blocker
+  // appeared during the smoke), smoke.mjs consumes the request and writes the sticky rejection, so it never stays pending.
   const forceBypass = !forceBlockedReason(root, stEnv) && !!forceRequestFor(root, stEnv, plan.finalSha);
   if (forceBypass && (state.rejected?.inputsKey === plan.inputsKey || state.held?.reason === 'smoke-harness-broken')) {
     alert('force-adopt-bypasses-rejection', { target: plan.finalSha, rejected: state.rejected?.reason ?? null });

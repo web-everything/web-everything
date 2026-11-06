@@ -33,14 +33,16 @@ import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
  * @param {{ready:object|null, plan:object, prevHead:string, treeOf:(sha:string)=>string|null,
  *   stillWanted:(ref:string)=>boolean, verifyBuilt?:(adopt:object)=>boolean,
  *   overlayTip?:(ref:string)=>string|null, registered?:(ref:string)=>boolean, allowFallback?:boolean,
- *   rejected?:object|null, nowMs:number, maxAgeMs:number}} o — `registered`: still on the overlay list after this
- *   tick's own edits (defaults to `stillWanted`); `allowFallback: false` (a mainOnly rebuild) refuses any fallback.
+ *   rejected?:object|null, nowMs:number, maxAgeMs:number, forcedWatch?:(sha:string)=>'ok'|'missing'|'unreadable'|'owed'}} o —
+ *   `registered`: still on the overlay list after this tick's own edits (defaults to `stillWanted`); `allowFallback: false`
+ *   (a mainOnly rebuild) refuses any fallback; `forcedWatch` (R508): the state of the rollback watch a FORCED record needs
+ *   (default `'missing'`, so a forced record is never adopted without proof of its watch).
  */
 export function matchReadyCandidate({
   ready, plan, prevHead, treeOf, stillWanted, verifyBuilt = () => false, overlayTip = () => null,
   registered = stillWanted, allowFallback = true, rejected = null, nowMs, maxAgeMs,
   liveApplied, carries = () => false, leftForMain = () => false,
-  removedForMain = () => false, contentInBuild = () => false,
+  removedForMain = () => false, contentInBuild = () => false, forcedWatch = () => 'missing',
 }) {
   if (!ready) return { adopt: null, reason: 'none' };
   const passedMs = Date.parse(ready.passedAt || '');
@@ -53,6 +55,12 @@ export function matchReadyCandidate({
   // R508: a forced record vouches for exactly ONE sha (its rollback watch is keyed to it). A same-tree or superseding
   // build substituted for it would be adopted with no health watch, so only an exact match may adopt it.
   if (ready.forced === true && plan.finalSha !== ready.adopt.finalSha) return { adopt: null, reason: 'forced-sha-pinned' };
+  // …and only while its rollback watch is really there: a forced build adopted with a missing, unreadable or already-owing watch would
+  // run with nothing to revert it. Unknown (no `forcedWatch` supplied) is not "ok": fail closed.
+  if (ready.forced === true) {
+    const watch = forcedWatch(ready.adopt.finalSha);
+    if (watch !== 'ok') return { adopt: null, reason: `forced-watch-${['unreadable', 'owed'].includes(watch) ? watch : 'missing'}` };
+  }
   const carriesOnlyWanted = (ready.adopt.applied || []).every((a) => stillWanted(a.ref));
   if (ready.kind === 'fallback') {
     if (!allowFallback) return { adopt: null, reason: 'fallback-not-allowed' };
