@@ -33,6 +33,12 @@ export const REVIEW_AUTH_FLOOR = Object.freeze([
   'scripts/operations/record-verdict*', 'scripts/operations/record-referral-ruling*', 'scripts/operations/land-human-only*',
   'scripts/conveyor/hiccup-approve.mjs', 'scripts/settings/delivery-identity.json', 'scripts/lib/review-escalation.mjs',
   'scripts/lib/identical-net-patch.mjs', 'scripts/lib/carry-equivalence.mjs', 'scripts/lib/numbering-carry.mjs',
+  // PR #6381 self-review: the operator's ruling on a confirmed red-team break (twin of record-referral-ruling), the
+  // standing ruling and the ruling that answers a stand-down, the ledger backfill of rulings, the human-only enqueue
+  // license, the approved-human-surface hold and the verdict hold of a PR's state.
+  'scripts/operations/record-red-team-ruling*', 'scripts/conveyor/standing-ruling-mark.mjs', 'scripts/conveyor/ruling-resolved-stand-down.mjs',
+  'scripts/operations/ledger-backfill-rulings.mjs', 'scripts/lib/human-only-enqueue-license.mjs', 'scripts/settings/human-only-enqueue.json',
+  'scripts/lib/approved-human-surface-hold.mjs', 'scripts/settings/approved-human-surface-hold.json', 'scripts/lib/pr-state/holds/verdict.mjs',
   // `**/` needs at least one folder here, so each `scripts/**/` entry above has a twin for a file directly in scripts/.
   'scripts/*human-clearance-carry*', 'scripts/accept-carry-*', 'scripts/*verdict-carry*', 'scripts/*clear-human*']);
 /** Modules the review authorization family imports directly (the source-scan test pins this list complete). */
@@ -60,7 +66,20 @@ const REVIEW_AUTH_IMPORTS = Object.freeze([
   'scripts/lib/review-seat-provider.mjs', 'scripts/lib/review-settings.mjs', 'scripts/lib/pr-state/referrals.mjs',
   'scripts/lib/pr-state/snapshot.mjs', 'scripts/lib/gh-app-shim.mjs', 'scripts/apply-review-request.mjs',
   'scripts/operations/review-pr.mjs', 'scripts/operations/review-pr-io.mjs', 'scripts/operations/engine.mjs',
-  'scripts/operations/effect-executor.mjs', 'scripts/operations/cli-adapter.mjs', 'scripts/operations/run.mjs']);
+  'scripts/operations/effect-executor.mjs', 'scripts/operations/cli-adapter.mjs', 'scripts/operations/run.mjs',
+  // The imports of the ruling modules added in the PR #6381 self-review.
+  'scripts/operations/action-record.mjs', 'scripts/operations/action-store.mjs', 'scripts/lib/red-team-disposition.mjs',
+  'scripts/lib/review-loop-policy.mjs', 'scripts/operations/land-prevention-card.mjs', 'scripts/operations/card-batch-io.mjs',
+  'scripts/operations/detached-dispatch.mjs', 'scripts/operations/call-log-store.mjs', 'scripts/conveyor/stand-down-answer-core.mjs',
+  'scripts/conveyor/stand-down.mjs']);
+/**
+ * Settings files the floor modules decide with (PR #6381 self-review: red-team.json was read by red-team-gate.mjs but
+ * unprotected). A test reads every floor module and pins each `scripts/settings/*.json` it names onto the floor.
+ */
+const FLOOR_SETTINGS = Object.freeze([
+  'scripts/settings/red-team.json', 'scripts/settings/github-auth.json', 'scripts/settings/human-review-surfaces.json',
+  'scripts/settings/direction-aware-human.json', 'scripts/settings/review-no-verdict-retry.json', 'scripts/settings/referral-hold-auto-resolve.json',
+  'scripts/settings/gh-throttle.json', 'scripts/settings/red-main-hold.json', 'scripts/settings/prototype-load.json']);
 export const GUARD_FLOOR = Object.freeze(['scripts/**/file-locks*', 'scripts/*file-locks*', 'scripts/**/lease*', 'scripts/*lease*',
   'scripts/lib/lane-lease.mjs', 'scripts/readiness/scope-lease*',
   'scripts/**/slot*', 'scripts/*slot*', 'scripts/**/lock-reaper*', 'scripts/*lock-reaper*', 'scripts/**/lane-pool*', 'scripts/*lane-pool*',
@@ -76,7 +95,7 @@ export const GUARD_FLOOR = Object.freeze(['scripts/**/file-locks*', 'scripts/*fi
   'scripts/lib/required-status-checks.mjs', 'scripts/lib/rollup-collapse.mjs',
   'scripts/lib/review-timing.mjs', 'scripts/lib/review-policy*', 'scripts/lib/github-auth-policy.mjs', 'scripts/operations/gate-health*',
   // Review authorization and the modules it imports directly (see REVIEW_AUTH_FLOOR).
-  ...REVIEW_AUTH_FLOOR, ...REVIEW_AUTH_IMPORTS,
+  ...REVIEW_AUTH_FLOOR, ...REVIEW_AUTH_IMPORTS, ...FLOOR_SETTINGS,
   // The review settings file: carryAcrossRebase and unattendedAcceptRequiresCleanReferrals decide carries and accepts.
   'scripts/settings/review.json',
   // The auditor itself: weakening it weakens every later audit.

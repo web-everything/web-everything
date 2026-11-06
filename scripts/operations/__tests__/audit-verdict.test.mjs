@@ -578,6 +578,13 @@ describe('R473 structured concurrency evidence', () => {
       'scripts/operations/land-human-only.mjs', 'scripts/conveyor/hiccup-approve.mjs', 'scripts/settings/delivery-identity.json',
       'scripts/lib/github-app-identity.mjs', 'scripts/lib/carry-equivalence.mjs', 'scripts/lib/identical-net-patch.mjs', 'scripts/lib/numbering-carry.mjs',
       'scripts/lib/review-seat-settings.mjs', 'scripts/settings/review.json',
+      // PR #6381 self-review: ruling, license and hold modules of the review authorization family, and settings files.
+      'scripts/operations/record-red-team-ruling.mjs', 'scripts/operations/record-red-team-ruling-io.mjs',
+      'scripts/operations/record-red-team-ruling-cli.mjs', 'scripts/conveyor/standing-ruling-mark.mjs',
+      'scripts/conveyor/ruling-resolved-stand-down.mjs', 'scripts/operations/ledger-backfill-rulings.mjs',
+      'scripts/lib/human-only-enqueue-license.mjs', 'scripts/settings/human-only-enqueue.json', 'scripts/lib/approved-human-surface-hold.mjs',
+      'scripts/settings/approved-human-surface-hold.json', 'scripts/lib/pr-state/holds/verdict.mjs', 'scripts/settings/red-team.json',
+      'scripts/settings/github-auth.json', 'scripts/settings/human-review-surfaces.json',
       // A case-insensitive file system resolves these to the guard itself.
       'Scripts/Guard-Bash.mjs', 'scripts/GUARD-bash.mjs', 'SCRIPTS/LIB/LANE-LEASE.MJS',
     ])('every guard, lease, lock, gate and audit module is on the built-in floor: E1, E2 and D3 in %s never ship', async file => {
@@ -625,6 +632,33 @@ describe('R473 structured concurrency evidence', () => {
     it.each([...new Set(directImports)].sort())(
       'every direct import of the review authorization family is on the floor: E2 in %s never ships (PR #6381 red team)', async file => {
         neverShips(await compute([finding({ class: 'E2', file })], options()));
+      });
+    // PR #6381 self-review: a floor module decides with the settings file it reads (red-team-gate.mjs reads
+    // red-team.json), so weakening that file weakens the module. Every floor module is read from the source and each
+    // scripts/settings/*.json it names must be on the floor too.
+    const FLOOR_MODULES = [...new Set(GUARD_FLOOR.flatMap(entry => execFileSync('git', ['ls-files', '-z', '--', `:(glob)${entry}`],
+      { cwd: repoRoot, encoding: 'utf8', maxBuffer: 4 << 20 }).split('\0')))]
+      .filter(p => /\.m?js$/.test(p) && !/\.test\.m?js$/.test(p) && !p.includes('/__tests__/') && !p.includes('/soak/')).sort();
+    const floorSettings = [...new Set(FLOOR_MODULES.flatMap(m => [...readFileSync(`${repoRoot}${m}`, 'utf8').matchAll(/settings\/([a-z0-9-]+\.json)/g)]
+      .map(x => `scripts/settings/${x[1]}`)))].filter(p => existsSync(`${repoRoot}${p}`)).sort();
+    it('the floor-settings scan is live', () => {
+      expect(FLOOR_MODULES.length).toBeGreaterThan(100);
+      expect(floorSettings).toEqual(expect.arrayContaining(['scripts/settings/red-team.json', 'scripts/settings/github-auth.json']));
+    });
+    it.each(floorSettings)('every settings file a floor module names is on the floor: E2 in %s never ships (PR #6381 self-review)', async file => {
+      neverShips(await compute([finding({ class: 'E2', file })], options()));
+    });
+    // PR #6381 self-review: a model reading a diff or a trace reports a protected file in shapes the globs never matched.
+    it.each(['a/scripts/lib/review-independence.mjs', 'b/scripts/lib/review-independence.mjs', './a/scripts/lib/review-independence.mjs',
+      'scripts/lib/review-independence.mjs:42', 'scripts/lib/review-independence.mjs:42:7', 'scripts/lib/review-independence.mjs#L42',
+      'scripts/lib/review-independence.mjs#L42-L50', 'scripts/lib/review-independence.mjs ', ' scripts/lib/review-independence.mjs',
+      'scripts/lib/review-​independence.mjs', 'scripts/lib/ｒeview-independence.mjs', 'a/scripts/guard-bash.mjs:12', 'b/.claude/settings.json'])(
+      'a protected file reported as %j still never ships', async file => {
+        for (const stage of ['prerelease', 'prod']) neverShips(await compute([finding({ class: 'E2', file })], options(stage, { guardFloorPaths: [] })));
+      });
+    it.each(['a/scripts/output.mjs', 'scripts/output.mjs:12', 'scripts/output.mjs#L12', 'scripts/output.mjs '])(
+      'an unprotected file reported as %j still ships as debt (the stripped forms add protection, never remove a path)', async file => {
+        expect((await compute([finding({ class: 'E2', file })], options())).verdict).toBe('NOT WEAKENED');
       });
   });
 

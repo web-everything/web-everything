@@ -130,9 +130,31 @@ function payByTime(due) {
 const MAX_PATH = 512;
 /** Most globs one CALLER list may carry (the trusted lists are bounded by audit-settings: the floor plus 256 per layer). */
 const MAX_GLOBS = GUARD_FLOOR.length + 512;
-/** Repo-relative POSIX form of a reported path, or null when it cannot be established (callers fail closed). */
+/**
+ * Every repo-relative POSIX form a reported path may name, or null when it cannot be established (callers fail closed).
+ * A model reading a diff or a stack trace reports the file in shapes the floor globs never match: the git-diff side
+ * prefix (`a/scripts/x.mjs`), a line or column suffix (`x.mjs:42`, `x.mjs:42:7`, `x.mjs#L42-L50`), surrounding
+ * whitespace, a compatibility-form or invisible character (PR #6381 self-review). Each such form adds the stripped
+ * path as a further candidate; a path is protected when ANY candidate matches, so a candidate only ever protects more.
+ */
 function pathCandidates(file) {
-  if (typeof file !== 'string' || file.length > MAX_PATH || /[\u0000-\u001f]/.test(file) || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(file)) return null;
+  if (typeof file !== 'string' || file.length > MAX_PATH) return null;
+  const forms = new Set([file]);
+  const add = p => { if (p && p.length) forms.add(p); };
+  add(file.normalize('NFKC').replace(/\p{Default_Ignorable_Code_Point}/gu, ''));
+  for (const f of [...forms]) add(f.trim());
+  for (const f of [...forms]) add(f.replace(/(?::\d+){1,2}$|#L\d+(?:-L?\d+)?$/, ''));
+  for (const f of [...forms]) add(f.replace(/^\.?\/?[ab]\//, ''));
+  const out = new Set();
+  for (const f of forms) {
+    const c = pathCandidate(f);
+    if (c === null) return null;
+    out.add(c);
+  }
+  return [...out];
+}
+function pathCandidate(file) {
+  if (/[\u0000-\u001f]/.test(file) || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(file)) return null;
   let path = file.replace(/\\/g, '/');
   if (path.startsWith('/')) {
     if (!path.startsWith(REPO_ROOT.replace(/\\/g, '/'))) return null;
@@ -144,13 +166,13 @@ function pathCandidates(file) {
     if (seg === '..') { if (!parts.length) return null; parts.pop(); continue; }
     parts.push(seg);
   }
-  return parts.length ? [parts.join('/')] : null;
+  return parts.length ? parts.join('/') : null;
 }
 // Case-insensitive: the checkout may sit on a case-insensitive file system, where `Scripts/Guard-Bash.mjs` IS the guard.
-// Folding both sides only ever protects more paths.
-const matchesAny = (file, pattern) => {
-  const c = pathCandidates(file);
-  return c === null || c.some(x => matchesPath(x.toLowerCase(), pattern.toLowerCase()));
+// Folding both sides only ever protects more paths. The candidates are computed once per path, not once per glob.
+const matchesSome = (file, patterns) => {
+  const c = pathCandidates(file)?.map(x => x.toLowerCase());
+  return c === undefined || patterns.some(p => c.some(x => matchesPath(x, p.toLowerCase())));
 };
 
 export function computeVerdict(findings, options = {}) {
@@ -194,7 +216,7 @@ export function computeVerdict(findings, options = {}) {
         result.recheck.push({ ...f, class: 'X2' });
         continue;
       }
-      const protectedPath = [...GUARD_FLOOR, ...raceBlockPaths].some(p => matchesAny(f.file, p));
+      const protectedPath = matchesSome(f.file, [...GUARD_FLOOR, ...raceBlockPaths]);
       if (protectedPath && !f.class.startsWith('B')) {
         if (validInterleaving(f.interleaving)) f.class = 'B4';
         else if (f.class !== 'D1') f.class = 'X2';
@@ -205,7 +227,7 @@ export function computeVerdict(findings, options = {}) {
     // and a card on main whose pay-by is current.
     if (f.class === 'D2' && !(proveD2 && validProof(f, relationProofs, base, head) && d2Verified(f, releaseStage, { ...options, requireOnMain, requirePayBy }))) { result.blocks.push(f); continue; }
     // E findings in guard paths always block; a path that cannot be established blocks too.
-    if (f.class.startsWith('E') && [...GUARD_FLOOR, ...guardFloorPaths].some(p => matchesAny(f.file, p))) { result.blocks.push(f); continue; }
+    if (f.class.startsWith('E') && matchesSome(f.file, [...GUARD_FLOOR, ...guardFloorPaths])) { result.blocks.push(f); continue; }
     if (f.class.startsWith('B') || (releaseStage === 'prod' && f.class.startsWith('E'))) { result.blocks.push(f); continue; }
     result.ships.push(f);
     result.cards.push({ ...f, ...(f.class === 'E1' ? { outcome: 'expedite', deadlineHours: 72 }
