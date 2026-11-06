@@ -77,9 +77,10 @@ function unwrap(args, start, cwd, depth) {
   if (depth > MAX_WRAPPER_DEPTH) throw new Error(`Too many nested command wrappers (more than ${MAX_WRAPPER_DEPTH}): cannot tell what the service runs`);
   const name = basename(args[start]).toLowerCase(), loose = LOOSE_WRAPPERS.test(name);
   const owners = [place(args[start], cwd, true)];
+  const scans = [];
   let a = args, i = start + 1;
   const resume = () => { const j = a.findIndex((x, k) => k > i && isCommand(x)); return j; };
-  const unknown = at => ({ owners, unknownAt: at, wide: true, args: a, cwd });
+  const unknown = at => ({ owners, scans, unknownAt: at, wide: true, args: a, cwd });
   const dir = v => cwd ? resolve(cwd, v) : isAbsolute(v) ? v : null;
   while (i < a.length) {
     const arg = a[i];
@@ -121,7 +122,8 @@ function unwrap(args, start, cwd, depth) {
       if (nodeOptions) {
         const preloads = shellSplit(nodeOptions[1]);
         if (preloads === null) throw new Error('Unsupported NODE_OPTIONS string (unterminated quote or escape): cannot tell whether the service preloads code from the clone');
-        owners.push(...preloads.map(v => preloadOwner(v, cwd)), ...preloads.flatMap(v => argumentPaths(v, cwd)));
+        owners.push(...nodeOptionPreloads(preloads).map(v => preloadOwner(v, cwd)));
+        scans.push(...preloads.map(arg => ({ arg, cwd })));
       }
       i += 1; continue;
     }
@@ -157,10 +159,11 @@ function unwrap(args, start, cwd, depth) {
   }
   if (i >= a.length) {
     // A loose wrapper with no recognizable command: any later path might be the program.
-    return loose && start + 1 < a.length ? unknown(start + 1) : { owners, unknownAt: null, args: a, cwd };
+    return loose && start + 1 < a.length ? unknown(start + 1) : { owners, scans, unknownAt: null, args: a, cwd };
   }
   const inner = codeArguments(a, i, cwd, depth + 1);
-  return { owners: [...owners, ...inner.owners], unknownAt: inner.unknownAt, wide: inner.wide, args: inner.args, cwd: inner.cwd };
+  return { owners: [...owners, ...inner.owners], scans: [...scans, ...(inner.scans ?? [])],
+    unknownAt: inner.unknownAt, wide: inner.wide, args: inner.args, cwd: inner.cwd };
 }
 function codeArguments(args, start = 0, cwd = null, depth = 0) {
   const executable = args[start], name = basename(executable).toLowerCase();
@@ -220,9 +223,19 @@ function preloadOwner(value, cwd) {
   if (value.startsWith('file://')) { try { return fileURLToPath(value); } catch { return value; } }
   return place(value, cwd, false);
 }
+// Extract preload operands from already split NODE_OPTIONS, retaining attached and separate forms.
+function nodeOptionPreloads(tokens) {
+  const out = [];
+  for (let i = 0; i < tokens.length; i += 1) {
+    const attached = /^--(?:require|import|loader|experimental-loader)=(.+)$/.exec(tokens[i]);
+    if (attached) out.push(attached[1]);
+    else if (/^(?:-r|--require|--import|--loader|--experimental-loader)$/.test(tokens[i]) && tokens[i + 1] !== undefined) { out.push(tokens[i + 1]); i += 1; }
+  }
+  return out;
+}
 // Ownership is deliberately independent of interpreter/wrapper option grammars. Each
 // reduction is shorter, so the set reaches a fixed point without a depth cutoff.
-function argumentPaths(arg, cwd) {
+function argumentPaths(arg, cwd, symlinkOnly = false) {
   const candidates = new Set([arg]);
   for (const value of candidates) {
     const add = piece => { if (piece && piece !== value) candidates.add(piece); };
@@ -238,6 +251,10 @@ function argumentPaths(arg, cwd) {
     if (value.startsWith('file://')) { try { add(fileURLToPath(value)); } catch { /* raw argument still checked */ } }
   }
   return [...new Set([...candidates].flatMap(value => {
+    // Bare pieces peeled from flags need a real canonical hop before they prove ownership.
+    // Keep them separate so a WorkingDirectory inside the clone cannot claim a bare name.
+    if (symlinkOnly) return cwd && arg.startsWith('-') && value !== arg && !/^[+-]/.test(value)
+      && !/[\s/]/.test(value) && !/\.[\w-]+$/.test(value) ? [resolve(cwd, value)] : [];
     if (isPathArg(value)) return [expand(value)];
     // Bare command names/options are not cwd-relative paths. A slash or filename
     // extension supplies path evidence; a filename extension only counts when peeled off a flag (-rpre.rb).
@@ -303,24 +320,28 @@ function parsePlist(p, { selfLabel, plistPath }) {
   // effective argv while keeping Program authoritative over the displayed argv[0].
   // Only an explicit absolute/home-relative WorkingDirectory can anchor relative script paths.
   const wd = typeof p.WorkingDirectory === 'string' && isPathArg(p.WorkingDirectory) ? expand(p.WorkingDirectory) : null;
-  const { owners, unknownAt, cwd, wide, args: effective } = codeArguments(args, 0, wd);
+  const { owners, unknownAt, cwd, wide, args: effective, scans = [] } = codeArguments(args, 0, wd);
   const nodeOptions = p.EnvironmentVariables?.NODE_OPTIONS;
-  const allArgs = [...argv, ...args, ...effective];
+  const scanArgs = [...argv, ...args, ...effective, ...scans.map(({ arg }) => arg)];
   if (typeof nodeOptions === 'string' && nodeOptions.trim()) {
     const preloads = shellSplit(nodeOptions);
     // An unparsable NODE_OPTIONS hides what node preloads: surface it, never skip it.
     if (preloads === null) throw new Error('Unsupported NODE_OPTIONS string (unterminated quote or escape): cannot tell whether the service preloads code from the clone');
     // Keep extensionless relative preload operands anchored as before, while the
     // structural candidates below also inspect every flag and expanded token.
-    owners.push(...preloads.map(v => preloadOwner(v, wd)));
-    allArgs.push(nodeOptions, ...preloads);
+    owners.push(...nodeOptionPreloads(preloads).map(v => preloadOwner(v, wd)));
+    scanArgs.push(nodeOptions, ...preloads);
   }
   // Relative candidates belong to the service's context, never this process's cwd.
   // The policy check (dev servers) must see the EFFECTIVE argv: `env -S "node .../next dev"` is one string in
   // the plist, so the original args alone would let a dev server through as a restartable sampler.
-  return { label: p.Label, plistPath, args: [...new Set(allArgs)], unknownOption: unknownAt === null ? null : effective[unknownAt],
-    paths: [...new Set([...owners.filter(isPathArg).map(expand),
-      ...allArgs.flatMap(arg => [...argumentPaths(arg, wd), ...argumentPaths(arg, cwd)])])],
+  return { label: p.Label, plistPath, args: [...new Set([...args, ...effective])], scanArgs,
+    unknownOption: unknownAt === null ? null : effective[unknownAt],
+    codePaths: owners.filter(isPathArg).map(expand),
+    paths: [...new Set([...scanArgs.flatMap(arg => [...argumentPaths(arg, wd), ...argumentPaths(arg, cwd)]),
+      ...scans.flatMap(({ arg, cwd }) => argumentPaths(arg, cwd))])],
+    symlinkPaths: [...new Set([...scanArgs.flatMap(arg => [...argumentPaths(arg, wd, true), ...argumentPaths(arg, cwd, true)]),
+      ...scans.flatMap(({ arg, cwd }) => argumentPaths(arg, cwd, true))])],
     // After an unknown interpreter option the script is the first non-option argument, or the second
     // when that option consumed an operand; later arguments are script data, not code. After an
     // unknown WRAPPER option the program position is unbounded, so every later path is a candidate.
@@ -336,9 +357,13 @@ function decide(parsed, { root, canonRoot, canon }) {
   // canon() returns null when a path cannot be resolved (permission, loop): that path is
   // unrelated evidence we cannot link to the clone, so it does not flag the service.
   const owned = paths => paths.some(path => inside(path, root) || (canon(path) !== null && inside(canon(path), canonRoot)));
-  if (parsed.args.some(arg => arg.includes(root) || arg.includes(canonRoot)) || owned(parsed.paths)) {
-    return { label: parsed.label, plistPath: parsed.plistPath, args: parsed.args };
-  }
+  const match = { label: parsed.label, plistPath: parsed.plistPath, args: parsed.args };
+  if (owned(parsed.codePaths)) return match;
+  if (parsed.scanArgs.some(arg => arg.includes(root) || arg.includes(canonRoot)) || owned(parsed.paths)
+    || parsed.symlinkPaths.some(path => {
+      const resolved = canon(path);
+      return resolved !== null && resolved !== path && inside(resolved, canonRoot);
+    })) return match;
   // An unclassifiable option hides the script position: if a clone path follows it, say so
   // instead of silently excluding the service from restart and stale detection.
   if (parsed.unknownOption !== null && owned(parsed.unknownPaths)) {
@@ -367,9 +392,9 @@ async function scanAsync({ cloneRoot, agentsDir = join(homedir(), 'Library', 'La
     try {
       const parsed = parsePlist(await readPlist(plistPath), { selfLabel, plistPath });
       const resolved = new Map();
-      // Same laziness as the sync scan: only paths the lexical check did not already claim.
-      for (const path of parsed ? [...parsed.paths, ...parsed.unknownPaths] : []) {
-        if (inside(path, root)) continue;
+      // Lexically owned paths need no IO, except bare candidates that require proof of a symlink hop.
+      for (const path of parsed ? [...parsed.codePaths, ...parsed.paths, ...parsed.unknownPaths, ...parsed.symlinkPaths] : []) {
+        if (inside(path, root) && !parsed.symlinkPaths.includes(path)) continue;
         resolved.set(path, await canonicalAsync(path, realpath).catch(() => null));
       }
       const match = decide(parsed, { root, canonRoot, canon: path => resolved.get(path) ?? null });

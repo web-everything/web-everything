@@ -36,6 +36,7 @@ describe('launchd any-argument ownership', () => {
     ['unknown attached long flag', ['/usr/bin/other', `--option=${cloneRoot}/x`, other]],
     ['raw substring in opaque data', ['/usr/bin/other', `opaque[${cloneRoot}]`, other]],
     ['original displayed argv0', [cloneRoot, other], undefined, '/usr/bin/other'],
+    ['displayed vite argv0 does not suppress a Program-authoritative node', ['vite', `${cloneRoot}/main.js`], undefined, '/usr/bin/node'],
   ])('claims %s in discovery, restart and stale detection', async (_name, ProgramArguments, WorkingDirectory, Program) => {
     const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments, WorkingDirectory, ...(Program ? { Program } : {}) }]);
     expect(findServicesRunningFromClone(o)).toMatchObject({ matches: [{ label: 'com.we.resource-sampler' }], unreadable: [] });
@@ -61,6 +62,34 @@ describe('launchd any-argument ownership', () => {
       EnvironmentVariables: { NODE_OPTIONS: `--unknown=-r${cloneRoot}/pre.rb` } }]);
     expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
     expect((await restartServicesForClone(o)).restarted).toHaveLength(1);
+  });
+  it.each(['--require=bootstrap', '--require bootstrap', '-r bootstrap'])(
+    'anchors extensionless NODE_OPTIONS preload operands for plist and env: %s', async options => {
+      for (const plist of [
+        { ProgramArguments: ['/usr/bin/node', other], EnvironmentVariables: { NODE_OPTIONS: options } },
+        { ProgramArguments: ['/usr/bin/env', `NODE_OPTIONS=${options}`, '/usr/bin/node', other] },
+      ]) {
+        const o = fixture([{ Label: 'com.we.resource-sampler', WorkingDirectory: cloneRoot, ...plist }]);
+        expect(findServicesRunningFromClone(o)).toMatchObject({ matches: [{ label: 'com.we.resource-sampler' }], unreadable: [] });
+        expect((await restartServicesForClone(o)).restarted).toHaveLength(1);
+      }
+    });
+  it.each([
+    ['symlink into clone', resolve('..', 'work'), 'clone', true],
+    ['plain directory inside clone', cloneRoot, 'identity', false],
+    ['symlink outside clone', resolve('..', 'work'), 'outside', false],
+    ['unreadable symlink', resolve('..', 'work'), 'unreadable', false],
+  ])('peeled bare -Ilib ownership requires a canonical hop into clone: %s', async (_name, WorkingDirectory, mode, owned) => {
+    const candidate = join(WorkingDirectory, 'lib');
+    const realpath = path => {
+      if (path !== candidate || mode === 'identity') return path;
+      if (mode === 'unreadable') throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+      return mode === 'clone' ? join(cloneRoot, 'lib') : resolve('..', 'outside', 'lib');
+    };
+    const o = { ...fixture([{ Label: 'com.we.resource-sampler', WorkingDirectory,
+      ProgramArguments: ['/usr/bin/perl', '-Ilib', other] }]), realpath };
+    expect(findServicesRunningFromClone(o)).toMatchObject({ matches: owned ? [{ label: 'com.we.resource-sampler' }] : [], unreadable: [] });
+    expect((await restartServicesForClone({ ...o, realpath: async path => realpath(path) })).restarted).toHaveLength(owned ? 1 : 0);
   });
   it('leaves an unrelated outside path with no clone mention unowned', () => {
     expect(findServicesRunningFromClone(fixture([{ Label: 'com.we.resource-sampler',
@@ -789,9 +818,12 @@ describe('launchd clone ownership: interpreter options and filesystem aliases', 
   ])('unknown option still claims clone mentions in script data: %s', (_n, ProgramArguments) => {
     expect(findServicesRunningFromClone(fixture([{ ...sampler, ProgramArguments }]))).toEqual({ matches: [expect.objectContaining({ label: 'com.we.resource-sampler' })], unreadable: [] });
   });
-  it('unknown option followed by an operand then a clone script is owned', () => {
-    const o = fixture([{ ...sampler, ProgramArguments: ['/usr/local/bin/node', '--made-up-option', '512', join(cloneRoot, 'sampler.mjs')] }]);
-    expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
+  it.each([
+    ['operand then clone script', ['512', join(cloneRoot, 'sampler.mjs')]],
+    ['clone vite script before policy', [join(cloneRoot, 'vite')]],
+  ])('unknown option plus a clone argument is owned by the any-argument rule (fail closed): %s', (_name, tail) => {
+    const o = fixture([{ ...sampler, ProgramArguments: ['/usr/local/bin/node', '--made-up-option', ...tail] }]);
+    expect(findServicesRunningFromClone(o)).toMatchObject({ matches: [{ label: sampler.Label }], unreadable: [] });
   });
 });
 
