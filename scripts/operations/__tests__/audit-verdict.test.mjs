@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { URL as NodeURL, fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
-import { GUARD_FLOOR, REVIEW_AUTH_FLOOR } from '../../lib/audit-settings.mjs';
+import { GUARD_FLOOR, LOCK_PRIMITIVES, REVIEW_AUTH_FLOOR } from '../../lib/audit-settings.mjs';
 import { findingFingerprint, proofFingerprint, readCardFromMain } from '../audit-verdict.mjs';
 
 // R473 stage 1 deliberately supplies tests only. Stage 2 supplies the implementation;
@@ -194,13 +194,57 @@ describe('R473 pure classified verdict', () => {
       }
     }
   });
+  // PR #6381 red team: fix-claim-store.mjs builds the `(repo, kind, pr)` lock key of the fix dispatch claim, yet its name
+  // holds no floor word, so a D3 claim-key race there cleared as NOT WEAKENED.
+  it('a D3 claim-key race in scripts/conveyor/fix-claim-store.mjs never clears as NOT WEAKENED (PR #6381 red team)', async () => {
+    for (const stage of ['prerelease', 'prod']) {
+      for (const extra of [{ interleaving: [{ actor: 'A', action: 'Acquires the PR claim at H1 and starts a fixer' },
+        { actor: 'A', action: 'Pushes H2 while still running' }, { actor: 'B', action: 'Acquires the separate H2 claim and starts another fixer' }] }, {}]) {
+        const f = finding({ id: 'claim-key-race', class: 'D3', file: 'scripts/conveyor/fix-claim-store.mjs', line: 43,
+          invariant: 'One live dispatch per repo/kind/PR', relation: 'introduced',
+          trigger: 'Add headSha to fixDispatchResource so a running fixer can rotate its own claim key',
+          consequence: 'A second dispatcher starts another fixer for the same PR while the first is live', ...extra });
+        const result = await compute([f], options(stage));
+        expect(result.verdict).toBe('WEAKENED');
+        expect(result.ships).toEqual([]);
+        expect(result.cards).toEqual([]);
+        if (extra.interleaving) expect(result.blocks).toEqual([expect.objectContaining({ id: 'claim-key-race', class: 'B4' })]);
+      }
+    }
+  });
+  // The class behind it: a module that takes a lock decides the lock's key and its holder, whatever its name. Every
+  // tracked module that imports a lock primitive directly is read from the source here and must be on the floor, so a
+  // new lock user can never stay unprotected because its name holds no floor word.
+  const lockScanRoot = fileURLToPath(new NodeURL('../../../', import.meta.url));
+  const LOCK_USERS = execFileSync('git', ['ls-files', '-z', '--', ':(glob)scripts/**/*.mjs', ':(glob)skills-src/**/*.mjs'],
+    { cwd: lockScanRoot, encoding: 'utf8', maxBuffer: 8 << 20 }).split('\0').filter(Boolean)
+    .filter(p => !p.includes('/__tests__/') && !/\.test\.mjs$/.test(p) && !LOCK_PRIMITIVES.includes(p))
+    .filter(p => [...readFileSync(`${lockScanRoot}${p}`, 'utf8')
+      .matchAll(/\b(?:from\s*|import\s*\(\s*|import\s+)['"](\.\.?\/[^'"\r\n]+)['"]/g)]
+      .some(m => LOCK_PRIMITIVES.includes(fileURLToPath(new NodeURL(m[1], new NodeURL(p, `file://${lockScanRoot}`))).slice(lockScanRoot.length))))
+    .sort();
+  it('the lock-user scan is live: it finds the claim stores and every primitive is a real file (PR #6381 red team)', () => {
+    expect(LOCK_PRIMITIVES.filter(p => !existsSync(`${lockScanRoot}${p}`))).toEqual([]);
+    expect(LOCK_USERS.length).toBeGreaterThan(20);
+    expect(LOCK_USERS).toEqual(expect.arrayContaining(['scripts/conveyor/fix-claim-store.mjs', 'scripts/conveyor/fix-dispatch-claim.mjs',
+      'scripts/conveyor/build-dispatch-claim.mjs', 'scripts/operations/tick-mutex.mjs', 'skills-src/conveyor/build-dispatch-daemon.mjs']));
+  });
+  it.each([...LOCK_PRIMITIVES, ...LOCK_USERS])('every lock primitive and every module that imports one is on the floor: E2 and D3 in %s never ship', async file => {
+    for (const cls of ['E2', 'D3']) {
+      for (const stage of ['prerelease', 'prod']) {
+        const result = await compute([finding({ class: cls, file })], options(stage, { guardFloorPaths: [], raceBlockPaths: [] }));
+        expect(result.verdict).toBe('WEAKENED');
+        expect(result.ships).toEqual([]);
+      }
+    }
+  });
   // The anywhere-in-basename globs also capture files whose name holds the word inside another word (`release` holds
   // `lease`), tests and golden-corpus data. Protecting more only ever blocks more, so this over-capture is accepted.
   // Every tracked file the wide form captures and the old start-of-name form did not is derived from git and listed.
   const overCaptureRoot = fileURLToPath(new NodeURL('../../../', import.meta.url));
   const tracked = spec => execFileSync('git', ['ls-files', '-z', '--', spec], { cwd: overCaptureRoot, encoding: 'utf8', maxBuffer: 4 << 20 })
     .split('\0').filter(Boolean);
-  const WORDS = ['file-locks', 'lease', 'slot', 'lock-reaper', 'lane-pool', 'merge', 'drain', 'mq'];
+  const WORDS = ['file-locks', 'lease', 'slot', 'lock-reaper', 'lane-pool', 'merge', 'drain', 'mq', 'claim', 'mutex'];
   const OVER_CAPTURE = [...new Set(WORDS.flatMap(w => {
     const prefixOnly = new Set([...tracked(`:(glob)scripts/**/${w}*`), ...tracked(`:(glob)scripts/${w}*`)]);
     return tracked(`:(glob)scripts/**/*${w}*`).filter(p => !prefixOnly.has(p));

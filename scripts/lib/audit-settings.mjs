@@ -89,15 +89,44 @@ const FLOOR_SETTINGS = Object.freeze([
   'scripts/settings/stand-down.json', 'scripts/settings/fix.json', 'scripts/review-settings.json', 'scripts/dispatch-settings.*',
   'scripts/lib/delivery-platform-preferences.json', 'scripts/lib/delivery-priority-settings.json', 'scripts/lib/poc-branches.json',
   'scripts/exec-output-baseline.json', 'scripts/pr-comment-read-baseline.json', 'scripts/check-standards.contract.json',
-  'scripts/lib/dispatch-routing-policy.json', 'scripts/ci/test-timings.json', 'scripts/lib/model-probation.json', 'scripts/lib/swept-repos.json']);
+  'scripts/lib/dispatch-routing-policy.json', 'scripts/ci/test-timings.json', 'scripts/lib/model-probation.json', 'scripts/lib/swept-repos.json',
+  // Read by the lock users added in the PR #6381 red team (the rebuild job and the coroner jobs).
+  'scripts/lib/daemon-rebuild-settings.json', 'scripts/settings/coroner.json', 'scripts/settings/coroner-postmortem.json']);
+/**
+ * The lock primitives: the modules that take an exclusive hold (file-locks.mjs reserves a lock entry, with-lock.mjs
+ * wraps it, coordination-lock.mjs takes the coordination lease). A test reads every tracked module and pins each one
+ * that imports a primitive directly onto the floor (PR #6381 red team: fix-claim-store.mjs builds the fix dispatch
+ * claim's lock key, but its name holds no floor word).
+ */
+export const LOCK_PRIMITIVES = Object.freeze(['scripts/readiness/file-locks.mjs', 'scripts/readiness/with-lock.mjs',
+  'scripts/operations/coordination-lock.mjs']);
+/** Every tracked module that imports a lock primitive directly (the source-scan test pins this list complete). */
+const LOCK_USERS = Object.freeze([
+  'scripts/conveyor/await-verify-loop.mjs', 'scripts/conveyor/build-dispatch-claim.mjs', 'scripts/conveyor/build-dispatch-hold-router.mjs',
+  'scripts/conveyor/fix-claim-store.mjs', 'scripts/conveyor/fix-dispatch-claim.mjs', 'scripts/conveyor/fix-procedure.mjs',
+  'scripts/conveyor/land-overlap-yield.mjs', 'scripts/conveyor/nightly-coroner-job.mjs', 'scripts/conveyor/resolve-runner-checkout.mjs',
+  'scripts/conveyor/soak/breaks/lease-reaper-borrowed-fixer-pid-invisible.mjs', 'scripts/held-cards-io.mjs',
+  'scripts/lib/daemon-clone-lock.mjs', 'scripts/lib/daemon-rebuild/overlay-main-sync.mjs', 'scripts/lib/daemon-rebuild/rebuild-job.mjs',
+  'scripts/lib/fix-slot-borrow.mjs', 'scripts/lib/gh-throttle-holders.mjs', 'scripts/lib/gh-throttle.mjs',
+  'scripts/lib/merge-queue-adaptive-batching.mjs', 'scripts/lib/target-registry.mjs', 'scripts/lib/verdict-ledger-outbox-spool.mjs',
+  'scripts/lib/verdict-ledger.mjs', 'scripts/operations/action-ground-truth.mjs', 'scripts/operations/action-store.mjs',
+  'scripts/operations/completion-store.mjs', 'scripts/operations/coroner-pr-postmortem.mjs', 'scripts/operations/daemon-status-io.mjs',
+  'scripts/operations/free-scope-io.mjs', 'scripts/operations/land-advance-gate.mjs', 'scripts/operations/restart-runner-io.mjs',
+  'scripts/operations/runner-activity-io.mjs', 'scripts/operations/tick-mutex.mjs', 'scripts/operations/tick-throttle.mjs',
+  'scripts/readiness/drain-lock.mjs', 'scripts/readiness/file-locks-cli.mjs', 'scripts/readiness/forge-remote-health.mjs',
+  'scripts/readiness/forge-slot-markers.mjs', 'scripts/readiness/heavy-admission.mjs', 'scripts/review-runner.mjs', 'scripts/verify-lane.mjs',
+  'skills-src/conveyor/build-dispatch-daemon.mjs', 'skills-src/conveyor/runner-lock.mjs']);
 // The concurrency words match ANYWHERE in the basename (`forge-slot-markers.mjs`, `lane-worker-without-lease.mjs`), not
 // only at its start (PR #6381 send-back). `**/` needs at least one folder, so each entry has a twin for scripts/ itself.
 // This also protects names holding the word inside another word (`release` holds `lease`): protecting more only ever
 // blocks more, and the audit-verdict test lists that over-capture.
-export const GUARD_FLOOR = Object.freeze(['scripts/**/*file-locks*', 'scripts/*file-locks*', 'scripts/**/*lease*', 'scripts/*lease*',
+// A Set: the lock users repeat a few modules other entries already name.
+export const GUARD_FLOOR = Object.freeze([...new Set(['scripts/**/*file-locks*', 'scripts/*file-locks*', 'scripts/**/*lease*', 'scripts/*lease*',
   'scripts/lib/lane-lease.mjs', 'scripts/readiness/scope-lease*',
   'scripts/**/*slot*', 'scripts/*slot*', 'scripts/**/*lock-reaper*', 'scripts/*lock-reaper*', 'scripts/**/*lane-pool*', 'scripts/*lane-pool*',
   'scripts/**/*merge*', 'scripts/*merge*', 'scripts/**/*drain*', 'scripts/*drain*', 'scripts/**/*mq*', 'scripts/*mq*',
+  // Claims and mutexes are locks too (PR #6381 red team: the fix dispatch claim store).
+  'scripts/**/*claim*', 'scripts/*claim*', 'scripts/**/*mutex*', 'scripts/*mutex*', ...LOCK_PRIMITIVES, ...LOCK_USERS,
   'scripts/*-lock.mjs', 'scripts/**/*-lock.mjs', 'scripts/**/with-lock*', 'skills-src/**/*-lock.mjs',
   'scripts/guard-*', 'scripts/**/guard-*', 'scripts/*-guard*', 'scripts/**/*-guard*', 'scripts/guarded-*', 'scripts/**/guarded-*',
   '.claude/settings.json', '.githooks/', 'scripts/lib/git-hook-surface.mjs', 'scripts/lib/permission-change.mjs',
@@ -114,7 +143,7 @@ export const GUARD_FLOOR = Object.freeze(['scripts/**/*file-locks*', 'scripts/*f
   'scripts/settings/review.json',
   // The auditor itself: weakening it weakens every later audit.
   'scripts/operations/audit-verdict.mjs', 'scripts/operations/codex-audit*', 'scripts/lib/audit-settings.mjs',
-  'scripts/lib/policy-cascade.mjs', 'scripts/settings/codex-audit.json']);
+  'scripts/lib/policy-cascade.mjs', 'scripts/settings/codex-audit.json'])]);
 /** What an invalid or unreadable path list resolves to: the floor plus every path (`**` matches any path). */
 const STRICTEST_PATHS = Object.freeze([...GUARD_FLOOR, '**']);
 
