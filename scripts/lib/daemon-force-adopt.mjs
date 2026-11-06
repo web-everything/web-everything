@@ -94,11 +94,38 @@ const watchUnreadable = (root, env) => {
 /** Rollbacks owed but whose marker could not be written to disk, keyed by watch path (this process only). Each entry keeps the
  *  whole watch, so the obligation survives a lost or unreadable watch file. */
 const pendingRollbacks = new Map();
-const clearWatch = (root, env) => { pendingRollbacks.delete(watchPath(root, env)); removeQuietly(watchPath(root, env)); };
+/** A watch that MOVED onto an unsmoked successor (carry / rebind) but whose write to disk failed, keyed by watch path (this process
+ *  only). The disk still holds the stale pre-move record (old sha, declared `carryTo`); without this overlay every later tick would
+ *  re-derive the move in memory, find the stale disk record "not the same watch" and return `none` forever, so an unhealthy successor
+ *  would never be rolled back. The overlay is the watch the ticks decide from until the disk catches up. */
+const unsavedMoves = new Map();
+const clearWatch = (root, env) => { const p = watchPath(root, env); pendingRollbacks.delete(p); unsavedMoves.delete(p); removeQuietly(p); };
+/** Write a moved watch; when the disk refuses it, keep it in memory instead (see {@link unsavedMoves}). Returns true when it landed. */
+function saveMoved(root, env, moved) {
+  const p = watchPath(root, env);
+  try { writeJson(p, moved); unsavedMoves.delete(p); return true; } catch { unsavedMoves.set(p, moved); return false; }
+}
+/** Best-effort write of a watch the tick updated (ticks left, adoptedSeen): when it fails and the watch is one kept in memory, the
+ *  updated copy replaces it, so a countdown still progresses. Never throws. */
+function persistWatch(root, env, w) {
+  const p = watchPath(root, env);
+  try { writeJson(p, w); unsavedMoves.delete(p); } catch { const kept = unsavedMoves.get(p); if (kept && kept.sha === w.sha) unsavedMoves.set(p, w); }
+}
 /** The in-process marker applies only to the build it was recorded for: a later watch on the same path starts clean. */
 const pendingFor = (root, env, sha) => { const p = pendingRollbacks.get(watchPath(root, env)); return p && p.sha === sha ? p.reason : undefined; };
 /** The watch on disk, else the one an unsaved obligation is kept for in memory (a rollback owed must not vanish with its file). */
-const currentWatch = (root, env) => readForceWatch(root, env) ?? pendingRollbacks.get(watchPath(root, env))?.watch ?? null;
+function currentWatch(root, env) {
+  const p = watchPath(root, env);
+  const disk = readForceWatch(root, env);
+  const moved = unsavedMoves.get(p);
+  if (moved) {
+    // The in-memory move wins only while the disk still holds the SAME forced adoption at its stale pre-move sha, or cannot be read at
+    // all (fail closed). A disk that caught up, was cleared, or holds another force never has its record shadowed.
+    if (disk ? disk.startedAt === moved.startedAt && disk.sha !== moved.sha : watchUnreadable(root, env)) return moved;
+    unsavedMoves.delete(p);
+  }
+  return disk ?? pendingRollbacks.get(p)?.watch ?? null;
+}
 
 /** Why a new force-adopt cannot start for this clone right now, else null. The ONE place these refusals live: the prepare step's
  *  sticky-rejection bypass asks it too, so a force that `recordForcedAdoption` would refuse never triggers a full re-smoke per tick.
@@ -207,12 +234,12 @@ export async function carryForceWatch({ root, env = process.env, fromSha, toSha,
   const moved = { ...rest, sha: toSha };
   const pending = pendingRollbacks.get(path);
   if (pending && (pending.sha === fromSha || pending.sha === watch.sha)) pendingRollbacks.set(path, { ...pending, sha: toSha, watch: { ...pending.watch, sha: toSha } });
-  try { writeJson(path, moved); } catch {
-    if (!pending) {
-      // Not saved and nothing keeps it in memory: say so where an operator reads it, never a silent loss of rollback protection.
-      appendLine(handoffFile(env), `- FORCE-ADOPT ${new Date().toISOString()} ${watch.daemon} ${watch.ruling}: force-adopt-watch-carry-failed ${fromSha} -> ${toSha}; the watch could not be moved onto the unsmoked successor\n`);
-      return false;
-    }
+  // A write the disk refuses is kept in memory (see unsavedMoves), so a tick in this process still guards the successor; a tick in
+  // another process re-derives the move from the declared `carryTo` still on disk.
+  if (!saveMoved(root, env, moved) && !pending) {
+    // Not saved and nothing owed in memory: say so where an operator reads it, never a silent loss of rollback protection.
+    appendLine(handoffFile(env), `- FORCE-ADOPT ${new Date().toISOString()} ${watch.daemon} ${watch.ruling}: force-adopt-watch-carry-failed ${fromSha} -> ${toSha}; the watch could not be moved onto the unsmoked successor\n`);
+    return false;
   }
   await emit?.({ kind: 'force-adopt-watch-carried', daemon: watch.daemon, detail: { ruling: watch.ruling, from: fromSha, to: toSha } });
   return true;
@@ -247,7 +274,7 @@ function rebindToCarry(root, env, watch) {
   const p = watchPath(root, env);
   const pending = pendingRollbacks.get(p);
   if (pending && pending.sha === watch.sha) pendingRollbacks.set(p, { ...pending, sha: carryTo, watch: { ...pending.watch, sha: carryTo } });
-  try { writeJson(p, moved); } catch { /* the next tick re-derives it; an owed rollback is still kept in memory above */ }
+  saveMoved(root, env, moved); // a write the disk refuses stays in memory: ticks keep deciding from `moved`, never from the stale disk record
   return moved;
 }
 
@@ -281,7 +308,7 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   const first = readHead(); // lazy: no git call unless a watch exists
   const head = first.head;
   // State writes here are best-effort: a failed write must never stop the health check or the rollback that follows.
-  const persist = (w) => { try { writeJson(watchPath(root, env), w); } catch { /* the next tick re-derives it */ } };
+  const persist = (w) => persistWatch(root, env, w);
   // An unsmoked successor adoption declared this move (`carryTo`) before it reset HEAD: HEAD on that successor is the SAME watched
   // code, not a superseding build, so rebind to it here (the adopting process's own carry may not have run yet, or may have died).
   if (watch.carryTo && head !== null && head === watch.carryTo) watch = rebindToCarry(root, env, watch);

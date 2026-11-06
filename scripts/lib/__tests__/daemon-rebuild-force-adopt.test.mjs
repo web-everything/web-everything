@@ -685,4 +685,20 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     expect(readForceWatch(cloneDir, env)).toMatchObject({ sha: target, ticksLeft: 4, adoptedSeen: true });
     expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8')).not.toMatch(/force-adopt-rolled-back/);
   });
+
+  it('the default health probe fails a forced build whose tracked tree was modified (dirty-tree check): never counted healthy', async () => {
+    const { base, originDir, cloneDir, env: env0 } = makeFixture();
+    const env = forceEnv(env0, base);
+    // Loadable entry module AND a second tracked file: only the tree check can tell this clone from a healthy one.
+    const target = advanceMain(originDir, (dir) => { writeFile(dir, 'scripts/lib/daemon-rebuild.mjs', 'export const ok = true;\n'); writeFile(dir, 'tracked.txt', 'clean\n'); });
+    expect(requestForceAdopt({ root: cloneDir, env, daemon: 'review', ruling: 'R508', quote: QUOTE, sha: target, rulingsText: RULINGS }).ok).toBe(true);
+    await tick(cloneDir, env, { runSmoke: failing() });
+    expect(headOf(cloneDir)).toBe(target);
+    writeFileSync(join(cloneDir, 'tracked.txt'), 'locally modified\n'); // tracked file modified after the adoption
+    await tick(cloneDir, env, { runSmoke: passing() }); // no forceWatchProbe injected: the real default probe runs
+    // not healthy: the watch did not count down (a healthy tick leaves ticksLeft 4); it either rolled back or still owes the revert
+    expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8')).toMatch(/force-adopt-rolled-back|force-adopt-rollback-failed/);
+    const w = readForceWatch(cloneDir, env);
+    if (w) expect(w).toMatchObject({ sha: target, rollbackPending: 'health-failed' });
+  });
 });

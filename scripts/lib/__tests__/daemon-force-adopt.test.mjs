@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { writeReadyCandidate, readReadyCandidate } from '../daemon-rebuild/state.mjs';
-import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync, chmodSync, readdirSync as nodeFsReaddir } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, existsSync, writeFileSync, chmodSync, readdirSync as nodeFsReaddir } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -361,6 +361,74 @@ describe('carryForceWatch: a successor adopted without its own smoke inherits th
     try { expect(await carryForceWatch({ root, env, fromSha: 'b'.repeat(40), toSha: 'd'.repeat(40) })).toBe(false); } finally { chmodSync(env.WE_DAEMON_STATE_DIR, 0o700); }
     expect(readFileSync(env.WE_FORCE_ADOPT_HANDOFF, 'utf8')).toMatch(/force-adopt-watch-carry-failed b{40} -> d{40}/);
     expect(readForceWatch(root, env)).toMatchObject({ sha: 'b'.repeat(40) });
+  });
+  describe('a watch move that cannot be persisted never suppresses the rollback of an unhealthy successor', () => {
+    const B = 'b'.repeat(40); const D = 'd'.repeat(40);
+    const tmpOf = () => `${join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(root)}.force-watch.json`)}.${process.pid}.tmp`;
+    // every watch write fails (the atomic temp path is occupied by a directory) while the rest of the state dir stays writable
+    const breakWrites = () => mkdirSync(tmpOf());
+    const fixWrites = () => rmSync(tmpOf(), { recursive: true, force: true });
+    const seen = async () => runForceWatchTick({ root, env, currentHead: B, probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async () => {} });
+    it('rebind write fails (declared intent on disk, HEAD on the successor): the unhealthy successor is still rolled back, and a recovered disk converges', async () => {
+      await rec(); await seen();
+      expect(declareForceCarry({ root, env, fromSha: B, toSha: D })).toBe(true);
+      breakWrites();
+      const rollback = vi.fn(async () => ({ ok: true }));
+      const r = await runForceWatchTick({ root, env, currentHead: () => D, probe: async () => ({ healthy: false }), rollback, emit: async () => {} });
+      expect(r).toMatchObject({ action: 'rollback', reason: 'health-failed' });
+      expect(rollback).toHaveBeenCalledWith({ head: 'a'.repeat(40) }, { sha: D });
+    });
+    it('rebind write fails on a healthy tick: ticks still count down on the successor instead of returning "none" forever, and the move lands once the disk recovers', async () => {
+      await rec(); await seen();
+      declareForceCarry({ root, env, fromSha: B, toSha: D });
+      breakWrites();
+      const healthyTick = () => runForceWatchTick({ root, env, currentHead: () => D, probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async () => {} });
+      expect((await healthyTick()).action).toBe('continue');
+      expect((await healthyTick()).action).toBe('continue');
+      fixWrites();
+      expect((await healthyTick()).action).toBe('continue');
+      expect(readForceWatch(root, env)).toMatchObject({ sha: D, ticksLeft: 1 });
+      expect(readForceWatch(root, env).carryTo).toBeUndefined();
+    });
+    it('carry write fails after a declared intent: the next tick on the successor rolls back an unhealthy build', async () => {
+      await rec(); await seen();
+      declareForceCarry({ root, env, fromSha: B, toSha: D });
+      breakWrites();
+      expect(await carryForceWatch({ root, env, fromSha: B, toSha: D })).toBe(false);
+      const rollback = vi.fn(async () => ({ ok: true }));
+      const r = await runForceWatchTick({ root, env, currentHead: () => D, probe: async () => ({ healthy: false }), rollback, emit: async () => {} });
+      expect(r).toMatchObject({ action: 'rollback' });
+      expect(rollback).toHaveBeenCalledTimes(1);
+    });
+    it('runForceWatchTick forwards the probe restart count: a healthy probe reporting a crash loop is rolled back', async () => {
+      await rec();
+      const rollback = vi.fn(async () => ({ ok: true }));
+      const r = await runForceWatchTick({ root, env, currentHead: B, probe: async () => ({ healthy: true, restarts: 3 }), rollback, emit: async () => {} });
+      expect(r).toMatchObject({ action: 'rollback', reason: 'crash-loop' });
+      expect(rollback).toHaveBeenCalledTimes(1);
+    });
+    it('an owed rollback survives a failed rebind write too (kept in memory, retried every tick)', async () => {
+      await rec();
+      await runForceWatchTick({ root, env, currentHead: B, probe: async () => ({ healthy: false }), rollback: async () => ({ ok: false }), emit: async () => {} });
+      declareForceCarry({ root, env, fromSha: B, toSha: D });
+      breakWrites();
+      const rollback = vi.fn(async () => ({ ok: false }));
+      const r = await runForceWatchTick({ root, env, currentHead: () => D, probe: async () => ({ healthy: true }), rollback, emit: async () => {} });
+      expect(r).toMatchObject({ action: 'rollback-failed', reason: 'health-failed' });
+      expect(rollback).toHaveBeenCalledWith({ head: 'a'.repeat(40) }, { sha: D });
+    });
+    it('a force for another build replaces a stale in-memory move: the overlay never shadows a different watch on disk', async () => {
+      await rec(); await seen();
+      declareForceCarry({ root, env, fromSha: B, toSha: D });
+      breakWrites();
+      await runForceWatchTick({ root, env, currentHead: () => D, probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async () => {} });
+      fixWrites();
+      rmSync(join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(root)}.force-watch.json`), { force: true });
+      await recordForcedAdoption({ root, env, request: { daemon: 'review', ruling: 'R508', quote: QUOTE }, sha: 'c'.repeat(40),
+        lastGood: { head: 'a'.repeat(40) }, smoke: { verdict: 'code', failed: [] }, emit: async () => {} });
+      expect(forceWatchGuards({ root, env, sha: D })).toBe(false);
+      expect(readForceWatch(root, env)).toMatchObject({ sha: 'c'.repeat(40) });
+    });
   });
   it('forceWatchGuards: true only for the watched sha (or its declared successor); false with no watch or another sha', async () => {
     expect(forceWatchGuards({ root, env, sha: 'b'.repeat(40) })).toBe(false); // no watch yet
