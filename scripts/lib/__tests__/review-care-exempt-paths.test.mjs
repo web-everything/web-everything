@@ -129,6 +129,42 @@ describe('R641 care exemptions', () => {
     expect(result.humanRequired).toBe(true);
   });
 
+  // #6433 red team: the hunks describe the CUMULATIVE basis only. Exempt lines are subtracted per basis, then
+  // the max is taken, so an ancestor's exempt lines can never hide the child's own non-exempt delta.
+  it('keeps a stacked child own non-exempt delta when the ancestor added exempt lines', () => {
+    const result = scoreEscalation({ changedFiles: ['app.js'], diffLines: 500,
+      humanBasisFiles: [timings, 'app.js'], cumulativeDiffLines: 1100,
+      diffHunks: section(timings, 1000) + section('app.js', 100) });
+    expect(result.signals.size).toBe(500);
+    expect(result.escalate).toBe(true);
+    expect(result.careLevel).not.toBe('none');
+  });
+
+  it('does not subtract from a stacked own delta with the same file set but a different line split', () => {
+    // Own: app.js 500 + timings 300 = 800. Cumulative: app.js 100 + timings 700 = 800. Equal sets and totals,
+    // yet the cumulative timings count says nothing about the own delta's split.
+    const result = scoreEscalation({ changedFiles: [timings, 'app.js'], diffLines: 800,
+      humanBasisFiles: [timings, 'app.js'], cumulativeDiffLines: 800,
+      diffHunks: section(timings, 700) + section('app.js', 100) });
+    expect(result.signals.size).toBe(800);
+  });
+
+  it('still clears a stacked child whose own delta is exempt files only', () => {
+    const result = scoreEscalation({ changedFiles: [timings], diffLines: 1000,
+      humanBasisFiles: [timings, 'app.js'], cumulativeDiffLines: 1010,
+      diffHunks: section(timings, 1000) + section('app.js', 10) });
+    expect(result.signals.size).toBeUndefined();
+  });
+
+  it('subtracts exempt lines when the own delta IS the cumulative basis (non-stacked net-diff shape)', () => {
+    // computeNetDiffChangedFiles / the gh fallback hand the SAME list for both bases when nothing is stacked.
+    const files = [timings, 'app.js'];
+    const result = scoreEscalation({ changedFiles: files, diffLines: 1010, humanBasisFiles: files,
+      cumulativeDiffLines: 1010, diffHunks: section(timings, 1000) + section('app.js', 10) });
+    expect(result.signals.size).toBeUndefined();
+    expect(result.careLevel).toBe('none');
+  });
+
   it('counts additions and removals without subtracting diff headers', () => {
     const diffHunks = `diff --git a/${timings} b/${timings}\n--- a/${timings}\n+++ b/${timings}\n@@ -1,250 +1,250 @@\n${'-old\n'.repeat(250)}${'+new\n'.repeat(250)}`;
     expect(scoreEscalation({ changedFiles: [timings, 'app.js'], diffLines: 900, diffHunks }).signals.size).toBe(400);
@@ -162,7 +198,24 @@ describe('R641 care exemptions', () => {
 
 describe('care exemption settings resolver', () => {
   const broadGlobs = ['scripts/**/*', 'scripts/**/**', 'scripts/*', '**/*', '*/**',
-    'scripts/g*.mjs', 'scripts/[ab]/**', 'scripts/?/file.json', 's*/lib/**'];
+    'scripts/g*.mjs', 'scripts/[ab]/**', 'scripts/?/file.json', 's*/lib/**',
+    // #6433 red team: compound or regex-metacharacter spellings widen reach — only a plain character set passes.
+    'scripts/ci/**|scripts/**', 'scripts/ci/a.json|app.js', 'scripts/ci/x|**', 'scripts/ci/+(a|b)/**',
+    'scripts/ci/@(**)', 'scripts/ci/$x.json', 'scripts/ci/^x.json', 'scripts/ci/a,b.json', 'scripts/ci/ä.json',
+    'scripts/ci/a b.json', 'scripts/ci/[a-z]*.json'];
+
+  it('a piped scope cannot exempt scripts/** through the environment (live repro)', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { value } = resolveReviewCareExemptPaths({ readFile: () => '{}', log: () => {},
+        env: { WE_REVIEW_CARE_EXEMPT_PATHS: '["scripts/ci/**|scripts/**"]' } });
+      const result = scoreEscalation({ changedFiles: ['scripts/lib/under-test.mjs'], diffLines: 1000,
+        careExemptPaths: value });
+      expect(result.careLevel).toBe('high');
+      expect(result.escalate).toBe(true);
+      expect(result.signals.careExempt).toBeUndefined();
+    } finally { warn.mockRestore(); }
+  });
 
   it.each(broadGlobs)('refuses shallow matching scope %s directly and through every settings layer', glob => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});

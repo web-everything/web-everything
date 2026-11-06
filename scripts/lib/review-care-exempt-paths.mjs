@@ -33,9 +33,12 @@ export function validateCareExemptPaths(value, { warn = m => console.warn(m) } =
   const validGlob = glob => {
     if (typeof glob !== 'string' || !glob.trim() || glob !== glob.trim()) return false;
     if (glob === '**/fixtures/**') return true;
-    if (/[\p{Cc}\p{Cf}\\!{}()]/u.test(glob) || glob.startsWith('/')
+    // Allow-list, not a deny-list: only plain path characters and the `*`/`?` wildcards. Every glob or regex
+    // metacharacter that can widen reach (`|` alternation, extglob `+@!`, braces, brackets, `$^`, non-ASCII,
+    // whitespace, control and format characters) is refused rather than enumerated (#6433 red team).
+    if (!/^[A-Za-z0-9._\-/*?]+$/.test(glob) || glob.startsWith('/')
       || glob.split('/').some(s => s === '..' || s === '.' || !s)) return false;
-    const wildcard = glob.search(/[*?\[]/);
+    const wildcard = glob.search(/[*?]/);
     // Count complete literal directories before the first wildcard. Equivalent broad
     // spellings must not evade the scope bound; exact file names remain allowed.
     if (wildcard !== -1 && glob.slice(0, wildcard).split('/').length - 1 <= 1) return false;

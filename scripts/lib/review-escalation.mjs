@@ -886,11 +886,28 @@ export function scoreEscalation({
   if (exemptFiles.length) {
     if (!basisFiles.length) scoredDiffLines = 0;
     else {
-      // Rename display spellings and the plain target resolve to the same section.
-      // Subtract each section once; an unavailable section still prevents subtraction.
-      const sections = new Set(exemptFiles.map(f => fileHunksOf(f)));
-      const counts = [...sections].map(section => changedLineCount(section));
-      if (counts.every(n => n !== null)) scoredDiffLines = Math.max(0, scoredDiffLines - counts.reduce((a, b) => a + b, 0));
+      // Subtract exempt lines on EACH basis separately, then take the max (#6433 red team): the hunks describe
+      // the cumulative basis only, so subtracting an ancestor's exempt lines from max(own, cumulative) could hide
+      // a stacked child's own non-exempt delta.
+      const ownLines = Number(diffLines) || 0;
+      const cumulativeLines = Number(cumulativeDiffLines) || 0;
+      // Exempt lines in one basis, from its own hunks. Rename display spellings and the plain target resolve to
+      // the same section, so each section is counted once; an unavailable or incomplete section subtracts nothing.
+      const exemptLinesIn = (files) => {
+        const counts = [...new Set(files.filter(f => exemptSet.has(f)).map(f => fileHunksOf(f)))].map(changedLineCount);
+        return counts.every(n => n !== null) ? counts.reduce((a, b) => a + b, 0) : 0;
+      };
+      const allExempt = (files) => files.length > 0 && files.every(f => exemptSet.has(f));
+      // The own delta IS the hunks' basis only when no separate cumulative list was supplied, or when the caller
+      // handed the very same list for both (the non-stacked net-diff and gh-files shapes). Equal contents are
+      // not proof: a stacked child can touch the same files with a different per-file split. Otherwise the own
+      // count stays whole unless every own file is exempt (fail closed).
+      const ownIsHunkBasis = !Array.isArray(humanBasisFiles) || humanBasisFiles === changedFiles;
+      const ownScored = allExempt(ownFiles) ? 0
+        : ownIsHunkBasis ? Math.max(0, ownLines - exemptLinesIn(ownFiles)) : ownLines;
+      const cumulativeScored = allExempt(cumulativeFiles) ? 0
+        : Math.max(0, cumulativeLines - exemptLinesIn(cumulativeFiles));
+      scoredDiffLines = Math.max(ownScored, cumulativeScored);
     }
   }
   if (scoredDiffLines >= t.diffLines) { signals.size = scoredDiffLines; reasons.push(`size (${scoredDiffLines} ≥ ${t.diffLines} changed lines)`); }
