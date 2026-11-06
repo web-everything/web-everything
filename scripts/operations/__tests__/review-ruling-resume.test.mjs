@@ -22,7 +22,7 @@ import { REVIEW_EFFECTS, reviewPrOperation, reviewSeatOptionsForRun } from '../r
 import { runReviewLoopOnce, defaultFindResumableRun, RESUME_MAX_ATTEMPTS } from '../review-loop-cli.mjs';
 import {
   classifyReferralsByRound, findingIdentityTable, REFERRAL_DEMOTED_REASONS, referralFindingKey, normalizeFinding,
-  mandatoryReferralReviewer, renderReferralRecord, openReferralHeads, buildOperatorRulingComment,
+  mandatoryReferralReviewer, mandatoryReferralState, renderReferralRecord, openReferralHeads, buildOperatorRulingComment,
 } from '../../lib/jury-core.mjs';
 import { advance, advanceWhileRunning, startRun } from '../engine.mjs';
 import { resolveOperation } from '../run.mjs';
@@ -143,9 +143,9 @@ const stubReader = () => ({ pr, repo }) => ({
   net: { paths: NET_PATHS, base: 'abc123', rev: HEAD_1, scored: true },
   diff: { text: '--- a/x\n+++ b/x\n+one line\n', scored: true },
 });
-const setup = () => {
+const setup = (readPr = stubReader()) => {
   // Replay the original two-seat panel, independently of the minimum for new reviews.
-  const declaration = reviewPrOperation({ readPr: stubReader(), minNonClaudeSeats: 0 });
+  const declaration = reviewPrOperation({ readPr, minNonClaudeSeats: 0 });
   const registry = createRegistry();
   registry.register(declaration);
   return { declaration, registry };
@@ -165,6 +165,84 @@ function sinksWith({ seen, ruled }) {
 }
 
 const argv = ['--pr=4361', '--repo=o/n'];
+
+describe('stale stageVerdict referral refusal', () => {
+  async function fixture(kind = 'card') {
+    const store = createMemoryRunStore();
+    const seen = [];
+    const judge = vi.fn(async () => judgeOutcome({ summary: 'gate seats clean', findings: [] }, {}));
+    const makeJudge = () => judge;
+    const body = '<!-- authored-by-actor: author -->';
+    const rec = { ...recordFor(HEAD_1, raised), pr: 4361, runId: 'r-stale', reviewer: mandatoryReferralReviewer('r-stale'), authorBody: body };
+    rec.referrals[0].seat = 'judgeCorrectnessAdvisory';
+    rec.referrals[0].key = referralFindingKey('judgeCorrectnessAdvisory', raised);
+    const key = rec.referrals[0].key;
+    if (kind === 'partial') {
+      const original = { ...raised, summary: 'another unruled defect' };
+      rec.referrals.push({ key: referralFindingKey('judge', original), seat: 'judge', original, finding: normalizeFinding(original) });
+    }
+    let comments = [{ body: renderReferralRecord(rec), author: { login: 'web-everything' } }];
+    const { declaration, registry } = setup(subject => {
+      const raw = stubReader()(subject);
+      return { ...raw, body, comments, detail: { ...raw.detail, labels: ['review:pending'], humanRequired: false, reviewClass: 'agent' } };
+    });
+    const live = () => ({ headRefOid: HEAD_1, body, createdAt: '', comments: kind === 'unreadable-thread' ? {} : comments });
+    const sinks = sinksWith({ seen, ruled: { value: false } });
+    sinks[REVIEW_EFFECTS.MANDATORY_REFERRALS] = async () => mandatoryReferralState(comments,
+      { repo: 'o/n', pr: 4361, head: HEAD_1, body, cardReadable: () => true });
+    const policy = { value: { unattendedAcceptRequiresCleanReferrals: false } };
+    const common = { declaration, registry, store, sinks, makeJudge, readAcceptancePr: live,
+      cardReadable: () => kind !== 'unreadable-card', acceptPolicy: policy, advisorySettings: () => ({ value: { mode: 'off' } }) };
+    await runReviewLoopOnce({ ...common, argv, mintRunId: () => rec.runId });
+    const refused = await runReviewLoopOnce({ ...common, argv: [`--resume=${rec.runId}`, '--answer=accept'] });
+    expect(refused.stopped).toBe('step-refused');
+    expect(refused.run.pending).toBeNull();
+    expect(refused.run.verdict.pendingReferrals).toEqual(rec.referrals.map(f => f.key));
+    if (kind !== 'missing') {
+      const body = buildOperatorRulingComment({ version: 1, repo: 'o/n', pr: 4361,
+        head: kind === 'other-head' ? HEAD_2 : HEAD_1,
+        rulings: [{ runId: kind === 'other-run' ? 'other' : rec.runId,
+          key: kind === 'other-key' ? 'other' : key, result: 'card', card: 'we:backlog/123-test.md' }],
+        actor: 'chalbert', channel: 'terminal', reason: 'track separately', at: '2026-11-06T13:25:00Z', clearerId: 'operator-session' });
+      comments = [...comments, { body: kind === 'malformed' ? body + '\nforged extra text' : body,
+        author: { login: 'chalbert' }, createdAt: '2026-11-06T13:25:00Z' }];
+      if (kind === 'missing-record') comments.shift();
+    }
+    return { common, store, judge, refused, live, rec };
+  }
+
+  it.each([false, true])('re-derives standing same-run/key/head card rulings and rewinds without new jurors (explicit resume: %s)', async explicit => {
+    const { common, store, judge, refused, live, rec } = await fixture();
+    const count = judge.mock.calls.length;
+    const p = { ...live(), number: 4361 };
+    const rows = [reviewRunEvidence(refused.run)];
+    expect(decideReferralHold(p, rows, { repo: 'o/n', cardReadable: () => true })).toBeNull();
+    expect(findResumableParkedRun(p, rows, { repo: 'o/n', cardReadable: () => true })).toEqual({ id: rec.runId, head: HEAD_1 });
+    const out = await runReviewLoopOnce({ ...common, argv: explicit ? [`--resume=${rec.runId}`] : argv, mintRunId: () => 'must-not-start',
+      findResumableRun: () => rec.runId });
+    expect(out.run.id).toBe(rec.runId);
+    expect(out.stopped).toBe('complete');
+    expect(out.run.verdict.pendingReferrals).toEqual([]);
+    expect(out.run.verdict.verdict).toBe('accept');
+    expect(out.run.findings.confirm).toBe('accept');
+    expect(out.run.findings.stageVerdict.applied).toBe(true);
+    expect(store.read('must-not-start')).toBeNull();
+    expect(judge.mock.calls.length).toBe(count);
+  });
+
+  it.each(['missing', 'partial', 'other-head', 'other-run', 'other-key', 'malformed', 'unreadable-card', 'unreadable-thread', 'missing-record'])('%s ruling keeps the refused run held', async kind => {
+    const { common, refused, live, rec, judge } = await fixture(kind);
+    const rows = [reviewRunEvidence(refused.run)];
+    const p = { ...live(), number: 4361 };
+    expect(decideReferralHold(p, rows, { repo: 'o/n', cardReadable: common.cardReadable })).not.toBeNull();
+    expect(findResumableParkedRun(p, rows, { repo: 'o/n', cardReadable: common.cardReadable })).toBeNull();
+    const count = judge.mock.calls.length;
+    const out = await runReviewLoopOnce({ ...common, argv: [`--resume=${rec.runId}`] });
+    expect(out.stopped).toBe('refused');
+    expect(out.run.verdict.pendingReferrals).toEqual(refused.run.verdict.pendingReferrals);
+    expect(judge.mock.calls.length).toBe(count);
+  });
+});
 
 describe('ordinary review-pr CLI resume preserves the saved roster', () => {
   it.each([
