@@ -542,6 +542,12 @@ export async function restartServicesForClone({ settings, platform, env = proces
           || !Number.isFinite(previous.at) || previous.at < 0 || typeof previous.sha !== 'string' || !previous.sha.trim())) {
           throw new Error('unreadable restart state: inspect persisted state');
         }
+        // An owed retry was planned from a listing made before the lock: trust only what is on disk now.
+        // Cleared, taken by another clone, or replaced by a newer sha => follow the marker, never the listing.
+        if (owed) {
+          if (!previous || previous.pendingSha === undefined || previous.pendingRoot !== options.cloneRoot) continue;
+          adoptedSha = previous.pendingSha;
+        }
         if (typeof adoptedSha !== 'string' || !adoptedSha.trim()) throw new Error('unknown adopted sha: inspect rebuild state');
         reason = previous && adoptedSha && previous.sha === adoptedSha ? 'same-adopted-sha'
           : previous && at - previous.at < p.minIntervalMs ? 'debounced' : null;

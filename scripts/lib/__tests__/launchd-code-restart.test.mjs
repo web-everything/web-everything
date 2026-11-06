@@ -1031,6 +1031,26 @@ describe('interpreter option shapes that once hid a clone script (value contains
         o.free(); await restartServicesForClone({ ...o, pendingOnly: true });
         expect(o.states.get(label)).toEqual({ at: 1_000_000, sha: 'A' });
       });
+      it('an owed retry follows the marker on disk after the lock, not the pre-lock listing', async () => {
+        const clock = { t: 1_000_000 }, o = locked(clock); await owe(o, clock);
+        const stale = o.stateStore.pending(); o.stateStore.pending = () => stale;
+        // Between listing and locking, a newer adoption replaced the owed sha.
+        o.states.set(label, { at: 1_001_000, sha: 'A', pendingSha: 'C', pendingRoot: cloneRoot });
+        clock.t += 600_000;
+        await restartServicesForClone({ ...o, pendingOnly: true });
+        expect(o.launchctl).toHaveBeenCalledTimes(2);
+        expect(o.states.get(label)).toEqual({ at: clock.t, sha: 'C' });
+      });
+      it('an owed retry whose marker was cleared or taken by another clone meanwhile restarts nothing', async () => {
+        for (const meanwhile of [{ at: 2_000_000, sha: 'C' }, { at: 1_001_000, sha: 'A', pendingSha: 'B', pendingRoot: resolve('fixtures/other-clone-root') }]) {
+          const clock = { t: 1_000_000 }, o = locked(clock); await owe(o, clock);
+          const stale = o.stateStore.pending(); o.stateStore.pending = () => stale;
+          o.states.set(label, meanwhile); clock.t += 3_000_000;
+          const r = await restartServicesForClone({ ...o, pendingOnly: true });
+          expect(r.restarted).toEqual([]); expect(o.launchctl).toHaveBeenCalledTimes(1);
+          expect(o.states.get(label)).toEqual(meanwhile);
+        }
+      });
       it('an unreadable lock result during cleanup is reported and writes nothing', async () => {
         const clock = { t: 1_000_000 }, o = locked(clock); await owe(o, clock);
         o.listPlists = () => []; clock.t += 600_000; o.lockStore.acquire = async () => undefined;
