@@ -34,7 +34,7 @@ import { releaseFixDispatchClaim } from './fix-dispatch-claim.mjs';
 import { tryReadCompletion } from '../operations/completion-store.mjs';
 import { ensureFreshGithubAppEnv, FLEET_APP_AUTH_OPTS, isGithubAppAuthGuardError } from '../lib/github-app-auth-env.mjs';
 import {
-  resolveFixerSlotSettings, fixSlotState, slotCountedItems, admitResumes, awaitPassRunner, releaseOnCompletion,
+  resolveFixerSlotSettings, fixSlotState, slotCountedItems, admitResumes, classifyStaleOwed, awaitPassRunner, releaseOnCompletion,
 } from './fixer-slot-rules.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -92,6 +92,8 @@ export function defaultSlotCountedFixClaims({
 
 // ── the cycle ────────────────────────────────────────────────────────────────────────────────────────────────
 
+const resumeMisses = new Map();
+
 /**
  * The verify-verdict pass, R3-gated. Off → one pass exactly as today. On → phase A pushes and records the owed wake-up
  * without waking anyone; phase B wakes only the admitted resumes (oldest first). Deferred ones keep their pending
@@ -100,30 +102,65 @@ export function defaultSlotCountedFixClaims({
 export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings, claims, nowMs, ttlMs, cap }) {
   if (!settings.parkedReleasesSlot || !allowResume) return runPass({ io, allowResume, nowMs, ttlMs });
   const a = await runPass({ io, allowResume: false, nowMs, ttlMs });
-  const records = io.listRecords();
-  const owedFix = records.filter(({ record: r }) => r?.pendingResume?.kind && SLOT_KINDS.has(r.kind));
-  const activeCount = claimStates(claims, records, { nowMs, ttlMs }).filter((x) => x.state === 'active').length;
+  const allRecords = io.listRecords();
+  const allOwed = allRecords.filter(({ record: r }) => r?.pendingResume?.kind && SLOT_KINDS.has(r.kind));
+  const prFacts = new Map();
+  const states = new Map(); // At most one state read per distinct owed PR per pass.
+  for (const { key, record } of allOwed) {
+    const id = JSON.stringify([record.repo, record.pr]);
+    if (!states.has(id)) {
+      try { states.set(id, await io.prState?.(record.repo, record.pr) ?? null); }
+      catch { states.set(id, null); }
+    }
+    prFacts.set(key, states.get(id));
+  }
+  const stale = new Set(classifyStaleOwed({ owed: allOwed, prFacts, records: allRecords }));
+  const cleared = [];
+  for (const { key, record } of allOwed) if (stale.has(key)) {
+    try {
+      if (typeof io.clearRecord === 'function' && (await io.clearRecord(key, record))?.cleared !== false) cleared.push(key);
+    } catch { /* Failed cleanup must not reserve admission capacity or stop live resumes. */ }
+  }
+  const records = allRecords.filter(({ key }) => !stale.has(key));
+  const owedFix = allOwed.filter(({ key }) => !stale.has(key));
+  const owedKeys = new Set(owedFix.map(({ key }) => key));
+  for (const key of resumeMisses.keys()) if (!owedKeys.has(key)) resumeMisses.delete(key);
+  // Retiring a waiter must not turn its matching claim into a newly "working" session.
+  const staleRecords = allOwed.filter(({ key }) => stale.has(key));
+  const liveClaims = claims.filter(c => waitRecordForClaim(c, records) || !waitRecordForClaim(c, staleRecords));
+  const activeCount = claimStates(liveClaims, records, { nowMs, ttlMs }).filter((x) => x.state === 'active').length;
   const { admit, defer } = admitResumes({
-    owed: owedFix.map(({ key, record }) => ({ key, requestedAtMs: ms(record.requestedAt) })), activeCount, cap, parkedReleasesSlot: true,
+    owed: owedFix.map(({ key, record }) => ({ key, requestedAtMs: ms(record.requestedAt), deprioritized: (resumeMisses.get(key) ?? 0) >= 3 })), activeCount, cap, parkedReleasesSlot: true,
   });
   const deferred = new Set(defer);
   const wake = records.filter(({ key, record }) => record?.pendingResume?.kind && !deferred.has(key));
   const wakeKeys = new Set(wake.map((e) => e.key));
+  const order = new Map(admit.map((key, i) => [key, i]));
   const b = wake.length
-    ? await runPass({ io: { ...io, listRecords: () => io.listRecords().filter((e) => wakeKeys.has(e.key)), listSalvage: undefined }, allowResume: true, nowMs, ttlMs })
+    ? await runPass({ io: { ...io, listRecords: () => io.listRecords().filter((e) => wakeKeys.has(e.key))
+      .sort((x, y) => (order.get(x.key) ?? admit.length) - (order.get(y.key) ?? admit.length)), listSalvage: undefined }, allowResume: true, nowMs, ttlMs })
     : { rows: [] };
+  const pending = new Set(io.listRecords().filter(({ record }) => record?.pendingResume?.kind).map(({ key }) => key));
+  for (const key of admit) {
+    if (pending.has(key)) resumeMisses.set(key, (resumeMisses.get(key) ?? 0) + 1);
+    else resumeMisses.delete(key);
+  }
   // Phase A answers `resume-paused` (allowResume:false) for every record it would have woken; that word is not shown.
   // A record pushed in phase A keeps its push row, with the phase-B wake (or the deferral) appended to its result.
   const pushedA = (r) => (r.result && r.result !== 'resume-paused' ? `${r.result}; ` : '');
-  const rows = (a.rows ?? []).filter((r) => !wakeKeys.has(r.key) && !deferred.has(r.key));
+  const rows = (a.rows ?? []).filter((r) => !stale.has(r.key) && !wakeKeys.has(r.key) && !deferred.has(r.key));
   for (const r of a.rows ?? []) {
-    if (deferred.has(r.key)) rows.push({ ...r, action: 'resume', reason: 'fix-slot-full', result: `${pushedA(r)}resume-deferred (fix slot full, ${activeCount} working ≥ cap ${cap})` });
+    if (deferred.has(r.key)) {
+      const record = owedFix.find(e => e.key === r.key)?.record;
+      const owedAhead = owedFix.filter(e => ms(e.record.requestedAt) < ms(record?.requestedAt)).length;
+      rows.push({ ...r, action: 'resume', reason: 'fix-slot-full', result: `${pushedA(r)}resume-deferred (fix slot full: ${owedAhead} owed ahead, ${admit.length} admitted, ${activeCount} working, cap ${cap})` });
+    }
   }
   for (const r of b.rows ?? []) {
     const before = (a.rows ?? []).find((x) => x.key === r.key && pushedA(x));
     rows.push(before ? { ...r, action: before.action, reason: before.reason, result: `${pushedA(before)}${r.result}` } : r);
   }
-  return { rows, admitted: admit, deferred: defer };
+  return { rows, admitted: admit, deferred: defer, cleared };
 }
 
 const latestFinite = (list) => { const ok = list.filter(Number.isFinite); return ok.length ? Math.max(...ok) : null; };

@@ -116,17 +116,29 @@ export function slotCountedItems({ items, cap, parkedReleasesSlot, parkedCapFact
   return [...working, ...parked].slice(0, n).map((x) => x.item);
 }
 
+/** Stale owed keys. PR facts are a Map keyed by record key; unknown facts retain the record.
+ * Only an explicitly closed PR or a strictly newer, different SHA for the same repo/PR retires a wait.
+ * `records` may include newer waits that have not yet become owed. */
+export function classifyStaleOwed({ owed, prFacts = new Map(), records = owed }) {
+  return owed.filter(({ key, record: r }) => prFacts.get(key)?.open === false
+    || records.some(({ record: newer }) => r.repo && r.pr && r.sha && newer?.sha
+      && newer.repo === r.repo && newer.pr === r.pr && newer.sha !== r.sha
+      && Date.parse(newer.requestedAt) > Date.parse(r.requestedAt)))
+    .map(({ key }) => key);
+}
+
 /**
  * R3 resume-admission. Facts: the owed resumes (`key`, when the wait began) and how many sessions are working now.
  *   off: every owed resume wakes (today).
- *   on:  oldest wait first, while working + woken < cap. The rest wait; they still hold their reserved slot (R2), so
+ *   on:  oldest wait first (repeated wake misses go last), while working + woken < cap. The rest wait; they still hold their reserved slot (R2), so
  *        no new dispatch can take it first.
- * @param {{owed:Array<{key:string, requestedAtMs:number}>, activeCount:number, cap:number, parkedReleasesSlot:boolean}} facts
+ * @param {{owed:Array<{key:string, requestedAtMs:number, deprioritized?:boolean}>, activeCount:number, cap:number, parkedReleasesSlot:boolean}} facts
  * @returns {{admit:string[], defer:string[]}}
  */
 export function admitResumes({ owed, activeCount, cap, parkedReleasesSlot }) {
   const list = (Array.isArray(owed) ? owed : []).slice()
-    .sort((a, b) => (a.requestedAtMs - b.requestedAtMs) || String(a.key).localeCompare(String(b.key)));
+    .sort((a, b) => (Number(!!a.deprioritized) - Number(!!b.deprioritized))
+      || (a.requestedAtMs - b.requestedAtMs) || String(a.key).localeCompare(String(b.key)));
   if (!parkedReleasesSlot) return { admit: list.map((o) => o.key), defer: [] };
   const free = Math.max(0, cap - Math.max(0, activeCount));
   return { admit: list.slice(0, free).map((o) => o.key), defer: list.slice(free).map((o) => o.key) };

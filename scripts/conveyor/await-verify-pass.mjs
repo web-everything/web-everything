@@ -832,6 +832,10 @@ export async function defaultAwaitVerifyIo({
   };
   return {
     // fix.pushBeforeGate through the policy cascade, re-read every pass so a settings flip applies without a restart.
+    prState: (repo, pr) => {
+      const head = prHead(repo, pr);
+      return head ? { open: head.open } : null;
+    },
     pushPolicy: () => loadFixPushPolicy({ env }),
     fixTimingPolicy: () => {
       const timing = resolveTimingPolicy({ env });
