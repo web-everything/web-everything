@@ -638,9 +638,17 @@ The bounce is repaired and re-pushed; now hand it back. This is **the one label 
 a script, so you cannot route around the invariant:
 
 ```bash
-node "{{WE_ROOT}}/scripts/conveyor/rearm-review.mjs" {{PR_NUM}} --repo={{REPO}} && \
-  node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=re-armed
-  node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
+node "{{WE_ROOT}}/scripts/conveyor/rearm-review.mjs" {{PR_NUM}} --repo={{REPO}}
+```
+
+Run `rearm-review.mjs` as its OWN Bash call: the command must START with `node "{{WE_ROOT}}/…"`, never behind `cd`,
+never chained (`&&`, `;`, `|`, a second line) with the completion report, `fix-end` or a learnings drop. Your
+session is pre-granted exactly that one command shape; a chained or `cd`-prefixed line is not matched and the
+auto-mode classifier denies it (live on #6399). Only after it succeeds, run these as separate calls:
+
+```bash
+node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=re-armed
+node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
 ```
 
 `rearm-review.mjs` swaps `review:changes → review:pending` (an independent re-review is owed) and posts a
