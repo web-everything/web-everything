@@ -321,7 +321,27 @@ function tighter(key, candidate, current) {
 }
 
 /**
- * Resolve the audit settings. `fileRead`/`path`/`platform` are test seams; production passes none.
+ * Under a platform-file override, each single-value setting the default chain sets validly is a floor: the override's
+ * value is kept only when it is at least as strict, else the chain's value is used (where the override omits it too).
+ * An invalid override value is left in place, so it fails that setting closed as usual.
+ */
+function tightenToChain(over, chain) {
+  const out = structuredClone(over);
+  for (const key of Object.keys(DEFAULTS)) {
+    const c = get(chain, key);
+    if (c === undefined || !VALID[key](c)) continue;
+    const o = get(out, key);
+    if (o !== undefined && (!VALID[key](o) || tighter(key, o, c))) continue;
+    const [a, b] = pathOf(key);
+    if (b === undefined) { out[a] = c; continue; }
+    if (out[a] === undefined) out[a] = {};
+    if (isObj(out[a])) out[a][b] = c;
+  }
+  return out;
+}
+
+/**
+ * Resolve the audit settings. `fileRead`/`path`/`platform`/`platformRead` are test seams; production passes none.
  * Never throws: anything the resolution itself cannot survive (a value a parser cannot convert, an environment
  * object that throws on read) resolves EVERY setting to its strictest option, with a warning (PR #6381 red team).
  * @returns {{value: object, sources: Record<string,string>, warnings: string[]}}
@@ -353,10 +373,12 @@ function resolveUnguarded({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync,
       // file that is missing is a choice we cannot read: it fails closed (PR #6381 judge). It is checked before AND
       // after the read so a file that appears or vanishes in between is not read as unset. A relative path would
       // resolve against whatever cwd the process has, so it fails closed too.
-      const configured = String(env?.[PLATFORM_PREFERENCES_ENV] ?? '').trim();
+      // One snapshot of env feeds every read below, so the override cannot read as unset here and as set in the reader.
+      const snap = { ...env };
+      const configured = String(snap[PLATFORM_PREFERENCES_ENV] ?? '').trim();
       const configuredBad = () => configured !== '' && (!isAbsolute(configured) || !existsSync(configured));
       const before = configuredBad();
-      const { prefs, errors } = readPlatformPreferences({ env, readFile: platformRead, warn: () => {} });
+      const { prefs, errors } = readPlatformPreferences({ env: snap, readFile: platformRead, warn: () => {} });
       plat = prefs.audit;
       platUnreadable = before || configuredBad() || errors.length > 0 || (Object.hasOwn(prefs, 'audit') && prefs.audit === null);
       if (configured !== '') {
@@ -365,11 +387,13 @@ function resolveUnguarded({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync,
         // warning. That is a choice we cannot read, so it fails closed (PR #6381 judge).
         if (!isObj(prefs.audit)) platUnreadable = true;
         // The default chain, read with the override removed from env, supplies path lists the override adds to.
-        const chainEnv = { ...env }; delete chainEnv[PLATFORM_PREFERENCES_ENV];
+        const chainEnv = { ...snap }; delete chainEnv[PLATFORM_PREFERENCES_ENV];
         const chain = readPlatformPreferences({ env: chainEnv, readFile: platformRead, warn: () => {} });
         chainPlat = chain.prefs.audit;
         // Read as it would be with no override: an unreadable chain or a present non-object `audit` fails closed.
         if (chain.errors.length > 0 || (Object.hasOwn(chain.prefs, 'audit') && !isObj(chainPlat))) platUnreadable = true;
+        // The chain's single-value settings are a floor too: the override may only tighten them (PR #6381 self-review).
+        if (!platUnreadable && isObj(chainPlat)) plat = tightenToChain(plat, chainPlat);
       }
     } catch { plat = undefined; chainPlat = undefined; platUnreadable = true; }
   }
@@ -379,12 +403,13 @@ function resolveUnguarded({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync,
   let cascade;
   try { cascade = cascadePolicy('audit', tool, { standard: undefined, platform: plat === undefined ? null : plat, env, log }); } catch { cascade = null; }
   const layered = cascade?.layered ?? {};
-  for (const [name, layer] of [['platform', plat], ['file', tool]]) {
+  for (const [name, layer] of [['platform chain', chainPlat], ['platform', plat], ['file', tool]]) {
     const unknown = unknownKeys(layer);
     if (unknown.length) warn(`audit ${name} layer has unknown setting(s) ${JSON.stringify(unknown.slice(0, 20))}; ignored (check the spelling)`);
   }
-  // Malformed RAW entries in either layer (raw only: the platform-level fault above is reported once, not per key).
-  const malformed = (key, valid) => [plat, tool].some(layer => rawMalformed(layer, key, valid) || caseShadowed(layer, key));
+  // Malformed RAW entries in any layer (raw only: the platform-level fault above is reported once, not per key). The
+  // default chain read under an override counts: a malformed chain entry fails that setting closed.
+  const malformed = (key, valid) => [chainPlat, plat, tool].some(layer => rawMalformed(layer, key, valid) || caseShadowed(layer, key));
   const value = {}; const sources = {};
   for (const key of Object.keys(DEFAULTS)) {
     // The source names the layer the value came from: the cascade layers the file over the platform (PR #6381 send-back).
@@ -422,9 +447,8 @@ function resolveUnguarded({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync,
     let strictest = unreadable || !cascade || platBad;
     const own = layer => (isObj(layer) ? layer[key] : undefined);
     const layerLists = [own(chainPlat), own(plat), own(tool)].filter(l => l !== undefined);
-    const chainMalformed = rawMalformed(chainPlat, key, validPaths) || caseShadowed(chainPlat, key);
     let platList = []; let list = [];
-    if (!layerLists.every(validPaths) || malformed(key, validPaths) || chainMalformed) { warn(`audit setting ${key} invalid; every path protected`); strictest = true; }
+    if (!layerLists.every(validPaths) || malformed(key, validPaths)) { warn(`audit setting ${key} invalid; every path protected`); strictest = true; }
     else {
       platList = [...(own(chainPlat) ?? []), ...(own(plat) ?? [])];
       list = [...platList, ...(own(tool) ?? [])];

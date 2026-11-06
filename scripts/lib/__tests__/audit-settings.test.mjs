@@ -124,7 +124,8 @@ describe('audit settings (R528)', () => {
       for (const body of ['{"name":"pkg","version":"1.0.0","scripts":{}}', '{}', '{"audit":null}', '{"audit":"prod"}', '{"audit":[]}']) {
         const r = fromDisk(prefs('pkg-like.json', body), full(), chain);
         expect(r.value).toMatchObject(STRICT);
-        expect(r.value.guardFloorPaths).toEqual(STRICT_PATHS);
+        // Every path is protected; the chain's own addition is kept as well, never dropped.
+        expect(r.value.guardFloorPaths).toEqual([...STRICT_PATHS, 'custom/**']);
         expect(r.value.raceBlockPaths).toEqual(STRICT_PATHS);
         expect(r.warnings.join()).toMatch(/platform preference unreadable/);
       }
@@ -136,7 +137,7 @@ describe('audit settings (R528)', () => {
       expect(r.value.guardFloorPaths).toEqual([...GUARD_FLOOR, 'custom/**', 'other/**']);
       expect(r.warnings).toEqual([]);
       // The operator-owned file in the default chain counts too, and an override with no lists keeps the chain lists.
-      const op = { 'platform-preferences.json': '{"audit":{"guardFloorPaths":["op/**"]}}' };
+      const op = { [join('.claude', 'platform-preferences.json')]: '{"audit":{"guardFloorPaths":["op/**"]}}' };
       expect(fromDisk(prefs('override-empty.json', '{"audit":{}}'), full(), op).value.guardFloorPaths).toEqual([...GUARD_FLOOR, 'op/**']);
       // An unreadable or invalid default chain still fails closed under an override.
       const broken = fromDisk(prefs('override-2.json', '{"audit":{}}'), full(), { 'delivery-platform-preferences.json': '{"audit":' });
@@ -144,6 +145,19 @@ describe('audit settings (R528)', () => {
       expect(broken.warnings.join()).toMatch(/platform preference unreadable/);
       const badList = fromDisk(prefs('override-3.json', '{"audit":{}}'), full(), { 'delivery-platform-preferences.json': '{"audit":{"guardFloorPaths":[""]}}' });
       expect(badList.value.guardFloorPaths).toEqual(STRICT_PATHS);
+    });
+    it('an override file may tighten the default chain single-value settings, never loosen them (PR #6381 self-review)', () => {
+      const chain = { 'delivery-platform-preferences.json': '{"audit":{"recheck":{"max":0},"releaseStage":"prod","cards":{"requirePayBy":true}}}' };
+      const looser = fromDisk(prefs('loose.json', '{"audit":{"recheck":{"max":3},"releaseStage":"prerelease","cards":{"requirePayBy":false}}}'), {}, chain);
+      expect(looser.value).toMatchObject({ recheckMax: 0, releaseStage: 'prod', requirePayBy: true });
+      // A chain value the override omits still applies; a stricter override value wins.
+      const omits = fromDisk(prefs('omits.json', '{"audit":{"verdict":{"mode":"shadow"}}}'), {}, chain);
+      expect(omits.value).toMatchObject({ recheckMax: 0, releaseStage: 'prod', verdictMode: 'shadow' });
+      const loose = { 'delivery-platform-preferences.json': '{"audit":{"recheck":{"max":2}}}' };
+      expect(fromDisk(prefs('tight.json', '{"audit":{"recheck":{"max":1}}}'), {}, loose).value.recheckMax).toBe(1);
+      // A malformed chain value fails that setting closed under an override.
+      const bad = { 'delivery-platform-preferences.json': '{"audit":{"recheck":{"max":"x"}}}' };
+      expect(fromDisk(prefs('any.json', '{"audit":{}}'), {}, bad).value.recheckMax).toBe(0);
     });
     it('platform path lists are unioned with the tool file lists, never replaced by them (PR #6381 judge)', () => {
       const r = fromDisk(prefs('lists.json', '{"audit":{"raceBlockPaths":["plat-race/**"],"guardFloorPaths":["plat-guard/**"]}}'),
