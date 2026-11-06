@@ -1,5 +1,6 @@
 import { RED_TEAM_STATUS_LABEL_META } from './red-team-status-label-meta.mjs';
 import { proposeHumanRequired } from './direction-aware-human.mjs';
+import { resolveReviewCareExemptPaths, validateCareExemptPaths, matchesCareExemptPath, isProtectedCarePath } from './review-care-exempt-paths.mjs';
 /**
  * review-escalation.mjs — the DETERMINISTIC drain review-escalation rubric (#2171, under #2162).
  *
@@ -516,17 +517,33 @@ export function deriveCareLevel({ signals = {}, humanRequired = false } = {}) {
  */
 export function plainDiffPath(entry) {
   if (typeof entry !== 'string' || !entry) return entry;
+  const sides = diffPathSides(entry);
+  return sides[sides.length - 1];
+}
+
+/**
+ * ONE numstat display entry → its plain paths: `[old, new]` for a rename, `[path]` otherwise. Same decoding as
+ * `plainDiffPath` (which returns the last element). A rule that must hold for a file wherever it moved — e.g.
+ * "guard, egress and trust-chain files always contribute review care" — checks EVERY side, so renaming a
+ * protected file into an exempt location cannot drop it (#6433 review).
+ * @param {string} entry one `parseNumstat` changed-file entry
+ * @returns {string[]} the plain old and new paths (one element when not a rename)
+ */
+export function diffPathSides(entry) {
+  if (typeof entry !== 'string' || !entry) return [entry];
   // Quoted rename: git quotes each SIDE in full and never uses the brace form when quoting is needed.
   const quotedRename = entry.match(/^(".*")\s=>\s(".*")$/);
-  if (quotedRename) return unquoteGitPath(quotedRename[2]);
+  if (quotedRename) return [unquoteGitPath(quotedRename[1]), unquoteGitPath(quotedRename[2])];
   // Compact brace rename — `<prefix>{<old> => <new>}<suffix>`; either side may be empty. Non-greedy on the old
   // side so the FIRST `{…}` group wins (git emits at most one).
   const braced = entry.match(/^(.*?)\{(.*?) => (.*?)\}(.*)$/);
-  if (braced) return collapseSlashes(`${braced[1]}${braced[3]}${braced[4]}`);
+  if (braced) {
+    return [collapseSlashes(`${braced[1]}${braced[2]}${braced[4]}`), collapseSlashes(`${braced[1]}${braced[3]}${braced[4]}`)];
+  }
   // Plain rename (no quoting, no common prefix/suffix). See the residual above for the ` => `-in-path case.
   const idx = entry.indexOf(' => ');
-  if (idx !== -1) return unquoteGitPath(entry.slice(idx + 4));
-  return unquoteGitPath(entry);
+  if (idx !== -1) return [unquoteGitPath(entry.slice(0, idx)), unquoteGitPath(entry.slice(idx + 4))];
+  return [unquoteGitPath(entry)];
 }
 
 // `dir/{sub => }/thing.md` → `dir/` + `` + `/thing.md` → `dir//thing.md`; git's own rendering of the same
@@ -682,6 +699,32 @@ export function parseDeviationDisclosure(body) {
   return text === '' ? '(no reason provided)' : text;
 }
 
+/** Count additions/deletions only from complete unified hunks; missing/truncated evidence cannot reduce care. */
+function changedLineCount(section) {
+  if (typeof section !== 'string') return null;
+  let oldLeft = 0, newLeft = 0, count = 0, seen = false;
+  for (const line of section.split('\n')) {
+    const header = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+    if (header) {
+      if (oldLeft || newLeft) return null;
+      oldLeft = Number(header[2] ?? 1);
+      newLeft = Number(header[4] ?? 1);
+      seen = true;
+    } else if (seen && (oldLeft || newLeft)) {
+      if (line.startsWith('+')) { newLeft--; count++; }
+      else if (line.startsWith('-')) { oldLeft--; count++; }
+      else if (line.startsWith(' ')) { oldLeft--; newLeft--; }
+      else if (!line.startsWith('\\')) return null;
+      if (oldLeft < 0 || newLeft < 0) return null;
+    }
+  }
+  // A present section with no hunk at all (binary, pure rename, mode-only, empty new file) changes no counted
+  // line — numstat reports 0 or `-` for it. The caller's total-equality check still refuses a section that
+  // was truncated before its first hunk.
+  if (!seen) return section.split('\n').some(line => line.startsWith('@@')) ? null : 0;
+  return !oldLeft && !newLeft ? count : null;
+}
+
 export function scoreEscalation({
   changedFiles = [],
   diffLines = 0,
@@ -696,6 +739,7 @@ export function scoreEscalation({
   basisNarrowed = true,
   deviation = null,
   humanSurfaces,
+  careExemptPaths = resolveReviewCareExemptPaths().value,
   readOnlyOps = new Set(),
   directionAwareLive = false,
 } = {}) {
@@ -725,7 +769,29 @@ export function scoreEscalation({
   const ownFiles = Array.isArray(changedFiles) ? changedFiles : [];
   // The CUMULATIVE list, exactly as supplied — this and only this is the hunks' basis (#2890 finding 4 below).
   const cumulativeFiles = Array.isArray(humanBasisFiles) ? humanBasisFiles : ownFiles;
-  const basisFiles = unionPaths(cumulativeFiles, ownFiles);
+  const gateBasis = unionPaths(cumulativeFiles, ownFiles);
+  // @invariant human-gate-reads-each-files-own-hunks (#human-is-principle-surface-not-path) — a file is judged against ITS OWN diff section, never the PR's whole text
+  const fileHunksOf = fileHunksResolver(diffHunks);
+  const permissionHits = sensitiveSurfaceHits(gateBasis, fileHunksOf, resolvedSurfaces);
+  // Protected rules are judged on EVERY side of an entry — the raw display string and both plain rename paths —
+  // so moving a guard, egress, trust-chain, engine or sensitive file into an exempt location keeps its care.
+  const careSides = f => [...new Set([f, ...diffPathSides(f)])];
+  // Sensitive surfaces stay in care even when their human category is currently disabled.
+  const sensitiveFiles = new Set(sensitiveSurfaceHits(gateBasis.flatMap(careSides), fileHunksOf,
+    normalizeHumanSurfaces('broad')).map(hit => hit.file));
+  const isCareProtected = f => careSides(f).some(side => isTrustChainPath(side) || isEngineTierPath(side)
+    || isProtectedCarePath(side) || sensitiveFiles.has(side));
+  const exemptions = validateCareExemptPaths(careExemptPaths);
+  // A rename is exempt only when EVERY side is exempt: moving a statute, tool or other authored file into an
+  // exempt location is still a change to that file (and deletes it from where it was).
+  const entryExempt = f => !isCareProtected(f) && diffPathSides(f).every(side => matchesCareExemptPath(side, exemptions));
+  // A plain target alias of a retained rename (`changedFiles` may list both spellings) resolves to the same diff
+  // section, so it must not subtract that section's lines either.
+  const retainedTargets = new Set(gateBasis.filter(f => !entryExempt(f)).map(plainDiffPath));
+  const exemptFiles = gateBasis.filter(f => entryExempt(f) && !retainedTargets.has(plainDiffPath(f)));
+  const exemptSet = new Set(exemptFiles);
+  const basisFiles = gateBasis.filter(f => !exemptSet.has(f));
+  if (exemptFiles.length) signals.careExempt = exemptFiles;
 
   // A trust-chain path ALWAYS escalates (even a relocated engine file that no longer matches `^scripts/`) —
   // isTrustChainPath covers both tiers, so the lander always gets an independent review whether or not it also
@@ -736,15 +802,12 @@ export function scoreEscalation({
 
   // All touch-set gates use the cumulative basis and each file's own hunks. The configured categories
   // decide which principle triggers require human review; inactive triggers still raise AI care via blast-radius.
-  const gateBasis = basisFiles;
-  // @invariant human-gate-reads-each-files-own-hunks (#human-is-principle-surface-not-path) — a file is judged against ITS OWN diff section, never the PR's whole text
-  const fileHunksOf = fileHunksResolver(diffHunks);
   const surfaces = gateBasis.map((f) => { const hunks = fileHunksOf(f); return { file: f, hunks, triggers: principleSurfaceTriggers(f, hunks) }; });
   const categoryFor = { 'leash-path': 'gate-self', 'statute-anchor': 'statute', 'marked-invariant': 'marked-invariant' };
   const demoted = {};
   for (const [trigger, category] of Object.entries(categoryFor)) {
     if (resolvedSurfaces.categories.includes(category)) continue;
-    const files = surfaces.filter(x => x.triggers.includes(trigger)).map(x => x.file);
+    const files = surfaces.filter(x => !exemptSet.has(x.file) && x.triggers.includes(trigger)).map(x => x.file);
     if (files.length) {
       demoted[category] = files;
       for (const file of files) if (!blastFiles.includes(file)) blastFiles.push(file);
@@ -770,7 +833,6 @@ export function scoreEscalation({
 
   // Keep one permission-change token so every existing clearance consumer sees the same sensitive holds.
   const otherHumanForced = humanForced;
-  const permissionHits = sensitiveSurfaceHits(gateBasis, fileHunksOf, resolvedSurfaces);
   if (permissionHits.length) {
     humanForced = true;
     signals.permissionChange = [...new Set(permissionHits.map((x) => x.file))];
@@ -814,7 +876,7 @@ export function scoreEscalation({
   //
   // Default `true`: every caller that supplies no flag (including every pre-#3343 one) scores exactly as before.
   // Flagged only when something was actually scored — an empty basis has no verdict to qualify.
-  const basisUntrusted = basisNarrowed === false && basisFiles.length > 0;
+  const basisUntrusted = basisNarrowed === false && gateBasis.length > 0;
   if (basisUntrusted) {
     signals.basisUntrusted = true;
     reasons.push('basis un-narrowed (merge-base unresolved) — the scored file set may include upstream-only changes');
@@ -824,7 +886,42 @@ export function scoreEscalation({
   // monotone rule as the file basis above: a stacked/self-declared base can raise this number, never lower it.
   // Still a CAPACITY dial and never a refusal (#3320) — crossing the threshold adds a reason and lifts the care
   // level, which is what routes more reviewers at it.
-  const scoredDiffLines = Math.max(Number(diffLines) || 0, Number(cumulativeDiffLines) || 0);
+  let scoredDiffLines = Math.max(Number(diffLines) || 0, Number(cumulativeDiffLines) || 0);
+  if (exemptFiles.length) {
+    if (!basisFiles.length) scoredDiffLines = 0;
+    else {
+      // Subtract exempt lines on EACH basis separately, then take the max (#6433 red team): the hunks describe
+      // the cumulative basis only, so subtracting an ancestor's exempt lines from max(own, cumulative) could hide
+      // a stacked child's own non-exempt delta.
+      const ownLines = Number(diffLines) || 0;
+      const cumulativeLines = Number(cumulativeDiffLines) || 0;
+      // Exempt lines in one basis, from its own hunks. Rename display spellings and the plain target resolve to
+      // the same section, so each section is counted once. The hunks must PROVABLY describe this basis: every
+      // file's section complete and their total equal to the basis's line count. Otherwise (a missing, binary or
+      // truncated section; or hunks from another basis, such as the base-tip text paired with ancestry counts
+      // when the merge-base lookup failed) nothing is subtracted, so upstream drift on an exempt file can never
+      // hide this PR's own lines (#6433 self-review).
+      const exemptLinesIn = (files, total) => {
+        const sum = list => {
+          const counts = [...new Set(list.map(f => fileHunksOf(f)))].map(changedLineCount);
+          return counts.every(n => n !== null) ? counts.reduce((a, b) => a + b, 0) : null;
+        };
+        if (sum(files) !== total) return 0;
+        return sum(files.filter(f => exemptSet.has(f))) ?? 0;
+      };
+      const allExempt = (files) => files.length > 0 && files.every(f => exemptSet.has(f));
+      // The own delta IS the hunks' basis only when no separate cumulative list was supplied, or when the caller
+      // handed the very same list for both (the non-stacked net-diff and gh-files shapes). Equal contents are
+      // not proof: a stacked child can touch the same files with a different per-file split. Otherwise the own
+      // count stays whole unless every own file is exempt (fail closed).
+      const ownIsHunkBasis = !Array.isArray(humanBasisFiles) || humanBasisFiles === changedFiles;
+      const ownScored = allExempt(ownFiles) ? 0
+        : ownIsHunkBasis ? Math.max(0, ownLines - exemptLinesIn(ownFiles, ownLines)) : ownLines;
+      const cumulativeScored = allExempt(cumulativeFiles) ? 0
+        : Math.max(0, cumulativeLines - exemptLinesIn(cumulativeFiles, cumulativeLines));
+      scoredDiffLines = Math.max(ownScored, cumulativeScored);
+    }
+  }
   if (scoredDiffLines >= t.diffLines) { signals.size = scoredDiffLines; reasons.push(`size (${scoredDiffLines} ≥ ${t.diffLines} changed lines)`); }
 
   if (Number(dismissedFindings) > 0) { signals.dismissedFindings = Number(dismissedFindings); reasons.push(`dismissed-findings (${dismissedFindings} pre-PR review finding(s) the lane dismissed)`); }

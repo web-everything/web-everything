@@ -1487,12 +1487,19 @@ describe('unprovable accepted head move — fresh full review', () => {
     expect(o.dispatch).not.toHaveBeenCalled();
     expect(o.lastDispatch.size).toBe(0);
   });
-  it.each(['review:human', 'review:held-mechanical', 'review-status:reviewing', 'red-team:blocked', 'red-team:pending'])(
+  it.each(['review:human', 'review:held-mechanical', 'review-status:reviewing', 'red-team:blocked'])(
     'does not re-review a held PR with %s', label => {
       const o = moved(); o.rawPrs[0].labels.push(label);
       expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
       expect(o.dispatch).not.toHaveBeenCalled();
     });
+  // R640: operator-accepted change, class correctness-in-normal-use.
+  it('R640 (operator ruling): a lone red-team:pending does not block the full review', () => {
+    const o = moved(); o.rawPrs[0].labels.push('red-team:pending');
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('review');
+    expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
+    expect(o.rawPrs[0].labels).toContain('red-team:pending');
+  });
   it.each(['inFlight', 'queued', 'recorded', 'seatRecorded', 'completedRecorded', 'status', 'unknown'])(
     'fails closed with live-head %s evidence', kind => {
       const o = moved(), evidence = o.readEvidence();

@@ -617,3 +617,105 @@ describe('review regressions: Forge and supervisor wiring', () => {
     }
   }, 10000);
 });
+
+describe('local shard wait budget (verify.localShardWaitMs)', () => {
+  const run = async ({ env = {}, needsGit = () => true, budgetMs = 3_600_000, exitCode = 0 } = {}) => {
+    const calls = [], lines = [];
+    const execute = async ({ command, args, files, report }) => {
+      calls.push({ command, args });
+      return { exitCode, reportText: exitCode === 75 ? '' : JSON.stringify({ testResults: files.map(name => ({ name, status: 'passed', assertionResults: [{ status: 'passed' }] })) }) };
+    };
+    const code = await runShards({ argv: ['npx', 'vitest', 'run', 'a'], shards: 1, parallel: 1, budgetMs }, {
+      discover: () => null, execute, now: () => 0, tmpdir: () => '/scratch', env, needsGit,
+      fs: { mkdtempSync: () => '/scratch/s', readFileSync: () => { throw Error('missing'); }, rmSync: () => {} },
+      acquireLocal: async () => ({ ok: true }), releaseLocal: () => {}, log: s => lines.push(s) });
+    return { code, calls, lines };
+  };
+  const waitFlag = call => call.args.find(a => a.startsWith('--wait-ms='));
+
+  it('gives a shard that must run locally (needs-git) a bounded wait of 15 minutes by default, before the -- separator', async () => {
+    const { calls } = await run();
+    expect(waitFlag(calls[0])).toBe('--wait-ms=900000');
+    expect(calls[0].args.indexOf(waitFlag(calls[0]))).toBeLessThan(calls[0].args.indexOf('--'));
+  });
+  it('adds no wait to a shard that can run remotely', async () => {
+    const { calls } = await run({ needsGit: () => false });
+    expect(waitFlag(calls[0])).toBeUndefined();
+  });
+  it('reads the budget from the cascade env (WE_VERIFY_LOCAL_SHARD_WAIT_MS), logging value and source', async () => {
+    const { calls, lines } = await run({ env: { WE_VERIFY_LOCAL_SHARD_WAIT_MS: '60000' } });
+    expect(waitFlag(calls[0])).toBe('--wait-ms=60000');
+    expect(lines.join('')).toMatch(/localShardWaitMs=60000/);
+  });
+  it('never waits longer than half the remaining verify budget (the other half is watchdog headroom)', async () => {
+    const { calls } = await run({ budgetMs: 5_000 });
+    expect(waitFlag(calls[0])).toBe('--wait-ms=2500');
+  });
+  it('the admission wait is always strictly shorter than the watchdog timeout, so a persistent deferral exits 75 and the watchdog never wins (budget 1620000, default wait)', async () => {
+    let clock = 0;
+    const seen = [];
+    const execute = async ({ args, timeoutMs }) => {
+      const waited = Number(/--wait-ms=(\d+)/.exec(args.join(' '))?.[1] ?? 0);
+      seen.push({ waited, timeoutMs });
+      // A real watchdog kills the child at timeoutMs; a wait that reaches it is a 124, not a 75.
+      if (waited >= timeoutMs) { clock += timeoutMs; return { exitCode: 124, timedOut: true, reportText: '' }; }
+      clock += waited;
+      return { exitCode: 75, reportText: '' };
+    };
+    // 600000 < the 900000 default wait: an uncapped wait would equal the whole watchdog timeout.
+    const code = await runShards({ argv: ['npx', 'vitest', 'run', 'a', 'b'], shards: 1, parallel: 1, budgetMs: 600_000 }, {
+      discover: () => null, execute, now: () => clock, tmpdir: () => '/scratch', env: {}, needsGit: () => true,
+      fs: { mkdtempSync: () => '/scratch/s', readFileSync: () => { throw Error('missing'); }, rmSync: () => {} },
+      acquireLocal: async () => ({ ok: true }), releaseLocal: () => {}, log: () => {} });
+    expect(code).toBe(SHARD_UNSETTLED_EXIT);
+    expect(seen).toHaveLength(1);
+    expect(seen[0].waited).toBeLessThan(seen[0].timeoutMs);
+  });
+  it('a one-millisecond remaining budget still passes a positive explicit wait (never 0 or an inherited default)', async () => {
+    const { calls } = await run({ budgetMs: 1 });
+    expect(waitFlag(calls[0])).toBe('--wait-ms=1');
+  });
+  it('ignores an invalid env value (fail closed to the default) and 0 is invalid too (never a zero or inherited wait)', async () => {
+    expect(waitFlag((await run({ env: { WE_VERIFY_LOCAL_SHARD_WAIT_MS: 'soon' } })).calls[0])).toBe('--wait-ms=900000');
+    expect(waitFlag((await run({ env: { WE_VERIFY_LOCAL_SHARD_WAIT_MS: '0' } })).calls[0])).toBe('--wait-ms=900000');
+  });
+  it('a waited deferral is not split-retried: one wait, exit 75 (never 124) even with two needs-git files and a tight budget', async () => {
+    const calls = [], lines = [];
+    let clock = 0;
+    const execute = async ({ args }) => {
+      calls.push(args);
+      const waited = Number(/--wait-ms=(\d+)/.exec(args.join(' '))?.[1] ?? 0);
+      clock += waited; // the admission wait consumes the verify budget
+      return { exitCode: 75, reportText: '' };
+    };
+    const code = await runShards({ argv: ['npx', 'vitest', 'run', 'a', 'b'], shards: 1, parallel: 1, budgetMs: 1_620_000 }, {
+      discover: () => null, execute, now: () => clock, tmpdir: () => '/scratch', env: {}, needsGit: () => true,
+      fs: { mkdtempSync: () => '/scratch/s', readFileSync: () => { throw Error('missing'); }, rmSync: () => {} },
+      acquireLocal: async () => ({ ok: true }), releaseLocal: () => {}, log: s => lines.push(s) });
+    expect(code).toBe(SHARD_UNSETTLED_EXIT);
+    expect(calls).toHaveLength(1);
+    expect(lines.join('')).not.toMatch(/retrying once/);
+  });
+  it('a deferral on the first split half stops the retry: the second half never queues for another wait', async () => {
+    const calls = [];
+    let clock = 0;
+    const execute = async ({ args, files }) => {
+      calls.push(files.length);
+      // Whole shard: ran but inventory incomplete (exit 0, empty report). First half: deferred after its wait.
+      if (files.length === 2) return { exitCode: 0, reportText: '' };
+      clock += Number(/--wait-ms=(\d+)/.exec(args.join(' '))?.[1] ?? 0);
+      return { exitCode: 75, reportText: '' };
+    };
+    const code = await runShards({ argv: ['npx', 'vitest', 'run', 'a', 'b'], shards: 1, parallel: 1, budgetMs: 3_600_000 }, {
+      discover: () => null, execute, now: () => clock, tmpdir: () => '/scratch', env: {}, needsGit: () => true,
+      fs: { mkdtempSync: () => '/scratch/s', readFileSync: () => { throw Error('missing'); }, rmSync: () => {} },
+      acquireLocal: async () => ({ ok: true }), releaseLocal: () => {}, log: () => {} });
+    expect(code).toBe(SHARD_UNSETTLED_EXIT);
+    expect(calls).toEqual([2, 1]);
+  });
+  it('a shard that still gets no slot within the budget still exits 75 (contract unchanged)', async () => {
+    const { code, lines } = await run({ exitCode: SHARD_UNSETTLED_EXIT });
+    expect(code).toBe(SHARD_UNSETTLED_EXIT);
+    expect(lines.join('')).toMatch(/host-load deferral.*waited/);
+  });
+});
