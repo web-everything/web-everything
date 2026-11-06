@@ -182,8 +182,9 @@ describe('launchd clone restart', () => {
     expect(r.restarted).toHaveLength(1); expect(o.launchctl).toHaveBeenCalled();
   });
   it('blank min-interval env is unset, not zero (debounce stays on)', async () => {
-    const o = fixture(); await restartServicesForClone({ ...o, env: { WE_DAEMON_SERVICE_RESTART_MIN_INTERVAL_MS: '  ' } });
-    const again = await restartServicesForClone({ ...o, env: { WE_DAEMON_SERVICE_RESTART_MIN_INTERVAL_MS: '  ' } });
+    // A different sha on the second call, so only the debounce (not the same-sha guard) can block it.
+    const o = fixture(); await restartServicesForClone({ ...o, adoptedSha: 'A', env: { WE_DAEMON_SERVICE_RESTART_MIN_INTERVAL_MS: '  ' } });
+    const again = await restartServicesForClone({ ...o, adoptedSha: 'B', env: { WE_DAEMON_SERVICE_RESTART_MIN_INTERVAL_MS: '  ' } });
     expect(o.launchctl).toHaveBeenCalledTimes(1); expect(again.restarted ?? []).toEqual([]);
   });
   it('unreadable and unparseable plist flagged not restarted', async () => {
