@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["plateau:scripts/wip-publish.ts", "plateau:scripts/__tests__/wip-publish.test.mjs", "plateau:src/wip/wip-agent-options.ts", "plateau:src/wip/wip-agent-options.test.ts", "we:docs/agent/testing.md"]
 dateOpened: "2026-09-28"
-preparedDate: "2026-11-03"
-preparedAgainstSha: "1b2aa007d3d7e718e7cf272da107a675f2cf5792"
+preparedDate: "2026-11-05"
+preparedAgainstSha: "27e2ab3d9d75ad000ae8e4b99410dcf2135de56c"
 tags: []
 ---
 
@@ -54,6 +54,16 @@ Extend the quality guidelines in `we:docs/agent/testing.md`: manually probed fix
 - Hold the first startup read for 25,000 fake milliseconds, opening the socket at time zero. Resolve it and flush microtasks; allow the single queued socket-open read to settle immediately, assert exactly two reads total, and assert no further read before 120,000 ms. The generic 10-second fallback queues additional timer reads at 10 and 20 seconds, so removing the override must produce exactly four reads after settlement at 25,000 ms (startup, socket-open, and two queued timer calls). Do not hold every read indefinitely or mistake the legitimate open-triggered read for a timer regression. A separate watcher case fires before that boundary and must read promptly. Count injected read calls, not sends or heavy cache misses. Stop the agent and restore real timers after every case.
 - In planned `plateau:scripts/__tests__/wip-publish.test.mjs`, name cases `live publisher uses cadence assembler` and `wiring guard refuses incomplete or bypassed evidence`. Read the actual script from disk. Exercise bypass, override, comment-only decoy, missing/duplicate call, wrong-module import, shadowed binding, escaped/indirect alias, malformed source, unsupported call shape and injected read failure fixtures through the same checker. Fail with a diagnostic requiring guard review; there is no permissive fallback.
 - Re-run existing `plateau:src/wip/wip-agent.test.ts`, `plateau:src/wip/wip-source.test.ts`, `plateau:src/wip/wip-publish.test.ts` and `plateau:src/wip/wip-feeds.test.ts` to protect the unchanged generic caller/default, watchers, feeds and HTTP behavior. Run through host heavy admission with Plateau root/config, never a bare test invocation.
+
+## Edge cases this change must handle
+
+1. Untrusted text: n/a: no LLM, PR, card or CLI text reaches a shell, argv, path or regex; the wiring guard parses repo source with the TypeScript parser and never evaluates it.
+2. Truncated reads: the guard reads the whole script from disk; an unreadable file fails the test with the source path (injected read-failure fixture), and a truncated file is rejected by the parse plus exactly-one-call checks. No `gh`/`git` reads are added.
+3. Shared state files: n/a: no state file is written; the suites use injected fakes only.
+4. Fail closed: a parse error, unreadable source, absent or duplicate call, unsupported syntax or wrong-module import fails the test with a "review/update the guard" diagnostic; never a skip, `[]` or pass (A3 negative fixtures).
+5. Identity scoping: imports are matched by actual module path (assembler must resolve to `plateau:src/wip/wip-agent-options.ts`) and named binding, not exported name alone; shadowed or aliased bindings are rejected.
+6. State over time: fake timers cover the two initialization reads, the 120,000 ms and 240,000 ms boundaries, a read held to 25,000 ms, and a watcher kick before the boundary; timers are stopped and real timers restored after every case. No persisted cadence state exists.
+7. Who wrote it: handled: no comment, ref, label or job name grants trust; comment-only decoys must not satisfy the guard (tested).
 
 ## Acceptance
 
