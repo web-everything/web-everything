@@ -89,6 +89,13 @@ export function quarantineNodeModulesStore(storeDir, reason) {
   return withNodeModulesStoreLock(storeDir, () => {
     const quarantined = join(dirname(storeDir), `.quarantined-${Date.now()}-${process.pid}-${basename(storeDir)}`);
     writeFileSync(quarantineNotice(storeDir), JSON.stringify({ reason, quarantined }));
+    // Quarantine revokes reuse immediately, but existing links must keep resolving.
+    // Keep their tree and permissions intact until the normal locked evictor sees
+    // no consumers. Unknown reference evidence also retains the store.
+    if (hasNodeModulesConsumer(storeDir, console.error, readFileSync)) {
+      writeFileSync(join(storeDir, NODE_MODULES_UNSAFE_FILE), JSON.stringify({ phase: 'quarantine', reason }));
+      return storeDir;
+    }
     renameSync(storeDir, quarantined);
     // A quarantine is never reusable; leave it removable by the next eviction pass.
     setNodeModulesWritable(join(quarantined, 'node_modules'), true);
@@ -192,9 +199,12 @@ export function recordNodeModulesConsumer(storeDir, into, { live = false, stagin
   return withNodeModulesStoreLock(storeDir, () => {
     // Eviction may have won the lock after the caller's integrity check. Refuse a deleted or
     // partly thawed source instead of publishing a reference and then creating a dangling link.
+    if (!live && hasQuarantinedNodeModulesStore(storeDir)) {
+      throw new Error('consumer source is quarantined');
+    }
     const modules = statSync(join(storeDir, 'node_modules'));
     if (!modules.isDirectory() || (!live && modules.mode & 0o222) || !existsSync(join(storeDir, COMPLETE_MARKER))) {
-      throw new Error('consumer source no longer complete and read-only');
+      throw Object.assign(new Error('consumer source no longer complete and read-only'), { code: 'ENODEMODULESSOURCE' });
     }
     const building = resolve(into);
     const consumer = building.replace(/\.building\.\d+$/, '');
@@ -212,7 +222,7 @@ export function recordNodeModulesConsumer(storeDir, into, { live = false, stagin
   });
 }
 
-function hasNodeModulesConsumer(storeDir, log, readFile) {
+function hasNodeModulesConsumer(storeDir, log, readFile, key = basename(storeDir)) {
   const refs = join(storeDir, CONSUMER_REFS);
   try {
     let names;
@@ -221,7 +231,7 @@ function hasNodeModulesConsumer(storeDir, log, readFile) {
       // A pending write or unknown record is not evidence that the store is unreferenced.
       if (!/^[a-f0-9]{64}\.json$/.test(name)) throw new Error('incomplete consumer reference');
       const data = JSON.parse(readFile(join(refs, name), 'utf8'));
-      if (data.ref !== nodeModulesRef(basename(storeDir)) || !isAbsolute(data.consumer ?? '') || !isAbsolute(data.building ?? '')) {
+      if (data.ref !== nodeModulesRef(key) || !isAbsolute(data.consumer ?? '') || !isAbsolute(data.building ?? '')) {
         throw new Error('invalid consumer reference');
       }
       if (data.live === true) {
@@ -313,6 +323,14 @@ export function ensureNodeModulesStore({ jobsDir, sourceDir, install = npmCiInst
   const key = lockfileKey(lock);
   const dir = join(snapshotsRoot(jobsDir), 'node-modules', key);
   mkdirSync(join(snapshotsRoot(jobsDir), 'node-modules'), { recursive: true });
+  if (hasQuarantinedNodeModulesStore(dir) && existsSync(dir)) {
+    withNodeModulesStoreLock(dir, () => {
+      if (hasNodeModulesConsumer(dir, console.error, readFileSync)) {
+        throw new Error('quarantined dependency store still has a live consumer');
+      }
+      removeStore(dir);
+    });
+  }
   buildOnce(dir, (into) => {
     copyFileSync(join(sourceDir, 'package.json'), join(into, 'package.json'));
     copyFileSync(join(sourceDir, 'package-lock.json'), join(into, 'package-lock.json'));
@@ -380,8 +398,18 @@ export function evictSnapshots({ jobsDir, referenced, keep = DEFAULT_SNAPSHOT_KE
     if (sub === 'node-modules' && existsSync(dir)) {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
         if (entry.isDirectory() && entry.name.startsWith('.quarantined-')) {
-          if (!dryRun) removeStore(join(dir, entry.name));
-          evicted.push(`quarantine:${entry.name}`);
+          const key = /^\.quarantined-\d+-\d+-(.+)$/.exec(entry.name)?.[1];
+          if (!key || (!existsSync(join(dir, key)) && refs.has(nodeModulesRef(key)))) continue;
+          try {
+            withLock(consumerLockPath(join(dir, key)), () => {
+              const storeDir = join(dir, entry.name);
+              if (hasNodeModulesConsumer(storeDir, log, readFile, key)) return;
+              if (!dryRun) removeStore(storeDir);
+              evicted.push(`quarantine:${entry.name}`);
+            }, CONSUMER_LOCK_OPTIONS);
+          } catch {
+            log(`snapshot eviction: retaining quarantine ${entry.name}; consumer protection unavailable`);
+          }
         }
       }
     }

@@ -118,7 +118,11 @@ function registerCurrentLiveTarget(root, options = {}) {
   let entry;
   try { entry = lstatSync(live); } catch (error) { if (error?.code === 'ENOENT') return; throw error; }
   if (entry.isSymbolicLink()) {
-    try { recordNodeModulesConsumer(dirname(realpathSync(live)), root, { ...options, live: true }); }
+    try {
+      const store = dirname(realpathSync(live));
+      recordNodeModulesConsumer(store, root, { ...options, live: true });
+      if (hasQuarantinedNodeModulesStore(store)) return 'quarantined';
+    }
     catch (error) {
       if (error?.code === 'ENOENT' && hasQuarantinedNodeModulesStore(dirname(resolve(dirname(live), readlinkSync(live))))) return 'quarantined';
       throw error;
@@ -134,7 +138,7 @@ export function linkOrCopyNodeModules({
   root, storeDir, destination = join(root, 'node_modules'), depsMode, step,
   exec = execFileSync, log = defaultLog, stat = statSync, readFile = readFileSync, lstat = lstatSync, readDir = readdirSync,
   env = process.env, settings,
-  referenceConsumer, liveConsumer,
+  referenceConsumer, liveConsumer, symlink = symlinkSync,
 }) {
   const mode = depsMode === undefined ? resolveRebuildDepsMode({ env, settings, log }).mode : depsMode;
   let reason = mode === 'copy' ? 'copy mode selected' : !validDepsMode(mode) ? 'invalid deps mode' : null;
@@ -142,6 +146,23 @@ export function linkOrCopyNodeModules({
   let source = original;
   try { source = realpathSync(original); }
   catch { reason = 'source device/integrity evidence unreadable'; }
+  // The checkout lockfile can move ahead of its live dependency link. Bind the real
+  // target to the requested store inputs before trusting (or copying) its contents.
+  if (source !== original) {
+    try {
+      if (lockfileKey(readFile(join(storeDir, 'package-lock.json'), 'utf8')) !==
+          lockfileKey(readFile(join(dirname(source), 'package-lock.json'), 'utf8'))) {
+        throw Object.assign(new Error('dependency store inputs do not match requested lockfile'), { code: 'ENODEMODULESINPUTS' });
+      }
+    } catch (error) {
+      throw Object.assign(new Error('dependency store input identity unavailable or mismatched', { cause: error }), { code: 'ENODEMODULESINPUTS' });
+    }
+  }
+  if (hasQuarantinedNodeModulesStore(dirname(source))) {
+    throw Object.assign(new Error('dependency store mutated: source is quarantined'), {
+      code: 'ENODEMODULESMUTATED', quarantined: dirname(source),
+    });
+  }
   let unsafe = false;
   try { readFile(join(dirname(source), NODE_MODULES_UNSAFE_FILE), 'utf8'); unsafe = true; reason = 'store marked unsafe during evidence generation; private copy only'; }
   catch (error) { if (error?.code !== 'ENOENT') { unsafe = true; reason = 'unsafe marker evidence unreadable; private copy only'; } }
@@ -195,6 +216,9 @@ export function linkOrCopyNodeModules({
       mutated ||= guarded && (['ENODEMODULESPERMISSION', 'EUNSAFENODEMODULESLINK', 'ENOENT'].includes(error?.code) || error instanceof SyntaxError);
     }
   }
+  if (mutated && !existsSync(source)) {
+    throw Object.assign(new Error('dependency store disappeared during validation'), { code: 'ENOENT' });
+  }
   if (mutated) {
     sayDeps(log, `rebuild dependencies: copy refused; quarantining mutated store (${reason})`);
     let quarantined;
@@ -205,8 +229,9 @@ export function linkOrCopyNodeModules({
     throw Object.assign(new Error(`dependency store mutated: ${reason}`), { code: 'ENODEMODULESMUTATED', quarantined });
   }
   if (!reason) {
+    let publishing = false;
     try {
-      const publish = () => symlinkSync(source, destination, 'dir');
+      const publish = () => { publishing = true; symlink(source, destination, 'dir'); };
       if (referenceConsumer) recordNodeModulesConsumer(dirname(source), referenceConsumer, {
         ...liveConsumer, requestedRef: nodeModulesRef(basename(storeDir)), publish,
       });
@@ -215,7 +240,8 @@ export function linkOrCopyNodeModules({
     } catch (error) {
       // Do not delete a pre-existing target on EEXIST; swap callers supply a fresh staging path.
       if (error?.code === 'EEXIST') throw error;
-      if (referenceConsumer) {
+      if (error?.code === 'ENOENT') throw error;
+      if (referenceConsumer && !publishing && error?.code !== 'ENODEMODULESSOURCE') {
         sayDeps(log, 'rebuild dependencies: consumer registration/link failed; refusing unprotected copy');
         throw Object.assign(new Error('dependency consumer registration/link failed', { cause: error }), { code: 'ENODEMODULESCONSUMER' });
       }
@@ -292,7 +318,7 @@ export function depsJobsDir(root, env = process.env) {
 /** The store directory (holding `node_modules/`) for a lockfile key, and whether it is complete. */
 export function depsStore(jobsDir, key) {
   const dir = join(snapshotsRoot(jobsDir), 'node-modules', key);
-  return { dir, complete: existsSync(join(dir, COMPLETE_MARKER)) && existsSync(join(dir, 'node_modules')) };
+  return { dir, complete: !hasQuarantinedNodeModulesStore(dir) && existsSync(join(dir, COMPLETE_MARKER)) && existsSync(join(dir, 'node_modules')) };
 }
 
 /**

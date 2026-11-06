@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join, relative } from 'node:path';
 import * as deps from '../daemon-rebuild/deps-job.mjs';
 import { cloneNodeModulesInstaller, REBUILD_JOB_KIND } from '../daemon-rebuild/rebuild-job.mjs';
-import { ensureNodeModulesStore, evictSnapshots, NODE_MODULES_HASH_FILE, NODE_MODULES_MANIFEST_FILE, NODE_MODULES_UNSAFE_FILE, nodeModulesRef, nodeModulesTreeEvidence, setNodeModulesWritable } from '../daemon-job-snapshots.mjs';
+import { ensureNodeModulesStore, evictSnapshots, quarantineNodeModulesStore, NODE_MODULES_HASH_FILE, NODE_MODULES_MANIFEST_FILE, NODE_MODULES_UNSAFE_FILE, nodeModulesRef, nodeModulesTreeEvidence, setNodeModulesWritable } from '../daemon-job-snapshots.mjs';
 import { createJobStore, enqueueJob, launchJob, prepareJobCode } from '../daemon-jobs-runtime.mjs';
 import { markClaimed, markLaunching } from '../daemon-jobs.mjs';
 import { withFileLock } from '../atomic-json-file.mjs';
@@ -276,6 +276,54 @@ describe('both rebuild copy sites use the guarded decision', () => {
     cloneNodeModulesInstaller(f.storeDir, { exec: f.exec, depsMode: 'symlink', log: f.log, fallback })(f.root);
     expect(fallback).toHaveBeenCalledTimes(1);
     expect(fallback).toHaveBeenCalledWith(f.root);
+    expect(f.exec).not.toHaveBeenCalled();
+  });
+
+  it('a live link to valid store A cannot satisfy requested lockfile B', () => {
+    const f = fixture();
+    symlinkSync(join(f.storeDir, 'node_modules'), join(f.sourceDir, 'node_modules'), 'dir');
+    const lockB = '{"lockfileVersion":3,"name":"B","packages":{}}';
+    for (const dir of [f.sourceDir, f.root]) writeFileSync(join(dir, 'package-lock.json'), lockB);
+    const fallback = vi.fn((into) => {
+      mkdirSync(join(into, 'node_modules'));
+      writeFileSync(join(into, 'node_modules', 'payload.txt'), 'B dependencies');
+    });
+    cloneNodeModulesInstaller(f.sourceDir, { exec: f.exec, log: f.log, fallback })(f.root);
+    expect(fallback).toHaveBeenCalledWith(f.root);
+    expect(lstatSync(target(f)).isSymbolicLink()).toBe(false);
+    expect(readFileSync(join(target(f), 'payload.txt'), 'utf8')).toBe('B dependencies');
+    expect(f.exec).not.toHaveBeenCalled();
+  });
+
+  it('symlink creation failure falls back to a private copy protected against eviction', () => {
+    const f = fixture();
+    const symlink = vi.fn(() => { throw Object.assign(new Error('links denied'), { code: 'EPERM' }); });
+    const exec = vi.fn((...args) => {
+      expect(evictSnapshots({ jobsDir: join(f.base, 'jobs'), referenced: [], keep: 0 }).evicted).toEqual([]);
+      f.exec(...args);
+    });
+    cloneNodeModulesInstaller(f.storeDir, { exec, log: f.log, symlink })(f.root);
+    expect(symlink).toHaveBeenCalledTimes(1);
+    expectCopied(f, /symlink creation.*failed/i);
+  });
+
+  it('a store disappearing during validation uses the installer fallback', () => {
+    const f = fixture();
+    const stat = vi.fn((path) => {
+      if (path === join(f.storeDir, 'node_modules')) {
+        setNodeModulesWritable(f.storeDir, true);
+        rmSync(f.storeDir, { recursive: true });
+      }
+      return statSync(path);
+    });
+    const fallback = vi.fn((into) => {
+      mkdirSync(join(into, 'node_modules'));
+      writeFileSync(join(into, 'node_modules', 'payload.txt'), 'reinstalled');
+    });
+    cloneNodeModulesInstaller(f.storeDir, { exec: f.exec, log: f.log, stat, fallback })(f.root);
+    expect(stat).toHaveBeenCalled();
+    expect(fallback).toHaveBeenCalledWith(f.root);
+    expect(readFileSync(join(target(f), 'payload.txt'), 'utf8')).toBe('reinstalled');
     expect(f.exec).not.toHaveBeenCalled();
   });
 
@@ -812,17 +860,18 @@ describe('quarantine recovery and explicit unsafe completion markers', () => {
     expectQuarantined(f, /fingerprint.*mismatch/i, () => deps.linkOrCopyNodeModules({ ...f, depsMode: 'copy' }));
   });
 
-  it('a quarantined live target queues a replacement install even after quarantine eviction and an unchanged installed key', async () => {
+  it('quarantine retains a mutated live target until its consumer releases it and queues recovery', async () => {
     const f = fixture();
     deps.swapNodeModules(f);
     const path = join(f.storeDir, 'node_modules', 'pkg', 'index.js');
     chmodSync(path, 0o644);
     writeFileSync(path, 'mutated while shared');
     chmodSync(path, 0o444);
-    const quarantined = expectQuarantined(f, /fingerprint.*mismatch/i);
-    expect(lstatSync(target(f)).isSymbolicLink()).toBe(true);
-    evictSnapshots({ jobsDir: join(f.base, 'jobs'), referenced: [], keep: 0 });
-    expect(existsSync(quarantined)).toBe(false);
+    expect(() => deps.linkOrCopyNodeModules(f)).toThrow(/dependency store mutated/);
+    expect(realpathSync(target(f))).toBe(join(f.storeDir, 'node_modules'));
+    expect(readFileSync(join(target(f), 'pkg', 'index.js'), 'utf8')).toBe('mutated while shared');
+    expect(statSync(join(f.storeDir, 'node_modules')).mode & 0o222).toBe(0);
+    expect(evictSnapshots({ jobsDir: join(f.base, 'jobs'), referenced: [], keep: 0 }).evicted).toEqual([]);
     const reattach = vi.fn(async () => null);
     const result = await deps.refreshDepsAsJob({
       root: f.root, installed: { read: () => basename(f.storeDir), write: vi.fn() },
@@ -830,8 +879,28 @@ describe('quarantine recovery and explicit unsafe completion markers', () => {
     });
     expect(result.reason).toBe('deps-job-started');
     expect(reattach).toHaveBeenCalledTimes(1);
+    expect(() => ensureNodeModulesStore({ jobsDir: join(f.base, 'jobs'), sourceDir: f.sourceDir, install: f.install }))
+      .toThrow(/quarantined.*consumer/i);
+    rmSync(target(f));
+    // Publish a private replacement: an absent link alone may be a swap interval.
+    mkdirSync(target(f));
+    evictSnapshots({ jobsDir: join(f.base, 'jobs'), referenced: [], keep: 0 });
+    expect(existsSync(f.storeDir)).toBe(false);
     ensureNodeModulesStore({ jobsDir: join(f.base, 'jobs'), sourceDir: f.sourceDir, install: f.install });
+    deps.swapNodeModules(f);
     expectLinked(f);
+  });
+
+  it('quarantine retains a rebuild snapshot source until the snapshot is removed', () => {
+    const f = fixture();
+    cloneNodeModulesInstaller(f.storeDir, { exec: f.exec, log: f.log })(f.root);
+    expect(quarantineNodeModulesStore(f.storeDir, 'mutation')).toBe(f.storeDir);
+    expectLinked(f);
+    expect(evictSnapshots({ jobsDir: join(f.base, 'jobs'), referenced: [], keep: 0 }).evicted).toEqual([]);
+    rmSync(f.root, { recursive: true });
+    expect(evictSnapshots({ jobsDir: join(f.base, 'jobs'), referenced: [], keep: 0 }).evicted)
+      .toEqual([nodeModulesRef(basename(f.storeDir))]);
+    expect(existsSync(f.storeDir)).toBe(false);
   });
 
   it.each(['hash', 'manifest', 'chmod', 'tree', 'manifest-write'])('evidence failure in %s publishes an unsafe marker BEFORE completion and forces a private copy', (phase) => {

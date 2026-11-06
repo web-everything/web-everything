@@ -110,7 +110,14 @@ export function cloneNodeModulesInstaller(sourceRoot, { exec = execFileSync, fal
     let same = false;
     try { same = readFileSync(join(sourceRoot, 'package-lock.json'), 'utf8') === readFileSync(join(into, 'package-lock.json'), 'utf8'); } catch { same = false; }
     if (same && existsSync(src)) {
-      linkOrCopyNodeModules({ ...options, root: into, storeDir: sourceRoot, exec, referenceConsumer: into });
+      try {
+        linkOrCopyNodeModules({ ...options, root: into, storeDir: sourceRoot, exec, referenceConsumer: into });
+      } catch (error) {
+        // A missing source or mismatched target cannot supply the requested dependencies.
+        // Install from the snapshot's own inputs instead of copying an older live target.
+        if (!['ENOENT', 'ENODEMODULESINPUTS'].includes(error?.code)) throw error;
+        fallback(into);
+      }
       return;
     }
     fallback(into);
