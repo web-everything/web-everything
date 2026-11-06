@@ -520,6 +520,7 @@ describe('prep-advisory PR with no full review settles stale pending (R639, #641
     const f = fixture({ readEvidence: () => evidence({ loopPayload: undefined }), ...over });
     f.rawPrs[0].labels = ['review:prep', 'ready-to-merge', 'red-team:pending'];
     f.rawPrs[0].comments = [prepNote()];
+    Object.assign(f.rawPrs[0], { headRefName: 'lane/4421-prepare-item-guards', files: [{ path: 'backlog/4421-guards.md' }] });
     return f;
   };
   it('plans a not-owed settlement instead of escalating, and removes only pending', () => {
@@ -533,6 +534,9 @@ describe('prep-advisory PR with no full review settles stale pending (R639, #641
   });
   it.each([
     ['no review:prep label', f => { f.rawPrs[0].labels = ['red-team:pending']; }],
+    ['code PR carrying the label and note', f => { f.rawPrs[0].files.push({ path: 'scripts/lib/x.mjs' }); }],
+    ['non-prepare branch', f => { f.rawPrs[0].headRefName = 'lane/other'; }],
+    ['file list missing', f => { delete f.rawPrs[0].files; }],
     ['prep note for another head', f => { f.rawPrs[0].comments = [prepNote(old)]; }],
     ['prep note blocked', f => { f.rawPrs[0].comments = [prepNote(head, ' blocked=1')]; }],
     ['prep note from untrusted author', f => { f.rawPrs[0].comments = [{ ...prepNote(), author: { login: 'rando' } }]; }],

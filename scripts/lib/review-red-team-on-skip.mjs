@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
 import { readFileSync, statSync } from 'node:fs';
 import { listRunIds, readRun, sharedRunsDir } from '../operations/run-store.mjs';
-import { priorPrepReviews } from '../conveyor/prep-review.mjs';
+import { priorPrepReviews, prepareCardOnly } from '../conveyor/prep-review.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { createHash } from 'node:crypto';
@@ -396,6 +396,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       const prepNotes = priorPrepReviews(rawPr.comments).filter(note => note.head === head);
       const prepAdvisoryClear = keepsPending && !acceptedReview && Array.isArray(reviews)
         && rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:prep')
+        // Only a PR whose whole diff is its one prepared card may be advisory-only; a label and note alone never prove it.
+        && prepareCardOnly(rawPr) !== null
         && prepNotes.length > 0 && prepNotes.every(note => !note.blocked)
         && evidence?.loopPayload == null && status == null
         && evidence?.inFlight === false && !evidence.queued
