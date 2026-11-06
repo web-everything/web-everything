@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -81,7 +81,15 @@ describe('audit settings (R528)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'audit-settings-'));
     afterAll(() => rmSync(dir, { recursive: true, force: true }));
     const prefs = (name, body) => { const p = join(dir, name); writeFileSync(p, body); return p; };
-    const fromDisk = (prefsPath, audit = {}) => resolveAuditSettings({ fileRead: file(audit), env: { WE_PLATFORM_PREFERENCES_FILE: prefsPath }, log: () => {} });
+    // The default platform chain (read when an override is set, to union its path lists) is faked: only the
+    // override file is read from disk, every default-chain file is absent unless `chain` names its body.
+    const platformRead = (override, chain = {}) => (p, enc) => {
+      if (p === override) return readFileSync(p, enc);
+      for (const [suffix, body] of Object.entries(chain)) if (p.endsWith(suffix)) return body;
+      throw Object.assign(new Error('absent'), { code: 'ENOENT' });
+    };
+    const fromDisk = (prefsPath, audit = {}, chain = {}) => resolveAuditSettings({ fileRead: file(audit),
+      env: { WE_PLATFORM_PREFERENCES_FILE: prefsPath }, platformRead: platformRead(prefsPath, chain), log: () => {} });
     it('an unreadable or corrupt platform file fails closed instead of reading as unset', () => {
       for (const p of [dir, prefs('truncated.json', '{"audit":{"releaseStage":"prod"} ')]) {
         const r = fromDisk(p);
@@ -106,8 +114,36 @@ describe('audit settings (R528)', () => {
         expect(r.value.guardFloorPaths).toEqual(STRICT_PATHS);
         expect(r.warnings.join()).toMatch(/platform preference unreadable/);
       }
-      // A configured file that exists is read normally (the check is about absence, not about being configured).
-      expect(fromDisk(prefs('present.json', '{}'), full()).value.releaseStage).toBe('prerelease');
+      // A configured file that exists and holds an `audit` object is read normally.
+      expect(fromDisk(prefs('present.json', '{"audit":{}}'), full()).value.releaseStage).toBe('prerelease');
+    });
+    it('an override file with no object "audit" fails closed instead of dropping the platform chain (PR #6381 judge)', () => {
+      // A package.json-like file: it parses, but sets no audit preference, so the override would silently replace the
+      // whole default platform chain (and its added protected paths) with nothing.
+      const chain = { 'delivery-platform-preferences.json': '{"audit":{"guardFloorPaths":["custom/**"]}}' };
+      for (const body of ['{"name":"pkg","version":"1.0.0","scripts":{}}', '{}', '{"audit":null}', '{"audit":"prod"}', '{"audit":[]}']) {
+        const r = fromDisk(prefs('pkg-like.json', body), full(), chain);
+        expect(r.value).toMatchObject(STRICT);
+        expect(r.value.guardFloorPaths).toEqual(STRICT_PATHS);
+        expect(r.value.raceBlockPaths).toEqual(STRICT_PATHS);
+        expect(r.warnings.join()).toMatch(/platform preference unreadable/);
+      }
+    });
+    it('an override file adds to the default chain path lists, never removes them (PR #6381 judge)', () => {
+      const chain = { 'delivery-platform-preferences.json': '{"audit":{"raceBlockPaths":["custom/**"],"guardFloorPaths":["custom/**"]}}' };
+      const r = fromDisk(prefs('override.json', '{"audit":{"raceBlockPaths":["other/**"],"guardFloorPaths":["other/**"]}}'), full(), chain);
+      expect(r.value.raceBlockPaths).toEqual([...GUARD_FLOOR, 'custom/**', 'other/**']);
+      expect(r.value.guardFloorPaths).toEqual([...GUARD_FLOOR, 'custom/**', 'other/**']);
+      expect(r.warnings).toEqual([]);
+      // The operator-owned file in the default chain counts too, and an override with no lists keeps the chain lists.
+      const op = { 'platform-preferences.json': '{"audit":{"guardFloorPaths":["op/**"]}}' };
+      expect(fromDisk(prefs('override-empty.json', '{"audit":{}}'), full(), op).value.guardFloorPaths).toEqual([...GUARD_FLOOR, 'op/**']);
+      // An unreadable or invalid default chain still fails closed under an override.
+      const broken = fromDisk(prefs('override-2.json', '{"audit":{}}'), full(), { 'delivery-platform-preferences.json': '{"audit":' });
+      expect(broken.value).toMatchObject(STRICT);
+      expect(broken.warnings.join()).toMatch(/platform preference unreadable/);
+      const badList = fromDisk(prefs('override-3.json', '{"audit":{}}'), full(), { 'delivery-platform-preferences.json': '{"audit":{"guardFloorPaths":[""]}}' });
+      expect(badList.value.guardFloorPaths).toEqual(STRICT_PATHS);
     });
     it('platform path lists are unioned with the tool file lists, never replaced by them (PR #6381 judge)', () => {
       const r = fromDisk(prefs('lists.json', '{"audit":{"raceBlockPaths":["plat-race/**"],"guardFloorPaths":["plat-guard/**"]}}'),

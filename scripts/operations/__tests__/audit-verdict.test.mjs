@@ -1,5 +1,7 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { URL as NodeURL, fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import { GUARD_FLOOR, LOCK_API, LOCK_HOLDERS, LOCK_PRIMITIVES, LOCK_USERS, REVIEW_AUTH_FLOOR } from '../../lib/audit-settings.mjs';
@@ -29,8 +31,10 @@ const settingsLayer = vi.hoisted(() => ({ current: null }));
 vi.mock('../../lib/audit-settings.mjs', async importOriginal => {
   const real = await importOriginal();
   return { ...real, resolveAuditSettings: () => {
-    const { audit, env } = settingsLayer.current;
-    return real.resolveAuditSettings({ fileRead: () => JSON.stringify({ audit }), platform: null, env, log: () => {} });
+    const { audit, env, platformRead } = settingsLayer.current;
+    // A layer with a `platformRead` seam reads the platform chain through it (the override case); others skip it.
+    return real.resolveAuditSettings({ fileRead: () => JSON.stringify({ audit }), ...(platformRead ? { platformRead } : { platform: null }),
+      env, log: () => {} });
   } };
 });
 // Default: trusted prove mode with a valid proof for every D2 (the relation label is irrelevant); opts override.
@@ -211,6 +215,31 @@ describe('R473 pure classified verdict', () => {
         if (extra.interleaving) expect(result.blocks).toEqual([expect.objectContaining({ id: 'claim-key-race', class: 'B4' })]);
       }
     }
+  });
+  // PR #6381 judge: WE_PLATFORM_PREFERENCES_FILE replaced the whole platform chain, so a race path the default chain
+  // protects was dropped and a D3 race there cleared once the override pointed anywhere else.
+  it('a D3 race in a default-chain protected path stays WEAKENED under a platform-file override (PR #6381 judge)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'audit-verdict-override-'));
+    try {
+      const chainBody = '{"audit":{"raceBlockPaths":["custom/**"],"guardFloorPaths":["custom/**"]}}';
+      const platformRead = override => (p, enc) => {
+        if (p === override) return readFileSync(p, enc);
+        if (p.endsWith('delivery-platform-preferences.json')) return chainBody;
+        throw Object.assign(new Error('absent'), { code: 'ENOENT' });
+      };
+      const f = finding({ class: 'D3', file: 'custom/writer.mjs', invariant: 'One writer owns the record',
+        trigger: 'A reads the record; B writes it; A writes over it', consequence: 'B\'s write is lost', interleaving });
+      for (const [name, body] of [['override.json', '{"audit":{"raceBlockPaths":["other/**"]}}'], ['package.json', '{"name":"pkg"}']]) {
+        const override = join(dir, name); writeFileSync(override, body);
+        const layer = { audit: AUDIT, env: { WE_PLATFORM_PREFERENCES_FILE: override }, platformRead: platformRead(override) };
+        const result = await compute([f], options('prerelease'), layer);
+        expect(result.verdict).toBe('WEAKENED');
+        expect(result.ships).toEqual([]);
+      }
+      // Control: without the default-chain path the same finding ships, so the path is what makes it block.
+      const plain = await compute([f], options('prerelease'));
+      expect(plain.verdict).toBe('NOT WEAKENED');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   // The class behind it: a module that takes a lock decides the lock's key and its holder, whatever its name. The lock
   // users are read from the source here, to their fixed point: a module importing a primitive, or importing a

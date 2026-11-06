@@ -339,12 +339,14 @@ export function resolveAuditSettings(options = {}) {
     return { value: Object.freeze(value), sources: Object.fromEntries(Object.keys(value).map(k => [k, 'strictest'])), warnings };
   }
 }
-function resolveUnguarded({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync, platform, env = process.env, log } = {}, warnings) {
+function resolveUnguarded({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync, platform, platformRead = readFileSync, env = process.env, log } = {}, warnings) {
   const warn = m => { warnings.push(m); try { (log ?? (() => {}))(m); } catch { /* never throws */ } };
   const { tool, unreadable } = readFile(path, fileRead);
   // The platform layer is read HERE, not inside the cascade, so its read errors and an explicit `"audit": null`
   // stay visible: the cascade drops both and they would read as "no platform preference".
-  let plat = platform; let platUnreadable = false;
+  // `chainPlat` is the default platform chain's audit preference, read only when an override replaces that chain:
+  // the override may ADD protected paths, never remove the chain's (PR #6381 judge).
+  let plat = platform; let platUnreadable = false; let chainPlat;
   if (plat === undefined) {
     try {
       // The reader skips a missing file silently. That is right for the default paths, but an EXPLICITLY configured
@@ -354,10 +356,22 @@ function resolveUnguarded({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync,
       const configured = String(env?.[PLATFORM_PREFERENCES_ENV] ?? '').trim();
       const configuredBad = () => configured !== '' && (!isAbsolute(configured) || !existsSync(configured));
       const before = configuredBad();
-      const { prefs, errors } = readPlatformPreferences({ env, warn: () => {} });
+      const { prefs, errors } = readPlatformPreferences({ env, readFile: platformRead, warn: () => {} });
       plat = prefs.audit;
       platUnreadable = before || configuredBad() || errors.length > 0 || (Object.hasOwn(prefs, 'audit') && prefs.audit === null);
-    } catch { plat = undefined; platUnreadable = true; }
+      if (configured !== '') {
+        // An explicitly configured file with no object `audit` (absent, null or not an object — a package.json, `{}`)
+        // sets no audit preference, yet it replaces the whole default chain: its protected paths would vanish with no
+        // warning. That is a choice we cannot read, so it fails closed (PR #6381 judge).
+        if (!isObj(prefs.audit)) platUnreadable = true;
+        // The default chain, read with the override removed from env, supplies path lists the override adds to.
+        const chainEnv = { ...env }; delete chainEnv[PLATFORM_PREFERENCES_ENV];
+        const chain = readPlatformPreferences({ env: chainEnv, readFile: platformRead, warn: () => {} });
+        chainPlat = chain.prefs.audit;
+        // Read as it would be with no override: an unreadable chain or a present non-object `audit` fails closed.
+        if (chain.errors.length > 0 || (Object.hasOwn(chain.prefs, 'audit') && !isObj(chainPlat))) platUnreadable = true;
+      }
+    } catch { plat = undefined; chainPlat = undefined; platUnreadable = true; }
   }
   // A platform preference that is present but not an object flattens to one root leaf and reads as all-omitted.
   const platBad = platUnreadable || (plat !== undefined && plat !== null && !isObj(plat));
@@ -403,14 +417,17 @@ function resolveUnguarded({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync,
   // an explicit choice we cannot read, so it resolves to the strictest list: the floor plus every path.
   // Each layer's list is read RAW and the lists are unioned: the cascade would let the file list REPLACE a platform
   // list, silently dropping the platform's extra protected paths (PR #6381 judge).
+  // Under a platform-file override the default chain's lists are unioned in first, so the override only adds.
   for (const key of ['raceBlockPaths', 'guardFloorPaths']) {
     let strictest = unreadable || !cascade || platBad;
-    const layerLists = [isObj(plat) ? plat[key] : undefined, isObj(tool) ? tool[key] : undefined].filter(l => l !== undefined);
+    const own = layer => (isObj(layer) ? layer[key] : undefined);
+    const layerLists = [own(chainPlat), own(plat), own(tool)].filter(l => l !== undefined);
+    const chainMalformed = rawMalformed(chainPlat, key, validPaths) || caseShadowed(chainPlat, key);
     let platList = []; let list = [];
-    if (!layerLists.every(validPaths) || malformed(key, validPaths)) { warn(`audit setting ${key} invalid; every path protected`); strictest = true; }
+    if (!layerLists.every(validPaths) || malformed(key, validPaths) || chainMalformed) { warn(`audit setting ${key} invalid; every path protected`); strictest = true; }
     else {
-      platList = isObj(plat) && plat[key] !== undefined ? plat[key] : [];
-      list = [...platList, ...(isObj(tool) && tool[key] !== undefined ? tool[key] : [])];
+      platList = [...(own(chainPlat) ?? []), ...(own(plat) ?? [])];
+      list = [...platList, ...(own(tool) ?? [])];
     }
     let envList = [];
     const raw = env?.[AUDIT_SETTINGS_ENV[key]];
