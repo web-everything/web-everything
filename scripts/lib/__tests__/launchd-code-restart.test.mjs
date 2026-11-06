@@ -887,9 +887,27 @@ describe('interpreter option shapes that once hid a clone script (value contains
       const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: [outside, other], EnvironmentVariables: { NODE_OPTIONS: `--require ${other}` } }]);
       expect(findServicesRunningFromClone(o).matches).toEqual([]);
     });
-    it('-r is the restricted-mode flag for a shell, not a preload operand', () => {
-      const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/bin/bash', '-r', join(cloneRoot, 'data'), other] }]);
-      expect(findServicesRunningFromClone(o).matches).toEqual([]);
+    // In a shell `-r` is the operand-free restricted-mode flag, so the next argument is the script that runs.
+    it.each(['bash', 'sh', 'zsh', 'dash', 'ksh'])('%s -r keeps the immediately following clone script as the executable code path', async shell => {
+      const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: [`/bin/${shell}`, '-r', join(cloneRoot, 'sampler.sh')] }]);
+      expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
+      expect((await restartServicesForClone(o)).restarted).toHaveLength(1);
+      expect(findStaleCodeServices({ ...o, readProcessStartMs: () => 100_000, readAdoptedAtMs: () => 200_000 })).toHaveLength(1);
+    });
+    it('bash -r with a clone script and trailing external data is still clone-backed; with an external script and a clone data argument it is not', () => {
+      expect(findServicesRunningFromClone(fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/bin/bash', '-r', join(cloneRoot, 'data'), other] }])).matches).toHaveLength(1);
+      const external = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/bin/bash', '-r', other, join(cloneRoot, 'data.json')] }]);
+      expect(findServicesRunningFromClone(external).matches).toEqual([]);
+    });
+    it('-r combined with other shell flags (-ru, -r -e) still leaves the next argument as the script', () => {
+      for (const flags of [['-ru'], ['-r', '-e'], ['-eu', '-r']]) {
+        const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/bin/bash', ...flags, join(cloneRoot, 'sampler.sh')] }]);
+        expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
+      }
+    });
+    it('-r is still a preload operand for ruby', () => {
+      const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/ruby', '-r', join(cloneRoot, 'boot.rb'), other] }]);
+      expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
     });
     it.each([
       ['separate operand', [outside, '--require', other, other]],

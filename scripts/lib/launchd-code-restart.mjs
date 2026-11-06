@@ -190,9 +190,10 @@ function codeArguments(args, start = 0, cwd = null, depth = 0) {
     // executes: it is an owner (a clone-backed bootstrap makes the service clone-backed), not skipped data.
     const attachedPreload = /^--(?:require|import|loader|experimental-loader)=(.+)$/.exec(arg);
     if (attachedPreload) { result.owners.push(preloadOwner(attachedPreload[1], cwd)); continue; }
-    if (operand.has(arg)) {
-      // `-r` is a preload only for node/ruby; in a shell it is the restricted-mode flag and takes no operand.
-      if (PRELOAD.has(arg) && (arg !== '-r' || /^(?:node|nodejs|ruby)$/.test(name)) && args[i + 1] !== undefined) result.owners.push(preloadOwner(args[i + 1], cwd));
+    // `-r` takes an operand (a preload) only for node/ruby. In a shell it is the operand-free restricted-mode flag,
+    // so the following argument is the script and must stay in view; elsewhere it falls through to the flag/unknown paths.
+    if (operand.has(arg) && (arg !== '-r' || /^(?:node|nodejs|ruby)$/.test(name))) {
+      if (PRELOAD.has(arg) && args[i + 1] !== undefined) result.owners.push(preloadOwner(args[i + 1], cwd));
       i += 1; continue;
     }
     if (arg.startsWith('-') || arg.startsWith('+')) {
