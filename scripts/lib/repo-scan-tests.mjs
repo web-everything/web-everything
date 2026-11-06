@@ -118,13 +118,6 @@ export const REPO_SCAN_TESTS = Object.freeze([
     inputs: ['scripts/lib/permission-change.mjs', 'scripts/lib/__tests__/permission-change.test.mjs'],
   },
   {
-    test: 'scripts/operations/__tests__/audit-verdict.test.mjs',
-    scope: 'full',
-    why: 'expands REVIEW_AUTH_FLOOR to tracked modules and reads their direct imports, so a new import in any review authorization module must be on the floor (a whole-family fact; not expressible per changed file)',
-    matches: (f) => /\.(mjs|cjs|js)$/.test(f) && !skipped(f) && !/\.test\./.test(f) && inTree(f, ['scripts']),
-    inputs: ['scripts/lib/audit-settings.mjs', 'scripts/operations/audit-verdict.mjs', 'scripts/operations/__tests__/audit-verdict.test.mjs'],
-  },
-  {
     test: 'scripts/operations/__tests__/worker-result.test.mjs',
     scope: 'full',
     why: 'asserts the legacy outcome mapping is total over every `--outcome=` word in skills-src/**/*-brief*.md (item 117 S1); reads the briefs, so a brief change must re-run it',
@@ -160,6 +153,7 @@ export const DEFERRED_SCAN_TESTS = Object.freeze({
   'scripts/operations/__tests__/unsized-kind-callers.test.mjs': 'greps scripts/ for a never-sized kind paired with a size (#x0h3pe4); cheap to run in CI, and every caller it guards also has its own wiring test',
   'scripts/lib/__tests__/settings-files.test.mjs': 'one test walks scripts/ to pin the direct readers of the legacy dispatch-settings.json to LEGACY_ONLY_READERS; it is a small walk, and it is also selected by `vitest related` whenever settings-files.mjs changes; a brand-new direct reader is caught by CI',
   'scripts/lib/__tests__/merge-queue-enqueue.test.mjs': 'one test greps scripts/ for any sender of the enqueue mutation other than merge-queue-enqueue.mjs (PR 4708); a small walk that is also selected by `vitest related` whenever merge-queue-enqueue.mjs changes, and a new sender elsewhere is caught by CI',
+  'scripts/operations/__tests__/audit-verdict.test.mjs': 'one case expands REVIEW_AUTH_FLOOR to the tracked review authorization modules and reads their direct imports; a small bounded walk that `vitest related` selects whenever audit-settings.mjs or audit-verdict.mjs changes, and a new unprotected import in another module is caught by CI',
   'scripts/operations/__tests__/run.test.mjs':'lists a throwaway run directory, not the repo',
   'scripts/operations/__tests__/review-loop-cli.test.mjs': 'lists a throwaway temp root, not the repo',
   'scripts/__tests__/review-set-label.approval-prevention-filing.test.mjs': 'lists a throwaway temp root, not the repo',

@@ -1,6 +1,3 @@
-// @repo-scanning-test scope=full
-// One case reads the tracked review authorization modules and checks each direct import is on REVIEW_AUTH_FLOOR
-// (registered in scripts/lib/repo-scan-tests.mjs).
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { URL as NodeURL, fileURLToPath } from 'node:url';
