@@ -37,17 +37,35 @@ function blankInlineCode(source) {
  * Blank every HTML blockquote/pre block, depth-counted so a nested block cannot end its outer one early.
  * An unterminated block runs to the end of the text. One linear pass.
  */
+function blankHtmlComments(source, code) {
+  // Same-length copy with every terminated HTML comment blanked, so a tag written inside a comment is not a tag. A `<!--`
+  // that sits in inline code does not start a comment; an unterminated one blanks nothing (the stripper then hides more).
+  let out = '', last = 0, from = 0;
+  for (;;) {
+    const open = source.indexOf('<!--', from);
+    if (open === -1) break;
+    if (code[open] !== '<') { from = open + 4; continue; }
+    const close = source.indexOf('-->', open + 4);
+    if (close === -1) break;
+    out += source.slice(last, open) + ' '.repeat(close + 3 - open);
+    last = from = close + 3;
+  }
+  return out + source.slice(last);
+}
 function stripHtmlBlocks(text) {
   const source = String(text ?? '');
-  // Tags are located in a same-length copy with inline code blanked (`<pre>` in prose is not a block), and only a
-  // whole tag name counts: `<pre-commit>` or `<blockquote styling` must not hide a real marker.
-  const scan = blankInlineCode(source);
+  // Tags are located in a same-length copy with comments blanked. Inline code (`<pre>` in prose is not a block) only
+  // hides a tag while no block is open: inside a real <pre>/<blockquote> there is no Markdown, so a backticked tag is a tag.
+  // Only a whole tag name counts: `<pre-commit>` or `<blockquote styling` must not hide a real marker.
+  const code = blankInlineCode(source);
+  const scan = blankHtmlComments(source, code);
   const tag = /<(\/?)(blockquote|pre)(?:\s[^<>]*)?\/?>/gi;
   // Open tag names, innermost last. A closer only counts when it names the innermost open tag: an unrelated one
   // (`</blockquote>` inside `<pre>`) is ignored, so a marker still inside the example stays hidden (fails closed).
   const open = [];
   let out = '', last = 0, start = 0, m;
   while ((m = tag.exec(scan))) {
+    if (!open.length && code[m.index] !== '<') continue; // a tag inside inline code, outside any block
     const name = m[2].toLowerCase();
     if (!m[1]) {
       if (!open.length) start = m.index;

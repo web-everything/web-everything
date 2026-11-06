@@ -384,6 +384,17 @@ describe('quoted and fenced references never resolve an operator request', () =>
   ])('%s does not expose the marker still inside the block', (_name, block) => {
     expect(open([request, comment('end', 'web-everything', '21:00', `${release}${block}`)])).toEqual(['1001']);
   });
+  it.each([
+    ['a </pre> inside an HTML comment', '<pre>\n<!-- </pre> -->\n<!-- addresses-operator-send-back: 1001 -->\n</pre>\n'],
+    ['a backticked <pre> opener inside an open block', '<pre>\n`<pre>`\n</pre>\n<!-- addresses-operator-send-back: 1001 -->\n</pre>\n'],
+    ['a backticked <blockquote> opener inside an open block', '<blockquote>\n`<blockquote>`\n</blockquote>\n<!-- addresses-operator-send-back: 1001 -->\n</blockquote>\n'],
+  ])('%s does not expose the marker still inside the block', (_name, block) => {
+    expect(open([request, comment('end', 'web-everything', '21:00', `${release}${block}`)])).toEqual(['1001']);
+  });
+  it('a <pre> inside an HTML comment is not an opener, so the real marker after it resolves', () => {
+    const body = `${release}<!-- <pre> -->\n<!-- addresses-operator-send-back: 1001 -->\n`;
+    expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual([]);
+  });
   it('properly nested mixed blocks still close, so a marker after them resolves', () => {
     const body = `${release}<pre><blockquote>x</blockquote></pre>\n<!-- addresses-operator-send-back: 1001 -->\n`;
     expect(open([request, comment('end', 'web-everything', '21:00', body)])).toEqual([]);
