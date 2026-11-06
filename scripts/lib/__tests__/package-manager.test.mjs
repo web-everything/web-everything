@@ -84,7 +84,7 @@ describe('a valid env override beats a malformed platform layer', () => {
       expect(r.degraded).toMatch(/invalid platform/);
       const calls = [];
       installWithFallback({ frozen: false, env: { WE_PACKAGE_MANAGER: 'pnpm' }, readPlatform: prefs, pnpmVersion: () => '9', log: () => {}, exec: (b, a) => calls.push([b, ...a]) });
-      expect(calls).toEqual([['pnpm', 'install']]);
+      expect(calls).toEqual([['pnpm', 'install', '--no-frozen-lockfile']]);
     });
   it('without an env override a malformed platform layer still resolves to npm and stays degraded', () => {
     const r = resolvePackageManager({ env: {}, readPlatform: () => ({ prefs: { packageManager: { choice: 'pnpm' } }, errors: [] }) });
@@ -146,6 +146,15 @@ describe('installArgv / installCommand', () => {
   it('pnpm: --frozen-lockfile when ci', () => {
     const r = installArgv({ ci: true, env: { WE_PACKAGE_MANAGER: 'pnpm' }, platform: undefined, pnpmVersion: () => '9' });
     expect(r).toMatchObject({ bin: 'pnpm', args: ['install', '--frozen-lockfile'], manager: 'pnpm', source: 'env' });
+  });
+  it('pnpm: a non-frozen install says --no-frozen-lockfile so CI=true cannot freeze it (pnpm freezes by default in CI)', () => {
+    const pnpmEnv = { WE_PACKAGE_MANAGER: 'pnpm', CI: 'true' };
+    expect(installArgv({ ci: false, env: pnpmEnv, platform: undefined, pnpmVersion: () => '9' }).args).toEqual(['install', '--no-frozen-lockfile']);
+    expect(installArgv({ ci: false, ignoreScripts: true, env: pnpmEnv, pnpmVersion: () => '9' }).args).toEqual(['install', '--no-frozen-lockfile', '--ignore-scripts']);
+    expect(installCommand({ frozen: false, env: pnpmEnv, pnpmVersion: () => '9', log: () => {} })).toBe('pnpm install --no-frozen-lockfile');
+    const calls = [];
+    installWithFallback({ frozen: false, env: pnpmEnv, pnpmVersion: () => '9', log: () => {}, exec: (b, a) => calls.push([b, ...a]) });
+    expect(calls).toEqual([['pnpm', 'install', '--no-frozen-lockfile']]);
   });
   it('ignoreScripts adds --ignore-scripts for both', () => {
     expect(installArgv({ ci: true, ignoreScripts: true, ...none }).args).toEqual(['ci', '--ignore-scripts']);
@@ -256,7 +265,7 @@ describe('installWithFallback', () => {
     const calls = [];
     const r = installWithFallback({ frozen: false, env: { WE_PACKAGE_MANAGER: 'pnpm' }, pnpmVersion: () => '9', log: () => {},
       exec: (bin, args) => { calls.push([bin, ...args]); if (bin === 'pnpm') throw new Error('ERR_PNPM_FETCH_FAIL'); } });
-    expect(calls).toEqual([['pnpm', 'install'], ['npm', 'install']]);
+    expect(calls).toEqual([['pnpm', 'install', '--no-frozen-lockfile'], ['npm', 'install']]);
     expect(r.fellBack).toBe(true);
   });
   it('a failed npm install propagates (no silent success)', () => {

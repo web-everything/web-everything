@@ -87,7 +87,8 @@ export function installArgv({ ci = false, ignoreScripts = false, pnpmVersion = d
       manager = 'npm'; note = `pnpm --version failed (from ${r.source}); using npm`;
     }
   }
-  const args = manager === 'pnpm' ? ['install', ...(ci ? ['--frozen-lockfile'] : [])] : [ci ? 'ci' : 'install'];
+  // pnpm freezes an existing lockfile by default when CI is set, so a non-frozen install must say so explicitly.
+  const args = manager === 'pnpm' ? ['install', ci ? '--frozen-lockfile' : '--no-frozen-lockfile'] : [ci ? 'ci' : 'install'];
   if (ignoreScripts) args.push('--ignore-scripts');
   return { bin: manager, args, manager, source: r.source, ...(note ? { note } : {}) };
 }
