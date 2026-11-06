@@ -320,6 +320,57 @@ describe('salvageLane (real git)', () => {
     expect(listLitterWorktrees(lane)).toEqual([]);
   });
 
+  it('a deleted worktree whose HEAD object probe fails for a reason other than "absent" throws and records no salvage', () => {
+    const wt = join(lane, '.claude', 'worktrees', 'faulty');
+    git(lane, 'worktree', 'add', '-q', '--detach', wt, 'origin/main');
+    writeFileSync(join(wt, 'saved.txt'), 'only here\n');
+    git(wt, 'add', '.'); git(wt, 'commit', '-qm', 'worktree only');
+    git(lane, 'worktree', 'lock', wt);
+    rmSync(wt, { recursive: true });
+    // Fault injection: a `git` shim on PATH that fails every `cat-file` with status 128 (a corrupt object database
+    // or malformed head) and runs everything else for real. Only the stale-worktree probe uses `cat-file`, so a
+    // salvage that swallowed this failure would skip the worktree's commits and let the caller's reset discard them.
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const shimDir = join(root, 'shim');
+    mkdirSync(shimDir);
+    const shim = join(shimDir, 'git');
+    writeFileSync(shim, `#!/bin/sh\nfor a in "$@"; do [ "$a" = cat-file ] && { echo 'fatal: injected fault' >&2; exit 128; }; done\nexec '${realGit}' "$@"\n`);
+    chmodSync(shim, 0o755);
+
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${oldPath}`;
+    try {
+      expect(() => salvageLane({ dir: lane, lane: 5, pool: 'p', branchRef: 'origin/main', salvageRoot, now: new Date('2026-09-27T02:00:00Z') })).toThrow(/injected fault|cat-file/);
+    } finally { process.env.PATH = oldPath; }
+    expect(existsSync(join(salvageRoot, 'index.jsonl'))).toBe(false);
+    // Without the fault the same lane salvages the worktree's commit (the probe passes, nothing else differs).
+    const rec = salvageLane({ dir: lane, lane: 5, pool: 'p', branchRef: 'origin/main', salvageRoot, now: new Date('2026-09-27T02:00:01Z') });
+    expect(rec.refs).toContain('refs/salvage/lane-5-20260927-020001-wt-faulty-head');
+  });
+
+  it('a lane and a registered worktree holding a nested repo at the SAME relative path get distinct copies with their own content', () => {
+    const rel = 'scratch/probe';
+    const wt = join(lane, '.claude', 'worktrees', 'fix-1');
+    git(lane, 'worktree', 'add', '-q', '--detach', wt, 'origin/main');
+    for (const [root, text] of [[lane, 'lane copy\n'], [wt, 'worktree copy\n']]) {
+      const nested = join(root, rel);
+      mkdirSync(nested, { recursive: true }); git(nested, 'init', '-q');
+      writeFileSync(join(nested, 'notes.txt'), text);
+    }
+
+    const rec = salvageLane({ dir: lane, lane: 5, pool: 'p', branchRef: 'origin/main', salvageRoot, now: new Date('2026-09-27T02:00:00Z') });
+    const base = join(rec.outDir, 'lane-5.nested-repos');
+    const laneDest = join(base, rel);
+    const wtDest = join(base, '.claude', 'worktrees', 'fix-1', rel);
+    expect(rec.nestedRepos).toEqual(expect.arrayContaining([
+      { rel, dest: laneDest },
+      { rel: join('.claude', 'worktrees', 'fix-1', rel), dest: wtDest },
+    ]));
+    expect(rec.nestedRepos).toHaveLength(2);
+    expect(readFileSync(join(laneDest, 'notes.txt'), 'utf8')).toBe('lane copy\n');
+    expect(readFileSync(join(wtDest, 'notes.txt'), 'utf8')).toBe('worktree copy\n');
+  });
+
   it('copies an untracked unborn nested repo verbatim while snapshotting normal changes without touching the real index', () => {
     const rel = '.fix-scratch/probe-run/base-clean';
     const nested = join(lane, rel);
