@@ -135,7 +135,7 @@ const sameMergedTree = trees => {
 };
 
 // Real Vitest reporters and the production runner; only process execution is injected.
-function tapRunners(f, { flaky = false, mainTitle = 'worker behaves', mainSuite = 'worker', corrupt } = {}) {
+function tapRunners(f, { flaky = false, mainTitle = 'worker behaves', mainSuite = 'worker', corrupt, hooksFile, hooksNested = false } = {}) {
   const calls = [];
   const runner = vi.fn(async options => runHeavyTests(options, { exec: async () => {
     const main = ok(options.root, ['rev-parse', 'HEAD']) === f.mainSha;
@@ -145,6 +145,15 @@ function tapRunners(f, { flaky = false, mainTitle = 'worker behaves', mainSuite 
       ...(failed ? { errors: [{ message: 'expected worker to behave', stack: '' }] } : {}) });
     let stdout = await scratchTestOutput(selectedFiles(options).map(name => {
       const failed = red && name === failedFile;
+      if (hooksFile && name === hooksFile) {
+        // An afterAll/beforeAll hook failure: every leaf passes but the suite itself is red.
+        const leaf = { type: 'test', name: 'hooked behaves', mode: 'run', result: state(false) };
+        return { type: 'suite', name, mode: 'run', result: state(!hooksNested), tasks: [
+          hooksNested
+            ? { type: 'suite', name: 'hooked', mode: 'run', result: state(true), tasks: [leaf] }
+            : leaf,
+        ] };
+      }
       return { type: 'suite', name, mode: 'run', result: state(failed), tasks: [
         { type: 'suite', name: main ? mainSuite : 'worker', mode: 'run', result: state(failed), tasks: [
           { type: 'suite', name: 'nested', mode: 'run', result: state(failed), tasks: [
@@ -172,6 +181,21 @@ describe('production heavy runner failing TAP evidence', () => {
     expect(kinds(f)).toContain('overlay-main-flaky-retried');
     expect(kinds(f)).toContain('overlay-main-synced');
     expect(f.pushes).toHaveLength(1);
+  });
+
+  it.each([
+    ['file-level', false],
+    ['nested describe', true],
+  ])('a red suite with no failed leaf (%s afterAll failure) beside a flaky leaf stays on operator review', async (_, hooksNested) => {
+    // worker0 has one failed leaf that would pass on rerun; worker1's leaf passes but its suite
+    // is red because a hook failed. The rerun must not erase the hook failure and publish.
+    const f = fixture(), calls = tapRunners(f, { flaky: true, hooksFile: 'worker1.test.mjs', hooksNested });
+    await expect(job(f)).rejects.toThrow(failure);
+    expect(calls).toHaveLength(1);
+    expect(kinds(f)).not.toContain('overlay-main-flaky-retried');
+    expect(kinds(f)).not.toContain('overlay-main-red');
+    expect(f.outcomes.map(event => event.kind)).toContain('overlay-main-sync-failed');
+    noPublication(f);
   });
 
   it('classifies the same nested assertion on merged tree and plain main as main-red', async () => {

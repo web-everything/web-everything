@@ -430,6 +430,11 @@ const remoteUnconfirmed = result => result?.status === 124 && typeof result.stde
 function failedTestReport(stdout, options) {
   if (typeof stdout !== 'string' || Buffer.byteLength(stdout) > 8 * 1024 * 1024) throw testFailure();
   const failed = new Map(), titles = [];
+  // A red suite (not ok ... {) with no failed leaf beneath it is a hook failure
+  // (beforeAll/afterAll); the leaf-only inventory below would erase it, so track it.
+  // Per-occurrence ids (not title paths) so duplicate sibling suite names cannot mask each other.
+  const redSuites = new Set(), suitesWithFailedLeaf = new Set(), suiteIds = [];
+  let suiteCount = 0;
   let leaf = 0, diagnostic, inTap = false;
   // Reuse the strict TAP plan and typed-test-count validator. Normalize only red
   // statuses/diagnostics for validation, then restore the observed failed leaves.
@@ -446,11 +451,17 @@ function failedTestReport(stdout, options) {
     const yaml = inTap && /^( +)---$/.exec(line);
     if (yaml) { diagnostic = yaml[1]; return []; }
     const task = inTap && /^( *)(not )?ok \d+ - (.*?)(?: # (SKIP|TODO|time=\d+(?:\.\d+)?ms))?( \{)?$/s.exec(line);
-    if (inTap && /^\s*}$/.test(line)) titles.pop();
+    if (inTap && /^\s*}$/.test(line)) { titles.pop(); suiteIds.pop(); }
     if (task) {
-      if (task[5]) titles.push(task[3]);
-      else if (titles.length) {
-        if (task[2]) failed.set(leaf, { title: task[3], ancestorTitles: titles.slice(1) });
+      if (task[5]) {
+        titles.push(task[3]);
+        suiteIds.push(suiteCount++);
+        if (task[2]) redSuites.add(suiteIds.at(-1));
+      } else if (titles.length) {
+        if (task[2]) {
+          failed.set(leaf, { title: task[3], ancestorTitles: titles.slice(1) });
+          for (const id of suiteIds) suitesWithFailedLeaf.add(id);
+        }
         leaf++;
       }
     }
@@ -470,6 +481,8 @@ function failedTestReport(stdout, options) {
     return [line.replace(/^(\s*)not ok /, '$1ok ')];
   }).join('\n');
   if (diagnostic !== undefined || !failed.size) throw testFailure();
+  // Fail closed: a red suite without a failed leaf is a hook failure that must not be rerun away.
+  for (const id of redSuites) if (!suitesWithFailedLeaf.has(id)) throw testFailure();
   const report = heavyTestReport(normalized, options);
   report.testResults.flatMap(r => r.assertionResults).forEach((assertion, index) => {
     if (failed.has(index)) {
