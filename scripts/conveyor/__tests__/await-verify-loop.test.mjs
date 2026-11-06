@@ -84,7 +84,7 @@ describe('runSlotAwareAwaitPass — the real pass, R3-gated', () => {
     expect(h.calls.resume).toEqual(['sid-2']); // the older wait wakes first
     expect(h.store.get('sid-1')?.pendingResume?.kind).toBe('green'); // kept on disk for the next cycle
     expect(out.rows.find((r) => r.pr === 2)).toMatchObject({ action: 'push', result: 'pushed; resumed:green' });
-    expect(out.rows.find((r) => r.pr === 1).result).toMatch(/^pushed; resume-deferred \(fix slot full/);
+    expect(out.rows.find((r) => r.pr === 1).result).toBe('pushed; resume-deferred (fix slot full: 1 owed ahead, 1 admitted, 1 working, cap 2)');
     // next cycle, a slot is free (7 finished): the owed resume wakes without a second push
     const again = await runSlotAwareAwaitPass({ io: h.io, runPass: runAwaitVerifyPass, allowResume: true, settings: ON, claims: [claim(1)], nowMs: NOW, ttlMs: TTL, cap: 2 });
     expect(h.calls.push.sort()).toEqual([1, 2]);
