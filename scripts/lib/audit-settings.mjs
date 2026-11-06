@@ -32,7 +32,9 @@ export const REVIEW_AUTH_FLOOR = Object.freeze([
   // Each operation with its -io and -cli halves: the I/O half performs the write the pure half decides.
   'scripts/operations/record-verdict*', 'scripts/operations/record-referral-ruling*', 'scripts/operations/land-human-only*',
   'scripts/conveyor/hiccup-approve.mjs', 'scripts/settings/delivery-identity.json', 'scripts/lib/review-escalation.mjs',
-  'scripts/lib/identical-net-patch.mjs', 'scripts/lib/carry-equivalence.mjs', 'scripts/lib/numbering-carry.mjs']);
+  'scripts/lib/identical-net-patch.mjs', 'scripts/lib/carry-equivalence.mjs', 'scripts/lib/numbering-carry.mjs',
+  // `**/` needs at least one folder here, so each `scripts/**/` entry above has a twin for a file directly in scripts/.
+  'scripts/*human-clearance-carry*', 'scripts/accept-carry-*', 'scripts/*verdict-carry*', 'scripts/*clear-human*']);
 /** Modules the review authorization family imports directly (the source-scan test pins this list complete). */
 const REVIEW_AUTH_IMPORTS = Object.freeze([
   'scripts/lib/github-app-identity.mjs', 'scripts/lib/approval-prevention-notice.mjs', 'scripts/lib/review-verdict-carried-marker.mjs',

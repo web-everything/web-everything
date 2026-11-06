@@ -598,18 +598,29 @@ describe('R473 structured concurrency evidence', () => {
         'scripts/lib/review-independence.mjs', 'scripts/lib/ruling-ledger.mjs', 'scripts/operations/record-verdict.mjs',
         'scripts/operations/record-referral-ruling.mjs', 'scripts/operations/land-human-only.mjs', 'scripts/lib/verdict-ledger.mjs',
         'scripts/lib/delegation-marker.mjs', 'scripts/lib/review-escalation.mjs', 'scripts/lib/human-clearance-carry.mjs']));
-      for (const entry of REVIEW_AUTH_FLOOR) expect(GUARD_FLOOR, entry).toContain(entry);
     });
-    // PR #6381 self-review: review-set-label.mjs decides whether a mandatory referral is cleared through these two.
+    // git's `scripts/**/x` also matches a file directly under scripts/, the floor's matcher does not: every scanned root
+    // must itself be protected, so a root the scan reaches can never sit outside the floor (PR #6381 self-review).
+    it.each(AUTH_ROOTS)('every review authorization root is on the floor: E2 in %s never ships', async file => {
+      neverShips(await compute([finding({ class: 'E2', file })], options()));
+    });
+    // PR #6381 self-review: imports of review-set-label.mjs (review-seat-policy and referral-card-readable decide whether a
+    // mandatory referral counts as cleared), review-escalation.mjs and the record-verdict I/O half.
     it.each(['scripts/operations/review-seat-policy.mjs', 'scripts/lib/referral-card-readable.mjs', 'scripts/lib/review-labels.mjs',
       'scripts/operations/record-verdict-io.mjs'])('E2 in %s (an import of a review authorization module) refuses clearance', async file => {
       for (const stage of ['prerelease', 'prod']) neverShips(await compute([finding({ class: 'E2', file })], options(stage, { guardFloorPaths: [] })));
     });
+    // A specifier never spans a line: without `\n` in the exclusion a doc comment such as "from './lib/ai-pr-" with the
+    // name continued on the next line read as an import of a path that does not exist (PR #6381 self-review).
     const directImports = AUTH_ROOTS.flatMap(root => [...readFileSync(`${repoRoot}${root}`, 'utf8')
-      .matchAll(/\bfrom\s*['"](\.\.?\/[^'"]+)['"]|\bimport\(\s*['"](\.\.?\/[^'"]+)['"]\s*\)/g)]
+      .matchAll(/\bfrom\s*['"](\.\.?\/[^'"\r\n]+)['"]|\bimport\(\s*['"](\.\.?\/[^'"\r\n]+)['"]\s*\)/g)]
       .map(m => fileURLToPath(new NodeURL(m[1] ?? m[2], new NodeURL(root, `file://${repoRoot}`))).slice(repoRoot.length)));
     it('the review authorization family has direct imports to check (the source scan is live)', () => {
-      expect(directImports).toEqual(expect.arrayContaining(['scripts/lib/github-app-identity.mjs', 'scripts/lib/carry-equivalence.mjs']));
+      expect(directImports).toEqual(expect.arrayContaining(['scripts/lib/github-app-identity.mjs', 'scripts/lib/carry-equivalence.mjs',
+        'scripts/operations/review-seat-policy.mjs']));
+    });
+    it('every scanned import is a real file (a misread specifier fails here, not as an unprotected made-up path)', () => {
+      expect([...new Set(directImports)].filter(p => !existsSync(`${repoRoot}${p}`))).toEqual([]);
     });
     it.each([...new Set(directImports)].sort())(
       'every direct import of the review authorization family is on the floor: E2 in %s never ships (PR #6381 red team)', async file => {
