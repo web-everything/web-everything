@@ -3994,6 +3994,12 @@ test `settings-files`; use heavy admission.
 
 ### Dependency-store recovery fixtures
 
+Cached rebuild aliases must be exercised through a second `prepareJobCode` with the same
+lockfile: the completion shortcut must recheck the resolved target's integrity, quarantine
+status and lockfile identity. Rejected or unreadable evidence removes only the cached alias;
+the rebuild installer receives `forcePrivate` and installs from pinned inputs rather than
+copying rejected live contents. Keep a valid-target reuse case alongside the refusal cases.
+
 `rebuild-deps-symlink.test.mjs` must recover a quarantined live store without manually
 unlinking its consumer: install a fresh generation, then drive the dependency tick's swap.
 Assert the old contents remain reachable until publication, the installed lockfile key

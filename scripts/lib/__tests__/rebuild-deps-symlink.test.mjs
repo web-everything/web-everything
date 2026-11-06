@@ -96,6 +96,43 @@ function expectQuarantined(f, reason, run = () => deps.linkOrCopyNodeModules(f))
   return failure.quarantined;
 }
 
+describe('cached rebuild aliases', () => {
+  it.each(['unchanged', 'mutated', 'quarantined', 'lockfile mismatch', 'missing evidence', 'unsafe', 'dangling'])('revalidates a cached alias when its target is %s', (state) => {
+    const f = fixture();
+    mkdirSync(join(f.base, 'rebuild-cache'));
+    const store = createJobStore(join(f.base, 'rebuild-cache'));
+    const record = enqueueJob({ store, kindDef: REBUILD_JOB_KIND, codeSha: 'cache-first', input: { root: f.root } });
+    const fallback = vi.fn(f.install);
+    const snapshot = {
+      materialize: (into) => {
+        for (const name of ['package.json', 'package-lock.json']) {
+          writeFileSync(join(into, name), readFileSync(join(f.sourceDir, name)));
+        }
+      },
+      install: cloneNodeModulesInstaller(f.storeDir, { exec: f.exec, log: f.log, fallback }),
+    };
+    const first = prepareJobCode({ store, record, kindDef: REBUILD_JOB_KIND, snapshot });
+    const alias = dirname(readlinkSync(join(first.cwd, 'node_modules')));
+    expect(lstatSync(join(alias, 'node_modules')).isSymbolicLink()).toBe(true);
+    if (state === 'mutated') {
+      chmodSync(join(f.storeDir, 'node_modules', 'payload.txt'), 0o644);
+      writeFileSync(join(f.storeDir, 'node_modules', 'payload.txt'), 'rejected contents');
+    }
+    if (state === 'quarantined') quarantineNodeModulesStore(f.storeDir, 'rejected');
+    if (state === 'lockfile mismatch') writeFileSync(join(f.storeDir, 'package-lock.json'), '{"different":true}');
+    if (state === 'missing evidence') rmSync(join(f.storeDir, NODE_MODULES_MANIFEST_FILE));
+    if (state === 'unsafe') writeFileSync(join(f.storeDir, NODE_MODULES_UNSAFE_FILE), '{}');
+    if (state === 'dangling') renameSync(join(f.storeDir, 'node_modules'), join(f.storeDir, 'removed'));
+    const nextRecord = enqueueJob({ store, kindDef: REBUILD_JOB_KIND, codeSha: 'cache-second', input: { root: f.root } });
+    const next = prepareJobCode({ store, record: nextRecord, kindDef: REBUILD_JOB_KIND, snapshot });
+    expect(next.snapshotKeys[1]).toBe(first.snapshotKeys[1]);
+    expect(lstatSync(join(alias, 'node_modules')).isSymbolicLink()).toBe(state === 'unchanged');
+    expect(fallback).toHaveBeenCalledTimes(state === 'unchanged' ? 0 : 1);
+    expect(readFileSync(join(next.cwd, 'node_modules', 'payload.txt'), 'utf8')).toBe('store payload');
+    expect(f.exec).not.toHaveBeenCalled();
+  });
+});
+
 describe('rebuild dependency mode and provenance', () => {
   it('defaults to symlink with built-in provenance and logs the effective value and source', () => {
     const log = vi.fn();

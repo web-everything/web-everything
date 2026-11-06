@@ -105,7 +105,13 @@ export function rebuildJobsDir(root, env = process.env) {
 
 /** Snapshot installer: guarded store link (or private copy) when lockfiles match, else npm ci. */
 export function cloneNodeModulesInstaller(sourceRoot, { exec = execFileSync, fallback = npmCiInstaller(), ...options } = {}) {
-  return (into) => {
+  return (into, { forcePrivate = false } = {}) => {
+    // A rejected cached alias must never copy from the same rejected live target.
+    if (forcePrivate) {
+      options.log?.('rebuild dependencies: copy fallback (cached alias target rejected; installing private dependencies)');
+      fallback(into);
+      return;
+    }
     const src = join(sourceRoot, 'node_modules');
     let same = false;
     try { same = readFileSync(join(sourceRoot, 'package-lock.json'), 'utf8') === readFileSync(join(into, 'package-lock.json'), 'utf8'); } catch { same = false; }

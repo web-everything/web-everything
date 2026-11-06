@@ -278,10 +278,10 @@ function hasNodeModulesConsumer(storeDir, log, readFile, key = basename(storeDir
 
 /**
  * Build `dir` once: materialize into a sibling temp dir, mark it complete, rename it into place. A leftover
- * temp dir from a killed build is removed first; a finished `dir` is returned untouched.
+ * temp dir from a killed build is removed first; a finished `dir` is reused only if accepted.
  */
-function buildOnce(dir, materialize) {
-  if (existsSync(join(dir, COMPLETE_MARKER))) return dir;
+function buildOnce(dir, materialize, reusable = () => true) {
+  if (existsSync(join(dir, COMPLETE_MARKER)) && reusable(dir)) return dir;
   if (existsSync(dir)) removeStore(dir); // an incomplete snapshot is never used
   const tmp = `${dir}.building.${process.pid}`;
   removeStore(tmp);
@@ -292,7 +292,7 @@ function buildOnce(dir, materialize) {
     renameSync(tmp, dir);
   } catch (e) {
     removeStore(tmp);
-    if (existsSync(join(dir, COMPLETE_MARKER))) return dir; // a concurrent builder won the rename
+    if (existsSync(join(dir, COMPLETE_MARKER)) && reusable(dir)) return dir; // a concurrent builder won the rename
     throw e;
   }
   return dir;
@@ -327,9 +327,36 @@ export function npmCiInstaller({ timeoutMs = NPM_INSTALL_TIMEOUT_MS } = {}) {
   };
 }
 
+/** Aliases carry no independent integrity: always check the resolved store's original evidence. */
+function validateNodeModulesAlias(dir, key) {
+  const modules = join(dir, 'node_modules');
+  if (!lstatSync(modules).isSymbolicLink()) return;
+  const source = realpathSync(modules);
+  const store = dirname(source);
+  if (hasQuarantinedNodeModulesStore(store)
+    || lstatSync(join(store, NODE_MODULES_UNSAFE_FILE), { throwIfNoEntry: false })
+    || !readFileSync(join(store, COMPLETE_MARKER), 'utf8').trim()
+    || lockfileKey(readFileSync(join(store, 'package-lock.json'), 'utf8')) !== key) {
+    throw new Error('cached dependency alias target rejected');
+  }
+  const hash = readFileSync(join(store, NODE_MODULES_HASH_FILE), 'utf8').trim();
+  const actual = createHash('sha256').update(readFileSync(join(source, '.package-lock.json'))).digest('hex');
+  const recorded = JSON.parse(readFileSync(join(store, NODE_MODULES_MANIFEST_FILE), 'utf8'));
+  const packages = nodeModulesPackageManifest(source);
+  const tree = nodeModulesTreeEvidence(source);
+  if (!/^[a-f0-9]{64}$/.test(hash) || hash !== actual
+    || recorded.sha256 !== packages.sha256
+    || JSON.stringify(recorded.packages) !== JSON.stringify(packages.packages)
+    || recorded.entryCount !== tree.entryCount || recorded.treeSha256 !== tree.treeSha256) {
+    throw new Error('cached dependency alias integrity mismatch');
+  }
+}
+
 /**
  * The `node_modules` store for the lockfile in `sourceDir`, built on first use.
- * @param {{jobsDir: string, sourceDir: string, install?: (into: string) => void}} o
+ * Installers receive `{ forcePrivate: true }` after rejecting a cached alias; rebuild installers
+ * must install from the pinned inputs instead of linking or copying the rejected live target.
+ * @param {{jobsDir: string, sourceDir: string, install?: (into: string, options?: {forcePrivate: boolean}) => void}} o
  * @returns {{key: string, dir: string}} Physical store key (a fresh generation after quarantine).
  */
 export function ensureNodeModulesStore({ jobsDir, sourceDir, install = npmCiInstaller(),
@@ -338,11 +365,13 @@ export function ensureNodeModulesStore({ jobsDir, sourceDir, install = npmCiInst
   const lock = readFileSync(join(sourceDir, 'package-lock.json'), 'utf8');
   const key = lockfileKey(lock);
   const dir = nodeModulesStoreDir(jobsDir, key);
+  let forcePrivate = false;
   mkdirSync(join(snapshotsRoot(jobsDir), 'node-modules'), { recursive: true });
   buildOnce(dir, (into) => {
     copyFileSync(join(sourceDir, 'package.json'), join(into, 'package.json'));
     copyFileSync(join(sourceDir, 'package-lock.json'), join(into, 'package-lock.json'));
-    install(into);
+    if (forcePrivate) install(into, { forcePrivate: true });
+    else install(into);
     // Cheap mutation evidence from npm's hidden lock, not a recursive package-content audit.
     // Missing/unreadable evidence leaves this store copy-only for rebuilds.
     // Some injected installers and npm configurations produce no hidden lock: do not invent evidence.
@@ -371,6 +400,9 @@ export function ensureNodeModulesStore({ jobsDir, sourceDir, install = npmCiInst
     }
     // Never re-freeze reused stores or regenerate their evidence: mutation must fail the guard,
     // not silently regain trust. Installs lacking the hidden lock never reach the freeze above.
+  }, (cached) => {
+    try { validateNodeModulesAlias(cached, key); return true; }
+    catch { forcePrivate = true; return false; }
   });
   rmSync(quarantineNotice(dir), { force: true });
   return { key: basename(dir), dir };
