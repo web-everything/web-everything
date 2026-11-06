@@ -1,13 +1,16 @@
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, existsSync, unlinkSync, readdirSync } from 'node:fs';
+import { Worker } from 'node:worker_threads';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import * as awaitStore from '../await-verify.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { writeStoredAwaitVerify, listStoredAwaitVerify } from '../await-verify.mjs';
 import { classifyStaleOwed } from '../fixer-slot-rules.mjs';
 import { runSlotAwareAwaitPass } from '../await-verify-loop.mjs';
 import { runAwaitVerifyPass, isHarnessRecord, defaultAwaitVerifyIo } from '../await-verify-pass.mjs';
+import { withFileLock } from '../../lib/atomic-json-file.mjs';
 
 const T0 = Date.parse('2026-10-08T19:30:00Z');
 const entry = (key, pr, age = 0, extra = {}) => ({ key, record: {
@@ -70,7 +73,7 @@ describe('stale owed resumes (R618)', () => {
     expect(h.store.has(old.key)).toBe(false);
   });
 
-  it.each(['sha', 'requestedAt', 'sessionId', 'inventory', 'restore', 'collision', 'after-rename', 'unreadable', 'missing', 'same'])
+  it.each(['sha', 'requestedAt', 'sessionId', 'inventory', 'restore', 'after-rename', 'unreadable', 'missing', 'same'])
   ('conditional store deletion protects concurrent writers: %s', mode => {
     const dir = mkdtempSync(join(tmpdir(), 'conditional-await-'));
     const old = entry('atomic', 1).record;
@@ -79,7 +82,6 @@ describe('stale owed resumes (R618)', () => {
     if (mode === 'requestedAt') Object.assign(replacement, { sha: old.sha, requestedAt: new Date(T0 + 1000).toISOString() });
     if (mode === 'sessionId') Object.assign(replacement, { sha: old.sha, sessionId: 'replacement' });
     if (mode === 'inventory') Object.assign(replacement, { sha: old.sha, previousCi: { ready: { ciFailures: ['unit'] } } });
-    let moved;
     try {
       writeFileSync(path, JSON.stringify(old));
       if (['sha', 'requestedAt', 'sessionId', 'inventory'].includes(mode)) writeFileSync(path, JSON.stringify(replacement));
@@ -88,9 +90,9 @@ describe('stale owed resumes (R618)', () => {
       const result = awaitStore.clearStoredAwaitVerifyIf('atomic', old, { dir,
         renameSyncFn: (from, to) => {
           if (from === path) {
-            if (mode === 'restore' || mode === 'collision') writeFileSync(path, JSON.stringify(replacement));
-            renameSync(from, to); moved = to;
-            if (mode === 'collision' || mode === 'after-rename') writeFileSync(path, JSON.stringify({ ...replacement, sessionId: 'latest' }));
+            if (mode === 'restore') writeFileSync(path, JSON.stringify(replacement));
+            renameSync(from, to);
+            if (mode === 'after-rename') writeFileSync(path, JSON.stringify({ ...replacement, sessionId: 'latest' }));
           } else renameSync(from, to);
         },
       });
@@ -98,10 +100,108 @@ describe('stale owed resumes (R618)', () => {
       if (mode === 'same' || mode === 'missing') expect(existsSync(path)).toBe(false);
       else if (mode === 'unreadable') expect(readFileSync(path, 'utf8')).toBe('{');
       else expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual(
-        ['collision', 'after-rename'].includes(mode) ? { ...replacement, sessionId: 'latest' } : replacement);
-      if (mode === 'collision') expect(JSON.parse(readFileSync(moved, 'utf8'))).toEqual(replacement);
+        mode === 'after-rename' ? { ...replacement, sessionId: 'latest' } : replacement);
       expect(awaitStore.clearStoredAwaitVerifyIf('../unsafe', old, { dir })).toEqual({ cleared: false });
       expect(awaitStore.clearStoredAwaitVerifyIf('atomic', {}, { dir })).toEqual({ cleared: false });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('collision: a writer recreating the path during clear keeps its replacement listed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'conditional-await-collision-'));
+    const old = entry('atomic', 1).record;
+    const replacement = { ...old, sha: 'b'.repeat(40) };
+    const path = join(dir, 'atomic.json');
+    const signal = new Int32Array(new SharedArrayBuffer(4));
+    let worker;
+    let published;
+    try {
+      expect(writeStoredAwaitVerify(old, { dir }).ok).toBe(true);
+      const result = awaitStore.clearStoredAwaitVerifyIf('atomic', old, { dir,
+        renameSyncFn: (from, to) => {
+          renameSync(from, to);
+          worker = new Worker(`
+            const { parentPort, workerData } = require('node:worker_threads');
+            (async () => {
+              const { writeStoredAwaitVerify } = await import(workerData.storeUrl);
+              const { withFileLock } = await import(workerData.lockUrl);
+              const { writeFileSync } = require('node:fs');
+              const result = writeStoredAwaitVerify(workerData.record, { dir: workerData.dir,
+                writeFileSyncFn: (...args) => {
+                  if (require('node:fs').existsSync(require('node:path').join(workerData.dir, '.store.lock')) === false)
+                    throw Error('clear did not hold the store lock during tmp write');
+                  writeFileSync(...args);
+                },
+                withFileLockFn: (lockPath, fn) => {
+                  const signal = new Int32Array(workerData.signal);
+                  Atomics.store(signal, 0, 1); Atomics.notify(signal, 0);
+                  return withFileLock(lockPath, fn);
+                },
+              });
+              parentPort.postMessage(result);
+            })().catch(error => { throw error; });
+          `, { eval: true, workerData: { dir, record: replacement, signal: signal.buffer,
+            storeUrl: pathToFileURL(resolve('scripts/conveyor/await-verify.mjs')).href,
+            lockUrl: pathToFileURL(resolve('scripts/lib/atomic-json-file.mjs')).href } });
+          published = new Promise((resolve, reject) => {
+            worker.once('message', resolve); worker.once('error', reject);
+            worker.once('exit', code => { if (code !== 0) reject(Error(`writer exited ${code}`)); });
+          });
+          expect(Atomics.wait(signal, 0, 0, 3000)).not.toBe('timed-out');
+          expect(existsSync(path)).toBe(false);
+        },
+        unlinkSyncFn: file => {
+          expect(existsSync(join(dir, '.store.lock'))).toBe(true);
+          expect(existsSync(path)).toBe(false);
+          unlinkSync(file);
+        },
+      });
+      expect(await published).toMatchObject({ ok: true });
+      expect(result).toEqual({ cleared: true });
+      expect(listStoredAwaitVerify({ dir })).toEqual([{ key: 'atomic', record: replacement }]);
+      expect(readdirSync(dir)).toEqual(['atomic.json']);
+    } finally {
+      if (worker) await worker.terminate();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['timeout', 'failure'])('store lock %s refuses clear and writer publication without losing the prior record', mode => {
+    const dir = mkdtempSync(join(tmpdir(), 'conditional-await-lock-'));
+    const old = entry('atomic', 1).record;
+    try {
+      expect(writeStoredAwaitVerify(old, { dir }).ok).toBe(true);
+      const lockPath = join(dir, '.store.lock');
+      writeFileSync(lockPath, `${process.pid}\n`);
+      const withFileLockFn = (path, fn) => {
+        expect(path).toBe(lockPath);
+        if (mode === 'failure') throw Error('lock unreadable');
+        return withFileLock(path, fn, { timeoutMs: 0 });
+      };
+      expect(awaitStore.clearStoredAwaitVerifyIf('atomic', old, { dir, withFileLockFn })).toEqual({ cleared: false });
+      expect(writeStoredAwaitVerify({ ...old, sha: 'b'.repeat(40) }, { dir, withFileLockFn }))
+        .toEqual({ ok: false, reason: 'write-failed' });
+      expect(listStoredAwaitVerify({ dir })).toEqual([{ key: 'atomic', record: old }]);
+      expect(readdirSync(dir).sort()).toEqual(['.store.lock', 'atomic.json']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('conditional clear rechecks after lock acquisition and skips the lock for missing or changed records', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'conditional-await-recheck-'));
+    const old = entry('atomic', 1).record;
+    const replacement = { ...old, sha: 'b'.repeat(40) };
+    try {
+      expect(writeStoredAwaitVerify(old, { dir }).ok).toBe(true);
+      const withFileLockFn = vi.fn((lockPath, fn) => {
+        expect(writeStoredAwaitVerify(replacement, { dir }).ok).toBe(true);
+        return withFileLock(lockPath, fn);
+      });
+      expect(awaitStore.clearStoredAwaitVerifyIf('atomic', old, { dir, withFileLockFn })).toEqual({ cleared: false });
+      expect(withFileLockFn).toHaveBeenCalledTimes(1);
+      withFileLockFn.mockClear();
+      expect(awaitStore.clearStoredAwaitVerifyIf('atomic', old, { dir, withFileLockFn })).toEqual({ cleared: false });
+      expect(awaitStore.clearStoredAwaitVerifyIf('missing', old, { dir, withFileLockFn })).toEqual({ cleared: false });
+      expect(withFileLockFn).not.toHaveBeenCalled();
+      expect(listStoredAwaitVerify({ dir })).toEqual([{ key: 'atomic', record: replacement }]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 

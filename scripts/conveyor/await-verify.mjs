@@ -13,6 +13,7 @@ import { execFileSync } from 'node:child_process';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { ghRepoSlug, DEFAULT_REPO_KEY, repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { loadSelfReviewPolicy, formatSelfReviewPolicyLine } from '../lib/fix-push-policy.mjs';
+import { withFileLock } from '../lib/atomic-json-file.mjs';
 
 /** Lane-local await record filename. */
 export const AWAIT_VERIFY_FILE = '.fix-await-verify';
@@ -164,7 +165,8 @@ export function listStoredAwaitVerify({ dir = awaitVerifyStoreDir(), readdirSync
 }
 /** Atomically write (or replace) one store record. */
 export function writeStoredAwaitVerify(record, { dir = awaitVerifyStoreDir(), writeFileSyncFn = writeFileSync,
-  renameSyncFn = renameSync, unlinkSyncFn = unlinkSync, mkdirSyncFn = mkdirSync, uniqueId = randomUUID } = {}) {
+  renameSyncFn = renameSync, unlinkSyncFn = unlinkSync, mkdirSyncFn = mkdirSync, uniqueId = randomUUID,
+  withFileLockFn = withFileLock } = {}) {
   if (!validRecord(record)) return { ok: false, reason: 'malformed' };
   const key = awaitVerifyStoreKey(record);
   if (!key) return { ok: false, reason: 'malformed' };
@@ -174,7 +176,7 @@ export function writeStoredAwaitVerify(record, { dir = awaitVerifyStoreDir(), wr
     mkdirSyncFn(dir, { recursive: true });
     tmp = `${path}.${uniqueId()}.tmp`;
     writeFileSyncFn(tmp, `${JSON.stringify(record)}\n`, { encoding: 'utf8', flag: 'wx' });
-    renameSyncFn(tmp, path);
+    withFileLockFn(join(dir, '.store.lock'), () => renameSyncFn(tmp, path));
     return { ok: true, path, key };
   } catch {
     if (tmp) { try { unlinkSyncFn(tmp); } catch { /* best-effort temporary cleanup */ } }
@@ -189,10 +191,10 @@ export function previousCiFailurePending(record, timing = { pushAfterCi: true })
       || (record.earlyPush?.ok && String(record.earlyPush.sha ?? '').toLowerCase() === String(record.sha ?? '').toLowerCase()))));
 }
 
-/** Retire only the expected shared record; quarantine first so a concurrent writer is never unlinked. */
+/** Retire only the expected shared record; serialize quarantine/deletion with store publication. */
 export function clearStoredAwaitVerifyIf(key, expected, { dir = awaitVerifyStoreDir(),
   readFileSyncFn = readFileSync, renameSyncFn = renameSync, unlinkSyncFn = unlinkSync,
-  existsSyncFn = existsSync, uniqueId = randomUUID } = {}) {
+  existsSyncFn = existsSync, uniqueId = randomUUID, withFileLockFn = withFileLock } = {}) {
   if (!nonEmpty(key) || !STORE_KEY_RE.test(key)
     || !nonEmpty(expected?.sha) || !nonEmpty(expected?.requestedAt)) return { cleared: false };
   const path = join(dir, `${key}.json`);
@@ -204,14 +206,21 @@ export function clearStoredAwaitVerifyIf(key, expected, { dir = awaitVerifyStore
         && isDeepStrictEqual(current, expected);
     } catch { return false; }
   };
+  // Missing or changed records need no lock; a matching snapshot is checked again under the mutex.
   if (!matches(path)) return { cleared: false };
-  try { renameSyncFn(path, tmp); } catch { return { cleared: false }; }
-  if (!matches(tmp)) {
-    // A replacement won the race to rename. Preserve it, and never overwrite a new original.
-    try { if (!existsSyncFn(path)) renameSyncFn(tmp, path); } catch { /* leave quarantined content intact */ }
-    return { cleared: false };
-  }
-  try { unlinkSyncFn(tmp); return { cleared: true }; } catch { return { cleared: false }; }
+  try {
+    return withFileLockFn(join(dir, '.store.lock'), () => {
+      if (!matches(path)) return { cleared: false };
+      renameSyncFn(path, tmp);
+      if (!matches(tmp)) {
+        // Preserve unexpected content, including changes from a writer that does not honor the lock.
+        try { if (!existsSyncFn(path)) renameSyncFn(tmp, path); } catch { /* leave quarantined content intact */ }
+        return { cleared: false };
+      }
+      unlinkSyncFn(tmp);
+      return { cleared: true };
+    });
+  } catch { return { cleared: false }; }
 }
 
 /** Remove one store record by key. */
