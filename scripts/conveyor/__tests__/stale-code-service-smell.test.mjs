@@ -170,6 +170,17 @@ it('non-clone state-directory rows (conveyor-state, plain dirs) with clean servi
   expect(Object.values(tick.state.episodes).filter(ep => ep.subject.startsWith('coverage:'))).toEqual([]);
   expect(Object.keys(tick.state.episodes)).toEqual([]);
 });
+it('an already-open coverage:conveyor-state episode closes once that non-clone row is skipped', () => {
+  const root = resolve('fixtures/closing-clone');
+  const ctx = { findStaleCodeServices: () => [], listCloneRoots: () => [root], env: {},
+    episodes: { e1: { smell: 'stale-code-service', subject: 'coverage:conveyor-state' }, e2: { smell: 'stale-code-service', subject: `coverage:${cloneKey(resolve('fixtures/gone'))}` } } };
+  const rows = smell.evaluate({ selfSync: [{ cloneKey: 'conveyor-state' }], cloneLag: [{ cloneRoot: root }] }, ctx);
+  expect(rows.find(row => row.subject === 'coverage:conveyor-state')).toMatchObject({ breach: false });
+  // A hashed clone key is never closed by absence: it stays open until positive coverage evidence re-emits it.
+  expect(rows.some(row => row.subject.startsWith(`coverage:${cloneKey(resolve('fixtures/gone'))}`))).toBe(false);
+  // Unreadable self-sync evidence closes nothing.
+  expect(smell.evaluate({ selfSync: null, cloneLag: [{ cloneRoot: root }] }, ctx).some(row => row.subject === 'coverage:conveyor-state')).toBe(false);
+});
 it('a real clone key (hashed) with no known root still yields unknown coverage', () => {
   const known = resolve('fixtures/known-clone'), stray = cloneKey(resolve('fixtures/unlisted-clone'));
   const rows = smell.evaluate({ selfSync: [{ cloneKey: cloneKey(known) }, { cloneKey: stray }, { cloneKey: 'conveyor-state' }], cloneLag: [{ cloneRoot: known }] },

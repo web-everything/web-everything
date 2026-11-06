@@ -849,6 +849,8 @@ describe('interpreter option shapes that once hid a clone script (value contains
       ['--loader=', [outside, `--loader=${boot}`, other]],
       ['--experimental-loader=', [outside, `--experimental-loader=${boot}`, other]],
       ['via env -S', ['/usr/bin/env', '-S', `"${outside}" --require "${boot}" "${other}"`]],
+      ['env NODE_OPTIONS= assignment', ['/usr/bin/env', `NODE_OPTIONS=--require ${boot}`, outside, other]],
+      ['env -S NODE_OPTIONS= assignment', ['/usr/bin/env', '-S', `NODE_OPTIONS="--require=${boot}" ${outside} ${other}`]],
     ])('%s is discovered, restarted and flagged stale', async (_name, ProgramArguments) => {
       const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments }]);
       expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
@@ -866,6 +868,14 @@ describe('interpreter option shapes that once hid a clone script (value contains
       expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
       expect((await restartServicesForClone(o)).restarted).toHaveLength(1);
       expect(findStaleCodeServices({ ...o, readProcessStartMs: () => 100_000, readAdoptedAtMs: () => 200_000 })).toHaveLength(1);
+    });
+    it('an unparsable env NODE_OPTIONS= assignment is flagged unreadable, and one outside the clone is not claimed', () => {
+      const bad = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/env', `NODE_OPTIONS=--require "${boot}`, outside, other] }]);
+      const result = findServicesRunningFromClone(bad);
+      expect(result.matches).toEqual([]);
+      expect(result.unreadable[0].error).toMatch(/Unsupported NODE_OPTIONS/);
+      const ext = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/env', `NODE_OPTIONS=--require ${other}`, outside, other] }]);
+      expect(findServicesRunningFromClone(ext).matches).toEqual([]);
     });
     it('an unparsable NODE_OPTIONS is flagged unreadable, never silently excluded', () => {
       const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: [outside, other], EnvironmentVariables: { NODE_OPTIONS: `--require "${boot}` } }]);

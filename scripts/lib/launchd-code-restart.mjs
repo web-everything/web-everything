@@ -113,7 +113,16 @@ function unwrap(args, start, cwd, depth) {
       i = j; break;
     }
     if (arg === '--') { i += 1; break; }
-    if (name === 'env' && /^[A-Za-z_]\w*=/.test(arg)) { i += 1; continue; }
+    if (name === 'env' && /^[A-Za-z_]\w*=/.test(arg)) {
+      // `env NODE_OPTIONS=--require …` preloads code into the node it launches, same as the plist environment.
+      const nodeOptions = /^NODE_OPTIONS=([^]*)$/.exec(arg);
+      if (nodeOptions) {
+        const preloads = nodeOptionPreloads(nodeOptions[1]);
+        if (preloads === null) throw new Error('Unsupported NODE_OPTIONS string (unterminated quote or escape): cannot tell whether the service preloads code from the clone');
+        owners.push(...preloads.map(v => preloadOwner(v, cwd)));
+      }
+      i += 1; continue;
+    }
     // env -S "prog args": one argv entry that env splits itself; expand it so the real program is seen.
     if (name === 'env' && (/^-S./.test(arg) || arg === '-S' || arg === '--split-string' || arg.startsWith('--split-string='))) {
       const attached = /^-S./.test(arg) ? arg.slice(2) : arg.startsWith('--split-string=') ? arg.slice(15) : null;

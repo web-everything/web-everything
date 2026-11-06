@@ -85,6 +85,15 @@ export default {
     const emitted = new Set(rows.map(row => row.subject));
     for (const ep of Object.values(episodes ?? {})) {
       if (ep?.smell !== 'stale-code-service' || typeof ep.subject !== 'string' || emitted.has(ep.subject)) continue;
+      // A `coverage:<key>` episode opened before non-clone state-directory rows (conveyor-state, ...) were skipped is
+      // never re-emitted; with readable self-sync evidence a key that is not a clone key is positively not coverage.
+      const coverageKey = /^coverage:(.+)$/.exec(ep.subject)?.[1];
+      if (coverageKey !== undefined) {
+        if (Array.isArray(selfSync) && coverageKey !== 'managed-clones' && !CLONE_KEY.test(coverageKey) && !knownKeys.has(coverageKey)) {
+          rows.push(covered(coverageKey));
+        }
+        continue;
+      }
       // Prefer a known root (a root may itself contain ":service:"); only retired roots fall back to parsing.
       const cloneRoot = [...roots].find(root => ep.subject.startsWith(`clone:${root}:service:`))
         ?? /^clone:(.+?):service:/.exec(ep.subject)?.[1];
