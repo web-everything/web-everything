@@ -53,6 +53,7 @@ export default {
           setting: { enabled: true, retryCooldownMin: 30 }, now: () => acceptedAt + 10_000,
           lastDispatch: new Map(), capacity: { lanes: 1, budget: { left: 1 }, remainingStarts: 1 },
           readEvidence: over.readEvidence ?? (() => evidence()), readStatus: () => over.status ?? null,
+          headNeverReviewed: over.headNeverReviewed ?? (() => false),
           readWitness: null, readCarry: () => null, readReviews: () => [], readComments: () => raw.comments,
           provider: { readPrState: () => raw, setLabels: () => { throw Error('unexpected direct label write'); } },
           proveMove: () => ({ ok: false }),
@@ -114,17 +115,26 @@ export default {
 
       const needsReview = () => evidence({ loopPayload: undefined });
       const selfBlock = replay('pending self-block on head needing review', { readEvidence: needsReview });
-      effects(selfBlock, { escalate: 1 });
-      check(selfBlock.row?.action === 'skip' && selfBlock.row?.escalate === true && !selfBlock.row?.settle
-        && selfBlock.raw.labels.includes('red-team:pending'), 'pending self-block lost its merge hold');
+      effects(selfBlock, { dispatch: 1 });
+      check(selfBlock.row?.action === 'review' && !selfBlock.row?.escalate && !selfBlock.row?.settle
+        && selfBlock.raw.labels.includes('red-team:pending'), 'R640 full review failed or lost its merge hold');
       const next = replay('self-block next tick', { raw: selfBlock.raw, readEvidence: needsReview });
-      effects(next, { escalate: 1 });
-      check(next.row?.action === 'skip' && next.raw.labels.includes('red-team:pending'),
-        'self-block next tick removed pending or dispatched a review');
+      effects(next, { dispatch: 1 });
+      check(next.row?.action === 'review' && next.raw.labels.includes('red-team:pending'),
+        'R640 next tick failed to review or removed pending');
       const conflict = replay('real blocked conflict', { raw: { labels: ['review:accepted', 'red-team:pending', 'red-team:blocked'] },
         readEvidence: needsReview });
       effects(conflict, { escalate: 1 });
       check(conflict.row?.escalate === true && conflict.raw.labels.length === 3, 'real conflict was removed instead of escalated');
+
+      const neverReviewed = replay('R640 unfinished other-head review allows full review', {
+        readEvidence: () => unfinished, headNeverReviewed: () => true,
+      });
+      effects(neverReviewed, { dispatch: 1 });
+      check(neverReviewed.row?.action === 'review'
+        && neverReviewed.row?.why === 'head never reviewed; a review is always allowed'
+        && !neverReviewed.calls.dispatch[0]?.redTeamOnly
+        && neverReviewed.raw.labels.includes('red-team:pending'), 'never-reviewed head failed full review or changed pending');
 
       const held = replay('review-unfinished escalates, never dispatches', { readEvidence: () => unfinished });
       effects(held, { escalate: 1 });

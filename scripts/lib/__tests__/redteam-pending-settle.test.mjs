@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import * as mod from '../review-red-team-on-skip.mjs';
+import { assertRunRecord, newRunRecord } from '../../operations/run-record.mjs';
 import pendingBreak from '../../conveyor/soak/breaks/redteam-pending-label-never-settles.mjs';
 import { redTeamMarker } from '../red-team-gate.mjs';
 import { redTeamOwedFor } from '../review-red-team-policy.mjs';
@@ -283,7 +284,7 @@ describe('planner settlement annotations', () => {
 describe('pending conflicts retain the merge hold', () => {
   const pathFixture = path => path === 'carry' ? carryFixture()
     : fixture({ readEvidence: () => evidence({ loopPayload: undefined }) });
-  it.each(['needsReview', 'carry'])('%s escalates lone pending without settling it', path => {
+  it.each(['carry'])('%s escalates lone pending without settling it', path => {
     const f = pathFixture(path);
     expect(decide(f)).toMatchObject({ action: 'skip', why: 'conflicting label prevents policy-clear', escalate: true });
     expect(decide(f)).not.toHaveProperty('settle');
@@ -359,7 +360,7 @@ describe('head-bound default pending settlement', () => {
 });
 
 describe('runner settles pending without dispatch', () => {
-  it.each(['carry', 'needsReview'])('%s escalates lone pending and keeps the merge hold across ticks', path => {
+  it.each(['carry'])('%s escalates lone pending and keeps the merge hold across ticks', path => {
     const f = path === 'carry' ? carryFixture() : fixture({ readEvidence: () => evidence({ loopPayload: undefined }) });
     const o = runFixture({ ...f, now: () => f.now });
     for (let tick = 0; tick < 2; tick++) {
@@ -386,9 +387,10 @@ describe('runner settles pending without dispatch', () => {
       settlePending: undefined, escalate: undefined });
     if (kind === 'real conflict') o.rawPrs[0].labels.push('red-team:blocked');
     const row = mod.runRedTeamOnSkip(o).rows[0];
-    expect(row.why).toBe('conflicting label prevents policy-clear');
+    expect(row.action).toBe(kind === 'pending' ? 'review' : 'skip');
     expect(row).not.toHaveProperty('settleError');
-    expect(o.settle).not.toHaveBeenCalled(); expect(o.dispatch).not.toHaveBeenCalled();
+    expect(o.settle).not.toHaveBeenCalled();
+    expect(o.dispatch).toHaveBeenCalledTimes(kind === 'pending' ? 1 : 0);
   });
   it.each(['pending', 'real conflict'])('dryRun never settles a guard conflict: %s', kind => {
     const o = runFixture({ dryRun: true, readEvidence: () => evidence({ loopPayload: undefined }) });
@@ -435,7 +437,7 @@ describe('runner settles pending without dispatch', () => {
       why: guard === 'head moved' ? 'live head missing or changed' : 'PR comments unreadable' });
     expect(o.settlePending).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled(); expect(o.settle).not.toHaveBeenCalled();
   });
-  it.each(['lone pending', 'real conflict'])('%s escalation publishes needs-you once across two ticks using real skip-published dedupe', kind => {
+  it.each(['real conflict'])('%s escalation publishes needs-you once across two ticks using real skip-published dedupe', kind => {
     const dir = mkdtempSync(join(tmpdir(), 'redteam-pending-settle-'));
     try {
       const publishNeedsYou = vi.fn(), postComment = vi.fn();
@@ -647,5 +649,124 @@ describe('posted red-team results retain pending and escalate', () => {
     o.rawPrs[0].comments.push(resultComment());
     expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ escalate: true, escalationContext: context });
     expect(o.escalate).toHaveBeenCalledOnce(); expect(o.syncLabels).not.toHaveBeenCalled();
+  });
+});
+
+describe('headNeverReviewedFromRuns complete bounded proof', () => {
+  const run = (over = {}) => ({ op: 'review-pr', input: { repo, pr }, ...payload('accept', old),
+    pending: null, effects: [], ...over });
+  function scanFixture(records = {}) {
+    return { repo, pr, head, runsDir: 'fixture-runs', list: vi.fn(() => Object.keys(records)),
+      read: vi.fn(id => records[id]), stat: vi.fn(() => ({ mtimeMs: acceptedAt })) };
+  }
+  function scan(f) {
+    expect(mod.headNeverReviewedFromRuns, 'export the complete never-reviewed-head scanner').toBeTypeOf('function');
+    return mod.headNeverReviewedFromRuns(f);
+  }
+  it.each([
+    ['running review', { verdict: null }],
+    ['pending review', { pending: { kind: 'agent' } }],
+    ['pending effect', { effects: [{ status: 'pending' }] }],
+    ['in-flight effect', { effects: [{ status: 'in-flight' }] }],
+    ['confirm with in-flight effect', { verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' }, effects: [{ status: 'in-flight' }] }],
+  ])('an older-head unfinished %s permits a never-reviewed proof under R640', (_name, over) => {
+    expect(scan(scanFixture({ 'review-pr-old': run(over) }))).toBe(true);
+  });
+  it('an older-head needs-human confirm still permits a never-reviewed proof under R640', () => {
+    expect(scan(scanFixture({ 'review-pr-old': run({ verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' } }) }))).toBe(true);
+  });
+  it('an exact-head unfinished confirm prevents proof even beside an older-head confirm', () => {
+    const confirm = { verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' } };
+    expect(scan(scanFixture({ 'review-pr-old': run(confirm), 'review-pr-head': run({ ...confirm, ...payload('needs-human') }) }))).toBe(false);
+  });
+  it.each([{}, [], { op: 'review-pr' }, { op: 'review-pr', input: { repo } }])('malformed review run cannot prove an unreviewed head: %j', record => {
+    expect(scan(scanFixture({ 'review-pr-malformed': record }))).toBe(false);
+  });
+  it('proves an empty completed scan has never reviewed the head', () => {
+    expect(scan(scanFixture())).toBe(true);
+  });
+  it('ignores old heads and exact-head records belonging to another repo or PR', () => {
+    expect(scan(scanFixture({ 'review-pr-old': run(),
+      'review-pr-other-repo': run({ input: { repo: 'other/repo', pr }, ...payload('accept') }),
+      'review-pr-other-pr': run({ input: { repo, pr: pr + 1 }, ...payload('accept') }),
+    }))).toBe(true);
+  });
+  it.each(['finished', 'unfinished', 'pending confirm'])('an exact-head %s run disproves never-reviewed', state => {
+    const exact = run({ ...payload('accept'), ...(state === 'unfinished' ? { verdict: null } : {}),
+      ...(state === 'pending confirm' ? { verdict: { verdict: 'needs-human' }, pending: { kind: 'confirm' } } : {}) });
+    expect(scan(scanFixture({ 'review-pr-exact': exact }))).toBe(false);
+  });
+  it('recognizes an exact-head record with a string PR number', () => {
+    expect(scan(scanFixture({ 'review-pr-exact': run({ ...payload('accept'), input: { repo, pr: String(pr) } }) }))).toBe(false);
+  });
+  it.each(['list', 'read', 'stat'])('returns false when %s throws instead of claiming no review', method => {
+    const f = scanFixture({ 'review-pr-old': run() });
+    f[method] = () => { throw Error('unreadable run scan'); };
+    expect(scan(f)).toBe(false);
+  });
+  it('proves no exact-head review after exactly 400 parsed old-head runs', () => {
+    const f = scanFixture(Object.fromEntries(Array.from({ length: 400 }, (_, i) => [`review-pr-${i}`, run()])));
+    expect(scan(f)).toBe(true); expect(f.read).toHaveBeenCalledTimes(400);
+  });
+  it('over 400 parses returns false for operator inspection without claiming never-reviewed', () => {
+    const f = scanFixture(Object.fromEntries(Array.from({ length: 401 }, (_, i) => [`review-pr-${i}`, run()])));
+    expect(scan(f)).toBe(false); expect(f.read.mock.calls.length).toBeLessThanOrEqual(400);
+  });
+});
+
+
+// R640: operator-accepted change, class correctness-in-normal-use.
+describe('R640 full review preserves pending', () => {
+  it('dispatches the full review with lone pending and applies retry cooldown', () => {
+    const o = runFixture({ readEvidence: () => evidence({ loopPayload: undefined }) });
+    expect(mod.runRedTeamOnSkip(o).rows[0].action).toBe('review');
+    expect(o.dispatch).toHaveBeenCalledOnce(); expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
+    expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'retry cooldown active' });
+    expect(o.rawPrs[0].labels).toContain('red-team:pending');
+    expect(o.settlePending).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled();
+  });
+  describe.each(['readWitness', 'readEvidence'])('never-reviewed head through %s', reader => {
+    const setup = () => runFixture({ [reader]: () => ({ ok: false, reason: 'review-unfinished' }),
+      headNeverReviewed: vi.fn(() => true) });
+    it('allows a full review without a finished review and never dispatches a red team', () => {
+      const o = setup(); delete o.rawPrs[0].reviews;
+      expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review', why: 'head never reviewed; a review is always allowed' });
+      expect(o.readReviews).toHaveBeenCalledOnce();
+      expect(o.headNeverReviewed).toHaveBeenCalledWith({ repo, pr, head });
+      expect(o.dispatch).toHaveBeenCalledOnce(); expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
+      expect(o.rawPrs[0].labels).toContain('red-team:pending');
+      expect(o.escalate).not.toHaveBeenCalled(); expect(o.settlePending).not.toHaveBeenCalled();
+      expect(o.settle).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled();
+    });
+    it.each(['unknown scan', 'throwing scan', 'unreadable reviews', 'formal hold', 'hold comment',
+      'red-team:blocked', 'review:changes', 'review-status:reviewing', 'cooldown'])(
+      'does not dispatch with %s', kind => {
+        const o = setup();
+        if (kind === 'unknown scan') o.headNeverReviewed = () => false;
+        if (kind === 'throwing scan') o.headNeverReviewed = () => { throw Error('unknown'); };
+        if (kind === 'unreadable reviews') { delete o.rawPrs[0].reviews; o.readReviews = () => { throw Error('offline'); }; }
+        if (kind === 'formal hold') o.rawPrs[0].reviews = [{ state: 'CHANGES_REQUESTED', submittedAt: iso(acceptedAt + 1) }];
+        if (kind === 'hold comment') o.rawPrs[0].comments.push(trusted('do not merge', iso(acceptedAt + 1)));
+        if (kind.includes(':')) o.rawPrs[0].labels.push(kind);
+        if (kind === 'cooldown') o.lastDispatch.set(`${repo}#${pr}@${head}`, o.now() - 1);
+        expect(mod.runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+        expect(o.dispatch).not.toHaveBeenCalled(); expect(o.settlePending).not.toHaveBeenCalled();
+        if (['unknown scan', 'throwing scan'].includes(kind)) expect(o.escalate).toHaveBeenCalledWith({ repo, pr, head, why: 'review-unfinished' });
+      });
+  });
+});
+
+describe('R640 default never-reviewed scan', () => {
+  it('allows this head with a persisted unfinished review on another head', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'r640-review-runs-'));
+    try {
+      writeFileSync(join(dir, 'review-pr-old.json'), JSON.stringify(assertRunRecord({ ...newRunRecord({ id: 'review-pr-old', op: 'review-pr', input: { repo, pr } }),
+        findings: payload('needs-human', old).findings, verdict: null,
+        pending: { kind: 'confirm', step: 'verdict', stepIndex: 1 }, effects: [] })));
+      const o = runFixture({ env: { OPERATION_RUNS_DIR: dir }, readEvidence: () => ({ ok: false, reason: 'review-unfinished' }) });
+      expect(mod.runRedTeamOnSkip(o).rows[0].action).toBe('review');
+      expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
+      expect(o.rawPrs[0].labels).toContain('red-team:pending');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
