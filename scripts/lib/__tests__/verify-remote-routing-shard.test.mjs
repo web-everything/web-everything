@@ -159,10 +159,11 @@ it.each([1, 75].flatMap(remoteExit => [false, true].flatMap(phaseAdmission => [f
   if (status === 'infrastructure-failure') expect(marker.infrastructure.reason).toBe('verify-unsettled');
 });
 
-// R495 — `vitest related` stays on the Mac by design (the remote wrapper maps only `vitest run`); name why.
+// R495 — a `vitest related` phase that cannot be wrapped (no --run, disallowed env) stays on the Mac; name why.
 it('names the local-only reason for a vitest related phase and keeps raw-command for the rest', () => {
   expect(localPhaseReason("npx vitest related 'scripts/a.mjs' --run --passWithNoTests && npm run check:standards"))
-    .toBe('vitest-related-local-only');
+    .toBe('raw-command');
+  expect(localPhaseReason('npx vitest related a.mjs && npm run check:standards')).toBe('vitest-related-local-only');
   expect(localPhaseReason('NODE_ENV=x npx vitest related a.mjs --run')).toBe('vitest-related-local-only');
   expect(localPhaseReason('npx vitest run a.test.mjs')).toBe('raw-command');
   expect(localPhaseReason('echo hi')).toBe('raw-command');

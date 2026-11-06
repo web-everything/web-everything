@@ -171,6 +171,7 @@ describe('remote admission policy', () => {
     {env:{},command:['vitest','run','a.test.mjs'],expected:['npm','run','test:unit','--','a.test.mjs']},
     {env:{},command:['vitest','run'],expected:['npm','run','test:unit']},
     {env:{},command:['vitest','list'],expected:['vitest','list']},
+    {env:{},command:['npx','vitest','related','source.mjs','--run','--passWithNoTests'],expected:['npx','vitest','related','source.mjs','--run','--passWithNoTests']},
   ])('main run dispatches a direct command or explicitly designated Mac verify gate remotely: %j', async ({env:gateEnv,command,expected}) => {
     const root = mkdtempSync(join(tmpdir(), 'remote-main-'));
     const pool = join(root, 'pool');

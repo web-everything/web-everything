@@ -2,6 +2,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { appendVerifyRemoteReport, heartbeatOwnedSlot } from '../readiness/heavy-admission.mjs';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
+import { shellQuote } from '../lib/verify-lane-gate.mjs';
 import { localPhaseReason, phaseAdmissionPlan, shouldConfirmRemoteRed, readRemoteReport, remoteInfrastructureFailure, phaseRunLocation, overallRunLocation, decidePhaseRemote } from '../lib/verify-remote-routing.mjs';
 import { runInNewContext } from 'node:vm';
 import { fstatSync, readSync } from 'node:fs';
@@ -385,8 +386,6 @@ describe('verify remote routing', () => {
     'WE_VITEST_MAX_WORKERS=2 npx vitest run a.test.mjs',
     'DIFF_COVERAGE_BASE=origin/main npx vitest run a.test.mjs',
     "'TZ'=UTC npx vitest run a.test.mjs",
-    'TZ=UTC npx vitest related a.mjs --run',
-    'npx vitest run a.test.mjs && npx vitest related b.mjs --run --passWithNoTests',
     'npx vitest run a.test.mjs && npx vitest run b.test.mjs --unknown',
     'npx vitest run a.test.mjs && npx vitest run',
     'npx vitest run a.test.mjs &&  npx vitest run b.test.mjs',
@@ -408,10 +407,48 @@ describe('verify remote routing', () => {
     'npx vitest run guard.test.mjs --outputFile.json=report.json',
     'npx vitest run --maxWorkers=1 --minWorkers=1 --no-file-parallelism retry.test.mjs',
     'npx vitest run retry.test.mjs --maxWorkers 1',
-    'npx vitest related source.mjs --run --passWithNoTests',
+    'npx vitest related --run',
+    'npx vitest related --run --passWithNoTests',
+    'npx vitest related source.mjs',
+    'npx vitest related source.mjs --run --unknown',
+    'npx vitest related ../source.mjs --run',
+    'npx vitest related source.mjs --run && node scan.mjs',
     'npx vitest run',
   ])('guard, retry, scan and unknown commands stay local and unchanged: %s', command => {
     expect(phaseAdmissionPlan({ command, decision: { remote: true } })).toEqual({ command, takeLocalSlot: true, setHeld: true });
+  });
+  it.each([
+    ['', 'source.mjs --run'],
+    ['', "'source file.mjs' other.mjs --run --passWithNoTests"],
+    ['TZ=UTC ', 'a.mjs --run'],
+  ])('related files use the direct wrapper with every argument intact: %s%s', (prefix, args) => {
+    const command = `${prefix}npx vitest related ${args}`;
+    expect(phaseAdmissionPlan({ command, decision: { remote: true } })).toEqual({
+      command: `${prefix}node ${shellQuote(resolve(repo, 'scripts/readiness/heavy-admission.mjs'))} run -- npx vitest related ${args}`,
+      takeLocalSlot: false, setHeld: false,
+    });
+    expect(phaseAdmissionPlan({ command, decision: { remote: false } }))
+      .toEqual({ command, takeLocalSlot: true, setHeld: true });
+  });
+  it.each(['', ' --passWithNoTests'])('wraps both run and related chain segments: %s', flags => {
+    expect(phaseAdmissionPlan({ command: `npx vitest run a.test.mjs && npx vitest related b.mjs --run${flags}`,
+      decision: { remote: true } })).toEqual({
+      command: `npm run test:unit -- a.test.mjs && node ${shellQuote(resolve(repo, 'scripts/readiness/heavy-admission.mjs'))} run -- npx vitest related b.mjs --run${flags}`,
+      takeLocalSlot: false, setHeld: false,
+    });
+  });
+  it('a related failure without a remote report does not authorize local confirmation', () => {
+    const plan = phaseAdmissionPlan({ command: 'npx vitest related source.mjs --run', decision: { remote: true } });
+    expect(plan.takeLocalSlot).toBe(false);
+    const ranOn = phaseRunLocation(readRemoteReport('report', () => ''), { remoteAttempt: true });
+    expect(shouldConfirmRemoteRed({ plan, exitCode: 1, ranOn })).toBe(false);
+  });
+  it.each([
+    ['npx vitest related source.mjs', 'vitest-related-local-only'],
+    ['npx vitest related --run', 'vitest-related-local-only'],
+    ['npx vitest related source.mjs --run && node scan.mjs', 'raw-command'],
+  ])('explains why the related phase remains local: %s', (command, reason) => {
+    expect(localPhaseReason(command)).toBe(reason);
   });
   it.each([
     '--unknown --passWithNoTests --testTimeout=15000 --hookTimeout=30000',

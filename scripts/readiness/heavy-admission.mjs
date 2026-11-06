@@ -2685,7 +2685,11 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
       // fixed standards and Vitest script contracts at this client boundary.
       let remoteArgv=requested[0]==='node'&&requested[1]==='scripts/check-standards.mjs'
         ? ['npm','run','check:standards',...(requested.length>2?['--',...requested.slice(2)]:[])] : requested;
-      if(requested[0]==='vitest'&&requested[1]==='run') {
+      if(requested[0]==='npx'&&requested[1]==='vitest'&&requested[2]==='related') {
+        // Related has no npm-script equivalent: preserve its files, --run and flags for Forge.
+        // Local fallback below still executes the original command.
+        remoteArgv=requested;
+      } else if(requested[0]==='vitest'&&requested[1]==='run') {
         const integration=requested[2]==='--config'&&requested[3]==='vitest.integration.config.ts';
         const coverage=requested[2]==='--coverage';
         const script=integration?'test:integration:vitest':coverage?'test:coverage':'test:unit';

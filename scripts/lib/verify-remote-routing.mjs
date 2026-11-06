@@ -55,14 +55,19 @@ function wrappedVitestCommand(command) {
   const parts = segmentParts(command);
   if (!parts) return null;
   const { prefix, words } = parts;
-  if (words[0] !== 'npx' || words[1] !== 'vitest' || words[2] !== 'run') return null;
+  if (words[0] !== 'npx' || words[1] !== 'vitest' || !['run', 'related'].includes(words[2])) return null;
   const args = words.slice(3);
   // The nested wrapper and Forge both receive every original argument; Forge's allowlist accepts the
   // gate options (R314), so nothing is stripped. Options must be literal words: a quoted spelling stays local.
   if (!args.length || args.some(arg => arg.startsWith("'-") || (arg.startsWith('-') && arg.includes("'")))) return null;
   // R335 widened the runner allowlist for the soak guard only (json report, --config); verify keeps those local.
   if (args.some(arg => /^(?:--reporter=json|--outputFile|--config)\b/.test(unquote(arg)))) return null;
-  if (!allowedCommand(['npx', 'vitest', 'run', ...args.map(unquote)])) return null;
+  // Forge requires related to have both file arguments and --run; otherwise keep it local.
+  if (!allowedCommand(['npx', 'vitest', words[2], ...args.map(unquote)])) return null;
+  if (words[2] === 'related') {
+    const wrapper = join(dirname(fileURLToPath(import.meta.url)), '../readiness/heavy-admission.mjs');
+    return `${prefix}node ${shellQuote(wrapper)} run -- npx vitest related ${args.join(' ')}`;
+  }
   return `${prefix}npm run test:unit -- ${args.join(' ')}`;
 }
 
@@ -87,10 +92,10 @@ function wrappedChain(command) {
 
 // Only THIS checkout-independent wrapper (beside this module) owns its own admission; any other path is an ordinary command.
 export const SHARD_RUN_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'verify-shard-run.mjs');
-// Why a phase the wrapper cannot take stays local. `vitest related` is local by design today: Forge's allowlist
-// accepts it, but the nested heavy-admission wrapper maps only `vitest run`, so it never reaches the remote path.
+// Related stays local only when it cannot be wrapped (for example, missing files or --run).
+// A wrappable related segment alongside a raw command does not make the raw command eligible.
 export function localPhaseReason(command) {
-  return command.split(' && ').some(segment => /^npx vitest related(?=\s|$)/.test(segment.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '')))
+  return command.split(' && ').some(segment => /^npx vitest related(?=\s|$)/.test(segment.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '')) && !wrappedVitestCommand(segment))
     ? 'vitest-related-local-only' : 'raw-command';
 }
 
