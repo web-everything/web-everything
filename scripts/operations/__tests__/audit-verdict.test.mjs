@@ -576,6 +576,7 @@ describe('R473 structured concurrency evidence', () => {
       'scripts/lib/jury-core.mjs', 'scripts/operations/record-verdict.mjs', 'scripts/operations/record-referral-ruling.mjs',
       'scripts/operations/land-human-only.mjs', 'scripts/conveyor/hiccup-approve.mjs', 'scripts/settings/delivery-identity.json',
       'scripts/lib/github-app-identity.mjs', 'scripts/lib/carry-equivalence.mjs', 'scripts/lib/identical-net-patch.mjs', 'scripts/lib/numbering-carry.mjs',
+      'scripts/lib/review-seat-settings.mjs', 'scripts/settings/review.json',
       // A case-insensitive file system resolves these to the guard itself.
       'Scripts/Guard-Bash.mjs', 'scripts/GUARD-bash.mjs', 'SCRIPTS/LIB/LANE-LEASE.MJS',
     ])('every guard, lease, lock, gate and audit module is on the built-in floor: E1, E2 and D3 in %s never ship', async file => {
@@ -587,7 +588,8 @@ describe('R473 structured concurrency evidence', () => {
     // floor too, so a new import cannot silently stay unprotected.
     const AUTH_ROOTS = ['scripts/lib/review-independence.mjs', 'scripts/lib/marker-authorship.mjs', 'scripts/lib/operator-identity.mjs',
       'scripts/lib/human-clearance-carry.mjs', 'scripts/lib/accept-carry-forward.mjs', 'scripts/lib/rebase-verdict-carry.mjs',
-      'scripts/lib/numbering-carry.mjs', 'scripts/lib/carry-equivalence.mjs', 'scripts/lib/identical-net-patch.mjs'];
+      'scripts/lib/numbering-carry.mjs', 'scripts/lib/carry-equivalence.mjs', 'scripts/lib/identical-net-patch.mjs',
+      'scripts/lib/unattended-review-accept.mjs'];
     const repoRoot = fileURLToPath(new NodeURL('../../../', import.meta.url));
     const directImports = AUTH_ROOTS.flatMap(root => [...readFileSync(`${repoRoot}${root}`, 'utf8')
       .matchAll(/\bfrom\s*['"](\.\.?\/[^'"]+)['"]|\bimport\(\s*['"](\.\.?\/[^'"]+)['"]\s*\)/g)]

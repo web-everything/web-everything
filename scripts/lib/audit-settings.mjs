@@ -43,7 +43,9 @@ export const GUARD_FLOOR = Object.freeze(['scripts/**/file-locks*', 'scripts/*fi
   'scripts/lib/github-app-identity.mjs', 'scripts/lib/identical-net-patch.mjs', 'scripts/lib/carry-equivalence.mjs',
   'scripts/lib/numbering-carry.mjs', 'scripts/lib/approval-prevention-notice.mjs', 'scripts/lib/review-verdict-carried-marker.mjs',
   'scripts/lib/rebase-drop-manifest.mjs', 'scripts/lib/settings-files.mjs', 'scripts/lib/review-label-provider.mjs',
-  'scripts/backlog/id.mjs',
+  'scripts/backlog/id.mjs', 'scripts/lib/review-seat-settings.mjs',
+  // The review settings file: carryAcrossRebase and unattendedAcceptRequiresCleanReferrals decide carries and accepts.
+  'scripts/settings/review.json',
   // The auditor itself: weakening it weakens every later audit.
   'scripts/operations/audit-verdict.mjs', 'scripts/operations/codex-audit*', 'scripts/lib/audit-settings.mjs',
   'scripts/lib/policy-cascade.mjs', 'scripts/settings/codex-audit.json']);
