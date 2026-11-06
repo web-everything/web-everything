@@ -8,7 +8,7 @@
 
 import { EventEmitter } from 'node:events';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync, existsSync } from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -1058,7 +1058,7 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       const stdout = '{}\n';
       const { fn: spawnFn, seen } = fakeSpawn(stdout);
       const logFile = explicitLog ? join(dir, 'logs', 'custom.jsonl') : undefined;
-      const report = await codexDirectTask({ dir: worktree, task: 'Inspect the checkout', gate: 'none', stream: false, spawnFn, logFile });
+      const report = await codexDirectTask({ dir: worktree, task: 'Inspect the checkout', gate: 'none', stream: false, spawnFn, logFile, keep: true });
       expect(seen.opts.cwd).toBe(worktree);
       expect(report.exitCode).toBe(0);
       expect(report.logFile).toBe(logFile ?? join(gitDir, 'codex-direct-task.jsonl'));
@@ -1204,7 +1204,7 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     try {
       for (const review of [false, false, true]) {
         const { fn: spawnFn, seen } = fakeSpawn('{}\n');
-        await codexDirectTask({ dir, task: 't', review, env, execFn, spawnFn, stream: false });
+        await codexDirectTask({ dir, task: 't', review, env, execFn, spawnFn, stream: false, keep: true });
         if (review) {
           expect(seen.opts.env).toBe(env);
           expect(flagValue(seen.argv, '-s')).toBe('read-only');
@@ -1328,6 +1328,62 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       expect(execCalls.some((c) => c.bin === 'git' && c.args.includes('clone'))).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['success', 'failure', 'worker-failure', 'post-log-failure', 'log-copy-failure', 'keep', 'exit'])('R657 cleans owned scratch/task dirs on %s, preserves the reported log, and unregisters its exit hook', async mode => {
+    const dirs = [];
+    const log = vi.fn();
+    const stdout = '{"type":"turn.completed","usage":{}}\n';
+    const before = process.listeners('exit');
+    const { fn: spawnFn } = fakeSpawn('{"type":"turn.completed","usage":{}}\n', { code: mode === 'worker-failure' ? 1 : 0 });
+    const execFn = (bin, args) => {
+      if (args[0] === 'clone' && mode === 'failure') throw new Error('clone failed');
+      if (args.includes('diff') && mode === 'post-log-failure') throw new Error('diff failed after logging');
+      if (args.includes('--absolute-git-dir')) return join(args[1], '.git');
+      if (args.includes('rev-parse')) return 'sha0';
+      if (args.includes('get-url')) throw new Error('no remote');
+      return '';
+    };
+    const opts = {
+      task: 't', repoRoot: '/repo', gate: 'none', selfReview: false, stream: false, execFn, log,
+      spawnFn: (...args) => {
+        if (mode === 'log-copy-failure') mkdirSync(`${dirs[0]}.jsonl`);
+        if (mode === 'exit') {
+          const hook = process.listeners('exit').find(fn => !before.includes(fn));
+          writeFileSync(join(dirs[0], '.git', 'codex-direct-task.jsonl'), stdout);
+          expect(dirs.every(existsSync)).toBe(true);
+          hook();
+          expect(dirs.some(existsSync)).toBe(false);
+          expect(readFileSync(`${dirs[0]}.jsonl`, 'utf8')).toBe(stdout);
+          throw new Error('simulated exit');
+        }
+        return spawnFn(...args);
+      },
+      installDeps: false, existsFn: () => false, keep: mode === 'keep',
+      mkTempDir: prefix => { const dir = mkdtempSync(prefix); dirs.push(dir); return dir; },
+    };
+    try {
+      if (['failure', 'post-log-failure', 'log-copy-failure', 'exit'].includes(mode)) await expect(codexDirectTask(opts)).rejects.toThrow();
+      else {
+        const report = await codexDirectTask(opts);
+        expect(readFileSync(report.logFile, 'utf8')).toBe('{"type":"turn.completed","usage":{}}\n');
+        expect(report.logFile).toBe(mode === 'keep' ? join(dirs[0], '.git', 'codex-direct-task.jsonl') : `${dirs[0]}.jsonl`);
+      }
+      expect(dirs.length).toBe(mode === 'failure' ? 1 : 2);
+      if (mode === 'log-copy-failure') {
+        expect(existsSync(dirs[0])).toBe(true);
+        expect(existsSync(dirs[1])).toBe(false);
+        expect(readFileSync(join(dirs[0], '.git', 'codex-direct-task.jsonl'), 'utf8')).toBe(stdout);
+        expect(log).toHaveBeenCalledWith(expect.stringContaining('log preservation failed; retaining'));
+      } else expect(dirs.every(dir => existsSync(dir) === (mode === 'keep'))).toBe(true);
+      if (['post-log-failure', 'exit'].includes(mode)) expect(readFileSync(`${dirs[0]}.jsonl`, 'utf8')).toBe(stdout);
+      expect(process.listeners('exit')).toEqual(before);
+    } finally {
+      for (const dir of dirs) {
+        rmSync(dir, { recursive: true, force: true });
+        rmSync(`${dir}.jsonl`, { recursive: true, force: true });
+      }
     }
   });
 

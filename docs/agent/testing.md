@@ -1441,6 +1441,17 @@ operator cleanup after checking that no writer is active. Preserve the synchroni
 two-writer tests, including the case with capacity for only one more record.
 
 ## Quality guidelines
+
+Clone object-maintenance probes must exercise real Git-shaped descendants on timeout and output
+overflow, and assert they stop before the clone write lock is released. Reuse the async
+`runMaintenanceGit` process-group runner so lock heartbeats remain live. Assert outside
+best-effort callbacks that catch errors; an assertion swallowed by the caller proves nothing.
+Every maintenance entry point (legacy sync, POC sync including partial merges, and rebuild
+adoption) must use the same WRITE-lock guard and check rebuild evidence under that lock.
+Pin competing readers/writers, unknown/unreadable evidence, and maintenance failure without
+changing the successful merge result in each legacy path's lock-contract tests.
+Use `spawn` for detached process groups: Node's `execFile` does not forward the
+`detached` option, so signalling `-child.pid` can fail with `ESRCH` while descendants survive.
 Real Git fixtures must pass `-c gc.auto=0 -c maintenance.auto=false` on their Git invocations.
 A large seed commit can launch detached maintenance/repack that outlives `execFileSync`, racing
 recursive snapshots and cleanup. Apply the same flags to bounded production freshness fetches;
@@ -3991,3 +4002,22 @@ Unreadable records still throw, never skip.
 
 The scoped regressions are `drain-red-team-evidence`, `stream-filter-runs`, and the settings layout
 test `settings-files`; use heavy admission.
+
+
+## R657 temporary-directory inspection
+
+Codex direct tasks remove owned scratch clones and task temp roots in `finally`, with an exit fallback.
+Before removing a scratch clone on return, exception, or exit, logs inside it are copied to the sibling `<scratch>.jsonl`;
+if copying fails, cleanup reports the failure and retains the clone with its original log.
+the returned `logFile` names that retained file. Post-adoption object packing takes the shared
+clone WRITE lock without waiting and checks rebuild-job evidence under that lock. Its Git
+commands strip inherited `GIT_*` overrides, matching the serialized GC path.
+Use `keep: true` / `--keep` when a caller or test needs to inspect those paths after completion;
+permission assertions about a live task should otherwise run in the injected spawn callback.
+Hermetic per-file cleanup reads late violation rows before removal, also runs at process exit,
+and honors the existing `WE_TMP_LEAK_KEEP=1` inspection flag.
+
+The hermetic home helper snapshots the original home before setting the per-file `HOME`.
+Retaining only the native `os.homedir` function is insufficient when it reads the changed
+environment: the guard and `realHomedir()` must continue to name the same live roots.
+The existing “real hooks: a swallowed in-process read” regression exercises this invariant.

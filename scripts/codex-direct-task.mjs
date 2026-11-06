@@ -114,11 +114,11 @@ import { laneGitConfigArgs, hardenLaneGitArgs, laneGitHardeningEnv } from './lib
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
 import { readProcStart } from './lib/daemon-jobs-runtime.mjs';
 import {
-  mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, openSync, closeSync, renameSync,
+  mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, openSync, closeSync, renameSync, copyFileSync,
 } from 'node:fs';
 import jobAsyncFs from 'node:fs/promises';
 import { tmpdir, homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -1113,6 +1113,7 @@ export async function codexDirectTask({
   collectQuotaFn = collectAndClearRolloutQuota,
   loadTranscriptCheck = () => import('./lib/codex-transcript-check.mjs'),
   resumeThreadId,
+  keep = false,
 } = {}) {
   // Fail before any clone, install or spawn work: a bad resume target must not cost a run.
   if (resumeThreadId !== undefined) assertResumeRequest({ resumeThreadId, ephemeral, outputSchemaFile, dir });
@@ -1137,6 +1138,31 @@ export async function codexDirectTask({
   if (!['none', 'related', 'standards', 'full'].includes(gate)) throw new Error('invalid build gate');
   if (!review && ephemeral && policy.selfReview.enabled) throw new Error('--ephemeral requires self-review off (--no-self-review or build.selfReview.enabled=false): a repair must resume the original builder');
   const briefPolicy = { ...policy, finalGate: gate };
+  const tempDirs = [];
+  let scratchLog;
+  const preserveScratchLog = () => {
+    if (scratchLog && existsSync(scratchLog.source)) copyFileSync(scratchLog.source, scratchLog.dest);
+  };
+  const cleanupTemps = () => {
+    if (keep) return;
+    let retainedClone;
+    try { preserveScratchLog(); }
+    catch (error) {
+      retainedClone = scratchLog.root;
+      emit(`codex-direct-task: log preservation failed; retaining ${retainedClone}: ${error.message}`);
+    }
+    for (const path of tempDirs) {
+      if (path === retainedClone) continue;
+      try { rmSync(path, { recursive: true, force: true }); } catch { /* best effort on exit */ }
+    }
+  };
+  const allocateTemp = (prefix) => {
+    const path = mkTempDir(prefix);
+    tempDirs.push(path);
+    return path;
+  };
+  process.once('exit', cleanupTemps);
+  try {
   let targetDir = dir;
   let scratch = null;
   if (!targetDir) {
@@ -1148,7 +1174,7 @@ export async function codexDirectTask({
       throw new Error(`codex-direct-task: gate-unavailable — --gate=${gate} needs scripts/verify-lane.mjs, which ${repoRoot} does not have; pass --gate=standards or --gate=none`);
     }
     scratch = await setupScratchClone({
-      repoRoot, mkTempDir, execFn, existsFn, installDeps, installStdio, wireOriginToRemote,
+      repoRoot, mkTempDir: allocateTemp, execFn, existsFn, installDeps, installStdio, wireOriginToRemote,
       installExecFn, installTimeoutMs, cloneExecFn, cloneTimeoutMs,
     });
     targetDir = scratch.dest;
@@ -1165,15 +1191,17 @@ export async function codexDirectTask({
   // into `captureDiff`'s output. A caller-supplied `--log=<path>` is trusted as-is (their choice, their risk).
   const gitDir = execFn('git', ['-C', targetDir, 'rev-parse', '--absolute-git-dir'], { timeout: GIT_STEP_TIMEOUT_MS }).trim();
   const resolvedLogFile = logFile || join(gitDir, review ? `codex-self-review-${randomUUID()}.jsonl` : 'codex-direct-task.jsonl');
+  const reportedLogFile = scratch && !keep && resolve(resolvedLogFile).startsWith(`${resolve(scratch.dest)}${sep}`)
+    ? `${scratch.dest}.jsonl` : resolvedLogFile;
+  if (reportedLogFile !== resolvedLogFile) scratchLog = { source: resolvedLogFile, dest: reportedLogFile, root: scratch.dest };
   mkdirSync(dirname(resolvedLogFile), { recursive: true });
 
   const route = resolveCodexTaskRoute({ kind: taskKind ?? (review ? 'review' : 'worker'), size, epic, decision, care, mandatoryLens,
     model, effort: effort !== undefined || tier !== undefined ? resolveCodexEffort({ tier, effort }) : undefined, env, log });
   ({ model, effort } = route);
 
-  // A private temp root isolates concurrent fixture repositories. Keep it for manual resume/debugging,
-  // just like the persisted Codex session and log; review mode allocates no new writable roots.
-  const tempRoot = review ? undefined : mkdtempSync(join(tmpdir(), 'we-codex-task-tmp-'));
+  // A private temp root isolates concurrent fixture repositories; --keep retains it for inspection.
+  const tempRoot = review ? undefined : allocateTemp(join(tmpdir(), 'we-codex-task-tmp-'));
   // The remote admission root sits beside the heavy lock root, exactly as heavy-admission derives it
   // (`join(dirname(lockRoot), 'remote')`). Without it the sandbox cannot read remote health or take a
   // remote slot, so every Codex-run gate silently fell back to local admission on this host.
@@ -1242,6 +1270,8 @@ export async function codexDirectTask({
 
   }
 
+  preserveScratchLog();
+
   return {
     model, effort, route,
     dir: targetDir,
@@ -1257,7 +1287,7 @@ export async function codexDirectTask({
     } : { created: false },
     startSha,
     argv: run.argv,
-    logFile: resolvedLogFile,
+    logFile: reportedLogFile,
     exitCode: run.code,
     timedOut: run.timedOut,
     events: summary,
@@ -1277,6 +1307,10 @@ export async function codexDirectTask({
     quotaRolloutFile,
     quotaRolloutCleared,
   };
+  } finally {
+    cleanupTemps();
+    process.removeListener('exit', cleanupTemps);
+  }
 }
 
 // ── detached jobs ────────────────────────────────────────────────────────────────────────────────
@@ -1567,6 +1601,7 @@ async function main() {
       + "  --resume=<threadId> (R302): continue a previous run's Codex thread (its report's events.threadId) so a follow-up\n"
       + '    fix keeps its context. Requires --dir; not with --output-schema-file or --ephemeral.\n'
       + '  --detach: launch a detached job; print its id and record path immediately.\n'
+      + '  --keep: retain scratch clone and task temp directories for inspection.\n'
       + '  wait --job=<id> [--max-ms=540000]: poll a job (maximum 9 minutes); exit 75 if still running.\n'
       + '    Aliases: --id=<id> for --job=<id>, --wait=<ms> for --max-ms=<ms> (same validation).\n'
       + '    A terminal task exit 75 is preserved in JSON but wait exits 1.\n'
@@ -1652,6 +1687,7 @@ async function main() {
       wireOriginToRemote: Boolean(flags['wire-origin-to-remote']),
       clearRolloutAfterRun: Boolean(flags['clear-rollout-after-run']),
       review: Boolean(flags.review),
+      keep: Boolean(flags.keep),
       resumeThreadId,
       ...(flags['no-self-review'] ? { selfReview: false } : {}),
     });

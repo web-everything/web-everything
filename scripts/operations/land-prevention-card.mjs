@@ -87,6 +87,7 @@
  */
 import { machinePrTitle, preventionCardTitle } from './machine-pr-title.mjs';
 import { execFileSync } from 'node:child_process';
+import { fetchFresh } from '../lib/git-fetch-fresh.mjs';
 import { writeFileSync, mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync, readdirSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -428,7 +429,15 @@ export async function foldOpenSingles({ lane }, {
         throw new Error('not exactly one added backlog card');
       }
       if (!/^[a-f0-9]{40}$/.test(pr.headRefOid)) throw new Error('invalid PR head');
-      exec('git', ['-C', lane, 'fetch', '--no-tags', '-q', 'origin', pr.headRefOid], {});
+      fetchFresh({ cwd: lane, branches: [pr.headRefName], noTags: true,
+        run: (args, cwd) => exec('git', ['-C', cwd, ...args], {}) });
+      const pinnedCommit = ['-C', lane, 'cat-file', '-e', `${pr.headRefOid}^{commit}`];
+      try { exec('git', pinnedCommit, {}); }
+      catch {
+        // A reused branch fetch can predate the PR head returned by the listing.
+        exec('git', ['-C', lane, 'fetch', '--quiet', '--no-tags', 'origin', pr.headRefOid], {});
+        exec('git', pinnedCommit, {});
+      }
       const changes = String(exec('git', ['-C', lane, 'diff', '--name-status', `origin/main...${pr.headRefOid}`], {})).trim();
       if (changes !== `A\t${rel}`) throw new Error('not exactly one added backlog card');
       const content = exec('git', ['-C', lane, 'show', `${pr.headRefOid}:${rel}`], {});
