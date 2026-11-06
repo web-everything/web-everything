@@ -259,6 +259,30 @@ describe('runForceWatchTick', () => {
     expect(rollback).toHaveBeenCalledTimes(3);
     expect(readForceWatch(root, env)).toBeNull();
   });
+  it('an owed rollback whose revert already landed (head is last-good) is recorded as a successful rollback, not as "superseded"', async () => {
+    await setup();
+    const events = [];
+    const emit = async (e) => { events.push(e.kind); };
+    expect((await runForceWatchTick({ root, env, probe: async () => ({ healthy: false }), rollback: async () => ({ ok: false }), emit })).action).toBe('rollback-failed');
+    const rollback = vi.fn(async () => ({ ok: true }));
+    // the reset reached disk before the failure was reported: head is now last-good, so there is nothing left to revert
+    const r = await runForceWatchTick({ root, env, currentHead: 'a'.repeat(40), probe: async () => ({ healthy: true }), rollback, emit });
+    expect(r).toMatchObject({ action: 'rollback', reason: 'health-failed' });
+    expect(rollback).not.toHaveBeenCalled();
+    expect(readForceWatch(root, env)).toBeNull();
+    expect(events).toContain('force-adopt-rolled-back');
+    expect(events).not.toContain('force-adopt-watch-superseded');
+    expect(readFileSync(env.WE_FORCE_ADOPT_HANDOFF, 'utf8')).toMatch(/ROLLED BACK/);
+    expect(readFileSync(env.WE_FORCE_ADOPT_CORONER, 'utf8')).toMatch(/force-adopt-rolled-back/);
+  });
+  it('an owed rollback is still dropped as superseded when a DIFFERENT newer build is head', async () => {
+    await setup();
+    await runForceWatchTick({ root, env, probe: async () => ({ healthy: false }), rollback: async () => ({ ok: false }), emit: async () => {} });
+    const events = [];
+    const r = await runForceWatchTick({ root, env, currentHead: 'c'.repeat(40), probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async (e) => { events.push(e.kind); } });
+    expect(r.action).toBe('superseded');
+    expect(events).toEqual(['force-adopt-watch-superseded']);
+  });
   it('a healthy probe that resolves after a concurrent tick recorded a failed rollback does not erase the owed rollback', async () => {
     await setup();
     const healthy = async () => ({ healthy: true });

@@ -194,6 +194,15 @@ export function evaluateForceWatch({ watch, healthy, restarts = 0, maxRestarts =
 export async function runForceWatchTick({ root, env = process.env, probe, rollback, emit, now = Date.now, notBefore = null, currentHead = null }) {
   let watch = currentWatch(root, env);
   if (!watch) return { action: 'none' };
+  // The one place a successful rollback is recorded (event, handoff line, coroner record) and its watch closed.
+  const finishRollback = async (w, reason) => {
+    clearWatch(root, env);
+    const at = new Date(now()).toISOString();
+    await emit?.({ kind: 'force-adopt-rolled-back', daemon: w.daemon, detail: { ruling: w.ruling, sha: w.sha, lastGood: w.lastGood?.head ?? null, reason } });
+    appendLine(handoffFile(env), `- FORCE-ADOPT ${at} ${w.daemon} ${w.ruling}: ROLLED BACK ${w.sha} -> ${w.lastGood?.head ?? '?'} (${reason})\n`);
+    appendLine(coronerFile(env), `${JSON.stringify({ kind: 'force-adopt-rolled-back', at, daemon: w.daemon, ruling: w.ruling, sha: w.sha, reason })}\n`);
+    return { action: 'rollback', reason };
+  };
   // A watch opened by THIS tick's own forced adoption starts counting at the next tick.
   if (notBefore !== null && Date.parse(watch.startedAt) >= notBefore) return { action: 'none' };
   // A `currentHead` FUNCTION that returns nothing (or throws) means git could not be read: that is a failure, never the same as
@@ -208,6 +217,8 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   const head = first.head;
   // Ticks only count once the forced build is really the running head (a ready-only job adopts a tick or more later).
   if (head !== null && head !== watch.sha) {
+    // An owed rollback whose revert already landed (head IS last-good) is paid: record it as a rollback, never as "superseded".
+    if (watch.rollbackPending && watch.lastGood?.head && head === watch.lastGood.head) return finishRollback(watch, watch.rollbackPending);
     if (watch.adoptedSeen || watch.rollbackPending) { clearWatch(root, env); await emit?.({ kind: 'force-adopt-watch-superseded', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, head } }); return { action: 'superseded' }; }
     if (now() - Date.parse(watch.startedAt) > FORCE_ADOPT_TTL_MS) {
       // The forced build never became head. Its ready candidate never passed smoke, so drop it too: left behind, a later
@@ -276,9 +287,5 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
     await emit?.({ kind: 'force-adopt-rollback-failed', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, reason: verdict.reason } });
     return { action: 'rollback-failed', reason: verdict.reason };
   }
-  clearWatch(root, env);
-  await emit?.({ kind: 'force-adopt-rolled-back', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, lastGood: watch.lastGood?.head ?? null, reason: verdict.reason } });
-  appendLine(handoffFile(env), `- FORCE-ADOPT ${at} ${watch.daemon} ${watch.ruling}: ROLLED BACK ${watch.sha} -> ${watch.lastGood?.head ?? '?'} (${verdict.reason})\n`);
-  appendLine(coronerFile(env), `${JSON.stringify({ kind: 'force-adopt-rolled-back', at, daemon: watch.daemon, ruling: watch.ruling, sha: watch.sha, reason: verdict.reason })}\n`);
-  return { action: 'rollback', reason: verdict.reason };
+  return finishRollback(watch, verdict.reason);
 }
