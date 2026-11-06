@@ -1,14 +1,5 @@
 {
   "version": 1,
-  "entries": [
-    {
-      "test": "scripts/__tests__/codex-direct-task.test.mjs",
-      "brokenSha": "1ba8f4835e",
-      "owner": "card:codex-direct-task-detached-deadline-flake",
-      "reason": "main red 17:46Z at #6416 merge: codex-direct-task.test.mjs detached jobs 'returns at the deadline during…' timing flake under host load (unrelated to #6416 drain diff); R157 quarantine",
-      "addedAt": 1793989054015,
-      "expiresAt": 1794075454015
-    }
-  ],
+  "entries": [],
   "mode": "quarantine"
 }
