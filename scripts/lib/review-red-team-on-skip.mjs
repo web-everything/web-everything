@@ -544,8 +544,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       return { ...rawPr, reviews };
     });
     const planningOptions = { repo, refusals, rawPrs: planningPrs,
-      readEvidence: readEvidence === readDrainRedTeamEvidence ? key => readEvidence({ ...key, env }) : readEvidence,
-      readStatus: readStatus === readRedTeamStatus ? key => readStatus({ ...key, env }) : readStatus,
+      readEvidence, readStatus,
       now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, readWitness,
       recoveryOptions: { now: at, probe: recoveryProbe(), deadlineMs: staleRunDeadlineMs(env) } };
     rows.push(...planRedTeamOnSkip(planningOptions));
