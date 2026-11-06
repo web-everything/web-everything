@@ -20,8 +20,12 @@ const logOnce = message => {
 
 /** Guard, egress and permission machinery always contributes care, including inside fixtures. */
 export function isProtectedCarePath(file) {
-  return /^(scripts|\.github|\.claude)\//.test(file)
-    && file.split('/').slice(1).some(segment => /^(guard|egress|permission)/.test(segment));
+  // Same normal form as the sensitive-surface classifiers (NFKC, lower case, one slash), so a re-cased or
+  // compatibility-spelled guard name cannot pass as unprotected.
+  const p = String(file ?? '').normalize('NFKC').replace(/\\/g, '/').toLowerCase().replace(/\/+/g, '/')
+    .replace(/^(?:\.?\/)+/, '');
+  return /^(scripts|\.github|\.claude)\//.test(p)
+    && p.split('/').slice(1).some(segment => /^(guard|egress|permission)/.test(segment));
 }
 
 /** Refuse broad, negated, traversing and compound patterns rather than expanding their reach. */

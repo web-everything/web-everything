@@ -777,12 +777,14 @@ export function scoreEscalation({
     normalizeHumanSurfaces('broad')).map(hit => hit.file));
   const isCareProtected = f => careSides(f).some(side => isTrustChainPath(side) || isEngineTierPath(side)
     || isProtectedCarePath(side) || sensitiveFiles.has(side));
-  // A plain target alias of a protected rename (`changedFiles` may list both spellings) resolves to the same
-  // diff section, so it must not subtract that section's lines either.
-  const protectedTargets = new Set(gateBasis.filter(isCareProtected).map(plainDiffPath));
   const exemptions = validateCareExemptPaths(careExemptPaths);
-  const exemptFiles = gateBasis.filter(f => !isCareProtected(f) && !protectedTargets.has(plainDiffPath(f))
-    && matchesCareExemptPath(plainDiffPath(f), exemptions));
+  // A rename is exempt only when EVERY side is exempt: moving a statute, tool or other authored file into an
+  // exempt location is still a change to that file (and deletes it from where it was).
+  const entryExempt = f => !isCareProtected(f) && diffPathSides(f).every(side => matchesCareExemptPath(side, exemptions));
+  // A plain target alias of a retained rename (`changedFiles` may list both spellings) resolves to the same diff
+  // section, so it must not subtract that section's lines either.
+  const retainedTargets = new Set(gateBasis.filter(f => !entryExempt(f)).map(plainDiffPath));
+  const exemptFiles = gateBasis.filter(f => entryExempt(f) && !retainedTargets.has(plainDiffPath(f)));
   const exemptSet = new Set(exemptFiles);
   const basisFiles = gateBasis.filter(f => !exemptSet.has(f));
   if (exemptFiles.length) signals.careExempt = exemptFiles;

@@ -28,8 +28,13 @@ describe('R641 care exemptions', () => {
       `diff --git a/${timings} b/${timings}`,
       `diff --git a/scripts/ci/old-timings.json b/${timings}\nrename from scripts/ci/old-timings.json\nrename to ${timings}`,
     ) + section('app.js', 400);
-    const result = scoreEscalation({ changedFiles: [renamed, timings, 'app.js'], diffLines: 600, diffHunks });
+    // Both rename sides must be exempt for the rename to be exempt (#6433 review).
+    const result = scoreEscalation({ changedFiles: [renamed, timings, 'app.js'], diffLines: 600, diffHunks,
+      careExemptPaths: ['scripts/ci/*.json'] });
     expect(result.signals.size).toBe(400);
+    // With only the target exempt, the alias must not subtract the retained rename's section.
+    expect(scoreEscalation({ changedFiles: [renamed, timings, 'app.js'], diffLines: 600, diffHunks }).signals.size)
+      .toBe(600);
   });
 
   it('timings alone have no size or blast-radius care and need no human', () => {
@@ -60,12 +65,17 @@ describe('R641 care exemptions', () => {
       return `${from.slice(0, cut)}{${from.slice(cut)} => ${to.slice(cut)}}`;
     },
     quoted: (from, to) => `"${from}" => "${to}"`,
+    // Real git quotes only the side that needs it.
+    mixed: (from, to) => `${from} => "${to}"`,
   };
-  const protectedSources = ['scripts/guard-bash.mjs', 'scripts/lib/egress-policy.mjs',
-    'scripts/lib/permission-change.mjs', 'scripts/merge-ai-prs.mjs', '.github/workflows/build.yml', '.env'];
+  // Protected machinery, plus authored files (a statute, an ordinary tool) that are not exempt themselves:
+  // a rename is exempt only when every side is.
+  const nonExemptSources = ['scripts/guard-bash.mjs', 'scripts/lib/egress-policy.mjs',
+    'scripts/lib/permission-change.mjs', 'scripts/merge-ai-prs.mjs', '.github/workflows/build.yml', '.env',
+    'docs/agent/platform-decisions.md', 'scripts/lib/foo.mjs'];
   const exemptTargets = ['data/generated/g.json', 'scripts/lib/__tests__/fixtures/policy.mjs',
     'scripts/ci/test-timings.json', 'src/_data/referenceIndex.json'];
-  it.each(Object.keys(renameForms).flatMap(form => protectedSources.flatMap(from =>
+  it.each(Object.keys(renameForms).flatMap(form => nonExemptSources.flatMap(from =>
     exemptTargets.map(to => [form, from, to]))))('keeps care for a %s rename of %s into exempt %s', (form, from, to) => {
     const entry = renameForms[form](from, to);
     for (const changedFiles of [[entry], [entry, to]]) {
@@ -79,10 +89,20 @@ describe('R641 care exemptions', () => {
     }
   });
 
-  it('still exempts a rename between two unprotected paths into an exempt location', () => {
+  it('still exempts a rename whose every side is exempt', () => {
     const entry = 'scripts/ci/{old-timings.json => test-timings.json}';
-    expect(scoreEscalation({ changedFiles: [entry], diffLines: 1000 }).signals.careExempt).toEqual([entry]);
+    expect(scoreEscalation({ changedFiles: [entry], diffLines: 1000, careExemptPaths: ['scripts/ci/*.json'] })
+      .signals.careExempt).toEqual([entry]);
+    expect(scoreEscalation({ changedFiles: [entry], diffLines: 1000 }).signals.careExempt).toBeUndefined();
   });
+
+  it.each(['scripts/tools/fixtures/Guard-check.mjs', 'scripts/tools/fixtures/EGRESS.json',
+    '.claude/Permission/fixtures/x.json', 'scripts/tools/fixtures/ｇuard-x.mjs'])(
+    'protects re-cased or compatibility-spelled machinery %s', file => {
+      const result = scoreEscalation({ changedFiles: [file], diffLines: 1000 });
+      expect(result.signals.careExempt).toBeUndefined();
+      expect(result.basisFiles).toEqual([file]);
+    });
 
   it('subtracts only exempt per-file changed lines when hunks are available', () => {
     const result = scoreEscalation({ changedFiles: [timings, 'app.js'], diffLines: 1002,
