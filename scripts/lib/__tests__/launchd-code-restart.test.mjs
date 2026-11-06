@@ -15,13 +15,66 @@ function fixture(plists = [{ Label: 'com.we.resource-sampler', ProgramArguments:
     launchctl: vi.fn(() => ({ stdout: 'pid = 42', status: 0 })), uid: () => 501, log: vi.fn(), now: () => 1_000_000,
     stateStore: new Map(), lockStore: { acquire: async () => async () => {} }, adoptedSha: 'new-sha', platform: null, env: {} };
 }
+describe('launchd any-argument ownership', () => {
+  const other = resolve('..', 'other-clone', 'entry');
+  it.each([
+    ['ruby attached -r', ['/usr/bin/ruby', `-r${cloneRoot}/pre.rb`, other]],
+    ['ruby separate -r', ['/usr/bin/ruby', '-r', `${cloneRoot}/pre.rb`, other]],
+    ['perl attached -M', ['/usr/bin/perl', `-M${cloneRoot}/P.pm`, other]],
+    ['perl attached -m', ['/usr/bin/perl', `-m${cloneRoot}/P.pm`, other]],
+    ['perl attached -I', ['/usr/bin/perl', `-I${cloneRoot}/lib`, other]],
+    ['attached --require', ['/usr/bin/node', `--require=${cloneRoot}/x`, other]],
+    ['attached --import file URL', ['/usr/bin/node', `--import=file://${cloneRoot}/x`, other]],
+    ['python attached -X', ['/usr/bin/python3', `-X${cloneRoot}/x`, other]],
+    ['python attached -W', ['/usr/bin/python3', `-W${cloneRoot}/x`, other]],
+    ['sudo loose wrapper', ['/usr/bin/sudo', '-u', 'me', '/usr/bin/ruby', `-r${cloneRoot}/pre.rb`, other]],
+    ['timeout loose wrapper', ['/usr/bin/timeout', '10', '/usr/bin/ruby', `-r${cloneRoot}/pre.rb`, other]],
+    ['taskpolicy loose wrapper', ['/usr/bin/taskpolicy', '-b', '/usr/bin/ruby', `-r${cloneRoot}/pre.rb`, other]],
+    ['env -S attached form', ['/usr/bin/env', '-S', `/usr/bin/ruby -r${cloneRoot}/pre.rb ${other}`]],
+    ['nohup wrapper', ['/usr/bin/nohup', '/usr/bin/ruby', `-r${cloneRoot}/pre.rb`, other]],
+    ['relative attached path with WorkingDirectory', ['/usr/bin/ruby', '-rpre.rb', other], cloneRoot],
+    ['unknown attached long flag', ['/usr/bin/other', `--option=${cloneRoot}/x`, other]],
+    ['raw substring in opaque data', ['/usr/bin/other', `opaque[${cloneRoot}]`, other]],
+    ['original displayed argv0', [cloneRoot, other], undefined, '/usr/bin/other'],
+  ])('claims %s in discovery, restart and stale detection', async (_name, ProgramArguments, WorkingDirectory, Program) => {
+    const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments, WorkingDirectory, ...(Program ? { Program } : {}) }]);
+    expect(findServicesRunningFromClone(o)).toMatchObject({ matches: [{ label: 'com.we.resource-sampler' }], unreadable: [] });
+    expect((await restartServicesForClone(o)).restarted).toHaveLength(1);
+    expect(findStaleCodeServices({ ...o, readProcessStartMs: () => 1000, readAdoptedAtMs: () => 2000 })).toHaveLength(1);
+  });
+  it.each([
+    ['trailing clone root slash', `${cloneRoot}/`, `-r${cloneRoot}/pre.rb`, undefined],
+    ['symlink candidate', cloneRoot, '-ralias/pre.rb', resolve('..')],
+    ['tilde expansion', join(homedir(), 'launchd-ownership-fixture'), '-r~/launchd-ownership-fixture/pre.rb', undefined],
+    ['attached symlink after equals', cloneRoot, `--arbitrary=${resolve('..', 'alias')}/pre.rb`, undefined],
+    ['list of symlink paths', cloneRoot, `--arbitrary=outside,${resolve('..', 'alias')}/pre.rb:elsewhere`, undefined],
+    ['first and last equals, list pieces', cloneRoot, `--unknown=key=outside,${cloneRoot}/x:elsewhere`, undefined],
+  ])('normalizes %s', async (_name, root, arg, WorkingDirectory) => {
+    const alias = resolve('..', 'alias');
+    const realpath = path => path === alias || path.startsWith(`${alias}/`) ? path.replace(alias, cloneRoot) : path;
+    const o = { ...fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/ruby', arg, other], WorkingDirectory }]), cloneRoot: root, realpath };
+    expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
+    expect((await restartServicesForClone({ ...o, realpath: async path => realpath(path) })).restarted).toHaveLength(1);
+  });
+  it('scans all NODE_OPTIONS tokens, including unknown attached flags', async () => {
+    const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/other', other],
+      EnvironmentVariables: { NODE_OPTIONS: `--unknown=-r${cloneRoot}/pre.rb` } }]);
+    expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
+    expect((await restartServicesForClone(o)).restarted).toHaveLength(1);
+  });
+  it('leaves an unrelated outside path with no clone mention unowned', () => {
+    expect(findServicesRunningFromClone(fixture([{ Label: 'com.we.resource-sampler',
+      ProgramArguments: ['/usr/bin/ruby', `-r${other}`, other] }]))).toEqual({ matches: [], unreadable: [] });
+  });
+});
+
 describe('launchd clone restart', () => {
-  it('label matching normalizes paths and respects path-boundary', () => {
+  it('label matching normalizes paths and conservatively claims raw root substrings', () => {
     const o = fixture([
       { Label: 'com.we.exact', ProgramArguments: [cloneRoot] },
       { Label: 'com.we.child', ProgramArguments: ['node', join(cloneRoot, 'scripts', '..', 'run.mjs')] },
       { Label: 'com.we.sibling', ProgramArguments: [`${cloneRoot}2/run.mjs`] }]);
-    expect(findServicesRunningFromClone(o).matches.map(x => x.label)).toEqual(['com.we.exact', 'com.we.child']);
+    expect(findServicesRunningFromClone(o).matches.map(x => x.label)).toEqual(['com.we.exact', 'com.we.child', 'com.we.sibling']);
   });
   it('bare executable with unrelated absolute script does not match when cwd equals cloneRoot', async () => {
     const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['node', resolve('..', 'other-clone', 'sampler.mjs')] }]);
@@ -39,26 +92,25 @@ describe('launchd clone restart', () => {
   it.each([
     ['data argument', [resolve('..', 'bin', 'sampler'), '--data-dir', cloneRoot]],
     ['script data argument', ['node', resolve('..', 'other-clone', 'sampler.mjs'), '--data-dir', cloneRoot]],
-    ['working directory alone', [resolve('..', 'bin', 'sampler')]],
-    // --require/--import/--loader values are CODE the service runs (covered by the preload tests below); a
-    // --conditions value is only data.
+    ['working directory alone', [resolve('..', 'bin', 'sampler')], false],
+    // Clone references count even when the option value is data.
     ['interpreter option value that is data', ['node', '--conditions', join(cloneRoot, 'loader.mjs'), resolve('..', 'other-clone', 'sampler.mjs')]],
-  ])('ownership counts executable/script positions only: %s', async (_name, ProgramArguments) => {
+  ])('any clone argument counts, while WorkingDirectory alone does not: %s', async (_name, ProgramArguments, owned = true) => {
     const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments, WorkingDirectory: cloneRoot }]);
-    expect(findServicesRunningFromClone(o).matches).toEqual([]);
-    expect((await restartServicesForClone(o)).restarted).toEqual([]);
-    expect(o.launchctl).not.toHaveBeenCalled();
+    expect(findServicesRunningFromClone(o).matches).toHaveLength(owned ? 1 : 0);
+    expect((await restartServicesForClone(o)).restarted).toHaveLength(owned ? 1 : 0);
+    expect(o.launchctl).toHaveBeenCalledTimes(owned ? 1 : 0);
   });
   it.each(['node', 'python3', 'bash'])('recognizes the first script position after interpreter %s', interpreter => {
     const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: [interpreter, join(cloneRoot, 'sampler')] }]);
     expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
   });
-  it('Program outside clone overrides a clone-looking ProgramArguments argv0', async () => {
+  it('clone-looking original argv0 proves ownership even with external Program', async () => {
     const o = fixture([{ Label: 'com.we.resource-sampler', Program: resolve('..', 'other-clone', 'sampler'),
       ProgramArguments: [join(cloneRoot, 'sampler.mjs')] }]);
-    expect(findServicesRunningFromClone(o).matches).toEqual([]);
-    expect((await restartServicesForClone(o)).restarted).toEqual([]);
-    expect(o.launchctl).not.toHaveBeenCalled();
+    expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
+    expect((await restartServicesForClone(o)).restarted).toHaveLength(1);
+    expect(o.launchctl).toHaveBeenCalled();
   });
   it.each(['node', 'python3', 'bash'].flatMap(interpreter => [[interpreter, false], [interpreter, true]]))('equivalent interpreter ownership for %s with explicit Program=%s', async (interpreter, explicitProgram) => {
     const executable = resolve('..', 'tools', interpreter);
@@ -72,16 +124,16 @@ describe('launchd clone restart', () => {
     expect(findStaleCodeServices({ ...o, readProcessStartMs: () => 100_000, readAdoptedAtMs: () => 200_000 }))
       .toEqual([expect.objectContaining({ label: plist.Label, reason: 'stale-code' })]);
   });
-  it('external Program interpreter ignores disguised argv0 when its actual script is outside the clone', async () => {
+  it('original argv0 clone mention proves ownership with an external script', async () => {
     const o = fixture([{ Label: 'com.we.resource-sampler', Program: resolve('..', 'tools', 'node'),
       ProgramArguments: [join(cloneRoot, 'sampler.mjs'), resolve('..', 'other-clone', 'sampler.mjs')] }]);
-    expect(findServicesRunningFromClone(o).matches).toEqual([]);
-    await restartServicesForClone(o); expect(o.launchctl).not.toHaveBeenCalled();
+    expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
+    await restartServicesForClone(o); expect(o.launchctl).toHaveBeenCalled();
   });
-  it('external non-interpreter Program cannot acquire script ownership from a fake node argv0', () => {
+  it('external non-interpreter Program is owned when an argument mentions the clone', () => {
     const o = fixture([{ Label: 'com.we.resource-sampler', Program: resolve('..', 'tools', 'sampler'),
       ProgramArguments: ['node', join(cloneRoot, 'sampler.mjs')] }]);
-    expect(findServicesRunningFromClone(o).matches).toEqual([]);
+    expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
   });
   it('Program alone establishes clone ownership without ProgramArguments', () => {
     const o = fixture([{ Label: 'com.we.resource-sampler', Program: join(cloneRoot, 'sampler') }]);
@@ -666,13 +718,13 @@ describe('launchd clone ownership: interpreter options and filesystem aliases', 
     expect(findStaleCodeServices({ ...o, readProcessStartMs: () => 1000, readAdoptedAtMs: () => 2000 }))
       .toEqual([expect.objectContaining({ reason: 'stale-code' })]);
   });
-  it('an unrecognized bare option before a clone path is surfaced as unreadable evidence, not silently excluded', async () => {
+  it('an unrecognized bare option before a clone path is owned', async () => {
     const o = fixture([{ ...sampler, ProgramArguments: ['/usr/local/bin/node', '--made-up-option', join(cloneRoot, 'sampler.mjs')] }]);
-    expect(findServicesRunningFromClone(o).unreadable).toEqual([expect.objectContaining({ error: expect.stringMatching(/--made-up-option/) })]);
-    expect((await restartServicesForClone(o)).flagged).toEqual([expect.objectContaining({ reason: expect.stringMatching(/^plist-unreadable/) })]);
+    expect(findServicesRunningFromClone(o)).toMatchObject({ matches: [{ label: sampler.Label }], unreadable: [] });
+    expect((await restartServicesForClone(o)).restarted).toHaveLength(1);
     expect(findStaleCodeServices({ ...o, readProcessStartMs: () => 1000, readAdoptedAtMs: () => 2000 }))
-      .toEqual([expect.objectContaining({ reason: 'plist-unreadable' })]);
-    expect(o.launchctl).not.toHaveBeenCalled();
+      .toEqual([expect.objectContaining({ reason: 'stale-code' })]);
+    expect(o.launchctl).toHaveBeenCalled();
   });
   it('an unrecognized option with no clone path anywhere stays quietly unrelated', () => {
     const o = fixture([{ ...sampler, ProgramArguments: ['/usr/local/bin/node', '--made-up-option', resolve('..', 'other-clone', 'sampler.mjs')] }]);
@@ -691,7 +743,7 @@ describe('launchd clone ownership: interpreter options and filesystem aliases', 
           .toEqual([expect.objectContaining({ reason: 'stale-code' })]);
       }
       const other = { ...fixture([{ ...sampler, ProgramArguments: ['/usr/local/bin/node', join(dir, 'clone2', 'sampler.mjs')] }]), cloneRoot: alias };
-      expect(findServicesRunningFromClone(other).matches).toEqual([]);
+      expect(findServicesRunningFromClone(other).matches).toHaveLength(1); // Raw canonical-root substring is sufficient.
     } finally { await fsAsync.rm(dir, { recursive: true, force: true }); }
   });
   it('a path that merely contains "vite" (vitest temp dir, vite-named folder) is not a dev server; real dev-server argv still is', async () => {
@@ -734,12 +786,12 @@ describe('launchd clone ownership: interpreter options and filesystem aliases', 
   it.each([
     ['later data path', ['/usr/local/bin/node', '--made-up-option', '/other/x.mjs', 'mode', join(cloneRoot, 'cfg.json')]],
     ['option operand then other script', ['/usr/local/bin/node', '--made-up-option', 'v', '/other/x.mjs', join(cloneRoot, 'cfg.json')]],
-  ])('unknown option does not flag on a clone path in script data: %s', (_n, ProgramArguments) => {
-    expect(findServicesRunningFromClone(fixture([{ ...sampler, ProgramArguments }]))).toEqual({ matches: [], unreadable: [] });
+  ])('unknown option still claims clone mentions in script data: %s', (_n, ProgramArguments) => {
+    expect(findServicesRunningFromClone(fixture([{ ...sampler, ProgramArguments }]))).toEqual({ matches: [expect.objectContaining({ label: 'com.we.resource-sampler' })], unreadable: [] });
   });
-  it('unknown option followed by an operand then a clone script is still surfaced', () => {
+  it('unknown option followed by an operand then a clone script is owned', () => {
     const o = fixture([{ ...sampler, ProgramArguments: ['/usr/local/bin/node', '--made-up-option', '512', join(cloneRoot, 'sampler.mjs')] }]);
-    expect(findServicesRunningFromClone(o).unreadable).toHaveLength(1);
+    expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
   });
 });
 
@@ -762,9 +814,9 @@ describe('python interpreter options never hide a clone script', () => {
     expect(findStaleCodeServices({ ...o, readProcessStartMs: () => 1000, readAdoptedAtMs: () => 2000 }))
       .toEqual([expect.objectContaining({ reason: 'stale-code' })]);
   });
-  it('python -O with an unrelated script and a clone data path stays unrelated', () => {
+  it('python -O with a clone data path is conservatively owned', () => {
     const o = fixture([{ ...sampler, ProgramArguments: ['/usr/bin/python3', '-O', resolve('..', 'other', 'x.py'), cloneRoot] }]);
-    expect(findServicesRunningFromClone(o)).toEqual({ matches: [], unreadable: [] });
+    expect(findServicesRunningFromClone(o)).toEqual({ matches: [expect.objectContaining({ label: 'com.we.resource-sampler' })], unreadable: [] });
   });
 });
 
@@ -813,8 +865,8 @@ describe('interpreter option shapes that once hid a clone script (value contains
     ['bash -ec inline program', ['/bin/bash', '-ec', `cat ${join(cloneRoot, 'data.txt')}`]],
     ['node -e inline program', ['/usr/bin/node', '-e', 'run()', join(cloneRoot, 'data.txt')]],
     ['python -c inline program', ['/usr/bin/python3', '-c', 'pass', join(cloneRoot, 'data.txt')]],
-  ])('inline-program option %s never makes a clone data path the script', (_name, ProgramArguments) => {
-    expect(findServicesRunningFromClone(fixture([{ Label: 'com.we.resource-sampler', ProgramArguments }]))).toEqual({ matches: [], unreadable: [] });
+  ])('inline-program option %s still claims clone mentions', (_name, ProgramArguments) => {
+    expect(findServicesRunningFromClone(fixture([{ Label: 'com.we.resource-sampler', ProgramArguments }]))).toEqual({ matches: [expect.objectContaining({ label: 'com.we.resource-sampler' })], unreadable: [] });
   });
   const outside = resolve('..', 'bin', 'node');
   it.each([
@@ -852,10 +904,10 @@ describe('interpreter option shapes that once hid a clone script (value contains
     ['nice -n wrapper', ['/usr/bin/nice', '-n', '5', outside, join(cloneRoot, 'sampler.mjs')], true],
     ['nested wrappers', ['/usr/bin/env', 'A=1', '/usr/bin/nohup', outside, join(cloneRoot, 'sampler.mjs')], true],
     ['env around an unrelated script', ['/usr/bin/env', outside, resolve('..', 'other-clone', 'sampler.mjs')], false],
-    ['clone path only as script data', ['/usr/bin/env', outside, resolve('..', 'other-clone', 'sampler.mjs'), join(cloneRoot, 'data')], false],
-    ['clone path as env assignment value', ['/usr/bin/env', `DATA=${join(cloneRoot, 'x')}`, outside, resolve('..', 'other-clone', 'sampler.mjs')], false],
+    ['clone path only as script data', ['/usr/bin/env', outside, resolve('..', 'other-clone', 'sampler.mjs'), join(cloneRoot, 'data')], true],
+    ['clone path as env assignment value', ['/usr/bin/env', `DATA=${join(cloneRoot, 'x')}`, outside, resolve('..', 'other-clone', 'sampler.mjs')], true],
     ['env -C outside leaves a relative script unproven', ['/usr/bin/env', '-C', resolve('..', 'other-clone'), outside, 'sampler.mjs'], false],
-    ['env -u operand is not the program', ['/usr/bin/env', '-u', join(cloneRoot, 'x'), outside, resolve('..', 'other-clone', 'sampler.mjs')], false],
+    ['env -u operand is not the program', ['/usr/bin/env', '-u', join(cloneRoot, 'x'), outside, resolve('..', 'other-clone', 'sampler.mjs')], true],
   ])('wrapper commands do not hide the executed program: %s', async (_name, ProgramArguments, owned) => {
     const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments }]);
     expect(findServicesRunningFromClone(o).matches).toHaveLength(owned ? 1 : 0);
@@ -909,11 +961,11 @@ describe('interpreter option shapes that once hid a clone script (value contains
     const unanchored = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/env', '-C', 'scripts', outside, 'x.mjs'] }]);
     expect(findServicesRunningFromClone(unanchored).matches).toEqual([]);
   });
-  it('env -C survives a later unknown option', () => {
+  it('env -C clone reference proves ownership despite a later unknown option', () => {
     const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/env', '-C', cloneRoot, '--mystery', 'x.mjs'] }]);
     expect(findServicesRunningFromClone(o).unreadable).toHaveLength(0);
     const flagged = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/env', '-C', cloneRoot, '--mystery', './x.mjs'] }]);
-    expect(findServicesRunningFromClone(flagged).unreadable).toHaveLength(1);
+    expect(findServicesRunningFromClone(flagged).matches).toHaveLength(1);
   });
   it('deeply nested wrappers fail closed with a clear error instead of a stack overflow', () => {
     const ProgramArguments = [...Array(5000).fill('/usr/bin/env'), outside, script];
@@ -945,11 +997,11 @@ describe('interpreter option shapes that once hid a clone script (value contains
   });
   it.each([
     ['option value path outside the clone', ['/usr/bin/sandbox-exec', '-f', resolve('..', 'other-clone', 'p.sb'), outside, other]],
-    ['env assignment with a slash is not a program', ['/usr/bin/sudo', `FOO=${join(cloneRoot, 'x')}`, outside, other]],
+    ['env assignment mentions clone', ['/usr/bin/sudo', `FOO=${join(cloneRoot, 'x')}`, outside, other], true],
     ['unrelated first operand', ['/usr/bin/sudo', '-u', 'me', resolve('..', 'other-clone', 'bin', 'sampler')]],
-    ['clone path only as data after an unrelated program', ['/usr/bin/timeout', '10', resolve('..', 'other-clone', 'bin', 'sampler'), 'node', join(cloneRoot, 'data')]],
-  ])('loose wrapper operands that are not the program stay unflagged: %s', (_name, ProgramArguments) => {
-    expect(findServicesRunningFromClone(fixture([{ Label: 'com.we.resource-sampler', ProgramArguments }])).matches).toEqual([]);
+    ['clone path only as data after an unrelated program', ['/usr/bin/timeout', '10', resolve('..', 'other-clone', 'bin', 'sampler'), 'node', join(cloneRoot, 'data')], true],
+  ])('loose wrapper ownership includes every operand: %s', (_name, ProgramArguments, owned = false) => {
+    expect(findServicesRunningFromClone(fixture([{ Label: 'com.we.resource-sampler', ProgramArguments }])).matches).toHaveLength(owned ? 1 : 0);
   });
   it('a relative first operand of a loose wrapper resolves against the explicit WorkingDirectory', () => {
     const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/sudo', './bin/sampler'], WorkingDirectory: cloneRoot }]);
@@ -969,9 +1021,9 @@ describe('interpreter option shapes that once hid a clone script (value contains
     expect((await restartServicesForClone(o)).restarted).toHaveLength(1);
     expect(findStaleCodeServices({ ...o, readProcessStartMs: () => 100_000, readAdoptedAtMs: () => 200_000 })).toHaveLength(1);
   });
-  it('quoted env -S string running an unrelated script is not claimed', () => {
+  it('quoted env -S string mentioning clone data is owned', () => {
     const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/env', '-S', `"${outside}" "${other}" "${join(cloneRoot, 'data')}"`] }]);
-    expect(findServicesRunningFromClone(o).matches).toEqual([]);
+    expect(findServicesRunningFromClone(o).matches).toHaveLength(1);
   });
   describe('node preload options run clone code before an external entry', () => {
     const boot = join(cloneRoot, 'bootstrap.cjs');
@@ -1031,10 +1083,10 @@ describe('interpreter option shapes that once hid a clone script (value contains
       expect((await restartServicesForClone(o)).restarted).toHaveLength(1);
       expect(findStaleCodeServices({ ...o, readProcessStartMs: () => 100_000, readAdoptedAtMs: () => 200_000 })).toHaveLength(1);
     });
-    it('bash -r with a clone script and trailing external data is still clone-backed; with an external script and a clone data argument it is not', () => {
+    it('bash -r clone script or clone data both establish ownership', () => {
       expect(findServicesRunningFromClone(fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/bin/bash', '-r', join(cloneRoot, 'data'), other] }])).matches).toHaveLength(1);
       const external = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/bin/bash', '-r', other, join(cloneRoot, 'data.json')] }]);
-      expect(findServicesRunningFromClone(external).matches).toEqual([]);
+      expect(findServicesRunningFromClone(external).matches).toHaveLength(1);
     });
     it('-r combined with other shell flags (-ru, -r -e) still leaves the next argument as the script', () => {
       for (const flags of [['-ru'], ['-r', '-e'], ['-eu', '-r']]) {
@@ -1265,9 +1317,9 @@ describe('interpreter option shapes that once hid a clone script (value contains
     const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/env', '--mystery', outside, join(cloneRoot, 'sampler.mjs')] }]);
     expect(findServicesRunningFromClone(o)).toMatchObject({ matches: [{ label: 'com.we.resource-sampler' }], unreadable: [] });
   });
-  it('an unclassifiable wrapper option with no interpreter after it names the option when a clone path follows', () => {
+  it('an unclassifiable wrapper option with a clone path is owned', () => {
     const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/env', '--mystery', 'operand', join(cloneRoot, 'bin', 'sampler')] }]);
-    expect(findServicesRunningFromClone(o).unreadable[0].error).toMatch(/--mystery/);
+    expect(findServicesRunningFromClone(o)).toMatchObject({ matches: [{ label: 'com.we.resource-sampler' }], unreadable: [] });
   });
   });
 });

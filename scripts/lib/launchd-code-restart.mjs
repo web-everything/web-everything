@@ -119,9 +119,9 @@ function unwrap(args, start, cwd, depth) {
       // `env NODE_OPTIONS=--require …` preloads code into the node it launches, same as the plist environment.
       const nodeOptions = /^NODE_OPTIONS=([^]*)$/.exec(arg);
       if (nodeOptions) {
-        const preloads = nodeOptionPreloads(nodeOptions[1]);
+        const preloads = shellSplit(nodeOptions[1]);
         if (preloads === null) throw new Error('Unsupported NODE_OPTIONS string (unterminated quote or escape): cannot tell whether the service preloads code from the clone');
-        owners.push(...preloads.map(v => preloadOwner(v, cwd)));
+        owners.push(...preloads.map(v => preloadOwner(v, cwd)), ...preloads.flatMap(v => argumentPaths(v, cwd)));
       }
       i += 1; continue;
     }
@@ -190,6 +190,8 @@ function codeArguments(args, start = 0, cwd = null, depth = 0) {
     if (noScript.has(arg) || (shell ? /^-[A-Za-z]*c[A-Za-z]*$/ : /^-[^-]*c/).test(arg) || /^(?:--eval|--print)=/.test(arg)) return result;
     // Preload options run the named module before the entry script, so their value is code the service
     // executes: it is an owner (a clone-backed bootstrap makes the service clone-backed), not skipped data.
+    // Retain known preload semantics for extensionless relative module names; the
+    // structural scan below covers arbitrary flags without needing to classify them.
     const attachedPreload = /^--(?:require|import|loader|experimental-loader)=(.+)$/.exec(arg);
     if (attachedPreload) { result.owners.push(preloadOwner(attachedPreload[1], cwd)); continue; }
     // `-r` takes an operand (a preload) only for node/ruby. In a shell it is the operand-free restricted-mode flag,
@@ -218,18 +220,30 @@ function preloadOwner(value, cwd) {
   if (value.startsWith('file://')) { try { return fileURLToPath(value); } catch { return value; } }
   return place(value, cwd, false);
 }
-// NODE_OPTIONS preloads run in every node process the service starts, whatever its argv looks like.
-// Returns the preload operands found (separate and attached forms); an unparsable string yields null.
-function nodeOptionPreloads(value) {
-  const tokens = shellSplit(value);
-  if (tokens === null) return null;
-  const out = [];
-  for (let i = 0; i < tokens.length; i += 1) {
-    const attached = /^--(?:require|import|loader|experimental-loader)=(.+)$/.exec(tokens[i]);
-    if (attached) out.push(attached[1]);
-    else if (/^(?:-r|--require|--import|--loader|--experimental-loader)$/.test(tokens[i]) && tokens[i + 1] !== undefined) { out.push(tokens[i + 1]); i += 1; }
+// Ownership is deliberately independent of interpreter/wrapper option grammars. Each
+// reduction is shorter, so the set reaches a fixed point without a depth cutoff.
+function argumentPaths(arg, cwd) {
+  const candidates = new Set([arg]);
+  for (const value of candidates) {
+    const add = piece => { if (piece && piece !== value) candidates.add(piece); };
+    if (value.includes('=')) {
+      add(value.slice(value.indexOf('=') + 1));
+      add(value.slice(value.lastIndexOf('=') + 1));
+    }
+    if (/^-[^-]/.test(value)) add(value.slice(2));
+    const long = /^--[\w-]+([^\w-].*)$/.exec(value);
+    if (long) add(long[1]);
+    for (const piece of value.split(/[:,\s]+/)) add(piece);
+    add(value.replace(/^["']+|["']+$/g, ''));
+    if (value.startsWith('file://')) { try { add(fileURLToPath(value)); } catch { /* raw argument still checked */ } }
   }
-  return out;
+  return [...new Set([...candidates].flatMap(value => {
+    if (isPathArg(value)) return [expand(value)];
+    // Bare command names/options are not cwd-relative paths. A slash or filename
+    // extension supplies path evidence; a filename extension only counts when peeled off a flag (-rpre.rb).
+    if (cwd && !/^[+-]/.test(value) && !/\s/.test(value) && (value.includes('/') || (arg.startsWith('-') && value !== arg && /\.[\w-]+$/.test(value)))) return [resolve(cwd, value)];
+    return [];
+  }))];
 }
 
 const inside = (path, root) => path === root || path.startsWith(root.endsWith(sep) ? root : root + sep);
@@ -273,8 +287,9 @@ function assertActive(signal) {
   if (signal?.aborted) throw new Error('service restart cancelled: inspect LaunchAgents before retrying');
 }
 
-// Parse only: which absolute paths hold the service's executable/script, and which paths
-// follow an option we could not classify. Ownership is decided by `decide`.
+// Keep every original/expanded argument and its path candidates. Interpreter parsing
+// additionally supplies known script paths and effective wrapper working directories.
+// Ownership is decided by `decide`, independently of option classification.
 function parsePlist(p, { selfLabel, plistPath }) {
   if (!p || typeof p.Label !== 'string' || !p.Label.trim()) throw new Error('Invalid Label');
   const hasProgram = Object.hasOwn(p, 'Program');
@@ -290,19 +305,22 @@ function parsePlist(p, { selfLabel, plistPath }) {
   const wd = typeof p.WorkingDirectory === 'string' && isPathArg(p.WorkingDirectory) ? expand(p.WorkingDirectory) : null;
   const { owners, unknownAt, cwd, wide, args: effective } = codeArguments(args, 0, wd);
   const nodeOptions = p.EnvironmentVariables?.NODE_OPTIONS;
+  const allArgs = [...argv, ...args, ...effective];
   if (typeof nodeOptions === 'string' && nodeOptions.trim()) {
-    const preloads = nodeOptionPreloads(nodeOptions);
+    const preloads = shellSplit(nodeOptions);
     // An unparsable NODE_OPTIONS hides what node preloads: surface it, never skip it.
     if (preloads === null) throw new Error('Unsupported NODE_OPTIONS string (unterminated quote or escape): cannot tell whether the service preloads code from the clone');
+    // Keep extensionless relative preload operands anchored as before, while the
+    // structural candidates below also inspect every flag and expanded token.
     owners.push(...preloads.map(v => preloadOwner(v, wd)));
+    allArgs.push(nodeOptions, ...preloads);
   }
-  // Bare executables, flags and relative paths belong to the service's context,
-  // not this process's cwd. Only absolute/home-relative paths, or paths resolved against
-  // the service's own explicit WorkingDirectory, prove ownership.
+  // Relative candidates belong to the service's context, never this process's cwd.
   // The policy check (dev servers) must see the EFFECTIVE argv: `env -S "node .../next dev"` is one string in
   // the plist, so the original args alone would let a dev server through as a restartable sampler.
-  return { label: p.Label, plistPath, args: [...new Set([...args, ...effective])], unknownOption: unknownAt === null ? null : effective[unknownAt],
-    paths: owners.filter(isPathArg).map(expand),
+  return { label: p.Label, plistPath, args: [...new Set(allArgs)], unknownOption: unknownAt === null ? null : effective[unknownAt],
+    paths: [...new Set([...owners.filter(isPathArg).map(expand),
+      ...allArgs.flatMap(arg => [...argumentPaths(arg, wd), ...argumentPaths(arg, cwd)])])],
     // After an unknown interpreter option the script is the first non-option argument, or the second
     // when that option consumed an operand; later arguments are script data, not code. After an
     // unknown WRAPPER option the program position is unbounded, so every later path is a candidate.
@@ -318,7 +336,9 @@ function decide(parsed, { root, canonRoot, canon }) {
   // canon() returns null when a path cannot be resolved (permission, loop): that path is
   // unrelated evidence we cannot link to the clone, so it does not flag the service.
   const owned = paths => paths.some(path => inside(path, root) || (canon(path) !== null && inside(canon(path), canonRoot)));
-  if (owned(parsed.paths)) return { label: parsed.label, plistPath: parsed.plistPath, args: parsed.args };
+  if (parsed.args.some(arg => arg.includes(root) || arg.includes(canonRoot)) || owned(parsed.paths)) {
+    return { label: parsed.label, plistPath: parsed.plistPath, args: parsed.args };
+  }
   // An unclassifiable option hides the script position: if a clone path follows it, say so
   // instead of silently excluding the service from restart and stale detection.
   if (parsed.unknownOption !== null && owned(parsed.unknownPaths)) {
