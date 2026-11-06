@@ -13,6 +13,7 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync, existsSy
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { readFreeLaneList, isFreeLaneListFresh } from '../lib/free-lane-list.mjs';
+import { keepAliveScript } from '../lib/test-keepalive.mjs';
 
 const SCRIPT = resolve(process.cwd(), 'scripts/lane-pool.mjs');
 
@@ -309,7 +310,8 @@ describe('spawnBounded — a stalled child fails within its bound', () => {
   it('rejects at the bound with the process tree, and kills the child and its descendants', async () => {
     // The child starts an idle grandchild (the CI stall shape: waiting, not burning CPU), then idles. The bound leaves
     // a loaded host seconds to start node and the grandchild before it fires.
-    const src = "require('child_process').spawn('sleep', ['300'], { stdio: 'ignore' }); setInterval(() => {}, 1000);";
+    // keepAliveScript idles the child bounded by the test runner (anchor pid) and a max lifetime, so it cannot orphan.
+    const src = keepAliveScript({ prelude: "require('child_process').spawn('sleep', ['300'], { stdio: 'ignore' });" });
     const started = Date.now();
     const err = await spawnBounded(['-e', src], { boundMs: 6_000, label: 'stall-probe' }).then(() => null, (e) => e);
     expect(err).toBeInstanceOf(Error);
