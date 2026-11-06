@@ -341,6 +341,39 @@ describe.each(['--lane=1', '--all-pools'])('release unpushed guard %s', selector
     refused(result, sha);
     expect(salvageSeen()).toEqual({ refs: '', record: false });
   });
+  // A filesystem symlink redirects the same fetch writes without showing as a symbolic ref (PR #6319 self-review):
+  // `refs/remotes/origin -> ../heads` made the pruning salvage fetch reset main and delete work/keep, and a symlinked
+  // `refs/release-verify` sent the verify fetch's writes into another repository.
+  it.each([
+    ['refs/remotes/origin', false], ['refs/remotes/origin', true], ['refs/release-verify', false], ['logs/refs/remotes/origin', false],
+  ])('refuses, and keeps every branch, when .git/%s is a filesystem symlink (recovery on: %s)', (link, recovery) => {
+    const pushed = git(['rev-parse', 'HEAD'], laneDir);
+    const sha = commitWork();
+    git(['branch', 'work/keep', sha], laneDir);
+    git(['reset', '--quiet', '--hard', pushed], laneDir);
+    if (recovery) {
+      // HEAD on its own branch, ahead of origin/main, so the salvage reaches its fetch.
+      git(['switch', '--quiet', '-c', 'feature'], laneDir);
+      writeFileSync(join(laneDir, 'other.txt'), 'head work\n');
+      git(['add', 'other.txt'], laneDir);
+      git(['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--quiet', '-m', 'head work'], laneDir);
+    }
+    const heads = git(['for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads/'], laneDir);
+    const decoy = join(base, 'decoy');
+    git(['init', '--quiet', decoy]);
+    const target = link === 'refs/release-verify' ? join(decoy, '.git', 'refs', 'heads') : link.startsWith('logs/')
+      ? join(decoy, '.git', 'logs-target') : '../heads';
+    mkdirSync(join(laneDir, '.git', link, '..'), { recursive: true });
+    if (existsSync(join(laneDir, '.git', link))) renameSync(join(laneDir, '.git', link), join(base, 'moved-aside'));
+    if (link.startsWith('logs/')) mkdirSync(target, { recursive: true });
+    symlinkSync(target, join(laneDir, '.git', link));
+    const result = release([], '', '', recovery ? RECOVERY_ON : {});
+    expect(git(['for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads/'], laneDir)).toBe(heads);
+    expect(result.stderr).toContain(`${link} is a filesystem symlink`);
+    if (recovery) expect(result.stderr).toMatch(/SALVAGE PUSH FAILED: .*filesystem symlink/);
+    refused(result, sha);
+    expect(git(['for-each-ref', '--format=%(refname)'], decoy)).toBe('');
+  });
   // Defense in depth: whatever the fetch does, a local branch or stash that moved during it refuses the release.
   it('refuses when a local branch moves during the verification fetch', () => {
     const pushed = git(['rev-parse', 'HEAD'], laneDir);

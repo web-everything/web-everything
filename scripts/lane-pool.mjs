@@ -2947,7 +2947,8 @@ function releaseUnprovenCommits(dir, salvage, proof) {
   };
   const before = snapshot();
   if (!before) return { commits };
-  try { proof.io.fetchVerifyObjects(dir); } catch { return { commits }; /* keep the unfetched, stricter result */ }
+  // A failed or refused fetch keeps the unfetched, stricter result and names why (a redirected ref directory, …).
+  try { proof.io.fetchVerifyObjects(dir); } catch (e) { return { commits, note: msgOf(e) }; }
   const after = snapshot();
   if (!after) return { commits };
   const moved = [...new Set([...before.keys(), ...after.keys()])].filter(ref => before.get(ref) !== after.get(ref));

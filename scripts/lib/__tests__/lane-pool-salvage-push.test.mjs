@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { LANE_GIT_CONFIG_PINS } from '../lane-git-hardening.mjs';
 
@@ -517,12 +517,15 @@ describe('real salvage preservation and transport', () => {
 
   const SYMREF_LISTING = '--format=%(refname)%00%(symref)';
   const containsCalls = runGit => runGit.mock.calls.filter(([, args]) => args.includes('for-each-ref') && args.includes('--contains'));
-  function realHarness({ cherry = `+ ${head}\n+ ${older}`, contains = '', symrefs = 'refs/remotes/origin/HEAD\0refs/remotes/origin/main\nrefs/remotes/origin/main\0', verifyRefs = '', fail } = {}) {
+  // A git dir that does not exist: no ref directory on the fetch paths is present, so none is a symlink.
+  const NO_GIT_DIR = resolve(tmpdir(), 'salvage-push-no-such-git-dir');
+  function realHarness({ cherry = `+ ${head}\n+ ${older}`, contains = '', symrefs = 'refs/remotes/origin/HEAD\0refs/remotes/origin/main\nrefs/remotes/origin/main\0', verifyRefs = '', gitDir = NO_GIT_DIR, fail } = {}) {
     const runGit = vi.fn((_command, args) => {
       if (fail && args.includes(fail)) throw new Error(`${fail} unavailable`);
       if (args.includes('rev-list')) return `${head}\n${older}`;
       if (args.includes('cherry')) return cherry;
       if (args.includes(SYMREF_LISTING)) return symrefs;
+      if (args.includes('--git-common-dir')) return gitDir;
       if (args.includes('for-each-ref') && args.some(arg => arg.startsWith('refs/release-verify/'))) return verifyRefs;
       if (args.includes('for-each-ref')) return contains;
       return '';
@@ -544,6 +547,41 @@ describe('real salvage preservation and transport', () => {
     }
     expect(runGit.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
   });
+  // A filesystem symlink on a fetch's write path redirects it without any symbolic ref showing (PR #6319 self-review).
+  it.each([
+    ['refs/remotes/origin', 'dir'], ['refs/remotes', 'dir'], ['refs/remotes/origin/work', 'dir'], ['refs/remotes/origin/main', 'file'],
+    ['refs/release-verify', 'dir'], ['logs/refs/remotes/origin/main', 'file'], ['logs/refs/release-verify', 'dir'], ['logs/refs', 'dir'],
+  ])('refuses every fetch, before fetching, when %s is a filesystem symlink (%s)', (link, kind) => {
+    const gitDir = mkdtempSync(join(tmpdir(), 'salvage-symlink-'));
+    try {
+      mkdirSync(join(gitDir, 'refs', 'remotes', 'origin'), { recursive: true });
+      mkdirSync(join(gitDir, 'refs', 'heads'), { recursive: true });
+      const target = join(gitDir, 'elsewhere');
+      if (kind === 'dir') mkdirSync(target); else writeFileSync(target, `${head}\n`);
+      rmSync(join(gitDir, link), { recursive: true, force: true });
+      mkdirSync(join(gitDir, link, '..'), { recursive: true });
+      symlinkSync(target, join(gitDir, link));
+      const { io, runGit } = realHarness({ gitDir, symrefs: '' });
+      for (const operation of [() => io.fetchHeads(laneDir), () => io.fetchVerifyObjects(laneDir), () => io.unmatchedShas(laneDir, [head])]) {
+        expect(operation).toThrow(`${link} is a filesystem symlink`);
+      }
+      expect(runGit.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
+    } finally { rmSync(gitDir, { recursive: true, force: true }); }
+  });
+  it('allows real ref directories and refuses an unreadable or relative git dir', () => {
+    const gitDir = mkdtempSync(join(tmpdir(), 'salvage-real-'));
+    try {
+      mkdirSync(join(gitDir, 'refs', 'remotes', 'origin', 'work'), { recursive: true });
+      mkdirSync(join(gitDir, 'logs', 'refs', 'release-verify'), { recursive: true });
+      writeFileSync(join(gitDir, 'refs', 'remotes', 'origin', 'work', 'x'), `${head}\n`);
+      const { io, runGit } = realHarness({ gitDir, symrefs: '' });
+      io.fetchHeads(laneDir);
+      expect(runGit.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(true);
+    } finally { rmSync(gitDir, { recursive: true, force: true }); }
+    const relative = realHarness({ gitDir: '.git', symrefs: '' });
+    expect(() => relative.io.fetchHeads(laneDir)).toThrow(/unreadable lane git dir/);
+    expect(relative.runGit.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
+  });
   it.each(['unreadable', 'malformed'])('refuses every fetch when the tracking symref listing is %s', failure => {
     const { io, runGit } = failure === 'unreadable' ? realHarness({ fail: SYMREF_LISTING })
       : realHarness({ symrefs: 'refs/remotes/origin/main\0refs/heads/a\0extra' });
@@ -555,6 +593,7 @@ describe('real salvage preservation and transport', () => {
     let fetched = null;
     const runGit = vi.fn((_command, args, options) => {
       if (args.includes(SYMREF_LISTING)) return '';
+      if (args.includes('--git-common-dir')) return NO_GIT_DIR;
       if (args.includes('fetch')) { fetched = args.find(arg => arg.startsWith('+refs/heads/*:')).split(':')[1].replace(/\/\*$/, ''); return ''; }
       if (args.includes('for-each-ref')) return fetched ? `${fetched}/main\n${fetched}/work/x` : '';
       if (args.includes('update-ref')) { expect(options.input).toBe(`option no-deref\ndelete ${fetched}/main\noption no-deref\ndelete ${fetched}/work/x\n`); }
@@ -573,6 +612,7 @@ describe('real salvage preservation and transport', () => {
     let fetched = null;
     const runGit = vi.fn((_command, args) => {
       if (args.includes(SYMREF_LISTING)) return '';
+      if (args.includes('--git-common-dir')) return NO_GIT_DIR;
       if (args.includes('fetch')) { fetched = args.find(arg => arg.startsWith('+refs/heads/*:')).split(':')[1].replace(/\/\*$/, ''); throw new Error('fetch died'); }
       if (args.includes('for-each-ref')) return fetched ? `${fetched}/main` : '';
       return '';

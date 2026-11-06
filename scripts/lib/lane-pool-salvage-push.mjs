@@ -2,7 +2,7 @@ import { sameRepoUrl, ensureLaneAlternates } from './lane-alternates.mjs';
 import { boundedGitCommand, BOUNDED_GIT_GRACE_MS } from './git-bounded.mjs';
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, realpathSync } from 'node:fs';
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { laneGitHardeningEnv, scrubGitRepoEnv } from './lane-git-hardening.mjs';
@@ -159,6 +159,36 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
     if (unsafe.length) {
       throw new Error(`${unsafe.slice(0, 5).join('; ')}; a fetch would write through it — remove it (git update-ref --no-deref -d <ref>)`);
     }
+    // A filesystem symlink redirects the same writes without showing as a symbolic ref: `.git/refs/remotes/origin ->
+    // ../heads` let the pruning fetch reset and delete local branches, and a symlinked `refs/release-verify` or reflog
+    // directory sends the writes into another repository (PR #6319 self-review). Every directory and entry on the path
+    // of a namespace a fetch writes (refs and reflogs) must be real; a missing one is fine.
+    const common = git(dir, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
+    if (!isAbsolute(common)) throw new Error('unreadable lane git dir; inspect the lane manually');
+    const walk = (path, shown) => {
+      let entry;
+      try { entry = lstatSync(path); } catch (e) {
+        if (e?.code === 'ENOENT') return false;
+        throw new Error(`unreadable ${shown}; inspect the lane manually`);
+      }
+      if (entry.isSymbolicLink()) throw new Error(`${shown} is a filesystem symlink; a fetch would write through it — remove it`);
+      return entry.isDirectory();
+    };
+    const below = (path, shown) => {
+      if (!walk(path, shown)) return;
+      for (const name of readdirSync(path)) below(join(path, name), `${shown}/${clean(name)}`);
+    };
+    for (const namespace of ['refs/remotes/origin', 'refs/release-verify']) {
+      for (const root of [[], ['logs']]) {
+        const parts = [...root, ...namespace.split('/')];
+        let path = common;
+        for (const [i, part] of parts.entries()) {
+          path = join(path, part);
+          if (i === parts.length - 1) below(path, parts.join('/'));
+          else if (!walk(path, parts.slice(0, i + 1).join('/'))) break;
+        }
+      }
+    }
   };
   // ops/* carries the verdict ledger (huge history, never lane work): the lane's diet config excludes it, and an explicit
   // refspec would otherwise pull ~117k objects on every release (lane-68, 2026-11-01).
@@ -177,7 +207,9 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
     };
     if (owned().length) throw new Error(`${ns} already holds refs; inspect the lane manually`);
     try {
-      transportGit(dir, 'fetch', '--recurse-submodules=no', '--no-write-fetch-head', '--no-tags', origin, `+refs/heads/*:${ns}/*`, notOps);
+      // No auto-maintenance: lane gc.* config must not repack or prune the lane during a release check.
+      transportGit(dir, 'fetch', '--recurse-submodules=no', '--no-write-fetch-head', '--no-auto-maintenance', '--no-tags', origin,
+        `+refs/heads/*:${ns}/*`, notOps);
     } finally {
       const refs = owned();
       if (refs.length) {
