@@ -1536,6 +1536,26 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   const notifications = [];
   for (const p of result.plan.filter((x) => x.kind === 'notify' && !x.suppressed)) {
     const ep = state.episodes[p.key];
+    if (ep?.smell === 'claude-auth-expired' && !Number.isFinite(ep.needsYouAt) && !flags['no-notify']) {
+      const item = { key: p.key, repo: 'health-watch', kind: 'needs-you', pr: 0,
+        head: `${p.key}:${ep.openedAt ?? ep.firstBreachAt}`,
+        reason: 'Claude login expired — re-login', title: 'Claude login expired — re-login (run /login)',
+        at: new Date(now).toISOString() };
+      if (flags['dry-run']) {
+        notifications.push({ key: p.key, channel: 'needs-you', dryRun: true, item });
+      } else {
+        try {
+          await (deps.publishNeedsYou ?? publishAttention)(item);
+          // Reminder/unsilence plans may notify again; the feed alerts once per episode.
+          ep.needsYouAt = now;
+          notifications.push({ key: p.key, channel: 'needs-you', item, ok: true, error: null });
+        } catch (e) {
+          const error = scrubText(String(e?.message || e).split('\n')[0]);
+          console.error(`health-watch: NEEDS-YOU publish failed: ${error}`);
+          notifications.push({ key: p.key, channel: 'needs-you', item, ok: false, error });
+        }
+      }
+    }
     // `--dry-run`/`--no-notify` both skip actually SENDING one (an OS-visible side effect, unlike the
     // read-only diagnoses above) — a dry-run reports what it would have sent via `result.plan` already.
     if (!ep || flags['no-notify'] || flags['dry-run']) continue;
