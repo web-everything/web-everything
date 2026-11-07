@@ -378,7 +378,8 @@ export function createRecordReferralRulingReader({ root = REPO_ROOT, readJson = 
     const open = readProtectionContext(thread, { repo, pr, readJson, cardReadable, changedLines, env, log });
     return {
       head: thread.headRefOid, ...open,
-      ...(actor === JUDGE_ACTOR ? { judgeActorPolicy: readJudgeWriterPolicy({ env, tool: tool?.judgeActor, log }), identity: readJson(['api', 'user']) } : {}),
+      ...(actor === JUDGE_ACTOR ? { judgeActorPolicy: readJudgeWriterPolicy({ env, tool: tool?.judgeActor, log }) } : {}),
+      ...(actor !== AUTO_POLICY_ACTOR ? { identity: readJson(['api', 'user']) } : {}),
       ...(asJudge ? { judgeNotRealMode: readJudgeNotRealMode({ env, tool, log }),
         evidence: readJudgeEvidence(evidenceFile, readFile),
         disagreements: referralDisagreements(thread.comments, open, { repo, pr, finding }) } : {}),
@@ -482,8 +483,8 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
         // The SAME policy the plan held (#6494 F7): this sink's env and tool layer, narrowed by the gate-visible policy.
         const judgeActorPolicy = readJudgeWriterPolicy({ env, tool: tool?.judgeActor, log: warn });
         for (const row of rulings) assertJudgeAuthority({ judgeActorPolicy }, { actor, ruling: row.result, supersedes: row.supersedes });
-        assertRulingIdentity(readJson(['api', 'user']), actor);
       }
+      if (actor !== AUTO_POLICY_ACTOR) assertRulingIdentity(readJson(['api', 'user']), actor);
       const before = readPrThread(repo, pr, { readJson });
       if (before.headRefOid !== head) throw new Error(`PR #${pr}'s head moved to ${before.headRefOid} since the plan (${head}); nothing posted — re-run against the new head`);
       if (actor === AUTO_POLICY_ACTOR) {
