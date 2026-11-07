@@ -176,7 +176,8 @@ export function planRetirements({ rows, git, gh, repo, mainRef = 'origin/main' }
     // trees must stay registered; only reproducible clean merges can be ignored for containment.
     if (baseRow && carried.cleanMerges) {
       const baseFound = findPr({ gh, row: baseRow, repo });
-      if (baseFound.ok && baseFound.pr?.state === 'OPEN') {
+      // A base registration's `pr:N` may point at an unrelated PR: the PR must actually be the base branch's own.
+      if (baseFound.ok && baseFound.pr?.state === 'OPEN' && baseFound.pr.headRefName === baseRef) {
         const baseCarried = carriedBeyondMain({ git, ref: baseRow.ref, mainRef });
         if (baseCarried.ok && carried.unique.every((sha) =>
           git(['merge-base', '--is-ancestor', sha, baseCarried.tip]).code === 0)) {

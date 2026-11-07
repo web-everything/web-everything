@@ -101,12 +101,58 @@ it('CLI re-proof fetches and passes the registered base for a redundant merge si
       ref: entry.ref, action: 'retire', reason: 'redundant-merge-sibling',
       evidence: { baseRef: REF, basePr: 42, baseTip: OTHER },
     });
-    expect(run.mock.calls.find(([, args]) => args[0] === 'fetch')[1]).toEqual([
-      'fetch', '--no-tags', '-q', `https://github.com/${REPO}.git`,
-      '+refs/heads/main:refs/remotes/origin/main',
-      `+refs/heads/${entry.ref}:refs/remotes/origin/${entry.ref}`, baseRefspec,
+    // The base rides its own optional fetch, so a base deleted on origin cannot fail the entry's required fetch.
+    expect(run.mock.calls.filter(([, args]) => args[0] === 'fetch').map(([, args]) => args)).toEqual([
+      ['fetch', '--no-tags', '-q', `https://github.com/${REPO}.git`,
+        '+refs/heads/main:refs/remotes/origin/main', `+refs/heads/${entry.ref}:refs/remotes/origin/${entry.ref}`],
+      ['fetch', '--no-tags', '-q', `https://github.com/${REPO}.git`, baseRefspec],
     ]);
     expect(readOverlays(root, { env })).toEqual([entry, baseEntry]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+it('CLI re-proof keeps the sibling\'s own outcome when the registered base is gone from origin (optional base fetch fails)', () => {
+  const root = mkdtempSync(join(tmpdir(), 'retire-base-gone-'));
+  const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: root };
+  const entry = { ref: `${REF}-m2` };
+  const baseEntry = { ref: REF, pr: 42 };
+  const baseRefspec = `+refs/heads/${REF}:refs/remotes/origin/${REF}`;
+  const proveWith = (rows, baseOnOrigin) => {
+    writeFileSync(overlayFilePath(root, env), JSON.stringify({ overlays: rows }));
+    const run = vi.fn((cmd, args) => {
+      if (cmd === 'gh') {
+        if (args[0] === 'repo') return { status: 0, stdout: repository(REPO) };
+        // The base branch was merged and deleted: its PR is MERGED and found through the merge-ref base.
+        if (args[1] === 'view') return { status: 0, stdout: JSON.stringify({ number: 42, state: 'MERGED', headRefName: REF }) };
+        return { status: 0, stdout: JSON.stringify(args[args.indexOf('--head') + 1] === REF
+          ? [{ number: 42, state: 'MERGED', headRefName: REF }] : []) };
+      }
+      if (args.includes('remote')) return { status: 0, stdout: `https://github.com/${REPO}.git` };
+      if (args.includes('--git-common-dir')) return { status: 0, stdout: root };
+      // git fetch exits non-zero for a ref missing on origin; a combined refspec list would fail whole.
+      if (args[0] === 'fetch') return { status: !baseOnOrigin && args.includes(baseRefspec) ? 1 : 0, stdout: '' };
+      if (args[0] === 'init') return { status: 0, stdout: '' };
+      if (args[0] === 'rev-parse') {
+        const gone = !baseOnOrigin && args.at(-1) === `refs/remotes/origin/${REF}^{commit}`;
+        return { status: gone ? 1 : 0, stdout: gone ? '' : TIP };
+      }
+      if (args[0] === 'rev-list') return { status: 0, stdout: '' };
+      if (args[0] === 'merge-tree') return { status: 0, stdout: TIP }; // Merging onto main changes nothing.
+      return { status: 1, stdout: '' };
+    });
+    return { decision: proveRetirement({ root, entry, env, run }), run };
+  };
+  try {
+    const without = proveWith([entry], true).decision; // Before the base registration existed.
+    expect(without).toMatchObject({ ref: entry.ref, action: 'retire', reason: 'pr-merged' });
+    const { decision, run } = proveWith([entry, baseEntry], false);
+    expect(decision).toMatchObject({ ref: entry.ref, action: 'retire', reason: 'pr-merged' });
+    expect(decision.reason).not.toBe('fetch-failed');
+    // The required fetch never carried the base refspec, so its failure could not poison it.
+    const required = run.mock.calls.map(([, args]) => args).find((args) => args[0] === 'fetch');
+    expect(required).not.toContain(baseRefspec);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

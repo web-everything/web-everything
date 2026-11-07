@@ -331,7 +331,7 @@ describe('planRetirements redundant merge siblings (fake git/gh)', () => {
   const unique = 'd'.repeat(40);
   const mainTree = 'a'.repeat(40);
   const fixture = ({ registered = true, contained = 0, state = 'OPEN', conflict = 1,
-    unreadableBase = false, unknownPr = false, mergeEdits = false, unreadableMerge = false, row = {} } = {}) => {
+    unreadableBase = false, unknownPr = false, mergeEdits = false, unreadableMerge = false, baseHead = baseRef, row = {} } = {}) => {
     const calls = [];
     const git = (args) => {
       calls.push(args);
@@ -349,7 +349,7 @@ describe('planRetirements redundant merge siblings (fake git/gh)', () => {
       return { code: 1, stdout: '' };
     };
     const stub = ghStub({ heads: { [baseRef]: { number: 7, state: 'OPEN' } },
-      views: unknownPr ? {} : { 8: { number: 8, state, headRefName: baseRef } } });
+      views: unknownPr ? {} : { 8: { number: 8, state, headRefName: baseHead } } });
     const rows = [{ ref, pr: null, ...row }, ...(registered ? [{ ref: baseRef, pr: 8 }] : [])];
     return { decision: planRetirements({ rows, git, gh: stub.gh, repo: 'web-everything/web-everything' })[0], calls };
   };
@@ -384,6 +384,8 @@ describe('planRetirements redundant merge siblings (fake git/gh)', () => {
   it.each([
     ['unreadable base tip', { unreadableBase: true }],
     ['unknown base PR', { unknownPr: true }],
+    ['base registration pointing at an unrelated OPEN PR', { baseHead: 'lane/unrelated' }],
+    ['base registration whose PR has no head branch name', { baseHead: null }],
     ['unreadable containment', { contained: 128 }],
     ['clean merge onto main', { conflict: 0 }],
     ['unreadable merge onto main', { conflict: 128 }],
