@@ -11,8 +11,12 @@ import { join, resolve } from 'node:path';
 
 export const DEPS_BACKENDS = ['npm', 'pnpm'];
 
-/** Hash of the inputs a `backend` install depends on, or null when there is no package.json. */
-export function lockHash(dir, backend = 'npm') {
+/**
+ * Hash of the inputs a `backend` install depends on, or null when there is no package.json. A pnpm install
+ * also depends on the store it links into (global virtual store: node_modules are symlinks into it), so the
+ * pnpm hash covers `storeDir` too — moving `WE_PNPM_STORE_DIR` makes pnpm lanes stale.
+ */
+export function lockHash(dir, backend = 'npm', storeDir = resolvePnpmStoreDir()) {
   const lock = join(dir, 'package-lock.json');
   const pkg = join(dir, 'package.json');
   const file = existsSync(lock) ? lock : existsSync(pkg) ? pkg : null;
@@ -24,6 +28,7 @@ export function lockHash(dir, backend = 'npm') {
       const path = join(dir, extra);
       if (existsSync(path)) hash.update('\0' + extra + '\0').update(readFileSync(path));
     }
+    hash.update('\0store\0' + storeDir);
   }
   return hash.digest('hex');
 }
@@ -32,12 +37,16 @@ function readMarker(markerPath) {
   return existsSync(markerPath) ? readFileSync(markerPath, 'utf8').trim() : null;
 }
 
-/** 'n/a' | 'missing' | 'stale' | 'ok' — ok when the marker matches the CURRENT hash of either backend. */
-export function depsReady(dir, markerPath) {
+/**
+ * 'n/a' | 'missing' | 'stale' | 'ok' — ok when the marker matches the CURRENT hash of either backend. A pnpm
+ * marker is ok only while its store still exists: a wiped store leaves every pnpm lane's links dangling.
+ */
+export function depsReady(dir, markerPath, storeDir = resolvePnpmStoreDir()) {
   if (lockHash(dir) === null) return 'n/a'; // no package.json → nothing to install
   if (!existsSync(join(dir, 'node_modules'))) return 'missing';
   const have = readMarker(markerPath);
-  return DEPS_BACKENDS.some(backend => markerMatches(have, lockHash(dir, backend), backend)) ? 'ok' : 'stale';
+  return DEPS_BACKENDS.some(backend => markerMatches(have, lockHash(dir, backend, storeDir), backend)
+    && (backend !== 'pnpm' || existsSync(storeDir))) ? 'ok' : 'stale';
 }
 
 /** The shared pnpm store: `WE_PNPM_STORE_DIR` when set, else `~/.cache/we-pnpm-store`. */
@@ -68,15 +77,12 @@ export function markerMatches(marker, hash, backend) {
 }
 
 /**
+ * Install unconditionally — readiness is `depsReady`'s call alone (it also checks the pnpm store exists).
  * `hashFor(backend)` hashes that backend's install inputs. Returns the marker to persist only AFTER success.
  * A throwing npm install propagates.
  */
 export function runDepsInstaller({ plan, hashFor, marker, hasNodeModules, exec, remove,
   invalidate = () => {}, log = () => {} }) {
-  const hash = hashFor(plan.backend);
-  if (hasNodeModules && markerMatches(marker, hash, plan.backend)) {
-    return { state: 'ok', backend: plan.backend, marker };
-  }
   invalidate();
   // Unknown or legacy state is npm-shaped; never reuse it for a pnpm installation.
   const previous = marker?.startsWith('pnpm:') ? 'pnpm' : 'npm';
@@ -104,14 +110,15 @@ export function runDepsInstaller({ plan, hashFor, marker, hasNodeModules, exec, 
  * A lane that is ready under EITHER backend is left alone, before any installer selection runs: selection
  * depends on the environment (PATH, the `pnpm --version` probe, a parity read), and letting it decide again
  * would wipe and reinstall a ready lane whenever that environment differs from the one that installed it.
- * So a lane switches backend only when its lockfiles change.
+ * So a lane switches backend only when its install inputs change (lockfiles, or the pnpm store it links into).
+ * `storeDir` must be the same store `selectPlan` passes to pnpm.
  */
-export function ensureLaneDeps({ dir, markerPath, selectPlan, exec, log = () => {} }) {
-  const state = depsReady(dir, markerPath);
+export function ensureLaneDeps({ dir, markerPath, selectPlan, exec, log = () => {}, storeDir = resolvePnpmStoreDir() }) {
+  const state = depsReady(dir, markerPath, storeDir);
   if (state === 'n/a' || state === 'ok') return state;
   const plan = selectPlan();
   const result = runDepsInstaller({
-    plan, hashFor: backend => lockHash(dir, backend), marker: readMarker(markerPath),
+    plan, hashFor: backend => lockHash(dir, backend, storeDir), marker: readMarker(markerPath),
     hasNodeModules: existsSync(join(dir, 'node_modules')),
     invalidate: () => rmSync(markerPath, { force: true }),
     remove: () => rmSync(join(dir, 'node_modules'), { recursive: true, force: true }),

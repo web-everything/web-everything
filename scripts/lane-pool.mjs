@@ -826,8 +826,9 @@ const depsReady = (dir) => laneDepsReady(dir, DEPS_MARKER(dir));
 // that is comparatively cheap and already deduped by `depsReady`'s lockfile-hash skip (most acquires do
 // nothing here at all). This function stays ungated.
 function ensureDeps(dir) {
+  const storeDir = resolvePnpmStoreDir();
   return ensureLaneDeps({
-    dir, markerPath: DEPS_MARKER(dir),
+    dir, markerPath: DEPS_MARKER(dir), storeDir,
     selectPlan: () => selectInstaller({
       which: name => (process.env.PATH || '').split(delimiter).map(dir => resolve(dir, name)).find(file => {
         try { accessSync(file, constants.X_OK); return statSync(file).isFile(); } catch { return false; }
@@ -838,7 +839,7 @@ function ensureDeps(dir) {
       hasPnpmLock: existsSync(join(dir, 'pnpm-lock.yaml')),
       hasNpmLock: existsSync(join(dir, 'package-lock.json')),
       parity: () => readLockfileParity(dir).ok,
-      storeDir: resolvePnpmStoreDir(),
+      storeDir,
     }),
     log: message => log(`  ${message} in ${dir} …`),
     // Installer stdout goes to OUR stderr: acquire --json must remain pure JSON.
