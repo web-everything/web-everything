@@ -21,7 +21,8 @@ function packageScripts() {
   return repoScripts;
 }
 
-const RUNNER_OPTS_WITH_VALUE = new Set(['--prefix', '-C', '--dir', '--cwd', '--workspace', '-w', '--filter', '-F']);
+const RUNNER_OPTS_WITH_VALUE = new Set(['--prefix', '-C', '--dir', '--cwd', '--workspace', '-w', '--filter', '-F',
+  '--loglevel', '--userconfig', '--globalconfig', '--registry', '--cache', '--script-shell', '--reporter']);
 /** The package script a runner head starts (`npm run x`, `npm run-script x`, `pnpm x`, `yarn x`, `bun run x`), or null. */
 function packageScriptName(words) {
   const runner = (words[0] || '').replace(/^.*\//, '').replace(/@.*$/, '');
@@ -95,6 +96,7 @@ export function findUngatedHeavySpawns(source, filename = 'source.mjs', { script
   const file = ts.createSourceFile(filename, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
   if (file.parseDiagnostics.length) return [{ filename, line: 1, reason: 'Unreadable syntax; inspect manually before clearing admission lint' }];
   const bindings = new Map(), namespaces = new Set(), admission = new Map(), scopes = new Map();
+  const processNames = new Set(['process']), processBinaryNames = new Set();
   const scopeOf = node => {
     let scope = node.parent;
     while (scope && !ts.isBlock(scope) && !ts.isFunctionLike(scope) && !ts.isSourceFile(scope)) scope = scope.parent;
@@ -116,6 +118,14 @@ export function findUngatedHeavySpawns(source, filename = 'source.mjs', { script
         if (named && ts.isNamespaceImport(named)) namespaces.add(named.name.text);
         if (named && ts.isNamedImports(named)) for (const e of named.elements) {
           if (SPAWNS.has((e.propertyName || e.name).text)) bindings.set(e.name.text, (e.propertyName || e.name).text);
+        }
+      }
+      // `import process from 'node:process'`, `import * as p from 'process'`, `import { execPath } from 'node:process'`.
+      if (/^(?:node:)?process$/.test(mod)) {
+        if (node.importClause?.name) processNames.add(node.importClause.name.text);
+        if (named && ts.isNamespaceImport(named)) processNames.add(named.name.text);
+        if (named && ts.isNamedImports(named)) for (const e of named.elements) {
+          if (['execPath', 'argv0'].includes((e.propertyName || e.name).text)) processBinaryNames.add(e.name.text);
         }
       }
       if (/(?:^|\/)readiness\/heavy-admission\.mjs$/.test(mod) && named && ts.isNamedImports(named)) {
@@ -176,7 +186,7 @@ export function findUngatedHeavySpawns(source, filename = 'source.mjs', { script
     if (ts.isParenthesizedExpression(node)) return isProcess(node.expression, seen);
     if (ts.isIdentifier(node)) {
       const value = valueOf(node);
-      return value === undefined ? node.text === 'process' : !!value && isProcess(value, seen);
+      return value === undefined ? processNames.has(node.text) : !!value && isProcess(value, seen);
     }
     return memberOf(node) === 'process' && ts.isIdentifier(node.expression) && node.expression.text === 'globalThis';
   };
@@ -185,7 +195,10 @@ export function findUngatedHeavySpawns(source, filename = 'source.mjs', { script
     if (!node || seen.has(node)) return false;
     seen.add(node);
     if (ts.isParenthesizedExpression(node)) return nodeBinary(node.expression, seen);
-    if (ts.isIdentifier(node)) { const value = valueOf(node); return !!value && nodeBinary(value, seen); }
+    if (ts.isIdentifier(node)) {
+      const value = valueOf(node);
+      return value === undefined ? processBinaryNames.has(node.text) : !!value && nodeBinary(value, seen);
+    }
     if (ts.isBindingElement(node)) {
       const pattern = node.parent, declaration = pattern?.parent;
       return ts.isObjectBindingPattern(pattern) && NODE_BINARY_KEYS.includes(keyOf(node.propertyName || node.name))

@@ -3513,28 +3513,34 @@ export function shellCString(segment) {
   const words = headWords(cmd);
   const prog = words.length ? words[0].text : '';
   if (!SHELL_PROGRAMS.has(prog)) return null;
-  for (let i = 1; i < words.length; i++) {
+  // The shell reads every option first; `-c` may sit in any cluster (`-ce`, `-euxc`) and options such as
+  // `-o pipefail` / `-O extglob` / `--rcfile f` take a value. The command string is the first operand.
+  let c = false, i = 1;
+  if (prog === 'busybox' && SHELL_PROGRAMS.has(words[1]?.text)) i = 2;   // `busybox sh -c '…'`
+  for (; i < words.length; i++) {
     const w = words[i].text;
-    if (SHELL_C_FLAG.test(w)) {
-      const word = words[i + 1];
-      if (!word) return null;
-      // The outer shell skips substitutions only inside a single-quoted run (outside `"…"`) or behind an
-      // escaped opener; a `'` inside `"…"` is a literal character, not a quote.
-      const raw = cmd.slice(word.start, word.end);
-      let unexpanded = false, dq = false;
-      for (let k = 0; k < raw.length && !unexpanded; k += 1) {
-        const ch = raw[k];
-        if (ch === '\\') { unexpanded = raw[k + 1] === '$' || raw[k + 1] === '`'; k += 1; }
-        else if (ch === '"') dq = !dq;
-        else if (ch === "'" && !dq) unexpanded = true;
-      }
-      return { text: word.dq ? word.text.replace(/\\(["\\$`])/g, '$1') : word.text, innerSubstitutions: unexpanded };
-    }
-    if (w.startsWith('-')) continue;
-    if (prog === 'busybox' && SHELL_PROGRAMS.has(w)) continue;   // `busybox sh -c '…'`
-    break;                                                        // a SCRIPT FILE, not a `-c` string
+    // Quotes are removed before the shell sees its argv, so a quoted `'-c'` (spawn argv) is still an option.
+    if (!/^[-+]/.test(w) || w === '-' || w === '+') break;
+    if (w === '--') { i += 1; break; }
+    if (/^--(?:rcfile|init-file)$/.test(w)) { i += 1; continue; }
+    if (w.startsWith('--')) continue;
+    if (w[0] === '-' && w.includes('c')) c = true;
+    if (/[oO]/.test(w)) i += 1;                                   // `-o pipefail`, `-euo pipefail`, `+O extglob`
   }
-  return null;
+  if (!c) return null;                                              // a SCRIPT FILE (or stdin), not a `-c` string
+  const word = words[i];
+  if (!word) return null;
+  // The outer shell skips substitutions only inside a single-quoted run (outside `"…"`) or behind an
+  // escaped opener; a `'` inside `"…"` is a literal character, not a quote.
+  const raw = cmd.slice(word.start, word.end);
+  let unexpanded = false, dq = false;
+  for (let k = 0; k < raw.length && !unexpanded; k += 1) {
+    const ch = raw[k];
+    if (ch === '\\') { unexpanded = raw[k + 1] === '$' || raw[k + 1] === '`'; k += 1; }
+    else if (ch === '"') dq = !dq;
+    else if (ch === "'" && !dq) unexpanded = true;
+  }
+  return { text: word.dq ? word.text.replace(/\\(["\\$`])/g, '$1') : word.text, innerSubstitutions: unexpanded };
 }
 
 /** Deny any unqueued test/standards execution, with a runnable replacement. Pure; no escape. */

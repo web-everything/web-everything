@@ -83,6 +83,12 @@ describe('daemon heavy spawn admission lint', () => {
     "spawnSync('npm test', { shell: true });",
     "spawnSync('echo', ['$(npm test)'], { shell: true });",
     "execFileSync('npm', ['test'], { shell: '/bin/sh' });",
+    "spawnSync('bash', ['-o', 'pipefail', '-c', 'npm test']);",
+    "spawnSync('bash', ['-ce', 'npm test']);",
+    "execSync(\"bash -euo pipefail -c 'npm test'\");",
+    "spawnSync('npm', ['--loglevel', 'silent', 'run', 'test:bun:scripts']);",
+    "import { execPath } from 'node:process'; spawnSync(execPath, ['--test']);",
+    "import proc from 'node:process'; spawnSync(proc.execPath, ['--test']);",
   ])('detects same-class spelling: %s', call => {
     expect(findUngatedHeavySpawns(all + call)).toHaveLength(1);
   });
@@ -93,6 +99,7 @@ describe('daemon heavy spawn admission lint', () => {
     "spawnSync('echo', ['$(npm test)'], { shell: false });",
     "const { execPath } = other; spawnSync(execPath, ['--test']);",
     "spawnSync('sh', ['script.sh']);",
+    "spawnSync('bash', ['-o', 'pipefail', 'script.sh', '-c', 'npm test']);",
   ])('leaves plain-argv data and queued scripts alone: %s', call => {
     expect(findUngatedHeavySpawns(all + call)).toEqual([]);
   });

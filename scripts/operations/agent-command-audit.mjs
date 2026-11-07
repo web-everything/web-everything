@@ -110,8 +110,9 @@ function redactShortPasswords(text) {
 }
 
 export function redact(text) {
-  // A `\`+newline is a line continuation: the shell deletes both, so the next line continues the same word.
-  let clean = stripVTControlCharacters(String(text)).replace(/\\\r?\n/g, '').replace(/[\x00-\x1f\x7f\x85]|\p{Zl}|\p{Zp}/gu, ' ');
+  // A `\`+newline is a line continuation; it becomes a space (never joined away), so the backslash can never
+  // pose as an escaped-space value (`--token \⏎ v`) and the next line still starts a word (`x\\⏎--token v`).
+  let clean = stripVTControlCharacters(String(text)).replace(/\\\r?\n/g, ' ').replace(/[\x00-\x1f\x7f\x85]|\p{Zl}|\p{Zp}/gu, ' ');
   if (clean.length > REDACT_MAX_CHARS) clean = clean.slice(0, REDACT_MAX_CHARS) + ' …[truncated]';
   // Value-carrying forms run before the generic name rule below, which would otherwise redact only the name.
   // Every rule that starts with a repeated class is anchored to a word start, so none of them is quadratic.

@@ -164,7 +164,8 @@ describe('agent command audit', () => {
     `docker login -p ${zq} reg`, `sshpass -p ${zq} ssh h`, `mysql -u root -p${zq} db`, `GH_TOKEN="a b"${zq} gh pr list`,
     `GH_TOKEN=$(echo ${zq}) gh pr list`, `cmd --token $(a $(b) ${zq})`, `cmd --token $(a ')' ${zq})`,
     `cmd --token=$(a "x)" ${zq})`, `cmd --token <(echo ${zq})`, `cmd --token \`echo \\\` ${zq}\``,
-    `cmd --token $(unterminated ${zq}`, `curl -H "X-Auth: ${zq}"`, `cmd --token${String.fromCharCode(0x2028)}${zq}`,
+    `cmd --token $(unterminated ${zq}`, `echo x\\\\\n--token ${zq}`, `cat <<EOF\nline\\\n--password ${zq}\nEOF`,
+    `cmd --token \\\r\n ${zq}`, `GH_TOKEN=\\\n${zq} gh`, `curl -H "X-Auth: ${zq}"`, `cmd --token${String.fromCharCode(0x2028)}${zq}`,
   ])('redacts the credential value in %s', command => {
     const out = redact(command);
     expect(out).not.toContain(zq);
@@ -178,6 +179,8 @@ describe('agent command audit', () => {
     ['bash -c "echo $(npm test)"', false], ["bash -c 'echo $(npm test)'", false], ['bash -c "echo \\$(npm test)"', false],
     ['sh -c "sh -c \\"npm test\\""', false], [`bash -c "x $(sh -c 'npm test')"`, false],
     [queue + 'bash -c "echo $(npm test)"', false],
+    ["bash -o pipefail -c 'npm test'", false], ["bash -euo pipefail -c 'npm test'", false], ["bash -ce 'npm test'", false],
+    ["bash -O extglob -c 'npm test'", false], ["bash -c -- 'npm test'", false], ["busybox sh -c 'npm test'", false],
   ])('counts the run in %s exactly once', (command, queued) => {
     expect(classifyCommand(command)).toEqual([expect.objectContaining({ category: 'npm test/check', queued })]);
   });
