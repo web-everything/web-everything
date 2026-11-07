@@ -154,6 +154,50 @@ describe('launchd restart by label (R703)', () => {
     expect(o.restarted.size).toBe(0);
   });
 
+  describe('nested policy values never rebuild into a truthy object', () => {
+    const nested = [
+      ['platform enabled.value true', { platform: { enabled: { value: true } } }],
+      ['platform enabled.value false', { platform: { enabled: { value: false } } }],
+      ['settings enabled.value true', { settings: { enabled: { value: true } } }],
+      ['deep nesting', { platform: { enabled: { a: { b: false } } } }],
+      ['nested allowedLabels', { settings: { allowedLabels: { x: [writer] } } }],
+      ['scalar platform layer', { platform: false }],
+    ];
+
+    it('platform enabled:{value:false} with settings enabled:false is a disabled skip, never a kickstart', async () => {
+      const o = fixture({ platform: { enabled: { value: false } }, settings: { enabled: false } });
+      const r = await restartServicesForClone(o);
+      expect(o.launchctl).not.toHaveBeenCalled();
+      expect(o.restarted.size).toBe(0);
+      expect(r.restarted).toEqual([]);
+      expect(r.errors).toEqual([]);
+      expect(r.skipped).toEqual([{ label: sampler, reason: 'disabled' }]);
+      expect(lines(o)).toContain('ignored malformed');
+    });
+
+    it.each(nested)('%s never restarts when the tool layer disables the feature', async (_name, layers) => {
+      const o = fixture({ ...layers, settings: { ...layers.settings, enabled: false } });
+      const r = await restartServicesForClone(o);
+      expect(o.launchctl).not.toHaveBeenCalled();
+      expect(r.restarted).toEqual([]);
+      expect(o.restarted.size).toBe(0);
+    });
+
+    it('a malformed platform value is ignored, so a valid tool allowlist still applies', async () => {
+      const o = fixture({ platform: { enabled: { value: false } }, settings: { allowedLabels: [writer] } });
+      const r = await restartServicesForClone(o);
+      expect(r.restarted).toEqual([{ label: writer, reason: 'kickstart -k' }]);
+      expect(o.launchctl.mock.calls).toEqual([[kick(writer)]]);
+    });
+
+    it('nested envValues never enable or widen the policy', async () => {
+      const o = fixture({ settings: { enabled: false }, envValues: { enabled: { value: true }, '': { enabled: true } } });
+      const r = await restartServicesForClone(o);
+      expect(o.launchctl).not.toHaveBeenCalled();
+      expect(r.skipped).toEqual([{ label: sampler, reason: 'disabled' }]);
+    });
+  });
+
   it.each([undefined, null, -1, 1.5, '501', NaN, () => { throw new Error('uid unavailable'); }])(
     'unreadable uid %s fails closed', async uid => {
       const o = fixture({ uid: typeof uid === 'function' ? uid : () => uid });
