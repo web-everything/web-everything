@@ -106,7 +106,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: main
-          fetch-depth: 0
+          fetch-depth: 1 # tip only; the history comes from the blobless fetch below (no blobs of old commits)
+
+      # NARROW FETCH (R696): `fetch-depth: 0` pulled every branch and every old blob (355 s measured). The gate reads
+      # main's FULL ancestry (first-parent `git log base..head`, merge-base, change lists) but only commits and trees
+      # of it, plus a few blobs on demand (a promisor remote fetches those lazily). So: complete main history,
+      # blobs filtered. FAILS CLOSED: a repo still shallow, or a missing main tip, stops the job here.
+      - name: Fetch main history (blobless)
+        run: |
+          git fetch --no-tags --unshallow --filter=blob:none origin '+refs/heads/main:refs/remotes/origin/main' || { echo "::error::merge-gate: could not fetch main history — failing closed." >&2; exit 1; }
+          [ "$(git rev-parse --is-shallow-repository)" = "false" ] || { echo "::error::merge-gate: history is still shallow after the blobless fetch — failing closed." >&2; exit 1; }
+          git rev-parse --verify --end-of-options 'refs/remotes/origin/main^{commit}' >/dev/null || { echo "::error::merge-gate: main tip does not resolve — failing closed." >&2; exit 1; }
 
       - uses: actions/setup-node@v4
         with:
@@ -143,6 +153,7 @@ jobs:
               [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::merge-gate: merge group sha is not a 40-hex commit id — failing closed." >&2; exit 1; }
             done
             git fetch origin -- "$MG_HEAD_SHA" "$MG_BASE_SHA"
+            git merge-base "$MG_BASE_SHA" "$MG_HEAD_SHA" >/dev/null || { echo "::error::merge-gate: no merge-base between the merge group's base and head after the narrowed fetch — failing closed." >&2; exit 1; }
             GROUP_TREE="$RUNNER_TEMP/group-tree"
             mkdir -p "$GROUP_TREE"
             git archive "$MG_HEAD_SHA" backlog | tar -x -C "$GROUP_TREE"
