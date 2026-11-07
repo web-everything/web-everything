@@ -111,6 +111,13 @@ describe('heavy-enforce — every direct test run requires admission', () => {
     'case x in\n x) npx vitest run a;;\nesac', "case x in x) bash -c 'npx vitest run a';; esac",
     'f() { npx vitest run a; }', 'function f { npx vitest run a; }', 'function f() { npx vitest run a; }',
     'coproc npx vitest run a', 'coproc T { npx vitest run a; }',
+    // Self-review of round 3: env options that take a value, GNU long-option abbreviations, env -S's own `\_`
+    // escape, quoted case subjects, spaced arm patterns, `coproc NAME ( … )` and more exec wrappers.
+    "env -P /usr/bin -S 'npx vitest run a'", "env -U nobody -S 'npx vitest run a'", "env -L 0 -S 'npx vitest run a'",
+    "env -a x -S 'npx vitest run a'", "env --split 'npx vitest run a'", "env --split-str='npx vitest run a'",
+    "env -S 'npx\\_vitest run a'", 'case "a b" in *) npx vitest run a;; esac', 'case x in x ) npx vitest run a;; esac',
+    'coproc N ( npx vitest run a )', 'caffeinate -i npx vitest run a', 'unbuffer npx vitest run a',
+    'chrt -i 0 npx vitest run a', 'taskset -c 0 npx vitest run a',
     ...['timeout', 'gtimeout'].flatMap(wrapper => [
       `${wrapper} 5 npx playwright test a`,
       `${wrapper} 5 node --test a.test.mjs`,
@@ -156,6 +163,8 @@ describe('heavy-enforce — every direct test run requires admission', () => {
     "env -S '" + queue + "npx vitest run a'", '{ ' + queue + 'npx vitest run a; }',
     'case x in x) ' + queue + 'npx vitest run a;; esac', 'f() { ' + queue + 'npx vitest run a; }',
     'env -S echo', 'echo case x in x', 'git commit -m "x) npx vitest run a"', 'echo "{ npx vitest run a; }"',
+    'nohup nohup nohup nohup nohup nohup echo hi', 'eval nohup eval nohup eval nohup echo hi',
+    "env -P /usr/bin -S 'echo hi'", 'case x in x ) echo hi;; esac', 'taskset -c 0 echo hi',
     'grep vitest x', 'echo npx vitest run', 'npx vitest --version', 'vitest --help',
     'git commit -m "document npx vitest run"',
   ])('allows admitted control flow or harmless mention `%s`', cmd => {

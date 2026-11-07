@@ -765,6 +765,21 @@ function wrapperPrefixLength(words) {
       }
       continue;
     }
+    if (w === 'caffeinate' || w === 'unbuffer') {                            // caffeinate -i [-t N] <cmd>, unbuffer <cmd>
+      i += 1;
+      while (i < words.length && words[i].startsWith('-') && words[i] !== '-') {
+        const opt = words[i++];
+        if (opt === '--') break;
+        if (/^-[tw]$/.test(opt)) i += 1;
+      }
+      continue;
+    }
+    if (w === 'taskset' || w === 'chrt') {                                   // taskset [-c] <mask> <cmd>, chrt [-r] <prio> <cmd>
+      i += 1;
+      while (i < words.length && words[i].startsWith('-') && words[i] !== '-') { if (words[i++] === '--') break; }
+      i += 1; // the mask / priority
+      continue;
+    }
     if (w === 'command' || w === 'builtin' || w === 'nice') { i += 1; continue; }
     if (w === 'sudo') {                                                       // sudo -n -u <user> … <cmd>
       i += 1;
@@ -1531,7 +1546,10 @@ export function nestedCommandStrings(segment) {
   if (split !== null && split.trim()) out.push(split);
   // Compound-command syntax (case arms, function heads, coproc) is peeled so `case x in x) bash -c '…';; esac`
   // reaches the `-c` re-execution below like a bare `bash -c '…'` does.
-  const cmd = canonicalCommand(stripShellControl(s));
+  // The segment itself without that syntax goes to every arm too (`case x in x) npm run build;; esac`).
+  const stripped = stripShellControl(s);
+  if (stripped && stripped !== s.trim()) out.push(stripped);
+  const cmd = canonicalCommand(stripped);
   if (!cmd) return out;
   // …and a group behind a WRAPPER (`time (npm run build)`, `sudo (…)`) — `canonicalCommand` peels the
   // wrapper, so the opener is at the head of what it returns even when it was not at the head of `s`.
@@ -3510,11 +3528,11 @@ const SHELL_CONTROL_PREFIX = /^(?:(?:do|then|else|elif|if|while|until|!)\s+)+/;
 const SHELL_COMPOUND_OPENERS = [
   SHELL_CONTROL_PREFIX,
   /^\{\s+/,                                                        // brace group `{ cmd; }`
-  /^case\s+\S+\s+in\b\s*/,                                         // `case "$x" in` (its first arm may follow)
-  /^\(?[^\s()|;&<>]+(?:\s*\|\s*[^\s()|;&<>]+)*\)\s*(?=\S)/,        // a case arm pattern `x)` / `(x|y)`
+  /^case\s+(?:"[^"]*"|'[^']*'|\S+)\s+in\b\s*/,                     // `case "$x" in` (its first arm may follow)
+  /^\(?\s*[^\s()|;&<>]+(?:\s*\|\s*[^\s()|;&<>]+)*\s*\)\s*(?=\S)/,  // a case arm pattern `x)` / `(x|y)` / `x )`
   /^function\s+[A-Za-z_][\w:.-]*(?:\s*\(\s*\))?\s*/,               // `function f { …` / `function f() { …`
   /^[A-Za-z_][\w:.-]*\s*\(\s*\)\s*/,                                // `f() { …`
-  /^coproc\s+(?:[A-Za-z_]\w*\s+(?=\{))?/,                          // `coproc cmd` / `coproc NAME { cmd; }`
+  /^coproc\s+(?:[A-Za-z_]\w*\s+(?=[{(]))?/,                        // `coproc cmd` / `coproc NAME { cmd; }` / `( cmd )`
 ];
 
 /** A segment with its leading shell compound-command syntax removed (control words, brace groups, case arms,
@@ -3540,23 +3558,31 @@ export function envSplitString(segment) {
   for (let i = at + 1; i < w.length; i += 1) {
     const opt = w[i];
     if (opt === '--' || !opt.startsWith('-') || opt === '-') return null; // options end; the command follows
-    const long = /^--split-string(?:=([\s\S]*))?$/.exec(opt);
-    if (long) return long[1] ?? w[i + 1] ?? null;
-    if (/^--(?:unset|chdir)$/.test(opt)) { i += 1; continue; }
+    // GNU accepts any unambiguous prefix of a long option (`--split`, `--sp=`).
+    const [name, value] = opt.includes('=') ? [opt.slice(0, opt.indexOf('=')), opt.slice(opt.indexOf('=') + 1)] : [opt, null];
+    const longOf = (full, min) => name.length >= min && full.startsWith(name);
+    if (longOf('--split-string', 4)) return envSplitText(value ?? w[i + 1]);
+    if (value === null && (longOf('--unset', 3) || longOf('--chdir', 3) || longOf('--argv0', 3))) { i += 1; continue; }
     if (opt.startsWith('--')) continue;
     for (let k = 1; k < opt.length; k += 1) {
-      if (opt[k] === 'u' || opt[k] === 'C') { if (k === opt.length - 1) i += 1; break; } // takes a value
-      if (opt[k] === 'S') return opt.slice(k + 1) || w[i + 1] || null;
+      // Options that take a value: GNU -u/-C/-a, BSD/macOS -u/-P/-L/-U.
+      if ('uCaPLU'.includes(opt[k])) { if (k === opt.length - 1) i += 1; break; }
+      if (opt[k] === 'S') return envSplitText(opt.slice(k + 1) || w[i + 1]);
     }
   }
   return null;
+}
+
+/** env -S's own escapes: `\_` is a space (`npx\_vitest` runs `npx vitest`), `\t` a tab. */
+function envSplitText(text) {
+  return text == null ? null : String(text).replace(/\\_/g, ' ').replace(/\\t/g, '\t');
 }
 
 /** The unqueued heavy run a segment starts, with the command text that classified (after env -S, launcher
  *  and alias unwrapping), or null. Deeper than the hop bound fails closed. Pure. */
 function heavyRunHead(segment) {
   let raw = String(segment || '');
-  for (let hop = 0; hop < 6; hop += 1) {
+  for (let hop = 0; hop < 16; hop += 1) {
     const split = envSplitString(raw);
     if (split !== null) { raw = split; continue; }
     const head = canonicalCommand(stripShellControl(raw));
@@ -3567,7 +3593,7 @@ function heavyRunHead(segment) {
     if (!alias) return null;
     raw = alias;
   }
-  return { kind: 'test', raw: null }; // implausibly deep wrapping: fail closed
+  return { kind: 'test', raw: null }; // 16+ nested launchers/env -S: implausible, so fail closed
 }
 
 /** The kind of unqueued heavy run a segment's executable head starts ('vitest' | 'node-test' | 'standards' |

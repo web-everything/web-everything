@@ -231,6 +231,28 @@ describe('agent command audit', () => {
     expect(out).not.toMatch(/firstPart|secondPart/);
     expect(out).toContain('[REDACTED]');
   });
+  // Self-review of round 3: the password is found inside `$( … )` / a subshell, before a comment or a line break,
+  // behind a path, and for every curl user option; a quote that closes a URL never starts a userinfo scan.
+  it.each([
+    ['x=$(htpasswd -nb user firstPart)', 'x=$(htpasswd -nb user [REDACTED])'],
+    ['(htpasswd -nb user firstPart)', '(htpasswd -nb user [REDACTED])'],
+    ['htpasswd -nb user firstPart) && echo x', 'htpasswd -nb user [REDACTED]) && echo x'],
+    ['/usr/bin/htpasswd -nb u firstPart', '/usr/bin/htpasswd -nb u [REDACTED]'],
+    ['htpasswd -nb u firstPart # note', 'htpasswd -nb u [REDACTED] # note'],
+    ['htpasswd -nb u firstPart\necho done', 'htpasswd -nb u [REDACTED] echo done'],
+    ['curl -su user:firstPart x', 'curl [REDACTED] x'], ['curl -U u:firstPart x', 'curl [REDACTED] x'],
+    ['curl --proxy-user u:firstPart x', 'curl [REDACTED] x'], ['curl -u= user:firstPart x', 'curl [REDACTED] x'],
+    ['echo "https://x.com" && npx @11ty/eleventy', 'echo "https://x.com" && npx @11ty/eleventy'],
+    [`curl "http://example.com" -d 'mail=a@b.c'`, `curl "http://example.com" -d 'mail=a@b.c'`],
+    [`curl 'https://user:firstPart@h/x'`, `curl 'https://[REDACTED]@h/x'`],
+  ])('redacts exactly the credential in %s', (command, expected) => {
+    expect(redact(command)).toBe(expected);
+  });
+  it('stays linear on an unterminated substitution after many -u options', () => {
+    const started = Date.now();
+    expect(redact('curl -u "$('.repeat(1600))).toContain('curl');
+    expect(Date.now() - started).toBeLessThan(500);
+  });
   it('keeps the operands around a quoted htpasswd password and ordinary -u options', () => {
     expect(redact(`htpasswd -nb user 'a b' 2>&1 | tail`)).toBe('htpasswd -nb user [REDACTED] 2>&1 | tail');
     expect(redact('htpasswd -i f user')).toBe('htpasswd -i f user');
