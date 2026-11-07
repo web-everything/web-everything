@@ -1,8 +1,8 @@
 /**
  * @file skills-src/conveyor/__tests__/verify-daemon.test.mjs
  * @description Unit proof of #3878's standalone Verify daemon — the pure loop and the thin per-tick wrapper
- *   (no real lease, no real dispatch, no real subprocess/gh/git, no real timers except the `realSleep`
- *   regression below): injected effects, so the tick/backoff/stop-condition decision is tested with fakes
+ *   (no real dispatch or subprocess/gh/git; real timers in the wake/sleep and heartbeat proofs):
+ *   injected effects, so the tick/backoff/stop-condition decision is tested with fakes
  *   exactly like the sibling daemons in this epic are.
  *
  *   #4130 (epic #3383 audit finding V1) adds `startIndependentHeartbeat` — a REAL timer independent of the
@@ -10,9 +10,10 @@
  *   gate tick against a real 15-minute runner-lock lease, showing the lease's own `heartbeatAt` keeps
  *   advancing (at least every 2 minutes) throughout, rather than lapsing mid-gate.
  */
-import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, chmodSync, watch, unwatchFile } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { EventEmitter } from 'node:events';
 import { join } from 'node:path';
 import { keepAliveScript } from '../../../scripts/lib/test-keepalive.mjs';
 import {
@@ -21,12 +22,147 @@ import {
   reconcileInFlight, pidAlive, processGroupAlive, killInFlight, makeCodeChangedGuard, createCleanup, runDaemon,
   VERIFY_DAEMON_LEASE_KEY, DEFAULT_INTERVAL_MS,
   resolveRestartInFlight, writeInFlightHandoff, adoptInFlight, isDispatchedRun, wireGateJobs,
+  createVerifyWakeSleep,
 } from '../verify-daemon.mjs';
+import { signalVerifyRequest, verifyHandoffDir } from '../../../scripts/lib/fix-handoff.mjs';
 import { laneNeedsVerifyDispatch } from '../../../scripts/conveyor/verify-dispatch.mjs';
 import { VERIFY_FILENAME, verifyStartBody } from '../../../scripts/lib/lane-verify.mjs';
 import {
   acquireRunnerLease, heartbeatRunnerLease, runnerLeaseStatus, makeOwner,
 } from '../runner-lock.mjs';
+
+describe('createVerifyWakeSleep + verify request handoff — real filesystem contract (red first)', () => {
+  let dir, timers, watchers, timerSpy;
+  const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const wakeSleep = (options = {}) => createVerifyWakeSleep({
+    dir, debounceMs: 40, statPollMs: 5, log: vi.fn(),
+    watchDir: (...args) => {
+      const watcher = watch(...args);
+      watchers.push(watcher);
+      return watcher;
+    },
+    ...options,
+  });
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'verify-wake-'));
+    timers = [];
+    watchers = [];
+    const realSetTimeout = globalThis.setTimeout;
+    timerSpy = vi.spyOn(globalThis, 'setTimeout').mockImplementation((...args) => {
+      const timer = realSetTimeout(...args);
+      timers.push(timer);
+      return timer;
+    });
+  });
+
+  afterEach(() => {
+    for (const timer of timers) clearTimeout(timer);
+    timerSpy.mockRestore();
+    for (const watcher of watchers) watcher.close();
+    unwatchFile(join(dir, 'wake'));
+    vi.unstubAllEnvs();
+    chmodSync(dir, 0o700);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('early wake: a verify request during sleep(5000) resolves handoff well under one second', async () => {
+    const sleep = wakeSleep();
+    const start = performance.now();
+    const pending = sleep(5000);
+    await delay(15);
+    expect(signalVerifyRequest({ dir, log: vi.fn() })).toBe(true);
+    const reason = await Promise.race([pending, delay(800).then(() => 'timed-out')]);
+    expect(reason).toBe('handoff');
+    expect(performance.now() - start).toBeLessThan(800);
+  });
+
+  it('backstop: without a signal sleep(60) resolves interval after approximately 60ms', async () => {
+    const sleep = wakeSleep();
+    const start = performance.now();
+    expect(await sleep(60)).toBe('interval');
+    expect(performance.now() - start).toBeGreaterThanOrEqual(50);
+    expect(performance.now() - start).toBeLessThan(600);
+  });
+
+  it('debounce/burst: five signals produce exactly one early wake and the following sleep(80) reaches interval', async () => {
+    const sleep = wakeSleep({ debounceMs: 80 });
+    const reasons = [];
+    const start = performance.now();
+    const pending = sleep(5000).then(reason => { reasons.push(reason); return reason; });
+    await delay(5);
+    for (let i = 0; i < 5; i += 1) {
+      expect(signalVerifyRequest({ dir, log: vi.fn() })).toBe(true);
+      if (i < 4) await delay(5);
+    }
+    expect(performance.now() - start).toBeLessThan(80);
+    expect(await Promise.race([pending, delay(600).then(() => 'timed-out')])).toBe('handoff');
+    const secondStart = performance.now();
+    reasons.push(await sleep(80));
+    expect(reasons).toEqual(['handoff', 'interval']);
+    expect(reasons.filter(reason => reason === 'handoff')).toHaveLength(1);
+    expect(performance.now() - secondStart).toBeGreaterThanOrEqual(65);
+  });
+
+  it.each(['throws', 'emits error'])('watcher failure (%s): logs, falls back to the timer without stat polling, and never spins or resolves twice', async failure => {
+    const log = vi.fn();
+    const watcher = new EventEmitter();
+    watcher.close = vi.fn();
+    const watchDir = vi.fn(() => {
+      if (failure === 'throws') throw new Error('watcher unavailable');
+      watchers.push(watcher);
+      setTimeout(() => watcher.emit('error', new Error('watcher unavailable')), 10);
+      return watcher;
+    });
+    // A poll cannot fire within this test's window; the timer must be sufficient alone.
+    const sleep = wakeSleep({ watchDir, statPollMs: 60_000, intervalFallback: realSleep, log });
+    const settled = vi.fn();
+    const start = performance.now();
+    const reason = await sleep(60).then(value => { settled(value); return value; });
+    expect(reason).toBe('interval');
+    expect(performance.now() - start).toBeGreaterThanOrEqual(50);
+    expect(performance.now() - start).toBeLessThan(600);
+    await delay(30);
+    expect(settled).toHaveBeenCalledTimes(1);
+    expect(settled).toHaveBeenCalledWith('interval');
+    expect(log.mock.calls.flat().join(' ')).toMatch(/watch(?:er)?.*(?:fail|error|unavailable)/i);
+    expect(watchDir).toHaveBeenCalledTimes(1);
+    expect(timerSpy.mock.calls.length).toBeLessThanOrEqual(8);
+  });
+
+  it('signalVerifyRequest returns false and logs without throwing when the directory is unwritable', () => {
+    chmodSync(dir, 0o500);
+    const log = vi.fn();
+    let result;
+    expect(() => { result = signalVerifyRequest({ dir, log }); }).not.toThrow();
+    expect(result).toBe(false);
+    expect(log.mock.calls.flat().join(' ')).toMatch(/(?:fail|EACCES|EPERM|permission)/i);
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  it('verifyHandoffDir uses WE_VERIFY_HANDOFF_DIR when set', () => {
+    vi.stubEnv('WE_VERIFY_HANDOFF_DIR', dir);
+    expect(verifyHandoffDir()).toBe(dir);
+  });
+
+  it('verifyHandoffDir defaults to ~/.claude/conveyor/verify-handoff when the override is absent', () => {
+    vi.stubEnv('WE_VERIFY_HANDOFF_DIR', undefined);
+    expect(verifyHandoffDir()).toBe(join(homedir(), '.claude', 'conveyor', 'verify-handoff'));
+  });
+
+  it('verify-lane request imports signalVerifyRequest and calls it before emitting requested', () => {
+    const source = readFileSync(join(process.cwd(), 'scripts', 'verify-lane.mjs'), 'utf8');
+    expect(source).toMatch(/^import\s*\{[^}]*\bsignalVerifyRequest\b[^}]*\}\s*from\s*['"]\.\/lib\/fix-handoff\.mjs['"]/m);
+    const requestBranches = [...source.matchAll(/if\s*\(MODE === 'request'\)\s*\{([\s\S]*?)^\}/gm)];
+    const branch = requestBranches.find(([, body]) => /status:\s*['"]requested['"]/.test(body))?.[1];
+    expect(branch, 'the request branch emitting requested must exist').toBeDefined();
+    expect(branch).toMatch(/^\s*(?:await\s+)?signalVerifyRequest\s*\(/m);
+    const signalAt = branch.search(/^\s*(?:await\s+)?signalVerifyRequest\s*\(/m);
+    const emitAt = branch.search(/\bemit\s*\(/);
+    expect(signalAt).toBeGreaterThanOrEqual(0);
+    expect(emitAt).toBeGreaterThan(signalAt);
+  });
+});
 
 describe('runDaemonLoop — the pure control flow', () => {
   it('requires a tickOnce effect', async () => {
