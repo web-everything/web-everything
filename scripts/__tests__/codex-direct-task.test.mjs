@@ -930,6 +930,9 @@ describe('captureDiff — the review artifact, never a commit/push', () => {
     ['core.trustctime=false + core.checkStat=minimal hide a same-size edit with its mtime restored', (dir, git) => {
       git('config', 'core.trustctime', 'false');
       git('config', 'core.checkStat', 'minimal');
+      // Git compares ctime to the second here: an edit in the same second as `git add` is invisible even with the
+      // pins (a limit of git's stat cache), so cross a second boundary first.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1100 - (Date.now() % 1000));
       writeFileSync(join(dir, 'text.txt'), 'a\nX\n');
       utimesSync(join(dir, 'text.txt'), OLD_TIME, OLD_TIME);
     }, fresh => expect(readFileSync(join(fresh, 'text.txt'), 'utf8')).toBe('a\nX\n')],
@@ -999,7 +1002,7 @@ describe('captureDiff — the review artifact, never a commit/push', () => {
       if (existsSync(join(dir, 'tool.sh'))) {
         // Case-insensitive filesystem: git cannot see the rename, so the clone must be kept.
         expect(report.patchExact).toBe(false);
-        expect(report.patchError).toMatch(/case- or normalization-only rename of "tool\.sh"/);
+        expect(report.patchError).toMatch(/case-only rename of "tool\.sh"/);
         expect(diffProvesNoEdits(report)).toBe(false);
       } else {
         expect(report.patchExact).toBe(true);
@@ -1012,6 +1015,23 @@ describe('captureDiff — the review artifact, never a commit/push', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
       rmSync(fresh, { recursive: true, force: true });
+    }
+  });
+
+  it('binarySafe: a clean repo with a decomposed (NFD) file name is not mistaken for a rename', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-codex-nfd-name-'));
+    try {
+      const git = initGitRepo(dir);
+      const name = 'café.txt';
+      writeFileSync(join(dir, name), 'x\n');
+      git('add', name);
+      git('-c', 'user.name=t', '-c', 'user.email=t@example.test', '-c', 'commit.gpgSign=false', 'commit', '--quiet', '-m', 'nfd');
+      const report = captureDiff({ dir, startSha: git('rev-parse', 'HEAD'), binarySafe: true });
+      expect(report.patchError).toBeUndefined();
+      expect(report.patchExact).toBe(true);
+      expect(diffProvesNoEdits(report)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 

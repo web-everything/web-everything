@@ -867,7 +867,9 @@ export function captureDiff({ dir, startSha, execFn = defaultExecFn, binarySafe 
 /** Checkout config Codex can write that makes git's view HIDE a worktree edit (both diffs empty, so an empty "exact"
  *  patch would let cleanup delete the only copy): `core.fileMode=false` drops executable-bit edits, `core.autocrlf`
  *  normalizes CRLF-only edits away, `core.ignoreStat` stops git noticing edits, `core.trustctime=false` /
- *  `core.checkStat=minimal` miss a same-size edit whose mtime was restored, `core.symlinks=false` hides a symlink
+ *  `core.checkStat=minimal` miss a same-size edit whose mtime was restored (git's ctime check is per second, so only
+ *  an edit within the second the clone's index recorded the file can still slip past: Codex starts later than that),
+ *  `core.symlinks=false` hides a symlink
  *  turned into a file, and `attr.tree` swaps in attributes (text/eol rules) from outside the worktree. Pinned for
  *  every capture read. Index bits (assume-unchanged, skip-worktree), `.git/info/attributes` and a case-only rename
  *  cannot be pinned off: they are refused as not byte-exact in `captureBinaryPatch`. */
@@ -893,30 +895,33 @@ function hasContent(path) {
   catch (error) { return error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR'; }
 }
 
-const foldName = (name) => name.normalize('NFC').toLowerCase();
+const nfc = (name) => name.normalize('NFC');
 
-/** The first tracked path whose name (or a parent directory's) exists on disk only under a different case or
- *  Unicode normalization: on a case-insensitive filesystem (`core.ignoreCase`, `core.precomposeUnicode`) git
- *  reports such a rename as no change, so the patch would rebuild the old name. A missing path is a deletion git
- *  does see; a listing failure other than a missing directory is doubt (thrown). */
+/** The first tracked path whose name (or a parent directory's) exists on disk only under a different case: on a
+ *  case-insensitive filesystem (`core.ignoreCase`) git reports such a rename as no change, so the patch would
+ *  rebuild the old name. Names compare in NFC: macOS git lists precomposed names (`core.precomposeUnicode`) while
+ *  the disk may store them decomposed, which is the same name, not a rename. A missing path is a deletion git does
+ *  see; a listing failure other than a missing directory is doubt (thrown). Each directory is listed once. */
 function caseOnlyRename(dir, paths) {
   const listings = new Map();
   const listing = (rel) => {
     if (!listings.has(rel)) {
       let names = null;
-      try { names = new Set(readdirSync(rel ? join(dir, rel) : dir)); }
-      catch (error) { if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error; }
+      try {
+        const raw = readdirSync(rel ? join(dir, rel) : dir).map(nfc);
+        names = { exact: new Set(raw), folded: new Set(raw.map(name => name.toLowerCase())) };
+      } catch (error) { if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error; }
       listings.set(rel, names);
     }
     return listings.get(rel);
   };
   for (const path of paths) {
-    const parts = path.replace(/\/$/, '').split('/');
+    const parts = path.replace(/\/$/, '').split('/').map(nfc);
     for (let i = 0; i < parts.length; i += 1) {
       const names = listing(parts.slice(0, i).join('/'));
-      if (!names || names.has(parts[i])) { if (!names) break; continue; }
-      const folded = foldName(parts[i]);
-      if ([...names].some(name => foldName(name) === folded)) return path;
+      if (!names) break;
+      if (names.exact.has(parts[i])) continue;
+      if (names.folded.has(parts[i].toLowerCase())) return path;
       break;
     }
   }
@@ -947,7 +952,7 @@ function captureBinaryPatch(git, startSha, { dir, untracked, intentToAddError })
     }
     if (flagged.length) return notExact(`${flagged.length} tracked path(s) carry an assume-unchanged or skip-worktree index bit, so edits to them are hidden (e.g. ${JSON.stringify(flagged[0])})`);
     const renamed = caseOnlyRename(dir, tracked);
-    if (renamed) return notExact(`a case- or normalization-only rename of ${JSON.stringify(renamed)} is invisible to git on this filesystem`);
+    if (renamed) return notExact(`a case-only rename of ${JSON.stringify(renamed)} is invisible to git on this filesystem`);
     // `.git/info/attributes` sits outside the committed tree and no config turns it off: its text/eol rules can
     // normalize an edit away. Only the repository's own `.gitattributes` files count.
     const attributesPath = String(git(['rev-parse', '--git-path', 'info/attributes']) ?? '').trim();
