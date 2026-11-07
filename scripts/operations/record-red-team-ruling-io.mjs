@@ -1,4 +1,5 @@
-import { readCardRulingFileMode, landRulingCard as defaultLandRulingCard, rulingCardFilingSink } from './record-referral-ruling-io.mjs';
+import { judgeEvidenceComment } from './record-referral-ruling.mjs';
+import { judgeRulingSink, judgeConfirm as defaultJudgeConfirm, readJudgeNotRealMode, readJudgeEvidence, readCardRulingFileMode, landRulingCard as defaultLandRulingCard, rulingCardFilingSink } from './record-referral-ruling-io.mjs';
 /**
  * @file scripts/operations/record-red-team-ruling-io.mjs
  * @description The IMPURE half of `record-red-team-ruling` (see `./record-red-team-ruling.mjs`): the reader (live
@@ -30,7 +31,7 @@ import { assertOperatorCliFresh } from '../lib/main-staleness.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 import { runCardDedupe, runLandPreventionCardCli } from './land-prevention-card.mjs';
-import { blockRulingId, assertRulingCardInputFits, CARD_PENDING_OUTCOME, OPERATOR_BLOCK_OUTCOME, OPERATOR_NOT_REAL_OUTCOME, RED_TEAM_RULING_BLOCK_EFFECT, RED_TEAM_RULING_NOT_REAL_EFFECT, conflictingPendingCardJobs, hasPendingCardIntent, OPERATOR_CARD_OUTCOME, RED_TEAM_RULING_CARD_EFFECT, buildRuleReasonComment, recordRedTeamRulingOperation, rulingCardResource, rulableBreaks } from './record-red-team-ruling.mjs';
+import { planRedTeamCard, blockRulingId, assertRulingCardInputFits, CARD_PENDING_OUTCOME, OPERATOR_BLOCK_OUTCOME, OPERATOR_NOT_REAL_OUTCOME, RED_TEAM_RULING_BLOCK_EFFECT, RED_TEAM_RULING_NOT_REAL_EFFECT, conflictingPendingCardJobs, hasPendingCardIntent, OPERATOR_CARD_OUTCOME, RED_TEAM_RULING_CARD_EFFECT, buildRuleReasonComment, recordRedTeamRulingOperation, rulingCardResource, rulableBreaks } from './record-red-team-ruling.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 /** `gh` under the OPERATOR channel: App tokens removed, so it runs as the operator's own login. */
@@ -102,17 +103,19 @@ const resolveCardDefault = (card, { runGit = git, readOnPr = readCardAtPrHead } 
 const readScopeLogged = (env) => readOperatorRulings({ env, log: (m) => process.stderr.write(`${m}\n`) });
 
 export function createRecordRedTeamRulingReader({ tool, log = line => console.error(line), env = process.env, readThread = readLiveThread, readSetting = () => readConfirmedBreaks({ env }),
-  readStandingRulingScope = standingRulingScope,
+  readStandingRulingScope = standingRulingScope, readFile = readFileSync,
   readScope = () => readScopeLogged(env), runGit = git, readOnPr = readCardAtPrHead,
   resolveCard = card => resolveCardDefault(card, { runGit, readOnPr }),
   resolveIdentity = () => resolveOperatorIdentity({ env }), now = () => new Date().toISOString(),
   assertFresh = () => assertOperatorCliFresh(REPO_ROOT, { label: 'record-red-team-ruling', env }) } = {}) {
-  return ({ repo, pr, card }) => {
+  return ({ repo, pr, card, asJudge, evidenceFile, disagreements }) => {
     assertFresh();
     const thread = readThread({ repo, pr });
     const head = String(thread.headRefOid ?? '').toLowerCase();
     const scope = readScope();
-    return { head, cardFileMode: readCardRulingFileMode({ env, tool, log }), labels: thread.labels ?? [], comments: thread.comments ?? [],
+    return { head, judgeNotRealMode: readJudgeNotRealMode({ env, tool, log }),
+      ...(asJudge ? { evidence: readJudgeEvidence(evidenceFile, readFile), disagreements } : {}),
+      cardFileMode: readCardRulingFileMode({ env, tool, log }), labels: thread.labels ?? [], comments: thread.comments ?? [],
       standingRuling: readStandingRulingScope({ repo, pr: { ...thread, number: Number(pr), headRefOid: head } }),
       setting: readSetting().value, scope: { value: scope.value, sources: scope.sources ?? {} }, now: now(), identity: resolveIdentity(),
       card: card === undefined || card === '' ? null : resolveCard(card, { repo, pr, head }) };
@@ -151,7 +154,7 @@ export const spawnStableCardJob = (input, session, binding, { spawnDetached = de
   return r.ok ? { ...r, session } : r;
 };
 
-export function createRecordRedTeamRulingSinks({ landRulingCard = defaultLandRulingCard, env = process.env, root = REPO_ROOT, readThread = readLiveThread,
+export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConfirm, landRulingCard = defaultLandRulingCard, env = process.env, root = REPO_ROOT, readThread = readLiveThread,
   readStandingRulingScope = standingRulingScope,
   readScope = () => readScopeLogged(env),
   runGit = git, readOnPr = readCardAtPrHead,
@@ -228,7 +231,7 @@ export function createRecordRedTeamRulingSinks({ landRulingCard = defaultLandRul
     try { return syncLabels({ repo: p.repo, pr: p.pr, head: p.head }); }
     catch (e) { warn(`red-team-status-label-miss: ${p.repo}#${p.pr}: ${String(e?.message ?? e)}`); return null; }
   };
-  const reasonBody = (p, cardNote) => buildRuleReasonComment({ head: p.head, ruling: p.ruling, actor: p.actor, channel: p.channel,
+  const reasonBody = (p, cardNote) => judgeEvidenceComment(p.judgeEvidence) + buildRuleReasonComment({ head: p.head, ruling: p.ruling, actor: p.actor, channel: p.channel,
     at: p.at, reason: p.reason, findings: p.findings, cardNote, cause: p.cause ?? null });
   const operatorRecord = (p, outcome, line) => `${redTeamGateMarker(p.pr, p.head, outcome, p.resultId)}\n`
     + `**Red-team gate** operator ruling (\`record-red-team-ruling\`) on head \`${p.head.slice(0, 12)}\`:\n${line}`;
@@ -237,6 +240,7 @@ export function createRecordRedTeamRulingSinks({ landRulingCard = defaultLandRul
     + `Operator card ruling pending (job ${p.jobKey}, break(s) ${p.indices.map((i) => `#${i}`).join(', ')}); the break stays held until the card is queued and recorded.`;
   return {
     ['github.red-team-ruling-file-card']: rulingCardFilingSink(landRulingCard),
+    ['github.red-team-ruling-file-card-judge']: judgeRulingSink({ confirm: judgeConfirm, land: landRulingCard, planCard: planRedTeamCard }),
     [RED_TEAM_RULING_CARD_EFFECT]: (p) => {
       const { comments } = recheck(p);
       if (p.cardRef) {
@@ -372,7 +376,7 @@ export function createRecordRedTeamRulingSinks({ landRulingCard = defaultLandRul
     [RED_TEAM_RULING_NOT_REAL_EFFECT]: async (p) => {
       recheck(p);
       const record = buildGateComment({ pr: p.pr, head: p.head, outcome: OPERATOR_NOT_REAL_OUTCOME, round: null, result: p.resultId,
-        plan: { sendBack: [], card: [], advisory: p.findings } });
+        plan: { sendBack: [], card: [], advisory: p.findings } }) + judgeEvidenceComment(p.judgeEvidence);
       post(p.repo, p.pr, reasonBody(p, 'Recorded as not real: the break stays advisory. This does not clear `review:human` or approve the PR.'));
       recheck(p, 'reason posted; no release record written');
       // F4: a clearing ruling must reach the ledger before its comment can release the break.

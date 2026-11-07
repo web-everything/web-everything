@@ -1,4 +1,4 @@
-import { assertCardFiling, cardFilingBinding, buildRulingCardInput, cardFilingVerdict, rulingCardSteps } from './record-referral-ruling.mjs';
+import { assertCardFiling, cardFilingBinding, buildRulingCardInput, cardFilingVerdict, rulingCardSteps, judgeRulingInput, landedRulingCard } from './record-referral-ruling.mjs';
 import { classAction, allClasses } from '../lib/finding-class-policy.mjs';
 import { breakClass } from '../lib/red-team-gate.mjs';
 /**
@@ -271,13 +271,14 @@ export function planRedTeamCard(read, input) {
   return { mode, cardInput, binding: cardFilingBinding(read, selected, state.resultId) };
 }
 
-export function recordRedTeamRulingOperation({ readRulingContext } = {}) {
+export function recordRedTeamRulingOperation({ readRulingContext, judgeConfirm } = {}) {
   if (typeof readRulingContext !== 'function') {
     throw new TypeError('record-red-team-ruling: needs a `readRulingContext({repo, pr})` reader — the real binding is '
       + '`we:scripts/operations/record-red-team-ruling-io.mjs`.');
   }
   return op(RECORD_RED_TEAM_RULING_OP, {
     input: {
+      ...judgeRulingInput,
       pr: 'number',
       repo: 'string',
       break: 'string',
@@ -292,13 +293,21 @@ export function recordRedTeamRulingOperation({ readRulingContext } = {}) {
     },
     verdictFrom: 'plan',
     read: compute({
-      reads: ['input.repo', 'input.pr', 'input.card'],
-      fn: (view) => readRulingContext({ repo: view.input.repo, pr: view.input.pr, card: view.input.card }),
+      reads: ['input'],
+      fn: (view) => readRulingContext({ repo: view.input.repo, pr: view.input.pr, card: view.input.card,
+        ...(view.input.asJudge !== undefined ? { asJudge: view.input.asJudge, evidenceFile: view.input.evidenceFile, disagreements: view.input.disagreements } : {}) }),
     }),
-    ...rulingCardSteps(readRulingContext, planRedTeamCard, 'github.red-team-ruling-file-card'),
+    ...rulingCardSteps(readRulingContext, planRedTeamCard, 'github.red-team-ruling-file-card', (read, input) => {
+      validateRedTeamRulingInput(read, input);
+      return selectRedTeamRulingFindings(read, input).selected;
+    }),
     plan: compute({
       reads: ['input.repo', 'input.pr', 'input.break', 'input.ruling', 'input.actor', 'input.channel', 'input.reason', 'input.card', 'input.cause', 'input.preview', 'findings.read', 'findings.reread', 'findings.cardPlan', 'findings.landCard'],
-      fn: (view) => cardFilingVerdict(view) ?? planRedTeamRuling(view.findings.reread ?? view.findings.read, view.input),
+      fn: (view) => {
+        const plan = cardFilingVerdict(view) ?? planRedTeamRuling(view.findings.reread ?? view.findings.read, (landedRulingCard(view.findings)?.input ?? view.input));
+        if (landedRulingCard(view.findings)?.judgeEvidence) plan.judgeEvidence = landedRulingCard(view.findings)?.judgeEvidence;
+        return plan;
+      },
     }),
     write: effectStep({
       reads: ['verdict', 'input.preview'],
@@ -310,7 +319,7 @@ export function recordRedTeamRulingOperation({ readRulingContext } = {}) {
           actor: view.verdict.actor, channel: view.verdict.channel, reason: view.verdict.reason, at: view.verdict.at,
           resultId: view.verdict.resultId, findings: view.verdict.findings, indices: view.verdict.indices,
           setting: view.verdict.setting, scope: view.verdict.scope, cardRef: view.verdict.cardRef, cause: view.verdict.cause, underChanges: view.verdict.underChanges,
-          cardInput: view.verdict.cardInput, jobKey: view.verdict.jobKey, session: view.verdict.session, sendBackBody: view.verdict.sendBackBody,
+          judgeEvidence: view.verdict.judgeEvidence, cardInput: view.verdict.cardInput, jobKey: view.verdict.jobKey, session: view.verdict.session, sendBackBody: view.verdict.sendBackBody,
         },
       }]),
     }),

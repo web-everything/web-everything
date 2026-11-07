@@ -439,7 +439,7 @@ export function cardFilingBinding(read, selected, resultId = null) {
 export const landedRulingCard = findings => findings.landCard?.effects?.[0]?.result;
 export function cardFilingVerdict(view) {
   if (!view.findings.cardPlan) return null;
-  if (view.input.preview) return { fileOnly: true, wouldFile: view.findings.cardPlan.cardInput };
+  if (view.input.preview) return { fileOnly: true, ...(view.findings.cardPlan.mode === 'judge' ? { wouldConfirm: true } : { wouldFile: view.findings.cardPlan.cardInput }) };
   if (view.findings.cardPlan.mode === 'two-step') {
     const landed = landedRulingCard(view.findings);
     if (!landed?.ok || !landed.ref) throw new Error('card filing result missing; no ruling recorded');
@@ -449,23 +449,32 @@ export function cardFilingVerdict(view) {
 }
 
 /** Shared step layout; all external filing remains in the injected sink. */
-export function rulingCardSteps(readRulingContext, planCard, type) {
+export function rulingCardSteps(readRulingContext, planCard, type, selectJudge) {
   return {
-    cardPlan: compute({ reads: ['input', 'findings.read'], fn: v => v.input.fileCard ? planCard(v.findings.read, v.input) : null }),
+    cardPlan: compute({ reads: ['input', 'findings.read'], fn: v => {
+      const judge = planJudgeRuling(v.findings.read, v.input, selectJudge);
+      return judge ?? (v.input.fileCard ? planCard(v.findings.read, v.input) : null);
+    } }),
     landCard: effectStep({ reads: ['input', 'findings.read', 'findings.cardPlan'],
-      effects: v => !v.findings.cardPlan || v.input.preview ? [] : [{ type, idempotent: true,
-        payload: { repo: v.input.repo, pr: v.input.pr, head: v.findings.read.head, cardInput: v.findings.cardPlan.cardInput } }] }),
+      effects: v => !v.findings.cardPlan || v.input.preview ? [] : [{
+        type: v.findings.cardPlan.mode === 'judge' ? `${type}-judge` : type, idempotent: true,
+        payload: v.findings.cardPlan.mode === 'judge' ? { ...v.findings.cardPlan, repo: v.input.repo, pr: v.input.pr }
+          : { repo: v.input.repo, pr: v.input.pr, head: v.findings.read.head, cardInput: v.findings.cardPlan.cardInput },
+      }] }),
     reread: compute({ reads: ['input', 'findings.read', 'findings.cardPlan', 'findings.landCard'], fn: v => {
       const landed = landedRulingCard(v.findings);
+      const judge = v.findings.cardPlan?.mode === 'judge';
+      if (judge && !v.input.preview && !landed?.judgeEvidence) throw new Error('missing judge confirmation result; ask the operator');
+      if (judge && landed?.input?.ruling === 'not-real') return v.findings.read;
       if (v.findings.cardPlan && !v.input.preview && (!landed?.ok || !landed.ref))
         throw new Error('card filing result missing; no ruling recorded');
-      if (v.findings.cardPlan?.mode !== 'one-call' || !landed?.ok) return v.findings.read;
+      if ((!judge && v.findings.cardPlan?.mode !== 'one-call') || !landed?.ok) return v.findings.read;
       const fresh = readRulingContext({ repo: v.input.repo, pr: v.input.pr, card: landed.ref });
-      const original = v.findings.cardPlan.binding;
+      const original = judge ? landed.binding : v.findings.cardPlan.binding;
       const recovery = `no ruling recorded; review the live findings and cite --card=${landed.ref} in a new ruling`;
-      if (!original || fresh.head !== original.head)
-        throw new Error(`PR head changed during card landing; ${recovery}`);
-      const refreshed = planCard(fresh, v.input);
+      if (!original || fresh.head !== original.head) throw new Error(`PR head changed during card landing; ${recovery}`);
+      const input = judge ? landed.input : v.input;
+      const refreshed = planCard(judge ? { ...fresh, cardFileMode: { value: 'one-call' } } : fresh, input);
       if (JSON.stringify(refreshed.binding) !== JSON.stringify(original))
         throw new Error(`selected finding identities changed during card landing; ${recovery}`);
       return fresh;
@@ -483,13 +492,80 @@ export function planReferralCard(read, input) {
   return { mode, cardInput: buildRulingCardInput(read, input, selected), binding: cardFilingBinding(read, selected) };
 }
 
-export function recordReferralRulingOperation({ readRulingContext } = {}) {
+/** Pure, fail-closed acting-judge policy. No evidence is executed here. */
+export function planJudgeNotReal({ mode, evidence, liveHead, findings, confirm, disagreements } = {}) {
+  if (!Array.isArray(findings) || !findings.length) throw new Error('missing finding evidence; operator-only');
+  for (const f of findings) {
+    const classes = [f.class, f.findingClass, ...(f.classes ?? []), ...(f.alsoClasses ?? [])];
+    const file = String(f.file ?? '').replaceAll('\\', '/');
+    if (!file || file.includes('..') || /(?:^|\/)(?:guards?|security|launchd)(?:\/|\.)|(?:drain|merge|firewall|codex-shim)/i.test(file)
+      || (!classes.some(c => typeof c === 'string' && c.trim()) || classes.some(c => /^security(?:-|$)/.test(c))) || f.securityReachableToday === true)
+      throw new Error('protected or security finding is operator-only');
+  }
+  if (!Number.isInteger(disagreements) || disagreements < 0) throw new Error('disagreements must be a nonnegative integer');
+  if (disagreements >= 2) throw new Error('repeated disagreements are operator-only');
+  if (!['off', 'evidence-required', 'open'].includes(mode)) throw new Error('invalid judgeNotRealMode');
+  if (mode === 'off') throw new Error('judge not-real is disabled (off); ask the operator');
+  if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) throw new Error('missing or unreadable evidence');
+  const bounded = {};
+  for (const field of ['command', 'output', 'headSha', 'handler', 'provingTest']) {
+    if (typeof evidence[field] !== 'string' || !evidence[field].trim()) throw new Error(`invalid evidence.${field}`);
+    if (field !== 'output' && evidence[field].length > 4000) throw new Error(`oversized evidence.${field}; ask the operator to review the full evidence`);
+    bounded[field] = evidence[field];
+  }
+  if (!/^[a-f0-9]{40}$/.test(liveHead ?? '') || bounded.headSha !== liveHead) throw new Error('stale or invalid evidence head');
+  if (!/^[^\r\n]+:[1-9][0-9]*$/.test(bounded.handler)) throw new Error('evidence.handler must be path:line');
+  if (bounded.output.length > 4000) bounded.output = bounded.output.slice(0, 3000) + ' [truncated; operator must inspect full evidence output]';
+  const agrees = mode === 'open' || confirm?.verdict === 'agree';
+  return { ruling: agrees ? 'not-real' : 'card', evidence: bounded,
+    reason: agrees ? 'Evidence supports not-real' : 'Confirmation did not agree; file a follow-up card' };
+}
+
+export const judgeRulingInput = {
+  asJudge: { type: 'boolean', required: false },
+  evidenceFile: { type: 'string', required: false },
+  disagreements: { type: 'number', required: false },
+};
+
+/** Pure preflight; confirmation and any filing belong to the effect sink. */
+export function planJudgeRuling(read, input, select) {
+  if (input.asJudge !== undefined && typeof input.asJudge !== 'boolean') throw new Error('asJudge must be boolean');
+  if (!input.asJudge) return null;
+  if (input.ruling !== 'not-real') throw new Error('asJudge applies only to not-real');
+  const policy = { mode: read.judgeNotRealMode?.value, evidence: read.evidence ?? input.evidence,
+    liveHead: read.head, findings: select(read, input),
+    disagreements: input.disagreements === undefined ? read.disagreements : input.disagreements };
+  const preflight = planJudgeNotReal({ ...policy, confirm: { verdict: 'agree' } });
+  return { mode: 'judge', policy: { ...policy, evidence: preflight.evidence }, input, read };
+}
+
+/** Canonical comment body and structured evidence share the exact same bounded observation. */
+export function finishJudgeRuling(policy, input, confirm) {
+  const plan = planJudgeNotReal({ ...policy, confirm });
+  const judgeEvidence = { ...plan.evidence, mode: policy.mode,
+    confirm: ['agree', 'disagree', 'unsure'].includes(confirm?.verdict) ? confirm.verdict : (policy.mode === 'open' ? 'skipped' : 'unreadable') };
+  const reason = String(input.reason) + judgeEvidenceComment(judgeEvidence);
+  if (reason.length > 4000) throw new Error('evidence exceeds ruling comment bound; select less evidence or ask the operator to review the full evidence');
+  return { input: { ...input, reason, ruling: plan.ruling,
+    ...(plan.ruling === 'card' ? { fileCard: true, cause: undefined } : {}) }, judgeEvidence };
+}
+
+/** Render bounded evidence as literal quoted data, including hostile comment delimiters. */
+export function judgeEvidenceComment(evidence) {
+  if (!evidence) return '';
+  return '\n\nJudge evidence:\n' + Object.entries(evidence).map(([k, v]) =>
+    `${k}: ${String(v).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')}`
+      .split(/\r\n|[\n\r\u2028\u2029]/u).map(line => `> ${line}`).join('\n')).join('\n');
+}
+
+export function recordReferralRulingOperation({ readRulingContext, judgeConfirm } = {}) {
   if (typeof readRulingContext !== 'function') {
     throw new TypeError('record-referral-ruling: needs a `readRulingContext({repo, pr, card})` reader — the real '
       + 'binding is `we:scripts/operations/record-referral-ruling-io.mjs`.');
   }
   return op(RECORD_REFERRAL_RULING_OP, {
     input: {
+      ...judgeRulingInput,
       pr: 'number',
       repo: 'string',
       finding: 'string',
@@ -506,14 +582,26 @@ export function recordReferralRulingOperation({ readRulingContext } = {}) {
     },
     verdictFrom: 'plan',
     read: compute({
-      reads: ['input.repo', 'input.pr', 'input.card'],
-      fn: (view) => readRulingContext({ repo: view.input.repo, pr: view.input.pr, card: view.input.card }),
+      reads: ['input'],
+      fn: (view) => readRulingContext({ repo: view.input.repo, pr: view.input.pr, card: view.input.card,
+        ...(view.input.asJudge !== undefined ? { asJudge: view.input.asJudge, evidenceFile: view.input.evidenceFile, disagreements: view.input.disagreements } : {}) }),
     }),
-    ...rulingCardSteps(readRulingContext, planReferralCard, 'github.referral-ruling-file-card'),
+    ...rulingCardSteps(readRulingContext, planReferralCard, 'github.referral-ruling-file-card', (read, input) => {
+      validateReferralRulingInput(input);
+      if (read.malformed) throw new Error('malformed referral evidence');
+      return selectOperatorRulingFindings(read, input).selected;
+    }),
     plan: compute({
       reads: ['input.repo', 'input.pr', 'input.finding', 'input.ruling', 'input.actor', 'input.channel',
         'input.reason', 'input.cause', 'input.sendBack', 'input.supersedes', 'input.preview', 'findings.read', 'findings.reread', 'findings.cardPlan', 'findings.landCard'],
-      fn: (view) => cardFilingVerdict(view) ?? planOperatorRuling(view.findings.reread ?? view.findings.read, view.input),
+      fn: (view) => {
+        const plan = cardFilingVerdict(view) ?? planOperatorRuling(view.findings.reread ?? view.findings.read, (landedRulingCard(view.findings)?.input ?? view.input));
+        if (landedRulingCard(view.findings)?.judgeEvidence && plan.record) {
+          plan.record.judgeEvidence = landedRulingCard(view.findings)?.judgeEvidence;
+          plan.body = buildOperatorRulingComment(plan.record);
+        }
+        return plan;
+      },
     }),
     write: effectStep({
       reads: ['verdict', 'input.preview'],
