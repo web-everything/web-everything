@@ -746,7 +746,26 @@ function wrapperPrefixLength(words) {
       }
       continue;
     }
-    if (w === 'time' || w === 'command' || w === 'builtin' || w === 'nice') { i += 1; continue; }
+    if (w === 'time') {                                                      // time [-p] [-f fmt] [-o file] [-a] [-v] <cmd>
+      i += 1;
+      while (i < words.length && words[i].startsWith('-') && words[i] !== '-') {
+        const opt = words[i++];
+        if (opt === '--') break;
+        if (/^(?:-f|-o|--format|--output)$/.test(opt)) i += 1;
+      }
+      continue;
+    }
+    if (w === 'stdbuf' || w === 'ionice') {                                   // stdbuf -oL <cmd>, ionice -c 3 <cmd>
+      i += 1;
+      const valued = w === 'stdbuf' ? /^-[ioe]$/ : /^-[cnp]$/;
+      while (i < words.length && words[i].startsWith('-') && words[i] !== '-') {
+        const opt = words[i++];
+        if (opt === '--') break;
+        if (valued.test(opt)) i += 1;
+      }
+      continue;
+    }
+    if (w === 'command' || w === 'builtin' || w === 'nice') { i += 1; continue; }
     if (w === 'sudo') {                                                       // sudo -n -u <user> … <cmd>
       i += 1;
       while (i < words.length && words[i].startsWith('-')) {
@@ -1507,7 +1526,12 @@ export function nestedCommandStrings(segment) {
   const tail = trailingGroupTail(s);
   if (tail !== null && tail.trim()) out.push(tail);
 
-  const cmd = canonicalCommand(s);
+  // `env -S '<cmd>'` splits its string into argv and runs it, so the string is a command line too (r3 #6461).
+  const split = envSplitString(s);
+  if (split !== null && split.trim()) out.push(split);
+  // Compound-command syntax (case arms, function heads, coproc) is peeled so `case x in x) bash -c '…';; esac`
+  // reaches the `-c` re-execution below like a bare `bash -c '…'` does.
+  const cmd = canonicalCommand(stripShellControl(s));
   if (!cmd) return out;
   // …and a group behind a WRAPPER (`time (npm run build)`, `sudo (…)`) — `canonicalCommand` peels the
   // wrapper, so the opener is at the head of what it returns even when it was not at the head of `s`.
@@ -3249,16 +3273,38 @@ const VITEST_VALUE_FLAGS = new Set(['--root', '-r', '--dir', '--config', '-c', '
  * zero guard coverage. Vitest/playwright have no such competing arm, so they are NOT cwd-gated — the queue
  * concern is identical at primary and in a lane for those.
  */
+/** The heads a raw heavy-tool check (playwright, eleventy) must test: the segment as written and its canonical
+ *  form, then again after each unwrapping the vitest classifier also does — compound-command syntax, `env -S`,
+ *  the exec wrappers `canonicalCommand` leaves behind (`nice -n 5`, `timeout` options) and launchers such as
+ *  `nohup`/`setsid`/`eval` (review #6461 r3). Bounded hops; pure. */
+function rawHeavyHeads(segment) {
+  const heads = [];
+  let raw = String(segment || '');
+  for (let hop = 0; hop < 6 && raw; hop += 1) {
+    const split = envSplitString(raw);
+    if (split !== null) { raw = split; continue; }
+    const s = stripShellControl(raw);
+    heads.push(s.replace(/^(?:\w+=\S+\s+)*(?:sudo\s+)?/, ''));
+    let canon = canonicalCommand(s);
+    for (let peel = 0; peel < 4 && canon; peel += 1) {
+      const words = headWords(canon);
+      const k = execWrapperWords(words.map((word) => word.text));
+      if (!k || !words[k]) break;
+      canon = canonicalCommand(canon.slice(words[k].start));
+    }
+    if (!canon) break;
+    heads.push(canon);
+    raw = heavyRunAlias(canon);
+  }
+  return [...new Set(heads.filter(Boolean))];
+}
+
 export function rawHeavyCommandReason(segment, { primaryCwd = false } = {}) {
   const ungated = ungatedHeavyRunReason(segment);
   if (ungated) return ungated;
   const s = String(segment || '').trim();
   if (!s) return null;
-  const cmd = s.replace(/^(?:\w+=\S+\s+)*(?:sudo\s+)?/, '');
-  const canon = canonicalCommand(s);
-  const heads = canon && canon !== cmd ? [cmd, canon] : [cmd];
-
-  for (const h of heads) {
+  for (const h of rawHeavyHeads(s)) {
     if (PLAYWRIGHT_TEST_HEAD.test(h)) {
       return 'a direct `playwright test` run skips the #3461 heavy-command admission queue (xxna58l, #3383). Use the wrapped script instead — `npm run test:integration` / `test:e2e` / `test:smoke` / `test:a11y` / `test:interaction`, whichever matches what you need (each already routes through `node scripts/readiness/heavy-admission.mjs run`). No targeted-run exception here: playwright has no fast single-spec mode cheap enough to justify skipping the queue.';
     }
@@ -3459,19 +3505,76 @@ function ungatedHeavyHead(head) {
 }
 
 const SHELL_CONTROL_PREFIX = /^(?:(?:do|then|else|elif|if|while|until|!)\s+)+/;
+// Compound-command openers a heavy run can sit behind (review #6461 round 3). Each is anchored and consumes at
+// least one character, so the loop below is bounded by the segment length.
+const SHELL_COMPOUND_OPENERS = [
+  SHELL_CONTROL_PREFIX,
+  /^\{\s+/,                                                        // brace group `{ cmd; }`
+  /^case\s+\S+\s+in\b\s*/,                                         // `case "$x" in` (its first arm may follow)
+  /^\(?[^\s()|;&<>]+(?:\s*\|\s*[^\s()|;&<>]+)*\)\s*(?=\S)/,        // a case arm pattern `x)` / `(x|y)`
+  /^function\s+[A-Za-z_][\w:.-]*(?:\s*\(\s*\))?\s*/,               // `function f { …` / `function f() { …`
+  /^[A-Za-z_][\w:.-]*\s*\(\s*\)\s*/,                                // `f() { …`
+  /^coproc\s+(?:[A-Za-z_]\w*\s+(?=\{))?/,                          // `coproc cmd` / `coproc NAME { cmd; }`
+];
+
+/** A segment with its leading shell compound-command syntax removed (control words, brace groups, case arms,
+ *  function definitions, coproc), so the command it runs is what the heavy classifiers see. Pure. */
+export function stripShellControl(segment) {
+  let s = String(segment || '').trim();
+  for (let guard = 0; guard < 64; guard += 1) {
+    const opener = SHELL_COMPOUND_OPENERS.map((re) => re.exec(s)).find((m) => m && m[0].length);
+    if (!opener) break;
+    s = s.slice(opener[0].length).trim();
+  }
+  return s;
+}
+
+/** The string `env -S <string>` / `env --split-string=<string>` (any wrapper prefix before env, any option
+ *  cluster holding S) splits into argv and runs, or null. env runs that string as the command, so it is the
+ *  head the heavy classifiers must see. Pure. */
+export function envSplitString(segment) {
+  const words = headWords(stripShellControl(segment).replace(/^[({]\s*/, ''));
+  const w = words.map((word) => word.text);
+  const at = w.findIndex((word) => /(?:^|\/)env$/.test(word));
+  if (at < 0 || wrapperPrefixLength(w.slice(0, at)) !== at) return null;
+  for (let i = at + 1; i < w.length; i += 1) {
+    const opt = w[i];
+    if (opt === '--' || !opt.startsWith('-') || opt === '-') return null; // options end; the command follows
+    const long = /^--split-string(?:=([\s\S]*))?$/.exec(opt);
+    if (long) return long[1] ?? w[i + 1] ?? null;
+    if (/^--(?:unset|chdir)$/.test(opt)) { i += 1; continue; }
+    if (opt.startsWith('--')) continue;
+    for (let k = 1; k < opt.length; k += 1) {
+      if (opt[k] === 'u' || opt[k] === 'C') { if (k === opt.length - 1) i += 1; break; } // takes a value
+      if (opt[k] === 'S') return opt.slice(k + 1) || w[i + 1] || null;
+    }
+  }
+  return null;
+}
+
+/** The unqueued heavy run a segment starts, with the command text that classified (after env -S, launcher
+ *  and alias unwrapping), or null. Deeper than the hop bound fails closed. Pure. */
+function heavyRunHead(segment) {
+  let raw = String(segment || '');
+  for (let hop = 0; hop < 6; hop += 1) {
+    const split = envSplitString(raw);
+    if (split !== null) { raw = split; continue; }
+    const head = canonicalCommand(stripShellControl(raw));
+    if (!head) return null;
+    const kind = ungatedHeavyHead(head)?.kind;
+    if (kind) return { kind, raw: stripShellControl(raw) };
+    const alias = heavyRunAlias(head);
+    if (!alias) return null;
+    raw = alias;
+  }
+  return { kind: 'test', raw: null }; // implausibly deep wrapping: fail closed
+}
 
 /** The kind of unqueued heavy run a segment's executable head starts ('vitest' | 'node-test' | 'standards' |
  *  'test'), or null. Shared with the static spawn lint and the transcript audit so all three classify the same
  *  heads (`npm test`, `npm --prefix . test`, `node --test`, …) instead of drifting copies. Pure. */
 export function ungatedHeavyRunKind(segment) {
-  let head = canonicalCommand(String(segment || '').trim().replace(SHELL_CONTROL_PREFIX, ''));
-  for (let hop = 0; hop < 4 && head; hop += 1) {
-    const kind = ungatedHeavyHead(head)?.kind;
-    if (kind) return kind;
-    head = heavyRunAlias(head);
-    if (head) head = canonicalCommand(head);
-  }
-  return null;
+  return heavyRunHead(segment)?.kind ?? null;
 }
 
 /** Spellings that run a package test script or a runner the head classifier does not resolve itself, reduced to
@@ -3532,7 +3635,7 @@ export function commandSubstitutionBodies(text) {
  *  no escaped opener), so a caller that already counted the outer command's substitutions must not count them
  *  again. Shared with the spawn lint and the transcript audit. Pure. */
 export function shellCString(segment) {
-  const cmd = canonicalCommand(String(segment || '').trim().replace(SHELL_CONTROL_PREFIX, ''));
+  const cmd = canonicalCommand(stripShellControl(segment));
   const words = headWords(cmd);
   const prog = words.length ? words[0].text : '';
   if (!SHELL_PROGRAMS.has(prog)) return null;
@@ -3567,11 +3670,21 @@ export function shellCString(segment) {
 }
 
 /** Deny any unqueued test/standards execution, with a runnable replacement. Pure; no escape. */
-export function ungatedHeavyRunReason(segment) {
-  // Shell control words are syntax, not part of the runnable replacement for this segment.
-  const s = String(segment || '').trim().replace(SHELL_CONTROL_PREFIX, '');
+export function ungatedHeavyRunReason(segment, depth = 0) {
+  // Shell control syntax (control words, brace groups, case arms, function heads) is not part of the runnable
+  // replacement for this segment.
+  const s = stripShellControl(segment);
   const run = ungatedHeavyHead(canonicalCommand(s));
-  if (!run) return null;
+  if (!run) {
+    // The shared classifier also sees through `env -S '<cmd>'`, launchers (`nohup`, `setsid`, `eval`) and
+    // aliases; deny what it finds, with the replacement for the command that actually runs (review #6461 r3).
+    const found = heavyRunHead(s);
+    if (!found) return null;
+    const inner = depth < 4 && found.raw && found.raw !== s ? ungatedHeavyRunReason(found.raw, depth + 1) : null;
+    return inner || 'heavy-enforce: this command starts an unqueued heavy run behind a wrapper the guard cannot rewrite. '
+      + 'There is no admission override. Run the heavy command itself in the foreground: '
+      + '`node scripts/readiness/heavy-admission.mjs run -- <command>`.';
+  }
   // Keep assignment spelling/quoting intact, placing it before node so it remains shell syntax. A leading
   // `WE_FULL_SUITE_OK=1` is kept too: the queued full-suite form still needs it to pass the xpnhz4o arm.
   const words = headWords(s);

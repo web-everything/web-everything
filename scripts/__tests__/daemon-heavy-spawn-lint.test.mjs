@@ -23,6 +23,12 @@ describe('daemon heavy spawn admission lint', () => {
     "spawnSync('pnpm', ['exec', 'playwright', 'test', 'a']);",
     "spawnSync('yarn', ['vitest', 'run', 'a']);",
     "spawnSync('sh', ['-c', 'npx vitest run a']);",
+    // Review #6461 round 3: env split strings, compound commands and exec wrappers, through the shared classifier.
+    "spawnSync('env', ['-S', 'npx vitest run a']);",
+    "spawnSync('env', ['--split-string=node --test a.test.mjs']);",
+    "spawnSync('sh', ['-c', 'case x in x) npx vitest run a;; esac']);",
+    "spawnSync('stdbuf', ['-oL', 'npx', 'vitest', 'run', 'a']);",
+    "spawnSync('time', ['-p', 'npx', 'vitest', 'run', 'a']);",
   ])('detects the executed heavy target: %s', call => {
     expect(findUngatedHeavySpawns(cp + call)).toHaveLength(1);
   });

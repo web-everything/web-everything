@@ -67,6 +67,11 @@ describe('agent command audit', () => {
     ['timeout 5 npx playwright test a', 'playwright'],
     ['timeout 5 node --test a', 'node --test'],
     ['gtimeout 5 node scripts/check-standards.mjs', 'check:standards'],
+    // Review #6461 round 3: env split strings, compound commands and more exec wrappers.
+    ["env -S 'npx vitest run a'", 'vitest'], ["env --split-string='npx vitest run a'", 'vitest'],
+    ["env -iS 'node --test a'", 'node --test'], ['time -p npx vitest run a', 'vitest'],
+    ['case x in x) npx vitest run a;; esac', 'vitest'], ['f() { npx playwright test a; }', 'playwright'],
+    ['stdbuf -oL npx vitest run a', 'vitest'], ['ionice -c 3 npx vitest run a', 'vitest'],
     ['npm test -- a', 'npm test/check'], ['npm ci', 'install/ci'],
     ['git fetch origin', 'git fetch/clone/wt/gc'], ['rg needle .', 'repo-wide find/grep'],
   ])('classifies bypass %s', (cmd, category) => {
@@ -209,6 +214,45 @@ describe('agent command audit', () => {
     const out = redact(command);
     expect(out).not.toContain(zq);
     expect(out).toContain('[REDACTED]');
+  });
+  // Review #6461 round 3: a credential is one whole shell word, so quoting, concatenation or a quoted separator
+  // never leaves part of it readable (the old rules cut the value at a space or a `;`).
+  it.each([
+    `htpasswd -nb user 'firstPart secondPart'`, `htpasswd -nb user "firstPart secondPart"`,
+    `htpasswd -nb user 'firstPart'"secondPart"`, `htpasswd -nb user firstPart\\ secondPart`,
+    `htpasswd -B -b f user 'firstPart secondPart'`, `htpasswd -bc f user 'firstPart;secondPart' && echo ok`,
+    `htpasswd -nb user 'firstPart secondPart' 2>&1 | tail`, `htpasswd -nb user 'firstPart secondPart' > out`,
+    `mysql -p'firstPart;secondPart' db`, `gh secret set X --repo 'a;b' --body 'firstPart secondPart'`,
+    `openssl enc -pass pass:'firstPart secondPart'`, `openssl enc -passin "pass:firstPart secondPart"`,
+    `curl -u 'user:firstPart secondPart' x`, `curl --user "user:firstPart secondPart" x`,
+    `git clone https://user:"firstPart secondPart"@host/repo`,
+  ])('redacts every part of a quoted or concatenated credential in %s', command => {
+    const out = redact(command);
+    expect(out).not.toMatch(/firstPart|secondPart/);
+    expect(out).toContain('[REDACTED]');
+  });
+  it('keeps the operands around a quoted htpasswd password and ordinary -u options', () => {
+    expect(redact(`htpasswd -nb user 'a b' 2>&1 | tail`)).toBe('htpasswd -nb user [REDACTED] 2>&1 | tail');
+    expect(redact('htpasswd -i f user')).toBe('htpasswd -i f user');
+    expect(redact('sort -u file')).toBe('sort -u file');
+    expect(redact('git clone https://github.com/a/b')).toBe('git clone https://github.com/a/b');
+  });
+  it('redacts a password cut by the length bound, and marks the cut after redaction', () => {
+    const out = redact(`htpasswd -nb user 'firstPart ${'x'.repeat(20000)} secondPart'`);
+    expect(out).not.toMatch(/firstPart|xxxxxxxxxx|secondPart/);
+    expect(out.endsWith(' …[truncated]')).toBe(true);
+  });
+  // Review #6461 round 3: the source is the transcript's own path, so real uuid-named files keep distinct keys.
+  it('keeps real-shaped transcript paths as distinct bySource keys', () => {
+    const sources = [
+      'claude:.claude/projects/-Users-x-workspace-proj/0d5c4b9e-6f1a-4c2b-9e8d-7a6b5c4d3e2f.jsonl',
+      'claude:.claude/projects/-Users-x-workspace-proj/1e6d5c0f-7a2b-4d3c-8f9e-8b7c6d5e4f3a.jsonl',
+      'codex:.codex/sessions/2026/07/02/rollout-2026-07-02T04-30-00-2f7e6d1a-8b3c-4e4d-9a0f-9c8d7e6f5a4b.jsonl',
+    ];
+    const bySource = {};
+    for (const source of sources) Object.assign(bySource, auditLines([claude('npm ci')], { date: '2026-07-02', source }).bySource);
+    expect(Object.keys(bySource)).toEqual(sources);
+    expect(auditLines([claude('npm ci')], { date: '2026-07-02', source: 'claude:a\x1b[31m\nb' }).rows[0].source).toBe('claude:a?b');
   });
   it.each([
     'git config --global user.name Bob', 'npx vitest --config vitest.config.ts run', `curl -d '{"name":"bob"}' u`,

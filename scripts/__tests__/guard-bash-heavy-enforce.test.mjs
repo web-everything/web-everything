@@ -100,6 +100,17 @@ describe('heavy-enforce — every direct test run requires admission', () => {
     // A command-text HELD assignment is not admission: only the wrapper itself sets it, in its child's env.
     'WE_HEAVY_ADMISSION_HELD=1 npx vitest run a', 'export WE_HEAVY_ADMISSION_HELD=1; npx vitest run a',
     'env WE_HEAVY_ADMISSION_HELD=1 npx vitest run a',
+    // Review #6461 round 3: env split strings, compound commands (brace groups, case arms, function bodies,
+    // coproc) and the remaining exec wrappers.
+    "env -S 'npx vitest run a'", 'env -S "npx vitest run a"', "env -S'npx vitest run a'",
+    "env --split-string='npx vitest run a'", "env --split-string 'npx vitest run a'", "env -iS 'npx vitest run a'",
+    "/usr/bin/env -S 'npx vitest run a'", "timeout 5 env -S 'npx vitest run a'", "env -S 'env -S \"npx vitest run a\"'",
+    '{ npx vitest run a; }', 'true && { npx vitest run a; }',
+    'case x in x) npx vitest run a;; esac', 'case x in (x) npx vitest run a;; esac',
+    'case x in a|b) npx vitest run a;; esac', 'case x in y) true;; x) npx vitest run a;; esac',
+    'case x in\n x) npx vitest run a;;\nesac', "case x in x) bash -c 'npx vitest run a';; esac",
+    'f() { npx vitest run a; }', 'function f { npx vitest run a; }', 'function f() { npx vitest run a; }',
+    'coproc npx vitest run a', 'coproc T { npx vitest run a; }',
     ...['timeout', 'gtimeout'].flatMap(wrapper => [
       `${wrapper} 5 npx playwright test a`,
       `${wrapper} 5 node --test a.test.mjs`,
@@ -109,6 +120,24 @@ describe('heavy-enforce — every direct test run requires admission', () => {
   ];
   it.each(controlBypasses)('denies control/wrapper bypass `%s`', cmd => {
     expect(decide(cmd, {})).not.toBeNull();
+  });
+  // Review #6461 round 3: every exec wrapper the guard peels, driven from one table, denies a heavy run behind it
+  // and still allows the admitted run behind it.
+  const execWrappers = ['time', 'time -p', 'time -f %e', 'command', 'builtin', 'nice', 'nice -n 5', 'sudo', 'sudo -u me',
+    'env', 'env -i', 'env X=1', 'timeout 5', 'gtimeout -s KILL 5', 'exec', 'stdbuf -oL', 'stdbuf -o L', 'ionice -c3',
+    'ionice -c 3 -n 7', 'nohup', 'setsid'];
+  it.each(execWrappers)('denies a heavy run behind the `%s` wrapper', wrapper => {
+    for (const run of ['npx vitest run a', 'npx playwright test a', 'node --test a.test.mjs', 'node scripts/check-standards.mjs']) {
+      expect(decide(`${wrapper} ${run}`, {}), `${wrapper} ${run}`).toMatch(/heavy-enforce|heavy-command admission queue/);
+    }
+  });
+  it.each(execWrappers.filter(wrapper => !/^(?:nohup|setsid)$/.test(wrapper)))('allows the admitted run behind `%s`', wrapper => {
+    expect(decide(`${wrapper} ${queue}npx vitest run a`, {})).toBeNull();
+  });
+  it('names the command env -S and a launcher actually run in the replacement', () => {
+    for (const cmd of ["env -S 'npx vitest run a'", 'nohup npx vitest run a', 'case x in x) npx vitest run a;; esac']) {
+      expect(decide(cmd, {})).toContain('`' + queue + 'npx vitest run a`');
+    }
   });
   it('suggests a runnable single segment for a loop body', () => {
     const reason = decide('for f in a b; do npx vitest run "$f"; done', {});
@@ -124,6 +153,9 @@ describe('heavy-enforce — every direct test run requires admission', () => {
     'exec ' + queue + 'npx vitest run a',
     "bash -c '" + queue + "npx vitest run a'", 'echo $(' + queue + 'npx vitest run a)',
     '(' + queue + 'npx vitest run a)', 'true && ' + queue + 'npx vitest run a',
+    "env -S '" + queue + "npx vitest run a'", '{ ' + queue + 'npx vitest run a; }',
+    'case x in x) ' + queue + 'npx vitest run a;; esac', 'f() { ' + queue + 'npx vitest run a; }',
+    'env -S echo', 'echo case x in x', 'git commit -m "x) npx vitest run a"', 'echo "{ npx vitest run a; }"',
     'grep vitest x', 'echo npx vitest run', 'npx vitest --version', 'vitest --help',
     'git commit -m "document npx vitest run"',
   ])('allows admitted control flow or harmless mention `%s`', cmd => {

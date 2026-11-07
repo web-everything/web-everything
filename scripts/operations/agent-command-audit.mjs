@@ -10,7 +10,7 @@ import { homedir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
-import { canonicalCommand, commandSubstitutionBodies, heredocScan, parseSegments, shellCString, shellTokens, ungatedHeavyRunKind } from '../guard-bash.mjs';
+import { canonicalCommand, commandSubstitutionBodies, envSplitString, heredocScan, parseSegments, shellCString, shellTokens, stripShellControl, ungatedHeavyRunKind } from '../guard-bash.mjs';
 
 const etDay = value => new Intl.DateTimeFormat('en-CA', {
   timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
@@ -37,8 +37,9 @@ const SECRET_SHORT_OPTIONS = [
   [/curl/, 'b'],
 ];
 const SECRET_SHORT_PROGRAMS = new RegExp(String.raw`(?<![\w./-])(?:${SECRET_SHORT_OPTIONS.map(([re]) => re.source).join('|')})(?![\w-])`, 'g');
-// Long options that carry a secret only for one program (`gh secret set X --body v`).
-const SECRET_LONG_OPTIONS = /(?<![\w./-])gh\s+secret\s+set\b[^;|&\n]*?\s(--body)(?![\w-])(=?)/g;
+// The program whose `--body` long option carries a secret (`gh secret set X --body v`); its segment end is found
+// quote-aware by redactPositionalSecrets.
+const SECRET_LONG_OPTIONS = /(?<![\w./-])gh\s+secret\s+set\b/g;
 // `config set <key> <value>` style commands (`npm config set //r/:_authToken v`, `yarn config set npmAuthToken v`,
 // `aws configure set aws_secret_access_key v`, `git config --global github.token v`): group 1 is the key.
 const CONFIG_KEY = /(?<![\w-])config(?:ure)?\s+(?:(?:set|add)\s+)?(?:-[\w-]+(?:=\S*)?\s+)*([^\s=-][^\s=]*)()(?=\s)/g;
@@ -77,6 +78,68 @@ function shellWordEnd(text, start) {
     i += 1;
   }
   return Math.min(i, text.length);
+}
+
+/** End of the shell segment that starts at `from`: the first `;`, `|`, `&` or newline OUTSIDE a word, so a
+ *  quoted or nested separator (`'p;w'`, `$(a; b)`) stays inside its word. One linear pass. */
+function shellSegmentEnd(text, from) {
+  let i = from;
+  while (i < text.length) {
+    const c = text[i];
+    if (/[;|&\n]/.test(c)) return i;
+    if (/\s/.test(c)) { i += 1; continue; }
+    i = Math.max(shellWordEnd(text, i), i + 1); // a lone `(`, `)`, `<`, `>` is one character
+  }
+  return text.length;
+}
+
+/** The [start, end) spans of the shell words in text[from, to), stopping at a redirection (its target is not an
+ *  operand of the command). */
+function shellWordSpans(text, from, to) {
+  const spans = [];
+  for (let i = from; i < to;) {
+    if (/\s/.test(text[i])) { i += 1; continue; }
+    if (/[<>]/.test(text[i]) || /^\d+[<>]/.test(text.slice(i, i + 12))) break;
+    const end = Math.min(Math.max(shellWordEnd(text, i), i + 1), to);
+    spans.push([i, end]);
+    i = end;
+  }
+  return spans;
+}
+
+/** Replace, for each match of the global `re`, the match plus the whole shell word starting where it ends with
+ *  `replacement(match, word)` (a string, or null to keep it). Quotes and concatenation stay in that one word. */
+function redactMatchedWords(text, re, replacement) {
+  let out = '', last = 0;
+  for (let m; (m = re.exec(text));) {
+    const end = Math.max(shellWordEnd(text, re.lastIndex), re.lastIndex);
+    const value = replacement(m, text.slice(re.lastIndex, end));
+    if (value === null) { if (!m[0].length) re.lastIndex += 1; continue; }
+    out += text.slice(last, m.index) + value;
+    last = re.lastIndex = end;
+  }
+  return out + text.slice(last);
+}
+
+/** The userinfo of `scheme://user:pass@host` URLs, including quoted or concatenated parts (`u:"p w"@h`). */
+function redactUrlUserinfo(text) {
+  const scheme = /(?<![a-z0-9+.-])[a-z][a-z0-9+.-]{0,31}:\/\//gi;
+  let out = '', last = 0;
+  for (let m; (m = scheme.exec(text));) {
+    let at = -1, quote = null, i = scheme.lastIndex;
+    for (; i < text.length; i += 1) {
+      const c = text[i];
+      if (quote) { if (c === quote) quote = null; else if (c === '@') at = i; continue; }
+      if (c === '"' || c === "'") { quote = c; continue; }
+      if (/[\s;|&<>()/?#]/.test(c)) break;
+      if (c === '@') at = i;
+    }
+    if (at < 0) { scheme.lastIndex = Math.max(i, scheme.lastIndex); continue; }
+    out += text.slice(last, scheme.lastIndex) + '[REDACTED]';
+    last = at;
+    scheme.lastIndex = Math.max(i, at + 1);
+  }
+  return out + text.slice(last);
 }
 
 /** Redact `--name v` / `--name=v` style values: `named` is a global regex whose match ends where the value
@@ -120,8 +183,7 @@ function redactShortPasswords(text) {
   let out = '', last = 0;
   for (let m; (m = SECRET_SHORT_PROGRAMS.exec(text));) {
     const from = SECRET_SHORT_PROGRAMS.lastIndex;
-    const segmentEnd = text.slice(from).search(/[;|&\n]/);
-    const end = segmentEnd < 0 ? text.length : from + segmentEnd;
+    const end = shellSegmentEnd(text, from); // a quoted `;` (`-p'a;b'`) stays inside the value
     const segment = text.slice(from, end);
     const letters = SECRET_SHORT_OPTIONS.filter(([re]) => new RegExp(`^(?:${re.source})$`).test(m[0])).map(([, l]) => l).join('');
     // The value is glued on when a non-space follows the letter (`-pv`, `-p=v`).
@@ -132,22 +194,55 @@ function redactShortPasswords(text) {
   return redactHtpasswd(out + text.slice(last));
 }
 
-/** `htpasswd -b[…] file user password` (or `-nb user password`): the password is the segment's last word. */
+/** `htpasswd -b[…] file user password` (or `-nb user password`, `-B -b …`): with `b` in any option cluster, the
+ *  password is the last operand. Words are whole shell words, so a quoted or concatenated password
+ *  (`'first second'`, `"a b"'c d'`, `'p;w'`) is redacted entirely; a redirection after it is not an operand. */
 function redactHtpasswd(text) {
-  // `[^\sb]*b` has one way to match a flag cluster, so a long `-bbbb…` cannot backtrack quadratically.
-  return text.replace(/(?<![\w./-])htpasswd\s+-[^\sb]*b\S*\s[^;|&\n]*/g, segment => {
-    const lastWord = segment.trimEnd().search(/\S+$/);
-    return lastWord < 0 ? segment : segment.slice(0, lastWord) + '[REDACTED]';
-  });
+  const program = /(?<![\w./-])htpasswd(?=\s|$)/g;
+  let out = '', last = 0;
+  for (let m; (m = program.exec(text));) {
+    const from = program.lastIndex, end = shellSegmentEnd(text, from);
+    const spans = shellWordSpans(text, from, end);
+    let batch = false, operands = 0;
+    for (; operands < spans.length; operands += 1) {
+      const word = text.slice(...spans[operands]).replace(/["']/g, '');
+      if (word === '--') { operands += 1; break; }
+      if (!/^-./.test(word)) break;
+      if (word.includes('b')) batch = true;
+    }
+    const password = spans.at(-1);
+    if (batch && password && spans.length > operands) {
+      out += text.slice(last, password[0]) + '[REDACTED]';
+      last = password[1];
+    }
+    program.lastIndex = Math.max(end, from);
+  }
+  return out + text.slice(last);
 }
 
 /** Values of `config set <credential key> <value>`, of `gh secret set X --body v`, and `pass:v` (openssl). */
 function redactPositionalSecrets(text) {
   const configured = redactOptionValues(text, CONFIG_KEY, configKeyIsCredential,
     { replacement: m => m[0] + ' [REDACTED]' });
-  return redactOptionValues(configured, SECRET_LONG_OPTIONS, () => true, {
-    replacement: m => m[0].slice(0, m[0].length - m[2].length) + ' [REDACTED]',
-  }).replace(/(?<![\w-])pass:(?:"[^"]*"|'[^']*'|[^\s"';|&]+)/g, 'pass:[REDACTED]');
+  let body = '', last = 0;
+  // `gh secret set X … --body v` up to the end of its segment, found quote-aware (`--repo 'a;b' --body v`).
+  for (let m; (m = SECRET_LONG_OPTIONS.exec(configured));) {
+    const from = SECRET_LONG_OPTIONS.lastIndex, end = shellSegmentEnd(configured, from);
+    body += configured.slice(last, from) + redactOptionValues(configured.slice(from, end), /(?<!\S)(--body)(?![\w-])(=?)/g,
+      () => true, { replacement: o => '--body [REDACTED]' });
+    last = SECRET_LONG_OPTIONS.lastIndex = Math.max(end, from);
+  }
+  body += configured.slice(last);
+  // `pass:v` (openssl) as one whole shell word, quoted or concatenated (`pass:'a b'c`, `"pass:a b"`).
+  // The word starts at the match (at its opening quote when there is one), so it is bounded as one shell word.
+  const passWord = /(?<![\w-])["']?pass:/g;
+  let out = '';
+  last = 0;
+  for (let m; (m = passWord.exec(body));) {
+    out += body.slice(last, m.index) + 'pass:[REDACTED]';
+    last = passWord.lastIndex = Math.max(shellWordEnd(body, m.index), passWord.lastIndex);
+  }
+  return out + body.slice(last);
 }
 
 /** Credential members of JSON or object-literal text (`{"password":"v"}`), quoted or escaped. */
@@ -180,17 +275,25 @@ export function redact(text) {
 
 function redactLine(text) {
   let clean = String(text).replace(/[\x00-\x1f\x7f\x85]|\p{Zl}|\p{Zp}/gu, ' ');
-  if (clean.length > REDACT_MAX_CHARS) clean = clean.slice(0, REDACT_MAX_CHARS) + ' …[truncated]';
+  // The cut mark is added after redaction: appended first, it would become the "last word" a rule such as
+  // htpasswd's redacts instead of a cut password (an unterminated quote then runs to the end and is redacted whole).
+  const cut = clean.length > REDACT_MAX_CHARS;
+  if (cut) clean = clean.slice(0, REDACT_MAX_CHARS);
+  return redactLineRules(clean) + (cut ? ' …[truncated]' : '');
+}
+
+function redactLineRules(clean) {
   // Value-carrying forms run before the generic name rule below, which would otherwise redact only the name.
   // Every rule that starts with a repeated class is anchored to a word start, so none of them is quadratic.
-  return redactAssignments(redactJsonMembers(redactPositionalSecrets(redactShortPasswords(redactCredentialOptions(clean
-    .replace(/(?<![a-z0-9+.-])([a-z][a-z0-9+.-]{0,31}:\/\/)[^\s/@"']+@/gi, '$1[REDACTED]@')
+  // URL userinfo and curl/git-style `user:password` pairs are bounded as whole shell words (quoted parts included).
+  const headers = redactUrlUserinfo(clean)
     // HTTP-style credential headers and `token: v`, with or without an auth scheme word.
     // A value opening with an escaped quote (`password: \"v\"`) is a quoted member, left to redactJsonMembers.
     .replace(/(?<![\w-])([\w-]+)\s*:\s*(?:(?:Bearer|Basic|Digest|Negotiate|token)\s+)?[^\s"';\\][^\s"';]*/gi,
-      (all, name) => (CREDENTIAL_HEADER.test(name) ? '[REDACTED]' : all))
-    // curl/git-style `user:password` pairs.
-    .replace(/(?<!\S)(?:--user(?:=|\s+)|-u\s*)[^\s:]*:\S+/g, '[REDACTED]'))))))
+      (all, name) => (CREDENTIAL_HEADER.test(name) ? '[REDACTED]' : all));
+  const pairs = redactMatchedWords(headers, /(?<!\S)(?:--user=|--user\s+|-u\s*)/g,
+    (m, word) => (word.replace(/["']/g, '').includes(':') ? '[REDACTED]' : null));
+  return redactAssignments(redactJsonMembers(redactPositionalSecrets(redactShortPasswords(redactCredentialOptions(pairs)))))
     .replace(/\b(?:gh[pousr]_|github_pat_|glpat-|sk-|xox[a-z]-)[A-Za-z0-9_-]+|\bnpm_[A-Za-z0-9]{20,}|\bAKIA[0-9A-Z]{16}\b/gi, '[REDACTED]')
     .replace(/\bBearer\s+(?:"[^"]*"|'[^']*'|[^\s"'`;,]+)/gi, '[REDACTED]')
     .replace(/\b(?:token|secret|key|bearer)\S*/gi, '[REDACTED]')
@@ -261,10 +364,17 @@ export function classifyCommand(cmd, depth = 0, withSubstitutions = true) {
     }
   }
   for (const segment of parseSegments(heredocs.unterminated ? String(cmd) : heredocs.text).segments) {
-    let head = canonicalCommand(segment), queued = false;
+    // Compound-command syntax (brace groups, case arms, function heads) is not the program that runs.
+    let head = canonicalCommand(stripShellControl(segment)), queued = false;
     // Node options may precede the wrapper script (`node --no-warnings …/heavy-admission.mjs run -- …`).
     const admitted = /^node\s+(?:-[^\s-]\S*\s+|--[^\s=-]\S*\s+)*\S*heavy-admission\.mjs\s+run\b[\s\S]*?\s--\s+([\s\S]+)$/.exec(head);
     if (admitted) { queued = true; head = canonicalCommand(admitted[1]); }
+    // `env -S '<cmd>'` runs its string as the command (the outer shell already expanded any substitution in it).
+    const split = envSplitString(admitted ? admitted[1] : segment);
+    if (split !== null) {
+      for (const hit of classifyCommand(split, depth + 1, false)) out.push({ ...hit, queued: queued || hit.queued });
+      continue;
+    }
     const words = shellTokens(head).filter(word => !word.op).map(word => word.text);
     // `sh -c "…"` as the inner shell receives it. Substitutions the outer shell already ran (an unquoted or
     // double-quoted word) were counted by the outer extraction above, so only a single-quoted body re-extracts.
@@ -319,6 +429,9 @@ function toolCommands(record) {
   return commands;
 }
 
+/** A transcript source label safe for a terminal table: control characters and line separators become `?`. */
+const sourceLabel = value => stripVTControlCharacters(String(value)).replace(/[\x00-\x1f\x7f\x85]|\p{Zl}|\p{Zp}/gu, '?');
+
 /** Pure JSONL reducer. Invalid records are counted and reported rather than silently cleared. */
 export function auditLines(lines, { date, source = 'unknown' } = {}) {
   // utc-day-slice-ok: UTC-anchored round-trip of a user-supplied YYYY-MM-DD string (Date.parse reads it as UTC), not a wall-clock "today" read
@@ -339,7 +452,9 @@ export function auditLines(lines, { date, source = 'unknown' } = {}) {
       catch { return [{ category: 'unparsed (classifier error)', queued: false, command: redact(String(command)) }]; }
     };
     for (const command of commands) for (const hit of classify(command)) {
-      const row = { ...hit, source: redact(source === 'unknown' ? kind : source), timestamp: record.timestamp };
+      // The source is the transcript's own path (built by the caller), not command text: credential redaction would
+      // turn every uuid-named session file into the same `[REDACTED]` key. Only terminal control text is removed.
+      const row = { ...hit, source: sourceLabel(source === 'unknown' ? kind : source), timestamp: record.timestamp };
       result.rows.push(row);
       for (const [table, key] of [[result.byCategory, row.category], [result.bySource, row.source]]) {
         const counts = table[key] ??= { queued: 0, bypassed: 0 };
