@@ -1740,4 +1740,85 @@ describe('R671 v1 acting judge referral blocks', () => {
     await expect(h.sink(payloadOf(plan))).resolves.toMatchObject({ posted: true });
     expect(h.posted).toEqual([plan.body]);
   });
+
+  describe('human actor rulings bind the authenticated poster (red-first)', () => {
+    const human = { login: 'chalbert', type: 'User' };
+    const operatorRequest = (ruling = 'block') => request(ruling, { actor: 'chalbert' });
+    const operatorSnapshot = (identity, ruling = 'block') => snapshot({ identity,
+      card: ruling === 'card' ? { ref: CARD, readable: true } : null });
+
+    it.each(['not-real', 'block', 'card'])('plan refuses a bot poster declaring a human actor for %s', ruling => {
+      expect(() => planOperatorRuling(operatorSnapshot(bot, ruling), operatorRequest(ruling)))
+        .toThrow(/human account|posting identity/i);
+    });
+
+    it.each(['not-real', 'block', 'card'])('plan records %s for the matching human poster', ruling => {
+      const plan = planOperatorRuling(operatorSnapshot(human, ruling), operatorRequest(ruling));
+      expect(plan.record.actor).toBe('chalbert');
+      expect(plan.record.rulings).toHaveLength(1);
+      expect(plan.record.rulings[0].result).toBe(ruling);
+      expect(parseOperatorRulingComment(gh(plan.body, human.login)).record.actor).toBe('chalbert');
+    });
+
+    it('plan fails closed when poster identity is missing', () => {
+      const read = operatorSnapshot(human);
+      delete read.identity;
+      expect(() => planOperatorRuling(read, operatorRequest())).toThrow(/human account|posting identity/i);
+    });
+
+    it('plan fails closed when poster identity is undefined', () => {
+      expect(() => planOperatorRuling(operatorSnapshot(undefined), operatorRequest()))
+        .toThrow(/human account|posting identity/i);
+    });
+
+    it('plan refuses an unregistered or mismatched human poster', () => {
+      expect(() => planOperatorRuling(operatorSnapshot({ login: 'mallory', type: 'User' }), operatorRequest()))
+        .toThrow(/not a registered operator|does not match/i);
+    });
+
+    it.each(['not-real', 'block', 'card'])('POST refuses a bot poster for human-actor %s before any writes', async ruling => {
+      const h = postHarness({ identity: bot });
+      const plan = planOperatorRuling(operatorSnapshot(human, ruling), operatorRequest(ruling));
+      await expect(h.sink(payloadOf(plan))).rejects.toThrow(/human account|posting identity/i);
+      expect(h.posted).toEqual([]);
+      expect(h.events).toEqual([]);
+    });
+
+    it.each(['not-real', 'block', 'card'])('POST records human-actor %s for the matching human poster', async ruling => {
+      const h = postHarness({ identity: human, login: human.login });
+      const plan = planOperatorRuling(operatorSnapshot(human, ruling), operatorRequest(ruling));
+      await expect(h.sink(payloadOf(plan))).resolves.toMatchObject({ posted: true, head });
+      expect(h.posted).toEqual([plan.body]);
+      expect(h.events).toHaveLength(1);
+      expect(h.events[0].actor.declared).toBe('chalbert');
+    });
+
+    it('POST fails closed on an unreadable poster identity before any writes', async () => {
+      const h = postHarness({ identity: human, login: human.login });
+      const readJson = h.readJson.getMockImplementation();
+      h.readJson.mockImplementation(args => {
+        if (args[0] === 'api') throw new Error('poster identity unreadable');
+        return readJson(args);
+      });
+      const plan = planOperatorRuling(operatorSnapshot(human), operatorRequest());
+      await expect(h.sink(payloadOf(plan))).rejects.toThrow(/poster identity unreadable/);
+      expect(h.posted).toEqual([]);
+      expect(h.events).toEqual([]);
+    });
+
+    it('reader populates poster identity from gh api user for a human actor', () => {
+      // realReader injects a Bot response for gh api user: the declared actor must not replace it.
+      const read = realReader({ env: prefsEnv() })({ repo, pr: 7, actor: 'chalbert' });
+      expect(read.identity).toEqual(bot);
+    });
+
+    it('reader leaves auto-policy poster identity absent and its block plan still works', () => {
+      const read = realReader({ env: prefsEnv() })({ repo, pr: 7, actor: 'auto-policy' });
+      expect(read.identity).toBeUndefined();
+      const plan = planOperatorRuling(read, request('block', { actor: 'auto-policy' }));
+      expect(plan.record.actor).toBe('auto-policy');
+      expect(plan.record.rulings).toHaveLength(1);
+      expect(plan.record.rulings[0].result).toBe('block');
+    });
+  });
 });
