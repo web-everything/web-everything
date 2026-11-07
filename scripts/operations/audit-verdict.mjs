@@ -191,13 +191,21 @@ function pathCandidate(file) {
 }
 // Case-insensitive: the checkout may sit on a case-insensitive file system, where `Scripts/Guard-Bash.mjs` IS the guard.
 // Folding both sides only ever protects more paths. The candidates are computed once per path, not once per glob.
-// A pattern is cleaned up the way a path candidate is (PR #6381 self-review): surrounding whitespace trimmed, `\` read
-// as `/`, doubled slashes collapsed, leading `./` and `/` dropped. Otherwise `./custom/**` or `/custom/**` matched no
-// candidate and protected nothing. A pattern that cleans up to nothing (`./`, `/`) names the repo root: every path.
+// A pattern is cleaned up the way a path candidate is (PR #6381 self-review), else `./custom/**`, `/custom/**`,
+// `custom/./**`, `custom<U+200B>/**` or a fullwidth letter matched no candidate and protected nothing: compatibility form
+// (NFKC), surrounding whitespace trimmed, invisible, control and format characters dropped, `\` read as `/`, empty and
+// `.` segments dropped, `..` resolved. A pattern that cleans up to nothing (`./`, `/`) names the repo root, and one that
+// climbs above it (`../x`) cannot be placed: both protect every path. A trailing `/` (a directory) is kept.
 const cleanPattern = p => {
-  let s = p.trim().replace(/\\/g, '/').replace(/\/{2,}/g, '/');
-  while (s.startsWith('./') || s.startsWith('/')) s = s.startsWith('./') ? s.slice(2) : s.slice(1);
-  return s === '' || s === '.' ? '**' : s.toLowerCase();
+  const s = p.normalize('NFKC').trim().replace(/[\p{Default_Ignorable_Code_Point}\p{Cc}\p{Cf}]/gu, '').replace(/\\/g, '/');
+  const segs = [];
+  for (const seg of s.split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') { if (!segs.length) return '**'; segs.pop(); continue; }
+    segs.push(seg);
+  }
+  if (!segs.length) return '**';
+  return `${segs.join('/')}${s.endsWith('/') ? '/' : ''}`.toLowerCase();
 };
 const matchesSome = (file, patterns) => {
   const clean = patterns.map(cleanPattern);
