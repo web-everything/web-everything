@@ -408,7 +408,7 @@ function coalescedReadFetch({ board, branch, run, now, env, log }) {
   };
   let stampFile;
   try {
-    if (OPS_READ_NEVER_CACHED.includes(branch)) return fetchOrigin('never-cached');
+    if (OPS_READ_NEVER_CACHED.includes(branch) || /freeze/i.test(branch)) return fetchOrigin('never-cached');
     if (!(ttl > 0)) return fetchOrigin('ttl-disabled');
     const common = String(run(['rev-parse', '--git-common-dir'], { cwd: board }) ?? '').trim();
     if (!common) throw new Error('no git dir');
