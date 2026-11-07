@@ -1,15 +1,16 @@
 ---
+bornAs: xek47br
 kind: story
-size: 3
+size: 2
 status: open
-scope: ["we:scripts/operations/red-team-gate-apply.mjs", "we:scripts/lib/prevention-landing-job.mjs"]
+scope: ["we:scripts/conveyor/review-referral-hold.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Card filed but its gate record not posted -> next gate run files the card again
+# Referral-hold notice reserved before it is posted
 
-Flow-sim gap B-C8, class K3 (one-shot step, no re-driver). Failing input: Trusted result on HEAD with a `degraded` finding (card action). No card-queued marker. gh comment post throws (throttle). first gate run: fileCard ok (:217), postComment fails (:182-185) -> status 'card-record-failed' (:222); any later gate run (review-job rerun, extend-rounds regate). Cited: we:scripts/operations/red-team-gate-apply.mjs:158, we:scripts/lib/prevention-landing-job.mjs:84. Soak-break sketch: double-act (duplicate follow-up card). Combine with C1: if no later run ever comes, the card is also simply never recorded.
+Flow-sim gap C-G6, class K3 (one-shot step, no re-driver). Failing input: A new same-head referral hold episode (hold.kind != same-head), receipt dir writable, no marker comment yet.' 'E19 process dies (or post fails with an error other than 'call not sent') after the receipt write Cited: we:scripts/conveyor/review-referral-hold.mjs:837. Soak-break sketch: stale-referral-hold-never-resumes (auto-resolve of fully-ruled holds; fixPresent true: we:review-referral-hold.mjs:575 exports decideReferralHoldAutoResolve and we:reconcile-pass.mjs references enrichPrsWithReferralHoldAutoResolve). Does not cover a lost noti…
 
 ## Acceptance
 
