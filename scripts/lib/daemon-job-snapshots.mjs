@@ -102,9 +102,12 @@ export function npmCiInstaller({ timeoutMs = NPM_INSTALL_TIMEOUT_MS } = {}) {
 /**
  * Read-only reuse check. Whatever the marker says, a tree whose top-level store links dangle is never reused: a copy of
  * a pnpm-linked clone can be stamped npm (its provenance is lost), and the shared store it links into can vanish.
- * A pnpm marker must also still match the current inputs and store generation.
+ * A pnpm marker must also still match the current inputs and store generation. With `sourceDir` (the source the store
+ * is being requested for) the marker is compared with THAT source's pnpm inputs: the store key is the npm lockfile
+ * alone, so a change to only `pnpm-lock.yaml` / `pnpm-workspace.yaml` of the source leaves the key unchanged and the
+ * cached copy's own (old) inputs would still match its own marker. Without it, the cached copy's inputs are used.
  */
-export function storeStillValid(dir) {
+export function storeStillValid(dir, sourceDir = null) {
   let marker;
   try { marker = readFileSync(join(dir, DEPS_MARKER_FILE), 'utf8').trim(); }
   catch (error) {
@@ -113,7 +116,8 @@ export function storeStillValid(dir) {
     marker = null;
   }
   try {
-    if (marker?.startsWith('pnpm:') && !markerMatches(marker, lockHash(dir, 'pnpm', resolvePnpmStoreDir()), 'pnpm')) return false;
+    // A source with no readable inputs hashes to null, which matches no marker: fail closed (rebuild).
+    if (marker?.startsWith('pnpm:') && !markerMatches(marker, lockHash(sourceDir ?? dir, 'pnpm', resolvePnpmStoreDir()), 'pnpm')) return false;
     return !hasDanglingTopLevelLink(join(dir, 'node_modules'));
   } catch { return false; }
 }
@@ -128,7 +132,7 @@ export function ensureNodeModulesStore({ jobsDir, sourceDir, install = npmCiInst
   const key = lockfileKey(lock);
   const dir = join(snapshotsRoot(jobsDir), 'node-modules', key);
   mkdirSync(join(snapshotsRoot(jobsDir), 'node-modules'), { recursive: true });
-  if (existsSync(join(dir, COMPLETE_MARKER)) && !storeStillValid(dir)) {
+  if (existsSync(join(dir, COMPLETE_MARKER)) && !storeStillValid(dir, sourceDir)) {
     rmSync(dir, { recursive: true, force: true });
   }
   buildOnce(dir, (into) => {

@@ -6,7 +6,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -64,6 +64,11 @@ describe('node_modules stores', () => {
 
   function completedStore(backend = 'pnpm') {
     const sourceDir = source('{"lockfileVersion":3}');
+    // The source carries the pnpm inputs the installer copies into the store (as pnpmAwareInstaller does).
+    if (backend === 'pnpm') {
+      writeFileSync(join(sourceDir, 'pnpm-lock.yaml'), 'lockfileVersion: "9.0"\n');
+      writeFileSync(join(sourceDir, 'pnpm-workspace.yaml'), 'allowBuilds:\n  esbuild: true\n');
+    }
     const storeDir = join(jobsDir, 'pnpm-store');
     vi.stubEnv('WE_PNPM_STORE_DIR', storeDir);
     ensureStoreGeneration(storeDir);
@@ -108,7 +113,7 @@ describe('node_modules stores', () => {
     expect(f.install).not.toHaveBeenCalled();
   });
 
-  it.each(['generation changed', 'pnpm lock changed', 'dangling link'])('rebuilds a completed pnpm store exactly once: %s', (reason) => {
+  it.each(['generation changed', 'pnpm lock changed', 'pnpm workspace changed', 'dangling link'])('rebuilds a completed pnpm store exactly once: %s', (reason) => {
     const f = completedStore();
     const marker = readFileSync(join(f.initial.dir, '.we-deps-marker'), 'utf8');
     expect(markerMatches(marker, lockHash(f.initial.dir, 'pnpm', f.storeDir), 'pnpm')).toBe(true);
@@ -117,14 +122,20 @@ describe('node_modules stores', () => {
       rmSync(f.storeDir, { recursive: true });
       ensureStoreGeneration(f.storeDir);
       mkdirSync(f.target); // Links still resolve: generation alone must invalidate reuse.
-    } else if (reason === 'pnpm lock changed') {
-      writeFileSync(join(f.initial.dir, 'pnpm-lock.yaml'), 'lockfileVersion: "9.0"\nchanged: true\n');
+    } else if (reason.startsWith('pnpm ')) {
+      // Only the SOURCE's pnpm inputs change; package-lock.json (and so the store key) is identical, and the
+      // cached copy's own inputs still match its own marker.
+      const file = reason === 'pnpm lock changed' ? 'pnpm-lock.yaml' : 'pnpm-workspace.yaml';
+      writeFileSync(join(f.sourceDir, file), 'changed: true\n');
+      expect(lockfileKey(readFileSync(join(f.sourceDir, 'package-lock.json'), 'utf8'))).toBe(f.initial.key);
+      expect(markerMatches(marker, lockHash(f.initial.dir, 'pnpm', f.storeDir), 'pnpm')).toBe(true);
+      expect(markerMatches(marker, lockHash(f.sourceDir, 'pnpm', f.storeDir), 'pnpm')).toBe(false);
     } else {
       rmSync(f.target, { recursive: true });
       expect(markerMatches(marker, lockHash(f.initial.dir, 'pnpm', f.storeDir), 'pnpm')).toBe(true);
       expect(hasDanglingTopLevelLink(join(f.initial.dir, 'node_modules'))).toBe(true);
     }
-    if (reason !== 'dangling link') {
+    if (reason === 'generation changed') {
       expect(markerMatches(marker, lockHash(f.initial.dir, 'pnpm', f.storeDir), 'pnpm')).toBe(false);
       expect(hasDanglingTopLevelLink(join(f.initial.dir, 'node_modules'))).toBe(false);
     }
@@ -136,6 +147,68 @@ describe('node_modules stores', () => {
     expect(existsSync(join(result.dir, '.snapshot-complete'))).toBe(true);
     ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install });
     expect(f.install).toHaveBeenCalledTimes(1);
+  });
+
+  // The live break: the store key is the npm lockfile alone, so a source whose only change is its pnpm inputs asks for the
+  // same store. The installer below mirrors pnpmAwareInstaller (copy the source's pnpm inputs in, stamp the marker).
+  describe('a completed pnpm store is rebuilt when only the source pnpm inputs change', () => {
+    function build() {
+      const sourceDir = source('{"lockfileVersion":3}');
+      writeFileSync(join(sourceDir, 'pnpm-lock.yaml'), 'lockfileVersion: "9.0"\n');
+      writeFileSync(join(sourceDir, 'pnpm-workspace.yaml'), 'allowBuilds:\n  esbuild: true\n');
+      const storeDir = join(jobsDir, 'pnpm-store-live');
+      vi.stubEnv('WE_PNPM_STORE_DIR', storeDir);
+      ensureStoreGeneration(storeDir);
+      const target = join(storeDir, 'esbuild');
+      mkdirSync(target);
+      const install = vi.fn((into) => {
+        for (const name of ['pnpm-lock.yaml', 'pnpm-workspace.yaml']) copyFileSync(join(sourceDir, name), join(into, name));
+        mkdirSync(join(into, 'node_modules'));
+        symlinkSync(target, join(into, 'node_modules', 'esbuild'), 'dir');
+        writeFileSync(join(into, '.we-deps-marker'), `pnpm:${lockHash(into, 'pnpm', storeDir)}`);
+      });
+      return { sourceDir, install };
+    }
+
+    it.each(['pnpm-lock.yaml', 'pnpm-workspace.yaml'])('changing only the source %s runs the installer again', (file) => {
+      const f = build();
+      const first = ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install });
+      expect(f.install).toHaveBeenCalledTimes(1);
+      ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install });
+      expect(f.install).toHaveBeenCalledTimes(1); // unchanged source: reused
+      writeFileSync(join(first.dir, 'stale-store-sentinel'), 'old');
+      writeFileSync(join(f.sourceDir, file), file === 'pnpm-lock.yaml' ? 'lockfileVersion: "9.0"\nchanged: true\n' : 'allowBuilds:\n  esbuild: false\n');
+      expect(lockfileKey(readFileSync(join(f.sourceDir, 'package-lock.json'), 'utf8'))).toBe(first.key); // key unchanged
+      const second = ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install });
+      expect(second).toEqual(first);
+      expect(f.install).toHaveBeenCalledTimes(2);
+      expect(existsSync(join(second.dir, 'stale-store-sentinel'))).toBe(false); // rebuilt, not patched
+      expect(readFileSync(join(second.dir, file), 'utf8')).toBe(readFileSync(join(f.sourceDir, file), 'utf8'));
+      ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install });
+      expect(f.install).toHaveBeenCalledTimes(2); // and the rebuilt store is reused
+    });
+
+    it('storeStillValid compares a pnpm marker with the requested source, and falls back to the copy without one', () => {
+      const f = build();
+      const { dir } = ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install });
+      expect(storeStillValid(dir)).toBe(true);
+      expect(storeStillValid(dir, f.sourceDir)).toBe(true);
+      writeFileSync(join(f.sourceDir, 'pnpm-lock.yaml'), 'changed: true\n');
+      expect(storeStillValid(dir)).toBe(true); // the cached copy alone cannot see the source change
+      expect(storeStillValid(dir, f.sourceDir)).toBe(false);
+    });
+
+    it('a source with no readable inputs fails closed (the store is not reused)', () => {
+      const f = build();
+      const { dir } = ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install });
+      expect(storeStillValid(dir, join(jobsDir, 'no-such-source'))).toBe(false);
+    });
+
+    it('an npm-marked store is not compared with the source pnpm inputs', () => {
+      const f = completedStore('npm');
+      writeFileSync(join(f.sourceDir, 'pnpm-lock.yaml'), 'changed: true\n');
+      expect(storeStillValid(f.initial.dir, f.sourceDir)).toBe(true);
+    });
   });
 
   it('reuses a fresh pnpm marker with resolving links without installing', () => {
