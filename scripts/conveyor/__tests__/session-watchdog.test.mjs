@@ -471,3 +471,328 @@ describe('R502 item 3: stale claim (holder silent, head unmoved, claim old) — 
     expect(resolveSessionWatchdogConfig({ staleClaimMinutes: -1 }).error).toMatch(/staleClaimMinutes/);
   });
 });
+
+
+describe('session reaping — config scalars', () => {
+  it('defaults to a 10 minute grace and five stops per tick', () => {
+    expect(DEFAULT_SESSION_WATCHDOG).toMatchObject({ reapFinishedGraceMinutes: 10, reapMaxStopsPerTick: 5 });
+  });
+  it.each(['reapFinishedGraceMinutes', 'reapMaxStopsPerTick'])('accepts %s as a positive numeric scalar override', (key) => {
+    const { config, error } = resolveSessionWatchdogConfig({ [key]: 3 });
+    expect(error).toBeNull();
+    expect(config[key]).toBe(3);
+    expect(config.intervalMinutes).toBe(CFG.intervalMinutes);
+  });
+  it.each(['reapFinishedGraceMinutes', 'reapMaxStopsPerTick'])('rejects non-positive and unreadable %s without partially applying config', (key) => {
+    for (const value of [0, -1, NaN, Infinity, '3', null]) {
+      const { config, error } = resolveSessionWatchdogConfig({ intervalMinutes: 7, [key]: value });
+      expect(error).toMatch(new RegExp(`${key}.*positive number`));
+      expect(config).toBe(CFG);
+    }
+  });
+});
+
+describe('planWatchdog — finished and duplicate stop-session contract', () => {
+  const cfg = { ...CFG, reapFinishedGraceMinutes: 10, reapMaxStopsPerTick: 5 };
+  const finished = (over = {}) => row({
+    listingKind: 'background', kind: 'fix', repo: 'we', target: '3771', prBound: true,
+    state: 'idle', class: CLASSES.FINISHED, evidence: { idleMinutes: 40, pendingTool: null }, ...over,
+  });
+  // ACTIVE isolates duplicate selection from the separate finished-session rule.
+  const duplicate = (over = {}) => finished({ class: CLASSES.ACTIVE, ...over });
+  const newer = (over = {}) => duplicate({ id: 'new-handle', sessionId: 'sid-new', startedAt: T0 - 60 * MIN, ...over });
+  const claim = (over = {}) => ({ meta: {
+    repo: 'we', pr: 3771, kind: 'fixing', who: 'fix-3771', sessionId: 'sid-1',
+    claimedAt: new Date(T0 - 5 * MIN).toISOString(), ...over,
+  } });
+  const stops = (rows, claims = [], config = cfg) => planWatchdog({
+    rows, claims, cfg: config, standardFor: () => standard20, nowMs: T0,
+  }).actions.filter((a) => a.type === 'stop-session');
+
+  it.each(['fix', 'ci-heal', 'prepare'])('stops an idle FINISHED %s background session at the grace boundary', (kind) => {
+    const r = finished({ kind, evidence: { idleMinutes: 10 }, prBound: kind !== 'prepare' });
+    expect(stops([r])).toEqual([{
+      type: 'stop-session', handle: r.id, session: r.name, sessionId: r.sessionId,
+      mode: 'finished', reason: expect.stringMatching(/\S/), idleMinutes: 10,
+    }]);
+  });
+  it('uses the configured finished grace rather than a hardcoded ten minutes', () => {
+    const r = finished({ evidence: { idleMinutes: 3 } });
+    expect(stops([r])).toEqual([]);
+    expect(stops([r], [], { ...cfg, reapFinishedGraceMinutes: 3 })).toHaveLength(1);
+  });
+  it.each([
+    ['idle below grace', { evidence: { idleMinutes: 9.9 } }],
+    ['working (busy)', { state: 'working' }],
+    ['unknown state', { state: undefined }],
+    ['another non-idle state', { state: 'paused' }],
+    ['pending tool', { evidence: { idleMinutes: 40, pendingTool: 'Bash' } }],
+    ['missing idle evidence', { evidence: {} }],
+    ['NaN idle evidence', { evidence: { idleMinutes: NaN } }],
+    ['infinite idle evidence', { evidence: { idleMinutes: Infinity } }],
+    ['review kind', { kind: 'review' }],
+    ['build kind', { kind: 'build' }],
+    ['interactive listing', { listingKind: 'interactive' }],
+    ['ACTIVE background wait', { class: CLASSES.ACTIVE }],
+    ['WAITING background wait', { class: CLASSES.WAITING }],
+    ['STALLED without completion', { class: CLASSES.STALLED }],
+  ])('keeps a finished-mode candidate with %s', (_label, over) => {
+    expect(stops([finished(over)])).toEqual([]);
+  });
+  it('keeps a FINISHED session holding a live claim by sessionId even when the claim name differs', () => {
+    expect(stops([finished()], [claim({ who: 'another-name' })])).toEqual([]);
+  });
+  it('keeps a FINISHED session holding a live claim by name when claim sessionId is absent', () => {
+    expect(stops([finished()], [claim({ sessionId: undefined })])).toEqual([]);
+  });
+  it('does not fall back to name when a claim has a different sessionId', () => {
+    expect(stops([finished()], [claim({ sessionId: 'not-listed' })])).toHaveLength(1);
+  });
+  it('a same-name live claim protects only its sessionId holder, regardless of listing order', () => {
+    const old = finished();
+    const keeper = newer({ class: CLASSES.FINISHED });
+    for (const rows of [[old, keeper], [keeper, old]]) {
+      expect(stops(rows, [claim({ sessionId: keeper.sessionId })])).toEqual([
+        expect.objectContaining({ handle: old.id, mode: 'finished' }),
+      ]);
+    }
+  });
+  it('name-only claim fallback protects the first matching row exactly as holderOf does', () => {
+    const first = finished();
+    const second = newer({ class: CLASSES.FINISHED });
+    expect(stops([first, second], [claim({ sessionId: undefined })])).toEqual([
+      expect.objectContaining({ handle: second.id, mode: 'finished' }),
+    ]);
+  });
+
+  it('keeps the newest idle duplicate and names that keeper in every older duplicate stop reason', () => {
+    const old = duplicate();
+    const middle = duplicate({ id: 'middle', sessionId: 'sid-middle', startedAt: T0 - 75 * MIN });
+    const keeper = newer();
+    for (const rows of [[old, keeper, middle], [middle, old, keeper]]) {
+      const actions = stops(rows);
+      expect(actions.map((a) => a.handle).sort()).toEqual([old.id, middle.id].sort());
+      for (const a of actions) {
+        expect(a).toMatchObject({ type: 'stop-session', mode: 'duplicate', idleMinutes: 40 });
+        expect(a.reason).toContain(keeper.name);
+        const source = rows.find((r) => r.id === a.handle);
+        expect(a).toMatchObject({ session: source.name, sessionId: source.sessionId });
+      }
+    }
+  });
+  it('a busy keeper outranks a newer idle row; only rows strictly older than that keeper are stopped', () => {
+    const old = duplicate();
+    const busy = newer({ state: 'working' });
+    const newestIdle = newer({ id: 'newest', sessionId: 'sid-newest', startedAt: T0 - 30 * MIN });
+    expect(stops([newestIdle, old, busy])).toEqual([
+      expect.objectContaining({ handle: old.id, mode: 'duplicate', reason: expect.stringContaining(busy.name) }),
+    ]);
+  });
+  it('a claimed keeper outranks a newer idle row and is never stopped', () => {
+    const old = duplicate({ id: 'older', sessionId: 'sid-older', startedAt: T0 - 120 * MIN });
+    const keeper = duplicate();
+    expect(stops([old, keeper, newer()], [claim()])).toEqual([
+      expect.objectContaining({ handle: old.id, mode: 'duplicate' }),
+    ]);
+  });
+  it('selects the newest among busy or claimed rows and never stops another busy or claimed duplicate', () => {
+    const old = duplicate({ id: 'old', sessionId: 'sid-old', startedAt: T0 - 120 * MIN });
+    const claimed = duplicate();
+    const busy = newer({ state: 'working' });
+    const laterIdle = newer({ id: 'later', sessionId: 'sid-later', startedAt: T0 - 30 * MIN });
+    expect(stops([laterIdle, old, claimed, busy], [claim()])).toEqual([
+      expect.objectContaining({ handle: old.id, mode: 'duplicate', reason: expect.stringContaining(busy.name) }),
+    ]);
+  });
+  it.each([
+    ['busy duplicate', { state: 'working' }],
+    ['pending tool call', { evidence: { idleMinutes: 40, pendingTool: 'Bash' } }],
+    ['unreadable idle evidence', { evidence: {} }],
+    ['NaN idle evidence', { evidence: { idleMinutes: NaN } }],
+    ['infinite idle evidence', { evidence: { idleMinutes: Infinity } }],
+    ['idle below grace', { evidence: { idleMinutes: 9 } }],
+    ['unknown startedAt', { startedAt: undefined }],
+    ['invalid startedAt', { startedAt: 'unreadable' }],
+    ['same start time as keeper', { startedAt: T0 - 60 * MIN }],
+    ['non-idle state', { state: 'paused' }],
+  ])('does not stop a duplicate with %s', (_label, over) => {
+    expect(stops([duplicate(over), newer({ state: 'working' })])).toEqual([]);
+  });
+  it('accepts finite idle evidence exactly at grace for an older duplicate', () => {
+    expect(stops([duplicate({ evidence: { idleMinutes: 10 } }), newer()])).toEqual([
+      expect.objectContaining({ handle: 'f29aeb29', mode: 'duplicate', idleMinutes: 10 }),
+    ]);
+  });
+  it.each(['fix', 'ci-heal', 'prepare'])('reaps an older PR-bound %s duplicate', (kind) => {
+    expect(stops([duplicate({ kind }), newer({ kind })])).toEqual([
+      expect.objectContaining({ handle: 'f29aeb29', mode: 'duplicate' }),
+    ]);
+  });
+  it('keeps a single-session group and its keeper', () => {
+    expect(stops([duplicate()])).toEqual([]);
+  });
+  it.each([
+    ['different repo', { repo: 'pa' }],
+    ['different kind', { kind: 'ci-heal' }],
+    ['different PR', { target: '3772' }],
+  ])('groups duplicates by repo + kind + target: %s stays separate', (_label, over) => {
+    expect(stops([duplicate(), newer(over)])).toEqual([]);
+  });
+  it.each([
+    ['non-prBound', { prBound: false }],
+    ['review', { kind: 'review' }],
+    ['build', { kind: 'build' }],
+  ])('never reaps %s groups as duplicates', (_label, over) => {
+    expect(stops([duplicate(over), newer(over)])).toEqual([]);
+  });
+  it('finished mode wins when the same row is also an eligible older duplicate: no double stop', () => {
+    const old = finished();
+    expect(stops([old, newer()])).toEqual([
+      expect.objectContaining({ handle: old.id, mode: 'finished' }),
+    ]);
+  });
+});
+
+describe('runSessionWatchdogPass — reaping with hermetic IO', () => {
+  const listing = (over = {}) => row({ kind: 'background', state: 'idle', pid: 2009, ...over });
+  const finishedTail = () => summarizeTail([
+    ...bash('git status --short', T0 - 41 * MIN), reply(T0 - 40 * MIN),
+  ], { nowMs: T0 });
+  const base = (over = {}) => {
+    const calls = { stop: [], reapEvents: [], logs: [], tailReads: [] };
+    const result = runSessionWatchdogPass({
+      nowMs: T0, act: true, agents: [listing()], processes: [{ pid: 2009, command: 'claude' }],
+      readTail: (r) => { calls.tailReads.push(r.sessionId); return finishedTail(); },
+      readHeavy: () => null, listClaims: () => [], prHeadFor: () => null, completionFor: () => null,
+      stop: ({ handle }) => { calls.stop.push(handle); return { stopped: true }; },
+      appendReapEvent: (e) => calls.reapEvents.push(e), log: (line) => calls.logs.push(line),
+      ownSessionId: 'orchestrator-not-listed',
+      rm: () => { throw new Error('unexpected ghost removal'); },
+      releaseFixing: () => { throw new Error('unexpected claim release'); },
+      releaseDispatch: () => { throw new Error('unexpected dispatch release'); },
+      readLedger: () => ({ emitted: new Set(), acked: new Set() }),
+      appendEvent: () => { throw new Error('unexpected escalation event'); },
+      relist: () => [], readRmLedger: () => ({}),
+      writeRmLedger: () => { throw new Error('unexpected rm ledger write'); },
+      ...over,
+    });
+    return { result, calls, actions: result.actions.filter((a) => a.type === 'stop-session') };
+  };
+
+  it('act:true executes a finished stop through the injected stop function', () => {
+    const { calls, actions } = base();
+    expect(calls.stop).toEqual(['f29aeb29']);
+    expect(actions).toEqual([expect.objectContaining({ mode: 'finished', ok: true })]);
+  });
+  it('report-only plans the stop with ok:null and never calls stop or appends a reap event', () => {
+    const { calls, actions } = base({ act: false });
+    expect(actions).toEqual([expect.objectContaining({ type: 'stop-session', ok: null })]);
+    expect(calls.stop).toEqual([]);
+    expect(calls.reapEvents).toEqual([]);
+  });
+  it('bounds eight eligible sessions to five stop calls and reports three explicitly deferred actions', () => {
+    const agents = Array.from({ length: 8 }, (_, i) => listing({
+      name: `fix-${3771 + i}`, id: `handle-${i}`, sessionId: `sid-${i}`,
+    }));
+    const { calls, actions } = base({ agents, config: { ...CFG, reapMaxStopsPerTick: 5 } });
+    expect(actions).toHaveLength(8);
+    expect(calls.stop).toHaveLength(5);
+    expect(new Set(calls.stop).size).toBe(5);
+    expect(actions.filter((a) => a.ok === true)).toHaveLength(5);
+    expect(actions.filter((a) => a.deferred)).toEqual(Array.from({ length: 3 }, () => expect.objectContaining({
+      ok: false, deferred: true, detail: 'deferred: per-tick stop bound',
+    })));
+    expect(calls.reapEvents).toHaveLength(5);
+    expect(calls.reapEvents.map((e) => e.handle).sort()).toEqual([...calls.stop].sort());
+  });
+  it('appends exactly one versioned stopped event with the executed action evidence', () => {
+    const { calls, actions } = base();
+    expect(actions).toHaveLength(1);
+    expect(calls.reapEvents).toEqual([{
+      type: 'session-watchdog.session-stopped', v: 1, sessionId: 'sid-1', name: 'fix-3771',
+      handle: 'f29aeb29', mode: 'finished', reason: actions[0].reason, idleMinutes: 40,
+      at: new Date(T0).toISOString(),
+    }]);
+  });
+  it('executes duplicate-mode stops and records their keeper reason in the event', () => {
+    const old = listing();
+    const keeper = listing({ id: 'keeper', sessionId: 'sid-keeper', startedAt: T0 - 60 * MIN });
+    const tail = summarizeTail(bash('git status --short', T0 - 15 * MIN), { nowMs: T0 });
+    const { calls, actions } = base({ agents: [old, keeper], readTail: () => tail });
+    expect(calls.stop).toEqual([old.id]);
+    expect(actions).toEqual([expect.objectContaining({ mode: 'duplicate', ok: true, reason: expect.stringContaining(keeper.name) })]);
+    expect(calls.reapEvents).toEqual([expect.objectContaining({
+      type: 'session-watchdog.session-stopped', mode: 'duplicate', handle: old.id, reason: actions[0].reason,
+    })]);
+  });
+  it.each(['returns stopped:false', 'throws'])('a failed stop (%s) reports ok:false and emits no reap event', (failure) => {
+    const attempts = [];
+    const { calls, actions } = base({ stop: ({ handle }) => {
+      attempts.push(handle);
+      if (failure === 'throws') throw new Error('stop failed');
+      return { stopped: false, reason: 'stop failed' };
+    } });
+    expect(attempts).toEqual(['f29aeb29']);
+    expect(actions).toEqual([expect.objectContaining({ ok: false })]);
+    expect(calls.reapEvents).toEqual([]);
+  });
+  it('refuses to stop the orchestrator ownSessionId even when otherwise eligible', () => {
+    const { calls, actions } = base({ ownSessionId: 'sid-1' });
+    expect(actions).toEqual([expect.objectContaining({ ok: false, detail: expect.stringContaining('own session') })]);
+    expect(calls.stop).toEqual([]);
+    expect(calls.reapEvents).toEqual([]);
+  });
+  it('excludes an interactive listing named fix-3771 before planning stops', () => {
+    const { result, calls, actions } = base({ agents: [listing({ kind: 'interactive' })] });
+    expect(result.rows).toEqual([]);
+    expect(actions).toEqual([]);
+    expect(calls.tailReads).toEqual([]);
+    expect(calls.stop).toEqual([]);
+    expect(calls.reapEvents).toEqual([]);
+  });
+  it('logs effective default grace 10 and standard/default provenance exactly once per pass', () => {
+    const { calls } = base();
+    const lines = calls.logs.filter((line) => line.includes('reapFinishedGraceMinutes'));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/\b10\b/);
+    expect(lines[0]).toMatch(/standard|default/i);
+  });
+  it('logs effective overridden grace 3 with override/tool provenance exactly once per pass', () => {
+    const { config, error } = resolveSessionWatchdogConfig({ reapFinishedGraceMinutes: 3 });
+    expect(error).toBeNull();
+    const { calls } = base({ config });
+    const lines = calls.logs.filter((line) => line.includes('reapFinishedGraceMinutes'));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/\b3\b/);
+    expect(lines[0]).toMatch(/override|tool/i);
+  });
+  it('keeps a WAITING same-command background job idle 40 minutes without a done record or endedOnReply', () => {
+    const entries = [0, 1, 2, 3].flatMap((i) => bash(WAIT, T0 - (67 - i * 9) * MIN, MIN, { pending: i === 3 }));
+    const tail = summarizeTail(entries, { nowMs: T0 });
+    const { result, calls, actions } = base({ readTail: () => tail });
+    expect(tail.endedOnReply).toBe(false);
+    expect(result.rows[0]).toMatchObject({ class: CLASSES.WAITING, evidence: { idleMinutes: 40 } });
+    expect(actions).toEqual([]);
+    expect(calls.stop).toEqual([]);
+    expect(calls.reapEvents).toEqual([]);
+  });
+  it('keeps a STALLED background job idle 40 minutes without a done record or endedOnReply', () => {
+    const tail = summarizeTail(bash(WAIT, T0 - 41 * MIN, MIN), { nowMs: T0 });
+    const { result, calls, actions } = base({ readTail: () => tail });
+    expect(tail.endedOnReply).toBe(false);
+    expect(result.rows[0]).toMatchObject({ class: CLASSES.STALLED, evidence: { idleMinutes: 40 } });
+    expect(actions).toEqual([]);
+    expect(calls.stop).toEqual([]);
+    expect(calls.reapEvents).toEqual([]);
+  });
+  it('stops a completion-record-done session past grace with a readable tail and no pending call', () => {
+    const tail = summarizeTail(bash('git status --short', T0 - 41 * MIN, MIN), { nowMs: T0 });
+    const { result, calls, actions } = base({ completionFor: () => ({ done: true }), readTail: () => tail });
+    expect(tail.endedOnReply).toBe(false);
+    expect(tail.pending).toBeNull();
+    expect(result.rows[0]).toMatchObject({ class: CLASSES.FINISHED, reason: 'completion-record-done' });
+    expect(actions).toEqual([expect.objectContaining({ mode: 'finished', ok: true })]);
+    expect(calls.stop).toEqual(['f29aeb29']);
+    expect(calls.reapEvents).toHaveLength(1);
+  });
+});
