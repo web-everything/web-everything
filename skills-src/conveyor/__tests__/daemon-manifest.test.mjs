@@ -263,7 +263,7 @@ describe('#4131 — the health watch job kinds', () => {
 it('R116 pr-merge-watch is an opt-in five-minute one-shot pass', () => {
   const entry = DAEMON_MANIFEST['pr-merge-watch'];
   expect(entry).toEqual({ script: 'scripts/conveyor/pass-daemons/pr-merge-watch-pass.mjs',
-    args: ['--repo=web-everything/web-everything'], intervalMs: 300000, defaultLaunch: false });
+    args: ['--repo=web-everything/web-everything'], intervalMs: 300000, defaultLaunch: false, eventRole: 'pr-merge-watch' });
   expect(existsSync(join(REPO_ROOT, entry.script))).toBe(true);
 });
 
