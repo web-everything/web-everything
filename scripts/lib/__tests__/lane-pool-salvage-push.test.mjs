@@ -274,6 +274,26 @@ describe('remoteHeads (the release proof) reads the canonical origin from the pr
       expect(existsSync(evilRan), 'the lane credential helper ran').toBe(false);
     } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
   });
+  // PR #6319 self-review: the primary listing's config check reads the SAME global config the listing applies (the
+  // account home), so a caller-set HOME cannot hide an account-level URL rewrite of the canonical origin from it.
+  it('the primary listing refuses a URL rewrite in the account home even when the caller points HOME elsewhere', () => {
+    const { dir, primary } = setup();
+    try {
+      const home = join(dir, 'home'), callerHome = join(dir, 'caller-home');
+      mkdirSync(home);
+      mkdirSync(callerHome);
+      execFileSync('git', ['config', '--file', join(home, '.gitconfig'), `url.${join(dir, 'elsewhere.git')}.insteadOf`, join(dir, 'origin.git')]);
+      vi.stubEnv('HOME', callerHome);
+      vi.stubEnv('XDG_CONFIG_HOME', callerHome);
+      vi.stubEnv('GIT_CONFIG_NOSYSTEM', '1');
+      const runGit = vi.fn(execFileSync);
+      const io = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: primary, primaryPath: primary }, backupRoot: join(dir, 'backups'), runGit, accountHome: home });
+      expect(() => io.remoteHeads()).toThrow(/URL rewriting configured/);
+      expect(runGit.mock.calls.some(([, args]) => args.includes('ls-remote'))).toBe(false);
+      // Every config read of that check ran under the listing's env (account home), not the caller's HOME.
+      for (const [, args, options] of runGit.mock.calls.filter(([, args]) => args.includes('config'))) expect(options.env.HOME, args.join(' ')).toBe(home);
+    } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+  });
   it('accepts operator auth/signing keys in the primary and excludes ops/* heads', () => {
     const { dir, primary, sha, io } = setup();
     try {

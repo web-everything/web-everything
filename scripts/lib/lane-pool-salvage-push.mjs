@@ -67,7 +67,11 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
       stdio: ['ignore', 'pipe', 'pipe'],
     }).trim();
   };
-  const checkTransportConfig = (dir, { primary = false } = {}) => {
+  const gitRun = git;
+  // `callEnv`: the env the checked transport itself runs under, so the check reads the same global config git applies
+  // (the primary listing reads it from the account home, not a caller-set HOME — PR #6319 self-review).
+  const checkTransportConfig = (dir, { primary = false, callEnv = env } = {}) => {
+    const git = (d, args) => gitRun(d, args, 120_000, false, callEnv);
     // An explicit URL still passes through url.*.insteadOf / pushInsteadOf. Refuse
     // every effective rewrite (including includes and global config) before transport.
     // NUL-delimited names keep newlines in a subsection from hiding a rewrite key.
@@ -240,8 +244,9 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
     const args = transport('ls-remote', origin, ...patterns);
     const primaryDir = repo.primaryPath || null;
     const dir = primaryDir || repo.referencePath;
-    checkTransportConfig(dir, { primary: !!primaryDir });
-    return git(dir, args, 120_000, true, primaryDir ? primaryEnv : env);
+    const callEnv = primaryDir ? primaryEnv : env;
+    checkTransportConfig(dir, { primary: !!primaryDir, callEnv });
+    return git(dir, args, 120_000, true, callEnv);
   };
   return {
     fetchHeads,

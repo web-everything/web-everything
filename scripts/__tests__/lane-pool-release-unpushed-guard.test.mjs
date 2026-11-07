@@ -842,6 +842,26 @@ describe('lane git hardening blocks lane credential helpers; the primary-only fo
     expect(existsSync(evilRan), `the ${key} helper ran`).toBe(false);
   });
 
+  // Self-review of route (a): the primary form hands a real credential to git, so no caller env may record it (a trace
+  // file with redaction off) or route it through a caller proxy with TLS checks off / a caller CA.
+  it('the primary form drops caller trace, proxy and TLS env; the lane form, which carries no credential, keeps them', () => {
+    const routing = { GIT_TRACE: '1', GIT_TRACE_CURL: join(root, 'trace'), GIT_TRACE_REDACT: '0', GIT_TRACE2_EVENT: join(root, 't2'),
+      GIT_CURL_VERBOSE: '1', GIT_SSL_NO_VERIFY: '1', GIT_SSL_CAINFO: join(root, 'ca'), GIT_SSL_CAPATH: root, GIT_SSL_CERT: join(root, 'c'),
+      GIT_HTTP_PROXY_AUTHMETHOD: 'basic', GIT_PROXY_COMMAND: join(root, 'proxy'), GIT_PROXY_SSL_CAINFO: join(root, 'ca'), GIT_REDIRECT_STDERR: join(root, 'err'),
+      SSL_CERT_FILE: join(root, 'ca'), SSL_CERT_DIR: root, CURL_CA_BUNDLE: join(root, 'ca'), CURL_HOME: root,
+      HTTPS_PROXY: 'http://127.0.0.1:9', https_proxy: 'http://127.0.0.1:9', HTTP_PROXY: 'http://127.0.0.1:9', http_proxy: 'http://127.0.0.1:9',
+      ALL_PROXY: 'http://127.0.0.1:9', all_proxy: 'http://127.0.0.1:9', NO_PROXY: '*', no_proxy: '*' };
+    const inherited = { ...base, ...routing };
+    const primary = laneGitHardeningEnv(inherited, { credentialPins: false, home });
+    for (const key of Object.keys(routing)) expect(primary, key).not.toHaveProperty(key);
+    expect(laneGitHardeningEnv(inherited)).toMatchObject(routing);
+    const clean = join(root, 'primary');
+    git(['init', '--quiet', clean], root);
+    const filled = fill(primary, clean);
+    expect(filled.status, filled.stderr).toBe(0);
+    expect(filled.stdout).toContain('password=trusted-pass');
+  });
+
   it('the primary form drops every inherited GIT_CONFIG_COUNT entry, so an inherited helper cannot outlive the missing reset', () => {
     const inherited = { ...base, GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: `!f() { touch '${evilRan}'; }; f`,
       GIT_CONFIG_KEY_1: 'core.askPass', GIT_CONFIG_VALUE_1: join(root, 'evil'), GIT_CONFIG_KEY_7: 'credential.helper', GIT_CONFIG_VALUE_7: 'orphan' };

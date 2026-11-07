@@ -77,6 +77,10 @@ export const GIT_REPO_LOCATION_ENV_KEYS = Object.freeze(['GIT_DIR', 'GIT_COMMON_
 export const GIT_REPO_ENV_KEYS = Object.freeze([...GIT_REPO_LOCATION_ENV_KEYS, 'GIT_CONFIG_PARAMETERS',
   'GIT_CONFIG_COUNT', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM']);
 const INHERITED_GIT_INDEXED_CONFIG_RE = /^GIT_CONFIG_(KEY|VALUE)_.*$/s;
+/** Env that records an HTTP exchange (traces, curl verbosity, redaction off) or routes / unverifies it (proxies, TLS and
+ *  CA settings). Dropped from the primary form only: there a real credential crosses the transport. Case-insensitive,
+ *  since curl reads lower-case proxy variables. Exported for its test. */
+export const CREDENTIAL_ROUTING_ENV_RE = /^(GIT_TRACE.*|GIT_CURL_.*|GIT_SSL_.*|GIT_HTTP_.*|GIT_PROXY_.*|GIT_REDIRECT_STDERR|SSL_CERT_(FILE|DIR)|CURL_CA_BUNDLE|CURL_HOME|(HTTPS?|ALL|NO)_PROXY)$/is;
 
 /**
  * A copy of `env` with every inherited git config override and repository-location variable removed, including orphaned
@@ -166,8 +170,13 @@ export function laneGitHardeningEnv(env = process.env, { remoteProbe = false, cr
   // command-scope entry at all, and reads global / system config only from the OS account's own locations: a caller
   // (a lane CLI controls its env) must not point HOME / XDG_CONFIG_HOME / GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM at a
   // file holding its own `credential.helper` or `core.askPass` (PR #6319 self-review). No account home → no HOME.
+  // The primary form also hands a real credential to git, so no caller env may choose where it goes or who sees it: a
+  // trace file with redaction off records the Authorization header, and a caller proxy with TLS checks off or a caller
+  // CA reads it on the wire (PR #6319 self-review). The operator's own proxy / TLS config in the account's global or
+  // the primary's local config still applies.
   if (credentialPins === false) {
-    for (const key of Object.keys(out)) if (key === 'GIT_CONFIG_COUNT' || INHERITED_GIT_INDEXED_CONFIG_RE.test(key)) delete out[key];
+    for (const key of Object.keys(out)) if (key === 'GIT_CONFIG_COUNT' || INHERITED_GIT_INDEXED_CONFIG_RE.test(key)
+      || CREDENTIAL_ROUTING_ENV_RE.test(key)) delete out[key];
     for (const key of ['XDG_CONFIG_HOME', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_EXEC_PATH']) delete out[key];
     if (home) out.HOME = home; else delete out.HOME;
   }
