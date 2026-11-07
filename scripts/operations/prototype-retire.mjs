@@ -174,7 +174,10 @@ export function planRetirements({ rows, git, gh, repo, mainRef = 'origin/main' }
       ? rows.find((entry) => entry.ref === baseRef) : null;
     // Ancestry alone cannot preserve edits introduced by merge commits. Unverifiable or edited merge
     // trees must stay registered; only reproducible clean merges can be ignored for containment.
-    if (baseRow && carried.cleanMerges) {
+    // A sibling with its OWN open PR keeps its registration however that PR was found (recorded or by head lookup):
+    // only the base's PR, found via `merge-ref-base`, is not the sibling's own.
+    const ownOpenPr = pr?.state === 'OPEN' && found.via !== 'merge-ref-base';
+    if (baseRow && carried.cleanMerges && !ownOpenPr) {
       const baseFound = findPr({ gh, row: baseRow, repo });
       // A base registration's `pr:N` may point at an unrelated PR: the PR must actually be the base branch's own.
       // Identity is repo plus branch: a fork PR heading a same-named branch is not the origin base's PR.
