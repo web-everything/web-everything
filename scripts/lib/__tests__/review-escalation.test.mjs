@@ -3043,6 +3043,52 @@ describe('R706 — proven human-clearance carriers', () => {
   const carrier = (over = {}) => ({ author: { login: 'web-everything' },
     body: [buildReviewedShaMarker(head), buildClearedHumanMarker('Ada'), buildClearedFromMarker('IC_original'), buildReviewedDiffMarker(diff)].join('\n'), ...over });
 
+  it.each(['refuse', 'trust-drain-record'])('R711 %s retains human source, bound clearance and plain-accept rules', mechanicalCarry => {
+    const policy = { mechanicalCarry };
+    const receipt = `\n<!-- human-clearance-carried: from=${original} to=${head} diff=${'e'.repeat(64)} -->`;
+    const changed = { ...carrier(), body: carrier().body.replace(diff, 'e'.repeat(64)) + receipt };
+    expect(parseLatestHumanClearedSha([source(), changed], policy)).toBe(mechanicalCarry === 'refuse' ? original : head);
+    expect(headEverHumanCleared([source(), changed], head, policy)).toBe(mechanicalCarry !== 'refuse');
+    expect(latestHumanClearanceSourceId([source(), changed], policy)).toBe('IC_original');
+    expect(parseLatestHumanClearedSha([changed], policy)).toBeNull();
+    expect(parseLatestHumanClearedSha([source({ body: buildReviewedShaMarker(original) }), changed], policy)).toBeNull();
+    const missingFingerprint = { ...changed, body: changed.body.replace(buildReviewedDiffMarker('e'.repeat(64)), '') };
+    expect(parseLatestHumanClearedSha([source(), missingFingerprint], policy)).toBe(original);
+    expect(headEverHumanCleared([source(), missingFingerprint], head, policy)).toBe(false);
+    const mismatchedFingerprint = { ...changed, body: changed.body.replace(`diff=${'e'.repeat(64)}`, `diff=${'f'.repeat(64)}`) };
+    expect(parseLatestHumanClearedSha([source(), mismatchedFingerprint], policy)).toBe(original);
+    expect(headEverHumanCleared([source(), mismatchedFingerprint], head, policy)).toBe(false);
+    const plain = { author: { login: 'web-everything' }, body: buildReviewedShaMarker(head) };
+    expect(parseLatestHumanClearedSha([source(), plain, changed], policy)).toBeNull();
+    expect(parseLatestHumanClearedSha([source(), changed, plain], policy)).toBeNull();
+    for (const body of [changed.body.replace(buildClearedFromMarker('IC_original'), ''),
+      changed.body.replace(`from=${original}`, `from=${next}`), changed.body.replace(`to=${head}`, `to=${next}`),
+      changed.body.replace(`diff=${'e'.repeat(64)}`, 'diff=invalid'), changed.body + receipt]) {
+      expect(parseLatestHumanClearedSha([source(), { ...changed, body }], policy)).toBe(original);
+    }
+    expect(parseLatestHumanClearedSha([source({ author: { login: 'web-everything' } }), changed], policy)).toBeNull();
+  });
+
+  it('R711 mechanical carry chains refuse unproven predecessors and retain plain-accept supersession', () => {
+    const policy = { mechanicalCarry: 'trust-drain-record' };
+    const first = { ...carrier(), body: carrier().body.replace(diff, 'e'.repeat(64))
+      + `\n<!-- human-clearance-carried: from=${original} to=${head} diff=${'e'.repeat(64)} -->` };
+    const second = { ...carrier(), body: carrier().body.replace(head, next).replace(diff, 'f'.repeat(64))
+      + `\n<!-- human-clearance-carried: from=${head} to=${next} diff=${'f'.repeat(64)} -->` };
+    expect(parseLatestHumanClearedSha([source(), first, second], policy)).toBe(next);
+    expect(headEverHumanCleared([source(), first, second], next, policy)).toBe(true);
+    expect(latestHumanClearanceSourceId([source(), first, second], policy)).toBe('IC_original');
+    expect(parseLatestHumanClearedSha([source(), second], policy)).toBe(original);
+    const unproven = { ...first, body: first.body.replace(`from=${original}`, `from=${next}`) };
+    expect(parseLatestHumanClearedSha([source(), unproven, second], policy)).toBe(original);
+    const plain = { author: { login: 'web-everything' }, body: buildReviewedShaMarker(head) };
+    expect(parseLatestHumanClearedSha([source(), first, plain, second], policy)).toBeNull();
+    expect(headEverHumanCleared([source(), first, plain, second], next, policy)).toBe(false);
+    expect(parseLatestHumanClearedSha([source({ author: first.author }), first, second], policy)).toBeNull();
+    expect(parseLatestHumanClearedSha([source(), first, { ...second, body: second.body.replace('IC_original', 'IC_first_carry') }], policy)).toBe(head);
+    expect(parseLatestHumanClearedSha([source(), first, { ...second, body: second.body.replace(`to=${next}`, `to=${original}`) }], policy)).toBe(head);
+  });
+
   it('exports cleared-from and refuses empty or unsafe citation ids', () => {
     expect(CLEARED_FROM_MARKER).toBe('cleared-from');
     for (const id of ['', null, undefined, 'abc', 'IC_ x', 'IC_<>', 'IC_ok\n']) expect(buildClearedFromMarker(id)).toBe('');

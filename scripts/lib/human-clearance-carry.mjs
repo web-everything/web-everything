@@ -41,6 +41,7 @@
  *   Setting: `review.carryEquivalence` (contribution|strict), env `WE_REVIEW_CARRY_EQUIVALENCE`.
  */
 import { proveIdenticalNetPatch, resolveIdenticalNetPatchSetting, logIdenticalNetPatchSetting } from './identical-net-patch.mjs';
+import { resolveMechanicalCarrySetting } from './human-clearance-mechanical-carry-setting.mjs';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -372,6 +373,7 @@ export function applyHumanClearanceCarry({
   equivalence = resolveCarryEquivalenceSetting().value, proveNumbering = proveNumberingOnlyMove,
   numberingSetting = resolveNumberingHumanClearanceSetting(), numberingOnly = false,
   netPatchSetting = resolveIdenticalNetPatchSetting(),
+  mechanicalCarry,
   setting = resolveHumanClearanceCarrySetting(), log = (s) => process.stderr.write(s),
 } = {}) {
   const d = proveHumanClearanceCarry({ evidence, enabled: setting.value, exec, cwd, mainRef, equivalence, proveNumbering, numberingSetting, numberingOnly, netPatchSetting });
@@ -383,6 +385,18 @@ export function applyHumanClearanceCarry({
   const tag = `${repo ? `${repo}` : ''}#${pr}`;
   if (!d.carry) {
     log(`  human-clearance-carry ${tag}: NOT carried ${String(evidence?.humanClearance?.sha || '').slice(0, 9)}→${String(evidence?.headSha || '').slice(0, 9)} — ${d.reason}\n`);
+    return null;
+  }
+  const mechanical = mechanicalCarry ?? resolveMechanicalCarrySetting({ log });
+  const sourceId = evidence?.humanClearance?.sourceId;
+  if (!buildClearedFromMarker(sourceId)) {
+    log(`  human-clearance-carry ${tag}: NOT carried — missing or unsafe human clearance source id\n`);
+    return null;
+  }
+  const body = buildCarryRecordBody({ ...d, headDiffText: evidence.headDiff, mechanicalReason: d.mechanicalReason, sourceId });
+  const recordedDiff = parseReviewedDiff([{ author: { login: 'web-everything' }, body }]);
+  if (!recordedDiff || (mechanical.value !== 'trust-drain-record' && recordedDiff !== evidence.humanClearance.diff)) {
+    log(`  human-clearance-carry ${tag}: NOT carried (humanClearance.mechanicalCarry=refuse) — reviewed diff changed; a human must re-approve\n`);
     return null;
   }
   const carried = { fromSha: d.fromSha, toSha: d.toSha, fingerprint: d.fingerprint, actor: d.actor, tier: d.tier, mechanicalReason: d.mechanicalReason, recorded: false };
@@ -407,7 +421,6 @@ export function applyHumanClearanceCarry({
         reason: `human clearance carry (${d.fromSha.slice(0, 9)}→${d.toSha.slice(0, 9)}) not recorded: ${changed} — merge deferred this pass` };
     }
   }
-  const body = buildCarryRecordBody({ ...d, headDiffText: evidence.headDiff, mechanicalReason: d.mechanicalReason, sourceId: evidence?.humanClearance?.sourceId ?? '' });
   try {
     exec('gh', ['pr', 'comment', String(pr), ...(repo ? ['--repo', repo] : []), '--body', body],
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });

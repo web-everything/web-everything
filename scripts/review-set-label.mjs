@@ -1793,6 +1793,10 @@ export function runReviewLabelCli({
   let humanClearance = null;
   if (to === 'restamp') {
     humanClearance = carriedHumanClearance ?? decideRestampHumanClearance({ comments: prComments, headSha, headDiff: reviewedDiff });
+    if (guardedRestamp && parseLatestHumanClearedSha(prComments)
+      && (!humanClearance || parseReviewedDiff([latestHumanClearanceComment(prComments)]) !== normalizeDiffFingerprint(reviewedDiff))) {
+      fail('CI-heal human clearance NOT carried: net reviewed diff changed — a human must re-approve', 1);
+    }
     if (!humanClearance && !guardedRestamp && !restampAcrossHold) {
       const derived = deriveHumanCarry();
       // An unreadable review / full-thread read must not mint this accept WITHOUT its `cleared-human` marker: that would drop

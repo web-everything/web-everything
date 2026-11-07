@@ -71,6 +71,7 @@ describe('shared carry proof against real git', () => {
       return cmd === 'git' ? execFileSync(cmd, args, opts) : writer(cmd, args);
     };
     const result = applyHumanClearanceCarry({ evidence, exec, cwd: r.cwd, pr: 5414,
+      mechanicalCarry: { value: 'trust-drain-record', source: 'test' },
       setting: { value: true, source: 'test' }, netPatchSetting: { value: netPatch, source: 'test' }, log: () => {},
       readNumberingLiveEvidence: () => ({ headSha: head, comments: [comment], reviews: [] }) });
     expect(patchReads).toBe(netPatch ? 2 : 0);

@@ -4527,9 +4527,9 @@ describe('guarded CI-heal restamp write boundary', () => {
     git('commit', '-am', 'reviewed contribution'); reviewedHead = git('rev-parse', 'HEAD');
     reviewedDiff = git('diff', reviewedBase, reviewedHead);
     git('checkout', 'main');
-    // Shift the source context without changing the PR's own addition/removal.
-    writeFileSync(join(dir, 'source.js'), '// upstream context\n' + context + 'export const value = 1;\n');
-    git('commit', '-am', 'base movement'); healedBase = git('rev-parse', 'HEAD');
+    // An unrelated upstream file moves the base while preserving the reviewed net diff.
+    writeFileSync(join(dir, 'upstream.txt'), 'unrelated base movement\n');
+    git('add', 'upstream.txt'); git('commit', '-m', 'base movement'); healedBase = git('rev-parse', 'HEAD');
     git('checkout', 'lane'); git('rebase', 'main'); healedHead = git('rev-parse', 'HEAD');
     healedDiff = git('diff', healedBase, healedHead);
     git('remote', 'add', 'origin', dir);
@@ -4558,10 +4558,18 @@ fs.writeFileSync('state.json', JSON.stringify(s));
   });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
+  function shiftSourceContextBase() {
+    git('checkout', 'main'); git('reset', '--hard', reviewedBase);
+    writeFileSync(join(dir, 'source.js'), '// upstream context\n' + context + 'export const value = 1;\n');
+    git('commit', '-am', 'shift source context'); healedBase = git('rev-parse', 'HEAD');
+    git('checkout', 'lane'); git('reset', '--hard', reviewedHead); git('rebase', 'main'); healedHead = git('rev-parse', 'HEAD');
+    healedDiff = git('diff', healedBase, healedHead);
+  }
+
   function run({ mode = 'plain', expected = healedHead, labels = ['review:accepted'], race, state = 'OPEN', extra = [], reviews = [] } = {}) {
     // R706: a human carry proves the same net reviewed diff, not contribution identity alone.
     let comment = { id: 'IC_original', author: { login: mode === 'human' ? 'chalbert' : 'web-everything' }, body: buildVerdictComment({
-      to: mode === 'human' ? 'clear-human' : 'accepted', actor: 'original reviewer', headSha: reviewedHead, reviewedDiff: mode === 'human' ? healedDiff : reviewedDiff,
+      to: mode === 'human' ? 'clear-human' : 'accepted', actor: 'original reviewer', headSha: reviewedHead, reviewedDiff,
     }) };
     if (mode === 'untrusted') comment.author.login = 'mallory';
     if (mode === 'no-digests') comment.body = buildReviewedShaMarker(reviewedHead);
@@ -4571,7 +4579,7 @@ fs.writeFileSync('state.json', JSON.stringify(s));
     writeFileSync(join(dir, 'state.json'), JSON.stringify(original));
     const r = spawnSync(process.execPath, [script, '42', '--repo=web-everything/web-everything', '--to=restamp', '--actor=CI healer', '--channel=ci-heal',
       ...(expected === null ? [] : [`--expect-head=${expected}`]), ...extra], {
-      cwd: dir, encoding: 'utf8', env: { ...process.env, PATH: `${join(dir, 'bin')}:${process.env.PATH}`,
+      cwd: dir, encoding: 'utf8', env: { ...process.env, WE_HUMAN_CLEARANCE_MECHANICAL_CARRY: 'refuse', PATH: `${join(dir, 'bin')}:${process.env.PATH}`,
         WE_VERDICT_LEDGER_DIR: join(dir, 'ledger'), WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'lock') },
     });
     const final = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8'));
@@ -4589,7 +4597,12 @@ fs.writeFileSync('state.json', JSON.stringify(s));
   }
 
   it.each(['plain', 'human'])('carries %s acceptance through base movement with exact proven-head markers', mode => {
-    expect(normalizeDiffFingerprint(reviewedDiff)).not.toBe(normalizeDiffFingerprint(healedDiff));
+    if (mode === 'plain') {
+      shiftSourceContextBase();
+      expect(normalizeDiffFingerprint(reviewedDiff)).not.toBe(normalizeDiffFingerprint(healedDiff));
+    } else {
+      expect(normalizeDiffFingerprint(reviewedDiff)).toBe(normalizeDiffFingerprint(healedDiff));
+    }
     expect(normalizeContributionFingerprint(reviewedDiff)).toBe(normalizeContributionFingerprint(healedDiff));
     const result = run({ mode });
     expect(result.r.status, result.r.stdout + result.r.stderr).toBe(0);
@@ -4599,11 +4612,22 @@ fs.writeFileSync('state.json', JSON.stringify(s));
     expect(parseReviewedContribution(result.added)).toBe(normalizeContributionFingerprint(healedDiff));
     expect(parseLatestHumanClearedSha([...result.original.comments, ...result.added])).toBe(mode === 'human' ? healedHead : null);
     expect(result.added[0].body).toContain(reviewedHead);
+    if (mode === 'human') expect(result.added[0].body).toContain('<!-- cleared-from: IC_original -->');
     expect(result.added[0].body).not.toContain("drain's own");
     expect(result.ledger).toHaveLength(1);
     expect(result.ledger[0].coverage.headSha).toBe(healedHead);
     // Every carry reads the formal reviews first (PR #4631 round 11), agent accept or operator clearance alike.
     expect(result.calls.map(a => a[0] === 'api' ? 'reviews' : a[1])).toEqual(['view', 'reviews', 'view', 'comment', 'view']);
+  });
+
+  it('refuses a human clearance when base movement changes the net reviewed diff under the default', () => {
+    shiftSourceContextBase();
+    expect(normalizeDiffFingerprint(reviewedDiff)).not.toBe(normalizeDiffFingerprint(healedDiff));
+    expect(normalizeContributionFingerprint(reviewedDiff)).toBe(normalizeContributionFingerprint(healedDiff));
+    const result = run({ mode: 'human' });
+    expect(parseReviewedDiff(result.original.comments)).toBe(normalizeDiffFingerprint(reviewedDiff));
+    refused(result);
+    expect(parseLatestHumanClearedSha(result.final.comments)).toBe(reviewedHead);
   });
 
   // PR #4631 round 11 (operator ruling 2026-10-10 ~19:25 ET): the CI-heal carry is a carry too — a standing native

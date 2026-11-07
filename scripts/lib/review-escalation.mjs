@@ -1,3 +1,4 @@
+import { resolveMechanicalCarrySetting } from './human-clearance-mechanical-carry-setting.mjs';
 import { RED_TEAM_STATUS_LABEL_META } from './red-team-status-label-meta.mjs';
 import { proposeHumanRequired } from './direction-aware-human.mjs';
 import { resolveReviewCareExemptPaths, validateCareExemptPaths, matchesCareExemptPath, isProtectedCarePath } from './review-care-exempt-paths.mjs';
@@ -2035,7 +2036,8 @@ export function buildClearedFromMarker(id) {
 
 // One ordered state machine for latest coverage, historical coverage, and original-source resolution.
 // Invalid carriers are invisible; trusted plain accepts reset the active source, even on another head.
-function humanClearanceStates(comments) {
+// `mechanicalCarry` is an optional test override; production resolves the R711 policy from the shared cascade.
+function humanClearanceStates(comments, { mechanicalCarry = resolveMechanicalCarrySetting().value } = {}) {
   const thread = Array.isArray(comments) ? comments : [];
   const byId = new Map();
   for (const c of thread) {
@@ -2082,8 +2084,15 @@ function humanClearanceStates(comments) {
           || new RegExp(CLEARED_HUMAN_PROSE_RE.source).test(sourceBody))) continue;
       const fingerprint = parseReviewedDiff([c]);
       const sameDiff = !!fingerprint && fingerprint === parseReviewedDiff([source]);
-      // Only an unchanged reviewed-diff fingerprint proves an unchanged diff: a textual carry marker is a claim, not proof.
-      if (!sameDiff) continue;
+      // R711: only the explicit operator setting trusts a drain's mechanical receipt.
+      // Its predecessor must already belong to this human source's proven chain.
+      const receipts = [...body.matchAll(/<!--\s*human-clearance-carried:\s*from=([0-9a-f]{7,40}) to=([0-9a-f]{7,40}) diff=([0-9a-f]{64})\s*-->/gi)];
+      const receipt = receipts.length === 1 ? receipts[0] : null;
+      const mechanical = mechanicalCarry === 'trust-drain-record' && receipt && !!fingerprint
+        && receipt[3].toLowerCase() === fingerprint
+        && chainShas.includes(receipt[1].toLowerCase())
+        && receipt[2].toLowerCase() === sha;
+      if (!sameDiff && !mechanical) continue;
       // A trusted plain accept of the cleared head, any head already carried to, or the head being carried to, supersedes the clearance;
       // one for an unrelated head does not (the same reading the drain's hold applies).
       if (plainSince.some(p => related(p, sha) || chainShas.some(h => related(p, h)))) continue;
@@ -2111,7 +2120,8 @@ function humanClearanceStates(comments) {
  * later plain accept (which stamps `reviewed-sha` alone) correctly reports no human coverage for its head.
  *
  * R706: trusted automation may carry this clearance only by citing the active original human comment
- * exactly once, with the same non-null reviewed-diff fingerprint. Invalid carriers are skipped entirely;
+ * exactly once, with the same non-null reviewed-diff fingerprint. R711's explicit trust-drain-record setting
+ * also accepts a drain receipt bound to an established clearance-chain SHA and carrier SHA. Invalid carriers are skipped entirely;
  * a trusted plain accept resets the source and supersedes the clearance.
  *
  * @returns {string|null} the reviewed SHA, lowercased, ONLY when the latest accept-shaped comment was a
@@ -2122,20 +2132,20 @@ function humanClearanceStates(comments) {
  * `reviewed-sha` + `cleared-human` comment posted after a REAL plain accept upgraded that accept into a human
  * clearance (review round 1 on PR #2716 — the "piggyback").
  */
-export function parseLatestHumanClearedSha(comments) {
-  const latest = humanClearanceStates(comments).at(-1);
+export function parseLatestHumanClearedSha(comments, options) {
+  const latest = humanClearanceStates(comments, options).at(-1);
   return latest?.cleared ? latest.sha : null;
 }
 
 /** The comment that carries the active clearance (a human original, or a PROVEN carrier); null when none stands. */
-export function latestHumanClearanceComment(comments) {
-  const latest = humanClearanceStates(comments).at(-1);
+export function latestHumanClearanceComment(comments, options) {
+  const latest = humanClearanceStates(comments, options).at(-1);
   return latest?.cleared ? latest.c : null;
 }
 
 /** Original human comment id of the active clearance; absent or superseded evidence → null. */
-export function latestHumanClearanceSourceId(comments) {
-  const latest = humanClearanceStates(comments).at(-1);
+export function latestHumanClearanceSourceId(comments, options) {
+  const latest = humanClearanceStates(comments, options).at(-1);
   return latest?.cleared ? latest.sourceId : null;
 }
 
@@ -2147,10 +2157,10 @@ export function latestHumanClearanceSourceId(comments) {
  * @returns {boolean} false for non-array/empty comments or a blank head
  * @example headEverHumanCleared(comments, 'abcdef1')
  */
-export function headEverHumanCleared(comments, headSha) {
+export function headEverHumanCleared(comments, headSha, options) {
   if (!Array.isArray(comments) || typeof headSha !== 'string' || !headSha.trim()) return false;
   const head = headSha.toLowerCase();
-  return humanClearanceStates(comments).some(state => state.cleared && state.sha === head);
+  return humanClearanceStates(comments, options).some(state => state.cleared && state.sha === head);
 }
 
 /**

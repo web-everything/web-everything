@@ -419,7 +419,7 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
     // The next hold check binds reviewed-sha and cleared-human to one comment: it must now name the NEW head.
     // R706 - unproven automation clearance is refused: the cleared comment has no reviewed-diff fingerprint, so the
     // carrier cannot prove an unchanged diff and readers keep the clearance on the old head (fail closed).
-    expect(parseLatestHumanClearedSha([clearComment(), { author: BOT, body }])).not.toBe(heads.head);
+    expect(parseLatestHumanClearedSha([clearComment(), { author: BOT, body }])).toBe(heads.cleared);
     expect(parseOperatorClearance([{ author: BOT, body }])).toEqual({ actor: 'chalbert' });
   });
 
@@ -473,7 +473,7 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
     expect(body).toContain(`reviewed-sha: ${heads.head}`);
     expect(body).toContain('cleared-human: chalbert');
     // R706 - unproven automation clearance is refused (diff-less source cannot prove an unchanged diff)
-    expect(parseLatestHumanClearedSha([clearComment(), { author: BOT, body }])).not.toBe(heads.head);
+    expect(parseLatestHumanClearedSha([clearComment(), { author: BOT, body }])).toBe(heads.cleared);
   });
 
   // PR #4631 round 11 (operator ruling 2026-10-10 ~19:25 ET): the PLAIN restamp's own clearance carry
@@ -882,6 +882,7 @@ describe('carryHumanClearanceOnIdenticalDiff — the drain\'s anti-test-gaming c
     const posted = [];
     const result = run({ comments, netDiffText: { scored: true, text: `${TEXT}+numbered\n`, rev: NEW },
       applyNumberingCarry: evidence => applyHumanClearanceCarry({ evidence, pr: 5414, numberingOnly: true,
+        mechanicalCarry: { value: 'trust-drain-record', source: 'test' },
         setting: { value: true, source: 'standard' }, numberingSetting: { value: true, source: 'standard' }, log: () => {},
         exec: (cmd, args) => { posted.push([cmd, args]); return ''; },
         proveNumbering: () => ({ ok, reason: ok ? 'exact numbering' : 'unrelated byte' }),
