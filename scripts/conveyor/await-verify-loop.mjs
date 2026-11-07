@@ -35,7 +35,7 @@ import { releaseFixDispatchClaim } from './fix-dispatch-claim.mjs';
 import { tryReadCompletion } from '../operations/completion-store.mjs';
 import { ensureFreshGithubAppEnv, FLEET_APP_AUTH_OPTS, isGithubAppAuthGuardError } from '../lib/github-app-auth-env.mjs';
 import {
-  resolveFixerSlotSettings, fixSlotState, slotCountedItems, admitResumes, classifyStaleOwed, awaitPassRunner, releaseOnCompletion,
+  resolveFixerSlotSettings, fixSlotState, slotCountedItems, admitResumes, classifyStaleOwed, classifyUnwakeableWait, awaitPassRunner, releaseOnCompletion,
 } from './fixer-slot-rules.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -100,8 +100,9 @@ const resumeMisses = new Map();
  * without waking anyone; phase B wakes only the admitted resumes (oldest first). Deferred ones keep their pending
  * resume on disk and their reserved slot (R2). Every effect is the pass's own (injectable `runPass`, `io`).
  */
-export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings, claims, nowMs, ttlMs, cap }) {
+export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings, claims, nowMs, ttlMs, cap, log = console.log }) {
   if (!settings.parkedReleasesSlot || !allowResume) return runPass({ io, allowResume, nowMs, ttlMs });
+  const beforeA = new Map(structuredClone(io.listRecords()).map(({ key, record }) => [key, record]));
   const a = await runPass({ io, allowResume: false, nowMs, ttlMs });
   // Detach the snapshot so even an in-place update during a PR read is detectable.
   const allRecords = structuredClone(io.listRecords());
@@ -127,8 +128,25 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
       if (typeof io.clearStoredRecordIf === 'function' && (await io.clearStoredRecordIf(key, record))?.cleared === true) cleared.push(key);
     } catch { /* Failed cleanup must not reserve admission capacity or stop live resumes. */ }
   }
-  // Closed waits with pending repair inventory stay on disk but cannot consume admission or wake.
-  const skipped = new Set([...stale, ...allOwed.filter(({ key }) => prFacts.get(key)?.open === false).map(({ key }) => key)]);
+  // Trust the pass's verdicts: other waits can still wake and must retain admission.
+  const unwakeable = new Map();
+  for (const row of a.rows ?? []) {
+    const reason = classifyUnwakeableWait(row);
+    // A verdict binds to the exact record phase A read; a record re-marked since is a new one and keeps admission.
+    const now = allOwed.find((e) => e.key === row.key)?.record;
+    // Re-read after the PR-state reads too: a re-mark during them replaces the record the verdict was about.
+    const live = io.listRecords().find((e) => e.key === row.key)?.record;
+    if (reason && now && beforeA.has(row.key) && isDeepStrictEqual(beforeA.get(row.key), now) && isDeepStrictEqual(live, now)) unwakeable.set(row.key, reason);
+  }
+  const excluded = [];
+  for (const { key, record } of allOwed) {
+    const reason = stale.has(key) ? 'stale' : prFacts.get(key)?.open === false ? 'closed-pr' : unwakeable.get(key);
+    if (!reason) continue;
+    excluded.push({ key, reason });
+    log(`await-verify: excluded from fix-slot admission ${key} (pr #${record.pr}): ${reason}`);
+  }
+  // Exclusion itself never clears the retained repair inventory.
+  const skipped = new Set(excluded.map(({ key }) => key));
   const records = allRecords.filter(({ key }) => !skipped.has(key));
   const owedFix = allOwed.filter(({ key }) => !skipped.has(key));
   const owedKeys = new Set(owedFix.map(({ key }) => key));
@@ -156,7 +174,10 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
   const pushedA = (r) => (r.result && r.result !== 'resume-paused' ? `${r.result}; ` : '');
   const rows = (a.rows ?? []).filter((r) => !skipped.has(r.key) && !wakeKeys.has(r.key) && !deferred.has(r.key));
   for (const { key, record } of allOwed) {
-    if (prFacts.get(key)?.open === false && !stale.has(key)) {
+    if (unwakeable.get(key) === 'resume-exhausted') {
+      rows.push({ key, pr: record.pr, who: record.who, action: 'resume', reason: 'resume-exhausted-excluded',
+        result: 'resume-exhausted; previous-head CI failures retained; operator recovery required (excluded from fix-slot admission)' });
+    } else if (prFacts.get(key)?.open === false && !stale.has(key)) {
       rows.push({ key, pr: record.pr, who: record.who, action: 'resume',
         reason: 'closed-pr-inventory-held', result: 'closed PR, failure inventory held' });
     }
@@ -175,7 +196,7 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
     if (misses >= 3) row.result = `${row.result}; missed ${misses}x`;
     rows.push(row);
   }
-  return { rows, admitted: admit, deferred: defer, cleared };
+  return { rows, admitted: admit, deferred: defer, cleared, excluded };
 }
 
 const latestFinite = (list) => { const ok = list.filter(Number.isFinite); return ok.length ? Math.max(...ok) : null; };
