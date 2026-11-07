@@ -204,3 +204,14 @@ describe('PR comment wake relevance', () => {
     expect(isRelevantEvent(e('changes_requested'), 'fix')).toBe(true);
   });
 });
+
+describe('isRelevantEvent — a caller-supplied rule (R689)', () => {
+  it('uses the supplied rule instead of the role table', () => {
+    const rule = (e) => e.type === 'x';
+    expect(isRelevantEvent({ type: 'x' }, 'some-pass', { rule })).toBe(true);
+    expect(isRelevantEvent({ type: 'y' }, 'some-pass', { rule })).toBe(false);
+  });
+  it('still honours the repo filter with a supplied rule', () => {
+    expect(isRelevantEvent({ type: 'x', repo: 'a/b' }, 'p', { rule: () => true, repos: ['c/d'] })).toBe(false);
+  });
+});

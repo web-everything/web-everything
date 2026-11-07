@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 import {
   runPassDaemonLoop, passDaemonLeaseKey, realSleep, DEFAULT_HEARTBEAT_INTERVAL_MS,
   PASS_DAEMON_SELF_SYNC_ENV, passDaemonSelfSyncEnabled, MAIN_ONLY_PASSES, spawnPassOnce,
-  waitForManifestEntry, passEnvFor,
+  waitForManifestEntry, passEnvFor, passSleepFor, PASS_EVENT_RULES,
 } from '../pass-daemon.mjs';
 import { DAEMON_MANIFEST } from '../daemon-manifest.mjs';
 import { withSelfSync, DAEMON_SELF_SYNC_BRANCH_ENV } from '../../../scripts/lib/daemon-self-sync.mjs';
@@ -443,5 +443,76 @@ describe('passEnvFor — the pass child env is read at spawn time (2026-10-09 pe
     const src = readFileSync(fileURLToPath(new URL('../pass-daemon.mjs', import.meta.url)), 'utf8');
     expect(src).not.toMatch(/const passEnv = \{ \.\.\.process\.env/);
     expect(src).toMatch(/env: passEnv\(\)/);
+  });
+});
+
+describe('passSleepFor — event-driven wake for passes that declare an eventRole (R689)', () => {
+  const quiet = { error() {} };
+  const feed = (events, { ok = true } = {}) => async () => (ok
+    ? { ok: true, events, cursor: 5, more: false, lastDeliveryAt: 1_000, lastEventAt: 1_000 }
+    : { ok: false, error: 'down' });
+  const clock = () => { let t = 1_000; return { now: () => t, rawSleep: async (ms) => { t += ms; } }; };
+  const cfgEnv = { WE_PR_EVENTS: '1', WE_PR_EVENTS_URL: 'https://feed.example/events', WE_PR_EVENTS_TOKEN: 'tok' };
+  const merged = { type: 'pull_request', action: 'closed', merged: true, repo: 'o/r', prs: [1] };
+  const base = (poll, extra = {}) => ({ env: cfgEnv, log: quiet, poll, ...clock(), ...extra });
+
+  it('a pass with a role wakes early on a matching event', async () => {
+    const entry = { script: 'x.mjs', intervalMs: 300_000, eventRole: 'pr-merge-watch' };
+    const sleep = passSleepFor('pr-merge-watch', entry, base(feed([merged])));
+    const r = await sleep(entry.intervalMs);
+    expect(r.woke).toBe(true);
+    expect(r.sleptMs).toBeLessThan(entry.intervalMs);
+  });
+
+  it('a pass with a role ignores a non-matching event and ticks on the timer (backstop)', async () => {
+    const entry = { script: 'x.mjs', intervalMs: 300_000, eventRole: 'pr-merge-watch' };
+    const other = { type: 'pull_request', action: 'closed', merged: false, repo: 'o/r', prs: [1] };
+    const r = await passSleepFor('pr-merge-watch', entry, base(feed([other])))(entry.intervalMs);
+    expect(r).toMatchObject({ woke: false, reason: 'interval' });
+    expect(r.sleptMs).toBe(entry.intervalMs);
+  });
+
+  it('a pass with no role keeps the plain timer', () => {
+    expect(passSleepFor('lease-reaper', { script: 'x.mjs', intervalMs: 1000 }, base(feed([merged])))).toBe(realSleep);
+  });
+
+  it('an unhealthy feed falls back to the timer', async () => {
+    const entry = { script: 'x.mjs', intervalMs: 300_000, eventRole: 'pr-merge-watch' };
+    const r = await passSleepFor('pr-merge-watch', entry, base(feed([], { ok: false })))(entry.intervalMs);
+    expect(r).toMatchObject({ woke: false, reason: 'interval', sleptMs: 300_000 });
+  });
+
+  it('a healthy feed does not stretch the pass interval', async () => {
+    const entry = { script: 'x.mjs', intervalMs: 300_000, eventRole: 'pr-merge-watch' };
+    const r = await passSleepFor('pr-merge-watch', entry, base(feed([])))(entry.intervalMs);
+    expect(r.sleptMs).toBe(300_000);
+  });
+
+  it('feature flag off keeps the plain timer', () => {
+    const entry = { script: 'x.mjs', intervalMs: 1000, eventRole: 'pr-merge-watch' };
+    expect(passSleepFor('pr-merge-watch', entry, { env: {}, log: quiet })).toBe(realSleep);
+  });
+
+  it('an unknown role fails closed to the plain timer', () => {
+    const entry = { script: 'x.mjs', intervalMs: 1000, eventRole: 'nope' };
+    expect(passSleepFor('p', entry, base(feed([merged])))).toBe(realSleep);
+  });
+
+  it('local rules: ci-red-recovery wakes on not-green, advisory-label-sweep on synchronize', () => {
+    expect(PASS_EVENT_RULES['ci-red-recovery']({ type: 'check_suite', conclusion: 'failure' })).toBe(true);
+    expect(PASS_EVENT_RULES['ci-red-recovery']({ type: 'check_run', conclusion: 'cancelled' })).toBe(true);
+    expect(PASS_EVENT_RULES['ci-red-recovery']({ type: 'check_suite', conclusion: 'success' })).toBe(false);
+    expect(PASS_EVENT_RULES['advisory-label-sweep']({ type: 'pull_request', action: 'synchronize' })).toBe(true);
+    expect(PASS_EVENT_RULES['advisory-label-sweep']({ type: 'pull_request', action: 'labeled' })).toBe(false);
+    expect(PASS_EVENT_RULES['pr-merge-watch']({ type: 'pull_request', action: 'closed', merged: false })).toBe(false);
+  });
+
+  it('merge-orphan uses the shared drain rule but its own status file (never the drain daemon status)', async () => {
+    const entry = { script: 'x.mjs', intervalMs: 300_000, eventRole: 'drain' };
+    const writes = [];
+    const drainEvt = { type: 'check_suite', action: 'completed', conclusion: 'success', repo: 'o/r', prs: [2] };
+    const r = await passSleepFor('merge-orphan-sweep', entry, base(feed([drainEvt]), { writeStatus: (st) => writes.push(st) }))(entry.intervalMs);
+    expect(r.woke).toBe(true);
+    expect(writes[0].role).toBe('merge-orphan-sweep');
   });
 });

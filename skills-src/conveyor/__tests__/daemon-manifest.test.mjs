@@ -266,3 +266,23 @@ it('R116 pr-merge-watch is an opt-in five-minute one-shot pass', () => {
     args: ['--repo=web-everything/web-everything'], intervalMs: 300000, defaultLaunch: false });
   expect(existsSync(join(REPO_ROOT, entry.script))).toBe(true);
 });
+
+describe('DAEMON_MANIFEST — eventRole (R689)', () => {
+  it('declares the event role on exactly the four event-driven passes', () => {
+    const roles = Object.fromEntries(Object.entries(DAEMON_MANIFEST).filter(([, e]) => e.eventRole).map(([n, e]) => [n, e.eventRole]));
+    expect(roles['merge-orphan-sweep']).toBe('drain');
+    expect(roles['pr-merge-watch']).toBe('pr-merge-watch');
+    for (const key of Object.keys(CONSTELLATION_REPOS)) {
+      expect(roles[`ci-red-recovery-watch-${key}`]).toBe('ci-red-recovery');
+      expect(roles[`advisory-label-sweep-${key}`]).toBe('advisory-label-sweep');
+    }
+    expect(Object.keys(roles).length).toBe(2 + 2 * Object.keys(CONSTELLATION_REPOS).length);
+  });
+  it('does not change those passes intervals', () => {
+    expect(DAEMON_MANIFEST['pr-merge-watch'].intervalMs).toBe(5 * 60_000);
+    expect(DAEMON_MANIFEST['merge-orphan-sweep'].intervalMs).toBe(15 * 60_000);
+  });
+  it('rejects a non-string eventRole', () => {
+    expect(() => assertValidManifestEntry('x', { script: 'a.mjs', intervalMs: 1, eventRole: 5 })).toThrow(/eventRole/);
+  });
+});
