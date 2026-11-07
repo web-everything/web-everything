@@ -1,15 +1,16 @@
 ---
+bornAs: xippm6f
 kind: story
-size: 3
+size: 2
 status: open
-scope: ["we:scripts/operations/review-pr-io.mjs", "we:scripts/operations/red-team-gate-apply.mjs", "we:scripts/lib/red-team-gate.mjs"]
+scope: ["we:scripts/merge-ai-prs.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# A transient read failure of the review-round ledger becomes a permanent round-cap hand-over to the operator
+# gh failure after a successful direct merge is recorded as a failed merge and its follow-up is lost
 
-Flow-sim gap B-C5, class K5 (transient read failure becomes a permanent decision). Failing input: Labels: review:accepted. Trusted red-team result on HEAD with a confirmed `broken` finding; no gate marker. Round is well under the cap. gate runs while the verdict ledger read fails (gh throttle, network, malformed row). Cited: we:scripts/operations/review-pr-io.mjs:401-408, we:scripts/operations/red-team-gate-apply.mjs:161, we:scripts/lib/red-team-gate.mjs:390-435. Soak-break sketch: wrong-clear of the automatic send-back (fixer is not dispatched; PR parked for an operator ruling via record-red-team-ruling) caused by a transient failure, never reconsidered
+Flow-sim gap D-C7, class K5 (transient read failure becomes a permanent decision). Failing input: non-local repo PR passes all gates; gh pr merge succeeded server-side but the CLI call throws (network drop / throttle after the response) ' 'the post-throw re-probe isPrAlreadyMerged also hits a gh miss Cited: we:scripts/merge-ai-prs.mjs:7287, we:scripts/merge-ai-prs.mjs:7351, we:scripts/merge-ai-prs.mjs:5110-5117, we:scripts/merge-ai-prs.mjs:7384, we:scripts/merge-ai-prs.mjs:7148. Soak-break sketch: none
 
 ## Acceptance
 
