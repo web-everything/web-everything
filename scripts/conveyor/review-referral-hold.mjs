@@ -32,7 +32,8 @@ export const GH_LIST_COMMENT_CAP = 100;
  * live re-read (empty `pending`) is what answers them. Failure tokens are deliberately absent and stay fail-closed:
  * `referral-persistence-failed` (nothing live re-derives a lost persist; it has its own retry path),
  * `malformed-referral-record` and `unreadable-referral-result` (the run's own findings are unknown, so its cached keys
- * cannot be trusted as complete). */
+ * cannot be trusted as complete), and `referral-overflow` (added after the live read for a withheld ruling; nothing
+ * live re-derives it). */
 export const PENDING_REASON_TOKENS = Object.freeze(new Set(['author-stamp-missing',
   'malformed-operator-ruling', 'unavailable-reviewed-head', 'wrong-subject']));
 export const REFERRAL_RETRY_MS = [15, 30, 60].map(n => n * 60_000);

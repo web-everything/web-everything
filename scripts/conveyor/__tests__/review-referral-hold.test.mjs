@@ -413,7 +413,7 @@ describe('same-head review loop regression (live #202)', () => {
       expect(hold(pr(), [row])).not.toBeNull();
     });
 
-  it.each(['referral-persistence-failed', 'malformed-referral-record', 'unreadable-referral-result'])(
+  it.each(['referral-persistence-failed', 'malformed-referral-record', 'unreadable-referral-result', 'referral-overflow'])(
     'keeps the failure token %s out of the reason set', token => {
       expect(PENDING_REASON_TOKENS.has(token)).toBe(false);
     });
@@ -421,10 +421,16 @@ describe('same-head review loop regression (live #202)', () => {
   // Drift guard: a new run-level reason pushed by jury-core must be classified here (reason vs fail-closed failure),
   // or a fully ruled refused run would silently never resume again.
   it('classifies every literal reason token jury-core pushes onto the referral pending list', () => {
-    const src = readFileSync(join(process.cwd(), 'scripts/lib/jury-core.mjs'), 'utf8');
-    const produced = new Set([...src.matchAll(/pending\.push\('([a-z]+(?:-[a-z]+)+)'\)|const pending = malformed \? \['([a-z]+(?:-[a-z]+)+)'\]/g)]
-      .map(m => m[1] ?? m[2]));
-    const failureTokens = new Set(['malformed-referral-record']);
+    // Every file that builds a referral pending list, and every literal shape it uses: push/unshift, an object-literal
+    // `pending: ['…']`, and an assigned or defaulted `pending… = … ['…']` / `?? ['…']` (any quote style).
+    const sources = ['scripts/lib/jury-core.mjs', 'scripts/operations/review-pr-io.mjs', 'scripts/operations/review-pr.mjs'];
+    const token = String.raw`['"\x60]([a-z]+(?:-[a-z]+)+)['"\x60]`;
+    const shapes = new RegExp(String.raw`\bpending(?:Referrals)?\b(?:\.(?:push|unshift)\(|\s*:\s*\[|\s*=[^;\n]*?\[|\s*\?\?\s*\[)\s*${token}`, 'g');
+    const produced = new Set(sources.flatMap(file => [...readFileSync(join(process.cwd(), file), 'utf8').matchAll(shapes)]
+      .map(m => m[1])));
+    // `referral-overflow` is pushed after the live read (a ruling withheld for size), so nothing live re-derives it.
+    const failureTokens = new Set(['malformed-referral-record', 'referral-persistence-failed', 'unreadable-referral-result',
+      'referral-overflow']);
     expect([...produced].sort()).toEqual([...PENDING_REASON_TOKENS, ...failureTokens].sort());
   });
   it.each(['referral-persistence-failed', 'malformed-referral-record', 'unreadable-referral-result'])
