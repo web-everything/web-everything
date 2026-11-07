@@ -243,9 +243,21 @@ const VALID = Object.freeze({ verdictMode: enumOf('verdictMode'), preExistingMod
   recheckMax: validCount, baseRecheckMax: validCount, requireOnMain: v => typeof v === 'boolean', requirePayBy: v => typeof v === 'boolean' });
 
 function readFile(path, read) {
-  try { const v = JSON.parse(read(path, 'utf8')); return isObj(v) && isObj(v.audit) ? { tool: v.audit } : { tool: null, unreadable: true }; }
-  catch { return { tool: null, unreadable: true }; }
+  try {
+    const v = JSON.parse(read(path, 'utf8'));
+    return isObj(v) && isObj(v.audit) && auditVariants(v).length === 0 ? { tool: v.audit } : { tool: null, unreadable: true };
+  } catch { return { tool: null, unreadable: true }; }
 }
+/**
+ * Top-level keys that are not exactly `audit` but fold to it (`Audit`, `audit` plus a zero-width space, fullwidth
+ * letters). The reader only ever reads `audit`, so such a key's settings would be dropped with no warning; the caller
+ * treats the section as unreadable instead (PR #6381 judge). Folded like a setting key (`foldKey`).
+ */
+function auditVariants(obj) {
+  return isObj(obj) ? Object.keys(obj).filter(k => k !== 'audit' && foldKey(k) === 'audit') : [];
+}
+// A key for a warning: JSON-quoted, with every non-printable-ASCII character escaped so an invisible one shows.
+const showKey = k => JSON.stringify(k).replace(/[^\x20-\x7e]/gu, c => `\\u${c.codePointAt(0).toString(16).padStart(4, '0')}`);
 const SECTION_PATHS = Object.freeze({ __proto__: null, verdictMode: ['verdict', 'mode'], preExistingMode: ['preExisting', 'mode'],
   baseRecheckMax: ['preExisting', 'baseRecheckMax'], recheckMax: ['recheck', 'max'], requireOnMain: ['cards', 'requireOnMain'],
   requirePayBy: ['cards', 'requirePayBy'] });
@@ -384,13 +396,21 @@ function resolveUnguarded({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync,
       const before = configuredBad();
       const { prefs, errors } = readPlatformPreferences({ env: snap, readFile: platformRead, warn: () => {} });
       plat = prefs.audit;
-      platUnreadable = before || configuredBad() || errors.length > 0 || (Object.hasOwn(prefs, 'audit') && prefs.audit === null);
+      // A key that only folds to `audit` (`Audit`, `audit` plus a zero-width space) is a section the reader drops
+      // unseen: every platform read below fails closed on one, with a warning naming it (PR #6381 judge).
+      const variantSeen = new Set();
+      const shadowed = obj => {
+        const keys = auditVariants(obj);
+        for (const k of keys) if (!variantSeen.has(k)) { variantSeen.add(k); warn(`audit platform preference key ${showKey(k)} is a variant of "audit"; the section is unreadable`); }
+        return keys.length > 0;
+      };
+      platUnreadable = before || configuredBad() || errors.length > 0 || (Object.hasOwn(prefs, 'audit') && prefs.audit === null) || shadowed(prefs);
       // The default chain env: the override removed. Each chain file is read on its own through the same reader.
       const chainEnv = { ...snap }; delete chainEnv[PLATFORM_PREFERENCES_ENV];
       for (const p of [...LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH, operatorPreferencesPath(chainEnv)]) {
         const one = readPlatformPreferences({ env: { ...chainEnv, [PLATFORM_PREFERENCES_ENV]: p }, readFile: platformRead, warn: () => {} });
         // A file unreadable here, or one whose present `audit` is not an object, is a choice we cannot read.
-        if (one.errors.length > 0 || (Object.hasOwn(one.prefs, 'audit') && !isObj(one.prefs.audit))) platUnreadable = true;
+        if (one.errors.length > 0 || (Object.hasOwn(one.prefs, 'audit') && !isObj(one.prefs.audit)) || shadowed(one.prefs)) platUnreadable = true;
         if (isObj(one.prefs.audit)) chainFiles.push(one.prefs.audit);
       }
       if (configured !== '') {
@@ -402,7 +422,7 @@ function resolveUnguarded({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync,
         const chain = readPlatformPreferences({ env: chainEnv, readFile: platformRead, warn: () => {} });
         chainPlat = chain.prefs.audit;
         // Read as it would be with no override: an unreadable chain or a present non-object `audit` fails closed.
-        if (chain.errors.length > 0 || (Object.hasOwn(chain.prefs, 'audit') && !isObj(chainPlat))) platUnreadable = true;
+        if (chain.errors.length > 0 || (Object.hasOwn(chain.prefs, 'audit') && !isObj(chainPlat)) || shadowed(chain.prefs)) platUnreadable = true;
         // The chain's single-value settings are a floor too: the override may only tighten them (PR #6381 self-review).
         if (!platUnreadable && isObj(chainPlat)) plat = tightenToChain(plat, chainPlat);
       }

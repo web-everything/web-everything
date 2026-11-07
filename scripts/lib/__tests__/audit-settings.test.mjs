@@ -179,6 +179,39 @@ describe('audit settings (R528)', () => {
       const bad = { 'delivery-platform-preferences.json': '{"audit":{"recheck":{"max":"x"}}}' };
       expect(fromDisk(prefs('any.json', '{"audit":{}}'), {}, bad).value.recheckMax).toBe(0);
     });
+    // PR #6381 judge (R10): a platform key `Audit`, or `audit` with an invisible character, was ignored, so its stricter
+    // preferences (releaseStage prod, protected paths) were dropped with no warning. It now fails closed.
+    describe('a platform key that only normalises to "audit" fails closed (PR #6381 judge)', () => {
+      const variants = ['Audit', 'audit​', 'AUDIT', '​audit', 'au­dit', 'ａudit', ' audit'];
+      const body = (key, extra = '') => `{${extra}${JSON.stringify(key)}:{"releaseStage":"prod","raceBlockPaths":["custom/**"]}}`;
+      const fromChain = chain => resolveAuditSettings({ fileRead: file(full()), env: {}, platformRead: platformRead('', chain), log: () => {} });
+      it.each(variants)('the default-chain platform key %j resolves strictest with a warning', key => {
+        for (const extra of ['', '"audit":{},']) {
+          const r = fromChain({ 'delivery-platform-preferences.json': body(key, extra) });
+          expect(r.value).toMatchObject(STRICT);
+          expect(r.value.raceBlockPaths).toEqual(STRICT_PATHS);
+          expect(r.warnings.join()).toMatch(/platform preference unreadable/);
+          expect(r.warnings.join()).toMatch(/variant of "audit"/);
+        }
+      });
+      it.each(variants)('an override file with the key %j beside "audit" resolves strictest with a warning', key => {
+        const r = fromDisk(prefs('variant.json', body(key, '"audit":{},')), full());
+        expect(r.value).toMatchObject(STRICT);
+        expect(r.warnings.join()).toMatch(/variant of "audit"/);
+      });
+      it('the trusted tool file with a variant key beside "audit" is unreadable, so strictest', () => {
+        const r = resolveAuditSettings({ fileRead: () => JSON.stringify({ audit: full(), Audit: { releaseStage: 'prod' } }), platform: null, env: {}, log: () => {} });
+        expect(r.value).toMatchObject(STRICT);
+      });
+      it('a plain "audit" key and unrelated keys still read normally', () => {
+        // The tool file sets no releaseStage here, so the platform value is the one that applies.
+        const r = resolveAuditSettings({ fileRead: file({}), env: {}, log: () => {},
+          platformRead: platformRead('', { 'delivery-platform-preferences.json': '{"audits":{},"auditor":1,"audit":{"releaseStage":"prod"}}' }) });
+        expect(r.value.releaseStage).toBe('prod');
+        expect(r.sources.releaseStage).toBe('platform');
+        expect(r.warnings).toEqual([]);
+      });
+    });
     it('platform path lists are unioned with the tool file lists, never replaced by them (PR #6381 judge)', () => {
       const r = fromDisk(prefs('lists.json', '{"audit":{"raceBlockPaths":["plat-race/**"],"guardFloorPaths":["plat-guard/**"]}}'),
         full({ raceBlockPaths: ['tool-race/**'], guardFloorPaths: ['tool-guard/**'] }));

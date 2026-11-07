@@ -216,6 +216,34 @@ describe('R473 pure classified verdict', () => {
       }
     }
   });
+  // PR #6381 judge (R10): a trailing-slash pattern holding a wildcard (`custom/**/`) was matched as a literal prefix, so
+  // it protected nothing and a D3 race or an E finding there cleared. It now matches like the same glob without it.
+  const d3 = file => finding({ class: 'D3', file, invariant: 'One writer owns the record',
+    trigger: 'A reads the record; B writes it; A writes over it', consequence: 'B\'s write is lost', interleaving });
+  it('a D3 finding on custom/writers/save.mjs with raceBlockPaths [custom/**/] is WEAKENED (PR #6381 judge)', async () => {
+    for (const pattern of ['custom/**/', 'custom/*/', 'custom/**//', 'custom/']) {
+      const result = await compute([d3('custom/writers/save.mjs')], options('prerelease'), trustedLayer({ raceBlockPaths: [pattern] }));
+      expect(result.verdict, pattern).toBe('WEAKENED');
+      expect(result.ships, pattern).toEqual([]);
+      // A caller-added pattern is matched the same way.
+      expect((await compute([d3('custom/writers/save.mjs')], options('prerelease', { raceBlockPaths: [pattern] }))).verdict, pattern).toBe('WEAKENED');
+    }
+    // `custom/**/` matches like `custom/**`, so a file directly under custom/ is protected too.
+    expect((await compute([d3('custom/save.mjs')], options('prerelease'), trustedLayer({ raceBlockPaths: ['custom/**/'] }))).verdict).toBe('WEAKENED');
+    // Control: the same finding outside the pattern ships.
+    expect((await compute([d3('other/writers/save.mjs')], options('prerelease'), trustedLayer({ raceBlockPaths: ['custom/**/'] }))).verdict).toBe('NOT WEAKENED');
+  });
+  it('an E2 finding with guardFloorPaths [custom/**/] is WEAKENED (PR #6381 judge)', async () => {
+    for (const pattern of ['custom/**/', 'custom/*/', 'custom/**//']) {
+      const f = finding({ class: 'E2', file: 'custom/writers/save.mjs' });
+      const result = await compute([f], options('prerelease'), trustedLayer({ guardFloorPaths: [pattern] }));
+      expect(result.verdict, pattern).toBe('WEAKENED');
+      expect(ids(result.blocks), pattern).toContain('f1');
+      expect((await compute([f], options('prerelease', { guardFloorPaths: [pattern] }))).verdict, pattern).toBe('WEAKENED');
+    }
+    expect((await compute([finding({ class: 'E2', file: 'other/x.mjs' })], options('prerelease'), trustedLayer({ guardFloorPaths: ['custom/**/'] }))).verdict)
+      .toBe('NOT WEAKENED');
+  });
   // PR #6381 judge: WE_PLATFORM_PREFERENCES_FILE replaced the whole platform chain, so a race path the default chain
   // protects was dropped and a D3 race there cleared once the override pointed anywhere else.
   it('a D3 race in a default-chain protected path stays WEAKENED under a platform-file override (PR #6381 judge)', async () => {

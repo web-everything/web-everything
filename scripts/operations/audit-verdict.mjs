@@ -39,12 +39,22 @@ export function validFinding(f) {
 
 /**
  * Literal globs: * matches within one segment, a run of two or more * spans directories, every other character is
- * literal; a trailing / is a prefix. Matched by a bitset state walk (bit i = "pattern token i is next"), never a
- * backtracking regex (PR #6381: nested `**` made a regex take exponential time). Cost is a few bitset operations
- * per path character; path and pattern lengths are bounded upstream.
+ * literal; a trailing / is a directory prefix. Matched by a bitset state walk (bit i = "pattern token i is next"),
+ * never a backtracking regex (PR #6381: nested `**` made a regex take exponential time). Cost is a few bitset
+ * operations per path character; path and pattern lengths are bounded upstream.
  */
 function matchesPath(file, pattern) {
-  if (pattern.endsWith('/')) return file.startsWith(pattern);
+  if (pattern.endsWith('/')) {
+    // A literal directory stays a plain prefix. One holding a wildcard (`custom/**/`, `custom/*/`) was a literal
+    // prefix too, so it protected nothing (PR #6381 judge): it now matches like the same glob without the trailing
+    // slashes, or anything under what that glob matches. Matching more only ever protects more.
+    if (!pattern.includes('*')) return file.startsWith(pattern);
+    const dir = pattern.replace(/\/+$/, '');
+    return globMatch(file, dir) || globMatch(file, `${dir}/**`);
+  }
+  return globMatch(file, pattern);
+}
+function globMatch(file, pattern) {
   const lit = new Map(); let star = 0n; let globstar = 0n; let n = 0n;
   for (let i = 0; i < pattern.length; n++) {
     const bit = 1n << n;
