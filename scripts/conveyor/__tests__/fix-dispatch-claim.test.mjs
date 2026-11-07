@@ -1728,6 +1728,74 @@ describe('absent dead claim recovery', () => {
     expect(readFixDispatchClaim(key())).not.toBeNull();
   });
 
+  it.each(['failed', 'unknown', 'throws', 'promise', 'rejected'])('renews unresolved salvage %s past the original TTL and reports it once', status => {
+    acquire(); sweep(T0 + 1000);
+    const events = [];
+    const extra = { recordEvent: e => events.push(e), salvageFor: () => {
+      if (status === 'throws') throw Error('salvage');
+      if (status === 'promise') return Promise.resolve({ status: 'salvaged' });
+      if (status === 'rejected') return Promise.reject(Error('salvage'));
+      return { status };
+    } };
+    sweep(T0 + 601_000, extra);
+    sweep(T0 + 602_000, extra);
+    expect(readFixDispatchClaim(key()).heartbeatAt).toBe(iso(T0 + 602_000));
+    expect(acquireFixDispatchClaim({ ...key(), owner: 'other', nowMs: T0 + 603_000, nowIso: iso(T0 + 603_000) }).ok).toBe(false);
+    sweep(T0 + MAX_FIX_DISPATCH_CLAIM_REFRESH_MS + 1, extra);
+    expect(readFixDispatchClaim(key()).heartbeatAt).toBe(iso(T0 + MAX_FIX_DISPATCH_CLAIM_REFRESH_MS + 1));
+    expect(events).toMatchObject([{ kind: 'stuck-session', detail: { reason: 'salvage-failed' } }]);
+  });
+
+  it.each(['absent', 'quiet'])('renews %s unknown pid proof and preserves dedupe across reentrant acquire but resets for a new session', mode => {
+    acquire();
+    const events = [];
+    const extra = { identity: () => ({ alive: null }), recordEvent: e => events.push(e),
+      activityMsFor: () => T0, hungThresholdMs: 60_000,
+      listAgentsAll: () => mode === 'absent' ? [] : [
+        { name: 'fix-6319', sessionId: 'session-1', pid: 68715, state: 'idle', startedAt: T0 }] };
+    const at = T0 + 9 * 60_000;
+    sweep(at, extra);
+    const flag = readFixDispatchClaim(key()).meta.stuckEmitted;
+    expect(flag).toMatchObject({ key: expect.any(String), reason: 'proof-unknown' });
+    expect(acquireFixDispatchClaim({ ...key(), owner: 'Mac:68715', nowMs: at + 1, nowIso: iso(at + 1) }).ok).toBe(true);
+    expect(readFixDispatchClaim(key()).meta.stuckEmitted).toEqual(flag);
+    sweep(at + 2, extra);
+    expect(acquireFixDispatchClaim({ ...key(), owner: 'other', nowMs: T0 + 601_000, nowIso: iso(T0 + 601_000) }).ok).toBe(false);
+    expect(events).toMatchObject([{ kind: 'stuck-session', detail: { reason: 'proof-unknown' } }]);
+    acquireFixDispatchClaim({ ...key(), owner: 'Mac:68715', sessionId: 'session-1', nowMs: at + 3, nowIso: iso(at + 3) });
+    expect(readFixDispatchClaim(key()).meta.stuckEmitted).toBeUndefined();
+    sweep(at + 4, extra);
+    expect(events).toHaveLength(2);
+  });
+
+  it.each(['reachability-failed', 'enumeration-failed', 'oversized', 'missing-bundle-tip'])('keeps and renews the claim when local branch proof is %s despite a clean salvage result', mode => {
+    acquire(); sweep(T0 + 1000);
+    const pool = join(claimRoot, 'pools');
+    const dir = join(pool, 'web-everything', 'lane-9');
+    mkdirSync(join(dir, '.git'), { recursive: true });
+    writeFileSync(join(dir, '.git', '.lane-lease'), JSON.stringify({ ownerSession: 'fix-6319' }));
+    vi.stubEnv('LANE_POOL_ROOT', pool);
+    const state = vi.spyOn(laneHistory, 'laneStateSnapshot').mockReturnValue({ unpushed: false });
+    const salvage = vi.spyOn(laneSalvage, 'salvageLane').mockReturnValue({ bundle: mode === 'missing-bundle-tip' ? 'incomplete.bundle' : null });
+    const exec = execFileSyncThrottled.getMockImplementation();
+    const git = execFileSyncThrottled.mockClear().mockImplementation((file, args) => {
+      expect(file).toBe('git');
+      if (mode === 'enumeration-failed') throw Error('enumeration unavailable');
+      if (args.includes('for-each-ref')) return 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/heads/unpublished\n'.repeat(mode === 'oversized' ? 1025 : 1);
+      if (mode === 'missing-bundle-tip' && args.includes('rev-list')) return 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n';
+      if (mode === 'missing-bundle-tip' && args.includes('bundle')) return 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb refs/salvage/other\n';
+      throw Error('reachability unavailable');
+    });
+    const events = [];
+    try {
+      expect(sweep(T0 + 601_000, { salvageFor: undefined, recordEvent: e => events.push(e) }).released ?? []).toEqual([]);
+      expect(git).toHaveBeenCalled();
+      expect(readFixDispatchClaim(key()).heartbeatAt).toBe(iso(T0 + 601_000));
+      expect(acquireFixDispatchClaim({ ...key(), owner: 'other', nowMs: T0 + 602_000, nowIso: iso(T0 + 602_000) }).ok).toBe(false);
+      expect(events).toMatchObject([{ kind: 'stuck-session', detail: { reason: 'salvage-failed' } }]);
+    } finally { git.mockImplementation(exec); state.mockRestore(); salvage.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
   it.each([true, false, null])('uses the existing salvage helper for discovered lease work state %s', unpushed => {
     acquire();
     const pool = join(claimRoot, 'pools');
@@ -1735,6 +1803,11 @@ describe('absent dead claim recovery', () => {
     mkdirSync(join(dir, '.git'), { recursive: true });
     writeFileSync(join(dir, '.git', '.lane-lease'), JSON.stringify({ ownerSession: 'fix-6319' }));
     vi.stubEnv('LANE_POOL_ROOT', pool);
+    const git = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    git('init', '-b', 'main');
+    git('config', 'user.name', 'Test'); git('config', 'user.email', 'test@example.invalid');
+    git('commit', '--allow-empty', '-m', 'published');
+    git('update-ref', 'refs/remotes/origin/main', 'HEAD');
     const state = vi.spyOn(laneHistory, 'laneStateSnapshot').mockReturnValue({ unpushed });
     const salvage = vi.spyOn(laneSalvage, 'salvageLane').mockReturnValue({ bundle: 'verified.bundle' });
     try {
@@ -1858,6 +1931,17 @@ describe('absent dead claim recovery', () => {
     expect(readFixDispatchClaim(key()).meta.idleHead).toBeUndefined();
   });
 
+  it('migrates the persisted boolean dedupe through same-owner acquire without repeating the quiet-holder alert', () => {
+    acquire(); meta({ stuckEmitted: true });
+    acquireFixDispatchClaim({ ...key(), owner: 'Mac:68715', nowMs: T0 + 1000, nowIso: iso(T0 + 1000) });
+    expect(readFixDispatchClaim(key()).meta.stuckEmitted).toMatchObject({ key: expect.any(String), reason: 'quiet-holder' });
+    const events = [];
+    sweep(T0 + 91 * 60_000, { identity: () => ({ alive: true }), activityMsFor: () => T0,
+      hungThresholdMs: 60_000, recordEvent: e => events.push(e),
+      listAgentsAll: () => [{ name: 'fix-6319', pid: 68715, state: 'idle', startedAt: T0 }] });
+    expect(events).toEqual([]);
+  });
+
   it('rechecks ownership immediately before persisting stuck-session dedupe', () => {
     acquire();
     const events = [];
@@ -1906,6 +1990,6 @@ describe('absent dead claim recovery', () => {
     expect(sweep(T0 + 60 * 60_000, extra).released ?? []).toEqual([]);
     expect(sweep(T0 + 91 * 60_000, extra).released ?? []).toEqual([]);
     expect(events.filter(e => e.kind === 'stuck-session')).toHaveLength(1);
-    expect(readFixDispatchClaim(key()).meta.stuckEmitted).toBe(true);
+    expect(readFixDispatchClaim(key()).meta.stuckEmitted).toMatchObject({ key: expect.any(String), reason: 'quiet-holder' });
   });
 });

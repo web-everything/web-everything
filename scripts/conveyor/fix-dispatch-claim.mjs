@@ -88,6 +88,7 @@ import { listWrappedWorkerAgents } from '../operations/worker-wrapper-launch.mjs
 import { startedAtMs } from './reconcile-core.mjs';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join as joinPath, basename } from 'node:path';
+import { laneGitHardeningEnv, hardenLaneGitArgs } from '../lib/lane-git-hardening.mjs';
 
 /** Newest activity (ms) of the holder: the SAME transcript-tail read the hung detector uses for the main transcript
  *  (so a missing, unreadable or partly unparseable transcript is unknown, exactly as `readHungInfo` treats it), and the
@@ -181,6 +182,29 @@ function salvageAbsentClaim(entry, { name, nowMs }) {
     const saved = salvageLane({ dir, lane, pool: basename(dirname(dir)), branchRef: 'origin/main',
       now: new Date(nowMs), reason: 'absent-session-dead', meta: { owner: entry.owner }, includeLocalBranches: true });
     if (!saved || (!saved.bundle && (state.unpushed || saved.bundle !== null))) return { status: 'unknown' };
+    // salvageLane historically treats a failed local-ref reachability probe as zero unique
+    // commits. Independently prove publication or exact bundle coverage before releasing.
+    // Bounds/failures retain the claim and surface salvage-failed for operator investigation.
+    const git = args => execFileSyncThrottled('git', hardenLaneGitArgs(args), {
+      cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 10_000, maxBuffer: 8 * 1024 * 1024, env: laneGitHardeningEnv(process.env),
+    }).trim();
+    const refs = git(['for-each-ref', '--format=%(objectname) %(refname)', 'refs/heads', 'refs/stash']);
+    const lines = refs ? refs.split('\n') : [];
+    if (lines.length > 1024 || lines.some(line => !/^(?:[a-f0-9]{40}|[a-f0-9]{64}) refs\/(?:heads\/.+|stash)$/.test(line))) return { status: 'unknown' };
+    const tips = [...new Set(lines.map(line => line.split(' ')[0]))];
+    if (tips.length) {
+      const unique = git(['rev-list', ...tips, '--not', '--remotes']);
+      const commits = unique ? unique.split('\n') : [];
+      if (commits.some(sha => !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(sha))) return { status: 'unknown' };
+      const unpublishedCommits = new Set(commits);
+      const unpublished = tips.filter(sha => unpublishedCommits.has(sha));
+      if (unpublished.length) {
+        if (!saved.bundle) return { status: 'unknown' };
+        const bundled = new Set(git(['bundle', 'list-heads', saved.bundle]).split('\n').map(line => line.split(' ')[0]));
+        if (unpublished.some(sha => !bundled.has(sha))) return { status: 'unknown' };
+      }
+    }
   }
   return { status: dirs.size ? 'salvaged' : 'clean' };
 }
@@ -233,6 +257,10 @@ export function fixDispatchClaimOwner({ host = hostname(), pid = process.pid } =
   return `${host}:${pid}`;
 }
 
+function stuckSessionKey(resource, meta) {
+  return `${resource}:${meta.claimedAt ?? ''}:${meta.sessionId || meta.who || resource}`;
+}
+
 /**
  * Take the claim for one `(repo, kind, pr)`. Atomic (`O_EXCL` mkdir, via {@link reserve}) across separate
  * processes with no daemon of its own; a stale (TTL-expired) claim is reclaimed automatically — see this
@@ -266,6 +294,13 @@ export function acquireFixDispatchClaim({
     // Card 87 — this fix runs in a BORROWED builder slot (`{executor, reason}`); the build daemon counts it there.
     ...(borrowed && typeof borrowed === 'object' && borrowed.executor ? { borrowed: { executor: String(borrowed.executor), reason: String(borrowed.reason ?? 'borrowed-build-slot') } } : {}),
   };
+  if (prior?.owner === owner) {
+    const key = stuckSessionKey(resource, meta);
+    if (prior.meta?.stuckEmitted?.key === key) meta.stuckEmitted = prior.meta.stuckEmitted;
+    else if (prior.meta?.stuckEmitted === true && stuckSessionKey(resource, prior.meta) === key) {
+      meta.stuckEmitted = { key, reason: 'quiet-holder' }; // migrate the historical boolean dedupe
+    }
+  }
   // `pidLiveness` is ALWAYS 'unknown' — see this file's own header for why a fast PID-dead reclaim would be
   // actively wrong here (the acquiring dispatcher's own exit is expected completion, not a crash).
   const result = reserve(lockRoot, resource, owner, nowMs, nowIso, pid, 'unknown', leaseMinutes, meta);
@@ -278,6 +313,8 @@ function readUnchangedClaim(lockRoot, resource, expected) {
   const current = readLockEntry(lockRoot, resource);
   return current && current.owner === expected.owner
     && current.meta?.claimedAt === expected.meta?.claimedAt
+    && current.meta?.sessionId === expected.meta?.sessionId
+    && current.meta?.who === expected.meta?.who
     && current.meta?.runnerPid === expected.meta?.runnerPid ? current : null;
 }
 
@@ -403,9 +440,10 @@ export const MAX_IDLE_CLAIM_OBSERVATION_GAP_MS = 20 * 60_000;
  *  - HUNG: every candidate agent row is first run through `hung-session.mjs#readHungInfo` (injectable as
  *    `hungInfoFor`) — the SAME detector `reconcile-pass.mjs` feeds `markHungSessions` — so a session stuck at
  *    `state: 'working'` with a stale transcript is not "live" here either.
- *  - CEILING: past {@link MAX_FIX_DISPATCH_CLAIM_REFRESH_MS} since `meta.claimedAt`, a claim is never refreshed.
+ *  - CEILING: past {@link MAX_FIX_DISPATCH_CLAIM_REFRESH_MS} since `meta.claimedAt`, confirmed live-session refresh stops.
+ *    Unknown pid proof and unresolved absent-session salvage retain their lease for operator investigation.
  *  - OWNERSHIP: after all identity probes, the entry is RE-READ immediately before each heartbeat/release and
- *    skipped unless owner, claimedAt and runnerPid still match the probed entry. A replaced dispatch or newly
+ *    skipped unless owner, claimedAt, holder session and runnerPid still match the probed entry. A replaced dispatch or newly
  *    stamped runner is skipped, not overwritten/released. (Read-then-write, not atomic: the residual window is
  *    the microseconds between that re-read and the write.)
  *  - A session judged hung, or older than the ceiling, deliberately LOSES its claim to the plain TTL — so a
@@ -475,10 +513,7 @@ export function refreshLiveFixDispatchClaims({
     };
     if (!Array.isArray(listed) || listed.incomplete) { resetAbsent(); clearClaimIdleHead(lockRoot, resource, entry); continue; }
 
-    if (Number.isFinite(claimedMs) && nowMs - claimedMs > MAX_FIX_DISPATCH_CLAIM_REFRESH_MS) {
-      clearClaimIdleHead(lockRoot, resource, entry);
-      continue;
-    }
+    const pastCeiling = Number.isFinite(claimedMs) && nowMs - claimedMs > MAX_FIX_DISPATCH_CLAIM_REFRESH_MS;
     // fix-procedure (`kind:'fixing'`, `we:scripts/conveyor/fix-procedure.mjs`): the holder's session name is
     // `meta.who`, not a minted slug — minting one would THROW on the unknown kind and crash this whole sweep.
     // A claim whose name cannot be resolved is skipped (left to its own TTL), never thrown over.
@@ -489,10 +524,28 @@ export function refreshLiveFixDispatchClaims({
       clearClaimIdleHead(lockRoot, resource, entry);
       continue;
     }
+    // Unknown proof / unresolved salvage keeps its lease, even beyond the normal live-session
+    // ceiling. Persist the alert before emitting it; refreshed still reports confirmed live holders.
+    const keepStuck = reason => {
+      const heartbeatAt = nowIso();
+      const current = readUnchangedClaim(lockRoot, resource, entry);
+      if (!current) return false;
+      const meta = { ...current.meta };
+      const key = stuckSessionKey(resource, meta);
+      const emit = meta.stuckEmitted?.key !== key && meta.stuckEmitted !== true;
+      if (meta.stuckEmitted?.key !== key) meta.stuckEmitted = { key, reason };
+      delete meta.idleHead;
+      if (!readUnchangedClaim(lockRoot, resource, entry)) return false;
+      if (!heartbeat(lockRoot, resource, current.owner, heartbeatAt, current.pid ?? null, meta)) return false;
+      if (emit) recordIdleRelease({ kind: 'stuck-session', repo, pr, daemon: 'reconcile-fix-dispatch',
+        detail: { kind, owner: entry.owner, reason } }, recordEvent);
+      return true;
+    };
     // A BORROWED (non-Claude) fix, or (117 S3b) a Claude fix / ci-heal run through the detached worker wrapper, has no
     // `claude agents` row: its liveness is its runner pid. Dead -> release now, with a reason; alive -> heartbeat.
     // (No pid stamped yet -> falls through to the plain TTL like any new claim.)
     if (Number.isInteger(entry.meta.runnerPid)) {
+      if (pastCeiling) { clearClaimIdleHead(lockRoot, resource, entry); continue; }
       resetAbsent();
       let identityReason = null;
       const probeIdentity = (pid, expectations) => {
@@ -554,7 +607,7 @@ export function refreshLiveFixDispatchClaims({
     if (quietUnknownHolder) {
       // Unknown pid proof cannot enter idle release or establish continued absence.
       resetAbsent();
-      clearClaimIdleHead(lockRoot, resource, entry);
+      keepStuck('proof-unknown');
       continue;
     }
     if (quietAliveHolder) {
@@ -572,6 +625,7 @@ export function refreshLiveFixDispatchClaims({
           cwd: entry.meta.laneDir || entry.meta.lanePath || entry.meta.lane?.path || '' }, { pr })?.awaiting === true; }
       catch { resetAbsent(); continue; }
       if (awaitingAbsent) {
+        if (pastCeiling) { resetAbsent(); continue; }
         resetAbsent();
         const cur = readUnchangedClaim(lockRoot, resource, entry);
         if (cur && heartbeat(lockRoot, resource, cur.owner, nowIso(), cur.pid ?? null, cur.meta)) {
@@ -584,7 +638,11 @@ export function refreshLiveFixDispatchClaims({
       const pid = Number.isInteger(entry.pid) && entry.pid > 0 ? entry.pid : ownerPid;
       let verdict;
       try { verdict = identity(pid); } catch { verdict = null; }
-      if (verdict?.alive !== false) { resetAbsent(); continue; }
+      if (verdict?.alive !== false) {
+        resetAbsent();
+        if (verdict?.alive !== true) keepStuck('proof-unknown');
+        continue;
+      }
       const cur = readUnchangedClaim(lockRoot, resource, entry);
       if (!cur) continue;
       const since = Date.parse(cur.meta.absentSince ?? '');
@@ -593,16 +651,17 @@ export function refreshLiveFixDispatchClaims({
         ? cur.meta.absentTicks + 1 : 1;
       const meta = { ...cur.meta, absentSince: validSince ? cur.meta.absentSince : new Date(nowMs).toISOString(), absentTicks: ticks };
       delete meta.idleHead;
-      // Persist evidence without renewing the dead holder's TTL.
-      heartbeat(lockRoot, resource, cur.owner, cur.heartbeatAt, cur.pid ?? null, meta);
+      // Protect unsalvaged work throughout absence observation and the salvage probe itself.
+      if (!heartbeat(lockRoot, resource, cur.owner, nowIso(), cur.pid ?? null, meta)) continue;
       if (ticks < 2 || !(validSince && nowMs - since >= absentRelease.minutes * 60_000)) continue;
-      let saved;
-      try { saved = salvageFor(entry, { name, nowMs }); } catch { continue; }
-      if (saved && typeof saved.then === 'function') {
-        void Promise.resolve(saved).catch(() => {});
-        continue; // this sweep is synchronous; unresolved salvage is never proof
-      }
-      if (!saved || !['clean', 'salvaged'].includes(saved.status)) continue;
+      let salvaged = false;
+      try {
+        const saved = salvageFor(entry, { name, nowMs });
+        if (saved && typeof saved.then === 'function') {
+          void Promise.resolve(saved).catch(() => {}); // synchronous sweep cannot accept async proof
+        } else salvaged = !!saved && ['clean', 'salvaged'].includes(saved.status);
+      } catch { /* unknown salvage remains protected below */ }
+      if (!salvaged) { keepStuck('salvage-failed'); continue; }
       if (!readUnchangedClaim(lockRoot, resource, entry)) continue;
       const result = releaseFixDispatchClaim({ repo, pr, kind, owner: entry.owner, lockRoot });
       if (result.released) {
@@ -614,6 +673,7 @@ export function refreshLiveFixDispatchClaims({
       }
       continue;
     }
+    if (pastCeiling) { clearClaimIdleHead(lockRoot, resource, entry); continue; }
     if (!isAwaiting && !isClaimSessionLive({ repo, pr, kind, agentsAll, name })) {
       // A terminal row must belong to THIS dispatch, not an older round with the
       // same reusable name. Missing/failed listings and the spawn-listing lag
@@ -676,6 +736,13 @@ export function refreshLiveFixDispatchClaims({
         if (typeof sha === 'string' && sha.trim()) idleHeadSha = sha;
       } catch { /* unknown head: retain the claim and reset its idle clock below */ }
     }
+    if (quietAliveHolder) {
+      if (keepStuck('quiet-holder')) {
+        if (isAwaiting) awaiting.push({ repo, pr, kind, owner: entry.owner });
+        refreshed.push({ repo, pr, kind, headSha, owner: entry.owner });
+      }
+      continue;
+    }
     const heartbeatAt = nowIso();
     const current = readUnchangedClaim(lockRoot, resource, entry);
     if (!current) continue;
@@ -705,20 +772,7 @@ export function refreshLiveFixDispatchClaims({
         continue;
       }
     }
-    let emitStuck = false;
-    if (!meta.stuckEmitted && quietAliveHolder) {
-      // The daemon sweep is singleton: persisted dedupe covers sequential sweeps.
-      // Re-read immediately before the write so a replacement claim is never marked.
-      const fresh = readUnchangedClaim(lockRoot, resource, entry);
-      if (!fresh) continue;
-      emitStuck = !fresh.meta.stuckEmitted;
-      meta.stuckEmitted = true;
-    }
     if (!heartbeat(lockRoot, resource, current.owner, heartbeatAt, current.pid ?? null, meta)) continue;
-    if (emitStuck) {
-      recordIdleRelease({ kind: 'stuck-session', repo, pr, daemon: 'reconcile-fix-dispatch',
-        detail: { kind, owner: entry.owner } }, recordEvent);
-    }
     if (isAwaiting) awaiting.push({ repo, pr, kind, owner: entry.owner });
     refreshed.push({
       repo, pr, kind, headSha, owner: entry.owner,
