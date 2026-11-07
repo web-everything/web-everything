@@ -24,8 +24,12 @@ import {
   DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES, fixDispatchClaimRoot, fixDispatchClaimOwner, fixDispatchResource,
   releaseSessionFixDispatchClaims, acquireFixDispatchClaim, releaseFixDispatchClaim, readFixDispatchClaim, fixDispatchSessionName,
   isClaimSessionLive, listFixDispatchClaims, refreshLiveFixDispatchClaims, transcriptActivityMs, MAX_FIX_DISPATCH_CLAIM_REFRESH_MS,
-  resolveIdleClaimRelease, readPrHead, recordIdleRelease, MAX_IDLE_CLAIM_OBSERVATION_GAP_MS,
+  resolveAbsentClaimRelease, resolveIdleClaimRelease, readPrHead, recordIdleRelease, MAX_IDLE_CLAIM_OBSERVATION_GAP_MS,
 } from '../fix-dispatch-claim.mjs';
+import * as laneSalvage from '../../lib/lane-salvage.mjs';
+import * as laneHistory from '../../lib/lane-history.mjs';
+import { pidIdentity } from '../../lib/pid-alive.mjs';
+import { makeAwaitingVerifyResolver } from '../await-verify.mjs';
 import { readHungInfo, resolveHungThresholdMs } from '../hung-session.mjs';
 import * as dispatchIo from '../../operations/dispatch-lane-io.mjs';
 import { newEnvelopeRecord } from '../../operations/completion-record.mjs';
@@ -1622,5 +1626,142 @@ describe('idle-claim auto-release (R201)', () => {
     sweep(T0 + 60_000, { extra: { idleRelease } });
     const r = sweep(T0 + 60_000 + 5 * 60_000, { extra: { idleRelease } });
     expect(r.released).toHaveLength(1);
+  });
+});
+
+
+describe('absent dead claim recovery', () => {
+  const key = () => ({ repo: 'we', pr: 6319, lockRoot: claimRoot });
+  const acquire = () => acquireFixDispatchClaim({ ...key(), owner: 'Mac:68715', pid: 68715, nowMs: T0, nowIso: iso(T0) });
+  const meta = patch => {
+    const e = readFixDispatchClaim(key());
+    heartbeat(claimRoot, fixDispatchResource(key()), e.owner, e.heartbeatAt, e.pid, { ...e.meta, ...patch });
+  };
+  const sweep = (at, extra = {}) => refreshLiveFixDispatchClaims({ lockRoot: claimRoot,
+    nowMs: at, nowIso: () => iso(at), listAgentsAll: () => [], awaitingVerifyFor: () => null,
+    identity: () => ({ alive: false, reason: 'gone' }), hungInfoFor: () => null,
+    salvageFor: () => ({ status: 'clean' }), recordEvent: () => {},
+    absentRelease: resolveAbsentClaimRelease({ env: {}, platform: null }), ...extra });
+
+  it('releases dead absent holders after two consecutive sweeps and records the reason and event', () => {
+    acquire();
+    const events = [];
+    expect(sweep(T0 + 1000).released ?? []).toEqual([]);
+    expect(readFixDispatchClaim(key()).meta).toMatchObject({ absentSince: iso(T0 + 1000), absentTicks: 1 });
+    expect(sweep(T0 + 2000, { recordEvent: e => events.push(e) }).released[0].reason).toMatch(/^absent-session-dead /);
+    expect(readFixDispatchClaim(key())).toBeNull();
+    expect(events).toMatchObject([{ kind: 'absent-claim-released', detail: { minutes: 10, sources: { minutes: 'standard' } } }]);
+  });
+
+  it('releases persisted absence via the policy age bound even with no tick counter', () => {
+    acquire(); meta({ absentSince: iso(T0) });
+    expect(sweep(T0 + 11 * 60_000).released).toHaveLength(1);
+  });
+
+  it('resolves absent policy provenance and rejects invalid or oversized bounds', () => {
+    const platform = { fixLoop: { absentClaimRelease: { minutes: 7 } } };
+    expect(resolveAbsentClaimRelease({ env: { WE_ABSENT_CLAIM_RELEASE_MINUTES: '3' }, platform })).toMatchObject({ minutes: 3, sources: { minutes: 'env' } });
+    for (const value of ['0', '-1', 'NaN', 'Infinity', '100000000000000000000']) {
+      expect(resolveAbsentClaimRelease({ env: { WE_ABSENT_CLAIM_RELEASE_MINUTES: value }, platform })).toMatchObject({ minutes: 7 });
+    }
+  });
+
+  it('keeps an absent holder whose pid is alive and resets absence tracking', () => {
+    acquire(); sweep(T0 + 1000);
+    expect(sweep(T0 + 2000, { identity: () => ({ alive: true }) }).released ?? []).toEqual([]);
+    expect(readFixDispatchClaim(key()).meta.absentSince).toBeUndefined();
+    expect(sweep(T0 + 3000).released ?? []).toEqual([]);
+  });
+
+  it.each([null, {}, 'throws'])('keeps unreadable listing %s and breaks consecutive absence', listing => {
+    acquire(); sweep(T0 + 1000);
+    expect(() => sweep(T0 + 2000, { listAgentsAll: () => { if (listing === 'throws') throw Error('unreadable'); return listing; } })).not.toThrow();
+    expect(readFixDispatchClaim(key()).meta.absentTicks).toBeUndefined();
+    expect(sweep(T0 + 3000).released ?? []).toEqual([]);
+  });
+
+  it.each([null, undefined, 'throws'])('keeps unknown pid proof %s without counting absence', proof => {
+    acquire(); sweep(T0 + 1000);
+    sweep(T0 + 2000, { identity: () => { if (proof === 'throws') throw Error('ps'); return { alive: proof }; } });
+    expect(readFixDispatchClaim(key()).meta.absentTicks).toBeUndefined();
+    expect(sweep(T0 + 3000).released ?? []).toEqual([]);
+  });
+
+  it('keeps a listed bg-spare holder using the real pidIdentity parser', () => {
+    acquire(); sweep(T0 + 1000);
+    const identity = (pid, options) => pidIdentity(pid, { ...options,
+      exec: () => 'S Fri Sep 25 11:59:00 2026 claude bg-spare --bg-spare socket' });
+    expect(identity(68715).alive).toBe(true);
+    expect(sweep(T0 + 2000, { identity, activityMsFor: () => T0, listAgentsAll: () => [
+      { name: 'fix-6319', pid: 68715, kind: 'background', state: 'working', startedAt: T0 },
+    ] }).released ?? []).toEqual([]);
+    expect(readFixDispatchClaim(key()).meta.absentSince).toBeUndefined();
+  });
+
+  it('runs salvage before releasing and rechecks ownership after salvage', () => {
+    acquire(); sweep(T0 + 1000);
+    const order = [];
+    const result = sweep(T0 + 2000, { salvageFor: e => {
+      expect(readFixDispatchClaim(key()).owner).toBe(e.owner); order.push('salvage'); return { status: 'salvaged' };
+    }, recordEvent: () => { expect(readFixDispatchClaim(key())).toBeNull(); order.push('release'); } });
+    expect(result.released).toHaveLength(1); expect(order).toEqual(['salvage', 'release']);
+  });
+
+  it.each(['failed', 'unknown', 'throws', 'promise'])('keeps the claim when salvage is %s', status => {
+    acquire(); sweep(T0 + 1000);
+    expect(sweep(T0 + 2000, { salvageFor: () => {
+      if (status === 'throws') throw Error('salvage');
+      return status === 'promise' ? Promise.resolve({ status: 'salvaged' }) : { status };
+    } }).released ?? []).toEqual([]);
+    expect(readFixDispatchClaim(key())).not.toBeNull();
+  });
+
+  it.each([true, false, null])('uses the existing salvage helper for discovered lease work state %s', unpushed => {
+    acquire();
+    const pool = join(claimRoot, 'pools');
+    const dir = join(pool, 'web-everything', 'lane-9');
+    mkdirSync(join(dir, '.git'), { recursive: true });
+    writeFileSync(join(dir, '.git', '.lane-lease'), JSON.stringify({ ownerSession: 'fix-6319' }));
+    vi.stubEnv('LANE_POOL_ROOT', pool);
+    const state = vi.spyOn(laneHistory, 'laneStateSnapshot').mockReturnValue({ unpushed });
+    const salvage = vi.spyOn(laneSalvage, 'salvageLane').mockReturnValue({ bundle: 'verified.bundle' });
+    try {
+      sweep(T0 + 1000);
+      const result = sweep(T0 + 2000, { salvageFor: undefined });
+      expect(result.released ?? []).toHaveLength(unpushed === null ? 0 : 1);
+      expect(state).toHaveBeenCalledWith(dir);
+      expect(salvage).toHaveBeenCalledTimes(unpushed === true ? 1 : 0);
+      if (unpushed) expect(salvage).toHaveBeenCalledWith(expect.objectContaining({ dir, lane: 9, includeLocalBranches: true }));
+    } finally { state.mockRestore(); salvage.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it('retains a replacement claim installed during salvage', () => {
+    acquire(); sweep(T0 + 1000);
+    const result = sweep(T0 + 2000, { salvageFor: () => {
+      releaseFixDispatchClaim({ ...key(), owner: 'Mac:68715' });
+      acquireFixDispatchClaim({ ...key(), owner: 'replacement', nowMs: T0 + 2000, nowIso: iso(T0 + 2000) });
+      return { status: 'salvaged' };
+    } });
+    expect(result.released ?? []).toEqual([]);
+    expect(readFixDispatchClaim(key()).owner).toBe('replacement');
+  });
+
+  it('keeps absent awaiting-verify claims without counting absence', () => {
+    acquire(); sweep(T0 + 1000);
+    sweep(T0 + 2000, { awaitingVerifyFor: makeAwaitingVerifyResolver({ now: () => T0 + 2000,
+      read: () => ({ v: 1, who: 'fix-6319', pr: 6319, requestedAt: iso(T0) }) }) });
+    expect(readFixDispatchClaim(key()).meta.absentTicks).toBeUndefined();
+    expect(sweep(T0 + 3000).released ?? []).toEqual([]);
+  });
+
+  it.each(['idle', 'blocked'])('keeps a quiet alive %s holder and emits stuck-session exactly once', state => {
+    acquire(); const events = [];
+    const extra = { identity: () => ({ alive: true }), activityMsFor: () => T0,
+      hungThresholdMs: 60_000, prHeadFor: () => 'unchanged-head', hungInfoFor: () => ({ hung: true, reason: 'stale-no-activity' }), recordEvent: e => events.push(e),
+      listAgentsAll: () => [{ name: 'fix-6319', pid: 68715, state, startedAt: T0 }] };
+    expect(sweep(T0 + 60 * 60_000, extra).released ?? []).toEqual([]);
+    expect(sweep(T0 + 91 * 60_000, extra).released ?? []).toEqual([]);
+    expect(events.filter(e => e.kind === 'stuck-session')).toHaveLength(1);
+    expect(readFixDispatchClaim(key()).meta.stuckEmitted).toBe(true);
   });
 });
