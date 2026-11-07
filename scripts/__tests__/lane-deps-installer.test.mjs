@@ -389,14 +389,77 @@ describe('lane deps hashing and readiness (real lane directory)', () => {
       expect(exec).not.toHaveBeenCalled();
       expect(existsSync(join(dir, 'node_modules', 'kept'))).toBe(true);
     });
-    it('our own lease (acquire) and a stale lease both migrate', () => {
-      for (const lease of [{ ...fresh, pid: process.pid }, { acquiredAt: '2020-01-01T00:00:00Z', ttlMinutes: 1, pid: process.pid + 1 }]) {
-        const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
-        writeLease(dir, lease);
-        const exec = vi.fn(() => mkdirSync(join(dir, 'node_modules'), { recursive: true }));
-        expect(migrate(dir, markerPath, storeDir, exec)).toBe('installed');
-        expect(exec).toHaveBeenCalledOnce();
-      }
+    const leaseFile = dir => join(dir, '.git', '.lane-lease');
+    const leasePid = dir => JSON.parse(readFileSync(leaseFile(dir), 'utf8')).pid;
+    /** A plan whose `backend` read number `at` (the read right after the final lease check) runs `onWindow`. */
+    const windowPlan = (plan, onWindow, at = 2) => {
+      let reads = 0;
+      return { ...plan, get backend() { if (++reads === at) onWindow(); return plan.backend; } };
+    };
+    it('our own lease (acquire) migrates and is left in place', () => {
+      const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
+      writeLease(dir, { ...fresh, pid: process.pid });
+      const before = readFileSync(leaseFile(dir), 'utf8');
+      const exec = vi.fn(() => mkdirSync(join(dir, 'node_modules'), { recursive: true }));
+      expect(migrate(dir, markerPath, storeDir, exec)).toBe('installed');
+      expect(exec).toHaveBeenCalledOnce();
+      expect(readFileSync(leaseFile(dir), 'utf8')).toBe(before);
+    });
+    it('a stale lease is not ours to claim: migration is deferred and the lane kept', () => {
+      const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
+      writeLease(dir, { acquiredAt: '2020-01-01T00:00:00Z', ttlMinutes: 1, pid: process.pid + 1 });
+      const exec = vi.fn();
+      expect(migrate(dir, markerPath, storeDir, exec)).toBe('ok');
+      expect(exec).not.toHaveBeenCalled();
+      expect(existsSync(join(dir, 'node_modules', 'kept'))).toBe(true);
+    });
+    it('a reserved lease with our pid is never claimed or migrated', () => {
+      const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
+      writeLease(dir, { ...fresh, pid: process.pid, reserved: true });
+      const exec = vi.fn();
+      expect(migrate(dir, markerPath, storeDir, exec)).toBe('ok');
+      expect(exec).not.toHaveBeenCalled();
+      expect(existsSync(join(dir, 'node_modules', 'kept'))).toBe(true);
+    });
+    it('an unleased lane is claimed with an exclusive lease for the whole migration, then released', () => {
+      const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
+      let during = null;
+      const exec = vi.fn(() => { during = leasePid(dir); mkdirSync(join(dir, 'node_modules')); });
+      expect(migrate(dir, markerPath, storeDir, exec)).toBe('installed');
+      expect(during).toBe(process.pid);
+      expect(existsSync(leaseFile(dir))).toBe(false);
+    });
+    it('a foreign exclusive claim AFTER the final lease check is refused (the lane is already ours)', () => {
+      const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
+      let refused = null;
+      const onWindow = () => {
+        try { writeFileSync(leaseFile(dir), JSON.stringify({ ...fresh, pid: process.pid + 1 }), { flag: 'wx' }); }
+        catch (error) { refused = error.code; }
+      };
+      const exec = vi.fn(() => mkdirSync(join(dir, 'node_modules')));
+      const selectPlan = () => windowPlan(select({ storeDir }), onWindow);
+      expect(ensureLaneDeps({ dir, markerPath, storeDir, selectPlan, exec })).toBe('installed');
+      expect(refused).toBe('EEXIST');
+      expect(exec).toHaveBeenCalledOnce();
+      expect(existsSync(leaseFile(dir))).toBe(false);
+    });
+    it('a foreign lease that REPLACES our claim before the removal stops the wipe and is left untouched', () => {
+      const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
+      const onWindow = () => writeLease(dir, { ...fresh, pid: process.pid + 1 });
+      const exec = vi.fn();
+      const selectPlan = () => windowPlan(select({ storeDir }), onWindow);
+      expect(ensureLaneDeps({ dir, markerPath, storeDir, selectPlan, exec })).toBe('ok');
+      expect(exec).not.toHaveBeenCalled();
+      expect(existsSync(join(dir, 'node_modules', 'kept'))).toBe(true);
+      expect(readFileSync(markerPath, 'utf8')).toBe(npmMarker(dir));
+      expect(leasePid(dir)).toBe(process.pid + 1);
+    });
+    it('a failing install still releases the claim', () => {
+      const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
+      const exec = vi.fn(() => { throw Error('install failed'); });
+      const plan = { ...select({ storeDir }), fallback: undefined };
+      expect(() => ensureLaneDeps({ dir, markerPath, storeDir, selectPlan: () => plan, exec })).toThrow('install failed');
+      expect(existsSync(leaseFile(dir))).toBe(false);
     });
   });
   it('a stale lane installs and stamps <backend>:<that backend hash>', () => {

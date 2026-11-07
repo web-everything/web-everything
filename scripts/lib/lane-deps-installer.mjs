@@ -208,6 +208,51 @@ export function hasForeignLiveLease(dir, nowMs = Date.now()) {
 }
 
 /**
+ * Claim a lane for a migration, so no other process can take it between our last lease check and the removal
+ * of node_modules. Returns `{ holds(), release() }`, or null when the lane is not ours to claim.
+ *   - our own lease (acquire wrote it, same pid, not reserved): already ours, nothing is written or removed;
+ *   - no lease: write one atomically and exclusively (temp file + hard link, like lane-pool's acquire), so a
+ *     process claiming the lane afterwards fails with EEXIST and sees a live lease;
+ *   - anything else (foreign, stale, reserved, unreadable): null. A stale lease cannot be swapped atomically
+ *     here, so its lane waits for the next acquire, which holds its own lease while it installs.
+ * `holds()` re-reads the lease and is true only while it is still our claim (a process that replaced the lease
+ * wins); `release()` removes the lease only if it is still our claim.
+ */
+export function claimLaneForMigration(dir, nowMs = Date.now()) {
+  const file = join(dir, '.git', '.lane-lease');
+  const read = () => {
+    try {
+      const lease = JSON.parse(readFileSync(file, 'utf8'));
+      return lease && typeof lease === 'object' ? lease : null;
+    } catch {
+      return null;
+    }
+  };
+  if (existsSync(file)) {
+    const lease = read();
+    return lease && !lease.reserved && lease.pid === process.pid
+      ? { holds: () => { const now = read(); return !!now && !now.reserved && now.pid === process.pid; }, release: () => {} }
+      : null;
+  }
+  const token = randomUUID();
+  const body = JSON.stringify({
+    session: 'lane-deps-migration', purpose: 'deps-migration', acquiredAt: new Date(nowMs).toISOString(),
+    ttlMinutes: 240, host: null, pid: process.pid, ownerSession: null, workflowLane: false, depsMigration: token,
+  }) + '\n';
+  const temp = `${file}.tmp-${process.pid}-${token}`;
+  try {
+    writeFileSync(temp, body, { flag: 'wx' });
+    linkSync(temp, file); // atomic no-clobber: fails EEXIST when anyone claimed the lane since the check above
+  } catch {
+    return null;
+  } finally {
+    rmSync(temp, { force: true });
+  }
+  const mine = () => read()?.depsMigration === token;
+  return { holds: mine, release: () => { if (mine()) rmSync(file, { force: true }); } };
+}
+
+/**
  * Install a lane's node_modules when needed. `selectPlan()` picks the installer; `exec(command, args)` runs it.
  * Returns the `depsReady` state ('n/a' | 'ok') when nothing is installed, else 'installed'.
  *
@@ -215,6 +260,8 @@ export function hasForeignLiveLease(dir, nowMs = Date.now()) {
  * lazily selects a plan and migrates when pnpm is usable; that same plan is reused for installation.
  * A pnpm install failure followed by successful npm fallback records the resulting npm lock hash in
  * `<markerPath>.pnpm-failed`, suppressing migration (and its probe) while that hash remains current.
+ * A migration of a ready lane first claims the lane (`claimLaneForMigration`) and holds the claim until the
+ * install ends; a lane that cannot be claimed (foreign, stale, reserved or unreadable lease) stays as it is.
  * `storeDir` must be the same store `selectPlan` passes to pnpm.
  */
 export function ensureLaneDeps({ dir, markerPath, selectPlan, exec, log = () => {}, storeDir = resolvePnpmStoreDir() }) {
@@ -227,9 +274,23 @@ export function ensureLaneDeps({ dir, markerPath, selectPlan, exec, log = () => 
   });
   if (state === 'n/a' || state === 'ok') return state;
   plan = getPlan();
-  // The probe above can take seconds: re-check, so a lane claimed meanwhile is never wiped by a migration.
-  // (A residual window between this check and the removal remains; migration only touches lanes that read ok.)
-  if (depsReady(dir, markerPath, storeDir) === 'ok' && hasForeignLiveLease(dir)) return 'ok';
+  // A lane that reads ok without the pnpm probe is only being MIGRATED. The probe above can take seconds, so
+  // claim the lane now (atomically, see claimLaneForMigration) instead of re-checking and hoping: once the claim
+  // is ours no other process can take the lane, and a lane we cannot claim is left alone.
+  let claim = null;
+  if (depsReady(dir, markerPath, storeDir) === 'ok') {
+    claim = claimLaneForMigration(dir);
+    if (!claim) return 'ok';
+  }
+  try {
+    return installLaneDeps({ dir, markerPath, storeDir, plan, claim, exec, log, failedPath });
+  } finally {
+    claim?.release();
+  }
+}
+
+/** The install half of `ensureLaneDeps`. A held `claim` is re-verified right before every removal. */
+function installLaneDeps({ dir, markerPath, storeDir, plan, claim, exec, log, failedPath }) {
   const wantedPnpm = plan.backend === 'pnpm'; // also true when the store is unusable and we fall back below
   let generation = null; // the store generation this pnpm install links into
   if (plan.backend === 'pnpm') {
@@ -240,11 +301,19 @@ export function ensureLaneDeps({ dir, markerPath, selectPlan, exec, log = () => 
       plan = plan.fallback;
     }
   }
+  // Last check before anything is touched: a process that replaced our claim owns the lane now.
+  if (claim && !claim.holds()) {
+    log('lane claimed by another process before migration; leaving deps as they are');
+    return 'ok';
+  }
+  const assertHeld = () => {
+    if (claim && !claim.holds()) throw new Error('lane claimed by another process during migration: ' + dir);
+  };
   const result = runDepsInstaller({
     plan, hashFor: backend => lockHash(dir, backend, storeDir), marker: readMarker(markerPath),
     hasNodeModules: existsSync(join(dir, 'node_modules')),
-    invalidate: () => rmSync(markerPath, { force: true }),
-    remove: () => rmSync(join(dir, 'node_modules'), { recursive: true, force: true }),
+    invalidate: () => { assertHeld(); rmSync(markerPath, { force: true }); },
+    remove: () => { assertHeld(); rmSync(join(dir, 'node_modules'), { recursive: true, force: true }); },
     log, exec,
   });
   // The store was wiped and recreated WHILE pnpm installed: this lane's links point at the old generation's
