@@ -2027,7 +2027,6 @@ export function parseChangesVerdictProse(body) {
 export const CLEARED_FROM_MARKER = 'cleared-from';
 const CLEARED_FROM_ID_RE = /^[A-Za-z0-9_=-]{4,}$/;
 const CLEARED_FROM_RE = new RegExp(`<!--\\s*${CLEARED_FROM_MARKER}:\\s*([^>]*?)\\s*-->`, 'g');
-const CARRY_PROOF_RE = /<!--\s*human-clearance-carried:\s*from=([0-9a-fA-F]{40})\s+to=([0-9a-fA-F]{40})\s+diff=[0-9a-fA-F]{64}\s*-->/;
 const safeClearanceId = id => typeof id === 'string' && id.trim() === id && CLEARED_FROM_ID_RE.test(id);
 export function buildClearedFromMarker(id) {
   return safeClearanceId(id)
@@ -2042,7 +2041,11 @@ function humanClearanceStates(comments) {
   for (const c of thread) {
     if (!safeClearanceId(c?.id)) continue;
     // Ambiguous ids are unreadable evidence, never a choice of which source to trust.
-    byId.set(c.id, byId.has(c.id) ? null : c);
+    // The same comment can appear twice (an embedded page overlapping the full thread): an identical copy is one
+    // comment; two DIFFERENT comments sharing an id are ambiguous evidence.
+    const seen = byId.get(c.id);
+    const same = seen && seen.body === c.body && (seen.author?.login ?? seen.user?.login) === (c.author?.login ?? c.user?.login);
+    byId.set(c.id, byId.has(c.id) && !same ? null : (seen ?? c));
   }
   const states = [];
   let sourceId = null;
@@ -2051,7 +2054,7 @@ function humanClearanceStates(comments) {
   const related = (a, b) => !!a && !!b && (a.startsWith(b) || b.startsWith(a));
   for (const c of thread) {
     const login = c?.author?.login ?? c?.user?.login;
-    if (typeof login !== 'string' || !login.trim()) continue; // Unknown poster, including viewer-only evidence.
+    const knownPoster = typeof login === 'string' && login.trim().length > 0;
     if (!isTrustedMarkerAuthor(c)) continue; // operators are trusted authors, so every human clearance passes this
     const human = isHumanOperatorComment(c);
     const body = typeof c?.body === 'string' ? c.body : '';
@@ -2062,11 +2065,12 @@ function humanClearanceStates(comments) {
     const hasMarker = new RegExp(CLEARED_HUMAN_RE.source).test(body);
     const cleared = hasMarker || (human && new RegExp(CLEARED_HUMAN_PROSE_RE.source).test(body));
     if (human) {
-      sourceId = cleared && safeClearanceId(c.id) && byId.get(c.id) === c ? c.id : null;
+      sourceId = cleared && safeClearanceId(c.id) && !!byId.get(c.id) && byId.get(c.id).body === c.body ? c.id : null;
       chainShas = [sha];
       plainSince = [];
     } else if (hasMarker) {
-      if (/^(unknown|ghost|none|null|undefined)$/i.test(login.trim())) continue; // a placeholder login is an unreadable author
+      if (!knownPoster) continue; // Unknown poster (including viewer-only evidence) can never carry a clearance.
+      if (/^(unknown|ghost|none|null|undefined)$/i.test(String(login).trim())) continue; // a placeholder login is an unreadable author
       const citations = [...body.matchAll(new RegExp(CLEARED_FROM_RE.source, 'g'))];
       if (citations.length !== 1) continue;
       const citedId = citations[0][1].trim();
@@ -2078,13 +2082,8 @@ function humanClearanceStates(comments) {
           || new RegExp(CLEARED_HUMAN_PROSE_RE.source).test(sourceBody))) continue;
       const fingerprint = parseReviewedDiff([c]);
       const sameDiff = !!fingerprint && fingerprint === parseReviewedDiff([source]);
-      // The drain's own mechanical carry record (human-clearance-carry.mjs) proves unchanged content by git proof
-      // rather than by the strict fingerprint: accept its carry marker when it names exactly this source head → this head.
-      // Restated here, not imported: human-clearance-carry.mjs imports this module, so importing it back is a cycle.
-      const carried = new RegExp(CARRY_PROOF_RE.source).exec(body);
-      const sourceSha = parseReviewedShaMarker(sourceBody);
-      const carryProof = !!carried && carried[1].toLowerCase() === sourceSha && carried[2].toLowerCase() === sha;
-      if (!sameDiff && !carryProof) continue;
+      // Only an unchanged reviewed-diff fingerprint proves an unchanged diff: a textual carry marker is a claim, not proof.
+      if (!sameDiff) continue;
       // A trusted plain accept of the cleared head, any head already carried to, or the head being carried to, supersedes the clearance;
       // one for an unrelated head does not (the same reading the drain's hold applies).
       if (plainSince.some(p => related(p, sha) || chainShas.some(h => related(p, h)))) continue;
@@ -2092,7 +2091,7 @@ function humanClearanceStates(comments) {
     } else {
       plainSince.push(sha);
     }
-    states.push({ sha, cleared, sourceId });
+    states.push({ sha, cleared, sourceId, c });
   }
   return states;
 }
@@ -2126,6 +2125,12 @@ function humanClearanceStates(comments) {
 export function parseLatestHumanClearedSha(comments) {
   const latest = humanClearanceStates(comments).at(-1);
   return latest?.cleared ? latest.sha : null;
+}
+
+/** The comment that carries the active clearance (a human original, or a PROVEN carrier); null when none stands. */
+export function latestHumanClearanceComment(comments) {
+  const latest = humanClearanceStates(comments).at(-1);
+  return latest?.cleared ? latest.c : null;
 }
 
 /** Original human comment id of the active clearance; absent or superseded evidence → null. */

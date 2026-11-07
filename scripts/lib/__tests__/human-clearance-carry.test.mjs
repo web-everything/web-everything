@@ -63,6 +63,11 @@ describe('latestHumanClearance', () => {
   it('reads the sha and diff from the SAME latest human comment', () => {
     expect(latestHumanClearance([clearHumanComment(CLEARED)])).toEqual({ sha: CLEARED, diff: FP, contribution: null, actor: 'chalbert', sourceId: 'IC_clearance' });
   });
+  it('R706: an uncited automation comment with a changed fingerprint never supplies the clearance metadata', () => {
+    const rejected = { author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${HEAD} -->\n<!-- reviewed-diff: ${'e'.repeat(64)} -->\n<!-- cleared-human: mallory -->` };
+    // The rejected carrier is invisible: the original human clearance still stands, with ITS fingerprint and actor.
+    expect(latestHumanClearance([clearHumanComment(CLEARED), rejected])).toMatchObject({ sha: CLEARED, diff: FP, actor: 'chalbert' });
+  });
   it('a later plain accept means no clearance to carry', () => {
     expect(latestHumanClearance([clearHumanComment(CLEARED), plainAccept(HEAD)])).toBe(null);
   });

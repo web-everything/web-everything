@@ -46,12 +46,11 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   parseLatestHumanClearedSha, parseReviewedSha, parseReviewedDiff, parseOperatorClearance, parseReviewedContribution,
-  buildReviewedShaMarker, buildReviewedDiffMarker, buildReviewedContributionMarker, buildClearedHumanMarker, buildClearedFromMarker, latestHumanClearanceSourceId,
+  buildReviewedShaMarker, buildReviewedDiffMarker, buildReviewedContributionMarker, buildClearedHumanMarker, buildClearedFromMarker, latestHumanClearanceSourceId, latestHumanClearanceComment,
 } from './review-escalation.mjs';
 import { compareCarryFingerprints, ensureCommitReadable, liveCarryFingerprints, proveReplayEquivalent, resolveCarryEquivalenceSetting } from './carry-equivalence.mjs';
 import { isNumberingTolerableLaterBody, proveNumberingOnlyMove, resolveNumberingHumanClearanceSetting } from './numbering-carry.mjs';
 import { latestAcceptRecord, laterReviewHold } from './accept-carry-forward.mjs';
-import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 
 export const HUMAN_CLEARANCE_CARRY_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'human-clearance-carry.json');
 export const HUMAN_CLEARANCE_CARRY_ENV = 'WE_REVIEW_HUMAN_CLEARANCE_CARRY';
@@ -91,8 +90,8 @@ export function latestHumanClearance(comments) {
   const list = Array.isArray(comments) ? comments : [];
   const sha = parseLatestHumanClearedSha(list);
   if (!sha) return null;
-  const trusted = list.filter(isTrustedMarkerAuthor);
-  const latest = trusted.findLast((c) => parseReviewedSha([c]));
+  // The comment the shared scan ACCEPTED (a human original or a proven carrier), never a rejected carrier's metadata.
+  const latest = latestHumanClearanceComment(list);
   if (!latest || parseReviewedSha([latest]) !== sha) return null;
   // Only a full 40-hex sha can be compared to the live head and fed to git; an attributed clearance needs a named actor
   // (`parseOperatorClearance` refuses an empty `cleared-human:` where `parseLatestHumanClearedSha` does not).

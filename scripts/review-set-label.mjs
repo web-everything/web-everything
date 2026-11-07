@@ -71,7 +71,7 @@ import { readPinnedChangedFiles, workflowEditHold } from './lib/merge-queue-enqu
 // #x9xqexm's base-independent third marker. Independent concerns.
 import {
   REVIEW_PR_CHANNEL, REVIEW_LABELS, hasReviewLabel, buildReviewedShaMarker, buildReviewedDiffMarker,
-  buildReviewedContributionMarker, buildClearedHumanMarker, buildClearedFromMarker, latestHumanClearanceSourceId, READY_TO_MERGE_LABEL,
+  buildReviewedContributionMarker, buildClearedHumanMarker, buildClearedFromMarker, latestHumanClearanceSourceId, latestHumanClearanceComment, READY_TO_MERGE_LABEL,
   // #3007 — the SAME two digests the markers carry, taken raw so the ledger row records the witnesses
   // themselves rather than re-deriving them from the rendered comment. One computation, two consumers.
   normalizeDiffFingerprint, normalizeContributionFingerprint,
@@ -851,16 +851,18 @@ export const bodyFileRoots = (cwd = process.cwd(), tmp = tmpdir()) => [cwd, tmp,
 export function decideRestampHumanClearance({ comments, headSha, headDiff } = {}) {
   const humanClearedSha = parseLatestHumanClearedSha(comments);
   if (!humanClearedSha) return null;
+  // The fingerprints and actor come from the comment the shared scan accepted, never a rejected carrier's markers.
+  const accepted = latestHumanClearanceComment(comments);
   const coverage = acceptanceCoversHead({
     acceptedSha: humanClearedSha,
     headSha,
-    acceptedDiff: parseReviewedDiff(comments),
+    acceptedDiff: parseReviewedDiff(accepted ? [accepted] : []),
     headDiff,
-    acceptedContribution: parseReviewedContribution(comments),
+    acceptedContribution: parseReviewedContribution(accepted ? [accepted] : []),
     headContribution: headDiff,
   });
   if (!coverage.covers) return null;
-  const clearance = parseOperatorClearance((Array.isArray(comments) ? comments : []).filter(isTrustedMarkerAuthor));
+  const clearance = parseOperatorClearance(accepted ? [accepted] : []);
   const sourceId = latestHumanClearanceSourceId(comments);
   return { actor: clearance ? clearance.actor : 'the operator', sha: humanClearedSha, ...(sourceId ? { sourceId } : {}) };
 }

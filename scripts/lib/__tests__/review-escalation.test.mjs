@@ -39,6 +39,7 @@ import {
   parseOperatorClearance,
   parseLatestHumanClearedSha,
   latestHumanClearanceSourceId,
+  latestHumanClearanceComment,
   CLEARED_FROM_MARKER,
   buildClearedFromMarker,
   headEverHumanCleared,
@@ -3099,7 +3100,7 @@ describe('R706 — proven human-clearance carriers', () => {
     const rows = [
       [source(), carrier({ body: carrier().body + '\n' + buildClearedFromMarker('IC_original') })],
       [source({ id: undefined }), carrier()],
-      [source(), source(), carrier()],
+      [source(), source({ body: source().body + '\n' }), carrier()], // two DIFFERENT comments sharing one id (an identical copy is one comment, tested above)
       [source({ body: buildReviewedShaMarker(original) }), carrier()],
       [source({ body: source().body.replace(buildReviewedDiffMarker(diff), '') }), carrier()],
       [source(), carrier({ body: carrier().body.replace(buildReviewedDiffMarker(diff), '') })],
@@ -3118,5 +3119,27 @@ describe('R706 — proven human-clearance carriers', () => {
     expect(body).toContain(buildClearedFromMarker('IC_original'));
     expect(parseLatestHumanClearedSha([source(), carrier({ body })])).toBe(head);
     expect(parseLatestHumanClearedSha([carrier({ body })])).toBeNull();
+  });
+  // Audit probes (R706): each was a way to carry or mask a clearance without proof.
+  it('an overlapping embedded + complete thread repeats the SAME human comment and still resolves it', () => {
+    const comments = [source(), source(), carrier()];
+    expect(parseLatestHumanClearedSha(comments)).toBe(head);
+    expect(latestHumanClearanceSourceId(comments)).toBe('IC_original');
+  });
+  it('two DIFFERENT comments sharing a citation id are ambiguous and refuse the carrier', () => {
+    const other = source({ body: source().body.replace(diff, 'e'.repeat(64)) });
+    expect(parseLatestHumanClearedSha([source(), other, carrier()])).not.toBe(head);
+  });
+  it('a textual human-clearance-carried marker with an arbitrary digest does not replace an unchanged fingerprint', () => {
+    const changed = 'e'.repeat(64);
+    const body = carrier().body.replace(diff, changed) + `\n<!-- human-clearance-carried: from=${original} to=${head} diff=${'f'.repeat(64)} -->`;
+    const comments = [source(), carrier({ body })];
+    expect(parseLatestHumanClearedSha(comments)).toBe(original);
+    expect(headEverHumanCleared(comments, head)).toBe(false);
+  });
+  it('latestHumanClearanceComment returns the accepted comment, never a rejected carrier', () => {
+    const rejected = carrier({ body: carrier().body.replace(diff, 'e'.repeat(64)) });
+    expect(latestHumanClearanceComment([source(), rejected]).id).toBe('IC_original');
+    expect(latestHumanClearanceComment([source(), carrier()]).body).toBe(carrier().body);
   });
 });
