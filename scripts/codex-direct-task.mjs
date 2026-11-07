@@ -114,7 +114,7 @@ import { laneGitConfigArgs, hardenLaneGitArgs, laneGitHardeningEnv } from './lib
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
 import { readProcStart } from './lib/daemon-jobs-runtime.mjs';
 import {
-  mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, openSync, closeSync, renameSync, copyFileSync,
+  mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, openSync, closeSync, renameSync, fchmodSync,
 } from 'node:fs';
 import jobAsyncFs from 'node:fs/promises';
 import { tmpdir, homedir } from 'node:os';
@@ -1078,6 +1078,8 @@ export async function runCodexDirectExec({
  *   shape (`collectAndClearRolloutQuota`) instead of the default read-only lookup — only worth setting for a
  *   caller with no `codex exec resume` use case for this particular run (see `readRolloutQuota`'s header).
  *   Default false: this script's whole point is resumability.
+ * @param {boolean} [opts.keep] - retain every owned temp dir (scratch clone and task temp root).
+ * @param {boolean} [opts.keepScratch] - retain only the scratch clone (the human CLI's output points into it).
  * @param {NodeJS.ProcessEnv} [opts.env] - for `resolveCodexHome`. Default `process.env`.
  * @param {Function} [opts.execFn]
  * @param {Function} [opts.spawnFn]
@@ -1124,6 +1126,7 @@ export async function codexDirectTask({
   loadTranscriptCheck = () => import('./lib/codex-transcript-check.mjs'),
   resumeThreadId,
   keep = false,
+  keepScratch = false,
 } = {}) {
   // Fail before any clone, install or spawn work: a bad resume target must not cost a run.
   if (resumeThreadId !== undefined) assertResumeRequest({ resumeThreadId, ephemeral, outputSchemaFile, dir });
@@ -1150,12 +1153,20 @@ export async function codexDirectTask({
   const briefPolicy = { ...policy, finalGate: gate };
   const tempDirs = [];
   let scratchLog;
+  // The preserved log sits beside the private mkdtemp clone in the shared tmpdir: create it owner-only
+  // (0600) and exclusively (`wx`, never through a pre-planted file or symlink), then refresh it in place.
   const preserveScratchLog = () => {
-    if (scratchLog && existsSync(scratchLog.source)) copyFileSync(scratchLog.source, scratchLog.dest);
+    if (!scratchLog || !existsSync(scratchLog.source)) return;
+    const fd = openSync(scratchLog.dest, scratchLog.written ? 'w' : 'wx', 0o600);
+    try { fchmodSync(fd, 0o600); writeFileSync(fd, readFileSync(scratchLog.source)); }
+    finally { closeSync(fd); }
+    scratchLog.written = true;
   };
+  // A human CLI run with no --dir leaves its edits only in the scratch clone it prints (keepScratch).
+  let retainedScratch;
   const cleanupTemps = () => {
     if (keep) return;
-    let retainedClone;
+    let retainedClone = retainedScratch;
     try { preserveScratchLog(); }
     catch (error) {
       retainedClone = scratchLog.root;
@@ -1188,6 +1199,7 @@ export async function codexDirectTask({
       installExecFn, installTimeoutMs, cloneExecFn, cloneTimeoutMs,
     });
     targetDir = scratch.dest;
+    if (keepScratch) retainedScratch = scratch.dest;
   } else if (!existsFn(targetDir)) {
     throw new Error(`codex-direct-task: --dir=${targetDir} does not exist`);
   }
@@ -1201,7 +1213,7 @@ export async function codexDirectTask({
   // into `captureDiff`'s output. A caller-supplied `--log=<path>` is trusted as-is (their choice, their risk).
   const gitDir = execFn('git', ['-C', targetDir, 'rev-parse', '--absolute-git-dir'], { timeout: GIT_STEP_TIMEOUT_MS }).trim();
   const resolvedLogFile = logFile || join(gitDir, review ? `codex-self-review-${randomUUID()}.jsonl` : 'codex-direct-task.jsonl');
-  const reportedLogFile = scratch && !keep && resolve(resolvedLogFile).startsWith(`${resolve(scratch.dest)}${sep}`)
+  const reportedLogFile = scratch && !keep && !retainedScratch && resolve(resolvedLogFile).startsWith(`${resolve(scratch.dest)}${sep}`)
     ? `${scratch.dest}.jsonl` : resolvedLogFile;
   if (reportedLogFile !== resolvedLogFile) scratchLog = { source: resolvedLogFile, dest: reportedLogFile, root: scratch.dest };
   mkdirSync(dirname(resolvedLogFile), { recursive: true });
@@ -1294,6 +1306,8 @@ export async function codexDirectTask({
       // unless the caller explicitly opted in via `wireOriginToRemote`/`--wire-origin-to-remote`.
       realOrigin: scratch.realOrigin,
       originWired: scratch.originWired,
+      // False when the clone is deleted on return (the default without --keep): `dir` is then gone.
+      retained: Boolean(keep || retainedScratch),
     } : { created: false },
     startSha,
     argv: run.argv,
@@ -1611,7 +1625,8 @@ async function main() {
       + "  --resume=<threadId> (R302): continue a previous run's Codex thread (its report's events.threadId) so a follow-up\n"
       + '    fix keeps its context. Requires --dir; not with --output-schema-file or --ephemeral.\n'
       + '  --detach: launch a detached job; print its id and record path immediately.\n'
-      + '  --keep: retain scratch clone and task temp directories for inspection.\n'
+      + '  --keep: retain scratch clone and task temp directories for inspection. Without --json the scratch\n'
+      + '    clone is always retained (it is where the printed edits live); --json removes it unless --keep.\n'
       + '  wait --job=<id> [--max-ms=540000]: poll a job (maximum 9 minutes); exit 75 if still running.\n'
       + '    Aliases: --id=<id> for --job=<id>, --wait=<ms> for --max-ms=<ms> (same validation).\n'
       + '    A terminal task exit 75 is preserved in JSON but wait exits 1.\n'
@@ -1698,6 +1713,9 @@ async function main() {
       clearRolloutAfterRun: Boolean(flags['clear-rollout-after-run']),
       review: Boolean(flags.review),
       keep: Boolean(flags.keep),
+      // Human mode prints the scratch clone as the place to read, commit and push the edits, and shows only a
+      // diffstat, so that clone must outlive the run. --json (and so every detached job) carries the full patch.
+      keepScratch: !flags.json,
       resumeThreadId,
       ...(flags['no-self-review'] ? { selfReview: false } : {}),
     });
@@ -1712,8 +1730,9 @@ async function main() {
     console.log(JSON.stringify(report, null, 2));
   } else {
     console.log('\n──────────────────────────────────────────────────────────');
-    console.log(`codex-direct-task: ${report.scratch.created ? 'scratch clone' : 'target dir'} → ${report.dir}`);
-    if (report.scratch.created && report.scratch.realOrigin) {
+    const scratchGone = report.scratch.created && !report.scratch.retained;
+    console.log(`codex-direct-task: ${report.scratch.created ? 'scratch clone' : 'target dir'} → ${report.dir}${scratchGone ? ' (removed after the run; pass --keep to retain it)' : ''}`);
+    if (!scratchGone && report.scratch.created && report.scratch.realOrigin) {
       console.log(report.scratch.originWired
         ? `  origin wired to the real remote (--wire-origin-to-remote): ${report.scratch.realOrigin}`
         : `  origin left at the local clone source (#3782, not push-capable). Real remote: ${report.scratch.realOrigin}\n`
@@ -1736,7 +1755,9 @@ async function main() {
       for (const s of report.gate.steps) console.log(`    ${s.pass ? '✓' : '✗'} ${s.cmd}${report.gate.unavailable ? ` — ${s.output}` : ''}`);
     }
     if (report.selfReview.notes.length) console.log(renderSelfReviewNotes(report.selfReview));
-    console.log('\n  NOTHING WAS COMMITTED OR PUSHED. Review the diff above (or `cd` into the dir and run `git diff`), then commit/land it yourself if you want it.');
+    console.log(scratchGone
+      ? '\n  NOTHING WAS COMMITTED OR PUSHED, and the scratch clone is gone. Re-run with --keep (or --json for the full patch) to keep the edits.'
+      : '\n  NOTHING WAS COMMITTED OR PUSHED. Review the diff above (or `cd` into the dir and run `git diff`), then commit/land it yourself if you want it.');
     console.log('──────────────────────────────────────────────────────────\n');
   }
   if (flags.job) return jobExitCode(report);

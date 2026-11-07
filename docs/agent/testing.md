@@ -4007,11 +4007,15 @@ test `settings-files`; use heavy admission.
 ## R657 temporary-directory inspection
 
 Codex direct tasks remove owned scratch clones and task temp roots in `finally`, with an exit fallback.
-Before removing a scratch clone on return, exception, or exit, logs inside it are copied to the sibling `<scratch>.jsonl`;
+Before removing a scratch clone on return, exception, or exit, logs inside it are copied to the sibling `<scratch>.jsonl`
+(created exclusively, owner-only 0600);
 if copying fails, cleanup reports the failure and retains the clone with its original log.
 the returned `logFile` names that retained file. Post-adoption object packing takes the shared
 clone WRITE lock without waiting and checks rebuild-job evidence under that lock. Its Git
 commands strip inherited `GIT_*` overrides, matching the serialized GC path.
+The human (non-`--json`) CLI passes `keepScratch: true`: it prints the scratch clone as the place to
+review, commit and push the edits, so that clone survives (its task temp root is still removed);
+`--json` runs, and so every detached job, carry the full patch and remove the clone.
 Use `keep: true` / `--keep` when a caller or test needs to inspect those paths after completion;
 permission assertions about a live task should otherwise run in the injected spawn callback.
 Hermetic per-file cleanup reads late violation rows before removal, also runs at process exit,
