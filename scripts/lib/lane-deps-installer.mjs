@@ -311,7 +311,15 @@ export function ensureLaneDeps({ dir, markerPath, selectPlan, exec, log = () => 
     // predates it and must keep running for our own lease (short, reserved or expired: acquire holds the lane while
     // it installs) and for an expired lease, which protects nothing; only another live process holding the lane,
     // or an unreadable lease, defers it. Skipping silently would hand the caller out-of-date node_modules.
-    if (!claim && (unchanged === 'ok' || hasForeignLiveLease(dir, Date.now(), { ownReservedIsOurs: true }))) return unchanged;
+    if (!claim) {
+      if (unchanged === 'ok') return unchanged;
+      if (hasForeignLiveLease(dir, Date.now(), { ownReservedIsOurs: true })) {
+        // Fail closed, but never silently: callers ignore the return value, so this line is the only trace that the
+        // lane keeps out-of-date node_modules (another live process holds it, or its lease file is unreadable).
+        log('stale deps NOT reinstalled: the lane is held by another live process or its lease is unreadable: ' + dir);
+        return unchanged;
+      }
+    }
   }
   try {
     return installLaneDeps({ dir, markerPath, storeDir, plan, claim, unchanged, exec, log, failedPath });

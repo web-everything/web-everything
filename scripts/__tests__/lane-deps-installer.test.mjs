@@ -577,6 +577,16 @@ describe('lane deps hashing and readiness (real lane directory)', () => {
         expect(exec).not.toHaveBeenCalled();
         expect(existsSync(join(dir, 'node_modules', 'kept'))).toBe(true);
       });
+      it('an UNREADABLE lease fails closed (reports stale, nothing wiped) and says so in the log', () => {
+        const { dir, markerPath, storeDir } = lane({ marker: () => 'pnpm:old' });
+        writeFileSync(leaseFile(dir), '{not json');
+        const exec = vi.fn();
+        const log = vi.fn();
+        expect(ensureLaneDeps({ dir, markerPath, storeDir, selectPlan: () => select({ storeDir }), exec, log })).toBe('stale');
+        expect(exec).not.toHaveBeenCalled();
+        expect(existsSync(join(dir, 'node_modules', 'kept'))).toBe(true);
+        expect(log).toHaveBeenCalledWith(expect.stringContaining('stale deps NOT reinstalled'));
+      });
     });
     it('a failing install still releases the claim', () => {
       const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
