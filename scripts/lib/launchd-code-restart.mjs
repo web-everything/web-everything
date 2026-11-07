@@ -130,7 +130,7 @@ function processStart(label, { launchctl, uid, ps }) {
   if (!Number.isFinite(start)) throw new Error('unreadable process start');
   const cwd = output.match(/^\s*working directory = (.+)$/m)?.[1]?.trim().replace(/^"(.*)"$/, '$1');
   if (!cwd) throw new Error('unknown service clone: inspect launchctl working directory');
-  const root = childProcess.execFileSync('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], commandOptions).trim();
+  const root = childProcess.execFileSync('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024 }).trim();
   if (!root) throw new Error('unknown service clone: inspect its working directory');
   return { start, cloneRoot: root, precisionMs: 1000 };
 }
