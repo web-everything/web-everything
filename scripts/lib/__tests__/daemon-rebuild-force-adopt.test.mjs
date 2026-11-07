@@ -770,6 +770,24 @@ describe('R508 force-adopt: a force-adopted build stays unverified (never the in
     expect(readReadyCandidate(cloneDir, env)).toBeNull();
   });
 
+  it('a build adopted as "no worse" over a failed smoke (harness-broken path, not a force) is likewise never the incremental-smoke baseline', async () => {
+    const { base, originDir, cloneDir, env: env0 } = makeFixture();
+    const env = forceEnv(env0, base);
+    delete env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE; // the default: adopt a candidate that fails only what last-good also fails
+    const F = advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n'));
+    const failAll = vi.fn(async () => ({ verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'dispatch-dry-run', detail: 'F defect', mayBeTransient: false }] } }));
+    const r = await tick(cloneDir, env, { runSmoke: failAll, forceWatchProbe: healthy });
+    expect(r.reason).toBe('harness-broken-adopted-not-worse');
+    expect(headOf(cloneDir)).toBe(F);
+    advanceMain(originDir, (dir) => writeFile(dir, 'scripts/lane-pool.mjs', '// only the pool changed\n'));
+    const runSmoke = incrementalAware();
+    // no-worse off for this tick: the point is which smoke S gets, not whether the harness-broken path can adopt it again
+    await tick(cloneDir, { ...env, WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' }, { runSmoke, forceWatchProbe: healthy });
+    expect(runSmoke).toHaveBeenCalled();
+    expect(runSmoke.mock.calls[0][0].changedFiles).toBeNull(); // a FULL smoke: F failed these checks and never passed them
+    expect(headOf(cloneDir)).toBe(F); // the failing full smoke keeps S out
+  });
+
   it('the same successor IS adopted once the full smoke passes, and a later successor goes back to the incremental smoke', async () => {
     const { originDir, cloneDir, env } = await forceAdoptF();
     const S = advanceMain(originDir, (dir) => writeFile(dir, 'scripts/lane-pool.mjs', '// only the pool changed\n'));

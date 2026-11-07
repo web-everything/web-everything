@@ -572,7 +572,7 @@ export async function smokeAndAdopt({
   /** Adopt `p`, whose smoke just PASSED. fix-rebuild-finalize: the pass is recorded as the clone's ready candidate
    *  FIRST, so a lock refusal here never throws it away — the next write-lock holder (this process's next tick, or
    *  a sibling at its own tick start) adopts it without re-smoking (see prepareRebuild). */
-  const finalize = async (p, onAdopted, readyMeta = { kind: 'candidate' }, smokeResult = null) => {
+  const finalize = async (p, onAdopted, readyMeta = { kind: 'candidate' }, smokeResult = null, { overFailedSmoke = false } = {}) => {
     // Record, BEFORE adopting, that this build's tree passed with a busy-pool skip (see `changedSince`).
     const busySkipped = busyPoolSkippedChecks(smokeResult);
     if (busySkipped.length) {
@@ -586,12 +586,14 @@ export async function smokeAndAdopt({
     // BEFORE adopting; the next smoke runs the FULL smoke until a build passes one. (prepare's skip-unrelated path is unaffected on purpose:
     // it adopts docs-only successors and carries the open force watch, which still guards the force-adopted code.)
     // Fail closed: if the tree cannot be resolved or the record cannot be written, the force is not finalized (the caller aborts it).
-    if (readyMeta?.forced === true) {
+    // The same holds for EVERY adoption over a failed smoke, not only the operator's force: the harness-broken "adopted as no worse" path
+    // (`overFailedSmoke`) adopts a build that failed checks last-good also failed, so those checks were never passed by it either.
+    if (readyMeta?.forced === true || overFailedSmoke === true) {
       const tree = verifyRev(git, `${p.finalSha}^{tree}`);
-      if (!tree) throw new Error('forced build: tree unresolvable, cannot record it as unverified');
-      // `locked` returns null (it does not throw) when the write lock is refused: that must not finalize the force with no record.
+      if (!tree) throw new Error('adopted over a failed smoke: tree unresolvable, cannot record it as unverified');
+      // `locked` returns null (it does not throw) when the write lock is refused: that must not finalize the adoption with no record.
       const recorded = await locked((st) => { st.forceUnverifiedTrees = [tree, ...(st.forceUnverifiedTrees || []).filter((t) => t !== tree)].slice(0, 5); });
-      if (!recorded) throw new Error('forced build: could not record it as unverified (write lock refused)');
+      if (!recorded) throw new Error('adopted over a failed smoke: could not record it as unverified (write lock refused)');
     }
     writeReadyCandidate(root, {
       ...readyMeta,
@@ -955,7 +957,7 @@ export async function smokeAndAdopt({
         alsoFailedOn: bFailed ? ['plain-main', 'last-good'] : ['last-good'],
         message: 'last-good failed every check the candidate failed — adopting the candidate as no worse so a candidate harness fix can arrive',
       });
-      const fin = await finalize(plan, undefined, undefined, a.smokeResult);
+      const fin = await finalize(plan, undefined, undefined, a.smokeResult, { overFailedSmoke: true });
       return { ...fin, reason: fin.adopted ? 'harness-broken-adopted-not-worse' : fin.reason };
     }
     const prevAttempts = priorRejected?.harnessBroken ? (priorRejected.attempts || 1) : 0;
