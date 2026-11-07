@@ -8,7 +8,10 @@
  * second caller must not be able to lose them by construction.
  */
 import { describe, it, expect } from 'vitest';
-import { stageOnTransportBranch, reclaimStrandedTransportWorktrees } from '../git-transport-branch.mjs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { stageOnTransportBranch, reclaimStrandedTransportWorktrees, readFromTransportBranch } from '../git-transport-branch.mjs';
 
 /** Every side effect stubbed, filesystem included. See the header of the module under test for why. */
 const stub = ({ diff = 'ops/x/a.json', onRun } = {}) => {
@@ -402,5 +405,71 @@ describe('the dirty guard sees untracked files whatever the git config says (red
       const kept = existsSync(j(wt, 'net.diff')) ? 'net.diff' : 'a.txt';
       expect(readFileSync(j(wt, kept), 'utf8')).toMatch(/request written|edited and hidden/);
     } finally { rmf(root, { recursive: true, force: true }); }
+  });
+});
+
+describe('read fetch is coalesced through a per-repo+branch TTL stamp in .git', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gtb-ttl-'));
+  const stampDir = join(dir, 'we-ops-fetch');
+  const stampFile = join(stampDir, encodeURIComponent('ops/x'));
+  const mk = () => {
+    const calls = [];
+    const logs = [];
+    let t = 1_000_000;
+    const run = (args) => {
+      calls.push(args[0]);
+      if (args[0] === 'rev-parse') return `${dir}\n`;
+      if (args[0] === 'ls-tree') return 'p';
+      return args[0] === 'show' ? 'text' : '';
+    };
+    const read = (over = {}) => readFromTransportBranch({
+      board: '/board', branch: 'ops/x', paths: ['p'], run, now: () => t, log: (m) => logs.push(m),
+      env: {}, sleep: () => {}, ...over,
+    });
+    return { calls, logs, read, tick: (ms) => { t += ms; } };
+  };
+  const fetches = (c) => c.filter((x) => x === 'fetch').length;
+  const reset = () => rmSync(stampDir, { recursive: true, force: true });
+
+  it('a read within the TTL skips the fetch and logs the source', () => {
+    reset(); const m = mk();
+    m.read(); m.tick(5_000); m.read();
+    expect(fetches(m.calls)).toBe(1);
+    expect(m.logs.join('\n')).toMatch(/source=origin/);
+    expect(m.logs.join('\n')).toMatch(/source=cache/);
+  });
+  it('a read past the TTL fetches again', () => {
+    reset(); const m = mk();
+    m.read(); m.tick(31_000); m.read();
+    expect(fetches(m.calls)).toBe(2);
+  });
+  it('the TTL is overridable by env', () => {
+    reset(); const m = mk();
+    const env = { WE_OPS_FETCH_TTL_MS: '1000' };
+    m.read({ env }); m.tick(2_000); m.read({ env });
+    expect(fetches(m.calls)).toBe(2);
+  });
+  it('a write always fetches, even with a fresh stamp', () => {
+    reset(); const m = mk();
+    m.read();
+    const s = stub();
+    stage(s);
+    expect(s.calls.some((c) => c.args?.[0] === 'fetch')).toBe(true);
+  });
+  it('two concurrent reads fetch once: the lock loser re-checks the stamp the winner wrote', () => {
+    reset(); const m = mk();
+    mkdirSync(stampDir, { recursive: true });
+    const lock = `${stampFile}.lock`;
+    mkdirSync(lock);
+    const sleep = () => { writeFileSync(stampFile, '1000000'); rmSync(lock, { recursive: true }); };
+    m.read({ sleep });
+    expect(fetches(m.calls)).toBe(0);
+  });
+  it('an unreadable stamp fails closed: fetch', () => {
+    reset(); const m = mk();
+    mkdirSync(stampDir, { recursive: true });
+    writeFileSync(stampFile, 'garbage');
+    m.read();
+    expect(fetches(m.calls)).toBe(1);
   });
 });
