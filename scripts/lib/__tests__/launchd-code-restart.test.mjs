@@ -234,6 +234,10 @@ describe('launchd clone restart', () => {
     ['sibling with dot suffix', `${cloneRoot}.bak/sampler.mjs`, false],
     ['sibling inside a shell string', `cd ${cloneRoot}-control && node x`, false],
     ['sibling after an equals', `--dir=${cloneRoot}-control`, false],
+    ['sibling with @ suffix', `${cloneRoot}@2/x`, false],
+    ['sibling with + suffix', `${cloneRoot}+x`, false],
+    ['sibling with ~ suffix', `${cloneRoot}~`, false],
+    ['sibling with % suffix', `${cloneRoot}%20copy/x`, false],
     ['child path', `${cloneRoot}/x.mjs`, true],
     ['shell string', `cd ${cloneRoot} && node x`, true],
     ['attached equals', `--dir=${cloneRoot}`, true],
@@ -258,6 +262,9 @@ describe('launchd clone restart', () => {
     ['/bin/sh', '-c', `cd ${cloneRoot} && rollup -w`],
     ['/bin/sh', '-c', `cd ${cloneRoot} && esbuild --serve=8000`],
     ['/bin/sh', '-c', `cd ${cloneRoot} && bun run serve`],
+    ['/bin/sh', '-c', `(cd ${cloneRoot}; npm start)`],
+    ['/bin/sh', '-c', `cd ${cloneRoot} && $(npm start)`],
+    ['/bin/sh', '-c', `cd ${cloneRoot} && { pnpm dev; }`],
   ])('shell-wrapped dev server is never restarted: %j', async (...args) => {
     const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: args }]);
     const r = await restartServicesForClone(o);

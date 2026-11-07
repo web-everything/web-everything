@@ -292,7 +292,9 @@ function shellSegments(args) {
   for (const arg of args) {
     if (!/\s/.test(arg)) continue;
     for (const part of arg.split(/&&|\|\||[;|&\n]/)) {
-      const tokens = shellSplit(part) ?? part.split(/\s+/);
+      // Subshells, groups and command substitution glue punctuation onto words: `(cd x; npm start)`.
+      const bare = part.replace(/[(){}`]/g, ' ');
+      const tokens = shellSplit(bare) ?? bare.split(/\s+/);
       const words = tokens.filter(Boolean);
       if (words.length) segments.push(words);
     }
@@ -313,7 +315,9 @@ function containsPath(arg, root) {
     const before = at === 0 ? '' : arg[at - 1];
     const after = arg[at + needle.length] ?? '';
     const beforeOk = before === '' || (!PATH_CHAR.test(before) && (before !== '/' || arg[at - 2] === '/'));
-    if (beforeOk && (after === '' || after === '/' || !PATH_CHAR.test(after))) return true;
+    // After: only a real terminator (end, "/", whitespace, quote, shell/list separator) ends the root;
+    // "@", "+", "~", "%" and the like continue a sibling name (`/clones/we@2`).
+    if (beforeOk && (after === '' || after === '/' || /[\s"'`:;,&|()<>=\[\]{}]/.test(after))) return true;
   }
   return false;
 }
