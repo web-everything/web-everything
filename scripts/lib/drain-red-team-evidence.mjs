@@ -151,7 +151,8 @@ function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, 
       if (s.repo !== wantRepo || s.pr !== Number(pr)) continue;
       if (s.rev !== null && s.rev !== want) {
         // Capped-scan fallback only: a live review of ANY other head of this PR still holds (never a finished one).
-        if (!otherHeadsHold || s.kind !== 'undecided') continue;
+        if (!otherHeadsHold || !['undecided', 'hard'].includes(s.kind)) continue;
+        if (s.kind === 'hard') return { complete: true, blocked: true };
         if (s.abandonable && now - st.mtimeMs >= ABANDONED_REVIEW_AFTER_MS) continue;
         return { complete: true, blocked: true };
       }
