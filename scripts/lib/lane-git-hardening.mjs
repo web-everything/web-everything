@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { statSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { userInfo } from 'node:os';
+import { basename, join, resolve } from 'node:path';
 
 /**
  * Git hardening for a process that runs git inside an AGENT-WRITABLE lane clone (we:backlog/5137 review).
@@ -61,10 +62,9 @@ const REMOTE_PROBE_CONFIG_PINS = Object.freeze([
  *  reports for its built-in gitconfig (where `credential.helper=osxkeychain` lives; `--system` does not read it). */
 const TRUSTED_CREDENTIAL_SCOPES = new Set(['system', 'global', 'unknown']);
 const CREDENTIAL_HELPER_KEY_RE = /^credential\.(?:.+\.)?helper$/is;
-/** The only env a trusted-config read passes git: where the system / global files are, and which git runs. No repo
- *  location and no command-scope config (`GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`) can reach the read. */
-const TRUSTED_READ_ENV_KEYS = Object.freeze(['HOME', 'XDG_CONFIG_HOME', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM',
-  'GIT_CONFIG_NOSYSTEM', 'PATH']);
+/** Env that would make the hardened git read its system / global config from a place the CALLER chose (a lane CLI
+ *  controls its env): with any of these set differently from the OS account's own home, nothing is replayed. */
+const CONFIG_LOCATION_ENV_KEYS = Object.freeze(['GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'HOME', 'XDG_CONFIG_HOME']);
 /** Above this many trusted helper entries the read fails closed: no helper is replayed (the reset pin stays). */
 export const MAX_TRUSTED_CREDENTIAL_PINS = 64;
 const TRUSTED_READ_MAX_BUFFER = 1024 * 1024;
@@ -103,26 +103,39 @@ const fileSignature = (file) => {
   try { const s = statSync(file); return `${file}:${s.ino}:${s.size}:${s.mtimeMs}`; } catch { return `${file}:absent`; }
 };
 
+const accountHome = () => { try { return userInfo().homedir || ''; } catch { return ''; } };
+
 /**
  * The operator's own credential helpers (and global askpass) as `[key, value]` pins to replay after the reset pins, so a
- * hardened git keeps authenticating with them while no lane-written helper runs. Read with `git config --show-scope
- * --list -z --includes` from `/` (never a lane: no local or worktree scope exists there) with only
- * {@link TRUSTED_READ_ENV_KEYS} from `env`, so it sees the same system / global files the hardened call will read and no
- * command-scope entry; only {@link TRUSTED_CREDENTIAL_SCOPES} entries are kept. Cached per env and config-file stat. Fails
- * closed: a read error, a non-string result or more than {@link MAX_TRUSTED_CREDENTIAL_PINS} helpers replays nothing (one
- * process warning names why; the transport then fails with git's own "could not read Username" error).
+ * hardened git keeps authenticating with them while no lane-written helper runs. The global / system files are located
+ * from the OS account (`os.userInfo().homedir`, git's default system file), NEVER from `env`: when `env` names another
+ * place ({@link CONFIG_LOCATION_ENV_KEYS} — a test's hermetic `GIT_CONFIG_GLOBAL`, or a lane CLI's
+ * `XDG_CONFIG_HOME=<lane dir>`) the hardened call would read a caller-chosen file, so nothing is replayed (fail closed:
+ * the reset pins stay). Read with `git config --show-scope --list -z --includes` from `/` (no local or worktree scope
+ * exists there) with no command-scope config; only {@link TRUSTED_CREDENTIAL_SCOPES} entries are kept. `PATH` /
+ * `DEVELOPER_DIR` pass through: they pick the git binary the hardened call itself runs. A successful read is cached per
+ * config-file stat; a failed one is not, so a timeout under load does not turn auth off for the process. A read error,
+ * a non-string result or more than {@link MAX_TRUSTED_CREDENTIAL_PINS} helpers replays nothing (one process warning
+ * names why; the transport then fails with git's own "could not read Username" error).
  * @param {Record<string,string|undefined>} env
- * @param {{exec?: typeof execFileSync}} options
+ * @param {{exec?: typeof execFileSync, homedir?: string}} options `homedir` is the account home (tests point it at a fixture).
  * @returns {Array<[string,string]>}
  */
-export function trustedCredentialPins(env = process.env, { exec = execFileSync } = {}) {
+export function trustedCredentialPins(env = process.env, { exec = execFileSync, homedir = accountHome() } = {}) {
+  const home = homedir ? resolve(homedir) : '';
+  const expected = { HOME: home, XDG_CONFIG_HOME: home && join(home, '.config') };
+  const redirected = CONFIG_LOCATION_ENV_KEYS.some((key) => {
+    const value = env?.[key];
+    if (value === undefined) return false;
+    return !(key in expected) || !expected[key] || resolve(String(value)) !== expected[key];
+  });
+  if (redirected) return Object.freeze([]);
   const readEnv = {};
-  for (const key of TRUSTED_READ_ENV_KEYS) if (typeof env?.[key] === 'string') readEnv[key] = env[key];
+  if (home && env?.HOME !== undefined) readEnv.HOME = home;
+  for (const key of ['PATH', 'DEVELOPER_DIR', 'GIT_CONFIG_NOSYSTEM']) if (typeof env?.[key] === 'string') readEnv[key] = env[key];
   if (readEnv.PATH === undefined && typeof process.env.PATH === 'string') readEnv.PATH = process.env.PATH;
-  const xdg = readEnv.XDG_CONFIG_HOME || (readEnv.HOME ? join(readEnv.HOME, '.config') : '');
-  const files = readEnv.GIT_CONFIG_GLOBAL !== undefined ? [readEnv.GIT_CONFIG_GLOBAL]
-    : [xdg && join(xdg, 'git', 'config'), readEnv.HOME && join(readEnv.HOME, '.gitconfig')];
-  const cacheKey = JSON.stringify([readEnv, ...files.map(fileSignature), fileSignature(readEnv.GIT_CONFIG_SYSTEM ?? '/etc/gitconfig')]);
+  const files = readEnv.HOME ? [join(home, '.config', 'git', 'config'), join(home, '.gitconfig')] : [];
+  const cacheKey = JSON.stringify([readEnv, ...files.map(fileSignature), fileSignature('/etc/gitconfig')]);
   if (exec === execFileSync && trustedPinCache.has(cacheKey)) return trustedPinCache.get(cacheKey);
   let pins;
   let why = '';
@@ -142,11 +155,11 @@ export function trustedCredentialPins(env = process.env, { exec = execFileSync }
     else why = `the trusted git config read failed (${e?.code ?? e?.status ?? 'error'})`;
   }
   if (why) {
-    pins = [];
     if (!warnedTrustedRead.has(why)) {
       warnedTrustedRead.add(why);
       process.emitWarning(`lane-git-hardening: no trusted credential helper replayed — ${why}`);
     }
+    return Object.freeze([]); // never cached: the next call reads again
   }
   const frozen = Object.freeze(pins.map((pin) => Object.freeze(pin)));
   if (exec === execFileSync) trustedPinCache.set(cacheKey, frozen);
@@ -154,10 +167,12 @@ export function trustedCredentialPins(env = process.env, { exec = execFileSync }
 }
 
 /** The pins as `-c k=v` argv pairs, for a caller that builds its own git command line: the inert pins, then the trusted
- *  credential replays read for `env`. A key containing `=` cannot ride `-c` (git splits at the first `=`), so that
- *  replay is left out — fail closed: the reset pin stays. */
+ *  credential replays read for `env`. A key containing `=` cannot ride `-c` (git splits at the first `=`), and dropping
+ *  only that entry would reorder the replay (a dropped URL-scoped reset lets an earlier helper run for that URL), so
+ *  then NO replay rides the argv — fail closed: the reset pins stay. */
 export const laneGitConfigArgs = ({ env = process.env, trustedPins = trustedCredentialPins(env) } = {}) =>
-  [...LANE_GIT_CONFIG_PINS, ...trustedPins.filter(([k]) => !k.includes('='))].flatMap(([k, v]) => ['-c', `${k}=${v}`]);
+  [...LANE_GIT_CONFIG_PINS, ...(trustedPins.some(([k]) => k.includes('=')) ? [] : trustedPins)]
+    .flatMap(([k, v]) => ['-c', `${k}=${v}`]);
 
 /** Inherited git env that moves where git reads or writes the repository (its dir, work tree, index, objects, refs,
  *  `git config` file) or changes what is reachable (a shallow or graft file hides history; `GIT_REF_PARANOIA=0` lets
