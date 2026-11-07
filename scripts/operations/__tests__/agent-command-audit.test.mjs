@@ -72,6 +72,22 @@ describe('agent command audit', () => {
   ])('classifies bypass %s', (cmd, category) => {
     expect(classifyCommand(cmd)).toEqual([expect.objectContaining({ category, queued: false })]);
   });
+  // Review #6461 round 2: only Node's executable positions count; an argument after the script operand is data.
+  it.each([
+    'node scripts/light.mjs --test', 'node scripts/light.mjs --test a.test.mjs',
+    'node scripts/light.mjs node_modules/vitest/vitest.mjs run a',
+    'node scripts/light.mjs scripts/check-standards.mjs', 'node --title --test light.mjs',
+  ])('ignores Node test flags and entry names after the script operand: %s', cmd => {
+    expect(classifyCommand(cmd)).toEqual([]);
+  });
+  it.each([
+    ['node --test a.test.mjs', 'node --test'], ['node --require ./setup.js --test a', 'node --test'],
+    ['node --no-warnings node_modules/vitest/vitest.mjs run a', 'vitest'],
+    ['node node_modules/.bin/vitest run a', 'vitest'],
+    ['node --max-old-space-size 4096 scripts/check-standards.mjs', 'check:standards'],
+  ])('still classifies Node in executable position: %s', (cmd, category) => {
+    expect(classifyCommand(cmd)).toEqual([expect.objectContaining({ category, queued: false })]);
+  });
   it('keeps admission local to a segment, including inside a loop', () => {
     expect(classifyCommand(`for f in a; do ${queue}npx vitest run "$f"; done; npx vitest run b`).map(r => r.queued)).toEqual([true, false]);
     expect(classifyCommand('npm run test:unit -- a')[0].queued).toBe(true);
@@ -253,6 +269,8 @@ describe('agent command audit', () => {
   it.each([
     ['a deep unclosed nest', '$('.repeat(8000)], ['too many substitutions', 'echo $(a) '.repeat(300)],
     ['an oversized command', 'npm ci ' + '$(a) '.repeat(4000)],
+    // Review #6461 round 2: the length bound alone, with one harmless substitution and no other limit hit.
+    ['one substitution in an oversized command', 'echo $(echo hi) ' + 'a'.repeat(17000)],
   ])('reports %s as one unparsed row instead of throwing', (_, command) => {
     expect(classifyCommand(command)).toEqual([expect.objectContaining({ category: expect.stringMatching(/^unparsed/), queued: false })]);
     expect(auditLines([claude(command)], { date: '2026-07-02' }).rows).toHaveLength(1);

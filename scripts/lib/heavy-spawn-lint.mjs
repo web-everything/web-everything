@@ -249,19 +249,31 @@ export function findUngatedHeavySpawns(source, filename = 'source.mjs', { script
     spawns.push(node);
   });
   // Bind each real comment to exactly one call, including harmless/admitted calls.
+  // Comment ranges come from the parsed file's own trivia (the gaps between tokens), never from re-scanning one
+  // line alone: a line inside a multiline template, a block comment or a continued string can read like a line
+  // comment when lexed by itself, yet is data.
+  const comments = new Map();
+  const collectComments = node => {
+    // JSX text is content, and JSDoc nodes sit inside a comment: neither starts real trivia.
+    if (node.kind === ts.SyntaxKind.JsxText
+      || (node.kind >= ts.SyntaxKind.FirstJSDocNode && node.kind <= ts.SyntaxKind.LastJSDocNode)) return;
+    for (const range of ts.getLeadingCommentRanges(source, node.pos) ?? []) comments.set(range.pos, range);
+    for (const range of ts.getTrailingCommentRanges(source, node.end) ?? []) comments.set(range.pos, range);
+    for (const child of node.getChildren(file)) collectComments(child);
+  };
+  collectComments(file);
   const allowed = new Set();
   const positions = spawns.map(node => ({ node, ...file.getLineAndCharacterOfPosition(node.getStart(file)) }));
-  source.split(/\r?\n/).forEach((text, line) => {
-    const scanner = ts.createScanner(ts.ScriptTarget.Latest, false, ts.LanguageVariant.Standard, text);
-    for (let token = scanner.scan(); token !== ts.SyntaxKind.EndOfFileToken; token = scanner.scan()) {
-      if (token !== ts.SyntaxKind.SingleLineCommentTrivia || !/^\/\/ heavy-admission-allow:\s*\S/.test(scanner.getTokenText())) continue;
-      const start = scanner.getTokenPos();
-      const standalone = !text.slice(0, start).trim();
-      const owner = standalone ? positions.find(pos => pos.line === line + 1)
-        : positions.filter(pos => pos.line === line && pos.character < start).at(-1);
-      if (owner) allowed.add(owner.node);
-    }
-  });
+  const lineStarts = file.getLineStarts();
+  for (const range of comments.values()) {
+    if (range.kind !== ts.SyntaxKind.SingleLineCommentTrivia
+      || !/^\/\/ heavy-admission-allow:\s*\S/.test(source.slice(range.pos, range.end))) continue;
+    const { line, character: start } = file.getLineAndCharacterOfPosition(range.pos);
+    const standalone = !source.slice(lineStarts[line], range.pos).trim();
+    const owner = standalone ? positions.find(pos => pos.line === line + 1)
+      : positions.filter(pos => pos.line === line && pos.character < start).at(-1);
+    if (owner) allowed.add(owner.node);
+  }
   for (const node of spawns) {
     const callee = node.expression;
     const origin = admittedField(node.arguments[0], 'file');

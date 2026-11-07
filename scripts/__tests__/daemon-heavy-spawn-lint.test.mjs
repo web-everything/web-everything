@@ -4,6 +4,8 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { findUngatedHeavySpawns } from '../lib/heavy-spawn-lint.mjs';
+import { resolveAdmissionPolicy } from '../readiness/heavy-admission.mjs';
+import { INVENTORY_RUN_TIMEOUT_MS, inventoryRunnerOptions } from '../conveyor/soak/breaks/auto-rebase-operator-withdrawal.mjs';
 
 const cp = "import { spawnSync } from 'node:child_process';\n";
 describe('daemon heavy spawn admission lint', () => {
@@ -33,7 +35,9 @@ describe('daemon heavy spawn admission lint', () => {
     expect(findUngatedHeavySpawns(ex + `execSync(${JSON.stringify(nest(5, 'npm test'))});`)).toHaveLength(1);
     expect(Date.now() - started).toBeLessThan(2000);
   });
-  it.each([['a deep unclosed nest', '$('.repeat(8000)], ['too many substitutions', 'echo $(a) '.repeat(300)]])(
+  // Review #6461 round 2: the length bound alone (one substitution, harmless body) fails closed too.
+  it.each([['a deep unclosed nest', '$('.repeat(8000)], ['too many substitutions', 'echo $(a) '.repeat(300)],
+    ['one substitution in an oversized command', 'echo $(echo hi) ' + 'a'.repeat(17000)]])(
     'fails closed on %s', (_, command) => {
       expect(findUngatedHeavySpawns(ex + `execSync(${JSON.stringify(command)});`)).toHaveLength(1);
     });
@@ -181,6 +185,33 @@ describe('daemon heavy spawn admission lint', () => {
   });
   it('rejects an allowance mentioned in a string rather than a comment', () => {
     expect(findUngatedHeavySpawns(cp + "const text = '// heavy-admission-allow: fake'; spawnSync('vitest');")).toHaveLength(1);
+  });
+  // Review #6461 round 2: comment ranges come from the whole source, so text that only LOOKS like a line
+  // comment when one line is read alone (inside a multiline template, a block comment or a continued string)
+  // never allows the spawn on the next line.
+  it.each([
+    ['a multiline template', 'const t = `\n// heavy-admission-allow: example\n`; spawnSync(\'vitest\');'],
+    ['a template with substitutions', 'const t = `${a}\n// heavy-admission-allow: example\n${b}`; spawnSync(\'vitest\');'],
+    ['a block comment', '/*\n// heavy-admission-allow: example\n*/ spawnSync(\'vitest\');'],
+    ['a JSDoc block', '/**\n// heavy-admission-allow: example\n */ spawnSync(\'vitest\');'],
+    ['a JSDoc tag', '/**\n * @example\n// heavy-admission-allow: example\n */ spawnSync(\'vitest\');'],
+    ['a line-continued string', "const s = 'a\\\n// heavy-admission-allow: example\\\n'; spawnSync('vitest');"],
+  ])('rejects an allowance inside %s spanning lines', (_, body) => {
+    expect(findUngatedHeavySpawns(cp + body)).toHaveLength(1);
+  });
+  it.each([
+    ['a template substitution', 'const t = `${\n// heavy-admission-allow: parent holds slot\nspawnSync(\'vitest\')}`;'],
+    ['a line after a multiline template', 'const t = `\nx\n`;\n// heavy-admission-allow: parent holds slot\nspawnSync(\'vitest\');'],
+  ])('still accepts a real allowance comment in %s', (_, body) => {
+    expect(findUngatedHeavySpawns(cp + body)).toEqual([]);
+  });
+  // Review #6461 round 2: a lint-fixed spawn with a run cap must not let the slot wait count against that cap.
+  it('keeps the queue wait out of the soak inventory runner timeout', () => {
+    const options = inventoryRunnerOptions('/scratch', { KEEP: '1' });
+    expect(options).toMatchObject({ cwd: '/scratch', timeout: INVENTORY_RUN_TIMEOUT_MS, env: { KEEP: '1' } });
+    const policy = resolveAdmissionPolicy({ platform: { runWaitMs: 600_000 }, env: options.env });
+    expect(policy.settings.runWaitMs).toBe(0);
+    expect(policy.sources.runWaitMs).toMatch(/WE_HEAVY_ADMISSION_RUN_WAIT_MS|env/);
   });
   it('accepts a file using the imported admission helper', () => {
     expect(findUngatedHeavySpawns(cp + "import { admittedArgv as admit } from './readiness/heavy-admission.mjs'; const a = admit('npx', ['vitest']); spawnSync(a.file, a.args);")).toEqual([]);

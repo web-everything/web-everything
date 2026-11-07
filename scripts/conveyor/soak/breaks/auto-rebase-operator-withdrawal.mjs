@@ -16,6 +16,17 @@ const success = stdout => ({ status: 0, stdout: stdout ?? '' });
 const agent = lastMessage => success(JSON.stringify({ exitCode: 0, events: { terminal: 'turn.completed' }, lastMessage }));
 
 // The worker is real; Git is virtual so this probe never mutates repository metadata.
+/** Run cap for the real Vitest child, and the spawn options that keep the queue wait out of it. */
+export const INVENTORY_RUN_TIMEOUT_MS = 30_000;
+/** The admission wrapper's slot wait would otherwise count against the run cap and get the wrapper killed
+ *  mid-wait. Inside a held slot (test:unit / verify set WE_HEAVY_ADMISSION_HELD=1) the wrapper runs the child at
+ *  once; outside one, a zero wait budget makes a busy queue an explicit deferral exit with its reason on stderr
+ *  (reported by the callers' status assertion), never a silent timeout kill. */
+export function inventoryRunnerOptions(cwd, env) {
+  return { cwd, env: { ...env, WE_HEAVY_ADMISSION_RUN_WAIT_MS: '0' }, encoding: 'utf8',
+    timeout: INVENTORY_RUN_TIMEOUT_MS, maxBuffer: 1024 * 1024 };
+}
+
 // realRunner exercises Vitest's actual file-filter/exclude behavior with the reported paths.
 export async function runTestInventoryCase({ mode = 'excluded', realRunner = false, rewriteBases, pendingFailure } = {}) {
   const dir = fs.mkdtempSync(join(tmpdir(), 'soak-auto-inventory-'));
@@ -64,9 +75,7 @@ export async function runTestInventoryCase({ mode = 'excluded', realRunner = fal
         // Same exclusion as the repository's unit config; no project setup or external state.
         fs.writeFileSync(join(scratch, 'vitest.config.mjs'), `export default { test: { passWithNoTests: true, exclude: [${JSON.stringify(integration)}], poolOptions: { threads: { minThreads: 1, maxThreads: 1 } } } };\n`);
         const admitted = admittedArgv(process.execPath, [join(REPO, 'node_modules/vitest/vitest.mjs'), ...args.slice(args.indexOf('--') + 3)]);
-        runnerResult = spawnSync(admitted.file, admitted.args, {
-          cwd: scratch, env, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
-        });
+        runnerResult = spawnSync(admitted.file, admitted.args, inventoryRunnerOptions(scratch, env));
         if (runnerResult.status === 0) fs.writeFileSync(testReport, JSON.stringify(heavyTestReport(runnerResult.stdout, { root: fs.realpathSync(scratch), args })));
         return runnerResult;
       }

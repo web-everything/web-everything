@@ -92,6 +92,14 @@ describe('heavy-enforce — every direct test run requires admission', () => {
     'env -u NAME -- X=1 gtimeout 5 npx vitest run a',
     'exec npx vitest run a',
     'timeout 290 npx vitest run a.test.mjs 2>&1 | tail -15',
+    // Review #6461 round 2: nested shells, substitutions, subshells and chains (guard-bash's nested-command recursion).
+    "bash -c 'npx vitest run a'", 'sh -c "npx vitest run a"', "bash -lc 'npx playwright test a'",
+    'echo $(npx vitest run a)', 'echo `npx vitest run a`', 'x="$(node --test a.test.mjs)"',
+    '(npx vitest run a)', '(cd /tmp && node scripts/check-standards.mjs)',
+    'true && npx vitest run a', 'false || npx vitest run a', 'true; npx vitest run a',
+    // A command-text HELD assignment is not admission: only the wrapper itself sets it, in its child's env.
+    'WE_HEAVY_ADMISSION_HELD=1 npx vitest run a', 'export WE_HEAVY_ADMISSION_HELD=1; npx vitest run a',
+    'env WE_HEAVY_ADMISSION_HELD=1 npx vitest run a',
     ...['timeout', 'gtimeout'].flatMap(wrapper => [
       `${wrapper} 5 npx playwright test a`,
       `${wrapper} 5 node --test a.test.mjs`,
@@ -114,6 +122,8 @@ describe('heavy-enforce — every direct test run requires admission', () => {
     queue + 'gtimeout 5 npx vitest run a',
     'env -i X=1 ' + queue + 'timeout 5 npx vitest run a',
     'exec ' + queue + 'npx vitest run a',
+    "bash -c '" + queue + "npx vitest run a'", 'echo $(' + queue + 'npx vitest run a)',
+    '(' + queue + 'npx vitest run a)', 'true && ' + queue + 'npx vitest run a',
     'grep vitest x', 'echo npx vitest run', 'npx vitest --version', 'vitest --help',
     'git commit -m "document npx vitest run"',
   ])('allows admitted control flow or harmless mention `%s`', cmd => {

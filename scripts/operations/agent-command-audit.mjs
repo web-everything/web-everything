@@ -274,12 +274,12 @@ export function classifyCommand(cmd, depth = 0, withSubstitutions = true) {
     }
     if (/^(?:npm|pnpm|yarn|bun)\s+run\s+(?:test:unit|check:standards)(?:\s|$)/.test(head)) queued = true;
     let category;
-    if (/^(?:vitest(?:@\S*)?\b|(?:pnpm|yarn|bun)\s+(?:exec\s+)?vitest\b|node\s+.*\b(?:vitest\.mjs|vitest\/dist\/cli\.js|\.bin\/vitest)\b)/.test(head)
+    // A `node` head is classified only by the Bash guard's executable-position parser below: `--test` or a vitest /
+    // check-standards path after the script operand is that script's own argument (`node light.mjs --test`).
+    if (/^(?:vitest(?:@\S*)?\b|(?:pnpm|yarn|bun)\s+(?:exec\s+)?vitest\b)/.test(head)
       && !/\s(?:--version|-v|--help|-h)(?:\s|$)/.test(head)) category = 'vitest';
     else if (/^(?:(?:pnpm|yarn|bun)\s+(?:exec\s+)?|npm\s+(?:exec|x)\s+(?:--\s+)?)?playwright(?:@\S*)?\s+test\b/.test(head)) category = 'playwright';
-    else if (/^node\s+.*?--test(?:=\S*)?(?:\s|$)/.test(head)
-      && !/^node\s+(?:(?:--\S+|-\w)\s+)*(?:--check|-c|--eval|-e|--print|-p|--version|-v|--help|-h)(?:\s|$)/.test(head)) category = 'node --test';
-    else if (/^node\s+.*\bcheck-standards\.mjs\b/.test(head) || /^(?:npm|pnpm)\s+run\s+check:standards(?:\s|$)/.test(head)) category = 'check:standards';
+    else if (/^(?:npm|pnpm)\s+run\s+check:standards(?:\s|$)/.test(head)) category = 'check:standards';
     else if (/^(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test\b|t\b|tst\b|check:(?:visual|render)\b)/.test(head)) category = 'npm test/check';
     // The Bash guard's classifier catches spellings the patterns above miss (`npm --prefix . test`, `npm -s test`).
     else if (HEAVY_KIND_CATEGORY[ungatedHeavyRunKind(head)]) category = HEAVY_KIND_CATEGORY[ungatedHeavyRunKind(head)];
