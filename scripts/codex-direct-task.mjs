@@ -114,11 +114,11 @@ import { laneGitConfigArgs, hardenLaneGitArgs, laneGitHardeningEnv } from './lib
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
 import { readProcStart } from './lib/daemon-jobs-runtime.mjs';
 import {
-  mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, openSync, closeSync, renameSync,
+  mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, openSync, closeSync, renameSync, fchmodSync, readSync, writeSync, realpathSync, statSync,
 } from 'node:fs';
 import jobAsyncFs from 'node:fs/promises';
 import { tmpdir, homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -247,6 +247,12 @@ export function assertResumeRequest({ resumeThreadId, ephemeral = false, outputS
 /** R650: directory of refusing vitest/playwright/npx shims, prepended to PATH inside Codex runs only. */
 export const CODEX_SHIM_DIR = resolve(process.env.WE_CODEX_SHIM_DIR || join(dirname(new URL(import.meta.url).pathname), 'codex-shims'));
 /** PATH with the shim dir first (deduped). */
+/** Symlink-free absolute path (its parent's, when the path itself does not exist yet); else just resolved. */
+export function canonicalPath(path) {
+  try { return realpathSync(path); } catch { /* not created yet */ }
+  try { return join(realpathSync(dirname(path)), basename(path)); } catch { return resolve(path); }
+}
+
 export function codexShimPath(env = process.env) {
   const rest = String(env.PATH ?? '').split(':').filter((d) => d && d !== CODEX_SHIM_DIR);
   return [CODEX_SHIM_DIR, ...rest].join(':');
@@ -614,6 +620,7 @@ export function detachedGateExecFn(bin, args, opts = {}) {
       clearTimeout(graceTimer);
       process.removeListener('SIGINT', onSigint);
       process.removeListener('SIGTERM', onSigterm);
+      process.removeListener('SIGHUP', onSighup);
     };
     const settle = (code, signal) => {
       if (settled) return;
@@ -644,6 +651,8 @@ export function detachedGateExecFn(bin, args, opts = {}) {
     };
     const onSigint = () => cancel('SIGINT');
     const onSigterm = () => cancel('SIGTERM');
+    // A detached gate never sees the terminal's hangup: kill it on ours.
+    const onSighup = () => cancel('SIGHUP');
     const fail = error => { failure ??= error; killGroup(); startGrace(); };
     for (const stream of ['stdout', 'stderr']) {
       child[stream].on('data', chunk => {
@@ -677,6 +686,7 @@ export function detachedGateExecFn(bin, args, opts = {}) {
     // Run before the internal-job listener exits and writes the failed job record.
     process.prependListener('SIGINT', onSigint);
     process.prependListener('SIGTERM', onSigterm);
+    process.prependListener('SIGHUP', onSighup);
   });
 }
 
@@ -821,27 +831,153 @@ function finishScratchClone({
  * @param {string} opts.dir
  * @param {string} opts.startSha
  * @param {Function} [opts.execFn]
- * @returns {{status: string, diff: string, diffStat: string, commits: string[], hasChanges: boolean}}
+ * @param {boolean} [opts.binarySafe] - also capture `patch`: `git diff --binary`, which `git apply --binary`
+ *   rebuilds byte for byte (binary paths are base85-encoded). `patchExact` is true only when those bytes
+ *   survive the UTF-8 string the report carries; a non-UTF-8 text edit, a failed read (e.g. maxBuffer) or an
+ *   unverifiable non-Buffer result is `false`, so the caller keeps the clone instead of trusting the patch.
+ *   `diff` itself stays `--text` (the review read: a path marked binary must stay visible to review).
+ * @returns {{status: string, diff: string, diffStat: string, commits: string[], hasChanges: boolean,
+ *   patch?: string|null, patchExact?: boolean, patchError?: string}}
  */
-export function captureDiff({ dir, startSha, execFn = defaultExecFn }) {
+export function captureDiff({ dir, startSha, execFn = defaultExecFn, binarySafe = false }) {
   if (typeof dir !== 'string' || !dir.trim()) throw new TypeError('codex-direct-task: `dir` must be a non-empty path');
   if (typeof startSha !== 'string' || !startSha.trim()) throw new TypeError('codex-direct-task: `startSha` must be a non-empty sha');
 
   // Codex can write this checkout's git config: the shared lane pins apply, diff drivers and textconv stay off, and a
   // checkout that defines a filter driver (which `status`/`diff` would run on worktree content) is refused first.
-  const git = (args) => execFn('git', ['-C', dir, ...laneGitConfigArgs(), '--no-replace-objects', ...hardenLaneGitArgs(args)],
-    { env: laneGitHardeningEnv(), timeout: GIT_STEP_TIMEOUT_MS });
+  const git = (args, extra = {}) => execFn('git', ['-C', dir, ...laneGitConfigArgs(), ...CAPTURE_GIT_CONFIG_ARGS, '--no-replace-objects', ...hardenLaneGitArgs(args)],
+    { env: laneGitHardeningEnv(), timeout: GIT_STEP_TIMEOUT_MS, ...extra });
   assertNoLaneFilterDrivers(git);
-  const status = git(['status', '--porcelain', '-z']);
+  // `--untracked-files=all`: a `status.showUntrackedFiles=no` the checkout sets must not hide new files.
+  const status = git(['status', '--porcelain', '-z', '--untracked-files=all']);
   const untracked = status.split('\0').filter((l) => l.startsWith('?? ')).map((l) => l.slice(3));
+  let intentToAddError;
   if (untracked.length) {
-    try { git(['add', '--intent-to-add', '--', ...untracked]); } catch { /* best-effort */ }
+    try { git(['add', '--intent-to-add', '--', ...untracked]); } catch (error) { intentToAddError = error; }
   }
   const diff = git(['diff', '--text', startSha]);
   const diffStat = git(['diff', '--stat', startSha]);
   const commitsRaw = git(['log', '--oneline', `${startSha}..HEAD`]);
   const commits = commitsRaw.split('\n').map((l) => l.trim()).filter(Boolean);
-  return { status: status.split('\0').filter(Boolean).join('\n'), diff, diffStat, commits, hasChanges: diff.trim().length > 0 || commits.length > 0 };
+  const result = { status: status.split('\0').filter(Boolean).join('\n'), diff, diffStat, commits, hasChanges: diff.trim().length > 0 || commits.length > 0 };
+  if (binarySafe) Object.assign(result, captureBinaryPatch(git, startSha, { dir, untracked, intentToAddError }));
+  return result;
+}
+
+/** Checkout config Codex can write that makes git's view HIDE a worktree edit (both diffs empty, so an empty "exact"
+ *  patch would let cleanup delete the only copy): `core.fileMode=false` drops executable-bit edits, `core.autocrlf`
+ *  normalizes CRLF-only edits away, `core.ignoreStat` stops git noticing edits, `core.trustctime=false` /
+ *  `core.checkStat=minimal` miss a same-size edit whose mtime was restored (git's ctime check is per second, so only
+ *  an edit within the second the clone's index recorded the file can still slip past: Codex starts later than that),
+ *  `core.symlinks=false` hides a symlink
+ *  turned into a file, and `attr.tree` swaps in attributes (text/eol rules) from outside the worktree. Pinned for
+ *  every capture read. Index bits (assume-unchanged, skip-worktree), `.git/info/attributes` and a case-only rename
+ *  cannot be pinned off: they are refused as not byte-exact in `captureBinaryPatch`. */
+export const CAPTURE_GIT_CONFIG_ARGS = Object.freeze(['-c', 'core.fileMode=true', '-c', 'core.autocrlf=false', '-c', 'core.ignoreStat=false',
+  '-c', 'core.trustctime=true', '-c', 'core.checkStat=default', '-c', 'core.symlinks=true', '-c', 'attr.tree=']);
+
+/** Fixed output shape for the byte-exact patch: the checkout's git config (which Codex can write) or the host's
+ *  must not colour it, drop or rename its `a/`/`b/` prefixes, or narrow it to a subdirectory — any of those
+ *  yields a patch `git apply` refuses while it still decodes as clean UTF-8. `--unified=3`: a `diff.context=0`
+ *  patch does not apply. `--ignore-submodules=none`: a gitlink change is never hidden (and is refused below).
+ *  `--binary` implies `--full-index`. */
+export const BINARY_PATCH_DIFF_ARGS = Object.freeze(['diff', '--binary', '--no-color', '--src-prefix=a/', '--dst-prefix=b/', '--no-relative',
+  '--unified=3', '--ignore-submodules=none']);
+
+/** A gitlink (mode 160000) line in the patch: it carries only a commit id, never the nested repository's files. */
+const GITLINK_PATCH_RE = /^(?:(?:new file|deleted file|new|old) mode 160000|index [0-9a-f]+\.\.[0-9a-f]+ 160000|[-+]Subproject commit [0-9a-f]+)$/m;
+
+const notExact = (reason) => ({ patch: null, patchExact: false, patchError: String(reason?.message ?? reason).split('\n')[0] });
+
+/** A non-empty regular file at `path`; a missing path is false, any other stat failure is doubt (true). */
+function hasContent(path) {
+  try { const st = statSync(path); return st.isFile() && st.size > 0; }
+  catch (error) { return error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR'; }
+}
+
+const nfc = (name) => name.normalize('NFC');
+
+/** The first tracked path whose name (or a parent directory's) exists on disk only under a different case: on a
+ *  case-insensitive filesystem (`core.ignoreCase`) git reports such a rename as no change, so the patch would
+ *  rebuild the old name. Names compare in NFC: macOS git lists precomposed names (`core.precomposeUnicode`) while
+ *  the disk may store them decomposed, which is the same name, not a rename. A missing path is a deletion git does
+ *  see; a listing failure other than a missing directory is doubt (thrown). Each directory is listed once. */
+function caseOnlyRename(dir, paths) {
+  const listings = new Map();
+  const listing = (rel) => {
+    if (!listings.has(rel)) {
+      let names = null;
+      try {
+        const raw = readdirSync(rel ? join(dir, rel) : dir).map(nfc);
+        names = { exact: new Set(raw), folded: new Set(raw.map(name => name.toLowerCase())) };
+      } catch (error) { if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error; }
+      listings.set(rel, names);
+    }
+    return listings.get(rel);
+  };
+  for (const path of paths) {
+    const parts = path.replace(/\/$/, '').split('/').map(nfc);
+    for (let i = 0; i < parts.length; i += 1) {
+      const names = listing(parts.slice(0, i).join('/'));
+      if (!names) break;
+      if (names.exact.has(parts[i])) continue;
+      if (names.folded.has(parts[i].toLowerCase())) return path;
+      break;
+    }
+  }
+  return null;
+}
+
+/** `captureDiff`'s byte-exact patch (see its `binarySafe`). Never throws: any doubt is a not-exact patch. */
+function captureBinaryPatch(git, startSha, { dir, untracked, intentToAddError }) {
+  // A new file the intent-to-add step could not stage is missing from every diff, so the patch is incomplete.
+  if (intentToAddError) return notExact(`new files could not be staged for the diff: ${intentToAddError.message ?? intentToAddError}`);
+  try {
+    // `.git/info/exclude` and `core.excludesFile` sit outside the committed tree (Codex can write both): a new
+    // file they hide is in the clone but not in the patch. Only the repository's own `.gitignore` files count.
+    const listed = git(['ls-files', '-z', '--others', '--exclude-per-directory=.gitignore']);
+    const seen = new Set(untracked);
+    const hidden = String(listed ?? '').split('\0').filter(path => path && !seen.has(path));
+    if (hidden.length) return notExact(`${hidden.length} new file(s) hidden by an exclude file outside .gitignore (e.g. ${JSON.stringify(hidden[0])})`);
+    // An assume-unchanged (lowercase tag) or skip-worktree (`S`) bit makes git skip a tracked path's worktree
+    // content, so an edit to it is in neither diff. Any entry this cannot parse is doubt too.
+    const flagged = [];
+    const tracked = [];
+    for (const entry of String(git(['ls-files', '-z', '-v']) ?? '').split('\0')) {
+      if (!entry) continue;
+      const match = /^([A-Za-z?]) (.+)$/s.exec(entry);
+      if (!match) return notExact(`unreadable index entry ${JSON.stringify(entry.slice(0, 80))}`);
+      if (match[1] === 'S' || match[1] !== match[1].toUpperCase()) flagged.push(match[2]);
+      tracked.push(match[2]);
+    }
+    if (flagged.length) return notExact(`${flagged.length} tracked path(s) carry an assume-unchanged or skip-worktree index bit, so edits to them are hidden (e.g. ${JSON.stringify(flagged[0])})`);
+    const renamed = caseOnlyRename(dir, tracked);
+    if (renamed) return notExact(`a case-only rename of ${JSON.stringify(renamed)} is invisible to git on this filesystem`);
+    // `.git/info/attributes` sits outside the committed tree and no config turns it off: its text/eol rules can
+    // normalize an edit away. Only the repository's own `.gitattributes` files count.
+    const attributesPath = String(git(['rev-parse', '--git-path', 'info/attributes']) ?? '').trim();
+    if (attributesPath && hasContent(isAbsolute(attributesPath) ? attributesPath : join(dir, attributesPath))) {
+      return notExact('a .git/info/attributes file outside the committed tree can hide edits');
+    }
+  } catch (error) { return notExact(error); }
+  let raw;
+  try { raw = git([...BINARY_PATCH_DIFF_ARGS, startSha], { encoding: 'buffer' }); }
+  catch (error) { return notExact(error); }
+  if (!Buffer.isBuffer(raw)) {
+    // An injected execFn that ignored the buffer encoding: only an empty patch is known to be exact.
+    const patch = String(raw ?? '');
+    return { patch, patchExact: patch === '' };
+  }
+  const patch = raw.toString('utf8');
+  // A nested repository (or submodule bump) travels as a bare commit id: its files exist only in the clone.
+  if (GITLINK_PATCH_RE.test(patch)) return { ...notExact('the patch has a nested repository (gitlink) whose files it cannot carry'), patch };
+  return { patch, patchExact: Buffer.from(patch, 'utf8').equals(raw) };
+}
+
+/** True only when a captured diff proved the clone holds no edits: nothing changed AND no capture doubt (a hidden
+ *  or unstaged new file is in neither diff, so `hasChanges` alone cannot prove it). */
+export function diffProvesNoEdits(diff) {
+  return Boolean(diff) && !diff.hasChanges && diff.patchExact !== false;
 }
 
 /**
@@ -974,6 +1110,7 @@ export async function runCodexDirectExec({
     const removeSignalListeners = () => {
       process.removeListener('SIGINT', onSigint);
       process.removeListener('SIGTERM', onSigterm);
+      process.removeListener('SIGHUP', onSighup);
     };
     const killWorker = () => {
       try {
@@ -988,6 +1125,8 @@ export async function runCodexDirectExec({
     };
     const onSigint = () => onSignal('SIGINT');
     const onSigterm = () => onSignal('SIGTERM');
+    // The worker is detached (its own session), so a terminal hangup reaches only us: kill it then too.
+    const onSighup = () => onSignal('SIGHUP');
     const settle = (r) => {
       if (settled) return;
       settled = true;
@@ -1013,6 +1152,7 @@ export async function runCodexDirectExec({
     // first, before that handler can exit the wrapper and leave its detached worker running.
     process.prependListener('SIGINT', onSigint);
     process.prependListener('SIGTERM', onSigterm);
+    process.prependListener('SIGHUP', onSighup);
     if (timeoutMs > 0) {
       timer = setTimeout(() => {
         killed = true;
@@ -1049,6 +1189,36 @@ export async function runCodexDirectExec({
 
 // ── the orchestrator ──────────────────────────────────────────────────────────────────────────────
 
+/** The signals whose default action kills this process without running 'exit' handlers or `finally`. */
+export const TERMINATING_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+const signalCleanups = new Set();
+
+// R688: the worker and gate wrappers kill their child group, remove themselves and re-raise the signal, and the
+// default action then skips the 'exit' hook and `finally`. One shared handler runs every active run's cleanup
+// (a self-review repair nests a second run) and re-raises. When any other handler remains (an embedding host, a
+// --job child's exit handler) that handler decides: a run it lets continue must keep its clone, and the exit hook
+// and `finally` clean up when the run does end.
+function onTerminatingSignal(signal) {
+  if (process.listenerCount(signal) > 1) return;
+  const cleanups = [...signalCleanups];
+  signalCleanups.clear();
+  for (const name of TERMINATING_SIGNALS) process.removeListener(name, onTerminatingSignal);
+  for (const cleanup of cleanups) {
+    try { cleanup(); } catch { /* best effort before the signal ends the process */ }
+  }
+  process.kill(process.pid, signal);
+}
+
+/** Run `cleanup` synchronously if a terminating signal arrives; returns the unregister function. */
+function registerSignalCleanup(cleanup) {
+  if (signalCleanups.size === 0) for (const name of TERMINATING_SIGNALS) process.on(name, onTerminatingSignal);
+  signalCleanups.add(cleanup);
+  return () => {
+    if (!signalCleanups.delete(cleanup) || signalCleanups.size) return;
+    for (const name of TERMINATING_SIGNALS) process.removeListener(name, onTerminatingSignal);
+  };
+}
+
 /**
  * THE ENTRY POINT a caller (a CLI invocation, or another script) uses. Resolves the target directory
  * (caller-named, or a fresh scratch clone), runs `codex exec`, captures the diff, optionally gates, and
@@ -1078,6 +1248,8 @@ export async function runCodexDirectExec({
  *   shape (`collectAndClearRolloutQuota`) instead of the default read-only lookup — only worth setting for a
  *   caller with no `codex exec resume` use case for this particular run (see `readRolloutQuota`'s header).
  *   Default false: this script's whole point is resumability.
+ * @param {boolean} [opts.keep] - retain every owned temp dir (scratch clone and task temp root).
+ * @param {boolean} [opts.keepScratch] - retain only the scratch clone (the human CLI's output points into it).
  * @param {NodeJS.ProcessEnv} [opts.env] - for `resolveCodexHome`. Default `process.env`.
  * @param {Function} [opts.execFn]
  * @param {Function} [opts.spawnFn]
@@ -1123,6 +1295,8 @@ export async function codexDirectTask({
   collectQuotaFn = collectAndClearRolloutQuota,
   loadTranscriptCheck = () => import('./lib/codex-transcript-check.mjs'),
   resumeThreadId,
+  keep = false,
+  keepScratch = false,
 } = {}) {
   // Fail before any clone, install or spawn work: a bad resume target must not cost a run.
   if (resumeThreadId !== undefined) assertResumeRequest({ resumeThreadId, ephemeral, outputSchemaFile, dir });
@@ -1147,6 +1321,59 @@ export async function codexDirectTask({
   if (!['none', 'related', 'standards', 'full'].includes(gate)) throw new Error('invalid build gate');
   if (!review && ephemeral && policy.selfReview.enabled) throw new Error('--ephemeral requires self-review off (--no-self-review or build.selfReview.enabled=false): a repair must resume the original builder');
   const briefPolicy = { ...policy, finalGate: gate };
+  const tempDirs = [];
+  let scratchLog;
+  // The preserved log sits beside the private mkdtemp clone in the shared tmpdir: create it owner-only
+  // (0600) and exclusively (`wx`, never through a pre-planted file or symlink), then refresh it in place.
+  // A stale file at that name (a reused temp name) is unlinked first, never written through; a directory
+  // or a file this user cannot remove makes the copy fail, and cleanup then retains the clone.
+  const preserveScratchLog = () => {
+    if (!scratchLog || !existsSync(scratchLog.source)) return;
+    if (!scratchLog.written) rmSync(scratchLog.dest, { force: true });
+    const fd = openSync(scratchLog.dest, scratchLog.written ? 'w' : 'wx', 0o600);
+    try {
+      fchmodSync(fd, 0o600);
+      // Chunked copy: a long transcript never sits in memory whole.
+      const src = openSync(scratchLog.source, 'r');
+      try {
+        const chunk = Buffer.allocUnsafe(1 << 20);
+        for (let n; (n = readSync(src, chunk, 0, chunk.length, null)) > 0;) writeSync(fd, chunk, 0, n);
+      } finally { closeSync(src); }
+    } finally { closeSync(fd); }
+    scratchLog.written = true;
+  };
+  // A human CLI run with no --dir leaves its edits only in the scratch clone it prints (keepScratch), and a --json
+  // run whose patch is not byte-exact keeps it too. Set on a successful return, or on a throw after Codex started
+  // that may leave edits (its error names the clone); an earlier throw prints just its error, and its clone is
+  // cleaned up. A signal or process exit mid-run (a cancelled task) still cleans up, through the signal or exit hook.
+  let retainedScratch;
+  // Set once Codex may have edited a scratch clone this run deletes; `capturedDiff` once the final diff is read.
+  let editsAt = null;
+  let capturedDiff;
+  let cleaned = false;
+  const cleanupTemps = () => {
+    if (keep || cleaned) return;
+    cleaned = true;
+    let retainedClone = retainedScratch;
+    if (!retainedClone) try { preserveScratchLog(); }
+    catch (error) {
+      retainedClone = scratchLog.root;
+      emit(`codex-direct-task: log preservation failed; retaining ${retainedClone}: ${error.message}`);
+    }
+    for (const path of tempDirs) {
+      if (path === retainedClone) continue;
+      try { rmSync(path, { recursive: true, force: true }); } catch { /* best effort on exit */ }
+    }
+  };
+  const allocateTemp = (prefix) => {
+    const path = mkTempDir(prefix);
+    tempDirs.push(path);
+    return path;
+  };
+  process.once('exit', cleanupTemps);
+  // A signal's default action ends the process with neither 'exit' nor `finally` (R688).
+  const removeSignalCleanup = registerSignalCleanup(cleanupTemps);
+  try {
   let targetDir = dir;
   let scratch = null;
   if (!targetDir) {
@@ -1158,7 +1385,7 @@ export async function codexDirectTask({
       throw new Error(`codex-direct-task: gate-unavailable — --gate=${gate} needs scripts/verify-lane.mjs, which ${repoRoot} does not have; pass --gate=standards or --gate=none`);
     }
     scratch = await setupScratchClone({
-      repoRoot, mkTempDir, execFn, existsFn, installDeps, installStdio, wireOriginToRemote,
+      repoRoot, mkTempDir: allocateTemp, execFn, existsFn, installDeps, installStdio, wireOriginToRemote,
       installExecFn, installTimeoutMs, cloneExecFn, cloneTimeoutMs,
     });
     targetDir = scratch.dest;
@@ -1175,20 +1402,28 @@ export async function codexDirectTask({
   // into `captureDiff`'s output. A caller-supplied `--log=<path>` is trusted as-is (their choice, their risk).
   const gitDir = execFn('git', ['-C', targetDir, 'rev-parse', '--absolute-git-dir'], { timeout: GIT_STEP_TIMEOUT_MS }).trim();
   const resolvedLogFile = logFile || join(gitDir, review ? `codex-self-review-${randomUUID()}.jsonl` : 'codex-direct-task.jsonl');
+  // `git rev-parse --absolute-git-dir` prints the canonical path (macOS: /private/var/… for a /var/… tmpdir),
+  // so compare against both spellings of the clone root, or the in-clone log is never preserved.
+  const scratchRoots = scratch ? [resolve(scratch.dest), canonicalPath(scratch.dest)] : [];
+  const reportedLogFile = scratch && !keep
+    && scratchRoots.some(root => canonicalPath(resolvedLogFile).startsWith(`${root}${sep}`) || resolve(resolvedLogFile).startsWith(`${root}${sep}`))
+    ? `${scratch.dest}.jsonl` : resolvedLogFile;
+  if (reportedLogFile !== resolvedLogFile) scratchLog = { source: resolvedLogFile, dest: reportedLogFile, root: scratch.dest };
   mkdirSync(dirname(resolvedLogFile), { recursive: true });
 
   const route = resolveCodexTaskRoute({ kind: taskKind ?? (review ? 'review' : 'worker'), size, epic, decision, care, mandatoryLens,
     model, effort: effort !== undefined || tier !== undefined ? resolveCodexEffort({ tier, effort }) : undefined, env, log });
   ({ model, effort } = route);
 
-  // A private temp root isolates concurrent fixture repositories. Keep it for manual resume/debugging,
-  // just like the persisted Codex session and log; review mode allocates no new writable roots.
-  const tempRoot = review ? undefined : mkdtempSync(join(tmpdir(), 'we-codex-task-tmp-'));
+  // A private temp root isolates concurrent fixture repositories; --keep retains it for inspection.
+  const tempRoot = review ? undefined : allocateTemp(join(tmpdir(), 'we-codex-task-tmp-'));
   // The remote admission root sits beside the heavy lock root, exactly as heavy-admission derives it
   // (`join(dirname(lockRoot), 'remote')`). Without it the sandbox cannot read remote health or take a
   // remote slot, so every Codex-run gate silently fell back to local admission on this host.
   const heavyLockRoot = review ? undefined : resolve(admissionLockRoot(resolve(targetDir), env));
   const writableRoots = review ? [] : [gitDir, heavyLockRoot, join(dirname(heavyLockRoot), 'remote'), tempRoot];
+  // From here on Codex may have edited the scratch clone, so a throw keeps it (see the catch below).
+  if (scratch && !keep) editsAt = { dest: scratch.dest, log: resolvedLogFile };
   const run = await withCodexUsage({ model, effort, taskKind: usageTaskKind ?? taskKind ?? (review ? 'review' : 'worker'), caller, repo, pr, card, cwd: targetDir }, () => runCodexDirectExec({
     dir: targetDir, task, outputSchemaFile, route, model, effort, ephemeral, timeoutMs, logFile: resolvedLogFile, stream, spawnFn, review,
     gitDir, writableRoots, tempRoot, env, policy: briefPolicy, resumeThreadId,
@@ -1216,7 +1451,8 @@ export async function codexDirectTask({
     },
     gate: async () => { gateResult = await executeGate(); return gateResult.pass; },
   }) : { skipped: true, rounds: 0, notes: [] };
-  const diff = captureDiff({ dir: targetDir, startSha, execFn });
+  const diff = captureDiff({ dir: targetDir, startSha, execFn, binarySafe: Boolean(scratch) });
+  capturedDiff = diff;
 
   // #x8wbivt Fork 4: surface the quota signal for any run that actually persisted a rollout (an `--ephemeral`
   // run writes none — nothing to read). Default is read-ONLY (`readQuotaFn`/`readRolloutQuota`) to preserve
@@ -1252,6 +1488,16 @@ export async function codexDirectTask({
 
   }
 
+  // --json (and every detached job) removes the clone and hands back `diff.patch`, so it must rebuild the edit
+  // byte for byte; when it cannot (a non-UTF-8 text edit, a failed binary read) the clone is the only copy.
+  const patchNotExact = Boolean(scratch) && diff.patchExact === false && !diffProvesNoEdits(diff);
+  const retainedReason = !scratch ? null : keep ? 'keep' : keepScratch ? 'human-cli' : patchNotExact ? 'patch-not-byte-exact' : null;
+  if (retainedReason === 'human-cli' || retainedReason === 'patch-not-byte-exact') retainedScratch = scratch.dest;
+  if (retainedReason === 'patch-not-byte-exact') {
+    emit(`codex-direct-task: diff.patch cannot rebuild these edits byte for byte (${diff.patchError ?? 'non-UTF-8 content'}); retaining the scratch clone at ${scratch.dest}`);
+  }
+  if (!retainedScratch) preserveScratchLog();
+
   return {
     model, effort, route,
     dir: targetDir,
@@ -1264,10 +1510,15 @@ export async function codexDirectTask({
       // unless the caller explicitly opted in via `wireOriginToRemote`/`--wire-origin-to-remote`.
       realOrigin: scratch.realOrigin,
       originWired: scratch.originWired,
+      // False when the clone is deleted on return (the default for --json without --keep): `dir` is then gone
+      // and `diff.patch` is the byte-exact copy of the edits. `retainedReason`: keep | human-cli |
+      // patch-not-byte-exact (the patch could not carry the edits, so the clone was kept).
+      retained: Boolean(keep || retainedScratch),
+      retainedReason,
     } : { created: false },
     startSha,
     argv: run.argv,
-    logFile: resolvedLogFile,
+    logFile: retainedScratch ? resolvedLogFile : reportedLogFile,
     exitCode: run.code,
     timedOut: run.timedOut,
     events: summary,
@@ -1287,6 +1538,23 @@ export async function codexDirectTask({
     quotaRolloutFile,
     quotaRolloutCleared,
   };
+  } catch (error) {
+    // Once Codex started, the scratch clone may hold the only copy of its edits (a red self-review repair gate, a
+    // failed capture, a failure after it): keep it unless the captured diff proved there were none. The CLI
+    // prints only the error, so the error names the kept clone and the log inside it.
+    if (editsAt && !cleaned && !retainedScratch && !diffProvesNoEdits(capturedDiff)) {
+      retainedScratch = editsAt.dest;
+      if (error instanceof Error) error.message += ` (scratch clone kept at ${editsAt.dest}: the run failed after Codex started, so its edits may be there; log at ${editsAt.log})`;
+    }
+    // The CLI prints only the error: name the preserved log, or a failed run leaves it unreported in tmpdir.
+    cleanupTemps();
+    if (scratchLog?.written && error instanceof Error) error.message += ` (log kept at ${scratchLog.dest})`;
+    throw error;
+  } finally {
+    cleanupTemps();
+    process.removeListener('exit', cleanupTemps);
+    removeSignalCleanup();
+  }
 }
 
 // ── detached jobs ────────────────────────────────────────────────────────────────────────────────
@@ -1577,6 +1845,10 @@ async function main() {
       + "  --resume=<threadId> (R302): continue a previous run's Codex thread (its report's events.threadId) so a follow-up\n"
       + '    fix keeps its context. Requires --dir; not with --output-schema-file or --ephemeral.\n'
       + '  --detach: launch a detached job; print its id and record path immediately.\n'
+      + '  --keep: retain scratch clone and task temp directories for inspection. Without --json the scratch\n'
+      + '    clone is always retained (it is where the printed edits live); --json removes it unless --keep, and\n'
+      + '    its diff.patch (git apply --binary) rebuilds the edits; when it cannot, the clone is kept\n'
+      + '    (scratch.retainedReason=patch-not-byte-exact).\n'
       + '  wait --job=<id> [--max-ms=540000]: poll a job (maximum 9 minutes); exit 75 if still running.\n'
       + '    Aliases: --id=<id> for --job=<id>, --wait=<ms> for --max-ms=<ms> (same validation).\n'
       + '    A terminal task exit 75 is preserved in JSON but wait exits 1.\n'
@@ -1662,6 +1934,10 @@ async function main() {
       wireOriginToRemote: Boolean(flags['wire-origin-to-remote']),
       clearRolloutAfterRun: Boolean(flags['clear-rollout-after-run']),
       review: Boolean(flags.review),
+      keep: Boolean(flags.keep),
+      // Human mode prints the scratch clone as the place to read, commit and push the edits, and shows only a
+      // diffstat, so that clone must outlive the run. --json (and so every detached job) carries the full patch.
+      keepScratch: !flags.json,
       resumeThreadId,
       ...(flags['no-self-review'] ? { selfReview: false } : {}),
     });
@@ -1676,8 +1952,9 @@ async function main() {
     console.log(JSON.stringify(report, null, 2));
   } else {
     console.log('\n──────────────────────────────────────────────────────────');
-    console.log(`codex-direct-task: ${report.scratch.created ? 'scratch clone' : 'target dir'} → ${report.dir}`);
-    if (report.scratch.created && report.scratch.realOrigin) {
+    const scratchGone = report.scratch.created && !report.scratch.retained;
+    console.log(`codex-direct-task: ${report.scratch.created ? 'scratch clone' : 'target dir'} → ${report.dir}${scratchGone ? ' (removed after the run; pass --keep to retain it)' : ''}`);
+    if (!scratchGone && report.scratch.created && report.scratch.realOrigin) {
       console.log(report.scratch.originWired
         ? `  origin wired to the real remote (--wire-origin-to-remote): ${report.scratch.realOrigin}`
         : `  origin left at the local clone source (#3782, not push-capable). Real remote: ${report.scratch.realOrigin}\n`
@@ -1700,7 +1977,9 @@ async function main() {
       for (const s of report.gate.steps) console.log(`    ${s.pass ? '✓' : '✗'} ${s.cmd}${report.gate.unavailable ? ` — ${s.output}` : ''}`);
     }
     if (report.selfReview.notes.length) console.log(renderSelfReviewNotes(report.selfReview));
-    console.log('\n  NOTHING WAS COMMITTED OR PUSHED. Review the diff above (or `cd` into the dir and run `git diff`), then commit/land it yourself if you want it.');
+    console.log(scratchGone
+      ? '\n  NOTHING WAS COMMITTED OR PUSHED, and the scratch clone is gone. Re-run with --keep (or --json for the full patch) to keep the edits.'
+      : '\n  NOTHING WAS COMMITTED OR PUSHED. Review the diff above (or `cd` into the dir and run `git diff`), then commit/land it yourself if you want it.');
     console.log('──────────────────────────────────────────────────────────\n');
   }
   if (flags.job) return jobExitCode(report);
@@ -1725,8 +2004,8 @@ if (isMain) {
     try { finish(code); } catch (e) { console.error(`codex-direct-task: job update failed: ${e.message}`); process.exitCode = 1; }
   });
   if (internalJob) {
-    for (const signal of ['SIGINT', 'SIGTERM']) {
-      process.once(signal, () => process.exit(signal === 'SIGINT' ? 130 : 143));
+    for (const [signal, code] of [['SIGINT', 130], ['SIGTERM', 143], ['SIGHUP', 129]]) {
+      process.once(signal, () => process.exit(code));
     }
   }
   (async () => {
