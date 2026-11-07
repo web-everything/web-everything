@@ -187,7 +187,7 @@ export function runDepsInstaller({ plan, hashFor, marker, hasNodeModules, exec, 
  * call ensureDeps on leased lanes too, so a lane in use must never be migrated; our own acquire's lease is fine.
  * An unreadable lease file reads as foreign-held (fail closed).
  */
-export function hasForeignLiveLease(dir, nowMs = Date.now()) {
+export function hasForeignLiveLease(dir, nowMs = Date.now(), { ownReservedIsOurs = false } = {}) {
   const file = join(dir, '.git', '.lane-lease');
   if (!existsSync(file)) return false;
   try {
@@ -195,7 +195,9 @@ export function hasForeignLiveLease(dir, nowMs = Date.now()) {
     // bootstrap fixture copies only this file's declared imports). TTL runs from the later of acquire/renew.
     const lease = JSON.parse(readFileSync(file, 'utf8'));
     if (!lease || typeof lease !== 'object') return true;
-    if (lease.reserved) return true; // reserved leases are never ours to migrate, whatever the pid
+    // Reserved leases are never ours to migrate, whatever the pid; a stale reinstall (which predates the claim
+    // gate) is the one caller that treats our own reserved lease as ours.
+    if (lease.reserved && !(ownReservedIsOurs && lease.pid === process.pid)) return true;
     if (lease.pid === process.pid) return false;
     return isLeaseFresh(lease, nowMs);
   } catch {
@@ -282,7 +284,9 @@ export function claimLaneForInstall(dir, nowMs = Date.now()) {
  * `<markerPath>.pnpm-failed`, suppressing migration (and its probe) while that hash remains current.
  * Any install that can remove an existing node_modules (a stale reinstall or a migration) first claims the lane
  * (`claimLaneForInstall`) and holds the claim until the install ends; a lane that cannot be claimed (foreign,
- * stale, reserved or unreadable lease) stays as it is and keeps its current state ('ok' or 'stale').
+ * stale, reserved or unreadable lease) stays as it is and keeps its current state ('ok' or 'stale'). The one
+ * exception is an ordinary stale reinstall (not a migration): it also proceeds, unclaimed, on our own lease or an
+ * expired one, and is deferred only while another live process holds the lane.
  * `storeDir` must be the same store `selectPlan` passes to pnpm.
  */
 export function ensureLaneDeps({ dir, markerPath, selectPlan, exec, log = () => {}, storeDir = resolvePnpmStoreDir() }) {
@@ -303,7 +307,11 @@ export function ensureLaneDeps({ dir, markerPath, selectPlan, exec, log = () => 
   const unchanged = depsReady(dir, markerPath, storeDir) === 'ok' ? 'ok' : state; // what a left-alone lane reports
   if (existsSync(join(dir, 'node_modules'))) {
     claim = claimLaneForInstall(dir);
-    if (!claim) return unchanged;
+    // The claim gate protects a MIGRATION (a lane that reads ok without the probe). An ordinary stale reinstall
+    // predates it and must keep running for our own lease (short, reserved or expired: acquire holds the lane while
+    // it installs) and for an expired lease, which protects nothing; only another live process holding the lane,
+    // or an unreadable lease, defers it. Skipping silently would hand the caller out-of-date node_modules.
+    if (!claim && (unchanged === 'ok' || hasForeignLiveLease(dir, Date.now(), { ownReservedIsOurs: true }))) return unchanged;
   }
   try {
     return installLaneDeps({ dir, markerPath, storeDir, plan, claim, unchanged, exec, log, failedPath });

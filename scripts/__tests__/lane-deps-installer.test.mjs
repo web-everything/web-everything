@@ -543,6 +543,41 @@ describe('lane deps hashing and readiness (real lane directory)', () => {
       expect(exec).not.toHaveBeenCalled();
       expect(existsSync(join(dir, 'node_modules', 'kept'))).toBe(true);
     });
+    // The claim gate protects migration; an ordinary stale reinstall predates it and must still run for any lane
+    // no OTHER live process holds (lane-pool ignores ensureLaneDeps' return value, so a silent skip hands the agent
+    // out-of-date node_modules with no error).
+    describe('a stale-marker lane is still reinstalled unless another live process holds it', () => {
+      const staleReinstall = lease => {
+        const { dir, markerPath, storeDir } = lane({ marker: () => 'pnpm:old' });
+        writeLease(dir, lease);
+        const before = readFileSync(leaseFile(dir), 'utf8');
+        const exec = vi.fn(() => mkdirSync(join(dir, 'node_modules'), { recursive: true }));
+        expect(migrate(dir, markerPath, storeDir, exec)).toBe('installed');
+        expect(exec).toHaveBeenCalledOnce();
+        expect(readFileSync(markerPath, 'utf8')).toBe('pnpm:' + lockHash(dir, 'pnpm', storeDir));
+        expect(readFileSync(leaseFile(dir), 'utf8')).toBe(before); // our own lease is left as acquire wrote it
+      };
+      it('our own lease with under 30 minutes left (acquire --ttl-minutes=20)', () => {
+        staleReinstall({ ...fresh, ttlMinutes: 20, pid: process.pid });
+      });
+      it('our own reserved lease (acquire --reserve)', () => {
+        staleReinstall({ ...fresh, pid: process.pid, reserved: true });
+      });
+      it('our own expired lease', () => {
+        staleReinstall({ acquiredAt: '2020-01-01T00:00:00Z', ttlMinutes: 1, pid: process.pid });
+      });
+      it('an expired foreign lease protects nothing', () => {
+        staleReinstall({ acquiredAt: '2020-01-01T00:00:00Z', ttlMinutes: 1, pid: process.pid + 1 });
+      });
+      it('a foreign RESERVED live lease still holds the lane (reports stale, nothing wiped)', () => {
+        const { dir, markerPath, storeDir } = lane({ marker: () => 'pnpm:old' });
+        writeLease(dir, { ...fresh, pid: process.pid + 1, reserved: true });
+        const exec = vi.fn();
+        expect(migrate(dir, markerPath, storeDir, exec)).toBe('stale');
+        expect(exec).not.toHaveBeenCalled();
+        expect(existsSync(join(dir, 'node_modules', 'kept'))).toBe(true);
+      });
+    });
     it('a failing install still releases the claim', () => {
       const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
       const exec = vi.fn(() => { throw Error('install failed'); });
