@@ -1119,6 +1119,8 @@ export function probeOverlayMainSync(flags, roots = () => daemonCloneRoots(works
 }
 
 /** One tick: probe, evaluate, diagnose, and persist. Returns the CLI summary. */
+// The one place this file calls the needs-you feed publisher (shared by every NEEDS-YOU line the tick writes).
+const feedPublish = (item, opts) => publishAttention(item, opts);
 export async function tick(flags = {}, { collectInventory = collectCredentialInventory, tmpSweepRun, ...deps } = {}) {
   const started = Date.now();
   const now = flags.now ? Date.parse(flags.now) : started;
@@ -1417,7 +1419,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   else if (prev.prSweep) state.prSweep = prev.prSweep;
   if (!flags['state-root'] && !flags['dry-run']) {
     for (const t of result.transitions.filter(t => t.type === 'opened' && t.episode?.smell === 'disk-space')) {
-      attempt('diskSpaceNeedsYou', () => publishAttention({
+      attempt('diskSpaceNeedsYou', () => feedPublish({
         repo: `host/${hostname()}`, pr: 0,
         // Episode report ids have minute precision. openedAt distinguishes even
         // two openings in the same minute and supplies the feed's complete identity.
@@ -1550,12 +1552,12 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
         notifications.push({ key: p.key, channel: 'needs-you', dryRun: true, item });
       } else {
         try {
-          await (deps.publishNeedsYou ?? publishAttention)(item);
+          await (deps.publishNeedsYou ?? feedPublish)(item);
           // Reminder/unsilence plans may notify again; the feed alerts once per episode.
           ep.needsYouAt = now;
           notifications.push({ key: p.key, channel: 'needs-you', item, ok: true, error: null });
         } catch (e) {
-          const error = scrubText(String(e?.message || e).split('\n')[0]);
+          const error = String(e?.message || e).split('\n')[0].slice(0, 200);
           ep.needsYouFailedAt = now;
           console.error(`health-watch: NEEDS-YOU publish failed: ${error}`);
           notifications.push({ key: p.key, channel: 'needs-you', item, ok: false, error });
