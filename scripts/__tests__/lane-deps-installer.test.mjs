@@ -361,6 +361,36 @@ describe('lane deps hashing and readiness (real lane directory)', () => {
     expect(ensureLaneDeps({ dir, markerPath, storeDir: badStore, selectPlan, exec })).toBe('ok');
     expect(exec).not.toHaveBeenCalled();
   });
+  describe('never migrates a lane another live process holds (provision/refresh call ensureDeps on leased lanes)', () => {
+    const writeLease = (dir, lease) => writeFileSync(join(dir, '.git', '.lane-lease'), JSON.stringify(lease));
+    const fresh = { acquiredAt: new Date().toISOString(), ttlMinutes: 240 };
+    const migrate = (dir, markerPath, storeDir, exec) =>
+      ensureLaneDeps({ dir, markerPath, storeDir, selectPlan: () => select({ storeDir }), exec });
+    it('foreign live lease: stays ok, no probe-driven wipe, node_modules kept', () => {
+      const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
+      writeLease(dir, { ...fresh, pid: process.pid + 1 });
+      const exec = vi.fn();
+      expect(migrate(dir, markerPath, storeDir, exec)).toBe('ok');
+      expect(exec).not.toHaveBeenCalled();
+      expect(existsSync(join(dir, 'node_modules', 'kept'))).toBe(true);
+    });
+    it('unreadable lease file reads as foreign-held (fail closed)', () => {
+      const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
+      writeFileSync(join(dir, '.git', '.lane-lease'), '{not json');
+      const exec = vi.fn();
+      expect(migrate(dir, markerPath, storeDir, exec)).toBe('ok');
+      expect(exec).not.toHaveBeenCalled();
+    });
+    it('our own lease (acquire) and a stale lease both migrate', () => {
+      for (const lease of [{ ...fresh, pid: process.pid }, { acquiredAt: '2020-01-01T00:00:00Z', ttlMinutes: 1, pid: process.pid + 1 }]) {
+        const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
+        writeLease(dir, lease);
+        const exec = vi.fn(() => mkdirSync(join(dir, 'node_modules'), { recursive: true }));
+        expect(migrate(dir, markerPath, storeDir, exec)).toBe('installed');
+        expect(exec).toHaveBeenCalledOnce();
+      }
+    });
+  });
   it('a stale lane installs and stamps <backend>:<that backend hash>', () => {
     const { dir, markerPath, storeDir } = lane({ marker: () => 'pnpm:old' });
     const exec = vi.fn(() => mkdirSync(join(dir, 'node_modules'), { recursive: true }));

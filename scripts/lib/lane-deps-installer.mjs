@@ -5,6 +5,7 @@ import { accessSync, constants, existsSync, linkSync, mkdirSync, readdirSync, re
 import { homedir, tmpdir } from 'node:os';
 import { delimiter, isAbsolute, join, resolve } from 'node:path';
 import { readLockfileParity } from '../check-lockfile-parity.mjs';
+import { LEASE_FILENAME, isLeaseStale } from './lane-lease.mjs';
 
 /**
  * Lane dependency installation. This runs BEFORE a lane has node_modules, so it imports only `node:` builtins
@@ -183,6 +184,22 @@ export function runDepsInstaller({ plan, hashFor, marker, hasNodeModules, exec, 
 }
 
 /**
+ * True when another live process holds this lane (a fresh lease whose pid is not ours). `provision`/`refresh`
+ * call ensureDeps on leased lanes too, so a lane in use must never be migrated; our own acquire's lease is fine.
+ * An unreadable lease file reads as foreign-held (fail closed).
+ */
+export function hasForeignLiveLease(dir, nowMs = Date.now()) {
+  const file = join(dir, '.git', LEASE_FILENAME);
+  if (!existsSync(file)) return false;
+  try {
+    const lease = JSON.parse(readFileSync(file, 'utf8'));
+    return !isLeaseStale(lease, nowMs) && lease.pid !== process.pid;
+  } catch {
+    return true;
+  }
+}
+
+/**
  * Install a lane's node_modules when needed. `selectPlan()` picks the installer; `exec(command, args)` runs it.
  * Returns the `depsReady` state ('n/a' | 'ok') when nothing is installed, else 'installed'.
  *
@@ -197,7 +214,8 @@ export function ensureLaneDeps({ dir, markerPath, selectPlan, exec, log = () => 
   const getPlan = () => (plan ??= selectPlan());
   const failedPath = markerPath + '.pnpm-failed';
   const state = depsReady(dir, markerPath, storeDir, {
-    pnpmUsable: () => readMarker(failedPath) !== lockHash(dir, 'npm') && getPlan().backend === 'pnpm',
+    pnpmUsable: () => readMarker(failedPath) !== lockHash(dir, 'npm') && !hasForeignLiveLease(dir)
+      && getPlan().backend === 'pnpm',
   });
   if (state === 'n/a' || state === 'ok') return state;
   plan = getPlan();
