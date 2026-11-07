@@ -1,3 +1,4 @@
+import * as hostSettings from '../host-overload-settings.mjs';
 // @vitest-environment node
 /** @file Tests for shared resource measurements without probing the host. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -48,11 +49,11 @@ describe('resource sampler', () => {
     expect(swapUsedPct('total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)')).toBe(0);
     expect(swapUsedPct('nonsense')).toBeNull();
     const snapshot = buildSnapshot({ sampledAtMs: 0, intervalMs: 10000, memFreePct: 12, memPressureLevel: 2, swapUsedPct: 95.8 });
-    expect(snapshot.memory).toEqual({ pressureLevel: 2, freePct: 12, swapUsedPct: 95.8 });
+    expect(snapshot.memory).toMatchObject({ pressureLevel: 2, freePct: 12, swapUsedPct: 95.8 });
   });
   it('builds freshness and preserves unavailable counters', () => {
     const snapshot = buildSnapshot({ sampledAtMs: 0, intervalMs: 10000 });
-    expect(snapshot.freshUntil).toBe('1970-01-01T00:00:30.000Z');
+    expect(snapshot.freshUntil).toBe('1970-01-01T00:00:20.000Z');
     expect(snapshot.schema).toBe('resource-snapshot/1');
     expect(snapshot.fsevents.backlog).toBeNull();
     expect(snapshot.errors).toEqual([]);
@@ -66,7 +67,7 @@ describe('resource sampler', () => {
     const s = sampler.sample();
     expect(s.cpu.idlePct).toBe(75);
     expect(s.disk.busyPct).toBe(1);
-    expect(s.memory).toEqual({ pressureLevel: null, freePct: 25, swapUsedPct: null });
+    expect(s.memory).toMatchObject({ pressureLevel: null, freePct: 25, swapUsedPct: null });
     expect(s.errors).toContainEqual({ probe: 'memPressureLevel', error: 'denied' });
     expect(s.agentSessions.total).toBe(1);
     for (const [, , options] of exec.mock.calls) expect(options).toMatchObject({ timeout: 5000, env: { LC_ALL: 'C' } });
@@ -108,5 +109,33 @@ describe('resource sampler', () => {
     const s = createSampler({ exec: () => '', cpus: () => [], countLanes: () => { seen.push('lanes'); return 3; }, readHeavySlots: () => ({ held: 1, cap: 2 }) }).sample();
     expect(s.laneCount).toBe(3);
     expect(s.heavySlots).toEqual({ held: 1, cap: 2 });
+  });
+});
+
+describe('R559 bounded snapshot freshness', () => {
+  it('caps a one-hour sampling gap at the policy maximum', () => {
+    const policy = vi.spyOn(hostSettings, 'loadHostOverloadSettings').mockReturnValue({
+      settings: { host: { capacity: { snapshotMaxFreshMs: 12000, memoryMetric: 'free', memAvailableFloorMb: 2048 } } }, sources: {} });
+    try {
+      let time = 0;
+      const sampler = createSampler({ now: () => time, exec: () => '', cpus: () => [], loadavg: () => [],
+        freemem: () => 25, totalmem: () => 100, readHeavySlots: () => ({}), countLanes: () => 0 });
+      sampler.sample(); time = 3600000;
+      const s = sampler.sample();
+      expect(s.intervalMs).toBe(3600000);
+      expect(Date.parse(s.freshUntil) - Date.parse(s.sampledAt)).toBe(12000);
+    } finally { policy.mockRestore(); }
+  });
+  it('uses the default maximum when policy is unreadable', () => {
+    const policy = vi.spyOn(hostSettings, 'loadHostOverloadSettings').mockImplementation(() => { throw Error('unreadable'); });
+    try {
+      const s = createSampler({ now: () => 0, exec: () => '', cpus: () => [], loadavg: () => [],
+        readHeavySlots: () => ({}), countLanes: () => 0 }).sample();
+      expect(Date.parse(s.freshUntil) - Date.parse(s.sampledAt)).toBe(20000);
+    } finally { policy.mockRestore(); }
+  });
+  it('preserves a shorter three-interval window', () => {
+    const s = buildSnapshot({ sampledAtMs: 0, intervalMs: 1000, maxFreshMs: 20000 });
+    expect(Date.parse(s.freshUntil)).toBe(3000);
   });
 });

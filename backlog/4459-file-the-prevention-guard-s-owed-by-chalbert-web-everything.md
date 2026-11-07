@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/operations/sweep-orphan-backlog-cards.mjs", "we:scripts/operations/__tests__/sweep-orphan-backlog-cards.test.mjs", "we:docs/agent/testing.md"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-03"
-preparedAgainstSha: "3ad6c4114ae1bd031a903c786de603faef122335"
+preparedDate: "2026-11-05"
+preparedAgainstSha: "fa7d3c16872ce1d496af6261a0cc0199af94270d"
 tags: []
 ---
 
@@ -18,7 +18,7 @@ Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outsta
 1. `we:scripts/operations/sweep-orphan-backlog-cards.mjs:474-507` — Test bounded content-validation exhaustion and explicitly refuse to commit unless a validation pass succeeded. Document the exhausted-case convention for bounded retry loops.
 2. `we:scripts/operations/sweep-orphan-backlog-cards.mjs:441-452` — Before acquiring a lane, refuse if any open PR has a head branch beginning with `lane/orphan-card-sweep-`. Test re-running while an earlier sweep PR remains open; the current session-specific branch is constructed at `we:scripts/operations/sweep-orphan-backlog-cards.mjs:530`.
 3. `we:scripts/operations/sweep-orphan-backlog-cards.mjs:247-251` — Assert the complete exec options object for the documented cwd, timeout and noninteractive environment guard. Record this testing convention in `we:docs/agent/testing.md`.
-4. `we:scripts/operations/sweep-orphan-backlog-cards.mjs:252-254` — Fetch with an explicit destination refspec and test both its argv and the resulting remote-tracking ref. The current test at `we:scripts/operations/__tests__/sweep-orphan-backlog-cards.test.mjs:231-235` asserts the old branch-only fetch.
+4. `we:scripts/operations/sweep-orphan-backlog-cards.mjs:252-254` — Fetch with an explicit destination refspec and test both its argv and the resulting remote-tracking ref. The current test at `we:scripts/operations/__tests__/sweep-orphan-backlog-cards.test.mjs:240-244` asserts the old branch-only fetch.
 
 Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2901@39c76fd99f3671069a724a79a9f115b16182ea40
 
@@ -46,6 +46,7 @@ All named tests below are to be added or strengthened in `we:scripts/operations/
 
 - **Bounded validation:** track whether a report actually returned `ok: true`. Set that flag only immediately before the success break. After the loop, return `fail('content-check', ...)` with an exhaustion reason instructing repair of the remaining cards before retry, and accumulated dropped cards unless the flag is set. Keep the existing no-survivors success return and finally-based lane release. Do not add a sixth attempt or let the later verification gate substitute for validation before commit.
 - **Re-run guard:** retain the existing session-specific branch scheme and implement the review's pre-acquisition refusal. After survivor selection and the dry-run return, read all open PRs for this checkout's repository through the injected exec seam. Route the production exec adapter’s GitHub calls through `runGhSync` from `we:scripts/lib/gh-throttle.mjs`, retaining the injected exec seam for tests and the existing Git adapter. Use explicit GET `gh api` pull-list requests to `repos/{owner}/{repo}/pulls?state=open&per_page=100&page=<n>`, resolving repository context from `cwd: REPO_ROOT`, filtering head refs locally by the literal `lane/orphan-card-sweep-` prefix. Do not treat `--head` as a wildcard search or inspect only the first page. Bound each page subprocess with `ACQUIRE_TIMEOUT_MS` and a 1 MiB maxBuffer; inspect at most ten pages, stopping successfully only on a page shorter than 100 entries. A full tenth page means incomplete discovery and refuses; never infer absence from a truncated listing. Validate each entry’s nonempty head ref, positive integer number and nonempty URL before treating a page as evidence. Any failed request, oversized output, invalid JSON, invalid response shape or exhausted page budget returns an explicit `open-pr-check` failure instructing the operator to inspect open sweep PRs and retry after restoring complete discovery. These are local safety limits, not new configurable settings. A matching open PR returns that refusal with its number and URL, before acquiring a lane, copying files or creating scratch space. Empty/fully deduped and dry-run paths retain their current no-op behavior. This prevents sequential re-runs while a PR is open; it does not claim atomic exclusion between simultaneous starts.
+- **Untrusted text:** import `foldUntrusted` from `we:scripts/lib/jury-core.mjs` (not yet imported by the sweep) and fold every PR head ref/URL embedded in the `open-pr-check` refusal. Refuse (fail closed, named reason) any origin branch name starting with `--` before building the fetch refspec. Tests: a PR head ref containing a newline/backtick appears folded in the refusal; a `--`-prefixed branch is refused before fetch.
 - **Exec contract:** in the existing test file, compare each main-read exec options object with `{ cwd, timeout: ACQUIRE_TIMEOUT_MS, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } }`. Include fetch, ref verification, both grep calls and show. Assert complete options for the new PR lookup too. Use returned call logs for assertions so production catch blocks cannot swallow assertion failures in an exec stub.
 - **Fetch destination:** replace the branch-only argument with `refs/heads/<branch>:refs/remotes/origin/<branch>`, derived from the existing origin-ref match. Keep fetch before ref verification and reads; propagate fetch failures through the existing read-main path. Preserve custom non-origin refs without fetching and preserve the current noninteractive options.
 - **Conventions:** add a short entry to `we:docs/agent/testing.md`: bounded loops that break only on success need an explicit exhausted-case return before side effects, tested with work remaining; comments promising exec guards require whole-options assertions. Link the sweep regression examples. A repository-wide lint or helper extraction is unnecessary for these guards.
@@ -72,9 +73,21 @@ All matching source tests live in `we:scripts/operations/__tests__/sweep-orphan-
 - Preserve the local Git fixture's before/after commit IDs and dedupe assertions as real subprocess evidence for fetch freshness under a restricted fetch mapping. Do not run the production sweep merely to gather proof: it acquires lanes and publishes PRs.
 - Run the queued standards gate after the body/convention changes. Use one admission wait of 60000 ms; if the queue remains busy, stop and report rather than polling. Report any unrelated failure accurately rather than claiming a green gate.
 
+## Edge cases this change must handle
+
+1. **Untrusted text** — PR head refs and URLs from the forge reach the refusal message: fold newlines/backticks (`foldUntrusted`, `we:scripts/lib/jury-core.mjs`) before embedding; the refspec branch name comes from the matched origin ref and must never start with `--` (refuse). Test: a head ref containing a newline is folded in the refusal.
+2. **Truncated reads** — PR listing is paged to a full-page boundary with `maxBuffer` 1 MiB; a full tenth page, oversized output or later-page failure is `open-pr-check` refusal, never "none" (covered by A3).
+3. **Shared state files** — n/a: no shared state file is written; simultaneous-start exclusion is the stated Follow-up.
+4. **Fail closed** — failed/invalid PR read, fetch failure and exhausted validation each return a named failure (`open-pr-check`, read-main, `content-check`) before any lane, commit or queue side effect (A1–A4).
+5. **Identity scoping** — head-prefix match is the literal `lane/orphan-card-sweep-` against the repo resolved from `cwd: REPO_ROOT`; PR identity is number + URL, validated per entry; hash/NNN spelling n/a (no card keys involved).
+6. **State over time** — an earlier session's open PR (different suffix) blocks; closed/merged PRs do not (open-state request); restart mid-sweep leaves lane release in the existing `finally`.
+7. **Who wrote it** — n/a for trust grants: the PR head prefix only blocks (fail closed), it never grants trust or skips a check; a spoofed matching branch can at worst delay a sweep, and the refusal names it for operator inspection.
+
 ## Follow-ups
 
 - Simultaneous sweeps can both observe no open PR before either publishes. Atomic reservation is outside the review's sequential re-run guard; capture a separate follow-up if simultaneous execution must be supported. Do not describe this check as a lock.
 - No global retry-loop lint, shared exec helper or source-clone cleanup is required here. The owed conventions and local regression tests are part of this item, not deferred work.
 
 revalidated: The supplied diff adds testing conventions without changing the sweep implementation, preparation premises, scope, or required proof plan.
+
+revalidated: The supplied scope diff adds unrelated testing conventions and does not change the preparation’s premises, design, scope, or test and proof plan.

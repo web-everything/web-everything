@@ -4,14 +4,16 @@
  * requests verification, records the wait, and ends the turn; the harness resumes the SAME session.
  * This slice only supplies the record and liveness exemptions; no fixer writes it automatically yet.
  */
-import { statSync, readFileSync, writeFileSync, renameSync, unlinkSync, mkdirSync, readdirSync } from 'node:fs';
+import { statSync, readFileSync, writeFileSync, renameSync, unlinkSync, mkdirSync, readdirSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { ghRepoSlug, DEFAULT_REPO_KEY, repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { loadSelfReviewPolicy, formatSelfReviewPolicyLine } from '../lib/fix-push-policy.mjs';
+import { withFileLock } from '../lib/atomic-json-file.mjs';
 
 /** Lane-local await record filename. */
 export const AWAIT_VERIFY_FILE = '.fix-await-verify';
@@ -163,7 +165,8 @@ export function listStoredAwaitVerify({ dir = awaitVerifyStoreDir(), readdirSync
 }
 /** Atomically write (or replace) one store record. */
 export function writeStoredAwaitVerify(record, { dir = awaitVerifyStoreDir(), writeFileSyncFn = writeFileSync,
-  renameSyncFn = renameSync, unlinkSyncFn = unlinkSync, mkdirSyncFn = mkdirSync, uniqueId = randomUUID } = {}) {
+  renameSyncFn = renameSync, unlinkSyncFn = unlinkSync, mkdirSyncFn = mkdirSync, uniqueId = randomUUID,
+  withFileLockFn = withFileLock } = {}) {
   if (!validRecord(record)) return { ok: false, reason: 'malformed' };
   const key = awaitVerifyStoreKey(record);
   if (!key) return { ok: false, reason: 'malformed' };
@@ -173,13 +176,53 @@ export function writeStoredAwaitVerify(record, { dir = awaitVerifyStoreDir(), wr
     mkdirSyncFn(dir, { recursive: true });
     tmp = `${path}.${uniqueId()}.tmp`;
     writeFileSyncFn(tmp, `${JSON.stringify(record)}\n`, { encoding: 'utf8', flag: 'wx' });
-    renameSyncFn(tmp, path);
+    withFileLockFn(join(dir, '.store.lock'), () => renameSyncFn(tmp, path));
     return { ok: true, path, key };
   } catch {
     if (tmp) { try { unlinkSyncFn(tmp); } catch { /* best-effort temporary cleanup */ } }
     return { ok: false, reason: 'write-failed' };
   }
 }
+/** Previous-head CI failures remain owned until a verified repair handoff. */
+export function previousCiFailurePending(record, timing = { pushAfterCi: true }) {
+  return Boolean(timing?.pushAfterCi && record?.kind === 'fix'
+    && record.previousCi?.ready?.ciFailures?.length > 0
+    && !(record.previousCi.failuresHandedOff && (record.pendingResume?.kind === 'green'
+      || (record.earlyPush?.ok && String(record.earlyPush.sha ?? '').toLowerCase() === String(record.sha ?? '').toLowerCase()))));
+}
+
+/** Retire only the expected shared record; serialize quarantine/deletion with store publication. */
+export function clearStoredAwaitVerifyIf(key, expected, { dir = awaitVerifyStoreDir(),
+  readFileSyncFn = readFileSync, renameSyncFn = renameSync, unlinkSyncFn = unlinkSync,
+  existsSyncFn = existsSync, uniqueId = randomUUID, withFileLockFn = withFileLock } = {}) {
+  if (!nonEmpty(key) || !STORE_KEY_RE.test(key)
+    || !nonEmpty(expected?.sha) || !nonEmpty(expected?.requestedAt)) return { cleared: false };
+  const path = join(dir, `${key}.json`);
+  const tmp = `${path}.${uniqueId()}.tmp`;
+  const matches = file => {
+    try {
+      const current = JSON.parse(readFileSyncFn(file, 'utf8'));
+      return ['sha', 'requestedAt', 'sessionId'].every(field => current?.[field] === expected[field])
+        && isDeepStrictEqual(current, expected);
+    } catch { return false; }
+  };
+  // Missing or changed records need no lock; a matching snapshot is checked again under the mutex.
+  if (!matches(path)) return { cleared: false };
+  try {
+    return withFileLockFn(join(dir, '.store.lock'), () => {
+      if (!matches(path)) return { cleared: false };
+      renameSyncFn(path, tmp);
+      if (!matches(tmp)) {
+        // Preserve unexpected content, including changes from a writer that does not honor the lock.
+        try { if (!existsSyncFn(path)) renameSyncFn(tmp, path); } catch { /* leave quarantined content intact */ }
+        return { cleared: false };
+      }
+      unlinkSyncFn(tmp);
+      return { cleared: true };
+    });
+  } catch { return { cleared: false }; }
+}
+
 /** Remove one store record by key. */
 export function clearStoredAwaitVerify(key, { dir = awaitVerifyStoreDir(), unlinkSyncFn = unlinkSync } = {}) {
   try {
@@ -262,6 +305,15 @@ export function selfReviewHold(record, { sessionId = null, who = null } = {}) {
 export const AWAIT_VERIFY_REF_RE = /^lane\/[A-Za-z0-9._/-]+$/;
 /** Session kinds whose briefs know how to be resumed by the verdict pass. */
 export const AWAIT_VERIFY_KINDS = Object.freeze(['fix', 'ci-heal', 'delivery', 'prepare']);
+
+/** Is this a record the harness pass owns (written by `mark --ref`)? Shared with stale-wait classification. */
+export function isHarnessRecord(record) {
+  return !!record && record.v === 1
+    && ((Number.isInteger(record.pr) && record.pr > 0) || (AWAIT_VERIFY_NO_PUSH_KINDS.includes(record.kind) && Number.isInteger(record.item) && record.item > 0))
+    && /^[a-f\d]{40}$/i.test(String(record.sha ?? '')) && typeof record.lane === 'string' && record.lane.startsWith('/')
+    && AWAIT_VERIFY_REF_RE.test(String(record.ref ?? '')) && !String(record.ref).includes('..')
+    && AWAIT_VERIFY_KINDS.includes(record.kind) && Number.isFinite(Date.parse(record.requestedAt));
+}
 
 /**
  * Thin CLI shell; filesystem, subprocess, environment, clock and output ports are injectable.

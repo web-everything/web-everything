@@ -5,6 +5,8 @@
  *
  *   node scripts/lane-git-diet.mjs                      # DRY RUN over every lane in the web-everything pool
  *   node scripts/lane-git-diet.mjs --apply --lanes=5,7  # act on those lanes only (an explicit list is required)
+ *   node scripts/lane-git-diet.mjs --daemon-clone=wev-fix-daemon [--apply] # registered name, dry run by default
+ *   --daemon-clone is mutually exclusive with --lanes, --pool and --pool-root.
  *   flags: --pool=<web-everything|frontierui|plateau-app>  --pool-root=<dir>  --scan-root=<dir>  --json
  *          --extra-scan-roots=<dir>[:<dir>...]  --gc-timeout-ms=N (1..1500000, default 900000)  --prune-expire=<git date, default 1.hour.ago>
  *   A malformed argv (unknown, repeated, value-less or out-of-range flag) exits 2 before any lane is read.
@@ -26,17 +28,20 @@
  *      and HEAD, and older than the grace window, are dropped (the old ledger blobs);
  *   4. drop the claim marker (only if it is still ours).
  * Never `reset`, `clean` or `checkout`; never a working-tree write. Never the primary checkout, `~/workspace/wev-*`,
- * or `.lanes/we-drain-daemon`. Git runs with inherited GIT_DIR-style and GIT_CONFIG* overrides scrubbed
+ * or `.lanes/we-drain-daemon` in pool mode. Daemon mode holds the rebuild write lock throughout,
+ * keeps refs/config intact, and rechecks all safety inputs before repack and prune. Git runs with inherited GIT_DIR-style and GIT_CONFIG* overrides scrubbed
  * (`scrubGitRepoEnv`) and the lane hardening pins applied.
  */
-import { execFileSync } from 'node:child_process';
+import { promisify } from 'node:util';
+import { execFile, execFileSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, hostname, tmpdir } from 'node:os';
 import { basename, delimiter, isAbsolute, join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { LEASE_FILENAME } from './lib/lane-lease.mjs';
 import { laneGitHardeningEnv, scrubGitRepoEnv } from './lib/lane-git-hardening.mjs';
-import { applyLaneDietConfig } from './lib/lane-git-diet.mjs';
+import { withWriteLock, inspectCloneLock } from './lib/daemon-clone-lock.mjs';
+import { applyLaneDietConfig, resolveDietDaemonClone, daemonDietEligibility } from './lib/lane-git-diet.mjs';
 import {
   cleanupEligibility, CLEANUP_POOLS, formatBytes, parseCountObjects, parseGitAlternates, projectedFreedBytes,
 } from './lib/lane-git-diet-cleanup.mjs';
@@ -49,12 +54,12 @@ for (const a of process.argv.slice(2)) {
   if (Object.hasOwn(flags, m[1])) { process.stderr.write(`--${m[1]} given more than once\n`); process.exit(2); }
   flags[m[1]] = m[2] ?? true;
 }
-const KNOWN = new Set(['apply', 'lanes', 'pool', 'pool-root', 'scan-root', 'extra-scan-roots', 'json', 'gc-timeout-ms', 'prune-expire']);
+const KNOWN = new Set(['apply', 'daemon-clone', 'lanes', 'pool', 'pool-root', 'scan-root', 'extra-scan-roots', 'json', 'gc-timeout-ms', 'prune-expire']);
 const unknown = Object.keys(flags).filter((f) => !KNOWN.has(f));
 if (unknown.length) { process.stderr.write(`unknown flag(s): ${unknown.map((f) => `--${f}`).join(', ')}\n`); process.exit(2); }
 // A bare or empty value flag would silently fall back to its default (a bare --pool-root reads the real pool), and a
 // valued switch (--apply=no) would silently read as off: refuse both. --extra-scan-roots has its own check below.
-for (const f of ['lanes', 'pool', 'pool-root', 'scan-root', 'gc-timeout-ms', 'prune-expire']) {
+for (const f of ['daemon-clone', 'lanes', 'pool', 'pool-root', 'scan-root', 'gc-timeout-ms', 'prune-expire']) {
   if (Object.hasOwn(flags, f) && (typeof flags[f] !== 'string' || !flags[f])) { process.stderr.write(`--${f} needs a value\n`); process.exit(2); }
 }
 for (const f of ['apply', 'json']) if (Object.hasOwn(flags, f) && flags[f] !== true) { process.stderr.write(`--${f} takes no value\n`); process.exit(2); }
@@ -63,41 +68,59 @@ const GC_TIMEOUT_MAX_MS = 25 * 60_000;
 if (flags['gc-timeout-ms'] !== undefined && !(/^\d+$/.test(flags['gc-timeout-ms']) && Number(flags['gc-timeout-ms']) >= 1 && Number(flags['gc-timeout-ms']) <= GC_TIMEOUT_MAX_MS)) {
   process.stderr.write(`--gc-timeout-ms must be a whole number of milliseconds from 1 to ${GC_TIMEOUT_MAX_MS}\n`); process.exit(2);
 }
+const DAEMON_NAME = flags['daemon-clone'];
+if (DAEMON_NAME && ['lanes', 'pool', 'pool-root'].some((key) => Object.hasOwn(flags, key))) {
+  process.stderr.write('--daemon-clone is mutually exclusive with --lanes / --pool / --pool-root\n'); process.exit(2);
+}
+let DAEMON_DIR;
+try {
+  if (DAEMON_NAME) DAEMON_DIR = resolveDietDaemonClone(DAEMON_NAME, resolve(flags['scan-root'] || join(homedir(), 'workspace')));
+} catch (err) { process.stderr.write(`${err.message}\n`); process.exit(2); }
+const DAEMON_OWNER = `lane-git-diet-${process.pid}-${randomBytes(8).toString('hex')}`;
+
+// In daemon mode even expiry parsing and the borrower inventory run only after lock admission.
+function usageExit() {
+  if (!DAEMON_DIR) process.exit(2);
+  process.exitCode = 2;
+  throw new Error('invalid cleanup arguments');
+}
+
+async function run() {
 // A malformed --prune-expire would fail only at `git prune`, after the ops refs are deleted and the repack ran: parse it
 // up front with git's own expiry parser (`now` stays valid: a deliberate operator choice the tests use too).
 if (flags['prune-expire'] !== undefined) {
   try { execFileSync('git', ['-c', `lanegitdiet.pruneexpire=${flags['prune-expire']}`, 'config', '--type=expiry-date', 'lanegitdiet.pruneexpire'], { cwd: tmpdir(), env: laneGitHardeningEnv(scrubGitRepoEnv(process.env)), stdio: 'ignore', timeout: 10_000 }); }
-  catch { process.stderr.write(`--prune-expire ${JSON.stringify(flags['prune-expire'])} is not an expiry date git can parse\n`); process.exit(2); }
+  catch { process.stderr.write(`--prune-expire ${JSON.stringify(flags['prune-expire'])} is not an expiry date git can parse\n`); usageExit(); }
 }
 const laneList = flags.lanes === undefined ? null : flags.lanes.split(',').map((s) => s.trim());
-if (laneList?.some((s) => !/^\d+$/.test(s))) { process.stderr.write('--lanes must be a comma-separated list of lane numbers\n'); process.exit(2); }
+if (laneList?.some((s) => !/^\d+$/.test(s))) { process.stderr.write('--lanes must be a comma-separated list of lane numbers\n'); usageExit(); }
 
 const APPLY = flags.apply === true;
 const POOL = typeof flags.pool === 'string' ? flags.pool : 'web-everything';
-if (!CLEANUP_POOLS.includes(POOL)) { process.stderr.write(`--pool must be one of ${CLEANUP_POOLS.join(', ')}\n`); process.exit(2); }
+if (!CLEANUP_POOLS.includes(POOL)) { process.stderr.write(`--pool must be one of ${CLEANUP_POOLS.join(', ')}\n`); usageExit(); }
 const real = (p) => { try { return realpathSync(p); } catch (err) { if (['ENOENT', 'ENOTDIR'].includes(err.code)) return null; throw err; } };
-const POOL_ROOT = real(typeof flags['pool-root'] === 'string' ? flags['pool-root'] : join(homedir(), 'workspace', '.lanes'));
+const POOL_ROOT = DAEMON_DIR ? join(resolve(flags['scan-root'] || join(homedir(), 'workspace')), '.lanes') : real(typeof flags['pool-root'] === 'string' ? flags['pool-root'] : join(homedir(), 'workspace', '.lanes'));
 const SCAN_ROOT = real(typeof flags['scan-root'] === 'string' ? flags['scan-root'] : join(homedir(), 'workspace'));
-if (!POOL_ROOT || !SCAN_ROOT) { process.stderr.write('pool root / scan root does not exist\n'); process.exit(2); }
+if (!POOL_ROOT || !SCAN_ROOT) { process.stderr.write('pool root / scan root does not exist\n'); usageExit(); }
 // Git records no back-pointer from a store to the repos borrowing it, so a borrower outside every scanned root is
 // invisible: the operator names any other place such clones live (`:`-separated; each root AND its children are
 // scanned), and the report lists every root. A bare or empty value is refused, never read as "no extra roots".
 const extraFlag = flags['extra-scan-roots'];
 const extraParts = extraFlag === undefined ? [] : typeof extraFlag === 'string' ? extraFlag.split(delimiter) : [''];
-if (extraParts.some((p) => !p)) { process.stderr.write('--extra-scan-roots needs non-empty directory paths\n'); process.exit(2); }
+if (extraParts.some((p) => !p)) { process.stderr.write('--extra-scan-roots needs non-empty directory paths\n'); usageExit(); }
 const EXTRA_SCAN_ROOTS = extraParts.map((p) => {
   const r = real(p);
-  if (!r) { process.stderr.write(`extra scan root ${p} does not exist\n`); process.exit(2); }
+  if (!r) { process.stderr.write(`extra scan root ${p} does not exist\n`); usageExit(); }
   return r;
 });
 const poolDir = join(POOL_ROOT, POOL);
 let poolEntries = null;
-try { poolEntries = readdirSync(poolDir); } catch { /* absent, not a directory or unlistable: refused below */ }
-if (!poolEntries) { process.stderr.write(`pool directory ${poolDir} does not exist or is not a readable directory\n`); process.exit(2); }
+try { poolEntries = DAEMON_DIR ? [] : readdirSync(poolDir); } catch { /* absent, not a directory or unlistable: refused below */ }
+if (!poolEntries) { process.stderr.write(`pool directory ${poolDir} does not exist or is not a readable directory\n`); usageExit(); }
 const GC_TIMEOUT_MS = flags['gc-timeout-ms'] === undefined ? 15 * 60_000 : Number(flags['gc-timeout-ms']);
 const PRUNE_EXPIRE = typeof flags['prune-expire'] === 'string' ? flags['prune-expire'] : '1.hour.ago';
 const ONLY = laneList ? new Set(laneList.map(Number)) : null;
-if (APPLY && !ONLY) { process.stderr.write('--apply needs an explicit --lanes=N,M list (the full apply is the operator\'s call)\n'); process.exit(2); }
+if (APPLY && !ONLY && !DAEMON_DIR) { process.stderr.write('--apply needs an explicit --lanes=N,M list (the full apply is the operator\'s call)\n'); usageExit(); }
 
 // Git env: no inherited repo redirection or env-injected config, plus the lane hardening pins (no fsmonitor/hooks run from lane config).
 const GIT_ENV = laneGitHardeningEnv(scrubGitRepoEnv(process.env));
@@ -206,12 +229,20 @@ const symrefTargets = (dir) => {
 // Never trimmed: a common dir `<lane>/.git ` must not read as the lane's own `.git`. Unreadable → null → refused.
 const commonDir = (dir) => { try { return real(gitPath(dir, ['rev-parse', '--path-format=absolute', '--git-common-dir'])); } catch { return null; } };
 
+const eligibility = (inputs) => {
+  if (!DAEMON_DIR) return cleanupEligibility(inputs);
+  const snapshot = inspectCloneLock(DAEMON_DIR);
+  return daemonDietEligibility(inputs, {
+    registeredDir: DAEMON_DIR,
+    lockHeld: snapshot.writerLive && snapshot.writer?.owner === DAEMON_OWNER && snapshot.writer?.pid === process.pid,
+  });
+};
 const eligible = (dir) => {
   const realGitDir = real(join(dir, '.git'));
   const storage = realGitDir ? refStorage(dir) : [];
-  if (storage.some(v => v !== 'files')) return cleanupEligibility({ dir, poolRoot: POOL_ROOT, refStorage: storage });
+  if (storage.some(v => v !== 'files')) return eligibility({ dir, poolRoot: POOL_ROOT, refStorage: storage });
   const objects = realGitDir ? real(join(realGitDir, 'objects')) : null;
-  return cleanupEligibility({
+  return eligibility({
     dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir, realCommonDir: realGitDir ? commonDir(dir) : undefined, realObjectsDir: objects ?? undefined, ...auditGitDir(dir),
     lease: readLease(dir), nowMs: Date.now(),
     borrowers: (objects && BORROWERS.get(objects)) || [], gcHooks: realGitDir ? gcHooks(dir) : [], gcRepackFilters: realGitDir ? gcRepackFilters(dir) : [],
@@ -222,8 +253,8 @@ const eligible = (dir) => {
 // Every eligibility input re-read while we hold the claim, ownership first: the real marker must still be ours.
 const recheckUnderClaim = (dir, holder) => {
   const storage = refStorage(dir);
-  if (storage.some(v => v !== 'files')) return cleanupEligibility({ dir, poolRoot: POOL_ROOT, refStorage: storage });
-  return cleanupEligibility({ dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir: real(join(dir, '.git')), realCommonDir: commonDir(dir), realObjectsDir: real(join(dir, '.git', 'objects')), ...auditGitDir(dir), lease: readLease(dir), claimHolder: holder, nowMs: Date.now(), gcHooks: gcHooks(dir), gcRepackFilters: gcRepackFilters(dir), gcReflogPatterns: gcReflogPatterns(dir), configHooks: configHooks(dir), refStorage: storage });
+  if (storage.some(v => v !== 'files')) return eligibility({ dir, poolRoot: POOL_ROOT, refStorage: storage });
+  return eligibility({ dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir: real(join(dir, '.git')), realCommonDir: commonDir(dir), realObjectsDir: real(join(dir, '.git', 'objects')), ...auditGitDir(dir), lease: readLease(dir), claimHolder: DAEMON_DIR ? undefined : holder, nowMs: Date.now(), gcHooks: gcHooks(dir), gcRepackFilters: gcRepackFilters(dir), gcReflogPatterns: gcReflogPatterns(dir), configHooks: configHooks(dir), refStorage: storage });
 };
 
 // O_EXCL claim, same marker shape as `lane-pool` (so `acquire` reads it as a live lease and skips the lane).
@@ -256,6 +287,40 @@ const lanes = poolEntries
 
 const rows = [];
 let total = 0;
+if (DAEMON_DIR) {
+  const dir = DAEMON_DIR;
+  const row = { clone: DAEMON_NAME };
+  rows.push(row);
+  try {
+    if (!existsSync(join(dir, '.git')) || !statSync(join(dir, '.git')).isDirectory()) throw new Error('no .git directory');
+    const e = eligible(dir);
+    if (!e.ok) row.skipped = e.reason;
+    else {
+      const beforeBytes = duBytes(join(dir, '.git', 'objects'));
+      if (!Number.isFinite(beforeBytes)) throw new Error('cannot measure object storage; cleanup refused');
+      const counts = parseCountObjects(git(dir, ['count-objects', '-v']));
+      const plan = [['repack', '-A', '-d', '-l', '--unpack-unreachable=never'], ['prune', `--expire=${PRUNE_EXPIRE}`]];
+      Object.assign(row, { mode: APPLY ? 'apply' : 'dry-run', beforeBytes, projectedBytes: projectedFreedBytes(counts), plan });
+      if (!APPLY) total += row.projectedBytes;
+      else {
+        // Daemon refs and fetch/unpack config belong to rebuild: skip the lane-only config/ref cleanup.
+        for (const args of plan) {
+          testPause(args[0] === 'repack' ? 'before-gc' : 'before-prune');
+          const borrowers = borrowerMap().get(real(join(dir, '.git', 'objects'))) || [];
+          if (borrowers.length) { row.skipped = `objects borrowed by ${borrowers.join(', ')} (${args[0]} skipped)`; break; }
+          const check = recheckUnderClaim(dir);
+          if (!check.ok) { row.skipped = `${check.reason} (${args[0]} skipped)`; break; }
+          // Yield during long Git operations so withWriteLock can renew its heartbeat.
+          await promisify(execFile)('git', args, { cwd: dir, env: GIT_ENV, timeout: GC_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024 });
+        }
+        row.afterBytes = duBytes(join(dir, '.git', 'objects'));
+        row.freedBytes = beforeBytes - row.afterBytes;
+        total += Number.isFinite(row.freedBytes) ? row.freedBytes : 0;
+      }
+    }
+  } catch (err) { row.error = String(err?.stderr || err?.message || err).trim(); }
+  if (row.skipped || row.error) process.exitCode = 1;
+}
 for (const n of lanes) {
   const dir = join(poolDir, `lane-${n}`);
   // The eligibility reads are inside the try: one unreadable lane (e.g. a corrupt config, git exit 128) is refused
@@ -333,15 +398,33 @@ for (const n of lanes) {
 }
 
 if (flags.json) {
-  process.stdout.write(JSON.stringify({ mode: APPLY ? 'apply' : 'dry-run', pool: POOL, scannedRoots: SCANNED, totalBytes: total, rows }, null, 2) + '\n');
+  process.stdout.write(JSON.stringify({ mode: APPLY ? 'apply' : 'dry-run', ...(DAEMON_DIR ? { clone: DAEMON_NAME } : { pool: POOL }), scannedRoots: SCANNED, totalBytes: total, rows }, null, 2) + '\n');
 } else {
   process.stdout.write(`borrower scan: ${SCANNED.join(', ')} (a borrower elsewhere is not seen: add --extra-scan-roots)\n`);
   for (const r of rows) {
-    if (r.skipped) process.stdout.write(`lane-${r.lane}: SKIP ${r.skipped}\n`);
-    else if (r.error) process.stdout.write(`lane-${r.lane}: ERROR ${r.error}\n`);
-    else if (r.mode === 'dry-run') process.stdout.write(`lane-${r.lane}: ~${formatBytes(r.projectedBytes)} potentially reclaimable (${r.loose} loose objects, ${r.packs} packs, ${r.opsRefs} ops refs)\n`);
-    else process.stdout.write(`lane-${r.lane}: ${formatBytes(r.beforeBytes)} -> ${formatBytes(r.afterBytes)} (freed ${formatBytes(r.freedBytes)}) [${r.configOps} config ops, ${r.opsRefsDeleted} ops refs deleted${r.opsRefsKept.length ? `, kept as symbolic-ref targets: ${r.opsRefsKept.join(', ')}` : ''}]\n`);
+    const label = r.clone || `lane-${r.lane}`;
+    if (r.clone && !r.skipped && !r.error) {
+      process.stdout.write(`${label}: ${formatBytes(r.beforeBytes)} objects; ~${formatBytes(r.projectedBytes)} potentially reclaimable\nplan: ${r.plan.map((args) => `git ${args.join(' ')}`).join(' -> ')}\n`);
+      if (APPLY) process.stdout.write(`after: ${formatBytes(r.afterBytes)}; freed ${formatBytes(r.freedBytes)}\n`);
+      continue;
+    }
+    if (r.skipped) process.stdout.write(`${label}: SKIP ${r.skipped}\n`);
+    else if (r.error) process.stdout.write(`${label}: ERROR ${r.error}\n`);
+    else if (r.mode === 'dry-run') process.stdout.write(`${label}: ~${formatBytes(r.projectedBytes)} potentially reclaimable (${r.loose} loose objects, ${r.packs} packs, ${r.opsRefs} ops refs)\n`);
+    else process.stdout.write(`${label}: ${formatBytes(r.beforeBytes)} -> ${formatBytes(r.afterBytes)} (freed ${formatBytes(r.freedBytes)}) [${r.configOps} config ops, ${r.opsRefsDeleted} ops refs deleted${r.opsRefsKept.length ? `, kept as symbolic-ref targets: ${r.opsRefsKept.join(', ')}` : ''}]\n`);
   }
   const counted = rows.filter((r) => !r.skipped && !r.error).length;
   process.stdout.write(`${APPLY ? 'freed' : 'projected (estimate)'}: ${formatBytes(total)} across ${counted} lane(s); skipped ${rows.filter((r) => r.skipped).length}, errors ${rows.filter((r) => r.error).length}\n`);
 }
+
+}
+
+if (DAEMON_DIR) {
+  try {
+    const locked = await withWriteLock(DAEMON_DIR, run, { owner: DAEMON_OWNER, waitMs: 0 });
+    if (!locked.ok) {
+      process.stderr.write(`daemon clone write lock busy: ${locked.reason} (${locked.heldBy || 'unknown holder'})\n`);
+      process.exitCode = 1;
+    }
+  } catch (err) { process.stderr.write(`${err.message}\n`); process.exitCode ||= 1; }
+} else await run();

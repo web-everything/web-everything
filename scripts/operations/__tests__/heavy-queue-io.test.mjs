@@ -141,3 +141,27 @@ describe('remote fallback summary', () => {
     } finally {rmSync(root,{recursive:true,force:true});}
   });
 });
+
+describe('forgeShare in the JSON verdict (R497)', () => {
+  it('carries forgeShare beside remoteFallbacks; UNKNOWN (never 100%) without a remote success record, a number with one', () => {
+    const root = mkdtempSync(join(process.env.TMPDIR,'forge-share-verdict-'));
+    try {
+      const env = {WE_UNDER_TEST:'1',LANE_POOL_ROOT:root};
+      const lockRoot = admissionLockRoot(root,env), nowMs = Date.now();
+      mkdirSync(lockRoot,{recursive:true});
+      const iso = (age) => new Date(nowMs-age).toISOString();
+      const old = JSON.stringify({ts:iso(5*3600000),at:iso(5*3600000),ms:1,reason:'old',kind:'files'})+'\n';
+      writeFileSync(join(lockRoot,'remote-fallbacks.jsonl'), old+JSON.stringify({ts:iso(2000),reason:'command-not-allowed',lane:'lane-3',kind:'files'})+'\n'+JSON.stringify({ts:iso(2000),reason:'remote-full (30s wait exhausted)'})+'\n');
+      writeFileSync(join(lockRoot,'durations.jsonl'), old+JSON.stringify({at:iso(1000),ms:500,lane:'3',kind:'files'})+'\n'+JSON.stringify({at:iso(2000),ms:1000,lane:'4',kind:'files'})+'\n');
+      const collect = () => collectHeavyQueue({repo:root,env,now:()=>nowMs,readBaseline:null,
+        readAdmission:()=>({cap:1,heldCount:0,freeCount:1,held:[],waiting:[]})});
+      const before = assessHeavyQueue(collect()).forgeShare;
+      expect(before).toMatchObject({status:'unknown',share:null,unknownReason:'no-remote-success-record'});
+      writeFileSync(join(lockRoot,'remote-runs.jsonl'), old+JSON.stringify({ts:iso(500),ms:2000})+'\n');
+      const after = assessHeavyQueue(collect()).forgeShare;
+      expect(after).toMatchObject({status:'ok',runs:{remote:1,local:2,expectedLocal:1,counted:2}});
+      expect(after.share).toBeCloseTo(0.5);
+      expect(assessHeavyQueue(collect()).remoteFallbacks.total).toBe(3); // incl. the 5h-old coverage row
+    } finally {rmSync(root,{recursive:true,force:true});}
+  });
+});

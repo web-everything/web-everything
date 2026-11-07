@@ -772,7 +772,12 @@ describe('standards input parity', () => {
   it.each([['a cancel-acknowledged finish (run killed before a receipt)', ackReceipt, 'cancelled'], ['a legacy runner null finish that never acknowledged cancel', 'null', 'unconfirmed'], ['a finish that failed to parse', 'untrusted', 'unconfirmed'],
     ['a cancel ack for another run', (_n, value) => JSON.stringify({v:1,nonce:value.nonce,run:'other',cancelAck:true}), 'unconfirmed'],
     ['a cancel ack with another nonce', (_n, value) => JSON.stringify({v:1,nonce:'f'.repeat(32),run:value.run,cancelAck:true}), 'unconfirmed'],
-    ['a cancel ack with another version', (_n, value) => JSON.stringify({v:2,nonce:value.nonce,run:value.run,cancelAck:true}), 'unconfirmed']])(
+    ['a cancel ack with another version', (_n, value) => JSON.stringify({v:2,nonce:value.nonce,run:value.run,cancelAck:true}), 'unconfirmed'],
+    ['a cancel ack with a string version', (_n, value) => JSON.stringify({v:'1',nonce:value.nonce,run:value.run,cancelAck:true}), 'unconfirmed'],
+    ['a cancel ack missing its nonce', (_n, value) => JSON.stringify({v:1,run:value.run,cancelAck:true}), 'unconfirmed'],
+    ['a cancel ack missing its run', (_n, value) => JSON.stringify({v:1,nonce:value.nonce,cancelAck:true}), 'unconfirmed'],
+    ['a cancel ack that is false', (_n, value) => JSON.stringify({v:1,nonce:value.nonce,run:value.run,cancelAck:false}), 'unconfirmed'],
+    ['a cancel ack that is the string true', (_n, value) => JSON.stringify({v:1,nonce:value.nonce,run:value.run,cancelAck:'true'}), 'unconfirmed']])(
     'x40a9dk: an aborted client reports %s as %s', async (_name, receipt, mode) => {
     const controller = new AbortController(), abort = () => controller.abort();
     const f = fixture({receipt}), original = f.exec;
@@ -1097,6 +1102,16 @@ describe('runRemote', () => {
     expect(await runRemote(f)).toEqual(kind === 'bound'
       ? {mode:'not-started',terminated:true,reason:'forge-rejected:snapshot-rejected'}
       : {mode:'unconfirmed',reason:'ambiguous-result'});
+  });
+
+  // R595 S1: the launcher's run-time egress-table-absent rejection is written as a plain `snapshot-rejected` record
+  // (siblings:false, no delta). The Mac only certifies not-started for siblings/delta/forge-busy rejections, so this
+  // record fails closed to unconfirmed (heavy-admission then refuses) rather than silently rerunning local.
+  // A dedicated Mac-side egress-table-absent reason is the planned follow-up; this pins today's behaviour.
+  it('a launcher run-time egress-table-absent rejection (plain snapshot-rejected, siblings:false) stays unconfirmed', async () => {
+    const f = fixture({runCode:1, receipt:(_nonce, value) => JSON.stringify(
+      {v:1,nonce:value.nonce,run:value.run,phase:'rejected',reason:'snapshot-rejected',siblings:false,started:false})});
+    expect(await runRemote(f)).toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
   });
 
   it('aborts not-started before rsync when an ancestor is redirected to different bytes at staging open', async () => {
@@ -2805,5 +2820,55 @@ describe('overlapped Forge discovery',()=>{
     pending.get('head').reject(new Error('local failure'));pending.get('bases').reject(new Error('remote failure'));
     expect(await result).toMatchObject({mode:'not-started',terminated:true,reason:'forge-unreachable'});
     expect(exec.mock.calls.filter(([call])=>!call.args.includes('--show-toplevel'))).toHaveLength(3);
+  });
+});
+
+describe('R324 elastic request envelope',()=>{
+  it('passes granted units in prepare while accepting a legacy runner reply',async()=>{
+    const f=fixture();
+    expect(await runRemote({...f,slotUnits:3})).toMatchObject({mode:'remote',code:0});
+    expect(JSON.parse(callsOf(f.exec).find(isPrepare).input)).toMatchObject({slotUnits:3,capabilities:{taskPressure:1}});
+  });
+  it('omits the extension for a one-unit legacy request',async()=>{
+    const f=fixture();await runRemote(f);
+    expect(JSON.parse(callsOf(f.exec).find(isPrepare).input)).not.toHaveProperty('slotUnits');
+    expect(JSON.parse(callsOf(f.exec).find(isPrepare).input).capabilities).toEqual({taskPressure:1});
+  });
+  it.each([0,257,1.5,NaN])('rejects invalid units before transport: %s',async slotUnits=>{
+    const f=fixture();
+    expect(await runRemote({...f,slotUnits})).toMatchObject({mode:'not-started',terminated:true,reason:'invalid-slot-units'});
+    expect(f.exec).not.toHaveBeenCalled();
+  });
+});
+
+describe('optional task-pressure receipt fields',()=>{
+  const note={processCount:1950,tasksMax:2048,tasksNear:true,
+    tasksNote:'1950 cgroup tasks (processes and threads) exceed 80% of TasksMax=2048'};
+  it('accepts the complete note emitted by the runner',async()=>{
+    const {taskPressureNote}=await import('../forge-exec-run.mjs');
+    expect(await runRemote(fixture({receipt:(_nonce,value)=>JSON.stringify({...value,...taskPressureNote(1950,2048)})})))
+      .toMatchObject({mode:'remote',code:0});
+  });
+  it('accepts an old receipt with all four fields absent',async()=>{
+    expect(await runRemote(fixture())).toMatchObject({mode:'remote',code:0});
+  });
+  it.each(Array.from({length:14},(_,i)=>i+1))('rejects partial field set %s',async mask=>{
+    const partial=Object.fromEntries(Object.entries(note).filter((_,i)=>mask & (1 << i)));
+    expect(await runRemote(fixture({receipt:(_nonce,value)=>JSON.stringify({...value,...partial})})))
+      .toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
+  });
+  it.each([
+    {processCount:null},{processCount:'1950'},{processCount:-1},{processCount:1950.5},
+    {processCount:Number.MAX_SAFE_INTEGER+1},{tasksMax:0},{tasksMax:'2048'},{tasksMax:2048.5},
+    {tasksMax:Number.MAX_SAFE_INTEGER+1},{tasksNear:false},{tasksNear:'true'},
+    {tasksNote:''},{tasksNote:'   '},{tasksNote:null},{tasksNote:'x'.repeat(257)},{tasksNote:'unsafe\nmessage'},
+    {tasksNote:'unsafe\u001bmessage'},{processCount:80,tasksMax:100},{processCount:1600},
+  ])('rejects malformed or inconsistent task-pressure evidence %j',async patch=>{
+    expect(await runRemote(fixture({receipt:(_nonce,value)=>JSON.stringify({...value,...note,...patch})})))
+      .toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
+  });
+  it('still rejects unrelated extra receipt fields alongside a valid note',async()=>{
+    expect(await runRemote(fixture({receipt:(_nonce,value)=>JSON.stringify({...value,...note,unexpected:true})})))
+      .toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
   });
 });

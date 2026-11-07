@@ -31,6 +31,8 @@ import { enrichPrsWithTimeoutEvidence } from '../../conveyor/reconcile-pass.mjs'
 import { readTimeoutBudget, timeoutKey } from '../../conveyor/timeout-retry-state.mjs';
 import { planReconcile } from '../../conveyor/reconcile-core.mjs';
 import { allocateCardNumber } from '../../lib/card-number-allocator.mjs';
+// These tests describe codex-first routing; the shipped routing.builder=claude is covered in routing-settings.test.mjs.
+process.env.WE_ROUTING_BUILDER = 'codex';
 
 // Keep a regression to numeric allocation hermetic; follow-up filing must never call this mock.
 vi.mock('../../lib/card-number-allocator.mjs', () => ({
@@ -236,6 +238,20 @@ describe('dispatchCiHeal (#3852)', () => {
     const { sinks } = recordingSink({});
     const out = await dispatchCiHeal(PLANNED, { readBrief: () => TEMPLATE, sinks });
     expect(out.agentId).toBeNull();
+  });
+
+  it('R549: an unreadable launch (handle is only the minted session id) reports launched unverified, never an agentId', async () => {
+    const { sinks } = recordingSink({ handle: 'minted-uuid', dispatch: { handleVerified: false } });
+    const out = await dispatchCiHeal(PLANNED, { readBrief: () => TEMPLATE, sinks });
+    expect(out.agentId).toBeNull();
+    expect(out.launched).toBe('unverified');
+  });
+
+  it('R549: a verified launch keeps its agentId and carries no unverified marker', async () => {
+    const { sinks } = recordingSink({ handle: 'agent-1', dispatch: { handleVerified: true } });
+    const out = await dispatchCiHeal(PLANNED, { readBrief: () => TEMPLATE, sinks });
+    expect(out.agentId).toBe('agent-1');
+    expect(out.launched).toBeUndefined();
   });
 
   it('refuses a scope token the brief cannot carry safely, before any sink call', async () => {

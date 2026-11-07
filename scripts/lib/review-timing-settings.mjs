@@ -28,10 +28,16 @@ export function resolveTimingPolicy({ env = process.env, read = readFileSync, re
   // Preserve the existing on/off control as an alias; the named timing setting wins when both are present.
   if (reviewEnv.skipDrainMechanical === undefined && ['on', 'off'].includes(env.WE_REVIEW_CARRY_ACROSS_REBASE))
     reviewEnv.skipDrainMechanical = env.WE_REVIEW_CARRY_ACROSS_REBASE === 'on';
-  const reviewResult = cascadePolicy('review', pickReview(review ?? readJson(join(HERE, '..', 'review-settings.json'), read)), {
+  // Keep legacy timing leaves; the dedicated tool timing block overrides them.
+  const toolReview = review ?? { ...readJson(join(HERE, '..', 'review-settings.json'), read),
+    ...readJson(join(HERE, '..', 'settings', 'review.json'), read)?.timing };
+  const reviewResult = cascadePolicy('review', pickReview(toolReview), {
     standard: REVIEW_TIMING_DEFAULTS, platform: pickReview(platformReview ?? platformPreference('review', { env, readFile: read })), env, log,
     envValues: reviewEnv, valid: {
       startAfter: v => ['fast-checks', 'ci-green', 'push'].includes(v),
+      startEarly: v => ['off', 'shadow', 'on'].includes(v),
+      startEarlyPublishWaitMs: nonnegative,
+      startEarlyPollMs: v => Number.isSafeInteger(v) && v > 0,
       fastChecks: validFastChecks,
       startBeforeCi: boolean, cancelOnCiRed: boolean, skipDrainMechanical: boolean, deltaMaxLines: nonnegative, deltaMaxFiles: nonnegative,
       earlyStartShadow: boolean, earlyStartCare: enumList(['none', 'low', 'elevated', 'high']),

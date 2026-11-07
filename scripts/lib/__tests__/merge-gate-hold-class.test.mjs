@@ -187,7 +187,8 @@ describe('fresh review CI merge-gate holds', () => {
   const rest = { ...row, status: 'completed', conclusion: 'failure', head_sha: sha,
     details_url: 'https://github.com/owner/repo/actions/runs/100/job/123' };
   function gate(extra = {}) {
-    return readReviewCiGate({ policy: { startAfter: 'ci-green' }, repo, pr: 4965, readHead: () => sha, readLabels: () => [],
+    // Historical strict-CI fixture: keep its original refusal contract independent of shipped start timing.
+    return readReviewCiGate({ policy: { startAfter: 'ci-green', startEarly: 'off' }, repo, pr: 4965, readHead: () => sha, readLabels: () => [],
       readChecks: () => [rest, { context: 'legacy', state: 'success' }],
       readRequired: () => ({ source: 'live', checks: ['merge-gate', 'legacy'] }),
       readMergeGateVerdict: () => verdict(), readFreeze: () => ({ error: 'unused' }), mergeGateSetting: 'on', ...extra });
@@ -293,8 +294,9 @@ describe('facts-first review CI merge-gate refusals', () => {
   const pr = 4965;
   const readRequired = () => ({ source: 'live', checks: ['merge-gate', 'test'] });
   async function gate(failedCheck, live) {
+    // The store's completed-failure contract predates early review; exercise its strict policy explicitly.
     const { readReviewCiGateFactsFirst } = await import('../review-facts.mjs');
-    return readReviewCiGateFactsFirst({ policy: { startAfter: 'ci-green' }, repo, pr, live, liveHead: () => sha,
+    return readReviewCiGateFactsFirst({ policy: { startAfter: 'ci-green', startEarly: 'off' }, repo, pr, live, liveHead: () => sha,
       readRequired, mergeGateSetting: 'on',
       lookup: () => ({ facts: { state: 'open', headSha: sha, labels: ['review:pending'],
         checks: ['merge-gate', 'test'].map(name => ({ name, conclusion: name === failedCheck ? 'failure' : 'success' })),
@@ -306,7 +308,7 @@ describe('facts-first review CI merge-gate refusals', () => {
     const live = vi.fn(() => allowed);
     expect(await gate('merge-gate', live)).toEqual(allowed);
     expect(live).toHaveBeenCalledTimes(1);
-    expect(live).toHaveBeenCalledWith({ repo, pr, readRequired, mergeGateSetting: 'on', policy: { startAfter: 'ci-green' } });
+    expect(live).toHaveBeenCalledWith({ repo, pr, readRequired, mergeGateSetting: 'on', policy: { startAfter: 'ci-green', startEarly: 'off' } });
   });
   it('still trusts a completed test failure without reading the live gate', async () => {
     const live = vi.fn(() => ({ allowed: true }));
