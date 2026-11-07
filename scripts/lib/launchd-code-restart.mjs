@@ -48,9 +48,15 @@ function strictLayer(layer, name, log) {
     return clean;
   }
   for (const [key, valid] of Object.entries(POLICY_KEYS)) {
-    if (!Object.hasOwn(layer, key) || layer[key] === undefined) continue;
-    if (valid(layer[key])) clean[key] = layer[key];
-    else safeLog(log, `${POLICY} ignored malformed ${name}.${key}`);
+    if (!Object.hasOwn(layer, key)) continue;
+    const value = layer[key];
+    if (value === undefined) continue;
+    if (valid(value)) clean[key] = value;
+    else if (key === 'enabled') {
+      // A kill switch that is present but unreadable means "off", never "fall through to a lower layer's on".
+      clean.enabled = false;
+      safeLog(log, `${POLICY} ${name}.enabled is malformed: treating as disabled`);
+    } else safeLog(log, `${POLICY} ignored malformed ${name}.${key}`);
   }
   return clean;
 }

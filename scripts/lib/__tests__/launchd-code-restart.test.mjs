@@ -168,7 +168,28 @@ describe('launchd restart by label (R703)', () => {
       expect(r.restarted).toEqual([]);
       expect(r.errors).toEqual([]);
       expect(r.skipped).toEqual([{ label: sampler, reason: 'disabled' }]);
-      expect(lines(o)).toContain('ignored malformed');
+      expect(lines(o)).toContain('malformed');
+    });
+
+    it.each([
+      ['nested settings', { settings: { enabled: { value: false } } }],
+      ['string "false" in settings', { settings: { enabled: 'false' } }],
+      ['number 0 in settings', { settings: { enabled: 0 } }],
+      ['nested platform alone', { platform: { enabled: { value: false } } }],
+      ['string "off" in platform', { platform: { enabled: 'off' } }],
+      ['nested env value', { envValues: { enabled: { value: false } } }],
+    ])('a present-but-malformed kill switch (%s) disables instead of falling back to on', async (_name, layers) => {
+      const o = fixture(layers);
+      const r = await restartServicesForClone(o);
+      expect(o.launchctl).not.toHaveBeenCalled();
+      expect(o.restarted.size).toBe(0);
+      expect(r.skipped).toEqual([{ label: sampler, reason: 'disabled' }]);
+      expect(lines(o)).toContain('malformed: treating as disabled');
+    });
+
+    it('a valid higher layer still overrides a malformed lower kill switch', async () => {
+      const o = fixture({ platform: { enabled: { value: false } }, settings: { enabled: true } });
+      expect((await restartServicesForClone(o)).restarted).toEqual([{ label: sampler, reason: 'kickstart -k' }]);
     });
 
     it.each(nested)('%s never restarts when the tool layer disables the feature', async (_name, layers) => {
@@ -179,8 +200,8 @@ describe('launchd restart by label (R703)', () => {
       expect(o.restarted.size).toBe(0);
     });
 
-    it('a malformed platform value is ignored, so a valid tool allowlist still applies', async () => {
-      const o = fixture({ platform: { enabled: { value: false } }, settings: { allowedLabels: [writer] } });
+    it('a malformed platform allowlist is ignored, so a valid tool allowlist still applies', async () => {
+      const o = fixture({ platform: { allowedLabels: { x: [sampler] } }, settings: { allowedLabels: [writer] } });
       const r = await restartServicesForClone(o);
       expect(r.restarted).toEqual([{ label: writer, reason: 'kickstart -k' }]);
       expect(o.launchctl.mock.calls).toEqual([[kick(writer)]]);
