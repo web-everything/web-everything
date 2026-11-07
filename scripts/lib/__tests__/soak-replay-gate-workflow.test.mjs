@@ -10,6 +10,7 @@ import yaml from 'js-yaml';
 const workflow = yaml.load(readFileSync(new URL('../../../.github/workflows/soak-replay-gate.yml', import.meta.url), 'utf8'));
 const steps = workflow.jobs['soak-replay-gate'].steps;
 const step = steps.find((s) => s.env?.PR_TITLE);
+const narrowFetchStep = steps.find((s) => s.name === 'Fetch main history (blobless)');
 const evaluator = new URL('../soak-replay-gate.mjs', import.meta.url).href;
 const realScripts = fileURLToPath(new URL('../../', import.meta.url));
 const gateFiles = ['soak-replay-gate-cli.mjs', 'lib/soak-replay-gate.mjs', 'lib/daemon-soak-scope.mjs', 'lib/soak-gate-merge-base-diff.mjs'];
@@ -48,7 +49,11 @@ function fixture(branch, eventBody = '') {
     const fail = process.env.GIT_FAIL;
     if (fail === 'fetch-head' && args[0] === 'fetch' && args[2] === ${JSON.stringify(head)}) process.exit(1);
     if (fail === 'fetch-main' && args[0] === 'fetch' && args[2] === ${JSON.stringify(mainRefspec)}) process.exit(1);
+    if (fail === 'fetch-base' && args[0] === 'fetch' && args[2] === ${JSON.stringify(base)}) process.exit(1);
+    if (fail === 'fetch-unshallow' && args.includes('--unshallow')) process.exit(1);
+    if (args[0] === 'rev-parse' && args[1] === '--is-shallow-repository') { console.log(process.env.SHALLOW === '1' ? 'true' : 'false'); process.exit(0); }
     if (args[0] === 'rev-parse') { if (fail === 'rev-parse') process.exit(128); console.log(process.env.MAIN_TIP); }
+    if (args[0] === 'merge-base' && fail === 'no-merge-base') process.exit(1);
     if (args[0] === 'merge-base') console.log(${JSON.stringify(fork)});
     if (args[0] === 'diff') console.log(${JSON.stringify(filesStatus)});
   `);
@@ -67,6 +72,12 @@ function fixture(branch, eventBody = '') {
   const log = name => existsSync(join(root, name)) ? readFileSync(join(root, name), 'utf8').trim().split('\n').map(JSON.parse) : [];
   return {
     root, log,
+    runNarrowFetch({ shallow = false, gitFail = '' } = {}) {
+      return spawnSync('bash', ['--noprofile', '--norc', '-eo', 'pipefail', '-c', narrowFetchStep.run], {
+        cwd: root, encoding: 'utf8', timeout: 10000,
+        env: { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}`, GIT_FAIL: gitFail, SHALLOW: shallow ? '1' : '0', MAIN_TIP: mainTip },
+      });
+    },
     run(body, { apiFailure = false, gitFail = '', baseRef = 'main', tip = mainTip } = {}) {
       writeFileSync(join(root, 'response.json'), JSON.stringify({ body }));
       return spawnSync('bash', ['--noprofile', '--norc', '-eo', 'pipefail', '-c', step.run], {
@@ -80,6 +91,7 @@ function fixture(branch, eventBody = '') {
   };
 }
 
+const mergeBaseAssert = (b) => ['merge-base', b, head];
 const mainFetchCalls = [
   ['fetch', 'origin', mainRefspec],
   ['rev-parse', '--verify', '--end-of-options', 'refs/remotes/origin/main^{commit}'],
@@ -89,7 +101,13 @@ describe('soak workflow live PR body transport', () => {
   it('retains event triggers, main ancestry, and read-only authenticated PR bindings', () => {
     expect(workflow.on.pull_request.types).toEqual(['opened', 'synchronize', 'reopened', 'edited']);
     expect(workflow.permissions).toEqual({ contents: 'read', 'pull-requests': 'read' });
-    expect(steps.find(s => s.uses?.startsWith('actions/checkout@')).with).toEqual({ ref: 'main', 'fetch-depth': 0 });
+    expect(steps.find(s => s.uses?.startsWith('actions/checkout@')).with).toEqual({ ref: 'main', 'fetch-depth': 1 });
+    // Narrow fetch: tip-only checkout, then complete main ancestry with blobs filtered, failing closed.
+    expect(steps.indexOf(narrowFetchStep)).toBe(steps.indexOf(steps.find(s => s.uses?.startsWith('actions/checkout@'))) + 1);
+    expect(narrowFetchStep.run).toContain('--unshallow --filter=blob:none');
+    expect(narrowFetchStep.run).toContain('--is-shallow-repository');
+    expect(narrowFetchStep.run).toContain('refs/remotes/origin/main^{commit}');
+    expect(step.run).toContain('git merge-base "$BASE_SHA" "$HEAD_SHA"');
     expect(step.env).toEqual({
       PR_TITLE: '${{ github.event.pull_request.title }}',
       BASE_REF: '${{ github.event.pull_request.base.ref }}',
@@ -110,7 +128,7 @@ describe('soak workflow live PR body transport', () => {
       expect(bodies.map(body => f.run(body).status)).toEqual([1, 0, 1]);
       expect(f.log('api.jsonl')).toEqual(bodies.map(() => ({ args: ['api', 'repos/fixture/repo/pulls/42', '--jq', '.body // ""'], token: 'fixture-token' })));
       expect(f.log('node.jsonl')).toEqual(bodies.map(body => argvFor(mainTip, body)));
-      const gitCalls = [['fetch', 'origin', head], ...mainFetchCalls, ...(branch === 'modern' ? [] : [
+      const gitCalls = [['fetch', 'origin', head], ...mainFetchCalls, mergeBaseAssert(mainTip), ...(branch === 'modern' ? [] : [
         ['merge-base', mainTip, head], ['diff', '--name-status', '-M', fork, head],
       ])];
       expect(f.log('git.jsonl')).toEqual(bodies.flatMap(() => gitCalls));
@@ -128,7 +146,7 @@ describe('soak workflow live PR body transport', () => {
       const f = fixture(branch);
       expect(f.run(waiver, { baseRef }).status).toBe(0);
       expect(f.log('node.jsonl')).toEqual([argvFor(base, waiver)]);
-      expect(f.log('git.jsonl')).toEqual([['fetch', 'origin', head], ...(branch === 'modern' ? [] : [
+      expect(f.log('git.jsonl')).toEqual([['fetch', 'origin', head], ['fetch', 'origin', base], mergeBaseAssert(base), ...(branch === 'modern' ? [] : [
         ['merge-base', base, head], ['diff', '--name-status', '-M', fork, head],
       ])]);
     });
@@ -137,11 +155,20 @@ describe('soak workflow live PR body transport', () => {
       ['fetch-head', /fetch PR head/],
       ['fetch-main', /fetch current main/],
       ['rev-parse', /resolve the fetched main tip/],
+      ['no-merge-base', /No merge-base between/],
     ])('refuses on %s failure without evaluating or using the stale event base', (gitFail, message) => {
       const f = fixture(branch, waiver);
       const result = f.run(waiver, { gitFail });
       expect(result.status).not.toBe(0);
       expect(result.stderr).toMatch(message);
+      expect(f.log('node.jsonl')).toEqual([]);
+    });
+
+    it('refuses a stacked PR whose event base cannot be fetched (no silent fallback)', () => {
+      const f = fixture(branch, waiver);
+      const result = f.run(waiver, { baseRef: 'lane/4124-stack', gitFail: 'fetch-base' });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/Failed to fetch event base/);
       expect(f.log('node.jsonl')).toEqual([]);
     });
 
@@ -166,6 +193,35 @@ describe('soak workflow live PR body transport', () => {
       expect(result.stderr).toMatch(/failed to retrieve.*PR body/i);
       expect(f.log('api.jsonl')).toHaveLength(1);
       expect(f.log('node.jsonl')).toEqual([]);
+    });
+  });
+
+  describe('narrow fetch fails closed', () => {
+    it('passes when main history is complete, fetching unshallow + blobless', () => {
+      const f = fixture('modern');
+      expect(f.runNarrowFetch().status).toBe(0);
+      expect(f.log('git.jsonl')[0]).toEqual(['fetch', '--no-tags', '--unshallow', '--filter=blob:none', 'origin', mainRefspec]);
+    });
+
+    it('FAILS when the repo is still shallow after the fetch', () => {
+      const f = fixture('modern');
+      const result = f.runNarrowFetch({ shallow: true });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/still shallow/);
+    });
+
+    it('FAILS when the history fetch itself fails', () => {
+      const f = fixture('modern');
+      const result = f.runNarrowFetch({ gitFail: 'fetch-unshallow' });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/could not fetch main history/);
+    });
+
+    it('FAILS when the main tip does not resolve', () => {
+      const f = fixture('modern');
+      const result = f.runNarrowFetch({ gitFail: 'rev-parse' });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/main tip does not resolve/);
     });
   });
 
