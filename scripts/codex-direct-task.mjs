@@ -244,6 +244,14 @@ export function assertResumeRequest({ resumeThreadId, ephemeral = false, outputS
   }
 }
 
+/** R650: directory of refusing vitest/playwright/npx shims, prepended to PATH inside Codex runs only. */
+export const CODEX_SHIM_DIR = resolve(process.env.WE_CODEX_SHIM_DIR || join(dirname(new URL(import.meta.url).pathname), 'codex-shims'));
+/** PATH with the shim dir first (deduped). */
+export function codexShimPath(env = process.env) {
+  const rest = String(env.PATH ?? '').split(':').filter((d) => d && d !== CODEX_SHIM_DIR);
+  return [CODEX_SHIM_DIR, ...rest].join(':');
+}
+
 export function buildCodexDirectTaskArgv({
   cwd,
   outputLastMessageFile,
@@ -304,6 +312,8 @@ export function buildCodexDirectTaskArgv({
     }
     argv.push('-c', 'sandbox_workspace_write.network_access=true');
     if (writableRoots.length) argv.push('-c', `sandbox_workspace_write.writable_roots=${JSON.stringify(writableRoots)}`);
+    // R650: shim dir first on the shell PATH so bare vitest/playwright/npx-vitest refuse (heavy-admission bypass).
+    argv.push('-c', `shell_environment_policy.set.PATH=${JSON.stringify(codexShimPath(env))}`);
     if (tempRoot) {
       for (const name of ['TMPDIR', 'TMP', 'TEMP']) {
         argv.push('-c', `shell_environment_policy.set.${name}=${JSON.stringify(tempRoot)}`);
@@ -939,7 +949,7 @@ export async function runCodexDirectExec({
   // tracked or git-cleaned... never seen by `git status --porcelain`" for exactly this reason.
   const outputLastMessageFile = join(gitDir, review ? `codex-self-review-${randomUUID()}-last-message.txt` : 'codex-direct-task-last-message.txt');
   route ??= resolveCodexTaskRoute({ kind: taskKind ?? (review ? 'review' : 'worker'), size, epic, decision, care, mandatoryLens, model, effort, env, log });
-  const argv = buildCodexDirectTaskArgv({ route, cwd: dir, outputLastMessageFile, outputSchemaFile, model, effort, ephemeral, review, writableRoots, tempRoot, resumeThreadId });
+  const argv = buildCodexDirectTaskArgv({ env, route, cwd: dir, outputLastMessageFile, outputSchemaFile, model, effort, ephemeral, review, writableRoots, tempRoot, resumeThreadId });
   const prompt = buildCodexPrompt(task, { review, policy });
   writeFileSync(logFile, '', { flag: resumeThreadId ? 'a' : 'w' });
   // A resumed turn that emits no final file must not reuse an earlier completion report.
@@ -949,7 +959,7 @@ export async function runCodexDirectExec({
     let child;
     try {
       child = spawnFn(cli, argv, { cwd: dir, stdio: ['pipe', 'pipe', 'pipe'], detached: true,
-        env: !review && tempRoot ? { ...env, TMPDIR: tempRoot, TMP: tempRoot, TEMP: tempRoot } : env });
+        env: review ? env : { ...env, PATH: codexShimPath(env), ...(tempRoot ? { TMPDIR: tempRoot, TMP: tempRoot, TEMP: tempRoot } : {}) } });
     } catch (e) {
       reject(new Error(`codex-direct-task: could not start \`${cli}\`: ${e.message}`));
       return;
