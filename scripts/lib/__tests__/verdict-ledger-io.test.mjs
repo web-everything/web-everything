@@ -58,6 +58,21 @@ describe('readLedgerFromGit: decision readers pass fresh, ordinary readers use t
     readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, fresh), fresh: true });
     expect(fetchCount(fresh)).toBe(2);
   });
+  it("forwards the caller's env: WE_OPS_FETCH_TTL_MS=0 disables coalescing", () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vlio-env-'));
+    const calls = [];
+    const env = { ...process.env, WE_OPS_FETCH_TTL_MS: '0' };
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, calls), env });
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, calls), env });
+    expect(fetchCount(calls)).toBe(2);
+  });
+  it('other readers (no fresh flag) still coalesce through the cache', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vlio-other-'));
+    const calls = [];
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, calls) });
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, calls) });
+    expect(fetchCount(calls)).toBe(1);
+  });
 });
 
 describe('the merge gate is a decision reader', () => {
