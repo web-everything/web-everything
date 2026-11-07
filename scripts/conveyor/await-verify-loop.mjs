@@ -134,7 +134,9 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
     const reason = classifyUnwakeableWait(row);
     // A verdict binds to the exact record phase A read; a record re-marked since is a new one and keeps admission.
     const now = allOwed.find((e) => e.key === row.key)?.record;
-    if (reason && now && beforeA.has(row.key) && isDeepStrictEqual(beforeA.get(row.key), now)) unwakeable.set(row.key, reason);
+    // Re-read after the PR-state reads too: a re-mark during them replaces the record the verdict was about.
+    const live = io.listRecords().find((e) => e.key === row.key)?.record;
+    if (reason && now && beforeA.has(row.key) && isDeepStrictEqual(beforeA.get(row.key), now) && isDeepStrictEqual(live, now)) unwakeable.set(row.key, reason);
   }
   const excluded = [];
   for (const { key, record } of allOwed) {

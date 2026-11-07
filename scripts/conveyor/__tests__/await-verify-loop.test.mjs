@@ -199,6 +199,22 @@ describe('runSlotAwareAwaitPass — the real pass, R3-gated', () => {
     expect(log).not.toHaveBeenCalled();
   });
 
+  it('a record re-marked during the PR-state reads keeps admission', async () => {
+    const h = harness([rec(1, { pendingResume: { kind: 'red' } })], {});
+    h.io.prState = async () => {
+      const [{ key, record }] = h.io.listRecords();
+      h.store.set(key, { ...record, requestedAt: new Date(T0 + 2000).toISOString() });
+      return { open: true, headSha: SHA };
+    };
+    const runPass = vi.fn(async ({ io, allowResume }) => (allowResume ? { rows: [] }
+      : { rows: io.listRecords().map(({ key, record }) => ({ key, pr: record.pr, action: 'wait', reason: 'previous-head CI repair must be verified and re-marked' })) }));
+    const log = vi.fn();
+    const out = await runSlots(h, { runPass, log });
+    expect(out.excluded).toEqual([]);
+    expect(out.admitted).toEqual(['sid-1']);
+    expect(log).not.toHaveBeenCalled();
+  });
+
   it('logs exactly one exclusion line per stale, closed, delivered and exhausted record with its reason', async () => {
     const records = [rec(1, { pendingResume: { kind: 'green' } }), repair(2),
       repair(3, { pendingResume: { kind: 'red', delivered: true } }),
