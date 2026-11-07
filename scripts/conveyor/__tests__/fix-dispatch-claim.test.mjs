@@ -19,6 +19,8 @@
 import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
+import * as fileLocks from '../../readiness/file-locks.mjs';
 import { join } from 'node:path';
 import {
   DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES, fixDispatchClaimRoot, fixDispatchClaimOwner, fixDispatchResource,
@@ -1643,19 +1645,29 @@ describe('absent dead claim recovery', () => {
     salvageFor: () => ({ status: 'clean' }), recordEvent: () => {},
     absentRelease: resolveAbsentClaimRelease({ env: {}, platform: null }), ...extra });
 
-  it('releases dead absent holders after two consecutive sweeps and records the reason and event', () => {
+  it('requires both consecutive sweeps and the policy age bound before releasing and recording the event', () => {
     acquire();
     const events = [];
     expect(sweep(T0 + 1000).released ?? []).toEqual([]);
     expect(readFixDispatchClaim(key()).meta).toMatchObject({ absentSince: iso(T0 + 1000), absentTicks: 1 });
-    expect(sweep(T0 + 2000, { recordEvent: e => events.push(e) }).released[0].reason).toMatch(/^absent-session-dead /);
+    expect(sweep(T0 + 2000).released ?? []).toEqual([]);
+    expect(readFixDispatchClaim(key()).meta.absentTicks).toBe(2);
+    expect(sweep(T0 + 601_000, { recordEvent: e => events.push(e) }).released[0].reason).toMatch(/^absent-session-dead /);
     expect(readFixDispatchClaim(key())).toBeNull();
     expect(events).toMatchObject([{ kind: 'absent-claim-released', detail: { minutes: 10, sources: { minutes: 'standard' } } }]);
   });
 
   it('releases persisted absence via the policy age bound even with no tick counter', () => {
     acquire(); meta({ absentSince: iso(T0) });
+    expect(sweep(T0 + 1000).released ?? []).toEqual([]);
     expect(sweep(T0 + 11 * 60_000).released).toHaveLength(1);
+  });
+
+  it('does not release from old persisted absence alone without two sweeps', () => {
+    acquire(); meta({ absentSince: iso(T0) });
+    expect(sweep(T0 + 11 * 60_000).released ?? []).toEqual([]);
+    expect(readFixDispatchClaim(key()).meta.absentTicks).toBe(1);
+    expect(sweep(T0 + 12 * 60_000).released).toHaveLength(1);
   });
 
   it('resolves absent policy provenance and rejects invalid or oversized bounds', () => {
@@ -1701,7 +1713,7 @@ describe('absent dead claim recovery', () => {
   it('runs salvage before releasing and rechecks ownership after salvage', () => {
     acquire(); sweep(T0 + 1000);
     const order = [];
-    const result = sweep(T0 + 2000, { salvageFor: e => {
+    const result = sweep(T0 + 601_000, { salvageFor: e => {
       expect(readFixDispatchClaim(key()).owner).toBe(e.owner); order.push('salvage'); return { status: 'salvaged' };
     }, recordEvent: () => { expect(readFixDispatchClaim(key())).toBeNull(); order.push('release'); } });
     expect(result.released).toHaveLength(1); expect(order).toEqual(['salvage', 'release']);
@@ -1709,7 +1721,7 @@ describe('absent dead claim recovery', () => {
 
   it.each(['failed', 'unknown', 'throws', 'promise'])('keeps the claim when salvage is %s', status => {
     acquire(); sweep(T0 + 1000);
-    expect(sweep(T0 + 2000, { salvageFor: () => {
+    expect(sweep(T0 + 601_000, { salvageFor: () => {
       if (status === 'throws') throw Error('salvage');
       return status === 'promise' ? Promise.resolve({ status: 'salvaged' }) : { status };
     } }).released ?? []).toEqual([]);
@@ -1727,17 +1739,17 @@ describe('absent dead claim recovery', () => {
     const salvage = vi.spyOn(laneSalvage, 'salvageLane').mockReturnValue({ bundle: 'verified.bundle' });
     try {
       sweep(T0 + 1000);
-      const result = sweep(T0 + 2000, { salvageFor: undefined });
+      const result = sweep(T0 + 601_000, { salvageFor: undefined });
       expect(result.released ?? []).toHaveLength(unpushed === null ? 0 : 1);
       expect(state).toHaveBeenCalledWith(dir);
-      expect(salvage).toHaveBeenCalledTimes(unpushed === true ? 1 : 0);
-      if (unpushed) expect(salvage).toHaveBeenCalledWith(expect.objectContaining({ dir, lane: 9, includeLocalBranches: true }));
+      expect(salvage).toHaveBeenCalledTimes(unpushed === null ? 0 : 1);
+      if (unpushed !== null) expect(salvage).toHaveBeenCalledWith(expect.objectContaining({ dir, lane: 9, includeLocalBranches: true }));
     } finally { state.mockRestore(); salvage.mockRestore(); vi.unstubAllEnvs(); }
   });
 
   it('retains a replacement claim installed during salvage', () => {
     acquire(); sweep(T0 + 1000);
-    const result = sweep(T0 + 2000, { salvageFor: () => {
+    const result = sweep(T0 + 601_000, { salvageFor: () => {
       releaseFixDispatchClaim({ ...key(), owner: 'Mac:68715' });
       acquireFixDispatchClaim({ ...key(), owner: 'replacement', nowMs: T0 + 2000, nowIso: iso(T0 + 2000) });
       return { status: 'salvaged' };
@@ -1752,6 +1764,138 @@ describe('absent dead claim recovery', () => {
       read: () => ({ v: 1, who: 'fix-6319', pr: 6319, requestedAt: iso(T0) }) }) });
     expect(readFixDispatchClaim(key()).meta.absentTicks).toBeUndefined();
     expect(sweep(T0 + 3000).released ?? []).toEqual([]);
+  });
+
+
+  it('default listing preserves unreadable wrapper evidence and resets absence', () => {
+    acquire(); sweep(T0 + 1000);
+    const completions = join(claimRoot, 'completions');
+    mkdirSync(completions);
+    writeFileSync(join(completions, 'fix-6319.json'), '{broken');
+    vi.stubEnv('OPERATION_COMPLETIONS_DIR', completions);
+    const list = vi.spyOn(dispatchIo, 'defaultListAgents').mockReturnValue([]);
+    try {
+      expect(sweep(T0 + 601_000, { listAgentsAll: undefined }).released ?? []).toEqual([]);
+      expect(readFixDispatchClaim(key()).meta.absentTicks).toBeUndefined();
+      expect(sweep(T0 + 602_000).released ?? []).toEqual([]);
+    } finally { list.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it('incomplete injected listings never count as absence', () => {
+    acquire(); sweep(T0 + 1000);
+    const rows = [];
+    Object.defineProperty(rows, 'incomplete', { value: [{ session: 'fix-6319' }] });
+    expect(sweep(T0 + 601_000, { listAgentsAll: () => rows }).released ?? []).toEqual([]);
+    expect(readFixDispatchClaim(key()).meta.absentSince).toBeUndefined();
+  });
+
+  it.each(['missing-pool', 'unparseable-lease', 'unreadable-lease', 'invalid-lease'])('keeps claims when salvage discovery is %s', mode => {
+    acquire(); sweep(T0 + 1000);
+    const pool = join(claimRoot, 'pools');
+    if (mode !== 'missing-pool') {
+      const gitDir = join(pool, 'web-everything', 'lane-9', '.git');
+      mkdirSync(gitDir, { recursive: true });
+      const lease = join(gitDir, '.lane-lease');
+      if (mode === 'unreadable-lease') mkdirSync(lease);
+      else writeFileSync(lease, mode === 'invalid-lease' ? 'null' : '{broken');
+    }
+    vi.stubEnv('LANE_POOL_ROOT', pool);
+    try {
+      expect(sweep(T0 + 601_000, { salvageFor: undefined }).released ?? []).toEqual([]);
+      expect(readFixDispatchClaim(key())).not.toBeNull();
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it('releases after complete readable discovery with no matched lanes', () => {
+    acquire(); sweep(T0 + 1000);
+    const pool = join(claimRoot, 'pools');
+    mkdirSync(join(pool, 'web-everything'), { recursive: true });
+    vi.stubEnv('LANE_POOL_ROOT', pool);
+    try { expect(sweep(T0 + 601_000, { salvageFor: undefined }).released).toHaveLength(1); }
+    finally { vi.unstubAllEnvs(); }
+  });
+
+  it('salvages unpushed commits on a non-HEAD local branch before release', () => {
+    acquire(); sweep(T0 + 1000);
+    const pool = join(claimRoot, 'pools');
+    const dir = join(pool, 'web-everything', 'lane-9');
+    mkdirSync(dir, { recursive: true });
+    const git = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    git('init', '-b', 'main');
+    git('config', 'user.name', 'Test'); git('config', 'user.email', 'test@example.invalid');
+    git('commit', '--allow-empty', '-m', 'base');
+    git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+    git('checkout', '-b', 'unpublished');
+    git('commit', '--allow-empty', '-m', 'precious work');
+    const precious = git('rev-parse', 'HEAD');
+    git('checkout', 'main');
+    writeFileSync(join(dir, '.git', '.lane-lease'), JSON.stringify({ ownerSession: 'fix-6319' }));
+    vi.stubEnv('LANE_POOL_ROOT', pool);
+    vi.stubEnv('WE_LANE_SALVAGE_DIR', join(claimRoot, 'salvage'));
+    try {
+      expect(laneHistory.laneStateSnapshot(dir).unpushed).toBe(false);
+      let observed;
+      const result = sweep(T0 + 601_000, { salvageFor: undefined, recordEvent: () => {
+        const records = readFileSync(join(claimRoot, 'salvage', 'index.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+        observed = { records, heads: git('bundle', 'list-heads', records[0].bundle), claim: readFixDispatchClaim(key()) };
+      } });
+      expect(result.released).toHaveLength(1);
+      expect(observed.records).toHaveLength(1);
+      expect(observed.heads).toContain(precious);
+      expect(observed.claim).toBeNull();
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it.each([null, undefined, 'throws'])('keeps quiet holders with unknown pid proof %s out of idle release', proof => {
+    acquire();
+    const head = vi.fn(() => 'unchanged');
+    const extra = { identity: () => { if (proof === 'throws') throw Error('ps'); return { alive: proof }; },
+      activityMsFor: () => T0, hungThresholdMs: 60_000, prHeadFor: head,
+      listAgentsAll: () => [{ name: 'fix-6319', pid: 68715, state: 'idle', startedAt: T0 }] };
+    sweep(T0 + 91 * 60_000, extra);
+    expect(sweep(T0 + 112 * 60_000, extra).released ?? []).toEqual([]);
+    expect(head).not.toHaveBeenCalled();
+    expect(readFixDispatchClaim(key()).meta.idleHead).toBeUndefined();
+  });
+
+  it('rechecks ownership immediately before persisting stuck-session dedupe', () => {
+    acquire();
+    const events = [];
+    const read = fileLocks.readLockEntry;
+    let armed = false;
+    const spy = vi.spyOn(fileLocks, 'readLockEntry').mockImplementation((...args) => {
+      const current = read(...args);
+      if (armed && current) {
+        armed = false;
+        Object.defineProperty(current.meta, 'stuckEmitted', { enumerable: true, get() {
+          releaseFixDispatchClaim({ ...key(), owner: 'Mac:68715' });
+          acquireFixDispatchClaim({ ...key(), owner: 'replacement', nowMs: T0 + 1000, nowIso: iso(T0 + 1000) });
+          return false;
+        } });
+      }
+      return current;
+    });
+    try {
+      sweep(T0 + 91 * 60_000, { nowIso: () => { armed = true; return iso(T0 + 91 * 60_000); },
+        identity: () => ({ alive: true }), activityMsFor: () => T0, hungThresholdMs: 60_000,
+        recordEvent: e => events.push(e),
+        listAgentsAll: () => [{ name: 'fix-6319', pid: 68715, state: 'idle', startedAt: T0 }] });
+      expect(events).toEqual([]);
+      expect(readFixDispatchClaim(key()).owner).toBe('replacement');
+    } finally { spy.mockRestore(); }
+  });
+
+  it('emits no stuck-session event when the dedupe write fails', () => {
+    acquire(); const events = [];
+    const write = fileLocks.heartbeat;
+    const spy = vi.spyOn(fileLocks, 'heartbeat').mockImplementation((...args) => args[5]?.stuckEmitted ? false : write(...args));
+    try {
+      sweep(T0 + 91 * 60_000, { identity: () => ({ alive: true }), activityMsFor: () => T0, hungThresholdMs: 60_000,
+        recordEvent: e => events.push(e),
+        listAgentsAll: () => [{ name: 'fix-6319', pid: 68715, state: 'idle', startedAt: T0 }] });
+      expect(events).toEqual([]);
+      expect(readFixDispatchClaim(key()).meta.stuckEmitted).toBeUndefined();
+    } finally { spy.mockRestore(); }
   });
 
   it.each(['idle', 'blocked'])('keeps a quiet alive %s holder and emits stuck-session exactly once', state => {

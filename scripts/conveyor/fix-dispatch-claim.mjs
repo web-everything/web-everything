@@ -148,10 +148,12 @@ function salvageAbsentClaim(entry, { name, nowMs }) {
   const poolRoot = guardedPoolRoot();
   const profile = CONSTELLATION_REPOS[meta.repo];
   if (!profile) return { status: 'unknown' };
+  let readablePools = 0;
   for (const pool of profile.dirs) {
     const poolDir = joinPath(poolRoot, pool);
     let children;
     try { children = readdirSync(poolDir); } catch (e) { if (e.code === 'ENOENT') continue; throw e; }
+    readablePools++;
     for (const child of children.filter(c => /^lane-\d+$/.test(c))) {
       const dir = joinPath(poolDir, child);
       if (Number(meta.lane?.lane ?? meta.lane) === Number(child.slice(5))) dirs.add(dir);
@@ -164,19 +166,21 @@ function salvageAbsentClaim(entry, { name, nowMs }) {
         || lease.holder === name || lease.holder === entry.owner) dirs.add(dir);
     }
   }
+  if (!readablePools) return { status: 'unknown' };
   for (const dir of dirs) {
     const awaiting = makeAwaitingVerifyResolver({ now: () => nowMs })({
       cwd: dir, name, sessionId: meta.sessionId,
     }, { pr: meta.pr });
     if (awaiting?.awaiting === true) return { status: 'unknown' };
     const state = laneStateSnapshot(dir);
-    if (state.unpushed === null) return { status: 'unknown' };
-    if (!state.unpushed) continue;
+    if (typeof state.unpushed !== 'boolean') return { status: 'unknown' };
+    // The snapshot describes HEAD only. Always salvage matched lanes so the helper also
+    // inspects every local branch; a clean HEAD cannot prove those branches were pushed.
     const lane = Number(/^lane-(\d+)$/.exec(basename(dir))?.[1]);
     if (!Number.isSafeInteger(lane) || lane < 1) return { status: 'unknown' };
     const saved = salvageLane({ dir, lane, pool: basename(dirname(dir)), branchRef: 'origin/main',
       now: new Date(nowMs), reason: 'absent-session-dead', meta: { owner: entry.owner }, includeLocalBranches: true });
-    if (!saved?.bundle) return { status: 'unknown' };
+    if (!saved || (!saved.bundle && (state.unpushed || saved.bundle !== null))) return { status: 'unknown' };
   }
   return { status: dirs.size ? 'salvaged' : 'clean' };
 }
@@ -426,7 +430,13 @@ export const MAX_IDLE_CLAIM_OBSERVATION_GAP_MS = 20 * 60_000;
  */
 export function refreshLiveFixDispatchClaims({
   lockRoot = fixDispatchClaimRoot(),
-  listAgentsAll = () => [...defaultListAgents({ all: true }), ...listWrappedWorkerAgents()],
+  listAgentsAll = () => {
+    const agents = defaultListAgents({ all: true });
+    const wrapped = listWrappedWorkerAgents();
+    // Array spread discards the wrapper listing's non-enumerable incomplete evidence.
+    if (!Array.isArray(agents) || !Array.isArray(wrapped) || agents.incomplete || wrapped.incomplete) return null;
+    return [...agents, ...wrapped];
+  },
   hungInfoFor = readHungInfo,
   awaitingVerifyFor = makeAwaitingVerifyResolver(),
   hungThresholdMs = resolveHungThresholdMs(),
@@ -463,7 +473,7 @@ export function refreshLiveFixDispatchClaims({
       delete meta.absentTicks;
       heartbeat(lockRoot, resource, cur.owner, cur.heartbeatAt, cur.pid ?? null, meta);
     };
-    if (!Array.isArray(listed)) { resetAbsent(); clearClaimIdleHead(lockRoot, resource, entry); continue; }
+    if (!Array.isArray(listed) || listed.incomplete) { resetAbsent(); clearClaimIdleHead(lockRoot, resource, entry); continue; }
 
     if (Number.isFinite(claimedMs) && nowMs - claimedMs > MAX_FIX_DISPATCH_CLAIM_REFRESH_MS) {
       clearClaimIdleHead(lockRoot, resource, entry);
@@ -530,14 +540,23 @@ export function refreshLiveFixDispatchClaims({
     const isAwaiting = typeof awaitingVerifyFor === 'function' && agentsAll.some((row) => {
       try { return awaitingVerifyFor(row, { pr })?.awaiting === true; } catch { return false; }
     });
+    let quietUnknownHolder = false;
     const quietAliveHolder = agentsAll.some(a => {
       if (!['idle', 'blocked'].includes(a.state) || !boundToClaim(a) || !Number.isInteger(a.pid)) return false;
       try {
         const at = activityMsFor(a);
-        return Number.isFinite(at) && nowMs - at >= hungThresholdMs * PENDING_CALL_GRACE_MULTIPLIER
-          && identity(a.pid, { startedBy: holderStartedBy(a, startedAtMs) })?.alive === true;
-      } catch { return false; }
+        if (!Number.isFinite(at) || nowMs - at < hungThresholdMs * PENDING_CALL_GRACE_MULTIPLIER) return false;
+        const verdict = identity(a.pid, { startedBy: holderStartedBy(a, startedAtMs) });
+        if (verdict?.alive !== true && verdict?.alive !== false) quietUnknownHolder = true;
+        return verdict?.alive === true;
+      } catch { quietUnknownHolder = true; return false; }
     });
+    if (quietUnknownHolder) {
+      // Unknown pid proof cannot enter idle release or establish continued absence.
+      resetAbsent();
+      clearClaimIdleHead(lockRoot, resource, entry);
+      continue;
+    }
     if (quietAliveHolder) {
       // Hung transcript evidence cannot pronounce a positively live, quiet holder dead.
       for (let i = 0; i < agentsAll.length; i++) {
@@ -576,7 +595,7 @@ export function refreshLiveFixDispatchClaims({
       delete meta.idleHead;
       // Persist evidence without renewing the dead holder's TTL.
       heartbeat(lockRoot, resource, cur.owner, cur.heartbeatAt, cur.pid ?? null, meta);
-      if (ticks < 2 && !(validSince && nowMs - since >= absentRelease.minutes * 60_000)) continue;
+      if (ticks < 2 || !(validSince && nowMs - since >= absentRelease.minutes * 60_000)) continue;
       let saved;
       try { saved = salvageFor(entry, { name, nowMs }); } catch { continue; }
       if (saved && typeof saved.then === 'function') {
@@ -686,13 +705,20 @@ export function refreshLiveFixDispatchClaims({
         continue;
       }
     }
+    let emitStuck = false;
     if (!meta.stuckEmitted && quietAliveHolder) {
+      // The daemon sweep is singleton: persisted dedupe covers sequential sweeps.
+      // Re-read immediately before the write so a replacement claim is never marked.
+      const fresh = readUnchangedClaim(lockRoot, resource, entry);
+      if (!fresh) continue;
+      emitStuck = !fresh.meta.stuckEmitted;
       meta.stuckEmitted = true;
-      if (!heartbeat(lockRoot, resource, current.owner, heartbeatAt, current.pid ?? null, meta)) continue;
+    }
+    if (!heartbeat(lockRoot, resource, current.owner, heartbeatAt, current.pid ?? null, meta)) continue;
+    if (emitStuck) {
       recordIdleRelease({ kind: 'stuck-session', repo, pr, daemon: 'reconcile-fix-dispatch',
         detail: { kind, owner: entry.owner } }, recordEvent);
     }
-    if (!heartbeat(lockRoot, resource, current.owner, heartbeatAt, current.pid ?? null, meta)) continue;
     if (isAwaiting) awaiting.push({ repo, pr, kind, owner: entry.owner });
     refreshed.push({
       repo, pr, kind, headSha, owner: entry.owner,
