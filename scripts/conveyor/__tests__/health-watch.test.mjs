@@ -145,6 +145,18 @@ describe('tick() — Claude auth expired NEEDS-YOU delivery', () => {
       expect(result.notifications).toContainEqual(expect.objectContaining({ channel: 'needs-you', ok: false, error: 'feed unavailable' }));
     } finally { log.mockRestore(); }
   });
+
+  it('retries a rejected publication on the next tick and then stops', async () => {
+    const { run, publishNeedsYou } = setup();
+    publishNeedsYou.mockRejectedValueOnce(new Error('feed unavailable'));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await run();
+      await run();
+      await run();
+      expect(publishNeedsYou).toHaveBeenCalledTimes(2);
+    } finally { log.mockRestore(); }
+  });
 });
 
 describe('lane scan cache target isolation', () => {
