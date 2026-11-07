@@ -262,7 +262,8 @@ export function classifyCommand(cmd, depth = 0, withSubstitutions = true) {
   }
   for (const segment of parseSegments(heredocs.unterminated ? String(cmd) : heredocs.text).segments) {
     let head = canonicalCommand(segment), queued = false;
-    const admitted = /^node\s+\S*heavy-admission\.mjs\s+run\b[\s\S]*?\s--\s+([\s\S]+)$/.exec(head);
+    // Node options may precede the wrapper script (`node --no-warnings …/heavy-admission.mjs run -- …`).
+    const admitted = /^node\s+(?:-[^\s-]\S*\s+|--[^\s=-]\S*\s+)*\S*heavy-admission\.mjs\s+run\b[\s\S]*?\s--\s+([\s\S]+)$/.exec(head);
     if (admitted) { queued = true; head = canonicalCommand(admitted[1]); }
     const words = shellTokens(head).filter(word => !word.op).map(word => word.text);
     // `sh -c "…"` as the inner shell receives it. Substitutions the outer shell already ran (an unquoted or

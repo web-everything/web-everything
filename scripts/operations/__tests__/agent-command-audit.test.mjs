@@ -88,6 +88,10 @@ describe('agent command audit', () => {
   ])('still classifies Node in executable position: %s', (cmd, category) => {
     expect(classifyCommand(cmd)).toEqual([expect.objectContaining({ category, queued: false })]);
   });
+  it.each(['node scripts/readiness/heavy-admission.mjs run -- node --test a',
+    'node --no-warnings scripts/readiness/heavy-admission.mjs run -- node --test a'])('counts an admitted Node test run as queued: %s', cmd => {
+    expect(classifyCommand(cmd)).toEqual([expect.objectContaining({ category: 'node --test', queued: true })]);
+  });
   it('keeps admission local to a segment, including inside a loop', () => {
     expect(classifyCommand(`for f in a; do ${queue}npx vitest run "$f"; done; npx vitest run b`).map(r => r.queued)).toEqual([true, false]);
     expect(classifyCommand('npm run test:unit -- a')[0].queued).toBe(true);

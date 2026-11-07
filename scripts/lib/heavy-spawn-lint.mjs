@@ -252,13 +252,20 @@ export function findUngatedHeavySpawns(source, filename = 'source.mjs', { script
   // Comment ranges come from the parsed file's own trivia (the gaps between tokens), never from re-scanning one
   // line alone: a line inside a multiline template, a block comment or a continued string can read like a line
   // comment when lexed by itself, yet is data.
-  const comments = new Map();
+  // (Only .mjs/.js sources are linted, and Node refuses JSX there, so JSX text is not modelled.)
+  const comments = new Map(), scannedLeading = new Set(), scannedTrailing = new Set();
   const collectComments = node => {
-    // JSX text is content, and JSDoc nodes sit inside a comment: neither starts real trivia.
-    if (node.kind === ts.SyntaxKind.JsxText
-      || (node.kind >= ts.SyntaxKind.FirstJSDocNode && node.kind <= ts.SyntaxKind.LastJSDocNode)) return;
-    for (const range of ts.getLeadingCommentRanges(source, node.pos) ?? []) comments.set(range.pos, range);
-    for (const range of ts.getTrailingCommentRanges(source, node.end) ?? []) comments.set(range.pos, range);
+    // JSDoc nodes sit inside a comment: they never start real trivia.
+    if (node.kind >= ts.SyntaxKind.FirstJSDocNode && node.kind <= ts.SyntaxKind.LastJSDocNode) return;
+    // Nodes sharing a boundary share its trivia: scan each position once (linear in the source).
+    if (!scannedLeading.has(node.pos)) {
+      scannedLeading.add(node.pos);
+      for (const range of ts.getLeadingCommentRanges(source, node.pos) ?? []) comments.set(range.pos, range);
+    }
+    if (!scannedTrailing.has(node.end)) {
+      scannedTrailing.add(node.end);
+      for (const range of ts.getTrailingCommentRanges(source, node.end) ?? []) comments.set(range.pos, range);
+    }
     for (const child of node.getChildren(file)) collectComments(child);
   };
   collectComments(file);
