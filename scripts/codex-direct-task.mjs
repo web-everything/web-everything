@@ -844,25 +844,44 @@ export function captureDiff({ dir, startSha, execFn = defaultExecFn, binarySafe 
   const git = (args, extra = {}) => execFn('git', ['-C', dir, ...laneGitConfigArgs(), '--no-replace-objects', ...hardenLaneGitArgs(args)],
     { env: laneGitHardeningEnv(), timeout: GIT_STEP_TIMEOUT_MS, ...extra });
   assertNoLaneFilterDrivers(git);
-  const status = git(['status', '--porcelain', '-z']);
+  // `--untracked-files=all`: a `status.showUntrackedFiles=no` the checkout sets must not hide new files.
+  const status = git(['status', '--porcelain', '-z', '--untracked-files=all']);
   const untracked = status.split('\0').filter((l) => l.startsWith('?? ')).map((l) => l.slice(3));
+  let intentToAddError;
   if (untracked.length) {
-    try { git(['add', '--intent-to-add', '--', ...untracked]); } catch { /* best-effort */ }
+    try { git(['add', '--intent-to-add', '--', ...untracked]); } catch (error) { intentToAddError = error; }
   }
   const diff = git(['diff', '--text', startSha]);
   const diffStat = git(['diff', '--stat', startSha]);
   const commitsRaw = git(['log', '--oneline', `${startSha}..HEAD`]);
   const commits = commitsRaw.split('\n').map((l) => l.trim()).filter(Boolean);
   const result = { status: status.split('\0').filter(Boolean).join('\n'), diff, diffStat, commits, hasChanges: diff.trim().length > 0 || commits.length > 0 };
-  if (binarySafe) Object.assign(result, captureBinaryPatch(git, startSha));
+  if (binarySafe) Object.assign(result, captureBinaryPatch(git, startSha, { untracked, intentToAddError }));
   return result;
 }
 
-/** `captureDiff`'s byte-exact patch (see its `binarySafe`). Never throws: a failed read is a not-exact patch. */
-function captureBinaryPatch(git, startSha) {
+/** Fixed output shape for the byte-exact patch: the checkout's git config (which Codex can write) or the host's
+ *  must not colour it, drop or rename its `a/`/`b/` prefixes, or narrow it to a subdirectory — any of those
+ *  yields a patch `git apply` refuses while it still decodes as clean UTF-8. `--binary` implies `--full-index`. */
+export const BINARY_PATCH_DIFF_ARGS = Object.freeze(['diff', '--binary', '--no-color', '--src-prefix=a/', '--dst-prefix=b/', '--no-relative']);
+
+const notExact = (reason) => ({ patch: null, patchExact: false, patchError: String(reason?.message ?? reason).split('\n')[0] });
+
+/** `captureDiff`'s byte-exact patch (see its `binarySafe`). Never throws: any doubt is a not-exact patch. */
+function captureBinaryPatch(git, startSha, { untracked, intentToAddError }) {
+  // A new file the intent-to-add step could not stage is missing from every diff, so the patch is incomplete.
+  if (intentToAddError) return notExact(`new files could not be staged for the diff: ${intentToAddError.message ?? intentToAddError}`);
+  try {
+    // `.git/info/exclude` and `core.excludesFile` sit outside the committed tree (Codex can write both): a new
+    // file they hide is in the clone but not in the patch. Only the repository's own `.gitignore` files count.
+    const listed = git(['ls-files', '-z', '--others', '--exclude-per-directory=.gitignore']);
+    const seen = new Set(untracked);
+    const hidden = String(listed ?? '').split('\0').filter(path => path && !seen.has(path));
+    if (hidden.length) return notExact(`${hidden.length} new file(s) hidden by an exclude file outside .gitignore (e.g. ${JSON.stringify(hidden[0])})`);
+  } catch (error) { return notExact(error); }
   let raw;
-  try { raw = git(['diff', '--binary', startSha], { encoding: 'buffer' }); }
-  catch (error) { return { patch: null, patchExact: false, patchError: String(error?.message ?? error).split('\n')[0] }; }
+  try { raw = git([...BINARY_PATCH_DIFF_ARGS, startSha], { encoding: 'buffer' }); }
+  catch (error) { return notExact(error); }
   if (!Buffer.isBuffer(raw)) {
     // An injected execFn that ignored the buffer encoding: only an empty patch is known to be exact.
     const patch = String(raw ?? '');
@@ -1201,9 +1220,13 @@ export async function codexDirectTask({
     scratchLog.written = true;
   };
   // A human CLI run with no --dir leaves its edits only in the scratch clone it prints (keepScratch), and a --json
-  // run whose patch is not byte-exact keeps it too. Set on a successful return, or when the final diff capture
-  // fails (its error names the clone); any other throw prints just its error, so its clone is cleaned up.
+  // run whose patch is not byte-exact keeps it too. Set on a successful return, or on a throw after Codex started
+  // that may leave edits (its error names the clone); an earlier throw prints just its error, and its clone is
+  // cleaned up. A signal or process exit mid-run (a cancelled task) still cleans up through the exit hook.
   let retainedScratch;
+  // Set once Codex may have edited a scratch clone this run deletes; `capturedDiff` once the final diff is read.
+  let editsAt = null;
+  let capturedDiff;
   let cleaned = false;
   const cleanupTemps = () => {
     if (keep || cleaned) return;
@@ -1274,6 +1297,8 @@ export async function codexDirectTask({
   // remote slot, so every Codex-run gate silently fell back to local admission on this host.
   const heavyLockRoot = review ? undefined : resolve(admissionLockRoot(resolve(targetDir), env));
   const writableRoots = review ? [] : [gitDir, heavyLockRoot, join(dirname(heavyLockRoot), 'remote'), tempRoot];
+  // From here on Codex may have edited the scratch clone, so a throw keeps it (see the catch below).
+  if (scratch && !keep) editsAt = { dest: scratch.dest, log: resolvedLogFile };
   const run = await withCodexUsage({ model, effort, taskKind: usageTaskKind ?? taskKind ?? (review ? 'review' : 'worker'), caller, repo, pr, card, cwd: targetDir }, () => runCodexDirectExec({
     dir: targetDir, task, outputSchemaFile, route, model, effort, ephemeral, timeoutMs, logFile: resolvedLogFile, stream, spawnFn, review,
     gitDir, writableRoots, tempRoot, env, policy: briefPolicy, resumeThreadId,
@@ -1301,17 +1326,8 @@ export async function codexDirectTask({
     },
     gate: async () => { gateResult = await executeGate(); return gateResult.pass; },
   }) : { skipped: true, rounds: 0, notes: [] };
-  let diff;
-  try { diff = captureDiff({ dir: targetDir, startSha, execFn, binarySafe: Boolean(scratch) }); }
-  catch (error) {
-    // The one throw that keeps a scratch clone: a failed capture cannot say whether Codex left edits there, and
-    // the clone would be their only copy. The error names it, since the CLI prints only the error.
-    if (scratch && !keep) {
-      retainedScratch = scratch.dest;
-      if (error instanceof Error) error.message += ` (scratch clone kept at ${scratch.dest}: its edits could not be captured; log at ${resolvedLogFile})`;
-    }
-    throw error;
-  }
+  const diff = captureDiff({ dir: targetDir, startSha, execFn, binarySafe: Boolean(scratch) });
+  capturedDiff = diff;
 
   // #x8wbivt Fork 4: surface the quota signal for any run that actually persisted a rollout (an `--ephemeral`
   // run writes none — nothing to read). Default is read-ONLY (`readQuotaFn`/`readRolloutQuota`) to preserve
@@ -1398,6 +1414,13 @@ export async function codexDirectTask({
     quotaRolloutCleared,
   };
   } catch (error) {
+    // Once Codex started, the scratch clone may hold the only copy of its edits (a red self-review repair gate, a
+    // failed capture, a failure after it): keep it unless the captured diff proved there were none. The CLI
+    // prints only the error, so the error names the kept clone and the log inside it.
+    if (editsAt && !cleaned && !retainedScratch && !(capturedDiff && !capturedDiff.hasChanges)) {
+      retainedScratch = editsAt.dest;
+      if (error instanceof Error) error.message += ` (scratch clone kept at ${editsAt.dest}: the run failed after Codex started, so its edits may be there; log at ${editsAt.log})`;
+    }
     // The CLI prints only the error: name the preserved log, or a failed run leaves it unreported in tmpdir.
     cleanupTemps();
     if (scratchLog?.written && error instanceof Error) error.message += ` (log kept at ${scratchLog.dest})`;

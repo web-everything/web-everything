@@ -867,6 +867,65 @@ describe('captureDiff — the review artifact, never a commit/push', () => {
     }
   });
 
+  // Codex can write the clone's .git/config, and the host's own config applies too: none of these may yield an
+  // exact-looking patch that `git apply` refuses or that silently drops a new file.
+  it.each([
+    [['color.diff', 'always'], ['color.ui', 'always']],
+    [['diff.noprefix', 'true']],
+    [['diff.mnemonicPrefix', 'true']],
+    [['diff.relative', 'true']],
+    [['status.showUntrackedFiles', 'no']],
+  ])('binarySafe: checkout config %j cannot break the patch', (...pairs) => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-codex-config-patch-'));
+    const fresh = `${dir}-fresh`;
+    try {
+      const git = initGitRepo(dir);
+      const startSha = git('rev-parse', 'HEAD');
+      for (const [key, value] of pairs) git('config', key, value);
+      mkdirSync(join(dir, 'nested'));
+      writeFileSync(join(dir, 'nested', 'added.bin'), binaryBytes(5));
+      writeFileSync(join(dir, 'top.txt'), 'top\n');
+      const report = captureDiff({ dir, startSha, binarySafe: true });
+      expect(report.patchExact).toBe(true);
+      expect(report.patch).not.toContain('\u001b[');
+      execFileSync('git', ['clone', '--quiet', dir, fresh]);
+      writeFileSync(join(fresh, '.patch'), report.patch);
+      execFileSync('git', ['-C', fresh, 'apply', '--binary', '.patch']);
+      expect(readFileSync(join(fresh, 'nested', 'added.bin')).equals(binaryBytes(5))).toBe(true);
+      expect(readFileSync(join(fresh, 'top.txt'), 'utf8')).toBe('top\n');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(fresh, { recursive: true, force: true });
+    }
+  });
+
+  it('binarySafe: a new file hidden by .git/info/exclude (outside the committed .gitignore) is not byte-exact', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-codex-exclude-patch-'));
+    try {
+      const git = initGitRepo(dir);
+      const startSha = git('rev-parse', 'HEAD');
+      writeFileSync(join(git('rev-parse', '--absolute-git-dir'), 'info', 'exclude'), 'hidden.bin\n');
+      writeFileSync(join(dir, 'hidden.bin'), binaryBytes(6));
+      const report = captureDiff({ dir, startSha, binarySafe: true });
+      expect(report.patchExact).toBe(false);
+      expect(report.patchError).toContain('hidden by an exclude file');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('binarySafe: a failed intent-to-add (new files missing from every diff) is not byte-exact', () => {
+    const execFn = (bin, args) => {
+      if (args.includes('status')) return '?? new.bin\0';
+      if (args.includes('--intent-to-add')) throw new Error('index.lock exists');
+      if (args.includes('ls-files')) return 'new.bin\0';
+      return '';
+    };
+    const report = captureDiff({ dir: '/d', startSha: 'abc', execFn, binarySafe: true });
+    expect(report.patchExact).toBe(false);
+    expect(report.patchError).toContain('index.lock exists');
+  });
+
   it('binarySafe: a non-UTF-8 text edit (no NUL, so git keeps it as text) is reported as not byte-exact', () => {
     const dir = mkdtempSync(join(tmpdir(), 'we-codex-latin1-patch-'));
     try {
@@ -1395,11 +1454,12 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
   });
 
   it.each(['success', 'failure', 'worker-failure', 'post-log-failure', 'log-copy-failure', 'keep', 'keep-scratch', 'keep-scratch-throw', 'exit',
-    'exact-patch', 'lossy-patch', 'capture-failure'])('R657 cleans owned scratch/task dirs on %s, preserves the reported log, and unregisters its exit hook', async mode => {
+    'exact-patch', 'lossy-patch', 'capture-failure', 'post-capture-failure-with-edits'])('R657 cleans (or, holding uncaptured edits, keeps) owned scratch/task dirs on %s, preserves the reported log, and unregisters its exit hook', async mode => {
     const dirs = [];
     const log = vi.fn();
     // A post-log failure AFTER the diff is captured: the quota read (it runs only for a run with a thread id).
-    const quotaThrows = ['post-log-failure', 'keep-scratch-throw'].includes(mode);
+    // With an empty captured diff the clone holds nothing and is cleaned; with edits it is their only copy.
+    const quotaThrows = ['post-log-failure', 'keep-scratch-throw', 'post-capture-failure-with-edits'].includes(mode);
     const stdout = `${quotaThrows ? '{"type":"thread.started","thread_id":"t1"}\n' : ''}{"type":"turn.completed","usage":{}}\n`;
     const before = process.listeners('exit');
     const { fn: spawnFn } = fakeSpawn(stdout, { code: mode === 'worker-failure' ? 1 : 0 });
@@ -1410,7 +1470,9 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       if (args[0] === 'clone' && mode === 'failure') throw new Error('clone failed');
       if (args.includes('diff') && mode === 'capture-failure') throw new Error('diff failed after logging');
       if (args.includes('--binary') && ['exact-patch', 'lossy-patch'].includes(mode)) return mode === 'exact-patch' ? exactPatch : lossyPatch;
-      if (args.includes('diff') && ['exact-patch', 'lossy-patch'].includes(mode) && !args.includes('--stat')) return '+change\n';
+      if (args.includes('diff') && ['exact-patch', 'lossy-patch', 'post-capture-failure-with-edits'].includes(mode) && !args.includes('--stat')) {
+        return args.includes('--binary') ? exactPatch : '+change\n';
+      }
       if (args.includes('--absolute-git-dir')) return join(args[1], '.git');
       if (args.includes('rev-parse')) return 'sha0';
       if (args.includes('get-url')) throw new Error('no remote');
@@ -1437,14 +1499,18 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     };
     try {
       // keep-scratch-throw: a human run that throws prints only its error, so nothing points into its clone.
-      if (['failure', 'post-log-failure', 'log-copy-failure', 'keep-scratch-throw', 'exit', 'capture-failure'].includes(mode)) {
+      if (['failure', 'post-log-failure', 'log-copy-failure', 'keep-scratch-throw', 'exit', 'capture-failure', 'post-capture-failure-with-edits'].includes(mode)) {
         const error = await codexDirectTask(opts).then(() => null, e => e);
         expect(error).toBeInstanceOf(Error);
         // The CLI prints only the error, so a failed run names the log it left in tmpdir.
         if (['post-log-failure', 'keep-scratch-throw'].includes(mode)) expect(error.message).toContain(`(log kept at ${dirs[0]}.jsonl)`);
         if (mode === 'log-copy-failure') expect(error.message).not.toContain('log kept at');
         // A failed capture cannot say whether the clone holds edits, so the error names the clone it kept.
-        if (mode === 'capture-failure') expect(error.message).toContain(`scratch clone kept at ${dirs[0]}`);
+        if (['capture-failure', 'post-capture-failure-with-edits'].includes(mode)) {
+          expect(error.message).toContain(`scratch clone kept at ${dirs[0]}`);
+          expect(error.message).toContain(`log at ${join(dirs[0], '.git', 'codex-direct-task.jsonl')}`);
+          expect(error.message).not.toContain('log kept at');
+        }
       }
       else {
         const report = await codexDirectTask(opts);
@@ -1464,7 +1530,7 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
         expect(existsSync(dirs[1])).toBe(false);
         expect(readFileSync(join(dirs[0], '.git', 'codex-direct-task.jsonl'), 'utf8')).toBe(stdout);
         expect(log).toHaveBeenCalledWith(expect.stringContaining('log preservation failed; retaining'));
-      } else if (['keep-scratch', 'lossy-patch', 'capture-failure'].includes(mode)) {
+      } else if (['keep-scratch', 'lossy-patch', 'capture-failure', 'post-capture-failure-with-edits'].includes(mode)) {
         expect(existsSync(dirs[0])).toBe(true);
         expect(existsSync(dirs[1])).toBe(false);
         expect(existsSync(`${dirs[0]}.jsonl`)).toBe(false);
