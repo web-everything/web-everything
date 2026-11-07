@@ -4014,7 +4014,8 @@ the returned `logFile` names that retained file. Post-adoption object packing ta
 clone WRITE lock without waiting and checks rebuild-job evidence under that lock. Its Git
 commands strip inherited `GIT_*` overrides, matching the serialized GC path.
 The human (non-`--json`) CLI passes `keepScratch: true`: it prints the scratch clone as the place to
-review, commit and push the edits, so that clone survives (its task temp root is still removed);
+review, commit and push the edits, so that clone survives a successful return (its task temp root is
+still removed; a run that throws prints only its error and cleans up as usual);
 `--json` runs, and so every detached job, carry the full patch and remove the clone.
 Use `keep: true` / `--keep` when a caller or test needs to inspect those paths after completion;
 permission assertions about a live task should otherwise run in the injected spawn callback.

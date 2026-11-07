@@ -114,11 +114,11 @@ import { laneGitConfigArgs, hardenLaneGitArgs, laneGitHardeningEnv } from './lib
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
 import { readProcStart } from './lib/daemon-jobs-runtime.mjs';
 import {
-  mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, openSync, closeSync, renameSync, fchmodSync,
+  mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, openSync, closeSync, renameSync, fchmodSync, readSync, writeSync, realpathSync,
 } from 'node:fs';
 import jobAsyncFs from 'node:fs/promises';
 import { tmpdir, homedir } from 'node:os';
-import { dirname, join, resolve, sep } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -247,6 +247,12 @@ export function assertResumeRequest({ resumeThreadId, ephemeral = false, outputS
 /** R650: directory of refusing vitest/playwright/npx shims, prepended to PATH inside Codex runs only. */
 export const CODEX_SHIM_DIR = resolve(process.env.WE_CODEX_SHIM_DIR || join(dirname(new URL(import.meta.url).pathname), 'codex-shims'));
 /** PATH with the shim dir first (deduped). */
+/** Symlink-free absolute path (its parent's, when the path itself does not exist yet); else just resolved. */
+export function canonicalPath(path) {
+  try { return realpathSync(path); } catch { /* not created yet */ }
+  try { return join(realpathSync(dirname(path)), basename(path)); } catch { return resolve(path); }
+}
+
 export function codexShimPath(env = process.env) {
   const rest = String(env.PATH ?? '').split(':').filter((d) => d && d !== CODEX_SHIM_DIR);
   return [CODEX_SHIM_DIR, ...rest].join(':');
@@ -1161,16 +1167,24 @@ export async function codexDirectTask({
     if (!scratchLog || !existsSync(scratchLog.source)) return;
     if (!scratchLog.written) rmSync(scratchLog.dest, { force: true });
     const fd = openSync(scratchLog.dest, scratchLog.written ? 'w' : 'wx', 0o600);
-    try { fchmodSync(fd, 0o600); writeFileSync(fd, readFileSync(scratchLog.source)); }
-    finally { closeSync(fd); }
+    try {
+      fchmodSync(fd, 0o600);
+      // Chunked copy: a long transcript never sits in memory whole.
+      const src = openSync(scratchLog.source, 'r');
+      try {
+        const chunk = Buffer.allocUnsafe(1 << 20);
+        for (let n; (n = readSync(src, chunk, 0, chunk.length, null)) > 0;) writeSync(fd, chunk, 0, n);
+      } finally { closeSync(src); }
+    } finally { closeSync(fd); }
     scratchLog.written = true;
   };
-  // A human CLI run with no --dir leaves its edits only in the scratch clone it prints (keepScratch).
+  // A human CLI run with no --dir leaves its edits only in the scratch clone it prints (keepScratch). Set only
+  // on a successful return: a run that throws prints just its error, so its clone is cleaned up as usual.
   let retainedScratch;
   const cleanupTemps = () => {
     if (keep) return;
     let retainedClone = retainedScratch;
-    try { preserveScratchLog(); }
+    if (!retainedClone) try { preserveScratchLog(); }
     catch (error) {
       retainedClone = scratchLog.root;
       emit(`codex-direct-task: log preservation failed; retaining ${retainedClone}: ${error.message}`);
@@ -1202,7 +1216,6 @@ export async function codexDirectTask({
       installExecFn, installTimeoutMs, cloneExecFn, cloneTimeoutMs,
     });
     targetDir = scratch.dest;
-    if (keepScratch) retainedScratch = scratch.dest;
   } else if (!existsFn(targetDir)) {
     throw new Error(`codex-direct-task: --dir=${targetDir} does not exist`);
   }
@@ -1216,7 +1229,11 @@ export async function codexDirectTask({
   // into `captureDiff`'s output. A caller-supplied `--log=<path>` is trusted as-is (their choice, their risk).
   const gitDir = execFn('git', ['-C', targetDir, 'rev-parse', '--absolute-git-dir'], { timeout: GIT_STEP_TIMEOUT_MS }).trim();
   const resolvedLogFile = logFile || join(gitDir, review ? `codex-self-review-${randomUUID()}.jsonl` : 'codex-direct-task.jsonl');
-  const reportedLogFile = scratch && !keep && !retainedScratch && resolve(resolvedLogFile).startsWith(`${resolve(scratch.dest)}${sep}`)
+  // `git rev-parse --absolute-git-dir` prints the canonical path (macOS: /private/var/… for a /var/… tmpdir),
+  // so compare against both spellings of the clone root, or the in-clone log is never preserved.
+  const scratchRoots = scratch ? [resolve(scratch.dest), canonicalPath(scratch.dest)] : [];
+  const reportedLogFile = scratch && !keep
+    && scratchRoots.some(root => canonicalPath(resolvedLogFile).startsWith(`${root}${sep}`) || resolve(resolvedLogFile).startsWith(`${root}${sep}`))
     ? `${scratch.dest}.jsonl` : resolvedLogFile;
   if (reportedLogFile !== resolvedLogFile) scratchLog = { source: resolvedLogFile, dest: reportedLogFile, root: scratch.dest };
   mkdirSync(dirname(resolvedLogFile), { recursive: true });
@@ -1295,7 +1312,8 @@ export async function codexDirectTask({
 
   }
 
-  preserveScratchLog();
+  if (keepScratch && scratch) retainedScratch = scratch.dest;
+  else preserveScratchLog();
 
   return {
     model, effort, route,
@@ -1314,7 +1332,7 @@ export async function codexDirectTask({
     } : { created: false },
     startSha,
     argv: run.argv,
-    logFile: reportedLogFile,
+    logFile: retainedScratch ? resolvedLogFile : reportedLogFile,
     exitCode: run.code,
     timedOut: run.timedOut,
     events: summary,

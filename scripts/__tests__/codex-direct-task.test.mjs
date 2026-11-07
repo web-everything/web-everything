@@ -8,7 +8,7 @@
 
 import { EventEmitter } from 'node:events';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, readdirSync, writeFileSync, statSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, readdirSync, writeFileSync, statSync, existsSync, symlinkSync } from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -1331,7 +1331,7 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     }
   });
 
-  it.each(['success', 'failure', 'worker-failure', 'post-log-failure', 'log-copy-failure', 'keep', 'keep-scratch', 'exit'])('R657 cleans owned scratch/task dirs on %s, preserves the reported log, and unregisters its exit hook', async mode => {
+  it.each(['success', 'failure', 'worker-failure', 'post-log-failure', 'log-copy-failure', 'keep', 'keep-scratch', 'keep-scratch-throw', 'exit'])('R657 cleans owned scratch/task dirs on %s, preserves the reported log, and unregisters its exit hook', async mode => {
     const dirs = [];
     const log = vi.fn();
     const stdout = '{"type":"turn.completed","usage":{}}\n';
@@ -1339,7 +1339,7 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     const { fn: spawnFn } = fakeSpawn('{"type":"turn.completed","usage":{}}\n', { code: mode === 'worker-failure' ? 1 : 0 });
     const execFn = (bin, args) => {
       if (args[0] === 'clone' && mode === 'failure') throw new Error('clone failed');
-      if (args.includes('diff') && mode === 'post-log-failure') throw new Error('diff failed after logging');
+      if (args.includes('diff') && ['post-log-failure', 'keep-scratch-throw'].includes(mode)) throw new Error('diff failed after logging');
       if (args.includes('--absolute-git-dir')) return join(args[1], '.git');
       if (args.includes('rev-parse')) return 'sha0';
       if (args.includes('get-url')) throw new Error('no remote');
@@ -1360,11 +1360,12 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
         }
         return spawnFn(...args);
       },
-      installDeps: false, existsFn: () => false, keep: mode === 'keep', keepScratch: mode === 'keep-scratch',
+      installDeps: false, existsFn: () => false, keep: mode === 'keep', keepScratch: mode.startsWith('keep-scratch'),
       mkTempDir: prefix => { const dir = mkdtempSync(prefix); dirs.push(dir); return dir; },
     };
     try {
-      if (['failure', 'post-log-failure', 'log-copy-failure', 'exit'].includes(mode)) await expect(codexDirectTask(opts)).rejects.toThrow();
+      // keep-scratch-throw: a human run that throws prints only its error, so nothing points into its clone.
+      if (['failure', 'post-log-failure', 'log-copy-failure', 'keep-scratch-throw', 'exit'].includes(mode)) await expect(codexDirectTask(opts)).rejects.toThrow();
       else {
         const report = await codexDirectTask(opts);
         expect(readFileSync(report.logFile, 'utf8')).toBe('{"type":"turn.completed","usage":{}}\n');
@@ -1385,7 +1386,7 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
         expect(existsSync(dirs[1])).toBe(false);
         expect(existsSync(`${dirs[0]}.jsonl`)).toBe(false);
       } else expect(dirs.every(dir => existsSync(dir) === (mode === 'keep'))).toBe(true);
-      if (['post-log-failure', 'exit'].includes(mode)) expect(readFileSync(`${dirs[0]}.jsonl`, 'utf8')).toBe(stdout);
+      if (['post-log-failure', 'keep-scratch-throw', 'exit'].includes(mode)) expect(readFileSync(`${dirs[0]}.jsonl`, 'utf8')).toBe(stdout);
       expect(process.listeners('exit')).toEqual(before);
     } finally {
       for (const dir of dirs) {
@@ -1763,15 +1764,21 @@ describe('direct CLI flags reach the actual spawn and JSON result', () => {
     const tmp = mkdtempSync(join(tmpdir(), 'we-direct-cli-scratch-'));
     const repoRoot = join(tmp, 'repo');
     mkdirSync(repoRoot);
+    // TMPDIR reached through a symlink, like macOS /var → /private/var: git reports the canonical spelling.
+    const realTmp = join(tmp, 'real');
+    const linkTmp = join(tmp, 'link');
+    mkdirSync(realTmp);
+    symlinkSync(realTmp, linkTmp);
     const preload = `import cp from 'node:child_process';
-      import { mkdirSync, writeFileSync } from 'node:fs';
+      import { mkdirSync, writeFileSync, realpathSync } from 'node:fs';
       import { join } from 'node:path';
       import { syncBuiltinESMExports } from 'node:module';
       import { EventEmitter } from 'node:events';
       cp.execFileSync = (bin, args) => {
         if (bin === 'git' && args[0] === 'clone') { mkdirSync(join(args.at(-1), '.git'), { recursive: true }); writeFileSync(join(args.at(-1), 'edited.txt'), 'codex edit'); return ''; }
         if (args.includes('get-url')) return 'git@example.invalid:o/r.git';
-        return args.includes('--absolute-git-dir') ? join(args[1], '.git') : args.includes('rev-parse') ? 'sha' : '';
+        // Like real git: the canonical path (macOS tmpdir /var/… → /private/var/…).
+        return args.includes('--absolute-git-dir') ? realpathSync(join(args[1], '.git')) : args.includes('rev-parse') ? 'sha' : '';
       };
       cp.spawn = () => {
         const child = new EventEmitter();
@@ -1788,13 +1795,15 @@ describe('direct CLI flags reach the actual spawn and JSON result', () => {
       const run = spawnSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`,
         'scripts/codex-direct-task.mjs', '--task=fixture', `--repo-root=${repoRoot}`, '--no-stream', '--no-install',
         '--gate=none', '--no-self-review', ...(json ? ['--json'] : [])],
-      { encoding: 'utf8', env: { ...process.env, TMPDIR: tmp, WE_CODEX_MODEL_BY_TASK: '{}' } });
+      { encoding: 'utf8', env: { ...process.env, TMPDIR: linkTmp, WE_CODEX_MODEL_BY_TASK: '{}' } });
       expect(run.status, run.stderr).toBe(0);
       if (json) {
         const report = JSON.parse(run.stdout);
         expect(report.scratch).toMatchObject({ created: true, retained: false });
         expect(existsSync(report.dir)).toBe(false);
+        expect(report.logFile).toBe(`${report.dir}.jsonl`);
         expect(statSync(report.logFile).mode & 0o777).toBe(0o600);
+        expect(readFileSync(report.logFile, 'utf8')).toContain('turn.completed');
         return;
       }
       const dest = run.stdout.match(/scratch clone → (\S+)/)?.[1];
@@ -1804,7 +1813,7 @@ describe('direct CLI flags reach the actual spawn and JSON result', () => {
       expect(run.stdout).not.toContain('removed after the run');
       expect(existsSync(run.stdout.match(/ {2}log: (\S+)/)?.[1])).toBe(true);
       // Only the clone the output points into survives; the task temp root is still removed.
-      expect(readdirSync(tmp).filter(name => name.startsWith('we-codex-task-tmp-'))).toEqual([]);
+      expect(readdirSync(realTmp).filter(name => name.startsWith('we-codex-task-tmp-'))).toEqual([]);
     } finally { rmSync(tmp, { recursive: true, force: true }); }
   });
 });
