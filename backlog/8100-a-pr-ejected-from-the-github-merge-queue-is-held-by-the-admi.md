@@ -1,15 +1,16 @@
 ---
+bornAs: xlv5uzx
 kind: story
 size: 5
 status: open
-scope: ["we:scripts/review-set-label.mjs", "we:scripts/operations/review-pr.mjs", "we:scripts/conveyor/convert-advisory-dispatch.mjs", "we:scripts/lib/advisory-labels.mjs", "we:scripts/conveyor/advisory-label-sweep.mjs"]
+scope: ["we:scripts/lib/drain-queue-safety.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/lib/enqueue-on-event.mjs", "we:scripts/lib/drain-merge-strategy.mjs", "we:scripts/operations/pr-ownership.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# clear-human leaves review:awaiting-advisory behind; restamp-with-carry strips it
+# A PR ejected from the GitHub merge queue is held by the admission guard with a log line only; no actor owns t…
 
-Flow-sim gap R3-G3, class K10 (hold without a settler). Failing input: PR parked by drain/pr-land with review:human + review:awaiting-advisory (MAP:6454, we:pr-land.mjs:1230-1234) and the advisory panel has not posted yet.' 'operator runs review-set-label --to=clear-human. Cited: we:scripts/review-set-label.mjs:473-476, we:scripts/review-set-label.mjs:602-605, we:scripts/operations/review-pr.mjs:3244, we:scripts/conveyor/convert-advisory-dispatch.mjs:378-380, we:scripts/lib/advisory-labels.mjs:182. Soak-break sketch: stuck stray label: PR reads review:accepted + awaiting-advisory (we:health-smells/review-label-conflict.mjs:36 flags it; we:operator-queue.mjs:215 raises 'label/comment disagreement' when an advisory comment exists). Does not block the drain (no drain reader)…
+Flow-sim gap R5c-G3, class K10 (hold without a settler). Failing input: PR ready-to-merge + review:accepted, own `test` green, was enqueued, then GitHub removed it from the queue (RemovedFromMergeQueueEvent reason failed_checks for the merge-group commit, or merge_conflict). (a) failed_checks on head H after the single infra retry was spent or retry evidence not met; (b) three merge_conflict ejecti… Cited: we:scripts/lib/drain-queue-safety.mjs:81-87, we:scripts/lib/drain-queue-safety.mjs:66-68, we:scripts/merge-ai-prs.mjs:4875-4877, we:scripts/lib/enqueue-on-event.mjs:318, we:scripts/lib/drain-merge-strategy.mjs:284-287. Soak-break sketch: Fixture: timeline with RemovedFromMergeQueueEvent failed_checks on head H (twice, or once plus a re-add), PR labelled accepted+ready-to-merge, checks green. Action: run the drain pass 5 times plus reconcile planning. Assertion that fails today: after N passes…
 
 ## Acceptance
 

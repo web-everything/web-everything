@@ -1,15 +1,16 @@
 ---
+bornAs: xt628bo
 kind: story
-size: 5
+size: 2
 status: open
-scope: ["we:scripts/lib/drain-queue-safety.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/lib/enqueue-on-event.mjs", "we:scripts/lib/drain-merge-strategy.mjs", "we:scripts/operations/pr-ownership.mjs"]
+scope: ["we:scripts/conveyor/reconcile-fix-dispatch.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# A PR ejected from the GitHub merge queue is held by the admission guard with a log line only; no actor owns t…
+# hold:fix label and fix-dispatch.kill do not stop review:changes fixers
 
-Flow-sim gap R5c-G3, class K10 (hold without a settler). Failing input: PR ready-to-merge + review:accepted, own `test` green, was enqueued, then GitHub removed it from the queue (RemovedFromMergeQueueEvent reason failed_checks for the merge-group commit, or merge_conflict). (a) failed_checks on head H after the single infra retry was spent or retry evidence not met; (b) three merge_conflict ejecti… Cited: we:scripts/lib/drain-queue-safety.mjs:81-87, we:scripts/lib/drain-queue-safety.mjs:66-68, we:scripts/merge-ai-prs.mjs:4875-4877, we:scripts/lib/enqueue-on-event.mjs:318, we:scripts/lib/drain-merge-strategy.mjs:284-287. Soak-break sketch: Fixture: timeline with RemovedFromMergeQueueEvent failed_checks on head H (twice, or once plus a re-add), PR labelled accepted+ready-to-merge, checks green. Action: run the drain pass 5 times plus reconcile planning. Assertion that fails today: after N passes…
+Flow-sim gap E-G1, class K10 (hold without a settler). Failing input: open lane PR with review:changes, no live claim, operator has created ~/.claude/conveyor/fix-dispatch.kill or put hold:fix on the PR' 'next fix-daemon tick Cited: we:scripts/conveyor/reconcile-fix-dispatch.mjs:2046-2179. Soak-break sketch: review fixer is dispatched anyway (acts despite operator hold)
 
 ## Acceptance
 

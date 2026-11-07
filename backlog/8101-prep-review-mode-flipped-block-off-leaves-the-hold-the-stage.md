@@ -1,4 +1,5 @@
 ---
+bornAs: xn09e3i
 kind: story
 size: 3
 status: open

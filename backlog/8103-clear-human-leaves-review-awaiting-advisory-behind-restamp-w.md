@@ -1,15 +1,16 @@
 ---
+bornAs: xvo03lx
 kind: story
-size: 2
+size: 5
 status: open
-scope: ["we:scripts/conveyor/reconcile-fix-dispatch.mjs"]
+scope: ["we:scripts/review-set-label.mjs", "we:scripts/operations/review-pr.mjs", "we:scripts/conveyor/convert-advisory-dispatch.mjs", "we:scripts/lib/advisory-labels.mjs", "we:scripts/conveyor/advisory-label-sweep.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# hold:fix label and fix-dispatch.kill do not stop review:changes fixers
+# clear-human leaves review:awaiting-advisory behind; restamp-with-carry strips it
 
-Flow-sim gap E-G1, class K10 (hold without a settler). Failing input: open lane PR with review:changes, no live claim, operator has created ~/.claude/conveyor/fix-dispatch.kill or put hold:fix on the PR' 'next fix-daemon tick Cited: we:scripts/conveyor/reconcile-fix-dispatch.mjs:2046-2179. Soak-break sketch: review fixer is dispatched anyway (acts despite operator hold)
+Flow-sim gap R3-G3, class K10 (hold without a settler). Failing input: PR parked by drain/pr-land with review:human + review:awaiting-advisory (MAP:6454, we:pr-land.mjs:1230-1234) and the advisory panel has not posted yet.' 'operator runs review-set-label --to=clear-human. Cited: we:scripts/review-set-label.mjs:473-476, we:scripts/review-set-label.mjs:602-605, we:scripts/operations/review-pr.mjs:3244, we:scripts/conveyor/convert-advisory-dispatch.mjs:378-380, we:scripts/lib/advisory-labels.mjs:182. Soak-break sketch: stuck stray label: PR reads review:accepted + awaiting-advisory (we:health-smells/review-label-conflict.mjs:36 flags it; we:operator-queue.mjs:215 raises 'label/comment disagreement' when an advisory comment exists). Does not block the drain (no drain reader)…
 
 ## Acceptance
 
