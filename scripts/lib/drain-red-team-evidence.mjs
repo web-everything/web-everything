@@ -1,6 +1,6 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
 import { createHash } from 'node:crypto';
-import { closeSync, mkdirSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { hostname } from 'node:os';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
@@ -468,9 +468,36 @@ export function historicalCardOnlySkipCandidate(old) {
     && !old.recorded && !old.inFlight && !old.queued;
 }
 
+/** A directory-only fallback: never spend more of the capped run-parse budget. */
+function cappedCardOnlyStatusHead({ repo, pr, head, env }) {
+  const dir = redTeamStatusDir(env), prefix = `${encodeURIComponent(repo)}-${Number(pr)}-`;
+  let names;
+  try { names = readdirSync(dir).filter(name => name.startsWith(prefix) && name.endsWith('.json')); }
+  catch { return null; }
+  let candidate = null;
+  for (const name of names) {
+    const oldHead = name.slice(prefix.length, -5);
+    if (!oldHead || oldHead === head) continue;
+    let bytes, prior;
+    try { bytes = readFileSync(join(dir, name), 'utf8'); }
+    catch { return null; }
+    try { prior = JSON.parse(bytes); }
+    catch { continue; }
+    const read = prior?.loopPayload?.findings?.read;
+    if (prior?.repo !== repo || !['number', 'string'].includes(typeof prior.pr)
+      || Number(prior.pr) !== Number(pr) || prior.head !== oldHead
+      || prior.status !== 'finished' || prior.skipCardOnly !== true
+      || !(prior.result === 'skipped' || (prior.result?.status === 'skipped' && prior.result.policy === 'card-only'))
+      || !read || read.netBasis?.rev !== oldHead || !redTeamCardOnly(read)) continue;
+    if (candidate !== null) return null;
+    candidate = oldHead;
+  }
+  return candidate;
+}
+
 /** Absence of a review payload is not an accept. Labels alone never schedule a post-accept pass. */
 export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
-  runsDir = resolveRunsDir(), list = listRunIds, read = readRun, stat = statSync, lookup, scanSettings = { env }, warn, now = Date.now(), isAlive = pidAlive, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime,
+  runsDir = resolveRunsDir(), list = listRunIds, read = readRun, stat = statSync, lookup, allowCappedStatusFallback = true, scanSettings = { env }, warn, now = Date.now(), isAlive = pidAlive, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime,
   readScorecards = () => readStore({ path: resolveScorecardStorePath(env) }).records } = {}) {
   const seats = readScorecards().filter(row => row.dispatchKind === 'review-seat' && row.seat === 'red-team'
     && row.repo === repo && Number(row.pr) === Number(pr) && row.rev === head);
@@ -547,7 +574,29 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
       ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error', 'failed'].includes(resultStatus), recorded: recorded || resultStatus === 'ran' };
   }
   const exactHit = latestRun();
-  if (exactHit.ok === false) return exactHit;
+  if (exactHit.ok === false) {
+    if (exactHit.reason === RUN_SCAN_CAPPED.reason && status === undefined && !recorded && allowCappedStatusFallback) {
+      const oldHead = cappedCardOnlyStatusHead({ repo, pr, head, env });
+      if (oldHead) {
+        try {
+          // The status is a chronology witness, not proof that omitted reviews are safe.
+          // Mirror scan-capped comment settlement, including its fail-closed quiet/start bounds.
+          const at = statSync(statusPath({ repo, pr, head: oldHead }, env)).mtimeMs;
+          const bounds = exactHit.settleBounds ?? {};
+          if (!Number.isFinite(at) || bounds.unfinishedUndecided !== true
+            || !(bounds.evaluatedAt - bounds.unfinishedActiveAt >= ABANDONED_REVIEW_AFTER_MS)
+            || !(at > bounds.unfinishedStartedAt) || typeof bounds.completeHeadRead !== 'function') return exactHit;
+          const complete = bounds.completeHeadRead({ pr, head, at });
+          if (complete?.complete !== true || complete.blocked !== false) return exactHit;
+          const old = readDrainRedTeamEvidence({ repo, pr, head: oldHead, env, runsDir, list, read, stat,
+            lookup: () => ({ ok: true, run: null, at: 0 }), allowCappedStatusFallback: false, scanSettings, warn, now,
+            isAlive, host, namespace, readPidStart, readScorecards });
+          if (historicalCardOnlySkipCandidate(old)) return old;
+        } catch { /* A failed status re-read leaves the capped evidence unknown. */ }
+      }
+    }
+    return exactHit;
+  }
   const loopPayload = exactHit.run;
   if (!loopPayload && !recorded) {
     const olderHit = latestRun(false);

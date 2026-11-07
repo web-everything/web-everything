@@ -1,11 +1,12 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord, readRun, writeRun } from '../../operations/run-store.mjs';
 import { historicalCardOnlySkipCandidate, readDrainRedTeamEvidence, recordRedTeamStatus, readRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
+import { cardOnlyHeadMoveCandidate } from '../review-red-team-on-skip.mjs';
 import { redTeamOwedFor } from '../review-red-team-policy.mjs';
 import { pidStartTime } from '../pid-alive.mjs';
 import { readRedTeamCarry, resumeRedTeamCarry } from '../red-team-carry-machine.mjs';
@@ -1115,5 +1116,88 @@ describe('settleUnknownEvidenceByComment: result older than the unfinished revie
     const broken = [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }];
     const ev = settle(unknown(), [result(head, 'web-everything', broken), accept()]);
     expect(redTeamEnqueueHold({ ...ev, comments: [result(head, 'web-everything', broken), accept()], pr, head, env: {} })).toMatch(/break requiring send-back|evidence unknown/);
+  });
+});
+
+
+describe('card-only status fallback after a capped exact-head scan', () => {
+  function capped() {
+    const f = fixture();
+    for (let i = 0; i < 4; i++) writeRun(newRunRecord({ id: `review-pr-capped-${i}`,
+      op: 'review-pr', input: { repo: 'other/repo', pr: i + 1 } }), f.runsDir);
+    return { ...f, scanSettings: { file: { runs: { scan: { maxParses: 1 } } }, env: {} }, warn: () => {} };
+  }
+  function oldStatus(f, head = 'c'.repeat(40)) {
+    const loopPayload = { ...payload(head), findings: { read: { netBasis: { rev: head },
+      netChangedFiles: ['backlog/6507-card.md'], diffText: '+renumber' } } };
+    recordRedTeamStatus({ ...f, loopPayload, status: 'finished', result: 'skipped' }, f);
+    return join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${head}.json`);
+  }
+  it.each(['skipped', { status: 'skipped', policy: 'card-only' }])('returns the unique old-head card-only status when the complete read is clean: %j', result => {
+    const f = capped(), path = oldStatus(f);
+    const status = JSON.parse(readFileSync(path, 'utf8'));
+    writeFileSync(path, JSON.stringify({ ...status, result }));
+    let parses = 0;
+    const evidence = readDrainRedTeamEvidence({ ...f, read: (...args) => { parses++; return readRun(...args); } });
+    expect(evidence).toMatchObject({ status: { head: 'c'.repeat(40) }, recorded: false });
+    expect(cardOnlyHeadMoveCandidate(evidence, f.head)).toBe(true);
+    expect(parses).toBe(5);
+  });
+  it('holds an unfinished running same-PR review hidden beyond the cap', () => {
+    const f = capped();
+    oldStatus(f);
+    const id = 'review-pr-hidden-running';
+    writeRun({ ...newRunRecord({ id, op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
+      findings: payload(f.head).findings, pending: { kind: 'read', step: 'read', stepIndex: 0 },
+      stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(Date.now() - 10_000).toISOString() }] }, f.runsDir);
+    utimesSync(join(f.runsDir, `${id}.json`), new Date(Date.now() - 1000), new Date(Date.now() - 1000));
+    const evidence = readDrainRedTeamEvidence(f);
+    expect(evidence).toMatchObject({ ok: false, reason: 'scan-capped' });
+    expect(cardOnlyHeadMoveCandidate(evidence, f.head)).toBe(false);
+    expect(readDrainRedTeamEvidence({ ...f, scanSettings: { file: { runs: { scan: { maxParses: 10 } } }, env: {} } }))
+      .toMatchObject({ ok: false, reason: 'review-unfinished' });
+  });
+  it.each(['missing bounds', 'missing complete read', 'throws', 'incomplete', 'blocked',
+    'missing undecided', 'missing read time', 'missing active time', 'missing start', 'recent activity', 'later start'])(
+    'keeps scan-capped unknown with %s', variant => {
+      const f = capped(); oldStatus(f);
+      const bounds = { unfinishedUndecided: true, evaluatedAt: Date.now(), unfinishedActiveAt: -Infinity,
+        unfinishedStartedAt: -Infinity, completeHeadRead: () => ({ complete: true, blocked: false }) };
+      if (variant === 'missing complete read') delete bounds.completeHeadRead;
+      if (variant === 'throws') bounds.completeHeadRead = () => { throw Error('unreadable'); };
+      if (variant === 'incomplete') bounds.completeHeadRead = () => ({ complete: false, blocked: false });
+      if (variant === 'blocked') bounds.completeHeadRead = () => ({ complete: true, blocked: true });
+      if (variant === 'missing undecided') delete bounds.unfinishedUndecided;
+      if (variant === 'missing read time') delete bounds.evaluatedAt;
+      if (variant === 'missing active time') delete bounds.unfinishedActiveAt;
+      if (variant === 'missing start') delete bounds.unfinishedStartedAt;
+      if (variant === 'recent activity') bounds.unfinishedActiveAt = Date.now();
+      if (variant === 'later start') bounds.unfinishedStartedAt = Date.now() + 60_000;
+      const exactHit = { ok: false, reason: 'scan-capped', ...(variant === 'missing bounds' ? {} : { settleBounds: bounds }) };
+      expect(readDrainRedTeamEvidence({ ...f, lookup: () => exactHit })).toBe(exactHit);
+    });
+  it('keeps scan-capped unknown when no status file exists', () => {
+    expect(readDrainRedTeamEvidence(capped())).toMatchObject({ ok: false, reason: 'scan-capped' });
+  });
+  it.each(['bad JSON', 'wrong pr', 'wrong repo', 'wrong head', 'not finished', 'not card-only',
+    'wrong policy', 'skip disabled', 'mismatched net revision', 'missing net revision', 'unreadable file'])('keeps scan-capped unknown for %s', variant => {
+    const f = capped(), path = oldStatus(f), status = JSON.parse(readFileSync(path, 'utf8'));
+    if (variant === 'wrong pr') status.pr++;
+    if (variant === 'wrong repo') status.repo = 'other/repo';
+    if (variant === 'wrong head') status.head = 'd'.repeat(40);
+    if (variant === 'not finished') status.status = 'running';
+    if (variant === 'not card-only') status.loopPayload.findings.read.netChangedFiles = ['scripts/code.mjs'];
+    if (variant === 'wrong policy') status.result = { status: 'skipped', policy: 'other' };
+    if (variant === 'skip disabled') status.skipCardOnly = false;
+    if (variant === 'mismatched net revision') status.loopPayload.findings.read.netBasis.rev = f.head;
+    if (variant === 'missing net revision') delete status.loopPayload.findings.read.netBasis.rev;
+    writeFileSync(path, variant === 'bad JSON' ? '{' : JSON.stringify(status));
+    if (variant === 'unreadable file') { rmSync(path); mkdirSync(path); }
+    expect(readDrainRedTeamEvidence(f)).toMatchObject({ ok: false, reason: 'scan-capped' });
+  });
+  it('keeps scan-capped unknown for two valid old-head candidates', () => {
+    const f = capped();
+    oldStatus(f); oldStatus(f, 'd'.repeat(40));
+    expect(readDrainRedTeamEvidence(f)).toMatchObject({ ok: false, reason: 'scan-capped' });
   });
 });
