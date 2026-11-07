@@ -601,7 +601,13 @@ export async function restartServicesForClone({ settings, platform, env = proces
     }
     try {
       const fresh = await stateStore.get(label);
-      if (fresh && fresh.pendingSha !== undefined && fresh.pendingSha === previous.pendingSha && fresh.at === previous.at) await stateStore.set(label, { at: fresh.at, sha: fresh.sha });
+      // Compare-and-delete: remove only the marker this restart consumed. Owner (clone), sha, cooldown
+      // anchor and generation must all match, so a marker another clone (or a later deferral) wrote since
+      // our read survives, even when it owes the same sha from the same anchor.
+      if (fresh && fresh.pendingSha !== undefined && fresh.pendingSha === previous.pendingSha && fresh.at === previous.at
+        && fresh.pendingRoot === previous.pendingRoot && fresh.pendingGen === previous.pendingGen) {
+        await stateStore.set(label, { at: fresh.at, sha: fresh.sha });
+      }
     } finally {
       if (release) await release();
     }
@@ -673,7 +679,8 @@ export async function restartServicesForClone({ settings, platform, env = proces
         if (reason === 'debounced') {
           // Remember the restart we owe: a later tick retries it once the cooldown has passed.
           // A newer adoption simply replaces the owed sha; a successful restart clears it.
-          if (!owed) await stateStore.set(label, { ...previous, pendingSha: adoptedSha, pendingRoot: options.cloneRoot });
+          // Each deferral gets its own generation, so cleanup can tell this marker from a later rewrite.
+          if (!owed) await stateStore.set(label, { ...previous, pendingSha: adoptedSha, pendingRoot: options.cloneRoot, pendingGen: randomBytes(6).toString('hex') });
           if (!owed) report('skipped', service, reason);
           continue;
         }

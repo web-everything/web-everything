@@ -1271,6 +1271,32 @@ describe('interpreter option shapes that once hid a clone script (value contains
       await restartServicesForClone({ ...o, pendingOnly: true });
       expect(o.states.get(label)).toEqual({ at: 2_000_000, sha: 'C' });
     });
+    it.each([
+      ['another clone re-owes the same sha from the same anchor', { pendingRoot: resolve('..', 'clone-b') }],
+      ['the same clone re-owes the same sha as a newer deferral', { pendingGen: 'newer-generation' }],
+    ])('cleanup is compare-and-delete: %s between the read and the cleanup', async (_name, rewrite) => {
+      const clock = { t: 1_000_000 }, o = cooled(clock);
+      await restartServicesForClone({ ...o, adoptedSha: 'A' });
+      clock.t += 1000; await restartServicesForClone({ ...o, adoptedSha: 'B' });
+      const consumed = o.states.get(label);
+      expect(consumed).toMatchObject({ pendingSha: 'B', pendingRoot: cloneRoot, pendingGen: expect.any(String) });
+      const listed = o.stateStore.pending();
+      o.stateStore.pending = () => listed; // clone A listed its owed marker here
+      const reowed = { ...consumed, ...rewrite }; // then clone B (or a later deferral) rewrote it
+      o.states.set(label, reowed);
+      o.listPlists = () => []; clock.t += 600_000; // A's plist is gone: A's cleanup runs
+      await restartServicesForClone({ ...o, pendingOnly: true });
+      expect(o.states.get(label)).toEqual(reowed);
+      expect(o.launchctl).toHaveBeenCalledTimes(1);
+    });
+    it('cleanup still clears the marker it consumed (owner, sha, anchor and generation match)', async () => {
+      const clock = { t: 1_000_000 }, o = cooled(clock);
+      await restartServicesForClone({ ...o, adoptedSha: 'A' });
+      clock.t += 1000; await restartServicesForClone({ ...o, adoptedSha: 'B' });
+      o.listPlists = () => []; clock.t += 600_000;
+      await restartServicesForClone({ ...o, pendingOnly: true });
+      expect(o.states.get(label)).toEqual({ at: 1_000_000, sha: 'A' });
+    });
     describe('clearing an owed marker is serialised by the label lock', () => {
       function locked(clock) {
         const o = cooled(clock), events = []; let busy = false;
