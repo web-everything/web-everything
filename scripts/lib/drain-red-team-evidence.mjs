@@ -128,7 +128,7 @@ const summarizeRun = run => ({ review: run?.op === 'review-pr', repo: typeof run
 //    and a later completed accept of the same head supersedes it. Newest is by read-step start (or resume stamp when later);
 //    a record whose start is unreadable or in the future cannot be ordered: a rejection of that kind holds, an accept supersedes nothing.
 // Any record that cannot be listed, statted, read or attributed to a PR fails closed.
-function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, settleAt }) {
+function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, settleAt, otherHeadsHold = false }) {
   const incomplete = { complete: false, blocked: false };
   try {
     const cache = summaryCache.get(read) ?? summaryCache.set(read, new Map()).get(read);
@@ -149,7 +149,12 @@ function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, 
       if (!s.review) continue;
       if (typeof s.repo !== 'string' || !s.repo || !Number.isFinite(s.pr)) return incomplete;
       if (s.repo !== wantRepo || s.pr !== Number(pr)) continue;
-      if (s.rev !== null && s.rev !== want) continue;
+      if (s.rev !== null && s.rev !== want) {
+        // Capped-scan fallback only: a live review of ANY other head of this PR still holds (never a finished one).
+        if (!otherHeadsHold || s.kind !== 'undecided') continue;
+        if (s.abandonable && now - st.mtimeMs >= ABANDONED_REVIEW_AFTER_MS) continue;
+        return { complete: true, blocked: true };
+      }
       if (s.kind === 'hard') return { complete: true, blocked: true };
       if (s.kind === 'undecided') {
         const quiet = now - st.mtimeMs >= ABANDONED_REVIEW_AFTER_MS;
@@ -591,6 +596,8 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
           // The carried-from head's own runs may hide beyond the cap too: it needs the same complete clean read.
           const source = completeSameHeadRead({ repo, pr, head: oldHead, runsDir, list, read, stat, now, settleAt: at });
           if (source?.complete !== true || source.blocked !== false) return exactHit;
+          const others = completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, settleAt: at, otherHeadsHold: true });
+          if (others?.complete !== true || others.blocked !== false) return exactHit;
           const old = readDrainRedTeamEvidence({ repo, pr, head: oldHead, env, runsDir, list, read, stat,
             lookup: () => ({ ok: true, run: null, at: 0 }), allowCappedStatusFallback: false, scanSettings, warn, now,
             isAlive, host, namespace, readPidStart, readScorecards });

@@ -1169,6 +1169,18 @@ describe('card-only status fallback after a capped exact-head scan', () => {
     expect(evidence).toMatchObject({ ok: false, reason: 'scan-capped' });
     expect(cardOnlyHeadMoveCandidate(evidence, f.head)).toBe(false);
   });
+  it('holds a running review of a third head of the same PR hidden beyond the cap', () => {
+    const f = capped(), third = 'd'.repeat(40);
+    oldStatus(f);
+    const id = 'review-pr-hidden-running-third';
+    writeRun({ ...newRunRecord({ id, op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
+      findings: payload(third).findings, pending: { kind: 'read', step: 'read', stepIndex: 0 },
+      stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(Date.now() - 10_000).toISOString() }] }, f.runsDir);
+    utimesSync(join(f.runsDir, `${id}.json`), new Date(Date.now() - 1000), new Date(Date.now() - 1000));
+    const evidence = readDrainRedTeamEvidence(f);
+    expect(evidence).toMatchObject({ ok: false, reason: 'scan-capped' });
+    expect(cardOnlyHeadMoveCandidate(evidence, f.head)).toBe(false);
+  });
   it.each(['missing bounds', 'missing complete read', 'throws', 'incomplete', 'blocked',
     'missing undecided', 'missing read time', 'missing active time', 'missing start', 'recent activity', 'later start'])(
     'keeps scan-capped unknown with %s', variant => {
