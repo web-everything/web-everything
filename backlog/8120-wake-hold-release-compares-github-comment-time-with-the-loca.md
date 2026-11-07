@@ -1,15 +1,16 @@
 ---
+bornAs: xvel34f
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/conveyor/reconcile-core.mjs"]
+scope: ["we:scripts/conveyor/review-referral-hold.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# concurrent-author quiet window compares local now with GitHub createdAt
+# wake/hold release compares GitHub comment time with the local run start time
 
-Flow-sim gap R4-G10, class K16 (mixed clock domains). Failing input: fixer paused for a concurrent author on head H (pause marker comment). host clock ahead of GitHub by minutes. Cited: we:scripts/conveyor/reconcile-core.mjs:367-368. Soak-break sketch: double-act. The fixer is released early while the author is still pushing (or held too long if behind). Window bounded by skew; low severity.
+Flow-sim gap R4-G2, class K16 (mixed clock domains). Failing input: a parked or persistence-failed review run on head H, `last.startedAt` stamped from the local job host (we:review-referral-hold.mjs, startedAt from run.stepTimings 'read', :73-77). host clock skewed against GitHub server time (NTP drift, sleeping laptop resume, VM pause). Cited: we:scripts/conveyor/review-referral-hold.mjs:208. Soak-break sketch: local clock AHEAD -> an operator ruling or re-arm posted just after the run started looks older than the run, is never seen as a wake: stuck parked until another event/push. Local clock BEHIND -> comments written before the run look newer: spurious 'wake', an…
 
 ## Acceptance
 
