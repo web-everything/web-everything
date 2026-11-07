@@ -866,10 +866,13 @@ export function captureDiff({ dir, startSha, execFn = defaultExecFn, binarySafe 
 
 /** Checkout config Codex can write that makes git's view HIDE a worktree edit (both diffs empty, so an empty "exact"
  *  patch would let cleanup delete the only copy): `core.fileMode=false` drops executable-bit edits, `core.autocrlf`
- *  normalizes CRLF-only edits away, `core.ignoreStat` stops git noticing edits. Pinned for every capture read.
- *  Index bits (assume-unchanged, skip-worktree) and `.git/info/attributes` cannot be pinned off: they are refused
- *  as not byte-exact in `captureBinaryPatch`. */
-export const CAPTURE_GIT_CONFIG_ARGS = Object.freeze(['-c', 'core.fileMode=true', '-c', 'core.autocrlf=false', '-c', 'core.ignoreStat=false']);
+ *  normalizes CRLF-only edits away, `core.ignoreStat` stops git noticing edits, `core.trustctime=false` /
+ *  `core.checkStat=minimal` miss a same-size edit whose mtime was restored, `core.symlinks=false` hides a symlink
+ *  turned into a file, and `attr.tree` swaps in attributes (text/eol rules) from outside the worktree. Pinned for
+ *  every capture read. Index bits (assume-unchanged, skip-worktree), `.git/info/attributes` and a case-only rename
+ *  cannot be pinned off: they are refused as not byte-exact in `captureBinaryPatch`. */
+export const CAPTURE_GIT_CONFIG_ARGS = Object.freeze(['-c', 'core.fileMode=true', '-c', 'core.autocrlf=false', '-c', 'core.ignoreStat=false',
+  '-c', 'core.trustctime=true', '-c', 'core.checkStat=default', '-c', 'core.symlinks=true', '-c', 'attr.tree=']);
 
 /** Fixed output shape for the byte-exact patch: the checkout's git config (which Codex can write) or the host's
  *  must not colour it, drop or rename its `a/`/`b/` prefixes, or narrow it to a subdirectory — any of those
@@ -884,13 +887,43 @@ const GITLINK_PATCH_RE = /^(?:(?:new file|deleted file|new|old) mode 160000|inde
 
 const notExact = (reason) => ({ patch: null, patchExact: false, patchError: String(reason?.message ?? reason).split('\n')[0] });
 
-/** `captureDiff`'s byte-exact patch (see its `binarySafe`). Never throws: any doubt is a not-exact patch. */
 /** A non-empty regular file at `path`; a missing path is false, any other stat failure is doubt (true). */
 function hasContent(path) {
   try { const st = statSync(path); return st.isFile() && st.size > 0; }
   catch (error) { return error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR'; }
 }
 
+const foldName = (name) => name.normalize('NFC').toLowerCase();
+
+/** The first tracked path whose name (or a parent directory's) exists on disk only under a different case or
+ *  Unicode normalization: on a case-insensitive filesystem (`core.ignoreCase`, `core.precomposeUnicode`) git
+ *  reports such a rename as no change, so the patch would rebuild the old name. A missing path is a deletion git
+ *  does see; a listing failure other than a missing directory is doubt (thrown). */
+function caseOnlyRename(dir, paths) {
+  const listings = new Map();
+  const listing = (rel) => {
+    if (!listings.has(rel)) {
+      let names = null;
+      try { names = new Set(readdirSync(rel ? join(dir, rel) : dir)); }
+      catch (error) { if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error; }
+      listings.set(rel, names);
+    }
+    return listings.get(rel);
+  };
+  for (const path of paths) {
+    const parts = path.replace(/\/$/, '').split('/');
+    for (let i = 0; i < parts.length; i += 1) {
+      const names = listing(parts.slice(0, i).join('/'));
+      if (!names || names.has(parts[i])) { if (!names) break; continue; }
+      const folded = foldName(parts[i]);
+      if ([...names].some(name => foldName(name) === folded)) return path;
+      break;
+    }
+  }
+  return null;
+}
+
+/** `captureDiff`'s byte-exact patch (see its `binarySafe`). Never throws: any doubt is a not-exact patch. */
 function captureBinaryPatch(git, startSha, { dir, untracked, intentToAddError }) {
   // A new file the intent-to-add step could not stage is missing from every diff, so the patch is incomplete.
   if (intentToAddError) return notExact(`new files could not be staged for the diff: ${intentToAddError.message ?? intentToAddError}`);
@@ -904,13 +937,17 @@ function captureBinaryPatch(git, startSha, { dir, untracked, intentToAddError })
     // An assume-unchanged (lowercase tag) or skip-worktree (`S`) bit makes git skip a tracked path's worktree
     // content, so an edit to it is in neither diff. Any entry this cannot parse is doubt too.
     const flagged = [];
+    const tracked = [];
     for (const entry of String(git(['ls-files', '-z', '-v']) ?? '').split('\0')) {
       if (!entry) continue;
       const match = /^([A-Za-z?]) (.+)$/s.exec(entry);
       if (!match) return notExact(`unreadable index entry ${JSON.stringify(entry.slice(0, 80))}`);
       if (match[1] === 'S' || match[1] !== match[1].toUpperCase()) flagged.push(match[2]);
+      tracked.push(match[2]);
     }
     if (flagged.length) return notExact(`${flagged.length} tracked path(s) carry an assume-unchanged or skip-worktree index bit, so edits to them are hidden (e.g. ${JSON.stringify(flagged[0])})`);
+    const renamed = caseOnlyRename(dir, tracked);
+    if (renamed) return notExact(`a case- or normalization-only rename of ${JSON.stringify(renamed)} is invisible to git on this filesystem`);
     // `.git/info/attributes` sits outside the committed tree and no config turns it off: its text/eol rules can
     // normalize an edit away. Only the repository's own `.gitattributes` files count.
     const attributesPath = String(git(['rev-parse', '--git-path', 'info/attributes']) ?? '').trim();

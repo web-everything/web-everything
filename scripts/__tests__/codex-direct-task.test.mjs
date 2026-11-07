@@ -8,7 +8,7 @@
 
 import { EventEmitter } from 'node:events';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, readdirSync, writeFileSync, statSync, existsSync, symlinkSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, readdirSync, writeFileSync, statSync, existsSync, symlinkSync, chmodSync, utimesSync, unlinkSync, lstatSync, renameSync } from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -911,10 +911,14 @@ describe('captureDiff — the review artifact, never a commit/push', () => {
 
   // Round 6 (block): checkout config or index bits Codex can set make git's view hide a worktree edit, so both
   // diffs come back empty and an "exact" empty patch would let cleanup delete the only copy of that edit.
+  const OLD_TIME = new Date('2020-01-01T00:00:00Z');
   const commitTracked = (dir, git) => {
     writeFileSync(join(dir, 'tool.sh'), '#!/bin/sh\necho hi\n');
     writeFileSync(join(dir, 'text.txt'), 'a\nb\n');
-    git('add', 'tool.sh', 'text.txt');
+    // An old mtime, so a later same-size edit is not "racy" and git trusts the cached stat data.
+    utimesSync(join(dir, 'text.txt'), OLD_TIME, OLD_TIME);
+    symlinkSync('text.txt', join(dir, 'link'));
+    git('add', 'tool.sh', 'text.txt', 'link');
     git('-c', 'user.name=t', '-c', 'user.email=t@example.test', '-c', 'commit.gpgSign=false', 'commit', '--quiet', '-m', 'tracked');
     return git('rev-parse', 'HEAD');
   };
@@ -923,6 +927,26 @@ describe('captureDiff — the review artifact, never a commit/push', () => {
       fresh => expect(statSync(join(fresh, 'tool.sh')).mode & 0o111).not.toBe(0)],
     ['core.autocrlf=true hides a CRLF-only edit', (dir, git) => { git('config', 'core.autocrlf', 'true'); writeFileSync(join(dir, 'text.txt'), 'a\r\nb\r\n'); },
       fresh => expect(readFileSync(join(fresh, 'text.txt'), 'utf8')).toBe('a\r\nb\r\n')],
+    ['core.trustctime=false + core.checkStat=minimal hide a same-size edit with its mtime restored', (dir, git) => {
+      git('config', 'core.trustctime', 'false');
+      git('config', 'core.checkStat', 'minimal');
+      writeFileSync(join(dir, 'text.txt'), 'a\nX\n');
+      utimesSync(join(dir, 'text.txt'), OLD_TIME, OLD_TIME);
+    }, fresh => expect(readFileSync(join(fresh, 'text.txt'), 'utf8')).toBe('a\nX\n')],
+    ['core.symlinks=false hides a symlink turned into a regular file', (dir, git) => {
+      git('config', 'core.symlinks', 'false');
+      unlinkSync(join(dir, 'link'));
+      writeFileSync(join(dir, 'link'), 'other\n');
+    }, fresh => {
+      expect(lstatSync(join(fresh, 'link')).isFile()).toBe(true);
+      expect(readFileSync(join(fresh, 'link'), 'utf8')).toBe('other\n');
+    }],
+    ['attr.tree pointing at "* text" hides a CRLF-only edit', (dir, git) => {
+      const blob = execFileSync('git', ['-C', dir, 'hash-object', '-w', '--stdin'], { input: '* text\n', encoding: 'utf8' }).trim();
+      const tree = execFileSync('git', ['-C', dir, 'mktree'], { input: `100644 blob ${blob}\t.gitattributes\n`, encoding: 'utf8' }).trim();
+      git('config', 'attr.tree', tree);
+      writeFileSync(join(dir, 'text.txt'), 'a\r\nb\r\n');
+    }, fresh => expect(readFileSync(join(fresh, 'text.txt'), 'utf8')).toBe('a\r\nb\r\n')],
   ])('binarySafe: %s — the patch still carries it', (_name, mutate, check) => {
     const dir = mkdtempSync(join(tmpdir(), 'we-codex-config-hide-'));
     const fresh = `${dir}-fresh`;
@@ -961,6 +985,33 @@ describe('captureDiff — the review artifact, never a commit/push', () => {
       expect(diffProvesNoEdits(report)).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('binarySafe: a case-only rename is carried by the patch, or refused where the filesystem folds case', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-codex-case-rename-'));
+    const fresh = `${dir}-fresh`;
+    try {
+      const git = initGitRepo(dir);
+      const startSha = commitTracked(dir, git);
+      renameSync(join(dir, 'tool.sh'), join(dir, 'TOOL.sh'));
+      const report = captureDiff({ dir, startSha, binarySafe: true });
+      if (existsSync(join(dir, 'tool.sh'))) {
+        // Case-insensitive filesystem: git cannot see the rename, so the clone must be kept.
+        expect(report.patchExact).toBe(false);
+        expect(report.patchError).toMatch(/case- or normalization-only rename of "tool\.sh"/);
+        expect(diffProvesNoEdits(report)).toBe(false);
+      } else {
+        expect(report.patchExact).toBe(true);
+        execFileSync('git', ['clone', '--quiet', dir, fresh]);
+        writeFileSync(join(fresh, '.patch'), report.patch);
+        execFileSync('git', ['-C', fresh, 'apply', '--binary', '.patch']);
+        expect(readdirSync(fresh)).toContain('TOOL.sh');
+        expect(readdirSync(fresh)).not.toContain('tool.sh');
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(fresh, { recursive: true, force: true });
     }
   });
 
