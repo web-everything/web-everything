@@ -400,6 +400,33 @@ describe('same-head review loop regression (live #202)', () => {
     expect(row).toMatchObject({ attempted: true, count: 1, parked: true });
     expect(hold(pr(), [row])).not.toBeNull();
   });
+
+  // PR #6465 round 2: every run-level reason `mandatoryReferralState` re-derives live is one shared set, so `attempted`
+  // and `count` skip it exactly as the refused-stage resume check does; failure tokens stay real (fail-closed) entries.
+  it.each(['malformed-operator-ruling', 'unavailable-reviewed-head', 'wrong-subject'])(
+    'counts %s as a reason, not a finding, and keeps the attempted referral held', token => {
+      const r = run();
+      r.findings.referralVerdict.pendingReferrals.unshift(token);
+      const row = reviewRunEvidence(r);
+      expect(PENDING_REASON_TOKENS.has(token)).toBe(true);
+      expect(row).toMatchObject({ attempted: true, count: 1, parked: true });
+      expect(hold(pr(), [row])).not.toBeNull();
+    });
+
+  it.each(['referral-persistence-failed', 'malformed-referral-record', 'unreadable-referral-result'])(
+    'keeps the failure token %s out of the reason set', token => {
+      expect(PENDING_REASON_TOKENS.has(token)).toBe(false);
+    });
+
+  // Drift guard: a new run-level reason pushed by jury-core must be classified here (reason vs fail-closed failure),
+  // or a fully ruled refused run would silently never resume again.
+  it('classifies every literal reason token jury-core pushes onto the referral pending list', () => {
+    const src = readFileSync(join(process.cwd(), 'scripts/lib/jury-core.mjs'), 'utf8');
+    const produced = new Set([...src.matchAll(/pending\.push\('([a-z]+(?:-[a-z]+)+)'\)|const pending = malformed \? \['([a-z]+(?:-[a-z]+)+)'\]/g)]
+      .map(m => m[1] ?? m[2]));
+    const failureTokens = new Set(['malformed-referral-record']);
+    expect([...produced].sort()).toEqual([...PENDING_REASON_TOKENS, ...failureTokens].sort());
+  });
   it.each(['referral-persistence-failed', 'malformed-referral-record', 'unreadable-referral-result'])
     ('preserves the failure token %s', token => {
       const r = run();

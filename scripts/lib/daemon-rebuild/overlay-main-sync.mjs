@@ -29,11 +29,32 @@ const marker = (root, env, ref) => join(`${overlayFilePath(root, env)}.auto-reba
 const executeGit = (args, opts) => spawnSync('git', args, { encoding: 'utf8', timeout: 60_000, maxBuffer: 8 * 1024 * 1024, ...opts });
 const cleanText = text => String(text ?? '').replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, '');
 const stderrTail = result => cleanText(result?.stderr || result?.error?.message).slice(-500);
+function testStderrTail(result, { failedAssertions = [], failed = [] } = {}) {
+  const combined = `${result?.stdout ?? ''}\n${result?.stderr || result?.error?.message || ''}`;
+  const namedFiles = new Set();
+  const names = failedAssertions.filter(identity => identity !== null).map(identity => {
+    const [file, form, ...title] = JSON.parse(identity);
+    namedFiles.add(file);
+    return `${file} > ${form === 'fullName' ? title[0] : [...title[0], title[1]].join(' > ')}`;
+  });
+  names.push(...failed.filter(file => !namedFiles.has(file)));
+  if (!names.length) {
+    for (const match of stripVTControlCharacters(combined).matchAll(/^\s*FAIL\s+([^\r\n]+)/gm)) names.push(match[1].trim());
+  }
+  // Preserve the historical stderr-only diagnostic byte for byte after sanitizing.
+  if (!result?.stdout && !names.length) return stderrTail(result);
+  const prefix = cleanText([...new Set(names)].join('; ')).slice(0, 500);
+  const tail = cleanText(combined);
+  if (!prefix) return tail.slice(-500);
+  // Reserve space for identities first: a long runner footer can only displace the tail.
+  const room = 500 - prefix.length - 3;
+  return room > 0 && tail ? `${prefix} | ${tail.slice(-room)}` : prefix;
+}
 const unsupportedAttributeSource = result => result?.status === 129 && !result.error
   && /^unknown option: --attr-source(?:=origin\/main)?\r?$/m.test(result.stderr ?? '');
-const output = result => {
+const output = (result, failureTail = stderrTail(result)) => {
   if (result?.status !== 0 || result.error || typeof result.stdout !== 'string') {
-    const step = result?.step ?? 'unknown', tail = stderrTail(result);
+    const step = result?.step ?? 'unknown', tail = failureTail;
     throw Object.assign(new Error(`${step}: command failed or incomplete; operator review required${tail ? `: ${tail}` : ''}`),
       { step, stderrTail: tail });
   }
@@ -424,7 +445,8 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
   }
   return result;
 }
-const testFailure = () => new Error('selected tests did not pass or execute; operator review required');
+const testFailure = evidence => Object.assign(new Error('selected tests did not pass or execute; operator review required'),
+  { stderrTail: evidence?.stderrTail ?? '' });
 const remoteUnconfirmed = result => result?.status === 124 && typeof result.stderr === 'string'
   && result.stderr.includes('remote termination unconfirmed; refusing local rerun (exit 124).');
 // Vitest's "Unhandled Errors" section header and its "Errors  N error(s)" summary row.
@@ -529,17 +551,18 @@ async function syncTestEvidence({ root, scratch, selected, testReport, env, io, 
     if (io.statSync(testReport).size > 8 * 1024 * 1024) throw new Error('test report over 8 MiB; operator review required');
     report = JSON.parse(io.readFileSync(testReport, 'utf8'));
   } catch (error) {
-    if (!commandOk) output({ ...result, step: 'tests' });
-    throw error;
+    if (!commandOk) output({ ...result, step: 'tests' }, testStderrTail(result));
+    throw Object.assign(error, { stderrTail: testStderrTail(result) });
   }
   const results = report?.testResults;
-  if (!Array.isArray(results)) throw testFailure();
+  if (!Array.isArray(results)) throw testFailure({ stderrTail: testStderrTail(result) });
   const names = selected.map(file => join(io.realpathSync(scratch), file));
-  const failed = [], passed = [], failedAssertions = [], byFile = new Map();
+  const failed = [], passed = [], failedAssertions = [], failedFiles = [], byFile = new Map();
   for (let i = 0; i < selected.length; i++) {
     const matches = results.filter(r => r?.name === names[i]);
     if (matches.length !== 1) continue;
     const r = matches[0], assertions = r.assertionResults;
+    if (r.status === 'failed') failedFiles.push(selected[i]);
     if (!Array.isArray(assertions) || !assertions.length
       || assertions.some(a => !['passed', 'failed'].includes(a?.status))) continue;
     const ids = status => assertions.filter(a => a.status === status).map(a => assertionIdentity(selected[i], a));
@@ -554,10 +577,11 @@ async function syncTestEvidence({ root, scratch, selected, testReport, env, io, 
     && results.length === selected.length && results.every(r => names.includes(r?.name));
   const green = commandOk && complete && !failed.length && report.success !== false
     && !(report.numFailedTests > 0) && !(report.numFailedTestSuites > 0);
+  const tail = testStderrTail(result, { failedAssertions, failed: [...new Set([...failed, ...failedFiles])] });
   if (!commandOk && !(result?.status === 1 && (!result.error || validatedFailure) && complete && failed.length)) {
-    output({ ...result, step: 'tests' });
+    output({ ...result, step: 'tests' }, tail);
   }
-  return { green, failed, complete, failedAssertions, byFile };
+  return { green, failed, complete, failedAssertions, byFile, stderrTail: tail };
 }
 // A green rerun only clears a failure it actually re-executed. Per previously failed file the rerun must
 // run at least as many assertions as the failing run did (a vanished assertion fails closed), and, when
@@ -711,7 +735,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
       // The remote process may still be running: neither publication nor a local rerun is safe.
       if (evidence.remoteUnconfirmed) return await skip('remote-termination-unconfirmed');
       if (evidence.green) continue;
-      if (!reruns || !evidence.complete || !evidence.failed.length) throw testFailure();
+      if (!reruns || !evidence.complete || !evidence.failed.length) throw testFailure(evidence);
       const retried = [...evidence.failed];
       let remaining = retried, previous = evidence;
       // Coverage is always measured against the ORIGINAL failure, never the previous rerun: with several
@@ -724,8 +748,8 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
         if (evidence.remoteUnconfirmed) return await skip('remote-termination-unconfirmed');
         // A file that stops failing must have re-executed what failed originally; otherwise it is no pass.
         const cleared = previous.failed.filter(file => !evidence.failed.includes(file) && evidence.byFile.has(file));
-        if (cleared.length && !rerunCoversFailures(original, evidence, cleared)) throw testFailure();
-        if (evidence.green && !cleared.length) throw testFailure();
+        if (cleared.length && !rerunCoversFailures(original, evidence, cleared)) throw testFailure(original);
+        if (evidence.green && !cleared.length) throw testFailure(original);
         if (evidence.green || !evidence.complete || !evidence.failed.length) break;
         remaining = evidence.failed; previous = evidence;
       }
@@ -759,7 +783,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
         event(root, { kind: 'overlay-main-red', ref, files: remaining }, { env });
         return await skip('main-red');
       }
-      throw testFailure();
+      throw testFailure(evidence);
     }
     setStep('verify');
     const current = readOverlayState(root, { env });

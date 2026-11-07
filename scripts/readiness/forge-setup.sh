@@ -17,7 +17,17 @@
 #   ops ALL=(root) NOPASSWD: /usr/local/libexec/forge-exec-run.mjs *
 # - root-owned forge-warm-base systemd service/timer (service runs as ops,
 #   timer every 30s) and /etc/cron.daily/forge-exec-prune root:root 0755;
-# - installs python3 and rsync if missing. Never prunes active slot locks.
+# - R497 egress: slot users forge-exec-1..N get no outbound network except loopback and
+#   TCP 443 to registry.npmjs.org (cold npm ci runs as the slot user). Rules come from
+#   /usr/local/libexec/forge-egress.sh (nft table inet forge_exec_egress), refreshed every
+#   5 min by forge-exec-egress.timer. ssh.service gets a drop-in (ssh.service.d/forge-egress.conf) that
+#   Requires= the egress service, so sshd refuses to start when the table could not be applied. Rollback, in
+#   this order (drop-in first: with it in place, stopping the egress service can stop sshd):
+#   rm -f /etc/systemd/system/ssh.service.d/forge-egress.conf;
+#   systemctl daemon-reload;
+#   nft delete table inet forge_exec_egress;
+#   systemctl disable --now forge-exec-egress.timer forge-exec-egress.service;
+# - installs python3, rsync and nftables if missing. Never prunes active slot locks.
 set -euo pipefail
 
 FORGE_EXEC_SLOTS=${FORGE_EXEC_SLOTS:-8}
@@ -286,6 +296,55 @@ WantedBy=timers.target
 TIMER
 systemctl daemon-reload
 systemctl enable --now forge-warm-base.timer
+# R497: no egress for slot users. Root-owned script, installed via temp + atomic rename.
+if ! command -v nft >/dev/null 2>&1; then
+  apt-get install -y nftables
+fi
+egress_pending=$(mktemp /usr/local/libexec/.forge-egress.XXXXXX)
+install -o root -g root -m 0755 "$(dirname -- "$0")/forge-egress.sh" "$egress_pending"
+mv -f -- "$egress_pending" /usr/local/libexec/forge-egress.sh
+cat > /etc/systemd/system/forge-exec-egress.service <<EGRESS
+[Unit]
+Description=Drop outbound network for Forge slot users (registry allowlist only)
+# Before sshd so no run can start on a rebooted Forge before the table exists. At boot the registry usually
+# does not resolve yet: the table installs CLOSED (no registry) and the timer opens the allowlist after 1 min.
+Before=ssh.socket ssh.service sshd.service
+DefaultDependencies=no
+# Only local-fs.target: any After= on a unit behind sockets.target (systemd-user-sessions, network-online) would
+# loop with Before=ssh.socket. Slot users are local accounts, so nothing later is needed to look them up.
+After=local-fs.target
+[Service]
+Type=oneshot
+Environment=FORGE_EXEC_SLOTS=$FORGE_EXEC_SLOTS
+ExecStart=/usr/local/libexec/forge-egress.sh apply
+[Install]
+WantedBy=multi-user.target
+EGRESS
+# Fail closed: Before= only orders startup. Requires= makes ssh refuse to start when the egress apply failed,
+# so a Forge whose table is missing accepts no slot commands. Ubuntu starts sshd through ssh.socket, which is
+# why the unit above is also ordered Before=ssh.socket. The drop-in is read once at start; the 5-minute timer
+# re-running the oneshot does not stop or restart an sshd that is already up. Rollback (see the header) removes this
+# drop-in and reloads BEFORE stopping the egress service; otherwise Requires= would stop sshd with it.
+mkdir -p /etc/systemd/system/ssh.service.d
+cat > /etc/systemd/system/ssh.service.d/forge-egress.conf <<'SSHDROPIN'
+[Unit]
+Requires=forge-exec-egress.service
+After=forge-exec-egress.service
+SSHDROPIN
+cat > /etc/systemd/system/forge-exec-egress.timer <<'EGRESST'
+[Unit]
+Description=Refresh the Forge slot egress registry allowlist
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Unit=forge-exec-egress.service
+[Install]
+WantedBy=timers.target
+EGRESST
+systemctl daemon-reload
+systemctl enable forge-exec-egress.service
+systemctl start forge-exec-egress.service
+systemctl enable --now forge-exec-egress.timer
 cat > /etc/cron.daily/forge-exec-prune <<'PRUNE'
 #!/bin/bash
 set -euo pipefail
