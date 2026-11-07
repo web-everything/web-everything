@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["plateau:scripts/wip-publish.ts", "plateau:scripts/__tests__/wip-publish.test.mjs", "plateau:src/wip/wip-agent-options.ts", "plateau:src/wip/wip-agent-options.test.ts", "we:docs/agent/testing.md"]
 dateOpened: "2026-09-28"
-preparedDate: "2026-11-05"
-preparedAgainstSha: "27e2ab3d9d75ad000ae8e4b99410dcf2135de56c"
+preparedDate: "2026-11-07"
+preparedAgainstSha: "87af65ada62a84ff7366c9f67e4b65b9abb599b9"
 tags: []
 ---
 
