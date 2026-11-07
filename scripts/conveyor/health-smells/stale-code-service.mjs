@@ -84,7 +84,7 @@ export default {
     // missingSubjectsUnknown keeps an episode open when its subject is not re-emitted. Close it only on
     // positive evidence: its clone was inspected completely (service removed, renamed or no longer
     // clone-backed), or coverage is fully known and the clone left the managed inventory.
-    const inventoryKnown = selfSyncReadable && roots.size > 0 &&!rows.some(row => row.breach && row.subject.startsWith('coverage:'));
+    const inventoryKnown = selfSyncReadable && roots.size > 0 && !rows.some(row => row.breach && row.subject.startsWith('coverage:'));
     const emitted = new Set(rows.map(row => row.subject));
     for (const ep of Object.values(episodes ?? {})) {
       if (ep?.smell !== 'stale-code-service' || typeof ep.subject !== 'string' || emitted.has(ep.subject)) continue;
