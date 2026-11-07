@@ -35,7 +35,7 @@
  */
 import { retryTransientGit } from './git-fetch-retry.mjs';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 
 /**
@@ -378,7 +378,7 @@ export function readFromTransportBranch({
 
 /** Default TTL for a READ's origin fetch of a transport branch; override with WE_OPS_FETCH_TTL_MS (0 = always fetch). */
 export const OPS_READ_FETCH_TTL_MS = 30_000;
-const OPS_LOCK_STALE_MS = 120_000;
+const OPS_LOCK_STALE_MS = 300_000;
 const OPS_LOCK_WAIT_MS = 60_000;
 
 function defaultFetchLog(msg) { process.stderr.write(`${msg}\n`); }
@@ -419,22 +419,31 @@ function coalescedReadFetch({ board, branch, run, now, env, log, sleep }) {
   const hit = () => { log(`ops-fetch branch=${branch} source=cache ${tag}`); };
   if (fresh()) return hit();
   const deadline = now() + OPS_LOCK_WAIT_MS;
+  const token = `${process.pid}-${now()}-${Math.random().toString(36).slice(2)}`;
   let held = false;
   while (!held) {
-    try { mkdirSync(lockDir); held = true; continue; } catch { /* held by another */ }
+    try { writeFileSync(lockDir, token, { flag: 'wx' }); held = true; continue; } catch (e) {
+      // only "someone else holds it" is waited on; any other fs error (permissions, bad path) fetches directly
+      if (e?.code !== 'EEXIST') return fetchOrigin('lock-error');
+    }
     if (fresh()) return hit();
+    if (now() > deadline) return fetchOrigin('lock-timeout');
     try {
-      if (now() - statSync(lockDir).mtimeMs > OPS_LOCK_STALE_MS) rmSync(lockDir, { recursive: true, force: true });
-      else if (now() > deadline) return fetchOrigin('lock-timeout');
-      else sleep(100);
-    } catch { /* lock vanished: retry */ }
+      if (now() - statSync(lockDir).mtimeMs > OPS_LOCK_STALE_MS) {
+        // atomic reclaim: of several reclaimers only one rename succeeds; the others retry
+        const gone = `${lockDir}.stale-${token}`;
+        renameSync(lockDir, gone);
+        rmSync(gone, { force: true });
+      } else sleep(100);
+    } catch { sleep(100); }
   }
   try {
     if (fresh()) return hit();
     fetchOrigin('stamp-stale');
     try { writeFileSync(stampFile, String(now())); } catch { /* next reader just fetches */ }
   } finally {
-    rmSync(lockDir, { recursive: true, force: true });
+    // release only a lock that is still ours: a reclaimed lock now belongs to a successor
+    try { if (readFileSync(lockDir, 'utf8') === token) rmSync(lockDir, { force: true }); } catch { /* already gone */ }
   }
 }
 

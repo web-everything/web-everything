@@ -8,7 +8,7 @@
  * second caller must not be able to lose them by construction.
  */
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { stageOnTransportBranch, reclaimStrandedTransportWorktrees, readFromTransportBranch } from '../git-transport-branch.mjs';
@@ -460,10 +460,43 @@ describe('read fetch is coalesced through a per-repo+branch TTL stamp in .git', 
     reset(); const m = mk();
     mkdirSync(stampDir, { recursive: true });
     const lock = `${stampFile}.lock`;
-    mkdirSync(lock);
-    const sleep = () => { writeFileSync(stampFile, '1000000'); rmSync(lock, { recursive: true }); };
+    writeFileSync(lock, 'other');
+    const sleep = () => { writeFileSync(stampFile, '1000000'); rmSync(lock, { force: true }); };
     m.read({ sleep });
     expect(fetches(m.calls)).toBe(0);
+  });
+  it('a failed fetch writes no stamp, so the next read fetches again', () => {
+    reset(); const m = mk();
+    const run = (a) => { m.calls.push(a[0]); if (a[0] === 'rev-parse') return `${dir}\n`; throw new Error('net'); };
+    expect(() => m.read({ run })).toThrow();
+    expect(existsSync(stampFile)).toBe(false);
+  });
+  it('a stale lock is reclaimed, then fetched and stamped', () => {
+    reset(); const m = mk();
+    mkdirSync(stampDir, { recursive: true });
+    writeFileSync(`${stampFile}.lock`, 'dead');
+    const old = new Date(Date.now() - 400_000);
+    utimesSync(`${stampFile}.lock`, old, old);
+    m.read({ now: () => Date.now() });
+    expect(fetches(m.calls)).toBe(1);
+    expect(existsSync(`${stampFile}.lock`)).toBe(false);
+  });
+  it('a lock that never frees times out to an origin fetch', () => {
+    reset(); const m = mk();
+    mkdirSync(stampDir, { recursive: true });
+    writeFileSync(`${stampFile}.lock`, 'busy');
+    let t = Date.now();
+    m.read({ now: () => t, sleep: () => { t += 30_000; } });
+    expect(fetches(m.calls)).toBe(1);
+    expect(m.logs.join('\n')).toMatch(/lock-timeout/);
+  });
+  it('a non-EEXIST lock error fetches directly instead of spinning', () => {
+    reset(); const m = mk();
+    mkdirSync(stampDir, { recursive: true });
+    chmodSync(stampDir, 0o500);
+    try { m.read(); } finally { chmodSync(stampDir, 0o700); }
+    expect(fetches(m.calls)).toBe(1);
+    expect(m.logs.join('\n')).toMatch(/lock-error/);
   });
   it('an unreadable stamp fails closed: fetch', () => {
     reset(); const m = mk();
