@@ -17,13 +17,21 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, realpathSync, writeSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, realpathSync, writeSync } from 'node:fs';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { daemonEventsPath } from './daemon-events.mjs';
 import { lastGoodForClone, rebuildGraceForClone } from './daemon-last-good.mjs';
 import { readSettings as readOperatorSettings } from './settings-files.mjs';
 // Sparse copied-CLI fixtures may omit the launcher; only lane fallback needs it, and must refuse without it.
 const freshLauncher = await import('../run-fresh.mjs').catch(() => null);
+
+/** Sync append of one daemon event (the caller exits right after, so the async writer cannot be used). */
+function emitLaneReleaseFailedSync(event) {
+  const path = daemonEventsPath();
+  mkdirSync(dirname(path), { recursive: true });
+  appendFileSync(path, `${JSON.stringify({ at: new Date().toISOString(), repo: 'web-everything', ...event })}\n`);
+}
 
 /** Default git runner — spawnSync (returns non-zero without throwing). */
 export function gitRun(args, opts = {}) {
@@ -373,7 +381,7 @@ export const OPERATOR_CLI_STALE_MARKER = 'run from an up-to-date lane';
 export function assertOperatorCliFresh(root, { label = 'operator-cli', base = 'main', run = gitRun,
   listBehindFiles = (r) => behindFiles(r, base, run), env = process.env,
   cwd = process.cwd(), argv = process.argv, execArgv = process.execArgv,
-  exists = existsSync, readSettings = readOperatorSettings, spawn = spawnSync, laneSpawn = spawnSync, exit = (code) => process.exit(code),
+  exists = existsSync, readSettings = readOperatorSettings, spawn = spawnSync, laneSpawn = spawnSync, emitEvent = emitLaneReleaseFailedSync, exit = (code) => process.exit(code),
   write = (s) => { try { writeSync(2, s); } catch { /* stderr closed */ } },
   skipUnderVitest = !!process.env.VITEST } = {}) {
   // A daemon-managed clone is kept current by its own gated rebuild (#4044); a unit test run drives the CLI from
@@ -456,16 +464,24 @@ export function assertOperatorCliFresh(root, { label = 'operator-cli', base = 'm
       } finally {
         // Release before exit (and on verification/spawn failure), using the pool-minted holder.
         if (lease) {
-          try {
-            const released = laneSpawn(process.execPath,
-              [pool, 'release', `--lane=${lease.lane}`, `--session=${lease.holder}`, `--repo=${root}`], laneOptions);
-            if (released?.error || released?.status !== 0) throw new Error('release failed');
-          } catch {
-            // Cleanup cannot undo a completed operation or replace its result with "Nothing was changed".
+          const release = () => laneSpawn(process.execPath,
+            [pool, 'release', `--lane=${lease.lane}`, `--session=${lease.holder}`, `--repo=${root}`], laneOptions);
+          let released;
+          try { released = release(); } catch { released = { error: true }; }
+          if (released?.error || released?.status !== 0) {
+            try { released = release(); } catch { released = { error: true }; } // retry once
+          }
+          if (released?.error || released?.status !== 0) {
+            // Cleanup cannot undo a completed operation or replace its result: keep the child's status, be loud,
+            // and leave one structured event so health-watch and the lease reaper can see the leaked lease.
             try {
               write(`${label}: could not release lane-${lease.lane}; release it: node scripts/lane-pool.mjs release `
                 + `--lane=${lease.lane} --session=${lease.holder} --repo=${root}\n`);
             } catch { /* A closed diagnostic stream must not discard the operation's result either. */ }
+            try {
+              emitEvent({ kind: 'lane-release-failed', daemon: 'operator-cli',
+                detail: { label, lane: lease.lane, session: lease.holder, repo: root } });
+            } catch { /* Best-effort event. */ }
           }
         }
       }

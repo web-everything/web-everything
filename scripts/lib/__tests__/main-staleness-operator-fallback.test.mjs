@@ -23,6 +23,7 @@ function fixture({ rootBehind = 14, candidateBehind = 0, candidateFiles = ['scri
     label: 'review-set-label', skipUnderVitest: false, run,
     listBehindFiles: vi.fn((r) => r === root ? ['scripts/old.mjs'] : candidateFiles),
     laneSpawn: vi.fn(() => ({ status: 1 })),
+    emitEvent: vi.fn(),
     spawn: vi.fn(() => ({ status: 7 })), exit: vi.fn(), write: vi.fn(),
     env: { KEEP: 'yes' }, cwd: `${candidate}/nested`,
     argv: [process.execPath, `${root}/${script}`, '--pr=4880', '--to=restamp'],
@@ -201,13 +202,34 @@ describe('operator CLI same-checkout fresh lane fallback', () => {
     const { o, call } = sameCheckout({ spawn: vi.fn(() => { mutations++; return { status: 0 }; }) });
     o.laneSpawn.mockImplementationOnce(() => ({ status: 0,
       stdout: JSON.stringify({ lane: 8, path: lane, holder: 'restamp-holder' }) }))
-      .mockImplementationOnce(release);
+      .mockImplementationOnce(release).mockImplementationOnce(release);
     expect(call()).toEqual({ reexecedFrom: lane, status: 0 });
     expect(mutations).toBe(1);
     expectReleased(o);
     expect(o.exit).toHaveBeenCalledWith(0);
     expect(o.write).toHaveBeenLastCalledWith(expect.stringContaining(
       'could not release lane-8; release it: node scripts/lane-pool.mjs release --lane=8 --session=restamp-holder'));
+    expect(o.emitEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries a failed release once and stays quiet when the retry succeeds', () => {
+    const { o, call } = sameCheckout({ spawn: vi.fn(() => ({ status: 0 })) });
+    o.laneSpawn.mockImplementationOnce(() => ({ status: 0,
+      stdout: JSON.stringify({ lane: 8, path: lane, holder: 'restamp-holder' }) }))
+      .mockImplementationOnce(() => ({ status: 1 }));
+    expect(call()).toEqual({ reexecedFrom: lane, status: 0 });
+    expect(o.laneSpawn.mock.calls.filter((c) => c[1][1] === 'release')).toHaveLength(2);
+    expect(o.emitEvent).not.toHaveBeenCalled();
+  });
+
+  it('release fails twice: the child status is kept and one lane-release-failed event is emitted', () => {
+    const { o, call } = sameCheckout({ releaseStatus: 1 });
+    expect(call()).toEqual({ reexecedFrom: lane, status: 7 });
+    expect(o.laneSpawn.mock.calls.filter((c) => c[1][1] === 'release')).toHaveLength(2);
+    expect(o.exit).toHaveBeenCalledWith(7);
+    expect(o.emitEvent).toHaveBeenCalledTimes(1);
+    expect(o.emitEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: 'lane-release-failed',
+      detail: expect.objectContaining({ lane: 8, session: 'restamp-holder' }) }));
   });
 
   it('preserves a nonzero child result when release fails', () => {

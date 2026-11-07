@@ -73,7 +73,7 @@ export default {
       git(seed, 'config', 'user.name', 'soak');
       git(seed, 'config', 'commit.gpgsign', 'false');
       mkdirSync(join(seed, 'scripts/lib'), { recursive: true });
-      for (const file of ['main-staleness.mjs', 'daemon-last-good.mjs', 'daemon-clone-layout.mjs', 'settings-files.mjs']) {
+      for (const file of ['main-staleness.mjs', 'daemon-last-good.mjs', 'daemon-clone-layout.mjs', 'settings-files.mjs', 'daemon-events.mjs', 'handoff-path.mjs']) {
         copyFileSync(join(sourceRoot, 'scripts/lib', file), join(seed, 'scripts/lib', file));
       }
       copyFileSync(join(sourceRoot, 'scripts/run-fresh.mjs'), join(seed, 'scripts/run-fresh.mjs'));
