@@ -102,6 +102,7 @@ const resumeMisses = new Map();
  */
 export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings, claims, nowMs, ttlMs, cap, log = console.log }) {
   if (!settings.parkedReleasesSlot || !allowResume) return runPass({ io, allowResume, nowMs, ttlMs });
+  const beforeA = new Map(structuredClone(io.listRecords()).map(({ key, record }) => [key, record]));
   const a = await runPass({ io, allowResume: false, nowMs, ttlMs });
   // Detach the snapshot so even an in-place update during a PR read is detectable.
   const allRecords = structuredClone(io.listRecords());
@@ -128,11 +129,12 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
     } catch { /* Failed cleanup must not reserve admission capacity or stop live resumes. */ }
   }
   // Trust the pass's verdicts: other waits can still wake and must retain admission.
-  const allOwedKeys = new Set(allOwed.map(({ key }) => key));
   const unwakeable = new Map();
   for (const row of a.rows ?? []) {
     const reason = classifyUnwakeableWait(row);
-    if (reason && allOwedKeys.has(row.key)) unwakeable.set(row.key, reason);
+    // A verdict binds to the exact record phase A read; a record re-marked since is a new one and keeps admission.
+    const now = allOwed.find((e) => e.key === row.key)?.record;
+    if (reason && now && beforeA.has(row.key) && isDeepStrictEqual(beforeA.get(row.key), now)) unwakeable.set(row.key, reason);
   }
   const excluded = [];
   for (const { key, record } of allOwed) {

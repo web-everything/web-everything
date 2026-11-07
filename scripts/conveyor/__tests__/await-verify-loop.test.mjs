@@ -181,6 +181,24 @@ describe('runSlotAwareAwaitPass — the real pass, R3-gated', () => {
     expect(h.store.get('sid-1')).toEqual(waiting);
   });
 
+  it('a record re-marked after phase A read it keeps admission: the exclusion binds to the record phase A judged', async () => {
+    const h = harness([rec(1, { pendingResume: { kind: 'red' } })], {});
+    let phase = 0;
+    const runPass = vi.fn(async ({ io }) => {
+      if (phase++ > 0) return { rows: [] };
+      const rows = io.listRecords().map(({ key, record }) => ({ key, pr: record.pr, action: 'wait', reason: 'previous-head CI repair must be verified and re-marked' }));
+      // A worker re-marks the same key right after the verdict, before the slot layer snapshots.
+      const [{ key, record }] = io.listRecords();
+      h.store.set(key, { ...record, requestedAt: new Date(T0 + 1000).toISOString() });
+      return { rows };
+    });
+    const log = vi.fn();
+    const out = await runSlots(h, { runPass, log });
+    expect(out.excluded).toEqual([]);
+    expect(out.admitted).toEqual(['sid-1']);
+    expect(log).not.toHaveBeenCalled();
+  });
+
   it('logs exactly one exclusion line per stale, closed, delivered and exhausted record with its reason', async () => {
     const records = [rec(1, { pendingResume: { kind: 'green' } }), repair(2),
       repair(3, { pendingResume: { kind: 'red', delivered: true } }),
