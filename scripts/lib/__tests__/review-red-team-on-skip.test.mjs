@@ -79,8 +79,15 @@ describe('#6345 — resume a stored needs-human review after its refused referra
     const projected = reviewRunEvidence(run);
     expect(projected).toMatchObject({ id, repo, pr, head, parked: true, referralStageRefused: true,
       pending: referrals.map(f => f.key) });
-    const notice = 'review paused: 2 referrals need a ruling; it resumes on a new push, a ruling, or a send-back';
+    const why = 'review paused: 2 referrals need a ruling; it resumes on a new push, a ruling, or a send-back';
+    // The production shape (notifyReferralHoldNotice): why + findings block + episode marker.
+    const findings = '\n\nWaiting on your ruling (block, card or not-real):\n- `scripts/x.mjs:1` — first defect\n- `no file` — second defect';
+    const marker = '\n\n<!-- review-referral-hold: 0123456789abcdef -->';
+    const notice = `${why}${findings}${marker}`;
     if (/pause notice/.test(kind)) comments.push({ body: notice, author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z' });
+    if (kind === 'bare notice without episode marker') comments.push({ body: why, author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z' });
+    if (kind === 'notice with persistence detail') comments.push({ author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z',
+      body: `${why}\n\nReferral persistence failed; the next bounded retry is at 2026-11-06T14:00:00.000Z.${marker}` });
     if (kind === 'persist-exhausted notice') comments.push({ body: 'review paused: 2 referrals could not be persisted and the automatic retries are spent; it resumes on a new push or an operator reply',
       author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z' });
     if (kind === 'notice from another author') comments.push({ body: notice, author: { login: 'stranger' }, createdAt: '2026-11-06T13:26:00Z' });
@@ -130,7 +137,7 @@ describe('#6345 — resume a stored needs-human review after its refused referra
   });
 
   it.each([
-    'persist-exhausted notice', 'notice from another author', 'other hold comment', 'review:human label',
+    'persist-exhausted notice', 'notice from another author', 'bare notice without episode marker', 'notice with persistence detail', 'other hold comment', 'review:human label',
     'pause notice and review:human label',
   ])('fails closed: a hold that is not the settled referral pause still skips: %s', kind => {
     const o = parkedFixture(kind);

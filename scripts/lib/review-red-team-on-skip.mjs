@@ -147,8 +147,14 @@ function conflictsWithPolicyClear(label, { settlesPending = false, settlesReview
  * caller that has just proven every referral ruled may treat it as settled: the persist-exhausted and ledger variants,
  * and any look-alike from another author, are different holds and stay. PURE. */
 function isSettledReferralPauseNotice(comment) {
-  return isAutomationAuthored(comment) && typeof comment?.body === 'string'
-    && /^review paused: \d+ referrals need a ruling; it resumes on a new push, a ruling, or a send-back\s*$/.test(comment.body.trim());
+  if (!isAutomationAuthored(comment) || typeof comment?.body !== 'string') return false;
+  const body = comment.body.trim();
+  // The real notice is `${why}${findings}${detail}\n\n<!-- review-referral-hold: <episode> -->` (notifyReferralHoldNotice):
+  // the leading line, an optional "Waiting on your ruling" findings block, then the episode marker. A persistence-failure
+  // detail means a persist hold, not a pause for rulings, so it never counts as settled.
+  return /^review paused: \d+ referrals need a ruling; it resumes on a new push, a ruling, or a send-back(?:\n|$)/.test(body)
+    && /\n<!-- review-referral-hold: [0-9a-f]+ -->$/.test(body)
+    && !/Referral persistence (?:failed|retries are exhausted)/.test(body);
 }
 
 /** A reviewed-sha marker alone never proves acceptance or supersedes a newer hold. */
