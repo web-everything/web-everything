@@ -1155,8 +1155,11 @@ export async function codexDirectTask({
   let scratchLog;
   // The preserved log sits beside the private mkdtemp clone in the shared tmpdir: create it owner-only
   // (0600) and exclusively (`wx`, never through a pre-planted file or symlink), then refresh it in place.
+  // A stale file at that name (a reused temp name) is unlinked first, never written through; a directory
+  // or a file this user cannot remove makes the copy fail, and cleanup then retains the clone.
   const preserveScratchLog = () => {
     if (!scratchLog || !existsSync(scratchLog.source)) return;
+    if (!scratchLog.written) rmSync(scratchLog.dest, { force: true });
     const fd = openSync(scratchLog.dest, scratchLog.written ? 'w' : 'wx', 0o600);
     try { fchmodSync(fd, 0o600); writeFileSync(fd, readFileSync(scratchLog.source)); }
     finally { closeSync(fd); }
