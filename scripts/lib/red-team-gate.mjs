@@ -585,6 +585,7 @@ const HOLDING_OUTCOMES = Object.freeze([GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.S
  * head. A carried result defers to the ruling on the head it was carried from, read from the thread before the carry.
  * Returns the validated ceremony record, or false. PURE.
  */
+const reviewedShaOf = body => [...body.matchAll(REVIEWED_SHA_ANY_RE)].map(m => m[1].toLowerCase()).at(-1) ?? null;
 function operatorRuled(records, pr, head, index) {
   const trusted = records.filter(r => isTrustedMarkerAuthor(r.c));
   if (parseLatestHumanClearedSha(trusted.filter(r => !r.from).map(r => r.c)) !== head) return false;
@@ -612,8 +613,11 @@ function operatorRuled(records, pr, head, index) {
     // The marker may name a head abbreviated (7–40 hex, any case), as its builder and parser allow: a prefix match supersedes.
     const reviewed = body => [...body.matchAll(REVIEWED_SHA_ANY_RE)]
       .some(([, s]) => [...rulingHeads].some(h => h.startsWith(s.toLowerCase())));
-    const reaccepted = cleared && trusted.some(r => !r.from && r.at > cleared.at && parseLatestHumanClearedSha([r.c]) === null
-      && reviewed(recordBody(r)));
+    const reaccepted = cleared && trusted.some(r => !r.from && r.at > cleared.at && reviewed(recordBody(r))
+      // R706: a restamp is a plain accept unless it is a PROVEN carrier, which only the thread up to it can show
+      // (it cites the original human comment); a single comment alone never proves it.
+      && !(parseLatestHumanClearedSha([r.c]) !== null
+        || (r.c && parseLatestHumanClearedSha(trusted.filter(x => !x.from && x.at <= r.at).map(x => x.c)) === reviewedShaOf(recordBody(r)))));
     if (cap && cleared && !reaccepted && cleared.at > result.at && gates.every(r =>
       !holds(r) || cleared.at > r.at)) return cleared;
     // A ruling inherited through a carry cannot approve this head's own later gate decisions.
