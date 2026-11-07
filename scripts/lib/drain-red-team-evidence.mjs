@@ -79,6 +79,13 @@ const verdictOf = run => (typeof run.verdict === 'string' ? run.verdict : run.ve
 // A verdict is PRESENT when it is anything but undefined or null: false, 0 and '' are malformed present verdicts, not absent ones.
 const hasVerdict = run => run.verdict !== undefined && run.verdict !== null;
 const abandonableReview = run => !hasVerdict(run) && run.resumeOf == null && run.resumedAt == null && isRunRecordTerminal(run);
+// Recovery alone may abandon the dead writer's own quiet referral wait. Other open steps,
+// label effects, present verdicts and resumed runs remain blocking, however old they are.
+const referralWait = run => !hasVerdict(run) && run.resumeOf == null && run.resumedAt == null
+  && (run.pending == null || (run.pending.kind === 'effect' && run.pending.step === 'mandatoryReferrals'))
+  && Array.isArray(run.effects) && run.effects.length === 1
+  && ['mandatoryReferrals', 'review.mandatory-referrals'].includes(run.effects[0]?.type)
+  && ['pending', 'in-flight'].includes(run.effects[0]?.status);
 const undecidedUnfinished = run => {
   // Any PRESENT verdict this reader does not recognise (an empty object, another key, an array, false, 0, '') counts as decided.
   return (!hasVerdict(run) || verdictOf(run) === 'needs-human') && !hasOpenEffect(run);
@@ -114,6 +121,7 @@ const cleanRev = value => (typeof value === 'string' && /^[a-f0-9]{40}$/i.test(v
 const summarizeRun = run => ({ review: run?.op === 'review-pr', repo: typeof run?.input?.repo === 'string' ? run.input.repo.trim().toLowerCase() : undefined,
   pr: strictPr(run?.input?.pr), rev: cleanRev(run?.findings?.read?.netBasis?.rev), kind: settleKind(run),
   // Order key: the read start, or the resume stamp when later (a rewound run finishes after it resumes); NaN when unreadable.
+  referralWait: referralWait(run), hasVerdict: hasVerdict(run),
   orderAt: unfinishedSince(run), resumed: run?.resumeOf != null || run?.resumedAt != null, abandonable: abandonableReview(run) });
 // R622: settlement needs a COMPLETE same-PR, same-head read. Run ids carry no PR, so this parses every review-pr
 // record (no parse cap: the bounded scan cannot vouch for what it did not read) and keeps only the summary. Over the
@@ -128,7 +136,7 @@ const summarizeRun = run => ({ review: run?.op === 'review-pr', repo: typeof run
 //    and a later completed accept of the same head supersedes it. Newest is by read-step start (or resume stamp when later);
 //    a record whose start is unreadable or in the future cannot be ordered: a rejection of that kind holds, an accept supersedes nothing.
 // Any record that cannot be listed, statted, read or attributed to a PR fails closed.
-function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, settleAt }) {
+function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, settleAt, recoveryReferralId = null }) {
   const incomplete = { complete: false, blocked: false };
   try {
     const cache = summaryCache.get(read) ?? summaryCache.set(read, new Map()).get(read);
@@ -150,6 +158,14 @@ function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, 
       if (typeof s.repo !== 'string' || !s.repo || !Number.isFinite(s.pr)) return incomplete;
       if (s.repo !== wantRepo || s.pr !== Number(pr)) continue;
       if (s.rev !== null && s.rev !== want) continue;
+      if (recoveryReferralId !== null) {
+        // This exception is bound to the owned referral, never shared with comment settlement.
+        if (id === recoveryReferralId && s.rev === want && s.referralWait
+          && now - st.mtimeMs >= ABANDONED_REVIEW_AFTER_MS) continue;
+        if (s.resumed || s.kind === 'reject' || (s.kind === 'undecided' && !s.abandonable && !s.hasVerdict)) {
+          return { complete: true, blocked: true };
+        }
+      }
       if (s.kind === 'hard') return { complete: true, blocked: true };
       if (s.kind === 'undecided') {
         const quiet = now - st.mtimeMs >= ABANDONED_REVIEW_AFTER_MS;
@@ -220,12 +236,13 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
   const failures = new Map();
   // R622: the complete same-PR, same-head read settlement requires; lazy (only a settle attempt pays) and memoized.
   const completeReads = new Map(); // per settling-comment time: the answer depends on it
-  const completeHeadRead = ({ pr: askedPr, head: askedHead, at } = {}) => {
+  const completeHeadRead = ({ pr: askedPr, head: askedHead, at, recoveryReferralId = null } = {}) => {
     if (Number(askedPr) !== Number(pr) || String(askedHead).toLowerCase() !== String(head).toLowerCase()) return { complete: false, blocked: false };
     const settleAt = Number.isFinite(at) ? at : NaN; // no usable comment time: any unfinished same-head review holds
-    if (!completeReads.has(settleAt) && completeReads.size >= 8) completeReads.clear(); // bounded: few distinct comments per tick
-    if (!completeReads.has(settleAt)) completeReads.set(settleAt, completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, settleAt }));
-    return completeReads.get(settleAt);
+    const cacheKey = JSON.stringify([settleAt, recoveryReferralId]);
+    if (!completeReads.has(cacheKey) && completeReads.size >= 8) completeReads.clear(); // bounded: few distinct comments per tick
+    if (!completeReads.has(cacheKey)) completeReads.set(cacheKey, completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, settleAt, recoveryReferralId }));
+    return completeReads.get(cacheKey);
   };
   const runScan = () => {
     const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, exactDecided: null, unfinished: null, since: -Infinity, active: -Infinity, undecided: true, verdictless: true }]));
@@ -279,7 +296,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     }
     if (unfinished && (!selected || unfinished.id === selected.id || reviewStartedAt(unfinished) >= selectedStart)) {
       return withSettleBounds({ ok: false, reason: 'review-unfinished' },
-        { exactDecided, unfinishedStartedAt: since, unfinishedUndecided: undecided, unfinishedVerdictless: verdictless, unfinishedActiveAt: active, evaluatedAt: now, completeHeadRead, ...(scan.end?.ok === false ? { unreadBoundaryAt: scan.boundary } : {}) });
+        { exactDecided, unfinished, unfinishedStartedAt: since, unfinishedUndecided: undecided, unfinishedVerdictless: verdictless, unfinishedActiveAt: active, evaluatedAt: now, completeHeadRead, ...(scan.end?.ok === false ? { unreadBoundaryAt: scan.boundary } : {}) });
     }
     if (scan.end?.ok !== false) return null;
     // Capped: usable only when no unread record can change this query's answer (see above).
@@ -323,12 +340,21 @@ export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir
   let latest = lookup();
   if (latest.ok === false && latest.reason === 'review-unfinished' && ['queued', 'running'].includes(parsed?.status)) {
     const bounds = latest.settleBounds;
-    // Only a complete scan of quiet, verdictless, never-resumed attempts permits this fallback.
+    // The bounded finder may stop early even without an unreadBoundaryAt. Recovery needs
+    // the complete same-head classification and proof this writer is the referral child.
     // Prove local owner death here: the planner's age fallback cannot authorize unknown owners.
-    if (bounds?.unfinishedVerdictless === true && !Object.hasOwn(bounds, 'unreadBoundaryAt')
+    const unfinished = bounds?.unfinished;
+    const writerRead = parsed?.loopPayload?.findings?.read;
+    const ownsReferral = unfinished?.run?.findings?.read?.netBasis?.rev === head
+      && writerRead?.netBasis?.rev === head && referralWait(unfinished.run)
+      && JSON.stringify(unfinished.run.effects[0].payload?.read) === JSON.stringify(writerRead);
+    if (ownsReferral
       && Number.isFinite(bounds.unfinishedActiveAt) && Number.isFinite(bounds.evaluatedAt)
       && bounds.evaluatedAt - bounds.unfinishedActiveAt >= ABANDONED_REVIEW_AFTER_MS
       && bounds.exactDecided?.run && redTeamOwedFor(bounds.exactDecided.run)) {
+      let complete;
+      try { complete = bounds.completeHeadRead({ pr, head, at: now, recoveryReferralId: unfinished.id }); }
+      catch { /* Unreadable complete evidence retains the original hold. */ }
       let dead = false;
       try {
         if (parsed.host === probe.host && parsed.pidNamespace === probe.namespace
@@ -341,7 +367,7 @@ export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir
           }
         }
       } catch { /* Unreadable liveness evidence retains the original unfinished-review hold. */ }
-      if (dead) latest = bounds.exactDecided;
+      if (dead && complete?.complete === true && complete.blocked === false) latest = bounds.exactDecided;
     }
   }
   let carryEvidence;

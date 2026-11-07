@@ -584,7 +584,8 @@ describe('dead running red-team owner behind an unfinished review', () => {
     const writer = { repo, pr, head, status, result: status === 'finished' ? 'ran' : null,
       pid: 99999999, host: foreign ? 'another-host' : os.hostname(), pidNamespace: pid.pidNamespace(),
       // Unknown birth time cannot authorize recovery by age for foreign/unprobeable owners.
-      pidStart: 'fixture-owner-start' };
+      pidStart: 'fixture-owner-start',
+      loopPayload: { findings: { read: { netBasis: { rev: head }, diffText: '+code', netChangedFiles: ['scripts/example.mjs'] } } } };
     if (status !== null) writeFileSync(writerPath, JSON.stringify(writer));
     const makeRun = (id, startedHoursAgo) => ({
       ...store.newRunRecord({ id, op: 'review-pr', input: { repo, pr } }),
@@ -596,7 +597,7 @@ describe('dead running red-team owner behind an unfinished review', () => {
         lensVerdicts: { correctness: 'accept' }, findings: [], admittedFindings: [] } };
     const unfinished = { ...makeRun('review-pr-6378-unfinished', 3),
       effects: [{ key: 'review-pr-6378-unfinished:1:0', type: 'mandatoryReferrals', stepIndex: 1,
-        index: 0, status: 'in-flight', handle: null }] };
+        index: 0, status: 'in-flight', handle: null, payload: { read: writer.loopPayload.findings.read } }] };
     const put = (run, age) => {
       const path = join(env.WE_SHARED_RUNS_DIR, `${run.id}.json`);
       writeFileSync(path, JSON.stringify(run));
@@ -637,6 +638,78 @@ describe('dead running red-team owner behind an unfinished review', () => {
     expect(f.probe.isAlive).toHaveBeenCalledWith(99999999);
     // The drain reader must retain its unfinished-review hold.
     expect(evidence.readDrainRedTeamEvidence(f.witnessOptions)).toMatchObject({ ok: false, reason: 'review-unfinished' });
+  });
+
+  it('holds an older rejection with an in-flight label effect left unread by early stop', () => {
+    const f = fixture();
+    f.put({ ...f.decided, id: 'review-pr-6378-hidden-rejection', verdict: { verdict: 'changes' },
+      stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(f.now - 9 * evidence.ABANDONED_REVIEW_AFTER_MS).toISOString() }],
+      effects: [{ key: 'review-pr-6378-hidden-rejection:1:0', type: 'label', stepIndex: 1, index: 0, status: 'in-flight' }] },
+    7 * evidence.ABANDONED_REVIEW_AFTER_MS);
+    const witness = f.readWitness();
+    expect(witness).toMatchObject({ ok: false, reason: 'review-unfinished' });
+    // The bounded finder stopped successfully before this rejection, rather than hitting its cap.
+    expect(witness.settleBounds).not.toHaveProperty('unreadBoundaryAt');
+    expect(f.plan().mode).toBe('skip');
+  });
+
+  it('holds an unfinished referral whose read differs from the dead writer payload', () => {
+    const f = fixture();
+    const effect = f.unfinished.effects[0];
+    f.put({ ...f.unfinished, effects: [{ ...effect,
+      payload: { read: { ...effect.payload.read, diffText: '+different review' } } }] }, 70 * 60_000);
+    expect(f.readWitness()).toMatchObject({ ok: false, reason: 'review-unfinished' });
+    expect(f.plan().mode).toBe('skip');
+  });
+
+  it('recovers the live-data shape with a quiet owned mandatoryReferrals pending step', () => {
+    const f = fixture();
+    f.put({ ...f.unfinished,
+      pending: { kind: 'effect', step: 'mandatoryReferrals', stepIndex: 1, count: 1 },
+      effects: [{ ...f.unfinished.effects[0], type: 'review.mandatory-referrals', status: 'pending' }] }, 70 * 60_000);
+    expect(f.readWitness().newest).toEqual(f.decided);
+    expect(f.plan()).toMatchObject({ mode: 'fresh', abandon: true });
+    expect(evidence.readDrainRedTeamEvidence(f.witnessOptions)).toMatchObject({ ok: false, reason: 'review-unfinished' });
+  });
+
+  it.each(['missing writer read', 'missing effect read', 'different head', 'another open step', 'label effect'])
+  ('holds the referral recovery with %s', kind => {
+    const f = fixture();
+    const run = structuredClone(f.unfinished);
+    if (kind === 'missing writer read') {
+      const writer = JSON.parse(fs.readFileSync(f.writerPath, 'utf8'));
+      delete writer.loopPayload;
+      writeFileSync(f.writerPath, JSON.stringify(writer));
+    }
+    if (kind === 'missing effect read') delete run.effects[0].payload.read;
+    if (kind === 'different head') run.effects[0].payload.read.netBasis.rev = 'b'.repeat(40);
+    if (kind === 'another open step') run.pending = { kind: 'effect', step: 'label', stepIndex: 2, count: 1 };
+    if (kind === 'label effect') run.effects.push({ key: `${run.id}:2:0`, type: 'label', stepIndex: 2, index: 0, status: 'pending' });
+    f.put(run, 70 * 60_000);
+    expect(f.readWitness()).toMatchObject({ ok: false, reason: 'review-unfinished' });
+    expect(f.plan().mode).toBe('skip');
+  });
+
+  it.each(['rejection', 'pending label', 'resumed', 'unreadable record', 'unreadable mtime'])
+  ('holds an older %s beyond the successful bounded scan', kind => {
+    const f = fixture();
+    const hour = evidence.ABANDONED_REVIEW_AFTER_MS;
+    const older = { ...f.decided, id: 'review-pr-6378-hidden-blocker',
+      stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(f.now - 9 * hour).toISOString() }] };
+    if (kind === 'rejection') older.verdict = { verdict: 'changes' };
+    if (kind === 'pending label') older.effects = [{ key: `${older.id}:1:0`, type: 'label', stepIndex: 1, index: 0, status: 'pending' }];
+    if (kind === 'resumed') older.resumedAt = f.now - 8 * hour;
+    const path = f.put(older, 7 * hour);
+    if (kind === 'unreadable record') {
+      writeFileSync(path, '{');
+      fs.utimesSync(path, new Date(f.now - 7 * hour), new Date(f.now - 7 * hour));
+    }
+    if (kind === 'unreadable mtime') {
+      let reads = 0;
+      f.witnessOptions.stat = p => p === path && ++reads % 2 === 0 ? { mtimeMs: NaN } : fs.statSync(p);
+    }
+    expect(f.readWitness()).toMatchObject({ ok: false, reason: 'review-unfinished' });
+    expect(f.plan().mode).toBe('skip');
   });
 
   it('holds a slow live owner with matching pidStart instead of recovering it twice', () => {
