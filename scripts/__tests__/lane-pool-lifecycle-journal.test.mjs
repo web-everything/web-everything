@@ -12,7 +12,7 @@
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, chmodSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -47,6 +47,24 @@ const reaperRelease = (lane, reason) => releaseLane(POOL, lane, {
 /** Keep work unpushed through release, which now tries to salvage before dropping the lease. */
 function rejectSalvagePush() {
   writeFileSync(join(originDir, 'hooks', 'pre-receive'), '#!/bin/sh\necho rejected > "$LANE_POOL_ROOT/salvage-rejected"\nexit 1\n', { mode: 0o755 });
+}
+
+/** Reaper release must keep unpreserved work; only an explicit operator discard sets up reclaim. */
+function discardAfterRefusedReaperRelease(lane, sha) {
+  const marker = join(lanePath(lane), '.git', '.lane-lease');
+  const lease = readFileSync(marker, 'utf8');
+  expect(() => reaperRelease(lane, 'ttl-stale')).toThrow(/UNPUSHED_WORK/);
+  expect(readFileSync(marker, 'utf8')).toBe(lease);
+  expect(git(['rev-parse', 'HEAD'], lanePath(lane))).toBe(sha);
+  expect(readLaneJournal(join(poolRoot, POOL), { lane }).some(e => e.action === 'release')).toBe(false);
+
+  const released = runPool(['release', `--lane=${lane}`, '--session=s', '--discard', '--json', ...poolArgs()]);
+  expect(released.code, released.err).toBe(0);
+  expect(JSON.parse(released.out).released).toBe(1);
+  expect(released.err).toMatch(/WARNING.*--discard/);
+  expect(released.err).toContain(sha.slice(0, 12));
+  expect(existsSync(marker)).toBe(false);
+  expect(git(['rev-parse', 'HEAD'], lanePath(lane))).toBe(sha);
 }
 
 /** The health watch's real `defaultReclaimLane`; the exec wrapper only adds this fixture's pool args + env
@@ -191,7 +209,7 @@ describe('lane lifecycle journal — acquire → reaper release → health-watch
     commit(lanePath(1), 'local only');
     const localSha = git(['rev-parse', 'HEAD'], lanePath(1));
     rejectSalvagePush();
-    reaperRelease(1, 'ttl-stale');
+    discardAfterRefusedReaperRelease(1, localSha);
     expect(existsSync(join(poolRoot, 'salvage-rejected'))).toBe(true);
     expect(git(['rev-list', 'origin/main..HEAD'], lanePath(1))).toBe(localSha);
     expect(git(['ls-remote', '--heads', originDir, 'refs/heads/salvage/*'], referenceDir)).toBe('');
@@ -213,7 +231,7 @@ describe('lane lifecycle journal — acquire → reaper release → health-watch
     commit(lanePath(2), 'local only');
     const localSha = git(['rev-parse', 'HEAD'], lanePath(2));
     rejectSalvagePush();
-    reaperRelease(2, 'ttl-stale');
+    discardAfterRefusedReaperRelease(2, localSha);
     expect(existsSync(join(poolRoot, 'salvage-rejected'))).toBe(true);
     expect(git(['rev-list', 'origin/main..HEAD'], lanePath(2))).toBe(localSha);
     expect(git(['ls-remote', '--heads', originDir, 'refs/heads/salvage/*'], referenceDir)).toBe('');

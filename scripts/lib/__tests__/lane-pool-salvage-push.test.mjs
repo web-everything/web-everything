@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { LANE_GIT_CONFIG_PINS } from '../lane-git-hardening.mjs';
 
@@ -63,7 +63,7 @@ describe('salvage push contract', () => {
 
   it('pushes HEAD rather than only the unmatched ancestor, with exactly three arguments and no force option', async () => {
     const h = harness();
-    expect(await h.run()).toMatchObject({ status: 'pushed', ref, unmatched: [older] });
+    expect(await h.run()).toMatchObject({ status: 'pushed', ref, sha: head, unmatched: [older] });
     expect(h.io.push.mock.calls).toEqual([[laneDir, ref, head]]);
     expect(h.io.push.mock.calls.flat().some(arg => /force|^\+|^-f$/.test(String(arg)))).toBe(false);
   });
@@ -131,7 +131,7 @@ describe('salvage push contract', () => {
     expect(h.io.record).toHaveBeenCalledTimes(1); expect(h.io.record).toHaveBeenCalledWith(7, `${ref} ${head}\n`);
     expect(settled).toBe(false);
     finishRecord();
-    expect(await pending).toMatchObject({ status: 'pushed', ref, unmatched: [older] });
+    expect(await pending).toMatchObject({ status: 'pushed', ref, sha: head, unmatched: [older] });
     expect(settled).toBe(true);
   });
 
@@ -155,6 +155,101 @@ describe('salvage push contract', () => {
   it('exports realSalvageIo with the five IO functions', () => {
     const io = realSalvageIo({ repo: { name: 'fixture', poolDir: 'pool', referencePath: 'reference', originUrl: 'origin.git', branch: 'main' }, backupRoot: 'backups' });
     for (const method of ['aheadShas', 'unmatchedShas', 'push', 'remoteSha', 'record']) expect(io[method]).toBeTypeOf('function');
+  });
+});
+
+describe('remoteHeads (the release proof) reads the canonical origin from the primary checkout', () => {
+  const setup = () => {
+    const dir = mkdtempSync(join(tmpdir(), 'salvage-heads-'));
+    const origin = join(dir, 'origin.git'), primary = join(dir, 'primary');
+    execFileSync('git', ['init', '--bare', '-q', '-b', 'main', origin]);
+    execFileSync('git', ['clone', '-q', origin, primary], { stdio: 'ignore' });
+    execFileSync('git', ['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.test', 'commit', '-q', '--allow-empty', '-m', 'base'], { cwd: primary });
+    execFileSync('git', ['push', '-q', 'origin', 'HEAD:refs/heads/main', 'HEAD:refs/heads/ops/ledger'], { cwd: primary });
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: primary, encoding: 'utf8' }).trim();
+    const io = realSalvageIo({ repo: { branch: 'main', originUrl: origin, referencePath: primary, primaryPath: primary }, backupRoot: join(dir, 'backups') });
+    return { dir, primary, sha, io };
+  };
+  // PR #6319 send-back: the auth exemption follows a VALIDATED primary (resolveRepo's primaryPath), never the
+  // invoking checkout. A release run inside a lane keeps that lane as referencePath: without a validated primary its
+  // credential helper refuses; with one, the listing runs in the primary and the lane's config is never consulted.
+  // `hook.<name>.command`: a config-defined hook runs during a transport even with the core.hooksPath pin (git 2.54).
+  it.each(['credential.helper', 'http.extraHeader', 'core.askPass', 'hook.lanehook.command'])('refuses %s in a referencePath that is not the validated primary', key => {
+    const { dir, primary, sha } = setup();
+    try {
+      const lane = join(dir, 'lane-1');
+      execFileSync('git', ['clone', '-q', join(dir, 'origin.git'), lane], { stdio: 'ignore' });
+      execFileSync('git', ['config', key, '!touch marker'], { cwd: lane });
+      const unvalidated = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: lane }, backupRoot: join(dir, 'backups') });
+      expect(() => unvalidated.remoteHeads()).toThrow(/lane-controlled transport/);
+      // The salvage ref check is the same canonical-origin listing: same cwd rule, same refusal.
+      expect(() => unvalidated.remoteSha('main')).toThrow(/lane-controlled transport/);
+      const runGit = vi.fn(execFileSync);
+      const validated = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: lane, primaryPath: primary }, backupRoot: join(dir, 'backups'), runGit });
+      expect(validated.remoteHeads()).toEqual([sha]);
+      expect(validated.remoteSha('main')).toBe(sha);
+      expect(runGit.mock.calls.filter(([, args]) => args.includes('ls-remote'))).toHaveLength(2);
+      expect(runGit.mock.calls.every(([, , options]) => options.cwd === primary)).toBe(true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('pins every transport to no credential helper, no askpass, no inherited ssh command and no terminal prompt', () => {
+    const { dir, primary } = setup();
+    try {
+      // A caller inside a lane controls its own env: an inherited askpass program must not reach the transport.
+      vi.stubEnv('GIT_ASKPASS', join(dir, 'lane-askpass'));
+      vi.stubEnv('SSH_ASKPASS', join(dir, 'lane-ssh-askpass'));
+      vi.stubEnv('GIT_SSH_COMMAND', join(dir, 'lane-ssh'));
+      vi.stubEnv('GIT_SSH', join(dir, 'lane-ssh'));
+      const runGit = vi.fn(execFileSync);
+      const io = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: primary, primaryPath: primary }, backupRoot: join(dir, 'backups'), runGit });
+      io.remoteHeads();
+      const listing = runGit.mock.calls.find(([, args]) => args.includes('ls-remote'));
+      const { env } = listing[2];
+      const pins = Object.fromEntries(Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) => [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]));
+      expect(pins).toMatchObject({ 'credential.helper': '', 'core.askPass': '' });
+      expect(env.GIT_TERMINAL_PROMPT).toBe('0');
+      expect(env).not.toHaveProperty('GIT_ASKPASS');
+      expect(env).not.toHaveProperty('SSH_ASKPASS');
+      expect(env).not.toHaveProperty('GIT_SSH_COMMAND');
+      expect(env).not.toHaveProperty('GIT_SSH');
+      expect(pins['core.sshCommand']).toBe('ssh');
+    } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('accepts operator auth/signing keys in the primary and excludes ops/* heads', () => {
+    const { dir, primary, sha, io } = setup();
+    try {
+      // An agent-writable lane may not carry these; the operator's primary legitimately can.
+      execFileSync('git', ['config', 'commit.gpgSign', 'false'], { cwd: primary });
+      execFileSync('git', ['config', 'credential.helper', 'store'], { cwd: primary });
+      expect(io.remoteHeads()).toEqual([sha]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  // The primary is the operator's own checkout: an upstream or fork remote there is normal, and the transport names
+  // the canonical origin URL explicitly, so a remote under any other name cannot redirect it.
+  it('accepts ordinary non-origin remotes (upstream, fork) in the primary for the release proof', () => {
+    const { dir, primary, sha, io } = setup();
+    try {
+      execFileSync('git', ['remote', 'add', 'upstream', 'https://example.invalid/upstream/repo.git'], { cwd: primary });
+      execFileSync('git', ['remote', 'add', 'fork', join(dir, 'fork.git')], { cwd: primary });
+      execFileSync('git', ['config', 'remote.fork.pushurl', 'https://example.invalid/fork/repo.git'], { cwd: primary });
+      expect(io.remoteHeads()).toEqual([sha]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  // A remote NAMED like the canonical origin is what git resolves the explicit URL argument to: that stays refused.
+  it.each(['url', 'pushurl', 'uploadpack'])('still refuses a primary remote aliasing the canonical origin (%s)', key => {
+    const { dir, primary, io } = setup();
+    try {
+      execFileSync('git', ['config', `remote.${join(dir, 'origin.git')}.${key}`, join(dir, 'decoy.git')], { cwd: primary });
+      expect(() => io.remoteHeads()).toThrow(/lane-controlled transport/);
+      expect(() => io.remoteSha('main')).toThrow(/lane-controlled transport/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('still refuses a URL rewrite in the primary', () => {
+    const { dir, primary, io } = setup();
+    try {
+      execFileSync('git', ['config', 'url.https://example.invalid/.insteadOf', '/'], { cwd: primary });
+      expect(() => io.remoteHeads()).toThrow(/URL rewriting/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
 
@@ -465,16 +560,116 @@ describe('real salvage preservation and transport', () => {
     expect(runGit.mock.calls.some(([, args]) => args.includes('push'))).toBe(false);
   });
 
-  function realHarness({ cherry = `+ ${head}\n+ ${older}`, contains = '', fail } = {}) {
+  const SYMREF_LISTING = '--format=%(refname)%00%(symref)';
+  const containsCalls = runGit => runGit.mock.calls.filter(([, args]) => args.includes('for-each-ref') && args.includes('--contains'));
+  // A git dir that does not exist: no ref directory on the fetch paths is present, so none is a symlink.
+  const NO_GIT_DIR = resolve(tmpdir(), 'salvage-push-no-such-git-dir');
+  function realHarness({ cherry = `+ ${head}\n+ ${older}`, contains = '', symrefs = 'refs/remotes/origin/HEAD\0refs/remotes/origin/main\nrefs/remotes/origin/main\0', verifyRefs = '', gitDir = NO_GIT_DIR, fail } = {}) {
     const runGit = vi.fn((_command, args) => {
       if (fail && args.includes(fail)) throw new Error(`${fail} unavailable`);
       if (args.includes('rev-list')) return `${head}\n${older}`;
       if (args.includes('cherry')) return cherry;
+      if (args.includes(SYMREF_LISTING)) return symrefs;
+      if (args.includes('--git-common-dir')) return gitDir;
+      if (args.includes('for-each-ref') && args.some(arg => arg.startsWith('refs/release-verify/'))) return verifyRefs;
       if (args.includes('for-each-ref')) return contains;
       return '';
     });
     return { runGit, io: realSalvageIo({ repo, runGit }) };
   }
+
+  // PR #6319 send-back (R639): a fetch writes THROUGH a symbolic ref, so a lane-made tracking symref aimed at a local
+  // branch would reset that branch. Every transport fetch refuses one before running; the ordinary origin/HEAD alias passes.
+  it.each([
+    ['refs/remotes/origin/main\0refs/heads/work/keep', 'refs/remotes/origin/main'],
+    ['refs/remotes/origin/HEAD\0refs/heads/work/keep', 'refs/remotes/origin/HEAD'],
+    ['refs/remotes/origin/HEAD\0refs/remotes/origin/HEAD', 'refs/remotes/origin/HEAD'],
+    ['refs/remotes/origin/x\0refs/remotes/origin/main', 'refs/remotes/origin/x'],
+  ])('refuses every fetch, before fetching, when the lane has the tracking symref %j', (symrefs, name) => {
+    const { io, runGit } = realHarness({ symrefs });
+    for (const operation of [() => io.fetchHeads(laneDir), () => io.fetchVerifyObjects(laneDir), () => io.unmatchedShas(laneDir, [head])]) {
+      expect(operation).toThrow(new RegExp(`${name.replaceAll('/', '\\/')} is a symbolic ref`));
+    }
+    expect(runGit.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
+  });
+  // A filesystem symlink on a fetch's write path redirects it without any symbolic ref showing (PR #6319 self-review).
+  it.each([
+    ['refs/remotes/origin', 'dir'], ['refs/remotes', 'dir'], ['refs/remotes/origin/work', 'dir'], ['refs/remotes/origin/main', 'file'],
+    ['refs/release-verify', 'dir'], ['logs/refs/remotes/origin/main', 'file'], ['logs/refs/release-verify', 'dir'], ['logs/refs', 'dir'],
+  ])('refuses every fetch, before fetching, when %s is a filesystem symlink (%s)', (link, kind) => {
+    const gitDir = mkdtempSync(join(tmpdir(), 'salvage-symlink-'));
+    try {
+      mkdirSync(join(gitDir, 'refs', 'remotes', 'origin'), { recursive: true });
+      mkdirSync(join(gitDir, 'refs', 'heads'), { recursive: true });
+      const target = join(gitDir, 'elsewhere');
+      if (kind === 'dir') mkdirSync(target); else writeFileSync(target, `${head}\n`);
+      rmSync(join(gitDir, link), { recursive: true, force: true });
+      mkdirSync(join(gitDir, link, '..'), { recursive: true });
+      symlinkSync(target, join(gitDir, link));
+      const { io, runGit } = realHarness({ gitDir, symrefs: '' });
+      for (const operation of [() => io.fetchHeads(laneDir), () => io.fetchVerifyObjects(laneDir), () => io.unmatchedShas(laneDir, [head])]) {
+        expect(operation).toThrow(`${link} is a filesystem symlink`);
+      }
+      expect(runGit.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
+    } finally { rmSync(gitDir, { recursive: true, force: true }); }
+  });
+  it('allows real ref directories and refuses an unreadable or relative git dir', () => {
+    const gitDir = mkdtempSync(join(tmpdir(), 'salvage-real-'));
+    try {
+      mkdirSync(join(gitDir, 'refs', 'remotes', 'origin', 'work'), { recursive: true });
+      mkdirSync(join(gitDir, 'logs', 'refs', 'release-verify'), { recursive: true });
+      writeFileSync(join(gitDir, 'refs', 'remotes', 'origin', 'work', 'x'), `${head}\n`);
+      const { io, runGit } = realHarness({ gitDir, symrefs: '' });
+      io.fetchHeads(laneDir);
+      // The salvage fetch writes no FETCH_HEAD and runs no lane-configured maintenance (reflog expiry, gc, pack-refs).
+      const fetchArgs = runGit.mock.calls.find(([, args]) => args.includes('fetch'))[1];
+      expect(fetchArgs).toEqual(expect.arrayContaining(['--no-write-fetch-head', '--no-auto-maintenance', '--recurse-submodules=no']));
+    } finally { rmSync(gitDir, { recursive: true, force: true }); }
+    const relative = realHarness({ gitDir: '.git', symrefs: '' });
+    expect(() => relative.io.fetchHeads(laneDir)).toThrow(/unreadable lane git dir/);
+    expect(relative.runGit.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
+  });
+  it.each(['unreadable', 'malformed'])('refuses every fetch when the tracking symref listing is %s', failure => {
+    const { io, runGit } = failure === 'unreadable' ? realHarness({ fail: SYMREF_LISTING })
+      : realHarness({ symrefs: 'refs/remotes/origin/main\0refs/heads/a\0extra' });
+    expect(() => io.fetchHeads(laneDir)).toThrow();
+    expect(() => io.fetchVerifyObjects(laneDir)).toThrow();
+    expect(runGit.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
+  });
+  it('fetchVerifyObjects fetches into a fresh private namespace with no FETCH_HEAD and deletes it without dereferencing', () => {
+    let fetched = null;
+    const runGit = vi.fn((_command, args, options) => {
+      if (args.includes(SYMREF_LISTING)) return '';
+      if (args.includes('--git-common-dir')) return NO_GIT_DIR;
+      if (args.includes('fetch')) { fetched = args.find(arg => arg.startsWith('+refs/heads/*:')).split(':')[1].replace(/\/\*$/, ''); return ''; }
+      if (args.includes('for-each-ref')) return fetched ? `${fetched}/main\n${fetched}/work/x` : '';
+      if (args.includes('update-ref')) { expect(options.input).toBe(`option no-deref\ndelete ${fetched}/main\noption no-deref\ndelete ${fetched}/work/x\n`); }
+      return '';
+    });
+    const io = realSalvageIo({ repo, runGit });
+    io.fetchVerifyObjects(laneDir);
+    expect(fetched).toMatch(/^refs\/release-verify\/[a-f0-9]{16}$/);
+    const fetchArgs = runGit.mock.calls.find(([, args]) => args.includes('fetch'))[1];
+    expect(fetchArgs).toEqual(expect.arrayContaining(['--no-write-fetch-head', '--no-auto-maintenance', '--no-tags', repo.originUrl, `+refs/heads/*:${fetched}/*`, '^refs/heads/ops/*']));
+    expect(fetchArgs).not.toContain('--prune');
+    expect(fetchArgs.some(arg => arg.includes('refs/remotes/'))).toBe(false);
+    expect(runGit.mock.calls.filter(([, args]) => args.includes('update-ref'))).toHaveLength(1);
+  });
+  it('fetchVerifyObjects deletes its namespace even when the fetch fails, and refuses an occupied namespace', () => {
+    let fetched = null;
+    const runGit = vi.fn((_command, args) => {
+      if (args.includes(SYMREF_LISTING)) return '';
+      if (args.includes('--git-common-dir')) return NO_GIT_DIR;
+      if (args.includes('fetch')) { fetched = args.find(arg => arg.startsWith('+refs/heads/*:')).split(':')[1].replace(/\/\*$/, ''); throw new Error('fetch died'); }
+      if (args.includes('for-each-ref')) return fetched ? `${fetched}/main` : '';
+      return '';
+    });
+    expect(() => realSalvageIo({ repo, runGit }).fetchVerifyObjects(laneDir)).toThrow('fetch died');
+    expect(runGit.mock.calls.filter(([, args]) => args.includes('update-ref'))).toHaveLength(1);
+    const { io, runGit: occupied } = realHarness({ verifyRefs: 'refs/release-verify/x/main' });
+    expect(() => io.fetchVerifyObjects(laneDir)).toThrow(/already holds refs/);
+    expect(occupied.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
+  });
 
   it('fetches pruned branch refs and pushes/verifies against the explicit canonical URL with transport pins and hardened env', () => {
     const { io, runGit } = realHarness();
@@ -502,8 +697,10 @@ describe('real salvage preservation and transport', () => {
     expect(fetchArgs).toEqual(expect.arrayContaining(['--recurse-submodules=no', '--prune', '--no-tags', '+refs/heads/*:refs/remotes/origin/*', '^refs/heads/ops/*']));
     const pushArgs = runGit.mock.calls.find(([, args]) => args.includes('push'))[1];
     expect(pushArgs.slice(pushArgs.indexOf('push'))).toEqual(['push', '--recurse-submodules=no', repo.originUrl, `${head}:refs/heads/${ref}`]);
+    expect(runGit.mock.calls.findIndex(([, args]) => args.includes(SYMREF_LISTING)))
+      .toBeLessThan(runGit.mock.calls.findIndex(([, args]) => args.includes('fetch')));
     expect(runGit.mock.calls.findIndex(([, args]) => args.includes('fetch')))
-      .toBeLessThan(runGit.mock.calls.findIndex(([, args]) => args.includes('for-each-ref')));
+      .toBeLessThan(runGit.mock.calls.findIndex(([, args]) => args.includes('--contains')));
   });
 
   it('uses one integration-branch patch check and exact-SHA reachability without enumerating or capping remote refs', () => {
@@ -511,15 +708,16 @@ describe('real salvage preservation and transport', () => {
     expect(io.unmatchedShas(laneDir, [head, older])).toEqual([older]);
     expect(runGit.mock.calls.filter(([, args]) => args.includes('cherry')).map(([, args]) => args))
       .toEqual([['cherry', 'origin/main', 'HEAD']]);
-    expect(runGit.mock.calls.filter(([, args]) => args.includes('for-each-ref')).map(([, args]) => args))
+    expect(containsCalls(runGit).map(([, args]) => args))
       .toEqual([['for-each-ref', '--exclude=refs/remotes/origin/ops/*', '--contains', older, '--format=%(refname)\t%(symref)', 'refs/remotes/origin']]);
+    expect(runGit.mock.calls.filter(([, args]) => args.includes(SYMREF_LISTING))).toHaveLength(1);
   });
 
   it('returns matched without pushing when the exact SHAs are reachable from remote branches', async () => {
     const { io, runGit } = realHarness({ contains: 'refs/remotes/origin/work/published' });
     expect(await salvagePushLane({ lane: 7, laneDir, io })).toMatchObject({ status: 'matched', unmatched: [] });
     expect(runGit.mock.calls.some(([, args]) => args.includes('push'))).toBe(false);
-    expect(runGit.mock.calls.filter(([, args]) => args.includes('for-each-ref'))).toHaveLength(2);
+    expect(containsCalls(runGit)).toHaveLength(2);
   });
 
   it('does not accept a symbolic ref (such as one aimed at origin/ops) as reachability evidence', async () => {
