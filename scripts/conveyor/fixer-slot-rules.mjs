@@ -117,6 +117,14 @@ export function slotCountedItems({ items, cap, parkedReleasesSlot, parkedCapFact
   return [...working, ...parked].slice(0, n).map((x) => x.item);
 }
 
+/** Classify only the two phase-A waits the pass cannot wake. Other waits retain admission. */
+export function classifyUnwakeableWait(row) {
+  if (row?.action !== 'wait') return null;
+  if (row.reason === 'previous-head CI repair must be verified and re-marked') return 'delivered-previous-ci';
+  if (typeof row.result === 'string' && row.result.startsWith('resume-exhausted')) return 'resume-exhausted';
+  return null;
+}
+
 export const STALE_HEAD_GRACE_MS = 60_000;
 
 /** Stale owed keys. PR facts are a Map keyed by record key; unknown facts retain the record.

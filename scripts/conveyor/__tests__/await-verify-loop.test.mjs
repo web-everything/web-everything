@@ -70,6 +70,27 @@ const green = { sha: SHA, status: 'green', startedAt: new Date(T0).toISOString()
 const running = { ...green, status: 'running', exitCode: null };
 
 describe('runSlotAwareAwaitPass — the real pass, R3-gated', () => {
+  it('classifies only delivered-previous-ci and resume-exhausted waits, preserving unrelated waits and non-wait actions', async () => {
+    const { classifyUnwakeableWait } = await import('../fixer-slot-rules.mjs');
+    const delivered = { reason: 'previous-head CI repair must be verified and re-marked' };
+    const exhausted = { result: 'resume-exhausted; previous-head CI failures retained; operator recovery required' };
+    expect(classifyUnwakeableWait({ action: 'wait', ...delivered })).toBe('delivered-previous-ci');
+    expect(classifyUnwakeableWait({ action: 'wait', ...exhausted })).toBe('resume-exhausted');
+    for (const reason of ['verify still running', 'red-load-deferred', 'persist-failed', 'infra retry']) {
+      expect(classifyUnwakeableWait({ action: 'wait', reason })).toBeNull();
+    }
+    for (const result of ['resume-paused', 'resume-retry', 'retry: resume-exhausted', '', null, 0]) {
+      expect(classifyUnwakeableWait({ action: 'wait', result })).toBeNull();
+    }
+    for (const action of ['resume', 'push', 'skip', 'error', undefined]) {
+      expect(classifyUnwakeableWait({ action, ...delivered })).toBeNull();
+      expect(classifyUnwakeableWait({ action, ...exhausted })).toBeNull();
+    }
+    expect(classifyUnwakeableWait({ action: 'wait' })).toBeNull();
+    expect(classifyUnwakeableWait(null)).toBeNull();
+    expect(classifyUnwakeableWait(undefined)).toBeNull();
+  });
+
   const repair = (pr, over = {}) => rec(pr, {
     requestedAt: new Date(T0 - 60_000).toISOString(),
     previousCi: { ready: { ciFailures: [{ name: 'unit', conclusion: 'failure' }] } },
