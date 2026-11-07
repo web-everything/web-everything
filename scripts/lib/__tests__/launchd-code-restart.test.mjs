@@ -379,11 +379,17 @@ describe('launchd clone restart', () => {
     const o = fixture(); let finish, markLaunched;
     const launched = new Promise(resolve => { markLaunched = resolve; });
     o.launchctl.mockImplementation(() => new Promise(resolve => { finish = resolve; markLaunched(); }));
+    // Start the second call only once the first is provably in flight (launchctl pending). Racing two
+    // un-awaited calls is load-dependent: if the awaited call wins, it deadlocks on a launchctl that is only
+    // released afterwards, and the module-level in-flight label stays claimed, failing every later test that
+    // shares the label.
     const first = restartServicesForClone(o);
-    // The helper may asynchronously inspect several host resources before launchctl.
-    const second = await restartServicesForClone(o);
-    expect(second.skipped[0].reason).toBe('restart-in-flight');
-    await launched; finish({ status: 0 }); await first; expect(o.launchctl).toHaveBeenCalledTimes(1);
+    try {
+      await launched;
+      const second = await restartServicesForClone(o);
+      expect(second.skipped[0].reason).toBe('restart-in-flight');
+    } finally { finish?.({ status: 0 }); }
+    await first; expect(o.launchctl).toHaveBeenCalledTimes(1);
   });
   it.each(['busy', 'error', 'unknown'])('restart lock acquisition fails closed with operator fallback: %s', async mode => {
     const o = fixture(), get = vi.spyOn(o.stateStore, 'get');
