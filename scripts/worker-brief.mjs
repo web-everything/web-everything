@@ -170,7 +170,12 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
    retain the lane and scope (keep renewing leases), and recover observation of the same verification.
    Do not release either resource or end the turn until verification is confirmed terminal;
    if observation cannot recover, escalate for supervised termination before cleanup. Open a PR only after green;
-   never end the turn while a task is running. Then open exactly one PR:
+   never end the turn while a task is running.
+   6a. **Codex audit.** After verify is green and before open-pr, commit, then run the repo's Codex audit on the net diff:
+   \`node scripts/operations/codex-audit.mjs --base=origin/main --head=<40-hex sha of your lane HEAD>\`.
+   Open the PR only on the verdict NOT WEAKENED. On WEAKENED: fix the findings, re-test, and re-audit, at most 2 repair rounds.
+   Then open the PR with the remaining findings noted in its body. Include the verdict in your report.
+   Then open exactly one PR:
    \`node scripts/operations/run.mjs open-pr --ref=lane/${purpose} --title="<title>" --bodyFile=${scratchDir}/body.md --json\`.
    If open-pr is refused by the PR limit, stop and report — never run pr-limit allow yourself.
 7. **Pre-push recheck.** Right before open-pr, re-run the free-scope check excluding yourself:
