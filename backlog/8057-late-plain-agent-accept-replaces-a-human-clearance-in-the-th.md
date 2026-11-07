@@ -1,15 +1,16 @@
 ---
+bornAs: x20io4r
 kind: story
-size: 5
+size: 3
 status: open
-scope: ["we:scripts/lib/round-judge.mjs", "we:scripts/conveyor/round-extension-mark.mjs", "we:scripts/conveyor/pr-stall-classify.mjs", "we:scripts/conveyor/pr-stall-sweep.mjs", "we:scripts/operations/extend-rounds.mjs"]
+scope: ["we:scripts/conveyor/human-surface-repark.mjs", "we:scripts/lib/review-escalation.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Round-judge grant count excludes standing-ruling (automation) grants, extend-rounds counts them
+# Late plain agent accept replaces a human clearance in the thread while labels still say cleared
 
-Flow-sim gap C-G11, class K9 (divergent predicates for one state). Failing input: PR has operator grants plus automation-authored standing-ruling grants (we:round-extension-mark.mjs:83 automation path, counted by countStandingRulingGrantRecords).' 'E15/E16 round cap reached, judge runs Cited: we:scripts/lib/round-judge.mjs:243, we:scripts/conveyor/round-extension-mark.mjs:83, we:scripts/conveyor/pr-stall-classify.mjs:287, we:scripts/conveyor/pr-stall-sweep.mjs:262, we:scripts/operations/extend-rounds.mjs:32. Soak-break sketch: review-live-round-cap-accounting (different: review job capacity; fixPresent true, we:skills-src/conveyor/review-daemon.mjs contains remainingReviewCapacity and jobAncestorOf)
+Flow-sim gap C-G9, class K9 (divergent predicates for one state). Failing input: Operator ran clear-human at head H (labels: review:accepted, review:human removed). A review run that started earlier finishes afterward and posts a plain accept comment with reviewed-sha H (or the review daemon posts an advisory-fix accept).' 'E7 approve before review finishes Cited: we:scripts/conveyor/human-surface-repark.mjs:64-70, we:scripts/lib/review-escalation.mjs:2038-2061, we:scripts/lib/review-escalation.mjs:3177, we:scripts/lib/review-escalation.mjs:3178-3199. Soak-break sketch: human-surface-repark-concurrent-clearance covers the sweep-vs-clear race; fixPresent true (we:human-surface-repark.mjs:154,180,86 contain the three required strings). Not this ordering.
 
 ## Acceptance
 

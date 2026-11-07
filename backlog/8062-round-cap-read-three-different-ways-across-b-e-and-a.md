@@ -1,15 +1,16 @@
 ---
+bornAs: xqemuzc
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/conveyor/human-surface-repark.mjs", "we:scripts/lib/review-escalation.mjs"]
+scope: ["we:scripts/operations/red-team-gate-apply.mjs", "we:scripts/conveyor/reconcile-core.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Late plain agent accept replaces a human clearance in the thread while labels still say cleared
+# Round cap read three different ways across B, E and A
 
-Flow-sim gap C-G9, class K9 (divergent predicates for one state). Failing input: Operator ran clear-human at head H (labels: review:accepted, review:human removed). A review run that started earlier finishes afterward and posts a plain accept comment with reviewed-sha H (or the review daemon posts an advisory-fix accept).' 'E7 approve before review finishes Cited: we:scripts/conveyor/human-surface-repark.mjs:64-70, we:scripts/lib/review-escalation.mjs:2038-2061, we:scripts/lib/review-escalation.mjs:3177, we:scripts/lib/review-escalation.mjs:3178-3199. Soak-break sketch: human-surface-repark-concurrent-clearance covers the sweep-vs-clear race; fixPresent true (we:human-surface-repark.mjs:154,180,86 contain the three required strings). Not this ordering.
+Flow-sim gap R3-G2, class K9 (divergent predicates for one state). Failing input: PR in a send-back loop. Fix daemon cap = resolveRoundCap(env WE_REVIEW_ROUND_CAP) (RC:1566-1571, copy in we:mechanical-round-cap.mjs:470-474), mechanical rounds excluded from the cap by default (RC:2166). Red-team gate cap = fixed DEFAULT_ROUND_CAP=5 (we:jury-core.mjs:2746), round = distinct reviewed heads incl. mechanical roun… Cited: we:scripts/operations/red-team-gate-apply.mjs:138, we:scripts/conveyor/reconcile-core.mjs:1566-1571. Soak-break sketch: stuck (a: review:changes label with no actor allowed to act) or wrong-escalate (b, c: needless needs-you round-cap). Env-conditional for a/b; (c) needs no env.
 
 ## Acceptance
 

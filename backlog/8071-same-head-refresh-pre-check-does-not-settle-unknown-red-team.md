@@ -1,15 +1,16 @@
 ---
+bornAs: xvcwwbm
 kind: story
-size: 5
+size: 3
 status: open
-scope: ["we:scripts/lib/merge-queue-enqueue.mjs", "we:scripts/lib/review-escalation.mjs", "we:scripts/lib/drain-queue-safety.mjs", "we:scripts/lib/drain-merge-strategy.mjs"]
+scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lib/drain-queue-safety.mjs", "we:scripts/lib/drain-merge-strategy.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# sendBackReason omits review:held-mechanical while the merge predicate counts it as a hold
+# Same-head refresh pre-check does not settle unknown red-team evidence by comment, unlike the enqueue path
 
-Flow-sim gap D-C5, class K9 (divergent predicates for one state). Failing input: labels [ready-to-merge, review:accepted, review:held-mechanical] on the live read at enqueue (a concurrent drain parked the PR for test-gaming and its ready-to-merge strip failed best-effort, MAP:6027-6032 catch swallowed; or a person added the label)' 'label added after the pass-start classification, or while already queued Cited: we:scripts/lib/merge-queue-enqueue.mjs:292, we:scripts/lib/review-escalation.mjs:2528, we:scripts/lib/drain-queue-safety.mjs:452-455, we:scripts/lib/drain-merge-strategy.mjs:390, we:scripts/lib/drain-merge-strategy.mjs:532. Soak-break sketch: none
+Flow-sim gap R3-G1, class K9 (divergent predicates for one state). Failing input: PR ready-to-merge + review:accepted, branch behind base (needs same-head merge-queue refresh), red-team result comment for head H is posted and trusted, but the run scan reports ok:false reason 'review-unfinished' or scan-capped (the exact cases settleUnknownEvidenceByComment exists for).' 'drain tries the mq same-head refresh … Cited: we:scripts/merge-ai-prs.mjs:4835-4852, we:scripts/lib/drain-queue-safety.mjs:463-471, we:scripts/lib/drain-merge-strategy.mjs:365. Soak-break sketch: stuck: refresh returns false (allow: enqueueAllowed()===true, we:drain-queue-safety.mjs:157) every pass, so the behind-branch PR is never refreshed/enqueued even though the enqueue path itself would admit it; no timer or settler on this path.
 
 ## Acceptance
 

@@ -1,15 +1,16 @@
 ---
+bornAs: x52rloy
 kind: story
 size: 5
 status: open
-scope: ["we:scripts/conveyor/pr-status-label.mjs", "we:scripts/progress-board.mjs", "we:scripts/lib/review-escalation.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/lib/drain-merge-strategy.mjs"]
+scope: ["we:scripts/lib/round-judge.mjs", "we:scripts/conveyor/round-extension-mark.mjs", "we:scripts/conveyor/pr-stall-classify.mjs", "we:scripts/conveyor/pr-stall-sweep.mjs", "we:scripts/operations/extend-rounds.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# review:accepted + review:changes pair read three different ways
+# Round-judge grant count excludes standing-ruling (automation) grants, extend-rounds counts them
 
-Flow-sim gap D-C4, class K9 (divergent predicates for one state). Failing input: labels [ready-to-merge, review:accepted, review:changes], head H = accepted head, CI green. Producible by a human adding review:changes in the UI, a pre-#2974 leftover, or accept-carry-forward moving an accept to a new head (it recognises a later changes verdict only from comment shapes, we:accept-carry-forward.mjs:101-134, not… Cited: we:scripts/conveyor/pr-status-label.mjs:141, we:scripts/progress-board.mjs:559, we:scripts/lib/review-escalation.mjs:2531, we:scripts/merge-ai-prs.mjs:1101, we:scripts/lib/review-escalation.mjs:3073-3222. Soak-break sketch: none (approved-human-head-review-churn touches revalidateForMerge only)
+Flow-sim gap C-G11, class K9 (divergent predicates for one state). Failing input: PR has operator grants plus automation-authored standing-ruling grants (we:round-extension-mark.mjs:83 automation path, counted by countStandingRulingGrantRecords).' 'E15/E16 round cap reached, judge runs Cited: we:scripts/lib/round-judge.mjs:243, we:scripts/conveyor/round-extension-mark.mjs:83, we:scripts/conveyor/pr-stall-classify.mjs:287, we:scripts/conveyor/pr-stall-sweep.mjs:262, we:scripts/operations/extend-rounds.mjs:32. Soak-break sketch: review-live-round-cap-accounting (different: review job capacity; fixPresent true, we:skills-src/conveyor/review-daemon.mjs contains remainingReviewCapacity and jobAncestorOf)
 
 ## Acceptance
 

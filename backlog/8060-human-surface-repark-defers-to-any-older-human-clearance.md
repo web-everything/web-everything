@@ -1,15 +1,16 @@
 ---
+bornAs: xjuwpzw
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/operations/red-team-gate-apply.mjs", "we:scripts/conveyor/reconcile-core.mjs"]
+scope: ["we:scripts/conveyor/human-surface-repark.mjs", "we:scripts/lib/review-escalation.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Round cap read three different ways across B, E and A
+# Human-surface repark defers to ANY older human clearance
 
-Flow-sim gap R3-G2, class K9 (divergent predicates for one state). Failing input: PR in a send-back loop. Fix daemon cap = resolveRoundCap(env WE_REVIEW_ROUND_CAP) (RC:1566-1571, copy in we:mechanical-round-cap.mjs:470-474), mechanical rounds excluded from the cap by default (RC:2166). Red-team gate cap = fixed DEFAULT_ROUND_CAP=5 (we:jury-core.mjs:2746), round = distinct reviewed heads incl. mechanical roun… Cited: we:scripts/operations/red-team-gate-apply.mjs:138, we:scripts/conveyor/reconcile-core.mjs:1566-1571. Soak-break sketch: stuck (a: review:changes label with no actor allowed to act) or wrong-escalate (b, c: needless needs-you round-cap). Env-conditional for a/b; (c) needs no env.
+Flow-sim gap C-G13, class K9 (divergent predicates for one state). Failing input: Labels [review:accepted] (left by clear-human at head A), net files include a workflow/identity path, fixer-only push moved head to B, latest accept-shaped comment still the clear-human at A.' 'E5 approval then fixer-only push Cited: we:scripts/conveyor/human-surface-repark.mjs:64-69, we:scripts/lib/review-escalation.mjs:3101-3165, we:scripts/lib/review-escalation.mjs:3149. Soak-break sketch: approved-human-head-review-churn (fixPresent true) covers identical-rebase carry only.
 
 ## Acceptance
 

@@ -1,15 +1,16 @@
 ---
+bornAs: xnqoxtk
 kind: story
-size: 3
+size: 5
 status: open
-scope: ["we:scripts/conveyor/human-surface-repark.mjs", "we:scripts/lib/review-escalation.mjs"]
+scope: ["we:scripts/conveyor/pr-status-label.mjs", "we:scripts/progress-board.mjs", "we:scripts/lib/review-escalation.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/lib/drain-merge-strategy.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Human-surface repark defers to ANY older human clearance
+# review:accepted + review:changes pair read three different ways
 
-Flow-sim gap C-G13, class K9 (divergent predicates for one state). Failing input: Labels [review:accepted] (left by clear-human at head A), net files include a workflow/identity path, fixer-only push moved head to B, latest accept-shaped comment still the clear-human at A.' 'E5 approval then fixer-only push Cited: we:scripts/conveyor/human-surface-repark.mjs:64-69, we:scripts/lib/review-escalation.mjs:3101-3165, we:scripts/lib/review-escalation.mjs:3149. Soak-break sketch: approved-human-head-review-churn (fixPresent true) covers identical-rebase carry only.
+Flow-sim gap D-C4, class K9 (divergent predicates for one state). Failing input: labels [ready-to-merge, review:accepted, review:changes], head H = accepted head, CI green. Producible by a human adding review:changes in the UI, a pre-#2974 leftover, or accept-carry-forward moving an accept to a new head (it recognises a later changes verdict only from comment shapes, we:accept-carry-forward.mjs:101-134, not… Cited: we:scripts/conveyor/pr-status-label.mjs:141, we:scripts/progress-board.mjs:559, we:scripts/lib/review-escalation.mjs:2531, we:scripts/merge-ai-prs.mjs:1101, we:scripts/lib/review-escalation.mjs:3073-3222. Soak-break sketch: none (approved-human-head-review-churn touches revalidateForMerge only)
 
 ## Acceptance
 
