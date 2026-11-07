@@ -16,7 +16,8 @@ const LABEL = 'com.we.resource-sampler';
 const ADOPTED_SHA = 'adopted-build';
 const ADOPTED_AT = Date.parse('2026-11-05T12:00:00Z');
 
-async function replay(helper, restartOnAdoption, rebuildResult = { moved: true, adopted: true, head: ADOPTED_SHA }) {
+async function replay(helper, restartOnAdoption, rebuildResult = { moved: true, adopted: true, head: ADOPTED_SHA },
+  plist = { Label: LABEL, ProgramArguments: ['node', join(ROOT, 'fixtures', 'sampler-clone', 'sampler.mjs')] }) {
   const cloneRoot = join(ROOT, 'fixtures', 'sampler-clone');
   const kicks = [], errors = [], stateStore = new Map();
   let processStartMs = ADOPTED_AT - 2.5 * 24 * 60 * 60 * 1000;
@@ -25,7 +26,7 @@ async function replay(helper, restartOnAdoption, rebuildResult = { moved: true, 
   const io = {
     cloneRoot, agentsDir: join(ROOT, 'fixtures', 'LaunchAgents'),
     listPlists: () => ['resource-sampler.plist'],
-    readPlist: () => ({ Label: LABEL, ProgramArguments: ['node', join(cloneRoot, 'sampler.mjs')] }),
+    readPlist: () => plist,
     readProcessStartMs: () => processStartMs, readAdoptedAtMs: () => adoptedAtMs,
   };
   const inspect = () => helper ? helper.findStaleCodeServices(io)
@@ -98,26 +99,25 @@ export default {
           || after.intent?.sha !== ADOPTED_SHA) {
         violations.push({ invariant: 'restart-on-adoption', detail: 'expected exactly one kickstart with persisted adoption intent' });
       }
-      // A python service started with the operand-free -O flag must stay visible to restart and stale detection.
+      // The allowlisted sampler restarts whatever its plist command line says (a relative entry file inside a shell
+      // command once hid it from restart and stale detection); an unlisted label never does, whatever its argv says.
       if (helper) {
-        const cloneRoot = join(ROOT, 'fixtures', 'sampler-clone');
-        const seen = helper.findServicesRunningFromClone({ cloneRoot, agentsDir: join(ROOT, 'fixtures', 'LaunchAgents'),
-          listPlists: () => ['py.plist'],
-          readPlist: () => ({ Label: LABEL, ProgramArguments: ['/usr/bin/python3', '-O', join(cloneRoot, 'sampler.py')] }) });
-        if (seen.matches.length !== 1) violations.push({ invariant: 'interpreter-option', detail: 'python -O hid a clone-backed service from restart and stale detection' });
+        const shellPlist = { Label: LABEL, WorkingDirectory: join(ROOT, 'fixtures', 'sampler-clone'),
+          ProgramArguments: ['/bin/sh', '-c', 'exec node sampler.mjs'] };
+        const shell = await replay(helper, true, undefined, shellPlist);
+        if (shell.kicks.length !== 1 || shell.stale.length) violations.push({ invariant: 'allowlisted-restart', detail: 'a shell-wrapped sampler was not restarted onto the adopted build' });
+        const cloneRoot = join(ROOT, 'fixtures', 'sampler-clone'), kicks = [];
+        await helper.restartServicesForClone({ cloneRoot, agentsDir: join(ROOT, 'fixtures', 'LaunchAgents'), adoptedSha: ADOPTED_SHA,
+          listPlists: () => ['writer.plist'], platform: null, env: {}, log: () => {}, uid: () => 501, now: () => ADOPTED_AT,
+          stateStore: new Map(), lockStore: { acquire: async () => async () => {} },
+          readPlist: () => ({ Label: 'com.we.writer', ProgramArguments: ['node', join(cloneRoot, 'writer.mjs')] }),
+          launchctl: argv => { kicks.push(argv); return { status: 0 }; } });
+        if (kicks.some(argv => argv.some(a => a.includes('com.we.writer')))) violations.push({ invariant: 'unlisted-never-restarted', detail: 'a label that is not on the allowlist was restarted' });
       }
       // A recovered adoption (moved=false, adopted=true) also leaves the sampler on old code until restarted.
       const recovered = await replay(helper, true, { moved: false, adopted: true, reason: 'recovered-adopted', head: ADOPTED_SHA });
       if (recovered.kicks.length !== 1 || recovered.stale.length) {
         violations.push({ invariant: 'restart-on-recovered-adoption', detail: 'recovered adoption did not restart the sampler onto the adopted build' });
-      }
-      // A clone-backed bootstrap loaded by --require before an external entry is code the service runs.
-      if (helper) {
-        const cloneRoot = join(ROOT, 'fixtures', 'sampler-clone');
-        const seen = helper.findServicesRunningFromClone({ cloneRoot, agentsDir: join(ROOT, 'fixtures', 'LaunchAgents'),
-          listPlists: () => ['preload.plist'],
-          readPlist: () => ({ Label: LABEL, ProgramArguments: ['/usr/local/bin/node', '--require', join(cloneRoot, 'bootstrap.cjs'), '/opt/external/entry.js'] }) });
-        if (seen.matches.length !== 1) violations.push({ invariant: 'interpreter-option', detail: 'node --require hid a clone-backed bootstrap from restart and stale detection' });
       }
       log?.(`stale-code-service: without restart=${before.stale.length}, with restart=${after.stale.length}, kicks=${after.kicks.length}`);
       return { violations, report: { before, after } };

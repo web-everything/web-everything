@@ -69,7 +69,7 @@ export default {
         summary: `${flag.label ?? flag.plistPath ?? 'LaunchAgent'}: ${flag.reason}`,
         recommendation: flag.reason === 'stale-code'
           ? 'Inspect the LaunchAgent; kickstart -k the approved stateless sampler to load the adopted build.'
-          : 'Inspect and repair the unreadable plist, process evidence or rebuild state; freshness cannot be established. Escalate to the operator before restarting.',
+          : 'Inspect and repair the unreadable process evidence, restart policy or rebuild state; freshness cannot be established. Escalate to the operator before restarting.',
       })));
       for (const service of fresh) {
         const clean = { breach: false, measure: { cloneRoot, ...service }, summary: 'Service is fresh or positively not running.', recommendation: 'No restart needed.' };

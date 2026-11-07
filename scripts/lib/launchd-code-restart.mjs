@@ -1,11 +1,13 @@
-/** Restart stateless clone-backed samplers after adoption; all host IO has injectable seams. */
-import { readdirSync, realpathSync } from 'node:fs';
+/**
+ * Restart an explicit, reviewed allowlist of stateless launchd services after adoption; all host IO has
+ * injectable seams. Which services restart is decided by LABEL alone (policy `daemon.serviceRestart.allowedLabels`):
+ * a plist's command line, arguments, shell string and wrappers are never read to infer ownership.
+ */
+import { execFileSync } from 'node:child_process';
 import fsAsync from 'node:fs/promises';
 import childProcess from 'node:child_process';
-import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
-import { fileURLToPath } from 'node:url';
-import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
+import { join, resolve } from 'node:path';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { randomBytes } from 'node:crypto';
 import { lockDirFor, makeLockEntry, parseLockEntry, releaseLockDirIf } from '../readiness/file-locks.mjs';
@@ -13,10 +15,8 @@ import { probePidLiveness } from '../readiness/pid-liveness.mjs';
 import { readRebuildState } from './daemon-rebuild/state.mjs';
 
 const commandOptions = { encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024 };
-const expand = p => resolve(p === '~' ? homedir() : p.startsWith('~/') ? join(homedir(), p.slice(2)) : p);
 const message = e => String(e?.message ?? e);
 const safeLog = (log, line) => { try { (typeof log === 'function' ? log : log?.error?.bind(log))?.(line.replace(/[\x00-\x1f\x7f]/g, ' ')); } catch { /* logging cannot fail a tick */ } };
-const readHostPlist = path => JSON.parse(execFileSync('plutil', ['-convert', 'json', '-o', '-', path], commandOptions));
 const runHost = (command, argv) => new Promise((ok, fail) => childProcess.execFile(command, argv, commandOptions,
   (error, stdout, stderr) => error ? fail(error) : ok({ stdout, stderr, status: 0 })));
 const readHostPlistAsync = async path => JSON.parse((await runHost('plutil', ['-convert', 'json', '-o', '-', path])).stdout);
@@ -24,446 +24,8 @@ const launchHost = argv => runHost('launchctl', argv);
 const printHost = argv => execFileSync('launchctl', argv, commandOptions);
 const userId = () => process.getuid();
 
-// Unknown interpreter options cannot establish a script position: an option's value
-// might be a data path. Recognized options with operands consume those operands.
-// Returns { owners, unknownAt }: unknownAt is the index of an option that could not be
-// classified (it may or may not take a separate operand), or null. The caller must not
-// treat that as "not the clone" when a later argument is a clone path.
-// `cwd` is the service's explicit absolute working directory (or null): relative script
-// paths resolve against it, exactly as launchd would run them. Without one they stay
-// unproven (the service's default cwd is not this process's cwd).
-const place = (arg, cwd, exe) => isPathArg(arg) ? expand(arg)
-  : cwd && !arg.startsWith('-') && !arg.startsWith('+') && (!exe || arg.includes('/')) ? resolve(cwd, arg) : arg;
-// Command wrappers that exec their first non-option, non-assignment operand. `env` is the
-// common launchd one; the rest are the same shape. An option we cannot classify is reported
-// as unknownAt so the caller flags a following clone path instead of silently excluding it.
-const INTERPRETER = /^(?:node|nodejs|python(?:\d+(?:\.\d+)*)?|pypy\d*|bash|sh|zsh|dash|ksh|ruby|perl)$/;
-// Wrappers whose options we parse precisely, and wrappers we only know by name (their
-// options and positional operands vary too much to enumerate: `timeout 10 node x`, `sudo -u me node x`).
-const WRAPPERS = /^(?:env|nohup|exec|command|time|nice|arch|caffeinate)$/;
-const LOOSE_WRAPPERS = /^(?:taskpolicy|sudo|xcrun|timeout|gtimeout|sandbox-exec|setsid|chroot|runuser|doas|stdbuf|ionice|chrt)$/;
-const isCommand = arg => { const n = basename(arg).toLowerCase(); return INTERPRETER.test(n) || WRAPPERS.test(n) || LOOSE_WRAPPERS.test(n); };
-const MAX_WRAPPER_DEPTH = 16;
-// Shell-style split for `env -S`: whitespace separates, single quotes are literal, double quotes honour
-// \" \\ \$ \` escapes, a backslash outside quotes escapes the next character. null = unparsable.
-function shellSplit(value) {
-  const tokens = []; let cur = '', has = false, quote = null;
-  for (let i = 0; i < value.length; i += 1) {
-    const c = value[i];
-    // env -S expands ${VAR} itself; the value is unknown here, so the real program/script cannot be resolved.
-    if (c === '$' && value[i + 1] === '{' && quote !== "'") return null;
-    if (quote === "'") { if (c === "'") quote = null; else cur += c; continue; }
-    if (quote === '"') {
-      if (c === '"') quote = null;
-      else if (c === '\\' && i + 1 < value.length && '"\\$`'.includes(value[i + 1])) { cur += value[i + 1]; i += 1; }
-      else cur += c;
-      continue;
-    }
-    if (/\s/.test(c)) { if (has) { tokens.push(cur); cur = ''; has = false; } continue; }
-    if (c === "'" || c === '"') { quote = c; has = true; continue; }
-    // env -S gives \_ \c \n \t ... special meaning (separator / stop / control char): not modelled, so unsupported.
-    if (c === '\\') { if (i + 1 >= value.length || /[_cntrfv]/.test(value[i + 1])) return null; cur += value[i + 1]; i += 1; has = true; continue; }
-    cur += c; has = true;
-  }
-  if (quote) return null;
-  if (has) tokens.push(cur);
-  return tokens;
-}
-// A wrapper option we cannot classify may carry an operand, so the program position is unknown.
-// Resume at the next argument that names an interpreter or another wrapper; failing that, report
-// the option as unknown with an UNBOUNDED scan (`wide`): the 2-operand window used for interpreter
-// options assumes "option, operand, script" and would miss a script behind a wrapper's own operands.
-function unwrap(args, start, cwd, depth) {
-  if (depth > MAX_WRAPPER_DEPTH) throw new Error(`Too many nested command wrappers (more than ${MAX_WRAPPER_DEPTH}): cannot tell what the service runs`);
-  const name = basename(args[start]).toLowerCase(), loose = LOOSE_WRAPPERS.test(name);
-  const owners = [place(args[start], cwd, true)];
-  const scans = [];
-  let a = args, i = start + 1;
-  const resume = () => { const j = a.findIndex((x, k) => k > i && isCommand(x)); return j; };
-  const unknown = at => ({ owners, scans, unknownAt: at, wide: true, args: a, cwd });
-  const dir = v => cwd ? resolve(cwd, v) : isAbsolute(v) ? v : null;
-  while (i < a.length) {
-    const arg = a[i];
-    if (loose) {
-      // Options and positional operands (duration, user, profile) are not enumerable: resume at the
-      // first later argument that names an interpreter or wrapper, else scan everything after the wrapper.
-      const j = a.findIndex((x, k) => k >= i && isCommand(x));
-      // The wrapper's own first operand may itself be the program (`sudo -u me /clone/bin/sampler`,
-      // `timeout 10 /clone/bin/sampler --runner node`): a path-like operand that is not an option value
-      // is an executable candidate even when an interpreter-named word appears later as plain data.
-      // Before a later interpreter, an operand right after an option is more likely that option's value
-      // (`sandbox-exec -f profile node x`); with no interpreter at all it is the best program candidate.
-      // A dash-word before a path may be a boolean flag (`sudo -E /clone/bin/x`, `timeout --foreground`) or take
-      // this path as its value (`sandbox-exec -f profile`): we cannot tell, so such an operand is an AMBIGUOUS
-      // owner (claimed, never dropped) and the scan still resumes at the interpreter. Env assignments are not programs.
-      let program = -1;
-      const ambiguous = [];
-      for (let k = i; k < (j < 0 ? a.length : j); k += 1) {
-        const x = a[k];
-        if (x === '--' || x.startsWith('-') || x.startsWith('+') || /^[A-Za-z_]\w*=/.test(x) || !(isPathArg(x) || x.includes('/'))) continue;
-        if (j >= 0 && k > start + 1 && a[k - 1].startsWith('-') && a[k - 1] !== '--') { ambiguous.push(a[k]); continue; }
-        program = k;
-        break;
-      }
-      owners.push(...ambiguous.map(x => place(x, cwd, true)));
-      if (program >= 0) {
-        // The first path-like operand is the program; later interpreter-named words are its data.
-        // Its own arguments are unknown, so a clone path among them is flagged, never silently ignored.
-        owners.push(place(a[program], cwd, true));
-        return unknown(start + 1);
-      }
-      if (j < 0) return unknown(start + 1);
-      i = j; break;
-    }
-    if (arg === '--') { i += 1; break; }
-    if (name === 'env' && /^[A-Za-z_]\w*=/.test(arg)) {
-      // `env NODE_OPTIONS=--require …` preloads code into the node it launches, same as the plist environment.
-      const nodeOptions = /^NODE_OPTIONS=([^]*)$/.exec(arg);
-      if (nodeOptions) {
-        const preloads = shellSplit(nodeOptions[1]);
-        if (preloads === null) throw new Error('Unsupported NODE_OPTIONS string (unterminated quote or escape): cannot tell whether the service preloads code from the clone');
-        owners.push(...nodeOptionPreloads(preloads).map(v => preloadOwner(v, cwd)));
-        scans.push(...preloads.map(arg => ({ arg, cwd })));
-      }
-      i += 1; continue;
-    }
-    // env -S "prog args": one argv entry that env splits itself; expand it so the real program is seen.
-    if (name === 'env' && (/^-S./.test(arg) || arg === '-S' || arg === '--split-string' || arg.startsWith('--split-string='))) {
-      const attached = /^-S./.test(arg) ? arg.slice(2) : arg.startsWith('--split-string=') ? arg.slice(15) : null;
-      const value = attached ?? a[i + 1];
-      if (value === undefined) return unknown(i);
-      const tokens = shellSplit(value);
-      // An unparsable string (unterminated quote, trailing backslash) hides what runs: surface it, never skip it.
-      if (tokens === null) throw new Error(`Unsupported env -S string (unterminated quote or escape): cannot tell whether the service runs code from the clone`);
-      a = [...a.slice(0, i), ...tokens, ...a.slice(i + (attached === null ? 2 : 1))];
-      continue;
-    }
-    if (name === 'env' && (arg === '-u' || arg === '--unset')) { i += 2; continue; }
-    if (name === 'env' && (arg === '-C' || arg === '--chdir' || arg.startsWith('--chdir='))) {
-      const v = arg.startsWith('--chdir=') ? arg.slice(8) : a[i + 1];
-      if (v === undefined) return unknown(i);
-      cwd = dir(v);
-      i += arg.startsWith('--chdir=') ? 1 : 2; continue;
-    }
-    if (name === 'env' && /^(?:-[i0v]+|--unset=.*|--ignore-environment|--null|--debug)$/.test(arg)) { i += 1; continue; }
-    if ((name === 'nice' && (arg === '-n' || arg === '--adjustment')) || (name === 'arch' && arg === '-arch')) { i += 2; continue; }
-    if ((name === 'nice' && /^(?:-\d+|-n\d+|--adjustment=.*)$/.test(arg)) || (name === 'time' && /^-[lp]+$/.test(arg))
-      || (name === 'arch' && /^-(?:arm64e?|x86_64h?|i386|32|64)$/.test(arg))
-      || (name === 'caffeinate' && /^-[dimsu]+$/.test(arg)) || (name === 'command' && arg === '-p')) { i += 1; continue; }
-    if (arg.startsWith('-') || arg.startsWith('+')) {
-      const j = resume();
-      if (j < 0) return unknown(i);
-      i = j; break;
-    }
-    break;
-  }
-  if (i >= a.length) {
-    // A loose wrapper with no recognizable command: any later path might be the program.
-    return loose && start + 1 < a.length ? unknown(start + 1) : { owners, scans, unknownAt: null, args: a, cwd };
-  }
-  const inner = codeArguments(a, i, cwd, depth + 1);
-  return { owners: [...owners, ...inner.owners], scans: [...scans, ...(inner.scans ?? [])],
-    unknownAt: inner.unknownAt, wide: inner.wide, args: inner.args, cwd: inner.cwd };
-}
-function codeArguments(args, start = 0, cwd = null, depth = 0) {
-  const executable = args[start], name = basename(executable).toLowerCase();
-  if (WRAPPERS.test(name) || LOOSE_WRAPPERS.test(name)) {
-    const wrapped = unwrap(args, start, cwd, depth);
-    return { ...wrapped, cwd: wrapped.cwd ?? cwd };
-  }
-  const result = { owners: [place(executable, cwd, true)], unknownAt: null, cwd, args };
-  if (!INTERPRETER.test(name)) return result;
-  // In a shell `-e` is errexit (a flag), not "evaluate the next argument"; `-c` is the inline-program option.
-  const shell = /^(?:bash|sh|zsh|dash|ksh)$/.test(name), rubyPerl = /^(?:ruby|perl)$/.test(name);
-  const noScript = new Set(shell ? ['-c', '--command'] : ['-e', '--eval', '-p', '--print', '-c', '-m', '--command']);
-  // Only options that take a SEPARATE operand belong here. Python's -O/-OO are operand-free
-  // optimisation flags: listing them would swallow the script path and hide the service.
-  // Ruby/perl `-I dir` takes a directory operand (python's -I is the operand-free isolate flag).
-  const operand = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader', '--conditions', '-W', '-X',
-    ...(rubyPerl ? ['-I'] : [])]);
-  const PRELOAD = new Set(['-r', '--require', '--import', '--loader', '--experimental-loader']);
-  // Operand-free short flags (python -B -E -I -O -P -R -S -b -d -i -q -s -u -v -x; ruby/perl -w -v), alone or combined.
-  const flag = /^(?:--(?:trace-warnings|no-warnings|no-deprecation|trace-deprecation|throw-deprecation|pending-deprecation|expose-gc|use-strict|harmony|preserve-symlinks|preserve-symlinks-main|abort-on-uncaught-exception|enable-source-maps|experimental-strip-types|noprofile|norc)|-[uBbEIsSOivxdqRPw]+)$/;
-  for (let i = start + 1; i < args.length; i += 1) {
-    const arg = args[i];
-    if (arg === '--') { result.owners.push(...args.slice(i + 1, i + 2).map(a => place(a, cwd, false))); return result; }
-    // An attached `-Wvalue` / `-Xvalue` (value may contain a "c", e.g. -Wignore::DeprecationWarning) is a
-    // complete option: check it before the combined-`-c` detector below.
-    if (/^-[WX]./.test(arg) || rubyPerl && /^-I./.test(arg)) continue;
-    if (noScript.has(arg) || (shell ? /^-[A-Za-z]*c[A-Za-z]*$/ : /^-[^-]*c/).test(arg) || /^(?:--eval|--print)=/.test(arg)) return result;
-    // Preload options run the named module before the entry script, so their value is code the service
-    // executes: it is an owner (a clone-backed bootstrap makes the service clone-backed), not skipped data.
-    // Retain known preload semantics for extensionless relative module names; the
-    // structural scan below covers arbitrary flags without needing to classify them.
-    const attachedPreload = /^--(?:require|import|loader|experimental-loader)=(.+)$/.exec(arg);
-    if (attachedPreload) { result.owners.push(preloadOwner(attachedPreload[1], cwd)); continue; }
-    // `-r` takes an operand (a preload) only for node/ruby. In a shell it is the operand-free restricted-mode flag,
-    // so the following argument is the script and must stay in view; elsewhere it falls through to the flag/unknown paths.
-    if (operand.has(arg) && (arg !== '-r' || /^(?:node|nodejs|ruby)$/.test(name))) {
-      if (PRELOAD.has(arg) && args[i + 1] !== undefined) result.owners.push(preloadOwner(args[i + 1], cwd));
-      i += 1; continue;
-    }
-    if (arg.startsWith('-') || arg.startsWith('+')) {
-      // `--name=value` carries its value attached, so it can never consume the next argument
-      // (covers --max-old-space-size=N, --stack-size=N and the other V8/Node valued options).
-      // `-Wignore` / `-Xdev` carry their value attached too, so they never consume the next argument.
-      // Shell flags that take no operand (-e -u -x -eu ...); -o/-O/-c are deliberately absent.
-      if (flag.test(arg) || /^--[A-Za-z][\w-]*=/.test(arg) || shell && /^-[efhilnrstuvxBCEHPT]+$/.test(arg)) continue;
-      result.unknownAt = i;
-      return result;
-    }
-    result.owners.push(place(arg, cwd, false));
-    return result;
-  }
-  return result;
-}
-
-// A preload operand may be a file: URL (`--import file:///clone/x.mjs`); normalise it to the path it names.
-function preloadOwner(value, cwd) {
-  if (value.startsWith('file://')) { try { return fileURLToPath(value); } catch { return value; } }
-  return place(value, cwd, false);
-}
-// Extract preload operands from already split NODE_OPTIONS, retaining attached and separate forms.
-function nodeOptionPreloads(tokens) {
-  const out = [];
-  for (let i = 0; i < tokens.length; i += 1) {
-    const attached = /^--(?:require|import|loader|experimental-loader)=(.+)$/.exec(tokens[i]);
-    if (attached) out.push(attached[1]);
-    else if (/^(?:-r|--require|--import|--loader|--experimental-loader)$/.test(tokens[i]) && tokens[i + 1] !== undefined) { out.push(tokens[i + 1]); i += 1; }
-  }
-  return out;
-}
-// Ownership is deliberately independent of interpreter/wrapper option grammars. Each
-// reduction is shorter, so the set reaches a fixed point without a depth cutoff.
-function argumentPaths(arg, cwd, symlinkOnly = false) {
-  const candidates = new Set([arg]);
-  for (const value of candidates) {
-    const add = piece => { if (piece && piece !== value) candidates.add(piece); };
-    if (value.includes('=')) {
-      add(value.slice(value.indexOf('=') + 1));
-      add(value.slice(value.lastIndexOf('=') + 1));
-    }
-    if (/^-[^-]/.test(value)) add(value.slice(2));
-    const long = /^--[\w-]+([^\w-].*)$/.exec(value);
-    if (long) add(long[1]);
-    for (const piece of value.split(/[:,\s]+/)) add(piece);
-    add(value.replace(/^["']+|["']+$/g, ''));
-    if (value.startsWith('file://')) { try { add(fileURLToPath(value)); } catch { /* raw argument still checked */ } }
-  }
-  return [...new Set([...candidates].flatMap(value => {
-    // Bare pieces peeled from flags need a real canonical hop before they prove ownership.
-    // Keep them separate so a WorkingDirectory inside the clone cannot claim a bare name.
-    if (symlinkOnly) return cwd && arg.startsWith('-') && value !== arg && !/^[+-]/.test(value)
-      && !/[\s/]/.test(value) && !/\.[\w-]+$/.test(value) ? [resolve(cwd, value)] : [];
-    if (isPathArg(value)) return [expand(value)];
-    // Bare command names/options are not cwd-relative paths. A slash or filename
-    // extension supplies path evidence; a filename extension only counts when peeled off a flag (-rpre.rb).
-    if (cwd && !/^[+-]/.test(value) && !/\s/.test(value) && (value.includes('/') || (arg.startsWith('-') && value !== arg && /\.[\w-]+$/.test(value)))) return [resolve(cwd, value)];
-    return [];
-  }))];
-}
-
-const inside = (path, root) => path === root || path.startsWith(root.endsWith(sep) ? root : root + sep);
-const isPathArg = arg => isAbsolute(arg) || arg === '~' || arg.startsWith('~/');
-// Canonical form of a path that may not exist: resolve the deepest existing ancestor and
-// re-append the rest. Only "missing" errors fall through; anything else fails closed.
-const missing = e => e?.code === 'ENOENT' || e?.code === 'ENOTDIR';
-function canonicalSync(path, realpath) {
-  try { return realpath(path); }
-  catch (e) {
-    const parent = dirname(path);
-    if (!missing(e) || parent === path) { if (missing(e)) return path; throw e; }
-    return join(canonicalSync(parent, realpath), basename(path));
-  }
-}
-async function canonicalAsync(path, realpath) {
-  try { return await realpath(path); }
-  catch (e) {
-    const parent = dirname(path);
-    if (!missing(e) || parent === path) { if (missing(e)) return path; throw e; }
-    return join(await canonicalAsync(parent, realpath), basename(path));
-  }
-}
-
-// A shell-wrapped command (`sh -lc "cd x && pnpm dev"`) is ONE argument: split it on shell
-// separators and words so each command segment gets the same name/tail checks as direct argv.
-function shellSegments(args) {
-  const segments = [];
-  for (const arg of args) {
-    if (!/\s/.test(arg)) continue;
-    for (const part of arg.split(/&&|\|\||[;|&\n]/)) {
-      // Subshells, groups and command substitution glue punctuation onto words: `(cd x; npm start)`.
-      const bare = part.replace(/[(){}`]/g, ' ');
-      const tokens = shellSplit(bare) ?? bare.split(/\s+/);
-      const words = tokens.filter(Boolean);
-      if (words.length) segments.push(words);
-    }
-  }
-  return segments;
-}
-function devServer(args) {
-  return devServerTokens(args) || shellSegments(args).some(devServerTokens);
-}
-// Match `root` only at a path boundary, so `/clones/we` does not claim `/clones/we-control/x`.
-// Before: start or a non-path char (a "/" counts only as part of a leading "//", e.g. file:///root).
-// After: end, "/" or a non-path char. Every occurrence is tried.
-const PATH_CHAR = /[\w.\-]/;
-function containsPath(arg, root) {
-  const needle = root.length > 1 ? root.replace(/\/+$/, '') : root;
-  if (!needle) return false;
-  for (let at = arg.indexOf(needle); at !== -1; at = arg.indexOf(needle, at + 1)) {
-    const before = at === 0 ? '' : arg[at - 1];
-    const after = arg[at + needle.length] ?? '';
-    const beforeOk = before === '' || (!PATH_CHAR.test(before) && (before !== '/' || arg[at - 2] === '/'));
-    // After: only a real terminator (end, "/", whitespace, quote, shell/list separator) ends the root;
-    // "@", "+", "~", "%" and the like continue a sibling name (`/clones/we@2`).
-    if (beforeOk && (after === '' || after === '/' || /[\s"'`:;,&|()<>=\[\]{}]/.test(after))) return true;
-  }
-  return false;
-}
-function devServerTokens(args) {
-  const names = args.map(arg => basename(arg).toLowerCase().replace(/\.(?:[cm]?js|cmd|exe)$/, '').replace(/^npm-cli$/, 'npm'));
-  if (names.some(name => /^(?:vite|webpack-dev(?:-server)?|storybook|serve|live-server|parcel)$/.test(name))) return true;
-  return names.some((name, i) => {
-    const tail = args.slice(i + 1);
-    if (/^(?:npm|npx|yarn|pnpm|bun|next|nuxt|astro|wrangler|ng)$/.test(name)
-      && tail.some(arg => !arg.startsWith('-') && /^(?:dev|start|serve)$/.test(arg))) return true;
-    if (/^python(?:\d+(?:\.\d+)*)?$/.test(name)
-      && tail.some((arg, j) => arg === '-mhttp.server' || arg === '-m' && tail[j + 1] === 'http.server')) return true;
-    if (name === 'php' && tail.some(arg => /^-S/.test(arg))) return true;
-    if (name === 'rollup' && tail.some(arg => /^-w|^--watch(?:=|$)/.test(arg))) return true;
-    return name === 'esbuild' && tail.some(arg => /^--serve(?:=|$)/.test(arg));
-  }) || args.some(arg => /(?:^|[\s/\\])(?:vite|webpack-dev(?:-server)?)(?=\s|$)|(?:^|\s)npm\s+(?:run\s+dev|start)(?=\s|$)/i.test(arg));
-}
-
 function assertActive(signal) {
   if (signal?.aborted) throw new Error('service restart cancelled: inspect LaunchAgents before retrying');
-}
-
-// Keep every original/expanded argument and its path candidates. Interpreter parsing
-// additionally supplies known script paths and effective wrapper working directories.
-// Ownership is decided by `decide`, independently of option classification.
-function parsePlist(p, { selfLabel, plistPath }) {
-  if (!p || typeof p.Label !== 'string' || !p.Label.trim()) throw new Error('Invalid Label');
-  const hasProgram = Object.hasOwn(p, 'Program');
-  if (hasProgram && (typeof p.Program !== 'string' || !p.Program.trim())) throw new Error('Invalid Program');
-  const argv = p.ProgramArguments === undefined && hasProgram ? [p.Program] : p.ProgramArguments;
-  if (!Array.isArray(argv) || !argv.length || !argv.every(x => typeof x === 'string')) throw new Error('Invalid ProgramArguments');
-  if (p.Label === selfLabel) return null;
-  // Program is authoritative when present; argv[0] may be an arbitrary display name.
-  const args = hasProgram ? [p.Program, ...argv.slice(1)] : argv;
-  // An external interpreter can still execute a clone-backed script; parse its
-  // effective argv while keeping Program authoritative over the displayed argv[0].
-  // Only an explicit absolute/home-relative WorkingDirectory can anchor relative script paths.
-  const wd = typeof p.WorkingDirectory === 'string' && isPathArg(p.WorkingDirectory) ? expand(p.WorkingDirectory) : null;
-  const { owners, unknownAt, cwd, wide, args: effective, scans = [] } = codeArguments(args, 0, wd);
-  const nodeOptions = p.EnvironmentVariables?.NODE_OPTIONS;
-  const scanArgs = [...argv, ...args, ...effective, ...scans.map(({ arg }) => arg)];
-  if (typeof nodeOptions === 'string' && nodeOptions.trim()) {
-    const preloads = shellSplit(nodeOptions);
-    // An unparsable NODE_OPTIONS hides what node preloads: surface it, never skip it.
-    if (preloads === null) throw new Error('Unsupported NODE_OPTIONS string (unterminated quote or escape): cannot tell whether the service preloads code from the clone');
-    // Keep extensionless relative preload operands anchored as before, while the
-    // structural candidates below also inspect every flag and expanded token.
-    owners.push(...nodeOptionPreloads(preloads).map(v => preloadOwner(v, wd)));
-    scanArgs.push(nodeOptions, ...preloads);
-  }
-  // Relative candidates belong to the service's context, never this process's cwd.
-  // The policy check (dev servers) must see the EFFECTIVE argv: `env -S "node .../next dev"` is one string in
-  // the plist, so the original args alone would let a dev server through as a restartable sampler.
-  return { label: p.Label, plistPath, args: [...new Set([...args, ...effective])], scanArgs,
-    unknownOption: unknownAt === null ? null : effective[unknownAt],
-    codePaths: owners.filter(isPathArg).map(expand),
-    paths: [...new Set([...scanArgs.flatMap(arg => [...argumentPaths(arg, wd), ...argumentPaths(arg, cwd)]),
-      ...scans.flatMap(({ arg, cwd }) => argumentPaths(arg, cwd))])],
-    symlinkPaths: [...new Set([...scanArgs.flatMap(arg => [...argumentPaths(arg, wd, true), ...argumentPaths(arg, cwd, true)]),
-      ...scans.flatMap(({ arg, cwd }) => argumentPaths(arg, cwd, true))])],
-    // After an unknown interpreter option the script is the first non-option argument, or the second
-    // when that option consumed an operand; later arguments are script data, not code. After an
-    // unknown WRAPPER option the program position is unbounded, so every later path is a candidate.
-    // Relative candidates resolve only when they carry a "/" (a bare word may be a program name or operand).
-    unknownPaths: unknownAt === null ? []
-      : effective.slice(unknownAt + 1).filter(a => !a.startsWith('-') && !a.startsWith('+')).slice(0, wide ? Infinity : 2)
-        .map(a => place(a, cwd ?? wd, true)).filter(isPathArg).map(expand) };
-}
-
-// Lexical prefix OR same location after resolving symlinks/aliases (/var vs /private/var).
-function decide(parsed, { root, canonRoot, canon }) {
-  if (!parsed) return null;
-  // canon() returns null when a path cannot be resolved (permission, loop): that path is
-  // unrelated evidence we cannot link to the clone, so it does not flag the service.
-  const owned = paths => paths.some(path => inside(path, root) || (canon(path) !== null && inside(canon(path), canonRoot)));
-  const match = { label: parsed.label, plistPath: parsed.plistPath, args: parsed.args };
-  if (owned(parsed.codePaths)) return match;
-  if (parsed.scanArgs.some(arg => containsPath(arg, root) || containsPath(arg, canonRoot)) || owned(parsed.paths)
-    || parsed.symlinkPaths.some(path => {
-      const resolved = canon(path);
-      return resolved !== null && resolved !== path && inside(resolved, canonRoot);
-    })) return match;
-  // An unclassifiable option hides the script position: if a clone path follows it, say so
-  // instead of silently excluding the service from restart and stale detection.
-  if (parsed.unknownOption !== null && owned(parsed.unknownPaths)) {
-    throw new Error(`Unrecognized interpreter option ${parsed.unknownOption}: cannot tell whether the service runs code from the clone`);
-  }
-  return null;
-}
-
-// The adoption hook uses this asynchronous path: no synchronous directory reads or
-// plutil subprocesses run on its tick. Public discovery/staleness APIs remain synchronous.
-async function scanAsync({ cloneRoot, agentsDir = join(homedir(), 'Library', 'LaunchAgents'),
-  readPlist = readHostPlistAsync, listPlists = dir => fsAsync.readdir(dir), selfLabel = null, signal,
-  realpath = fsAsync.realpath }) {
-  const matches = [], unreadable = [];
-  let files;
-  try { files = await listPlists(agentsDir); }
-  catch (error) { return { matches, unreadable: [{ plistPath: agentsDir, error: message(error) }] }; }
-  const root = expand(cloneRoot);
-  let canonRoot;
-  try { canonRoot = await canonicalAsync(root, realpath); }
-  catch (error) { return { matches, unreadable: [{ plistPath: root, error: message(error) }] }; }
-  for (const file of files) {
-    assertActive(signal);
-    if (!file.endsWith('.plist')) continue;
-    const plistPath = resolve(agentsDir, file);
-    try {
-      const parsed = parsePlist(await readPlist(plistPath), { selfLabel, plistPath });
-      const resolved = new Map();
-      // Lexically owned paths need no IO, except bare candidates that require proof of a symlink hop.
-      for (const path of parsed ? [...parsed.codePaths, ...parsed.paths, ...parsed.unknownPaths, ...parsed.symlinkPaths] : []) {
-        if (inside(path, root) && !parsed.symlinkPaths.includes(path)) continue;
-        resolved.set(path, await canonicalAsync(path, realpath).catch(() => null));
-      }
-      const match = decide(parsed, { root, canonRoot, canon: path => resolved.get(path) ?? null });
-      if (match) matches.push(match);
-    } catch (error) { unreadable.push({ plistPath, error: message(error) }); }
-  }
-  return { matches, unreadable };
-}
-
-function scan({ cloneRoot, agentsDir = join(homedir(), 'Library', 'LaunchAgents'), readPlist = readHostPlist,
-  listPlists = readdirSync, selfLabel = null, realpath = realpathSync }) {
-  const matches = [], unreadable = [];
-  let files;
-  try { files = listPlists(agentsDir); } catch (error) { return { matches, unreadable: [{ plistPath: agentsDir, error: message(error) }] }; }
-  const root = expand(cloneRoot);
-  let canonRoot;
-  try { canonRoot = canonicalSync(root, realpath); }
-  catch (error) { return { matches, unreadable: [{ plistPath: root, error: message(error) }] }; }
-  for (const file of files) {
-    if (!file.endsWith('.plist')) continue;
-    const plistPath = resolve(agentsDir, file);
-    try {
-      const match = decide(parsePlist(readPlist(plistPath), { selfLabel, plistPath }),
-        { root, canonRoot, canon: path => { try { return canonicalSync(path, realpath); } catch { return null; } } });
-      if (match) matches.push(match);
-    } catch (error) { unreadable.push({ plistPath, error: message(error) }); }
-  }
-  return { matches, unreadable };
-}
-
-export function findServicesRunningFromClone(options) {
-  const { matches, unreadable } = scan(options);
-  return { matches: matches.map(({ label, plistPath }) => ({ label, plistPath })), unreadable };
 }
 
 // Per-label files survive adopting-daemon exits. Unknown/corrupt state refuses the restart.
@@ -543,11 +105,17 @@ export function createDiskLocks({ root: rootOpt, liveness = probePidLiveness, pi
 }
 const diskLocks = createDiskLocks();
 const inFlight = new Set();
-const glob = (label, pattern) => pattern.endsWith('*') ? label.startsWith(pattern.slice(0, -1)) : label === pattern;
-const patterns = value => Array.isArray(value) && value.every(x => typeof x === 'string' && /^(?:[^*]+\*?|\*)$/.test(x));
-const defaults = { enabled: true, allow: ['com.we.*', 'com.webeverything.*'], deny: [],
-  // Namespace membership alone does not establish that a service is stateless.
-  approvedStatelessLabels: ['com.we.resource-sampler'], minIntervalMs: 600_000 };
+
+// The reviewed allowlist is EXACT labels (no globs): a label names one service, nothing is matched by prefix.
+// Labels go into a launchctl service target, so keep them to a plain launchd-label alphabet (no "/", spaces, "*").
+const LABEL = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const labels = value => Array.isArray(value) && value.every(x => typeof x === 'string' && LABEL.test(x));
+const defaults = { enabled: true,
+  // Namespace membership alone does not establish that a service is stateless: every entry is reviewed by hand.
+  allowedLabels: ['com.we.resource-sampler'], minIntervalMs: 600_000 };
+// Labels under these namespaces are named in the log when they are NOT on the allowlist, so a missing entry is visible.
+const MANAGED_NAMESPACE = /^com\.(?:we|webeverything)\./;
+const MAX_NAMED = 20;
 
 // Kill-switch parsing is case/whitespace-insensitive and FAILS CLOSED: an operator who set the variable
 // meant to stop restarts, so any non-empty value that is not a recognised "enable" word disables them.
@@ -559,7 +127,7 @@ function parseKillSwitch(raw) {
 }
 
 // One policy for both restart and stale detection, so detection never alerts on a service
-// that policy intentionally leaves alone (dev servers, non-allowed or non-approved writers).
+// that policy intentionally leaves alone.
 function resolveRestartPolicy({ settings, platform, env, envValues, log }) {
   const values = envValues ?? {
     enabled: parseKillSwitch(env.WE_DAEMON_SERVICE_RESTART_ENABLED),
@@ -567,25 +135,41 @@ function resolveRestartPolicy({ settings, platform, env, envValues, log }) {
     minIntervalMs: String(env.WE_DAEMON_SERVICE_RESTART_MIN_INTERVAL_MS ?? '').trim() === '' ? undefined : Number(env.WE_DAEMON_SERVICE_RESTART_MIN_INTERVAL_MS),
   };
   return cascadePolicy('daemon.serviceRestart', settings, { standard: defaults, platform, env, envValues: values,
-    valid: { enabled: v => typeof v === 'boolean', allow: patterns, deny: patterns,
-      approvedStatelessLabels: v => Array.isArray(v) && v.every(x => typeof x === 'string' && x.length > 0 && !x.includes('*')),
+    valid: { enabled: v => typeof v === 'boolean', allowedLabels: labels,
       minIntervalMs: v => Number.isFinite(v) && v >= 0 }, log: line => safeLog(log, line) });
 }
-// Why policy never restarts this service (null when it is restartable). Independent of `enabled`.
-const neverRestartReason = (label, args, p) =>
-  /dev|vite|storybook|playground|npm-start/i.test(label) || devServer(args) ? 'built-in-never'
-  : p.deny.some(x => glob(label, x)) ? 'denied'
-  : !p.allow.some(x => glob(label, x)) ? 'not-allowed'
-  : !p.approvedStatelessLabels.includes(label) ? 'stateless-approval-required' : null;
+// Why policy never restarts this label (null when it is restartable). Decided by the label ONLY, never by argv.
+// Independent of `enabled`. The name guard keeps a dev server out even if one were ever listed by mistake.
+const neverRestartReason = (label, p) =>
+  /dev|vite|storybook|playground|npm-start/i.test(label) ? 'built-in-never'
+  : !p.allowedLabels.includes(label) ? 'not-allowlisted' : null;
+
+// Labels of managed-namespace LaunchAgents that are not on the allowlist (label read only; nothing else in a plist is looked at).
+async function unlistedLabels({ agentsDir = join(homedir(), 'Library', 'LaunchAgents'), readPlist = readHostPlistAsync,
+  listPlists = dir => fsAsync.readdir(dir), allowed, selfLabel, signal }) {
+  const named = [];
+  let unreadable = 0, files;
+  try { files = await listPlists(agentsDir); } catch { return { named, unreadable: 1 }; }
+  for (const file of files) {
+    assertActive(signal);
+    if (!file.endsWith('.plist')) continue;
+    try {
+      const label = (await readPlist(resolve(agentsDir, file)))?.Label;
+      if (typeof label === 'string' && MANAGED_NAMESPACE.test(label) && !allowed.includes(label) && label !== selfLabel
+        && !named.includes(label)) named.push(label);
+    } catch { unreadable += 1; }
+  }
+  return { named, unreadable };
+}
 
 export async function restartServicesForClone({ settings, platform, env = process.env, envValues,
   launchctl = launchHost, uid = userId, log = console, now = Date.now, stateStore = diskState, lockStore = diskLocks,
-  adoptedSha: adoptedShaOpt, signal, pendingOnly = false, ...options } = {}) {
+  adoptedSha: adoptedShaOpt, signal, pendingOnly = false, selfLabel = null, ...options } = {}) {
   const result = { restarted: [], skipped: [], flagged: [], errors: [] };
   let source = 'unresolved';
   let adoptedSha = adoptedShaOpt;
   // pendingOnly (later ticks): retry only the labels whose restart a cooldown deferred. Each owes the sha it
-  // was deferred for; nothing is scanned when none is owed, and a label that no longer qualifies is cleared.
+  // was deferred for; nothing is inspected when none is owed, and a label that no longer qualifies is cleared.
   let owed = null;
   // Clear an owed marker without rolling back a restart another process recorded since we listed it:
   // re-read first and only write when the marker we listed is still the one on disk.
@@ -615,7 +199,7 @@ export async function restartServicesForClone({ settings, platform, env = proces
   const report = (kind, service, reason) => {
     const entry = { ...service, reason };
     result[kind].push(entry);
-    safeLog(log, `daemon.serviceRestart ${kind} ${service.label ?? service.plistPath ?? '?'}: ${reason} (source ${source})`);
+    safeLog(log, `daemon.serviceRestart ${kind} ${service.label ?? '?'}: ${reason} (source ${source})`);
   };
   try {
     // State is keyed by label, shared by every clone's daemon: a marker belongs to the clone that deferred it.
@@ -626,22 +210,27 @@ export async function restartServicesForClone({ settings, platform, env = proces
     const policy = resolveRestartPolicy({ settings, platform, env, envValues, log });
     source = JSON.stringify({ values: policy.value, sources: policy.sources });
     if (owed) {
-      // Inside the cooldown there is nothing to do: skip the plist scan (one plutil per plist) until one is due.
+      // Inside the cooldown there is nothing to do until one is due.
       const current = now();
       owed = new Map([...owed].filter(([, x]) => !(current - x.at < policy.value.minIntervalMs)));
       if (!owed.size) return result;
     }
-    const { matches, unreadable } = await scanAsync({ ...options, signal });
-    if (!pendingOnly) for (const bad of unreadable) report('flagged', bad, 'plist-unreadable: inspect and repair plist before restarting');
     const p = policy.value;
-    const seen = new Set();
-    for (const { args, ...service } of matches) {
-      const { label } = service;
-      if (owed && !owed.has(label)) continue;
-      seen.add(label);
+    // Services that are not on the allowlist are never restarted. One line names them so a missing entry is visible.
+    if (!pendingOnly) {
+      const { named, unreadable } = await unlistedLabels({ ...options, allowed: p.allowedLabels, selfLabel, signal });
+      for (const label of named) result.skipped.push({ label, reason: 'not-allowlisted' });
+      if (named.length || unreadable) {
+        safeLog(log, `daemon.serviceRestart not-allowlisted: ${named.length ? `${named.slice(0, MAX_NAMED).join(', ')}${named.length > MAX_NAMED ? `, +${named.length - MAX_NAMED} more` : ''}` : 'none named'}`
+          + `${unreadable ? ` (${unreadable} LaunchAgent entr${unreadable === 1 ? 'y' : 'ies'} unreadable)` : ''}: never restarted; `
+          + `add the label to daemon.serviceRestart.allowedLabels to restart it (allowedLabels source ${policy.sources?.allowedLabels ?? 'unknown'})`);
+      }
+    }
+    for (const label of owed ? owed.keys() : new Set(p.allowedLabels)) {
+      const service = { label };
       // A deferred restart owes the sha it was deferred for, not the (possibly absent) current adoption.
       if (owed) adoptedSha = owed.get(label).pendingSha;
-      let reason = !p.enabled ? 'disabled' : neverRestartReason(label, args, p);
+      let reason = label === selfLabel ? 'self' : !p.enabled ? 'disabled' : neverRestartReason(label, p);
       if (reason) {
         if (owed) { try { await settle(label, owed.get(label)); } catch (error) { report('errors', service, message(error)); } continue; }
         report('skipped', service, reason); continue;
@@ -706,7 +295,7 @@ export async function restartServicesForClone({ settings, platform, env = proces
         phase = 'launch';
         assertActive(signal);
         // No mid-write signal exists. kickstart -k is the operator's proven operation for
-        // these stateless samplers; exact stateless approval plus the allowlist safeguards writers.
+        // these stateless samplers; the reviewed label allowlist safeguards writers.
         const answer = await launchctl(['kickstart', '-k', `gui/${id}/${label}`]);
         if (answer?.error || answer?.status != null && answer.status !== 0 || answer?.code != null && answer.code !== 0) throw new Error(message(answer.error ?? answer.stderr ?? 'launchctl failed'));
         report('restarted', service, 'kickstart -k');
@@ -723,11 +312,6 @@ export async function restartServicesForClone({ settings, platform, env = proces
         }
         inFlight.delete(label);
       }
-    }
-    // An owed label whose plist is gone (or no longer clone-backed) has nothing to restart: stop retrying it.
-    // Unreadable plists could be the owed service, so absence only counts as evidence on a clean scan.
-    if (owed && unreadable.length === 0) for (const [label, state] of owed) {
-      if (!seen.has(label)) { try { await settle(label, state); } catch (error) { report('errors', { label }, message(error)); } }
     }
   } catch (error) { report('errors', {}, message(error)); }
   return result;
@@ -754,22 +338,23 @@ function processStart(label, { launchctl, uid, ps }) {
 }
 
 /** null process start means positively not running; unknown evidence is flagged.
+ * Inspects exactly the allowlisted labels (the services policy restarts), never a plist's command line.
  * onFreshService reports positive clean evidence so health episodes can close without treating absence as clean. */
 export function findStaleCodeServices({ readProcessStartMs = processStart, onFreshService = () => {},
   readAdoptedAtMs = root => Date.parse(readRebuildState(root)?.adopted?.at ?? ''),
   launchctl = printHost, uid = userId, ps = argv => execFileSync('ps', argv, commandOptions),
-  settings, platform, env = process.env, envValues, log, ...options } = {}) {
-  const { matches, unreadable } = scan(options);
-  const flagged = unreadable.map(x => ({ label: null, ...x, reason: 'plist-unreadable' }));
-  // Same policy as the restart path; an unreadable policy fails closed into an unreadable flag.
-  let p = null, policyError = null;
-  try { p = resolveRestartPolicy({ settings, platform, env, envValues, log }).value; } catch (error) { policyError = error; }
-  for (const { args, ...service } of matches) {
+  settings, platform, env = process.env, envValues, log, selfLabel = null, ...options } = {}) {
+  // An unreadable policy fails closed: one unlabeled flag (the inspection is incomplete), never a clean result.
+  let p;
+  try { p = resolveRestartPolicy({ settings, platform, env, envValues, log }).value; }
+  catch (error) { return [{ label: null, reason: 'policy-unreadable', error: message(error) }]; }
+  const flagged = [];
+  for (const label of new Set(p.allowedLabels)) {
+    const service = { label };
     try {
-      if (policyError) throw policyError;
-      // Services policy never restarts are neither stale nor fresh evidence: stay silent.
-      if (neverRestartReason(service.label, args, p)) continue;
-      const start = readProcessStartMs(service.label, { launchctl, uid, ps });
+      // The watching daemon restarts through self-sync; services policy never restarts are neither stale nor fresh evidence.
+      if (label === selfLabel || neverRestartReason(label, p)) continue;
+      const start = readProcessStartMs(label, { launchctl, uid, ps });
       if (start === null) { onFreshService(service); continue; }
       if (!Number.isFinite(start)) throw new Error('unreadable process start');
       const adopted = readAdoptedAtMs(options.cloneRoot);
