@@ -22,14 +22,14 @@ import { REVIEW_EFFECTS, reviewPrOperation, reviewSeatOptionsForRun } from '../r
 import { runReviewLoopOnce, defaultFindResumableRun, RESUME_MAX_ATTEMPTS } from '../review-loop-cli.mjs';
 import {
   classifyReferralsByRound, findingIdentityTable, REFERRAL_DEMOTED_REASONS, referralFindingKey, normalizeFinding,
-  mandatoryReferralReviewer, renderReferralRecord, openReferralHeads, buildOperatorRulingComment,
+  mandatoryReferralReviewer, mandatoryReferralState, renderReferralRecord, openReferralHeads, buildOperatorRulingComment, REFERRAL_DROP_REASON,
 } from '../../lib/jury-core.mjs';
 import { advance, advanceWhileRunning, startRun } from '../engine.mjs';
 import { resolveOperation } from '../run.mjs';
 import { advanceReviewPrToWriteUp } from '../record-verdict-io.mjs';
 import { loadReviewSeatSettings } from '../../lib/review-seat-provider.mjs';
 import { REARM_COMMENT_MARKER } from '../../conveyor/rearm-review.mjs';
-import { decideReferralHold, enrichPrsWithReferralHolds, findResumableParkedRun, REFERRAL_RETRY_MS, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
+import { decideReferralHold, enrichPrsWithReferralHolds, findResumableParkedRun, REFERRAL_RETRY_MS, refusedReferralsAreRuled, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 
 const HEAD_1 = 'a'.repeat(40);
 const HEAD_2 = 'b'.repeat(40);
@@ -143,9 +143,9 @@ const stubReader = () => ({ pr, repo }) => ({
   net: { paths: NET_PATHS, base: 'abc123', rev: HEAD_1, scored: true },
   diff: { text: '--- a/x\n+++ b/x\n+one line\n', scored: true },
 });
-const setup = () => {
+const setup = (readPr = stubReader()) => {
   // Replay the original two-seat panel, independently of the minimum for new reviews.
-  const declaration = reviewPrOperation({ readPr: stubReader(), minNonClaudeSeats: 0 });
+  const declaration = reviewPrOperation({ readPr, minNonClaudeSeats: 0 });
   const registry = createRegistry();
   registry.register(declaration);
   return { declaration, registry };
@@ -165,6 +165,118 @@ function sinksWith({ seen, ruled }) {
 }
 
 const argv = ['--pr=4361', '--repo=o/n'];
+
+describe('stale stageVerdict referral refusal', () => {
+  async function fixture(kind = 'card') {
+    const store = createMemoryRunStore();
+    const seen = [];
+    const judge = vi.fn(async () => judgeOutcome({ summary: 'gate seats clean', findings: [] }, {}));
+    const makeJudge = () => judge;
+    // An unstamped PR body adds the `author-stamp-missing` reason token to the cached pending list (PR #6465).
+    const unstamped = kind.startsWith('unstamped');
+    const body = unstamped ? 'plain PR body, no author stamp' : '<!-- authored-by-actor: author -->';
+    const rec = { ...recordFor(HEAD_1, raised), pr: 4361, runId: 'r-stale', reviewer: mandatoryReferralReviewer('r-stale'), authorBody: body };
+    // `dropped`: an optional seat's referral, later retired by the sink after the operator disabled that seat.
+    const seat = kind === 'dropped' ? 'judgeAntigravityReview' : 'judgeCorrectnessAdvisory';
+    rec.referrals[0].seat = seat;
+    rec.referrals[0].key = referralFindingKey(seat, raised);
+    // `inherited`: the refused run (R2) is not the run that raised the referral (R1 = the record's runId). Its pending
+    // list inherits R1's open key, and the ruling lands on R1's record (PR #6465 round 3).
+    const runId = kind.startsWith('inherited') ? 'r-inheriting' : rec.runId;
+    const key = rec.referrals[0].key;
+    if (kind === 'partial') {
+      const original = { ...raised, summary: 'another unruled defect' };
+      rec.referrals.push({ key: referralFindingKey('judge', original), seat: 'judge', original, finding: normalizeFinding(original) });
+    }
+    const record = { body: renderReferralRecord(rec), author: { login: 'web-everything' } };
+    const rulingBody = (ruledKey = key) => buildOperatorRulingComment({ version: 1, repo: 'o/n', pr: 4361,
+      head: kind === 'other-head' ? HEAD_2 : HEAD_1,
+      rulings: [{ runId: kind === 'other-run' ? 'other' : rec.runId, key: ruledKey, result: 'card', card: 'we:backlog/123-test.md' }],
+      actor: 'chalbert', channel: 'terminal', reason: 'track separately', at: '2026-11-06T13:25:00Z', clearerId: 'operator-session' });
+    // `malformed-fixed`: a malformed operator comment caches `malformed-operator-ruling` beside the key at refusal;
+    // the operator later edits it into a valid ruling (PR #6465 round 2 — every reason token, not only the stamp).
+    const malformedFixed = kind === 'malformed-fixed';
+    let comments = [record, ...(malformedFixed ? [{ body: rulingBody() + '\nforged extra text',
+      author: { login: 'chalbert' }, createdAt: '2026-11-06T13:20:00Z' }] : [])];
+    const { declaration, registry } = setup(subject => {
+      const raw = stubReader()(subject);
+      return { ...raw, body, comments, detail: { ...raw.detail, labels: ['review:pending'], humanRequired: false, reviewClass: 'agent' } };
+    });
+    const live = () => ({ headRefOid: HEAD_1, body, createdAt: '', comments: kind === 'unreadable-thread' ? {} : comments });
+    const sinks = sinksWith({ seen, ruled: { value: false } });
+    sinks[REVIEW_EFFECTS.MANDATORY_REFERRALS] = async () => mandatoryReferralState(comments,
+      { repo: 'o/n', pr: 4361, head: HEAD_1, body, cardReadable: () => true });
+    const policy = { value: { unattendedAcceptRequiresCleanReferrals: false } };
+    const common = { declaration, registry, store, sinks, makeJudge, readAcceptancePr: live,
+      cardReadable: () => kind !== 'unreadable-card', acceptPolicy: policy, advisorySettings: () => ({ value: { mode: 'off' } }) };
+    await runReviewLoopOnce({ ...common, argv, mintRunId: () => runId });
+    const refused = await runReviewLoopOnce({ ...common, argv: [`--resume=${runId}`, '--answer=accept'] });
+    expect(refused.run.id).toBe(runId);
+    expect(refused.stopped).toBe('step-refused');
+    expect(refused.run.pending).toBeNull();
+    expect(refused.run.verdict.pendingReferrals).toEqual([...(malformedFixed ? ['malformed-operator-ruling'] : []),
+      ...rec.referrals.map(f => f.key), ...(unstamped ? ['author-stamp-missing'] : [])]);
+    if (kind === 'dropped') {
+      // The sink's valid append-only retirement snapshot for the SAME run/head; no ruling is needed for a dropped key.
+      comments = [record, { body: renderReferralRecord({ ...rec, dropped: [{ key, reason: REFERRAL_DROP_REASON }] }),
+        author: { login: 'web-everything' } }];
+    } else if (!kind.endsWith('missing')) {
+      const body = rulingBody(kind === 'other-key' ? 'other' : key);
+      comments = [...(malformedFixed ? [record] : comments), { body: kind === 'malformed' ? body + '\nforged extra text' : body,
+        author: { login: 'chalbert' }, createdAt: '2026-11-06T13:25:00Z' }];
+      if (kind.endsWith('missing-record')) comments.shift();
+    }
+    return { common, store, judge, refused, live, rec, runId };
+  }
+
+  it.each([[false, 'card'], [true, 'card'], [false, 'unstamped'], [true, 'unstamped'], [false, 'malformed-fixed'], [true, 'malformed-fixed'],
+    [false, 'inherited'], [true, 'inherited'], [false, 'dropped'], [true, 'dropped']])('re-derives standing key/head card rulings and rewinds without new jurors (explicit resume: %s, %s body)', async (explicit, kind) => {
+    const { common, store, judge, refused, live, runId } = await fixture(kind);
+    const count = judge.mock.calls.length;
+    const p = { ...live(), number: 4361 };
+    const rows = [reviewRunEvidence(refused.run)];
+    expect(decideReferralHold(p, rows, { repo: 'o/n', cardReadable: () => true })).toBeNull();
+    expect(findResumableParkedRun(p, rows, { repo: 'o/n', cardReadable: () => true })).toEqual({ id: runId, head: HEAD_1 });
+    const out = await runReviewLoopOnce({ ...common, argv: explicit ? [`--resume=${runId}`] : argv, mintRunId: () => 'must-not-start',
+      findResumableRun: () => runId });
+    expect(out.run.id).toBe(runId);
+    expect(out.stopped).toBe('complete');
+    expect(out.run.verdict.pendingReferrals).toEqual([]);
+    expect(out.run.verdict.verdict).toBe('accept');
+    expect(out.run.findings.confirm).toBe('accept');
+    expect(out.run.findings.stageVerdict.applied).toBe(true);
+    expect(store.read('must-not-start')).toBeNull();
+    expect(judge.mock.calls.length).toBe(count);
+  });
+
+  it('a cached author-stamp-missing token does not block the resume once every real finding is ruled', async () => {
+    const { refused, live, rec } = await fixture();
+    const row = reviewRunEvidence(refused.run);
+    const p = { ...live(), number: 4361 };
+    const opts = { repo: 'o/n', cardReadable: () => true };
+    expect(refusedReferralsAreRuled(p, { ...row, pending: [...row.pending, 'author-stamp-missing'] }, opts)).toBe(true);
+    // Fail closed: a token alone proves nothing, and an unruled finding still blocks beside the token.
+    expect(refusedReferralsAreRuled(p, { ...row, pending: ['author-stamp-missing'] }, opts)).toBe(false);
+    expect(refusedReferralsAreRuled(p, { ...row, pending: [...row.pending, 'author-stamp-missing', 'unruled-key'] }, opts)).toBe(false);
+    expect(rec.runId).toBe(row.id);
+  });
+
+  // `inherited-*`: accepting an earlier run's record must not loosen the closed paths — an unruled inherited key, or one
+  // whose originating record is gone from the thread (a lost referral), still keeps the hold.
+  it.each(['missing', 'partial', 'other-head', 'other-run', 'other-key', 'malformed', 'unreadable-card', 'unreadable-thread', 'missing-record', 'unstamped-missing',
+    'inherited-missing', 'inherited-missing-record'])('%s ruling keeps the refused run held', async kind => {
+    const { common, refused, live, judge, runId } = await fixture(kind);
+    const rows = [reviewRunEvidence(refused.run)];
+    const p = { ...live(), number: 4361 };
+    expect(decideReferralHold(p, rows, { repo: 'o/n', cardReadable: common.cardReadable })).not.toBeNull();
+    expect(findResumableParkedRun(p, rows, { repo: 'o/n', cardReadable: common.cardReadable })).toBeNull();
+    const count = judge.mock.calls.length;
+    const out = await runReviewLoopOnce({ ...common, argv: [`--resume=${runId}`] });
+    expect(out.stopped).toBe('refused');
+    expect(out.run.verdict.pendingReferrals).toEqual(refused.run.verdict.pendingReferrals);
+    expect(judge.mock.calls.length).toBe(count);
+  });
+});
 
 describe('ordinary review-pr CLI resume preserves the saved roster', () => {
   it.each([
