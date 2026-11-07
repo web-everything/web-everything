@@ -81,10 +81,10 @@ import { readStandardMinutes, admissionLockRoot } from '../readiness/heavy-admis
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { listLiveFixClaims, releaseFixClaim, FIXING_KIND } from './fix-procedure.mjs';
 import { fixDispatchClaimRoot, fixDispatchSessionName, listFixDispatchClaims } from './fix-claim-store.mjs';
-import { parseLockEntry } from '../readiness/file-locks.mjs';
+import { isLeaseExpired, parseLockEntry } from '../readiness/file-locks.mjs';
 import { awaitVerifyStoreDir, awaitVerifyStoreKey, classifyAwaitVerify, resolveAwaitVerifyPath, resolveAwaitVerifyTtlMs } from './await-verify.mjs';
 import { releaseSessionFixDispatchClaims } from './fix-dispatch-claim.mjs';
-import { makeCompletionResolver, rmSessionRecord, stopSessionWithRetry } from './session-reaper.mjs';
+import { makeChatSpawnGuardResolver, makeCompletionResolver, rmSessionRecord, stopSessionWithRetry } from './session-reaper.mjs';
 import { cascadePolicy, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
@@ -559,7 +559,13 @@ export function defaultClaimStoreReadable(readDirectory = readdirSync, readEntry
     let parsed = null;
     try { parsed = parseLockEntry(readEntry(join(root, entry, 'lock.json'), 'utf8')); }
     catch { /* An entry disappearing mid-scan is incomplete evidence, too. */ }
-    if (!parsed || !parsed.meta?.repo || !parsed.meta?.pr || !parsed.meta?.kind) {
+    // At its own heartbeat with a zero TTL, a valid timestamp has age zero and is not expired.
+    // The shared lease predicate treats an invalid timestamp as infinitely old. Real expiry is still allowed.
+    const invalidHeartbeat = parsed && isLeaseExpired(parsed, Date.parse(parsed.heartbeatAt), 0);
+    const ttl = parsed?.meta?.ttlMinutes;
+    const invalidTtl = parsed?.meta?.kind === FIXING_KIND && ttl !== undefined
+      && (!Number.isFinite(Number(ttl)) || Number(ttl) <= 0);
+    if (!parsed || !parsed.meta?.repo || !parsed.meta?.pr || !parsed.meta?.kind || invalidHeartbeat || invalidTtl) {
       // Quote the entry name to keep control characters inert; never log lock contents or read errors.
       log(`session-watchdog: claim store unreadable (${JSON.stringify(`${entry}/lock.json`)}); stops refused until a successful read`);
       return false;
@@ -633,6 +639,7 @@ export function runSessionWatchdogPass({
   prHeadFor = makeSnapshotHeadReader({ maxAgeMs: config.prHeadMaxAgeMinutes * MINUTE }),
   completionFor = makeCompletionResolver(),
   awaitingVerifyFor = makeStopAwaitingVerifyResolver({ now: () => nowMs }),
+  chatSpawnGuardFor = makeChatSpawnGuardResolver({ now: () => nowMs }),
   rm = rmSessionRecord,
   stop = stopSessionWithRetry,
   ownSessionId = process.env.CLAUDE_CODE_SESSION_ID,
@@ -689,10 +696,16 @@ export function runSessionWatchdogPass({
   let claims = [];
   let dispatchClaims = [];
   let claimsReadable = false;
+  let fixingClaimsReadable = false;
+  // Findings retain the original tolerant fixing-claim read, independent of the stricter stop-only probe.
+  try {
+    claims = listClaims === listLiveFixClaims ? listClaims({ nowMs }) : listClaims();
+    fixingClaimsReadable = Array.isArray(claims);
+  }
+  catch { claims = []; }
   try {
     if (claimStoreReadable() === true) {
-      claims = listClaims === listLiveFixClaims ? listClaims({ nowMs }) : listClaims();
-      if (!Array.isArray(claims)) throw new Error('unreadable fixing claims');
+      if (!fixingClaimsReadable) throw new Error('unreadable fixing claims');
       const dispatch = listDispatchClaims(fixDispatchClaimRoot(), { liveOnly: true, nowMs });
       if (!Array.isArray(dispatch)) throw new Error('unreadable dispatch claims');
       dispatchClaims = dispatch.map((claim) => {
@@ -735,6 +748,17 @@ export function runSessionWatchdogPass({
         }
         const row = rows.find((r) => r.id === a.handle && r.sessionId === a.sessionId);
         const source = listingForRow.get(row);
+        let chatGuard = null;
+        try {
+          if (!source || typeof chatSpawnGuardFor !== 'function') throw new Error('chat-spawn evidence unavailable');
+          chatGuard = chatSpawnGuardFor(source);
+        } catch { /* unknown guard evidence refuses the stop below */ }
+        if (chatGuard?.blocked !== false) {
+          const detail = chatGuard?.blocked === true ? 'refused: chat-spawn guarded' : 'refused: chat-spawn guard unreadable';
+          done.push({ ...a, ok: false, detail });
+          log(`session-watchdog: ${detail}; stop refused for ${a.handle}`);
+          continue;
+        }
         let awaiting = null;
         try {
           if (!source || typeof awaitingVerifyFor !== 'function') throw new Error('verification evidence unavailable');
