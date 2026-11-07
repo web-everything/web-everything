@@ -653,7 +653,9 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           && (r.headSha == null || r.headSha === head))
         || !Array.isArray(rawPr.comments) || redTeamForHead(rawPr.comments, pr, head)
         || !Array.isArray(rawPr.labels) || !rawPr.labels.some(label =>
-          ['review:accepted', 'red-team:pending'].includes(typeof label === 'string' ? label : label?.name))) return rawPr;
+          // review:pending is the parked run's own retained label: a ruled referral-blocked review resumes through
+          // fullReviewDecision, which needs the formal reviews even when no accept or red-team label is present.
+          ['review:accepted', 'red-team:pending', 'review:pending'].includes(typeof label === 'string' ? label : label?.name))) return rawPr;
       if (reviewsByPr.has(pr)) return { ...rawPr, reviews: reviewsByPr.get(pr) };
       let reviews;
       try {

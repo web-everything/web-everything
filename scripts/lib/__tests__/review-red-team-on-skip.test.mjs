@@ -95,7 +95,9 @@ describe('#6345 — resume a stored needs-human review after its refused referra
       author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z' });
     if (kind === 'notice from another author') comments.push({ body: notice, author: { login: 'stranger' }, createdAt: '2026-11-06T13:26:00Z' });
     if (kind === 'other hold comment') comments.push({ body: '🛑 conveyor fix — stood down', author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z' });
-    const labels = ['red-team:pending', ...(/review:pending/.test(kind) ? ['review:pending'] : []),
+    // The production parked run need not carry red-team:pending: "only review:pending" pins that label set.
+    const onlyReviewPending = /only review:pending/.test(kind);
+    const labels = [...(onlyReviewPending ? [] : ['red-team:pending']), ...(/review:pending/.test(kind) ? ['review:pending'] : []),
       ...(/review:human/.test(kind) ? ['review:human'] : [])];
     const rawPr = { number: pr, headRefOid: head, body, comments, reviews: [], labels };
     // Validate the fixture through the real shared gate, without a planner-only mock seam.
@@ -113,7 +115,14 @@ describe('#6345 — resume a stored needs-human review after its refused referra
     if (kind === 'missing comments') rawPr.comments = undefined;
     if (kind === 'formal review hold') rawPr.reviews = [{ state: 'CHANGES_REQUESTED', author: { login: 'reviewer' } }];
     if (kind === 'unreadable reviews') rawPr.reviews = undefined;
-    return runFixture({ rawPrs: [rawPr], readReviews: vi.fn(() => rawPr.reviews), readEvidence: () => ({ loopPayload, inFlight: false,
+    // The daemon snapshot omits formal reviews; the wrapper must fetch them itself through the reader.
+    const snapshot = /daemon snapshot/.test(kind);
+    if (snapshot) delete rawPr.reviews;
+    const fetched = /with formal review hold/.test(kind) ? [{ state: 'CHANGES_REQUESTED', author: { login: 'reviewer' } }] : [];
+    return runFixture({ rawPrs: [rawPr], readReviews: vi.fn(() => {
+      if (/reader throws/.test(kind)) throw new Error('offline');
+      return snapshot ? fetched : rawPr.reviews;
+    }), readEvidence: () => ({ loopPayload, inFlight: false,
       queued: false, recorded: false, seatRecorded: false }),
     readReviewRuns: vi.fn(() => {
       if (kind === 'unreadable run reader') throw new Error('run evidence unreadable');
@@ -137,6 +146,29 @@ describe('#6345 — resume a stored needs-human review after its refused referra
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review', head,
       why: 'stored review needs-human only on referrals now ruled; resume the parked run' });
     expect(o.dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    'only review:pending label, daemon snapshot without reviews',
+    'only review:pending label and pause notice, daemon snapshot without reviews',
+  ])('fetches the missing formal reviews itself and resumes: %s', kind => {
+    const o = parkedFixture(kind);
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review', head,
+      why: 'stored review needs-human only on referrals now ruled; resume the parked run' });
+    expect(o.readReviews).toHaveBeenCalledOnce();
+    expect(o.readReviews).toHaveBeenCalledWith({ repo, pr });
+    expect(o.rawPrs[0]).not.toHaveProperty('reviews');
+    expect(o.dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    'only review:pending label, daemon snapshot with formal review hold',
+    'only review:pending label, daemon snapshot, reader throws',
+  ])('fails closed when the fetched formal reviews hold or are unreadable: %s', kind => {
+    const o = parkedFixture(kind);
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+    expect(o.readReviews).toHaveBeenCalledOnce();
+    expect(o.dispatch).not.toHaveBeenCalled();
   });
 
   it.each([
