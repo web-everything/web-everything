@@ -66,6 +66,43 @@ describe('daemon heavy spawn admission lint', () => {
   ])('detects unqueued package test / node --test entry points: %s', call => {
     expect(findUngatedHeavySpawns(cp.replace('spawnSync }', 'spawnSync, execSync }') + call)).toHaveLength(1);
   });
+  // Self-review #6461 (round 2): the same class through package scripts, spreads, Node-binary spellings,
+  // shell options and escaped nested `sh -c`.
+  const all = "import { spawnSync, execSync, execFileSync } from 'node:child_process';\n";
+  it.each([
+    "spawnSync('npm', ['run', 'test:bun:scripts']);",
+    "execSync('npm run test:bun:scripts');",
+    "const a = ['--test', 'x.mjs']; spawnSync('node', [...a, 'y']);",
+    "const a = ['test', '--', 'x']; spawnSync('npm', [...a]);",
+    'execSync(`${process.execPath} --test a`);',
+    "const { execPath } = process; spawnSync(execPath, ['--test']);",
+    "spawnSync(process['execPath'], ['--test']);",
+    "spawnSync(process.argv[0], ['--test']);",
+    "spawnSync(globalThis.process.execPath, ['--test']);",
+    "execSync('sh -c \"sh -c \\\\\"npm test\\\\\"\"');",
+    "spawnSync('npm test', { shell: true });",
+    "spawnSync('echo', ['$(npm test)'], { shell: true });",
+    "execFileSync('npm', ['test'], { shell: '/bin/sh' });",
+  ])('detects same-class spelling: %s', call => {
+    expect(findUngatedHeavySpawns(all + call)).toHaveLength(1);
+  });
+  it.each([
+    "spawnSync('npm', ['run', 'test:e2e']);",
+    "spawnSync('gh', ['pr', 'comment', '42', '--body', '" + '`'.repeat(280) + "']);",
+    "spawnSync('git', ['commit', '-m', '" + 'x'.repeat(17000) + "']);",
+    "spawnSync('echo', ['$(npm test)'], { shell: false });",
+    "const { execPath } = other; spawnSync(execPath, ['--test']);",
+    "spawnSync('sh', ['script.sh']);",
+  ])('leaves plain-argv data and queued scripts alone: %s', call => {
+    expect(findUngatedHeavySpawns(all + call)).toEqual([]);
+  });
+  it('resolves package scripts through the given table and fails closed when it is unreadable', () => {
+    const call = "spawnSync('npm', ['run', 'ci:all']);";
+    expect(findUngatedHeavySpawns(all + call, 's.mjs', { scripts: { 'ci:all': 'npm run lint && vitest run' } })).toHaveLength(1);
+    expect(findUngatedHeavySpawns(all + call, 's.mjs', { scripts: { 'ci:all': 'npm run lint' } })).toEqual([]);
+    expect(findUngatedHeavySpawns(all + "spawnSync('npm', ['run', 'test:x']);", 's.mjs', { scripts: null })).toHaveLength(1);
+    expect(findUngatedHeavySpawns(all + "spawnSync('npm', ['run', 'test:unit']);", 's.mjs', { scripts: null })).toEqual([]);
+  });
   it.each([
     "spawnSync('npm', ['run', 'test:unit', '--', 'a.test.mjs']);",
     "spawnSync('npm', ['run', 'check:standards']);",

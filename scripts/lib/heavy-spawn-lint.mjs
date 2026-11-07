@@ -1,6 +1,7 @@
 /** Static admission lint for literal heavy child_process commands. No code is executed. */
+import { readFileSync } from 'node:fs';
 import ts from 'typescript';
-import { canonicalCommand, commandSubstitutionBodies, parseSegments, shellTokens, ungatedHeavyRunKind } from '../guard-bash.mjs';
+import { canonicalCommand, commandSubstitutionBodies, parseSegments, shellCString, shellTokens, ungatedHeavyRunKind } from '../guard-bash.mjs';
 
 const SPAWNS = new Set(['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']);
 const quote = value => "'" + value.replaceAll("'", "'\\''") + "'";
@@ -9,32 +10,62 @@ const quote = value => "'" + value.replaceAll("'", "'\\''") + "'";
 const SUBSTITUTION_MAX_CHARS = 16384;
 const SUBSTITUTION_MAX_BODIES = 64;
 
+/** This repository's package scripts, or null when package.json cannot be read (callers then fail closed). */
+let repoScripts;
+function packageScripts() {
+  if (repoScripts !== undefined) return repoScripts;
+  try {
+    const scripts = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')).scripts;
+    repoScripts = scripts && typeof scripts === 'object' ? scripts : null;
+  } catch { repoScripts = null; }
+  return repoScripts;
+}
+
+const RUNNER_OPTS_WITH_VALUE = new Set(['--prefix', '-C', '--dir', '--cwd', '--workspace', '-w', '--filter', '-F']);
+/** The package script a runner head starts (`npm run x`, `npm run-script x`, `pnpm x`, `yarn x`, `bun run x`), or null. */
+function packageScriptName(words) {
+  const runner = (words[0] || '').replace(/^.*\//, '').replace(/@.*$/, '');
+  if (!/^(?:npm|pnpm|yarn|bun)$/.test(runner)) return null;
+  let i = 1;
+  const skipFlags = () => { while (words[i]?.startsWith('-') && words[i] !== '--') i += RUNNER_OPTS_WITH_VALUE.has(words[i]) ? 2 : 1; };
+  skipFlags();
+  if (['run', 'run-script', 'rum', 'urn'].includes(words[i])) { i += 1; skipFlags(); return words[i] ?? null; }
+  return runner === 'npm' ? null : words[i] ?? null; // pnpm/yarn/bun also run a script named bare
+}
+
 /** Inspect executable positions only; arguments to ordinary programs are data.
- *  `withSubstitutions` is false for a substitution body: the extractor already returned its nested bodies,
- *  so re-extracting them would grow combinatorially with nesting. */
-function heavyCommand(command, depth = 0, withSubstitutions = true) {
+ *  `substitutions` is true only for text a shell parses: a substitution body (the extractor already returned its
+ *  nested bodies, so re-extracting them would grow combinatorially) and plain argv (nothing expands) skip it.
+ *  `scripts` is the package script table a `npm run <name>` resolves through (null: unreadable, fail closed). */
+function heavyCommand(command, { depth = 0, substitutions = true, scripts = packageScripts() } = {}) {
   if (depth > 8) return true; // fail closed on implausibly deep nesting
+  const inner = (text, subs = true) => heavyCommand(text, { depth: depth + 1, substitutions: subs, scripts });
   // A shell expands `$( … )` / backticks before running the outer command, so their bodies are executed too.
-  // Array arguments arrive single-quoted (see quote()), where nothing expands.
-  if (withSubstitutions) {
+  if (substitutions) {
     if (command.length > SUBSTITUTION_MAX_CHARS) return true;
     // Openers bound the body count from above; checking them first keeps a deep nest off the quadratic extractor.
     if ((command.match(/\$\(|`/g) || []).length > SUBSTITUTION_MAX_BODIES * 4) return true;
     let bodies;
     try { bodies = commandSubstitutionBodies(command); } catch { return true; } // stack overflow on a pathological nest
     if (bodies.length > SUBSTITUTION_MAX_BODIES) return true;
-    if (bodies.some(body => heavyCommand(body, depth + 1, false))) return true;
+    if (bodies.some(body => inner(body, false))) return true;
   }
   return parseSegments(command).segments.some(segment => {
     // The Bash guard's own classifier first: package test scripts (`npm test`, `npm --prefix . test`, `pnpm t`),
     // `node --test`, vitest and check-standards heads. The checks below add playwright and `sh -c` bodies.
     if (ungatedHeavyRunKind(segment)) return true;
+    // `sh -c "…"` as the inner shell receives it (escaped quotes resolved, any nesting depth).
+    const shellC = shellCString(segment);
+    if (shellC) return inner(shellC.text);
     const words = shellTokens(canonicalCommand(segment)).filter(word => !word.op).map(word => word.text);
-    let [program, ...args] = words;
-    if (/^(?:ba|da|z|k)?sh$/.test(program || '')) {
-      const at = args.findIndex(arg => /^-[a-z]*c[a-z]*$/.test(arg));
-      return at >= 0 && !!args[at + 1] && heavyCommand(args[at + 1], depth + 1);
+    // Any package script whose own body is an unqueued heavy run (`npm run test:bun:scripts` → `npx bun test`).
+    const script = packageScriptName(words);
+    if (script !== null) {
+      if (scripts && typeof scripts[script] === 'string' && inner(scripts[script])) return true;
+      if (!scripts && /^(?:test|t|tst)(?::|$)/.test(script) && script !== 'test:unit') return true;
     }
+    let [program, ...args] = words;
+    if (/^(?:ba|da|z|k)?sh$/.test(program || '')) return false; // a script file, not a `-c` string
     if (/^(?:npm|pnpm|yarn|bun)$/.test(program || '')) {
       if (['exec', 'x'].includes(args[0])) args.shift();
       else if (program === 'npm') return false;
@@ -58,7 +89,8 @@ function heavyCommand(command, depth = 0, withSubstitutions = true) {
   });
 }
 
-export function findUngatedHeavySpawns(source, filename = 'source.mjs') {
+/** `scripts` overrides the package script table (tests); by default this repository's package.json is read. */
+export function findUngatedHeavySpawns(source, filename = 'source.mjs', { scripts = packageScripts() } = {}) {
   if (typeof source !== 'string') return [{ filename, line: 1, reason: 'Unreadable source; inspect manually before clearing admission lint' }];
   const file = ts.createSourceFile(filename, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
   if (file.parseDiagnostics.length) return [{ filename, line: 1, reason: 'Unreadable syntax; inspect manually before clearing admission lint' }];
@@ -90,10 +122,11 @@ export function findUngatedHeavySpawns(source, filename = 'source.mjs') {
         for (const e of named.elements) if (['runUnderAdmission', 'admittedArgv'].includes((e.propertyName || e.name).text)) admission.set(e.name.text, (e.propertyName || e.name).text);
       }
     }
-    if ((ts.isVariableDeclaration(node) || ts.isParameter(node)) && ts.isIdentifier(node.name)) {
+    // A destructured name (`const { execPath } = process`) is bound to its BindingElement.
+    if ((ts.isVariableDeclaration(node) || ts.isParameter(node) || ts.isBindingElement(node)) && ts.isIdentifier(node.name)) {
       const scope = scopeOf(node);
       if (!scopes.has(scope)) scopes.set(scope, new Map());
-      scopes.get(scope).set(node.name.text, node.initializer ?? null);
+      scopes.get(scope).set(node.name.text, ts.isBindingElement(node) ? node : node.initializer ?? null);
     }
   });
   walk(file, node => {
@@ -132,8 +165,40 @@ export function findUngatedHeavySpawns(source, filename = 'source.mjs') {
     }
     return false;
   };
+  // The running Node binary, however it is spelled: `process.execPath`, `process['argv0']`, `process.argv[0]`,
+  // `globalThis.process.execPath`, an alias of one, or `const { execPath } = process`.
+  const keyOf = node => (node && (ts.isIdentifier(node) || ts.isStringLiteralLike(node) || ts.isNumericLiteral(node)) ? node.text : undefined);
+  const memberOf = node => (ts.isPropertyAccessExpression(node) ? node.name.text
+    : ts.isElementAccessExpression(node) ? keyOf(node.argumentExpression) : undefined);
+  const isProcess = (node, seen) => {
+    if (!node || seen.has(node)) return false;
+    seen.add(node);
+    if (ts.isParenthesizedExpression(node)) return isProcess(node.expression, seen);
+    if (ts.isIdentifier(node)) {
+      const value = valueOf(node);
+      return value === undefined ? node.text === 'process' : !!value && isProcess(value, seen);
+    }
+    return memberOf(node) === 'process' && ts.isIdentifier(node.expression) && node.expression.text === 'globalThis';
+  };
+  const NODE_BINARY_KEYS = ['execPath', 'argv0'];
+  const nodeBinary = (node, seen = new Set()) => {
+    if (!node || seen.has(node)) return false;
+    seen.add(node);
+    if (ts.isParenthesizedExpression(node)) return nodeBinary(node.expression, seen);
+    if (ts.isIdentifier(node)) { const value = valueOf(node); return !!value && nodeBinary(value, seen); }
+    if (ts.isBindingElement(node)) {
+      const pattern = node.parent, declaration = pattern?.parent;
+      return ts.isObjectBindingPattern(pattern) && NODE_BINARY_KEYS.includes(keyOf(node.propertyName || node.name))
+        && ts.isVariableDeclaration(declaration) && isProcess(declaration.initializer, seen);
+    }
+    if (!ts.isPropertyAccessExpression(node) && !ts.isElementAccessExpression(node)) return false;
+    const member = memberOf(node);
+    if (NODE_BINARY_KEYS.includes(member)) return isProcess(node.expression, seen);
+    return member === '0' && memberOf(node.expression) === 'argv' && isProcess(node.expression.expression, seen);
+  };
   const literals = (node, seen = new Set()) => {
     if (!node) return '';
+    if (nodeBinary(node)) return 'node';
     if (ts.isStringLiteralLike(node) || [ts.SyntaxKind.TemplateHead, ts.SyntaxKind.TemplateMiddle, ts.SyntaxKind.TemplateTail].includes(node.kind)) return node.text;
     if (ts.isPropertyAccessExpression(node)) return literals(node.expression, seen);
     if (ts.isIdentifier(node)) {
@@ -174,18 +239,25 @@ export function findUngatedHeavySpawns(source, filename = 'source.mjs') {
     const origin = admittedField(node.arguments[0], 'file');
     if ((origin && origin === admittedField(node.arguments[1], 'args')) || inAdmissionCallback(node)) continue;
     const method = ts.isIdentifier(callee) ? bindings.get(callee.text) : callee.name.text;
-    // `process.execPath` (or `process.argv0`) is the running Node binary: spawnSync(process.execPath, ['--test', …]).
-    const nodeBinary = (() => {
-      const file = resolveValue(node.arguments[0]);
-      return file && ts.isPropertyAccessExpression(file) && ts.isIdentifier(file.expression)
-        && file.expression.text === 'process' && ['execPath', 'argv0'].includes(file.name.text);
-    })();
-    let command = nodeBinary ? 'node' : literals(node.arguments[0]).trim();
+    // `literals` spells the running Node binary (`process.execPath`, …) as `node`.
+    let command = literals(node.arguments[0]).trim();
     const args = resolveValue(node.arguments[1]);
+    // exec/execSync always run a shell; spawn/execFile do with a truthy `shell` option, joining argv unquoted.
+    const options = node.arguments.slice(1, 3).map(arg => resolveValue(arg)).find(arg => arg && ts.isObjectLiteralExpression(arg));
+    const shellOption = options?.properties.some(prop => ts.isPropertyAssignment(prop) && keyOf(prop.name) === 'shell'
+      && prop.initializer.kind !== ts.SyntaxKind.FalseKeyword && !(ts.isStringLiteralLike(prop.initializer) && !prop.initializer.text));
+    const shell = /^exec(?:Sync)?$/.test(method) || (method !== 'fork' && !!shellOption);
     if (!/^exec(?:Sync)?$/.test(method) && args && ts.isArrayLiteralExpression(args)) {
-      command += ' ' + args.elements.map(arg => quote(literals(arg).trim())).join(' ');
+      // A spread of a resolvable array literal contributes its elements, not one joined word.
+      const flat = (elements, seen) => elements.flatMap(el => {
+        if (!ts.isSpreadElement(el)) return [el];
+        const spread = resolveValue(el.expression);
+        return spread && ts.isArrayLiteralExpression(spread) && !seen.has(spread) ? flat(spread.elements, new Set([...seen, spread])) : [el];
+      });
+      command += ' ' + flat(args.elements, new Set([args])).map(arg => (shell ? literals(arg).trim() : quote(literals(arg).trim()))).join(' ');
     }
-    if (!heavyCommand(command)) continue;
+    // Plain argv reaches no shell, so its words are data: no substitution scan and no substitution bounds.
+    if (!heavyCommand(command, { substitutions: shell, scripts })) continue;
     const line = file.getLineAndCharacterOfPosition(node.getStart(file)).line;
     if (allowed.has(node)) continue;
     hits.push({ filename, line: line + 1, reason: 'Heavy spawn requires runUnderAdmission/admittedArgv or a justified inline allowance' });

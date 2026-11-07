@@ -153,6 +153,34 @@ describe('agent command audit', () => {
   ])('classifies unqueued heavy spelling %s', (command, category) => {
     expect(classifyCommand(command)).toEqual([expect.objectContaining({ category, queued: false })]);
   });
+  // Self-review #6461 (round 2): credentials behind a harmless name, a line continuation, other option names,
+  // `-p` password options, joined or substituted values. A value with no known token prefix is used throughout.
+  const zq = 'Zq9vWm4Lp';
+  it.each([
+    `curl https://gitlab.test/api?page=1&private_token=${zq}`, `curl https://api.test/x?a=b&access_token=${zq}`,
+    `curl -d grant_type=x&client_secret=${zq}`, `docker run --env=GITHUB_TOKEN=${zq} img`,
+    `docker build --build-arg=NPM_TOKEN=${zq} .`, `cmd --set-env=GH_TOKEN=${zq}`, `cmd --token \\\n ${zq}`,
+    `cmd --passphrase ${zq}`, `cmd --pwd ${zq}`, `cmd --jwt ${zq}`, `MYSQL_PWD=${zq} mysql`, `cmd --access-key-id ${zq}`,
+    `docker login -p ${zq} reg`, `sshpass -p ${zq} ssh h`, `mysql -u root -p${zq} db`, `GH_TOKEN="a b"${zq} gh pr list`,
+    `GH_TOKEN=$(echo ${zq}) gh pr list`, `cmd --token $(a $(b) ${zq})`, `cmd --token $(a ')' ${zq})`,
+    `cmd --token=$(a "x)" ${zq})`, `cmd --token <(echo ${zq})`, `cmd --token \`echo \\\` ${zq}\``,
+    `cmd --token $(unterminated ${zq}`, `curl -H "X-Auth: ${zq}"`, `cmd --token${String.fromCharCode(0x2028)}${zq}`,
+  ])('redacts the credential value in %s', command => {
+    const out = redact(command);
+    expect(out).not.toContain(zq);
+    expect(out).toContain('[REDACTED]');
+  });
+  it.each([
+    'mkdir -p a/b', 'npm run build -- --page=2', 'curl https://x.test/?page=1&limit=2', 'docker run -p 80:80 img',
+    'ls; mysql -h host -P 3306', 'echo a=b c=d',
+  ])('leaves short options and harmless assignments in %s unchanged', command => expect(redact(command)).toBe(command));
+  it.each([
+    ['bash -c "echo $(npm test)"', false], ["bash -c 'echo $(npm test)'", false], ['bash -c "echo \\$(npm test)"', false],
+    ['sh -c "sh -c \\"npm test\\""', false], [`bash -c "x $(sh -c 'npm test')"`, false],
+    [queue + 'bash -c "echo $(npm test)"', false],
+  ])('counts the run in %s exactly once', (command, queued) => {
+    expect(classifyCommand(command)).toEqual([expect.objectContaining({ category: 'npm test/check', queued })]);
+  });
   it('redacts a space-separated credential option through auditLines', () => {
     const report = JSON.stringify(auditLines([claude(`npx vitest run a.test.mjs --token ${fakeGl}`)], { date: '2026-07-02' }));
     expect(report).not.toContain('12345678901234567890');

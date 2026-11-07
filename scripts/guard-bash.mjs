@@ -3503,6 +3503,40 @@ export function commandSubstitutionBodies(text) {
   return substitutionBodies(String(text || ''));
 }
 
+/** The `-c` string a shell head in `segment` executes (`sh -c '…'`, `bash -ec "…"`, `busybox sh -c …`), as the
+ *  inner shell RECEIVES it (a `"…"` word has `\"`, `\\`, `\$`, ``\` `` resolved), or null. `innerSubstitutions`
+ *  is false when the outer shell already ran every substitution in the word (it was not single-quoted and holds
+ *  no escaped opener), so a caller that already counted the outer command's substitutions must not count them
+ *  again. Shared with the spawn lint and the transcript audit. Pure. */
+export function shellCString(segment) {
+  const cmd = canonicalCommand(String(segment || '').trim().replace(SHELL_CONTROL_PREFIX, ''));
+  const words = headWords(cmd);
+  const prog = words.length ? words[0].text : '';
+  if (!SHELL_PROGRAMS.has(prog)) return null;
+  for (let i = 1; i < words.length; i++) {
+    const w = words[i].text;
+    if (SHELL_C_FLAG.test(w)) {
+      const word = words[i + 1];
+      if (!word) return null;
+      // The outer shell skips substitutions only inside a single-quoted run (outside `"…"`) or behind an
+      // escaped opener; a `'` inside `"…"` is a literal character, not a quote.
+      const raw = cmd.slice(word.start, word.end);
+      let unexpanded = false, dq = false;
+      for (let k = 0; k < raw.length && !unexpanded; k += 1) {
+        const ch = raw[k];
+        if (ch === '\\') { unexpanded = raw[k + 1] === '$' || raw[k + 1] === '`'; k += 1; }
+        else if (ch === '"') dq = !dq;
+        else if (ch === "'" && !dq) unexpanded = true;
+      }
+      return { text: word.dq ? word.text.replace(/\\(["\\$`])/g, '$1') : word.text, innerSubstitutions: unexpanded };
+    }
+    if (w.startsWith('-')) continue;
+    if (prog === 'busybox' && SHELL_PROGRAMS.has(w)) continue;   // `busybox sh -c '…'`
+    break;                                                        // a SCRIPT FILE, not a `-c` string
+  }
+  return null;
+}
+
 /** Deny any unqueued test/standards execution, with a runnable replacement. Pure; no escape. */
 export function ungatedHeavyRunReason(segment) {
   // Shell control words are syntax, not part of the runnable replacement for this segment.

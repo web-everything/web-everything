@@ -10,7 +10,7 @@ import { homedir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
-import { canonicalCommand, commandSubstitutionBodies, parseSegments, shellTokens, ungatedHeavyRunKind } from '../guard-bash.mjs';
+import { canonicalCommand, commandSubstitutionBodies, parseSegments, shellCString, shellTokens, ungatedHeavyRunKind } from '../guard-bash.mjs';
 
 const etDay = value => new Intl.DateTimeFormat('en-CA', {
   timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
@@ -18,56 +18,112 @@ const etDay = value => new Intl.DateTimeFormat('en-CA', {
 
 // Option names that carry a credential (`--token`, `--api-key`, `--client-secret`, `--password`, `--pass`,
 // `--pat`/`--gitlab-pat` personal access tokens, …). `pat` is a whole name part, so `--path`/`--compat` stay data.
-const CREDENTIAL_OPTION = /token|secret|passw(?:or)?d|^pass$|^pw$|(?:^|[-_])pat$|credential|auth(?!or)|cookie|key$/i;
-// One whole shell word: concatenated quoted runs, `$'…'`, `$( … )`, backticks, escapes and plain characters.
-const SHELL_WORD = String.raw`(?:"(?:\\.|[^"\\])*"|'[^']*'|\$'(?:\\.|[^'\\])*'|\$\([^)]*\)|` + '`[^`]*`'
-  + String.raw`|\\.|[^\s"'` + '`' + String.raw`;|&\\])+`;
+const CREDENTIAL_OPTION = /token|secret|passw(?:or)?d|passphrase|^pass$|^pw$|^pwd$|jwt|(?:^|[-_])pat$|credential|auth(?!or)|cookie|key(?:[-_]?id)?$/i;
 const EMPTY_WORD = /^(?:""|'')+$/;
-// Header names (`Authorization:`, `PRIVATE-TOKEN:`, `x-api-key:`, `token:`) and assignment names
-// (`API_KEY=`, `MY_PASS=`, `GITLAB_AUTH=`) whose value is a credential. Tested on one captured name.
-const CREDENTIAL_HEADER = /authorization|token|secret|password|cookie|(?:api|access|private|secret|auth)[-_]?key/i;
-const CREDENTIAL_ASSIGNMENT = /key|token|secret|passw(?:or)?d|pass(?:[_-]|$)|(?:^|[_-])pat(?:[_-]|$)|credential|auth(?!or)|cookie/i;
+// Header names (`Authorization:`, `PRIVATE-TOKEN:`, `x-api-key:`, `X-Auth:`, `token:`) and assignment names
+// (`API_KEY=`, `MY_PASS=`, `GITLAB_AUTH=`, `MYSQL_PWD=`) whose value is a credential. Tested on one captured name.
+const CREDENTIAL_HEADER = /authorization|token|secret|password|cookie|jwt|(?:^|[-_])auth$|(?:api|access|private|secret|auth)[-_]?key/i;
+const CREDENTIAL_ASSIGNMENT = /key|token|secret|passw(?:or)?d|passphrase|pass(?:[_-]|$)|(?:^|[_-])pwd$|jwt|(?:^|[_-])pat(?:[_-]|$)|credential|auth(?!or)|cookie/i;
+// Programs whose `-p` short option carries a password (`docker login -p v`, `sshpass -p v`, `mysql -pv`).
+const PASSWORD_SHORT_P = /(?<![\w./-])(?:(?:docker|podman|nerdctl|buildah|skopeo|helm\s+registry)\s+login|sshpass|mysql\w*|mariadb\w*)(?![\w-])/g;
 // Commands longer than this are cut before redaction so every rule stays linear-time; the cut is marked.
 export const REDACT_MAX_CHARS = 16384;
 
-/** Redact a credential option together with its value, attached (`--token=x`) or separate (`--token x`).
- *  Option names are compared with shell quotes removed (`--"token"`, `"--token"`, `--to''ken`); an empty
- *  quoted value (`--token "" v`) takes the next word too. */
-function redactCredentialOptions(text) {
-  const name = /(?<![^\s"'])["']?-{1,2}([^\s=]+)(=?)/g;
-  let out = '', last = 0;
-  for (let m; (m = name.exec(text));) {
-    if (!CREDENTIAL_OPTION.test(m[1].replace(/["']/g, ''))) continue;
-    let end = name.lastIndex;
-    for (let words = 0; words < 2; words += 1) {
-      const value = new RegExp((m[2] && !words ? '' : String.raw`\s+`) + SHELL_WORD, 'y');
-      value.lastIndex = end;
-      const hit = value.exec(text);
-      if (!hit) break;
-      end = value.lastIndex;
-      if (!EMPTY_WORD.test(hit[0].trim())) break;
+/** End index of the one shell word that starts at `start`: concatenated quoted runs, `$'…'`, `$( … )` /
+ *  `<( … )` / `${ … }` at any nesting depth (with quotes inside), backticks and escapes. One linear pass. An
+ *  unterminated construct runs to the end of the text, so a value that cannot be bounded is redacted whole. */
+function shellWordEnd(text, start) {
+  const stack = [];
+  let i = start;
+  while (i < text.length) {
+    const c = text[i], top = stack.at(-1);
+    if (top === "'") { i += 1; if (c === "'") stack.pop(); continue; }
+    if (c === '\\') { i += 2; continue; }
+    if (top === "$'") { i += 1; if (c === "'") stack.pop(); continue; }
+    if (top === '`') { i += 1; if (c === '`') stack.pop(); continue; }
+    if ((c === '$' || c === '<' || c === '>') && text[i + 1] === '(') { stack.push(')'); i += 2; continue; }
+    if (c === '$' && text[i + 1] === '{') { stack.push('}'); i += 2; continue; }
+    if (c === '`') { stack.push('`'); i += 1; continue; }
+    if (top === '"') { i += 1; if (c === '"') stack.pop(); continue; }
+    if (c === '"') { stack.push('"'); i += 1; continue; }
+    if (c === "'") { stack.push(text[i - 1] === '$' ? "$'" : "'"); i += 1; continue; }
+    if (top === ')' || top === '}') {
+      if (c === top) stack.pop();
+      else if (c === '(' && top === ')') stack.push(')');
+      i += 1;
+      continue;
     }
-    out += text.slice(last, m.index) + '[REDACTED]';
-    last = name.lastIndex = end;
+    if (/[\s;|&()<>]/.test(c)) break;
+    i += 1;
+  }
+  return Math.min(i, text.length);
+}
+
+/** Redact `--name v` / `--name=v` style values: `named` is a global regex whose match ends where the value
+ *  starts (group 1 the option name; group 2 defined and non-false-y per `attached` when the value is glued on);
+ *  `isCredential` tests the name. An empty quoted value (`--token "" v`) takes the next word too. */
+function redactOptionValues(text, named, isCredential, { attached = m => !!m[2], replacement = '[REDACTED]' } = {}) {
+  let out = '', last = 0;
+  for (let m; (m = named.exec(text));) {
+    if (!isCredential(m[1].replace(/["']/g, ''))) continue;
+    let end = named.lastIndex;
+    for (let words = 0; words < 2; words += 1) {
+      let at = end;
+      if (!attached(m, end) || words) { while (/\s/.test(text[at] || '')) at += 1; if (at === end) break; }
+      const wordEnd = shellWordEnd(text, at);
+      if (wordEnd === at) break;
+      end = wordEnd;
+      if (!EMPTY_WORD.test(text.slice(at, wordEnd))) break;
+    }
+    out += text.slice(last, m.index) + replacement;
+    last = named.lastIndex = Math.max(end, named.lastIndex);
+  }
+  return out + text.slice(last);
+}
+
+/** Redact a credential option together with its value, attached (`--token=x`) or separate (`--token x`).
+ *  Option names are compared with shell quotes removed (`--"token"`, `"--token"`, `--to''ken`). */
+function redactCredentialOptions(text) {
+  return redactOptionValues(text, /(?<![^\s"'])["']?-{1,2}([^\s=]+)(=?)/g, name => CREDENTIAL_OPTION.test(name));
+}
+
+/** Redact `NAME=value` credential assignments, anywhere a name starts: env prefixes (`GH_TOKEN="a b"x cmd`),
+ *  query strings (`?page=1&private_token=v`) and nested option values (`--env=GITHUB_TOKEN=v`). A harmless name
+ *  is skipped past its `=` only, so the name after it is still examined; the value is one whole shell word. */
+function redactAssignments(text) {
+  return redactOptionValues(text, /(?<![\w-])([\w-]+)\s*(=)\s*/g, name => CREDENTIAL_ASSIGNMENT.test(name));
+}
+
+/** `-p` password values of the programs in PASSWORD_SHORT_P, attached (`-pv`) or separate (`-p v`). */
+function redactShortPasswords(text) {
+  let out = '', last = 0;
+  for (let m; (m = PASSWORD_SHORT_P.exec(text));) {
+    const segmentEnd = text.slice(PASSWORD_SHORT_P.lastIndex).search(/[;|&\n]/);
+    const end = segmentEnd < 0 ? text.length : PASSWORD_SHORT_P.lastIndex + segmentEnd;
+    const segment = text.slice(PASSWORD_SHORT_P.lastIndex, end);
+    // The value is glued on when a non-space follows `-p` (`-pv`, `-p=v`).
+    out += text.slice(last, PASSWORD_SHORT_P.lastIndex) + redactOptionValues(segment, /(?<!\S)-(p)(=?)/g, () => true,
+      { attached: (m, at) => !/^\s?$/.test(segment[at] ?? ''), replacement: '-p [REDACTED]' });
+    last = PASSWORD_SHORT_P.lastIndex = end;
   }
   return out + text.slice(last);
 }
 
 export function redact(text) {
-  let clean = stripVTControlCharacters(String(text)).replace(/[\x00-\x1f\x7f]/g, ' ');
+  // A `\`+newline is a line continuation: the shell deletes both, so the next line continues the same word.
+  let clean = stripVTControlCharacters(String(text)).replace(/\\\r?\n/g, '').replace(/[\x00-\x1f\x7f\x85]|\p{Zl}|\p{Zp}/gu, ' ');
   if (clean.length > REDACT_MAX_CHARS) clean = clean.slice(0, REDACT_MAX_CHARS) + ' …[truncated]';
   // Value-carrying forms run before the generic name rule below, which would otherwise redact only the name.
   // Every rule that starts with a repeated class is anchored to a word start, so none of them is quadratic.
-  return redactCredentialOptions(clean
+  return redactAssignments(redactShortPasswords(redactCredentialOptions(clean
     .replace(/(?<![a-z0-9+.-])([a-z][a-z0-9+.-]{0,31}:\/\/)[^\s/@"']+@/gi, '$1[REDACTED]@')
     // HTTP-style credential headers and `token: v`, with or without an auth scheme word.
     .replace(/(?<![\w-])([\w-]+)\s*:\s*(?:(?:Bearer|Basic|Digest|Negotiate|token)\s+)?[^\s"';]+/gi,
       (all, name) => (CREDENTIAL_HEADER.test(name) ? '[REDACTED]' : all))
     // curl/git-style `user:password` pairs.
-    .replace(/(?<!\S)(?:--user(?:=|\s+)|-u\s*)[^\s:]*:\S+/g, '[REDACTED]'))
+    .replace(/(?<!\S)(?:--user(?:=|\s+)|-u\s*)[^\s:]*:\S+/g, '[REDACTED]'))))
     .replace(/\b(?:gh[pousr]_|github_pat_|glpat-|sk-|xox[a-z]-)[A-Za-z0-9_-]+|\bnpm_[A-Za-z0-9]{20,}|\bAKIA[0-9A-Z]{16}\b/gi, '[REDACTED]')
     .replace(/\bBearer\s+(?:"[^"]*"|'[^']*'|[^\s"'`;,]+)/gi, '[REDACTED]')
-    .replace(/(?<![\w-])([\w-]+)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s;,]+)/g, (all, name) => (CREDENTIAL_ASSIGNMENT.test(name) ? '[REDACTED]' : all))
     .replace(/\b(?:token|secret|key|bearer)\S*/gi, '[REDACTED]')
     .replace(/\b[a-f0-9]{32,}\b/gi, '[REDACTED]')
     .replace(/(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{40,}={0,2}(?![A-Za-z0-9+/_-])/g, '[REDACTED]');
@@ -126,12 +182,12 @@ export function classifyCommand(cmd, depth = 0, withSubstitutions = true) {
     const admitted = /^node\s+\S*heavy-admission\.mjs\s+run\b[\s\S]*?\s--\s+([\s\S]+)$/.exec(head);
     if (admitted) { queued = true; head = canonicalCommand(admitted[1]); }
     const words = shellTokens(head).filter(word => !word.op).map(word => word.text);
-    if (/^(?:ba|da|z|k)?sh$/.test(words[0] || '')) {
-      const at = words.findIndex((word, index) => index > 0 && /^-[a-z]*c[a-z]*$/.test(word));
-      if (at >= 0 && words[at + 1]) {
-        for (const hit of classifyCommand(words[at + 1], depth + 1)) out.push({ ...hit, queued: queued || hit.queued });
-        continue;
-      }
+    // `sh -c "…"` as the inner shell receives it. Substitutions the outer shell already ran (an unquoted or
+    // double-quoted word) were counted by the outer extraction above, so only a single-quoted body re-extracts.
+    const shellC = shellCString(head);
+    if (shellC) {
+      for (const hit of classifyCommand(shellC.text, depth + 1, shellC.innerSubstitutions)) out.push({ ...hit, queued: queued || hit.queued });
+      continue;
     }
     if (/^(?:npm|pnpm|yarn|bun)\s+run\s+(?:test:unit|check:standards)(?:\s|$)/.test(head)) queued = true;
     let category;
