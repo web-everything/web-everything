@@ -43,7 +43,7 @@ import { lockIdFor } from '../../readiness/file-locks.mjs';
 import { alertsFilePath } from './state.mjs';
 import { readGit } from '../proc-read.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
-import { pnpmAwareInstaller } from './deps-job.mjs';
+import { pnpmAwareInstaller, rebaseNodeModulesLinks } from './deps-job.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const SETTINGS_PATH = resolve(SELF, '..', '..', 'daemon-rebuild-settings.json');
@@ -110,10 +110,17 @@ export function cloneNodeModulesInstaller(sourceRoot, { exec = execFileSync, fal
     let same = false;
     try { same = readFileSync(join(sourceRoot, 'package-lock.json'), 'utf8') === readFileSync(join(into, 'package-lock.json'), 'utf8'); } catch { same = false; }
     if (same && existsSync(src)) {
-      try { exec('cp', ['-cR', src, join(into, 'node_modules')], { stdio: 'ignore', timeout: 5 * 60_000 }); return; } catch { /* no clonefile */ }
-      rmSync(join(into, 'node_modules'), { recursive: true, force: true });
-      exec('cp', ['-R', src, join(into, 'node_modules')], { stdio: 'ignore', timeout: 10 * 60_000 });
-      return;
+      const dest = join(into, 'node_modules');
+      // The clone's tree may hold pnpm's relative store links; they must resolve from the snapshot's depth too.
+      const rebased = () => {
+        if (!existsSync(dest)) return true;
+        try { rebaseNodeModulesLinks({ from: src, copy: dest, final: dest }); return true; } catch { return false; }
+      };
+      try { exec('cp', ['-cR', src, dest], { stdio: 'ignore', timeout: 5 * 60_000 }); if (rebased()) return; } catch { /* no clonefile */ }
+      rmSync(dest, { recursive: true, force: true });
+      exec('cp', ['-R', src, dest], { stdio: 'ignore', timeout: 10 * 60_000 });
+      if (rebased()) return;
+      rmSync(dest, { recursive: true, force: true });
     }
     fallback(into);
   };

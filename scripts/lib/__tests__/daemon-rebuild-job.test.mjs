@@ -9,10 +9,10 @@ import {
   describe, it, expect, beforeEach, afterEach, vi,
 } from 'vitest';
 import {
-  mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync,
+  mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync, symlinkSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, relative } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 import {
@@ -437,5 +437,24 @@ describe('detached rebuild lock wait', () => {
     for (const value of ['0', '-1', 'invalid']) {
       expect(wait({ WE_DAEMON_REBUILD_JOB_LOCK_WAIT_MS: value })).toBe(900_000);
     }
+  });
+});
+
+describe('cloneNodeModulesInstaller — legacy clone keeps pnpm store links resolving (real cp, no mocks)', () => {
+  it('a relative global-store link in the clone still resolves from the deeper snapshot', () => {
+    const base = mktemp('we-rebuild-links-');
+    const global = join(base, 'global-store', 'esbuild');
+    writeFile(global, 'marker.txt', 'esbuild');
+    const sourceRoot = join(base, 'clone');
+    const into = join(base, 'jobs', 'snapshots', 'node-modules', 'key');
+    for (const dir of [sourceRoot, into]) {
+      writeFile(dir, 'package.json', '{"name":"snapshot","version":"1.0.0"}');
+      writeFile(dir, 'package-lock.json', '{"lockfileVersion":3}');
+    }
+    mkdirSync(join(sourceRoot, 'node_modules'), { recursive: true });
+    symlinkSync(relative(join(sourceRoot, 'node_modules'), global), join(sourceRoot, 'node_modules', 'esbuild'));
+    const pnpm = { env: {}, which: () => null, log: () => {}, storeDir: join(base, 'no-store') };
+    cloneNodeModulesInstaller(sourceRoot, { pnpm, fallback: () => { throw new Error('npm fallback must not run'); } })(into);
+    expect(readFileSync(join(into, 'node_modules', 'esbuild', 'marker.txt'), 'utf8')).toBe('esbuild');
   });
 });

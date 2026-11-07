@@ -6,13 +6,15 @@
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
-  existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync,
+  chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync,
+  symlinkSync, writeFileSync,
 } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 
 import {
-  refreshDepsAsJob, resolveDepsAsJob, installStep, swapNodeModules, depsStore, runDepsJob,
+  nativeBuilt, refreshDepsAsJob, resolveDepsAsJob, installStep, swapNodeModules, depsStore, runDepsJob,
   DEPS_JOB_KIND, DEPS_JOB_KINDS, DEPS_AS_JOB_ENV, DEPS_JOB_NPM_ARGS, depsJobInstaller,
   pnpmAwareInstaller, DEPS_MARKER_FILE,
 } from '../daemon-rebuild/deps-job.mjs';
@@ -497,5 +499,160 @@ describe('swapNodeModules', () => {
     swapNodeModules({ root: clone, storeDir: store });
     expect(readdirSync(join(clone, 'node_modules'))).toEqual(['new.txt']);
     expect(readdirSync(clone)).toEqual(['node_modules']);
+  });
+});
+
+describe('swapNodeModules — pnpm links survive the change of depth (real cp, no mocks)', () => {
+  // The store sits deeper (jobs/node-modules/<key>) than the clone, like the daemon's real layout.
+  function pnpmLayout() {
+    const base = mk('swap-gvs-');
+    const global = join(base, 'global-store');
+    for (const pkg of ['esbuild', '@esbuild/darwin-arm64']) {
+      mkdirSync(join(global, pkg), { recursive: true });
+      writeFileSync(join(global, pkg, 'marker.txt'), pkg);
+    }
+    const store = join(base, 'jobs', 'snapshots', 'node-modules', 'key');
+    const modules = join(store, 'node_modules');
+    mkdirSync(join(modules, '@esbuild'), { recursive: true });
+    mkdirSync(join(modules, '.bin'));
+    mkdirSync(join(modules, '.pnpm', 'inner'), { recursive: true });
+    writeFileSync(join(modules, '.pnpm', 'inner', 'inner.txt'), 'inner');
+    const rel = (from, to) => relative(from, to);
+    symlinkSync(rel(modules, join(global, 'esbuild')), join(modules, 'esbuild'));
+    symlinkSync(rel(join(modules, '@esbuild'), join(global, '@esbuild/darwin-arm64')), join(modules, '@esbuild', 'darwin-arm64'));
+    symlinkSync(join('.pnpm', 'inner'), join(modules, 'inner')); // inside the tree: text must stay
+    symlinkSync(join(global, 'esbuild'), join(modules, 'absolute')); // absolute: untouched
+    const shim = join(modules, '.bin', 'esbuild');
+    writeFileSync(shim, [
+      '#!/bin/sh',
+      'basedir=$(dirname "$0")',
+      `export NODE_PATH="$basedir/${rel(join(modules, '.bin'), join(global, 'esbuild'))}:$basedir/../.pnpm/inner:$NODE_PATH"`,
+      `cat "$basedir/${rel(join(modules, '.bin'), join(global, 'esbuild'))}/marker.txt"`,
+      '',
+    ].join('\n'));
+    chmodSync(shim, 0o755);
+    const clone = join(base, 'clone');
+    mkdirSync(join(clone, 'node_modules'), { recursive: true });
+    writeFileSync(join(clone, 'node_modules', 'old.txt'), 'old');
+    return { base, global, store, modules, clone };
+  }
+
+  it('relative global-store links and bin shims still resolve at the clone, and the copy is not mocked', () => {
+    const f = pnpmLayout();
+    // Reproduces the break: a verbatim copy dangles at this depth.
+    const naive = join(f.base, 'naive');
+    execFileSync('cp', ['-R', f.modules, naive]);
+    expect(existsSync(join(naive, 'esbuild'))).toBe(false);
+
+    swapNodeModules({ root: f.clone, storeDir: f.store });
+    const live = join(f.clone, 'node_modules');
+    expect(realpathSync(join(live, 'esbuild'))).toBe(realpathSync(join(f.global, 'esbuild')));
+    expect(readFileSync(join(live, 'esbuild', 'marker.txt'), 'utf8')).toBe('esbuild');
+    expect(readFileSync(join(live, '@esbuild', 'darwin-arm64', 'marker.txt'), 'utf8')).toBe('@esbuild/darwin-arm64');
+    expect(readFileSync(join(live, 'inner', 'inner.txt'), 'utf8')).toBe('inner');
+    expect(readlinkSync(join(live, 'inner'))).toBe(join('.pnpm', 'inner'));
+    expect(readlinkSync(join(live, 'absolute'))).toBe(join(f.global, 'esbuild'));
+    expect(execFileSync('sh', [join(live, '.bin', 'esbuild')], { encoding: 'utf8' })).toBe('esbuild');
+    expect(statSync(join(live, '.bin', 'esbuild')).mode & 0o111).not.toBe(0);
+    expect(readFileSync(join(live, '.bin', 'esbuild'), 'utf8')).toContain('$basedir/../.pnpm/inner');
+    // The kept store is not modified by the rebase.
+    expect(readFileSync(join(f.modules, '.bin', 'esbuild'), 'utf8')).toContain(relative(join(f.modules, '.bin'), join(f.global, 'esbuild')));
+    expect(readdirSync(f.clone).sort()).toEqual(['node_modules']);
+  });
+
+  it('a link that cannot resolve after the copy fails the swap before the working deps are touched', () => {
+    const f = pnpmLayout();
+    // Source resolves, the (injected) copy drops the link target's directory → rebase must refuse, not stamp.
+    const exec = (cmd, args, opts) => {
+      execFileSync(cmd, args, opts);
+      rmSync(join(args[args.length - 1], '.pnpm', 'inner'), { recursive: true, force: true });
+    };
+    let err;
+    try { swapNodeModules({ root: f.clone, storeDir: f.store, exec }); } catch (e) { err = e; }
+    expect(err?.message).toMatch(/did not survive the copy/);
+    expect(err?.liveIntact).not.toBe(false);
+    expect(readdirSync(join(f.clone, 'node_modules'))).toEqual(['old.txt']);
+    expect(readdirSync(f.clone)).toEqual(['node_modules']);
+  });
+});
+
+describe('nativeBuilt — a platform package needs its own binding (real files)', () => {
+  const MACHO = Buffer.from('cffaedfe00000000', 'hex');
+  // A pnpm GVS-like layout: <store>/<pkg>/node_modules/<name>, adjacent siblings, linked from into/node_modules.
+  function sharpLayout({ binding = true, libvips = true, libvipsExecutable = false } = {}, into = mk('native-into-')) {
+    const gvs = mk('native-gvs-');
+    const platform = `${process.platform}-${process.arch}`;
+    const pkg = (dir, manifest, files = {}) => {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest));
+      for (const [name, mode] of Object.entries(files)) {
+        mkdirSync(join(dir, name, '..'), { recursive: true });
+        writeFileSync(join(dir, name), MACHO);
+        chmodSync(join(dir, name), mode);
+      }
+    };
+    const modules = join(gvs, 'sharp', 'node_modules');
+    pkg(join(modules, 'sharp'), {
+      name: 'sharp', optionalDependencies: { [`@img/sharp-${platform}`]: '1', [`@img/sharp-libvips-${platform}`]: '1' },
+    });
+    if (binding) {
+      pkg(join(modules, '@img', `sharp-${platform}`), {
+        name: `@img/sharp-${platform}`, os: [process.platform], cpu: [process.arch],
+        optionalDependencies: { [`@img/sharp-libvips-${platform}`]: '1' },
+      }, { 'lib/sharp.node': 0o644 });
+    }
+    if (libvips) {
+      pkg(join(modules, '@img', `sharp-libvips-${platform}`), {
+        name: `@img/sharp-libvips-${platform}`, os: [process.platform], cpu: [process.arch],
+      }, { 'lib/libvips-cpp.8.17.1.dylib': libvipsExecutable ? 0o755 : 0o644 });
+    }
+    mkdirSync(join(into, 'node_modules'), { recursive: true });
+    writeFileSync(join(into, 'package.json'), '{}');
+    symlinkSync(join(modules, 'sharp'), join(into, 'node_modules', 'sharp'));
+    return into;
+  }
+
+  it('accepts the binding plus its supporting library', () => {
+    expect(nativeBuilt(sharpLayout(), ['sharp'])).toBe(true);
+  });
+
+  it.each([false, true])('libvips present (executable=%s) but the binding absent is NOT built', (libvipsExecutable) => {
+    expect(nativeBuilt(sharpLayout({ binding: false, libvipsExecutable }), ['sharp'])).toBe(false);
+  });
+
+  it('the binding present but its platform supporting library absent is NOT built', () => {
+    expect(nativeBuilt(sharpLayout({ libvips: false }), ['sharp'])).toBe(false);
+  });
+
+  it('a package whose only artifact is a shared library is NOT built', () => {
+    const into = mk('native-lib-only-');
+    const dir = join(into, 'node_modules', 'sharp');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'package.json'), '{"name":"sharp"}');
+    writeFileSync(join(dir, 'libvips.dylib'), MACHO);
+    chmodSync(join(dir, 'libvips.dylib'), 0o755);
+    expect(nativeBuilt(into, ['sharp'])).toBe(false);
+  });
+
+  it('the npm fallback runs when the binding is missing (pnpm result is rejected)', () => {
+    const sourceRoot = mk('native-fb-source-');
+    const into = mk('native-fb-into-');
+    const storeDir = join(mk('native-fb-store-'), 'store');
+    ensureStoreGeneration(storeDir);
+    for (const dir of [sourceRoot, into]) {
+      writeFileSync(join(dir, 'package.json'), '{"name":"snapshot","version":"1.0.0"}');
+      writeFileSync(join(dir, 'package-lock.json'), '{"lockfileVersion":3}');
+    }
+    writeFileSync(join(sourceRoot, 'pnpm-lock.yaml'), 'lockfileVersion: "9.0"\n');
+    writeFileSync(join(sourceRoot, 'pnpm-workspace.yaml'), 'allowBuilds:\n  sharp: true\n');
+    const legacy = vi.fn();
+    const log = vi.fn();
+    pnpmAwareInstaller({
+      sourceRoot, legacy, log, storeDir, env: {}, which: () => 'pnpm', parity: () => true,
+      exec: (cmd, args) => { if (args[0] === '--version') return '12.1.0'; sharpLayout({ binding: false }, into); return ''; },
+    })(into);
+    expect(legacy).toHaveBeenCalledTimes(1);
+    expect(legacy).toHaveBeenCalledWith(into);
+    expect(log.mock.calls.some(([line]) => String(line).includes('native build missing: sharp'))).toBe(true);
   });
 });

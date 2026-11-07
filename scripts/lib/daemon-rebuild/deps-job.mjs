@@ -22,10 +22,10 @@
  */
 import { execFileSync } from 'node:child_process';
 import {
-  closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync,
-  realpathSync, renameSync, rmSync, statSync, writeFileSync,
+  closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync,
+  realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { defineJobKind, kindRegistry } from '../daemon-jobs.mjs';
@@ -148,12 +148,16 @@ function installedBuilds(into) {
  * Bound traversal to 2048 entries and six levels per package; incomplete evidence uses npm. */
 export function nativeBuilt(into, names) {
   const magic = new Set(['7f454c46', '4d5a', 'feedface', 'cefaedfe', 'feedfacf', 'cffaedfe', 'cafebabe', 'bebafeca']);
-  function artifact(root) {
+  // A binding is what the package loads (.node, or an executable). A supporting shared library
+  // (.so/.dylib/.dll/.a, e.g. sharp-libvips) is never a binding, even when its mode is executable.
+  const LIBRARY = /\.(?:so(?:\.\d+)*|dylib|dll|a)$/;
+  function artifact(root, binding) {
     let remaining = 2048;
     function visit(dir, depth) {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
         if (--remaining < 0) throw new Error('native artifact scan limit');
         if (entry.name === 'node_modules' || entry.isSymbolicLink()) continue;
+        if (binding && LIBRARY.test(entry.name)) continue;
         const path = join(dir, entry.name);
         if (entry.isDirectory()) {
           if (depth === 0) throw new Error('native artifact scan depth');
@@ -170,22 +174,36 @@ export function nativeBuilt(into, names) {
     }
     return visit(root, 6);
   }
+  const validName = (dependency) => /^(?:@[\w.-]+\/)?[\w.-]+$/.test(dependency) && dependency !== '.' && dependency !== '..';
+  const supports = (values, value) => !values || (Array.isArray(values)
+    && !values.includes('!' + value) && (values.every((v) => v.startsWith('!')) || values.includes(value)));
+  // Resolve optional packages from this package's own dependency graph, including scoped GVS paths.
+  const locate = (root, name, dependency) => {
+    const modules = name.startsWith('@') ? dirname(dirname(root)) : dirname(root);
+    return [join(root, 'node_modules', dependency), join(modules, dependency)].find((path) => existsSync(path));
+  };
+  /** A platform package counts only with its own binding AND the supporting libraries named for this platform
+   * (sharp-libvips-darwin-arm64 is the binding's dependency, never evidence for sharp by itself). */
+  const platformBinding = (dependency, candidate) => {
+    const real = realpathSync(candidate);
+    const meta = JSON.parse(readFileSync(join(real, 'package.json'), 'utf8'));
+    if (!supports(meta.os, process.platform) || !supports(meta.cpu, process.arch) || !artifact(real, true)) return false;
+    return Object.keys(meta.optionalDependencies ?? {})
+      .filter((support) => validName(support) && support.endsWith(`-${process.platform}-${process.arch}`))
+      .every((support) => {
+        const found = locate(real, dependency, support);
+        return found !== undefined && artifact(realpathSync(found), false);
+      });
+  };
   try {
     const packages = installedPackages(into);
     return names.every((name) => packages.has(name) && [...packages.get(name)].every((root) => {
       const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
-      if (artifact(root)) return true;
-      // Resolve optional packages from this package's own dependency graph, including scoped GVS paths.
-      const modules = name.startsWith('@') ? dirname(dirname(root)) : dirname(root);
+      if (artifact(root, true)) return true;
       return Object.keys(pkg.optionalDependencies ?? {}).some((dependency) => {
-        if (!/^(?:@[\w.-]+\/)?[\w.-]+$/.test(dependency) || dependency === '.' || dependency === '..') return false;
-        const candidate = [join(root, 'node_modules', dependency), join(modules, dependency)]
-          .find((path) => existsSync(path));
-        if (!candidate) return false;
-        const meta = JSON.parse(readFileSync(join(candidate, 'package.json'), 'utf8'));
-        const supports = (values, value) => !values || (Array.isArray(values)
-          && !values.includes('!' + value) && (values.every((v) => v.startsWith('!')) || values.includes(value)));
-        return supports(meta.os, process.platform) && supports(meta.cpu, process.arch) && artifact(realpathSync(candidate));
+        if (!validName(dependency)) return false;
+        const candidate = locate(root, name, dependency);
+        return candidate !== undefined && platformBinding(dependency, candidate);
       });
     }));
   } catch { return false; }
@@ -310,6 +328,60 @@ export function depsStore(jobsDir, key) {
   return { dir, complete: existsSync(join(dir, COMPLETE_MARKER)) && existsSync(join(dir, 'node_modules')) && storeStillValid(dir) };
 }
 
+const MAX_REBASE_ENTRIES = 2_000_000;
+const MAX_SHIM_BYTES = 256 * 1024;
+const insideTree = (path, tree) => path === tree || path.startsWith(tree + sep);
+
+/**
+ * Make a copied `node_modules` work at its FINAL location. `cp -R` keeps symlink text verbatim, so pnpm's relative
+ * links into the shared store (and the `$basedir/…` paths inside its `.bin` shims) dangle once the tree sits at a
+ * different depth than where it was installed. Links and shims that point INSIDE the tree keep their text (the
+ * tree moves as a unit); every other relative one is rewritten to reach the same target from `final`. Absolute
+ * links are left alone. Fails closed: a link that resolved in `from` but not in the copy throws.
+ * @param {{from: string, copy: string, final: string}} o `from` the tree as installed, `copy` where the copy is now,
+ *   `final` where it will live.
+ */
+export function rebaseNodeModulesLinks({ from, copy, final }) {
+  from = resolve(from); copy = resolve(copy); final = resolve(final);
+  if (from === final) return;
+  const stack = [''];
+  let seen = 0;
+  while (stack.length) {
+    const rel = stack.pop();
+    const dir = join(copy, rel);
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (++seen > MAX_REBASE_ENTRIES) throw new Error('node_modules link rebase entry limit');
+      const childRel = join(rel, entry.name);
+      const path = join(copy, childRel);
+      if (entry.isSymbolicLink()) {
+        const target = readlinkSync(path);
+        if (isAbsolute(target)) continue;
+        const original = join(from, childRel);
+        const absolute = resolve(dirname(original), target);
+        if (insideTree(absolute, from)) {
+          if (existsSync(original) && !existsSync(path)) throw new Error(`node_modules link did not survive the copy: ${childRel}`);
+          continue;
+        }
+        if (existsSync(original) && !existsSync(absolute)) throw new Error(`node_modules link would dangle: ${childRel}`);
+        rmSync(path, { force: true });
+        symlinkSync(relative(dirname(join(final, childRel)), absolute), path);
+      } else if (entry.isDirectory()) {
+        stack.push(childRel);
+      } else if (entry.isFile() && basename(rel) === '.bin' && statSync(path).size <= MAX_SHIM_BYTES) {
+        const text = readFileSync(path, 'utf8');
+        if (!text.includes('$basedir/')) continue;
+        const binDir = dirname(join(from, childRel));
+        const next = text.replace(/\$basedir((?:\/[^\s"':$;|&()]+)+)/g, (whole, tail) => {
+          const absolute = resolve(binDir, `.${tail}`);
+          if (insideTree(absolute, from)) return whole;
+          return `$basedir/${relative(dirname(join(final, childRel)), absolute).split(sep).join('/') || '.'}`;
+        });
+        if (next !== text) writeFileSync(path, next);
+      }
+    }
+  }
+}
+
 /**
  * Swap a complete store's `node_modules` into `root` — the caller guarantees no pass is running. The copy is an APFS
  * clone (`cp -c`, near-instant; a plain copy where the filesystem has none) into a sibling temp dir; then the live
@@ -333,6 +405,12 @@ export function swapNodeModules({ root, storeDir, exec = execFileSync, rename = 
   try { exec('cp', ['-cR', join(storeDir, 'node_modules'), tmp], { stdio: 'ignore', timeout: 5 * 60_000 }); } catch {
     rmSync(tmp, { recursive: true, force: true });
     exec('cp', ['-R', join(storeDir, 'node_modules'), tmp], { stdio: 'ignore', timeout: 10 * 60_000 });
+  }
+  // Relative store links and bin shims are rebased BEFORE the live tree is touched, so a copy that cannot
+  // resolve at the final location leaves the working dependencies in place (and the lockfile key unstamped).
+  try { rebaseNodeModulesLinks({ from: join(storeDir, 'node_modules'), copy: tmp, final: live }); } catch (e) {
+    rmSync(tmp, { recursive: true, force: true });
+    throw e;
   }
   const hadLive = existsSync(live);
   if (hadLive) rename(live, old);
