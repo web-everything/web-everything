@@ -7,8 +7,8 @@ status: open
 scope: ["we:scripts/lib/__tests__/gh-throttle.fidelity.test.mjs", "we:eslint.config.mjs", "we:__tests__/eslint.config*.test.mjs", "we:package.json", "we:package-lock.json", "we:scripts/lib/__tests__/library-no-undef.test.mjs"]
 scopeRationale: "The six scoped entries are the predicted edits. Acceptance A3 names we:scripts/lib/gh-throttle.mjs only as a required read-only member of the production-library scan; no runtime edit is planned. Any defect exposed by that scan requires an explicit source/test scope correction before implementation."
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-06"
-preparedAgainstSha: "fa7d3c16872ce1d496af6261a0cc0199af94270d"
+preparedDate: "2026-11-07"
+preparedAgainstSha: "f9a9e945e8cbccfc769dcee13c73ada3b58b0113"
 tags: []
 ---
 
@@ -27,6 +27,7 @@ Revalidated by source inspection against checkout `230db4555dd82de1bd165453d678a
 - **Coverage evidence:** `we:scripts/lib/__tests__/gh-throttle.fidelity.test.mjs:340` compares successful stdout for piped stdio without asserting absence of parent stderr writes. Its omitted-stdio oracle at `we:scripts/lib/__tests__/gh-throttle.fidelity.test.mjs:367` explicitly requires warning relay. Neither this file nor `we:scripts/lib/__tests__/gh-throttle.test.mjs` references the two exported capture/settlement seams. Preserve both defaults and caller behavior; add the missing composed and explicit-pipe assertions.
 - **Corrected scope:** retain all six incoming entries. Root ESLint configuration and the proposed scan/config tests are absent; `we:package.json:96` starts the direct development dependencies without ESLint or globals. Production includes CommonJS (`we:scripts/lib/data-table-build-hook.cjs:1`) as well as ESM. Planned `we:__tests__/eslint.config.test.mjs` covers the config and both manifests; planned `we:scripts/lib/__tests__/library-no-undef.test.mjs` imports those cases and scans actual production libraries. Script tests are discovered at `we:vitest.config.ts:128`; root config tests are not in that include list. CI assigns the normal unit roster at `we:.github/workflows/ci.yml:106`. No runtime or CI edit is presently justified.
 - **Re-stamp 2026-11-06:** premise re-verified against `fa7d3c16`; goal undelivered (eslint config and scan tests still absent), `we:scripts/lib/gh-throttle.mjs:1029,1051,1929` citations hold. Only the CI citation drifted, now `we:.github/workflows/ci.yml:106` (the sharded `vitest run` job).
+- **Re-stamp 2026-11-07:** re-verified against `f9a9e945`; goal undelivered (no `eslint.config.*`, `__tests__/eslint*`, or `library-no-undef` test exists). `we:scripts/lib/gh-throttle.mjs:1029,1051,1929` and `stripGhDebug` at `:921` still hold; later gh-throttle commits did not move the seams. No design change.
 - **Size remains 3 → 3:** approximately 90 changed lines in the existing fidelity test, 45 in the config, 100 in the root config test, 120 in the library scan test, and two direct dependency entries plus generated lockfile changes. The two bounded behavioral additions and static-analysis integration remain a story; no task-only estimatedLoc field is added. The source anchors above establish the touch set; dependency lockfile churn is installation-dependent.
 - **Follow-up correction:** #4460 proposes a fetch-failure behavioral regression, not another lint rollout. Its planned library timeout guard will be covered automatically by this recursive scan. The current fetch catch calls an existing classifier at `we:scripts/conveyor/infra-blocked.mjs:720`; the sibling's proposal is in `we:backlog/4460-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md`. No prerequisite or blockedBy change is needed.
 
