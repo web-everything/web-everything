@@ -1,15 +1,16 @@
 ---
+bornAs: xzpc8rq
 kind: story
-size: 2
+size: 3
 status: open
-scope: ["we:scripts/operations/red-team-gate-apply.mjs"]
+scope: ["we:scripts/conveyor/review-hold-reconcile.mjs", "we:scripts/review-set-label.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Send-back lands on a head that was pushed during the gate's send-back write
+# Hold-reconcile heal removes review:accepted from a stale snapshot after a concurrent clear-human
 
-Flow-sim gap B-C6, class K6 (check-then-act race with no pin). Failing input: Result and confirmed `broken` finding for head A; labels review:accepted; gate run in progress. author pushes head B after the head re-read (we:red-team-gate-apply.mjs:195) and before review-set-label --to=changes finishes (spawn timeout 180 s, :274). Cited: we:scripts/operations/red-team-gate-apply.mjs:195-197. Soak-break sketch: wrong-clear/wrong-act: the new head B is bounced to review:changes with head A's findings; fixer is dispatched on stale text; B is never judged first
+Flow-sim gap A-C7, class K6 (check-then-act race with no pin). Failing input: labels: [review:accepted, review:human] files: 'PR thread has no clear-human record for the live head (parseLatestHumanClearedSha != head), so heal.heal is true' operator runs review-set-label --to=clear-human between the sweep's live read and its label write Cited: we:scripts/conveyor/review-hold-reconcile.mjs:314-322, we:scripts/conveyor/review-hold-reconcile.mjs:327, we:scripts/conveyor/review-hold-reconcile.mjs:340-348, we:scripts/conveyor/review-hold-reconcile.mjs:358, we:scripts/conveyor/review-hold-reconcile.mjs:349-351. Soak-break sketch: wrong-clear: the operator's fresh clearance loses review:accepted and gets a false durable comment; PR then carries neither hold nor accept (planner sees missing review label, RC:2134). Narrow window (two gh calls).
 
 ## Acceptance
 

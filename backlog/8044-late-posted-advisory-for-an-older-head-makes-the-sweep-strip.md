@@ -1,15 +1,16 @@
 ---
+bornAs: x64himg
 kind: story
-size: 5
+size: 3
 status: open
-scope: ["we:scripts/lib/pr-merge-gate.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/lib/drain-queue-safety.mjs", "we:scripts/lib/drain-merge-strategy.mjs"]
+scope: ["we:scripts/lib/advisory-labels.mjs", "we:scripts/conveyor/advisory-label-sweep.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Direct merge: ready-to-merge withdrawn by a human between pass-start and merge still merges (non-local repos)
+# Late-posted advisory for an older head makes the sweep strip advisory:accepted from the current head
 
-Flow-sim gap D-C1, class K6 (check-then-act race with no pin). Failing input: non-local repo (e.g. frontierui; DMS:300 enqueues()=false). PR labels at pass start [ready-to-merge], every commit Co-Authored-By Claude (isAiGeneratedPr true), CI green, MERGEABLE/CLEAN, body non-empty, no .state files involved.' 'human removes ready-to-merge in the UI after the listing but before this PR's turn in the serial … Cited: we:scripts/lib/pr-merge-gate.mjs:40, we:scripts/merge-ai-prs.mjs:7168, we:scripts/merge-ai-prs.mjs:1133, we:scripts/merge-ai-prs.mjs:1001, we:scripts/merge-ai-prs.mjs:1006. Soak-break sketch: none
+Flow-sim gap B-C10, class K6 (check-then-act race with no pin). Failing input: Head B live, labels review:human + advisory:accepted. Trusted comments in order: advisory(Net basis x..B, 10:00), advisory(Net basis x..A, 10:05) (the slow run for the pre-push head A posted after B's). sweep tick. Cited: we:scripts/lib/advisory-labels.mjs:105-125, we:scripts/conveyor/advisory-label-sweep.mjs:77-83. Soak-break sketch: wrong-clear (advisory:accepted removed from B; PR shows human-review-pending-advisory). Unverified whether the advisory poster refuses to post for a non-live head; if it does this is unreachable.
 
 ## Acceptance
 

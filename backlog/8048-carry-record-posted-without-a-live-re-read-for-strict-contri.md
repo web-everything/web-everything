@@ -1,15 +1,16 @@
 ---
+bornAs: xneiq0k
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/conveyor/review-hold-reconcile.mjs", "we:scripts/review-set-label.mjs"]
+scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lib/human-clearance-carry.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Hold-reconcile heal removes review:accepted from a stale snapshot after a concurrent clear-human
+# Carry record posted without a live re-read for strict/contribution tiers
 
-Flow-sim gap A-C7, class K6 (check-then-act race with no pin). Failing input: labels: [review:accepted, review:human] files: 'PR thread has no clear-human record for the live head (parseLatestHumanClearedSha != head), so heal.heal is true' operator runs review-set-label --to=clear-human between the sweep's live read and its label write Cited: we:scripts/conveyor/review-hold-reconcile.mjs:314-322, we:scripts/conveyor/review-hold-reconcile.mjs:327, we:scripts/conveyor/review-hold-reconcile.mjs:340-348, we:scripts/conveyor/review-hold-reconcile.mjs:358, we:scripts/conveyor/review-hold-reconcile.mjs:349-351. Soak-break sketch: wrong-clear: the operator's fresh clearance loses review:accepted and gets a false durable comment; PR then carries neither hold nor accept (planner sees missing review label, RC:2134). Narrow window (two gh calls).
+Flow-sim gap C-G7, class K6 (check-then-act race with no pin). Failing input: Operator cleared head A (clear-human comment is the latest accept-shaped one); drain merged main in to produce head B with identical net diff; evidence snapshot read at T0. Operator posts a send-back ('🔁 review — changes requested') or a review:human hold at T1 > T0.' 'E23 / E8 concurrent send-back during the carry Cited: we:scripts/merge-ai-prs.mjs:917-920, we:scripts/lib/human-clearance-carry.mjs:380-384. Soak-break sketch: approved-human-head-review-churn (carry of approved human-surface heads; fixPresent true: we:merge-ai-prs.mjs contains readApprovedHumanSurfaceHold and we:review-job.mjs contains decideRebaseVerdictCarry). Race with a send-back not covered.
 
 ## Acceptance
 

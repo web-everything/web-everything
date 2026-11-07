@@ -1,15 +1,16 @@
 ---
+bornAs: xmmmc8w
 kind: story
-size: 3
+size: 2
 status: open
-scope: ["we:scripts/lib/advisory-labels.mjs", "we:scripts/conveyor/advisory-label-sweep.mjs"]
+scope: ["we:scripts/operations/red-team-gate-apply.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Late-posted advisory for an older head makes the sweep strip advisory:accepted from the current head
+# Send-back lands on a head that was pushed during the gate's send-back write
 
-Flow-sim gap B-C10, class K6 (check-then-act race with no pin). Failing input: Head B live, labels review:human + advisory:accepted. Trusted comments in order: advisory(Net basis x..B, 10:00), advisory(Net basis x..A, 10:05) (the slow run for the pre-push head A posted after B's). sweep tick. Cited: we:scripts/lib/advisory-labels.mjs:105-125, we:scripts/conveyor/advisory-label-sweep.mjs:77-83. Soak-break sketch: wrong-clear (advisory:accepted removed from B; PR shows human-review-pending-advisory). Unverified whether the advisory poster refuses to post for a non-live head; if it does this is unreachable.
+Flow-sim gap B-C6, class K6 (check-then-act race with no pin). Failing input: Result and confirmed `broken` finding for head A; labels review:accepted; gate run in progress. author pushes head B after the head re-read (we:red-team-gate-apply.mjs:195) and before review-set-label --to=changes finishes (spawn timeout 180 s, :274). Cited: we:scripts/operations/red-team-gate-apply.mjs:195-197. Soak-break sketch: wrong-clear/wrong-act: the new head B is bounced to review:changes with head A's findings; fixer is dispatched on stale text; B is never judged first
 
 ## Acceptance
 

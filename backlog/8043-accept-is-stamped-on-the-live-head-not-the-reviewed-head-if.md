@@ -1,15 +1,16 @@
 ---
+bornAs: x1176k1
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lib/human-clearance-carry.mjs"]
+scope: ["we:scripts/review-set-label.mjs", "we:scripts/operations/review-pr-io.mjs", "we:scripts/conveyor/reconcile-core.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Carry record posted without a live re-read for strict/contribution tiers
+# Accept is stamped on the live head, not the reviewed head, if a push lands between the pre-write head check a…
 
-Flow-sim gap C-G7, class K6 (check-then-act race with no pin). Failing input: Operator cleared head A (clear-human comment is the latest accept-shaped one); drain merged main in to produce head B with identical net diff; evidence snapshot read at T0. Operator posts a send-back ('🔁 review — changes requested') or a review:human hold at T1 > T0.' 'E23 / E8 concurrent send-back during the carry Cited: we:scripts/merge-ai-prs.mjs:917-920, we:scripts/lib/human-clearance-carry.mjs:380-384. Soak-break sketch: approved-human-head-review-churn (carry of approved human-surface heads; fixPresent true: we:merge-ai-prs.mjs contains readApprovedHumanSurfaceHold and we:review-job.mjs contains decideRebaseVerdictCarry). Race with a send-back not covered.
+Flow-sim gap A-C5, class K6 (check-then-act race with no pin). Failing input: labels: [review:pending] files: 'review job reviewed head H1 (read.netBasis.rev=H1), verdict accept, CI green; PR head still H1 at RPIO:1007/1038' author pushes H2 after assertPublishable's last assertHead and before the child process we:review-set-label.mjs reads PR state (node start-up + imports + gh, seconds) Cited: we:scripts/review-set-label.mjs, we:scripts/operations/review-pr-io.mjs:991-1039, we:scripts/operations/review-pr-io.mjs:1590-1604, we:scripts/review-set-label.mjs:1153-1166, we:scripts/review-set-label.mjs:1370. Soak-break sketch: wrong-clear: review:accepted + matching reviewed-sha on a head no panel read (the file itself notes this at RPIO:991-996 for the unpinned case).
 
 ## Acceptance
 

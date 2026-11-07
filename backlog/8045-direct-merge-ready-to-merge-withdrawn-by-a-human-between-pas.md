@@ -1,15 +1,16 @@
 ---
+bornAs: xc6b2yl
 kind: story
-size: 3
+size: 5
 status: open
-scope: ["we:scripts/review-set-label.mjs", "we:scripts/operations/review-pr-io.mjs", "we:scripts/conveyor/reconcile-core.mjs"]
+scope: ["we:scripts/lib/pr-merge-gate.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/lib/drain-queue-safety.mjs", "we:scripts/lib/drain-merge-strategy.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Accept is stamped on the live head, not the reviewed head, if a push lands between the pre-write head check a…
+# Direct merge: ready-to-merge withdrawn by a human between pass-start and merge still merges (non-local repos)
 
-Flow-sim gap A-C5, class K6 (check-then-act race with no pin). Failing input: labels: [review:pending] files: 'review job reviewed head H1 (read.netBasis.rev=H1), verdict accept, CI green; PR head still H1 at RPIO:1007/1038' author pushes H2 after assertPublishable's last assertHead and before the child process we:review-set-label.mjs reads PR state (node start-up + imports + gh, seconds) Cited: we:scripts/review-set-label.mjs, we:scripts/operations/review-pr-io.mjs:991-1039, we:scripts/operations/review-pr-io.mjs:1590-1604, we:scripts/review-set-label.mjs:1153-1166, we:scripts/review-set-label.mjs:1370. Soak-break sketch: wrong-clear: review:accepted + matching reviewed-sha on a head no panel read (the file itself notes this at RPIO:991-996 for the unpinned case).
+Flow-sim gap D-C1, class K6 (check-then-act race with no pin). Failing input: non-local repo (e.g. frontierui; DMS:300 enqueues()=false). PR labels at pass start [ready-to-merge], every commit Co-Authored-By Claude (isAiGeneratedPr true), CI green, MERGEABLE/CLEAN, body non-empty, no .state files involved.' 'human removes ready-to-merge in the UI after the listing but before this PR's turn in the serial … Cited: we:scripts/lib/pr-merge-gate.mjs:40, we:scripts/merge-ai-prs.mjs:7168, we:scripts/merge-ai-prs.mjs:1133, we:scripts/merge-ai-prs.mjs:1001, we:scripts/merge-ai-prs.mjs:1006. Soak-break sketch: none
 
 ## Acceptance
 

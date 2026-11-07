@@ -1,15 +1,16 @@
 ---
+bornAs: xnkvnz4
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/operations/review-pr.mjs", "we:scripts/operations/review-pr-io.mjs", "we:scripts/review-set-label.mjs"]
+scope: ["we:scripts/conveyor/advisory-label-sweep.mjs", "we:scripts/lib/red-team-status-labels.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# A human's review:changes bounce set while a review is running is stripped by the agent accept
+# Sweep applies red-team labels computed for the old head onto a PR that moved during its own publish step
 
-Flow-sim gap A-C6, class K6 (check-then-act race with no pin). Failing input: labels: [review:pending] files: 'review job running on head H1 (read at T0, panel takes ~20 min); run record read.labels = [review:pending]' operator bounces H1 via review-set-label --to=changes (adds review:changes, removes review:pending) at T0+10 min; panel then accepts Cited: we:scripts/operations/review-pr.mjs:2141, we:scripts/operations/review-pr-io.mjs:1583-1604, we:scripts/review-set-label.mjs:1333-1337, we:scripts/review-set-label.mjs:684-692, we:scripts/review-set-label.mjs:756-758. Soak-break sketch: wrong-clear: the human bounce is removed and review:accepted added; drain may merge. (Intentional for a stale changes from a bounce that was fixed, #2974 at RSL:665-683, but indistinguishable here from a bounce that arrived during the review.)
+Flow-sim gap B-C7, class K6 (check-then-act race with no pin). Failing input: Snapshot head A, labels red-team:pending. Status file for A: finished/ran with comment 'withheld' (needs publish). Sweep reads live (head A) at we:advisory-label-sweep.mjs:178. publishStored runs (:194, gh comment list + post) and the author pushes head B before :206. Cited: we:scripts/conveyor/advisory-label-sweep.mjs:178, we:scripts/lib/red-team-status-labels.mjs:37-38. Soak-break sketch: wrong-clear (transient): B briefly carries A's red-team:clear (or blocked). Repaired the next tick because the PR carries a red-team label and is re-nominated (we:advisory-label-sweep.mjs:172-173). Matters only if delegated-clear-human or an admission read la…
 
 ## Acceptance
 
