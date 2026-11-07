@@ -559,3 +559,154 @@ describe('loopFailureLabel — the loop\'s own error is recorded, never swallowe
     expect(loopFailureLabel({ stopped: 'confirm' }, 2)).toBe('exit 2');
   });
 });
+
+describe('dead running red-team owner behind an unfinished review', () => {
+  let evidence, recovery, fs, os, pid, store, createReviewJobIo;
+  beforeEach(async () => {
+    [evidence, recovery, fs, os, pid, store, { createReviewJobIo }] = await Promise.all([
+      import('../../lib/drain-red-team-evidence.mjs'),
+      import('../../lib/review-red-team-on-skip.mjs'),
+      import('node:fs'), import('node:os'), import('../../lib/pid-alive.mjs'),
+      import('../run-store.mjs'), import('../review-job.mjs'),
+    ]);
+  });
+
+  function fixture({ status = 'running', quietMs = evidence.ABANDONED_REVIEW_AFTER_MS + 60_000,
+    failedSeat = false, foreign = false, alive = false, unreadableProbe = false } = {}) {
+    const now = Date.parse('2026-11-07T12:00:00Z');
+    const hour = evidence.ABANDONED_REVIEW_AFTER_MS;
+    const repo = REPO, pr = 6378, head = `d3fd9d3a${'a'.repeat(32)}`;
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_RED_TEAM_STALE_RUN_MS: String(2 * hour) };
+    const key = { repo, pr, head, env };
+    mkdirSync(env.WE_SHARED_RUNS_DIR, { recursive: true });
+    mkdirSync(evidence.redTeamStatusDir(env), { recursive: true });
+    const writerPath = join(evidence.redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`);
+    const writer = { repo, pr, head, status, result: status === 'finished' ? 'ran' : null,
+      pid: 99999999, host: foreign ? 'another-host' : os.hostname(), pidNamespace: pid.pidNamespace(),
+      // Unknown birth time cannot authorize recovery by age for foreign/unprobeable owners.
+      pidStart: 'fixture-owner-start' };
+    if (status !== null) writeFileSync(writerPath, JSON.stringify(writer));
+    const makeRun = (id, startedHoursAgo) => ({
+      ...store.newRunRecord({ id, op: 'review-pr', input: { repo, pr } }),
+      stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(now - startedHoursAgo * hour).toISOString() }],
+      findings: { read: { netBasis: { rev: head }, diffText: '+code', netChangedFiles: ['scripts/example.mjs'] } },
+    });
+    const decided = { ...makeRun('review-pr-6378-decided', 6),
+      verdict: { verdict: 'needs-human', humanRequired: true,
+        lensVerdicts: { correctness: 'accept' }, findings: [], admittedFindings: [] } };
+    const unfinished = { ...makeRun('review-pr-6378-unfinished', 3),
+      effects: [{ key: 'review-pr-6378-unfinished:1:0', type: 'mandatoryReferrals', stepIndex: 1,
+        index: 0, status: 'in-flight', handle: null }] };
+    const put = (run, age) => {
+      const path = join(env.WE_SHARED_RUNS_DIR, `${run.id}.json`);
+      writeFileSync(path, JSON.stringify(run));
+      fs.utimesSync(path, new Date(now - age), new Date(now - age));
+      return path;
+    };
+    // Both mtimes postdate both read starts, so the bounded scan sees both records.
+    put(decided, 90 * 60_000);
+    const unfinishedPath = put(unfinished, quietMs);
+    const probe = { host: os.hostname(), namespace: pid.pidNamespace(),
+      isAlive: vi.fn(() => { if (unreadableProbe) throw Error('pid table unreadable'); return alive; }),
+      readPidStart: vi.fn(() => writer.pidStart) };
+    const seats = failedSeat ? [{ dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head, status: 'unparseable' }] : [];
+    const witnessOptions = { ...key, runsDir: env.WE_SHARED_RUNS_DIR, now, stat: fs.statSync, readScorecards: () => seats };
+    const readWitness = () => evidence.readRecoveryWitness(witnessOptions);
+    const recoveryOptions = { now, probe, deadlineMs: 2 * hour };
+    const plan = () => recovery.planRedTeamRecovery(readWitness(), recoveryOptions);
+    const abandon = () => recovery.abandonStaleRedTeamRun(key, {
+      readWitness, now: () => now, probe, deadlineMs: recoveryOptions.deadlineMs,
+    });
+    const planningOptions = { repo, refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }],
+      rawPrs: [{ number: pr, headRefOid: head, comments: [], reviews: [], labels: ['review:human', 'red-team:pending'] }],
+      readWitness, readEvidence: () => evidence.readDrainRedTeamEvidence(witnessOptions),
+      readStatus: () => status === null ? null : writer, readCarry: () => null,
+      headNeverReviewed: () => false, now, setting: { enabled: true, retryCooldownMin: 0 },
+      lastDispatch: new Map(), recoveryOptions };
+    return { key, env, now, decided, unfinished, unfinishedPath, put, writerPath, probe,
+      witnessOptions, readWitness, plan, abandon, planningOptions };
+  }
+
+  it.each([false, true])('recovers the dead running writer with the newest decided advisory accept (failed seat=%s)', failedSeat => {
+    const f = fixture({ failedSeat });
+    const witness = f.readWitness();
+    expect(witness).not.toMatchObject({ ok: false, reason: 'review-unfinished' });
+    expect(witness.newest).toEqual(f.decided);
+    expect(f.plan()).toMatchObject({ mode: 'fresh', retry: failedSeat, abandon: true,
+      executionPrior: failedSeat ? { status: 'finished', result: 'failed' } : null });
+    expect(f.probe.isAlive).toHaveBeenCalledWith(99999999);
+    // The drain reader must retain its unfinished-review hold.
+    expect(evidence.readDrainRedTeamEvidence(f.witnessOptions)).toMatchObject({ ok: false, reason: 'review-unfinished' });
+  });
+
+  it('holds a slow live owner with matching pidStart instead of recovering it twice', () => {
+    const f = fixture({ alive: true });
+    expect(f.plan()).toMatchObject({ mode: 'skip', why: 'owner live' });
+    expect(f.probe.readPidStart).toHaveBeenCalledWith(99999999);
+    expect(f.abandon()).toEqual({ ok: false });
+    expect(existsSync(`${f.writerPath}.stale-redispatch-1`)).toBe(false);
+  });
+
+  it.each(['foreign host', 'unreadable pid table'])('holds an owner with %s and never re-dispatches', kind => {
+    const f = fixture({ foreign: kind === 'foreign host', unreadableProbe: kind === 'unreadable pid table' });
+    expect(f.plan().mode).toBe('skip');
+    expect(recovery.planRedTeamOnSkip(f.planningOptions)[0].action).toBe('skip');
+    expect(f.abandon()).toEqual({ ok: false });
+    expect(existsSync(`${f.writerPath}.stale-redispatch-1`)).toBe(false);
+  });
+
+  it('keeps review-unfinished when the unfinished run was touched less than an hour ago', () => {
+    const f = fixture({ quietMs: evidence.ABANDONED_REVIEW_AFTER_MS - 1 });
+    expect(f.readWitness()).toMatchObject({ ok: false, reason: 'review-unfinished' });
+    expect(f.plan().mode).toBe('skip');
+  });
+
+  it('keeps review-unfinished when another unfinished run of this PR on another head is still active', () => {
+    const f = fixture();
+    f.put({ ...f.unfinished, id: 'review-pr-6378-other-head',
+      findings: { read: { netBasis: { rev: 'b'.repeat(40) } } } }, 1000);
+    expect(f.readWitness()).toMatchObject({ ok: false, reason: 'review-unfinished' });
+  });
+
+  it.each([null, 'finished'])('keeps review-unfinished with no active writer (status=%s)', status => {
+    const f = fixture({ status });
+    expect(f.readWitness()).toMatchObject({ ok: false, reason: 'review-unfinished' });
+    expect(f.plan().mode).toBe('skip');
+  });
+
+  it('keeps review-unfinished when the decided same-head review does not owe a red team', () => {
+    const f = fixture();
+    f.put({ ...f.decided, verdict: { verdict: 'changes' } }, 90 * 60_000);
+    expect(f.readWitness()).toMatchObject({ ok: false, reason: 'review-unfinished' });
+  });
+
+  it('dispatches dead owner recovery on already-reviewed-head exactly once after abandonment and queued admission', () => {
+    const f = fixture();
+    const decide = () => recovery.planRedTeamOnSkip(f.planningOptions)[0];
+    expect(decide()).toMatchObject({ action: 'dispatch', staleRecovery: true, why: 'dead owner recovery' });
+    expect(f.abandon()).toEqual({ ok: true });
+    expect(existsSync(`${f.writerPath}.stale-redispatch-1`)).toBe(true);
+    const io = createReviewJobIo({ root: dir, env: f.env, readWitness: f.readWitness, recoveryProbe: f.probe });
+    io.redTeamStatus({ ...f.key, loopPayload: f.decided, status: 'queued', redTeamMode: 'fresh' });
+    expect(decide()).toMatchObject({ action: 'skip' });
+    expect(f.abandon()).toEqual({ ok: false });
+  });
+
+  it('dispatches recovery without any label writes, including review:* and ready-to-merge', () => {
+    const f = fixture();
+    const setLabels = vi.fn(), ensureLabel = vi.fn(), syncLabels = vi.fn();
+    const provider = { readPrState: () => f.planningOptions.rawPrs[0], setLabels, ensureLabel };
+    const dispatch = vi.fn(() => ({ jobPid: 12345 }));
+    const result = recovery.runRedTeamOnSkip({
+      ...f.planningOptions, plan: { refusals: f.planningOptions.refusals }, env: f.env,
+      now: () => f.now, capacity: { lanes: 1, remainingStarts: 1 },
+      provider, syncLabels, dispatch, abandon: f.abandon, escalate: vi.fn(),
+    });
+    expect(setLabels).not.toHaveBeenCalled();
+    expect(ensureLabel).not.toHaveBeenCalled();
+    expect(syncLabels).not.toHaveBeenCalled();
+    expect(result.rows[0]).toMatchObject({ action: 'dispatch', staleRecovery: true, why: 'dead owner recovery' });
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch).toHaveBeenCalledWith({ repo: f.key.repo, pr: f.key.pr, redTeamOnly: true, redTeamMode: 'fresh' });
+  });
+});
