@@ -1,4 +1,5 @@
 ---
+bornAs: xo9o752
 kind: story
 size: 3
 status: open
@@ -7,9 +8,9 @@ dateOpened: "2026-11-07"
 tags: []
 ---
 
-# A needs-judgment stand-down is shown in the queue's NEEDS YOU but is never published to the needs-you feed (d…
+# A human-only (workflow-file) approved PR is hidden from every text/feed surface when the main-CI probe or the…
 
-Flow-sim gap R8b-G1, class K15 (detector or report false negative). Failing input: PR (any labels) with an unresolved trusted stand-down comment whose trailer reason is 'needs-judgment'; review setting standDownQueueSection unset (built-in default 'needs-you', we:review-settings.mjs:49).' 'needs-you-feed tick runs operator-queue --json and builds items from the report. Cited: we:scripts/operations/operator-queue.mjs:813-820, we:scripts/operations/operator-queue.mjs:867, we:scripts/operations/needs-you-feed.mjs:80, we:scripts/operations/operator-queue.mjs. Soak-break sketch: Fixture: operator-queue --json report with needsYouStandDowns=[{repo,number:7,title,standDownAt,question,remaining:[]}] and every other section empty. Action: itemsFromReport(report) (and runOnce with liveGate:false). Assert items contains a row for #7 with a…
+Flow-sim gap R8b-G6, class K15 (detector or report false negative). Failing input: PR with review:accepted + ready-to-merge, all checks green, MERGEABLE, red team clear on head, touching .github/workflows/*; readMainCi throws (gh/probe failure) or readNetDiff returns an error (e.g. repoProfile(repo).checkoutPath undefined -> 'no checkout to read the pinned diff from', we:merge-queue-enqueue.mjs:251).' 'operat… Cited: we:scripts/operations/operator-queue.mjs:766-772, we:scripts/operations/operator-queue.mjs:773-779, we:scripts/operations/operator-queue.mjs:743-745, we:scripts/operations/operator-queue.mjs:861-869, we:scripts/operations/needs-you-feed.mjs:79. Soak-break sketch: Fixture: operator-queue main() with one approved workflow-touching PR, readMainCi injected to throw. Action: run in text mode and capture stdout/exitCode. Assert output contains 'UNKNOWN' or the pending reason (or exitCode 1 / report.incomplete); fails today …
 
 ## Acceptance
 

@@ -1,15 +1,16 @@
 ---
+bornAs: xqp4486
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/readiness/lane-manifest.mjs", "we:scripts/lib/fast-drain-scope.mjs", "we:scripts/merge-ai-prs.mjs"]
+scope: ["we:scripts/conveyor/pr-events-worker/core.mjs", "we:scripts/lib/pr-events.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# A malformed or partially invalid PR-body or local-tree manifest reads as 'no manifest', dropping blockedBy an…
+# Queue-ejection and base-retarget webhooks are not subscribed, so the drain is not woken for them; recovery wa…
 
-Flow-sim gap R9c-G5, class K15 (detector or report false negative). Failing input: Lane PR whose body manifest block was hand-edited or re-written by a fixer's `gh pr edit --body` (broken JSON, a blockedBy written as '#2151', or a block missing). blockedBy names an open item. Drain builds verdicts. Cited: we:scripts/readiness/lane-manifest.mjs:219-225, we:scripts/readiness/lane-manifest.mjs:124, we:scripts/readiness/lane-manifest.mjs:258-266, we:scripts/lib/fast-drain-scope.mjs:101, we:scripts/merge-ai-prs.mjs:5044-5062. Soak-break sketch: Fixture: PR body with the lane-manifest markers around '{'item':50,'blockedBy':[49],' (truncated) while item 49 is an open candidate. Action: buildDrainVerdicts + planLabelDrain. Assert (fails today): PR 50 is deferred or held with reason 'manifest block pres…
+Flow-sim gap R7b-G5, class K15 (detector or report false negative). Failing input: PR in the GitHub merge queue, ready-to-merge. GitHub removes it (failed merge-group checks) and fires pull_request.dequeued / merge_group.destroyed; or a stacked PR's base is edited (pull_request.edited with changes.base). 'Webhook delivered to the Worker. Cited: we:scripts/conveyor/pr-events-worker/core.mjs:30, we:scripts/conveyor/pr-events-worker/core.mjs:407-410, we:scripts/lib/pr-events.mjs:163-170, we:scripts/lib/pr-events.mjs:49. Soak-break sketch: Fixture: replay a pull_request.dequeued payload through handleRequest. Assertion that fails today: a stored record exists and isRelevantEvent(rec,'drain') is true; today the answer is stored:false and no wake is produced.
 
 ## Acceptance
 

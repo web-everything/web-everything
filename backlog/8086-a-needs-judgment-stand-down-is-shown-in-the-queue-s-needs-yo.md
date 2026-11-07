@@ -1,15 +1,16 @@
 ---
+bornAs: xqku0oj
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/conveyor/pr-events-worker/core.mjs", "we:scripts/lib/pr-events.mjs"]
+scope: ["we:scripts/operations/operator-queue.mjs", "we:scripts/operations/needs-you-feed.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Waker health uses the Worker's GLOBAL last-delivery clock, so a dead webhook for one repo is masked by traffi…
+# A needs-judgment stand-down is shown in the queue's NEEDS YOU but is never published to the needs-you feed (d…
 
-Flow-sim gap R7b-G6, class K15 (detector or report false negative). Failing input: Daemon scoped to repos=[web-everything/web-everything], WE_PR_EVENTS=1. The webhook for that repo breaks (secret rotated -> 401, hook disabled); another repo on the same Worker keeps delivering, and ignored events keep calling touch(). 'Waker polls /events. Cited: we:scripts/conveyor/pr-events-worker/core.mjs:266, we:scripts/lib/pr-events.mjs:211, we:scripts/lib/pr-events.mjs:128-131, we:scripts/lib/pr-events.mjs:134-136. Soak-break sketch: Fixture: createEventWaker with repos=['a/b'], a poll stub whose lastDeliveryAt is fresh but every event is for 'c/d'. Assertion that fails today: health() is not 'healthy' for the scoped repo (interval stays base); today it is healthy and sleep uses the 10-mi…
+Flow-sim gap R8b-G1, class K15 (detector or report false negative). Failing input: PR (any labels) with an unresolved trusted stand-down comment whose trailer reason is 'needs-judgment'; review setting standDownQueueSection unset (built-in default 'needs-you', we:review-settings.mjs:49).' 'needs-you-feed tick runs operator-queue --json and builds items from the report. Cited: we:scripts/operations/operator-queue.mjs:813-820, we:scripts/operations/operator-queue.mjs:867, we:scripts/operations/needs-you-feed.mjs:80, we:scripts/operations/operator-queue.mjs. Soak-break sketch: Fixture: operator-queue --json report with needsYouStandDowns=[{repo,number:7,title,standDownAt,question,remaining:[]}] and every other section empty. Action: itemsFromReport(report) (and runOnce with liveGate:false). Assert items contains a row for #7 with a…
 
 ## Acceptance
 

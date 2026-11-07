@@ -1,15 +1,16 @@
 ---
+bornAs: xp16z0q
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/conveyor/pr-events-worker/core.mjs", "we:scripts/lib/pr-events.mjs"]
+scope: ["we:scripts/conveyor/review-tick-promote.mjs", "we:scripts/conveyor/reconcile-pass.mjs", "we:skills-src/conveyor/review-daemon.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Queue-ejection and base-retarget webhooks are not subscribed, so the drain is not woken for them; recovery wa…
+# A deferred replan after a stale-accept re-arm replaces the plan with an empty one and the daemon logs 'no ope…
 
-Flow-sim gap R7b-G5, class K15 (detector or report false negative). Failing input: PR in the GitHub merge queue, ready-to-merge. GitHub removes it (failed merge-group checks) and fires pull_request.dequeued / merge_group.destroyed; or a stacked PR's base is edited (pull_request.edited with changes.base). 'Webhook delivered to the Worker. Cited: we:scripts/conveyor/pr-events-worker/core.mjs:30, we:scripts/conveyor/pr-events-worker/core.mjs:407-410, we:scripts/lib/pr-events.mjs:163-170, we:scripts/lib/pr-events.mjs:49. Soak-break sketch: Fixture: replay a pull_request.dequeued payload through handleRequest. Assertion that fails today: a stored record exists and isRelevantEvent(rec,'drain') is true; today the answer is stored:false and no wake is produced.
+Flow-sim gap A-C8, class K15 (detector or report false negative). Failing input: labels: 'PR X: [review:accepted] with head moved past its accept (plan row restore-review-label/stale-accept); other PRs in the repo owed reviews or parked on operator holds (review:human, stood-down, cap-exhausted)' files: 'tick 1st plan fine (RD:491 only checks plan.deferred there)' re-arm succeeds (RTP:130) and then replan(n… Cited: we:scripts/conveyor/review-tick-promote.mjs:146, we:scripts/conveyor/reconcile-pass.mjs:1705, we:scripts/conveyor/review-tick-promote.mjs:147-148, we:skills-src/conveyor/review-daemon.mjs:557-567, we:skills-src/conveyor/review-daemon.mjs:491. Soak-break sketch: wrong-clear (health watch's operator-hold-aging is told the repo has no holds) plus silent zero dispatch for that repo this tick; reconcileError stays null so the tick line does not flag LIST/RECONCILE FAILED (RD:1746). Self-heals next tick for dispatch.
 
 ## Acceptance
 
