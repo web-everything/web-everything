@@ -1,3 +1,4 @@
+import { assertRulingIdentity } from '../lib/operator-identity.mjs';
 /**
  * @file scripts/operations/record-referral-ruling.mjs
  * @description THE `record-referral-ruling` DECLARATION (#4979) — the sanctioned way to record an OPERATOR's
@@ -57,7 +58,7 @@ import {
   validateOperatorRuling, OPERATOR_RULING_RESULTS, AUTO_POLICY_ACTOR, operatorRulingId, sameFindingForClearing,
   readReferralRecords, readOperatorRulings, carriedBackingHolds, sameReferralForPolicy, referralRecheck,
 } from '../lib/jury-core.mjs';
-import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
+import { OPERATOR_LOGINS, JUDGE_ACTOR, JUDGE_ATTRIBUTION, assertJudgeAuthority, isSecurityClass } from '../lib/marker-authorship.mjs';
 import { ignoredRulings } from '../lib/ruling-ledger.mjs';
 
 export const RECORD_REFERRAL_RULING_OP = 'record-referral-ruling';
@@ -282,6 +283,7 @@ const findingLocation = ({ file, line }) => `${file ?? ''}${line == null ? '' : 
 
 /** Decide the handoff after the last pending ruling, preserving blocks from other findings. PURE. */
 export function planRulingFollowUp({ open, selected, ruling, reason, enabled, head, actor = '' }) {
+  assertJudgeReason(actor, reason);
   if (!enabled) return null;
   const isSelected = (o) => selected.some((s) => s.runId === o.runId && s.key === o.key);
   // Findings still waiting on a ruling after this one. The ruling comment itself wakes the paused review (the hold
@@ -309,7 +311,7 @@ function validateReferralRulingInput(input) {
   if (input.cause !== undefined && (ruling !== 'not-real' || !FALSE_FINDING_CAUSES.includes(input.cause))) throw new Error('--cause requires not-real and a known false-finding cause');
   const byPolicy = String(actor ?? '').toLowerCase() === AUTO_POLICY_ACTOR;
   if (byPolicy && ruling !== 'block') throw new Error(`--actor=${AUTO_POLICY_ACTOR} may only rule \`block\`; card and not-real are the operator's`);
-  if (!byPolicy && !OPERATOR_LOGINS.includes(String(actor ?? '').toLowerCase())) {
+  if (!byPolicy && actor !== JUDGE_ACTOR && !OPERATOR_LOGINS.includes(String(actor ?? '').toLowerCase())) {
     throw new Error(`--actor must be a registered operator login (${OPERATOR_LOGINS.join(', ')}); this ruling is the operator's`);
   }
   if (!String(reason ?? '').trim()) throw new Error('--reason is required: the operator\'s words, verbatim');
@@ -372,8 +374,16 @@ function selectOperatorRulingFindings(read, input) {
   return { selected, skipped, supersedesFor };
 }
 
+/** Judge prose must never contain tokens consumed by review-clearance readers. */
+export function assertJudgeReason(actor, reason) {
+  if (actor === JUDGE_ACTOR && /reviewed-sha|cleared-human/i.test(String(reason ?? '')))
+    throw new Error('judge reason contains a reserved review clearance token; operator-only');
+}
+
 /** THE VERDICT. Build and validate the record; refuse anything the gate would not honour. PURE. */
 export function planOperatorRuling(read, input) {
+  assertJudgeReason(input.actor, input.reason);
+  assertJudgeAuthority(read, input);
   validateReferralRulingInput(input);
   const { repo, pr, ruling, actor, channel, reason } = input;
   const byPolicy = String(actor ?? '').toLowerCase() === AUTO_POLICY_ACTOR;
@@ -384,12 +394,13 @@ export function planOperatorRuling(read, input) {
   const selection = selectOperatorRulingFindings(read, input);
   if (selection.noop) return selection;
   const { selected, skipped, supersedesFor } = selection;
+  if (actor === JUDGE_ACTOR) assertRulingIdentity(read.identity, actor);
   const record = {
     version: 1, repo, pr: Number(pr), head: read.head,
     rulings: selected.map((o) => ({ runId: o.runId, key: o.key, result: ruling, ...(ruling === 'not-real' ? { lens: o.seat ?? JSON.parse(o.key)[0] } : {}),
       ...(input.cause ? { cause: input.cause } : {}), ...(ruling === 'card' ? { card: read.card.ref } : {}),
       ...(supersedesFor(o).length ? { supersedes: supersedesFor(o) } : {}) })),
-    actor: String(actor).toLowerCase(), channel: String(channel).trim(), reason: String(reason), at: read.now,
+    actor: String(actor).toLowerCase(), channel: String(channel).trim(), reason: actor === JUDGE_ACTOR ? `${JUDGE_ATTRIBUTION}\n${reason}` : String(reason), at: read.now,
     clearerId: read.clearerId,
   };
   if (!validateOperatorRuling(record)) throw new Error('the operator ruling record failed validation; nothing posted');
@@ -402,6 +413,7 @@ export function planOperatorRuling(read, input) {
 
 /** Validate filing options before any effect; mode evidence is never defaulted here. */
 export function assertCardFiling(read, input) {
+  assertJudgeAuthority(read, input);
   if (input.ruling !== 'card') throw new Error('fileCard applies only to --ruling=card');
   if (input.card) throw new Error('--file-card cannot be combined with --card');
   const mode = read.cardFileMode?.value;
@@ -523,7 +535,7 @@ export function planJudgeNotReal({ mode, evidence, liveHead, findings, confirm, 
     const classes = [f.class, f.findingClass, ...(f.classes ?? []), ...(f.alsoClasses ?? [])];
     const file = String(f.file ?? '').replaceAll('\\', '/');
     if (!file || file.includes('..') || /guard|security|launchd|drain|merge|firewall|codex-shim/i.test(file)
-      || (!classes.some(c => typeof c === 'string' && c.trim()) || classes.some(c => /^security(?:-|$)/.test(c))) || f.securityReachableToday === true)
+      || (!classes.some(c => typeof c === 'string' && c.trim()) || classes.some(isSecurityClass)) || f.securityReachableToday === true)
       throw new Error('protected or security finding is operator-only');
   }
   if (!Number.isInteger(disagreements) || disagreements < 0) throw new Error('disagreements must be a nonnegative integer');
@@ -553,6 +565,7 @@ export const judgeRulingInput = {
 
 /** Pure preflight; confirmation and any filing belong to the effect sink. */
 export function planJudgeRuling(read, input, select) {
+  if (input.actor === JUDGE_ACTOR) assertJudgeAuthority(read, input);
   if (input.asJudge !== undefined && typeof input.asJudge !== 'boolean') throw new Error('asJudge must be boolean');
   if (!input.asJudge) return null;
   if (input.ruling !== 'not-real') throw new Error('asJudge applies only to not-real');
@@ -611,7 +624,7 @@ export function recordReferralRulingOperation({ readRulingContext, judgeConfirm 
     verdictFrom: 'plan',
     read: compute({
       reads: ['input'],
-      fn: (view) => readRulingContext({ repo: view.input.repo, pr: view.input.pr, card: view.input.card,
+      fn: (view) => readRulingContext({ repo: view.input.repo, pr: view.input.pr, actor: view.input.actor, card: view.input.card,
         ...(view.input.asJudge !== undefined ? { asJudge: view.input.asJudge, evidenceFile: view.input.evidenceFile, finding: view.input.finding } : {}) }),
     }),
     ...rulingCardSteps(readRulingContext, planReferralCard, 'github.referral-ruling-file-card', (read, input) => {

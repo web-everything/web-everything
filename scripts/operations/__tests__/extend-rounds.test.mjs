@@ -116,52 +116,13 @@ describe('buildRoundExtensionComment — the granted count cannot start a new pr
 });
 
 
-describe('R671 acting judge round grant (red-first)', () => {
-  const attribution = 'Ruled by acting judge (R10), not the operator';
-  const judgeRead = { ...read, files: ['src/ordinary.js'] };
-  const judgeInput = { ...input, actor: 'judge:r10' };
-  it('grants rounds with a distinct actor and attribution in record and comment', () => {
-    const plan = planRoundExtension(judgeRead, judgeInput);
-    expect(plan.record).toMatchObject(judgeInput);
-    expect(JSON.stringify(plan.record)).toContain(attribution);
-    expect(plan.body).toContain(attribution);
-    expect(countGrantedRoundExtensions([automation(plan.body)], input)).toBe(2);
-    expect(countGrantedRoundExtensions([trusted(plan.body)], input)).toBe(0);
-    expect(countGrantedRoundExtensions([{ body: plan.body, author: { login: 'mallory' }, viewerDidAuthor: true }], input)).toBe(0);
-  });
-  it('posts as automation and proves its grant without operator credentials', async () => {
-    const plan = planRoundExtension(judgeRead, judgeInput);
-    const posted = [];
-    const post = vi.fn((_repo, _pr, body) => posted.push(automation(body)));
-    const sinks = createExtendRoundsSinks({ readThread: () => ({ ...judgeRead, comments: [...posted] }),
-      post, readViewerLogin: () => AUTOMATION_LOGINS[0] });
-    await expect(sinks[ROUND_EXTENSION_POST_EFFECT](plan)).resolves.toMatchObject({ granted: 2 });
-    expect(post).toHaveBeenCalledTimes(1);
-    expect(posted[0].body).toContain(attribution);
-  });
-  it.each([OPERATOR_LOGINS[0], 'mallory', ''])('judge refuses posting identity %s before writing', async login => {
-    const plan = planRoundExtension(judgeRead, judgeInput);
-    const post = vi.fn();
-    const sinks = createExtendRoundsSinks({ readThread: () => judgeRead, post, readViewerLogin: () => login });
-    await expect(sinks[ROUND_EXTENSION_POST_EFFECT](plan)).rejects.toThrow(/automation|posting identity/i);
-    expect(post).not.toHaveBeenCalled();
-  });
-  it.each([{ enabled: false, actor: 'judge:r10' }, { enabled: 'yes', actor: 'judge:r10' },
-    { enabled: true, actor: '' }])('disabled or malformed policy refuses %j', value => {
-    expect(() => planRoundExtension({ ...read, judgeActorPolicy: { value } }, judgeInput))
-      .toThrow(/disabled|invalid|malformed|judge.*policy/i);
-  });
-  it.each(['scripts/guard-git-push.mjs', 'scripts/security/check.mjs', 'scripts/launchd/agent.plist',
-    'scripts/drain-queue.mjs', 'scripts/merge-queue.mjs', 'scripts/firewall.mjs', 'scripts/codex-shim.mjs'])(
-    'judge cannot grant more rounds to PR touching protected %s', file => {
-      expect(() => planRoundExtension({ ...read, files: [file] }, judgeInput)).toThrow(/protected|operator.only/i);
+describe('R671 v1 refuses judge round grants', () => {
+  it.each([{}, { files: ['src/ordinary.js'], headRefOid: 'a'.repeat(40), changedFiles: 1 }])(
+    'judge grant is refused regardless of supplied evidence %j', over => {
+      expect(() => planRoundExtension({ ...read, ...over }, { ...input, actor: 'judge:r10' }))
+        .toThrow('judge grant is refused in v1; operator-only');
     });
-  it('does not widen the operator path or accept unknown actors', () => {
-    expect(OPERATOR_LOGINS).not.toContain('judge:r10');
+  it('unknown actors remain refused', () => {
     expect(() => planRoundExtension(read, { ...input, actor: 'judge:unknown' })).toThrow(/operator|actor/i);
-    const plan = planRoundExtension(read, input);
-    expect(countGrantedRoundExtensions([trusted(plan.body)], input)).toBe(2);
-    expect(countGrantedRoundExtensions([automation(plan.body)], input)).toBe(0);
-    expect(plan.body).not.toContain(attribution);
   });
 });

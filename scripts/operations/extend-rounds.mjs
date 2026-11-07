@@ -7,7 +7,7 @@
  */
 import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
-import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
+import { OPERATOR_LOGINS, JUDGE_ACTOR } from '../lib/marker-authorship.mjs';
 import {
   buildRoundExtensionComment, countGrantedRoundExtensions, countStandingRulingGrantRecords, MAX_TOTAL_ROUND_EXTENSIONS,
 } from '../conveyor/round-extension-mark.mjs';
@@ -18,6 +18,7 @@ export const ROUND_EXTENSION_POST_EFFECT = 'github.round-extension';
 /** Pure verdict: attribution is the operator's, with verbatim reason and an explicit channel. */
 export function planRoundExtension(read, input) {
   const { repo, pr, by, actor, channel, reason } = input;
+  if (actor === JUDGE_ACTOR) throw new Error('judge grant is refused in v1; operator-only');
   if (!OPERATOR_LOGINS.includes(String(actor ?? '').toLowerCase())) {
     throw new Error(`--actor must be a registered operator login (${OPERATOR_LOGINS.join(', ')}); this extension is the operator's`);
   }

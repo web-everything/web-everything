@@ -1082,8 +1082,8 @@ describe('R668 acting judge not-real requires evidence (red-first)', () => {
     return { run, result, operation, view, written, judgeConfirm, landRulingCard, noIO, snapshot, rtIO };
   }
 
-  it('R671 red-team writer persists judge attribution in ledger and PR record without rewriting history', async () => {
-    const h = await fixture('red-team', { inputOver: { actor: 'judge:r10' },
+  it('R671 red-team block writer persists judge attribution in ledger and PR record without rewriting history', async () => {
+    const h = await fixture('red-team', { inputOver: { actor: 'judge:r10', ruling: 'block', asJudge: false, cause: undefined },
       readOver: { identity: { login: 'web-everything', type: 'Bot' }, files: ['scripts/x.mjs'] } });
     const plan = await h.run();
     const historical = gh('Historical operator ruling: preserve verbatim', 'chalbert');
@@ -1091,7 +1091,7 @@ describe('R668 acting judge not-real requires evidence (red-first)', () => {
     const before = JSON.stringify(comments);
     const rows = [], posted = [];
     const sinks = h.rtIO.createRecordRedTeamRulingSinks({
-      readThread: () => ({ headRefOid: head, labels: ['review:human'], comments: [...comments] }),
+      readThread: () => ({ headRefOid: head, labels: ['review:changes'], comments: [...comments] }),
       readScope: () => h.snapshot.scope, readStandingRulingScope: () => null,
       resolveIdentity: () => ({ login: 'web-everything', type: 'Bot' }), syncLabels: () => null,
       readEvents: async () => ({ status: 'ok', rows: [...rows] }),
@@ -1112,15 +1112,12 @@ describe('R668 acting judge not-real requires evidence (red-first)', () => {
 
   // R671: use the existing evidence operation, with the distinct actor and automation poster.
   for (const kind of ['referral', 'red-team']) {
-    it(`R671 ${kind}: judge:r10 not-real traverses --asJudge with live evidence`, async () => {
+    it(`${kind}: judge not-real is refused in v1; operator-only`, async () => {
       const h = await fixture(kind, { inputOver: { actor: 'judge:r10' },
         readOver: { identity: { login: 'web-everything', type: 'Bot' }, files: ['scripts/x.mjs'] } });
-      const plan = await h.run();
-      expect(h.result(plan)).toBe('not-real');
-      expect(h.judgeConfirm).toHaveBeenCalledTimes(1);
-      expect(storedEvidence(plan)).toMatchObject(evidence());
-      expect(kind === 'referral' ? plan.record.actor : plan.actor).toBe('judge:r10');
-      expect(h.written).toHaveLength(1);
+      await expect(h.run()).rejects.toThrow(/judge not-real is refused in v1; operator-only/);
+      expect(h.judgeConfirm).not.toHaveBeenCalled();
+      expect(h.written).toEqual([]);
     });
     it(`R671 ${kind}: judge:r10 cannot bypass --asJudge or omit its evidence`, async () => {
       for (const inputOver of [{ asJudge: false }, { evidence: undefined }]) {
@@ -1331,6 +1328,15 @@ describe('R668 acting judge not-real requires evidence (red-first)', () => {
       expect(JSON.stringify(h.written)).not.toMatch(/"(?:result|ruling)":"not-real"/);
       expect(h.noIO).not.toHaveBeenCalled();
     });
+    it.each(['security/injection', 'security-foo'])(`${kind}: operator asJudge refuses security namespace %s`, async value => {
+      const [ref] = await modules;
+      expect(() => ref.planJudgeNotReal(policy({ findings: [{ ...claims()[0], class: value }] })))
+        .toThrow(/security|operator.only/i);
+    });
+    it(`${kind}: operator asJudge does not classify securityish as security`, async () => {
+      const [ref] = await modules;
+      expect(ref.planJudgeNotReal(policy({ findings: [{ ...claims()[0], class: 'securityish' }] }))).toMatchObject({ ruling: 'not-real' });
+    });
     const refusals = [
       ['security-class finding => refused', { findings: [{ ...claims()[0], class: 'security' }] }, { findingOver: { findingClass: 'security' } }, /security|operator.only/i],
       ['guard-file finding => refused', { findings: [{ ...claims()[0], file: 'scripts/guards/head.mjs' }] }, { findingOver: { file: 'scripts/guards/head.mjs' } }, /guard|operator.only/i],
@@ -1514,54 +1520,81 @@ describe('R668 acting judge not-real requires evidence (red-first)', () => {
 });
 
 
-describe('R671 distinct acting judge referral actor (red-first)', () => {
+describe('R671 v1 acting judge referral blocks', () => {
   const attribution = 'Ruled by acting judge (R10), not the operator';
   const rec = referral();
   const base = openReferralFindings({ comments: [gh(renderReferralRecord(rec))], ...ctx() });
-  const snapshot = (ruling, over = {}) => ({ ...base, head, now: '2026-11-07T12:00:00Z', clearerId: 'judge-session',
-    files: ['scripts/x.mjs'], identity: { login: 'web-everything', type: 'Bot' },
-    judgeActorPolicy: { value: { enabled: true, actor: 'judge:r10' } },
-    card: ruling === 'card' ? { requested: CARD, ref: CARD, readable: true } : null, ...over });
-  const request = (ruling, over = {}) => ({ repo, pr: 7, finding: 'all-open', ruling,
+  const snapshot = (over = {}) => ({ ...base, head, now: '2026-11-07T12:00:00Z', clearerId: 'judge-session',
+    identity: { login: 'web-everything', type: 'Bot' },
+    judgeActorPolicy: { value: { enabled: true, actor: 'judge:r10' } }, ...over });
+  const request = (ruling = 'block', over = {}) => ({ repo, pr: 7, finding: 'all-open', ruling,
     actor: 'judge:r10', channel: 'chat', reason: 'Observed the failure', ...over });
-
-  it.each(['block', 'card'])('allows judge %s and attributes both record and comment', result => {
-    const plan = planOperatorRuling(snapshot(result), request(result));
+  it.each(['reviewed-sha', 'ReViEwEd-ShA', 'cleared-human', 'ClEaReD-HuMaN'])(
+    'judge referral writer refuses reserved token %s in reason before producing any body', token => {
+      let plan;
+      expect(() => { plan = planOperatorRuling(snapshot(), request('block', { reason: `Prose ${token} here` })); })
+        .toThrow(/judge.*reserved.*review.*token/i);
+      expect(plan).toBeUndefined();
+    });
+  it.each(['reviewed-sha', 'CLEARED-HUMAN'])('judge referral effects refuse %s before any write', async token => {
+    const post = vi.fn(), runSetLabel = vi.fn(), readJson = vi.fn(), readPr = vi.fn();
+    const sinks = createRecordReferralRulingSinks({ post, runSetLabel, readJson, readPr });
+    const plan = planOperatorRuling(snapshot(), request());
+    const payload = { ...plan.record, body: `Prose ${token}`, rulings: plan.record.rulings };
+    await expect(sinks[OPERATOR_RULING_POST_EFFECT](payload)).rejects.toThrow(/judge.*reserved.*review.*token/i);
+    await expect(sinks[OPERATOR_RULING_FOLLOW_UP_EFFECT]({ ...payload, action: 'send-back' }))
+      .rejects.toThrow(/judge.*reserved.*review.*token/i);
+    expect(post).not.toHaveBeenCalled();
+    expect(runSetLabel).not.toHaveBeenCalled();
+    expect(readJson).not.toHaveBeenCalled();
+    expect(readPr).not.toHaveBeenCalled();
+  });
+  it('operator referral reasons retain the existing treatment of review tokens', () => {
+    const reason = 'reviewed-sha and CLEARED-HUMAN in operator prose';
+    const plan = planOperatorRuling(snapshot(), request('block', { actor: 'chalbert', reason }));
+    expect(plan.record.reason).toBe(reason);
+    expect(plan.body).toContain(reason);
+  });
+  it('allows judge block with attribution in record and PR comment', () => {
+    const plan = planOperatorRuling(snapshot(), request());
     expect(plan.record.actor).toBe('judge:r10');
     expect(JSON.stringify(plan.record)).toContain(attribution);
     expect(plan.body).toContain(attribution);
     expect(parseOperatorRulingComment(gh(plan.body)).record.actor).toBe('judge:r10');
     const state = mandatoryReferralState([gh(renderReferralRecord(rec)), gh(plan.body)], ctx());
-    expect(result === 'block' ? state.blocked : state.pending).toEqual(result === 'block' ? [rec.referrals[0].key] : []);
+    expect(state.blocked).toEqual([rec.referrals[0].key]);
   });
-  it.each(['approval', 'clear-human', 'accept'])('refuses judge %s', result => {
-    expect(() => planOperatorRuling(snapshot(result), request(result))).toThrow(/ruling|approval|clear-human|accept/i);
-  });
-  it.each(['block', 'card', 'not-real'].flatMap(result => [
-    { securityReachableToday: true }, { category: 'security' }, { findingClass: 'security' },
-  ].map(fields => [result, fields])))('refuses security-class %s with %j', (result, fields) => {
-    const read = snapshot(result);
-    read.open = read.open.map(f => ({ ...f, ...fields }));
-    expect(() => planOperatorRuling(read, request(result, result === 'not-real' ? { asJudge: true, cause: 'other' } : {})))
-      .toThrow(/security|operator.only/i);
-  });
-  const protectedFiles = ['scripts/guard-git-push.mjs', 'scripts/security/check.mjs', 'scripts/launchd/agent.plist',
-    'scripts/drain-queue.mjs', 'scripts/merge-queue.mjs', 'scripts/firewall.mjs', 'scripts/codex-shim.mjs'];
-  it.each(protectedFiles)('refuses card/not-real for PR touching %s even when selected finding is elsewhere; allows block', file => {
-    expect(() => planOperatorRuling(snapshot('card', { files: ['scripts/x.mjs', file] }), request('card')))
-      .toThrow(/protected|operator.only/i);
-    expect(() => planOperatorRuling(snapshot('not-real', { files: ['scripts/x.mjs', file] }), request('not-real', { asJudge: true, cause: 'other' })))
-      .toThrow(/protected|operator.only/i);
-    expect(planOperatorRuling(snapshot('block', { files: [file] }), request('block')).record.rulings[0].result).toBe('block');
-  });
+  it.each(['card', 'not-real', 'approval', 'clear-human', 'accept'])(
+    'judge %s is refused in v1 before producing a record', ruling => {
+      expect(() => planOperatorRuling(snapshot(), request(ruling)))
+        .toThrow(`judge ${ruling} is refused in v1; operator-only`);
+    });
+  it.each([{ category: 'security/injection' }, { findingClass: undefined }, { findingClass: 'unknown' }])(
+    'judge block is allowed without security/classification eligibility %j', fields => {
+      const read = snapshot();
+      read.open = read.open.map(f => ({ ...f, ...fields }));
+      expect(planOperatorRuling(read, request()).record.rulings[0].result).toBe('block');
+    });
   it.each([{ enabled: false, actor: 'judge:r10' }, { enabled: 'yes', actor: 'judge:r10' },
     { enabled: true, actor: '' }])('refuses disabled/malformed policy %j', value => {
-    expect(() => planOperatorRuling(snapshot('block', { judgeActorPolicy: { value } }), request('block')))
+    expect(() => planOperatorRuling(snapshot({ judgeActorPolicy: { value } }), request()))
       .toThrow(/disabled|invalid|malformed|judge.*policy/i);
   });
+  it.each(['card', 'not-real'])('persisted judge %s records never count', result => {
+    const plan = planOperatorRuling(snapshot(), request());
+    const forged = { ...plan.record, rulings: plan.record.rulings.map(row => ({ ...row, result })) };
+    const body = plan.body.replace(/(<!-- mandatory-referral-operator-ruling-v1: )[A-Za-z0-9+/=]+( -->)/,
+      (_match, before, after) => before + Buffer.from(JSON.stringify(forged)).toString('base64') + after);
+    expect(readOperatorRulings([gh(body)]).rulings).toEqual([]);
+    expect(mandatoryReferralState([gh(renderReferralRecord(rec)), gh(body)], ctx()).pending).toEqual([rec.referrals[0].key]);
+  });
+  it.each(['mallory', 'chalbert'])('forged judge referral block by %s is ignored', login => {
+    const plan = planOperatorRuling(snapshot(), request());
+    expect(readOperatorRulings([{ body: plan.body, author: { login } }]).rulings).toEqual([]);
+  });
   it('unknown actor stays refused and the existing operator record stays operator-worded', () => {
-    expect(() => planOperatorRuling(snapshot('block'), request('block', { actor: 'judge:unknown' }))).toThrow(/actor|operator/i);
-    const plan = planOperatorRuling(snapshot('block'), request('block', { actor: 'chalbert' }));
+    expect(() => planOperatorRuling(snapshot(), request('block', { actor: 'judge:unknown' }))).toThrow(/actor|operator/i);
+    const plan = planOperatorRuling(snapshot(), request('block', { actor: 'chalbert' }));
     expect(plan.record.actor).toBe('chalbert');
     expect(plan.body).toMatch(/operator ruling/i);
     expect(plan.body).not.toContain(attribution);

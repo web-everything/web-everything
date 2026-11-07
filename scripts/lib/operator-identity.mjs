@@ -13,7 +13,7 @@
  *     itself (follow-up hook in `red-team-gate.mjs`); this module's callers apply it today.
  */
 import { spawnSync } from 'node:child_process';
-import { OPERATOR_LOGINS } from './marker-authorship.mjs';
+import { OPERATOR_LOGINS, JUDGE_ACTOR, JUDGE_ATTRIBUTION, isJudgeAuthored, readJudgeActorPolicy } from './marker-authorship.mjs';
 import { parseRedTeamGateMarker } from './red-team-gate.mjs';
 
 /** Gate-record outcomes only an operator may write. */
@@ -27,8 +27,8 @@ export function operatorGhEnv(env = process.env) {
 }
 
 /** The authenticated `gh` identity under the operator channel. Throws when it cannot be read. */
-export function resolveOperatorIdentity({ env = process.env, run = spawnSync } = {}) {
-  const r = run('gh', ['api', 'user'], { env: operatorGhEnv(env), encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] });
+export function resolveOperatorIdentity({ env = process.env, run = spawnSync, automation = false } = {}) {
+  const r = run('gh', ['api', 'user'], { env: automation ? env : operatorGhEnv(env), encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] });
   if (r.status !== 0) throw new Error(`could not resolve the posting identity (gh api user failed: ${String(r.stderr ?? r.error?.message ?? '').trim().slice(0, 200)})`);
   const user = JSON.parse(String(r.stdout ?? '{}'));
   return { login: String(user.login ?? ''), type: String(user.type ?? '') };
@@ -49,6 +49,8 @@ export function assertHumanOperator(identity, actor) {
 
 /** Is this comment written by a human operator account? PURE. */
 export function isHumanOperatorComment(c) {
+  if (parseRedTeamGateMarker(c?.body)?.actor !== undefined
+    || /^Cleared by judge:r10\b/m.test(String(c?.body ?? ''))) return false;
   const login = String((typeof c === 'string' ? '' : (c?.author?.login ?? c?.user?.login)) ?? '').toLowerCase();
   const a = typeof c === 'string' ? null : (c?.author ?? c?.user);
   return isHuman(login, String(a?.type ?? '')) && a?.is_bot !== true && OPERATOR_LOGINS.includes(login);
@@ -58,6 +60,23 @@ export function isHumanOperatorComment(c) {
 export function operatorBoundComments(comments) {
   return (Array.isArray(comments) ? comments : []).filter((c) => {
     const m = parseRedTeamGateMarker(typeof c === 'string' ? c : c?.body);
-    return !(m && OPERATOR_GATE_OUTCOMES.includes(m.outcome)) || isHumanOperatorComment(c);
+    if (m?.actor !== undefined) return isRulingComment(c);
+    return !(m && OPERATOR_GATE_OUTCOMES.includes(m.outcome)) || isRulingComment(c);
   });
+}
+
+export function assertRulingIdentity(identity, actor) {
+  if (actor !== JUDGE_ACTOR) return assertHumanOperator(identity, actor);
+  if (!isJudgeAuthored({ author: identity })) throw new Error('judge posting identity must be trusted automation');
+  return identity.login;
+}
+/** Judge comments can only add a hold, with explicit attribution and live policy. */
+export function isRulingComment(c) {
+  const m = parseRedTeamGateMarker(c?.body);
+  if (m?.actor === undefined) return isHumanOperatorComment(c);
+  if (m.actor !== JUDGE_ACTOR || m.outcome !== 'operator-block' || !isJudgeAuthored(c)
+    || /reviewed-sha|cleared-human/i.test(String(c?.body ?? ''))
+    || !String(c?.body ?? '').split(/\r?\n/).some(line => line === JUDGE_ATTRIBUTION || line === `${JUDGE_ATTRIBUTION} (${JUDGE_ACTOR})`)) return false;
+  try { const p = readJudgeActorPolicy().value; return p.enabled === true && p.actor === JUDGE_ACTOR; }
+  catch { return false; }
 }

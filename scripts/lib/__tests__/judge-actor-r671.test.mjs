@@ -1,7 +1,7 @@
 /** R671 red-first contract: judgeActor policy + actor= on the existing gate marker. */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import * as authorship from '../marker-authorship.mjs';
-import { assertHumanOperator, isHumanOperatorComment, operatorBoundComments } from '../operator-identity.mjs';
+import { assertHumanOperator, isHumanOperatorComment, isRulingComment, operatorBoundComments } from '../operator-identity.mjs';
 import { operatorBlockRulings } from '../ruling-ledger.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { redTeamGateMarker, liveResultGateState, operatorRulingsOnLiveResult,
@@ -16,7 +16,7 @@ const opLogin = authorship.OPERATOR_LOGINS[0];
 const comment = (body, login = botLogin) => ({ body, author: { login }, createdAt: '2026-11-07T12:00:00Z' });
 const result = comment(renderRedTeamComment({ pr, rev: head, provider: 'codex', model: 'm',
   recheckStatus: 'ok', foldedVerdict: 'changes', findings: [{ summary: 'live break', category: 'edge-case',
-    impactIfUnfixed: 'broken', file: 'src/x.js', line: 7, confirmedByRecheck: true }] }));
+    findingClass: 'coverage-or-style', impactIfUnfixed: 'broken', file: 'src/x.js', line: 7, confirmedByRecheck: true }] }));
 const rid = liveResultGateState([result], pr, head).resultId;
 // Contract: actor= is part of the anchored gate marker, not free-form words in a reason.
 const judgeGate = (outcome, line, login = botLogin) => comment(
@@ -24,7 +24,7 @@ const judgeGate = (outcome, line, login = botLogin) => comment(
     + `\n${attribution}\n${line}`, login);
 const cap = comment(redTeamGateMarker(pr, head, 'round-cap', rid));
 const disposition = comments => readRedTeamDisposition({ comments, pr, head, setting: CONFIRMED_BREAKS_DEFAULTS,
-  operatorRulings: { anyState: true } });
+  operatorRulings: { anyState: true }, repo: 'we' });
 
 describe('R671 judgeActor policy cascade', () => {
   const policy = over => authorship.readJudgeActorPolicy({ env: {}, platform: {}, tool: {}, ...over });
@@ -52,12 +52,7 @@ describe('R671 judgeActor policy cascade', () => {
       expect(authorship.readJudgeActorPolicy).toBeTypeOf('function');
       expect(() => policy(over)).toThrow(/invalid|malformed|judge/i);
     });
-  it.each(['scripts/guard-git-push.mjs', 'scripts/security/check.mjs', 'scripts/launchd/a.plist',
-    'scripts/drain-queue.mjs', 'scripts/merge-queue.mjs', 'scripts/firewall.mjs', 'scripts/codex-shim.mjs'])(
-    'shared isJudgeProtectedPath helper recognizes %s', file => {
-      expect(authorship.isJudgeProtectedPath(file)).toBe(true);
-      expect(authorship.isJudgeProtectedPath('src/ordinary.js')).toBe(false);
-    });
+
 });
 
 describe('R671 judge readers bind actor and automation author', () => {
@@ -69,23 +64,21 @@ describe('R671 judge readers bind actor and automation author', () => {
     const d = disposition([result, cap, block]);
     expect([...d.held, ...d.sendBack].map(f => f.index)).toEqual([1]);
   });
-  it.each(['operator-card', 'operator-not-real'])('trusted automation %s releases only the ruled finding', outcome => {
-    const line = outcome === 'operator-card'
-      ? '- 1 finding(s) carded by the operator to `we:backlog/x.md` (#1).'
-      : '- 1 finding(s) left advisory (#1).';
-    const c = judgeGate(outcome, line);
-    expect(operatorBoundComments([c])).toEqual([c]);
-    expect(operatorRulingsOnLiveResult([result, cap, c], pr, head).ruled.get(1))
-      .toEqual([outcome === 'operator-card' ? 'card' : 'not-real']);
-    expect(disposition([result, cap, c]).held).toEqual([]);
-  });
+  it.each(['operator-card', 'operator-not-real', 'accept', 'clear-human', 'card-queued', 'sent-back', 'round-cap'])(
+    'ignores forged automation judge %s outcome in v1', outcome => {
+      const c = judgeGate(outcome, '- 1 finding(s) left advisory (#1).');
+      expect(operatorBoundComments([c])).toEqual([]);
+      expect(operatorRulingsOnLiveResult([result, cap, c], pr, head).ruled.size).toBe(0);
+      expect(liveResultGateState([result, c], pr, head, 'we', null).outcomes.has(outcome)).toBe(false);
+      expect(disposition([result, cap, c]).held.map(f => f.index)).toEqual([1]);
+    });
   it.each(['mallory', opLogin, undefined])('ignores judge marker by other/missing author %s even with viewerDidAuthor', login => {
     const block = judgeGate('operator-block', '- 1 confirmed break(s) sent back to the fixer (#1).', login);
     block.author = login === undefined ? undefined : { login };
     block.viewerDidAuthor = true;
     expect(operatorBoundComments([block])).toEqual([]);
     expect(operatorRulingsOnLiveResult([result, block], pr, head).blocked.size).toBe(0);
-    expect(liveResultGateState([result, block], pr, head).outcomes.has('operator-block')).toBe(false);
+    expect(liveResultGateState([result, block], pr, head, 'we', null).outcomes.has('operator-block')).toBe(false);
   });
   it('automation without the judge actor cannot claim an operator card ruling', () => {
     const c = comment(redTeamGateMarker(pr, head, 'operator-card', rid)
@@ -105,5 +98,64 @@ describe('R671 judge readers bind actor and automation author', () => {
     expect(() => assertHumanOperator({ login: botLogin, type: 'Bot' }, actor)).toThrow();
     const c = comment(`## Operator ruling: send back to fix (block)\n\n${attribution}\nactor=judge:r10\n\n1. \`src/x.js\` ruling: block`);
     expect(operatorBlockRulings([c])).toEqual([]);
+  });
+});
+
+
+describe('R671 v1 only adds holds', () => {
+  it.each(['card', 'not-real', 'approval', 'clear-human', 'accept', undefined])('refuses judge %s in the shared authority boundary', ruling => {
+    expect(() => authorship.assertJudgeAuthority({}, { actor, ruling, asJudge: true }))
+      .toThrow(`judge ${ruling ?? 'grant'} is refused in v1; operator-only`);
+  });
+  it('block needs no classification or protected-path eligibility', () => {
+    expect(() => authorship.assertJudgeAuthority({}, { actor, ruling: 'block' },
+      [{ category: 'security/injection' }, { findingClass: 'unknown' }])).not.toThrow();
+  });
+  it('disabled policy refuses persisted judge blocks', () => {
+    vi.stubEnv('WE_JUDGE_ACTOR_ENABLED', 'false');
+    try {
+      const block = judgeGate('operator-block', '- 1 confirmed break(s) sent back to the fixer (#1).');
+      expect(operatorBoundComments([block])).toEqual([]);
+      expect(operatorRulingsOnLiveResult([result, block], pr, head).blocked.size).toBe(0);
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it('judge block without attribution is ignored', () => {
+    const block = judgeGate('operator-block', '- 1 confirmed break(s) sent back to the fixer (#1).');
+    block.body = block.body.replace(attribution, '');
+    expect(operatorBoundComments([block])).toEqual([]);
+  });
+  it('a judge block marker cannot smuggle a release action', () => {
+    const block = judgeGate('operator-block', '- 1 finding(s) left advisory (#1).');
+    expect(disposition([result, cap, block]).held.map(f => f.index)).toEqual([1]);
+    expect(operatorRulingsOnLiveResult([result, cap, block], pr, head).ruled.size).toBe(0);
+  });
+  it('judge grant markers never count', async () => {
+    const { buildRoundExtensionComment, countGrantedRoundExtensions } = await import('../../conveyor/round-extension-mark.mjs');
+    const body = buildRoundExtensionComment({ repo: 'web-everything/web-everything', pr, by: 1, actor,
+      channel: 'chat', reason: attribution, at: '2026-11-07T12:00:00Z' }) + `\n${attribution}`;
+    for (const login of [botLogin, opLogin]) expect(countGrantedRoundExtensions([comment(body, login)],
+      { repo: 'web-everything/web-everything', pr })).toBe(0);
+  });
+  it.each([['security/injection', true], ['security-foo', true], ['securityish', false]])(
+    'shared security matcher classifies %s as %s', (value, security) => {
+      expect(authorship.isSecurityClass(value)).toBe(security);
+    });
+});
+
+
+describe('R671 judge comments cannot carry review clearance tokens', () => {
+  it.each(['reviewed-sha', 'ReViEwEd-ShA', 'cleared-human', 'ClEaReD-HuMaN'])(
+    'rejects judge block containing %s anywhere, including prose', token => {
+      const block = judgeGate('operator-block', '- 1 confirmed break(s) sent back to the fixer (#1).');
+      block.body += `\nOrdinary prose before ${token} and after.`;
+      expect(isRulingComment(block)).toBe(false);
+      expect(operatorBoundComments([block])).toEqual([]);
+      expect(liveResultGateState([result, block], pr, head).outcomes.has('operator-block')).toBe(false);
+    });
+  it('preserves operator comments containing review clearance tokens', () => {
+    const block = comment(redTeamGateMarker(pr, head, 'operator-block', rid)
+      + '\n- 1 confirmed break(s) sent back to the fixer (#1).\nreviewed-sha and CLEARED-HUMAN in prose', opLogin);
+    expect(isRulingComment(block)).toBe(true);
+    expect(operatorBoundComments([block])).toEqual([block]);
   });
 });
