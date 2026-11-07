@@ -146,6 +146,26 @@ describe('scanBundleRange lane first-parent scope', () => {
     expect(await scan()).toMatchObject({ path: 'side.yml', finding });
   });
 
+  // The prerequisite-skip key is path + mode + blob sha: an entry is skipped only when ALL THREE equal origin/main's.
+  it('scans a public path whose blob changed to a credential (same path and mode, different sha)', async () => {
+    write('cfg.yml', 'public\n');
+    originMain = commit('public cfg');
+    write('cfg.yml', `api_key: ${literal}\n`);
+    commit('lane edits cfg');
+    expect(await scan()).toMatchObject({ path: 'cfg.yml', finding: 'high-entropy-api_key' });
+  });
+
+  it.each([
+    ['a credential-looking blob copied to a new path', 'copy.yml', 'high-entropy-api_key'],
+    ['a public blob copied to an excluded path', 'keys/server.pem', 'excluded-path'],
+  ])('scans %s (same mode and sha, different path)', async (_name, path, finding) => {
+    write('public.yml', `api_key: ${literal}\n`);
+    originMain = commit('public blob');
+    write(path, `api_key: ${literal}\n`);
+    commit('lane copies public blob');
+    expect(await scan()).toMatchObject({ path, finding });
+  });
+
   it.each(['deploy/id_rsa', 'certs/server.pem', 'keys/signing.key'])('rejects a lane-added regular key file %s even with innocuous contents', async path => {
     write(path, 'not a secret\n');
     commit('lane adds key-named file');
@@ -160,6 +180,7 @@ describe('scanBundleRange fails closed on every Git failure shape', () => {
   const isLsTree = call => call.args.includes('ls-tree');
   const isRevList = call => call.args.includes('rev-list');
   const isRawLog = call => call.args.includes('--raw');
+  const isMessageLog = call => call.args.includes('log') && call.args.some(arg => arg.startsWith('--format=%an'));
 
   it.each([
     ['non-zero exit', () => ({ code: 128, stdout: Buffer.alloc(0), stderr: Buffer.from('boom') })],
@@ -180,6 +201,10 @@ describe('scanBundleRange fails closed on every Git failure shape', () => {
   it.each([
     ['rev-list non-zero exit', isRevList, () => ({ code: 1, stdout: Buffer.alloc(0), stderr: Buffer.from('boom') })],
     ['rev-list returns a non-SHA token', isRevList, () => ok('not-a-sha\n')],
+    ['rev-list succeeds with null stdout', isRevList, () => ({ code: 0, stdout: null, stderr: Buffer.alloc(0) })],
+    ['rev-list output is not newline-terminated', isRevList, () => ok(sha)],
+    ['commit-message log succeeds with null stdout', isMessageLog, () => ({ code: 0, stdout: null, stderr: Buffer.alloc(0) })],
+    ['commit-message log non-zero exit', isMessageLog, () => ({ code: 128, stdout: Buffer.alloc(0), stderr: Buffer.from('boom') })],
     ['log throws', isRawLog, () => { throw new Error('spawn failed'); }],
     ['log non-zero exit', isRawLog, () => ({ code: 128, stdout: Buffer.alloc(0), stderr: Buffer.from('boom') })],
     ['log null stdout', isRawLog, () => ({ code: 0, stdout: null, stderr: Buffer.alloc(0) })],

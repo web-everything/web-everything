@@ -147,8 +147,11 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
   // Enumerate the full bundled ancestry: a merged branch can add and delete a credential
   // before its merge, leaving no trace in the merge's first-parent diff.
   const revs = await git(['rev-list', '--root', range]);
-  if (revs.code !== 0) throw bundleError('bundle-credential-scan-failed');
-  const commits = bytes(revs.stdout).toString('utf8').split('\n').filter(Boolean);
+  // Missing or unterminated output is unknown evidence, never an empty range (which would skip all scanning).
+  if (revs.code !== 0 || revs.stdout == null) throw bundleError('bundle-credential-scan-failed');
+  const revText = bytes(revs.stdout).toString('utf8');
+  if (revText && !revText.endsWith('\n')) throw bundleError('bundle-credential-scan-failed');
+  const commits = revText.split('\n').filter(Boolean);
   if (commits.length > maxBlobs) throw bundleError('bundle-credential-scan-too-large');
   if (commits.some(sha => !REVISION.test(sha))) throw bundleError('bundle-credential-scan-failed');
   // -t lists tree (directory) entries too: without it an EMPTY subtree entry (crafted with mktree) has no file below it
@@ -164,7 +167,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
   if (log.code !== 0 || log.stdout == null) throw bundleError('bundle-credential-scan-failed');
   // Commit messages (and author/committer identity lines) travel in the pack too. Tags are not bundled: only the pinned ref is.
   const messages = await git(['log', '-z', '--root', '--format=%an%n%ae%n%cn%n%ce%n%B', range]);
-  if (messages.code !== 0) throw bundleError('bundle-credential-scan-failed');
+  if (messages.code !== 0 || messages.stdout == null) throw bundleError('bundle-credential-scan-failed');
   for (const message of splitNul(bytes(messages.stdout))) {
     // Same scanner as blobs (secret assignments included); a message is plain text.
     let finding = credentialTextFinding(message.toString('latin1')) ?? credentialTextFinding(message.toString('utf8'));

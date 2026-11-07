@@ -45,7 +45,10 @@ describe('credentialContentFinding GitHub Actions references', () => {
 
   // private-key is only refused by the entropy rule (value >= 20 chars); short forms carry no credential there.
   const unsupported = ["${{ format('abcdefghij0123456789XYZ') }}", "${{ 'abcdefghij0123456789XYZ' }}", '${{ toJSON(secrets) }}',
-    "${{ secrets.X == 'abcdefghij0123456789XYZ' }}"];
+    "${{ secrets.X == 'abcdefghij0123456789XYZ' }}",
+    // a || chain is only a reference when EVERY arm is a dotted context path
+    "${{ steps.x.outputs.token || 'abcdefghij0123456789XYZ' }}", "${{ 'abcdefghij0123456789XYZ' || secrets.X }}",
+    '${{ secrets.X || abcdefghij0123456789XYZ }}', '${{ secrets.X || secrets.Y || "abcdefghij0123456789XYZ" }}'];
   it.each([
     ...unsupported.map(value => ['private-key', value]),
     ...['token', 'secret'].flatMap(field => [...unsupported, '${{ secrets }}', '${{ secrets.X[0] }}'].map(value => [field, value])),
