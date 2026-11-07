@@ -362,7 +362,7 @@ export function createDrainMergeStrategy({
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) return { allowed: false, reason: 'red-team comments unreadable' };
         const comments = pages.flat();
         if (!safety.value.waitForRedTeamBeforeEnqueue) return { allowed: true, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
-        const evidence = settleUnknownEvidenceByComment(readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env }), pages.flat(), c.num, headSha);
+        const evidence = settleUnknownEvidenceByComment(readRedTeamEvidence({ repo: slugOf(c.repo), pr: c.num, head: headSha, env }), pages.flat(), c.num, headSha, live.reviews);
         const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env,
           standingRuling: grantScopeFor(c, headSha, pages.flat()) });
         return { allowed: !reason, reason, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
@@ -413,7 +413,7 @@ export function createDrainMergeStrategy({
         const pages = readThreadPages(c.repo, c.num);
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team admission: unreadable complete comments');
         const standingRuling = grantScopeFor(c, headSha, pages.flat());
-        evidence = settleUnknownEvidenceByComment(evidence, pages.flat(), c.num, headSha);
+        evidence = settleUnknownEvidenceByComment(evidence, pages.flat(), c.num, headSha, live.reviews);
         const reason = redTeamEnqueueHold({ ...evidence, comments: pages.flat(), pr: c.num, head: headSha, repo: slugOf(c.repo), env, standingRuling });
         try {
           const statusInput = { repo: slugOf(c.repo), pr: c.num, head: headSha, evidence, env, standingRuling,
