@@ -35,6 +35,7 @@ import {
   createJobStore, createTickClock, enqueueJob, reattachTick, runJob,
 } from '../daemon-jobs-runtime.mjs';
 import { evictSnapshots, npmCiInstaller } from '../daemon-job-snapshots.mjs';
+import { hasDanglingTopLevelLink } from '../lane-deps-installer.mjs';
 import { TERMINAL_JOB_STATUSES } from '../../operations/job-record.mjs';
 import { daemonJobsDir, deleteRun } from '../../operations/run-store.mjs';
 import { cloneKey, appendOverlayEvent } from '../daemon-overlays.mjs';
@@ -112,9 +113,12 @@ export function cloneNodeModulesInstaller(sourceRoot, { exec = execFileSync, fal
     if (same && existsSync(src)) {
       const dest = join(into, 'node_modules');
       // The clone's tree may hold pnpm's relative store links; they must resolve from the snapshot's depth too.
+      // A copy whose store links already dangle (shared store wiped under the source clone) is not a usable tree:
+      // it must not be stamped as installed, so it falls to the npm install instead.
       const rebased = () => {
         if (!existsSync(dest)) return true;
-        try { rebaseNodeModulesLinks({ from: src, copy: dest, final: dest }); return true; } catch { return false; }
+        try { rebaseNodeModulesLinks({ from: src, copy: dest, final: dest }); } catch { return false; }
+        return !hasDanglingTopLevelLink(dest);
       };
       try { exec('cp', ['-cR', src, dest], { stdio: 'ignore', timeout: 5 * 60_000 }); if (rebased()) return; } catch { /* no clonefile */ }
       rmSync(dest, { recursive: true, force: true });

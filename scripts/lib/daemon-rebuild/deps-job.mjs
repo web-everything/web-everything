@@ -41,7 +41,7 @@ import { cloneKey } from '../daemon-overlays.mjs';
 import { NPM_INSTALL_TIMEOUT_MS } from '../bounded-child.mjs';
 import { readGit } from '../proc-read.mjs';
 import {
-  selectInstaller, runDepsInstaller, markerMatches, lockHash, readStoreGeneration,
+  selectInstaller, runDepsInstaller, markerMatches, lockHash, readStoreGeneration, hasDanglingTopLevelLink,
   resolvePnpmStoreDir, whichOnPath, PROBE_TIMEOUT_MS, PROBE_MAX_BUFFER,
 } from '../lane-deps-installer.mjs';
 import { readLockfileParity } from '../../check-lockfile-parity.mjs';
@@ -236,7 +236,9 @@ export function pnpmAwareInstaller({
     // This plan is never spawned: its dispatch calls the existing installer directly.
     const npm = { backend: 'npm', command: Symbol('legacy-installer'), args: [] };
     if (plan.backend === 'pnpm') {
-      plan.args.push('--ignore-scripts');
+      // Unattended and run with the daemon's credentials: no lifecycle scripts AND no pnpmfile / config-dependency
+      // hooks (a checked-in .pnpmfile.cjs or a `pnpmfile:` setting in the copied workspace config is code, too).
+      plan.args.push('--ignore-scripts', '--ignore-pnpmfile');
       plan.fallback = npm;
       if (readStoreGeneration(storeDir) === null) {
         log('pnpm store not initialised by a lane; using npm');
@@ -470,7 +472,9 @@ export async function refreshDepsAsJob({
   const say = (m) => log(`deps-job: ${m}`);
   let key;
   try { key = lockfileKey(readLock(root)); } catch { return { reason: 'no-lockfile' }; }
-  if (installed.read() === key) return { reason: 'up-to-date', key };
+  // The recorded key proves which lockfile was swapped in, not that the tree still works: pnpm links point into a
+  // shared store that can be wiped underneath the clone. A dangling top-level link (or an unreadable tree) is not ready.
+  if (installed.read() === key && !hasDanglingTopLevelLink(join(root, 'node_modules'))) return { reason: 'up-to-date', key };
   mkdirSync(store.dir, { recursive: true });
   const kind = DEPS_JOB_KIND.kind;
   const mine = () => store.list().records.filter((r) => r.job.kind === kind && r.input?.key === key);

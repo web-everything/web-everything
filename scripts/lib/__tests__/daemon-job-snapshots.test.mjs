@@ -89,13 +89,16 @@ describe('node_modules stores', () => {
     return { sourceDir, storeDir, target, initial, install };
   }
 
-  it.each(['valid pnpm', 'generation changed', 'dangling link', 'npm', 'no marker', 'unreadable marker'])('read-only shared store validation: %s', (reason) => {
-    const f = completedStore(reason === 'npm' ? 'npm' : reason === 'no marker' ? null : 'pnpm');
+  it.each([
+    'valid pnpm', 'generation changed', 'dangling link', 'npm', 'no marker', 'unreadable marker',
+    'npm dangling link', 'no marker dangling link',
+  ])('read-only shared store validation: %s', (reason) => {
+    const f = completedStore(reason.startsWith('npm') ? 'npm' : reason.startsWith('no marker') ? null : 'pnpm');
     if (reason === 'generation changed') {
       rmSync(f.storeDir, { recursive: true });
       ensureStoreGeneration(f.storeDir);
       mkdirSync(f.target);
-    } else if (reason === 'dangling link') rmSync(f.target, { recursive: true });
+    } else if (reason.endsWith('dangling link')) rmSync(f.target, { recursive: true });
     else if (reason === 'unreadable marker') {
       rmSync(join(f.initial.dir, '.we-deps-marker'));
       mkdirSync(join(f.initial.dir, '.we-deps-marker'));
@@ -146,14 +149,27 @@ describe('node_modules stores', () => {
     expect(existsSync(join(f.initial.dir, 'old-store-sentinel'))).toBe(true);
   });
 
-  it.each(['npm', null])('preserves completed-store reuse for marker backend=%s', (backend) => {
+  it.each(['npm', null])('preserves completed-store reuse while the links resolve, marker backend=%s', (backend) => {
+    const f = completedStore(backend);
+    expect(hasDanglingTopLevelLink(join(f.initial.dir, 'node_modules'))).toBe(false);
+    expect(ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install })).toEqual(f.initial);
+    expect(f.install).not.toHaveBeenCalled();
+    expect(existsSync(join(f.initial.dir, 'old-store-sentinel'))).toBe(true);
+  });
+
+  // A copied pnpm-linked clone is stamped npm (its provenance is lost), so the marker cannot be trusted alone: once the
+  // shared store it links into is gone the store is rebuilt exactly once, never reused.
+  it.each(['npm', null])('rebuilds a completed store whose links dangle even though its marker says backend=%s', (backend) => {
     const f = completedStore(backend);
     rmSync(f.storeDir, { recursive: true });
     ensureStoreGeneration(f.storeDir);
     expect(hasDanglingTopLevelLink(join(f.initial.dir, 'node_modules'))).toBe(true);
+    expect(storeStillValid(f.initial.dir)).toBe(false);
     expect(ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install })).toEqual(f.initial);
-    expect(f.install).not.toHaveBeenCalled();
-    expect(existsSync(join(f.initial.dir, 'old-store-sentinel'))).toBe(true);
+    expect(f.install).toHaveBeenCalledTimes(1);
+    expect(existsSync(join(f.initial.dir, 'old-store-sentinel'))).toBe(false);
+    ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install });
+    expect(f.install).toHaveBeenCalledTimes(1);
   });
 
   it('keys the store by the lockfile, so two snapshots with one lockfile share one install', () => {

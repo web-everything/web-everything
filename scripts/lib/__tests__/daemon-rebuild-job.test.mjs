@@ -13,7 +13,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, relative } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, execFileSync } from 'node:child_process';
 
 import {
   rebuildClone, readRebuildState, readReadyCandidate,
@@ -138,7 +138,7 @@ describe('cloneNodeModulesInstaller — pnpm snapshot routing', () => {
   it('routes a matching snapshot with a pnpm lock through pnpm and writes its marker', () => {
     const f = setup();
     cloneNodeModulesInstaller(f.sourceRoot, f)(f.into);
-    expect(installs(f)).toEqual([['pnpm', ['install', '--frozen-lockfile', `--store-dir=${f.pnpm.storeDir}`, '--ignore-scripts'], expect.objectContaining({ cwd: f.into })]]);
+    expect(installs(f)).toEqual([['pnpm', ['install', '--frozen-lockfile', `--store-dir=${f.pnpm.storeDir}`, '--ignore-scripts', '--ignore-pnpmfile'], expect.objectContaining({ cwd: f.into })]]);
     expect(f.exec).not.toHaveBeenCalled();
     expect(f.fallback).not.toHaveBeenCalled();
     expectMarker(f, 'pnpm');
@@ -151,7 +151,7 @@ describe('cloneNodeModulesInstaller — pnpm snapshot routing', () => {
     cloneNodeModulesInstaller(f.sourceRoot, f)(f.into);
     expect(installs(f)).toHaveLength(1);
     for (const [, args] of installs(f)) {
-      expect(args).toEqual(['install', '--frozen-lockfile', `--store-dir=${f.pnpm.storeDir}`, '--ignore-scripts']);
+      expect(args).toEqual(['install', '--frozen-lockfile', `--store-dir=${f.pnpm.storeDir}`, '--ignore-scripts', '--ignore-pnpmfile']);
     }
   });
 
@@ -194,6 +194,39 @@ describe('cloneNodeModulesInstaller — pnpm snapshot routing', () => {
         ['native build missing', '@parcel/watcher', 'esbuild', 'backend=npm'].every((text) => String(line).includes(text)))).toBe(true);
       expectMarker(f, 'npm');
     }
+  });
+
+  describe('the copy fallback validates a pnpm-linked clone (real cp, no mocked copy)', () => {
+    // A clone whose node_modules links into a shared pnpm global store, copied while pnpm is unavailable.
+    function linkedClone(f) {
+      const shared = mktemp('we-rebuild-shared-store-');
+      mkdirSync(join(shared, 'esbuild'));
+      writeFileSync(join(shared, 'esbuild', 'index.js'), 'x');
+      symlinkSync(join(shared, 'esbuild'), join(f.sourceRoot, 'node_modules', 'esbuild'), 'dir');
+      f.pnpm.which.mockReturnValue(null);
+      // The production exec throws on a failed copy (no `cp -c` here) so the plain `cp -R` retry is reached.
+      f.exec.mockImplementation((cmd, args) => { execFileSync(cmd, args, { stdio: 'ignore' }); });
+      return shared;
+    }
+
+    it('a link that resolves is copied, the npm install does not run, and the tree resolves', () => {
+      const f = setup();
+      linkedClone(f);
+      cloneNodeModulesInstaller(f.sourceRoot, f)(f.into);
+      expect(f.fallback).not.toHaveBeenCalled();
+      expect(existsSync(join(f.into, 'node_modules', 'esbuild', 'index.js'))).toBe(true);
+    });
+
+    it('links already dangling in the source (shared store wiped) are refused: the copy is removed and npm runs', () => {
+      const f = setup();
+      const shared = linkedClone(f);
+      rmSync(shared, { recursive: true, force: true });
+      f.fallback.mockImplementation(() => { expect(existsSync(join(f.into, 'node_modules'))).toBe(false); });
+      cloneNodeModulesInstaller(f.sourceRoot, f)(f.into);
+      expect(f.fallback).toHaveBeenCalledTimes(1);
+      expect(f.fallback).toHaveBeenCalledWith(f.into);
+      expect(existsSync(join(f.into, 'node_modules', 'esbuild'))).toBe(false);
+    });
   });
 
   it('retains the cp -cR clone path when pnpm is unavailable and records backend=npm', () => {

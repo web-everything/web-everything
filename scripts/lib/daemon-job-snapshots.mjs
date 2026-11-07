@@ -99,18 +99,22 @@ export function npmCiInstaller({ timeoutMs = NPM_INSTALL_TIMEOUT_MS } = {}) {
   };
 }
 
-/** Read-only reuse check: historical/npm stores are retained; pnpm evidence must still match and resolve. */
+/**
+ * Read-only reuse check. Whatever the marker says, a tree whose top-level store links dangle is never reused: a copy of
+ * a pnpm-linked clone can be stamped npm (its provenance is lost), and the shared store it links into can vanish.
+ * A pnpm marker must also still match the current inputs and store generation.
+ */
 export function storeStillValid(dir) {
   let marker;
   try { marker = readFileSync(join(dir, DEPS_MARKER_FILE), 'utf8').trim(); }
   catch (error) {
     // Historical stores have no marker. Other read failures are incomplete evidence.
-    return error.code === 'ENOENT';
+    if (error.code !== 'ENOENT') return false;
+    marker = null;
   }
-  if (!marker.startsWith('pnpm:')) return true;
   try {
-    return markerMatches(marker, lockHash(dir, 'pnpm', resolvePnpmStoreDir()), 'pnpm')
-      && !hasDanglingTopLevelLink(join(dir, 'node_modules'));
+    if (marker?.startsWith('pnpm:') && !markerMatches(marker, lockHash(dir, 'pnpm', resolvePnpmStoreDir()), 'pnpm')) return false;
+    return !hasDanglingTopLevelLink(join(dir, 'node_modules'));
   } catch { return false; }
 }
 

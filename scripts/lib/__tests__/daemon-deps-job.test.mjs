@@ -85,7 +85,7 @@ describe('pnpmAwareInstaller — snapshot dependency backend', () => {
   it('chooses usable pnpm, copies its inputs, and reads the lane-initialised store generation', () => {
     const f = setup();
     pnpmAwareInstaller(f)(f.into);
-    expect(installs(f)).toEqual([['pnpm', ['install', '--frozen-lockfile', `--store-dir=${f.storeDir}`, '--ignore-scripts'], expect.objectContaining({ cwd: f.into })]]);
+    expect(installs(f)).toEqual([['pnpm', ['install', '--frozen-lockfile', `--store-dir=${f.storeDir}`, '--ignore-scripts', '--ignore-pnpmfile'], expect.objectContaining({ cwd: f.into })]]);
     expect(f.which).toHaveBeenCalledWith('pnpm');
     expect(f.parity).toHaveBeenCalledTimes(1);
     expect(f.legacy).not.toHaveBeenCalled();
@@ -111,15 +111,27 @@ describe('pnpmAwareInstaller — snapshot dependency backend', () => {
     expectMarker(f, 'npm');
   });
 
-  it.each([undefined, false])('always disables pnpm install scripts even with ignoreScripts=%s', (ignoreScripts) => {
+  it.each([undefined, false])('always disables pnpm install scripts and pnpmfile hooks even with ignoreScripts=%s', (ignoreScripts) => {
     const f = setup();
     f.ignoreScripts = ignoreScripts;
-    f.env = { npm_config_ignore_scripts: 'false', PNPM_CONFIG_IGNORE_SCRIPTS: 'false' };
+    f.env = { npm_config_ignore_scripts: 'false', PNPM_CONFIG_IGNORE_SCRIPTS: 'false', npm_config_ignore_pnpmfile: 'false' };
     depsJobInstaller(f)(f.into);
     expect(installs(f)).toHaveLength(1);
     for (const [, args] of installs(f)) {
-      expect(args).toEqual(['install', '--frozen-lockfile', `--store-dir=${f.storeDir}`, '--ignore-scripts']);
+      expect(args).toEqual(['install', '--frozen-lockfile', `--store-dir=${f.storeDir}`, '--ignore-scripts', '--ignore-pnpmfile']);
     }
+  });
+
+  it('the pnpm argv carries --ignore-pnpmfile even when the copied workspace config names a pnpmfile', () => {
+    const f = setup();
+    // The copied workspace config names a pnpmfile by absolute path, as in the demonstrated break.
+    const payload = join(f.sourceRoot, 'payload.cjs');
+    writeFileSync(payload, 'throw new Error("pnpmfile executed")');
+    writeFileSync(join(f.sourceRoot, 'pnpm-workspace.yaml'), `pnpmfile: ${payload}\n`);
+    depsJobInstaller(f)(f.into);
+    expect(readFileSync(join(f.into, 'pnpm-workspace.yaml'), 'utf8')).toContain('pnpmfile:');
+    const [[, args]] = installs(f);
+    expect(args).toContain('--ignore-pnpmfile');
   });
 
   it.each([false, true])('checks all installed allowBuilds packages after pnpm; native built=%s', (built) => {
@@ -243,7 +255,7 @@ describe('pnpmAwareInstaller — snapshot dependency backend', () => {
     f.exec.mockImplementation((cmd, args, opts) => {
       if (args[0] === 'install') {
         expect(opts.cwd).toBe(f.into);
-        expect(args).toEqual(expect.arrayContaining(['--frozen-lockfile', '--ignore-scripts']));
+        expect(args).toEqual(expect.arrayContaining(['--frozen-lockfile', '--ignore-scripts', '--ignore-pnpmfile']));
         expect(readFileSync(generationFile, 'utf8')).toBe(generationBefore);
       }
       return exec(cmd, args, opts);
@@ -309,6 +321,31 @@ describe('refreshDepsAsJob — the loop side never installs', () => {
     const swap = vi.fn();
     expect(await refreshDepsAsJob({ root: f.root, installed: f.installed, store: f.store, reattach: noReattach, swap, codeSha: SHA })).toMatchObject({ reason: 'up-to-date' });
     expect(swap).not.toHaveBeenCalled();
+  });
+
+  it('a matching key is NOT up-to-date once the live pnpm links dangle: the store is revalidated and recovery queued', async () => {
+    const f = fixture();
+    f.installed.write(f.key);
+    // The swapped-in tree links into a shared store that is then wiped; package-lock.json is unchanged.
+    const sharedStore = mk('deps-shared-store-');
+    mkdirSync(join(sharedStore, 'esbuild'));
+    symlinkSync(join(sharedStore, 'esbuild'), join(f.root, 'node_modules', 'esbuild'), 'dir');
+    const swap = vi.fn();
+    expect(await refreshDepsAsJob({ root: f.root, installed: f.installed, store: f.store, reattach: noReattach, swap, codeSha: SHA }))
+      .toMatchObject({ reason: 'up-to-date' });
+    rmSync(sharedStore, { recursive: true, force: true });
+    const r = await refreshDepsAsJob({ root: f.root, installed: f.installed, store: f.store, reattach: noReattach, swap, codeSha: SHA });
+    expect(r).toMatchObject({ reason: 'deps-job-started', key: f.key });
+    expect(f.store.list().records).toHaveLength(1);
+    expect(f.store.list().records[0]).toMatchObject({ input: { key: f.key }, job: { kind: DEPS_JOB_KIND.kind, status: 'queued' } });
+  });
+
+  it('a matching key with no readable live node_modules is not up-to-date (fail closed)', async () => {
+    const f = fixture();
+    f.installed.write(f.key);
+    rmSync(join(f.root, 'node_modules'), { recursive: true });
+    const r = await refreshDepsAsJob({ root: f.root, installed: f.installed, store: f.store, reattach: noReattach, swap: vi.fn(), codeSha: SHA });
+    expect(r.reason).not.toBe('up-to-date');
   });
 
   it('a changed lockfile queues ONE install job and returns at once; the live node_modules is untouched', async () => {
