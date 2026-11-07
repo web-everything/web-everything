@@ -127,14 +127,14 @@ it('ages missing CI from the push, preserving that time on a same-head retry', (
 
 
 const sizePush = { repo: 'o/r', pr: 7, head: 'abc' };
-function sizeHarness({ labels = [], readNumstat, filesOutput, repo = 'o/r', fail } = {}) {
+function sizeHarness({ labels = [], readNumstat, filesOutput, repo = 'o/r', fail, changedFiles } = {}) {
   const calls = [];
   const run = (cmd, args) => {
     expect(cmd).toBe('gh');
     calls.push(args);
     if (fail?.(args)) throw new Error('size write failed');
     if (args[0] === 'api' || (args[1] === 'view' && args.at(-1) === 'files')) return filesOutput;
-    if (args[1] === 'view') return JSON.stringify({ headRefOid: 'abc', labels });
+    if (args[1] === 'view') return JSON.stringify({ headRefOid: 'abc', labels, ...(changedFiles === undefined ? {} : { changedFiles }) });
     return '';
   };
   const invoke = () => markFixPushAwaitingCi({ ...sizePush, repo }, {
@@ -263,16 +263,16 @@ it.each([
   expect(delivered).toHaveLength(1);
   expect(sizeAdds(calls)).toHaveLength(1);
 });
-const fileRow = (filename, additions, deletions, hasPatch = true) => JSON.stringify({ additions, deletions, filename, hasPatch }) + '\n';
+const fileRow = (filename, additions, deletions, hasPatch = true, previous_filename = null) => JSON.stringify({ additions, deletions, filename, previous_filename, hasPatch }) + '\n';
 it('default reader uses paginated API rows with the repo and PR', () => {
-  const { calls, invoke } = sizeHarness({ filesOutput: fileRow('src/a.mjs', 301, 0) });
+  const { calls, invoke } = sizeHarness({ filesOutput: fileRow('src/a.mjs', 301, 0), changedFiles: 1 });
   expect(invoke()).toBe(true);
   expect(calls[1]).toEqual(['api', '--paginate', 'repos/o/r/pulls/7/files', '--jq', FILES_JQ]);
   expect(FILES_JQ).toContain('hasPatch:(.patch != null)');
   expect(sizeAdds(calls)).toHaveLength(1);
 });
 it('default reader treats a patch-less zero-change file (binary) as unmeasurable, never as a zero-sized diff', () => {
-  const { calls, invoke } = sizeHarness({ filesOutput: fileRow('src/a.mjs', 5, 0) + fileRow('image.png', 0, 0, false) });
+  const { calls, invoke } = sizeHarness({ filesOutput: fileRow('src/a.mjs', 5, 0) + fileRow('image.png', 0, 0, false), changedFiles: 2 });
   expect(invoke()).toBe(true);
   expect(sizeAdds(calls)).toHaveLength(1);
   expect(sizeComments(calls)[0].at(-1)).toContain('pr-size-unmeasurable');
@@ -280,22 +280,51 @@ it('default reader treats a patch-less zero-change file (binary) as unmeasurable
 });
 it('filesToNumstat keeps measured zeros, marks binary rows unmeasurable and rejects malformed evidence', () => {
   expect(filesToNumstat('')).toBe('');
-  expect(filesToNumstat(fileRow('a.mjs', 3, 4))).toBe('3\t4\ta.mjs\n');
+  expect(filesToNumstat(fileRow('a.mjs', 3, 4))).toBe('3\t4\ta.mjs\0');
   // A patch-bearing zero row (e.g. an emptied-line edit) is a measured zero, not binary.
-  expect(filesToNumstat(fileRow('a.mjs', 0, 0))).toBe('0\t0\ta.mjs\n');
-  expect(filesToNumstat(fileRow('img.png', 0, 0, false))).toBe('-\t-\timg.png\n');
+  expect(filesToNumstat(fileRow('a.mjs', 0, 0))).toBe('0\t0\ta.mjs\0');
+  expect(filesToNumstat(fileRow('img.png', 0, 0, false))).toBe('-\t-\timg.png\0');
+  // A rename carries both paths (git -z shape); an unchanged-name previous_filename is not a rename.
+  expect(filesToNumstat(fileRow('b.mjs', 1, 2, true, 'a.mjs'))).toBe('1\t2\t\0a.mjs\0b.mjs\0');
+  expect(filesToNumstat(fileRow('a.mjs', 1, 2, true, 'a.mjs'))).toBe('1\t2\ta.mjs\0');
   for (const bad of [
     fileRow('a.mjs', 1, 0).slice(0, -1), // truncated last row (no final newline)
     '{"additions":1,"deletions":0,"filen\n', // cut mid-row
     '\n', // blank row
     fileRow('a.mjs', null, 0), fileRow('a.mjs', -1, 0), fileRow('a.mjs', 1.5, 0), fileRow('', 1, 0),
     JSON.stringify({ additions: 1, deletions: 0, filename: 'a' }) + '\n', // hasPatch missing
+    fileRow('a.mjs', 1, 0, true, 'x\ny'), fileRow('a.mjs', 1, 0, true, ''),
     'null\n', '[]\n', 42,
   ]) expect(() => filesToNumstat(bad)).toThrow();
   // A path holding a tab/newline would forge extra numstat rows: it is rejected outright (fails closed).
-  const { calls, invoke } = sizeHarness({ filesOutput: fileRow('a\n0\t0\tb', 1, 0) });
+  const { calls, invoke } = sizeHarness({ filesOutput: fileRow('a\n0\t0\tb', 1, 0), changedFiles: 1 });
   expect(invoke()).toBe(true);
   expect(sizeComments(calls)[0].at(-1)).toContain('pr-size-unmeasurable');
+});
+it.each([
+  ['an empty read while the PR has files', '', 3],
+  ['a short read', fileRow('src/a.mjs', 1, 0), 2],
+  ['extra rows', fileRow('src/a.mjs', 1, 0) + fileRow('b.mjs', 1, 0), 1],
+  ['an unknown PR file count', fileRow('src/a.mjs', 1, 0), undefined],
+])('default reader fails closed on %s (cross-check against the PR file count)', (name, filesOutput, changedFiles) => {
+  const { calls, invoke } = sizeHarness({ filesOutput, changedFiles });
+  expect(invoke()).toBe(true);
+  expect(sizeAdds(calls)).toHaveLength(1);
+  expect(sizeComments(calls)[0].at(-1)).toContain('pr-size-unmeasurable');
+  expectCiHandoff(calls);
+});
+it('default reader accepts an empty read only when the PR has no files', () => {
+  const { calls, invoke } = sizeHarness({ filesOutput: '', changedFiles: 0 });
+  expect(invoke()).toBe(true);
+  expect(sizeAdds(calls)).toHaveLength(0);
+  expectCiHandoff(calls);
+});
+it('a rename out of source into a test path is measured against its source, not as test-only (default reader)', () => {
+  const { calls, invoke } = sizeHarness({ filesOutput: fileRow('src/__tests__/x.test.mjs', 200, 200, true, 'src/x.mjs'), changedFiles: 1 });
+  expect(invoke()).toBe(true);
+  expect(sizeAdds(calls)).toHaveLength(1);
+  expect(sizeComments(calls)[0].at(-1)).toContain('pr-size-over-cap');
+  expectCiHandoff(calls);
 });
 it('default reader without a repo is unmeasurable and fails closed (no implicit repo)', () => {
   const { calls, invoke } = sizeHarness({ repo: '' });
@@ -305,7 +334,7 @@ it('default reader without a repo is unmeasurable and fails closed (no implicit 
   expect(sizeComments(calls)[0].at(-1)).toContain('pr-size-unmeasurable');
 });
 it('default reader fails closed at the 3000-file API cap with human review fallback', () => {
-  const { calls, invoke } = sizeHarness({ filesOutput: fileRow('src/a.mjs', 0, 0).repeat(3000) });
+  const { calls, invoke } = sizeHarness({ filesOutput: fileRow('src/a.mjs', 0, 0).repeat(3000), changedFiles: 3000 });
   expect(invoke()).toBe(true);
   expect(sizeAdds(calls)).toHaveLength(1);
   expect(sizeComments(calls)[0].at(-1)).toContain('pr-size-unmeasurable');
