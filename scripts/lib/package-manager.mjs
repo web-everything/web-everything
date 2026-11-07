@@ -1,0 +1,143 @@
+/**
+ * packageManager setting (story 5743, slice 1): `npm | pnpm`, resolved through the policy cascade
+ * standard (npm) -> platform (platform-preferences.json `packageManager`) -> repo/tool -> env WE_PACKAGE_MANAGER.
+ * Nothing calls this yet; install sites are wired in later slices. Only the install verb changes: every
+ * `npm run` / `npx` call site stays as it is.
+ *
+ * Fail closed: an unknown value resolves to npm (never to a lower layer's pnpm); a missing `pnpm` or a failed
+ * pnpm install falls back to npm, and says so.
+ */
+import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+import { cascadePolicy, readPlatformPreferences } from './policy-cascade.mjs';
+
+export const PACKAGE_MANAGERS = ['npm', 'pnpm'];
+const text = (v) => (v === undefined || v === null || !String(v).trim() ? undefined : String(v).trim());
+
+/** @returns {{manager:'npm'|'pnpm', source:string, value:unknown, note?:string}} */
+export function resolvePackageManager({ env = process.env, tool, platform, log, readPlatform = readPlatformPreferences } = {}) {
+  let degraded;
+  if (platform === undefined) { // read the platform layer here so an unreadable file is visible, not silently dropped
+    const { prefs, errors } = readPlatform({ env, warn: () => {} });
+    platform = prefs.packageManager;
+    if (errors.length) degraded = `platform preferences unreadable (${errors[0]})`;
+    const configured = String(env?.WE_PLATFORM_PREFERENCES_FILE ?? '').trim();
+    if (!degraded && configured && !existsSync(configured)) degraded = 'platform preferences file configured but missing';
+  }
+  if (!degraded && platform !== undefined && !PACKAGE_MANAGERS.includes(platform)) degraded = `invalid platform packageManager ${JSON.stringify(platform)}`;
+  // A malformed platform value (an object leaf would survive next to a scalar env override) never enters the cascade:
+  // it is dropped here and reported as `degraded`, so a valid higher layer still wins and nothing lower can switch managers.
+  if (platform !== undefined && !PACKAGE_MANAGERS.includes(platform)) platform = null;
+  const r = cascadePolicy('packageManager', text(tool), {
+    standard: 'npm', platform, env, envValues: { '': text(env.WE_PACKAGE_MANAGER) }, ...(log ? { log } : {}),
+  });
+  const source = r.sources[''] ?? 'standard';
+  const value = r.value;
+  if (PACKAGE_MANAGERS.includes(value)) return { manager: value, source, value, ...(degraded ? { degraded } : {}) };
+  return { manager: 'npm', source, value, ...(degraded ? { degraded } : {}), note: `unknown packageManager ${JSON.stringify(value)} (from ${source}); using npm` };
+}
+
+/**
+ * Fail closed. Falling back to npm is allowed only when pnpm could not run (a spawn error code) or every pnpm error
+ * code in its output is a registry-fetch failure. Any other pnpm error code, and any lockfile or integrity wording
+ * anywhere in the output, always blocks the fallback: npm checks a different lockfile and would mask it.
+ */
+const DENY = /lockfile|integrity|checksum|keyid|signature|ELIFECYCLE|lifecycle|postinstall|preinstall/i;
+const SPAWN_CODES = new Set(['ENOENT', 'EACCES', 'EPERM']);
+const FETCH_CODES = new Set(['ERR_PNPM_FETCH_FAIL', 'ERR_PNPM_META_FETCH_FAIL']);
+const pnpmCodes = (t) => [...String(t).matchAll(/ERR_PNPM_[A-Z0-9_]+/g)].map((m) => m[0]);
+function pnpmUnusable(e) {
+  // A timeout or a kill means pnpm was running and was cut off: partial fetch-failure output proves nothing. Never fall back.
+  if (e?.code === 'ETIMEDOUT' || e?.killed === true || e?.signal) return false;
+  // Node's execFileSync message starts with "Command failed: <argv>", and the argv names --frozen-lockfile: classifying on
+  // it would make DENY match every failure. Drop that one line; the real output is in stdout/stderr and the message tail.
+  const message = String(e?.message ?? '').replace(/^Command failed:[^\n]*\n?/, '');
+  const out = `${message}\n${e?.stdout ?? ''}\n${e?.stderr ?? ''}`;
+  if (DENY.test(out)) return false;
+  const codes = pnpmCodes(out);
+  if (codes.some((c) => !FETCH_CODES.has(c))) return false; // any non-fetch pnpm error code wins over a spawn code
+  if (SPAWN_CODES.has(e?.code)) return true;
+  if (codes.length) return true; // only fetch-failure codes
+  return false; // unclassified: fail closed (a signature or launcher rejection is not 'pnpm missing')
+}
+const runnerFailure = (e) => pnpmUnusable(e);
+
+const defaultPnpmVersion = () => execFileSync('pnpm', ['--version'], { stdio: 'pipe', timeout: 30_000 }).toString().trim();
+
+/** @returns {{bin:string, args:string[], manager:string, source:string, note?:string}} */
+export function installArgv({ ci = false, ignoreScripts = false, pnpmVersion = defaultPnpmVersion, lockfileParity, ...opts } = {}) {
+  const r = resolvePackageManager(opts);
+  let { manager, note } = r;
+  if (r.degraded && !note) note = `${r.degraded}; resolved ${r.manager}`;
+  // A frozen npm ci needs the parity proof when an unknown value forced npm, or a degraded platform layer may have masked
+  // a pnpm choice (the standard default won). A valid explicit env/tool value overrides the degraded layer, so a frozen
+  // pnpm install, or an explicit npm one, needs no npm proof: npm parity is only checked if a pnpm fallback to npm happens.
+  // A platform-won npm is masked too: an unreadable operator file (merged last) may have said pnpm over the repo file's npm.
+  const masked = !!r.note || (!!r.degraded && r.manager === 'npm' && (r.source === 'standard' || r.source === 'platform'));
+  if (masked && ci) {
+    let proven = false;
+    try { proven = typeof lockfileParity === 'function' && lockfileParity() === true; } catch { proven = false; }
+    if (!proven) throw new Error(`${r.note ?? r.degraded}; refusing a frozen npm ci without a lockfileParity proof`);
+  }
+  if (manager === 'pnpm') {
+    try { pnpmVersion(); } catch (e) {
+      if (!pnpmUnusable(e)) throw e; // fail closed: an integrity/lockfile-class failure is not 'pnpm missing'
+      // A frozen npm install checks package-lock.json, not pnpm-lock.yaml: it needs a caller-supplied parity proof.
+      let proven = false;
+      if (ci) { try { proven = typeof lockfileParity === 'function' && lockfileParity() === true; } catch { proven = false; } }
+      if (ci && !proven) throw new Error(`pnpm unusable (${String(e?.message ?? e).split('\n')[0]}); refusing a frozen npm ci without a lockfileParity proof`, { cause: e });
+      manager = 'npm'; note = `pnpm --version failed (from ${r.source}); using npm`;
+    }
+  }
+  // pnpm freezes an existing lockfile by default when CI is set, so a non-frozen install must say so explicitly.
+  const args = manager === 'pnpm' ? ['install', ci ? '--frozen-lockfile' : '--no-frozen-lockfile'] : [ci ? 'ci' : 'install'];
+  if (ignoreScripts) args.push('--ignore-scripts');
+  return { bin: manager, args, manager, source: r.source, ...(note ? { note } : {}) };
+}
+
+/** The install command line as text (`frozen` = lockfile-exact install). */
+export function installCommand({ frozen = false, log = (l) => console.error(l), ...opts } = {}) {
+  const { bin, args, note } = installArgv({ ...opts, ci: frozen });
+  if (note) log(`package-manager · ${note}`);
+  return [bin, ...args].join(' ');
+}
+
+/**
+ * Run the install. A pnpm that cannot run or reach the registry falls back to npm and logs it; a FROZEN fallback also
+ * needs `lockfileParity()` to return true (npm ci validates a different lockfile). Every other failure is rethrown.
+ */
+/**
+ * Node's default 1 MiB maxBuffer kills a verbose but healthy install (ENOBUFS + SIGTERM). Output is still piped, because a
+ * failure is classified on it, so give it an explicit bound instead: 256 MiB per stream. Past that the install is killed
+ * and the error is unclassified (signal set), so it fails closed and never falls back to npm.
+ */
+export const INSTALL_MAX_BUFFER = 256 * 1024 * 1024;
+export const defaultInstallExec = (bin, args, o) => execFileSync(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: INSTALL_MAX_BUFFER, ...o });
+
+export function installWithFallback({ frozen = false, ignoreScripts = false, cwd, exec = defaultInstallExec, log = (l) => console.error(l), lockfileParity, ...opts } = {}) {
+  const first = installArgv({ ...opts, ci: frozen, ignoreScripts, lockfileParity });
+  if (first.note) log(`package-manager · ${first.note}`);
+  try { exec(first.bin, first.args, { cwd }); return { ...first, fellBack: false }; }
+  catch (e) {
+    if (first.manager !== 'pnpm') throw e;
+    // Fail closed: only a pnpm that could not run, or reach the registry, falls back (see FALLBACK_OK).
+    if (!runnerFailure(e)) { log(`package-manager · pnpm install failed and is not a runner/network failure (${String(e?.message ?? e).split('\n')[0]}); NOT falling back to npm`); throw e; }
+    // A frozen npm fallback checks package-lock.json, not pnpm-lock.yaml, so it needs a caller-supplied parity proof.
+    let proven = false;
+    try { proven = typeof lockfileParity === 'function' && lockfileParity() === true; } catch { proven = false; }
+    if (frozen && !proven) {
+      log('package-manager · pnpm frozen install failed (runner/network); NOT falling back to npm ci: no lockfileParity proof supplied');
+      throw e;
+    }
+    log(`package-manager · pnpm install failed (${String(e?.message ?? e).split('\n')[0]}); falling back to npm ${frozen ? 'ci' : 'install'}`);
+    const args = [frozen ? 'ci' : 'install', ...(ignoreScripts ? ['--ignore-scripts'] : [])];
+    exec('npm', args, { cwd });
+    return { bin: 'npm', args, manager: 'npm', source: first.source, fellBack: true, pnpmError: String(e?.message ?? e).split('\n')[0] };
+  }
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href && process.argv.includes('--explain')) {
+  const r = installArgv({ ci: true });
+  console.log(`packageManager=${r.manager} source=${r.source} command="${[r.bin, ...r.args].join(' ')}"${r.note ? ` note="${r.note}"` : ''}`);
+}
