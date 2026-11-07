@@ -33,3 +33,24 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — Setting is per platform with repo override.
 6. **State over time** — Lockfile drift between npm and pnpm is checked in CI.
 7. **Who wrote it** — The source layer of the setting is logged.
+
+## Progress
+
+**2026-11-05 · slice 1 (A1 measurement + the setting).** One copy of origin/main (544 npm packages), pnpm 9.15.9 pinned via `npx`, hoisted linker, store outside the repo. Events come from a recursive `fs.watch` counter on the target; disk is the `df` delta. One run per arm, on a loaded Mac, so treat the df column as noisy.
+
+| arm | wall s | fs events | disk delta MB |
+|---|---|---|---|
+| npm ci, cold cache | 9.0 | 22.0k | 1675 |
+| npm ci, warm cache | 7.0 | 27.9k | 726 |
+| pnpm hoisted, clone, cold store | 12.3 | 39.8k | 578 |
+| pnpm hoisted, clone, warm store | 3.8 | 26.5k | 19 |
+| pnpm hoisted, hardlink, cold store | 13.2 | 22.5k | 551 |
+| pnpm hoisted, hardlink, warm store | 7.4 | 22.4k | 295 |
+| `cp -cR` of the npm tree (today's rebuild-job) | 4.8 | 40.5k | 198 |
+| symlink to the shared store | 0.003 | 1 | n/a |
+
+Files written: npm 18.8k, pnpm 18.76k; the pnpm store is 470 MB, counted once. Unit tests (`we:scripts/lib/__tests__`) under the default isolated pnpm layout: 481 of 492 files pass; the 11 failing files are "not a git repository" errors (the archive has no `.git`), with zero module-resolution errors, so no phantom-dependency breakage was found.
+
+Conclusion: pnpm cuts disk heavily (a warm install is 19 MB vs 726 MB) and install time (3.8 s vs 7 s), but barely cuts fs events. Only a symlink to a shared store cuts events, to 1. So for rebuild jobs, replace cp -cR with a symlink where tests don't write into node_modules; pnpm is the disk and time win for lanes.
+
+The setting itself: `we:scripts/lib/package-manager.mjs` (`resolvePackageManager`, `installArgv`, `installCommand`, `installWithFallback`, `--explain`); nothing calls it yet.
