@@ -188,9 +188,8 @@ describe('renderWorkerBrief', () => {
     expect(text).toContain('node scripts/operations/codex-audit.mjs --base=origin/main --head=<40-hex sha of your lane HEAD>');
     expect(text).toContain('NOT WEAKENED');
     expect(text).toContain('at most 2 repair rounds');
-    expect(text).toContain('remaining findings');
-    expect(text).toContain('AUDIT: WEAKENED (unresolved)');
-    expect(text).toContain('never a clear audit');
+    expect(text).toContain('do NOT open a PR; report the remaining findings');
+    expect(text).not.toContain('AUDIT: WEAKENED');
     expect(text).toContain('verdict in your report');
   });
 

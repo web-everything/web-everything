@@ -174,8 +174,7 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
    6a. **Codex audit.** After verify is green and before open-pr, commit, then run the repo's Codex audit on the net diff:
    \`node scripts/operations/codex-audit.mjs --base=origin/main --head=<40-hex sha of your lane HEAD>\`.
    Open the PR only on the verdict NOT WEAKENED. On WEAKENED: fix the findings, re-test, and re-audit, at most 2 repair rounds.
-   If findings remain after those rounds, open the PR with the remaining findings noted in its body, and begin the body with the line
-   \`AUDIT: WEAKENED (unresolved)\` so a human reviews it; that PR is never a clear audit. Include the verdict in your report.
+   If it is still WEAKENED after those 2 rounds, stop: do NOT open a PR; report the remaining findings. Include the verdict in your report.
    Then open exactly one PR:
    \`node scripts/operations/run.mjs open-pr --ref=lane/${purpose} --title="<title>" --bodyFile=${scratchDir}/body.md --json\`.
    If open-pr is refused by the PR limit, stop and report — never run pr-limit allow yourself.
