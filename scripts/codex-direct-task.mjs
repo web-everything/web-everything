@@ -827,16 +827,22 @@ function finishScratchClone({
  * @param {string} opts.dir
  * @param {string} opts.startSha
  * @param {Function} [opts.execFn]
- * @returns {{status: string, diff: string, diffStat: string, commits: string[], hasChanges: boolean}}
+ * @param {boolean} [opts.binarySafe] - also capture `patch`: `git diff --binary`, which `git apply --binary`
+ *   rebuilds byte for byte (binary paths are base85-encoded). `patchExact` is true only when those bytes
+ *   survive the UTF-8 string the report carries; a non-UTF-8 text edit, a failed read (e.g. maxBuffer) or an
+ *   unverifiable non-Buffer result is `false`, so the caller keeps the clone instead of trusting the patch.
+ *   `diff` itself stays `--text` (the review read: a path marked binary must stay visible to review).
+ * @returns {{status: string, diff: string, diffStat: string, commits: string[], hasChanges: boolean,
+ *   patch?: string|null, patchExact?: boolean, patchError?: string}}
  */
-export function captureDiff({ dir, startSha, execFn = defaultExecFn }) {
+export function captureDiff({ dir, startSha, execFn = defaultExecFn, binarySafe = false }) {
   if (typeof dir !== 'string' || !dir.trim()) throw new TypeError('codex-direct-task: `dir` must be a non-empty path');
   if (typeof startSha !== 'string' || !startSha.trim()) throw new TypeError('codex-direct-task: `startSha` must be a non-empty sha');
 
   // Codex can write this checkout's git config: the shared lane pins apply, diff drivers and textconv stay off, and a
   // checkout that defines a filter driver (which `status`/`diff` would run on worktree content) is refused first.
-  const git = (args) => execFn('git', ['-C', dir, ...laneGitConfigArgs(), '--no-replace-objects', ...hardenLaneGitArgs(args)],
-    { env: laneGitHardeningEnv(), timeout: GIT_STEP_TIMEOUT_MS });
+  const git = (args, extra = {}) => execFn('git', ['-C', dir, ...laneGitConfigArgs(), '--no-replace-objects', ...hardenLaneGitArgs(args)],
+    { env: laneGitHardeningEnv(), timeout: GIT_STEP_TIMEOUT_MS, ...extra });
   assertNoLaneFilterDrivers(git);
   const status = git(['status', '--porcelain', '-z']);
   const untracked = status.split('\0').filter((l) => l.startsWith('?? ')).map((l) => l.slice(3));
@@ -847,7 +853,23 @@ export function captureDiff({ dir, startSha, execFn = defaultExecFn }) {
   const diffStat = git(['diff', '--stat', startSha]);
   const commitsRaw = git(['log', '--oneline', `${startSha}..HEAD`]);
   const commits = commitsRaw.split('\n').map((l) => l.trim()).filter(Boolean);
-  return { status: status.split('\0').filter(Boolean).join('\n'), diff, diffStat, commits, hasChanges: diff.trim().length > 0 || commits.length > 0 };
+  const result = { status: status.split('\0').filter(Boolean).join('\n'), diff, diffStat, commits, hasChanges: diff.trim().length > 0 || commits.length > 0 };
+  if (binarySafe) Object.assign(result, captureBinaryPatch(git, startSha));
+  return result;
+}
+
+/** `captureDiff`'s byte-exact patch (see its `binarySafe`). Never throws: a failed read is a not-exact patch. */
+function captureBinaryPatch(git, startSha) {
+  let raw;
+  try { raw = git(['diff', '--binary', startSha], { encoding: 'buffer' }); }
+  catch (error) { return { patch: null, patchExact: false, patchError: String(error?.message ?? error).split('\n')[0] }; }
+  if (!Buffer.isBuffer(raw)) {
+    // An injected execFn that ignored the buffer encoding: only an empty patch is known to be exact.
+    const patch = String(raw ?? '');
+    return { patch, patchExact: patch === '' };
+  }
+  const patch = raw.toString('utf8');
+  return { patch, patchExact: Buffer.from(patch, 'utf8').equals(raw) };
 }
 
 /**
@@ -1178,8 +1200,9 @@ export async function codexDirectTask({
     } finally { closeSync(fd); }
     scratchLog.written = true;
   };
-  // A human CLI run with no --dir leaves its edits only in the scratch clone it prints (keepScratch). Set only
-  // on a successful return: a run that throws prints just its error, so its clone is cleaned up as usual.
+  // A human CLI run with no --dir leaves its edits only in the scratch clone it prints (keepScratch), and a --json
+  // run whose patch is not byte-exact keeps it too. Set on a successful return, or when the final diff capture
+  // fails (its error names the clone); any other throw prints just its error, so its clone is cleaned up.
   let retainedScratch;
   let cleaned = false;
   const cleanupTemps = () => {
@@ -1278,7 +1301,17 @@ export async function codexDirectTask({
     },
     gate: async () => { gateResult = await executeGate(); return gateResult.pass; },
   }) : { skipped: true, rounds: 0, notes: [] };
-  const diff = captureDiff({ dir: targetDir, startSha, execFn });
+  let diff;
+  try { diff = captureDiff({ dir: targetDir, startSha, execFn, binarySafe: Boolean(scratch) }); }
+  catch (error) {
+    // The one throw that keeps a scratch clone: a failed capture cannot say whether Codex left edits there, and
+    // the clone would be their only copy. The error names it, since the CLI prints only the error.
+    if (scratch && !keep) {
+      retainedScratch = scratch.dest;
+      if (error instanceof Error) error.message += ` (scratch clone kept at ${scratch.dest}: its edits could not be captured; log at ${resolvedLogFile})`;
+    }
+    throw error;
+  }
 
   // #x8wbivt Fork 4: surface the quota signal for any run that actually persisted a rollout (an `--ephemeral`
   // run writes none — nothing to read). Default is read-ONLY (`readQuotaFn`/`readRolloutQuota`) to preserve
@@ -1314,8 +1347,15 @@ export async function codexDirectTask({
 
   }
 
-  if (keepScratch && scratch) retainedScratch = scratch.dest;
-  else preserveScratchLog();
+  // --json (and every detached job) removes the clone and hands back `diff.patch`, so it must rebuild the edit
+  // byte for byte; when it cannot (a non-UTF-8 text edit, a failed binary read) the clone is the only copy.
+  const patchNotExact = Boolean(scratch) && diff.hasChanges && !diff.patchExact;
+  const retainedReason = !scratch ? null : keep ? 'keep' : keepScratch ? 'human-cli' : patchNotExact ? 'patch-not-byte-exact' : null;
+  if (retainedReason === 'human-cli' || retainedReason === 'patch-not-byte-exact') retainedScratch = scratch.dest;
+  if (retainedReason === 'patch-not-byte-exact') {
+    emit(`codex-direct-task: diff.patch cannot rebuild these edits byte for byte (${diff.patchError ?? 'non-UTF-8 content'}); retaining the scratch clone at ${scratch.dest}`);
+  }
+  if (!retainedScratch) preserveScratchLog();
 
   return {
     model, effort, route,
@@ -1329,8 +1369,11 @@ export async function codexDirectTask({
       // unless the caller explicitly opted in via `wireOriginToRemote`/`--wire-origin-to-remote`.
       realOrigin: scratch.realOrigin,
       originWired: scratch.originWired,
-      // False when the clone is deleted on return (the default without --keep): `dir` is then gone.
+      // False when the clone is deleted on return (the default for --json without --keep): `dir` is then gone
+      // and `diff.patch` is the byte-exact copy of the edits. `retainedReason`: keep | human-cli |
+      // patch-not-byte-exact (the patch could not carry the edits, so the clone was kept).
       retained: Boolean(keep || retainedScratch),
+      retainedReason,
     } : { created: false },
     startSha,
     argv: run.argv,
@@ -1654,7 +1697,9 @@ async function main() {
       + '    fix keeps its context. Requires --dir; not with --output-schema-file or --ephemeral.\n'
       + '  --detach: launch a detached job; print its id and record path immediately.\n'
       + '  --keep: retain scratch clone and task temp directories for inspection. Without --json the scratch\n'
-      + '    clone is always retained (it is where the printed edits live); --json removes it unless --keep.\n'
+      + '    clone is always retained (it is where the printed edits live); --json removes it unless --keep, and\n'
+      + '    its diff.patch (git apply --binary) rebuilds the edits; when it cannot, the clone is kept\n'
+      + '    (scratch.retainedReason=patch-not-byte-exact).\n'
       + '  wait --job=<id> [--max-ms=540000]: poll a job (maximum 9 minutes); exit 75 if still running.\n'
       + '    Aliases: --id=<id> for --job=<id>, --wait=<ms> for --max-ms=<ms> (same validation).\n'
       + '    A terminal task exit 75 is preserved in JSON but wait exits 1.\n'
