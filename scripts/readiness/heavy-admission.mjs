@@ -1936,7 +1936,7 @@ export async function acquireSlotBlocking({
   policy = loadAdmissionPolicy({ env }), canDefer = false, readResourceSnapshot = readSnapshot,
   hostAdmission = (o) => env[ADMISSION_HELD_ENV] === '1'
     ? { admitted: true, reason: 'host admission already held' } : hostLoadAdmission(o),
-  interactive = !!process.stdin.isTTY, waitMs = 0, waitSource = 'standard', random = Math.random, ...seams
+  interactive = !!process.stdin.isTTY, waitMs = 0, waitSource = 'standard', random = Math.random, location = null, ...seams
 }) {
   if (isAdmissionOff(env)) return { ok: false, slot: null, timedOut: false, disabled: true, waitedMs: 0 };
   // heavy-run-wait — a wait budget applies only to a caller that would otherwise defer; anything else is unchanged.
@@ -2061,7 +2061,7 @@ export async function acquireSlotBlocking({
         // Card xmh9mtr — WHO holds it is fixed here, at acquire (env first, then the lane lease as it is NOW);
         // reading it at release mis-attributes a lane whose lease was reaped or re-leased meanwhile.
         const identity = resolveHoldIdentity({ env, repo: repo ?? repoOfOwner(owner), readLease: seams.readLease });
-        const meta = { kind: jobKind, acquiredAt: nowIso, lane: lane ?? null, ...(command ? { command: String(command).slice(0, 200) } : {}), ...(holder ? { holder } : {}), ...identity, ...(cls.class !== 'P3' ? { priority: cls.class } : {}) };
+        const meta = { kind: jobKind, acquiredAt: nowIso, lane: lane ?? null, ...(command ? { command: String(command).slice(0, 200) } : {}), ...(holder ? { holder } : {}), ...(location ? { location } : {}), ...identity, ...(cls.class !== 'P3' ? { priority: cls.class } : {}) };
         const r = tryAcquireSlot({ lockRoot, cap, owner, nowMs: attempt, nowIso, pid, leaseMinutes, meta, slots: slotOrder });
         if (r.ok) {
           if (cls.class === 'P0') log(`heavy-command admission: red-main repair admitted — class P0, slot ${r.slot}, after ${Math.round((attempt - startedAt) / 1000)}s [${prioritySrc}]\n`);
@@ -2431,7 +2431,7 @@ export async function runUnderAdmission({
   lockRoot, cap, owner, lane = null, num = null, repo = null, ceilingMs = DEFAULT_ADMISSION_CEILING_MS, leaseMinutes = ADMISSION_LEASE_MINUTES,
   kind = null, command, cwd = process.cwd(), exec = (cmd, o) => execSync(cmd, o), log = (m) => process.stderr.write(m),
   now = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
-  bypass = null, env = process.env, policy = loadAdmissionPolicy({ env }), waitMs = 0, waitSource = 'standard',
+  bypass = null, env = process.env, policy = loadAdmissionPolicy({ env }), waitMs = 0, waitSource = 'standard', location = null,
 }) {
   // The child always runs with the re-entrancy flag, so anything it runs that is itself wrapped passes through.
   const childEnv = { ...env, [ADMISSION_HELD_ENV]: '1' };
@@ -2446,7 +2446,7 @@ export async function runUnderAdmission({
   // `WE_HEAVY_ADMISSION=off` check apply to the `run` wrapper's wait too, not just this function's own messages.
   // Card xkyw1x4 — the kind is read off the wrapped command itself unless the caller names it.
   const runKind = kind ?? classifyCommandKind(command, env);
-  const admission = await acquireSlotBlocking({ lockRoot, cap, owner, lane, num, repo, kind: runKind, command, ceilingMs, leaseMinutes, now, sleep, log, env, policy, canDefer: true, waitMs, waitSource });
+  const admission = await acquireSlotBlocking({ lockRoot, cap, owner, lane, num, repo, kind: runKind, command, ceilingMs, leaseMinutes, now, sleep, log, env, policy, canDefer: true, waitMs, waitSource, location });
   if (admission.deferred) return { exitCode: ADMISSION_DEFERRED_EXIT, admission };
   if (admission.timedOut) {
     log(`⚠ heavy-command admission: timed out after ${admission.waitedMs}ms waiting for capacity (cap=${cap}) — proceeding unslotted.\n`);
@@ -2671,6 +2671,10 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
       process.stderr.write(`✗ --container-node-modules requires --container (it shadows a mount --container itself creates).\n`);
       process.exit(1);
     }
+    // `--local`: explicit per-job opt-out of remote dispatch ONLY. It is read from this CLI's own flag, never from
+    // env or settings, and the job still queues for a LOCAL slot under the normal cap (it never skips admission).
+    const forceLocal = flags.local === true;
+    if (forceLocal) process.stderr.write(`heavy-admission run: location=local reason=--local (source: flag --local; remote dispatch skipped, a local admission slot is still required)\n`);
     const bypass = admissionBypassReason({ env: process.env, poolExists: existsSync(poolRootOf(lockRoot)) });
     // The Mac verify driver holds local phase capacity, but its gate may run on
     // Forge. Consume this internal handoff once; local fallback stays reentrant.
@@ -2679,7 +2683,7 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
     // Preflight may have chosen remote before policy/load changed or admission was bypassed.
     // Every local completion of that handoff still needs evidence of the first local verdict.
     let reportLocalExecution = forgeGate;
-    if (!useContainer && ((!bypass && !process.env[ADMISSION_HELD_ENV]) || (bypass==='held' && forgeGate && !isAdmissionOff(process.env) && !/^(true|1)$/i.test(process.env.CI??'')))) {
+    if (!useContainer && !forceLocal && ((!bypass && !process.env[ADMISSION_HELD_ENV]) || (bypass==='held' && forgeGate && !isAdmissionOff(process.env) && !/^(true|1)$/i.test(process.env.CI??'')))) {
       const requested=argv.slice(dashDashIdx+1);
       // package.json wraps the underlying executable, so reconstruct only the
       // fixed standards and Vitest script contracts at this client boundary.
@@ -2732,13 +2736,13 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
         }
       }
     }
-    const runOpts = { lockRoot, cap, owner, policy, lane: lane ?? (/lane-(\d+)/.exec(repo) || [])[1] ?? null, num, repo, ceilingMs, command, cwd: repo, bypass, kind: typeof flags.kind === 'string' ? flags.kind : null, waitMs, waitSource };
+    const runOpts = { lockRoot, cap, owner, policy, lane: lane ?? (/lane-(\d+)/.exec(repo) || [])[1] ?? null, num, repo, ceilingMs, command, cwd: repo, bypass, kind: typeof flags.kind === 'string' ? flags.kind : null, waitMs, waitSource, ...(forceLocal ? { location: 'local' } : {}) };
     if (useContainer) runOpts.exec = (cmd, o) => execContainerized(cmd, { ...o, nodeModulesVolume: useNodeModulesVolume });
     const { exitCode } = await runUnderAdmission(runOpts);
     if (reportLocalExecution) appendVerifyRemoteReport(process.env, { location: 'local-fallback', exitCode });
     process.exit(exitCode);
   }
-  process.stderr.write(`usage: heavy-admission.mjs <status|load-status|queue-status|acquire|release|run|reap> [--apply] [--ttl-minutes=] [--repo=] [--cap=] [--max-per-core=] [--min-idle-pct=] [--min-pressure-level=] [--window=] [--owner=] [--lane=] [--num=] [--json] [--ceiling-ms=] [--wait-ms=] [-- <command…>]\n`);
+  process.stderr.write(`usage: heavy-admission.mjs <status|load-status|queue-status|acquire|release|run|reap> [--apply] [--ttl-minutes=] [--repo=] [--cap=] [--max-per-core=] [--min-idle-pct=] [--min-pressure-level=] [--window=] [--owner=] [--lane=] [--num=] [--json] [--ceiling-ms=] [--wait-ms=] [--local] [-- <command…>]\n`);
   process.exit(3);
 }
 
