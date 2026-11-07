@@ -131,11 +131,16 @@ export class LedgerAppendExhaustedError extends Error {
  * Read one repo's ledger from the git transport.
  * NEVER THROWS. `unreadable` means "we do not know"; callers must hold, never treat it as empty.
  *
+ * FRESH BY DEFAULT. Ledger rows drive labels, human holds and merges, so any reader may be a decision reader
+ * (PR #6489: the label mirror named no flag and re-added a cleared review:human from a 30s-stale read). Only an
+ * explicit `fresh: false` may be served from the transport-branch TTL cache; any other value fetches.
+ *
  * @returns {{status: 'ok', records: object[], text: string} | {status: 'unreadable', reason: string, error: string}}
  */
 export function readLedgerFromGit({
-  board, repo, branch = LEDGER_TRANSPORT_BRANCH, run, exec, env = process.env, settings, log = defaultLog, fresh = false,
+  board, repo, branch = LEDGER_TRANSPORT_BRANCH, run, exec, env = process.env, settings, log = defaultLog, fresh,
 } = {}) {
+  fresh = fresh !== false;
   const path = ledgerGitPath(repo);
   let files;
   try {

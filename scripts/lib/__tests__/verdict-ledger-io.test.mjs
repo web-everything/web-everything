@@ -45,33 +45,37 @@ describe('readLedgerFromGit: unreadable is never empty', () => {
   });
 });
 
-describe('readLedgerFromGit: decision readers pass fresh, ordinary readers use the TTL cache', () => {
+describe('readLedgerFromGit: every read is fresh unless the caller opts into the TTL cache', () => {
   const mkRun = (dir, calls) => (args) => { calls.push(args[0]); return args[0] === 'rev-parse' ? `${dir}\n` : ''; };
   const fetchCount = (calls) => calls.filter((c) => c === 'fetch').length;
-  it('fresh: true fetches every time; the default read coalesces', () => {
+  it('fresh: true fetches every time; only an explicit fresh: false coalesces', () => {
     const dir = mkdtempSync(join(tmpdir(), 'vlio-ttl-'));
     const cached = []; const fresh = [];
-    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, cached) });
-    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, cached) });
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, cached), fresh: false });
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, cached), fresh: false });
     expect(fetchCount(cached)).toBe(1);
     readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, fresh), fresh: true });
     readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, fresh), fresh: true });
     expect(fetchCount(fresh)).toBe(2);
   });
-  it("forwards the caller's env: WE_OPS_FETCH_TTL_MS=0 disables coalescing", () => {
-    const dir = mkdtempSync(join(tmpdir(), 'vlio-env-'));
+  // PR #6489 red team: pr-label-mirror reads with no `fresh` flag and re-added a cleared review:human from a
+  // 30s-stale ledger. Ledger rows drive labels, holds and merges, so a read that names no flag must fetch.
+  it('a read that passes no fresh flag fetches every time, even with a warm stamp', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vlio-ttl-'));
     const calls = [];
-    const env = { ...process.env, WE_OPS_FETCH_TTL_MS: '0' };
-    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, calls), env });
-    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, calls), env });
-    expect(fetchCount(calls)).toBe(2);
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, calls), fresh: false }); // warm the stamp
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, calls) });
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, calls) });
+    expect(fetchCount(calls)).toBe(3);
   });
-  it('other readers (no fresh flag) still coalesce through the cache', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'vlio-other-'));
+  it('the shared git store (label mirror, holds, every store reader) fetches on each read by default', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vlio-ttl-'));
     const calls = [];
-    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, calls) });
-    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, calls) });
-    expect(fetchCount(calls)).toBe(1);
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, calls), fresh: false }); // warm the stamp
+    const store = createGitLedgerStore();
+    expect(await store.read({ board: '/board', repo: REPO, run: mkRun(dir, calls) })).toMatchObject({ status: 'ok' });
+    expect(await store.read({ board: '/board', repo: REPO, run: mkRun(dir, calls) })).toMatchObject({ status: 'ok' });
+    expect(fetchCount(calls)).toBe(3);
   });
 });
 
