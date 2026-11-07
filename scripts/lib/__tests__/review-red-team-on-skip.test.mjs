@@ -2,6 +2,7 @@ import { runGhSync } from '../gh-throttle.mjs';
 import { redTeamForHead, redTeamMarker } from '../red-team-gate.mjs';
 import { latestAcceptRecord } from '../accept-carry-forward.mjs';
 import { proveCardOnlyHeadMove } from '../card-only-head-move.mjs';
+import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 import * as numbering from '../numbering-carry.mjs';
 import { describe, it, expect, vi } from 'vitest';
 import { cardOnlyHeadMoveCandidate, normalizeRedTeamResult, planRedTeamOnSkip, runRedTeamOnSkip, resolveReviewRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
@@ -85,6 +86,8 @@ describe('#6345 — resume a stored needs-human review after its refused referra
     const marker = '\n\n<!-- review-referral-hold: 0123456789abcdef -->';
     const notice = `${why}${findings}${marker}`;
     if (/pause notice/.test(kind)) comments.push({ body: notice, author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z' });
+    // The daemon sometimes posts under the operator's own credential; the producer's dedupe trusts that author too.
+    if (kind === 'notice posted under the operator credential') comments.push({ body: notice, author: { login: OPERATOR_LOGINS[0] }, createdAt: '2026-11-06T13:26:00Z' });
     if (kind === 'bare notice without episode marker') comments.push({ body: why, author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z' });
     if (kind === 'notice with persistence detail') comments.push({ author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z',
       body: `${why}\n\nReferral persistence failed; the next bounded retry is at 2026-11-06T14:00:00.000Z.${marker}` });
@@ -128,7 +131,7 @@ describe('#6345 — resume a stored needs-human review after its refused referra
   });
 
   it.each([
-    'pause notice', 'review:pending label', 'pause notice and review:pending label',
+    'pause notice', 'review:pending label', 'pause notice and review:pending label', 'notice posted under the operator credential',
   ])('resumes when the parked run carries its own settled marks: %s', kind => {
     const o = parkedFixture(kind);
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review', head,

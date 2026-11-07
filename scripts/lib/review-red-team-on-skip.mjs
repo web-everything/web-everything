@@ -25,7 +25,7 @@ import { failedRedTeamRetry, redTeamStatusWithoutRun, completedRedTeamSeat } fro
 import { redTeamRequired, VERDICTS } from './jury-core.mjs';
 import { isLaterVerdictBody, latestAcceptRecord, laterReviewHold } from './accept-carry-forward.mjs';
 import { restampRecord, strandedNumberingRecords } from './numbering-carry.mjs';
-import { isAutomationAuthored } from './marker-authorship.mjs';
+import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { RED_TEAM_STATUS_LABELS } from './red-team-status-label-meta.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
@@ -147,7 +147,8 @@ function conflictsWithPolicyClear(label, { settlesPending = false, settlesReview
  * caller that has just proven every referral ruled may treat it as settled: the persist-exhausted and ledger variants,
  * and any look-alike from another author, are different holds and stay. PURE. */
 function isSettledReferralPauseNotice(comment) {
-  if (!isAutomationAuthored(comment) || typeof comment?.body !== 'string') return false;
+  // Same trust set the producer's own dedupe uses (notifyReferralHoldNotice): the daemon sometimes posts under the operator's credential.
+  if (!isTrustedMarkerAuthor(comment) || typeof comment?.body !== 'string') return false;
   const body = comment.body.trim();
   // The real notice is `${why}${findings}${detail}\n\n<!-- review-referral-hold: <episode> -->` (notifyReferralHoldNotice):
   // the leading line, an optional "Waiting on your ruling" findings block, then the episode marker. A persistence-failure
