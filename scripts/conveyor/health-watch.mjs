@@ -55,7 +55,6 @@ import { sealDueBatches } from '../operations/card-batch-seal-io.mjs';
 import { readFixLoopRows } from './fix-loop-ledger.mjs';
 import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 import { mirrorSyncForTick } from '../lib/mirror-sync.mjs';
-import { appendDaemonEvent } from '../lib/daemon-events.mjs';
 import { archiveClaudeJobs, formatClaudeJobsArchiveLine } from './claude-jobs-archive.mjs';
 import { sweepOurTmp, readBusyTopLevel, formatTmpSweepLine } from './tmp-sweep.mjs';
 import { fetchPrCommits } from '../lib/pr-limit.mjs';
@@ -1389,12 +1388,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
       throw new Error(`${mirrorSync?.status || 'unavailable'}: ${mirrorSync?.reason || 'mirror refresh did not complete'}`);
     }
   });
-  if (probeErrors.mirrorSync) {
-    probeErrors.mirrorSync = scrubText(probeErrors.mirrorSync).replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 240);
-    await attempt('mirrorSyncEvent', () => (deps.emit ?? appendDaemonEvent)({
-      kind: 'mirror-sync-failed', daemon: 'health-watch', detail: { error: probeErrors.mirrorSync },
-    }));
-  }
+  if (probeErrors.mirrorSync) probeErrors.mirrorSync = probeErrors.mirrorSync.replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 240);
 
   // A tick the watchdog killed last time is the overrun smell's input.
   const overrunPath = join(dir, 'overrun.json');

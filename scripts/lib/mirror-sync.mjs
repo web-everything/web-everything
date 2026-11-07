@@ -7,6 +7,7 @@ import {
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { cascadePolicy } from './policy-cascade.mjs';
+import { appendDaemonEvent } from './daemon-events.mjs';
 
 const positiveInteger = value => Number.isSafeInteger(value) && value > 0;
 const nonemptyPath = value => typeof value === 'string' && value.trim().length > 0
@@ -132,6 +133,8 @@ export async function mirrorSyncForTick({ dryRun, fixtureTick, now, config, env,
     ...(deps.run ? { run: deps.run } : {}),
     ...(deps.exists ? { exists: deps.exists } : {}),
     ...(deps.log ? { log: deps.log } : {}),
-    ...(deps.emit ? { emit: deps.emit } : {}),
+    emit: deps.emit ?? (event => appendDaemonEvent({
+      kind: event.type, daemon: 'health-watch', detail: { reason: event.reason },
+    })),
   });
 }
