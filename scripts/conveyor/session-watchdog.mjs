@@ -80,7 +80,7 @@ import { dispatchDemandMinutes } from '../readiness/heavy-queue-projection.mjs';
 import { readStandardMinutes, admissionLockRoot } from '../readiness/heavy-admission.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { listLiveFixClaims, releaseFixClaim, FIXING_KIND } from './fix-procedure.mjs';
-import { fixDispatchClaimRoot, fixDispatchSessionName, listFixDispatchClaims } from './fix-claim-store.mjs';
+import { DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES, fixDispatchClaimRoot, fixDispatchSessionName } from './fix-claim-store.mjs';
 import { isLeaseExpired, parseLockEntry } from '../readiness/file-locks.mjs';
 import { awaitVerifyStoreDir, awaitVerifyStoreKey, classifyAwaitVerify, resolveAwaitVerifyPath, resolveAwaitVerifyTtlMs } from './await-verify.mjs';
 import { releaseSessionFixDispatchClaims } from './fix-dispatch-claim.mjs';
@@ -281,7 +281,12 @@ export function summarizeTail(entries, { windowCalls = DEFAULT_SESSION_WATCHDOG.
   // A loop is waiting, not iterating: no edit or commit after the dominant command's first run in the window.
   const firstIdx = dominant.sig == null ? -1 : recent.findIndex((c) => !c.edit && c.segs.includes(dominant.sig));
   dominant.changesSince = firstIdx < 0 ? 0 : recent.slice(firstIdx).filter((c) => c.edit || c.commit).length;
-  const pending = detectBlockedOnChild(list);
+  // A later resolved call cannot discharge an earlier call. Inspect the entire retained transcript;
+  // truncated transcripts are independently ineligible for stops.
+  const unresolved = calls.find((c) => !c.id || !resultAt.has(c.id));
+  const pending = unresolved
+    ? { pending: true, toolName: unresolved.name, isNestedBlockingAgent: unresolved.name === 'Agent' }
+    : detectBlockedOnChild(list);
   const last = list.at(-1);
   const lastBlocks = last?.blocks || [];
   const endedOnReply = !pending.pending && last?.kind === 'assistant'
@@ -567,10 +572,18 @@ const isNonTerminal = (a) => a?.state !== 'done' && a?.state !== 'stopped' && a?
  *   actions:Array<object>, events:Array<object>, acked:string[]}}
  */
 export function defaultClaimStoreReadable(readDirectory = readdirSync, readEntry = readFileSync, log = () => {}) {
-  const root = fixDispatchClaimRoot();
+  try { listStopDispatchClaims(fixDispatchClaimRoot(), { readDirectory, readEntry, log }); return true; }
+  catch { return false; }
+}
+
+/** Stop-only claim snapshot: validate the entries actually returned, rather than trusting a prior probe. */
+export function listStopDispatchClaims(root = fixDispatchClaimRoot(), {
+  readDirectory = readdirSync, readEntry = readFileSync, log = () => {}, liveOnly = false, nowMs = Date.now(),
+} = {}) {
   let entries;
   try { entries = readDirectory(root); }
-  catch (err) { return err?.code === 'ENOENT'; }
+  catch (err) { if (err?.code === 'ENOENT') return []; throw err; }
+  const claims = [];
   for (const entry of entries) {
     let parsed = null;
     try { parsed = parseLockEntry(readEntry(join(root, entry, 'lock.json'), 'utf8')); }
@@ -584,10 +597,11 @@ export function defaultClaimStoreReadable(readDirectory = readdirSync, readEntry
     if (!parsed || !parsed.meta?.repo || !parsed.meta?.pr || !parsed.meta?.kind || invalidHeartbeat || invalidTtl) {
       // Quote the entry name to keep control characters inert; never log lock contents or read errors.
       log(`session-watchdog: claim store unreadable (${JSON.stringify(`${entry}/lock.json`)}); stops refused until a successful read`);
-      return false;
+      throw new Error('claim store unreadable');
     }
+    if (!liveOnly || !isLeaseExpired(parsed, nowMs, DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES)) claims.push(parsed);
   }
-  return true;
+  return claims;
 }
 
 /** Stop-only resolver: missing records are safe, unreadable or malformed evidence is unknown. */
@@ -638,20 +652,33 @@ export function makeStopAwaitingVerifyResolver({
 /** Keep the reaper's chat policy, but refuse stops when its tolerant readers swallowed an IO failure. */
 export function makeStopChatSpawnGuardResolver({ readFileSyncFn = readFileSync, ...options } = {}) {
   let unreadable = false;
+  let readingLink = true;
+  let parent = null;
+  let markerMismatch = false;
   const guardFor = makeChatSpawnGuardResolver({
     ...options,
     readFileSyncFn: (...args) => {
-      try { return readFileSyncFn(...args); }
+      let text;
+      try { text = readFileSyncFn(...args); }
       catch (err) {
         if (err?.code !== 'ENOENT') unreadable = true;
         throw err;
       }
+      let record = null;
+      try { record = JSON.parse(text); } catch { /* The reaper also parses this record. */ }
+      // The resolver reads the spawn link first, then the linked parent's ended marker, if any.
+      if (readingLink) { parent = record?.spawnedByChatSessionId; readingLink = false; }
+      else markerMismatch = !parent || record?.chatSessionId !== parent;
+      return text;
     },
   });
   return (session) => {
     unreadable = false;
+    readingLink = true;
+    parent = null;
+    markerMismatch = false;
     const guard = guardFor(session);
-    return unreadable ? null : guard;
+    return unreadable ? null : markerMismatch ? { blocked: true, reason: 'chat-ended-marker-mismatch' } : guard;
   };
 }
 
@@ -666,10 +693,12 @@ export function runSessionWatchdogPass({
   readTail = (row) => readWatchdogTail(row, config, nowMs),
   readHeavy = () => readStandardMinutes(admissionLockRoot(REPO_ROOT)),
   listClaims = listLiveFixClaims,
-  listDispatchClaims = listFixDispatchClaims,
+  listDispatchClaims = listStopDispatchClaims,
+  readClaimDirectory = readdirSync,
+  readClaimEntry = readFileSync,
   claimStoreReadable = () => {
     // Injected readers own their evidence; the default reader silently returns [] on directory read errors.
-    if (listClaims !== listLiveFixClaims && listDispatchClaims !== listFixDispatchClaims) return true;
+    if (listClaims !== listLiveFixClaims && listDispatchClaims !== listStopDispatchClaims) return true;
     return defaultClaimStoreReadable(readdirSync, readFileSync, log);
   },
   prHeadFor = makeSnapshotHeadReader({ maxAgeMs: config.prHeadMaxAgeMinutes * MINUTE }),
@@ -742,7 +771,10 @@ export function runSessionWatchdogPass({
   try {
     if (claimStoreReadable() === true) {
       if (!fixingClaimsReadable) throw new Error('unreadable fixing claims');
-      const dispatch = listDispatchClaims(fixDispatchClaimRoot(), { liveOnly: true, nowMs });
+      const dispatch = listDispatchClaims(fixDispatchClaimRoot(), {
+        liveOnly: true, nowMs,
+        ...(listDispatchClaims === listStopDispatchClaims ? { readDirectory: readClaimDirectory, readEntry: readClaimEntry, log } : {}),
+      });
       if (!Array.isArray(dispatch)) throw new Error('unreadable dispatch claims');
       dispatchClaims = dispatch.map((claim) => {
         const meta = claim.meta;

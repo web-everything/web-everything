@@ -1178,6 +1178,69 @@ describe('runSessionWatchdogPass — reaping with hermetic IO', () => {
     expect(actions).toEqual([]);
   });
 
+  it.each(['finished', 'duplicate'])('an earlier unresolved Agent call survives a later resolved Read and refuses %s stops', (mode) => {
+    const old = listing();
+    const keeper = listing({ id: 'keeper', sessionId: 'sid-keeper', startedAt: T0 - 60 * MIN });
+    for (const resolved of [false, true]) {
+      const entries = [
+        ...call('Agent', { prompt: 'still running' }, T0 - 50 * MIN, MIN, { pending: !resolved }),
+        ...call('Read', { file_path: 'status.txt' }, T0 - 41 * MIN, MIN),
+      ];
+      const tail = summarizeTail(entries, { nowMs: T0 });
+      const { calls, actions } = base({ agents: mode === 'finished' ? [old] : [old, keeper], readTail: () => tail,
+        completionFor: () => mode === 'finished' ? { done: true } : null });
+      expect(calls.stop).toEqual(resolved ? [old.id] : []);
+      expect(actions).toEqual(resolved ? [expect.objectContaining({ mode, ok: true })] : []);
+      expect(calls.reapEvents).toHaveLength(resolved ? 1 : 0);
+    }
+  });
+
+  it.each(['parent-B', null])('an ended marker for %s cannot unblock parent-A session even past the chat guard ceiling', (markerParent) => {
+    const chatSpawnGuardFor = makeStopChatSpawnGuardResolver({
+      spawnsDir: 'spawn-links', endedDir: 'chat-ended', now: () => T0, ceilingMs: MIN,
+      readFileSyncFn: path => path === join('spawn-links', 'sid-1.json') ? JSON.stringify({
+        v: 1, spawnedSessionId: 'sid-1', spawnedByChatSessionId: 'parent-A', recordedAt: new Date(T0 - 2 * MIN).toISOString(),
+      }) : JSON.stringify(markerParent ? { chatSessionId: markerParent } : {}),
+    });
+    const { calls, actions } = base({ chatSpawnGuardFor });
+    expect(calls.stop).toEqual([]);
+    expect(calls.reapEvents).toEqual([]);
+    expect(actions).toEqual([expect.objectContaining({ detail: 'refused: chat-spawn guarded' })]);
+  });
+
+  it('an ended marker with matching parent identity allows the stop', () => {
+    const chatSpawnGuardFor = makeStopChatSpawnGuardResolver({
+      spawnsDir: 'spawn-links', endedDir: 'chat-ended', now: () => T0,
+      readFileSyncFn: path => path === join('spawn-links', 'sid-1.json') ? JSON.stringify({
+        v: 1, spawnedSessionId: 'sid-1', spawnedByChatSessionId: 'parent-A', recordedAt: new Date(T0).toISOString(),
+      }) : JSON.stringify({ chatSessionId: 'parent-A' }),
+    });
+    expect(base({ chatSpawnGuardFor }).calls.stop).toEqual(['f29aeb29']);
+  });
+
+  it.each(['EACCES', 'corrupt', 'directory-EACCES'])('the actual strict claim read refuses stops after a successful probe (%s)', (failure) => {
+    const claimStoreReadable = vi.fn(() => true);
+    const readClaimDirectory = vi.fn(() => {
+      if (failure === 'directory-EACCES') throw Object.assign(new Error('secret-directory'), { code: 'EACCES' });
+      return ['changed-entry'];
+    });
+    const readClaimEntry = vi.fn(() => {
+      if (failure === 'EACCES') throw Object.assign(new Error('secret-entry'), { code: 'EACCES' });
+      return '{secret-corrupt';
+    });
+    const { calls, actions } = base({ claimStoreReadable, listDispatchClaims: undefined, readClaimDirectory, readClaimEntry });
+    expect(claimStoreReadable).toHaveBeenCalledOnce();
+    expect(calls.stop).toEqual([]);
+    expect(calls.reapEvents).toEqual([]);
+    expect(actions).toEqual([expect.objectContaining({ detail: 'refused: claim store unreadable' })]);
+    expect(readClaimDirectory).toHaveBeenCalledWith(fixDispatchClaimRoot());
+    if (failure !== 'directory-EACCES') {
+      expect(readClaimEntry).toHaveBeenCalledWith(join(fixDispatchClaimRoot(), 'changed-entry', 'lock.json'), 'utf8');
+      expect(calls.logs.some(line => line.includes('changed-entry/lock.json'))).toBe(true);
+    }
+    expect(JSON.stringify({ actions, logs: calls.logs })).not.toContain('secret-');
+  });
+
   it('report-only plans the stop with ok:null and never calls stop or appends a reap event', () => {
     const { calls, actions } = base({ act: false });
     expect(actions).toEqual([expect.objectContaining({ type: 'stop-session', ok: null })]);
