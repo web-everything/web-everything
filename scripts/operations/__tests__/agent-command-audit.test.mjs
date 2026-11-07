@@ -158,6 +158,23 @@ describe('agent command audit', () => {
     expect(report).not.toContain('12345678901234567890');
     expect(report).toContain('vitest');
   });
+  // Self-review #6461: nested substitutions are classified once each, with bounded time and rows.
+  const nest = (levels, inner) => Array.from({ length: levels }).reduce(cmd => `echo $(${cmd})`, inner);
+  it('classifies each nested substitution once, with no combinatorial growth', () => {
+    expect(classifyCommand('echo $(echo $(npm test))')).toEqual([expect.objectContaining({ category: 'npm test/check' })]);
+    expect(classifyCommand(nest(5, 'npm test'))).toHaveLength(1);
+    const started = Date.now();
+    expect(classifyCommand(nest(20, 'echo hi'))).toEqual([]);
+    expect(classifyCommand('echo ' + '$('.repeat(20))).toEqual([]);
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+  it.each([
+    ['a deep unclosed nest', '$('.repeat(8000)], ['too many substitutions', 'echo $(a) '.repeat(300)],
+    ['an oversized command', 'npm ci ' + '$(a) '.repeat(4000)],
+  ])('reports %s as one unparsed row instead of throwing', (_, command) => {
+    expect(classifyCommand(command)).toEqual([expect.objectContaining({ category: expect.stringMatching(/^unparsed/), queued: false })]);
+    expect(auditLines([claude(command)], { date: '2026-07-02' }).rows).toHaveLength(1);
+  });
   it('keeps ordinary flags readable', () => {
     expect(redact('npx vitest run a.test.mjs --run --bail=1')).toBe('npx vitest run a.test.mjs --run --bail=1');
   });

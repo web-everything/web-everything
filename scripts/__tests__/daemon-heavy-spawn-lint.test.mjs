@@ -24,6 +24,19 @@ describe('daemon heavy spawn admission lint', () => {
   ])('detects the executed heavy target: %s', call => {
     expect(findUngatedHeavySpawns(cp + call)).toHaveLength(1);
   });
+  // Self-review #6461: nested substitutions are inspected once each; a pathological nest fails closed.
+  const ex = "import { execSync } from 'node:child_process';\n";
+  const nest = (levels, inner) => Array.from({ length: levels }).reduce(cmd => `echo $(${cmd})`, inner);
+  it('inspects nested substitutions without combinatorial growth', () => {
+    const started = Date.now();
+    expect(findUngatedHeavySpawns(ex + `execSync(${JSON.stringify(nest(20, 'echo hi'))});`)).toEqual([]);
+    expect(findUngatedHeavySpawns(ex + `execSync(${JSON.stringify(nest(5, 'npm test'))});`)).toHaveLength(1);
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+  it.each([['a deep unclosed nest', '$('.repeat(8000)], ['too many substitutions', 'echo $(a) '.repeat(300)]])(
+    'fails closed on %s', (_, command) => {
+      expect(findUngatedHeavySpawns(ex + `execSync(${JSON.stringify(command)});`)).toHaveLength(1);
+    });
   // Red-team #6461: package test scripts and Node's own test runner are unqueued heavy entry points too.
   it.each([
     "spawnSync('npm', ['test', '--', 'a.test.mjs']);",

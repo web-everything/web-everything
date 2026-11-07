@@ -5,12 +5,26 @@ import { canonicalCommand, commandSubstitutionBodies, parseSegments, shellTokens
 const SPAWNS = new Set(['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']);
 const quote = value => "'" + value.replaceAll("'", "'\\''") + "'";
 
-/** Inspect executable positions only; arguments to ordinary programs are data. */
-function heavyCommand(command, depth = 0) {
+// Bounds on command-substitution extraction; past either one the command fails closed (treated as heavy).
+const SUBSTITUTION_MAX_CHARS = 16384;
+const SUBSTITUTION_MAX_BODIES = 64;
+
+/** Inspect executable positions only; arguments to ordinary programs are data.
+ *  `withSubstitutions` is false for a substitution body: the extractor already returned its nested bodies,
+ *  so re-extracting them would grow combinatorially with nesting. */
+function heavyCommand(command, depth = 0, withSubstitutions = true) {
   if (depth > 8) return true; // fail closed on implausibly deep nesting
   // A shell expands `$( … )` / backticks before running the outer command, so their bodies are executed too.
   // Array arguments arrive single-quoted (see quote()), where nothing expands.
-  if (commandSubstitutionBodies(command).some(body => heavyCommand(body, depth + 1))) return true;
+  if (withSubstitutions) {
+    if (command.length > SUBSTITUTION_MAX_CHARS) return true;
+    // Openers bound the body count from above; checking them first keeps a deep nest off the quadratic extractor.
+    if ((command.match(/\$\(|`/g) || []).length > SUBSTITUTION_MAX_BODIES * 4) return true;
+    let bodies;
+    try { bodies = commandSubstitutionBodies(command); } catch { return true; } // stack overflow on a pathological nest
+    if (bodies.length > SUBSTITUTION_MAX_BODIES) return true;
+    if (bodies.some(body => heavyCommand(body, depth + 1, false))) return true;
+  }
   return parseSegments(command).segments.some(segment => {
     // The Bash guard's own classifier first: package test scripts (`npm test`, `npm --prefix . test`, `pnpm t`),
     // `node --test`, vitest and check-standards heads. The checks below add playwright and `sh -c` bodies.

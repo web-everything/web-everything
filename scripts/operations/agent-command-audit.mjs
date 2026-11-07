@@ -93,12 +93,34 @@ function repoWideSearch(words) {
 
 const HEAVY_KIND_CATEGORY = { vitest: 'vitest', 'node-test': 'node --test', standards: 'check:standards', test: 'npm test/check' };
 
-/** One entry per heavy category/status/segment; admission never leaks across a separator. */
-export function classifyCommand(cmd, depth = 0) {
+// Bounds on command-substitution extraction. Past either one the command is reported unparsed, never dropped.
+export const SUBSTITUTION_MAX_CHARS = 16384;
+export const SUBSTITUTION_MAX_BODIES = 64;
+
+/** Every substitution body of `cmd`, or null when it is too long, too nested or unreadable (fail closed). */
+export function boundedSubstitutionBodies(cmd) {
+  const text = String(cmd ?? '');
+  if (text.length > SUBSTITUTION_MAX_CHARS) return null;
+  // Openers bound the body count from above; checking them first keeps a deep nest off the quadratic extractor.
+  if ((text.match(/\$\(|`/g) || []).length > SUBSTITUTION_MAX_BODIES * 4) return null;
+  try {
+    const bodies = commandSubstitutionBodies(text);
+    return bodies.length > SUBSTITUTION_MAX_BODIES ? null : bodies;
+  } catch { return null; } // a pathological nest overflows the extractor's stack
+}
+
+/** One entry per heavy category/status/segment; admission never leaks across a separator.
+ *  `withSubstitutions` is false for a substitution body: the extractor already returned its nested bodies,
+ *  so re-extracting them would count each one again and grow combinatorially with nesting. */
+export function classifyCommand(cmd, depth = 0, withSubstitutions = true) {
   const out = [];
   if (depth > 8) return [{ category: 'unparsed (nesting too deep)', queued: false, command: redact(String(cmd)) }];
   // A shell runs `$( … )` / backtick bodies too; they are never admitted by the outer command's queue.
-  for (const body of commandSubstitutionBodies(cmd)) out.push(...classifyCommand(body, depth + 1));
+  if (withSubstitutions) {
+    const bodies = boundedSubstitutionBodies(cmd);
+    if (!bodies) return [{ category: 'unparsed (substitutions too long or too nested)', queued: false, command: redact(String(cmd)) }];
+    for (const body of bodies) out.push(...classifyCommand(body, depth + 1, false));
+  }
   for (const segment of parseSegments(String(cmd)).segments) {
     let head = canonicalCommand(segment), queued = false;
     const admitted = /^node\s+\S*heavy-admission\.mjs\s+run\b[\s\S]*?\s--\s+([\s\S]+)$/.exec(head);
@@ -172,7 +194,11 @@ export function auditLines(lines, { date, source = 'unknown' } = {}) {
     if (!Number.isFinite(Date.parse(record.timestamp))) { result.invalidLines++; continue; }
     if (date && etDay(record.timestamp) !== date) continue;
     const kind = record.message ? 'claude' : 'codex';
-    for (const command of commands) for (const hit of classifyCommand(command)) {
+    const classify = command => {
+      try { return classifyCommand(command); }
+      catch { return [{ category: 'unparsed (classifier error)', queued: false, command: redact(String(command)) }]; }
+    };
+    for (const command of commands) for (const hit of classify(command)) {
       const row = { ...hit, source: redact(source === 'unknown' ? kind : source), timestamp: record.timestamp };
       result.rows.push(row);
       for (const [table, key] of [[result.byCategory, row.category], [result.bySource, row.source]]) {
