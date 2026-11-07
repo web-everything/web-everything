@@ -242,13 +242,19 @@ describe('remoteHeads (the release proof) reads the canonical origin from the pr
       const helper = `!f() { touch '${primaryRan}'; [ "$1" = get ] && printf 'username=operator\\npassword=primary-pass\\n'; }; f`;
       if (scope === 'local') execFileSync('git', ['config', 'credential.helper', helper], { cwd: primary });
       else execFileSync('git', ['config', '--file', join(home, '.gitconfig'), 'credential.helper', helper]);
-      vi.stubEnv('HOME', home);
-      vi.stubEnv('XDG_CONFIG_HOME', undefined);
+      // The caller (a release run inside a lane) points HOME / XDG_CONFIG_HOME at a lane-written config with its own
+      // helper: the primary listing reads global config from the account home (`accountHome`) instead.
+      const callerHome = join(dir, 'caller-home');
+      mkdirSync(join(callerHome, 'git'), { recursive: true });
+      const evilHelper = `!f() { touch '${evilRan}'; echo username=evil; echo password=evil; }; f`;
+      for (const file of [join(callerHome, '.gitconfig'), join(callerHome, 'git', 'config')]) execFileSync('git', ['config', '--file', file, 'credential.helper', evilHelper]);
+      vi.stubEnv('HOME', callerHome);
+      vi.stubEnv('XDG_CONFIG_HOME', callerHome);
       vi.stubEnv('GIT_CONFIG_NOSYSTEM', '1');
       const lane = join(dir, 'lane-1');
       execFileSync('git', ['clone', '-q', join(dir, 'origin.git'), lane], { stdio: 'ignore' });
       const runGit = vi.fn(execFileSync);
-      const io = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: lane, primaryPath: primary }, backupRoot: join(dir, 'backups'), runGit });
+      const io = realSalvageIo({ repo: { branch: 'main', originUrl: join(dir, 'origin.git'), referencePath: lane, primaryPath: primary }, backupRoot: join(dir, 'backups'), runGit, accountHome: home });
       io.remoteHeads();
       io.fetchHeads(lane);
       const envOf = command => runGit.mock.calls.find(([, args]) => args.includes(command))[2].env;
@@ -259,6 +265,7 @@ describe('remoteHeads (the release proof) reads the canonical origin from the pr
       expect(filled.status, filled.stderr).toBe(0);
       expect(filled.stdout).toContain('password=primary-pass');
       expect(existsSync(primaryRan)).toBe(true);
+      expect(existsSync(evilRan), 'the caller-home helper ran in the primary listing').toBe(false);
       // The lane transport keeps the reset pins: a helper the lane sets afterwards is not run and nothing answers.
       execFileSync('git', ['config', 'credential.helper', `!f() { touch '${evilRan}'; echo username=evil; echo password=evil; }; f`], { cwd: lane });
       execFileSync('git', ['config', 'core.askPass', `${join(dir, 'lane-askpass')}`], { cwd: lane });

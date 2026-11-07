@@ -44,12 +44,13 @@ export async function salvagePushLane({ lane, laneDir, io, now = () => new Date(
   }
 }
 
-export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env.WE_LANE_BACKUP_ROOT || join(homedir(), 'workspace', '.operations', 'backup'), runGit = execFileSync }) {
+export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env.WE_LANE_BACKUP_ROOT || join(homedir(), 'workspace', '.operations', 'backup'), runGit = execFileSync, accountHome }) {
   const baseEnv = { ...scrubGitRepoEnv(process.env), GIT_OPTIONAL_LOCKS: '0' };
   const env = laneGitHardeningEnv(baseEnv);
   // The canonical-origin listing run in the VALIDATED primary only: the operator's own credential helper / askpass
-  // there authenticates an HTTPS origin. No lane is ever the cwd of a call with this env (PR #6319, R674 route a).
-  const primaryEnv = laneGitHardeningEnv(baseEnv, { credentialPins: false });
+  // there authenticates an HTTPS origin. No lane is ever the cwd of a call with this env (PR #6319, R674 route a). Its
+  // global config comes from the OS account's home, never a caller-set HOME (`accountHome` is a test fixture hook).
+  const primaryEnv = laneGitHardeningEnv(baseEnv, { credentialPins: false, ...(accountHome ? { home: accountHome } : {}) });
   // resolveRepo makes configured local origins absolute; explicit --origin paths remain invocation-relative.
   const origin = repo.originUrl ? (/^[^/]*:/.test(repo.originUrl) ? repo.originUrl : resolve(repo.originUrl)) : null;
   const normalizeRemoteName = name => name.toLowerCase().replace(/\/+$/, '').replace(/\.git$/, '');

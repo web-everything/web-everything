@@ -773,10 +773,11 @@ describe('lane git hardening blocks lane credential helpers; the primary-only fo
   it('credentialPins:false drops ONLY the two credential resets; every other pin, the env drops and the prompt-off stay', () => {
     const inherited = { ...base, GIT_ASKPASS: join(root, 'x'), SSH_ASKPASS: join(root, 'x'), GIT_SSH_COMMAND: 'x', GIT_SSH: 'x', GIT_EXTERNAL_DIFF: 'x' };
     const lanePins = pinsOf(laneGitHardeningEnv(inherited));
-    const primary = laneGitHardeningEnv(inherited, { credentialPins: false });
+    const primary = laneGitHardeningEnv(inherited, { credentialPins: false, home });
     expect(pinsOf(primary)).toEqual(lanePins.filter(([k]) => !['credential.helper', 'core.askPass'].includes(k)));
     expect(primary.GIT_TERMINAL_PROMPT).toBe('0');
     for (const key of ['GIT_ASKPASS', 'SSH_ASKPASS', 'GIT_SSH_COMMAND', 'GIT_SSH', 'GIT_EXTERNAL_DIFF']) expect(primary).not.toHaveProperty(key);
+    expect(primary.HOME).toBe(home);
     // In a checkout with no lane-set helper (the primary), the operator's global helper then authenticates.
     const clean = join(root, 'primary');
     git(['init', '--quiet', clean], root);
@@ -808,7 +809,7 @@ describe('lane git hardening blocks lane credential helpers; the primary-only fo
     const clean = join(root, 'primary');
     git(['init', '--quiet', clean], root);
     for (const [name, env, cwd] of [['lane pins', laneGitHardeningEnv(inherited), lane],
-      ['primary form', laneGitHardeningEnv(inherited, { credentialPins: false }), clean]]) {
+      ['primary form', laneGitHardeningEnv(inherited, { credentialPins: false, home }), clean]]) {
       expect(env, name).not.toHaveProperty('GIT_CONFIG_PARAMETERS');
       fill(env, cwd);
       expect(existsSync(evilRan), `${name}: the inherited GIT_CONFIG_PARAMETERS helper ran`).toBe(false);
@@ -817,10 +818,34 @@ describe('lane git hardening blocks lane credential helpers; the primary-only fo
     }
   });
 
+  // Self-review of route (a): with no reset, a caller-chosen global / system config location would be read as trusted.
+  it.each([
+    ['HOME', dir => dir],
+    ['XDG_CONFIG_HOME', dir => dir],
+    ['GIT_CONFIG_GLOBAL', dir => join(dir, '.gitconfig')],
+    ['GIT_CONFIG_SYSTEM', dir => join(dir, '.gitconfig')],
+  ])('the primary form ignores a caller-chosen %s holding a helper; the account helper still answers', (key, location) => {
+    const attacker = join(root, 'attacker');
+    mkdirSync(join(attacker, 'git'), { recursive: true });
+    const evilHelper = `!f() { touch '${evilRan}'; echo username=evil; echo password=evil; }; f`;
+    for (const file of [join(attacker, '.gitconfig'), join(attacker, 'git', 'config')]) git(['config', '--file', file, 'credential.helper', evilHelper], root);
+    const inherited = { ...base, [key]: location(attacker) };
+    if (key === 'GIT_CONFIG_SYSTEM') delete inherited.GIT_CONFIG_NOSYSTEM;
+    const env = laneGitHardeningEnv(inherited, { credentialPins: false, home });
+    expect(env.HOME).toBe(home);
+    for (const k of ['XDG_CONFIG_HOME', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM']) expect(env, k).not.toHaveProperty(k);
+    const clean = join(root, 'primary');
+    git(['init', '--quiet', clean], root);
+    const filled = fill(env, clean);
+    expect(filled.status, filled.stderr).toBe(0);
+    expect(filled.stdout).toContain('password=trusted-pass');
+    expect(existsSync(evilRan), `the ${key} helper ran`).toBe(false);
+  });
+
   it('the primary form drops every inherited GIT_CONFIG_COUNT entry, so an inherited helper cannot outlive the missing reset', () => {
     const inherited = { ...base, GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: `!f() { touch '${evilRan}'; }; f`,
       GIT_CONFIG_KEY_1: 'core.askPass', GIT_CONFIG_VALUE_1: join(root, 'evil'), GIT_CONFIG_KEY_7: 'credential.helper', GIT_CONFIG_VALUE_7: 'orphan' };
-    const env = laneGitHardeningEnv(inherited, { credentialPins: false });
+    const env = laneGitHardeningEnv(inherited, { credentialPins: false, home });
     expect(pinsOf(env).map(([k]) => k)).not.toContain('credential.helper');
     expect(Object.keys(env).filter(k => /^GIT_CONFIG_(KEY|VALUE)_/.test(k))).toHaveLength(2 * Number(env.GIT_CONFIG_COUNT));
     const clean = join(root, 'primary');

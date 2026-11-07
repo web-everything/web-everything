@@ -1,5 +1,8 @@
 import { execFileSync } from 'node:child_process';
+import { userInfo } from 'node:os';
 import { basename } from 'node:path';
+
+const accountHome = () => { try { return userInfo().homedir || ''; } catch { return ''; } };
 
 /**
  * Git hardening for a process that runs git inside an AGENT-WRITABLE lane clone (we:backlog/5137 review).
@@ -137,12 +140,13 @@ export function scrubGitRepoEnv(env) {
  * come AFTER its entries, so they win). `GIT_EXTERNAL_DIFF` is dropped: an inherited one would run on every `git diff`.
  * `credentialPins: false` leaves out only the `credential.helper` / `core.askPass` resets, for a git call that runs in
  * the operator's validated primary checkout (its own helper must authenticate); every other pin, the dropped askpass /
- * ssh env and `GIT_TERMINAL_PROMPT=0` stay. Never pass it for a call whose cwd is a lane.
+ * ssh env and `GIT_TERMINAL_PROMPT=0` stay. Never pass it for a call whose cwd is a lane. `home` (default: the OS
+ * account's home, never `env.HOME`) is where that form reads global config; tests point it at a fixture.
  * @param {Record<string,string|undefined>} env
- * @param {{remoteProbe?: boolean, credentialPins?: boolean}} options `remoteProbe` restricts transports only for an isolated remote proof.
+ * @param {{remoteProbe?: boolean, credentialPins?: boolean, home?: string}} options `remoteProbe` restricts transports only for an isolated remote proof.
  * @returns {Record<string,string|undefined>}
  */
-export function laneGitHardeningEnv(env = process.env, { remoteProbe = false, credentialPins = true } = {}) {
+export function laneGitHardeningEnv(env = process.env, { remoteProbe = false, credentialPins = true, home = credentialPins === false ? accountHome() : '' } = {}) {
   // No lazy fetch: a lane declaring itself a partial clone of a promisor remote would fetch a missing object through
   // its own `remote.<name>.uploadpack` on a plain `show` / `diff` / `cat-file` (PR #5775 self-review).
   // No prompt either: an inherited askpass program (a caller inside a lane controls its env) would run on a credential
@@ -158,10 +162,14 @@ export function laneGitHardeningEnv(env = process.env, { remoteProbe = false, cr
   // Git applies GIT_CONFIG_PARAMETERS AFTER the GIT_CONFIG_COUNT list, so an inherited one would outrank every pin
   // below (an inherited `credential.helper` lands after the reset; `core.fsmonitor` beats its pin).
   delete out.GIT_CONFIG_PARAMETERS;
-  // Without the credential resets nothing would reset an inherited command-scope helper, so the primary form keeps
-  // no inherited GIT_CONFIG_COUNT entry at all.
+  // Without the credential resets nothing would reset an inherited helper, so the primary form keeps no inherited
+  // command-scope entry at all, and reads global / system config only from the OS account's own locations: a caller
+  // (a lane CLI controls its env) must not point HOME / XDG_CONFIG_HOME / GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM at a
+  // file holding its own `credential.helper` or `core.askPass` (PR #6319 self-review). No account home → no HOME.
   if (credentialPins === false) {
     for (const key of Object.keys(out)) if (key === 'GIT_CONFIG_COUNT' || INHERITED_GIT_INDEXED_CONFIG_RE.test(key)) delete out[key];
+    for (const key of ['XDG_CONFIG_HOME', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_EXEC_PATH']) delete out[key];
+    if (home) out.HOME = home; else delete out.HOME;
   }
   const n = Number.parseInt(String(out.GIT_CONFIG_COUNT ?? '0'), 10);
   const start = Number.isInteger(n) && n > 0 ? n : 0;
