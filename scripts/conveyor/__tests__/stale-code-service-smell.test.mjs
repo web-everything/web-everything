@@ -11,13 +11,15 @@ it('stale-code-service is discoverable using an existing probe', () => {
 it('stale flag true/false and unreadable plist require operator action', () => {
   const cloneRoot = resolve('fixtures/clone');
   const findStale = vi.fn(() => [{ label: 'com.we.sampler', plistPath: 'sampler.plist', reason: 'stale-code' }, { label: null, plistPath: 'bad.plist', reason: 'plist-unreadable' }]);
-  const rows = smell.evaluate({ cloneLag: [{ cloneRoot }] }, { findStaleCodeServices: findStale, listCloneRoots: () => [cloneRoot], env: {} });
+  // Readable (empty) self-sync evidence; its managed-clones coverage row is asserted elsewhere, so only service rows are checked here.
+  const rows = smell.evaluate({ selfSync: [], cloneLag: [{ cloneRoot }] }, { findStaleCodeServices: findStale, listCloneRoots: () => [cloneRoot], env: {} })
+    .filter(row => !row.subject.startsWith('coverage:'));
   expect(findStale).toHaveBeenCalledWith({ cloneRoot, selfLabel: null, onFreshService: expect.any(Function) }); expect(rows).toHaveLength(3);
   expect(rows.map(row => row.breach)).toEqual([false, true, true]);
   expect(rows[0].subject).toBe(`clone:${cloneRoot}:service:unknown`);
   expect(rows.slice(1).map(row => row.measure.reason)).toEqual(['stale-code', 'plist-unreadable']);
   expect(rows[2].recommendation).toMatch(/plist|inspect/i);
-  expect(smell.evaluate({ cloneLag: [{ cloneRoot }] }, { findStaleCodeServices: () => [], listCloneRoots: () => [cloneRoot] })[0].breach).toBe(false);
+  expect(smell.evaluate({ selfSync: [], cloneLag: [{ cloneRoot }] }, { findStaleCodeServices: () => [], listCloneRoots: () => [cloneRoot] }).every(row => row.breach === false)).toBe(true);
 });
 it('reader failure flags an operator-visible fallback', () => {
   const rows = smell.evaluate({ cloneLag: [{ cloneRoot: resolve('fixtures/clone') }] }, { findStaleCodeServices: () => { throw new Error('cannot inspect'); }, listCloneRoots: () => [resolve('fixtures/clone')] });
@@ -203,4 +205,17 @@ it.each([0, 120_000, 300_000])('smell leaves grace handling to the detector rega
     subject: `clone:${cloneRoot}:service:com.we.sampler`, breach: true,
     measure: expect.objectContaining({ reason: 'stale-code' }),
   }));
+});
+
+it.each([null, undefined, {}])('unreadable self-sync evidence (%j) keeps an episode for a clone outside the registry open', unreadable => {
+  const f = episodeFixture();
+  const other = resolve('fixtures/other-managed-clone');
+  f.setRoots([other]);
+  const next = runHealthTick(f.initial.state, { selfSync: unreadable, cloneLag: [{ cloneRoot: other }] }, [f.descriptor], 2000);
+  expect(next.state.episodes[f.key]?.status).toBe('open');
+  expect(next.transitions.some(t => t.type === 'closed' && t.key === f.key)).toBe(false);
+  const rows = smell.evaluate({ selfSync: unreadable, cloneLag: [{ cloneRoot: other }] },
+    { findStaleCodeServices: () => [], listCloneRoots: () => [other], env: {}, episodes: f.initial.state.episodes });
+  expect(rows.find(row => row.subject === 'coverage:managed-clones')).toMatchObject({ breach: true, measure: { reason: 'self-sync evidence unreadable' } });
+  expect(rows.some(row => row.subject === f.initial.state.episodes[f.key].subject)).toBe(false);
 });

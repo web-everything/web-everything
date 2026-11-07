@@ -29,18 +29,21 @@ export default {
     // The watching daemon is itself clone-backed and restarts through self-sync, not as a service to alert on.
     const selfLabel = env.XPC_SERVICE_NAME || env.LAUNCH_JOB_LABEL || null;
     const rows = [], roots = new Set(), completeRoots = new Set();
+    // Unreadable self-sync evidence (null, missing, not an array) leaves coverage unknown: say so and never close on it.
+    const selfSyncReadable = Array.isArray(selfSync), selfSyncRows = selfSyncReadable ? selfSync : [];
     try {
       const managed = listCloneRoots();
       if (!Array.isArray(managed)) throw new Error('managed clone list unreadable');
       for (const root of [...managed, ...(cloneLag || []).map(c => c.cloneRoot),
-        ...(selfSync || []).map(c => c.cloneRoot ?? c.root).filter(root => root !== undefined)]) {
+        ...selfSyncRows.map(c => c.cloneRoot ?? c.root).filter(root => root !== undefined)]) {
         if (typeof root !== 'string' || !isAbsolute(root)) throw new Error('managed clone root unreadable');
         roots.add(root);
       }
     } catch (error) { return [unknown('managed-clones', String(error.message ?? error))]; }
     const knownKeys = new Set([...roots].map(root => cloneKey(root)));
-    if (roots.size && Array.isArray(selfSync)) rows.push(covered('managed-clones'));
-    for (const c of selfSync || []) {
+    if (!selfSyncReadable) rows.push(unknown('managed-clones', 'self-sync evidence unreadable'));
+    else if (roots.size) rows.push(covered('managed-clones'));
+    for (const c of selfSyncRows) {
       // probeSelfSync emits a row per state-directory entry (e.g. `conveyor-state`). Only a row that is a clone
       // (a hashed clone key, or one carrying its root) counts; plain state dirs are skipped, not reported unknown.
       if (typeof c.cloneKey === 'string' && (CLONE_KEY.test(c.cloneKey) || c.cloneRoot !== undefined || c.root !== undefined)) rows.push(knownKeys.has(c.cloneKey) ? covered(c.cloneKey) : unknown(c.cloneKey, 'self-sync clone has no known root'));
@@ -81,7 +84,7 @@ export default {
     // missingSubjectsUnknown keeps an episode open when its subject is not re-emitted. Close it only on
     // positive evidence: its clone was inspected completely (service removed, renamed or no longer
     // clone-backed), or coverage is fully known and the clone left the managed inventory.
-    const inventoryKnown = roots.size > 0 && !rows.some(row => row.breach && row.subject.startsWith('coverage:'));
+    const inventoryKnown = selfSyncReadable && roots.size > 0 &&!rows.some(row => row.breach && row.subject.startsWith('coverage:'));
     const emitted = new Set(rows.map(row => row.subject));
     for (const ep of Object.values(episodes ?? {})) {
       if (ep?.smell !== 'stale-code-service' || typeof ep.subject !== 'string' || emitted.has(ep.subject)) continue;
