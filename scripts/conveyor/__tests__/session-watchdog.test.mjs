@@ -7,9 +7,9 @@
  *   bounded reader.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -25,6 +25,7 @@ import ghostListed from '../health-smells/ghost-session-listed.mjs';
 import { probeSessionWatchdog } from '../health-watch.mjs';
 import { runHealthTick, emptyHealthState } from '../health-watch-core.mjs';
 import { fixDispatchClaimRoot, listFixDispatchClaims } from '../fix-claim-store.mjs';
+import { listLiveFixClaims } from '../fix-procedure.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(HERE, '..', 'soak', 'breaks', 'fixtures', 'fix-3771-wait-loop.jsonl');
@@ -273,7 +274,7 @@ describe('runSessionWatchdogPass — the IO shell with fakes', () => {
     const opts = {
       nowMs: NOW, agents: listing, processes: [{ pid: 2009, command: 'claude' }, { pid: 3, command: 'claude' }],
       readTail: (r) => { calls.tailReads.push(r.name); return tails[r.sessionId] ?? null; },
-      listDispatchClaims: () => [], awaitingVerifyFor: () => ({ awaiting: false }), readHeavy: () => null, listClaims: () => claims, prHeadFor: () => 'abc', completionFor: () => null,
+      listDispatchClaims: () => [], chatSpawnGuardFor: () => ({ blocked: false }), awaitingVerifyFor: () => ({ awaiting: false }), readHeavy: () => null, listClaims: () => claims, prHeadFor: () => 'abc', completionFor: () => null,
       rm: ({ handle }) => { calls.rm.push(handle); return { removed: true, alreadyGone: false }; },
       releaseFixing: () => ({ released: false, reason: 'absent' }), releaseDispatch: () => ({ released: [], skipped: [] }),
       readLedger: () => ({ emitted: new Set(), acked: new Set() }), appendEvent: (e) => calls.events.push(e),
@@ -671,7 +672,7 @@ describe('runSessionWatchdogPass — reaping with hermetic IO', () => {
     const result = runSessionWatchdogPass({
       nowMs: T0, act: true, agents: [listing()], processes: [{ pid: 2009, command: 'claude' }],
       readTail: (r) => { calls.tailReads.push(r.sessionId); return finishedTail(); },
-      listDispatchClaims: () => [], awaitingVerifyFor: () => ({ awaiting: false }), readHeavy: () => null, listClaims: () => [], prHeadFor: () => null, completionFor: () => null,
+      listDispatchClaims: () => [], chatSpawnGuardFor: () => ({ blocked: false }), awaitingVerifyFor: () => ({ awaiting: false }), readHeavy: () => null, listClaims: () => [], prHeadFor: () => null, completionFor: () => null,
       stop: ({ handle }) => { calls.stop.push(handle); return { stopped: true }; },
       appendReapEvent: (e) => calls.reapEvents.push(e), log: (line) => calls.logs.push(line),
       ownSessionId: 'orchestrator-not-listed',
@@ -945,6 +946,99 @@ describe('runSessionWatchdogPass — reaping with hermetic IO', () => {
     const { calls, actions } = base({ agents: [listing({ cwd: 'scratch/session' })], awaitingVerifyFor });
     expect(calls.stop).toEqual([]);
     expect(actions).toEqual([expect.objectContaining({ detail: 'refused: awaiting verification unreadable' })]);
+  });
+
+  it.each(['finished', 'duplicate'])('chat-spawn guarded, throwing and unknown guards refuse %s stops; unguarded allows them', (mode) => {
+    const old = listing({ cwd: 'scratch/session', extraListingEvidence: true });
+    const keeper = listing({ id: 'keeper', sessionId: 'sid-keeper', startedAt: T0 - 60 * MIN });
+    const tail = mode === 'finished' ? finishedTail() : summarizeTail(bash('git status --short', T0 - 15 * MIN), { nowMs: T0 });
+    for (const outcome of ['guarded', 'throws', 'null', 'incomplete', 'unguarded']) {
+      const chatSpawnGuardFor = vi.fn(session => {
+        if (outcome === 'throws') throw new Error('unknown chat ownership');
+        if (outcome === 'null') return null;
+        if (outcome === 'incomplete') return {};
+        return { blocked: outcome === 'guarded', reason: outcome === 'guarded' ? 'chat-not-ended' : 'no-link' };
+      });
+      const { calls, actions } = base({ agents: mode === 'finished' ? [old] : [old, keeper], readTail: () => tail, chatSpawnGuardFor });
+      expect(chatSpawnGuardFor).toHaveBeenCalledWith(old);
+      expect(chatSpawnGuardFor.mock.calls[0][0]).toBe(old);
+      expect(calls.stop).toEqual(outcome === 'unguarded' ? [old.id] : []);
+      expect(calls.reapEvents).toHaveLength(outcome === 'unguarded' ? 1 : 0);
+      if (outcome !== 'unguarded') expect(actions).toEqual([expect.objectContaining({
+        ok: false, detail: outcome === 'guarded' ? 'refused: chat-spawn guarded' : 'refused: chat-spawn guard unreadable',
+      })]);
+    }
+  });
+
+  it('an unrelated corrupt lock preserves fixing findings and escalation events while refusing stops', () => {
+    const root = mkdtempSync(join(tmpdir(), 'watchdog-corrupt-claims-'));
+    try {
+      for (const name of ['valid', 'corrupt']) mkdirSync(join(root, name));
+      writeFileSync(join(root, 'valid', 'lock.json'), JSON.stringify({
+        owner: 'fixer', heartbeatAt: new Date(T0 - MIN).toISOString(),
+        meta: { repo: 'we', pr: 3771, kind: 'fixing', who: 'fix-3771', sessionId: 'sid-1',
+          headSha: 'abc', claimedAt: new Date(T0 - 120 * MIN).toISOString(), ttlMinutes: 240 },
+      }));
+      writeFileSync(join(root, 'corrupt', 'lock.json'), '{corrupt');
+      const listClaims = vi.fn(() => listLiveFixClaims({ lockRoot: root, nowMs: T0 }));
+      const events = [];
+      const stalled = summarizeTail(bash('git status --short', T0 - 41 * MIN, MIN), { nowMs: T0 });
+      const { result, calls, actions } = base({
+        agents: [listing(), listing({ name: 'fix-3772', id: 'finished', sessionId: 'sid-finished' })],
+        readTail: session => session.sessionId === 'sid-1' ? stalled : finishedTail(),
+        listClaims, prHeadFor: () => 'abc', appendEvent: event => events.push(event),
+        claimStoreReadable: () => defaultClaimStoreReadable(() => readdirSync(root),
+          (path, encoding) => readFileSync(join(root, basename(dirname(path)), 'lock.json'), encoding)),
+      });
+      expect(listClaims).toHaveBeenCalledTimes(1);
+      expect(result.findings.map(f => f.type).sort()).toEqual(['fix-claim-held-no-progress', 'fixer-stuck', 'stale-claim']);
+      expect(events).toEqual([expect.objectContaining({ type: ESCALATION_EVENT_TYPE, session: expect.objectContaining({ sessionId: 'sid-1' }) })]);
+      expect(result.events).toEqual([expect.objectContaining({ written: true })]);
+      expect(calls.stop).toEqual([]);
+      expect(calls.reapEvents).toEqual([]);
+      expect(actions).toEqual([expect.objectContaining({ handle: 'finished', detail: 'refused: claim store unreadable' })]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(['throws', 'null'])('a failed fixing-claim read (%s) still refuses stops after separating the findings read', (failure) => {
+    const { calls, actions } = base({ listClaims: () => {
+      if (failure === 'throws') throw new Error('unreadable fixing claims');
+      return null;
+    } });
+    expect(calls.stop).toEqual([]);
+    expect(actions).toEqual([expect.objectContaining({ detail: 'refused: claim store unreadable' })]);
+  });
+
+  it.each(['fix', 'fixing'])('invalid heartbeat timestamps refuse stops for %s claims, naming only the entry', (kind) => {
+    const logs = [];
+    const { calls, actions } = base({ claimStoreReadable: () => defaultClaimStoreReadable(
+      () => ['invalid-heartbeat'], () => JSON.stringify({ owner: 'secret-owner', heartbeatAt: 'secret-invalid-date',
+        meta: { repo: 'we', pr: 3771, kind, who: 'fix-3771', sessionId: 'sid-1' } }), line => logs.push(line)),
+    });
+    expect(calls.stop).toEqual([]);
+    expect(calls.reapEvents).toEqual([]);
+    expect(actions).toEqual([expect.objectContaining({ detail: 'refused: claim store unreadable' })]);
+    expect(logs).toEqual([expect.stringContaining('invalid-heartbeat/lock.json')]);
+    expect(logs.join(' ')).not.toContain('secret-owner');
+    expect(logs.join(' ')).not.toContain('secret-invalid-date');
+  });
+
+  it.each(['Infinity', 'NaN', -1, 0])('invalid fixing claim TTL %s refuses stops', (ttlMinutes) => {
+    const logs = [];
+    const { calls, actions } = base({ claimStoreReadable: () => defaultClaimStoreReadable(
+      () => ['invalid-ttl'], () => JSON.stringify({ owner: 'holder', heartbeatAt: new Date(T0).toISOString(),
+        meta: { repo: 'we', pr: 3771, kind: 'fixing', ttlMinutes } }), line => logs.push(line)),
+    });
+    expect(calls.stop).toEqual([]);
+    expect(actions).toEqual([expect.objectContaining({ detail: 'refused: claim store unreadable' })]);
+    expect(logs).toEqual([expect.stringContaining('invalid-ttl/lock.json')]);
+  });
+
+  it('valid historical heartbeat timestamps remain readable even when the lease has expired', () => {
+    expect(defaultClaimStoreReadable(() => ['expired'], () => JSON.stringify({
+      owner: 'holder', heartbeatAt: new Date(T0 - 24 * 60 * MIN).toISOString(),
+      meta: { repo: 'we', pr: 3771, kind: 'fix' },
+    }))).toBe(true);
   });
 
   it('report-only plans the stop with ok:null and never calls stop or appends a reap event', () => {
