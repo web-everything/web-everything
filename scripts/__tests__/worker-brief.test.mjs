@@ -189,6 +189,8 @@ describe('renderWorkerBrief', () => {
     expect(text).toContain('NOT WEAKENED');
     expect(text).toContain('at most 2 repair rounds');
     expect(text).toContain('remaining findings');
+    expect(text).toContain('AUDIT: WEAKENED (unresolved)');
+    expect(text).toContain('never a clear audit');
     expect(text).toContain('verdict in your report');
   });
 
