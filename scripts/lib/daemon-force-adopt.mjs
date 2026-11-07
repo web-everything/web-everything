@@ -8,8 +8,20 @@
  * clone to the last-good build on a failed health check or a crash loop.
  * Pure decisions are exported separately from the small file IO; the git revert itself is injected (rebuild.mjs
  * reuses `finalizeRebuild`, so it keeps the one locked reset path).
+ *
+ * THE WATCH RULE (operator ruling R672, one rule instead of per-path patches):
+ *  - EVERY change to the watch record goes through {@link transitionWatch}: one function, under the watch's own lock, with a
+ *    compare-and-swap on the record's `version`. Nothing else writes or removes the watch file.
+ *  - The watch retires only when its ticks are healthy (`passed`), a rollback completes (`rolled-back`, or HEAD is already the
+ *    rollback target), or the forced build never ran (`never-adopted`: its adoption was aborted / discarded / expired). It NEVER
+ *    retires because another build superseded the watched one.
+ *  - The watch and its rollback target (`lastGood`) carry over to ANY successor build: a tick that finds HEAD on another build
+ *    moves the watch onto it ({@link runForceWatchTick} `follow`). Because it follows HEAD, no adoption path (smoked, unsmoked,
+ *    no-worse, fallback, ready-record) needs to know about the watch at all.
+ *  - Before any rollback, HEAD is compared with the watched sha under the clone's write lock (rebuild.mjs); a mismatch is
+ *    reported as `superseded`, and the watch follows HEAD instead of reverting a build it does not watch.
  */
-import { appendFileSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { stateDir, readReadyCandidate, clearReadyCandidate } from './daemon-rebuild/state.mjs';
@@ -85,47 +97,84 @@ export function forceRequestFor(root, env, sha, now = Date.now) {
 // Best-effort: an unwritable/unreadable state dir (ENOTDIR, EACCES) must not turn a refusal into a throw.
 const removeQuietly = (p) => { try { rmSync(p, { force: true }); } catch { /* unreachable state dir: nothing to clear */ } };
 export const clearForceAdopt = (root, env = process.env) => removeQuietly(requestPath(root, env));
+
 export const readForceWatch = (root, env = process.env) => readJson(watchPath(root, env));
-/** true when a watch file EXISTS but cannot be read or parsed (EACCES, EIO, corrupt JSON). That is not "no watch": a second
- *  force would overwrite the open watch's last-good with an unproven build. Only a missing file (ENOENT) means absent. */
-const watchUnreadable = (root, env) => {
-  try { JSON.parse(readFileSync(watchPath(root, env), 'utf8')); return false; } catch (e) { return e?.code !== 'ENOENT' && e?.code !== 'ENOTDIR'; } // a state dir that is not a directory cannot hold a watch
-};
-/** Rollbacks owed but whose marker could not be written to disk, keyed by watch path (this process only). Each entry keeps the
- *  whole watch, so the obligation survives a lost or unreadable watch file. */
+/** The watch file as it is: `missing` (ENOENT / a state dir that is not a directory), `unreadable` (EACCES, EIO, corrupt JSON — that
+ *  is NOT "no watch": a second force would overwrite the open watch's last-good with an unproven build) or `ok`. */
+function readWatchRecord(root, env) {
+  let text;
+  try { text = readFileSync(watchPath(root, env), 'utf8'); } catch (e) { return { state: e?.code === 'ENOENT' || e?.code === 'ENOTDIR' ? 'missing' : 'unreadable', watch: null }; }
+  try { const w = JSON.parse(text); return w && typeof w === 'object' ? { state: 'ok', watch: w } : { state: 'unreadable', watch: null }; } catch { return { state: 'unreadable', watch: null }; }
+}
+const watchUnreadable = (root, env) => readWatchRecord(root, env).state === 'unreadable';
+
+/** Rollbacks owed whose marker could not be written to disk, keyed by watch path (this process only). Each entry keeps the whole
+ *  watch, so the obligation survives a lost or unreadable watch file; {@link blocked} refuses a new force until it is paid. */
 const pendingRollbacks = new Map();
-/** A watch that MOVED onto an unsmoked successor (carry / rebind) but whose write to disk failed, keyed by watch path (this process
- *  only). The disk still holds the stale pre-move record (old sha, declared `carryTo`); without this overlay every later tick would
- *  re-derive the move in memory, find the stale disk record "not the same watch" and return `none` forever, so an unhealthy successor
- *  would never be rolled back. The overlay is the watch the ticks decide from until the disk catches up. */
-const unsavedMoves = new Map();
-const clearWatch = (root, env) => { const p = watchPath(root, env); pendingRollbacks.delete(p); unsavedMoves.delete(p); removeQuietly(p); };
-/** Write a moved watch; when the disk refuses it, keep it in memory instead (see {@link unsavedMoves}). Returns true when it landed. */
-function saveMoved(root, env, moved) {
-  const p = watchPath(root, env);
-  try { writeJson(p, moved); unsavedMoves.delete(p); return true; } catch { unsavedMoves.set(p, moved); return false; }
-}
-/** Best-effort write of a watch the tick updated (ticks left, adoptedSeen): when it fails and the watch is one kept in memory, the
- *  updated copy replaces it, so a countdown still progresses. Never throws. */
-function persistWatch(root, env, w) {
-  const p = watchPath(root, env);
-  try { writeJson(p, w); unsavedMoves.delete(p); } catch { const kept = unsavedMoves.get(p); if (kept && kept.sha === w.sha) unsavedMoves.set(p, w); }
-}
 /** The in-process marker applies only to the build it was recorded for: a later watch on the same path starts clean. */
 const pendingFor = (root, env, sha) => { const p = pendingRollbacks.get(watchPath(root, env)); return p && p.sha === sha ? p.reason : undefined; };
 /** The watch on disk, else the one an unsaved obligation is kept for in memory (a rollback owed must not vanish with its file). */
-function currentWatch(root, env) {
-  const p = watchPath(root, env);
-  const disk = readForceWatch(root, env);
-  const moved = unsavedMoves.get(p);
-  if (moved) {
-    // The in-memory move wins only while the disk still holds the SAME forced adoption at its stale pre-move sha, or cannot be read at
-    // all (fail closed). A disk that caught up, was cleared, or holds another force never has its record shadowed.
-    // A disk record that names a DIFFERENT declared successor is newer than the overlay (another writer chained a further move): it wins.
-    if (disk ? disk.startedAt === moved.startedAt && disk.sha !== moved.sha && (!disk.carryTo || disk.carryTo === moved.sha) : watchUnreadable(root, env)) return moved;
-    unsavedMoves.delete(p);
+const currentWatch = (root, env) => readForceWatch(root, env) ?? pendingRollbacks.get(watchPath(root, env))?.watch ?? null;
+
+// ── THE one writer ───────────────────────────────────────────────────────────────────────────────────────────────
+const WATCH_LOCK_WAIT_MS = 2000;
+const WATCH_LOCK_STALE_MS = 30_000;
+const sleepSync = (ms) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
+/** Run `fn` holding the watch's own lock (an atomically created directory next to the record; a holder that died is taken over once
+ *  it is older than WATCH_LOCK_STALE_MS). Never throws: `{ ok:false, reason }` when the lock could not be taken or `fn` threw. */
+function withWatchLock(root, env, fn) {
+  const dir = `${watchPath(root, env)}.lock`;
+  const deadline = Date.now() + WATCH_LOCK_WAIT_MS;
+  for (;;) {
+    try { mkdirSync(dirname(dir), { recursive: true }); mkdirSync(dir); break; } catch (e) {
+      if (e?.code !== 'EEXIST') return { ok: false, reason: 'lock-failed' };
+      try { if (Date.now() - statSync(dir).mtimeMs > WATCH_LOCK_STALE_MS) { rmSync(dir, { recursive: true, force: true }); continue; } } catch { /* raced with the holder's release */ }
+      if (Date.now() > deadline) return { ok: false, reason: 'lock-busy' };
+      sleepSync(10);
+    }
   }
-  return disk ?? pendingRollbacks.get(p)?.watch ?? null;
+  try { return { ok: true, value: fn() }; } catch { return { ok: false, reason: 'write-failed' }; } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+/**
+ * The ONLY way the watch record changes. `decide(current, state)` runs SYNCHRONOUSLY under the watch lock against the record as it is
+ * on disk right now (`state`: 'ok' | 'missing' | 'unreadable') and returns `{ next?, ...info }`: `next` an object writes it (its
+ * `version` is bumped), `next: null` retires the watch, no `next` leaves it alone. `expectVersion` is the compare-and-swap: when
+ * given and the record's version moved since the caller read it, nothing is written (`reason: 'stale'`).
+ * Returns `{ ok, changed, out, watch, reason }`; `ok:false` means the transition did not happen (the caller fails closed).
+ */
+export function transitionWatch(root, env, decide, { expectVersion } = {}) {
+  const p = watchPath(root, env);
+  const locked = withWatchLock(root, env, () => {
+    const { state, watch: cur } = readWatchRecord(root, env);
+    if (expectVersion !== undefined && (cur?.version ?? 0) !== expectVersion) return { stale: true };
+    const out = decide(cur, state) ?? {};
+    if (out.next === undefined) return { out, changed: false, watch: cur };
+    if (out.next === null) {
+      rmSync(p, { force: true });
+      if (readWatchRecord(root, env).state !== 'missing') throw new Error('watch not removed');
+      pendingRollbacks.delete(p);
+      return { out, changed: true, watch: null };
+    }
+    const next = { ...out.next, version: (cur?.version ?? 0) + 1 };
+    writeJson(p, next);
+    return { out, changed: true, watch: next };
+  });
+  if (!locked.ok) return { ok: false, changed: false, reason: locked.reason, out: {} };
+  if (locked.value.stale) return { ok: false, changed: false, reason: 'stale', out: {} };
+  return { ok: true, ...locked.value };
+}
+
+/** Retire the watch (through {@link transitionWatch}). `sha` restricts it to the watch for that build; `unlessRan` refuses a watch that
+ *  owes a rollback or whose build has been seen running (those only ever retire as `passed` / `rolled-back`). Returns true when retired. */
+function retireWatch(root, env, { sha = null, unlessRan = false } = {}) {
+  const t = transitionWatch(root, env, (cur) => {
+    if (!cur) return {};
+    if (sha && cur.sha !== sha) return {};
+    if (unlessRan && (cur.adoptedSeen || cur.rollbackPending)) return {};
+    return { next: null };
+  });
+  return t.ok && t.changed;
 }
 
 /** Why a new force-adopt cannot start for this clone right now, else null. The ONE place these refusals live: the prepare step's
@@ -142,11 +191,8 @@ export function forceBlockedReason(root, env = process.env) {
  *  no rollback; `'missing'` (no file, or a watch for another build), `'unreadable'` (the file exists but cannot be read or parsed)
  *  and `'owed'` (a rollback is already owed) all mean the build must NOT be adopted: it would run with nothing to revert it. */
 export function forcedWatchStatus(root, env = process.env, sha) {
-  let text;
-  try { text = readFileSync(watchPath(root, env), 'utf8'); } catch (e) { return e?.code === 'ENOENT' || e?.code === 'ENOTDIR' ? 'missing' : 'unreadable'; }
-  let watch;
-  try { watch = JSON.parse(text); } catch { return 'unreadable'; }
-  if (!watch || typeof watch !== 'object') return 'unreadable';
+  const { state, watch } = readWatchRecord(root, env);
+  if (state !== 'ok') return state;
   if (!sha || watch.sha !== sha) return 'missing';
   return watch.rollbackPending ? 'owed' : 'ok';
 }
@@ -173,20 +219,25 @@ export async function recordForcedAdoption({ root, env = process.env, request, s
   const retract = async (reason) => {
     appendLine(handoffFile(env), `- FORCE-ADOPT ${at} ${request.daemon} ${request.ruling}: NOT adopted ${sha} (${reason}); request consumed\n`);
     appendLine(coronerFile(env), `${JSON.stringify({ kind: 'force-adopt-aborted', at, daemon: request.daemon, ruling: request.ruling, sha, reason })}\n`);
-    clearWatch(root, env);
+    retireWatch(root, env, { sha, unlessRan: true });
     clearForceAdopt(root, env);
     try { await emit?.({ kind: 'force-adopt-aborted', daemon: request.daemon, detail: { ruling: request.ruling, sha, reason } }); } catch { /* best effort: the events sink may be the one that failed */ }
     return { ok: false, reason };
   };
   if (!(evented && handed && coroned)) return retract('audit-sink-failed');
-  try { writeJson(watchPath(root, env), { daemon: request.daemon, ruling: request.ruling, sha, lastGood, ticksLeft: FORCE_ADOPT_WATCH_TICKS, bad: 0, startedAt: at }); } catch { return retract('watch-write-failed'); }
+  // Opened through the one writer; refused (never overwritten) when another watch appeared since the check above.
+  const opened = transitionWatch(root, env, (cur, state) => (cur || state === 'unreadable'
+    ? { raced: true }
+    : { next: { daemon: request.daemon, ruling: request.ruling, sha, lastGood, ticksLeft: FORCE_ADOPT_WATCH_TICKS, bad: 0, startedAt: at } }));
+  if (!opened.ok) return retract('watch-write-failed');
+  if (opened.out.raced) return retract(forceBlockedReason(root, env) ?? 'watch-already-open');
   clearForceAdopt(root, env);
   return { ok: true };
 }
 
 /** The adoption did not happen (lock refused, reset failed): drop the watch that was opened for it, and say so. */
 export async function abortForcedAdoption({ root, env = process.env, request, sha, emit, now = Date.now }) {
-  clearWatch(root, env);
+  retireWatch(root, env, { sha, unlessRan: true });
   const at = new Date(now()).toISOString();
   appendLine(handoffFile(env), `- FORCE-ADOPT ${at} ${request.daemon} ${request.ruling}: NOT adopted ${sha} (adoption did not complete); request consumed\n`);
   // The coroner already holds a `force-adopt-review` record for this sha: say it did not happen.
@@ -197,12 +248,11 @@ export async function abortForcedAdoption({ root, env = process.env, request, sh
 
 /** A forced ready record was discarded without being adopted (refused as not the authorized sha, expired, other base): close
  *  the watch opened for it, which would otherwise only wait out the TTL and block the next force. A watch whose build already
- *  ran as head is left alone. Returns true when a watch was closed. */
+ *  ran as head, or that owes a rollback, is left alone (the build ran: the revert is still owed). Returns true when a watch was closed. */
 export async function abortForcedWatch({ root, env = process.env, sha, reason, emit, now = Date.now }) {
   const watch = readForceWatch(root, env);
-  // A watch that owes a rollback is never closed here: the build ran (the marker says so), so the revert is still owed.
   if (!watch || watch.sha !== sha || watch.adoptedSeen || watch.rollbackPending) return false;
-  clearWatch(root, env);
+  if (!retireWatch(root, env, { sha, unlessRan: true })) return false;
   const at = new Date(now()).toISOString();
   const why = String(reason ?? 'discarded').replace(/[^\x20-\x7e]/g, '?').slice(0, 80); // the reason can carry a ref name
   appendLine(handoffFile(env), `- FORCE-ADOPT ${at} ${watch.daemon} ${watch.ruling}: NOT adopted ${sha} (${why}); watch closed\n`);
@@ -221,64 +271,6 @@ export async function dropReadyCandidate({ root, env = process.env, keepSha = nu
   if (ready?.forced === true && sha && sha !== keepSha) await abortForcedWatch({ root, env, sha, reason, emit, now });
 }
 
-/** A successor adopted WITHOUT its own smoke (skip-unrelated: the move changes nothing the daemon runs) still carries the forced
- *  build's unverified code, so the open watch moves onto it instead of being dropped as "superseded": same last-good, same ticks
- *  left, same owed-rollback marker. Only a watch for exactly `fromSha` moves. Returns true when it moved. */
-export async function carryForceWatch({ root, env = process.env, fromSha, toSha, emit }) {
-  if (!fromSha || !toSha || fromSha === toSha) return false;
-  const path = watchPath(root, env);
-  const watch = currentWatch(root, env);
-  // Already moved by a watch tick that saw the intent (`carryTo`) and HEAD on the successor: nothing left to do.
-  if (watch && watch.sha === toSha && !watch.carryTo) return true;
-  if (!watch || (watch.sha !== fromSha && watch.carryTo !== fromSha)) return false; // chained: the previous intent is the source
-  const { carryTo: _intent, ...rest } = watch;
-  const moved = { ...rest, sha: toSha };
-  const pending = pendingRollbacks.get(path);
-  if (pending && (pending.sha === fromSha || pending.sha === watch.sha)) pendingRollbacks.set(path, { ...pending, sha: toSha, watch: { ...pending.watch, sha: toSha } });
-  // A write the disk refuses is kept in memory (see unsavedMoves), so a tick in this process still guards the successor; a tick in
-  // another process re-derives the move from the declared `carryTo` still on disk.
-  if (!saveMoved(root, env, moved) && !pending) {
-    // Not saved and nothing owed in memory: say so where an operator reads it, never a silent loss of rollback protection.
-    appendLine(handoffFile(env), `- FORCE-ADOPT ${new Date().toISOString()} ${watch.daemon} ${watch.ruling}: force-adopt-watch-carry-failed ${fromSha} -> ${toSha}; the watch could not be moved onto the unsmoked successor\n`);
-    return false;
-  }
-  await emit?.({ kind: 'force-adopt-watch-carried', daemon: watch.daemon, detail: { ruling: watch.ruling, from: fromSha, to: toSha } });
-  return true;
-}
-
-/** Declare, BEFORE the clone's HEAD moves, that the open watch for `fromSha` is about to follow it to `toSha` (a skip-unrelated
- *  adoption). A watch tick that reads HEAD on `toSha` in the window before {@link carryForceWatch} runs (or after a crash between the
- *  reset and the carry) rebinds the watch itself instead of closing it as superseded. `toSha: null` withdraws the intent (the move failed). */
-export function declareForceCarry({ root, env = process.env, fromSha, toSha = null }) {
-  const watch = currentWatch(root, env);
-  // A chained move (F -> S1 -> S2 before any tick or carry rebound the watch) names the previous intent as its source.
-  if (!watch || (watch.sha !== fromSha && watch.carryTo !== fromSha)) return false;
-  const { carryTo: _old, ...rest } = watch;
-  try { writeJson(watchPath(root, env), toSha ? { ...rest, carryTo: toSha } : rest); return true; } catch { return false; }
-}
-
-/** True when an open force watch (on disk, or an owed rollback held in memory) guards `sha` (or is already declared to move onto it).
- *  An unsmoked-successor adoption must fail closed when this holds and the carry intent could not be declared: the watch would be
- *  left on a superseded sha and erased, dropping automatic rollback protection for the unverified code. */
-export function forceWatchGuards({ root, env = process.env, sha }) {
-  if (!sha) return false;
-  const watch = currentWatch(root, env);
-  if (watch) return watch.sha === sha || watch.carryTo === sha;
-  return watchUnreadable(root, env); // fail closed: an unreadable watch file may be an open one (same rule as forceBlockedReason)
-}
-
-/** Move a watch that declared `carryTo` onto that successor: same last-good, ticks left and owed-rollback marker (on disk and in memory),
- *  intent cleared. The ONE rebind path for every tick site that finds HEAD on the declared successor. Returns the moved watch. */
-function rebindToCarry(root, env, watch) {
-  const { carryTo, ...rest } = watch;
-  const moved = { ...rest, sha: carryTo };
-  const p = watchPath(root, env);
-  const pending = pendingRollbacks.get(p);
-  if (pending && pending.sha === watch.sha) pendingRollbacks.set(p, { ...pending, sha: carryTo, watch: { ...pending.watch, sha: carryTo } });
-  saveMoved(root, env, moved); // a write the disk refuses stays in memory: ticks keep deciding from `moved`, never from the stale disk record
-  return moved;
-}
-
 /** PURE. One watch tick: fail closed on a failed health check or a crash loop, else count down. */
 export function evaluateForceWatch({ watch, healthy, restarts = 0, maxRestarts = FORCE_ADOPT_MAX_RESTARTS }) {
   // A rollback that already failed stays mandatory: a later healthy probe must not forget it and count the watch down.
@@ -290,10 +282,12 @@ export function evaluateForceWatch({ watch, healthy, restarts = 0, maxRestarts =
   return { action: 'continue', watch: { ...watch, ticksLeft } };
 }
 
-/** One tick of the post-force health watch. `probe(root)` -> { healthy, restarts? }; `rollback(lastGood)` -> { ok }. */
+/** One tick of the post-force health watch. `probe(root)` -> { healthy, restarts? }; `rollback(lastGood, { sha })` -> { ok } or
+ *  { superseded, head } when HEAD is no longer the watched build. */
 export async function runForceWatchTick({ root, env = process.env, probe, rollback, emit, now = Date.now, notBefore = null, currentHead = null }) {
   let watch = currentWatch(root, env);
   if (!watch) return { action: 'none' };
+  const p = watchPath(root, env);
   // A watch opened by THIS tick's own forced adoption starts COUNTING at the next tick, but its health is still checked now: the
   // running process still has the previous (good) code loaded, so a build that can no longer even import is reverted before the
   // restart onto it (afterwards nothing would run this watcher: a daemon that fails to import its own rebuild module never ticks).
@@ -308,105 +302,153 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   };
   const first = readHead(); // lazy: no git call unless a watch exists
   const head = first.head;
-  // State writes here are best-effort: a failed write must never stop the health check or the rollback that follows.
-  const persist = (w) => persistWatch(root, env, w);
-  // An unsmoked successor adoption declared this move (`carryTo`) before it reset HEAD: HEAD on that successor is the SAME watched
-  // code, not a superseding build, so rebind to it here (the adopting process's own carry may not have run yet, or may have died).
-  if (watch.carryTo && head !== null && head === watch.carryTo) watch = rebindToCarry(root, env, watch);
+  const readySha = () => readReadyCandidate(root, env)?.adopt?.finalSha;
+  const expired = () => now() - Date.parse(watch.startedAt) > FORCE_ADOPT_TTL_MS;
   const expire = async () => {
     // The forced build never became head. Its ready candidate never passed smoke, so drop it too: left behind, a later
     // write-lock holder would adopt it with no health watch.
-    if (readReadyCandidate(root, env)?.adopt?.finalSha === watch.sha) clearReadyCandidate(root, env);
-    clearWatch(root, env);
+    if (readySha() === watch.sha) clearReadyCandidate(root, env);
+    retireWatch(root, env, { sha: watch.sha, unlessRan: true });
     await emit?.({ kind: 'force-adopt-watch-expired', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, head } });
     return { action: 'expired' };
   };
-  const expired = () => now() - Date.parse(watch.startedAt) > FORCE_ADOPT_TTL_MS;
+  /** The watch follows HEAD onto a successor build (ANY build: smoked, unsmoked, no-worse, fallback, ready record), keeping its
+   *  rollback target, ticks left and owed-rollback marker. HEAD already on the rollback target means the revert happened some other
+   *  way: that completes the watch. Returns { watch } (moved), { reverted }, { gone } (another writer closed or moved it) or { failed }. */
+  // `recordSha` is the sha of the record as it is on DISK; `watch.sha` is the build this tick decides about. They differ only when a
+  // follow could not be written (`unsaved`): the tick then keeps deciding in memory, so a refused write never suppresses the rollback
+  // of an unhealthy successor, while the disk keeps the old record (fail closed: it is never retired or counted down from memory).
+  let recordSha = watch.sha;
+  let unsaved = false;
+  const follow = async (toHead) => {
+    const t = transitionWatch(root, env, (cur) => {
+      if (!cur || cur.sha !== recordSha) return { gone: true };
+      if (cur.sha === toHead) return { same: true }; // already there (a rollback that found HEAD on the watched build's own record)
+      if (cur.lastGood?.head && cur.lastGood.head === toHead) return { next: null, reverted: true };
+      return { next: { ...cur, sha: toHead, adoptedSeen: true, lineage: [...(Array.isArray(cur.lineage) ? cur.lineage : []), cur.sha].slice(-10) } };
+    });
+    if (!t.ok) return { failed: true };
+    if (t.out.same) return { watch: t.watch };
+    if (t.out.reverted) {
+      await emit?.({ kind: 'force-adopt-watch-reverted', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: recordSha, head: toHead } });
+      return { reverted: true };
+    }
+    const pend = pendingRollbacks.get(p);
+    if (t.out.gone) {
+      // No record on disk but an owed rollback kept in memory (its file was lost): the obligation follows HEAD in memory too.
+      if (pend && pend.sha === recordSha) {
+        const moved = { ...pend.watch, sha: toHead, adoptedSeen: true };
+        pendingRollbacks.set(p, { ...pend, sha: toHead, watch: moved });
+        recordSha = toHead; unsaved = false;
+        return { watch: moved };
+      }
+      return { gone: true };
+    }
+    if (pend && pend.sha === recordSha) pendingRollbacks.set(p, { ...pend, sha: toHead, watch: { ...pend.watch, sha: toHead } });
+    await emit?.({ kind: 'force-adopt-watch-followed', daemon: watch.daemon, detail: { ruling: watch.ruling, from: recordSha, to: toHead } });
+    recordSha = toHead; unsaved = false;
+    return { watch: t.watch };
+  };
+  const followResult = (f) => (f.failed ? { action: 'follow-failed' } : f.reverted ? { action: 'reverted' } : f.gone ? { action: 'none' } : null);
+  /** Follow HEAD; when the write is refused, hold the move in memory for this tick. Returns a terminal tick result, or null to go on. */
+  const moveTo = async (toHead) => {
+    const f = await follow(toHead);
+    if (f.failed) { watch = { ...watch, sha: toHead, adoptedSeen: true }; unsaved = true; return null; }
+    const stop = followResult(f);
+    if (stop) return stop;
+    watch = f.watch;
+    return null;
+  };
+
   // The build has not been seen running and its ready record is still waiting to be adopted: it is NOT head yet. A HEAD that cannot
   // be read right now (a transient git failure) says nothing about it, so the tick RETRIES with the watch and the ready record kept:
-  // no rollback (it would read "already reverted" on last-good and drop the record), no supersede, no marker. The retry is bounded
+  // no rollback (it would read "already reverted" on last-good and drop the record), no follow, no marker. The retry is bounded
   // by the same TTL as a build that never becomes head. Once the build has run, or no ready record is left (a direct adoption),
   // an unreadable HEAD is a failure again (below).
-  if (!watch.adoptedSeen && readReadyCandidate(root, env)?.adopt?.finalSha === watch.sha && (first.unreadable || (head !== null && head !== watch.sha))) {
+  if (!watch.adoptedSeen && readySha() === watch.sha && (first.unreadable || (head !== null && head !== watch.sha))) {
     // A marker left by an earlier unreadable tick of this same never-run build is stale: drop it, or the next tick would read it as "ran".
-    if (watch.rollbackPending || pendingRollbacks.has(watchPath(root, env))) {
-      pendingRollbacks.delete(watchPath(root, env));
-      const { rollbackPending: _stale, ...clean } = watch;
-      persist(clean);
+    if (watch.rollbackPending || pendingRollbacks.has(p)) {
+      pendingRollbacks.delete(p);
+      transitionWatch(root, env, (cur) => {
+        if (!cur || cur.sha !== watch.sha || !cur.rollbackPending) return {};
+        const { rollbackPending: _stale, ...clean } = cur;
+        return { next: clean };
+      });
     }
     return expired() ? expire() : { action: 'waiting' };
   }
-  // Ticks only count once the forced build is really the running head (a ready-only job adopts a tick or more later).
+  // HEAD is on another build. If the watched build ran (seen, owed a revert, or its ready record is gone and HEAD is not simply still
+  // on last-good), that build was SUPERSEDED: the watch follows HEAD, it is never erased. Otherwise the forced build has not run yet.
   if (head !== null && head !== watch.sha) {
-    if (watch.adoptedSeen || watch.rollbackPending) { clearWatch(root, env); await emit?.({ kind: 'force-adopt-watch-superseded', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, head } }); return { action: 'superseded' }; }
-    if (expired()) return expire();
-    return { action: 'waiting' };
+    const ran = watch.adoptedSeen === true || !!watch.rollbackPending || !!pendingFor(root, env, watch.sha)
+      || (readySha() !== watch.sha && head !== watch.lastGood?.head);
+    if (!ran) return expired() ? expire() : { action: 'waiting' };
+    const stop = await moveTo(head);
+    if (stop) return stop;
   }
-  if (head !== null && !watch.adoptedSeen) { watch.adoptedSeen = true; persist(watch); }
+  if (head !== null && !watch.adoptedSeen) {
+    const t = transitionWatch(root, env, (cur) => (cur && cur.sha === watch.sha && !cur.adoptedSeen ? { next: { ...cur, adoptedSeen: true } } : {}));
+    watch = { ...(t.ok && t.watch ? t.watch : watch), adoptedSeen: true };
+  }
   let health;
   if (first.unreadable) health = { healthy: false }; // no head, no verdict on the build: do not even trust a healthy probe
   else { try { health = await probe(root); } catch { health = { healthy: false }; } }
-  // The probe is async: a concurrent tick may have recorded an owed rollback, or closed the watch, since our first read. Decide
-  // from the CURRENT record, never the stale snapshot, so a healthy result can neither erase a mandatory rollback nor
-  // count down / re-create a watch another tick already closed.
-  const fresh = currentWatch(root, env);
-  if (!fresh || fresh.sha !== watch.sha) return { action: 'none' };
-  watch = { ...fresh, adoptedSeen: fresh.adoptedSeen === true || watch.adoptedSeen === true };
-  // The head was read BEFORE the probe too: a sibling that adopted a newer build meanwhile means this build is no longer running, so a
-  // healthy result says nothing about it (no countdown, no false "passed") and an unhealthy one owes no revert.
+  // The head was read BEFORE the probe too: a build adopted meanwhile means the probed one is no longer running, so a healthy result
+  // says nothing about it (no countdown, no false "passed") and an unhealthy one owes no revert: the watch follows the new HEAD.
   const second = first.unreadable ? first : readHead();
   const headNow = second.head;
-  // A skip-unrelated successor may have been adopted while the probe ran (intent declared, HEAD reset, the adopter's own carry not
-  // yet run): HEAD on the DECLARED successor is the same watched code, so the watch follows it (keeping any owed rollback) instead
-  // of being closed as superseded. The probe judged the old head, so this tick neither counts down nor rolls back.
-  // Re-read the record AFTER the head read: the intent may be declared in the gap between our first read and the (git-spawning) head read.
-  const latest = currentWatch(root, env);
-  if (latest?.sha === watch.sha && latest.carryTo && headNow !== null && headNow === latest.carryTo) { rebindToCarry(root, env, latest); return { action: 'none' }; }
+  // The probe is async: a concurrent tick may have recorded an owed rollback, moved, or closed the watch since our first read. Decide
+  // from the CURRENT record, never the stale snapshot, so a healthy result can neither erase a mandatory rollback nor
+  // count down / re-create a watch another tick already closed.
+  const fresh = unsaved ? watch : currentWatch(root, env); // an unsaved move is the only record this tick has: the disk still holds the old sha
+  if (!fresh || fresh.sha !== watch.sha) return { action: 'none' };
+  watch = { ...fresh, adoptedSeen: fresh.adoptedSeen === true || watch.adoptedSeen === true };
   if (headNow !== null && headNow !== watch.sha) {
-    clearWatch(root, env);
-    await emit?.({ kind: 'force-adopt-watch-superseded', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, head: headNow } });
-    return { action: 'superseded' };
+    const stop = await moveTo(headNow);
+    return stop ?? { action: 'followed' };
   }
   const headUnreadable = first.unreadable || second.unreadable;
   if (headUnreadable) health = { healthy: false }; // unreadable after the probe: the probe's verdict cannot be tied to this build
-  // Every write/clear below follows an await on a rollback that may take the clone lock: act only if this exact watch is still the
-  // one on disk (or kept in memory), never on the snapshot (it may have been closed, or replaced by a force for another build).
-  const sameWatch = () => currentWatch(root, env)?.sha === watch.sha;
   const pendingReason = watch.rollbackPending || pendingFor(root, env, watch.sha); // disk marker, else the in-process one
   let verdict = evaluateForceWatch({ watch: pendingReason ? { ...watch, rollbackPending: pendingReason } : watch, healthy: health?.healthy, restarts: health?.restarts ?? 0 });
   if (headUnreadable && !pendingReason && verdict.action === 'rollback') verdict = { ...verdict, reason: 'head-unreadable' };
   if (openedThisTick && (verdict.action === 'continue' || verdict.action === 'done')) return { action: 'none' }; // healthy on arrival: counting starts next tick
-  if (verdict.action === 'continue') { persist(verdict.watch); return { action: 'continue', ticksLeft: verdict.watch.ticksLeft }; }
-  if (verdict.action === 'done') { clearWatch(root, env); await emit?.({ kind: 'force-adopt-watch-passed', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha } }); return { action: 'done' }; }
+  const expectVersion = fresh.version ?? 0;
+  if (verdict.action === 'continue') {
+    // Compare-and-swap on the version: an overlapping tick that already counted (or moved) the watch makes this one a no-op.
+    const t = transitionWatch(root, env, (cur) => (cur && cur.sha === watch.sha ? { next: { ...cur, ticksLeft: verdict.watch.ticksLeft } } : {}), { expectVersion });
+    if (!t.ok && t.reason === 'stale') return { action: 'none' };
+    return { action: 'continue', ticksLeft: verdict.watch.ticksLeft };
+  }
+  if (verdict.action === 'done') {
+    // Retires only a watch that still owes nothing: a rollback owed meanwhile (disk or memory) keeps it.
+    const t = transitionWatch(root, env, (cur) => (cur && cur.sha === watch.sha && !cur.rollbackPending && !pendingFor(root, env, watch.sha) ? { next: null } : {}), { expectVersion });
+    if (!t.ok || !t.changed) return { action: 'none' };
+    await emit?.({ kind: 'force-adopt-watch-passed', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha } });
+    return { action: 'done' };
+  }
   const at = new Date(now()).toISOString();
   let result;
   // The owed-rollback marker is recorded BEFORE the rollback starts (not after it fails): the rollback awaits the clone's write lock,
-  // and an overlapping healthy tick that completes meanwhile would otherwise close the watch and erase the obligation. Written
-  // directly (not the swallowing persist): if the disk refuses it, the whole obligation is kept in memory instead (it blocks any new
-  // force-adopt and every tick retries it). It is cleared only below, once the rollback has succeeded (or the build was superseded).
-  const owed = { ...watch, rollbackPending: verdict.reason };
+  // and an overlapping healthy tick that completes meanwhile would otherwise close the watch and erase the obligation. Recorded through
+  // the one writer: if the disk refuses it, the whole obligation is kept in memory instead (it blocks any new force-adopt and every
+  // tick retries it). It is cleared only below, once the rollback has succeeded (or HEAD is already the rollback target).
   const markOwed = () => {
-    try { writeJson(watchPath(root, env), owed); pendingRollbacks.delete(watchPath(root, env)); return true; } catch {
-      pendingRollbacks.set(watchPath(root, env), { sha: watch.sha, reason: verdict.reason, watch: owed });
-      return false;
-    }
+    const t = transitionWatch(root, env, (cur) => (cur && cur.sha === recordSha ? { next: { ...cur, rollbackPending: verdict.reason } } : { other: !!cur }));
+    if (t.ok && (t.changed || t.out.other)) { if (t.changed) pendingRollbacks.delete(p); return true; } // `other`: the watch already moved on, nothing of ours to keep
+    pendingRollbacks.set(p, { sha: watch.sha, reason: verdict.reason, watch: { ...watch, rollbackPending: verdict.reason } });
+    return false;
   };
   let saved = markOwed();
   // `sha` lets the rollback verify, under the clone's write lock, that the watched build is STILL head before it reverts anything.
   try { result = await rollback(watch.lastGood, { sha: watch.sha }); } catch { result = { ok: false }; }
-  if (!sameWatch()) return { action: 'none' }; // another tick closed (or replaced) this watch during the rollback: it owns the outcome
+  const cur = currentWatch(root, env);
+  if (!cur || cur.sha !== recordSha) return { action: 'none' }; // another tick closed (or moved) this watch during the rollback: it owns the outcome
   if (result?.superseded === true) {
-    // The head the rollback found is the DECLARED successor of an unsmoked adoption: the same code, so the watch (and any owed
-    // rollback) follows it. Re-read the record: the intent may have been declared after our snapshot.
-    const cur = currentWatch(root, env);
-    if (cur?.carryTo && result.head && cur.carryTo === result.head) { rebindToCarry(root, env, cur); return { action: 'none' }; }
-    // A superseding build was adopted while the probe/rollback ran: it is running, the watched build is not, so there is nothing
-    // to revert. Close the watch without touching the newer build. The forced build's own ready record (never adopted, so never
-    // watched again) goes too: left behind, a later write-lock holder would adopt it with no health watch.
-    if (readReadyCandidate(root, env)?.adopt?.finalSha === watch.sha) clearReadyCandidate(root, env);
-    clearWatch(root, env);
-    await emit?.({ kind: 'force-adopt-watch-superseded', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, head: result.head ?? null } });
-    return { action: 'superseded' };
+    // HEAD is no longer the watched build (a successor was adopted while the probe/rollback waited): nothing to revert HERE, and the
+    // watch is not closed. It follows HEAD with its rollback target and owed marker; the next tick reverts the successor if still owed.
+    const stop = await moveTo(result.head);
+    return stop ?? { action: 'followed' };
   }
   if (!result?.ok) {
     // Re-confirm the marker (a write that failed before the rollback may succeed now); if it still cannot be saved, the obligation
@@ -416,7 +458,9 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
     await emit?.({ kind: 'force-adopt-rollback-failed', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, reason: verdict.reason } });
     return { action: 'rollback-failed', reason: verdict.reason };
   }
-  clearWatch(root, env);
+  // The rollback completed. If the disk refuses to remove the record, the next tick finds HEAD on the rollback target and retires it then.
+  retireWatch(root, env, { sha: recordSha });
+  pendingRollbacks.delete(p); // the obligation is paid (also when it only ever lived in memory)
   await emit?.({ kind: 'force-adopt-rolled-back', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, lastGood: watch.lastGood?.head ?? null, reason: verdict.reason } });
   appendLine(handoffFile(env), `- FORCE-ADOPT ${at} ${watch.daemon} ${watch.ruling}: ROLLED BACK ${watch.sha} -> ${watch.lastGood?.head ?? '?'} (${verdict.reason})\n`);
   appendLine(coronerFile(env), `${JSON.stringify({ kind: 'force-adopt-rolled-back', at, daemon: watch.daemon, ruling: watch.ruling, sha: watch.sha, reason: verdict.reason })}\n`);

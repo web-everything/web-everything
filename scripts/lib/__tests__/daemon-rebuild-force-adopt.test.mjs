@@ -556,33 +556,43 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     expect(r).toMatchObject({ reason: 'skipped-unrelated', skippedSmoke: true });
     expect(smoke).not.toHaveBeenCalled();
     expect(headOf(cloneDir)).toBe(successor);
-    // carried, not erased: this tick's own watch step already counted the (healthy) successor once more
+    // followed, not erased: this tick's own watch step moved the watch onto HEAD and counted the (healthy) successor once more
     expect(readForceWatch(cloneDir, env)).toMatchObject({ sha: successor, ticksLeft: 3, lastGood: { head: lastGood } });
-    expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8')).toMatch(/force-adopt-watch-carried/);
+    expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8')).toMatch(/force-adopt-watch-followed/);
     expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8')).not.toMatch(/force-adopt-watch-superseded/);
     await tick(cloneDir, env, { runSmoke: passing(), forceWatchProbe: unhealthy });
     expect(headOf(cloneDir)).toBe(lastGood); // the unverified forced code is still reverted
     expect(readForceWatch(cloneDir, env)).toBeNull();
   });
 
-  it('an unsmoked successor is NOT adopted when the open watch cannot be told about the move: it is built and smoked instead (fail closed)', async () => {
-    const { originDir, cloneDir, env, target, arm } = setup();
+  // R672: every adoption path is "HEAD moves"; the watch follows HEAD on its own tick, so no path needs to write to it (and none can lose it).
+  it.each([
+    ['an unsmoked documentation successor (skip-unrelated path)', 'docs'],
+    ['a smoked successor (a full smoke passes)', 'smoked'],
+    ['a build adopted as "no worse" over a failed smoke (harness-broken path, smoke.mjs adopt-not-worse)', 'noworse'],
+  ])('table: %s adopted while a force watch is open -> the watch follows it and still rolls it back to the ORIGINAL last-good', async (_name, kind) => {
+    const { originDir, cloneDir, env: env0, lastGood, target, arm } = setup();
     arm();
-    await tick(cloneDir, env, { runSmoke: failing(), forceWatchProbe: healthy }); // forced build adopted and watched
-    const before = readForceWatch(cloneDir, env);
-    expect(before).toMatchObject({ sha: target });
-    const successor = advanceMainEmpty(originDir);
-    // every watch write fails (the atomic temp path is occupied by a directory) while the rest of the state dir stays writable
-    mkdirSync(`${join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(cloneDir)}.force-watch.json`)}.${process.pid}.tmp`);
-    const smoke = passing();
-    const r = await tick(cloneDir, env, { runSmoke: smoke, forceWatchProbe: healthy, skipCheck: () => ({ skip: true, reason: 'docs-only' }) });
-    expect(r.reason).not.toBe('skipped-unrelated');
-    expect(r.skippedSmoke).toBeUndefined();
-    expect(smoke).toHaveBeenCalled(); // the successor got a smoke of its own instead of riding the forced build's watch unprotected
-    expect(headOf(cloneDir)).toBe(successor); // and, smoked green, it is adopted normally
+    await tick(cloneDir, env0, { runSmoke: failing(), forceWatchProbe: healthy }); // the forced build is adopted and watched
+    expect(headOf(cloneDir)).toBe(target);
+    let env = env0; let extra; let successor;
+    if (kind === 'docs') { successor = advanceMainEmpty(originDir); extra = { runSmoke: passing(), skipCheck: () => ({ skip: true, reason: 'docs-only' }) }; }
+    else if (kind === 'smoked') { successor = advanceMain(originDir, (dir) => writeFile(dir, 'scripts/lane-pool.mjs', '// pool\n')); extra = { runSmoke: passing() }; }
+    else {
+      successor = advanceMain(originDir, (dir) => writeFile(dir, 'scripts/lane-pool.mjs', '// pool\n'));
+      env = { ...env0 }; delete env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE; // the default: adopt a candidate failing only what last-good also fails
+      extra = { runSmoke: failing() };
+    }
+    await tick(cloneDir, env, { ...extra, forceWatchProbe: healthy });
+    expect(headOf(cloneDir)).toBe(successor);
+    expect(readForceWatch(cloneDir, env)).toMatchObject({ sha: successor, lastGood: { head: lastGood } }); // followed, never erased
+    expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8')).not.toMatch(/force-adopt-watch-superseded/);
+    await tick(cloneDir, env, { runSmoke: passing(), forceWatchProbe: unhealthy });
+    expect(headOf(cloneDir)).toBe(lastGood); // the unverified forced code (and the successor on top of it) is reverted
+    expect(readForceWatch(cloneDir, env)).toBeNull();
   });
 
-  it('a rollback never reverts a build a sibling adopted while the health probe ran: the watch closes and the newer build keeps running', async () => {
+  it('a rollback never reverts a build a sibling adopted while the health probe ran: the watch follows it and the newer build keeps running this tick', async () => {
     const { originDir, cloneDir, env, lastGood, target, arm } = setup();
     arm();
     await tick(cloneDir, env, { runSmoke: failing(), forceWatchProbe: healthy }); // the forced build is adopted and watched
@@ -598,9 +608,10 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     expect(successor).not.toBeNull();
     expect(headOf(cloneDir)).toBe(successor); // NOT reset to last-good
     expect(headOf(cloneDir)).not.toBe(lastGood);
-    expect(readForceWatch(cloneDir, env)).toBeNull();
+    expect(readForceWatch(cloneDir, env)).toMatchObject({ sha: successor, lastGood: { head: lastGood } }); // followed, not erased
     const events = readFileSync(env.WE_DAEMON_EVENTS, 'utf8');
-    expect(events).toMatch(/force-adopt-watch-superseded/);
+    expect(events).toMatch(/force-adopt-watch-followed/);
+    expect(events).not.toMatch(/force-adopt-watch-superseded/);
     expect(events).not.toMatch(/force-adopt-rolled-back/);
     expect(handoffOf(env)).not.toMatch(/ROLLED BACK/);
   });

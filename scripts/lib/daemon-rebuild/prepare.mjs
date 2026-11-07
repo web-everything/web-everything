@@ -16,7 +16,7 @@ import {
   overlayGraduated, reportDiscardedCandidate,
 } from './adopt.mjs';
 import { hostname } from 'node:os';
-import { forceRequestFor, forceBlockedReason, dropReadyCandidate, forcedWatchStatus, carryForceWatch, declareForceCarry, forceWatchGuards } from '../daemon-force-adopt.mjs';
+import { forceRequestFor, forceBlockedReason, dropReadyCandidate, forcedWatchStatus } from '../daemon-force-adopt.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import {
   findUnsafeLocalState, knownInputsOf, rollbackUnverified, collectUntrackedPaths, ensureSafeToMove,
@@ -666,16 +666,10 @@ export async function prepareRebuild({
     const d = skipCheck(changedFiles);
     if (d?.skip) {
       if (readyOnly) return mutationDue('skip-unrelated-adopt');
-      // R508: this successor is adopted without a smoke of its own, so an open force watch for the build it replaces keeps guarding the
-      // (unverified) code it carries, with the original last-good, instead of being erased as "superseded". The move is declared in
-      // the watch BEFORE HEAD changes, so a watch tick that lands between the reset and the carry (or a crash there) rebinds, not closes.
-      let carryDeclared = false;
-      try { carryDeclared = declareForceCarry({ root, env: stEnv, fromSha: prevHead, toSha: plan.finalSha }); } catch { /* handled below */ }
-      // Fail closed: an open force watch guards the build being replaced but the carry could not be declared, so adopting this successor
-      // unsmoked would strand the watch on a superseded sha (erased as "superseded") and lose the automatic rollback. Fall through to the
-      // ordinary build+smoke path instead, which keeps the watch and gives the successor a smoke of its own.
-      let guardUndeclared = false;
-      try { guardUndeclared = !carryDeclared && forceWatchGuards({ root, env: stEnv, sha: prevHead }); } catch { guardUndeclared = true; }
+      // R508: an open force watch for the build this successor replaces needs nothing from this path: the watch follows HEAD onto ANY
+      // successor on its next tick, keeping its rollback target (daemon-force-adopt.mjs, the single watch-transition rule), so an
+      // unsmoked adoption can neither erase it nor depend on a carry write that could fail.
+      let guardUndeclared = false; // true: the unverified status could not be passed on, so this successor is built and smoked instead
       // R508: a force-adopted build is never a trusted smoke baseline (`forceUnverifiedTrees`, see smoke.mjs `changedSince`). This unsmoked
       // successor inherits that status BEFORE it is adopted, or a docs-only hop would launder it and the next incremental smoke would
       // skip the checks the force-adopted build failed. Fail closed: if it cannot be recorded, build and smoke the successor instead.
@@ -693,33 +687,16 @@ export async function prepareRebuild({
           }
         } catch {
           guardUndeclared = true;
-          if (carryDeclared) { try { declareForceCarry({ root, env: stEnv, fromSha: prevHead, toSha: null }); } catch { /* best effort */ } }
         }
       }
       if (guardUndeclared) {
-        log?.error?.(`daemon-rebuild: NOT skipping rebuild+smoke for ${String(plan.finalSha).slice(0, 9)} — an open force-adopt watch guards ${String(prevHead).slice(0, 9)} and its carry could not be declared; building and smoking it instead`);
+        log?.error?.(`daemon-rebuild: NOT skipping rebuild+smoke for ${String(plan.finalSha).slice(0, 9)} — the force-unverified status of ${String(prevHead).slice(0, 9)} could not be passed on to it; building and smoking it instead`);
       } else {
       log?.error?.(`daemon-rebuild: skipped rebuild+smoke for ${String(plan.finalSha).slice(0, 9)} — ${d.reason} (daemonRebuild.skipUnrelated)`);
-      let fin;
-      try {
-        fin = await finalizeRebuild({
-          root, env, log, run, stateOpts, now, plan, prevHead, lease: { token: null },
-        });
-      } catch (e) {
-        if (carryDeclared) { try { declareForceCarry({ root, env: stEnv, fromSha: prevHead, toSha: null }); } catch { /* best effort */ } }
-        throw e;
-      }
+      const fin = await finalizeRebuild({
+        root, env, log, run, stateOpts, now, plan, prevHead, lease: { token: null },
+      });
       const { alerts: finAlerts = [], ...finResult } = fin;
-      if (finResult.adopted) {
-        try {
-          await carryForceWatch({
-            root, env: stEnv, fromSha: prevHead, toSha: plan.finalSha,
-            emit: (e) => appendDaemonEvent(e, { env: { WE_DAEMON_EVENTS: env?.WE_DAEMON_EVENTS } }),
-          });
-        } catch { /* a failed carry is reported in the handoff file by carryForceWatch; the declared intent still covers a watch tick */ }
-      } else if (carryDeclared) {
-        try { declareForceCarry({ root, env: stEnv, fromSha: prevHead, toSha: null }); } catch { /* best effort */ }
-      }
       return {
         terminal: true,
         result: { ...finResult, ...(finResult.adopted ? { reason: 'skipped-unrelated', skippedSmoke: true } : {}) },
