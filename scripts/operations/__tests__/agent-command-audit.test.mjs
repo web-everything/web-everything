@@ -171,6 +171,34 @@ describe('agent command audit', () => {
     expect(out).not.toContain(zq);
     expect(out).toContain('[REDACTED]');
   });
+  // Self-review #6461 (round 3): positional config keys, program-specific secret options, JSON members, session
+  // and one-time-password options, and a line continuation inside the option name.
+  it.each([
+    `npm config set //registry.npmjs.org/:_authToken ${zq}`, `npm config set //r/:_password ${zq}`,
+    `yarn config set npmAuthToken ${zq}`, `aws configure set aws_secret_access_key ${zq}`,
+    `git config --global github.token ${zq}`, `gh secret set NPM_TOKEN --body ${zq}`, `gh secret set X --body=${zq}`,
+    `gh secret set X -b ${zq}`, `bw unlock --session ${zq}`, `x --sig ${zq}`, `x --signature ${zq}`, `x --otp ${zq}`,
+    `x --pin ${zq}`, `x --sessionid ${zq}`, `redis-cli -a ${zq}`, `mongosh -p ${zq}`, `openssl enc -passin pass:${zq}`,
+    `zip -P ${zq} a.zip f`, `unzip -P ${zq} a.zip`, `7z a -p${zq} a.7z`, `ssh-keygen -N ${zq} -f k`,
+    `smbclient -U user%${zq}`, `curl -b s=${zq} u`, `htpasswd -b f user ${zq}`, `curl -d '{"password":"${zq}"}' u`,
+    `curl -d '{"api_key": "${zq}"}' u`, `curl -d "{\\"password\\":\\"${zq}\\"}" u`, `cmd --tok\\\nen ${zq}`,
+  ])('redacts the round-3 credential shape %s', command => {
+    const out = redact(command);
+    expect(out).not.toContain(zq);
+    expect(out).toContain('[REDACTED]');
+  });
+  it.each([
+    'git config --global user.name Bob', 'npx vitest --config vitest.config.ts run', `curl -d '{"name":"bob"}' u`,
+  ])('leaves harmless config keys and JSON members in %s unchanged', command => expect(redact(command)).toBe(command));
+  it.each([
+    ["cat > f <<'EOF'\n" + 'hello world\n'.repeat(1500) + 'EOF', []],
+    ['cat <<EOF\nnpm test\nEOF', []],
+    ['bash <<EOF\nnpm test\nEOF', ['npm test/check']],
+    ['npm --loglevel silent test', ['npm test/check']], ['npm --tag x test', ['npm test/check']],
+    ['nohup npm test', ['npm test/check']], ["eval 'npm test'", ['npm test/check']], ['NPM test', ['npm test/check']],
+  ])('classifies long plain text, heredocs, npm value options and launchers: %s', (command, categories) => {
+    expect(classifyCommand(command).map(row => row.category)).toEqual(categories);
+  });
   it.each([
     'mkdir -p a/b', 'npm run build -- --page=2', 'curl https://x.test/?page=1&limit=2', 'docker run -p 80:80 img',
     'ls; mysql -h host -P 3306', 'echo a=b c=d',

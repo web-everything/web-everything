@@ -10,7 +10,7 @@ import { homedir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
-import { canonicalCommand, commandSubstitutionBodies, parseSegments, shellCString, shellTokens, ungatedHeavyRunKind } from '../guard-bash.mjs';
+import { canonicalCommand, commandSubstitutionBodies, heredocScan, parseSegments, shellCString, shellTokens, ungatedHeavyRunKind } from '../guard-bash.mjs';
 
 const etDay = value => new Intl.DateTimeFormat('en-CA', {
   timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
@@ -18,14 +18,33 @@ const etDay = value => new Intl.DateTimeFormat('en-CA', {
 
 // Option names that carry a credential (`--token`, `--api-key`, `--client-secret`, `--password`, `--pass`,
 // `--pat`/`--gitlab-pat` personal access tokens, …). `pat` is a whole name part, so `--path`/`--compat` stay data.
-const CREDENTIAL_OPTION = /token|secret|passw(?:or)?d|passphrase|^pass$|^pw$|^pwd$|jwt|(?:^|[-_])pat$|credential|auth(?!or)|cookie|key(?:[-_]?id)?$/i;
+// Session keys (`bw unlock --session v`), signatures, one-time passwords and PINs carry a credential too.
+const CREDENTIAL_OPTION = /token|secret|passw(?:or)?d|passphrase|^pass$|^pw$|^pwd$|jwt|(?:^|[-_])pat$|credential|auth(?!or)|cookie|key(?:[-_]?id)?$|session(?:[-_]?id)?$|^sig(?:nature)?$|^otp$|^pin$/i;
 const EMPTY_WORD = /^(?:""|'')+$/;
 // Header names (`Authorization:`, `PRIVATE-TOKEN:`, `x-api-key:`, `X-Auth:`, `token:`) and assignment names
 // (`API_KEY=`, `MY_PASS=`, `GITLAB_AUTH=`, `MYSQL_PWD=`) whose value is a credential. Tested on one captured name.
 const CREDENTIAL_HEADER = /authorization|token|secret|password|cookie|jwt|(?:^|[-_])auth$|(?:api|access|private|secret|auth)[-_]?key/i;
 const CREDENTIAL_ASSIGNMENT = /key|token|secret|passw(?:or)?d|passphrase|pass(?:[_-]|$)|(?:^|[_-])pwd$|jwt|(?:^|[_-])pat(?:[_-]|$)|credential|auth(?!or)|cookie/i;
-// Programs whose `-p` short option carries a password (`docker login -p v`, `sshpass -p v`, `mysql -pv`).
-const PASSWORD_SHORT_P = /(?<![\w./-])(?:(?:docker|podman|nerdctl|buildah|skopeo|helm\s+registry)\s+login|sshpass|mysql\w*|mariadb\w*)(?![\w-])/g;
+// Programs whose own short options carry a password or secret, attached (`mysql -pv`, `7z a -pv`) or separate
+// (`docker login -p v`, `redis-cli -a v`, `zip -P v f`, `ssh-keygen -N v`, `gh secret set X -b v`, `curl -b c=v`).
+const SECRET_SHORT_OPTIONS = [
+  [/(?:(?:docker|podman|nerdctl|buildah|skopeo|helm\s+registry)\s+login|sshpass|mysql\w*|mariadb\w*|mongo(?:sh|dump|restore|import|export)?|7z[ar]?)/, 'p'],
+  [/redis-cli/, 'a'],
+  [/(?:un)?zip|zipcloak/, 'P'],
+  [/ssh-keygen/, 'NP'],
+  [/gh\s+secret\s+set/, 'b'],
+  [/smbclient/, 'U'],
+  [/curl/, 'b'],
+];
+const SECRET_SHORT_PROGRAMS = new RegExp(String.raw`(?<![\w./-])(?:${SECRET_SHORT_OPTIONS.map(([re]) => re.source).join('|')})(?![\w-])`, 'g');
+// Long options that carry a secret only for one program (`gh secret set X --body v`).
+const SECRET_LONG_OPTIONS = /(?<![\w./-])gh\s+secret\s+set\b[^;|&\n]*?\s(--body)(=?)/g;
+// `config set <key> <value>` style commands (`npm config set //r/:_authToken v`, `yarn config set npmAuthToken v`,
+// `aws configure set aws_secret_access_key v`, `git config --global github.token v`): group 1 is the key.
+const CONFIG_KEY = /(?<![\w-])config(?:ure)?\s+(?:(?:set|add)\s+)?(?:--?[\w-]+(?:=\S*)?\s+)*([^\s=-][^\s=]*)()(?=\s)/g;
+const configKeyIsCredential = key => CREDENTIAL_ASSIGNMENT.test(key.split(/[/:.]/).filter(Boolean).pop() || '');
+// JSON / object-literal members whose name is a credential (`{"password":"v"}`, `{\"api_key\": \"v\"}`, `pin: 1234`).
+const JSON_MEMBER = /(\\?["'])([\w.-]+)\1\s*:\s*(\\?"(?:[^"\\]|\\.)*?\\?"|\\?'[^']*?\\?'|[^\s,}'"]+)/g;
 // Commands longer than this are cut before redaction so every rule stays linear-time; the cut is marked.
 export const REDACT_MAX_CHARS = 16384;
 
@@ -75,7 +94,7 @@ function redactOptionValues(text, named, isCredential, { attached = m => !!m[2],
       end = wordEnd;
       if (!EMPTY_WORD.test(text.slice(at, wordEnd))) break;
     }
-    out += text.slice(last, m.index) + replacement;
+    out += text.slice(last, m.index) + (typeof replacement === 'function' ? replacement(m) : replacement);
     last = named.lastIndex = Math.max(end, named.lastIndex);
   }
   return out + text.slice(last);
@@ -94,35 +113,66 @@ function redactAssignments(text) {
   return redactOptionValues(text, /(?<![\w-])([\w-]+)\s*(=)\s*/g, name => CREDENTIAL_ASSIGNMENT.test(name));
 }
 
-/** `-p` password values of the programs in PASSWORD_SHORT_P, attached (`-pv`) or separate (`-p v`). */
+/** Secret short-option values of the programs in SECRET_SHORT_OPTIONS, attached (`-pv`) or separate (`-p v`),
+ *  up to the end of that program's segment; `htpasswd -b f user v` takes its password as the last operand. */
 function redactShortPasswords(text) {
   let out = '', last = 0;
-  for (let m; (m = PASSWORD_SHORT_P.exec(text));) {
-    const segmentEnd = text.slice(PASSWORD_SHORT_P.lastIndex).search(/[;|&\n]/);
-    const end = segmentEnd < 0 ? text.length : PASSWORD_SHORT_P.lastIndex + segmentEnd;
-    const segment = text.slice(PASSWORD_SHORT_P.lastIndex, end);
-    // The value is glued on when a non-space follows `-p` (`-pv`, `-p=v`).
-    out += text.slice(last, PASSWORD_SHORT_P.lastIndex) + redactOptionValues(segment, /(?<!\S)-(p)(=?)/g, () => true,
-      { attached: (m, at) => !/^\s?$/.test(segment[at] ?? ''), replacement: '-p [REDACTED]' });
-    last = PASSWORD_SHORT_P.lastIndex = end;
+  for (let m; (m = SECRET_SHORT_PROGRAMS.exec(text));) {
+    const from = SECRET_SHORT_PROGRAMS.lastIndex;
+    const segmentEnd = text.slice(from).search(/[;|&\n]/);
+    const end = segmentEnd < 0 ? text.length : from + segmentEnd;
+    const segment = text.slice(from, end);
+    const letters = SECRET_SHORT_OPTIONS.filter(([re]) => new RegExp(`^(?:${re.source})$`).test(m[0])).map(([, l]) => l).join('');
+    // The value is glued on when a non-space follows the letter (`-pv`, `-p=v`).
+    out += text.slice(last, from) + redactOptionValues(segment, new RegExp(`(?<!\\S)-([${letters}])(=?)`, 'g'), () => true,
+      { attached: (o, at) => !/^\s?$/.test(segment[at] ?? ''), replacement: o => `-${o[1]} [REDACTED]` });
+    last = SECRET_SHORT_PROGRAMS.lastIndex = end;
   }
-  return out + text.slice(last);
+  return redactHtpasswd(out + text.slice(last));
+}
+
+/** `htpasswd -b[…] file user password` (or `-nb user password`): the password is the segment's last word. */
+function redactHtpasswd(text) {
+  return text.replace(/(?<![\w./-])htpasswd\s+-\w*b\w*\s[^;|&\n]*/g, segment => {
+    const lastWord = segment.trimEnd().search(/\S+$/);
+    return lastWord < 0 ? segment : segment.slice(0, lastWord) + '[REDACTED]';
+  });
+}
+
+/** Values of `config set <credential key> <value>`, of `gh secret set X --body v`, and `pass:v` (openssl). */
+function redactPositionalSecrets(text) {
+  const configured = redactOptionValues(text, CONFIG_KEY, configKeyIsCredential,
+    { replacement: m => m[0] + ' [REDACTED]' });
+  return redactOptionValues(configured, SECRET_LONG_OPTIONS, () => true, {
+    replacement: m => m[0].slice(0, m[0].length - m[2].length) + ' [REDACTED]',
+  }).replace(/(?<![\w-])pass:(?:"[^"]*"|'[^']*'|[^\s"';|&]+)/g, 'pass:[REDACTED]');
+}
+
+/** Credential members of JSON or object-literal text (`{"password":"v"}`), quoted or escaped. */
+function redactJsonMembers(text) {
+  return text.replace(JSON_MEMBER, (all, quote, name) => (CREDENTIAL_ASSIGNMENT.test(name) || /^pin$|^otp$/i.test(name)
+    ? `${quote}${name}${quote}:[REDACTED]` : all));
 }
 
 export function redact(text) {
-  // A `\`+newline is a line continuation; it becomes a space (never joined away), so the backslash can never
-  // pose as an escaped-space value (`--token \⏎ v`) and the next line still starts a word (`x\\⏎--token v`).
-  let clean = stripVTControlCharacters(String(text)).replace(/\\\r?\n/g, ' ').replace(/[\x00-\x1f\x7f\x85]|\p{Zl}|\p{Zp}/gu, ' ');
+  // An unescaped `\`+newline is a line continuation: bash deletes it, joining the words around it (`--tok\⏎en v`
+  // is `--token v`), so it is removed here too. The backslash can then never pose as an escaped-space value
+  // (`--token \⏎ v`). Before an option dash it becomes a space instead (`line\⏎--password v`), so a glued-on
+  // option is still read as one. An escaped backslash before a newline (`x\\⏎--token v`) is no continuation:
+  // the newline stays a word break.
+  let clean = stripVTControlCharacters(String(text))
+    .replace(/(?<!\\)((?:\\\\)*)\\\r?\n(-?)/g, (all, pairs, dash) => pairs + (dash ? ' -' : ''))
+    .replace(/[\x00-\x1f\x7f\x85]|\p{Zl}|\p{Zp}/gu, ' ');
   if (clean.length > REDACT_MAX_CHARS) clean = clean.slice(0, REDACT_MAX_CHARS) + ' …[truncated]';
   // Value-carrying forms run before the generic name rule below, which would otherwise redact only the name.
   // Every rule that starts with a repeated class is anchored to a word start, so none of them is quadratic.
-  return redactAssignments(redactShortPasswords(redactCredentialOptions(clean
+  return redactAssignments(redactJsonMembers(redactPositionalSecrets(redactShortPasswords(redactCredentialOptions(clean
     .replace(/(?<![a-z0-9+.-])([a-z][a-z0-9+.-]{0,31}:\/\/)[^\s/@"']+@/gi, '$1[REDACTED]@')
     // HTTP-style credential headers and `token: v`, with or without an auth scheme word.
     .replace(/(?<![\w-])([\w-]+)\s*:\s*(?:(?:Bearer|Basic|Digest|Negotiate|token)\s+)?[^\s"';]+/gi,
       (all, name) => (CREDENTIAL_HEADER.test(name) ? '[REDACTED]' : all))
     // curl/git-style `user:password` pairs.
-    .replace(/(?<!\S)(?:--user(?:=|\s+)|-u\s*)[^\s:]*:\S+/g, '[REDACTED]'))))
+    .replace(/(?<!\S)(?:--user(?:=|\s+)|-u\s*)[^\s:]*:\S+/g, '[REDACTED]'))))))
     .replace(/\b(?:gh[pousr]_|github_pat_|glpat-|sk-|xox[a-z]-)[A-Za-z0-9_-]+|\bnpm_[A-Za-z0-9]{20,}|\bAKIA[0-9A-Z]{16}\b/gi, '[REDACTED]')
     .replace(/\bBearer\s+(?:"[^"]*"|'[^']*'|[^\s"'`;,]+)/gi, '[REDACTED]')
     .replace(/\b(?:token|secret|key|bearer)\S*/gi, '[REDACTED]')
@@ -157,9 +207,13 @@ export const SUBSTITUTION_MAX_BODIES = 64;
 /** Every substitution body of `cmd`, or null when it is too long, too nested or unreadable (fail closed). */
 export function boundedSubstitutionBodies(cmd) {
   const text = String(cmd ?? '');
+  // Openers bound the body count from above; with none there is nothing to extract, so a long plain command
+  // (a big heredoc write, a long commit message) is classified normally instead of reported unparsed.
+  const openers = (text.match(/\$\(|`/g) || []).length;
+  if (!openers) return [];
   if (text.length > SUBSTITUTION_MAX_CHARS) return null;
-  // Openers bound the body count from above; checking them first keeps a deep nest off the quadratic extractor.
-  if ((text.match(/\$\(|`/g) || []).length > SUBSTITUTION_MAX_BODIES * 4) return null;
+  // Checking the opener count first keeps a deep nest off the quadratic extractor.
+  if (openers > SUBSTITUTION_MAX_BODIES * 4) return null;
   try {
     const bodies = commandSubstitutionBodies(text);
     return bodies.length > SUBSTITUTION_MAX_BODIES ? null : bodies;
@@ -178,7 +232,15 @@ export function classifyCommand(cmd, depth = 0, withSubstitutions = true) {
     if (!bodies) return [{ category: 'unparsed (substitutions too long or too nested)', queued: false, command: redact(String(cmd)) }];
     for (const body of bodies) out.push(...classifyCommand(body, depth + 1, false));
   }
-  for (const segment of parseSegments(String(cmd)).segments) {
+  // Heredoc bodies are data for `cat <<EOF`, but a shell reading its script from one runs them (`bash <<EOF`).
+  // An unterminated scan keeps the raw text (fail closed). Substitutions in a body were already extracted above.
+  const heredocs = heredocScan(String(cmd));
+  if (!heredocs.unterminated) {
+    for (const doc of heredocs.heredocs) {
+      if (/^(?:\S*\/)?(?:ba|da|z|k)?sh\b/.test(canonicalCommand(doc.head))) out.push(...classifyCommand(doc.body, depth + 1, false));
+    }
+  }
+  for (const segment of parseSegments(heredocs.unterminated ? String(cmd) : heredocs.text).segments) {
     let head = canonicalCommand(segment), queued = false;
     const admitted = /^node\s+\S*heavy-admission\.mjs\s+run\b[\s\S]*?\s--\s+([\s\S]+)$/.exec(head);
     if (admitted) { queued = true; head = canonicalCommand(admitted[1]); }

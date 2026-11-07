@@ -948,7 +948,8 @@ export function runnerInvocation(head) {
       if (RUNNER_CALL_FLAGS.has(flag)) {                       // the value IS a command line
         return { exec: eq === -1 ? (words[i + 1] ? words[i + 1].text : '') : w.slice(eq + 1) };
       }
-      if (eq === -1 && RUNNER_VALUE_FLAGS.has(flag)) i += 1;   // consume the flag's separate value word
+      // consume the flag's separate value word (npm's own `--tag x` too, so the value `x` is never `npm x`)
+      if (eq === -1 && (RUNNER_VALUE_FLAGS.has(flag) || (runner === 'npm' && NPM_VALUE_FLAGS.has(flag)))) i += 1;
       i += 1;
       continue;
     }
@@ -3287,6 +3288,9 @@ const VITEST_WATCH_FLAG = /^(?:--watch|-w)(?:=(?:true|1|yes|on))?$/i;
 /** npm options that choose WHICH package's `test` script runs; a replacement that drops them tests another package. */
 const NPM_SCOPE_VALUE_FLAGS = new Set(['-w', '--workspace', '--prefix', '-C']);
 const NPM_SCOPE_BARE_FLAG = /^(?:-ws|--workspaces|--include-workspace-root|-iwr)$/;
+/** npm config options that take a separate value before the subcommand (`npm --loglevel silent test`). */
+const NPM_VALUE_FLAGS = new Set(['--loglevel', '--tag', '--registry', '--userconfig', '--globalconfig', '--cache',
+  '--script-shell', '--node-options', '--otp', '--scope']);
 const NODE_SCRIPT_WORD = /\.(?:[cm]?js|ts)$/;
 const NODE_SCRIPT_VALUE_FLAGS = new Set(['--require', '-r', '--import', '--loader', '--experimental-loader',
   '--test-reporter', '--test-reporter-destination', '--test-name-pattern', '--test-skip-pattern',
@@ -3427,7 +3431,7 @@ function ungatedHeavyHead(head) {
     while (w[j]?.startsWith('-')) {
       const span = npmScopeSpan(words, j);
       if (span) scope.push(rawWords(head, words.slice(j, j + span)));
-      j += span || (!w[j].includes('=') && RUNNER_VALUE_FLAGS.has(w[j]) ? 2 : 1);
+      j += span || (!w[j].includes('=') && (RUNNER_VALUE_FLAGS.has(w[j]) || NPM_VALUE_FLAGS.has(w[j])) ? 2 : 1);
     }
     if (['test', 't', 'tst'].includes(w[j])) at = j;
   }
@@ -3479,6 +3483,25 @@ function heavyRunAlias(head) {
   const rest = (k) => (words[k] ? ' ' + head.slice(words[k].start) : '');
   // canonicalCommand peels one `env` per pass (`/usr/bin/env npm test` → `env npm test` → `npm test`).
   if (/(?:^|\/)env$/.test(w[0] || '') && words[1]) return 'env' + rest(1);
+  // Launchers that run the rest as a command: `nohup npm test`, `setsid -f npm test`, `eval 'npm test'` (eval
+  // joins its words and re-parses them, so the quoted word is a command string, not data).
+  if (/^(?:nohup|setsid)$/.test(w[0] || '')) {
+    let i = 1;
+    while (w[i]?.startsWith('-')) { i += 1; if (w[i - 1] === '--') break; }
+    return words[i] ? head.slice(words[i].start) : null;
+  }
+  if (w[0] === 'eval' && words[1]) return w.slice(1).join(' ');
+  // A case-insensitive filesystem (macOS) runs `NPM test` as npm.
+  if (/^(?:npm|pnpm|yarn|bun|npx|node|vitest|corepack)$/i.test(w[0] || '') && w[0] !== w[0].toLowerCase()) return w[0].toLowerCase() + rest(1);
+  // npm options that take a separate value (`npm --loglevel silent test`, `npm --tag x test`). Any non-flag word
+  // right after a flag may be its value; a `test` script name after it is read as the test script (fail closed).
+  if (w[0] === 'npm') {
+    for (let j = 1; w[j]?.startsWith('-') && w[j] !== '--'; j += 1) {
+      if (!w[j].includes('=') && w[j + 1] && !w[j + 1].startsWith('-') && ['test', 't', 'tst'].includes(w[j + 2])) {
+        return 'npm test' + rest(j + 3);
+      }
+    }
+  }
   if (/^bun@\S+$/.test(w[0] || '')) return 'bun' + rest(1); // `npx bun@1.4.2 test` canonicalizes to this
   if (w[0] === 'corepack' && /^(?:npm|pnpm|yarn)(?:@\S*)?$/.test(w[1] || '')) return w[1].replace(/@.*$/, '') + rest(2);
   if (w[0] === 'npm' && ['it', 'cit', 'install-test', 'install-ci-test'].includes(w[1])) return 'npm test' + rest(2);

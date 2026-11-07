@@ -103,6 +103,35 @@ describe('daemon heavy spawn admission lint', () => {
   ])('leaves plain-argv data and queued scripts alone: %s', call => {
     expect(findUngatedHeavySpawns(all + call)).toEqual([]);
   });
+  // Self-review #6461 (round 3): npm value options, launchers, case-folded names, fork execArgv, joined strings
+  // and shell-fed heredocs.
+  const withFork = "import { spawnSync, execSync, fork } from 'node:child_process';\n";
+  it.each([
+    "spawnSync('npm', ['--loglevel', 'silent', 'test']);",
+    "spawnSync('npm', ['--tag', 'x', 'test']);",
+    "spawnSync('nohup', ['npm', 'test']);",
+    "execSync('nohup npm test');",
+    "execSync(\"eval 'npm test'\");",
+    "spawnSync('NPM', ['test']);",
+    "fork('a.test.mjs', [], { execArgv: ['--test'] });",
+    "fork('a.test.mjs', { execArgv: flags });",
+    "spawnSync('node', ['--te' + 'st', 'a.test.mjs']);",
+    "spawnSync('n' + 'pm', ['test']);",
+    "spawnSync('node', [`--te${'st'}`]);",
+    "execSync('bash <<EOF\\nnpm test\\nEOF');",
+  ])('detects launcher / joined / fork spellings: %s', call => {
+    expect(findUngatedHeavySpawns(withFork + call)).toHaveLength(1);
+  });
+  it.each([
+    "execSync('git commit -m \"" + 'x'.repeat(17000) + "\"');",
+    "execSync('cat <<EOF\\nnpm test\\nEOF');",
+    "fork('worker.mjs', [], { execArgv: ['--max-old-space-size=4096'] });",
+    "fork('worker.mjs');",
+    "spawnSync('npm', ['--loglevel', 'silent', 'run', 'build']);",
+    "spawnSync('nohup', ['node', 'x.mjs']);",
+  ])('leaves long plain commands, heredoc data and plain forks alone: %s', call => {
+    expect(findUngatedHeavySpawns(withFork + call)).toEqual([]);
+  });
   it('resolves package scripts through the given table and fails closed when it is unreadable', () => {
     const call = "spawnSync('npm', ['run', 'ci:all']);";
     expect(findUngatedHeavySpawns(all + call, 's.mjs', { scripts: { 'ci:all': 'npm run lint && vitest run' } })).toHaveLength(1);

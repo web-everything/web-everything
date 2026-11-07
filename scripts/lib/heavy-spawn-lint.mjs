@@ -1,7 +1,7 @@
 /** Static admission lint for literal heavy child_process commands. No code is executed. */
 import { readFileSync } from 'node:fs';
 import ts from 'typescript';
-import { canonicalCommand, commandSubstitutionBodies, parseSegments, shellCString, shellTokens, ungatedHeavyRunKind } from '../guard-bash.mjs';
+import { canonicalCommand, commandSubstitutionBodies, heredocScan, parseSegments, shellCString, shellTokens, ungatedHeavyRunKind } from '../guard-bash.mjs';
 
 const SPAWNS = new Set(['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']);
 const quote = value => "'" + value.replaceAll("'", "'\\''") + "'";
@@ -42,16 +42,25 @@ function heavyCommand(command, { depth = 0, substitutions = true, scripts = pack
   if (depth > 8) return true; // fail closed on implausibly deep nesting
   const inner = (text, subs = true) => heavyCommand(text, { depth: depth + 1, substitutions: subs, scripts });
   // A shell expands `$( … )` / backticks before running the outer command, so their bodies are executed too.
-  if (substitutions) {
+  // Openers bound the body count from above; with none there is nothing to extract, so a long plain command
+  // (a big commit message, a heredoc write) is classified normally instead of tripping the length bound.
+  const openers = substitutions ? (command.match(/\$\(|`/g) || []).length : 0;
+  if (openers) {
     if (command.length > SUBSTITUTION_MAX_CHARS) return true;
-    // Openers bound the body count from above; checking them first keeps a deep nest off the quadratic extractor.
-    if ((command.match(/\$\(|`/g) || []).length > SUBSTITUTION_MAX_BODIES * 4) return true;
+    // Checking the opener count first keeps a deep nest off the quadratic extractor.
+    if (openers > SUBSTITUTION_MAX_BODIES * 4) return true;
     let bodies;
     try { bodies = commandSubstitutionBodies(command); } catch { return true; } // stack overflow on a pathological nest
     if (bodies.length > SUBSTITUTION_MAX_BODIES) return true;
     if (bodies.some(body => inner(body, false))) return true;
   }
-  return parseSegments(command).segments.some(segment => {
+  // Heredoc bodies are data for `cat <<EOF`, but a shell reading its script from one runs them (`bash <<EOF`).
+  // An unterminated scan keeps the raw text (fail closed). Substitutions in a body were already scanned above.
+  const heredocs = heredocScan(command);
+  const text = heredocs.unterminated ? command : heredocs.text;
+  if (!heredocs.unterminated && heredocs.heredocs.some(doc => /^(?:\S*\/)?(?:ba|da|z|k)?sh\b/.test(canonicalCommand(doc.head))
+    && inner(doc.body, false))) return true;
+  return parseSegments(text).segments.some(segment => {
     // The Bash guard's own classifier first: package test scripts (`npm test`, `npm --prefix . test`, `pnpm t`),
     // `node --test`, vitest and check-standards heads. The checks below add playwright and `sh -c` bodies.
     if (ungatedHeavyRunKind(segment)) return true;
@@ -213,6 +222,10 @@ export function findUngatedHeavySpawns(source, filename = 'source.mjs', { script
     if (!node) return '';
     if (nodeBinary(node)) return 'node';
     if (ts.isStringLiteralLike(node) || [ts.SyntaxKind.TemplateHead, ts.SyntaxKind.TemplateMiddle, ts.SyntaxKind.TemplateTail].includes(node.kind)) return node.text;
+    // String joins glue their parts with no space (`'--te' + 'st'`, `` `n${'pm'}` ``), as the runtime value does.
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) return literals(node.left, seen) + literals(node.right, seen);
+    if (ts.isTemplateExpression(node)) return node.head.text + node.templateSpans.map(span => literals(span.expression, seen) + span.literal.text).join('');
+    if (ts.isParenthesizedExpression(node)) return literals(node.expression, seen);
     if (ts.isPropertyAccessExpression(node)) return literals(node.expression, seen);
     if (ts.isIdentifier(node)) {
       const value = valueOf(node);
@@ -260,6 +273,16 @@ export function findUngatedHeavySpawns(source, filename = 'source.mjs', { script
     const shellOption = options?.properties.some(prop => ts.isPropertyAssignment(prop) && keyOf(prop.name) === 'shell'
       && prop.initializer.kind !== ts.SyntaxKind.FalseKeyword && !(ts.isStringLiteralLike(prop.initializer) && !prop.initializer.text));
     const shell = /^exec(?:Sync)?$/.test(method) || (method !== 'fork' && !!shellOption);
+    // fork runs `node <execArgv> <module> <args>`: `fork('a.test.mjs', [], { execArgv: ['--test'] })` is a test run.
+    // Without execArgv the module path is classified as before (a heavy entry module is still caught).
+    const execArgv = method === 'fork'
+      && options?.properties.find(prop => ts.isPropertyAssignment(prop) && keyOf(prop.name) === 'execArgv');
+    if (execArgv) {
+      const list = resolveValue(execArgv.initializer);
+      const flags = list && ts.isArrayLiteralExpression(list) ? list.elements.map(el => quote(literals(el).trim())).join(' ')
+        : "'--test'"; // an execArgv that cannot be read is treated as a test run (fail closed)
+      command = `node ${flags} ${quote(command)}`;
+    }
     if (!/^exec(?:Sync)?$/.test(method) && args && ts.isArrayLiteralExpression(args)) {
       // A spread of a resolvable array literal contributes its elements, not one joined word.
       const flat = (elements, seen) => elements.flatMap(el => {

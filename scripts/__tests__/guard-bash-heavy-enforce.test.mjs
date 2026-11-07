@@ -61,6 +61,8 @@ const ordinarySessionRuns = [
   // a pinned vitest version, exec wrappers, vitest's own entry script, separate-valued node options
   'pnpm vitest run a.test.mjs', 'yarn vitest run a.test.mjs', 'bun vitest run a.test.mjs',
   'npm -s test', 'npm --silent test -- a.test.mjs', 'npm --prefix . test', 'npm -w x test -- a.test.mjs',
+  // npm config options with a separate value before the subcommand (self-review #6461 round 3)
+  'npm --loglevel silent test', 'npm --tag x test -- a.test.mjs',
   'npx vitest@latest run a.test.mjs', 'npx -y vitest@2 run a.test.mjs',
   'timeout 300 npx vitest run a.test.mjs', 'timeout -s KILL 300 npx vitest run a.test.mjs',
   'nice -n 5 npx vitest run a.test.mjs', 'nice -5 npx vitest run a.test.mjs',
