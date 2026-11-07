@@ -1276,6 +1276,44 @@ describe('runSessionWatchdogPass — reaping with hermetic IO', () => {
     expect(calls.logs.join(' ')).not.toContain('secret-owner');
   });
 
+  it.each([
+    ['stale-by-age', -48 * 60 * MIN, 'finished'], ['future-dated', 60 * MIN, 'finished'],
+    ['stale-by-age', -48 * 60 * MIN, 'duplicate'], ['future-dated', 60 * MIN, 'duplicate'],
+  ])('a %s spawn link (%d ms offset) needs a matching ended-parent marker before a %s stop', (_age, offset, mode) => {
+    const old = listing();
+    const keeper = listing({ id: 'keeper', sessionId: 'sid-keeper', startedAt: T0 - 60 * MIN });
+    const tail = mode === 'finished' ? finishedTail() : summarizeTail(bash('git status --short', T0 - 15 * MIN), { nowMs: T0 });
+    for (const ended of [false, true]) {
+      const chatSpawnGuardFor = makeStopChatSpawnGuardResolver({
+        spawnsDir: 'spawn-links', endedDir: 'chat-ended', now: () => T0,
+        readFileSyncFn: path => {
+          if (path === join('spawn-links', 'sid-1.json')) return JSON.stringify({
+            v: 1, spawnedSessionId: 'sid-1', spawnedByChatSessionId: 'parent-A', recordedAt: new Date(T0 + offset).toISOString(),
+          });
+          if (ended) return JSON.stringify({ chatSessionId: 'parent-A' });
+          throw Object.assign(new Error('missing marker'), { code: 'ENOENT' });
+        },
+      });
+      const { calls, actions } = base({ agents: mode === 'finished' ? [old] : [old, keeper], readTail: () => tail, chatSpawnGuardFor });
+      expect(calls.stop).toEqual(ended ? [old.id] : []);
+      expect(calls.reapEvents).toHaveLength(ended ? 1 : 0);
+      expect(actions).toEqual([expect.objectContaining(ended ? { mode, ok: true } : { detail: 'refused: chat-spawn guarded' })]);
+    }
+  });
+
+  it.each(['another-session', null, undefined])('a link naming spawnedSessionId=%s cannot unblock the candidate with its ended parent', (spawnedSessionId) => {
+    const chatSpawnGuardFor = makeStopChatSpawnGuardResolver({
+      spawnsDir: 'spawn-links', endedDir: 'chat-ended', now: () => T0,
+      readFileSyncFn: path => path === join('spawn-links', 'sid-1.json') ? JSON.stringify({
+        v: 1, spawnedSessionId, spawnedByChatSessionId: 'parent-A', recordedAt: new Date(T0).toISOString(),
+      }) : JSON.stringify({ chatSessionId: 'parent-A' }),
+    });
+    const { calls, actions } = base({ chatSpawnGuardFor });
+    expect(calls.stop).toEqual([]);
+    expect(calls.reapEvents).toEqual([]);
+    expect(actions).toEqual([expect.objectContaining({ detail: 'refused: chat-spawn guarded' })]);
+  });
+
   it('report-only plans the stop with ok:null and never calls stop or appends a reap event', () => {
     const { calls, actions } = base({ act: false });
     expect(actions).toEqual([expect.objectContaining({ type: 'stop-session', ok: null })]);

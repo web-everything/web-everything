@@ -653,14 +653,18 @@ export function makeStopAwaitingVerifyResolver({
   };
 }
 
-/** Keep the reaper's chat policy, but refuse stops when its tolerant readers swallowed an IO failure. */
+/** Stop-only chat policy: bind the child and parent, require an ended marker, and refuse unreadable evidence. */
 export function makeStopChatSpawnGuardResolver({ readFileSyncFn = readFileSync, ...options } = {}) {
   let unreadable = false;
   let readingLink = true;
   let parent = null;
   let markerMismatch = false;
+  let candidateId = null;
+  let linkMismatch = false;
   const guardFor = makeChatSpawnGuardResolver({
     ...options,
+    // In this stop path, age and clock skew cannot substitute for a matching ended-parent marker.
+    ceilingMs: null,
     readFileSyncFn: (...args) => {
       let text;
       try { text = readFileSyncFn(...args); }
@@ -671,7 +675,11 @@ export function makeStopChatSpawnGuardResolver({ readFileSyncFn = readFileSync, 
       let record = null;
       try { record = JSON.parse(text); } catch { /* The reaper also parses this record. */ }
       // The resolver reads the spawn link first, then the linked parent's ended marker, if any.
-      if (readingLink) { parent = record?.spawnedByChatSessionId; readingLink = false; }
+      if (readingLink) {
+        parent = record?.spawnedByChatSessionId;
+        linkMismatch = typeof record?.spawnedSessionId !== 'string' || record.spawnedSessionId !== candidateId;
+        readingLink = false;
+      }
       else markerMismatch = !parent || record?.chatSessionId !== parent;
       return text;
     },
@@ -681,8 +689,12 @@ export function makeStopChatSpawnGuardResolver({ readFileSyncFn = readFileSync, 
     readingLink = true;
     parent = null;
     markerMismatch = false;
+    candidateId = session?.sessionId;
+    linkMismatch = false;
     const guard = guardFor(session);
-    return unreadable ? null : markerMismatch ? { blocked: true, reason: 'chat-ended-marker-mismatch' } : guard;
+    if (unreadable) return null;
+    if (linkMismatch) return { blocked: true, reason: 'chat-spawn-link-mismatch' };
+    return markerMismatch ? { blocked: true, reason: 'chat-ended-marker-mismatch' } : guard;
   };
 }
 
