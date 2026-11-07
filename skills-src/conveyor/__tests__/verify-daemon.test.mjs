@@ -146,8 +146,10 @@ describe('createVerifyWakeSleep + verify request handoff — real filesystem con
   });
 
   it('verifyHandoffDir defaults to ~/.claude/conveyor/verify-handoff when the override is absent', () => {
-    vi.stubEnv('WE_VERIFY_HANDOFF_DIR', undefined);
-    expect(verifyHandoffDir()).toBe(join(homedir(), '.claude', 'conveyor', 'verify-handoff'));
+    const saved = process.env.WE_VERIFY_HANDOFF_DIR;
+    delete process.env.WE_VERIFY_HANDOFF_DIR;
+    try { expect(verifyHandoffDir()).toBe(join(homedir(), '.claude', 'conveyor', 'verify-handoff')); }
+    finally { if (saved !== undefined) process.env.WE_VERIFY_HANDOFF_DIR = saved; }
   });
 
   it('verify-lane request imports signalVerifyRequest and calls it before emitting requested', () => {
@@ -161,6 +163,137 @@ describe('createVerifyWakeSleep + verify request handoff — real filesystem con
     const emitAt = branch.search(/\bemit\s*\(/);
     expect(signalAt).toBeGreaterThanOrEqual(0);
     expect(emitAt).toBeGreaterThan(signalAt);
+  });
+});
+
+describe('createVerifyWakeSleep — deterministic scheduling guarantees', () => {
+  let dir, watchers, notify, watchDir, log;
+
+  beforeEach(() => {
+    vi.useFakeTimers({ now: 0 });
+    dir = mkdtempSync(join(tmpdir(), 'verify-wake-scheduler-'));
+    watchers = [];
+    log = vi.fn();
+    watchDir = vi.fn((_dir, check) => {
+      notify = check;
+      const watcher = new EventEmitter();
+      watcher.close = vi.fn();
+      watchers.push(watcher);
+      return watcher;
+    });
+  });
+
+  afterEach(() => {
+    unwatchFile(join(dir, 'wake'));
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const request = async () => {
+    expect(signalVerifyRequest({ dir, log })).toBe(true);
+    notify(); // Inject the directory event; mailbox reads and scheduler timers remain real code.
+    await vi.advanceTimersByTimeAsync(0);
+  };
+  const wakeSleep = (options = {}) => createVerifyWakeSleep({
+    dir, debounceMs: 40, statPollMs: 60_000, watchDir, log, ...options,
+  });
+
+  it('burst debounce waits a full quiet window after the final request and coalesces to one wake', async () => {
+    const sleep = wakeSleep();
+    const settled = vi.fn();
+    const pending = sleep(200).then(settled);
+    await vi.advanceTimersByTimeAsync(10);
+    await request();
+    await vi.advanceTimersByTimeAsync(20);
+    await request();
+    await vi.advanceTimersByTimeAsync(20);
+    await request();
+    await vi.advanceTimersByTimeAsync(39);
+    expect(settled).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await pending;
+    expect(Date.now()).toBe(90);
+    expect(settled.mock.calls).toEqual([['handoff']]);
+
+    settled.mockClear();
+    const following = sleep(80).then(settled);
+    await vi.advanceTimersByTimeAsync(79);
+    expect(settled).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await following;
+    expect(settled.mock.calls).toEqual([['interval']]);
+    expect(watchers.every(watcher => watcher.close.mock.calls.length === 1)).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('continuous requests cannot extend waking beyond the original interval deadline', async () => {
+    const sleep = wakeSleep();
+    const settled = vi.fn();
+    const pending = sleep(100).then(settled);
+    await vi.advanceTimersByTimeAsync(10);
+    await request();
+    await vi.advanceTimersByTimeAsync(30);
+    await request();
+    await vi.advanceTimersByTimeAsync(30);
+    await request();
+    await vi.advanceTimersByTimeAsync(25);
+    await request();
+    await vi.advanceTimersByTimeAsync(4);
+    expect(settled).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await pending;
+    expect(Date.now()).toBe(100);
+    expect(settled.mock.calls).toEqual([['handoff']]);
+    expect(watchers.every(watcher => watcher.close.mock.calls.length === 1)).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(['throws', 'emits error'])('watcher failure (%s) preserves the deadline and all subsequent sleeps use only the timer', async failure => {
+    const unavailable = vi.fn(() => {
+      if (failure === 'throws') throw new Error('watcher unavailable');
+      const watcher = new EventEmitter();
+      watcher.close = vi.fn();
+      watchers.push(watcher);
+      setTimeout(() => watcher.emit('error', new Error('watcher unavailable')), 10);
+      return watcher;
+    });
+    const intervalFallback = vi.fn(realSleep);
+    const sleep = wakeSleep({ watchDir: unavailable, intervalFallback });
+    const settled = vi.fn();
+    const pending = sleep(100).then(settled);
+    await vi.advanceTimersByTimeAsync(99);
+    expect(settled).not.toHaveBeenCalled();
+    expect(intervalFallback).toHaveBeenCalledWith(failure === 'throws' ? 100 : 90);
+    await vi.advanceTimersByTimeAsync(1);
+    await pending;
+    expect(Date.now()).toBe(100);
+    expect(settled.mock.calls).toEqual([['interval']]);
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][0]).toMatch(/watcher failed.*interval timer/);
+
+    // Even a pending mailbox signal cannot restart watching after a failure.
+    expect(signalVerifyRequest({ dir, log })).toBe(true);
+    settled.mockClear();
+    const second = sleep(60).then(settled);
+    await vi.advanceTimersByTimeAsync(59);
+    expect(settled).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await second;
+    expect(settled.mock.calls).toEqual([['interval']]);
+
+    settled.mockClear();
+    const third = sleep(40).then(settled);
+    await vi.advanceTimersByTimeAsync(39);
+    expect(settled).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await third;
+    expect(settled.mock.calls).toEqual([['interval']]);
+    expect(intervalFallback.mock.calls).toEqual([[failure === 'throws' ? 100 : 90], [60], [40]]);
+    expect(unavailable).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(watchers.every(watcher => watcher.close.mock.calls.length === 1)).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 
