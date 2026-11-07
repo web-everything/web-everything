@@ -429,26 +429,67 @@ describe('lane deps hashing and readiness (real lane directory)', () => {
       expect(exec).not.toHaveBeenCalled();
       expect(existsSync(join(dir, 'node_modules', 'kept'))).toBe(true);
     });
-    describe('a claim whose lease expires before the removal stops the wipe (an expired lease can be reclaimed)', () => {
+    it('our own lease with under 30 minutes left is not claimed (the install could outlast it): lane kept', () => {
+      const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
+      writeLease(dir, { ...fresh, ttlMinutes: 20, pid: process.pid });
+      const exec = vi.fn();
+      expect(migrate(dir, markerPath, storeDir, exec)).toBe('ok');
+      expect(exec).not.toHaveBeenCalled();
+      expect(existsSync(join(dir, 'node_modules', 'kept'))).toBe(true);
+    });
+    describe('a claim that is expired or about to expire never removes or stamps (an expired lease can be reclaimed)', () => {
       afterEach(() => { vi.useRealTimers(); });
-      const expireInWindow = () => { vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(Date.now() + 31 * 60_000); };
-      it('our own acquire lease expiring between the final check and the removal', () => {
+      const advance = minutes => () => { vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(Date.now() + minutes * 60_000); };
+      const ownLease = dir => writeLease(dir, { ...fresh, ttlMinutes: 60, pid: process.pid });
+      it('our own acquire lease expired between the final check and the removal', () => {
         const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
-        writeLease(dir, { ...fresh, ttlMinutes: 30, pid: process.pid });
+        ownLease(dir);
         const exec = vi.fn();
-        const selectPlan = () => windowPlan(select({ storeDir }), expireInWindow);
+        const selectPlan = () => windowPlan(select({ storeDir }), advance(61));
         expect(ensureLaneDeps({ dir, markerPath, storeDir, selectPlan, exec })).toBe('ok');
         expect(exec).not.toHaveBeenCalled();
         expect(existsSync(join(dir, 'node_modules', 'kept'))).toBe(true);
       });
-      it('our migration claim (30 min TTL) expiring between the final check and the removal', () => {
+      it('a lease with under 5 minutes left at the removal (not yet expired) is refused too', () => {
         const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
+        ownLease(dir);
         const exec = vi.fn();
-        const selectPlan = () => windowPlan(select({ storeDir }), expireInWindow);
+        const selectPlan = () => windowPlan(select({ storeDir }), advance(57));
         expect(ensureLaneDeps({ dir, markerPath, storeDir, selectPlan, exec })).toBe('ok');
         expect(exec).not.toHaveBeenCalled();
         expect(existsSync(join(dir, 'node_modules', 'kept'))).toBe(true);
-        expect(existsSync(leaseFile(dir))).toBe(false); // our own expired claim is still cleaned up
+      });
+      it('our migration claim expired between the final check and the removal; the claim is still cleaned up', () => {
+        const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
+        const exec = vi.fn();
+        const selectPlan = () => windowPlan(select({ storeDir }), advance(61));
+        expect(ensureLaneDeps({ dir, markerPath, storeDir, selectPlan, exec })).toBe('ok');
+        expect(exec).not.toHaveBeenCalled();
+        expect(existsSync(join(dir, 'node_modules', 'kept'))).toBe(true);
+        expect(existsSync(leaseFile(dir))).toBe(false);
+      });
+      it('the migration claim is granted for longer than one pnpm plus one npm install (60 minutes)', () => {
+        const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
+        let ttl = null;
+        const exec = vi.fn(() => { ttl = JSON.parse(readFileSync(leaseFile(dir), 'utf8')).ttlMinutes; mkdirSync(join(dir, 'node_modules')); });
+        expect(migrate(dir, markerPath, storeDir, exec)).toBe('installed');
+        expect(ttl).toBe(60);
+      });
+      it('a holder that expires DURING the install (resumes later) stamps no marker and reports stale', () => {
+        const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
+        ownLease(dir);
+        const exec = vi.fn(() => { mkdirSync(join(dir, 'node_modules')); advance(61)(); });
+        expect(ensureLaneDeps({ dir, markerPath, storeDir, selectPlan: () => select({ storeDir }), exec })).toBe('stale');
+        expect(exec).toHaveBeenCalledOnce();
+        expect(existsSync(markerPath)).toBe(false);
+        expect(existsSync(markerPath + '.pnpm-failed')).toBe(false);
+      });
+      it('a foreign lease that took over DURING the install keeps its lane unstamped and untouched', () => {
+        const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
+        const exec = vi.fn(() => { mkdirSync(join(dir, 'node_modules')); writeLease(dir, { ...fresh, pid: process.pid + 1 }); });
+        expect(ensureLaneDeps({ dir, markerPath, storeDir, selectPlan: () => select({ storeDir }), exec })).toBe('stale');
+        expect(existsSync(markerPath)).toBe(false);
+        expect(leasePid(dir)).toBe(process.pid + 1);
       });
     });
     it('an unleased lane is claimed with an exclusive lease for the whole migration, then released', () => {

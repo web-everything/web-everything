@@ -208,13 +208,21 @@ export function hasForeignLiveLease(dir, nowMs = Date.now()) {
  * like lane-lease.mjs. A lease that is not fresh can be reclaimed by another acquire at any moment, so it
  * protects nothing: no removal may rely on it.
  */
-function isLeaseFresh(lease, nowMs) {
+function isLeaseFresh(lease, nowMs, marginMs = 0) {
   const acquired = Date.parse(lease.acquiredAt);
   if (Number.isNaN(acquired)) return false;
   const renewed = Date.parse(lease.renewedAt);
   const ttl = Number.isFinite(lease.ttlMinutes) ? lease.ttlMinutes * 60_000 : 240 * 60_000;
-  return nowMs - (Number.isNaN(renewed) ? acquired : Math.max(acquired, renewed)) < ttl;
+  return nowMs - (Number.isNaN(renewed) ? acquired : Math.max(acquired, renewed)) < ttl - marginMs;
 }
+
+// An install is bounded (a pnpm attempt, then an npm fallback, each under NPM_INSTALL_TIMEOUT_MS = 10 min), and the
+// claim is never renewed, so a claim must outlast all of it. The migration claim lasts CLAIM_TTL_MINUTES; our own
+// acquire lease is claimed only while it has MIN_CLAIM_REMAINING_MS left (else the lane is left as it is, never
+// started and abandoned). A removal needs REMOVAL_MARGIN_MS of lease left, so an expiry cannot land during it.
+const CLAIM_TTL_MINUTES = 60;
+const MIN_CLAIM_REMAINING_MS = 30 * 60_000;
+const REMOVAL_MARGIN_MS = 5 * 60_000;
 
 /**
  * Claim a lane for an install or migration, so no other process can take it between our last lease check and
@@ -241,14 +249,14 @@ export function claimLaneForInstall(dir, nowMs = Date.now()) {
   // between our last check and the removal, so `holds()` is false (fail closed) once the lease is not fresh.
   if (existsSync(file)) {
     const lease = read();
-    return lease && !lease.reserved && lease.pid === process.pid && isLeaseFresh(lease, nowMs)
-      ? { holds: () => { const now = read(); return !!now && !now.reserved && now.pid === process.pid && isLeaseFresh(now, Date.now()); }, release: () => {} }
+    return lease && !lease.reserved && lease.pid === process.pid && isLeaseFresh(lease, nowMs, MIN_CLAIM_REMAINING_MS)
+      ? { holds: (marginMs = 0) => { const now = read(); return !!now && !now.reserved && now.pid === process.pid && isLeaseFresh(now, Date.now(), marginMs); }, release: () => {} }
       : null;
   }
   const token = randomUUID();
   const body = JSON.stringify({
     session: 'lane-deps-migration', purpose: 'deps-migration', acquiredAt: new Date(nowMs).toISOString(),
-    ttlMinutes: 30, host: null, pid: process.pid, ownerSession: null, workflowLane: false, depsMigration: token,
+    ttlMinutes: CLAIM_TTL_MINUTES, host: null, pid: process.pid, ownerSession: null, workflowLane: false, depsMigration: token,
   }) + '\n';
   const temp = `${file}.tmp-${process.pid}-${token}`;
   try {
@@ -259,7 +267,7 @@ export function claimLaneForInstall(dir, nowMs = Date.now()) {
   } finally {
     rmSync(temp, { force: true });
   }
-  const mine = () => { const now = read(); return now?.depsMigration === token && isLeaseFresh(now, Date.now()); };
+  const mine = (marginMs = 0) => { const now = read(); return now?.depsMigration === token && isLeaseFresh(now, Date.now(), marginMs); };
   const stillOurs = () => read()?.depsMigration === token;
   return { holds: mine, release: () => { if (stillOurs()) rmSync(file, { force: true }); } };
 }
@@ -317,12 +325,12 @@ function installLaneDeps({ dir, markerPath, storeDir, plan, claim, unchanged, ex
     }
   }
   // Last check before anything is touched: a process that replaced our claim owns the lane now.
-  if (claim && !claim.holds()) {
-    log('lane claimed by another process before migration; leaving deps as they are');
+  if (claim && !claim.holds(REMOVAL_MARGIN_MS)) {
+    log('lane claimed by another process (or its lease is about to expire) before migration; leaving deps as they are');
     return unchanged;
   }
   const assertHeld = () => {
-    if (claim && !claim.holds()) throw new Error('lane claimed by another process during migration: ' + dir);
+    if (claim && !claim.holds(REMOVAL_MARGIN_MS)) throw new Error('lane claim lost or expiring during migration: ' + dir);
   };
   const result = runDepsInstaller({
     plan, hashFor: backend => lockHash(dir, backend, storeDir), marker: readMarker(markerPath),
@@ -338,6 +346,12 @@ function installLaneDeps({ dir, markerPath, storeDir, plan, claim, unchanged, ex
     return 'stale';
   }
   if (result.state === 'installed') {
+    // An expired holder that resumes must not stamp a marker over a lane another acquire may now own: stamp nothing
+    // and the lane stays stale, so the next acquire reinstalls.
+    if (claim && !claim.holds()) {
+      log('lane claim lost during install; leaving deps stale');
+      return 'stale';
+    }
     if (wantedPnpm && result.backend === 'npm') {
       writeFileSync(failedPath, lockHash(dir, 'npm'));
     }
