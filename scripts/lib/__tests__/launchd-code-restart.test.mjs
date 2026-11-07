@@ -1289,6 +1289,24 @@ describe('interpreter option shapes that once hid a clone script (value contains
       expect(o.states.get(label)).toEqual(reowed);
       expect(o.launchctl).toHaveBeenCalledTimes(1);
     });
+    it("clone A's same-sha skip never clears clone B's owed marker", async () => {
+      const clock = { t: 1_000_000 }, o = cooled(clock), cloneB = resolve('..', 'clone-b');
+      o.states.set(label, { at: 1_000_000, sha: 'X', pendingSha: 'B1', pendingRoot: cloneB, pendingGen: 'g1' });
+      clock.t += 1000;
+      const r = await restartServicesForClone({ ...o, adoptedSha: 'X' });
+      expect(r.skipped).toEqual([expect.objectContaining({ reason: 'same-adopted-sha' })]);
+      expect(o.states.get(label)).toEqual({ at: 1_000_000, sha: 'X', pendingSha: 'B1', pendingRoot: cloneB, pendingGen: 'g1' });
+    });
+    it("clone A's debounced deferral never overwrites clone B's owed marker, and says so", async () => {
+      const clock = { t: 1_000_000 }, o = cooled(clock), cloneB = resolve('..', 'clone-b');
+      const bMarker = { at: 1_000_000, sha: 'X', pendingSha: 'B1', pendingRoot: cloneB, pendingGen: 'g1' };
+      o.states.set(label, bMarker);
+      clock.t += 1000;
+      const r = await restartServicesForClone({ ...o, adoptedSha: 'A1' });
+      expect(r.skipped).toEqual([expect.objectContaining({ reason: 'debounced' })]);
+      expect(r.flagged).toEqual([expect.objectContaining({ reason: expect.stringMatching(/restart-owed-by-other-clone/) })]);
+      expect(o.states.get(label)).toEqual(bMarker);
+    });
     it('cleanup still clears the marker it consumed (owner, sha, anchor and generation match)', async () => {
       const clock = { t: 1_000_000 }, o = cooled(clock);
       await restartServicesForClone({ ...o, adoptedSha: 'A' });

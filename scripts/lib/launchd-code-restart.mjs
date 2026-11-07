@@ -680,13 +680,17 @@ export async function restartServicesForClone({ settings, platform, env = proces
           // Remember the restart we owe: a later tick retries it once the cooldown has passed.
           // A newer adoption simply replaces the owed sha; a successful restart clears it.
           // Each deferral gets its own generation, so cleanup can tell this marker from a later rewrite.
-          if (!owed) await stateStore.set(label, { ...previous, pendingSha: adoptedSha, pendingRoot: options.cloneRoot, pendingGen: randomBytes(6).toString('hex') });
+          // The state holds one marker per label: never overwrite another clone's owed restart. Say so instead.
+          const foreign = previous.pendingSha !== undefined && previous.pendingRoot !== undefined && previous.pendingRoot !== options.cloneRoot;
+          if (!owed && !foreign) await stateStore.set(label, { ...previous, pendingSha: adoptedSha, pendingRoot: options.cloneRoot, pendingGen: randomBytes(6).toString('hex') });
           if (!owed) report('skipped', service, reason);
+          if (!owed && foreign) report('flagged', service, 'restart-owed-by-other-clone: another clone already owes this label a restart; inspect and restart the service by hand if it is not retried');
           continue;
         }
         if (reason) {
           // Already running the adopted sha (e.g. A, B deferred, then back to A): nothing is owed any more.
-          if (previous.pendingSha !== undefined) await settle(label, previous, true);
+          // Only this clone's own marker: another clone's owed restart is not consumed by our same-sha skip.
+          if (previous.pendingSha !== undefined && (previous.pendingRoot === undefined || previous.pendingRoot === options.cloneRoot)) await settle(label, previous, true);
           if (!owed) report('skipped', service, reason);
           continue;
         }
