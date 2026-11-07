@@ -17,10 +17,34 @@ const defaultRun = (cmd, args) => execFileSyncThrottled(cmd, args, { encoding: '
 function defaultReadNumstat({ repo, pr, run }) {
   // A repo-less read would be implicit; callers always pass the slug, so no repo is unmeasurable (fails closed).
   if (!repo) throw new Error('size evidence needs an explicit repo');
-  const text = run('gh', ['api', '--paginate', `repos/${repo}/pulls/${pr}/files`, '--jq', '.[]|"\\(.additions)\\t\\(.deletions)\\t\\(.filename)"']);
+  const text = run('gh', ['api', '--paginate', `repos/${repo}/pulls/${pr}/files`, '--jq', FILES_JQ]);
+  return filesToNumstat(text);
+}
+/** One compact JSON object per file; `hasPatch` lets the reader tell a binary file from a measured zero. */
+export const FILES_JQ = '.[]|{additions,deletions,filename,hasPatch:(.patch != null)}|tojson';
+/**
+ * Convert the files-API rows to numstat text. The API reports binary files (and deletions of them) as 0/0 with no
+ * patch, which git numstat spells `-\t-`: a zero-change row with no patch is unmeasurable, never a zero-sized diff.
+ * Any row that is not exactly well-formed throws (the caller falls back to human review).
+ */
+// Controls, DEL, U+2028/2029 and quotes in a path could forge numstat rows or break the tab-delimited framing.
+const UNSAFE_PATH_CHARS = new RegExp('[\\u0000-\\u001f\\u007f\\u2028\\u2029"]');
+export function filesToNumstat(text) {
+  if (typeof text !== 'string') throw new Error('incomplete PR files');
+  if (!text) return '';
+  if (!text.endsWith('\n')) throw new Error('truncated PR files');
+  const lines = text.slice(0, -1).split('\n');
   // The files endpoint silently caps evidence at 3000 files.
-  if (typeof text !== 'string' || text.split('\n').filter(Boolean).length >= 3000) throw new Error('incomplete PR files');
-  return text;
+  if (lines.length >= 3000) throw new Error('incomplete PR files');
+  return lines.map(line => {
+    const row = JSON.parse(line);
+    const { additions, deletions, filename, hasPatch } = row ?? {};
+    const count = n => Number.isSafeInteger(n) && n >= 0;
+    if (!count(additions) || !count(deletions) || typeof filename !== 'string' || !filename || UNSAFE_PATH_CHARS.test(filename) || typeof hasPatch !== 'boolean') {
+      throw new Error('unreadable PR file row');
+    }
+    return `${!hasPatch && additions + deletions === 0 ? '-\t-' : `${additions}\t${deletions}`}\t${filename}\n`;
+  }).join('');
 }
 export const FIX_PUSH_RED_CI_LABELS = Object.freeze(['ci:failed', 'status:ci-red']);
 export const FIX_PUSH_FIXER_LABELS = Object.freeze(['status:fixing', 'status:takeover-running']);
