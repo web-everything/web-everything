@@ -286,7 +286,7 @@ export function seedFromReviewComments(comments) {
     else if (isControlComment(body)) latest = { kind: 'control', body }; // re-arm / stand-down / escalation / hold: not an accept
   }
   if (latest?.kind !== 'accept') return null;
-  let open = null, found = null; // open = { ch, len } of the fence we are inside
+  let open = null, found = null, depth = 0; // open = { ch, len } of the fence we are inside; depth = open HTML <blockquote> count
   for (const line of latest.body.split(/\r?\n/).slice(0, 12)) {
     const f = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line); // CommonMark: at most 3 spaces of indent (4+ is an indented code block, not a fence)
     if (open) {
@@ -297,6 +297,11 @@ export function seedFromReviewComments(comments) {
     // A backtick fence's info string cannot contain a backtick (that is inline code, not a fence).
     if (f && !(f[1][0] === '`' && f[2].includes('`'))) { open = { ch: f[1][0], len: f[1].length }; continue; }
     if (/^\s*>/.test(line)) continue;
+    // HTML blockquotes quote like Markdown ones: a marker inside one (depth > 0) is quoted text, and the tag lines themselves never carry a marker.
+    // Tags are counted in order, case-insensitively, several per line; a stray closer never goes below 0, an unclosed opener quotes the rest.
+    let tagLine = false;
+    for (const t of line.matchAll(/<(\/?)blockquote(?=[\s/>]|$)/gi)) { tagLine = true; depth = t[1] ? Math.max(0, depth - 1) : depth + 1; }
+    if (tagLine || depth > 0) continue;
     const m = MARKER_LINE.exec(line);
     if (m) found = m[1];
   }

@@ -457,6 +457,34 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     expect(readFileSync(log, 'utf8')).toBe(logBefore);
     expect(readFileSync(map, 'utf8')).toBe(mapBefore);
   });
+  it('pre-index PR: a reviewed-sha marker inside an HTML blockquote is quoted text and never seeds the head', () => {
+    const [A, B] = ['1'.repeat(40), '2'.repeat(40)];
+    const mk = body => [{ viewerDidAuthor: true, body }];
+    const m = s => `<!-- reviewed-sha: ${s} -->`;
+    const head = `✅ review — accepted\n\nRecorded by bot.\n`;
+    const idx = readHeadIndex({ dir });
+    // exact operator repro: A outside, B inside <blockquote>
+    const body = `${head}${m(A)}\n<blockquote>\n${m(B)}\n</blockquote>\n`;
+    const seed = seedFromReviewComments(mk(body));
+    expect(seed?.lastReviewedHead).toBe(A);
+    expect(headReviewOwed({ index: idx, repo: 'o/r', pr: 5, head: B, seed: null }).owed).toBe(true);
+    expect(headReviewOwed({ index: idx, repo: 'o/r', pr: 5, head: B, seed })).toMatchObject({ owed: true, reason: 'new-head', lastReviewedHead: A });
+    // B only inside a blockquote: no seed at all
+    for (const [name, text] of Object.entries({
+      single: `<blockquote>\n${m(B)}\n</blockquote>`,
+      nested: `<blockquote>\n<blockquote>\n${m(B)}\n</blockquote>\n${m(B)}\n</blockquote>`, // inner closer leaves depth 1
+      'same-line pair then marker outside is allowed only after close': `<blockquote>x</blockquote><blockquote>\n${m(B)}\n</blockquote>`,
+      'uppercase / attributes': `<BLOCKQUOTE class="q">\n${m(B)}\n</BlockQuote >`,
+      'unclosed quotes the rest': `<blockquote>\n${m(B)}`,
+      'two openers on one line': `<blockquote><blockquote>\n${m(B)}\n</blockquote>\n${m(B)}\n</blockquote>`,
+    })) expect(seedFromReviewComments(mk(`${head}${text}\n`)), name).toBeNull();
+    // same-line open+close does not leave a depth behind: a marker after it still seeds
+    expect(seedFromReviewComments(mk(`${head}<blockquote>quoted</blockquote>\n${m(A)}\n`))?.lastReviewedHead).toBe(A);
+    // a stray closer does not go negative: the marker after it still seeds, and a later opener still quotes
+    expect(seedFromReviewComments(mk(`${head}</blockquote>\n${m(A)}\n<blockquote>\n${m(B)}\n</blockquote>\n`))?.lastReviewedHead).toBe(A);
+    // a tag in prose that is not a blockquote element does not quote
+    expect(seedFromReviewComments(mk(`${head}<blockquotes>\n${m(A)}\n`))?.lastReviewedHead).toBe(A);
+  });
   it('pre-index PR: seeds only from an accept-shaped verdict with a whole-line marker; anything else is owed', () => {
     const mk = body => [{ viewerDidAuthor: true, body }];
     const good = `✅ review — accepted\n\nRecorded by bot.\n<!-- reviewed-sha: ${H(3)} -->\n`;
