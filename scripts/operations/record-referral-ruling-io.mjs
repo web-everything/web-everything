@@ -1,4 +1,4 @@
-import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
+import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readFindingClassPolicy } from '../lib/finding-class-policy.mjs';
 import { landPreventionCard as defaultLandPreventionCard, runCardDedupe } from './land-prevention-card.mjs';
 /**
@@ -160,10 +160,14 @@ export function readCardRulingFileMode({ env = process.env, tool, log = line => 
   if (tool !== undefined && Object.hasOwn(tool, 'cardRulingFileMode') && !MODES.includes(tool.cardRulingFileMode)) {
     throw new Error('invalid cardRulingFileMode in tool settings: use two-step or one-call');
   }
-  const platformBlock = platformPreference('cardRuling', { env });
-  if (platformBlock && typeof platformBlock === 'object' && Object.hasOwn(platformBlock, 'cardRulingFileMode')
-    && !MODES.includes(platformBlock.cardRulingFileMode)) {
-    throw new Error('invalid cardRulingFileMode in platform settings: use two-step or one-call');
+  const { prefs, errors } = readPlatformPreferences({ env });
+  if (errors?.length) throw new Error(`unreadable platform settings: ${errors.join('; ')}`);
+  if (prefs && Object.hasOwn(prefs, 'cardRuling')) {
+    const block = prefs.cardRuling;
+    if (!block || typeof block !== 'object' || Array.isArray(block)
+      || (Object.hasOwn(block, 'cardRulingFileMode') && !MODES.includes(block.cardRulingFileMode))) {
+      throw new Error('invalid cardRuling platform settings: cardRulingFileMode must be two-step or one-call');
+    }
   }
   const resolved = cascadePolicy('cardRuling', tool, {
     standard: { cardRulingFileMode: 'two-step' }, env, log,

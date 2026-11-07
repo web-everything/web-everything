@@ -810,3 +810,26 @@ describe('cardRulingFileMode rejects non-enum layer values, even empty objects',
     expect(() => readCardRulingFileMode({ env: {}, tool: { cardRulingFileMode: 'both' }, log: () => {} })).toThrow(/tool settings/);
   });
 });
+
+describe('cardRulingFileMode rejects malformed platform blocks', () => {
+  it.each([['"unsafe"'], ['null'], ['[]'], ['{"cardRulingFileMode":"both"}'], ['{"cardRulingFileMode":{}}']])('platform cardRuling=%s throws', async (block) => {
+    const { readCardRulingFileMode } = await import('../record-referral-ruling-io.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'crfm-'));
+    const file = join(dir, 'prefs.json');
+    writeFileSync(file, `{"cardRuling":${block}}`);
+    try {
+      expect(() => readCardRulingFileMode({ env: { WE_PLATFORM_PREFERENCES_FILE: file }, log: () => {} })).toThrow(/cardRuling|cardRulingFileMode/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('a valid platform value resolves with its source', async () => {
+    const { readCardRulingFileMode } = await import('../record-referral-ruling-io.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'crfm-'));
+    const file = join(dir, 'prefs.json');
+    writeFileSync(file, '{"cardRuling":{"cardRulingFileMode":"one-call"}}');
+    try {
+      const r = readCardRulingFileMode({ env: { WE_PLATFORM_PREFERENCES_FILE: file }, log: () => {} });
+      expect(r.value).toBe('one-call');
+      expect(r.source).toMatch(/platform/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
