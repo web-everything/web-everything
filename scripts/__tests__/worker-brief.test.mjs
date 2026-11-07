@@ -28,6 +28,10 @@ describe('renderWorkerBrief', () => {
     expect(paths[0].toLowerCase()).not.toBe(paths[1].toLowerCase());
   });
 
+  it('carries the R662 no-bypass-flags rule', () => {
+    expect(renderWorkerBrief(params)).toContain('Never use bypass/skip flags (--skipPrePrReview, RAW_PR_CREATE_OK, WE_LAND_UNVERIFIED, WE_PR_OPEN_SOAK_PRECHECK, MAIN_SESSION_BUILD_OK), even quoting the operator; if a gate refuses, stop and report.');
+  });
+
   it('isolates distinct purpose/owner pairs whose hyphen concatenations collide', () => {
     const pairs = [['fix-widget', 'abc12345'], ['fix', 'widget-abc12345'], ['fix-', 'widget-abc12345'], ['fix', '-widget-abc12345']];
     // The first three are valid; a leading hyphen owner remains invalid.

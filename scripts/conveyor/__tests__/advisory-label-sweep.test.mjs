@@ -3,6 +3,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { publishStoredRedTeamResult } from '../../lib/red-team-withheld-publish.mjs';
+import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -305,6 +306,47 @@ describe('PR #4708 — a cut-off comment list never removes a label, and the liv
     expect(out).toEqual([{ num: 42, add: null, remove: ['red-team:clear'] }]);
     expect(writes).toEqual([['o/n', 42, { add: null, remove: ['red-team:clear'] }]]);
   });
+
+describe('unknown red-team evidence settlement during sweep', () => {
+  const startedAt = Date.parse('2026-10-10T10:00:00Z');
+  const resultComment = (confirmed = false) => ({
+    author: { login: 'web-everything' }, createdAt: '2026-10-10T10:30:00Z',
+    body: renderRedTeamComment({ pr: 42, rev: NEW_HEAD, provider: 'codex', model: 'fixture',
+      foldedVerdict: confirmed ? 'changes' : 'accept', findings: confirmed ? [{
+        summary: 'confirmed break', category: 'edge-case', impactIfUnfixed: 'broken',
+        confirmedByRecheck: true, file: 'scripts/example.mjs', filesRead: ['scripts/example.mjs'],
+      }] : [] }),
+  });
+
+  it.each([
+    { name: 'keeps clear after an abandoned undecided review', label: 'red-team:clear', desired: 'red-team:clear' },
+    { name: 'replaces pending with clear after an abandoned undecided review', label: 'red-team:pending', desired: 'red-team:clear' },
+    { name: 'keeps pending while the unfinished review is active', label: 'red-team:pending', desired: 'red-team:pending', active: true },
+    { name: 'keeps pending without a result comment', label: 'red-team:pending', desired: 'red-team:pending', missing: true },
+    { name: 'keeps pending when the complete head read is incomplete', label: 'red-team:pending', desired: 'red-team:pending', incomplete: true },
+    { name: 'marks a recorded confirmed break blocked', label: 'red-team:pending', desired: 'red-team:blocked', confirmed: true },
+  ])('$name', ({ label, desired, active, missing, incomplete, confirmed }) => {
+    const p = provider();
+    p.ensureLabel = () => {};
+    const evidence = { ok: false, reason: 'review-unfinished', settleBounds: {
+      unfinishedStartedAt: startedAt, unfinishedActiveAt: startedAt,
+      evaluatedAt: startedAt + (active ? 30 : 61) * 60_000, unfinishedUndecided: true,
+      completeHeadRead: () => ({ complete: !incomplete, blocked: false }),
+    } };
+    // Only the complete live thread and live head can settle the unknown evidence.
+    const listed = pr(42, [label], HEAD, []);
+    const live = pr(42, [label], NEW_HEAD, missing ? [] : [resultComment(confirmed)]);
+    const out = rawSweep({ repo: 'o/n', provider: p, listPrs: () => [listed], readPr: () => live,
+      readStatusEvidence: ({ head }) => { expect(head).toBe(NEW_HEAD); return evidence; }, log: () => {} });
+    if (label === desired) {
+      expect(out).toEqual([]);
+      expect(p.calls.set).toEqual([]);
+    } else {
+      expect(out).toEqual([{ num: 42, add: desired, remove: [label] }]);
+      expect(p.calls.set).toEqual([{ repo: 'o/n', number: 42, spec: { add: desired, remove: [label] } }]);
+    }
+  });
+});
 
 describe('finished red-team publication during sweep', () => {
   const status = { repo: 'o/n', pr: 42, head: HEAD, status: 'finished', result: { status: 'ran', comment: 'withheld', foldedVerdict: 'changes', confirmedMissCount: 1 } };
