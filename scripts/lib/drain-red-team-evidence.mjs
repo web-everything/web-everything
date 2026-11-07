@@ -194,7 +194,7 @@ const abandonedReview = (hit, now) => !hasVerdict(hit.run) && hit.run.resumeOf =
   && now - hit.at >= ABANDONED_REVIEW_AFTER_MS;
 const TIE_ORDERS = ['id-asc', 'id-desc'];
 // R622: the times a result comment must beat to settle unknown evidence. Non-enumerable, so every existing
-// shape comparison of the failure object is unchanged; only settleUnknownEvidenceByComment reads it.
+// shape comparison of the failure object is unchanged; recovery also reads the decided same-head run.
 const withSettleBounds = (failure, bounds) => Object.defineProperty(failure, 'settleBounds', { value: bounds, enumerable: false });
 
 // Retain only the selected head/PR payloads and the newest unfinished attempt. Finished
@@ -228,7 +228,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     return completeReads.get(settleAt);
   };
   const runScan = () => {
-    const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, unfinished: null, since: -Infinity, active: -Infinity, undecided: true }]));
+    const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, exactDecided: null, unfinished: null, since: -Infinity, active: -Infinity, undecided: true }]));
     const startless = []; // ids and mtimes only, never payloads
     let count = 0, newestSettled = false, boundary = -Infinity;
     // The read window is fixed in one order (equal mtimes by ascending id) for every caller: the tie
@@ -245,6 +245,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
           for (const slot of Object.values(slots)) {
             if (slot.newer(hit, slot.newest)) slot.newest = hit;
             if (run.findings?.read?.netBasis?.rev === head && slot.newer(hit, slot.exact)) slot.exact = hit;
+            if (run.findings?.read?.netBasis?.rev === head && hasVerdict(run) && slot.newer(hit, slot.exactDecided)) slot.exactDecided = hit;
             if (unfinishedReview(run)) {
               if (slot.newer(hit, slot.unfinished)) slot.unfinished = hit;
               // R622: the settle bound covers EVERY unfinished run of this PR (any may be resumed later), NaN if any is unreadable.
@@ -267,7 +268,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     scan = { slots, startless, count, end, newestSettled, boundary };
   };
   const failureFor = (order, exactHead, writtenAfter, newestHead) => {
-    const { newest, exact, unfinished, since, undecided, active } = scan.slots[order];
+    const { newest, exact, exactDecided, unfinished, since, undecided, active } = scan.slots[order];
     const selected = exact ?? newest;
     const selectedStart = selected ? reviewStartedAt(selected) : NaN;
     // A start-less run last written before the selected run started is older; any other cannot be ordered.
@@ -277,7 +278,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     }
     if (unfinished && (!selected || unfinished.id === selected.id || reviewStartedAt(unfinished) >= selectedStart)) {
       return withSettleBounds({ ok: false, reason: 'review-unfinished' },
-        { unfinishedStartedAt: since, unfinishedUndecided: undecided, unfinishedActiveAt: active, evaluatedAt: now, completeHeadRead, ...(scan.end?.ok === false ? { unreadBoundaryAt: scan.boundary } : {}) });
+        { exactDecided, unfinishedStartedAt: since, unfinishedUndecided: undecided, unfinishedActiveAt: active, evaluatedAt: now, completeHeadRead, ...(scan.end?.ok === false ? { unreadBoundaryAt: scan.boundary } : {}) });
     }
     if (scan.end?.ok !== false) return null;
     // Capped: usable only when no unread record can change this query's answer (see above).
@@ -317,7 +318,15 @@ export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir
   // starts in the drain's ascending id order.
   const readCarryEvidence = () => readDrainRedTeamEvidence({ ...key, env, runsDir, list, read, stat, scanSettings, warn, now,
     lookup: (exactHead = true, _order, options) => lookup(exactHead, 'id-asc', options), readScorecards: () => records });
-  const latest = lookup();
+  let latest = lookup();
+  if (latest.ok === false && latest.reason === 'review-unfinished' && ['queued', 'running'].includes(parsed?.status)) {
+    const bounds = latest.settleBounds;
+    // Only recovery may look behind a quiet unfinished review. The recovery planner still
+    // proves the writer is dead and owns the single redispatch marker before admitting work.
+    if (Number.isFinite(bounds?.unfinishedActiveAt) && Number.isFinite(bounds?.evaluatedAt)
+      && bounds.evaluatedAt - bounds.unfinishedActiveAt >= ABANDONED_REVIEW_AFTER_MS
+      && bounds.exactDecided?.run && redTeamOwedFor(bounds.exactDecided.run)) latest = bounds.exactDecided;
+  }
   let carryEvidence;
   if (latest.ok === false) {
     // A capped exact-head query cannot prove there is no exact-head run, but the drain's carry

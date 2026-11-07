@@ -686,7 +686,8 @@ describe('dead running red-team owner behind an unfinished review', () => {
     expect(decide()).toMatchObject({ action: 'dispatch', staleRecovery: true, why: 'dead owner recovery' });
     expect(f.abandon()).toEqual({ ok: true });
     expect(existsSync(`${f.writerPath}.stale-redispatch-1`)).toBe(true);
-    const io = createReviewJobIo({ root: dir, env: f.env, readWitness: f.readWitness, recoveryProbe: f.probe });
+    // This fixture exercises local admission; label projection would require live GitHub IO.
+    const io = createReviewJobIo({ root: dir, env: { ...f.env, WE_RED_TEAM_STATUS_LABELS: 'false' }, readWitness: f.readWitness, recoveryProbe: f.probe });
     io.redTeamStatus({ ...f.key, loopPayload: f.decided, status: 'queued', redTeamMode: 'fresh' });
     expect(decide()).toMatchObject({ action: 'skip' });
     expect(f.abandon()).toEqual({ ok: false });
