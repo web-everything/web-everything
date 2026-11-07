@@ -1202,3 +1202,96 @@ describe('prevention batch landing', () => {
     expect(retract).not.toHaveBeenCalled();
   });
 });
+
+
+it('R657 fold callers coalesce fresh branch fetches while still reading each pinned PR head', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fold-fetch-fresh-'));
+  const branch = 'lane/x123456-prevention-card'; const sha = 'a'.repeat(40);
+  const ref = `refs/remotes/origin/${branch}`; const rel = 'backlog/x123456-card.md';
+  mkdirSync(join(dir, '.git'), { recursive: true }); mkdirSync(join(dir, 'backlog'));
+  writeFileSync(join(dir, '.git/config'), '[remote "origin"]\nurl = https://example.invalid/repo\n');
+  const fetches = []; const heads = [];
+  const exec = (bin, args) => {
+    if (bin === 'gh') return JSON.stringify([{ number: 1, headRefName: branch, headRefOid: sha, files: [{ path: rel }] }]);
+    if (args.includes('get-url')) return 'https://example.invalid/repo';
+    if (args.includes('--null')) return 'remote.origin.url\nhttps://example.invalid/repo\0';
+    if (args.includes('fetch')) { fetches.push(args); return ''; }
+    if (args.includes('for-each-ref')) return `${ref} ${sha}\n`;
+    if (args.includes('cat-file')) {
+      expect(args.slice(-3)).toEqual(['cat-file', '-e', `${sha}^{commit}`]);
+      return '';
+    }
+    if (args.includes('diff')) { heads.push(args.at(-1)); return `A\t${rel}\n`; }
+    if (args.includes('show')) return 'card';
+    throw new Error(`unexpected command: ${args.join(' ')}`);
+  };
+  try {
+    const opts = { exec, batch: async () => ({ batched: true, batchRef: 'batch' }), write: () => {} };
+    const results = await Promise.all([foldOpenSingles({ lane: dir }, opts), foldOpenSingles({ lane: dir }, opts)]);
+    expect(results.map(r => r.folded)).toEqual([[1], [1]]);
+    expect(fetches).toHaveLength(1);
+    expect(fetches[0]).toContain(`+refs/heads/${branch}:${ref}`);
+    expect(heads).toEqual([`origin/main...${sha}`, `origin/main...${sha}`]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it.each(['available', 'fetch-failed', 'still-missing'])('fold mode recovers a newer pinned head after a cached branch fetch: %s', async mode => {
+  const dir = mkdtempSync(join(tmpdir(), 'fold-fetch-pinned-'));
+  const branch = 'lane/x123456-prevention-card';
+  const oldSha = 'a'.repeat(40); const sha = 'b'.repeat(40);
+  const ref = `refs/remotes/origin/${branch}`; const rel = 'backlog/x123456-card.md';
+  mkdirSync(join(dir, '.git'), { recursive: true }); mkdirSync(join(dir, 'backlog'));
+  writeFileSync(join(dir, '.git/config'), '[remote "origin"]\nurl = https://example.invalid/repo\n');
+  let head = oldSha; let recovered = false;
+  const calls = [];
+  const exec = (bin, args) => {
+    if (bin === 'gh') return JSON.stringify([{ number: 1, headRefName: branch, headRefOid: head, files: [{ path: rel }] }]);
+    calls.push(args.slice(2));
+    if (args.includes('get-url')) return 'https://example.invalid/repo';
+    if (args.includes('--null')) return 'remote.origin.url\nhttps://example.invalid/repo\0';
+    if (args.includes('for-each-ref')) return `${ref} ${oldSha}\n`;
+    if (args.includes('fetch')) {
+      if (args.at(-1) === sha) {
+        if (mode === 'fetch-failed') throw new Error('pinned fetch failed');
+        recovered = mode === 'available';
+      }
+      return '';
+    }
+    if (args.includes('cat-file')) {
+      expect(args.at(-1)).toBe(`${head}^{commit}`);
+      if (head === sha && !recovered) throw new Error('pinned commit missing');
+      return '';
+    }
+    if (args.includes('diff') || args.includes('show')) {
+      if (head === sha && !recovered) throw new Error('read before pinned commit recovery');
+      expect(args.at(-1)).toBe(args.includes('diff') ? `origin/main...${head}` : `${head}:${rel}`);
+      return args.includes('diff') ? `A\t${rel}\n` : 'card';
+    }
+    throw new Error(`unexpected command: ${args.join(' ')}`);
+  };
+  const batch = vi.fn(async () => ({ batched: true, batchRef: 'batch' }));
+  try {
+    const opts = { exec, batch, write: () => {} };
+    expect((await foldOpenSingles({ lane: dir }, opts)).folded).toEqual([1]);
+    head = sha; calls.length = 0; batch.mockClear();
+    const result = await foldOpenSingles({ lane: dir }, opts);
+    expect(calls.filter(args => args[0] === 'fetch')).toEqual([
+      ['fetch', '--quiet', '--no-tags', 'origin', sha],
+    ]);
+    const recovery = calls.findIndex(args => args[0] === 'fetch');
+    expect(calls[recovery - 1]).toEqual(['cat-file', '-e', `${sha}^{commit}`]);
+    if (mode === 'available') {
+      expect(calls.slice(recovery + 1, recovery + 3)).toEqual([
+        ['cat-file', '-e', `${sha}^{commit}`], ['diff', '--name-status', `origin/main...${sha}`],
+      ]);
+      expect(result).toEqual({ folded: [1], notFolded: [] });
+      expect(batch).toHaveBeenCalledTimes(1);
+      expect(batch.mock.calls[0][0].source.head).toBe(sha);
+    } else {
+      expect(result).toEqual({ folded: [], notFolded: [{ pr: 1,
+        reason: mode === 'fetch-failed' ? 'pinned fetch failed' : 'pinned commit missing' }] });
+      expect(calls.some(args => ['diff', 'show'].includes(args[0]))).toBe(false);
+      expect(batch).not.toHaveBeenCalled();
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

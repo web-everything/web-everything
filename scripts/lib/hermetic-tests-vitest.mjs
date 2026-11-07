@@ -31,10 +31,11 @@ export function realHomedir() {
  * (see the note in vitest.setup.ts) silently kept returning the real home. `syncBuiltinESMExports()` makes the
  * replacement reach `import { homedir } from 'node:os'` named imports too. Installed once per worker.
  */
-export function installFakeHomedir() {
+export function installFakeHomedir(realHome = realHomedir()) {
   if (os[HOME_KEY]) return;
   const orig = os.homedir;
-  Object.defineProperty(os, HOME_KEY, { value: orig, enumerable: false });
+  // Keep the home used to build the guard, not a native function that may re-read HOME after it changes.
+  Object.defineProperty(os, HOME_KEY, { value: () => realHome, enumerable: false });
   os.homedir = function homedir() { return process.env.HOME || orig.call(os); };
   syncBuiltinESMExports();
 }
@@ -82,7 +83,7 @@ export function setupHermeticTestFile({
   if (fakeHome) {
     mkdirSync(fakeHome, { recursive: true });
     Object.assign(process.env, fakeHomeEnv({ realHome: home, fakeHome, settings, env: process.env, exists: existsSync }));
-    installFakeHomedir();
+    installFakeHomedir(home);
   }
 
   for (const key of LIVE_GITHUB_ENV_KEYS) delete process.env[key];
@@ -157,13 +158,27 @@ export function setupHermeticTestFile({
     settle(name, mine);
   });
 
+  const cleanupOnExit = () => {
+    if (ambient.WE_TMP_LEAK_KEEP === '1') return;
+    try { afterSettle?.(); } finally { cleanupDirs(); }
+  };
+  const cleanupDirs = () => {
+    for (const dir of [violationsDir, fakeHome].filter(Boolean)) {
+      try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+    }
+  };
+  process.once('exit', cleanupOnExit);
+
   afterAll(() => {
     try {
       const leftovers = [...inProcess.splice(0), ...late.splice(0), ...readNewLog()];
-      try { rmSync(violationsDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+      if (ambient.WE_TMP_LEAK_KEEP !== '1') {
+        try { rmSync(violationsDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+      }
       settle(`${fileLabel} > (outside any single test, or a child that outlived its test)`, leftovers);
     } finally {
-      afterSettle?.(); // after the shim log is read, even when settling fails the file
+      try { cleanupOnExit(); }
+      finally { process.removeListener('exit', cleanupOnExit); }
     }
   });
 

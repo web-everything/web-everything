@@ -4,18 +4,20 @@
  *   REAL temporary git repos so the actual fetch/merge/abort commands are proven, not only mocked.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync, existsSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
-  decideSelfSync, selfSyncCheckout, withSelfSync, readHeadSha, readOriginRefSha,
+  maintainCloneObjects, cloneHasObjectBorrowers, cloneGitIsBusy, decideSelfSync, selfSyncCheckout, withSelfSync, readHeadSha, readOriginRefSha,
   DAEMON_SELF_SYNC_BRANCH_ENV, resolvePocSyncBranch, decidePocSelfSync, selfSyncCheckoutPoc,
   isSafeBranchName, decideRestart, collectImportClosure, changedFilesBetween, resolveRestartMinIntervalMs,
   DEFAULT_RESTART_MIN_INTERVAL_MS, resolveMaxAdoptWaitTicks,
 } from '../daemon-self-sync.mjs';
 import { assertMainNotStale, isStaleMainRefusalMessage } from '../main-staleness.mjs';
+import { acquireRead, releaseRead, acquireWrite, releaseWrite, inspectCloneLock } from '../daemon-clone-lock.mjs';
+import { keepAliveScript } from '../test-keepalive.mjs';
 
 describe('decideSelfSync — pure', () => {
   const base = { fetched: true, behind: 3, dirty: false, onBase: true };
@@ -44,73 +46,75 @@ describe('selfSyncCheckout — injected git', () => {
     return { run, calls, opts };
   };
 
-  it('behind on a clean main → merges and reports the commit count', () => {
+  it('behind on a clean main → merges and reports the commit count', async () => {
     const { run, calls } = runner();
-    expect(selfSyncCheckout({ root: '/x', run })).toEqual({ merged: true, commits: 2, reason: 'merged' });
+    const maintainObjects = vi.fn();
+    expect(await selfSyncCheckout({ root: '/x', run, maintainObjects })).toEqual({ merged: true, commits: 2, reason: 'merged' });
     expect(calls.some((c) => c.startsWith('merge origin/main'))).toBe(true);
+    expect(maintainObjects).toHaveBeenCalledWith(expect.objectContaining({ root: '/x', run }));
   });
 
-  it('a merge conflict is ABORTED — the tree is left as it was', () => {
+  it('a merge conflict is ABORTED — the tree is left as it was', async () => {
     const { run, calls } = runner({ merge: (args) => (args[1] === '--abort' ? { status: 0, stdout: '' } : { status: 1, stdout: '', stderr: 'CONFLICT' }) });
-    expect(selfSyncCheckout({ root: '/x', run })).toEqual({ merged: false, commits: 0, reason: 'conflict' });
+    expect(await selfSyncCheckout({ root: '/x', run })).toEqual({ merged: false, commits: 0, reason: 'conflict' });
     expect(calls).toContain('merge --abort');
   });
 
-  it('a dirty tree never reaches merge', () => {
+  it('a dirty tree never reaches merge', async () => {
     const { run, calls } = runner({ status: { status: 0, stdout: ' M file.txt\n' } });
-    expect(selfSyncCheckout({ root: '/x', run }).reason).toBe('dirty');
+    expect((await selfSyncCheckout({ root: '/x', run })).reason).toBe('dirty');
     expect(calls.some((c) => c.startsWith('merge'))).toBe(false);
   });
 
-  it('runs every git command in the given root', () => {
+  it('runs every git command in the given root', async () => {
     const seen = [];
-    selfSyncCheckout({ root: '/the/clone', run: (args, opts) => { seen.push(opts.cwd); return { status: 0, stdout: args[0] === 'symbolic-ref' ? 'main' : '0' }; } });
+    await selfSyncCheckout({ root: '/the/clone', run: (args, opts) => { seen.push(opts.cwd); return { status: 0, stdout: args[0] === 'symbolic-ref' ? 'main' : '0' }; } });
     expect(new Set(seen)).toEqual(new Set(['/the/clone']));
   });
 
-  it('every git command carries a timeout + SIGKILL, defaulting to 60s', () => {
+  it('every git command carries a timeout + SIGKILL, defaulting to 60s', async () => {
     const { run, opts } = runner();
-    selfSyncCheckout({ root: '/x', run });
+    await selfSyncCheckout({ root: '/x', run });
     expect(opts.length).toBeGreaterThan(0);
     for (const o of opts) expect(o).toMatchObject({ cwd: '/x', timeout: 60_000, killSignal: 'SIGKILL' });
   });
 
-  it('the timeout is overridable via timeoutMs, and reaches every call including merge --abort', () => {
+  it('the timeout is overridable via timeoutMs, and reaches every call including merge --abort', async () => {
     const { run, opts } = runner({ merge: (args) => (args[1] === '--abort' ? { status: 0, stdout: '' } : { status: 1, stdout: '', stderr: 'CONFLICT' }) });
-    selfSyncCheckout({ root: '/x', run, timeoutMs: 5_000 });
+    await selfSyncCheckout({ root: '/x', run, timeoutMs: 5_000 });
     expect(opts.length).toBeGreaterThan(0);
     for (const o of opts) expect(o).toMatchObject({ timeout: 5_000, killSignal: 'SIGKILL' });
   });
 
-  it('a timed-out fetch (null status, like a killed spawnSync) is treated as fetch-failed, never reaching merge', () => {
+  it('a timed-out fetch (null status, like a killed spawnSync) is treated as fetch-failed, never reaching merge', async () => {
     const { run, calls } = runner({ fetch: { status: null, stdout: '', stderr: '', signal: 'SIGKILL' } });
-    expect(selfSyncCheckout({ root: '/x', run })).toEqual({ merged: false, commits: 0, reason: 'fetch-failed' });
+    expect(await selfSyncCheckout({ root: '/x', run })).toEqual({ merged: false, commits: 0, reason: 'fetch-failed' });
     expect(calls.some((c) => c.startsWith('merge'))).toBe(false);
   });
 
-  it('a timed-out merge (null status) is ABORTED and reported the same as any other failed merge', () => {
+  it('a timed-out merge (null status) is ABORTED and reported the same as any other failed merge', async () => {
     const { run, calls } = runner({
       merge: (args) => (args[1] === '--abort' ? { status: 0, stdout: '' } : { status: null, stdout: '', stderr: '', signal: 'SIGKILL' }),
     });
-    expect(selfSyncCheckout({ root: '/x', run })).toEqual({ merged: false, commits: 0, reason: 'conflict' });
+    expect(await selfSyncCheckout({ root: '/x', run })).toEqual({ merged: false, commits: 0, reason: 'conflict' });
     expect(calls).toContain('merge --abort');
   });
 
-  it('a timed-out git status is NOT read as a clean tree — skips as status-failed, never reaching merge', () => {
+  it('a timed-out git status is NOT read as a clean tree — skips as status-failed, never reaching merge', async () => {
     const { run, calls } = runner({ status: { status: null, stdout: '', stderr: '', signal: 'SIGKILL' } });
-    expect(selfSyncCheckout({ root: '/x', run })).toEqual({ merged: false, commits: 0, reason: 'status-failed' });
+    expect(await selfSyncCheckout({ root: '/x', run })).toEqual({ merged: false, commits: 0, reason: 'status-failed' });
     expect(calls.some((c) => c.startsWith('merge'))).toBe(false);
   });
 
-  it('a failed git status in gitRun\'s real shape (status 1, empty stdout) also skips as status-failed', () => {
+  it('a failed git status in gitRun\'s real shape (status 1, empty stdout) also skips as status-failed', async () => {
     const { run } = runner({ status: { status: 1, stdout: '', stderr: 'fatal' } });
-    expect(selfSyncCheckout({ root: '/x', run })).toEqual({ merged: false, commits: 0, reason: 'status-failed' });
+    expect(await selfSyncCheckout({ root: '/x', run })).toEqual({ merged: false, commits: 0, reason: 'status-failed' });
   });
 
-  it('a rev-list that "succeeds" but prints no number is count-failed, not up-to-date', () => {
+  it('a rev-list that "succeeds" but prints no number is count-failed, not up-to-date', async () => {
     for (const stdout of ['', 'garbage\n']) {
       const { run } = runner({ 'rev-list': { status: 0, stdout } });
-      expect(selfSyncCheckout({ root: '/x', run })).toEqual({ merged: false, commits: 0, reason: 'count-failed' });
+      expect(await selfSyncCheckout({ root: '/x', run })).toEqual({ merged: false, commits: 0, reason: 'count-failed' });
     }
   });
 
@@ -121,9 +125,9 @@ describe('selfSyncCheckout — injected git', () => {
   const EXPECTED = { fetch: 'fetch-failed', 'rev-list': 'count-failed', 'symbolic-ref': 'head-failed', status: 'status-failed', merge: 'conflict' };
   for (const [site, reason] of Object.entries(EXPECTED)) {
     for (const [shape, result] of [['timed-out', TIMED_OUT], ['failed', FAILED]]) {
-      it(`a ${shape} \`${site}\` never leads to merged:true and reports ${reason}`, () => {
+      it(`a ${shape} \`${site}\` never leads to merged:true and reports ${reason}`, async () => {
         const { run } = runner({ [site]: result });
-        expect(selfSyncCheckout({ root: '/x', run })).toEqual({ merged: false, commits: 0, reason });
+        expect(await selfSyncCheckout({ root: '/x', run })).toEqual({ merged: false, commits: 0, reason });
       });
     }
   }
@@ -148,13 +152,20 @@ describe('withSelfSync — DEFAULT path: rebuild-driven (#4044 Module E)', () =>
       moved: true, adopted: true, head: 'deadbeef', prevHead: 'old', plan: {},
     }));
     const acquireRead = vi.fn(okLock);
+    const maintainObjects = vi.fn();
+    const lockRoot = mkdtempSync(join(tmpdir(), 'adoption-maintenance-lock-'));
+    try {
     const w = withSelfSync({ tickOnce: tick }, {
-      root: '/x', onRestart, rebuild, acquireRead, releaseRead: vi.fn(), readState: emptyState, log: { error: vi.fn() },
+      root: '/x', onRestart, rebuild, maintainObjects, acquireRead, releaseRead: vi.fn(), readState: emptyState, log: { error: vi.fn() },
+      env: { WE_DAEMON_CLONE_LOCK_ROOT: lockRoot },
+      hasMaintenanceRebuildJob: () => false,
     });
     await expect(w.tickOnce()).resolves.toBe('restarted');
     expect(tick).not.toHaveBeenCalled();
     expect(onRestart).toHaveBeenCalledWith(expect.objectContaining({ moved: true, adopted: true, head: 'deadbeef' }));
     expect(acquireRead).not.toHaveBeenCalled();
+    expect(maintainObjects).toHaveBeenCalledWith(expect.objectContaining({ root: '/x' }));
+    } finally { rmSync(lockRoot, { recursive: true, force: true }); }
   });
 
   it('a rebuild that moves nothing still ticks, under the read lock', async () => {
@@ -567,11 +578,11 @@ describe('selfSyncCheckout — REAL git (temp repos)', () => {
   });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
-  it('behind AND ahead (the real daemon-clone shape) → a real merge lands both', () => {
+  it('behind AND ahead (the real daemon-clone shape) → a real merge lands both', async () => {
     const up = join(dir, 'upstream'); const d = join(dir, 'daemon');
     commit(d, 'local.txt', 'run-ahead fix\n'); // the clone is ahead
     commit(up, 'b.txt', 'two\n'); git(up, 'push', '-q', 'origin', 'main'); // and behind
-    const r = selfSyncCheckout({ root: d, run: (args, opts) => {
+    const r = await selfSyncCheckout({ root: d, run: (args, opts) => {
       try { return { status: 0, stdout: execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { ...opts, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) }; }
       catch (e) { return { status: e.status ?? 1, stdout: String(e.stdout ?? ''), stderr: String(e.stderr ?? '') }; }
     } });
@@ -580,12 +591,12 @@ describe('selfSyncCheckout — REAL git (temp repos)', () => {
     expect(git(d, 'ls-files').split('\n')).toEqual(expect.arrayContaining(['b.txt', 'local.txt']));
   });
 
-  it('a conflicting upstream change → merge aborted, tree and HEAD unchanged', () => {
+  it('a conflicting upstream change → merge aborted, tree and HEAD unchanged', async () => {
     const up = join(dir, 'upstream'); const d = join(dir, 'daemon');
     commit(d, 'a.txt', 'daemon side\n');
     commit(up, 'a.txt', 'upstream side\n'); git(up, 'push', '-q', 'origin', 'main');
     const headBefore = git(d, 'rev-parse', 'HEAD').trim();
-    const r = selfSyncCheckout({ root: d, run: (args, opts) => {
+    const r = await selfSyncCheckout({ root: d, run: (args, opts) => {
       try { return { status: 0, stdout: execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { ...opts, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) }; }
       catch (e) { return { status: e.status ?? 1, stdout: String(e.stdout ?? ''), stderr: String(e.stderr ?? '') }; }
     } });
@@ -662,74 +673,76 @@ describe('selfSyncCheckoutPoc — injected git', () => {
     return { run, calls, opts };
   };
 
-  it('requires a pocBranch', () => expect(() => selfSyncCheckoutPoc({ root: '/x', run: () => ({ status: 0, stdout: '' }) })).toThrow(/pocBranch/));
+  it('requires a pocBranch', async () => await expect(selfSyncCheckoutPoc({ root: '/x', run: () => ({ status: 0, stdout: '' }) })).rejects.toThrow(/pocBranch/));
 
-  it('behind on both, clean tree → merges both sources', () => {
+  it('behind on both, clean tree → merges both sources', async () => {
     const { run, calls } = runner();
-    expect(selfSyncCheckoutPoc({ root: '/x', pocBranch: 'lane/daemon-poc', run })).toEqual({ merged: true, commits: 2, reason: 'merged' });
+    expect(await selfSyncCheckoutPoc({ root: '/x', pocBranch: 'lane/daemon-poc', run })).toEqual({ merged: true, commits: 2, reason: 'merged' });
     expect(calls.some((c) => c.startsWith('merge origin/main'))).toBe(true);
     expect(calls.some((c) => c.startsWith('merge origin/lane/daemon-poc'))).toBe(true);
   });
 
-  it('a conflict on main STOPS the tick — poc is never attempted', () => {
+  it('a conflict on main STOPS the tick — poc is never attempted', async () => {
     const { run, calls } = runner({ merge: (args) => (args[1] === '--abort' ? { status: 0, stdout: '' } : args[1] === 'origin/main' ? { status: 1, stdout: '', stderr: 'CONFLICT' } : { status: 0, stdout: '' }) });
-    expect(selfSyncCheckoutPoc({ root: '/x', pocBranch: 'lane/daemon-poc', run })).toEqual({ merged: false, commits: 0, reason: 'conflict' });
+    expect(await selfSyncCheckoutPoc({ root: '/x', pocBranch: 'lane/daemon-poc', run })).toEqual({ merged: false, commits: 0, reason: 'conflict' });
     expect(calls).toContain('merge --abort');
     expect(calls.some((c) => c.startsWith('merge origin/lane/daemon-poc'))).toBe(false);
   });
 
-  it('main merges clean, poc conflicts → merged-partial (main progress is kept)', () => {
+  it('main merges clean, poc conflicts → merged-partial (main progress is kept)', async () => {
     const { run } = runner({ merge: (args) => (args[1] === '--abort' ? { status: 0, stdout: '' } : args[1] === 'origin/main' ? { status: 0, stdout: '' } : { status: 1, stdout: '', stderr: 'CONFLICT' }) });
-    expect(selfSyncCheckoutPoc({ root: '/x', pocBranch: 'lane/daemon-poc', run })).toEqual({ merged: true, commits: 1, reason: 'merged-partial' });
+    expect(await selfSyncCheckoutPoc({ root: '/x', pocBranch: 'lane/daemon-poc', run })).toEqual({ merged: true, commits: 1, reason: 'merged-partial' });
   });
 
-  it('a dirty tree never reaches merge', () => {
+  it('a dirty tree never reaches merge', async () => {
     const { run, calls } = runner({ status: { status: 0, stdout: ' M file.txt\n' } });
-    expect(selfSyncCheckoutPoc({ root: '/x', pocBranch: 'lane/daemon-poc', run }).reason).toBe('dirty');
+    expect((await selfSyncCheckoutPoc({ root: '/x', pocBranch: 'lane/daemon-poc', run })).reason).toBe('dirty');
     expect(calls.some((c) => c.startsWith('merge'))).toBe(false);
   });
 
-  it('not on the poc branch is never touched', () => {
+  it('not on the poc branch is never touched', async () => {
     const { run } = runner({ 'symbolic-ref': { status: 0, stdout: 'main\n' } });
-    expect(selfSyncCheckoutPoc({ root: '/x', pocBranch: 'lane/daemon-poc', run }).reason).toBe('not-on-branch');
+    expect((await selfSyncCheckoutPoc({ root: '/x', pocBranch: 'lane/daemon-poc', run })).reason).toBe('not-on-branch');
   });
 
-  it('every git command carries a timeout + SIGKILL, defaulting to 60s, overridable via timeoutMs', () => {
+  it('every git command carries a timeout + SIGKILL, defaulting to 60s, overridable via timeoutMs', async () => {
     const { run, opts } = runner();
-    selfSyncCheckoutPoc({ root: '/x', pocBranch: 'lane/daemon-poc', run });
+    await selfSyncCheckoutPoc({ root: '/x', pocBranch: 'lane/daemon-poc', run });
     expect(opts.length).toBeGreaterThan(0);
     for (const o of opts) expect(o).toMatchObject({ cwd: '/x', timeout: 60_000, killSignal: 'SIGKILL' });
 
     const { run: run2, opts: opts2 } = runner();
-    selfSyncCheckoutPoc({ root: '/x', pocBranch: 'lane/daemon-poc', run: run2, timeoutMs: 5_000 });
+    await selfSyncCheckoutPoc({ root: '/x', pocBranch: 'lane/daemon-poc', run: run2, timeoutMs: 5_000 });
     for (const o of opts2) expect(o).toMatchObject({ timeout: 5_000 });
   });
 
-  it('a timed-out status is NOT read as clean — status-failed, never reaching merge', () => {
+  it('a timed-out status is NOT read as clean — status-failed, never reaching merge', async () => {
     const { run, calls } = runner({ status: { status: null, stdout: '', stderr: '', signal: 'SIGKILL' } });
-    expect(selfSyncCheckoutPoc({ root: '/x', pocBranch: 'lane/daemon-poc', run })).toEqual({ merged: false, commits: 0, reason: 'status-failed' });
+    expect(await selfSyncCheckoutPoc({ root: '/x', pocBranch: 'lane/daemon-poc', run })).toEqual({ merged: false, commits: 0, reason: 'status-failed' });
     expect(calls.some((c) => c.startsWith('merge'))).toBe(false);
   });
 
-  it('a rev-list that "succeeds" with no number on the only behind source is count-failed, not up-to-date', () => {
+  it('a rev-list that "succeeds" with no number on the only behind source is count-failed, not up-to-date', async () => {
     const { run } = runner({
       'rev-list': (args) => (args.includes(`HEAD..origin/main`) ? { status: 0, stdout: 'garbage\n' } : { status: 0, stdout: '0\n' }),
     });
-    expect(selfSyncCheckoutPoc({ root: '/x', pocBranch: 'lane/daemon-poc', run })).toEqual({ merged: false, commits: 0, reason: 'count-failed' });
+    expect(await selfSyncCheckoutPoc({ root: '/x', pocBranch: 'lane/daemon-poc', run })).toEqual({ merged: false, commits: 0, reason: 'count-failed' });
   });
 });
 
 describe('withSelfSync — POC mode dispatch', () => {
   it('DAEMON_SELF_SYNC_BRANCH set → routes through syncPoc, not sync', async () => {
     const tick = vi.fn(); const onRestart = vi.fn(() => 'restarted');
-    const syncPoc = vi.fn(() => ({ merged: true, commits: 3, reason: 'merged' }));
+    const syncPoc = vi.fn(async () => ({ merged: true, commits: 3, reason: 'merged' }));
     const sync = vi.fn();
+    const env = { [DAEMON_SELF_SYNC_BRANCH_ENV]: 'lane/daemon-poc' };
+    const log = { error: vi.fn() };
+    const hasMaintenanceRebuildJob = vi.fn(() => false);
     const w = withSelfSync({ tickOnce: tick }, {
-      root: '/x', onRestart, sync, syncPoc, log: { error: vi.fn() },
-      env: { [DAEMON_SELF_SYNC_BRANCH_ENV]: 'lane/daemon-poc' },
+      root: '/x', onRestart, sync, syncPoc, log, env, hasMaintenanceRebuildJob,
     });
     await expect(w.tickOnce()).resolves.toBe('restarted');
-    expect(syncPoc).toHaveBeenCalledWith({ root: '/x', base: 'main', pocBranch: 'lane/daemon-poc' });
+    expect(syncPoc).toHaveBeenCalledWith({ root: '/x', base: 'main', pocBranch: 'lane/daemon-poc', env, log, hasMaintenanceRebuildJob });
     expect(sync).not.toHaveBeenCalled();
     expect(tick).not.toHaveBeenCalled();
   });
@@ -782,12 +795,15 @@ describe('withSelfSync — POC mode dispatch', () => {
 
   it('an explicit timeoutMs is forwarded to the injected syncPoc', async () => {
     const syncPoc = vi.fn(() => ({ merged: false, commits: 0, reason: 'up-to-date' }));
+    const env = { [DAEMON_SELF_SYNC_BRANCH_ENV]: 'lane/daemon-poc' };
+    const log = { error: vi.fn() };
+    const hasMaintenanceRebuildJob = vi.fn(() => false);
     const w = withSelfSync({ tickOnce: () => 'ticked' }, {
-      root: '/x', onRestart: vi.fn(), syncPoc, timeoutMs: 5_000,
-      env: { [DAEMON_SELF_SYNC_BRANCH_ENV]: 'lane/daemon-poc' },
+      root: '/x', onRestart: vi.fn(), syncPoc, timeoutMs: 5_000, env, log, hasMaintenanceRebuildJob,
     });
     await w.tickOnce();
-    expect(syncPoc).toHaveBeenCalledWith({ root: '/x', base: 'main', pocBranch: 'lane/daemon-poc', timeoutMs: 5_000 });
+    expect(syncPoc).toHaveBeenCalledWith({ root: '/x', base: 'main', pocBranch: 'lane/daemon-poc', timeoutMs: 5_000,
+      env, log, hasMaintenanceRebuildJob });
   });
 });
 
@@ -819,33 +835,33 @@ describe('selfSyncCheckoutPoc — REAL git (temp repos, two upstreams)', () => {
   });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
-  it('merges NEW commits from both origin/main and origin/lane/daemon-poc in one tick', () => {
+  it('merges NEW commits from both origin/main and origin/lane/daemon-poc in one tick', async () => {
     const up = join(dir, 'upstream'); const d = join(dir, 'daemon');
     commit(up, 'b.txt', 'two\n'); git(up, 'push', '-q', 'origin', 'main'); // main gets a new commit
-    const r = selfSyncCheckoutPoc({ root: d, base: 'main', pocBranch: 'lane/daemon-poc', run: realRun });
+    const r = await selfSyncCheckoutPoc({ root: d, base: 'main', pocBranch: 'lane/daemon-poc', run: realRun });
     expect(r).toEqual({ merged: true, commits: 2, reason: 'merged' }); // 1 from main (b.txt) + 1 already on lane/daemon-poc (poc-only.txt)
     expect(git(d, 'rev-list', '--count', 'HEAD..origin/main').trim()).toBe('0');
     expect(git(d, 'rev-list', '--count', 'HEAD..origin/lane/daemon-poc').trim()).toBe('0');
     expect(git(d, 'ls-files').split('\n')).toEqual(expect.arrayContaining(['a.txt', 'b.txt', 'poc-only.txt']));
   });
 
-  it('a conflicting origin/lane/daemon-poc change aborts cleanly — tree and HEAD unchanged', () => {
+  it('a conflicting origin/lane/daemon-poc change aborts cleanly — tree and HEAD unchanged', async () => {
     const d = join(dir, 'daemon');
     // Make the daemon clone's own tip conflict with what's already on lane/daemon-poc (poc-only.txt content).
     commit(d, 'poc-only.txt', 'daemon side, conflicting\n');
     const headBefore = git(d, 'rev-parse', 'HEAD').trim();
-    const r = selfSyncCheckoutPoc({ root: d, base: 'main', pocBranch: 'lane/daemon-poc', run: realRun });
+    const r = await selfSyncCheckoutPoc({ root: d, base: 'main', pocBranch: 'lane/daemon-poc', run: realRun });
     expect(r.reason).toBe('conflict');
     expect(r.merged).toBe(false);
     expect(git(d, 'rev-parse', 'HEAD').trim()).toBe(headBefore);
     expect(git(d, 'status', '--porcelain').trim()).toBe('');
   });
 
-  it('a leading-dash pocBranch is REFUSED before any git runs — never parsed as a git option (argv injection)', () => {
+  it('a leading-dash pocBranch is REFUSED before any git runs — never parsed as a git option (argv injection)', async () => {
     const d = join(dir, 'daemon');
     const marker = join(dir, 'pwned');
     const evil = `--upload-pack=touch ${marker};`;
-    expect(() => selfSyncCheckoutPoc({ root: d, base: 'main', pocBranch: evil, run: realRun })).toThrow(/not a safe branch name/);
+    await expect(selfSyncCheckoutPoc({ root: d, base: 'main', pocBranch: evil, run: realRun })).rejects.toThrow(/not a safe branch name/);
     expect(existsSync(marker)).toBe(false);
   });
 });
@@ -869,10 +885,10 @@ describe('POC-mode branch validation — every entry point fails closed', () => 
     })).toThrow(/not a safe branch name/);
     expect(syncPoc).not.toHaveBeenCalled();
   });
-  it('selfSyncCheckoutPoc fetches with a `--` separator so even a ref is never read as an option', () => {
+  it('selfSyncCheckoutPoc fetches with a `--` separator so even a ref is never read as an option', async () => {
     const calls = [];
     const run = (args) => { calls.push(args); return { status: 0, stdout: args[0] === 'symbolic-ref' ? 'lane/daemon-poc\n' : args[0] === 'rev-list' ? '0\n' : '' }; };
-    selfSyncCheckoutPoc({ root: '/x', pocBranch: 'lane/daemon-poc', run });
+    await selfSyncCheckoutPoc({ root: '/x', pocBranch: 'lane/daemon-poc', run });
     const fetches = calls.filter((a) => a[0] === 'fetch');
     expect(fetches).toHaveLength(2);
     for (const f of fetches) expect(f.indexOf('--')).toBeGreaterThan(-1);
@@ -1059,4 +1075,294 @@ describe('a skipped tick is an empty tick every real daemon onTick can log (#404
     // under a loaded host (reproduced on origin/main at load average ~230, 2026-09-26). The assertion is about
     // onTick's behaviour, not import speed, so it gets an explicit budget rather than failing the gate on load.
   }, 60_000);
+});
+
+
+describe('R657 object maintenance', () => {
+  const options = () => ({ root: '/clone', hasBorrowers: () => false, isBusy: () => false, log: { error: vi.fn() } });
+  describe.each([
+    { name: 'selfSyncCheckout', sync: selfSyncCheckout, poc: false, partial: false },
+    { name: 'selfSyncCheckoutPoc', sync: selfSyncCheckoutPoc, poc: true, partial: false },
+    { name: 'selfSyncCheckoutPoc partial merge', sync: selfSyncCheckoutPoc, poc: true, partial: true },
+  ])('$name maintenance lock contract', ({ sync, poc, partial }) => {
+    it.each(['idle', 'reader', 'writer', 'rebuild', 'unknown', 'unreadable', 'maintenance-failed'])(
+      'holds WRITE through maintenance and skips competing/unknown evidence: %s', async mode => {
+        const root = mkdtempSync(join(tmpdir(), 'legacy-maintenance-lock-'));
+        const lockRoot = join(root, 'locks');
+        const env = { WE_DAEMON_CLONE_LOCK_ROOT: lockRoot, WE_DAEMON_STATE_DIR: join(root, 'state') };
+        const lockOpts = { lockRoot, owner: 'other-job', waitMs: 0 };
+        const log = { error: vi.fn() };
+        let evidenceWriter;
+        const maintenanceWriters = [];
+        const hasMaintenanceRebuildJob = vi.fn(() => {
+          evidenceWriter = inspectCloneLock(root, { lockRoot }).writer;
+          if (mode === 'unreadable') throw new Error('unreadable jobs');
+          return mode === 'unknown' ? undefined : mode === 'rebuild';
+        });
+        const maintainObjects = vi.fn(async () => {
+          maintenanceWriters.push(inspectCloneLock(root, { lockRoot }).writer);
+          await Promise.resolve();
+          maintenanceWriters.push(inspectCloneLock(root, { lockRoot }).writer);
+          if (mode === 'maintenance-failed') throw new Error('pack failed');
+        });
+        const run = vi.fn(args => ({ status: partial && args[0] === 'merge' && args[1] === 'origin/lane/daemon-poc' ? 1 : 0,
+          stdout: args[0] === 'symbolic-ref' ? (poc ? 'lane/daemon-poc' : 'main') : args[0] === 'rev-list' ? '1' : '' }));
+        try {
+          if (mode === 'reader') expect(acquireRead(root, lockOpts).ok).toBe(true);
+          if (mode === 'writer') expect((await acquireWrite(root, lockOpts)).ok).toBe(true);
+          await expect(sync({ root, run, env, log, maintainObjects, hasMaintenanceRebuildJob,
+            ...(poc ? { pocBranch: 'lane/daemon-poc' } : {}) })).resolves.toEqual({
+            merged: true, commits: poc && !partial ? 2 : 1, reason: partial ? 'merged-partial' : 'merged',
+          });
+          const maintained = ['idle', 'maintenance-failed'].includes(mode);
+          expect(maintainObjects).toHaveBeenCalledTimes(maintained ? 1 : 0);
+          expect(hasMaintenanceRebuildJob).toHaveBeenCalledTimes(['reader', 'writer'].includes(mode) ? 0 : 1);
+          if (!['reader', 'writer'].includes(mode)) {
+            expect(evidenceWriter?.owner).toBe(`clone-object-maintenance:${process.pid}`);
+            expect(inspectCloneLock(root, { lockRoot }).writer).toBeNull();
+          }
+          if (maintained) {
+            expect(maintenanceWriters).toHaveLength(2);
+            for (const writer of maintenanceWriters) expect(writer?.owner).toBe(evidenceWriter.owner);
+            expect(maintainObjects).toHaveBeenCalledWith(expect.objectContaining({ root, env, log, run, timeoutMs: 60_000 }));
+          }
+          if (mode === 'writer') expect(inspectCloneLock(root, { lockRoot }).writer.owner).toBe('other-job');
+          if (mode === 'reader') expect(inspectCloneLock(root, { lockRoot }).readers).toHaveLength(1);
+          if (['unreadable', 'maintenance-failed'].includes(mode)) expect(log.error).toHaveBeenCalledWith(expect.stringContaining('inspect clone before retrying'));
+        } finally {
+          releaseRead(root, lockOpts);
+          releaseWrite(root, lockOpts);
+          rmSync(root, { recursive: true, force: true });
+        }
+      });
+  });
+  it('strips all inherited Git overrides from every maintenance command without changing the parent env', async () => {
+    const env = { PATH: '/bin', GIT_DIR: '/foreign', GIT_WORK_TREE: '/foreign', GIT_INDEX_FILE: '/foreign/index',
+      GIT_OBJECT_DIRECTORY: '/foreign/objects', GIT_ALTERNATE_OBJECT_DIRECTORIES: '/foreign/alternates',
+      GIT_COMMON_DIR: '/foreign/common', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.bare', GIT_CONFIG_VALUE_0: 'true' };
+    const before = { ...env };
+    const run = vi.fn(() => ({ status: 0 }));
+    expect(await maintainCloneObjects({ ...options(), env, run })).toEqual({ skipped: false });
+    expect(run).toHaveBeenCalledTimes(4);
+    for (const [, opts] of run.mock.calls) expect(opts.env).toEqual({ PATH: '/bin' });
+    expect(env).toEqual(before);
+  });
+  it.each(['idle', 'reader', 'writer', 'rebuild', 'unknown', 'unreadable'])(
+    'post-adoption maintenance holds the clone write lock and skips unavailable/active/unknown evidence: %s', async mode => {
+      const root = mkdtempSync(join(tmpdir(), 'adoption-maintenance-'));
+      const lockRoot = join(root, 'locks');
+      const lockOpts = { lockRoot, owner: 'other-job', waitMs: 0 };
+      const env = { WE_DAEMON_CLONE_LOCK_ROOT: lockRoot, WE_DAEMON_STATE_DIR: join(root, 'state') };
+      const hasMaintenanceRebuildJob = vi.fn(() => {
+        expect(inspectCloneLock(root, { lockRoot }).writer).not.toBeNull();
+        if (mode === 'unreadable') throw new Error('unreadable jobs');
+        return mode === 'unknown' ? undefined : mode === 'rebuild';
+      });
+      const maintainObjects = vi.fn(() => {
+        expect(inspectCloneLock(root, { lockRoot }).writer.owner).toBe(`clone-object-maintenance:${process.pid}`);
+      });
+      try {
+        const w = withSelfSync({ tickOnce: vi.fn() }, {
+          root, env, readHead: () => 'old', onRestart: () => 'restarted', log: { error: vi.fn() },
+          readState: () => ({ adopted: null, rejected: null, inProgress: null, quarantine: null }),
+          rebuild: async () => {
+            if (mode === 'reader') expect(acquireRead(root, lockOpts).ok).toBe(true);
+            if (mode === 'writer') expect((await acquireWrite(root, lockOpts)).ok).toBe(true);
+            return { moved: true, adopted: true, head: 'new', prevHead: 'old', plan: {} };
+          },
+          maintainObjects, hasMaintenanceRebuildJob,
+        });
+        await expect(w.tickOnce()).resolves.toBe('restarted');
+        expect(maintainObjects).toHaveBeenCalledTimes(mode === 'idle' ? 1 : 0);
+        expect(hasMaintenanceRebuildJob).toHaveBeenCalledTimes(['reader', 'writer'].includes(mode) ? 0 : 1);
+        if (!['reader', 'writer'].includes(mode)) expect(inspectCloneLock(root, { lockRoot }).writer).toBeNull();
+      } finally {
+        releaseRead(root, lockOpts);
+        releaseWrite(root, lockOpts);
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  it('sets pack retention and prunes packed duplicates before a local repack, with bounded git commands', async () => {
+    const run = vi.fn(() => ({ status: 0 }));
+    expect(await maintainCloneObjects({ ...options(), run, timeoutMs: 123 })).toEqual({ skipped: false });
+    expect(run.mock.calls.map(([args]) => args)).toEqual([
+      ['config', '--local', 'fetch.unpackLimit', '1'], ['config', '--local', 'transfer.unpackLimit', '1'],
+      ['prune-packed'], ['repack', '-d', '-l'],
+    ]);
+    for (const [, opts] of run.mock.calls) expect(opts).toMatchObject({ cwd: '/clone', timeout: 123, killSignal: 'SIGKILL' });
+  });
+  it.each(['hasBorrowers', 'isBusy'])('skips every git command for %s or unknown evidence', async key => {
+    for (const answer of [true, undefined]) {
+      const run = vi.fn();
+      expect((await maintainCloneObjects({ ...options(), [key]: () => answer, run })).skipped).toBe(true);
+      expect(run).not.toHaveBeenCalled();
+    }
+  });
+  it.each(['scan', 'throw', 'nonzero'])('logs and swallows %s failures without continuing', async mode => {
+    const opts = options();
+    const run = vi.fn(() => { if (mode === 'throw') throw new Error('corrupt'); return { status: 1 }; });
+    const result = await maintainCloneObjects({ ...opts, run, ...(mode === 'scan' ? { hasBorrowers: () => { throw new Error('unreadable'); } } : {}) });
+    expect(result.reason).toBe('maintenance-failed');
+    expect(opts.log.error).toHaveBeenCalled();
+    expect(run).toHaveBeenCalledTimes(mode === 'scan' ? 0 : 1);
+  });
+  it.each(['timeout', 'output overflow', 'stderr overflow'])('kills Git descendants on %s before releasing the clone write lock', async mode => {
+    const root = mkdtempSync(join(tmpdir(), 'maintenance-process-group-'));
+    const lockRoot = join(root, 'locks');
+    const pidFile = join(root, 'pack.pid');
+    const fallbackFile = join(root, 'parent-backstop');
+    const env = { ...process.env, PATH: `${root}:${process.env.PATH}`,
+      WE_DAEMON_CLONE_LOCK_ROOT: lockRoot, WE_DAEMON_STATE_DIR: join(root, 'state'),
+      PACK_PID_FILE: pidFile, PACK_FAILURE_MODE: mode, PACK_FALLBACK_FILE: fallbackFile };
+    // A real Git-shaped parent and pack-objects-shaped descendant. The descendant
+    // closes inherited output, so killing only the parent would resolve promptly
+    // and leave a live writer after the clone lock is released.
+    writeFileSync(join(root, 'git'), `#!${process.execPath}
+const { spawn } = require('node:child_process');
+const { writeFileSync } = require('node:fs');
+if (process.argv[2] !== 'repack') process.exit(0);
+const pack = spawn(process.execPath, ['-e', ${JSON.stringify(keepAliveScript({ anchorPid: process.pid, maxLifetimeMs: 30_000, postlude: "process.send('ready');" }))}],
+  { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
+pack.once('message', () => {
+  writeFileSync(process.env.PACK_PID_FILE, String(pack.pid));
+  if (process.env.PACK_FAILURE_MODE === 'output overflow') process.stdout.write('x'.repeat(128 * 1024));
+  if (process.env.PACK_FAILURE_MODE === 'stderr overflow') process.stderr.write('x'.repeat(128 * 1024));
+});
+// Fixture backstop: even a broken group killer must not strand its parent.
+setTimeout(() => { writeFileSync(process.env.PACK_FALLBACK_FILE, 'reached'); process.exit(3); }, 5000);
+`, { mode: 0o755 });
+    let packPid;
+    const groupSignals = [];
+    const realKill = process.kill.bind(process);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+      try {
+        const result = realKill(pid, signal);
+        if (pid < 0) groupSignals.push({ pid, signal, result });
+        return result;
+      } catch (error) {
+        if (pid < 0) groupSignals.push({ pid, signal, error: error.code });
+        throw error;
+      }
+    });
+    let maintenanceError;
+    let maintenanceResult;
+    let writerBefore;
+    let writerAfter;
+    const expectPackStopped = () => {
+      // A terminated orphan can briefly remain a zombie until the host reaps it.
+      let state = '';
+      try { state = execFileSync('ps', ['-p', String(packPid), '-o', 'stat='], { encoding: 'utf8', timeout: 1000, maxBuffer: 1024 }).trim(); }
+      catch (error) { if (error.status !== 1) throw error; }
+      expect(state === '' || state.startsWith('Z'), JSON.stringify({ state, packPid, groupSignals })).toBe(true);
+    };
+    try {
+      const w = withSelfSync({ tickOnce: vi.fn() }, {
+        root, env, readHead: () => 'old', onRestart: () => 'restarted', log: { error: vi.fn() },
+        readState: () => ({ adopted: null, rejected: null, inProgress: null, quarantine: null }),
+        rebuild: async () => ({ moved: true, adopted: true, head: 'new', prevHead: 'old', plan: {} }),
+        hasMaintenanceRebuildJob: () => false,
+        maintainObjects: async opts => {
+          try {
+            writerBefore = inspectCloneLock(root, { lockRoot }).writer;
+            maintenanceResult = await maintainCloneObjects({ ...opts, timeoutMs: 2000,
+              hasBorrowers: () => false, isBusy: () => false });
+            packPid = Number(readFileSync(pidFile, 'utf8'));
+            writerAfter = inspectCloneLock(root, { lockRoot }).writer;
+            expectPackStopped();
+          } catch (error) { maintenanceError = error; }
+        },
+      });
+      await expect(w.tickOnce()).resolves.toBe('restarted');
+      // Assert outside the best-effort wrapper, which intentionally catches errors.
+      if (maintenanceError) throw maintenanceError;
+      expect(maintenanceError).toBeUndefined();
+      expect(packPid).toBeGreaterThan(0);
+      expect(existsSync(fallbackFile)).toBe(false);
+      expect(groupSignals).toContainEqual(expect.objectContaining({ signal: 'SIGKILL', result: true }));
+      expect(maintenanceResult).toEqual({ skipped: true, reason: 'maintenance-failed' });
+      expect(writerBefore?.owner).toBe(`clone-object-maintenance:${process.pid}`);
+      expect(writerAfter?.owner).toBe(writerBefore.owner);
+      expect(inspectCloneLock(root, { lockRoot }).writer).toBeNull();
+      expectPackStopped();
+    } finally {
+      // Also clean up descendants if the regression returns before killing them.
+      if (!packPid && existsSync(pidFile)) packPid = Number(readFileSync(pidFile, 'utf8'));
+      if (packPid) { try { process.kill(packPid, 'SIGKILL'); } catch { /* already gone */ } }
+      killSpy.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 10_000);
+  it('detects relative and canonical alternates and refuses oversized discovery', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'object-borrowers-'));
+    const source = join(dir, 'source'); const borrower = join(dir, 'borrower');
+    mkdirSync(join(source, '.git/objects'), { recursive: true });
+    mkdirSync(join(borrower, '.git/objects/info'), { recursive: true });
+    try {
+      expect(cloneHasObjectBorrowers(source, { roots: [borrower] })).toBe(false);
+      writeFileSync(join(borrower, '.git/objects/info/alternates'), '../../../source/.git/objects\n');
+      expect(cloneHasObjectBorrowers(source, { roots: [borrower] })).toBe(true);
+      expect(() => cloneHasObjectBorrowers(source, { roots: Array(4097).fill(borrower) })).toThrow(/inspect clone borrowers manually/);
+      writeFileSync(join(borrower, '.git/objects/info/alternates'), '/missing-store\n');
+      expect(() => cloneHasObjectBorrowers(source, { roots: [borrower] })).toThrow();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('follows a linked worktree common object store when scanning borrowers', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'object-worktree-'));
+    const source = join(dir, 'source'); const borrower = join(dir, 'borrower'); const linked = join(dir, 'linked');
+    mkdirSync(join(source, '.git/objects'), { recursive: true });
+    mkdirSync(join(borrower, '.git/objects/info'), { recursive: true });
+    mkdirSync(join(borrower, '.git/worktrees/linked'), { recursive: true }); mkdirSync(linked);
+    writeFileSync(join(linked, '.git'), `gitdir: ${join(borrower, '.git/worktrees/linked')}\n`);
+    writeFileSync(join(borrower, '.git/worktrees/linked/commondir'), '../..');
+    writeFileSync(join(borrower, '.git/objects/info/alternates'), join(source, '.git/objects'));
+    try { expect(cloneHasObjectBorrowers(source, { roots: [linked] })).toBe(true); }
+    finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('blocks Git in checkout subdirectories but excludes sibling paths sharing the checkout prefix', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'object-busy-descendant-'));
+    const root = join(dir, 'checkout');
+    mkdirSync(join(root, '.git'), { recursive: true });
+    mkdirSync(join(root, 'scripts'));
+    const sibling = join(dir, 'checkout-other');
+    mkdirSync(sibling);
+    try {
+      for (const [cwd, busy] of [[root, true], [join(root, 'scripts'), true], [sibling, false]]) {
+        const exec = bin => bin === 'ps' ? '123 /usr/bin/git\n' : `p123\nn${cwd}\n`;
+        expect(cloneGitIsBusy(root, { exec })).toBe(busy);
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('treats two Git PIDs as busy when only one has cwd evidence', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'object-busy-partial-'));
+    const root = join(dir, 'checkout');
+    const elsewhere = join(dir, 'elsewhere');
+    mkdirSync(join(root, '.git'), { recursive: true });
+    mkdirSync(elsewhere);
+    const processes = '123 /usr/bin/git\n456 /usr/bin/git\n';
+    try {
+      for (const output of [`p123\nn${elsewhere}\n`, `p123\nn${elsewhere}\np456\n`, `p123\np456\nn${elsewhere}\n`]) {
+        const exec = vi.fn(bin => bin === 'ps' ? processes : output);
+        expect(cloneGitIsBusy(root, { exec })).toBe(true);
+        expect(exec).toHaveBeenCalledWith('lsof', ['-n', '-a', '-p', '123,456', '-d', 'cwd', '-Fn'], expect.any(Object));
+      }
+      const exec = bin => bin === 'ps' ? processes : `p123\nn${elsewhere}\np456\nn${elsewhere}\n`;
+      expect(cloneGitIsBusy(root, { exec })).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('blocks index locks and running Git with this cwd, and fails closed on unavailable process evidence', () => {
+    const root = mkdtempSync(join(tmpdir(), 'object-busy-'));
+    mkdirSync(join(root, '.git'));
+    const exec = vi.fn(bin => bin === 'ps' ? '123 /usr/bin/git\n' : `p123\nn${root}\n`);
+    try {
+      expect(cloneGitIsBusy(root, { exec })).toBe(true);
+      expect(cloneGitIsBusy(root, { exec: () => '1 /usr/bin/node\n' })).toBe(false);
+      expect(() => cloneGitIsBusy(root, { exec: () => '' })).toThrow(/unreadable process table/);
+      expect(() => cloneGitIsBusy(root, { exec: () => 'invalid' })).toThrow(/incomplete process table/);
+      expect(() => cloneGitIsBusy(root, { exec: () => { throw new Error('no ps'); } })).toThrow(/no ps/);
+      expect(() => cloneGitIsBusy(root, { exec: bin => bin === 'ps' ? '1 git' : '' })).toThrow(/unreadable Git cwd/);
+      writeFileSync(join(root, '.git/index.lock'), ''); exec.mockClear();
+      expect(cloneGitIsBusy(root, { exec })).toBe(true);
+      expect(exec).not.toHaveBeenCalled();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
 });

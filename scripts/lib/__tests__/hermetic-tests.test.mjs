@@ -351,7 +351,7 @@ describe('setupHermeticTestFile lifecycle (beforeEach / afterEach / afterAll)', 
   });
 
   /** A throwaway checkout + a live root beside it; returns the driven hooks and the stub fs. */
-  function harness({ ambient = {}, testFile = 'a/some.test.mjs', debt = [], afterSettle } = {}) {
+  function harness({ ambient = {}, testFile = 'a/some.test.mjs', debt = [], afterSettle, fakeHome } = {}) {
     const repo = join(box, `repo${seq += 1}`); const live = join(box, 'live'); const violationsDir = join(box, `viol${seq}`);
     mkdirSync(join(repo, 'scripts'), { recursive: true }); mkdirSync(live, { recursive: true });
     writeFileSync(join(repo, 'scripts', 'hermetic-tests.settings.json'), JSON.stringify({
@@ -365,7 +365,7 @@ describe('setupHermeticTestFile lifecycle (beforeEach / afterEach / afterAll)', 
     setupHermeticTestFile({
       beforeEach: (fn) => hooks.beforeEach.push(fn), afterEach: (fn) => hooks.afterEach.push(fn), afterAll: (fn) => hooks.afterAll.push(fn),
       expect: { getState: () => ({ testPath: join(repo, testFile), currentTestName: 'case one' }) },
-      repoRoot: repo, ambient, violationsDir, afterSettle, guardFs: { fs, fsPromises: {}, fetchHost: null },
+      repoRoot: repo, ambient, violationsDir, afterSettle, fakeHome, guardFs: { fs, fsPromises: {}, fetchHost: null },
     });
     const run = (hook) => hooks[hook].forEach((fn) => fn());
     const logRow = (testId, kind, target) => {
@@ -413,6 +413,28 @@ describe('setupHermeticTestFile lifecycle (beforeEach / afterEach / afterAll)', 
     expect(() => h.run('afterEach')).not.toThrow();
     expect(() => h.run('afterAll')).toThrow(/outside any single test, or a child that outlived its test/);
     expect(existsSync(h.violationsDir)).toBe(false); // afterAll removes the shim log dir even when it fails the file
+  });
+
+  it.each(['afterAll', 'exit', 'keep'])('R657 removes per-file home/log dirs at %s and honors inspection retention', mode => {
+    const before = process.listeners('exit');
+    const fakeHome = join(box, 'fake-home');
+    const savedHome = process.env.HOME;
+    const h = harness({ fakeHome, ambient: mode === 'keep' ? { WE_TMP_LEAK_KEEP: '1' } : {} });
+    mkdirSync(h.violationsDir, { recursive: true });
+    try {
+      if (mode === 'exit') {
+        const hook = process.listeners('exit').find(fn => !before.includes(fn));
+        hook();
+        expect(existsSync(fakeHome)).toBe(false);
+        expect(existsSync(h.violationsDir)).toBe(false);
+      }
+      h.run('afterAll');
+      expect(existsSync(fakeHome)).toBe(mode === 'keep');
+      expect(existsSync(h.violationsDir)).toBe(mode === 'keep');
+      expect(process.listeners('exit')).toEqual(before);
+    } finally {
+      if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+    }
   });
 
   it('afterSettle runs AFTER the late rows are read, and still runs when settling fails the file', () => {
