@@ -197,14 +197,23 @@ export function hasForeignLiveLease(dir, nowMs = Date.now()) {
     if (!lease || typeof lease !== 'object') return true;
     if (lease.reserved) return true; // reserved leases are never ours to migrate, whatever the pid
     if (lease.pid === process.pid) return false;
-    const acquired = Date.parse(lease.acquiredAt);
-    if (Number.isNaN(acquired)) return false; // unparseable timestamp reads stale in lane-lease.mjs
-    const renewed = Date.parse(lease.renewedAt);
-    const ttl = Number.isFinite(lease.ttlMinutes) ? lease.ttlMinutes * 60_000 : 240 * 60_000;
-    return nowMs - (Number.isNaN(renewed) ? acquired : Math.max(acquired, renewed)) < ttl;
+    return isLeaseFresh(lease, nowMs);
   } catch {
     return true;
   }
+}
+
+/**
+ * True while a lease is inside its TTL (from the later of acquire/renew). An unparseable timestamp reads stale,
+ * like lane-lease.mjs. A lease that is not fresh can be reclaimed by another acquire at any moment, so it
+ * protects nothing: no removal may rely on it.
+ */
+function isLeaseFresh(lease, nowMs) {
+  const acquired = Date.parse(lease.acquiredAt);
+  if (Number.isNaN(acquired)) return false;
+  const renewed = Date.parse(lease.renewedAt);
+  const ttl = Number.isFinite(lease.ttlMinutes) ? lease.ttlMinutes * 60_000 : 240 * 60_000;
+  return nowMs - (Number.isNaN(renewed) ? acquired : Math.max(acquired, renewed)) < ttl;
 }
 
 /**
@@ -228,10 +237,12 @@ export function claimLaneForInstall(dir, nowMs = Date.now()) {
       return null;
     }
   };
+  // A claim only protects the lane while its lease is fresh: an expired lease can be reclaimed by another acquire
+  // between our last check and the removal, so `holds()` is false (fail closed) once the lease is not fresh.
   if (existsSync(file)) {
     const lease = read();
-    return lease && !lease.reserved && lease.pid === process.pid
-      ? { holds: () => { const now = read(); return !!now && !now.reserved && now.pid === process.pid; }, release: () => {} }
+    return lease && !lease.reserved && lease.pid === process.pid && isLeaseFresh(lease, nowMs)
+      ? { holds: () => { const now = read(); return !!now && !now.reserved && now.pid === process.pid && isLeaseFresh(now, Date.now()); }, release: () => {} }
       : null;
   }
   const token = randomUUID();
@@ -248,8 +259,9 @@ export function claimLaneForInstall(dir, nowMs = Date.now()) {
   } finally {
     rmSync(temp, { force: true });
   }
-  const mine = () => read()?.depsMigration === token;
-  return { holds: mine, release: () => { if (mine()) rmSync(file, { force: true }); } };
+  const mine = () => { const now = read(); return now?.depsMigration === token && isLeaseFresh(now, Date.now()); };
+  const stillOurs = () => read()?.depsMigration === token;
+  return { holds: mine, release: () => { if (stillOurs()) rmSync(file, { force: true }); } };
 }
 
 /**
