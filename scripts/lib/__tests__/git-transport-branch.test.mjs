@@ -495,6 +495,14 @@ describe('read fetch is coalesced through a per-repo+branch TTL stamp in .git', 
     m.read({ branch: 'ops/review-requests' }); m.read({ branch: 'ops/review-requests' });
     expect(fetches(m.calls)).toBe(1);
   });
+  it('fresh: true always fetches even with a fresh stamp, while an ordinary read still hits the cache', () => {
+    reset(); const m = mk();
+    m.read(); m.read({ fresh: true }); m.read({ fresh: true });
+    expect(fetches(m.calls)).toBe(3);
+    expect(m.logs.join('\n')).toMatch(/fresh-required/);
+    m.read(); // the earlier fresh fetches did not break the ordinary cache
+    expect(fetches(m.calls)).toBe(3);
+  });
   it('an unreadable stamp fails closed: fetch', () => {
     reset(); const m = mk();
     mkdirSync(stampDir, { recursive: true });

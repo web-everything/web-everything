@@ -6,6 +6,8 @@
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import {
   appendGitRowsSync, createGitLedgerStore, appendLedgerRows, readLedgerFromGit, ledgerGitPath, LedgerAppendExhaustedError, LEDGER_TRANSPORT_BRANCH,
   resolveLedgerReadSettings, formatLedgerReadSettings, sizedLedgerRun, DEFAULT_LEDGER_READ_MAX_BYTES, LEDGER_READ_MAX_BYTES_ENV,
@@ -40,6 +42,21 @@ describe('readLedgerFromGit: unreadable is never empty', () => {
     const r = readLedgerFromGit({ board: '/board', repo: REPO, run });
     expect(r.status).toBe('ok');
     expect(r.records).toHaveLength(1);
+  });
+});
+
+describe('readLedgerFromGit: decision readers pass fresh, ordinary readers use the TTL cache', () => {
+  const mkRun = (dir, calls) => (args) => { calls.push(args[0]); return args[0] === 'rev-parse' ? `${dir}\n` : ''; };
+  const fetchCount = (calls) => calls.filter((c) => c === 'fetch').length;
+  it('fresh: true fetches every time; the default read coalesces', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vlio-ttl-'));
+    const cached = []; const fresh = [];
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, cached) });
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, cached) });
+    expect(fetchCount(cached)).toBe(1);
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, fresh), fresh: true });
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, fresh), fresh: true });
+    expect(fetchCount(fresh)).toBe(2);
   });
 });
 
