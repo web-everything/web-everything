@@ -85,10 +85,10 @@ describe('explicit label allowlist (operator route R673): no command-line parsin
   it('an unreadable or oversized plist and an unreadable agents directory never block an allowlisted restart; the line counts them', async () => {
     const bad = fixture([new Error('stdout maxBuffer length exceeded'), { Label: 'com.we.writer' }]);
     expect((await restartServicesForClone(bad)).restarted).toHaveLength(1);
-    expect(bad.log.mock.calls.flat().join('\n')).toMatch(/not-allowlisted: com\.we\.writer \(1 LaunchAgent entry unreadable\)/);
+    expect(bad.log.mock.calls.flat().join('\n')).toMatch(/not-allowlisted: com\.we\.writer \(1 LaunchAgent entry unreadable, invalid or past the scan bound\)/);
     const gone = fixture(); gone.listPlists = () => { throw new Error('permission denied'); };
     expect((await restartServicesForClone(gone)).restarted).toHaveLength(1);
-    expect(gone.log.mock.calls.flat().join('\n')).toMatch(/not-allowlisted: none named \(1 LaunchAgent entry unreadable\)/);
+    expect(gone.log.mock.calls.flat().join('\n')).toMatch(/not-allowlisted: none named \(1 LaunchAgent entry unreadable, invalid or past the scan bound\)/);
   });
   it.each([['wildcard', ['*']], ['namespace glob', ['com.we.*']], ['a path', ['com.we/x']], ['whitespace', ['com.we x']], ['empty', ['']], ['not an array', 'com.we.writer']])(
     'an invalid allowlist (%s) never widens the list: the standard default still applies', async (_name, allowedLabels) => {
@@ -119,6 +119,59 @@ describe('explicit label allowlist (operator route R673): no command-line parsin
     clock.t += 600_000;
     await restartServicesForClone({ ...o, pendingOnly: true, settings: { allowedLabels: [] } });
     expect(o.stateStore.get(sampler)).toEqual({ at: 1_000_000, sha: 'A' }); expect(o.launchctl).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    ['more than 64 labels', Array.from({ length: 65 }, (_, i) => `com.we.s${i}`)],
+    ['a label over 128 characters', [`com.we.${'a'.repeat(125)}`]],
+    ['two labels differing only by case', ['com.we.Writer', 'com.we.writer']],
+  ])('an allowlist with %s is rejected whole: the standard default applies', async (_name, allowedLabels) => {
+    const o = fixture([]); await restartServicesForClone({ ...o, settings: { allowedLabels } });
+    expect(kicked(o)).toEqual([sampler]);
+  });
+  describe('the not-allowlisted listing is informational and bounded', () => {
+    it('allowlisted restarts finish before any plist is read, so a slow directory cannot delay them', async () => {
+      const events = [], o = fixture([{ Label: 'com.we.writer' }]);
+      const read = o.readPlist;
+      o.launchctl.mockImplementation(() => { events.push('kick'); return { status: 0 }; });
+      o.readPlist = path => { events.push('read'); return read(path); };
+      await restartServicesForClone(o);
+      expect(events).toEqual(['kick', 'read']);
+    });
+    it('stops after 200 plists and says the scan was cut short', async () => {
+      const plists = Array.from({ length: 250 }, (_, i) => ({ Label: `com.we.extra${i}` })), o = fixture(plists);
+      const read = vi.fn(o.readPlist); o.readPlist = read;
+      const r = await restartServicesForClone(o);
+      expect(read).toHaveBeenCalledTimes(200);
+      expect(o.log.mock.calls.flat().join('\n')).toMatch(/past the scan bound/);
+      expect(r.skipped.filter(x => x.reason === 'not-allowlisted')).toHaveLength(20);
+      expect(o.log.mock.calls.flat().join('\n')).toMatch(/\+180 more/);
+    });
+    it('stops after the 3 second budget', async () => {
+      let t = 1_000_000; const o = fixture(Array.from({ length: 10 }, (_, i) => ({ Label: `com.we.slow${i}` })));
+      const read = o.readPlist; let reads = 0;
+      o.now = () => t; o.readPlist = path => { reads += 1; t += 1500; return read(path); };
+      await restartServicesForClone(o);
+      expect(reads).toBe(2);
+      expect(o.log.mock.calls.flat().join('\n')).toMatch(/past the scan bound/);
+    });
+    it('an abort during the listing stops it quietly and reports no error', async () => {
+      const controller = new AbortController(), o = fixture([{ Label: 'com.we.a' }, { Label: 'com.we.b' }]);
+      const read = o.readPlist; let reads = 0;
+      o.readPlist = path => { reads += 1; controller.abort(); return read(path); };
+      const r = await restartServicesForClone({ ...o, signal: controller.signal });
+      expect(reads).toBe(1); expect(r.errors).toEqual([]);
+    });
+    it.each([
+      ['an over-long label', `com.we.${'x'.repeat(1_000_000)}`],
+      ['a label with control characters', 'com.we.bad\nname'],
+      ['a label with a path', 'com.we.a/b'],
+    ])('%s is never named in the log or the result; it is counted instead', async (_name, Label) => {
+      const o = fixture([{ Label }]); const r = await restartServicesForClone(o);
+      const text = o.log.mock.calls.flat().join('\n');
+      expect(text).toMatch(/not-allowlisted: none named \(1 LaunchAgent entry unreadable, invalid/);
+      expect(text.length).toBeLessThan(5000);
+      expect(r.skipped).toEqual([]);
+    });
   });
 });
 
@@ -519,16 +572,13 @@ describe('withSelfSync service restart hook', () => {
       expect(vi.getTimerCount()).toBe(0);
     } finally { vi.useRealTimers(); }
   });
-  it.each(['inspection', 'state persistence', 'lock acquisition'])('timeout cancellation prevents late kickstarts when delayed %s resumes', async stage => {
+  it.each(['state persistence', 'lock acquisition'])('timeout cancellation prevents late kickstarts when delayed %s resumes', async stage => {
     vi.useFakeTimers();
     const o = fixture(), log = { error: vi.fn() }, onRestart = vi.fn(() => 'restarted');
     let release, markStarted, restartDone, signal;
     const blocked = new Promise(resolve => { release = resolve; });
     const started = new Promise(resolve => { markStarted = resolve; });
-    if (stage === 'inspection') {
-      const read = o.readPlist;
-      o.readPlist = async path => { markStarted(); await blocked; return read(path); };
-    } else if (stage === 'lock acquisition') {
+    if (stage === 'lock acquisition') {
       const acquire = o.lockStore.acquire;
       o.lockStore.acquire = async label => { markStarted(); await blocked; return acquire(label); };
     } else {
@@ -565,7 +615,7 @@ describe('withSelfSync service restart hook', () => {
       expect(vi.getTimerCount()).toBe(0);
     } finally { release(); vi.useRealTimers(); }
   });
-  it('production plist inspection stays asynchronous while tick awaits completed kickstart', async () => {
+  it('the production not-allowlisted listing stays asynchronous and runs only after the kickstart; the tick waits for it', async () => {
     const o = fixture(); let completePlutil, restartDone, markInspectionStarted;
     const inspectionStarted = new Promise(resolve => { markInspectionStarted = resolve; });
     const readDir = vi.spyOn(fsAsync, 'readdir').mockResolvedValue(['0.plist']);
@@ -587,7 +637,7 @@ describe('withSelfSync service restart hook', () => {
       expect(tickDone).toBe(false);
       expect(readDir).toHaveBeenCalledWith(o.agentsDir);
       expect(exec).toHaveBeenCalledWith('plutil', ['-convert', 'json', '-o', '-', join(o.agentsDir, '0.plist')], expect.objectContaining({ timeout: 5000 }), expect.any(Function));
-      expect(o.launchctl).not.toHaveBeenCalled();
+      expect(o.launchctl).toHaveBeenCalledTimes(1); // the restart is already done; only the informational listing is pending
       let settled = false;
       void restartDone.then(() => { settled = true; });
       await Promise.resolve(); expect(settled).toBe(false);
@@ -614,6 +664,7 @@ describe('withSelfSync service restart hook', () => {
 });
 
 describe('stale detection inspects exactly the allowlisted labels', () => {
+  const sampler = 'com.we.resource-sampler';
   const stale = o => findStaleCodeServices({ ...o, readProcessStartMs: () => 1000, readAdoptedAtMs: () => 2000 });
   const svc = (Label, ProgramArguments = ['node', join(cloneRoot, 'sampler.mjs')]) => ({ Label, ProgramArguments });
   it('a label that is not on the allowlist is never inspected, whatever its argv says', () => {
@@ -630,6 +681,31 @@ describe('stale detection inspects exactly the allowlisted labels', () => {
   it('an extra reviewed label is inspected alongside the default sampler, with no plist needed', () => {
     const o = { ...fixture([]), settings: { allowedLabels: ['com.we.resource-sampler', 'com.we.extra'] } };
     expect(stale(o).map(f => f.label)).toEqual(['com.we.resource-sampler', 'com.we.extra']);
+  });
+  describe('a host-wide service is judged per clone without false alarms', () => {
+    const base = { readProcessStartMs: () => 1000, readAdoptedAtMs: () => 2000, readAdoptedHead: () => 'S' };
+    it('a second clone adopting the build another clone already restarted for is fresh, not stale forever', () => {
+      const fresh = vi.fn(), readRestart = vi.fn(() => ({ at: 900, sha: 'S' }));
+      expect(findStaleCodeServices({ ...fixture(), ...base, readRestart, onFreshService: fresh })).toEqual([]);
+      expect(readRestart).toHaveBeenCalledWith(sampler);
+      expect(fresh).toHaveBeenCalledWith(expect.objectContaining({ label: sampler }));
+    });
+    it.each([
+      ['the restart record names another build', { at: 900, sha: 'OLD' }],
+      ['the process started before the restart was recorded (kickstart failed)', { at: 2500, sha: 'S' }],
+      ['the restart record has no usable time', { sha: 'S' }],
+      ['there is no restart record', undefined],
+    ])('still stale when %s', (_n, record) => {
+      expect(findStaleCodeServices({ ...fixture(), ...base, readRestart: () => record })).toEqual([expect.objectContaining({ label: sampler, reason: 'stale-code' })]);
+    });
+    it('still stale when the clone has no adopted head to match the restart record against', () => {
+      expect(findStaleCodeServices({ ...fixture(), ...base, readAdoptedHead: () => null, readRestart: () => ({ at: 900, sha: 'S' }) })).toHaveLength(1);
+    });
+    it('a clone that has adopted nothing makes no claim: no stale flag and no fresh evidence', () => {
+      const fresh = vi.fn(), readProcessStartMs = vi.fn(() => 1000);
+      expect(findStaleCodeServices({ ...fixture(), readProcessStartMs, readAdoptedAtMs: () => null, onFreshService: fresh })).toEqual([]);
+      expect(fresh).not.toHaveBeenCalled();
+    });
   });
   it('stale detection never reads a plist or its command line', () => {
     const readPlist = vi.fn(), listPlists = vi.fn();

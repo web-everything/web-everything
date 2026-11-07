@@ -4,6 +4,7 @@
  * a plist's command line, arguments, shell string and wrappers are never read to infer ownership.
  */
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import fsAsync from 'node:fs/promises';
 import childProcess from 'node:child_process';
 import { homedir } from 'node:os';
@@ -108,14 +109,22 @@ const inFlight = new Set();
 
 // The reviewed allowlist is EXACT labels (no globs): a label names one service, nothing is matched by prefix.
 // Labels go into a launchctl service target, so keep them to a plain launchd-label alphabet (no "/", spaces, "*").
+// Bounded: a label becomes a state-file name (255-byte limit), and labels differing only by case would share
+// one state file on a case-insensitive volume, so the list is capped and must be unique ignoring case.
 const LABEL = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
-const labels = value => Array.isArray(value) && value.every(x => typeof x === 'string' && LABEL.test(x));
+const MAX_LABEL = 128, MAX_ALLOWED = 64;
+const labels = value => Array.isArray(value) && value.length <= MAX_ALLOWED
+  && value.every(x => typeof x === 'string' && x.length <= MAX_LABEL && LABEL.test(x))
+  && new Set(value.map(x => x.toLowerCase())).size === value.length;
 const defaults = { enabled: true,
   // Namespace membership alone does not establish that a service is stateless: every entry is reviewed by hand.
   allowedLabels: ['com.we.resource-sampler'], minIntervalMs: 600_000 };
 // Labels under these namespaces are named in the log when they are NOT on the allowlist, so a missing entry is visible.
 const MANAGED_NAMESPACE = /^com\.(?:we|webeverything)\./;
 const MAX_NAMED = 20;
+// The not-allowlisted listing is informational and runs AFTER the restarts, so it is bounded: at most this many
+// plists and this much wall time (a hung plutil costs one 5s timeout, never the restart).
+const MAX_SCANNED_PLISTS = 200, SCAN_BUDGET_MS = 3000;
 
 // Kill-switch parsing is case/whitespace-insensitive and FAILS CLOSED: an operator who set the variable
 // meant to stop restarts, so any non-empty value that is not a recognised "enable" word disables them.
@@ -145,18 +154,23 @@ const neverRestartReason = (label, p) =>
   : !p.allowedLabels.includes(label) ? 'not-allowlisted' : null;
 
 // Labels of managed-namespace LaunchAgents that are not on the allowlist (label read only; nothing else in a plist is looked at).
+// Informational: never throws on abort (it just stops), skips entries past the bounds, and counts anything it cannot
+// use (unreadable plist, over-long or malformed label, scan cut short) as `unreadable` so the log line says so.
 async function unlistedLabels({ agentsDir = join(homedir(), 'Library', 'LaunchAgents'), readPlist = readHostPlistAsync,
-  listPlists = dir => fsAsync.readdir(dir), allowed, selfLabel, signal }) {
-  const named = [];
-  let unreadable = 0, files;
+  listPlists = dir => fsAsync.readdir(dir), allowed, selfLabel, signal, now }) {
+  const named = [], started = now();
+  let unreadable = 0, files, scanned = 0;
   try { files = await listPlists(agentsDir); } catch { return { named, unreadable: 1 }; }
   for (const file of files) {
-    assertActive(signal);
+    if (signal?.aborted) break;
     if (!file.endsWith('.plist')) continue;
+    if (scanned >= MAX_SCANNED_PLISTS || now() - started >= SCAN_BUDGET_MS) { unreadable += 1; break; }
+    scanned += 1;
     try {
       const label = (await readPlist(resolve(agentsDir, file)))?.Label;
-      if (typeof label === 'string' && MANAGED_NAMESPACE.test(label) && !allowed.includes(label) && label !== selfLabel
-        && !named.includes(label)) named.push(label);
+      if (typeof label !== 'string' || !MANAGED_NAMESPACE.test(label)) continue;
+      if (label.length > MAX_LABEL || !LABEL.test(label)) { unreadable += 1; continue; }
+      if (!allowed.includes(label) && label !== selfLabel && !named.includes(label)) named.push(label);
     } catch { unreadable += 1; }
   }
   return { named, unreadable };
@@ -216,16 +230,6 @@ export async function restartServicesForClone({ settings, platform, env = proces
       if (!owed.size) return result;
     }
     const p = policy.value;
-    // Services that are not on the allowlist are never restarted. One line names them so a missing entry is visible.
-    if (!pendingOnly) {
-      const { named, unreadable } = await unlistedLabels({ ...options, allowed: p.allowedLabels, selfLabel, signal });
-      for (const label of named) result.skipped.push({ label, reason: 'not-allowlisted' });
-      if (named.length || unreadable) {
-        safeLog(log, `daemon.serviceRestart not-allowlisted: ${named.length ? `${named.slice(0, MAX_NAMED).join(', ')}${named.length > MAX_NAMED ? `, +${named.length - MAX_NAMED} more` : ''}` : 'none named'}`
-          + `${unreadable ? ` (${unreadable} LaunchAgent entr${unreadable === 1 ? 'y' : 'ies'} unreadable)` : ''}: never restarted; `
-          + `add the label to daemon.serviceRestart.allowedLabels to restart it (allowedLabels source ${policy.sources?.allowedLabels ?? 'unknown'})`);
-      }
-    }
     for (const label of owed ? owed.keys() : new Set(p.allowedLabels)) {
       const service = { label };
       // A deferred restart owes the sha it was deferred for, not the (possibly absent) current adoption.
@@ -313,6 +317,17 @@ export async function restartServicesForClone({ settings, platform, env = proces
         inFlight.delete(label);
       }
     }
+    // Services that are not on the allowlist are never restarted. One line names them so a missing entry is visible.
+    // It runs AFTER the restarts and is bounded, so a slow or oversized LaunchAgents directory can never delay one.
+    if (!pendingOnly) {
+      const { named, unreadable } = await unlistedLabels({ ...options, allowed: p.allowedLabels, selfLabel, signal, now });
+      for (const label of named.slice(0, MAX_NAMED)) result.skipped.push({ label, reason: 'not-allowlisted' });
+      if (named.length || unreadable) {
+        safeLog(log, `daemon.serviceRestart not-allowlisted: ${named.length ? `${named.slice(0, MAX_NAMED).join(', ')}${named.length > MAX_NAMED ? `, +${named.length - MAX_NAMED} more` : ''}` : 'none named'}`
+          + `${unreadable ? ` (${unreadable} LaunchAgent entr${unreadable === 1 ? 'y' : 'ies'} unreadable, invalid or past the scan bound)` : ''}: never restarted; `
+          + `add the label to daemon.serviceRestart.allowedLabels to restart it (allowedLabels source ${policy.sources?.allowedLabels ?? 'unknown'})`);
+      }
+    }
   } catch (error) { report('errors', {}, message(error)); }
   return result;
 }
@@ -340,8 +355,18 @@ function processStart(label, { launchctl, uid, ps }) {
 /** null process start means positively not running; unknown evidence is flagged.
  * Inspects exactly the allowlisted labels (the services policy restarts), never a plist's command line.
  * onFreshService reports positive clean evidence so health episodes can close without treating absence as clean. */
+// The allowlisted services are host-wide, but adoption is per clone: a clone that adopted the same build another
+// clone already restarted the service for never restarts it again (same-adopted-sha), so its own adoption time
+// alone would flag that service stale for good. The restart record is the evidence that the build is loaded.
+const readRestartRecord = label => { try { return JSON.parse(readFileSync(diskState.path(label), 'utf8')); } catch { return undefined; } };
+// null = this clone has adopted nothing (no claim to be stale against); NaN = an adoption record with an unusable time.
+const readAdoption = root => {
+  const adopted = readRebuildState(root)?.adopted;
+  return adopted == null ? { atMs: null, head: null } : { atMs: Date.parse(adopted.at ?? ''), head: adopted.head ?? null };
+};
+
 export function findStaleCodeServices({ readProcessStartMs = processStart, onFreshService = () => {},
-  readAdoptedAtMs = root => Date.parse(readRebuildState(root)?.adopted?.at ?? ''),
+  readAdoptedAtMs, readAdoptedHead, readRestart = readRestartRecord,
   launchctl = printHost, uid = userId, ps = argv => execFileSync('ps', argv, commandOptions),
   settings, platform, env = process.env, envValues, log, selfLabel = null, ...options } = {}) {
   // An unreadable policy fails closed: one unlabeled flag (the inspection is incomplete), never a clean result.
@@ -357,10 +382,17 @@ export function findStaleCodeServices({ readProcessStartMs = processStart, onFre
       const start = readProcessStartMs(label, { launchctl, uid, ps });
       if (start === null) { onFreshService(service); continue; }
       if (!Number.isFinite(start)) throw new Error('unreadable process start');
-      const adopted = readAdoptedAtMs(options.cloneRoot);
+      const adoption = readAdoptedAtMs ? { atMs: readAdoptedAtMs(options.cloneRoot), head: readAdoptedHead?.(options.cloneRoot) ?? null } : readAdoption(options.cloneRoot);
+      const adopted = adoption.atMs;
+      // This clone has adopted nothing, so there is no rebuild the service could be stale against: no claim either way.
+      if (adopted === null) continue;
       if (!Number.isFinite(adopted)) { flagged.push({ ...service, reason: 'adoption-unreadable' }); continue; }
-      if (start < Math.floor(adopted / 1000) * 1000) flagged.push({ ...service, reason: 'stale-code', processStartMs: start, adoptedAtMs: adopted });
-      else onFreshService(service);
+      if (start >= Math.floor(adopted / 1000) * 1000) { onFreshService(service); continue; }
+      // Started before this clone's adoption: still fresh when it was restarted for this very build (its restart
+      // record names the adopted head) and the process started after that restart was recorded.
+      const restart = adoption.head ? readRestart(label) : undefined;
+      if (restart && restart.sha === adoption.head && Number.isFinite(restart.at) && start >= Math.floor(restart.at / 1000) * 1000) onFreshService(service);
+      else flagged.push({ ...service, reason: 'stale-code', processStartMs: start, adoptedAtMs: adopted });
     } catch (error) { flagged.push({ ...service, reason: 'process-unreadable', error: message(error) }); }
   }
   return flagged;
