@@ -115,6 +115,25 @@ describe('lane deps installer', () => {
 });
 
 describe('lane deps hashing and readiness (real lane directory)', () => {
+  it('a matching npm marker is stale when pnpm is usable', () => {
+    const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
+    const pnpmUsable = vi.fn(() => true);
+    expect(depsReady(dir, markerPath, storeDir, { pnpmUsable })).toBe('stale');
+    expect(pnpmUsable).toHaveBeenCalledOnce();
+  });
+  it('a matching npm marker stays ok when pnpm is unavailable or no probe is supplied', () => {
+    const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
+    expect(depsReady(dir, markerPath, storeDir, { pnpmUsable: () => false })).toBe('ok');
+    expect(depsReady(dir, markerPath, storeDir)).toBe('ok');
+  });
+  it('a matching legacy raw-hash marker is stale when pnpm is usable (lane-4)', () => {
+    const { dir, markerPath, storeDir } = lane({ marker: d => lockHash(d, 'npm') });
+    expect(depsReady(dir, markerPath, storeDir, { pnpmUsable: () => true })).toBe('stale');
+  });
+  it('a matching pnpm marker stays ok even when pnpm is usable', () => {
+    const { dir, markerPath, storeDir } = lane({ marker: pnpmMarker });
+    expect(depsReady(dir, markerPath, storeDir, { pnpmUsable: () => true })).toBe('ok');
+  });
   it.each(['pnpm-lock.yaml', 'pnpm-workspace.yaml'])(
     'a %s change moves the pnpm hash only and makes a pnpm-marked lane stale', file => {
       const { dir, markerPath, storeDir } = lane({ marker: pnpmMarker });
@@ -147,12 +166,14 @@ describe('lane deps hashing and readiness (real lane directory)', () => {
     expect(lockHash(dir, 'pnpm', moved)).not.toBe(lockHash(dir, 'pnpm', storeDir));
     expect(depsReady(dir, markerPath, moved)).toBe('stale');
   });
-  it('a legacy plain-hash (npm) marker stays ready and skips install', () => {
+  it('a legacy plain-hash (npm) marker migrates to pnpm when the selected plan is pnpm', () => {
     const { dir, markerPath, storeDir } = lane({ marker: d => lockHash(d, 'npm') });
-    const exec = vi.fn();
-    expect(ensureLaneDeps({ dir, markerPath, storeDir, selectPlan: () => select({ storeDir }), exec })).toBe('ok');
-    expect(exec).not.toHaveBeenCalled();
-    expect(existsSync(join(dir, 'node_modules', 'kept'))).toBe(true);
+    const exec = vi.fn(() => mkdirSync(join(dir, 'node_modules')));
+    expect(ensureLaneDeps({ dir, markerPath, storeDir, selectPlan: () => select({ storeDir }), exec })).toBe('installed');
+    expect(exec).toHaveBeenCalledOnce();
+    expect(exec).toHaveBeenCalledWith('/bin/pnpm', ['install', '--frozen-lockfile', '--store-dir=' + storeDir]);
+    expect(existsSync(join(dir, 'node_modules', 'kept'))).toBe(false);
+    expect(readFileSync(markerPath, 'utf8')).toBe(pnpmMarker(dir, storeDir));
   });
   it('a store wiped and recreated DURING a pnpm install leaves the lane stale, with no marker', () => {
     const { dir, markerPath, storeDir } = lane({ marker: () => 'pnpm:old' });
@@ -255,14 +276,11 @@ describe('lane deps hashing and readiness (real lane directory)', () => {
     expect(depsReady(dir, markerPath)).toBe('missing');
   });
 
-  it.each([
-    ['pnpm-marked lane, plan now resolves to npm', 'pnpm', 'npm'],
-    ['npm-marked lane, plan now resolves to pnpm', 'npm', 'pnpm'],
-  ])('a ready %s is left alone: no probe, no wipe, no install', (_name, installed) => {
-    const { dir, markerPath, storeDir } = lane({ marker: installed === 'pnpm' ? pnpmMarker : npmMarker });
+  it('a ready pnpm-marked lane is left alone: no probe, no wipe, no install', () => {
+    const { dir, markerPath, storeDir } = lane({ marker: pnpmMarker });
     const before = readFileSync(markerPath, 'utf8');
-    // The plan an install would pick now resolves to the OTHER backend (PATH, probe or parity changed).
-    const selectPlan = vi.fn(() => installed === 'pnpm' ? select({ which: () => null }) : select());
+    // The plan an install would pick now resolves to npm (PATH, probe or parity changed).
+    const selectPlan = vi.fn(() => select({ which: () => null }));
     const exec = vi.fn();
     const state = ensureLaneDeps({ dir, markerPath, storeDir, selectPlan, exec });
     expect(existsSync(join(dir, 'node_modules', 'kept'))).toBe(true);
@@ -270,6 +288,67 @@ describe('lane deps hashing and readiness (real lane directory)', () => {
     expect(selectPlan).not.toHaveBeenCalled(); // no `pnpm --version` probe on a ready lane
     expect(state).toBe('ok');
     expect(readFileSync(markerPath, 'utf8')).toBe(before);
+  });
+  it('a ready npm-marked lane migrates with one pnpm plan and removes only its node_modules', () => {
+    const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
+    const nodeModules = join(dir, 'node_modules');
+    const sibling = join(dir, 'node_modules-sibling');
+    const storeFile = join(storeDir, 'kept');
+    writeFileSync(sibling, 'lane sibling');
+    writeFileSync(storeFile, 'shared store content');
+    const generation = readStoreGeneration(storeDir);
+    const plan = select({ storeDir });
+    const selectPlan = vi.fn(() => plan);
+    const exec = vi.fn(() => {
+      expect(existsSync(nodeModules)).toBe(false);
+      expect(readFileSync(sibling, 'utf8')).toBe('lane sibling');
+      expect(readFileSync(storeFile, 'utf8')).toBe('shared store content');
+      mkdirSync(nodeModules);
+    });
+    expect(ensureLaneDeps({ dir, markerPath, storeDir, selectPlan, exec })).toBe('installed');
+    expect(selectPlan).toHaveBeenCalledOnce();
+    expect(exec).toHaveBeenCalledOnce();
+    expect(exec).toHaveBeenCalledWith(plan.command, plan.args);
+    expect(existsSync(join(nodeModules, 'kept'))).toBe(false);
+    expect(readFileSync(sibling, 'utf8')).toBe('lane sibling');
+    expect(readFileSync(storeFile, 'utf8')).toBe('shared store content');
+    expect(readStoreGeneration(storeDir)).toBe(generation);
+    expect(readFileSync(markerPath, 'utf8')).toBe(pnpmMarker(dir, storeDir));
+  });
+  it.each([
+    ['pnpm missing', { which: () => null }],
+    ['parity fails', { parity: () => false }],
+  ])('a ready npm-marked lane stays ok without reinstalling when %s', (_reason, overrides) => {
+    const { dir, markerPath, storeDir } = lane({ marker: npmMarker });
+    const before = readFileSync(markerPath, 'utf8');
+    const selectPlan = vi.fn(() => select({ storeDir, ...overrides }));
+    const exec = vi.fn();
+    expect(ensureLaneDeps({ dir, markerPath, storeDir, selectPlan, exec })).toBe('ok');
+    expect(exec).not.toHaveBeenCalled();
+    expect(existsSync(join(dir, 'node_modules', 'kept'))).toBe(true);
+    expect(readFileSync(markerPath, 'utf8')).toBe(before);
+    expect(selectPlan).toHaveBeenCalledOnce();
+  });
+  it('a failed pnpm install records the current npm hash and prevents reinstalling on the next acquire', () => {
+    const { dir, markerPath, storeDir } = lane({ nodeModules: false });
+    const selectPlan = vi.fn(() => select({ storeDir }));
+    const exec = vi.fn().mockImplementationOnce(() => { throw Error('pnpm failed'); })
+      .mockImplementationOnce(() => {
+        writeFileSync(join(dir, 'package-lock.json'), '{"lockfileVersion":3,"afterFallback":true}');
+        mkdirSync(join(dir, 'node_modules'));
+      });
+    expect(ensureLaneDeps({ dir, markerPath, storeDir, selectPlan, exec })).toBe('installed');
+    expect(exec.mock.calls).toEqual([
+      ['/bin/pnpm', ['install', '--frozen-lockfile', '--store-dir=' + storeDir]],
+      ['npm', ['ci']],
+    ]);
+    expect(readFileSync(markerPath, 'utf8')).toBe(npmMarker(dir));
+    exec.mockClear();
+    selectPlan.mockClear();
+    expect(ensureLaneDeps({ dir, markerPath, storeDir, selectPlan, exec })).toBe('ok');
+    expect(exec).not.toHaveBeenCalled();
+    expect(selectPlan).not.toHaveBeenCalled();
+    expect(readFileSync(markerPath + '.pnpm-failed', 'utf8')).toBe(lockHash(dir, 'npm'));
   });
   it('a stale lane installs and stamps <backend>:<that backend hash>', () => {
     const { dir, markerPath, storeDir } = lane({ marker: () => 'pnpm:old' });
