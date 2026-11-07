@@ -53,9 +53,10 @@ const keyOf = (x) => `${x?.repo ?? ''}#${x?.num}`;
  * @param {Array<{num,repo?,reason?,role?}>} [p.coupleHeld]
  * @param {Array<{num,repo?,waitOn?,overlapYield?}>} [p.deferred]
  * @param {Array<{num,repo?,reasons?}>} [p.parked]
+ * @param {Array<{num,repo?,outcome?,kind?,reason?}>} [p.enqueueOutcomes] real enqueue holds for ready PRs (#6222)
  * @returns {Array<{num:number,repo:string|null,kind:string,reason:string,source:string}>}
  */
-export function buildSkipReasons({ verdicts = [], merged = [], failedMerges = [], revalidationAborted = [], pendingRebased = [], coupleHeld = [], deferred = [], parked = [] } = {}) {
+export function buildSkipReasons({ verdicts = [], merged = [], failedMerges = [], revalidationAborted = [], pendingRebased = [], coupleHeld = [], deferred = [], parked = [], enqueueOutcomes = [] } = {}) {
   const landed = new Set(merged.map(keyOf));
   const rows = new Map();
   const put = (x, kind, reason, source) => {
@@ -82,8 +83,11 @@ export function buildSkipReasons({ verdicts = [], merged = [], failedMerges = []
   }
   // Listed ready at pass start but never landed and never reported by a bucket above. Name the cause: a couple
   // partner (same item) that did not land, else the pass simply ended before reaching it.
+  const heldAtEnqueue = new Map(enqueueOutcomes.filter((o) => o?.outcome === 'not-enqueued').map((o) => [keyOf(o), o]));
   for (const v of verdicts) {
     if (v.decision !== 'merge') continue;
+    const held = heldAtEnqueue.get(keyOf(v));
+    if (held) { put(v, String(held.kind || 'batching-deferred'), held.reason || 'admission deferred', 'enqueueOutcomes'); continue; }
     const partner = v.item == null ? null : verdicts.find((o) => o !== v && o.item != null && String(o.item) === String(v.item)
       && keyOf(o) !== keyOf(v) && !landed.has(keyOf(o)));
     if (partner) {

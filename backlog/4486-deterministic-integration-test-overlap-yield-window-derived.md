@@ -6,8 +6,8 @@ status: open
 scope: ["we:scripts/conveyor/land-overlap-yield.mjs", "we:scripts/conveyor/__tests__/land-overlap-yield.test.mjs", "we:scripts/conveyor/__tests__/land-overlap-yield-history.test.mjs"]
 estimatedLoc: 260
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-02"
-preparedAgainstSha: "72bb0262baf5eb33807bdfca065b7aefdac5bcc0"
+preparedDate: "2026-11-06"
+preparedAgainstSha: "372aa56e0c56a24d91f254fd7c5635aa4d064df7"
 tags: []
 ---
 
@@ -22,6 +22,8 @@ Follow-up from we:backlog/4314-file-the-prevention-guard-s-owed-by-chalbert-web-
 - Additional factual correction: we:scripts/conveyor/land-overlap-yield.mjs:281 implements the smaller-of-current-and-default fallback but emits no warning; we:scripts/conveyor/land-overlap-yield.mjs:416 likewise silently marks shallow evidence untrusted. The requested warning needs implementation, not merely an assertion against existing behavior.
 - Corrected scope: retain the reader module and its unit tests; add we:scripts/conveyor/__tests__/land-overlap-yield-history.test.mjs for real repositories. Remove the drain source/test from the touch set: we:scripts/merge-ai-prs.mjs:223 imports the same compute function, and we:scripts/conveyor/land-overlap-yield.mjs:505–522 already creates a reader per planning pass and bypasses history for explicit window overrides. No caller signature or default change is required.
 - Estimate: previously no estimatedLoc or size. Set estimatedLoc to 260: approximately 45 changed lines in we:scripts/conveyor/land-overlap-yield.mjs, 35 in we:scripts/conveyor/__tests__/land-overlap-yield.test.mjs, and 180 in the new we:scripts/conveyor/__tests__/land-overlap-yield-history.test.mjs. The checked helper directory we:scripts/__tests__/lib/ contains spawn-timeout helpers, not a reusable Git-history fixture.
+
+- Re-prepare 2026-11-06: premise rechecked against main 372aa56e. `git diff 72bb0262..HEAD` is empty for we:scripts/conveyor/land-overlap-yield.mjs and we:scripts/conveyor/__tests__/land-overlap-yield.test.mjs, and the history test file does not exist, so the goal is undelivered and the cited lines (rev-list at :421, silent untrusted fallback) still hold. Design, MVP, tests and [A1]–[A5] unchanged; only the stamp was refreshed.
 
 ## Design
 
