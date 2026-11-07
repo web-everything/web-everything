@@ -1,4 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { rebuildStatePath } from '../daemon-rebuild/state.mjs';
 import * as restartModule from '../launchd-code-restart.mjs';
 
 const { restartServicesForClone } = restartModule;
@@ -362,6 +366,18 @@ describe('findStaleCodeServices reports older running code without restarting', 
     expect(await inspect(o)).toEqual([expect.objectContaining({ label: sampler, reason: 'adoption-unreadable' })]);
     expect(o.onFreshService).not.toHaveBeenCalled();
   });
+
+  it.each([['corrupt adoption file', '{not json'], ['unreadable adoption path (directory)', null]])(
+    'fails closed with adoption-unreadable for a %s read by the real reader', async (_name, body) => {
+      const dir = mkdtempSync(join(tmpdir(), 'adopt-'));
+      try {
+        const file = rebuildStatePath(cloneRoot, { WE_DAEMON_STATE_DIR: dir });
+        if (body === null) mkdirSync(file); else writeFileSync(file, body);
+        const o = staleFixture({ readAdoptedAtMs: undefined, env: { WE_DAEMON_STATE_DIR: dir } });
+        expect(await inspect(o)).toEqual([expect.objectContaining({ label: sampler, reason: 'adoption-unreadable' })]);
+        expect(o.onFreshService).not.toHaveBeenCalled();
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
 
   it('makes no stale or fresh claim when the clone has adopted nothing', async () => {
     const o = staleFixture({ readAdoptedAtMs: vi.fn(() => null) });

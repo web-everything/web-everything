@@ -1,7 +1,8 @@
 // Restart reviewed launchd labels when the adopted sha differs from their last successful restart.
 import childProcess from 'node:child_process';
 import { cloneKey } from './daemon-overlays.mjs';
-import { readRebuildState } from './daemon-rebuild/state.mjs';
+import { readFileSync } from 'node:fs';
+import { rebuildStatePath } from './daemon-rebuild/state.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 
 const commandOptions = { encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024 };
@@ -134,11 +135,14 @@ function processStart(label, { launchctl, uid, ps }) {
   return { start, cloneRoot: root, precisionMs: 1000 };
 }
 
-// null adoption means no adopted build; NaN means an unusable adoption timestamp.
-const readAdoption = root => {
-  const adopted = readRebuildState(root)?.adopted;
+// null adoption means no adopted build (no state file); NaN means unreadable or unusable evidence.
+const readAdoption = (root, env = process.env) => {
+  let parsed;
+  try { parsed = JSON.parse(readFileSync(rebuildStatePath(root, env), 'utf8')); }
+  catch (e) { return e?.code === 'ENOENT' ? { atMs: null, head: null } : { atMs: NaN, head: null }; }
+  const adopted = parsed?.adopted;
   return adopted == null ? { atMs: null, head: null }
-    : { atMs: Date.parse(adopted.at ?? ''), head: adopted.head ?? null };
+    : { atMs: Date.parse(adopted?.at ?? ''), head: adopted?.head ?? null };
 };
 
 /** Inspect only policy-approved labels; fresh callbacks require positive process evidence. */
@@ -171,7 +175,7 @@ export function findStaleCodeServices({ cloneRoot, settings, platform, env = pro
       if (!Number.isFinite(start)) throw new Error('unreadable process start');
       let adopted;
       try {
-        adopted = readAdoptedAtMs ? readAdoptedAtMs(cloneRoot) : readAdoption(cloneRoot).atMs;
+        adopted = readAdoptedAtMs ? readAdoptedAtMs(cloneRoot) : readAdoption(cloneRoot, env).atMs;
         if (adopted !== null && !Number.isFinite(adopted)) throw new Error('unreadable adoption time');
       } catch (error) { flags.complete = false; flags.push({ ...service, reason: 'adoption-unreadable', error: message(error) }); continue; }
       if (adopted === null) { flags.complete = false; continue; }
