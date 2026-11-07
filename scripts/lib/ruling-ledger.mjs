@@ -24,7 +24,7 @@
 import { renderOperatorSendBackBrief, renderOperatorSendBackReviewBlock } from './operator-send-backs.mjs';
 import { readReferralRecords, referralRecheck, referralRecordState, mandatoryReferralState,parseOperatorRulingComment, readOperatorRulings, carriedBackingHolds, sameFindingForClearing, operatorRulingId, AUTO_POLICY_ACTOR } from './jury-core.mjs';
 import { isRestackOf } from './restack-equivalence.mjs';
-import { isOperatorAuthored, isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { JUDGE_ACTOR, OPERATOR_LOGINS, isOperatorAuthored, isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { DEFAULT_FIXER_ESCALATION, TEST_FIRST_INSTRUCTION, humanAtMisses } from './fixer-escalation-policy.mjs';
 
 export const RULING_NEEDED_LABEL = 'advisory:ruling-needed';
@@ -233,13 +233,19 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
   (Array.isArray(pr?.comments) ? pr.comments : []).forEach((c, index) => {
     const parsed = parseOperatorRulingComment(c);
     for (const x of parsed?.record?.rulings ?? []) {
+      if (parsed.record.actor === JUDGE_ACTOR && x.result !== 'block') continue;
+      // Structural parsing proves authorship, not current judge authority. Use
+      // the same authorized rows as the acceptance gate before retiring a hold.
+      if (parsed.record.actor === JUDGE_ACTOR && !operatorRulings.some(o =>
+        o.actor === JUDGE_ACTOR && o.head === parsed.record.head && o.runId === x.runId
+        && o.key === x.key && o.result === x.result && o.at === parsed.record.at)) continue;
       const ruled = allRecords.find((r) => r.runId === x.runId && r.head === parsed.record.head)?.referrals.find((f) => f.key === x.key);
       if (ruled) structured.push({ index, result: x.result, clearing: clearingView(ruled), supersedes: x.supersedes ?? [] });
       // An `auto-policy` structured `block` (review.referralDefault=auto-block) is a standing block like a reviewer's: the
       // same finding coming back on a later head is an ignored ruling, so a fixer that keeps missing escalates to the
       // operator instead of being auto-blocked forever. The operator's own structured blocks are NOT registered here
       // (operator mode is unchanged).
-      if (ruled && x.result === 'block' && String(parsed.record.actor ?? '').toLowerCase() === AUTO_POLICY_ACTOR) {
+      if (ruled && x.result === 'block' && [AUTO_POLICY_ACTOR, JUDGE_ACTOR].includes(String(parsed.record.actor ?? '').toLowerCase())) {
         blocks.set(`structured:${index}:${x.runId}:${x.key}`, { source: 'structured', rulingId: operatorRulingId({ head: parsed.record.head, runId: x.runId, key: x.key, at: parsed.record.at }),
           finding: findingView(ruled), clearing: clearingView(ruled), ruling: x.reason ?? parsed.record.reason, priorHead: parsed.record.head, index, at: sinceOf(c) });
       }
@@ -324,7 +330,7 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
       // auto-block on 166d067, the same finding re-raised on the fix head dfa0b5c and auto-blocked again; the fixer
       // found it already fixed, ended without a push, and was re-dispatched ~25 times with no escalation).
       if (operatorRulings.some((o) => o.head === head && o.runId === record.runId && o.key === f.key
-        && String(o.actor ?? '').toLowerCase() !== AUTO_POLICY_ACTOR)
+        && OPERATOR_LOGINS.includes(String(o.actor ?? '').toLowerCase()))
         || (record.carried ?? []).some((c) => c.key === f.key && c.result !== 'block'
           && carriedBackingHolds(c, { repo: record.repo, pr: record.pr, operatorRulings }))) continue;
       // The standing ruling is the LATEST matching block: a fresh re-ruling restarts the count, so the ladder gives

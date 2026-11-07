@@ -11,7 +11,7 @@ import { buildVerdictCarriedMarker } from '../../lib/review-verdict-carried-mark
 import { assertRulingCardInputFits, planRedTeamRuling, rulableBreaks, selectBreaks, recordRedTeamRulingOperation, buildRuleReasonComment, RED_TEAM_RULING_CARD_EFFECT, RED_TEAM_RULING_BLOCK_EFFECT, RED_TEAM_RULING_NOT_REAL_EFFECT } from '../record-red-team-ruling.mjs';
 import { assertHumanOperator, operatorBoundComments } from '../../lib/operator-identity.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
-import { runCardLandingWithReceipt, createRecordRedTeamRulingSinks, spawnStableCardJob } from '../record-red-team-ruling-io.mjs';
+import { runCardLandingWithReceipt, createRecordRedTeamRulingReader, createRecordRedTeamRulingSinks, spawnStableCardJob } from '../record-red-team-ruling-io.mjs';
 import { blockRulingId, cardJobKey, conflictingPendingCardJobs, rulingCardResource } from '../record-red-team-ruling.mjs';
 import { applyRedTeamGate } from '../red-team-gate-apply.mjs';
 import { parseAdvisories, trustedAdvisoryComments } from '../../lib/advisory-labels.mjs';
@@ -2301,4 +2301,120 @@ describe('block and not-real rulings', () => {
     });
   });
 
+});
+
+
+describe('R671 v1 acting judge red-team blocks', () => {
+  const attribution = 'Ruled by acting judge (R10), not the operator';
+  const identity = { login: 'web-everything', type: 'Bot' };
+  const judgeRead = (over = {}) => read({ identity,
+    judgeActorPolicy: { value: { enabled: true, actor: 'judge:r10' } }, ...over });
+  const judgeInput = (ruling = 'block', over = {}) => input({ actor: 'judge:r10', ruling, card: undefined, ...over });
+  it.each(['reviewed-sha', 'ReViEwEd-ShA', 'cleared-human', 'ClEaReD-HuMaN'])(
+    'judge red-team writer refuses reserved token %s in reason before producing any body', token => {
+      let plan;
+      expect(() => { plan = planRedTeamRuling(judgeRead(), judgeInput('block', { reason: `Prose ${token} here` })); })
+        .toThrow(/judge.*reserved.*review.*token/i);
+      expect(plan).toBeUndefined();
+    });
+  it.each(['reason', 'sendBackBody'])('judge red-team effect refuses reserved token in %s before posting', async field => {
+    const plan = planRedTeamRuling(judgeRead(), judgeInput());
+    const post = vi.fn(), readThread = vi.fn(), runSetLabel = vi.fn();
+    const sinks = createRecordRedTeamRulingSinks({ post, readThread, runSetLabel, resolveIdentity: () => identity });
+    await expect(sinks[plan.effect]({ ...plan, [field]: 'Prose CLEARED-HUMAN here' }))
+      .rejects.toThrow(/judge.*reserved.*review.*token/i);
+    expect(post).not.toHaveBeenCalled();
+    expect(runSetLabel).not.toHaveBeenCalled();
+    expect(readThread).not.toHaveBeenCalled();
+  });
+  it('operator red-team reasons retain the existing treatment of review tokens', () => {
+    const reason = 'reviewed-sha and CLEARED-HUMAN in operator prose';
+    const plan = planRedTeamRuling(read(), input({ reason }));
+    expect(plan.reason).toBe(reason);
+    expect(buildRuleReasonComment(plan)).toContain(reason);
+  });
+  it('allows judge block posted as automation', () => {
+    const plan = planRedTeamRuling(judgeRead(), judgeInput());
+    expect(plan).toMatchObject({ actor: 'judge:r10', ruling: 'block', indices: [1] });
+    expect(buildRuleReasonComment(plan)).toContain(attribution);
+  });
+  it.each(['card', 'not-real', 'approval', 'clear-human', 'accept'])(
+    'judge %s is refused in v1 before producing a release', ruling => {
+      expect(() => planRedTeamRuling(judgeRead(), judgeInput(ruling)))
+        .toThrow(`judge ${ruling} is refused in v1; operator-only`);
+    });
+  it('judge not-real asJudge is refused in v1', () => {
+    expect(() => planRedTeamRuling(judgeRead(), judgeInput('not-real', { asJudge: true, cause: 'other' })))
+      .toThrow('judge not-real is refused in v1; operator-only');
+  });
+  it.each([{ category: 'security/injection' }, { findingClass: undefined }, { findingClass: 'unknown' }])(
+    'judge block permits security or unreadable classification %j', fields => {
+      const comments = [redTeam(HEAD, [{ summary: 'live break', file: 'backlog/x.md', line: 24,
+        category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true, ...fields }]), capped()];
+      expect(planRedTeamRuling(judgeRead({ comments }), judgeInput()).ruling).toBe('block');
+    });
+  it.each([{ enabled: false, actor: 'judge:r10' }, { enabled: 'yes', actor: 'judge:r10' },
+    { enabled: true, actor: '' }])('refuses disabled/malformed actor policy %j', value => {
+    expect(() => planRedTeamRuling(judgeRead({ judgeActorPolicy: { value } }), judgeInput()))
+      .toThrow(/disabled|invalid|malformed|judge.*policy/i);
+  });
+  it.each([OP, { login: 'mallory', type: 'User' }, undefined])('judge refuses a non-automation poster %j', identity => {
+    expect(() => planRedTeamRuling(judgeRead({ identity }), judgeInput())).toThrow(/automation|posting identity/i);
+  });
+  it('unknown actors remain refused; operator still requires matching human identity', () => {
+    expect(() => planRedTeamRuling(judgeRead(), judgeInput('block', { actor: 'judge:unknown' }))).toThrow(/actor|operator/i);
+    expect(planRedTeamRuling(read(), input())).toMatchObject({ actor: OP.login, ruling: 'card' });
+    expect(() => planRedTeamRuling(judgeRead(), input())).toThrow(/human|operator/i);
+    expect(buildRuleReasonComment(planRedTeamRuling(read(), input()))).not.toContain(attribution);
+  });
+
+  // #6494 — the effects re-check the authority boundary on their own: a judge card / not-real plan handed straight to
+  // its effect (planning would refuse it) is refused before any read or write.
+  it.each([['card', RED_TEAM_RULING_CARD_EFFECT], ['not-real', RED_TEAM_RULING_NOT_REAL_EFFECT]])(
+    'judge %s handed straight to its red-team effect is refused before any write', async (ruling, effect) => {
+      const plan = { ...planRedTeamRuling(read(), input(ruling === 'card' ? {} : { ruling, card: undefined, cause: 'other' })), actor: 'judge:r10' };
+      const post = vi.fn(), readThread = vi.fn(), runSetLabel = vi.fn();
+      const sinks = createRecordRedTeamRulingSinks({ post, readThread, runSetLabel, warn: () => {}, resolveIdentity: () => identity });
+      // the card effect is synchronous: lift a synchronous throw into the same rejection
+      await expect(Promise.resolve().then(() => sinks[effect](plan))).rejects.toThrow(`judge ${ruling} is refused in v1; operator-only`);
+      expect(post).not.toHaveBeenCalled();
+      expect(readThread).not.toHaveBeenCalled();
+      expect(runSetLabel).not.toHaveBeenCalled();
+    });
+
+  // #6494 F7 — planning and the effect hold ONE policy: a tool block may narrow the gate-visible policy, never widen it.
+  const scratch = [];
+  afterEach(() => { for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+  const prefsEnv = (judgeActor) => {
+    const dir = mkdtempSync(join(tmpdir(), 'judge-actor-policy-'));
+    scratch.push(dir);
+    writeFileSync(join(dir, 'preferences.json'), JSON.stringify({ judgeActor }));
+    return { WE_PLATFORM_PREFERENCES_FILE: join(dir, 'preferences.json') };
+  };
+  it.each([
+    ['platform disabled, tool enabled', { enabled: false }, { enabled: true }, false],
+    ['platform enabled, tool disabled', { enabled: true }, { enabled: false }, false],
+    ['platform enabled, tool enabled', { enabled: true }, { enabled: true }, true],
+  ])('red-team writer: %s — planning and the effect agree', async (_name, platform, toolBlock, allowed) => {
+    const env = prefsEnv(platform), tool = { judgeActor: toolBlock };
+    const reader = createRecordRedTeamRulingReader({ env, tool, log: () => {}, assertFresh: () => {}, now: () => read().now,
+      readThread: () => ({ headRefOid: HEAD, comments: thread(), labels: [{ name: 'review:human' }] }),
+      readEvents: () => ({ status: 'ok', rows: [] }),
+      readSetting: () => ({ value: { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses: {} } }),
+      readScope: () => ({ value: { anyState: true }, sources: {} }), readStandingRulingScope: () => null,
+      resolveIdentity: () => identity, resolveCard: () => null });
+    const context = reader({ repo, pr: PR, actor: 'judge:r10' });
+    expect(context.judgeActorPolicy.value.enabled).toBe(allowed);
+    const post = vi.fn(), readThread = vi.fn(), runSetLabel = vi.fn();
+    const sinks = createRecordRedTeamRulingSinks({ env, tool, post, readThread, runSetLabel, warn: () => {}, resolveIdentity: () => identity });
+    if (!allowed) {
+      expect(() => planRedTeamRuling(judgeRead({ judgeActorPolicy: context.judgeActorPolicy }), judgeInput())).toThrow(/judge actor disabled/);
+      // the effect, handed a plan made under an enabled policy, refuses the same way before any read or write
+      await expect(sinks[RED_TEAM_RULING_BLOCK_EFFECT](planRedTeamRuling(judgeRead(), judgeInput()))).rejects.toThrow(/judge actor disabled/);
+      expect(post).not.toHaveBeenCalled();
+      expect(readThread).not.toHaveBeenCalled();
+      return;
+    }
+    expect(planRedTeamRuling(judgeRead({ judgeActorPolicy: context.judgeActorPolicy }), judgeInput())).toMatchObject({ actor: 'judge:r10', ruling: 'block' });
+  });
 });

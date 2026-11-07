@@ -1,3 +1,6 @@
+import { assertJudgeReason } from './record-referral-ruling.mjs';
+import { assertRulingIdentity } from '../lib/operator-identity.mjs';
+import { JUDGE_ACTOR, JUDGE_ATTRIBUTION, readJudgeActorPolicy, readJudgeWriterPolicy, assertJudgeAuthority } from '../lib/marker-authorship.mjs';
 import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readFindingClassPolicy } from '../lib/finding-class-policy.mjs';
 import { landPreventionCard as defaultLandPreventionCard, runCardDedupe } from './land-prevention-card.mjs';
@@ -323,6 +326,7 @@ export const rulingCardFilingSink = land => async ({ cardInput, repo, pr }) => {
 
 /** The single confirmation effect, followed by the existing filing helper only on uncertainty. */
 export const judgeRulingSink = ({ confirm = judgeConfirm, land, planCard }) => async ({ policy, input, read, repo, pr }) => {
+  assertJudgeAuthority(read, input);
   planJudgeNotReal({ ...policy, confirm: { verdict: 'agree' } });
   // Check the comment bound before spending a model call as well as afterwards.
   finishJudgeRuling(policy, input, { verdict: 'unsure' });
@@ -367,13 +371,14 @@ export function createRecordReferralRulingReader({ root = REPO_ROOT, readJson = 
   env = process.env, tool, readFile = readFileSync, readable = referralCardReadable, openPrHead = openPrHeadBacklog, changedLines, log = (m) => process.stderr.write(`${m}\n`),
   // Item 113 — the ruling is judged with THIS checkout's code; refuse from a stale one (see `assertOperatorCliFresh`).
   assertFresh = () => assertOperatorCliFresh(REPO_ROOT, { label: 'record-referral-ruling', env }) } = {}) {
-  return ({ repo, pr, card, asJudge, evidenceFile, finding }) => {
+  return ({ repo, pr, card, actor, asJudge, evidenceFile, finding }) => {
     assertFresh();
     const thread = readPrThread(repo, pr, { readJson });
     const cardReadable = (ref) => readable(ref, root);
     const open = readProtectionContext(thread, { repo, pr, readJson, cardReadable, changedLines, env, log });
     return {
       head: thread.headRefOid, ...open,
+      ...(actor === JUDGE_ACTOR ? { judgeActorPolicy: readJudgeWriterPolicy({ env, tool: tool?.judgeActor, log }), identity: readJson(['api', 'user']) } : {}),
       ...(asJudge ? { judgeNotRealMode: readJudgeNotRealMode({ env, tool, log }),
         evidence: readJudgeEvidence(evidenceFile, readFile),
         disagreements: referralDisagreements(thread.comments, open, { repo, pr, finding }) } : {}),
@@ -414,7 +419,7 @@ export async function appendLedgerEvents(events, opts = {}) {
   if (misses.length) throw new Error(events.length === 1 ? misses[0] : `${misses.length} of ${events.length} ledger events failed: ${misses.join('; ')}`);
 }
 
-export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeConfirm, readJson = ghJson, changedLines, env = process.env, root = REPO_ROOT, readable = referralCardReadable,
+export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeConfirm, readJson = ghJson, changedLines, env = process.env, tool, root = REPO_ROOT, readable = referralCardReadable,
   landRulingCard: landCard = landRulingCard,
   appendEvents = appendLedgerEvents,
   warn = (m) => process.stderr.write(`${m}\n`),
@@ -428,6 +433,7 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
     ['github.referral-ruling-file-card']: rulingCardFilingSink(landCard),
     ['github.referral-ruling-file-card-judge']: judgeRulingSink({ confirm, land: landCard, planCard: planReferralCard }),
     [OPERATOR_RULING_FOLLOW_UP_EFFECT]: async ({ repo, pr, head, action, body, actor, channel, remaining = [] }) => {
+      assertJudgeReason(actor, body);
       const before = await readPr(repo, pr);
       if (before.headRefOid !== head) throw new Error(`PR #${pr}'s head moved to ${before.headRefOid} since the plan (${head}); nothing changed — re-run against the new head`);
       // Others still wait: the ruling comment woke the paused review (a fresh advisory follows on this head); the
@@ -470,6 +476,14 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
       return { action, sentBack, labelCleared, ...(ledgerWriteMiss ? { ledgerWriteMiss } : {}) };
     },
     [OPERATOR_RULING_POST_EFFECT]: async ({ repo, pr, head, body, rulings = [], actor = '', channel = '', skipped = [], protectionSnapshot }) => {
+      assertJudgeReason(actor, body);
+      if (actor === JUDGE_ACTOR) {
+        if (!rulings.length) throw new Error('judge empty ruling is refused in v1; operator-only');
+        // The SAME policy the plan held (#6494 F7): this sink's env and tool layer, narrowed by the gate-visible policy.
+        const judgeActorPolicy = readJudgeWriterPolicy({ env, tool: tool?.judgeActor, log: warn });
+        for (const row of rulings) assertJudgeAuthority({ judgeActorPolicy }, { actor, ruling: row.result, supersedes: row.supersedes });
+        assertRulingIdentity(readJson(['api', 'user']), actor);
+      }
       const before = readPrThread(repo, pr, { readJson });
       if (before.headRefOid !== head) throw new Error(`PR #${pr}'s head moved to ${before.headRefOid} since the plan (${head}); nothing posted — re-run against the new head`);
       if (actor === AUTO_POLICY_ACTOR) {
@@ -493,7 +507,7 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
       }
       const events = rulings.map((r) => buildLedgerEvent({ type: EVENT_TYPES.RULING, repo, pr, at: now(),
         // Hash the FULL key, the form the referral row names (`review-pr-io`); a raw key never closes its referral.
-        source: 'record-referral-ruling', declaredActor: actor, channel, findingKey: ledgerFindingKey(r.key), ruling: r.result }));
+        source: 'record-referral-ruling', declaredActor: actor, channel: actor === JUDGE_ACTOR ? `${channel}; ${JUDGE_ATTRIBUTION}` : channel, findingKey: ledgerFindingKey(r.key), ruling: r.result }));
       const tryAppend = async (list) => { try { await appendEvents(list); return null; } catch (e) { return String(e?.message ?? e); } };
       // F4: a CLEARING ruling (card / not-real) that cannot be recorded does not clear: nothing is posted, the
       // operation stays resumable. A HOLDING ruling (block) is still posted and raises ledger-write-miss.
@@ -545,7 +559,11 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
         if (!already) post(repo, pr, body);
         const after = readPrThread(repo, pr, { readJson });
         seen = after.comments.filter((c) => String(c?.body ?? '').replace(/\r\n/g, '\n').trimEnd() === body);
-        if (!seen.length || !readOperatorRulings(seen, { head }).rulings.length) {
+        // A judge row is read back through the gate-visible policy under this sink's env, as the gate will read it.
+        const counted = readOperatorRulings(actor === JUDGE_ACTOR ? after.comments : seen,
+          { head, ...(actor === JUDGE_ACTOR ? { judgePolicy: () => readJudgeActorPolicy({ env, log: warn }).value } : {}) }).rulings;
+        if (!seen.length || !(actor === JUDGE_ACTOR ? rulings.length && rulings.every(x => counted.some(r =>
+          r.actor === actor && r.head === head && x.runId === r.runId && x.key === r.key && x.result === r.result)) : counted.length)) {
           throw new Error('the ruling comment is not readable by the gate after posting (untrusted author or altered body); the hold remains — inspect the thread before retrying');
         }
       } catch (error) {
