@@ -45,6 +45,10 @@
  * PURE. The reader and the sink live in `./record-referral-ruling-io.mjs`.
  */
 
+import { boundCardText, CARD_TEXT_CAPS } from './land-prevention-card.mjs';
+import { createHash } from 'node:crypto';
+import { classAction } from '../lib/finding-class-policy.mjs';
+import { IN_REPO_LOCUS } from '../lib/citation-check.mjs';
 import { FALSE_FINDING_CAUSES } from '../lib/false-finding-causes.mjs';
 import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
@@ -99,6 +103,8 @@ export function openReferralFindings({ comments, repo, pr, head, body = '', crea
         const standing = standingRulings(f, record, state);
         if (standing.length) ruled.push({ runId: record.runId, key: f.key, seat: f.seat, file: f.finding?.file ?? '',
           line: Number.isInteger(f.finding?.line) ? f.finding.line : null, summary: f.finding?.summary ?? '',
+          findingClass: f.finding?.findingClass, alsoClasses: f.finding?.alsoClasses,
+          classBasis: f.finding?.classBasis, securityReachableToday: f.finding?.securityReachableToday,
           state: 'ruled', rulingIds: standing.map((x) => x.id), standing });
       }
       if (held.has(f.key)) {
@@ -107,6 +113,8 @@ export function openReferralFindings({ comments, repo, pr, head, body = '', crea
         open.push({ index: open.length + 1, runId: record.runId, key: f.key, seat: f.seat,
           file: f.finding?.file ?? '', line: Number.isInteger(f.finding?.line) ? f.finding.line : null,
           summary: f.finding?.summary ?? '',
+          findingClass: f.finding?.findingClass, alsoClasses: f.finding?.alsoClasses,
+          classBasis: f.finding?.classBasis, securityReachableToday: f.finding?.securityReachableToday,
           state: blocked ? OPEN_FINDING_STATES.BLOCKED : recheck ? OPEN_FINDING_STATES.NEEDS_RECHECK : OPEN_FINDING_STATES.PENDING,
           rationale: blocked ? (effective?.rationale ?? effective?.reason ?? '') : '' });
       }
@@ -295,8 +303,7 @@ export function planRulingFollowUp({ open, selected, ruling, reason, enabled, he
   return { action: 'send-back', blocked, body };
 }
 
-/** THE VERDICT. Build and validate the record; refuse anything the gate would not honour. PURE. */
-export function planOperatorRuling(read, input) {
+function validateReferralRulingInput(input) {
   const { repo, pr, finding, ruling, actor, channel, reason } = input;
   if (!OPERATOR_RULING_RESULTS.includes(ruling)) throw new Error(`--ruling must be one of ${OPERATOR_RULING_RESULTS.join('|')}`);
   if (input.cause !== undefined && (ruling !== 'not-real' || !FALSE_FINDING_CAUSES.includes(input.cause))) throw new Error('--cause requires not-real and a known false-finding cause');
@@ -307,10 +314,12 @@ export function planOperatorRuling(read, input) {
   }
   if (!String(reason ?? '').trim()) throw new Error('--reason is required: the operator\'s words, verbatim');
   if (!String(channel ?? '').trim() || /[\r\n]/.test(channel)) throw new Error('--channel is required and must be one line');
-  if (ruling === 'card' && !read.card) throw new Error('--ruling=card requires --card=<id or we:backlog path> naming a readable backlog card');
-  if (ruling === 'card' && !read.card.readable) throw new Error(`--card ${read.card.requested} does not resolve to a readable backlog card in this checkout (${read.card.reason})`);
-  if (ruling !== 'card' && read.card) throw new Error('--card applies only to --ruling=card');
-  if (read.malformed) throw new Error('the PR thread carries a malformed referral record or ruling; the gate holds it and a ruling cannot repair it');
+}
+
+/** Shared selection for planning a ruling and filing its follow-up. PURE. */
+function selectOperatorRulingFindings(read, input) {
+  const { repo, pr, finding, actor } = input;
+  const byPolicy = String(actor ?? '').toLowerCase() === AUTO_POLICY_ACTOR;
   const supersedeIds = [...new Set(String(input.supersedes ?? '').split(',').map((x) => x.trim()).filter(Boolean))];
   if (byPolicy && supersedeIds.length) throw new Error('auto-policy cannot supersede rulings');
   if (byPolicy && read.protectionMalformed) throw new Error('automatic policy refuses malformed referral history');
@@ -360,6 +369,21 @@ export function planOperatorRuling(read, input) {
         + ruled.map(describe).join('\n'));
     }
   }
+  return { selected, skipped, supersedesFor };
+}
+
+/** THE VERDICT. Build and validate the record; refuse anything the gate would not honour. PURE. */
+export function planOperatorRuling(read, input) {
+  validateReferralRulingInput(input);
+  const { repo, pr, ruling, actor, channel, reason } = input;
+  const byPolicy = String(actor ?? '').toLowerCase() === AUTO_POLICY_ACTOR;
+  if (ruling === 'card' && !read.card) throw new Error('--ruling=card requires --card=<id or we:backlog path> naming a readable backlog card');
+  if (ruling === 'card' && !read.card.readable) throw new Error(`--card ${read.card.requested} does not resolve to a readable backlog card in this checkout (${read.card.reason})`);
+  if (ruling !== 'card' && read.card) throw new Error('--card applies only to --ruling=card');
+  if (read.malformed) throw new Error('the PR thread carries a malformed referral record or ruling; the gate holds it and a ruling cannot repair it');
+  const selection = selectOperatorRulingFindings(read, input);
+  if (selection.noop) return selection;
+  const { selected, skipped, supersedesFor } = selection;
   const record = {
     version: 1, repo, pr: Number(pr), head: read.head,
     rulings: selected.map((o) => ({ runId: o.runId, key: o.key, result: ruling, ...(ruling === 'not-real' ? { lens: o.seat ?? JSON.parse(o.key)[0] } : {}),
@@ -376,6 +400,89 @@ export function planOperatorRuling(read, input) {
     supersedes: record.rulings.flatMap((r) => r.supersedes ?? []), followUp };
 }
 
+/** Validate filing options before any effect; mode evidence is never defaulted here. */
+export function assertCardFiling(read, input) {
+  if (input.ruling !== 'card') throw new Error('fileCard applies only to --ruling=card');
+  if (input.card) throw new Error('--file-card cannot be combined with --card');
+  const mode = read.cardFileMode?.value;
+  if (!['two-step', 'one-call'].includes(mode)) throw new Error('invalid cardRulingFileMode; use two-step or one-call');
+  return mode;
+}
+
+/** PURE input shared by both operator filing paths. */
+export function buildRulingCardInput(read, input, selected) {
+  const files = [...new Set(selected.map(f => f.file).filter(Boolean))];
+  const digest = `Operator card follow-up for ${input.repo}#${input.pr} (head ${read.head}):\n\n`
+    + selected.map(f => `- ${IN_REPO_LOCUS}${f.file ?? ''}${f.line == null ? '' : `:${f.line}`} — ${f.summary}`).join('\n');
+  const scope = files.map(f => `${IN_REPO_LOCUS}${f}`).join(',');
+  for (const [field, value] of Object.entries({ digest, scope })) {
+    const bounded = boundCardText(value, Number.MAX_SAFE_INTEGER, { singleLine: field === 'scope', escapeWikiLinks: field !== 'scope' });
+    if (!bounded.trim() || bounded.length > CARD_TEXT_CAPS[field])
+      throw new Error(`card filing ${field} is empty or exceeds its limit; select a smaller finding group or file the complete findings manually and cite --card`);
+  }
+  const slug = createHash('sha256').update(JSON.stringify([input.repo, input.pr, read.head, selected])).digest('hex').slice(0, 12);
+  return { title: `Follow-up from ${input.repo}#${input.pr} (head ${read.head.slice(0, 9)})`,
+    kind: 'story', size: '2', digest, scope,
+    parent: '', queue: 'true', session: `card-ruling-${slug}` };
+}
+
+/** Pin the exact evidence used to file, including positional identity and classification. PURE. */
+export function cardFilingBinding(read, selected, resultId = null) {
+  return { head: read.head, resultId, findings: selected.map(f => ({
+    runId: f.runId, key: f.key, index: f.index, file: f.file, line: f.line, summary: f.summary,
+    findingClass: f.findingClass, alsoClasses: f.alsoClasses, classBasis: f.classBasis,
+    securityReachableToday: f.securityReachableToday,
+  })) };
+}
+
+/** The engine records effect results under their ordinal step. */
+export const landedRulingCard = findings => findings.landCard?.effects?.[0]?.result;
+export function cardFilingVerdict(view) {
+  if (!view.findings.cardPlan) return null;
+  if (view.input.preview) return { fileOnly: true, wouldFile: view.findings.cardPlan.cardInput };
+  if (view.findings.cardPlan.mode === 'two-step') {
+    const landed = landedRulingCard(view.findings);
+    if (!landed?.ok || !landed.ref) throw new Error('card filing result missing; no ruling recorded');
+    return { fileOnly: true, cardRef: landed.ref, mode: 'two-step', reused: landed.reused };
+  }
+  return null;
+}
+
+/** Shared step layout; all external filing remains in the injected sink. */
+export function rulingCardSteps(readRulingContext, planCard, type) {
+  return {
+    cardPlan: compute({ reads: ['input', 'findings.read'], fn: v => v.input.fileCard ? planCard(v.findings.read, v.input) : null }),
+    landCard: effectStep({ reads: ['input', 'findings.read', 'findings.cardPlan'],
+      effects: v => !v.findings.cardPlan || v.input.preview ? [] : [{ type, idempotent: true,
+        payload: { repo: v.input.repo, pr: v.input.pr, head: v.findings.read.head, cardInput: v.findings.cardPlan.cardInput } }] }),
+    reread: compute({ reads: ['input', 'findings.read', 'findings.cardPlan', 'findings.landCard'], fn: v => {
+      const landed = landedRulingCard(v.findings);
+      if (v.findings.cardPlan && !v.input.preview && (!landed?.ok || !landed.ref))
+        throw new Error('card filing result missing; no ruling recorded');
+      if (v.findings.cardPlan?.mode !== 'one-call' || !landed?.ok) return v.findings.read;
+      const fresh = readRulingContext({ repo: v.input.repo, pr: v.input.pr, card: landed.ref });
+      const original = v.findings.cardPlan.binding;
+      const recovery = `no ruling recorded; review the live findings and cite --card=${landed.ref} in a new ruling`;
+      if (!original || fresh.head !== original.head)
+        throw new Error(`PR head changed during card landing; ${recovery}`);
+      const refreshed = planCard(fresh, v.input);
+      if (JSON.stringify(refreshed.binding) !== JSON.stringify(original))
+        throw new Error(`selected finding identities changed during card landing; ${recovery}`);
+      return fresh;
+    } }),
+  };
+}
+
+export function planReferralCard(read, input) {
+  const mode = assertCardFiling(read, input);
+  validateReferralRulingInput(input);
+  if (read.malformed) throw new Error('the PR thread carries a malformed referral record or ruling; no card filed');
+  const { selected } = selectOperatorRulingFindings(read, input);
+  if (selected.some(f => f.securityReachableToday === true || classAction(f, read.findingClassPolicy) !== 'defer-card'))
+    throw new Error('fileCard refuses a fix-now or security break; only coverage-class findings can be carded');
+  return { mode, cardInput: buildRulingCardInput(read, input, selected), binding: cardFilingBinding(read, selected) };
+}
+
 export function recordReferralRulingOperation({ readRulingContext } = {}) {
   if (typeof readRulingContext !== 'function') {
     throw new TypeError('record-referral-ruling: needs a `readRulingContext({repo, pr, card})` reader — the real '
@@ -388,6 +495,7 @@ export function recordReferralRulingOperation({ readRulingContext } = {}) {
       finding: 'string',
       ruling: { type: 'string', enum: [...OPERATOR_RULING_RESULTS] },
       card: { type: 'string', required: false },
+      fileCard: { type: 'boolean', required: false },
       supersedes: { type: 'string', required: false },
       cause: { type: 'string', enum: [...FALSE_FINDING_CAUSES], required: false },
       actor: 'string',
@@ -401,16 +509,17 @@ export function recordReferralRulingOperation({ readRulingContext } = {}) {
       reads: ['input.repo', 'input.pr', 'input.card'],
       fn: (view) => readRulingContext({ repo: view.input.repo, pr: view.input.pr, card: view.input.card }),
     }),
+    ...rulingCardSteps(readRulingContext, planReferralCard, 'github.referral-ruling-file-card'),
     plan: compute({
       reads: ['input.repo', 'input.pr', 'input.finding', 'input.ruling', 'input.actor', 'input.channel',
-        'input.reason', 'input.cause', 'input.sendBack', 'input.supersedes', 'findings.read'],
-      fn: (view) => planOperatorRuling(view.findings.read, view.input),
+        'input.reason', 'input.cause', 'input.sendBack', 'input.supersedes', 'input.preview', 'findings.read', 'findings.reread', 'findings.cardPlan', 'findings.landCard'],
+      fn: (view) => cardFilingVerdict(view) ?? planOperatorRuling(view.findings.reread ?? view.findings.read, view.input),
     }),
     write: effectStep({
       reads: ['verdict', 'input.preview'],
       // NOT idempotent: a repeat posts a second comment. The sink re-reads the thread first and skips a
       // byte-identical ruling already present, so a replay after a crash cannot double-post.
-      effects: (view) => (view.input.preview || view.verdict.noop ? [] : [{
+      effects: (view) => (view.input.preview || view.verdict.fileOnly || view.verdict.noop ? [] : [{
         type: OPERATOR_RULING_POST_EFFECT, idempotent: false,
         payload: { repo: view.verdict.record.repo, pr: view.verdict.record.pr, head: view.verdict.record.head, body: view.verdict.body,
           rulings: view.verdict.record.rulings.map((r) => ({ runId: r.runId, key: r.key, result: r.result })),

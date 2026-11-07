@@ -1,3 +1,6 @@
+import { assertCardFiling, cardFilingBinding, buildRulingCardInput, cardFilingVerdict, rulingCardSteps } from './record-referral-ruling.mjs';
+import { classAction, allClasses } from '../lib/finding-class-policy.mjs';
+import { breakClass } from '../lib/red-team-gate.mjs';
 /**
  * @file scripts/operations/record-red-team-ruling.mjs
  * @description Operator card, block and not-real ruling for a confirmed break in any state of the live result.
@@ -188,8 +191,7 @@ export function hasPendingCardIntent(comments, { pr, head, resultId, jobKey }) {
   });
 }
 
-/** THE VERDICT. Validate, select, and describe the writes. PURE. */
-export function planRedTeamRuling(read, input) {
+function validateRedTeamRulingInput(read, input) {
   const { pr, ruling, actor, channel, reason } = input;
   if (!RED_TEAM_RULINGS.includes(ruling)) throw new Error(`--ruling must be one of ${RED_TEAM_RULINGS.join('|')}`);
   if (!OPERATOR_LOGINS.includes(String(actor ?? '').toLowerCase())) {
@@ -205,6 +207,10 @@ export function planRedTeamRuling(read, input) {
   if (ruling === 'card' && (String(input.card ?? '').trim() || read.card) && !read.card?.readable) {
     throw new Error(`--card ${read.card?.requested ?? input.card} does not resolve to a readable backlog card (${read.card?.reason ?? 'unresolved'})`);
   }
+}
+
+function selectRedTeamRulingFindings(read, input) {
+  const { pr, ruling, actor } = input;
   // Bind to who actually posts: the authenticated gh identity must be a human operator and equal --actor.
   assertHumanOperator(read.identity, actor);
   const head = String(read.head ?? '').toLowerCase();
@@ -215,6 +221,14 @@ export function planRedTeamRuling(read, input) {
   const selected = selectBreaks(rulable, input.break, noun);
   const unconfirmed = selected.filter((f) => !f.confirmed);
   if (unconfirmed.length) throw new Error(`break(s) ${unconfirmed.map((f) => `#${f.index}`).join(', ')} were not confirmed by the re-check; only a confirmed break can be ruled on`);
+  return { head, comments, scope, state, atCap, selected };
+}
+
+/** THE VERDICT. Validate, select, and describe the writes. PURE. */
+export function planRedTeamRuling(read, input) {
+  validateRedTeamRulingInput(read, input);
+  const { pr, ruling, actor, channel, reason } = input;
+  const { head, comments, scope, state, atCap, selected } = selectRedTeamRulingFindings(read, input);
   const base = { repo: input.repo, pr: Number(pr), head, ruling, actor: String(actor).toLowerCase(), channel: String(channel).trim(),
     reason: String(reason), at: read.now, resultId: state.resultId, findings: selected, setting: read.setting,
     indices: selected.map((f) => f.index), scope, scopeSources: read.scope?.sources ?? {}, atCap,
@@ -243,6 +257,20 @@ export function planRedTeamRuling(read, input) {
   return { ...base, effect: RED_TEAM_RULING_NOT_REAL_EFFECT, cause: input.cause };
 }
 
+export function planRedTeamCard(read, input) {
+  const mode = assertCardFiling(read, input);
+  validateRedTeamRulingInput(read, input);
+  const { selected, state } = selectRedTeamRulingFindings(read, input);
+  const policy = read.setting?.findingClasses ?? {};
+  if (selected.some(f => f.securityReachableToday === true || !(classAction(f, policy) === 'defer-card'
+    || (breakClass(f) === 'degraded' && read.setting?.degraded === 'card'
+      && !allClasses(f).some(c => classAction({ ...f, findingClass: c, alsoClasses: [] }, policy) === 'fix-now')))))
+    throw new Error('fileCard refuses a fix-now or security break; only coverage-class findings can be carded');
+  const cardInput = buildRulingCardInput(read, input, selected);
+  assertRulingCardInputFits(cardInput);
+  return { mode, cardInput, binding: cardFilingBinding(read, selected, state.resultId) };
+}
+
 export function recordRedTeamRulingOperation({ readRulingContext } = {}) {
   if (typeof readRulingContext !== 'function') {
     throw new TypeError('record-red-team-ruling: needs a `readRulingContext({repo, pr})` reader — the real binding is '
@@ -258,6 +286,7 @@ export function recordRedTeamRulingOperation({ readRulingContext } = {}) {
       channel: 'string',
       reason: 'string',
       card: { type: 'string', required: false },
+      fileCard: { type: 'boolean', required: false },
       cause: { type: 'string', enum: [...FALSE_FINDING_CAUSES], required: false },
       preview: { type: 'boolean', required: false, default: false },
     },
@@ -266,14 +295,15 @@ export function recordRedTeamRulingOperation({ readRulingContext } = {}) {
       reads: ['input.repo', 'input.pr', 'input.card'],
       fn: (view) => readRulingContext({ repo: view.input.repo, pr: view.input.pr, card: view.input.card }),
     }),
+    ...rulingCardSteps(readRulingContext, planRedTeamCard, 'github.red-team-ruling-file-card'),
     plan: compute({
-      reads: ['input.repo', 'input.pr', 'input.break', 'input.ruling', 'input.actor', 'input.channel', 'input.reason', 'input.card', 'input.cause', 'findings.read'],
-      fn: (view) => planRedTeamRuling(view.findings.read, view.input),
+      reads: ['input.repo', 'input.pr', 'input.break', 'input.ruling', 'input.actor', 'input.channel', 'input.reason', 'input.card', 'input.cause', 'input.preview', 'findings.read', 'findings.reread', 'findings.cardPlan', 'findings.landCard'],
+      fn: (view) => cardFilingVerdict(view) ?? planRedTeamRuling(view.findings.reread ?? view.findings.read, view.input),
     }),
     write: effectStep({
       reads: ['verdict', 'input.preview'],
       // The sink re-reads the thread and refuses when the selected breaks are no longer held.
-      effects: (view) => (view.input.preview ? [] : [{
+      effects: (view) => (view.input.preview || view.verdict.fileOnly ? [] : [{
         type: view.verdict.effect, idempotent: view.verdict.ruling === 'block',
         payload: {
           repo: view.verdict.repo, pr: view.verdict.pr, head: view.verdict.head, ruling: view.verdict.ruling,

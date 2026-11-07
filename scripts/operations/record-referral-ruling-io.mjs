@@ -1,3 +1,6 @@
+import { cascadePolicy } from '../lib/policy-cascade.mjs';
+import { readFindingClassPolicy } from '../lib/finding-class-policy.mjs';
+import { landPreventionCard as defaultLandPreventionCard, runCardDedupe } from './land-prevention-card.mjs';
 /**
  * @file scripts/operations/record-referral-ruling-io.mjs
  * @description The io binding of `record-referral-ruling` (#4979): reads the PR thread through `gh`, resolves the
@@ -150,8 +153,49 @@ function readProtectionContext(thread, { repo, pr, readJson, cardReadable, chang
     } });
 }
 
+/** Resolve and reject invalid evidence at any layer, rather than silently falling back. */
+export function readCardRulingFileMode({ env = process.env, tool, log = line => console.error(line) } = {}) {
+  const resolved = cascadePolicy('cardRuling', tool, {
+    standard: { cardRulingFileMode: 'two-step' }, env, log,
+    envValues: { cardRulingFileMode: env.WE_CARD_RULING_FILE_MODE },
+    valid: { cardRulingFileMode: v => ['two-step', 'one-call'].includes(v) },
+  });
+  if (resolved.invalid.length) throw new Error(`invalid cardRulingFileMode: ${resolved.invalid.join(', ')}`);
+  const value = resolved.value.cardRulingFileMode, source = resolved.sources.cardRulingFileMode;
+  log(`cardRulingFileMode=${value} (${source})`);
+  return { value, source };
+}
+
+/** Read-only dedupe first; new cards always use the existing isolated single-card landing path. */
+export async function landRulingCard(input, { repo, pr, dedupe = runCardDedupe,
+  landPreventionCard = defaultLandPreventionCard, ...landingOptions } = {}) {
+  const plan = await dedupe(input, { lane: REPO_ROOT });
+  if (plan?.action === 'mention' && plan.matches?.length) {
+    const refs = plan.matches.map(({ card }) => {
+      if (!card?.rel || (card.host !== 'main' && !card.host?.pr)) return null;
+      return `we:${card.rel}${card.host === 'main' ? '' : `@pr${card.host.pr}`}`;
+    });
+    if (refs.every(Boolean) && new Set(refs).size === 1)
+      return { ok: true, reused: true, ref: refs[0], pr: plan.matches[0].card.host?.pr ?? null };
+  }
+  const result = await landPreventionCard(input, { ...landingOptions,
+    dedupe: () => null, batch: async () => ({ batched: false, disabled: true }) });
+  if (result?.ok && result.rel && result.pr && !['batched', 'held', 'mentioned'].includes(result.step))
+    return { ok: true, reused: false, ref: `we:${result.rel}@pr${result.pr}`, pr: result.pr };
+  return { ok: false, step: result?.step ?? 'landing',
+    reason: [result?.rel, result?.reason ?? 'card did not land on a single-card PR'].filter(Boolean).join(': ') };
+}
+
+/** A failed landing can never turn into a recorded ruling. */
+export const rulingCardFilingSink = land => async ({ cardInput, repo, pr }) => {
+  const result = await land(cardInput, { repo, pr });
+  if (!result?.ok || !result.ref)
+    throw new Error(`card filing failed at ${result?.step ?? 'landing'}: ${result?.reason ?? 'missing card reference'}; no ruling recorded`);
+  return result;
+};
+
 export function createRecordReferralRulingReader({ root = REPO_ROOT, readJson = ghJson, now = () => new Date().toISOString(),
-  env = process.env, readable = referralCardReadable, openPrHead = openPrHeadBacklog, changedLines, log = (m) => process.stderr.write(`${m}\n`),
+  env = process.env, tool, readable = referralCardReadable, openPrHead = openPrHeadBacklog, changedLines, log = (m) => process.stderr.write(`${m}\n`),
   // Item 113 — the ruling is judged with THIS checkout's code; refuse from a stale one (see `assertOperatorCliFresh`).
   assertFresh = () => assertOperatorCliFresh(REPO_ROOT, { label: 'record-referral-ruling', env }) } = {}) {
   return ({ repo, pr, card }) => {
@@ -161,6 +205,8 @@ export function createRecordReferralRulingReader({ root = REPO_ROOT, readJson = 
     const open = readProtectionContext(thread, { repo, pr, readJson, cardReadable, changedLines, env, log });
     return {
       head: thread.headRefOid, ...open,
+      cardFileMode: readCardRulingFileMode({ env, tool, log }),
+      findingClassPolicy: readFindingClassPolicy({ env, log }),
       card: resolveCardRef(card, { root, readable, pr, prHead: lazyPrHead(() => openPrHead({ repo, pr, head: thread.headRefOid })) }),
       followUpEnabled: env.WE_REFERRAL_RULING_FOLLOW_UP !== '0',
       now: now(), clearerId: currentActorId(env),
@@ -197,6 +243,7 @@ export async function appendLedgerEvents(events, opts = {}) {
 }
 
 export function createRecordReferralRulingSinks({ readJson = ghJson, changedLines, env = process.env, root = REPO_ROOT, readable = referralCardReadable,
+  landRulingCard: landCard = landRulingCard,
   appendEvents = appendLedgerEvents,
   warn = (m) => process.stderr.write(`${m}\n`),
   now = () => new Date().toISOString(),
@@ -206,6 +253,7 @@ export function createRecordReferralRulingSinks({ readJson = ghJson, changedLine
   ['pr', 'comment', String(pr), '--repo', repo, '--body', body], { encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 }) } = {}) {
   return {
+    ['github.referral-ruling-file-card']: rulingCardFilingSink(landCard),
     [OPERATOR_RULING_FOLLOW_UP_EFFECT]: async ({ repo, pr, head, action, body, actor, channel, remaining = [] }) => {
       const before = await readPr(repo, pr);
       if (before.headRefOid !== head) throw new Error(`PR #${pr}'s head moved to ${before.headRefOid} since the plan (${head}); nothing changed — re-run against the new head`);

@@ -1,3 +1,4 @@
+import { readCardRulingFileMode, landRulingCard as defaultLandRulingCard, rulingCardFilingSink } from './record-referral-ruling-io.mjs';
 /**
  * @file scripts/operations/record-red-team-ruling-io.mjs
  * @description The IMPURE half of `record-red-team-ruling` (see `./record-red-team-ruling.mjs`): the reader (live
@@ -100,7 +101,7 @@ const resolveCardDefault = (card, { runGit = git, readOnPr = readCardAtPrHead } 
 /** Log the effective ruling scope and its policy-cascade source. */
 const readScopeLogged = (env) => readOperatorRulings({ env, log: (m) => process.stderr.write(`${m}\n`) });
 
-export function createRecordRedTeamRulingReader({ env = process.env, readThread = readLiveThread, readSetting = () => readConfirmedBreaks({ env }),
+export function createRecordRedTeamRulingReader({ tool, log = line => console.error(line), env = process.env, readThread = readLiveThread, readSetting = () => readConfirmedBreaks({ env }),
   readStandingRulingScope = standingRulingScope,
   readScope = () => readScopeLogged(env), runGit = git, readOnPr = readCardAtPrHead,
   resolveCard = card => resolveCardDefault(card, { runGit, readOnPr }),
@@ -111,7 +112,7 @@ export function createRecordRedTeamRulingReader({ env = process.env, readThread 
     const thread = readThread({ repo, pr });
     const head = String(thread.headRefOid ?? '').toLowerCase();
     const scope = readScope();
-    return { head, labels: thread.labels ?? [], comments: thread.comments ?? [],
+    return { head, cardFileMode: readCardRulingFileMode({ env, tool, log }), labels: thread.labels ?? [], comments: thread.comments ?? [],
       standingRuling: readStandingRulingScope({ repo, pr: { ...thread, number: Number(pr), headRefOid: head } }),
       setting: readSetting().value, scope: { value: scope.value, sources: scope.sources ?? {} }, now: now(), identity: resolveIdentity(),
       card: card === undefined || card === '' ? null : resolveCard(card, { repo, pr, head }) };
@@ -150,7 +151,7 @@ export const spawnStableCardJob = (input, session, binding, { spawnDetached = de
   return r.ok ? { ...r, session } : r;
 };
 
-export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_ROOT, readThread = readLiveThread,
+export function createRecordRedTeamRulingSinks({ landRulingCard = defaultLandRulingCard, env = process.env, root = REPO_ROOT, readThread = readLiveThread,
   readStandingRulingScope = standingRulingScope,
   readScope = () => readScopeLogged(env),
   runGit = git, readOnPr = readCardAtPrHead,
@@ -235,6 +236,7 @@ export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_
   const intentBody = (p) => `${redTeamGateMarker(p.pr, p.head, CARD_PENDING_OUTCOME, p.resultId)}\n`
     + `Operator card ruling pending (job ${p.jobKey}, break(s) ${p.indices.map((i) => `#${i}`).join(', ')}); the break stays held until the card is queued and recorded.`;
   return {
+    ['github.red-team-ruling-file-card']: rulingCardFilingSink(landRulingCard),
     [RED_TEAM_RULING_CARD_EFFECT]: (p) => {
       const { comments } = recheck(p);
       if (p.cardRef) {
