@@ -11,9 +11,6 @@ import {
 // Deliberately unresolved: this contract must fail red until the module is implemented.
 import { mirrorSyncForTick, resolveMirrorSyncPolicy, syncMirror } from '../mirror-sync.mjs';
 
-vi.mock('node:os', async (importOriginal) => ({
-  ...await importOriginal(), homedir: () => 'fixture-home',
-}));
 vi.mock('../policy-cascade.mjs', async (importOriginal) => ({
   ...await importOriginal(), cascadePolicy: vi.fn((...args) => realCascade(...args)),
 }));

@@ -54,6 +54,8 @@ import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { sealDueBatches } from '../operations/card-batch-seal-io.mjs';
 import { readFixLoopRows } from './fix-loop-ledger.mjs';
 import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
+import { mirrorSyncForTick } from '../lib/mirror-sync.mjs';
+import { appendDaemonEvent } from '../lib/daemon-events.mjs';
 import { archiveClaudeJobs, formatClaudeJobsArchiveLine } from './claude-jobs-archive.mjs';
 import { sweepOurTmp, readBusyTopLevel, formatTmpSweepLine } from './tmp-sweep.mjs';
 import { fetchPrCommits } from '../lib/pr-limit.mjs';
@@ -1374,6 +1376,24 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     Object.assign(probes, got.probes);
     Object.assign(probeErrors, got.errors);
     if (got.probes.prs && got.probes.agents) ghCache.at = now;
+  }
+
+  // Mirror freshness has its own cadence, independent of GitHub probes and --no-gh.
+  await attempt('mirrorSync', async () => {
+    const mirrorSync = await mirrorSyncForTick({
+      flags, fixtureTick, dryRun: !!flags['dry-run'], now, config,
+      deps: { syncMirror: deps.syncMirror, stateDir: dir },
+    });
+    if (flags['dry-run'] || fixtureTick) return;
+    if (!['synced', 'rate-limited', 'locked'].includes(mirrorSync?.status)) {
+      throw new Error(`${mirrorSync?.status || 'unavailable'}: ${mirrorSync?.reason || 'mirror refresh did not complete'}`);
+    }
+  });
+  if (probeErrors.mirrorSync) {
+    probeErrors.mirrorSync = scrubText(probeErrors.mirrorSync).replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 240);
+    await attempt('mirrorSyncEvent', () => (deps.emit ?? appendDaemonEvent)({
+      kind: 'mirror-sync-failed', daemon: 'health-watch', detail: { error: probeErrors.mirrorSync },
+    }));
   }
 
   // A tick the watchdog killed last time is the overrun smell's input.
