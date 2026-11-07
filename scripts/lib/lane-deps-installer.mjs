@@ -195,8 +195,8 @@ export function hasForeignLiveLease(dir, nowMs = Date.now()) {
     // bootstrap fixture copies only this file's declared imports). TTL runs from the later of acquire/renew.
     const lease = JSON.parse(readFileSync(file, 'utf8'));
     if (!lease || typeof lease !== 'object') return true;
+    if (lease.reserved) return true; // reserved leases are never ours to migrate, whatever the pid
     if (lease.pid === process.pid) return false;
-    if (lease.reserved) return true;
     const acquired = Date.parse(lease.acquiredAt);
     if (Number.isNaN(acquired)) return false; // unparseable timestamp reads stale in lane-lease.mjs
     const renewed = Date.parse(lease.renewedAt);
