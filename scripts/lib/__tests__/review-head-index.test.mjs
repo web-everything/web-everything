@@ -559,6 +559,30 @@ for (let n = 0; n < 6; n++) recordReview({ dir: d, repo: 'o/r', pr: 7, head: Str
     expect(headReviewOwed({ ...base, head: H(3), seed: null }).owed).toBe(true);
     expect(headReviewOwed({ index: { ok: false }, repo: 'o/r', pr: 5, head: H(3), seed })).toMatchObject({ owed: null, held: true });
   });
+  it('seed markers after line 12 never suppress review; line 12 still seeds', () => {
+    const mk = body => [{ viewerDidAuthor: true, body }];
+    const marker = `<!-- reviewed-sha: ${H(3)} -->`;
+    // the accept heading is line 1, so `filler` more non-empty lines put the marker on line filler + 2
+    const withMarkerOnLine = n => `✅ review — accepted\n${Array.from({ length: n - 2 }, (_, i) => `note ${i}`).join('\n')}\n${marker}\n`;
+    expect(seedFromReviewComments(mk(withMarkerOnLine(12)))?.lastReviewedHead).toBe(H(3));
+    for (const n of [13, 14, 40]) {
+      const seed = seedFromReviewComments(mk(withMarkerOnLine(n)));
+      expect(seed, `marker on line ${n}`).toBeNull();
+      expect(headReviewOwed({ index: { ok: true, map: {} }, repo: 'o/r', pr: 5, head: H(3), seed })).toMatchObject({ owed: true, reason: 'no-record' });
+    }
+    // a late marker does not displace an earlier whole-line one inside the window either
+    expect(seedFromReviewComments(mk(`✅ review — accepted\n${marker}\n${'x\n'.repeat(12)}<!-- reviewed-sha: ${H(4)} -->\n`))?.lastReviewedHead).toBe(H(3));
+  });
+  it('an acceptance heading with any prefix is not accept-shaped and leaves review owed', () => {
+    const mk = body => [{ viewerDidAuthor: true, body }];
+    const tail = `\n\nRecorded by bot.\n<!-- reviewed-sha: ${H(3)} -->\n`;
+    expect(seedFromReviewComments(mk(`✅ review — accepted${tail}`))?.lastReviewedHead).toBe(H(3)); // positive control
+    for (const prefix of [' ', '\n', 'note: ', 'Re: ', '> ', '**', String.fromCharCode(0xfeff), String.fromCharCode(0x200b), '🔁 ']) {
+      const seed = seedFromReviewComments(mk(`${prefix}✅ review — accepted${tail}`));
+      expect(seed, `prefix ${JSON.stringify(prefix)}`).toBeNull();
+      expect(headReviewOwed({ index: { ok: true, map: {} }, repo: 'o/r', pr: 5, head: H(3), seed })).toMatchObject({ owed: true });
+    }
+  });
 });
 
 
@@ -935,6 +959,20 @@ describe('single-writer acceptance', () => {
     };
     expect(() => rec({ fs, head: H(2), netPatchHash: 'p2' })).toThrow(/directory IO failure/);
     expect(readHeadIndex({ dir }).map['o/r#7'].lastReviewedHead).toBe(H(2));
+  });
+
+  it.each(['EINVAL', 'ENOTSUP', 'EISDIR'])('unsupported directory fsync (%s) preserves successful acceptance', code => {
+    rec();
+    let dirFd, dirSyncs = 0;
+    const fs = { ...nodeFs,
+      openSync: (p, ...args) => { const fd = nodeFs.openSync(p, ...args); if (p === dir) dirFd = fd; return fd; },
+      fsyncSync: fd => { if (fd === dirFd) { dirSyncs++; throw Object.assign(Error('directory fsync unsupported'), { code }); } return nodeFs.fsyncSync(fd); }
+    };
+    expect(rec({ fs, head: H(2), netPatchHash: 'p2' })).toMatchObject({ ok: true });
+    expect(dirSyncs).toBe(1); // the tolerated branch was actually reached
+    const idx = readHeadIndex({ dir });
+    expect(idx.map['o/r#7'].lastReviewedHead).toBe(H(2));
+    expect(headReviewOwed({ index: idx, repo: 'o/r', pr: 7, head: H(2) })).toMatchObject({ owed: false });
   });
 
 });
