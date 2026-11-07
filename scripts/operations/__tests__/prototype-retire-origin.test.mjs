@@ -7,6 +7,10 @@ import { describe, it, expect, vi } from 'vitest';
 import { planFetchFailed, resolveOriginRepository } from '../prototype-retire.mjs';
 import { defaultDeps } from '../prototype-load-io.mjs';
 import { proveRetirement, proveSquashMerged } from '../../daemon-overlay.mjs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { overlayFilePath, readOverlays } from '../../lib/daemon-overlays.mjs';
 
 const REPO = 'web-everything/web-everything';
 const REF = 'lane/example';
@@ -60,6 +64,53 @@ const paths = [
 ];
 const RETIRE = { action: 'retire', reason: 'pr-squash-merged', tip: TIP, pr: 7 };
 const KEEP = { action: 'keep', reason: 'fetch-failed' };
+
+it('CLI re-proof fetches and passes the registered base for a redundant merge sibling, keeping it without that registration', () => {
+  const root = mkdtempSync(join(tmpdir(), 'retire-base-proof-'));
+  const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: root };
+  const entry = { ref: `${REF}-m2` };
+  const baseEntry = { ref: REF, pr: 42 };
+  const baseRefspec = `+refs/heads/${REF}:refs/remotes/origin/${REF}`;
+  const run = vi.fn((cmd, args) => {
+    if (cmd === 'gh') {
+      if (args[0] === 'repo') return { status: 0, stdout: repository(REPO) };
+      if (args[1] === 'view') {
+        expect(args[2]).toBe('42'); // The stored base registration, including its PR, reaches the planner.
+        return { status: 0, stdout: JSON.stringify({ number: 42, state: 'OPEN', headRefName: REF }) };
+      }
+      expect(args.slice(0, 2)).toEqual(['pr', 'list']);
+      return { status: 0, stdout: JSON.stringify(args[args.indexOf('--head') + 1] === REF
+        ? [{ number: 42, state: 'OPEN', headRefName: REF }] : []) };
+    }
+    expect(cmd).toBe('git');
+    if (args.includes('remote')) return { status: 0, stdout: `https://github.com/${REPO}.git` };
+    if (args.includes('--git-common-dir')) return { status: 0, stdout: root };
+    if (args[0] === 'init' || args[0] === 'fetch') return { status: 0, stdout: '' };
+    if (args[0] === 'rev-parse') return { status: 0, stdout: args.at(-1) === `refs/remotes/origin/${REF}^{commit}` ? OTHER : TIP };
+    if (args[0] === 'rev-list') return { status: 0, stdout: args.includes('--no-merges') ? MERGE : '' };
+    if (args[0] === 'merge-tree') return { status: 1, stdout: '' }; // Conflicts with main.
+    expect(args).toEqual(['merge-base', '--is-ancestor', MERGE, OTHER]);
+    return { status: 0, stdout: '' };
+  });
+  try {
+    expect(proveRetirement({ root, entry, env, run })).toMatchObject({ ref: entry.ref, action: 'keep', reason: 'pr-open' });
+    expect(run.mock.calls.find(([, args]) => args[0] === 'fetch')[1]).not.toContain(baseRefspec);
+    run.mockClear();
+    writeFileSync(overlayFilePath(root, env), JSON.stringify({ overlays: [entry, baseEntry] }));
+    expect(proveRetirement({ root, entry, env, run })).toMatchObject({
+      ref: entry.ref, action: 'retire', reason: 'redundant-merge-sibling',
+      evidence: { baseRef: REF, basePr: 42, baseTip: OTHER },
+    });
+    expect(run.mock.calls.find(([, args]) => args[0] === 'fetch')[1]).toEqual([
+      'fetch', '--no-tags', '-q', `https://github.com/${REPO}.git`,
+      '+refs/heads/main:refs/remotes/origin/main',
+      `+refs/heads/${entry.ref}:refs/remotes/origin/${entry.ref}`, baseRefspec,
+    ]);
+    expect(readOverlays(root, { env })).toEqual([entry, baseEntry]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 describe.each(paths)('deleted branch with an authoritative last tip: %s', (_name, decide) => {
   it.each([undefined, 7])('retires when the branch was last deleted at the merged PR head (recorded PR %s)', (pr) => {
