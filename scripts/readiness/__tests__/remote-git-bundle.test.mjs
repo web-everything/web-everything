@@ -63,6 +63,16 @@ const beginMainMerge = (publicContent = 'public update\n') => {
 };
 
 describe('scanBundleRange lane first-parent scope', () => {
+  it('rejects a regular-file-to-symlink mode-only transition with the same prerequisite path and blob', async () => {
+    write('link.txt', '.env.local');
+    originMain = commit('public regular file');
+    const sha = git(lane, 'rev-parse', `${originMain}:link.txt`);
+    git(lane, 'update-index', '--cacheinfo', `120000,${sha},link.txt`);
+    commit('lane mode-only transition');
+    expect(git(lane, 'ls-tree', 'HEAD', '--', 'link.txt')).toBe(`120000 blob ${sha}\tlink.txt`);
+    expect(await scan()).toEqual({ path: 'link.txt', finding: 'symlink' });
+  });
+
   it('does not rescan secret-looking main content already present at origin/main after a lane merge', async () => {
     write('lane.txt', 'clean lane change\n');
     commit('lane change');

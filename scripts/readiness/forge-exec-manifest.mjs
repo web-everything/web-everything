@@ -129,11 +129,22 @@ export function credentialContentFinding(path,content) {
   if(raw)return raw;
   // YAML/INI/plain-text assignments, including quoted fields and YAML lists.
   // This is a conservative exclusion heuristic, not a parser for arbitrary formats.
-  for(const [,field,value] of text.matchAll(/(?:^|[\r\n])[\t ]*(?:-[\t ]+)?["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?[\t ]*[:=][\t ]*([^\r\n]*)/g)) {
+  for(const match of text.matchAll(/(?:^|[\r\n])([\t ]*)(?:-[\t ]+)?["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?[\t ]*[:=][\t ]*([^\r\n]*)/g)) {
+    const [,indent,field,value]=match;
+    const trimmed=value.trim(),literal=/^(["'])(.*)\1$/.exec(trimmed)?.[2]??trimmed;
+    // Only dotted context references (optionally joined by ||) prove that the
+    // expression contains no literal credential. Unknown expression forms refuse.
+    // Raw token patterns above still apply, including inside the reference.
+    if(/^\$\{\{\s*[A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)+(?:\s*\|\|\s*[A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)+)*\s*\}\}$/.test(literal)) {
+      // A more-indented next non-blank line can extend a YAML plain scalar.
+      // In that case the first line alone cannot prove a whole-value reference.
+      const nextLine=/^([\t ]*)([^\t \r\n][^\r\n]*)/m.exec(text.slice(match.index+match[0].length));
+      if(!nextLine||nextLine[1].length<=indent.length)continue;
+      if(secretField.test(field)&&nextLine[2].length>=20&&entropy(nextLine[2])>=3.5)return `high-entropy-${field}`;
+    }
     if(secretField.test(field)&&value.length>=20&&entropy(value)>=3.5)return `high-entropy-${field}`;
     if(/password|passwd|secret|token|api[_-]?key/i.test(field)) {
-      // Only whole, explicit placeholders qualify; expressions and suffixes do not.
-      const trimmed=value.trim(),literal=/^(["'])(.*)\1$/.exec(trimmed)?.[2]??trimmed;
+      // Only whole, explicit placeholders qualify; mixed expressions do not.
       if(!/^(?:example|<placeholder>|<redacted>|\[REDACTED\])?$/i.test(literal))return `secret-assignment-${field}`;
     }
   }
