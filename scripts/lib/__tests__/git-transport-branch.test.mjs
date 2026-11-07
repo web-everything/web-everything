@@ -485,6 +485,16 @@ describe('read fetch is coalesced through a per-repo+branch TTL stamp in .git', 
     expect(fetches(m.calls)).toBe(2);
     expect(m.logs.join('\n')).toMatch(/never-cached/);
   });
+  it('the quarantine branch (a merge/skip decision input) is never served from cache', () => {
+    reset(); const m = mk();
+    m.read({ branch: 'ops/quarantine' }); m.read({ branch: 'ops/quarantine' });
+    expect(fetches(m.calls)).toBe(2);
+  });
+  it('a decision-free branch like review-requests is cached', () => {
+    reset(); const m = mk();
+    m.read({ branch: 'ops/review-requests' }); m.read({ branch: 'ops/review-requests' });
+    expect(fetches(m.calls)).toBe(1);
+  });
   it('an unreadable stamp fails closed: fetch', () => {
     reset(); const m = mk();
     mkdirSync(stampDir, { recursive: true });

@@ -384,7 +384,7 @@ export const OPS_READ_FETCH_TTL_MS = 30_000;
  * read after a verdict seeing a freeze published seconds earlier (merge-gate-check.mjs), so a 30s-stale clear
  * document would defeat it. These always fetch.
  */
-export const OPS_READ_NEVER_CACHED = Object.freeze(['ops/red-main-freeze']);
+export const OPS_READ_NEVER_CACHED = Object.freeze(['ops/red-main-freeze', 'ops/quarantine']);
 
 function defaultFetchLog(msg) { process.stderr.write(`${msg}\n`); }
 

@@ -8,7 +8,7 @@
  * `scripts/lib/verdict-ledger.mjs`, and every sibling library test in this repo sits in `scripts/lib/__tests__/`
  * (`review-escalation.test.mjs`, `jury-ledger.test.mjs`, …). The card's path is corrected rather than followed.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { existsSync, mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1757,6 +1757,7 @@ describe('configured shared ledger readers (Part B)', () => {
       const event = buildLedgerEvent({ type: 'ruling', repo: REPO, pr: 1, at: AT, source: 'test', findingKey: 'f1', ruling: 'block' });
       appendLedgerRows({ repo: REPO, board: ctx.clone, records: [rec(), event], sleep: () => {} });
       const opts = { board: ctx.clone, env: { WE_VERDICT_LEDGER_READ_STORE: 'git' } };
+      vi.stubEnv('WE_OPS_FETCH_TTL_MS', '0'); // broken-origin assertion below needs every read to fetch
       const shared = await readLedgerEventsFromStore(REPO, opts);
       expect(shared).toMatchObject({ status: 'ok', store: { name: 'git', shared: true } });
       expect(shared.rows.map((r) => r.id)).toEqual([ledgerEventId(rec()), ledgerEventId(event)]);
@@ -1771,6 +1772,7 @@ describe('configured shared ledger readers (Part B)', () => {
       const broken = await readLedgerEventsFromStore(REPO, opts);
       expect(broken).toMatchObject({ status: 'unreadable', store: { name: 'git' } });
       expect(broken.rows).toBeUndefined();
+      vi.unstubAllEnvs();
     });
   });
 
