@@ -498,7 +498,7 @@ export function planJudgeNotReal({ mode, evidence, liveHead, findings, confirm, 
   for (const f of findings) {
     const classes = [f.class, f.findingClass, ...(f.classes ?? []), ...(f.alsoClasses ?? [])];
     const file = String(f.file ?? '').replaceAll('\\', '/');
-    if (!file || file.includes('..') || /(?:^|\/)(?:guards?|security|launchd)(?:\/|\.)|(?:drain|merge|firewall|codex-shim)/i.test(file)
+    if (!file || file.includes('..') || /guard|security|launchd|drain|merge|firewall|codex-shim/i.test(file)
       || (!classes.some(c => typeof c === 'string' && c.trim()) || classes.some(c => /^security(?:-|$)/.test(c))) || f.securityReachableToday === true)
       throw new Error('protected or security finding is operator-only');
   }
@@ -532,9 +532,12 @@ export function planJudgeRuling(read, input, select) {
   if (input.asJudge !== undefined && typeof input.asJudge !== 'boolean') throw new Error('asJudge must be boolean');
   if (!input.asJudge) return null;
   if (input.ruling !== 'not-real') throw new Error('asJudge applies only to not-real');
+  if (!Number.isInteger(read.disagreements) || read.disagreements < 0
+    || (input.disagreements !== undefined && (!Number.isInteger(input.disagreements) || input.disagreements < 0)))
+    throw new Error('reader and supplied disagreements must be nonnegative integers');
   const policy = { mode: read.judgeNotRealMode?.value, evidence: read.evidence ?? input.evidence,
     liveHead: read.head, findings: select(read, input),
-    disagreements: input.disagreements === undefined ? read.disagreements : input.disagreements };
+    disagreements: input.disagreements === undefined ? read.disagreements : Math.max(input.disagreements, read.disagreements) };
   const preflight = planJudgeNotReal({ ...policy, confirm: { verdict: 'agree' } });
   return { mode: 'judge', policy: { ...policy, evidence: preflight.evidence }, input, read };
 }
