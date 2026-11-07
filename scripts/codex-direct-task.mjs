@@ -862,8 +862,14 @@ export function captureDiff({ dir, startSha, execFn = defaultExecFn, binarySafe 
 
 /** Fixed output shape for the byte-exact patch: the checkout's git config (which Codex can write) or the host's
  *  must not colour it, drop or rename its `a/`/`b/` prefixes, or narrow it to a subdirectory — any of those
- *  yields a patch `git apply` refuses while it still decodes as clean UTF-8. `--binary` implies `--full-index`. */
-export const BINARY_PATCH_DIFF_ARGS = Object.freeze(['diff', '--binary', '--no-color', '--src-prefix=a/', '--dst-prefix=b/', '--no-relative']);
+ *  yields a patch `git apply` refuses while it still decodes as clean UTF-8. `--unified=3`: a `diff.context=0`
+ *  patch does not apply. `--ignore-submodules=none`: a gitlink change is never hidden (and is refused below).
+ *  `--binary` implies `--full-index`. */
+export const BINARY_PATCH_DIFF_ARGS = Object.freeze(['diff', '--binary', '--no-color', '--src-prefix=a/', '--dst-prefix=b/', '--no-relative',
+  '--unified=3', '--ignore-submodules=none']);
+
+/** A gitlink (mode 160000) line in the patch: it carries only a commit id, never the nested repository's files. */
+const GITLINK_PATCH_RE = /^(?:(?:new file|deleted file|new|old) mode 160000|index [0-9a-f]+\.\.[0-9a-f]+ 160000|[-+]Subproject commit [0-9a-f]+)$/m;
 
 const notExact = (reason) => ({ patch: null, patchExact: false, patchError: String(reason?.message ?? reason).split('\n')[0] });
 
@@ -888,7 +894,15 @@ function captureBinaryPatch(git, startSha, { untracked, intentToAddError }) {
     return { patch, patchExact: patch === '' };
   }
   const patch = raw.toString('utf8');
+  // A nested repository (or submodule bump) travels as a bare commit id: its files exist only in the clone.
+  if (GITLINK_PATCH_RE.test(patch)) return { ...notExact('the patch has a nested repository (gitlink) whose files it cannot carry'), patch };
   return { patch, patchExact: Buffer.from(patch, 'utf8').equals(raw) };
+}
+
+/** True only when a captured diff proved the clone holds no edits: nothing changed AND no capture doubt (a hidden
+ *  or unstaged new file is in neither diff, so `hasChanges` alone cannot prove it). */
+export function diffProvesNoEdits(diff) {
+  return Boolean(diff) && !diff.hasChanges && diff.patchExact !== false;
 }
 
 /**
@@ -1365,7 +1379,7 @@ export async function codexDirectTask({
 
   // --json (and every detached job) removes the clone and hands back `diff.patch`, so it must rebuild the edit
   // byte for byte; when it cannot (a non-UTF-8 text edit, a failed binary read) the clone is the only copy.
-  const patchNotExact = Boolean(scratch) && diff.hasChanges && !diff.patchExact;
+  const patchNotExact = Boolean(scratch) && diff.patchExact === false && !diffProvesNoEdits(diff);
   const retainedReason = !scratch ? null : keep ? 'keep' : keepScratch ? 'human-cli' : patchNotExact ? 'patch-not-byte-exact' : null;
   if (retainedReason === 'human-cli' || retainedReason === 'patch-not-byte-exact') retainedScratch = scratch.dest;
   if (retainedReason === 'patch-not-byte-exact') {
@@ -1417,7 +1431,7 @@ export async function codexDirectTask({
     // Once Codex started, the scratch clone may hold the only copy of its edits (a red self-review repair gate, a
     // failed capture, a failure after it): keep it unless the captured diff proved there were none. The CLI
     // prints only the error, so the error names the kept clone and the log inside it.
-    if (editsAt && !cleaned && !retainedScratch && !(capturedDiff && !capturedDiff.hasChanges)) {
+    if (editsAt && !cleaned && !retainedScratch && !diffProvesNoEdits(capturedDiff)) {
       retainedScratch = editsAt.dest;
       if (error instanceof Error) error.message += ` (scratch clone kept at ${editsAt.dest}: the run failed after Codex started, so its edits may be there; log at ${editsAt.log})`;
     }

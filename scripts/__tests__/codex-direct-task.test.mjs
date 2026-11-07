@@ -45,6 +45,7 @@ import {
   detachedGateExecFn,
   setupScratchClone,
   captureDiff,
+  diffProvesNoEdits,
   runGate,
   runCodexDirectExec,
   codexDirectTask,
@@ -875,13 +876,20 @@ describe('captureDiff — the review artifact, never a commit/push', () => {
     [['diff.mnemonicPrefix', 'true']],
     [['diff.relative', 'true']],
     [['status.showUntrackedFiles', 'no']],
+    [['diff.context', '0']],
+    [['diff.ignoreSubmodules', 'all'], ['diff.renames', 'copies']],
   ])('binarySafe: checkout config %j cannot break the patch', (...pairs) => {
     const dir = mkdtempSync(join(tmpdir(), 'we-codex-config-patch-'));
     const fresh = `${dir}-fresh`;
     try {
       const git = initGitRepo(dir);
+      // A modified line with context around it: a zero-context patch of it does not apply.
+      writeFileSync(join(dir, 'ctx.txt'), 'a\nb\nc\nd\ne\n');
+      git('add', 'ctx.txt');
+      git('-c', 'user.name=t', '-c', 'user.email=t@example.test', '-c', 'commit.gpgSign=false', 'commit', '--quiet', '-m', 'ctx');
       const startSha = git('rev-parse', 'HEAD');
       for (const [key, value] of pairs) git('config', key, value);
+      writeFileSync(join(dir, 'ctx.txt'), 'a\nb\nC\nd\ne\n');
       mkdirSync(join(dir, 'nested'));
       writeFileSync(join(dir, 'nested', 'added.bin'), binaryBytes(5));
       writeFileSync(join(dir, 'top.txt'), 'top\n');
@@ -893,6 +901,7 @@ describe('captureDiff — the review artifact, never a commit/push', () => {
       execFileSync('git', ['-C', fresh, 'apply', '--binary', '.patch']);
       expect(readFileSync(join(fresh, 'nested', 'added.bin')).equals(binaryBytes(5))).toBe(true);
       expect(readFileSync(join(fresh, 'top.txt'), 'utf8')).toBe('top\n');
+      expect(readFileSync(join(fresh, 'ctx.txt'), 'utf8')).toBe('a\nb\nC\nd\ne\n');
     } finally {
       rmSync(dir, { recursive: true, force: true });
       rmSync(fresh, { recursive: true, force: true });
@@ -912,6 +921,33 @@ describe('captureDiff — the review artifact, never a commit/push', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('binarySafe: a nested repository Codex created (a bare gitlink in the patch) is not byte-exact', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-codex-gitlink-patch-'));
+    try {
+      const git = initGitRepo(dir);
+      const startSha = git('rev-parse', 'HEAD');
+      const nested = join(dir, 'vendor-repo');
+      mkdirSync(nested);
+      const nestedGit = initGitRepo(nested);
+      writeFileSync(join(nested, 'lib.bin'), binaryBytes(7));
+      nestedGit('add', 'lib.bin');
+      nestedGit('-c', 'user.name=t', '-c', 'user.email=t@example.test', '-c', 'commit.gpgSign=false', 'commit', '--quiet', '-m', 'lib');
+      const report = captureDiff({ dir, startSha, binarySafe: true });
+      expect(report.patchExact).toBe(false);
+      expect(report.patchError).toContain('gitlink');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('diffProvesNoEdits: only an empty AND exact capture proves the clone holds nothing', () => {
+    expect(diffProvesNoEdits(undefined)).toBe(false);
+    expect(diffProvesNoEdits({ hasChanges: false })).toBe(true);
+    expect(diffProvesNoEdits({ hasChanges: false, patchExact: true })).toBe(true);
+    expect(diffProvesNoEdits({ hasChanges: false, patchExact: false, patchError: 'hidden' })).toBe(false);
+    expect(diffProvesNoEdits({ hasChanges: true, patchExact: true })).toBe(false);
   });
 
   it('binarySafe: a failed intent-to-add (new files missing from every diff) is not byte-exact', () => {
@@ -1454,7 +1490,7 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
   });
 
   it.each(['success', 'failure', 'worker-failure', 'post-log-failure', 'log-copy-failure', 'keep', 'keep-scratch', 'keep-scratch-throw', 'exit',
-    'exact-patch', 'lossy-patch', 'capture-failure', 'post-capture-failure-with-edits'])('R657 cleans (or, holding uncaptured edits, keeps) owned scratch/task dirs on %s, preserves the reported log, and unregisters its exit hook', async mode => {
+    'exact-patch', 'lossy-patch', 'capture-failure', 'post-capture-failure-with-edits', 'hidden-new-file'])('R657 cleans (or, holding uncaptured edits, keeps) owned scratch/task dirs on %s, preserves the reported log, and unregisters its exit hook', async mode => {
     const dirs = [];
     const log = vi.fn();
     // A post-log failure AFTER the diff is captured: the quota read (it runs only for a run with a thread id).
@@ -1469,6 +1505,8 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     const execFn = (bin, args) => {
       if (args[0] === 'clone' && mode === 'failure') throw new Error('clone failed');
       if (args.includes('diff') && mode === 'capture-failure') throw new Error('diff failed after logging');
+      // Codex's only edit is a new file an exclude file outside .gitignore hides: both diffs are empty.
+      if (args.includes('ls-files') && mode === 'hidden-new-file') return 'hidden.bin\0';
       if (args.includes('--binary') && ['exact-patch', 'lossy-patch'].includes(mode)) return mode === 'exact-patch' ? exactPatch : lossyPatch;
       if (args.includes('diff') && ['exact-patch', 'lossy-patch', 'post-capture-failure-with-edits'].includes(mode) && !args.includes('--stat')) {
         return args.includes('--binary') ? exactPatch : '+change\n';
@@ -1498,7 +1536,7 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       ...(quotaThrows ? { readQuotaFn: () => { throw new Error('quota read failed after logging'); } } : {}),
     };
     try {
-      // keep-scratch-throw: a human run that throws prints only its error, so nothing points into its clone.
+      // keep-scratch-throw: a human run that throws after an empty capture prints only its error, and its clone is cleaned.
       if (['failure', 'post-log-failure', 'log-copy-failure', 'keep-scratch-throw', 'exit', 'capture-failure', 'post-capture-failure-with-edits'].includes(mode)) {
         const error = await codexDirectTask(opts).then(() => null, e => e);
         expect(error).toBeInstanceOf(Error);
@@ -1515,10 +1553,11 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       else {
         const report = await codexDirectTask(opts);
         expect(readFileSync(report.logFile, 'utf8')).toBe('{"type":"turn.completed","usage":{}}\n');
-        const retained = ['keep', 'keep-scratch', 'lossy-patch'].includes(mode);
+        const retained = ['keep', 'keep-scratch', 'lossy-patch', 'hidden-new-file'].includes(mode);
         expect(report.logFile).toBe(retained ? join(dirs[0], '.git', 'codex-direct-task.jsonl') : `${dirs[0]}.jsonl`);
         expect(report.scratch.retained).toBe(retained);
-        expect(report.scratch.retainedReason).toBe({ keep: 'keep', 'keep-scratch': 'human-cli', 'lossy-patch': 'patch-not-byte-exact' }[mode] ?? null);
+        expect(report.scratch.retainedReason).toBe({ keep: 'keep', 'keep-scratch': 'human-cli', 'lossy-patch': 'patch-not-byte-exact', 'hidden-new-file': 'patch-not-byte-exact' }[mode] ?? null);
+        if (mode === 'hidden-new-file') expect(report.diff.hasChanges).toBe(false);
         if (mode === 'exact-patch') expect(report.diff.patch).toBe(exactPatch.toString('utf8'));
         if (mode === 'lossy-patch') expect(log).toHaveBeenCalledWith(expect.stringContaining(`retaining the scratch clone at ${dirs[0]}`));
         // The preserved sibling log sits in the shared tmpdir, so it is owner-only.
@@ -1530,7 +1569,7 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
         expect(existsSync(dirs[1])).toBe(false);
         expect(readFileSync(join(dirs[0], '.git', 'codex-direct-task.jsonl'), 'utf8')).toBe(stdout);
         expect(log).toHaveBeenCalledWith(expect.stringContaining('log preservation failed; retaining'));
-      } else if (['keep-scratch', 'lossy-patch', 'capture-failure', 'post-capture-failure-with-edits'].includes(mode)) {
+      } else if (['keep-scratch', 'lossy-patch', 'capture-failure', 'post-capture-failure-with-edits', 'hidden-new-file'].includes(mode)) {
         expect(existsSync(dirs[0])).toBe(true);
         expect(existsSync(dirs[1])).toBe(false);
         expect(existsSync(`${dirs[0]}.jsonl`)).toBe(false);
