@@ -467,13 +467,27 @@ export function rulingCardSteps(readRulingContext, planCard, type, selectJudge) 
       if (judge && !v.input.preview && !landed?.judgeEvidence) throw new Error('missing judge confirmation result; ask the operator');
       if (judge && landed?.input?.ruling === 'not-real') {
         let fresh;
-        try { fresh = readRulingContext({ repo: v.input.repo, pr: v.input.pr, card: v.input.card, asJudge: v.input.asJudge, evidenceFile: v.input.evidenceFile, disagreements: v.input.disagreements }); }
+        try { fresh = readRulingContext({ repo: v.input.repo, pr: v.input.pr, card: v.input.card, asJudge: v.input.asJudge, evidenceFile: v.input.evidenceFile, disagreements: v.input.disagreements, finding: v.input.finding, break: v.input.break }); }
         catch { throw new Error('disagreement history unreadable after judge confirmation; operator-only; no ruling recorded'); }
         if (!Number.isInteger(fresh?.disagreements) || fresh.disagreements < 0
           || fresh.disagreements >= 2 || fresh.disagreements > v.findings.read.disagreements)
           throw new Error('disagreement history unknown, repeated, or increased after judge confirmation; operator-only; no ruling recorded');
         if (fresh.head !== v.findings.read.head)
           throw new Error('PR head changed during judge confirmation; operator-only; no ruling recorded');
+        try {
+          const selected = selectJudge(fresh, v.input);
+          const identities = findings => JSON.stringify([...new Set(findings.map(f => {
+            if (typeof f.runId !== 'string' || !f.runId || typeof f.key !== 'string' || !f.key)
+              throw new Error('missing selected finding identity');
+            return JSON.stringify([f.runId, f.key]);
+          }))].sort());
+          if (identities(selected) !== identities(v.findings.cardPlan.policy.findings))
+            throw new Error('selected finding identities changed during judge confirmation');
+          planJudgeNotReal({ ...v.findings.cardPlan.policy, findings: selected, liveHead: fresh.head,
+            disagreements: fresh.disagreements, confirm: { verdict: landed.judgeEvidence.confirm } });
+        } catch (error) {
+          throw new Error(`${error.message}; operator-only; no ruling recorded`);
+        }
         return fresh;
       }
       if (v.findings.cardPlan && !v.input.preview && (!landed?.ok || !landed.ref))

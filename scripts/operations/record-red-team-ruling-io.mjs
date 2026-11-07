@@ -102,9 +102,18 @@ const resolveCardDefault = (card, { runGit = git, readOnPr = readCardAtPrHead } 
 /** Log the effective ruling scope and its policy-cascade source. */
 const readScopeLogged = (env) => readOperatorRulings({ env, log: (m) => process.stderr.write(`${m}\n`) });
 
+/** The engine's compute steps are synchronous. Await the shared store in a bounded child instead. */
+export function readJudgeLedgerSync(repo, { env = process.env, run = execFileSync } = {}) {
+  const moduleUrl = new URL('../lib/verdict-ledger.mjs', import.meta.url).href;
+  return JSON.parse(run(process.execPath, ['--input-type=module', '-e',
+    `import { readLedgerEventsFromStore } from ${JSON.stringify(moduleUrl)};
+     process.stdout.write(JSON.stringify(await readLedgerEventsFromStore(process.argv[1])));`, repo],
+  { env, encoding: 'utf8', timeout: 60_000, maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
+}
+
 export function createRecordRedTeamRulingReader({ tool, log = line => console.error(line), env = process.env, readThread = readLiveThread, readSetting = () => readConfirmedBreaks({ env }),
   readStandingRulingScope = standingRulingScope, readFile = readFileSync,
-  readEvents = repo => readLedgerEventsFromStore(repo, { env }),
+  readEvents = repo => readJudgeLedgerSync(repo, { env }),
   readScope = () => readScopeLogged(env), runGit = git, readOnPr = readCardAtPrHead,
   resolveCard = card => resolveCardDefault(card, { runGit, readOnPr }),
   resolveIdentity = () => resolveOperatorIdentity({ env }), now = () => new Date().toISOString(),
@@ -140,7 +149,12 @@ export function createRecordRedTeamRulingReader({ tool, log = line => console.er
         setting: readSetting().value, scope: { value: scope.value, sources: scope.sources ?? {} }, now: now(), identity: resolveIdentity(),
         card: card === undefined || card === '' ? null : resolveCard(card, { repo, pr, head }) };
     };
-    return asJudge ? Promise.resolve().then(() => readEvents(repo)).catch(() => null).then(build) : build();
+    let ledger;
+    if (asJudge) {
+      try { ledger = readEvents(repo); }
+      catch { ledger = null; }
+    }
+    return build(ledger);
   };
 }
 

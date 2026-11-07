@@ -299,7 +299,8 @@ export function recordRedTeamRulingOperation({ readRulingContext, judgeConfirm }
     }),
     ...rulingCardSteps(readRulingContext, planRedTeamCard, 'github.red-team-ruling-file-card', (read, input) => {
       validateRedTeamRulingInput(read, input);
-      return selectRedTeamRulingFindings(read, input).selected;
+      const { selected, state } = selectRedTeamRulingFindings(read, input);
+      return selected.map(f => ({ ...f, runId: state.resultId, key: String(f.index) }));
     }),
     plan: compute({
       reads: ['input.repo', 'input.pr', 'input.break', 'input.ruling', 'input.actor', 'input.channel', 'input.reason', 'input.card', 'input.cause', 'input.preview', 'findings.read', 'findings.reread', 'findings.cardPlan', 'findings.landCard'],

@@ -1076,7 +1076,98 @@ describe('R668 acting judge not-real requires evidence (red-first)', () => {
     return { run, result, operation, view, written, judgeConfirm, landRulingCard, noIO, snapshot, rtIO };
   }
 
+  for (const history of ['ok', 'unreadable', 'throws', 'async']) {
+    it(`red-team: real engine with synchronous judge reader and ${history} history`, async () => {
+      const [, rt, rtIO, , , engine] = await modules;
+      const { createRegistry } = await import('../registry.mjs');
+      const { applyPendingEffects } = await import('../effect-executor.mjs');
+      const { createMemoryRunStore } = await import('../run-store.mjs');
+      const h = await fixture('red-team');
+      const readEvents = vi.fn(() => {
+        if (history === 'throws') throw new Error('ledger unavailable');
+        if (history === 'async') return Promise.resolve({ status: 'ok', rows: [] });
+        return { status: history, rows: [] };
+      });
+      const reader = rtIO.createRecordRedTeamRulingReader({
+        env: { WE_PLATFORM_PREFERENCES_FILE: prefsFile({}) }, assertFresh: () => {}, log: () => {},
+        readThread: () => ({ headRefOid: head, comments: h.snapshot.comments, labels: h.snapshot.labels }),
+        readSetting: () => ({ value: h.snapshot.setting }), readScope: () => h.snapshot.scope,
+        readStandingRulingScope: () => null, resolveIdentity: () => h.snapshot.identity,
+        readFile: () => JSON.stringify(evidence()), readEvents,
+      });
+      const registry = createRegistry();
+      const operation = rt.recordRedTeamRulingOperation({ readRulingContext: reader });
+      registry.register(operation);
+      const { finding: _finding, evidence: _evidence, sendBack: _sendBack, ...input } = h.view.input;
+      let run = engine.startRun({ op: operation.name, id: `judge-engine-${history}`,
+        input: { ...input, evidenceFile: 'evidence.json' }, registry });
+      const written = [];
+      const sinks = {
+        ...rtIO.createRecordRedTeamRulingSinks({ judgeConfirm: h.judgeConfirm, landRulingCard: h.landRulingCard }),
+        'github.red-team-ruling-not-real': p => { written.push(p); return { ok: true }; },
+      };
+      const drive = async () => {
+        for (let step = 0; step < 20 && !engine.isComplete(run, { registry }); step++) {
+          run = engine.advanceWhileRunning(run, { registry });
+          if (run.pending) run = (await applyPendingEffects(run, { sinks, store: createMemoryRunStore() })).run;
+        }
+        expect(engine.isComplete(run, { registry })).toBe(true);
+      };
+      if (history === 'ok') {
+        await drive();
+        expect(run.findings.read).toMatchObject({ head, disagreements: 0 });
+        expect(run.verdict.ruling).toBe('not-real');
+        expect(h.judgeConfirm).toHaveBeenCalledTimes(1);
+        expect(readEvents).toHaveBeenCalledTimes(2);
+        expect(written).toHaveLength(1);
+        expect(written[0].judgeEvidence.confirm).toBe('agree');
+      } else {
+        await expect(drive()).rejects.toThrow(/disagreement|history unknown/i);
+        expect(h.judgeConfirm).not.toHaveBeenCalled();
+        expect(written).toEqual([]);
+      }
+    });
+  }
+
+  it('red-team: synchronous ledger child is bounded and returns parsed store evidence', async () => {
+    const [, , rtIO] = await modules;
+    const run = vi.fn(() => JSON.stringify({ status: 'ok', rows: [] }));
+    expect(rtIO.readJudgeLedgerSync(repo, { env: {}, run })).toEqual({ status: 'ok', rows: [] });
+    expect(run).toHaveBeenCalledWith(process.execPath, expect.arrayContaining([repo]),
+      expect.objectContaining({ timeout: 60_000, maxBuffer: 64 * 1024 * 1024, env: {} }));
+    expect(() => rtIO.readJudgeLedgerSync(repo, { run: () => { throw new Error('maxBuffer exceeded'); } }))
+      .toThrow(/maxBuffer/);
+    expect(() => rtIO.readJudgeLedgerSync(repo, { run: () => '{}' + 'invalid' })).toThrow();
+  });
+
   for (const kind of ['referral', 'red-team']) {
+    for (const change of ['new security finding', 'same identity becomes security', 'same identity becomes protected']) {
+      it(`${kind}: ${change} during confirm (referral all-open) => operator-only, nothing posted`, async () => {
+        const h = await fixture(kind);
+        const [, , , seats] = await modules;
+        h.judgeConfirm.mockImplementation(async () => {
+          const over = change.includes('protected') ? { file: 'scripts/security/check.mjs' } : { findingClass: 'security', securityReachableToday: true };
+          if (kind === 'referral') {
+            const changed = { ...h.snapshot.open[0], ...over };
+            if (change === 'new security finding') h.snapshot.open.push({ ...changed, key: 'new-security-key' });
+            else h.snapshot.open[0] = changed;
+          } else {
+            const f = { ...finding('coverage fixture'), line: 7, impactIfUnfixed: 'degraded',
+              findingClass: 'coverage-or-style', classBasis: 'Missing test, no live break', confirmedByRecheck: true };
+            h.snapshot.comments[0] = gh(seats.renderRedTeamComment({ pr: 7, rev: head, provider: 'codex', model: 'm',
+              recheckStatus: 'ok', foldedVerdict: 'changes', findingClasses: {},
+              findings: change === 'new security finding' ? [{ ...f, ...over }, f] : [{ ...f, ...over }] }),
+            'web-everything', { createdAt: '2026-10-04T14:00:00Z' });
+          }
+          return { verdict: 'agree' };
+        });
+        await expect(h.run()).rejects.toThrow(/operator-only/);
+        expect(h.judgeConfirm).toHaveBeenCalledTimes(1);
+        expect(h.landRulingCard).not.toHaveBeenCalled();
+        expect(h.written).toEqual([]);
+        expect(h.noIO).not.toHaveBeenCalled();
+      });
+    }
     async function realContext(h, { asJudge = true, unknown = false, repeated = false } = {}) {
       const [, , rtIO, , gate] = await modules;
       const common = { env: { WE_PLATFORM_PREFERENCES_FILE: prefsFile({}),
