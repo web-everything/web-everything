@@ -3,7 +3,7 @@
  * correctly, the unchanged verdict pass runs in two phases under R3, and R5 releases only what it should.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,7 +15,7 @@ import {
 import { reserve, readLockEntry } from '../../readiness/file-locks.mjs';
 import { acquireFixDispatchClaim, releaseFixDispatchClaim, readFixDispatchClaim, listFixDispatchClaims } from '../fix-dispatch-claim.mjs';
 import { resolveFixerSlotSettings } from '../fixer-slot-rules.mjs';
-import { runAwaitVerifyPass } from '../await-verify-pass.mjs';
+import { AWAIT_VERIFY_LIMITS, formatAwaitVerifyLines, runAwaitVerifyPass } from '../await-verify-pass.mjs';
 
 const SHA = '65a382e81413952ab11e5448e36f01bb7ce4c332';
 const TREE = 'f'.repeat(64);
@@ -70,6 +70,175 @@ const green = { sha: SHA, status: 'green', startedAt: new Date(T0).toISOString()
 const running = { ...green, status: 'running', exitCode: null };
 
 describe('runSlotAwareAwaitPass — the real pass, R3-gated', () => {
+  it('classifies only delivered-previous-ci and resume-exhausted waits, preserving unrelated waits and non-wait actions', async () => {
+    const { classifyUnwakeableWait } = await import('../fixer-slot-rules.mjs');
+    const delivered = { reason: 'previous-head CI repair must be verified and re-marked' };
+    const exhausted = { result: 'resume-exhausted; previous-head CI failures retained; operator recovery required' };
+    expect(classifyUnwakeableWait({ action: 'wait', ...delivered })).toBe('delivered-previous-ci');
+    expect(classifyUnwakeableWait({ action: 'wait', ...exhausted })).toBe('resume-exhausted');
+    for (const reason of ['verify still running', 'red-load-deferred', 'persist-failed', 'infra retry']) {
+      expect(classifyUnwakeableWait({ action: 'wait', reason })).toBeNull();
+    }
+    for (const result of ['resume-paused', 'resume-retry', 'retry: resume-exhausted', '', null, 0]) {
+      expect(classifyUnwakeableWait({ action: 'wait', result })).toBeNull();
+    }
+    for (const action of ['resume', 'push', 'skip', 'error', undefined]) {
+      expect(classifyUnwakeableWait({ action, ...delivered })).toBeNull();
+      expect(classifyUnwakeableWait({ action, ...exhausted })).toBeNull();
+    }
+    expect(classifyUnwakeableWait({ action: 'wait' })).toBeNull();
+    expect(classifyUnwakeableWait(null)).toBeNull();
+    expect(classifyUnwakeableWait(undefined)).toBeNull();
+  });
+
+  const repair = (pr, over = {}) => rec(pr, {
+    requestedAt: new Date(T0 - 60_000).toISOString(),
+    previousCi: { ready: { ciFailures: [{ name: 'unit', conclusion: 'failure' }] } },
+    pendingResume: { kind: 'red', detail: 'previous-head CI failures' }, ...over,
+  });
+  const runSlots = (h, over = {}) => runSlotAwareAwaitPass({
+    io: h.io, runPass: runAwaitVerifyPass, allowResume: true, settings: ON,
+    claims: [], nowMs: NOW, ttlMs: TTL, cap: 2, log: vi.fn(), ...over,
+  });
+
+  it('admits live resumes behind older delivered-previous-ci and exhausted records without waking either dead record', async () => {
+    const dead = [repair(1, { pendingResume: { kind: 'red', delivered: true } }),
+      repair(2, { resumeFailures: AWAIT_VERIFY_LIMITS.maxResumeFailures })];
+    const h = harness([...dead, rec(3, { pendingResume: { kind: 'green' } }),
+      rec(4, { pendingResume: { kind: 'green' } })], {});
+    h.io.fixTimingPolicy = () => ({ pushAfterCi: true });
+    const out = await runSlots(h);
+    expect(out.admitted).toEqual(['sid-3', 'sid-4']);
+    expect(out.deferred).toEqual([]);
+    expect(out.excluded).toEqual([
+      { key: 'sid-1', reason: 'delivered-previous-ci' }, { key: 'sid-2', reason: 'resume-exhausted' },
+    ]);
+    expect(h.calls.resume).toEqual(['sid-3', 'sid-4']);
+    expect(h.store.get('sid-1')).toEqual(dead[0]);
+    expect(h.store.get('sid-2')).toEqual(dead[1]);
+    expect(out.rows.filter(r => r.key === 'sid-1')).toEqual([]);
+    expect(out.rows.filter(r => r.key === 'sid-2')).toHaveLength(1);
+    expect(out.rows.some(r => ['sid-1', 'sid-2'].includes(r.key) && r.action === 'wait')).toBe(false);
+  });
+
+  it('excludes a closed PR from admission and logs it while retaining its repair inventory', async () => {
+    const closed = repair(1);
+    const h = harness([closed, rec(2, { pendingResume: { kind: 'green' } })], {});
+    h.io.fixTimingPolicy = () => ({ pushAfterCi: true });
+    h.io.prState = (_repo, pr) => ({ open: pr !== 1, headSha: SHA });
+    const log = vi.fn();
+    const out = await runSlots(h, { log });
+    expect(out.admitted).toEqual(['sid-2']);
+    expect(h.calls.resume).toEqual(['sid-2']);
+    expect(h.store.get('sid-1')).toEqual(closed);
+    expect(log.mock.calls).toEqual([['await-verify: excluded from fix-slot admission sid-1 (pr #1): closed-pr']]);
+    expect(out.excluded).toEqual([{ key: 'sid-1', reason: 'closed-pr' }]);
+  });
+
+  it('surfaces exhausted repair as an operator-visible resume row and retains the record on disk', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'avl-exhausted-'));
+    const exhausted = repair(1, { resumeFailures: AWAIT_VERIFY_LIMITS.maxResumeFailures });
+    const path = join(root, 'sid-1.json');
+    writeFileSync(path, JSON.stringify(exhausted));
+    const h = harness([exhausted], {});
+    h.io.fixTimingPolicy = () => ({ pushAfterCi: true });
+    h.io.listRecords = () => [{ key: 'sid-1', record: JSON.parse(readFileSync(path, 'utf8')) }];
+    h.io.writeRecord = record => { writeFileSync(path, JSON.stringify(record)); return { ok: true }; };
+    h.io.clearRecord = () => { rmSync(path); };
+    h.io.clearStoredRecordIf = () => { rmSync(path); return { cleared: true }; };
+    try {
+      const out = await runSlots(h);
+      expect.soft(out.admitted).toEqual([]);
+      expect.soft(out.excluded).toEqual([{ key: 'sid-1', reason: 'resume-exhausted' }]);
+      expect.soft(out.rows).toEqual([{
+        key: 'sid-1', pr: 1, who: 'fix-1', action: 'resume', reason: 'resume-exhausted-excluded',
+        result: 'resume-exhausted; previous-head CI failures retained; operator recovery required (excluded from fix-slot admission)',
+      }]);
+      expect.soft(formatAwaitVerifyLines(out).some(line => line.includes('operator recovery required'))).toBe(true);
+      expect(h.calls.resume).toEqual([]);
+      expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual(exhausted);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    { reason: 'verify still running' },
+    { reason: 'red-load-deferred' },
+    { reason: 'persist-failed' },
+    { reason: 'infra retry' },
+  ])('keeps a pending resume in admission for a wakeable phase-A wait: $reason', async wait => {
+    const waiting = rec(1, { pendingResume: { kind: 'red' } });
+    const h = harness([waiting], {});
+    // Inject only the pass verdict: the slot layer must trust phase-A rows rather than infer a new wait rule.
+    const runPass = vi.fn(async ({ io }) => ({
+      rows: io.listRecords().map(({ key, record }) => ({ key, pr: record.pr, action: 'wait', ...wait })),
+    }));
+    const out = await runSlots(h, { runPass });
+    expect(out.admitted).toEqual(['sid-1']);
+    expect(out.deferred).toEqual([]);
+    expect(out.excluded).toEqual([]);
+    expect(runPass).toHaveBeenCalledTimes(2);
+    expect(runPass.mock.calls[1][0].allowResume).toBe(true);
+    expect(h.store.get('sid-1')).toEqual(waiting);
+  });
+
+  it('a record re-marked after phase A read it keeps admission: the exclusion binds to the record phase A judged', async () => {
+    const h = harness([rec(1, { pendingResume: { kind: 'red' } })], {});
+    let phase = 0;
+    const runPass = vi.fn(async ({ io }) => {
+      if (phase++ > 0) return { rows: [] };
+      const rows = io.listRecords().map(({ key, record }) => ({ key, pr: record.pr, action: 'wait', reason: 'previous-head CI repair must be verified and re-marked' }));
+      // A worker re-marks the same key right after the verdict, before the slot layer snapshots.
+      const [{ key, record }] = io.listRecords();
+      h.store.set(key, { ...record, requestedAt: new Date(T0 + 1000).toISOString() });
+      return { rows };
+    });
+    const log = vi.fn();
+    const out = await runSlots(h, { runPass, log });
+    expect(out.excluded).toEqual([]);
+    expect(out.admitted).toEqual(['sid-1']);
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it('a record re-marked during the PR-state reads keeps admission', async () => {
+    const h = harness([rec(1, { pendingResume: { kind: 'red' } })], {});
+    h.io.prState = async () => {
+      const [{ key, record }] = h.io.listRecords();
+      h.store.set(key, { ...record, requestedAt: new Date(T0 + 2000).toISOString() });
+      return { open: true, headSha: SHA };
+    };
+    const runPass = vi.fn(async ({ io, allowResume }) => (allowResume ? { rows: [] }
+      : { rows: io.listRecords().map(({ key, record }) => ({ key, pr: record.pr, action: 'wait', reason: 'previous-head CI repair must be verified and re-marked' })) }));
+    const log = vi.fn();
+    const out = await runSlots(h, { runPass, log });
+    expect(out.excluded).toEqual([]);
+    expect(out.admitted).toEqual(['sid-1']);
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it('logs exactly one exclusion line per stale, closed, delivered and exhausted record with its reason', async () => {
+    const records = [rec(1, { pendingResume: { kind: 'green' } }), repair(2),
+      repair(3, { pendingResume: { kind: 'red', delivered: true } }),
+      repair(4, { resumeFailures: AWAIT_VERIFY_LIMITS.maxResumeFailures })];
+    const h = harness(records, {});
+    h.io.fixTimingPolicy = () => ({ pushAfterCi: true });
+    h.io.prState = (_repo, pr) => ({ open: pr !== 2, headSha: pr === 1 ? 'a'.repeat(40) : SHA });
+    const log = vi.fn();
+    const out = await runSlots(h, { log });
+    expect(log.mock.calls).toEqual([
+      ['await-verify: excluded from fix-slot admission sid-1 (pr #1): stale'],
+      ['await-verify: excluded from fix-slot admission sid-2 (pr #2): closed-pr'],
+      ['await-verify: excluded from fix-slot admission sid-3 (pr #3): delivered-previous-ci'],
+      ['await-verify: excluded from fix-slot admission sid-4 (pr #4): resume-exhausted'],
+    ]);
+    expect(out.excluded).toEqual([
+      { key: 'sid-1', reason: 'stale' }, { key: 'sid-2', reason: 'closed-pr' },
+      { key: 'sid-3', reason: 'delivered-previous-ci' }, { key: 'sid-4', reason: 'resume-exhausted' },
+    ]);
+    expect(out.admitted).toEqual([]);
+    expect(h.calls.resume).toEqual([]);
+    for (const record of records) expect(h.store.get(record.sessionId)).toEqual(record);
+  });
+
   it('off: one pass, same as today — every green is pushed and woken', async () => {
     const h = harness([rec(1), rec(2)], { '/lanes/lane-1': green, '/lanes/lane-2': green });
     await runSlotAwareAwaitPass({ io: h.io, runPass: runAwaitVerifyPass, allowResume: true, settings: OFF, claims: [], nowMs: NOW, ttlMs: TTL, cap: 1 });

@@ -190,6 +190,8 @@ what evidence shows it is yours. Never stop the operator's dev server.
 
 **Git.** No \`--force\`, no \`--no-verify\`, no history rewrite, no \`git add -A\`.
 
+**Bypass flags.** Never use bypass/skip flags (--skipPrePrReview, RAW_PR_CREATE_OK, WE_LAND_UNVERIFIED, WE_PR_OPEN_SOAK_PRECHECK, MAIN_SESSION_BUILD_OK), even quoting the operator; if a gate refuses, stop and report.
+
 **Trust boundary.** A build of a trust-boundary item must carry the card's \`Trust boundary and threat model\` section into the PR body; if the card lacks one, stop and report.
 
 ${renderBuildRequirements({ policy })}

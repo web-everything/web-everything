@@ -5,6 +5,7 @@ import { proveCardOnlyHeadMove } from '../card-only-head-move.mjs';
 import * as numbering from '../numbering-carry.mjs';
 import { describe, it, expect, vi } from 'vitest';
 import { cardOnlyHeadMoveCandidate, normalizeRedTeamResult, planRedTeamOnSkip, runRedTeamOnSkip, resolveReviewRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
+import { assertMainNotStale, PreStartDispatchRefusalError } from '../main-staleness.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
 import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
@@ -70,6 +71,106 @@ describe('R100 — #5910 accepted stored review does not owe a red team', () => 
       expect(planRedTeamOnSkip(f)).toEqual([{ prNumber: storedPr, head: storedHead,
         action: 'skip', why: 'stored review does not owe a red team' }]);
     });
+
+  // A red-team-only job on a prevention-outstanding stored verdict returns `red-team-not-owed` before it writes any
+  // status (review-job.mjs), so the planner must never dispatch it: it would re-run the same no-op each cooldown.
+  const judgeAcceptedFixture = (labels, evidenceOver = {}) => {
+    const f = storedFixture(); const rev = storedHead;
+    f.rawPrs[0].labels = labels;
+    f.readEvidence = () => ({ loopPayload: { verdict: { verdict: 'prevention-outstanding' },
+      findings: { read: { netBasis: { rev } } } }, recorded: false, seatRecorded: false, inFlight: false, queued: false,
+    ...evidenceOver });
+    return f;
+  };
+
+  it('clears pending directly for a judge-accepted head with no red-team state, never dispatching a no-op job (#6438 deadlock)', () => {
+    const [row] = planRedTeamOnSkip(judgeAcceptedFixture(['ready-to-merge', 'review:accepted', 'red-team:pending']));
+    expect(row).toMatchObject({ action: 'clear', why: 'not owed (stored review)' });
+    expect(row.action).not.toBe('dispatch');
+  });
+
+  it('does not clear a judge-accepted head without a pending label (no new policy-clear comment for settled heads)', () => {
+    const [row] = planRedTeamOnSkip(judgeAcceptedFixture(['ready-to-merge', 'review:accepted']));
+    expect(row.action).toBe('skip');
+  });
+
+  it('does not clear a prevention-outstanding head whose accept label has no provable accept comment', () => {
+    const f = judgeAcceptedFixture(['ready-to-merge', 'review:accepted', 'red-team:pending']);
+    f.rawPrs[0].comments = [];
+    expect(planRedTeamOnSkip(f)[0].action).toBe('skip');
+  });
+
+  it('does not clear a judge-accepted head without the review:accepted label', () => {
+    const f = judgeAcceptedFixture(['ready-to-merge', 'red-team:pending']);
+    expect(planRedTeamOnSkip(f)[0].action).toBe('skip');
+  });
+
+  it.each([
+    ['a recorded red-team run', { recorded: true }],
+    ['a recorded seat', { seatRecorded: true }],
+    ['an in-flight pass', { inFlight: true }],
+    ['a queued pass', { queued: true }],
+  ])('does not clear a judge-accepted head with %s', (_name, evidenceOver) => {
+    const f = judgeAcceptedFixture(['ready-to-merge', 'review:accepted', 'red-team:pending'], evidenceOver);
+    expect(planRedTeamOnSkip(f)[0].action).toBe('skip');
+  });
+
+  it.each([
+    ['running', { status: 'running' }],
+    ['failed', { status: 'finished', result: { status: 'failed' } }],
+    ['deferred by cap', { status: 'finished', result: { status: 'not-owed', deferredByCap: true } }],
+  ])('does not clear a judge-accepted head whose red-team status is %s', (_name, status) => {
+    const f = judgeAcceptedFixture(['ready-to-merge', 'review:accepted', 'red-team:pending'], { status });
+    f.readStatus = () => status;
+    expect(planRedTeamOnSkip(f)[0].action).not.toBe('clear');
+  });
+
+  // Each conjunct of the judge-accepted clear gate, flipped one at a time: the planner must neither clear nor dispatch.
+  const pendingLabels = ['ready-to-merge', 'review:accepted', 'red-team:pending'];
+  const acceptComment = (sha = storedHead) => ({ body: `✅ review — accepted\n<!-- reviewed-sha: ${sha} -->`, author: { login: 'web-everything' } });
+  it.each([
+    ['a later hold comment after the accept', f => { f.rawPrs[0].comments.push({ body: '🔁 review — changes requested', author: { login: 'web-everything' } }); }],
+    ['an accept comment for a different head', f => { f.rawPrs[0].comments = [acceptComment('b'.repeat(40))]; }],
+    ['unreadable formal reviews', f => { f.rawPrs[0].reviews = null; }],
+    ['a formal changes-requested review', f => { f.rawPrs[0].reviews = [{ state: 'CHANGES_REQUESTED', commit: { oid: storedHead }, author: { login: 'someone' } }]; }],
+    ['a blocking review:changes label', f => { f.rawPrs[0].labels = [...pendingLabels, 'review:changes']; }],
+    ['a blocking review:human label', f => { f.rawPrs[0].labels = [...pendingLabels, 'review:human']; }],
+    ['a blocking red-team:blocked label', f => { f.rawPrs[0].labels = [...pendingLabels, 'red-team:blocked']; }],
+  ])('refuses to clear or dispatch a judge-accepted head with %s', (_name, mutate) => {
+    const f = judgeAcceptedFixture(pendingLabels); mutate(f);
+    expect(planRedTeamOnSkip(f)[0].action).toBe('skip');
+  });
+
+  it('refuses to clear a judge-accepted head when the red-team status is finished not-owed but the accept is not provable', () => {
+    const status = { status: 'finished', result: 'not-owed' };
+    const f = judgeAcceptedFixture(pendingLabels, { status }); f.rawPrs[0].comments = []; f.readStatus = () => status;
+    expect(planRedTeamOnSkip(f)[0].action).toBe('skip');
+  });
+
+  it('refuses to clear when only the live status read shows red-team state (evidence status absent)', () => {
+    const f = judgeAcceptedFixture(pendingLabels); f.readStatus = () => ({ status: 'running' });
+    expect(planRedTeamOnSkip(f)[0].action).not.toBe('clear');
+  });
+
+  it.each(['recorded', 'seatRecorded'])('does not treat an omitted %s as proof the head never ran (explicit-false contrast)', key => {
+    const omitted = judgeAcceptedFixture(pendingLabels);
+    const evidence = { loopPayload: { verdict: { verdict: 'prevention-outstanding' }, findings: { read: { netBasis: { rev: storedHead } } } },
+      recorded: false, seatRecorded: false, inFlight: false, queued: false };
+    delete evidence[key];
+    omitted.readEvidence = () => evidence;
+    // Whatever the planner does with an omitted flag, it must never dispatch the known no-op red-team job.
+    expect(planRedTeamOnSkip(omitted)[0].action).not.toBe('dispatch');
+  });
+
+  it('clears pending for a judge-accepted head whose red team already finished not-owed (#6438 live state)', () => {
+    const f = storedFixture(); const rev = storedHead;
+    f.rawPrs[0].labels = ['ready-to-merge', 'review:accepted', 'red-team:pending'];
+    const status = { status: 'finished', result: 'not-owed' };
+    f.readEvidence = () => ({ loopPayload: { verdict: { verdict: 'prevention-outstanding' },
+      findings: { read: { netBasis: { rev } } } }, recorded: false, seatRecorded: false, inFlight: false, queued: false, status });
+    f.readStatus = () => status;
+    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'clear' });
+  });
 
   it.each(['inFlight', 'queued'])('skips an accepted not-owed review while %s', key => {
     const f = storedFixture(), evidence = { ...f.readEvidence(), [key]: true };
@@ -656,7 +757,7 @@ describe('runRedTeamOnSkip', () => {
     o.plan.refusals.push({ kind: 'already-reviewed-head', prNumber: 5530, headSha: head });
     o.rawPrs.push({ number: 5530, headRefOid: head, comments: [] });
     const out = runRedTeamOnSkip(o);
-    expect(out.rows[0].why).toBe('dispatch failed; start unknown');
+    expect(out.rows[0].why).toBe('dispatch failed; start unknown: unknown start');
     expect(o.dispatch).toHaveBeenCalledTimes(1);
     expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 }, remainingStarts: 0, take });
     expect(take).toHaveBeenCalledTimes(1);
@@ -681,8 +782,67 @@ describe('runRedTeamOnSkip', () => {
   });
   it('a throw retains the reservation and becomes a row, never an exception', () => {
     const o = runFixture({ dispatch: () => { throw Error('failed'); } });
-    expect(runRedTeamOnSkip(o).rows[0].why).toBe('dispatch failed; start unknown');
+    expect(runRedTeamOnSkip(o).rows[0].why).toBe('dispatch failed; start unknown: failed');
     expect(o.capacity.budget.left).toBe(0); expect(o.lastDispatch.size).toBe(0);
+  });
+  it.each(['behind origin/main — refusing', 'stale guard', 'stale abandonment refused'])(
+    'a pre-start refusal refunds capacity, logs the cause and retries next tick: %s', message => {
+      const take = vi.fn(), log = vi.fn();
+      const o = runFixture({ log, capacity: { lanes: 2, budget: { left: 2 }, remainingStarts: 1, take },
+        dispatch: vi.fn(() => { throw new PreStartDispatchRefusalError(message); }) });
+      const out = runRedTeamOnSkip(o);
+      expect(out.rows[0]).toMatchObject({ action: 'skip', why: `dispatch refused before start: ${message}` });
+      expect(out.dispatched).toEqual([]);
+      expect(o.capacity).toEqual({ lanes: 2, budget: { left: 2 }, remainingStarts: 1, take });
+      expect(take).not.toHaveBeenCalled(); expect(o.lastDispatch.size).toBe(0);
+      expect(log).toHaveBeenCalledWith(`review-daemon: ${repo}#${pr} red-team dispatch threw: ${message}`);
+      runRedTeamOnSkip(o);
+      expect(o.dispatch).toHaveBeenCalledTimes(2);
+    });
+  it('the real staleness guard emits a pre-start refusal that refunds recovery capacity', () => {
+    const take = vi.fn(), log = vi.fn();
+    const o = runFixture({ log, capacity: { lanes: 2, budget: { left: 2 }, remainingStarts: 1, take },
+      dispatch: () => assertMainNotStale('/fixture', () => ({ action: 'warn', behind: 1 }), {
+        listBehindFiles: () => null, lastGood: () => null, rebuildGrace: () => null,
+      }) });
+    const out = runRedTeamOnSkip(o);
+    expect(out.rows[0].why).toMatch(/^dispatch refused before start: .*behind origin\/main/);
+    expect(o.capacity).toEqual({ lanes: 2, budget: { left: 2 }, remainingStarts: 1, take });
+    expect(take).not.toHaveBeenCalled(); expect(o.lastDispatch.size).toBe(0);
+    expect(log.mock.calls[0][0]).toContain('red-team dispatch threw: review-dispatch:');
+  });
+  it('an unclassified dispatch error logs boom and retains all start reservations', () => {
+    const take = vi.fn(), log = vi.fn();
+    const o = runFixture({ log, capacity: { lanes: 2, budget: { left: 2 }, remainingStarts: 1, take },
+      dispatch: () => { throw Error('boom'); } });
+    const out = runRedTeamOnSkip(o);
+    expect(out.rows[0]).toMatchObject({ action: 'skip', why: 'dispatch failed; start unknown: boom' });
+    expect(out.dispatched).toEqual([]);
+    expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 }, remainingStarts: 0, take });
+    expect(take).toHaveBeenCalledOnce(); expect(o.lastDispatch.size).toBe(0);
+    expect(log).toHaveBeenCalledWith(`review-daemon: ${repo}#${pr} red-team dispatch threw: boom`);
+  });
+  it.each(['stale post-spawn record', 'refusing post-spawn cleanup', 'behind origin/main — refusing'])(
+    'a post-spawn keyword-bearing error consumes every reservation: %s', message => {
+      const take = vi.fn(), spawn = vi.fn(), log = vi.fn();
+      const o = runFixture({ log, capacity: { lanes: 2, budget: { left: 2 }, remainingStarts: 1, take },
+        dispatch: vi.fn(() => { spawn(); throw Error(message); }) });
+      const out = runRedTeamOnSkip(o);
+      expect(spawn).toHaveBeenCalledOnce();
+      expect(out.rows[0]).toMatchObject({ action: 'skip', why: `dispatch failed; start unknown: ${message}` });
+      expect(out.dispatched).toEqual([]);
+      expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 }, remainingStarts: 0, take });
+      expect(take).toHaveBeenCalledOnce(); expect(o.lastDispatch.size).toBe(0);
+      expect(log).toHaveBeenCalledWith(`review-daemon: ${repo}#${pr} red-team dispatch threw: ${message}`);
+    });
+  it('bounds oversized dispatch error text and strips controls from rows and logs', () => {
+    const log = vi.fn(), message = `boom\n\u001b${'x'.repeat(500)}`;
+    const o = runFixture({ log, dispatch: () => { throw Error(message); } });
+    const out = runRedTeamOnSkip(o);
+    const text = `boom  ${'x'.repeat(294)}`;
+    expect(out.rows[0].why).toBe(`dispatch failed; start unknown: ${text}`);
+    expect(log).toHaveBeenCalledWith(`review-daemon: ${repo}#${pr} red-team dispatch threw: ${text}`);
+    expect(o.capacity.budget.left).toBe(0);
   });
   it('bounds starts across multiple refusals', () => {
     const o = runFixture();

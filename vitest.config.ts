@@ -255,6 +255,9 @@ export default defineConfig({
       // #4122 — same tier: real throwaway origin/reference/pool, real spawned `lane-pool.mjs acquire`/
       // `provision` children, a PATH git shim tracing lane git calls (proof of the free-lane-list fast path).
       'scripts/__tests__/lane-pool-acquire-free-list.test.mjs',
+      // Same tier: real throwaway origin/reference/pool and 10 real spawned `lane-pool.mjs` children (one 5-lane
+      // provision per file, then acquire/release/trim). It once ran ~30 and stalled unit shards 4 and 8 to the job cap.
+      'scripts/__tests__/lane-pool-free-list-event-refresh.test.mjs',
       // #x96v5hl — same `lane-pool-trim.test.mjs` barrier-plus-real-concurrent-spawn technique (a real
       // `release`/`acquire` child paused mid-run via an env-var test seam, a second real concurrent CLI child
       // racing into that exact window): proof of the release/reap and stale-reclaim TOCTOU fixes.

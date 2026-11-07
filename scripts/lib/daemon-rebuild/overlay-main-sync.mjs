@@ -5,8 +5,8 @@ import { dirname, join, resolve, isAbsolute } from 'node:path';
 import { tmpdir, hostname } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
-import { isDeepStrictEqual } from 'node:util';
-import { cascadePolicy } from '../policy-cascade.mjs';
+import { isDeepStrictEqual, stripVTControlCharacters } from 'node:util';
+import { cascadePolicy, platformPreference } from '../policy-cascade.mjs';
 import { readOverlayState, overlayFilePath, appendOverlayEvent, registrationIdentity } from '../daemon-overlays.mjs';
 import { isSafeBranchName } from '../daemon-self-sync.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
@@ -16,7 +16,7 @@ import { buildReverseImportGraph, testDepths, isVitestTestFile, isGraphSourceFil
 import { alertsFilePath } from './state.mjs';
 import { REBUILD_IDENTITY_ENV } from './shared.mjs';
 import { tryLease } from '../../operations/coordination-lock.mjs';
-import { buildHeavyTestInvocation, runHeavyTests } from './auto-rebase.mjs';
+import { buildHeavyTestInvocation, runHeavyTests, heavyTestReport } from './auto-rebase.mjs';
 
 const SELF = fileURLToPath(import.meta.url), SETTINGS = join(dirname(SELF), '../daemon-rebuild-settings.json');
 const validMode = mode => ['off', 'shadow', 'on'].includes(mode);
@@ -29,11 +29,32 @@ const marker = (root, env, ref) => join(`${overlayFilePath(root, env)}.auto-reba
 const executeGit = (args, opts) => spawnSync('git', args, { encoding: 'utf8', timeout: 60_000, maxBuffer: 8 * 1024 * 1024, ...opts });
 const cleanText = text => String(text ?? '').replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, '');
 const stderrTail = result => cleanText(result?.stderr || result?.error?.message).slice(-500);
+function testStderrTail(result, { failedAssertions = [], failed = [] } = {}) {
+  const combined = `${result?.stdout ?? ''}\n${result?.stderr || result?.error?.message || ''}`;
+  const namedFiles = new Set();
+  const names = failedAssertions.filter(identity => identity !== null).map(identity => {
+    const [file, form, ...title] = JSON.parse(identity);
+    namedFiles.add(file);
+    return `${file} > ${form === 'fullName' ? title[0] : [...title[0], title[1]].join(' > ')}`;
+  });
+  names.push(...failed.filter(file => !namedFiles.has(file)));
+  if (!names.length) {
+    for (const match of stripVTControlCharacters(combined).matchAll(/^\s*FAIL\s+([^\r\n]+)/gm)) names.push(match[1].trim());
+  }
+  // Preserve the historical stderr-only diagnostic byte for byte after sanitizing.
+  if (!result?.stdout && !names.length) return stderrTail(result);
+  const prefix = cleanText([...new Set(names)].join('; ')).slice(0, 500);
+  const tail = cleanText(combined);
+  if (!prefix) return tail.slice(-500);
+  // Reserve space for identities first: a long runner footer can only displace the tail.
+  const room = 500 - prefix.length - 3;
+  return room > 0 && tail ? `${prefix} | ${tail.slice(-room)}` : prefix;
+}
 const unsupportedAttributeSource = result => result?.status === 129 && !result.error
   && /^unknown option: --attr-source(?:=origin\/main)?\r?$/m.test(result.stderr ?? '');
-const output = result => {
+const output = (result, failureTail = stderrTail(result)) => {
   if (result?.status !== 0 || result.error || typeof result.stdout !== 'string') {
-    const step = result?.step ?? 'unknown', tail = stderrTail(result);
+    const step = result?.step ?? 'unknown', tail = failureTail;
     throw Object.assign(new Error(`${step}: command failed or incomplete; operator review required${tail ? `: ${tail}` : ''}`),
       { step, stderrTail: tail });
   }
@@ -116,9 +137,9 @@ function readSyncState(file, io = fs) {
 }
 function validateSyncState(data) {
   if (!data || !Object.hasOwn(data, 'lastSyncedMain')) throw new Error('invalid main-sync state; operator repair required');
-  for (const key of ['lastSyncedMain', 'attemptedMain', 'shadowMain', 'pushRetryMain', 'pushRetryAfter', 'errorAt', 'firstFailureAt', 'failureAlertedAt', 'failureReason', 'staleRef', 'staleRegistration', 'conflictMain', 'conflictTip', ...retryKeys]) {
+  for (const key of ['lastSyncedMain', 'attemptedMain', 'shadowMain', 'pushRetryMain', 'pushRetryAfter', 'errorAt', 'firstFailureAt', 'failureAlertedAt', 'failureReason', 'staleRef', 'staleRegistration', 'conflictMain', 'conflictTip', 'mainRedMain', 'mainRedTip', 'mainRedAt', ...retryKeys]) {
     if (!Object.hasOwn(data, key)) data[key] = {};
-    const map = data[key], timestamp = ['pushRetryAfter', 'errorAt', 'retryAfter', 'retryTries', 'firstFailureAt', 'failureAlertedAt', 'staleRef'].includes(key);
+    const map = data[key], timestamp = ['pushRetryAfter', 'errorAt', 'retryAfter', 'retryTries', 'firstFailureAt', 'failureAlertedAt', 'staleRef', 'mainRedAt'].includes(key);
     const invalid = value => {
       if (key === 'failureReason') return typeof value !== 'string';
       if (key === 'staleRegistration') return typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value);
@@ -138,6 +159,10 @@ function validateSyncState(data) {
   const pairRefs = new Set([...Object.keys(data.conflictMain), ...Object.keys(data.conflictTip)]);
   if ([...pairRefs].some(ref => !Object.hasOwn(data.conflictMain, ref) || !Object.hasOwn(data.conflictTip, ref))) {
     throw new Error('incomplete conflict pair state; operator repair required');
+  }
+  const redRefs = new Set([...Object.keys(data.mainRedMain), ...Object.keys(data.mainRedTip), ...Object.keys(data.mainRedAt)]);
+  if ([...redRefs].some(ref => !Object.hasOwn(data.mainRedMain, ref) || !Object.hasOwn(data.mainRedTip, ref))) {
+    throw new Error('incomplete main-red pair state; operator repair required');
   }
   const retryRefs = new Set(retryKeys.flatMap(key => Object.keys(data[key])));
   if ([...retryRefs].some(ref => retryKeys.some(key => !Object.hasOwn(data[key], ref)))) {
@@ -262,6 +287,36 @@ export function resolveOverlayMainSyncMode(env = process.env, { settingsPath = S
   if (lastModeLog !== key) { console.error(line); lastModeLog = key; }
   return value;
 }
+export function resolveOverlayFlakeReruns(env = process.env, { settingsPath = SETTINGS } = {}) {
+  let tool;
+  try { tool = JSON.parse(fs.readFileSync(settingsPath, 'utf8')).overlay?.mainSync; } catch { /* standard */ }
+  const raw = env.WE_DAEMON_OVERLAY_MAIN_SYNC_FLAKE_RERUNS;
+  const r = cascadePolicy('overlay.mainSync', tool, { env,
+    platform: platformPreference('overlay', { env })?.mainSync ?? {},
+    standard: { flakeReruns: 1 },
+    envValues: { flakeReruns: typeof raw === 'string' && raw.trim() ? Number(raw) : undefined },
+    valid: { flakeReruns: n => Number.isSafeInteger(n) && n >= 0 && n <= 2 } });
+  return { value: r.value.flakeReruns, source: r.sources.flakeReruns };
+}
+export function resolveOverlayMainRedExpiryHours(env = process.env, { settingsPath = SETTINGS } = {}) {
+  let tool;
+  try { tool = JSON.parse(fs.readFileSync(settingsPath, 'utf8')).overlay?.mainSync; } catch { /* standard */ }
+  const raw = env.WE_DAEMON_OVERLAY_MAIN_SYNC_MAIN_RED_EXPIRY_HOURS;
+  const r = cascadePolicy('overlay.mainSync', tool, { env,
+    platform: platformPreference('overlay', { env })?.mainSync ?? {},
+    standard: { mainRedExpiryHours: 6 },
+    envValues: { mainRedExpiryHours: typeof raw === 'string' && raw.trim() ? Number(raw) : undefined },
+    valid: { mainRedExpiryHours: n => typeof n === 'number' && Number.isFinite(n)
+      && n >= 0 && n <= Number.MAX_SAFE_INTEGER / 3_600_000 } });
+  return { value: r.value.mainRedExpiryHours, source: r.sources.mainRedExpiryHours };
+}
+function mainRedKnown(state, ref, main, tip, env, now = () => new Date().toISOString()) {
+  if (state.mainRedMain[ref] !== main || state.mainRedTip[ref] !== tip
+    || !Object.hasOwn(state.mainRedAt, ref)) return false;
+  const age = new Date(now()).getTime() - state.mainRedAt[ref];
+  const { value: hours } = resolveOverlayMainRedExpiryHours(env);
+  return age >= 0 && age < hours * 3_600_000;
+}
 export function selectSyncTargets(state) {
   if (state?.corrupt || !Array.isArray(state?.overlays)) throw new Error('overlay state unavailable; operator repair required');
   return state.overlays.filter(o => !state.overlays.some(other => other !== o && other.stackBases?.includes(o.ref))).map(o => o.ref);
@@ -306,6 +361,7 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
       const main = sha(run(['rev-parse', 'origin/main']));
       if (synced.retryMain[ref] === main && Date.now() < synced.retryAfter[ref]) { skip('cooldown'); continue; }
       const tip = sha(run(['rev-parse', `origin/${ref}`]));
+      if (mainRedKnown(synced, ref, main, tip, env, deps.now)) { skip('main-red-known'); continue; }
       const pairKnown = synced.conflictMain[ref] === main && synced.conflictTip[ref] === tip;
       // A known conflicting (main, tip) pair is final: silent skip (its one conflict event was already emitted).
       if (pairKnown) {
@@ -389,6 +445,170 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
   }
   return result;
 }
+const testFailure = evidence => Object.assign(new Error('selected tests did not pass or execute; operator review required'),
+  { stderrTail: evidence?.stderrTail ?? '' });
+const remoteUnconfirmed = result => result?.status === 124 && typeof result.stderr === 'string'
+  && result.stderr.includes('remote termination unconfirmed; refusing local rerun (exit 124).');
+// Vitest's "Unhandled Errors" section header and its "Errors  N error(s)" summary row.
+const UNHANDLED_ERRORS = /^\s*(?:⎯+\s*)?Unhandled (?:Errors?|Rejections?)\b|^\s*Errors\s+\d+ errors?\s*$/i;
+function failedTestReport(stdout, options) {
+  if (typeof stdout !== 'string' || Buffer.byteLength(stdout) > 8 * 1024 * 1024) throw testFailure();
+  const failed = new Map(), titles = [];
+  // A red suite (not ok ... {) with no failed leaf beneath it is a hook failure
+  // (beforeAll/afterAll); the leaf-only inventory below would erase it, so track it.
+  // Per-occurrence ids (not title paths) so duplicate sibling suite names cannot mask each other.
+  const redSuites = new Set(), suitesWithFailedLeaf = new Set(), suiteIds = [];
+  let suiteCount = 0;
+  let leaf = 0, diagnostic, inTap = false;
+  // Reuse the strict TAP plan and typed-test-count validator. Normalize only red
+  // statuses/diagnostics for validation, then restore the observed failed leaves.
+  const normalized = stdout.replace(/\r\n/g, '\n').split('\n').flatMap(line => {
+    // BasicReporter colors its summary in CI (same as heavyTestReport): strip ANSI for summary
+    // detection only, so TAP titles stay literal.
+    const plain = stripVTControlCharacters(line);
+    if (line === 'TAP version 13') inTap = true;
+    if (/^(?: Test Files|  Snapshots)  /.test(plain)) inTap = false;
+    if (diagnostic !== undefined) {
+      if (line === `${diagnostic}...`) diagnostic = undefined;
+      return [];
+    }
+    // Fail closed: an unhandled error is a red run the failed leaves do not explain, so it must
+    // never be rerun away. Checked outside YAML diagnostics; a TAP result line never matches these.
+    if (UNHANDLED_ERRORS.test(plain)) throw testFailure();
+    const yaml = inTap && /^( +)---$/.exec(line);
+    if (yaml) { diagnostic = yaml[1]; return []; }
+    const task = inTap && /^( *)(not )?ok \d+ - (.*?)(?: # (SKIP|TODO|time=\d+(?:\.\d+)?ms))?( \{)?$/s.exec(line);
+    if (inTap && /^\s*}$/.test(line)) { titles.pop(); suiteIds.pop(); }
+    if (task) {
+      if (task[5]) {
+        titles.push(task[3]);
+        suiteIds.push(suiteCount++);
+        if (task[2]) redSuites.add(suiteIds.at(-1));
+      } else if (titles.length) {
+        if (task[2]) {
+          failed.set(leaf, { title: task[3], ancestorTitles: titles.slice(1) });
+          for (const id of suiteIds) suitesWithFailedLeaf.add(id);
+        }
+        leaf++;
+      }
+    }
+    if (plain.startsWith('      Tests  ')) {
+      const summary = /^      Tests  (.+) \((\d+)\)$/.exec(plain);
+      if (!summary) throw testFailure();
+      let passed = 0;
+      const pending = [];
+      for (const part of summary[1].split(' | ')) {
+        const count = /^(\d+) (passed|failed|skipped|todo)$/.exec(part);
+        if (!count) throw testFailure();
+        if (['passed', 'failed'].includes(count[2])) passed += Number(count[1]);
+        else pending.push(part);
+      }
+      return [`      Tests  ${[...(passed ? [`${passed} passed`] : []), ...pending].join(' | ')} (${summary[2]})`];
+    }
+    return [line.replace(/^(\s*)not ok /, '$1ok ')];
+  }).join('\n');
+  if (diagnostic !== undefined || !failed.size) throw testFailure();
+  // Fail closed: a red suite without a failed leaf is a hook failure that must not be rerun away.
+  for (const id of redSuites) if (!suitesWithFailedLeaf.has(id)) throw testFailure();
+  const report = heavyTestReport(normalized, options);
+  report.testResults.flatMap(r => r.assertionResults).forEach((assertion, index) => {
+    if (failed.has(index)) {
+      if (assertion.status !== 'passed') throw testFailure();
+      assertion.status = 'failed';
+      Object.assign(assertion, failed.get(index));
+    }
+  });
+  return report;
+}
+// Scope identities to their file; never infer a test identity from a failing filename.
+function assertionIdentity(file, assertion) {
+  if (typeof assertion.fullName === 'string' && assertion.fullName.trim()) {
+    return JSON.stringify([file, 'fullName', assertion.fullName]);
+  }
+  if (typeof assertion.title === 'string' && assertion.title.trim()
+    && Array.isArray(assertion.ancestorTitles)
+    && assertion.ancestorTitles.every(title => typeof title === 'string' && title.trim())) {
+    return JSON.stringify([file, 'title', assertion.ancestorTitles, assertion.title]);
+  }
+  return null;
+}
+async function syncTestEvidence({ root, scratch, selected, testReport, env, io, runner }) {
+  io.rmSync(testReport, { force: true }); // Never consume a previous attempt's evidence.
+  const invocation = buildHeavyTestInvocation({ root, scratch, selected, testReport, env, io });
+  const result = await (runner ?? (options => runHeavyTests(options, { io })))(invocation);
+  if (remoteUnconfirmed(result)) return { remoteUnconfirmed: true };
+  let validatedFailure = false;
+  if (result?.status === 1) {
+    try {
+      const report = failedTestReport(result.stdout, { ...invocation, root: io.realpathSync(scratch) });
+      io.writeFileSync(testReport, JSON.stringify(report));
+      validatedFailure = true;
+    } catch { /* No trustworthy TAP inventory: retain the command failure below. */ }
+  }
+  const commandOk = result?.status === 0 && !result.error && typeof result.stdout === 'string';
+  let report;
+  try {
+    if (io.statSync(testReport).size > 8 * 1024 * 1024) throw new Error('test report over 8 MiB; operator review required');
+    report = JSON.parse(io.readFileSync(testReport, 'utf8'));
+  } catch (error) {
+    if (!commandOk) output({ ...result, step: 'tests' }, testStderrTail(result));
+    throw Object.assign(error, { stderrTail: testStderrTail(result) });
+  }
+  const results = report?.testResults;
+  if (!Array.isArray(results)) throw testFailure({ stderrTail: testStderrTail(result) });
+  const names = selected.map(file => join(io.realpathSync(scratch), file));
+  const failed = [], passed = [], failedAssertions = [], failedFiles = [], byFile = new Map();
+  for (let i = 0; i < selected.length; i++) {
+    const matches = results.filter(r => r?.name === names[i]);
+    if (matches.length !== 1) continue;
+    const r = matches[0], assertions = r.assertionResults;
+    if (r.status === 'failed') failedFiles.push(selected[i]);
+    if (!Array.isArray(assertions) || !assertions.length
+      || assertions.some(a => !['passed', 'failed'].includes(a?.status))) continue;
+    const ids = status => assertions.filter(a => a.status === status).map(a => assertionIdentity(selected[i], a));
+    byFile.set(selected[i], { total: assertions.length, failedIds: ids('failed'), passedIds: ids('passed') });
+    if (assertions.some(a => a.status === 'failed')) {
+      failed.push(selected[i]);
+      failedAssertions.push(...assertions.filter(a => a.status === 'failed').map(a => assertionIdentity(selected[i], a)));
+    }
+    else if (r.status !== 'failed') passed.push(selected[i]);
+  }
+  const complete = passed.length + failed.length === selected.length
+    && results.length === selected.length && results.every(r => names.includes(r?.name));
+  const green = commandOk && complete && !failed.length && report.success !== false
+    && !(report.numFailedTests > 0) && !(report.numFailedTestSuites > 0);
+  const tail = testStderrTail(result, { failedAssertions, failed: [...new Set([...failed, ...failedFiles])] });
+  if (!commandOk && !(result?.status === 1 && (!result.error || validatedFailure) && complete && failed.length)) {
+    output({ ...result, step: 'tests' }, tail);
+  }
+  return { green, failed, complete, failedAssertions, byFile, stderrTail: tail };
+}
+// A green rerun only clears a failure it actually re-executed. Per previously failed file the rerun must
+// run at least as many assertions as the failing run did (a vanished assertion fails closed), and, when
+// both sides carry assertion identities, every previously failed identity must reappear among the
+// rerun's passed ones (counted, so duplicate titles cannot cover each other). A TAP-derived passing
+// report carries no titles, so there the count is the guarantee.
+function rerunCoversFailures(previous, rerun, files) {
+  for (const file of files) {
+    const before = previous.byFile.get(file), after = rerun.byFile.get(file);
+    if (!before || !after || after.total < before.total) return false;
+    if (before.failedIds.some(id => id === null)) return false;
+    if (after.passedIds.some(id => id === null)) continue;
+    if (!coveredWithMultiplicity(before.failedIds, after.passedIds)) return false;
+  }
+  return true;
+}
+// Every needed identity must be matched by its own supplied occurrence: duplicates consume one each.
+function coveredWithMultiplicity(needed, supplied) {
+  const available = new Map();
+  for (const id of supplied) available.set(id, (available.get(id) ?? 0) + 1);
+  for (const id of needed) {
+    const left = available.get(id) ?? 0;
+    if (left < 1) return false;
+    available.set(id, left - 1);
+  }
+  return true;
+}
 export async function runOverlayMainSync({ root, ref, token, env = process.env, deps = {} }) {
   const io = deps.io ?? fs, event = deps.appendOverlayEvent ?? appendOverlayEvent;
   const now = deps.now ?? (() => new Date().toISOString());
@@ -453,6 +673,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     output(git(['checkout', '--force', '-b', ref, `origin/${ref}`], scratch, [], { timeout: 300_000 }));
     const from = sha(git(['rev-parse', 'HEAD'], scratch));
     main = sha(git(['rev-parse', 'origin/main'], scratch));
+    if (mainRedKnown(synced, ref, main, from, env, now)) return await skip('main-red-known');
     if (synced.conflictMain[ref] === main && synced.conflictTip[ref] === from) return await skip('conflict-known');
     const base = sha(git(['merge-base', main, from], scratch));
     const own = paths(git(['diff', '--name-only', '-z', base, from], scratch));
@@ -504,27 +725,65 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     // forced every scratch test run back onto the Mac. A local clone is cheap (hardlinked objects) and committed-only.
     if (io.existsSync(frontier)) output(git(['clone', '--quiet', '--local', frontier, join(scratchParent, 'frontierui')], scratchParent));
     setStep('tests');
+    const { value: reruns, source: rerunsSource } = resolveOverlayFlakeReruns(env);
     for (let offset = 0; offset < tests.length; offset += 50) {
       const chunk = tests.slice(offset, offset + 50);
-      const reportFile = join(scratchParent, `tests-${offset / 50}.json`);
-      const invocation = buildHeavyTestInvocation({ root, scratch, selected: chunk, testReport: reportFile, env, io });
-      const result = await (deps.testRunner ?? (o => runHeavyTests(o, { io })))(invocation);
+      const check = (selected, attempt, tree = scratch, runner = deps.testRunner) => syncTestEvidence({
+        root, scratch: tree, selected, env, io, runner,
+        testReport: join(scratchParent, `tests-${offset / 50}-${attempt}.json`) });
+      let evidence = await check(chunk, 'initial');
       // The remote process may still be running: neither publication nor a local rerun is safe.
-      if (result?.status === 124 && typeof result.stderr === 'string'
-        && result.stderr.includes('remote termination unconfirmed; refusing local rerun (exit 124).')) {
-        return await skip('remote-termination-unconfirmed');
+      if (evidence.remoteUnconfirmed) return await skip('remote-termination-unconfirmed');
+      if (evidence.green) continue;
+      if (!reruns || !evidence.complete || !evidence.failed.length) throw testFailure(evidence);
+      const retried = [...evidence.failed];
+      let remaining = retried, previous = evidence;
+      // Coverage is always measured against the ORIGINAL failure, never the previous rerun: with several
+      // reruns an assertion that vanished in rerun 1 would otherwise be forgotten by rerun 2.
+      // A file is only checked on the rerun where it clears, and that single run must itself re-execute
+      // every originally failed assertion (passes are not pooled across reruns: pooling over-credits twins).
+      const original = evidence;
+      for (let attempt = 0; attempt < reruns; attempt++) {
+        evidence = await check(remaining, attempt);
+        if (evidence.remoteUnconfirmed) return await skip('remote-termination-unconfirmed');
+        // A file that stops failing must have re-executed what failed originally; otherwise it is no pass.
+        const cleared = previous.failed.filter(file => !evidence.failed.includes(file) && evidence.byFile.has(file));
+        if (cleared.length && !rerunCoversFailures(original, evidence, cleared)) throw testFailure(original);
+        if (evidence.green && !cleared.length) throw testFailure(original);
+        if (evidence.green || !evidence.complete || !evidence.failed.length) break;
+        remaining = evidence.failed; previous = evidence;
       }
-      output({ ...result, step });
-      if (io.statSync(reportFile).size > 8 * 1024 * 1024) throw new Error('test report over 8 MiB; operator review required');
-      const report = JSON.parse(io.readFileSync(reportFile, 'utf8'));
-      const results = report.testResults ?? [];
-      const executed = new Set(results.filter(r => Array.isArray(r.assertionResults)
-        && r.assertionResults.length && r.assertionResults.every(a => a.status === 'passed')).map(r => r.name));
-      if (report.success === false || report.numFailedTests > 0 || report.numFailedTestSuites > 0 || results.some(r => r.status === 'failed'
-        || !Array.isArray(r.assertionResults) || !r.assertionResults.length || r.assertionResults.some(a => a.status !== 'passed'))
-        || chunk.some(f => !executed.has(join(io.realpathSync(scratch), f)))) {
-        throw new Error('selected tests did not pass or execute; operator review required');
+      if (evidence.green) {
+        event(root, { kind: 'overlay-main-flaky-retried', ref, files: retried,
+          flakeReruns: reruns, flakeRerunsSource: rerunsSource }, { env });
+        continue;
       }
+      let mainRed = false;
+      try {
+        const mainScratch = join(scratchParent, `main-${offset / 50}`);
+        output(git(['clone', '--shared', '--no-checkout', scratch, mainScratch]));
+        output(git(['checkout', '--force', '--detach', main], mainScratch, [], { timeout: 300_000 }));
+        io.appendFileSync(join(mainScratch, '.git', 'info', 'exclude'), '\n/node_modules\n');
+        io.symlinkSync(join(root, 'node_modules'), join(mainScratch, 'node_modules'), 'dir');
+        const comparison = await check(remaining, 'main', mainScratch, deps.mainTestRunner ?? null);
+        // The remote process may still be running: do not classify, publish or fail on this evidence.
+        if (comparison.remoteUnconfirmed) return await skip('remote-termination-unconfirmed');
+        // Counted, so two same-titled overlay failures need two main failures (one cannot cover both).
+        mainRed = evidence.complete && evidence.failedAssertions.length > 0
+          && evidence.failedAssertions.every(identity => identity !== null)
+          && comparison.complete && comparison.failedAssertions.every(identity => identity !== null)
+          && coveredWithMultiplicity(evidence.failedAssertions, comparison.failedAssertions);
+      } catch { /* Unknown main evidence must retain the ordinary operator-review failure. */ }
+      setStep('tests');
+      if (mainRed) {
+        updateSyncState(sidecar(root, env), state => {
+          state.mainRedMain[ref] = main; state.mainRedTip[ref] = from; state.mainRedAt[ref] = new Date(now()).getTime();
+          clearRetry(state, ref);
+        }, io);
+        event(root, { kind: 'overlay-main-red', ref, files: remaining }, { env });
+        return await skip('main-red');
+      }
+      throw testFailure(evidence);
     }
     setStep('verify');
     const current = readOverlayState(root, { env });
@@ -559,6 +818,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
       state.lastSyncedMain[ref] = main;
       delete state.pushRetryAfter[ref]; delete state.pushRetryMain[ref];
       delete state.conflictMain[ref]; delete state.conflictTip[ref];
+      delete state.mainRedMain[ref]; delete state.mainRedTip[ref]; delete state.mainRedAt[ref];
     }, io);
     const diagnostic = failureMarker(root, env, ref);
     transaction(diagnostic, () => io.rmSync(diagnostic, { force: true }), io);

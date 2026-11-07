@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { RED_TEAM_STATUS_LABELS, syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
-import { readDrainRedTeamEvidence, redTeamStatusDir } from '../lib/drain-red-team-evidence.mjs';
+import { readDrainRedTeamEvidence, redTeamStatusDir, settleUnknownEvidenceByComment } from '../lib/drain-red-team-evidence.mjs';
 import { needsPublish, publishStoredRedTeamResult } from '../lib/red-team-withheld-publish.mjs';
 /**
  * @file scripts/conveyor/advisory-label-sweep.mjs
@@ -187,7 +187,7 @@ export function sweepAdvisoryLabels({
         throw error;
       }
       if (!live || (live.state && live.state !== 'OPEN')) continue;
-      const evidence = readStatusEvidence({ repo: resolvedRepo, pr: pr.number, head: live.headRefOid });
+      let evidence = readStatusEvidence({ repo: resolvedRepo, pr: pr.number, head: live.headRefOid });
       let comments = live.comments;
       if (!dryRun && needsPublish(evidence.status)) {
         try {
@@ -202,6 +202,7 @@ export function sweepAdvisoryLabels({
           log(`red-team publication #${pr.number}: ${publication.publishError}`);
         }
       }
+      evidence = settleUnknownEvidenceByComment(evidence, comments, pr.number, live.headRefOid);
       const plan = syncRedTeamStatusLabels({ repo: resolvedRepo, pr: pr.number, head: live.headRefOid,
         evidence, live, comments, provider, dryRun, log });
       if (plan.add || plan.remove.length || Object.keys(publication).length) results.push({ num: pr.number, ...plan, ...publication });
