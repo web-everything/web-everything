@@ -175,6 +175,23 @@ describe('renderWorkerBrief', () => {
     expect(brief.slice(brief.indexOf('6. **One PR.**'), brief.indexOf('7. **Pre-push'))).toContain('verify ONCE at the end');
   });
 
+  it('puts a Codex audit requiring NOT WEAKENED between verify and open-pr (6a)', () => {
+    const brief = renderWorkerBrief(params);
+    const step = brief.slice(brief.indexOf('6. **One PR.**'), brief.indexOf('7. **Pre-push'));
+    const verify = step.indexOf('verify ONCE at the end');
+    const audit = step.indexOf('6a. **Codex audit.**');
+    const openPr = step.indexOf('operations/run.mjs open-pr');
+    expect(verify).toBeGreaterThan(-1);
+    expect(audit).toBeGreaterThan(verify);
+    expect(openPr).toBeGreaterThan(audit);
+    const text = step.slice(audit, openPr);
+    expect(text).toContain('node scripts/operations/codex-audit.mjs --base=origin/main --head=<40-hex sha of your lane HEAD>');
+    expect(text).toContain('NOT WEAKENED');
+    expect(text).toContain('at most 2 repair rounds');
+    expect(text).toContain('remaining findings');
+    expect(text).toContain('verdict in your report');
+  });
+
   it('renders every standard section in order and the qualified scope in commands under the standard policy', () => {
     // Pin the standard: the live platform preference deliberately selects related tests.
     const policy = resolveBuildPolicy({ env: {}, tool: {}, platform: {} });
