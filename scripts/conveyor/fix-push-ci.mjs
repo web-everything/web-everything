@@ -21,8 +21,9 @@ function defaultReadNumstat({ repo, pr, run }) {
     if (typeof text !== 'string' || text.split('\n').filter(Boolean).length >= 3000) throw new Error('incomplete PR files');
     return text;
   }
-  const { files } = JSON.parse(run('gh', ['pr', 'view', String(pr), '--json', 'files']));
-  if (!Array.isArray(files) || files.length >= 3000) throw new Error('incomplete PR files');
+  const { files, changedFiles } = JSON.parse(run('gh', ['pr', 'view', String(pr), '--json', 'files,changedFiles']));
+  // gh may page or cap the list: the file list must match the forge's own count.
+  if (!Array.isArray(files) || files.length >= 3000 || changedFiles !== files.length) throw new Error('incomplete PR files');
   return files.map(file => {
     if (!Number.isSafeInteger(file.additions) || !Number.isSafeInteger(file.deletions)
       || typeof file.path !== 'string' || /[\t\r\n\0]/.test(file.path)) throw new Error('invalid PR file');
