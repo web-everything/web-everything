@@ -1584,6 +1584,66 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     }
   });
 
+  // R688 break 1: the worker wrapper kills Codex and re-raises the signal, and a default signal death fires
+  // neither 'exit' nor `finally`. Deliver a REAL signal to a separate process once its worker has started.
+  it.each(['SIGTERM', 'SIGINT'])('R688 a real %s after the worker starts removes the scratch clone and task temp root and keeps the sibling log', async signal => {
+    const event = '{"type":"thread.started","thread_id":"t1"}\n';
+    const worker = keepAliveScript({ maxLifetimeMs: 20000, prelude: `process.stdout.write(${JSON.stringify(event)});` });
+    const script = `
+      import { mkdtempSync } from 'node:fs';
+      import { spawn } from 'node:child_process';
+      import { join } from 'node:path';
+      const { codexDirectTask } = await import(${JSON.stringify(new URL('../codex-direct-task.mjs', import.meta.url).href)});
+      const dirs = [];
+      const execFn = (_bin, args) => args.includes('--absolute-git-dir') ? join(args[1], '.git')
+        : args.includes('rev-parse') ? 'sha0' : args.includes('get-url') ? (() => { throw new Error('no remote'); })() : '';
+      await codexDirectTask({ task: 't', repoRoot: '/repo', gate: 'none', selfReview: false, stream: false, log: false,
+        installDeps: false, existsFn: () => false, execFn,
+        mkTempDir: prefix => { const dir = mkdtempSync(prefix); dirs.push(dir); return dir; },
+        spawnFn: (_cli, _argv, opts) => {
+          const child = spawn(process.execPath, ['-e', ${JSON.stringify(worker)}], opts);
+          child.stdout.once('data', () => setTimeout(() => process.stdout.write(JSON.stringify({ dirs, pid: child.pid }) + '\\n'), 200));
+          return child;
+        } });
+      process.stdout.write('FINISHED\\n');`;
+    const proc = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let started;
+    let stderr = '';
+    proc.stderr.on('data', d => { stderr += d; });
+    try {
+      started = await new Promise((resolveStart, reject) => {
+        let out = '';
+        proc.stdout.on('data', d => {
+          out += d;
+          const line = out.split('\n').find(l => l.startsWith('{'));
+          if (line) resolveStart(JSON.parse(line));
+        });
+        proc.once('exit', (code, sig) => reject(new Error(`child exited ${code ?? sig} before its worker started: ${stderr}`)));
+      });
+      const [scratch, taskTmp] = started.dirs;
+      expect(started.dirs).toHaveLength(2);
+      expect(existsSync(taskTmp)).toBe(true);
+      expect(readFileSync(join(scratch, '.git', 'codex-direct-task.jsonl'), 'utf8')).toBe(event);
+      const exited = new Promise(resolveExit => proc.once('exit', (code, sig) => resolveExit({ code, sig })));
+      proc.kill(signal);
+      // The cleanup re-raises the signal, so the process still dies of it (no 'FINISHED', no clean exit code).
+      expect(await exited).toEqual({ code: null, sig: signal });
+      expect(existsSync(scratch)).toBe(false);
+      expect(existsSync(taskTmp)).toBe(false);
+      expect(readFileSync(`${scratch}.jsonl`, 'utf8')).toBe(event);
+      expect(statSync(`${scratch}.jsonl`).mode & 0o777).toBe(0o600);
+    } finally {
+      proc.kill('SIGKILL');
+      if (started) {
+        try { process.kill(-started.pid, 'SIGKILL'); } catch { /* already gone */ }
+        for (const dir of started.dirs) {
+          rmSync(dir, { recursive: true, force: true });
+          rmSync(`${dir}.jsonl`, { force: true });
+        }
+      }
+    }
+  }, 20000);
+
   it('codexDirectTask: with no --dir, requires repoRoot and creates a scratch clone first', async () => {
     const { fn: spawnFn } = fakeSpawn('{"type":"turn.completed","usage":{}}\n');
     await expect(codexDirectTask({ task: 't', execFn: () => '', spawnFn })).rejects.toThrow(/repoRoot/);

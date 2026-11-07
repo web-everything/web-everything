@@ -1236,7 +1236,7 @@ export async function codexDirectTask({
   // A human CLI run with no --dir leaves its edits only in the scratch clone it prints (keepScratch), and a --json
   // run whose patch is not byte-exact keeps it too. Set on a successful return, or on a throw after Codex started
   // that may leave edits (its error names the clone); an earlier throw prints just its error, and its clone is
-  // cleaned up. A signal or process exit mid-run (a cancelled task) still cleans up through the exit hook.
+  // cleaned up. A signal or process exit mid-run (a cancelled task) still cleans up, through the signal or exit hook.
   let retainedScratch;
   // Set once Codex may have edited a scratch clone this run deletes; `capturedDiff` once the final diff is read.
   let editsAt = null;
@@ -1262,6 +1262,22 @@ export async function codexDirectTask({
     return path;
   };
   process.once('exit', cleanupTemps);
+  // A signal's default action ends the process with neither 'exit' nor `finally` (R688): the worker and gate
+  // wrappers kill their child group and re-raise. So clean up synchronously on the same signal, then re-raise
+  // it once nothing else handles it (a --job child's own handler exits, and the exit hook above cleans up).
+  const onTerminatingSignal = (signal) => {
+    removeSignalCleanup();
+    cleanupTemps();
+    if (process.listenerCount(signal) === 0) process.kill(process.pid, signal);
+  };
+  const onSigint = () => onTerminatingSignal('SIGINT');
+  const onSigterm = () => onTerminatingSignal('SIGTERM');
+  const removeSignalCleanup = () => {
+    process.removeListener('SIGINT', onSigint);
+    process.removeListener('SIGTERM', onSigterm);
+  };
+  process.on('SIGINT', onSigint);
+  process.on('SIGTERM', onSigterm);
   try {
   let targetDir = dir;
   let scratch = null;
@@ -1442,6 +1458,7 @@ export async function codexDirectTask({
   } finally {
     cleanupTemps();
     process.removeListener('exit', cleanupTemps);
+    removeSignalCleanup();
   }
 }
 
