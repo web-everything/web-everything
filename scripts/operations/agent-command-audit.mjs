@@ -17,8 +17,10 @@ const etDay = value => new Intl.DateTimeFormat('en-CA', {
 }).format(new Date(value));
 
 // Option names that carry a credential (`--token`, `--api-key`, `--client-secret`, `--password`, `--pass`,
-// `--pat`/`--gitlab-pat` personal access tokens, …). `pat` is a whole name part, so `--path`/`--compat` stay data.
-const CREDENTIAL_OPTION = /token|secret|passw(?:or)?d|^pass$|^pw$|(?:^|[-_])pat$|credential|auth(?!or)|cookie|key$/i;
+// `--pat`/`--gitlab-pat` personal access tokens, `--access-key-id`, `--passphrase`, `--pwd`, `--jwt`, …).
+// `pat`, `pwd`, `jwt` and `key` match as whole name parts, so `--path`/`--compat`/`--keyboard` stay data.
+const CREDENTIAL_OPTION = new RegExp(String.raw`token|secret|passw(?:or)?d|passphrase|^pass$|^pw$|credential|auth(?!or)|cookie`
+  + String.raw`|(?:^|[-_])(?:pat|pwd|jwt)$|key$|(?:^|[-_])key(?:[-_]|$)`, 'i');
 // One whole shell word: concatenated quoted runs, `$'…'`, `$( … )`, backticks, escapes and plain characters.
 const SHELL_WORD = String.raw`(?:"(?:\\.|[^"\\])*"|'[^']*'|\$'(?:\\.|[^'\\])*'|\$\([^)]*\)|` + '`[^`]*`'
   + String.raw`|\\.|[^\s"'` + '`' + String.raw`;|&\\])+`;
@@ -26,18 +28,19 @@ const EMPTY_WORD = /^(?:""|'')+$/;
 // Header names (`Authorization:`, `PRIVATE-TOKEN:`, `x-api-key:`, `token:`) and assignment names
 // (`API_KEY=`, `MY_PASS=`, `GITLAB_AUTH=`) whose value is a credential. Tested on one captured name.
 const CREDENTIAL_HEADER = /authorization|token|secret|password|cookie|(?:api|access|private|secret|auth)[-_]?key/i;
-const CREDENTIAL_ASSIGNMENT = /key|token|secret|passw(?:or)?d|pass(?:[_-]|$)|(?:^|[_-])pat(?:[_-]|$)|credential|auth(?!or)|cookie/i;
+// A bare `PWD=` is the shell's working directory, so only a prefixed `MYSQL_PWD=` counts.
+const CREDENTIAL_ASSIGNMENT = /key|token|secret|passw(?:or)?d|passphrase|pass(?:[_-]|$)|(?:^|[_-])(?:pat|jwt)(?:[_-]|$)|[_-]pwd$|credential|auth(?!or)|cookie/i;
 // Commands longer than this are cut before redaction so every rule stays linear-time; the cut is marked.
 export const REDACT_MAX_CHARS = 16384;
 
 /** Redact a credential option together with its value, attached (`--token=x`) or separate (`--token x`).
- *  Option names are compared with shell quotes removed (`--"token"`, `"--token"`, `--to''ken`); an empty
- *  quoted value (`--token "" v`) takes the next word too. */
+ *  Option names are compared with shell quotes and escapes removed (`--"token"`, `"--token"`, `--to''ken`,
+ *  `--to\ken`); an empty quoted value (`--token "" v`) takes the next word too. */
 function redactCredentialOptions(text) {
   const name = /(?<![^\s"'])["']?-{1,2}([^\s=]+)(=?)/g;
   let out = '', last = 0;
   for (let m; (m = name.exec(text));) {
-    if (!CREDENTIAL_OPTION.test(m[1].replace(/["']/g, ''))) continue;
+    if (!CREDENTIAL_OPTION.test(m[1].replace(/["'\\]/g, ''))) continue;
     let end = name.lastIndex;
     for (let words = 0; words < 2; words += 1) {
       const value = new RegExp((m[2] && !words ? '' : String.raw`\s+`) + SHELL_WORD, 'y');
@@ -97,12 +100,14 @@ const HEAVY_KIND_CATEGORY = { vitest: 'vitest', 'node-test': 'node --test', stan
 export const SUBSTITUTION_MAX_CHARS = 16384;
 export const SUBSTITUTION_MAX_BODIES = 64;
 
-/** Every substitution body of `cmd`, or null when it is too long, too nested or unreadable (fail closed). */
+/** Every substitution body of `cmd`, or null when it is too long, too nested or unreadable (fail closed).
+ *  The length and opener bounds ignore single-quoted runs, where a shell expands nothing. */
 export function boundedSubstitutionBodies(cmd) {
   const text = String(cmd ?? '');
-  if (text.length > SUBSTITUTION_MAX_CHARS) return null;
+  const expandable = text.replace(/'[^']*'/g, "''");
+  if (expandable.length > SUBSTITUTION_MAX_CHARS) return null;
   // Openers bound the body count from above; checking them first keeps a deep nest off the quadratic extractor.
-  if ((text.match(/\$\(|`/g) || []).length > SUBSTITUTION_MAX_BODIES * 4) return null;
+  if ((expandable.match(/\$\(|`/g) || []).length > SUBSTITUTION_MAX_BODIES * 4) return null;
   try {
     const bodies = commandSubstitutionBodies(text);
     return bodies.length > SUBSTITUTION_MAX_BODIES ? null : bodies;
@@ -118,8 +123,9 @@ export function classifyCommand(cmd, depth = 0, withSubstitutions = true) {
   // A shell runs `$( … )` / backtick bodies too; they are never admitted by the outer command's queue.
   if (withSubstitutions) {
     const bodies = boundedSubstitutionBodies(cmd);
-    if (!bodies) return [{ category: 'unparsed (substitutions too long or too nested)', queued: false, command: redact(String(cmd)) }];
-    for (const body of bodies) out.push(...classifyCommand(body, depth + 1, false));
+    // Past a bound the substitutions are reported unparsed; the top-level segments below are still classified.
+    if (!bodies) out.push({ category: 'unparsed (substitutions too long or too nested)', queued: false, command: redact(String(cmd)) });
+    for (const body of bodies || []) out.push(...classifyCommand(body, depth + 1, false));
   }
   for (const segment of parseSegments(String(cmd)).segments) {
     let head = canonicalCommand(segment), queued = false;
@@ -166,7 +172,10 @@ function toolCommands(record) {
   if (['exec_command', 'shell_command', 'shell', 'local_shell'].includes(name) && args && typeof args === 'object') {
     const command = args.cmd ?? args.command;
     if (typeof command === 'string') commands.push(command);
-    else if (Array.isArray(command) && command.every(x => typeof x === 'string')) commands.push(command.join(' '));
+    // An argv array: quote each element so `["bash", "-lc", "npm test"]` keeps `npm test` as the one `-c` body.
+    else if (Array.isArray(command) && command.every(x => typeof x === 'string')) {
+      commands.push(command.map(x => (/^[\w@%+=:,./-]+$/.test(x) ? x : "'" + x.replaceAll("'", "'\\''") + "'")).join(' '));
+    }
   }
   if (name === 'exec' && typeof raw === 'string') {
     // Extract literal cmd properties only. Never eval transcript JavaScript.

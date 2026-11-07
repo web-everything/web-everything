@@ -208,6 +208,11 @@ describe('heavy-enforce — every direct test run requires admission', () => {
     ['WE_FULL_SUITE_OK=1 npm test', 'WE_FULL_SUITE_OK=1 npm run test:unit'],
     ['npm test -- a.test.mjs', 'npm run test:unit -- a.test.mjs'],
     ['npm -s test -- a.test.mjs', 'npm run test:unit -- a.test.mjs'],
+    // #6461: npm's run-script aliases and config options with a separate value run the same test script
+    ['npm rum test -- a.test.mjs', 'npm run test:unit -- a.test.mjs'],
+    ['npm urn test -- a.test.mjs', 'npm run test:unit -- a.test.mjs'],
+    ['npm --loglevel silent test -- a.test.mjs', 'npm run test:unit -- a.test.mjs'],
+    ['npm --loglevel silent run test -- a.test.mjs', 'npm run test:unit -- a.test.mjs'],
     ['pnpm vitest run a.test.mjs', queue + 'pnpm vitest run a.test.mjs'],
     // a watch/dev process would hold an admission slot until killed: queue a one-shot `run` instead
     ['vitest watch a.test.mjs', queue + 'vitest run a.test.mjs'],

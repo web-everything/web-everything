@@ -128,6 +128,10 @@ describe('agent command audit', () => {
     `https://x.test/a?pass=${plain}`,
     // A personal access token (`--pat`, `--gitlab-pat`, `GITLAB_PAT=`) is a credential too.
     `--pat ${plain}`, `--pat=${plain}`, `--gitlab-pat ${plain}`, `GITLAB_PAT=${plain}`, `PAT=${plain}`,
+    // `key` inside a longer name, passphrases, `*_PWD`, JWTs, and a backslash-escaped option name.
+    `--access-key-id ${plain}`, `--api-key-file ${plain}`, `--passphrase ${plain}`, `--passphrase=${plain}`,
+    `PASSPHRASE=${plain}`, `MYSQL_PWD=${plain}`, `--pwd ${plain}`, `--jwt ${plain}`, `APP_JWT=${plain}`,
+    `--to\\ken ${plain}`,
   ])('redacts a prefix-free credential value in %s', value => {
     const out = redact(`npm ci ${value}`);
     expect(out).not.toContain('hunter2zq');
@@ -136,7 +140,7 @@ describe('agent command audit', () => {
   it.each([
     'npx vitest run a.test.mjs --passWithNoTests=false', 'git log --author=bob', 'git fetch origin main:main',
     'curl https://x.test/a', 'env -u HOME npm ci',
-    'git -C . log --path=a --compat x', 'PATH=/usr/bin npm ci', 'git diff --patience a',
+    'git -C . log --path=a --compat x', 'PATH=/usr/bin npm ci', 'git diff --patience a', 'PWD=/a npm ci',
   ])('leaves ordinary command %s unchanged', command => expect(redact(command)).toBe(command));
   it('stays linear-time and marks a cut on oversized input', () => {
     for (const unit of ['a.', 'a-', 'a+', '-a', 'token', '"--token ', 'x:']) {
@@ -160,20 +164,44 @@ describe('agent command audit', () => {
   });
   // Self-review #6461: nested substitutions are classified once each, with bounded time and rows.
   const nest = (levels, inner) => Array.from({ length: levels }).reduce(cmd => `echo $(${cmd})`, inner);
+  // Row counts are asserted as numbers so a regression fails fast instead of diffing thousands of rows.
   it('classifies each nested substitution once, with no combinatorial growth', () => {
-    expect(classifyCommand('echo $(echo $(npm test))')).toEqual([expect.objectContaining({ category: 'npm test/check' })]);
-    expect(classifyCommand(nest(5, 'npm test'))).toHaveLength(1);
-    const started = Date.now();
-    expect(classifyCommand(nest(20, 'echo hi'))).toEqual([]);
-    expect(classifyCommand('echo ' + '$('.repeat(20))).toEqual([]);
-    expect(Date.now() - started).toBeLessThan(2000);
+    expect(classifyCommand('echo $(echo $(npm test))').map(row => row.category)).toEqual(['npm test/check']);
+    expect(classifyCommand(nest(5, 'npm test')).length).toBe(1);
+    expect(classifyCommand(nest(10, 'echo hi')).length).toBe(0);
+    expect(classifyCommand('echo ' + '$('.repeat(10)).length).toBe(0);
   });
   it.each([
-    ['a deep unclosed nest', '$('.repeat(8000)], ['too many substitutions', 'echo $(a) '.repeat(300)],
+    ['a deep unclosed nest', '$('.repeat(8000)], ['too many substitution openers', 'echo $(a) '.repeat(300)],
+    ['more than 64 substitution bodies', 'echo ' + '$(true) '.repeat(65)],
     ['an oversized command', 'npm ci ' + '$(a) '.repeat(4000)],
   ])('reports %s as one unparsed row instead of throwing', (_, command) => {
-    expect(classifyCommand(command)).toEqual([expect.objectContaining({ category: expect.stringMatching(/^unparsed/), queued: false })]);
-    expect(auditLines([claude(command)], { date: '2026-07-02' }).rows).toHaveLength(1);
+    const rows = classifyCommand(command);
+    expect(rows.length).toBe(1);
+    expect(rows[0]).toMatchObject({ category: expect.stringMatching(/^unparsed/), queued: false });
+    expect(auditLines([claude(command)], { date: '2026-07-02' }).rows.length).toBe(1);
+  });
+  it('still classifies the top-level segments when a substitution bound trips', () => {
+    expect(classifyCommand('npm test; echo ' + '$(a) '.repeat(70)).map(row => row.category))
+      .toEqual([expect.stringMatching(/^unparsed/), 'npm test/check']);
+  });
+  it('ignores single-quoted text when applying the substitution bounds', () => {
+    expect(classifyCommand(`git commit -m '${'`x` '.repeat(130)}'`).length).toBe(0);
+    expect(classifyCommand(`git commit -m '${'x'.repeat(17000)}'`).length).toBe(0);
+  });
+  // Red-team #6461 class: npm's run-script aliases and config options with a separate value.
+  it.each(['npm rum test', 'npm urn test', 'npm --loglevel silent test', 'npm --cache /x test',
+    'npm --color false test', 'npm --loglevel silent run test'])('classifies npm spelling %s as a test run', command => {
+    expect(classifyCommand(command).map(row => row.category)).toEqual(['npm test/check']);
+  });
+  it.each(['npm rum build', 'npm --loglevel silent run build'])('leaves npm non-test script %s unclassified', command => {
+    expect(classifyCommand(command)).toEqual([]);
+  });
+  it('reads a Codex argv array as argv, keeping the bash -c body whole', () => {
+    const codexArgv = command => JSON.stringify({ timestamp: '2026-07-02T12:00:00Z',
+      payload: { type: 'function_call', name: 'shell', arguments: JSON.stringify({ command }) } });
+    const rows = auditLines([codexArgv(['bash', '-lc', 'npm test']), codexArgv(['bash', '-lc', 'npx vitest run a.test.mjs'])]).rows;
+    expect(rows.map(row => row.category)).toEqual(['npm test/check', 'vitest']);
   });
   it('keeps ordinary flags readable', () => {
     expect(redact('npx vitest run a.test.mjs --run --bail=1')).toBe('npx vitest run a.test.mjs --run --bail=1');

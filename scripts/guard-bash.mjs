@@ -455,21 +455,6 @@ export function orchestratorDelegateReason(command, ctx = {}) {
     '--test-name-pattern', '--test-reporter', '--test-reporter-destination', '--test-shard',
     '--test-skip-pattern', '--test-timeout', '--tls-cipher-list', '--tls-keylog', '--use-largepages',
     '--v8-pool-size', '--watch-path']);
-  // npm accepts config options before both `run` and the script name, including separate values.
-  const npmValueFlags = new Set([...RUNNER_VALUE_FLAGS, ...(`
-    --_auth --access --also --audit-level --auth-type --before --ca --cache --cache-max --cache-min
-    --cafile --call --cert --cidr --cpu --depth --diff --diff-dst-prefix --diff-src-prefix --diff-unified
-    --editor --expect-result-count --fetch-retries --fetch-retry-factor --fetch-retry-maxtimeout
-    --fetch-retry-mintimeout --fetch-timeout --git --globalconfig --heading --https-proxy --include
-    --init-author-email --init-author-name --init-author-url --init-license --init-module --init-version
-    --init.author.email --init.author.name --init.author.url --init.license --init.module --init.version
-    --install-strategy --key --libc --local-address --location --lockfile-version --loglevel --logs-dir
-    --logs-max --maxsockets --message --node-options --noproxy --omit --only --os --otp --package
-    --pack-destination --prefix --preid --provenance-file --proxy --registry --replace-registry-host
-    --save-prefix --sbom-format --sbom-type --scope --script-shell --searchexclude --searchlimit
-    --searchopts --searchstaleness --shell --tag --tag-version-prefix --umask --user-agent --userconfig
-    --viewer --which --workspace
-  `).trim().split(/\s+/)]);
   const normalize = (text) => {
     const words = headWords(canonicalCommand(peelPollingSegment(text))).map(w => w.text);
     if (words[0] === 'node') {
@@ -498,16 +483,11 @@ export function orchestratorDelegateReason(command, ctx = {}) {
       const skipOptions = () => {
         while (words[i]?.startsWith('-')) {
           if (words[i] === '--') { i += 1; break; }
-          const flag = words[i];
-          // Exact booleans take precedence over config-name abbreviations (e.g. --save vs --save-prefix).
-          const valueFlag = npmValueFlags.has(flag) || (!/^(?:--audit|--global|--provenance|--save)$/.test(flag)
-            && flag.startsWith('--') && [...npmValueFlags].some(known => known.startsWith(flag)));
-          i += !flag.includes('=') && (valueFlag || /^(?:true|false)$/.test(words[i + 1] || '')
-            || (flag === '--color' && words[i + 1] === 'always')) ? 2 : 1;
+          i += npmOptionSpan(words, i);
         }
       };
       skipOptions();
-      if (words[i] === 'run' || words[i] === 'run-script') {
+      if (NPM_RUN_WORDS.has(words[i])) {
         i += 1;
         skipOptions();
         return [['npm', 'run', ...words.slice(i)]];
@@ -875,6 +855,34 @@ const MULTI_SCRIPT_RUNNERS = new Set(['run-s', 'run-p', 'npm-run-all']);
 const RUNNER_VALUE_FLAGS = new Set(['--package', '-p', '--filter', '-F', '--workspace', '-w', '--prefix', '-C', '--dir', '--cwd']);
 /** npm `exec --call/-c '<command>'` — the value is a COMMAND LINE, so it is recursed, not skipped. */
 const RUNNER_CALL_FLAGS = new Set(['--call', '-c']);
+// npm accepts config options before both `run` and the script name, including separate values.
+const NPM_CONFIG_VALUE_FLAGS = new Set([...RUNNER_VALUE_FLAGS, ...(`
+    --_auth --access --also --audit-level --auth-type --before --ca --cache --cache-max --cache-min
+    --cafile --call --cert --cidr --cpu --depth --diff --diff-dst-prefix --diff-src-prefix --diff-unified
+    --editor --expect-result-count --fetch-retries --fetch-retry-factor --fetch-retry-maxtimeout
+    --fetch-retry-mintimeout --fetch-timeout --git --globalconfig --heading --https-proxy --include
+    --init-author-email --init-author-name --init-author-url --init-license --init-module --init-version
+    --init.author.email --init.author.name --init.author.url --init.license --init.module --init.version
+    --install-strategy --key --libc --local-address --location --lockfile-version --loglevel --logs-dir
+    --logs-max --maxsockets --message --node-options --noproxy --omit --only --os --otp --package
+    --pack-destination --prefix --preid --provenance-file --proxy --registry --replace-registry-host
+    --save-prefix --sbom-format --sbom-type --scope --script-shell --searchexclude --searchlimit
+    --searchopts --searchstaleness --shell --tag --tag-version-prefix --umask --user-agent --userconfig
+    --viewer --which --workspace
+  `).trim().split(/\s+/)]);
+/** npm's `run-script` aliases (`npm rum test`, `npm urn test` run the `test` script like `npm run test`). */
+const NPM_RUN_WORDS = new Set(['run', 'run-script', 'rum', 'urn']);
+
+/** How many words the npm option at `words[i]` spans: 2 when it takes a separate value (`--loglevel silent`,
+ *  `--color false`, an abbreviated value option), else 1. `words` are plain strings. Pure. */
+function npmOptionSpan(words, i) {
+  const flag = words[i];
+  // Exact booleans take precedence over config-name abbreviations (e.g. --save vs --save-prefix).
+  const valueFlag = NPM_CONFIG_VALUE_FLAGS.has(flag) || (!/^(?:--audit|--global|--provenance|--save)$/.test(flag)
+    && flag.startsWith('--') && [...NPM_CONFIG_VALUE_FLAGS].some(known => known.startsWith(flag)));
+  return !flag.includes('=') && (valueFlag || /^(?:true|false)$/.test(words[i + 1] || '')
+    || (flag === '--color' && words[i + 1] === 'always')) ? 2 : 1;
+}
 
 /** Quote-aware word split of a command head that also reports each word's RAW `start`/`end` offsets in
  *  `head`, so the `exec` remainder (and `canonicalCommand`'s argument tail) can be handed on VERBATIM —
@@ -948,13 +956,14 @@ export function runnerInvocation(head) {
       if (RUNNER_CALL_FLAGS.has(flag)) {                       // the value IS a command line
         return { exec: eq === -1 ? (words[i + 1] ? words[i + 1].text : '') : w.slice(eq + 1) };
       }
-      if (eq === -1 && RUNNER_VALUE_FLAGS.has(flag)) i += 1;   // consume the flag's separate value word
-      i += 1;
+      // consume the flag's separate value word (npm's own config options too: `npm --loglevel silent run test`)
+      if (runner === 'npm') i += npmOptionSpan(words.map((word) => word.text), i);
+      else i += eq === -1 && RUNNER_VALUE_FLAGS.has(flag) ? 2 : 1;
       continue;
     }
     if (w === 'exec' || w === 'dlx' || (runner === 'npm' && w === 'x' && !sawRun && !sawExec)) { sawExec = true; i += 1; continue; }
     if (w === 'workspace' || w === 'workspaces') { i += 2; continue; }  // `yarn workspace <name> <rest…>`
-    if (w === 'run' || w === 'run-script') { sawRun = true; i += 1; continue; }
+    if (w === 'run' || w === 'run-script' || (runner === 'npm' && NPM_RUN_WORDS.has(w))) { sawRun = true; i += 1; continue; }
     break;                                                    // the subcommand / script-name position
   }
   if (i >= words.length) return { names: [] };
@@ -3427,7 +3436,7 @@ function ungatedHeavyHead(head) {
     while (w[j]?.startsWith('-')) {
       const span = npmScopeSpan(words, j);
       if (span) scope.push(rawWords(head, words.slice(j, j + span)));
-      j += span || (!w[j].includes('=') && RUNNER_VALUE_FLAGS.has(w[j]) ? 2 : 1);
+      j += span || npmOptionSpan(w, j); // config options with a separate value too: `npm --loglevel silent test`
     }
     if (['test', 't', 'tst'].includes(w[j])) at = j;
   }

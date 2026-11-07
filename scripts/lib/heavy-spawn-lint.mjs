@@ -17,9 +17,11 @@ function heavyCommand(command, depth = 0, withSubstitutions = true) {
   // A shell expands `$( … )` / backticks before running the outer command, so their bodies are executed too.
   // Array arguments arrive single-quoted (see quote()), where nothing expands.
   if (withSubstitutions) {
-    if (command.length > SUBSTITUTION_MAX_CHARS) return true;
+    // The length and opener bounds ignore single-quoted runs (every array argument, see quote()): nothing expands there.
+    const expandable = command.replace(/'[^']*'/g, "''");
+    if (expandable.length > SUBSTITUTION_MAX_CHARS) return true;
     // Openers bound the body count from above; checking them first keeps a deep nest off the quadratic extractor.
-    if ((command.match(/\$\(|`/g) || []).length > SUBSTITUTION_MAX_BODIES * 4) return true;
+    if ((expandable.match(/\$\(|`/g) || []).length > SUBSTITUTION_MAX_BODIES * 4) return true;
     let bodies;
     try { bodies = commandSubstitutionBodies(command); } catch { return true; } // stack overflow on a pathological nest
     if (bodies.length > SUBSTITUTION_MAX_BODIES) return true;

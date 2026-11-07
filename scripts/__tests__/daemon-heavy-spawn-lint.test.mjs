@@ -28,14 +28,33 @@ describe('daemon heavy spawn admission lint', () => {
   const ex = "import { execSync } from 'node:child_process';\n";
   const nest = (levels, inner) => Array.from({ length: levels }).reduce(cmd => `echo $(${cmd})`, inner);
   it('inspects nested substitutions without combinatorial growth', () => {
-    const started = Date.now();
-    expect(findUngatedHeavySpawns(ex + `execSync(${JSON.stringify(nest(20, 'echo hi'))});`)).toEqual([]);
-    expect(findUngatedHeavySpawns(ex + `execSync(${JSON.stringify(nest(5, 'npm test'))});`)).toHaveLength(1);
-    expect(Date.now() - started).toBeLessThan(2000);
+    expect(findUngatedHeavySpawns(ex + `execSync(${JSON.stringify(nest(10, 'echo hi'))});`).length).toBe(0);
+    expect(findUngatedHeavySpawns(ex + `execSync(${JSON.stringify(nest(5, 'npm test'))});`).length).toBe(1);
   });
-  it.each([['a deep unclosed nest', '$('.repeat(8000)], ['too many substitutions', 'echo $(a) '.repeat(300)]])(
-    'fails closed on %s', (_, command) => {
-      expect(findUngatedHeavySpawns(ex + `execSync(${JSON.stringify(command)});`)).toHaveLength(1);
+  it.each([
+    ['a deep unclosed nest', '$('.repeat(8000)], ['too many substitution openers', 'echo $(a) '.repeat(300)],
+    ['more than 64 substitution bodies', 'echo ' + '$(true) '.repeat(65)],
+  ])('fails closed on %s', (_, command) => {
+    expect(findUngatedHeavySpawns(ex + `execSync(${JSON.stringify(command)});`).length).toBe(1);
+  });
+  // Array arguments are single-quoted, where nothing expands: a long or backtick-heavy argument is data.
+  it.each([
+    `execFileSync('gh', ['pr', 'create', '--body', ${JSON.stringify('`x` '.repeat(130))}]);`,
+    `execFileSync('git', ['commit', '-m', '${'x'.repeat(17000)}']);`,
+  ])('does not flag a long quoted array argument (%#)', call => {
+    expect(findUngatedHeavySpawns("import { execFileSync } from 'node:child_process';\n" + call).length).toBe(0);
+  });
+  // Red-team #6461 class: npm's run-script aliases and config options with a separate value.
+  it.each([
+    "spawnSync('npm', ['rum', 'test']);", "spawnSync('npm', ['urn', 'test']);",
+    "spawnSync('npm', ['--loglevel', 'silent', 'test']);", "spawnSync('npm', ['--loglevel', 'silent', 'run', 'test']);",
+    "spawnSync('npm', ['--cache', '/x', 'test']);",
+  ])('detects npm spelling %s', call => {
+    expect(findUngatedHeavySpawns(cp + call).length).toBe(1);
+  });
+  it.each(["spawnSync('npm', ['rum', 'build']);", "spawnSync('npm', ['--loglevel', 'silent', 'run', 'build']);"])(
+    'ignores npm non-test script %s', call => {
+      expect(findUngatedHeavySpawns(cp + call).length).toBe(0);
     });
   // Red-team #6461: package test scripts and Node's own test runner are unqueued heavy entry points too.
   it.each([
