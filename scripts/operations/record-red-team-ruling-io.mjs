@@ -1,4 +1,5 @@
-import { judgeEvidenceComment } from './record-referral-ruling.mjs';
+import { JUDGE_ACTOR, JUDGE_ATTRIBUTION, readJudgeActorPolicy, readJudgeWriterPolicy, assertJudgeAuthority, isJudgeAuthored } from '../lib/marker-authorship.mjs';
+import { assertJudgeReason, judgeEvidenceComment } from './record-referral-ruling.mjs';
 import { judgeRulingSink, judgeConfirm as defaultJudgeConfirm, readJudgeNotRealMode, readJudgeEvidence, readCardRulingFileMode, landRulingCard as defaultLandRulingCard, rulingCardFilingSink } from './record-referral-ruling-io.mjs';
 /**
  * @file scripts/operations/record-red-team-ruling-io.mjs
@@ -17,7 +18,7 @@ import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { resolveCardRef } from './record-referral-ruling-io.mjs';
 import { CARD_REF_RE, readCardAtPrHead, referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { trackingRefspec } from '../lib/git-transport-branch.mjs';
-import { assertHumanOperator, isHumanOperatorComment, operatorBoundComments, operatorGhEnv, resolveOperatorIdentity } from '../lib/operator-identity.mjs';
+import { assertRulingIdentity, isRulingComment, judgePolicyOnce, assertHumanOperator, isHumanOperatorComment, operatorBoundComments, operatorGhEnv, resolveOperatorIdentity } from '../lib/operator-identity.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { createActionStore } from './action-store.mjs';
 import { cardBatchStateDir } from './card-batch-io.mjs';
@@ -35,8 +36,8 @@ import { planRedTeamCard, blockRulingId, assertRulingCardInputFits, CARD_PENDING
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 /** `gh` under the OPERATOR channel: App tokens removed, so it runs as the operator's own login. */
-const gh = (args, input, env = process.env) => {
-  const r = spawnSync('gh', args, { env: operatorGhEnv(env), encoding: 'utf8', timeout: 60_000, maxBuffer: 256 * 1024 * 1024, input,
+const gh = (args, input, env = process.env, actor) => {
+  const r = spawnSync('gh', args, { env: actor === JUDGE_ACTOR ? env : operatorGhEnv(env), encoding: 'utf8', timeout: 60_000, maxBuffer: 256 * 1024 * 1024, input,
     stdio: [input == null ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
   if (r.status !== 0) throw new Error(`gh ${args.slice(0, 2).join(' ')} failed: ${String(r.stderr ?? r.error?.message ?? '').trim().slice(0, 300)}`);
   return String(r.stdout ?? '');
@@ -116,9 +117,9 @@ export function createRecordRedTeamRulingReader({ tool, log = line => console.er
   readEvents = repo => readJudgeLedgerSync(repo, { env }),
   readScope = () => readScopeLogged(env), runGit = git, readOnPr = readCardAtPrHead,
   resolveCard = card => resolveCardDefault(card, { runGit, readOnPr }),
-  resolveIdentity = () => resolveOperatorIdentity({ env }), now = () => new Date().toISOString(),
+  resolveIdentity = actor => resolveOperatorIdentity({ env, ...(actor === JUDGE_ACTOR ? { automation: true } : {}) }), now = () => new Date().toISOString(),
   assertFresh = () => assertOperatorCliFresh(REPO_ROOT, { label: 'record-red-team-ruling', env }) } = {}) {
-  return ({ repo, pr, card, asJudge, evidenceFile, break: breakSpec }) => {
+  return ({ repo, pr, card, actor, asJudge, evidenceFile, break: breakSpec }) => {
     assertFresh();
     const thread = readThread({ repo, pr });
     const head = String(thread.headRefOid ?? '').toLowerCase();
@@ -141,12 +142,12 @@ export function createRecordRedTeamRulingReader({ tool, log = line => console.er
           disagreements = Math.max(0, ...indices.map(i => counts.get(i)?.size ?? 0));
         }
       }
-      return { head,
+      return { head, ...(actor === JUDGE_ACTOR ? { judgeActorPolicy: readJudgeWriterPolicy({ env, tool: tool?.judgeActor, log }) } : {}),
         ...(asJudge ? { judgeNotRealMode: readJudgeNotRealMode({ env, tool, log }),
           evidence: readJudgeEvidence(evidenceFile, readFile), disagreements } : {}),
         cardFileMode: readCardRulingFileMode({ env, tool, log }), labels: thread.labels ?? [], comments: thread.comments ?? [],
         standingRuling,
-        setting: readSetting().value, scope: { value: scope.value, sources: scope.sources ?? {} }, now: now(), identity: resolveIdentity(),
+        setting: readSetting().value, scope: { value: scope.value, sources: scope.sources ?? {} }, now: now(), identity: resolveIdentity(actor),
         card: card === undefined || card === '' ? null : resolveCard(card, { repo, pr, head }) };
     };
     let ledger;
@@ -190,14 +191,14 @@ export const spawnStableCardJob = (input, session, binding, { spawnDetached = de
   return r.ok ? { ...r, session } : r;
 };
 
-export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConfirm, landRulingCard = defaultLandRulingCard, env = process.env, root = REPO_ROOT, readThread = readLiveThread,
+export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConfirm, landRulingCard = defaultLandRulingCard, env = process.env, tool, root = REPO_ROOT, readThread = readLiveThread,
   readStandingRulingScope = standingRulingScope,
   readScope = () => readScopeLogged(env),
   runGit = git, readOnPr = readCardAtPrHead,
   resolveCard = card => resolveCardDefault(card, { runGit, readOnPr }),
-  resolveIdentity = () => resolveOperatorIdentity({ env }),
+  resolveIdentity = actor => resolveOperatorIdentity({ env, ...(actor === JUDGE_ACTOR ? { automation: true } : {}) }),
   coordinationRoot = resolveCoordinationRoot(), actions = createActionStore({ root: coordinationRoot }), fileCard = spawnStableCardJob,
-  post = (repo, pr, body) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body, env),
+  post = (repo, pr, body, actor) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body, env, actor),
   runSetLabel = execFileSync, appendEvents = appendLedgerEvents,
   readEvents = repo => readLedgerEventsFromStore(repo, { env }),
   syncLabels = ({ repo, pr, head }) => syncRedTeamStatusLabels({ repo, pr, head, env }),
@@ -209,13 +210,19 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
   };
   /** Right before any write: the poster, the head, the SAME result, and every selected break still rulable the same way
    *  the plan found it (the same `rulableBreaks` rule, so the cap and held-break checks apply here too). */
+  // One judge-policy read per proof pass, under THIS sink's env — the env its recheck holds (#6494 F2/F7).
+  const passPolicy = () => judgePolicyOnce(() => readJudgeActorPolicy({ env, log: warn }));
   const recheck = (p, noWrite = 'nothing written') => {
-    assertHumanOperator(resolveIdentity(), p.actor);
+    assertJudgeReason(p.actor, p.reason);
+    assertJudgeReason(p.actor, p.sendBackBody);
+    // The SAME policy the plan held (#6494 F7): this sink's env and tool layer, narrowed by the gate-visible policy.
+    if (p.actor === JUDGE_ACTOR) assertJudgeAuthority({ judgeActorPolicy: readJudgeWriterPolicy({ env, tool: tool?.judgeActor, log: warn }) }, p);
+    assertRulingIdentity(resolveIdentity(p.actor), p.actor);
     const thread = readThread({ repo: p.repo, pr: p.pr });
     if (!Array.isArray(thread.labels) || !Array.isArray(thread.comments)) throw new Error('unreadable thread or labels; retry after a complete read');
     const head = String(thread.headRefOid ?? '').toLowerCase();
     if (head !== p.head) throw new Error(`PR #${p.pr}'s head moved to ${head} since the plan (${p.head}); ${noWrite} — re-run against the new head`);
-    const comments = operatorBoundComments(thread.comments);
+    const comments = operatorBoundComments(thread.comments, { policy: passPolicy() });
     const standingRuling = readStandingRulingScope({ repo: p.repo, pr: { ...thread, number: p.pr, headRefOid: head } });
     let now;
     try { now = rulableBreaks({ comments, repo: p.repo, labels: thread.labels, pr: p.pr, head, setting: p.setting, scope: effectiveScope(p), ruling: p.ruling, citesCard: Boolean(p.cardRef), standingRuling }); }
@@ -232,10 +239,11 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
     const after = readThread({ repo: p.repo, pr: p.pr });
     const head = String(after.headRefOid ?? '').toLowerCase();
     if (head !== p.head) throw new Error(`${what} was posted but PR #${p.pr}'s head moved to ${head}; the ruling binds to ${p.head} only — inspect and re-run on the new head`);
-    const comments = operatorBoundComments(after.comments);
+    const policy = passPolicy();
+    const comments = operatorBoundComments(after.comments, { policy });
     const standingRuling = readStandingRulingScope({ repo: p.repo, pr: { ...after, number: p.pr, headRefOid: head } });
     if (liveResultGateState(comments, p.pr, head, p.repo, standingRuling).resultId !== p.resultId) throw new Error(`${what} was posted but the live red-team result changed; inspect the thread before retrying`);
-    if (record && !comments.some((c) => String(c?.body ?? '').trim() === record.trim() && isHumanOperatorComment(c))) {
+    if (record && !comments.some((c) => String(c?.body ?? '').trim() === record.trim() && isRulingComment(c, policy))) {
       throw new Error(`${what} is not in the read-back as a human operator's comment (altered, or posted as another account); inspect the thread before retrying`);
     }
     const d = readRedTeamDisposition({ comments, repo: p.repo, pr: p.pr, head, setting: p.setting, operatorRulings: effectiveScope(p), standingRuling });
@@ -250,10 +258,11 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
     const after = readThread({ repo: p.repo, pr: p.pr });
     const head = String(after.headRefOid ?? '').toLowerCase();
     if (head !== p.head) throw new Error(`the operator-block record was posted but PR #${p.pr}'s head moved to ${head}; inspect the thread`);
-    const comments = operatorBoundComments(after.comments);
+    const policy = passPolicy();
+    const comments = operatorBoundComments(after.comments, { policy });
     const standingRuling = readStandingRulingScope({ repo: p.repo, pr: { ...after, number: p.pr, headRefOid: head } });
     if (liveResultGateState(comments, p.pr, head, p.repo, standingRuling).resultId !== p.resultId) throw new Error('the operator-block record was posted but the live red-team result changed; inspect the thread');
-    if (!comments.some((c) => String(c?.body ?? '').trim() === record.trim() && isHumanOperatorComment(c))) {
+    if (!comments.some((c) => String(c?.body ?? '').trim() === record.trim() && isRulingComment(c, policy))) {
       throw new Error("the operator-block record is not in the read-back as a human operator's comment; inspect the thread before retrying");
     }
     const d = readRedTeamDisposition({ comments, repo: p.repo, pr: p.pr, head, setting: p.setting, operatorRulings: p.scope, standingRuling });
@@ -269,8 +278,12 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
   };
   const reasonBody = (p, cardNote) => judgeEvidenceComment(p.judgeEvidence) + buildRuleReasonComment({ head: p.head, ruling: p.ruling, actor: p.actor, channel: p.channel,
     at: p.at, reason: p.reason, findings: p.findings, cardNote, cause: p.cause ?? null });
-  const operatorRecord = (p, outcome, line) => `${redTeamGateMarker(p.pr, p.head, outcome, p.resultId)}\n`
-    + `**Red-team gate** operator ruling (\`record-red-team-ruling\`) on head \`${p.head.slice(0, 12)}\`:\n${line}`;
+  // Only judge block records carry the distinct actor and attribution.
+  const attributeRuling = (p, body) => p.actor === JUDGE_ACTOR && p.ruling === 'block'
+    ? body.replace(' -->', ` actor=${JUDGE_ACTOR} -->`) + `\n${JUDGE_ATTRIBUTION} (${JUDGE_ACTOR})`
+    : body;
+  const operatorRecord = (p, outcome, line) => attributeRuling(p, `${redTeamGateMarker(p.pr, p.head, outcome, p.resultId)}\n`
+    + `**Red-team gate** operator ruling (\`record-red-team-ruling\`) on head \`${p.head.slice(0, 12)}\`:\n${line}`);
   const indexList = (p) => `(${p.indices.map((i) => `#${i}`).join(', ')})`;
   const intentBody = (p) => `${redTeamGateMarker(p.pr, p.head, CARD_PENDING_OUTCOME, p.resultId)}\n`
     + `Operator card ruling pending (job ${p.jobKey}, break(s) ${p.indices.map((i) => `#${i}`).join(', ')}); the break stays held until the card is queued and recorded.`;
@@ -283,7 +296,7 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
         // Persist the reason before release: either failed POST leaves the break held and retryable.
         if (!/^we:backlog\/[A-Za-z0-9][A-Za-z0-9._-]*\.md(?:@pr[1-9]\d{0,8})?$/.test(p.cardRef)) throw new Error(`--card resolved to an unsafe reference ${JSON.stringify(p.cardRef)}; nothing written`);
         const record = operatorRecord(p, OPERATOR_CARD_OUTCOME, `- ${p.indices.length} finding(s) carded by the operator to \`${p.cardRef}\` ${indexList(p)}.`);
-        post(p.repo, p.pr, reasonBody(p, `Carded to the existing card \`${p.cardRef}\`; no new card is filed.`));
+        post(p.repo, p.pr, reasonBody(p, `Carded to the existing card \`${p.cardRef}\`; no new card is filed.`), p.actor);
         // The reason POST may outlive the card. Validate the exact planned reference at the release boundary.
         let card;
         try { card = resolveCard(p.cardRef, { repo: p.repo, pr: p.pr, head: p.head }); }
@@ -292,7 +305,7 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
           throw new Error(`--card ${p.cardRef} no longer resolves to the same readable backlog card (${card?.reason ?? 'unreadable'}); reason posted; no release record written`);
         }
         recheck(p, 'reason posted; no release record written');
-        post(p.repo, p.pr, record);
+        post(p.repo, p.pr, record, p.actor);
         proveReleased(p, 'the operator-card record', record);
         return { ruling: 'card', head: p.head, indices: p.indices, card: { ref: p.cardRef }, labels: resync(p) };
       }
@@ -336,7 +349,7 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
         // Fence BEFORE any side effect. Ambiguous spawn failures remain dispatching, never auto-reclaimed.
         r = transition(actions, r, 'dispatching', { dispatchingSince: Date.now() });
         try {
-          if (!hasIntent) post(p.repo, p.pr, intentBody(p));
+          if (!hasIntent) post(p.repo, p.pr, intentBody(p), p.actor);
           recheck(p, 'pending intent posted; no card job started');
         }
         catch (error) {
@@ -362,7 +375,7 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
       // Release only with positive child evidence that the card exists or is durably spooled.
       const record = buildGateComment({ pr: p.pr, head: p.head, outcome: OPERATOR_CARD_OUTCOME, round: null, result: p.resultId,
         plan: { sendBack: [], card: p.findings, advisory: [] }, cardResult: card });
-      post(p.repo, p.pr, reasonBody(p, `Follow-up card queued through the prevention landing job (${session}); filing may be paused, in which case it is owed in the spool.`));
+      post(p.repo, p.pr, reasonBody(p, `Follow-up card queued through the prevention landing job (${session}); filing may be paused, in which case it is owed in the spool.`), p.actor);
       // A receipt survives its backing card/spool. Re-read that evidence on every release attempt.
       const result = r.evidence.result, ref = landingRef(result);
       let readable = false;
@@ -405,15 +418,16 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
       } catch { readable = false; }
       if (!readable) throw new Error(`card completion evidence no longer resolves to a readable card or spool; no release record written — inspect the landing log for ${session}; recover the owed card and cite its readable --card reference`);
       recheck(p, 'card queued and reason posted; no release record written');
-      post(p.repo, p.pr, record);
+      post(p.repo, p.pr, record, p.actor);
       proveReleased(p, 'the operator-card record', record);
       return { ruling: 'card', head: p.head, indices: p.indices, card, labels: resync(p) };
     },
     [RED_TEAM_RULING_NOT_REAL_EFFECT]: async (p) => {
+      if (p.actor === JUDGE_ACTOR) assertJudgeAuthority({}, p);
       recheck(p);
       const record = buildGateComment({ pr: p.pr, head: p.head, outcome: OPERATOR_NOT_REAL_OUTCOME, round: null, result: p.resultId,
         plan: { sendBack: [], card: [], advisory: p.findings } }) + judgeEvidenceComment(p.judgeEvidence);
-      post(p.repo, p.pr, reasonBody(p, 'Recorded as not real: the break stays advisory. This does not clear `review:human` or approve the PR.'));
+      post(p.repo, p.pr, reasonBody(p, 'Recorded as not real: the break stays advisory. This does not clear `review:human` or approve the PR.'), p.actor);
       recheck(p, 'reason posted; no release record written');
       // F4: a clearing ruling must reach the ledger before its comment can release the break.
       try {
@@ -425,7 +439,7 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
         throw new Error(`ledger-write-miss: not-real ruling was not confirmed in the verdict ledger; no release record written (${String(e?.message ?? e)}); retry once the ledger is writable`);
       }
       recheck(p, 'reason posted and ledger recorded; no release record written');
-      post(p.repo, p.pr, record);
+      post(p.repo, p.pr, record, p.actor);
       proveReleased(p, 'the not-real record', record);
       return { ruling: 'not-real', head: p.head, indices: p.indices, cause: p.cause ?? null, labels: resync(p) };
     },
@@ -436,15 +450,18 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
       const rulingId = blockRulingId(p), marker = `<!-- we:red-team-block ruling=${rulingId} -->`;
       const record = operatorRecord(p, OPERATOR_BLOCK_OUTCOME, `- ${p.indices.length} confirmed break(s) sent back to the fixer ${indexList(p)}.`) + `\n${marker}`;
       const reason = `${marker}\n${reasonBody(p, 'Blocked: the break(s) go back to the fixer.')}`;
-      const hasReason = comments => comments.filter(isTrustedMarkerAuthor).some(c => isHumanOperatorComment(c)
+      assertJudgeReason(p.actor, reason);
+      assertJudgeReason(p.actor, record);
+      const hasReason = comments => comments.filter(isTrustedMarkerAuthor).some(c => (p.actor === JUDGE_ACTOR ? isJudgeAuthored(c) : isHumanOperatorComment(c))
         && String(c.body ?? '').startsWith(`${marker}\n**Operator ruling on the post-accept red team: block**`));
       // Adding a hold is safe: restore it before any ledger or reason failure can strand a released finding.
-      if (!fresh.comments.filter(isTrustedMarkerAuthor).some(c => isHumanOperatorComment(c) && String(c.body ?? '').trim() === record)) {
-        await post(p.repo, p.pr, record);
+      const policy = passPolicy();
+      if (!fresh.comments.filter(isTrustedMarkerAuthor).some(c => isRulingComment(c, policy) && String(c.body ?? '').trim() === record)) {
+        await post(p.repo, p.pr, record, p.actor);
       }
       const intents = p.indices.map(index => ({ ...buildLedgerEvent({ type: EVENT_TYPES.RULING,
         repo: p.repo, pr: p.pr, at: now(), source: 'record-red-team-ruling', declaredActor: p.actor,
-        channel: p.channel, session: rulingId, findingKey: `red-team:${p.head}:${p.resultId}:${index}`, ruling: 'block' }),
+        channel: p.actor === JUDGE_ACTOR ? `${p.channel}; ${JUDGE_ATTRIBUTION}` : p.channel, session: rulingId, findingKey: `red-team:${p.head}:${p.resultId}:${index}`, ruling: 'block' }),
         id: `rtr-block-${rulingId}-${index}` }));
       const missingIntents = async () => {
         const ledger = await readEvents(p.repo);
@@ -461,7 +478,7 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
       }
       fresh = recheck(p);
       if (!hasReason(fresh.comments)) {
-        await post(p.repo, p.pr, reason);
+        await post(p.repo, p.pr, reason, p.actor);
         fresh = recheck(p);
       }
       if (!hasReason(fresh.comments)) throw new Error('block reason not in the read-back as a human operator comment; retry');
