@@ -33,7 +33,7 @@ import {
   createJobStore, createTickClock, enqueueJob, reattachTick, runJob,
 } from '../daemon-jobs-runtime.mjs';
 import {
-  ensureNodeModulesStore, evictSnapshots, lockfileKey, snapshotsRoot,
+  ensureNodeModulesStore, evictSnapshots, lockfileKey, snapshotsRoot, storeStillValid,
 } from '../daemon-job-snapshots.mjs';
 import { TERMINAL_JOB_STATUSES } from '../../operations/job-record.mjs';
 import { daemonJobsDir } from '../../operations/run-store.mjs';
@@ -41,7 +41,7 @@ import { cloneKey } from '../daemon-overlays.mjs';
 import { NPM_INSTALL_TIMEOUT_MS } from '../bounded-child.mjs';
 import { readGit } from '../proc-read.mjs';
 import {
-  selectInstaller, runDepsInstaller, markerMatches, lockHash, ensureStoreGeneration,
+  selectInstaller, runDepsInstaller, markerMatches, lockHash, readStoreGeneration,
   resolvePnpmStoreDir, whichOnPath, PROBE_TIMEOUT_MS, PROBE_MAX_BUFFER,
 } from '../lane-deps-installer.mjs';
 import { readLockfileParity } from '../../check-lockfile-parity.mjs';
@@ -220,10 +220,8 @@ export function pnpmAwareInstaller({
     if (plan.backend === 'pnpm') {
       plan.args.push('--ignore-scripts');
       plan.fallback = npm;
-      try {
-        ensureStoreGeneration(storeDir);
-      } catch {
-        log('pnpm store generation unavailable; falling back to npm');
+      if (readStoreGeneration(storeDir) === null) {
+        log('pnpm store not initialised by a lane; using npm');
         plan = npm;
       }
     } else plan = npm;
@@ -309,7 +307,7 @@ export function depsJobsDir(root, env = process.env) {
 /** The store directory (holding `node_modules/`) for a lockfile key, and whether it is complete. */
 export function depsStore(jobsDir, key) {
   const dir = join(snapshotsRoot(jobsDir), 'node-modules', key);
-  return { dir, complete: existsSync(join(dir, COMPLETE_MARKER)) && existsSync(join(dir, 'node_modules')) };
+  return { dir, complete: existsSync(join(dir, COMPLETE_MARKER)) && existsSync(join(dir, 'node_modules')) && storeStillValid(dir) };
 }
 
 /**

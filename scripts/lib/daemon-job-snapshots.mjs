@@ -99,6 +99,21 @@ export function npmCiInstaller({ timeoutMs = NPM_INSTALL_TIMEOUT_MS } = {}) {
   };
 }
 
+/** Read-only reuse check: historical/npm stores are retained; pnpm evidence must still match and resolve. */
+export function storeStillValid(dir) {
+  let marker;
+  try { marker = readFileSync(join(dir, DEPS_MARKER_FILE), 'utf8').trim(); }
+  catch (error) {
+    // Historical stores have no marker. Other read failures are incomplete evidence.
+    return error.code === 'ENOENT';
+  }
+  if (!marker.startsWith('pnpm:')) return true;
+  try {
+    return markerMatches(marker, lockHash(dir, 'pnpm', resolvePnpmStoreDir()), 'pnpm')
+      && !hasDanglingTopLevelLink(join(dir, 'node_modules'));
+  } catch { return false; }
+}
+
 /**
  * The `node_modules` store for the lockfile in `sourceDir`, built on first use.
  * @param {{jobsDir: string, sourceDir: string, install?: (into: string) => void}} o
@@ -109,21 +124,8 @@ export function ensureNodeModulesStore({ jobsDir, sourceDir, install = npmCiInst
   const key = lockfileKey(lock);
   const dir = join(snapshotsRoot(jobsDir), 'node-modules', key);
   mkdirSync(join(snapshotsRoot(jobsDir), 'node-modules'), { recursive: true });
-  if (existsSync(join(dir, COMPLETE_MARKER))) {
-    let marker;
-    try { marker = readFileSync(join(dir, DEPS_MARKER_FILE), 'utf8').trim(); }
-    catch (error) {
-      // Historical stores have no marker. An unreadable marker is incomplete evidence.
-      if (error.code !== 'ENOENT') rmSync(dir, { recursive: true, force: true });
-    }
-    if (marker?.startsWith('pnpm:')) {
-      let ready = false;
-      try {
-        ready = markerMatches(marker, lockHash(dir, 'pnpm', resolvePnpmStoreDir()), 'pnpm')
-          && !hasDanglingTopLevelLink(join(dir, 'node_modules'));
-      } catch { /* Unreadable install inputs invalidate the completed store. */ }
-      if (!ready) rmSync(dir, { recursive: true, force: true });
-    }
+  if (existsSync(join(dir, COMPLETE_MARKER)) && !storeStillValid(dir)) {
+    rmSync(dir, { recursive: true, force: true });
   }
   buildOnce(dir, (into) => {
     copyFileSync(join(sourceDir, 'package.json'), join(into, 'package.json'));

@@ -103,7 +103,7 @@ export function rebuildJobsDir(root, env = process.env) {
   return daemonJobsDir(`rebuild-${cloneKey(root)}`, env);
 }
 
-/** Snapshot installer: script-free pnpm with verified native artifacts, else the clone/npm path. */
+/** Snapshot installer: script-free pnpm with a lane-initialised store and verified native artifacts, else clone/npm. */
 export function cloneNodeModulesInstaller(sourceRoot, { exec = execFileSync, fallback = npmCiInstaller(), pnpm = {} } = {}) {
   const legacy = (into) => {
     const src = join(sourceRoot, 'node_modules');

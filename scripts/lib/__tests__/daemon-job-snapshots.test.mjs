@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-  codeRef, ensureCodeSnapshot, ensureNodeModulesStore, evictSnapshots, linkNodeModules, lockfileKey, nodeModulesRef, snapshotsRoot,
+  codeRef, ensureCodeSnapshot, ensureNodeModulesStore, evictSnapshots, linkNodeModules, lockfileKey, nodeModulesRef, snapshotsRoot, storeStillValid,
 } from '../daemon-job-snapshots.mjs';
 
 import { ensureStoreGeneration, lockHash, markerMatches, hasDanglingTopLevelLink } from '../lane-deps-installer.mjs';
@@ -88,6 +88,22 @@ describe('node_modules stores', () => {
     });
     return { sourceDir, storeDir, target, initial, install };
   }
+
+  it.each(['valid pnpm', 'generation changed', 'dangling link', 'npm', 'no marker', 'unreadable marker'])('read-only shared store validation: %s', (reason) => {
+    const f = completedStore(reason === 'npm' ? 'npm' : reason === 'no marker' ? null : 'pnpm');
+    if (reason === 'generation changed') {
+      rmSync(f.storeDir, { recursive: true });
+      ensureStoreGeneration(f.storeDir);
+      mkdirSync(f.target);
+    } else if (reason === 'dangling link') rmSync(f.target, { recursive: true });
+    else if (reason === 'unreadable marker') {
+      rmSync(join(f.initial.dir, '.we-deps-marker'));
+      mkdirSync(join(f.initial.dir, '.we-deps-marker'));
+    }
+    expect(storeStillValid(f.initial.dir)).toBe(['valid pnpm', 'npm', 'no marker'].includes(reason));
+    expect(existsSync(join(f.initial.dir, 'old-store-sentinel'))).toBe(true);
+    expect(f.install).not.toHaveBeenCalled();
+  });
 
   it.each(['generation changed', 'pnpm lock changed', 'dangling link'])('rebuilds a completed pnpm store exactly once: %s', (reason) => {
     const f = completedStore();

@@ -6,7 +6,7 @@
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
-  existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -27,7 +27,7 @@ import { lockfileKey } from '../daemon-job-snapshots.mjs';
 
 const tmp = [];
 const mk = (p) => { const d = mkdtempSync(join(tmpdir(), p)); tmp.push(d); return d; };
-afterEach(() => { while (tmp.length) rmSync(tmp.pop(), { recursive: true, force: true }); });
+afterEach(() => { vi.unstubAllEnvs(); while (tmp.length) rmSync(tmp.pop(), { recursive: true, force: true }); });
 
 const SHA = 'a'.repeat(40);
 function fixture({ lock = '{"lockfileVersion":3,"v":2}' } = {}) {
@@ -45,10 +45,11 @@ function fixture({ lock = '{"lockfileVersion":3,"v":2}' } = {}) {
 const noReattach = vi.fn(async () => ({ actions: [] }));
 
 describe('pnpmAwareInstaller — snapshot dependency backend', () => {
-  function setup() {
+  function setup(initialised = true) {
     const sourceRoot = mk('deps-pnpm-source-');
     const into = mk('deps-pnpm-snapshot-');
     const storeDir = join(mk('deps-pnpm-store-'), 'store');
+    if (initialised) ensureStoreGeneration(storeDir);
     for (const dir of [sourceRoot, into]) {
       writeFileSync(join(dir, 'package.json'), '{"name":"snapshot","version":"1.0.0"}');
       writeFileSync(join(dir, 'package-lock.json'), '{"lockfileVersion":3}');
@@ -79,7 +80,7 @@ describe('pnpmAwareInstaller — snapshot dependency backend', () => {
     expect(markerMatches(marker, hash, backend)).toBe(true);
   }
 
-  it('chooses usable pnpm, copies its inputs, and ensures the store generation before installing', () => {
+  it('chooses usable pnpm, copies its inputs, and reads the lane-initialised store generation', () => {
     const f = setup();
     pnpmAwareInstaller(f)(f.into);
     expect(installs(f)).toEqual([['pnpm', ['install', '--frozen-lockfile', `--store-dir=${f.storeDir}`, '--ignore-scripts'], expect.objectContaining({ cwd: f.into })]]);
@@ -168,8 +169,8 @@ describe('pnpmAwareInstaller — snapshot dependency backend', () => {
     expectMarker(f, 'pnpm');
   });
 
-  it('uses legacy when the store generation cannot be ensured', () => {
-    const f = setup();
+  it('uses legacy when the store generation is unreadable', () => {
+    const f = setup(false);
     writeFileSync(f.storeDir, 'a file cannot be a store directory');
     pnpmAwareInstaller(f)(f.into);
     expect(installs(f)).toEqual([]);
@@ -177,6 +178,26 @@ describe('pnpmAwareInstaller — snapshot dependency backend', () => {
     expect(f.legacy).toHaveBeenCalledWith(f.into);
     expect(logged(f, 'backend=npm')).toBe(true);
     expectMarker(f, 'npm');
+  });
+
+  it.each(['absent store', 'missing generation', 'invalid generation'])('uses legacy without writing the shared store: %s', (reason) => {
+    const f = setup(false);
+    if (reason !== 'absent store') mkdirSync(f.storeDir);
+    if (reason === 'invalid generation') writeFileSync(join(f.storeDir, '.we-lane-store-generation'), 'invalid');
+    const before = reason === 'absent store' ? null : statSync(f.storeDir);
+    pnpmAwareInstaller(f)(f.into);
+    expect(installs(f)).toEqual([]);
+    expect(f.legacy).toHaveBeenCalledTimes(1);
+    expect(f.legacy).toHaveBeenCalledWith(f.into);
+    expect(f.log).toHaveBeenCalledWith('pnpm store not initialised by a lane; using npm');
+    expect(logged(f, 'backend=npm')).toBe(true);
+    expectMarker(f, 'npm');
+    if (before === null) expect(existsSync(f.storeDir)).toBe(false);
+    else {
+      expect(statSync(f.storeDir).mtimeMs).toBe(before.mtimeMs);
+      expect(readdirSync(f.storeDir)).toEqual(reason === 'invalid generation' ? ['.we-lane-store-generation'] : []);
+      if (reason === 'invalid generation') expect(readFileSync(join(f.storeDir, '.we-lane-store-generation'), 'utf8')).toBe('invalid');
+    }
   });
 
   it.each([false, true])('removes partial pnpm output and falls back exactly once; legacy failure=%s', (legacyFails) => {
@@ -237,6 +258,40 @@ describe('pnpmAwareInstaller — snapshot dependency backend', () => {
     expect(installs(f)).toHaveLength(1);
     expect(snapshot(f.storeDir)).toEqual(before);
     expectMarker(f, 'pnpm');
+  });
+});
+
+describe('depsStore — completed store validation', () => {
+  it.each(['generation changed', 'dangling link', 'valid pnpm', 'npm', 'no marker'])('reports completeness and queues stale stores: %s', async (reason) => {
+    const f = fixture();
+    const shared = join(mk('deps-shared-'), 'store');
+    vi.stubEnv('WE_PNPM_STORE_DIR', shared);
+    ensureStoreGeneration(shared);
+    const target = join(shared, 'package');
+    mkdirSync(target);
+    const { dir } = depsStore(f.jobs, f.key);
+    mkdirSync(join(dir, 'node_modules'), { recursive: true });
+    symlinkSync(target, join(dir, 'node_modules', 'package'), 'dir');
+    writeFileSync(join(dir, 'package-lock.json'), f.lock);
+    writeFileSync(join(dir, '.snapshot-complete'), 'done');
+    if (reason !== 'no marker') {
+      const backend = reason === 'npm' ? 'npm' : 'pnpm';
+      writeFileSync(join(dir, DEPS_MARKER_FILE), `${backend}:${lockHash(dir, backend, shared)}`);
+    }
+    if (reason === 'generation changed') {
+      rmSync(shared, { recursive: true });
+      ensureStoreGeneration(shared);
+      mkdirSync(target);
+    } else if (reason === 'dangling link') rmSync(target, { recursive: true });
+    const stale = ['generation changed', 'dangling link'].includes(reason);
+    expect(depsStore(f.jobs, f.key)).toEqual({ dir, complete: !stale });
+    if (stale) {
+      const swap = vi.fn();
+      expect(await refreshDepsAsJob({ root: f.root, installed: f.installed, store: f.store, reattach: noReattach, swap, codeSha: SHA })).toMatchObject({ reason: 'deps-job-started' });
+      expect(swap).not.toHaveBeenCalled();
+      expect(f.store.list().records).toHaveLength(1);
+      expect(f.installed.write).not.toHaveBeenCalled();
+    }
   });
 });
 

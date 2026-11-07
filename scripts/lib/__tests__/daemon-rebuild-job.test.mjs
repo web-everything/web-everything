@@ -22,7 +22,7 @@ import {
   resolveRebuildAsJob, rebuildCloneAsJob, rebuildChildArgs, parseRebuildChildOutput, REBUILD_JOB_KIND, RESULT_SUFFIX,
   cloneNodeModulesInstaller,
 } from '../daemon-rebuild/rebuild-job.mjs';
-import { lockHash, markerMatches } from '../lane-deps-installer.mjs';
+import { lockHash, markerMatches, ensureStoreGeneration } from '../lane-deps-installer.mjs';
 import { readRebuildStarvation, writeRebuildStarvation } from '../daemon-rebuild/lease.mjs';
 import * as rebuildLease from '../daemon-rebuild/lease.mjs';
 import { createJobStore, enqueueJob } from '../daemon-jobs-runtime.mjs';
@@ -93,10 +93,11 @@ afterEach(() => {
 });
 
 describe('cloneNodeModulesInstaller — pnpm snapshot routing', () => {
-  function setup() {
+  function setup(initialised = true) {
     const sourceRoot = mktemp('we-rebuild-pnpm-source-');
     const into = mktemp('we-rebuild-pnpm-snapshot-');
     const storeDir = join(mktemp('we-rebuild-pnpm-store-'), 'store');
+    if (initialised) ensureStoreGeneration(storeDir);
     for (const dir of [sourceRoot, into]) {
       writeFile(dir, 'package.json', '{"name":"snapshot","version":"1.0.0"}');
       writeFile(dir, 'package-lock.json', '{"lockfileVersion":3}');
@@ -121,6 +122,18 @@ describe('cloneNodeModulesInstaller — pnpm snapshot routing', () => {
     expect(markerMatches(marker, hash, backend)).toBe(true);
     expect(f.pnpm.log.mock.calls.some(([line]) => String(line).includes(`backend=${backend}`))).toBe(true);
   }
+
+  it('uses the legacy clone path without creating an absent shared pnpm store', () => {
+    const f = setup(false);
+    cloneNodeModulesInstaller(f.sourceRoot, f)(f.into);
+    expect(installs(f)).toEqual([]);
+    expect(f.exec).toHaveBeenCalledTimes(1);
+    expect(f.exec).toHaveBeenCalledWith('cp', ['-cR', join(f.sourceRoot, 'node_modules'), join(f.into, 'node_modules')], expect.any(Object));
+    expect(f.fallback).not.toHaveBeenCalled();
+    expect(f.pnpm.log).toHaveBeenCalledWith('pnpm store not initialised by a lane; using npm');
+    expect(existsSync(f.pnpm.storeDir)).toBe(false);
+    expectMarker(f, 'npm');
+  });
 
   it('routes a matching snapshot with a pnpm lock through pnpm and writes its marker', () => {
     const f = setup();
