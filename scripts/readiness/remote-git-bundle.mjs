@@ -114,8 +114,8 @@ const SIGNATURE_ARMOR = /-----(?:BEGIN|END) (?:PGP SIGNATURE|SSH SIGNATURE|SIGNE
 const bytes = (value) => Buffer.isBuffer(value) ? value : Buffer.from(value ?? '');
 
 /**
- * R559: scan every blob a bundle of `prerequisite..head` (or the whole history when `prerequisite` is null)
- * would carry. Path policy is the manifest's own exclusion policy; content uses its raw token patterns.
+ * R559: scan every bundled commit's additions beyond the prerequisite tree (or the whole history when it is null).
+ * Path policy is the manifest's own exclusion policy; content uses its raw token patterns.
  * Returns the first {path, finding} or null; throws bundle-credential-scan-too-large instead of skipping.
  */
 export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs = 20000, maxTotalBytes = 128 * 1024 * 1024 }) {
@@ -128,13 +128,46 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
   if (shallow.code !== 0 || bytes(shallow.stdout).toString('utf8').trim() !== 'false') throw bundleError('bundle-credential-scan-failed', 'shallow-repository');
   const graftPath = await git(['rev-parse', '--git-path', 'info/grafts']);
   if (graftPath.code !== 0 || existsSync(resolve(cwd, bytes(graftPath.stdout).toString('utf8').trim()))) throw bundleError('bundle-credential-scan-failed', 'grafts-file');
+  const prerequisiteEntries = new Set();
+  if (prerequisite) {
+    let tree;
+    try { tree = await git(['ls-tree', '-r', '-t', '-z', '--full-tree', prerequisite]); }
+    catch { throw bundleError('bundle-credential-scan-failed'); }
+    if (tree.code !== 0 || tree.stdout == null) throw bundleError('bundle-credential-scan-failed');
+    const out = bytes(tree.stdout);
+    if (out.length && out.at(-1) !== NUL) throw bundleError('bundle-credential-scan-failed');
+    for (const entry of splitNul(out)) {
+      const tab = entry.indexOf(9);
+      const meta = entry.subarray(0, tab).toString('ascii');
+      const match = /^[0-7]{6} (?:blob|tree|commit) ([0-9a-f]{40}(?:[0-9a-f]{24})?)$/.exec(meta);
+      if (tab < 0 || !match || tab === entry.length - 1) throw bundleError('bundle-credential-scan-failed');
+      prerequisiteEntries.add(`${entry.subarray(tab + 1).toString('latin1')}\0${meta.slice(0, 6)}\0${match[1]}`);
+    }
+  }
+  // Enumerate the full bundled ancestry: a merged branch can add and delete a credential
+  // before its merge, leaving no trace in the merge's first-parent diff.
+  const revs = await git(['rev-list', '--root', range]);
+  // Missing or unterminated output is unknown evidence, never an empty range (which would skip all scanning).
+  if (revs.code !== 0 || revs.stdout == null) throw bundleError('bundle-credential-scan-failed');
+  const revText = bytes(revs.stdout).toString('utf8');
+  if (revText && !revText.endsWith('\n')) throw bundleError('bundle-credential-scan-failed');
+  const commits = revText.split('\n').filter(Boolean);
+  if (commits.length > maxBlobs) throw bundleError('bundle-credential-scan-too-large');
+  if (commits.some(sha => !REVISION.test(sha))) throw bundleError('bundle-credential-scan-failed');
   // -t lists tree (directory) entries too: without it an EMPTY subtree entry (crafted with mktree) has no file below it
   // and never shows up, yet its name travels in the pack.
-  const log = await git(['log', '--raw', '-t', '--ignore-submodules=none', '-z', '--no-renames', '--no-abbrev', '--root', '--diff-merges=separate', '--no-relative', '--no-ext-diff', '--no-textconv', '--no-show-signature', '--diff-filter=d', '--format=', range]);
-  if (log.code !== 0) throw bundleError('bundle-credential-scan-failed');
+  // Keep the separate-diff default for full bundles. Incremental scans explicitly visit ALL
+  // bundled commits without walking, diffing each merge against parent 1. Thus both side-branch
+  // history and merge resolutions remain visible, independent of user config.
+  let log;
+  try {
+    log = prerequisite && !commits.length ? { code: 0, stdout: Buffer.alloc(0) }
+      : await git(['log', '--raw', '-t', '--ignore-submodules=none', '-z', '--no-renames', '--no-abbrev', '--root', '--diff-merges=separate', ...(prerequisite ? ['--first-parent', '--diff-merges=first-parent', '--no-walk=unsorted'] : []), '--no-relative', '--no-ext-diff', '--no-textconv', '--no-show-signature', '--diff-filter=d', '--format=', ...(prerequisite ? commits : [range])]);
+  } catch { throw bundleError('bundle-credential-scan-failed'); }
+  if (log.code !== 0 || log.stdout == null) throw bundleError('bundle-credential-scan-failed');
   // Commit messages (and author/committer identity lines) travel in the pack too. Tags are not bundled: only the pinned ref is.
   const messages = await git(['log', '-z', '--root', '--format=%an%n%ae%n%cn%n%ce%n%B', range]);
-  if (messages.code !== 0) throw bundleError('bundle-credential-scan-failed');
+  if (messages.code !== 0 || messages.stdout == null) throw bundleError('bundle-credential-scan-failed');
   for (const message of splitNul(bytes(messages.stdout))) {
     // Same scanner as blobs (secret assignments included); a message is plain text.
     let finding = credentialTextFinding(message.toString('latin1')) ?? credentialTextFinding(message.toString('utf8'));
@@ -143,10 +176,6 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
   }
   // The formatted log above shows only author/committer/message. Extended headers (multiline gpgsig, mergetag, encoding, ...)
   // also travel in the pack, so scan the COMPLETE raw object of every commit in the range.
-  const revs = await git(['rev-list', '--root', range]);
-  if (revs.code !== 0) throw bundleError('bundle-credential-scan-failed');
-  const commits = bytes(revs.stdout).toString('utf8').split('\n').filter(Boolean);
-  if (commits.length > maxBlobs) throw bundleError('bundle-credential-scan-too-large');
   if (commits.length) {
     const commitCheck = await git(['cat-file', '--batch-check=%(objectname) %(objecttype) %(objectsize)'], commits.join('\n') + '\n');
     if (commitCheck.code !== 0) throw bundleError('bundle-credential-scan-failed');
@@ -191,7 +220,7 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
   for (let i = 0; i < tokens.length; i++) {
     const meta = tokens[i].toString('latin1');
     if (!meta) continue; // only a bare separator between commits may be skipped; any other token must be a header or its path
-    // Fail closed: --diff-merges=separate emits exactly ":old new oldsha newsha status". A combined header ("::", several old
+    // Fail closed: separate and first-parent merge diffs emit ":old new oldsha newsha status". A combined header ("::", several old
     // modes/hashes) means the config-independent invocation was not honoured; never parse it as an ordinary diff.
     // A token that is not a header (and was not consumed as a path below) is unknown output: refuse, never skip.
     const fields = meta.split(' ');
@@ -200,6 +229,8 @@ export async function scanBundleRange({ cwd, head, prerequisite, exec, maxBlobs 
     const [, newMode, , newSha] = fields;
     const path = tokens[++i];
     if (!path) throw bundleError('bundle-credential-scan-failed');
+    // A mode-only change can turn public regular-file bytes into a prohibited symlink.
+    if (prerequisiteEntries.has(`${path.toString('latin1')}\0${newMode}\0${newSha}`)) continue;
     const label = path.toString('utf8');
     if (newMode === '160000' || newMode === '120000') return { path: label, finding: newMode === '160000' ? 'gitlink' : 'symlink' };
     // Tree entries (file AND directory names) travel in the pack: a token in a name is a leak whatever the blob holds.

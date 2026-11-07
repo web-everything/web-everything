@@ -11,6 +11,8 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawn } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import {
   classifyPrOpenFailure,
   correlateCause,
@@ -426,6 +428,28 @@ describe('fs roundtrip — atomic write, tolerant read, idempotent record-IO', (
     expect(ran).toBe(true);
     expect(existsSync(stale)).toBe(false);
   });
+
+  it('withInfraLock keeps mutual exclusion across processes — a waiter never unlinks a lock another process just took', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'ib-fs-'));
+    const path = join(dir, '.conveyor', 'store.json');
+    const libUrl = pathToFileURL(join(process.cwd(), 'scripts/conveyor/infra-blocked.mjs')).href;
+    const procs = 8; const perProc = 60;
+    const code = `import { withInfraLock } from ${JSON.stringify(libUrl)};
+      import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+      const p = ${JSON.stringify(path)};
+      for (let i = 0; i < ${perProc}; i++) withInfraLock(p, () => {
+        const a = existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : [];
+        a.push(1); writeFileSync(p, JSON.stringify(a));
+      }, { requireLock: true });`;
+    await Promise.all(Array.from({ length: procs }, () => new Promise((done, fail) => {
+      const child = spawn(process.execPath, ['--input-type=module', '-e', code]);
+      let stderr = '';
+      child.stderr.on('data', (d) => { stderr += d; });
+      child.on('error', fail);
+      child.on('close', (status) => (status === 0 ? done() : fail(new Error(stderr))));
+    })));
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toHaveLength(procs * perProc);
+  }, 120_000);
 
   it('mutateInfraStore re-reads the CURRENT on-disk store (no stale snapshot) then applies the transform', () => {
     dir = mkdtempSync(join(tmpdir(), 'ib-fs-'));
