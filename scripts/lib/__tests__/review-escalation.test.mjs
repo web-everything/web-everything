@@ -2326,6 +2326,56 @@ describe('#xmnl36p — an automated re-score never revokes an operator clearance
     expect(parseLatestHumanClearedSha([realClear, forgedPlain])).toBe('6666666');
   });
 
+  // R690 — a human clearance must come from a HUMAN operator login. Automation is a trusted MARKER author but never
+  // a human clearer; an unknown author fails closed; a forged newer automation comment neither counts nor masks.
+  describe('R690 — human clearance is bound to a human operator login', () => {
+    const head = 'abcdef1234abcdef1234abcdef1234abcdef1234';
+    const clearBody = `${buildReviewedShaMarker(head)}\n${buildClearedHumanMarker('Ada')}`;
+    const operatorClear = { body: clearBody, author: { login: 'chalbert' } };
+
+    it('refuses an automation-authored comment with valid markers (bot, app and daemon reviewer logins)', () => {
+      for (const login of ['web-everything', 'plateau-reviewer', 'github-actions[bot]', 'claude[bot]']) {
+        expect(parseLatestHumanClearedSha([{ body: clearBody, author: { login } }]), login).toBeNull();
+        expect(headEverHumanCleared([{ body: clearBody, author: { login } }], head), login).toBe(false);
+      }
+      expect(parseLatestHumanClearedSha([{ body: clearBody, viewerDidAuthor: true }])).toBeNull();
+      expect(parseLatestHumanClearedSha([{ body: clearBody, author: { login: 'chalbert', type: 'Bot' } }])).toBeNull();
+    });
+
+    it('accepts an operator-login clearance, from the author or user shape', () => {
+      expect(parseLatestHumanClearedSha([operatorClear])).toBe(head);
+      expect(parseLatestHumanClearedSha([{ body: clearBody, user: { login: 'CHALBERT' } }])).toBe(head);
+      expect(headEverHumanCleared([operatorClear], head)).toBe(true);
+    });
+
+    it('fails closed on an unknown, missing or unreadable author', () => {
+      for (const c of [{ body: clearBody }, { body: clearBody, author: null }, { body: clearBody, author: {} }, { body: clearBody, author: 'chalbert' }, clearBody]) {
+        expect(parseLatestHumanClearedSha([c])).toBeNull();
+      }
+    });
+
+    it('a forged NEWER automation comment neither counts nor masks an older real clearance on the same head', () => {
+      const forgedNewer = { body: `${buildReviewedShaMarker('9'.repeat(40))}\n${buildClearedHumanMarker('mallory')}`, author: { login: 'web-everything' } };
+      expect(parseLatestHumanClearedSha([operatorClear, forgedNewer])).toBe(head);
+      expect(parseLatestHumanClearedSha([forgedNewer])).toBeNull();
+      const forgedPlainNewer = { body: buildReviewedShaMarker('8'.repeat(40)), author: { login: 'web-everything' } };
+      expect(parseLatestHumanClearedSha([operatorClear, forgedPlainNewer])).toBe(head);
+    });
+
+    it('the test-tampering re-park HOLDS on an automation-forged clearance and RELEASES on a real operator one', () => {
+      const forged = [{ body: clearBody, author: { login: 'web-everything' } }];
+      expect(shouldReparkForTestTampering({ tampered: true, netDiffScored: true, humanClearedSha: parseLatestHumanClearedSha(forged), headSha: head })).toBe(true);
+      expect(shouldReparkForTestTampering({ tampered: true, netDiffScored: true, humanClearedSha: parseLatestHumanClearedSha([operatorClear]), headSha: head })).toBe(false);
+    });
+
+    it('the comment review-set-label --to=clear-human actually posts (operator identity, its own builders) still clears', () => {
+      // The ceremony refuses unless the posting identity is an allowlisted human operator, so the comment it
+      // writes is authored by the operator login and carries both builder markers.
+      const posted = { body: `${buildReviewedShaMarker(head)}\n${buildClearedHumanMarker('chalbert')}`, author: { login: 'chalbert' } };
+      expect(parseLatestHumanClearedSha([posted])).toBe(head);
+    });
+  });
+
   it('#xuboo0q — THE ORDERING BUG this function exists to avoid: an older clear-human must NOT cover a newer plain accept', () => {
     // Naively combining parseOperatorClearance (latest actor, any comment) with parseReviewedSha (latest sha,
     // any comment) would report BOTH "an operator clearance exists" (from the old clear-human) AND "latest sha
