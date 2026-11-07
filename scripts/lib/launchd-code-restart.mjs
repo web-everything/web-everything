@@ -698,7 +698,11 @@ export async function restartServicesForClone({ settings, platform, env = proces
         if (!Number.isInteger(id) || id < 0) throw new Error('unreadable uid');
         // Record intent BEFORE kickstart: process death or launchctl failure must not
         // erase the cooldown. A failed write refuses the restart and requires inspection.
-        await stateStore.set(label, { at, sha: adoptedSha });
+        // The state holds one marker per label: another clone's owed restart rides through our successful
+        // restart untouched (only a marker this clone owns, or a legacy rootless one, is consumed here).
+        const carried = previous?.pendingSha !== undefined && previous.pendingRoot !== undefined && previous.pendingRoot !== options.cloneRoot
+          ? { pendingSha: previous.pendingSha, pendingRoot: previous.pendingRoot, pendingGen: previous.pendingGen } : {};
+        await stateStore.set(label, { at, sha: adoptedSha, ...carried });
         phase = 'launch';
         assertActive(signal);
         // No mid-write signal exists. kickstart -k is the operator's proven operation for

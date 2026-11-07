@@ -1307,6 +1307,22 @@ describe('interpreter option shapes that once hid a clone script (value contains
       expect(r.flagged).toEqual([expect.objectContaining({ reason: expect.stringMatching(/restart-owed-by-other-clone/) })]);
       expect(o.states.get(label)).toEqual(bMarker);
     });
+    it("clone A's successful restart never erases clone B's owed marker", async () => {
+      const clock = { t: 1_000_000 }, o = cooled(clock), cloneB = resolve('..', 'clone-b');
+      o.states.set(label, { at: 1_000_000, sha: 'X', pendingSha: 'B1', pendingRoot: cloneB, pendingGen: 'g1' });
+      clock.t += 600_000; // cooldown passed: A restarts for A1
+      const r = await restartServicesForClone({ ...o, adoptedSha: 'A1' });
+      expect(r.restarted).toHaveLength(1);
+      expect(o.states.get(label)).toEqual({ at: 1_600_000, sha: 'A1', pendingSha: 'B1', pendingRoot: cloneB, pendingGen: 'g1' });
+    });
+    it("clone A's successful restart still consumes A's own owed marker", async () => {
+      const clock = { t: 1_000_000 }, o = cooled(clock);
+      await restartServicesForClone({ ...o, adoptedSha: 'A' });
+      clock.t += 1000; await restartServicesForClone({ ...o, adoptedSha: 'B' });
+      clock.t += 600_000;
+      await restartServicesForClone({ ...o, adoptedSha: 'C' });
+      expect(o.states.get(label)).toEqual({ at: 1_601_000, sha: 'C' });
+    });
     it('cleanup still clears the marker it consumed (owner, sha, anchor and generation match)', async () => {
       const clock = { t: 1_000_000 }, o = cooled(clock);
       await restartServicesForClone({ ...o, adoptedSha: 'A' });
