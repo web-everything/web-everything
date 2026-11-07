@@ -175,6 +175,26 @@ describe('renderWorkerBrief', () => {
     expect(brief.slice(brief.indexOf('6. **One PR.**'), brief.indexOf('7. **Pre-push'))).toContain('verify ONCE at the end');
   });
 
+  it('puts a Codex audit requiring NOT WEAKENED between verify and open-pr (6a)', () => {
+    const brief = renderWorkerBrief(params);
+    const step = brief.slice(brief.indexOf('6. **One PR.**'), brief.indexOf('7. **Pre-push'));
+    const verify = step.indexOf('verify ONCE at the end');
+    const audit = step.indexOf('6a. **Codex audit.**');
+    const openPr = step.indexOf('operations/run.mjs open-pr');
+    expect(verify).toBeGreaterThan(-1);
+    expect(audit).toBeGreaterThan(verify);
+    expect(openPr).toBeGreaterThan(audit);
+    const text = step.slice(audit, openPr);
+    expect(text).toMatch(/node \S*scripts\/operations\/codex-audit\.mjs\S* --base=origin\/main --head=<40-hex sha of your lane HEAD>/);
+    expect(text).not.toContain('node scripts/operations/codex-audit.mjs');
+    expect(text).toContain('lane as the working directory');
+    expect(text).toContain('NOT WEAKENED');
+    expect(text).toContain('at most 2 repair rounds');
+    expect(text).toContain('do NOT open a PR; report the remaining findings');
+    expect(text).not.toContain('AUDIT: WEAKENED');
+    expect(text).toContain('verdict in your report');
+  });
+
   it('renders every standard section in order and the qualified scope in commands under the standard policy', () => {
     // Pin the standard: the live platform preference deliberately selects related tests.
     const policy = resolveBuildPolicy({ env: {}, tool: {}, platform: {} });
