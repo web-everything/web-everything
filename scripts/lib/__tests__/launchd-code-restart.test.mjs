@@ -105,6 +105,17 @@ describe('explicit label allowlist (operator route R673): no command-line parsin
     const r = await restartServicesForClone({ ...o, settings: { allowedLabels: [label] } });
     expect(r.skipped).toContainEqual({ label, reason: 'built-in-never' }); expect(o.launchctl).not.toHaveBeenCalled();
   });
+  it.each(['com.we.dev-server', 'com.we.my.vite.app', 'com.we.npm-start-x'])('dev-server labels match on whole segments: %s is never restarted', async label => {
+    const o = fixture([{ Label: label }]);
+    const r = await restartServicesForClone({ ...o, settings: { allowedLabels: [label] } });
+    expect(r.skipped).toContainEqual({ label, reason: 'built-in-never' }); expect(o.launchctl).not.toHaveBeenCalled();
+  });
+  it.each(['com.we.device-x', 'com.we.devops', 'com.we.activite', 'com.we.deviate'])('a listed label that only contains a dev word inside a longer word is restarted: %s', async label => {
+    const o = fixture([{ Label: label }]);
+    const r = await restartServicesForClone({ ...o, settings: { allowedLabels: [label] } });
+    expect(r.restarted).toEqual([expect.objectContaining({ label })]);
+    expect(o.launchctl).toHaveBeenCalledWith(['kickstart', '-k', `gui/501/${label}`]);
+  });
   it('the adopting daemon itself (selfLabel) is never restarted, even when listed', async () => {
     const o = fixture();
     const r = await restartServicesForClone({ ...o, selfLabel: sampler });

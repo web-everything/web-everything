@@ -149,8 +149,10 @@ function resolveRestartPolicy({ settings, platform, env, envValues, log }) {
 }
 // Why policy never restarts this label (null when it is restartable). Decided by the label ONLY, never by argv.
 // Independent of `enabled`. The name guard keeps a dev server out even if one were ever listed by mistake.
+// Matched on whole label segments (split at . _ -), so `com.we.dev-server` is a dev server but `com.we.device-x` is not.
+const DEV_LABEL = /(?:^|[._-])(?:dev|vite|storybook|playground|npm-start)(?:[._-]|$)/i;
 const neverRestartReason = (label, p) =>
-  /dev|vite|storybook|playground|npm-start/i.test(label) ? 'built-in-never'
+  DEV_LABEL.test(label) ? 'built-in-never'
   : !p.allowedLabels.includes(label) ? 'not-allowlisted' : null;
 
 // Labels of managed-namespace LaunchAgents that are not on the allowlist (label read only; nothing else in a plist is looked at).
