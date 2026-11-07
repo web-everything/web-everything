@@ -1241,6 +1241,41 @@ describe('runSessionWatchdogPass — reaping with hermetic IO', () => {
     expect(JSON.stringify({ actions, logs: calls.logs })).not.toContain('secret-');
   });
 
+  it.each(['finished', 'duplicate'])('a 240-minute fixing lease with a 30-minute heartbeat protects its %s holder in the strict snapshot', (mode) => {
+    const old = listing();
+    const keeper = listing({ id: 'keeper', sessionId: 'sid-keeper', startedAt: T0 - 60 * MIN });
+    const tail = mode === 'finished' ? finishedTail() : summarizeTail(bash('git status --short', T0 - 15 * MIN), { nowMs: T0 });
+    const { calls, actions } = base({
+      agents: mode === 'finished' ? [old] : [old, keeper], readTail: () => tail,
+      claimStoreReadable: () => true, listDispatchClaims: undefined,
+      readClaimDirectory: () => ['long-lease'], readClaimEntry: () => JSON.stringify({
+        owner: 'holder', heartbeatAt: new Date(T0 - 30 * MIN).toISOString(),
+        meta: { repo: 'we', pr: 3771, kind: 'fixing', ttlMinutes: 240, sessionId: old.sessionId, who: old.name },
+      }),
+    });
+    expect(calls.stop).toEqual([]);
+    expect(calls.reapEvents).toEqual([]);
+    expect(actions).toEqual([]);
+  });
+
+  it.each([
+    ['sessionId', 42], ['sessionId', ''], ['sessionId', '  '], ['sessionId', null],
+    ['who', 42], ['who', ''], ['who', '  '], ['who', null], ['name', 42],
+  ])('malformed claim holder identity %s=%s refuses stops and names only the entry', (field, value) => {
+    const { calls, actions } = base({
+      claimStoreReadable: () => true, listDispatchClaims: undefined,
+      readClaimDirectory: () => ['bad-identity'], readClaimEntry: () => JSON.stringify({
+        owner: 'secret-owner', heartbeatAt: new Date(T0).toISOString(),
+        meta: { repo: 'we', pr: 3771, kind: 'fix', who: 'another-name', [field]: value },
+      }),
+    });
+    expect(calls.stop).toEqual([]);
+    expect(calls.reapEvents).toEqual([]);
+    expect(actions).toEqual([expect.objectContaining({ detail: 'refused: claim store unreadable' })]);
+    expect(calls.logs.some(line => line.includes('bad-identity/lock.json'))).toBe(true);
+    expect(calls.logs.join(' ')).not.toContain('secret-owner');
+  });
+
   it('report-only plans the stop with ok:null and never calls stop or appends a reap event', () => {
     const { calls, actions } = base({ act: false });
     expect(actions).toEqual([expect.objectContaining({ type: 'stop-session', ok: null })]);

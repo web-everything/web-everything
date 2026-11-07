@@ -80,7 +80,7 @@ import { dispatchDemandMinutes } from '../readiness/heavy-queue-projection.mjs';
 import { readStandardMinutes, admissionLockRoot } from '../readiness/heavy-admission.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { listLiveFixClaims, releaseFixClaim, FIXING_KIND } from './fix-procedure.mjs';
-import { DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES, fixDispatchClaimRoot, fixDispatchSessionName } from './fix-claim-store.mjs';
+import { fixDispatchClaimRoot, fixDispatchSessionName } from './fix-claim-store.mjs';
 import { isLeaseExpired, parseLockEntry } from '../readiness/file-locks.mjs';
 import { awaitVerifyStoreDir, awaitVerifyStoreKey, classifyAwaitVerify, resolveAwaitVerifyPath, resolveAwaitVerifyTtlMs } from './await-verify.mjs';
 import { releaseSessionFixDispatchClaims } from './fix-dispatch-claim.mjs';
@@ -578,7 +578,7 @@ export function defaultClaimStoreReadable(readDirectory = readdirSync, readEntry
 
 /** Stop-only claim snapshot: validate the entries actually returned, rather than trusting a prior probe. */
 export function listStopDispatchClaims(root = fixDispatchClaimRoot(), {
-  readDirectory = readdirSync, readEntry = readFileSync, log = () => {}, liveOnly = false, nowMs = Date.now(),
+  readDirectory = readdirSync, readEntry = readFileSync, log = () => {},
 } = {}) {
   let entries;
   try { entries = readDirectory(root); }
@@ -594,12 +594,16 @@ export function listStopDispatchClaims(root = fixDispatchClaimRoot(), {
     const ttl = parsed?.meta?.ttlMinutes;
     const invalidTtl = parsed?.meta?.kind === FIXING_KIND && ttl !== undefined
       && (!Number.isFinite(Number(ttl)) || Number(ttl) <= 0);
-    if (!parsed || !parsed.meta?.repo || !parsed.meta?.pr || !parsed.meta?.kind || invalidHeartbeat || invalidTtl) {
+    const invalidIdentity = ['sessionId', 'who', 'name'].some((key) => parsed?.meta && Object.hasOwn(parsed.meta, key)
+      && (typeof parsed.meta[key] !== 'string' || !parsed.meta[key].trim()));
+    if (!parsed || !parsed.meta?.repo || !parsed.meta?.pr || !parsed.meta?.kind || invalidHeartbeat || invalidTtl || invalidIdentity) {
       // Quote the entry name to keep control characters inert; never log lock contents or read errors.
       log(`session-watchdog: claim store unreadable (${JSON.stringify(`${entry}/lock.json`)}); stops refused until a successful read`);
       throw new Error('claim store unreadable');
     }
-    if (!liveOnly || !isLeaseExpired(parsed, nowMs, DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES)) claims.push(parsed);
+    // The store has no per-entry liveness helper covering fixing TTLs. Retain every validated claim:
+    // a stale claim may delay a stop, but a private expiry rule must never discard a live holder.
+    claims.push(parsed);
   }
   return claims;
 }
