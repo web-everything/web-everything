@@ -848,3 +848,13 @@ describe('fileCard fails closed on missing dedupe evidence and unclassified degr
       .toMatchObject({ ok: true, ref: 'we:backlog/x1.md@pr9' });
   });
 });
+
+describe('fileCard refuses when the dedupe lookup itself throws', () => {
+  it('returns ok:false step dedupe and never lands', async () => {
+    const { landRulingCard } = await import('../record-referral-ruling-io.mjs');
+    const landPreventionCard = vi.fn();
+    const r = await landRulingCard({ title: 't' }, { dedupe: () => { throw new Error('open-PR card lookup failed'); }, landPreventionCard });
+    expect(r).toMatchObject({ ok: false, step: 'dedupe' });
+    expect(landPreventionCard).not.toHaveBeenCalled();
+  });
+});

@@ -1,7 +1,7 @@
 import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readFindingClassPolicy } from '../lib/finding-class-policy.mjs';
 import { landPreventionCard as defaultLandPreventionCard, runCardDedupe } from './land-prevention-card.mjs';
-import { loadCardDedupePolicy } from '../lib/card-dedupe.mjs';
+import { loadCardDedupePolicy, readPrHostedCards } from '../lib/card-dedupe.mjs';
 /**
  * @file scripts/operations/record-referral-ruling-io.mjs
  * @description The io binding of `record-referral-ruling` (#4979): reads the PR thread through `gh`, resolves the
@@ -183,12 +183,23 @@ export function readCardRulingFileMode({ env = process.env, tool, log = line => 
 
 /** Read-only dedupe first; new cards always use the existing isolated single-card landing path. */
 // Dedupe is forced ON for ruling cards whatever the repo-wide default says: this path must never file a duplicate.
-const rulingDedupe = (input, options) => runCardDedupe(input, { ...options,
+// A failed PR lookup (readPrHostedCards swallows it as []) must also refuse, never read as "no card exists".
+const strictPrCards = (dir) => {
+  let failure = null;
+  const cards = readPrHostedCards({ cwd: dir, exec: (cmd, args, opts) => {
+    try { return String(execFileSyncThrottled(cmd, args, opts)); } catch (error) { failure = error; throw error; }
+  } });
+  if (failure) throw new Error('open-PR card lookup failed');
+  return cards;
+};
+const rulingDedupe = (input, options) => runCardDedupe(input, { ...options, readPrCards: strictPrCards,
   loadPolicy: () => ({ ...loadCardDedupePolicy({ root: REPO_ROOT, env: process.env }), dedupe: true }) });
 
 export async function landRulingCard(input, { repo, pr, dedupe = rulingDedupe,
   landPreventionCard = defaultLandPreventionCard, ...landingOptions } = {}) {
-  const plan = await dedupe(input, { lane: REPO_ROOT });
+  let plan;
+  try { plan = await dedupe(input, { lane: REPO_ROOT }); }
+  catch (error) { return { ok: false, step: 'dedupe', reason: `duplicate-card check failed: ${String(error?.message ?? error).split('\n')[0]}; nothing filed` }; }
   if (plan?.action === 'mention' && plan.matches?.length) {
     const refs = plan.matches.map(({ card }) => {
       if (!card?.rel || (card.host !== 'main' && !card.host?.pr)) return null;
