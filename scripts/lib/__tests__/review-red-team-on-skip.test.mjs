@@ -127,7 +127,9 @@ describe('#6345 — resume a stored needs-human review after its refused referra
   it('fails closed: an older ruled run does not mask a newer same-head run that is not ruled', () => {
     const o = parkedFixture();
     const [ruledRun] = o.readReviewRuns();
-    o.readReviewRuns = vi.fn(() => [{ ...ruledRun, startedAt: 1 }, { ...ruledRun, id: 'review-pr-newer', startedAt: 2 }]);
+    // The newer run owes a key no referral record on this head carries, so it is genuinely unruled.
+    o.readReviewRuns = vi.fn(() => [{ ...ruledRun, startedAt: 1 },
+      { ...ruledRun, id: 'review-pr-newer', startedAt: 2, pending: [...ruledRun.pending, 'judge:unrecorded-newer-defect'] }]);
     expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
     expect(o.dispatch).not.toHaveBeenCalled();
   });
