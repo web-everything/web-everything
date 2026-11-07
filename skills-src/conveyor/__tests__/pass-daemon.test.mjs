@@ -454,7 +454,7 @@ describe('passSleepFor — event-driven wake for passes that declare an eventRol
   const clock = () => { let t = 1_000; return { now: () => t, rawSleep: async (ms) => { t += ms; } }; };
   const cfgEnv = { WE_PR_EVENTS: '1', WE_PR_EVENTS_URL: 'https://feed.example/events', WE_PR_EVENTS_TOKEN: 'tok' };
   const merged = { type: 'pull_request', action: 'closed', merged: true, repo: 'o/r', prs: [1] };
-  const base = (poll, extra = {}) => ({ env: cfgEnv, log: quiet, poll, ...clock(), ...extra });
+  const base = (poll, extra = {}) => ({ env: cfgEnv, log: quiet, poll, writeStatus: null, ...clock(), ...extra });
 
   it('a pass with a role wakes early on a matching event', async () => {
     const entry = { script: 'x.mjs', intervalMs: 300_000, eventRole: 'pr-merge-watch' };
