@@ -1,4 +1,5 @@
 ---
+bornAs: x172as9
 kind: story
 size: 3
 status: open

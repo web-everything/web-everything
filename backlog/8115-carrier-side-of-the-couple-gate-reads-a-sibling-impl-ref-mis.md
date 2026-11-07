@@ -1,15 +1,16 @@
 ---
+bornAs: xfz3rkl
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/conveyor/orphan-claim-release.mjs", "we:scripts/backlog.mjs"]
+scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lib/couple-cascade.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# orphan-claim-release reads open PRs with --limit 300 and never checks truncation, so a card named only by an …
+# Carrier side of the couple gate reads a sibling impl ref missing from the open-PR listing as 'landed' even wh…
 
-Flow-sim gap R8a-G3, class K17 (partial page read as complete). Failing input: More than 300 open WE PRs. Card 4459 is status:active, older than 48h, no lease, no live session. Its only open PR (lane/4459-foo) is not in the 300 rows returned. orphan-claim-release --apply runs Cited: we:scripts/conveyor/orphan-claim-release.mjs:397, we:scripts/conveyor/orphan-claim-release.mjs:406, we:scripts/conveyor/orphan-claim-release.mjs:199, we:scripts/conveyor/orphan-claim-release.mjs:203-204, we:scripts/backlog.mjs. Soak-break sketch: Fixture: 300 filler open PRs plus a 301st naming card 4459, card 4459 active and 3 days old, other signals empty-but-array. Action: planOrphanRelease with openPrs = first 300 rows. Assert (fails today): card is skipped as signal-unavailable/open-pr-window-unc…
+Flow-sim gap R7a-G2, class K17 (partial page read as complete). Failing input: Carrier we#9 manifest repos [{plateau-app, lane/x1},{we, lane/x1b}] (distinct refs, or same ref via the cascade check b). plateau-app has >= OPEN_PR_LIST_LIMIT open PRs so the listing is full-page, or its `gh pr list` threw (collectOpenPrContext returns {prs:[], failed:true}). The impl plateau-app#5 (head lane/x1, ready-to-merg… Cited: we:scripts/merge-ai-prs.mjs:2102-2115, we:scripts/merge-ai-prs.mjs:2089, we:scripts/lib/couple-cascade.mjs:95-99, we:scripts/merge-ai-prs.mjs:7284. Soak-break sketch: Fixture: seedCouple with distinct refs and a fake-gh `pr list --repo plateau-app` that throws (or returns exactly OPEN_PR_LIST_LIMIT rows without the impl). Action: one drain pass. Assertion that fails today: we carrier MERGED while plateau-app impl is OPEN; …
 
 ## Acceptance
 

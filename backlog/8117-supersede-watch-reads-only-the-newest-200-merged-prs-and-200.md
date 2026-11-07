@@ -1,15 +1,16 @@
 ---
+bornAs: xuj1xr3
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lib/couple-cascade.mjs"]
+scope: ["we:scripts/conveyor/supersede-watch.mjs", "we:scripts/conveyor/supersede-rule.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Carrier side of the couple gate reads a sibling impl ref missing from the open-PR listing as 'landed' even wh…
+# Supersede watch reads only the newest 200 merged PRs and 200 open PRs; absence is read as 'no marker' (cap an…
 
-Flow-sim gap R7a-G2, class K17 (partial page read as complete). Failing input: Carrier we#9 manifest repos [{plateau-app, lane/x1},{we, lane/x1b}] (distinct refs, or same ref via the cascade check b). plateau-app has >= OPEN_PR_LIST_LIMIT open PRs so the listing is full-page, or its `gh pr list` threw (collectOpenPrContext returns {prs:[], failed:true}). The impl plateau-app#5 (head lane/x1, ready-to-merg… Cited: we:scripts/merge-ai-prs.mjs:2102-2115, we:scripts/merge-ai-prs.mjs:2089, we:scripts/lib/couple-cascade.mjs:95-99, we:scripts/merge-ai-prs.mjs:7284. Soak-break sketch: Fixture: seedCouple with distinct refs and a fake-gh `pr list --repo plateau-app` that throws (or returns exactly OPEN_PR_LIST_LIMIT rows without the impl). Action: one drain pass. Assertion that fails today: we carrier MERGED while plateau-app impl is OPEN; …
+Flow-sim gap R9b-G3, class K17 (partial page read as complete). Failing input: Repo merges more than 200 PRs inside the lookback window (live PR numbers advance ~65/day), or has more than 200 open PRs. #B merged earlier with 'Supersedes: #A'; #A still open.' 'Every tick: defaultReadMergedPrs gets 200 newest, window filter applied after the cap; #B is not in the 200, so no marker is read. Open list capped … Cited: we:scripts/conveyor/supersede-watch.mjs:25, we:scripts/conveyor/supersede-rule.mjs:34, we:scripts/conveyor/supersede-rule.mjs:336-340. Soak-break sketch: fixture: readMergedPrs stub returning 200 unrelated merged rows newer than the marker row (marker row merged 5 days ago); openNumbers includes #A. action: runSupersedeWatch with a stub exec that honours --limit. assert holds contains {pr:A, by:B} - today empt…
 
 ## Acceptance
 
