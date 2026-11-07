@@ -1868,6 +1868,7 @@
   "scripts/conveyor/soak/breaks/ruling-rereview-spends-advisory-round.soak.test.mjs": 0.28,
   "scripts/conveyor/soak/breaks/scope-bloat-net-diff-deadlock.soak.test.mjs": 0.81,
   "scripts/conveyor/soak/breaks/superseded-pr-dispatched.soak.test.mjs": 0.76,
+  "scripts/conveyor/soak/breaks/fix-slots-skip-dead-awaits.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/takeover-void-cancels-later-retry.soak.test.mjs": 0.32,
   "scripts/conveyor/soak/breaks/refused-stage-pending-referrals-never-resume.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/red-team-stale-refusal-burns-start-slot.soak.test.mjs": 1.5,
