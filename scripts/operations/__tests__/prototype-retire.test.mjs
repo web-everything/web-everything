@@ -323,6 +323,82 @@ describe('planRetirements', () => {
   });
 });
 
+describe('planRetirements redundant merge siblings (fake git/gh)', () => {
+  const baseRef = 'lane/live';
+  const ref = `${baseRef}-m2`;
+  const baseTip = 'b'.repeat(40);
+  const tip = 'c'.repeat(40);
+  const unique = 'd'.repeat(40);
+  const mainTree = 'a'.repeat(40);
+  const fixture = ({ registered = true, contained = 0, state = 'OPEN', conflict = 1,
+    unreadableBase = false, unknownPr = false, mergeEdits = false, unreadableMerge = false, baseHead = baseRef, baseCross = false, row = {} } = {}) => {
+    const calls = [];
+    const git = (args) => {
+      calls.push(args);
+      const key = args.join(' ');
+      if (key === `rev-parse --verify --quiet refs/remotes/origin/${ref}^{commit}`) return { code: 0, stdout: tip };
+      if (key === `rev-parse --verify --quiet refs/remotes/origin/${baseRef}^{commit}`) return { code: unreadableBase ? 1 : 0, stdout: baseTip };
+      if (key === 'rev-parse --verify origin/main^{tree}') return { code: 0, stdout: mainTree };
+      if (args[0] === 'rev-list' && args[1] === '--no-merges') return { code: 0, stdout: unique };
+      if (args[0] === 'rev-list' && args[1] === '--merges') return { code: 0, stdout: args[2].endsWith(tip) ? tip : '' };
+      if (key === `rev-list --parents -n 1 ${tip}`) return { code: 0, stdout: `${tip} ${mainTree} ${unique}` };
+      if (key === `merge-tree --write-tree --no-messages ${mainTree} ${unique}`) return { code: unreadableMerge ? 128 : 0, stdout: 'e'.repeat(40) };
+      if (key === `rev-parse --verify ${tip}^{tree}`) return { code: 0, stdout: (mergeEdits ? 'f' : 'e').repeat(40) };
+      if (key === `merge-base --is-ancestor ${unique} ${baseTip}`) return { code: contained, stdout: '' };
+      if (args[0] === 'merge-tree' && args.at(-2) === 'origin/main') return { code: conflict, stdout: 'e'.repeat(40) };
+      return { code: 1, stdout: '' };
+    };
+    const stub = ghStub({ heads: { [baseRef]: { number: 7, state: 'OPEN' } },
+      views: unknownPr ? {} : { 8: { number: 8, state, headRefName: baseHead, isCrossRepository: baseCross } } });
+    const rows = [{ ref, pr: null, ...row }, ...(registered ? [{ ref: baseRef, pr: 8 }] : [])];
+    return { decision: planRetirements({ rows, git, gh: stub.gh, repo: 'web-everything/web-everything' })[0], calls };
+  };
+
+  it.each([
+    ['redundant sibling', {}, 'retire'],
+    ['sibling with a unique commit not in base', { contained: 1 }, 'keep'],
+    ['base not registered', { registered: false }, 'keep'],
+    ['base PR closed', { state: 'CLOSED' }, 'keep'],
+  ])('%s: %s => %s', (_label, options, action) => {
+    const { decision, calls } = fixture(options);
+    expect(decision).toMatchObject({ action, reason: action === 'retire' ? 'redundant-merge-sibling' : 'pr-open' });
+    if (action === 'retire') {
+      expect(decision.evidence).toMatchObject({ basePr: 8, baseRef, baseTip, cleanMerges: true });
+      expect(calls).toContainEqual(['merge-base', '--is-ancestor', unique, baseTip]);
+      expect(calls).not.toContainEqual(['merge-base', '--is-ancestor', tip, baseTip]);
+    }
+  });
+
+  it('keeps a sibling with unique merge-resolution edits despite identical non-merge ancestry in the base', () => {
+    expect(fixture({ mergeEdits: true }).decision).toMatchObject({
+      action: 'keep', reason: 'pr-open', evidence: { unique: 1, merges: 1, cleanMerges: false },
+    });
+  });
+
+  it('keeps a sibling whose merge content cannot be verified', () => {
+    expect(fixture({ unreadableMerge: true }).decision).toMatchObject({
+      action: 'keep', reason: 'pr-open', evidence: { cleanMerges: false },
+    });
+  });
+
+  it.each([
+    ['unreadable base tip', { unreadableBase: true }],
+    ['unknown base PR', { unknownPr: true }],
+    ['base registration pointing at an unrelated OPEN PR', { baseHead: 'lane/unrelated' }],
+    ['base registration whose PR has no head branch name', { baseHead: null }],
+    ['base registration whose same-named PR heads a fork', { baseCross: true }],
+    ['base registration whose PR does not say whether it is cross-repository', { baseCross: null }],
+    ['unreadable containment', { contained: 128 }],
+    ['clean merge onto main', { conflict: 0 }],
+    ['unreadable merge onto main', { conflict: 128 }],
+    ['own recorded PR', { row: { pr: 8 } }],
+    ['pinned sibling', { row: { pinned: true } }],
+    ['edge resolution', { row: { edgeResolution: { sha: tip } } }],
+  ])('keeps a sibling with %s', (_label, options) => {
+    expect(fixture(options).decision.action).toBe('keep');
+  });
+});
+
 describe('planFetchFailed (registration whose branch could not be fetched)', () => {
   const REPO = 'web-everything/web-everything';
   const OFF = 'f'.repeat(40);
