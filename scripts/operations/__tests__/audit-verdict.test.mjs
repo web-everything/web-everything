@@ -233,6 +233,21 @@ describe('R473 pure classified verdict', () => {
     // Control: the same finding outside the pattern ships.
     expect((await compute([d3('other/writers/save.mjs')], options('prerelease'), trustedLayer({ raceBlockPaths: ['custom/**/'] }))).verdict).toBe('NOT WEAKENED');
   });
+  // The same class (PR #6381 self-review): a pattern is cleaned up the way a path candidate is, so a leading ./ or /,
+  // a backslash, a doubled slash or surrounding whitespace never makes a protected pattern match nothing.
+  it('a protected pattern written with ./, /, \\, // or whitespace still protects its paths (PR #6381 self-review)', async () => {
+    for (const pattern of ['./custom/**', '/custom/**', 'custom\\**', 'custom//**', 'custom/** ', ' custom/**', './custom/', './/custom/**/', 'custom\\']) {
+      const race = await compute([d3('custom/writers/save.mjs')], options('prerelease'), trustedLayer({ raceBlockPaths: [pattern] }));
+      expect(race.verdict, pattern).toBe('WEAKENED');
+      const guard = await compute([finding({ class: 'E2', file: 'custom/writers/save.mjs' })], options('prerelease'), trustedLayer({ guardFloorPaths: [pattern] }));
+      expect(guard.verdict, pattern).toBe('WEAKENED');
+      expect((await compute([d3('other/writers/save.mjs')], options('prerelease'), trustedLayer({ raceBlockPaths: [pattern] }))).verdict, pattern).toBe('NOT WEAKENED');
+    }
+    // A pattern naming the repo root (`./`, `/`) protects every path.
+    for (const pattern of ['./', '/']) {
+      expect((await compute([d3('other/writers/save.mjs')], options('prerelease'), trustedLayer({ raceBlockPaths: [pattern] }))).verdict, pattern).toBe('WEAKENED');
+    }
+  });
   it('an E2 finding with guardFloorPaths [custom/**/] is WEAKENED (PR #6381 judge)', async () => {
     for (const pattern of ['custom/**/', 'custom/*/', 'custom/**//']) {
       const f = finding({ class: 'E2', file: 'custom/writers/save.mjs' });

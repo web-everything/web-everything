@@ -287,7 +287,8 @@ function rawMalformed(layer, key, valid) {
  * choice the cascade cannot see: it would read as omitted and earn the default. It fails that setting closed instead.
  * Other misspellings (`verdicts`) cannot be mapped to a setting; they are only named by `unknownKeys`.
  */
-const foldKey = s => s.normalize('NFKC').replace(/[\s\p{Default_Ignorable_Code_Point}]/gu, '').toLowerCase();
+// Control (Cc) and format (Cf) characters and the blank braille cell are invisible too (PR #6381 self-review).
+const foldKey = s => s.normalize('NFKC').replace(/[\s\p{Default_Ignorable_Code_Point}\p{Cc}\p{Cf}⠀]/gu, '').toLowerCase();
 function caseShadowed(layer, key) {
   if (!isObj(layer)) return false;
   const [a, b] = pathOf(key);
@@ -401,7 +402,8 @@ function resolveUnguarded({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync,
       const variantSeen = new Set();
       const shadowed = obj => {
         const keys = auditVariants(obj);
-        for (const k of keys) if (!variantSeen.has(k)) { variantSeen.add(k); warn(`audit platform preference key ${showKey(k)} is a variant of "audit"; the section is unreadable`); }
+        // At most 5 keys are named, each cut to 64 characters: the section fails closed whatever the count.
+        for (const k of keys) if (!variantSeen.has(k) && variantSeen.size < 5) { variantSeen.add(k); warn(`audit platform preference key ${showKey(k.slice(0, 64))} is a variant of "audit"; the section is unreadable`); }
         return keys.length > 0;
       };
       platUnreadable = before || configuredBad() || errors.length > 0 || (Object.hasOwn(prefs, 'audit') && prefs.audit === null) || shadowed(prefs);

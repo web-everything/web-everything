@@ -191,9 +191,18 @@ function pathCandidate(file) {
 }
 // Case-insensitive: the checkout may sit on a case-insensitive file system, where `Scripts/Guard-Bash.mjs` IS the guard.
 // Folding both sides only ever protects more paths. The candidates are computed once per path, not once per glob.
+// A pattern is cleaned up the way a path candidate is (PR #6381 self-review): surrounding whitespace trimmed, `\` read
+// as `/`, doubled slashes collapsed, leading `./` and `/` dropped. Otherwise `./custom/**` or `/custom/**` matched no
+// candidate and protected nothing. A pattern that cleans up to nothing (`./`, `/`) names the repo root: every path.
+const cleanPattern = p => {
+  let s = p.trim().replace(/\\/g, '/').replace(/\/{2,}/g, '/');
+  while (s.startsWith('./') || s.startsWith('/')) s = s.startsWith('./') ? s.slice(2) : s.slice(1);
+  return s === '' || s === '.' ? '**' : s.toLowerCase();
+};
 const matchesSome = (file, patterns) => {
-  const c = pathCandidates(file, anchorsOf(patterns))?.map(x => x.toLowerCase());
-  return c === undefined || patterns.some(p => c.some(x => matchesPath(x, p.toLowerCase())));
+  const clean = patterns.map(cleanPattern);
+  const c = pathCandidates(file, anchorsOf(clean))?.map(x => x.toLowerCase());
+  return c === undefined || clean.some(p => c.some(x => matchesPath(x, p)));
 };
 
 export function computeVerdict(findings, options = {}) {

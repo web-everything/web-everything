@@ -182,7 +182,9 @@ describe('audit settings (R528)', () => {
     // PR #6381 judge (R10): a platform key `Audit`, or `audit` with an invisible character, was ignored, so its stricter
     // preferences (releaseStage prod, protected paths) were dropped with no warning. It now fails closed.
     describe('a platform key that only normalises to "audit" fails closed (PR #6381 judge)', () => {
-      const variants = ['Audit', 'audit​', 'AUDIT', '​audit', 'au­dit', 'ａudit', ' audit'];
+      // Invisible control characters (DEL, C1 controls), format characters and the blank braille cell count too.
+      const variants = ['Audit', 'audit​', 'AUDIT', '​audit', 'au­dit', 'ａudit', ' audit',
+        'audit\u007f', 'audit\u0085', 'audit\u009f', 'audit⠀', 'audit؀'];
       const body = (key, extra = '') => `{${extra}${JSON.stringify(key)}:{"releaseStage":"prod","raceBlockPaths":["custom/**"]}}`;
       const fromChain = chain => resolveAuditSettings({ fileRead: file(full()), env: {}, platformRead: platformRead('', chain), log: () => {} });
       it.each(variants)('the default-chain platform key %j resolves strictest with a warning', key => {
