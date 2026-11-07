@@ -716,9 +716,34 @@ function wrapperPrefixLength(words) {
   while (i < words.length) {
     const w = words[i];
     if (/^[A-Za-z_]\w*=/.test(w)) { i += 1; continue; }                       // bare `FOO=1 <cmd>` assignment
+    if (/^(?:do|then|else|elif|if|while|until|!)$/.test(w)) { i += 1; continue; }
+    if (w === 'timeout' || w === 'gtimeout') {
+      i += 1;
+      while (i < words.length && words[i].startsWith('-')) {
+        const opt = words[i++];
+        if (/^(?:-s|-k|--signal|--kill-after)$/.test(opt)) i += 1;
+      }
+      i += 1; // duration
+      continue;
+    }
+    if (w === 'exec') {
+      i += 1;
+      while (i < words.length && words[i].startsWith('-')) {
+        const opt = words[i++];
+        if (opt === '-a') i += 1;
+        if (opt === '--') break;
+      }
+      continue;
+    }
     if (w === 'env') {                                                        // env VAR=val … <cmd>
       i += 1;
-      while (i < words.length && /^[A-Za-z_]\w*=/.test(words[i])) i += 1;
+      while (i < words.length) {
+        const opt = words[i];
+        if (opt === '--') { i += 1; break; }
+        if (opt === '-u' || opt === '--unset' || opt === '-C' || opt === '--chdir') { i += 2; continue; }
+        if (opt.startsWith('-') || /^[A-Za-z_]\w*=/.test(opt)) { i += 1; continue; }
+        break;
+      }
       continue;
     }
     if (w === 'time' || w === 'command' || w === 'builtin' || w === 'nice') { i += 1; continue; }
@@ -923,7 +948,8 @@ export function runnerInvocation(head) {
       if (RUNNER_CALL_FLAGS.has(flag)) {                       // the value IS a command line
         return { exec: eq === -1 ? (words[i + 1] ? words[i + 1].text : '') : w.slice(eq + 1) };
       }
-      if (eq === -1 && RUNNER_VALUE_FLAGS.has(flag)) i += 1;   // consume the flag's separate value word
+      // consume the flag's separate value word (npm's own `--tag x` too, so the value `x` is never `npm x`)
+      if (eq === -1 && (RUNNER_VALUE_FLAGS.has(flag) || (runner === 'npm' && NPM_VALUE_FLAGS.has(flag)))) i += 1;
       i += 1;
       continue;
     }
@@ -3262,6 +3288,9 @@ const VITEST_WATCH_FLAG = /^(?:--watch|-w)(?:=(?:true|1|yes|on))?$/i;
 /** npm options that choose WHICH package's `test` script runs; a replacement that drops them tests another package. */
 const NPM_SCOPE_VALUE_FLAGS = new Set(['-w', '--workspace', '--prefix', '-C']);
 const NPM_SCOPE_BARE_FLAG = /^(?:-ws|--workspaces|--include-workspace-root|-iwr)$/;
+/** npm config options that take a separate value before the subcommand (`npm --loglevel silent test`). */
+const NPM_VALUE_FLAGS = new Set(['--loglevel', '--tag', '--registry', '--userconfig', '--globalconfig', '--cache',
+  '--script-shell', '--node-options', '--otp', '--scope']);
 const NODE_SCRIPT_WORD = /\.(?:[cm]?js|ts)$/;
 const NODE_SCRIPT_VALUE_FLAGS = new Set(['--require', '-r', '--import', '--loader', '--experimental-loader',
   '--test-reporter', '--test-reporter-destination', '--test-name-pattern', '--test-skip-pattern',
@@ -3271,7 +3300,7 @@ const NODE_SCRIPT_VALUE_FLAGS = new Set(['--require', '-r', '--import', '--loade
  *  (`timeout [opts] <duration>`, and the `-n <N>` it leaves behind after peeling `nice`)? `nohup` is left
  *  alone on purpose: the background-run guard owns it, and a queued replacement keeping it would be denied there. */
 function execWrapperWords(w) {
-  if (w[0] === 'timeout') {
+  if (w[0] === 'timeout' || w[0] === 'gtimeout') {
     let i = 1;
     while (w[i]?.startsWith('-')) i += /^(?:-s|-k|--signal|--kill-after)$/.test(w[i]) ? 2 : 1;
     return i + 1; // the duration
@@ -3402,7 +3431,7 @@ function ungatedHeavyHead(head) {
     while (w[j]?.startsWith('-')) {
       const span = npmScopeSpan(words, j);
       if (span) scope.push(rawWords(head, words.slice(j, j + span)));
-      j += span || (!w[j].includes('=') && RUNNER_VALUE_FLAGS.has(w[j]) ? 2 : 1);
+      j += span || (!w[j].includes('=') && (RUNNER_VALUE_FLAGS.has(w[j]) || NPM_VALUE_FLAGS.has(w[j])) ? 2 : 1);
     }
     if (['test', 't', 'tst'].includes(w[j])) at = j;
   }
@@ -3429,9 +3458,118 @@ function ungatedHeavyHead(head) {
   return { kind: 'test', tail: forwarded.replace(/^(?:run|watch|dev)(?:\s+|$)/, ''), scope };
 }
 
+const SHELL_CONTROL_PREFIX = /^(?:(?:do|then|else|elif|if|while|until|!)\s+)+/;
+
+/** The kind of unqueued heavy run a segment's executable head starts ('vitest' | 'node-test' | 'standards' |
+ *  'test'), or null. Shared with the static spawn lint and the transcript audit so all three classify the same
+ *  heads (`npm test`, `npm --prefix . test`, `node --test`, …) instead of drifting copies. Pure. */
+export function ungatedHeavyRunKind(segment) {
+  let head = canonicalCommand(String(segment || '').trim().replace(SHELL_CONTROL_PREFIX, ''));
+  for (let hop = 0; hop < 4 && head; hop += 1) {
+    const kind = ungatedHeavyHead(head)?.kind;
+    if (kind) return kind;
+    head = heavyRunAlias(head);
+    if (head) head = canonicalCommand(head);
+  }
+  return null;
+}
+
+/** Spellings that run a package test script or a runner the head classifier does not resolve itself, reduced to
+ *  one it does: `/usr/bin/env npm test`, `corepack pnpm test`, `npm it|cit`, `node --run test`, `npx bun test`.
+ *  Used only for classification (lint/audit); null when the head is none of these. Pure. */
+function heavyRunAlias(head) {
+  const words = headWords(head);
+  const w = words.map((word) => word.text);
+  const rest = (k) => (words[k] ? ' ' + head.slice(words[k].start) : '');
+  // canonicalCommand peels one `env` per pass (`/usr/bin/env npm test` → `env npm test` → `npm test`).
+  if (/(?:^|\/)env$/.test(w[0] || '') && words[1]) return 'env' + rest(1);
+  // Launchers that run the rest as a command: `nohup npm test`, `setsid -f npm test`, `eval 'npm test'` (eval
+  // joins its words and re-parses them, so the quoted word is a command string, not data).
+  if (/^(?:nohup|setsid)$/.test(w[0] || '')) {
+    let i = 1;
+    while (w[i]?.startsWith('-')) { i += 1; if (w[i - 1] === '--') break; }
+    return words[i] ? head.slice(words[i].start) : null;
+  }
+  if (w[0] === 'eval' && words[1]) return w.slice(1).join(' ');
+  // A case-insensitive filesystem (macOS) runs `NPM test` as npm.
+  if (/^(?:npm|pnpm|yarn|bun|npx|node|vitest|corepack)$/i.test(w[0] || '') && w[0] !== w[0].toLowerCase()) return w[0].toLowerCase() + rest(1);
+  // npm options that take a separate value (`npm --loglevel silent test`, `npm --tag x test`). Any non-flag word
+  // right after a flag may be its value; a `test` script name after it is read as the test script (fail closed).
+  if (w[0] === 'npm') {
+    for (let j = 1; w[j]?.startsWith('-') && w[j] !== '--'; j += 1) {
+      if (!w[j].includes('=') && w[j + 1] && !w[j + 1].startsWith('-') && ['test', 't', 'tst'].includes(w[j + 2])) {
+        return 'npm test' + rest(j + 3);
+      }
+    }
+  }
+  if (/^bun@\S+$/.test(w[0] || '')) return 'bun' + rest(1); // `npx bun@1.4.2 test` canonicalizes to this
+  if (w[0] === 'corepack' && /^(?:npm|pnpm|yarn)(?:@\S*)?$/.test(w[1] || '')) return w[1].replace(/@.*$/, '') + rest(2);
+  if (w[0] === 'npm' && ['it', 'cit', 'install-test', 'install-ci-test'].includes(w[1])) return 'npm test' + rest(2);
+  if (w[0] === 'node') {
+    for (let i = 1; w[i]?.startsWith('-') && w[i] !== '--'; i += 1) {
+      if (w[i] === '--run' && w[i + 1]) return 'npm run ' + w[i + 1] + rest(i + 2);
+      if (w[i].startsWith('--run=') && w[i].length > 6) return 'npm run ' + w[i].slice(6) + rest(i + 1);
+    }
+    return null;
+  }
+  const npx = /^(?:npx|pnpx|bunx)$/.test(w[0] || '') ? 1 : w[0] === 'npm' && ['exec', 'x'].includes(w[1]) ? 2 : 0;
+  if (npx) {
+    let i = npx;
+    while (w[i]?.startsWith('-')) { i += 1; if (w[i - 1] === '--') break; }
+    if (/^bun(?:@\S*)?$/.test(w[i] || '')) return 'bun' + rest(i + 1);
+  }
+  return null;
+}
+
+/** Every `$( … )` / backtick command-substitution body in `text` (any depth; never inside single quotes). Pure. */
+export function commandSubstitutionBodies(text) {
+  return substitutionBodies(String(text || ''));
+}
+
+/** The `-c` string a shell head in `segment` executes (`sh -c '…'`, `bash -ec "…"`, `busybox sh -c …`), as the
+ *  inner shell RECEIVES it (a `"…"` word has `\"`, `\\`, `\$`, ``\` `` resolved), or null. `innerSubstitutions`
+ *  is false when the outer shell already ran every substitution in the word (it was not single-quoted and holds
+ *  no escaped opener), so a caller that already counted the outer command's substitutions must not count them
+ *  again. Shared with the spawn lint and the transcript audit. Pure. */
+export function shellCString(segment) {
+  const cmd = canonicalCommand(String(segment || '').trim().replace(SHELL_CONTROL_PREFIX, ''));
+  const words = headWords(cmd);
+  const prog = words.length ? words[0].text : '';
+  if (!SHELL_PROGRAMS.has(prog)) return null;
+  // The shell reads every option first; `-c` may sit in any cluster (`-ce`, `-euxc`) and options such as
+  // `-o pipefail` / `-O extglob` / `--rcfile f` take a value. The command string is the first operand.
+  let c = false, i = 1;
+  if (prog === 'busybox' && SHELL_PROGRAMS.has(words[1]?.text)) i = 2;   // `busybox sh -c '…'`
+  for (; i < words.length; i++) {
+    const w = words[i].text;
+    // Quotes are removed before the shell sees its argv, so a quoted `'-c'` (spawn argv) is still an option.
+    if (!/^[-+]/.test(w) || w === '-' || w === '+') break;
+    if (w === '--') { i += 1; break; }
+    if (/^--(?:rcfile|init-file)$/.test(w)) { i += 1; continue; }
+    if (w.startsWith('--')) continue;
+    if (w[0] === '-' && w.includes('c')) c = true;
+    if (/[oO]/.test(w)) i += 1;                                   // `-o pipefail`, `-euo pipefail`, `+O extglob`
+  }
+  if (!c) return null;                                              // a SCRIPT FILE (or stdin), not a `-c` string
+  const word = words[i];
+  if (!word) return null;
+  // The outer shell skips substitutions only inside a single-quoted run (outside `"…"`) or behind an
+  // escaped opener; a `'` inside `"…"` is a literal character, not a quote.
+  const raw = cmd.slice(word.start, word.end);
+  let unexpanded = false, dq = false;
+  for (let k = 0; k < raw.length && !unexpanded; k += 1) {
+    const ch = raw[k];
+    if (ch === '\\') { unexpanded = raw[k + 1] === '$' || raw[k + 1] === '`'; k += 1; }
+    else if (ch === '"') dq = !dq;
+    else if (ch === "'" && !dq) unexpanded = true;
+  }
+  return { text: word.dq ? word.text.replace(/\\(["\\$`])/g, '$1') : word.text, innerSubstitutions: unexpanded };
+}
+
 /** Deny any unqueued test/standards execution, with a runnable replacement. Pure; no escape. */
 export function ungatedHeavyRunReason(segment) {
-  const s = String(segment || '').trim();
+  // Shell control words are syntax, not part of the runnable replacement for this segment.
+  const s = String(segment || '').trim().replace(SHELL_CONTROL_PREFIX, '');
   const run = ungatedHeavyHead(canonicalCommand(s));
   if (!run) return null;
   // Keep assignment spelling/quoting intact, placing it before node so it remains shell syntax. A leading
@@ -3439,9 +3577,21 @@ export function ungatedHeavyRunReason(segment) {
   const words = headWords(s);
   let i = words[0]?.text === 'env' ? 1 : 0;
   const prefix = i ? ['env'] : [];
-  while (/^[A-Za-z_]\w*=/.test(words[i]?.text || '')) {
-    prefix.push(s.slice(words[i].start, words[i].end));
-    i += 1;
+  while (i < words.length) {
+    const word = words[i].text;
+    if (/^[A-Za-z_]\w*=/.test(word)) { prefix.push(s.slice(words[i].start, words[i].end)); i += 1; continue; }
+    if (prefix[0] === 'env' && word.startsWith('-')) {
+      prefix.push(s.slice(words[i].start, words[i].end)); i += 1;
+      if (/^(?:-u|--unset|-C|--chdir)$/.test(word) && words[i]) {
+        prefix.push(s.slice(words[i].start, words[i].end)); i += 1;
+      }
+      if (word === '--') {
+        while (/^[A-Za-z_]\w*=/.test(words[i]?.text || '')) { prefix.push(s.slice(words[i].start, words[i].end)); i += 1; }
+        break;
+      }
+      continue;
+    }
+    break;
   }
   const env = prefix.length ? prefix.join(' ') + ' ' : '';
   const command = i ? s.slice(words[i]?.start ?? s.length) : s;
