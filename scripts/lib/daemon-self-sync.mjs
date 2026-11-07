@@ -748,7 +748,8 @@ export function withSelfSync(effects, {
     const result = await rebuildImpl(...args);
     // A recovered adoption (moved=false, adopted=true) also put new code on disk that running services have not loaded.
     if (result?.adopted && (result.moved || result.reason === 'recovered-adopted')) await runRestart(restartServices, { adoptedSha: result.head });
-    else if (retryPendingRestarts) await runRestart(retryPendingRestarts, { pendingOnly: true });
+    // No restart while a rebuild job is in flight: an owed restart waits for a tick with no job running.
+    else if (retryPendingRestarts && !/^rebuild-job-(started|running)$/.test(String(result?.reason))) await runRestart(retryPendingRestarts, { pendingOnly: true });
     return result;
   };
   const bg = background === undefined

@@ -969,5 +969,16 @@ describe('owed restarts and the cooldown', () => {
       expect(restart).toHaveBeenCalledWith(expect.objectContaining({ adoptedSha: 'new' }));
       expect(retry).not.toHaveBeenCalled();
     });
+    it.each(['rebuild-job-started', 'rebuild-job-running'])('an owed restart is not retried while a rebuild job is in flight (%s)', async reason => {
+      const retry = vi.fn(async () => {}), restart = vi.fn(async () => {});
+      await withSelfSync({ tickOnce: () => 'ticked' }, {
+        root: cloneRoot, env: {}, versions: null, background: null, onRestart: () => 'restarted',
+        rebuild: async () => ({ moved: false, reason }),
+        restartServices: restart, retryPendingRestarts: retry, readHead: () => 'boot', readOriginRef: () => null,
+        readState: () => ({}), readReady: () => null, cloneIdentity: () => null, acquireRead: () => ({ ok: true }),
+        releaseRead: () => {}, importClosure: () => new Set(), diffFiles: () => [], log: { error: vi.fn() } }).tickOnce();
+      expect(retry).not.toHaveBeenCalled();
+      expect(restart).not.toHaveBeenCalled();
+    });
   });
 });
