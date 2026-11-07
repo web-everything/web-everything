@@ -237,7 +237,8 @@ describe('R473 pure classified verdict', () => {
   // a backslash, a doubled slash or surrounding whitespace never makes a protected pattern match nothing.
   it('a protected pattern written with ./, /, \\, // or whitespace still protects its paths (PR #6381 self-review)', async () => {
     for (const pattern of ['./custom/**', '/custom/**', 'custom\\**', 'custom//**', 'custom/** ', ' custom/**', './custom/', './/custom/**/', 'custom\\',
-      'custom/./**', 'custom/**/.', 'x/../custom/**', 'custom​/**', 'ｃustom/**', 'cus\u007ftom/**', 'custom/­**/']) {
+      'custom/./**', 'custom/**/.', 'x/../custom/**', 'custom​/**', 'ｃustom/**', 'cus\u007ftom/**', 'custom/­**/',
+      'custom/** ​', '​ custom/**', ' ​ custom/** ​ ']) {
       const race = await compute([d3('custom/writers/save.mjs')], options('prerelease'), trustedLayer({ raceBlockPaths: [pattern] }));
       expect(race.verdict, pattern).toBe('WEAKENED');
       const guard = await compute([finding({ class: 'E2', file: 'custom/writers/save.mjs' })], options('prerelease'), trustedLayer({ guardFloorPaths: [pattern] }));

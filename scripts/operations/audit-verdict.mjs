@@ -197,7 +197,8 @@ function pathCandidate(file) {
 // `.` segments dropped, `..` resolved. A pattern that cleans up to nothing (`./`, `/`) names the repo root, and one that
 // climbs above it (`../x`) cannot be placed: both protect every path. A trailing `/` (a directory) is kept.
 const cleanPattern = p => {
-  const s = p.normalize('NFKC').trim().replace(/[\p{Default_Ignorable_Code_Point}\p{Cc}\p{Cf}]/gu, '').replace(/\\/g, '/');
+  // Trimmed AFTER the invisible characters go, so a space beside one (`custom/** <U+200B>`) is trimmed too.
+  const s = p.normalize('NFKC').replace(/[\p{Default_Ignorable_Code_Point}\p{Cc}\p{Cf}]/gu, '').trim().replace(/\\/g, '/');
   const segs = [];
   for (const seg of s.split('/')) {
     if (seg === '' || seg === '.') continue;
