@@ -114,7 +114,7 @@ import {
   addOverlay, removeOverlay, readOverlayState, readOverlays, appendOverlayEvent, overlayFilePath, recordEdgeResolution, allowConflictGate,
   readOverrideViewerLogin, registrationIdentity,
 } from './lib/daemon-overlays.mjs';
-import { planRetirements, planFetchFailed, resolveOriginRepository } from './operations/prototype-retire.mjs';
+import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository } from './operations/prototype-retire.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { previewOverlayConflict } from './lib/daemon-rebuild.mjs';
 import { overlaySafetySettings } from './lib/daemon-load-overlay.mjs';
@@ -287,12 +287,15 @@ function retirementGitHub({ root, env, run }) {
  * @returns {{ref:string, action:'retire'|'keep', reason:string, tip?:string, evidence?:object}}
  */
 export function proveRetirement({ root, entry, env = process.env, run = spawnSync }) {
+  const base = mergeRefBase(entry.ref);
+  const baseEntry = base ? readOverlays(root, { env }).find((row) => row.ref === base) : null;
+  const rows = baseEntry ? [entry, baseEntry] : [entry];
   const result = withScratchFetch({
     root, env, run, prefix: 'we-daemon-overlay-retire-',
-    refspecs: ['+refs/heads/main:refs/remotes/origin/main', `+refs/heads/${entry.ref}:refs/remotes/origin/${entry.ref}`],
+    refspecs: ['+refs/heads/main:refs/remotes/origin/main', ...rows.map((row) => `+refs/heads/${row.ref}:refs/remotes/origin/${row.ref}`)],
   }, (git) => {
     const { gh, repo } = retirementGitHub({ root, env, run });
-    return planRetirements({ rows: [entry], git, gh, repo })[0];
+    return planRetirements({ rows, git, gh, repo })[0];
   });
   if (result?.action === 'retire') return result;
   // Only a branch that is GONE from origin can have been squash-merged and deleted; anything else stays as proved above.
