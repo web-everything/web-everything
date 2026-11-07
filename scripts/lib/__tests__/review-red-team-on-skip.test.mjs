@@ -79,7 +79,15 @@ describe('#6345 — resume a stored needs-human review after its refused referra
     const projected = reviewRunEvidence(run);
     expect(projected).toMatchObject({ id, repo, pr, head, parked: true, referralStageRefused: true,
       pending: referrals.map(f => f.key) });
-    const rawPr = { number: pr, headRefOid: head, body, comments, reviews: [], labels: ['red-team:pending'] };
+    const notice = 'review paused: 2 referrals need a ruling; it resumes on a new push, a ruling, or a send-back';
+    if (/pause notice/.test(kind)) comments.push({ body: notice, author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z' });
+    if (kind === 'persist-exhausted notice') comments.push({ body: 'review paused: 2 referrals could not be persisted and the automatic retries are spent; it resumes on a new push or an operator reply',
+      author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z' });
+    if (kind === 'notice from another author') comments.push({ body: notice, author: { login: 'stranger' }, createdAt: '2026-11-06T13:26:00Z' });
+    if (kind === 'other hold comment') comments.push({ body: '🛑 conveyor fix — stood down', author: { login: 'web-everything' }, createdAt: '2026-11-06T13:26:00Z' });
+    const labels = ['red-team:pending', ...(/review:pending/.test(kind) ? ['review:pending'] : []),
+      ...(/review:human/.test(kind) ? ['review:human'] : [])];
+    const rawPr = { number: pr, headRefOid: head, body, comments, reviews: [], labels };
     // Validate the fixture through the real shared gate, without a planner-only mock seam.
     expect(refusedReferralsAreRuled(rawPr, projected, { repo })).toBe(![
       'unruled referral', 'partial rulings', 'ruling for other head', 'ruling for other run', 'unreadable referral card',
@@ -110,6 +118,24 @@ describe('#6345 — resume a stored needs-human review after its refused referra
     expect(o.readReviewRuns).toHaveBeenCalled();
     expect(o.dispatch).toHaveBeenCalledTimes(1);
     expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
+  });
+
+  it.each([
+    'pause notice', 'review:pending label', 'pause notice and review:pending label',
+  ])('resumes when the parked run carries its own settled marks: %s', kind => {
+    const o = parkedFixture(kind);
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review', head,
+      why: 'stored review needs-human only on referrals now ruled; resume the parked run' });
+    expect(o.dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    'persist-exhausted notice', 'notice from another author', 'other hold comment', 'review:human label',
+    'pause notice and review:human label',
+  ])('fails closed: a hold that is not the settled referral pause still skips: %s', kind => {
+    const o = parkedFixture(kind);
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+    expect(o.dispatch).not.toHaveBeenCalled();
   });
 
   it.each([
