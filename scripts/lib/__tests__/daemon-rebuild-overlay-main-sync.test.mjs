@@ -451,6 +451,59 @@ describe('overlay main sync', () => {
     expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toContainEqual(expect.objectContaining({ kind: 'overlay-main-sync-needs-you', repo: 'web-everything', ref }));
   });
 
+  it('tests failure preserves stdout test names ahead of a long tmp-leak stderr footer', async () => {
+    const f = fixture(), events = [];
+    f.deps.appendDaemonEvent = event => events.push(event);
+    f.deps.testRunner = async () => ({ status: 1,
+      stdout: 'FAIL scripts/x.test.mjs > suite > case name\nAssertionError: expected true to be false\n',
+      stderr: '[tmp-leak] ' + 'temporary directory detail\n'.repeat(100),
+    });
+    await expect(job(f)).rejects.toMatchObject({ step: 'tests' });
+    const failure = events.find(event => event.kind === 'overlay-main-sync-failed');
+    expect(failure.detail.stderrTail).toContain('scripts/x.test.mjs');
+    expect(failure.detail.stderrTail).toContain('case name');
+    expect(failure.detail.stderrTail.length).toBeLessThanOrEqual(500);
+    expect(failure.detail.stderrTail).toMatch(/^scripts\/x\.test\.mjs > suite > case name/);
+    expect(failure.detail.stderrTail).toContain('temporary directory detail');
+    expect(failure.detail.stderrTail).not.toMatch(/[\p{Cc}\p{Cf}]/u);
+  });
+
+  it.each(['fullName', 'title', 'file only', 'failed file without assertions', 'incomplete report'])('tests failure preserves structured %s evidence ahead of the output tail', async mode => {
+    const f = fixture(), events = [];
+    f.env.WE_DAEMON_OVERLAY_MAIN_SYNC_FLAKE_RERUNS = '0';
+    f.deps.appendDaemonEvent = event => events.push(event);
+    f.deps.testRunner = async ({ root: scratch, args, testReport }) => {
+      const assertion = mode === 'fullName' ? { status: 'failed', fullName: 'suite > structured case' }
+        : mode === 'file only' ? { status: 'failed' }
+          : { status: 'failed', ancestorTitles: ['suite'], title: 'structured case' };
+      const testResults = args.filter(file => /\.test\.mjs$/.test(file)).map(file => ({
+        name: join(fs.realpathSync(scratch), file), status: 'failed',
+        assertionResults: mode === 'failed file without assertions' ? [] : [assertion],
+      }));
+      fs.writeFileSync(testReport, JSON.stringify({ testResults: mode === 'incomplete report' ? testResults.slice(0, 1) : testResults }));
+      return { status: mode === 'incomplete report' ? 1 : 0,
+        stdout: 'FAIL misleading.test.mjs > wrong case\nAssertionError: structured failure\n',
+        stderr: '[tmp-leak] ' + 'footer\x00\n'.repeat(200),
+      };
+    };
+    await expect(job(f)).rejects.toMatchObject({ step: 'tests' });
+    const { stderrTail } = events.find(event => event.kind === 'overlay-main-sync-failed').detail;
+    expect(stderrTail).toMatch(/^overlay\.test\.mjs/);
+    if (!['file only', 'failed file without assertions'].includes(mode)) expect(stderrTail).toContain('overlay.test.mjs > suite > structured case');
+    expect(stderrTail).not.toContain('misleading.test.mjs');
+    expect(stderrTail).toHaveLength(500);
+    expect(stderrTail).not.toMatch(/[\p{Cc}\p{Cf}]/u);
+  });
+
+  it('tests failure includes stdout diagnostics when stderr is empty and no names are known', async () => {
+    const f = fixture(), events = [];
+    f.deps.appendDaemonEvent = event => events.push(event);
+    f.deps.testRunner = async () => ({ status: 1, stdout: 'AssertionError: stdout-only diagnostic\n', stderr: '' });
+    await expect(job(f)).rejects.toMatchObject({ step: 'tests' });
+    expect(events.find(event => event.kind === 'overlay-main-sync-failed').detail.stderrTail)
+      .toBe('AssertionError: stdout-only diagnostic');
+  });
+
   it('invalid rev-parse evidence fails closed and names its step even without a main SHA', async () => {
     const f = fixture(), git = f.deps.git;
     ageFailure(f);
