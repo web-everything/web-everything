@@ -362,7 +362,8 @@ describe('R473 pure classified verdict', () => {
   // Protecting more only ever blocks more, so a module that only reads, checks or removes a lock file counts too.
   const stripComments = s => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:'"`\\])\/\/.*$/gm, '$1');
   const HOLD_FORMS = Object.freeze({
-    exclusiveCreate: /(['"`])wx\+?\1|\bO_EXCL\b|(?:^|[^\w$])link(?:Sync)?\s*\(/m,
+    // A call has its paren right after the name: `link (` in a message string is prose, not a call.
+    exclusiveCreate: /(['"`])wx\+?\1|\bO_EXCL\b|(?:^|[^\w$])link(?:Sync)?\(/m,
     lockDirectory: /\bmkdir(?:Sync)?\s*\((?![^)]*recursive\s*:\s*true)[^)]*\)[\s\S]{0,400}?EEXIST|EEXIST[\s\S]{0,400}?\bmkdir(?:Sync)?\s*\((?![^)]*recursive\s*:\s*true)/,
     lockFileName: /['"`][^'"`\s]*(?:\.(?:lock|lease|mutex)s?|[-_.](?:lock|lease|mutex)s?\.(?:json|d|pid|txt))['"`]|['"`/](?:lock|lease|mutex)s\//i,
   });
@@ -390,7 +391,7 @@ describe('R473 pure classified verdict', () => {
     expect(holdFormsOf("join(root, 'locks/x.json')")).toEqual(['lockFileName']);
     for (const none of ["mkdirSync(dir, { recursive: true }); if (e.code === 'EEXIST') {}", "read('package-lock.json')",
       "name.endsWith('.lock')", "// openSync(p, 'wx')", "/* const p = 'x.lock' */", "writeFileSync(p, x, 'utf8')", 'unlinkSync(p); await unlink(q);',
-      'makeLink(x); hyperlink(y);']) {
+      'makeLink(x); hyperlink(y);', 'v.push(`would add a leaf link (${f}) to the map`)']) {
       expect(holdFormsOf(none), none).toEqual([]);
     }
   });

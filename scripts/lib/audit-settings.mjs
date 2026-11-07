@@ -96,7 +96,9 @@ const FLOOR_SETTINGS = Object.freeze([
   'scripts/lib/dispatch-size-policy.json', 'scripts/lib/dispatch-supervision-promotions.json', 'scripts/lib/review-fix-policy-settings.json',
   'scripts/settings/delivery-metrics.json', 'scripts/settings/needs-you-feed.json', 'scripts/settings/pr-land-ready.json',
   'scripts/settings/pr-limit.json', 'scripts/settings/pr-stall-sweep.json', 'scripts/settings/review-concurrency.json',
-  'scripts/settings/review-red-team-on-skip.json']);
+  'scripts/settings/review-red-team-on-skip.json',
+  // Read by hold-scan holders (archive-retention.mjs, scheduled-sweep.mjs).
+  'scripts/settings/archive-retention.json', 'scripts/quiet-hours-settings.json']);
 /**
  * The lock primitives: the modules that take an exclusive hold (file-locks.mjs reserves a lock entry, with-lock.mjs
  * wraps it, coordination-lock.mjs takes the coordination lease). Any import of one makes a module a lock user (PR #6381
