@@ -12,6 +12,8 @@ import { readLockfileParity } from '../check-lockfile-parity.mjs';
  *   - `selectInstaller` / `runDepsInstaller` take every subprocess/filesystem effect injected.
  *   - `lockHash`, `depsReady`, the store generation and `ensureLaneDeps` read and write the lane and store.
  *   - `createLaneDepsRuntime` is the real subprocess wiring lane-pool uses (PATH lookup, probe, install stdio).
+ * Ready npm lanes migrate when pnpm is usable; a failed pnpm install suppresses migration for the resulting
+ * npm lock hash. Ready pnpm lanes need no installer probe.
  */
 
 export const DEPS_BACKENDS = ['npm', 'pnpm'];
@@ -111,13 +113,15 @@ export function hasDanglingTopLevelLink(nodeModules) {
 /**
  * 'n/a' | 'missing' | 'stale' | 'ok' — ok when the marker matches the CURRENT hash of either backend. A pnpm
  * marker is ok only while the store it was installed into still carries the same generation token AND the
- * lane's top-level links still resolve into it.
+ * lane's top-level links still resolve into it. A matching npm (including raw-hash) marker is stale when
+ * the optional `pnpmUsable()` probe returns true; without a probe, pnpm is treated as unavailable.
  */
-export function depsReady(dir, markerPath, storeDir = resolvePnpmStoreDir()) {
+export function depsReady(dir, markerPath, storeDir = resolvePnpmStoreDir(), { pnpmUsable = () => false } = {}) {
   if (lockHash(dir) === null) return 'n/a'; // no package.json → nothing to install
   const nodeModules = join(dir, 'node_modules');
   if (!existsSync(nodeModules)) return 'missing';
   const have = readMarker(markerPath);
+  if (markerMatches(have, lockHash(dir, 'npm'), 'npm')) return pnpmUsable() === true ? 'stale' : 'ok';
   return DEPS_BACKENDS.some(backend => markerMatches(have, lockHash(dir, backend, storeDir), backend)
     && (backend !== 'pnpm' || (readStoreGeneration(storeDir) !== null && !hasDanglingTopLevelLink(nodeModules))))
     ? 'ok' : 'stale';
@@ -182,16 +186,21 @@ export function runDepsInstaller({ plan, hashFor, marker, hasNodeModules, exec, 
  * Install a lane's node_modules when needed. `selectPlan()` picks the installer; `exec(command, args)` runs it.
  * Returns the `depsReady` state ('n/a' | 'ok') when nothing is installed, else 'installed'.
  *
- * A lane that is ready under EITHER backend is left alone, before any installer selection runs: selection
- * depends on the environment (PATH, the `pnpm --version` probe, a parity read), and letting it decide again
- * would wipe and reinstall a ready lane whenever that environment differs from the one that installed it.
- * So a lane switches backend only when its install inputs change (lockfiles, or the pnpm store it links into).
+ * A ready pnpm lane is left alone without installer selection. A matching npm/raw-hash lane with node_modules
+ * lazily selects a plan and migrates when pnpm is usable; that same plan is reused for installation.
+ * A pnpm install failure followed by successful npm fallback records the resulting npm lock hash in
+ * `<markerPath>.pnpm-failed`, suppressing migration (and its probe) while that hash remains current.
  * `storeDir` must be the same store `selectPlan` passes to pnpm.
  */
 export function ensureLaneDeps({ dir, markerPath, selectPlan, exec, log = () => {}, storeDir = resolvePnpmStoreDir() }) {
-  const state = depsReady(dir, markerPath, storeDir);
+  let plan;
+  const getPlan = () => (plan ??= selectPlan());
+  const failedPath = markerPath + '.pnpm-failed';
+  const state = depsReady(dir, markerPath, storeDir, {
+    pnpmUsable: () => readMarker(failedPath) !== lockHash(dir, 'npm') && getPlan().backend === 'pnpm',
+  });
   if (state === 'n/a' || state === 'ok') return state;
-  let plan = selectPlan();
+  plan = getPlan();
   let generation = null; // the store generation this pnpm install links into
   if (plan.backend === 'pnpm') {
     try {
@@ -214,7 +223,12 @@ export function ensureLaneDeps({ dir, markerPath, selectPlan, exec, log = () => 
     log('pnpm store generation changed during install; leaving deps stale');
     return 'stale';
   }
-  if (result.state === 'installed') writeFileSync(markerPath, result.marker);
+  if (result.state === 'installed') {
+    if (plan.backend === 'pnpm' && result.backend === 'npm') {
+      writeFileSync(failedPath, lockHash(dir, 'npm'));
+    }
+    writeFileSync(markerPath, result.marker);
+  }
   return result.state;
 }
 
