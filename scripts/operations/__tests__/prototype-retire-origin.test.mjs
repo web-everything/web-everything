@@ -76,11 +76,11 @@ it('CLI re-proof fetches and passes the registered base for a redundant merge si
       if (args[0] === 'repo') return { status: 0, stdout: repository(REPO) };
       if (args[1] === 'view') {
         expect(args[2]).toBe('42'); // The stored base registration, including its PR, reaches the planner.
-        return { status: 0, stdout: JSON.stringify({ number: 42, state: 'OPEN', headRefName: REF }) };
+        return { status: 0, stdout: JSON.stringify({ number: 42, state: 'OPEN', headRefName: REF, isCrossRepository: false }) };
       }
       expect(args.slice(0, 2)).toEqual(['pr', 'list']);
       return { status: 0, stdout: JSON.stringify(args[args.indexOf('--head') + 1] === REF
-        ? [{ number: 42, state: 'OPEN', headRefName: REF }] : []) };
+        ? [{ number: 42, state: 'OPEN', headRefName: REF, isCrossRepository: false }] : []) };
     }
     expect(cmd).toBe('git');
     if (args.includes('remote')) return { status: 0, stdout: `https://github.com/${REPO}.git` };

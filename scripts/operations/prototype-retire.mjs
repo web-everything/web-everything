@@ -106,12 +106,12 @@ function ghJson(gh, args) {
 /** The registration's PR: its recorded number, else a PR whose head is the ref, else (for `-m<N>`) its base branch. */
 function findPr({ gh, row, repo }) {
   if (Number.isInteger(row.pr)) {
-    const view = ghJson(gh, ['pr', 'view', String(row.pr), '--repo', repo, '--json', 'number,state,headRefName']);
+    const view = ghJson(gh, ['pr', 'view', String(row.pr), '--repo', repo, '--json', 'number,state,headRefName,isCrossRepository']);
     return view.ok && view.value ? { ok: true, pr: view.value, via: 'registration' } : { ok: false };
   }
   for (const [head, via] of [[row.ref, 'head'], [mergeRefBase(row.ref), 'merge-ref-base']]) {
     if (!head) continue;
-    const list = ghJson(gh, ['pr', 'list', '--repo', repo, '--head', head, '--state', 'all', '--json', 'number,state,headRefName', '--limit', '5']);
+    const list = ghJson(gh, ['pr', 'list', '--repo', repo, '--head', head, '--state', 'all', '--json', 'number,state,headRefName,isCrossRepository', '--limit', '5']);
     if (!list.ok || !Array.isArray(list.value)) return { ok: false };
     const exact = list.value.filter((pr) => pr?.headRefName === head);
     if (exact.length > 1) return { ok: false, ambiguous: true };
@@ -177,7 +177,9 @@ export function planRetirements({ rows, git, gh, repo, mainRef = 'origin/main' }
     if (baseRow && carried.cleanMerges) {
       const baseFound = findPr({ gh, row: baseRow, repo });
       // A base registration's `pr:N` may point at an unrelated PR: the PR must actually be the base branch's own.
-      if (baseFound.ok && baseFound.pr?.state === 'OPEN' && baseFound.pr.headRefName === baseRef) {
+      // Identity is repo plus branch: a fork PR heading a same-named branch is not the origin base's PR.
+      if (baseFound.ok && baseFound.pr?.state === 'OPEN' && baseFound.pr.headRefName === baseRef
+        && baseFound.pr.isCrossRepository === false) {
         const baseCarried = carriedBeyondMain({ git, ref: baseRow.ref, mainRef });
         if (baseCarried.ok && carried.unique.every((sha) =>
           git(['merge-base', '--is-ancestor', sha, baseCarried.tip]).code === 0)) {
