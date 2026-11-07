@@ -41,7 +41,7 @@ const SECRET_SHORT_PROGRAMS = new RegExp(String.raw`(?<![\w./-])(?:${SECRET_SHOR
 const SECRET_LONG_OPTIONS = /(?<![\w./-])gh\s+secret\s+set\b[^;|&\n]*?\s(--body)(?![\w-])(=?)/g;
 // `config set <key> <value>` style commands (`npm config set //r/:_authToken v`, `yarn config set npmAuthToken v`,
 // `aws configure set aws_secret_access_key v`, `git config --global github.token v`): group 1 is the key.
-const CONFIG_KEY = /(?<![\w-])config(?:ure)?\s+(?:(?:set|add)\s+)?(?:--?[\w-]+(?:=\S*)?\s+)*([^\s=-][^\s=]*)()(?=\s)/g;
+const CONFIG_KEY = /(?<![\w-])config(?:ure)?\s+(?:(?:set|add)\s+)?(?:-[\w-]+(?:=\S*)?\s+)*([^\s=-][^\s=]*)()(?=\s)/g;
 const configKeyIsCredential = key => CREDENTIAL_ASSIGNMENT.test(key.split(/[/:.]/).filter(Boolean).pop() || '');
 // JSON / object-literal members whose name is a credential (`{"password":"v"}`, `{\"api_key\": \"v\"}`, `pin: 1234`).
 // The name may be unquoted (`{password: "v"}`, `{ pin: 1234 }`); a name start is anchored, so it stays linear.

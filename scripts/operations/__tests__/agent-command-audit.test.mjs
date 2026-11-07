@@ -204,6 +204,14 @@ describe('agent command audit', () => {
     }
     expect(Date.now() - started).toBeLessThan(2000);
   });
+  it('does not backtrack exponentially on repeated dash-option runs after config (CodeQL js/redos)', () => {
+    const started = Date.now();
+    redact(`config ${'--\t-'.repeat(4000)}`);
+    redact(`config ${'--\t-'.repeat(4000)}\u0000`);
+    expect(Date.now() - started).toBeLessThan(2000);
+    // the flag-skipping still reaches the key after real option runs
+    expect(redact('git config --global --replace-all github.token ghp_abc123')).not.toContain('ghp_abc123');
+  });
   it.each([
     ["cat > f <<'EOF'\n" + 'hello world\n'.repeat(1500) + 'EOF', []],
     ['cat <<EOF\nnpm test\nEOF', []],
