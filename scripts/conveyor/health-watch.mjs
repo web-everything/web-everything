@@ -1538,7 +1538,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   const notifications = [];
   // A failed NEEDS-YOU publish retries next tick (not only on the next notify transition); desktop notify is not repeated.
   const needsYouRetries = Object.entries(state.episodes ?? {})
-    .filter(([k, e]) => e?.smell === 'claude-auth-expired' && Number.isFinite(e.needsYouFailedAt) && !Number.isFinite(e.needsYouAt)
+    .filter(([k, e]) => e?.smell === 'claude-auth-expired' && Number.isFinite(e.needsYouFailedAt) && !Number.isFinite(e.needsYouAt) && !e.tracked
       && (e.status === 'open' || e.status === 'flapping') && !result.plan.some((x) => x.key === k && x.kind === 'notify' && !x.suppressed))
     .map(([key]) => ({ key, kind: 'notify', retry: true }));
   for (const p of [...result.plan.filter((x) => x.kind === 'notify' && !x.suppressed), ...needsYouRetries]) {

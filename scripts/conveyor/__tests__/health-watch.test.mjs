@@ -6,7 +6,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, readFileSync, existsSync, utimesSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { EventEmitter } from 'node:events';
 
@@ -155,6 +155,19 @@ describe('tick() — Claude auth expired NEEDS-YOU delivery', () => {
       await run();
       await run();
       expect(publishNeedsYou).toHaveBeenCalledTimes(2);
+    } finally { log.mockRestore(); }
+  });
+
+  it('does not retry a rejected publication once an active silence tracks the episode', async () => {
+    const { run, publishNeedsYou, statePath } = setup();
+    publishNeedsYou.mockRejectedValueOnce(new Error('feed unavailable'));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await run();
+      writeFileSync(join(dirname(statePath), 'silences.json'), JSON.stringify([
+        { smell: 'claude-auth-expired', subject: null, card: '1', expiresAt: start + 3_600_000 }]));
+      await run();
+      expect(publishNeedsYou).toHaveBeenCalledTimes(1);
     } finally { log.mockRestore(); }
   });
 });
