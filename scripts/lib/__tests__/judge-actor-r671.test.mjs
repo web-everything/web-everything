@@ -1,8 +1,12 @@
 /** R671 red-first contract: judgeActor policy + actor= on the existing gate marker. */
 import { describe, it, expect, vi } from 'vitest';
 import * as authorship from '../marker-authorship.mjs';
-import { assertHumanOperator, isHumanOperatorComment, isRulingComment, operatorBoundComments } from '../operator-identity.mjs';
-import { operatorBlockRulings } from '../ruling-ledger.mjs';
+import { assertHumanOperator, isHumanOperatorComment, isRulingComment, judgePolicyOnce, operatorBoundComments } from '../operator-identity.mjs';
+import { ignoredRulings, operatorBlockRulings } from '../ruling-ledger.mjs';
+import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
+
+// Ledger fixtures must not depend on which historical commits exist in the host checkout (as ruling-ledger.test.mjs).
+vi.mock('../restack-equivalence.mjs', () => ({ isRestackOf: () => false }));
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { redTeamGateMarker, liveResultGateState, operatorRulingsOnLiveResult,
   readRedTeamDisposition, CONFIRMED_BREAKS_DEFAULTS } from '../red-team-gate.mjs';
@@ -157,5 +161,111 @@ describe('R671 judge comments cannot carry review clearance tokens', () => {
       + '\n- 1 confirmed break(s) sent back to the fixer (#1).\nreviewed-sha and CLEARED-HUMAN in prose', opLogin);
     expect(isRulingComment(block)).toBe(true);
     expect(operatorBoundComments([block])).toEqual([block]);
+  });
+});
+
+describe('#6494 judge policy is read once per reader pass, and logged once per line', () => {
+  const block = () => judgeGate('operator-block', '- 1 confirmed break(s) sent back to the fixer (#1).');
+  it('operatorBoundComments resolves the policy once for every judge comment of the pass', () => {
+    const resolve = vi.fn(() => ({ value: { enabled: true, actor } }));
+    const policy = judgePolicyOnce(resolve);
+    expect(operatorBoundComments([block(), block(), block()], { policy })).toHaveLength(3);
+    expect(isRulingComment(block(), policy)).toBe(true);
+    expect(resolve).toHaveBeenCalledTimes(1);
+  });
+  it('a failed policy read refuses every judge comment of the pass without re-reading', () => {
+    const resolve = vi.fn(() => { throw new Error('unreadable judge actor policy'); });
+    const policy = judgePolicyOnce(resolve);
+    expect(operatorBoundComments([block(), block()], { policy })).toEqual([]);
+    expect(resolve).toHaveBeenCalledTimes(1);
+  });
+  it('a non-judge comment never reads the policy', () => {
+    const resolve = vi.fn(() => ({ value: { enabled: true, actor } }));
+    expect(operatorBoundComments([result, cap], { policy: judgePolicyOnce(resolve) })).toHaveLength(2);
+    expect(resolve).not.toHaveBeenCalled();
+  });
+  it('readJudgeActorPolicy logs a distinct provenance line once per sink, not once per call', () => {
+    const lines = [];
+    const log = line => lines.push(line);
+    for (let i = 0; i < 4; i++) authorship.readJudgeActorPolicy({ env: {}, platform: {}, log });
+    authorship.readJudgeActorPolicy({ env: { WE_JUDGE_ACTOR_ENABLED: 'false' }, platform: {}, log });
+    expect(lines.filter(l => /^policy-cascade judgeActor /.test(l))).toEqual([
+      'policy-cascade judgeActor enabled=true (standard) actor=judge:r10 (standard)',
+      'policy-cascade judgeActor enabled=false (env) actor=judge:r10 (standard)']);
+  });
+  it('the red-team gate readers keep honouring an enabled judge block across a multi-block thread', () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const comments = [result, cap, block(), block(), block()];
+      expect(operatorRulingsOnLiveResult(comments, pr, head).blocked).toEqual(new Set([1]));
+      expect(liveResultGateState(comments, pr, head, 'we', null).outcomes.has('operator-block')).toBe(true);
+      const d = disposition(comments);
+      expect([...d.held, ...d.sendBack].map(f => f.index)).toEqual([1]);
+      expect(errors.mock.calls.filter(([l]) => /^policy-cascade judgeActor /.test(String(l))).length).toBeLessThanOrEqual(1);
+    } finally { errors.mockRestore(); }
+  });
+});
+
+describe('#6494 judge writers hold the gate-visible policy (a tool block only narrows it)', () => {
+  const writer = over => authorship.readJudgeWriterPolicy({ env: {}, log: () => {}, ...over });
+  it.each([
+    ['no tool block', {}, true],
+    ['tool enables an enabled gate', { tool: { enabled: true } }, true],
+    ['tool disables', { tool: { enabled: false } }, false],
+    ['env disables the gate under an enabling tool', { tool: { enabled: true }, env: { WE_JUDGE_ACTOR_ENABLED: 'false' } }, false],
+  ])('%s', (_name, over, enabled) => {
+    expect(writer(over).value.enabled).toBe(enabled);
+  });
+  it('assertJudgeAuthority refuses supersession given as a flag string or as a derived id list', () => {
+    const read = { judgeActorPolicy: { value: { enabled: true, actor } } };
+    for (const supersedes of ['operator:aaaaaaaaa:0123456789ab', ['operator:aaaaaaaaa:0123456789ab'], ' x ,'])
+      expect(() => authorship.assertJudgeAuthority(read, { actor, ruling: 'block', supersedes })).toThrow('judge cannot supersede rulings; operator-only');
+    for (const supersedes of [undefined, '', '  ', []])
+      expect(() => authorship.assertJudgeAuthority(read, { actor, ruling: 'block', supersedes })).not.toThrow();
+  });
+});
+
+// #6494 F3 — ignoredRulings: a judge structured block is a standing block like auto-policy's, only while it is a
+// gate-counted judge block, and it never settles the escalation ladder the way an operator's own ruling does.
+describe('#6494 ignoredRulings with judge structured blocks', () => {
+  const H1 = 'a'.repeat(40), H2 = 'b'.repeat(40);
+  const t = n => new Date(Date.parse('2026-10-03T08:00:00Z') + n * 60_000).toISOString();
+  const repo = 'web-everything/web-everything';
+  const record = (h, runId) => {
+    const original = { summary: 'policy pointer files are missing from the standards manifest so the gate cannot see them',
+      file: 'policy/pointer.md', line: 12, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+    const key = referralFindingKey('judge', original);
+    return { version: 1, repo, pr: 3794, head: h, runId, reviewer: mandatoryReferralReviewer(runId),
+      authorBody: '<!-- authored-by-actor: author -->', attempted: true,
+      referrals: [{ key, seat: 'judge', original, finding: normalizeFinding(original) }], rulings: [] };
+  };
+  const recComment = (rec, n) => ({ body: renderReferralRecord(rec), createdAt: t(n), author: { login: botLogin } });
+  const rulingComment = (rec, n, { who = actor, login = botLogin, supersedes } = {}) => ({ author: { login }, createdAt: t(n),
+    body: buildOperatorRulingComment({ version: 1, repo, pr: rec.pr, head: rec.head, actor: who, channel: 'review daemon',
+      reason: who === actor ? `${attribution}\nblocked: the pointer list is incomplete` : 'still blocked', at: t(n), clearerId: '',
+      rulings: [{ runId: rec.runId, key: rec.referrals[0].key, result: 'block', ...(supersedes ? { supersedes } : {}) }] }) });
+  const r1 = record(H1, 'run-1'), r2 = record(H2, 'run-2');
+  const cameBack = extra => ignoredRulings({ headRefOid: H2, comments: [recComment(r1, 1), ...extra, recComment(r2, 10)] });
+
+  it('a gate-counted judge block is a standing block: the same finding re-raised on a later head came back', () => {
+    const ig = cameBack([rulingComment(r1, 3)]);
+    expect(ig?.matches).toHaveLength(1);
+    expect(ig.matches[0].source).toBe('structured');
+  });
+  it('a disabled judge policy makes the persisted judge block inert (no standing block)', () => {
+    vi.stubEnv('WE_JUDGE_ACTOR_ENABLED', 'false');
+    try { expect(cameBack([rulingComment(r1, 3)])).toBeNull(); } finally { vi.unstubAllEnvs(); }
+  });
+  it.each([['an operator login', { login: opLogin }], ['an unknown login', { login: 'mallory' }],
+    ['a supersedes list', { supersedes: ['operator:aaaaaaaaa:0123456789ab'] }]])(
+    'a forged judge block (%s) registers nothing', (_name, over) => {
+      expect(cameBack([rulingComment(r1, 3, over)])).toBeNull();
+    });
+  it('a judge re-block on the current head does not settle the ladder; an operator block does (control)', () => {
+    const judgeAgain = ignoredRulings({ headRefOid: H2, comments: [recComment(r1, 1), rulingComment(r1, 3), recComment(r2, 10), rulingComment(r2, 12)] });
+    expect(judgeAgain?.matches).toHaveLength(1);
+    expect(judgeAgain.misses).toBe(1);
+    expect(ignoredRulings({ headRefOid: H2, comments: [recComment(r1, 1), rulingComment(r1, 3), recComment(r2, 10),
+      rulingComment(r2, 12, { who: opLogin, login: opLogin })] })).toBeNull();
   });
 });

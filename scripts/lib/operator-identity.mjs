@@ -13,7 +13,7 @@
  *     itself (follow-up hook in `red-team-gate.mjs`); this module's callers apply it today.
  */
 import { spawnSync } from 'node:child_process';
-import { OPERATOR_LOGINS, JUDGE_ACTOR, JUDGE_ATTRIBUTION, isJudgeAuthored, readJudgeActorPolicy } from './marker-authorship.mjs';
+import { OPERATOR_LOGINS, JUDGE_ACTOR, JUDGE_ATTRIBUTION, JUDGE_RESERVED_TOKEN_RE, isJudgeAuthored, readJudgeActorPolicy } from './marker-authorship.mjs';
 import { parseRedTeamGateMarker } from './red-team-gate.mjs';
 
 /** Gate-record outcomes only an operator may write. */
@@ -57,12 +57,26 @@ export function isHumanOperatorComment(c) {
 }
 
 /** Drop every `operator-*` gate record that a human operator did not author. All other comments pass. PURE. */
-export function operatorBoundComments(comments) {
+export function operatorBoundComments(comments, { policy = judgePolicyOnce() } = {}) {
   return (Array.isArray(comments) ? comments : []).filter((c) => {
     const m = parseRedTeamGateMarker(typeof c === 'string' ? c : c?.body);
-    if (m?.actor !== undefined) return isRulingComment(c);
-    return !(m && OPERATOR_GATE_OUTCOMES.includes(m.outcome)) || isRulingComment(c);
+    if (m?.actor !== undefined) return isRulingComment(c, policy);
+    return !(m && OPERATOR_GATE_OUTCOMES.includes(m.outcome)) || isRulingComment(c, policy);
   });
+}
+
+/**
+ * One judge-policy read per reader pass (#6494 F2): resolved lazily on the first judge-marked comment, then reused —
+ * a failed read included, so an unreadable policy refuses every judge comment of the pass without re-reading.
+ * @param {() => {value: object}} [resolve] the resolver; a writer passes its own env-bound one for its read-back.
+ */
+export function judgePolicyOnce(resolve = () => readJudgeActorPolicy()) {
+  let r;
+  return () => {
+    if (!r) { try { r = { value: resolve().value }; } catch (error) { r = { error }; } }
+    if (r.error) throw r.error;
+    return r.value;
+  };
 }
 
 export function assertRulingIdentity(identity, actor) {
@@ -71,12 +85,12 @@ export function assertRulingIdentity(identity, actor) {
   return identity.login;
 }
 /** Judge comments can only add a hold, with explicit attribution and live policy. */
-export function isRulingComment(c) {
+export function isRulingComment(c, policy = judgePolicyOnce()) {
   const m = parseRedTeamGateMarker(c?.body);
   if (m?.actor === undefined) return isHumanOperatorComment(c);
   if (m.actor !== JUDGE_ACTOR || m.outcome !== 'operator-block' || !isJudgeAuthored(c)
-    || /reviewed-sha|cleared-human/i.test(String(c?.body ?? ''))
+    || JUDGE_RESERVED_TOKEN_RE.test(String(c?.body ?? ''))
     || !String(c?.body ?? '').split(/\r?\n/).some(line => line === JUDGE_ATTRIBUTION || line === `${JUDGE_ATTRIBUTION} (${JUDGE_ACTOR})`)) return false;
-  try { const p = readJudgeActorPolicy().value; return p.enabled === true && p.actor === JUDGE_ACTOR; }
+  try { const p = policy(); return p.enabled === true && p.actor === JUDGE_ACTOR; }
   catch { return false; }
 }

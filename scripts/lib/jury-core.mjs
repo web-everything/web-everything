@@ -45,7 +45,7 @@ import { CARD_REF_RE } from './referral-card-readable.mjs';
 import { deriveSessionId, sessionSeed } from './judge-spawn.mjs';
 import { decideClearerIndependence, INDEPENDENCE, parseAuthorActorId } from './review-independence.mjs';
 import { CARE_LEVELS } from './review-escalation.mjs';
-import { AUTOMATION_LOGINS, OPERATOR_LOGINS, JUDGE_ACTOR, JUDGE_ATTRIBUTION, isTrustedMarkerAuthor,
+import { AUTOMATION_LOGINS, OPERATOR_LOGINS, JUDGE_ACTOR, JUDGE_ATTRIBUTION, JUDGE_RESERVED_TOKEN_RE, isTrustedMarkerAuthor,
   readJudgeActorPolicy } from './marker-authorship.mjs';
 // #2438's labelled data fence (#2967 moved it to a leaf so this module can reach it — `review-core.mjs`,
 // where it used to live, imports THIS module, so importing back would be a cycle).
@@ -3902,8 +3902,12 @@ export function parseOperatorRulingComment(comment) {
   let record = null;
   try { record = match ? JSON.parse(Buffer.from(match[1], 'base64').toString('utf8')) : null; } catch { record = null; }
   const head = typeof record?.head === 'string' && /^[a-f0-9]{40}$/.test(record.head) ? record.head : undefined;
+  // A judge record only adds holds (#6494): automation-authored, block rows only, no supersession (a judge block can
+  // never retire a standing ruling), and no review-clearance token anywhere in the comment — the same refusal the
+  // red-team reader applies, so a crafted canonical record cannot carry one past the writer's check.
   if (record?.actor === JUDGE_ACTOR && (!AUTOMATION_LOGINS.includes(login)
-    || !Array.isArray(record.rulings) || record.rulings.some(x => x?.result !== 'block'))) return null;
+    || !Array.isArray(record.rulings) || record.rulings.some(x => x?.result !== 'block' || (Array.isArray(x?.supersedes) && x.supersedes.length))
+    || JUDGE_RESERVED_TOKEN_RE.test(body))) return null;
   if (!trusted || !record || !validateOperatorRuling(record)) return { malformed: true, head };
   try { if (buildOperatorRulingComment(record) !== normalized) return { malformed: true, head }; }
   catch { return { malformed: true, head }; }
@@ -3920,7 +3924,7 @@ export function operatorRulingId(o) {
 }
 
 /** Every valid operator ruling in thread order, flattened to one entry per (run, finding). */
-export function readOperatorRulings(comments, { head } = {}) {
+export function readOperatorRulings(comments, { head, judgePolicy = () => readJudgeActorPolicy().value } = {}) {
   const rulings = [];
   let malformed = false;
   const current = /^[a-f0-9]{40}$/.test(head ?? '') ? head : null;
@@ -3929,7 +3933,7 @@ export function readOperatorRulings(comments, { head } = {}) {
   // (pr, head, run) and alias-equal repo, so every later exact comparison against that record still holds and nothing
   // else about the match loosens. No such record: the ruling keeps the spelling it was written with.
   let recordRepos, blockRepos;
-  let judgePolicy;
+  let judge; // the judge policy, read once per call and only when a judge record is met
   const blockSubject = (repo, pr, head, runId, key) => JSON.stringify([canonicalRepoSlug(repo), pr, head, runId, key]);
   const spellingOf = (repo, pr, head, runId, key, result) => {
     // A `block` never adopts: only a clearing ruling is made MORE visible, so a spelling mismatch can never hide a hold.
@@ -3968,10 +3972,9 @@ export function readOperatorRulings(comments, { head } = {}) {
     for (const x of r.rulings) {
       if (r.actor === JUDGE_ACTOR) {
         if (x.result !== 'block') continue;
-        try {
-          judgePolicy ??= readJudgeActorPolicy().value;
-          if (judgePolicy.enabled !== true || judgePolicy.actor !== JUDGE_ACTOR) continue;
-        } catch { continue; }
+        // An unreadable policy refuses every judge row (fail closed) and is not re-read per row.
+        if (judge === undefined) { try { judge = judgePolicy() ?? null; } catch { judge = null; } }
+        if (judge?.enabled !== true || judge.actor !== JUDGE_ACTOR) continue;
       }
       rulings.push(Object.freeze({ operator: true, repo: spellingOf(r.repo, r.pr, r.head, x.runId, x.key, x.result), pr: r.pr, head: r.head, runId: x.runId, key: x.key,
         result: x.result, ...(x.cause ? { cause: x.cause } : {}), ...(x.lens ? { lens: x.lens } : {}), ...(x.card ? { card: x.card } : {}), ...(x.supersedes ? { supersedes: [...x.supersedes] } : {}), actor: r.actor, channel: r.channel, reason: r.reason,

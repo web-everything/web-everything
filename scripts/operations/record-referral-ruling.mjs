@@ -58,7 +58,7 @@ import {
   validateOperatorRuling, OPERATOR_RULING_RESULTS, AUTO_POLICY_ACTOR, operatorRulingId, sameFindingForClearing,
   readReferralRecords, readOperatorRulings, carriedBackingHolds, sameReferralForPolicy, referralRecheck,
 } from '../lib/jury-core.mjs';
-import { OPERATOR_LOGINS, JUDGE_ACTOR, JUDGE_ATTRIBUTION, assertJudgeAuthority, isSecurityClass } from '../lib/marker-authorship.mjs';
+import { OPERATOR_LOGINS, JUDGE_ACTOR, JUDGE_ATTRIBUTION, JUDGE_RESERVED_TOKEN_RE, assertJudgeAuthority, isSecurityClass } from '../lib/marker-authorship.mjs';
 import { ignoredRulings } from '../lib/ruling-ledger.mjs';
 
 export const RECORD_REFERRAL_RULING_OP = 'record-referral-ruling';
@@ -376,7 +376,7 @@ function selectOperatorRulingFindings(read, input) {
 
 /** Judge prose must never contain tokens consumed by review-clearance readers. */
 export function assertJudgeReason(actor, reason) {
-  if (actor === JUDGE_ACTOR && /reviewed-sha|cleared-human/i.test(String(reason ?? '')))
+  if (actor === JUDGE_ACTOR && JUDGE_RESERVED_TOKEN_RE.test(String(reason ?? '')))
     throw new Error('judge reason contains a reserved review clearance token; operator-only');
 }
 
@@ -394,7 +394,11 @@ export function planOperatorRuling(read, input) {
   const selection = selectOperatorRulingFindings(read, input);
   if (selection.noop) return selection;
   const { selected, skipped, supersedesFor } = selection;
-  if (actor === JUDGE_ACTOR) assertRulingIdentity(read.identity, actor);
+  if (actor === JUDGE_ACTOR) {
+    // The selection may DERIVE supersession (a disputed finding with no --supersedes): refuse it like an explicit one.
+    for (const o of selected) assertJudgeAuthority(read, { actor, ruling, supersedes: supersedesFor(o) });
+    assertRulingIdentity(read.identity, actor);
+  }
   const record = {
     version: 1, repo, pr: Number(pr), head: read.head,
     rulings: selected.map((o) => ({ runId: o.runId, key: o.key, result: ruling, ...(ruling === 'not-real' ? { lens: o.seat ?? JSON.parse(o.key)[0] } : {}),
@@ -651,7 +655,9 @@ export function recordReferralRulingOperation({ readRulingContext, judgeConfirm 
       effects: (view) => (view.input.preview || view.verdict.fileOnly || view.verdict.noop ? [] : [{
         type: OPERATOR_RULING_POST_EFFECT, idempotent: false,
         payload: { repo: view.verdict.record.repo, pr: view.verdict.record.pr, head: view.verdict.record.head, body: view.verdict.body,
-          rulings: view.verdict.record.rulings.map((r) => ({ runId: r.runId, key: r.key, result: r.result })),
+          // `supersedes` rides along so the effect re-checks the actor's authority on the row it posts (#6494).
+          rulings: view.verdict.record.rulings.map((r) => ({ runId: r.runId, key: r.key, result: r.result,
+            ...(r.supersedes?.length ? { supersedes: [...r.supersedes] } : {}) })),
           skipped: view.verdict.skipped,
           protectionSnapshot: view.verdict.protectionSnapshot,
           actor: view.verdict.record.actor, channel: view.verdict.record.channel },

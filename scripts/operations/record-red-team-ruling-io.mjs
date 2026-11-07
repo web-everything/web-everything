@@ -1,4 +1,4 @@
-import { JUDGE_ACTOR, JUDGE_ATTRIBUTION, readJudgeActorPolicy, assertJudgeAuthority, isJudgeAuthored } from '../lib/marker-authorship.mjs';
+import { JUDGE_ACTOR, JUDGE_ATTRIBUTION, readJudgeWriterPolicy, assertJudgeAuthority, isJudgeAuthored } from '../lib/marker-authorship.mjs';
 import { assertJudgeReason, judgeEvidenceComment } from './record-referral-ruling.mjs';
 import { judgeRulingSink, judgeConfirm as defaultJudgeConfirm, readJudgeNotRealMode, readJudgeEvidence, readCardRulingFileMode, landRulingCard as defaultLandRulingCard, rulingCardFilingSink } from './record-referral-ruling-io.mjs';
 /**
@@ -142,7 +142,7 @@ export function createRecordRedTeamRulingReader({ tool, log = line => console.er
           disagreements = Math.max(0, ...indices.map(i => counts.get(i)?.size ?? 0));
         }
       }
-      return { head, ...(actor === JUDGE_ACTOR ? { judgeActorPolicy: readJudgeActorPolicy({ env, tool: tool?.judgeActor, log }) } : {}),
+      return { head, ...(actor === JUDGE_ACTOR ? { judgeActorPolicy: readJudgeWriterPolicy({ env, tool: tool?.judgeActor, log }) } : {}),
         ...(asJudge ? { judgeNotRealMode: readJudgeNotRealMode({ env, tool, log }),
           evidence: readJudgeEvidence(evidenceFile, readFile), disagreements } : {}),
         cardFileMode: readCardRulingFileMode({ env, tool, log }), labels: thread.labels ?? [], comments: thread.comments ?? [],
@@ -191,7 +191,7 @@ export const spawnStableCardJob = (input, session, binding, { spawnDetached = de
   return r.ok ? { ...r, session } : r;
 };
 
-export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConfirm, landRulingCard = defaultLandRulingCard, env = process.env, root = REPO_ROOT, readThread = readLiveThread,
+export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConfirm, landRulingCard = defaultLandRulingCard, env = process.env, tool, root = REPO_ROOT, readThread = readLiveThread,
   readStandingRulingScope = standingRulingScope,
   readScope = () => readScopeLogged(env),
   runGit = git, readOnPr = readCardAtPrHead,
@@ -213,12 +213,9 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
   const recheck = (p, noWrite = 'nothing written') => {
     assertJudgeReason(p.actor, p.reason);
     assertJudgeReason(p.actor, p.sendBackBody);
-    assertJudgeAuthority({}, p);
+    // The SAME policy the plan held (#6494 F7): this sink's env and tool layer, narrowed by the gate-visible policy.
+    if (p.actor === JUDGE_ACTOR) assertJudgeAuthority({ judgeActorPolicy: readJudgeWriterPolicy({ env, tool: tool?.judgeActor, log: warn }) }, p);
     assertRulingIdentity(resolveIdentity(p.actor), p.actor);
-    if (p.actor === JUDGE_ACTOR) {
-      const policy = readJudgeActorPolicy({ env, log: warn });
-      if (!policy.value.enabled) throw new Error('judge actor disabled; ask the operator');
-    }
     const thread = readThread({ repo: p.repo, pr: p.pr });
     if (!Array.isArray(thread.labels) || !Array.isArray(thread.comments)) throw new Error('unreadable thread or labels; retry after a complete read');
     const head = String(thread.headRefOid ?? '').toLowerCase();

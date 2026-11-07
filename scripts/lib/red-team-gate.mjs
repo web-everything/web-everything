@@ -28,7 +28,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveCascade, platformPreference, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
-import { isHumanOperatorComment, isRulingComment } from './operator-identity.mjs';
+import { isHumanOperatorComment, isRulingComment, judgePolicyOnce } from './operator-identity.mjs';
 
 import { parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
 import { parseLatestHumanClearedSha, REVIEWED_SHA_MARKER } from './review-escalation.mjs';
@@ -333,9 +333,10 @@ export function parseRedTeamGateMarker(body) {
 export function gateOutcomesForHead(comments, pr, head) {
   const live = String(head ?? '').toLowerCase();
   const found = new Set();
+  const policy = judgePolicyOnce();
   for (const c of Array.isArray(comments) ? comments : []) {
     const m = parseRedTeamGateMarker(typeof c === 'string' ? c : c?.body);
-    if (m && m.pr === Number(pr) && m.rev === live && isTrustedMarkerAuthor(c) && (m.actor === undefined || isRulingComment(c))) found.add(m.outcome);
+    if (m && m.pr === Number(pr) && m.rev === live && isTrustedMarkerAuthor(c) && (m.actor === undefined || isRulingComment(c, policy))) found.add(m.outcome);
   }
   return found;
 }
@@ -482,10 +483,14 @@ function threadRecords(comments) {
   // Every reader below counts trusted records only, so untrusted comments are dropped before any parse.
   // `at` is the comment's position in the WHOLE thread, so it compares directly with an operator grant's index
   // ({@link roundExtensionGrants}); grant snapshots additionally retain stable identities across thread edits.
+  // `ruling` (is this record a ruling a gate reader honours) is decided ONCE per record, with one judge-policy read
+  // for the whole pass (#6494 F2); every reader below uses it instead of re-deciding per comment.
+  const policy = judgePolicyOnce();
+  const rec = (c, at, from) => ({ c, at, ...(from !== undefined ? { from } : {}), ruling: isRulingComment(c, policy) });
   return (Array.isArray(comments) ? comments : []).flatMap((c, at) => {
     if (!isTrustedMarkerAuthor(c)) return [];
     const gate = parseRedTeamGateMarker(c?.body);
-    if (gate?.actor !== undefined && !isRulingComment(c)) return [];
+    if (gate?.actor !== undefined && !isRulingComment(c, policy)) return [];
     const body = typeof c === 'string' ? c : c?.body;
     const lines = typeof body === 'string' ? body.replace(/\r\n/g, '\n').trimStart().split('\n') : [];
     const k = lines.findIndex(line => CARRIED_LINE_RE.test(line));
@@ -496,9 +501,9 @@ function threadRecords(comments) {
     if (!advisory || advisory.rev !== carried.toSha || !lines.slice(0, k).every(line => {
       const gate = parseRedTeamGateMarker(line);
       return gate?.rev === carried.toSha && gate.pr === advisory.pr;
-    })) return [{ c, at }];
+    })) return [rec(c, at)];
     const parts = [...lines.slice(0, k), advisoryBody];
-    return [{ c, at }, ...parts.map(part => ({ c: { ...c, body: part }, at, from: carried.fromSha }))];
+    return [rec(c, at), ...parts.map(part => rec({ ...c, body: part }, at, carried.fromSha))];
   });
 }
 
@@ -532,7 +537,7 @@ function gateRecordsFor(records, pr, sha, hit) {
   const id = redTeamResultId(hit.parsed);
   return records.flatMap(r => {
     const gate = parseRedTeamGateMarker(recordBody(r));
-    if (gate?.pr !== Number(pr) || gate.rev !== sha || (gate.actor !== undefined && !isRulingComment(r.c))) return [];
+    if (gate?.pr !== Number(pr) || gate.rev !== sha || (gate.actor !== undefined && !r.ruling)) return [];
     if (gate.actor !== undefined && gateActionLines(recordBody(r)).some(line => !['send-back', 'held'].includes(line.action))) return [];
     const decides = gate.result ? gate.result === id
       : threadOrder(r, hit) > 0 || (r.from != null && hit.from != null && r.at === hit.at);
@@ -722,12 +727,12 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
           if (operatorRelease && (!first || r.from || (anyState && r.gate.result !== want))) continue;
           // A stale cap POST cannot overwrite the per-finding send-back that superseded its decision.
           if (action === 'held' && own.get(index) === 'send-back' && supersededCaps.has(r)) continue;
-          if ((action === 'held' || action === 'send-back') && !(block && action === 'send-back' && isRulingComment(r.c))) {
+          if ((action === 'held' || action === 'send-back') && !(block && action === 'send-back' && r.ruling)) {
             ordinaryHolds.set(index, Math.max(ordinaryHolds.get(index) ?? -1, r.at));
           }
-          if (RELEASING_ACTIONS.has(action) || (block && action === 'send-back' && isRulingComment(r.c))) {
+          if (RELEASING_ACTIONS.has(action) || (block && action === 'send-back' && r.ruling)) {
             rulings.push({ kind: action === 'send-back' ? 'block' : action === 'card' ? 'card' : 'not-real',
-              source: operatorRelease || (block && isRulingComment(r.c)) ? 'operator' : 'automatic',
+              source: operatorRelease || (block && r.ruling) ? 'operator' : 'automatic',
               keys: [index], at: r.at, action });
           }
           own.set(index, action);

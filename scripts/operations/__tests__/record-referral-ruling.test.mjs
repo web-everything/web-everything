@@ -1599,4 +1599,132 @@ describe('R671 v1 acting judge referral blocks', () => {
     expect(plan.body).toMatch(/operator ruling/i);
     expect(plan.body).not.toContain(attribution);
   });
+
+  // #6494 — the judge branch of the POST effect: one success path, and one test per refusal.
+  const scratch = [];
+  afterEach(() => { for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+  const prefsEnv = (judgeActor) => {
+    const dir = mkdtempSync(join(tmpdir(), 'judge-actor-policy-'));
+    scratch.push(dir);
+    writeFileSync(join(dir, 'preferences.json'), JSON.stringify(judgeActor === undefined ? {} : { judgeActor }));
+    return { WE_PLATFORM_PREFERENCES_FILE: join(dir, 'preferences.json') };
+  };
+  const bot = { login: 'web-everything', type: 'Bot' };
+  const postHarness = ({ identity = bot, env = prefsEnv(), tool, login = 'web-everything' } = {}) => {
+    const thread = { headRefOid: head, body: '', comments: [gh(renderReferralRecord(rec))] };
+    const posted = [], events = [];
+    const readJson = vi.fn((args) => (args[0] === 'api' ? identity : structuredClone(thread)));
+    const sinks = createRecordReferralRulingSinks({ env, tool, readJson, warn: () => {}, now: () => '2026-11-07T12:00:00Z',
+      appendEvents: async (list) => { events.push(...list); },
+      post: (_r, _p, body) => { posted.push(body); thread.comments.push(gh(body, login)); } });
+    return { sink: sinks[OPERATOR_RULING_POST_EFFECT], posted, events, readJson };
+  };
+  const payloadOf = (plan) => ({ repo, pr: 7, head, body: plan.body, actor: plan.record.actor, channel: plan.record.channel,
+    rulings: plan.record.rulings.map((r) => ({ runId: r.runId, key: r.key, result: r.result, ...(r.supersedes ? { supersedes: r.supersedes } : {}) })) });
+
+  it('judge block posts through the referral POST effect and reads back as a gate-counted block', async () => {
+    const h = postHarness();
+    const plan = planOperatorRuling(snapshot(), request());
+    await expect(h.sink(payloadOf(plan))).resolves.toMatchObject({ posted: true, head });
+    expect(h.posted).toEqual([plan.body]);
+    expect(h.readJson).toHaveBeenCalledWith(['api', 'user']);
+    expect(h.events).toHaveLength(1);
+    expect(h.events[0].actor.declared).toBe('judge:r10');
+    expect(JSON.stringify(h.events[0])).toContain(attribution);
+    const state = mandatoryReferralState([gh(renderReferralRecord(rec)), gh(plan.body)], ctx());
+    expect(state.blocked).toEqual([rec.referrals[0].key]);
+  });
+  it.each([
+    ['a non-automation posting identity', { identity: { login: 'chalbert', type: 'User' } }, {}, /automation|posting identity/i],
+    ['a disabled policy', { env: { ...prefsEnv(), WE_JUDGE_ACTOR_ENABLED: 'false' } }, {}, /judge actor disabled/],
+    ['a row that supersedes a standing ruling', {}, { supersedes: ['operator:aaaaaaaaa:0123456789ab'] }, /judge cannot supersede rulings/],
+    ['an empty ruling', {}, { empty: true }, /judge empty ruling is refused/],
+  ])('judge referral POST effect refuses %s before posting', async (_name, harness, { supersedes, empty }, message) => {
+    const h = postHarness(harness);
+    const payload = payloadOf(planOperatorRuling(snapshot(), request()));
+    if (supersedes) payload.rulings = payload.rulings.map((r) => ({ ...r, supersedes }));
+    if (empty) payload.rulings = [];
+    await expect(h.sink(payload)).rejects.toThrow(message);
+    expect(h.posted).toEqual([]);
+    expect(h.events).toEqual([]);
+  });
+  it('judge referral POST effect refuses a block the gate would not count after posting', async () => {
+    const h = postHarness({ login: 'chalbert' });
+    await expect(h.sink(payloadOf(planOperatorRuling(snapshot(), request())))).rejects.toThrow(/not readable by the gate/);
+  });
+
+  it('judge cannot supersede: explicit --supersedes and a disputed-finding auto-supersede are both refused', () => {
+    expect(() => planOperatorRuling(snapshot(), request('block', { supersedes: 'operator:aaaaaaaaa:0123456789ab' })))
+      .toThrow('judge cannot supersede rulings; operator-only');
+    const disputed = base.open.map((f) => ({ ...f, standing: [], rulingIds: ['operator:aaaaaaaaa:0123456789ab'],
+      blockIds: ['operator:aaaaaaaaa:0123456789ab'] }));
+    const read = snapshot({ open: [], disputed });
+    expect(() => planOperatorRuling(read, request())).toThrow('judge cannot supersede rulings; operator-only');
+    // control: the operator's auto-supersede of the same disputed finding still plans
+    expect(planOperatorRuling(read, request('block', { actor: 'chalbert' })).supersedes).toEqual(['operator:aaaaaaaaa:0123456789ab']);
+  });
+
+  // The structured-referral READER enforces the same judge refusals the writer does (a crafted canonical record).
+  const canonicalJudge = (over = {}) => {
+    const plan = planOperatorRuling(snapshot(), request());
+    return gh(buildOperatorRulingComment({ ...plan.record, ...over }));
+  };
+  it.each(['reviewed-sha', 'ReViEwEd-ShA', 'cleared-human', 'ClEaReD-HuMaN'])(
+    'persisted judge referral blocks containing clearance token %s are ignored', token => {
+      const c = canonicalJudge({ reason: `${attribution}\nOrdinary prose before ${token} and after.` });
+      expect(parseOperatorRulingComment(c)).toBeNull();
+      expect(readOperatorRulings([c]).rulings).toEqual([]);
+      const state = mandatoryReferralState([gh(renderReferralRecord(rec)), c], ctx());
+      expect(state.blocked).toEqual([]);
+      expect(state.pending).toEqual([rec.referrals[0].key]);
+      // control: the same canonical record without the token is a counted judge block
+      expect(readOperatorRulings([canonicalJudge()]).rulings).toHaveLength(1);
+    });
+  it('persisted judge referral block carrying supersedes is ignored', () => {
+    const plan = planOperatorRuling(snapshot(), request());
+    const c = canonicalJudge({ rulings: plan.record.rulings.map((r) => ({ ...r, supersedes: ['operator:aaaaaaaaa:0123456789ab'] })) });
+    expect(readOperatorRulings([c]).rulings).toEqual([]);
+  });
+  it('disabled policy ignores persisted judge referral blocks', () => {
+    const c = canonicalJudge();
+    expect(readOperatorRulings([c], { judgePolicy: () => ({ enabled: false, actor: 'judge:r10' }) }).rulings).toEqual([]);
+    expect(readOperatorRulings([c], { judgePolicy: () => { throw new Error('unreadable'); } }).rulings).toEqual([]);
+    vi.stubEnv('WE_JUDGE_ACTOR_ENABLED', 'false');
+    try {
+      expect(readOperatorRulings([c]).rulings).toEqual([]);
+      expect(mandatoryReferralState([gh(renderReferralRecord(rec)), c], ctx()).pending).toEqual([rec.referrals[0].key]);
+    } finally { vi.unstubAllEnvs(); }
+    expect(readOperatorRulings([c]).rulings).toHaveLength(1);
+  });
+  it('reads the judge policy once per readOperatorRulings pass', () => {
+    const judgePolicy = vi.fn(() => ({ enabled: true, actor: 'judge:r10' }));
+    expect(readOperatorRulings([canonicalJudge(), canonicalJudge(), canonicalJudge()], { judgePolicy }).rulings).toHaveLength(3);
+    expect(judgePolicy).toHaveBeenCalledTimes(1);
+  });
+
+  // #6494 F7 — planning and the effect hold ONE policy: a tool block may narrow the gate-visible policy, never widen it.
+  const realReader = ({ env, tool }) => createRecordReferralRulingReader({ env, tool, log: () => {}, assertFresh: () => {},
+    now: () => '2026-11-07T12:00:00Z', changedLines: () => null, readable: () => false,
+    openPrHead: () => { throw new Error('unexpected PR read'); },
+    readJson: (args) => (args[0] === 'api' ? bot : { headRefOid: head, body: '<!-- authored-by-actor: author -->', comments: [gh(renderReferralRecord(rec))] }) });
+  it.each([
+    ['platform disabled, tool enabled', { enabled: false }, { enabled: true }, false],
+    ['platform enabled, tool disabled', { enabled: true }, { enabled: false }, false],
+    ['platform enabled, tool enabled', { enabled: true }, { enabled: true }, true],
+  ])('referral writer: %s — planning and the POST effect agree', async (_name, platform, toolBlock, allowed) => {
+    const env = prefsEnv(platform), tool = { judgeActor: toolBlock };
+    const read = realReader({ env, tool })({ repo, pr: 7, actor: 'judge:r10' });
+    expect(read.judgeActorPolicy.value.enabled).toBe(allowed);
+    const h = postHarness({ env, tool });
+    if (!allowed) {
+      expect(() => planOperatorRuling({ ...read, now: '2026-11-07T12:00:00Z', clearerId: 'judge-session' }, request())).toThrow(/judge actor disabled/);
+      // the effect, handed a plan made under an enabled policy, refuses the same way
+      await expect(h.sink(payloadOf(planOperatorRuling(snapshot(), request())))).rejects.toThrow(/judge actor disabled/);
+      expect(h.posted).toEqual([]);
+      return;
+    }
+    const plan = planOperatorRuling({ ...read, now: '2026-11-07T12:00:00Z', clearerId: 'judge-session' }, request());
+    await expect(h.sink(payloadOf(plan))).resolves.toMatchObject({ posted: true });
+    expect(h.posted).toEqual([plan.body]);
+  });
 });

@@ -11,7 +11,7 @@ import { buildVerdictCarriedMarker } from '../../lib/review-verdict-carried-mark
 import { assertRulingCardInputFits, planRedTeamRuling, rulableBreaks, selectBreaks, recordRedTeamRulingOperation, buildRuleReasonComment, RED_TEAM_RULING_CARD_EFFECT, RED_TEAM_RULING_BLOCK_EFFECT, RED_TEAM_RULING_NOT_REAL_EFFECT } from '../record-red-team-ruling.mjs';
 import { assertHumanOperator, operatorBoundComments } from '../../lib/operator-identity.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
-import { runCardLandingWithReceipt, createRecordRedTeamRulingSinks, spawnStableCardJob } from '../record-red-team-ruling-io.mjs';
+import { runCardLandingWithReceipt, createRecordRedTeamRulingReader, createRecordRedTeamRulingSinks, spawnStableCardJob } from '../record-red-team-ruling-io.mjs';
 import { blockRulingId, cardJobKey, conflictingPendingCardJobs, rulingCardResource } from '../record-red-team-ruling.mjs';
 import { applyRedTeamGate } from '../red-team-gate-apply.mjs';
 import { parseAdvisories, trustedAdvisoryComments } from '../../lib/advisory-labels.mjs';
@@ -2366,5 +2366,41 @@ describe('R671 v1 acting judge red-team blocks', () => {
     expect(planRedTeamRuling(read(), input())).toMatchObject({ actor: OP.login, ruling: 'card' });
     expect(() => planRedTeamRuling(judgeRead(), input())).toThrow(/human|operator/i);
     expect(buildRuleReasonComment(planRedTeamRuling(read(), input()))).not.toContain(attribution);
+  });
+
+  // #6494 F7 — planning and the effect hold ONE policy: a tool block may narrow the gate-visible policy, never widen it.
+  const scratch = [];
+  afterEach(() => { for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+  const prefsEnv = (judgeActor) => {
+    const dir = mkdtempSync(join(tmpdir(), 'judge-actor-policy-'));
+    scratch.push(dir);
+    writeFileSync(join(dir, 'preferences.json'), JSON.stringify({ judgeActor }));
+    return { WE_PLATFORM_PREFERENCES_FILE: join(dir, 'preferences.json') };
+  };
+  it.each([
+    ['platform disabled, tool enabled', { enabled: false }, { enabled: true }, false],
+    ['platform enabled, tool disabled', { enabled: true }, { enabled: false }, false],
+    ['platform enabled, tool enabled', { enabled: true }, { enabled: true }, true],
+  ])('red-team writer: %s — planning and the effect agree', async (_name, platform, toolBlock, allowed) => {
+    const env = prefsEnv(platform), tool = { judgeActor: toolBlock };
+    const reader = createRecordRedTeamRulingReader({ env, tool, log: () => {}, assertFresh: () => {}, now: () => read().now,
+      readThread: () => ({ headRefOid: HEAD, comments: thread(), labels: [{ name: 'review:human' }] }),
+      readEvents: () => ({ status: 'ok', rows: [] }),
+      readSetting: () => ({ value: { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses: {} } }),
+      readScope: () => ({ value: { anyState: true }, sources: {} }), readStandingRulingScope: () => null,
+      resolveIdentity: () => identity, resolveCard: () => null });
+    const context = reader({ repo, pr: PR, actor: 'judge:r10' });
+    expect(context.judgeActorPolicy.value.enabled).toBe(allowed);
+    const post = vi.fn(), readThread = vi.fn(), runSetLabel = vi.fn();
+    const sinks = createRecordRedTeamRulingSinks({ env, tool, post, readThread, runSetLabel, warn: () => {}, resolveIdentity: () => identity });
+    if (!allowed) {
+      expect(() => planRedTeamRuling(judgeRead({ judgeActorPolicy: context.judgeActorPolicy }), judgeInput())).toThrow(/judge actor disabled/);
+      // the effect, handed a plan made under an enabled policy, refuses the same way before any read or write
+      await expect(sinks[RED_TEAM_RULING_BLOCK_EFFECT](planRedTeamRuling(judgeRead(), judgeInput()))).rejects.toThrow(/judge actor disabled/);
+      expect(post).not.toHaveBeenCalled();
+      expect(readThread).not.toHaveBeenCalled();
+      return;
+    }
+    expect(planRedTeamRuling(judgeRead({ judgeActorPolicy: context.judgeActorPolicy }), judgeInput())).toMatchObject({ actor: 'judge:r10', ruling: 'block' });
   });
 });
