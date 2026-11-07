@@ -134,7 +134,7 @@ export class LedgerAppendExhaustedError extends Error {
  * @returns {{status: 'ok', records: object[], text: string} | {status: 'unreadable', reason: string, error: string}}
  */
 export function readLedgerFromGit({
-  board, repo, branch = LEDGER_TRANSPORT_BRANCH, run, exec, env = process.env, settings, log = defaultLog,
+  board, repo, branch = LEDGER_TRANSPORT_BRANCH, run, exec, env = process.env, settings, log = defaultLog, fresh = false,
 } = {}) {
   const path = ledgerGitPath(repo);
   let files;
@@ -146,7 +146,7 @@ export function readLedgerFromGit({
       if (!loggedCaps.has(line)) { loggedCaps.add(line); log(line); }
       run = sizedLedgerRun({ maxBytes: cap.maxBytes, source: cap.sources.maxBytes, ...(exec ? { exec } : {}) });
     }
-    files = readFromTransportBranch({ board, branch, paths: [path], run });
+    files = readFromTransportBranch({ board, branch, paths: [path], run, fresh });
   } catch (e) {
     const reason = e?.code === READ_CAP_CODE ? 'ledger-exceeds-read-cap' : 'transport-read-failed';
     return { status: 'unreadable', reason, error: String(e?.message ?? e) };

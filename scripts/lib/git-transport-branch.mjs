@@ -364,10 +364,10 @@ function readExisting(abs) {
  * @returns {Record<string, string|null>} path -> text, or null when the path is not on the branch.
  */
 export function readFromTransportBranch({
-  board, branch, paths = [], run = defaultGit, now = Date.now, env = process.env, log = defaultFetchLog,
+  board, branch, paths = [], run = defaultGit, now = Date.now, env = process.env, log = defaultFetchLog, fresh = false,
 } = {}) {
   if (!board || !branch) throw new TypeError('git-transport-branch: `board` and `branch` are both required');
-  coalescedReadFetch({ board, branch, run, now, env, log });
+  coalescedReadFetch({ board, branch, run, now, env, log, fresh });
   const out = {};
   for (const path of paths) {
     const listed = run(['ls-tree', '--name-only', `origin/${branch}`, '--', path], { cwd: board }).trim();
@@ -395,9 +395,11 @@ function defaultFetchLog(msg) { process.stderr.write(`${msg}\n`); }
  * No lock: two overlapping misses simply both fetch (what every read did before), so nothing can wedge. The
  * stamp is written atomically (tmp file + rename) only after a successful fetch. An unreadable or corrupt stamp,
  * or any fs problem, means a plain fetch (fail closed). Writes (`stageOnTransportBranch`) never use this: they
- * always fetch before staging. Logs `source=cache|origin`.
+ * always fetch before staging. A DECISION reader (merge gate, anything that approves or blocks) passes
+ * `fresh: true`: it never reads the cache, but its fetch still refreshes the stamp for ordinary readers.
+ * Logs `source=cache|origin`.
  */
-function coalescedReadFetch({ board, branch, run, now, env, log }) {
+function coalescedReadFetch({ board, branch, run, now, env, log, fresh = false }) {
   const rawTtl = env?.WE_OPS_FETCH_TTL_MS;
   const fromEnv = rawTtl !== undefined && rawTtl !== '' && Number.isFinite(Number(rawTtl));
   const ttl = fromEnv ? Number(rawTtl) : OPS_READ_FETCH_TTL_MS;
@@ -419,11 +421,11 @@ function coalescedReadFetch({ board, branch, run, now, env, log }) {
   const started = now();
   try {
     const at = Number(readFileSync(stampFile, 'utf8').trim());
-    if (Number.isFinite(at) && at > 0 && started - at >= 0 && started - at < ttl) {
+    if (!fresh && Number.isFinite(at) && at > 0 && started - at >= 0 && started - at < ttl) {
       return log(`ops-fetch branch=${branch} source=cache ${tag}`);
     }
   } catch { /* unreadable stamp: fetch */ }
-  fetchOrigin('stamp-stale');
+  fetchOrigin(fresh ? 'fresh-required' : 'stamp-stale');
   try {
     const tmp = `${stampFile}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
     writeFileSync(tmp, String(started));

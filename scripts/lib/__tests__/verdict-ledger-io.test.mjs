@@ -6,7 +6,7 @@
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import {
   appendGitRowsSync, createGitLedgerStore, appendLedgerRows, readLedgerFromGit, ledgerGitPath, LedgerAppendExhaustedError, LEDGER_TRANSPORT_BRANCH,
@@ -57,6 +57,13 @@ describe('readLedgerFromGit: decision readers pass fresh, ordinary readers use t
     readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, fresh), fresh: true });
     readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, fresh), fresh: true });
     expect(fetchCount(fresh)).toBe(2);
+  });
+});
+
+describe('the merge gate is a decision reader', () => {
+  it('merge-gate-check reads the ledger with fresh: true (never the TTL cache)', () => {
+    const src = readFileSync(join(import.meta.dirname, '../../merge-gate-check.mjs'), 'utf8');
+    expect(src).toMatch(/readLedgerFromGit\(\{[^}]*fresh: true/);
   });
 });
 
