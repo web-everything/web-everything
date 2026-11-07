@@ -269,11 +269,12 @@ it('default reader uses paginated API numstat with the repo and PR', () => {
   expect(calls[1]).toEqual(['api', '--paginate', 'repos/o/r/pulls/7/files', '--jq', '.[]|"\\(.additions)\\t\\(.deletions)\\t\\(.filename)"']);
   expect(sizeAdds(calls)).toHaveLength(1);
 });
-it('default reader without a repo uses gh pr view files', () => {
-  const { calls, invoke } = sizeHarness({ repo: '', filesOutput: JSON.stringify({ files: [{ additions: 301, deletions: 0, path: 'src/a.mjs' }], changedFiles: 1 }) });
+it('default reader without a repo is unmeasurable and fails closed (no implicit repo)', () => {
+  const { calls, invoke } = sizeHarness({ repo: '' });
   expect(invoke()).toBe(true);
-  expect(calls[1]).toEqual(['pr', 'view', '7', '--json', 'files,changedFiles']);
+  expect(calls.some(args => args.includes('files') || args.includes('files,changedFiles'))).toBe(false);
   expect(sizeAdds(calls)).toHaveLength(1);
+  expect(sizeComments(calls)[0].at(-1)).toContain('pr-size-unmeasurable');
 });
 it('default reader fails closed at the 3000-file API cap with human review fallback', () => {
   const { calls, invoke } = sizeHarness({ filesOutput: '0\t0\tsrc/a.mjs\n'.repeat(3000) });
@@ -282,19 +283,4 @@ it('default reader fails closed at the 3000-file API cap with human review fallb
   expect(sizeComments(calls)[0].at(-1)).toContain('pr-size-unmeasurable');
   expect(sizeComments(calls)[0].at(-1)).toContain('human review of the full diff is required');
   expectCiHandoff(calls);
-});
-it('fails closed when the no-repo file list is partial (default reader) and keeps the size label', () => {
-  const calls = [];
-  const run = (cmd, args) => {
-    calls.push(args);
-    if (args[1] === 'view' && args.includes('headRefOid,labels,statusCheckRollup')) {
-      return JSON.stringify({ headRefOid: 'abc', labels: ['size:over-cap'] });
-    }
-    if (args[1] === 'view' && args.includes('files,changedFiles')) {
-      return JSON.stringify({ files: [{ path: 'a.mjs', additions: 1, deletions: 0 }], changedFiles: 250 });
-    }
-    return '';
-  };
-  markFixPushAwaitingCi({ pr: 7, head: 'abc' }, { run, recordPush: () => {} });
-  expect(calls.some(args => args.includes('--remove-label') && args.includes('size:over-cap'))).toBe(false);
 });

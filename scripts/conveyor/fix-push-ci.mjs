@@ -15,20 +15,12 @@ import { planSizeGrowth, planGrowthTransition, SIZE_OVER_CAP_LABEL } from '../li
 export const FIX_PUSH_GATE_CHECK = 'merge-gate';
 const defaultRun = (cmd, args) => execFileSyncThrottled(cmd, args, { encoding: 'utf8', timeout: resolveChildTimeoutMs(), maxBuffer: 4 * 1024 * 1024 });
 function defaultReadNumstat({ repo, pr, run }) {
-  if (repo) {
-    const text = run('gh', ['api', '--paginate', `repos/${repo}/pulls/${pr}/files`, '--jq', '.[]|"\\(.additions)\\t\\(.deletions)\\t\\(.filename)"']);
-    // The files endpoint silently caps evidence at 3000 files.
-    if (typeof text !== 'string' || text.split('\n').filter(Boolean).length >= 3000) throw new Error('incomplete PR files');
-    return text;
-  }
-  const { files, changedFiles } = JSON.parse(run('gh', ['pr', 'view', String(pr), '--json', 'files,changedFiles']));
-  // gh may page or cap the list: the file list must match the forge's own count.
-  if (!Array.isArray(files) || files.length >= 3000 || changedFiles !== files.length) throw new Error('incomplete PR files');
-  return files.map(file => {
-    if (!Number.isSafeInteger(file.additions) || !Number.isSafeInteger(file.deletions)
-      || typeof file.path !== 'string' || /[\t\r\n\0]/.test(file.path)) throw new Error('invalid PR file');
-    return `${file.additions}\t${file.deletions}\t${file.path}\n`;
-  }).join('');
+  // A repo-less read would be implicit; callers always pass the slug, so no repo is unmeasurable (fails closed).
+  if (!repo) throw new Error('size evidence needs an explicit repo');
+  const text = run('gh', ['api', '--paginate', `repos/${repo}/pulls/${pr}/files`, '--jq', '.[]|"\\(.additions)\\t\\(.deletions)\\t\\(.filename)"']);
+  // The files endpoint silently caps evidence at 3000 files.
+  if (typeof text !== 'string' || text.split('\n').filter(Boolean).length >= 3000) throw new Error('incomplete PR files');
+  return text;
 }
 export const FIX_PUSH_RED_CI_LABELS = Object.freeze(['ci:failed', 'status:ci-red']);
 export const FIX_PUSH_FIXER_LABELS = Object.freeze(['status:fixing', 'status:takeover-running']);
