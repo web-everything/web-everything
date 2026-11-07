@@ -1711,6 +1711,7 @@
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
  "soak": {
+  "scripts/conveyor/soak/breaks/overlay-main-sync-unrunnable-selection.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/review-pr-list-504-reads-zero-owed.soak.test.mjs": 3.02,
   "scripts/conveyor/soak/breaks/recovery-apply-unbounded-hits-pass-deadline.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/smoke-dryrun-resumes-real-session.soak.test.mjs": 2,

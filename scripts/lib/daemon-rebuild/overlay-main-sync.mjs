@@ -532,6 +532,36 @@ function assertionIdentity(file, assertion) {
   }
   return null;
 }
+// Vitest 1.x has no list CLI: let its own config loader and project globbing define the inventory.
+const VITEST_LIST_SCRIPT = `
+const { createVitest } = await import('vitest/node');
+const ctx = await createVitest('test', { watch: false, run: false });
+try {
+  const files = await ctx.globTestFiles();
+  console.log(JSON.stringify(files.map(entry => Array.isArray(entry) ? entry[1] : entry)));
+} finally { await ctx.close(); }
+`;
+const TEST_LIST_MAX_BUFFER = 8 * 1024 * 1024;
+async function runnableTestFiles({ scratch, env, runner = spawnSync }) {
+  let result;
+  try {
+    result = await runner(process.execPath, ['--input-type=module', '-e', VITEST_LIST_SCRIPT], {
+      cwd: scratch, env, encoding: 'utf8', timeout: 60_000, maxBuffer: TEST_LIST_MAX_BUFFER,
+    });
+    const stdout = output({ ...result, step: 'test-select' });
+    if (Buffer.byteLength(stdout, 'utf8') > TEST_LIST_MAX_BUFFER) throw new Error('Vitest inventory exceeds 8 MiB');
+    const files = JSON.parse(stdout);
+    if (!Array.isArray(files) || files.some(file => typeof file !== 'string' || !isAbsolute(file) || file.includes('\0'))) {
+      throw new Error('invalid Vitest inventory paths');
+    }
+    return new Set(files);
+  } catch (cause) {
+    const tail = stderrTail(result) || cleanText(cause.message).slice(-500);
+    throw Object.assign(new Error(`Vitest inventory unavailable; operator review required: ${cleanText(cause.message)}`),
+      { step: 'test-select', stderrTail: tail });
+  }
+}
+
 async function syncTestEvidence({ root, scratch, selected, testReport, env, io, runner }) {
   io.rmSync(testReport, { force: true }); // Never consume a previous attempt's evidence.
   const invocation = buildHeavyTestInvocation({ root, scratch, selected, testReport, env, io });
@@ -716,7 +746,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     const selected = new Set(own.filter(f => candidates.has(f) && isVitestTestFile(f)));
     for (const f of testDepths([...own, ...conflictTouched], reverse).keys()) if (candidates.has(f)) selected.add(f);
     if (!selected.size) return await skip('no-relevant-tests');
-    const tests = [...selected].sort();
+    let tests = [...selected].sort();
     io.appendFileSync(join(scratch, '.git', 'info', 'exclude'), '\n/node_modules\n');
     io.statSync(join(root, 'node_modules'));
     io.symlinkSync(join(root, 'node_modules'), join(scratch, 'node_modules'), 'dir');
@@ -724,6 +754,14 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     // A real, clean clone, never a link: the Forge manifest refuses a symlinked or dirty sibling, so a link here
     // forced every scratch test run back onto the Mac. A local clone is cheap (hardlinked objects) and committed-only.
     if (io.existsSync(frontier)) output(git(['clone', '--quiet', '--local', frontier, join(scratchParent, 'frontierui')], scratchParent));
+    setStep('test-select');
+    const runnable = await runnableTestFiles({ scratch, env, runner: deps.testListRunner });
+    const scratchReal = io.realpathSync(scratch);
+    tests = tests.filter(file => runnable.has(join(scratchReal, file)));
+    const filteredNotRunnable = selected.size - tests.length;
+    console.error(`overlay-main-sync test-select ref=${cleanText(ref)} selected: ${tests.length} filteredNotRunnable: ${filteredNotRunnable}`);
+    event(root, { kind: 'overlay-main-test-selection', ref, selected: tests.length, filteredNotRunnable }, { env });
+    if (!tests.length) return await skip('no-relevant-tests');
     setStep('tests');
     const { value: reruns, source: rerunsSource } = resolveOverlayFlakeReruns(env);
     for (let offset = 0; offset < tests.length; offset += 50) {

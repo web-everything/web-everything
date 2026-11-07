@@ -1,5 +1,5 @@
 /** A long tmp-leak footer must not displace the failed test's stdout identity. */
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -60,6 +60,9 @@ export default {
             return git(args, opts);
           },
           appendDaemonEvent: event => { events.push(event); },
+          // Vitest inventory: the committed overlay test is runnable, so selection reaches the runner below.
+          testListRunner: (_command, _args, { cwd }) => ({ status: 0,
+            stdout: JSON.stringify([join(realpathSync(cwd), FILE)]), stderr: '' }),
           testRunner: async () => {
             testCalls++;
             return { status: 1,
