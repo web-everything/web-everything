@@ -35,7 +35,7 @@
  */
 import { retryTransientGit } from './git-fetch-retry.mjs';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 
 /**
@@ -364,10 +364,10 @@ function readExisting(abs) {
  * @returns {Record<string, string|null>} path -> text, or null when the path is not on the branch.
  */
 export function readFromTransportBranch({
-  board, branch, paths = [], run = defaultGit, now = Date.now, env = process.env, log = defaultFetchLog, sleep = sleepSync,
+  board, branch, paths = [], run = defaultGit, now = Date.now, env = process.env, log = defaultFetchLog,
 } = {}) {
   if (!board || !branch) throw new TypeError('git-transport-branch: `board` and `branch` are both required');
-  coalescedReadFetch({ board, branch, run, now, env, log, sleep });
+  coalescedReadFetch({ board, branch, run, now, env, log });
   const out = {};
   for (const path of paths) {
     const listed = run(['ls-tree', '--name-only', `origin/${branch}`, '--', path], { cwd: board }).trim();
@@ -378,21 +378,19 @@ export function readFromTransportBranch({
 
 /** Default TTL for a READ's origin fetch of a transport branch; override with WE_OPS_FETCH_TTL_MS (0 = always fetch). */
 export const OPS_READ_FETCH_TTL_MS = 30_000;
-const OPS_LOCK_STALE_MS = 300_000;
-const OPS_LOCK_WAIT_MS = 60_000;
 
 function defaultFetchLog(msg) { process.stderr.write(`${msg}\n`); }
-function sleepSync(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
 
 /**
  * READS ONLY. Many lanes and daemons read the same ops branch every tick and each ran its own network fetch
  * (a ~10 MB ledger: ~70% CPU in `git unpack-objects`). A per-repo+branch stamp inside the repo's own git dir
- * records the last successful fetch; a read within the TTL uses the existing remote-tracking ref. A lock
- * (atomic mkdir) lets concurrent callers share one fetch: the loser re-checks the stamp the winner wrote.
- * Writes (`stageOnTransportBranch`) never use this: they always fetch before staging. Any unreadable stamp or
- * lock problem falls back to a plain fetch (fail closed). Logs `source=cache|origin`.
+ * records when the last successful fetch STARTED; a read within the TTL uses the existing remote-tracking ref.
+ * No lock: two overlapping misses simply both fetch (what every read did before), so nothing can wedge. The
+ * stamp is written atomically (tmp file + rename) only after a successful fetch. An unreadable or corrupt stamp,
+ * or any fs problem, means a plain fetch (fail closed). Writes (`stageOnTransportBranch`) never use this: they
+ * always fetch before staging. Logs `source=cache|origin`.
  */
-function coalescedReadFetch({ board, branch, run, now, env, log, sleep }) {
+function coalescedReadFetch({ board, branch, run, now, env, log }) {
   const rawTtl = env?.WE_OPS_FETCH_TTL_MS;
   const fromEnv = rawTtl !== undefined && rawTtl !== '' && Number.isFinite(Number(rawTtl));
   const ttl = fromEnv ? Number(rawTtl) : OPS_READ_FETCH_TTL_MS;
@@ -401,50 +399,28 @@ function coalescedReadFetch({ board, branch, run, now, env, log, sleep }) {
     retryTransientGit(() => run(['fetch', '--quiet', 'origin', trackingRefspec(branch)], { cwd: board }));
     log(`ops-fetch branch=${branch} source=origin ${tag} ${why}`);
   };
-  let stampFile; let lockDir;
+  let stampFile;
   try {
     if (!(ttl > 0)) return fetchOrigin('ttl-disabled');
-    const gitDir = resolve(board, run(['rev-parse', '--git-common-dir'], { cwd: board }).trim());
-    const dir = join(gitDir, 'we-ops-fetch');
+    const common = String(run(['rev-parse', '--git-common-dir'], { cwd: board }) ?? '').trim();
+    if (!common) throw new Error('no git dir');
+    const dir = join(resolve(board, common), 'we-ops-fetch');
     mkdirSync(dir, { recursive: true });
     stampFile = join(dir, encodeURIComponent(branch));
-    lockDir = `${stampFile}.lock`;
   } catch { return fetchOrigin('stamp-unavailable'); }
-  const fresh = () => {
-    try {
-      const at = Number(readFileSync(stampFile, 'utf8').trim());
-      return Number.isFinite(at) && at > 0 && now() - at >= 0 && now() - at < ttl;
-    } catch { return false; }
-  };
-  const hit = () => { log(`ops-fetch branch=${branch} source=cache ${tag}`); };
-  if (fresh()) return hit();
-  const deadline = now() + OPS_LOCK_WAIT_MS;
-  const token = `${process.pid}-${now()}-${Math.random().toString(36).slice(2)}`;
-  let held = false;
-  while (!held) {
-    try { writeFileSync(lockDir, token, { flag: 'wx' }); held = true; continue; } catch (e) {
-      // only "someone else holds it" is waited on; any other fs error (permissions, bad path) fetches directly
-      if (e?.code !== 'EEXIST') return fetchOrigin('lock-error');
-    }
-    if (fresh()) return hit();
-    if (now() > deadline) return fetchOrigin('lock-timeout');
-    try {
-      if (now() - statSync(lockDir).mtimeMs > OPS_LOCK_STALE_MS) {
-        // atomic reclaim: of several reclaimers only one rename succeeds; the others retry
-        const gone = `${lockDir}.stale-${token}`;
-        renameSync(lockDir, gone);
-        rmSync(gone, { force: true });
-      } else sleep(100);
-    } catch { sleep(100); }
-  }
+  const started = now();
   try {
-    if (fresh()) return hit();
-    fetchOrigin('stamp-stale');
-    try { writeFileSync(stampFile, String(now())); } catch { /* next reader just fetches */ }
-  } finally {
-    // release only a lock that is still ours: a reclaimed lock now belongs to a successor
-    try { if (readFileSync(lockDir, 'utf8') === token) rmSync(lockDir, { force: true }); } catch { /* already gone */ }
-  }
+    const at = Number(readFileSync(stampFile, 'utf8').trim());
+    if (Number.isFinite(at) && at > 0 && started - at >= 0 && started - at < ttl) {
+      return log(`ops-fetch branch=${branch} source=cache ${tag}`);
+    }
+  } catch { /* unreadable stamp: fetch */ }
+  fetchOrigin('stamp-stale');
+  try {
+    const tmp = `${stampFile}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+    writeFileSync(tmp, String(started));
+    renameSync(tmp, stampFile);
+  } catch { /* next reader just fetches */ }
 }
 
 function defaultGit(args, opts) {

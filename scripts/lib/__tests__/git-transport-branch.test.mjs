@@ -8,7 +8,7 @@
  * second caller must not be able to lose them by construction.
  */
 import { describe, it, expect } from 'vitest';
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { stageOnTransportBranch, reclaimStrandedTransportWorktrees, readFromTransportBranch } from '../git-transport-branch.mjs';
@@ -424,7 +424,7 @@ describe('read fetch is coalesced through a per-repo+branch TTL stamp in .git', 
     };
     const read = (over = {}) => readFromTransportBranch({
       board: '/board', branch: 'ops/x', paths: ['p'], run, now: () => t, log: (m) => logs.push(m),
-      env: {}, sleep: () => {}, ...over,
+      env: {}, ...over,
     });
     return { calls, logs, read, tick: (ms) => { t += ms; } };
   };
@@ -456,47 +456,28 @@ describe('read fetch is coalesced through a per-repo+branch TTL stamp in .git', 
     stage(s);
     expect(s.calls.some((c) => c.args?.[0] === 'fetch')).toBe(true);
   });
-  it('two concurrent reads fetch once: the lock loser re-checks the stamp the winner wrote', () => {
-    reset(); const m = mk();
-    mkdirSync(stampDir, { recursive: true });
-    const lock = `${stampFile}.lock`;
-    writeFileSync(lock, 'other');
-    const sleep = () => { writeFileSync(stampFile, '1000000'); rmSync(lock, { force: true }); };
-    m.read({ sleep });
-    expect(fetches(m.calls)).toBe(0);
-  });
   it('a failed fetch writes no stamp, so the next read fetches again', () => {
     reset(); const m = mk();
     const run = (a) => { m.calls.push(a[0]); if (a[0] === 'rev-parse') return `${dir}\n`; throw new Error('net'); };
     expect(() => m.read({ run })).toThrow();
     expect(existsSync(stampFile)).toBe(false);
   });
-  it('a stale lock is reclaimed, then fetched and stamped', () => {
+  it('two overlapping reads each fetch or skip correctly, with no deadlock', () => {
     reset(); const m = mk();
-    mkdirSync(stampDir, { recursive: true });
-    writeFileSync(`${stampFile}.lock`, 'dead');
-    const old = new Date(Date.now() - 400_000);
-    utimesSync(`${stampFile}.lock`, old, old);
-    m.read({ now: () => Date.now() });
-    expect(fetches(m.calls)).toBe(1);
-    expect(existsSync(`${stampFile}.lock`)).toBe(false);
-  });
-  it('a lock that never frees times out to an origin fetch', () => {
-    reset(); const m = mk();
-    mkdirSync(stampDir, { recursive: true });
-    writeFileSync(`${stampFile}.lock`, 'busy');
-    let t = Date.now();
-    m.read({ now: () => t, sleep: () => { t += 30_000; } });
-    expect(fetches(m.calls)).toBe(1);
-    expect(m.logs.join('\n')).toMatch(/lock-timeout/);
-  });
-  it('a non-EEXIST lock error fetches directly instead of spinning', () => {
-    reset(); const m = mk();
-    mkdirSync(stampDir, { recursive: true });
-    chmodSync(stampDir, 0o500);
-    try { m.read(); } finally { chmodSync(stampDir, 0o700); }
-    expect(fetches(m.calls)).toBe(1);
-    expect(m.logs.join('\n')).toMatch(/lock-error/);
+    // overlap: the second read starts while the first one's fetch is still running (no stamp yet)
+    let inner = 0;
+    const run = (a) => {
+      m.calls.push(a[0]);
+      if (a[0] === 'rev-parse') return `${dir}\n`;
+      if (a[0] === 'fetch' && inner === 0) { inner += 1; m.read(); }
+      if (a[0] === 'ls-tree') return 'p';
+      return a[0] === 'show' ? 'text' : '';
+    };
+    m.read({ run });
+    expect(fetches(m.calls)).toBe(2); // both missed and fetched; harmless, same as before
+    m.read(); // stamp now fresh: skip
+    expect(fetches(m.calls)).toBe(2);
+    expect(readdirSync(stampDir).filter((f) => f.endsWith('.tmp'))).toEqual([]);
   });
   it('an unreadable stamp fails closed: fetch', () => {
     reset(); const m = mk();
