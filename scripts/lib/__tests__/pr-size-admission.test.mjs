@@ -98,7 +98,9 @@ describe('planSizeGrowth — pure post-open size escalation', () => {
     expect(result.splitPlan.groups).toHaveLength(150);
     expect(result.splitPlan.files).toHaveLength(150);
     expect(Buffer.byteLength(result.splitPlan.text)).toBeLessThan(4400);
-    expect(result.splitPlan.text).not.toMatch(/<script>|\n/);
+    // Case-insensitive, string-based (no HTML-filtering regexp: CodeQL flags a /<script>/ regexp as bad HTML filtering).
+    expect(result.splitPlan.text.toLowerCase().includes('<script')).toBe(false);
+    expect(result.splitPlan.text.includes('\n')).toBe(false);
     expect(result.splitPlan.text).toContain('omitted; summary budget');
     expect(result.splitPlan.text).toContain('Human review of the full diff is required');
   });
