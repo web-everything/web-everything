@@ -21,7 +21,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { readOperatorRulings, AUTO_POLICY_ACTOR, exactCitedPath } from '../lib/jury-core.mjs';
+import { readReferralRecords, operatorRulingId, readOperatorRulings, AUTO_POLICY_ACTOR, exactCitedPath } from '../lib/jury-core.mjs';
 import { currentActorId } from '../lib/review-independence.mjs';
 import { referralCardReadable } from '../review-set-label.mjs';
 import { CARD_REF_RE } from '../lib/referral-card-readable.mjs';
@@ -31,7 +31,7 @@ import '../lib/verdict-ledger-io.mjs'; // registers the `git` store `appendVerdi
 import { ledgerFindingKey } from '../lib/pr-state/referrals.mjs';
 import { assertOperatorCliFresh } from '../lib/main-staleness.mjs';
 import { idFromName, normalizeId } from '../backlog/id.mjs';
-import { openReferralFindings, automaticPolicyTargets, describePolicySkip, policyProtectionSnapshot,
+import { selectFindings, openReferralFindings, automaticPolicyTargets, describePolicySkip, policyProtectionSnapshot,
   OPERATOR_RULING_POST_EFFECT, OPERATOR_RULING_FOLLOW_UP_EFFECT, planJudgeNotReal, finishJudgeRuling, planReferralCard } from './record-referral-ruling.mjs';
 import { createChangedLinesReader, changesTouchCitedLines, COMPARE_FILE_CAP } from './review-pr-io.mjs';
 
@@ -190,9 +190,10 @@ export async function judgeConfirm({ findings, evidence, head }, { spawnFn = spa
   const input = fenceUntrusted('findings', JSON.stringify({ findings, head })) + '\n'
     + fenceUntrusted('material', JSON.stringify(evidence));
   if (input.length > 65536) throw new Error('judge input exceeds bound; file a card or ask the operator');
-  let overflow = false;
+  let overflow = false, exitCode;
   const spawnBounded = (...args) => {
     const child = spawnFn(...args);
+    child.on('close', code => { exitCode = code; });
     let bytes = 0;
     for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => {
       bytes += chunk.length;
@@ -213,6 +214,9 @@ export async function judgeConfirm({ findings, evidence, head }, { spawnFn = spa
     if (overflow || result.timedOut) throw new Error('judge output incomplete; file a card or ask the operator');
     if (!['agree', 'disagree', 'unsure'].includes(result.value?.verdict))
       throw new Error('judge verdict unknown; file a card or ask the operator');
+    // The shared parser preserves structured output even after a process failure.
+    // Its returned outcome omits exit status: require the observed child close.
+    if (exitCode !== 0 || result.is_error) return { verdict: 'unsure' };
     return result.value;
   } finally {
     rmSync(cwd, { recursive: true, force: true });
@@ -334,19 +338,45 @@ export const judgeRulingSink = ({ confirm = judgeConfirm, land, planCard }) => a
   return { ...receipt, ...outcome, binding: card.binding };
 };
 
+/** Count distinct historical ruling IDs per finding, including replaced rulings. */
+function referralDisagreements(comments, open, { repo, pr, finding }) {
+  const history = readReferralRecords(comments), operators = readOperatorRulings(comments);
+  if (history.malformed || operators.malformed || open.protectionMalformed) return undefined;
+  const numbered = finding === 'all-open' || /^\d+(,\d+)*$/.test(finding ?? '');
+  const targets = numbered ? open.open : [...open.open,
+    ...open.ruled.filter(r => !open.disputed.some(d => d.runId === r.runId && d.key === r.key)), ...open.disputed];
+  const selected = finding ? selectFindings(targets, finding) : targets;
+  return Math.max(0, ...selected.map(f => {
+    const ids = new Set();
+    const add = r => {
+      if (r.id) ids.add(r.id);
+      for (const id of [r.supersedes ?? []].flat()) ids.add(id);
+    };
+    for (const r of history.records) if (r.repo === repo && r.pr === Number(pr) && r.runId === f.runId) {
+      for (const ruling of r.rulings) if (ruling.key === f.key) add(ruling);
+    }
+    for (const r of operators.rulings) if (r.repo === repo && r.pr === Number(pr) && r.runId === f.runId && r.key === f.key) add({ ...r, id: operatorRulingId(r) });
+    for (const r of [...open.ruled, ...open.disputed]) if (r.runId === f.runId && r.key === f.key) {
+      for (const id of [...r.rulingIds, ...(r.blockIds ?? [])]) ids.add(id);
+    }
+    return ids.size;
+  }));
+}
+
 export function createRecordReferralRulingReader({ root = REPO_ROOT, readJson = ghJson, now = () => new Date().toISOString(),
   env = process.env, tool, readFile = readFileSync, readable = referralCardReadable, openPrHead = openPrHeadBacklog, changedLines, log = (m) => process.stderr.write(`${m}\n`),
   // Item 113 — the ruling is judged with THIS checkout's code; refuse from a stale one (see `assertOperatorCliFresh`).
   assertFresh = () => assertOperatorCliFresh(REPO_ROOT, { label: 'record-referral-ruling', env }) } = {}) {
-  return ({ repo, pr, card, asJudge, evidenceFile, disagreements }) => {
+  return ({ repo, pr, card, asJudge, evidenceFile, finding }) => {
     assertFresh();
     const thread = readPrThread(repo, pr, { readJson });
     const cardReadable = (ref) => readable(ref, root);
     const open = readProtectionContext(thread, { repo, pr, readJson, cardReadable, changedLines, env, log });
     return {
       head: thread.headRefOid, ...open,
-      judgeNotRealMode: readJudgeNotRealMode({ env, tool, log }),
-      ...(asJudge ? { evidence: readJudgeEvidence(evidenceFile, readFile), disagreements } : {}),
+      ...(asJudge ? { judgeNotRealMode: readJudgeNotRealMode({ env, tool, log }),
+        evidence: readJudgeEvidence(evidenceFile, readFile),
+        disagreements: referralDisagreements(thread.comments, open, { repo, pr, finding }) } : {}),
       cardFileMode: readCardRulingFileMode({ env, tool, log }),
       findingClassPolicy: readFindingClassPolicy({ env, log }),
       card: resolveCardRef(card, { root, readable, pr, prHead: lazyPrHead(() => openPrHead({ repo, pr, head: thread.headRefOid })) }),

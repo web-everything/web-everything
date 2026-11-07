@@ -295,7 +295,7 @@ export function recordRedTeamRulingOperation({ readRulingContext, judgeConfirm }
     read: compute({
       reads: ['input'],
       fn: (view) => readRulingContext({ repo: view.input.repo, pr: view.input.pr, card: view.input.card,
-        ...(view.input.asJudge !== undefined ? { asJudge: view.input.asJudge, evidenceFile: view.input.evidenceFile, disagreements: view.input.disagreements } : {}) }),
+        ...(view.input.asJudge !== undefined ? { asJudge: view.input.asJudge, evidenceFile: view.input.evidenceFile, break: view.input.break } : {}) }),
     }),
     ...rulingCardSteps(readRulingContext, planRedTeamCard, 'github.red-team-ruling-file-card', (read, input) => {
       validateRedTeamRulingInput(read, input);

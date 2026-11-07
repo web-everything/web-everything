@@ -534,7 +534,7 @@ export function planJudgeRuling(read, input, select) {
   if (input.ruling !== 'not-real') throw new Error('asJudge applies only to not-real');
   if (!Number.isInteger(read.disagreements) || read.disagreements < 0
     || (input.disagreements !== undefined && (!Number.isInteger(input.disagreements) || input.disagreements < 0)))
-    throw new Error('reader and supplied disagreements must be nonnegative integers');
+    throw new Error('reader and supplied disagreements must be nonnegative integers; history unknown: ask the operator to rule');
   const policy = { mode: read.judgeNotRealMode?.value, evidence: read.evidence ?? input.evidence,
     liveHead: read.head, findings: select(read, input),
     disagreements: input.disagreements === undefined ? read.disagreements : Math.max(input.disagreements, read.disagreements) };
@@ -587,7 +587,7 @@ export function recordReferralRulingOperation({ readRulingContext, judgeConfirm 
     read: compute({
       reads: ['input'],
       fn: (view) => readRulingContext({ repo: view.input.repo, pr: view.input.pr, card: view.input.card,
-        ...(view.input.asJudge !== undefined ? { asJudge: view.input.asJudge, evidenceFile: view.input.evidenceFile, disagreements: view.input.disagreements } : {}) }),
+        ...(view.input.asJudge !== undefined ? { asJudge: view.input.asJudge, evidenceFile: view.input.evidenceFile, finding: view.input.finding } : {}) }),
     }),
     ...rulingCardSteps(readRulingContext, planReferralCard, 'github.referral-ruling-file-card', (read, input) => {
       validateReferralRulingInput(input);

@@ -703,7 +703,7 @@ describe('fileCard: synchronous card filing before an optional operator ruling (
           readJson: () => ({ headRefOid: head, body: '', comments: [] }), changedLines: () => null,
           readable: () => false, openPrHead: () => { throw new Error('unexpected PR read'); },
         }) : rtIO.createRecordRedTeamRulingReader({ ...common,
-          readThread: () => ({ headRefOid: head, comments: [], labels: [] }),
+          readThread: () => ({ headRefOid: head, comments: [], labels: [] }), readEvents: () => ({ status: 'ok', rows: [] }),
           readSetting: () => ({ value: { ...gate.CONFIRMED_BREAKS_DEFAULTS, findingClasses: {} } }),
           readScope: () => ({ value: { anyState: true }, sources: {} }), readStandingRulingScope: () => null,
           resolveIdentity: () => ({ login: 'chalbert', type: 'User' }), resolveCard: () => null,
@@ -987,6 +987,29 @@ describe('R668 acting judge not-real requires evidence (red-first)', () => {
     });
   }
 
+  for (const kind of ['referral', 'red-team']) {
+    for (const exitCode of [1, null]) it(`${kind}: structured agree with exit ${exitCode} => card, never not-real`, async () => {
+      const { judgeConfirm } = await import('../record-referral-ruling-io.mjs');
+      const { EventEmitter } = await import('node:events');
+      const { PassThrough } = await import('node:stream');
+      const spawnFn = () => {
+        const child = new EventEmitter();
+        child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.stdin = new PassThrough();
+        child.kill = vi.fn();
+        child.stdin.on('data', () => queueMicrotask(() => {
+          child.stdout.write(JSON.stringify({ structured_output: { verdict: 'agree' } }));
+          child.emit('close', exitCode);
+        }));
+        return child;
+      };
+      const h = await fixture(kind);
+      h.judgeConfirm.mockImplementation(args => judgeConfirm(args, { spawnFn }));
+      expect(h.result(await h.run())).toBe('card');
+      expect(h.landRulingCard).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(h.written)).not.toMatch(/"(?:result|ruling)":"not-real"/);
+    });
+  }
+
   async function fixture(kind, { mode = 'evidence-required', verdict = 'agree', inputOver = {}, readOver = {},
     findingOver = {}, confirmThrows = false } = {}) {
     const [ref, rt, rtIO, seats, gate, engine] = await modules;
@@ -1051,6 +1074,62 @@ describe('R668 acting judge not-real requires evidence (red-first)', () => {
     }
     const result = v => kind === 'referral' ? v.record.rulings[0].result : v.ruling;
     return { run, result, operation, view, written, judgeConfirm, landRulingCard, noIO, snapshot, rtIO };
+  }
+
+  for (const kind of ['referral', 'red-team']) {
+    async function realContext(h, { asJudge = true, unknown = false, repeated = false } = {}) {
+      const [, , rtIO, , gate] = await modules;
+      const common = { env: { WE_PLATFORM_PREFERENCES_FILE: prefsFile({}),
+        WE_JUDGE_NOT_REAL_MODE: asJudge ? 'open' : 'typo' },
+        assertFresh: () => {}, log: () => {}, readFile: () => {
+          if (!asJudge) throw new Error('operator path must not read evidence');
+          return JSON.stringify(evidence());
+        } };
+      const comments = [...h.snapshot.comments];
+      if (kind === 'referral' && repeated) {
+        const rec = JSON.parse(decodeURIComponent(comments[0].body.match(/mandatory-referrals-v1: ([^\s]+)/)[1]));
+        rec.rulings = [0, 1].map(i => ({ id: `${rec.runId}:${i}`, key: rec.referrals[0].key,
+          reviewerId: rec.reviewer.id, lens: 'correctness', result: 'block', rationale: 'opposing ruling', evidence: ['diff'] }));
+        comments[0] = gh(renderReferralRecord(rec));
+      }
+      if (kind === 'referral' && unknown) comments.push(gh('<!-- mandatory-referrals-v1: broken -->'));
+      const reader = kind === 'referral' ? createRecordReferralRulingReader({ ...common,
+        readJson: () => ({ headRefOid: head, body: '', comments }), readable: () => false, changedLines: () => null,
+      }) : rtIO.createRecordRedTeamRulingReader({ ...common,
+        readThread: () => ({ headRefOid: head, comments, labels: h.snapshot.labels }),
+        readSetting: () => ({ value: h.snapshot.setting }), readScope: () => h.snapshot.scope,
+        resolveIdentity: () => h.snapshot.identity, readStandingRulingScope: () => null,
+        readEvents: () => {
+          if (unknown) return { status: 'error' };
+          const state = gate.liveResultGateState(comments, 7, head, repo);
+          return { status: 'ok', rows: repeated ? [0, 1].map(i => ({ id: `opposing-${i}`, repo, pr: 7,
+            type: 'ruling', findingKey: `red-team:${head}:${state.resultId}:1`, ruling: 'block' })) : [] };
+        },
+      });
+      return reader({ repo, pr: 7, finding: 'all-open', break: '1', asJudge, evidenceFile: 'evidence.json', disagreements: 0 });
+    }
+    it(`${kind}: real reader derives two disagreements; supplied zero cannot clear in open`, async () => {
+      const h = await fixture(kind, { mode: 'open', inputOver: { disagreements: 0 } });
+      Object.assign(h.snapshot, await realContext(h, { repeated: true }));
+      expect(h.snapshot.disagreements).toBe(2);
+      await expect(h.run()).rejects.toThrow(/disagree|operator.only/i);
+      expect(h.written).toEqual([]);
+    });
+    it(`${kind}: reader cannot derive history => refused despite supplied zero`, async () => {
+      const h = await fixture(kind, { mode: 'open', inputOver: { disagreements: 0 } });
+      const context = await realContext(h, { unknown: true });
+      expect(context.disagreements).toBeUndefined();
+      h.snapshot.disagreements = context.disagreements;
+      await expect(h.run()).rejects.toThrow(/disagree|integer/i);
+      expect(h.written).toEqual([]);
+    });
+    it(`${kind}: invalid judge mode with asJudge false still records operator not-real without reading evidence`, async () => {
+      const h = await fixture(kind, { inputOver: { asJudge: false, evidence: undefined } });
+      Object.assign(h.snapshot, await realContext(h, { asJudge: false }));
+      expect(h.snapshot.judgeNotRealMode).toEqual({ value: 'evidence-required', source: 'standard' });
+      expect(h.result(await h.run())).toBe('not-real');
+      expect(h.judgeConfirm).not.toHaveBeenCalled();
+    });
   }
 
   for (const kind of ['referral', 'red-team']) {
@@ -1146,12 +1225,12 @@ describe('R668 acting judge not-real requires evidence (red-first)', () => {
         readJson: () => ({ headRefOid: head, body: '', comments: [] }), changedLines: () => null, readable: () => false,
         openPrHead: () => { throw new Error('unexpected PR read'); },
       }) : rtIO.createRecordRedTeamRulingReader({ ...common,
-        readThread: () => ({ headRefOid: head, comments: [], labels: [] }),
+        readThread: () => ({ headRefOid: head, comments: [], labels: [] }), readEvents: () => ({ status: 'ok', rows: [] }),
         readSetting: () => ({ value: { ...gate.CONFIRMED_BREAKS_DEFAULTS, findingClasses: {} } }),
         readScope: () => ({ value: { anyState: true }, sources: {} }), readStandingRulingScope: () => null,
         resolveIdentity: () => ({ login: 'chalbert', type: 'User' }), resolveCard: () => null,
       });
-      return { context: await reader({ repo, pr: 7 }), lines };
+      return { context: await reader({ repo, pr: 7, asJudge: true }), lines };
     }
     for (const [layer, options, value] of [
       ['standard', {}, 'evidence-required'],

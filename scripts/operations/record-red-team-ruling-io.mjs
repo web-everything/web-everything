@@ -31,7 +31,7 @@ import { assertOperatorCliFresh } from '../lib/main-staleness.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 import { runCardDedupe, runLandPreventionCardCli } from './land-prevention-card.mjs';
-import { planRedTeamCard, blockRulingId, assertRulingCardInputFits, CARD_PENDING_OUTCOME, OPERATOR_BLOCK_OUTCOME, OPERATOR_NOT_REAL_OUTCOME, RED_TEAM_RULING_BLOCK_EFFECT, RED_TEAM_RULING_NOT_REAL_EFFECT, conflictingPendingCardJobs, hasPendingCardIntent, OPERATOR_CARD_OUTCOME, RED_TEAM_RULING_CARD_EFFECT, buildRuleReasonComment, recordRedTeamRulingOperation, rulingCardResource, rulableBreaks } from './record-red-team-ruling.mjs';
+import { planRedTeamCard, blockRulingId, assertRulingCardInputFits, CARD_PENDING_OUTCOME, OPERATOR_BLOCK_OUTCOME, OPERATOR_NOT_REAL_OUTCOME, RED_TEAM_RULING_BLOCK_EFFECT, RED_TEAM_RULING_NOT_REAL_EFFECT, conflictingPendingCardJobs, hasPendingCardIntent, OPERATOR_CARD_OUTCOME, RED_TEAM_RULING_CARD_EFFECT, buildRuleReasonComment, recordRedTeamRulingOperation, rulingCardResource, selectBreaks, rulableBreaks } from './record-red-team-ruling.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 /** `gh` under the OPERATOR channel: App tokens removed, so it runs as the operator's own login. */
@@ -104,21 +104,43 @@ const readScopeLogged = (env) => readOperatorRulings({ env, log: (m) => process.
 
 export function createRecordRedTeamRulingReader({ tool, log = line => console.error(line), env = process.env, readThread = readLiveThread, readSetting = () => readConfirmedBreaks({ env }),
   readStandingRulingScope = standingRulingScope, readFile = readFileSync,
+  readEvents = repo => readLedgerEventsFromStore(repo, { env }),
   readScope = () => readScopeLogged(env), runGit = git, readOnPr = readCardAtPrHead,
   resolveCard = card => resolveCardDefault(card, { runGit, readOnPr }),
   resolveIdentity = () => resolveOperatorIdentity({ env }), now = () => new Date().toISOString(),
   assertFresh = () => assertOperatorCliFresh(REPO_ROOT, { label: 'record-red-team-ruling', env }) } = {}) {
-  return ({ repo, pr, card, asJudge, evidenceFile, disagreements }) => {
+  return ({ repo, pr, card, asJudge, evidenceFile, break: breakSpec }) => {
     assertFresh();
     const thread = readThread({ repo, pr });
     const head = String(thread.headRefOid ?? '').toLowerCase();
     const scope = readScope();
-    return { head, judgeNotRealMode: readJudgeNotRealMode({ env, tool, log }),
-      ...(asJudge ? { evidence: readJudgeEvidence(evidenceFile, readFile), disagreements } : {}),
-      cardFileMode: readCardRulingFileMode({ env, tool, log }), labels: thread.labels ?? [], comments: thread.comments ?? [],
-      standingRuling: readStandingRulingScope({ repo, pr: { ...thread, number: Number(pr), headRefOid: head } }),
-      setting: readSetting().value, scope: { value: scope.value, sources: scope.sources ?? {} }, now: now(), identity: resolveIdentity(),
-      card: card === undefined || card === '' ? null : resolveCard(card, { repo, pr, head }) };
+    const standingRuling = readStandingRulingScope({ repo, pr: { ...thread, number: Number(pr), headRefOid: head } });
+    const build = (ledger) => {
+      let disagreements;
+      if (asJudge) {
+        const state = liveResultGateState(operatorBoundComments(thread.comments), pr, head, repo, standingRuling);
+        if (ledger?.status === 'ok' && Array.isArray(ledger.rows) && state.resultId && Array.isArray(thread.comments)) {
+          const prefix = `red-team:${head}:${state.resultId}:`;
+          const counts = new Map();
+          for (const row of ledger.rows) if (row.repo === repo && row.pr === Number(pr)
+            && row.type === EVENT_TYPES.RULING && row.findingKey?.startsWith(prefix) && row.ruling === 'block') {
+            const index = Number(row.findingKey.slice(prefix.length));
+            if (!counts.has(index)) counts.set(index, new Set());
+            counts.get(index).add(row.id);
+          }
+          const indices = breakSpec ? selectBreaks(state.result.findings, breakSpec).map(f => f.index) : [...counts.keys()];
+          disagreements = Math.max(0, ...indices.map(i => counts.get(i)?.size ?? 0));
+        }
+      }
+      return { head,
+        ...(asJudge ? { judgeNotRealMode: readJudgeNotRealMode({ env, tool, log }),
+          evidence: readJudgeEvidence(evidenceFile, readFile), disagreements } : {}),
+        cardFileMode: readCardRulingFileMode({ env, tool, log }), labels: thread.labels ?? [], comments: thread.comments ?? [],
+        standingRuling,
+        setting: readSetting().value, scope: { value: scope.value, sources: scope.sources ?? {} }, now: now(), identity: resolveIdentity(),
+        card: card === undefined || card === '' ? null : resolveCard(card, { repo, pr, head }) };
+    };
+    return asJudge ? Promise.resolve().then(() => readEvents(repo)).catch(() => null).then(build) : build();
   };
 }
 
