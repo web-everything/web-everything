@@ -1,6 +1,6 @@
 // Restart reviewed launchd labels when the adopted sha differs from their last successful restart.
 import childProcess from 'node:child_process';
-import { cascadePolicy } from './policy-cascade.mjs';
+import { cascadePolicy, platformPreference } from './policy-cascade.mjs';
 
 const commandOptions = { encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024 };
 const message = e => String(e?.message ?? e);
@@ -34,15 +34,41 @@ function parseKillSwitch(raw) {
   return word === '' ? undefined : ENABLE_WORDS.has(word);
 }
 
+const POLICY_KEYS = { enabled: v => typeof v === 'boolean', allowedLabels: labels };
+const POLICY = 'daemon.serviceRestart';
+
+// The cascade flattens nested objects into leaves and validates each leaf by its TOP key only, so
+// `enabled: {value: false}` passes the boolean check and is rebuilt as a truthy object. Keep only the two known
+// keys, each already a valid whole value; drop (and log) anything else before the cascade sees it.
+function strictLayer(layer, name, log) {
+  if (layer === undefined || layer === null) return undefined;
+  const clean = {};
+  if (typeof layer !== 'object' || Array.isArray(layer)) {
+    safeLog(log, `${POLICY} ignored malformed ${name} layer (not an object)`);
+    return clean;
+  }
+  for (const [key, valid] of Object.entries(POLICY_KEYS)) {
+    if (!Object.hasOwn(layer, key) || layer[key] === undefined) continue;
+    if (valid(layer[key])) clean[key] = layer[key];
+    else safeLog(log, `${POLICY} ignored malformed ${name}.${key}`);
+  }
+  return clean;
+}
+
 function resolveRestartPolicy({ settings, platform, env, envValues, log }) {
-  const values = envValues ?? {
-    enabled: parseKillSwitch(env.WE_DAEMON_SERVICE_RESTART_ENABLED),
-  };
-  return cascadePolicy('daemon.serviceRestart', settings, {
-    standard: defaults, platform, env, envValues: values,
-    valid: { enabled: v => typeof v === 'boolean', allowedLabels: labels },
+  const raw = envValues ?? { enabled: parseKillSwitch(env.WE_DAEMON_SERVICE_RESTART_ENABLED) };
+  let plat = platform;
+  if (plat === undefined) { try { plat = platformPreference(POLICY, { env }); } catch { plat = undefined; } }
+  const policy = cascadePolicy(POLICY, strictLayer(settings, 'settings', log), {
+    standard: defaults, env,
+    platform: strictLayer(plat, 'platform', log) ?? {},
+    envValues: strictLayer(raw, 'env', log) ?? {},
+    valid: POLICY_KEYS,
     log: line => safeLog(log, line),
   });
+  const p = policy.value;
+  if (typeof p?.enabled !== 'boolean' || !labels(p.allowedLabels)) throw new Error('service restart policy is malformed');
+  return policy;
 }
 
 const DEV_LABEL = /(?:^|[._-])(?:dev|vite|storybook|playground|npm-start)(?:[._-]|$)/i;
