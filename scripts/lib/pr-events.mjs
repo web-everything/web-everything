@@ -108,7 +108,10 @@ const NOT_GREEN = (c) => c != null && !['success', 'neutral', 'skipped'].include
 /** Which events wake which daemon. Anything not listed is ignored by that role. */
 export const ROLE_RELEVANCE = Object.freeze({
   // Review daemon: a PR appearing, moving, changing labels or finishing CI can make a review owed.
-  review: (e) => e.type === 'pull_request' || e.type === 'check_suite' || e.type === 'check_run',
+  // Also a red-team result / advisory / ruling comment or a submitted review: review and judge react to them at once.
+  review: (e) => e.type === 'pull_request' || e.type === 'check_suite' || e.type === 'check_run'
+    || e.type === 'pull_request_review'
+    || (e.type === 'issue_comment' && ['redteam', 'advisory', 'ruling'].includes(e.kind)),
   // Fix daemon: a red check, a changes-requested review, a label flip (review:changes / ci:failed), a new push.
   fix: (e) => (e.type === 'pull_request' && ['labeled', 'unlabeled', 'synchronize', 'closed'].includes(e.action))
     || ((e.type === 'check_suite' || e.type === 'check_run') && NOT_GREEN(e.conclusion))
