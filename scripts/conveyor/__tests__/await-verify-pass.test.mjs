@@ -694,14 +694,16 @@ describe('laneFilterDrivers (#5137 review)', () => {
 
 describe('lane-git-hardening (#5137 review)', () => {
   it('pins every code-executing lane-config key through git\'s environment, after any existing GIT_CONFIG_COUNT entries', () => {
-    const env = laneGitHardeningEnv({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'user.name', GIT_CONFIG_VALUE_0: 'x', GIT_EXTERNAL_DIFF: '/evil' });
+    // No system / global config (PR #6319): Apple git's built-in `credential.helper=osxkeychain` would otherwise be
+    // replayed after the pins as a trusted helper, and this test counts the pins alone.
+    const env = laneGitHardeningEnv({ GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'user.name', GIT_CONFIG_VALUE_0: 'x', GIT_EXTERNAL_DIFF: '/evil' });
     expect(env.GIT_CONFIG_COUNT).toBe(String(1 + LANE_GIT_CONFIG_PINS.length));
     expect([env.GIT_CONFIG_KEY_0, env.GIT_CONFIG_VALUE_0]).toEqual(['user.name', 'x']);
     const pins = LANE_GIT_CONFIG_PINS.map((_, i) => [env[`GIT_CONFIG_KEY_${1 + i}`], env[`GIT_CONFIG_VALUE_${1 + i}`]]);
     expect(pins).toEqual(LANE_GIT_CONFIG_PINS.map(([k, v]) => [k, v]));
     expect(LANE_GIT_CONFIG_PINS.map(([k]) => k)).toEqual(expect.arrayContaining(['core.fsmonitor', 'core.hooksPath', 'core.attributesFile', 'core.sshCommand']));
     expect(env.GIT_EXTERNAL_DIFF).toBeUndefined();
-    expect(laneGitHardeningEnv({}).GIT_CONFIG_COUNT).toBe(String(LANE_GIT_CONFIG_PINS.length));
+    expect(laneGitHardeningEnv({ GIT_CONFIG_NOSYSTEM: '1' }).GIT_CONFIG_COUNT).toBe(String(LANE_GIT_CONFIG_PINS.length));
   });
   it('rewrites a diff to never run diff.external / textconv and a hash-object to never run a clean filter', () => {
     expect(hardenLaneGitArgs(['diff', '--name-only', 'HEAD'])).toEqual(['diff', '--no-ext-diff', '--no-textconv', '--name-only', 'HEAD']);

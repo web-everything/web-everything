@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
-import { basename } from 'node:path';
+import { statSync } from 'node:fs';
+import { basename, join } from 'node:path';
 
 /**
  * Git hardening for a process that runs git inside an AGENT-WRITABLE lane clone (we:backlog/5137 review).
@@ -21,9 +22,11 @@ export const LANE_GIT_CONFIG_PINS = Object.freeze([
   ['core.hooksPath', '/dev/null'],
   ['core.attributesFile', '/dev/null'],
   ['core.sshCommand', 'ssh'],
-  // PR #6319 send-back: no credential helper or askpass program from any config scope runs during an unattended
-  // transport. An empty `credential.helper` resets the helper list; an empty `core.askPass` counts as unset. The
-  // matching env (`GIT_ASKPASS`, `SSH_ASKPASS`) is dropped in laneGitHardeningEnv, which also disables terminal prompts.
+  // PR #6319 send-back: no credential helper or askpass program a LANE (local / worktree / include) or an inherited
+  // command-scope entry names runs during an unattended transport. An empty `credential.helper` resets the helper list;
+  // an empty `core.askPass` counts as unset. Both forms below then replay the operator's own trusted helpers AFTER
+  // these resets ({@link trustedCredentialPins}), so osxkeychain / `gh auth git-credential` keep working. The matching
+  // env (`GIT_ASKPASS`, `SSH_ASKPASS`) is dropped in laneGitHardeningEnv, which also disables terminal prompts.
   ['credential.helper', ''],
   ['core.askPass', ''],
   ['commit.gpgsign', 'false'],
@@ -54,8 +57,107 @@ const REMOTE_PROBE_CONFIG_PINS = Object.freeze([
   ['protocol.ssh.allow', 'always'],
 ]);
 
-/** The pins as `-c k=v` argv pairs, for a caller that builds its own git command line. */
-export const laneGitConfigArgs = () => LANE_GIT_CONFIG_PINS.flatMap(([k, v]) => ['-c', `${k}=${v}`]);
+/** Config scopes no lane can write: the system file, the host user's global file, and the `unknown` scope Apple's git
+ *  reports for its built-in gitconfig (where `credential.helper=osxkeychain` lives; `--system` does not read it). */
+const TRUSTED_CREDENTIAL_SCOPES = new Set(['system', 'global', 'unknown']);
+const CREDENTIAL_HELPER_KEY_RE = /^credential\.(?:.+\.)?helper$/is;
+/** The only env a trusted-config read passes git: where the system / global files are, and which git runs. No repo
+ *  location and no command-scope config (`GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`) can reach the read. */
+const TRUSTED_READ_ENV_KEYS = Object.freeze(['HOME', 'XDG_CONFIG_HOME', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM',
+  'GIT_CONFIG_NOSYSTEM', 'PATH']);
+/** Above this many trusted helper entries the read fails closed: no helper is replayed (the reset pin stays). */
+export const MAX_TRUSTED_CREDENTIAL_PINS = 64;
+const TRUSTED_READ_MAX_BUFFER = 1024 * 1024;
+const TRUSTED_READ_TIMEOUT_MS = 10_000;
+
+/**
+ * The trusted credential pins in `git config --show-scope --list -z` output: every `credential[.<url>].helper` entry of a
+ * trusted scope, in git's read order (empty values included — each one resets the list exactly as it does unpinned),
+ * then the last GLOBAL `core.askPass`, if non-empty. Local, worktree, command and any other scope is ignored. Returns null
+ * above {@link MAX_TRUSTED_CREDENTIAL_PINS} helper entries. Pure.
+ * @param {string} listOutput
+ * @returns {Array<[string,string]>|null}
+ */
+export function parseTrustedCredentialPins(listOutput) {
+  const parts = String(listOutput ?? '').split('\0');
+  const helpers = [];
+  let askPass = '';
+  for (let i = 0; i + 1 < parts.length; i += 2) {
+    const scope = parts[i];
+    if (!TRUSTED_CREDENTIAL_SCOPES.has(scope)) continue;
+    const nl = parts[i + 1].indexOf('\n');
+    if (nl === -1) continue; // a valueless key: not a helper git would run
+    const key = parts[i + 1].slice(0, nl);
+    const value = parts[i + 1].slice(nl + 1);
+    if (CREDENTIAL_HELPER_KEY_RE.test(key)) helpers.push([key, value]);
+    else if (scope === 'global' && key.toLowerCase() === 'core.askpass') askPass = value;
+  }
+  if (helpers.length > MAX_TRUSTED_CREDENTIAL_PINS) return null;
+  return askPass ? [...helpers, ['core.askPass', askPass]] : helpers;
+}
+
+const trustedPinCache = new Map();
+const warnedTrustedRead = new Set();
+const fileSignature = (file) => {
+  if (!file) return '-';
+  try { const s = statSync(file); return `${file}:${s.ino}:${s.size}:${s.mtimeMs}`; } catch { return `${file}:absent`; }
+};
+
+/**
+ * The operator's own credential helpers (and global askpass) as `[key, value]` pins to replay after the reset pins, so a
+ * hardened git keeps authenticating with them while no lane-written helper runs. Read with `git config --show-scope
+ * --list -z --includes` from `/` (never a lane: no local or worktree scope exists there) with only
+ * {@link TRUSTED_READ_ENV_KEYS} from `env`, so it sees the same system / global files the hardened call will read and no
+ * command-scope entry; only {@link TRUSTED_CREDENTIAL_SCOPES} entries are kept. Cached per env and config-file stat. Fails
+ * closed: a read error, a non-string result or more than {@link MAX_TRUSTED_CREDENTIAL_PINS} helpers replays nothing (one
+ * process warning names why; the transport then fails with git's own "could not read Username" error).
+ * @param {Record<string,string|undefined>} env
+ * @param {{exec?: typeof execFileSync}} options
+ * @returns {Array<[string,string]>}
+ */
+export function trustedCredentialPins(env = process.env, { exec = execFileSync } = {}) {
+  const readEnv = {};
+  for (const key of TRUSTED_READ_ENV_KEYS) if (typeof env?.[key] === 'string') readEnv[key] = env[key];
+  if (readEnv.PATH === undefined && typeof process.env.PATH === 'string') readEnv.PATH = process.env.PATH;
+  const xdg = readEnv.XDG_CONFIG_HOME || (readEnv.HOME ? join(readEnv.HOME, '.config') : '');
+  const files = readEnv.GIT_CONFIG_GLOBAL !== undefined ? [readEnv.GIT_CONFIG_GLOBAL]
+    : [xdg && join(xdg, 'git', 'config'), readEnv.HOME && join(readEnv.HOME, '.gitconfig')];
+  const cacheKey = JSON.stringify([readEnv, ...files.map(fileSignature), fileSignature(readEnv.GIT_CONFIG_SYSTEM ?? '/etc/gitconfig')]);
+  if (exec === execFileSync && trustedPinCache.has(cacheKey)) return trustedPinCache.get(cacheKey);
+  let pins;
+  let why = '';
+  try {
+    const out = exec('git', ['config', '--show-scope', '--list', '-z', '--includes'], {
+      cwd: '/', env: readEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+      maxBuffer: TRUSTED_READ_MAX_BUFFER, timeout: TRUSTED_READ_TIMEOUT_MS,
+    });
+    if (typeof out !== 'string') why = 'the trusted git config read returned no text';
+    else {
+      pins = parseTrustedCredentialPins(out);
+      if (pins === null) why = `more than ${MAX_TRUSTED_CREDENTIAL_PINS} trusted credential.helper entries`;
+    }
+  } catch (e) {
+    // Exit 1 with no output is git's "no config at all" (no global file, no system file): nothing to replay.
+    if (e?.status === 1 && !String(e?.stdout ?? '')) pins = [];
+    else why = `the trusted git config read failed (${e?.code ?? e?.status ?? 'error'})`;
+  }
+  if (why) {
+    pins = [];
+    if (!warnedTrustedRead.has(why)) {
+      warnedTrustedRead.add(why);
+      process.emitWarning(`lane-git-hardening: no trusted credential helper replayed — ${why}`);
+    }
+  }
+  const frozen = Object.freeze(pins.map((pin) => Object.freeze(pin)));
+  if (exec === execFileSync) trustedPinCache.set(cacheKey, frozen);
+  return frozen;
+}
+
+/** The pins as `-c k=v` argv pairs, for a caller that builds its own git command line: the inert pins, then the trusted
+ *  credential replays read for `env`. A key containing `=` cannot ride `-c` (git splits at the first `=`), so that
+ *  replay is left out — fail closed: the reset pin stays. */
+export const laneGitConfigArgs = ({ env = process.env, trustedPins = trustedCredentialPins(env) } = {}) =>
+  [...LANE_GIT_CONFIG_PINS, ...trustedPins.filter(([k]) => !k.includes('='))].flatMap(([k, v]) => ['-c', `${k}=${v}`]);
 
 /** Inherited git env that moves where git reads or writes the repository (its dir, work tree, index, objects, refs,
  *  `git config` file) or changes what is reachable (a shallow or graft file hides history; `GIT_REF_PARANOIA=0` lets
@@ -130,10 +232,13 @@ export function scrubGitRepoEnv(env) {
  * `env` with the pins appended to git's environment config list. An existing `GIT_CONFIG_COUNT` is preserved (the pins
  * come AFTER its entries, so they win). `GIT_EXTERNAL_DIFF` is dropped: an inherited one would run on every `git diff`.
  * @param {Record<string,string|undefined>} env
- * @param {{remoteProbe?: boolean}} options Restrict transports only for an isolated remote proof.
+ * The operator's trusted credential helpers ({@link trustedCredentialPins}, read for `env`) are appended after the pins,
+ * so they follow the `credential.helper` / `core.askPass` resets; `trustedPins: []` replays none.
+ * @param {Record<string,string|undefined>} env
+ * @param {{remoteProbe?: boolean, trustedPins?: Array<[string,string]>}} options Restrict transports only for an isolated remote proof.
  * @returns {Record<string,string|undefined>}
  */
-export function laneGitHardeningEnv(env = process.env, { remoteProbe = false } = {}) {
+export function laneGitHardeningEnv(env = process.env, { remoteProbe = false, trustedPins = trustedCredentialPins(env) } = {}) {
   // No lazy fetch: a lane declaring itself a partial clone of a promisor remote would fetch a missing object through
   // its own `remote.<name>.uploadpack` on a plain `show` / `diff` / `cat-file` (PR #5775 self-review).
   // No prompt either: an inherited askpass program (a caller inside a lane controls its env) would run on a credential
@@ -148,7 +253,7 @@ export function laneGitHardeningEnv(env = process.env, { remoteProbe = false } =
   delete out.GIT_SSH;
   const n = Number.parseInt(String(out.GIT_CONFIG_COUNT ?? '0'), 10);
   const start = Number.isInteger(n) && n > 0 ? n : 0;
-  const pins = remoteProbe ? [...LANE_GIT_CONFIG_PINS, ...REMOTE_PROBE_CONFIG_PINS] : LANE_GIT_CONFIG_PINS;
+  const pins = [...LANE_GIT_CONFIG_PINS, ...trustedPins, ...(remoteProbe ? REMOTE_PROBE_CONFIG_PINS : [])];
   pins.forEach(([k, v], i) => {
     out[`GIT_CONFIG_KEY_${start + i}`] = k;
     out[`GIT_CONFIG_VALUE_${start + i}`] = v;
