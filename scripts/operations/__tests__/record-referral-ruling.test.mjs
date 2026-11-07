@@ -4,7 +4,7 @@
  *   the acceptance entry point (we:scripts/review-set-label.mjs#assertMandatoryReferralsCleared) and the referral
  *   hold's wake-up (we:scripts/conveyor/review-referral-hold.mjs).
  */
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, readFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -480,5 +480,290 @@ describe('unattended live-referral gate', () => {
     const env = { WE_POLICY_CASCADE_LOG: '1', WE_REVIEW_UNATTENDED_ACCEPT_REQUIRES_CLEAN_REFERRALS: 'false' };
     expect(policy({ env, log: line => lines.push(line) }).value.unattendedAcceptRequiresCleanReferrals).toBe(false);
     expect(lines.join('\n')).toMatch(/policy-cascade.*review.*unattendedAcceptRequiresCleanReferrals=false \(env\)/);
+  });
+});
+
+
+describe('fileCard: synchronous card filing before an optional operator ruling (red-first)', () => {
+  const modules = Promise.all([
+    import('../record-red-team-ruling.mjs'), import('../record-red-team-ruling-io.mjs'),
+    import('../record-referral-ruling-io.mjs'), import('../review-extra-seats.mjs'),
+    import('../../lib/red-team-gate.mjs'), import('../../lib/policy-cascade.mjs'),
+    import('../engine.mjs'),
+  ]);
+  const LANDED = 'we:backlog/xab12cd-coverage.md@pr91';
+  const coverage = { findingClass: 'coverage-or-style', classBasis: 'Missing regression coverage; no live break',
+    alsoClasses: ['theoretical-race'] };
+  const modes = ['two-step', 'one-call'];
+  const scratch = [];
+  afterEach(() => { for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+
+  function prefsFile(prefs = {}) {
+    const dir = mkdtempSync(join(tmpdir(), 'card-ruling-policy-'));
+    scratch.push(dir);
+    const path = join(dir, 'preferences.json');
+    writeFileSync(path, JSON.stringify(prefs));
+    return path;
+  }
+
+  // Call the public declaration's steps, retaining the engine's ordinal effect-finding shape.
+  // Filing uses the REAL sink with only landRulingCard injected; ruling effects are captured, never posted.
+  async function fixture(kind, mode = 'two-step', { findingOver = {}, extraFindings = [], inputOver = {},
+    landing = { ok: true, ref: LANDED, pr: 91, reused: false }, readable = true } = {}) {
+    const [rt, rtIO, referralIO, seats, gate, , engine] = await modules;
+    const f = { ...finding('coverage fixture'), impactIfUnfixed: kind === 'referral' ? 'broken' : 'degraded', ...coverage, ...findingOver };
+    const all = [f, ...extraFindings];
+    const rec = referral({ summaries: all.map(x => x.summary) });
+    rec.referrals.forEach((r, i) => { r.original = all[i]; r.finding = normalizeFinding(all[i]); });
+    const comments = kind === 'referral' ? [gh(renderReferralRecord(rec))] : [
+      gh(seats.renderRedTeamComment({ pr: 7, rev: head, provider: 'codex', model: 'm',
+        recheckStatus: 'ok', foldedVerdict: 'changes', findingClasses: {},
+        findings: all.map(x => ({ ...x, confirmedByRecheck: true })) }), 'web-everything', { createdAt: '2026-10-04T14:00:00Z' }),
+      gh(gate.redTeamGateMarker(7, head, 'round-cap'), 'web-everything', { createdAt: '2026-10-04T14:01:00Z' }),
+    ];
+    const snapshot = { head, comments, card: null, now: '2026-10-04T14:30:00Z', clearerId: 's',
+      cardFileMode: { value: mode, source: 'standard' }, findingClassPolicy: {}, followUpEnabled: false,
+      ...(kind === 'referral' ? openReferralFindings({ comments, ...ctx(), cardReadable: () => false }) : {
+        identity: { login: 'chalbert', type: 'User' }, labels: [{ name: 'review:human' }],
+        setting: { ...gate.CONFIRMED_BREAKS_DEFAULTS, findingClasses: {} }, scope: { value: { anyState: true } },
+      }) };
+    const readRulingContext = vi.fn(({ card }) => ({ ...snapshot,
+      card: card ? { requested: card, ref: card, readable, reason: readable ? 'readable' : 'missing' } : null }));
+    const landRulingCard = vi.fn(async () => landing);
+    const noIO = vi.fn(() => { throw new Error('unexpected external IO'); });
+    const sinks = (kind === 'referral' ? createRecordReferralRulingSinks : rtIO.createRecordRedTeamRulingSinks)({
+      landRulingCard, env: {}, readJson: noIO, readThread: noIO, post: noIO,
+      appendEvents: noIO, readEvents: noIO, resolveIdentity: noIO,
+      readScope: noIO, readStandingRulingScope: noIO, syncLabels: noIO,
+    });
+    const operation = (kind === 'referral' ? recordReferralRulingOperation : rt.recordRedTeamRulingOperation)({ readRulingContext });
+    const input = { repo, pr: 7, finding: 'all-open', break: '1', ruling: 'card', actor: 'chalbert',
+      channel: 'chat', reason: 'Track coverage', sendBack: false, preview: false, fileCard: true, ...inputOver };
+    const view = { input, findings: {} };
+    const filed = [], written = [];
+    const step = name => {
+      const entry = operation.steps.find(s => s.name === name);
+      expect(entry, `missing ${name} step: fileCard feature is not implemented`).toBeDefined();
+      return entry.step;
+    };
+    async function compute(name) {
+      const declaration = step(name);
+      const value = await declaration.fn(engine.projectReads(view, declaration.reads));
+      view.findings[name] = value;
+      if (name === 'plan') view.verdict = value;
+      return value;
+    }
+    async function run() {
+      await compute('read');
+      await compute('cardPlan');
+      const landStep = step('landCard');
+      const effects = landStep.effects(engine.projectReads(view, landStep.reads));
+      const results = [];
+      for (const effect of effects) {
+        filed.push(effect);
+        expect(typeof sinks[effect.type], `missing filing sink ${effect.type}`).toBe('function');
+        const result = await sinks[effect.type](effect.payload);
+        results.push({ type: effect.type, status: 'applied', result });
+      }
+      view.findings.landCard = { applied: true, effects: results };
+      await compute('reread');
+      await compute('plan');
+      const writeStep = step('write');
+      written.push(...writeStep.effects(engine.projectReads(view, writeStep.reads)));
+      return view.verdict;
+    }
+    return { run, compute, step, operation, input, snapshot, view, filed, written,
+      landRulingCard, readRulingContext, noIO, referralIO };
+  }
+
+  for (const kind of ['referral', 'red-team']) {
+    describe(kind, () => {
+      it('declares optional boolean fileCard and read → cardPlan → landCard → reread → plan → write', async () => {
+        const h = await fixture(kind);
+        expect(h.operation.input.fileCard).toMatchObject({ type: 'boolean', required: false });
+        expect(h.operation.steps.map(s => s.name)).toEqual(['read', 'cardPlan', 'landCard', 'reread', 'plan', 'write']);
+      });
+
+      it.each(modes)('%s: files once with finding text, PR/head and we: scope; only one-call records a ruling', async mode => {
+        const h = await fixture(kind, mode);
+        const verdict = await h.run();
+        expect(h.landRulingCard).toHaveBeenCalledTimes(1);
+        const cardInput = h.view.findings.cardPlan.cardInput;
+        expect(h.view.findings.cardPlan.mode).toBe(mode);
+        expect(cardInput).toMatchObject({ title: expect.any(String), kind: 'story', size: '2', parent: '', queue: 'true',
+          scope: 'we:scripts/x.mjs', session: expect.stringMatching(/^card-ruling-/) });
+        expect(cardInput.title.trim()).not.toBe('');
+        expect(cardInput.digest).toContain('coverage fixture');
+        expect(h.landRulingCard).toHaveBeenCalledWith(cardInput, { repo, pr: 7 });
+        expect(h.filed).toEqual([{ type: `github.${kind === 'referral' ? 'referral' : 'red-team'}-ruling-file-card`,
+          idempotent: true, payload: { repo, pr: 7, head, cardInput } }]);
+        if (mode === 'two-step') {
+          expect(verdict).toMatchObject({ fileOnly: true, cardRef: LANDED, mode, reused: false });
+          expect(h.written).toEqual([]);
+          expect(h.readRulingContext).toHaveBeenCalledTimes(1);
+        } else {
+          expect(h.readRulingContext).toHaveBeenCalledTimes(2);
+          expect(h.readRulingContext).toHaveBeenLastCalledWith({ repo, pr: 7, card: LANDED });
+          expect(h.written).toHaveLength(1);
+          if (kind === 'referral') expect(verdict.record.rulings).toEqual([
+            expect.objectContaining({ result: 'card', card: LANDED }),
+          ]);
+          else expect(h.written[0]).toMatchObject({ type: 'github.red-team-ruling-card', payload: { cardRef: LANDED } });
+        }
+        expect(h.noIO).not.toHaveBeenCalled();
+      });
+
+      it.each(modes)('%s: cardPlan is pure, repeatable and selects only the requested finding', async mode => {
+        const h = await fixture(kind, mode, { extraFindings: [{ ...finding('unselected confirmed break'),
+          findingClass: 'live-reproduced', classBasis: 'Reproduced' }], inputOver: { finding: '1', break: '1' } });
+        await h.compute('read');
+        const before = structuredClone(h.snapshot);
+        const first = await h.compute('cardPlan');
+        expect(await h.compute('cardPlan')).toEqual(first);
+        expect(h.snapshot).toEqual(before);
+        expect(first.cardInput.digest).toContain('coverage fixture');
+        expect(first.cardInput.digest).not.toContain('unselected confirmed break');
+        expect(h.landRulingCard).not.toHaveBeenCalled();
+        expect(h.noIO).not.toHaveBeenCalled();
+      });
+
+      const unsafe = [
+        ['fix-now class', { findingClass: 'correctness-in-normal-use' }],
+        ['broken unclassified impact', { impactIfUnfixed: 'broken', findingClass: undefined, alsoClasses: [] }],
+        ['retained fix-now class', { alsoClasses: ['live-reproduced'] }],
+        ['security reachable today', { securityReachableToday: true }],
+        ['missing classification basis', { impactIfUnfixed: 'broken', classBasis: '' }],
+      ];
+      for (const mode of modes) it.each(unsafe)(`${mode}: refuses %s before filing or ruling`, async (_name, findingOver) => {
+        const h = await fixture(kind, mode, { findingOver });
+        await expect(h.run()).rejects.toThrow(/coverage|fix.now|break.class|security|cannot.*card|refus.*card/i);
+        expect(h.landRulingCard).not.toHaveBeenCalled();
+        expect(h.filed).toEqual([]);
+        expect(h.written).toEqual([]);
+      });
+
+      for (const mode of modes) it.each([
+        ['file-item', 'fixture file-item failed'],
+        ['open-pr', 'backlog/xab12cd-coverage.md was filed but its PR failed'],
+      ])(`${mode}: %s failure throws with recovery detail and no ruling`, async (step, reason) => {
+        const h = await fixture(kind, mode, { landing: { ok: false, step, reason } });
+        await expect(h.run()).rejects.toThrow(`card filing failed at ${step}: ${reason}; no ruling recorded`);
+        expect(h.landRulingCard).toHaveBeenCalledTimes(1);
+        expect(h.written).toEqual([]);
+        expect(h.readRulingContext).toHaveBeenCalledTimes(1);
+      });
+
+      it('one-call rereads the landed reference and keeps the existing readable-card refusal', async () => {
+        const h = await fixture(kind, 'one-call', { readable: false });
+        await expect(h.run()).rejects.toThrow(/does not resolve to a readable backlog card/);
+        expect(h.landRulingCard).toHaveBeenCalledTimes(1);
+        expect(h.readRulingContext).toHaveBeenLastCalledWith({ repo, pr: 7, card: LANDED });
+        expect(h.written).toEqual([]);
+      });
+
+      for (const mode of modes) it.each([
+        ['--card and fileCard together', { card: CARD }, /file.card.*--card|--card.*file.card/i],
+        ['non-card ruling', { ruling: 'block' }, /file.card.*(?:ruling|card)|only.*ruling=card/i],
+      ])(`${mode}: refuses %s before any effects`, async (_name, inputOver, error) => {
+        const h = await fixture(kind, mode, { inputOver });
+        await expect(h.run()).rejects.toThrow(error);
+        expect(h.landRulingCard).not.toHaveBeenCalled();
+        expect(h.written).toEqual([]);
+      });
+
+      it.each(modes)('%s: preview returns wouldFile and files/posts nothing', async mode => {
+        const h = await fixture(kind, mode, { inputOver: { preview: true } });
+        expect(await h.run()).toMatchObject({ fileOnly: true, wouldFile: h.view.findings.cardPlan.cardInput });
+        expect(h.landRulingCard).not.toHaveBeenCalled();
+        expect(h.filed).toEqual([]);
+        expect(h.written).toEqual([]);
+      });
+
+      it('without fileCard, cardPlan is null, no filing occurs and the existing --card verdict is preserved', async () => {
+        const h = await fixture(kind, 'one-call', { inputOver: { fileCard: undefined, card: CARD } });
+        await h.run();
+        expect(h.view.findings.cardPlan).toBeNull();
+        expect(h.filed).toEqual([]);
+        expect(h.landRulingCard).not.toHaveBeenCalled();
+        expect(h.readRulingContext).toHaveBeenCalledTimes(1);
+        expect(h.written).toHaveLength(1);
+        if (kind === 'referral') expect(h.view.verdict.record.rulings[0].card).toBe(CARD);
+        else expect(h.written[0].payload.cardRef).toBe(CARD);
+      });
+
+      // Probe settings through the real reader; pin every unrelated reader dependency.
+      async function readMode({ prefs = {}, envOver = {}, tool = {} } = {}) {
+        const [, rtIO, , , gate, cascade] = await modules;
+        cascade.resetCascadeLogForTest();
+        const lines = [];
+        const env = { WE_PLATFORM_PREFERENCES_FILE: prefsFile(prefs), WE_POLICY_CASCADE_LOG: '1', ...envOver };
+        const common = { env, tool, log: line => lines.push(line), assertFresh: () => {},
+          now: () => '2026-10-04T14:30:00Z' };
+        const reader = kind === 'referral' ? createRecordReferralRulingReader({ ...common,
+          readJson: () => ({ headRefOid: head, body: '', comments: [] }), changedLines: () => null,
+          readable: () => false, openPrHead: () => { throw new Error('unexpected PR read'); },
+        }) : rtIO.createRecordRedTeamRulingReader({ ...common,
+          readThread: () => ({ headRefOid: head, comments: [], labels: [] }),
+          readSetting: () => ({ value: { ...gate.CONFIRMED_BREAKS_DEFAULTS, findingClasses: {} } }),
+          readScope: () => ({ value: { anyState: true }, sources: {} }), readStandingRulingScope: () => null,
+          resolveIdentity: () => ({ login: 'chalbert', type: 'User' }), resolveCard: () => null,
+        });
+        return { context: reader({ repo, pr: 7 }), lines };
+      }
+      it.each([
+        ['default', {}, 'two-step', 'standard'],
+        ['platform', { prefs: { cardRuling: { cardRulingFileMode: 'one-call' } } }, 'one-call', 'platform'],
+        ['tool overrides platform', { prefs: { cardRuling: { cardRulingFileMode: 'one-call' } },
+          tool: { cardRulingFileMode: 'two-step' } }, 'two-step', 'tool'],
+        ['env overrides tool', { tool: { cardRulingFileMode: 'two-step' },
+          envOver: { WE_CARD_RULING_FILE_MODE: 'one-call' } }, 'one-call', 'env'],
+      ])('reader resolves %s mode and logs value plus provenance', async (_name, options, value, source) => {
+        const { context, lines } = await readMode(options);
+        expect(context.cardFileMode).toEqual({ value, source });
+        expect(lines.join('\n')).toMatch(new RegExp(`cardRulingFileMode[=:]\\s*${value}.*${source}`));
+        if (kind === 'referral') expect(context.findingClassPolicy).toEqual({});
+      });
+      it.each(['', 'ONE-CALL', 'typo'])('invalid env mode %j throws instead of falling back', async value => {
+        await expect(readMode({ envOver: { WE_CARD_RULING_FILE_MODE: value } })).rejects.toThrow(/cardRulingFileMode|WE_CARD_RULING_FILE_MODE/);
+      });
+      it('invalid mode in an injected context is refused before filing', async () => {
+        const h = await fixture(kind, 'unsafe-mode');
+        await expect(h.run()).rejects.toThrow(/cardRulingFileMode|file.mode|invalid.*mode/i);
+        expect(h.landRulingCard).not.toHaveBeenCalled();
+        expect(h.written).toEqual([]);
+      });
+
+      for (const mode of modes) it.each(['main', { pr: 82 }])(`${mode}: real landing helper reuses one matching card on %j without filing`, async host => {
+        const h = await fixture(kind, mode);
+        const land = h.referralIO.landRulingCard;
+        expect(typeof land, 'missing exported landRulingCard implementation').toBe('function');
+        const card = { rel: 'backlog/xexisting-coverage.md', host };
+        const ref = `we:${card.rel}${host === 'main' ? '' : `@pr${host.pr}`}`;
+        const dedupe = vi.fn(() => ({ action: 'mention', matches: [{ card }, { card: { ...card } }],
+          mentions: [{ card, lines: [] }], remaining: null }));
+        const exec = vi.fn(() => { throw new Error('duplicate filing attempted'); });
+        const landing = vi.fn(exec);
+        h.landRulingCard.mockImplementation((input, context) => land(input, {
+          ...context, dedupe, landPreventionCard: landing, exec,
+        }));
+        const verdict = await h.run();
+        expect(dedupe).toHaveBeenCalledTimes(1);
+        expect(dedupe).toHaveBeenCalledWith(h.view.findings.cardPlan.cardInput,
+          expect.objectContaining({ lane: h.referralIO.REPO_ROOT }));
+        expect(landing).not.toHaveBeenCalled();
+        expect(exec).not.toHaveBeenCalled();
+        if (mode === 'two-step') expect(verdict).toMatchObject({ fileOnly: true, cardRef: ref, reused: true });
+        else if (kind === 'referral') expect(verdict.record.rulings[0].card).toBe(ref);
+        else expect(h.written[0].payload.cardRef).toBe(ref);
+      });
+    });
+  }
+
+  it('open referral entries retain classification evidence from the normalized finding', () => {
+    const rec = referral();
+    Object.assign(rec.referrals[0].original, coverage);
+    rec.referrals[0].finding = normalizeFinding(rec.referrals[0].original);
+    const result = openReferralFindings({ ...ctx(), comments: [gh(renderReferralRecord(rec))] });
+    expect(result.open[0]).toMatchObject(coverage);
   });
 });
