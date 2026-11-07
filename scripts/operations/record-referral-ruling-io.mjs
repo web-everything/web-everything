@@ -1,6 +1,7 @@
 import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readFindingClassPolicy } from '../lib/finding-class-policy.mjs';
 import { landPreventionCard as defaultLandPreventionCard, runCardDedupe } from './land-prevention-card.mjs';
+import { loadCardDedupePolicy } from '../lib/card-dedupe.mjs';
 /**
  * @file scripts/operations/record-referral-ruling-io.mjs
  * @description The io binding of `record-referral-ruling` (#4979): reads the PR thread through `gh`, resolves the
@@ -181,7 +182,11 @@ export function readCardRulingFileMode({ env = process.env, tool, log = line => 
 }
 
 /** Read-only dedupe first; new cards always use the existing isolated single-card landing path. */
-export async function landRulingCard(input, { repo, pr, dedupe = runCardDedupe,
+// Dedupe is forced ON for ruling cards whatever the repo-wide default says: this path must never file a duplicate.
+const rulingDedupe = (input, options) => runCardDedupe(input, { ...options,
+  loadPolicy: () => ({ ...loadCardDedupePolicy({ root: REPO_ROOT, env: process.env }), dedupe: true }) });
+
+export async function landRulingCard(input, { repo, pr, dedupe = rulingDedupe,
   landPreventionCard = defaultLandPreventionCard, ...landingOptions } = {}) {
   const plan = await dedupe(input, { lane: REPO_ROOT });
   if (plan?.action === 'mention' && plan.matches?.length) {
@@ -191,6 +196,10 @@ export async function landRulingCard(input, { repo, pr, dedupe = runCardDedupe,
     });
     if (refs.every(Boolean) && new Set(refs).size === 1)
       return { ok: true, reused: true, ref: refs[0], pr: plan.matches[0].card.host?.pr ?? null };
+  }
+  // Fail closed: unreadable dedupe evidence never proceeds to filing.
+  if (!plan || plan.action === 'off') {
+    return { ok: false, step: 'dedupe', reason: 'duplicate-card check unavailable; nothing filed' };
   }
   // Fail closed: any other match (several cards, or only some findings matched) would file a duplicate.
   if (plan?.matches?.length) {

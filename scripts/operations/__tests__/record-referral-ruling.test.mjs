@@ -833,3 +833,18 @@ describe('cardRulingFileMode rejects malformed platform blocks', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
+
+describe('fileCard fails closed on missing dedupe evidence and unclassified degraded findings', () => {
+  it.each([[null], [{ action: 'off', matches: [] }]])('refuses to file when dedupe evidence is %j', async (plan) => {
+    const { landRulingCard } = await import('../record-referral-ruling-io.mjs');
+    const landPreventionCard = vi.fn();
+    expect(await landRulingCard({ title: 't' }, { dedupe: () => plan, landPreventionCard })).toMatchObject({ ok: false, step: 'dedupe' });
+    expect(landPreventionCard).not.toHaveBeenCalled();
+  });
+  it('files when dedupe ran and found no match', async () => {
+    const { landRulingCard } = await import('../record-referral-ruling-io.mjs');
+    const landPreventionCard = vi.fn(async () => ({ ok: true, step: 'done', rel: 'backlog/x1.md', pr: 9 }));
+    expect(await landRulingCard({ title: 't' }, { dedupe: () => ({ action: 'file', matches: [] }), landPreventionCard }))
+      .toMatchObject({ ok: true, ref: 'we:backlog/x1.md@pr9' });
+  });
+});

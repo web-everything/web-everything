@@ -264,7 +264,7 @@ export function planRedTeamCard(read, input) {
   const policy = read.setting?.findingClasses ?? {};
   if (selected.some(f => f.securityReachableToday === true || !(classAction(f, policy) === 'defer-card'
     || (breakClass(f) === 'degraded' && read.setting?.degraded === 'card'
-      && !allClasses(f).some(c => classAction({ ...f, findingClass: c, alsoClasses: [] }, policy) === 'fix-now')))))
+      && allClasses(f).length > 0 && !allClasses(f).some(c => classAction({ ...f, findingClass: c, alsoClasses: [] }, policy) === 'fix-now')))))
     throw new Error('fileCard refuses a fix-now or security break; only coverage-class findings can be carded');
   const cardInput = buildRulingCardInput(read, input, selected);
   assertRulingCardInputFits(cardInput);
