@@ -98,12 +98,12 @@ describe('launchd any-argument ownership', () => {
 });
 
 describe('launchd clone restart', () => {
-  it('label matching normalizes paths and conservatively claims raw root substrings', () => {
+  it('label matching normalizes paths and claims the root only at a path boundary', () => {
     const o = fixture([
       { Label: 'com.we.exact', ProgramArguments: [cloneRoot] },
       { Label: 'com.we.child', ProgramArguments: ['node', join(cloneRoot, 'scripts', '..', 'run.mjs')] },
       { Label: 'com.we.sibling', ProgramArguments: [`${cloneRoot}2/run.mjs`] }]);
-    expect(findServicesRunningFromClone(o).matches.map(x => x.label)).toEqual(['com.we.exact', 'com.we.child', 'com.we.sibling']);
+    expect(findServicesRunningFromClone(o).matches.map(x => x.label)).toEqual(['com.we.exact', 'com.we.child']);
   });
   it('bare executable with unrelated absolute script does not match when cwd equals cloneRoot', async () => {
     const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['node', resolve('..', 'other-clone', 'sampler.mjs')] }]);
@@ -228,6 +228,50 @@ describe('launchd clone restart', () => {
     const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: [join(cloneRoot, 'sampler.mjs'), ...args] }]);
     const r = await restartServicesForClone(o);
     expect(r.skipped[0]?.reason).toBe('built-in-never'); expect(o.launchctl).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['sibling directory sharing the prefix', `${cloneRoot}-control/sampler.mjs`, false],
+    ['sibling with dot suffix', `${cloneRoot}.bak/sampler.mjs`, false],
+    ['sibling inside a shell string', `cd ${cloneRoot}-control && node x`, false],
+    ['sibling after an equals', `--dir=${cloneRoot}-control`, false],
+    ['child path', `${cloneRoot}/x.mjs`, true],
+    ['shell string', `cd ${cloneRoot} && node x`, true],
+    ['attached equals', `--dir=${cloneRoot}`, true],
+    ['bare root', cloneRoot, true],
+    ['quoted', `"${cloneRoot}"`, true],
+    ['file URL', `file://${cloneRoot}/x`, true],
+    ['second occurrence after a sibling', `${cloneRoot}-control:${cloneRoot}/x`, true],
+  ])('catch-all matches the clone only at a path boundary: %s', async (_name, arg, owned) => {
+    const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/usr/bin/other', arg] }]);
+    expect(findServicesRunningFromClone(o)).toMatchObject({ matches: owned ? [{ label: 'com.we.resource-sampler' }] : [], unreadable: [] });
+    const r = await restartServicesForClone(o);
+    expect(r.restarted).toHaveLength(owned ? 1 : 0);
+    if (!owned) expect(o.launchctl).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['/bin/sh', '-lc', `cd ${cloneRoot}/site && pnpm dev`],
+    ['/bin/sh', '-c', `cd ${cloneRoot}/site; npm run dev`],
+    ['/bin/sh', '-c', `cd ${cloneRoot}/site || yarn start`],
+    ['/bin/bash', '-lc', `cd ${cloneRoot}/site && npx next dev`],
+    ['/bin/zsh', '-c', `cd ${cloneRoot} | python3 -m http.server 8000`],
+    ['/bin/sh', '-c', `cd ${cloneRoot} && php -S localhost:8080`],
+    ['/bin/sh', '-c', `cd ${cloneRoot} && rollup -w`],
+    ['/bin/sh', '-c', `cd ${cloneRoot} && esbuild --serve=8000`],
+    ['/bin/sh', '-c', `cd ${cloneRoot} && bun run serve`],
+  ])('shell-wrapped dev server is never restarted: %j', async (...args) => {
+    const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: args }]);
+    const r = await restartServicesForClone(o);
+    expect(r.skipped[0]?.reason).toBe('built-in-never'); expect(o.launchctl).not.toHaveBeenCalled();
+  });
+  it('direct and shell-wrapped dev-server forms agree', async () => {
+    const direct = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['pnpm', '--dir', `${cloneRoot}/site`, 'dev'] }]);
+    const wrapped = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/bin/sh', '-lc', `cd ${cloneRoot}/site && pnpm dev`] }]);
+    expect((await restartServicesForClone(direct)).skipped[0]?.reason).toBe('built-in-never');
+    expect((await restartServicesForClone(wrapped)).skipped[0]?.reason).toBe('built-in-never');
+  });
+  it('a shell string without a dev server is still restarted', async () => {
+    const o = fixture([{ Label: 'com.we.resource-sampler', ProgramArguments: ['/bin/sh', '-c', `cd ${cloneRoot} && node sampler.mjs`] }]);
+    expect((await restartServicesForClone(o)).restarted).toHaveLength(1);
   });
   it.each([
     ['nuxt', 'dev'], ['astro', 'dev'], ['next', 'dev'], ['python', '-m', 'http.server'], ['python3', '-m', 'http.server'],
@@ -772,7 +816,7 @@ describe('launchd clone ownership: interpreter options and filesystem aliases', 
           .toEqual([expect.objectContaining({ reason: 'stale-code' })]);
       }
       const other = { ...fixture([{ ...sampler, ProgramArguments: ['/usr/local/bin/node', join(dir, 'clone2', 'sampler.mjs')] }]), cloneRoot: alias };
-      expect(findServicesRunningFromClone(other).matches).toHaveLength(1); // Raw canonical-root substring is sufficient.
+      expect(findServicesRunningFromClone(other).matches).toHaveLength(0); // A prefix-sharing sibling (clone2) is not the clone.
     } finally { await fsAsync.rm(dir, { recursive: true, force: true }); }
   });
   it('a path that merely contains "vite" (vitest temp dir, vite-named folder) is not a dev server; real dev-server argv still is', async () => {

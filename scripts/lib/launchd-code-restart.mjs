@@ -285,7 +285,39 @@ async function canonicalAsync(path, realpath) {
   }
 }
 
+// A shell-wrapped command (`sh -lc "cd x && pnpm dev"`) is ONE argument: split it on shell
+// separators and words so each command segment gets the same name/tail checks as direct argv.
+function shellSegments(args) {
+  const segments = [];
+  for (const arg of args) {
+    if (!/\s/.test(arg)) continue;
+    for (const part of arg.split(/&&|\|\||[;|&\n]/)) {
+      const tokens = shellSplit(part) ?? part.split(/\s+/);
+      const words = tokens.filter(Boolean);
+      if (words.length) segments.push(words);
+    }
+  }
+  return segments;
+}
 function devServer(args) {
+  return devServerTokens(args) || shellSegments(args).some(devServerTokens);
+}
+// Match `root` only at a path boundary, so `/clones/we` does not claim `/clones/we-control/x`.
+// Before: start or a non-path char (a "/" counts only as part of a leading "//", e.g. file:///root).
+// After: end, "/" or a non-path char. Every occurrence is tried.
+const PATH_CHAR = /[\w.\-]/;
+function containsPath(arg, root) {
+  const needle = root.length > 1 ? root.replace(/\/+$/, '') : root;
+  if (!needle) return false;
+  for (let at = arg.indexOf(needle); at !== -1; at = arg.indexOf(needle, at + 1)) {
+    const before = at === 0 ? '' : arg[at - 1];
+    const after = arg[at + needle.length] ?? '';
+    const beforeOk = before === '' || (!PATH_CHAR.test(before) && (before !== '/' || arg[at - 2] === '/'));
+    if (beforeOk && (after === '' || after === '/' || !PATH_CHAR.test(after))) return true;
+  }
+  return false;
+}
+function devServerTokens(args) {
   const names = args.map(arg => basename(arg).toLowerCase().replace(/\.(?:[cm]?js|cmd|exe)$/, '').replace(/^npm-cli$/, 'npm'));
   if (names.some(name => /^(?:vite|webpack-dev(?:-server)?|storybook|serve|live-server|parcel)$/.test(name))) return true;
   return names.some((name, i) => {
@@ -359,7 +391,7 @@ function decide(parsed, { root, canonRoot, canon }) {
   const owned = paths => paths.some(path => inside(path, root) || (canon(path) !== null && inside(canon(path), canonRoot)));
   const match = { label: parsed.label, plistPath: parsed.plistPath, args: parsed.args };
   if (owned(parsed.codePaths)) return match;
-  if (parsed.scanArgs.some(arg => arg.includes(root) || arg.includes(canonRoot)) || owned(parsed.paths)
+  if (parsed.scanArgs.some(arg => containsPath(arg, root) || containsPath(arg, canonRoot)) || owned(parsed.paths)
     || parsed.symlinkPaths.some(path => {
       const resolved = canon(path);
       return resolved !== null && resolved !== path && inside(resolved, canonRoot);
