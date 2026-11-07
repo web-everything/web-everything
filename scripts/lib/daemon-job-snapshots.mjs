@@ -23,8 +23,11 @@ import { join } from 'node:path';
 
 import { DEFAULT_CHILD_TIMEOUT_MS, NPM_INSTALL_TIMEOUT_MS } from './bounded-child.mjs';
 import { DEFAULT_SNAPSHOT_KEEP, selectEvictions } from './daemon-jobs.mjs';
+import { markerMatches, lockHash, hasDanglingTopLevelLink, resolvePnpmStoreDir } from './lane-deps-installer.mjs';
 
 const COMPLETE_MARKER = '.snapshot-complete';
+// Keep this leaf independent of deps-job, which imports the snapshot helpers.
+const DEPS_MARKER_FILE = '.we-deps-marker';
 const KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 /** `<jobsDir>/.snapshots` — dot-named so the run store's `*.json` listing never sees it. */
@@ -106,6 +109,22 @@ export function ensureNodeModulesStore({ jobsDir, sourceDir, install = npmCiInst
   const key = lockfileKey(lock);
   const dir = join(snapshotsRoot(jobsDir), 'node-modules', key);
   mkdirSync(join(snapshotsRoot(jobsDir), 'node-modules'), { recursive: true });
+  if (existsSync(join(dir, COMPLETE_MARKER))) {
+    let marker;
+    try { marker = readFileSync(join(dir, DEPS_MARKER_FILE), 'utf8').trim(); }
+    catch (error) {
+      // Historical stores have no marker. An unreadable marker is incomplete evidence.
+      if (error.code !== 'ENOENT') rmSync(dir, { recursive: true, force: true });
+    }
+    if (marker?.startsWith('pnpm:')) {
+      let ready = false;
+      try {
+        ready = markerMatches(marker, lockHash(dir, 'pnpm', resolvePnpmStoreDir()), 'pnpm')
+          && !hasDanglingTopLevelLink(join(dir, 'node_modules'));
+      } catch { /* Unreadable install inputs invalidate the completed store. */ }
+      if (!ready) rmSync(dir, { recursive: true, force: true });
+    }
+  }
   buildOnce(dir, (into) => {
     copyFileSync(join(sourceDir, 'package.json'), join(into, 'package.json'));
     copyFileSync(join(sourceDir, 'package-lock.json'), join(into, 'package-lock.json'));

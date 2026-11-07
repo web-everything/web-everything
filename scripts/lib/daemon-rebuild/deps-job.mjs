@@ -22,9 +22,10 @@
  */
 import { execFileSync } from 'node:child_process';
 import {
-  copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync,
+  closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync,
+  realpathSync, renameSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { defineJobKind, kindRegistry } from '../daemon-jobs.mjs';
@@ -54,12 +55,141 @@ const COMPLETE_MARKER = '.snapshot-complete';
 
 /**
  * The argv for the install job's legacy npm backend. `--ignore-scripts` prevents npm lifecycle scripts in the
- * unattended daemon. The pnpm backend instead uses pnpm-workspace.yaml's allowBuilds policy for native builds.
+ * unattended daemon. The pnpm backend also disables scripts and verifies cached native build artifacts.
  * Exported so a caller (the drain) can refuse the job path when it is missing, and pinned by a test.
  */
 export const DEPS_JOB_NPM_ARGS = Object.freeze(['ci', '--ignore-scripts', '--no-audit', '--no-fund']);
 
 export const DEPS_MARKER_FILE = '.we-deps-marker';
+
+/** Follow the installed dependency graph, rather than treating root links as its inventory.
+ * Resolve from real package paths so pnpm's adjacent GVS dependencies and multiple versions are visited.
+ * A graph exceeding 10000 instances fails closed through the installer's logged npm fallback. */
+function installedPackages(into) {
+  const modules = join(into, 'node_modules');
+  const pending = [];
+  const packages = new Map();
+  const seen = new Set();
+  if (!existsSync(modules)) return packages;
+  for (const entry of readdirSync(modules, { withFileTypes: true })) {
+    if (entry.name.startsWith('.')) continue;
+    const path = join(modules, entry.name);
+    if (entry.name.startsWith('@')) {
+      for (const child of readdirSync(path, { withFileTypes: true })) {
+        if (child.isDirectory() || child.isSymbolicLink()) pending.push([`${entry.name}/${child.name}`, join(path, child.name)]);
+      }
+    } else if (entry.isDirectory() || entry.isSymbolicLink()) pending.push([entry.name, path]);
+  }
+  while (pending.length) {
+    const [requestedName, path] = pending.pop();
+    const root = realpathSync(path);
+    if (seen.has(root)) continue;
+    seen.add(root);
+    if (seen.size > 10000) throw new Error('native dependency graph exceeds 10000 instances');
+    let pkg = {};
+    try { pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    const name = pkg.name ?? requestedName;
+    if (!packages.has(name)) packages.set(name, new Set());
+    packages.get(name).add(root);
+    for (const dependency of Object.keys({ ...pkg.dependencies, ...pkg.optionalDependencies, ...pkg.peerDependencies })) {
+      if (!/^(?:@[\w.-]+\/)?[\w.-]+$/.test(dependency)
+        || dependency.split('/').some((part) => part === '.' || part === '..')) {
+        throw new Error('invalid installed dependency name');
+      }
+      let ancestor = root;
+      for (;;) {
+        const candidate = join(ancestor, 'node_modules', dependency);
+        if (existsSync(candidate)) {
+          pending.push([dependency, candidate]);
+          break;
+        }
+        const parent = dirname(ancestor);
+        if (parent === ancestor) break;
+        ancestor = parent;
+      }
+    }
+  }
+  return packages;
+}
+
+/** Read the workspace's boolean allowBuilds map without requiring installed YAML dependencies.
+ * Unsupported policy syntax fails closed to the legacy installer, rather than silently skipping a build. */
+function installedBuilds(into) {
+  let policy;
+  try { policy = readFileSync(join(into, 'pnpm-workspace.yaml'), 'utf8'); }
+  catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+  const names = [];
+  const packages = installedPackages(into);
+  let inBuilds = false;
+  for (const line of policy.split(/\r?\n/)) {
+    if (/^\s*(?:#.*)?$/.test(line)) continue;
+    if (/^allowBuilds\s*:/.test(line)) {
+      if (!/^allowBuilds\s*:\s*(?:#.*)?$/.test(line)) throw new Error('unsupported allowBuilds policy');
+      inBuilds = true;
+      continue;
+    }
+    if (!inBuilds) continue;
+    if (/^\S/.test(line)) { inBuilds = false; continue; }
+    const entry = /^\s+(?:"([^"]+)"|'([^']+)'|([^\s:]+)):\s*(true|false)\s*(?:#.*)?$/.exec(line);
+    if (!entry) throw new Error('unsupported allowBuilds entry');
+    const name = entry[1] ?? entry[2] ?? entry[3];
+    if (!/^(?:@[\w.-]+\/)?[\w.-]+$/.test(name) || name === '.' || name === '..') {
+      throw new Error('invalid allowBuilds package');
+    }
+    if (entry[4] === 'true' && packages.has(name)) names.push(name);
+  }
+  return names;
+}
+
+/** Verify artifacts, never execute package code or write to pnpm's shared store.
+ * GVS esbuild has a Mach-O bin/esbuild (also in its adjacent @esbuild platform package).
+ * Other native packages ship .node libraries or native executables in optional platform packages.
+ * Bound traversal to 2048 entries and six levels per package; incomplete evidence uses npm. */
+export function nativeBuilt(into, names) {
+  const magic = new Set(['7f454c46', '4d5a', 'feedface', 'cefaedfe', 'feedfacf', 'cffaedfe', 'cafebabe', 'bebafeca']);
+  function artifact(root) {
+    let remaining = 2048;
+    function visit(dir, depth) {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (--remaining < 0) throw new Error('native artifact scan limit');
+        if (entry.name === 'node_modules' || entry.isSymbolicLink()) continue;
+        const path = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (depth === 0) throw new Error('native artifact scan depth');
+          if (visit(path, depth - 1)) return true;
+        } else if (entry.isFile() && (/\.(?:node|so|dylib|dll|exe)$/.test(entry.name) || (statSync(path).mode & 0o111))) {
+          const fd = openSync(path, 'r');
+          const header = Buffer.alloc(4);
+          try { readSync(fd, header, 0, 4, 0); } finally { closeSync(fd); }
+          const hex = header.toString('hex');
+          if (magic.has(hex) || magic.has(hex.slice(0, 4))) return true;
+        }
+      }
+      return false;
+    }
+    return visit(root, 6);
+  }
+  try {
+    const packages = installedPackages(into);
+    return names.every((name) => packages.has(name) && [...packages.get(name)].every((root) => {
+      const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+      if (artifact(root)) return true;
+      // Resolve optional packages from this package's own dependency graph, including scoped GVS paths.
+      const modules = name.startsWith('@') ? dirname(dirname(root)) : dirname(root);
+      return Object.keys(pkg.optionalDependencies ?? {}).some((dependency) => {
+        if (!/^(?:@[\w.-]+\/)?[\w.-]+$/.test(dependency) || dependency === '.' || dependency === '..') return false;
+        const candidate = [join(root, 'node_modules', dependency), join(modules, dependency)]
+          .find((path) => existsSync(path));
+        if (!candidate) return false;
+        const meta = JSON.parse(readFileSync(join(candidate, 'package.json'), 'utf8'));
+        const supports = (values, value) => !values || (Array.isArray(values)
+          && !values.includes('!' + value) && (values.every((v) => v.startsWith('!')) || values.includes(value)));
+        return supports(meta.os, process.platform) && supports(meta.cpu, process.arch) && artifact(realpathSync(candidate));
+      });
+    }));
+  } catch { return false; }
+}
 
 /** Install snapshot-local dependencies, using the legacy installer once if pnpm cannot be used. */
 export function pnpmAwareInstaller({
@@ -68,6 +198,7 @@ export function pnpmAwareInstaller({
   parity = () => readLockfileParity(sourceRoot).ok,
   log = (line) => process.stderr.write(`[deps-installer] ${line}\n`),
   timeoutMs = NPM_INSTALL_TIMEOUT_MS,
+  nativeBuilt: checkNativeBuilt = nativeBuilt,
 } = {}) {
   return (into) => {
     let same = false;
@@ -87,6 +218,7 @@ export function pnpmAwareInstaller({
     // This plan is never spawned: its dispatch calls the existing installer directly.
     const npm = { backend: 'npm', command: Symbol('legacy-installer'), args: [] };
     if (plan.backend === 'pnpm') {
+      plan.args.push('--ignore-scripts');
       plan.fallback = npm;
       try {
         ensureStoreGeneration(storeDir);
@@ -118,10 +250,16 @@ export function pnpmAwareInstaller({
         const backend = command === npm.command ? 'npm' : 'pnpm';
         log(`backend=${backend}`);
         if (backend === 'npm') return legacy(into);
-        return exec(command, args, {
+        const output = exec(command, args, {
           cwd: into, env, stdio: ['ignore', 2, 'pipe'], timeout: timeoutMs,
           maxBuffer: PROBE_MAX_BUFFER, killSignal: 'SIGKILL',
         });
+        const names = installedBuilds(into);
+        if (checkNativeBuilt(into, names) !== true) {
+          log(`native build missing: ${names.join(', ')}; backend=npm`);
+          throw new Error('native build missing');
+        }
+        return output;
       },
     });
     // Without a lockfile or manifest there is no dependency identity to persist.

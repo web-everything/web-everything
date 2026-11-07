@@ -103,7 +103,7 @@ export function rebuildJobsDir(root, env = process.env) {
   return daemonJobsDir(`rebuild-${cloneKey(root)}`, env);
 }
 
-/** Snapshot `node_modules` installer: an APFS clone of the clone's own tree when the lockfile matches, else npm ci. */
+/** Snapshot installer: script-free pnpm with verified native artifacts, else the clone/npm path. */
 export function cloneNodeModulesInstaller(sourceRoot, { exec = execFileSync, fallback = npmCiInstaller(), pnpm = {} } = {}) {
   const legacy = (into) => {
     const src = join(sourceRoot, 'node_modules');
