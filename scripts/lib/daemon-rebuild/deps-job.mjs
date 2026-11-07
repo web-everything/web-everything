@@ -11,7 +11,7 @@
  *      key with the one its `node_modules` was installed for; when they differ it queues ONE install job for the new
  *      lockfile (a fresh `node_modules` store under the job dir, never the live one), watches it, and once the store
  *      is complete SWAPS it in (an APFS clone copy, then two renames) — at a pass boundary, never under a running pass.
- *   2. JOB CHILD — this file run as a script from a pinned code snapshot: `npm ci --ignore-scripts` into the
+ *   2. JOB CHILD — this file run as a script from a pinned code snapshot: pnpm, or `npm ci --ignore-scripts`, into the
  *      lockfile-keyed store (`ensureNodeModulesStore`: built in a temp dir and renamed into place, so a half-built
  *      store is never used).
  *
@@ -22,7 +22,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import {
-  existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync,
+  copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync,
 } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -39,6 +39,11 @@ import { daemonJobsDir } from '../../operations/run-store.mjs';
 import { cloneKey } from '../daemon-overlays.mjs';
 import { NPM_INSTALL_TIMEOUT_MS } from '../bounded-child.mjs';
 import { readGit } from '../proc-read.mjs';
+import {
+  selectInstaller, runDepsInstaller, markerMatches, lockHash, ensureStoreGeneration,
+  resolvePnpmStoreDir, whichOnPath, PROBE_TIMEOUT_MS, PROBE_MAX_BUFFER,
+} from '../lane-deps-installer.mjs';
+import { readLockfileParity } from '../../check-lockfile-parity.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const SETTINGS_PATH = resolve(SELF, '..', '..', 'daemon-rebuild-settings.json');
@@ -48,18 +53,89 @@ export const DEFAULT_DEPS_JOB_RETRY_MS = 5 * 60_000;
 const COMPLETE_MARKER = '.snapshot-complete';
 
 /**
- * The ONE argv the install job runs `npm` with. `--ignore-scripts` is load-bearing: the daemon runs unattended with
- * the operator's gh/git credentials, so a lockfile change that lands on main (possibly merged by the drain itself)
- * must never execute npm lifecycle scripts. Exported so a caller (the drain) can refuse the job path when it is
- * missing, and pinned by a test.
+ * The argv for the install job's legacy npm backend. `--ignore-scripts` prevents npm lifecycle scripts in the
+ * unattended daemon. The pnpm backend instead uses pnpm-workspace.yaml's allowBuilds policy for native builds.
+ * Exported so a caller (the drain) can refuse the job path when it is missing, and pinned by a test.
  */
 export const DEPS_JOB_NPM_ARGS = Object.freeze(['ci', '--ignore-scripts', '--no-audit', '--no-fund']);
 
-/** The install job's installer: `npm <DEPS_JOB_NPM_ARGS>` in a directory holding only the manifest and lockfile. */
-export function depsJobInstaller({ timeoutMs = NPM_INSTALL_TIMEOUT_MS, exec = execFileSync } = {}) {
+export const DEPS_MARKER_FILE = '.we-deps-marker';
+
+/** Install snapshot-local dependencies, using the legacy installer once if pnpm cannot be used. */
+export function pnpmAwareInstaller({
+  sourceRoot = process.cwd(), legacy, env = process.env, exec = execFileSync,
+  storeDir = resolvePnpmStoreDir(env), which = (name) => whichOnPath(name, env.PATH),
+  parity = () => readLockfileParity(sourceRoot).ok,
+  log = (line) => process.stderr.write(`[deps-installer] ${line}\n`),
+  timeoutMs = NPM_INSTALL_TIMEOUT_MS,
+} = {}) {
   return (into) => {
+    let same = false;
+    try {
+      same = readFileSync(join(sourceRoot, 'package-lock.json'), 'utf8')
+        === readFileSync(join(into, 'package-lock.json'), 'utf8');
+    } catch { /* Missing or unreadable inputs must use the legacy path. */ }
+    let plan = selectInstaller({
+      which, parity, storeDir,
+      hasPnpmLock: same && existsSync(join(sourceRoot, 'pnpm-lock.yaml')),
+      hasNpmLock: existsSync(join(into, 'package-lock.json')),
+      exec: (command, args, { cwd }) => exec(command, args, {
+        cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: PROBE_TIMEOUT_MS, maxBuffer: PROBE_MAX_BUFFER, killSignal: 'SIGKILL',
+      }),
+    });
+    // This plan is never spawned: its dispatch calls the existing installer directly.
+    const npm = { backend: 'npm', command: Symbol('legacy-installer'), args: [] };
+    if (plan.backend === 'pnpm') {
+      plan.fallback = npm;
+      try {
+        ensureStoreGeneration(storeDir);
+      } catch {
+        log('pnpm store generation unavailable; falling back to npm');
+        plan = npm;
+      }
+    } else plan = npm;
+    if (plan.backend === 'pnpm' && resolve(sourceRoot) !== resolve(into)) {
+      for (const name of ['pnpm-lock.yaml', 'pnpm-workspace.yaml']) {
+        const source = join(sourceRoot, name);
+        if (existsSync(source)) copyFileSync(source, join(into, name));
+        else rmSync(join(into, name), { force: true });
+      }
+    }
+    const markerPath = join(into, DEPS_MARKER_FILE);
+    let marker = null;
+    try { marker = readFileSync(markerPath, 'utf8').trim(); } catch { /* No trusted marker yet. */ }
+    const hashFor = (backend) => lockHash(into, backend, storeDir);
+    // Normalize old unprefixed npm markers for the shared runner's backend transition check.
+    const npmHash = hashFor('npm');
+    if (npmHash && markerMatches(marker, npmHash, 'npm')) marker = `npm:${npmHash}`;
+    const result = runDepsInstaller({
+      plan, hashFor, marker, hasNodeModules: existsSync(join(into, 'node_modules')),
+      invalidate: () => rmSync(markerPath, { force: true }),
+      remove: () => rmSync(join(into, 'node_modules'), { recursive: true, force: true }),
+      log,
+      exec: (command, args) => {
+        const backend = command === npm.command ? 'npm' : 'pnpm';
+        log(`backend=${backend}`);
+        if (backend === 'npm') return legacy(into);
+        return exec(command, args, {
+          cwd: into, env, stdio: ['ignore', 2, 'pipe'], timeout: timeoutMs,
+          maxBuffer: PROBE_MAX_BUFFER, killSignal: 'SIGKILL',
+        });
+      },
+    });
+    // Without a lockfile or manifest there is no dependency identity to persist.
+    if (hashFor(result.backend) !== null) writeFileSync(markerPath, result.marker);
+  };
+}
+
+/** The deps job uses pnpm when eligible, retaining its script-free npm fallback. */
+export function depsJobInstaller({ timeoutMs = NPM_INSTALL_TIMEOUT_MS, exec = execFileSync,
+  sourceRoot = process.cwd(), ...options } = {}) {
+  const legacy = (into) => {
     exec('npm', [...DEPS_JOB_NPM_ARGS], { cwd: into, stdio: ['ignore', 'ignore', 'pipe'], timeout: timeoutMs });
   };
+  return pnpmAwareInstaller({ ...options, sourceRoot, timeoutMs, exec, legacy });
 }
 
 export const DEPS_JOB_KIND = defineJobKind({
@@ -235,7 +311,7 @@ export async function refreshDepsAsJob({
 // ── job child ────────────────────────────────────────────────────────────────────────────────────────────────
 
 /** The job's one step: build the lockfile-keyed store from the pinned snapshot's lockfile (idempotent). */
-export function installStep({ jobsDir, sourceDir, expectKey, install = depsJobInstaller() }) {
+export function installStep({ jobsDir, sourceDir, expectKey, install = depsJobInstaller({ sourceRoot: sourceDir }) }) {
   const got = lockfileKey(readFileSync(join(sourceDir, 'package-lock.json'), 'utf8'));
   if (expectKey && got !== expectKey) throw new Error(`lockfile of the pinned commit is ${got}, not the requested ${expectKey}`);
   const { key, dir } = ensureNodeModulesStore({ jobsDir, sourceDir, install });
@@ -248,7 +324,7 @@ export function installStep({ jobsDir, sourceDir, expectKey, install = depsJobIn
  * @param {{env?: object, cwd?: string, install?: Function, run?: typeof runJob, write?: (s: string) => void}} [o]
  */
 export async function runDepsJob({
-  env = process.env, cwd = process.cwd(), install = depsJobInstaller(), run = runJob, write = (m) => process.stderr.write(m),
+  env = process.env, cwd = process.cwd(), install = depsJobInstaller({ sourceRoot: cwd, env }), run = runJob, write = (m) => process.stderr.write(m),
 } = {}) {
   const dir = env.OPERATION_RUNS_DIR;
   return run({

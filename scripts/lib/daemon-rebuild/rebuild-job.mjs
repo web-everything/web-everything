@@ -43,6 +43,7 @@ import { lockIdFor } from '../../readiness/file-locks.mjs';
 import { alertsFilePath } from './state.mjs';
 import { readGit } from '../proc-read.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
+import { pnpmAwareInstaller } from './deps-job.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const SETTINGS_PATH = resolve(SELF, '..', '..', 'daemon-rebuild-settings.json');
@@ -103,8 +104,8 @@ export function rebuildJobsDir(root, env = process.env) {
 }
 
 /** Snapshot `node_modules` installer: an APFS clone of the clone's own tree when the lockfile matches, else npm ci. */
-export function cloneNodeModulesInstaller(sourceRoot, { exec = execFileSync, fallback = npmCiInstaller() } = {}) {
-  return (into) => {
+export function cloneNodeModulesInstaller(sourceRoot, { exec = execFileSync, fallback = npmCiInstaller(), pnpm = {} } = {}) {
+  const legacy = (into) => {
     const src = join(sourceRoot, 'node_modules');
     let same = false;
     try { same = readFileSync(join(sourceRoot, 'package-lock.json'), 'utf8') === readFileSync(join(into, 'package-lock.json'), 'utf8'); } catch { same = false; }
@@ -116,6 +117,7 @@ export function cloneNodeModulesInstaller(sourceRoot, { exec = execFileSync, fal
     }
     fallback(into);
   };
+  return pnpmAwareInstaller({ ...pnpm, sourceRoot, legacy });
 }
 
 function readConsumed(dir) {
