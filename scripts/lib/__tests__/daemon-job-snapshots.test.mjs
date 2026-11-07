@@ -4,9 +4,9 @@
  *   used half-built, the store keyed by the lockfile (two commits with one lockfile share it), a real
  *   `git archive` snapshot, and eviction (unreferenced stores go, at most 2 kept).
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -14,9 +14,11 @@ import {
   codeRef, ensureCodeSnapshot, ensureNodeModulesStore, evictSnapshots, linkNodeModules, lockfileKey, nodeModulesRef, snapshotsRoot,
 } from '../daemon-job-snapshots.mjs';
 
+import { ensureStoreGeneration, lockHash, markerMatches, hasDanglingTopLevelLink } from '../lane-deps-installer.mjs';
+
 let jobsDir;
 beforeEach(() => { jobsDir = mkdtempSync(join(tmpdir(), 'we-job-snapshots-')); });
-afterEach(() => { rmSync(jobsDir, { recursive: true, force: true }); });
+afterEach(() => { vi.unstubAllEnvs(); rmSync(jobsDir, { recursive: true, force: true }); });
 
 describe('code snapshots', () => {
   it('builds once and reuses the finished snapshot', () => {
@@ -59,6 +61,84 @@ describe('node_modules stores', () => {
     writeFileSync(join(d, 'package-lock.json'), lock);
     return d;
   };
+
+  function completedStore(backend = 'pnpm') {
+    const sourceDir = source('{"lockfileVersion":3}');
+    const storeDir = join(jobsDir, 'pnpm-store');
+    vi.stubEnv('WE_PNPM_STORE_DIR', storeDir);
+    ensureStoreGeneration(storeDir);
+    const target = join(storeDir, 'esbuild');
+    mkdirSync(target);
+    const initial = ensureNodeModulesStore({ jobsDir, sourceDir, install: (into) => {
+      mkdirSync(join(into, 'node_modules'));
+      symlinkSync(target, join(into, 'node_modules', 'esbuild'), 'dir');
+      writeFileSync(join(into, 'old-store-sentinel'), 'old');
+      if (backend) {
+        writeFileSync(join(into, 'pnpm-lock.yaml'), 'lockfileVersion: "9.0"\n');
+        writeFileSync(join(into, 'pnpm-workspace.yaml'), 'allowBuilds:\n  esbuild: true\n');
+        writeFileSync(join(into, '.we-deps-marker'), `${backend}:${lockHash(into, backend, storeDir)}`);
+      }
+    } });
+    expect(existsSync(join(initial.dir, '.snapshot-complete'))).toBe(true);
+    const install = vi.fn((into) => {
+      // Invalidation must remove the old store before materializing its replacement.
+      expect(existsSync(initial.dir)).toBe(false);
+      mkdirSync(join(into, 'node_modules'));
+      writeFileSync(join(into, 'node_modules', 'rebuilt'), 'new');
+    });
+    return { sourceDir, storeDir, target, initial, install };
+  }
+
+  it.each(['generation changed', 'pnpm lock changed', 'dangling link'])('rebuilds a completed pnpm store exactly once: %s', (reason) => {
+    const f = completedStore();
+    const marker = readFileSync(join(f.initial.dir, '.we-deps-marker'), 'utf8');
+    expect(markerMatches(marker, lockHash(f.initial.dir, 'pnpm', f.storeDir), 'pnpm')).toBe(true);
+    expect(hasDanglingTopLevelLink(join(f.initial.dir, 'node_modules'))).toBe(false);
+    if (reason === 'generation changed') {
+      rmSync(f.storeDir, { recursive: true });
+      ensureStoreGeneration(f.storeDir);
+      mkdirSync(f.target); // Links still resolve: generation alone must invalidate reuse.
+    } else if (reason === 'pnpm lock changed') {
+      writeFileSync(join(f.initial.dir, 'pnpm-lock.yaml'), 'lockfileVersion: "9.0"\nchanged: true\n');
+    } else {
+      rmSync(f.target, { recursive: true });
+      expect(markerMatches(marker, lockHash(f.initial.dir, 'pnpm', f.storeDir), 'pnpm')).toBe(true);
+      expect(hasDanglingTopLevelLink(join(f.initial.dir, 'node_modules'))).toBe(true);
+    }
+    if (reason !== 'dangling link') {
+      expect(markerMatches(marker, lockHash(f.initial.dir, 'pnpm', f.storeDir), 'pnpm')).toBe(false);
+      expect(hasDanglingTopLevelLink(join(f.initial.dir, 'node_modules'))).toBe(false);
+    }
+    const result = ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install });
+    expect(f.install).toHaveBeenCalledTimes(1);
+    expect(result).toEqual(f.initial);
+    expect(existsSync(join(result.dir, 'old-store-sentinel'))).toBe(false);
+    expect(readFileSync(join(result.dir, 'node_modules', 'rebuilt'), 'utf8')).toBe('new');
+    expect(existsSync(join(result.dir, '.snapshot-complete'))).toBe(true);
+    ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install });
+    expect(f.install).toHaveBeenCalledTimes(1);
+  });
+
+  it('reuses a fresh pnpm marker with resolving links without installing', () => {
+    const f = completedStore();
+    const marker = readFileSync(join(f.initial.dir, '.we-deps-marker'), 'utf8');
+    expect(markerMatches(marker, lockHash(f.initial.dir, 'pnpm', f.storeDir), 'pnpm')).toBe(true);
+    expect(hasDanglingTopLevelLink(join(f.initial.dir, 'node_modules'))).toBe(false);
+    expect(ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install })).toEqual(f.initial);
+    expect(f.install).not.toHaveBeenCalled();
+    expect(readFileSync(join(f.initial.dir, '.we-deps-marker'), 'utf8')).toBe(marker);
+    expect(existsSync(join(f.initial.dir, 'old-store-sentinel'))).toBe(true);
+  });
+
+  it.each(['npm', null])('preserves completed-store reuse for marker backend=%s', (backend) => {
+    const f = completedStore(backend);
+    rmSync(f.storeDir, { recursive: true });
+    ensureStoreGeneration(f.storeDir);
+    expect(hasDanglingTopLevelLink(join(f.initial.dir, 'node_modules'))).toBe(true);
+    expect(ensureNodeModulesStore({ jobsDir, sourceDir: f.sourceDir, install: f.install })).toEqual(f.initial);
+    expect(f.install).not.toHaveBeenCalled();
+    expect(existsSync(join(f.initial.dir, 'old-store-sentinel'))).toBe(true);
+  });
 
   it('keys the store by the lockfile, so two snapshots with one lockfile share one install', () => {
     let installs = 0;

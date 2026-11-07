@@ -125,10 +125,62 @@ describe('cloneNodeModulesInstaller — pnpm snapshot routing', () => {
   it('routes a matching snapshot with a pnpm lock through pnpm and writes its marker', () => {
     const f = setup();
     cloneNodeModulesInstaller(f.sourceRoot, f)(f.into);
-    expect(installs(f)).toEqual([['pnpm', ['install', '--frozen-lockfile', `--store-dir=${f.pnpm.storeDir}`], expect.objectContaining({ cwd: f.into })]]);
+    expect(installs(f)).toEqual([['pnpm', ['install', '--frozen-lockfile', `--store-dir=${f.pnpm.storeDir}`, '--ignore-scripts'], expect.objectContaining({ cwd: f.into })]]);
     expect(f.exec).not.toHaveBeenCalled();
     expect(f.fallback).not.toHaveBeenCalled();
     expectMarker(f, 'pnpm');
+  });
+
+  it.each([undefined, false])('always disables pnpm install scripts even with ignoreScripts=%s', (ignoreScripts) => {
+    const f = setup();
+    f.pnpm.ignoreScripts = ignoreScripts;
+    f.pnpm.env = { npm_config_ignore_scripts: 'false', PNPM_CONFIG_IGNORE_SCRIPTS: 'false' };
+    cloneNodeModulesInstaller(f.sourceRoot, f)(f.into);
+    expect(installs(f)).toHaveLength(1);
+    for (const [, args] of installs(f)) {
+      expect(args).toEqual(['install', '--frozen-lockfile', `--store-dir=${f.pnpm.storeDir}`, '--ignore-scripts']);
+    }
+  });
+
+  it.each([false, true])('checks all installed allowBuilds packages after pnpm; native built=%s', (built) => {
+    const f = setup();
+    const policy = 'allowBuilds:\n  esbuild: true\n  "@parcel/watcher": true\n  sharp: true\n  blocked: false\n';
+    writeFile(f.sourceRoot, 'pnpm-workspace.yaml', policy);
+    f.pnpm.exec.mockImplementation((cmd, args) => {
+      if (args[0] === '--version') return '12.1.0';
+      for (const name of ['esbuild', '@parcel/watcher', 'blocked', 'ordinary']) {
+        mkdirSync(join(f.into, 'node_modules', name), { recursive: true });
+      }
+      writeFileSync(join(f.into, 'node_modules', 'partial'), 'pnpm output');
+    });
+    f.pnpm.nativeBuilt = vi.fn((into, names) => {
+      expect(into).toBe(f.into);
+      expect([...names].sort()).toEqual(['@parcel/watcher', 'esbuild']);
+      expect(existsSync(join(into, 'node_modules', 'partial'))).toBe(true);
+      return built;
+    });
+    f.exec.mockImplementation(() => {
+      expect(existsSync(join(f.into, 'node_modules'))).toBe(false);
+      writeFile(f.into, 'node_modules/copied', 'legacy output');
+    });
+    cloneNodeModulesInstaller(f.sourceRoot, f)(f.into);
+    expect(installs(f)).toHaveLength(1);
+    expect(f.pnpm.nativeBuilt).toHaveBeenCalledTimes(1);
+    if (built) {
+      expect(f.exec).not.toHaveBeenCalled();
+      expect(f.fallback).not.toHaveBeenCalled();
+      expect(existsSync(join(f.into, 'node_modules', 'partial'))).toBe(true);
+      expectMarker(f, 'pnpm');
+    } else {
+      expect(f.exec).toHaveBeenCalledTimes(1);
+      expect(f.exec).toHaveBeenCalledWith('cp', ['-cR', join(f.sourceRoot, 'node_modules'), join(f.into, 'node_modules')], expect.any(Object));
+      expect(f.fallback).not.toHaveBeenCalled();
+      expect(existsSync(join(f.into, 'node_modules', 'partial'))).toBe(false);
+      expect(readFileSync(join(f.into, 'node_modules', 'copied'), 'utf8')).toBe('legacy output');
+      expect(f.pnpm.log.mock.calls.some(([line]) =>
+        ['native build missing', '@parcel/watcher', 'esbuild', 'backend=npm'].every((text) => String(line).includes(text)))).toBe(true);
+      expectMarker(f, 'npm');
+    }
   });
 
   it('retains the cp -cR clone path when pnpm is unavailable and records backend=npm', () => {
