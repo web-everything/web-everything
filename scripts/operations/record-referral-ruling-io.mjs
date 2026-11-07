@@ -1,4 +1,4 @@
-import { cascadePolicy } from '../lib/policy-cascade.mjs';
+import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
 import { readFindingClassPolicy } from '../lib/finding-class-policy.mjs';
 import { landPreventionCard as defaultLandPreventionCard, runCardDedupe } from './land-prevention-card.mjs';
 /**
@@ -156,6 +156,15 @@ function readProtectionContext(thread, { repo, pr, readJson, cardReadable, chang
 /** Resolve and reject invalid evidence at any layer, rather than silently falling back. */
 export function readCardRulingFileMode({ env = process.env, tool, log = line => console.error(line) } = {}) {
   if (tool !== undefined && (!tool || typeof tool !== 'object' || Array.isArray(tool))) throw new Error('invalid cardRuling tool settings: expected an object');
+  const MODES = ['two-step', 'one-call'];
+  if (tool !== undefined && Object.hasOwn(tool, 'cardRulingFileMode') && !MODES.includes(tool.cardRulingFileMode)) {
+    throw new Error('invalid cardRulingFileMode in tool settings: use two-step or one-call');
+  }
+  const platformBlock = platformPreference('cardRuling', { env });
+  if (platformBlock && typeof platformBlock === 'object' && Object.hasOwn(platformBlock, 'cardRulingFileMode')
+    && !MODES.includes(platformBlock.cardRulingFileMode)) {
+    throw new Error('invalid cardRulingFileMode in platform settings: use two-step or one-call');
+  }
   const resolved = cascadePolicy('cardRuling', tool, {
     standard: { cardRulingFileMode: 'two-step' }, env, log,
     envValues: { cardRulingFileMode: env.WE_CARD_RULING_FILE_MODE },

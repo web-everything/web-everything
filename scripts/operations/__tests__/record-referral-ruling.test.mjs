@@ -802,3 +802,11 @@ describe('fileCard fail-closed dedupe and setting validation', () => {
     expect(() => readCardRulingFileMode({ env: {}, tool: 'unsafe', log: () => {} })).toThrow(/tool settings/);
   });
 });
+
+describe('cardRulingFileMode rejects non-enum layer values, even empty objects', () => {
+  it('tool layer {} or a bad string throws', async () => {
+    const { readCardRulingFileMode } = await import('../record-referral-ruling-io.mjs');
+    expect(() => readCardRulingFileMode({ env: {}, tool: { cardRulingFileMode: {} }, log: () => {} })).toThrow(/tool settings/);
+    expect(() => readCardRulingFileMode({ env: {}, tool: { cardRulingFileMode: 'both' }, log: () => {} })).toThrow(/tool settings/);
+  });
+});
