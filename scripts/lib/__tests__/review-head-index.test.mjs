@@ -40,6 +40,25 @@ describe('headReviewOwed', () => {
     rec();
     expect(headReviewOwed({ index: readHeadIndex({ dir }), repo: 'o/r', pr: 7, head: H(2), netPatchHash: null }).owed).toBe(true);
   });
+  it('a non-string head or seed head (array/object that SHA.test would coerce) is held, never carried or suppressed', () => {
+    rec({ verdict: 'reject' });
+    const index = readHeadIndex({ dir });
+    // [H(2)] stringifies to a valid sha: it must not read as a new head carrying p1's verdict, nor as a same-head match
+    for (const head of [[H(2)], [H(1)], { toString: () => H(2) }, new String(H(2))]) {
+      expect(headReviewOwed({ index, repo: 'o/r', pr: 7, head, netPatchHash: 'p1' }))
+        .toMatchObject({ owed: null, held: true, reason: 'head-unreadable' });
+    }
+    // an array-valued seed head (pre-index PR) is not a seed: the review stays owed
+    const empty = readHeadIndex({ dir: join(dir, 'empty') });
+    for (const lastReviewedHead of [[H(2)], new String(H(2))]) {
+      expect(headReviewOwed({ index: empty, repo: 'o/r', pr: 9, head: H(2), seed: { lastReviewedHead, verdict: 'marker' } }))
+        .toMatchObject({ owed: true, reason: 'no-record' });
+    }
+    // netPatchKey refuses a non-string sha before running git
+    const exec = vi.fn();
+    expect(netPatchKey({ exec, cwd: dir, sha: [H(2)] })).toMatchObject({ ok: false });
+    expect(exec).not.toHaveBeenCalled();
+  });
   it('unreadable index -> fail closed (held as unknown, never nothing-owed)', () => {
     rec(); rec({ head: H(2), netPatchHash: 'p2' });
     const { log } = headIndexPaths(dir);

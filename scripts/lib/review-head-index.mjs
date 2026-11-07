@@ -28,6 +28,8 @@ import { REVIEWED_SHA_MARKER } from './review-escalation.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 
 const SHA = /^[0-9a-f]{40}$/;
+// SHA.test() coerces its argument to a string, so an array [sha] or a String object would pass it. Every untrusted sha goes through isSha.
+const isSha = v => typeof v === 'string' && SHA.test(v);
 export const HEAD_INDEX_STANDARD = Object.freeze({ keepPerPr: 20, logMaxLines: 2000 });
 export const MAP_VERSION = 2;
 const posInt = v => Number.isSafeInteger(v) && v > 0;
@@ -55,7 +57,7 @@ export function resolveHeadIndexSettings({ file = readSettings(), platform, env 
  */
 export function netPatchKey({ exec, cwd, sha, mainRef = 'origin/main' } = {}) {
   try {
-    if (!SHA.test(sha ?? '')) throw Error('invalid head');
+    if (!isSha(sha)) throw Error('invalid head');
     const git = args => String(exec('git', args, { cwd, encoding: 'latin1', timeout: 10000, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
     const base = git(['merge-base', mainRef, sha]).trim();
     if (!SHA.test(base)) throw Error('unreadable merge-base');
@@ -310,11 +312,11 @@ export function seedFromReviewComments(comments) {
 
 export function headReviewOwed({ index, repo, pr, head, netPatchHash = null, seed = null } = {}) {
   if (!index || index.ok !== true || !index.map) return { owed: null, held: true, reason: 'index-unreadable' };
-  if (!SHA.test(head ?? '')) return { owed: null, held: true, reason: 'head-unreadable' };
+  if (!isSha(head)) return { owed: null, held: true, reason: 'head-unreadable' };
   const r = hasOwn(index.map, prKey(repo, pr)) ? index.map[prKey(repo, pr)] : null;
   if (!r) {
     // Pre-index PR: seed from the latest trusted reviewed-sha marker. No marker (or no seed given) is owed, never nothing-owed.
-    if (seed && SHA.test(seed.lastReviewedHead ?? '')) {
+    if (seed && isSha(seed.lastReviewedHead)) {
       return seed.lastReviewedHead === head ? { owed: false, reason: 'same-head', seeded: true, verdict: seed.verdict }
         : { owed: true, reason: 'new-head', seeded: true, lastReviewedHead: seed.lastReviewedHead };
     }
