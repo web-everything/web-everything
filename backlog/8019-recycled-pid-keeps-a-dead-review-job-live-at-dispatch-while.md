@@ -1,15 +1,16 @@
 ---
+bornAs: x5pm7j1
 kind: story
-size: 3
+size: 5
 status: open
-scope: ["we:scripts/conveyor/orphan-fix-round.mjs", "we:scripts/conveyor/fix-dispatch-claim.mjs"]
+scope: ["we:scripts/operations/review-job-store.mjs", "we:scripts/conveyor/reconcile-pass.mjs", "we:scripts/conveyor/reconcile-core.mjs", "we:skills-src/conveyor/review-daemon.mjs", "we:scripts/operations/review-job.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# orphan guard treats an expired dispatch claim file as 'owned'
+# Recycled pid keeps a dead review job 'live' at dispatch while the planner says the PR is free
 
-Flow-sim gap E-G10, class K1 (liveness false positive). Failing input: PR review:changes with a kind 'fix' claim file past its 10 min TTL whose session row has vanished from claude agents (refresh neither releases nor heartbeats it)' 'orphan pass Cited: we:scripts/conveyor/orphan-fix-round.mjs:179-185, we:scripts/conveyor/fix-dispatch-claim.mjs:456-473, we:scripts/conveyor/orphan-fix-round.mjs:88. Soak-break sketch: guard skips the PR while the stale file stays. The ordinary dispatcher can still reclaim it (reserve :348-379), so impact is limited to cases where ordinary dispatch also declines.
+Flow-sim gap A-C1, class K1 (liveness false positive). Failing input: labels: [review:pending] files: '.operations/review-jobs/review-<N>.json = {slug, pr:N, repo, pid:P, startedAt:T0, cwd}; the job died (kill -9 or host reboot); pid P is now an unrelated live process (reused). No review verdict comment. CI green.' any daemon tick after the job died (or after a reboot) Cited: we:scripts/operations/review-job-store.mjs:107-118, we:scripts/conveyor/reconcile-pass.mjs:624-636, we:scripts/conveyor/reconcile-pass.mjs:602-612, we:scripts/conveyor/reconcile-core.mjs:1372-1382, we:skills-src/conveyor/review-daemon.mjs:677. Soak-break sketch: stuck: the PR is owed a review every tick and never dispatched while P stays alive (a system/long-lived pid can be alive indefinitely). Daemon logs only 'not dispatched - live-job' (RD:1755).
 
 ## Acceptance
 

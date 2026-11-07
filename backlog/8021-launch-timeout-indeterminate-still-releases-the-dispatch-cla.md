@@ -1,15 +1,16 @@
 ---
+bornAs: xxvje0b
 kind: story
-size: 5
+size: 3
 status: open
-scope: ["we:scripts/operations/review-job-store.mjs", "we:scripts/conveyor/reconcile-pass.mjs", "we:scripts/conveyor/reconcile-core.mjs", "we:skills-src/conveyor/review-daemon.mjs", "we:scripts/operations/review-job.mjs"]
+scope: ["we:scripts/operations/dispatch-lane-io.mjs", "we:scripts/conveyor/reconcile-fix-dispatch.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# Recycled pid keeps a dead review job 'live' at dispatch while the planner says the PR is free
+# launch timeout (indeterminate) still releases the dispatch claim, so a possibly-live session is no longer fen…
 
-Flow-sim gap A-C1, class K1 (liveness false positive). Failing input: labels: [review:pending] files: '.operations/review-jobs/review-<N>.json = {slug, pr:N, repo, pid:P, startedAt:T0, cwd}; the job died (kill -9 or host reboot); pid P is now an unrelated live process (reused). No review verdict comment. CI green.' any daemon tick after the job died (or after a reboot) Cited: we:scripts/operations/review-job-store.mjs:107-118, we:scripts/conveyor/reconcile-pass.mjs:624-636, we:scripts/conveyor/reconcile-pass.mjs:602-612, we:scripts/conveyor/reconcile-core.mjs:1372-1382, we:skills-src/conveyor/review-daemon.mjs:677. Soak-break sketch: stuck: the PR is owed a review every tick and never dispatched while P stays alive (a system/long-lived pid can be alive indefinitely). Daemon logs only 'not dispatched - live-job' (RD:1755).
+Flow-sim gap E-G3, class K1 (liveness false positive). Failing input: dispatchFix launched claude --bg; the CLI call is killed at SPAWN_TIMEOUT_MS with SIGKILL but the session already registered with the background daemon (listing lags 26+ s, we:fix-claim-store.mjs:16-20)' 'exception from spawnAgent Cited: we:scripts/operations/dispatch-lane-io.mjs:2053-2055, we:scripts/conveyor/reconcile-fix-dispatch.mjs:1686-1699. Soak-break sketch: claim gone; next tick (120 s) can dispatch a second fixer if the listing still does not show the first. Bounded only by bindAgents name matching.
 
 ## Acceptance
 

@@ -1,15 +1,16 @@
 ---
+bornAs: xrw0e7l
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/operations/dispatch-lane-io.mjs", "we:scripts/conveyor/reconcile-fix-dispatch.mjs"]
+scope: ["we:scripts/conveyor/orphan-fix-round.mjs", "we:scripts/conveyor/fix-dispatch-claim.mjs"]
 dateOpened: "2026-11-07"
 tags: []
 ---
 
-# launch timeout (indeterminate) still releases the dispatch claim, so a possibly-live session is no longer fen…
+# orphan guard treats an expired dispatch claim file as 'owned'
 
-Flow-sim gap E-G3, class K1 (liveness false positive). Failing input: dispatchFix launched claude --bg; the CLI call is killed at SPAWN_TIMEOUT_MS with SIGKILL but the session already registered with the background daemon (listing lags 26+ s, we:fix-claim-store.mjs:16-20)' 'exception from spawnAgent Cited: we:scripts/operations/dispatch-lane-io.mjs:2053-2055, we:scripts/conveyor/reconcile-fix-dispatch.mjs:1686-1699. Soak-break sketch: claim gone; next tick (120 s) can dispatch a second fixer if the listing still does not show the first. Bounded only by bindAgents name matching.
+Flow-sim gap E-G10, class K1 (liveness false positive). Failing input: PR review:changes with a kind 'fix' claim file past its 10 min TTL whose session row has vanished from claude agents (refresh neither releases nor heartbeats it)' 'orphan pass Cited: we:scripts/conveyor/orphan-fix-round.mjs:179-185, we:scripts/conveyor/fix-dispatch-claim.mjs:456-473, we:scripts/conveyor/orphan-fix-round.mjs:88. Soak-break sketch: guard skips the PR while the stale file stays. The ordinary dispatcher can still reclaim it (reserve :348-379), so impact is limited to cases where ordinary dispatch also declines.
 
 ## Acceptance
 
