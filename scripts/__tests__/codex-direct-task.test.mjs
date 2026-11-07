@@ -1365,7 +1365,13 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     };
     try {
       // keep-scratch-throw: a human run that throws prints only its error, so nothing points into its clone.
-      if (['failure', 'post-log-failure', 'log-copy-failure', 'keep-scratch-throw', 'exit'].includes(mode)) await expect(codexDirectTask(opts)).rejects.toThrow();
+      if (['failure', 'post-log-failure', 'log-copy-failure', 'keep-scratch-throw', 'exit'].includes(mode)) {
+        const error = await codexDirectTask(opts).then(() => null, e => e);
+        expect(error).toBeInstanceOf(Error);
+        // The CLI prints only the error, so a failed run names the log it left in tmpdir.
+        if (['post-log-failure', 'keep-scratch-throw'].includes(mode)) expect(error.message).toContain(`(log kept at ${dirs[0]}.jsonl)`);
+        if (mode === 'log-copy-failure') expect(error.message).not.toContain('log kept at');
+      }
       else {
         const report = await codexDirectTask(opts);
         expect(readFileSync(report.logFile, 'utf8')).toBe('{"type":"turn.completed","usage":{}}\n');

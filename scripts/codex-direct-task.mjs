@@ -1181,8 +1181,10 @@ export async function codexDirectTask({
   // A human CLI run with no --dir leaves its edits only in the scratch clone it prints (keepScratch). Set only
   // on a successful return: a run that throws prints just its error, so its clone is cleaned up as usual.
   let retainedScratch;
+  let cleaned = false;
   const cleanupTemps = () => {
-    if (keep) return;
+    if (keep || cleaned) return;
+    cleaned = true;
     let retainedClone = retainedScratch;
     if (!retainedClone) try { preserveScratchLog(); }
     catch (error) {
@@ -1352,6 +1354,11 @@ export async function codexDirectTask({
     quotaRolloutFile,
     quotaRolloutCleared,
   };
+  } catch (error) {
+    // The CLI prints only the error: name the preserved log, or a failed run leaves it unreported in tmpdir.
+    cleanupTemps();
+    if (scratchLog?.written && error instanceof Error) error.message += ` (log kept at ${scratchLog.dest})`;
+    throw error;
   } finally {
     cleanupTemps();
     process.removeListener('exit', cleanupTemps);
