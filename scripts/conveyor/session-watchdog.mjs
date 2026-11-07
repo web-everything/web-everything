@@ -67,7 +67,7 @@
  *   node scripts/conveyor/session-watchdog.mjs --apply [--json]  # one pass that also takes its actions
  */
 import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
-import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -80,6 +80,7 @@ import { dispatchDemandMinutes } from '../readiness/heavy-queue-projection.mjs';
 import { readStandardMinutes, admissionLockRoot } from '../readiness/heavy-admission.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { listLiveFixClaims, releaseFixClaim, FIXING_KIND } from './fix-procedure.mjs';
+import { fixDispatchClaimRoot } from './fix-claim-store.mjs';
 import { releaseSessionFixDispatchClaims } from './fix-dispatch-claim.mjs';
 import { makeCompletionResolver, rmSessionRecord, stopSessionWithRetry } from './session-reaper.mjs';
 import { cascadePolicy, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
@@ -367,7 +368,12 @@ export function planWatchdog({ rows, claims, prHeadFor = () => null, standardFor
   for (const c of claims || []) {
     const m = c.meta || {};
     const holder = holderOf(c);
-    if (holder) claimHolders.add(holder);
+    if (m.sessionId) {
+      if (holder) claimHolders.add(holder);
+    } else {
+      // A name-only claim cannot distinguish sessions sharing a name; protect all of them from stops.
+      for (const r of rows) if (r.name === m.who) claimHolders.add(r);
+    }
     if (holder) claimedBy.add(holder.name);
     const claimedMs = Date.parse(m.claimedAt ?? '');
     const claimAgeMs = Number.isFinite(claimedMs) ? nowMs - claimedMs : null;
@@ -532,6 +538,11 @@ const isNonTerminal = (a) => a?.state !== 'done' && a?.state !== 'stopped' && a?
  * @returns {{at:string, act:boolean, standards:object, rows:Array<object>, findings:Array<object>,
  *   actions:Array<object>, events:Array<object>, acked:string[]}}
  */
+export function defaultClaimStoreReadable(readDirectory = readdirSync) {
+  try { readDirectory(fixDispatchClaimRoot()); return true; }
+  catch (err) { return err?.code === 'ENOENT'; }
+}
+
 export function runSessionWatchdogPass({
   nowMs = Date.now(),
   config = DEFAULT_SESSION_WATCHDOG,
@@ -542,7 +553,12 @@ export function runSessionWatchdogPass({
   readProcesses = () => defaultProcesses(),
   readTail = (row) => readWatchdogTail(row, config, nowMs),
   readHeavy = () => readStandardMinutes(admissionLockRoot(REPO_ROOT)),
-  listClaims = () => listLiveFixClaims({ nowMs }),
+  listClaims = listLiveFixClaims,
+  claimStoreReadable = () => {
+    // Injected readers own their evidence; the default reader silently returns [] on directory read errors.
+    if (listClaims !== listLiveFixClaims) return true;
+    return defaultClaimStoreReadable();
+  },
   prHeadFor = makeSnapshotHeadReader({ maxAgeMs: config.prHeadMaxAgeMinutes * MINUTE }),
   completionFor = makeCompletionResolver(),
   rm = rmSessionRecord,
@@ -598,7 +614,12 @@ export function runSessionWatchdogPass({
 
   let claims = [];
   let claimsReadable = false;
-  try { claims = listClaims(); claimsReadable = Array.isArray(claims); } catch { /* refuse stops without claim evidence */ }
+  try {
+    if (claimStoreReadable() === true) {
+      claims = listClaims === listLiveFixClaims ? listClaims({ nowMs }) : listClaims();
+      claimsReadable = Array.isArray(claims);
+    }
+  } catch { /* refuse stops without claim evidence */ }
   if (!claimsReadable) { claims = []; log('session-watchdog: claim store unreadable; stops refused until a successful read'); }
   const plan = planWatchdog({ rows, claims, prHeadFor, standardFor, nowMs, cfg: config });
 
