@@ -236,9 +236,11 @@ describe('R473 pure classified verdict', () => {
   // The same class (PR #6381 self-review): a pattern is cleaned up the way a path candidate is, so a leading ./ or /,
   // a backslash, a doubled slash or surrounding whitespace never makes a protected pattern match nothing.
   it('a protected pattern written with ./, /, \\, // or whitespace still protects its paths (PR #6381 self-review)', async () => {
+    // Invisible characters are built from code points: a raw one in source is refused by check:standards.
+    const ZW = String.fromCodePoint(0x200b);
     for (const pattern of ['./custom/**', '/custom/**', 'custom\\**', 'custom//**', 'custom/** ', ' custom/**', './custom/', './/custom/**/', 'custom\\',
-      'custom/./**', 'custom/**/.', 'x/../custom/**', 'custom​/**', 'ｃustom/**', 'cus\u007ftom/**', 'custom/­**/',
-      'custom/** ​', '​ custom/**', ' ​ custom/** ​ ']) {
+      'custom/./**', 'custom/**/.', 'x/../custom/**', `custom${ZW}/**`, `${String.fromCodePoint(0xff43)}ustom/**`,
+      `cus${String.fromCodePoint(0x7f)}tom/**`, `custom/${String.fromCodePoint(0xad)}**/`, `custom/** ${ZW}`, `${ZW} custom/**`, ` ${ZW} custom/** ${ZW} `]) {
       const race = await compute([d3('custom/writers/save.mjs')], options('prerelease'), trustedLayer({ raceBlockPaths: [pattern] }));
       expect(race.verdict, pattern).toBe('WEAKENED');
       const guard = await compute([finding({ class: 'E2', file: 'custom/writers/save.mjs' })], options('prerelease'), trustedLayer({ guardFloorPaths: [pattern] }));

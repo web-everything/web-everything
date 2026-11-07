@@ -183,8 +183,10 @@ describe('audit settings (R528)', () => {
     // preferences (releaseStage prod, protected paths) were dropped with no warning. It now fails closed.
     describe('a platform key that only normalises to "audit" fails closed (PR #6381 judge)', () => {
       // Invisible control characters (DEL, C1 controls), format characters and the blank braille cell count too.
-      const variants = ['Audit', 'audit​', 'AUDIT', '​audit', 'au­dit', 'ａudit', ' audit',
-        'audit\u007f', 'audit\u0085', 'audit\u009f', 'audit⠀', 'audit؀'];
+      // Built from code points: a raw invisible character in source is refused by check:standards.
+      const cp = n => String.fromCodePoint(n);
+      const variants = ['Audit', `audit${cp(0x200b)}`, 'AUDIT', `${cp(0x200b)}audit`, `au${cp(0xad)}dit`, `${cp(0xff41)}udit`, ' audit',
+        `audit${cp(0x7f)}`, `audit${cp(0x85)}`, `audit${cp(0x9f)}`, `audit${cp(0x2800)}`, `audit${cp(0x600)}`];
       const body = (key, extra = '') => `{${extra}${JSON.stringify(key)}:{"releaseStage":"prod","raceBlockPaths":["custom/**"]}}`;
       const fromChain = chain => resolveAuditSettings({ fileRead: file(full()), env: {}, platformRead: platformRead('', chain), log: () => {} });
       it.each(variants)('the default-chain platform key %j resolves strictest with a warning', key => {

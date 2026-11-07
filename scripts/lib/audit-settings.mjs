@@ -287,8 +287,9 @@ function rawMalformed(layer, key, valid) {
  * choice the cascade cannot see: it would read as omitted and earn the default. It fails that setting closed instead.
  * Other misspellings (`verdicts`) cannot be mapped to a setting; they are only named by `unknownKeys`.
  */
-// Control (Cc) and format (Cf) characters and the blank braille cell are invisible too (PR #6381 self-review).
-const foldKey = s => s.normalize('NFKC').replace(/[\s\p{Default_Ignorable_Code_Point}\p{Cc}\p{Cf}⠀]/gu, '').toLowerCase();
+// Control (Cc) and format (Cf) characters and braille cells (the blank one is invisible) fold away too (PR #6381
+// self-review). Written as property classes: a raw invisible character in source is refused by check:standards.
+const foldKey = s => s.normalize('NFKC').replace(/[\s\p{Default_Ignorable_Code_Point}\p{Cc}\p{Cf}\p{Script=Braille}]/gu, '').toLowerCase();
 function caseShadowed(layer, key) {
   if (!isObj(layer)) return false;
   const [a, b] = pathOf(key);
